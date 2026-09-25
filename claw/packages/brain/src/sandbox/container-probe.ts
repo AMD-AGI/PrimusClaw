@@ -27,7 +27,7 @@ import { AGENT_SANDBOX_NAMESPACE, SANDBOX_NAMESPACE } from "../config.js";
 import { metrics } from "../infra/metrics.js";
 import { getHandsKv, readHandsEntry } from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
-import type { SandboxExecResult, SandboxInstance } from "./provider.js";
+import type { SandboxExecOptions, SandboxExecResult, SandboxInstance } from "./provider.js";
 
 const logger = pino({ name: "sandbox-container-probe" });
 
@@ -65,6 +65,7 @@ export type ContainerProbeReason =
   | "exec_nonzero"
   | "exec_no_exit_code"
   | "exec_sandbox_gone"
+  | "exec_sandbox_terminal"
   | "exec_unreachable"
   | "exec_deadline"
   | "kv_unreachable"
@@ -79,6 +80,7 @@ export const HANDS_ENTRY_CORRUPT = "hands_entry_corrupt";
 export interface ContainerProbeOutcome {
   verdict: ContainerProbeVerdict;
   reason: ContainerProbeReason;
+  failureReason?: string;
 }
 
 export interface HandsProbeEntry {
@@ -90,6 +92,11 @@ export interface HandsProbeEntry {
   sandboxName?: string;
   namespace?: string;
   userId?: string;
+  terminalReason?: string;
+  /** Multi-node cluster workload id (= message id) for scoped cascade reclaim. */
+  messageId?: string;
+  /** Non-empty when this sandbox was built for a multi-node cluster. */
+  mnServiceUrl?: string;
 }
 
 export interface ContainerProbeEffects {
@@ -99,6 +106,7 @@ export interface ContainerProbeEffects {
     command: string,
     timeout: string,
     signal?: AbortSignal,
+    opts?: SandboxExecOptions,
   ) => Promise<SandboxExecResult>;
 }
 
@@ -138,16 +146,21 @@ export function parseHandsProbeValue(raw: string): HandsProbeEntry {
   }
 }
 
+// Job tracking is the caller's to declare. A command that starts user-facing
+// work -- the Hands relaunch is one -- has to enter the EnvD roster, or the
+// sandbox reports no user processes for the rest of its life and the idle
+// reclaim tears it down under running work.
 async function defaultExec(
   inst: SandboxInstance,
   command: string,
   timeout: string,
   signal?: AbortSignal,
+  opts?: SandboxExecOptions,
 ): Promise<SandboxExecResult> {
   const provider = inst.provider === "agent-sandbox"
     ? getAgentSandboxProvider()
     : getSafeWorkloadProvider();
-  return provider.exec(inst, command, timeout, signal);
+  return provider.exec(inst, command, timeout, signal, opts);
 }
 
 const realEffects: ContainerProbeEffects = {
@@ -241,8 +254,9 @@ export function execInSandbox(
   command: string,
   timeout: string,
   signal?: AbortSignal,
+  opts?: SandboxExecOptions,
 ): Promise<SandboxExecResult> {
-  return effects.exec(inst, command, timeout, signal);
+  return effects.exec(inst, command, timeout, signal, opts);
 }
 
 /**
@@ -313,7 +327,9 @@ async function execWithDeadline(
   // probe waiting out its full deadline for a caller that had already gone.
   if (signal?.aborted) throw new Error(PROBE_ABORTED_ERROR);
   const controller = new AbortController();
-  const call = effects.exec(inst, PROBE_COMMAND, PROBE_TIMEOUT, controller.signal);
+  const call = effects.exec(
+    inst, PROBE_COMMAND, PROBE_TIMEOUT, controller.signal, { untracked: true },
+  );
   // The losing side of the race still settles. Claiming its rejection keeps a
   // slow failure arriving after the deadline from becoming an unhandled
   // rejection, which in Node takes the process down.
@@ -395,6 +411,13 @@ async function classify(
     const msg = String((err as Error)?.message ?? err);
     if (msg === PROBE_ABORTED_ERROR) return { verdict: "unknown", reason: "aborted" };
     if (msg === PROBE_DEADLINE_ERROR) return { verdict: "unknown", reason: "exec_deadline" };
+    if ((err as { sandboxTerminal?: boolean })?.sandboxTerminal === true) {
+      return {
+        verdict: "dead",
+        reason: "exec_sandbox_terminal",
+        failureReason: (err as { reason?: string }).reason ?? "sandbox_workload_terminal",
+      };
+    }
     if (execFailureMeansGone(err, inst.provider)) {
       return { verdict: "dead", reason: "exec_sandbox_gone" };
     }

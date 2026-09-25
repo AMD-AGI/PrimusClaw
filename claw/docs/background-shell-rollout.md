@@ -444,13 +444,44 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST \
    # not to today's count. The reserve is how many of those slots are held back
    # so a target another replica created can always be taken on before it is
    # served; a few percent of the ceiling, never zero.
-   SANDBOX_KEEPALIVE_TARGET_CEILING="200"
-   SANDBOX_KEEPALIVE_RECONCILE_RESERVE="20"
+   #
+   # Keep the ceiling at or below one sweep's ping capacity, which this build
+   # reports as 160 (`keepalivePingsPerSweep()`). At or under it a handle waits
+   # no deferrals and the gap below is 1380s; one past it a handle can wait a
+   # whole extra sweep, and the gap jumps to 2100s -- so raising the ceiling
+   # alone is what turns a configuration that started into one that does not.
+   SANDBOX_KEEPALIVE_TARGET_CEILING="128"
+   SANDBOX_KEEPALIVE_RECONCILE_RESERVE="16"
    # The shortest idle reclaim in force here. Brain proves the worst-case gap
    # between two refreshes of one handle against it and refuses to start where
    # the gap is not under it, so a ceiling too large for the interval is
    # rejected here rather than found later as a reclaimed sandbox.
-   SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC="900"
+   #
+   # This is a property of the platform, not a number to pick: it is how long
+   # something other than Brain leaves an unrefreshed sandbox alone. The gap is
+   #   (1 + D) * SANDBOX_KEEPALIVE_INTERVAL_SEC + (2 + D) * SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC
+   # where D is the deferral count the ceiling implies. With the shipped
+   # defaults (interval 60s, span 660s) and a ceiling within one sweep's
+   # capacity that is 1380s, so a 900s reclaim does not fit and Brain refuses,
+   # naming both numbers.
+   #
+   # 1800 works here and is deliberately conservative. Nothing outside Brain
+   # reclaims an idle sandbox any more: the control plane's idle GC is gone and
+   # no activity stamp is refreshed, so the only deadline Brain does not control
+   # is the workload's own timeout -- 24h by default
+   # (MULTI_NODE_DEFAULT_TIMEOUT_SECONDS / SANDBOX_DEFAULT_TIMEOUT_SECONDS).
+   # Brain's own idle reclaim is not this number: it runs on
+   # SANDBOX_IDLE_REUSE_SECONDS and is driven by EnvD's jobs roster, so a live
+   # background shell holds its sandbox regardless of when it was last pinged.
+   #
+   # Declare what the platform actually does, not what gets past the check. The
+   # proof is only worth the number: set it longer than the real reclaim and it
+   # establishes nothing, and the sandbox can be taken between two sweeps after
+   # all. Below the shipped span the span has to come down first, and it cannot
+   # go under a sweep's own worst case (`keepaliveSweepCeilingSec()`, 624s with
+   # the shipped retry bounds, of which 137s is one teardown: the stop's
+   # retries plus the dag-handle release and the multi-node cascade after it).
+   SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC="1800"
    # Only if PRE-4 applies.
    BASH_MAX_TIMEOUT_SEC=""
    ```

@@ -175,20 +175,22 @@ test("the verdict is on the handle, so another replica can read it", async (t) =
 
   t.mock.timers.tick(16 * 60_000);
 
-  // A different replica: same bucket, no memory of any of this, and a probe that
-  // would fail if it were reached at all. The decision has to come off the
-  // handle.
+  // A different replica: same bucket, no memory of any of this. It reconfirms at
+  // the destructive boundary -- nothing is destroyed on a reading taken sixteen
+  // minutes ago -- but it does not have to spend a sweep establishing the
+  // verdict first, which is what no replica ever got to finish.
   resetBackgroundWorkStateForTest();
+  let boundaryReads = 0;
   const other = {
     kv: k.kv,
-    countActiveShells: async () => { throw new Error("this replica cannot reach Hands"); },
+    countActiveShells: async () => { boundaryReads += 1; return 0; },
   };
   await sweep(other);
 
+  assert.equal(boundaryReads, 1, "one read, at the boundary, not one to open the window");
   assert.ok(
     k.deleted.includes(KEY),
-    "with the answer already on the handle the sweep can give the sandbox back on "
-      + "sight; needing its own probe first is what no replica ever got to finish",
+    "with the window already on the handle the sweep can give the sandbox back on sight",
   );
 });
 
@@ -222,15 +224,15 @@ function stubClearWork(): void {
   });
 }
 
-test("positive idle evidence reclaims a handle despite failed Hands probes and rotating sweeps", async (t) => {
+test("an empty roster reclaims a handle across rotating sweeps", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const k = fakeKv();
-  stubClearWork();
-  const deps = {
-    kv: k.kv,
-    countActiveShells: async () => { throw new Error("hands unreachable"); },
-  };
+  stubPingableProvider();
+  const deps = { kv: k.kv, countActiveShells: async () => 0 };
 
+  // Every other sweep walks elsewhere, which is most sweeps for most handles on
+  // a multi-replica Brain. The window is carried on the handle, so the sweeps
+  // that do see it are enough to finish it.
   for (let i = 0; i < 8 && !k.deleted.includes(KEY); i++) {
     await sweep(deps);
     k.setVisible(false);
@@ -239,7 +241,7 @@ test("positive idle evidence reclaims a handle despite failed Hands probes and r
     t.mock.timers.tick(3 * 60_000);
   }
 
-  assert.equal(k.current().bgRunning, 0, "the complete record read supplies positive idle evidence");
+  assert.equal(k.current().bgRunning, 0, "the roster read supplies the zero the window needs");
   assert.ok(k.deleted.includes(KEY), "observed idle work is reclaimed after the reuse window");
 });
 
@@ -1522,37 +1524,33 @@ test("a probe nothing can reserve is not asked at all", async () => {
   );
 });
 
-test("shared idle evidence survives a local cache expiring between visits", async (t) => {
+test("a shared zero survives a local cache expiring between visits", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const k = fakeKv();
-  stubClearWork();
-  const deps = {
-    kv: k.kv,
-    countActiveShells: async () => { throw new Error("hands unreachable"); },
-  };
+  stubPingableProvider();
+  const deps = { kv: k.kv, countActiveShells: async () => 0 };
   for (let visit = 0; visit < 5 && !k.deleted.includes(KEY); visit++) {
     await sweep(deps);
     t.mock.timers.tick(6 * 60_000);
   }
-  assert.ok(k.deleted.includes(KEY), "positive idle evidence permits eventual reclamation");
+  assert.ok(k.deleted.includes(KEY), "an empty roster, read again each visit, completes the window");
 });
 
-test("idle record evidence is revised when Hands returns with running work", async () => {
+test("an empty roster verdict is revised when a later read finds work", async () => {
   const k = fakeKv();
-  stubClearWork();
-  let reachable = false;
+  stubPingableProvider();
+  let busy = false;
   let probes = 0;
   const deps = {
     kv: k.kv,
     countActiveShells: async () => {
       probes += 1;
-      if (!reachable) throw new Error("hands unreachable");
-      return 1;
+      return busy ? 1 : 0;
     },
   };
   await sweep(deps);
   assert.equal(k.current().bgRunning, 0);
-  reachable = true;
+  busy = true;
   ageBackgroundWorkCacheForTest(6 * 60_000);
   await sweep(deps);
   assert.equal(probes, 2, "cached evidence must not prevent a later measurement");
@@ -1562,11 +1560,8 @@ test("idle record evidence is revised when Hands returns with running work", asy
 
 test("an evidence verdict is not reaped while a rotating sweep walks elsewhere", async () => {
   const k = fakeKv();
-  stubClearWork();
-  const deps = {
-    kv: k.kv,
-    countActiveShells: async () => { throw new Error("hands unreachable"); },
-  };
+  stubPingableProvider();
+  const deps = { kv: k.kv, countActiveShells: async () => 0 };
   await sweep(deps);
   assert.equal(k.current().bgRunning, 0);
   k.setVisible(false);
@@ -1575,20 +1570,17 @@ test("an evidence verdict is not reaped while a rotating sweep walks elsewhere",
   assert.equal(backgroundWorkStateSizesForTest().cache, 1);
 });
 
-test("a refresh can revise idle evidence before the reuse window ends", async () => {
+test("a refresh can revise an empty roster before the reuse window ends", async () => {
   const k = fakeKv();
-  stubClearWork();
-  let reachable = false;
+  stubPingableProvider();
+  let busy = false;
   const deps = {
     kv: k.kv,
-    countActiveShells: async () => {
-      if (!reachable) throw new Error("hands unreachable");
-      return 3;
-    },
+    countActiveShells: async () => (busy ? 3 : 0),
   };
   await sweep(deps);
   assert.equal(k.current().bgRunning, 0);
-  reachable = true;
+  busy = true;
   ageBackgroundWorkCacheForTest(6 * 60_000);
   await sweep(deps);
   assert.ok(!k.deleted.includes(KEY));
@@ -1616,73 +1608,77 @@ test("positive provider absence releases a gone identity without idle aging", as
       });
       const deps = { kv: k.kv, countActiveShells: async () => { throw new Error("unreachable"); } };
       await sweep(deps);
-      assert.ok(!k.deleted.includes(KEY), "the first sweep holds unknown until evidence arrives");
-      assert.ok(Date.now() - Number(k.current().idleSince) < 60_000);
+      // Nothing is torn down from inside the probe. What it conclusively learned
+      // is published, and the sweep that reads it back does the releasing -- so
+      // the run-lease and revision guards still front every teardown.
+      assert.ok(!k.deleted.includes(KEY));
+      if (state === "absent") {
+        assert.equal(k.current().terminalReason, undefined, "absence is not a session failure");
+      } else {
+        assert.equal(k.current().terminalReason, "sandbox_workload_terminal");
+      }
+
       await sweep(deps);
-      assert.equal(statusReads, 1);
-      assert.equal(workReads, 0, "positive absence does not require a container read");
       assert.ok(k.deleted.includes(KEY), "gone bypasses the ordinary idle reuse window");
+      assert.equal(workReads, 0, "a conclusive control-plane answer needs no container read");
+      // The count is not pinned: both the roster probe and the ping phase reach
+      // the control plane through this one read. What matters is that it was
+      // asked and that no container read followed.
+      assert.ok(statusReads >= 1, "the control plane is what answered");
     });
   }
 });
 
-test("a failed evidence read stays unknown even when provider running is false", async (t) => {
+test("a running flag the control plane cannot qualify stays unknown", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const k = fakeKv();
-  let reads = 0;
+  let statusReads = 0;
+  // Neither Running nor conclusively finished: `running: false` with no phase to
+  // name is exactly the answer that decides nothing.
   stubPingableProvider({
-    async get() { return { running: false, healthy: false }; },
-    async exec(_inst, command) {
-      if (!command.includes("epoch.json")) return { exitCode: 0, stdout: "", stderr: "" };
-      reads += 1;
-      return { exitCode: 1, stdout: CLEAR_WORK, stderr: "record read failed" };
-    },
+    async get() { statusReads += 1; return { running: false, healthy: false }; },
   });
-  const deps = { kv: k.kv, countActiveShells: async () => { throw new Error("unreachable"); } };
+  const deps = { kv: k.kv, countActiveShells: async () => 0 };
   await sweep(deps);
   t.mock.timers.tick(16 * 60_000);
   await sweep(deps);
-  assert.equal(reads, 2, "each failed Hands probe reaches the independent record reader");
-  assert.equal(k.current().bgRunning, undefined, "partial stdout is not a zero count");
-  assert.equal(k.current().idleSince, Date.now(), "unknown resets the idle clock");
-  assert.ok(!k.deleted.includes(KEY));
+  assert.ok(statusReads > 0, "the roster is not read until Running is confirmed");
+  assert.equal(k.current().bgRunning, undefined, "an unconfirmed sandbox yields no count");
+  assert.ok(!k.deleted.includes(KEY), "unknown must not authorise idle destroy");
 });
 
-test("evidence arriving after local reuse cannot publish idle or gone", async (t) => {
-  for (const channel of ["provider", "records"] as const) {
-    await t.test(channel, async () => {
-      resetBackgroundWorkStateForTest();
-      restoreProviders?.();
-      const k = fakeKv();
-      const pending = Promise.withResolvers<void>();
-      let reading = false;
-      stubPingableProvider({
-        async get() {
-          if (channel === "provider") {
-            reading = true;
-            await pending.promise;
-            return { running: false, healthy: false, state: "absent" };
-          }
-          return { running: true, healthy: true, state: "running" };
-        },
-        async exec(_inst, command) {
-          if (command.includes("epoch.json")) {
-            reading = true;
-            await pending.promise;
-          }
-          return { exitCode: 0, stdout: CLEAR_WORK, stderr: "" };
-        },
-      });
-      const deps = { kv: k.kv, countActiveShells: async () => { throw new Error("unreachable"); } };
-      await sweep(deps);
-      assert.ok(reading);
-      registerSandbox(SESSION, { provider: "safe-workload", workloadId: ENTRY.workloadId });
-      pending.resolve();
-      await new Promise((r) => setImmediate(r));
-      assert.equal(backgroundWorkStateSizesForTest().cache, 0);
-      assert.equal(k.current().bgRunning, undefined);
-      unregisterSandbox(SESSION);
-    });
+test("evidence arriving after local reuse cannot publish idle or gone", async () => {
+  const k = fakeKv();
+  const pending = Promise.withResolvers<void>();
+  let reading = false;
+  // Held on the roster read rather than the control-plane one: the sweep reaches
+  // the control plane on paths this case is not about, and the answer that must
+  // not be published once the handle is in use again is the conclusive one the
+  // roster read eventually raises.
+  const { SandboxTerminalProbeError } = await import("../src/sandbox/job-probe.js");
+  stubPingableProvider();
+  const deps = {
+    kv: k.kv,
+    countActiveShells: async () => {
+      reading = true;
+      await pending.promise;
+      throw new SandboxTerminalProbeError("absent", "sandbox_workload_absent");
+    },
+  };
+  try {
+    await sweep(deps);
+    assert.ok(reading);
+    registerSandbox(SESSION, { provider: "safe-workload", workloadId: ENTRY.workloadId });
+    pending.resolve();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(backgroundWorkStateSizesForTest().cache, 0);
+    assert.equal(k.current().bgRunning, undefined);
+    assert.ok(!k.deleted.includes(KEY), "a stale conclusion cannot release a handle in use");
+  } finally {
+    // Held open, this read is reached by every later sweep in the file.
+    pending.resolve();
+    unregisterSandbox(SESSION);
+    await new Promise((r) => setImmediate(r));
   }
 });
 
@@ -1761,26 +1757,18 @@ test("a failed refresh invalidates local and shared idle evidence immediately", 
   await sweep({ kv: k.kv, countActiveShells: async () => 0 });
   assert.equal(k.current().bgRunning, 0);
   t.mock.timers.tick(4 * 60_000);
-  const pendingEvidence = Promise.withResolvers<void>();
   restoreProviders?.();
+  // The control plane can no longer qualify the sandbox, so the refresh never
+  // reaches a roster and the zero it was refreshing stops being evidence.
   stubPingableProvider({
-    async get() {
-      await pendingEvidence.promise;
-      return { running: false, healthy: false, state: "unknown" };
-    },
+    async get() { return { running: false, healthy: false, state: "unknown" }; },
   });
   const deps = { kv: k.kv, countActiveShells: async () => { throw new Error("refresh failed"); } };
-  try {
-    await sweep(deps);
-    assert.equal(k.current().bgRunning, undefined, "the failed refresh invalidates the shared zero");
-    assert.equal(k.current().bgCheckedAt, undefined);
-    await sweep(deps);
-    assert.equal(k.current().idleSince, Date.now(), "the local zero cannot survive a failed refresh");
-    assert.ok(!k.deleted.includes(KEY));
-  } finally {
-    pendingEvidence.resolve();
-    await new Promise((r) => setImmediate(r));
-  }
+  await sweep(deps);
+  assert.equal(k.current().bgRunning, undefined, "the failed refresh invalidates the shared zero");
+  assert.equal(k.current().bgCheckedAt, undefined);
+  await sweep(deps);
+  assert.ok(!k.deleted.includes(KEY), "unknown after a failed refresh must not destroy");
   resetBackgroundWorkStateForTest();
   t.mock.timers.tick(16 * 60_000);
   await sweep(deps);

@@ -172,7 +172,6 @@ spec:
             - --max-concurrent-requests={{ .Values.router.config.maxConcurrentRequests }}
             - --gc-interval={{ .Values.workloadmanager.config.gcInterval }}
             - --default-ttl={{ .Values.workloadmanager.config.defaultTTL }}
-            - --session-timeout={{ .Values.controlplane.config.sessionTimeout }}
             - --leader-elect={{ ternary "true" "false" .Values.controlplane.config.leaderElect }}
             - --extensions={{ ternary "true" "false" .Values.controlplane.config.extensions }}
             - --namespace={{ .Release.Namespace }}

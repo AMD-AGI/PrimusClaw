@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"reflect"
+	"regexp"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -171,8 +172,8 @@ func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox
 	allErrors = errors.Join(allErrors, err)
 
 	// Reconcile Pod
-	pod, err := r.reconcilePod(ctx, sandbox, nameHash)
-	allErrors = errors.Join(allErrors, err)
+	pod, podErr := r.reconcilePod(ctx, sandbox, nameHash)
+	allErrors = errors.Join(allErrors, podErr)
 	if pod == nil {
 		sandbox.Status.Replicas = 0
 		sandbox.Status.LabelSelector = ""
@@ -188,8 +189,123 @@ func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox
 	// compute and set overall Ready condition
 	readyCondition := r.computeReadyCondition(sandbox, allErrors, svc, pod)
 	meta.SetStatusCondition(&sandbox.Status.Conditions, readyCondition)
+	// Only where the Pod's state was actually read. A Get that failed is not a
+	// Pod that is absent, and acting on it as one removes a terminal condition
+	// already published -- which is how a sandbox that failed stops saying so
+	// on one apiserver blip, and, where the Pod is gone for good, never says it
+	// again. Replicas 0 deletes the Pod on purpose, so its absence there says
+	// nothing about the outcome already published either.
+	scaledToZero := sandbox.Spec.Replicas != nil && *sandbox.Spec.Replicas == 0
+	if podErr == nil && !scaledToZero {
+		applyPodTerminalConditions(sandbox, pod)
+	}
 
 	return allErrors
+}
+
+// applyPodTerminalConditions records Succeeded/Failed from the Pod phase so
+// SaFE ResourceTemplate can map a finished codeinterpreter container to a
+// workload terminal phase. Ready stays False after the Pod leaves Running.
+func applyPodTerminalConditions(sandbox *sandboxv1alpha1.Sandbox, pod *corev1.Pod) {
+	if pod == nil {
+		meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionSucceeded))
+		meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed))
+		return
+	}
+	switch pod.Status.Phase {
+	case corev1.PodSucceeded:
+		meta.SetStatusCondition(&sandbox.Status.Conditions, metav1.Condition{
+			Type:               string(sandboxv1alpha1.SandboxConditionSucceeded),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: sandbox.Generation,
+			Reason:             sandboxv1alpha1.SandboxReasonPodSucceeded,
+			Message:            "Pod phase is Succeeded; EnvD exited 0 without an explicit Brain stop",
+		})
+		meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed))
+	case corev1.PodFailed:
+		reason, message := podFailureDetail(pod)
+		meta.SetStatusCondition(&sandbox.Status.Conditions, metav1.Condition{
+			Type:               string(sandboxv1alpha1.SandboxConditionFailed),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: sandbox.Generation,
+			Reason:             reason,
+			Message:            message,
+		})
+		meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionSucceeded))
+	default:
+		meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionSucceeded))
+		meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed))
+	}
+}
+
+// conditionReasonPattern is what the API server accepts in a condition reason.
+var conditionReasonPattern = regexp.MustCompile(`^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$`)
+
+// conditionReason holds a reason to what a status update can actually carry.
+//
+// The container runtime supplies the termination reason, and nothing about it
+// is bound to the API server's grammar: one space or hyphen in it and the
+// whole Status().Update() is rejected -- Ready and every other condition with
+// it -- leaving the controller to fail the same reconcile for ever. The
+// unusable text is not lost, only moved: the message below quotes it.
+func conditionReason(reason string) string {
+	if conditionReasonPattern.MatchString(reason) {
+		return reason
+	}
+	return sandboxv1alpha1.SandboxReasonPodFailed
+}
+
+// podFailureDetail preserves the container termination reason for SaFE and
+// Brain instead of reducing every sandbox crash to a generic PodFailed.
+//
+// The container that failed is the one that explains the Pod, and it is not
+// necessarily the first in the list: a sidecar that exited 0 stands ahead of
+// the OOMKilled sandbox in many Pods, and taking whichever came first reported
+// the crash as a clean exit. A zero-exit container is therefore only the
+// answer when nothing else terminated.
+func podFailureDetail(pod *corev1.Pod) (string, string) {
+	var clean *corev1.ContainerStatus
+	for i := range pod.Status.ContainerStatuses {
+		status := &pod.Status.ContainerStatuses[i]
+		terminated := status.State.Terminated
+		if terminated == nil {
+			continue
+		}
+		if terminated.ExitCode == 0 {
+			if clean == nil {
+				clean = status
+			}
+			continue
+		}
+		return terminatedDetail(status)
+	}
+	// Nothing in the Pod failed, yet the Pod did. Eviction and node pressure
+	// are decided about the Pod rather than about a container, and the Pod's
+	// own message is the only place that reason appears -- so it is preferred
+	// over a container that exited 0, which as a failure detail reports
+	// exitCode=0 and explains nothing.
+	if pod.Status.Message != "" {
+		return conditionReason(pod.Status.Reason), pod.Status.Message
+	}
+	if clean != nil {
+		return terminatedDetail(clean)
+	}
+	return sandboxv1alpha1.SandboxReasonPodFailed, "Pod phase is Failed"
+}
+
+// terminatedDetail renders one terminated container as a condition.
+func terminatedDetail(status *corev1.ContainerStatus) (string, string) {
+	terminated := status.State.Terminated
+	reason := terminated.Reason
+	if reason == "" {
+		reason = sandboxv1alpha1.SandboxReasonPodFailed
+	}
+	return conditionReason(reason), fmt.Sprintf(
+		"Container %s terminated: reason=%s exitCode=%d",
+		status.Name,
+		reason,
+		terminated.ExitCode,
+	)
 }
 
 func (r *SandboxReconciler) computeReadyCondition(sandbox *sandboxv1alpha1.Sandbox, err error, svc *corev1.Service, pod *corev1.Pod) metav1.Condition {

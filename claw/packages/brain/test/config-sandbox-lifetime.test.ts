@@ -14,8 +14,8 @@
  *
  * The sibling environments are next door, for the same reason they are in the
  * NATS_REPLICAS trio: a value config refuses is
- * config-sandbox-lifetime-refused.test.ts, and the deploy mode where one of
- * these settings does nothing is config-sandbox-lifetime-safe.test.ts.
+ * config-sandbox-lifetime-refused.test.ts, and the other deploy mode is
+ * config-sandbox-lifetime-safe.test.ts.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -42,7 +42,13 @@ test("a configured Go duration survives to both forms", () => {
   assert.equal(AGENT_SANDBOX_MAX_SESSION_SECONDS, 48 * 3600);
 });
 
-test("a value that parses is not also reported as a problem", () => {
+test("the idle knob is reported as inert, and the ceiling is not", () => {
+  // Both parse, so neither is refused -- but one of them no longer does
+  // anything in any deploy mode, and saying so is the whole reason it is still
+  // resolved rather than dropped. The ceiling must stay quiet: a notice that
+  // fired for both would train the reader to skip it.
   const problems = envSettingProblems().filter((p) => p.includes("AGENT_SANDBOX"));
-  assert.deepEqual(problems, [], `nothing to report, got: ${problems.join(" | ")}`);
+  assert.equal(problems.length, 1, `exactly one notice expected, got: ${problems.join(" | ")}`);
+  assert.match(problems[0]!, /^AGENT_SANDBOX_SESSION_TIMEOUT=90m/);
+  assert.doesNotMatch(problems[0]!, /not a positive Go duration/);
 });

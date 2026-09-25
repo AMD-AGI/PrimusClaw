@@ -208,6 +208,9 @@ test("a confirmed zero expires the handle, once a window has passed since it", a
   // Without moving the clock this reads as "kept", which is what an unanswered
   // stretch is supposed to look like.
   const { kv, deleted } = fakeKv();
+  // The roster is only read once the control plane confirms Running, and the
+  // reclaim stops the workload before it clears the record.
+  stubPingableProvider();
   let clock = Date.now();
   const deps = { kv, countActiveShells: async () => 0, now: () => clock };
 
@@ -290,22 +293,16 @@ test("a probe that never answers holds the handle at every streak length", async
   );
 });
 
-test("work that outlasts the reuse window still leaves a window behind it", async () => {
-  // The bug this pins: idleSince is stamped when the task ends, so a job that
-  // runs longer than the window means the handle is already expired the moment
-  // the job finishes -- deleted by the very next sweep, before the session can
-  // reuse the pod or read what the job wrote.
+test("work that outlasts the reuse window is held by a non-zero jobs count", async () => {
+  // Park stamp alone would make the handle look expired while work still runs.
+  // Destroy requires a sync count of zero, so a long job keeps the sandbox.
   const { kv, current } = fakeKv();
   stubPingableProvider();
 
   await sweepUntilProbed({ kv, countActiveShells: async () => 1 });
 
-  const idleSince = current().idleSince;
-  assert.equal(typeof idleSince, "number", "the idle clock was never moved while work ran");
-  assert.ok(
-    Date.now() - (idleSince as number) < 60_000,
-    `the stamp has to track the work, not the turn that started it; got ${idleSince}`,
-  );
+  assert.equal(current().idleSince, 0, "the period's identity stays put");
+  assert.equal(current().bgRunning, 1, "running work is recorded");
 });
 
 test("the probe is not repeated on every tick", async () => {
@@ -438,14 +435,15 @@ test("the ping fan-out is bounded too, not just the probes", async () => {
   let live = 0;
   const provider = {
     kind: "safe-workload",
-    async exec() {
+    // The ping is a control-plane status read, so that is where the fan-out is.
+    async get() {
       live += 1;
       peak = Math.max(peak, live);
       await new Promise((r) => setImmediate(r));
       live -= 1;
-      return { exitCode: 0, stdout: "", stderr: "" };
+      return { running: true, healthy: true };
     },
-    async get() { return { running: true, healthy: true }; },
+    async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
     async stop() {},
   } as unknown as SandboxProvider;
   restoreProviders = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
@@ -454,7 +452,12 @@ test("the ping fan-out is bounded too, not just the probes", async () => {
   await runKeepaliveTickForTest({ kv, countActiveShells: async () => 0 });
 
   assert.ok(peak > 0, "nothing was pinged at all");
-  assert.ok(peak <= 16, `${peak} pings were in flight at once`);
+  // Both phases reach the control plane through this one read, and they overlap:
+  // the probes a sweep dispatches are still in flight when the ping phase
+  // starts. Each is bounded on its own -- 8 probes, 16 pings -- so the ceiling
+  // the shared pool actually sees is the sum, and it is that sum that must not
+  // grow with the size of the fleet.
+  assert.ok(peak <= 24, `${peak} control-plane reads were in flight at once`);
 });
 
 test("a probe still in the air when a task takes the sandbox back is discarded", async () => {
@@ -503,11 +506,11 @@ test("a target's record is renewed before it waits its turn to be pinged", async
   let revisionAtPing: number | null = null;
   const provider = {
     kind: "safe-workload",
-    async exec() {
+    async get() {
       revisionAtPing = revision();
-      return { exitCode: 0, stdout: "", stderr: "" };
+      return { running: true, healthy: true };
     },
-    async get() { return { running: true, healthy: true }; },
+    async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
     async stop() {},
   } as unknown as SandboxProvider;
   restoreProviders = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
@@ -828,44 +831,26 @@ test("handing a handle back to the idle pool re-opens the question", async () =>
   assert.ok(asked > 0, "the handle going back into the pool must discard the old answer");
 });
 
-test("provider and record evidence stay within the asynchronous probe limit", async () => {
-  const status = Promise.withResolvers<void>();
-  const records = Promise.withResolvers<void>();
-  let statusReads = 0;
-  let recordReads = 0;
-  const provider = {
-    async get() {
-      statusReads += 1;
-      await status.promise;
-      return { running: true, healthy: true, state: "running" };
-    },
-    async exec(_inst: unknown, command: string) {
-      if (command.includes("epoch.json")) {
-        recordReads += 1;
-        await records.promise;
-      }
-      return { exitCode: 0, stdout: "", stderr: "" };
-    },
-  } as unknown as SandboxProvider;
-  restoreProviders = bindSandboxProviders({ safeWorkload: provider });
+test("outstanding roster reads stay within the asynchronous probe limit", async () => {
+  const outstanding = Promise.withResolvers<void>();
+  let reads = 0;
+  stubPingableProvider();
   const deps = {
     kv: manyIdleHandles(24),
-    countActiveShells: async () => { throw new Error("unreachable"); },
+    countActiveShells: async () => {
+      reads += 1;
+      await outstanding.promise;
+      return 0;
+    },
   };
   try {
     await runKeepaliveTickForTest(deps);
     await new Promise((r) => setImmediate(r));
-    assert.equal(statusReads, 8);
+    assert.equal(reads, 8, "more handles than slots must not all be asked at once");
     await runKeepaliveTickForTest(deps);
-    assert.equal(statusReads, 8, "waiting for provider status must keep the probe slots reserved");
-    status.resolve();
-    await new Promise((r) => setImmediate(r));
-    assert.equal(recordReads, 8);
-    await runKeepaliveTickForTest(deps);
-    assert.equal(statusReads, 8, "waiting for records must keep the same slots reserved");
+    assert.equal(reads, 8, "a read still outstanding keeps its slot reserved");
   } finally {
-    status.resolve();
-    records.resolve();
+    outstanding.resolve();
     await new Promise((r) => setImmediate(r));
   }
 });

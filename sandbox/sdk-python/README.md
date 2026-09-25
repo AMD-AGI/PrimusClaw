@@ -82,9 +82,9 @@ default so that a router behind a self-signed certificate works out of the box,
 and the package suppresses urllib3's warning about it at import time. Pass
 `verify_ssl=True` against any endpoint you did not provision yourself.
 
-**Sandboxes have an idle timeout.** The router reclaims a sandbox that goes
-quiet; `--session-timeout` on the CLI and the equivalent SDK argument adjust it
-within the platform's hard cap.
+**Sandboxes end at their max duration, not when they go quiet.** Nothing
+reclaims a sandbox for being idle. `maxSessionDuration` (default 24h) is what
+ends one, so size it for the work rather than relying on inactivity.
 
 **Egress from inside the sandbox is filtered.** When the platform enables the
 egress proxy, outbound traffic from your code reaches public endpoints but is

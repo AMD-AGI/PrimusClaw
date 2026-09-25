@@ -148,6 +148,7 @@ export function applyRunEndedIdleFields(
   // it. Two literal lists is one edit away from exactly that.
   for (const field of SHARED_VERDICT_FIELDS) delete info[field];
   delete info.workSeenAt;
+  delete info.quiescedAt;
 }
 
 /**

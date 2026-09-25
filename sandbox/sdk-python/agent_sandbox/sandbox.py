@@ -99,7 +99,7 @@ class Sandbox:
             verify_ssl: SSL certificate verification. Defaults to SANDBOX_VERIFY_SSL env var.
             overrides: Optional dict of safe parameter overrides:
                        - environment: dict of env vars to merge
-                       - sessionTimeout: idle timeout (e.g. "10m", no hard cap)
+                       - sessionTimeout: recorded on the Sandbox, not enforced
                        - maxSessionDuration: max lifetime (e.g. "4h"; default 24h, no hard cap)
                        - runtimeClassName: Pod runtime (e.g. "kata-qemu", non-WarmPool only)
                        - labels: dict of labels to merge

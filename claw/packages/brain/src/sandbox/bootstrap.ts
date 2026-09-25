@@ -25,10 +25,15 @@ import {
   WAIT_DEFAULT_SEC, HANDS_ENV_FILE_WAIT_SEC, HANDS_CHILD_ISOLATION_ENV,
 } from "../config.js";
 import { toolTimeoutCeilingSec } from "../tools/hands.js";
+import type { SandboxExecOptions } from "./provider.js";
 
 const logger = pino({ name: "sandbox-bootstrap" });
 
-export type SandboxExecFn = (cmd: string, timeout: string) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
+export type SandboxExecFn = (
+  cmd: string,
+  timeout: string,
+  opts?: SandboxExecOptions,
+) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
 
 /** One place the Hands binary might come from, and the command that tries it. */
 export interface HandsBinarySource {
@@ -334,7 +339,12 @@ export async function bootstrapHandsInSandbox(
    */
   env?: Record<string, string>,
 ): Promise<void> {
-  const mkdir = await execFn("mkdir -p /workspace && chmod 777 /workspace", "30s");
+  // Preparing the workspace is housekeeping, so it stays out of the job roster
+  // the same way the probes do. Counted as a user job it would make a sandbox
+  // look briefly busy on every restart, for a mkdir that has already returned.
+  const mkdir = await execFn(
+    "mkdir -p /workspace && chmod 777 /workspace", "30s", { untracked: true },
+  );
   if (mkdir.exitCode !== 0) {
     throw new Error(
       `bootstrap.mkdir_workspace exit_code=${mkdir.exitCode} stderr=${mkdir.stderr.slice(0, 300)}`,
@@ -355,8 +365,10 @@ export async function bootstrapHandsInSandbox(
       // consumed it. A source whose Hands read the file and then died would
       // otherwise leave that proof lying around for the next one, which would
       // start with nothing to read and be told it had passed.
+      // Housekeeping like the mkdir above: kept off the job roster so a probe
+      // landing on it does not reset the sandbox's idle window.
       if (envToPlace) {
-        const wrote = await execFn(writeEnvFileCmd(envToPlace), "30s");
+        const wrote = await execFn(writeEnvFileCmd(envToPlace), "30s", { untracked: true });
         if (wrote.exitCode !== 0) {
           // Fatal rather than degraded: a sandbox without the user's environment
           // fails later, further away, and looks like the user's own mistake.
@@ -365,7 +377,10 @@ export async function bootstrapHandsInSandbox(
           );
         }
       }
-      const r = await execFn(source.cmd, HANDS_BOOTSTRAP_START_TIMEOUT);
+      // Marked as the Hands start so EnvD accounts for the supervisor as
+      // infrastructure. Left to be inferred from the script, it would be
+      // counted as user work and hold the sandbox open past every idle window.
+      const r = await execFn(source.cmd, HANDS_BOOTSTRAP_START_TIMEOUT, { hands: true });
       if (r.exitCode === 0) {
         logger.info(
           { sessionId, source: source.name, stdout: r.stdout.slice(0, 200) },
@@ -384,7 +399,7 @@ export async function bootstrapHandsInSandbox(
     // write that failed after an earlier source had already placed it, an
     // exec-channel throw, no source working -- would otherwise leave the
     // caller's keys in /tmp until the pod's TTL.
-    if (envFile) await execFn(`rm -f ${envFile}`, "30s").catch(() => {});
+    if (envFile) await execFn(`rm -f ${envFile}`, "30s", { untracked: true }).catch(() => {});
   }
 
   // Naming every source that was tried, because the failure that matters is

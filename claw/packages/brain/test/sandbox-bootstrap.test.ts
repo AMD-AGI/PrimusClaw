@@ -21,6 +21,7 @@ import {
   HANDS_LOG_PATH, HANDS_STATE_DIR,
   inImageStartCmd, type SandboxExecFn,
 } from "../src/sandbox/bootstrap.js";
+import type { SandboxExecOptions } from "../src/sandbox/provider.js";
 import { CLAW_DEPLOY_ROOT, BRAIN_HTTP_URL } from "../src/config.js";
 
 const SESSION = "sess-bootstrap";
@@ -33,11 +34,13 @@ const fail = (stderr: string) => ({ exitCode: 1, stdout: "", stderr });
 /** Record every command the bootstrap runs, and reply from a scripted list. */
 function recorder(replies: Array<{ exitCode: number; stdout: string; stderr: string }>) {
   const cmds: string[] = [];
-  const exec: SandboxExecFn = async (cmd) => {
+  const opts: Array<SandboxExecOptions | undefined> = [];
+  const exec: SandboxExecFn = async (cmd, _timeout, o) => {
     cmds.push(cmd);
+    opts.push(o);
     return replies[cmds.length - 1] ?? ok;
   };
-  return { cmds, exec };
+  return { cmds, opts, exec };
 }
 
 /** The command that writes the env file, which precedes each source. */
@@ -95,6 +98,46 @@ test("an image carrying the binary starts from it and never reaches the download
   assert.equal(attempts.length, 1, "a source that worked must end the search");
   assert.match(attempts[0]!, /\/app\/hands-binary/);
   assert.ok(!attempts[0]!.includes("curl"), "no image that ships Hands should pay for a download");
+});
+
+/**
+ * EnvD has to tell the resident supervisor apart from user work: the
+ * supervisor's own process is infrastructure, and counting it as work would
+ * hold the sandbox open past every idle window. Brain is the side that knows
+ * which execute is the start, so it says so rather than leaving EnvD to read it
+ * out of a shell script that also mentions the binary in `test -x`, a download
+ * and an error message.
+ */
+test("the execute that starts Hands says so, and the surrounding steps do not", async () => {
+  const r = recorder([ok, ok, ok]);
+  await bootstrapHandsInSandbox(r.exec, SESSION, PORT, TOKEN, { HF_TOKEN: "x" });
+
+  const starts = r.cmds
+    .map((cmd, i) => ({ cmd, hands: r.opts[i]?.hands === true }))
+    .filter(({ cmd }) => !isEnvWrite(cmd) && !isEnvCleanup(cmd) && !cmd.startsWith("mkdir -p /workspace"));
+  assert.ok(starts.length > 0, "a bootstrap that starts nothing is not a bootstrap");
+  for (const { cmd, hands } of starts) {
+    assert.ok(hands, `the Hands start must be marked as such:\n${cmd}`);
+  }
+  for (const [i, cmd] of r.cmds.entries()) {
+    if (starts.some((s) => s.cmd === cmd)) continue;
+    assert.ok(!r.opts[i]?.hands,
+      `housekeeping must not claim to be the supervisor:\n${cmd}`);
+  }
+});
+
+test("the env handover stays off the job roster like the mkdir", async () => {
+  // Counted as user jobs, a probe landing on the write or the cleanup clears
+  // quiescedAt and restarts the sandbox's idle window.
+  const r = recorder([ok, ok, ok]);
+  await bootstrapHandsInSandbox(r.exec, SESSION, PORT, TOKEN, { HF_TOKEN: "x" });
+  const housekeeping = r.cmds
+    .map((cmd, i) => ({ cmd, untracked: r.opts[i]?.untracked === true }))
+    .filter(({ cmd }) => isEnvWrite(cmd) || isEnvCleanup(cmd));
+  assert.ok(housekeeping.length >= 2, "precondition: the file is written and removed");
+  for (const { cmd, untracked } of housekeeping) {
+    assert.ok(untracked, `env housekeeping must be untracked:\n${cmd}`);
+  }
 });
 
 test("an image without the binary falls through to the next source", async (t) => {

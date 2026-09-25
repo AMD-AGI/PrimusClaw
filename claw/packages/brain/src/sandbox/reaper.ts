@@ -31,7 +31,7 @@ import { reclaimIdleSessionClusters as realReclaimIdleSessionClusters }
 let reclaimClusters = realReclaimIdleSessionClusters;
 
 export function bindClusterReclaimForTest(
-  fn: (sessionId: string, apiKey: string) => Promise<number>,
+  fn: (sessionId: string, apiKey: string, messageId?: string) => Promise<number>,
 ): () => void {
   const prev = reclaimClusters;
   reclaimClusters = fn;
@@ -45,12 +45,13 @@ import {
   getHandsKv,
   revokeHandsToken,
   revokeSessionHandsToken,
-  sessionHasActiveRunLease,
+  readRunLeaseState,
 } from "./registry.js";
 import { isTombstone } from "../tasks/lock.js";
 import { SandboxStopUnavailable } from "./errors.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
-import { unregisterSandbox } from "./keepalive.js";
+import { pingTargetIdentity, unregisterSandbox } from "./keepalive.js";
+import { releaseAdmission } from "./admission.js";
 import {
   instanceFromEntry,
   parseHandsProbeValue,
@@ -147,6 +148,76 @@ export function releaseLocalHandsState(sessionId: string): void {
  */
 const STOP_ATTEMPTS = 3;
 const STOP_RETRY_DELAY_MS = 1_000;
+
+/**
+ * The deadline each attempt is handed, which both providers arm on their stop
+ * call. Stated here because the ceiling below is what other phases budget
+ * against, and a number living only inside the providers cannot be summed.
+ */
+const STOP_ATTEMPT_TIMEOUT_MS = 30_000;
+
+/**
+ * The longest the dag-handle release may hold a teardown.
+ *
+ * The scan inside it carries its own deadline; the conditional writes that
+ * follow, one per handle naming the workload, do not. Armed here so the term
+ * below bounds a wait this side actually enforces.
+ */
+const HANDLE_RELEASE_CEILING_MS = 15_000;
+
+/**
+ * The longest the multi-node cascade may hold a teardown.
+ *
+ * A messageId-scoped cascade is one DELETE, but the pre-messageId fallback
+ * pages the session's workloads and deletes them in turn, and page count times
+ * control-plane latency is not a number this file can state. Bounding the wait
+ * is what makes the term below true; the cascade is best-effort either way and
+ * the workload timeout stays behind it.
+ */
+const CLUSTER_CASCADE_CEILING_MS = 30_000;
+
+/**
+ * Fail the wait once the ceiling is spent, whatever the call is still doing.
+ *
+ * The call is not cancelled -- neither the handle store nor the control plane
+ * takes a signal here -- so what this bounds is the waiting, which is the cost
+ * the teardown's callers budget for.
+ */
+async function withCeiling<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+  // Claimed so the losing side cannot surface as an unhandled rejection after
+  // the race has already settled.
+  work.catch(() => {});
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${what} exceeded ${ms}ms`)), ms);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * The longest one `destroyHands` can take, retries and the waits between them
+ * included.
+ *
+ * Derived rather than written down: a hand-written ceiling named one attempt and
+ * so understated a teardown by the retry count, and every phase that budgets
+ * around a teardown inherited that error. The two awaits that follow the stop
+ * are terms for the same reason -- a teardown is not over when the workload
+ * stops, and a phase that budgets for the stop alone overruns by whatever the
+ * handle release and the cluster cascade take.
+ */
+export function handsStopCeilingMs(): number {
+  return STOP_ATTEMPTS * STOP_ATTEMPT_TIMEOUT_MS
+    + (STOP_ATTEMPTS - 1) * STOP_RETRY_DELAY_MS
+    + HANDLE_RELEASE_CEILING_MS
+    + CLUSTER_CASCADE_CEILING_MS;
+}
 
 /**
  * The bounds above, parameterised for the reason bootstrap's commands are: the
@@ -276,6 +347,18 @@ export async function destroyHands(
    * them. Callers with nothing to lose pass nothing and behave as before.
    */
   stillOwned?: () => boolean,
+  /**
+   * The message this teardown is being run on behalf of, where there is one.
+   *
+   * A multi-node cluster is named by the message that created it, and a
+   * redelivery of that same message adopts the cluster rather than building a
+   * new one -- so when a replacement is being built FOR that message, the
+   * cluster the handle names is the one the replacement is about to be wired
+   * to. Cascading there deletes it out from under the run. Callers replacing a
+   * sandbox pass the message in flight; callers whose message is over (idle
+   * reclaim, session delete) pass nothing and cascade as before.
+   */
+  opts?: { activeMessageId?: string },
 ): Promise<void> {
   const kv = getHandsKv();
   const recorded = await readHandsEntry(sessionId);
@@ -325,12 +408,62 @@ export async function destroyHands(
       ? (target as { workloadId?: string }).workloadId
       : undefined;
     if (stoppedWorkload) {
-      await releaseHandlesForWorkload(stoppedWorkload).catch((e: unknown) => {
+      await withCeiling(
+        releaseHandlesForWorkload(stoppedWorkload),
+        HANDLE_RELEASE_CEILING_MS,
+        "dag-handle release",
+      ).catch((e: unknown) => {
         logger.warn(
           { sessionId, workloadId: stoppedWorkload, err: (e as Error)?.message ?? String(e) },
           "dag-handles.release_after_stop_failed",
         );
       });
+    }
+    // Multi-node GPU clusters follow the sandbox once this generation's stop
+    // is finished or abandoned. Scope DELETE to messageId so a successor
+    // ensure() under the same session is not swept. Include `unavailable`:
+    // teardown still drops the hands pointer, and without cascade the cluster
+    // would wait on workload timeout alone. Best-effort -- timeout remains the
+    // hard backstop when SaFE itself cannot be reached.
+    //
+    // A handle with no messageId cascades nothing. Session-scoped reclaim is
+    // the only other thing this could do, and it deletes every non-terminal
+    // cluster the session has -- including one a successor message created
+    // while this teardown was in flight, which is the case the scoping exists
+    // to prevent. Handles written before the field carry no cluster this can
+    // safely name, and their clusters are left to the workload timeout.
+    if (stopOutcome === "stopped" || stopOutcome === "unavailable") {
+      const platformKey = String(
+        (target as { platformKey?: string }).platformKey
+          ?? (ownsRecorded ? recorded.identity?.platformKey : "")
+          ?? "",
+      );
+      const messageId = String(
+        (target as { messageId?: string }).messageId
+          ?? (ownsRecorded ? recorded.identity?.messageId : "")
+          ?? "",
+      ).trim();
+      const activeMessageId = (opts?.activeMessageId ?? "").trim();
+      if (messageId && messageId === activeMessageId) {
+        // The message that owns this cluster is the one running now: this is a
+        // replacement being built for it, not the end of it. Its cluster has
+        // already been adopted by the run that is about to use it.
+        logger.info(
+          { sessionId, messageId },
+          "mn.cascade_skipped_for_message_in_flight",
+        );
+      } else if (platformKey && messageId) {
+        await withCeiling(
+          reclaimClusters(sessionId, platformKey, messageId),
+          CLUSTER_CASCADE_CEILING_MS,
+          "mn cluster cascade",
+        ).catch((e: unknown) => {
+          logger.warn(
+            { sessionId, messageId, err: (e as Error)?.message ?? String(e) },
+            "mn.cascade_after_sandbox_stop_failed",
+          );
+        });
+      }
     }
   } catch (cause) {
     // Counted before the rethrow: the caller turns this into a replacement
@@ -352,7 +485,20 @@ export async function destroyHands(
   // Scoped local cleanup: never revoke a sibling's token or remove a
   // registration that replaced this one while stop was in flight.
   revokeHandsToken(knownToken || (ownsRecorded ? recorded.identity?.token || "" : ""));
-  unregisterSandbox(sessionId, target);
+  // The slot is held past the stop and given back below, with the record that
+  // names it. A binding still in the bucket under this identity is a target the
+  // next sweep reconciles back in, so a ceiling passed on before the delete
+  // lands admits over itself. Where the record names some other sandbox there
+  // is no such reconcile, and the slot has to be given back explicitly or it is
+  // counted against the ceiling for a workload that is already stopped.
+  unregisterSandbox(sessionId, target, { releaseSlot: false });
+
+  const releaseSlot = async (): Promise<void> => {
+    const identity = pingTargetIdentity(target);
+    if (!await releaseAdmission(identity)) {
+      logger.error({ sessionId, identity }, "sandbox.destroy.admission_release_unconfirmed");
+    }
+  };
 
   if (!ownsRecorded || recorded.revision === undefined) {
     logger.warn(
@@ -364,23 +510,35 @@ export async function destroyHands(
       },
       "sandbox.destroy.left_session_entry",
     );
+    // The record names another sandbox, so no sweep will reconcile this
+    // identity back onto the roster.
+    await releaseSlot();
     return;
   }
 
   const deleted = await deleteHandsEntryIfRevision(kv, key, recorded.revision);
-  if (deleted) return;
+  if (deleted) {
+    await releaseSlot();
+    return;
+  }
 
   // A keepalive TTL refresh changes the revision without changing ownership.
   // Retry that benign race, but never delete a replacement sibling.
   const latest = await readHandsEntry(sessionId);
-  if (latest.state === "missing") return;
+  if (latest.state === "missing") {
+    await releaseSlot();
+    return;
+  }
   if (
     latest.state === "valid"
     && latest.identity
     && latest.revision !== undefined
     && sameHandsSandbox(target, latest.identity)
   ) {
-    if (await deleteHandsEntryIfRevision(kv, latest.key ?? key, latest.revision)) return;
+    if (await deleteHandsEntryIfRevision(kv, latest.key ?? key, latest.revision)) {
+      await releaseSlot();
+      return;
+    }
     // Losing twice means the key is being written faster than we can clear
     // it -- but the workload is already stopped, which is the part callers
     // build a replacement on top of. Throwing here fails a user request over
@@ -390,15 +548,27 @@ export async function destroyHands(
       { sessionId, workloadId: target.workloadId || target.sandboxName },
       "sandbox.destroy.entry_left_after_stop",
     );
+    // The slot stays out: a binding still in the bucket under this identity is
+    // a target the next sweep reconciles back in, and a ceiling handed on
+    // before the record goes admits over itself. Reconciliation is what gives
+    // the slot back, once the record it is derived from is gone.
     return;
   }
   if (latest.state === "valid") {
     logger.warn({ sessionId, revision: recorded.revision }, "sandbox.destroy.kv_owner_changed");
+    // Same as above: the key belongs to a different sandbox now, so this
+    // identity is not coming back through a reconcile.
+    await releaseSlot();
     return;
   }
   // Unreadable is different from contended: the stop is confirmed, but we
   // cannot see whose entry this is, so clearing it might remove a sibling's.
   // Refusing keeps the caller from building over a record it cannot vouch for.
+  // The slot does return here, unlike the branch above: there the record was
+  // read and still named this identity, so a sweep brings it back and the
+  // ceiling is not lost. Nothing here can be read, so nothing will reconcile,
+  // and a slot kept would stay charged to a stopped workload until the horizon.
+  await releaseSlot();
   throw new Error("hands KV unavailable after confirmed sandbox stop");
 }
 
@@ -591,34 +761,6 @@ const SWEEPER_INTERVAL_MS = 5 * 60 * 1000;
 const SWEEPER_HEALTH_TIMEOUT_MS = 3_000;
 // Evict threshold now comes from config (SANDBOX_SWEEPER_EVICT_AFTER_FAILURES);
 // <=0 disables sweeper-driven eviction entirely.
-
-/**
- * Whether anyone still holds the run lease at `scope` -- and, separately,
- * whether we could find out.
- *
- * `sessionHasActiveRunLease` is the same read and the same tombstone rule; what
- * it does not have is the third answer. It collapses an unreadable bucket into
- * `false`, and `false` is not inert at its callers: the multi-node sweep
- * (`mn_sweeper`, below) reads it as licence and goes on to `reclaimClusters`,
- * which deletes the user's cluster and cannot be undone by a later pass. That
- * is a hazard in the existing helper rather than something introduced here, and
- * it is the reason this function was added instead of reusing it: the pending
- * collector would inherit the same collapse, and a stop issued against a live
- * sandbox because a KV read timed out has nothing after it to retry. "The store
- * did not answer" has to stay distinguishable from "nobody is running".
- */
-async function readRunLeaseState(kv: KV, scope: string): Promise<"held" | "free" | "unknown"> {
-  let lock;
-  try {
-    lock = await kv.get(`lock.${scope}`);
-  } catch (err) {
-    logger.warn({ err, scope }, "sweeper.lease_read_failed");
-    return "unknown";
-  }
-  // A released lease is deleted, and a delete leaves a readable entry with an
-  // empty value -- so presence alone reads every finished run as a running one.
-  return lock && !isTombstone(lock) ? "held" : "free";
-}
 
 /**
  * Is the walked entry still, byte for byte, the one the decision was taken on?
@@ -919,12 +1061,8 @@ async function sweepStaleHands(): Promise<void> {
           );
           continue;
         }
-        //
-        // And an unreadable bucket is not an absent lease either, which is the
-        // one place this cannot simply call `sessionHasActiveRunLease`: that
-        // one folds a failed read into `false`, which is harmless where it is
-        // used today (a skipped cluster reclaim, retried next pass) and is a
-        // licence to stop a live sandbox here.
+        // And an unreadable bucket is not an absent lease either: readRunLeaseState
+        // keeps "unknown" distinct so a KV blip cannot licence a stop.
         const lease = await readRunLeaseState(kv, info.runScope);
         if (lease !== "free") {
           if (lease === "unknown") {
@@ -990,41 +1128,27 @@ export function startSandboxSweeper(): void {
 }
 
 /**
- * May this session's GPU clusters be reclaimed now?
+ * May this session's GPU clusters be reclaimed by the orphan sweeper?
  *
- * `keepalive === false` comes first and is never waived: it is the only signal
- * that no task is running, and it covers DAG-rooted tasks that the session-keyed
- * task lock misses.
- *
- * Past that there are two kinds of idle and only one waits. A live session
- * between messages waits out MULTI_NODE_IDLE_RECLAIM_MS, so its cluster is still
- * warm when the next message arrives. A handle parked by a session delete skips
- * it: there is no next message to keep anything warm for, so waiting only delays
- * the GPUs going back. See parkHandsHandle for the two configurations where that
- * exemption is load-bearing rather than merely faster.
+ * `keepalive === false` is required. Idle sandbox reclaim owns lifetime;
+ * clusters for ordinary idle parks are torn down in destroyHands after the
+ * sandbox stops. This sweeper only covers session-delete parks, where there is
+ * no next message and waiting on the sandbox idle window would only delay GPUs.
  */
 export function eligibleForClusterReclaim(
   info: {
     keepalive?: unknown;
     sessionDeleted?: unknown;
-    idleSince?: unknown;
-    workSeenAt?: unknown;
   },
-  now: number,
+  _now: number,
 ): boolean {
   if (info.keepalive !== false) return false;
-  if (info.sessionDeleted === true) return true;
-  const idleSince = typeof info.idleSince === "number" ? info.idleSince : 0;
-  const workSeenAt = typeof info.workSeenAt === "number" ? info.workSeenAt : 0;
-  // Keep this reuse window aligned with keepalive.ts: observed work extends it.
-  const reuseWindowStart = Math.max(idleSince, workSeenAt);
-  return reuseWindowStart > 0 && now - reuseWindowStart >= MULTI_NODE_IDLE_RECLAIM_MS;
+  return info.sessionDeleted === true;
 }
 
 /**
- * Periodic multi-node sweeper: reclaim the GPU clusters of sessions whose sandbox
- * has gone idle, and of sessions deleted without a confirmed teardown.
- * eligibleForClusterReclaim above decides which entries qualify.
+ * Periodic multi-node sweeper: reclaim GPU clusters left after a session delete.
+ * Ordinary idle parks cascade from destroyHands instead.
  *
  * Only reaches sessions that still hold a `hands.*` entry, since the SaFE key it
  * needs to delete a workload lives there. A cluster whose entry has already
@@ -1061,7 +1185,9 @@ async function sweepIdleMultiNodeClusters(): Promise<void> {
       // `idleSince` on a sandbox a turn is actively running in, and that is
       // exactly the shape this function reads as its licence. What it does
       // next is delete the user's cluster, which no later pass can undo.
-      if (await sessionHasActiveRunLease(kv, sessionId, info.runScope)) {
+      const leaseScope = typeof info.runScope === "string" && info.runScope
+        ? info.runScope : sessionId;
+      if ((await readRunLeaseState(kv, leaseScope)) !== "free") {
         logger.info({ sessionId }, "mn_sweeper.skipped_run_in_flight");
         continue;
       }
@@ -1114,8 +1240,8 @@ export function startMultiNodeSweeper(): void {
  * let the nets that already exist catch it: sweepIdleMultiNodeClusters above
  * walks `hands.*` and reclaims a deleted session's clusters on its next pass,
  * without the idle window a live session would have to sit through. The pod goes
- * with it, from the other direction -- `keepalive: false` stops the ticker
- * pinging it, so the control-plane's own sandbox idle-GC stops being suppressed.
+ * with it from the other direction: `keepalive: false` stops the ticker pinging
+ * it, and Brain idle reclaim (or the workload hard TTL) tears the sandbox down.
  *
  * Deliberately does not retry on conflict or error. Losing this hand-off costs
  * the sweeper's path, not the reclamation itself: the workload's own timeout

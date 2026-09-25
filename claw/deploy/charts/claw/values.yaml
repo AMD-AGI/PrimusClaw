@@ -352,6 +352,9 @@ secret:
   # Max time a sandbox may stay Pending/Creating before the message fails with
   # reason sandbox_pending_timeout. 0 = wait forever. Default 3h.
   sandboxPendingTimeoutSeconds: "10800"
+  # How long a Running sandbox with an empty GET /api/jobs roster stays up
+  # before Brain idle-reclaims it. Default 15 minutes.
+  sandboxIdleReuseSeconds: "900"
   multiNodeDefaultTimeoutSeconds: "86400"
   llmApiStyle: anthropic
   # Prompt caching. `llmCacheStyle` only means anything when llmApiStyle is
@@ -611,6 +614,10 @@ features:
   # before it is served. Size the ceiling to the deployment's real fleet: too
   # low refuses new sandboxes, too high means the refresh gap was proven at a
   # number the fleet exceeds.
+  #
+  # Keep it at or below one sweep's ping capacity (160 in this build): at or
+  # under it a handle waits no deferrals, past it the refresh gap grows by a
+  # whole sweep and a deadline that was accepted stops being accepted.
   keepaliveTargetCeiling: ""
   keepaliveReconcileReserve: ""
   # The shortest idle reclaim in force on this deployment, in seconds. Brain

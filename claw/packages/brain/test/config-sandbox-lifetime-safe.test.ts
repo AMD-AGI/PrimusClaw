@@ -11,6 +11,12 @@
  * meaning per deploy mode. It stays unwired, and the cost of that decision is
  * paid here: a setting that does nothing says so at startup.
  *
+ * Not a property of this mode any more, and kept here anyway: the annotation
+ * it lands on in kubernetes mode had one reader, the control plane's sandbox
+ * idle GC, and that is gone. The notice now fires in both modes -- see
+ * config-sandbox-lifetime.test.ts for the other one -- and this file holds the
+ * half of it that also proves the ceiling still reaches the workload.
+ *
  * The ceiling does apply on this path, so it must NOT be reported -- a notice
  * that fires for both would train the reader to skip it.
  *

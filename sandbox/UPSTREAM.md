@@ -40,7 +40,7 @@ boilerplate comes from the Kubernetes code generators, which emit that header.
 | `api/`, `controllers/`, `internal/` | most | few | Core `Sandbox` CRD and reconcilers, largely upstream |
 | `extensions/` | most | few | `SandboxTemplate` / `SandboxClaim` / `SandboxWarmPool` |
 | `client-go/` | all | — | Generated clients; the generator emits the upstream header even for AMD-defined types |
-| `manifests/` | most | `rbac/` | `rbac/agentd.yaml` and `rbac/workload-manager.yaml` cover AMD components and have no upstream counterpart |
+| `manifests/` | most | `rbac/` | `rbac/workload-manager.yaml` covers AMD components and has no upstream counterpart |
 | `test/` | all | — | Upstream e2e suites (now behind the `e2e` build tag) |
 | `pkg/` | majority | substantial | Upstream primitives plus the AMD additions below |
 | `cmd/` | some | majority | `cmd/controlplane` is the AMD unified control plane |
@@ -60,8 +60,7 @@ The significant AMD additions are:
   DNS-rebinding protection.
 - **`pkg/policy`** — embedded OPA policy engine and the `ClusterSandboxPolicy`
   presets.
-- **`pkg/agentd`, `pkg/store`, `pkg/audit`** — session runtime, Redis-backed
-  state, audit trail.
+- **`pkg/store`, `pkg/audit`** — Redis-backed session state and the audit trail.
 - **AMD GPU support** (`amd.com/gpu` resources, MI300X / MI325X / MI355X) and
   the Kata Containers runtime path.
 - **`deploy/`** — the entire deployment surface.

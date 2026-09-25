@@ -66,14 +66,78 @@ test("terminated is a conclusive workload phase", async () => {
 
   assert.deepEqual(
     await new SafeWorkloadProvider().get(INSTANCE),
-    { running: false, healthy: false, state: "terminal" },
+    {
+      running: false,
+      healthy: false,
+      state: "terminal",
+      reason: "sandbox_workload_terminal",
+    },
   );
+});
+
+test("a transient exec 5xx does not look up the Workload API", async () => {
+  let calls = 0;
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    calls += 1;
+    const url = String(input);
+    if (url.includes("/api/v1/workloads/")) {
+      return { ok: true, status: 200, json: async () => ({ phase: "Running" }) } as Response;
+    }
+    return { ok: false, status: 502, text: async () => "bad gateway" } as Response;
+  }) as typeof globalThis.fetch;
+
+  await assert.rejects(
+    () => new SafeWorkloadProvider().exec(INSTANCE, "true", "1s"),
+    /HTTP 502/,
+  );
+  assert.equal(calls, 1);
+});
+
+test("multi-node SSH key materialisation is untracked", async () => {
+  // Provision writing the cluster key without untracked counted as a user job
+  // and raced the first jobs probe into a false running verdict.
+  const src = await import("node:fs/promises")
+    .then((fs) => fs.readFile(new URL("../src/sandbox/ensure-hands.ts", import.meta.url), "utf8"));
+  const at = src.indexOf("writeSandboxSshKey(");
+  assert.ok(at >= 0, "writeSandboxSshKey is still called from ensureHands");
+  const call = src.slice(at, at + 220);
+  assert.match(call, /untracked:\s*true/,
+    "SSH key write must not occupy the jobs roster");
+});
+
+test("keepalive-style untracked exec is sent on the execute body", async () => {
+  let body = "";
+  globalThis.fetch = (async (_input, init) => {
+    body = String(init?.body ?? "");
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ exit_code: 0, stdout: "", stderr: "" }),
+    } as Response;
+  }) as typeof globalThis.fetch;
+
+  await new SafeWorkloadProvider().exec(INSTANCE, "true", "1s", undefined, { untracked: true });
+  assert.match(body, /"untracked":true/);
 });
 
 test("the shipped chart does not opt every sandbox into automatic eviction", async () => {
   const values = await import("node:fs/promises")
     .then((fs) => fs.readFile(new URL("../../../deploy/charts/claw/values.yaml", import.meta.url), "utf8"));
   assert.match(values, /sandboxKeepaliveFailLimit:\s*"0"/);
+});
+
+test("controlplane accepts enable-idle-gc as a no-op, like session-timeout", async () => {
+  // Manifests from this PR's earlier revisions still pass --enable-idle-gc=false.
+  // An unknown flag ends flag.Parse in os.Exit(2) before any listener starts.
+  const src = await import("node:fs/promises")
+    .then((fs) => fs.readFile(
+      new URL("../../../../sandbox/cmd/controlplane/main.go", import.meta.url),
+      "utf8",
+    ));
+  assert.match(src, /flag\.BoolVar\(&deprecatedEnableIdleGC, "enable-idle-gc"/);
+  assert.match(src, /WARNING: enable-idle-gc is ignored/);
+  assert.doesNotMatch(src, /agentd\.SandboxReconciler|sandbox-idle-gc-controller/);
+  assert.match(src, /Sandbox idle-GC is not wired/);
 });
 
 test("a downgraded callback body caps failure_reason too", async () => {

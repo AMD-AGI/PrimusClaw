@@ -61,12 +61,27 @@ export interface SandboxStatus {
   podIp?: string;
   /** Whether the provider could distinguish absence from a control-plane error. */
   state?: "running" | "terminal" | "absent" | "unknown";
+  /** Stable reason when state is terminal. */
+  reason?: string;
 }
 
 export interface SandboxExecResult {
   exitCode: number;
   stdout: string;
   stderr: string;
+}
+
+/** Options for a provider exec. */
+export interface SandboxExecOptions {
+  /** When true, EnvD does not register this execute as a user job. */
+  untracked?: boolean;
+  /**
+   * When true, this execute starts the resident Hands supervisor, so EnvD
+   * accounts for the descendants it spawns rather than counting the supervisor
+   * itself as user work. Stated here because the caller knows what it is
+   * starting; EnvD can otherwise only guess from the shell script it receives.
+   */
+  hands?: boolean;
 }
 
 /**
@@ -97,6 +112,7 @@ export interface SandboxProvider {
     command: string,
     timeout: string,
     signal?: AbortSignal,
+    opts?: SandboxExecOptions,
   ): Promise<SandboxExecResult>;
   stop(inst: SandboxInstance): Promise<void>;
 }

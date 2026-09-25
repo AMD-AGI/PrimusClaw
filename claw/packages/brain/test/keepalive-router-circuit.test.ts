@@ -31,6 +31,8 @@ test("simultaneous gone responses open the circuit instead of stopping every san
   let stops = 0;
   const provider = {
     kind: "safe-workload",
+    // The ping asks the control plane, and a workload it cannot find is gone.
+    async get() { return { running: false, healthy: false, state: "absent" }; },
     async exec() { throw new SandboxGoneError("router and workload lookup returned 404"); },
     async stop() { stops++; },
   } as unknown as SandboxProvider;
@@ -71,23 +73,50 @@ test("a single gone response reaches the verdict and jumps the counter", async (
   // KV bucket, so a unit test cannot watch it -- which is also why the circuit
   // test above would pass even if nothing were ever adjudicated.
   const { lastVerdictForTest } = await import("../src/sandbox/keepalive.js") as any;
-  let execs = 0;
+  let asked = 0;
   const provider = {
     kind: "safe-workload",
-    async exec() { execs++; throw new SandboxGoneError("workload absent (HTTP 404)"); },
+    async get() { asked++; return { running: false, healthy: false, state: "absent" }; },
+    async exec() { throw new SandboxGoneError("workload absent (HTTP 404)"); },
     async stop() {},
   } as unknown as SandboxProvider;
   const restore = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
   registerSandbox("s-solo", { provider: "safe-workload", workloadId: "wl-solo", platformKey: "pk" });
   try {
     await runKeepaliveTickForTest({ kv: emptyKv() });
-    assert.ok(execs > 0, `precondition: the sandbox was pinged (execs=${execs})`);
+    assert.ok(asked > 0, `precondition: the sandbox was pinged (asked=${asked})`);
     const v = lastVerdictForTest("wl-solo");
     assert.ok(v, "the failure must reach the verdict at all");
     assert.equal(v.gone, true, "a lone gone is not suppressed");
     assert.equal(v.fails, 1, "and jumps straight to the limit");
   } finally {
     unregisterSandbox("s-solo");
+    restore();
+  }
+});
+
+test("an unknown agent-sandbox state does not count as a keepalive failure", async () => {
+  const { lastVerdictForTest } = await import("../src/sandbox/keepalive.js") as {
+    lastVerdictForTest: (part: string) => { fails: number; gone: boolean } | null;
+  };
+  const provider = {
+    kind: "agent-sandbox",
+    async get() { return { running: false, healthy: false, state: "unknown" }; },
+    async exec() { throw new Error("exec must not run for agent-sandbox ping"); },
+    async stop() {},
+  } as unknown as SandboxProvider;
+  const restore = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
+  registerSandbox("s-unknown", {
+    provider: "agent-sandbox",
+    sessionId: "s-unknown",
+    sandboxName: "sbx",
+    namespace: "ns",
+  });
+  try {
+    await runKeepaliveTickForTest({ kv: emptyKv() });
+    assert.equal(lastVerdictForTest("s-unknown"), null);
+  } finally {
+    unregisterSandbox("s-unknown");
     restore();
   }
 });

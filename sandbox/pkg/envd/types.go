@@ -14,6 +14,13 @@ type ExecuteRequest struct {
 	Timeout    string            `json:"timeout,omitempty"` // e.g. "60s"
 	WorkingDir string            `json:"working_dir,omitempty"`
 	Env        map[string]string `json:"env,omitempty"`
+	// Hands marks the execute that starts the resident Hands supervisor, whose
+	// own process is infrastructure rather than user work. Set by the caller,
+	// which knows what it is starting; EnvD otherwise has to infer it from the
+	// shell script it is handed.
+	Hands bool `json:"hands,omitempty"`
+	// Untracked omits this execute from GET /api/jobs user-process accounting.
+	Untracked bool `json:"untracked,omitempty"`
 }
 
 // ExecuteResponse is the result of a synchronous execution.
@@ -100,6 +107,25 @@ type GPUDevice struct {
 	MemoryUsed  string `json:"memory_used"`
 	Utilization int    `json:"utilization"`
 	Temperature int    `json:"temperature"`
+}
+
+// JobsResponse is the response from GET /api/jobs.
+type JobsResponse struct {
+	// UserProcesses is true when any tracked execute still has a live user PID,
+	// and when tracking was lost: an unaccountable roster is not an empty one.
+	UserProcesses    bool   `json:"user_processes"`
+	UserProcessCount int    `json:"user_process_count"`
+	TrackingLost     bool   `json:"tracking_lost"`
+	PodUID           string `json:"pod_uid,omitempty"`
+	InstanceID       string `json:"instance_id"`
+}
+
+// JobsPurgeResponse is the response from DELETE /api/jobs.
+type JobsPurgeResponse struct {
+	// Requested is how many tracked user jobs were on the roster.
+	Requested int `json:"requested"`
+	// Purged is how many of them were asked to end.
+	Purged int `json:"purged"`
 }
 
 // GPUStatusResponse is the response from GET /api/gpu/status.

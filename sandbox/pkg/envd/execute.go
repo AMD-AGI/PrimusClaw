@@ -6,12 +6,12 @@ package envd
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
+	"sync"
 	"syscall"
 	"time"
 
@@ -76,40 +76,56 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 		workDir = abs
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), timeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, req.Command[0], req.Command[1:]...)
-	cmd.Dir = workDir
-	cmd.Env = s.buildChildEnv(req.Env)
-	stripEnvDProxyGroup(cmd)
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	var stdout, stderr synchronizedBuffer
 
 	startTime := time.Now()
-	err := cmd.Run()
+	_, exitCh, drained, stop, err := s.startTrackedCommand(
+		req.Command, workDir, s.buildChildEnv(req.Env), &stdout, &stderr,
+		jobTracking{track: !req.Untracked, hands: handsExecute(&req)},
+	)
+	exitCode := 0
+	timedOut := false
+	if err == nil {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		select {
+		case exitCode = <-exitCh:
+		case <-timer.C:
+			exitCode = finalizeTimedOutCommand(exitCh, stop)
+			timedOut = true
+		case <-r.Context().Done():
+			// HTTP cancellation does not stop the tracked tree, but the
+			// response no longer owns these buffers. Close them so a
+			// detached descendant cannot grow heap until OOMKill.
+			// The request timeout still applies: abandon the response, keep
+			// waiting so a disconnect cannot leave an unbounded process tree.
+			_ = stdout.take()
+			_ = stderr.take()
+			awaitTrackedExit(exitCh, timer, stop)
+			return
+		}
+		awaitOutputQuiet(drained, func() time.Time {
+			out, errOut := stdout.lastWrite(), stderr.lastWrite()
+			if errOut.After(out) {
+				return errOut
+			}
+			return out
+		})
+		// After the drain, so callers reading the tail of stderr find it last.
+		if timedOut {
+			stderr.appendString(fmt.Sprintf("command timed out after %s", timeout))
+		}
+	}
 	endTime := time.Now()
 
-	exitCode := 0
 	if err != nil {
-		// Check context timeout FIRST — exec.CommandContext kills the process and
-		// returns *exec.ExitError(-1), so ctx.Err() must be checked before ExitError.
-		// Use exit code 124 — GNU timeout standard.
-		if ctx.Err() != nil {
-			exitCode = 124
-			stderr.WriteString(fmt.Sprintf("command timed out after %s", timeout))
-		} else if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			exitCode = 1
-		}
+		exitCode = 1
+		stderr.appendString(err.Error())
 	}
 
 	resp := ExecuteResponse{
-		Stdout:    stdout.String(),
-		Stderr:    stderr.String(),
+		Stdout:    stdout.take(),
+		Stderr:    stderr.take(),
 		ExitCode:  exitCode,
 		Duration:  endTime.Sub(startTime).Seconds(),
 		StartTime: startTime.UTC(),
@@ -164,83 +180,69 @@ func (s *Server) handleExecuteStream(w http.ResponseWriter, r *http.Request) {
 		workDir = abs
 	}
 
-	// Setup SSE headers
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		httpError(w, "streaming not supported", http.StatusInternalServerError)
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), timeout)
-	defer cancel()
+	// Set before the command starts, because its output writers are live from
+	// the moment it does: a first write that beat this would commit the
+	// response with a sniffed content type. Nothing is sent yet, so a start
+	// that fails can still answer with a status -- it withdraws these first.
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 
-	cmd := exec.CommandContext(ctx, req.Command[0], req.Command[1:]...)
-	cmd.Dir = workDir
-	cmd.Env = s.buildChildEnv(req.Env)
-	stripEnvDProxyGroup(cmd)
-
-	stdoutPipe, err := cmd.StdoutPipe()
+	stream := &sseCommandStream{w: w, flusher: flusher, active: true}
+	pid, exitCh, drained, stop, err := s.startTrackedCommand(
+		req.Command,
+		workDir,
+		s.buildChildEnv(req.Env),
+		stream.writer("stdout"),
+		stream.writer("stderr"),
+		jobTracking{track: !req.Untracked, hands: handsExecute(&req)},
+	)
 	if err != nil {
-		httpError(w, "failed to create stdout pipe: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		httpError(w, "failed to create stderr pipe: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if err := cmd.Start(); err != nil {
+		// Output held before start is dropped with the stream, so the response
+		// is still uncommitted and can carry a status.
+		stream.deactivate()
+		h := w.Header()
+		h.Del("Content-Type")
+		h.Del("Cache-Control")
+		h.Del("Connection")
+		h.Del("X-Accel-Buffering")
 		httpError(w, "failed to start command: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Send start event
-	sseWrite(w, flusher, "start", map[string]interface{}{"pid": cmd.Process.Pid})
-
-	// Stream stdout and stderr concurrently
-	done := make(chan struct{}, 2)
-
-	streamPipe := func(pipe interface{ Read([]byte) (int, error) }, key string) {
-		buf := make([]byte, 4096)
-		for {
-			n, err := pipe.Read(buf)
-			if n > 0 {
-				sseWrite(w, flusher, "data", map[string]string{key: string(buf[:n])})
-			}
-			if err != nil {
-				break
-			}
-		}
-		done <- struct{}{}
-	}
-
-	go streamPipe(stdoutPipe, "stdout")
-	go streamPipe(stderrPipe, "stderr")
-
-	// Wait for both streams to finish
-	<-done
-	<-done
+	stream.begin(pid)
 
 	exitCode := 0
-	if err := cmd.Wait(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			exitCode = 1
-		}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case exitCode = <-exitCh:
+	case <-timer.C:
+		exitCode = finalizeTimedOutCommand(exitCh, stop)
+	case <-r.Context().Done():
+		// Same contract as handleExecute: disconnect closes the stream, the
+		// request timeout still stops the tracked tree.
+		stream.deactivate()
+		awaitTrackedExit(exitCh, timer, stop)
+		return
 	}
+	// Let the output the exit status overtook reach the stream before it stops
+	// accepting bytes, or the tail of the command is dropped silently.
+	awaitOutputQuiet(drained, stream.lastWrite)
 
-	sseWrite(w, flusher, "end", map[string]interface{}{
+	stream.event("end", map[string]interface{}{
 		"exit_code": exitCode,
 		"exited":    true,
 		"status":    exitStatusString(exitCode),
 	})
+	stream.deactivate()
 }
 
 // buildChildEnv constructs the environment for a child process.
@@ -264,7 +266,80 @@ func (s *Server) buildChildEnv(userEnv map[string]string) []string {
 	return env
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// GNU timeout's documented execute timeout status.
+const executeTimeoutExitCode = 124
+
+// awaitTrackedExit keeps the request timeout armed after the HTTP client leaves.
+// Disconnect alone must not abandon a tree that would outlive every reclaim clock.
+func awaitTrackedExit(exitCh <-chan int, timer *time.Timer, stop func()) {
+	select {
+	case <-exitCh:
+	case <-timer.C:
+		_ = finalizeTimedOutCommand(exitCh, stop)
+	}
+}
+
+// How long the output path must stay silent before a response is built from it.
+const outputQuietPeriod = 100 * time.Millisecond
+
+// Ceiling on that wait. Descendants the command detached hold the same pipe and
+// may keep writing, so neither the drain signal nor silence is guaranteed to
+// arrive, and the response has to be bounded regardless.
+const outputQuietCeiling = 2 * time.Second
+
+// How long to wait for a first byte when nothing has been written yet. Long
+// enough for output the exit status overtook to land, short of the ceiling so a
+// silent command that detached a child does not pay all of it.
+const outputFirstByteGrace = 500 * time.Millisecond
+
+// awaitOutputQuiet resynchronises the exit status with the output it overtook.
+//
+// The exit status travels on its own descriptor while output travels through a
+// pipe and a copy goroutine, so the status routinely overtakes the last bytes
+// the command wrote.
+//
+// `drained` closing is the real answer: it is the point at which the supervisor
+// has been reaped and os/exec has joined the copy goroutines, so nothing can
+// arrive afterwards. It cannot be waited on alone, because a detached
+// descendant inherits the same pipe and holds it open for as long as it runs --
+// which is why silence and a ceiling remain underneath it.
+//
+// Silence is only evidence once something has been written. A buffer that has
+// received nothing carries a zero timestamp, and the age of a zero timestamp is
+// quiet by any measure; treating that as completion is what answered with an
+// exit status and no output. Nothing written is bounded by
+// outputFirstByteGrace instead.
+func awaitOutputQuiet(drained <-chan struct{}, lastWrite func() time.Time) {
+	started := time.Now()
+	deadline := started.Add(outputQuietCeiling)
+	for time.Now().Before(deadline) {
+		select {
+		case <-drained:
+			return
+		default:
+		}
+		at := lastWrite()
+		if at.IsZero() {
+			if time.Since(started) >= outputFirstByteGrace {
+				return
+			}
+		} else if time.Since(at) >= outputQuietPeriod {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// finalizeTimedOutCommand stops the tracked tree and always reports 124,
+// including when the shim surfaces SIGKILL as -1.
+func finalizeTimedOutCommand(exitCh <-chan int, stop func()) int {
+	stop()
+	select {
+	case <-exitCh:
+	case <-time.After(time.Second):
+	}
+	return executeTimeoutExitCode
+}
 
 func sseWrite(w http.ResponseWriter, f http.Flusher, event string, data interface{}) {
 	b, _ := json.Marshal(data)
@@ -277,6 +352,155 @@ func exitStatusString(code int) string {
 		return "completed"
 	}
 	return "failed"
+}
+
+type synchronizedBuffer struct {
+	mu     sync.Mutex
+	b      bytes.Buffer
+	last   time.Time
+	closed bool
+}
+
+// Write appends command output while the response still owns this buffer.
+// After take(), further bytes from a long-lived detached descendant are
+// discarded so the handler's buffer cannot grow for as long as that process runs.
+func (b *synchronizedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return len(p), nil
+	}
+	b.last = time.Now()
+	return b.b.Write(p)
+}
+
+// lastWrite reports when output last arrived, zero where none has.
+func (b *synchronizedBuffer) lastWrite() time.Time {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.last
+}
+
+// appendString appends an EnvD-generated error message.
+func (b *synchronizedBuffer) appendString(s string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return
+	}
+	_, _ = b.b.WriteString(s)
+}
+
+// take returns the buffered output and stops retaining later writes.
+func (b *synchronizedBuffer) take() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.closed = true
+	out := b.b.String()
+	b.b.Reset()
+	return out
+}
+
+// String returns a stable output snapshot without closing the buffer.
+func (b *synchronizedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
+}
+
+type sseCommandStream struct {
+	mu      sync.Mutex
+	w       http.ResponseWriter
+	flusher http.Flusher
+	active  bool
+	last    time.Time
+	// Output held until begin sends the start event. The writers go live when
+	// the shim starts, ahead of the pid handshake, so nothing may reach the
+	// response before start -- and a failed handshake must still find it
+	// uncommitted so it can answer with a status.
+	started bool
+	pending []sseChunk
+}
+
+// sseChunk is one output write held back until the start event is sent.
+type sseChunk struct {
+	key  string
+	text string
+}
+
+// begin sends the start event, then any output that arrived before it.
+func (s *sseCommandStream) begin(pid int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active {
+		sseWrite(s.w, s.flusher, "start", map[string]interface{}{"pid": pid})
+		for _, c := range s.pending {
+			sseWrite(s.w, s.flusher, "data", map[string]string{c.key: c.text})
+		}
+	}
+	s.started = true
+	s.pending = nil
+}
+
+// lastWrite reports when output last arrived, zero where none has.
+func (s *sseCommandStream) lastWrite() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.last
+}
+
+// writer creates one stdout or stderr field writer.
+func (s *sseCommandStream) writer(key string) *sseFieldWriter {
+	return &sseFieldWriter{stream: s, key: key}
+}
+
+// event emits one SSE event while the response is active. Output arrives from
+// the command's copy goroutines, so every write to the ResponseWriter goes
+// through here.
+func (s *sseCommandStream) event(name string, data interface{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active {
+		sseWrite(s.w, s.flusher, name, data)
+	}
+}
+
+// deactivate stops writes after the HTTP response has ended, and lets go of
+// the response it was writing to.
+//
+// Releasing the writer matters because of how long this struct can live: the
+// field writers below are the shim's stdout and stderr, and os/exec joins its
+// copy goroutines only once every holder of that pipe has closed it -- which
+// includes work the command detached. Held, the ResponseWriter of a connection
+// that ended minutes ago stays reachable for as long as that work runs.
+func (s *sseCommandStream) deactivate() {
+	s.mu.Lock()
+	s.active = false
+	s.w = nil
+	s.flusher = nil
+	s.pending = nil
+	s.mu.Unlock()
+}
+
+type sseFieldWriter struct {
+	stream *sseCommandStream
+	key    string
+}
+
+// Write emits one synchronized SSE data event while the response is active.
+func (w *sseFieldWriter) Write(p []byte) (int, error) {
+	w.stream.mu.Lock()
+	defer w.stream.mu.Unlock()
+	w.stream.last = time.Now()
+	if !w.stream.active {
+		return len(p), nil
+	}
+	if !w.stream.started {
+		w.stream.pending = append(w.stream.pending, sseChunk{key: w.key, text: string(p)})
+		return len(p), nil
+	}
+	sseWrite(w.stream.w, w.stream.flusher, "data", map[string]string{w.key: string(p)})
+	return len(p), nil
 }
 
 // stripEnvDProxyGroup sets the child process's supplementary groups to only

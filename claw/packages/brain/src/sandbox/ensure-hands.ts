@@ -235,6 +235,8 @@ export interface SandboxReuseEffects {
     sessionId: string,
     known?: HandsProbeEntry,
     knownToken?: string,
+    /** The message a replacement is being built for; never cascaded away. */
+    activeMessageId?: string,
   ) => Promise<void>;
   registerSandbox: typeof registerSandbox;
   probeSandboxContainer: (
@@ -287,11 +289,27 @@ export interface EnsureHandsOptions {
   signal?: AbortSignal;
 }
 
+/**
+ * Maps the reuse-effects arity onto destroyHands opts.
+ *
+ * Call sites pass the in-flight messageId as the fourth argument; destroyHands
+ * takes it on opts so MN cascade can skip the cluster that message still owns.
+ */
+export function destroyHandsForReuse(
+  sessionId: string,
+  known?: HandsProbeEntry,
+  knownToken?: string,
+  activeMessageId?: string,
+): Promise<void> {
+  return destroyHands(sessionId, known, knownToken, undefined, { activeMessageId });
+}
+
 const realReuseEffects: SandboxReuseEffects = {
   dagHoldsWorkload,
   workloadHeldByOtherDag,
   releaseHandlesForWorkload,
-  destroyHands, registerSandbox, probeSandboxContainer, restartHandsInSandbox,
+  destroyHands: destroyHandsForReuse,
+  registerSandbox, probeSandboxContainer, restartHandsInSandbox,
   unregisterSandbox, markHandsIdle,
   countLiveWork, retainContainer,
 };
@@ -392,6 +410,19 @@ async function probeHandleSandbox(
   // unrepairable, not because anything confirmed the container had left.
   if (!identity || !token) return { state: "gone", detail: health.detail };
   const probe = await reuseEffects.probeSandboxContainer(sessionId, identity, signal);
+  if (probe.reason === "exec_sandbox_terminal") {
+    // Same stance as the recorded-terminalReason branch in reuseRecordedSandbox:
+    // a parked sandbox's death is not this message's outcome. Stop whatever the
+    // control plane still holds, then answer `gone` so the caller rebuilds --
+    // a `use` node, which cannot rebuild, still fails on `gone`.
+    await reuseEffects.destroyHands(sessionId, identity, token).catch((err) => {
+      logger.warn({ err, sessionId }, "ensureHands.terminal_cleanup_failed");
+    });
+    return {
+      state: "gone",
+      detail: probe.failureReason ?? "sandbox_workload_terminal",
+    };
+  }
   if (probe.verdict === "unknown") return { state: "unknown", detail: probe.reason };
   if (probe.verdict === "dead") return { state: "gone", detail: health.detail };
   const restarted = await reuseEffects.restartHandsInSandbox({
@@ -632,6 +663,19 @@ async function recoverUnhealthyReuse(
   held?: SandboxAttribution,
 ): Promise<UnhealthyRecovery> {
   const probe = await reuseEffects.probeSandboxContainer(sessionId, identity, signal);
+  if (probe.reason === "exec_sandbox_terminal") {
+    // A terminal workload is the same fact the recorded-terminalReason branch
+    // acts on, and it gets the same answer: stop what is left, report the
+    // container gone, and let this message provision its own sandbox.
+    await reuseEffects.destroyHands(
+      sessionId,
+      identity,
+      typeof info.token === "string" ? info.token : undefined,
+    ).catch((err) => {
+      logger.warn({ err, sessionId }, "ensureHands.terminal_cleanup_failed");
+    });
+    return { outcome: "gone" };
+  }
   if (probe.verdict === "dead") return { outcome: "gone" };
   if (probe.verdict === "unknown") {
     logger.warn(
@@ -1844,6 +1888,37 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
   const { binding, info } = recorded;
   const identity = reuseIdentity(info);
   const hasToken = typeof info.token === "string" && info.token.length > 0;
+  if (typeof info.terminalReason === "string" && info.terminalReason) {
+    // The previous sandbox is already finished: this turn is new work, not a
+    // retry of the one that died. Tear down whatever the control plane still
+    // holds so a replacement is not admitted beside a stuck workload, then fall
+    // through to ordinary provision. The failure is not surfaced to the user --
+    // a parked sandbox's death is not this message's outcome -- but it is logged
+    // so operators can see the replace.
+    const terminalFields = {
+      sessionId,
+      workloadId: info.workloadId ?? null,
+      provider: info.provider ?? null,
+      sandboxName: info.sandboxName ?? null,
+      reason: info.terminalReason,
+    };
+    logger.info(terminalFields, "ensureHands.terminal_entry_rebuilding");
+    try {
+      await reuseEffects.destroyHands(
+        sessionId,
+        identity,
+        hasToken ? info.token : undefined,
+        request.message_id,
+      );
+      logger.info(terminalFields, "ensureHands.terminal_workload_stopped");
+    } catch (err) {
+      logger.warn(
+        { ...terminalFields, err: (err as Error)?.message ?? String(err) },
+        "ensureHands.terminal_cleanup_failed",
+      );
+    }
+    return null;
+  }
 
   // Multi-node bakes cluster env at sandbox create; hands never reloads env.
   // Always replace any prior sandbox (single- or multi-node) with a fresh one.
@@ -1864,7 +1939,20 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
       );
       return null;
     }
-    await reuseEffects.destroyHands(sessionId, identity, hasToken ? info.token : undefined);
+    // The cluster this handle names belongs to the message being replaced, and
+    // for a redelivery that is the message running now -- whose cluster the
+    // provider has already adopted for the sandbox about to be built.
+    await reuseEffects.destroyHands(
+      sessionId, identity, hasToken ? info.token : undefined, request.message_id,
+    );
+    return null;
+  }
+
+  if (info.status === "closing" || info.status === "reclaiming") {
+    logger.info(
+      { sessionId, workloadId: info.workloadId, status: info.status },
+      "ensureHands.closing_not_reusable",
+    );
     return null;
   }
 
@@ -1987,7 +2075,9 @@ async function clearIdleMarkers(
   // have added a way for a live sandbox to be refused and replaced: a lost race
   // whose re-read lands on a key a rolling migration has moved reads as a
   // deleted record. That refusal stays reserved for the reason that earns it.
-  const clearingMarkers = info.keepalive !== undefined || info.idleSince != null;
+  const clearingMarkers = info.keepalive !== undefined
+    || info.idleSince != null
+    || info.quiescedAt != null;
   if (!restamp && !clearingMarkers) return true;
   // Same reason the retry below skips these: `keepalive:false` is what marks a
   // handle parked, and eligibleForClusterReclaim refuses any entry whose
@@ -1998,8 +2088,13 @@ async function clearIdleMarkers(
     logger.warn({ sessionId }, "ensureHands.idle_markers_left_parked");
     return true;
   }
+  if (info.status === "closing" || info.status === "reclaiming") {
+    logger.info({ sessionId }, "ensureHands.idle_markers_left_closing");
+    return false;
+  }
   delete info.keepalive;
   delete info.idleSince;
+  delete info.quiescedAt;
   if (restamp && held) {
     info.taskId = held.taskId;
     info.attemptId = held.attemptId;
@@ -2039,7 +2134,13 @@ async function clearIdleMarkers(
     // The markers are not part of the identity HandsProbeEntry describes, but
     // they live on the same value and this is the writer that removes them.
     const current = parseHandsProbeValue(sc.decode(latest.value)) as HandsProbeEntry
-      & { keepalive?: boolean; idleSince?: unknown; sessionDeleted?: boolean };
+      & {
+        keepalive?: boolean;
+        idleSince?: unknown;
+        quiescedAt?: unknown;
+        sessionDeleted?: boolean;
+        status?: string;
+      };
     // Parked by a session delete while we were losing the race. Same sandbox,
     // so the identity check below would pass -- but clearing `keepalive:false`
     // here un-parks it, and eligibleForClusterReclaim refuses any entry whose
@@ -2049,6 +2150,10 @@ async function clearIdleMarkers(
     if (current.sessionDeleted === true) {
       logger.warn({ sessionId }, "ensureHands.idle_markers_left_parked");
       return true;
+    }
+    if (current.status === "closing" || current.status === "reclaiming") {
+      logger.info({ sessionId }, "ensureHands.idle_markers_left_closing");
+      return false;
     }
     if (!sameHandsSandbox(identity, current)) {
       // Someone else's sandbox now. Reusing ours is still correct -- it passed
@@ -2064,10 +2169,16 @@ async function clearIdleMarkers(
     const stamped = restamp && held
       ? { taskId: held.taskId, attemptId: held.attemptId }
       : {};
-    const stillNeedsMarkers = current.keepalive !== undefined || current.idleSince != null;
+    const stillNeedsMarkers = current.keepalive !== undefined
+      || current.idleSince != null
+      || current.quiescedAt != null;
     if (!stillNeedsMarkers && !restamp) return true;
     await kv.update(key, sc.encode(JSON.stringify({
-      ...current, ...stamped, keepalive: undefined, idleSince: undefined,
+      ...current,
+      ...stamped,
+      keepalive: undefined,
+      idleSince: undefined,
+      quiescedAt: undefined,
     })), latest.revision);
     return true;
   } catch (err) {
@@ -2632,7 +2743,7 @@ async function provisionHands(
 
   logger.info({ sessionId, workloadId, handsBaseUrl }, "ensureHands.bootstrap_start");
   await bootstrapHandsInSandbox(
-    (cmd, t) => getSafeWorkloadProvider().exec(inst, cmd, t),
+    (cmd, t, opts) => getSafeWorkloadProvider().exec(inst, cmd, t, undefined, opts),
     sessionId, mcpPort, handsToken, env,
   );
   logger.info({ sessionId, workloadId }, "ensureHands.bootstrap_done");
@@ -2668,7 +2779,7 @@ async function provisionHands(
   // cluster has to exist as a file here before the optimizer runs.
   if (multiNodeContext?.sshPrivateKey && multiNodeContext.sshKeyPath) {
     await writeSandboxSshKey(
-      (cmd, t) => getSafeWorkloadProvider().exec(inst, cmd, t),
+      (cmd, t) => getSafeWorkloadProvider().exec(inst, cmd, t, undefined, { untracked: true }),
       multiNodeContext.sshKeyPath,
       multiNodeContext.sshPrivateKey,
     );
@@ -2719,6 +2830,8 @@ async function provisionHands(
     namespace: nsForSandbox,
     // Multi-node cluster URL baked into env at create (observability only).
     mnServiceUrl: multiNodeContext?.serviceUrl ?? null,
+    // Cluster DELETE target for destroyHands cascade (workload id = message id).
+    messageId: multiNodeContext ? (request.message_id?.trim() || null) : null,
     createdAt: new Date().toISOString(),
   }));
 
@@ -2802,7 +2915,12 @@ async function provisionHands(
         { sessionId, dagRoot, handle: action.handle, workloadId, err: (e as Error).message },
         "ensureHands.handle_register_failed_rollback",
       );
-      await reuseEffects.destroyHands(sessionId, identity, handsToken).catch((cleanupErr) => {
+      await reuseEffects.destroyHands(
+        sessionId,
+        identity,
+        handsToken,
+        request.message_id?.trim() || undefined,
+      ).catch((cleanupErr) => {
         // Logged with the id: if the early registration is also gone, this
         // line is what is left to find the workload by.
         logger.error(
@@ -3440,7 +3558,7 @@ async function ensureHandsAgentSandbox(
       "ensureHands.agent.bootstrap_start",
     );
     await bootstrapHandsInSandbox(
-      (cmd, t) => provider.exec(inst, cmd, t),
+      (cmd, t, opts) => provider.exec(inst, cmd, t, undefined, opts),
       sessionId, mcpPort, handsToken, env,
     );
 

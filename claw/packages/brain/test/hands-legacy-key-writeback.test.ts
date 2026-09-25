@@ -24,8 +24,10 @@ import { readHandsProbeEntry } from "../src/sandbox/container-probe.js";
 import {
   markHandsIdle, registerSandbox, runKeepaliveTickForTest, unregisterSandbox,
 } from "../src/sandbox/keepalive.js";
+import { bindSandboxProviders } from "../src/sandbox/factory.js";
 import { markRetryPending } from "../src/tasks/retry-pending.js";
 import { filterToRegExp } from "./nats-kv-stub.js";
+import type { SandboxProvider } from "../src/sandbox/provider.js";
 
 const sc = StringCodec();
 
@@ -100,6 +102,17 @@ function kvHolding(held: string, value: unknown = BINDING): { kv: SeedableKv; wr
 /** markHandsIdle is fire-and-forget, so let its promise chain settle. */
 function settle(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 10));
+}
+
+/** Expired-retry stop confirms Running before reading the jobs roster. */
+function bindRunningProvider(): () => void {
+  const provider = {
+    kind: "safe-workload",
+    async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
+    async get() { return { running: true, healthy: true, state: "running" }; },
+    async stop() {},
+  } as unknown as SandboxProvider;
+  return bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
 }
 
 test("the container probe finds a binding held under the legacy key", async () => {
@@ -198,6 +211,7 @@ test("an expired retry deletes the record it examined, not a re-derived key", as
   // is coming back for, and the sandbox is held open indefinitely.
   const { kv, writes } = kvHolding(LEGACY_KEY);
   bindHandsKv(kv);
+  const restore = bindRunningProvider();
   await markRetryPending(kv, {
     sessionId: SESSION_ID,
     createdAtMs: 0,
@@ -206,7 +220,11 @@ test("an expired retry deletes the record it examined, not a re-derived key", as
     workloadId: "wl-1",
   });
 
-  await runKeepaliveTickForTest({ kv, countActiveShells: async () => 0 });
+  try {
+    await runKeepaliveTickForTest({ kv, countActiveShells: async () => 0 });
+  } finally {
+    restore();
+  }
 
   assert.deepEqual(writes.deleted.filter((k) => k.startsWith("hands.")), [LEGACY_KEY],
     "the orphaned record was left behind and a re-derived key deleted instead");
@@ -219,6 +237,7 @@ test("an expired retry leaves a canonical sibling of another generation alone", 
   const { kv, writes } = kvHolding(LEGACY_KEY);
   kv.seed(CANONICAL_KEY, JSON.stringify({ ...BINDING, workloadId: "wl-newer" }));
   bindHandsKv(kv);
+  const restore = bindRunningProvider();
   await markRetryPending(kv, {
     sessionId: SESSION_ID,
     createdAtMs: 0,
@@ -227,7 +246,11 @@ test("an expired retry leaves a canonical sibling of another generation alone", 
     workloadId: "wl-1",
   });
 
-  await runKeepaliveTickForTest({ kv, countActiveShells: async () => 0 });
+  try {
+    await runKeepaliveTickForTest({ kv, countActiveShells: async () => 0 });
+  } finally {
+    restore();
+  }
 
   assert.ok(!writes.deleted.includes(CANONICAL_KEY),
     "a live sibling generation was deleted by a key re-derived from the session id");
@@ -241,6 +264,7 @@ test("an expired retry on a locally registered generation deletes that one", asy
   const { kv, writes } = kvHolding(LEGACY_KEY);
   kv.seed(CANONICAL_KEY, JSON.stringify({ ...BINDING, workloadId: "wl-newer" }));
   bindHandsKv(kv);
+  const restore = bindRunningProvider();
   const local = {
     provider: "safe-workload" as const,
     workloadId: "wl-1",
@@ -262,6 +286,7 @@ test("an expired retry on a locally registered generation deletes that one", asy
     await runKeepaliveTickForTest({ kv, countActiveShells: async () => 0 });
   } finally {
     unregisterSandbox(SESSION_ID, local);
+    restore();
   }
 
   assert.ok(!writes.deleted.includes(CANONICAL_KEY),
@@ -276,6 +301,7 @@ test("an expired retry deletes nothing when no record names the registered gener
   // wrong answer and the bucket TTL takes it.
   const { kv, writes } = kvHolding(CANONICAL_KEY, { ...BINDING, workloadId: "wl-someone-else" });
   bindHandsKv(kv);
+  const restore = bindRunningProvider();
   const local = {
     provider: "safe-workload" as const,
     workloadId: "wl-gone",
@@ -297,6 +323,7 @@ test("an expired retry deletes nothing when no record names the registered gener
     await runKeepaliveTickForTest({ kv, countActiveShells: async () => 0 });
   } finally {
     unregisterSandbox(SESSION_ID, local);
+    restore();
   }
 
   assert.deepEqual(writes.deleted.filter((k) => k.startsWith("hands.")), [],

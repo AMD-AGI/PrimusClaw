@@ -231,7 +231,10 @@ export async function countLiveWork(
   const deadline = AbortSignal.timeout(LIVE_WORK_READ_CEILING_MS);
   const until = signal ? AbortSignal.any([signal, deadline]) : deadline;
   try {
-    const result = await execInSandbox(inst, gatherCommand(stateDir), EXEC_TIMEOUT, until);
+    // Reading the ledger is not user work, so it stays out of the job roster.
+    const result = await execInSandbox(
+      inst, gatherCommand(stateDir), EXEC_TIMEOUT, until, { untracked: true },
+    );
     // A non-zero exit is a read that did not finish, over an unknown fraction
     // of the subtree: nothing in its stdout says which records are missing.
     if (result.exitCode !== 0) {

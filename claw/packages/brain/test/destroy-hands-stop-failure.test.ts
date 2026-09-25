@@ -307,3 +307,80 @@ test("a key another teardown deleted first does not fail this one", async () => 
   assert.equal(stub.calls(), 1, "the workload is stopped either way");
   assert.deepEqual(deleted, [], "and the entry is already gone, so there is nothing to delete");
 });
+
+test("an unreadable entry after a confirmed stop still releases its admission slot", async () => {
+  // Stop lands, delete CAS loses, re-read cannot parse ownership → throw.
+  // The slot must still return or the ceiling stays charged until the horizon.
+  const {
+    bindAdmission, admitSandbox, markCensusReconciled,
+  } = await import("../src/sandbox/admission.js");
+  const { rosterStore } = await import("../src/sandbox/roster-store.js");
+  const values = new Map<string, Uint8Array>();
+  const revisions = new Map<string, number>();
+  const rosterKv = {
+    async get(key: string) {
+      if (!values.has(key)) return null;
+      return { value: values.get(key)!, revision: revisions.get(key) ?? 1 };
+    },
+    async put(key: string, value: Uint8Array) {
+      values.set(key, value);
+      revisions.set(key, (revisions.get(key) ?? 0) + 1);
+      return revisions.get(key)!;
+    },
+    async create(key: string, value: Uint8Array) {
+      if (values.has(key)) throw Object.assign(new Error("exists"), { code: "10071" });
+      return rosterKv.put(key, value);
+    },
+    async update(key: string, value: Uint8Array, expected: number) {
+      if ((revisions.get(key) ?? 0) !== expected) {
+        throw Object.assign(new Error("wrong last sequence"), { code: "10071" });
+      }
+      return rosterKv.put(key, value);
+    },
+    async delete(key: string) { values.delete(key); },
+    async keys() {
+      return (async function* () { yield* values.keys(); })();
+    },
+  } as unknown as KV;
+  await bindAdmission(rosterKv, { ceiling: 8, reconciliationReserve: 2 });
+  markCensusReconciled();
+  const hold = await admitSandbox(SESSION);
+  await hold.bind("safe:wl-1");
+  assert.ok(
+    (await rosterStore(rosterKv).read())!.roster.entries.some((e) => e.identity === "safe:wl-1"),
+    "precondition: slot is held",
+  );
+
+  let reads = 0;
+  const handsKv = {
+    async get(key: string) {
+      reads += 1;
+      if (reads === 1) {
+        return { key, value: sc.encode(JSON.stringify(ENTRY)), revision: 3 };
+      }
+      // Unparseable ownership → readHandsEntry state "unknown".
+      return { key, value: sc.encode("{}"), revision: 9 };
+    },
+    async delete(_key: string, opts?: { previousSeq?: number }) {
+      if (opts?.previousSeq === 3) throw new Error("wrong last sequence: 3");
+    },
+    async put() { return 1; },
+    async update() { return 4; },
+  } as unknown as KV;
+  bindHandsKv(handsKv);
+  restoreRetry = bindSandboxStopRetry({ delayMs: 1 });
+  stubStop(async () => {});
+
+  await assert.rejects(
+    () => destroyHands(SESSION, ENTRY),
+    /hands KV unavailable after confirmed sandbox stop/,
+  );
+
+  const roster = await rosterStore(rosterKv).read();
+  assert.equal(
+    roster?.roster.entries.some((e) => e.identity === "safe:wl-1"),
+    false,
+    "slot must be released even when the entry is left behind",
+  );
+  await bindAdmission(rosterKv, { ceiling: 0, reconciliationReserve: 0 });
+});

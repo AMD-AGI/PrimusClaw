@@ -209,18 +209,59 @@ async function findSessionWorkloads(sessionId: string, apiKey: string): Promise<
 }
 
 /**
- * Reclaim the GPU clusters of a session whose sandbox has gone idle.
+ * Reclaim GPU cluster(s) for a session whose sandbox has gone idle.
  *
- * Complements the two teardown paths that can both be missed: per-message
- * release does not run when Brain dies mid-task, and session teardown only runs
- * when the session is actually deleted. Deliberately spares the sandbox itself,
- * which is kept warm for reuse.
+ * When `messageId` is set, only that workload is deleted (MN cluster id is the
+ * message id). destroyHands cascades must use this form so a successor's newly
+ * ensured cluster under the same session is not swept with the prior sandbox.
+ *
+ * Without `messageId`, every non-terminal cluster for the session is deleted
+ * (session-delete sweeper). Deliberately spares the Hands sandbox workload.
  *
  * @param sessionId Session whose clusters should be reclaimed.
  * @param apiKey SaFE key of the session's owner.
+ * @param messageId When set, delete only this cluster workload id.
  * @returns How many clusters were deleted.
  */
-export async function reclaimIdleSessionClusters(sessionId: string, apiKey: string): Promise<number> {
+export async function reclaimIdleSessionClusters(
+  sessionId: string,
+  apiKey: string,
+  messageId?: string,
+): Promise<number> {
+  const scoped = (messageId ?? "").trim();
+  if (scoped) {
+    // Established as one of THIS session's clusters before it is deleted, the
+    // way the unscoped branch below establishes every id it acts on. The id
+    // reaches here from the client's `message_id`, and a DELETE on a workload
+    // id is unconditional at the control plane: unchecked, a caller naming one
+    // of its own unrelated workloads has it reclaimed on a sandbox's idle
+    // timer, and the 404 that a wrong guess returns reads as success.
+    //
+    // Unverified means not deleted. A cluster left behind costs GPUs until the
+    // workload's own timeout; deleting something this session does not own
+    // costs work nobody asked to end.
+    const { items, incomplete } = await findSessionWorkloads(sessionId, apiKey);
+    const named = items.find((ref) => ref.id === scoped);
+    if (!named || !CLUSTER_KINDS.has(named.kind)) {
+      logger.warn(
+        { sessionId, workloadId: scoped, kind: named?.kind ?? null, incomplete },
+        "mn.safe_idle_reclaim_unverified",
+      );
+      return 0;
+    }
+    const resp = await safeFetch(`/api/v1/workloads/${scoped}`, { method: "DELETE", apiKey })
+      .catch((e) => ({ status: 0, body: String(e) }));
+    if ([200, 202, 204, 404].includes(resp.status)) {
+      logger.info({ sessionId, workloadId: scoped, kind: named.kind }, "mn.safe_idle_reclaimed");
+      return 1;
+    }
+    logger.warn(
+      { sessionId, workloadId: scoped, status: resp.status },
+      "mn.safe_idle_reclaim_failed",
+    );
+    return 0;
+  }
+
   // A shortfall is not worth reporting here. It cannot hide a running cluster
   // from this sweep -- the walk above pages through everything non-terminal, so
   // what is missing is an entry with no id, which no caller could delete anyway.

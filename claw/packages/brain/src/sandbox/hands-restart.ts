@@ -62,7 +62,9 @@ import {
   type HandsProbeEntry,
 } from "./container-probe.js";
 import { checkHandsHealth } from "./hands-health.js";
-import { parseExecTimeoutMs, type SandboxInstance } from "./provider.js";
+import {
+  parseExecTimeoutMs, type SandboxExecOptions, type SandboxInstance,
+} from "./provider.js";
 
 const logger = pino({ name: "sandbox-hands-restart" });
 
@@ -140,6 +142,21 @@ export function isSafeHandsBinaryPath(path: string): boolean {
   return SAFE_HANDS_BINARY_PATH.test(path);
 }
 
+/** The process table the scanner walks. */
+export const PROC_TABLE_GLOB = "/proc/[0-9]*";
+
+const SAFE_PROC_GLOB = /^\/[A-Za-z0-9._/-]+\/\[0-9\]\*$/;
+
+/**
+ * Only an absolute glob ending in the numeric-entry pattern may enter the
+ * generated scanner, the string being interpolated into `sh` unquoted so it
+ * can expand. A caller that scans a fixture tree instead of `/proc` passes
+ * its own root here; the shape is fixed so nothing else can ride along.
+ */
+export function isSafeProcGlob(glob: string): boolean {
+  return SAFE_PROC_GLOB.test(glob);
+}
+
 function knownHandsBinaryPaths(): string[] {
   return [HANDS_IN_IMAGE_BINARY, HANDS_DOWNLOADED_BINARY, LOCAL_MODE_HANDS_BINARY]
     .filter(isSafeHandsBinaryPath);
@@ -178,7 +195,13 @@ function knownHandsBinaryPaths(): string[] {
  * Exits zero throughout: nothing to kill is the normal case on a crash, and a
  * process that disappears between reading cmdline and killing it is harmless.
  */
-export function stopStaleHandsCmdForPaths(candidates: readonly string[]): string {
+export function stopStaleHandsCmdForPaths(
+  candidates: readonly string[],
+  procGlob: string = PROC_TABLE_GLOB,
+): string {
+  if (!isSafeProcGlob(procGlob)) {
+    throw new Error(`unsafe process-table glob: ${procGlob}`);
+  }
   const paths = candidates.filter(isSafeHandsBinaryPath);
   // Nothing survived the filter, so there is nothing to match. Falling through
   // would emit `; self=$$; ... case "$argv0" in )` -- a leading separator and an
@@ -192,7 +215,7 @@ export function stopStaleHandsCmdForPaths(candidates: readonly string[]): string
     .join("; ");
   const cases = paths.map((_, i) => `"$p${i}"`).join("|");
   return `${assigns}; self=$$; `
-    + "for proc in /proc/[0-9]*; do "
+    + `for proc in ${procGlob}; do `
     + "pid=${proc##*/}; [ \"$pid\" = \"$self\" ] && continue; "
     + "tr '\\000' '\\n' < \"$proc/cmdline\" 2>/dev/null | "
     + "{ IFS= read -r argv0 || exit 0; "
@@ -247,7 +270,7 @@ async function killAndRelaunch(
     () => controller.abort(new Error(HANDS_RESTART_DEADLINE)),
     deadlineMs,
   );
-  const execCapped = async (cmd: string, timeout: string) => {
+  const execCapped = async (cmd: string, timeout: string, opts?: SandboxExecOptions) => {
     const remaining = deadlineAt - Date.now();
     if (remaining <= 0) throw new Error(HANDS_RESTART_DEADLINE);
     const call = execInSandbox(
@@ -255,6 +278,7 @@ async function killAndRelaunch(
       cmd,
       timeoutWithinBudget(timeout, remaining),
       controller.signal,
+      opts,
     );
     call.catch(() => {});
     let onAbort: (() => void) | undefined;
@@ -272,7 +296,10 @@ async function killAndRelaunch(
     }
   };
   try {
-    await execCapped(stopStaleHandsCmd(), STOP_TIMEOUT);
+    // Clearing the port is housekeeping, so it stays out of the job roster. The
+    // relaunch below does not: the shim it registers is what makes the restarted
+    // Hands and everything it spawns visible to GET /api/jobs.
+    await execCapped(stopStaleHandsCmd(), STOP_TIMEOUT, { untracked: true });
     await bootstrapHandsInSandbox(
       execCapped,
       attempt.sessionId,

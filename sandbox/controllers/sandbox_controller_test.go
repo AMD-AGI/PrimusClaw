@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -191,6 +192,109 @@ func TestComputeReadyCondition(t *testing.T) {
 			require.Equal(t, tc.expectedReason, condition.Reason)
 		})
 	}
+}
+
+func TestApplyPodTerminalConditions(t *testing.T) {
+	sandbox := &sandboxv1alpha1.Sandbox{ObjectMeta: metav1.ObjectMeta{Generation: 1}}
+
+	applyPodTerminalConditions(sandbox, &corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodRunning}})
+	require.Nil(t, meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionSucceeded)))
+	require.Nil(t, meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed)))
+
+	applyPodTerminalConditions(sandbox, &corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodSucceeded}})
+	cond := meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionSucceeded))
+	require.NotNil(t, cond)
+	require.Equal(t, metav1.ConditionTrue, cond.Status)
+	require.Equal(t, sandboxv1alpha1.SandboxReasonPodSucceeded, cond.Reason)
+	require.Nil(t, meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed)))
+
+	applyPodTerminalConditions(sandbox, &corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodFailed}})
+	require.Nil(t, meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionSucceeded)))
+	failed := meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed))
+	require.NotNil(t, failed)
+	require.Equal(t, metav1.ConditionTrue, failed.Status)
+	require.Equal(t, sandboxv1alpha1.SandboxReasonPodFailed, failed.Reason)
+
+	applyPodTerminalConditions(sandbox, nil)
+	require.Nil(t, meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionSucceeded)))
+	require.Nil(t, meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed)))
+}
+
+func TestScaleToZeroKeepsPublishedTerminalCondition(t *testing.T) {
+	// Replicas 0 deletes the Pod on purpose; that absence is not evidence the
+	// terminal outcome already published for it no longer holds.
+	sandbox := &sandboxv1alpha1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "sb-zero", Namespace: "sb-ns", Generation: 1},
+		Spec:       sandboxv1alpha1.SandboxSpec{Replicas: ptr.To(int32(0))},
+	}
+	meta.SetStatusCondition(&sandbox.Status.Conditions, metav1.Condition{
+		Type:   string(sandboxv1alpha1.SandboxConditionFailed),
+		Status: metav1.ConditionTrue,
+		Reason: sandboxv1alpha1.SandboxReasonPodFailed,
+	})
+	r := SandboxReconciler{
+		Client: newFakeClient(sandbox),
+		Scheme: Scheme,
+		Tracer: asmetrics.NewNoOp(),
+	}
+	require.NoError(t, r.reconcileChildResources(t.Context(), sandbox))
+	failed := meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed))
+	require.NotNil(t, failed, "scale-to-zero must not erase a published Failed condition")
+	require.Equal(t, metav1.ConditionTrue, failed.Status)
+}
+
+func TestRuntimeReasonCannotRejectTheStatusUpdate(t *testing.T) {
+	// The reason comes from the container runtime and is bound by nothing the
+	// API server accepts. One that fails validation rejects the whole status
+	// update, Ready with it, and the controller then fails the same reconcile
+	// for ever -- so the reason is held to the grammar and the runtime's text
+	// survives in the message instead.
+	sandbox := &sandboxv1alpha1.Sandbox{ObjectMeta: metav1.ObjectMeta{Generation: 1}}
+	applyPodTerminalConditions(sandbox, &corev1.Pod{Status: corev1.PodStatus{
+		Phase: corev1.PodFailed,
+		ContainerStatuses: []corev1.ContainerStatus{{
+			Name: "sandbox",
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				Reason:   "OOM killed - cgroup limit",
+				ExitCode: 137,
+			}},
+		}},
+	}})
+	failed := meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed))
+	require.NotNil(t, failed)
+	require.Equal(t, sandboxv1alpha1.SandboxReasonPodFailed, failed.Reason)
+	require.Contains(t, failed.Message, "OOM killed - cgroup limit")
+
+	require.Equal(t, "OOMKilled", conditionReason("OOMKilled"))
+}
+
+func TestPodFailureNamesTheContainerThatFailed(t *testing.T) {
+	// A sidecar that exited 0 can stand ahead of the container that crashed,
+	// and taking whichever terminated first reported the crash as a clean exit.
+	sandbox := &sandboxv1alpha1.Sandbox{ObjectMeta: metav1.ObjectMeta{Generation: 1}}
+	applyPodTerminalConditions(sandbox, &corev1.Pod{Status: corev1.PodStatus{
+		Phase: corev1.PodFailed,
+		ContainerStatuses: []corev1.ContainerStatus{
+			{
+				Name: "sidecar",
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					Reason:   "Completed",
+					ExitCode: 0,
+				}},
+			},
+			{
+				Name: "envd",
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					Reason:   "OOMKilled",
+					ExitCode: 137,
+				}},
+			},
+		},
+	}})
+	failed := meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed))
+	require.NotNil(t, failed)
+	require.Equal(t, "OOMKilled", failed.Reason)
+	require.Contains(t, failed.Message, "Container envd")
 }
 
 func TestReconcile(t *testing.T) {

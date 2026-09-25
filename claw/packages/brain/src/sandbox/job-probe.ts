@@ -1,0 +1,238 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+import {
+  AGENT_SANDBOX_ROUTER_URL,
+  AGENT_SANDBOX_NAMESPACE,
+  AUTH_INTERNAL_TOKEN,
+  SAFE_API_URL,
+  SANDBOX_NAMESPACE,
+  SANDBOX_ROUTER_URL,
+} from "../config.js";
+import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
+import type { SandboxInstance, SandboxStatus } from "./provider.js";
+import { SandboxRuntimeTerminalError } from "./errors.js";
+
+export interface JobProbeEntry {
+  provider?: "safe-workload" | "agent-sandbox";
+  workloadId?: string;
+  platformKey?: string;
+  sessionId?: string;
+  sandboxName?: string;
+  namespace?: string;
+  userId?: string;
+  podUid?: string;
+  envdInstanceId?: string;
+}
+
+export interface JobsProbeResult {
+  count: number;
+  podUid?: string;
+  instanceId?: string;
+}
+
+export class SandboxTerminalProbeError extends Error {
+  readonly sandboxTerminal = true;
+
+  constructor(
+    readonly state: "terminal" | "absent",
+    readonly reason = "sandbox_workload_terminal",
+  ) {
+    super(`sandbox jobs probe found workload state=${state}`);
+    this.name = "SandboxTerminalProbeError";
+  }
+}
+
+export class SandboxTrackingLostError extends Error {
+  readonly trackingLost = true;
+  constructor() {
+    super("sandbox jobs tracking was lost");
+    this.name = "SandboxTrackingLostError";
+  }
+}
+
+/** EnvD on this Pod has no jobs roster. Brain must not idle-reclaim it. */
+export class SandboxJobsUnavailableError extends Error {
+  readonly jobsUnavailable = true;
+  constructor(readonly httpStatus: number) {
+    super(`sandbox jobs API is unavailable: HTTP ${httpStatus}`);
+    this.name = "SandboxJobsUnavailableError";
+  }
+}
+
+/** Convert a persisted handle into the provider-neutral sandbox identity. */
+function instanceFromEntry(entry: JobProbeEntry): SandboxInstance {
+  const agent = entry.provider === "agent-sandbox";
+  const id = agent ? entry.sessionId : entry.workloadId;
+  if (!id) throw new Error("sandbox jobs probe is missing its workload identity");
+  return {
+    provider: agent ? "agent-sandbox" : "safe-workload",
+    id,
+    sandboxName: entry.sandboxName || entry.workloadId || "",
+    namespace: entry.namespace || (agent ? AGENT_SANDBOX_NAMESPACE : SANDBOX_NAMESPACE),
+    handsBaseUrl: "",
+    platformKey: entry.platformKey,
+    userId: entry.userId,
+  };
+}
+
+/** Refuse to inspect jobs unless the control plane confirms Running. */
+function requireRunning(status: SandboxStatus): void {
+  if (status.state === "terminal") {
+    throw new SandboxTerminalProbeError(status.state, status.reason ?? "sandbox_workload_terminal");
+  }
+  if (status.state === "absent") {
+    throw new SandboxTerminalProbeError(status.state, status.reason ?? "sandbox_workload_absent");
+  }
+  if (!status.running || status.state === "unknown") {
+    throw new Error(`sandbox jobs probe requires Running, state=${status.state || "unknown"}`);
+  }
+}
+
+/** Validate the EnvD response without treating malformed data as idle. */
+function parseJobsBody(body: unknown): JobsProbeResult {
+  const raw = body as {
+    user_process_count?: unknown;
+    tracking_lost?: unknown;
+    pod_uid?: unknown;
+    instance_id?: unknown;
+  } | null;
+  if (raw?.tracking_lost === true) {
+    throw new SandboxTrackingLostError();
+  }
+  const count = raw?.user_process_count;
+  if (typeof count !== "number" || !Number.isInteger(count) || count < 0) {
+    throw new Error(`sandbox jobs probe returned invalid user_process_count=${String(count)}`);
+  }
+  const podUid = typeof raw?.pod_uid === "string" && raw.pod_uid ? raw.pod_uid : undefined;
+  const instanceId = typeof raw?.instance_id === "string" && raw.instance_id
+    ? raw.instance_id
+    : undefined;
+  return { count, podUid, instanceId };
+}
+
+/** Bind jobs to one EnvD process; a rebuilt Pod must not look idle. */
+function assertSameInstance(entry: JobProbeEntry, result: JobsProbeResult): void {
+  if (entry.podUid && result.podUid && entry.podUid !== result.podUid) {
+    throw new SandboxRuntimeTerminalError(
+      "sandbox_instance_replaced",
+      `sandbox Pod UID changed from ${entry.podUid} to ${result.podUid}`,
+    );
+  }
+  if (entry.envdInstanceId && result.instanceId && entry.envdInstanceId !== result.instanceId) {
+    throw new SandboxRuntimeTerminalError(
+      "sandbox_instance_replaced",
+      `EnvD instance changed from ${entry.envdInstanceId} to ${result.instanceId}`,
+    );
+  }
+}
+
+/** Return the number of user task processes after independently confirming Running. */
+export async function countSandboxUserProcesses(
+  entry: JobProbeEntry,
+  timeoutMs = 5_000,
+): Promise<number> {
+  return (await inspectSandboxJobs(entry, timeoutMs)).count;
+}
+
+/**
+ * Confirm through the control plane that the sandbox is Running.
+ *
+ * Absence and a terminal phase are conclusions about the workload rather than
+ * about its job roster, so this is asked independently of how the roster is
+ * read and stays outside any substitution of that read.
+ */
+export async function assertSandboxRunning(entry: JobProbeEntry): Promise<void> {
+  const inst = instanceFromEntry(entry);
+  const provider = inst.provider === "agent-sandbox"
+    ? getAgentSandboxProvider()
+    : getSafeWorkloadProvider();
+  requireRunning(await provider.get(inst));
+}
+
+/**
+ * The probe's whole deadline, spanning both of its round trips.
+ *
+ * The probe reads the workload's status and then reads the roster. A deadline
+ * on only the second leaves the first bounded by the provider's own transport
+ * timeout -- a number this side did not choose, and one the sweep phase that
+ * awaits this probe cannot state as its cost. Sized to cover both, so the
+ * caller's argument is the bound rather than one term of it.
+ */
+export const JOBS_PROBE_BUDGET_MS = 20_000;
+
+/**
+ * Fail once the budget is spent, whatever the awaited call is still doing.
+ *
+ * The call is not cancelled: a provider read holds its own deadline and this
+ * side cannot reach into it. What this bounds is the waiting, which is the cost
+ * the phase actually pays.
+ */
+async function withinBudget<T>(work: Promise<T>, deadline: number, what: string): Promise<T> {
+  const left = deadline - Date.now();
+  if (left <= 0) throw new Error(`sandbox jobs probe budget expired before the ${what}`);
+  // Claimed so the losing side of the race cannot surface as an unhandled
+  // rejection after this function has already returned its verdict.
+  work.catch(() => {});
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`sandbox jobs probe budget expired during the ${what}`)),
+          left,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** Inspect EnvD jobs and the process identity those jobs belong to. */
+export async function inspectSandboxJobs(
+  entry: JobProbeEntry,
+  timeoutMs = JOBS_PROBE_BUDGET_MS,
+): Promise<JobsProbeResult> {
+  const inst = instanceFromEntry(entry);
+  const agent = inst.provider === "agent-sandbox";
+  const deadline = Date.now() + timeoutMs;
+  await withinBudget(assertSandboxRunning(entry), deadline, "workload status read");
+
+  const base = agent
+    ? AGENT_SANDBOX_ROUTER_URL.replace(/\/+$/, "")
+    : (SANDBOX_ROUTER_URL.trim()
+      ? SANDBOX_ROUTER_URL.replace(/\/+$/, "")
+      : `${SAFE_API_URL}/sandbox`);
+  if (!base) throw new Error("sandbox jobs probe router URL is not configured");
+
+  const name = agent ? inst.sandboxName : inst.id;
+  const url = `${base}/v1/namespaces/${inst.namespace}/code-interpreters/${name}/invocations/api/jobs`;
+  const headers: Record<string, string> = { "x-session-id": inst.id };
+  if (agent) {
+    if (inst.userId) headers.userId = inst.userId;
+  } else {
+    headers.Authorization = `Bearer ${inst.platformKey ?? ""}`;
+    if (AUTH_INTERNAL_TOKEN.trim()) headers["X-Internal-Token"] = AUTH_INTERNAL_TOKEN.trim();
+  }
+
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) {
+    throw new Error("sandbox jobs probe budget expired before the roster read");
+  }
+  const response = await fetch(url, {
+    method: "GET",
+    headers,
+    signal: AbortSignal.timeout(remaining),
+  });
+  if (!response.ok) {
+    if (response.status === 404 || response.status === 405 || response.status === 501) {
+      throw new SandboxJobsUnavailableError(response.status);
+    }
+    throw new Error(`sandbox jobs probe failed: HTTP ${response.status}`);
+  }
+  const result = parseJobsBody(await response.json().catch(() => null));
+  assertSameInstance(entry, result);
+  return result;
+}

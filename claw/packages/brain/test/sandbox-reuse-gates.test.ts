@@ -58,6 +58,7 @@ interface Entry {
   sandboxName?: string;
   namespace?: string;
   userId?: string;
+  terminalReason?: string;
 }
 
 function fakeKv(entry: Entry | null): { kv: KV; puts: string[] } {
@@ -810,6 +811,45 @@ test("reuse is refused while the fleet is uncounted, and registers nothing", asy
     // A ceiling of zero binds no roster, which is this module's off state.
     await bindAdmission(rosterKv, { ceiling: 0, reconciliationReserve: 0 });
   }
+});
+
+test("a parked terminal entry is torn down and replaced rather than failing the turn", async () => {
+  // The user sent a new message; the previous sandbox's death is not this
+  // turn's outcome. The workload is stopped first so a replacement is not
+  // admitted beside one that is still billed, then reuse falls through.
+  const destroyed: string[] = [];
+  restoreEffects = bindSandboxReuseEffects({
+    destroyHands: async (sessionId) => { destroyed.push(sessionId); },
+    registerSandbox: (() => {}) as never,
+    probeSandboxContainer: async () => ({ verdict: "alive", reason: "exec_ok" as const }),
+    restartHandsInSandbox: async () => ({ ok: true, detail: "healthy" }),
+    countLiveWork: async () => ({ verdict: "clear", classes: {}, reason: "clear" }),
+    retainContainer: async () => "retained",
+  });
+  const { a } = attempt({
+    ...LIVE,
+    specFingerprint: specOf(),
+    terminalReason: "sandbox_timed_out",
+  });
+  assert.equal(await tryReuseSessionSandbox(a), null);
+  assert.deepEqual(destroyed, ["s-1"]);
+});
+
+test("a failed terminal cleanup still lets the turn provision a replacement", async () => {
+  restoreEffects = bindSandboxReuseEffects({
+    destroyHands: async () => { throw new Error("stop failed"); },
+    registerSandbox: (() => {}) as never,
+    probeSandboxContainer: async () => ({ verdict: "alive", reason: "exec_ok" as const }),
+    restartHandsInSandbox: async () => ({ ok: true, detail: "healthy" }),
+    countLiveWork: async () => ({ verdict: "clear", classes: {}, reason: "clear" }),
+    retainContainer: async () => "retained",
+  });
+  const { a } = attempt({
+    ...LIVE,
+    specFingerprint: specOf(),
+    terminalReason: "sandbox_timed_out",
+  });
+  assert.equal(await tryReuseSessionSandbox(a), null);
 });
 
 // A pending entry is not automatically this task's leftover.

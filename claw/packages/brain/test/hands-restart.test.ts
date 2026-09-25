@@ -14,9 +14,13 @@ import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { exec as execCallback, spawn } from "node:child_process";
 import { once } from "node:events";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { promisify } from "node:util";
 import {
   isSafeHandsBinaryPath,
+  isSafeProcGlob,
   mcpPortFromUrl,
   restartHandsInSandbox,
   stopStaleHandsCmd,
@@ -46,6 +50,35 @@ const ENTRY = {
 /** Production bounds are 10 * 2s; nothing here needs to wait that out. */
 const FAST_POLL = { pollTries: 2, pollIntervalMs: 1 };
 const TEST_SCAN_PATHS = ["/app/hands-binary", "/tmp/.hands-binary"] as const;
+
+/**
+ * A process table holding only the entries a case is about.
+ *
+ * The scanner walks every numeric entry under its root and forks `tr` for each
+ * one, so its cost tracks the size of that table: on a host carrying hundreds
+ * of thousands of processes, scanning the real `/proc` takes minutes. The
+ * entries name live PIDs and carry the argv under test, which keeps the kill
+ * and the survival checks real while bounding the walk to those few.
+ */
+async function procFixture(
+  entries: ReadonlyArray<{ pid: number; argv: readonly string[] }>,
+): Promise<{ glob: string; cleanup: () => Promise<void> }> {
+  const root = await mkdtemp(path.join(tmpdir(), "proc-fixture-"));
+  for (const { pid, argv } of entries) {
+    const dir = path.join(root, String(pid));
+    await mkdir(dir);
+    await writeFile(path.join(dir, "cmdline"), `${argv.join("\0")}\0`);
+  }
+  return {
+    glob: `${root}/[0-9]*`,
+    cleanup: () => rm(root, { recursive: true, force: true }),
+  };
+}
+
+/** A long-lived child whose only role is to be killed or to survive. */
+function spawnIdle() {
+  return spawn(process.execPath, ["-e", "setInterval(() => {}, 60_000)"], { stdio: "ignore" });
+}
 
 test("only shell-literal-safe absolute binary paths reach the proc scanner", () => {
   assert.equal(isSafeHandsBinaryPath("/mnt/shared/ns/hands-binary"), true);
@@ -118,18 +151,24 @@ test("the kill pattern cannot match the shell that runs it", () => {
   assert.match(cmd, /\/tmp\/\.hands-'bin'ary/);
 });
 
+test("only an absolute numeric-entry glob reaches the proc scanner", () => {
+  assert.equal(isSafeProcGlob("/proc/[0-9]*"), true);
+  assert.equal(isSafeProcGlob("/tmp/proc-fixture-a1/[0-9]*"), true);
+  for (const bad of ["/proc/*", "proc/[0-9]*", "/proc/[0-9]*; rm -rf /", "/proc/$(id)/[0-9]*"]) {
+    assert.equal(isSafeProcGlob(bad), false, bad);
+    assert.throws(() => stopStaleHandsCmdForPaths(TEST_SCAN_PATHS, bad), /unsafe process-table glob/);
+  }
+});
+
 test("the proc scanner kills Hands without killing an unrelated holder", async () => {
-  const hands = spawn(process.execPath, ["-e", "setInterval(() => {}, 60_000)"], {
-    argv0: "/tmp/.hands-binary",
-    stdio: "ignore",
-  });
-  const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 60_000)"], {
-    argv0: "e2e-holder",
-    stdio: "ignore",
-  });
+  const hands = spawnIdle();
+  const holder = spawnIdle();
+  const fixture = await procFixture([
+    { pid: hands.pid!, argv: ["/tmp/.hands-binary"] },
+    { pid: holder.pid!, argv: ["e2e-holder"] },
+  ]);
   try {
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    await exec(stopStaleHandsCmdForPaths(TEST_SCAN_PATHS));
+    await exec(stopStaleHandsCmdForPaths(TEST_SCAN_PATHS, fixture.glob));
     if (hands.exitCode === null && hands.signalCode === null) {
       await Promise.race([
         once(hands, "exit"),
@@ -140,36 +179,36 @@ test("the proc scanner kills Hands without killing an unrelated holder", async (
     assert.equal(hands.signalCode, "SIGKILL");
     assert.doesNotThrow(() => process.kill(holder.pid!, 0), "holder must survive");
   } finally {
+    await fixture.cleanup();
     hands.kill("SIGKILL");
     holder.kill("SIGKILL");
   }
 });
 
 test("a process whose cmdline only mentions hands-binary is not killed", async () => {
-  const decoy = spawn(process.execPath, ["-e", "setInterval(() => {}, 60_000)"], {
-    argv0: "/opt/run-hands-binary-helper",
-    stdio: "ignore",
-  });
+  const decoy = spawnIdle();
+  const fixture = await procFixture([
+    { pid: decoy.pid!, argv: ["/opt/run-hands-binary-helper"] },
+  ]);
   try {
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    await exec(stopStaleHandsCmdForPaths(TEST_SCAN_PATHS));
+    await exec(stopStaleHandsCmdForPaths(TEST_SCAN_PATHS, fixture.glob));
     assert.doesNotThrow(() => process.kill(decoy.pid!, 0), "substring decoy must survive");
   } finally {
+    await fixture.cleanup();
     decoy.kill("SIGKILL");
   }
 });
 
 test("an exact Hands path used as a non-argv0 argument is not killed", async () => {
-  const decoy = spawn(
-    process.execPath,
-    ["-e", "setInterval(() => {}, 60_000)", "/app/hands-binary"],
-    { argv0: "argument-holder", stdio: "ignore" },
-  );
+  const decoy = spawnIdle();
+  const fixture = await procFixture([
+    { pid: decoy.pid!, argv: ["argument-holder", "-e", "noop", "/app/hands-binary"] },
+  ]);
   try {
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    await exec(stopStaleHandsCmdForPaths(TEST_SCAN_PATHS));
+    await exec(stopStaleHandsCmdForPaths(TEST_SCAN_PATHS, fixture.glob));
     assert.doesNotThrow(() => process.kill(decoy.pid!, 0), "argument-only decoy must survive");
   } finally {
+    await fixture.cleanup();
     decoy.kill("SIGKILL");
   }
 });

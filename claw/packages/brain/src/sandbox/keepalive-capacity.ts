@@ -150,7 +150,9 @@ export function validateKeepaliveCapacity(input: CapacityInput): CapacitySetting
       `SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC=${input.sweepSpanSec} does not cover a sweep's `
       + `own worst case of ${input.pingPhaseCeilingSec}s -- the retention reads, the ping `
       + "phase and the failure handling that follows it, each bounded by its own budget -- "
-      + "so the span every refresh gap is derived from is one the sweep routinely exceeds.",
+      + "so the span every refresh gap is derived from is one the sweep routinely exceeds. "
+      + "Two of those budgets are fractions of BRAIN_REGISTRY_TTL_MS, so raising the "
+      + "bucket TTL raises this worst case with it and the span has to follow.",
     );
   }
   const deadline = requirePositiveInteger(
@@ -163,7 +165,10 @@ export function validateKeepaliveCapacity(input: CapacityInput): CapacitySetting
       `these settings cannot keep a sandbox alive: at SANDBOX_KEEPALIVE_TARGET_CEILING`
       + `=${ceiling} a handle waits up to ${deferrals} deferral(s), so two refreshes of `
       + `one handle can be ${gap}s apart, which is not under the ${deadline}s reclaim in `
-      + `force (SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC). Lower the ceiling or the interval, `
+      + `force (SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC). The gap is `
+      + `(1 + ${deferrals}) * ${input.keepaliveIntervalSec}s interval + `
+      + `(2 + ${deferrals}) * ${input.sweepSpanSec}s span, so this configuration needs `
+      + `SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC > ${gap}. Lower the ceiling or the interval, `
       + `or declare a longer deadline.`,
     );
   }

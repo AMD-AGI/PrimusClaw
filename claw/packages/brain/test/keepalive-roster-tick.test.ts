@@ -118,11 +118,17 @@ beforeEach(() => {
   resetBackgroundWorkStateForTest();
   restoreProviders = bindSandboxProviders({
     safeWorkload: {
-      async exec(inst: { id: string }) {
+      async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
+      // The ping phase is a control-plane status read: it confirms the workload
+      // is still Running and renews the record, without entering the container.
+      // The same read fronts the roster probe. Tests about a conclusive phase or
+      // a stop rebind a provider of their own.
+      async get(inst: { id: string }) {
         pinged.push(inst.id);
         onPing?.();
-        return { exitCode: 0, stdout: "", stderr: "" };
+        return { running: true, healthy: true, state: "running" };
       },
+      async stop() {},
     } as unknown as SandboxProvider,
   });
 });
@@ -393,12 +399,13 @@ test("last activity never ages past the idle deadline, over four of them", async
   restoreProviders?.();
   restoreProviders = bindSandboxProviders({
     safeWorkload: {
-      async exec(inst: { id: string }) {
+      async get(inst: { id: string }) {
         pinged.push(inst.id);
         now += PING_MS;
         lastActivity.set(inst.id, now);
-        return { exitCode: 0, stdout: "", stderr: "" };
+        return { running: true, healthy: true, state: "running" };
       },
+      async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
     } as unknown as SandboxProvider,
   });
 
@@ -448,11 +455,12 @@ test("a target that arrives or leaves cannot push a deferred one further back", 
   restoreProviders?.();
   restoreProviders = bindSandboxProviders({
     safeWorkload: {
-      async exec(inst: { id: string }) {
+      async get(inst: { id: string }) {
         pinged.push(inst.id);
         now += PING_MS;
-        return { exitCode: 0, stdout: "", stderr: "" };
+        return { running: true, healthy: true, state: "running" };
       },
+      async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
     } as unknown as SandboxProvider,
   });
 
@@ -689,16 +697,21 @@ test("many unresponsive retained containers do not stretch the sweep past its sp
   restoreProviders?.();
   restoreProviders = bindSandboxProviders({
     safeWorkload: {
+      // A ping is a control-plane read and stays cheap, so what this measures is
+      // the census and not the ping phase.
+      async get(inst: { id: string }) {
+        pinged.push(inst.id);
+        now += 100;
+        return { running: true, healthy: true, state: "running" };
+      },
       async exec(inst: { id: string }, command: string) {
         // The gather command is the expensive one: a container that will not
-        // answer holds it for the whole exec timeout. A ping is cheap and stays
-        // cheap, so what this measures is the census and not the ping phase.
+        // answer holds it for the whole exec timeout.
         if (command.includes("MARKER")) {
           gathered.push(inst.id);
           now += READ_MS;
           return { exitCode: 0, stdout: "", stderr: "" };
         }
-        pinged.push(inst.id);
         now += 100;
         return { exitCode: 0, stdout: "", stderr: "" };
       },
@@ -762,13 +775,17 @@ test("a retention whose release fails does not cost the fleet its refresh", asyn
   restoreProviders?.();
   restoreProviders = bindSandboxProviders({
     safeWorkload: {
-      async exec(inst: { id: string }, command: string) {
+      async get(inst: { id: string }) {
+        pinged.push(inst.id);
+        now += 100;
+        return { running: true, healthy: true, state: "running" };
+      },
+      async exec(_inst: { id: string }, command: string) {
         if (command.includes("MARKER")) {
           // Answers `clear`, so the read reaches the release that then fails.
           now += 100;
           return { exitCode: 0, stdout: CLEAR, stderr: "" };
         }
-        pinged.push(inst.id);
         now += 100;
         return { exitCode: 0, stdout: "", stderr: "" };
       },
@@ -817,9 +834,13 @@ test("a retention whose work has finished is read even when stuck ones lead the 
   restoreProviders?.();
   restoreProviders = bindSandboxProviders({
     safeWorkload: {
+      async get(inst: { id: string }) {
+        pinged.push(inst.id);
+        now += 100;
+        return { running: true, healthy: true, state: "running" };
+      },
       async exec(inst: { id: string }, command: string) {
         if (!command.includes("MARKER")) {
-          pinged.push(inst.id);
           now += 100;
           return { exitCode: 0, stdout: "", stderr: "" };
         }
@@ -884,9 +905,13 @@ test("the tail of the walk gets its turn however many stuck containers lead it",
   restoreProviders?.();
   restoreProviders = bindSandboxProviders({
     safeWorkload: {
+      async get(inst: { id: string }) {
+        pinged.push(inst.id);
+        now += 100;
+        return { running: true, healthy: true, state: "running" };
+      },
       async exec(inst: { id: string }, command: string) {
         if (!command.includes("MARKER")) {
-          pinged.push(inst.id);
           now += 100;
           return { exitCode: 0, stdout: "", stderr: "" };
         }
@@ -966,9 +991,13 @@ test("a slow preliminary walk cannot spend the retention-read budget", async () 
   restoreProviders?.();
   restoreProviders = bindSandboxProviders({
     safeWorkload: {
+      async get(inst: { id: string }) {
+        pinged.push(inst.id);
+        now += 100;
+        return { running: true, healthy: true, state: "running" };
+      },
       async exec(inst: { id: string }, command: string) {
         if (!command.includes("MARKER")) {
-          pinged.push(inst.id);
           now += 100;
           return { exitCode: 0, stdout: "", stderr: "" };
         }
@@ -1055,6 +1084,17 @@ test("a parked handle that expires gives its slot back", async () => {
   const hold = await admitSandbox("sess-park");
   await hold.bind(identity);
   kv.seed("hands.sess-park", retained("wl-park"));
+
+  // The roster is read only once the control plane confirms Running, and the
+  // expiry stops the workload before it clears the record.
+  restoreProviders?.();
+  restoreProviders = bindSandboxProviders({
+    safeWorkload: {
+      async get() { return { running: true, healthy: true, state: "running" }; },
+      async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
+      async stop() {},
+    } as unknown as SandboxProvider,
+  });
 
   // The background-work probe answers a tick behind, so the idle verdict this
   // expiry depends on lands on a later sweep than the one that asks for it --
@@ -1147,9 +1187,13 @@ test("a finished retention is read within its bound when refreshes permute the w
   restoreProviders?.();
   restoreProviders = bindSandboxProviders({
     safeWorkload: {
+      async get(inst: { id: string }) {
+        pinged.push(inst.id);
+        now += 100;
+        return { running: true, healthy: true, state: "running" };
+      },
       async exec(inst: { id: string }, command: string) {
         if (!command.includes("MARKER")) {
-          pinged.push(inst.id);
           now += 100;
           return { exitCode: 0, stdout: "", stderr: "" };
         }
@@ -1236,12 +1280,16 @@ test("a census read that outlasts the container timeout still fits the census ce
   restoreProviders?.();
   restoreProviders = bindSandboxProviders({
     safeWorkload: {
+      // The first ping marks the end of the census: nothing between them awaits
+      // a container, and the stub's store answers for free.
+      async get(inst: { id: string }) {
+        censusEndedAt ??= now;
+        pinged.push(inst.id);
+        now += 100;
+        return { running: true, healthy: true, state: "running" };
+      },
       async exec(inst: { id: string }, command: string, _timeout: string, signal?: AbortSignal) {
         if (!command.includes("MARKER")) {
-          // The first ping marks the end of the census: nothing between them
-          // awaits a container, and the stub's store answers for free.
-          censusEndedAt ??= now;
-          pinged.push(inst.id);
           now += 100;
           return { exitCode: 0, stdout: "", stderr: "" };
         }
@@ -1370,9 +1418,13 @@ test("a restart mid-cycle costs the tail one more cycle and no more", async () =
   restoreProviders?.();
   restoreProviders = bindSandboxProviders({
     safeWorkload: {
+      async get(inst: { id: string }) {
+        pinged.push(inst.id);
+        now += 100;
+        return { running: true, healthy: true, state: "running" };
+      },
       async exec(inst: { id: string }, command: string) {
         if (!command.includes("MARKER")) {
-          pinged.push(inst.id);
           now += 100;
           return { exitCode: 0, stdout: "", stderr: "" };
         }
@@ -1458,9 +1510,13 @@ test("a retention the walk could not read keeps its place in the queue", async (
   restoreProviders?.();
   restoreProviders = bindSandboxProviders({
     safeWorkload: {
+      async get(inst: { id: string }) {
+        pinged.push(inst.id);
+        now += 100;
+        return { running: true, healthy: true, state: "running" };
+      },
       async exec(inst: { id: string }, command: string) {
         if (!command.includes("MARKER")) {
-          pinged.push(inst.id);
           now += 100;
           return { exitCode: 0, stdout: "", stderr: "" };
         }

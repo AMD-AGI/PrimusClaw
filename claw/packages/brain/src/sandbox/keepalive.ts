@@ -4,13 +4,15 @@
 import { randomBytes } from "node:crypto";
 import { StringCodec, type KV } from "nats";
 import { isRevisionConflict } from "@claw/utils";
-import { applyRunEndedIdleFields, PROTECTED_CLASSES, type RunEndedParkResult } from "@claw/protocol";
+import { applyRunEndedIdleFields, type RunEndedParkResult } from "@claw/protocol";
 // The verdict rules are imported, never restated. `usableSharedVerdict` is read
 // here and by the API's orphan-handle sweep, which must not stop a sandbox this
 // file is still holding for background work; one definition is what keeps the
 // two answering the same question. See sandbox/bg-verdict.ts in @claw/protocol.
+// Brain idle-expiry uses first confirmed empty (`quiescedAt`); destroy requires
+// a sync jobs count of zero. Multi-node clusters are reclaimed after sandbox destroy.
 import {
-  BG_VERDICT_TTL_MS, SHARED_VERDICT_FIELDS, measuredUnderThisIdlePeriod, reuseWindowStart,
+  BG_VERDICT_TTL_MS, SHARED_VERDICT_FIELDS, measuredUnderThisIdlePeriod,
   sameIdlePeriod, usableSharedVerdict,
   type BackgroundWork, type SharedVerdictFields,
 } from "@claw/protocol";
@@ -22,15 +24,14 @@ import {
 } from "../config.js";
 import { clearRetryPending, getRetryPending, isRetryPendingExpired } from "../tasks/retry-pending.js";
 import { isTombstone } from "../tasks/lock.js";
-import { destroyHands } from "./reaper.js";
+import { destroyHands, handsStopCeilingMs } from "./reaper.js";
 import {
-  handsEntryKeys, readHandsEntry, reconcileReservedKeys, retentionStore,
-  sessionHasActiveRunLease,
+  bindHandsKv, handsEntryKeys, readHandsEntry, reconcileReservedKeys, retentionStore,
+  readRunLeaseState, sessionHasActiveRunLease,
 } from "./registry.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
 import { dagsNamingWorkload, listAllDagHandles, releaseHandlesForWorkload } from "./handles.js";
 import type { HandleInfo } from "@claw/protocol";
-import { HandsLivenessIndeterminate, countActiveShells } from "../clients/hands.js";
 import { reconcileTargets, renewAndReap, type RosterConfig, type RosterStore } from "./admission-roster.js";
 import {
   latchRosterStale, markCensusReconciled, markRosterStale, releaseAdmission,
@@ -38,13 +39,23 @@ import {
 import { pingsPerSweep } from "./keepalive-capacity.js";
 import pino from "pino";
 import { isRetentionEntry, sessionIdFromHandsKey } from "./hands-key.js";
-import { instanceFromEntry } from "./container-probe.js";
+import { instanceFromEntry, type HandsProbeEntry } from "./container-probe.js";
 import { LIVE_WORK_READ_CEILING_MS, countLiveWork } from "./live-work-gate.js";
 import type { SandboxInstance } from "./provider.js";
 import {
   ledgerKeyForRetention, reassertRetentions, releaseRetention,
 } from "./retain-container.js";
 import { HANDS_STATE_DIR } from "./bootstrap.js";
+import {
+  assertSandboxRunning,
+  inspectSandboxJobs,
+  JOBS_PROBE_BUDGET_MS,
+  SandboxJobsUnavailableError,
+  SandboxTerminalProbeError,
+  SandboxTrackingLostError,
+  type JobsProbeResult,
+} from "./job-probe.js";
+import { SandboxGoneError, SandboxRuntimeTerminalError } from "./errors.js";
 
 const logger = pino({ name: "sandbox-keepalive" });
 const sc = StringCodec();
@@ -59,6 +70,8 @@ export interface SandboxEntry {
   sandboxName?: string;  // agent-sandbox
   namespace?: string;
   userId?: string;       // agent-sandbox: BYOK identity forwarded to the Router
+  /** Multi-node cluster workload id (= message id) for cascade reclaim. */
+  messageId?: string;
 }
 
 /**
@@ -70,7 +83,7 @@ export interface SandboxEntry {
  * rules that interpret it (`@claw/protocol` sandbox/bg-verdict).
  */
 interface HandsKvEntry extends SharedVerdictFields {
-  status?: "pending" | "ready";
+  status?: "pending" | "ready" | "reclaiming" | "closing";
   provider?: "safe-workload" | "agent-sandbox";
   workloadId?: string;
   sessionId?: string;
@@ -101,9 +114,14 @@ interface HandsKvEntry extends SharedVerdictFields {
   taskId?: string | null;
   attemptId?: string | null;
   dagRootTaskId?: string | null;
-  /** False on a post-task idle reuse handle: kept for reuse but NOT pinged so
-   *  the pod idles out via the control-plane GC. Set by stopKeepaliveAfterTask. */
+  /** False on a post-task idle reuse handle: kept for reuse but not pinged.
+   *  Brain idle reclaim (or the workload hard TTL) tears it down. */
   keepalive?: boolean;
+  /** Epoch ms when EnvD first reported no tracked user jobs. */
+  quiescedAt?: number;
+  /** Identity of the Pod and EnvD process that produced the jobs verdict. */
+  podUid?: string;
+  envdInstanceId?: string;
   /**
    * Per-call token used to confirm an idle write whose acknowledgement was lost.
    * The sweep does not use it.
@@ -114,16 +132,25 @@ interface HandsKvEntry extends SharedVerdictFields {
    * while any unexpired reservation remains; each probe releases only its token.
    */
   bgProbes?: Record<string, number>;
+  /** Sandbox terminal reason observed after the workload reached Running. */
+  terminalReason?: string;
   /** True on a handle parked by a session delete rather than by a finished task.
    *  The multi-node sweep reclaims these without waiting out the idle window,
    *  there being no next message to hold a cluster for. Set by parkHandsHandle. */
   sessionDeleted?: boolean;
+  /** Multi-node cluster workload id (= message id) for destroyHands cascade. */
+  messageId?: string;
 }
 
 interface KeepaliveDeps {
   kv: KV;
-  /** Test seam for the background-work probe. */
+  /** Test seam for the EnvD jobs probe. Production never calls Hands here. */
   countActiveShells?: (url: string, token: string, owner: string) => Promise<number>;
+  /** Publish a terminal sandbox event to the session event stream. */
+  emitSandboxFailure?: (
+    sessionId: string,
+    event: Record<string, unknown>,
+  ) => Promise<void>;
   /** Test seam for the durable DAG handle map, which needs JetStream otherwise. */
   listDagHandles?: () => Promise<Array<[string, Record<string, HandleInfo>]>>;
   /**
@@ -137,6 +164,8 @@ interface KeepaliveDeps {
   ) => Promise<void>;
   /** Test seam for the ping-phase budget. */
   pingBudgetMs?: number;
+  /** Test seam for the idle-expiry budget. */
+  idleExpiryBudgetMs?: number;
   /**
    * Test seam for the clock the ping deadline is measured against.
    *
@@ -156,6 +185,34 @@ interface KeepaliveDeps {
    * admitted ones leave -- which starves exactly the target holding live work.
    */
   roster?: { store: RosterStore; config: RosterConfig };
+}
+
+/** Read the authoritative user-job count for idle reclaim. */
+async function probeUserProcesses(
+  deps: KeepaliveDeps,
+  info: HandsKvEntry,
+  sessionId: string,
+  opts?: { persistIdentity?: boolean },
+): Promise<number> {
+  const entry = { ...info, sessionId: info.sessionId || sessionId };
+  if (deps.countActiveShells) {
+    // The roster read is substituted; the control-plane check is not. A
+    // workload reported absent or terminal is that regardless of who counts
+    // its jobs, and the substitution must not turn it into an unknown.
+    await assertSandboxRunning(entry);
+    return deps.countActiveShells(info.handsUrl ?? "", info.token ?? "", sessionId);
+  }
+  const result = await inspectSandboxJobs(entry);
+  // Expiry CAS is conditioned on the enrollment revision. Persisting identity
+  // here bumps that revision and the subsequent closing write self-collides.
+  if (opts?.persistIdentity !== false) {
+    await persistJobsIdentity(deps, sessionId, result);
+  }
+  return result.count;
+}
+
+function isClosingStatus(status: HandsKvEntry["status"]): boolean {
+  return status === "closing" || status === "reclaiming";
 }
 
 let timer: ReturnType<typeof setInterval> | null = null;
@@ -667,6 +724,7 @@ function sandboxEntryFrom(info: HandsKvEntry): SandboxEntry | null {
     sandboxName: info.sandboxName,
     namespace: info.namespace,
     userId: info.userId,
+    messageId: info.messageId || undefined,
   };
 }
 
@@ -707,19 +765,26 @@ function sandboxRegistryKey(entry: SandboxEntry): string {
  * identity is the only way to tell them apart, so an unreadable or
  * non-matching record is passed over rather than guessed at.
  */
-async function recordKeyNamingSandbox(
+async function recordNamingSandbox(
   kv: KV, sessionId: string, entry: SandboxEntry,
-): Promise<string | null> {
+): Promise<{ key: string; info: HandsKvEntry; record: HandsRecord } | null> {
   for (const key of handsEntryKeys(sessionId)) {
     const found = await kv.get(key).catch(() => null);
     if (!found) continue;
     try {
-      if (sameRegisteredSandbox(entry, JSON.parse(sc.decode(found.value)) as HandsKvEntry)) {
-        return key;
+      const info = JSON.parse(sc.decode(found.value)) as HandsKvEntry;
+      if (sameRegisteredSandbox(entry, info)) {
+        return { key, info, record: { value: found.value, revision: found.revision } };
       }
     } catch { /* unreadable is not evidence that this is the record we want */ }
   }
   return null;
+}
+
+async function recordKeyNamingSandbox(
+  kv: KV, sessionId: string, entry: SandboxEntry,
+): Promise<string | null> {
+  return (await recordNamingSandbox(kv, sessionId, entry))?.key ?? null;
 }
 
 /**
@@ -766,6 +831,7 @@ function entryIdentity(info: HandsKvEntry): string {
 /** Drop orphaned READY sandboxes when a retryable attempt was never redelivered. */
 async function shouldSkipExpiredRetry(
   deps: KeepaliveDeps,
+  census: TargetCensus,
   sessionId: string,
   source: "local" | "kv",
   entry?: SandboxEntry,
@@ -790,7 +856,8 @@ async function shouldSkipExpiredRetry(
     // Nothing is known, so nothing is released: the next sweep asks again.
     return false;
   }
-  if (activeLock) {
+  // A released lease reads back as a tombstone, not a miss.
+  if (activeLock && !isTombstone(activeLock)) {
     logger.warn(
       {
         sessionId,
@@ -808,30 +875,277 @@ async function shouldSkipExpiredRetry(
     return false;
   }
 
-  unregisterSandbox(sessionId, entry);
-  await deleteExpiredRetryRecord(deps.kv, sessionId, recordKey, entry);
-  await clearRetryPending(deps.kv, sessionId, pending.lockKey);
-  logger.warn(
-    {
-      sessionId,
-      source,
-      attempt: pending.attempt,
-      messageId: pending.messageId,
-      lockKey,
-      reasonClass: pending.reasonClass,
-      reason: pending.reason,
-      workloadId: entry?.workloadId || pending.workloadId,
-      graceSec: pending.graceSec,
-      ageMs: nowMs - pending.createdAtMs,
-      createdAtMs: pending.createdAtMs,
-      createdAtIso: new Date(pending.createdAtMs).toISOString(),
-      deadlineMs: pending.deadlineMs,
-      deadlineIso: new Date(pending.deadlineMs).toISOString(),
-      expiredByMs: nowMs - pending.deadlineMs,
+  // The retry owned one generation of this session. A pending record is
+  // session-scoped, so the sibling generation's handle sees it too -- and that
+  // sibling can be live. A record naming something else is not this retry's to
+  // stop, and stays an ordinary target of the walk.
+  if (pending.workloadId && entry?.workloadId && pending.workloadId !== entry.workloadId) {
+    return false;
+  }
+
+
+  // Resolved by identity, not by whichever key answers first: during a rolling
+  // upgrade the canonical key can hold a different, live generation, and both
+  // the stop and the delete have to land on the one this retry owned.
+  let record: Awaited<ReturnType<typeof recordNamingSandbox>> = null;
+  try {
+    record = entry ? await recordNamingSandbox(deps.kv, sessionId, entry) : null;
+  } catch (err) {
+    logger.warn({ err, sessionId }, "keepalive.retry_pending_entry_read_failed");
+    return false;
+  }
+  if (!record) {
+    // Nothing on record names it, so there is nothing to stop and nothing this
+    // may delete -- deleting the record that does answer would strand the
+    // workload it names. The orphan, if there is one, is left to the bucket TTL.
+    unregisterSandbox(sessionId, entry);
+    await clearRetryPending(deps.kv, sessionId, pending.lockKey);
+    logger.warn(
+      { sessionId, source, workloadId: entry?.workloadId || pending.workloadId },
+      "keepalive.retry_pending_record_unresolved",
+    );
+    return true;
+  }
+
+  const named = record;
+  const info = named.info;
+
+  // An undelivered retry says nothing about what is running inside the
+  // sandbox, and this path stops the workload rather than only dropping its
+  // pointer -- so the reclaim evidence has to be asked for at the destructive
+  // boundary (confirm below), not from the walk-time peek cache. A background
+  // shell started by an earlier task of this session outlives the message that
+  // started it; the lock this retry released is a statement about that
+  // message, not about the container. READY / keepalive:true handles never
+  // carry a usable peek verdict here (clearIdleMarkers / registerSandbox wipe
+  // it), so peeking would always pass and stop live work.
+  //
+  // Walk-time lease filter only: the queue confirm rechecks lease and lock
+  // after the (bounded) delay before destroyHands. Unknown is not free.
+  {
+    const scope = typeof info.runScope === "string" && info.runScope
+      ? info.runScope : sessionId;
+    if ((await readRunLeaseState(deps.kv, scope)) !== "free") return false;
+  }
+
+  // Stop the workload (and messageId-scoped MN cluster) before dropping the
+  // hands pointer. Control-plane idle-GC no longer cleans up after a bare KV
+  // delete, so releasing the pointer alone would orphan the sandbox until its
+  // workload timeout.
+  const known: HandsProbeEntry = {
+    provider: info.provider,
+    workloadId: info.workloadId || entry?.workloadId || pending.workloadId,
+    platformKey: info.platformKey || entry?.platformKey,
+    token: info.token,
+    sessionId: info.sessionId || entry?.sessionId,
+    sandboxName: info.sandboxName || entry?.sandboxName,
+    namespace: info.namespace || entry?.namespace,
+    userId: info.userId || entry?.userId,
+    // Only from the handle. `pending.messageId` is the message the retry was
+    // for, which every session has; the cascade field is a multi-node cluster
+    // id, which only a multi-node handle records. Backfilled from the retry it
+    // sent every single-node teardown looking for clusters that never existed.
+    messageId: info.messageId || entry?.messageId,
+  };
+
+  // Queued, not awaited: this runs inside the serial walk of the bucket, and a
+  // stop carries its own retries and sleeps. Run here, one unresponsive control
+  // plane spends the sweep on teardowns and the ping phase behind it never
+  // renews a live record. The queue is bounded by the idle-expiry budget, and
+  // the bookkeeping below is only correct once the stop has succeeded, so it
+  // travels with the item rather than running now.
+  if (teardownDeferred(sessionId, nowMs)) return true;
+  if (census.expiredRetriesQueued.has(sessionId)) return true;
+  census.expiredRetriesQueued.add(sessionId);
+  census.teardowns.push({
+    sessionId,
+    info: known,
+    token: info.token,
+    site: "retry_pending_stop_retry",
+    confirm: () => confirmExpiredRetryStop(
+      deps, sessionId, info, lockKey, named.key, named.record, known,
+    ),
+    after: async () => {
+      unregisterSandbox(sessionId, entry);
+      // A teardown that owned the record has already removed it under its own
+      // CAS; only one it could not claim is left for this to drop.
+      if (entry && await recordKeyNamingSandbox(deps.kv, sessionId, entry)) {
+        await deleteExpiredRetryRecord(deps.kv, sessionId, recordKey, entry);
+      }
+      await clearRetryPending(deps.kv, sessionId, pending.lockKey);
+      logger.warn(
+        {
+          sessionId,
+          source,
+          attempt: pending.attempt,
+          messageId: pending.messageId,
+          lockKey,
+          reasonClass: pending.reasonClass,
+          reason: pending.reason,
+          workloadId: entry?.workloadId || pending.workloadId,
+          graceSec: pending.graceSec,
+          ageMs: nowMs - pending.createdAtMs,
+          createdAtMs: pending.createdAtMs,
+          createdAtIso: new Date(pending.createdAtMs).toISOString(),
+          deadlineMs: pending.deadlineMs,
+          deadlineIso: new Date(pending.deadlineMs).toISOString(),
+          expiredByMs: nowMs - pending.deadlineMs,
+        },
+        "keepalive.retry_pending_expired",
+      );
     },
-    "keepalive.retry_pending_expired",
-  );
+  });
   return true;
+}
+
+/**
+ * Destructive-boundary evidence for an expired retry-pending stop.
+ *
+ * Same shape as idle reclaim: only an explicit empty jobs roster authorises
+ * destroyHands, and after that probe the enrollment must still be claimable
+ * through claimIdleStop (lock / lease / identity / ready→closing CAS). Lock
+ * and run-lease are checked before the probe as a cheap filter, then again
+ * after it -- a redelivery that lands during the probe window must win.
+ */
+async function confirmExpiredRetryStop(
+  deps: KeepaliveDeps,
+  sessionId: string,
+  info: HandsKvEntry,
+  lockKey: string,
+  recordKey: string,
+  enrollment: HandsRecord,
+  expected: SandboxEntry,
+): Promise<boolean> {
+  try {
+    const lock = await deps.kv.get(`lock.${lockKey}`);
+    if (lock && !isTombstone(lock)) {
+      logger.warn(
+        { sessionId, lockKey, workloadId: info.workloadId },
+        "keepalive.retry_pending_stop_deferred_lock_active",
+      );
+      return false;
+    }
+  } catch (err) {
+    logger.warn({ err, sessionId, lockKey }, "keepalive.retry_pending_stop_lock_read_failed");
+    return false;
+  }
+  {
+    const scope = typeof info.runScope === "string" && info.runScope
+      ? info.runScope : sessionId;
+    if ((await readRunLeaseState(deps.kv, scope)) !== "free") {
+      logger.info(
+        { sessionId, workloadId: info.workloadId },
+        "keepalive.retry_pending_stop_deferred_run_lease",
+      );
+      return false;
+    }
+  }
+  if (!canProbeJobs(info, sessionId)) {
+    logger.warn(
+      { sessionId, workloadId: info.workloadId },
+      "keepalive.retry_pending_stop_deferred_unprobeable",
+    );
+    return false;
+  }
+  const identity = entryIdentity(info);
+  // Enrollment revision is taken here, not at walk queue time: the KV walk may
+  // renew the same key after the teardown was queued, and a stale revision
+  // would self-collide on the closing CAS.
+  let enrollmentNow = enrollment;
+  let infoNow = info;
+  try {
+    const fresh = await deps.kv.get(recordKey);
+    if (!fresh || isTombstone(fresh)) return false;
+    const parsed = JSON.parse(sc.decode(fresh.value)) as HandsKvEntry;
+    if (!sameRegisteredSandbox(expected, {
+      provider: parsed.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload",
+      workloadId: parsed.workloadId,
+      platformKey: parsed.platformKey,
+      sessionId: parsed.sessionId,
+      sandboxName: parsed.sandboxName,
+      namespace: parsed.namespace,
+    })) {
+      logger.info(
+        { sessionId, workloadId: info.workloadId },
+        "keepalive.retry_pending_stop_deferred_identity",
+      );
+      return false;
+    }
+    infoNow = { ...info, ...parsed };
+    enrollmentNow = { value: fresh.value, revision: fresh.revision };
+  } catch {
+    return false;
+  }
+  const claimRevision = enrollmentNow.revision;
+  try {
+    const running = await probeUserProcesses(deps, infoNow, sessionId, {
+      persistIdentity: false,
+    });
+    if (running > 0) {
+      logger.info(
+        { sessionId, workloadId: infoNow.workloadId, running },
+        "keepalive.retry_pending_stop_deferred_jobs_busy",
+      );
+      return false;
+    }
+  } catch (err) {
+    // Unavailable / tracking_lost / soft control-plane faults never authorise
+    // a stop. Terminal/absent are conclusions about the workload, not a zero
+    // roster, and this path is only for reclaiming an orphaned READY handle.
+    logger.warn(
+      {
+        err: (err as Error)?.message ?? String(err),
+        sessionId,
+        workloadId: infoNow.workloadId,
+      },
+      "keepalive.retry_pending_stop_evidence_unavailable",
+    );
+    return false;
+  }
+
+  // Probe window: a redelivery may have taken the lock or run lease, or written
+  // a new generation onto the same key. Recheck and CAS via claimIdleStop.
+  try {
+    const lock = await deps.kv.get(`lock.${lockKey}`);
+    if (lock && !isTombstone(lock)) {
+      logger.warn(
+        { sessionId, lockKey, workloadId: infoNow.workloadId },
+        "keepalive.retry_pending_stop_deferred_lock_active",
+      );
+      return false;
+    }
+  } catch (err) {
+    logger.warn({ err, sessionId, lockKey }, "keepalive.retry_pending_stop_lock_read_failed");
+    return false;
+  }
+  let claimedInfo = infoNow;
+  try {
+    const latest = await deps.kv.get(recordKey);
+    if (!latest || isTombstone(latest)) return false;
+    const parsed = JSON.parse(sc.decode(latest.value)) as HandsKvEntry;
+    if (!sameRegisteredSandbox(expected, {
+      provider: parsed.provider === "agent-sandbox" ? "agent-sandbox" : "safe-workload",
+      workloadId: parsed.workloadId,
+      platformKey: parsed.platformKey,
+      sessionId: parsed.sessionId,
+      sandboxName: parsed.sandboxName,
+      namespace: parsed.namespace,
+    })) {
+      logger.info(
+        { sessionId, workloadId: infoNow.workloadId },
+        "keepalive.retry_pending_stop_deferred_identity",
+      );
+      return false;
+    }
+    claimedInfo = { ...infoNow, ...parsed };
+  } catch {
+    return false;
+  }
+  return claimIdleStop(
+    deps, recordKey, identity, sessionId, claimedInfo, claimRevision, enrollmentNow,
+    undefined,
+    { collectingIdentity: identity, expected },
+  );
 }
 
 /** Register a sandbox for keepalive pinging. Called by ensureHands. */
@@ -985,6 +1299,7 @@ export function markHandsIdle(
         Date.now(),
         entry.revision,
       );
+      delete info.quiescedAt;
       // Conditional update prevents resurrecting a concurrently deleted handle.
       const witness = nextEntryToken();
       info.idleWriter = witness;
@@ -1029,6 +1344,123 @@ const BG_UNKNOWN_STREAK_TTL_MS = 4 * 60 * 60_000;
  * and are rotated into later sweeps.
  */
 const BG_PROBE_MAX_IN_FLIGHT = 8;
+const IDLE_EXPIRY_MAX_IN_FLIGHT = 4;
+
+/**
+ * How long a teardown that failed waits before the walk offers it again.
+ *
+ * A stop that cannot succeed leaves its record `closing`, and the walk reaches
+ * a `closing` record every sweep. Attempted unconditionally, one unreachable
+ * control plane makes every sweep re-pay the stop's full cost for a set that
+ * never shrinks, and the phase that renews every live record is the one behind
+ * it. Deferring converges the cost without abandoning the teardown: the record
+ * stays, and the next sweep past the backoff tries again.
+ *
+ * Derived from the sweep cadence rather than fixed, because a backoff at or
+ * below one interval expires before the next sweep reaches the record and defers
+ * nothing at all. A fixed number would read as a backoff while being none on
+ * any deployment whose interval caught up with it.
+ *
+ * Kept in memory rather than on the record. The cost being bounded is this
+ * replica's sweep, a replica that restarted has no teardown of its own left to
+ * defer, and writing it would put a conditional update in the path of a stop
+ * that is already failing.
+ */
+// Capped below the bucket TTL: a closing record is not renewed by the ping
+// phase, so a backoff at or above the TTL expires the entry before the retry
+// can fire and silently abandons the stop.
+export const TEARDOWN_RETRY_BACKOFF_MS = Math.min(
+  Math.max(1, SANDBOX_KEEPALIVE_INTERVAL_SEC) * 5 * 1000,
+  Math.max(1, Math.floor(BRAIN_REGISTRY_TTL_MS / 2)),
+);
+const teardownRetryAt = new Map<string, number>();
+
+/**
+ * Drop the backoffs whose wait has passed.
+ *
+ * `teardownDeferred` clears an entry when it is asked about one, and a handle
+ * that leaves the bucket is never asked about again -- so without this the map
+ * keeps a row per session that was ever deferred, for the life of the process.
+ */
+function pruneTeardownBackoff(now: number): void {
+  for (const [sessionId, until] of teardownRetryAt) {
+    if (now >= until) teardownRetryAt.delete(sessionId);
+  }
+}
+
+/** Whether a teardown that failed is still inside its backoff. */
+function teardownDeferred(sessionId: string, now: number): boolean {
+  const until = teardownRetryAt.get(sessionId);
+  if (until === undefined) return false;
+  if (now >= until) {
+    teardownRetryAt.delete(sessionId);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Refresh every target the census still holds after a phase that can outlast a
+ * single bucket TTL between the walk's renew and the ping phase's.
+ */
+async function renewCensusTargets(
+  deps: KeepaliveDeps,
+  targets: Map<string, RegisteredSandbox>,
+): Promise<void> {
+  for (const registered of targets.values()) {
+    const sid = registered.entry.sessionId || registered.sessionId;
+    if (!sid) continue;
+    try {
+      const existing = await readHandsEntry(deps.kv, sid);
+      if (!existing) continue;
+      await deps.kv.update(existing.key, existing.entry.value, existing.revision);
+    } catch {
+      // The ping phase retries; a missed refresh here is not a stop.
+    }
+  }
+}
+
+/** Refresh hands keys still held after the idle-expiry phase. */
+async function renewIdleExpiryCandidates(
+  deps: KeepaliveDeps,
+  expiries: Array<{ candidate: ProbeCandidate }>,
+): Promise<void> {
+  for (const { candidate } of expiries) {
+    const sid = candidate.sessionId;
+    if (!sid) continue;
+    try {
+      const existing = await readHandsEntry(deps.kv, sid);
+      if (!existing) continue;
+      await deps.kv.update(existing.key, existing.entry.value, existing.revision);
+    } catch {
+      // Same stance as renewCensusTargets: a missed refresh is not a stop.
+    }
+  }
+}
+
+/** Refresh parked idle handles that are still inside the reuse window. */
+async function renewIdleHolds(
+  deps: KeepaliveDeps,
+  holds: Array<{ sessionId: string }>,
+): Promise<void> {
+  for (const { sessionId: sid } of holds) {
+    if (!sid) continue;
+    try {
+      const existing = await readHandsEntry(deps.kv, sid);
+      if (!existing) continue;
+      await deps.kv.update(existing.key, existing.entry.value, existing.revision);
+    } catch {
+      // A missed refresh is not a stop; the next sweep asks again.
+    }
+  }
+}
+
+/**
+ * Cutoff for starting idle expiries in one sweep, a quarter of the record TTL.
+ * The ping phase behind it needs what is left to renew every live record before
+ * the bucket drops it.
+ */
+const IDLE_EXPIRY_BUDGET_MS = Math.max(1_000, Math.floor(BRAIN_REGISTRY_TTL_MS / 4));
 
 /**
  * Reservation deadline for a probe and its verdict write. It is shorter than
@@ -1047,6 +1479,17 @@ const BG_PROBE_RESERVE_ATTEMPTS = 8;
  * must outlast concurrent idle writes, but a persistent store fault stays bounded.
  */
 const BG_VERDICT_WRITE_ATTEMPTS = 64;
+
+/**
+ * Retry ceiling for an `idle` verdict. Lower than a running one, which still
+ * outlasts it under contention, but not one: every sweep writes this key -- the
+ * window on a working handle, the record renewal behind it, a probe reservation
+ * -- and a fleet has more than one replica sweeping. A single attempt made an
+ * empty roster contingent on landing in a gap between those writes, and a
+ * verdict that never lands leaves the sandbox held. Yielding to a newer running
+ * verdict is the guard below, not this ceiling.
+ */
+const BG_IDLE_VERDICT_WRITE_ATTEMPTS = 8;
 
 /**
  * How long the retention read phase may go on starting live-work reads.
@@ -1258,12 +1701,40 @@ export function keepaliveCensusPhaseCeilingSec(): number {
  */
 export function keepaliveSweepCeilingSec(): number {
   return keepaliveCensusPhaseCeilingSec()
+    + keepaliveIdleExpiryPhaseCeilingSec()
     + keepalivePingPhaseCeilingSec()
-    + Math.ceil((FAILURE_PHASE_BUDGET_MS + HANDS_STOP_CEILING_MS) / 1000);
+    + Math.ceil((FAILURE_PHASE_BUDGET_MS + handsStopCeiling()) / 1000);
 }
 
-/** Longest one started eviction may take, stop and retries together. */
-const HANDS_STOP_CEILING_MS = 30_000;
+/**
+ * The longest the idle-expiry phase can run: its budget bars the *starting* of
+ * a teardown, so the ones already in flight when it expires run on for their
+ * own ceiling. They run concurrently, so one ceiling is the term rather than
+ * one per slot.
+ *
+ * Two ceilings, because the work this phase starts is two calls: it reconfirms
+ * the roster at the destructive boundary, then stops the sandbox. The probe
+ * term is the budget the probe is given and not the provider's own timeout,
+ * which is what `JOBS_PROBE_BUDGET_MS` exists to make true.
+ */
+export function keepaliveIdleExpiryPhaseCeilingSec(): number {
+  return Math.ceil(
+    (IDLE_EXPIRY_BUDGET_MS + JOBS_PROBE_BUDGET_MS + handsStopCeiling()) / 1000,
+  );
+}
+
+/**
+ * Longest one started eviction may take, stop and retries together.
+ *
+ * Read from the retry bounds the stop itself uses rather than written here: as
+ * a constant it named a single attempt, so every phase that budgets around a
+ * teardown understated it by the retry count. Called rather than captured
+ * because the two modules import each other, and a value read at module scope
+ * would be read before the bounds it derives from exist.
+ */
+function handsStopCeiling(): number {
+  return handsStopCeilingMs();
+}
 
 /** Longest one ping may take before its own timeout ends it. */
 const HANDS_PING_CEILING_MS = 15_000;
@@ -1300,6 +1771,7 @@ export function resetBackgroundWorkStateForTest(): void {
   bgProbeInFlight.clear();
   bgGeneration.clear();
   bgProbeCursor = 0;
+  teardownRetryAt.clear();
   // Rotation state like the cursor above it: a queue left by one test names keys
   // the next one never walks, and its first read phase would order itself around
   // retentions that do not exist.
@@ -1343,7 +1815,18 @@ function newTickStats(): TickStats {
 }
 
 /** Where a verdict came from, for the tick counters. */
-type VerdictSource = "mem" | "handle" | "none" | "no-hands";
+type VerdictSource = "mem" | "handle" | "none";
+
+/**
+ * Anchor for idle-expiry (scheme B): first confirmed empty jobs roster.
+ * Park's `idleSince` opens the idle period but does not start the reuse window;
+ * a long bg-shell that outlasts the park must still get a full window after it
+ * stops. Without `quiescedAt`, the handle is not clock-expired.
+ */
+function idleExpiryAnchor(info: HandsKvEntry): number | null {
+  return typeof info.quiescedAt === "number" ? info.quiescedAt : null;
+}
+
 
 /** This replica's own last answer, if it is fresh enough to reuse and still
  *  about the idle period the handle is in. */
@@ -1376,19 +1859,6 @@ function peekBackgroundWork(
 ): { state: BackgroundWork; source: VerdictSource; at?: number } {
   const cached = usableCachedVerdict(identity, info);
   const shared = usableSharedVerdict(info);
-  // Missing credentials mean this replica cannot ask again -- not that the
-  // answer is no. Returning `idle` here, before any verdict was read, threw
-  // away a witnessed `running` that another replica (or this one, before the
-  // token went) had already established: a sandbox with live background work
-  // was released because the address to re-check it had gone missing.
-  //
-  // So the evidence is read first, and the legacy `idle` is the fallback for
-  // the case it was written for: no credentials *and* nothing on record.
-  if (!info.handsUrl || !info.token) {
-    if (cached?.state === "running") return { state: "running", source: "mem", at: cached.at };
-    if (shared?.state === "running") return { state: "running", source: "handle", at: shared.at };
-    return { state: "idle", source: "no-hands" };
-  }
   if (cached?.state === "gone" || cached?.state === "unknown") {
     return { state: cached.state, source: "mem", at: cached.at };
   }
@@ -1407,9 +1877,22 @@ function peekBackgroundWork(
   return { state: "unknown", source: "none" };
 }
 
+/**
+ * Whether the handle contains enough control-plane identity to query EnvD jobs.
+ *
+ * agent-sandbox needs both the Router session id (header) and the CodeInterpreter
+ * name (URL path). sessionId alone still builds `.../code-interpreters//...`,
+ * which 404s as jobs-unavailable and never reclaim.
+ */
+function canProbeJobs(info: HandsKvEntry, sessionId: string): boolean {
+  return info.provider === "agent-sandbox"
+    ? !!(info.sessionId || sessionId) && !!info.sandboxName
+    : !!(info.workloadId && info.platformKey);
+}
+
 /** Whether this sandbox identity needs a new background-work probe. */
-function needsProbe(identity: string, info: HandsKvEntry): boolean {
-  if (!info.handsUrl || !info.token) return false;
+function needsProbe(identity: string, info: HandsKvEntry, sessionId: string): boolean {
+  if (!canProbeJobs(info, sessionId)) return false;
   // A verdict from another idle period cannot suppress a fresh probe.
   const cached = usableCachedVerdict(identity, info);
   if (cached && cached.state !== "unknown" && Date.now() - cached.at < BG_PROBE_REFRESH_MS) return false;
@@ -1489,6 +1972,74 @@ async function releaseProbe(
   } catch { /* best effort: the deadline is the backstop */ }
 }
 
+/** Bind jobs answers to the EnvD process that produced them. */
+async function persistJobsIdentity(
+  deps: KeepaliveDeps,
+  sessionId: string,
+  result: JobsProbeResult,
+): Promise<void> {
+  if (!result.podUid && !result.instanceId) return;
+  try {
+    const existing = await readHandsEntry(deps.kv, sessionId);
+    if (!existing) return;
+    const info = JSON.parse(existing.value) as HandsKvEntry;
+    const next: HandsKvEntry = {
+      ...info,
+      podUid: info.podUid || result.podUid,
+      envdInstanceId: info.envdInstanceId || result.instanceId,
+    };
+    if (next.podUid === info.podUid && next.envdInstanceId === info.envdInstanceId) return;
+    await deps.kv.update(existing.key, sc.encode(JSON.stringify(next)), existing.revision);
+  } catch {
+    // The next successful jobs probe retries the identity binding.
+  }
+}
+
+/** Publish a sandbox-failed event after a successful terminal CAS. */
+async function emitTerminalFailureEvent(
+  deps: KeepaliveDeps,
+  sessionId: string,
+  reason: string,
+): Promise<void> {
+  if (!deps.emitSandboxFailure) return;
+  await deps.emitSandboxFailure(sessionId, {
+    type: "sandboxStatus",
+    status: "failed",
+    reason,
+    message: `Sandbox workload entered terminal phase (${reason})`,
+  }).catch((err) => {
+    logger.warn({ err, sessionId, reason }, "keepalive.terminal_event_failed");
+  });
+}
+
+/**
+ * Persist one terminal verdict for a sandbox identity.
+ * Writes `terminalReason` and `status: closing` in a single CAS so a later
+ * reclaim cannot self-collide on the enrollment revision, then emits.
+ */
+async function reportTerminalFailure(
+  deps: KeepaliveDeps,
+  sessionId: string,
+  identity: string,
+  reason: string,
+): Promise<void> {
+  try {
+    const existing = await readHandsEntry(deps.kv, sessionId);
+    if (!existing) return;
+    const info = JSON.parse(existing.value) as HandsKvEntry;
+    if (entryIdentity(info) !== identity || info.terminalReason) return;
+    await deps.kv.update(
+      existing.key,
+      sc.encode(JSON.stringify({ ...info, terminalReason: reason, status: "closing" })),
+      existing.revision,
+    );
+  } catch {
+    // A later provider check reaches the same terminal result.
+    return;
+  }
+  await emitTerminalFailureEvent(deps, sessionId, reason);
+}
+
 interface ProbeCandidate {
   key: string;
   identity: string;
@@ -1533,18 +2084,38 @@ async function runBackgroundProbe(deps: KeepaliveDeps, probe: BackgroundProbe): 
     const reserved = await reserveProbe(deps, key, identity, token);
     if (!reserved || probeIsStale(probe)) return;
     try {
-      const running = await (deps.countActiveShells ?? countActiveShells)(
-        info.handsUrl!, info.token!, sessionId,
-      );
+      const running = await probeUserProcesses(deps, info, sessionId);
       await recordProbeVerdict(deps, probe, running > 0 ? "running" : "idle", running);
     } catch (err) {
       if (probeIsStale(probe)) return;
       await invalidateProbeVerdict(deps, probe);
       if (probeIsStale(probe)) return;
-      const evidence = await readProbeEvidence(probe);
-      if (probeIsStale(probe)) return;
-      if (evidence.state === "unknown") reportUnknownProbe(probe, err);
-      else await recordProbeVerdict(deps, probe, evidence.state, evidence.running);
+      if (err instanceof SandboxTerminalProbeError) {
+        if (err.state === "absent") {
+          logger.info(
+            { sessionId, workloadId: info.workloadId, reason: err.reason },
+            "keepalive.jobs_probe_absent",
+          );
+          // Published as a verdict rather than acted on here. Absence is not a
+          // session failure, so it carries no terminal reason; recording it is
+          // what lets the reclaim path act on it under the run-lease and
+          // revision guards a teardown from inside the probe would bypass.
+          await recordProbeVerdict(deps, probe, "gone");
+        } else {
+          await reportTerminalFailure(deps, sessionId, identity, err.reason);
+        }
+      } else if (err instanceof SandboxRuntimeTerminalError) {
+        await reportTerminalFailure(deps, sessionId, identity, err.reason);
+      } else if (err instanceof SandboxTrackingLostError) {
+        logger.error({ sessionId, workloadId: info.workloadId }, "keepalive.jobs_tracking_lost");
+      } else if (err instanceof SandboxJobsUnavailableError) {
+        logger.info(
+          { sessionId, workloadId: info.workloadId, status: err.httpStatus },
+          "keepalive.jobs_api_absent",
+        );
+      } else {
+        reportUnknownProbe(probe, err);
+      }
     }
   } catch (err) {
     if (!probeIsStale(probe)) {
@@ -1564,7 +2135,7 @@ async function invalidateProbeVerdict(deps: KeepaliveDeps, probe: BackgroundProb
   });
   try {
     const e = await deps.kv.get(key);
-    if (!e || probeIsStale(probe)) return;
+    if (!e || isTombstone(e) || probeIsStale(probe)) return;
     const current = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
     if (entryIdentity(current) !== identity || !sameIdlePeriod(info.idleEpoch, current)
       || info.idleSince !== current.idleSince || info.idleRev !== current.idleRev
@@ -1583,32 +2154,6 @@ async function invalidateProbeVerdict(deps: KeepaliveDeps, probe: BackgroundProb
   }
 }
 
-async function readProbeEvidence(
-  probe: BackgroundProbe,
-): Promise<{ state: BackgroundWork; running?: number }> {
-  const inst = instanceFromEntry(probe.sessionId, probe.info);
-  if (!inst) return { state: "unknown" };
-  const provider = inst.provider === "agent-sandbox"
-    ? getAgentSandboxProvider() : getSafeWorkloadProvider();
-  try {
-    const status = await provider.get(inst);
-    if (probeIsStale(probe)) return { state: "unknown" };
-    if (status.state === "absent" || status.state === "terminal") return { state: "gone" };
-  } catch (err) {
-    logger.warn({ err, sessionId: probe.sessionId }, "keepalive.provider_evidence_failed");
-  }
-  if (probeIsStale(probe)) return { state: "unknown" };
-  const live = await countLiveWork(inst, HANDS_STATE_DIR);
-  if (probeIsStale(probe)) return { state: "unknown" };
-  if (live.verdict === "clear") return { state: "idle", running: 0 };
-  if (live.verdict === "protected") {
-    const running = PROTECTED_CLASSES.reduce((sum, cls) => sum + (live.classes[cls] ?? 0), 0);
-    return { state: "running", running };
-  }
-  logger.warn({ sessionId: probe.sessionId, reason: live.reason }, "keepalive.work_evidence_unknown");
-  return { state: "unknown" };
-}
-
 async function recordProbeVerdict(
   deps: KeepaliveDeps,
   probe: BackgroundProbe,
@@ -1621,6 +2166,8 @@ async function recordProbeVerdict(
     || await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope);
   if (probeIsStale(probe)) return;
   if (held && state !== "running") return;
+  // Verdict freshness is compared against `Date.now` by usableSharedVerdict and
+  // usableCachedVerdict, so the reading they age must come off that same clock.
   const measuredAt = Date.now();
   bgProbeCache.set(identity, {
     at: measuredAt, state, epoch: info.idleEpoch,
@@ -1643,10 +2190,6 @@ async function recordProbeVerdict(
 
 function reportUnknownProbe(probe: BackgroundProbe, err: unknown): void {
   const { identity, sessionId, info } = probe;
-  if (err instanceof HandsLivenessIndeterminate) {
-    logger.error({ sessionId, workloadId: info.workloadId }, "keepalive.background_work_indeterminate");
-    return;
-  }
   const streak = (bgUnknownStreak.get(identity)?.count ?? 0) + 1;
   bgUnknownStreak.set(identity, { count: streak, at: Date.now() });
   logger.warn(
@@ -1701,9 +2244,11 @@ async function persistVerdict(
   stale: () => boolean,
 ): Promise<void> {
   try {
-    // Re-read all guards after contention; `idle` yields after one attempt.
+    // Re-read all guards after contention, on either verdict: each attempt
+    // re-applies them, so a retry cannot carry a stale decision past a
+    // reactivation, a replacement, or a newer running answer.
     let workloadId: string | undefined;
-    const attempts = running > 0 ? BG_VERDICT_WRITE_ATTEMPTS : 1;
+    const attempts = running > 0 ? BG_VERDICT_WRITE_ATTEMPTS : BG_IDLE_VERDICT_WRITE_ATTEMPTS;
     for (let attempt = 1; attempt <= attempts; attempt++) {
       const e = await deps.kv.get(key);
       if (!e || stale()) return;
@@ -1743,8 +2288,15 @@ async function persistVerdict(
         );
         return;
       }
+      // The reuse window opens on first confirmed empty (`quiescedAt`). Keep an
+      // existing anchor; if work cleared it while the shared verdict stayed
+      // idle, stamp a new one so the clock cannot stick open forever.
+      const quiescedAt = (deps.now ?? Date.now)();
       const next = sc.encode(JSON.stringify({
         ...info,
+        ...(running === 0
+          ? { quiescedAt: info.quiescedAt ?? quiescedAt }
+          : { quiescedAt: undefined }),
         bgCheckedAt: measuredAt,
         bgRunning: running,
         bgEpoch: epoch,
@@ -1757,49 +2309,45 @@ async function persistVerdict(
         await deps.kv.update(key, next, e.revision);
         return;
       } catch {
-        // A running retry re-reads the entry and all guards on the next attempt.
+        // The next attempt re-reads the entry and all guards.
         logger.info(
           { sessionId, workloadId, attempt },
           "keepalive.background_work_answer_write_contended",
         );
       }
     }
-    // Exhausted running retries are reported; an unconditional write could
-    // overwrite a newer reactivation or replacement.
-    if (running > 0) {
-      logger.warn(
-        { sessionId, workloadId, attempts },
-        "keepalive.background_work_answer_write_abandoned",
-      );
-    }
+    // Exhausted retries are reported; an unconditional write could overwrite a
+    // newer reactivation or replacement. An abandoned idle verdict reads back as
+    // `unknown`, which keeps the sandbox until a later sweep measures it again.
+    logger.warn(
+      { sessionId, workloadId, attempts, running },
+      "keepalive.background_work_answer_write_abandoned",
+    );
   } catch {
     // Missing verdicts read back as `unknown`, which keeps the sandbox.
   }
 }
 
 /**
- * Move the idle clock forward on a handle whose sandbox is still working.
- * `idleSince` follows the measurement anchor; `workSeenAt` gives the reuse window
- * a current local clock. The update is conditional and best-effort.
+ * Renew a parked handle after a running jobs answer.
+ *
+ * Clears `quiescedAt` so the reuse window restarts only after the next confirmed
+ * empty roster. `idleSince` stays where park opened the idle period.
  */
 async function refreshIdleSince(
   deps: KeepaliveDeps,
   key: string,
   revision: number,
   info: HandsKvEntry,
-  seenAt: number,
+  workObserved = true,
 ): Promise<void> {
   try {
-    // Keep the verdict anchor monotonic and no later than its measurement.
-    const idleSince = Math.max(
-      typeof info.idleSince === "number" ? info.idleSince : 0,
-      seenAt,
-    );
-    // The reuse clock reflects when this sweep acted on the running verdict.
-    const next = sc.encode(JSON.stringify({ ...info, idleSince, workSeenAt: (deps.now ?? Date.now)() }));
+    const next = sc.encode(JSON.stringify({
+      ...info,
+      ...(workObserved ? { quiescedAt: undefined } : {}),
+    }));
     await deps.kv.update(key, next, revision);
-    // Keep the scan copy aligned for probes dispatched later in this tick.
-    info.idleSince = idleSince;
+    if (workObserved) delete info.quiescedAt;
   } catch { /* lost the race, or KV is unhappy; the next sweep tries again */ }
 }
 
@@ -1828,6 +2376,8 @@ interface RetentionRead {
   inst: SandboxInstance;
 }
 
+type HandsRecord = { value: Uint8Array; revision: number };
+
 interface TargetCensus {
   targets: Map<string, RegisteredSandbox>;
   seenIdentities: Set<string>;
@@ -1841,26 +2391,133 @@ interface TargetCensus {
    * walk does not know the whole set until it ends.
    */
   retentionReads: Map<string, RetentionRead>;
+  idleExpiries: Array<{ candidate: ProbeCandidate; record: HandsRecord }>;
+  /** Stops owed by handles the walk found already closing or already terminal. */
+  teardowns: Array<{
+    sessionId: string;
+    info: HandsKvEntry | HandsProbeEntry;
+    site: string;
+    token?: string;
+    /** Bookkeeping that is only correct once the stop has succeeded. */
+    after?: () => Promise<void>;
+    /**
+     * Destructive-boundary gate. Asked immediately before destroyHands; false
+     * skips the stop and its after callback (evidence must be re-checked after
+     * the walk→queue delay).
+     */
+    confirm?: () => Promise<boolean>;
+  }>;
+  /**
+   * Parked idle handles still inside the reuse window.
+   *
+   * They renew once during the walk, then sit out of census.targets and
+   * census.idleExpiries -- so without a mid-sweep refresh a long teardown
+   * phase can outlast BRAIN_REGISTRY_TTL_MS and drop them.
+   */
+  idleHolds: Array<{ sessionId: string }>;
+  /**
+   * Sessions whose expired retry-pending record is already owed a stop.
+   *
+   * One session is reachable from the local registry and from its KV record,
+   * and a queue built from both would act on that record twice -- which the
+   * inline stop this queue replaced could not do, because the first one
+   * cleared the record the second would have read. Closing and terminal
+   * handles are not deduplicated: those are per record, and one session can
+   * legitimately owe a stop for more than one generation.
+   */
+  expiredRetriesQueued: Set<string>;
 }
-
-type HandsRecord = { value: Uint8Array; revision: number };
 
 async function collectTargets(
   deps: KeepaliveDeps,
   seenIdentities: Set<string>,
   stats: TickStats,
-): Promise<{ targets: Map<string, RegisteredSandbox>; complete: boolean }> {
+): Promise<{
+  targets: Map<string, RegisteredSandbox>;
+  complete: boolean;
+  idleHolds: Array<{ sessionId: string }>;
+}> {
   const clock = deps.now ?? Date.now;
   const censusStartedAt = clock();
+  pruneTeardownBackoff(censusStartedAt);
   const census: TargetCensus = {
     targets: new Map(), seenIdentities, probeCandidates: [], stats,
     retentionReads: new Map(),
+    idleExpiries: [],
+    teardowns: [],
+    idleHolds: [],
+    expiredRetriesQueued: new Set(),
   };
   for (const [key, registered] of localRegistry) {
-    if (await shouldSkipExpiredRetry(deps, registered.sessionId, "local", registered.entry)) continue;
+    if (await shouldSkipExpiredRetry(
+      deps, census, registered.sessionId, "local", registered.entry,
+    )) continue;
     census.targets.set(key, registered);
   }
   const kvComplete = await collectKvTargets(deps, census);
+  // Bounded, because every expiry confirms Running, reads the roster and stops a
+  // workload: against a slow control plane this phase can spend the whole sweep,
+  // and the phase behind it is the one that renews every live record ahead of
+  // its bucket TTL. A deferred candidate is still expired -- the next sweep
+  // reaches it through the same scan, on a clock that has not been reset.
+  const expiryDeadline = clock() + (deps.idleExpiryBudgetMs ?? IDLE_EXPIRY_BUDGET_MS);
+  let deferredExpiries = 0;
+  // Teardowns owed by the walk share the budget with the expiries: both end in
+  // destroyHands, and what the budget protects is the phase behind them.
+  await forEachWithLimit(census.teardowns, IDLE_EXPIRY_MAX_IN_FLIGHT, async (item) => {
+    if (clock() >= expiryDeadline) {
+      deferredExpiries += 1;
+      return;
+    }
+    if (item.confirm && !(await item.confirm())) return;
+    await destroyHands(item.sessionId, item.info, item.token)
+      .then(async () => {
+        teardownRetryAt.delete(item.sessionId);
+        await item.after?.();
+      })
+      .catch((err) => {
+        // Held off rather than retried on the next sweep. The record stays
+        // `closing`, so the walk keeps offering this handle, and a stop that
+        // cannot succeed would otherwise re-pay its whole cost every sweep for
+        // a set that never shrinks.
+        teardownRetryAt.set(item.sessionId, clock() + TEARDOWN_RETRY_BACKOFF_MS);
+        logger.error(
+          {
+            err: (err as Error)?.message ?? String(err),
+            sessionId: item.sessionId,
+            workloadId: item.info.workloadId,
+            site: item.site,
+            retryInMs: TEARDOWN_RETRY_BACKOFF_MS,
+          },
+          `keepalive.${item.site}`,
+        );
+      });
+  });
+  await forEachWithLimit(census.idleExpiries, IDLE_EXPIRY_MAX_IN_FLIGHT, async (item) => {
+    if (clock() >= expiryDeadline) {
+      deferredExpiries += 1;
+      return;
+    }
+    await expireIdleTarget(deps, item.candidate, item.record, census.stats);
+  });
+  if (deferredExpiries > 0) {
+    logger.warn(
+      { deferred: deferredExpiries, expiries: census.idleExpiries.length,
+        teardowns: census.teardowns.length },
+      "keepalive.idle_expiry_budget_exhausted",
+    );
+  }
+  // Idle-expiry candidates are not in census.targets. Renew survivors (deferred,
+  // keptRunLease, superseded) so a long teardown budget cannot drop their KV TTL.
+  // Destroyed keys read as missing and are skipped.
+  await renewIdleExpiryCandidates(deps, census.idleExpiries);
+  // Within-window parks are likewise outside targets; refresh them here so a
+  // sweep whose teardown phase outlasts the bucket TTL does not forget them.
+  await renewIdleHolds(deps, census.idleHolds);
+  // The idle-expiry phase sits between the census renew and the ping renew.
+  // With a long stop ceiling that gap alone can approach the bucket TTL, so
+  // live targets are refreshed again before the walk returns.
+  await renewCensusTargets(deps, census.targets);
   const dagComplete = await collectDagTargets(deps, census);
   stats.probes += dispatchProbes(deps, census.probeCandidates);
   // Accounted apart from the reads, and only accounted: the reads happen after
@@ -1893,7 +2550,8 @@ async function collectTargets(
   const readsComplete = census.retentionReads.size
     ? await runRetentionReadPhase(deps, census, kvComplete)
     : true;
-  return { targets: census.targets, complete: kvComplete && dagComplete && readsComplete };
+  return { targets: census.targets, complete: kvComplete && dagComplete && readsComplete,
+    idleHolds: census.idleHolds };
 }
 
 async function collectKvTargets(deps: KeepaliveDeps, census: TargetCensus): Promise<boolean> {
@@ -1929,7 +2587,31 @@ async function collectKvTarget(
 ): Promise<boolean> {
   const sessionId = sessionIdFromHandsKey(key);
   const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
+  // Queued rather than awaited here: a stop carries its own retries and sleeps,
+  // and this runs inside the serial walk of the bucket. Left inline, one
+  // unresponsive control plane spends the sweep on teardowns and the ping phase
+  // behind it never renews a single live record.
+  if (isClosingStatus(info.status)) {
+    // Renewed here: closing records are not ping targets, and without a refresh
+    // the bucket TTL drops them during the teardown backoff.
+    await deps.kv.update(key, e.value, e.revision).catch(() => {});
+    if (!teardownDeferred(sessionId, (deps.now ?? Date.now)())) {
+      census.teardowns.push({ sessionId, info, site: "closing_stop_retry" });
+    }
+    return true;
+  }
   if (info.status && info.status !== "ready") return true;
+  if (info.terminalReason) {
+    await deps.kv.update(key, e.value, e.revision).catch(() => {});
+    if (!teardownDeferred(sessionId, (deps.now ?? Date.now)())) {
+      logger.error(
+        { sessionId, workloadId: info.workloadId, reason: info.terminalReason },
+        "keepalive.sandbox_terminal_recorded",
+      );
+      census.teardowns.push({ sessionId, info, site: "terminal_stop_retry" });
+    }
+    return true;
+  }
   if (isRetentionEntry(info)) {
     return sweepRetention(deps, census, key, e, info);
   }
@@ -1937,9 +2619,12 @@ async function collectKvTarget(
   census.seenIdentities.add(identity);
   if (info.keepalive === false && await collectIdleTarget(deps, census, key, e, info)) return true;
   const entry = sandboxEntryFrom(info);
-  if (!entry || await shouldSkipExpiredRetry(deps, sessionId, "kv", entry, key)) return true;
-  // Renew before queueing so bounded ping concurrency cannot exhaust the TTL.
+  if (!entry) return true;
+  // Renew before queueing so bounded ping concurrency cannot exhaust the TTL,
+  // and before the expired-retry check so a teardown deferred by that queue's
+  // budget still finds its record on the next sweep.
   await deps.kv.update(key, e.value, e.revision).catch(() => {});
+  if (await shouldSkipExpiredRetry(deps, census, sessionId, "kv", entry, key)) return true;
   if (!census.targets.has(identity)) census.targets.set(identity, { sessionId, entry });
   return true;
 }
@@ -1968,37 +2653,36 @@ async function collectIdleTarget(
   else stats.bgIdle += 1;
   if (peeked.source === "mem") stats.fromMem += 1;
   else if (peeked.source === "handle") stats.fromHandle += 1;
-  else if (peeked.source === "none") stats.fromNone += 1;
-  else if (peeked.source === "no-hands") stats.fromNoHands += 1;
+  else if (!canProbeJobs(info, sessionId)) stats.fromNoHands += 1;
+  else stats.fromNone += 1;
   const candidate = { key, identity, sessionId, info, generation: bgGeneration.get(identity) ?? 0 };
-  if (needsProbe(identity, info)) census.probeCandidates.push(candidate);
-  if (bgWork === "running" || bgWork === "unknown") {
-    // `unknown` is refreshed on this sweep's own clock rather than on a
-    // measurement, and that is deliberate rather than an oversight to be tidied
-    // away. Returning early already keeps the handle here -- an unreachable
-    // sandbox is never reclaimed on a guess -- but the reuse window this writes
-    // is not read here alone: `eligibleForClusterReclaim` in the reaper derives
-    // it from the same two fields, by the comment on its own formula, and that
-    // sweep consults no background-work verdict at all and runs on a shorter
-    // horizon (MULTI_NODE_IDLE_RECLAIM_MS, five minutes, against fifteen here).
-    // Leaving the window where it was would therefore not merely hold the
-    // handle: it would hand a handle nobody can get an answer about to the one
-    // sweep that deletes a user's GPU cluster, on the evidence this branch
-    // exists to say we do not have. What is left held instead is bounded and
-    // reported -- the probe below resolves all but an unreachable control
-    // plane, and a streak past BG_UNKNOWN_TOLERANCE raises
-    // `keepalive.background_work_unreconciled` for an operator.
-    const seenAt = bgWork === "running" ? peeked.at ?? Date.now() : (deps.now ?? Date.now)();
-    await refreshIdleSince(deps, key, e.revision, info, seenAt);
+  if (needsProbe(identity, info, sessionId)) census.probeCandidates.push(candidate);
+  if (bgWork === "running") {
+    await refreshIdleSince(deps, key, e.revision, info);
     return false;
   }
+  // Incomplete control-plane identity cannot confirm an empty jobs roster.
+  // Renew the KV TTL so Brain does not forget the handle; do not reclaim.
+  if (!canProbeJobs(info, sessionId) && bgWork !== "gone") {
+    census.idleHolds.push({ sessionId });
+    await deps.kv.update(key, value, e.revision).catch(() => {});
+    return true;
+  }
+  const anchor = idleExpiryAnchor(info);
   const expired = bgWork === "gone"
-    || (deps.now ?? Date.now)() - reuseWindowStart(info) > SANDBOX_IDLE_REUSE_MS;
+    || (anchor !== null
+      && (deps.now ?? Date.now)() - anchor > SANDBOX_IDLE_REUSE_MS);
+  // Hold an in-window unknown for an in-flight probe; renew TTL only.
+  if (bgWork === "unknown" && canProbeJobs(info, sessionId) && !expired) {
+    await deps.kv.update(key, value, e.revision).catch(() => {});
+    return false;
+  }
   if (expired) {
-    await expireIdleTarget(deps, candidate, { ...e, value }, stats);
+    census.idleExpiries.push({ candidate, record: { ...e, value } });
   }
   else {
     stats.withinWindow += 1;
+    census.idleHolds.push({ sessionId });
     await deps.kv.update(key, value, e.revision).catch(() => {});
   }
   return true;
@@ -2015,14 +2699,19 @@ async function collectIdleTarget(
 async function expireIdleTarget(
   deps: KeepaliveDeps, candidate: ProbeCandidate, e: HandsRecord, stats: TickStats,
 ): Promise<void> {
-  const { key, identity, sessionId, info } = candidate;
+  const { key, identity, sessionId } = candidate;
+  let info = candidate.info;
   if (registeredSandboxCount(sessionId) > 0 || localRegistry.has(identity)) {
     stats.keptLocal += 1;
     return;
   }
-  if (await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope)) {
-    stats.keptRunLease += 1;
-    return;
+  {
+    const scope = typeof info.runScope === "string" && info.runScope
+      ? info.runScope : sessionId;
+    if ((await readRunLeaseState(deps.kv, scope)) !== "free") {
+      stats.keptRunLease += 1;
+      return;
+    }
   }
   if (probeIsStale(candidate) || localRegistry.has(identity) || registeredSandboxCount(sessionId) > 0) {
     stats.keptLocal += 1;
@@ -2033,19 +2722,191 @@ async function expireIdleTarget(
     await deps.kv.update(key, e.value, e.revision).catch(() => {});
     return;
   }
-  // Release only after the conditional delete wins against any reactivation.
-  const deleted = await deps.kv.delete(key, { previousSeq: e.revision })
-    .then(() => true).catch(() => false);
-  if (deleted) {
+  // Reconfirm Running and an empty EnvD jobs roster at the destructive boundary.
+  // Destroy requires a readable jobs count of zero; unavailable / tracking_lost
+  // never authorise reclaim. CAS uses the enrollment revision so a concurrent
+  // ensureHands / clearIdleMarkers write wins instead of being overwritten.
+  let claimed = false;
+  const claimRevision = e.revision;
+  const expected = sandboxEntryFrom(candidate.info);
+  const claimOpts = expected ? { expected } : undefined;
+  try {
+    if (!canProbeJobs(info, sessionId)) {
+      await deps.kv.update(key, e.value, e.revision).catch(() => {});
+      return;
+    }
+    const running = await probeUserProcesses(deps, info, sessionId, {
+      persistIdentity: false,
+    });
+    if (running > 0) {
+      await refreshIdleSince(deps, key, claimRevision, info);
+      return;
+    }
+    // Refresh fields for the stop payload; CAS still uses claimRevision.
+    // Identity binding is deferred past this CAS so the probe cannot
+    // self-bump the enrollment revision the closing write conditions on.
+    try {
+      const latest = await deps.kv.get(key);
+      if (!latest || isTombstone(latest)) return;
+      info = { ...info, ...JSON.parse(sc.decode(latest.value)) as HandsKvEntry };
+    } catch {
+      return;
+    }
+    // Re-check lease/local registry after the (bounded) jobs probe: a turn that
+    // started during the probe must win over this reclaim.
+    if (!(await claimIdleStop(
+      deps, key, identity, sessionId, info, claimRevision, e, undefined, claimOpts,
+    ))) {
+      return;
+    }
+    claimed = true;
+    await destroyHands(sessionId, info);
     stats.expired += 1;
-    if (!await releaseAdmission(identity)) {
-      logger.error({ sessionId, identity }, "keepalive.admission_release_unconfirmed");
+    logger.info(
+      { sessionId, sandboxName: info.sandboxName, workloadId: info.workloadId },
+      "keepalive.idle_handle_expired",
+    );
+  } catch (err) {
+    if (err instanceof SandboxTerminalProbeError) {
+      if (err.state === "absent") {
+        if (!(await claimIdleStop(
+          deps, key, identity, sessionId, info, claimRevision, e, undefined, claimOpts,
+        ))) {
+          return;
+        }
+        claimed = true;
+        await destroyHands(sessionId, info).catch((stopErr) => {
+          logger.warn({ err: stopErr, sessionId }, "keepalive.absent_stop_retry");
+        });
+        stats.expired += 1;
+        logger.info(
+          { sessionId, workloadId: info.workloadId, reason: err.reason },
+          "keepalive.idle_handle_absent",
+        );
+      } else {
+        // One CAS: terminalReason + closing. Splitting those writes bumped the
+        // enrollment revision so claimIdleStop always lost to itself.
+        if (!(await claimIdleStop(
+          deps, key, identity, sessionId, info, claimRevision, e, err.reason, claimOpts,
+        ))) {
+          return;
+        }
+        claimed = true;
+        await destroyHands(sessionId, info).catch((stopErr) => {
+          logger.warn({ err: stopErr, sessionId }, "keepalive.terminal_stop_retry");
+        });
+      }
+    } else if (err instanceof SandboxRuntimeTerminalError) {
+      if (!(await claimIdleStop(
+        deps, key, identity, sessionId, info, claimRevision, e, err.reason, claimOpts,
+      ))) {
+        return;
+      }
+      claimed = true;
+      await destroyHands(sessionId, info).catch((stopErr) => {
+        logger.warn({ err: stopErr, sessionId }, "keepalive.terminal_stop_retry");
+      });
+    } else if (err instanceof SandboxTrackingLostError) {
+      // Tracking loss means jobs cannot prove idle; hard timeout is the backstop.
+      logger.error({ sessionId, workloadId: info.workloadId }, "keepalive.idle_reclaim_tracking_lost");
+      if (!claimed) await deps.kv.update(key, e.value, e.revision).catch(() => {});
+    } else if (err instanceof SandboxJobsUnavailableError) {
+      // No readable jobs roster: never treat as idle-empty.
+      logger.info(
+        { sessionId, workloadId: info.workloadId, status: err.httpStatus },
+        "keepalive.idle_reclaim_jobs_unavailable",
+      );
+      if (!claimed) await deps.kv.update(key, e.value, e.revision).catch(() => {});
+    } else if (isRevisionConflict(err)) {
+      logger.info({ sessionId, identity }, "keepalive.idle_reclaim_superseded");
+    } else {
+      logger.warn(
+        { err, sessionId, workloadId: info.workloadId },
+        "keepalive.idle_reclaim_deferred",
+      );
+      if (!claimed) await deps.kv.update(key, e.value, e.revision).catch(() => {});
     }
   }
-  logger.info(
-    { sessionId, sandboxName: info.sandboxName, workloadId: info.workloadId, deleted },
-    "keepalive.idle_handle_expired",
-  );
+}
+
+/**
+ * After a long destructive probe, re-check leases and CAS ready→closing before
+ * any unclaimed destroyHands. Returns false when a concurrent turn won.
+ * When `terminalReason` is set, the same CAS also records it so emit and
+ * destroy do not race a second update against the enrollment revision.
+ *
+ * Shared gate for idle reclaim, expired-retry, and failure eviction:
+ * registry / sibling check, fail-closed run lease, optional identity match,
+ * then revision CAS. Paths that must stop a dead sandbox under a live turn
+ * pass `claimDespiteLease` and decide MN cascade from the lease themselves.
+ * `claimDespiteSiblings` skips the registry / sibling check for a verdict on
+ * one identity (failure eviction): another registered sandbox of the same
+ * session says nothing about whether this one is alive.
+ */
+async function claimIdleStop(
+  deps: KeepaliveDeps,
+  key: string,
+  identity: string,
+  sessionId: string,
+  info: HandsKvEntry,
+  claimRevision: number,
+  e: HandsRecord,
+  terminalReason?: string,
+  opts?: {
+    collectingIdentity?: string;
+    expected?: SandboxEntry;
+    claimDespiteLease?: boolean;
+    claimDespiteSiblings?: boolean;
+  },
+): Promise<boolean> {
+  if (opts?.expected) {
+    const named = sandboxEntryFrom(info);
+    if (!named || !sameRegisteredSandbox(opts.expected, named)) {
+      logger.info({ sessionId, identity }, "keepalive.idle_reclaim_identity_mismatch");
+      return false;
+    }
+  }
+  const collecting = opts?.collectingIdentity;
+  if (opts?.claimDespiteSiblings) {
+    // Verdict on this identity alone; see the doc comment.
+  } else if (collecting) {
+    for (const [regKey, registered] of localRegistry) {
+      if (registered.sessionId === sessionId && regKey !== collecting) return false;
+    }
+  } else if (registeredSandboxCount(sessionId) > 0 || localRegistry.has(identity)) {
+    return false;
+  }
+  const leaseScope = typeof info.runScope === "string" && info.runScope
+    ? info.runScope : sessionId;
+  const lease = await readRunLeaseState(deps.kv, leaseScope);
+  if (lease !== "free" && !opts?.claimDespiteLease) {
+    if (lease === "unknown") {
+      logger.warn(
+        { sessionId, identity, leaseScope },
+        "keepalive.idle_reclaim_lease_unreadable",
+      );
+    }
+    return false;
+  }
+  try {
+    const next = terminalReason
+      ? { ...info, terminalReason, status: "closing" as const }
+      : { ...info, status: "closing" as const };
+    await deps.kv.update(key, sc.encode(JSON.stringify(next)), claimRevision);
+  } catch (err) {
+    if (isRevisionConflict(err)) {
+      logger.info({ sessionId, identity }, "keepalive.idle_reclaim_superseded");
+      return false;
+    }
+    logger.warn(
+      { err, sessionId, workloadId: info.workloadId },
+      "keepalive.idle_reclaim_deferred",
+    );
+    await deps.kv.update(key, e.value, e.revision).catch(() => {});
+    return false;
+  }
+  if (terminalReason) await emitTerminalFailureEvent(deps, sessionId, terminalReason);
+  return true;
 }
 
 async function collectDagTargets(deps: KeepaliveDeps, census: TargetCensus): Promise<boolean> {
@@ -2074,7 +2935,15 @@ async function collectDagTargets(deps: KeepaliveDeps, census: TargetCensus): Pro
         if (!usable) continue;
         const key = sandboxRegistryKey(entry);
         census.seenIdentities.add(key);
-        if (!census.targets.has(key)) census.targets.set(key, { sessionId: dagRoot, entry });
+        if (!census.targets.has(key)) {
+          // The Hands entry is keyed by the user session, not the DAG root.
+          // Using the root here made reportTerminalFailure and the ping renew
+          // look up a key that never exists.
+          census.targets.set(key, {
+            sessionId: entry.sessionId || dagRoot,
+            entry,
+          });
+        }
       }
     }
     return true;
@@ -2084,12 +2953,13 @@ async function collectDagTargets(deps: KeepaliveDeps, census: TargetCensus): Pro
   }
 }
 
-/**
- * Periodically exec a no-op inside every active sandbox to refresh the
- * SaFE Workload Manager's lastActivity timestamp, preventing idle GC.
- */
 /** One sweep, exported so its decisions can be tested without an interval. */
 export async function runKeepaliveTickForTest(deps: KeepaliveDeps): Promise<void> {
+  // Reclaim reaches destroyHands, which reads the process-wide handle KV
+  // instead of the bucket passed in here. Binding the injected one keeps a
+  // sweep driven through this entry point operating on a single bucket; the
+  // production path binds it at boot.
+  bindHandsKv(deps.kv);
   return tick(deps);
 }
 
@@ -2115,6 +2985,7 @@ interface KeepaliveFailure {
 const FAILURE_PHASE_BUDGET_MS = 30_000;
 
 async function handleKeepaliveFailures(
+  deps: KeepaliveDeps,
   failures: KeepaliveFailure[],
   targetCount: number,
   now: () => number = Date.now,
@@ -2168,7 +3039,51 @@ async function handleKeepaliveFailures(
       // otherwise a genuine node-wide loss would be suppressed forever.
       && (!goneCircuitOpen || fails > SANDBOX_KEEPALIVE_FAIL_LIMIT)
     ) {
-      await destroyHands(sessionId, entry).catch((err2) =>
+      // Failure eviction shares claimIdleStop with idle/expired-retry: identity
+      // + ready→closing CAS before destroyHands. Lease is fail-closed and only
+      // gates MN cascade (held/unknown → skip); claimDespiteLease still stops a
+      // dead sandbox under a live turn so the message can rebuild.
+      const named = await recordNamingSandbox(deps.kv, sessionId, entry);
+      let activeMessageId = "";
+      if (named) {
+        const leaseScope = typeof named.info.runScope === "string" && named.info.runScope
+          ? named.info.runScope : sessionId;
+        const lease = await readRunLeaseState(deps.kv, leaseScope);
+        const messageId = (
+          entry.messageId || named.info.messageId || ""
+        ).trim();
+        if (messageId && lease !== "free") activeMessageId = messageId;
+        const identity = entryIdentity(named.info);
+        const claimed = await claimIdleStop(
+          deps,
+          named.key,
+          identity,
+          sessionId,
+          named.info,
+          named.record.revision,
+          named.record,
+          undefined,
+          {
+            expected: entry,
+            claimDespiteLease: true,
+            claimDespiteSiblings: true,
+          },
+        );
+        if (!claimed) continue;
+      } else {
+        // No enrollment naming this generation: still stop the known target,
+        // but never cascade on an unreadable lease.
+        const lease = await readRunLeaseState(deps.kv, sessionId);
+        const messageId = (entry.messageId || "").trim();
+        if (messageId && lease !== "free") activeMessageId = messageId;
+      }
+      await destroyHands(
+        sessionId,
+        entry,
+        undefined,
+        undefined,
+        activeMessageId ? { activeMessageId } : undefined,
+      ).catch((err2) =>
         logger.warn({ err: err2, sessionId }, "keepalive.destroy_failed"),
       );
       failCounts.delete(targetKey);
@@ -2365,24 +3280,44 @@ async function pingSandbox(
   if (isAgent ? !entry.sessionId : (!entry.workloadId || !entry.platformKey)) return null;
 
   try {
-    if (isAgent) {
-      await getAgentSandboxProvider().get({
+    // A control-plane status read on both providers, and no command in the
+    // container. Live targets still need a Running check; idle reclaim reads
+    // the EnvD jobs roster separately and does not refresh LastActivity.
+    const status = isAgent
+      ? await getAgentSandboxProvider().get({
         provider: "agent-sandbox",
         id: entry.sessionId!,
         sandboxName: entry.sandboxName ?? "",
         namespace: entry.namespace ?? "",
         handsBaseUrl: "",
         userId: entry.userId,
-      });
-    } else {
-      await getSafeWorkloadProvider().exec({
+      })
+      : await getSafeWorkloadProvider().get({
         provider: "safe-workload",
         id: entry.workloadId!,
         sandboxName: entry.workloadId!,
         namespace: entry.namespace ?? "",
         handsBaseUrl: "",
         platformKey: entry.platformKey!,
-      }, "date -Iseconds > /tmp/keepalive_ts", "15s");
+      });
+    if (status.state === "terminal") {
+      throw new SandboxRuntimeTerminalError(
+        status.reason ?? "sandbox_workload_terminal",
+        `sandbox workload state=${status.state}`,
+      );
+    }
+    if (status.state === "absent") {
+      throw new SandboxGoneError(`sandbox workload state=${status.state}`);
+    }
+    if (status.state !== "running") {
+      // Soft / unknown control-plane states are not keepalive failures: counting
+      // them would let a brief SaFE blip burn FAIL_LIMIT and destroyHands every
+      // target, including sandboxes with live background shells.
+      logger.info(
+        { sessionId, provider: entry.provider ?? "safe-workload", state: status.state ?? "unknown" },
+        "keepalive.sandbox_state_unknown",
+      );
+      return null;
     }
     failCounts.delete(targetKey);
     const existing = await readHandsEntry(deps.kv, sessionId).catch(() => null);
@@ -2402,6 +3337,14 @@ async function pingSandbox(
     );
     return null;
   } catch (error: any) {
+    if (error instanceof SandboxRuntimeTerminalError) {
+      await reportTerminalFailure(
+        deps,
+        entry.sessionId || sessionId,
+        targetKey,
+        error.reason,
+      );
+    }
     if (error?.sandboxConfirmedRunning === true) {
       failCounts.delete(targetKey);
       logger.error(
@@ -2453,6 +3396,7 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
   const stats = newTickStats();
   const census = await collectTargets(deps, seenIdentities, stats);
   const targets = census.targets;
+  const idleHolds = census.idleHolds;
   const servable = await admitTargets(deps, targets, census.complete);
   if (servable) dropUnadmitted(targets, servable);
   pruneSweepState(targets, seenIdentities);
@@ -2469,21 +3413,25 @@ async function tick(deps: KeepaliveDeps): Promise<void> {
     );
   }
 
-  if (!targets.size) return;
+  if (targets.size) {
+    const clock = deps.now ?? Date.now;
+    const phase = await runPingPhase(deps, targets);
 
-  const clock = deps.now ?? Date.now;
-  const phase = await runPingPhase(deps, targets);
+    await handleKeepaliveFailures(deps, phase.failures, targets.size, clock);
 
-  await handleKeepaliveFailures(phase.failures, targets.size, clock);
-
-  pingDeferred = phase.deferredNow;
-  if (phase.deferred > 0) {
-    logger.warn(
-      { pinged: phase.pinged, deferred: phase.deferred, total: phase.orderedCount,
-        budgetMs: deps.pingBudgetMs ?? PING_PHASE_BUDGET_MS },
-      "keepalive.ping_budget_exhausted",
-    );
+    pingDeferred = phase.deferredNow;
+    if (phase.deferred > 0) {
+      logger.warn(
+        { pinged: phase.pinged, deferred: phase.deferred, total: phase.orderedCount,
+          budgetMs: deps.pingBudgetMs ?? PING_PHASE_BUDGET_MS },
+        "keepalive.ping_budget_exhausted",
+      );
+    }
   }
+
+  // After ping/failure (or when there were no ping targets): within-window
+  // parks sat out of both phases and need a refresh that outlasts them.
+  await renewIdleHolds(deps, idleHolds);
 }
 
 /**

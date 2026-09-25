@@ -66,8 +66,9 @@ const (
 	// sandboxNameLabelKey is the label key set on Sandbox objects and their Pods.
 	sandboxNameLabelKey = "runtime.agent-sandbox.io/sandbox-name"
 
-	// idleTimeoutAnnotationKey stores per-sandbox idle timeout on the Sandbox object.
-	// Read by Agentd for per-sandbox GC.
+	// idleTimeoutAnnotationKey records a per-sandbox idle timeout on the Sandbox
+	// object. Metadata only: no controller in this cluster reclaims a sandbox
+	// for being idle, and `maxSessionDuration` is what ends one.
 	idleTimeoutAnnotationKey = "runtime.agent-sandbox.io/idle-timeout"
 
 	// userIDLabelKey stores the verified user ID as a Label on the Sandbox object.
@@ -450,10 +451,9 @@ func applyClaimMetadataWithRetry(
 // The error is returned, not discarded. Everything in this patch is load-bearing
 // on a pod that already exists: the session-id annotation is how a session is
 // recovered when the store is lost, the idle-timeout annotation is the only
-// place a configured lifetime lands on a claim, and the user label is how the
-// sandbox is attributed. Swallowing a failure returned a sandbox that looks
-// created and quietly has none of them -- the caller's lifetime silently
-// replaced by the controller default, with nothing outside to tell from.
+// place a requested idle setting is recorded at all, and the user label is how
+// the sandbox is attributed. Swallowing a failure returned a sandbox that looks
+// created and quietly has none of them, with nothing outside to tell from.
 // Failing the claim is recoverable; a claim that half-succeeded is not.
 func applyClaimMetadata(
 	ctx context.Context,
@@ -564,7 +564,7 @@ func (c *K8sSandboxCreator) createViaClaim(ctx context.Context, ci *runtimev1alp
 				}
 				// Patch labels + annotations onto the Sandbox created by WarmPool controller:
 				// - session-id annotation: enables session recovery from K8s when Redis is lost
-				// - idle-timeout annotation: for Agentd per-sandbox GC
+				// - idle-timeout annotation: recorded, not enforced
 				// - user.id label: queryable user identity (SaFE convention)
 				// - user.name annotation: display name with possible special chars
 				patchLabels := map[string]string{}

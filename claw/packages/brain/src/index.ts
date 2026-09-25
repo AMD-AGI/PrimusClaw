@@ -417,14 +417,10 @@ function validateStartupConfig(): void {
     );
   }
 
-  // The idle-reclaim fallback rests on a parked handle outliving the gap between
-  // two sweeps. The keepalive tick refreshes most of them, but not a PENDING one
-  // and not any of them when keepalive is off, and those live a single bucket TTL
-  // -- the interval has to fit under the shortest case, not the common one. At or
-  // above the TTL such an entry expires before any pass sees it and the fallback
-  // is gone without a trace. Checked here because the two values are set
-  // independently, and the failure produces no symptom of its own -- just GPU
-  // clusters running until the workload's timeout.
+  // The MN session-delete sweeper walks parked `hands.*` entries. When it is
+  // enabled (MULTI_NODE_IDLE_RECLAIM_MS > 0), its interval must stay below the
+  // bucket TTL or a parked PENDING/session-delete handle can expire unseen and
+  // leave GPU clusters to the workload timeout alone.
   if (
     MULTI_NODE_IDLE_RECLAIM_MS > 0
     && MULTI_NODE_SWEEPER_INTERVAL_MS >= BRAIN_REGISTRY_TTL_MS
@@ -764,7 +760,11 @@ function proveKeepaliveCapacity(): CapacitySettings {
 async function startBackgroundRuntime(capacity: CapacitySettings): Promise<void> {
   startWatchdog();
   await bindAdmission(kv, capacity);
-  await startSandboxKeepalive({ kv, ...rosterDeps(kv, capacity) });
+  await startSandboxKeepalive({
+    kv,
+    ...rosterDeps(kv, capacity),
+    emitSandboxFailure: (sessionId, event) => emitter.emit(sessionId, event),
+  });
   startSandboxSweeper();
   startMultiNodeSweeper();
 }

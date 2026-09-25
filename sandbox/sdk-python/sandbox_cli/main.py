@@ -167,7 +167,7 @@ if HAS_CLICK:
     @click.option("--template", "-t", required=True, help="CodeInterpreter template name")
     @click.option("--namespace", "-n", default=None, help="K8s namespace")
     @click.option("--env", "-e", multiple=True, help="Environment variable override (KEY=VALUE, repeatable)")
-    @click.option("--session-timeout", default=None, help="Idle timeout override (e.g. 10m, hard cap 15m)")
+    @click.option("--session-timeout", default=None, help="Recorded on the Sandbox, not enforced (e.g. 10m)")
     @click.option("--max-duration", default=None, help="Max lifetime override (e.g. 4h, hard cap 24h)")
     @click.option("--runtime-class", default=None, help="RuntimeClassName override (e.g. kata-qemu, non-WarmPool only)")
     @click.option("--label", "-l", multiple=True, help="Label override (key=value, repeatable)")

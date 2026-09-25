@@ -437,13 +437,6 @@ func (s *Server) handleInvoke(c *gin.Context, kind string) {
 		}
 	}
 
-	// Update last activity immediately, then keep refreshing while the proxy
-	// connection is alive. This prevents GC from killing sandboxes that are
-	// actively executing long-running commands (e.g. model training).
-	refreshCtx, refreshCancel := context.WithCancel(context.Background())
-	defer refreshCancel()
-	go s.refreshActivityWhileAlive(refreshCtx, info.SessionID)
-
 	// Inject session-id in response header
 	c.Header("x-session-id", sessionID)
 
@@ -511,46 +504,6 @@ func logRouterExecute(c *gin.Context, sessionID, namespace, workloadID, invokePa
 		"timeout", payload.Timeout,
 		"command", cmdlog.Preview(payload.Command, 0),
 	)
-}
-
-// activityRefreshInterval controls how often LastActivity is updated while a
-// proxy connection is open. Must be well below the default idle timeout (15min)
-// to guarantee the sandbox is never mistakenly considered idle.
-const activityRefreshInterval = 5 * time.Minute
-
-// refreshActivityWhileAlive updates LastActivity immediately and then every
-// activityRefreshInterval until ctx is cancelled (i.e. the proxy request ends).
-// This keeps long-running requests (exec, stream, tunnel) from triggering idle GC.
-func (s *Server) refreshActivityWhileAlive(ctx context.Context, sessionID string) {
-	touch := func() {
-		tCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		defer cancel()
-		if err := s.store.UpdateSessionLastActivity(tCtx, sessionID, time.Now()); err != nil {
-			// ErrNotFound here means the refresh had nowhere to land, so this
-			// keepalive kept nothing alive -- the case the store contract now
-			// reports rather than swallows. Not fatal: the request is still
-			// being served, and idle-gc's recovery baseline covers the gap.
-			// A cancelled ctx is just the request ending, so it is not a fault.
-			if ctx.Err() != nil {
-				return
-			}
-			log.Warn("router: session activity refresh did not land",
-				"sessionId", sessionID, "error", err)
-		}
-	}
-
-	touch()
-
-	ticker := time.NewTicker(activityRefreshInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			touch()
-		}
-	}
 }
 
 // concurrencyLimitMiddleware limits concurrent requests.

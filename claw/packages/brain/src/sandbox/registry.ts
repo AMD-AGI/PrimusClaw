@@ -293,6 +293,30 @@ export function revokeHandsToken(token: string): void {
  * `keepalive:false` with a stale `idleSince`, which is exactly the shape a
  * reclaim treats as its licence.
  */
+/**
+ * Tri-state run-lease read for destructive paths.
+ *
+ * `sessionHasActiveRunLease` folds a failed KV read into `false`, which is only
+ * safe where "no lease" means "skip a reclaim and try again" -- never where it
+ * licences a stop or cluster DELETE. Callers that destroy must treat `unknown`
+ * like `held`.
+ */
+export async function readRunLeaseState(
+  kv: KV,
+  scope: string,
+): Promise<"held" | "free" | "unknown"> {
+  let lock;
+  try {
+    lock = await kv.get(`lock.${scope}`);
+  } catch (err) {
+    logger.warn({ err, scope }, "run_lease.read_failed");
+    return "unknown";
+  }
+  // A released lease is deleted, and a delete leaves a readable entry with an
+  // empty value -- so presence alone reads every finished run as a running one.
+  return lock && !isTombstone(lock) ? "held" : "free";
+}
+
 export async function sessionHasActiveRunLease(
   kv: KV,
   sessionId: string,
@@ -303,13 +327,9 @@ export async function sessionHasActiveRunLease(
   // multi-node clusters. Entries written before this field existed fall back to
   // the session, which is what a single-node run uses anyway.
   const scope = typeof runScope === "string" && runScope ? runScope : sessionId;
-  const lock = await kv.get(`lock.${scope}`).catch(() => null);
-  // A released lease is deleted, and a delete leaves a readable entry with an
-  // empty value -- so `!!lock` reads every finished run as a running one, and
-  // the reclaim this guard fronts would be skipped for the tombstone's whole
-  // lifetime. isTombstone is the same check task-lock already applies to these
-  // keys for the same reason.
-  return !!lock && !isTombstone(lock);
+  // Fail-open: a blip looks like no lease. Harmless only for "skip and retry"
+  // callers -- destructive paths must use readRunLeaseState instead.
+  return (await readRunLeaseState(kv, scope)) === "held";
 }
 
 export async function isValidHandsToken(token: string): Promise<boolean> {
