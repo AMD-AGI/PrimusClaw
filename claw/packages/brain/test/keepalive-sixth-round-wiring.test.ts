@@ -32,6 +32,8 @@ const { bindSandboxProviders } = await import("../src/sandbox/factory.js");
 const {
   runKeepaliveTickForTest,
   resetBackgroundWorkStateForTest,
+  registerSandbox,
+  registeredSandboxCount,
   unregisterSandbox,
 } = await import("../src/sandbox/keepalive.js");
 
@@ -196,6 +198,48 @@ test("keepalive failure eviction skips MN cascade only while a run lease is held
   await runKeepaliveTickForTest({ kv: stale.kv, countActiveShells: async () => 0 });
   assert.ok(stops >= 1, "stale handles are still evicted");
   assert.deepEqual(reclaimed, ["msg-stale"], "no lease means cascade must reclaim");
+});
+
+test("failure eviction is not vetoed by a live sibling sandbox of the same session", async (t) => {
+  // A DAG session can hold two sandboxes. One of them confirmed dead is a
+  // verdict on that identity; the other staying registered is no reason to
+  // keep it -- or to keep its admission slot and KV record alive for ever.
+  const SESSION = "sess-dag-two";
+  const DEAD = `wl-${SESSION}`;
+  const SIBLING = "wl-sibling";
+  const { kv } = failEvictKv({ sessionId: SESSION, messageId: "msg-dag", runLease: false });
+  bindHandsKv(kv);
+
+  const stopped: string[] = [];
+  const provider = {
+    kind: "safe-workload",
+    async get(inst: { id: string }) {
+      return inst.id === DEAD
+        ? { running: false, healthy: false, state: "absent" }
+        : { running: true, healthy: true, state: "running" };
+    },
+    async stop(inst: { id: string }) { stopped.push(inst.id); },
+  } as unknown as SandboxProvider;
+  const restoreProviders = bindSandboxProviders({
+    safeWorkload: provider, agentSandbox: provider,
+  });
+  const restoreRetry = bindSandboxStopRetry({ attempts: 1, delayMs: 0 });
+  const restoreReclaim = bindClusterReclaimForTest(async () => 0);
+  t.after(() => {
+    restoreProviders();
+    restoreRetry();
+    restoreReclaim();
+    unregisterSandbox(SESSION);
+  });
+
+  const base = { provider: "safe-workload" as const, platformKey: "pk", namespace: "ns" };
+  registerSandbox(SESSION, { ...base, workloadId: DEAD });
+  registerSandbox(SESSION, { ...base, workloadId: SIBLING });
+
+  await runKeepaliveTickForTest({ kv, countActiveShells: async () => 0 });
+
+  assert.deepEqual(stopped, [DEAD], "the dead sandbox is evicted, the live sibling is not");
+  assert.equal(registeredSandboxCount(SESSION), 1, "only the sibling stays registered");
 });
 
 test("tick renews within-window idle holds after the ping phase", async (t) => {

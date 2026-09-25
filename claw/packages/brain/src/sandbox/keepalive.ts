@@ -2839,6 +2839,9 @@ async function expireIdleTarget(
  * registry / sibling check, fail-closed run lease, optional identity match,
  * then revision CAS. Paths that must stop a dead sandbox under a live turn
  * pass `claimDespiteLease` and decide MN cascade from the lease themselves.
+ * `claimDespiteSiblings` skips the registry / sibling check for a verdict on
+ * one identity (failure eviction): another registered sandbox of the same
+ * session says nothing about whether this one is alive.
  */
 async function claimIdleStop(
   deps: KeepaliveDeps,
@@ -2853,6 +2856,7 @@ async function claimIdleStop(
     collectingIdentity?: string;
     expected?: SandboxEntry;
     claimDespiteLease?: boolean;
+    claimDespiteSiblings?: boolean;
   },
 ): Promise<boolean> {
   if (opts?.expected) {
@@ -2863,7 +2867,9 @@ async function claimIdleStop(
     }
   }
   const collecting = opts?.collectingIdentity;
-  if (collecting) {
+  if (opts?.claimDespiteSiblings) {
+    // Verdict on this identity alone; see the doc comment.
+  } else if (collecting) {
     for (const [regKey, registered] of localRegistry) {
       if (registered.sessionId === sessionId && regKey !== collecting) return false;
     }
@@ -3058,9 +3064,9 @@ async function handleKeepaliveFailures(
           named.record,
           undefined,
           {
-            collectingIdentity: identity,
             expected: entry,
             claimDespiteLease: true,
+            claimDespiteSiblings: true,
           },
         );
         if (!claimed) continue;
