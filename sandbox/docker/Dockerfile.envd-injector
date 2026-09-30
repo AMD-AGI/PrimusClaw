@@ -112,11 +112,17 @@ RUN wget -q -O /tmp/iptables.tar.xz \
 # Use a content-addressed URL (a commit SHA, a digest). These become trust
 # anchors, so whoever controls the ref controls what TLS the sandbox accepts.
 #
-# NOTE: nothing consumes this bundle today. The CodeInterpreter initContainer
-# copies only envd, tmux, iptables and the musl loader into /shared/bin (see
-# pkg/workloadmanager/codeinterpreter_controller.go), so /setup-amd-ca.sh is
-# never invoked and would take its "bundle not found; skip" path if it were.
-# Wiring it up means adding the copy there as well as building with URLs here.
+# Rebuilding the image is not the only way in, and not the preferred one: a
+# deployment can hand the sandbox its anchors at run time by mounting a
+# ConfigMap of PEM certificates at /etc/claw/extra-ca (see sandbox/README.md).
+#
+# CONTRACT: the final image ships this bundle at /amd-bundle.pem and the merge
+# script at /setup-amd-ca.sh. Pod templates maintained outside this repository
+# copy both into /shared/bin and run `/shared/bin/setup-amd-ca.sh && exec envd`;
+# the CodeInterpreter controller does the same when an extra CA is configured.
+# Renaming either file breaks every such template. The script merges this
+# bundle and the mounted directory with the user image's system bundle into
+# /shared/bin/ca-bundle.pem (docker/scripts/setup-amd-ca.sh).
 FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS ca-fetcher
 
 ARG EXTRA_CA_CERT_URLS=""
@@ -124,8 +130,8 @@ ARG EXTRA_CA_CERT_URLS=""
 RUN apk add --no-cache ca-certificates wget
 
 # The output files are always created, empty when no URLs were given, so the
-# final stage's COPY instructions succeed either way. setup-amd-ca.sh already
-# treats an empty bundle as "nothing to do".
+# final stage's COPY instructions succeed either way. setup-amd-ca.sh treats
+# an empty bundle as "no anchors from the image".
 RUN mkdir -p /extra-ca \
     && : > /extra-ca/ca-bundle.pem \
     && if [ -n "$EXTRA_CA_CERT_URLS" ]; then \
@@ -150,7 +156,8 @@ COPY --from=envd-builder /envd /envd
 COPY --from=tmux-builder /tmux /tmux
 COPY --from=iptables-builder /iptables /iptables
 COPY --from=iptables-builder /musl-ld.so /musl-ld.so
-# Empty unless the build opted in via EXTRA_CA_CERT_URLS.
+# Empty unless the build opted in via EXTRA_CA_CERT_URLS. Paths are a contract
+# (see Stage 3); sandbox/pkg/workloadmanager/extra_ca_test.go pins them.
 COPY --from=ca-fetcher /extra-ca/ca-bundle.pem /amd-bundle.pem
 COPY docker/scripts/setup-amd-ca.sh            /setup-amd-ca.sh
 RUN chmod +x /setup-amd-ca.sh

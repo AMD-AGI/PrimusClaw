@@ -198,6 +198,11 @@ const WORKSPACE_FACING = [
   // second, application-specific name. An identifier, not a credential; the
   // credential is AUTH_CLAW_TOKEN, which this list deliberately omits.
   "CLAW_SESSION_ID",
+  // The CA bundle the sandbox was configured to trust. Without these a command
+  // the model runs verifies TLS against the image's default store alone, and
+  // fails against every endpoint the deployment's own CA signs. Each names a
+  // file path; none carries secret material.
+  "SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
 ];
 
 /**

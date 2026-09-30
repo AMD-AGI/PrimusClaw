@@ -25,6 +25,12 @@ case "$*" in
     ;;
   *"get secret envd-router-identity"*) exit 1 ;;
   *"get ns "*) exit 1 ;;
+  *"get configmap"*)
+    case "$*" in
+      *"-n ${MOCK_CA_NS:-} "*) printf '%s' "${MOCK_CA_DATA:-}" ;;
+      *) exit 1 ;;
+    esac
+    ;;
   *"create secret generic envd-router-identity"*)
     printf 'apiVersion: v1\nkind: Secret\nmetadata:\n  name: envd-router-identity\n'
     ;;
@@ -151,5 +157,45 @@ with open(sys.argv[1], encoding="utf-8") as f:
     values = json.load(f)
 assert values["redis"]["password"] == r"pa,ss\word={x}"
 PY
+
+# Extra CA ConfigMap: forwarded to the chart when present, and a missing or
+# certificate-less one stops the install before Helm runs.
+ca_env=(
+  PATH="$tmp/bin:$PATH"
+  HELM_CAPTURE="$capture"
+  HELM_VALUES_CAPTURE="$values_capture"
+  MOCK_HELM_APPLIED="$tmp/helm.applied"
+  SAFE_API_URL="https://safe.example"
+  FORCE_SANDBOX=true
+  AUTO_INSTALL_HELM=false
+  NAMESPACE=release-test
+  SANDBOX_EXTRA_CA_CONFIGMAP=org-ca
+  SANDBOX_EXTRA_CA_NAMESPACES=sandboxes
+  MOCK_CA_NS=sandboxes
+)
+rm -f "$capture"
+if ! env "${ca_env[@]}" MOCK_CA_DATA='{"ca.crt":"-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----"}' \
+  bash "$repo_root/sandbox/deploy/scripts/install.sh" >"$output" 2>&1; then
+  command cat "$output" >&2
+  exit 1
+fi
+grep -q -- '--set-string controlplane.config.sandboxExtraCAConfigMap=org-ca' "$capture"
+
+rm -f "$capture"
+if env "${ca_env[@]}" MOCK_CA_NS=elsewhere \
+  bash "$repo_root/sandbox/deploy/scripts/install.sh" >"$output" 2>&1; then
+  echo "installer accepted a missing extra CA ConfigMap" >&2
+  exit 1
+fi
+grep -q 'SANDBOX_EXTRA_CA_CONFIGMAP=org-ca not found in namespace sandboxes' "$output"
+[[ ! -e "$capture" ]] || { echo "missing CA ConfigMap still reached Helm" >&2; exit 1; }
+
+if env "${ca_env[@]}" MOCK_CA_DATA='{"ca.crt":"hello"}' \
+  bash "$repo_root/sandbox/deploy/scripts/install.sh" >"$output" 2>&1; then
+  echo "installer accepted an extra CA ConfigMap without a certificate" >&2
+  exit 1
+fi
+grep -q 'ConfigMap sandboxes/org-ca holds no PEM certificate' "$output"
+[[ ! -e "$capture" ]] || { echo "certificate-less CA ConfigMap still reached Helm" >&2; exit 1; }
 
 echo "installer behavior: ok"

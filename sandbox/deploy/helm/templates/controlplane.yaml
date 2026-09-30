@@ -226,6 +226,14 @@ spec:
             - name: SANDBOX_IMAGE_REGISTRY
               value: {{ .Values.controlplane.config.sandboxImageRegistry | quote }}
             {{- end }}
+            {{- if .Values.controlplane.config.sandboxExtraCAConfigMap }}
+            - name: SANDBOX_EXTRA_CA_CONFIGMAP
+              value: {{ .Values.controlplane.config.sandboxExtraCAConfigMap | quote }}
+            {{- end }}
+            {{- if .Values.controlplane.config.sandboxExtraCARequired }}
+            - name: SANDBOX_EXTRA_CA_REQUIRED
+              value: "true"
+            {{- end }}
             {{- if .Values.controlplane.config.registrySecret }}
             - name: REGISTRY_SECRET
               value: {{ .Values.controlplane.config.registrySecret | quote }}
