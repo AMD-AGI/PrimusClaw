@@ -30,6 +30,16 @@ import { getPluginToolScope } from "../tools/scope.js";
 const logger = pino({ name: "script-runner" });
 const WAIT_EXTERNAL_SENTINEL = "AKA_WAIT_EXTERNAL";
 
+/**
+ * Consecutive calls a repeated step may lose in transit before the loss ends it.
+ *
+ * The proxy in front of a sandbox resets its connections every few minutes, and a
+ * repeated `wait` is nearly always in flight when that happens. Ending the
+ * repetition there failed runs that were healthy. Bounded, so a sandbox that is
+ * really gone still fails the step within a few seconds.
+ */
+const REPEAT_TRANSPORT_RETRIES = 3;
+
 export interface ScriptRunCtx {
   hands?: HandsClient | null;
   /** AgentHook fire(...) function from `agent/hooks.ts`; optional for the harness. */
@@ -291,6 +301,7 @@ export async function runScript(
     const repeatDeadline = repeat ? nowMs() + repeat.max_seconds * 1000 : 0;
     let attempt = 0;
     let repeatStopped = "";
+    let transportLosses = 0;
 
     // eslint-disable-next-line no-constant-condition
     while (true) {
@@ -310,6 +321,7 @@ export async function runScript(
       resultText = "";
       structured = undefined;
       stepError = undefined;
+      let lostInTransit = false;
       const attemptTimeoutMs = Math.max(
         1,
         Math.floor(repeat ? Math.min(stepDeadlineSec * 1000, remainingMs) : stepDeadlineSec * 1000),
@@ -373,6 +385,7 @@ export async function runScript(
         }
       } catch (callErr) {
         stepError = callErr instanceof Error ? callErr.message : String(callErr);
+        lostInTransit = true;
       }
 
       toolStats.total_calls++;
@@ -396,6 +409,28 @@ export async function runScript(
       if (stepError && !waitExternal) toolStats.error_calls++;
 
       if (!repeat) break;
+      // A call that never came back is not an answer from the tool, and the loop
+      // calls this step again anyway, so a lost one is sent again rather than ending
+      // the repetition. An answer that is an error still ends it, below.
+      if (lostInTransit && transportLosses < REPEAT_TRANSPORT_RETRIES && attempt < repeat.max_attempts) {
+        transportLosses++;
+        logger.warn(
+          { step: i, name: step.name, attempt, transportLosses, err: stepError },
+          "script.repeat_call_lost_retrying",
+        );
+        const completedSleep = await sleep(
+          Math.min(Math.max(1, repeat.interval_sec ?? 0) * 1000, Math.max(0, repeatDeadline - nowMs())),
+          ctx.signal,
+        );
+        if (!completedSleep) {
+          return failResult(
+            "script aborted by signal", "cancelled",
+            captures, artifacts, toolStats, startedAt,
+          );
+        }
+        continue;
+      }
+      if (!lostInTransit) transportLosses = 0;
       // An error ends the repetition and is handled by on_fail below, exactly as it
       // would be for a single attempt.
       if (stepError || waitExternal) { repeatStopped = "error"; break; }
