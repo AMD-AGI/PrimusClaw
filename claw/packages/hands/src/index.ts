@@ -9,7 +9,7 @@ import Fastify from "fastify";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { constantTimeEquals, verifyScopeCredential, type CredentialScope } from "@claw/utils";
-import { RECLAIM_CAUSES, isReclaimCause, isReapGrace } from "@claw/protocol";
+import { HANDS_TOKEN_HEADER, RECLAIM_CAUSES, isReclaimCause, isReapGrace } from "@claw/protocol";
 import { tools } from "./tools/index.js";
 import {
   MAX_REAP_GRACE_MS, MIN_REAP_GRACE_MS, REAP_GRACE_MS,
@@ -46,7 +46,20 @@ function authFailure(req: { headers: Record<string, unknown> }): { status: numbe
   return null;
 }
 
-function presentedCredential(req: { headers: Record<string, unknown> }): string {
+/**
+ * The credential this request presents.
+ *
+ * Read from {@link HANDS_TOKEN_HEADER} first because a request that came
+ * through the sandbox Router's port proxy arrives with `Authorization`
+ * stripped; Brain sends the same value in both, so a direct request is judged
+ * on the same credential either way. `Authorization` stays accepted for
+ * callers that only send it. Either way the value is then checked exactly as
+ * before -- this only decides where it is read from.
+ */
+export function presentedCredential(req: { headers: Record<string, unknown> }): string {
+  const routed = req.headers[HANDS_TOKEN_HEADER.toLowerCase()];
+  const fromRouted = typeof routed === "string" ? routed.trim() : "";
+  if (fromRouted) return fromRouted;
   return String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
 }
 

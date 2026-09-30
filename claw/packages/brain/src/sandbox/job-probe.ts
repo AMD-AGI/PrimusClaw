@@ -7,11 +7,11 @@ import {
   AUTH_INTERNAL_TOKEN,
   SAFE_API_URL,
   SANDBOX_NAMESPACE,
-  SANDBOX_ROUTER_URL,
 } from "../config.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
 import type { SandboxInstance, SandboxStatus } from "./provider.js";
 import { SandboxRuntimeTerminalError } from "./errors.js";
+import { fetchThroughRouters, sandboxRouterBases } from "./sandbox-router.js";
 
 export interface JobProbeEntry {
   provider?: "safe-workload" | "agent-sandbox";
@@ -200,15 +200,16 @@ export async function inspectSandboxJobs(
   const deadline = Date.now() + timeoutMs;
   await withinBudget(assertSandboxRunning(entry), deadline, "workload status read");
 
+  // SaFE mode may list several Router bases (see sandbox-router.ts); the
+  // agent-sandbox provider and the no-Router ingress each have one.
+  const routers = agent ? [] : sandboxRouterBases();
   const base = agent
     ? AGENT_SANDBOX_ROUTER_URL.replace(/\/+$/, "")
-    : (SANDBOX_ROUTER_URL.trim()
-      ? SANDBOX_ROUTER_URL.replace(/\/+$/, "")
-      : `${SAFE_API_URL}/sandbox`);
+    : (routers.length > 0 ? routers[0] : `${SAFE_API_URL}/sandbox`);
   if (!base) throw new Error("sandbox jobs probe router URL is not configured");
 
   const name = agent ? inst.sandboxName : inst.id;
-  const url = `${base}/v1/namespaces/${inst.namespace}/code-interpreters/${name}/invocations/api/jobs`;
+  const path = `/v1/namespaces/${inst.namespace}/code-interpreters/${name}/invocations/api/jobs`;
   const headers: Record<string, string> = { "x-session-id": inst.id };
   if (agent) {
     if (inst.userId) headers.userId = inst.userId;
@@ -221,11 +222,14 @@ export async function inspectSandboxJobs(
   if (remaining <= 0) {
     throw new Error("sandbox jobs probe budget expired before the roster read");
   }
-  const response = await fetch(url, {
+  const init: RequestInit = {
     method: "GET",
     headers,
     signal: AbortSignal.timeout(remaining),
-  });
+  };
+  const response = routers.length > 0
+    ? await fetchThroughRouters(routers, path, init, fetch)
+    : await fetch(`${base}${path}`, init);
   if (!response.ok) {
     if (response.status === 404 || response.status === 405 || response.status === 501) {
       throw new SandboxJobsUnavailableError(response.status);

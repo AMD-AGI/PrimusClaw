@@ -19,7 +19,6 @@ import {
   AGENT_SANDBOX_MAX_SESSION_SECONDS,
   SANDBOX_NAMESPACE,
   SANDBOX_WORKLOAD_PRIORITY,
-  SANDBOX_ROUTER_URL,
   AUTH_INTERNAL_TOKEN,
 } from "../config.js";
 import {
@@ -32,6 +31,7 @@ import {
 import { resourcesMapToWorkloadArray } from "./params.js";
 import { EXEC_TRANSPORT_SLACK_MS, parseExecTimeoutMs } from "./provider.js";
 import { sandboxWorkloadName } from "./workload-naming.js";
+import { fetchThroughRouters, safeHandsBaseUrl, sandboxRouterBases } from "./sandbox-router.js";
 import { waitForWorkloadReady, type WorkloadWaitDeps } from "./workload-wait.js";
 import type {
   SandboxProvider,
@@ -148,7 +148,7 @@ export class SafeWorkloadProvider implements SandboxProvider {
       id: workloadId,
       sandboxName: workloadId,
       namespace: ns,
-      handsBaseUrl: `http://${workloadId}.${ns}.svc.cluster.local:${HANDS_MCP_PORT}`,
+      handsBaseUrl: safeHandsBaseUrl(ns, workloadId, HANDS_MCP_PORT),
       platformKey: apiKey,
     };
   }
@@ -190,9 +190,8 @@ export class SafeWorkloadProvider implements SandboxProvider {
     opts?: SandboxExecOptions,
   ): Promise<SandboxExecResult> {
     const ns = inst.namespace?.trim() || SANDBOX_NAMESPACE;
-    const routerConfigured = SANDBOX_ROUTER_URL.trim();
-    const execBase = routerConfigured ? routerConfigured.replace(/\/+$/, "") : `${SAFE_API_URL}/sandbox`;
-    const url = `${execBase}/v1/namespaces/${ns}/code-interpreters/${inst.id}/invocations/api/execute`;
+    const routers = sandboxRouterBases();
+    const path = `/v1/namespaces/${ns}/code-interpreters/${inst.id}/invocations/api/execute`;
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       "x-session-id": inst.id,
@@ -201,7 +200,7 @@ export class SafeWorkloadProvider implements SandboxProvider {
     const internalToken = AUTH_INTERNAL_TOKEN.trim();
     if (internalToken) headers["X-Internal-Token"] = internalToken;
 
-    const resp = await fetch(url, {
+    const init: RequestInit = {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -222,7 +221,12 @@ export class SafeWorkloadProvider implements SandboxProvider {
           AbortSignal.timeout(parseExecTimeoutMs(timeout) + EXEC_TRANSPORT_SLACK_MS),
         ])
         : AbortSignal.timeout(parseExecTimeoutMs(timeout) + EXEC_TRANSPORT_SLACK_MS),
-    });
+    };
+    // With no Router configured this is the SaFE public ingress, one address,
+    // exactly as before.
+    const resp = routers.length > 0
+      ? await fetchThroughRouters(routers, path, init, fetch)
+      : await fetch(`${SAFE_API_URL}/sandbox${path}`, init);
     if (!resp.ok) {
       const errBody = await resp.text();
       const msg = `sandboxExec failed: HTTP ${resp.status} ${errBody.slice(0, 300)}`;

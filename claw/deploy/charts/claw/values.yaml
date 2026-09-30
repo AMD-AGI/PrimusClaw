@@ -341,8 +341,17 @@ secret:
   # `workspace_id` lands its sandbox there instead (sandbox/ensure-hands.ts). It defaults
   # to `default` so a fresh cluster installs without pre-creating a namespace;
   # point it at a dedicated namespace to keep agent workloads isolated.
+  #
+  # In SaFE mode sandboxRouterUrl may list several comma-separated bases for the same
+  # Router, e.g. one per gateway node of a remote cluster; Brain moves to the next only
+  # when a connection cannot be opened. Keep it a single URL in kubernetes mode, where it
+  # is also AGENT_SANDBOX_ROUTER_URL.
   sandboxRouterUrl: http://agent-sandbox-router.agent-sandbox-system.svc.cluster.local:8080
   sandboxNamespace: default
+  # Reach Hands through the Router's port proxy instead of the sandbox's cluster DNS name
+  # (SANDBOX_HANDS_VIA_ROUTER). Only needed when sandboxes run in another cluster, where
+  # that name does not resolve. SaFE mode only.
+  sandboxHandsViaRouter: "false"
   clawDeployRoot: ""
   workspacePersistBase: ""
   litellmApiBase: ""
