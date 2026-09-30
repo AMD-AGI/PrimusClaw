@@ -392,6 +392,10 @@ secret:
   cursorApiKey: ""
   s3Endpoint: ""
   s3ApiEndpoint: ""
+  # The S3 API endpoint as sandboxes reach it, for the presigned URLs workspace
+  # sync hands them. Empty uses s3ApiEndpoint; set it when sandboxes run where
+  # that name does not resolve (for example another cluster).
+  s3SandboxEndpoint: ""
   s3Bucket: claw
   s3Region: us
   s3AccessKey: ""

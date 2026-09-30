@@ -623,6 +623,7 @@ values = {
         "s3Bucket": env("S3_BUCKET", "claw"),
         "s3Endpoint": env("S3_ENDPOINT"),
         "s3ApiEndpoint": env("S3_API_ENDPOINT"),
+        "s3SandboxEndpoint": env("S3_SANDBOX_ENDPOINT"),
         "s3AccessKey": env("S3_ACCESS_KEY"),
         "s3SecretKey": env("S3_SECRET_KEY"),
     },
