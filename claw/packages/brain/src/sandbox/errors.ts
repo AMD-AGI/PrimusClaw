@@ -49,6 +49,23 @@ export class SandboxProvisionTerminalError extends Error {
 }
 
 /**
+ * The provisioning give-up behind `err`, wherever it sits in the cause chain.
+ *
+ * A lazy sandbox open reaches the runner wrapped in `SandboxAttachError`
+ * (agent/attach-error.ts), so matching on the thrown class alone reads a
+ * terminal give-up as an ordinary failure: it is recorded as `agent_error`,
+ * and one whose message names a retryable status is naked back into the queue.
+ */
+export function provisionTerminalOf(err: unknown): SandboxProvisionTerminalError | null {
+  let current: unknown = err;
+  for (let depth = 0; current && depth < 4; depth++) {
+    if (current instanceof SandboxProvisionTerminalError) return current;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return null;
+}
+
+/**
  * classifyWorkloadTerminalReason maps a SaFE workload detail payload (already
  * observed in a terminal phase) to a stable reason.
  *
