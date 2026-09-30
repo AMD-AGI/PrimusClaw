@@ -124,6 +124,18 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- A sandbox that never came up is no longer recorded as `agent_error`, and is no
+  longer retried. Under lazy sandbox creation the provisioning give-up reaches the
+  task runner wrapped in `SandboxAttachError`, and the runner matched the give-up by
+  its class alone: the run failed as `agent_error` instead of its provisioning code
+  (`sandbox_workload_terminal`, `sandbox_gone`, ...), and a give-up whose message
+  named a retryable status was naked back into the queue it had just given up on.
+  The runner now finds the give-up anywhere in the cause chain.
+- Parking a session whose hands handle was deleted no longer fails and retries
+  every sweep. NATS KV answers `get` on a deleted key with its delete marker, an
+  empty value, and `parkHandsHandle` parsed it as a handle ("Unexpected end of
+  JSON input") while `parkHandsAfterRun` skipped it as unreadable. Both now read a
+  delete or purge marker as `gone`.
 - `GET /v1/runs` no longer answers 500 when a query parameter is given twice.
   A repeated key parses to an array, and the handler read every parameter as a
   string, so `?ids=a&ids=b` — and the same for `state` and `since` — reached a
@@ -188,6 +200,11 @@ record it.
   numbers — they were wrong.
 
 ### Added
+- `terminal.failure_reason` on `GET /v1/runs`: Claw's own code for how the run
+  failed. `class` and `kill_reason` report a run whose sandbox never became usable
+  as `failed` / `""`, exactly like an agent that ran and broke; the provisioning
+  codes listed in `claw/docs/run-api.md` are what tell a dispatcher that nothing
+  executed.
 - `run_id` on the responses that start a run, so a caller can read back the run
   it just began. `POST /v1/sessions` with a `message` reports it at
   `data.message.run_id`, and `POST /v1/sessions/{id}/messages` at the top level

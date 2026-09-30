@@ -61,7 +61,7 @@ import type { ContainerProbeVerdict, HandsProbeEntry } from "../sandbox/containe
 import { checkHandsHealth } from "../sandbox/hands-health.js";
 import { restartHandsInSandbox } from "../sandbox/hands-restart.js";
 import { resolveSandboxAction } from "../sandbox/params.js";
-import { SandboxProvisionTerminalError } from "../sandbox/errors.js";
+import { provisionTerminalOf } from "../sandbox/errors.js";
 import { runScript } from "./script-runner.js";
 import {
   AgentDoneDeliveryError, postAgentDone, postRunLease, postTaskRunning, sandboxForLease,
@@ -3591,9 +3591,7 @@ class TaskRunner {
     const rawMsg = String(err?.message || err);
     // A SandboxProvisionTerminalError carries an authoritative machine reason
     // (e.g. sandbox_workload_terminal); else fall back to the message-regex classifier.
-    const sandboxReason = err instanceof SandboxProvisionTerminalError
-      ? err.reason
-      : classifySandboxFailure(rawMsg);
+    const sandboxReason = provisionTerminalOf(err)?.reason ?? classifySandboxFailure(rawMsg);
     if (sandboxReason) {
       await this.onEvent({
         type: "sandboxStatus",
@@ -4160,7 +4158,7 @@ class TaskRunner {
     if (this.abortCtrl.signal.reason === DEADLINE_EXCEEDED_ABORT_REASON) return "failed";
     if (this.abortCtrl.signal.aborted) return "interrupted";
     if (err instanceof AgentDoneDeliveryError) return "retryable";
-    if (err instanceof SandboxProvisionTerminalError) return "failed";
+    if (provisionTerminalOf(err)) return "failed";
     return isRetryable(err) ? "retryable" : "failed";
   }
 
@@ -4210,7 +4208,7 @@ class TaskRunner {
       this.msg.nak(5_000);
       return;
     }
-    if (err instanceof SandboxProvisionTerminalError) {
+    if (provisionTerminalOf(err)) {
       await this.settleTerminal(
         () => this.handleFatalError(err),
         "task.provision_terminal_agent_done_delivery_exhausted",

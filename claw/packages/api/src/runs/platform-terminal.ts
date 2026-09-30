@@ -53,6 +53,17 @@ export interface TerminalFacts {
   signal: string;
 }
 
+export interface TerminalView extends TerminalFacts {
+  /**
+   * Claw's own code for how the run failed, `""` when none was recorded.
+   *
+   * `class` and `kill_reason` say whether the platform ended the run, and a run
+   * whose sandbox never became usable is `failed` / `""` exactly like an agent
+   * that ran and broke. The sandbox-provisioning codes are what tell them apart.
+   */
+  failure_reason: string;
+}
+
 export interface RunView {
   run_id: string;
   /**
@@ -68,7 +79,7 @@ export interface RunView {
    */
   session_id: string;
   phase: RunPhase;
-  terminal: TerminalFacts | null;
+  terminal: TerminalView | null;
   timestamps: {
     created_at: string;
     started_at: string;
