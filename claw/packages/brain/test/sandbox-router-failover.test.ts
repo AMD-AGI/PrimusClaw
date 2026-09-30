@@ -146,3 +146,26 @@ test("exec is not re-sent when the connection broke after it opened", async () =
   await assert.rejects(() => new SafeWorkloadProvider().exec(inst, "echo hi", "5s"));
   assert.equal(seen.length, 1);
 });
+
+test("a single base is sent exactly as given, init and all", async () => {
+  const calls: Array<[string, RequestInit | undefined]> = [];
+  const init: RequestInit = { method: "POST", body: "{}" };
+  await fetchThroughRouters(["http://only.test"], "/x", init, async (u: string, i?: RequestInit) => { calls.push([u, i]); return "ok"; });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], "http://only.test/x");
+  assert.equal(calls[0][1], init, "the same init object, redirect policy untouched");
+});
+
+test("with several bases a redirect is not followed, so its second hop cannot look like a connect failure", async () => {
+  const inits: Array<RequestInit | undefined> = [];
+  await fetchThroughRouters(BASES, "/x", { method: "POST", body: "{}" }, async (_u: string, i?: RequestInit) => { inits.push(i); return "ok"; });
+  assert.equal(inits[0]?.redirect, "manual");
+});
+
+test("an aborted signal stops the walk with the abort reason", async () => {
+  const ac = new AbortController();
+  const seen: string[] = [];
+  const f = async (url: string) => { seen.push(url); ac.abort(new Error("stop")); throw refused(); };
+  await assert.rejects(() => fetchThroughRouters(BASES, "/x", { signal: ac.signal }, f), /stop/);
+  assert.deepEqual(seen, ["http://a.test/x"]);
+});

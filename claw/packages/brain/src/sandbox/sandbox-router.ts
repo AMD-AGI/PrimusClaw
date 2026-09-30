@@ -126,12 +126,19 @@ export async function fetchThroughRouters<R>(
   fetchImpl: FetchLike<R>,
 ): Promise<R> {
   if (bases.length === 0) throw new Error("no sandbox router base configured");
+  // One base is one address: the request goes exactly as it did before lists.
+  if (bases.length === 1) return fetchImpl(`${bases[0]}${suffix}`, init);
+  // A followed redirect would open a second connection whose failure looks
+  // like a connect failure although the first hop already received the
+  // request. The Router never redirects, so a 3xx is handed back as an answer
+  // instead of being followed.
+  if ((init?.redirect ?? "follow") === "follow") init = { ...init, redirect: "manual" };
   const order = orderedBases(bases);
   // A body that cannot be replayed gets exactly one try, on the likeliest base.
   const tries = replayable(init?.body) ? order : order.slice(0, 1);
   let lastErr: unknown;
   for (const base of tries) {
-    if (init?.signal?.aborted) break;
+    if (init?.signal?.aborted) throw init.signal.reason ?? lastErr;
     try {
       const res = await fetchImpl(`${base}${suffix}`, init);
       preferredByList.set(bases.join(","), base);
@@ -145,7 +152,7 @@ export async function fetchThroughRouters<R>(
       );
     }
   }
-  throw lastErr ?? new Error("request aborted before any sandbox router was tried");
+  throw lastErr;
 }
 
 /**

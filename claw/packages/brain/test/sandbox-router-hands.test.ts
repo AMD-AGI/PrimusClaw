@@ -33,8 +33,9 @@ await new Promise<void>((r) => probe.close(() => r()));
 process.env.SANDBOX_ROUTER_URL = `${dead},${live}`;
 process.env.SANDBOX_HANDS_VIA_ROUTER = "true";
 
-const { handsViaRouter, safeHandsBaseUrl, resetRouterPreferenceForTest } =
+const { handsViaRouter, safeHandsBaseUrl, resetRouterPreferenceForTest, fetchThroughRouters } =
   await import("../src/sandbox/sandbox-router.js");
+const { mcpPortFromUrl } = await import("../src/sandbox/hands-restart.js");
 const { checkHandsHealth } = await import("../src/sandbox/hands-health.js");
 const { countActiveShells } = await import("../src/clients/hands.js");
 
@@ -67,4 +68,30 @@ test("health and a credentialed route carry the session and X-Hands-Token, past 
   const token = last.headers["x-hands-token"];
   assert.ok(typeof token === "string" && token.length > 0, "credential travels in X-Hands-Token");
   assert.equal(last.headers.authorization, `Bearer ${token}`, "and in Authorization, the same value");
+});
+
+test("a restart takes the Hands port from the proxy path, not the Router's port", () => {
+  assert.equal(mcpPortFromUrl("http://router:8080/v1/namespaces/ns/code-interpreters/wl/invocations/proxy/9100/mcp"), "9100");
+  assert.equal(mcpPortFromUrl("http://wl.ns.svc.cluster.local:9100/mcp"), "9100");
+});
+
+test("a Router that answers with a redirect to a dead address is not followed, and nothing is re-sent", async () => {
+  const hits: string[] = [];
+  const redirecting = createServer((req, res) => {
+    hits.push(`${req.method} ${req.url}`);
+    res.writeHead(302, { location: `${dead}/elsewhere` });
+    res.end();
+  });
+  await new Promise<void>((r) => redirecting.listen(0, "127.0.0.1", r));
+  const a = `http://127.0.0.1:${(redirecting.address() as AddressInfo).port}`;
+  resetRouterPreferenceForTest();
+  seen.length = 0;
+  try {
+    const res = await fetchThroughRouters([a, live], "/exec", { method: "POST", body: "{}" }, fetch);
+    assert.equal(res.status, 302, "the redirect is the answer");
+    assert.deepEqual(hits, ["POST /exec"]);
+    assert.equal(seen.length, 0, "the second Router never saw the request");
+  } finally {
+    redirecting.close();
+  }
 });
