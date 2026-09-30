@@ -206,3 +206,26 @@ test("D6 a live run has no terminal block at all", () => {
   assert.equal(phaseOf("cancelling"), "running");
   assert.equal(phaseOf("failed"), "terminal");
 });
+
+test("D7 the run view carries Claw's own failure code beside the classification", async () => {
+  // `class` and `kill_reason` answer "did the platform do it", and for a run
+  // whose sandbox never came up they answer `failed` / "" -- the same as an
+  // agent that ran and broke. The code is what tells the two apart.
+  const { toRunView } = await import("../src/runs/routes.js");
+  const row = {
+    task_id: "ktsk_1", session_id: "sess-1", status: "failed",
+    failure_reason: "sandbox_workload_terminal", sandbox_workload_id: "w-1",
+    platform_exit_code: null, platform_node: null, platform_message: null,
+    platform_container_reason: null, created_at: null, started_at: null,
+    completed_at: null, deadline_at: null,
+  };
+
+  const failed = toRunView(row);
+  assert.equal(failed.terminal?.class, "failed");
+  assert.equal(failed.terminal?.failure_reason, "sandbox_workload_terminal");
+
+  assert.equal(toRunView({ ...row, failure_reason: null }).terminal?.failure_reason, "",
+    "no recorded code is an empty string, not a missing field");
+  assert.equal(toRunView({ ...row, status: "running" }).terminal, null,
+    "a live run still has no terminal block");
+});

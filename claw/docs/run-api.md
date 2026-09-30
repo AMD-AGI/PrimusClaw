@@ -93,7 +93,18 @@ Neither `ids` nor `session_ids` may be combined with `cursor`
 
 ## The terminal block
 
-A terminal run carries `class`, `kill_reason`, `exit_code`, and `signal`.
+A terminal run carries `class`, `kill_reason`, `exit_code`, `signal`, and
+`failure_reason`.
+
+`failure_reason` is Claw's own code for how the run failed, `""` when none was
+recorded. It is what separates a run that never started from one that ran and broke,
+which `class` and `kill_reason` do not: both are `failed` / `""`. A run whose sandbox
+never became usable records one of the provisioning codes --
+`sandbox_workload_terminal`, `sandbox_exited_before_ready`, `sandbox_container_failed`,
+`sandbox_envd_exited`, `sandbox_timed_out`, `sandbox_pending_timeout`,
+`sandbox_status_unreadable`, `sandbox_gone`, `sandbox_create_failed`,
+`sandbox_image_missing`, `sandbox_auth_missing`, `sandbox_template_missing`,
+`sandbox_health_failed`, `sandbox_bootstrap_failed` -- and nothing in it executed.
 
 `exit_code` is `null` when no exit code was ever reported -- most often because the
 run's worker went away with its node. Null means unknown; it is not a success and not
