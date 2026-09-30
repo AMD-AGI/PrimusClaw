@@ -162,6 +162,7 @@ test("R4 a run is rendered with the platform's account of its ending", async () 
   assert.equal(body.phase, "terminal");
   assert.deepEqual(body.terminal, {
     class: "killed", kill_reason: "preempted", exit_code: 137, signal: "SIGKILL",
+    failure_reason: "brain_timeout",
   });
   assert.equal(body.placement.node, "gpu-node-7");
 });
