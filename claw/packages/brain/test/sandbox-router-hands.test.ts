@@ -53,7 +53,7 @@ test("health and a credentialed route carry the session and X-Hands-Token, past 
   resetRouterPreferenceForTest();
   seen.length = 0;
   const mcpUrl = `${safeHandsBaseUrl("ns", "wl-7", "9100")}/mcp`;
-  assert.ok(mcpUrl.startsWith(dead), "built on the first base, which is down");
+  assert.equal(new URL(mcpUrl).origin, dead, "built on the first base, which is down");
 
   const health = await checkHandsHealth(mcpUrl, 3_000);
   assert.deepEqual(health, { ok: true, detail: "ok" });

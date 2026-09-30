@@ -66,7 +66,7 @@ test("a refused connection moves to the next base, and the answering one is trie
   const seen: string[] = [];
   const f = async (url: string) => {
     seen.push(url);
-    if (url.startsWith("http://a.test")) throw refused();
+    if (new URL(url).host === "a.test") throw refused();
     return `ok ${url}`;
   };
   assert.equal(await fetchThroughRouters(BASES, "/p?q=1", { method: "POST", body: "{}" }, f), "ok http://b.test/p?q=1");
@@ -102,7 +102,7 @@ test("the URL wrapper keeps the path and only swaps a configured base", async ()
   const seen: string[] = [];
   const f = withRouterFailover(async (input: string) => {
     seen.push(String(input));
-    if (String(input).startsWith("http://a.test")) throw refused();
+    if (new URL(String(input)).host === "a.test") throw refused();
     return "ok";
   }, () => BASES);
   await f("http://a.test/v1/namespaces/ns/code-interpreters/w/invocations/proxy/9100/health");
@@ -127,7 +127,7 @@ test("exec moves to the next Router base when the first refuses, and runs once",
   const seen: string[] = [];
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     seen.push(`${init?.method} ${String(input)}`);
-    if (String(input).startsWith("http://r1.test")) throw refused();
+    if (new URL(String(input)).host === "r1.test") throw refused();
     return { ok: true, status: 200, json: async () => ({ exit_code: 0, stdout: "hi\n", stderr: "" }) } as Response;
   }) as typeof fetch;
   const inst = { provider: "safe-workload" as const, id: "wl-1", sandboxName: "wl-1", namespace: "ns", handsBaseUrl: "", platformKey: "pk" };
