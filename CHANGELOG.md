@@ -131,6 +131,11 @@ record it.
   (`sandbox_workload_terminal`, `sandbox_gone`, ...), and a give-up whose message
   named a retryable status was naked back into the queue it had just given up on.
   The runner now finds the give-up anywhere in the cause chain.
+- Parking a session whose hands handle was deleted no longer fails and retries
+  every sweep. NATS KV answers `get` on a deleted key with its delete marker, an
+  empty value, and `parkHandsHandle` parsed it as a handle ("Unexpected end of
+  JSON input") while `parkHandsAfterRun` skipped it as unreadable. Both now read a
+  delete or purge marker as `gone`.
 - `GET /v1/runs` no longer answers 500 when a query parameter is given twice.
   A repeated key parses to an array, and the handler read every parameter as a
   string, so `?ids=a&ids=b` — and the same for `state` and `since` — reached a
