@@ -5,21 +5,30 @@
 # Merge the user image's system CA bundle with extra CA anchors into
 # /shared/bin/ca-bundle.pem. Runs in the sandbox's main container before envd.
 #
-# The name, the paths and the calling contract are fixed: templates outside
-# this repository copy /setup-amd-ca.sh and /amd-bundle.pem from the
-# envd-injector image into /shared/bin and start the main container with
+# Calling contract: a pod template copies /setup-extra-ca.sh and
+# /extra-ca-bundle.pem from the envd-injector image into /shared/bin and starts
+# the main container with
 #
-#     /shared/bin/setup-amd-ca.sh && exec /shared/bin/envd ...
+#     /shared/bin/setup-extra-ca.sh && exec /shared/bin/envd ...
 #
 # The CodeInterpreter controller runs the same script the same way when
 # SANDBOX_EXTRA_CA_CONFIGMAP or SANDBOX_EXTRA_CA_REQUIRED is set.
 #
+# Deprecated compatibility names: the injector image also ships this same file
+# as /setup-amd-ca.sh and the same bundle as /amd-bundle.pem, for
+# self-maintained sandbox templates written before the generic names existed.
+# Invoked under either name the script behaves identically; new templates
+# should use the generic names.
+#
 # Extra anchors come from:
-#   - /shared/bin/amd-bundle.pem, the bundle baked into the envd-injector image
-#     at build time (EXTRA_CA_CERT_URLS; empty by default);
-#   - every file in /etc/claw/extra-ca, an optional mounted directory (a
-#     ConfigMap of PEM certificates); dot-entries such as the kubelet's ..data
-#     are skipped.
+#   - the bundle baked into the envd-injector image at build time
+#     (EXTRA_CA_CERT_URLS; empty by default), found next to the output bundle
+#     as extra-ca-bundle.pem, or under its deprecated compatibility name
+#     amd-bundle.pem when only that one was copied. EXTRA_CA_IMAGE_BUNDLE
+#     overrides the path;
+#   - every file in /etc/claw/extra-ca (EXTRA_CA_DIR), an optional mounted
+#     directory (a ConfigMap of PEM certificates); dot-entries such as the
+#     kubelet's ..data are skipped.
 #
 # Strict mode: the container is configured to use the bundle when
 # EXTRA_CA_REQUIRED=true, or when SSL_CERT_FILE, CURL_CA_BUNDLE,
@@ -28,7 +37,7 @@
 # non-zero naming both places, so `&& exec envd` does not start a sandbox whose
 # every TLS client would fail against a missing bundle.
 #
-# Otherwise, with no anchor found it skips and exits 0, as it always has.
+# Otherwise, with no anchor found it skips and exits 0.
 # A file that is present but is not a PEM certificate is an error either way.
 #
 # Designed for sh / dash / busybox: no bash-isms, nothing beyond cat and mv,
@@ -36,13 +45,22 @@
 
 set -eu
 
-IMAGE_BUNDLE="${EXTRA_CA_IMAGE_BUNDLE:-/shared/bin/amd-bundle.pem}"
 CA_DIR="${EXTRA_CA_DIR:-/etc/claw/extra-ca}"
 OUT_BUNDLE="${EXTRA_CA_BUNDLE:-/shared/bin/ca-bundle.pem}"
+BIN_DIR="${OUT_BUNDLE%/*}"
+if [ -n "${EXTRA_CA_IMAGE_BUNDLE:-}" ]; then
+    IMAGE_BUNDLE="$EXTRA_CA_IMAGE_BUNDLE"
+elif [ ! -e "$BIN_DIR/extra-ca-bundle.pem" ] && [ -e "$BIN_DIR/amd-bundle.pem" ]; then
+    # Deprecated compatibility name, copied by self-maintained sandbox
+    # templates written before the rename. Same content as extra-ca-bundle.pem.
+    IMAGE_BUNDLE="$BIN_DIR/amd-bundle.pem"
+else
+    IMAGE_BUNDLE="$BIN_DIR/extra-ca-bundle.pem"
+fi
 SYS_BUNDLES="${EXTRA_CA_SYSTEM_BUNDLES:-/etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem}"
 
 fail() {
-    echo "setup-amd-ca: error: $*" >&2
+    echo "setup-extra-ca: error: $*" >&2
     exit 1
 }
 
@@ -92,7 +110,7 @@ if [ "$extras" -eq 0 ]; then
     if [ -n "$strict" ]; then
         fail "the container is configured to use $OUT_BUNDLE ($strict) but no extra CA certificate was found: $IMAGE_BUNDLE (baked into the envd-injector image with EXTRA_CA_CERT_URLS) is missing or empty, and $CA_DIR (mount a ConfigMap of PEM certificates there) holds no certificate. Refusing to start: every TLS client would fail against this bundle."
     fi
-    echo "setup-amd-ca: no extra CA found at $IMAGE_BUNDLE or in $CA_DIR; skip" >&2
+    echo "setup-extra-ca: no extra CA found at $IMAGE_BUNDLE or in $CA_DIR; skip" >&2
     exit 0
 fi
 
@@ -110,8 +128,8 @@ if [ -n "$sys" ]; then
         fail "cannot write $tmp"
     fi
 else
-    echo "setup-amd-ca: warning: no system CA bundle in this image (looked at: $SYS_BUNDLES); $OUT_BUNDLE holds only the extra anchors, so public TLS endpoints will not verify" >&2
+    echo "setup-extra-ca: warning: no system CA bundle in this image (looked at: $SYS_BUNDLES); $OUT_BUNDLE holds only the extra anchors, so public TLS endpoints will not verify" >&2
 fi
 
 mv "$tmp" "$OUT_BUNDLE" || fail "cannot write $OUT_BUNDLE"
-echo "setup-amd-ca: wrote $OUT_BUNDLE (system bundle: ${sys:-none}; extra anchor files: $extras)"
+echo "setup-extra-ca: wrote $OUT_BUNDLE (system bundle: ${sys:-none}; extra anchor files: $extras)"

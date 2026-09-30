@@ -59,7 +59,7 @@ grep -qx 'EGRESS_EXTRA_BLOCKED_CIDRS=10.0.0.0/8,192.168.0.0/16' "$capture"
 grep -qx 'SANDBOX_EXTRA_CA_CONFIGMAP=' "$capture"
 
 capture="$tmp/extra-ca.env"
-env "${common_env[@]}" CAPTURE="$capture" SAFE_API_URL="https://safe.example" \
+env "${common_env[@]}" CAPTURE="$capture" SAFE_API_URL="https://auth.example" \
   SANDBOX_EXTRA_CA_CONFIGMAP=org-ca SANDBOX_WORKLOAD_NAMESPACE=agents \
   bash "$tmp/repo/deploy/deploy.sh" --yes --skip-litellm --skip-sandbox-check >/dev/null
 grep -qx 'SANDBOX_EXTRA_CA_CONFIGMAP=org-ca' "$capture"

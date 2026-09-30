@@ -428,7 +428,7 @@ func (r *CodeInterpreterReconciler) buildPodTemplate(ci *runtimev1alpha1.CodeInt
 		})
 	}
 
-	// Extra CA: point the TLS clients at the bundle setup-amd-ca.sh writes.
+	// Extra CA: point the TLS clients at the bundle setup-extra-ca.sh writes.
 	// A value the template already sets is left alone. EXTRA_CA_REQUIRED makes
 	// the script fail when it finds no anchor, whatever the template sets.
 	if extraCAEnabled() {
@@ -595,7 +595,7 @@ func (r *CodeInterpreterReconciler) buildPodTemplate(ci *runtimev1alpha1.CodeInt
 		// /shared/bin/ld-musl-x86_64.so.1 so it works in any glibc-based user image.
 		// iptables is copied twice (as iptables + ip6tables) because xtables-legacy-multi
 		// uses argv[0] to determine the protocol family.
-		// With an extra CA configured it also copies setup-amd-ca.sh and the
+		// With an extra CA configured it also copies setup-extra-ca.sh and the
 		// image-baked bundle (EXTRA_CA_CERT_URLS).
 		Command: []string{"sh", "-c", injectorCmd},
 		VolumeMounts: []corev1.VolumeMount{
@@ -634,7 +634,7 @@ func (r *CodeInterpreterReconciler) buildPodTemplate(ci *runtimev1alpha1.CodeInt
 		Resources:       *resources,
 		VolumeMounts:    mainVolumeMounts,
 		SecurityContext: secCtx,
-		// With an extra CA declared, setup-amd-ca.sh can stop the container
+		// With an extra CA declared, setup-extra-ca.sh can stop the container
 		// before envd starts. FallbackToLogsOnError puts its message in the
 		// termination state, so kubectl describe shows why.
 		TerminationMessagePolicy: extraCATerminationMessagePolicy(),
@@ -808,14 +808,14 @@ const (
 // paths. Templates outside this repository copy them the same way, so the
 // names are a contract of the envd-injector image (Dockerfile.envd-injector).
 // No `|| true`: an injector image without them fails the initContainer.
-const extraCAInjectorCopy = " && cp /setup-amd-ca.sh /amd-bundle.pem /shared/bin/"
+const extraCAInjectorCopy = " && cp /setup-extra-ca.sh /extra-ca-bundle.pem /shared/bin/"
 
 // extraCASetupScript runs before the build steps and envd. The script fails
 // with a message naming both anchor sources when it finds none. The check
-// after it catches an injector image older than the ConfigMap support, whose
-// setup-amd-ca.sh skips silently and writes nothing.
-const extraCASetupScript = "/bin/sh /shared/bin/setup-amd-ca.sh && " +
-	"{ [ -s " + extraCABundlePath + " ] || { echo \"setup-amd-ca: error: " + extraCABundlePath +
+// after it catches a script that exits 0 without writing the bundle, such as
+// one from an injector image that predates strict mode.
+const extraCASetupScript = "/bin/sh /shared/bin/setup-extra-ca.sh && " +
+	"{ [ -s " + extraCABundlePath + " ] || { echo \"setup-extra-ca: error: " + extraCABundlePath +
 	" was not written; the envd-injector image predates extra CA support, use a newer one\" >&2; exit 1; }; } && "
 
 // extraCABundleEnvNames are the variables pointed at extraCABundlePath.

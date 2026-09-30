@@ -37,7 +37,7 @@ controlplane:
     # sandboxExtraCAConfigMap names a ConfigMap whose keys are PEM certificates;
     # it must exist in every namespace sandboxes run in (install.sh checks it).
     # When set, each sandbox mounts it at /etc/claw/extra-ca, runs the injector's
-    # /setup-amd-ca.sh to merge it with its image's system bundle
+    # /setup-extra-ca.sh to merge it with its image's system bundle
     # into /shared/bin/ca-bundle.pem, and points SSL_CERT_FILE,
     # REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE and NODE_EXTRA_CA_CERTS at that file.
     # A missing ConfigMap holds the pod in ContainerCreating; one without a
