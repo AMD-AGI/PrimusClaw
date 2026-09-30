@@ -124,6 +124,11 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- `deploy/upgrade.sh` no longer drops `PG_SSL_NO_VERIFY`. Only `deploy.sh`
+  read it, so the first upgrade of a deployment installed with it re-rendered
+  the API at verify-full, and against a PGO-managed database every new API pod
+  failed its TLS handshake. It is now recorded in `values.<ns>.env` like the
+  other operator knobs and forwarded on every render.
 - A sandbox that never came up is no longer recorded as `agent_error`, and is no
   longer retried. Under lazy sandbox creation the provisioning give-up reaches the
   task runner wrapped in `SandboxAttachError`, and the runner matched the give-up by

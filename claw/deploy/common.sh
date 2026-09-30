@@ -217,6 +217,12 @@ HANDS_CHILD_UID_MIN="${HANDS_CHILD_UID_MIN:-}"
 HANDS_CHILD_UID_MAX="${HANDS_CHILD_UID_MAX:-}"
 HANDS_CHILD_ISOLATION="${HANDS_CHILD_ISOLATION:-}"
 SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC="${SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC:-}"
+
+# "true" keeps the API's PG connection encrypted but skips server-certificate
+# validation, which a PGO-managed database needs: no trust store carries its
+# CA. Empty means the chart default, verify-full. Recorded here because
+# upgrade.sh re-renders the API from this file alone.
+PG_SSL_NO_VERIFY="${PG_SSL_NO_VERIFY:-}"
 EOF
   chmod 600 "$_VALUES_FILE"
   unset _BOOT_USER_ENV_KEY _BOOT_AUTH_TOKEN
@@ -234,10 +240,10 @@ _SHELL_S3_API_ENDPOINT="${S3_API_ENDPOINT:-}"
 _SHELL_S3_ACCESS_KEY="${S3_ACCESS_KEY:-}"
 _SHELL_S3_SECRET_KEY="${S3_SECRET_KEY:-}"
 # Fields the file may leave blank for the shell to answer, and which the run
-# that answers one records for every run after it. Both feature families live
-# in this one list: the Doorbell switches and admission ceilings, and the
-# background-shell runtime's enablement, bash ceiling, keepalive bounds and
-# child-UID range. Adding a key here is all it takes to give it the whole
+# that answers one records for every run after it: the Doorbell switches and
+# admission ceilings, the background-shell runtime's enablement, bash ceiling,
+# keepalive bounds and child-UID range, and the API's PG certificate policy.
+# Adding a key here is all it takes to give it the whole
 # capture -> file-wins -> write-back cycle below.
 CLAW_RECORDED_KEYS="AGENT_SANDBOX_SESSION_TIMEOUT AGENT_SANDBOX_MAX_SESSION_DURATION
 RUN_DOORBELL_DISPATCH BRAIN_DOORBELL_EXECUTION RUN_FAT_PREPARING_RECONCILE
@@ -246,7 +252,8 @@ ADMIT_SOFT_GPU_NODES ADMIT_HARD_GPU_NODES ADMIT_TREE_MAX_NODES ADMIT_TREE_MAX_DE
 BG_SHELL_ENABLED BASH_MAX_TIMEOUT_SEC
 SANDBOX_KEEPALIVE_TARGET_CEILING SANDBOX_KEEPALIVE_RECONCILE_RESERVE
 SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC
-HANDS_CHILD_UID_MIN HANDS_CHILD_UID_MAX HANDS_CHILD_ISOLATION"
+HANDS_CHILD_UID_MIN HANDS_CHILD_UID_MAX HANDS_CHILD_ISOLATION
+PG_SSL_NO_VERIFY"
 for _recorded_key in $CLAW_RECORDED_KEYS; do
   eval "_SHELL_${_recorded_key}=\${${_recorded_key}:-}"
 done
@@ -891,6 +898,7 @@ render_chart() {
     ${HANDS_CHILD_UID_MIN:+--set-string features.childUidMin="$HANDS_CHILD_UID_MIN"} \
     ${HANDS_CHILD_UID_MAX:+--set-string features.childUidMax="$HANDS_CHILD_UID_MAX"} \
     ${HANDS_CHILD_ISOLATION:+--set-string features.childIsolation="$HANDS_CHILD_ISOLATION"} \
+    ${PG_SSL_NO_VERIFY:+--set postgres.sslNoVerify="$PG_SSL_NO_VERIFY"} \
     ${preserved[@]+"${preserved[@]}"} \
     "$@" \
     --show-only "templates/$template" > "$dst"
