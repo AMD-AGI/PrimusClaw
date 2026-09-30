@@ -124,6 +124,11 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- `deploy/upgrade.sh` no longer drops `PG_SSL_NO_VERIFY`. Only `deploy.sh`
+  read it, so the first upgrade of a deployment installed with it re-rendered
+  the API at verify-full, and against a PGO-managed database every new API pod
+  failed its TLS handshake. It is now recorded in `values.<ns>.env` like the
+  other operator knobs and forwarded on every render.
 - `GET /v1/runs` no longer answers 500 when a query parameter is given twice.
   A repeated key parses to an array, and the handler read every parameter as a
   string, so `?ids=a&ids=b` — and the same for `state` and `since` — reached a
