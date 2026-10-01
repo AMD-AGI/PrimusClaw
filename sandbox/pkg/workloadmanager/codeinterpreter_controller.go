@@ -428,6 +428,18 @@ func (r *CodeInterpreterReconciler) buildPodTemplate(ci *runtimev1alpha1.CodeInt
 		})
 	}
 
+	// Extra CA: point the TLS clients at the bundle setup-extra-ca.sh writes.
+	// A value the template already sets is left alone. EXTRA_CA_REQUIRED makes
+	// the script fail when it finds no anchor, whatever the template sets.
+	if extraCAEnabled() {
+		envVars = append(envVars, corev1.EnvVar{Name: "EXTRA_CA_REQUIRED", Value: "true"})
+		for _, name := range extraCABundleEnvNames {
+			if !hasEnvVar(envVars, name) {
+				envVars = append(envVars, corev1.EnvVar{Name: name, Value: extraCABundlePath})
+			}
+		}
+	}
+
 	// Apply WORKDIR step (last one wins)
 	for _, step := range tmpl.Steps {
 		if step.Type == "workdir" && len(step.Args) > 0 {
@@ -496,6 +508,20 @@ func (r *CodeInterpreterReconciler) buildPodTemplate(ci *runtimev1alpha1.CodeInt
 		})
 	}
 
+	// Extra CA ConfigMap. Not optional: a missing ConfigMap keeps the pod in
+	// ContainerCreating with a FailedMount event naming it, instead of starting
+	// a sandbox without the anchor.
+	if cm := sandboxExtraCAConfigMap(); cm != "" {
+		volumes = append(volumes, corev1.Volume{
+			Name: extraCAVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: cm},
+				},
+			},
+		})
+	}
+
 	// User-defined volumes from template (e.g. hostPath, NFS, PVC)
 	volumes = append(volumes, tmpl.Volumes...)
 
@@ -511,6 +537,9 @@ func (r *CodeInterpreterReconciler) buildPodTemplate(ci *runtimev1alpha1.CodeInt
 	//
 	// The user's fromImage is used as-is — no image modification needed.
 	startupScript := buildStartupScript(tmpl.Steps, workspace)
+	if extraCAEnabled() {
+		startupScript = extraCASetupScript + startupScript
+	}
 
 	mainVolumeMounts := []corev1.VolumeMount{
 		{Name: "envd-bin", MountPath: "/shared/bin"},
@@ -528,6 +557,13 @@ func (r *CodeInterpreterReconciler) buildPodTemplate(ci *runtimev1alpha1.CodeInt
 			MountPath: "/dev/shm",
 		})
 	}
+	if sandboxExtraCAConfigMap() != "" {
+		mainVolumeMounts = append(mainVolumeMounts, corev1.VolumeMount{
+			Name:      extraCAVolumeName,
+			MountPath: extraCAMountPath,
+			ReadOnly:  true,
+		})
+	}
 
 	// User-defined mounts: omit readOnly → read-only by default; explicit readOnly:false → writable.
 	// Memory-backed emptyDir is forced RW regardless (shared-memory semantics).
@@ -543,6 +579,13 @@ func (r *CodeInterpreterReconciler) buildPodTemplate(ci *runtimev1alpha1.CodeInt
 		mainVolumeMounts = append(mainVolumeMounts, codeInterpreterVolumeMountToCore(vm, isMemoryEmptyDir))
 	}
 
+	injectorCmd := "cp /envd /shared/bin/envd && (cp /tmux /shared/bin/tmux 2>/dev/null || true) && (cp /iptables /shared/bin/iptables && cp /iptables /shared/bin/ip6tables && ln -sf iptables /shared/bin/iptables-legacy && ln -sf ip6tables /shared/bin/ip6tables-legacy && cp /musl-ld.so /shared/bin/ld-musl-x86_64.so.1 && ln -sf ld-musl-x86_64.so.1 /shared/bin/libc.musl-x86_64.so.1 2>/dev/null || true)"
+	if extraCAEnabled() {
+		// No `|| true`: an injector image without the script fails the
+		// initContainer rather than letting the sandbox start without its CA.
+		injectorCmd += extraCAInjectorCopy
+	}
+
 	envdInjectorContainer := corev1.Container{
 		Name:            "envd-injector",
 		Image:           envdInjectorImage(),
@@ -552,7 +595,9 @@ func (r *CodeInterpreterReconciler) buildPodTemplate(ci *runtimev1alpha1.CodeInt
 		// /shared/bin/ld-musl-x86_64.so.1 so it works in any glibc-based user image.
 		// iptables is copied twice (as iptables + ip6tables) because xtables-legacy-multi
 		// uses argv[0] to determine the protocol family.
-		Command: []string{"sh", "-c", "cp /envd /shared/bin/envd && (cp /tmux /shared/bin/tmux 2>/dev/null || true) && (cp /iptables /shared/bin/iptables && cp /iptables /shared/bin/ip6tables && ln -sf iptables /shared/bin/iptables-legacy && ln -sf ip6tables /shared/bin/ip6tables-legacy && cp /musl-ld.so /shared/bin/ld-musl-x86_64.so.1 && ln -sf ld-musl-x86_64.so.1 /shared/bin/libc.musl-x86_64.so.1 2>/dev/null || true)"},
+		// With an extra CA configured it also copies setup-extra-ca.sh and the
+		// image-baked bundle (EXTRA_CA_CERT_URLS).
+		Command: []string{"sh", "-c", injectorCmd},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: "envd-bin", MountPath: "/shared/bin"},
 		},
@@ -589,6 +634,10 @@ func (r *CodeInterpreterReconciler) buildPodTemplate(ci *runtimev1alpha1.CodeInt
 		Resources:       *resources,
 		VolumeMounts:    mainVolumeMounts,
 		SecurityContext: secCtx,
+		// With an extra CA declared, setup-extra-ca.sh can stop the container
+		// before envd starts. FallbackToLogsOnError puts its message in the
+		// termination state, so kubectl describe shows why.
+		TerminationMessagePolicy: extraCATerminationMessagePolicy(),
 		// ReadinessProbe: EnvD serves /health on port 8080.
 		// Pod Ready=true ONLY after EnvD is actually responding — this means
 		// ALL run steps have completed successfully (they execute before exec envd).
@@ -746,6 +795,67 @@ func sandboxTolerations() []corev1.Toleration {
 		tolerations = append(tolerations, t)
 	}
 	return tolerations
+}
+
+// Extra CA anchors for sandboxes behind a TLS-intercepting egress.
+const (
+	extraCAVolumeName = "claw-extra-ca"
+	extraCAMountPath  = "/etc/claw/extra-ca"
+	extraCABundlePath = "/shared/bin/ca-bundle.pem"
+)
+
+// The injector image ships the merge script and its baked bundle at these
+// paths. Templates outside this repository copy them the same way, so the
+// names are a contract of the envd-injector image (Dockerfile.envd-injector).
+// No `|| true`: an injector image without them fails the initContainer.
+const extraCAInjectorCopy = " && cp /setup-extra-ca.sh /extra-ca-bundle.pem /shared/bin/"
+
+// extraCASetupScript runs before the build steps and envd. The script fails
+// with a message naming both anchor sources when it finds none. The check
+// after it catches a script that exits 0 without writing the bundle, such as
+// one from an injector image that predates strict mode.
+//
+// Each check ends in an explicit `exit 1` and the prefix ends in `;`, not
+// `&&`: the build steps after it are joined with `&&`, but a template step may
+// itself contain `;`, which would otherwise resume the chain after a failed
+// check and start envd without the CA.
+const extraCASetupScript = "/bin/sh /shared/bin/setup-extra-ca.sh || exit 1; " +
+	"[ -s " + extraCABundlePath + " ] || { echo \"setup-extra-ca: error: " + extraCABundlePath +
+	" was not written; the envd-injector image predates extra CA support, use a newer one\" >&2; exit 1; }; "
+
+// extraCABundleEnvNames are the variables pointed at extraCABundlePath.
+var extraCABundleEnvNames = []string{"SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS"}
+
+// sandboxExtraCAConfigMap names the ConfigMap, in each sandbox's namespace,
+// whose keys are PEM CA certificates to trust in addition to the image's.
+func sandboxExtraCAConfigMap() string {
+	return strings.TrimSpace(os.Getenv("SANDBOX_EXTRA_CA_CONFIGMAP"))
+}
+
+// extraCAEnabled reports whether sandboxes must start with an extra CA: a
+// ConfigMap is configured, or SANDBOX_EXTRA_CA_REQUIRED=true declares that the
+// injector image carries one (EXTRA_CA_CERT_URLS). Unset leaves the pod as it
+// was before this existed.
+func extraCAEnabled() bool {
+	return sandboxExtraCAConfigMap() != "" || os.Getenv("SANDBOX_EXTRA_CA_REQUIRED") == "true"
+}
+
+// extraCATerminationMessagePolicy is empty (the API default) unless an extra
+// CA is declared, so an undeclared pod template is unchanged.
+func extraCATerminationMessagePolicy() corev1.TerminationMessagePolicy {
+	if extraCAEnabled() {
+		return corev1.TerminationMessageFallbackToLogsOnError
+	}
+	return ""
+}
+
+func hasEnvVar(env []corev1.EnvVar, name string) bool {
+	for _, e := range env {
+		if e.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // egressEnabled returns true when egress proxy is configured.

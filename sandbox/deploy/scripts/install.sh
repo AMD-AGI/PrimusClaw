@@ -39,6 +39,9 @@
 #   EGRESS_ENABLED=true                       # enable EnvD egress enforcement
 #   EGRESS_EXTRA_BLOCKED_CIDRS=               # comma-separated additional CIDRs
 #                                             # one of the two above MUST be provided
+#   SANDBOX_EXTRA_CA_CONFIGMAP=               # ConfigMap of PEM CA certs mounted into every sandbox
+#   SANDBOX_EXTRA_CA_NAMESPACES=default       # comma-separated sandbox namespaces the ConfigMap must exist in
+#   SANDBOX_EXTRA_CA_REQUIRED=false           # true = the envd-injector image carries the CA (EXTRA_CA_CERT_URLS)
 #   AUTO_INSTALL_HELM=true                    # auto-download helm to HELM_INSTALL_DIR if missing
 #   HELM_VERSION=v3.14.0
 #   HELM_INSTALL_DIR=$HOME/.local/bin
@@ -76,6 +79,9 @@ HELM_INSTALL_DIR="${HELM_INSTALL_DIR:-${HOME}/.local/bin}"
 DRY_RUN="${DRY_RUN:-false}"
 EGRESS_ENABLED="${EGRESS_ENABLED:-true}"
 EGRESS_EXTRA_BLOCKED_CIDRS="${EGRESS_EXTRA_BLOCKED_CIDRS:-}"
+SANDBOX_EXTRA_CA_CONFIGMAP="${SANDBOX_EXTRA_CA_CONFIGMAP:-}"
+SANDBOX_EXTRA_CA_NAMESPACES="${SANDBOX_EXTRA_CA_NAMESPACES:-default}"
+SANDBOX_EXTRA_CA_REQUIRED="${SANDBOX_EXTRA_CA_REQUIRED:-false}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPLOY_DIR="$(dirname "${SCRIPT_DIR}")"
@@ -175,6 +181,25 @@ ensure_helm
 kubectl cluster-info >/dev/null 2>&1 || err "kubectl cannot reach cluster, check kubeconfig/context"
 
 CTX="$(kubectl config current-context 2>/dev/null || echo '<unknown>')"
+
+# The extra CA ConfigMap is mounted from each sandbox's own namespace. Check it
+# here rather than let the first sandbox sit in ContainerCreating.
+if [[ -n "${SANDBOX_EXTRA_CA_CONFIGMAP}" ]]; then
+    IFS=',' read -r -a EXTRA_CA_NS_LIST <<<"${SANDBOX_EXTRA_CA_NAMESPACES}"
+    for ca_ns in "${EXTRA_CA_NS_LIST[@]}"; do
+        ca_ns="${ca_ns// /}"
+        [[ -n "${ca_ns}" ]] || continue
+        if [[ "${DRY_RUN}" == "true" ]]; then
+            log "dry-run: would check ConfigMap ${ca_ns}/${SANDBOX_EXTRA_CA_CONFIGMAP} holds a PEM certificate"
+            continue
+        fi
+        CA_DATA="$(kubectl -n "${ca_ns}" get configmap "${SANDBOX_EXTRA_CA_CONFIGMAP}" -o jsonpath='{.data}' 2>/dev/null)" \
+            || err "SANDBOX_EXTRA_CA_CONFIGMAP=${SANDBOX_EXTRA_CA_CONFIGMAP} not found in namespace ${ca_ns}; create it (kubectl -n ${ca_ns} create configmap ${SANDBOX_EXTRA_CA_CONFIGMAP} --from-file=ca.crt=<your-ca.pem>) or fix SANDBOX_EXTRA_CA_NAMESPACES"
+        [[ "${CA_DATA}" == *"BEGIN CERTIFICATE"* ]] \
+            || err "ConfigMap ${ca_ns}/${SANDBOX_EXTRA_CA_CONFIGMAP} holds no PEM certificate; sandboxes would fail to start"
+        ok "extra CA ConfigMap ${ca_ns}/${SANDBOX_EXTRA_CA_CONFIGMAP} present"
+    done
+fi
 
 # If a redis StatefulSet already exists, its volumeClaimTemplates.storageClassName
 # is immutable — reuse the deployed value and ignore the requested one so re-runs
@@ -379,6 +404,12 @@ HELM_ARGS=(
 )
 [[ -n "${REDIS_STORAGE_CLASS}" ]] && HELM_ARGS+=( --set "redis.storage.storageClassName=${REDIS_STORAGE_CLASS}" )
 [[ -n "${IMAGE_PULL_SECRET}"   ]] && HELM_ARGS+=( --set "imagePullSecrets[0].name=${IMAGE_PULL_SECRET}" )
+[[ -n "${SANDBOX_EXTRA_CA_CONFIGMAP}" ]] && HELM_ARGS+=(
+    --set-string "controlplane.config.sandboxExtraCAConfigMap=${SANDBOX_EXTRA_CA_CONFIGMAP}"
+)
+[[ "${SANDBOX_EXTRA_CA_REQUIRED}" == "true" ]] && HELM_ARGS+=(
+    --set "controlplane.config.sandboxExtraCARequired=true"
+)
 [[ -n "${SANDBOX_NODE_SELECTOR:-}" ]] && HELM_ARGS+=(
     --set-string "controlplane.config.sandboxNodeSelector=${SANDBOX_NODE_SELECTOR}"
 )

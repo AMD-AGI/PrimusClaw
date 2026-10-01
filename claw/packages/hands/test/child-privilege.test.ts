@@ -117,6 +117,33 @@ test("the child environment carries the session id", () => {
   }
 });
 
+test("the child environment carries the configured CA bundle, and still drops an unrelated secret", () => {
+  // Regression guard. These were filtered out, so a command the model ran
+  // ignored the CA bundle the sandbox was configured with and failed TLS
+  // verification against every endpoint the deployment's own CA signs. Each
+  // names a file path, so passing them through costs no secrecy.
+  const bundle = {
+    SSL_CERT_FILE: "/etc/ssl/custom/ca-bundle.crt",
+    CURL_CA_BUNDLE: "/etc/ssl/custom/curl-ca.crt",
+    REQUESTS_CA_BUNDLE: "/etc/ssl/custom/requests-ca.crt",
+    NODE_EXTRA_CA_CERTS: "/etc/ssl/custom/node-extra.crt",
+  };
+  const set = { ...bundle, CLAW_UNRELATED_SECRET_KEY: "an-unrelated-secret-no-child-may-read" };
+  const previous = Object.fromEntries(Object.keys(set).map((k) => [k, process.env[k]]));
+  Object.assign(process.env, set);
+  try {
+    const env = privilege.childEnvironment();
+    for (const [key, value] of Object.entries(bundle)) assert.equal(env[key], value, key);
+    assert.equal(env.CLAW_UNRELATED_SECRET_KEY, undefined);
+    assert.doesNotMatch(JSON.stringify(env), /an-unrelated-secret-no-child-may-read/);
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
 test("a spawned command cannot read the token out of its own environment", async () => {
   bg.spawnBackground("sess-env", "run-env", "env; cat /proc/self/environ | tr '\\0' '\\n'", "envdump");
   await settle(300);

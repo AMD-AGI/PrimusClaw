@@ -27,6 +27,8 @@ printf 'REDIS_STORAGE_CLASS=%s\n' "${REDIS_STORAGE_CLASS:-}" >>"$CAPTURE"
 printf 'EGRESS_ENABLED=%s\n' "${EGRESS_ENABLED:-}" >>"$CAPTURE"
 printf 'EGRESS_EXTRA_BLOCKED_CIDRS=%s\n' "${EGRESS_EXTRA_BLOCKED_CIDRS:-}" >>"$CAPTURE"
 printf 'DRY_RUN=%s\n' "${DRY_RUN:-}" >>"$CAPTURE"
+printf 'SANDBOX_EXTRA_CA_CONFIGMAP=%s\n' "${SANDBOX_EXTRA_CA_CONFIGMAP:-}" >>"$CAPTURE"
+printf 'SANDBOX_EXTRA_CA_NAMESPACES=%s\n' "${SANDBOX_EXTRA_CA_NAMESPACES:-}" >>"$CAPTURE"
 EOF
 chmod +x "$tmp/repo/sandbox/deploy/scripts/install.sh"
 
@@ -54,6 +56,14 @@ grep -qx 'ALLOW_INSECURE_NO_AUTH=' "$capture"
 grep -qx 'REDIS_STORAGE_CLASS=release-sc' "$capture"
 grep -qx 'EGRESS_ENABLED=false' "$capture"
 grep -qx 'EGRESS_EXTRA_BLOCKED_CIDRS=10.0.0.0/8,192.168.0.0/16' "$capture"
+grep -qx 'SANDBOX_EXTRA_CA_CONFIGMAP=' "$capture"
+
+capture="$tmp/extra-ca.env"
+env "${common_env[@]}" CAPTURE="$capture" SAFE_API_URL="https://auth.example" \
+  SANDBOX_EXTRA_CA_CONFIGMAP=org-ca SANDBOX_WORKLOAD_NAMESPACE=agents \
+  bash "$tmp/repo/deploy/deploy.sh" --yes --skip-litellm --skip-sandbox-check >/dev/null
+grep -qx 'SANDBOX_EXTRA_CA_CONFIGMAP=org-ca' "$capture"
+grep -qx 'SANDBOX_EXTRA_CA_NAMESPACES=agents' "$capture"
 
 cat >"$tmp/profile.env" <<'EOF'
 SAFE_API_URL=https://profile-safe.example
