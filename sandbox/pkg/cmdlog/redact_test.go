@@ -25,6 +25,11 @@ func TestRedactMasksCredentialShapes(t *testing.T) {
 		"password":          "PGPASSWORD=" + secret + " psql",
 		"json":              `{"token":"` + secret + `","n":1}`,
 		"json authz":        `{"Authorization": "Bearer ` + secret + `"}`,
+		"single-quoted":     "AUTH_CLAW_TOKEN='" + secret + "' /app/hands",
+		"double-quoted":     `OPENAI_API_KEY="` + secret + `" python x.py`,
+		"aws secret":        "AWS_SECRET_ACCESS_KEY=" + secret,
+		"api key header":    "curl -H 'X-API-KEY: " + secret + "' https://x",
+		"auth token header": "X-Auth-Token: " + secret,
 	}
 	for name, in := range cases {
 		got := Redact(in)
@@ -44,6 +49,8 @@ func TestRedactLeavesShellReferencesAndOrdinaryText(t *testing.T) {
 		`curl -H "Authorization: Bearer ${AUTH_CLAW_TOKEN}" https://brain/x`,
 		`printf '%s' "$CLAW_HANDS_ENV_B64" | base64 -d > /tmp/.hands-env`,
 		`echo max_tokens=100 tokens=5`,
+		`export AUTH_CLAW_TOKEN="$AUTH_CLAW_TOKEN"`,
+		`curl -H "X-API-Key: ${KEY}" https://x`,
 		`loaded Router public key from secret agent-sandbox-system/router-key`,
 		`sh -c ls -la /tmp`,
 	}
