@@ -28,6 +28,9 @@ func TestRedactMasksCredentialShapes(t *testing.T) {
 		"single-quoted":     "AUTH_CLAW_TOKEN='" + secret + "' /app/hands",
 		"double-quoted":     `OPENAI_API_KEY="` + secret + `" python x.py`,
 		"aws secret":        "AWS_SECRET_ACCESS_KEY=" + secret,
+		"quoted with space": "PGPASSWORD='" + secret + " " + secret + "' psql",
+		"dq with space":     `PGPASSWORD="` + secret + ` ` + secret + `" psql`,
+		"sq literal dollar": "PGPASSWORD='$" + secret + "' psql",
 		"api key header":    "curl -H 'X-API-KEY: " + secret + "' https://x",
 		"auth token header": "X-Auth-Token: " + secret,
 	}

@@ -34,8 +34,13 @@ var credentialPatterns = []struct {
 	{regexp.MustCompile(`(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]+`), "${1}" + Mask},
 	// token=, access_token=, AUTH_CLAW_TOKEN=, X-Amz-Security-Token=, and the
 	// same for secrets, passwords, API and access keys and signed-URL
-	// signatures; bare or quoted (NAME='v', NAME="v").
-	{regexp.MustCompile(`(?i)\b([A-Za-z0-9_.-]*` + sensitiveName + `=["']?)[^\s$&'"][^\s&'"]*`), "${1}" + Mask},
+	// signatures. Quoted forms first, masked to the closing quote so a value
+	// with spaces is not cut at its first word. Inside single quotes `$` is a
+	// literal, so the whole value is masked; inside double quotes a value that
+	// starts with `$` is a reference and stays readable.
+	{regexp.MustCompile(`(?i)\b([A-Za-z0-9_.-]*` + sensitiveName + `=')[^']*`), "${1}" + Mask},
+	{regexp.MustCompile(`(?i)\b([A-Za-z0-9_.-]*` + sensitiveName + `=")[^"$][^"]*`), "${1}" + Mask},
+	{regexp.MustCompile(`(?i)\b([A-Za-z0-9_.-]*` + sensitiveName + `=)[^\s$&'"][^\s&'"]*`), "${1}" + Mask},
 	// X-API-Key: <value>, X-Auth-Token: <value> and the like, as headers.
 	{regexp.MustCompile(`(?i)\b((?:x-)?(?:api[_-]?key|auth[_-]?token|access[_-]?token)["']?\s*:\s*["']?)[^\s$'",;&][^\s'",;&]*`), "${1}" + Mask},
 	// "token": "<value>" and the like, as JSON puts them.
