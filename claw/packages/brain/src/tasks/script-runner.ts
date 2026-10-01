@@ -309,6 +309,12 @@ export async function runScript(
     let repeatStopped = "";
     let transportLosses = 0;
     let firstLossAt = 0;
+    // Set once any call of this repetition was lost and sent again. A tool whose
+    // reply advances a read cursor (Hands' `wait` reads new shell output) has
+    // already consumed what the lost reply carried, so the re-sent call cannot
+    // return it. The step still settles on the tool's answer -- before re-sending
+    // it failed outright -- but the text it ends with may lack that piece.
+    let resentAfterLoss = false;
 
     // eslint-disable-next-line no-constant-condition
     while (true) {
@@ -423,6 +429,7 @@ export async function runScript(
       const lossBudgetMs = ctx.transportLossBudgetMs ?? REPEAT_TRANSPORT_LOSS_BUDGET_MS;
       if (lostInTransit && nowMs() - firstLossAt < lossBudgetMs && attempt < repeat.max_attempts) {
         transportLosses++;
+        resentAfterLoss = true;
         logger.warn(
           { step: i, name: step.name, attempt, transportLosses, err: stepError },
           "script.repeat_call_lost_retrying",
@@ -444,7 +451,16 @@ export async function runScript(
       // An error ends the repetition and is handled by on_fail below, exactly as it
       // would be for a single attempt.
       if (stepError || waitExternal) { repeatStopped = "error"; break; }
-      if (repeatSatisfied(repeat, structured)) { repeatStopped = "done"; break; }
+      if (repeatSatisfied(repeat, structured)) {
+        repeatStopped = "done";
+        if (resentAfterLoss) {
+          logger.warn(
+            { step: i, name: step.name, attempt },
+            "script.repeat_done_after_lost_call: the text of a lost reply is not recoverable, so this step's output may be incomplete",
+          );
+        }
+        break;
+      }
       if (attempt >= repeat.max_attempts) { repeatStopped = "max_attempts"; break; }
       await onEvent({
         type: "scriptStep", name: step.name, step: i, status: "repeating", attempt, scope,
