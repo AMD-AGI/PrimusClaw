@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   bootstrapHandsInSandbox, handsBinarySources, handsBaseEnv, HANDS_ENV_FILE,
+  HANDS_ENV_PAYLOAD_ENV, HANDS_TOKEN_ENV, writeEnvFileCmd, brainAssetCurl,
   HANDS_LOG_PATH, HANDS_STATE_DIR,
   inImageStartCmd, type SandboxExecFn,
 } from "../src/sandbox/bootstrap.js";
@@ -62,7 +63,7 @@ function startAttempts(cmds: string[]): string[] {
 }
 
 test("the free in-image source is tried on every image, not just recognised ones", () => {
-  const sources = handsBinarySources(handsBaseEnv(SESSION, PORT, TOKEN), TOKEN);
+  const sources = handsBinarySources(handsBaseEnv(SESSION, PORT));
 
   assert.equal(sources[0]?.name, "in_image",
     "the source that costs nothing must be attempted before the ones that do");
@@ -71,7 +72,7 @@ test("the free in-image source is tried on every image, not just recognised ones
 });
 
 test("configured sources follow in ascending cost, unconfigured ones are absent", () => {
-  const names = handsBinarySources(handsBaseEnv(SESSION, PORT, TOKEN), TOKEN).map((s) => s.name);
+  const names = handsBinarySources(handsBaseEnv(SESSION, PORT)).map((s) => s.name);
 
   assert.deepEqual(names, [
     "in_image",
@@ -81,8 +82,8 @@ test("configured sources follow in ascending cost, unconfigured ones are absent"
 });
 
 test("every source launches with the same env and the same liveness check", () => {
-  const baseEnv = handsBaseEnv(SESSION, PORT, TOKEN);
-  for (const source of handsBinarySources(baseEnv, TOKEN)) {
+  const baseEnv = handsBaseEnv(SESSION, PORT);
+  for (const source of handsBinarySources(baseEnv)) {
     assert.ok(source.cmd.includes(baseEnv),
       `${source.name} must pass the token, session and port through to the binary`);
     assert.match(source.cmd, /kill -0 \$PID/,
@@ -153,7 +154,7 @@ test("an image without the binary falls through to the next source", async (t) =
 });
 
 test("when no source works the error names each one that was tried", async () => {
-  const sourceCount = handsBinarySources(handsBaseEnv(SESSION, PORT, TOKEN), TOKEN).length;
+  const sourceCount = handsBinarySources(handsBaseEnv(SESSION, PORT)).length;
   const r = recorder([ok, ...Array(sourceCount).fill(fail("boom"))]);
 
   await assert.rejects(
@@ -195,12 +196,15 @@ test("the caller's environment is handed to the sandbox, not left in the pod spe
     ANTHROPIC_API_KEY: "sk-test",
   });
 
-  const write = r.cmds.find((c) => c.includes(HANDS_ENV_FILE) && c.includes("base64 -d"));
-  assert.ok(write, "the environment has to reach the sandbox somehow");
-  assert.ok(!write!.includes("hf-secret"),
+  const writeAt = r.cmds.findIndex((c) => c.includes(HANDS_ENV_FILE) && c.includes("base64 -d"));
+  assert.ok(writeAt >= 0, "the environment has to reach the sandbox somehow");
+  const write = r.cmds[writeAt]!;
+  assert.ok(!write.includes("hf-secret"),
     "encoded rather than interpolated: values contain quotes, newlines and $(...)");
 
-  const payload = /printf '%s' '([A-Za-z0-9+/=]+)'/.exec(write!)?.[1] ?? "";
+  const payload = r.opts[writeAt]?.env?.[HANDS_ENV_PAYLOAD_ENV] ?? "";
+  assert.ok(payload && !write.includes(payload),
+    "the payload rides in the request env, not in the logged command");
   assert.deepEqual(JSON.parse(Buffer.from(payload, "base64").toString("utf8")), {
     HF_TOKEN: "hf-secret",
     ANTHROPIC_API_KEY: "sk-test",
@@ -213,7 +217,7 @@ test("the caller's environment is handed to the sandbox, not left in the pod spe
 test("a sandbox with no environment to hand over is bootstrapped as before", () => {
   // Every deployment that does not use the pool is on this path, and adding a
   // round trip to it would be a cost paid for nothing.
-  assert.ok(!handsBaseEnv(SESSION, PORT, TOKEN).includes("HANDS_ENV_FILE"));
+  assert.ok(!handsBaseEnv(SESSION, PORT).includes("HANDS_ENV_FILE"));
 });
 
 test("the environment file is put back before each source, not written once", async (t) => {
@@ -386,7 +390,7 @@ test("the guard counts in the shell rather than through seq", () => {
   // an image without coreutils has no `seq`: `for _ in $(seq N)` expands to an
   // empty list there, checks once, and fails a healthy Hands with a message
   // about a binary that is too old.
-  const cmd = inImageStartCmd(handsBaseEnv(SESSION, PORT, TOKEN), undefined, undefined, "/tmp/.hands-env");
+  const cmd = inImageStartCmd(handsBaseEnv(SESSION, PORT), undefined, undefined, "/tmp/.hands-env");
   assert.doesNotMatch(cmd, /\bseq\b/, "seq is not on every image this now probes");
   assert.match(cmd, /while \[ \$_w -lt \d+ \]/, "the wait is a shell-arithmetic loop");
   assert.match(cmd, /kill -9 -\$PID/,
@@ -408,7 +412,7 @@ test("the guard counts in the shell rather than through seq", () => {
 test("the production probe carries a bound", () => {
   // The parameters above are for the test; this is the command a sandbox gets.
   assert.match(
-    inImageStartCmd(handsBaseEnv(SESSION, PORT, TOKEN)),
+    inImageStartCmd(handsBaseEnv(SESSION, PORT)),
     /timeout -k 2 \d+ \/app\/hands-binary --self-check/,
     "an unbounded probe is the failure this pins",
   );
@@ -457,12 +461,12 @@ test("the child-isolation declaration reaches the sandbox, and nothing is substi
   delete process.env.HANDS_CHILD_UID_MAX;
   delete process.env.HANDS_CHILD_ISOLATION;
   try {
-    assert.ok(!handsBaseEnv(SESSION, PORT, TOKEN).includes("HANDS_CHILD"),
+    assert.ok(!handsBaseEnv(SESSION, PORT).includes("HANDS_CHILD"),
       "an undeclared posture stays undeclared");
 
     process.env.HANDS_CHILD_UID_MIN = "65500";
     process.env.HANDS_CHILD_UID_MAX = "65533";
-    const env = handsBaseEnv(SESSION, PORT, TOKEN);
+    const env = handsBaseEnv(SESSION, PORT);
     assert.match(env, /HANDS_CHILD_UID_MIN=65500/);
     assert.match(env, /HANDS_CHILD_UID_MAX=65533/);
   } finally {
@@ -471,4 +475,81 @@ test("the child-isolation declaration reaches the sandbox, and nothing is substi
       else process.env[key] = value;
     }
   }
+});
+
+/**
+ * The Router and EnvD log the command string of every execute. The per-sandbox
+ * token and the user's environment used to be interpolated into it -- the
+ * token as a curl header and as an `AUTH_CLAW_TOKEN=` prefix, the environment
+ * as base64 -- and so landed in the control-plane log in the clear. They now
+ * travel in the execute request's env map, which nothing logs.
+ */
+test("no command carries the token or the environment; the request env does", async () => {
+  const secretToken = "f".repeat(64);
+  const r = recorder([ok, ok, fail("no usable hands-binary at /app/hands-binary"), ok, ok, ok, ok]);
+  await bootstrapHandsInSandbox(r.exec, SESSION, PORT, secretToken, { HF_TOKEN: "hf-secret" }).catch(() => {});
+  assert.ok(r.cmds.length >= 3, "precondition: the bootstrap ran its steps");
+  for (const [i, cmd] of r.cmds.entries()) {
+    assert.ok(!cmd.includes(secretToken), `the token must not be in a command:\n${cmd}`);
+    assert.ok(!cmd.includes("hf-secret"), `a user value must not be in a command:\n${cmd}`);
+    const payload = r.opts[i]?.env?.[HANDS_ENV_PAYLOAD_ENV];
+    if (payload) assert.ok(!cmd.includes(payload), "nor its encoding");
+  }
+  const starts = r.cmds.map((c, i) => ({ c, o: r.opts[i] })).filter(({ o }) => o?.hands);
+  assert.ok(starts.length > 0);
+  for (const { o } of starts) {
+    assert.equal(o?.env?.[HANDS_TOKEN_ENV], secretToken,
+      "every Hands start must be handed the token, or Hands comes up with no credential");
+  }
+});
+
+/**
+ * The download is the command that leaked: run it against a stand-in curl that
+ * records its argv, so what is proven is the header curl actually receives,
+ * not the shape of a string.
+ */
+test("the download sends the token from the request env, and the command never holds it", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "bootstrap-curl-"));
+  const argvOut = path.join(dir, "argv");
+  await writeFile(path.join(dir, "curl"), `#!/bin/sh\nfor a in "$@"; do printf '%s\\n' "$a"; done > ${argvOut}\n`);
+  await chmod(path.join(dir, "curl"), 0o755);
+  const secretToken = "b".repeat(64);
+  const cmd = brainAssetCurl("/internal/assets/hands-binary", "http://brain.invalid:8100");
+  assert.ok(!cmd.includes(secretToken));
+  assert.ok(cmd.includes(`\${${HANDS_TOKEN_ENV}}`), cmd);
+  const code = await new Promise<number>((resolve) => {
+    const child = execFile("sh", ["-c", cmd], {
+      env: { PATH: `${dir}:/usr/bin:/bin`, [HANDS_TOKEN_ENV]: secretToken },
+    }, () => {});
+    child.on("exit", (c) => resolve(c ?? -1));
+  });
+  assert.equal(code, 0);
+  const argv = (await readFile(argvOut, "utf8")).split("\n").filter(Boolean);
+  const h = argv.indexOf("-H");
+  assert.ok(h >= 0, argv.join(" | "));
+  assert.equal(argv[h + 1], `Authorization: Bearer ${secretToken}`, "the header curl receives is the expanded token");
+  assert.deepEqual(argv.slice(-1), ["http://brain.invalid:8100/internal/assets/hands-binary"]);
+});
+
+/** Run the real commands in a local shell, so the expansion is proven, not assumed. */
+test("the shell expands the request env into the env file and the launched process", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "bootstrap-env-"));
+  const out = path.join(dir, "seen");
+  const bin = path.join(dir, "fake-hands");
+  await writeFile(bin, `#!/bin/sh\nprintf '%s' "$${HANDS_TOKEN_ENV}" > ${out}\n`);
+  await chmod(bin, 0o755);
+  const secretToken = "a".repeat(64);
+  const run = (cmd: string, env: Record<string, string>) => new Promise<number>((resolve) => {
+    const child = execFile("sh", ["-c", cmd], { env: { PATH: "/usr/bin:/bin", ...env } }, () => {});
+    child.on("exit", (code) => resolve(code ?? -1));
+  });
+  // The launch path the sources share: prefix env, then the binary.
+  const launch = `${handsBaseEnv(SESSION, PORT)} ${bin}`;
+  assert.equal(await run(launch, { [HANDS_TOKEN_ENV]: secretToken }), 0);
+  assert.equal(await readFile(out, "utf8"), secretToken);
+
+  const write = writeEnvFileCmd({ HF_TOKEN: "it's \"quoted\"\n$(nope)" });
+  const target = path.join(dir, "env.json");
+  assert.equal(await run(write.cmd.split(HANDS_ENV_FILE).join(target), write.env), 0);
+  assert.deepEqual(JSON.parse(await readFile(target, "utf8")), { HF_TOKEN: "it's \"quoted\"\n$(nope)" });
 });

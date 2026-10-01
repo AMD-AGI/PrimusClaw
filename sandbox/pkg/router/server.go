@@ -120,7 +120,8 @@ func New(
 // - Control-plane routes (code-interpreter CRUD, templates) are reverse-proxied to Workload Manager.
 func (s *Server) setupRoutes() {
 	s.engine = gin.New()
-	s.engine.Use(gin.Recovery())
+	// The default recovery dumps request headers and masks only Authorization.
+	s.engine.Use(gin.RecoveryWithWriter(cmdlog.RedactingWriter(gin.DefaultErrorWriter)))
 	s.engine.Use(metricsMiddleware())
 
 	// Health check endpoints (no concurrency limit)

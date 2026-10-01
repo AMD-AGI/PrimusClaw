@@ -38,7 +38,7 @@ function healthPayload(): string {
 /** What `handsBaseEnv` forwards, as the sandbox will parse it. */
 function forwarded(): Record<string, string> {
   return Object.fromEntries(
-    handsBaseEnv("s-1", "9100", "tok").split(" ").filter((p) => p.includes("=")).map((p) => {
+    handsBaseEnv("s-1", "9100").split(" ").filter((p) => p.includes("=")).map((p) => {
       const i = p.indexOf("=");
       return [p.slice(0, i), p.slice(i + 1)];
     }),

@@ -364,6 +364,7 @@ export class AgentSandboxProvider implements SandboxProvider {
         timeout,
         ...(opts?.untracked ? { untracked: true } : {}),
         ...(opts?.hands ? { hands: true } : {}),
+        ...(opts?.env && Object.keys(opts.env).length ? { env: opts.env } : {}),
       }),
       timeoutMs: parseExecTimeoutMs(timeout) + EXEC_TRANSPORT_SLACK_MS,
       userId: inst.userId,

@@ -14,7 +14,11 @@ func Preview(argv []string, limit int) string {
 	if limit <= 0 {
 		limit = defaultPreviewBytes
 	}
-	out := strings.Join(argv, " ")
+	masked := make([]string, len(argv))
+	for i, a := range argv {
+		masked[i] = RedactArg(a)
+	}
+	out := strings.Join(masked, " ")
 	out = strings.Map(func(r rune) rune {
 		switch r {
 		case '\n', '\r', '\t':
@@ -24,6 +28,10 @@ func Preview(argv []string, limit int) string {
 		}
 	}, out)
 	out = strings.Join(strings.Fields(out), " ")
+
+	// Masked before the cut, for the reason Value masks first: a credential
+	// truncated part-way is no longer recognisable as one.
+	out = Redact(out)
 
 	// Folding rather than escaping is deliberate: argv routinely spans lines,
 	// and rendering a heredoc on one line is the whole point of a preview.
