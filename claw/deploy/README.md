@@ -102,6 +102,7 @@ exist before the first session runs, or workspace sync has nowhere to write.
 | `SANDBOX_NAMESPACE`            | SaFE sandbox namespace                   | `example-sandbox`                                     |
 | `ANTHROPIC_BASE_URL`           | LLM gateway URL                          | `https://cluster.example.com/llm-gateway`   |
 | `S3_ENDPOINT`                  | MinIO / S3 endpoint                      | `http://minio.minio.svc.cluster.local:9000`          |
+| `S3_SANDBOX_ENDPOINT`          | S3 endpoint as sandboxes reach it, for presigned URLs (default: `S3_API_ENDPOINT`) | `https://cluster.example.com` |
 | `S3_BUCKET`                    | S3 bucket name                           | `claw`                                               |
 | `MAX_TURNS`                    | Agent loop max turns                     | `2000`                                               |
 | `MAX_CONCURRENT`               | Max concurrent Brain sessions            | `3`                                                  |

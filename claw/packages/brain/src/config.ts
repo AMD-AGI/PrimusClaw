@@ -560,6 +560,13 @@ export const S3_ENDPOINT = env("S3_ENDPOINT");
 // host/port when S3_ENDPOINT was (mis)configured at a non-API URL (e.g.
 // the MinIO Console port) without mutating S3_ENDPOINT.
 export const S3_API_ENDPOINT = env("S3_API_ENDPOINT") || S3_ENDPOINT;
+// S3_SANDBOX_ENDPOINT: the S3 API endpoint as a sandbox reaches it. Workspace
+// sync hands the sandbox presigned URLs, and a presigned URL names its host:
+// when sandboxes run somewhere the in-cluster API endpoint does not resolve
+// (another cluster), every upload and restore fails with "Unable to connect".
+// Only the presigned URLs use it; Brain's own S3 calls keep S3_API_ENDPOINT.
+// Falls back to S3_API_ENDPOINT.
+export const S3_SANDBOX_ENDPOINT = env("S3_SANDBOX_ENDPOINT") || S3_API_ENDPOINT;
 export const S3_FORCE_PATH_STYLE = envBool("S3_FORCE_PATH_STYLE", true);
 /**
  * Ceiling on deletions per prune round -- see prunePlan for why a large stale
