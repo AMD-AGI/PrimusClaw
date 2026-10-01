@@ -351,6 +351,10 @@ secret:
   # Reach Hands through the Router's port proxy instead of the sandbox's cluster DNS name
   # (SANDBOX_HANDS_VIA_ROUTER). Only needed when sandboxes run in another cluster, where
   # that name does not resolve. SaFE mode only.
+  # Requires a Router running without --enable-auth (router.config.enableAuth=false in
+  # the sandbox chart): routed Hands requests carry the per-sandbox Hands token, not a
+  # SaFE API key, so a Router with auth on answers 401 and Hands provisioning fails its
+  # health check.
   sandboxHandsViaRouter: "false"
   clawDeployRoot: ""
   workspacePersistBase: ""
