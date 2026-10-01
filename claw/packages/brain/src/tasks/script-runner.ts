@@ -31,20 +31,26 @@ const logger = pino({ name: "script-runner" });
 const WAIT_EXTERNAL_SENTINEL = "AKA_WAIT_EXTERNAL";
 
 /**
- * Consecutive calls a repeated step may lose in transit before the loss ends it.
+ * How long a repeated step keeps re-sending calls that are lost in transit, timed
+ * from the first loss in a row.
  *
  * The proxy in front of a sandbox resets its connections every few minutes, and a
- * repeated `wait` is nearly always in flight when that happens. Ending the
- * repetition there failed runs that were healthy. Bounded, so a sandbox that is
- * really gone still fails the step within a few seconds.
+ * repeated `wait` is nearly always in flight when that happens. The outage lasts
+ * from a few seconds to over ten -- three retries a second apart did not outlast
+ * one -- and ending the repetition there failed runs that were healthy. Bounded,
+ * so a sandbox that is really gone still fails the step within two minutes.
  */
-const REPEAT_TRANSPORT_RETRIES = 3;
+const REPEAT_TRANSPORT_LOSS_BUDGET_MS = 120_000;
+/** Ceiling on the doubling pause between re-sends of a lost call. */
+const REPEAT_TRANSPORT_MAX_BACKOFF_MS = 15_000;
 
 export interface ScriptRunCtx {
   hands?: HandsClient | null;
   /** AgentHook fire(...) function from `agent/hooks.ts`; optional for the harness. */
   fireHook?: (event: string, payload: Record<string, unknown>) => Promise<{ block?: boolean; reason?: string }>;
   signal?: AbortSignal;
+  /** Overrides REPEAT_TRANSPORT_LOSS_BUDGET_MS; tests set it so a bound is reached in milliseconds. */
+  transportLossBudgetMs?: number;
 }
 
 function zeroTokens(): TokenUsage {
@@ -302,6 +308,7 @@ export async function runScript(
     let attempt = 0;
     let repeatStopped = "";
     let transportLosses = 0;
+    let firstLossAt = 0;
 
     // eslint-disable-next-line no-constant-condition
     while (true) {
@@ -412,14 +419,17 @@ export async function runScript(
       // A call that never came back is not an answer from the tool, and the loop
       // calls this step again anyway, so a lost one is sent again rather than ending
       // the repetition. An answer that is an error still ends it, below.
-      if (lostInTransit && transportLosses < REPEAT_TRANSPORT_RETRIES && attempt < repeat.max_attempts) {
+      if (lostInTransit && transportLosses === 0) firstLossAt = nowMs();
+      const lossBudgetMs = ctx.transportLossBudgetMs ?? REPEAT_TRANSPORT_LOSS_BUDGET_MS;
+      if (lostInTransit && nowMs() - firstLossAt < lossBudgetMs && attempt < repeat.max_attempts) {
         transportLosses++;
         logger.warn(
           { step: i, name: step.name, attempt, transportLosses, err: stepError },
           "script.repeat_call_lost_retrying",
         );
+        const backoffMs = Math.min(1000 * 2 ** (transportLosses - 1), REPEAT_TRANSPORT_MAX_BACKOFF_MS);
         const completedSleep = await sleep(
-          Math.min(Math.max(1, repeat.interval_sec ?? 0) * 1000, Math.max(0, repeatDeadline - nowMs())),
+          Math.min(backoffMs, Math.max(0, lossBudgetMs - (nowMs() - firstLossAt)), Math.max(0, repeatDeadline - nowMs())),
           ctx.signal,
         );
         if (!completedSleep) {
