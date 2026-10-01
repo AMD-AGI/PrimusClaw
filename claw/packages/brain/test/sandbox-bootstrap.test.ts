@@ -519,14 +519,16 @@ test("the download sends the token from the request env, and the command never h
   assert.ok(cmd.includes(`\${${HANDS_TOKEN_ENV}}`), cmd);
   const code = await new Promise<number>((resolve) => {
     const child = execFile("sh", ["-c", cmd], {
-      env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, [HANDS_TOKEN_ENV]: secretToken },
+      env: { PATH: `${dir}:/usr/bin:/bin`, [HANDS_TOKEN_ENV]: secretToken },
     }, () => {});
     child.on("exit", (c) => resolve(c ?? -1));
   });
   assert.equal(code, 0);
-  const argv = (await readFile(argvOut, "utf8")).split("\n");
-  assert.ok(argv.includes(`Authorization: Bearer ${secretToken}`), argv.join(" | "));
-  assert.ok(argv.includes("http://brain.invalid:8100/internal/assets/hands-binary"));
+  const argv = (await readFile(argvOut, "utf8")).split("\n").filter(Boolean);
+  const h = argv.indexOf("-H");
+  assert.ok(h >= 0, argv.join(" | "));
+  assert.equal(argv[h + 1], `Authorization: Bearer ${secretToken}`, "the header curl receives is the expanded token");
+  assert.deepEqual(argv.slice(-1), ["http://brain.invalid:8100/internal/assets/hands-binary"]);
 });
 
 /** Run the real commands in a local shell, so the expansion is proven, not assumed. */
@@ -538,7 +540,7 @@ test("the shell expands the request env into the env file and the launched proce
   await chmod(bin, 0o755);
   const secretToken = "a".repeat(64);
   const run = (cmd: string, env: Record<string, string>) => new Promise<number>((resolve) => {
-    const child = execFile("sh", ["-c", cmd], { env: { ...process.env, ...env } }, () => {});
+    const child = execFile("sh", ["-c", cmd], { env: { PATH: "/usr/bin:/bin", ...env } }, () => {});
     child.on("exit", (code) => resolve(code ?? -1));
   });
   // The launch path the sources share: prefix env, then the binary.
