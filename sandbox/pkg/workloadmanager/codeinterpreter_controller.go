@@ -814,9 +814,14 @@ const extraCAInjectorCopy = " && cp /setup-extra-ca.sh /extra-ca-bundle.pem /sha
 // with a message naming both anchor sources when it finds none. The check
 // after it catches a script that exits 0 without writing the bundle, such as
 // one from an injector image that predates strict mode.
-const extraCASetupScript = "/bin/sh /shared/bin/setup-extra-ca.sh && " +
-	"{ [ -s " + extraCABundlePath + " ] || { echo \"setup-extra-ca: error: " + extraCABundlePath +
-	" was not written; the envd-injector image predates extra CA support, use a newer one\" >&2; exit 1; }; } && "
+//
+// Each check ends in an explicit `exit 1` and the prefix ends in `;`, not
+// `&&`: the build steps after it are joined with `&&`, but a template step may
+// itself contain `;`, which would otherwise resume the chain after a failed
+// check and start envd without the CA.
+const extraCASetupScript = "/bin/sh /shared/bin/setup-extra-ca.sh || exit 1; " +
+	"[ -s " + extraCABundlePath + " ] || { echo \"setup-extra-ca: error: " + extraCABundlePath +
+	" was not written; the envd-injector image predates extra CA support, use a newer one\" >&2; exit 1; }; "
 
 // extraCABundleEnvNames are the variables pointed at extraCABundlePath.
 var extraCABundleEnvNames = []string{"SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS"}

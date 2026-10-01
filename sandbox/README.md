@@ -127,6 +127,9 @@ SANDBOX_EXTRA_CA_NAMESPACES=<sandbox-namespace> \
 deploy/scripts/install.sh   # together with your usual install settings
 ```
 
+`install.sh` skips a release that is already fully ready, so to add or change
+the ConfigMap on an existing install, run it with `FORCE_SANDBOX=1` as well.
+
 With Helm directly, set `controlplane.config.sandboxExtraCAConfigMap`. Every
 sandbox the controller creates then mounts the ConfigMap at `/etc/claw/extra-ca`,
 copies `/setup-extra-ca.sh` and `/extra-ca-bundle.pem` from the injector, runs

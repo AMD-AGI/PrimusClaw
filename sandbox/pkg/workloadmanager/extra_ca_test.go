@@ -178,7 +178,7 @@ func assertDeclaredContainers(t *testing.T, pt sandboxv1alpha1.PodTemplate) {
 		t.Fatalf("injector does not copy /setup-extra-ca.sh and /extra-ca-bundle.pem unconditionally: %q", cmd)
 	}
 	main := pt.Spec.Containers[0]
-	if !strings.HasPrefix(main.Args[0], "/bin/sh /shared/bin/setup-extra-ca.sh && ") {
+	if !strings.HasPrefix(main.Args[0], "/bin/sh /shared/bin/setup-extra-ca.sh || exit 1; ") {
 		t.Fatalf("setup-extra-ca.sh does not run first: %q", main.Args[0])
 	}
 	if v, _ := envValue(main.Env, "EXTRA_CA_REQUIRED"); v != "true" {
@@ -636,12 +636,19 @@ func TestSetupExtraCARejectsNonPEMKey(t *testing.T) {
 // /shared/bin rewritten to a temp directory holding the given script.
 func runControllerPrefix(t *testing.T, script []byte, env ...string) (string, error, bool) {
 	t.Helper()
+	return runControllerPrefixWithSteps(t, script, "", env...)
+}
+
+// runControllerPrefixWithSteps is runControllerPrefix with build steps, joined
+// the way buildStartupScript joins them, between the prefix and envd.
+func runControllerPrefixWithSteps(t *testing.T, script []byte, steps string, env ...string) (string, error, bool) {
+	t.Helper()
 	bin := t.TempDir()
 	if err := os.WriteFile(filepath.Join(bin, "setup-extra-ca.sh"), script, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	marker := filepath.Join(bin, "envd-started")
-	line := strings.ReplaceAll(extraCASetupScript, "/shared/bin", bin) + "exec touch " + marker
+	line := strings.ReplaceAll(extraCASetupScript, "/shared/bin", bin) + steps + "exec touch " + marker
 	cmd := exec.Command("/bin/sh", "-c", line)
 	cmd.Env = append([]string{"PATH=" + os.Getenv("PATH")}, env...)
 	out, err := cmd.CombinedOutput()
@@ -672,6 +679,25 @@ func TestControllerPrefixWithRealScriptFailsLoudly(t *testing.T) {
 		"EXTRA_CA_IMAGE_BUNDLE="+filepath.Join(d, "none.pem"), "EXTRA_CA_BUNDLE="+filepath.Join(d, "out.pem"))
 	if err == nil || envd || !strings.Contains(out, "no extra CA certificate was found") {
 		t.Fatalf("err=%v envd=%v:\n%s", err, envd, out)
+	}
+}
+
+// A template build step containing `;` must not resume the startup chain
+// after a failed CA check: with `&&` after the prefix, `A && B ; C && envd`
+// skips B on A's failure and then starts envd anyway.
+func TestControllerPrefixNotBypassedBySemicolonStep(t *testing.T) {
+	script, err := os.ReadFile(setupScriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := t.TempDir()
+	// buildStartupScript's shape: steps joined with " && " ahead of envd.
+	steps := "mkdir -p " + d + " && echo first; echo second && "
+	out, err, envd := runControllerPrefixWithSteps(t, script, steps,
+		"EXTRA_CA_REQUIRED=true", "EXTRA_CA_DIR="+filepath.Join(d, "none"),
+		"EXTRA_CA_IMAGE_BUNDLE="+filepath.Join(d, "none.pem"), "EXTRA_CA_BUNDLE="+filepath.Join(d, "out.pem"))
+	if err == nil || envd || !strings.Contains(out, "no extra CA certificate was found") {
+		t.Fatalf("a ';' build step let envd start after a failed CA check (err=%v envd=%v):\n%s", err, envd, out)
 	}
 }
 
