@@ -160,8 +160,30 @@ export const SAFE_API_URL = env("SAFE_API_URL");
 export const TOOLS_API_URL = `${SAFE_API_URL}/claw-api/v1/tools`;
 
 // --- Sandbox ---
-/** Optional in-cluster agent-sandbox-router base (no path suffix). When set, SafeWorkloadProvider.exec uses this + `/v1/namespaces/...`; when empty, uses `${SAFE_API_URL}/sandbox` + same path (public ingress). */
+/**
+ * Optional agent-sandbox-router base (no path suffix). When set, SafeWorkloadProvider.exec
+ * uses this + `/v1/namespaces/...`; when empty, uses `${SAFE_API_URL}/sandbox` + same path
+ * (public ingress).
+ *
+ * May list several bases, comma-separated, all fronting the same Router (for example one
+ * per gateway node of a remote cluster). Requests go to the one that last answered and move
+ * to the next only when a connection could not be opened, so a request is never sent twice.
+ * Read it through `sandboxRouterBases()` -- the raw string is not a URL once it holds a list.
+ */
 export const SANDBOX_ROUTER_URL = env("SANDBOX_ROUTER_URL", "");
+/**
+ * Reach Hands through the Router's port proxy instead of the sandbox's cluster DNS name.
+ *
+ * Off by default because the DNS name is the shorter path wherever it resolves, which is
+ * every deployment whose sandboxes run in its own cluster. Turn it on when they run in
+ * another cluster, where that name does not resolve and the Router is the only way in.
+ * Has no effect without SANDBOX_ROUTER_URL.
+ *
+ * Requires a Router running without `--enable-auth`. Routed Hands requests carry the
+ * per-sandbox Hands token (in Authorization and X-Hands-Token), not a SaFE API key, so a
+ * Router with auth on refuses them with 401 and the Hands health check fails loudly.
+ */
+export const SANDBOX_HANDS_VIA_ROUTER = envBool("SANDBOX_HANDS_VIA_ROUTER", false);
 export const SANDBOX_NAMESPACE = env("SANDBOX_NAMESPACE", "default");
 export const SANDBOX_CLUSTER_ID = env("SANDBOX_CLUSTER_ID");
 

@@ -3,11 +3,13 @@
 
 import { mintScopeCredential } from "@claw/utils";
 import type { ReapReport, ReapedShell, ReclaimCause } from "@claw/protocol";
+import { handsCredentialHeaders, handsRouteHeaders } from "@claw/protocol";
 import { createHmac } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import pino from "pino";
 import { Agent, fetch as undiciFetch } from "undici";
+import { withRouterFailover } from "../sandbox/sandbox-router.js";
 import { metrics } from "../infra/metrics.js";
 import {
   isShellAddressingCall, resolveStart, restorePublicShellId, restoreStructuredShellId,
@@ -80,6 +82,14 @@ const HANDS_DISPATCHER = new Agent({
   bodyTimeout: 0,
   keepAliveTimeout: 4_000,
 });
+
+/**
+ * undici's fetch, failing over between Router bases when this Hands URL is a
+ * Router port-proxy URL (see sandbox/sandbox-router.ts); a direct URL passes
+ * straight through. Every request to Hands goes through this, so the MCP
+ * transport and the plain-HTTP routes cannot disagree about where Hands is.
+ */
+const handsFetch = withRouterFailover(undiciFetch);
 
 /**
  * Returns true when the given error indicates the Hands sandbox is unreachable
@@ -264,7 +274,8 @@ export function explainHandsError(
  */
 async function probeShellRecordsCapability(url: string): Promise<boolean> {
   try {
-    const resp = await undiciFetch(handsEndpoint(url, "/health"), {
+    const resp = await handsFetch(handsEndpoint(url, "/health"), {
+      headers: handsRouteHeaders(url),
       signal: AbortSignal.timeout(5_000),
       dispatcher: HANDS_DISPATCHER,
     } as Parameters<typeof undiciFetch>[1]);
@@ -670,10 +681,12 @@ export class HandsClient {
         // HANDS_DISPATCHER below; mixing v6 fetch with a v8 dispatcher throws
         // `invalid onRequestStart method`. See HANDS_DISPATCHER doc above.
         // Cast to the DOM `fetch` type the SDK's FetchLike expects.
-        fetch: undiciFetch as unknown as typeof fetch,
+        fetch: handsFetch as unknown as typeof fetch,
         requestInit: {
           headers: {
-            Authorization: `Bearer ${this.token}`,
+            // Authorization plus X-Hands-Token, and x-session-id when routed:
+            // the Router strips the first and needs the last.
+            ...handsCredentialHeaders(this.url, this.token),
             ...(this.owner ? { [OWNER_HEADER]: this.owner } : {}),
             ...(this.shellRun ? { [RUN_HEADER]: this.shellRun } : {}),
             ...(this.deadlineAt ? { [DEADLINE_HEADER]: this.deadlineAt } : {}),
@@ -759,9 +772,9 @@ export class HandsClient {
    */
   async classifyShell(shellId: string, timeoutMs = 10_000): Promise<ShellClassProbe> {
     try {
-      const resp = await undiciFetch(handsEndpoint(this.url, "/internal/shells/class"), {
+      const resp = await handsFetch(handsEndpoint(this.url, "/internal/shells/class"), {
         method: "POST",
-        headers: { Authorization: `Bearer ${this.scopedCredential()}`, "content-type": "application/json" },
+        headers: { ...handsCredentialHeaders(this.url, this.scopedCredential()), "content-type": "application/json" },
         body: JSON.stringify({ shell_id: await this.wireShellId(shellId) }),
         signal: AbortSignal.timeout(timeoutMs),
         dispatcher: HANDS_DISPATCHER,
@@ -784,9 +797,9 @@ export class HandsClient {
    */
   private async probeShellRecord(shellId: string): Promise<RecordProbe> {
     try {
-      const resp = await undiciFetch(handsEndpoint(this.url, "/internal/shells/record"), {
+      const resp = await handsFetch(handsEndpoint(this.url, "/internal/shells/record"), {
         method: "POST",
-        headers: { Authorization: `Bearer ${this.scopedCredential()}`, "content-type": "application/json" },
+        headers: { ...handsCredentialHeaders(this.url, this.scopedCredential()), "content-type": "application/json" },
         body: JSON.stringify({ shell_id: shellId }),
         signal: AbortSignal.timeout(10_000),
         dispatcher: HANDS_DISPATCHER,
@@ -1116,9 +1129,9 @@ export class HandsClient {
    */
   async reapShells(cause: ReclaimCause, reclaimOp: string, graceMs = BG_SHELL_REAP_GRACE_MS): Promise<ReapReport> {
     if (!this.shellRun) return { stopped: 0, escalated: 0, surviving: 0, shells: [] };
-    const resp = await undiciFetch(handsEndpoint(this.url, "/internal/shells/reap"), {
+    const resp = await handsFetch(handsEndpoint(this.url, "/internal/shells/reap"), {
       method: "POST",
-      headers: { Authorization: `Bearer ${this.scopedCredential()}`, "content-type": "application/json" },
+      headers: { ...handsCredentialHeaders(this.url, this.scopedCredential()), "content-type": "application/json" },
       body: JSON.stringify({ cause, reclaim_op: reclaimOp, grace_ms: graceMs }),
       // Derived from the grace rather than fixed beside it: a deadline chosen
       // independently leaves the top of the grace domain unusable end to end,
@@ -1263,10 +1276,10 @@ export async function countActiveShells(
   timeoutMs = 5_000,
 ): Promise<number> {
   if (!owner) throw new Error("hands_active_shells_failed: empty owner");
-  const resp = await undiciFetch(handsEndpoint(url, "/internal/shells/active"), {
+  const resp = await handsFetch(handsEndpoint(url, "/internal/shells/active"), {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${mintScopeCredential({ owner, run: null }, token)}`,
+      ...handsCredentialHeaders(url, mintScopeCredential({ owner, run: null }, token)),
       "content-type": "application/json",
     },
     body: JSON.stringify({}),

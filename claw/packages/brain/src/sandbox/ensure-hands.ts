@@ -28,6 +28,7 @@ import {
 import { getSystemEnv } from "../infra/system-env.js";
 import { resolveRequestLlmKey } from "../llm/key-source.js";
 import { checkHandsHealth } from "./hands-health.js";
+import { safeHandsBaseUrl } from "./sandbox-router.js";
 import type { HandsHealthResult } from "./hands-health.js";
 import { destroyHands } from "./reaper.js";
 import {
@@ -2739,7 +2740,9 @@ async function provisionHands(
   let admitted = false;
   try {
   const workloadId = inst.id;
-  const handsBaseUrl = `http://${workloadId}.${nsForSandbox}.svc.cluster.local:${mcpPort}`;
+  // The cluster DNS name unless Hands is reached through the Router, in which
+  // case the Router's port proxy for this sandbox (see sandbox-router.ts).
+  const handsBaseUrl = safeHandsBaseUrl(nsForSandbox, workloadId, mcpPort);
 
   logger.info({ sessionId, workloadId, handsBaseUrl }, "ensureHands.bootstrap_start");
   await bootstrapHandsInSandbox(
@@ -2753,7 +2756,9 @@ async function provisionHands(
   let handsHealthy = false;
   for (let i = 0; i < HANDS_HEALTH_MAX_TRIES; i++) {
     try {
-      const hr = await fetch(`${handsBaseUrl}/health`, { signal: AbortSignal.timeout(3000) });
+      // The shared probe, so a routed URL carries the session header the
+      // Router needs and fails over between Router bases like every other call.
+      const hr = await checkHandsHealth(`${handsBaseUrl}/mcp`, 3000);
       if (hr.ok) { handsHealthy = true; break; }
     } catch { /* retry */ }
     await sleep(HANDS_HEALTH_INTERVAL_MS);
