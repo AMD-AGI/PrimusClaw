@@ -83,10 +83,10 @@ export const HANDS_ENV_PAYLOAD_ENV = "CLAW_HANDS_ENV_B64";
  *  The token is a shell reference, not a value. The command string is logged
  *  by the Router and by EnvD on every execute; the request's `env` map is not,
  *  so the credential travels there and is expanded inside the sandbox. */
-function brainAssetCurl(endpoint: string): string {
+export function brainAssetCurl(endpoint: string, baseUrl: string = BRAIN_HTTP_URL): string {
   return `curl -sfL --retry 3 --retry-delay 2 `
     + `-H "Authorization: Bearer \${${HANDS_TOKEN_ENV}}" `
-    + `${BRAIN_HTTP_URL}${endpoint}`;
+    + `${baseUrl}${endpoint}`;
 }
 
 /**

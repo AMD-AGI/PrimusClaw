@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   bootstrapHandsInSandbox, handsBinarySources, handsBaseEnv, HANDS_ENV_FILE,
-  HANDS_ENV_PAYLOAD_ENV, HANDS_TOKEN_ENV, writeEnvFileCmd,
+  HANDS_ENV_PAYLOAD_ENV, HANDS_TOKEN_ENV, writeEnvFileCmd, brainAssetCurl,
   HANDS_LOG_PATH, HANDS_STATE_DIR,
   inImageStartCmd, type SandboxExecFn,
 } from "../src/sandbox/bootstrap.js";
@@ -503,13 +503,30 @@ test("no command carries the token or the environment; the request env does", as
   }
 });
 
-test("the download source names the token by reference", (t) => {
-  const brainHttp = handsBinarySources(handsBaseEnv(SESSION, PORT)).find((s) => s.name === "brain_http");
-  if (!brainHttp) {
-    t.skip("BRAIN_HTTP_URL not configured in this environment");
-    return;
-  }
-  assert.ok(brainHttp.cmd.includes(`"Authorization: Bearer \${${HANDS_TOKEN_ENV}}"`), brainHttp.cmd);
+/**
+ * The download is the command that leaked: run it against a stand-in curl that
+ * records its argv, so what is proven is the header curl actually receives,
+ * not the shape of a string.
+ */
+test("the download sends the token from the request env, and the command never holds it", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "bootstrap-curl-"));
+  const argvOut = path.join(dir, "argv");
+  await writeFile(path.join(dir, "curl"), `#!/bin/sh\nfor a in "$@"; do printf '%s\\n' "$a"; done > ${argvOut}\n`);
+  await chmod(path.join(dir, "curl"), 0o755);
+  const secretToken = "b".repeat(64);
+  const cmd = brainAssetCurl("/internal/assets/hands-binary", "http://brain.invalid:8100");
+  assert.ok(!cmd.includes(secretToken));
+  assert.ok(cmd.includes(`\${${HANDS_TOKEN_ENV}}`), cmd);
+  const code = await new Promise<number>((resolve) => {
+    const child = execFile("sh", ["-c", cmd], {
+      env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, [HANDS_TOKEN_ENV]: secretToken },
+    }, () => {});
+    child.on("exit", (c) => resolve(c ?? -1));
+  });
+  assert.equal(code, 0);
+  const argv = (await readFile(argvOut, "utf8")).split("\n");
+  assert.ok(argv.includes(`Authorization: Bearer ${secretToken}`), argv.join(" | "));
+  assert.ok(argv.includes("http://brain.invalid:8100/internal/assets/hands-binary"));
 });
 
 /** Run the real commands in a local shell, so the expansion is proven, not assumed. */
