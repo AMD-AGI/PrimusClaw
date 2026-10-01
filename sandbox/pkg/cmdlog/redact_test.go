@@ -31,6 +31,8 @@ func TestRedactMasksCredentialShapes(t *testing.T) {
 		"quoted with space": "PGPASSWORD='" + secret + " " + secret + "' psql",
 		"dq with space":     `PGPASSWORD="` + secret + ` ` + secret + `" psql`,
 		"sq literal dollar": "PGPASSWORD='$" + secret + "' psql",
+		"escaped space":     `PGPASSWORD=` + secret + `\ ` + secret + ` psql`,
+		"dq escaped quote":  `PGPASSWORD="` + secret + `\"` + secret + `" psql`,
 		"api key header":    "curl -H 'X-API-KEY: " + secret + "' https://x",
 		"auth token header": "X-Auth-Token: " + secret,
 	}
@@ -73,5 +75,17 @@ func TestPreviewAndValueMaskBeforeTruncating(t *testing.T) {
 	}
 	if got := Preview([]string{"sh", "-c", long}, 260); strings.Contains(got, secret[:16]) {
 		t.Errorf("Preview let part of a credential through: %q", got)
+	}
+}
+
+// An argv element is one value however many spaces it holds; masking only the
+// joined line would cut it at the first one.
+func TestPreviewMasksAWholeAssignmentArgument(t *testing.T) {
+	got := Preview([]string{"env", "PGPASSWORD=" + secret + " " + secret, "psql"}, 0)
+	if strings.Contains(got, secret) {
+		t.Errorf("Preview let part of an argv assignment through: %q", got)
+	}
+	if got := Preview([]string{"env", "AUTH_CLAW_TOKEN=$AUTH_CLAW_TOKEN", "x"}, 0); !strings.Contains(got, "$AUTH_CLAW_TOKEN") {
+		t.Errorf("Preview masked a shell reference: %q", got)
 	}
 }

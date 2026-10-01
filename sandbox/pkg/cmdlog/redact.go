@@ -3,7 +3,10 @@
 
 package cmdlog
 
-import "regexp"
+import (
+	"regexp"
+	"strings"
+)
 
 // Mask replaces every credential Redact finds.
 const Mask = "***"
@@ -39,8 +42,9 @@ var credentialPatterns = []struct {
 	// literal, so the whole value is masked; inside double quotes a value that
 	// starts with `$` is a reference and stays readable.
 	{regexp.MustCompile(`(?i)\b([A-Za-z0-9_.-]*` + sensitiveName + `=')[^']*`), "${1}" + Mask},
-	{regexp.MustCompile(`(?i)\b([A-Za-z0-9_.-]*` + sensitiveName + `=")[^"$][^"]*`), "${1}" + Mask},
-	{regexp.MustCompile(`(?i)\b([A-Za-z0-9_.-]*` + sensitiveName + `=)[^\s$&'"][^\s&'"]*`), "${1}" + Mask},
+	{regexp.MustCompile(`(?i)\b([A-Za-z0-9_.-]*` + sensitiveName + `=")(?:\\.|[^"$\\])(?:\\.|[^"\\])*`), "${1}" + Mask},
+	// Unquoted, where a backslash escapes the next byte (`alpha\ beta`).
+	{regexp.MustCompile(`(?i)\b([A-Za-z0-9_.-]*` + sensitiveName + `=)(?:\\.|[^\s$&'"\\])(?:\\.|[^\s&'"\\])*`), "${1}" + Mask},
 	// X-API-Key: <value>, X-Auth-Token: <value> and the like, as headers.
 	{regexp.MustCompile(`(?i)\b((?:x-)?(?:api[_-]?key|auth[_-]?token|access[_-]?token)["']?\s*:\s*["']?)[^\s$'",;&][^\s'",;&]*`), "${1}" + Mask},
 	// "token": "<value>" and the like, as JSON puts them.
@@ -59,6 +63,19 @@ func Redact(v string) string {
 	}
 	return schemelessAuthorization.ReplaceAllStringFunc(v, redactSchemeless)
 }
+
+// RedactArg masks one argv element. An element is a whole value to the
+// program receiving it, so `PGPASSWORD=alpha beta` passed as one argument (to
+// env, say) is one assignment, which a pattern run over the joined command line
+// would cut at the space.
+func RedactArg(a string) string {
+	if m := sensitiveArg.FindStringSubmatchIndex(a); m != nil && !strings.HasPrefix(a[m[1]:], "$") && a[m[1]:] != "" {
+		return a[:m[1]] + Mask
+	}
+	return a
+}
+
+var sensitiveArg = regexp.MustCompile(`(?i)^[A-Za-z0-9_.-]*` + sensitiveName + `=`)
 
 var (
 	schemelessAuthorization = regexp.MustCompile(`(?i)(authorization["']?\s*[:=]\s*["']?)([^\s$'",;&][^\s'",;&]*)`)

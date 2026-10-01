@@ -14,7 +14,11 @@ func Preview(argv []string, limit int) string {
 	if limit <= 0 {
 		limit = defaultPreviewBytes
 	}
-	out := strings.Join(argv, " ")
+	masked := make([]string, len(argv))
+	for i, a := range argv {
+		masked[i] = RedactArg(a)
+	}
+	out := strings.Join(masked, " ")
 	out = strings.Map(func(r rune) rune {
 		switch r {
 		case '\n', '\r', '\t':
