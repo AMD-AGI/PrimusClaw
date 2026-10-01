@@ -82,6 +82,14 @@ export interface SandboxExecOptions {
    * starting; EnvD can otherwise only guess from the shell script it receives.
    */
   hands?: boolean;
+  /**
+   * Environment for the command, sent as the execute request's `env` map.
+   *
+   * Credentials go here and the command refers to them as `$NAME`. The command
+   * string is logged by the Router and by EnvD on every execute; this map is
+   * not, so a value placed here stays out of the control-plane log.
+   */
+  env?: Record<string, string>;
 }
 
 /**

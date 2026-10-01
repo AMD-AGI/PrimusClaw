@@ -75,7 +75,7 @@ test("the descriptions say when to reach for a background shell", () => {
 test("the sandbox is launched with the same answer Brain gave the model", () => {
   // Hands has its own copy of the flag, and the two disagreeing would mean
   // either a tool the model can see and not use, or one it uses unannounced.
-  const env = handsBaseEnv("s-1", "9100", "tok");
+  const env = handsBaseEnv("s-1", "9100");
   assert.match(env, /BG_SHELL_ENABLED=true/);
   assert.match(env, new RegExp(`BASH_MAX_TIMEOUT_SEC=${toolTimeoutCeilingSec("bash")}(\\s|$)`),
     "the tight ceiling belongs with the background shells that make it livable, "
@@ -152,7 +152,7 @@ test("schema, deadline and forwarded env agree with the one held ceiling", () =>
     callDeadlineMs("bash", { command: "x", timeout: held * 10 }),
     held * 1000 + MCP_DEADLINE_SLACK_MS,
   );
-  assert.match(handsBaseEnv("s-1", "9100", "tok"),
+  assert.match(handsBaseEnv("s-1", "9100"),
     new RegExp(`BASH_MAX_TIMEOUT_SEC=${held}(\\s|$)`));
 });
 
