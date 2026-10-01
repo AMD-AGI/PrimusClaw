@@ -4,6 +4,7 @@
 package cmdlog
 
 import (
+	"io"
 	"regexp"
 	"strings"
 )
@@ -45,8 +46,10 @@ var credentialPatterns = []struct {
 	{regexp.MustCompile(`(?i)\b([A-Za-z0-9_.-]*` + sensitiveName + `=")(?:\\.|[^"$\\])(?:\\.|[^"\\])*`), "${1}" + Mask},
 	// Unquoted, where a backslash escapes the next byte (`alpha\ beta`).
 	{regexp.MustCompile(`(?i)\b([A-Za-z0-9_.-]*` + sensitiveName + `=)(?:\\.|[^\s$&'"\\])(?:\\.|[^\s&'"\\])*`), "${1}" + Mask},
-	// X-API-Key: <value>, X-Auth-Token: <value> and the like, as headers.
-	{regexp.MustCompile(`(?i)\b((?:x-)?(?:api[_-]?key|auth[_-]?token|access[_-]?token)["']?\s*:\s*["']?)[^\s$'",;&][^\s'",;&]*`), "${1}" + Mask},
+	// X-API-Key: <value>, X-Hands-Token: <value>, X-Auth-Token: <value>, and any
+	// other header whose name ends in a credential word, as a request dump
+	// prints them.
+	{regexp.MustCompile(`(?i)\b((?:[A-Za-z0-9]+[_-])*(?:token|api[_-]?key|secret)["']?[ \t]*:[ \t]*["']?)[^\s$'",;&][^\s'",;&]*`), "${1}" + Mask},
 	// "token": "<value>" and the like, as JSON puts them.
 	{regexp.MustCompile(`(?i)("[A-Za-z0-9_.-]*` + sensitiveName + `"\s*:\s*")[^"]*`), "${1}" + Mask},
 }
@@ -88,4 +91,22 @@ func redactSchemeless(m string) string {
 		return m
 	}
 	return sub[1] + Mask
+}
+
+// RedactingWriter masks credentials in everything written through it.
+//
+// For output that does not go through pkg/logx: gin's recovery middleware dumps
+// the request headers of a panicking handler and masks only Authorization, so a
+// proxied request that carries its credential in another header -- the Router's
+// Hands port proxy and X-Hands-Token -- printed it in the clear on every client
+// disconnect (http.ErrAbortHandler).
+func RedactingWriter(w io.Writer) io.Writer { return redactingWriter{w} }
+
+type redactingWriter struct{ w io.Writer }
+
+func (r redactingWriter) Write(p []byte) (int, error) {
+	if _, err := io.WriteString(r.w, Redact(string(p))); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }

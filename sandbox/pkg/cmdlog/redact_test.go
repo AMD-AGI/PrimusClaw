@@ -12,29 +12,30 @@ const secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 
 func TestRedactMasksCredentialShapes(t *testing.T) {
 	cases := map[string]string{
-		"curl header":       `curl -sfL -H 'Authorization: Bearer ` + secret + `' https://brain/x`,
-		"header dump":       "Authorization: " + secret,
-		"basic":             "Authorization: Basic " + secret,
-		"bare bearer":       "sent Bearer " + secret + " upstream",
-		"env assignment":    "AUTH_CLAW_TOKEN=" + secret + " CLAW_SESSION_ID=s1 setsid /app/hands",
-		"query token":       "GET /x?token=" + secret + "&a=1",
-		"access_token":      "access_token=" + secret,
-		"amz signature":     "https://s3/x?X-Amz-Credential=" + secret + "&X-Amz-Signature=" + secret,
-		"amz session token": "X-Amz-Security-Token=" + secret,
-		"api key":           "OPENAI_API_KEY=" + secret,
-		"password":          "PGPASSWORD=" + secret + " psql",
-		"json":              `{"token":"` + secret + `","n":1}`,
-		"json authz":        `{"Authorization": "Bearer ` + secret + `"}`,
-		"single-quoted":     "AUTH_CLAW_TOKEN='" + secret + "' /app/hands",
-		"double-quoted":     `OPENAI_API_KEY="` + secret + `" python x.py`,
-		"aws secret":        "AWS_SECRET_ACCESS_KEY=" + secret,
-		"quoted with space": "PGPASSWORD='" + secret + " " + secret + "' psql",
-		"dq with space":     `PGPASSWORD="` + secret + ` ` + secret + `" psql`,
-		"sq literal dollar": "PGPASSWORD='$" + secret + "' psql",
-		"escaped space":     `PGPASSWORD=` + secret + `\ ` + secret + ` psql`,
-		"dq escaped quote":  `PGPASSWORD="` + secret + `\"` + secret + `" psql`,
-		"api key header":    "curl -H 'X-API-KEY: " + secret + "' https://x",
-		"auth token header": "X-Auth-Token: " + secret,
+		"curl header":        `curl -sfL -H 'Authorization: Bearer ` + secret + `' https://brain/x`,
+		"header dump":        "Authorization: " + secret,
+		"basic":              "Authorization: Basic " + secret,
+		"bare bearer":        "sent Bearer " + secret + " upstream",
+		"env assignment":     "AUTH_CLAW_TOKEN=" + secret + " CLAW_SESSION_ID=s1 setsid /app/hands",
+		"query token":        "GET /x?token=" + secret + "&a=1",
+		"access_token":       "access_token=" + secret,
+		"amz signature":      "https://s3/x?X-Amz-Credential=" + secret + "&X-Amz-Signature=" + secret,
+		"amz session token":  "X-Amz-Security-Token=" + secret,
+		"api key":            "OPENAI_API_KEY=" + secret,
+		"password":           "PGPASSWORD=" + secret + " psql",
+		"json":               `{"token":"` + secret + `","n":1}`,
+		"json authz":         `{"Authorization": "Bearer ` + secret + `"}`,
+		"single-quoted":      "AUTH_CLAW_TOKEN='" + secret + "' /app/hands",
+		"double-quoted":      `OPENAI_API_KEY="` + secret + `" python x.py`,
+		"aws secret":         "AWS_SECRET_ACCESS_KEY=" + secret,
+		"quoted with space":  "PGPASSWORD='" + secret + " " + secret + "' psql",
+		"dq with space":      `PGPASSWORD="` + secret + ` ` + secret + `" psql`,
+		"sq literal dollar":  "PGPASSWORD='$" + secret + "' psql",
+		"escaped space":      `PGPASSWORD=` + secret + `\ ` + secret + ` psql`,
+		"dq escaped quote":   `PGPASSWORD="` + secret + `\"` + secret + `" psql`,
+		"api key header":     "curl -H 'X-API-KEY: " + secret + "' https://x",
+		"auth token header":  "X-Auth-Token: " + secret,
+		"hands token header": "GET /x HTTP/1.1\r\nHost: h\r\nX-Hands-Token: " + secret + "\r\nAccept: */*\r\n",
 	}
 	for name, in := range cases {
 		got := Redact(in)
@@ -58,6 +59,7 @@ func TestRedactLeavesShellReferencesAndOrdinaryText(t *testing.T) {
 		`curl -H "X-API-Key: ${KEY}" https://x`,
 		`loaded Router public key from secret agent-sandbox-system/router-key`,
 		`sh -c ls -la /tmp`,
+		"GET /x HTTP/1.1\r\nAccept: text/event-stream\r\nMcp-Session-Id: abc\r\nSec-Fetch-Mode: cors\r\n",
 	}
 	for _, in := range keep {
 		if got := Redact(in); got != in {
@@ -87,5 +89,17 @@ func TestPreviewMasksAWholeAssignmentArgument(t *testing.T) {
 	}
 	if got := Preview([]string{"env", "AUTH_CLAW_TOKEN=$AUTH_CLAW_TOKEN", "x"}, 0); !strings.Contains(got, "$AUTH_CLAW_TOKEN") {
 		t.Errorf("Preview masked a shell reference: %q", got)
+	}
+}
+
+func TestRedactingWriterMasksAndReportsTheCallerLength(t *testing.T) {
+	var b strings.Builder
+	in := "X-Hands-Token: " + secret + "\n"
+	n, err := RedactingWriter(&b).Write([]byte(in))
+	if err != nil || n != len(in) {
+		t.Fatalf("Write = %d, %v; want %d, nil", n, err, len(in))
+	}
+	if strings.Contains(b.String(), secret) {
+		t.Errorf("credential survived: %q", b.String())
 	}
 }

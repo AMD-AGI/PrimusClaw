@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/agent-sandbox/pkg/api"
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
 	"sigs.k8s.io/agent-sandbox/pkg/builder"
+	"sigs.k8s.io/agent-sandbox/pkg/cmdlog"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/policy"
 	"sigs.k8s.io/agent-sandbox/pkg/safe"
@@ -183,7 +184,8 @@ func (s *Server) emitAudit(ctx context.Context, event *audit.AuditEvent) {
 // setupRoutes configures HTTP routes.
 func (s *Server) setupRoutes() {
 	s.router = gin.New()
-	s.router.Use(gin.Recovery())
+	// The default recovery dumps request headers and masks only Authorization.
+	s.router.Use(gin.RecoveryWithWriter(cmdlog.RedactingWriter(gin.DefaultErrorWriter)))
 
 	// Health check (no auth required)
 	s.router.GET("/health", s.handleHealthDeep)
