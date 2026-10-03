@@ -19,7 +19,7 @@ import path from "node:path";
 import {
   bootstrapHandsInSandbox, handsBinarySources, handsBaseEnv, HANDS_ENV_FILE,
   HANDS_ENV_PAYLOAD_ENV, HANDS_TOKEN_ENV, writeEnvFileCmd, brainAssetCurl,
-  HANDS_LOG_PATH, HANDS_STATE_DIR,
+  handsBinaryDownloadCmd, HANDS_LOG_PATH, HANDS_STATE_DIR,
   inImageStartCmd, type SandboxExecFn,
 } from "../src/sandbox/bootstrap.js";
 import type { SandboxExecOptions } from "../src/sandbox/provider.js";
@@ -529,6 +529,49 @@ test("the download sends the token from the request env, and the command never h
   assert.ok(h >= 0, argv.join(" | "));
   assert.equal(argv[h + 1], `Authorization: Bearer ${secretToken}`, "the header curl receives is the expanded token");
   assert.deepEqual(argv.slice(-1), ["http://brain.invalid:8100/internal/assets/hands-binary"]);
+});
+
+/**
+ * A rejected download comes back in under a second, and curl's `--retry` does
+ * not cover a 4xx: one 403 used to fail the sandbox, with only "download
+ * failed" to say why. Run the download against a stand-in curl that refuses a
+ * set number of times.
+ */
+async function downloadWithRefusals(refusals: number) {
+  const dir = await mkdtemp(path.join(tmpdir(), "bootstrap-retry-"));
+  const count = path.join(dir, "count");
+  const dest = path.join(dir, "hands-binary");
+  await writeFile(path.join(dir, "curl"), [
+    "#!/bin/sh",
+    `n=$(cat ${count} 2>/dev/null || echo 0); n=$((n+1)); echo $n > ${count}`,
+    `if [ $n -le ${refusals} ]; then echo "curl: (22) The requested URL returned error: 403" >&2; exit 22; fi`,
+    `while [ $# -gt 0 ]; do if [ "$1" = "-o" ]; then printf binary > "$2"; fi; shift; done`,
+    "",
+  ].join("\n"));
+  await chmod(path.join(dir, "curl"), 0o755);
+  const cmd = handsBinaryDownloadCmd(dest, 3, 0, "http://brain.invalid:8100");
+  const { code, stderr } = await new Promise<{ code: number; stderr: string }>((resolve) => {
+    execFile("sh", ["-c", cmd], {
+      env: { PATH: `${dir}:/usr/bin:/bin`, [HANDS_TOKEN_ENV]: TOKEN },
+    }, (err, _out, stderrText) => resolve({ code: err ? Number(err.code) : 0, stderr: stderrText }));
+  });
+  const attempts = Number((await readFile(count, "utf8")).trim());
+  const downloaded = await readFile(dest, "utf8").catch(() => "");
+  return { code, stderr, attempts, downloaded };
+}
+
+test("a refused download is tried again, and succeeds when a later attempt does", async () => {
+  const r = await downloadWithRefusals(2);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.attempts, 3);
+  assert.equal(r.downloaded, "binary");
+});
+
+test("a download refused every time stops at its limit and says what curl said", async () => {
+  const r = await downloadWithRefusals(99);
+  assert.equal(r.code, 1);
+  assert.equal(r.attempts, 3, "bounded, so the source fails inside its exec budget");
+  assert.match(r.stderr, /hands-binary download failed after 3 attempts: curl: \(22\) .*403/);
 });
 
 /** Run the real commands in a local shell, so the expansion is proven, not assumed. */
