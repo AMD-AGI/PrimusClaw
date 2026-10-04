@@ -49,6 +49,7 @@ import {
   ledgerKeyForRetention, reassertRetentions, releaseRetention,
 } from "./retain-container.js";
 import { HANDS_STATE_DIR } from "./bootstrap.js";
+import { applyHold, putReclaimHold, readReclaimHold, type ReclaimHold } from "./reclaim-hold.js";
 import {
   assertSandboxRunning,
   inspectSandboxJobs,
@@ -373,6 +374,39 @@ function sameStreak(a: ReclaimStreak | undefined, b: ReclaimStreak | undefined):
 const HOLD_WRITE_ATTEMPTS = 3;
 
 /**
+ * The shared-hold note for one holding reading: what it holds and which
+ * streaks it ends. `seen` is the record the reading was taken against, when
+ * the caller holds one; a streak there that the reading does not continue is
+ * recorded as ended, bound to its idle period.
+ */
+function holdNote(
+  identity: string, now: number, obs: JobsObservation, seen?: HandsKvEntry,
+): ReclaimHold {
+  const note: ReclaimHold = {
+    identity, endedAt: {}, endedStreaks: {}, at: now, expiresAt: now + LOCAL_HOLD_TTL_MS,
+  };
+  if (obs.kind === "failure") note.failureAt = now;
+  else if ((obs.count ?? 0) > 0) note.positiveAt = now;
+  for (const reason of reasonsEndedBy(obs)) note.endedAt[reason] = now;
+  const streak = seen?.reclaimStreak;
+  if (seen && streak) {
+    const after = applyObservation(seen, obs, {
+      identity, idleEpoch: seen.idleEpoch, idleSince: seen.idleSince, now,
+      spacingMs: RECLAIM_OBSERVATION_SPACING_MS,
+    }).reclaimStreak;
+    if (!sameStreak(after, streak)) {
+      note.endedAt[streak.reason] = later(note.endedAt[streak.reason], now);
+      note.endedStreaks[streak.reason] = {
+        firstAt: streak.firstAt,
+        ...(streak.idleEpoch !== undefined ? { idleEpoch: streak.idleEpoch } : {}),
+        ...(streak.idleSince !== undefined ? { idleSince: streak.idleSince } : {}),
+      };
+    }
+  }
+  return note;
+}
+
+/**
  * Land a reading that can only hold a destroy (a failed probe, a positive
  * count) on the record, re-reading and re-applying it on a lost CAS.
  *
@@ -383,6 +417,15 @@ const HOLD_WRITE_ATTEMPTS = 3;
  * two and the streak is ended in the same write. A reading that still cannot be
  * written is held by this process (see LocalHold), so a lost write never
  * shortens the quiet window; it is logged, not swallowed.
+ *
+ * Before any of that, the reading is put to the sandbox's hold key (see
+ * sandbox/reclaim-hold.ts), which no revision race can refuse: the hands
+ * record is renewed on every sweep and a CAS on it can lose every attempt,
+ * which left the hold in this process only and let another replica destroy.
+ * Every destructive confirmation reads that key.
+ *
+ * A positive count -- from the bound instance or a replaced one -- also clears
+ * the reuse anchor (`quiescedAt`): live work restarts the reuse window.
  */
 async function persistHoldingObservation(
   deps: KeepaliveDeps,
@@ -390,11 +433,20 @@ async function persistHoldingObservation(
   identity: string,
   obs: JobsObservation,
   first?: { info: HandsKvEntry; revision: number },
-  extra?: (next: HandsKvEntry) => HandsKvEntry,
 ): Promise<{ info: HandsKvEntry; revision: number } | null> {
+  const now = (deps.now ?? Date.now)();
   // Noted before any write is tried: a KV that fails every read below must
   // hold the destroy here just as a lost CAS does.
-  noteLocalHold(identity, (deps.now ?? Date.now)(), obs);
+  noteLocalHold(identity, now, obs);
+  // And put where every replica's confirmation reads it, unconditionally.
+  // The record as the caller read it, not through this process's holds: the
+  // streak to mark ended is the one on the record, which those may already hide.
+  await putReclaimHold(deps.kv, holdNote(identity, now, obs, first?.info)).catch((err: unknown) => {
+    logger.warn(
+      { identity, kind: obs.kind, err: (err as Error)?.message ?? String(err) },
+      "keepalive.reclaim_hold_put_failed",
+    );
+  });
   for (let attempt = 1; attempt <= HOLD_WRITE_ATTEMPTS; attempt++) {
     try {
       let base: HandsKvEntry;
@@ -420,7 +472,7 @@ async function persistHoldingObservation(
       // holds: it may end the streak there, never start or extend one, since
       // the record may now be in an idle period the reading was not about.
       if (reread) next.reclaimStreak = sameStreak(next.reclaimStreak, prior) ? prior : undefined;
-      if (extra) next = extra(next);
+      if (obs.kind !== "failure" && (obs.count ?? 0) > 0) next = { ...next, quiescedAt: undefined };
       const written = await deps.kv.update(key, sc.encode(JSON.stringify(next)), revision);
       return { info: next, revision: written };
     } catch {
@@ -488,12 +540,39 @@ async function confirmReclaim(
   // Through what this process has seen, too: a hold whose write was lost is
   // still a hold here (see LocalHold).
   info = withLocalHolds(identity, info, now);
-  const decision = reclaimDecision(
-    info, reason,
-    { identity, idleEpoch: info.idleEpoch, idleSince: info.idleSince, now },
+  const decide = (fields: HandsKvEntry) => reclaimDecision(
+    fields, reason,
+    { identity, idleEpoch: fields.idleEpoch, idleSince: fields.idleSince, now },
     { sweeps: SANDBOX_RECLAIM_CONFIRM_SWEEPS, quietMs: SANDBOX_RECLAIM_QUIET_MS },
   );
-  if (decision.allowed) return true;
+  let decision = decide(info);
+  if (decision.allowed) {
+    // And through what every replica has put to the hold key: a holding
+    // reading whose record write lost every CAS is there, whichever replica
+    // made it. Unreadable, it holds the destroy.
+    let shared: ReclaimHold | null;
+    try {
+      shared = await readReclaimHold(deps.kv, identity);
+    } catch (err) {
+      metrics.onKeepaliveReclaimHeld(reason, "hold_unreadable");
+      logger.warn(
+        { ...reclaimEvidence(sessionId, info, reason, probe), err: (err as Error)?.message ?? String(err) },
+        "keepalive.reclaim_hold_unreadable",
+      );
+      return false;
+    }
+    const applied = applyHold(info, shared, identity, now);
+    info = applied.info;
+    decision = decide(info);
+    if (decision.allowed) return true;
+    if (shared) {
+      // Still holding: re-put so the bucket's max age does not drop it while it
+      // is the only thing ending the streak on the record.
+      await putReclaimHold(deps.kv, shared).catch((err: unknown) => {
+        logger.warn({ identity, err: (err as Error)?.message ?? String(err) }, "keepalive.reclaim_hold_put_failed");
+      });
+    }
+  }
   metrics.onKeepaliveReclaimHeld(reason, decision.hold);
   logger.info(
     { ...reclaimEvidence(sessionId, info, reason, probe), hold: decision.hold },
@@ -3239,7 +3318,6 @@ async function expireIdleTarget(
       await persistHoldingObservation(
         deps, key, identity, { kind: "count", count: running },
         { info, revision: claimRevision },
-        (next) => ({ ...next, quiescedAt: undefined }),
       );
       return;
     }

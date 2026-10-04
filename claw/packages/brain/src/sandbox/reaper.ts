@@ -51,6 +51,7 @@ import { isTombstone } from "../tasks/lock.js";
 import { SandboxStopUnavailable } from "./errors.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
 import { pingTargetIdentity, unregisterSandbox } from "./keepalive.js";
+import { deleteReclaimHold } from "./reclaim-hold.js";
 import { releaseAdmission } from "./admission.js";
 import {
   instanceFromEntry,
@@ -495,6 +496,11 @@ export async function destroyHands(
 
   const releaseSlot = async (): Promise<void> => {
     const identity = pingTargetIdentity(target);
+    // The record naming this sandbox is gone (or names another one), so the
+    // destroy evidence held for it has nothing left to hold.
+    await deleteReclaimHold(kv, identity).catch((e: unknown) => {
+      logger.warn({ sessionId, identity, err: (e as Error)?.message ?? String(e) }, "sandbox.destroy.reclaim_hold_left");
+    });
     if (!await releaseAdmission(identity)) {
       logger.error({ sessionId, identity }, "sandbox.destroy.admission_release_unconfirmed");
     }

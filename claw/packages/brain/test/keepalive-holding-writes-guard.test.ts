@@ -70,25 +70,89 @@ const EVIDENCE: RegExp[] = [
   new RegExp(`delete\\s+[\\w.]+\\.(?:${FIELDS}|${CLEARED})\\b`, "g"),
 ];
 
-/** A single KV write whose failure is swallowed. */
-const SWALLOWED: RegExp[] = [
-  // kv.update(...).catch(() => {}) and its spellings.
-  /\.(?:update|put)\([^;]*?\)\s*\.catch\(\s*\(\s*\w*\s*\)\s*=>\s*(?:\{\s*\}|undefined|null|void 0)\s*\)/g,
-  // try { ... kv.update(...) ... } catch { } -- an empty or comment-only catch.
-  /try\s*\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*?\.(?:update|put)\((?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*?\}\s*catch\s*(?:\(\s*\w*\s*\))?\s*\{(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\n]*)*\}/g,
-];
+/** kv.update(...).catch(() => {}) and its spellings: a single KV write whose failure is swallowed. */
+const SWALLOWED_CATCH = /\.(?:update|put)\([^;]*?\)\s*\.catch\(\s*\(\s*\w*\s*\)\s*=>\s*(?:\{\s*\}|undefined|null|void 0)\s*\)/g;
 
-function spans(text: string, res: RegExp[]): { at: number; end: number }[] {
+/** Index of the brace closing the one opened at `open`, or -1. Linear. */
+function closingBrace(text: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    if (text[i] === "{") depth += 1;
+    else if (text[i] === "}" && --depth === 0) return i;
+  }
+  return -1;
+}
+
+function skipSpace(text: string, i: number): number {
+  while (i < text.length && /\s/.test(text[i])) i += 1;
+  return i;
+}
+
+/** Whether `body` is only whitespace and comments. Linear. */
+function blank(body: string): boolean {
+  for (let i = skipSpace(body, 0); i < body.length; i = skipSpace(body, i)) {
+    if (body.startsWith("//", i)) {
+      const nl = body.indexOf("\n", i);
+      i = nl < 0 ? body.length : nl + 1;
+    } else if (body.startsWith("/*", i)) {
+      const end = body.indexOf("*/", i + 2);
+      if (end < 0) return false;
+      i = end + 2;
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * try { ... kv.update(...) ... } catch { } -- a write inside a try whose catch
+ * is empty or comment-only. A scan rather than one regular expression: the
+ * nested-brace expression this replaced backtracked exponentially on a catch
+ * full of comment markers.
+ */
+function emptyCatchWrites(text: string): { at: number; end: number }[] {
+  const out: { at: number; end: number }[] = [];
+  const head = /\btry\s*\{/g;
+  for (let m = head.exec(text); m; m = head.exec(text)) {
+    const open = m.index + m[0].length - 1;
+    const close = closingBrace(text, open);
+    if (close < 0) continue;
+    // Anchored at the write, not the `try`: whether the write is in a retry
+    // loop is asked from where the write is.
+    const write = text.slice(open + 1, close).search(/\.(?:update|put)\(/);
+    if (write < 0) continue;
+    let i = skipSpace(text, close + 1);
+    if (!text.startsWith("catch", i)) continue;
+    i = skipSpace(text, i + "catch".length);
+    if (text[i] === "(") {
+      const param = text.indexOf(")", i);
+      if (param < 0 || !/^\(\s*\w*\s*\)$/.test(text.slice(i, param + 1))) continue;
+      i = skipSpace(text, param + 1);
+    }
+    if (text[i] !== "{") continue;
+    const end = closingBrace(text, i);
+    if (end >= 0 && blank(text.slice(i + 1, end))) out.push({ at: open + 1 + write, end: end + 1 });
+  }
+  return out;
+}
+
+function regexSpans(text: string, res: RegExp[]): { at: number; end: number }[] {
   const out: { at: number; end: number }[] = [];
   for (const re of res) {
     re.lastIndex = 0;
     for (let m = re.exec(text); m; m = re.exec(text)) out.push({ at: m.index, end: m.index + m[0].length });
   }
-  return out.sort((a, b) => a.at - b.at);
+  return out;
+}
+
+/** Every single KV write whose failure is swallowed. */
+function swallowedWrites(text: string): { at: number; end: number }[] {
+  return [...regexSpans(text, [SWALLOWED_CATCH]), ...emptyCatchWrites(text)].sort((a, b) => a.at - b.at);
 }
 
 function positions(text: string, res: RegExp[]): number[] {
-  return spans(text, res).map((s) => s.at);
+  return regexSpans(text, res).map((s) => s.at).sort((a, b) => a - b);
 }
 
 /**
@@ -117,7 +181,7 @@ function derive(files: { path: string; text: string }[]) {
       const evidence = positions(fn.text, EVIDENCE);
       if (evidence.length === 0) continue;
       // A write whose payload or preceding code carries the evidence.
-      const swallowed = spans(fn.text, SWALLOWED).filter((w) => w.end > evidence[0]);
+      const swallowed = swallowedWrites(fn.text).filter((w) => w.end > evidence[0]);
       const id = `${rel}#${fn.name}`;
       for (const at of evidence) {
         sites.push({
@@ -187,7 +251,7 @@ test("confirmReclaim swallows a write only for an advancing reading", () => {
   const fn = functionsOf("sandbox/keepalive.ts", text).find((c) => c.name === "confirmReclaim")!;
   const branch = fn.text.indexOf("if (reading?.holds)");
   const routed = fn.text.indexOf("persistHoldingObservation(", branch);
-  const bare = positions(fn.text, SWALLOWED);
+  const bare = swallowedWrites(fn.text).map((w) => w.at);
   assert.ok(branch >= 0 && routed > branch, "a holding reading is routed to persistHoldingObservation");
   assert.equal(bare.length, 1, "one swallowed write, the advancing one");
   assert.ok(bare[0] > routed, "and it comes after the holding branch returned");
@@ -209,4 +273,67 @@ test("confirmReclaim swallows a write only for an advancing reading", () => {
         `${c.name} applies a reading with observe() and cannot know whether it holds`);
     }
   }
+});
+
+test("the try/catch scan is linear on the inputs the old expression backtracked on", () => {
+  // CodeQL js/redos on the expression this scan replaced: a catch body full of
+  // comment markers. Each input is scanned well inside a second.
+  for (const marker of ["//", "*//*"]) {
+    const prefix = marker === "//" ? "try{{.put(}}catch{{//" : "try{{.put(}}catch{{/*";
+    const text = prefix + marker.repeat(50_000);
+    const started = process.hrtime.bigint();
+    holdingWriteViolations([{ path: join(SRC, "sandbox/adversarial.ts"), text: `function f() {\n  observe(x);\n${text}\n}\n` }]);
+    const ms = Number(process.hrtime.bigint() - started) / 1e6;
+    assert.ok(ms < 1000, `${JSON.stringify(marker)} x50000 took ${ms.toFixed(0)} ms`);
+  }
+  // And it still sees what it is for, in each spelling.
+  for (const write of [
+    "try { await kv.update(k, v, r); } catch { }",
+    "try { await kv.put(k, v); } catch (err) { /* lost */ }",
+    "try {\n  if (a) { await kv.update(k, v, r); }\n} catch {\n  // lost the race\n}",
+  ]) {
+    const found = holdingWriteViolations([{
+      path: join(SRC, "sandbox/mutant.ts"),
+      text: `function f(info) {\n  info.lastProbeFailureAt = 1;\n  ${write}\n}\n`,
+    }]);
+    assert.equal(found.length, 1, `missed: ${write}`);
+  }
+  // A catch that does something is not swallowed.
+  assert.deepEqual(holdingWriteViolations([{
+    path: join(SRC, "sandbox/mutant.ts"),
+    text: "function f(info) {\n  info.lastProbeFailureAt = 1;\n  try { await kv.update(k, v, r); } catch (err) { log(err); }\n}\n",
+  }]), []);
+});
+
+test("holding evidence goes to the hold key, and every destructive confirmation reads it fail-closed", () => {
+  // The record's CAS can lose every attempt (the record is renewed on every
+  // sweep), so the sanctioned holding path is the hold key's unconditional put,
+  // made before the retry loop, and the confirmation every idle_empty and
+  // instance_replaced destroy goes through reads it before allowing one.
+  const text = FILES.find((f) => f.path.endsWith("sandbox/keepalive.ts"))!.text;
+  const fns = functionsOf("sandbox/keepalive.ts", text);
+  const persist = fns.find((c) => c.name === "persistHoldingObservation")!.text;
+  const put = persist.indexOf("putReclaimHold(");
+  const loop = persist.search(/\bfor\s*\(/);
+  assert.ok(put >= 0 && loop > put, "persistHoldingObservation puts the hold key before its CAS loop");
+
+  const confirm = fns.find((c) => c.name === "confirmReclaim")!.text;
+  const read = confirm.indexOf("readReclaimHold(");
+  const allowed = confirm.indexOf("return true");
+  assert.ok(read >= 0 && allowed > read, "confirmReclaim reads the hold key before it can allow a destroy");
+  const failClosed = confirm.slice(read).match(/catch\s*\([^)]*\)\s*\{([\s\S]*?)\n {4}\}/);
+  assert.ok(failClosed && /return false;/.test(failClosed[1]), "an unreadable hold key holds the destroy");
+  assert.equal((confirm.match(/return true/g) ?? []).length, 1, "one way out that allows a destroy");
+
+  // Every destroy for these reasons is behind confirmReclaim.
+  for (const c of fns) {
+    const reclaims = c.text.match(/onKeepaliveReclaim\("(?:idle_empty|instance_replaced)"\)/g) ?? [];
+    if (reclaims.length === 0) continue;
+    assert.ok(c.text.includes("confirmReclaim("), `${c.name} reclaims without confirmReclaim`);
+  }
+
+  // The hold key is never written under CAS: no update/create on it anywhere.
+  const hold = FILES.find((f) => f.path.endsWith("sandbox/reclaim-hold.ts"))!.text;
+  assert.ok(/\bkv\.put\(key,/.test(hold), "the hold key is written with put");
+  assert.ok(!/\.(?:update|create)\(/.test(hold), "and never with a revision-conditioned write");
 });

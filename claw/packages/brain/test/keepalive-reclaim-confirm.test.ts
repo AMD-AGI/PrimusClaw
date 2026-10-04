@@ -22,6 +22,7 @@ import * as replicaA from "../src/sandbox/keepalive.js";
 import { bindSandboxProviders } from "../src/sandbox/factory.js";
 import { registry } from "../src/infra/metrics.js";
 import { filterToRegExp } from "./nats-kv-stub.js";
+import { RECLAIM_HOLD_PREFIX, reclaimHoldKey } from "../src/sandbox/reclaim-hold.js";
 import type { SandboxProvider, SandboxStatus } from "../src/sandbox/provider.js";
 
 const sc = StringCodec();
@@ -57,7 +58,16 @@ interface SharedKv {
   kv: KV;
   deleted: string[];
   current: () => Record<string, any> | null;
+  /** The value under any key, parsed. */
+  read: (key: string) => Record<string, any> | null;
 }
+
+/** The identity keepalive names this test's sandbox by. */
+const IDENTITY = "safe:wl-confirm";
+const HOLD_KEY = reclaimHoldKey(IDENTITY);
+
+/** When set, every read of a hold key throws. */
+let holdReadFails = false;
 
 /** Runs on every read of the run lease, before it answers; see the last test. */
 let onLeaseRead: (() => Promise<void>) | null = null;
@@ -77,6 +87,7 @@ function sharedKv(initial: Record<string, unknown>): SharedKv {
     },
     async get(key: string) {
       if (key === `lock.${SESSION}` && onLeaseRead) await onLeaseRead();
+      if (key.startsWith(RECLAIM_HOLD_PREFIX) && holdReadFails) throw new Error("bucket unavailable");
       const e = store.get(key);
       return e ? { key, value: e.value, revision: e.revision, operation: "PUT" } : null;
     },
@@ -111,6 +122,10 @@ function sharedKv(initial: Record<string, unknown>): SharedKv {
     deleted,
     current: () => {
       const e = store.get(KEY);
+      return e ? JSON.parse(sc.decode(e.value)) : null;
+    },
+    read: (key: string) => {
+      const e = store.get(key);
       return e ? JSON.parse(sc.decode(e.value)) : null;
     },
   };
@@ -166,6 +181,7 @@ beforeEach(() => {
   rosterReads = 0;
   onLeaseRead = null;
   onRecordUpdate = null;
+  holdReadFails = false;
   stubProvider();
   stubRouter();
 });
@@ -763,5 +779,176 @@ test("an answer from the bound instance whose write lost a race still ends a rep
     assert.ok(verdictsRefused > 0, "sanity: the background verdict did not carry it");
   } finally {
     replicaB.resetBackgroundWorkStateForTest();
+  }
+});
+
+// --- the hold key: holding evidence no revision race can refuse ---
+
+/** Two sweeps of empty rosters on replica A: one reading short of a destroy. */
+async function twoEmptySweeps(t: { mock: { timers: { tick(ms: number): void } } }, k: SharedKv): Promise<void> {
+  await sweep(replicaA, k.kv);
+  t.mock.timers.tick(SWEEP_MS);
+  await sweep(replicaA, k.kv);
+  assert.equal(k.current()?.reclaimStreak?.count, 2, "sanity: one reading short of a destroy");
+}
+
+test("a failure marker that loses every CAS on one replica still holds the destroy on the other", async (t) => {
+  // Codex round 5: the record is renewed under every probe, so the bounded
+  // re-read retry can lose all three attempts. The hold then lived only in
+  // replica A's memory; replica B read the old streak and an empty roster and
+  // destroyed inside the quiet window (reclaim_hold_unpersisted attempts:3,
+  // then reclaim_destroy consecutive:3 on B).
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const replicaB = await import("../src/sandbox/keepalive.js?replica=hold-failure") as Replica;
+  const k = sharedKv(entry(Date.now()));
+  try {
+    await twoEmptySweeps(t, k);
+    let refused = 0;
+    onRecordUpdate = (next) => {
+      if (typeof next.lastProbeFailureAt === "number") {
+        refused += 1;
+        throw new Error("wrong last sequence");
+      }
+    };
+    t.mock.timers.tick(SWEEP_MS);
+    roster = { kind: "eof" };
+    const failedAt = Date.now();
+    await sweep(replicaA, k.kv);
+    onRecordUpdate = null;
+    assert.ok(refused >= 3, `sanity: every record write of the marker lost its CAS; refused=${refused}`);
+    assert.equal(k.current()?.lastProbeFailureAt, undefined, "sanity: nothing reached the record");
+    assert.equal(k.current()?.reclaimStreak?.count, 2, "sanity: the stale streak is still on it");
+
+    // Replica B has only the bucket to go on. Every sweep inside the quiet
+    // window is held, the first of them included.
+    roster = { kind: "ok", count: 0 };
+    for (let i = 0; Date.now() + SWEEP_MS - failedAt < 300_000; i++) {
+      t.mock.timers.tick(SWEEP_MS);
+      await sweep(replicaB, k.kv);
+      assert.ok(!destroyed(k),
+        `empty sweep ${i + 1} on the other replica destroyed it inside the quiet window; stops=${JSON.stringify(stops)}`);
+    }
+    // And the stale streak the failure ended does not count: confirmation
+    // starts again after it.
+    assert.ok((k.current()?.reclaimStreak?.firstAt ?? 0) >= failedAt,
+      `the streak the failure ended survived; record=${JSON.stringify(k.current())}`);
+    const hold = k.read(HOLD_KEY);
+    assert.equal(hold?.failureAt, failedAt, `the failure is on the hold key; hold=${JSON.stringify(hold)}`);
+    assert.equal(hold?.identity, IDENTITY);
+
+    // A hold, not a veto: past the window B reclaims, and the hold key goes
+    // with the record.
+    for (let i = 0; i < 6 && !destroyed(k); i++) {
+      t.mock.timers.tick(SWEEP_MS);
+      await sweep(replicaB, k.kv);
+    }
+    assert.ok(destroyed(k), "sanity: past the window the sandbox is reclaimed");
+    assert.ok(k.deleted.includes(HOLD_KEY), `the hold key was left behind; deleted=${JSON.stringify(k.deleted)}`);
+  } finally {
+    replicaB.resetBackgroundWorkStateForTest();
+  }
+});
+
+test("a positive count that loses every CAS on one replica still holds the destroy on the other", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const replicaB = await import("../src/sandbox/keepalive.js?replica=hold-positive") as Replica;
+  const k = sharedKv(entry(Date.now()));
+  try {
+    await twoEmptySweeps(t, k);
+    onRecordUpdate = (next) => {
+      if (typeof next.lastPositiveCountAt === "number") throw new Error("wrong last sequence");
+    };
+    t.mock.timers.tick(SWEEP_MS);
+    roster = { kind: "ok", count: 250 };
+    const busyAt = Date.now();
+    await sweep(replicaA, k.kv);
+    onRecordUpdate = null;
+    assert.equal(k.current()?.lastPositiveCountAt, undefined, "sanity: nothing reached the record");
+
+    roster = { kind: "ok", count: 0 };
+    for (let i = 0; Date.now() + SWEEP_MS - busyAt < 300_000; i++) {
+      t.mock.timers.tick(SWEEP_MS);
+      await sweep(replicaB, k.kv);
+      assert.ok(!destroyed(k),
+        `empty sweep ${i + 1} on the other replica destroyed it right after live work; stops=${JSON.stringify(stops)}`);
+    }
+    assert.equal(k.read(HOLD_KEY)?.positiveAt, busyAt);
+  } finally {
+    replicaB.resetBackgroundWorkStateForTest();
+  }
+});
+
+test("an ended replaced run whose every CAS is lost is not completed on the other replica", async (t) => {
+  // No failure and no positive count here: the bound instance answering empty
+  // only ends the replaced run. The hold key carries that end, bound to the
+  // run it ended, so the other replica cannot complete it.
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const replicaB = await import("../src/sandbox/keepalive.js?replica=hold-ended") as Replica;
+  const k = sharedKv(entry(Date.now()));
+  try {
+    roster = { kind: "ok", count: 0, instance: "envd-2" };
+    await sweep(replicaA, k.kv);
+    t.mock.timers.tick(SWEEP_MS);
+    await sweep(replicaA, k.kv);
+    const run = k.current()?.reclaimStreak;
+    assert.equal(run?.reason, "instance_replaced", "sanity: a replaced run");
+    assert.equal(run?.count, 2, "sanity: one reading short of a destroy");
+
+    // Every write that would end the run on the record is refused.
+    onRecordUpdate = (next) => {
+      if (next.reclaimStreak?.reason !== "instance_replaced") throw new Error("wrong last sequence");
+    };
+    t.mock.timers.tick(SWEEP_MS);
+    roster = { kind: "ok", count: 0 };
+    await sweep(replicaA, k.kv);
+    onRecordUpdate = null;
+    assert.equal(k.current()?.reclaimStreak?.firstAt, run?.firstAt, "sanity: the ended run is still on the record");
+
+    t.mock.timers.tick(SWEEP_MS);
+    roster = { kind: "ok", count: 0, instance: "envd-2" };
+    await sweep(replicaB, k.kv);
+    assert.ok(!destroyed(k), `a replaced run the bound instance ended was completed; stops=${JSON.stringify(stops)}`);
+    assert.equal(k.read(HOLD_KEY)?.endedStreaks?.instance_replaced?.firstAt, run?.firstAt,
+      `the end of the run is on the hold key; hold=${JSON.stringify(k.read(HOLD_KEY))}`);
+  } finally {
+    replicaB.resetBackgroundWorkStateForTest();
+  }
+});
+
+test("a hold key that cannot be read holds the destroy", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const k = sharedKv(entry(Date.now()));
+  await twoEmptySweeps(t, k);
+  holdReadFails = true;
+  t.mock.timers.tick(SWEEP_MS);
+  await sweep(replicaA, k.kv);
+  assert.ok(!destroyed(k), `destroyed without reading the hold key; stops=${JSON.stringify(stops)}`);
+  holdReadFails = false;
+  t.mock.timers.tick(SWEEP_MS);
+  await sweep(replicaA, k.kv);
+  assert.ok(destroyed(k), "sanity: readable again, the confirmed streak is reclaimed");
+});
+
+test("live work read from a replaced instance clears the reuse anchor, like live work from the bound one", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const k = sharedKv(entry(Date.now()));
+  assert.equal(typeof k.current()?.quiescedAt, "number", "sanity: the reuse anchor is set");
+  roster = { kind: "ok", count: 250, instance: "envd-2" };
+  await sweep(replicaA, k.kv);
+  assert.equal(typeof k.current()?.lastPositiveCountAt, "number", "sanity: the positive count landed");
+  assert.equal(k.current()?.quiescedAt, undefined,
+    `the reuse anchor survived live work; record=${JSON.stringify(k.current())}`);
+  assert.ok(!destroyed(k));
+});
+
+test("the hold key is one token outside every hands.* walk", () => {
+  for (const identity of [IDENTITY, "agent:sess.with.dots:ns:sb-1", "safe:wl.x/y z"]) {
+    const key = reclaimHoldKey(identity);
+    assert.ok(key.startsWith(RECLAIM_HOLD_PREFIX));
+    assert.ok(!key.slice(RECLAIM_HOLD_PREFIX.length).includes("."), `${key} is more than one token`);
+    assert.match(key, /^[-/_=.A-Za-z0-9]+$/, `${key} is not a valid KV key`);
+    for (const filter of ["hands.*", "hands.>", "retained-*", "handles.>"]) {
+      assert.ok(!filterToRegExp(filter).test(key), `${filter} matches ${key}`);
+    }
   }
 });
