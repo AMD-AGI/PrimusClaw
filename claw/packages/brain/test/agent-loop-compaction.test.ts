@@ -45,7 +45,8 @@ function session(turns: Array<Partial<LlmTurnResult>>, completeImpl?: () => Prom
       const t = turns[i++];
       if (!t) throw new Error(`scripted session exhausted after ${i - 1} turns`);
       return {
-        content: t.content ?? [],
+        // Says something: an empty turn is nudged rather than ending the loop.
+        content: t.content ?? [{ type: "text", text: "ok" }],
         stopReason: t.stopReason ?? "end_turn",
         usage: t.usage ?? { input_tokens: 0, output_tokens: 0, cache_create: 0, cache_read: 0 },
         firstByteMs: 1,
