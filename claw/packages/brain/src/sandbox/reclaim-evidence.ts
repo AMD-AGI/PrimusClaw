@@ -22,8 +22,8 @@
  *   - no probe failed and no probe saw a positive count within
  *     `SANDBOX_RECLAIM_QUIET_MS`.
  *
- * A contrary reading -- a positive count, a failed probe, a different replaced
- * identity -- restarts the count. A workload the control plane itself reports
+ * A contrary reading -- a positive count (from the bound instance or a new
+ * one), a failed probe, a different replaced identity -- restarts the count. A workload the control plane itself reports
  * terminal or absent is not this: that answer is authoritative and is acted on
  * at once, and tracking_lost / jobs-unavailable never authorise a destroy.
  *
@@ -112,7 +112,11 @@ export function applyObservation(
   if (obs.kind === "failure") {
     return { ...base, lastProbeFailureAt: ctx.now, reclaimStreak: undefined };
   }
-  if (obs.kind === "count" && obs.count > 0) {
+  // Live user work is contrary evidence whichever instance reports it: a
+  // replaced reading with a positive count ends any streak exactly like a
+  // positive count from the bound instance, so the replacement branch never
+  // reclaims a sandbox whose processes are still running.
+  if ((obs.count ?? 0) > 0) {
     return { ...base, lastPositiveCountAt: ctx.now, reclaimStreak: undefined };
   }
   const reason: ReclaimReason = obs.kind === "replaced" ? "instance_replaced" : "idle_empty";

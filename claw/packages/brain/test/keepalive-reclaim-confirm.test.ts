@@ -318,6 +318,45 @@ test("a replaced instance confirmed on 3 sweeps, with no failure in the window, 
     "destroyed as a replacement, not as an empty roster");
 });
 
+test("a replaced instance reporting live processes on every sweep is never reclaimed", async (t) => {
+  // The instance that answers is new, but it is running the user's work: a
+  // positive count is contrary evidence whichever EnvD reports it.
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const k = sharedKv(entry(Date.now()));
+  roster = { kind: "ok", count: 250, instance: "envd-2" };
+
+  for (let i = 0; i < 4; i++) {
+    await sweep(replicaA, k.kv);
+    t.mock.timers.tick(SWEEP_MS);
+  }
+  assert.ok(!destroyed(k), `live processes on the new instance were reclaimed; stops=${JSON.stringify(stops)}`);
+  assert.equal(k.current()?.reclaimStreak, undefined, "a positive count does not build a replaced streak");
+  assert.equal(typeof k.current()?.lastPositiveCountAt, "number", "and opens the quiet window");
+
+  // The work then finishes on the new instance: the replaced readings count
+  // from zero and the quiet window after the last positive count still holds.
+  roster = { kind: "ok", count: 0, instance: "envd-2" };
+  for (let i = 0; i < 3; i++) {
+    await sweep(replicaA, k.kv);
+    t.mock.timers.tick(SWEEP_MS);
+  }
+  assert.ok(!destroyed(k), "inside the quiet window after the last positive count");
+  assert.equal(k.current()?.reclaimStreak?.reason, "instance_replaced");
+});
+
+test("replaced readings from different new instances do not add up", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const k = sharedKv(entry(Date.now()));
+
+  for (const instance of ["envd-2", "envd-3", "envd-2"]) {
+    roster = { kind: "ok", count: 0, instance };
+    await sweep(replicaA, k.kv);
+    t.mock.timers.tick(SWEEP_MS);
+  }
+  assert.ok(!destroyed(k), `three replaced readings about different instances destroyed it; stops=${JSON.stringify(stops)}`);
+  assert.equal(k.current()?.reclaimStreak?.count, 1, "each new identity starts its own run");
+});
+
 test("a workload the control plane reports terminal is still destroyed at once", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   // Even straight after a failed probe: the control plane's answer is authoritative.
