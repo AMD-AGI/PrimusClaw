@@ -39,6 +39,7 @@ export function bindClusterReclaimForTest(
 }
 
 import { metrics } from "../infra/metrics.js";
+import { drainKeys } from "../infra/kv-keys.js";
 import { checkHandsHealth } from "./hands-health.js";
 import { releaseHandlesForWorkload } from "./handles.js";
 import {
@@ -944,14 +945,36 @@ async function collectAbandonedPending(
  * endpoint, delete KV + Workload when unhealthy for too long. Complements
  * the in-task lazy revalidation for long-idle sessions.
  */
+let staleSweepInFlight = false;
+
 async function sweepStaleHands(): Promise<void> {
+  // One pass at a time. A pass health-checks every entry, each with its own
+  // timeout, so on a large fleet of unreachable sandboxes it can outlast the
+  // interval; a second pass running beside it would count each failure twice
+  // and reach the eviction threshold in half the passes it is set to.
+  if (staleSweepInFlight) {
+    logger.info("sweeper.pass_skipped_in_flight");
+    return;
+  }
+  staleSweepInFlight = true;
+  try {
+    await sweepStaleHandsPass();
+  } finally {
+    staleSweepInFlight = false;
+  }
+}
+
+async function sweepStaleHandsPass(): Promise<void> {
   const kv = getHandsKv();
   let scanned = 0;
   let evicted = 0;
   try {
-    const iter = await kv.keys("hands.*");
+    // Drained before any entry is read: the listing ends at the first key when
+    // the bucket is asked anything else while it is open (see drainKeys), and
+    // this walk reads each entry, so it used to sweep one sandbox per pass.
+    const keys = await drainKeys(await kv.keys("hands.*"));
     const now = new Date().toISOString();
-    for await (const key of iter) {
+    for (const key of keys) {
       scanned += 1;
       const sessionId = sessionIdFromHandsKey(key);
       let info: Record<string, unknown> = {};
@@ -1095,6 +1118,21 @@ async function sweepStaleHands(): Promise<void> {
       // contract as SANDBOX_KEEPALIVE_FAIL_LIMIT: MCP /health here is not a
       // destroy license unless an operator turns that on.
       if (SANDBOX_SWEEPER_EVICT_AFTER_FAILURES > 0 && fails >= SANDBOX_SWEEPER_EVICT_AFTER_FAILURES) {
+        // A failed health check is not evidence that nobody is using the
+        // sandbox: a container busy with the run's own work can miss it. A run
+        // holding its lease owns the sandbox and finds out about a dead one
+        // itself; the stop here is for sandboxes nobody is running in. The
+        // lease is read under the entry's scope (a DAG root or workspace gate),
+        // falling back to the session for entries written before runScope, and
+        // an unreadable lease is not a free one -- the same reads the pending
+        // branch above and the multi-node sweep below take before they stop.
+        const leaseScope = typeof info.runScope === "string" && info.runScope
+          ? info.runScope : sessionId;
+        const lease = await readRunLeaseState(kv, leaseScope);
+        if (lease !== "free") {
+          logger.info({ sessionId, leaseScope, lease, fails }, "sweeper.evict_skipped_run_in_flight");
+          continue;
+        }
         try {
           // Stop the identity whose health was checked. destroyHands performs
           // revision-CAS cleanup and leaves a newer sibling entry untouched.
@@ -1154,13 +1192,33 @@ export function eligibleForClusterReclaim(
  * needs to delete a workload lives there. A cluster whose entry has already
  * expired is left to the workload's own `timeout`.
  */
+let multiNodeSweepInFlight = false;
+
 async function sweepIdleMultiNodeClusters(): Promise<void> {
+  // One pass at a time: each session costs a control-plane listing, and a pass
+  // that outlasts the interval must not be joined by another walking the same
+  // sessions and issuing the same DELETEs beside it.
+  if (multiNodeSweepInFlight) {
+    logger.info("mn_sweeper.pass_skipped_in_flight");
+    return;
+  }
+  multiNodeSweepInFlight = true;
+  try {
+    await sweepIdleMultiNodeClustersPass();
+  } finally {
+    multiNodeSweepInFlight = false;
+  }
+}
+
+async function sweepIdleMultiNodeClustersPass(): Promise<void> {
   const kv = getHandsKv();
   let scanned = 0;
   let reclaimed = 0;
   try {
-    const iter = await kv.keys("hands.*");
-    for await (const key of iter) {
+    // Drained first, for the reason the health sweep gives: read inside the
+    // open listing, this walk reached only the bucket's first entry.
+    const keys = await drainKeys(await kv.keys("hands.*"));
+    for (const key of keys) {
       const sessionId = sessionIdFromHandsKey(key);
       let info: Record<string, unknown> = {};
       try {
