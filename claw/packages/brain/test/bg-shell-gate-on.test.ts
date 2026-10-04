@@ -80,7 +80,7 @@ test("the sandbox is launched with the same answer Brain gave the model", () => 
   assert.match(env, new RegExp(`BASH_MAX_TIMEOUT_SEC=${toolTimeoutCeilingSec("bash")}(\\s|$)`),
     "the tight ceiling belongs with the background shells that make it livable, "
       + "and is read from the one function every surface reads");
-  assert.match(env, /BASH_DEFAULT_TIMEOUT_SEC=120/);
+  assert.match(env, /BASH_DEFAULT_TIMEOUT_SEC=100/);
   assert.match(env, new RegExp(`WAIT_MAX_SEC=${toolTimeoutCeilingSec("wait")}(\\s|$)`),
     "Brain builds a wait's deadline from this, so the sandbox has to clamp waits "
       + "at the same number");
@@ -98,24 +98,24 @@ test("a call that outran the deadline is sent to the tool that can outlast it", 
   const text = explainHandsError(toolTimeout(), "bash");
   assert.match(text, /run_in_background=true/);
   assert.match(text, /wait/, "the half that makes a long job survivable");
-  assert.match(text, /180s deadline/, "the 120s ceiling plus transport slack");
+  assert.match(text, /160s deadline/, "the 100s ceiling plus transport slack");
   assert.doesNotMatch(text, /killed/,
     "abandoning the call cancels nothing in the sandbox, and a model told "
       + "otherwise re-runs a command that is still writing");
 });
 
-test("where the ceiling is 120s, the advice is not to raise the timeout", () => {
-  // Hands clamps the argument to 120s, and the bash schema says so. A message
+test("where the ceiling is 100s, the advice is not to raise the timeout", () => {
+  // Hands clamps the argument to 100s, and the bash schema says so. A message
   // offering an hour instead contradicted the schema the model was planning
   // against, and buying a longer block than the tool can use is how a -32001
   // from a sandbox that stopped answering became an hour-long hang.
   const asked = explainHandsError(toolTimeout(), "bash", { command: "train", timeout: 3600 });
-  assert.match(asked, /180s deadline/, "3600 was never granted, so it is not the deadline");
+  assert.match(asked, /160s deadline/, "3600 was never granted, so it is not the deadline");
   assert.match(asked, /unlikely to be the repair/);
   assert.doesNotMatch(asked, /does raise it/);
   assert.doesNotMatch(asked, /3600s/, "the hard cap is not this call's ceiling");
 
-  assert.equal(callDeadlineMs("bash", { command: "train", timeout: 3600 }), 180_000,
+  assert.equal(callDeadlineMs("bash", { command: "train", timeout: 3600 }), 160_000,
     "and the deadline the call is actually given is the one reported");
 });
 
@@ -123,8 +123,9 @@ test("with somewhere to put long work, the foreground ceiling is the tight one",
   const { BASH_FOREGROUND_MAX_SEC } = await import("../src/config.js");
   // F <= S < G: under the 300s graceful shutdown, so a run handed to another
   // replica has no command from the previous owner still writing. The literal
-  // is the subject: this is the raw setting, not a surface value.
-  assert.equal(BASH_FOREGROUND_MAX_SEC, 120);
+  // is the subject: this is the raw setting, not a surface value. Under 120s
+  // too, the response-header timeout of the Router's port proxy.
+  assert.equal(BASH_FOREGROUND_MAX_SEC, 100);
 });
 
 test("the whole built-in surface is pinned in the open state too", () => {
@@ -136,7 +137,7 @@ test("the background tool set is exactly the four names", () => {
 });
 
 test("the ceiling function's own answers are pinned with the switch on", () => {
-  assert.equal(toolTimeoutCeilingSec("bash"), 120);
+  assert.equal(toolTimeoutCeilingSec("bash"), 100);
   assert.equal(toolTimeoutCeilingSec("wait"), 100,
     "the wait ceiling does not follow the switch; only bash's configured "
       + "maximum does");
