@@ -734,9 +734,20 @@ test("an answer from the bound instance whose write lost a race still ends a rep
     assert.equal(k.current()?.reclaimStreak?.reason, "instance_replaced", "sanity: a replaced run");
     assert.equal(k.current()?.reclaimStreak?.count, 2, "sanity: one reading short of a destroy");
 
+    // The background verdict also carries the bound answer to the record; it
+    // is kept from landing here, so what is under test is the expiry path's
+    // own write and not the other writer covering for it.
+    let verdictsRefused = 0;
+    onRecordUpdate = (next) => {
+      if (next.bgCheckedAt !== k.current()?.bgCheckedAt) {
+        verdictsRefused += 1;
+        throw new Error("wrong last sequence");
+      }
+    };
     t.mock.timers.tick(SWEEP_MS);
     roster = { kind: "ok", count: 0 };
     await sweepWithRenewalUnderProbe(k);
+    onRecordUpdate = null;
     assert.notEqual(k.current()?.reclaimStreak?.reason, "instance_replaced",
       `the bound answer was lost to the renewal; record=${JSON.stringify(k.current())}`);
 
@@ -744,6 +755,7 @@ test("an answer from the bound instance whose write lost a race still ends a rep
     roster = { kind: "ok", count: 0, instance: "envd-2" };
     await sweep(replicaB, k.kv);
     assert.ok(!destroyed(k), `a replaced run the bound instance ended was completed; stops=${JSON.stringify(stops)}`);
+    assert.ok(verdictsRefused > 0, "sanity: the background verdict did not carry it");
   } finally {
     replicaB.resetBackgroundWorkStateForTest();
   }
