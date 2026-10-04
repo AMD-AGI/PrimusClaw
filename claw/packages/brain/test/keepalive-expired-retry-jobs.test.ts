@@ -9,6 +9,7 @@
  * that shape, so the destructive boundary has to read the jobs roster itself.
  */
 
+import "./reclaim-single-reading-env.js";
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { StringCodec, type KV } from "nats";

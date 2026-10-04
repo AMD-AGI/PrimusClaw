@@ -12,6 +12,7 @@
 // clear lost its race, or one a sibling wrote mid-turn -- then reads as an
 // expired handle while the session is actively running.
 
+import "./reclaim-single-reading-env.js";
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { StringCodec } from "nats";

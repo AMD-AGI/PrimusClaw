@@ -15,6 +15,7 @@
 // behaviour exactly, and a probe that cannot answer is not read as "no work has
 // ever been more true" but as the status quo.
 
+import "./reclaim-single-reading-env.js";
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { StringCodec } from "nats";

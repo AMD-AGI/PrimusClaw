@@ -894,6 +894,23 @@ if (env("SANDBOX_IDLE_REUSE_MS")) {
       + "SANDBOX_IDLE_REUSE_SECONDS and it is in seconds, not milliseconds",
   );
 }
+// Confirmation before the jobs probe may destroy a sandbox. An empty roster
+// ("idle: 0 user processes") or a changed EnvD/Pod identity must be observed on
+// this many consecutive sweeps -- persisted on the hands record, so it holds
+// across Brain replicas -- before idle reclaim acts on it. Any contrary
+// observation (a positive count, a failed probe) restarts the count. A blank or
+// invalid value takes the default; 1 restores single-observation reclaim.
+export const SANDBOX_RECLAIM_CONFIRM_SWEEPS = envInt(
+  "SANDBOX_RECLAIM_CONFIRM_SWEEPS", 3, { min: 1, max: 100 },
+);
+// Quiet window after a failed jobs probe (EOF, HTTP error, timeout, tracking
+// lost) or a positive process count, during which the jobs probe never
+// authorises a destroy. A data-path blip is followed by a roster that can read
+// empty or come from a restarted EnvD; this is how long that reading is
+// distrusted. 0 disables the window. Blank takes the default (300).
+export const SANDBOX_RECLAIM_QUIET_MS = envInt(
+  "SANDBOX_RECLAIM_QUIET_SECONDS", 300, { min: 0, max: 24 * 3600 },
+) * 1000;
 // Mirror of CHECKPOINT_TTL_MS; kept as a distinct symbol so call-sites that
 // attach to the BRAIN_CHECKPOINTS bucket read the bucket-scoped constant
 // (matches BRAIN_REGISTRY_TTL_MS naming).

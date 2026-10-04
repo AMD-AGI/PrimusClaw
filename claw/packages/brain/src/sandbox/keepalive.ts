@@ -21,7 +21,10 @@ import {
   SANDBOX_KEEPALIVE_FAIL_LIMIT,
   SANDBOX_IDLE_REUSE_MS,
   BRAIN_REGISTRY_TTL_MS,
+  SANDBOX_RECLAIM_CONFIRM_SWEEPS,
+  SANDBOX_RECLAIM_QUIET_MS,
 } from "../config.js";
+import { metrics } from "../infra/metrics.js";
 import { clearRetryPending, getRetryPending, isRetryPendingExpired } from "../tasks/retry-pending.js";
 import { isTombstone } from "../tasks/lock.js";
 import { destroyHands, handsStopCeilingMs } from "./reaper.js";
@@ -52,9 +55,14 @@ import {
   JOBS_PROBE_BUDGET_MS,
   SandboxJobsUnavailableError,
   SandboxTerminalProbeError,
+  SandboxInstanceReplacedError,
   SandboxTrackingLostError,
   type JobsProbeResult,
 } from "./job-probe.js";
+import {
+  applyObservation, reclaimDecision,
+  type JobsObservation, type ReclaimEvidenceFields, type ReclaimReason,
+} from "./reclaim-evidence.js";
 import { SandboxGoneError, SandboxRuntimeTerminalError } from "./errors.js";
 
 const logger = pino({ name: "sandbox-keepalive" });
@@ -82,7 +90,7 @@ export interface SandboxEntry {
  * `applyRunEndedIdleFields` in a third place, so the declaration lives with the
  * rules that interpret it (`@claw/protocol` sandbox/bg-verdict).
  */
-interface HandsKvEntry extends SharedVerdictFields {
+interface HandsKvEntry extends SharedVerdictFields, ReclaimEvidenceFields {
   status?: "pending" | "ready" | "reclaiming" | "closing";
   provider?: "safe-workload" | "agent-sandbox";
   workloadId?: string;
@@ -194,13 +202,23 @@ async function probeUserProcesses(
   sessionId: string,
   opts?: { persistIdentity?: boolean },
 ): Promise<number> {
+  return (await probeJobs(deps, info, sessionId, opts)).count;
+}
+
+/** The jobs probe with the identity it answered from, for reclaim evidence. */
+async function probeJobs(
+  deps: KeepaliveDeps,
+  info: HandsKvEntry,
+  sessionId: string,
+  opts?: { persistIdentity?: boolean },
+): Promise<JobsProbeResult> {
   const entry = { ...info, sessionId: info.sessionId || sessionId };
   if (deps.countActiveShells) {
     // The roster read is substituted; the control-plane check is not. A
     // workload reported absent or terminal is that regardless of who counts
     // its jobs, and the substitution must not turn it into an unknown.
     await assertSandboxRunning(entry);
-    return deps.countActiveShells(info.handsUrl ?? "", info.token ?? "", sessionId);
+    return { count: await deps.countActiveShells(info.handsUrl ?? "", info.token ?? "", sessionId) };
   }
   const result = await inspectSandboxJobs(entry);
   // Expiry CAS is conditioned on the enrollment revision. Persisting identity
@@ -208,7 +226,119 @@ async function probeUserProcesses(
   if (opts?.persistIdentity !== false) {
     await persistJobsIdentity(deps, sessionId, result);
   }
-  return result.count;
+  return result;
+}
+
+/**
+ * Readings of the jobs probe closer together than this are one sweep's worth of
+ * evidence: several replicas may each sweep a record inside one interval, and a
+ * background probe and the expiry probe can both land in the same sweep.
+ */
+const RECLAIM_OBSERVATION_SPACING_MS = Math.max(1, SANDBOX_KEEPALIVE_INTERVAL_SEC) * 1000 / 2;
+
+/** The record after one jobs-probe reading; see sandbox/reclaim-evidence.ts. */
+function observe(
+  deps: KeepaliveDeps, identity: string, info: HandsKvEntry, obs: JobsObservation,
+): HandsKvEntry {
+  return {
+    ...info,
+    ...applyObservation(info, obs, {
+      identity,
+      idleEpoch: info.idleEpoch,
+      now: (deps.now ?? Date.now)(),
+      spacingMs: RECLAIM_OBSERVATION_SPACING_MS,
+    }),
+  };
+}
+
+function replacedObservation(err: SandboxInstanceReplacedError): JobsObservation {
+  return {
+    kind: "replaced",
+    count: err.after.count,
+    podUidAfter: err.after.podUid,
+    instanceIdAfter: err.after.instanceId,
+  };
+}
+
+/** Everything a destroy (or a held destroy) was shown, for the warn log. */
+function reclaimEvidence(
+  sessionId: string,
+  info: HandsKvEntry,
+  branch: string,
+  probe?: { count?: number; podUid?: string; instanceId?: string },
+): Record<string, unknown> {
+  const streak = info.reclaimStreak;
+  return {
+    sessionId,
+    workloadId: info.workloadId,
+    sandboxName: info.sandboxName,
+    branch,
+    observedCount: probe?.count,
+    observedCounts: streak?.counts,
+    consecutive: streak?.count ?? 0,
+    requiredConsecutive: SANDBOX_RECLAIM_CONFIRM_SWEEPS,
+    streakFirstAt: streak?.firstAt,
+    podUidBefore: info.podUid,
+    podUidAfter: probe?.podUid ?? streak?.podUidAfter,
+    instanceIdBefore: info.envdInstanceId,
+    instanceIdAfter: probe?.instanceId ?? streak?.instanceIdAfter,
+    lastProbeFailureAt: info.lastProbeFailureAt,
+    lastPositiveCountAt: info.lastPositiveCountAt,
+  };
+}
+
+/**
+ * Whether the recorded evidence authorises a destroy for `reason`. When it
+ * does not, the reading is persisted under `revision` (which also renews the
+ * record's TTL) and the hold is logged; the caller then keeps the sandbox.
+ */
+async function confirmReclaim(
+  deps: KeepaliveDeps,
+  key: string,
+  revision: number,
+  sessionId: string,
+  identity: string,
+  info: HandsKvEntry,
+  reason: ReclaimReason,
+  probe?: { count?: number; podUid?: string; instanceId?: string },
+): Promise<boolean> {
+  const decision = reclaimDecision(
+    info, reason,
+    { identity, idleEpoch: info.idleEpoch, now: (deps.now ?? Date.now)() },
+    { sweeps: SANDBOX_RECLAIM_CONFIRM_SWEEPS, quietMs: SANDBOX_RECLAIM_QUIET_MS },
+  );
+  if (decision.allowed) return true;
+  metrics.onKeepaliveReclaimHeld(reason, decision.hold);
+  logger.info(
+    { ...reclaimEvidence(sessionId, info, reason, probe), hold: decision.hold },
+    "keepalive.reclaim_held",
+  );
+  await deps.kv.update(key, sc.encode(JSON.stringify(info)), revision).catch(() => {});
+  return false;
+}
+
+/**
+ * Record one reading on the current record, re-read under CAS. Used where no
+ * enrollment revision is being held for a claim (the background probe).
+ * Returns the record as written, or null when it could not be.
+ */
+async function recordObservation(
+  deps: KeepaliveDeps, key: string, identity: string, obs: JobsObservation,
+): Promise<{ info: HandsKvEntry; revision: number } | null> {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const e = await deps.kv.get(key);
+      if (!e || isTombstone(e)) return null;
+      const current = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
+      if (entryIdentity(current) !== identity || isClosingStatus(current.status)) return null;
+      const next = observe(deps, identity, current, obs);
+      const revision = await deps.kv.update(key, sc.encode(JSON.stringify(next)), e.revision);
+      return { info: next, revision };
+    } catch {
+      // Re-read: the revision moved.
+    }
+  }
+  return null;
 }
 
 function isClosingStatus(status: HandsKvEntry["status"]): boolean {
@@ -1077,18 +1207,26 @@ async function confirmExpiredRetryStop(
     return false;
   }
   const claimRevision = enrollmentNow.revision;
+  let probed: JobsProbeResult;
   try {
-    const running = await probeUserProcesses(deps, infoNow, sessionId, {
+    probed = await probeJobs(deps, infoNow, sessionId, {
       persistIdentity: false,
     });
+    const running = probed.count;
     if (running > 0) {
       logger.info(
         { sessionId, workloadId: infoNow.workloadId, running },
         "keepalive.retry_pending_stop_deferred_jobs_busy",
       );
+      const next = observe(deps, identity, infoNow, { kind: "count", count: running });
+      await deps.kv.update(recordKey, sc.encode(JSON.stringify(next)), claimRevision).catch(() => {});
       return false;
     }
   } catch (err) {
+    if (!(err instanceof SandboxTerminalProbeError) && !(err instanceof SandboxInstanceReplacedError)) {
+      // A failed read ends any destroy streak and opens the quiet window.
+      await recordFailedProbe(deps, recordKey, identity, infoNow, claimRevision);
+    }
     // Unavailable / tracking_lost / soft control-plane faults never authorise
     // a stop. Terminal/absent are conclusions about the workload, not a zero
     // roster, and this path is only for reclaiming an orphaned READY handle.
@@ -1141,11 +1279,26 @@ async function confirmExpiredRetryStop(
   } catch {
     return false;
   }
-  return claimIdleStop(
+  // Same confirmation as idle expiry: one empty roster does not stop a sandbox.
+  claimedInfo = observe(deps, identity, claimedInfo, { kind: "count", count: 0 });
+  if (!(await confirmReclaim(
+    deps, recordKey, claimRevision, sessionId, identity, claimedInfo, "idle_empty", probed,
+  ))) {
+    return false;
+  }
+  const claimedStop = await claimIdleStop(
     deps, recordKey, identity, sessionId, claimedInfo, claimRevision, enrollmentNow,
     undefined,
     { collectingIdentity: identity, expected },
   );
+  if (claimedStop) {
+    logger.warn(
+      reclaimEvidence(sessionId, claimedInfo, "idle_empty_retry_pending", probed),
+      "keepalive.reclaim_destroy",
+    );
+    metrics.onKeepaliveReclaim("idle_empty");
+  }
+  return claimedStop;
 }
 
 /** Register a sandbox for keepalive pinging. Called by ensureHands. */
@@ -2104,17 +2257,38 @@ async function runBackgroundProbe(deps: KeepaliveDeps, probe: BackgroundProbe): 
         } else {
           await reportTerminalFailure(deps, sessionId, identity, err.reason);
         }
+      } else if (err instanceof SandboxInstanceReplacedError) {
+        // One answer from a new identity is not a replacement: an EnvD that
+        // restarted beside a data-path blip answers this way with the user's
+        // work still running. Act only on a confirmed run of them.
+        const recorded = await recordObservation(deps, key, identity, replacedObservation(err));
+        if (!recorded) return;
+        const probeFacts = { count: err.after.count, podUid: err.after.podUid, instanceId: err.after.instanceId };
+        if (await confirmReclaim(
+          deps, key, recorded.revision, sessionId, identity, recorded.info,
+          "instance_replaced", probeFacts,
+        )) {
+          logger.warn(
+            reclaimEvidence(sessionId, recorded.info, "instance_replaced", probeFacts),
+            "keepalive.reclaim_destroy",
+          );
+          metrics.onKeepaliveReclaim("instance_replaced");
+          await reportTerminalFailure(deps, sessionId, identity, err.reason);
+        }
       } else if (err instanceof SandboxRuntimeTerminalError) {
         await reportTerminalFailure(deps, sessionId, identity, err.reason);
       } else if (err instanceof SandboxTrackingLostError) {
         logger.error({ sessionId, workloadId: info.workloadId }, "keepalive.jobs_tracking_lost");
+        await recordObservation(deps, key, identity, { kind: "failure" });
       } else if (err instanceof SandboxJobsUnavailableError) {
         logger.info(
           { sessionId, workloadId: info.workloadId, status: err.httpStatus },
           "keepalive.jobs_api_absent",
         );
+        await recordObservation(deps, key, identity, { kind: "failure" });
       } else {
         reportUnknownProbe(probe, err);
+        await recordObservation(deps, key, identity, { kind: "failure" });
       }
     }
   } catch (err) {
@@ -2292,8 +2466,15 @@ async function persistVerdict(
       // existing anchor; if work cleared it while the shared verdict stayed
       // idle, stamp a new one so the clock cannot stick open forever.
       const quiescedAt = (deps.now ?? Date.now)();
+      // A positive count is contrary evidence to any destroy streak and opens
+      // the quiet window; an answer from the bound instance ends a replaced
+      // streak. See sandbox/reclaim-evidence.ts.
+      const evidence: ReclaimEvidenceFields = running > 0
+        ? { lastPositiveCountAt: quiescedAt, reclaimStreak: undefined }
+        : info.reclaimStreak?.reason === "instance_replaced" ? { reclaimStreak: undefined } : {};
       const next = sc.encode(JSON.stringify({
         ...info,
+        ...evidence,
         ...(running === 0
           ? { quiescedAt: info.quiescedAt ?? quiescedAt }
           : { quiescedAt: undefined }),
@@ -2735,10 +2916,12 @@ async function expireIdleTarget(
       await deps.kv.update(key, e.value, e.revision).catch(() => {});
       return;
     }
-    const running = await probeUserProcesses(deps, info, sessionId, {
+    const probed = await probeJobs(deps, info, sessionId, {
       persistIdentity: false,
     });
+    const running = probed.count;
     if (running > 0) {
+      info = observe(deps, identity, info, { kind: "count", count: running });
       await refreshIdleSince(deps, key, claimRevision, info);
       return;
     }
@@ -2752,6 +2935,14 @@ async function expireIdleTarget(
     } catch {
       return;
     }
+    // One empty roster is not enough: it has to agree with the sweeps before
+    // it, with no failed probe or positive count inside the quiet window.
+    info = observe(deps, identity, info, { kind: "count", count: 0 });
+    if (!(await confirmReclaim(
+      deps, key, claimRevision, sessionId, identity, info, "idle_empty", probed,
+    ))) {
+      return;
+    }
     // Re-check lease/local registry after the (bounded) jobs probe: a turn that
     // started during the probe must win over this reclaim.
     if (!(await claimIdleStop(
@@ -2760,6 +2951,8 @@ async function expireIdleTarget(
       return;
     }
     claimed = true;
+    logger.warn(reclaimEvidence(sessionId, info, "idle_empty", probed), "keepalive.reclaim_destroy");
+    metrics.onKeepaliveReclaim("idle_empty");
     await destroyHands(sessionId, info);
     stats.expired += 1;
     logger.info(
@@ -2768,6 +2961,7 @@ async function expireIdleTarget(
     );
   } catch (err) {
     if (err instanceof SandboxTerminalProbeError) {
+      // The control plane's own answer: authoritative, acted on at once.
       if (err.state === "absent") {
         if (!(await claimIdleStop(
           deps, key, identity, sessionId, info, claimRevision, e, undefined, claimOpts,
@@ -2775,6 +2969,11 @@ async function expireIdleTarget(
           return;
         }
         claimed = true;
+        logger.warn(
+          { ...reclaimEvidence(sessionId, info, "absent"), reason: err.reason },
+          "keepalive.reclaim_destroy",
+        );
+        metrics.onKeepaliveReclaim("absent");
         await destroyHands(sessionId, info).catch((stopErr) => {
           logger.warn({ err: stopErr, sessionId }, "keepalive.absent_stop_retry");
         });
@@ -2792,31 +2991,56 @@ async function expireIdleTarget(
           return;
         }
         claimed = true;
+        logger.warn(
+          { ...reclaimEvidence(sessionId, info, "terminal"), reason: err.reason },
+          "keepalive.reclaim_destroy",
+        );
+        metrics.onKeepaliveReclaim("terminal");
         await destroyHands(sessionId, info).catch((stopErr) => {
           logger.warn({ err: stopErr, sessionId }, "keepalive.terminal_stop_retry");
         });
       }
     } else if (err instanceof SandboxRuntimeTerminalError) {
+      let branch: "instance_replaced" | "terminal" = "terminal";
+      let probeFacts: { count?: number; podUid?: string; instanceId?: string } | undefined;
+      if (err instanceof SandboxInstanceReplacedError) {
+        // A new EnvD/Pod identity, read once, is held like an empty roster:
+        // neither provider's status read names a Pod UID or EnvD instance, so
+        // nothing on the platform side can confirm it short of terminal/absent.
+        branch = "instance_replaced";
+        probeFacts = { count: err.after.count, podUid: err.after.podUid, instanceId: err.after.instanceId };
+        info = observe(deps, identity, info, replacedObservation(err));
+        if (!(await confirmReclaim(
+          deps, key, claimRevision, sessionId, identity, info, "instance_replaced", probeFacts,
+        ))) {
+          return;
+        }
+      }
       if (!(await claimIdleStop(
         deps, key, identity, sessionId, info, claimRevision, e, err.reason, claimOpts,
       ))) {
         return;
       }
       claimed = true;
+      logger.warn(
+        { ...reclaimEvidence(sessionId, info, branch, probeFacts), reason: err.reason },
+        "keepalive.reclaim_destroy",
+      );
+      metrics.onKeepaliveReclaim(branch);
       await destroyHands(sessionId, info).catch((stopErr) => {
         logger.warn({ err: stopErr, sessionId }, "keepalive.terminal_stop_retry");
       });
     } else if (err instanceof SandboxTrackingLostError) {
       // Tracking loss means jobs cannot prove idle; hard timeout is the backstop.
       logger.error({ sessionId, workloadId: info.workloadId }, "keepalive.idle_reclaim_tracking_lost");
-      if (!claimed) await deps.kv.update(key, e.value, e.revision).catch(() => {});
+      if (!claimed) await recordFailedProbe(deps, key, identity, info, e.revision);
     } else if (err instanceof SandboxJobsUnavailableError) {
       // No readable jobs roster: never treat as idle-empty.
       logger.info(
         { sessionId, workloadId: info.workloadId, status: err.httpStatus },
         "keepalive.idle_reclaim_jobs_unavailable",
       );
-      if (!claimed) await deps.kv.update(key, e.value, e.revision).catch(() => {});
+      if (!claimed) await recordFailedProbe(deps, key, identity, info, e.revision);
     } else if (isRevisionConflict(err)) {
       logger.info({ sessionId, identity }, "keepalive.idle_reclaim_superseded");
     } else {
@@ -2824,9 +3048,20 @@ async function expireIdleTarget(
         { err, sessionId, workloadId: info.workloadId },
         "keepalive.idle_reclaim_deferred",
       );
-      if (!claimed) await deps.kv.update(key, e.value, e.revision).catch(() => {});
+      if (!claimed) await recordFailedProbe(deps, key, identity, info, e.revision);
     }
   }
+}
+
+/**
+ * Renew the record under the enrollment revision with a failed probe recorded,
+ * which ends any destroy streak and opens the quiet window.
+ */
+async function recordFailedProbe(
+  deps: KeepaliveDeps, key: string, identity: string, info: HandsKvEntry, revision: number,
+): Promise<void> {
+  const next = observe(deps, identity, info, { kind: "failure" });
+  await deps.kv.update(key, sc.encode(JSON.stringify(next)), revision).catch(() => {});
 }
 
 /**
