@@ -7,7 +7,7 @@ SPDX-License-Identifier: MIT
 
 `features.backgroundShell` turns on `bash(run_in_background=true)`, `bash_output`,
 `kill_shell` and `wait`, and with them tightens the foreground `bash` ceiling from
-ten hours (held under the MCP transport cap at 3540s) to 120s. Both halves ship
+ten hours (held under the MCP transport cap at 3540s) to 100s. Both halves ship
 **off**. This guide is the procedure for turning them on for one deployment, the
 readings that say whether it worked, and the way back.
 

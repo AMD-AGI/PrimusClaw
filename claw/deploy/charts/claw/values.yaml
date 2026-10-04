@@ -616,14 +616,19 @@ features:
   # part of the work.
   #
   # It also decides the foreground bash ceiling, because a short ceiling is only
-  # reasonable where long work has somewhere else to go. On, the ceiling is 120s
+  # reasonable where long work has somewhere else to go. On, the ceiling is 100s
   # and every foreground command has ended well inside the 300s
   # brain.terminationGracePeriodSeconds, which is what makes a rolling update
   # safe to hand a run over during. Off, it is ten hours held down to 3540s by
   # the MCP cap -- an order of magnitude past that grace, so a restart can leave
   # the outgoing replica still running a command the incoming one has taken
   # over. Pin brain.bashMaxTimeoutSec if you need the short ceiling without the
-  # background tools.
+  # background tools. Where Brain reaches Hands through the sandbox Router
+  # (SANDBOX_HANDS_VIA_ROUTER) the ceiling is 100s either way: one foreground
+  # command is one request, and the Router's port proxy cuts any request whose
+  # reply has not started within 120s, so a longer ceiling there only turns a
+  # timeout into a 502. Keep any pin under every response-header timeout
+  # between Brain and Hands.
   backgroundShell: false
   # Capacity data the keepalive sweep is proven against, required whenever
   # backgroundShell is true and refused when absent -- a deferral bound stated

@@ -58,7 +58,10 @@ interface CallerContext {
    * answer was written: Brain gave up, or a proxy between the two cut the
    * request. A tool that consumes something on the way out -- `wait` reading
    * a background shell's output advances its read offset -- checks it so that
-   * an answer nobody can receive does not use up what it would have carried.
+   * an answer nobody can receive does not use up what it would have carried,
+   * and a tool whose work only exists to produce that answer -- a foreground
+   * command -- checks it so that nothing keeps running for a reply nobody can
+   * receive.
    */
   signal?: AbortSignal;
 }
