@@ -750,6 +750,11 @@ test("an answer from the bound instance whose write lost a race still ends a rep
     onRecordUpdate = null;
     assert.notEqual(k.current()?.reclaimStreak?.reason, "instance_replaced",
       `the bound answer was lost to the renewal; record=${JSON.stringify(k.current())}`);
+    // Re-applied to a record that moved under the probe, the reading only
+    // holds: it ends the run there but starts none, since that record may be
+    // in an idle period the reading was not about.
+    assert.equal(k.current()?.reclaimStreak, undefined,
+      `a reading re-applied after a lost CAS started a streak; record=${JSON.stringify(k.current())}`);
 
     t.mock.timers.tick(SWEEP_MS);
     roster = { kind: "ok", count: 0, instance: "envd-2" };
