@@ -148,9 +148,12 @@ const EMPTY_TURN_NUDGE = `${RESUME_NOTICE_PREFIX} Your last reply was empty: no 
  * a different answer.
  */
 export class EmptyAgentTurnError extends Error {
-  constructor() {
-    super("The model ended its turn without any text or tool call twice in a row, "
-      + "and the task produced no output.");
+  constructor(lastTurn = false) {
+    super(lastTurn
+      ? "The model ended its last allowed turn without any text or tool call, "
+        + "and the task produced no output."
+      : "The model ended its turn without any text or tool call twice in a row, "
+        + "and the task produced no output.");
     this.name = "EmptyAgentTurnError";
   }
 }
@@ -1459,6 +1462,19 @@ class AgentLoopRunner {
     );
     if (!toolUses.length && !saidSomething) {
       // Nothing to show and nothing to run: not a report, so not an ending.
+      // A run that never said a word is not a success, and the top level is
+      // where that becomes the task's outcome. A sub-agent's empty answer goes
+      // back to the agent that asked, which can judge it; a run that reported
+      // something before keeps ending the way it always did.
+      const failsWhenSilent = this.depth === 0 && !this.textParts.some((t) => t.trim() !== "");
+      // The nudge is only an answer if the model is asked again. On the last
+      // allowed turn it never is: the loop would end on the cap with the same
+      // empty result the nudge exists to prevent.
+      const lastTurn = this.maxTurns > 0 && turn + 1 >= this.maxTurns + this.initialTurn;
+      if (lastTurn && failsWhenSilent) {
+        logger.warn({ turn, sessionId: this.sessionId, stopReason }, "agent-loop.empty_turn_failed");
+        throw new EmptyAgentTurnError(true);
+      }
       if (!this.emptyTurnNudged) {
         this.emptyTurnNudged = true;
         logger.warn({ turn, sessionId: this.sessionId, stopReason, depth: this.depth }, "agent-loop.empty_turn_nudge");
@@ -1467,11 +1483,8 @@ class AgentLoopRunner {
         this.workingMessages.push({ role: "user", content: EMPTY_TURN_NUDGE });
         return false;
       }
-      // Silent again. A run that has reported something before keeps ending the
-      // way it always did; one that never said a word is not a success, and the
-      // top level is where that becomes the task's outcome. A sub-agent's empty
-      // answer goes back to the agent that asked, which can judge it.
-      if (this.depth === 0 && !this.textParts.some((t) => t.trim() !== "")) {
+      // Silent again.
+      if (failsWhenSilent) {
         logger.warn({ turn, sessionId: this.sessionId, stopReason }, "agent-loop.empty_turn_failed");
         throw new EmptyAgentTurnError();
       }

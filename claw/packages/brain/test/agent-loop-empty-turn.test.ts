@@ -117,3 +117,47 @@ test("the nudge is re-armed by a turn that did something", async () => {
   assert.equal(nudges.length, 2, "the second silence was nudged too");
   assert.equal(result.finalText, "finished");
 });
+
+test("an empty turn on the only allowed turn fails rather than ending on the cap", async () => {
+  // The nudge is only an answer if the model is asked again. With maxTurns 1
+  // it never is, and the loop used to return an empty result the runner then
+  // reported as a success.
+  const { session, sent } = scripted([empty]);
+  const events: Array<Record<string, unknown>> = [];
+  await assert.rejects(
+    agentLoop(prompt, [] as ToolSchema[], { ...options(session, events), maxTurns: 1 }),
+    (err: unknown) => err instanceof EmptyAgentTurnError && /last allowed turn/.test(err.message),
+  );
+  assert.equal(sent.length, 1);
+  assert.equal(events.filter((e) => e.type === "ResultMessage").length, 0);
+});
+
+test("an empty turn on the last of several allowed turns fails rather than ending on the cap", async () => {
+  const tool = { content: [{ type: "tool_use", id: "t1", name: "bash", input: { command: "true" } }],
+    stopReason: "tool_use" };
+  const { session, sent } = scripted([tool, { ...tool, content: [{ ...tool.content[0], id: "t2" }] }, empty]);
+  const events: Array<Record<string, unknown>> = [];
+  await assert.rejects(
+    agentLoop(prompt, [] as ToolSchema[], { ...options(session, events), maxTurns: 3 }),
+    (err: unknown) => err instanceof EmptyAgentTurnError,
+  );
+  assert.equal(sent.length, 3);
+  assert.equal(events.filter((e) => e.type === "ResultMessage").length, 0);
+});
+
+test("an empty last turn after a report, or in a sub-agent, still ends normally", async () => {
+  const reported = scripted([
+    { content: [{ type: "text", text: "report: all green" },
+      { type: "tool_use", id: "t1", name: "bash", input: { command: "true" } }], stopReason: "tool_use" },
+    empty,
+  ]);
+  const events: Array<Record<string, unknown>> = [];
+  const result = await agentLoop(prompt, [] as ToolSchema[],
+    { ...options(reported.session, events), maxTurns: 2 });
+  assert.equal(result.finalText, "report: all green");
+
+  const sub = scripted([empty]);
+  const subResult = await agentLoop(prompt, [] as ToolSchema[],
+    { ...options(sub.session, [], 1), maxTurns: 1 });
+  assert.equal(subResult.finalText, "");
+});
