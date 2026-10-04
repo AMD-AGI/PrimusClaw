@@ -196,7 +196,19 @@ export async function putReclaimHold(kv: Pick<KV, "get" | "put">, note: ReclaimH
   }
 }
 
-/** Remove the hold key once the sandbox it is about is gone. */
-export async function deleteReclaimHold(kv: Pick<KV, "delete">, identity: string): Promise<void> {
-  await kv.delete(reclaimHoldKey(identity));
+/**
+ * Remove the hold key once the sandbox it is about is gone. Only where there is
+ * a hold of this identity: a delete of an absent key still writes a marker to
+ * the bucket, and most sandboxes are destroyed without ever having held. A
+ * value that is not one is left to the bucket's max age.
+ */
+export async function deleteReclaimHold(kv: Pick<KV, "get" | "delete">, identity: string): Promise<void> {
+  let held: ReclaimHold | null;
+  try {
+    held = await readReclaimHold(kv, identity);
+  } catch (err) {
+    if (err instanceof MalformedReclaimHoldError) return;
+    throw err;
+  }
+  if (held) await kv.delete(reclaimHoldKey(identity));
 }
