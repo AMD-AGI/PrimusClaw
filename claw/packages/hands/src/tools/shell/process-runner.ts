@@ -53,6 +53,18 @@ export interface ManagedShell {
    * dressed as a check.
    */
   groupToken?: string;
+  /**
+   * When the leader exited while the rest of its group went on running.
+   *
+   * Set only on that path: the shell stays `running` because the group is
+   * what "running" means, but the command the caller asked for has finished,
+   * and `exitCode`/`signal` already hold its outcome. An install script that
+   * ends by starting daemons (`ray start`, `nohup server &`) looks exactly like
+   * this, and a caller shown only `running` never learns its command returned.
+   * Absent where nobody saw the leader go -- a stand-in rebuilt from a record
+   * after a restart -- which is "not known", not "still running".
+   */
+  leaderExitedAt?: number;
 }
 
 export interface ManagedShellResult {
@@ -64,6 +76,8 @@ export interface ManagedShellResult {
   timedOut: boolean;
   stdoutTruncated: boolean;
   stderrTruncated: boolean;
+  /** Stopped because the request waiting for it went away, not by its timeout. */
+  abandoned: boolean;
 }
 
 interface SpawnManagedShellOptions {
@@ -83,6 +97,14 @@ interface RunForegroundOptions {
   forceResolveMs?: number;
   owner: string;
   run: string;
+  /**
+   * The request this command answers. When it is aborted the command is
+   * stopped the way a timeout stops it: nothing else holds a handle on a
+   * foreground command, so one left running after its caller went away would
+   * go on writing to the workspace with no way to read, wait on or kill it --
+   * and the agent, told the call failed, will usually run it again beside it.
+   */
+  signal?: AbortSignal;
 }
 
 /** Write a compact structured lifecycle log to stdout. */
@@ -201,6 +223,7 @@ export function spawnManagedShell(command: string, options: SpawnManagedShellOpt
     shell.exitCode = code;
     shell.signal = signal;
     if (!groupLives) shell.endedAt = Date.now();
+    else shell.leaderExitedAt = Date.now();
     // Foreground exit/error logs are emitted by runForegroundShell.finish so
     // each shell shows exactly one terminal event in the log stream.
     if (shell.kind !== "foreground") {
@@ -234,6 +257,7 @@ export async function runForegroundShell(
     run: options.run,
   });
   const terminateGraceMs = options.terminateGraceMs ?? 5_000;
+  let abandoned = false;
   const forceResolveMs = options.forceResolveMs ?? 10_000;
 
   return await new Promise<ManagedShellResult>((resolve) => {
@@ -296,8 +320,31 @@ export async function runForegroundShell(
         timedOut: shell.timedOut,
         stdoutTruncated: shell.stdoutDroppedBytes > 0,
         stderrTruncated: shell.stderrDroppedBytes > 0,
+        abandoned,
       });
+      options.signal?.removeEventListener("abort", onAbort);
     };
+
+    // The same escalation the timeout uses: the group, then SIGKILL after the
+    // grace, then resolve regardless.
+    const stop = () => {
+      terminateManagedProcess(shell, "SIGTERM");
+      sigkillTimer = setTimeout(() => terminateManagedProcess(shell, "SIGKILL"), terminateGraceMs);
+      forceTimer = setTimeout(() => {
+        shell.process.stdout?.destroy();
+        shell.process.stderr?.destroy();
+        finish(124, "SIGKILL");
+      }, forceResolveMs);
+    };
+
+    function onAbort() {
+      if (finished || abandoned || shell.timedOut) return;
+      abandoned = true;
+      shell.status = "killed";
+      if (killTimer) clearTimeout(killTimer);
+      logShellEvent("shell.foreground.abandoned", shell);
+      stop();
+    }
 
     shell.process.on("close", (code, signal) =>
       finish(code ?? (shell.timedOut ? 124 : 1), signal, true));
@@ -307,15 +354,11 @@ export async function runForegroundShell(
       killTimer = setTimeout(() => {
         shell.timedOut = true;
         shell.status = "timed_out";
-        terminateManagedProcess(shell, "SIGTERM");
-        sigkillTimer = setTimeout(() => terminateManagedProcess(shell, "SIGKILL"), terminateGraceMs);
-        forceTimer = setTimeout(() => {
-          shell.process.stdout?.destroy();
-          shell.process.stderr?.destroy();
-          finish(124, "SIGKILL");
-        }, forceResolveMs);
+        stop();
       }, options.timeoutMs);
     }
+    if (options.signal?.aborted) onAbort();
+    else options.signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 

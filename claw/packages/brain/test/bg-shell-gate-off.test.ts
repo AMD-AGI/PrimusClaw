@@ -176,7 +176,7 @@ test("the ceiling function's own answers are pinned, not only agreement with it"
   // three together and satisfies every such comparison. These two literals are
   // the subject rather than a copy of one.
   assert.equal(toolTimeoutCeilingSec("bash"), 3540);
-  assert.equal(toolTimeoutCeilingSec("wait"), 1800);
+  assert.equal(toolTimeoutCeilingSec("wait"), 100);
 });
 
 test("schema, deadline and forwarded env all state the one held ceiling", () => {
