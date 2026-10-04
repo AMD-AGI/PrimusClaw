@@ -504,6 +504,48 @@ test("a lost CAS on the idle markers retries instead of failing the turn", async
     "the markers still have to come off, or the ticker collects the sandbox");
 });
 
+test("a reactivation that loses the CAS twice still clears the destroy streak", async () => {
+  // The re-read used to be retried once. Two heartbeats landing during the
+  // health check left the markers -- and the idle period's destroy streak --
+  // on a handle a turn had taken back.
+  stubEffects();
+  stubHealth("ok");
+  const streak = { reason: "idle_empty", identity: "wl-1", count: 2, firstAt: 1, lastAt: 2, counts: [0, 0] };
+  const idle = {
+    ...LIVE, specFingerprint: specOf(), keepalive: false, idleSince: "2026-01-01T00:00:00Z",
+    reclaimStreak: streak,
+  };
+  const enc = new TextEncoder();
+  const puts: string[] = [];
+  let revision = 7;
+  let losses = 0;
+  const kv = {
+    async get(key: string) {
+      if (!key.startsWith("hands.")) return null;
+      return { key, value: enc.encode(JSON.stringify(idle)), revision };
+    },
+    async update(_key: string, value: Uint8Array, expected: number) {
+      if (expected !== revision) throw new Error(`wrong last sequence: ${expected}`);
+      if (losses < 2) {
+        // A heartbeat lands between every read and its write, twice.
+        losses += 1;
+        revision += 1;
+        throw new Error(`wrong last sequence: ${expected}`);
+      }
+      puts.push(new TextDecoder().decode(value));
+      return ++revision;
+    },
+    async put() { return 1; },
+  };
+  const { a } = attempt(idle, { kv: kv as unknown as KV });
+  assert.ok(await tryReuseSessionSandbox(a));
+  assert.equal(losses, 2, "sanity: two writes lost");
+  assert.equal(puts.length, 1, `the markers never came off: ${JSON.stringify(puts)}`);
+  const written = JSON.parse(puts[0]!);
+  assert.ok(!("reclaimStreak" in written) && !written.keepalive && written.idleSince == null,
+    `a reactivated handle kept its idle period's markers: ${puts[0]}`);
+});
+
 test("a lost CAS whose key now names another sandbox reuses without overwriting it", async () => {
   // A DAG sibling took the shared session key. Our own sandbox passed its own
   // health check under its own identity, so reuse is still right -- but the

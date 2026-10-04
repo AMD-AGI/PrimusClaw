@@ -103,3 +103,22 @@ test("a replaced reading with no processes still counts toward confirmation", ()
     { allowed: true },
   );
 });
+
+test("a reading never pulls a later failure or positive-count time back", () => {
+  // A replica whose clock runs behind writes an earlier time than the record
+  // already holds; the quiet window it would shut is the one that holds.
+  const prev: ReclaimEvidenceFields = {
+    lastProbeFailureAt: T0 + 120_000,
+    lastPositiveCountAt: T0 + 120_000,
+    reclaimStreak: streak({}),
+  };
+  const ctx = { identity: "id-1", idleEpoch: 1, now: T0 + SWEEP, spacingMs: SPACING };
+  const failed = applyObservation(prev, { kind: "failure" }, ctx);
+  assert.equal(failed.lastProbeFailureAt, T0 + 120_000, "the later failure stands");
+  assert.equal(failed.reclaimStreak, undefined, "and the run still ends");
+  const busy = applyObservation(prev, { kind: "count", count: 5 }, ctx);
+  assert.equal(busy.lastPositiveCountAt, T0 + 120_000, "the later positive count stands");
+  assert.equal(busy.reclaimStreak, undefined);
+  const fresh = applyObservation({}, { kind: "failure" }, ctx);
+  assert.equal(fresh.lastProbeFailureAt, T0 + SWEEP, "sanity: a first failure is this reading's time");
+});
