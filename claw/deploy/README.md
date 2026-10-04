@@ -255,6 +255,27 @@ the `monitoring.coreos.com` CRDs may not be installed; enabling it without them 
 apply fail, which is deliberate — rendering nothing when scraping was explicitly asked
 for is the failure this setting exists to prevent.
 
+On a VictoriaMetrics cluster a ServiceMonitor or VMServiceScrape can be accepted and
+never scraped: with no `monitoring.coreos.com` CRDs the first is refused, and a
+namespace-scoped operator (`WATCH_NAMESPACE`) or a VMAgent whose
+`serviceScrapeNamespaceSelector` leaves the release namespace out leaves the job with no
+targets — moving a VMServiceScrape into the monitoring namespace does not help, because a
+namespace-scoped operator rewrites its discovery to its own namespace and ignores
+`namespaceSelector`. Use VMScrapeConfigs instead, placed where the VMAgent looks; their
+raw Kubernetes service discovery is passed through as written:
+
+```yaml
+vmScrapeConfig:
+  enabled: true
+  namespace: monitoring   # a namespace your VMAgent selects; empty = release namespace
+```
+
+That creates one VMScrapeConfig per component in `monitoring`, named
+`<release-namespace>-primus-claw-{api,brain}`, discovering the `http` endpoints of the
+release namespace's Services. Targets get `job` and `service` set to the Service name,
+as a VMServiceScrape would. It is mutually exclusive with `serviceMonitor.enabled` —
+both would scrape the same targets — and the chart refuses the combination.
+
 Two things bite when installing the dashboard outside `helm install`:
 
 - **`kubectl apply` cannot take it.** The JSON is ~250KB, and `kubectl apply` stores the
@@ -338,6 +359,7 @@ Requires `boto3` (`pip install boto3`). See `deploy/minio-lifecycle.py` for user
 | `minio-lifecycle.py` | S3 bucket lifecycle rules script (boto3) |
 | `charts/claw/dashboards/claw-brain.json` | Grafana dashboard for the Brain metrics (installed by the chart when `grafanaDashboard.enabled`, or imported by hand) |
 | `charts/claw/templates/servicemonitor.yaml` | Prometheus Operator ServiceMonitors for API and Brain (`serviceMonitor.enabled`) |
+| `charts/claw/templates/vmscrapeconfig.yaml` | VictoriaMetrics VMScrapeConfigs for API and Brain (`vmScrapeConfig.enabled`) |
 | `charts/claw/values.schema.json` | JSON Schema for the Doorbell switch and the eight admission ceilings, enforced by `helm lint`/`template`/`upgrade` |
 | `charts/claw/templates/admission-preflight.yaml` | Render-time refusal of a soft ceiling above its hard ceiling, and of any ceiling set while Doorbell dispatch is off |
 | `promql/rollout-gates.test.yaml` | `promtool test rules` fixture for the rollout gates in `../docs/doorbell-rollout.md`, under both scrape modes |

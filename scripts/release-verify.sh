@@ -60,6 +60,9 @@ bash "$repo_root/scripts/release-tests/claw-deploy-security.sh"
 echo "==> chart values schema and rollout ordering"
 bash "$repo_root/scripts/release-tests/helm-values-schema.sh"
 
+echo "==> chart VMScrapeConfigs"
+bash "$repo_root/scripts/release-tests/claw-vmscrapeconfig.sh"
+
 echo "==> PromQL rollout gates"
 bash "$repo_root/scripts/release-tests/promql-gates.sh"
 

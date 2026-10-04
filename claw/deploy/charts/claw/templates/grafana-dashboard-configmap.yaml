@@ -23,10 +23,10 @@ in the Grafana UI. A sidecar import has no prompt, so set
 grafanaDashboard.datasourceUid to the uid of the Prometheus-compatible source
 that scrapes Brain /metrics and it is substituted in on render.
 
-NOTE: this chart ships no ServiceMonitor, PodMonitor or VMServiceScrape -- only
-the prometheus.io/* annotations on the Deployments. Neither the Prometheus
-Operator nor the VictoriaMetrics Operator reads those annotations, so on either
-of them these panels stay empty until you add a scrape object of your own.
+NOTE: these panels stay empty unless something scrapes the pods. Neither the
+Prometheus Operator nor the VictoriaMetrics Operator reads the Deployments'
+prometheus.io/* annotations; enable serviceMonitor or vmScrapeConfig (see
+servicemonitor.yaml / vmscrapeconfig.yaml) or add a scrape object of your own.
 */ -}}
 {{- if .Values.grafanaDashboard.enabled }}
 {{- $root := . }}

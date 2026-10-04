@@ -572,15 +572,35 @@ serviceMonitor:
   relabelings: []
   metricRelabelings: []
 
+# VictoriaMetrics Operator VMScrapeConfigs for the same two endpoints, for
+# clusters where a ServiceMonitor or a VMServiceScrape is never scraped: no
+# monitoring.coreos.com CRDs, a namespace-scoped operator (WATCH_NAMESPACE), or
+# a VMAgent whose serviceScrapeNamespaceSelector leaves this namespace out --
+# all three accept the object and leave the job with no targets. Off by
+# default. Mutually exclusive with serviceMonitor.enabled (double scraping).
+vmScrapeConfig:
+  enabled: false
+  # Leave empty to create them in the release namespace. Set it to a namespace
+  # your VMAgent selects scrape objects from (for a namespace-scoped operator,
+  # its own namespace); service discovery still targets the release namespace,
+  # and the object name is prefixed with it.
+  namespace: ""
+  labels: {}
+  interval: 30s
+  scrapeTimeout: 10s
+  # Appended after the chart's own relabelConfigs (keep/job/namespace/service/
+  # pod/node), so an entry here can refine but not undo the target selection.
+  relabelConfigs: []
+  metricRelabelConfigs: []
+
 # Grafana dashboards for the Brain metrics, shipped as ConfigMaps the Grafana
 # sidecar can discover. Off by default: the chart cannot tell whether a sidecar
 # is watching, and an unread 250KB ConfigMap in every namespace is worse than
 # an extra install step.
 #
-# Note this chart ships no ServiceMonitor/PodMonitor/VMServiceScrape, only the
-# prometheus.io/* annotations on the Deployments. The Prometheus Operator and
-# the VictoriaMetrics Operator both ignore those annotations, so on either of
-# them the panels stay empty until you add a scrape object of your own.
+# The panels stay empty unless something scrapes the pods: the Deployments'
+# prometheus.io/* annotations are ignored by both operators, so enable
+# serviceMonitor or vmScrapeConfig above (or bring a scrape object of your own).
 grafanaDashboard:
   enabled: false
   # Label the Grafana sidecar matches on. The defaults are what the upstream

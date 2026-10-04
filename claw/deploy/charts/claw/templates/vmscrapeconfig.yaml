@@ -1,0 +1,101 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+{{- /*
+VictoriaMetrics Operator VMScrapeConfigs for the API and Brain /metrics
+endpoints, for clusters where neither a ServiceMonitor nor a VMServiceScrape
+in the release namespace is ever scraped:
+
+  - no monitoring.coreos.com CRDs, so a ServiceMonitor is refused, or
+  - a namespace-scoped operator (WATCH_NAMESPACE) or a VMAgent whose
+    serviceScrapeNamespaceSelector leaves this namespace out. Both accept the
+    object and never scrape it. Moving a VMServiceScrape into the monitoring
+    namespace does not help either: a namespace-scoped operator rewrites its
+    service discovery to its own namespace and ignores namespaceSelector, so
+    the job exists and has zero targets.
+
+A VMScrapeConfig carries a raw kubernetes_sd_config whose namespaces the
+operator passes through untouched. Placed in a namespace the VMAgent selects
+(vmScrapeConfig.namespace), it discovers this release's Services from there.
+
+The labels mirror what a VMServiceScrape for the same Service would produce
+(job and service = the Service name, plus namespace, pod, node), so moving
+between the two keeps job= and every query on it stable.
+
+Mutually exclusive with serviceMonitor.enabled: wherever the converter does see
+the ServiceMonitor, both objects scrape the same targets and every rate is
+doubled.
+*/ -}}
+{{- if .Values.vmScrapeConfig.enabled }}
+{{- if .Values.serviceMonitor.enabled }}
+{{- fail "vmScrapeConfig.enabled and serviceMonitor.enabled are mutually exclusive: both would scrape the same API and Brain targets. Enable one." }}
+{{- end }}
+{{- $root := . }}
+{{- $ns := default .Release.Namespace .Values.vmScrapeConfig.namespace }}
+{{- range $component := list "api" "brain" }}
+{{- $svc := printf "primus-claw-%s" $component }}
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMScrapeConfig
+metadata:
+  {{- /* Prefixed with the release namespace when placed elsewhere, so two
+  releases scraped from one monitoring namespace do not overwrite each other. */}}
+  {{- if eq $ns $root.Release.Namespace }}
+  name: {{ $svc }}
+  {{- else }}
+  name: {{ printf "%s-%s" $root.Release.Namespace $svc | trunc 63 | trimSuffix "-" }}
+  {{- end }}
+  {{- with $root.Values.vmScrapeConfig.namespace }}
+  namespace: {{ . }}
+  {{- end }}
+  labels:
+    {{- include "primus-claw.labels" $root | nindent 4 }}
+    component: {{ $svc }}
+    {{- with $root.Values.vmScrapeConfig.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  scrapeInterval: {{ $root.Values.vmScrapeConfig.interval }}
+  scrapeTimeout: {{ $root.Values.vmScrapeConfig.scrapeTimeout }}
+  metricsPath: /metrics
+  kubernetesSDConfigs:
+    - role: endpoints
+      namespaces:
+        names:
+          - {{ $root.Release.Namespace }}
+  relabelConfigs:
+    - action: keep
+      sourceLabels: [__meta_kubernetes_service_label_app]
+      regex: primus-claw
+    - action: keep
+      sourceLabels: [__meta_kubernetes_service_label_component]
+      regex: {{ $svc }}
+    # Port by NAME, as in servicemonitor.yaml: both Services expose metrics as
+    # "http", whatever brain.port / api.port are set to.
+    - action: keep
+      sourceLabels: [__meta_kubernetes_endpoint_port_name]
+      regex: http
+    - action: replace
+      sourceLabels: [__meta_kubernetes_service_name]
+      targetLabel: job
+    - action: replace
+      sourceLabels: [__meta_kubernetes_namespace]
+      targetLabel: namespace
+    - action: replace
+      sourceLabels: [__meta_kubernetes_service_name]
+      targetLabel: service
+    - action: replace
+      sourceLabels: [__meta_kubernetes_pod_name]
+      targetLabel: pod
+    - action: replace
+      sourceLabels: [__meta_kubernetes_pod_node_name]
+      targetLabel: node
+    {{- with $root.Values.vmScrapeConfig.relabelConfigs }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with $root.Values.vmScrapeConfig.metricRelabelConfigs }}
+  metricRelabelConfigs:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}
