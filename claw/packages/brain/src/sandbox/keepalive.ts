@@ -24,6 +24,7 @@ import {
 } from "../config.js";
 import { clearRetryPending, getRetryPending, isRetryPendingExpired } from "../tasks/retry-pending.js";
 import { isTombstone } from "../tasks/lock.js";
+import { drainKeys } from "../infra/kv-keys.js";
 import { destroyHands, handsStopCeilingMs } from "./reaper.js";
 import {
   bindHandsKv, handsEntryKeys, readHandsEntry, reconcileReservedKeys, retentionStore,
@@ -2557,8 +2558,10 @@ async function collectTargets(
 async function collectKvTargets(deps: KeepaliveDeps, census: TargetCensus): Promise<boolean> {
   let complete = true;
   try {
-    const keys = await deps.kv.keys("hands.*");
-    for await (const key of keys) {
+    // Listed in full before any is read: reading inside the listing ends it
+    // after the first key (see drainKeys), and the sweep saw one sandbox.
+    const keys = await drainKeys(await deps.kv.keys("hands.*"));
+    for (const key of keys) {
       let e: Awaited<ReturnType<typeof deps.kv.get>>;
       try {
         e = await deps.kv.get(key);

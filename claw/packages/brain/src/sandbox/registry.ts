@@ -14,6 +14,7 @@
 import { LRUCache } from "lru-cache";
 import type { KV, KvEntry } from "nats";
 import { isTombstone } from "../tasks/lock.js";
+import { drainKeys } from "../infra/kv-keys.js";
 import { StringCodec } from "nats";
 import { isValidDagHandleToken } from "./handles.js";
 import {
@@ -37,9 +38,7 @@ export function bindHandsKv(kv: KV): void {
 function reservedKeyStore(kv: KV): HandsKeyStore {
   return {
     keys: async (filter) => {
-      const out: string[] = [];
-      for await (const key of await kv.keys(filter)) out.push(key);
-      return out;
+      return drainKeys(await kv.keys(filter));
     },
     read: async (key) => {
       const entry = await kv.get(key);
@@ -350,8 +349,10 @@ export async function isValidHandsToken(token: string): Promise<boolean> {
     // Filtered server-side: this bucket also holds `lock.*`, `deleted.*` and
     // `brain.min_version`, and every miss here walks the whole key space before
     // it can answer. Matches the filter sweepStaleHands already uses.
-    const keys = await kv.keys("hands.*");
-    for await (const key of keys) {
+    // Listed in full before any is read: reading inside the listing ends it
+    // after the first key (see drainKeys), which denied every token but one.
+    const keys = await drainKeys(await kv.keys("hands.*"));
+    for (const key of keys) {
       const e = await kv.get(key).catch(() => null);
       if (!e) continue;
       try {
