@@ -127,6 +127,33 @@ function isMidStreamDrop(err: unknown): boolean {
 // ones, and never mutate the persisted workingMessages — KV stays a
 // monotonic audit trail.
 const RESUME_NOTICE_PREFIX = "[system-notice]:";
+
+/**
+ * What the model is told after a turn with no text and no tool call.
+ *
+ * Such a turn used to end the loop as a success. A model that stops without a
+ * word has not said it is done -- gateways and models both produce this shape
+ * mid-task -- and finishing there reported a completed task with nothing in it.
+ * One nudge, in the same synthetic-notice form a resume hint takes.
+ */
+const EMPTY_TURN_NUDGE = `${RESUME_NOTICE_PREFIX} Your last reply was empty: no text and no tool call. `
+  + "If the task is not finished, continue working on it. If it is finished, reply with a short "
+  + "report of what you did and the result.";
+
+/**
+ * A top-level run whose model went silent twice running and never said anything.
+ *
+ * Not retryable on purpose: the message avoids every phrase isRetryable reads,
+ * and redelivering the same conversation to the same model is not evidence of
+ * a different answer.
+ */
+export class EmptyAgentTurnError extends Error {
+  constructor() {
+    super("The model ended its turn without any text or tool call twice in a row, "
+      + "and the task produced no output.");
+    this.name = "EmptyAgentTurnError";
+  }
+}
 const RESUME_NOTICE_KEEP_RECENT = 3;
 
 export function filterResumeNotices(messages: Message[]): Message[] {
@@ -615,6 +642,8 @@ class AgentLoopRunner {
   // --- Resume: pre-populated from checkpoint in the constructor ---
   private workingMessages: Message[];
   private textParts: string[];
+  /** Whether the previous turn was empty and was answered with EMPTY_TURN_NUDGE. */
+  private emptyTurnNudged = false;
   private usage: TokenUsage;
   private errorCount: number;
   private toolCallsByName: Record<string, number>;
@@ -1425,6 +1454,30 @@ class AgentLoopRunner {
     // for information the next turn with text carries anyway.
 
     const toolUses = content.filter((b: any) => b.type === "tool_use");
+    const saidSomething = content.some(
+      (b: any) => b.type === "text" && typeof b.text === "string" && b.text.trim() !== "",
+    );
+    if (!toolUses.length && !saidSomething) {
+      // Nothing to show and nothing to run: not a report, so not an ending.
+      if (!this.emptyTurnNudged) {
+        this.emptyTurnNudged = true;
+        logger.warn({ turn, sessionId: this.sessionId, stopReason, depth: this.depth }, "agent-loop.empty_turn_nudge");
+        // The empty assistant turn itself is not kept: an assistant message
+        // with no content is one the providers refuse.
+        this.workingMessages.push({ role: "user", content: EMPTY_TURN_NUDGE });
+        return false;
+      }
+      // Silent again. A run that has reported something before keeps ending the
+      // way it always did; one that never said a word is not a success, and the
+      // top level is where that becomes the task's outcome. A sub-agent's empty
+      // answer goes back to the agent that asked, which can judge it.
+      if (this.depth === 0 && !this.textParts.some((t) => t.trim() !== "")) {
+        logger.warn({ turn, sessionId: this.sessionId, stopReason }, "agent-loop.empty_turn_failed");
+        throw new EmptyAgentTurnError();
+      }
+    } else {
+      this.emptyTurnNudged = false;
+    }
     if (!toolUses.length || stopReason === "end_turn") {
       logger.info({ turn, sessionId: this.sessionId, stopReason, textPartsCount: this.textParts.length }, "agent-loop.end_turn");
       // Stop: fires once per loop completion. Only the top-level loop runs
