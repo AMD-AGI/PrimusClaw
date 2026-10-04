@@ -554,6 +554,26 @@ function disabledAnswer(): ShellAnswer {
   };
 }
 
+/**
+ * The leader's outcome, for a shell whose leader exited while its group did not.
+ *
+ * The shell is still `running` -- something it started is -- but the command
+ * itself has returned, and that is what the caller asked to run. Reported
+ * beside the status rather than instead of it: the group is not gone, and
+ * saying `exited` would take it out of every count that protects it.
+ */
+export function leaderExit(shell: BgShell | undefined): { exitCode: number | null; signal: string | null } | null {
+  if (!shell || shell.status !== "running" || shell.leaderExitedAt === undefined) return null;
+  return { exitCode: shell.exitCode, signal: shell.signal };
+}
+
+/** The sentence that goes with `leaderExit`, shared by bash_output and wait. */
+export function leaderExitText(leader: { exitCode: number | null; signal: string | null }): string {
+  const how = leader.signal ? `signal=${leader.signal}` : `exit_code=${leader.exitCode ?? "?"}`;
+  return `Command exited (${how}); processes it started are still running in its process group, `
+    + "so the shell stays running. kill_shell stops them.";
+}
+
 /** Read new output from one of this run's shells since its last poll. */
 export function pollOutput(owner: string, run: string, id: string, filter?: string): ShellAnswer {
   if (!BG_SHELL_ENABLED) return disabledAnswer();
@@ -563,11 +583,13 @@ export function pollOutput(owner: string, run: string, id: string, filter?: stri
   // nothing the caller could do with that either way.
   if (resolved.cls === "unknown") return unknownAnswer();
 
+  const leader = resolved.status ? null : leaderExit(resolved.shell);
   const structured = {
     shell_class: resolved.cls,
     shell_id: id,
     output_available: resolved.outputAvailable,
     ...(resolved.status ? { status: resolved.status, exit_code: resolved.exitCode ?? null } : {}),
+    ...(leader ? { leader_exited: true, leader_exit_code: leader.exitCode, leader_signal: leader.signal } : {}),
   };
 
   const parts = [`Shell: ${id}`, `Class: ${resolved.cls}`];
@@ -581,6 +603,7 @@ export function pollOutput(owner: string, run: string, id: string, filter?: stri
   const shell = resolved.shell;
   const output = pollManagedOutput(shell, filter);
   if (resolved.status) parts.push(`Outcome: ${resolved.status} (exit_code=${resolved.exitCode ?? "?"})`);
+  if (leader) parts.push(leaderExitText(leader));
   if (shell.truncated) parts.push(`Warning: output buffer overflow, ${shell.stdoutDroppedBytes + shell.stderrDroppedBytes} bytes dropped`);
   if (output.lostBytes > 0) parts.push(`Warning: ${output.lostBytes} unread bytes were dropped from the ring buffer`);
   if (output.stdout) parts.push(`New stdout (${output.stdout.length} chars):`, output.stdout);
