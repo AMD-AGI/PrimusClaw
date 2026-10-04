@@ -189,8 +189,8 @@ test("a foreground call carries no shell id and is left alone", async () => {
   sandboxOfVersion(false);
 
   const { hands, sent } = clientFor("ktsk_1");
-  await hands.callTool("bash", { command: "ls" });
-  assert.deepEqual(sent[0], { command: "ls" });
+  await hands.callTool("bash", { command: "ls", timeout: 5 });
+  assert.deepEqual(sent[0], { command: "ls", timeout: 5 });
 });
 
 test("the structured shell id is restored too, so a script step can address it", async () => {

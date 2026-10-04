@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { z } from "zod";
-import { currentOwner, currentRun } from "../../runtime/owner-context.js";
+import { currentCallSignal, currentOwner, currentRun } from "../../runtime/owner-context.js";
 import {
   waitForShellExit, pollOutput, leaderExitHow, BG_SHELL_DISABLED_MESSAGE, UNKNOWN_SHELL_MESSAGE,
 } from "./bg-manager.js";
@@ -24,8 +24,25 @@ import { BG_SHELL_ENABLED } from "../../config.js";
  * one LLM turn per interval -- for a two-hour training run, hundreds of turns
  * spent asking "done yet". Parking in a single call costs one.
  */
-const WAIT_DEFAULT_SEC = parseInt(process.env.WAIT_DEFAULT_SEC || "300", 10);
-const WAIT_MAX_SEC = parseInt(process.env.WAIT_MAX_SEC || "1800", 10);
+/*
+ * Why one wait is nonetheless held under two minutes.
+ *
+ * A wait is answered by the HTTP request that carries it, and the reply is a
+ * single JSON body written when the wait ends -- so nothing reaches the caller
+ * until then, not even headers. Every hop in between may give up on a request
+ * that has sent nothing: the sandbox Router's port proxy, for one, stops
+ * waiting for response headers after 120s and answers 502 "sandbox service
+ * unreachable". A wait longer than that limit is not a long wait, it is a
+ * failed call; the agent sees an unreachable sandbox, not a running job.
+ *
+ * Those limits belong to whatever proxy a deployment puts in front of Hands,
+ * and none of them is visible from here, so the per-call ceiling sits well
+ * under the shortest one known rather than being derived from any. The long
+ * wait the argument above is about is still one call per slice: a wait that
+ * runs out says the shell is still running, and the caller waits again.
+ */
+export const WAIT_DEFAULT_SEC = parseInt(process.env.WAIT_DEFAULT_SEC || "100", 10);
+export const WAIT_MAX_SEC = parseInt(process.env.WAIT_MAX_SEC || "100", 10);
 
 const schema = {
   shell_id: z.string().describe("Background shell id to wait for, from bash run_in_background=true"),
@@ -61,7 +78,8 @@ export const wait = {
 
     const owner = currentOwner();
     const run = currentRun();
-    const pending = waitForShellExit(owner, run, args.shell_id, timeoutSec * 1000);
+    const signal = currentCallSignal();
+    const pending = waitForShellExit(owner, run, args.shell_id, timeoutSec * 1000, signal);
     // Not a wait at all: the class already settles the question, so the caller
     // is answered now rather than held for the timeout on a shell that can
     // never produce an exit event.
@@ -104,6 +122,21 @@ export const wait = {
     const startedAt = Date.now();
     const shell = await pending;
     const waitedSec = Math.round((Date.now() - startedAt) / 1000);
+
+    // The request carrying this wait is gone, so whatever is returned now is
+    // written to nobody. Reading the output here would advance the read offset
+    // past bytes the caller never received, and the next wait or bash_output
+    // would start after them: the shell's output, lost. Left unread, it is
+    // all still there for the call that comes next.
+    if (signal?.aborted) {
+      return {
+        content: [{
+          type: "text" as const,
+          text: `Error: the request carrying this wait ended after ${waitedSec}s; no output was read`,
+        }],
+        isError: true,
+      };
+    }
 
     // The output is read through the ordinary poll so that a wait and a
     // bash_output leave the read offset in the same place: whichever the model
