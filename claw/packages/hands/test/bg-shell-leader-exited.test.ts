@@ -92,3 +92,19 @@ test("the leader's exit does not take the shell out of the live-work count", asy
   await leaderGoneGroupAlive("o-4", "r-4", "counted", "sleep 30 & exit 0");
   assert.equal(runningShellCount("o-4"), 1);
 });
+
+test("a wait that times out names the signal that killed the command, not exit_code=?", async () => {
+  // The leader kills itself; the background sleep keeps the group alive.
+  await leaderGoneGroupAlive("o-5", "r-5", "daemon-signalled", "sleep 30 & kill -KILL $$");
+
+  const result = await withCaller({ owner: "o-5", run: "r-5" },
+    () => wait.execute({ shell_id: "daemon-signalled", timeout_sec: 0.3 }));
+  const s = result.structuredContent as Record<string, unknown>;
+  assert.equal(s.finished, false);
+  assert.equal(s.leader_exited, true);
+  assert.equal(s.leader_exit_code, null);
+  assert.equal(s.leader_signal, "SIGKILL");
+  const text = result.content[0].text;
+  assert.match(text, /its command has exited \(signal=SIGKILL\)/);
+  assert.doesNotMatch(text, /exit_code=\?/);
+});

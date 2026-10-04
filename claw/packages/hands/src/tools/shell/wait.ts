@@ -4,7 +4,7 @@
 import { z } from "zod";
 import { currentOwner, currentRun } from "../../runtime/owner-context.js";
 import {
-  waitForShellExit, pollOutput, BG_SHELL_DISABLED_MESSAGE, UNKNOWN_SHELL_MESSAGE,
+  waitForShellExit, pollOutput, leaderExitHow, BG_SHELL_DISABLED_MESSAGE, UNKNOWN_SHELL_MESSAGE,
 } from "./bg-manager.js";
 import { BG_SHELL_ENABLED } from "../../config.js";
 
@@ -118,7 +118,10 @@ export const wait = {
       ? `Shell ${args.shell_id} finished after ~${waitedSec}s (status=${shell.status}, exit_code=${shell.exitCode ?? "?"})`
       : leaderExited
         ? `Shell ${args.shell_id} is still running after ${waitedSec}s, but its command has exited `
-          + `(exit_code=${polled.structured.leader_exit_code ?? "?"}); what remains are processes it started. `
+          + `(${leaderExitHow({
+            exitCode: (polled.structured.leader_exit_code as number | null | undefined) ?? null,
+            signal: (polled.structured.leader_signal as string | null | undefined) ?? null,
+          })}); what remains are processes it started. `
           + "Waiting again waits for those; kill_shell stops them."
         : `Shell ${args.shell_id} is still running after ${waitedSec}s. Call wait again to keep waiting, or kill_shell to stop it.`;
 

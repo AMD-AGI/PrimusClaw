@@ -568,8 +568,18 @@ export function leaderExit(shell: BgShell | undefined): { exitCode: number | nul
 }
 
 /** The sentence that goes with `leaderExit`, shared by bash_output and wait. */
+/**
+ * How the leader ended, as `signal=SIGX` or `exit_code=N`.
+ *
+ * A leader killed by a signal has no exit code; printing `exit_code=?` for it
+ * reads as "unknown" when the answer is known and is the signal.
+ */
+export function leaderExitHow(leader: { exitCode: number | null; signal: string | null }): string {
+  return leader.signal ? `signal=${leader.signal}` : `exit_code=${leader.exitCode ?? "?"}`;
+}
+
 export function leaderExitText(leader: { exitCode: number | null; signal: string | null }): string {
-  const how = leader.signal ? `signal=${leader.signal}` : `exit_code=${leader.exitCode ?? "?"}`;
+  const how = leaderExitHow(leader);
   return `Command exited (${how}); processes it started are still running in its process group, `
     + "so the shell stays running. kill_shell stops them.";
 }
