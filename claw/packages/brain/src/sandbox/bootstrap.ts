@@ -84,9 +84,41 @@ export const HANDS_ENV_PAYLOAD_ENV = "CLAW_HANDS_ENV_B64";
  *  by the Router and by EnvD on every execute; the request's `env` map is not,
  *  so the credential travels there and is expanded inside the sandbox. */
 export function brainAssetCurl(endpoint: string, baseUrl: string = BRAIN_HTTP_URL): string {
-  return `curl -sfL --retry 3 --retry-delay 2 `
+  return `curl -sSfL --retry 3 --retry-delay 2 `
     + `-H "Authorization: Bearer \${${HANDS_TOKEN_ENV}}" `
     + `${baseUrl}${endpoint}`;
+}
+
+/** How many times the Hands download is attempted before its source gives up. */
+const HANDS_DOWNLOAD_ATTEMPTS = 3;
+
+/**
+ * Seconds between Hands download attempts.
+ *
+ * curl's own `--retry` covers timeouts and 5xx, not a refused connection or a
+ * 4xx, and those come back in under a second: one rejected request was enough
+ * to fail the sandbox. The gap outlasts the 5s `deniedTokens` window in
+ * registry.ts, so a retried 403 is checked again rather than answered from it.
+ */
+const HANDS_DOWNLOAD_RETRY_DELAY_SEC = 6;
+
+/**
+ * Shell snippet: download the Hands binary to `dest`, retrying any failure.
+ *
+ * Retried in shell rather than with `--retry-all-errors`, which needs curl 7.71
+ * and would make an older curl reject the whole command. curl's own message is
+ * kept, so a failure names the status or error rather than only that the
+ * download did not happen.
+ */
+export function handsBinaryDownloadCmd(
+  dest: string,
+  attempts: number = HANDS_DOWNLOAD_ATTEMPTS,
+  delaySec: number = HANDS_DOWNLOAD_RETRY_DELAY_SEC,
+  baseUrl: string = BRAIN_HTTP_URL,
+): string {
+  return `_try=1; until _err=$(${brainAssetCurl("/internal/assets/hands-binary", baseUrl)} -o ${dest} 2>&1); do `
+    + `if [ $_try -ge ${attempts} ]; then echo "hands-binary download failed after $_try attempts: $_err" >&2; exit 1; fi; `
+    + `_try=$((_try+1)); sleep ${delaySec}; done; `;
 }
 
 /**
@@ -214,7 +246,7 @@ function brainDownloadStartCmd(baseEnv: string, envFile?: string): string {
   // `sandbox_health_failed` with "hands.log: No such file or directory"). Only
   // the final binary launch is backgrounded, then verified alive, mirroring
   // sharedStorageStartCmd.
-  return `${brainAssetCurl("/internal/assets/hands-binary")} -o ${binPath} || { echo "hands-binary download failed" >&2; exit 1; }; `
+  return handsBinaryDownloadCmd(binPath)
     + `chmod +x ${binPath} || { echo "chmod hands-binary failed" >&2; exit 1; }; `
     + `test -s ${binPath} || { echo "hands-binary is empty after download" >&2; exit 1; }; `
     + launchCmd(baseEnv, binPath, envFile);
