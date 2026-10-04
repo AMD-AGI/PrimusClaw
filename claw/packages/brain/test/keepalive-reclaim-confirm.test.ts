@@ -915,6 +915,60 @@ test("an ended replaced run whose every CAS is lost is not completed on the othe
   }
 });
 
+test("a background positive count whose every verdict CAS is lost still ends the replaced run on the other replica", async (t) => {
+  // Codex round 6: the background probe read 250 live processes from the
+  // bound instance and noted it only in its own process before persistVerdict,
+  // whose bounded CAS lost every attempt (background_work_answer_write_abandoned
+  // running:250). The hold key was never written, so the other replica read the
+  // replaced run still on the record and completed it (reclaim_destroy
+  // instance_replaced consecutive:3).
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const replicaB = await import("../src/sandbox/keepalive.js?replica=hold-verdict") as Replica;
+  // No reuse window open: only the background probe asks.
+  const k = sharedKv(entry(Date.now(), { quiescedAt: undefined }));
+  try {
+    roster = { kind: "ok", count: 0, instance: "envd-2" };
+    await sweep(replicaA, k.kv);
+    t.mock.timers.tick(SWEEP_MS);
+    await sweep(replicaA, k.kv);
+    const run = k.current()?.reclaimStreak;
+    assert.equal(run?.reason, "instance_replaced", "sanity: a replaced run");
+    assert.equal(run?.count, 2, "sanity: one reading short of a confirmation");
+
+    // Every write that would carry the live count to the record loses its CAS.
+    let refused = 0;
+    onRecordUpdate = (next) => {
+      if (next.bgRunning === 250 || typeof next.lastPositiveCountAt === "number") {
+        refused += 1;
+        throw new Error("wrong last sequence");
+      }
+    };
+    t.mock.timers.tick(SWEEP_MS);
+    roster = { kind: "ok", count: 250 };
+    const busyAt = Date.now();
+    await sweep(replicaA, k.kv);
+    for (let i = 0; i < 200 && refused < 64; i++) await new Promise((r) => setImmediate(r));
+    onRecordUpdate = null;
+    assert.ok(refused >= 64, `sanity: every verdict write lost its CAS; refused=${refused}`);
+    assert.equal(k.current()?.lastPositiveCountAt, undefined, "sanity: nothing reached the record");
+    assert.equal(k.current()?.reclaimStreak?.firstAt, run?.firstAt, "sanity: the run is still on the record");
+
+    // Replica B reads the replaced instance once more: the third reading of a
+    // run the live count ended.
+    t.mock.timers.tick(SWEEP_MS);
+    roster = { kind: "ok", count: 0, instance: "envd-2" };
+    await sweep(replicaB, k.kv);
+    assert.equal(k.current()?.terminalReason, undefined,
+      `the other replica completed a replaced run live work had ended; record=${JSON.stringify(k.current())}`);
+    assert.ok(!destroyed(k), `destroyed; stops=${JSON.stringify(stops)}`);
+    const hold = k.read(HOLD_KEY);
+    assert.equal(hold?.positiveAt, busyAt, `the live count is on the hold key; hold=${JSON.stringify(hold)}`);
+    assert.ok((hold?.endedAt?.instance_replaced ?? 0) >= busyAt, "and so is the end of the replaced run");
+  } finally {
+    replicaB.resetBackgroundWorkStateForTest();
+  }
+});
+
 test("a hold key that cannot be read holds the destroy", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const k = sharedKv(entry(Date.now()));

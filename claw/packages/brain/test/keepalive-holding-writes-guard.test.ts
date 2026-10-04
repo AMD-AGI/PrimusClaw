@@ -255,22 +255,24 @@ test("confirmReclaim swallows a write only for an advancing reading", () => {
   assert.ok(branch >= 0 && routed > branch, "a holding reading is routed to persistHoldingObservation");
   assert.equal(bare.length, 1, "one swallowed write, the advancing one");
   assert.ok(bare[0] > routed, "and it comes after the holding branch returned");
-  // Every caller that applies a reading hands it to the confirmation, so the
-  // confirmation knows which branch it is in.
+  // Every caller that applies a reading and confirms on it hands the reading
+  // to the confirmation, so the confirmation knows which branch it is in.
   for (const c of functionsOf("sandbox/keepalive.ts", text)) {
-    if (c.name === "observe") continue;
+    if (c.name === "observe" || !c.text.includes("confirmReclaim(")) continue;
     const applied = (c.text.match(/\bobserveReading\(/g) ?? []).length
       - (c.name === "observeReading" ? 1 : 0);
     if (applied === 0) continue;
     const handed = (c.text.match(/observed\.reading/g) ?? []).length;
     assert.equal(handed, applied, `${c.name} applies ${applied} reading(s) and hands ${handed} to confirmReclaim`);
   }
-  // A bare observe() is a reading with its class thrown away: only the two
-  // writers that re-read and retry may use it.
+  // A bare observe() is a reading that has not been recorded: only
+  // observeReading (which records it) and persistHoldingObservation (which
+  // recorded it before its loop, and again for a streak a re-read shows) may
+  // use it.
   for (const c of functionsOf("sandbox/keepalive.ts", text)) {
     if (/(?<!function\s)\bobserve\(/.test(c.text)) {
-      assert.ok(["persistHoldingObservation", "recordObservation"].includes(c.name),
-        `${c.name} applies a reading with observe() and cannot know whether it holds`);
+      assert.ok(["observeReading", "persistHoldingObservation"].includes(c.name),
+        `${c.name} applies a reading with observe() and records none of it`);
     }
   }
 });
@@ -313,9 +315,11 @@ test("holding evidence goes to the hold key, and every destructive confirmation 
   const text = FILES.find((f) => f.path.endsWith("sandbox/keepalive.ts"))!.text;
   const fns = functionsOf("sandbox/keepalive.ts", text);
   const persist = fns.find((c) => c.name === "persistHoldingObservation")!.text;
-  const put = persist.indexOf("putReclaimHold(");
+  const put = persist.indexOf("recordHold(");
   const loop = persist.search(/\bfor\s*\(/);
-  assert.ok(put >= 0 && loop > put, "persistHoldingObservation puts the hold key before its CAS loop");
+  assert.ok(put >= 0 && loop > put, "persistHoldingObservation records the reading before its CAS loop");
+  const record = fns.find((c) => c.name === "recordHold")!.text;
+  assert.ok(/putReclaimHold\(/.test(record), "and recording puts the hold key");
 
   const confirm = fns.find((c) => c.name === "confirmReclaim")!.text;
   const read = confirm.indexOf("readReclaimHold(");
@@ -336,4 +340,156 @@ test("holding evidence goes to the hold key, and every destructive confirmation 
   const hold = FILES.find((f) => f.path.endsWith("sandbox/reclaim-hold.ts"))!.text;
   assert.ok(/\bkv\.put\(key,/.test(hold), "the hold key is written with put");
   assert.ok(!/\.(?:update|create)\(/.test(hold), "and never with a revision-conditioned write");
+});
+
+// --- one way to record holding evidence ---
+//
+// Codex round 6: recordProbeVerdict noted a positive count in this process's
+// LocalHold and handed it to persistVerdict, whose bounded CAS lost every
+// attempt; the hold key was never written, and another replica completed the
+// replaced run the count had ended. The hold key was written on one path
+// (persistHoldingObservation) and not on another, because noting a hold and
+// sharing it were two calls. They are one now (recordHold), and these pin that.
+
+/** Calls that record a reading, here and on the hold key, before they return. */
+const ROUTES = /\b(?:recordHold|observeReading|persistHoldingObservation|recordFailedProbe)\(/;
+
+/** A reading applied, or a holding field written, by hand. */
+const HOLDING: RegExp[] = [
+  /(?<!function\s)\bobserve(?:Reading)?\(/g,
+  new RegExp(`\\b(?:${FIELDS})\\s*:(?!:)`, "g"),
+  new RegExp(`\\.(?:${FIELDS})\\s*=(?!=)`, "g"),
+  new RegExp(`delete\\s+[\\w.]+\\.(?:${FIELDS})\\b`, "g"),
+];
+
+/** A write to the hands record (or any CAS'd key): what a hold must precede. */
+const RECORD_WRITE = /\.(?:update|create)\(/g;
+
+/**
+ * Functions that are not readings: a reactivation drops the streak because it
+ * ends the idle period, and the decision helpers only read.
+ */
+const NOT_A_READING = new Set([
+  "sandbox/ensure-hands.ts#clearIdleMarkers",
+]);
+
+/** Where a holding reading reaches a record write with no recording before it. */
+export function unrecordedHoldingWrites(files: { path: string; text: string }[]): string[] {
+  const out: string[] = [];
+  for (const f of files) {
+    const rel = relative(SRC, f.path);
+    const fns = functionsOf(rel, f.text);
+    for (const fn of fns) {
+      const id = `${rel}#${fn.name}`;
+      if (NOT_A_READING.has(id) || fn.name === "recordHold") continue;
+      const evidence = positions(fn.text, HOLDING);
+      if (evidence.length === 0) continue;
+      for (const w of regexSpans(fn.text, [RECORD_WRITE])) {
+        if (w.at < evidence[0]) continue;
+        if (ROUTES.test(fn.text.slice(0, w.at))) continue;
+        // Recorded by every caller before the call, which is as good.
+        const callers = fns.filter((c) => c !== fn && new RegExp(`\\b${fn.name}\\(`).test(c.text));
+        const covered = callers.length > 0 && callers.every((c) => {
+          const call = c.text.search(new RegExp(`\\b${fn.name}\\(`));
+          return ROUTES.test(c.text.slice(0, call));
+        });
+        if (covered) continue;
+        const line = fn.line + fn.text.slice(0, w.at).split("\n").length - 1;
+        out.push(`${rel}:${line} (${fn.name}): ${fn.text.slice(w.at, w.at + 80).replace(/\s+/g, " ")}`);
+      }
+    }
+  }
+  return out;
+}
+
+/** Every touch of this process's hold map outside the functions allowed it. */
+export function localHoldTouches(file: { path: string; text: string }): string[] {
+  const rel = relative(SRC, file.path);
+  const out: string[] = [];
+  for (const fn of functionsOf(rel, file.text)) {
+    // The declaration falls inside whichever function precedes it.
+    const body = fn.text.replace(/^const localHolds\s*=.*$/m, "");
+    const writes = body.match(/\blocalHolds\s*\.\s*set\(/g) ?? [];
+    const refs = body.match(/\blocalHolds\b/g) ?? [];
+    if (fn.name === "recordHold") continue;
+    // Readers: the merge every decision goes through, which prunes an expired
+    // note, and the test reset.
+    const reader = fn.name === "withLocalHolds" || fn.name === "resetBackgroundWorkStateForTest";
+    if (writes.length > 0 || (refs.length > 0 && !reader)) out.push(`${fn.name}: ${refs.length} reference(s), ${writes.length} write(s)`);
+    if (/(?<!function\s)\bnoteLocalHold\(/.test(body)) out.push(`${fn.name}: calls noteLocalHold`);
+  }
+  return out;
+}
+
+test("recordHold is the only way holding evidence is recorded", () => {
+  const ka = FILES.find((f) => f.path.endsWith("sandbox/keepalive.ts"))!;
+  const fns = functionsOf("sandbox/keepalive.ts", ka.text);
+  const record = fns.find((c) => c.name === "recordHold");
+  assert.ok(record, "recordHold exists");
+  assert.ok(!fns.some((c) => c.name === "noteLocalHold"), "noting a hold apart from sharing it is gone");
+  // The map: added to in recordHold only, and read only by the merge.
+  assert.deepEqual(localHoldTouches(ka), [], "this process's holds are touched outside recordHold");
+  assert.ok(/\blocalHolds\s*\.\s*set\(/.test(record!.text), "recordHold notes the hold here");
+  // The note and the put are the same call, and the put comes first in the
+  // only sense that matters: before the caller's record write, which the
+  // check below pins.
+  const note = record!.text.search(/\blocalHolds\s*\.\s*set\(/);
+  const put = record!.text.indexOf("putReclaimHold(");
+  assert.ok(note >= 0 && put > note, "recordHold puts what it notes to the hold key");
+  // The hold key is put from recordHold, and re-put (unchanged) only by the
+  // confirmation that is still holding on it.
+  for (const c of fns) {
+    if (!c.text.includes("putReclaimHold(")) continue;
+    assert.ok(["recordHold", "confirmReclaim"].includes(c.name), `${c.name} puts a hold of its own`);
+  }
+  // Every holding reading reaches the record only after it was recorded.
+  assert.deepEqual(unrecordedHoldingWrites(FILES), [],
+    "a holding reading reaches a record write without recordHold");
+  // The background verdict, by name: recorded before persistVerdict's CAS.
+  const verdict = fns.find((c) => c.name === "recordProbeVerdict")!.text;
+  const recorded = verdict.indexOf("recordHold(");
+  const persisted = verdict.indexOf("persistVerdict(");
+  assert.ok(recorded >= 0 && persisted > recorded, "recordProbeVerdict records the count before persistVerdict");
+});
+
+test("the recording guards refuse the shapes they were written for", () => {
+  // recordProbeVerdict as it was on 94c3aa2: noted locally, never put.
+  const mutant = `
+const localHolds = new Map();
+async function recordHold(deps, identity, obs) {
+  localHolds.set(identity, obs);
+  await putReclaimHold(deps.kv, obs);
+}
+function noteLocalHold(identity, now, obs) {
+  localHolds.set(identity, { at: now });
+}
+async function recordProbeVerdict(deps, probe, running) {
+  noteLocalHold(probe.identity, 1, { kind: "count", count: running });
+  await persistVerdict(deps, probe.key, running);
+}
+async function persistVerdict(deps, key, running) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const e = await deps.kv.get(key);
+    const next = { ...JSON.parse(e.value), lastPositiveCountAt: 1, reclaimStreak: undefined };
+    try { await deps.kv.update(key, next, e.revision); return; } catch { continue; }
+  }
+}
+`;
+  const file = { path: join(SRC, "sandbox/mutant.ts"), text: mutant };
+  const touches = localHoldTouches(file);
+  assert.deepEqual(touches, [
+    "noteLocalHold: 1 reference(s), 1 write(s)",
+    "recordProbeVerdict: calls noteLocalHold",
+  ], "the map written outside recordHold, and the call that reaches it, are both refused");
+  const unrecorded = unrecordedHoldingWrites([file]);
+  assert.equal(unrecorded.length, 1, `persistVerdict's CAS is unrecorded; found=${JSON.stringify(unrecorded)}`);
+  assert.match(unrecorded[0], /\(persistVerdict\)/);
+
+  // Routed through recordHold by its caller, the same CAS is accepted.
+  const fixed = mutant
+    .replace(/function noteLocalHold[\s\S]*?\n\}\n/, "")
+    .replace("noteLocalHold(probe.identity, 1,", "await recordHold(deps, probe.identity,");
+  const ok = { path: join(SRC, "sandbox/mutant.ts"), text: fixed };
+  assert.deepEqual(localHoldTouches(ok), []);
+  assert.deepEqual(unrecordedHoldingWrites([ok]), []);
 });
