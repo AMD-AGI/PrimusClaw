@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { StringCodec, type KV } from "nats";
+import { drainKeys } from "../infra/kv-keys.js";
 
 const sc = StringCodec();
 
@@ -129,7 +130,9 @@ export async function getRetryPending(kv: KV, sessionId: string, lockKey?: strin
   // resident under keepalive with a GPU attached to it.
   const keys = await kv.keys(`${RETRY_PENDING_PREFIX}${sanitizeKeyPart(sessionId)}.>`).catch(() => null);
   if (!keys) return null;
-  for await (const key of keys) {
+  // Listed in full before any is read: a read inside the listing ends it after
+  // the first key (see drainKeys), so a malformed first entry hid the real one.
+  for (const key of await drainKeys(keys)) {
     const entry = await decodeRetryPending(kv, key, sessionId);
     if (entry) return entry;
   }

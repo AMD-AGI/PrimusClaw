@@ -53,6 +53,18 @@ export interface ManagedShell {
    * dressed as a check.
    */
   groupToken?: string;
+  /**
+   * When the leader exited while the rest of its group went on running.
+   *
+   * Set only on that path: the shell stays `running` because the group is
+   * what "running" means, but the command the caller asked for has finished,
+   * and `exitCode`/`signal` already hold its outcome. An install script that
+   * ends by starting daemons (`ray start`, `nohup server &`) looks exactly like
+   * this, and a caller shown only `running` never learns its command returned.
+   * Absent where nobody saw the leader go -- a stand-in rebuilt from a record
+   * after a restart -- which is "not known", not "still running".
+   */
+  leaderExitedAt?: number;
 }
 
 export interface ManagedShellResult {
@@ -201,6 +213,7 @@ export function spawnManagedShell(command: string, options: SpawnManagedShellOpt
     shell.exitCode = code;
     shell.signal = signal;
     if (!groupLives) shell.endedAt = Date.now();
+    else shell.leaderExitedAt = Date.now();
     // Foreground exit/error logs are emitted by runForegroundShell.finish so
     // each shell shows exactly one terminal event in the log stream.
     if (shell.kind !== "foreground") {

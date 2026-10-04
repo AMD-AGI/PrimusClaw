@@ -4,7 +4,7 @@
 import { z } from "zod";
 import { currentOwner, currentRun } from "../../runtime/owner-context.js";
 import {
-  waitForShellExit, pollOutput, BG_SHELL_DISABLED_MESSAGE, UNKNOWN_SHELL_MESSAGE,
+  waitForShellExit, pollOutput, leaderExitHow, BG_SHELL_DISABLED_MESSAGE, UNKNOWN_SHELL_MESSAGE,
 } from "./bg-manager.js";
 import { BG_SHELL_ENABLED } from "../../config.js";
 
@@ -110,9 +110,20 @@ export const wait = {
     // used, it has seen the same bytes and the next call continues after them.
     const polled = pollOutput(owner, run, args.shell_id, undefined);
 
+    // A timeout on a shell whose command already returned says so: the wait is
+    // for the group, which a command that ends by starting daemons never
+    // drains, and "still running" alone hid that the command had finished.
+    const leaderExited = polled.structured.leader_exited === true;
     const header = shell
       ? `Shell ${args.shell_id} finished after ~${waitedSec}s (status=${shell.status}, exit_code=${shell.exitCode ?? "?"})`
-      : `Shell ${args.shell_id} is still running after ${waitedSec}s. Call wait again to keep waiting, or kill_shell to stop it.`;
+      : leaderExited
+        ? `Shell ${args.shell_id} is still running after ${waitedSec}s, but its command has exited `
+          + `(${leaderExitHow({
+            exitCode: (polled.structured.leader_exit_code as number | null | undefined) ?? null,
+            signal: (polled.structured.leader_signal as string | null | undefined) ?? null,
+          })}); what remains are processes it started. `
+          + "Waiting again waits for those; kill_shell stops them."
+        : `Shell ${args.shell_id} is still running after ${waitedSec}s. Call wait again to keep waiting, or kill_shell to stop it.`;
 
     return {
       content: [{ type: "text" as const, text: `${header}\n\n${polled.text}` }],
@@ -130,6 +141,11 @@ export const wait = {
         status: shell?.status ?? "running",
         exit_code: shell?.exitCode ?? null,
         waited_sec: waitedSec,
+        ...(leaderExited && !shell ? {
+          leader_exited: true,
+          leader_exit_code: polled.structured.leader_exit_code ?? null,
+          leader_signal: polled.structured.leader_signal ?? null,
+        } : {}),
       },
     };
   },
