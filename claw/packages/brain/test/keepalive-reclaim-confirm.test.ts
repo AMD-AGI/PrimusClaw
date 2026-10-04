@@ -670,3 +670,81 @@ test("a positive count whose write lost a race still ends the streak", async (t)
     replicaB.resetBackgroundWorkStateForTest();
   }
 });
+
+/** Run one sweep on replica A while the record is renewed under its probe. */
+async function sweepWithRenewalUnderProbe(k: SharedKv): Promise<void> {
+  let release!: () => void;
+  rosterGate = new Promise<void>((r) => { release = r; });
+  const reads = rosterReads;
+  const inFlight = sweep(replicaA, k.kv);
+  for (let i = 0; i < 200 && rosterReads === reads; i++) await new Promise((r) => setImmediate(r));
+  assert.ok(rosterReads > reads, "sanity: the probe is reading the roster");
+  await k.kv.put(KEY, sc.encode(JSON.stringify(k.current())));
+  rosterGate = null;
+  release();
+  await inFlight;
+}
+
+test("live work read from a replaced instance whose write lost a race still holds the other replica", async (t) => {
+  // The replaced branch of the expiry probe observed the reading and handed it
+  // to the confirmation, which wrote it once under the pre-probe revision and
+  // swallowed the conflict. A replaced answer with live processes is a positive
+  // count: lost, it left the other replica a clear record to destroy from.
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const replicaB = await import("../src/sandbox/keepalive.js?replica=b") as Replica;
+  const k = sharedKv(entry(Date.now()));
+  try {
+    await sweep(replicaA, k.kv);
+    t.mock.timers.tick(SWEEP_MS);
+    await sweep(replicaA, k.kv);
+    assert.equal(k.current()?.reclaimStreak?.count, 2, "sanity: one reading short of a destroy");
+
+    t.mock.timers.tick(SWEEP_MS);
+    const busyAt = Date.now();
+    roster = { kind: "ok", count: 250, instance: "envd-2" };
+    await sweepWithRenewalUnderProbe(k);
+    assert.equal(k.current()?.lastPositiveCountAt, busyAt,
+      `the replaced positive count was lost to the renewal; record=${JSON.stringify(k.current())}`);
+    assert.equal(k.current()?.reclaimStreak, undefined, "and the streak it ends went with it");
+
+    roster = { kind: "ok", count: 0 };
+    for (let i = 0; i < 4; i++) {
+      t.mock.timers.tick(SWEEP_MS);
+      await sweep(replicaB, k.kv);
+      assert.ok(!destroyed(k),
+        `empty sweep ${i + 1} on the other replica destroyed it inside the window; stops=${JSON.stringify(stops)}`);
+    }
+  } finally {
+    replicaB.resetBackgroundWorkStateForTest();
+  }
+});
+
+test("an answer from the bound instance whose write lost a race still ends a replaced run", async (t) => {
+  // An empty roster from the bound instance is contrary to a replacement run.
+  // Written once and lost, the run stayed on the record and the next replaced
+  // reading on the other replica completed it.
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const replicaB = await import("../src/sandbox/keepalive.js?replica=b") as Replica;
+  const k = sharedKv(entry(Date.now()));
+  try {
+    roster = { kind: "ok", count: 0, instance: "envd-2" };
+    await sweep(replicaA, k.kv);
+    t.mock.timers.tick(SWEEP_MS);
+    await sweep(replicaA, k.kv);
+    assert.equal(k.current()?.reclaimStreak?.reason, "instance_replaced", "sanity: a replaced run");
+    assert.equal(k.current()?.reclaimStreak?.count, 2, "sanity: one reading short of a destroy");
+
+    t.mock.timers.tick(SWEEP_MS);
+    roster = { kind: "ok", count: 0 };
+    await sweepWithRenewalUnderProbe(k);
+    assert.notEqual(k.current()?.reclaimStreak?.reason, "instance_replaced",
+      `the bound answer was lost to the renewal; record=${JSON.stringify(k.current())}`);
+
+    t.mock.timers.tick(SWEEP_MS);
+    roster = { kind: "ok", count: 0, instance: "envd-2" };
+    await sweep(replicaB, k.kv);
+    assert.ok(!destroyed(k), `a replaced run the bound instance ended was completed; stops=${JSON.stringify(stops)}`);
+  } finally {
+    replicaB.resetBackgroundWorkStateForTest();
+  }
+});

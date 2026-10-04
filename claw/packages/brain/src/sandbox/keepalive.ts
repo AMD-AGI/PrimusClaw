@@ -61,7 +61,7 @@ import {
 } from "./job-probe.js";
 import {
   applyObservation, later, reclaimDecision,
-  type JobsObservation, type ReclaimEvidenceFields, type ReclaimReason,
+  type JobsObservation, type ReclaimEvidenceFields, type ReclaimReason, type ReclaimStreak,
 } from "./reclaim-evidence.js";
 import { SandboxGoneError, SandboxRuntimeTerminalError } from "./errors.js";
 
@@ -321,10 +321,32 @@ function withLocalHolds(identity: string, info: HandsKvEntry, now: number): Hand
   return merged;
 }
 
+/**
+ * One jobs-probe reading as it bears on a destroy. `holds` is true when the
+ * reading can only hold one: a failed probe, a positive count, or a reading
+ * that ends the streak the record held (an answer from the bound instance
+ * ending a replaced run, a replaced answer ending an empty one). Such a reading
+ * must reach the record through persistHoldingObservation, never through a
+ * single CAS whose conflict is swallowed.
+ */
+interface ObservedReading {
+  /** The record as read, before the reading was applied. */
+  base: HandsKvEntry;
+  obs: JobsObservation;
+  holds: boolean;
+}
+
 /** The record after one jobs-probe reading; see sandbox/reclaim-evidence.ts. */
 function observe(
   deps: KeepaliveDeps, identity: string, info: HandsKvEntry, obs: JobsObservation,
 ): HandsKvEntry {
+  return observeReading(deps, identity, info, obs).info;
+}
+
+/** As observe, also saying whether the reading can only hold a destroy. */
+function observeReading(
+  deps: KeepaliveDeps, identity: string, info: HandsKvEntry, obs: JobsObservation,
+): { info: HandsKvEntry; reading: ObservedReading } {
   const now = (deps.now ?? Date.now)();
   const prev = withLocalHolds(identity, info, now);
   const fields = applyObservation(prev, obs, {
@@ -339,7 +361,12 @@ function observe(
   const ended = before && !(after && after.reason === before.reason && after.firstAt === before.firstAt)
     ? [before.reason] : [];
   noteLocalHold(identity, now, obs, ended);
-  return { ...prev, ...fields };
+  const holds = obs.kind === "failure" || (obs.count ?? 0) > 0 || ended.length > 0;
+  return { info: { ...prev, ...fields }, reading: { base: info, obs, holds } };
+}
+
+function sameStreak(a: ReclaimStreak | undefined, b: ReclaimStreak | undefined): boolean {
+  return !!a && !!b && a.reason === b.reason && a.firstAt === b.firstAt;
 }
 
 /** Attempts at landing a reading that can only hold a destroy. */
@@ -372,7 +399,8 @@ async function persistHoldingObservation(
     try {
       let base: HandsKvEntry;
       let revision: number;
-      if (attempt === 1 && first) {
+      const reread = !(attempt === 1 && first);
+      if (!reread && first) {
         base = first.info;
         revision = first.revision;
       } else {
@@ -385,7 +413,13 @@ async function persistHoldingObservation(
         base = current;
         revision = e.revision;
       }
+      const prior = reread
+        ? withLocalHolds(identity, base, (deps.now ?? Date.now)()).reclaimStreak : undefined;
       let next = observe(deps, identity, base, obs);
+      // On a record that moved since the reading was taken, the reading only
+      // holds: it may end the streak there, never start or extend one, since
+      // the record may now be in an idle period the reading was not about.
+      if (reread) next.reclaimStreak = sameStreak(next.reclaimStreak, prior) ? prior : undefined;
       if (extra) next = extra(next);
       const written = await deps.kv.update(key, sc.encode(JSON.stringify(next)), revision);
       return { info: next, revision: written };
@@ -447,6 +481,8 @@ async function confirmReclaim(
   info: HandsKvEntry,
   reason: ReclaimReason,
   probe?: { count?: number; podUid?: string; instanceId?: string },
+  /** The reading `info` carries, when it was applied here and not yet written. */
+  reading?: ObservedReading,
 ): Promise<boolean> {
   const now = (deps.now ?? Date.now)();
   // Through what this process has seen, too: a hold whose write was lost is
@@ -463,6 +499,15 @@ async function confirmReclaim(
     { ...reclaimEvidence(sessionId, info, reason, probe), hold: decision.hold },
     "keepalive.reclaim_held",
   );
+  if (reading?.holds) {
+    // A reading that can only hold a destroy is re-read and re-applied on a
+    // lost CAS: dropped, it leaves another replica the streak it ended or the
+    // quiet window it opened.
+    await persistHoldingObservation(deps, key, identity, reading.obs, { info: reading.base, revision });
+    return false;
+  }
+  // ADVANCING only: the reading extends or starts a streak and ended none. A
+  // lost write costs a sweep of confirmation, never the hold.
   await deps.kv.update(key, sc.encode(JSON.stringify(info)), revision).catch(() => {});
   return false;
 }
@@ -1398,8 +1443,12 @@ async function confirmExpiredRetryStop(
         { sessionId, workloadId: infoNow.workloadId, running },
         "keepalive.retry_pending_stop_deferred_jobs_busy",
       );
-      const next = observe(deps, identity, infoNow, { kind: "count", count: running });
-      await deps.kv.update(recordKey, sc.encode(JSON.stringify(next)), claimRevision).catch(() => {});
+      // Live work holds the destroy on every replica: landed even when the
+      // record moved during the probe (see persistHoldingObservation).
+      await persistHoldingObservation(
+        deps, recordKey, identity, { kind: "count", count: running },
+        { info: infoNow, revision: claimRevision },
+      );
       return false;
     }
   } catch (err) {
@@ -1460,9 +1509,11 @@ async function confirmExpiredRetryStop(
     return false;
   }
   // Same confirmation as idle expiry: one empty roster does not stop a sandbox.
-  claimedInfo = observe(deps, identity, claimedInfo, { kind: "count", count: 0 });
+  const observed = observeReading(deps, identity, claimedInfo, { kind: "count", count: 0 });
+  claimedInfo = observed.info;
   if (!(await confirmReclaim(
     deps, recordKey, claimRevision, sessionId, identity, claimedInfo, "idle_empty", probed,
+    observed.reading,
   ))) {
     return false;
   }
@@ -2767,7 +2818,30 @@ async function refreshIdleSince(
     }));
     await deps.kv.update(key, next, revision);
     if (workObserved) delete info.quiescedAt;
-  } catch { /* lost the race, or KV is unhappy; the next sweep tries again */ }
+    return;
+  } catch {
+    if (!workObserved) return; // a plain renewal: the next sweep tries again
+  }
+  // Clearing the reuse anchor holds the destroy (the window restarts only on
+  // the next confirmed empty roster), so a lost race re-reads and re-applies it
+  // to the same sandbox in the same idle period rather than dropping it.
+  const identity = entryIdentity(info);
+  for (let attempt = 1; attempt <= HOLD_WRITE_ATTEMPTS; attempt++) {
+    try {
+      const e = await deps.kv.get(key);
+      if (!e || isTombstone(e)) return;
+      const current = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
+      if (entryIdentity(current) !== identity || isClosingStatus(current.status)) return;
+      if (!stillInIdlePeriod(info, current)) return;
+      if (current.quiescedAt === undefined) return;
+      await deps.kv.update(key, sc.encode(JSON.stringify({ ...current, quiescedAt: undefined })), e.revision);
+      delete info.quiescedAt;
+      return;
+    } catch {
+      // The revision moved again: re-read.
+    }
+  }
+  logger.warn({ identity, attempts: HOLD_WRITE_ATTEMPTS }, "keepalive.reuse_anchor_clear_unpersisted");
 }
 
 /** Run `fn` over every item, at most `limit` at a time. */
@@ -3181,9 +3255,10 @@ async function expireIdleTarget(
     }
     // One empty roster is not enough: it has to agree with the sweeps before
     // it, with no failed probe or positive count inside the quiet window.
-    info = observe(deps, identity, info, { kind: "count", count: 0 });
+    const observed = observeReading(deps, identity, info, { kind: "count", count: 0 });
+    info = observed.info;
     if (!(await confirmReclaim(
-      deps, key, claimRevision, sessionId, identity, info, "idle_empty", probed,
+      deps, key, claimRevision, sessionId, identity, info, "idle_empty", probed, observed.reading,
     ))) {
       return;
     }
@@ -3253,9 +3328,11 @@ async function expireIdleTarget(
         // nothing on the platform side can confirm it short of terminal/absent.
         branch = "instance_replaced";
         probeFacts = { count: err.after.count, podUid: err.after.podUid, instanceId: err.after.instanceId };
-        info = observe(deps, identity, info, replacedObservation(err));
+        const observed = observeReading(deps, identity, info, replacedObservation(err));
+        info = observed.info;
         if (!(await confirmReclaim(
           deps, key, claimRevision, sessionId, identity, info, "instance_replaced", probeFacts,
+          observed.reading,
         ))) {
           return;
         }
