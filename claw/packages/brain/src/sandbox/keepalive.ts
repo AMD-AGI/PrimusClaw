@@ -245,6 +245,7 @@ function observe(
     ...applyObservation(info, obs, {
       identity,
       idleEpoch: info.idleEpoch,
+      idleSince: info.idleSince,
       now: (deps.now ?? Date.now)(),
       spacingMs: RECLAIM_OBSERVATION_SPACING_MS,
     }),
@@ -304,7 +305,7 @@ async function confirmReclaim(
 ): Promise<boolean> {
   const decision = reclaimDecision(
     info, reason,
-    { identity, idleEpoch: info.idleEpoch, now: (deps.now ?? Date.now)() },
+    { identity, idleEpoch: info.idleEpoch, idleSince: info.idleSince, now: (deps.now ?? Date.now)() },
     { sweeps: SANDBOX_RECLAIM_CONFIRM_SWEEPS, quietMs: SANDBOX_RECLAIM_QUIET_MS },
   );
   if (decision.allowed) return true;
@@ -318,12 +319,34 @@ async function confirmReclaim(
 }
 
 /**
+ * Whether `current` is still parked in the idle period `atStart` was read in.
+ *
+ * Matched the way persistVerdict matches a verdict: epoch for current writers,
+ * `idleSince` for older ones, `idleRev` against same-millisecond reuse. A
+ * reactivation clears `idleSince`, and the next park writes a new one under a
+ * new revision, so no reading taken before either can pass.
+ */
+function stillInIdlePeriod(atStart: HandsKvEntry, current: HandsKvEntry): boolean {
+  return current.keepalive === false
+    && typeof current.idleSince === "number"
+    && sameIdlePeriod(atStart.idleEpoch, current)
+    && current.idleSince === atStart.idleSince
+    && current.idleRev === atStart.idleRev;
+}
+
+/**
  * Record one reading on the current record, re-read under CAS. Used where no
  * enrollment revision is being held for a claim (the background probe).
  * Returns the record as written, or null when it could not be.
+ *
+ * A reading that can advance a destroy streak is about the idle period the
+ * probe started in (`atStart`), and is dropped once the handle has left it: a
+ * probe still in flight when a turn takes the sandbox back must not complete
+ * the old period's streak against a handle that is now in use. A failed probe
+ * is recorded regardless; it only ever holds a destroy.
  */
 async function recordObservation(
-  deps: KeepaliveDeps, key: string, identity: string, obs: JobsObservation,
+  deps: KeepaliveDeps, key: string, identity: string, obs: JobsObservation, atStart: HandsKvEntry,
 ): Promise<{ info: HandsKvEntry; revision: number } | null> {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
@@ -331,6 +354,11 @@ async function recordObservation(
       if (!e || isTombstone(e)) return null;
       const current = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
       if (entryIdentity(current) !== identity || isClosingStatus(current.status)) return null;
+      if (obs.kind !== "failure"
+        && (!stillInIdlePeriod(atStart, current) || localRegistry.has(identity))) {
+        logger.info({ identity }, "keepalive.reclaim_observation_reactivated");
+        return null;
+      }
       const next = observe(deps, identity, current, obs);
       const revision = await deps.kv.update(key, sc.encode(JSON.stringify(next)), e.revision);
       return { info: next, revision };
@@ -2261,34 +2289,35 @@ async function runBackgroundProbe(deps: KeepaliveDeps, probe: BackgroundProbe): 
         // One answer from a new identity is not a replacement: an EnvD that
         // restarted beside a data-path blip answers this way with the user's
         // work still running. Act only on a confirmed run of them.
-        const recorded = await recordObservation(deps, key, identity, replacedObservation(err));
+        const recorded = await recordObservation(
+          deps, key, identity, replacedObservation(err), info,
+        );
         if (!recorded) return;
         const probeFacts = { count: err.after.count, podUid: err.after.podUid, instanceId: err.after.instanceId };
         if (await confirmReclaim(
           deps, key, recorded.revision, sessionId, identity, recorded.info,
           "instance_replaced", probeFacts,
-        )) {
+        ) && await closeConfirmedReplacement(deps, key, sessionId, identity, recorded, err.reason)) {
           logger.warn(
             reclaimEvidence(sessionId, recorded.info, "instance_replaced", probeFacts),
             "keepalive.reclaim_destroy",
           );
           metrics.onKeepaliveReclaim("instance_replaced");
-          await reportTerminalFailure(deps, sessionId, identity, err.reason);
         }
       } else if (err instanceof SandboxRuntimeTerminalError) {
         await reportTerminalFailure(deps, sessionId, identity, err.reason);
       } else if (err instanceof SandboxTrackingLostError) {
         logger.error({ sessionId, workloadId: info.workloadId }, "keepalive.jobs_tracking_lost");
-        await recordObservation(deps, key, identity, { kind: "failure" });
+        await recordObservation(deps, key, identity, { kind: "failure" }, info);
       } else if (err instanceof SandboxJobsUnavailableError) {
         logger.info(
           { sessionId, workloadId: info.workloadId, status: err.httpStatus },
           "keepalive.jobs_api_absent",
         );
-        await recordObservation(deps, key, identity, { kind: "failure" });
+        await recordObservation(deps, key, identity, { kind: "failure" }, info);
       } else {
         reportUnknownProbe(probe, err);
-        await recordObservation(deps, key, identity, { kind: "failure" });
+        await recordObservation(deps, key, identity, { kind: "failure" }, info);
       }
     }
   } catch (err) {
@@ -2299,6 +2328,46 @@ async function runBackgroundProbe(deps: KeepaliveDeps, probe: BackgroundProbe): 
   } finally {
     await releaseProbe(deps, key, identity, token);
   }
+}
+
+/**
+ * Write the terminal verdict for a confirmed replacement in the same CAS as the
+ * reading that confirmed it.
+ *
+ * Not reportTerminalFailure, which re-reads and writes whatever it finds: a
+ * turn that takes the handle back between the confirming write and this one
+ * would be marked closing, and the next sweep stops a sandbox in use. The
+ * revision the confirming reading was written under is the witness that the
+ * handle is still in the idle period the streak was built in; a sandbox held
+ * here or under a run lease is not closed on an unconfirmed-by-platform reading.
+ */
+async function closeConfirmedReplacement(
+  deps: KeepaliveDeps,
+  key: string,
+  sessionId: string,
+  identity: string,
+  recorded: { info: HandsKvEntry; revision: number },
+  reason: string,
+): Promise<boolean> {
+  if (localRegistry.has(identity)
+    || await sessionHasActiveRunLease(deps.kv, sessionId, recorded.info.runScope)) {
+    logger.info({ sessionId, identity }, "keepalive.reclaim_replaced_held");
+    return false;
+  }
+  try {
+    await deps.kv.update(
+      key,
+      sc.encode(JSON.stringify({ ...recorded.info, terminalReason: reason, status: "closing" })),
+      recorded.revision,
+    );
+  } catch {
+    // Moved since the confirming reading: a reactivation, or another writer.
+    // A later sweep reads it again, under whatever period it is in by then.
+    logger.info({ sessionId, identity }, "keepalive.idle_reclaim_superseded");
+    return false;
+  }
+  await emitTerminalFailureEvent(deps, sessionId, reason);
+  return true;
 }
 
 async function invalidateProbeVerdict(deps: KeepaliveDeps, probe: BackgroundProbe): Promise<void> {

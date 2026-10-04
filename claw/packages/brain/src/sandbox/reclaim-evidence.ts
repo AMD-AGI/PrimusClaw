@@ -43,6 +43,12 @@ export interface ReclaimStreak {
   identity: string;
   /** Idle period the readings were made in; a reactivation starts a new one. */
   idleEpoch?: number;
+  /**
+   * The period's `idleSince` as well: a replica on an older build reactivates
+   * and re-idles a handle without touching `idleEpoch` (or this streak), and
+   * `idleSince` is the one field every build's park writes anew.
+   */
+  idleSince?: number;
   count: number;
   firstAt: number;
   lastAt: number;
@@ -75,6 +81,7 @@ export type JobsObservation =
 export interface ObservationContext {
   identity: string;
   idleEpoch?: number;
+  idleSince?: number;
   now: number;
   /** Readings closer together than this are one sweep's worth of evidence. */
   spacingMs: number;
@@ -82,14 +89,21 @@ export interface ObservationContext {
 
 const MAX_KEPT_COUNTS = 8;
 
+/** Whether a streak was recorded in the idle period `ctx` names. */
+function samePeriod(
+  streak: ReclaimStreak, ctx: { idleEpoch?: number; idleSince?: number },
+): boolean {
+  return streak.idleEpoch === ctx.idleEpoch && streak.idleSince === ctx.idleSince;
+}
+
 function continues(
   streak: ReclaimStreak | undefined,
   reason: ReclaimReason,
   obs: JobsObservation,
-  ctx: { identity: string; idleEpoch?: number },
+  ctx: { identity: string; idleEpoch?: number; idleSince?: number },
 ): streak is ReclaimStreak {
   if (!streak || streak.reason !== reason || streak.identity !== ctx.identity) return false;
-  if (streak.idleEpoch !== ctx.idleEpoch) return false;
+  if (!samePeriod(streak, ctx)) return false;
   if (obs.kind === "replaced") {
     return streak.podUidAfter === obs.podUidAfter && streak.instanceIdAfter === obs.instanceIdAfter;
   }
@@ -146,6 +160,7 @@ export function applyObservation(
     counts: [count],
   };
   if (ctx.idleEpoch !== undefined) streak.idleEpoch = ctx.idleEpoch;
+  if (ctx.idleSince !== undefined) streak.idleSince = ctx.idleSince;
   if (obs.kind === "replaced") {
     if (obs.podUidAfter) streak.podUidAfter = obs.podUidAfter;
     if (obs.instanceIdAfter) streak.instanceIdAfter = obs.instanceIdAfter;
@@ -164,12 +179,12 @@ export interface ReclaimConfirmConfig {
 export function reclaimDecision(
   fields: ReclaimEvidenceFields,
   reason: ReclaimReason,
-  ctx: { identity: string; idleEpoch?: number; now: number },
+  ctx: { identity: string; idleEpoch?: number; idleSince?: number; now: number },
   cfg: ReclaimConfirmConfig,
 ): { allowed: true } | { allowed: false; hold: ReclaimHold } {
   const streak = fields.reclaimStreak;
   if (!streak || streak.reason !== reason || streak.identity !== ctx.identity
-    || streak.idleEpoch !== ctx.idleEpoch || streak.count < cfg.sweeps) {
+    || !samePeriod(streak, ctx) || streak.count < cfg.sweeps) {
     return { allowed: false, hold: "awaiting_confirmation" };
   }
   if (typeof fields.lastProbeFailureAt === "number"

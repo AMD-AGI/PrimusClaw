@@ -2096,6 +2096,9 @@ async function clearIdleMarkers(
   delete info.keepalive;
   delete info.idleSince;
   delete info.quiescedAt;
+  // A destroy streak is evidence about the idle period this ends; carried into
+  // the next one it could complete there. See sandbox/reclaim-evidence.ts.
+  delete info.reclaimStreak;
   if (restamp && held) {
     info.taskId = held.taskId;
     info.attemptId = held.attemptId;
@@ -2180,6 +2183,7 @@ async function clearIdleMarkers(
       keepalive: undefined,
       idleSince: undefined,
       quiescedAt: undefined,
+      reclaimStreak: undefined,
     })), latest.revision);
     return true;
   } catch (err) {

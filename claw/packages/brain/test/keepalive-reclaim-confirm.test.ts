@@ -129,11 +129,14 @@ type Roster =
   | { kind: "eof" }
   | { kind: "ok"; count: number; pod?: string; instance?: string };
 let roster: Roster = { kind: "ok", count: 0 };
+/** When set, every jobs read waits on it before answering. */
+let rosterGate: Promise<void> | null = null;
 const realFetch = globalThis.fetch;
 
 function stubRouter(): void {
   globalThis.fetch = (async (url: string | URL) => {
     if (!String(url).endsWith("/api/jobs")) throw new Error(`unexpected fetch ${String(url)}`);
+    if (rosterGate) await rosterGate;
     if (roster.kind === "eof") {
       throw Object.assign(new TypeError("fetch failed"), { cause: new Error("other side closed (EOF)") });
     }
@@ -149,6 +152,7 @@ beforeEach(() => {
   status = { running: true, healthy: true, state: "running" };
   stops = [];
   roster = { kind: "ok", count: 0 };
+  rosterGate = null;
   stubProvider();
   stubRouter();
 });
@@ -426,4 +430,70 @@ test("a failed probe on one replica holds a destroy on the other", async (t) => 
   } finally {
     replicaB.resetBackgroundWorkStateForTest();
   }
+});
+
+test("a replaced reading still in flight when the handle is taken back does not close it", async (t) => {
+  // The background probe re-reads the record before it writes its reading, but
+  // used to check only that the sandbox and its status were the same. A turn
+  // that took the handle back on another replica while the third probe was
+  // reading the roster clears the idle markers and nothing else, so the third
+  // reading completed the old period's streak, the probe wrote terminalReason
+  // + closing, and the next sweep stopped a sandbox the turn was using.
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  // Background work held, so no reuse window is open and only the probe asks.
+  const k = sharedKv(entry(Date.now(), { quiescedAt: undefined }));
+  roster = { kind: "ok", count: 0, instance: "envd-2" };
+
+  for (let i = 0; i < 2; i++) {
+    await sweep(replicaA, k.kv);
+    t.mock.timers.tick(SWEEP_MS);
+  }
+  assert.equal(k.current()?.reclaimStreak?.count, 2, "sanity: one reading short of a confirmation");
+  const idlePeriod = k.current()!.idleSince;
+
+  // The third probe is reading the roster...
+  let release!: () => void;
+  rosterGate = new Promise<void>((r) => { release = r; });
+  await sweep(replicaA, k.kv);
+  assert.equal(k.current()?.reclaimStreak?.count, 2, "sanity: the third reading is still in the air");
+
+  // ...when a turn on another replica takes the handle back. A build that
+  // predates the streak clears only the markers it knows about.
+  const active = { ...k.current()! };
+  delete active.keepalive;
+  delete active.idleSince;
+  delete active.quiescedAt;
+  await k.kv.put(KEY, sc.encode(JSON.stringify(active)));
+
+  rosterGate = null;
+  release();
+  for (let i = 0; i < 30; i++) await new Promise((r) => setImmediate(r));
+
+  assert.equal(k.current()?.terminalReason, undefined,
+    `a reading from the old idle period closed a handle in use; record=${JSON.stringify(k.current())}`);
+  assert.equal(k.current()?.status, "ready");
+  assert.ok(k.current()?.keepalive === undefined && k.current()?.idleSince === undefined,
+    "the turn's reactivation stands");
+  assert.notEqual(k.current()?.reclaimStreak?.count, 3, "the old streak was not completed");
+  assert.ok(!destroyed(k));
+
+  // The turn ends and the handle parks again. That is a new idle period: the
+  // two readings from before the turn do not count toward it.
+  t.mock.timers.tick(SWEEP_MS);
+  await k.kv.put(KEY, sc.encode(JSON.stringify({
+    ...k.current(), keepalive: false, idleSince: Date.now(),
+  })));
+  assert.notEqual(Date.now(), idlePeriod, "sanity: a different period");
+  await sweep(replicaA, k.kv);
+  assert.equal(k.current()?.reclaimStreak?.count, 1, "the new period counts from one");
+  t.mock.timers.tick(SWEEP_MS);
+  await sweep(replicaA, k.kv);
+  assert.ok(!destroyed(k) && k.current()?.terminalReason === undefined,
+    "two readings in the new period are still two");
+  t.mock.timers.tick(SWEEP_MS);
+  await sweep(replicaA, k.kv);
+  t.mock.timers.tick(SWEEP_MS);
+  await sweep(replicaA, k.kv);
+  assert.ok(destroyed(k) || k.current()?.terminalReason === "sandbox_instance_replaced",
+    "sanity: three in the new period still confirm it");
 });

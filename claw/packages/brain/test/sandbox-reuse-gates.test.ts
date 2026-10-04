@@ -59,6 +59,7 @@ interface Entry {
   namespace?: string;
   userId?: string;
   terminalReason?: string;
+  reclaimStreak?: Record<string, unknown>;
 }
 
 function fakeKv(entry: Entry | null): { kv: KV; puts: string[] } {
@@ -408,6 +409,31 @@ test("reactivating an idle sandbox clears the marker that had it collected", asy
   assert.equal(puts.length, 1, "the marker is only rewritten when there is one to clear");
   const written = JSON.parse(puts[0]);
   assert.ok(!("keepalive" in written) && !("idleSince" in written));
+});
+
+test("reactivating an idle sandbox drops the idle period's destroy streak", async () => {
+  // Keepalive builds a streak of agreeing readings before it destroys an idle
+  // sandbox, bound to the idle period they were made in. A reactivation ends
+  // that period; a streak carried past it could be completed by a reading
+  // still in flight about the old one.
+  stubEffects();
+  stubHealth("ok");
+  const streak = { reason: "instance_replaced", identity: "wl-1", count: 2, firstAt: 1, lastAt: 2, counts: [0, 0] };
+  const idle = {
+    ...LIVE, specFingerprint: specOf(), keepalive: false, idleSince: "2026-01-01T00:00:00Z",
+    reclaimStreak: streak,
+  };
+  const { a, puts } = attempt(idle);
+  assert.ok(await tryReuseSessionSandbox(a));
+  assert.equal(puts.length, 1);
+  assert.ok(!("reclaimStreak" in JSON.parse(puts[0]!)), `first write kept the streak: ${puts[0]}`);
+
+  // And on the retry after a lost CAS, which rebuilds the value from a re-read.
+  const { kv, puts: retried } = conflictingKv(idle, { ...idle });
+  const { a: again } = attempt(idle, { kv });
+  assert.ok(await tryReuseSessionSandbox(again));
+  assert.equal(retried.length, 1);
+  assert.ok(!("reclaimStreak" in JSON.parse(retried[0]!)), `retry kept the streak: ${retried[0]}`);
 });
 
 test("reusing a sandbox with nothing to clear writes nothing at all", async () => {
