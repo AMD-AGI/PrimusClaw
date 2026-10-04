@@ -137,7 +137,7 @@ test("the background tool set is exactly the four names", () => {
 
 test("the ceiling function's own answers are pinned with the switch on", () => {
   assert.equal(toolTimeoutCeilingSec("bash"), 120);
-  assert.equal(toolTimeoutCeilingSec("wait"), 1800,
+  assert.equal(toolTimeoutCeilingSec("wait"), 100,
     "the wait ceiling does not follow the switch; only bash's configured "
       + "maximum does");
 });

@@ -638,6 +638,7 @@ export function waitForShellExit(
   run: string,
   id: string,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<BgShell | null> | ShellResolution {
   if (!BG_SHELL_ENABLED) return UNKNOWN_RESOLUTION;
   const resolved = resolveShell(owner, run, id);
@@ -669,6 +670,7 @@ export function waitForShellExit(
       // released.
       shell.process.removeListener("exit", onExit);
       offGroup();
+      signal?.removeEventListener("abort", giveUp);
       // One tick, so process-runner's own exit handler has set status and
       // exitCode before the caller reads them off the shell.
       setImmediate(() => done(shell));
@@ -693,7 +695,8 @@ export function waitForShellExit(
     // delivered before this call existed, so the subscription below can never
     // fire for it and the wait would sit out its whole timeout.
     const offGroup = onGroupDrained(regKey(owner, run || NO_RUN, id), () => finish());
-    const timer = setTimeout(() => {
+    const giveUp = () => {
+      clearTimeout(timer);
       // The listener leaves with the wait that registered it. A wait that runs
       // out is expected to be repeated -- the documented way to sit on a
       // twelve-hour job is a series of waits -- so one left behind per timeout
@@ -701,10 +704,16 @@ export function waitForShellExit(
       // MaxListenersExceededWarning against a leak that is not one.
       shell.process.removeListener("exit", onExit);
       offGroup();
+      signal?.removeEventListener("abort", giveUp);
       done(null);
-    }, timeoutMs);
+    };
+    const timer = setTimeout(giveUp, timeoutMs);
     timer.unref?.();
     shell.process.once("exit", onExit);
+    // A caller that has gone away is not waited for: it ends the wait the way
+    // the timeout does, and the caller decides what that means.
+    if (signal?.aborted) { giveUp(); return; }
+    signal?.addEventListener("abort", giveUp, { once: true });
   });
 }
 

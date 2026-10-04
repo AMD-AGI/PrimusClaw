@@ -1616,9 +1616,9 @@ export const BG_SHELL_REAP_GRACE_MS = envInt(
 /**
  * The ceiling on one `wait` call, mirroring Hands' WAIT_MAX_SEC.
  *
- * Far longer than the foreground ceiling, and deliberately so: a wait is not
- * doing anything, so abandoning one costs nothing and leaves nothing
- * half-written, which is the whole argument the foreground ceiling rests on.
+ * Not bound by the foreground ceiling's argument: a wait is not doing
+ * anything, so abandoning one costs nothing and leaves nothing half-written.
+ * What bounds it instead is the request that carries it (below).
  *
  * Brain needs the number because it builds the RPC deadline for the call, and
  * Hands clamps a larger `timeout_sec` to this without saying so. A deadline
@@ -1631,8 +1631,18 @@ export const BG_SHELL_REAP_GRACE_MS = envInt(
  *
  * Refused below 1 for the same reason the foreground ceiling is: a wait whose
  * deadline is the transport slack alone is a wait that cannot wait.
+ *
+ * The default is under two minutes, not the half-hour it once was, because a
+ * wait is answered by one HTTP request whose reply is written only when the
+ * wait ends, and a proxy in front of Hands may cut a request that has sent
+ * nothing for that long: the sandbox Router's port proxy gives up on response
+ * headers at 120s. A 180s wait failed at exactly 120s as "sandbox service
+ * unreachable", and the agent tore down a job that was running fine. Brain's
+ * own deadline is built from this number and is never the shorter one, so the
+ * ceiling has to sit under the proxy's limit; a longer wait is a series of
+ * calls. Raise it only where nothing between Brain and Hands has such a limit.
  */
-export const WAIT_MAX_SEC = envInt("WAIT_MAX_SEC", 1_800, { min: 1 });
+export const WAIT_MAX_SEC = envInt("WAIT_MAX_SEC", 100, { min: 1 });
 
 /**
  * The default a `wait` that names no timeout gets, mirroring Hands'
@@ -1643,7 +1653,8 @@ export const WAIT_MAX_SEC = envInt("WAIT_MAX_SEC", 1_800, { min: 1 });
  * comes to plan around a wait length nothing enforces. It travels with the rest
  * of the sandbox env so the number the schema names is the number that applies.
  */
-export const WAIT_DEFAULT_SEC = envInt("WAIT_DEFAULT_SEC", 300, { min: 1 });
+// Equal to the ceiling by default: a default above it would be clamped on every call.
+export const WAIT_DEFAULT_SEC = envInt("WAIT_DEFAULT_SEC", 100, { min: 1 });
 
 // --- HITL ---
 export const HITL_ENABLED = envBool("HITL_ENABLED", false);
