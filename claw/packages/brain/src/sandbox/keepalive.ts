@@ -2339,7 +2339,8 @@ async function runBackgroundProbe(deps: KeepaliveDeps, probe: BackgroundProbe): 
  * would be marked closing, and the next sweep stops a sandbox in use. The
  * revision the confirming reading was written under is the witness that the
  * handle is still in the idle period the streak was built in; a sandbox held
- * here or under a run lease is not closed on an unconfirmed-by-platform reading.
+ * here, under a run lease, or whose lease cannot be read is not closed on a
+ * reading the platform has not confirmed.
  */
 async function closeConfirmedReplacement(
   deps: KeepaliveDeps,
@@ -2349,9 +2350,15 @@ async function closeConfirmedReplacement(
   recorded: { info: HandsKvEntry; revision: number },
   reason: string,
 ): Promise<boolean> {
-  if (localRegistry.has(identity)
-    || await sessionHasActiveRunLease(deps.kv, sessionId, recorded.info.runScope)) {
+  if (localRegistry.has(identity)) {
     logger.info({ sessionId, identity }, "keepalive.reclaim_replaced_held");
+    return false;
+  }
+  // A destructive read: unreadable is not free (see sessionHasActiveRunLease).
+  const leaseScope = typeof recorded.info.runScope === "string" && recorded.info.runScope
+    ? recorded.info.runScope : sessionId;
+  if (await readRunLeaseState(deps.kv, leaseScope) !== "free") {
+    logger.info({ sessionId, identity, leaseScope }, "keepalive.reclaim_replaced_held");
     return false;
   }
   try {

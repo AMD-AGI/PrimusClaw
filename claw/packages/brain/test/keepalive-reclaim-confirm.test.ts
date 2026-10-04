@@ -59,6 +59,9 @@ interface SharedKv {
   current: () => Record<string, any> | null;
 }
 
+/** Runs on every read of the run lease, before it answers; see the last test. */
+let onLeaseRead: (() => Promise<void>) | null = null;
+
 function sharedKv(initial: Record<string, unknown>): SharedKv {
   const store = new Map<string, { value: Uint8Array; revision: number }>();
   let seq = 10;
@@ -71,6 +74,7 @@ function sharedKv(initial: Record<string, unknown>): SharedKv {
       return (async function* () { yield* matched; })();
     },
     async get(key: string) {
+      if (key === `lock.${SESSION}` && onLeaseRead) await onLeaseRead();
       const e = store.get(key);
       return e ? { key, value: e.value, revision: e.revision, operation: "PUT" } : null;
     },
@@ -153,6 +157,7 @@ beforeEach(() => {
   stops = [];
   roster = { kind: "ok", count: 0 };
   rosterGate = null;
+  onLeaseRead = null;
   stubProvider();
   stubRouter();
 });
@@ -496,4 +501,39 @@ test("a replaced reading still in flight when the handle is taken back does not 
   await sweep(replicaA, k.kv);
   assert.ok(destroyed(k) || k.current()?.terminalReason === "sandbox_instance_replaced",
     "sanity: three in the new period still confirm it");
+});
+
+test("a turn that takes the handle back after the third reading is written still wins", async (t) => {
+  // The window after the confirming reading is on the record: the probe then
+  // checks the run lease and writes closing. That write used to re-read the
+  // record and close whatever it found under the same sandbox identity, so a
+  // reactivation landing in between was closed too.
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const k = sharedKv(entry(Date.now(), { quiescedAt: undefined }));
+  roster = { kind: "ok", count: 0, instance: "envd-2" };
+  for (let i = 0; i < 2; i++) {
+    await sweep(replicaA, k.kv);
+    t.mock.timers.tick(SWEEP_MS);
+  }
+  assert.equal(k.current()?.reclaimStreak?.count, 2, "sanity: one reading short");
+
+  // The lease read is the step between the confirming write and the close; a
+  // turn on another replica takes the handle back while it is in the air.
+  let reactivated = false;
+  onLeaseRead = async () => {
+    if (reactivated || k.current()?.reclaimStreak?.count !== 3) return;
+    reactivated = true;
+    const active = { ...k.current()! };
+    delete active.keepalive;
+    delete active.idleSince;
+    delete active.quiescedAt;
+    await k.kv.put(KEY, sc.encode(JSON.stringify(active)));
+  };
+  await sweep(replicaA, k.kv);
+
+  assert.ok(reactivated, "sanity: the reactivation landed between the confirmation and the close");
+  assert.equal(k.current()?.terminalReason, undefined,
+    `closed a handle a turn had taken back; record=${JSON.stringify(k.current())}`);
+  assert.equal(k.current()?.status, "ready");
+  assert.ok(!destroyed(k));
 });
