@@ -184,6 +184,15 @@ export const SANDBOX_ROUTER_URL = env("SANDBOX_ROUTER_URL", "");
  * Router with auth on refuses them with 401 and the Hands health check fails loudly.
  */
 export const SANDBOX_HANDS_VIA_ROUTER = envBool("SANDBOX_HANDS_VIA_ROUTER", false);
+
+/**
+ * Whether Brain reaches Hands through the Router's port proxy: the same answer
+ * as `handsViaRouter()` in sandbox/sandbox-router.ts, read here because limits
+ * defined in this file depend on it and that module imports this one.
+ */
+export function handsBehindRouterProxy(): boolean {
+  return SANDBOX_HANDS_VIA_ROUTER && /[^\s,]/.test(SANDBOX_ROUTER_URL);
+}
 export const SANDBOX_NAMESPACE = env("SANDBOX_NAMESPACE", "default");
 export const SANDBOX_CLUSTER_ID = env("SANDBOX_CLUSTER_ID");
 
@@ -1587,10 +1596,22 @@ export const BG_SHELL_ENABLED = envBool("BG_SHELL_ENABLED", false);
  * does not satisfy it: the window in which two replicas can both be driving one
  * workspace is as wide as the ceiling. That is the trade the hatch buys, and it
  * is why the chart documents the pairing beside the feature flag.
+ *
+ * The short ceiling is 100s, not 120s, because one foreground command is one
+ * HTTP request to Hands whose reply is written only when the command ends, and
+ * the sandbox Router's port proxy gives up on response headers at 120s with a
+ * 502 "sandbox service unreachable on port 9100". A command granted 120s met
+ * that limit before its own: the agent was told its sandbox was unreachable,
+ * lost the output, and the command went on running with nothing able to reach
+ * it. For the same reason the long ceiling does not apply where Hands is
+ * reached through that proxy (SANDBOX_HANDS_VIA_ROUTER): no command there can
+ * outlive 120s whatever it is granted, so granting more only turns a timeout
+ * the agent can read into a 502 it cannot. A `wait` has to fit under the same
+ * limit.
  */
 export const BASH_FOREGROUND_MAX_SEC = envInt(
   "BASH_MAX_TIMEOUT_SEC",
-  BG_SHELL_ENABLED ? 120 : 36_000,
+  BG_SHELL_ENABLED || handsBehindRouterProxy() ? 100 : 36_000,
   // A ceiling of zero or less is not "no limit". At zero the RPC deadline this
   // now builds collapses to the transport slack alone, one minute for every
   // command whatever it asked for; below minus the slack it goes negative,
@@ -1602,11 +1623,15 @@ export const BASH_FOREGROUND_MAX_SEC = envInt(
 /**
  * The default the model is told about, mirroring Hands' BASH_DEFAULT_TIMEOUT_SEC.
  *
- * Separate from the ceiling because the two only coincide at 120s: once the
+ * Separate from the ceiling because the two only coincide at 100s: once the
  * ceiling is the ten-hour one, a schema that reports it as the default invites
  * every command to be planned as if it had ten hours.
+ *
+ * 100s rather than 120s for the reason the ceiling gives: a command left to the
+ * default must be answered before a 120s response-header timeout in front of
+ * Hands cuts the request.
  */
-export const BASH_FOREGROUND_DEFAULT_SEC = envInt("BASH_DEFAULT_TIMEOUT_SEC", 120);
+export const BASH_FOREGROUND_DEFAULT_SEC = envInt("BASH_DEFAULT_TIMEOUT_SEC", 100);
 
 // Shared with Hands so the reap grace and the client deadline cannot diverge.
 export const BG_SHELL_REAP_GRACE_MS = envInt(
