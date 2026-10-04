@@ -89,6 +89,13 @@ export interface ObservationContext {
 
 const MAX_KEPT_COUNTS = 8;
 
+/** The later of two instants, either of which may be missing. */
+export function later(a: number | undefined, b: number | undefined): number | undefined {
+  if (typeof a !== "number") return b;
+  if (typeof b !== "number") return a;
+  return Math.max(a, b);
+}
+
 /** Whether a streak was recorded in the idle period `ctx` names. */
 function samePeriod(
   streak: ReclaimStreak, ctx: { idleEpoch?: number; idleSince?: number },
@@ -123,15 +130,18 @@ export function applyObservation(
     lastProbeFailureAt: prev.lastProbeFailureAt,
     lastPositiveCountAt: prev.lastPositiveCountAt,
   };
+  // Evidence that only holds a destroy is merged as the later of what the
+  // record already holds and this reading: a replica whose clock runs behind
+  // must not pull an open quiet window shut by writing an earlier time over it.
   if (obs.kind === "failure") {
-    return { ...base, lastProbeFailureAt: ctx.now, reclaimStreak: undefined };
+    return { ...base, lastProbeFailureAt: later(prev.lastProbeFailureAt, ctx.now), reclaimStreak: undefined };
   }
   // Live user work is contrary evidence whichever instance reports it: a
   // replaced reading with a positive count ends any streak exactly like a
   // positive count from the bound instance, so the replacement branch never
   // reclaims a sandbox whose processes are still running.
   if ((obs.count ?? 0) > 0) {
-    return { ...base, lastPositiveCountAt: ctx.now, reclaimStreak: undefined };
+    return { ...base, lastPositiveCountAt: later(prev.lastPositiveCountAt, ctx.now), reclaimStreak: undefined };
   }
   const reason: ReclaimReason = obs.kind === "replaced" ? "instance_replaced" : "idle_empty";
   const count = obs.count ?? 0;

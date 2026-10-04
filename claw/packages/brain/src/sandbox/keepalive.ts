@@ -60,7 +60,7 @@ import {
   type JobsProbeResult,
 } from "./job-probe.js";
 import {
-  applyObservation, reclaimDecision,
+  applyObservation, later, reclaimDecision,
   type JobsObservation, type ReclaimEvidenceFields, type ReclaimReason,
 } from "./reclaim-evidence.js";
 import { SandboxGoneError, SandboxRuntimeTerminalError } from "./errors.js";
@@ -236,20 +236,165 @@ async function probeJobs(
  */
 const RECLAIM_OBSERVATION_SPACING_MS = Math.max(1, SANDBOX_KEEPALIVE_INTERVAL_SEC) * 1000 / 2;
 
+/**
+ * Evidence this process has seen that can only hold a destroy, kept beside the
+ * record rather than instead of it.
+ *
+ * Every such reading -- a failed probe, a positive count, a reading that ends a
+ * streak -- is written to the hands record under CAS, and a write can still be
+ * lost: the record moves under every probe (TTL renewals, another replica's
+ * sweep, a turn's reactivation), and a bounded retry can run out. A lost
+ * failure marker left the streak it should have ended on the record with no
+ * quiet window behind it, and the next empty reading a sweep later completed it.
+ *
+ * So the reading is noted here first, and every decision this process makes
+ * reads the record through it (`withLocalHolds`): a write that never lands
+ * cannot shorten the quiet window or let an ended streak complete, here. The
+ * next write this process makes to the record carries the merged view, which
+ * is how a lost marker reaches the other replicas.
+ */
+interface LocalHold {
+  failureAt?: number;
+  positiveAt?: number;
+  /** Per reason, when a streak of it was last ended by a contrary reading. */
+  endedAt: Partial<Record<ReclaimReason, number>>;
+  /** Last time anything was noted, for pruning. */
+  at: number;
+}
+
+const localHolds = new Map<string, LocalHold>();
+
+/**
+ * How long a noted hold is kept. The quiet window bounds what a failure or a
+ * positive count can hold; an ended streak is kept longer, since nothing but
+ * this note stops the stale streak a lost write left behind from continuing.
+ */
+const LOCAL_HOLD_TTL_MS = Math.max(SANDBOX_RECLAIM_QUIET_MS, 60 * 60_000);
+
+const ALL_REASONS: readonly ReclaimReason[] = ["idle_empty", "instance_replaced"];
+
+/** The streak reasons a reading is contrary to, whatever the record holds. */
+function reasonsEndedBy(obs: JobsObservation): ReclaimReason[] {
+  if (obs.kind === "failure" || (obs.count ?? 0) > 0) return [...ALL_REASONS];
+  // An answer from the bound instance is contrary to any replacement run.
+  if (obs.kind === "count") return ["instance_replaced"];
+  return [];
+}
+
+function noteLocalHold(
+  identity: string, now: number, obs: JobsObservation, alsoEnded: ReclaimReason[] = [],
+): void {
+  const hold = localHolds.get(identity) ?? { endedAt: {}, at: now };
+  if (obs.kind === "failure") hold.failureAt = later(hold.failureAt, now);
+  else if ((obs.count ?? 0) > 0) hold.positiveAt = later(hold.positiveAt, now);
+  for (const reason of [...reasonsEndedBy(obs), ...alsoEnded]) {
+    hold.endedAt[reason] = later(hold.endedAt[reason], now);
+  }
+  hold.at = Math.max(hold.at, now);
+  localHolds.set(identity, hold);
+}
+
+/**
+ * `info` as this process knows it: the later of its own and the record's
+ * failure and positive-count times, and no streak that began before a reading
+ * this process saw end it.
+ */
+function withLocalHolds(identity: string, info: HandsKvEntry, now: number): HandsKvEntry {
+  const hold = localHolds.get(identity);
+  if (!hold) return info;
+  if (now - hold.at > LOCAL_HOLD_TTL_MS) {
+    localHolds.delete(identity);
+    return info;
+  }
+  const merged: HandsKvEntry = {
+    ...info,
+    lastProbeFailureAt: later(info.lastProbeFailureAt, hold.failureAt),
+    lastPositiveCountAt: later(info.lastPositiveCountAt, hold.positiveAt),
+  };
+  const streak = merged.reclaimStreak;
+  const endedAt = streak ? hold.endedAt[streak.reason] : undefined;
+  // Strictly before: a streak that starts on the very reading that ended the
+  // previous one is the new run, not the old.
+  if (streak && typeof endedAt === "number" && streak.firstAt < endedAt) {
+    delete merged.reclaimStreak;
+  }
+  return merged;
+}
+
 /** The record after one jobs-probe reading; see sandbox/reclaim-evidence.ts. */
 function observe(
   deps: KeepaliveDeps, identity: string, info: HandsKvEntry, obs: JobsObservation,
 ): HandsKvEntry {
-  return {
-    ...info,
-    ...applyObservation(info, obs, {
-      identity,
-      idleEpoch: info.idleEpoch,
-      idleSince: info.idleSince,
-      now: (deps.now ?? Date.now)(),
-      spacingMs: RECLAIM_OBSERVATION_SPACING_MS,
-    }),
-  };
+  const now = (deps.now ?? Date.now)();
+  const prev = withLocalHolds(identity, info, now);
+  const fields = applyObservation(prev, obs, {
+    identity,
+    idleEpoch: prev.idleEpoch,
+    idleSince: prev.idleSince,
+    now,
+    spacingMs: RECLAIM_OBSERVATION_SPACING_MS,
+  });
+  const before = prev.reclaimStreak;
+  const after = fields.reclaimStreak;
+  const ended = before && !(after && after.reason === before.reason && after.firstAt === before.firstAt)
+    ? [before.reason] : [];
+  noteLocalHold(identity, now, obs, ended);
+  return { ...prev, ...fields };
+}
+
+/** Attempts at landing a reading that can only hold a destroy. */
+const HOLD_WRITE_ATTEMPTS = 3;
+
+/**
+ * Land a reading that can only hold a destroy (a failed probe, a positive
+ * count) on the record, re-reading and re-applying it on a lost CAS.
+ *
+ * The first attempt may be made under a revision the caller is holding
+ * (`first`), which renews the record exactly as the single write this replaces
+ * did. Each retry reads the record fresh and applies the reading to whatever
+ * is there, so the failure or positive-count time is merged as the later of the
+ * two and the streak is ended in the same write. A reading that still cannot be
+ * written is held by this process (see LocalHold), so a lost write never
+ * shortens the quiet window; it is logged, not swallowed.
+ */
+async function persistHoldingObservation(
+  deps: KeepaliveDeps,
+  key: string,
+  identity: string,
+  obs: JobsObservation,
+  first?: { info: HandsKvEntry; revision: number },
+  extra?: (next: HandsKvEntry) => HandsKvEntry,
+): Promise<{ info: HandsKvEntry; revision: number } | null> {
+  // Noted before any write is tried: a KV that fails every read below must
+  // hold the destroy here just as a lost CAS does.
+  noteLocalHold(identity, (deps.now ?? Date.now)(), obs);
+  for (let attempt = 1; attempt <= HOLD_WRITE_ATTEMPTS; attempt++) {
+    try {
+      let base: HandsKvEntry;
+      let revision: number;
+      if (attempt === 1 && first) {
+        base = first.info;
+        revision = first.revision;
+      } else {
+        const e = await deps.kv.get(key);
+        // Gone, or now naming another sandbox or being closed: nothing of
+        // this sandbox's is left for the reading to hold.
+        if (!e || isTombstone(e)) return null;
+        const current = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
+        if (entryIdentity(current) !== identity || isClosingStatus(current.status)) return null;
+        base = current;
+        revision = e.revision;
+      }
+      let next = observe(deps, identity, base, obs);
+      if (extra) next = extra(next);
+      const written = await deps.kv.update(key, sc.encode(JSON.stringify(next)), revision);
+      return { info: next, revision: written };
+    } catch {
+      // The revision moved (or the bucket failed): re-read and re-apply.
+    }
+  }
+  logger.warn({ identity, kind: obs.kind, attempts: HOLD_WRITE_ATTEMPTS }, "keepalive.reclaim_hold_unpersisted");
+  return null;
 }
 
 function replacedObservation(err: SandboxInstanceReplacedError): JobsObservation {
@@ -303,9 +448,13 @@ async function confirmReclaim(
   reason: ReclaimReason,
   probe?: { count?: number; podUid?: string; instanceId?: string },
 ): Promise<boolean> {
+  const now = (deps.now ?? Date.now)();
+  // Through what this process has seen, too: a hold whose write was lost is
+  // still a hold here (see LocalHold).
+  info = withLocalHolds(identity, info, now);
   const decision = reclaimDecision(
     info, reason,
-    { identity, idleEpoch: info.idleEpoch, idleSince: info.idleSince, now: (deps.now ?? Date.now)() },
+    { identity, idleEpoch: info.idleEpoch, idleSince: info.idleSince, now },
     { sweeps: SANDBOX_RECLAIM_CONFIRM_SWEEPS, quietMs: SANDBOX_RECLAIM_QUIET_MS },
   );
   if (decision.allowed) return true;
@@ -342,20 +491,23 @@ function stillInIdlePeriod(atStart: HandsKvEntry, current: HandsKvEntry): boolea
  * A reading that can advance a destroy streak is about the idle period the
  * probe started in (`atStart`), and is dropped once the handle has left it: a
  * probe still in flight when a turn takes the sandbox back must not complete
- * the old period's streak against a handle that is now in use. A failed probe
- * is recorded regardless; it only ever holds a destroy.
+ * the old period's streak against a handle that is now in use. A reading that
+ * only ever holds a destroy -- a failed probe, a positive count -- is recorded
+ * regardless, through persistHoldingObservation.
  */
 async function recordObservation(
   deps: KeepaliveDeps, key: string, identity: string, obs: JobsObservation, atStart: HandsKvEntry,
 ): Promise<{ info: HandsKvEntry; revision: number } | null> {
+  if (obs.kind === "failure" || (obs.count ?? 0) > 0) {
+    return persistHoldingObservation(deps, key, identity, obs);
+  }
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const e = await deps.kv.get(key);
       if (!e || isTombstone(e)) return null;
       const current = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
       if (entryIdentity(current) !== identity || isClosingStatus(current.status)) return null;
-      if (obs.kind !== "failure"
-        && (!stillInIdlePeriod(atStart, current) || localRegistry.has(identity))) {
+      if (!stillInIdlePeriod(atStart, current) || localRegistry.has(identity)) {
         logger.info({ identity }, "keepalive.reclaim_observation_reactivated");
         return null;
       }
@@ -1953,6 +2105,7 @@ export function resetBackgroundWorkStateForTest(): void {
   bgGeneration.clear();
   bgProbeCursor = 0;
   teardownRetryAt.clear();
+  localHolds.clear();
   // Rotation state like the cursor above it: a queue left by one test names keys
   // the next one never walks, and its first read phase would order itself around
   // retentions that do not exist.
@@ -2412,6 +2565,12 @@ async function recordProbeVerdict(
 ): Promise<void> {
   if (probeIsStale(probe)) return;
   const { key, identity, sessionId, info, verdictAtStart } = probe;
+  // The reading holds a destroy here whether or not the verdict below lands:
+  // a positive count opens the quiet window, and an answer from the bound
+  // instance ends any replacement run (see LocalHold).
+  if (running !== undefined) {
+    noteLocalHold(identity, (deps.now ?? Date.now)(), { kind: "count", count: running });
+  }
   const held = localRegistry.has(identity)
     || await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope);
   if (probeIsStale(probe)) return;
@@ -2545,11 +2704,14 @@ async function persistVerdict(
       // A positive count is contrary evidence to any destroy streak and opens
       // the quiet window; an answer from the bound instance ends a replaced
       // streak. See sandbox/reclaim-evidence.ts.
+      // Read through this process's holds, so a marker a lost write dropped is
+      // carried by this one (see LocalHold).
+      const known = withLocalHolds(identity, info, quiescedAt);
       const evidence: ReclaimEvidenceFields = running > 0
-        ? { lastPositiveCountAt: quiescedAt, reclaimStreak: undefined }
-        : info.reclaimStreak?.reason === "instance_replaced" ? { reclaimStreak: undefined } : {};
+        ? { lastPositiveCountAt: later(known.lastPositiveCountAt, quiescedAt), reclaimStreak: undefined }
+        : known.reclaimStreak?.reason === "instance_replaced" ? { reclaimStreak: undefined } : {};
       const next = sc.encode(JSON.stringify({
-        ...info,
+        ...known,
         ...evidence,
         ...(running === 0
           ? { quiescedAt: info.quiescedAt ?? quiescedAt }
@@ -2997,8 +3159,14 @@ async function expireIdleTarget(
     });
     const running = probed.count;
     if (running > 0) {
-      info = observe(deps, identity, info, { kind: "count", count: running });
-      await refreshIdleSince(deps, key, claimRevision, info);
+      // Live work: the positive count and the cleared reuse anchor are landed
+      // even when the record moved during the probe, never dropped with a lost
+      // CAS (see persistHoldingObservation).
+      await persistHoldingObservation(
+        deps, key, identity, { kind: "count", count: running },
+        { info, revision: claimRevision },
+        (next) => ({ ...next, quiescedAt: undefined }),
+      );
       return;
     }
     // Refresh fields for the stop payload; CAS still uses claimRevision.
@@ -3132,12 +3300,19 @@ async function expireIdleTarget(
 /**
  * Renew the record under the enrollment revision with a failed probe recorded,
  * which ends any destroy streak and opens the quiet window.
+ *
+ * The enrollment revision is read before the probe, and the record moves while
+ * it runs (TTL renewals, another replica, a reactivation). This used to be one
+ * CAS with the conflict swallowed, which lost the failure marker and left the
+ * streak it should have ended in place: the next empty reading a sweep later
+ * completed it and destroyed the sandbox inside the quiet window. It is now
+ * re-read and re-applied on a lost CAS, and held in this process if it still
+ * cannot land.
  */
 async function recordFailedProbe(
   deps: KeepaliveDeps, key: string, identity: string, info: HandsKvEntry, revision: number,
 ): Promise<void> {
-  const next = observe(deps, identity, info, { kind: "failure" });
-  await deps.kv.update(key, sc.encode(JSON.stringify(next)), revision).catch(() => {});
+  await persistHoldingObservation(deps, key, identity, { kind: "failure" }, { info, revision });
 }
 
 /**

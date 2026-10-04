@@ -61,6 +61,8 @@ interface SharedKv {
 
 /** Runs on every read of the run lease, before it answers; see the last test. */
 let onLeaseRead: (() => Promise<void>) | null = null;
+/** Runs on every conditional write of the hands record, before its CAS; may throw. */
+let onRecordUpdate: ((next: Record<string, any>) => void) | null = null;
 
 function sharedKv(initial: Record<string, unknown>): SharedKv {
   const store = new Map<string, { value: Uint8Array; revision: number }>();
@@ -88,6 +90,7 @@ function sharedKv(initial: Record<string, unknown>): SharedKv {
       return seq;
     },
     async update(key: string, value: Uint8Array, rev: number) {
+      if (key === KEY && onRecordUpdate) onRecordUpdate(JSON.parse(sc.decode(value)));
       const e = store.get(key);
       if (!e || e.revision !== rev) throw new Error("wrong last sequence");
       store.set(key, { value, revision: ++seq });
@@ -135,11 +138,14 @@ type Roster =
 let roster: Roster = { kind: "ok", count: 0 };
 /** When set, every jobs read waits on it before answering. */
 let rosterGate: Promise<void> | null = null;
+/** Jobs reads made so far, answered or still waiting on the gate. */
+let rosterReads = 0;
 const realFetch = globalThis.fetch;
 
 function stubRouter(): void {
   globalThis.fetch = (async (url: string | URL) => {
     if (!String(url).endsWith("/api/jobs")) throw new Error(`unexpected fetch ${String(url)}`);
+    rosterReads += 1;
     if (rosterGate) await rosterGate;
     if (roster.kind === "eof") {
       throw Object.assign(new TypeError("fetch failed"), { cause: new Error("other side closed (EOF)") });
@@ -157,7 +163,9 @@ beforeEach(() => {
   stops = [];
   roster = { kind: "ok", count: 0 };
   rosterGate = null;
+  rosterReads = 0;
   onLeaseRead = null;
+  onRecordUpdate = null;
   stubProvider();
   stubRouter();
 });
@@ -536,4 +544,129 @@ test("a turn that takes the handle back after the third reading is written still
     `closed a handle a turn had taken back; record=${JSON.stringify(k.current())}`);
   assert.equal(k.current()?.status, "ready");
   assert.ok(!destroyed(k));
+});
+
+test("a failure marker whose write lost a race still lands, and the next empty reading does not destroy", async (t) => {
+  // The expiry probe takes the record's revision before it reads the roster
+  // and wrote the failure marker under it once, swallowing the conflict. Any
+  // write in between -- a TTL renewal, another replica -- lost the marker and
+  // kept the streak it should have ended, so the next empty reading a sweep
+  // later completed that streak and destroyed the sandbox inside the window.
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const replicaB = await import("../src/sandbox/keepalive.js?replica=b") as Replica;
+  const k = sharedKv(entry(Date.now()));
+  try {
+    await sweep(replicaA, k.kv);
+    t.mock.timers.tick(SWEEP_MS);
+    await sweep(replicaA, k.kv);
+    assert.equal(k.current()?.reclaimStreak?.count, 2, "sanity: one reading short of a destroy");
+
+    // The third probe reads EOF; while it is in the air, the record is renewed.
+    t.mock.timers.tick(SWEEP_MS);
+    roster = { kind: "eof" };
+    let release!: () => void;
+    rosterGate = new Promise<void>((r) => { release = r; });
+    const reads = rosterReads;
+    const inFlight = sweep(replicaA, k.kv);
+    for (let i = 0; i < 200 && rosterReads === reads; i++) await new Promise((r) => setImmediate(r));
+    assert.ok(rosterReads > reads, "sanity: the probe is reading the roster");
+    await k.kv.put(KEY, sc.encode(JSON.stringify(k.current())));
+    rosterGate = null;
+    release();
+    await inFlight;
+
+    assert.equal(typeof k.current()?.lastProbeFailureAt, "number",
+      `the failure marker was lost to the renewal; record=${JSON.stringify(k.current())}`);
+    assert.equal(k.current()?.reclaimStreak, undefined, "and the streak it ends went with it");
+
+    // The next empty reading, a sweep later and on the other replica -- which
+    // has only the record to go on -- is inside the quiet window.
+    t.mock.timers.tick(SWEEP_MS);
+    roster = { kind: "ok", count: 0 };
+    await sweep(replicaB, k.kv);
+    assert.ok(!destroyed(k), `destroyed inside the quiet window; stops=${JSON.stringify(stops)}`);
+  } finally {
+    replicaB.resetBackgroundWorkStateForTest();
+  }
+});
+
+test("a failure marker that cannot be written at all still holds the destroy on this replica", async (t) => {
+  // The retry is bounded; past it the reading is held in process memory, so a
+  // write that never lands cannot shorten the quiet window here.
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const k = sharedKv(entry(Date.now()));
+  await sweep(replicaA, k.kv);
+  t.mock.timers.tick(SWEEP_MS);
+  await sweep(replicaA, k.kv);
+  assert.equal(k.current()?.reclaimStreak?.count, 2, "sanity: one reading short of a destroy");
+
+  // Every write that would record the failure loses its CAS.
+  let refused = 0;
+  onRecordUpdate = (next) => {
+    if (typeof next.lastProbeFailureAt === "number") {
+      refused += 1;
+      throw new Error("wrong last sequence");
+    }
+  };
+  t.mock.timers.tick(SWEEP_MS);
+  roster = { kind: "eof" };
+  await sweep(replicaA, k.kv);
+  assert.ok(refused > 0, "sanity: the failure was refused");
+  assert.equal(k.current()?.lastProbeFailureAt, undefined, "sanity: nothing reached the record");
+  assert.equal(k.current()?.reclaimStreak?.count, 2, "sanity: the stale streak is still on it");
+
+  roster = { kind: "ok", count: 0 };
+  for (let i = 0; i < 3; i++) {
+    t.mock.timers.tick(SWEEP_MS);
+    await sweep(replicaA, k.kv);
+    assert.ok(!destroyed(k),
+      `sweep ${i + 1} after an unrecorded failure destroyed it; stops=${JSON.stringify(stops)}`);
+  }
+
+  // The hold is the quiet window, not a veto: once the record can be written
+  // and the window has passed, a confirmed empty roster is reclaimed.
+  onRecordUpdate = null;
+  for (let i = 0; i < 4 && !destroyed(k); i++) {
+    t.mock.timers.tick(SWEEP_MS);
+    await sweep(replicaA, k.kv);
+  }
+  assert.ok(destroyed(k), "sanity: past the window the sandbox is reclaimed");
+});
+
+test("a positive count whose write lost a race still ends the streak", async (t) => {
+  // Same shape as the failure marker: live work read by the expiry probe is
+  // contrary evidence and must not be dropped with a lost CAS.
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const replicaB = await import("../src/sandbox/keepalive.js?replica=b") as Replica;
+  const k = sharedKv(entry(Date.now()));
+  try {
+    await sweep(replicaA, k.kv);
+    t.mock.timers.tick(SWEEP_MS);
+    await sweep(replicaA, k.kv);
+    assert.equal(k.current()?.reclaimStreak?.count, 2, "sanity: one reading short of a destroy");
+
+    t.mock.timers.tick(SWEEP_MS);
+    roster = { kind: "ok", count: 250 };
+    let release!: () => void;
+    rosterGate = new Promise<void>((r) => { release = r; });
+    const reads = rosterReads;
+    const inFlight = sweep(replicaA, k.kv);
+    for (let i = 0; i < 200 && rosterReads === reads; i++) await new Promise((r) => setImmediate(r));
+    assert.ok(rosterReads > reads, "sanity: the probe is reading the roster");
+    await k.kv.put(KEY, sc.encode(JSON.stringify(k.current())));
+    rosterGate = null;
+    release();
+    await inFlight;
+
+    assert.equal(typeof k.current()?.lastPositiveCountAt, "number",
+      `the positive count was lost to the renewal; record=${JSON.stringify(k.current())}`);
+    assert.equal(k.current()?.reclaimStreak, undefined, "and the streak it ends went with it");
+
+    t.mock.timers.tick(SWEEP_MS);
+    roster = { kind: "ok", count: 0 };
+    await sweep(replicaB, k.kv);
+    assert.ok(!destroyed(k), `destroyed right after live work was seen; stops=${JSON.stringify(stops)}`);
+  } finally {
+    replicaB.resetBackgroundWorkStateForTest();
+  }
 });
