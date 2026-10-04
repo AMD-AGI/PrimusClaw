@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { readFileSync, readdirSync } from "node:fs";
+import { accessSync, constants, readFileSync, readdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { SHELL_GROUP_TOKEN_VAR } from "@claw/protocol";
 import { WORKSPACE } from "../../config.js";
@@ -109,6 +109,31 @@ export function logShellEvent(event: string, shell: ManagedShell, extra: Record<
   }));
 }
 
+const BASH_CANDIDATES = ["/bin/bash", "/usr/bin/bash"] as const;
+
+/**
+ * The interpreter managed shells run under: bash where the image has one,
+ * `/bin/sh` only where it does not.
+ *
+ * The tool is named `bash` and models write bash -- `[[ ]]`, `${!name}`,
+ * `source` of a bash-only file. On images whose `/bin/sh` is dash those are
+ * syntax errors before the command has done anything, and the model spends
+ * turns rediscovering that it has to wrap its own command in `bash -c`.
+ */
+export function resolveCommandShell(candidates: readonly string[] = BASH_CANDIDATES): string {
+  for (const path of candidates) {
+    try {
+      accessSync(path, constants.X_OK);
+      return path;
+    } catch {
+      continue;
+    }
+  }
+  return "/bin/sh";
+}
+
+let commandShell: string | undefined;
+
 /**
  * Spawn a managed shell as a detached process group, under its run's own
  * unprivileged identity and with an environment built from an allow-list.
@@ -120,7 +145,8 @@ export function spawnManagedShell(command: string, options: SpawnManagedShellOpt
   const id = options.id || `${options.kind}-${randomUUID().slice(0, 8)}`;
   const privilege = resolveChildPrivilege(options.owner, options.run);
   const groupToken = randomUUID();
-  const proc = spawn("/bin/sh", ["-c", command], {
+  commandShell ??= resolveCommandShell();
+  const proc = spawn(commandShell, ["-c", command], {
     cwd: WORKSPACE,
     env: { ...privilege.env, [SHELL_GROUP_TOKEN_VAR]: groupToken },
     ...(privilege.uid === undefined ? {} : { uid: privilege.uid, gid: privilege.gid }),

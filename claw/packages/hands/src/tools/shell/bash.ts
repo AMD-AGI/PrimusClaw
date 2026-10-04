@@ -57,7 +57,7 @@ const schema = {
 
 /**
  * Uses the shared process-runner: detached process groups (so timeout
- * cleanup can kill the full tree, not just the top-level /bin/sh), capped
+ * cleanup can kill the full tree, not just the top-level shell), capped
  * stdout/stderr buffers (truncates with marker, keeps streaming), and
  * non-blocking execution so the MCP server can serve other tool calls
  * concurrently.
