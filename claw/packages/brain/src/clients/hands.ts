@@ -39,7 +39,7 @@ export interface CallContext {
 import { bgRowStore } from "../sandbox/bg-row-store.js";
 import {
   BG_SHELL_ENABLED, BG_SHELL_REAP_GRACE_MS, BRAIN_CHECKPOINT_KEY, BRAIN_ID,
-  HANDS_CALL_DEFAULT_TIMEOUT_MS, HANDS_CLOSE_TIMEOUT_MS,
+  HANDS_CALL_DEFAULT_TIMEOUT_MS, HANDS_CLOSE_TIMEOUT_MS, WAIT_DEFAULT_SEC, BASH_FOREGROUND_DEFAULT_SEC,
 } from "../config.js";
 import {
   isSandboxTool, MCP_DEADLINE_SLACK_MS, toolTakesTimeout, toolTimeoutCeilingSec,
@@ -632,6 +632,79 @@ export function callDeadlineMs(toolName: string, args: Record<string, unknown>):
 }
 
 /**
+ * A `wait`'s arguments with the timeout it will be granted written in.
+ *
+ * Hands clamps a wait to its own ceiling, but which ceiling depends on the
+ * Hands a sandbox was started with: one created before the ceiling came down
+ * still clamps at the half-hour it was handed then, and still applies the old
+ * five-minute default to a wait that names none. Either outlives the request
+ * that carries it -- a proxy in front of Hands may cut a request that has sent
+ * nothing for 120s -- and the agent is told its sandbox is unreachable while
+ * the job it is waiting on runs on. Sending the granted number explicitly
+ * makes this side's ceiling the one that applies, whatever the sandbox's is.
+ *
+ * A value that is not a positive number is passed through untouched, so Hands
+ * still answers it with its own refusal.
+ */
+export function boundWaitArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const asked = args.timeout_sec;
+  if (asked === undefined) {
+    return { ...args, timeout_sec: Math.min(WAIT_DEFAULT_SEC, toolTimeoutCeilingSec("wait")) };
+  }
+  if (typeof asked !== "number" || !(asked > 0)) return args;
+  return { ...args, timeout_sec: Math.min(asked, toolTimeoutCeilingSec("wait")) };
+}
+
+/**
+ * A foreground `bash` call's arguments with the timeout it will be granted
+ * written in, and the larger number it asked for when that was reduced.
+ *
+ * A foreground command is one HTTP request whose reply is written only when the
+ * command ends, and a proxy in front of Hands may cut a request that has sent
+ * nothing for 120s -- the sandbox Router's port proxy does, answering 502
+ * "sandbox service unreachable". Hands clamps to its own ceiling, but which
+ * ceiling depends on the Hands a sandbox was started with: one created before
+ * the ceiling came down still allows 120s, and applies a 120s default to a call
+ * that names none. Sending the granted number makes this side's ceiling the
+ * one that applies, whatever the sandbox's is.
+ *
+ * A background start is left alone (its timeout means nothing), and so is a
+ * value that is not a positive number, so Hands still answers it with its own
+ * refusal.
+ */
+export function boundBashArgs(
+  args: Record<string, unknown>,
+): { args: Record<string, unknown>; reducedFromSec?: number } {
+  if (args.run_in_background === true) return { args };
+  const ceilingSec = toolTimeoutCeilingSec("bash");
+  const asked = args.timeout;
+  if (asked === undefined) {
+    return { args: { ...args, timeout: Math.min(BASH_FOREGROUND_DEFAULT_SEC, ceilingSec) } };
+  }
+  if (typeof asked !== "number" || !(asked > 0)) return { args };
+  if (asked <= ceilingSec) return { args };
+  return { args: { ...args, timeout: ceilingSec }, reducedFromSec: asked };
+}
+
+/**
+ * Say so when a command Brain clamped then ran into the clamp.
+ *
+ * Hands only sees the number Brain sent, so its own timeout message cannot say
+ * the request was reduced -- and without that, the obvious repair is a larger
+ * timeout, which is the one thing that cannot work. The structured field is
+ * set too, because it is what the foreground-timeout metric reads.
+ */
+function noteReducedTimeout(
+  text: string, structured: unknown, reducedFromSec: number, grantedSec: number,
+): string {
+  const s = structured as { outcome?: unknown; clamped?: unknown } | undefined;
+  if (!s || typeof s !== "object" || s.outcome !== "foreground_timeout") return text;
+  s.clamped = true;
+  return `${text}\nThe requested ${reducedFromSec}s was reduced to the ${grantedSec}s per-call limit, `
+    + `so raising it again will not help.`;
+}
+
+/**
  * MCP client for communicating with a Hands Tool MCP Server.
  * Per-request: each session gets its own HandsClient (different hands_mcp_url).
  */
@@ -887,12 +960,24 @@ export class HandsClient {
       if (settled) return settled;
     }
 
-    const wired = await this.wireArgs(name, fixed);
+    const bounded = name === "bash" ? boundBashArgs(fixed)
+      : { args: name === "wait" ? boundWaitArgs(fixed) : fixed };
+    const wired = await this.wireArgs(name, bounded.args);
     const result = await this.client.callTool(
       { name, arguments: wired },
       undefined,
       { timeout: callDeadlineMs(name, args), signal } as any,
     );
+    if (bounded.reducedFromSec !== undefined) {
+      const structured = (result as { structuredContent?: unknown }).structuredContent;
+      const content = (result.content as Array<{ type: string; text?: string }>) ?? [];
+      const last = [...content].reverse().find((c) => c.type === "text" && c.text);
+      if (last) {
+        last.text = noteReducedTimeout(
+          last.text!, structured, bounded.reducedFromSec, bounded.args.timeout as number,
+        );
+      }
+    }
     countForegroundTimeout(result);
     const isError = !!(result as { isError?: boolean }).isError;
     const texts = (result.content as Array<{ type: string; text?: string }>)

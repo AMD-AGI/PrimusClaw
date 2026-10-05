@@ -213,11 +213,22 @@ app.all("/mcp", async (req, reply) => {
   // run inside this async context and can read who is calling without being
   // handed it. An absent or malformed owner collapses to the shared `unowned`
   // bucket, and an absent run means no run will reap what this call starts.
+  //
+  // The request's lifetime rides along too. A JSON reply is written only when
+  // the tool returns, so a caller or proxy that stops waiting first (a gateway
+  // response-header timeout, Brain's own deadline) leaves the tool running
+  // into a socket nobody reads; the signal is how a tool learns that before it
+  // consumes anything on the way out.
+  const callAbort = new AbortController();
+  reply.raw.once("close", () => {
+    if (!reply.raw.writableFinished) callAbort.abort();
+  });
   await withCaller(
     {
       owner: normalizeOwner(req.headers[OWNER_HEADER]),
       run: normalizeRun(req.headers[RUN_HEADER]),
       deadline: normalizeDeadline(req.headers[DEADLINE_HEADER]),
+      signal: callAbort.signal,
     },
     () => transport.handleRequest(req.raw, reply.raw, req.body),
   );

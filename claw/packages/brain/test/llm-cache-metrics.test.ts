@@ -35,7 +35,8 @@ function session(turn: Partial<LlmTurnResult>): LlmSession {
   return {
     async streamTurn() {
       const t: LlmTurnResult = {
-        content: [], stopReason: "end_turn",
+        // Says something: an empty turn is nudged rather than ending the loop.
+        content: [{ type: "text", text: "ok" }], stopReason: "end_turn",
         usage: { input_tokens: 0, output_tokens: 0, cache_create: 0, cache_read: 0 },
         firstByteMs: 1,
         ...turn,

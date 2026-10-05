@@ -88,7 +88,8 @@ test("a turn nobody could measure is counted instead of passing silently", async
   const session: LlmSession = {
     async streamTurn() {
       return {
-        content: [], stopReason: "end_turn",
+        // Says something: an empty last turn now fails the run instead.
+        content: [{ type: "text", text: "ok" }], stopReason: "end_turn",
         usage: { input_tokens: 0, output_tokens: 0, cache_create: 0, cache_read: 0 },
         firstByteMs: 1,
       } as LlmTurnResult;
@@ -109,7 +110,8 @@ test("a measured turn is not counted as unknown", async () => {
   const session: LlmSession = {
     async streamTurn() {
       return {
-        content: [], stopReason: "end_turn",
+        // Says something: an empty last turn now fails the run instead.
+        content: [{ type: "text", text: "ok" }], stopReason: "end_turn",
         usage: { input_tokens: 10, output_tokens: 1, cache_create: 0, cache_read: 0 },
         firstByteMs: 1, promptTokens: 10,
       } as LlmTurnResult;

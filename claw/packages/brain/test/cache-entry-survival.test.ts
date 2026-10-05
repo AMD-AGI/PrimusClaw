@@ -42,7 +42,8 @@ function session(
       const t = turns[i++];
       if (!t) throw new Error("scripted session exhausted");
       const result = {
-        content: t.content ?? [],
+        // Says something: an empty turn is nudged rather than ending the loop.
+        content: t.content ?? [{ type: "text", text: "ok" }],
         stopReason: t.stopReason ?? "end_turn",
         usage: t.usage ?? { input_tokens: 1, output_tokens: 1, cache_create: 0, cache_read: 0 },
         firstByteMs: 1,

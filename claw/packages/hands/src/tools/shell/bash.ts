@@ -3,12 +3,17 @@
 
 import { z } from "zod";
 import { spawnBackground } from "./bg-manager.js";
-import { currentOwner, currentRun } from "../../runtime/owner-context.js";
+import { currentCallSignal, currentOwner, currentRun } from "../../runtime/owner-context.js";
 import { runForegroundShell } from "./process-runner.js";
 import { BG_SHELL_ENABLED } from "../../config.js";
 
 const MAX_OUTPUT_BYTES = parseInt(process.env.BASH_OUTPUT_BYTES || `${10 * 1024 * 1024}`, 10);
-const DEFAULT_TIMEOUT_SEC = parseInt(process.env.BASH_DEFAULT_TIMEOUT_SEC || "120", 10);
+/**
+ * Under the foreground ceiling's default rather than at two minutes, for the
+ * reason the ceiling gives below: a command that runs to its default has to be
+ * answered before anything between Brain and here gives up on the request.
+ */
+const DEFAULT_TIMEOUT_SEC = parseInt(process.env.BASH_DEFAULT_TIMEOUT_SEC || "100", 10);
 
 /**
  * The foreground ceiling, F in the handover constraint F <= S < G.
@@ -21,10 +26,18 @@ const DEFAULT_TIMEOUT_SEC = parseInt(process.env.BASH_DEFAULT_TIMEOUT_SEC || "12
  * window in which two replicas can both be driving the same workspace is ten
  * hours wide.
  *
- * G is the graceful shutdown period, 300s in the Helm chart. F is set to 120s:
+ * G is the graceful shutdown period, 300s in the Helm chart. F is set to 100s:
  * equal to the default timeout, so nothing that does not explicitly ask for
  * more is affected, and leaving most of G for the checkpoint and final
  * workspace sync that have to happen after the command stops.
+ *
+ * It is 100s rather than two minutes because one foreground command is one
+ * HTTP request whose reply -- headers included -- is written only when the
+ * command ends, and a proxy in front of Hands may give up on a request that has
+ * sent nothing for 120s: the sandbox Router's port proxy answers 502 "sandbox
+ * service unreachable" at exactly that age. A command allowed 120s ran into it
+ * and the agent saw an unreachable sandbox instead of its own timeout and the
+ * output so far. The same limit is why `wait` defaults to 100s.
  *
  * Ten hours was also never reachable. Brain abandons any MCP call at one hour,
  * so a command given a longer timeout died at that boundary and reported a
@@ -40,7 +53,7 @@ const DEFAULT_TIMEOUT_SEC = parseInt(process.env.BASH_DEFAULT_TIMEOUT_SEC || "12
  * started without it.
  */
 export const MAX_TIMEOUT_SEC = parseInt(
-  process.env.BASH_MAX_TIMEOUT_SEC || (BG_SHELL_ENABLED ? "120" : "36000"),
+  process.env.BASH_MAX_TIMEOUT_SEC || (BG_SHELL_ENABLED ? "100" : "36000"),
   10,
 );
 
@@ -57,14 +70,14 @@ const schema = {
 
 /**
  * Uses the shared process-runner: detached process groups (so timeout
- * cleanup can kill the full tree, not just the top-level /bin/sh), capped
+ * cleanup can kill the full tree, not just the top-level shell), capped
  * stdout/stderr buffers (truncates with marker, keeps streaming), and
  * non-blocking execution so the MCP server can serve other tool calls
  * concurrently.
  */
 export const bash = {
   name: "bash",
-  description: "Execute a shell command in the workspace directory. Foreground commands have a default 120s timeout and kill the whole process group on timeout; use run_in_background=true for long-running work.",
+  description: `Execute a shell command in the workspace directory. Foreground commands have a default ${DEFAULT_TIMEOUT_SEC}s timeout and kill the whole process group on timeout; use run_in_background=true for long-running work.`,
   zodSchema: schema,
   execute: async (args: {
     command: string; timeout?: number;
@@ -115,7 +128,18 @@ export const bash = {
       bufferBytes: MAX_OUTPUT_BYTES,
       owner: currentOwner(),
       run: currentRun(),
+      signal: currentCallSignal(),
     });
+
+    if (result.abandoned) {
+      // Written to a closed request, so nobody reads this; it is here so the
+      // tool still returns a result rather than throwing into the transport.
+      return {
+        content: [{ type: "text" as const, text: "The request for this command was closed before it finished, so the command was stopped." }],
+        isError: true,
+        structuredContent: { outcome: "foreground_abandoned" },
+      };
+    }
 
     if (result.timedOut) {
       // Naming the ceiling matters more than naming the elapsed time: without
@@ -129,9 +153,12 @@ export const bash = {
       // run_in_background where it is refused sends the model round a loop it
       // cannot leave, and so does suggesting a longer timeout to a command that
       // was just clamped.
+      // A timeout already at the ceiling is the clamped case too, whoever did
+      // the clamping: Brain sends the granted number, so Hands sees the ceiling
+      // itself rather than the larger number the model asked for.
       const advice = BG_SHELL_ENABLED
         ? ` For work that takes longer, start it with run_in_background=true and then call wait.`
-        : clamped
+        : clamped || grantedSec >= MAX_TIMEOUT_SEC
           ? ` Split it into steps that each finish inside the limit.`
           : ` For work that takes longer, raise the timeout, up to ${MAX_TIMEOUT_SEC}s.`;
       return {

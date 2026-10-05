@@ -48,7 +48,7 @@ test("a bash timeout sets the deadline, plus slack for transport", () => {
 test("wait's own timeout field is honoured too", () => {
   // The regression this exists for: `wait` never sets `timeout`, so before
   // this it fell through to the hard cap every time.
-  assert.equal(callDeadlineMs("wait", { shell_id: "bg-1", timeout_sec: 1800 }), 1_800_000 + SLACK_MS);
+  assert.equal(callDeadlineMs("wait", { shell_id: "bg-1", timeout_sec: 90 }), 90_000 + SLACK_MS);
 });
 
 test("a call that names no timeout gets the hard cap", () => {

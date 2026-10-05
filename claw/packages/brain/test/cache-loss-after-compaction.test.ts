@@ -57,7 +57,8 @@ function reading(promptTokens: number): Partial<LlmTurnResult> {
 
 /** The turn under test: markers went out, the provider said zero. */
 const missed: Partial<LlmTurnResult> = {
-  content: [],
+  // Says something: an empty turn is nudged rather than ending the loop.
+  content: [{ type: "text", text: "ok" }] as any,
   stopReason: "end_turn",
   usage: { input_tokens: 5000, output_tokens: 1, cache_create: 0, cache_read: 0 },
   promptTokens: 100,
