@@ -372,6 +372,12 @@ secret:
   # How long a Running sandbox with an empty GET /api/jobs roster stays up
   # before Brain idle-reclaims it. Default 15 minutes.
   sandboxIdleReuseSeconds: "900"
+  # Consecutive sweeps that must agree a parked sandbox is empty (or that its
+  # EnvD/Pod was replaced) before idle reclaim destroys it. Blank = 3.
+  sandboxReclaimConfirmSweeps: ""
+  # Seconds after a failed jobs probe or a positive process count during which
+  # idle reclaim never destroys. Blank = 300; "0" disables.
+  sandboxReclaimQuietSeconds: ""
   multiNodeDefaultTimeoutSeconds: "86400"
   llmApiStyle: anthropic
   # Prompt caching. `llmCacheStyle` only means anything when llmApiStyle is

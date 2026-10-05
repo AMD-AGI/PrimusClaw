@@ -1,6 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import "./reclaim-single-reading-env.js";
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { StringCodec } from "nats";

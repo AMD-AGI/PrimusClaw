@@ -80,7 +80,7 @@ test("expiry CAS is not self-bumped by jobs identity persistence", () => {
     "the destructive probe skips identity binding",
   );
   assert.match(
-    bodyOf("probeUserProcesses"),
+    bodyOf("probeJobs"),
     /persistIdentity !== false/,
     "background probes still bind identity by default",
   );
@@ -89,7 +89,7 @@ test("expiry CAS is not self-bumped by jobs identity persistence", () => {
 test("idle destroy re-checks the run lease after the jobs probe", () => {
   // A turn that starts during the (bounded) probe must not lose its sandbox.
   const body = bodyOf("expireIdleTarget");
-  const probe = body.indexOf("probeUserProcesses(");
+  const probe = body.indexOf("probeJobs(");
   const claim = body.indexOf("claimIdleStop(");
   assert.ok(probe >= 0 && claim > probe,
     "claimIdleStop runs on the success path after the sync jobs probe");
@@ -161,7 +161,7 @@ test("an expired retry stops the sandbox before dropping the hands pointer", () 
   );
   assert.match(
     bodyOf("confirmExpiredRetryStop"),
-    /probeUserProcesses\(/,
+    /probeJobs\(/,
     "expired-retry must read the jobs roster, not a walk-time peek cache",
   );
   assert.match(

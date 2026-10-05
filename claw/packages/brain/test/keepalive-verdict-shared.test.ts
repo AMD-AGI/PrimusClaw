@@ -17,6 +17,7 @@
 // These pin the two halves of the repair: the answer is written where another
 // process can read it, and absence from a sweep is no longer what discards it.
 
+import "./reclaim-single-reading-env.js";
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { StringCodec } from "nats";

@@ -21,7 +21,10 @@ import {
   SANDBOX_KEEPALIVE_FAIL_LIMIT,
   SANDBOX_IDLE_REUSE_MS,
   BRAIN_REGISTRY_TTL_MS,
+  SANDBOX_RECLAIM_CONFIRM_SWEEPS,
+  SANDBOX_RECLAIM_QUIET_MS,
 } from "../config.js";
+import { metrics } from "../infra/metrics.js";
 import { clearRetryPending, getRetryPending, isRetryPendingExpired } from "../tasks/retry-pending.js";
 import { isTombstone } from "../tasks/lock.js";
 import { drainKeys } from "../infra/kv-keys.js";
@@ -47,15 +50,21 @@ import {
   ledgerKeyForRetention, reassertRetentions, releaseRetention,
 } from "./retain-container.js";
 import { HANDS_STATE_DIR } from "./bootstrap.js";
+import { applyHold, putReclaimHold, readReclaimHold, type ReclaimHold } from "./reclaim-hold.js";
 import {
   assertSandboxRunning,
   inspectSandboxJobs,
   JOBS_PROBE_BUDGET_MS,
   SandboxJobsUnavailableError,
   SandboxTerminalProbeError,
+  SandboxInstanceReplacedError,
   SandboxTrackingLostError,
   type JobsProbeResult,
 } from "./job-probe.js";
+import {
+  applyObservation, later, reclaimDecision,
+  type JobsObservation, type ReclaimEvidenceFields, type ReclaimReason, type ReclaimStreak,
+} from "./reclaim-evidence.js";
 import { SandboxGoneError, SandboxRuntimeTerminalError } from "./errors.js";
 
 const logger = pino({ name: "sandbox-keepalive" });
@@ -83,7 +92,7 @@ export interface SandboxEntry {
  * `applyRunEndedIdleFields` in a third place, so the declaration lives with the
  * rules that interpret it (`@claw/protocol` sandbox/bg-verdict).
  */
-interface HandsKvEntry extends SharedVerdictFields {
+interface HandsKvEntry extends SharedVerdictFields, ReclaimEvidenceFields {
   status?: "pending" | "ready" | "reclaiming" | "closing";
   provider?: "safe-workload" | "agent-sandbox";
   workloadId?: string;
@@ -195,13 +204,23 @@ async function probeUserProcesses(
   sessionId: string,
   opts?: { persistIdentity?: boolean },
 ): Promise<number> {
+  return (await probeJobs(deps, info, sessionId, opts)).count;
+}
+
+/** The jobs probe with the identity it answered from, for reclaim evidence. */
+async function probeJobs(
+  deps: KeepaliveDeps,
+  info: HandsKvEntry,
+  sessionId: string,
+  opts?: { persistIdentity?: boolean },
+): Promise<JobsProbeResult> {
   const entry = { ...info, sessionId: info.sessionId || sessionId };
   if (deps.countActiveShells) {
     // The roster read is substituted; the control-plane check is not. A
     // workload reported absent or terminal is that regardless of who counts
     // its jobs, and the substitution must not turn it into an unknown.
     await assertSandboxRunning(entry);
-    return deps.countActiveShells(info.handsUrl ?? "", info.token ?? "", sessionId);
+    return { count: await deps.countActiveShells(info.handsUrl ?? "", info.token ?? "", sessionId) };
   }
   const result = await inspectSandboxJobs(entry);
   // Expiry CAS is conditioned on the enrollment revision. Persisting identity
@@ -209,7 +228,475 @@ async function probeUserProcesses(
   if (opts?.persistIdentity !== false) {
     await persistJobsIdentity(deps, sessionId, result);
   }
-  return result.count;
+  return result;
+}
+
+/**
+ * Readings of the jobs probe closer together than this are one sweep's worth of
+ * evidence: several replicas may each sweep a record inside one interval, and a
+ * background probe and the expiry probe can both land in the same sweep.
+ */
+const RECLAIM_OBSERVATION_SPACING_MS = Math.max(1, SANDBOX_KEEPALIVE_INTERVAL_SEC) * 1000 / 2;
+
+/**
+ * Evidence this process has seen that can only hold a destroy, kept beside the
+ * record rather than instead of it.
+ *
+ * Every such reading -- a failed probe, a positive count, a reading that ends a
+ * streak -- is written to the hands record under CAS, and a write can still be
+ * lost: the record moves under every probe (TTL renewals, another replica's
+ * sweep, a turn's reactivation), and a bounded retry can run out. A lost
+ * failure marker left the streak it should have ended on the record with no
+ * quiet window behind it, and the next empty reading a sweep later completed it.
+ *
+ * So the reading is noted here first, and every decision this process makes
+ * reads the record through it (`withLocalHolds`): a write that never lands
+ * cannot shorten the quiet window or let an ended streak complete, here. The
+ * other replicas get it from the hold key (sandbox/reclaim-hold.ts), which
+ * recordHold puts in the same step; the next write this process makes to the
+ * record also carries the merged view.
+ *
+ * Only recordHold adds to this map. A reading noted here and not put to the
+ * hold key is a hold on one replica only, which is the defect this exists to
+ * close (codex round 6: the background verdict noted a positive count here,
+ * lost every CAS, and another replica completed the replaced run it ended).
+ */
+interface LocalHold {
+  failureAt?: number;
+  positiveAt?: number;
+  /** Per reason, when a streak of it was last ended by a contrary reading. */
+  endedAt: Partial<Record<ReclaimReason, number>>;
+  /** Last time anything was noted, for pruning. */
+  at: number;
+}
+
+const localHolds = new Map<string, LocalHold>();
+
+/**
+ * How long a noted hold is kept. The quiet window bounds what a failure or a
+ * positive count can hold; an ended streak is kept longer, since nothing but
+ * this note stops the stale streak a lost write left behind from continuing.
+ */
+const LOCAL_HOLD_TTL_MS = Math.max(SANDBOX_RECLAIM_QUIET_MS, 60 * 60_000);
+
+const ALL_REASONS: readonly ReclaimReason[] = ["idle_empty", "instance_replaced"];
+
+/** The streak reasons a reading is contrary to, whatever the record holds. */
+function reasonsEndedBy(obs: JobsObservation): ReclaimReason[] {
+  if (obs.kind === "failure" || (obs.count ?? 0) > 0) return [...ALL_REASONS];
+  // An answer from the bound instance is contrary to any replacement run.
+  if (obs.kind === "count") return ["instance_replaced"];
+  return [];
+}
+
+/**
+ * `info` as this process knows it: the later of its own and the record's
+ * failure and positive-count times, and no streak that began before a reading
+ * this process saw end it.
+ */
+function withLocalHolds(identity: string, info: HandsKvEntry, now: number): HandsKvEntry {
+  const hold = localHolds.get(identity);
+  if (!hold) return info;
+  if (now - hold.at > LOCAL_HOLD_TTL_MS) {
+    localHolds.delete(identity);
+    return info;
+  }
+  const merged: HandsKvEntry = {
+    ...info,
+    lastProbeFailureAt: later(info.lastProbeFailureAt, hold.failureAt),
+    lastPositiveCountAt: later(info.lastPositiveCountAt, hold.positiveAt),
+  };
+  const streak = merged.reclaimStreak;
+  const endedAt = streak ? hold.endedAt[streak.reason] : undefined;
+  // Strictly before: a streak that starts on the very reading that ended the
+  // previous one is the new run, not the old.
+  if (streak && typeof endedAt === "number" && streak.firstAt < endedAt) {
+    delete merged.reclaimStreak;
+  }
+  return merged;
+}
+
+/**
+ * One jobs-probe reading as it bears on a destroy. `holds` is true when the
+ * reading can only hold one: a failed probe, a positive count, or a reading
+ * that ends the streak the record held (an answer from the bound instance
+ * ending a replaced run, a replaced answer ending an empty one). Such a reading
+ * must reach the record through persistHoldingObservation, never through a
+ * single CAS whose conflict is swallowed.
+ */
+interface ObservedReading {
+  /** The record as read, before the reading was applied. */
+  base: HandsKvEntry;
+  obs: JobsObservation;
+  holds: boolean;
+}
+
+/**
+ * The record after one jobs-probe reading; see sandbox/reclaim-evidence.ts.
+ * Pure: it records nothing, so a caller that writes the result must have
+ * passed the reading through recordHold first.
+ */
+function observe(
+  deps: KeepaliveDeps, identity: string, info: HandsKvEntry, obs: JobsObservation, now?: number,
+): { info: HandsKvEntry; ended: ReclaimReason[] } {
+  now ??= (deps.now ?? Date.now)();
+  const prev = withLocalHolds(identity, info, now);
+  const fields = applyObservation(prev, obs, {
+    identity,
+    idleEpoch: prev.idleEpoch,
+    idleSince: prev.idleSince,
+    now,
+    spacingMs: RECLAIM_OBSERVATION_SPACING_MS,
+  });
+  const before = prev.reclaimStreak;
+  const after = fields.reclaimStreak;
+  const ended = before && !(after && after.reason === before.reason && after.firstAt === before.firstAt)
+    ? [before.reason] : [];
+  return { info: { ...prev, ...fields }, ended };
+}
+
+/**
+ * Apply one reading and record it (recordHold) before returning, also saying
+ * whether it can only hold a destroy. Whatever the caller then writes, the
+ * evidence is already where every replica's confirmation reads it.
+ */
+async function observeReading(
+  deps: KeepaliveDeps, identity: string, info: HandsKvEntry, obs: JobsObservation,
+): Promise<{ info: HandsKvEntry; reading: ObservedReading }> {
+  const now = (deps.now ?? Date.now)();
+  const applied = observe(deps, identity, info, obs, now);
+  await recordHold(deps, identity, obs, { seen: info, ended: applied.ended, now });
+  const holds = obs.kind === "failure" || (obs.count ?? 0) > 0 || applied.ended.length > 0;
+  return { info: applied.info, reading: { base: info, obs, holds } };
+}
+
+function sameStreak(a: ReclaimStreak | undefined, b: ReclaimStreak | undefined): boolean {
+  return !!a && !!b && a.reason === b.reason && a.firstAt === b.firstAt;
+}
+
+/** Attempts at landing a reading that can only hold a destroy. */
+const HOLD_WRITE_ATTEMPTS = 3;
+
+/**
+ * The shared-hold note for one holding reading: what it holds and which
+ * streaks it ends. `seen` is the record the reading was taken against, when
+ * the caller holds one; a streak there that the reading does not continue is
+ * recorded as ended, bound to its idle period.
+ */
+function holdNote(
+  identity: string, now: number, obs: JobsObservation, seen?: HandsKvEntry,
+): ReclaimHold {
+  const note: ReclaimHold = {
+    identity, endedAt: {}, endedStreaks: {}, at: now, expiresAt: now + LOCAL_HOLD_TTL_MS,
+  };
+  if (obs.kind === "failure") note.failureAt = now;
+  else if ((obs.count ?? 0) > 0) note.positiveAt = now;
+  for (const reason of reasonsEndedBy(obs)) note.endedAt[reason] = now;
+  const streak = seen?.reclaimStreak;
+  if (seen && streak) {
+    const after = applyObservation(seen, obs, {
+      identity, idleEpoch: seen.idleEpoch, idleSince: seen.idleSince, now,
+      spacingMs: RECLAIM_OBSERVATION_SPACING_MS,
+    }).reclaimStreak;
+    if (!sameStreak(after, streak)) {
+      note.endedAt[streak.reason] = later(note.endedAt[streak.reason], now);
+      note.endedStreaks[streak.reason] = {
+        firstAt: streak.firstAt,
+        ...(streak.idleEpoch !== undefined ? { idleEpoch: streak.idleEpoch } : {}),
+        ...(streak.idleSince !== undefined ? { idleSince: streak.idleSince } : {}),
+      };
+    }
+  }
+  return note;
+}
+
+/**
+ * Record one jobs-probe reading as evidence that can hold a destroy: the ONLY
+ * way such evidence is recorded, and it must be awaited before the reading
+ * reaches any write of the hands record.
+ *
+ * It notes the reading in this process (see LocalHold) and, when the reading
+ * holds anything -- a failed probe, a positive count, or the end of a streak --
+ * puts it to the sandbox's hold key, merged as the later of each field. The
+ * put is unconditional (no revision to lose), so the evidence reaches every
+ * replica's confirmation whatever happens to the record CAS that follows; a
+ * bucket that fails the put is logged, and the local note still holds here.
+ * A reading that holds nothing (an empty roster that ends no streak) is noted
+ * locally only: it is not evidence another replica needs, and putting it would
+ * write the bucket on every sweep of every idle sandbox.
+ *
+ * `seen` is the record the reading was taken against, when the caller has
+ * one: a streak there that the reading does not continue is put as ended,
+ * bound to its idle period. `ended` names streaks the caller saw end on a view
+ * the record does not show (this process's own holds).
+ */
+async function recordHold(
+  deps: KeepaliveDeps,
+  identity: string,
+  obs: JobsObservation,
+  opts: { seen?: HandsKvEntry; ended?: ReclaimReason[]; now?: number } = {},
+): Promise<void> {
+  const now = opts.now ?? (deps.now ?? Date.now)();
+  const ended = opts.ended ?? [];
+  const local = localHolds.get(identity) ?? { endedAt: {}, at: now };
+  if (obs.kind === "failure") local.failureAt = later(local.failureAt, now);
+  else if ((obs.count ?? 0) > 0) local.positiveAt = later(local.positiveAt, now);
+  for (const reason of [...reasonsEndedBy(obs), ...ended]) {
+    local.endedAt[reason] = later(local.endedAt[reason], now);
+  }
+  local.at = Math.max(local.at, now);
+  localHolds.set(identity, local);
+
+  const note = holdNote(identity, now, obs, opts.seen);
+  for (const reason of ended) note.endedAt[reason] = later(note.endedAt[reason], now);
+  const holds = obs.kind === "failure" || (obs.count ?? 0) > 0
+    || ended.length > 0 || Object.keys(note.endedStreaks).length > 0;
+  if (!holds) return;
+  await putReclaimHold(deps.kv, note).catch((err: unknown) => {
+    logger.warn(
+      { identity, kind: obs.kind, err: (err as Error)?.message ?? String(err) },
+      "keepalive.reclaim_hold_put_failed",
+    );
+  });
+}
+
+/**
+ * Land a reading that can only hold a destroy (a failed probe, a positive
+ * count) on the record, re-reading and re-applying it on a lost CAS.
+ *
+ * The first attempt may be made under a revision the caller is holding
+ * (`first`), which renews the record exactly as the single write this replaces
+ * did. Each retry reads the record fresh and applies the reading to whatever
+ * is there, so the failure or positive-count time is merged as the later of the
+ * two and the streak is ended in the same write. A reading that still cannot be
+ * written is held by this process (see LocalHold), so a lost write never
+ * shortens the quiet window; it is logged, not swallowed.
+ *
+ * Before any of that, the reading is put to the sandbox's hold key (see
+ * sandbox/reclaim-hold.ts), which no revision race can refuse: the hands
+ * record is renewed on every sweep and a CAS on it can lose every attempt,
+ * which left the hold in this process only and let another replica destroy.
+ * Every destructive confirmation reads that key.
+ *
+ * A positive count -- from the bound instance or a replaced one -- also clears
+ * the reuse anchor (`quiescedAt`): live work restarts the reuse window.
+ */
+async function persistHoldingObservation(
+  deps: KeepaliveDeps,
+  key: string,
+  identity: string,
+  obs: JobsObservation,
+  first?: { info: HandsKvEntry; revision: number },
+): Promise<{ info: HandsKvEntry; revision: number } | null> {
+  // Recorded before any write is tried, here and on the hold key: a KV that
+  // fails every read below, or a CAS that loses every attempt, must hold the
+  // destroy on every replica. The record as the caller read it, not through
+  // this process's holds: the streak to mark ended is the one on the record,
+  // which those may already hide.
+  await recordHold(deps, identity, obs, { seen: first?.info });
+  for (let attempt = 1; attempt <= HOLD_WRITE_ATTEMPTS; attempt++) {
+    try {
+      let base: HandsKvEntry;
+      let revision: number;
+      const reread = !(attempt === 1 && first);
+      if (!reread && first) {
+        base = first.info;
+        revision = first.revision;
+      } else {
+        const e = await deps.kv.get(key);
+        // Gone, or now naming another sandbox or being closed: nothing of
+        // this sandbox's is left for the reading to hold.
+        if (!e || isTombstone(e)) return null;
+        const current = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
+        if (entryIdentity(current) !== identity || isClosingStatus(current.status)) return null;
+        base = current;
+        revision = e.revision;
+      }
+      const prior = reread
+        ? withLocalHolds(identity, base, (deps.now ?? Date.now)()).reclaimStreak : undefined;
+      const applied = observe(deps, identity, base, obs);
+      // A record that moved may carry a streak the first recording did not
+      // see; its end is recorded before this write is tried, too.
+      if (reread && applied.ended.length > 0) {
+        await recordHold(deps, identity, obs, { seen: base, ended: applied.ended });
+      }
+      let next = applied.info;
+      // On a record that moved since the reading was taken, the reading only
+      // holds: it may end the streak there, never start or extend one, since
+      // the record may now be in an idle period the reading was not about.
+      if (reread) next.reclaimStreak = sameStreak(next.reclaimStreak, prior) ? prior : undefined;
+      if (obs.kind !== "failure" && (obs.count ?? 0) > 0) next = { ...next, quiescedAt: undefined };
+      const written = await deps.kv.update(key, sc.encode(JSON.stringify(next)), revision);
+      return { info: next, revision: written };
+    } catch {
+      // The revision moved (or the bucket failed): re-read and re-apply.
+    }
+  }
+  logger.warn({ identity, kind: obs.kind, attempts: HOLD_WRITE_ATTEMPTS }, "keepalive.reclaim_hold_unpersisted");
+  return null;
+}
+
+function replacedObservation(err: SandboxInstanceReplacedError): JobsObservation {
+  return {
+    kind: "replaced",
+    count: err.after.count,
+    podUidAfter: err.after.podUid,
+    instanceIdAfter: err.after.instanceId,
+  };
+}
+
+/** Everything a destroy (or a held destroy) was shown, for the warn log. */
+function reclaimEvidence(
+  sessionId: string,
+  info: HandsKvEntry,
+  branch: string,
+  probe?: { count?: number; podUid?: string; instanceId?: string },
+): Record<string, unknown> {
+  const streak = info.reclaimStreak;
+  return {
+    sessionId,
+    workloadId: info.workloadId,
+    sandboxName: info.sandboxName,
+    branch,
+    observedCount: probe?.count,
+    observedCounts: streak?.counts,
+    consecutive: streak?.count ?? 0,
+    requiredConsecutive: SANDBOX_RECLAIM_CONFIRM_SWEEPS,
+    streakFirstAt: streak?.firstAt,
+    podUidBefore: info.podUid,
+    podUidAfter: probe?.podUid ?? streak?.podUidAfter,
+    instanceIdBefore: info.envdInstanceId,
+    instanceIdAfter: probe?.instanceId ?? streak?.instanceIdAfter,
+    lastProbeFailureAt: info.lastProbeFailureAt,
+    lastPositiveCountAt: info.lastPositiveCountAt,
+  };
+}
+
+/**
+ * Whether the recorded evidence authorises a destroy for `reason`. When it
+ * does not, the reading is persisted under `revision` (which also renews the
+ * record's TTL) and the hold is logged; the caller then keeps the sandbox.
+ */
+async function confirmReclaim(
+  deps: KeepaliveDeps,
+  key: string,
+  revision: number,
+  sessionId: string,
+  identity: string,
+  info: HandsKvEntry,
+  reason: ReclaimReason,
+  probe?: { count?: number; podUid?: string; instanceId?: string },
+  /** The reading `info` carries, when it was applied here and not yet written. */
+  reading?: ObservedReading,
+): Promise<boolean> {
+  const now = (deps.now ?? Date.now)();
+  // Through what this process has seen, too: a hold whose write was lost is
+  // still a hold here (see LocalHold).
+  info = withLocalHolds(identity, info, now);
+  const decide = (fields: HandsKvEntry) => reclaimDecision(
+    fields, reason,
+    { identity, idleEpoch: fields.idleEpoch, idleSince: fields.idleSince, now },
+    { sweeps: SANDBOX_RECLAIM_CONFIRM_SWEEPS, quietMs: SANDBOX_RECLAIM_QUIET_MS },
+  );
+  let decision = decide(info);
+  if (decision.allowed) {
+    // And through what every replica has put to the hold key: a holding
+    // reading whose record write lost every CAS is there, whichever replica
+    // made it. Unreadable, it holds the destroy.
+    let shared: ReclaimHold | null;
+    try {
+      shared = await readReclaimHold(deps.kv, identity);
+    } catch (err) {
+      metrics.onKeepaliveReclaimHeld(reason, "hold_unreadable");
+      logger.warn(
+        { ...reclaimEvidence(sessionId, info, reason, probe), err: (err as Error)?.message ?? String(err) },
+        "keepalive.reclaim_hold_unreadable",
+      );
+      return false;
+    }
+    const applied = applyHold(info, shared, identity, now);
+    info = applied.info;
+    decision = decide(info);
+    if (decision.allowed) return true;
+    if (shared) {
+      // Still holding: re-put so the bucket's max age does not drop it while it
+      // is the only thing ending the streak on the record.
+      await putReclaimHold(deps.kv, shared).catch((err: unknown) => {
+        logger.warn({ identity, err: (err as Error)?.message ?? String(err) }, "keepalive.reclaim_hold_put_failed");
+      });
+    }
+  }
+  metrics.onKeepaliveReclaimHeld(reason, decision.hold);
+  logger.info(
+    { ...reclaimEvidence(sessionId, info, reason, probe), hold: decision.hold },
+    "keepalive.reclaim_held",
+  );
+  if (reading?.holds) {
+    // A reading that can only hold a destroy is re-read and re-applied on a
+    // lost CAS: dropped, it leaves another replica the streak it ended or the
+    // quiet window it opened.
+    await persistHoldingObservation(deps, key, identity, reading.obs, { info: reading.base, revision });
+    return false;
+  }
+  // ADVANCING only: the reading extends or starts a streak and ended none. A
+  // lost write costs a sweep of confirmation, never the hold.
+  await deps.kv.update(key, sc.encode(JSON.stringify(info)), revision).catch(() => {});
+  return false;
+}
+
+/**
+ * Whether `current` is still parked in the idle period `atStart` was read in.
+ *
+ * Matched the way persistVerdict matches a verdict: epoch for current writers,
+ * `idleSince` for older ones, `idleRev` against same-millisecond reuse. A
+ * reactivation clears `idleSince`, and the next park writes a new one under a
+ * new revision, so no reading taken before either can pass.
+ */
+function stillInIdlePeriod(atStart: HandsKvEntry, current: HandsKvEntry): boolean {
+  return current.keepalive === false
+    && typeof current.idleSince === "number"
+    && sameIdlePeriod(atStart.idleEpoch, current)
+    && current.idleSince === atStart.idleSince
+    && current.idleRev === atStart.idleRev;
+}
+
+/**
+ * Record one reading on the current record, re-read under CAS. Used where no
+ * enrollment revision is being held for a claim (the background probe).
+ * Returns the record as written, or null when it could not be.
+ *
+ * A reading that can advance a destroy streak is about the idle period the
+ * probe started in (`atStart`), and is dropped once the handle has left it: a
+ * probe still in flight when a turn takes the sandbox back must not complete
+ * the old period's streak against a handle that is now in use. A reading that
+ * only ever holds a destroy -- a failed probe, a positive count -- is recorded
+ * regardless, through persistHoldingObservation.
+ */
+async function recordObservation(
+  deps: KeepaliveDeps, key: string, identity: string, obs: JobsObservation, atStart: HandsKvEntry,
+): Promise<{ info: HandsKvEntry; revision: number } | null> {
+  if (obs.kind === "failure" || (obs.count ?? 0) > 0) {
+    return persistHoldingObservation(deps, key, identity, obs);
+  }
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const e = await deps.kv.get(key);
+      if (!e || isTombstone(e)) return null;
+      const current = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
+      if (entryIdentity(current) !== identity || isClosingStatus(current.status)) return null;
+      if (!stillInIdlePeriod(atStart, current) || localRegistry.has(identity)) {
+        logger.info({ identity }, "keepalive.reclaim_observation_reactivated");
+        return null;
+      }
+      // An empty or replaced answer can still end a streak: recorded first.
+      const next = (await observeReading(deps, identity, current, obs)).info;
+      const revision = await deps.kv.update(key, sc.encode(JSON.stringify(next)), e.revision);
+      return { info: next, revision };
+    } catch {
+      // Re-read: the revision moved.
+    }
+  }
+  return null;
 }
 
 function isClosingStatus(status: HandsKvEntry["status"]): boolean {
@@ -1078,18 +1565,30 @@ async function confirmExpiredRetryStop(
     return false;
   }
   const claimRevision = enrollmentNow.revision;
+  let probed: JobsProbeResult;
   try {
-    const running = await probeUserProcesses(deps, infoNow, sessionId, {
+    probed = await probeJobs(deps, infoNow, sessionId, {
       persistIdentity: false,
     });
+    const running = probed.count;
     if (running > 0) {
       logger.info(
         { sessionId, workloadId: infoNow.workloadId, running },
         "keepalive.retry_pending_stop_deferred_jobs_busy",
       );
+      // Live work holds the destroy on every replica: landed even when the
+      // record moved during the probe (see persistHoldingObservation).
+      await persistHoldingObservation(
+        deps, recordKey, identity, { kind: "count", count: running },
+        { info: infoNow, revision: claimRevision },
+      );
       return false;
     }
   } catch (err) {
+    if (!(err instanceof SandboxTerminalProbeError) && !(err instanceof SandboxInstanceReplacedError)) {
+      // A failed read ends any destroy streak and opens the quiet window.
+      await recordFailedProbe(deps, recordKey, identity, infoNow, claimRevision);
+    }
     // Unavailable / tracking_lost / soft control-plane faults never authorise
     // a stop. Terminal/absent are conclusions about the workload, not a zero
     // roster, and this path is only for reclaiming an orphaned READY handle.
@@ -1142,11 +1641,28 @@ async function confirmExpiredRetryStop(
   } catch {
     return false;
   }
-  return claimIdleStop(
+  // Same confirmation as idle expiry: one empty roster does not stop a sandbox.
+  const observed = await observeReading(deps, identity, claimedInfo, { kind: "count", count: 0 });
+  claimedInfo = observed.info;
+  if (!(await confirmReclaim(
+    deps, recordKey, claimRevision, sessionId, identity, claimedInfo, "idle_empty", probed,
+    observed.reading,
+  ))) {
+    return false;
+  }
+  const claimedStop = await claimIdleStop(
     deps, recordKey, identity, sessionId, claimedInfo, claimRevision, enrollmentNow,
     undefined,
     { collectingIdentity: identity, expected },
   );
+  if (claimedStop) {
+    logger.warn(
+      reclaimEvidence(sessionId, claimedInfo, "idle_empty_retry_pending", probed),
+      "keepalive.reclaim_destroy",
+    );
+    metrics.onKeepaliveReclaim("idle_empty");
+  }
+  return claimedStop;
 }
 
 /** Register a sandbox for keepalive pinging. Called by ensureHands. */
@@ -1773,6 +2289,7 @@ export function resetBackgroundWorkStateForTest(): void {
   bgGeneration.clear();
   bgProbeCursor = 0;
   teardownRetryAt.clear();
+  localHolds.clear();
   // Rotation state like the cursor above it: a queue left by one test names keys
   // the next one never walks, and its first read phase would order itself around
   // retentions that do not exist.
@@ -1959,19 +2476,27 @@ async function reserveProbe(
 async function releaseProbe(
   deps: KeepaliveDeps, key: string, identity: string, token: string,
 ): Promise<void> {
-  try {
-    const e = await deps.kv.get(key);
-    if (!e) return;
-    const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
-    if (entryIdentity(info) !== identity) return;
-    if (!info.bgProbes || !(token in info.bgProbes)) return;
-    const bgProbes = liveProbeReservations(info, Date.now());
-    delete bgProbes[token];
-    const next: HandsKvEntry = { ...info, bgProbes };
-    if (Object.keys(bgProbes).length === 0) delete next.bgProbes;
-    await deps.kv.update(key, sc.encode(JSON.stringify(next)), e.revision);
-  } catch { /* best effort: the deadline is the backstop */ }
+  // Re-read on a lost CAS: the sweep that dispatched this probe renews the
+  // same record while the probe finishes, and a release lost to that renewal
+  // left the reservation standing until its deadline, holding the expiry.
+  for (let attempt = 1; attempt <= PROBE_RELEASE_ATTEMPTS; attempt++) {
+    try {
+      const e = await deps.kv.get(key);
+      if (!e) return;
+      const info = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
+      if (entryIdentity(info) !== identity) return;
+      if (!info.bgProbes || !(token in info.bgProbes)) return;
+      const bgProbes = liveProbeReservations(info, Date.now());
+      delete bgProbes[token];
+      const next: HandsKvEntry = { ...info, bgProbes };
+      if (Object.keys(bgProbes).length === 0) delete next.bgProbes;
+      await deps.kv.update(key, sc.encode(JSON.stringify(next)), e.revision);
+      return;
+    } catch { /* re-read; past the last attempt the deadline is the backstop */ }
+  }
 }
+
+const PROBE_RELEASE_ATTEMPTS = 3;
 
 /** Bind jobs answers to the EnvD process that produced them. */
 async function persistJobsIdentity(
@@ -2106,17 +2631,39 @@ async function runBackgroundProbe(deps: KeepaliveDeps, probe: BackgroundProbe): 
         } else {
           await reportTerminalFailure(deps, sessionId, identity, err.reason);
         }
+      } else if (err instanceof SandboxInstanceReplacedError) {
+        // One answer from a new identity is not a replacement: an EnvD that
+        // restarted beside a data-path blip answers this way with the user's
+        // work still running. Act only on a confirmed run of them.
+        const recorded = await recordObservation(
+          deps, key, identity, replacedObservation(err), info,
+        );
+        if (!recorded) return;
+        const probeFacts = { count: err.after.count, podUid: err.after.podUid, instanceId: err.after.instanceId };
+        if (await confirmReclaim(
+          deps, key, recorded.revision, sessionId, identity, recorded.info,
+          "instance_replaced", probeFacts,
+        ) && await closeConfirmedReplacement(deps, key, sessionId, identity, recorded, err.reason)) {
+          logger.warn(
+            reclaimEvidence(sessionId, recorded.info, "instance_replaced", probeFacts),
+            "keepalive.reclaim_destroy",
+          );
+          metrics.onKeepaliveReclaim("instance_replaced");
+        }
       } else if (err instanceof SandboxRuntimeTerminalError) {
         await reportTerminalFailure(deps, sessionId, identity, err.reason);
       } else if (err instanceof SandboxTrackingLostError) {
         logger.error({ sessionId, workloadId: info.workloadId }, "keepalive.jobs_tracking_lost");
+        await recordObservation(deps, key, identity, { kind: "failure" }, info);
       } else if (err instanceof SandboxJobsUnavailableError) {
         logger.info(
           { sessionId, workloadId: info.workloadId, status: err.httpStatus },
           "keepalive.jobs_api_absent",
         );
+        await recordObservation(deps, key, identity, { kind: "failure" }, info);
       } else {
         reportUnknownProbe(probe, err);
+        await recordObservation(deps, key, identity, { kind: "failure" }, info);
       }
     }
   } catch (err) {
@@ -2127,6 +2674,53 @@ async function runBackgroundProbe(deps: KeepaliveDeps, probe: BackgroundProbe): 
   } finally {
     await releaseProbe(deps, key, identity, token);
   }
+}
+
+/**
+ * Write the terminal verdict for a confirmed replacement in the same CAS as the
+ * reading that confirmed it.
+ *
+ * Not reportTerminalFailure, which re-reads and writes whatever it finds: a
+ * turn that takes the handle back between the confirming write and this one
+ * would be marked closing, and the next sweep stops a sandbox in use. The
+ * revision the confirming reading was written under is the witness that the
+ * handle is still in the idle period the streak was built in; a sandbox held
+ * here, under a run lease, or whose lease cannot be read is not closed on a
+ * reading the platform has not confirmed.
+ */
+async function closeConfirmedReplacement(
+  deps: KeepaliveDeps,
+  key: string,
+  sessionId: string,
+  identity: string,
+  recorded: { info: HandsKvEntry; revision: number },
+  reason: string,
+): Promise<boolean> {
+  if (localRegistry.has(identity)) {
+    logger.info({ sessionId, identity }, "keepalive.reclaim_replaced_held");
+    return false;
+  }
+  // A destructive read: unreadable is not free (see sessionHasActiveRunLease).
+  const leaseScope = typeof recorded.info.runScope === "string" && recorded.info.runScope
+    ? recorded.info.runScope : sessionId;
+  if (await readRunLeaseState(deps.kv, leaseScope) !== "free") {
+    logger.info({ sessionId, identity, leaseScope }, "keepalive.reclaim_replaced_held");
+    return false;
+  }
+  try {
+    await deps.kv.update(
+      key,
+      sc.encode(JSON.stringify({ ...recorded.info, terminalReason: reason, status: "closing" })),
+      recorded.revision,
+    );
+  } catch {
+    // Moved since the confirming reading: a reactivation, or another writer.
+    // A later sweep reads it again, under whatever period it is in by then.
+    logger.info({ sessionId, identity }, "keepalive.idle_reclaim_superseded");
+    return false;
+  }
+  await emitTerminalFailureEvent(deps, sessionId, reason);
+  return true;
 }
 
 async function invalidateProbeVerdict(deps: KeepaliveDeps, probe: BackgroundProbe): Promise<void> {
@@ -2164,6 +2758,13 @@ async function recordProbeVerdict(
 ): Promise<void> {
   if (probeIsStale(probe)) return;
   const { key, identity, sessionId, info, verdictAtStart } = probe;
+  // The reading holds a destroy whether or not the verdict below lands: a
+  // positive count opens the quiet window, and an answer from the bound
+  // instance ends any replacement run. Recorded here and on the hold key
+  // before persistVerdict's CAS, which can lose every attempt.
+  if (running !== undefined) {
+    await recordHold(deps, identity, { kind: "count", count: running }, { seen: info });
+  }
   const held = localRegistry.has(identity)
     || await sessionHasActiveRunLease(deps.kv, sessionId, info.runScope);
   if (probeIsStale(probe)) return;
@@ -2287,6 +2888,7 @@ async function persistVerdict(
     // re-applies them, so a retry cannot carry a stale decision past a
     // reactivation, a replacement, or a newer running answer.
     let workloadId: string | undefined;
+    let endRecorded: ReclaimStreak | undefined;
     const attempts = running > 0 ? BG_VERDICT_WRITE_ATTEMPTS : BG_IDLE_VERDICT_WRITE_ATTEMPTS;
     for (let attempt = 1; attempt <= attempts; attempt++) {
       const e = await deps.kv.get(key);
@@ -2331,8 +2933,27 @@ async function persistVerdict(
       // existing anchor; if work cleared it while the shared verdict stayed
       // idle, stamp a new one so the clock cannot stick open forever.
       const quiescedAt = (deps.now ?? Date.now)();
+      // A positive count is contrary evidence to any destroy streak and opens
+      // the quiet window; an answer from the bound instance ends a replaced
+      // streak. See sandbox/reclaim-evidence.ts.
+      // Read through this process's holds, so a marker a lost write dropped is
+      // carried by this one (see LocalHold).
+      const known = withLocalHolds(identity, info, quiescedAt);
+      // recordProbeVerdict recorded the reading against the record the probe
+      // started from; a streak this re-read shows that the verdict ends is
+      // recorded too, before the CAS that may lose.
+      const ends = running > 0 ? known.reclaimStreak
+        : known.reclaimStreak?.reason === "instance_replaced" ? known.reclaimStreak : undefined;
+      if (ends && !sameStreak(ends, endRecorded)) {
+        await recordHold(deps, identity, { kind: "count", count: running }, { seen: known, now: quiescedAt });
+        endRecorded = ends;
+      }
+      const evidence: ReclaimEvidenceFields = running > 0
+        ? { lastPositiveCountAt: later(known.lastPositiveCountAt, quiescedAt), reclaimStreak: undefined }
+        : known.reclaimStreak?.reason === "instance_replaced" ? { reclaimStreak: undefined } : {};
       const next = sc.encode(JSON.stringify({
-        ...info,
+        ...known,
+        ...evidence,
         ...(running === 0
           ? { quiescedAt: info.quiescedAt ?? quiescedAt }
           : { quiescedAt: undefined }),
@@ -2387,7 +3008,30 @@ async function refreshIdleSince(
     }));
     await deps.kv.update(key, next, revision);
     if (workObserved) delete info.quiescedAt;
-  } catch { /* lost the race, or KV is unhappy; the next sweep tries again */ }
+    return;
+  } catch {
+    if (!workObserved) return; // a plain renewal: the next sweep tries again
+  }
+  // Clearing the reuse anchor holds the destroy (the window restarts only on
+  // the next confirmed empty roster), so a lost race re-reads and re-applies it
+  // to the same sandbox in the same idle period rather than dropping it.
+  const identity = entryIdentity(info);
+  for (let attempt = 1; attempt <= HOLD_WRITE_ATTEMPTS; attempt++) {
+    try {
+      const e = await deps.kv.get(key);
+      if (!e || isTombstone(e)) return;
+      const current = JSON.parse(sc.decode(e.value)) as HandsKvEntry;
+      if (entryIdentity(current) !== identity || isClosingStatus(current.status)) return;
+      if (!stillInIdlePeriod(info, current)) return;
+      if (current.quiescedAt === undefined) return;
+      await deps.kv.update(key, sc.encode(JSON.stringify({ ...current, quiescedAt: undefined })), e.revision);
+      delete info.quiescedAt;
+      return;
+    } catch {
+      // The revision moved again: re-read.
+    }
+  }
+  logger.warn({ identity, attempts: HOLD_WRITE_ATTEMPTS }, "keepalive.reuse_anchor_clear_unpersisted");
 }
 
 /** Run `fn` over every item, at most `limit` at a time. */
@@ -2776,11 +3420,18 @@ async function expireIdleTarget(
       await deps.kv.update(key, e.value, e.revision).catch(() => {});
       return;
     }
-    const running = await probeUserProcesses(deps, info, sessionId, {
+    const probed = await probeJobs(deps, info, sessionId, {
       persistIdentity: false,
     });
+    const running = probed.count;
     if (running > 0) {
-      await refreshIdleSince(deps, key, claimRevision, info);
+      // Live work: the positive count and the cleared reuse anchor are landed
+      // even when the record moved during the probe, never dropped with a lost
+      // CAS (see persistHoldingObservation).
+      await persistHoldingObservation(
+        deps, key, identity, { kind: "count", count: running },
+        { info, revision: claimRevision },
+      );
       return;
     }
     // Refresh fields for the stop payload; CAS still uses claimRevision.
@@ -2793,6 +3444,15 @@ async function expireIdleTarget(
     } catch {
       return;
     }
+    // One empty roster is not enough: it has to agree with the sweeps before
+    // it, with no failed probe or positive count inside the quiet window.
+    const observed = await observeReading(deps, identity, info, { kind: "count", count: 0 });
+    info = observed.info;
+    if (!(await confirmReclaim(
+      deps, key, claimRevision, sessionId, identity, info, "idle_empty", probed, observed.reading,
+    ))) {
+      return;
+    }
     // Re-check lease/local registry after the (bounded) jobs probe: a turn that
     // started during the probe must win over this reclaim.
     if (!(await claimIdleStop(
@@ -2801,6 +3461,8 @@ async function expireIdleTarget(
       return;
     }
     claimed = true;
+    logger.warn(reclaimEvidence(sessionId, info, "idle_empty", probed), "keepalive.reclaim_destroy");
+    metrics.onKeepaliveReclaim("idle_empty");
     await destroyHands(sessionId, info);
     stats.expired += 1;
     logger.info(
@@ -2809,6 +3471,7 @@ async function expireIdleTarget(
     );
   } catch (err) {
     if (err instanceof SandboxTerminalProbeError) {
+      // The control plane's own answer: authoritative, acted on at once.
       if (err.state === "absent") {
         if (!(await claimIdleStop(
           deps, key, identity, sessionId, info, claimRevision, e, undefined, claimOpts,
@@ -2816,6 +3479,11 @@ async function expireIdleTarget(
           return;
         }
         claimed = true;
+        logger.warn(
+          { ...reclaimEvidence(sessionId, info, "absent"), reason: err.reason },
+          "keepalive.reclaim_destroy",
+        );
+        metrics.onKeepaliveReclaim("absent");
         await destroyHands(sessionId, info).catch((stopErr) => {
           logger.warn({ err: stopErr, sessionId }, "keepalive.absent_stop_retry");
         });
@@ -2833,31 +3501,58 @@ async function expireIdleTarget(
           return;
         }
         claimed = true;
+        logger.warn(
+          { ...reclaimEvidence(sessionId, info, "terminal"), reason: err.reason },
+          "keepalive.reclaim_destroy",
+        );
+        metrics.onKeepaliveReclaim("terminal");
         await destroyHands(sessionId, info).catch((stopErr) => {
           logger.warn({ err: stopErr, sessionId }, "keepalive.terminal_stop_retry");
         });
       }
     } else if (err instanceof SandboxRuntimeTerminalError) {
+      let branch: "instance_replaced" | "terminal" = "terminal";
+      let probeFacts: { count?: number; podUid?: string; instanceId?: string } | undefined;
+      if (err instanceof SandboxInstanceReplacedError) {
+        // A new EnvD/Pod identity, read once, is held like an empty roster:
+        // neither provider's status read names a Pod UID or EnvD instance, so
+        // nothing on the platform side can confirm it short of terminal/absent.
+        branch = "instance_replaced";
+        probeFacts = { count: err.after.count, podUid: err.after.podUid, instanceId: err.after.instanceId };
+        const observed = await observeReading(deps, identity, info, replacedObservation(err));
+        info = observed.info;
+        if (!(await confirmReclaim(
+          deps, key, claimRevision, sessionId, identity, info, "instance_replaced", probeFacts,
+          observed.reading,
+        ))) {
+          return;
+        }
+      }
       if (!(await claimIdleStop(
         deps, key, identity, sessionId, info, claimRevision, e, err.reason, claimOpts,
       ))) {
         return;
       }
       claimed = true;
+      logger.warn(
+        { ...reclaimEvidence(sessionId, info, branch, probeFacts), reason: err.reason },
+        "keepalive.reclaim_destroy",
+      );
+      metrics.onKeepaliveReclaim(branch);
       await destroyHands(sessionId, info).catch((stopErr) => {
         logger.warn({ err: stopErr, sessionId }, "keepalive.terminal_stop_retry");
       });
     } else if (err instanceof SandboxTrackingLostError) {
       // Tracking loss means jobs cannot prove idle; hard timeout is the backstop.
       logger.error({ sessionId, workloadId: info.workloadId }, "keepalive.idle_reclaim_tracking_lost");
-      if (!claimed) await deps.kv.update(key, e.value, e.revision).catch(() => {});
+      if (!claimed) await recordFailedProbe(deps, key, identity, info, e.revision);
     } else if (err instanceof SandboxJobsUnavailableError) {
       // No readable jobs roster: never treat as idle-empty.
       logger.info(
         { sessionId, workloadId: info.workloadId, status: err.httpStatus },
         "keepalive.idle_reclaim_jobs_unavailable",
       );
-      if (!claimed) await deps.kv.update(key, e.value, e.revision).catch(() => {});
+      if (!claimed) await recordFailedProbe(deps, key, identity, info, e.revision);
     } else if (isRevisionConflict(err)) {
       logger.info({ sessionId, identity }, "keepalive.idle_reclaim_superseded");
     } else {
@@ -2865,9 +3560,27 @@ async function expireIdleTarget(
         { err, sessionId, workloadId: info.workloadId },
         "keepalive.idle_reclaim_deferred",
       );
-      if (!claimed) await deps.kv.update(key, e.value, e.revision).catch(() => {});
+      if (!claimed) await recordFailedProbe(deps, key, identity, info, e.revision);
     }
   }
+}
+
+/**
+ * Renew the record under the enrollment revision with a failed probe recorded,
+ * which ends any destroy streak and opens the quiet window.
+ *
+ * The enrollment revision is read before the probe, and the record moves while
+ * it runs (TTL renewals, another replica, a reactivation). This used to be one
+ * CAS with the conflict swallowed, which lost the failure marker and left the
+ * streak it should have ended in place: the next empty reading a sweep later
+ * completed it and destroyed the sandbox inside the quiet window. It is now
+ * re-read and re-applied on a lost CAS, and held in this process if it still
+ * cannot land.
+ */
+async function recordFailedProbe(
+  deps: KeepaliveDeps, key: string, identity: string, info: HandsKvEntry, revision: number,
+): Promise<void> {
+  await persistHoldingObservation(deps, key, identity, { kind: "failure" }, { info, revision });
 }
 
 /**
