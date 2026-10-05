@@ -2614,6 +2614,7 @@ async function runBackgroundProbe(deps: KeepaliveDeps, probe: BackgroundProbe): 
       await recordProbeVerdict(deps, probe, running > 0 ? "running" : "idle", running);
     } catch (err) {
       if (probeIsStale(probe)) return;
+      if (await failedUnderRunningVerdict(deps, probe, err)) return;
       await invalidateProbeVerdict(deps, probe);
       if (probeIsStale(probe)) return;
       if (err instanceof SandboxTerminalProbeError) {
@@ -2790,7 +2791,7 @@ async function recordProbeVerdict(
   }
 }
 
-function reportUnknownProbe(probe: BackgroundProbe, err: unknown): void {
+function reportUnknownProbe(probe: BackgroundProbe, err: unknown): number {
   const { identity, sessionId, info } = probe;
   const streak = (bgUnknownStreak.get(identity)?.count ?? 0) + 1;
   bgUnknownStreak.set(identity, { count: streak, at: Date.now() });
@@ -2804,6 +2805,43 @@ function reportUnknownProbe(probe: BackgroundProbe, err: unknown): void {
       "keepalive.background_work_unreconciled",
     );
   }
+  return streak;
+}
+
+/**
+ * Settles a failed probe under a measured `running` verdict, which one
+ * unanswered probe does not end. Returns false for every other failure.
+ *
+ * The probe goes through the sandbox's Pod IP, and a node-side restart can
+ * drop a request or two while every process inside keeps running. Deleting the
+ * verdict on that one failure handed the API's orphan sweep an "awaiting"
+ * entry idle for longer than its wait, and it stopped a sandbox with 249
+ * processes running sixteen seconds later. So the verdict stands until the
+ * failures are consecutive past BG_UNKNOWN_TOLERANCE -- Kubernetes'
+ * failureThreshold -- and is invalidated then; its own TTL still bounds it.
+ *
+ * Only the unclassified failure qualifies. A terminal, absent, untracked or
+ * jobs-unavailable answer is an answer and invalidates as before, and so does
+ * any failure under an `idle` verdict, the one that can delete.
+ */
+async function failedUnderRunningVerdict(
+  deps: KeepaliveDeps, probe: BackgroundProbe, err: unknown,
+): Promise<boolean> {
+  if (
+    err instanceof SandboxTerminalProbeError || err instanceof SandboxRuntimeTerminalError
+    || err instanceof SandboxTrackingLostError || err instanceof SandboxJobsUnavailableError
+  ) return false;
+  if (usableSharedVerdict(probe.info)?.state !== "running") return false;
+  const streak = reportUnknownProbe(probe, err);
+  if (streak > BG_UNKNOWN_TOLERANCE) {
+    await invalidateProbeVerdict(deps, probe);
+    return true;
+  }
+  logger.info(
+    { sessionId: probe.sessionId, workloadId: probe.info.workloadId, streak, tolerance: BG_UNKNOWN_TOLERANCE },
+    "keepalive.running_verdict_kept_through_failed_probe",
+  );
+  return true;
 }
 
 /**
