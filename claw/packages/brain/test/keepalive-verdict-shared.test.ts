@@ -26,6 +26,7 @@ import {
   backgroundWorkStateSizesForTest, ageBackgroundWorkCacheForTest, markHandsIdle, registerSandbox,
 } from "../src/sandbox/keepalive.js";
 import { bindSandboxProviders } from "../src/sandbox/factory.js";
+import { usableSharedVerdict } from "@claw/protocol";
 import { filterToRegExp } from "./nats-kv-stub.js";
 import type { SandboxProvider } from "../src/sandbox/provider.js";
 
@@ -1748,6 +1749,70 @@ test("positive verdicts refresh before expiry without restarting the idle window
     assert.equal(k.current().idleSince, idleSince);
   }
   assert.ok(k.deleted.includes(KEY), "repeated zero replies must complete the fifteen-minute window");
+});
+
+// The probe reaches the sandbox through its Pod IP, and a node-side restart can
+// drop one request while every process inside keeps running. Deleting the
+// `running` verdict on that one failure let the API's orphan sweep stop a
+// sandbox with 249 processes running sixteen seconds later.
+test("one failed probe keeps a running verdict; failures past the tolerance withdraw it", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const k = fakeKv();
+  stubPingableProvider();
+  await sweep({ kv: k.kv, countActiveShells: async () => 249 });
+  assert.equal(k.current().bgRunning, 249, "sanity: a running verdict was measured");
+  const measuredAt = k.current().bgCheckedAt;
+  const failing = {
+    kv: k.kv,
+    countActiveShells: async () => { throw new Error("sandbox jobs probe failed: HTTP 502"); },
+  };
+  t.mock.timers.tick(4 * 60_000);
+  await sweep(failing);
+  assert.equal(k.current().bgRunning, 249, "one failed refresh must not withdraw the running verdict");
+  assert.equal(k.current().bgCheckedAt, measuredAt, "and must not restamp it as a new measurement");
+  assert.equal(
+    usableSharedVerdict(k.current())?.state, "running",
+    "the API's orphan sweep, reading the same entry, must still see work running",
+  );
+  for (let failure = 2; failure <= 5; failure++) {
+    t.mock.timers.tick(60_000);
+    await sweep(failing);
+    assert.equal(k.current().bgRunning, 249, `failure ${failure} is within the tolerance`);
+  }
+  assert.equal(backgroundWorkStateSizesForTest().streaks, 1, "sanity: the failures were counted");
+  t.mock.timers.tick(60_000);
+  await sweep(failing);
+  assert.equal(k.current().bgRunning, undefined, "the sixth consecutive failure withdraws the verdict");
+  assert.equal(k.current().bgCheckedAt, undefined);
+  assert.ok(!k.deleted.includes(KEY), "withdrawing evidence is not a reclaim");
+});
+
+test("a successful probe ends the failure streak a running verdict was kept through", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const k = fakeKv();
+  stubPingableProvider();
+  let fail = false;
+  const deps = {
+    kv: k.kv,
+    countActiveShells: async () => {
+      if (fail) throw new Error("sandbox jobs probe failed: HTTP 502");
+      return 3;
+    },
+  };
+  await sweep(deps);
+  for (let round = 0; round < 3; round++) {
+    fail = true;
+    for (let failure = 0; failure < 5; failure++) {
+      t.mock.timers.tick(60_000 * (failure === 0 ? 4 : 1));
+      await sweep(deps);
+    }
+    assert.equal(k.current().bgRunning, 3, `round ${round}: five failures in a row keep the verdict`);
+    fail = false;
+    t.mock.timers.tick(60_000);
+    await sweep(deps);
+    assert.equal(k.current().bgCheckedAt, Date.now(), `round ${round}: the answer is a fresh measurement`);
+  }
+  assert.equal(k.current().bgRunning, 3, "fifteen failures that were never consecutive past five withdraw nothing");
 });
 
 test("a failed refresh invalidates local and shared idle evidence immediately", async (t) => {
