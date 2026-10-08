@@ -32,6 +32,7 @@ import (
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	extensionsv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
+	"sigs.k8s.io/agent-sandbox/pkg/audit"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
@@ -1028,7 +1029,33 @@ func (c *K8sSandboxCreator) DeleteSandbox(ctx context.Context, info *store.Sandb
 		}
 		return err
 	}
+	c.markDeleteAuditIssued(ctx, sandbox)
 	return ctrlclient.IgnoreNotFound(c.client.Delete(ctx, sandbox))
+}
+
+// markDeleteAuditIssued best-effort tags a Sandbox as already accounted for
+// by a sandbox.deleted audit event, before this deletes it. The caller (the
+// user-delete and GC-TTL paths in server.go) emits its own event with the
+// real reason right around this call; the tag it leaves behind here is what
+// keeps the runtime controller's generic emitUnaccountedDeleteAudit (see
+// sandbox_controller.go) from also emitting a second, reason-less event for
+// the same deletion once it observes DeletionTimestamp set.
+//
+// Best-effort: a failed patch only risks one extra ReasonExternal event on
+// the controller side, not a missed audit record -- the real event from the
+// caller already went to the store independently of this annotation.
+func (c *K8sSandboxCreator) markDeleteAuditIssued(ctx context.Context, sandbox *sandboxv1alpha1.Sandbox) {
+	if sandbox.Annotations != nil && sandbox.Annotations[audit.AnnDeleteAuditIssued] != "" {
+		return
+	}
+	patchBase := sandbox.DeepCopy()
+	if sandbox.Annotations == nil {
+		sandbox.Annotations = make(map[string]string)
+	}
+	sandbox.Annotations[audit.AnnDeleteAuditIssued] = "true"
+	if err := c.client.Patch(ctx, sandbox, ctrlclient.MergeFrom(patchBase)); err != nil {
+		log.Warn("failed to tag sandbox as delete-audited", "sandbox", sandbox.Name, "namespace", sandbox.Namespace, "error", err)
+	}
 }
 
 // DeleteSandboxClaim deletes a WarmPool-based sandbox session.
@@ -1196,6 +1223,7 @@ func (c *K8sSandboxCreator) deleteWarmPoolClaim(ctx context.Context, key types.N
 // one with it already; IgnoreNotFound is what makes that the same outcome
 // rather than a failure.
 func (c *K8sSandboxCreator) deleteWarmPoolSandbox(ctx context.Context, info *store.SandboxInfo, sandbox *sandboxv1alpha1.Sandbox) error {
+	c.markDeleteAuditIssued(ctx, sandbox)
 	if err := ctrlclient.IgnoreNotFound(c.client.Delete(ctx, sandbox)); err != nil {
 		return fmt.Errorf("delete warm-pool sandbox %s/%s: %w",
 			info.Namespace, info.SandboxName, err)

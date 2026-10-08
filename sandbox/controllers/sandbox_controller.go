@@ -103,6 +103,7 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// If the sandbox is being deleted, do nothing
 	if !sandbox.ObjectMeta.DeletionTimestamp.IsZero() {
 		log.Info("Sandbox is being deleted")
+		r.emitUnaccountedDeleteAudit(ctx, sandbox)
 		return ctrl.Result{}, nil
 	}
 
@@ -702,8 +703,81 @@ func (r *SandboxReconciler) emitShutdownExpiryAudit(ctx context.Context, sandbox
 		sandbox.Annotations = make(map[string]string)
 	}
 	sandbox.Annotations[annShutdownExpiryAuditIssued] = "true"
+	// Also tag the shared marker so emitUnaccountedDeleteAudit (reached once
+	// r.Delete below sets DeletionTimestamp on a later reconcile) does not
+	// emit a second, misleading ReasonExternal event for a deletion that is
+	// already accounted for as shutdown_expired.
+	sandbox.Annotations[audit.AnnDeleteAuditIssued] = "true"
 	if err := r.Patch(ctx, sandbox, client.MergeFrom(patchBase)); err != nil {
 		log.Error(err, "failed to patch shutdown-expiry audit idempotency annotation", "sandbox", sandbox.Name, "namespace", sandbox.Namespace)
+	}
+}
+
+// emitUnaccountedDeleteAudit records sandbox.deleted for a Sandbox whose
+// deletion nobody tagged first. The shutdown-expiry path above and the
+// Workload Manager's user-delete/GC paths (see markDeleteAuditIssued in
+// pkg/workloadmanager/k8s_builder.go) all set audit.AnnDeleteAuditIssued
+// before or as part of issuing the delete that takes the Sandbox down; what
+// reaches here with that annotation absent is external to PrimusClaw's own
+// code -- a drain, a node eviction, or a direct kubectl/API delete of the
+// Sandbox object -- which is exactly the shape of the L639 incident: a
+// Sandbox disappeared and none of our own delete paths had touched it.
+//
+// Fire-and-forget like its siblings: a store failure is logged (and counted
+// by RedisAuditStore.Store's metric) but never blocks reconciliation. Who
+// actually issued the delete is not recoverable from here -- this only
+// records that an unaccounted deletion happened and when, so it leaves a
+// trail instead of the silence L639 found.
+func (r *SandboxReconciler) emitUnaccountedDeleteAudit(ctx context.Context, sandbox *sandboxv1alpha1.Sandbox) {
+	if r.Audit == nil {
+		return
+	}
+	if sandbox.Annotations != nil &&
+		(sandbox.Annotations[audit.AnnDeleteAuditIssued] != "" ||
+			sandbox.Annotations[annShutdownExpiryAuditIssued] != "") {
+		return
+	}
+	log := log.FromContext(ctx)
+	sessionID := ""
+	userID := ""
+	userName := ""
+	if sandbox.Annotations != nil {
+		sessionID = sandbox.Annotations[annSessionID]
+		userName = sandbox.Annotations[annUserName]
+	}
+	if sandbox.Labels != nil {
+		userID = sandbox.Labels[labelUserID]
+	}
+	if sessionID == "" {
+		sessionID = sandbox.Namespace + "/" + sandbox.Name
+	}
+	created := sandbox.CreationTimestamp.Time
+	event := &audit.AuditEvent{
+		ID:           audit.NewEventID(),
+		EventType:    audit.EventDeleted,
+		SessionID:    sessionID,
+		SandboxName:  sandbox.Name,
+		Namespace:    sandbox.Namespace,
+		UserID:       userID,
+		UserName:     userName,
+		Timestamp:    time.Now(),
+		DeleteReason: audit.ReasonExternal,
+	}
+	if !created.IsZero() {
+		event.DurationMs = time.Since(created).Milliseconds()
+	}
+	audit.NormalizeEvent(event)
+	if err := r.Audit.Store(ctx, event); err != nil {
+		log.Error(err, "failed to emit external-delete audit", "sandbox", sandbox.Name, "namespace", sandbox.Namespace)
+		return
+	}
+	patchBase := sandbox.DeepCopy()
+	if sandbox.Annotations == nil {
+		sandbox.Annotations = make(map[string]string)
+	}
+	sandbox.Annotations[audit.AnnDeleteAuditIssued] = "true"
+	if err := r.Patch(ctx, sandbox, client.MergeFrom(patchBase)); err != nil {
+		log.Error(err, "failed to patch delete-audit idempotency annotation", "sandbox", sandbox.Name, "namespace", sandbox.Namespace)
 	}
 }
 

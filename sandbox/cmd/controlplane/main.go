@@ -233,9 +233,28 @@ func main() {
 	if wmCfg.Audit.Enabled {
 		if rs, ok := st.(*store.RedisStore); ok {
 			auditStore = audit.NewRedisStore(rs.Client(), wmCfg.Audit.RetentionDays)
+			// AUDIT_ENABLED=true plus a store that constructs cleanly is not
+			// proof the backend actually accepts and returns writes -- see
+			// L639: that exact combination shipped silently for days with
+			// zero events landing. Round-trip one synthetic event now, so a
+			// broken backend is a loud startup log line and a 0-valued
+			// audit_backend_up metric instead of a forensic dead end the
+			// next time an audit record is needed.
+			selfCheckCtx, selfCheckCancel := context.WithTimeout(ctx, 10*time.Second)
+			if err := audit.SelfCheck(selfCheckCtx, auditStore); err != nil {
+				log.Error("audit backend self-check failed: AUDIT_ENABLED=true but events are not landing",
+					"error", err)
+				audit.BackendUp.Set(0)
+			} else {
+				audit.BackendUp.Set(1)
+			}
+			selfCheckCancel()
 		} else {
 			log.Warn("audit logging requires Redis store; disabled in memory mode")
+			audit.BackendUp.Set(0)
 		}
+	} else {
+		audit.BackendUp.Set(0)
 	}
 
 	clientset, err := kubernetes.NewForConfig(k8sCfg)
