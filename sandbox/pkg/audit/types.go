@@ -32,7 +32,27 @@ const (
 	ReasonGCTTL           = "gc_ttl"
 	ReasonGCIdle          = "gc_idle"
 	ReasonShutdownExpired = "shutdown_expired"
+	// ReasonExternal marks a sandbox.deleted event emitted by the runtime
+	// controller for a Sandbox it observed being torn down without any of
+	// the reasons above having tagged it first (see AnnDeleteAuditIssued) --
+	// a drain, an eviction, or a direct kubectl/API delete of the Sandbox
+	// object that never went through PrimusClaw's own delete paths. Who
+	// actually issued that delete is not recoverable from here; this only
+	// records that it happened and when, so the deletion itself is not
+	// invisible to audit even when its cause is.
+	ReasonExternal = "external"
 )
+
+// AnnDeleteAuditIssued marks a Sandbox object as already accounted for by a
+// sandbox.deleted audit event. Every code path that deletes a Sandbox and
+// emits its own audit event (the Workload Manager's user-delete and GC paths
+// in k8s_builder.go, and the runtime controller's shutdown-expiry path) sets
+// this annotation before or as part of issuing the delete. The runtime
+// controller's generic "Sandbox is being deleted" branch checks for it and
+// only emits a ReasonExternal event when it is absent, so a deletion that was
+// already audited for a specific reason is not also double-counted as an
+// unexplained one.
+const AnnDeleteAuditIssued = "runtime.agent-sandbox.io/delete-audit-issued"
 
 // AuditEvent is a structured audit record for sandbox lifecycle events.
 type AuditEvent struct {

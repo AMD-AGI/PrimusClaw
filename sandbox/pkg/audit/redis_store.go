@@ -9,12 +9,30 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/redis/go-redis/v9"
 )
 
 const (
 	globalEventsKey  = "audit:events"
 	sessionKeyPrefix = "audit:session:"
+)
+
+// storeWriteErrorsTotal counts failed Store() calls, labelled by event type.
+// This is the single choke point every caller (the Workload Manager's
+// user-delete and GC paths, and the runtime controller's shutdown-expiry and
+// external-delete paths) goes through, so one counter here covers all of
+// them. A caller that only logs a failed write (see the "could not read is
+// not nothing wrong" lesson -- the same applies to "could not write") leaves
+// an audit gap indistinguishable from "nothing happened"; this makes that
+// gap show up on a dashboard/alert even if the log line scrolls by unread.
+var storeWriteErrorsTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "audit_store_write_errors_total",
+		Help: "Total audit event Store() calls that failed, by event type",
+	},
+	[]string{"event_type"},
 )
 
 // RedisAuditStore implements AuditStore using Redis Sorted Sets.
@@ -49,8 +67,11 @@ func (s *RedisAuditStore) Store(ctx context.Context, event *AuditEvent) error {
 	pipe.ZAdd(ctx, globalEventsKey, redis.Z{Score: score, Member: string(data)})
 	pipe.ZAdd(ctx, sessionKey, redis.Z{Score: score, Member: string(data)})
 	pipe.Expire(ctx, sessionKey, ttl)
-	_, err = pipe.Exec(ctx)
-	return err
+	if _, err := pipe.Exec(ctx); err != nil {
+		storeWriteErrorsTotal.WithLabelValues(event.EventType).Inc()
+		return fmt.Errorf("redis pipeline exec: %w", err)
+	}
+	return nil
 }
 
 func (s *RedisAuditStore) QueryBySession(ctx context.Context, sessionID string) ([]*AuditEvent, error) {
