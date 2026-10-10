@@ -23,6 +23,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/agent-sandbox/pkg/cmdlog"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
+	"sigs.k8s.io/agent-sandbox/pkg/nsadmission"
 	"sigs.k8s.io/agent-sandbox/pkg/safe"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
@@ -35,6 +36,9 @@ type Config struct {
 	SafeAPIURL            string
 	WorkloadManagerURL    string
 	Namespace             string
+	// Namespaces decides which namespaces /v1/namespaces/:namespace serves.
+	// nil admits every namespace.
+	Namespaces *nsadmission.Admitter
 }
 
 // DefaultConfig returns sensible defaults.
@@ -151,11 +155,17 @@ func (s *Server) setupRoutes() {
 	// POST: execute commands, upload files, create sessions
 	// DELETE: delete files, destroy sessions
 	// PUT/PATCH: reserved for future use
-	v1.GET("/namespaces/:namespace/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
-	v1.POST("/namespaces/:namespace/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
-	v1.DELETE("/namespaces/:namespace/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
-	v1.PUT("/namespaces/:namespace/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
-	v1.PATCH("/namespaces/:namespace/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
+	//
+	// Namespace admission runs on the whole group, after authentication and
+	// before the handler: a namespace outside the selector is answered with the
+	// same 404 as a missing CodeInterpreter, before any session lookup,
+	// auto-create, port proxy or tunnel.
+	namespaced := v1.Group("/namespaces/:namespace", s.namespaceAdmissionMiddleware())
+	namespaced.GET("/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
+	namespaced.POST("/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
+	namespaced.DELETE("/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
+	namespaced.PUT("/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
+	namespaced.PATCH("/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
 
 	// ── Control plane: proxied to Workload Manager ───────────────────────
 	// Sandbox session management
@@ -180,6 +190,19 @@ func (s *Server) setupRoutes() {
 
 	// WM health (proxied for unified /v1/health)
 	v1.GET("/health", s.proxyToWM)
+}
+
+// namespaceAdmissionMiddleware rejects requests for namespaces the configured
+// selector does not admit. See package nsadmission for the status codes.
+func (s *Server) namespaceAdmissionMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		namespace := c.Param("namespace")
+		if !s.cfg.Namespaces.Gate(c, namespace, fmt.Sprintf("%s %q not found in namespace %q",
+			store.CodeInterpreterKind, c.Param("name"), namespace)) {
+			return
+		}
+		c.Next()
+	}
 }
 
 // Run starts the HTTP server.
@@ -318,6 +341,14 @@ func (s *Server) handleHealthReady(c *gin.Context) {
 		detail := "status " + strconv.Itoa(resp.StatusCode)
 		s.noteReadiness(false, "workload_manager", "status", detail)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready", "reason": "workload-manager: " + detail})
+		return
+	}
+
+	// A replica whose namespace cache is cold would answer every namespaced
+	// request with 503; keep it out of the Service until it can answer.
+	if !s.cfg.Namespaces.Ready() {
+		s.noteReadiness(false, "namespace_admission", "not_synced", "namespace informer not synced")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready", "reason": "namespace admission: cache not synced"})
 		return
 	}
 

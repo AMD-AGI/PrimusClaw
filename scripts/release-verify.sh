@@ -63,6 +63,9 @@ bash "$repo_root/scripts/release-tests/helm-values-schema.sh"
 echo "==> PromQL rollout gates"
 bash "$repo_root/scripts/release-tests/promql-gates.sh"
 
+echo "==> sandbox chart: namespace admission and router Ingress"
+bash "$repo_root/scripts/release-tests/sandbox-router-ingress.sh"
+
 echo "==> Helm lint and render"
 helm lint "$repo_root/sandbox/deploy/helm" \
   --values "$repo_root/scripts/release-tests/values/sandbox-release.yaml"
