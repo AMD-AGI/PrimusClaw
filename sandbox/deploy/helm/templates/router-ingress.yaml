@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- if and .Values.controlplane.enabled .Values.router.ingress.enabled }}
+{{- if not .Values.router.config.namespaceSelector }}
+{{- fail "router.ingress.enabled requires router.config.namespaceSelector: the static path prefix would otherwise expose every namespace through the Router" }}
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ required "router.ingress.name is required" .Values.router.ingress.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: agent-sandbox-controlplane
+    app.kubernetes.io/component: router
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  {{- with .Values.router.ingress.annotations }}
+  annotations: {{ toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.router.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  rules:
+    {{- if .Values.router.ingress.host }}
+    - host: {{ .Values.router.ingress.host | quote }}
+      http:
+    {{- else }}
+    - http:
+    {{- end }}
+        paths:
+          - path: {{ required "router.ingress.path is required" .Values.router.ingress.path | quote }}
+            pathType: Prefix
+            backend:
+              service:
+                name: agent-sandbox-router
+                port:
+                  number: {{ .Values.controlplane.service.router.port }}
+{{- end }}

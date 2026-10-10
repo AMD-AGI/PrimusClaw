@@ -23,6 +23,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/agent-sandbox/pkg/cmdlog"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
+	"sigs.k8s.io/agent-sandbox/pkg/nsadmission"
 	"sigs.k8s.io/agent-sandbox/pkg/safe"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
@@ -35,6 +36,9 @@ type Config struct {
 	SafeAPIURL            string
 	WorkloadManagerURL    string
 	Namespace             string
+	// Namespaces decides which namespaces /v1/namespaces/:namespace serves.
+	// nil admits every namespace.
+	Namespaces *nsadmission.Admitter
 }
 
 // DefaultConfig returns sensible defaults.
@@ -151,11 +155,17 @@ func (s *Server) setupRoutes() {
 	// POST: execute commands, upload files, create sessions
 	// DELETE: delete files, destroy sessions
 	// PUT/PATCH: reserved for future use
-	v1.GET("/namespaces/:namespace/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
-	v1.POST("/namespaces/:namespace/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
-	v1.DELETE("/namespaces/:namespace/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
-	v1.PUT("/namespaces/:namespace/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
-	v1.PATCH("/namespaces/:namespace/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
+	//
+	// Namespace admission runs on the whole group, after authentication and
+	// before the handler: a namespace outside the selector is answered with the
+	// same 404 as a missing CodeInterpreter, before any session lookup,
+	// auto-create, port proxy or tunnel.
+	namespaced := v1.Group("/namespaces/:namespace", s.namespaceAdmissionMiddleware())
+	namespaced.GET("/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
+	namespaced.POST("/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
+	namespaced.DELETE("/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
+	namespaced.PUT("/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
+	namespaced.PATCH("/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
 
 	// ── Control plane: proxied to Workload Manager ───────────────────────
 	// Sandbox session management
@@ -180,6 +190,19 @@ func (s *Server) setupRoutes() {
 
 	// WM health (proxied for unified /v1/health)
 	v1.GET("/health", s.proxyToWM)
+}
+
+// namespaceAdmissionMiddleware rejects requests for namespaces the configured
+// selector does not admit. See package nsadmission for the status codes.
+func (s *Server) namespaceAdmissionMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		namespace := c.Param("namespace")
+		if !s.cfg.Namespaces.Gate(c, namespace, fmt.Sprintf("%s %q not found in namespace %q",
+			store.CodeInterpreterKind, c.Param("name"), namespace)) {
+			return
+		}
+		c.Next()
+	}
 }
 
 // Run starts the HTTP server.
@@ -321,6 +344,14 @@ func (s *Server) handleHealthReady(c *gin.Context) {
 		return
 	}
 
+	// A replica whose namespace cache is cold would answer every namespaced
+	// request with 503; keep it out of the Service until it can answer.
+	if !s.cfg.Namespaces.Ready() {
+		s.noteReadiness(false, "namespace_admission", "not_synced", "namespace informer not synced")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready", "reason": "namespace admission: cache not synced"})
+		return
+	}
+
 	s.noteReadiness(true, "", "", "")
 	c.JSON(http.StatusOK, gin.H{"status": "ready"})
 }
@@ -404,6 +435,21 @@ func (s *Server) handleInvoke(c *gin.Context, kind string) {
 			return
 		}
 		c.JSON(http.StatusBadGateway, gin.H{"error": errMsg})
+		return
+	}
+	// The admission middleware judged the namespace in the URL, but a session
+	// ID resolves to its sandbox wherever that sandbox lives. Under admission
+	// the sandbox must be in the namespace the URL names, or a session from a
+	// non-admitted namespace would be reachable through any admitted one (and
+	// unlabelling a namespace would not cut off its live sessions). Answered
+	// with the middleware's 404 so the two refusals are indistinguishable.
+	if s.cfg.Namespaces != nil && info.Namespace != namespace {
+		log.Info("namespace.admission.session_mismatch",
+			"urlNamespace", namespace, "sessionNamespace", info.Namespace,
+			"method", c.Request.Method, "path", c.FullPath())
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": fmt.Sprintf("%s %q not found in namespace %q", kind, name, namespace),
+		})
 		return
 	}
 	sessionID = info.SessionID
