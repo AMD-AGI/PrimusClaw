@@ -9,9 +9,14 @@
 // namespace rather than an edit to this deployment. No selector means every
 // namespace is admitted, which is the behaviour before this package existed.
 //
-// A namespace that does not match is answered exactly like a CodeInterpreter
-// that does not exist (404), before any session lookup, sandbox creation or
-// proxying, so a caller learns nothing about namespaces it may not use.
+// On the Router's /v1/namespaces/:namespace routes, a namespace that does not
+// match is answered exactly like a CodeInterpreter that does not exist (404),
+// before any session lookup, sandbox creation or proxying; a session whose
+// sandbox lives in another namespace than the one the URL names gets the same
+// 404. The Workload Manager applies the check to sandbox creation and to
+// template create/get/update/delete. Not covered yet: the list endpoints and
+// the routes keyed only by session ID (get/delete/recover a session, its
+// policy and logs), which the static /v1/namespaces/ Ingress does not expose.
 //
 // The check fails closed: until the informer has synced, or when the cache
 // cannot answer, every request gets 503. That is deliberately not 404 -- a 404

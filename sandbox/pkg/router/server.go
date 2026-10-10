@@ -437,6 +437,21 @@ func (s *Server) handleInvoke(c *gin.Context, kind string) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": errMsg})
 		return
 	}
+	// The admission middleware judged the namespace in the URL, but a session
+	// ID resolves to its sandbox wherever that sandbox lives. Under admission
+	// the sandbox must be in the namespace the URL names, or a session from a
+	// non-admitted namespace would be reachable through any admitted one (and
+	// unlabelling a namespace would not cut off its live sessions). Answered
+	// with the middleware's 404 so the two refusals are indistinguishable.
+	if s.cfg.Namespaces != nil && info.Namespace != namespace {
+		log.Info("namespace.admission.session_mismatch",
+			"urlNamespace", namespace, "sessionNamespace", info.Namespace,
+			"method", c.Request.Method, "path", c.FullPath())
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": fmt.Sprintf("%s %q not found in namespace %q", kind, name, namespace),
+		})
+		return
+	}
 	sessionID = info.SessionID
 
 	// A session ID is a routing handle, not an authorization credential.

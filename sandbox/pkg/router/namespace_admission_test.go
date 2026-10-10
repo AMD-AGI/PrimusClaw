@@ -66,11 +66,25 @@ type recordingSessionManager struct {
 	info  *store.SandboxInfo
 }
 
+// GetSandboxBySession mirrors the real manager's namespace handling: an
+// auto-create (no session ID) makes a sandbox in the URL namespace, while a
+// session ID resolves to its sandbox wherever that lives (m.info.Namespace),
+// whatever namespace the URL names.
 func (m *recordingSessionManager) GetSandboxBySession(_ context.Context, sessionID, namespace, _, _ string) (*store.SandboxInfo, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.calls = append(m.calls, namespace+"|"+sessionID)
-	return m.info, nil
+	info := *m.info
+	if sessionID == "" {
+		info.Namespace = namespace
+	}
+	return &info, nil
+}
+
+func (m *recordingSessionManager) setSessionNamespace(ns string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.info.Namespace = ns
 }
 
 func (m *recordingSessionManager) Calls() []string {
@@ -102,7 +116,7 @@ func newAdmissionRig(t *testing.T, admitter *nsadmission.Admitter) *admissionRig
 	podPort, _ := strconv.Atoi(port)
 
 	sessions := &recordingSessionManager{info: &store.SandboxInfo{
-		SessionID: "sid-1", PodIP: host, PodPort: podPort,
+		SessionID: "sid-1", Namespace: "admitted", PodIP: host, PodPort: podPort,
 	}}
 	s := &Server{
 		cfg:            Config{Namespaces: admitter},
@@ -189,6 +203,32 @@ func TestInvokeDeniedNamespaceGetsRouter404BeforeSessionLayer(t *testing.T) {
 	}
 	if n := rig.upstream.Load(); n != 0 {
 		t.Fatalf("a denied namespace reached the sandbox %d times", n)
+	}
+}
+
+// A session ID resolves to its sandbox wherever that sandbox lives, so the
+// URL namespace alone is not the boundary: a session from a non-admitted
+// namespace, named through an admitted one, must get the same 404 and never
+// reach the sandbox -- by invocation, port proxy or tunnel.
+func TestInvokeSessionFromDeniedNamespaceThroughAdmittedPathGets404(t *testing.T) {
+	rig := newAdmissionRig(t, newAdmitter(t, true))
+	rig.sessions.setSessionNamespace("denied")
+	cases := []invokeCase{
+		{"invocation with session", http.MethodPost, "/api/execute", "sid-1"},
+		{"port proxy", http.MethodGet, "/proxy/" + rig.port + "/mcp", "sid-1"},
+		{"tunnel", http.MethodGet, "/tunnel/" + rig.port, "sid-1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, body := rig.do(t, tc, "admitted")
+			want := `CodeInterpreter "ci" not found in namespace "admitted"`
+			if code != http.StatusNotFound || body["error"] != want {
+				t.Fatalf("got %d %v, want 404 %q", code, body, want)
+			}
+		})
+	}
+	if n := rig.upstream.Load(); n != 0 {
+		t.Fatalf("a sandbox in a non-admitted namespace was reached %d times", n)
 	}
 }
 
