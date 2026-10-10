@@ -11,11 +11,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -39,7 +41,24 @@ type Config struct {
 	// Namespaces decides which namespaces /v1/namespaces/:namespace serves.
 	// nil admits every namespace.
 	Namespaces *nsadmission.Admitter
+
+	// ShutdownDelay is how long the Router keeps accepting new requests after
+	// Run's context ends, while /health/ready already answers 503 -- the
+	// in-process counterpart of kube-apiserver's --shutdown-delay-duration. It
+	// covers the time the Service endpoints and the gateway in front of them
+	// need to stop sending this replica new requests. A preStop sleep does the
+	// same before the signal arrives; this is the part that still works where
+	// preStop is unavailable.
+	ShutdownDelay time.Duration
+	// ShutdownTimeout bounds how long in-flight requests (proxied sandbox
+	// calls, SSE streams) may run after the listener closes. When it expires
+	// the remaining connections are closed. Zero means DefaultShutdownTimeout.
+	// terminationGracePeriodSeconds must cover preStop + ShutdownDelay + this.
+	ShutdownTimeout time.Duration
 }
+
+// DefaultShutdownTimeout is used when Config.ShutdownTimeout is zero.
+const DefaultShutdownTimeout = 30 * time.Second
 
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
@@ -65,6 +84,11 @@ type Server struct {
 	wasReady       bool
 	notReadySince  time.Time
 	lastUnreadyLog time.Time
+
+	// draining is set once Run's context ends: from then on /health/ready
+	// answers 503 so the replica leaves every endpoint list, while requests
+	// already in flight are allowed to finish.
+	draining atomic.Bool
 }
 
 // New creates a new Router server.
@@ -205,23 +229,64 @@ func (s *Server) namespaceAdmissionMiddleware() gin.HandlerFunc {
 	}
 }
 
-// Run starts the HTTP server.
+// Run starts the HTTP server and, when ctx ends, drains it.
 func (s *Server) Run(ctx context.Context) error {
-	srv := &http.Server{
-		Addr:    fmt.Sprintf(":%d", s.cfg.Port),
-		Handler: s.engine,
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", s.cfg.Port))
+	if err != nil {
+		return err
 	}
+	return s.Serve(ctx, ln)
+}
+
+// Serve serves on ln until ctx ends, then drains the way a Kubernetes Pod is
+// expected to: readiness fails at once, new requests are still accepted for
+// ShutdownDelay, then the listener closes and in-flight requests get up to
+// ShutdownTimeout to finish. Only connections still open after that are cut.
+//
+// Before this, Run called Shutdown the moment the signal arrived and main
+// returned without waiting for it, so a rollout cut every proxied request in
+// flight (two Hands MCP calls, and ~1 s of 503 at the gateway, on 2026-10-10).
+//
+// Hijacked connections (WebSocket tunnels, upgraded port-proxy streams) are not
+// tracked by http.Server.Shutdown and end when the process exits.
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	srv := &http.Server{Handler: s.engine}
 	errCh := make(chan error, 1)
 	go func() {
-		log.Info("router listening", "port", s.cfg.Port)
-		errCh <- srv.ListenAndServe()
+		log.Info("router listening", "addr", ln.Addr().String())
+		errCh <- srv.Serve(ln)
 	}()
 	select {
 	case <-ctx.Done():
-		return srv.Shutdown(context.Background())
 	case err := <-errCh:
 		return err
 	}
+
+	s.draining.Store(true)
+	log.Info("router.drain.started", "shutdownDelay", s.cfg.ShutdownDelay.String(),
+		"shutdownTimeout", s.shutdownTimeout().String())
+	if s.cfg.ShutdownDelay > 0 {
+		time.Sleep(s.cfg.ShutdownDelay)
+	}
+
+	shutCtx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout())
+	defer cancel()
+	start := time.Now()
+	if err := srv.Shutdown(shutCtx); err != nil {
+		log.Warn("router.drain.timeout: closing connections still in flight",
+			"waitedSeconds", time.Since(start).Seconds(), "error", err)
+		_ = srv.Close()
+		return nil
+	}
+	log.Info("router.drain.complete", "waitedSeconds", time.Since(start).Seconds())
+	return nil
+}
+
+func (s *Server) shutdownTimeout() time.Duration {
+	if s.cfg.ShutdownTimeout > 0 {
+		return s.cfg.ShutdownTimeout
+	}
+	return DefaultShutdownTimeout
 }
 
 // ─── Handlers ────────────────────────────────────────────────────────────────
@@ -308,6 +373,14 @@ const unreadyHeartbeat = 5 * time.Minute
 
 func (s *Server) handleHealthReady(c *gin.Context) {
 	ctx := c.Request.Context()
+
+	// Checked first: a draining replica must leave the endpoints even though
+	// every dependency below is still healthy.
+	if s.draining.Load() {
+		s.noteReadiness(false, "shutdown", "draining", "router is draining")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready", "reason": "draining"})
+		return
+	}
 
 	if err := s.store.Ping(ctx); err != nil {
 		s.noteReadiness(false, "store", "error", err.Error())
