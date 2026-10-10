@@ -62,8 +62,10 @@ type Config struct {
 	DefaultTTL time.Duration
 	Inference  InferenceConfig
 	Audit      AuditConfig
-	// Namespaces decides which namespaces sessions and templates may be
-	// created in or managed through this API. nil admits every namespace.
+	// Namespaces decides which namespaces sandboxes may be created in and
+	// templates created, read, updated or deleted in. The list endpoints and
+	// the routes keyed only by session ID are not gated. nil admits every
+	// namespace.
 	Namespaces *nsadmission.Admitter
 }
 

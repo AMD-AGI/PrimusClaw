@@ -15,6 +15,7 @@ import (
 
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/dynamic"
@@ -69,6 +70,33 @@ func checkAuthPosture(cfg *router.Config) error {
 		"reach the Router or Workload Manager can create sandboxes and execute code inside them. " +
 		"Never use this configuration outside an isolated development cluster.")
 	return nil
+}
+
+// namespaceSelectorFromEnv returns the namespace selector to enforce: the
+// NAMESPACE_SELECTOR environment variable (how the chart passes it) when set,
+// otherwise the --namespace-selector flag value. An unparseable selector is an
+// error, never "no selector", so a typo cannot fail open.
+func namespaceSelectorFromEnv(flagValue string) (labels.Selector, error) {
+	if v := os.Getenv(nsadmission.EnvVar); v != "" {
+		flagValue = v
+	}
+	return nsadmission.ParseSelector(flagValue)
+}
+
+// wireNamespaceAdmission starts one Admitter for selector and hands it to both
+// the Router and the Workload Manager. A nil selector leaves both unset, which
+// admits every namespace.
+func wireNamespaceAdmission(ctx context.Context, client kubernetes.Interface, selector labels.Selector,
+	routerCfg *router.Config, wmCfg *workloadmanager.Config) *nsadmission.Admitter {
+	admitter := nsadmission.New(client, selector)
+	if admitter == nil {
+		return nil
+	}
+	admitter.Start(ctx)
+	routerCfg.Namespaces = admitter
+	wmCfg.Namespaces = admitter
+	log.Info("namespace admission enabled", "selector", admitter.Selector())
+	return admitter
 }
 
 func init() {
@@ -162,12 +190,9 @@ func main() {
 	if v := os.Getenv("SAFE_API_URL"); v != "" {
 		routerCfg.SafeAPIURL = v
 	}
-	if v := os.Getenv(nsadmission.EnvVar); v != "" {
-		namespaceSelector = v
-	}
 	// Parsed before anything starts: a selector that does not parse must stop
 	// the process, not degrade to admitting every namespace.
-	nsSelector, err := nsadmission.ParseSelector(namespaceSelector)
+	nsSelector, err := namespaceSelectorFromEnv(namespaceSelector)
 	if err != nil {
 		log.Error("namespace admission refused", "error", err)
 		os.Exit(1)
@@ -283,12 +308,7 @@ func main() {
 	// Shared by the Router and the Workload Manager. Not waited for here: until
 	// it syncs every namespaced request is refused with 503 and the Router's
 	// readiness probe fails, so the replica takes no traffic it cannot judge.
-	if admitter := nsadmission.New(clientset, nsSelector); admitter != nil {
-		admitter.Start(ctx)
-		routerCfg.Namespaces = admitter
-		wmCfg.Namespaces = admitter
-		log.Info("namespace admission enabled", "selector", admitter.Selector())
-	}
+	wireNamespaceAdmission(ctx, clientset, nsSelector, &routerCfg, &wmCfg)
 
 	dynamicClient, err := dynamic.NewForConfig(k8sCfg)
 	if err != nil {
