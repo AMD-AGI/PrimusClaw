@@ -77,6 +77,12 @@ rules:
   - apiGroups: ["runtime.agent-sandbox.io"]
     resources: ["clustersandboxpolicies"]
     verbs: ["get", "list", "watch"]
+  {{- if .Values.router.config.namespaceSelector }}
+  # Namespace admission (router.config.namespaceSelector) watches Namespaces.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -198,6 +204,10 @@ spec:
               value: {{ ternary "true" "false" .Values.router.config.enableAuth | quote }}
             - name: SAFE_API_URL
               value: {{ .Values.router.config.safeApiUrl | quote }}
+            {{- if .Values.router.config.namespaceSelector }}
+            - name: NAMESPACE_SELECTOR
+              value: {{ .Values.router.config.namespaceSelector | quote }}
+            {{- end }}
             - name: ALLOW_INSECURE_NO_AUTH
               value: {{ ternary "true" "false" .Values.security.allowInsecureNoAuth | quote }}
             - name: EGRESS_ENABLED

@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/agent-sandbox/pkg/builder"
 	"sigs.k8s.io/agent-sandbox/pkg/cmdlog"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
+	"sigs.k8s.io/agent-sandbox/pkg/nsadmission"
 	"sigs.k8s.io/agent-sandbox/pkg/policy"
 	"sigs.k8s.io/agent-sandbox/pkg/safe"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
@@ -61,6 +62,9 @@ type Config struct {
 	DefaultTTL time.Duration
 	Inference  InferenceConfig
 	Audit      AuditConfig
+	// Namespaces decides which namespaces sessions and templates may be
+	// created in or managed through this API. nil admits every namespace.
+	Namespaces *nsadmission.Admitter
 }
 
 // DefaultConfig returns sensible defaults.
@@ -315,6 +319,14 @@ func (s *Server) handleHealthDeep(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "checks": checks})
 }
 
+// admitNamespace applies namespace admission to a request about kind/name in
+// namespace. A namespace outside the selector gets the same 404 as a missing
+// object; see package nsadmission. It returns true when the request may proceed.
+func (s *Server) admitNamespace(c *gin.Context, kind, name, namespace string) bool {
+	return s.cfg.Namespaces.Gate(c, namespace,
+		fmt.Sprintf("%s %q not found in namespace %q", kind, name, namespace))
+}
+
 // handleCodeInterpreterCreate handles POST /v1/code-interpreter.
 func (s *Server) handleCodeInterpreterCreate(c *gin.Context) {
 	s.handleCreate(c, store.CodeInterpreterKind)
@@ -349,6 +361,10 @@ func (s *Server) handleCodeInterpreterCreateStream(c *gin.Context) {
 	createTemplate = req.Name
 	if req.Namespace == "" {
 		req.Namespace = s.cfg.Namespace
+	}
+	// Before the SSE headers: once they are flushed a 404 can no longer be sent.
+	if !s.admitNamespace(c, store.CodeInterpreterKind, req.Name, req.Namespace) {
+		return
 	}
 
 	// Setup SSE headers (after body is fully consumed)
@@ -480,6 +496,9 @@ func (s *Server) handleCreate(c *gin.Context, kind string) {
 	}
 	if req.Namespace == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "namespace is required"})
+		return
+	}
+	if !s.admitNamespace(c, kind, req.Name, req.Namespace) {
 		return
 	}
 
@@ -1098,6 +1117,10 @@ func (s *Server) handleTemplateCreate(c *gin.Context) {
 	if req.Namespace == "" {
 		req.Namespace = "default"
 	}
+	// Before the image build: a denied namespace must not cost a kaniko run.
+	if !s.admitNamespace(c, store.CodeInterpreterKind, req.Name, req.Namespace) {
+		return
+	}
 
 	// Extract user identity from auth middleware
 	var user *UserIdentity
@@ -1203,6 +1226,9 @@ func (s *Server) handleTemplateCreateStream(c *gin.Context) {
 	}
 	if req.Namespace == "" {
 		req.Namespace = "default"
+	}
+	if !s.admitNamespace(c, store.CodeInterpreterKind, req.Name, req.Namespace) {
+		return
 	}
 
 	var user *UserIdentity
@@ -1420,6 +1446,9 @@ func (s *Server) handleTemplateGet(c *gin.Context) {
 	}
 	name := c.Param("name")
 	namespace := c.Param("namespace")
+	if !s.admitNamespace(c, store.CodeInterpreterKind, name, namespace) {
+		return
+	}
 	ci, err := s.k8s.GetTemplate(c.Request.Context(), name, namespace)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
@@ -1444,6 +1473,9 @@ func (s *Server) handleTemplateUpdate(c *gin.Context) {
 	}
 	name := c.Param("name")
 	namespace := c.Param("namespace")
+	if !s.admitNamespace(c, store.CodeInterpreterKind, name, namespace) {
+		return
+	}
 	var req UpdateTemplateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: " + err.Error()})
@@ -1486,6 +1518,9 @@ func (s *Server) handleTemplateDelete(c *gin.Context) {
 	}
 	name := c.Param("name")
 	namespace := c.Param("namespace")
+	if !s.admitNamespace(c, store.CodeInterpreterKind, name, namespace) {
+		return
+	}
 
 	// Fetch existing template for permission check
 	existing, err := s.k8s.GetTemplate(c.Request.Context(), name, namespace)

@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
 	"sigs.k8s.io/agent-sandbox/pkg/builder"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
+	"sigs.k8s.io/agent-sandbox/pkg/nsadmission"
 	"sigs.k8s.io/agent-sandbox/pkg/router"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 	"sigs.k8s.io/agent-sandbox/pkg/workloadmanager"
@@ -94,6 +95,7 @@ func main() {
 	// would take the whole control plane down on an image bump alone, so it is
 	// parsed and reported rather than refused. Remove in the next release.
 	var deprecatedSessionTimeout time.Duration
+	var namespaceSelector string
 	var deprecatedEnableIdleGC bool
 
 	routerPort = 8080
@@ -104,6 +106,9 @@ func main() {
 	flag.IntVar(&routerCfg.MaxConcurrentRequests, "max-concurrent-requests", routerCfg.MaxConcurrentRequests, "Max concurrent Router requests")
 	flag.BoolVar(&routerCfg.EnableAuth, "enable-auth", routerCfg.EnableAuth, "Enable SaFE API Key authentication")
 	flag.StringVar(&routerCfg.SafeAPIURL, "safe-api-url", routerCfg.SafeAPIURL, "SaFE API server URL")
+	flag.StringVar(&namespaceSelector, "namespace-selector", "",
+		"Label selector (kubectl -l syntax) of the namespaces the Router and Workload Manager serve; "+
+			"empty serves every namespace. Overridden by "+nsadmission.EnvVar)
 	flag.StringVar(&wmCfg.Namespace, "namespace", wmCfg.Namespace, "K8s namespace for system components")
 	flag.DurationVar(&wmCfg.GCInterval, "gc-interval", wmCfg.GCInterval, "GC scan interval")
 	flag.DurationVar(&wmCfg.DefaultTTL, "default-ttl", wmCfg.DefaultTTL, "Default sandbox TTL")
@@ -156,6 +161,16 @@ func main() {
 	}
 	if v := os.Getenv("SAFE_API_URL"); v != "" {
 		routerCfg.SafeAPIURL = v
+	}
+	if v := os.Getenv(nsadmission.EnvVar); v != "" {
+		namespaceSelector = v
+	}
+	// Parsed before anything starts: a selector that does not parse must stop
+	// the process, not degrade to admitting every namespace.
+	nsSelector, err := nsadmission.ParseSelector(namespaceSelector)
+	if err != nil {
+		log.Error("namespace admission refused", "error", err)
+		os.Exit(1)
 	}
 	if v := os.Getenv("GC_INTERVAL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
@@ -264,6 +279,16 @@ func main() {
 	}
 
 	workloadmanager.InitPublicKeyCache(ctx, clientset)
+
+	// Shared by the Router and the Workload Manager. Not waited for here: until
+	// it syncs every namespaced request is refused with 503 and the Router's
+	// readiness probe fails, so the replica takes no traffic it cannot judge.
+	if admitter := nsadmission.New(clientset, nsSelector); admitter != nil {
+		admitter.Start(ctx)
+		routerCfg.Namespaces = admitter
+		wmCfg.Namespaces = admitter
+		log.Info("namespace admission enabled", "selector", admitter.Selector())
+	}
 
 	dynamicClient, err := dynamic.NewForConfig(k8sCfg)
 	if err != nil {

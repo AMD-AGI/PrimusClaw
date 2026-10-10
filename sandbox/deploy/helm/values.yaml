@@ -136,6 +136,28 @@ router:
     # all — not a weaker check, none. Set true (plus safeApiUrl) in production.
     enableAuth: false
     safeApiUrl: ""                # required when enableAuth=true
+    # Label selector (kubectl -l syntax) of the namespaces the Router and the
+    # Workload Manager serve, e.g. "example.com/sandbox=enabled". A request for
+    # a namespace that does not match gets the same 404 as a missing
+    # CodeInterpreter, before any session lookup, auto-create or proxying.
+    # Empty serves every namespace (no Namespace informer, no extra RBAC).
+    # When set, the chart grants get/list/watch on namespaces, and the Router
+    # reports not-ready until its namespace cache has synced.
+    namespaceSelector: ""
+  # Optional Ingress with ONE static Prefix path to the Router Service, so a
+  # new workspace needs a namespace label rather than a new Ingress path.
+  # It requires router.config.namespaceSelector: without one the prefix would
+  # expose every namespace, and the chart refuses to render.
+  # Annotations are passed through verbatim; put the gateway's source
+  # allow-list and timeouts here -- they are controller-specific, so the chart
+  # does not invent defaults for them.
+  ingress:
+    enabled: false
+    name: agent-sandbox-router
+    className: ""
+    host: ""                      # empty = match any host
+    path: /v1/namespaces/
+    annotations: {}
   extraEnv: []
 
 # ── Workload Manager (merged into controlplane; only config/extraEnv are consumed) ──
