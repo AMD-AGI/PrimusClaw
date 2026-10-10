@@ -46,6 +46,22 @@ controlplane:
     # image (built with EXTRA_CA_CERT_URLS) and fails the same way if it is empty.
     sandboxExtraCAConfigMap: ""
     sandboxExtraCARequired: false
+  # Graceful drain on rollout or eviction, in Kubernetes order:
+  #  1. preStop sleeps preStopSleepSeconds while the Pod, already terminating,
+  #     is removed from the Service endpoints and the gateway stops routing to
+  #     it. Uses the native sleep action (Kubernetes >= 1.30; the image is
+  #     distroless and has no sleep binary). 0 disables it.
+  #  2. On SIGTERM /health/ready fails and the Router keeps accepting requests
+  #     for delaySeconds -- the fallback where preStop is unavailable.
+  #  3. The listener closes; in-flight proxied requests and streams get up to
+  #     timeoutSeconds to finish, then the rest are closed.
+  # terminationGracePeriodSeconds defaults to the sum plus 15s for the Workload
+  # Manager and controllers to stop; an explicit value below the sum is refused.
+  shutdown:
+    preStopSleepSeconds: 10
+    delaySeconds: 5
+    timeoutSeconds: 60
+    terminationGracePeriodSeconds: null
   service:
     router:
       type: ClusterIP

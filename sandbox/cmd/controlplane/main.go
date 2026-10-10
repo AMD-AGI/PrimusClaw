@@ -151,6 +151,11 @@ func main() {
 	// not wired: LastActivity is not refreshed, and Brain owns idle reclaim.
 	flag.BoolVar(&deprecatedEnableIdleGC, "enable-idle-gc", false,
 		"Deprecated and ignored: sandbox idle reclaim is owned by Brain")
+	flag.DurationVar(&routerCfg.ShutdownDelay, "shutdown-delay", 0,
+		"After SIGTERM, keep accepting Router requests this long with /health/ready failing, "+
+			"so endpoints and the gateway drop the replica before the listener closes")
+	flag.DurationVar(&routerCfg.ShutdownTimeout, "shutdown-timeout", router.DefaultShutdownTimeout,
+		"After the shutdown delay, how long in-flight Router requests may run before they are closed")
 	flag.Parse()
 
 	// Said out loud, because the environment variable never failed at all: a
@@ -238,8 +243,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	// sigCtx ends on the signal and drives only the Router's drain; ctx is the
+	// lifetime of everything the Router depends on and ends after the drain
+	// (see runUntilSignal). During startup a signal still aborts at once.
+	sigCtx, sigCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer sigCancel()
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	stopStartupAbort := context.AfterFunc(sigCtx, cancel)
 
 	k8sCfg := ctrl.GetConfigOrDie()
 	mgr, err := ctrl.NewManager(k8sCfg, ctrl.Options{
@@ -433,32 +444,20 @@ func main() {
 		go watcher.Run(ctx)
 	}
 
-	errCh := make(chan error, 3)
-	go func() {
-		log.Info("router starting", "port", routerCfg.Port)
-		if err := routerServer.Run(ctx); err != nil && err.Error() != "http: Server closed" {
-			errCh <- fmt.Errorf("router: %w", err)
-		}
-	}()
-	go func() {
-		log.Info("workload-manager API starting", "port", wmCfg.Port)
-		if err := apiServer.Run(ctx); err != nil && err.Error() != "http: Server closed" {
-			errCh <- fmt.Errorf("workload-manager: %w", err)
-		}
-	}()
-	go func() {
-		log.Info("controller manager starting", "metrics", metricsAddr, "probe", probeAddr)
-		if err := mgr.Start(ctx); err != nil {
-			errCh <- fmt.Errorf("manager: %w", err)
-		}
-	}()
-
-	select {
-	case <-ctx.Done():
-		log.Info("controlplane shutdown complete")
-	case err := <-errCh:
+	if !stopStartupAbort() {
+		log.Info("controlplane stopped during startup")
+		return
+	}
+	err = runUntilSignal(sigCtx, ctx, cancel,
+		component{name: "router", run: routerServer.Run},
+		[]component{
+			{name: "workload-manager API", run: apiServer.Run},
+			{name: "controller manager", run: mgr.Start},
+		},
+		15*time.Second)
+	if err != nil {
 		log.Error("controlplane exited with error", "error", err)
-		cancel()
 		os.Exit(1)
 	}
+	log.Info("controlplane shutdown complete")
 }

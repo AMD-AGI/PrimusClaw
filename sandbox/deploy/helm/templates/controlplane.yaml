@@ -157,6 +157,16 @@ spec:
         prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: agent-sandbox-controlplane
+      {{- $sd := .Values.controlplane.shutdown }}
+      {{- $drain := add (int $sd.preStopSleepSeconds) (int $sd.delaySeconds) (int $sd.timeoutSeconds) }}
+      {{- $grace := add $drain 15 }}
+      {{- if not (kindIs "invalid" $sd.terminationGracePeriodSeconds) }}
+      {{- $grace = int $sd.terminationGracePeriodSeconds }}
+      {{- if lt $grace $drain }}
+      {{- fail (printf "controlplane.shutdown.terminationGracePeriodSeconds=%d is shorter than preStopSleepSeconds+delaySeconds+timeoutSeconds=%d: kubelet would kill in-flight requests mid-drain" $grace $drain) }}
+      {{- end }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ $grace }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets: {{ toYaml . | nindent 8 }}
       {{- end }}
@@ -181,6 +191,8 @@ spec:
             - --leader-elect={{ ternary "true" "false" .Values.controlplane.config.leaderElect }}
             - --extensions={{ ternary "true" "false" .Values.controlplane.config.extensions }}
             - --namespace={{ .Release.Namespace }}
+            - --shutdown-delay={{ int .Values.controlplane.shutdown.delaySeconds }}s
+            - --shutdown-timeout={{ int .Values.controlplane.shutdown.timeoutSeconds }}s
             {{- if .Values.router.config.enableAuth }}
             - --enable-auth=true
             - --safe-api-url={{ .Values.router.config.safeApiUrl }}
@@ -270,6 +282,12 @@ spec:
               name: manager-metrics
             - containerPort: {{ .Values.controlplane.ports.managerHealth }}
               name: manager-health
+          {{- if gt (int .Values.controlplane.shutdown.preStopSleepSeconds) 0 }}
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: {{ int .Values.controlplane.shutdown.preStopSleepSeconds }}
+          {{- end }}
           # 30 * 2s = 60s. The router port stays closed until the JWT identity
           # is reconciled against the envd-router-identity Secret, so this has
           # to cover identityReconcileBudget (pkg/router/jwt.go, 30s) plus the
