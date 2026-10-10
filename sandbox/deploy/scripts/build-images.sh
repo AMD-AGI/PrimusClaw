@@ -108,7 +108,7 @@ mkdir -p bin
 log "Building controlplane ..."
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "${GO_BIN}" build -buildvcs=false \
     -ldflags="-s -w -X main.version=${TAG}" \
-    -o bin/controlplane ./cmd/controlplane/main.go
+    -o bin/controlplane ./cmd/controlplane
 ok "bin/controlplane"
 
 log "Building envd ..."
