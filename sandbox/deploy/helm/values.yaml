@@ -46,6 +46,26 @@ controlplane:
     # image (built with EXTRA_CA_CERT_URLS) and fails the same way if it is empty.
     sandboxExtraCAConfigMap: ""
     sandboxExtraCARequired: false
+  # Graceful drain on rollout or eviction, in Kubernetes order:
+  #  1. preStop sleeps preStopSleepSeconds while the Pod, already terminating,
+  #     is removed from the Service endpoints and the gateway stops routing to
+  #     it. Uses the native sleep action (Kubernetes >= 1.30; the image is
+  #     distroless and has no sleep binary). 0 disables it.
+  #  2. On SIGTERM /health/ready fails and the Router keeps accepting requests
+  #     for delaySeconds -- the fallback where preStop is unavailable.
+  #  3. The listener closes; in-flight proxied requests and streams get up to
+  #     timeoutSeconds to finish, then the rest are closed.
+  #  4. The Workload Manager and the rest get stopGraceSeconds to stop. The
+  #     controllers stop at SIGTERM and release the leader lease at once, so
+  #     the replacement Pod reconciles Sandboxes while this one still drains.
+  # terminationGracePeriodSeconds defaults to the sum of all four plus 10s of
+  # margin; an explicit value below that is refused.
+  shutdown:
+    preStopSleepSeconds: 10
+    delaySeconds: 5
+    timeoutSeconds: 60
+    stopGraceSeconds: 15
+    terminationGracePeriodSeconds: null
   service:
     router:
       type: ClusterIP
@@ -136,6 +156,34 @@ router:
     # all — not a weaker check, none. Set true (plus safeApiUrl) in production.
     enableAuth: false
     safeApiUrl: ""                # required when enableAuth=true
+    # Label selector (kubectl -l syntax) of the namespaces the Router and the
+    # Workload Manager serve, e.g. "example.com/sandbox=enabled". A request for
+    # a namespace that does not match gets 403 namespace_not_admitted (not 404,
+    # which clients read as "sandbox gone"); a session is judged by the
+    # namespace its sandbox lives in, not the one its URL names.
+    # Empty serves every namespace (no Namespace informer, no extra RBAC); a
+    # value of only whitespace is refused by the chart and the binary.
+    # When set, the chart grants get/list/watch on namespaces, and the Router
+    # reports not-ready until its namespace cache has synced.
+    # Label every namespace clients use, including the implicit ones: a sandbox
+    # created without a namespace goes to the release namespace, while a
+    # template created without one goes to "default". If clients rely on
+    # either default, label that namespace too, or their requests get 403.
+    namespaceSelector: ""
+  # Optional Ingress with ONE static Prefix path to the Router Service, so a
+  # new workspace needs a namespace label rather than a new Ingress path.
+  # It requires router.config.namespaceSelector: without one the prefix would
+  # expose every namespace, and the chart refuses to render.
+  # Annotations are passed through verbatim; put the gateway's source
+  # allow-list and timeouts here -- they are controller-specific, so the chart
+  # does not invent defaults for them.
+  ingress:
+    enabled: false
+    name: agent-sandbox-router
+    className: ""
+    host: ""                      # empty = match any host
+    path: /v1/namespaces/         # must start with /v1/namespaces/ (the chart refuses anything wider)
+    annotations: {}
   extraEnv: []
 
 # ── Workload Manager (merged into controlplane; only config/extraEnv are consumed) ──

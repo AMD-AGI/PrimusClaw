@@ -1,0 +1,233 @@
+// SPDX-FileCopyrightText: Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+// Package nsadmission decides which namespaces the Router and the Workload
+// Manager serve, from a Namespace label selector.
+//
+// The selector uses the same syntax as `kubectl get ns -l` and is matched
+// against a Namespace informer, so admitting a new namespace is a label on that
+// namespace rather than an edit to this deployment. No selector means every
+// namespace is admitted, which is the behaviour before this package existed.
+//
+// A namespace that does not match is refused with 403 and code
+// "namespace_not_admitted". It is deliberately not 404: clients of the
+// invocation routes read a 404 as "this sandbox is gone" (Brain's container
+// probe destroys and recreates the sandbox on `exec failed: HTTP 404`), so a
+// 404 would turn an operator removing a label, or a selector written too
+// narrowly, into the destruction of every live sandbox in that namespace. A
+// 403 says the sandbox may exist but this deployment will not serve it, which
+// such clients treat as "unknown" and leave alone.
+//
+// On the Router's /v1/namespaces/:namespace routes, a request without a
+// session ID (which auto-creates a sandbox in the URL namespace) is judged by
+// the URL namespace before any session lookup, sandbox creation or proxying.
+// A request with a session ID is judged by the namespace the session's sandbox
+// actually lives in, after the lookup and before anything reaches the sandbox;
+// the URL namespace is not compared with it, because existing clients name a
+// default namespace in the URL whatever namespace the session lives in. The
+// Workload Manager applies the check to sandbox creation and to template
+// create/get/update/delete, to the routes keyed by session ID (get and delete
+// a session, get and patch its policy, read its logs), judged by the
+// namespace the session lives in, and filters the session and template lists
+// down to admitted namespaces. Session recovery (/sessions/:id/recover) is not
+// gated: its caller is the Router, which judges the recovered session's own
+// namespace before using it, and the Router does not expose that route.
+//
+// The check fails closed: until the informer has synced, or when the cache
+// cannot answer, every request gets 503. That is deliberately not 404 either,
+// for the same reason, and because the condition is transient and retrying is
+// correct. The Router's readiness probe reports not-ready over the same window,
+// so in a normal rollout no traffic reaches a replica whose cache is cold.
+package nsadmission
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/cache"
+
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
+)
+
+// EnvVar is the environment variable carrying the selector.
+const EnvVar = "NAMESPACE_SELECTOR"
+
+// Decision is the outcome of an admission check.
+type Decision int
+
+const (
+	// Admitted means the namespace matches the selector (or no selector is set).
+	Admitted Decision = iota
+	// NotAdmitted means the namespace does not exist or does not match.
+	NotAdmitted
+	// Unavailable means the cache cannot answer yet; the caller must deny.
+	Unavailable
+)
+
+func (d Decision) String() string {
+	switch d {
+	case Admitted:
+		return "admitted"
+	case NotAdmitted:
+		return "not_admitted"
+	default:
+		return "unavailable"
+	}
+}
+
+// Admitter answers whether a namespace is admitted. A nil *Admitter admits
+// every namespace, so callers need no branch for the unconfigured case.
+type Admitter struct {
+	selector labels.Selector
+	factory  informers.SharedInformerFactory
+	informer cache.SharedIndexInformer
+	lister   corelisters.NamespaceLister
+}
+
+// ParseSelector parses a label selector in kubectl -l syntax. The empty string
+// returns (nil, nil): no admission control. A string of only whitespace is an
+// error rather than "no selector": it is a value someone set and got wrong, and
+// a mistake must not fail open.
+func ParseSelector(s string) (labels.Selector, error) {
+	if s == "" {
+		return nil, nil
+	}
+	if strings.TrimSpace(s) == "" {
+		return nil, fmt.Errorf("namespace selector %q is only whitespace; leave it empty to serve every namespace", s)
+	}
+	s = strings.TrimSpace(s)
+	sel, err := labels.Parse(s)
+	if err != nil {
+		return nil, fmt.Errorf("invalid namespace selector %q: %w", s, err)
+	}
+	if sel.Empty() {
+		return nil, fmt.Errorf("namespace selector %q selects every namespace; leave it empty instead", s)
+	}
+	return sel, nil
+}
+
+// New returns an Admitter for selector, or nil when selector is nil.
+// The informer lists and watches only the namespaces the selector matches
+// (server-side filtering), so the cache stays small however many namespaces
+// the cluster holds. Call Start before serving.
+func New(client kubernetes.Interface, selector labels.Selector) *Admitter {
+	if selector == nil {
+		return nil
+	}
+	sel := selector.String()
+	factory := informers.NewSharedInformerFactoryWithOptions(client, 0,
+		informers.WithTweakListOptions(func(o *metav1.ListOptions) {
+			o.LabelSelector = sel
+		}))
+	nsInformer := factory.Core().V1().Namespaces()
+	return &Admitter{
+		selector: selector,
+		factory:  factory,
+		informer: nsInformer.Informer(),
+		lister:   nsInformer.Lister(),
+	}
+}
+
+// Start runs the informer until ctx is done. It does not wait for the sync:
+// until then Admit returns Unavailable and Ready returns false.
+func (a *Admitter) Start(ctx context.Context) {
+	if a == nil {
+		return
+	}
+	a.factory.Start(ctx.Done())
+}
+
+// Selector returns the configured selector as a string ("" when unset).
+func (a *Admitter) Selector() string {
+	if a == nil {
+		return ""
+	}
+	return a.selector.String()
+}
+
+// Ready reports whether the cache can answer. Always true when unconfigured.
+func (a *Admitter) Ready() bool {
+	return a == nil || a.informer.HasSynced()
+}
+
+// Admit decides whether namespace is admitted.
+func (a *Admitter) Admit(namespace string) Decision {
+	if a == nil {
+		return Admitted
+	}
+	if !a.informer.HasSynced() {
+		return Unavailable
+	}
+	ns, err := a.lister.Get(namespace)
+	if k8serrors.IsNotFound(err) {
+		return NotAdmitted
+	}
+	if err != nil {
+		return Unavailable
+	}
+	// The list is already filtered by the API server; matching again keeps the
+	// decision correct even if a cached object predates a label change that the
+	// watch has not delivered as a delete.
+	if !a.selector.Matches(labels.Set(ns.Labels)) {
+		return NotAdmitted
+	}
+	return Admitted
+}
+
+// Gate checks namespace and, when it is not admitted, writes the response and
+// aborts the request: 403 namespace_not_admitted, or 503 when the cache cannot
+// answer. It returns true when the request may proceed.
+func (a *Admitter) Gate(c *gin.Context, namespace string) bool {
+	switch d := a.Admit(namespace); d {
+	case Admitted:
+		return true
+	case NotAdmitted:
+		log.Info("namespace.admission.denied", "namespace", namespace,
+			"method", c.Request.Method, "path", c.FullPath())
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+			"error": fmt.Sprintf("namespace %q is not served by this deployment", namespace),
+			"code":  "namespace_not_admitted",
+		})
+		return false
+	default:
+		abortUnavailable(c, namespace)
+		return false
+	}
+}
+
+// GateReady is Gate for a request that spans namespaces (a list): when the
+// cache cannot answer it writes the same 503 as Gate and returns false, so the
+// caller never filters a list against a cold cache. The caller then keeps only
+// the entries whose namespace Admit reports Admitted.
+func (a *Admitter) GateReady(c *gin.Context) bool {
+	if a.Ready() {
+		return true
+	}
+	abortUnavailable(c, "")
+	return false
+}
+
+// Filter reports whether an entry in namespace may appear in a list. Call it
+// only after GateReady has passed.
+func (a *Admitter) Filter(namespace string) bool {
+	return a.Admit(namespace) == Admitted
+}
+
+func abortUnavailable(c *gin.Context, namespace string) {
+	log.Warn("namespace.admission.unavailable", "namespace", namespace,
+		"method", c.Request.Method, "path", c.FullPath())
+	c.Header("Retry-After", "1")
+	c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+		"error": "namespace admission is not ready, retry later",
+		"code":  "namespace_admission_unavailable",
+	})
+}
