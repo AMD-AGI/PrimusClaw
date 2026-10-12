@@ -146,14 +146,34 @@ render "$tmp/ingress.yaml" \
   --set-string 'router.ingress.annotations.example\.com/source-allow=192.0.2.0/24'
 check "$tmp/ingress.yaml" ingress
 
-# An Ingress without a selector would expose every namespace: refused.
-if render "$tmp/refused.yaml" --set router.ingress.enabled=true 2>"$tmp/refused.err"; then
-  echo "  FAIL [no-selector]: an enabled Ingress without a namespace selector rendered" >&2
-  exit 1
-fi
-grep -q "router.ingress.enabled requires router.config.namespaceSelector" "$tmp/refused.err" || {
-  echo "  FAIL [no-selector]: refused for the wrong reason:" >&2
-  cat "$tmp/refused.err" >&2
-  exit 1
+# refused <name> <expected error text> <helm args...> -- the render must fail,
+# and for the stated reason.
+refused() {
+  local name="$1" want="$2"
+  shift 2
+  if render "$tmp/refused.yaml" "$@" 2>"$tmp/refused.err"; then
+    echo "  FAIL [$name]: rendered, want refused" >&2
+    exit 1
+  fi
+  grep -qF "$want" "$tmp/refused.err" || {
+    echo "  FAIL [$name]: refused for the wrong reason:" >&2
+    cat "$tmp/refused.err" >&2
+    exit 1
+  }
+  echo "  ok: $name refused"
 }
-echo "  ok: no-selector refused"
+
+# An Ingress without a selector would expose every namespace.
+refused no-selector "router.ingress.enabled requires router.config.namespaceSelector" \
+  --set router.ingress.enabled=true
+
+# A blank selector is a mistake, not "serve every namespace".
+refused blank-selector "router.config.namespaceSelector is only whitespace" \
+  --set-string 'router.config.namespaceSelector=  '
+
+# A prefix wider than the namespaced routes would expose unadmitted ones.
+for path in / /v1/ /v1/namespaces; do
+  refused "ingress-path=$path" "router.ingress.path must start with /v1/namespaces/" \
+    --set-string router.config.namespaceSelector=example.com/sandbox=enabled \
+    --set router.ingress.enabled=true --set-string "router.ingress.path=$path"
+done

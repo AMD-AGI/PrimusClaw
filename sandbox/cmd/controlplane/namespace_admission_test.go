@@ -52,6 +52,17 @@ func TestNamespaceSelectorFromEnvRefusesAnInvalidSelector(t *testing.T) {
 
 // Both servers must enforce the same Admitter: the Router for invocations and
 // the Workload Manager for creates proxied through the Router.
+func TestNamespaceSelectorFromEnvRefusesAWhitespaceSelector(t *testing.T) {
+	t.Setenv(nsadmission.EnvVar, "  ")
+	if sel, err := namespaceSelectorFromEnv(""); err == nil || sel != nil {
+		t.Fatalf("a blank NAMESPACE_SELECTOR must stop start-up, got %v, %v", sel, err)
+	}
+	t.Setenv(nsadmission.EnvVar, "")
+	if sel, err := namespaceSelectorFromEnv(" "); err == nil || sel != nil {
+		t.Fatalf("a blank --namespace-selector must stop start-up, got %v, %v", sel, err)
+	}
+}
+
 func TestWireNamespaceAdmissionSetsRouterAndWorkloadManager(t *testing.T) {
 	sel, err := nsadmission.ParseSelector("example.com/sandbox=enabled")
 	if err != nil {

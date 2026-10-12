@@ -9,21 +9,32 @@
 // namespace rather than an edit to this deployment. No selector means every
 // namespace is admitted, which is the behaviour before this package existed.
 //
-// On the Router's /v1/namespaces/:namespace routes, a namespace that does not
-// match is answered exactly like a CodeInterpreter that does not exist (404),
-// before any session lookup, sandbox creation or proxying; a session whose
-// sandbox lives in another namespace than the one the URL names gets the same
-// 404. The Workload Manager applies the check to sandbox creation and to
-// template create/get/update/delete. Not covered yet: the list endpoints and
-// the routes keyed only by session ID (get/delete/recover a session, its
-// policy and logs), which the static /v1/namespaces/ Ingress does not expose.
+// A namespace that does not match is refused with 403 and code
+// "namespace_not_admitted". It is deliberately not 404: clients of the
+// invocation routes read a 404 as "this sandbox is gone" (Brain's container
+// probe destroys and recreates the sandbox on `exec failed: HTTP 404`), so a
+// 404 would turn an operator removing a label, or a selector written too
+// narrowly, into the destruction of every live sandbox in that namespace. A
+// 403 says the sandbox may exist but this deployment will not serve it, which
+// such clients treat as "unknown" and leave alone.
+//
+// On the Router's /v1/namespaces/:namespace routes, a request without a
+// session ID (which auto-creates a sandbox in the URL namespace) is judged by
+// the URL namespace before any session lookup, sandbox creation or proxying.
+// A request with a session ID is judged by the namespace the session's sandbox
+// actually lives in, after the lookup and before anything reaches the sandbox;
+// the URL namespace is not compared with it, because existing clients name a
+// default namespace in the URL whatever namespace the session lives in. The
+// Workload Manager applies the check to sandbox creation and to template
+// create/get/update/delete. Not covered yet: the list endpoints and the
+// routes keyed only by session ID (get/delete/recover a session, its policy
+// and logs), which the static /v1/namespaces/ Ingress does not expose.
 //
 // The check fails closed: until the informer has synced, or when the cache
-// cannot answer, every request gets 503. That is deliberately not 404 -- a 404
-// tells a client the workspace does not exist, which it may cache or surface as
-// a permanent error, while the condition is transient and retrying is correct.
-// The Router's readiness probe reports not-ready over the same window, so in a
-// normal rollout no traffic reaches a replica whose cache is cold.
+// cannot answer, every request gets 503. That is deliberately not 404 either,
+// for the same reason, and because the condition is transient and retrying is
+// correct. The Router's readiness probe reports not-ready over the same window,
+// so in a normal rollout no traffic reaches a replica whose cache is cold.
 package nsadmission
 
 import (
@@ -79,13 +90,18 @@ type Admitter struct {
 	lister   corelisters.NamespaceLister
 }
 
-// ParseSelector parses a label selector in kubectl -l syntax. An empty or
-// all-whitespace string returns (nil, nil): no admission control.
+// ParseSelector parses a label selector in kubectl -l syntax. The empty string
+// returns (nil, nil): no admission control. A string of only whitespace is an
+// error rather than "no selector": it is a value someone set and got wrong, and
+// a mistake must not fail open.
 func ParseSelector(s string) (labels.Selector, error) {
-	s = strings.TrimSpace(s)
 	if s == "" {
 		return nil, nil
 	}
+	if strings.TrimSpace(s) == "" {
+		return nil, fmt.Errorf("namespace selector %q is only whitespace; leave it empty to serve every namespace", s)
+	}
+	s = strings.TrimSpace(s)
 	sel, err := labels.Parse(s)
 	if err != nil {
 		return nil, fmt.Errorf("invalid namespace selector %q: %w", s, err)
@@ -165,19 +181,19 @@ func (a *Admitter) Admit(namespace string) Decision {
 }
 
 // Gate checks namespace and, when it is not admitted, writes the response and
-// aborts the request. It returns true when the request may proceed.
-//
-// notFound is the body of the 404 and should be the same text the caller
-// returns for an object that does not exist, so a non-admitted namespace is
-// indistinguishable from an empty one.
-func (a *Admitter) Gate(c *gin.Context, namespace, notFound string) bool {
+// aborts the request: 403 namespace_not_admitted, or 503 when the cache cannot
+// answer. It returns true when the request may proceed.
+func (a *Admitter) Gate(c *gin.Context, namespace string) bool {
 	switch d := a.Admit(namespace); d {
 	case Admitted:
 		return true
 	case NotAdmitted:
 		log.Info("namespace.admission.denied", "namespace", namespace,
 			"method", c.Request.Method, "path", c.FullPath())
-		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": notFound})
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+			"error": fmt.Sprintf("namespace %q is not served by this deployment", namespace),
+			"code":  "namespace_not_admitted",
+		})
 		return false
 	default:
 		log.Warn("namespace.admission.unavailable", "namespace", namespace,
