@@ -233,6 +233,16 @@ brain:
   # the code's own default. Zero is refused (the floor is 1) and the default
   # is kept; it does not turn the guard off.
   handsEnvFileWaitSec: ""
+  # Name of an existing Secret in this release's namespace holding one Hugging
+  # Face token per workspace: key = workspace (sandbox namespace), value = that
+  # workspace's token. In SaFE mode Brain sets it as HF_TOKEN in every sandbox of that
+  # workspace (kubernetes mode gets none); a workspace with no key gets none.
+  # The chart only mounts it --
+  # create it yourself so the token never passes through values, e.g.
+  #   kubectl create secret generic claw-workspace-hf-token \
+  #     --from-literal=<workspace>=<token>
+  # Empty (the default) renders nothing.
+  workspaceHfTokenSecret: ""
   resources:
     requests:
       cpu: "4"

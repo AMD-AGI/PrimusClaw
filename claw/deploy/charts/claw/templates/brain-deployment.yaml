@@ -151,11 +151,24 @@ spec:
                 matchLabels:
                   app: primus-claw
                   component: primus-claw-brain
-      {{- if and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
+      {{- $sandboxTemplateMounted := and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
+      {{- $hfTokenSecret := .Values.brain.workspaceHfTokenSecret }}
+      {{- if or $sandboxTemplateMounted $hfTokenSecret }}
       volumes:
+      {{- if $sandboxTemplateMounted }}
       - name: sandbox-template
         configMap:
           name: {{ .Values.sandboxTemplate.name }}
+      {{- end }}
+      {{- if $hfTokenSecret }}
+      # Optional so a missing Secret leaves sandboxes without HF_TOKEN instead
+      # of leaving Brain unable to start.
+      - name: workspace-hf-token
+        secret:
+          secretName: {{ $hfTokenSecret | quote }}
+          optional: true
+          defaultMode: 0440
+      {{- end }}
       {{- end }}
       containers:
       - name: brain
@@ -302,11 +315,22 @@ spec:
         # of them and the sandbox never starts.
         - name: HANDS_ENV_FILE_WAIT_SEC
           value: {{ .Values.brain.handsEnvFileWaitSec | quote }}
-        {{- if and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
+        {{- if $hfTokenSecret }}
+        - name: SANDBOX_HF_TOKEN_DIR
+          value: /etc/claw-workspace-hf-token
+        {{- end }}
+        {{- if or $sandboxTemplateMounted $hfTokenSecret }}
         volumeMounts:
+        {{- if $sandboxTemplateMounted }}
         - name: sandbox-template
           mountPath: /etc/claw
           readOnly: true
+        {{- end }}
+        {{- if $hfTokenSecret }}
+        - name: workspace-hf-token
+          mountPath: /etc/claw-workspace-hf-token
+          readOnly: true
+        {{- end }}
         {{- end }}
         startupProbe:
           httpGet: { path: /health, port: http }

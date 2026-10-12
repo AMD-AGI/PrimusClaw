@@ -22,7 +22,7 @@ import {
 } from "./attribution.js";
 import {
   HANDS_MCP_URL, SAFE_API_URL, SANDBOX_NAMESPACE, AUTH_INTERNAL_TOKEN,
-  ANTHROPIC_BASE_URL, OPENAI_BASE_URL, isKubernetesMode, AGENT_SANDBOX_NAMESPACE,
+  ANTHROPIC_BASE_URL, OPENAI_BASE_URL, isKubernetesMode,
   HANDS_HEALTH_MAX_TRIES, HANDS_HEALTH_INTERVAL_MS,
 } from "../config.js";
 import { getSystemEnv } from "../infra/system-env.js";
@@ -67,6 +67,7 @@ import {
   admitSandbox, assertFleetCensused, type AdmissionHold,
 } from "./admission.js";
 import { pingTargetIdentity } from "./keepalive.js";
+import { applyWorkspaceHfToken, sandboxNamespaceFor, workspaceHfTokenFor } from "./workspace-hf-token.js";
 
 const logger = pino({ name: "ensure-hands" });
 const sc = StringCodec();
@@ -216,10 +217,6 @@ export function requestSpecFingerprint(
  * name, the SaFE exec URL and the KV entry keepalive reads back -- and with the
  * fingerprint, since a pod cannot move namespace after it is scheduled.
  */
-function sandboxNamespaceFor(request: ExecuteRequest): string {
-  const fallback = isKubernetesMode() ? AGENT_SANDBOX_NAMESPACE : SANDBOX_NAMESPACE;
-  return request.workspace_id?.trim() || fallback;
-}
 
 /**
  * What deciding against reuse does to the world, besides answering.
@@ -2647,6 +2644,9 @@ async function provisionHands(
     env.ANTHROPIC_API_KEY = apiKey;
     env.OPENAI_API_KEY = apiKey;
   }
+  // Per-workspace Hugging Face token, from the Secret mounted into Brain; see
+  // sandbox/workspace-hf-token.ts. Same layer and same reason as the LLM key.
+  applyWorkspaceHfToken(env, workspaceHfTokenFor(request));
 
   // Multi-node: point Hyperloom's SaFE-less external mode at the cluster Brain
   // already provisioned instead of the per-user SaFE workload it would

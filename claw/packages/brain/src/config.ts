@@ -195,6 +195,10 @@ export function handsBehindRouterProxy(): boolean {
 }
 export const SANDBOX_NAMESPACE = env("SANDBOX_NAMESPACE", "default");
 export const SANDBOX_CLUSTER_ID = env("SANDBOX_CLUSTER_ID");
+// Directory of a mounted Secret holding one Hugging Face token per workspace
+// (key = workspace / sandbox namespace). Empty disables it. See
+// sandbox/workspace-hf-token.ts.
+export const SANDBOX_HF_TOKEN_DIR = env("SANDBOX_HF_TOKEN_DIR", "");
 
 // --- agent-sandbox provider (kubernetes mode) ---
 // Router base URL of PrimusClaw/Sandbox, e.g.

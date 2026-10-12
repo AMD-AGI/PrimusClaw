@@ -29,6 +29,7 @@ import {
 import { isRetryable } from "../infra/retry.js";
 import { unregisterSandbox, markHandsIdle } from "../sandbox/keepalive.js";
 import { attributionOf } from "../sandbox/attribution.js";
+import { workspaceHfTokenFor } from "../sandbox/workspace-hf-token.js";
 import { markRetryPending } from "./retry-pending.js";
 import { isSessionDeletedLocally } from "../infra/deleted-sessions.js";
 import { buildOutstandingStartHint, classifyResumeOutcome } from "./resume-outcome.js";
@@ -163,6 +164,9 @@ function runtimeSecrets(request: ExecuteRequest, resolvedPlatformKey = ""): Runt
       resolvedPlatformKey,
       request.llm_api_key,
       request.backend_internal_token,
+      // Brain put it into the sandbox env itself, so it is a known secret, not
+      // a guess: a transcript that echoes it must not carry it out.
+      workspaceHfTokenFor(request),
     ]),
     nominated: present([
       ...sensitiveEnvValues(request.user_env),
