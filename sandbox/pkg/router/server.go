@@ -89,6 +89,8 @@ type Server struct {
 	// answers 503 so the replica leaves every endpoint list, while requests
 	// already in flight are allowed to finish.
 	draining atomic.Bool
+	// shutdownDelayHook, when set, replaces time.After for the shutdown delay.
+	shutdownDelayHook func(time.Duration) <-chan time.Time
 }
 
 // New creates a new Router server.
@@ -242,6 +244,8 @@ func (s *Server) Run(ctx context.Context) error {
 // expected to: readiness fails at once, new requests are still accepted for
 // ShutdownDelay, then the listener closes and in-flight requests get up to
 // ShutdownTimeout to finish. Only connections still open after that are cut.
+// Cutting them is returned as ErrDrainIncomplete so the process exits non-zero
+// and says which component failed to drain.
 //
 // Before this, Run called Shutdown the moment the signal arrived and main
 // returned without waiting for it, so a rollout cut every proxied request in
@@ -266,7 +270,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	log.Info("router.drain.started", "shutdownDelay", s.cfg.ShutdownDelay.String(),
 		"shutdownTimeout", s.shutdownTimeout().String())
 	if s.cfg.ShutdownDelay > 0 {
-		time.Sleep(s.cfg.ShutdownDelay)
+		<-s.delayAfter(s.cfg.ShutdownDelay)
 	}
 
 	shutCtx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout())
@@ -276,10 +280,22 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		log.Warn("router.drain.timeout: closing connections still in flight",
 			"waitedSeconds", time.Since(start).Seconds(), "error", err)
 		_ = srv.Close()
-		return nil
+		return fmt.Errorf("%w after %s: %w", ErrDrainIncomplete, s.shutdownTimeout(), err)
 	}
 	log.Info("router.drain.complete", "waitedSeconds", time.Since(start).Seconds())
 	return nil
+}
+
+// ErrDrainIncomplete is returned by Serve when requests were still in flight
+// at ShutdownTimeout and their connections had to be closed.
+var ErrDrainIncomplete = errors.New("router drain incomplete: in-flight connections closed")
+
+// delayAfter waits out ShutdownDelay; tests replace it to control the window.
+func (s *Server) delayAfter(d time.Duration) <-chan time.Time {
+	if s.shutdownDelayHook != nil {
+		return s.shutdownDelayHook(d)
+	}
+	return time.After(d)
 }
 
 func (s *Server) shutdownTimeout() time.Duration {

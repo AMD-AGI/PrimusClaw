@@ -159,11 +159,12 @@ spec:
       serviceAccountName: agent-sandbox-controlplane
       {{- $sd := .Values.controlplane.shutdown }}
       {{- $drain := add (int $sd.preStopSleepSeconds) (int $sd.delaySeconds) (int $sd.timeoutSeconds) }}
-      {{- $grace := add $drain 15 }}
+      {{- $need := add $drain (int $sd.stopGraceSeconds) 10 }}
+      {{- $grace := $need }}
       {{- if not (kindIs "invalid" $sd.terminationGracePeriodSeconds) }}
       {{- $grace = int $sd.terminationGracePeriodSeconds }}
-      {{- if lt $grace $drain }}
-      {{- fail (printf "controlplane.shutdown.terminationGracePeriodSeconds=%d is shorter than preStopSleepSeconds+delaySeconds+timeoutSeconds=%d: kubelet would kill in-flight requests mid-drain" $grace $drain) }}
+      {{- if lt $grace $need }}
+      {{- fail (printf "controlplane.shutdown.terminationGracePeriodSeconds=%d is shorter than preStopSleepSeconds+delaySeconds+timeoutSeconds+stopGraceSeconds+10=%d: kubelet would kill the Pod mid-shutdown" $grace $need) }}
       {{- end }}
       {{- end }}
       terminationGracePeriodSeconds: {{ $grace }}
@@ -193,6 +194,7 @@ spec:
             - --namespace={{ .Release.Namespace }}
             - --shutdown-delay={{ int .Values.controlplane.shutdown.delaySeconds }}s
             - --shutdown-timeout={{ int .Values.controlplane.shutdown.timeoutSeconds }}s
+            - --shutdown-stop-grace={{ int .Values.controlplane.shutdown.stopGraceSeconds }}s
             {{- if .Values.router.config.enableAuth }}
             - --enable-auth=true
             - --safe-api-url={{ .Values.router.config.safeApiUrl }}

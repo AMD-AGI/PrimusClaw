@@ -25,7 +25,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/controllers"
@@ -115,6 +114,7 @@ func main() {
 	var metricsAddr string
 	var probeAddr string
 	var enableLeaderElection bool
+	var stopGrace time.Duration
 	var enableExtensions bool
 	// Accepted and ignored for one release. Sandbox idle reclaim is Brain's,
 	// driven by EnvD's jobs roster, and nothing here reads this any more --
@@ -156,6 +156,9 @@ func main() {
 			"so endpoints and the gateway drop the replica before the listener closes")
 	flag.DurationVar(&routerCfg.ShutdownTimeout, "shutdown-timeout", router.DefaultShutdownTimeout,
 		"After the shutdown delay, how long in-flight Router requests may run before they are closed")
+	flag.DurationVar(&stopGrace, "shutdown-stop-grace", defaultStopGrace,
+		"After the Router has drained, how long the Workload Manager and controllers may take to stop. "+
+			"terminationGracePeriodSeconds must cover preStop + shutdown-delay + shutdown-timeout + this")
 	flag.Parse()
 
 	// Said out loud, because the environment variable never failed at all: a
@@ -253,15 +256,7 @@ func main() {
 	stopStartupAbort := context.AfterFunc(sigCtx, cancel)
 
 	k8sCfg := ctrl.GetConfigOrDie()
-	mgr, err := ctrl.NewManager(k8sCfg, ctrl.Options{
-		Scheme: scheme,
-		Metrics: metricsserver.Options{
-			BindAddress: metricsAddr,
-		},
-		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "agent-sandbox-controlplane.agent-sandbox.io",
-	})
+	mgr, err := ctrl.NewManager(k8sCfg, managerOptions(metricsAddr, probeAddr, enableLeaderElection))
 	if err != nil {
 		log.Error("unable to create manager", "error", err)
 		os.Exit(1)
@@ -452,9 +447,9 @@ func main() {
 		component{name: "router", run: routerServer.Run},
 		[]component{
 			{name: "workload-manager API", run: apiServer.Run},
-			{name: "controller manager", run: mgr.Start},
+			managerComponent(mgr.Start),
 		},
-		15*time.Second)
+		stopGrace)
 	if err != nil {
 		log.Error("controlplane exited with error", "error", err)
 		os.Exit(1)

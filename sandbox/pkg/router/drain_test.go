@@ -31,7 +31,7 @@ type drainFixture struct {
 	cancel context.CancelFunc
 }
 
-func newDrainFixture(t *testing.T, upstream *httptest.Server, cfg Config) *drainFixture {
+func newDrainFixture(t *testing.T, upstream *httptest.Server, cfg Config, opts ...func(*Server)) *drainFixture {
 	t.Helper()
 	wm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -47,6 +47,9 @@ func newDrainFixture(t *testing.T, upstream *httptest.Server, cfg Config) *drain
 	cfg.WorkloadManagerURL = wm.URL
 	s := newReadinessServer(t, wm.URL)
 	s.cfg = cfg
+	for _, o := range opts {
+		o(s)
+	}
 	s.engine.Any("/proxy/*rest", func(c *gin.Context) {
 		s.handlePortProxy(c, info, port, c.Param("rest"))
 	})
@@ -107,22 +110,35 @@ func TestDrainKeepsInFlightProxyAndFailsReadiness(t *testing.T) {
 	// wait forever for the held handler.
 	defer releaseOnce.Do(func() { close(release) })
 
-	f := newDrainFixture(t, upstream, Config{ShutdownDelay: 500 * time.Millisecond, ShutdownTimeout: 5 * time.Second})
+	// The delay window is held open by the test rather than by the clock, so a
+	// slow -race run cannot close it before the assertions inside it.
+	delayEnd := make(chan time.Time)
+	var delayed sync.Once
+	defer delayed.Do(func() { close(delayEnd) })
+	f := newDrainFixture(t, upstream, Config{ShutdownDelay: time.Hour, ShutdownTimeout: 30 * time.Second},
+		func(s *Server) { s.shutdownDelayHook = func(time.Duration) <-chan time.Time { return delayEnd } })
 	require.Equal(t, http.StatusOK, f.status(t, "/health/ready"), "ready before the signal")
 
 	result := startProxied(f)
 	<-arrived
 
 	f.cancel() // SIGTERM
-	require.Eventually(t, func() bool { return f.s.draining.Load() }, time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return f.s.draining.Load() }, 5*time.Second, 5*time.Millisecond)
 	assert.Equal(t, http.StatusServiceUnavailable, f.status(t, "/health/ready"),
 		"readiness must fail while draining")
 	assert.Equal(t, http.StatusOK, f.status(t, "/health/live"),
 		"the listener stays open during the shutdown delay")
 
-	// Hold the request past the delay so it is still in flight when the
-	// listener closes and Shutdown starts waiting.
-	time.Sleep(700 * time.Millisecond)
+	// End the delay with the request still in flight: the listener closes and
+	// Shutdown waits for it.
+	delayed.Do(func() { close(delayEnd) })
+	require.Eventually(t, func() bool {
+		resp, err := (&http.Client{Timeout: time.Second}).Get(f.base + "/health/live")
+		if err == nil {
+			resp.Body.Close()
+		}
+		return err != nil
+	}, 5*time.Second, 5*time.Millisecond, "the listener closes after the delay")
 	select {
 	case err := <-f.served:
 		t.Fatalf("Serve returned with a request in flight: %v", err)
@@ -168,7 +184,7 @@ func TestDrainIsBoundedByShutdownTimeout(t *testing.T) {
 	f.cancel()
 	select {
 	case err := <-f.served:
-		assert.NoError(t, err)
+		assert.ErrorIs(t, err, ErrDrainIncomplete, "cutting connections is reported, not swallowed")
 	case <-time.After(3 * time.Second):
 		t.Fatal("Serve ignored ShutdownTimeout")
 	}
