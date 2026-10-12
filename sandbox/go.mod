@@ -6,7 +6,7 @@ go 1.26.0
 // The `go` directive above is only a language-version floor and does not pin
 // what actually compiles the code; without this, a build on go1.26.0 picks up
 // 21 reachable stdlib advisories that govulncheck then reports.
-toolchain go1.26.7
+toolchain go1.26.9
 
 require (
 	github.com/coreos/go-iptables v0.8.0
@@ -22,7 +22,7 @@ require (
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.46.0
 	go.opentelemetry.io/otel/sdk v1.46.0
 	go.opentelemetry.io/otel/trace v1.46.0
-	golang.org/x/net v0.59.0
+	golang.org/x/net v0.60.0
 	k8s.io/api v0.37.1
 	k8s.io/apiextensions-apiserver v0.37.1
 	k8s.io/apimachinery v0.37.1
