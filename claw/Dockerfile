@@ -10,7 +10,7 @@
 # ──────────────────────────────────────────────────────────────────────
 
 # ========== Stage 1: build ==========
-FROM node:26-bookworm-slim@sha256:662933cf47f013bc8e4beb31a6116448427a82057ba7c42c97e4c5ba766504c2 AS builder
+FROM node:26-bookworm-slim@sha256:86f07bc9c5dce4578cf37e5a418b7bfc7f817cda25cde66e2b66e95ed86c4567 AS builder
 WORKDIR /app
 
 # ============ Extra CA anchors (opt-in) ============
@@ -166,13 +166,15 @@ RUN bun build packages/hands/src/index.ts \
 
 # ========== Stage 2: runtime ==========
 # node:26-slim (Debian/glibc) — Node.js runs API and Brain processes.
-FROM node:26-bookworm-slim@sha256:662933cf47f013bc8e4beb31a6116448427a82057ba7c42c97e4c5ba766504c2 AS runtime
+FROM node:26-bookworm-slim@sha256:86f07bc9c5dce4578cf37e5a418b7bfc7f817cda25cde66e2b66e95ed86c4567 AS runtime
 WORKDIR /app
 ENV NODE_ENV=production \
     WORKSPACE_PATH=/workspace
 
+# perl-base is already present; naming it makes apt pull the patched build
+# (5.36.0-7+deb12u4) even when the base image has not been rebuilt yet.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends tini ca-certificates bash curl xz-utils \
+ && apt-get install -y --no-install-recommends tini ca-certificates bash curl xz-utils perl-base \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /workspace
 
