@@ -158,9 +158,11 @@ router:
     safeApiUrl: ""                # required when enableAuth=true
     # Label selector (kubectl -l syntax) of the namespaces the Router and the
     # Workload Manager serve, e.g. "example.com/sandbox=enabled". A request for
-    # a namespace that does not match gets the same 404 as a missing
-    # CodeInterpreter, before any session lookup, auto-create or proxying.
-    # Empty serves every namespace (no Namespace informer, no extra RBAC).
+    # a namespace that does not match gets 403 namespace_not_admitted (not 404,
+    # which clients read as "sandbox gone"); a session is judged by the
+    # namespace its sandbox lives in, not the one its URL names.
+    # Empty serves every namespace (no Namespace informer, no extra RBAC); a
+    # value of only whitespace is refused by the chart and the binary.
     # When set, the chart grants get/list/watch on namespaces, and the Router
     # reports not-ready until its namespace cache has synced.
     namespaceSelector: ""
@@ -176,7 +178,7 @@ router:
     name: agent-sandbox-router
     className: ""
     host: ""                      # empty = match any host
-    path: /v1/namespaces/
+    path: /v1/namespaces/         # must start with /v1/namespaces/ (the chart refuses anything wider)
     annotations: {}
   extraEnv: []
 

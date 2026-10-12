@@ -48,11 +48,17 @@ func started(t *testing.T, selector string, nss ...*corev1.Namespace) *Admitter 
 }
 
 func TestParseSelector(t *testing.T) {
-	for _, s := range []string{"", "   "} {
-		sel, err := ParseSelector(s)
-		if err != nil || sel != nil {
-			t.Fatalf("ParseSelector(%q) = %v, %v; want nil, nil", s, sel, err)
+	if sel, err := ParseSelector(""); err != nil || sel != nil {
+		t.Fatalf("ParseSelector(\"\") = %v, %v; want nil, nil", sel, err)
+	}
+	// A value that is set but blank is a mistake, and must not fail open.
+	for _, s := range []string{" ", "   ", "\t\n"} {
+		if sel, err := ParseSelector(s); err == nil || sel != nil {
+			t.Fatalf("ParseSelector(%q) = %v, %v; want an error", s, sel, err)
 		}
+	}
+	if sel, err := ParseSelector("  example.com/sandbox=enabled "); err != nil || sel.String() != "example.com/sandbox=enabled" {
+		t.Fatalf("padded selector: %v, %v", sel, err)
 	}
 	if _, err := ParseSelector("example.com/sandbox=enabled,tier in (a,b)"); err != nil {
 		t.Fatalf("valid selector refused: %v", err)
@@ -131,14 +137,16 @@ func TestGateStatuses(t *testing.T) {
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
 		c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
-		ok := a.Gate(c, ns, "gone")
+		ok := a.Gate(c, ns)
 		return w, ok
 	}
 
 	if w, ok := run(synced, "team-a"); !ok || w.Code != http.StatusOK {
 		t.Fatalf("admitted: ok=%v code=%d", ok, w.Code)
 	}
-	if w, ok := run(synced, "other"); ok || w.Code != http.StatusNotFound || w.Body.String() != `{"error":"gone"}` {
+	// 403, never 404: a client reads 404 on the data plane as "sandbox gone".
+	if w, ok := run(synced, "other"); ok || w.Code != http.StatusForbidden ||
+		w.Body.String() != `{"code":"namespace_not_admitted","error":"namespace \"other\" is not served by this deployment"}` {
 		t.Fatalf("not admitted: ok=%v code=%d body=%s", ok, w.Code, w.Body)
 	}
 	if w, ok := run(unsynced, "team-a"); ok || w.Code != http.StatusServiceUnavailable || w.Header().Get("Retry-After") == "" {

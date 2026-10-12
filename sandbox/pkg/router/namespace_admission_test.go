@@ -170,9 +170,7 @@ func TestInvokeAdmittedNamespaceReachesSessionLayer(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			before := len(rig.sessions.Calls())
 			code, body := rig.do(t, tc, "admitted")
-			if code == http.StatusNotFound || code == http.StatusServiceUnavailable && body["code"] == "namespace_admission_unavailable" {
-				t.Fatalf("admitted namespace was refused: %d %v", code, body)
-			}
+			assertServed(t, code, body)
 			calls := rig.sessions.Calls()
 			if len(calls) != before+1 || calls[len(calls)-1] != "admitted|"+tc.sessionID {
 				t.Fatalf("session layer not reached as expected: %v", calls)
@@ -185,50 +183,91 @@ func TestInvokeAdmittedNamespaceReachesSessionLayer(t *testing.T) {
 	}
 }
 
-func TestInvokeDeniedNamespaceGetsRouter404BeforeSessionLayer(t *testing.T) {
+// assertServed checks the request got past namespace admission. The rig has
+// no JWT signer, so an invocation ends in the proxy's own 503; the port proxy
+// reaches the upstream and is the end-to-end proof.
+func assertServed(t *testing.T, code int, body map[string]any) {
+	t.Helper()
+	if code == http.StatusNotFound || code == http.StatusForbidden ||
+		body["code"] == "namespace_admission_unavailable" || body["code"] == "namespace_not_admitted" {
+		t.Fatalf("refused by namespace admission: %d %v", code, body)
+	}
+}
+
+// assertNotAdmitted checks the refusal is 403 namespace_not_admitted -- never
+// 404, which a client reads as "this sandbox is gone" and recreates it.
+func assertNotAdmitted(t *testing.T, code int, body map[string]any) {
+	t.Helper()
+	if code != http.StatusForbidden || body["code"] != "namespace_not_admitted" {
+		t.Fatalf("got %d %v, want 403 namespace_not_admitted", code, body)
+	}
+}
+
+// Without a session ID the request would create a sandbox in the URL
+// namespace, so that namespace is judged before the session layer is touched.
+func TestInvokeAutoCreateInDeniedNamespaceGets403BeforeSessionLayer(t *testing.T) {
 	rig := newAdmissionRig(t, newAdmitter(t, true))
-	for _, tc := range invokeCases(rig.port) {
-		t.Run(tc.name, func(t *testing.T) {
-			for _, ns := range []string{"denied", "does-not-exist"} {
-				code, body := rig.do(t, tc, ns)
-				want := `CodeInterpreter "ci" not found in namespace "` + ns + `"`
-				if code != http.StatusNotFound || body["error"] != want {
-					t.Fatalf("%s: got %d %v, want 404 %q", ns, code, body, want)
-				}
-			}
-		})
+	tc := invokeCase{"auto-create", http.MethodPost, "/api/execute", ""}
+	for _, ns := range []string{"denied", "does-not-exist"} {
+		code, body := rig.do(t, tc, ns)
+		assertNotAdmitted(t, code, body)
 	}
 	if calls := rig.sessions.Calls(); len(calls) != 0 {
-		t.Fatalf("a denied namespace reached the session layer (lookup or auto-create): %v", calls)
+		t.Fatalf("a denied namespace reached the session layer (auto-create): %v", calls)
 	}
 	if n := rig.upstream.Load(); n != 0 {
 		t.Fatalf("a denied namespace reached the sandbox %d times", n)
 	}
 }
 
+func sessionCases(port string) []invokeCase {
+	return []invokeCase{
+		{"invocation with session", http.MethodPost, "/api/execute", "sid-1"},
+		{"port proxy", http.MethodGet, "/proxy/" + port + "/mcp", "sid-1"},
+		{"tunnel", http.MethodGet, "/tunnel/" + port, "sid-1"},
+	}
+}
+
 // A session ID resolves to its sandbox wherever that sandbox lives, so the
-// URL namespace alone is not the boundary: a session from a non-admitted
-// namespace, named through an admitted one, must get the same 404 and never
-// reach the sandbox -- by invocation, port proxy or tunnel.
-func TestInvokeSessionFromDeniedNamespaceThroughAdmittedPathGets404(t *testing.T) {
+// session's own namespace is the boundary: a session from a non-admitted
+// namespace gets 403 whatever namespace the URL names, and never reaches the
+// sandbox -- by invocation, port proxy or tunnel.
+func TestInvokeSessionInDeniedNamespaceGets403WhateverTheURLSays(t *testing.T) {
 	rig := newAdmissionRig(t, newAdmitter(t, true))
 	rig.sessions.setSessionNamespace("denied")
-	cases := []invokeCase{
-		{"invocation with session", http.MethodPost, "/api/execute", "sid-1"},
-		{"port proxy", http.MethodGet, "/proxy/" + rig.port + "/mcp", "sid-1"},
-		{"tunnel", http.MethodGet, "/tunnel/" + rig.port, "sid-1"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			code, body := rig.do(t, tc, "admitted")
-			want := `CodeInterpreter "ci" not found in namespace "admitted"`
-			if code != http.StatusNotFound || body["error"] != want {
-				t.Fatalf("got %d %v, want 404 %q", code, body, want)
-			}
-		})
+	for _, tc := range sessionCases(rig.port) {
+		for _, urlNS := range []string{"admitted", "default", "denied"} {
+			t.Run(tc.name+"/url="+urlNS, func(t *testing.T) {
+				code, body := rig.do(t, tc, urlNS)
+				assertNotAdmitted(t, code, body)
+			})
+		}
 	}
 	if n := rig.upstream.Load(); n != 0 {
 		t.Fatalf("a sandbox in a non-admitted namespace was reached %d times", n)
+	}
+}
+
+// Clients name a default namespace in the URL whatever namespace the session
+// lives in (Brain's probe and the SDK both default to "default"). A session in
+// an admitted namespace must be served through such a URL -- even one naming
+// a namespace that is itself not admitted or does not exist.
+func TestInvokeSessionInAdmittedNamespaceServedThroughAnyURLNamespace(t *testing.T) {
+	rig := newAdmissionRig(t, newAdmitter(t, true))
+	for _, tc := range invokeCases(rig.port) {
+		if tc.sessionID == "" {
+			continue
+		}
+		for _, urlNS := range []string{"default", "denied"} {
+			t.Run(tc.name+"/url="+urlNS, func(t *testing.T) {
+				before := rig.upstream.Load()
+				code, body := rig.do(t, tc, urlNS)
+				assertServed(t, code, body)
+				if tc.name == "port proxy" && (code != http.StatusOK || rig.upstream.Load() != before+1) {
+					t.Fatalf("port proxy through URL %q did not reach the sandbox: %d %v", urlNS, code, body)
+				}
+			})
+		}
 	}
 }
 
@@ -242,8 +281,12 @@ func TestInvokeUnsyncedAdmissionFailsClosed(t *testing.T) {
 			}
 		})
 	}
-	if calls := rig.sessions.Calls(); len(calls) != 0 {
-		t.Fatalf("an unsynced cache let requests through: %v", calls)
+	// Session requests are looked up (read-only) and then refused; the
+	// auto-create never reaches the session layer.
+	for _, call := range rig.sessions.Calls() {
+		if strings.HasSuffix(call, "|") {
+			t.Fatalf("an unsynced cache let an auto-create through: %v", rig.sessions.Calls())
+		}
 	}
 	if n := rig.upstream.Load(); n != 0 {
 		t.Fatalf("an unsynced cache let %d requests reach the sandbox", n)
@@ -253,7 +296,7 @@ func TestInvokeUnsyncedAdmissionFailsClosed(t *testing.T) {
 func TestInvokeWithoutSelectorAdmitsEveryNamespace(t *testing.T) {
 	rig := newAdmissionRig(t, nil)
 	tc := invokeCases(rig.port)[1]
-	if code, body := rig.do(t, tc, "anything"); code == http.StatusNotFound {
+	if code, body := rig.do(t, tc, "anything"); code == http.StatusNotFound || code == http.StatusForbidden {
 		t.Fatalf("no selector must keep today's behaviour: %d %v", code, body)
 	}
 	if calls := rig.sessions.Calls(); len(calls) != 1 {

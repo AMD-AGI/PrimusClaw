@@ -56,7 +56,7 @@ func wmAdmitter(t *testing.T, synced bool) *nsadmission.Admitter {
 
 // existingTemplate is seeded in both namespaces so that, for the entries that
 // act on an existing template, a missing admission check shows up as a 200/204
-// instead of the 404 the test expects.
+// instead of the 403 the test expects.
 const existingTemplate = "existing"
 
 type wmRig struct {
@@ -122,8 +122,6 @@ type wmEntry struct {
 	// effect reports whether the request changed state in ns; nil when the
 	// entry is read-only.
 	effect func(t *testing.T, r *wmRig, ns string) bool
-	// target is the object name the 404 names.
-	target string
 }
 
 const templateSpec = `"spec":{"template":{"fromImage":"example.invalid/sandbox:1"}}`
@@ -136,44 +134,44 @@ func wmEntries() []wmEntry {
 			request: func(ns string) (string, string, string) {
 				return http.MethodPost, "/v1/code-interpreter", `{"name":"tmpl","namespace":"` + ns + `"}`
 			},
-			admittedCode: http.StatusOK, effect: sessionCreated, target: "tmpl",
+			admittedCode: http.StatusOK, effect: sessionCreated,
 		},
 		{
 			name: "POST /v1/code-interpreter/stream",
 			request: func(ns string) (string, string, string) {
 				return http.MethodPost, "/v1/code-interpreter/stream", `{"name":"tmpl","namespace":"` + ns + `"}`
 			},
-			admittedCode: http.StatusOK, effect: sessionCreated, target: "tmpl",
+			admittedCode: http.StatusOK, effect: sessionCreated,
 		},
 		{
 			name: "POST /v1/templates", withK8s: true,
 			request: func(ns string) (string, string, string) {
 				return http.MethodPost, "/v1/templates", `{"name":"new","namespace":"` + ns + `",` + templateSpec + `}`
 			},
-			admittedCode: http.StatusCreated, target: "new",
-			effect: func(t *testing.T, r *wmRig, ns string) bool { return r.templateExists(t, ns, "new") },
+			admittedCode: http.StatusCreated,
+			effect:       func(t *testing.T, r *wmRig, ns string) bool { return r.templateExists(t, ns, "new") },
 		},
 		{
 			name: "POST /v1/templates/stream", withK8s: true,
 			request: func(ns string) (string, string, string) {
 				return http.MethodPost, "/v1/templates/stream", `{"name":"new","namespace":"` + ns + `",` + templateSpec + `}`
 			},
-			admittedCode: http.StatusOK, target: "new",
-			effect: func(t *testing.T, r *wmRig, ns string) bool { return r.templateExists(t, ns, "new") },
+			admittedCode: http.StatusOK,
+			effect:       func(t *testing.T, r *wmRig, ns string) bool { return r.templateExists(t, ns, "new") },
 		},
 		{
 			name: "GET /v1/templates/:namespace/:name", withK8s: true,
 			request: func(ns string) (string, string, string) {
 				return http.MethodGet, "/v1/templates/" + ns + "/" + existingTemplate, ""
 			},
-			admittedCode: http.StatusOK, target: existingTemplate,
+			admittedCode: http.StatusOK,
 		},
 		{
 			name: "PUT /v1/templates/:namespace/:name", withK8s: true,
 			request: func(ns string) (string, string, string) {
 				return http.MethodPut, "/v1/templates/" + ns + "/" + existingTemplate, `{` + templateSpec + `}`
 			},
-			admittedCode: http.StatusOK, target: existingTemplate,
+			admittedCode: http.StatusOK,
 			effect: func(t *testing.T, r *wmRig, ns string) bool {
 				ci := &runtimev1alpha1.CodeInterpreter{}
 				if err := r.k8s.Get(context.Background(), ctrlclient.ObjectKey{Namespace: ns, Name: existingTemplate}, ci); err != nil {
@@ -187,8 +185,8 @@ func wmEntries() []wmEntry {
 			request: func(ns string) (string, string, string) {
 				return http.MethodDelete, "/v1/templates/" + ns + "/" + existingTemplate, ""
 			},
-			admittedCode: http.StatusNoContent, target: existingTemplate,
-			effect: func(t *testing.T, r *wmRig, ns string) bool { return !r.templateExists(t, ns, existingTemplate) },
+			admittedCode: http.StatusNoContent,
+			effect:       func(t *testing.T, r *wmRig, ns string) bool { return !r.templateExists(t, ns, existingTemplate) },
 		},
 	}
 }
@@ -208,16 +206,15 @@ func TestWMAdmittedNamespaceIsServed(t *testing.T) {
 	}
 }
 
-func TestWMDeniedNamespaceGets404WithoutSideEffects(t *testing.T) {
+func TestWMDeniedNamespaceGets403WithoutSideEffects(t *testing.T) {
 	for _, e := range wmEntries() {
 		t.Run(e.name, func(t *testing.T) {
 			rig := newWMRig(t, wmAdmitter(t, true), e.withK8s)
 			w := rig.serve(e.request("denied"))
 			var body map[string]any
 			_ = json.Unmarshal(w.Body.Bytes(), &body)
-			want := `CodeInterpreter "` + e.target + `" not found in namespace "denied"`
-			if w.Code != http.StatusNotFound || body["error"] != want {
-				t.Fatalf("denied: got %d %s, want 404 %q", w.Code, w.Body, want)
+			if w.Code != http.StatusForbidden || body["code"] != "namespace_not_admitted" {
+				t.Fatalf("denied: got %d %s, want 403 namespace_not_admitted", w.Code, w.Body)
 			}
 			if e.effect != nil && e.effect(t, rig, "denied") {
 				t.Fatal("a denied namespace was changed")
