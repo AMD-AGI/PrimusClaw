@@ -5,6 +5,9 @@
 {{- if not .Values.router.config.namespaceSelector }}
 {{- fail "router.ingress.enabled requires router.config.namespaceSelector: the static path prefix would otherwise expose every namespace through the Router" }}
 {{- end }}
+{{- if not (hasPrefix "/v1/namespaces/" (toString .Values.router.ingress.path)) }}
+{{- fail "router.ingress.path must start with /v1/namespaces/: namespace admission covers only the Router's namespaced routes, so a wider prefix would expose the unadmitted ones" }}
+{{- end }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress

@@ -2,6 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 {{- if .Values.controlplane.enabled }}
+{{- with .Values.router.config.namespaceSelector }}
+{{- if not (trim .) }}
+{{- fail "router.config.namespaceSelector is only whitespace: leave it empty to serve every namespace, or set a label selector" }}
+{{- end }}
+{{- end }}
 ---
 apiVersion: v1
 kind: ServiceAccount

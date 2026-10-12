@@ -321,12 +321,11 @@ func (s *Server) handleHealthDeep(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "checks": checks})
 }
 
-// admitNamespace applies namespace admission to a request about kind/name in
-// namespace. A namespace outside the selector gets the same 404 as a missing
-// object; see package nsadmission. It returns true when the request may proceed.
-func (s *Server) admitNamespace(c *gin.Context, kind, name, namespace string) bool {
-	return s.cfg.Namespaces.Gate(c, namespace,
-		fmt.Sprintf("%s %q not found in namespace %q", kind, name, namespace))
+// admitNamespace applies namespace admission to a request in namespace: a
+// namespace outside the selector gets 403 namespace_not_admitted (see package
+// nsadmission for why not 404). It returns true when the request may proceed.
+func (s *Server) admitNamespace(c *gin.Context, namespace string) bool {
+	return s.cfg.Namespaces.Gate(c, namespace)
 }
 
 // handleCodeInterpreterCreate handles POST /v1/code-interpreter.
@@ -364,8 +363,8 @@ func (s *Server) handleCodeInterpreterCreateStream(c *gin.Context) {
 	if req.Namespace == "" {
 		req.Namespace = s.cfg.Namespace
 	}
-	// Before the SSE headers: once they are flushed a 404 can no longer be sent.
-	if !s.admitNamespace(c, store.CodeInterpreterKind, req.Name, req.Namespace) {
+	// Before the SSE headers: once they are flushed a 403 can no longer be sent.
+	if !s.admitNamespace(c, req.Namespace) {
 		return
 	}
 
@@ -500,7 +499,7 @@ func (s *Server) handleCreate(c *gin.Context, kind string) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "namespace is required"})
 		return
 	}
-	if !s.admitNamespace(c, kind, req.Name, req.Namespace) {
+	if !s.admitNamespace(c, req.Namespace) {
 		return
 	}
 
@@ -1120,7 +1119,7 @@ func (s *Server) handleTemplateCreate(c *gin.Context) {
 		req.Namespace = "default"
 	}
 	// Before the image build: a denied namespace must not cost a kaniko run.
-	if !s.admitNamespace(c, store.CodeInterpreterKind, req.Name, req.Namespace) {
+	if !s.admitNamespace(c, req.Namespace) {
 		return
 	}
 
@@ -1229,7 +1228,7 @@ func (s *Server) handleTemplateCreateStream(c *gin.Context) {
 	if req.Namespace == "" {
 		req.Namespace = "default"
 	}
-	if !s.admitNamespace(c, store.CodeInterpreterKind, req.Name, req.Namespace) {
+	if !s.admitNamespace(c, req.Namespace) {
 		return
 	}
 
@@ -1448,7 +1447,7 @@ func (s *Server) handleTemplateGet(c *gin.Context) {
 	}
 	name := c.Param("name")
 	namespace := c.Param("namespace")
-	if !s.admitNamespace(c, store.CodeInterpreterKind, name, namespace) {
+	if !s.admitNamespace(c, namespace) {
 		return
 	}
 	ci, err := s.k8s.GetTemplate(c.Request.Context(), name, namespace)
@@ -1475,7 +1474,7 @@ func (s *Server) handleTemplateUpdate(c *gin.Context) {
 	}
 	name := c.Param("name")
 	namespace := c.Param("namespace")
-	if !s.admitNamespace(c, store.CodeInterpreterKind, name, namespace) {
+	if !s.admitNamespace(c, namespace) {
 		return
 	}
 	var req UpdateTemplateRequest
@@ -1520,7 +1519,7 @@ func (s *Server) handleTemplateDelete(c *gin.Context) {
 	}
 	name := c.Param("name")
 	namespace := c.Param("namespace")
-	if !s.admitNamespace(c, store.CodeInterpreterKind, name, namespace) {
+	if !s.admitNamespace(c, namespace) {
 		return
 	}
 

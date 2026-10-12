@@ -156,10 +156,11 @@ func (s *Server) setupRoutes() {
 	// DELETE: delete files, destroy sessions
 	// PUT/PATCH: reserved for future use
 	//
-	// Namespace admission runs on the whole group, after authentication and
-	// before the handler: a namespace outside the selector is answered with the
-	// same 404 as a missing CodeInterpreter, before any session lookup,
-	// auto-create, port proxy or tunnel.
+	// Namespace admission (403 namespace_not_admitted, see package
+	// nsadmission): a request without a session ID is judged by the URL
+	// namespace in this middleware, before the auto-create; a request with one
+	// is judged in handleInvoke by the namespace its sandbox lives in, before
+	// any invocation, port proxy or tunnel.
 	namespaced := v1.Group("/namespaces/:namespace", s.namespaceAdmissionMiddleware())
 	namespaced.GET("/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
 	namespaced.POST("/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
@@ -192,13 +193,15 @@ func (s *Server) setupRoutes() {
 	v1.GET("/health", s.proxyToWM)
 }
 
-// namespaceAdmissionMiddleware rejects requests for namespaces the configured
-// selector does not admit. See package nsadmission for the status codes.
+// namespaceAdmissionMiddleware rejects a request without a session ID whose
+// URL namespace the configured selector does not admit; such a request would
+// create a sandbox in that namespace. A request with a session ID passes: the
+// URL namespace says nothing about where its sandbox lives (clients put a
+// default namespace there), so handleInvoke judges the session's own
+// namespace instead. See package nsadmission for the status codes.
 func (s *Server) namespaceAdmissionMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		namespace := c.Param("namespace")
-		if !s.cfg.Namespaces.Gate(c, namespace, fmt.Sprintf("%s %q not found in namespace %q",
-			store.CodeInterpreterKind, c.Param("name"), namespace)) {
+		if c.GetHeader("x-session-id") == "" && !s.cfg.Namespaces.Gate(c, c.Param("namespace")) {
 			return
 		}
 		c.Next()
@@ -437,19 +440,15 @@ func (s *Server) handleInvoke(c *gin.Context, kind string) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": errMsg})
 		return
 	}
-	// The admission middleware judged the namespace in the URL, but a session
-	// ID resolves to its sandbox wherever that sandbox lives. Under admission
-	// the sandbox must be in the namespace the URL names, or a session from a
-	// non-admitted namespace would be reachable through any admitted one (and
-	// unlabelling a namespace would not cut off its live sessions). Answered
-	// with the middleware's 404 so the two refusals are indistinguishable.
-	if s.cfg.Namespaces != nil && info.Namespace != namespace {
-		log.Info("namespace.admission.session_mismatch",
-			"urlNamespace", namespace, "sessionNamespace", info.Namespace,
-			"method", c.Request.Method, "path", c.FullPath())
-		c.JSON(http.StatusNotFound, gin.H{
-			"error": fmt.Sprintf("%s %q not found in namespace %q", kind, name, namespace),
-		})
+	// Admission is judged on the namespace the sandbox actually lives in, not
+	// the one the URL names: a session ID resolves to its sandbox wherever it
+	// is, so judging the URL would let a session from a non-admitted namespace
+	// through any admitted one (and unlabelling a namespace would not cut off
+	// its live sessions), while refusing a URL that merely differs would break
+	// clients that name a default namespace for every session. For an
+	// auto-created sandbox this repeats the middleware's check on the same
+	// namespace.
+	if !s.cfg.Namespaces.Gate(c, info.Namespace) {
 		return
 	}
 	sessionID = info.SessionID
