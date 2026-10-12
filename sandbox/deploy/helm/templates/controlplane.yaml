@@ -299,9 +299,14 @@ spec:
           # is reconciled against the envd-router-identity Secret, so this has
           # to cover identityReconcileBudget (pkg/router/jwt.go, 30s) plus the
           # rest of startup. Shortening it kills the container mid-retry.
+          # It asks /health/live, not /health/ready: readiness also waits for
+          # the namespace admission cache, and a cache that cannot sync (e.g.
+          # namespace RBAC managed outside this chart and missing) must keep
+          # the replica out of the Service, not restart the whole control
+          # plane in a loop.
           startupProbe:
             httpGet:
-              path: /health/ready
+              path: /health/live
               port: router
             failureThreshold: 30
             periodSeconds: 2

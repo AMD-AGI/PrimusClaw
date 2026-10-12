@@ -88,6 +88,12 @@ elif case == "selector":
         fail(f"namespace RBAC is not exactly get/list/watch on core namespaces: {rules}")
     if env_of_controlplane().get("NAMESPACE_SELECTOR") != "example.com/sandbox=enabled":
         fail("NAMESPACE_SELECTOR did not carry the selector")
+    # Only readiness may wait for the namespace cache: a startup probe on
+    # /health/ready restarts the control plane when the cache cannot sync.
+    c0 = [d for d in kind("Deployment") if d["metadata"]["name"] == "agent-sandbox-controlplane"][0]["spec"]["template"]["spec"]["containers"][0]
+    probes = {p: c0.get(p, {}).get("httpGet", {}).get("path") for p in ("startupProbe", "readinessProbe", "livenessProbe")}
+    if probes != {"startupProbe": "/health/live", "readinessProbe": "/health/ready", "livenessProbe": "/health/live"}:
+        fail(f"probe paths: {probes}")
 
 elif case == "ingress":
     ings = kind("Ingress")

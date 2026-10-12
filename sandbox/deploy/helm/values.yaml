@@ -165,6 +165,10 @@ router:
     # value of only whitespace is refused by the chart and the binary.
     # When set, the chart grants get/list/watch on namespaces, and the Router
     # reports not-ready until its namespace cache has synced.
+    # Label every namespace clients use, including the implicit ones: a sandbox
+    # created without a namespace goes to the release namespace, while a
+    # template created without one goes to "default". If clients rely on
+    # either default, label that namespace too, or their requests get 403.
     namespaceSelector: ""
   # Optional Ingress with ONE static Prefix path to the Router Service, so a
   # new workspace needs a namespace label rather than a new Ingress path.

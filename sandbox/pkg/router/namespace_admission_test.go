@@ -320,3 +320,56 @@ func TestReadinessWaitsForNamespaceCache(t *testing.T) {
 		t.Fatalf("synced namespace cache: ready = %d, want 200", w.Code)
 	}
 }
+
+// On the auto-create path the Workload Manager makes the admission decision
+// too; its 403 and 503 must reach the client with their status, body and
+// Retry-After, not as a 502.
+func TestInvokeAutoCreateRelaysWorkloadManagerRefusal(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cases := []struct {
+		status     int
+		body       string
+		retryAfter string
+	}{
+		{http.StatusForbidden, `{"code":"namespace_not_admitted","error":"namespace \"x\" is not served by this deployment"}`, ""},
+		{http.StatusServiceUnavailable, `{"code":"namespace_admission_unavailable","error":"namespace admission is not ready, retry later"}`, "1"},
+	}
+	for _, tc := range cases {
+		t.Run(strconv.Itoa(tc.status), func(t *testing.T) {
+			wm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if tc.retryAfter != "" {
+					w.Header().Set("Retry-After", tc.retryAfter)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer wm.Close()
+			s := &Server{
+				cfg:            Config{},
+				store:          store.NewMemoryStore(),
+				sessionManager: &defaultSessionManager{wmURL: wm.URL, httpClient: wm.Client()},
+			}
+			s.setupRoutes()
+			ts := httptest.NewServer(s.engine)
+			defer ts.Close()
+
+			resp, err := ts.Client().Post(ts.URL+"/v1/namespaces/x/code-interpreters/ci/invocations/api/execute",
+				"application/json", strings.NewReader(`{"command":["true"]}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			var got map[string]any
+			_ = json.NewDecoder(resp.Body).Decode(&got)
+			var want map[string]any
+			_ = json.Unmarshal([]byte(tc.body), &want)
+			if resp.StatusCode != tc.status || got["code"] != want["code"] {
+				t.Fatalf("got %d %v, want %d %v", resp.StatusCode, got, tc.status, want)
+			}
+			if resp.Header.Get("Retry-After") != tc.retryAfter {
+				t.Fatalf("Retry-After = %q, want %q", resp.Header.Get("Retry-After"), tc.retryAfter)
+			}
+		})
+	}
+}

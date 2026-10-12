@@ -89,6 +89,7 @@ func wireNamespaceAdmission(ctx context.Context, client kubernetes.Interface, se
 	routerCfg *router.Config, wmCfg *workloadmanager.Config) *nsadmission.Admitter {
 	admitter := nsadmission.New(client, selector)
 	if admitter == nil {
+		log.Info("namespace admission disabled: no namespace selector, every namespace is served")
 		return nil
 	}
 	admitter.Start(ctx)
@@ -314,6 +315,8 @@ func main() {
 	// Shared by the Router and the Workload Manager. Not waited for here: until
 	// it syncs every namespaced request is refused with 503 and the Router's
 	// readiness probe fails, so the replica takes no traffic it cannot judge.
+	// Only readiness waits for it; the startup and liveness probes do not, so a
+	// cache that never syncs leaves the replica unready rather than restarting.
 	wireNamespaceAdmission(ctx, clientset, nsSelector, &routerCfg, &wmCfg)
 
 	dynamicClient, err := dynamic.NewForConfig(k8sCfg)

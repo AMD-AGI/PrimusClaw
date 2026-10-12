@@ -506,6 +506,16 @@ func (s *Server) handleInvoke(c *gin.Context, kind string) {
 			"kind", kind, "name", name, "sessionId", sessionID, "error", err)
 		errMsg := err.Error()
 
+		// A Workload Manager refusal or transient condition is relayed as is.
+		var wmErr *wmStatusError
+		if errors.As(err, &wmErr) {
+			if wmErr.RetryAfter != "" {
+				c.Header("Retry-After", wmErr.RetryAfter)
+			}
+			c.Data(wmErr.Status, "application/json; charset=utf-8", wmErr.Body)
+			return
+		}
+
 		// Session not found (expired/deleted, not recoverable from K8s either)
 		if strings.Contains(errMsg, "session") && strings.Contains(errMsg, "not found") {
 			c.JSON(http.StatusNotFound, gin.H{"error": errMsg})

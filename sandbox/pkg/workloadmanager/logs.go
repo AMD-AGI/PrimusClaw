@@ -46,6 +46,9 @@ func (s *Server) handleGetLogs(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
 		return
 	}
+	if !s.admitSession(c, info) {
+		return
+	}
 
 	if !canViewAll(c) {
 		if uid := currentUserID(c); uid != "" && info.UserID != uid {

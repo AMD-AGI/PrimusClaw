@@ -62,10 +62,8 @@ type Config struct {
 	DefaultTTL time.Duration
 	Inference  InferenceConfig
 	Audit      AuditConfig
-	// Namespaces decides which namespaces sandboxes may be created in and
-	// templates created, read, updated or deleted in. The list endpoints and
-	// the routes keyed only by session ID are not gated. nil admits every
-	// namespace.
+	// Namespaces decides which namespaces this Workload Manager serves: see
+	// package nsadmission for the routes it covers. nil admits every namespace.
 	Namespaces *nsadmission.Admitter
 }
 
@@ -326,6 +324,13 @@ func (s *Server) handleHealthDeep(c *gin.Context) {
 // nsadmission for why not 404). It returns true when the request may proceed.
 func (s *Server) admitNamespace(c *gin.Context, namespace string) bool {
 	return s.cfg.Namespaces.Gate(c, namespace)
+}
+
+// admitSession applies namespace admission to a request keyed by session ID,
+// judged by the namespace the session's sandbox lives in. It returns true when
+// the request may proceed.
+func (s *Server) admitSession(c *gin.Context, info *store.SandboxInfo) bool {
+	return s.cfg.Namespaces.Gate(c, info.Namespace)
 }
 
 // handleCodeInterpreterCreate handles POST /v1/code-interpreter.
@@ -723,6 +728,9 @@ func (s *Server) handleListSandboxes(c *gin.Context) {
 		}
 	}
 
+	if !s.cfg.Namespaces.GateReady(c) {
+		return
+	}
 	all, err := s.store.ListAllSandboxes(c.Request.Context(), 10000)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list sandboxes: " + err.Error()})
@@ -743,6 +751,10 @@ func (s *Server) handleListSandboxes(c *gin.Context) {
 			continue
 		}
 		if req.Namespace != "" && info.Namespace != req.Namespace {
+			continue
+		}
+		// Sessions in namespaces this deployment does not serve are not listed.
+		if !s.cfg.Namespaces.Filter(info.Namespace) {
 			continue
 		}
 		if req.Status != "" && info.Status != req.Status {
@@ -848,6 +860,9 @@ func (s *Server) handleGetSandbox(c *gin.Context) {
 			return
 		}
 		info, restoreRecovered = recovered, true
+	}
+	if !s.admitSession(c, info) {
+		return
 	}
 
 	// Permission check: non-admin users can only see their own sandboxes
@@ -994,6 +1009,9 @@ func (s *Server) handleDeleteSandbox(c *gin.Context) {
 	info, err := s.store.GetSandboxBySessionID(c.Request.Context(), sessionID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "session not found: " + err.Error()})
+		return
+	}
+	if !s.admitSession(c, info) {
 		return
 	}
 
@@ -1358,6 +1376,9 @@ func (s *Server) handleTemplateList(c *gin.Context) {
 	// K8s Label Selectors don't support OR (user.id=X OR public=true),
 	// so server-side (Go) filtering is the simplest correct approach.
 	// Template count is typically small (<1000), so this is efficient enough.
+	if !s.cfg.Namespaces.GateReady(c) {
+		return
+	}
 	result, err := s.k8s.ListTemplates(c.Request.Context(), req.Namespace, "")
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -1370,6 +1391,10 @@ func (s *Server) handleTemplateList(c *gin.Context) {
 	// ── Filter ──
 	filtered := make([]runtimev1alpha1.CodeInterpreter, 0, len(result.Items))
 	for _, ci := range result.Items {
+		// Templates in namespaces this deployment does not serve are not listed.
+		if !s.cfg.Namespaces.Filter(ci.Namespace) {
+			continue
+		}
 		// Permission filter: default users see only own + public templates
 		if !viewAll && uid != "" {
 			isOwner := ci.Labels != nil && ci.Labels[userIDLabelKey] == uid
@@ -1668,6 +1693,9 @@ func (s *Server) handleGetPolicy(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
 		return
 	}
+	if !s.admitSession(c, info) {
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"sessionId":            info.SessionID,
@@ -1703,6 +1731,9 @@ func (s *Server) handleUpdatePolicy(c *gin.Context) {
 	info, err := s.store.GetSandboxBySessionID(c.Request.Context(), sessionID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
+		return
+	}
+	if !s.admitSession(c, info) {
 		return
 	}
 

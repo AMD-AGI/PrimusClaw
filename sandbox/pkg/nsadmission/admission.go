@@ -26,9 +26,12 @@
 // the URL namespace is not compared with it, because existing clients name a
 // default namespace in the URL whatever namespace the session lives in. The
 // Workload Manager applies the check to sandbox creation and to template
-// create/get/update/delete. Not covered yet: the list endpoints and the
-// routes keyed only by session ID (get/delete/recover a session, its policy
-// and logs), which the static /v1/namespaces/ Ingress does not expose.
+// create/get/update/delete, to the routes keyed by session ID (get and delete
+// a session, get and patch its policy, read its logs), judged by the
+// namespace the session lives in, and filters the session and template lists
+// down to admitted namespaces. Session recovery (/sessions/:id/recover) is not
+// gated: its caller is the Router, which judges the recovered session's own
+// namespace before using it, and the Router does not expose that route.
 //
 // The check fails closed: until the informer has synced, or when the cache
 // cannot answer, every request gets 503. That is deliberately not 404 either,
@@ -196,13 +199,35 @@ func (a *Admitter) Gate(c *gin.Context, namespace string) bool {
 		})
 		return false
 	default:
-		log.Warn("namespace.admission.unavailable", "namespace", namespace,
-			"method", c.Request.Method, "path", c.FullPath())
-		c.Header("Retry-After", "1")
-		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
-			"error": "namespace admission is not ready, retry later",
-			"code":  "namespace_admission_unavailable",
-		})
+		abortUnavailable(c, namespace)
 		return false
 	}
+}
+
+// GateReady is Gate for a request that spans namespaces (a list): when the
+// cache cannot answer it writes the same 503 as Gate and returns false, so the
+// caller never filters a list against a cold cache. The caller then keeps only
+// the entries whose namespace Admit reports Admitted.
+func (a *Admitter) GateReady(c *gin.Context) bool {
+	if a.Ready() {
+		return true
+	}
+	abortUnavailable(c, "")
+	return false
+}
+
+// Filter reports whether an entry in namespace may appear in a list. Call it
+// only after GateReady has passed.
+func (a *Admitter) Filter(namespace string) bool {
+	return a.Admit(namespace) == Admitted
+}
+
+func abortUnavailable(c *gin.Context, namespace string) {
+	log.Warn("namespace.admission.unavailable", "namespace", namespace,
+		"method", c.Request.Method, "path", c.FullPath())
+	c.Header("Retry-After", "1")
+	c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+		"error": "namespace admission is not ready, retry later",
+		"code":  "namespace_admission_unavailable",
+	})
 }
