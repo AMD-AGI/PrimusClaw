@@ -98,7 +98,11 @@ func TestRunUntilSignalOtherFailureDoesNotCutTheDrain(t *testing.T) {
 	var log eventLog
 	router := component{name: "router", run: func(rc context.Context) error {
 		<-rc.Done()
-		<-failed
+		select {
+		case <-failed:
+		case <-time.After(3 * time.Second):
+			log.add("manager not stopped by the signal")
+		}
 		<-finishDrain
 		if ctx.Err() != nil {
 			log.add("dependencies stopped while router was draining")
@@ -115,7 +119,12 @@ func TestRunUntilSignalOtherFailureDoesNotCutTheDrain(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- runUntilSignal(sigCtx, ctx, cancel, router, []component{manager}, time.Second) }()
 	signal()
-	<-failed
+	select {
+	case <-failed:
+	case <-time.After(3 * time.Second):
+		close(finishDrain)
+		t.Fatal("the stopOnSignal component was not stopped by the signal")
+	}
 	select {
 	case err := <-done:
 		t.Fatalf("runUntilSignal returned before the router drained: %v", err)
