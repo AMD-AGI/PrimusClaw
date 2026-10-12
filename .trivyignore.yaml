@@ -36,4 +36,32 @@
 #
 # The rebuild also closes CVE-2026-89157, the third of the same batch, which was
 # failing the gate with no entry here at all.
-vulnerabilities: []
+#
+# 2026-10-12: perl-base in node:26-bookworm-slim. Debian published
+# 5.36.0-7+deb12u4 for these; the newest node:26-bookworm-slim digest (checked
+# the same day) still carries deb12u3, so no pin bump helps. claw/Dockerfile
+# installs perl-base in the runtime stage, so the shipped image does get the
+# fixed package; only the upstream-image scan stays red. Expires 2026-10-19:
+# delete the entries once node rebuilds, or re-justify in a commit.
+vulnerabilities:
+  - id: CVE-2026-13221
+    expired_at: 2026-10-19
+    statement: "Fixed in perl-base 5.36.0-7+deb12u4; node:26-bookworm-slim not yet rebuilt."
+  - id: CVE-2026-42496
+    expired_at: 2026-10-19
+    statement: "Fixed in perl-base 5.36.0-7+deb12u4; node:26-bookworm-slim not yet rebuilt."
+  - id: CVE-2026-8376
+    expired_at: 2026-10-19
+    statement: "Fixed in perl-base 5.36.0-7+deb12u4; node:26-bookworm-slim not yet rebuilt."
+  - id: CVE-2026-42497
+    expired_at: 2026-10-19
+    statement: "Fixed in perl-base 5.36.0-7+deb12u4; node:26-bookworm-slim not yet rebuilt."
+  - id: CVE-2026-48962
+    expired_at: 2026-10-19
+    statement: "Fixed in perl-base 5.36.0-7+deb12u4; node:26-bookworm-slim not yet rebuilt."
+  - id: CVE-2026-57432
+    expired_at: 2026-10-19
+    statement: "Fixed in perl-base 5.36.0-7+deb12u4; node:26-bookworm-slim not yet rebuilt."
+  - id: CVE-2026-57433
+    expired_at: 2026-10-19
+    statement: "Fixed in perl-base 5.36.0-7+deb12u4; node:26-bookworm-slim not yet rebuilt."
