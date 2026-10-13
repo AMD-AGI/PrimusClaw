@@ -60,7 +60,8 @@ workloadmanager:
     safeApiUrl: https://<your-safe-api>
 egress:
   enabled: true                  # transparent proxy + SSRF protection
-  extraBlockedCIDRs: "169.254.0.0/16,100.64.0.0/10"
+  # 169.254.0.0/16 and 100.64.0.0/10 are blocked without any setting; use
+  # extraBlockedCIDRs only for ranges the built-in list does not cover.
 ```
 
 In addition:
@@ -246,13 +247,13 @@ A high-frequency, short-task code-execution environment that also supports long-
 
 envd runs a **transparent proxy** as a goroutine inside the process (no extra sidecar or daemon). `iptables REDIRECT` forces all outbound TCP through the proxy; during init envd configures the rules with `CAP_NET_ADMIN`, then drops `CAP_NET_ADMIN`/`CAP_NET_RAW` so user processes cannot bypass it. Each connection goes through: recover the original destination (`SO_ORIGINAL_DST`) → extract the domain (TLS SNI / HTTP Host) → **SSRF check** → DNS-rebinding defense → policy evaluation → connect using the validated IP.
 
-- **SSRF protection** (security baseline; not bypassable by in-sandbox code once the proxy is running, since `CAP_NET_ADMIN`/`CAP_NET_RAW` are dropped after init): always blocks loopback and IPv6 link-local/unique-local; by default blocks private ranges (`10/8`, `172.16/12`, `192.168/16`); extendable via Helm `extraBlockedCIDRs`. Applies even in `audit` mode — but not at all when `egress.enabled: false`.
+- **SSRF protection** (security baseline; not bypassable by in-sandbox code once the proxy is running, since `CAP_NET_ADMIN`/`CAP_NET_RAW` are dropped after init): always blocks loopback, IPv4 link-local `169.254/16` (cloud metadata endpoints) and IPv6 link-local/unique-local; by default blocks private ranges (`10/8`, `172.16/12`, `192.168/16`) and carrier-grade NAT (`100.64/10`); extendable via Helm `extraBlockedCIDRs`. Applies even in `audit` mode — but not at all when `egress.enabled: false`.
 - **DNS-rebinding defense**: once a hostname resolves to a safe IP, the proxy dials that exact IP rather than re-resolving the name.
 - Source: `pkg/envd/egress/` (`ssrf.go`, proxy, dns, sni).
 
 ### Policy engine
 
-An embedded **OPA (Open Policy Agent) Go SDK** evaluates `allow`/`deny`/`audit` at L4 (domain + port) — no external OPA daemon. Policies are cluster-scoped `ClusterSandboxPolicy` CRDs shipped as platform presets via the Helm chart; a CodeInterpreter template references one through `spec.runtimePolicy` (defaults to `agent-default`).
+A built-in Go evaluator (`pkg/policy`), running inside envd, decides `allow`/`deny`/`audit` for each outbound connection from its destination IP and domain (TLS SNI / HTTP Host) — there is no external policy daemon. Evaluating policies with an embedded **OPA (Open Policy Agent)** engine is planned, not yet implemented; the `PolicyEvaluator` interface in `pkg/envd/egress/proxy.go` is the extension point reserved for it. Policies are cluster-scoped `ClusterSandboxPolicy` CRDs shipped as platform presets via the Helm chart; a CodeInterpreter template references one through `spec.runtimePolicy` (defaults to `agent-default`).
 
 | Preset            | Use case            | External egress      | Internal egress     |
 | ----------------- | ------------------- | -------------------- | ------------------- |
@@ -265,7 +266,7 @@ An embedded **OPA (Open Policy Agent) Go SDK** evaluates `allow`/`deny`/`audit` 
 
 ### Policy hot reload
 
-Allow-lists can be changed on a running sandbox without restarting the Pod. envd periodically **pulls** the latest policy from the Workload Manager (default every 30s, via Router, reusing the existing JWT channel) and atomically swaps it through the OPA SDK when the version changes. Two change sources: platform-level edits to `ClusterSandboxPolicy`, and per-sandbox developer updates via SDK/CLI/API (`PATCH /v1/sandbox/sessions/{id}/policy`, overwrite semantics). If the pull fails, the last good policy stays in effect. Source: `pkg/envd/policy_sync.go`.
+Allow-lists can be changed on a running sandbox without restarting the Pod. envd periodically **pulls** the latest policy from the Workload Manager (default every 30s, via Router, reusing the existing JWT channel) and atomically swaps it into the policy evaluator (`policy.Engine.UpdateConfig`) when the version changes. Two change sources: platform-level edits to `ClusterSandboxPolicy`, and per-sandbox developer updates via SDK/CLI/API (`PATCH /v1/sandbox/sessions/{id}/policy`, overwrite semantics). If the pull fails, the last good policy stays in effect. Source: `pkg/envd/policy_sync.go`.
 
 ## Unified Inference Egress
 
