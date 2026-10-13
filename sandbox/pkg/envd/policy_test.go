@@ -11,14 +11,16 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 // TestCallWMSendsTheNewestTokenWMHasNotRefused walks a session's token through
 // capture, refusal and replacement. Steps: "set X" captures X as a proxied
-// request would; "call X" expects WM to receive X; "call -" expects no WM call.
-// WM refuses tokens named "expired*" with 401 and "foreign*" with 403; on
-// "expired-race" a newer request lands while WM is still answering.
+// request would; "call X,Y" expects WM to receive X then Y; "call -" expects no
+// WM call. WM refuses tokens named "expired*" with 401 and "foreign*" with 403.
+// On "expired-race" a newer request lands while WM is still answering; on
+// "expired-overlap" it lands and has its own token refused first.
 func TestCallWMSendsTheNewestTokenWMHasNotRefused(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -35,6 +37,7 @@ func TestCallWMSendsTheNewestTokenWMHasNotRefused(t *testing.T) {
 		{name: "fresh token after a refusal is sent", steps: []string{"set expired-a", "call expired-a", "call -", "set b", "call b", "call b"}, wantErr: errAwaitingToken},
 		{name: "token for another session is not resent", steps: []string{"set foreign-a", "call foreign-a", "call -"}, wantErr: errAwaitingToken},
 		{name: "refusing an older token keeps the newer one", steps: []string{"set expired-race", "call expired-race", "call newer"}},
+		{name: "late refusal of an older token keeps the newer refusal", steps: []string{"set expired-overlap", "call expired-overlap,expired-newer", "call -"}, wantErr: errAwaitingToken},
 		{name: "same token captured again stays refused", steps: []string{"set expired-a", "call expired-a", "set expired-a", "call -"}, wantErr: errAwaitingToken},
 	}
 
@@ -44,7 +47,7 @@ func TestCallWMSendsTheNewestTokenWMHasNotRefused(t *testing.T) {
 			var seen []string
 			c := &inferenceKeyCache{sessionID: "sess-a", ready: make(chan struct{}), fetchStarted: true}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				require.Equal(t, "/v1/internal/policy/sess-a", r.URL.Path)
+				assert.Equal(t, "/v1/internal/policy/sess-a", r.URL.Path)
 				token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 				mu.Lock()
 				seen = append(seen, token)
@@ -52,6 +55,12 @@ func TestCallWMSendsTheNewestTokenWMHasNotRefused(t *testing.T) {
 				switch {
 				case token == "expired-race":
 					c.setJWTToken("newer")
+					w.WriteHeader(http.StatusUnauthorized)
+				case token == "expired-overlap":
+					c.setJWTToken("expired-newer")
+					if resp, err := c.callWM(r.Context(), http.DefaultClient, http.MethodGet, "policy", nil); assert.NoError(t, err) {
+						resp.Body.Close()
+					}
 					w.WriteHeader(http.StatusUnauthorized)
 				case strings.HasPrefix(token, "expired"):
 					w.WriteHeader(http.StatusUnauthorized)
@@ -90,7 +99,7 @@ func TestCallWMSendsTheNewestTokenWMHasNotRefused(t *testing.T) {
 				}
 				require.NoError(t, err, step)
 				resp.Body.Close()
-				require.Equal(t, []string{token}, got, step)
+				require.Equal(t, strings.Split(token, ","), got, step)
 			}
 		})
 	}

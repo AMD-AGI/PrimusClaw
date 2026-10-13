@@ -200,7 +200,9 @@ func (c *inferenceKeyCache) callWM(ctx context.Context, client *http.Client, met
 	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		c.mu.Lock()
-		c.refused = token
+		if c.jwtToken == token { // a newer request may have replaced it meanwhile
+			c.refused = token
+		}
 		c.mu.Unlock()
 	}
 	return resp, nil

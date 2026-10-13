@@ -108,7 +108,7 @@ func (r *recordingAuditStore) Store(_ context.Context, e *audit.AuditEvent) erro
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if e.Egress != nil {
-		r.domains = append(r.domains, e.Egress.Domain)
+		r.domains = append(r.domains, e.Egress.Domain+"@"+e.Metadata["observedAt"])
 	}
 	return nil
 }
@@ -199,6 +199,9 @@ func (h *wmSyncHarness) appliedHosts() []string {
 // TestEnvDStaysInSyncWithWMPastRouterTokenTTL runs the Router's signer, Workload
 // Manager's internal API and EnvD's capture, policy syncer and audit uploader
 // together on a fake clock, so a session can outlive the 5 minute Router token.
+// The sync workers are started by startWMSync, as Server.Run does once its
+// privileged egress setup is done; that setup and the proxy's own decision
+// reporting are not exercised here.
 func TestEnvDStaysInSyncWithWMPastRouterTokenTTL(t *testing.T) {
 	cs := fake.NewClientset()
 	jm, err := router.NewJWTManager(cs)
@@ -237,7 +240,7 @@ func TestEnvDStaysInSyncWithWMPastRouterTokenTTL(t *testing.T) {
 				time.Sleep(31 * time.Second)
 				synctest.Wait()
 				assert.Equal(t, []string{"v2.example"}, h.appliedHosts(), "policy update not applied; WM answered: %s", wmTransport.summary())
-				assert.Equal(t, []string{"blocked.example"}, h.audits.delivered(), "audit event lost; WM answered: %s", wmTransport.summary())
+				assert.Equal(t, []string{"blocked.example@2000-01-01T00:10:00Z"}, h.audits.delivered(), "audit event lost; WM answered: %s", wmTransport.summary())
 			},
 		},
 		{
@@ -257,11 +260,14 @@ func TestEnvDStaysInSyncWithWMPastRouterTokenTTL(t *testing.T) {
 				assert.Empty(t, h.audits.delivered())
 				assert.LessOrEqual(t, wmTransport.count(http.StatusUnauthorized), 2, "WM polled with a refused token: %s", wmTransport.summary())
 
+				// The request that ends the idle period delivers what was held at
+				// once: the sandbox may be torn down right after it.
 				h.routerRequest()
+				synctest.Wait()
+				assert.Equal(t, []string{"during-idle.example@2000-01-01T01:00:00Z"}, h.audits.delivered(), "audit event from the idle period not delivered on resume; WM answered: %s", wmTransport.summary())
 				time.Sleep(31 * time.Second)
 				synctest.Wait()
 				assert.Equal(t, []string{"v2.example"}, h.appliedHosts(), "policy update not applied after the session resumed; WM answered: %s", wmTransport.summary())
-				assert.Equal(t, []string{"during-idle.example"}, h.audits.delivered(), "audit event from the idle period lost; WM answered: %s", wmTransport.summary())
 			},
 		},
 		{

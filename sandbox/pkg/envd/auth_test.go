@@ -7,6 +7,7 @@ package envd
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -103,21 +104,24 @@ func TestHandlerCapturesOnlyAuthenticatedTokens(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			s := &Server{auth: &authManager{}, inference: &inferenceKeyCache{jwtToken: "earlier", ready: make(chan struct{})}}
-			if tc.verify {
-				s.auth.publicKey = &key.PublicKey
-			}
-			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
-			req.Header.Set("Authorization", "Bearer "+tc.token)
-			rec := httptest.NewRecorder()
-			s.Handler().ServeHTTP(rec, req)
-			require.Equal(t, tc.wantStatus, rec.Code)
-			want := "earlier"
-			if tc.wantKept {
-				want = tc.token
-			}
-			require.Equal(t, want, s.inference.jwtToken)
-		})
+		// Each case runs before any token is held, and after one is.
+		for _, earlier := range []string{"", "earlier"} {
+			t.Run(fmt.Sprintf("%s/held=%q", tc.name, earlier), func(t *testing.T) {
+				s := &Server{auth: &authManager{}, inference: &inferenceKeyCache{jwtToken: earlier, ready: make(chan struct{})}}
+				if tc.verify {
+					s.auth.publicKey = &key.PublicKey
+				}
+				req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+				req.Header.Set("Authorization", "Bearer "+tc.token)
+				rec := httptest.NewRecorder()
+				s.Handler().ServeHTTP(rec, req)
+				require.Equal(t, tc.wantStatus, rec.Code)
+				want := earlier
+				if tc.wantKept {
+					want = tc.token
+				}
+				require.Equal(t, want, s.inference.jwtToken)
+			})
+		}
 	}
 }

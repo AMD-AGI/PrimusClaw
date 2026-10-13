@@ -225,6 +225,9 @@ func (s *Server) sessionCaptureMiddleware(next http.Handler) http.Handler {
 		if sid := r.Header.Get("x-session-id"); sid != "" {
 			s.inference.setSessionID(sid)
 		}
+		if s.auditReporter != nil {
+			s.auditReporter.wake()
+		}
 		next.ServeHTTP(w, r)
 	})
 }
