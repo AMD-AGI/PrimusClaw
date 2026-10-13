@@ -49,8 +49,12 @@ const BOOTSTRAP_OWNED = new Set([
  * `HANDS_STATE_DIR` decides where the records that address background shells
  * live. Both are read after this file is applied, so a name that slipped
  * through would be indistinguishable from one an operator set.
+ *
+ * The same set is what a spawned command does not inherit (see
+ * child-privilege.ts): a name this service owns is its configuration, not the
+ * workspace's.
  */
-function bootstrapOwned(key: string): boolean {
+export function bootstrapOwned(key: string): boolean {
   return key.startsWith("HANDS_") || key.startsWith("BG_SHELL_") || BOOTSTRAP_OWNED.has(key);
 }
 

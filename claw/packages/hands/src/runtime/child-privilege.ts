@@ -6,9 +6,10 @@
  *
  * The boundary is a property of the spawn, in three parts: an unprivileged
  * identity of its own per *(owner scope, run identity)* pair, a process view
- * that cannot observe another pair's processes, and an environment built from
- * an allow-list rather than passed through. Foreground and background share
- * this one path, so neither is a way round the others.
+ * that cannot observe another pair's processes, and an environment that is the
+ * container's own minus this service's configuration and credentials.
+ * Foreground and background share this one path, so neither is a way round
+ * the others.
  *
  * The environment binds unconditionally; it needs nothing of the sandbox. The
  * other two are the sandbox's to provide, and declaring an identity range is
@@ -20,7 +21,7 @@
 
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { APPLIED_ENV_KEYS } from "./env-file.js";
+import { APPLIED_ENV_KEYS, bootstrapOwned } from "./env-file.js";
 import { currentEpoch, stateRoot } from "./shell-records.js";
 
 /** Raised where the boundary cannot be placed. Never downgraded to a warning. */
@@ -183,27 +184,52 @@ function persistAllocations(table: Map<string, number>): void {
 }
 
 /**
- * Names a model-issued process may see, and nothing else.
+ * Names Hands passes on although it owns them.
  *
- * Built up rather than filtered down: a deny list is a promise to remember
- * every future secret, and the token that matters is set by the launch command,
- * so any list starting from the parent's environment carries it by default.
+ * Everything else a command sees is the container's environment: what the
+ * image declares (`ENV` in its config), what the pod spec sets, and what
+ * Kubernetes adds, the same environment `kubectl exec` gives. A command run
+ * for the model is work in that image, and the image's settings are how it is
+ * meant to be run -- library search paths, toolchain locations, runtime tuning.
+ * Rebuilding the environment from a fixed list of names dropped all of them,
+ * and a workload that depends on one ran with a different configuration than
+ * the image's author intended, without any error.
  */
-const WORKSPACE_FACING = [
-  "PATH", "HOME", "SHELL", "TERM", "TZ", "LANG", "LC_ALL", "PWD", "USER", "LOGNAME",
-  // The session a command is running for. Named here because a command needs to
-  // be able to say which session it belongs to -- Hyperloom stamps it into its
-  // run manifest and its LLM attribution -- and because the alternative is what
-  // was there before: the same value reaching the child anyway under a
-  // second, application-specific name. An identifier, not a credential; the
-  // credential is AUTH_CLAW_TOKEN, which this list deliberately omits.
+const PASSED_ON_ALTHOUGH_OWNED = new Set([
+  // The session a command is running for. A command needs to be able to say
+  // which session it belongs to -- Hyperloom stamps it into its run manifest
+  // and its LLM attribution. An identifier, not a credential; the credential is
+  // AUTH_CLAW_TOKEN, which is withheld.
   "CLAW_SESSION_ID",
-  // The CA bundle the sandbox was configured to trust. Without these a command
-  // the model runs verifies TLS against the image's default store alone, and
-  // fails against every endpoint the deployment's own CA signs. Each names a
-  // file path; none carries secret material.
-  "SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
-];
+]);
+
+/**
+ * Whether a name is configuration of the sandbox runtime rather than of the
+ * workspace, and so is withheld from a spawned command.
+ *
+ * Hands' own names are the closed set the env file is already forbidden to
+ * set, plus the two this service reads that the env file leaves alone: the
+ * legacy name of the internal token, and the output cap. `ENVD_` is the
+ * sandbox daemon's own namespace (its key for verifying callers, the file it
+ * reads the session from), which it hands down only because it starts this
+ * process.
+ *
+ * A deny list, which is what the allow-list this replaced was written to avoid,
+ * and the trade is deliberate. The secret that matters is this service's
+ * bearer token, which is in the set by name. Every other value in the
+ * container's environment was put there for the workload: by the image, by the
+ * pod spec, or by reference from a workspace Secret, and withholding those is
+ * what broke the workloads. A child running under Hands' own identity reads
+ * `/proc/1/environ` regardless, so the list was never what kept the token
+ * from a child that wanted it; that is the identity boundary's job.
+ */
+function runtimeOwned(key: string): boolean {
+  if (PASSED_ON_ALTHOUGH_OWNED.has(key)) return false;
+  return bootstrapOwned(key)
+    || key === "AUTH_INTERNAL_TOKEN"
+    || key === "BASH_OUTPUT_BYTES"
+    || key.startsWith("ENVD_");
+}
 
 /**
  * Names whose value is a path, or a list of them, the child will resolve
@@ -226,21 +252,25 @@ function usablePathValue(value: string): boolean {
 
 export function childEnvironment(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
-  for (const key of WORKSPACE_FACING) {
-    const value = process.env[key];
-    // Blank is unset here as everywhere else in this service's configuration.
-    if (!value) continue;
-    if (PATH_SHAPED.has(key) && !usablePathValue(value)) {
-      throw new ChildPrivilegeUnavailable(
-        `${key} is not a usable absolute path, so no child environment could be built from it`,
-      );
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value === undefined || runtimeOwned(key)) continue;
+    if (PATH_SHAPED.has(key)) {
+      // Blank is unset here as everywhere else in this service's configuration.
+      if (!value) continue;
+      if (!usablePathValue(value)) {
+        throw new ChildPrivilegeUnavailable(
+          `${key} is not a usable absolute path, so no child environment could be built from it`,
+        );
+      }
     }
     env[key] = value;
   }
   // The per-request environment Brain wrote for this session: the user's own
-  // configuration and credentials for their own work, which is what a command
-  // is run to use. Hands' own configuration is not in that set -- the env file
-  // never applies it -- so the token is not reachable through here either.
+  // configuration and credentials for their own work. It is already in
+  // process.env, over whatever the image set, and is laid on last so that a
+  // name the request chose reaches the command even where it collides with
+  // one the runtime keeps. The env file never applies a name this service
+  // owns, so the token is not reachable through here either.
   for (const key of APPLIED_ENV_KEYS) {
     const value = process.env[key];
     if (value !== undefined) env[key] = value;

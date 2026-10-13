@@ -158,7 +158,7 @@ let commandShell: string | undefined;
 
 /**
  * Spawn a managed shell as a detached process group, under its run's own
- * unprivileged identity and with an environment built from an allow-list.
+ * unprivileged identity and with the container's environment minus Hands' own.
  *
  * @throws ChildPrivilegeUnavailable where the sandbox declares an identity
  * range and cannot partition the process view to go with it.

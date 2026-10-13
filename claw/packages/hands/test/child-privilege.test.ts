@@ -10,10 +10,9 @@
  * work -- and, because one sandbox serves several runs under one identity, the
  * other runs' processes as well.
  *
- * The properties here are negative and are asserted over whole surfaces rather
- * than named fields: no deny list of variable names, no inspection of a chosen
- * few. A boundary that has to enumerate what it forbids is a promise to
- * remember every future secret.
+ * The token is asserted by value over the whole environment as well as by
+ * name, so a copy under some other name fails here. What a child does see --
+ * the container's own environment -- is covered in child-environment.test.ts.
  */
 import test, { after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -95,8 +94,6 @@ test("the child environment carries no Brain-facing credential, over the whole e
   assert.equal(env.AUTH_CLAW_TOKEN, undefined);
   assert.equal(env.HANDS_STATE_DIR, undefined, "the record subtree's location is not the child's business");
   assert.equal(env.MCP_PORT, undefined);
-  // Built up rather than filtered down, so PATH survives and nothing else
-  // arrives by default.
   assert.equal(env.PATH, process.env.PATH);
 });
 
@@ -117,7 +114,7 @@ test("the child environment carries the session id", () => {
   }
 });
 
-test("the child environment carries the configured CA bundle, and still drops an unrelated secret", () => {
+test("the child environment carries the configured CA bundle", () => {
   // Regression guard. These were filtered out, so a command the model ran
   // ignored the CA bundle the sandbox was configured with and failed TLS
   // verification against every endpoint the deployment's own CA signs. Each
@@ -128,14 +125,11 @@ test("the child environment carries the configured CA bundle, and still drops an
     REQUESTS_CA_BUNDLE: "/etc/ssl/custom/requests-ca.crt",
     NODE_EXTRA_CA_CERTS: "/etc/ssl/custom/node-extra.crt",
   };
-  const set = { ...bundle, CLAW_UNRELATED_SECRET_KEY: "an-unrelated-secret-no-child-may-read" };
-  const previous = Object.fromEntries(Object.keys(set).map((k) => [k, process.env[k]]));
-  Object.assign(process.env, set);
+  const previous = Object.fromEntries(Object.keys(bundle).map((k) => [k, process.env[k]]));
+  Object.assign(process.env, bundle);
   try {
     const env = privilege.childEnvironment();
     for (const [key, value] of Object.entries(bundle)) assert.equal(env[key], value, key);
-    assert.equal(env.CLAW_UNRELATED_SECRET_KEY, undefined);
-    assert.doesNotMatch(JSON.stringify(env), /an-unrelated-secret-no-child-may-read/);
   } finally {
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[key];
