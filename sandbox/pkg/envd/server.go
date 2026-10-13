@@ -68,7 +68,7 @@ type Config struct {
 	TMuxWidth       int
 	TMuxHeight      int
 	EgressEnabled   bool     // §4.1: enable transparent proxy + SSRF protection
-	ExtraBlockCIDRs []string // §4.1: additional CIDRs to block (e.g. 169.254.0.0/16)
+	ExtraBlockCIDRs []string // §4.1: additional CIDRs to block, beyond the built-in lists in egress/ssrf.go
 	// Shutdown drain budget; zero takes defaultShutdownDrainTimeout. Must stay
 	// under the pod's termination grace, or the drain ends in a SIGKILL.
 	ShutdownDrainTimeout time.Duration

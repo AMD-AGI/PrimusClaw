@@ -37,7 +37,8 @@ var (
 )
 
 // NewSSRFChecker creates a checker with baseline + default private CIDR blocks.
-// extraCIDRs adds deployment-specific ranges (e.g. 169.254.0.0/16 for cloud metadata).
+// extraCIDRs adds deployment-specific ranges that the built-in lists above do
+// not already cover, such as a site's own public address ranges.
 func NewSSRFChecker(extraCIDRs []string) (*SSRFChecker, error) {
 	c := &SSRFChecker{}
 

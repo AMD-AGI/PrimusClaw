@@ -4,7 +4,7 @@
 
 | Goal | Description |
 |------|------|
-| Old Brain stops accepting new tasks during upgrade | Stops pulling within milliseconds after version signal arrives |
+| Old Brain stops accepting new tasks during upgrade | Hands new deliveries back within milliseconds after version signal arrives |
 | New Brain comes online first, old Brain exits last | maxSurge=100%, no gap, no forced interruption |
 | Old Brain exits naturally, K8s auto-cleans | Old Pod completes tasks then receives SIGTERM → exit, Deployment auto-reclaims |
 | Current in-flight tasks are not interrupted or can be resumed | Checkpoint after SIGTERM, any new Brain can resume |
@@ -498,6 +498,15 @@ async function watchVersionDrain(): Promise<void> {
   }
 }
 ```
+
+As shipped, the version drain does not call `consumerIter.stop()`. Stopping the
+consumer cannot be undone, and this drain has to be reversible: a Pod that drained
+on a stale value resumes once the key names its version (§2.2). A drained Pod keeps
+its consumer and hands each new delivery back, as the `draining` branch in §5.6.6
+does; only the SIGTERM handler (§5.6.2) stops the consumer. The version test is
+also identity rather than the `<` above (§2.2), and the drain is tracked apart from
+shutdown, so a Pod that has already drained still runs the SIGTERM handler instead
+of returning at its `if (draining)` guard.
 
 #### 5.6.4 Checkpoint Utility Functions
 
@@ -1063,11 +1072,11 @@ t=30  All 3 new Pods pass readinessProbe
         ↓ (new version confirmed healthy, safety point)
         upgrade.sh: write brain.min_version = NEW_TAG
         │ (KV Watch millisecond-level push)
-        ├─ Brain-old-0 → draining=true → consumerIter.stop()
-        ├─ Brain-old-1 → draining=true → consumerIter.stop()
-        └─ Brain-old-2 → draining=true → consumerIter.stop()
+        ├─ Brain-old-0 → draining=true → hand new deliveries back (consumer keeps running)
+        ├─ Brain-old-1 → draining=true → hand new deliveries back (consumer keeps running)
+        └─ Brain-old-2 → draining=true → hand new deliveries back (consumer keeps running)
 
-t=30  New Pods take over all new tasks (old Pods stopped pulling)
+t=30  New Pods take over all new tasks (old Pods hand every new delivery back)
       Deployment controller: simultaneously sends SIGTERM to old Pods
 
 t=30  Brain-old-0,1,2 receive SIGTERM
