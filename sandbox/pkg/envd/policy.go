@@ -7,6 +7,7 @@ package envd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,7 +20,8 @@ import (
 )
 
 // inferenceKeyCache fetches the user's inference API Key from Workload Manager
-// once (on first request) and caches it for the lifetime of the sandbox.
+// once (on first request) and caches it for the lifetime of the sandbox. It also
+// holds the session ID and Router token every envd call to WM is made with.
 //
 // The API Key is fixed at sandbox creation time (stored in Redis by WM) and
 // never changes, so a single fetch is sufficient. No periodic polling needed.
@@ -27,7 +29,8 @@ type inferenceKeyCache struct {
 	mu sync.RWMutex
 
 	wmURL        string // Workload Manager base URL
-	jwtToken     string // Router-signed JWT captured from first incoming request
+	jwtToken     string // newest Router-signed JWT; Router signs one per proxied request
+	refused      string // a token Workload Manager refused, never sent again
 	sessionID    string // set once, from first request's x-session-id header
 	apiKey       string // cached after successful fetch
 	fetched      bool   // true after first successful fetch (apiKey may still be empty)
@@ -64,17 +67,16 @@ func newInferenceKeyCache() *inferenceKeyCache {
 	}
 }
 
-// setJWTToken captures the Router-signed JWT (first-write-wins) and triggers
-// policy fetch when sessionID is also set. Safe because fetch (~6s) ≪ JWT TTL (5min+1min leeway).
+// setJWTToken records the newest Router-signed JWT and triggers the policy fetch
+// when sessionID is also set. Each token expires five minutes after the Router
+// signed it, so envd keeps calling Workload Manager on the latest one.
 func (c *inferenceKeyCache) setJWTToken(token string) {
 	if token == "" {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.jwtToken == "" {
-		c.jwtToken = token
-	}
+	c.jwtToken = token
 	c.tryStartFetch()
 }
 
@@ -146,25 +148,62 @@ func (c *inferenceKeyCache) getSessionID() string {
 	return c.sessionID
 }
 
-// getJWTToken returns the captured Router JWT.
-func (c *inferenceKeyCache) getJWTToken() string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.jwtToken
-}
-
 // getWMURL returns the Workload Manager URL.
 func (c *inferenceKeyCache) getWMURL() string {
 	return c.wmURL
 }
 
-// waitForReady blocks until the first policy fetch completes (or times out).
-func (c *inferenceKeyCache) waitForReady() {
+// waitForReady blocks until the first policy fetch completes, or ctx ends. The
+// fetch follows the first proxied request, which a warm-pool Pod sees only once
+// it is claimed.
+func (c *inferenceKeyCache) waitForReady(ctx context.Context) bool {
 	select {
 	case <-c.ready:
-	case <-time.After(30 * time.Second):
-		log.Warn("inferenceKeyCache: timed out waiting for first request")
+		return true
+	case <-ctx.Done():
+		return false
 	}
+}
+
+var (
+	errNoWM          = errors.New("workload manager URL is not set")
+	errAwaitingToken = errors.New("awaiting a Router token workload manager accepts")
+)
+
+// callWM calls Workload Manager's internal API for this sandbox's session with
+// the newest Router token. A token WM refuses has expired or is otherwise
+// unusable, so it is not sent again: until the next proxied request brings a
+// fresh one -- the first one also brings the session ID -- callWM returns
+// errAwaitingToken without calling WM.
+func (c *inferenceKeyCache) callWM(ctx context.Context, client *http.Client, method, api string, body io.Reader) (*http.Response, error) {
+	c.mu.RLock()
+	wmURL, sessionID, token, refused := c.wmURL, c.sessionID, c.jwtToken, c.refused
+	c.mu.RUnlock()
+	if wmURL == "" {
+		return nil, errNoWM
+	}
+	if sessionID == "" || token == "" || token == refused {
+		return nil, errAwaitingToken
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, fmt.Sprintf("%s/v1/internal/%s/%s", wmURL, api, sessionID), body)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request: %w", err)
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		c.mu.Lock()
+		c.refused = token
+		c.mu.Unlock()
+	}
+	return resp, nil
 }
 
 // fetch calls WM once to get the inference API Key and caches the result.
@@ -173,16 +212,7 @@ func (c *inferenceKeyCache) waitForReady() {
 func (c *inferenceKeyCache) fetch(ctx context.Context) {
 	defer c.closeReady.Do(func() { close(c.ready) })
 
-	c.mu.RLock()
-	sid := c.sessionID
-	wmURL := c.wmURL
-	c.mu.RUnlock()
-
-	if sid == "" || wmURL == "" {
-		return
-	}
-
-	url := fmt.Sprintf("%s/v1/internal/policy/%s", wmURL, sid)
+	sid := c.getSessionID()
 
 	const maxRetries = 3
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -194,7 +224,7 @@ func (c *inferenceKeyCache) fetch(ctx context.Context) {
 			}
 		}
 
-		apiKey, err := c.doFetch(ctx, url)
+		apiKey, err := c.doFetch(ctx)
 		if err != nil {
 			log.Warn("inferenceKeyCache: fetch failed",
 				"attempt", attempt+1, "error", err)
@@ -218,21 +248,10 @@ func (c *inferenceKeyCache) fetch(ctx context.Context) {
 		"sessionId", sid)
 }
 
-func (c *inferenceKeyCache) doFetch(ctx context.Context, url string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func (c *inferenceKeyCache) doFetch(ctx context.Context) (string, error) {
+	resp, err := c.callWM(ctx, c.httpClient, http.MethodGet, "policy", nil)
 	if err != nil {
-		return "", fmt.Errorf("build request: %w", err)
-	}
-	c.mu.RLock()
-	jwt := c.jwtToken
-	c.mu.RUnlock()
-	if jwt != "" {
-		req.Header.Set("Authorization", "Bearer "+jwt)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("request: %w", err)
+		return "", err
 	}
 	defer resp.Body.Close()
 

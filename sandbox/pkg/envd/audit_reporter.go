@@ -8,7 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"net/http"
 	"time"
 
@@ -25,10 +25,20 @@ type internalAuditRequest struct {
 	Egress    *audit.EgressDetails `json:"egress,omitempty"`
 }
 
+// Events wait in held while envd has no Router token Workload Manager accepts:
+// before the first proxied request, and after a session has been idle longer
+// than a token lives. The next request brings a fresh token, and with it the
+// next retry delivers them.
+const (
+	auditRetryInterval = 30 * time.Second
+	maxHeldAuditEvents = 256
+)
+
 type egressAuditReporter struct {
 	cache  *inferenceKeyCache
 	client *http.Client
 	queue  chan egress.DecisionEvent
+	held   []egress.DecisionEvent // oldest first; touched only by Run
 }
 
 func newEgressAuditReporter(cache *inferenceKeyCache) *egressAuditReporter {
@@ -50,24 +60,43 @@ func (r *egressAuditReporter) ReportDecision(event egress.DecisionEvent) {
 }
 
 func (r *egressAuditReporter) Run(ctx context.Context) {
+	retry := time.NewTicker(auditRetryInterval)
+	defer retry.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case event := <-r.queue:
-			r.send(ctx, event)
+			r.hold(event)
+			r.flush(ctx)
+		case <-retry.C:
+			r.flush(ctx)
 		}
 	}
 }
 
-func (r *egressAuditReporter) send(ctx context.Context, event egress.DecisionEvent) {
-	wmURL := r.cache.getWMURL()
-	sessionID := r.cache.getSessionID()
-	jwtToken := r.cache.getJWTToken()
-	if wmURL == "" || sessionID == "" || jwtToken == "" {
-		return
+// hold queues event behind those already waiting, dropping the oldest when full.
+func (r *egressAuditReporter) hold(event egress.DecisionEvent) {
+	if len(r.held) == maxHeldAuditEvents {
+		log.Warn("egress audit: no Router token for Workload Manager, dropping oldest held event",
+			"stage", r.held[0].Stage, "action", r.held[0].Action)
+		r.held = r.held[1:]
 	}
+	r.held = append(r.held, event)
+}
 
+// flush uploads held events oldest first, stopping at the first one that has to
+// wait for a token.
+func (r *egressAuditReporter) flush(ctx context.Context) {
+	for len(r.held) > 0 && r.send(ctx, r.held[0]) {
+		r.held = r.held[1:]
+	}
+}
+
+// send uploads one event and reports whether it is done with: delivered, or
+// failed for a reason retrying would not fix. It is not done while envd holds
+// no Router token Workload Manager accepts.
+func (r *egressAuditReporter) send(ctx context.Context, event egress.DecisionEvent) bool {
 	payload := internalAuditRequest{
 		EventType: audit.EventEgress,
 		Source:    audit.SourceEgress,
@@ -85,32 +114,27 @@ func (r *egressAuditReporter) send(ctx context.Context, event egress.DecisionEve
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return
+		return true
 	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(
-		reqCtx,
-		http.MethodPost,
-		fmt.Sprintf("%s/v1/internal/audit/%s", wmURL, sessionID),
-		bytes.NewReader(body),
-	)
-	if err != nil {
-		return
+	resp, err := r.cache.callWM(reqCtx, r.client, http.MethodPost, "audit", bytes.NewReader(body))
+	if errors.Is(err, errAwaitingToken) {
+		return false
 	}
-	req.Header.Set("Authorization", "Bearer "+jwtToken)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := r.client.Do(req)
 	if err != nil {
 		log.Debug("egress audit upload failed", "error", err)
-		return
+		return true
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return false
+	}
 	if resp.StatusCode >= 300 {
 		log.Debug("egress audit upload returned non-2xx", "status", resp.StatusCode)
 	}
+	return true
 }

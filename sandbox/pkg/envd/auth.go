@@ -73,12 +73,6 @@ func (am *authManager) loadFromEnv() error {
 // If publicKey is nil (ENVD_AUTH_PUBLIC_KEY not set → authMode=none), auth is skipped.
 func (s *Server) jwtMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Health check is always public
-		if r.URL.Path == "/health" {
-			next.ServeHTTP(w, r)
-			return
-		}
-
 		s.auth.mu.RLock()
 		pubKey := s.auth.publicKey
 		s.auth.mu.RUnlock()
