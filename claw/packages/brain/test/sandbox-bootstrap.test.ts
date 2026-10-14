@@ -21,9 +21,13 @@ import {
   HANDS_ENV_PAYLOAD_ENV, HANDS_TOKEN_ENV, writeEnvFileCmd, brainAssetCurl,
   handsBinaryDownloadCmd, HANDS_LOG_PATH, HANDS_STATE_DIR,
   inImageStartCmd, type SandboxExecFn,
+  HANDS_DOWNLOAD_ATTEMPTS, HANDS_DOWNLOAD_RETRY_DELAY_SEC,
 } from "../src/sandbox/bootstrap.js";
 import type { SandboxExecOptions } from "../src/sandbox/provider.js";
-import { CLAW_DEPLOY_ROOT, BRAIN_HTTP_URL } from "../src/config.js";
+import {
+  CLAW_DEPLOY_ROOT, BRAIN_HTTP_URL, HANDS_BOOTSTRAP_START_TIMEOUT, HANDS_ENV_FILE_WAIT_SEC,
+} from "../src/config.js";
+import { createServer, type Socket } from "node:net";
 
 const SESSION = "sess-bootstrap";
 const TOKEN = "tok-abc";
@@ -31,6 +35,27 @@ const PORT = "9100";
 
 const ok = { exitCode: 0, stdout: "started_pid=42", stderr: "" };
 const fail = (stderr: string) => ({ exitCode: 1, stdout: "", stderr });
+
+/** Run a shell snippet from a file. The snippet is not a process argument. */
+async function runSnippet(
+  cmd: string,
+  env: NodeJS.ProcessEnv,
+  opts?: { timeout?: number; killSignal?: NodeJS.Signals },
+): Promise<{ code: number; stderr: string }> {
+  const dir = await mkdtemp(path.join(tmpdir(), "bootstrap-snippet-"));
+  const script = path.join(dir, "snippet.sh");
+  await writeFile(script, `#!/bin/sh\n${cmd}`);
+  await chmod(script, 0o755);
+  return new Promise((resolve) => {
+    execFile(script, [], {
+      env,
+      timeout: opts?.timeout,
+      killSignal: opts?.killSignal,
+    }, (err, _out, stderrText) => {
+      resolve({ code: err ? Number(err.code ?? -1) : 0, stderr: stderrText });
+    });
+  });
+}
 
 /** Record every command the bootstrap runs, and reply from a scripted list. */
 function recorder(replies: Array<{ exitCode: number; stdout: string; stderr: string }>) {
@@ -572,6 +597,73 @@ test("a download refused every time stops at its limit and says what curl said",
   assert.equal(r.code, 1);
   assert.equal(r.attempts, 3, "bounded, so the source fails inside its exec budget");
   assert.match(r.stderr, /hands-binary download failed after 3 attempts: curl: \(22\) .*403/);
+});
+
+/**
+ * A connection that opens and then stalls used to hold curl until the exec
+ * budget abandoned the whole step: no further attempt ran, and the failure
+ * carried nothing from curl. Run the real curl against a server that accepts
+ * and never answers, with short bounds so the test is quick.
+ */
+test("a stalled download times out per attempt, is retried, and fails with curl's own error", async () => {
+  const sockets: Socket[] = [];
+  let connections = 0;
+  const server = createServer((sock) => { connections += 1; sockets.push(sock); });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as { port: number }).port;
+  const dir = await mkdtemp(path.join(tmpdir(), "bootstrap-stall-"));
+  const cmd = handsBinaryDownloadCmd(path.join(dir, "hands-binary"), 2, 0, `http://127.0.0.1:${port}`, 1, 1);
+  const started = Date.now();
+  try {
+    // The kill bounds the test, not the command: an unbounded curl is killed
+    // here and the assertions below say so.
+    const { code, stderr } = await runSnippet(cmd, { PATH: "/usr/bin:/bin", [HANDS_TOKEN_ENV]: TOKEN }, {
+      timeout: 20_000, killSignal: "SIGKILL",
+    });
+    const elapsed = Date.now() - started;
+    assert.equal(code, 1, `the download must fail on its own, not be killed (stderr=${stderr})`);
+    assert.ok(elapsed < 15_000, `two 1s attempts took ${elapsed}ms`);
+    assert.equal(connections, 2, "each attempt opened its own connection");
+    assert.match(stderr, /hands-binary download failed after 2 attempts: curl: \(28\) /);
+  } finally {
+    for (const s of sockets) s.destroy();
+    server.close();
+  }
+});
+
+/**
+ * Every attempt, the gaps between them and the launch that follows must fit in
+ * the one exec that runs the source. A bound read from the argv curl actually
+ * receives, so a flag that is lost in the command fails here too.
+ */
+test("the default download is bounded per attempt and its attempts fit the exec budget", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "bootstrap-bound-"));
+  const argvOut = path.join(dir, "argv");
+  await writeFile(path.join(dir, "curl"), `#!/bin/sh\nfor a in "$@"; do printf '%s\\n' "$a"; done > ${argvOut}\n`);
+  await chmod(path.join(dir, "curl"), 0o755);
+  const cmd = handsBinaryDownloadCmd(path.join(dir, "hands-binary"));
+  const { code } = await runSnippet(cmd, { PATH: `${dir}:/usr/bin:/bin`, [HANDS_TOKEN_ENV]: TOKEN });
+  assert.equal(code, 0);
+  const argv = (await readFile(argvOut, "utf8")).split("\n").filter(Boolean);
+  const flag = (name: string) => {
+    const i = argv.indexOf(name);
+    assert.ok(i >= 0, `${name} missing from curl argv: ${argv.join(" ")}`);
+    const v = Number(argv[i + 1]);
+    assert.ok(Number.isFinite(v) && v > 0, `${name} ${argv[i + 1]}`);
+    return v;
+  };
+  const maxTime = flag("--max-time");
+  const connect = flag("--connect-timeout");
+  assert.ok(connect <= maxTime, "connecting is part of the attempt");
+  assert.ok(maxTime >= 25, `--max-time ${maxTime}s leaves no headroom over the 21s downloads measured`);
+  // curl's own retries would run each bounded attempt up to four times over.
+  assert.ok(!argv.some((a) => a.startsWith("--retry")), argv.join(" "));
+  const budget = /^(\d+)s$/.exec(HANDS_BOOTSTRAP_START_TIMEOUT);
+  assert.ok(budget, HANDS_BOOTSTRAP_START_TIMEOUT);
+  const worst = HANDS_DOWNLOAD_ATTEMPTS * maxTime
+    + (HANDS_DOWNLOAD_ATTEMPTS - 1) * HANDS_DOWNLOAD_RETRY_DELAY_SEC
+    + 1 + HANDS_ENV_FILE_WAIT_SEC; // launch liveness check, then the env-file guard
+  assert.ok(worst < Number(budget[1]), `worst case ${worst}s does not fit the ${budget[1]}s exec budget`);
 });
 
 /** Run the real commands in a local shell, so the expansion is proven, not assumed. */
