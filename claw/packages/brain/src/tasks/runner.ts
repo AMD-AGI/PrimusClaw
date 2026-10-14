@@ -1343,8 +1343,8 @@ class TaskRunner {
    * at most every SCRIPT_PROGRESS_REFRESH_MS, enough to keep the entry inside
    * its TTL through a step that waits for a day.
    *
-   * Not skipped once the run is aborted, unlike a turn's checkpoint: a drain
-   * lets the step in flight finish, and that step has to be recorded as done or
+   * Not skipped once the run is aborted, unlike a turn's checkpoint: a step
+   * that finished just as a drain began still has to be recorded as done, or
    * the worker taking over runs it again.
    *
    * Only into a sealed (v4) checkpoint. Progress is tool results verbatim --
@@ -3885,11 +3885,7 @@ class TaskRunner {
       logger.warn({ sessionId: this.sessionId, deadlineAt: raw }, "task.deadline_unparseable");
       return () => {};
     }
-    // Already past it on arrival: a redelivery of a task whose budget expired
-    // while it was queued. Firing on the next tick rather than immediately so
-    // the abort lands after run() has entered its try block and can catch it.
-    const delay = Math.max(0, deadlineMs - Date.now());
-    const timer = setTimeout(() => {
+    const fire = (): void => {
       if (this.abortCtrl.signal.aborted) return;
       logger.warn(
         {
@@ -3903,7 +3899,18 @@ class TaskRunner {
         "task.deadline_exceeded",
       );
       this.abortCtrl.abort(DEADLINE_EXCEEDED_ABORT_REASON);
-    }, delay);
+    };
+    // Already past it on arrival: a redelivery, or a hand-over, of a run whose
+    // budget expired meanwhile. Aborted now rather than on the next tick, which
+    // a run with nothing left to do -- a script taken over after its last step
+    // -- could finish ahead of, reporting a completion after its deadline. This
+    // is called from executeRun, inside run()'s try, so the abort is caught.
+    const delay = deadlineMs - Date.now();
+    if (delay <= 0) {
+      fire();
+      return () => {};
+    }
+    const timer = setTimeout(fire, delay);
     timer.unref();
     return () => clearTimeout(timer);
   }
@@ -4258,10 +4265,10 @@ class TaskRunner {
 
     // MCP SDK 1.12 does not propagate AbortSignal through callTool.
     //
-    // A script is handed over here even when the step the drain let finish was
-    // its last: that step is recorded as done, so the next worker runs nothing
-    // and reports the outcome with the time it needs, rather than this pod
-    // racing its grace period through the terminal path.
+    // A script is handed over here even if it reached its end just as the
+    // drain began: every step it finished is recorded, so the next worker runs
+    // nothing again and reports the outcome with the time it needs, rather than
+    // this pod racing its grace period through the terminal path.
     if (this.abortCtrl.signal.reason === SIGTERM_ABORT_REASON) {
       logger.info(
         { sessionId: this.sessionId, messageId: this.messageId,

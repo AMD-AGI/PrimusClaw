@@ -15,12 +15,11 @@
  *      sandbox, with the earlier steps' captures; no finished step runs again
  *   T3 a takeover that finds the sandbox gone fails the run, saying so, and
  *      issues no tool call into the new sandbox
- *   T4 a drain lets a single-call step finish and records it, so the successor
- *      does not run it a second time
- *   T5 a drain that lands in the last step records it as done and hands over;
- *      the successor runs nothing and reports the outcome
- *   T6 a resumed repeating step keeps the bounds it began with, and a drain
- *      waits for a single call only so long
+ *   T4 a drain cuts off the step in flight; the successor runs that step again
+ *      and none of the steps that had finished
+ *   T5 a run drained as its last step finishes is handed over; the successor
+ *      runs nothing, reports the outcome, and still honours the deadline
+ *   T6 a resumed repeating step keeps the bounds it began with
  *
  * Run with sealed (v4) checkpoints, the only format progress is written to.
  */
@@ -108,39 +107,36 @@ test("T3 a takeover that finds its sandbox gone fails the run and says why", asy
   assert.deepEqual(second.republished, []);
 });
 
-test("T4 a drain lets a single-call step finish, and the successor does not run it again", async () => {
+test("T4 a drain cuts off the step in flight; the successor runs that step again, and only it", async () => {
   const { kv } = sharedKv();
   const script: ScriptStep[] = [
-    { name: "bash", arguments: { command: "./migrate.sh" }, captures: "migrated" } as ScriptStep,
+    { name: "bash", arguments: { command: "./prepare.sh" }, captures: "prepared" } as ScriptStep,
+    { name: "bash", arguments: { command: "./migrate.sh" } } as ScriptStep,
     { name: "bash", arguments: { command: "./report.sh" } } as ScriptStep,
   ];
-  let callSawAbort = false;
   const first = await runWorker({
     kvCkpt: kv, script, sandboxCreated: true, seq: 30,
     answer: async (_name, args, w, signal) => {
-      // The rollout arrives while the first, non-repeatable step is running.
+      if (args.command === "./prepare.sh") return { text: "prepared" };
+      // The rollout arrives while the second step is running.
       w.abort.abort(SIGTERM_ABORT_REASON);
-      await new Promise((r) => setTimeout(r, 20));
-      callSawAbort = signal?.aborted === true;
-      return { text: `ran ${String(args.command)}` };
+      return untilAborted(signal);
     },
   });
-  assert.equal(callSawAbort, false, "the drain cut off a call that may already have done its work");
-  assert.deepEqual(first.calls.map((c) => c.args.command), ["./migrate.sh"],
-    "a draining worker must not start the next step");
+  assert.deepEqual(first.calls.map((c) => c.args.command), ["./prepare.sh", "./migrate.sh"]);
   assert.equal(first.republished.length, 1);
 
   const second = await runWorker({
     kvCkpt: kv, script, sandboxCreated: false, seq: 31,
     answer: async (_name, args) => ({ text: `ran ${String(args.command)}` }),
   });
-  assert.deepEqual(second.calls.map((c) => c.args.command), ["./report.sh"],
-    "the finished step ran twice");
+  assert.deepEqual(second.calls.map((c) => c.args.command), ["./migrate.sh", "./report.sh"],
+    "a finished step ran twice, or the step that was cut off was skipped");
   assert.equal(second.done[0].abortReason, "completed");
-  assert.match(second.done[0].captures?.migrated ?? "", /ran \.\/migrate\.sh/);
+  assert.match(second.done[0].captures?.prepared ?? "", /prepared/);
 });
 
-test("T4b a user's Stop still cuts a single-call step off at once", async () => {
+test("T4b a user's Stop cuts the call off and is not handed over", async () => {
   const { kv } = sharedKv();
   let sawAbort = false;
   const w = await runWorker({
@@ -153,20 +149,26 @@ test("T4b a user's Stop still cuts a single-call step off at once", async () => 
       return untilAborted(signal);
     },
   });
-  assert.equal(sawAbort, true, "only a drain is let finish; a Stop is not");
+  assert.equal(sawAbort, true, "a Stop must reach the call in flight");
   assert.deepEqual(w.republished, []);
 });
 
-test("T5 a drain in the last step records it and hands over; the successor only reports", async () => {
-  const { kv } = sharedKv();
+/** A script whose only step finishes, with the drain arriving as it is recorded. */
+async function drainedAfterLastStep(kv: import("nats").KV) {
   const script = [{ name: "bash", arguments: { command: "./last.sh" }, captures: "out" } as ScriptStep];
   const first = await runWorker({
     kvCkpt: kv, script, sandboxCreated: true, seq: 40,
-    answer: async (_name, _args, worker) => {
-      worker.abort.abort(SIGTERM_ABORT_REASON);
-      return { text: "last done" };
+    answer: async () => ({ text: "last done" }),
+    onEmit: (event, w) => {
+      if (event.type === "scriptStep" && event.status === "completed") w.abort.abort(SIGTERM_ABORT_REASON);
     },
   });
+  return { script, first };
+}
+
+test("T5 a run drained as its last step finishes is handed over; the successor only reports", async () => {
+  const { kv } = sharedKv();
+  const { script, first } = await drainedAfterLastStep(kv);
   assert.deepEqual(first.done, [],
     "a draining pod must not race its grace period through the terminal path");
   assert.equal(first.republished.length, 1);
@@ -180,6 +182,21 @@ test("T5 a drain in the last step records it and hands over; the successor only 
   assert.equal(second.done[0].abortReason, "completed");
   assert.equal(second.done[0].finalText, "last done", "the successor must report the step's own result");
   assert.match(second.done[0].captures?.out ?? "", /last done/);
+});
+
+test("T5c a successor with nothing left to run still honours a deadline that passed meanwhile", async () => {
+  const { kv } = sharedKv();
+  const { script } = await drainedAfterLastStep(kv);
+  const second = await runWorker({
+    kvCkpt: kv, script, sandboxCreated: false, seq: 42,
+    requestExtra: { deadline_at: new Date(Date.now() - 1_000).toISOString() },
+    answer: async () => ({ text: "ran again" }),
+  });
+  assert.deepEqual(second.calls, []);
+  assert.equal(second.done.length, 1);
+  assert.notEqual(second.done[0].abortReason, "completed",
+    "a run past its deadline was reported complete");
+  assert.match(second.done[0].failureReason ?? second.done[0].finalText ?? "", /run_budget_exhausted|budget/);
 });
 
 test("T5b the first call of a repetition records its start at once, inside the refresh interval", async () => {
@@ -257,36 +274,4 @@ test("T6c progress is reported after every finished step", async () => {
   const hands = { async callToolFull() { return { text: "ok", structured: undefined, isError: false }; } };
   await runScript(req, { hands: hands as never, onProgress: async (p) => { seen.push(p.step); } }, async () => {});
   assert.deepEqual(seen, [1, 2]);
-});
-
-test("T6d a drain gives up on a single call that will not come back in time", async () => {
-  const ctl = new AbortController();
-  const req = {
-    session_id: "s", task_id: "t", message_id: "m", user_id: "u", mode: "script",
-    script: [
-      { name: "bash", arguments: { command: "./hangs.sh" } },
-      { name: "bash", arguments: { command: "./next.sh" } },
-    ],
-  } as unknown as ExecuteRequest;
-  const seen: number[] = [];
-  let cutOff = false;
-  const hands = {
-    async callToolFull(_n: string, _a: unknown, signal?: AbortSignal) {
-      ctl.abort(SIGTERM_ABORT_REASON);
-      // Bounded, so a drain that never cuts the call off fails here rather than hanging.
-      await Promise.race([
-        untilAborted(signal).catch(() => { cutOff = true; }),
-        new Promise((r) => setTimeout(r, 2_000)),
-      ]);
-      throw new Error("This operation was aborted");
-    },
-  };
-  const result = await runScript(req, {
-    hands: hands as never, signal: ctl.signal, drainStepWaitMs: 20,
-    onProgress: async (p) => { seen.push(p.step); },
-  }, async () => {});
-  assert.equal(cutOff, true, "an unbounded wait outlives the pod's grace and nothing is handed over");
-  assert.equal(result.abortReason, "cancelled",
-    "a call cut off by the drain is not the step's answer: the run must stop, to be handed over");
-  assert.deepEqual(seen, [], "a step that was cut off must not be recorded as finished");
 });

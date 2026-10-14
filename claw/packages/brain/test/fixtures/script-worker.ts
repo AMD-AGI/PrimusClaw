@@ -83,6 +83,8 @@ export async function runWorker(opts: {
   sandboxCreated: boolean;
   seq: number;
   requestExtra?: Record<string, unknown>;
+  /** Sees every event the run emits, after the fact; may raise the drain. */
+  onEmit?: (event: Record<string, unknown>, w: Worker) => void;
   answer: (name: string, args: Record<string, unknown>, w: Worker, signal?: AbortSignal) => Promise<Answer>;
 }): Promise<Worker> {
   const w: Worker = {
@@ -140,7 +142,9 @@ export async function runWorker(opts: {
   };
   runner.bindTaskRunnerDeps({
     kv: sharedKv().kv, kvCkpt: opts.kvCkpt,
-    emitter: { async emit() {} } as never,
+    emitter: {
+      async emit(_sid: string, event: Record<string, unknown>) { opts.onEmit?.(event, w); },
+    } as never,
     engine: { async execute() { throw new Error("a script run must not reach the model engine"); } } as never,
     sideEffects,
   });
@@ -178,4 +182,3 @@ export function untilAborted(signal?: AbortSignal): Promise<never> {
     signal?.addEventListener("abort", () => reject(new Error("This operation was aborted")), { once: true });
   });
 }
-

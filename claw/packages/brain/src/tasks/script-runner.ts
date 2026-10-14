@@ -26,7 +26,6 @@ import type {
 import type { HandsClient } from "../clients/hands.js";
 import { callBackendMcpTool } from "../clients/backend-mcp.js";
 import { getPluginToolScope } from "../tools/scope.js";
-import { SIGTERM_ABORT_REASON } from "./abort-registry.js";
 
 const logger = pino({ name: "script-runner" });
 const WAIT_EXTERNAL_SENTINEL = "AKA_WAIT_EXTERNAL";
@@ -44,19 +43,6 @@ const WAIT_EXTERNAL_SENTINEL = "AKA_WAIT_EXTERNAL";
 const REPEAT_TRANSPORT_LOSS_BUDGET_MS = 120_000;
 /** Ceiling on the doubling pause between re-sends of a lost call. */
 const REPEAT_TRANSPORT_MAX_BACKOFF_MS = 15_000;
-
-/**
- * How long a drain waits for a single-call step to come back before cutting it
- * off.
- *
- * The pod's termination grace is 300s, and the hand-over has to fit inside it
- * after the step returns -- a pod killed while still waiting hands nothing over,
- * and the run is lost exactly as before. 120s is what a foreground command is
- * already kept under (the Router proxy's header timeout), so an ordinary step
- * finishes well inside it; one that does not is cut off and run again by the
- * next worker, which is the better of the two ways to fail.
- */
-const DRAIN_STEP_WAIT_MS = 120_000;
 
 /**
  * Where a script run stands: what another worker needs to carry it on.
@@ -91,8 +77,6 @@ export interface ScriptRunCtx {
   signal?: AbortSignal;
   /** Overrides REPEAT_TRANSPORT_LOSS_BUDGET_MS; tests set it so a bound is reached in milliseconds. */
   transportLossBudgetMs?: number;
-  /** Overrides DRAIN_STEP_WAIT_MS, for the same reason. */
-  drainStepWaitMs?: number;
   /** Progress a previous worker recorded for this run; the run carries on from it. */
   resume?: ScriptProgress;
   /**
@@ -224,48 +208,6 @@ function sleep(ms: number, signal?: AbortSignal): Promise<boolean> {
 }
 
 /**
- * The run's signal, except that a drain does not reach it.
- *
- * Given to a step that makes one call. A drain (SIGTERM) means another worker
- * will carry the run on, and it can only start after a step that has finished:
- * a call cut off part-way may still have done its work in the sandbox, and the
- * successor cannot tell, so it would run it again. The wait is bounded by
- * `waitMs` (see DRAIN_STEP_WAIT_MS) so the hand-over still fits in the pod's
- * grace; `cutOff` says the bound was reached and the call's answer is not the
- * step's. A repeating step does not need this -- calling it again is what it
- * does -- and any other abort, a user's Stop above all, cuts the call off at
- * once.
- */
-function signalIgnoringDrain(
-  signal: AbortSignal | undefined, waitMs: number,
-): { signal?: AbortSignal; done: () => void; cutOff: () => boolean } {
-  if (!signal) return { done: () => {}, cutOff: () => false };
-  const ctl = new AbortController();
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  let cut = false;
-  const onAbort = () => {
-    if (signal.reason !== SIGTERM_ABORT_REASON) {
-      ctl.abort(signal.reason);
-      return;
-    }
-    timer = setTimeout(() => {
-      cut = true;
-      ctl.abort(signal.reason);
-    }, waitMs);
-  };
-  if (signal.aborted) onAbort();
-  else signal.addEventListener("abort", onAbort, { once: true });
-  return {
-    signal: ctl.signal,
-    done: () => {
-      signal.removeEventListener("abort", onAbort);
-      if (timer) clearTimeout(timer);
-    },
-    cutOff: () => cut,
-  };
-}
-
-/**
  * Whether a repetition's condition holds over the step's structured result.
  *
  * A miss is not satisfaction: a tool that returned no structured result, or one
@@ -363,10 +305,6 @@ export async function runScript(
       );
     }
   };
-  // A drain lets a single-call step finish (see signalIgnoringDrain); this is
-  // what tells the rest of the step that the call was allowed to come back.
-  const draining = (): boolean =>
-    ctx.signal?.aborted === true && ctx.signal.reason === SIGTERM_ABORT_REASON;
 
   await ctx.fireHook?.("SessionStart", { mode: "script", task_id: request.task_id ?? "" });
   if (resume) {
@@ -472,10 +410,6 @@ export async function runScript(
       const attemptSignal = budgetSignal && ctx.signal
         ? AbortSignal.any([ctx.signal, budgetSignal])
         : (budgetSignal ?? ctx.signal);
-      const oneCall = repeat
-        ? null
-        : signalIgnoringDrain(ctx.signal, ctx.drainStepWaitMs ?? DRAIN_STEP_WAIT_MS);
-      const callSignal = oneCall ? oneCall.signal : attemptSignal;
       try {
         if (scope === "backend") {
           if (!request.backend_mcp_url) throw new Error("backend_mcp_url not provided for scope=backend tool");
@@ -485,7 +419,7 @@ export async function runScript(
             request.backend_internal_token,
             step.name,
             args,
-            { timeoutMs: attemptTimeoutMs, signal: callSignal },
+            { timeoutMs: attemptTimeoutMs, signal: attemptSignal },
           );
           if (out.wait_external) {
             waitExternal = true;
@@ -514,7 +448,7 @@ export async function runScript(
           // The step's position: a replay re-enters at the same one, which is
           // what lets a background start there recognise its own retry.
           const out = await ctx.hands.callToolFull(
-            step.name, handsArgs, callSignal, { stepIdentity: `script:${i}` },
+            step.name, handsArgs, attemptSignal, { stepIdentity: `script:${i}` },
           );
           resultText = out.text;
           structured = out.structured;
@@ -532,8 +466,6 @@ export async function runScript(
       } catch (callErr) {
         stepError = callErr instanceof Error ? callErr.message : String(callErr);
         lostInTransit = true;
-      } finally {
-        oneCall?.done();
       }
 
       toolStats.total_calls++;
@@ -541,10 +473,12 @@ export async function runScript(
 
       // Cancellation and the wall-clock bound outrank a late tool answer. A
       // completed-looking result after either event must not advance the DAG.
-      // A drain is the exception for a single-call step, whose call it let
-      // finish: that answer is the step's, and it is recorded below before the
-      // run stops at the next step.
-      if (ctx.signal?.aborted && !(oneCall && draining() && !oneCall.cutOff())) {
+      // Nor is it recorded as progress: a step cut off part-way is run again by
+      // whoever takes the run over, since nothing can say whether it took
+      // effect. A background start resolves to the shell it already started
+      // (by its step identity), and a repeating step is meant to be called
+      // again; a one-off command is the case that may run twice.
+      if (ctx.signal?.aborted) {
         return failResult(
           "script aborted by signal", "cancelled",
           captures, artifacts, toolStats, startedAt,
