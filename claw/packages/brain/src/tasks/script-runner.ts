@@ -26,6 +26,7 @@ import type {
 import type { HandsClient } from "../clients/hands.js";
 import { callBackendMcpTool } from "../clients/backend-mcp.js";
 import { getPluginToolScope } from "../tools/scope.js";
+import { SIGTERM_ABORT_REASON } from "./abort-registry.js";
 
 const logger = pino({ name: "script-runner" });
 const WAIT_EXTERNAL_SENTINEL = "AKA_WAIT_EXTERNAL";
@@ -44,6 +45,32 @@ const REPEAT_TRANSPORT_LOSS_BUDGET_MS = 120_000;
 /** Ceiling on the doubling pause between re-sends of a lost call. */
 const REPEAT_TRANSPORT_MAX_BACKOFF_MS = 15_000;
 
+/**
+ * Where a script run stands: what another worker needs to carry it on.
+ *
+ * A script has no conversation to replay. Its state is the step it is on and
+ * what the steps before it captured, so that is what the run's checkpoint holds.
+ * A worker that takes the run over -- the pod it was on was replaced in a
+ * rollout, or died -- starts at that step rather than the first, and a step that
+ * already finished is not run a second time.
+ */
+export interface ScriptProgress {
+  /** The step to run next. Every step before it has finished. */
+  step: number;
+  captures: Record<string, string>;
+  /** The last finished step's result, which `${prev.*}` and the final text read. */
+  last_text: string;
+  last_structured?: unknown;
+  /**
+   * For a repeating step that has begun: when the repetition started and how
+   * many calls it has made. Carried so a takeover keeps the step's own bounds:
+   * `max_seconds` and `max_attempts` budget the step, not each worker that runs
+   * part of it.
+   */
+  repeat_started_at?: number;
+  repeat_attempts?: number;
+}
+
 export interface ScriptRunCtx {
   hands?: HandsClient | null;
   /** AgentHook fire(...) function from `agent/hooks.ts`; optional for the harness. */
@@ -51,6 +78,14 @@ export interface ScriptRunCtx {
   signal?: AbortSignal;
   /** Overrides REPEAT_TRANSPORT_LOSS_BUDGET_MS; tests set it so a bound is reached in milliseconds. */
   transportLossBudgetMs?: number;
+  /** Progress a previous worker recorded for this run; the run carries on from it. */
+  resume?: ScriptProgress;
+  /**
+   * Told where the run stands after each finished step, and on each call of a
+   * repeating step. A failure to record it is logged, not raised: the run itself
+   * is unaffected, only how far back a takeover would have to start.
+   */
+  onProgress?: (progress: ScriptProgress) => Promise<void>;
 }
 
 function zeroTokens(): TokenUsage {
@@ -174,6 +209,28 @@ function sleep(ms: number, signal?: AbortSignal): Promise<boolean> {
 }
 
 /**
+ * The run's signal, except that a drain does not reach it.
+ *
+ * Given to a step that makes one call. A drain (SIGTERM) means another worker
+ * will carry the run on, and it can only start after a step that has finished:
+ * a call cut off part-way may still have done its work in the sandbox, and the
+ * successor cannot tell, so it would run it again. Letting the call come back
+ * costs at most the step's own timeout, which is what bounds it anyway. A
+ * repeating step does not need this -- calling it again is what it does -- and
+ * any other abort, a user's Stop above all, still cuts the call off at once.
+ */
+function signalIgnoringDrain(signal: AbortSignal | undefined): { signal?: AbortSignal; done: () => void } {
+  if (!signal) return { done: () => {} };
+  const ctl = new AbortController();
+  const onAbort = () => {
+    if (signal.reason !== SIGTERM_ABORT_REASON) ctl.abort(signal.reason);
+  };
+  if (signal.aborted) onAbort();
+  else signal.addEventListener("abort", onAbort, { once: true });
+  return { signal: ctl.signal, done: () => signal.removeEventListener("abort", onAbort) };
+}
+
+/**
  * Whether a repetition's condition holds over the step's structured result.
  *
  * A miss is not satisfaction: a tool that returned no structured result, or one
@@ -253,15 +310,35 @@ export async function runScript(
 ): Promise<ExecuteResult> {
   const startedAt = nowMs();
   const script = request.script ?? [];
-  const captures: Record<string, string> = {};
+  const resume = ctx.resume;
+  const captures: Record<string, string> = { ...(resume?.captures ?? {}) };
   const toolStats: ToolStats = { total_calls: 0, error_calls: 0, by_tool: {} };
   const artifacts: Artifact[] = [];
-  let lastResultText = "";
-  let lastStructured: unknown = undefined;
+  let lastResultText = resume?.last_text ?? "";
+  let lastStructured: unknown = resume?.last_structured;
+  const firstStep = Math.max(0, Math.min(resume?.step ?? 0, script.length));
+  const report = async (progress: ScriptProgress): Promise<void> => {
+    if (!ctx.onProgress) return;
+    try {
+      await ctx.onProgress(progress);
+    } catch (err) {
+      logger.warn(
+        { step: progress.step, err: err instanceof Error ? err.message : String(err) },
+        "script.progress_write_failed",
+      );
+    }
+  };
+  // A drain lets a single-call step finish (see signalIgnoringDrain); this is
+  // what tells the rest of the step that the call was allowed to come back.
+  const draining = (): boolean =>
+    ctx.signal?.aborted === true && ctx.signal.reason === SIGTERM_ABORT_REASON;
 
   await ctx.fireHook?.("SessionStart", { mode: "script", task_id: request.task_id ?? "" });
+  if (resume) {
+    logger.info({ task_id: request.task_id, step: firstStep, steps: script.length }, "script.resumed");
+  }
 
-  for (let i = 0; i < script.length; i++) {
+  for (let i = firstStep; i < script.length; i++) {
     if (ctx.signal?.aborted) {
       return failResult(
         "script aborted by signal", "cancelled",
@@ -304,8 +381,13 @@ export async function runScript(
     // loop wraps exactly one step's call: nothing nests, so the executor stays
     // the flat pass over one array that every other stage assumes it is.
     const repeat = step.repeat;
-    const repeatDeadline = repeat ? nowMs() + repeat.max_seconds * 1000 : 0;
-    let attempt = 0;
+    // A takeover re-enters the step it was on, and keeps that step's bounds.
+    const resumedHere = resume !== undefined && i === resume.step;
+    const repeatStartedAt = resumedHere && resume.repeat_started_at !== undefined
+      ? resume.repeat_started_at
+      : nowMs();
+    const repeatDeadline = repeat ? repeatStartedAt + repeat.max_seconds * 1000 : 0;
+    let attempt = repeat && resumedHere ? Math.max(0, resume.repeat_attempts ?? 0) : 0;
     let repeatStopped = "";
     let transportLosses = 0;
     let firstLossAt = 0;
@@ -329,8 +411,20 @@ export async function runScript(
         repeatStopped = "max_seconds";
         break;
       }
+      // Reachable only on a takeover: the worker before this one may have made
+      // the last call the step was allowed.
+      if (repeat && attempt >= repeat.max_attempts) {
+        repeatStopped = "max_attempts";
+        break;
+      }
 
       attempt++;
+      if (repeat) {
+        await report({
+          step: i, captures: { ...captures }, last_text: lastResultText, last_structured: lastStructured,
+          repeat_started_at: repeatStartedAt, repeat_attempts: attempt,
+        });
+      }
       resultText = "";
       structured = undefined;
       stepError = undefined;
@@ -343,6 +437,8 @@ export async function runScript(
       const attemptSignal = budgetSignal && ctx.signal
         ? AbortSignal.any([ctx.signal, budgetSignal])
         : (budgetSignal ?? ctx.signal);
+      const oneCall = repeat ? null : signalIgnoringDrain(ctx.signal);
+      const callSignal = oneCall ? oneCall.signal : attemptSignal;
       try {
         if (scope === "backend") {
           if (!request.backend_mcp_url) throw new Error("backend_mcp_url not provided for scope=backend tool");
@@ -352,7 +448,7 @@ export async function runScript(
             request.backend_internal_token,
             step.name,
             args,
-            { timeoutMs: attemptTimeoutMs, signal: attemptSignal },
+            { timeoutMs: attemptTimeoutMs, signal: callSignal },
           );
           if (out.wait_external) {
             waitExternal = true;
@@ -381,7 +477,7 @@ export async function runScript(
           // The step's position: a replay re-enters at the same one, which is
           // what lets a background start there recognise its own retry.
           const out = await ctx.hands.callToolFull(
-            step.name, handsArgs, attemptSignal, { stepIdentity: `script:${i}` },
+            step.name, handsArgs, callSignal, { stepIdentity: `script:${i}` },
           );
           resultText = out.text;
           structured = out.structured;
@@ -399,6 +495,8 @@ export async function runScript(
       } catch (callErr) {
         stepError = callErr instanceof Error ? callErr.message : String(callErr);
         lostInTransit = true;
+      } finally {
+        oneCall?.done();
       }
 
       toolStats.total_calls++;
@@ -406,7 +504,10 @@ export async function runScript(
 
       // Cancellation and the wall-clock bound outrank a late tool answer. A
       // completed-looking result after either event must not advance the DAG.
-      if (ctx.signal?.aborted) {
+      // A drain is the exception for a single-call step, whose call it let
+      // finish: that answer is the step's, and it is recorded below before the
+      // run stops at the next step.
+      if (ctx.signal?.aborted && !(oneCall && draining())) {
         return failResult(
           "script aborted by signal", "cancelled",
           captures, artifacts, toolStats, startedAt,
@@ -538,6 +639,7 @@ export async function runScript(
     }
     lastResultText = resultText ?? lastResultText;
     lastStructured = structured;
+    await report({ step: i + 1, captures: { ...captures }, last_text: lastResultText, last_structured: lastStructured });
   }
 
   await ctx.fireHook?.("Stop", { mode: "script" });
