@@ -44,6 +44,32 @@ const REPEAT_TRANSPORT_LOSS_BUDGET_MS = 120_000;
 /** Ceiling on the doubling pause between re-sends of a lost call. */
 const REPEAT_TRANSPORT_MAX_BACKOFF_MS = 15_000;
 
+/**
+ * Where a script run stands: what another worker needs to carry it on.
+ *
+ * A script has no conversation to replay. Its state is the step it is on and
+ * what the steps before it captured, so that is what the run's checkpoint holds.
+ * A worker that takes the run over -- the pod it was on was replaced in a
+ * rollout, or died -- starts at that step rather than the first, and a step that
+ * already finished is not run a second time.
+ */
+export interface ScriptProgress {
+  /** The step to run next. Every step before it has finished. */
+  step: number;
+  captures: Record<string, string>;
+  /** The last finished step's result, which `${prev.*}` and the final text read. */
+  last_text: string;
+  last_structured?: unknown;
+  /**
+   * For a repeating step that has begun: when the repetition started and how
+   * many calls it has made. Carried so a takeover keeps the step's own bounds:
+   * `max_seconds` and `max_attempts` budget the step, not each worker that runs
+   * part of it.
+   */
+  repeat_started_at?: number;
+  repeat_attempts?: number;
+}
+
 export interface ScriptRunCtx {
   hands?: HandsClient | null;
   /** AgentHook fire(...) function from `agent/hooks.ts`; optional for the harness. */
@@ -51,6 +77,14 @@ export interface ScriptRunCtx {
   signal?: AbortSignal;
   /** Overrides REPEAT_TRANSPORT_LOSS_BUDGET_MS; tests set it so a bound is reached in milliseconds. */
   transportLossBudgetMs?: number;
+  /** Progress a previous worker recorded for this run; the run carries on from it. */
+  resume?: ScriptProgress;
+  /**
+   * Told where the run stands after each finished step, and on each call of a
+   * repeating step. A failure to record it is logged, not raised: the run itself
+   * is unaffected, only how far back a takeover would have to start.
+   */
+  onProgress?: (progress: ScriptProgress) => Promise<void>;
 }
 
 function zeroTokens(): TokenUsage {
@@ -253,15 +287,31 @@ export async function runScript(
 ): Promise<ExecuteResult> {
   const startedAt = nowMs();
   const script = request.script ?? [];
-  const captures: Record<string, string> = {};
+  const resume = ctx.resume;
+  const captures: Record<string, string> = { ...(resume?.captures ?? {}) };
   const toolStats: ToolStats = { total_calls: 0, error_calls: 0, by_tool: {} };
   const artifacts: Artifact[] = [];
-  let lastResultText = "";
-  let lastStructured: unknown = undefined;
+  let lastResultText = resume?.last_text ?? "";
+  let lastStructured: unknown = resume?.last_structured;
+  const firstStep = Math.max(0, Math.min(resume?.step ?? 0, script.length));
+  const report = async (progress: ScriptProgress): Promise<void> => {
+    if (!ctx.onProgress) return;
+    try {
+      await ctx.onProgress(progress);
+    } catch (err) {
+      logger.warn(
+        { step: progress.step, err: err instanceof Error ? err.message : String(err) },
+        "script.progress_write_failed",
+      );
+    }
+  };
 
   await ctx.fireHook?.("SessionStart", { mode: "script", task_id: request.task_id ?? "" });
+  if (resume) {
+    logger.info({ task_id: request.task_id, step: firstStep, steps: script.length }, "script.resumed");
+  }
 
-  for (let i = 0; i < script.length; i++) {
+  for (let i = firstStep; i < script.length; i++) {
     if (ctx.signal?.aborted) {
       return failResult(
         "script aborted by signal", "cancelled",
@@ -304,8 +354,13 @@ export async function runScript(
     // loop wraps exactly one step's call: nothing nests, so the executor stays
     // the flat pass over one array that every other stage assumes it is.
     const repeat = step.repeat;
-    const repeatDeadline = repeat ? nowMs() + repeat.max_seconds * 1000 : 0;
-    let attempt = 0;
+    // A takeover re-enters the step it was on, and keeps that step's bounds.
+    const resumedHere = resume !== undefined && i === resume.step;
+    const repeatStartedAt = resumedHere && resume.repeat_started_at !== undefined
+      ? resume.repeat_started_at
+      : nowMs();
+    const repeatDeadline = repeat ? repeatStartedAt + repeat.max_seconds * 1000 : 0;
+    let attempt = repeat && resumedHere ? Math.max(0, resume.repeat_attempts ?? 0) : 0;
     let repeatStopped = "";
     let transportLosses = 0;
     let firstLossAt = 0;
@@ -329,8 +384,20 @@ export async function runScript(
         repeatStopped = "max_seconds";
         break;
       }
+      // Reachable only on a takeover: the worker before this one may have made
+      // the last call the step was allowed.
+      if (repeat && attempt >= repeat.max_attempts) {
+        repeatStopped = "max_attempts";
+        break;
+      }
 
       attempt++;
+      if (repeat) {
+        await report({
+          step: i, captures: { ...captures }, last_text: lastResultText, last_structured: lastStructured,
+          repeat_started_at: repeatStartedAt, repeat_attempts: attempt,
+        });
+      }
       resultText = "";
       structured = undefined;
       stepError = undefined;
@@ -406,6 +473,11 @@ export async function runScript(
 
       // Cancellation and the wall-clock bound outrank a late tool answer. A
       // completed-looking result after either event must not advance the DAG.
+      // Nor is it recorded as progress: a step cut off part-way is run again by
+      // whoever takes the run over, since nothing can say whether it took
+      // effect. A background start resolves to the shell it already started
+      // (by its step identity), and a repeating step is meant to be called
+      // again; a one-off command is the case that may run twice.
       if (ctx.signal?.aborted) {
         return failResult(
           "script aborted by signal", "cancelled",
@@ -538,6 +610,7 @@ export async function runScript(
     }
     lastResultText = resultText ?? lastResultText;
     lastStructured = structured;
+    await report({ step: i + 1, captures: { ...captures }, last_text: lastResultText, last_structured: lastStructured });
   }
 
   await ctx.fireHook?.("Stop", { mode: "script" });

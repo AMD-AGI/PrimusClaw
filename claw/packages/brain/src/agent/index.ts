@@ -4,6 +4,7 @@
 import type { ExecuteRequest, ExecuteResult, EventCallback, TokenUsage, Message } from "@claw/protocol";
 import type { RunIdentity } from "../tasks/run-identity.js";
 import type { HandsClient } from "../clients/hands.js";
+import type { ScriptProgress } from "../tasks/script-runner.js";
 import pino from "pino";
 
 const logger = pino({ name: "engine" });
@@ -86,6 +87,12 @@ export interface CheckpointState {
    * number may only ever under-report.
    */
   tool_ok_by_name?: Record<string, number>;
+  /**
+   * A `mode=script` run's progress, which is all of its state: a script has no
+   * conversation, so `messages` is empty and `turns_completed` counts finished
+   * steps. Present only on a script run's checkpoint.
+   */
+  script?: ScriptProgress;
 }
 
 /**

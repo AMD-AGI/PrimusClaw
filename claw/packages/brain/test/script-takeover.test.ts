@@ -1,0 +1,277 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+/**
+ * A script run taken over part-way, by the real runner over the real script
+ * executor.
+ *
+ * A DAG script step can run for a day. The pod running it is replaced on every
+ * brain rollout, and the run's queue message has usually aged out of the task
+ * stream by then, so there is nothing for a nak to redeliver. What has to hold:
+ *
+ *   T1 a draining pod hands the run over: lease released, the same request
+ *      published again, the old delivery acked -- not left to a nak
+ *   T2 the worker taking it over continues from the step it was on, in the same
+ *      sandbox, with the earlier steps' captures; no finished step runs again
+ *   T3 a takeover that finds the sandbox gone fails the run, saying so, and
+ *      issues no tool call into the new sandbox
+ *   T4 a drain cuts off the step in flight; the successor runs that step again
+ *      and none of the steps that had finished
+ *   T5 a run drained as its last step finishes is handed over; the successor
+ *      runs nothing, reports the outcome, and still honours the deadline
+ *   T6 a resumed repeating step keeps the bounds it began with
+ *
+ * Run with sealed (v4) checkpoints, the only format progress is written to.
+ */
+import { randomBytes } from "node:crypto";
+
+// Progress is kept only in a sealed checkpoint; see script-takeover-v3 for the
+// plaintext format. Read once at module scope, so set before anything loads.
+process.env.CHECKPOINT_WRITE_VERSION = "4";
+const SEAL_KEY = randomBytes(32);
+process.env.BRAIN_CHECKPOINT_KEY = SEAL_KEY.toString("base64");
+
+import test from "node:test";
+import assert from "node:assert/strict";
+import type { ExecuteRequest, ScriptStep } from "@claw/protocol";
+
+const {
+  runWorker, sharedKv, untilAborted, SIGTERM_ABORT_REASON, START_THEN_WAIT, SUBJECT, PAYLOAD, TASK, SESSION,
+} = await import("./fixtures/script-worker.js");
+const { decodeCheckpoint } = await import("../src/tasks/checkpoint-codec.js");
+const { runScript } = await import("../src/tasks/script-runner.js");
+
+test("T1/T2 a drained run is handed over and continues where it was, in the same sandbox", async () => {
+  const { kv } = sharedKv();
+
+  // The first worker starts the job and is drained while it waits on it.
+  let waits = 0;
+  const first = await runWorker({
+    kvCkpt: kv, script: START_THEN_WAIT, sandboxCreated: true, seq: 10,
+    answer: async (name, _args, w, signal) => {
+      if (name === "bash") return { text: "started sh-live", structured: { shell_id: "sh-live" } };
+      waits += 1;
+      if (waits < 3) return { structured: { finished: false } };
+      w.abort.abort(SIGTERM_ABORT_REASON);
+      return untilAborted(signal);
+    },
+  });
+  assert.deepEqual(first.done, [], "a drained run must not report an outcome");
+  assert.deepEqual(first.released, [{ taskId: TASK, releaseLease: true }],
+    "the lease has to be given back so the next worker's first renewal is not refused");
+  assert.equal(first.republished.length, 1, "the run was not handed over: nothing will pick it up");
+  assert.equal(first.republished[0].subject, SUBJECT);
+  assert.deepEqual(first.republished[0].data, PAYLOAD, "the hand-over must carry the same request");
+  assert.deepEqual(first.delivery.settled, ["ack"],
+    "the old delivery is acked once a copy is out; a nak alone reaches nothing after the stream's max_age");
+
+  // The second worker takes the new message and finds the same sandbox alive.
+  const second = await runWorker({
+    kvCkpt: kv, script: START_THEN_WAIT, sandboxCreated: false, seq: 11,
+    answer: async (name) => {
+      if (name === "bash") return { text: "started sh-NEW", structured: { shell_id: "sh-NEW" } };
+      return { text: "exit 0", structured: { finished: true, exit_code: 0 } };
+    },
+  });
+  assert.deepEqual(second.calls.map((c) => c.name), ["wait"],
+    "the takeover ran a step that had already finished -- the background job would be started twice");
+  assert.equal(second.calls[0].args.shell_id, "sh-live",
+    "the takeover must re-attach to the shell the first worker started, from its capture");
+  assert.equal(second.done.length, 1, "the resumed run never reported");
+  assert.equal(second.done[0].abortReason, "completed");
+  assert.equal(second.done[0].failureReason, undefined);
+  assert.match(second.done[0].captures?.job ?? "", /sh-live/, "the earlier step's capture was lost");
+  assert.deepEqual(second.republished, []);
+});
+
+test("T3 a takeover that finds its sandbox gone fails the run and says why", async () => {
+  const { kv } = sharedKv();
+  await runWorker({
+    kvCkpt: kv, script: START_THEN_WAIT, sandboxCreated: true, seq: 20,
+    answer: async (name, _args, w, signal) => {
+      if (name === "bash") return { text: "started", structured: { shell_id: "sh-live" } };
+      w.abort.abort(SIGTERM_ABORT_REASON);
+      return untilAborted(signal);
+    },
+  });
+
+  // The sandbox died meanwhile: attaching to the session provisioned a new one.
+  const second = await runWorker({
+    kvCkpt: kv, script: START_THEN_WAIT, sandboxCreated: true, seq: 21,
+    answer: async () => ({ structured: { finished: true } }),
+  });
+  assert.deepEqual(second.calls, [],
+    "nothing may run in a new sandbox: the job the later steps wait on is not there");
+  assert.equal(second.done.length, 1, "a lost run must still report, or the DAG waits on it");
+  assert.match(second.done[0].failureReason ?? second.done[0].finalText ?? "", /script_sandbox_lost/);
+  assert.deepEqual(second.republished, []);
+});
+
+test("T4 a drain cuts off the step in flight; the successor runs that step again, and only it", async () => {
+  const { kv } = sharedKv();
+  const script: ScriptStep[] = [
+    { name: "bash", arguments: { command: "./prepare.sh" }, captures: "prepared" } as ScriptStep,
+    { name: "bash", arguments: { command: "./migrate.sh" } } as ScriptStep,
+    { name: "bash", arguments: { command: "./report.sh" } } as ScriptStep,
+  ];
+  const first = await runWorker({
+    kvCkpt: kv, script, sandboxCreated: true, seq: 30,
+    answer: async (_name, args, w, signal) => {
+      if (args.command === "./prepare.sh") return { text: "prepared" };
+      // The rollout arrives while the second step is running.
+      w.abort.abort(SIGTERM_ABORT_REASON);
+      return untilAborted(signal);
+    },
+  });
+  assert.deepEqual(first.calls.map((c) => c.args.command), ["./prepare.sh", "./migrate.sh"]);
+  assert.equal(first.republished.length, 1);
+
+  const second = await runWorker({
+    kvCkpt: kv, script, sandboxCreated: false, seq: 31,
+    answer: async (_name, args) => ({ text: `ran ${String(args.command)}` }),
+  });
+  assert.deepEqual(second.calls.map((c) => c.args.command), ["./migrate.sh", "./report.sh"],
+    "a finished step ran twice, or the step that was cut off was skipped");
+  assert.equal(second.done[0].abortReason, "completed");
+  assert.match(second.done[0].captures?.prepared ?? "", /prepared/);
+});
+
+test("T4b a user's Stop cuts the call off and is not handed over", async () => {
+  const { kv } = sharedKv();
+  let sawAbort = false;
+  const w = await runWorker({
+    kvCkpt: kv,
+    script: [{ name: "bash", arguments: { command: "sleep 600" } } as ScriptStep],
+    sandboxCreated: true, seq: 35,
+    answer: async (_name, _args, worker, signal) => {
+      worker.abort.abort();
+      sawAbort = signal?.aborted === true;
+      return untilAborted(signal);
+    },
+  });
+  assert.equal(sawAbort, true, "a Stop must reach the call in flight");
+  assert.deepEqual(w.republished, []);
+});
+
+/** A script whose only step finishes, with the drain arriving as it is recorded. */
+async function drainedAfterLastStep(kv: import("nats").KV) {
+  const script = [{ name: "bash", arguments: { command: "./last.sh" }, captures: "out" } as ScriptStep];
+  const first = await runWorker({
+    kvCkpt: kv, script, sandboxCreated: true, seq: 40,
+    answer: async () => ({ text: "last done" }),
+    onEmit: (event, w) => {
+      if (event.type === "scriptStep" && event.status === "completed") w.abort.abort(SIGTERM_ABORT_REASON);
+    },
+  });
+  return { script, first };
+}
+
+test("T5 a run drained as its last step finishes is handed over; the successor only reports", async () => {
+  const { kv } = sharedKv();
+  const { script, first } = await drainedAfterLastStep(kv);
+  assert.deepEqual(first.done, [],
+    "a draining pod must not race its grace period through the terminal path");
+  assert.equal(first.republished.length, 1);
+
+  const second = await runWorker({
+    kvCkpt: kv, script, sandboxCreated: false, seq: 41,
+    answer: async () => ({ text: "ran again" }),
+  });
+  assert.deepEqual(second.calls, [], "the finished last step ran a second time");
+  assert.equal(second.done.length, 1);
+  assert.equal(second.done[0].abortReason, "completed");
+  assert.equal(second.done[0].finalText, "last done", "the successor must report the step's own result");
+  assert.match(second.done[0].captures?.out ?? "", /last done/);
+});
+
+test("T5c a successor with nothing left to run still honours a deadline that passed meanwhile", async () => {
+  const { kv } = sharedKv();
+  const { script } = await drainedAfterLastStep(kv);
+  const second = await runWorker({
+    kvCkpt: kv, script, sandboxCreated: false, seq: 42,
+    requestExtra: { deadline_at: new Date(Date.now() - 1_000).toISOString() },
+    answer: async () => ({ text: "ran again" }),
+  });
+  assert.deepEqual(second.calls, []);
+  assert.equal(second.done.length, 1);
+  assert.notEqual(second.done[0].abortReason, "completed",
+    "a run past its deadline was reported complete");
+  assert.match(second.done[0].failureReason ?? second.done[0].finalText ?? "", /run_budget_exhausted|budget/);
+});
+
+test("T5b the first call of a repetition records its start at once, inside the refresh interval", async () => {
+  const { kv, store } = sharedKv();
+  const before = Date.now();
+  await runWorker({
+    kvCkpt: kv, script: START_THEN_WAIT, sandboxCreated: true, seq: 45,
+    answer: async (name, _args, w, signal) => {
+      if (name === "bash") return { text: "started", structured: { shell_id: "sh-live" } };
+      w.abort.abort(SIGTERM_ABORT_REASON);
+      return untilAborted(signal);
+    },
+  });
+  const bytes = store.get(`task-ckpt.${SESSION}.${TASK}`);
+  assert.ok(bytes, "no checkpoint was written");
+  const decoded = decodeCheckpoint(bytes, SEAL_KEY, {
+    sessionId: SESSION, messageId: TASK, userId: "u1",
+  });
+  assert.ok(decoded.ok, "the checkpoint did not open");
+  const progress = decoded.value.state.script;
+  assert.equal(progress?.step, 1);
+  assert.ok((progress?.repeat_started_at ?? 0) >= before,
+    "the repetition's start was not recorded, so a takeover would grant the step its whole budget again");
+  assert.equal(progress?.repeat_attempts, 1);
+});
+
+// ---------------------------------------------------------------------------
+// The executor alone: a resumed repeating step keeps the bounds it began with.
+// ---------------------------------------------------------------------------
+
+function waitOnly(max: { attempts: number; seconds: number }): ExecuteRequest {
+  return {
+    session_id: "s", task_id: "t", message_id: "m", user_id: "u", mode: "script",
+    script: [{
+      name: "wait", arguments: { shell_id: "sh" },
+      repeat: { until: { path: "finished", equals: true }, max_attempts: max.attempts, max_seconds: max.seconds },
+    }],
+  } as unknown as ExecuteRequest;
+}
+
+const neverDone = {
+  calls: 0,
+  async callToolFull() { this.calls += 1; return { text: "", structured: { finished: false }, isError: false }; },
+};
+
+test("T6 a resumed repeat counts the time it already ran against max_seconds", async () => {
+  const hands = { ...neverDone, calls: 0 };
+  const result = await runScript(waitOnly({ attempts: 1000, seconds: 60 }), {
+    hands: hands as never,
+    resume: { step: 0, captures: {}, last_text: "", repeat_started_at: Date.now() - 61_000, repeat_attempts: 3 },
+  }, async () => {});
+  assert.equal(hands.calls, 0, "the step's 60s were already spent; a takeover must not grant it another 60");
+  assert.match(result.failureReason ?? "", /max_seconds/);
+});
+
+test("T6b a resumed repeat counts the calls it already made against max_attempts", async () => {
+  const hands = { ...neverDone, calls: 0 };
+  const result = await runScript(waitOnly({ attempts: 5, seconds: 3600 }), {
+    hands: hands as never,
+    resume: { step: 0, captures: {}, last_text: "", repeat_started_at: Date.now(), repeat_attempts: 4 },
+  }, async () => {});
+  assert.equal(hands.calls, 1, "four of five calls were made before the takeover");
+  assert.match(result.failureReason ?? "", /max_attempts/);
+});
+
+test("T6c progress is reported after every finished step", async () => {
+  const seen: number[] = [];
+  const req = {
+    session_id: "s", task_id: "t", message_id: "m", user_id: "u", mode: "script",
+    script: [
+      { name: "bash", arguments: { command: "a" }, captures: "a" },
+      { name: "bash", arguments: { command: "b" } },
+    ],
+  } as unknown as ExecuteRequest;
+  const hands = { async callToolFull() { return { text: "ok", structured: undefined, isError: false }; } };
+  await runScript(req, { hands: hands as never, onProgress: async (p) => { seen.push(p.step); } }, async () => {});
+  assert.deepEqual(seen, [1, 2]);
+});
