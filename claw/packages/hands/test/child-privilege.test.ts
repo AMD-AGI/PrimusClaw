@@ -62,7 +62,7 @@ test("a declared identity with no process view refuses the spawn, both forms", a
   );
 });
 
-test("a sandbox declaring no baseline says so on every spawn, and still restricts the environment", async () => {
+test("a sandbox declaring no baseline says so on every spawn, and still withholds the token", async () => {
   // The identity half needs something of the sandbox; the environment half does
   // not, so it binds regardless. An operator reads the signal to know the
   // isolation baseline has not reached this deployment.

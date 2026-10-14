@@ -35,6 +35,9 @@ const CONTAINER = {
   HF_TOKEN: "hf-by-reference-for-the-workload",
   // Overridden by the request below.
   IMAGE_DEFAULT_OVERRIDDEN: "from-the-image",
+  // Set to the empty string on purpose. `kubectl exec` passes it as set, and
+  // "set but empty" and "unset" mean different things to many programs.
+  SET_BUT_EMPTY: "",
 };
 
 /** What Brain's launch command and the sandbox daemon set for Hands itself. */
@@ -54,6 +57,8 @@ const RUNTIME_OWNED = {
   HANDS_CHILD_ISOLATION: "unenforced",
   ENVD_AUTH_PUBLIC_KEY: "envd-public-key-material",
   ENVD_SESSION_ID_FILE: "/var/run/envd/session-id",
+  // Claw's internal namespace, reserved whole as the request gate reserves it.
+  CLAW_DEPLOY_MODE: "claw-internal-setting",
 };
 
 const REQUEST = {
@@ -105,6 +110,7 @@ test("the runtime's own configuration and credentials do not", () => {
   assert.doesNotMatch(serialised, /hands-bearer-token-no-child-may-read/);
   assert.doesNotMatch(serialised, /legacy-hands-token-no-child-may-read/);
   assert.doesNotMatch(serialised, /envd-public-key-material/);
+  assert.doesNotMatch(serialised, /claw-internal-setting/);
 });
 
 test("a spawned shell sees the same thing", async () => {
@@ -124,6 +130,29 @@ test("a spawned shell sees the same thing", async () => {
   assert.ok(lines.has("ROCPROFILER_QUEUE_INTERPOSITION=0"));
   assert.ok(lines.has(`LD_LIBRARY_PATH=${CONTAINER.LD_LIBRARY_PATH}`));
   assert.ok(lines.has("IMAGE_DEFAULT_OVERRIDDEN=from-the-request"));
-  assert.ok(![...lines].some((l) => l.startsWith("AUTH_CLAW_TOKEN=")), "the token reached the shell");
-  assert.doesNotMatch(result.stdout, /hands-bearer-token-no-child-may-read/);
+  assert.ok(lines.has("SET_BUT_EMPTY="), "an empty value is a value");
+  const names = new Set([...lines].map((l) => l.slice(0, l.indexOf("="))));
+  for (const key of [...Object.keys(RUNTIME_OWNED), "HANDS_ENV_FILE"]) {
+    assert.ok(!names.has(key), `${key} reached the shell`);
+  }
+  for (const value of [
+    "hands-bearer-token-no-child-may-read", "legacy-hands-token-no-child-may-read",
+    "envd-public-key-material", "claw-internal-setting",
+  ]) {
+    assert.ok(!result.stdout.includes(value), `${value} reached the shell`);
+  }
+  assert.ok(lines.has("CLAW_SESSION_ID=sess-child-env"));
+});
+
+test("a blank path-shaped name is left out rather than passed as nothing", () => {
+  const previous = process.env.HOME;
+  process.env.HOME = "";
+  try {
+    const env = privilege.childEnvironment();
+    assert.equal("HOME" in env, false);
+    assert.equal(env.SET_BUT_EMPTY, "");
+  } finally {
+    if (previous === undefined) delete process.env.HOME;
+    else process.env.HOME = previous;
+  }
 });

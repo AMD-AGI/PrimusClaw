@@ -23,39 +23,58 @@
  */
 import { readFileSync, unlinkSync } from "node:fs";
 
-/** Names this process was started with, which the file must not overrule. */
-const BOOTSTRAP_OWNED = new Set([
+/**
+ * Names this service reads as its own configuration.
+ *
+ * Every name Hands reads from its environment is here or under one of the
+ * prefixes below, and test/service-owned-names.test.ts holds the source to
+ * that. Two things are decided from this one set, so they cannot drift apart:
+ * the env file never applies one of these names, and a spawned command never
+ * inherits one (child-privilege.ts).
+ */
+const SERVICE_OWNED = new Set([
   // The token this launch was given. The file carries the same value today,
   // and if it ever did not, the file's copy would leave Hands rejecting the
   // Brain that started it.
   "AUTH_CLAW_TOKEN",
-  "CLAW_SESSION_ID",
+  // The legacy name of the same token, read where AUTH_CLAW_TOKEN is blank.
+  "AUTH_INTERNAL_TOKEN",
   "MCP_PORT",
   "WORKSPACE_PATH",
   "BASH_MAX_TIMEOUT_SEC",
   "BASH_DEFAULT_TIMEOUT_SEC",
+  // The output cap the bash tool keeps per command.
+  "BASH_OUTPUT_BYTES",
   "WAIT_MAX_SEC",
   "WAIT_DEFAULT_SEC",
 ]);
 
 /**
- * Whether a name belongs to this service's own configuration rather than to
- * the request.
+ * Namespaces reserved whole.
  *
- * Reserved by prefix and not by enumeration, because the file is built from
- * user and session environment and an omission here is a request choosing how
- * the sandbox is configured: `HANDS_CHILD_ISOLATION` and the child identity
- * range decide whether a command runs under an identity of its own, and
- * `HANDS_STATE_DIR` decides where the records that address background shells
- * live. Both are read after this file is applied, so a name that slipped
- * through would be indistinguishable from one an operator set.
- *
- * The same set is what a spawned command does not inherit (see
- * child-privilege.ts): a name this service owns is its configuration, not the
- * workspace's.
+ * `HANDS_` and `BG_SHELL_` are this service's own. `CLAW_` is reserved for
+ * Claw's internal contracts, as the request gate in @claw/protocol treats it.
+ * `ENVD_` is the sandbox daemon's (its key for verifying callers, the file it
+ * reads the session from), which reaches this process only because the daemon
+ * starts it.
  */
-export function bootstrapOwned(key: string): boolean {
-  return key.startsWith("HANDS_") || key.startsWith("BG_SHELL_") || BOOTSTRAP_OWNED.has(key);
+const SERVICE_OWNED_PREFIXES = ["HANDS_", "BG_SHELL_", "CLAW_", "ENVD_"];
+
+/**
+ * Whether a name belongs to the sandbox runtime's own configuration rather
+ * than to the request or the workspace.
+ *
+ * Reserved by prefix and not only by enumeration, because the file is built
+ * from user, session and sandbox-spec environment and an omission here is a
+ * request choosing how the sandbox is configured: `HANDS_CHILD_ISOLATION` and
+ * the child identity range decide whether a command runs under an identity of
+ * its own, `HANDS_STATE_DIR` decides where the records that address background
+ * shells live, and `BASH_OUTPUT_BYTES` how much of a command's output is kept.
+ * All are read after this file is applied, so a name that slipped through
+ * would be indistinguishable from one an operator set.
+ */
+export function serviceOwned(key: string): boolean {
+  return SERVICE_OWNED.has(key) || SERVICE_OWNED_PREFIXES.some((p) => key.startsWith(p));
 }
 
 /**
@@ -81,7 +100,7 @@ export function applyEnvFile(path: string | undefined = process.env.HANDS_ENV_FI
     if (typeof value !== "string") continue;
     // The file is the per-request answer and outranks whatever the image or a
     // pooled pod's template happened to set -- that is the case it exists for.
-    if (bootstrapOwned(key)) continue;
+    if (serviceOwned(key)) continue;
     process.env[key] = value;
     applied.push(key);
   }

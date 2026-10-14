@@ -21,7 +21,7 @@
 
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { APPLIED_ENV_KEYS, bootstrapOwned } from "./env-file.js";
+import { serviceOwned } from "./env-file.js";
 import { currentEpoch, stateRoot } from "./shell-records.js";
 
 /** Raised where the boundary cannot be placed. Never downgraded to a warning. */
@@ -207,12 +207,9 @@ const PASSED_ON_ALTHOUGH_OWNED = new Set([
  * Whether a name is configuration of the sandbox runtime rather than of the
  * workspace, and so is withheld from a spawned command.
  *
- * Hands' own names are the closed set the env file is already forbidden to
- * set, plus the two this service reads that the env file leaves alone: the
- * legacy name of the internal token, and the output cap. `ENVD_` is the
- * sandbox daemon's own namespace (its key for verifying callers, the file it
- * reads the session from), which it hands down only because it starts this
- * process.
+ * The set is the one the env file is forbidden to apply (env-file.ts), so a
+ * name cannot be withheld here and still be put back by a request, and a name
+ * this service starts reading is withheld by the same edit that protects it.
  *
  * A deny list, which is what the allow-list this replaced was written to avoid,
  * and the trade is deliberate. The secret that matters is this service's
@@ -223,12 +220,8 @@ const PASSED_ON_ALTHOUGH_OWNED = new Set([
  * `/proc/1/environ` regardless, so the list was never what kept the token
  * from a child that wanted it; that is the identity boundary's job.
  */
-function runtimeOwned(key: string): boolean {
-  if (PASSED_ON_ALTHOUGH_OWNED.has(key)) return false;
-  return bootstrapOwned(key)
-    || key === "AUTH_INTERNAL_TOKEN"
-    || key === "BASH_OUTPUT_BYTES"
-    || key.startsWith("ENVD_");
+function withheld(key: string): boolean {
+  return serviceOwned(key) && !PASSED_ON_ALTHOUGH_OWNED.has(key);
 }
 
 /**
@@ -250,13 +243,24 @@ function usablePathValue(value: string): boolean {
     && entries.every((e) => e.startsWith("/") && !e.split("/").includes(".."));
 }
 
+/**
+ * The environment a spawned command runs with.
+ *
+ * Values pass as they are, empty ones included, as `kubectl exec` passes them:
+ * a workload may set a name to the empty string on purpose. The exception is
+ * a blank path-shaped name, which is left out so the shell falls back to its
+ * own default rather than resolving programs against nothing.
+ *
+ * The request's environment from the env file needs no step of its own: the
+ * file was applied to this process before anything here runs, over whatever
+ * the image set, and it applies no name this service owns.
+ */
 export function childEnvironment(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(process.env)) {
-    if (value === undefined || runtimeOwned(key)) continue;
+    if (value === undefined || withheld(key)) continue;
     if (PATH_SHAPED.has(key)) {
-      // Blank is unset here as everywhere else in this service's configuration.
-      if (!value) continue;
+      if (value === "") continue;
       if (!usablePathValue(value)) {
         throw new ChildPrivilegeUnavailable(
           `${key} is not a usable absolute path, so no child environment could be built from it`,
@@ -264,16 +268,6 @@ export function childEnvironment(): NodeJS.ProcessEnv {
       }
     }
     env[key] = value;
-  }
-  // The per-request environment Brain wrote for this session: the user's own
-  // configuration and credentials for their own work. It is already in
-  // process.env, over whatever the image set, and is laid on last so that a
-  // name the request chose reaches the command even where it collides with
-  // one the runtime keeps. The env file never applies a name this service
-  // owns, so the token is not reachable through here either.
-  for (const key of APPLIED_ENV_KEYS) {
-    const value = process.env[key];
-    if (value !== undefined) env[key] = value;
   }
   return env;
 }
