@@ -1346,9 +1346,18 @@ class TaskRunner {
    * Not skipped once the run is aborted, unlike a turn's checkpoint: a drain
    * lets the step in flight finish, and that step has to be recorded as done or
    * the worker taking over runs it again.
+   *
+   * Only into a sealed (v4) checkpoint. Progress is tool results verbatim --
+   * captures and the last structured result, fields a conversation checkpoint
+   * never holds -- and the v3 format is plaintext behind its redactor, which
+   * both leaves values it does not recognise readable and rewrites the ones it
+   * does, so a later step would read `<redacted>` where it needs the value.
+   * Without it a takeover starts from the first step again, as before; a
+   * background start there resolves to the shell already running (see
+   * `allocateStartIdentity`), which is what keeps a long job attached.
    */
   private readonly onScriptProgress = async (progress: ScriptProgress): Promise<void> => {
-    if (this.taskFinished) return;
+    if (this.taskFinished || CHECKPOINT_WRITE_VERSION !== 4) return;
     const now = Date.now();
     if (progress.step === this.scriptProgressStep
       && now - this.scriptProgressAt < SCRIPT_PROGRESS_REFRESH_MS) return;
