@@ -7,7 +7,7 @@ package envd
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"net/http"
 	"sync"
@@ -26,9 +26,7 @@ type allowedInternalUpdater interface {
 type PolicySyncer struct {
 	engine                 *policy.Engine
 	allowedInternalUpdater allowedInternalUpdater
-	wmURL                  string
-	sessionID              string
-	jwtToken               string
+	wm                     *inferenceKeyCache
 	interval               time.Duration
 
 	mu             sync.Mutex
@@ -36,14 +34,13 @@ type PolicySyncer struct {
 	lastSuccessful *policy.PolicyConfig
 }
 
-// NewPolicySyncer creates a syncer that polls WM for policy updates.
-func NewPolicySyncer(engine *policy.Engine, updater allowedInternalUpdater, wmURL, sessionID, jwtToken string) *PolicySyncer {
+// NewPolicySyncer creates a syncer that polls WM for policy updates with the
+// session and Router token wm holds at each poll.
+func NewPolicySyncer(engine *policy.Engine, updater allowedInternalUpdater, wm *inferenceKeyCache) *PolicySyncer {
 	return &PolicySyncer{
 		engine:                 engine,
 		allowedInternalUpdater: updater,
-		wmURL:                  wmURL,
-		sessionID:              sessionID,
-		jwtToken:               jwtToken,
+		wm:                     wm,
 		interval:               30 * time.Second,
 	}
 }
@@ -74,24 +71,13 @@ type egressPolicyResponse struct {
 }
 
 func (s *PolicySyncer) syncOnce(ctx context.Context) {
-	if s.wmURL == "" || s.sessionID == "" {
-		return
-	}
-
-	endpoint := fmt.Sprintf("%s/v1/internal/policy/%s", s.wmURL, s.sessionID)
 	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		log.Warn("policy_sync: build request failed", "error", err)
+	resp, err := s.wm.callWM(reqCtx, http.DefaultClient, http.MethodGet, "policy", nil)
+	if errors.Is(err, errNoWM) || errors.Is(err, errAwaitingToken) {
 		return
 	}
-	if s.jwtToken != "" {
-		req.Header.Set("Authorization", "Bearer "+s.jwtToken)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		log.Warn("policy_sync: request failed, using last known policy", "error", err)
 		return

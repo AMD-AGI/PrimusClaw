@@ -242,6 +242,11 @@ func (s *Server) setupRoutes() {
 	internal.POST("/audit/:sessionId", s.handleInternalAudit)
 }
 
+// Handler returns the HTTP handler serving every Workload Manager route.
+func (s *Server) Handler() http.Handler {
+	return s.router
+}
+
 // Run starts the HTTP server and the GC loop.
 // Uses h2c (HTTP/2 cleartext) for efficient internal communication.
 func (s *Server) Run(ctx context.Context) error {
@@ -253,7 +258,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 	// h2c wraps Gin handler with HTTP/2 cleartext support
 	h2s := &http2.Server{}
-	h2cHandler := h2c.NewHandler(s.router, h2s)
+	h2cHandler := h2c.NewHandler(s.Handler(), h2s)
 
 	srv := &http.Server{
 		Addr:        fmt.Sprintf(":%d", s.cfg.Port),

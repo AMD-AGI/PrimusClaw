@@ -54,6 +54,11 @@ const (
 // unexplained one.
 const AnnDeleteAuditIssued = "runtime.agent-sandbox.io/delete-audit-issued"
 
+// MetadataObservedAt is the metadata key a reporter that holds events before
+// uploading them records each event's observation time under, in RFC 3339.
+// Workload Manager stamps such an event with that time rather than its arrival.
+const MetadataObservedAt = "observedAt"
+
 // AuditEvent is a structured audit record for sandbox lifecycle events.
 type AuditEvent struct {
 	ID            string            `json:"id"`
