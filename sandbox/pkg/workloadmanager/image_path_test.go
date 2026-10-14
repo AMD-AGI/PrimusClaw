@@ -11,7 +11,8 @@
 //   - the PATH the container starts with comes first, in its own order;
 //   - every entry the old PATH had follows it, once, so nothing that resolved
 //     before stops resolving;
-//   - an empty PATH gets exactly the old value;
+//   - an empty or unset PATH gets exactly the old value;
+//   - empty, relative and ".." entries are dropped, the rest keep their order;
 //   - the startup reaches its build steps (and the extra-CA check runs its
 //     commands) however short the starting PATH is;
 //   - the pod spec no longer sets PATH, and a PATH the template sets is kept.
@@ -59,7 +60,9 @@ func startupPath(t *testing.T, sh []string, env []string, rewrite func(dir, scri
 		script = rewrite(dir, script)
 	}
 	cmd := exec.Command(sh[0], append(sh[1:], "-c", script)...)
-	cmd.Env = env
+	// Exactly env: a nil Env would inherit this process's environment, PATH
+	// included, and the "no PATH" case would test the host's PATH instead.
+	cmd.Env = append([]string{}, env...)
 	if b, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("startup command failed: %v\n%s\ncommand: %s", err, b, script)
 	}
@@ -140,14 +143,22 @@ func TestStartupWithoutPathKeepsShellDefaultAndOldEntries(t *testing.T) {
 	noExtraCA(t)
 	// The container runtime gives a container with no PATH a default one, and
 	// a shell started with none does the same. Either way the old entries are
-	// all present once and the startup reaches its steps.
+	// all present once and the startup reaches its steps. The environment is
+	// empty, so the host's own PATH cannot stand in for the shell's default:
+	// a directory only this process's PATH names must not show up.
+	const hostOnly = "/host-only-path-entry"
+	t.Setenv("PATH", hostOnly+":"+os.Getenv("PATH"))
 	forEachShell(t, func(t *testing.T, sh []string) {
 		got := startupPath(t, sh, nil, nil)
+		if countEntry(got, hostOnly) != 0 {
+			t.Fatalf("the startup ran with this process's PATH, not an empty environment: %s", got)
+		}
 		for _, e := range strings.Split(previousPodPath, ":") {
 			if n := countEntry(got, e); n != 1 {
 				t.Fatalf("%s appears %d times in %s", e, n, got)
 			}
 		}
+		assertUsableByHands(t, got)
 	})
 }
 
@@ -201,5 +212,118 @@ func TestPodSpecKeepsTemplatePath(t *testing.T) {
 	}
 	if len(paths) != 1 || paths[0] != templatePath {
 		t.Fatalf("PATH env vars on the main container = %q, want only the template's %q", paths, templatePath)
+	}
+}
+
+// assertUsableByHands checks path the way Hands' childEnvironment does before
+// it starts any command: at least one entry, every non-empty entry absolute
+// and free of ".." segments. A PATH failing it gives a sandbox that runs nothing.
+func assertUsableByHands(t *testing.T, path string) {
+	t.Helper()
+	n := 0
+	for _, e := range strings.Split(path, ":") {
+		if e == "" {
+			continue
+		}
+		n++
+		if !strings.HasPrefix(e, "/") {
+			t.Fatalf("PATH %q has the relative entry %q", path, e)
+		}
+		for _, seg := range strings.Split(e, "/") {
+			if seg == ".." {
+				t.Fatalf("PATH %q has the traversing entry %q", path, e)
+			}
+		}
+	}
+	if n == 0 {
+		t.Fatalf("PATH %q has no entries", path)
+	}
+}
+
+// An image PATH with empty, relative and ".." entries loses exactly those, and
+// a repeated directory keeps its first position: what is left resolves every
+// absolute directory in the image's order, and Hands accepts it.
+func TestStartupDropsEntriesHandsWouldRefuse(t *testing.T) {
+	noExtraCA(t)
+	start := "/opt/venv/bin:.:bin::/opt/a/../b:~/bin:/usr/bin:/opt/c/..:../d:/opt/venv/bin:/opt/..e"
+	want := "/opt/venv/bin:/usr/bin:/opt/..e:/shared/bin:/home/sandbox/.local/bin:/usr/local/bin:/bin:/sbin"
+	forEachShell(t, func(t *testing.T, sh []string) {
+		got := startupPath(t, sh, []string{"PATH=" + start}, nil)
+		if got != want {
+			t.Fatalf("PATH after startup:\n got %s\nwant %s", got, want)
+		}
+		assertUsableByHands(t, got)
+	})
+}
+
+// A trailing or leading ':' is an empty entry (the working directory) too.
+func TestStartupDropsLeadingAndTrailingEmptyEntries(t *testing.T) {
+	noExtraCA(t)
+	forEachShell(t, func(t *testing.T, sh []string) {
+		got := startupPath(t, sh, []string{"PATH=:/opt/venv/bin:"}, nil)
+		if want := "/opt/venv/bin:" + previousPodPath; got != want {
+			t.Fatalf("PATH after startup:\n got %s\nwant %s", got, want)
+		}
+	})
+}
+
+// The appended entries are taken literally: a space, a glob character or a
+// quote in one must neither split it nor expand it. Nothing in
+// runtimePathEntries has one today; this pins the quoting for when one does.
+func TestPathSetupKeepsEntriesLiterally(t *testing.T) {
+	entries := []string{"/opt/my tools/bin", "/opt/*", "/opt/it's", "/opt/$HOME"}
+	dir := t.TempDir()
+	// Something for "/opt/*" to match if it were expanded.
+	if err := os.WriteFile(filepath.Join(dir, "match"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	script := pathSetupScriptFor(entries) + `printf '%s' "$PATH"`
+	forEachShell(t, func(t *testing.T, sh []string) {
+		cmd := exec.Command(sh[0], append(sh[1:], "-c", script)...)
+		cmd.Dir = dir
+		cmd.Env = []string{"PATH=/usr/bin", "HOME=/root"}
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%v\n%s", err, out)
+		}
+		if want := "/usr/bin:" + strings.Join(entries, ":"); string(out) != want {
+			t.Fatalf("PATH:\n got %s\nwant %s", out, want)
+		}
+	})
+}
+
+// The setup leaves none of its own variables behind for envd to inherit.
+func TestPathSetupLeavesNoVariables(t *testing.T) {
+	script := pathSetupScript() + `set`
+	forEachShell(t, func(t *testing.T, sh []string) {
+		cmd := exec.Command(sh[0], append(sh[1:], "-c", script)...)
+		cmd.Env = []string{"PATH=/usr/bin"}
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%v\n%s", err, out)
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			if strings.HasPrefix(line, "__sandbox_path") {
+				t.Fatalf("variable left set: %s", line)
+			}
+		}
+	})
+}
+
+func TestRuntimePathEntriesAreKeptAsWritten(t *testing.T) {
+	for _, e := range runtimePathEntries {
+		if !validPathEntry(e) {
+			t.Fatalf("runtimePathEntries has %q, which PATH cannot carry as written", e)
+		}
+	}
+	for _, bad := range []string{"bin", "", "/a:b", "/a/../b", "/a/..", "/a\nb"} {
+		if validPathEntry(bad) {
+			t.Fatalf("validPathEntry(%q) = true", bad)
+		}
+	}
+	for _, ok := range []string{"/a b", "/opt/*", "/opt/..e", "/"} {
+		if !validPathEntry(ok) {
+			t.Fatalf("validPathEntry(%q) = false", ok)
+		}
 	}
 }

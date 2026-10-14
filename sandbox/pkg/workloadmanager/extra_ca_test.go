@@ -297,7 +297,7 @@ func shells(t *testing.T) [][]string {
 		out = append(out, []string{p, "sh"})
 	}
 	if p, err := exec.LookPath("bash"); err == nil {
-		out = append(out, []string{p, "--posix"})
+		out = append(out, []string{p, "--norc", "--noprofile", "--posix"})
 	}
 	return out
 }

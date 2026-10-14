@@ -26,6 +26,9 @@ const (
 	EnvDProxyGID = 15534
 )
 
+// injectedPath is injected.Path; tests point it at a directory of their own.
+var injectedPath = injected.Path
+
 // newIPTables runs the iptables the envd-injector copied in beside envd, the
 // legacy backend Kata needs, rather than whichever one the image's PATH would
 // find first; without an injected copy it resolves through PATH as before.
@@ -34,7 +37,7 @@ func newIPTables(proto iptables.Protocol) (*iptables.IPTables, error) {
 	if proto == iptables.ProtocolIPv6 {
 		tool = "ip6tables"
 	}
-	return iptables.New(iptables.IPFamily(proto), iptables.Path(injected.Path(tool)))
+	return iptables.New(iptables.IPFamily(proto), iptables.Path(injectedPath(tool)))
 }
 
 // AddEnvDProxyGroup adds EnvDProxyGID to the current process's supplementary
