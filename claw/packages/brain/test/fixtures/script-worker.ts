@@ -14,7 +14,7 @@ export const runner = await import("../../src/tasks/runner.js");
 export const { SIGTERM_ABORT_REASON, activeAbort } = await import("../../src/tasks/abort-registry.js");
 type SideEffects = import("../../src/tasks/runner.js")["TaskRunnerSideEffects"];
 
-const SESSION = "sess-script-takeover";
+export const SESSION = "sess-script-takeover";
 export const TASK = "task-script-takeover";
 export const SUBJECT = "tasks.execute";
 export const PAYLOAD = new TextEncoder().encode('{"the":"request"}');

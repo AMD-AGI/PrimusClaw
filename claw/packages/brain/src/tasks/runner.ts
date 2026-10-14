@@ -1177,8 +1177,8 @@ class TaskRunner {
   private inflightCkptInProgress = false;
 
   private resumeCheckpoint: CheckpointState | undefined;
-  /** The script progress last written, and when; see `onScriptProgress`. */
-  private scriptProgressStep = -1;
+  /** Which script progress was last written, and when; see `onScriptProgress`. */
+  private scriptProgressKey = "";
   private scriptProgressAt = 0;
   private resumeMode: "sandbox_reuse" | "workspace_restore"
                     | "no_data_turn0" | "skip_no_ckpt" = "skip_no_ckpt";
@@ -1359,7 +1359,10 @@ class TaskRunner {
   private readonly onScriptProgress = async (progress: ScriptProgress): Promise<void> => {
     if (this.taskFinished || CHECKPOINT_WRITE_VERSION !== 4) return;
     const now = Date.now();
-    if (progress.step === this.scriptProgressStep
+    // A new step, or the first call of a repetition, is written at once: the
+    // repetition's start time is what keeps its bounds across a takeover.
+    const key = `${progress.step}:${progress.repeat_started_at ?? ""}`;
+    if (key === this.scriptProgressKey
       && now - this.scriptProgressAt < SCRIPT_PROGRESS_REFRESH_MS) return;
     const state: CheckpointState = {
       messages: [],
@@ -1374,7 +1377,7 @@ class TaskRunner {
       script: progress,
     };
     if (await this.writeKvCheckpoint(state)) {
-      this.scriptProgressStep = progress.step;
+      this.scriptProgressKey = key;
       this.scriptProgressAt = now;
     }
   };
@@ -3416,7 +3419,7 @@ class TaskRunner {
     }
     logger.info(
       { sessionId: this.sessionId, taskId: this.request.task_id,
-        step: this.scriptProgressStep },
+        progress: this.scriptProgressKey },
       "task.sigterm.script_handed_over",
     );
     this.msg.ack();
@@ -4255,14 +4258,11 @@ class TaskRunner {
 
     // MCP SDK 1.12 does not propagate AbortSignal through callTool.
     //
-    // Except a script that reached its own end while draining: a drain lets
-    // the step in flight finish, and when that step was the last one -- or
-    // failed, or handed off to an external wait -- the run is over and its
-    // outcome is reported like any other. Handing it over instead would have
-    // the next worker run that step again. A script stopped by the drain
-    // reports `cancelled`, and goes to the hand-over below.
-    const scriptEnded = this.request.mode === "script" && result.abortReason !== "cancelled";
-    if (this.abortCtrl.signal.reason === SIGTERM_ABORT_REASON && !scriptEnded) {
+    // A script is handed over here even when the step the drain let finish was
+    // its last: that step is recorded as done, so the next worker runs nothing
+    // and reports the outcome with the time it needs, rather than this pod
+    // racing its grace period through the terminal path.
+    if (this.abortCtrl.signal.reason === SIGTERM_ABORT_REASON) {
       logger.info(
         { sessionId: this.sessionId, messageId: this.messageId,
           engineAbortReason: result.abortReason ?? "completed", turns: result.turns },
@@ -4270,7 +4270,7 @@ class TaskRunner {
       );
       throw SIGTERM_ABORT_REASON;
     }
-    if (this.abortCtrl.signal.aborted && !(scriptEnded && this.abortCtrl.signal.reason === SIGTERM_ABORT_REASON)) {
+    if (this.abortCtrl.signal.aborted) {
       throw this.abortCtrl.signal.reason ?? new Error("cancelled by user");
     }
 

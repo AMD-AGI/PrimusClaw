@@ -17,8 +17,8 @@
  *      issues no tool call into the new sandbox
  *   T4 a drain lets a single-call step finish and records it, so the successor
  *      does not run it a second time
- *   T5 a drain that lands in the last step reports the run's own outcome rather
- *      than handing a finished run over
+ *   T5 a drain that lands in the last step records it as done and hands over;
+ *      the successor runs nothing and reports the outcome
  *   T6 a resumed repeating step keeps the bounds it began with, and a drain
  *      waits for a single call only so long
  *
@@ -29,15 +29,17 @@ import { randomBytes } from "node:crypto";
 // Progress is kept only in a sealed checkpoint; see script-takeover-v3 for the
 // plaintext format. Read once at module scope, so set before anything loads.
 process.env.CHECKPOINT_WRITE_VERSION = "4";
-process.env.BRAIN_CHECKPOINT_KEY = randomBytes(32).toString("base64");
+const SEAL_KEY = randomBytes(32);
+process.env.BRAIN_CHECKPOINT_KEY = SEAL_KEY.toString("base64");
 
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { ExecuteRequest, ScriptStep } from "@claw/protocol";
 
 const {
-  runWorker, sharedKv, untilAborted, SIGTERM_ABORT_REASON, START_THEN_WAIT, SUBJECT, PAYLOAD, TASK,
+  runWorker, sharedKv, untilAborted, SIGTERM_ABORT_REASON, START_THEN_WAIT, SUBJECT, PAYLOAD, TASK, SESSION,
 } = await import("./fixtures/script-worker.js");
+const { decodeCheckpoint } = await import("../src/tasks/checkpoint-codec.js");
 const { runScript } = await import("../src/tasks/script-runner.js");
 
 test("T1/T2 a drained run is handed over and continues where it was, in the same sandbox", async () => {
@@ -155,26 +157,58 @@ test("T4b a user's Stop still cuts a single-call step off at once", async () => 
   assert.deepEqual(w.republished, []);
 });
 
-test("T5 a drain in the last step reports the run's own outcome instead of handing it over", async () => {
+test("T5 a drain in the last step records it and hands over; the successor only reports", async () => {
   const { kv } = sharedKv();
-  const w = await runWorker({
-    kvCkpt: kv,
-    script: [{ name: "bash", arguments: { command: "./last.sh" } } as ScriptStep],
-    sandboxCreated: true, seq: 40,
+  const script = [{ name: "bash", arguments: { command: "./last.sh" }, captures: "out" } as ScriptStep];
+  const first = await runWorker({
+    kvCkpt: kv, script, sandboxCreated: true, seq: 40,
     answer: async (_name, _args, worker) => {
       worker.abort.abort(SIGTERM_ABORT_REASON);
-      return { text: "done" };
+      return { text: "last done" };
     },
   });
-  assert.deepEqual(w.republished, [], "a finished run was handed over, so its last step would run again");
-  assert.equal(w.done.length, 1);
-  assert.equal(w.done[0].abortReason, "completed");
+  assert.deepEqual(first.done, [],
+    "a draining pod must not race its grace period through the terminal path");
+  assert.equal(first.republished.length, 1);
+
+  const second = await runWorker({
+    kvCkpt: kv, script, sandboxCreated: false, seq: 41,
+    answer: async () => ({ text: "ran again" }),
+  });
+  assert.deepEqual(second.calls, [], "the finished last step ran a second time");
+  assert.equal(second.done.length, 1);
+  assert.equal(second.done[0].abortReason, "completed");
+  assert.equal(second.done[0].finalText, "last done", "the successor must report the step's own result");
+  assert.match(second.done[0].captures?.out ?? "", /last done/);
+});
+
+test("T5b the first call of a repetition records its start at once, inside the refresh interval", async () => {
+  const { kv, store } = sharedKv();
+  const before = Date.now();
+  await runWorker({
+    kvCkpt: kv, script: START_THEN_WAIT, sandboxCreated: true, seq: 45,
+    answer: async (name, _args, w, signal) => {
+      if (name === "bash") return { text: "started", structured: { shell_id: "sh-live" } };
+      w.abort.abort(SIGTERM_ABORT_REASON);
+      return untilAborted(signal);
+    },
+  });
+  const bytes = store.get(`task-ckpt.${SESSION}.${TASK}`);
+  assert.ok(bytes, "no checkpoint was written");
+  const decoded = decodeCheckpoint(bytes, SEAL_KEY, {
+    sessionId: SESSION, messageId: TASK, userId: "u1",
+  });
+  assert.ok(decoded.ok, "the checkpoint did not open");
+  const progress = decoded.value.state.script;
+  assert.equal(progress?.step, 1);
+  assert.ok((progress?.repeat_started_at ?? 0) >= before,
+    "the repetition's start was not recorded, so a takeover would grant the step its whole budget again");
+  assert.equal(progress?.repeat_attempts, 1);
 });
 
 // ---------------------------------------------------------------------------
 // The executor alone: a resumed repeating step keeps the bounds it began with.
 // ---------------------------------------------------------------------------
-
 
 function waitOnly(max: { attempts: number; seconds: number }): ExecuteRequest {
   return {
