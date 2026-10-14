@@ -97,6 +97,7 @@ async function runWorker(opts: {
   script: ScriptStep[];
   sandboxCreated: boolean;
   seq: number;
+  requestExtra?: Record<string, unknown>;
   answer: (name: string, args: Record<string, unknown>, w: Worker, signal?: AbortSignal) => Promise<Answer>;
 }): Promise<Worker> {
   const w: Worker = {
@@ -162,6 +163,7 @@ async function runWorker(opts: {
     session_id: SESSION, task_id: TASK, message_id: TASK, user_id: "u1",
     mode: "script", script: opts.script,
     callback_url: "http://api.test/v1/internal/dags",
+    ...(opts.requestExtra ?? {}),
   } as unknown as ExecuteRequest;
   const lockKey = `lock.${SESSION}`;
   activeAbort.set(lockKey, w.abort);
@@ -376,4 +378,57 @@ test("T6c progress is reported after every finished step", async () => {
   const hands = { async callToolFull() { return { text: "ok", structured: undefined, isError: false }; } };
   await runScript(req, { hands: hands as never, onProgress: async (p) => { seen.push(p.step); } }, async () => {});
   assert.deepEqual(seen, [1, 2]);
+});
+
+test("T6d a drain gives up on a single call that will not come back in time", async () => {
+  const ctl = new AbortController();
+  const req = {
+    session_id: "s", task_id: "t", message_id: "m", user_id: "u", mode: "script",
+    script: [
+      { name: "bash", arguments: { command: "./hangs.sh" } },
+      { name: "bash", arguments: { command: "./next.sh" } },
+    ],
+  } as unknown as ExecuteRequest;
+  const seen: number[] = [];
+  let cutOff = false;
+  const hands = {
+    async callToolFull(_n: string, _a: unknown, signal?: AbortSignal) {
+      ctl.abort(SIGTERM_ABORT_REASON);
+      // Bounded, so a drain that never cuts the call off fails here rather than hanging.
+      await Promise.race([
+        untilAborted(signal).catch(() => { cutOff = true; }),
+        new Promise((r) => setTimeout(r, 2_000)),
+      ]);
+      throw new Error("This operation was aborted");
+    },
+  };
+  const result = await runScript(req, {
+    hands: hands as never, signal: ctl.signal, drainStepWaitMs: 20,
+    onProgress: async (p) => { seen.push(p.step); },
+  }, async () => {});
+  assert.equal(cutOff, true, "an unbounded wait outlives the pod's grace and nothing is handed over");
+  assert.equal(result.abortReason, "cancelled",
+    "a call cut off by the drain is not the step's answer: the run must stop, to be handed over");
+  assert.deepEqual(seen, [], "a step that was cut off must not be recorded as finished");
+});
+
+test("T7 a v3 checkpoint puts a script's progress through the same redaction as a conversation", async () => {
+  const { kv, store } = sharedKv();
+  const TOKEN = "backend-token-0123456789abcdef";
+  await runWorker({
+    kvCkpt: kv, script: START_THEN_WAIT, sandboxCreated: true, seq: 50,
+    requestExtra: { backend_internal_token: TOKEN },
+    answer: async (name, _args, w, signal) => {
+      if (name === "bash") {
+        return { text: `started with ${TOKEN}`, structured: { shell_id: "sh-live", echoed: TOKEN } };
+      }
+      w.abort.abort(SIGTERM_ABORT_REASON);
+      return untilAborted(signal);
+    },
+  });
+  const stored = [...store.entries()].find(([key]) => key.startsWith("task-ckpt."));
+  assert.ok(stored, "the drained run left no checkpoint to be taken over from");
+  const text = new TextDecoder().decode(stored[1]);
+  assert.ok(text.includes("sh-live"), "the capture the next step needs must survive");
+  assert.ok(!text.includes(TOKEN), "a run secret reached the checkpoint in the clear");
 });

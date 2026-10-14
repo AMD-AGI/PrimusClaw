@@ -46,6 +46,19 @@ const REPEAT_TRANSPORT_LOSS_BUDGET_MS = 120_000;
 const REPEAT_TRANSPORT_MAX_BACKOFF_MS = 15_000;
 
 /**
+ * How long a drain waits for a single-call step to come back before cutting it
+ * off.
+ *
+ * The pod's termination grace is 300s, and the hand-over has to fit inside it
+ * after the step returns -- a pod killed while still waiting hands nothing over,
+ * and the run is lost exactly as before. 120s is what a foreground command is
+ * already kept under (the Router proxy's header timeout), so an ordinary step
+ * finishes well inside it; one that does not is cut off and run again by the
+ * next worker, which is the better of the two ways to fail.
+ */
+const DRAIN_STEP_WAIT_MS = 120_000;
+
+/**
  * Where a script run stands: what another worker needs to carry it on.
  *
  * A script has no conversation to replay. Its state is the step it is on and
@@ -78,6 +91,8 @@ export interface ScriptRunCtx {
   signal?: AbortSignal;
   /** Overrides REPEAT_TRANSPORT_LOSS_BUDGET_MS; tests set it so a bound is reached in milliseconds. */
   transportLossBudgetMs?: number;
+  /** Overrides DRAIN_STEP_WAIT_MS, for the same reason. */
+  drainStepWaitMs?: number;
   /** Progress a previous worker recorded for this run; the run carries on from it. */
   resume?: ScriptProgress;
   /**
@@ -214,20 +229,40 @@ function sleep(ms: number, signal?: AbortSignal): Promise<boolean> {
  * Given to a step that makes one call. A drain (SIGTERM) means another worker
  * will carry the run on, and it can only start after a step that has finished:
  * a call cut off part-way may still have done its work in the sandbox, and the
- * successor cannot tell, so it would run it again. Letting the call come back
- * costs at most the step's own timeout, which is what bounds it anyway. A
- * repeating step does not need this -- calling it again is what it does -- and
- * any other abort, a user's Stop above all, still cuts the call off at once.
+ * successor cannot tell, so it would run it again. The wait is bounded by
+ * `waitMs` (see DRAIN_STEP_WAIT_MS) so the hand-over still fits in the pod's
+ * grace; `cutOff` says the bound was reached and the call's answer is not the
+ * step's. A repeating step does not need this -- calling it again is what it
+ * does -- and any other abort, a user's Stop above all, cuts the call off at
+ * once.
  */
-function signalIgnoringDrain(signal: AbortSignal | undefined): { signal?: AbortSignal; done: () => void } {
-  if (!signal) return { done: () => {} };
+function signalIgnoringDrain(
+  signal: AbortSignal | undefined, waitMs: number,
+): { signal?: AbortSignal; done: () => void; cutOff: () => boolean } {
+  if (!signal) return { done: () => {}, cutOff: () => false };
   const ctl = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let cut = false;
   const onAbort = () => {
-    if (signal.reason !== SIGTERM_ABORT_REASON) ctl.abort(signal.reason);
+    if (signal.reason !== SIGTERM_ABORT_REASON) {
+      ctl.abort(signal.reason);
+      return;
+    }
+    timer = setTimeout(() => {
+      cut = true;
+      ctl.abort(signal.reason);
+    }, waitMs);
   };
   if (signal.aborted) onAbort();
   else signal.addEventListener("abort", onAbort, { once: true });
-  return { signal: ctl.signal, done: () => signal.removeEventListener("abort", onAbort) };
+  return {
+    signal: ctl.signal,
+    done: () => {
+      signal.removeEventListener("abort", onAbort);
+      if (timer) clearTimeout(timer);
+    },
+    cutOff: () => cut,
+  };
 }
 
 /**
@@ -437,7 +472,9 @@ export async function runScript(
       const attemptSignal = budgetSignal && ctx.signal
         ? AbortSignal.any([ctx.signal, budgetSignal])
         : (budgetSignal ?? ctx.signal);
-      const oneCall = repeat ? null : signalIgnoringDrain(ctx.signal);
+      const oneCall = repeat
+        ? null
+        : signalIgnoringDrain(ctx.signal, ctx.drainStepWaitMs ?? DRAIN_STEP_WAIT_MS);
       const callSignal = oneCall ? oneCall.signal : attemptSignal;
       try {
         if (scope === "backend") {
@@ -507,7 +544,7 @@ export async function runScript(
       // A drain is the exception for a single-call step, whose call it let
       // finish: that answer is the step's, and it is recorded below before the
       // run stops at the next step.
-      if (ctx.signal?.aborted && !(oneCall && draining())) {
+      if (ctx.signal?.aborted && !(oneCall && draining() && !oneCall.cutOff())) {
         return failResult(
           "script aborted by signal", "cancelled",
           captures, artifacts, toolStats, startedAt,
