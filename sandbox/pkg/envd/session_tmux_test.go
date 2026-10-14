@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -36,6 +37,13 @@ func serve(t *testing.T, s *Server, method, target, body string, h func(http.Res
 	}
 }
 
+// canSetGroups reports whether this process may set its supplementary groups
+// (CAP_SETGID), by setting them to what they already are.
+func canSetGroups() bool {
+	groups, err := syscall.Getgroups()
+	return err == nil && syscall.Setgroups(groups) == nil
+}
+
 // Every tmux command a session or terminal endpoint runs names envd's own
 // socket, so none of them can reach a tmux server the workload started.
 func TestSessionEndpointsUseEnvdTmuxSocket(t *testing.T) {
@@ -48,7 +56,15 @@ func TestSessionEndpointsUseEnvdTmuxSocket(t *testing.T) {
 	useTmux(t, fake)
 	s := newSessionTestServer(t)
 	id := "abc"
-	serve(t, s, http.MethodPost, "/api/session/create", "", s.handleSessionCreate)
+	want := []string{"send-keys", "capture-pane", "kill-session"}
+	// Creating a session starts tmux with the pod's groups minus the proxy
+	// group, which only a process allowed to set its groups can do.
+	if canSetGroups() {
+		serve(t, s, http.MethodPost, "/api/session/create", "", s.handleSessionCreate)
+		want = append(want, "new-session")
+	} else {
+		t.Log("this process cannot set its groups, so session create is not recorded")
+	}
 	serve(t, s, http.MethodPost, "/", `{"command":"true","timeout":"150ms"}`, func(w http.ResponseWriter, r *http.Request) { s.handleSessionExec(w, r, id) })
 	serve(t, s, http.MethodGet, "/", "", func(w http.ResponseWriter, r *http.Request) { s.handleSessionOutput(w, r, id) })
 	serve(t, s, http.MethodPost, "/", `{"keys":["ls","Enter","C-c"]}`, func(w http.ResponseWriter, r *http.Request) { s.handleTerminalSendKeys(w, r, id) })
@@ -68,7 +84,7 @@ func TestSessionEndpointsUseEnvdTmuxSocket(t *testing.T) {
 		}
 		seen[f[2]] = true
 	}
-	for _, sub := range []string{"new-session", "send-keys", "capture-pane", "kill-session"} {
+	for _, sub := range want {
 		if !seen[sub] {
 			t.Fatalf("no %s among the recorded tmux commands:\n%s", sub, b)
 		}
@@ -96,11 +112,16 @@ func TestSessionsLiveApartFromTheWorkloadsTmux(t *testing.T) {
 	t.Cleanup(func() { _, _ = user("kill-server") })
 	t.Cleanup(func() { _ = sessionTmux.command(context.Background(), "kill-server").Run() })
 
+	// The session is started the way handleSessionCreate starts it, minus the
+	// group change that needs privileges; the endpoints then reach it.
+	if out, err := sessionTmux.command(context.Background(), "new-session", "-d", "-s", "sandbox-iso", "-x", "80", "-y", "24").CombinedOutput(); err != nil {
+		t.Fatalf("starting envd's session: %v %s", err, out)
+	}
 	s := newSessionTestServer(t)
 	rec := httptest.NewRecorder()
-	s.handleSessionCreate(rec, httptest.NewRequest(http.MethodPost, "/api/session/create", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("create: %d %s", rec.Code, rec.Body.String())
+	s.handleSessionExec(rec, httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"command":"echo envd-$((40+2))","timeout":"10s"}`)), "iso")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "envd-42") {
+		t.Fatalf("exec on envd's session: %d %s", rec.Code, rec.Body.String())
 	}
 
 	workload, err := user("list-sessions", "-F", "#{session_name}")
@@ -114,8 +135,8 @@ func TestSessionsLiveApartFromTheWorkloadsTmux(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listing envd's server: %v %s", err, envd)
 	}
-	if got := strings.TrimSpace(string(envd)); !strings.HasPrefix(got, "sandbox-") || strings.Contains(got, "workload") {
-		t.Fatalf("envd's tmux server lists %q", got)
+	if got := strings.TrimSpace(string(envd)); got != "sandbox-iso" {
+		t.Fatalf("envd's tmux server lists %q, want only sandbox-iso", got)
 	}
 }
 
