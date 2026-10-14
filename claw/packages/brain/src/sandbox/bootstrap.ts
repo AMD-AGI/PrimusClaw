@@ -76,21 +76,50 @@ export const HANDS_TOKEN_ENV = "AUTH_CLAW_TOKEN";
 /** The execute-request env var that carries the base64 env-file payload. */
 export const HANDS_ENV_PAYLOAD_ENV = "CLAW_HANDS_ENV_B64";
 
+/**
+ * Seconds one Hands download attempt may spend connecting to Brain.
+ *
+ * Brain is an in-cluster Service; a connection that has not opened in this long
+ * is not going to, and waiting longer only takes time from the next attempt.
+ */
+export const HANDS_DOWNLOAD_CONNECT_TIMEOUT_SEC = 10;
+
+/**
+ * Seconds one Hands download attempt may run in total, connect included.
+ *
+ * Measured downloads of the ~90MB binary took 4-21s. Without a bound, a
+ * connection that opened and then stalled held curl until the exec budget
+ * (HANDS_BOOTSTRAP_START_TIMEOUT, 150s) abandoned the whole step: no retry
+ * ran, and the step failed with nothing from curl to say why. 30s is half
+ * again the slowest download seen, and three attempts of it still finish
+ * inside the budget with room for the launch that follows.
+ */
+export const HANDS_DOWNLOAD_MAX_TIME_SEC = 30;
+
 /** Build the curl command that downloads a Brain-served asset into the sandbox.
  *  Uses BRAIN_HTTP_URL (in-cluster brain ClusterIP svc) so the request
  *  load-balances across brain pods and survives rolling updates.
  *
  *  The token is a shell reference, not a value. The command string is logged
  *  by the Router and by EnvD on every execute; the request's `env` map is not,
- *  so the credential travels there and is expanded inside the sandbox. */
-export function brainAssetCurl(endpoint: string, baseUrl: string = BRAIN_HTTP_URL): string {
-  return `curl -sSfL --retry 3 --retry-delay 2 `
+ *  so the credential travels there and is expanded inside the sandbox.
+ *
+ *  One bounded request, no `--retry`: the caller retries every failure in
+ *  shell, and curl's own retries would multiply each attempt's time bound by
+ *  four and push the attempts back past the exec budget. */
+export function brainAssetCurl(
+  endpoint: string,
+  baseUrl: string = BRAIN_HTTP_URL,
+  maxTimeSec: number = HANDS_DOWNLOAD_MAX_TIME_SEC,
+  connectTimeoutSec: number = HANDS_DOWNLOAD_CONNECT_TIMEOUT_SEC,
+): string {
+  return `curl -sSfL --connect-timeout ${connectTimeoutSec} --max-time ${maxTimeSec} `
     + `-H "Authorization: Bearer \${${HANDS_TOKEN_ENV}}" `
     + `${baseUrl}${endpoint}`;
 }
 
 /** How many times the Hands download is attempted before its source gives up. */
-const HANDS_DOWNLOAD_ATTEMPTS = 3;
+export const HANDS_DOWNLOAD_ATTEMPTS = 3;
 
 /**
  * Seconds between Hands download attempts.
@@ -100,7 +129,7 @@ const HANDS_DOWNLOAD_ATTEMPTS = 3;
  * to fail the sandbox. The gap outlasts the 5s `deniedTokens` window in
  * registry.ts, so a retried 403 is checked again rather than answered from it.
  */
-const HANDS_DOWNLOAD_RETRY_DELAY_SEC = 6;
+export const HANDS_DOWNLOAD_RETRY_DELAY_SEC = 6;
 
 /**
  * Shell snippet: download the Hands binary to `dest`, retrying any failure.
@@ -108,15 +137,20 @@ const HANDS_DOWNLOAD_RETRY_DELAY_SEC = 6;
  * Retried in shell rather than with `--retry-all-errors`, which needs curl 7.71
  * and would make an older curl reject the whole command. curl's own message is
  * kept, so a failure names the status or error rather than only that the
- * download did not happen.
+ * download did not happen. Each attempt is time-bounded (see
+ * HANDS_DOWNLOAD_MAX_TIME_SEC), so a stalled connection becomes curl's timeout
+ * error and the next attempt, instead of the exec budget running out silently.
  */
 export function handsBinaryDownloadCmd(
   dest: string,
   attempts: number = HANDS_DOWNLOAD_ATTEMPTS,
   delaySec: number = HANDS_DOWNLOAD_RETRY_DELAY_SEC,
   baseUrl: string = BRAIN_HTTP_URL,
+  maxTimeSec: number = HANDS_DOWNLOAD_MAX_TIME_SEC,
+  connectTimeoutSec: number = HANDS_DOWNLOAD_CONNECT_TIMEOUT_SEC,
 ): string {
-  return `_try=1; until _err=$(${brainAssetCurl("/internal/assets/hands-binary", baseUrl)} -o ${dest} 2>&1); do `
+  const curl = brainAssetCurl("/internal/assets/hands-binary", baseUrl, maxTimeSec, connectTimeoutSec);
+  return `_try=1; until _err=$(${curl} -o ${dest} 2>&1); do `
     + `if [ $_try -ge ${attempts} ]; then echo "hands-binary download failed after $_try attempts: $_err" >&2; exit 1; fi; `
     + `_try=$((_try+1)); sleep ${delaySec}; done; `;
 }
