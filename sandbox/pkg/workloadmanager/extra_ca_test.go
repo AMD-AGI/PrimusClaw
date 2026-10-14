@@ -83,7 +83,7 @@ func TestExtraCAUndeclaredLeavesPodUnchanged(t *testing.T) {
 		t.Fatalf("injector command changed with no extra CA declared:\n%s", got)
 	}
 	main := pt.Spec.Containers[0]
-	if want := buildStartupScript(ci.Spec.Template.Steps, "/home/sandbox"); main.Args[0] != want {
+	if want := pathSetupScript() + buildStartupScript(ci.Spec.Template.Steps, "/home/sandbox"); main.Args[0] != want {
 		t.Fatalf("startup script changed with no extra CA declared:\n got %q\nwant %q", main.Args[0], want)
 	}
 	for _, v := range pt.Spec.Volumes {
@@ -178,8 +178,8 @@ func assertDeclaredContainers(t *testing.T, pt sandboxv1alpha1.PodTemplate) {
 		t.Fatalf("injector does not copy /setup-extra-ca.sh and /extra-ca-bundle.pem unconditionally: %q", cmd)
 	}
 	main := pt.Spec.Containers[0]
-	if !strings.HasPrefix(main.Args[0], "/bin/sh /shared/bin/setup-extra-ca.sh || exit 1; ") {
-		t.Fatalf("setup-extra-ca.sh does not run first: %q", main.Args[0])
+	if !strings.HasPrefix(main.Args[0], pathSetupScript()+"/bin/sh /shared/bin/setup-extra-ca.sh || exit 1; ") {
+		t.Fatalf("setup-extra-ca.sh does not run first after the PATH setup: %q", main.Args[0])
 	}
 	if v, _ := envValue(main.Env, "EXTRA_CA_REQUIRED"); v != "true" {
 		t.Fatalf("EXTRA_CA_REQUIRED = %q, want true", v)
@@ -297,7 +297,7 @@ func shells(t *testing.T) [][]string {
 		out = append(out, []string{p, "sh"})
 	}
 	if p, err := exec.LookPath("bash"); err == nil {
-		out = append(out, []string{p, "--posix"})
+		out = append(out, []string{p, "--norc", "--noprofile", "--posix"})
 	}
 	return out
 }

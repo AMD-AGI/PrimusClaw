@@ -278,16 +278,78 @@ func envdInjectorImage() string {
 	return "primussafe/agent-sandbox-envd-injector:latest"
 }
 
+// runtimePathEntries is the PATH every sandbox had while the pod spec set it:
+// the tools the envd-injector initContainer copies in (envd, tmux, iptables),
+// the workspace user's `pip install --user` scripts, and the system
+// directories the startup script and setup-extra-ca.sh run their commands from.
+var runtimePathEntries = []string{"/shared/bin", "/home/sandbox/.local/bin", "/usr/local/bin", "/usr/bin", "/bin", "/sbin"}
+
+// pathSetupScript rebuilds PATH from the one the container starts with -- the
+// image's, or the one the template's environment or ENV steps set -- followed
+// by runtimePathEntries, keeping each directory's first occurrence in order.
+// An empty or unset PATH becomes exactly runtimePathEntries.
+//
+// Entries that are empty, relative (".", "bin", "~/bin") or contain a ".."
+// segment are dropped. They resolve against whatever directory a command
+// happens to run in, and Hands refuses to start any command while PATH holds
+// one (childEnvironment in claw/packages/hands), so an image declaring one
+// would give a sandbox that starts but can run nothing.
+//
+// The pod spec does not set PATH: a PATH env var on the container replaces the
+// image's, and every command envd starts inherits it, so an image's venv,
+// toolchain and sbin directories vanished from the sandbox while every other
+// variable the image declares came through. Appending rather than prepending
+// lets a command find the image's binary first where the image has one; envd
+// runs the injected iptables and tmux by their path (pkg/envd/injected), and
+// its tmux server on a socket of its own, so its own tools do not depend on
+// the order.
+//
+// It runs first, ahead of the extra-CA check and the build steps, so both find
+// the system commands they run however short the starting PATH is. It uses
+// only shell builtins, and ends in `;`, as the prefix after it does.
+func pathSetupScript() string { return pathSetupScriptFor(runtimePathEntries) }
+
+// pathSetupScriptFor is pathSetupScript appending entries. The entries travel
+// as one single-quoted word, so a space or a glob character in one is taken
+// literally; a ':' would split it, and validPathEntry rules that out.
+func pathSetupScriptFor(entries []string) string {
+	return `__sandbox_path_rest="${PATH-}:"` + shellSingleQuote(strings.Join(entries, ":")+":") + `; __sandbox_path=; ` +
+		`while [ -n "$__sandbox_path_rest" ]; do ` +
+		`__sandbox_path_dir="${__sandbox_path_rest%%:*}"; __sandbox_path_rest="${__sandbox_path_rest#*:}"; ` +
+		`case "$__sandbox_path_dir" in */../*|*/..) ;; /*) case ":$__sandbox_path:" in *":$__sandbox_path_dir:"*) ;; ` +
+		`*) __sandbox_path="${__sandbox_path:+$__sandbox_path:}$__sandbox_path_dir" ;; esac ;; esac; done; ` +
+		`PATH="$__sandbox_path"; export PATH; unset __sandbox_path_rest __sandbox_path_dir __sandbox_path; `
+}
+
+// validPathEntry reports whether e can stand in runtimePathEntries: an
+// absolute directory with no ':' (the PATH separator), no ".." segment and no
+// newline, so pathSetupScript keeps it as written.
+func validPathEntry(e string) bool {
+	if !strings.HasPrefix(e, "/") || strings.ContainsAny(e, ":\n") {
+		return false
+	}
+	for _, seg := range strings.Split(e, "/") {
+		if seg == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// shellSingleQuote quotes s as one literal POSIX shell word.
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 // buildStartupScript builds the container startup command from steps + exec envd.
-// The initContainer copies envd and tmux to /shared/bin/ before the main container starts.
+// The initContainer copies envd and tmux to /shared/bin/ before the main container
+// starts; buildPodTemplate puts pathSetupScript (and the extra-CA check) ahead of it.
 //
 // Example output:
 //
-//	export PATH=/shared/bin:$PATH && mkdir -p /home/sandbox && pip install numpy -q && exec /shared/bin/envd --port=8080 --workspace=/home/sandbox
+//	mkdir -p /home/sandbox && pip install numpy -q && exec /shared/bin/envd --port=8080 --workspace=/home/sandbox
 func buildStartupScript(steps []runtimev1alpha1.SandboxBuildStep, workspace string) string {
 	var parts []string
-	// Add /shared/bin to PATH so EnvD can find tmux (injected by initContainer).
-	parts = append(parts, "export PATH=/shared/bin:$PATH")
 	// Create workspace directory — it may not exist in the base image.
 	// We intentionally do NOT cd into it: the container keeps the image's default
 	// WORKDIR, which may be meaningful for custom images. EnvD's --workspace flag
@@ -361,15 +423,10 @@ func (r *CodeInterpreterReconciler) buildPodTemplate(ci *runtimev1alpha1.CodeInt
 		}
 	}
 
-	// Inject PATH that includes /shared/bin (for envd, tmux injected by initContainer).
-	// This is always prepended so envd and tmux are discoverable regardless of
-	// the base image's default PATH or user's env steps.
-	// If the user also sets PATH via env step, their value is already in envVars
-	// above; we prepend /shared/bin to ensure injected tools are always found.
-	envVars = append(envVars, corev1.EnvVar{
-		Name:  "PATH",
-		Value: "/shared/bin:/home/sandbox/.local/bin:/usr/local/bin:/usr/bin:/bin:/sbin",
-	})
+	// PATH is deliberately not set here: a PATH env var on the container would
+	// replace the image's. The startup script appends what the sandbox needs to
+	// whatever PATH the container starts with (pathSetupScript), and a PATH the
+	// template's environment or ENV steps set above is kept the same way.
 	envVars = append(envVars, corev1.EnvVar{
 		Name: "POD_UID",
 		ValueFrom: &corev1.EnvVarSource{
@@ -540,6 +597,7 @@ func (r *CodeInterpreterReconciler) buildPodTemplate(ci *runtimev1alpha1.CodeInt
 	if extraCAEnabled() {
 		startupScript = extraCASetupScript + startupScript
 	}
+	startupScript = pathSetupScript() + startupScript
 
 	mainVolumeMounts := []corev1.VolumeMount{
 		{Name: "envd-bin", MountPath: "/shared/bin"},

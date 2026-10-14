@@ -9,6 +9,7 @@ import (
 
 	"github.com/coreos/go-iptables/iptables"
 
+	"sigs.k8s.io/agent-sandbox/pkg/envd/injected"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
@@ -24,6 +25,20 @@ const (
 	// from REDIRECT, while user processes (spawned without this group) are captured.
 	EnvDProxyGID = 15534
 )
+
+// injectedPath is injected.Path; tests point it at a directory of their own.
+var injectedPath = injected.Path
+
+// newIPTables runs the iptables the envd-injector copied in beside envd, the
+// legacy backend Kata needs, rather than whichever one the image's PATH would
+// find first; without an injected copy it resolves through PATH as before.
+func newIPTables(proto iptables.Protocol) (*iptables.IPTables, error) {
+	tool := "iptables"
+	if proto == iptables.ProtocolIPv6 {
+		tool = "ip6tables"
+	}
+	return iptables.New(iptables.IPFamily(proto), iptables.Path(injectedPath(tool)))
+}
 
 // AddEnvDProxyGroup adds EnvDProxyGID to the current process's supplementary
 // groups. Must be called before SetupIPTables so iptables rules can match it.
@@ -50,7 +65,7 @@ func AddEnvDProxyGroup() error {
 // EnvD's own traffic is exempted via --gid-owner matching on EnvDProxyGID.
 // Must be called with CAP_NET_ADMIN after AddEnvDProxyGroup.
 func SetupIPTables() error {
-	ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
+	ipt, err := newIPTables(iptables.ProtocolIPv4)
 	if err != nil {
 		return fmt.Errorf("init iptables: %w", err)
 	}
@@ -105,7 +120,7 @@ func SetupIPTables() error {
 
 // setupIPv6Drop blocks all outbound IPv6 TCP except loopback and EnvD's own traffic.
 func setupIPv6Drop(gid string) error {
-	ipt6, err := iptables.NewWithProtocol(iptables.ProtocolIPv6)
+	ipt6, err := newIPTables(iptables.ProtocolIPv6)
 	if err != nil {
 		return fmt.Errorf("init ip6tables: %w", err)
 	}
@@ -132,11 +147,11 @@ func setupIPv6Drop(gid string) error {
 
 // CleanupIPTables removes the egress redirect rules. Best-effort, logs errors.
 func CleanupIPTables() {
-	if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv4); err == nil {
+	if ipt, err := newIPTables(iptables.ProtocolIPv4); err == nil {
 		_ = ipt.Delete(natTable, outputChain, "-p", "tcp", "-j", egressChain)
 		_ = ipt.ClearAndDeleteChain(natTable, egressChain)
 	}
-	if ipt6, err := iptables.NewWithProtocol(iptables.ProtocolIPv6); err == nil {
+	if ipt6, err := newIPTables(iptables.ProtocolIPv6); err == nil {
 		_ = ipt6.Delete(filterTable, outputChain, "-p", "tcp", "-j", egressChain)
 		_ = ipt6.ClearAndDeleteChain(filterTable, egressChain)
 	}
