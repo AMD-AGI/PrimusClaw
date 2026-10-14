@@ -13,7 +13,13 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"sigs.k8s.io/agent-sandbox/pkg/envd/injected"
 )
+
+// tmuxPath is the tmux the envd-injector copied in beside envd when there is
+// one, so a session does not depend on whether the image ships its own.
+func tmuxPath() string { return injected.Path("tmux") }
 
 // handleSessionCreate handles POST /api/session/create
 // Creates a new tmux session and returns its terminal_id.
@@ -26,7 +32,7 @@ func (s *Server) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 	id := newShortID()
 	sessionName := "sandbox-" + id
 
-	cmd := exec.CommandContext(r.Context(), "tmux", "new-session", "-d", "-s", sessionName,
+	cmd := exec.CommandContext(r.Context(), tmuxPath(), "new-session", "-d", "-s", sessionName,
 		"-x", fmt.Sprintf("%d", s.tmuxWidth),
 		"-y", fmt.Sprintf("%d", s.tmuxHeight),
 	)
@@ -82,7 +88,7 @@ func (s *Server) handleSessionExec(w http.ResponseWriter, r *http.Request, sessi
 	// We search for "\nMARKER" (line-start match) to find only the real output line,
 	// not the marker that appears inside the echoed command string.
 	fullCmd := fmt.Sprintf("%s; printf '\\n%s\\n'", command, marker)
-	sendKeys := exec.Command("tmux", "send-keys", "-t", sessionName, fullCmd, "Enter")
+	sendKeys := exec.Command(tmuxPath(), "send-keys", "-t", sessionName, fullCmd, "Enter")
 	if out, err := sendKeys.CombinedOutput(); err != nil {
 		httpError(w, "failed to send keys: "+string(out), http.StatusInternalServerError)
 		return
@@ -99,7 +105,7 @@ func (s *Server) handleSessionExec(w http.ResponseWriter, r *http.Request, sessi
 		time.Sleep(100 * time.Millisecond)
 
 		// Capture full pane history (not just visible area) to avoid scroll-off issues
-		capture := exec.Command("tmux", "capture-pane", "-t", sessionName, "-p", "-S", "-")
+		capture := exec.Command(tmuxPath(), "capture-pane", "-t", sessionName, "-p", "-S", "-")
 		out, err := capture.Output()
 		if err != nil {
 			continue
@@ -160,7 +166,7 @@ func (s *Server) handleSessionOutput(w http.ResponseWriter, r *http.Request, ses
 	}
 
 	sessionName := "sandbox-" + sessionID
-	capture := exec.CommandContext(r.Context(), "tmux", "capture-pane", "-t", sessionName, "-p")
+	capture := exec.CommandContext(r.Context(), tmuxPath(), "capture-pane", "-t", sessionName, "-p")
 	out, err := capture.Output()
 	if err != nil {
 		httpError(w, "failed to capture pane: "+err.Error(), http.StatusInternalServerError)
@@ -179,7 +185,7 @@ func (s *Server) handleSessionDelete(w http.ResponseWriter, r *http.Request, ses
 	}
 
 	sessionName := "sandbox-" + sessionID
-	cmd := exec.CommandContext(r.Context(), "tmux", "kill-session", "-t", sessionName)
+	cmd := exec.CommandContext(r.Context(), tmuxPath(), "kill-session", "-t", sessionName)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		httpError(w, "failed to kill session: "+string(out), http.StatusInternalServerError)
 		return
@@ -227,7 +233,7 @@ func (s *Server) handleTerminalSendKeys(w http.ResponseWriter, r *http.Request, 
 				args = append(args, "") // no Enter for regular text
 			}
 		}
-		cmd := exec.CommandContext(r.Context(), "tmux", args...)
+		cmd := exec.CommandContext(r.Context(), tmuxPath(), args...)
 		if _, err := cmd.CombinedOutput(); err != nil {
 			// Best-effort; continue
 		}
@@ -253,7 +259,7 @@ func (s *Server) handleTerminalScreen(w http.ResponseWriter, r *http.Request, se
 	sessionName := "sandbox-" + sessionID
 
 	// Capture with cursor position
-	capture := exec.CommandContext(r.Context(), "tmux", "capture-pane", "-t", sessionName, "-p", "-e")
+	capture := exec.CommandContext(r.Context(), tmuxPath(), "capture-pane", "-t", sessionName, "-p", "-e")
 	out, err := capture.Output()
 	if err != nil {
 		httpError(w, "failed to capture screen: "+err.Error(), http.StatusInternalServerError)

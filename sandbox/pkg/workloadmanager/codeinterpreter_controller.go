@@ -278,16 +278,42 @@ func envdInjectorImage() string {
 	return "primussafe/agent-sandbox-envd-injector:latest"
 }
 
+// runtimePathEntries is the PATH every sandbox had while the pod spec set it:
+// the tools the envd-injector initContainer copies in (envd, tmux, iptables),
+// the workspace user's `pip install --user` scripts, and the system
+// directories the startup script and setup-extra-ca.sh run their commands from.
+var runtimePathEntries = []string{"/shared/bin", "/home/sandbox/.local/bin", "/usr/local/bin", "/usr/bin", "/bin", "/sbin"}
+
+// pathSetupScript keeps the PATH the container starts with -- the image's, or
+// the one the template's environment or ENV steps set -- in its own order, and
+// appends each entry of runtimePathEntries it lacks, once. An empty PATH
+// becomes exactly runtimePathEntries.
+//
+// The pod spec does not set PATH: a PATH env var on the container replaces the
+// image's, and every command envd starts inherits it, so an image's venv,
+// toolchain and sbin directories vanished from the sandbox while every other
+// variable the image declares came through. Appending rather than prepending
+// lets a command find the image's binary first where the image has one; envd
+// runs the injected iptables and tmux by their path (pkg/envd/injected), so
+// its own tools do not depend on the order.
+//
+// It runs first, ahead of the extra-CA check and the build steps, so both find
+// the system commands they run however short the starting PATH is. It ends in
+// `;`: `export` cannot fail, and the prefix after it ends in `;` as well.
+func pathSetupScript() string {
+	return "for d in " + strings.Join(runtimePathEntries, " ") +
+		`; do case ":${PATH}:" in *":${d}:"*) ;; *) PATH="${PATH:+${PATH}:}${d}" ;; esac; done; export PATH; `
+}
+
 // buildStartupScript builds the container startup command from steps + exec envd.
-// The initContainer copies envd and tmux to /shared/bin/ before the main container starts.
+// The initContainer copies envd and tmux to /shared/bin/ before the main container
+// starts; buildPodTemplate puts pathSetupScript (and the extra-CA check) ahead of it.
 //
 // Example output:
 //
-//	export PATH=/shared/bin:$PATH && mkdir -p /home/sandbox && pip install numpy -q && exec /shared/bin/envd --port=8080 --workspace=/home/sandbox
+//	mkdir -p /home/sandbox && pip install numpy -q && exec /shared/bin/envd --port=8080 --workspace=/home/sandbox
 func buildStartupScript(steps []runtimev1alpha1.SandboxBuildStep, workspace string) string {
 	var parts []string
-	// Add /shared/bin to PATH so EnvD can find tmux (injected by initContainer).
-	parts = append(parts, "export PATH=/shared/bin:$PATH")
 	// Create workspace directory — it may not exist in the base image.
 	// We intentionally do NOT cd into it: the container keeps the image's default
 	// WORKDIR, which may be meaningful for custom images. EnvD's --workspace flag
@@ -361,15 +387,10 @@ func (r *CodeInterpreterReconciler) buildPodTemplate(ci *runtimev1alpha1.CodeInt
 		}
 	}
 
-	// Inject PATH that includes /shared/bin (for envd, tmux injected by initContainer).
-	// This is always prepended so envd and tmux are discoverable regardless of
-	// the base image's default PATH or user's env steps.
-	// If the user also sets PATH via env step, their value is already in envVars
-	// above; we prepend /shared/bin to ensure injected tools are always found.
-	envVars = append(envVars, corev1.EnvVar{
-		Name:  "PATH",
-		Value: "/shared/bin:/home/sandbox/.local/bin:/usr/local/bin:/usr/bin:/bin:/sbin",
-	})
+	// PATH is deliberately not set here: a PATH env var on the container would
+	// replace the image's. The startup script appends what the sandbox needs to
+	// whatever PATH the container starts with (pathSetupScript), and a PATH the
+	// template's environment or ENV steps set above is kept the same way.
 	envVars = append(envVars, corev1.EnvVar{
 		Name: "POD_UID",
 		ValueFrom: &corev1.EnvVarSource{
@@ -540,6 +561,7 @@ func (r *CodeInterpreterReconciler) buildPodTemplate(ci *runtimev1alpha1.CodeInt
 	if extraCAEnabled() {
 		startupScript = extraCASetupScript + startupScript
 	}
+	startupScript = pathSetupScript() + startupScript
 
 	mainVolumeMounts := []corev1.VolumeMount{
 		{Name: "envd-bin", MountPath: "/shared/bin"},
