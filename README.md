@@ -68,14 +68,17 @@ argument (`api` / `brain` / `hands`) — see
 | Package | Path | Description |
 |---------|------|-------------|
 | **api** | `packages/api` | Public-facing Fastify server: sessions, events (SSE), memory, skills, plugins, MCP, admin, A2A, task DAGs. Persists to PostgreSQL, publishes tasks to NATS. |
-| **brain** | `packages/brain` | Core agent-loop engine: LLM calls, tool routing/resolution, sub-agents, SaFE sandbox lifecycle, workspace↔S3 sync. Consumes tasks from NATS as a pull-consumer (auto-sharded across replicas). |
+| **brain** | `packages/brain` | Core agent-loop engine: LLM calls, tool routing/resolution, sub-agents, SaFE sandbox lifecycle, workspace↔S3 sync. Pulls tasks from one durable JetStream consumer, `brain-workers`, which the API provisions and every replica shares; whichever replica has capacity takes the next task. |
 | **hands** | `packages/hands` | MCP tool server that runs *inside* the per-session SaFE sandbox (fs / exec / patch tools). Brain talks to it over MCP/HTTP. |
 | **protocol** | `packages/protocol` | The api↔brain contract: shared types, NATS subject builders, sandbox env composition, and the coordination protocols (run leases, task consumer, sandbox handle map, hands parking). |
 | **utils** | `packages/utils` | Domain-free helpers, safe for every role including the in-sandbox one: KV abstraction, secret redaction, constant-time compare, env settings. |
 
-Dependency order is `utils → protocol → {hands, brain, api}`. `hands` deliberately
-depends on `utils` only: it runs inside the sandbox and must not reach the
-control-plane protocol.
+Dependency order is `utils → protocol → {hands, brain, api}`. `hands` runs inside
+the sandbox. It depends on `utils` and `protocol`, but takes from `protocol` only
+the contract it shares with Brain: background-shell records and their
+classification, reclaim causes and reap grace bounds, and the Hands credential
+header. `protocol` has no dependency other than `utils`, and `hands` opens no
+NATS or database connection.
 
 ## Repository layout
 

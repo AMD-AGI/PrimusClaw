@@ -4,7 +4,7 @@
 
 | Goal | Description |
 |------|------|
-| Old Brain stops accepting new tasks during upgrade | Stops pulling within milliseconds after version signal arrives |
+| Old Brain stops accepting new tasks during upgrade | Hands new deliveries back within milliseconds after version signal arrives |
 | New Brain comes online first, old Brain exits last | maxSurge=100%, no gap, no forced interruption |
 | Old Brain exits naturally, K8s auto-cleans | Old Pod completes tasks then receives SIGTERM → exit, Deployment auto-reclaims |
 | Current in-flight tasks are not interrupted or can be resumed | Checkpoint after SIGTERM, any new Brain can resume |
@@ -23,8 +23,8 @@ New: Deployment  (maxSurge=100%, maxUnavailable=0)
 ```
 
 Brain is essentially a stateless worker — all persistent state (NATS/PG/S3/KV) is external.
-StatefulSet's stable Pod ordinals were only used for NATS durable consumer naming;
-after switching to Ephemeral consumers, this dependency is eliminated and safe migration to Deployment is possible.
+StatefulSet's stable Pod ordinals were only used for naming each Pod's NATS durable consumer;
+with every Pod pulling from one shared durable (§2.3), this dependency is eliminated and safe migration to Deployment is possible.
 
 ### 2.2 Upgrade Flow
 
@@ -64,17 +64,25 @@ Old Brain: already idle (tasks completed earlier) → exits in seconds
 K8s auto-cleans old Pods, Deployment stabilizes at 3 replicas
 ```
 
-### 2.3 NATS Consumer Change: Durable → Ephemeral
+### 2.3 NATS Consumer Change: Per-Pod Durable → One Shared Durable
 
 ```
-Old: durable consumer (name = BRAIN_ID = primus-claw-brain-0)
+Old: one durable consumer per Pod (name = BRAIN_ID = primus-claw-brain-0)
     → Consumer persists after Pod exits, requires manual cleanup
 
-New: ephemeral consumer (no durable_name)
-    → NATS auto-destroys on connection disconnect, zero residual
-    → Multiple concurrent Brains still fan-out, session lock ensures single-instance processing
-    → Pod restart creates new ephemeral consumer, nak'd messages redeliver after ack_wait
+New: one durable pull consumer, brain-workers, shared by every Brain Pod
+    → Fixed name: nothing is left behind per Pod, and no Pod ordinal is needed
+    → Each message goes to one Pod at a time; a Pod with free capacity pulls the next one
+    → Provisioned and reconciled by the API; Brain pulls from it but never writes its config
+    → A Pod that exits mid-task stops acking; the message is redelivered after ack_wait
 ```
+
+This section originally planned one ephemeral consumer per Pod (no `durable_name`).
+That was implemented and then replaced by the shared durable, for two reasons: every
+Pod's consumer received every message, so all Pods contended for the session lock on
+each task; and the implementation used an ordered consumer (`ack_policy: none`), which
+ignores `nak()`, so a task handed back after a retryable failure was lost. The shared
+durable is described in [`architecture-design.md`](architecture-design.md) §6.1.
 
 ---
 
@@ -491,6 +499,15 @@ async function watchVersionDrain(): Promise<void> {
 }
 ```
 
+As shipped, the version drain does not call `consumerIter.stop()`. Stopping the
+consumer cannot be undone, and this drain has to be reversible: a Pod that drained
+on a stale value resumes once the key names its version (§2.2). A drained Pod keeps
+its consumer and hands each new delivery back, as the `draining` branch in §5.6.6
+does; only the SIGTERM handler (§5.6.2) stops the consumer. The version test is
+also identity rather than the `<` above (§2.2), and the drain is tracked apart from
+shutdown, so a Pod that has already drained still runs the SIGTERM handler instead
+of returning at its `if (draining)` guard.
+
 #### 5.6.4 Checkpoint Utility Functions
 
 ```typescript
@@ -783,28 +800,12 @@ async function main() {
   // Start version-aware drain watcher.
   await watchVersionDrain();                    // ADD
 
-  // ── Ephemeral consumer (replaces durable) ────────────────────────────────
-  // No durable_name → NATS server destroys consumer when connection closes.
-  // Pod restart creates a fresh consumer; in-flight messages are redelivered
-  // after ack_wait. Zero orphaned consumers on upgrades.
-  const consumerCfg = {
-    // durable_name intentionally omitted: ephemeral consumer
-    filter_subject: taskSub,
-    ack_policy: AckPolicy.Explicit,
-    max_ack_pending: MAX_CONCURRENT,
-    ack_wait: 120_000_000_000,  // 120s in ns — unchanged
-  };
-  // IMPORTANT: create the consumer explicitly so cfg actually takes effect.
-  // The exact API differs across nats.js versions; wrap it in one helper.
-  //
-  // Example contract:
-  //   const consumer = await createEphemeralConsumer(jsm, js, taskStreamName, consumerCfg);
-  //
-  // Helper semantics:
-  //   1) create ephemeral consumer with consumerCfg (no durable_name)
-  //   2) return a handle supporting consume()
-  //   3) on process exit / nc.drain(), server auto-removes the consumer
-  const consumer = await createEphemeralConsumer(jsm, js, taskStreamName, consumerCfg);
+  // ── Shared durable consumer (see §2.3) ──────────────────────────────────
+  // Every Brain Pod pulls from the one `brain-workers` durable. The API
+  // provisions and reconciles it; Brain waits for it and checks its
+  // configuration, but never writes it. A Pod that exits mid-task stops
+  // acking, and the message is redelivered after ack_wait.
+  const consumer = await js.consumers.get(TASK_STREAM_NAME, TASK_CONSUMER_NAME);
 
   // Wrap consume loop to support draining.
   const iter = await consumer.consume();
@@ -1071,11 +1072,11 @@ t=30  All 3 new Pods pass readinessProbe
         ↓ (new version confirmed healthy, safety point)
         upgrade.sh: write brain.min_version = NEW_TAG
         │ (KV Watch millisecond-level push)
-        ├─ Brain-old-0 → draining=true → consumerIter.stop()
-        ├─ Brain-old-1 → draining=true → consumerIter.stop()
-        └─ Brain-old-2 → draining=true → consumerIter.stop()
+        ├─ Brain-old-0 → draining=true → hand new deliveries back (consumer keeps running)
+        ├─ Brain-old-1 → draining=true → hand new deliveries back (consumer keeps running)
+        └─ Brain-old-2 → draining=true → hand new deliveries back (consumer keeps running)
 
-t=30  New Pods take over all new tasks (old Pods stopped pulling)
+t=30  New Pods take over all new tasks (old Pods hand every new delivery back)
       Deployment controller: simultaneously sends SIGTERM to old Pods
 
 t=30  Brain-old-0,1,2 receive SIGTERM
@@ -1284,7 +1285,7 @@ Sandbox alive means:
 | `packages/brain/src/agent/index.ts` | Extend `ExecuteExtras`, add `CheckpointState` interface | ~20 lines |
 | `packages/brain/src/agent/agent-loop.ts` | `LoopOptions` extension, resume initialization, setup_commands tracking, turn boundary checkpoint | ~60 lines |
 | `packages/brain/src/engines/claude.ts` | Pass `onCheckpoint` / `resumeFrom` to agentLoop | ~5 lines |
-| `packages/brain/src/index.ts` | SIGTERM handler, version drain KV Watch, ephemeral consumer, checkpoint utility functions, handleTask refactor | ~160 lines |
+| `packages/brain/src/index.ts` | SIGTERM handler, version drain KV Watch, shared durable consumer (§2.3), checkpoint utility functions, handleTask refactor | ~160 lines |
 | `deploy/manifests/brain-deployment.yaml` | StatefulSet → Deployment, maxSurge=3, BRAIN_VERSION env, preStop, remove serviceName | Rewrite (~60 lines) |
 | `deploy/charts/claw/templates/services.yaml` | Delete headless service | ~15 lines deleted |
 | `deploy/upgrade.sh` | `upgrade_brain()` function (signal + apply), Step 4/5 reference new filenames | ~30 lines |

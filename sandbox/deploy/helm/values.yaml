@@ -206,7 +206,7 @@ workloadmanager:
 # metadata endpoints and the public internet. Enable it in production.
 egress:
   enabled: false                    # true = enable transparent proxy + SSRF protection
-  extraBlockedCIDRs: ""             # Extra blocked CIDRs (comma-separated), e.g. "169.254.0.0/16,100.64.0.0/10"
+  extraBlockedCIDRs: ""             # Extra blocked CIDRs (comma-separated) for ranges the built-in list does not cover, e.g. "203.0.113.0/24,198.51.100.0/24"
 
 # ── Inference (unified inference gateway) ─────────────────────────────────────
 # OPENAI_BASE_URL injected via Pod env (global);

@@ -25,8 +25,11 @@ Build order is `utils → protocol → {hands, brain, api}`, and `npm run build
 each package consumes its dependencies' emitted `.d.ts`, so a package must be
 listed after everything it imports.
 
-`hands` depends on `utils` only, deliberately. It runs inside the sandbox and
-must not reach the control-plane protocol.
+`hands` runs inside the sandbox. It depends on `utils` and `protocol`, but takes
+from `protocol` only the contract it shares with Brain: background-shell records
+and their classification, reclaim causes and reap grace bounds, and the Hands
+credential header. `protocol` has no dependency other than `utils`, and `hands`
+opens no NATS or database connection.
 
 ## Build and run
 

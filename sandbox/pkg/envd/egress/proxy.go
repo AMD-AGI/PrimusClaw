@@ -15,8 +15,9 @@ import (
 )
 
 // PolicyEvaluator is the extension point for OPA policy evaluation (Phase 4).
-// The transparent proxy calls Evaluate after SSRF checks pass. Phase 3 uses
-// DefaultPolicyEvaluator which allows all traffic.
+// The transparent proxy calls Evaluate after SSRF checks pass. envd passes the
+// built-in pkg/policy evaluator (NewPolicyEngineAdapter); DefaultPolicyEvaluator,
+// which allows all traffic, is used only when the evaluator is nil.
 type PolicyEvaluator interface {
 	Evaluate(ctx context.Context, req EgressRequest) Decision
 }
