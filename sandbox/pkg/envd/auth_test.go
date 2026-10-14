@@ -125,3 +125,43 @@ func TestHandlerCapturesOnlyAuthenticatedTokens(t *testing.T) {
 		}
 	}
 }
+
+// TestSessionIDComesFromTheVerifiedToken: with a verification key, the session
+// envd calls Workload Manager for is the one in the token it verified, whatever
+// x-session-id the first request carried. Without one, the header is all there is.
+func TestSessionIDComesFromTheVerifiedToken(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	sessionFile := filepath.Join(t.TempDir(), "session-id")
+	require.NoError(t, os.WriteFile(sessionFile, []byte("session-a\n"), 0o600))
+	t.Setenv(SessionIDFileEnvVar, sessionFile)
+	claims := jwt.MapClaims{
+		"iss": jwtIssuer, "aud": jwtAudience, "session_id": "session-a",
+		"iat": time.Now().Unix(), "exp": time.Now().Add(5 * time.Minute).Unix(),
+	}
+	token, err := jwt.NewWithClaims(jwt.SigningMethodRS256, claims).SignedString(key)
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		name   string
+		verify bool
+		want   string
+	}{
+		{name: "verified token", verify: true, want: "session-a"},
+		{name: "no verification key", want: "session-other"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Server{auth: &authManager{}, inference: &inferenceKeyCache{ready: make(chan struct{})}}
+			if tc.verify {
+				s.auth.publicKey = &key.PublicKey
+			}
+			req := httptest.NewRequest(http.MethodGet, "/api/jobs", nil)
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("x-session-id", "session-other")
+			rec := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rec, req)
+			require.Equal(t, http.StatusOK, rec.Code)
+			require.Equal(t, tc.want, s.inference.getSessionID())
+		})
+	}
+}

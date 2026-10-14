@@ -222,7 +222,13 @@ func (s *Server) sessionCaptureMiddleware(next http.Handler) http.Handler {
 		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
 			s.inference.setJWTToken(auth[len("Bearer "):])
 		}
-		if sid := r.Header.Get("x-session-id"); sid != "" {
+		// With a verification key the session comes from the token
+		// jwtMiddleware verified, not from a header anyone could have set.
+		sid := r.Header.Get("x-session-id")
+		if verified, ok := r.Context().Value(verifiedSessionIDKey{}).(string); ok {
+			sid = verified
+		}
+		if sid != "" {
 			s.inference.setSessionID(sid)
 		}
 		if s.auditReporter != nil {

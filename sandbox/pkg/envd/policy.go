@@ -34,10 +34,11 @@ type inferenceKeyCache struct {
 	sessionID    string // set once, from first request's x-session-id header
 	apiKey       string // cached after successful fetch
 	fetched      bool   // true after first successful fetch (apiKey may still be empty)
-	fetchStarted bool   // true once the fetch goroutine has been launched
+	fetchStarted bool   // true while a fetch goroutine runs
 
-	ready      chan struct{} // closed when fetch completes (success or failure)
+	ready      chan struct{} // closed when the first fetch completes (success or failure)
 	closeReady sync.Once
+	fetchDone  chan struct{} // closed when the latest fetch completes
 
 	httpClient *http.Client
 }
@@ -103,42 +104,59 @@ func (c *inferenceKeyCache) setSessionID(id string) {
 	c.tryStartFetch()
 }
 
-// tryStartFetch starts the background fetch goroutine if both sessionID and
-// jwtToken are set and fetch hasn't been started yet. Must be called with mu held.
+// tryStartFetch starts the background fetch goroutine if sessionID and a token
+// WM has not refused are set, no fetch is running and none has succeeded. A
+// fetch that ended without the key is started again by the next proxied request
+// that brings a fresh token. Must be called with mu held.
 func (c *inferenceKeyCache) tryStartFetch() {
-	if c.sessionID == "" || c.jwtToken == "" || c.wmURL == "" || c.fetchStarted {
+	if c.sessionID == "" || c.jwtToken == "" || c.jwtToken == c.refused || c.wmURL == "" || c.fetchStarted || c.fetched {
 		return
 	}
 	c.fetchStarted = true
-	go c.fetch(context.Background())
+	done := make(chan struct{})
+	c.fetchDone = done
+	go c.fetch(context.Background(), done)
 }
 
 // getApiKey returns the cached inference API Key (empty if not yet fetched or disabled).
-// Blocks up to 15s for the initial fetch to complete; returns empty on timeout
-// (e.g. when JWT is never captured because authMode=none).
+// It waits, up to 15s in all, for a running fetch -- and any fetch that one
+// hands over to with a fresher token -- or, before any fetch has started, for
+// the first one; it returns empty on timeout (e.g. when JWT is never captured
+// because authMode=none).
 func (c *inferenceKeyCache) getApiKey() string {
-	c.mu.RLock()
-	hasSession := c.sessionID != ""
-	key := c.apiKey
-	fetched := c.fetched
-	c.mu.RUnlock()
+	timeout := time.NewTimer(15 * time.Second)
+	defer timeout.Stop()
+	for waitedFirst := false; ; {
+		c.mu.RLock()
+		hasSession := c.sessionID != ""
+		key := c.apiKey
+		fetched := c.fetched
+		running := c.fetchStarted
+		done := c.fetchDone
+		c.mu.RUnlock()
 
-	if fetched {
-		return key
-	}
-	if !hasSession {
-		return key
-	}
+		if fetched || !hasSession {
+			return key
+		}
+		wait := done
+		switch {
+		case running:
+			// wait for it, then look again: it may hand over to a new fetch
+		case done != nil || waitedFirst:
+			return key // the latest fetch ended without a key; the next request retries
+		default:
+			wait, waitedFirst = c.ready, true // no fetch has started yet
+		}
 
-	select {
-	case <-c.ready:
-	case <-time.After(15 * time.Second):
-		log.Warn("inferenceKeyCache: timed out waiting for policy fetch (JWT may not have been captured)")
+		select {
+		case <-wait:
+		case <-timeout.C:
+			log.Warn("inferenceKeyCache: timed out waiting for policy fetch (JWT may not have been captured)")
+			c.mu.RLock()
+			defer c.mu.RUnlock()
+			return c.apiKey
+		}
 	}
-
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.apiKey
 }
 
 // getSessionID returns the captured session ID.
@@ -157,13 +175,23 @@ func (c *inferenceKeyCache) getWMURL() string {
 // fetch follows the first proxied request, which a warm-pool Pod sees only once
 // it is claimed.
 func (c *inferenceKeyCache) waitForReady(ctx context.Context) bool {
-	select {
-	case <-c.ready:
-		return true
-	case <-ctx.Done():
-		return false
+	warn := time.NewTimer(readyWarnAfter)
+	defer warn.Stop()
+	for {
+		select {
+		case <-c.ready:
+			return true
+		case <-ctx.Done():
+			return false
+		case <-warn.C:
+			log.Warn("inferenceKeyCache: no proxied request with a session ID and Router token yet; policy sync is waiting for one",
+				"waited", readyWarnAfter)
+		}
 	}
 }
+
+// readyWarnAfter is how long waitForReady waits before saying so.
+const readyWarnAfter = 30 * time.Second
 
 var (
 	errNoWM          = errors.New("workload manager URL is not set")
@@ -208,11 +236,23 @@ func (c *inferenceKeyCache) callWM(ctx context.Context, client *http.Client, met
 	return resp, nil
 }
 
-// fetch calls WM once to get the inference API Key and caches the result.
+// fetch calls WM to get the inference API Key and caches the result.
 // Retries a few times on transient failures (WM may not be ready yet when
-// the first request arrives right after Pod startup).
-func (c *inferenceKeyCache) fetch(ctx context.Context) {
-	defer c.closeReady.Do(func() { close(c.ready) })
+// the first request arrives right after Pod startup). Once WM has refused the
+// token, retrying cannot help: fetch ends, and the next proxied request starts
+// it again with the fresh token it brings.
+func (c *inferenceKeyCache) fetch(ctx context.Context, done chan struct{}) {
+	awaitingToken := false
+	defer func() {
+		c.mu.Lock()
+		c.fetchStarted = false
+		if awaitingToken {
+			c.tryStartFetch() // a fresh token may have arrived while this one was refused
+		}
+		c.mu.Unlock()
+		close(done)
+		c.closeReady.Do(func() { close(c.ready) })
+	}()
 
 	sid := c.getSessionID()
 
@@ -227,6 +267,12 @@ func (c *inferenceKeyCache) fetch(ctx context.Context) {
 		}
 
 		apiKey, err := c.doFetch(ctx)
+		if errors.Is(err, errAwaitingToken) {
+			awaitingToken = true
+			log.Warn("inferenceKeyCache: Workload Manager refused the Router token; fetching again on the next request",
+				"sessionId", sid)
+			return
+		}
 		if err != nil {
 			log.Warn("inferenceKeyCache: fetch failed",
 				"attempt", attempt+1, "error", err)
@@ -246,7 +292,7 @@ func (c *inferenceKeyCache) fetch(ctx context.Context) {
 		return
 	}
 
-	log.Warn("inferenceKeyCache: all retries exhausted, inference API key not available",
+	log.Warn("inferenceKeyCache: all retries exhausted, inference API key not available until the next request",
 		"sessionId", sid)
 }
 
@@ -257,6 +303,9 @@ func (c *inferenceKeyCache) doFetch(ctx context.Context) (string, error) {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return "", fmt.Errorf("%w: status %d", errAwaitingToken, resp.StatusCode)
+	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
 		return "", fmt.Errorf("non-200 response: %d %s", resp.StatusCode, string(body))

@@ -4,12 +4,17 @@
 package envd
 
 import (
+	"bytes"
 	"context"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -102,5 +107,132 @@ func TestCallWMSendsTheNewestTokenWMHasNotRefused(t *testing.T) {
 				require.Equal(t, strings.Split(token, ","), got, step)
 			}
 		})
+	}
+}
+
+// TestInferenceKeyFetchSurvivesARefusedToken: WM refuses the token the first
+// fetch is made with -- its key cache has not caught up with a rotated Router
+// key, or an audit upload had the same token refused first. The next proxied
+// request brings a fresh token, and the exec it carries gets the API key.
+func TestInferenceKeyFetchSurvivesARefusedToken(t *testing.T) {
+	var mu sync.Mutex
+	var seen []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		mu.Lock()
+		seen = append(seen, token)
+		mu.Unlock()
+		if strings.HasPrefix(token, "refused") {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"policyVersion":1,"inference":{"apiKey":"sk-session"}}`))
+	}))
+	defer server.Close()
+
+	c := &inferenceKeyCache{wmURL: server.URL, ready: make(chan struct{}), httpClient: server.Client()}
+	c.setJWTToken("refused-a")
+	c.setSessionID("sess-a")
+	select {
+	case <-c.ready:
+	case <-time.After(time.Minute):
+		t.Fatal("the first fetch never finished")
+	}
+
+	c.setJWTToken("fresh-b") // the next proxied request
+	assert.Equal(t, "sk-session", c.getApiKey())
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"refused-a", "fresh-b"}, seen)
+}
+
+// TestWaitForReadySaysItIsStillWaiting: a Pod that never sees a proxied request
+// keeps the policy syncer waiting, and says so instead of waiting silently.
+func TestWaitForReadySaysItIsStillWaiting(t *testing.T) {
+	var buf bytes.Buffer
+	var bufMu sync.Mutex
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&lockedWriter{w: &buf, mu: &bufMu}, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	synctest.Test(t, func(t *testing.T) {
+		c := &inferenceKeyCache{ready: make(chan struct{})}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		result := make(chan bool, 1)
+		go func() { result <- c.waitForReady(ctx) }()
+
+		time.Sleep(readyWarnAfter + time.Second)
+		synctest.Wait()
+		bufMu.Lock()
+		logged := buf.String()
+		bufMu.Unlock()
+		assert.Contains(t, logged, "policy sync is waiting")
+
+		close(c.ready) // the first request finally arrives
+		assert.True(t, <-result)
+	})
+}
+
+type lockedWriter struct {
+	w  io.Writer
+	mu *sync.Mutex
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
+}
+
+// TestInferenceKeyWaitsForTheFetchARefusalHandsOverTo: the next proxied request
+// brings a fresh token while the refused fetch is still waiting for WM. Its
+// command must wait for the fetch made with the fresh token, not return when
+// the refused one ends.
+func TestInferenceKeyWaitsForTheFetchARefusalHandsOverTo(t *testing.T) {
+	release := make(chan struct{})
+	arrived := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ") == "refused-a" {
+			arrived <- struct{}{}
+			<-release
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		time.Sleep(50 * time.Millisecond) // the fresh fetch takes a moment too
+		_, _ = w.Write([]byte(`{"policyVersion":1,"inference":{"apiKey":"sk-session"}}`))
+	}))
+	defer server.Close()
+
+	c := &inferenceKeyCache{wmURL: server.URL, ready: make(chan struct{}), httpClient: server.Client()}
+	c.setJWTToken("refused-a")
+	c.setSessionID("sess-a")
+	<-arrived
+
+	c.setJWTToken("fresh-b") // the next proxied request, while WM still holds the first
+	got := make(chan string, 1)
+	go func() { got <- c.getApiKey() }()
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	select {
+	case key := <-got:
+		assert.Equal(t, "sk-session", key)
+	case <-time.After(time.Minute):
+		t.Fatal("getApiKey never returned")
+	}
+}
+
+// TestInferenceKeyWithoutWorkloadManagerDoesNotWait: with no WM URL the session
+// ID closes ready without any fetch, and getApiKey returns at once.
+func TestInferenceKeyWithoutWorkloadManagerDoesNotWait(t *testing.T) {
+	c := &inferenceKeyCache{ready: make(chan struct{})}
+	c.setSessionID("sess-a")
+	got := make(chan string, 1)
+	go func() { got <- c.getApiKey() }()
+	select {
+	case key := <-got:
+		assert.Empty(t, key)
+	case <-time.After(5 * time.Second):
+		t.Fatal("getApiKey kept waiting with no fetch to wait for")
 	}
 }
