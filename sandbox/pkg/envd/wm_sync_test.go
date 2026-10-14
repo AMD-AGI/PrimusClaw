@@ -44,27 +44,63 @@ type inProcessWM struct {
 	mu      sync.Mutex
 	handler http.Handler
 	calls   []string
+	fault   map[string]wmFault // per internal API
+}
+
+// wmFault is how WM fails calls to one internal API.
+type wmFault struct {
+	refuse int  // answer the next refuse calls 401
+	down   bool // the connection fails
+	hang   bool // no answer until the caller gives up
 }
 
 func (p *inProcessWM) RoundTrip(req *http.Request) (*http.Response, error) {
-	p.mu.Lock()
-	h := p.handler
-	p.mu.Unlock()
-	served := req.Clone(req.Context())
-	served.RequestURI = req.URL.RequestURI()
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, served)
 	api, _, _ := strings.Cut(strings.TrimPrefix(req.URL.Path, "/v1/internal/"), "/")
 	p.mu.Lock()
-	p.calls = append(p.calls, fmt.Sprintf("%s %d", api, rec.Code))
+	h, fault := p.handler, p.fault[api]
+	if fault.refuse > 0 {
+		f := p.fault[api]
+		f.refuse--
+		p.fault[api] = f
+	}
 	p.mu.Unlock()
+	switch {
+	case fault.down:
+		p.record(api + " down")
+		return nil, fmt.Errorf("dial workload manager: connection refused")
+	case fault.hang:
+		<-req.Context().Done()
+		p.record(api + " hung")
+		return nil, req.Context().Err()
+	}
+	rec := httptest.NewRecorder()
+	if fault.refuse > 0 {
+		rec.WriteHeader(http.StatusUnauthorized)
+	} else {
+		served := req.Clone(req.Context())
+		served.RequestURI = req.URL.RequestURI()
+		h.ServeHTTP(rec, served)
+	}
+	p.record(fmt.Sprintf("%s %d", api, rec.Code))
 	return rec.Result(), nil
+}
+
+func (p *inProcessWM) record(call string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls = append(p.calls, call)
 }
 
 func (p *inProcessWM) use(h http.Handler) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.handler, p.calls = h, nil
+	p.handler, p.calls, p.fault = h, nil, map[string]wmFault{}
+}
+
+func (p *inProcessWM) setFault(api string, f wmFault) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.fault[api] = f
 }
 
 // summary counts WM's answers per internal API, e.g. "policy 200=2 401=1".
@@ -88,11 +124,16 @@ func (p *inProcessWM) summary() string {
 }
 
 func (p *inProcessWM) count(status int) int {
+	return p.countCalls(fmt.Sprintf(" %d", status))
+}
+
+// countCalls counts calls whose record ends in suffix, e.g. "audit hung".
+func (p *inProcessWM) countCalls(suffix string) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	n := 0
 	for _, c := range p.calls {
-		if strings.HasSuffix(c, fmt.Sprintf(" %d", status)) {
+		if strings.HasSuffix(c, suffix) {
 			n++
 		}
 	}
@@ -108,7 +149,7 @@ func (r *recordingAuditStore) Store(_ context.Context, e *audit.AuditEvent) erro
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if e.Egress != nil {
-		r.domains = append(r.domains, e.Egress.Domain+"@"+e.Metadata["observedAt"])
+		r.domains = append(r.domains, e.Egress.Domain+"@"+e.Timestamp.Format(time.RFC3339))
 	}
 	return nil
 }
@@ -129,7 +170,10 @@ func (*recordingAuditStore) QueryByTimeRange(context.Context, time.Time, time.Ti
 
 func (*recordingAuditStore) DeleteBefore(context.Context, time.Time) (int64, error) { return 0, nil }
 
-const syncSessionID = "sess_wm_sync"
+const (
+	syncSessionID    = "sess_wm_sync"
+	syncInferenceKey = "sk-wm-sync"
+)
 
 // wmSyncHarness is one sandbox: an EnvD built by New with egress on, the
 // Router's signer, and Workload Manager's real routes behind the in-process
@@ -149,9 +193,12 @@ func newWMSyncHarness(t *testing.T, jm *router.JWTManager) *wmSyncHarness {
 		SessionID: syncSessionID, SandboxName: "sbx", Namespace: "default",
 		RuntimePolicy: "agent-default", PolicyMode: "enforce",
 		AllowedEgressHosts: []string{"v1.example"}, PolicyVersion: 1,
+		InferenceApiKey: syncInferenceKey,
 	}))
 	audits := &recordingAuditStore{}
-	wm := workloadmanager.New(workloadmanager.DefaultConfig(), st).WithAuditStore(audits).Handler()
+	cfg := workloadmanager.DefaultConfig()
+	cfg.Inference.Enabled = true
+	wm := workloadmanager.New(cfg, st).WithAuditStore(audits).Handler()
 	wmTransport.use(wm)
 
 	s, err := New(Config{EgressEnabled: true})
@@ -190,6 +237,17 @@ func (h *wmSyncHarness) patchPolicy(host string) {
 
 func (h *wmSyncHarness) deny(domain string) {
 	h.envd.auditReporter.ReportDecision(egress.DecisionEvent{Action: "deny", Stage: "policy", Domain: domain})
+}
+
+// childHasInferenceKey reports whether a command started now gets the session's
+// inference API key.
+func (h *wmSyncHarness) childHasInferenceKey() bool {
+	for _, kv := range h.envd.buildChildEnv(nil) {
+		if kv == "OPENAI_API_KEY="+syncInferenceKey {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *wmSyncHarness) appliedHosts() []string {
@@ -295,6 +353,82 @@ func TestEnvDStaysInSyncWithWMPastRouterTokenTTL(t *testing.T) {
 				time.Sleep(31 * time.Second)
 				synctest.Wait()
 				assert.Equal(t, []string{"v2.example"}, h.appliedHosts(), "WM answered: %s", wmTransport.summary())
+			},
+		},
+		{
+			// WM refuses the token of the first fetch: its key cache has not
+			// caught up with a rotated Router key, or a concurrent audit
+			// upload had the same token refused first.
+			name: "first policy fetch refused",
+			run: func(t *testing.T, h *wmSyncHarness) {
+				wmTransport.setFault("policy", wmFault{refuse: 1})
+				h.routerRequest()
+				synctest.Wait()
+				time.Sleep(time.Minute)
+				h.routerRequest()
+				synctest.Wait()
+				assert.True(t, h.childHasInferenceKey(), "inference API key never fetched; WM answered: %s", wmTransport.summary())
+				time.Sleep(31 * time.Second)
+				synctest.Wait()
+				assert.Equal(t, []string{"v1.example"}, h.appliedHosts(), "WM answered: %s", wmTransport.summary())
+			},
+		},
+		{
+			// A Workload Manager rollout: connections fail for 30 seconds.
+			name: "WM unreachable for a rollout",
+			run: func(t *testing.T, h *wmSyncHarness) {
+				h.routerRequest()
+				synctest.Wait()
+				wmTransport.setFault("audit", wmFault{down: true})
+				h.deny("during-rollout.example")
+				time.Sleep(30 * time.Second)
+				synctest.Wait()
+				wmTransport.setFault("audit", wmFault{})
+				time.Sleep(auditRetryInterval + time.Second)
+				synctest.Wait()
+				assert.Equal(t, []string{"during-rollout.example@2000-01-01T00:00:00Z"}, h.audits.delivered(), "WM answered: %s", wmTransport.summary())
+			},
+		},
+		{
+			// WM accepts connections but never answers. A burst of denials
+			// arrives while an upload waits for it, then one a second for a
+			// minute: the newest decisions must be the ones kept, and WM is not
+			// retried back to back.
+			name: "WM hangs while denials pile up",
+			run: func(t *testing.T, h *wmSyncHarness) {
+				h.routerRequest()
+				synctest.Wait()
+				wmTransport.setFault("audit", wmFault{hang: true})
+				const total = maxHeldAuditEvents + 44
+				for i := range total {
+					h.deny(fmt.Sprintf("d%d.example", i))
+					time.Sleep(10 * time.Millisecond)
+				}
+				const trickle = 60
+				for i := range trickle {
+					h.deny(fmt.Sprintf("t%d.example", i))
+					time.Sleep(time.Second)
+				}
+				hung := wmTransport.countCalls("audit hung")
+				assert.LessOrEqual(t, hung, 5, "WM retried without backing off: %s", wmTransport.summary())
+				// An upload hung when WM recovered times out, and the retry
+				// follows one interval later.
+				wmTransport.setFault("audit", wmFault{})
+				h.routerRequest()
+				time.Sleep(5*time.Second + auditRetryInterval + time.Second)
+				synctest.Wait()
+				var all, delivered []string
+				for i := range total {
+					all = append(all, fmt.Sprintf("d%d.example", i))
+				}
+				for i := range trickle {
+					all = append(all, fmt.Sprintf("t%d.example", i))
+				}
+				for _, d := range h.audits.delivered() {
+					domain, _, _ := strings.Cut(d, "@")
+					delivered = append(delivered, domain)
+				}
+				assert.Equal(t, all[len(all)-maxHeldAuditEvents:], delivered, "the newest denials must be the ones kept; WM answered: %s", wmTransport.summary())
 			},
 		},
 	}
