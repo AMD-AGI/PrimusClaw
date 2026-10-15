@@ -414,7 +414,17 @@ export type SessionBackgroundWork =
     workloadId?: string;
     running?: number;
   }
-  | { state: "awaiting"; workloadId: string; sinceMs: number }
+  | {
+    state: "awaiting";
+    workloadId: string;
+    sinceMs: number;
+    /**
+     * When the keepalive last counted live processes in this sandbox, if that
+     * was inside the current idle period. Set means the missing verdict is a
+     * measurement that stopped answering, not one that never started.
+     */
+    workSeenAt?: number;
+  }
   | { state: "unreadable"; reason: string };
 
 /**
@@ -533,10 +543,18 @@ export async function readSessionBackgroundWork(
   if (!info.handsUrl || !info.token) {
     return { state: "clear", reason: "no_credentials", workloadId };
   }
+  // `lastPositiveCountAt` is written by the keepalive probe beside the verdict
+  // but is not one of the verdict's fields, so it survives the probe retracting
+  // a `running` verdict after consecutive failures -- which is exactly what an
+  // unreachable node produces. Inside this idle period it says the keepalive
+  // is measuring this sandbox and last found work in it.
+  const since = reuseWindowStart(fields);
+  const positiveAt = (info as { lastPositiveCountAt?: unknown }).lastPositiveCountAt;
   return {
     state: "awaiting",
     workloadId,
-    sinceMs: Math.max(0, now - reuseWindowStart(fields)),
+    sinceMs: Math.max(0, now - since),
+    ...(typeof positiveAt === "number" && positiveAt >= since ? { workSeenAt: positiveAt } : {}),
   };
 }
 

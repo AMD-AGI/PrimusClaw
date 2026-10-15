@@ -34,6 +34,8 @@
  *   G8  a binding written under the legacy key name is still read
  *   G9  a store that cannot be read does not license a stop
  *   G10 a measured running shell holds the sandbox even with no way to re-ask
+ *   G11 work measured in this idle period, then the probe lost contact: kept
+ *   G12 CONTROL: work measured only BEFORE this idle period does not hold it
  */
 import test, { after, afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -350,4 +352,51 @@ test("G10 a measured running shell holds the sandbox even with no way to re-ask"
   await reapOrphanHandles();
 
   assert.deepEqual(stopped, [], "the measurement stands on its own");
+});
+
+test("G11 work measured in this idle period, then the probe lost contact: kept", async () => {
+  // The node under a long-running sandbox goes NotReady. Brain's probe fails
+  // past its tolerance and retracts the `running` verdict, so the entry carries
+  // no verdict at all -- and, because the idle period opened hours ago, it is
+  // already past the wait. Before this, the sweep read that as "unmeasured" and
+  // stopped a sandbox whose processes were counted a few minutes earlier.
+  // `lastPositiveCountAt` is the keepalive's own record that it measured live
+  // work here in this idle period; a later failure to measure is unknown, not
+  // empty, and unknown keeps the sandbox until a verdict says otherwise.
+  handleFor("t-chat", "w-bg", "s-1");
+  chatIsOver("s-1");
+  const old = Date.now() - BG_VERDICT_TTL_MS - 60_000;
+  bucketHolding({
+    [handsSessionKey("s-1")]: parkedEntry("w-bg", {
+      idleSince: old, idleEpoch: old, idleRev: 7,
+      lastPositiveCountAt: Date.now() - 4 * 60_000,
+      lastProbeFailureAt: Date.now() - 30_000,
+    }),
+  });
+
+  await reapOrphanHandles();
+
+  assert.deepEqual(
+    stopped, [],
+    "a sandbox measured running in this idle period and then unreachable is unknown, not orphaned",
+  );
+});
+
+test("G12 CONTROL: work measured only BEFORE this idle period does not hold it", async () => {
+  // G7's shape with a positive count from an earlier period: that count says
+  // nothing about this period, so the bounded wait still applies and the
+  // sweep still reaps -- the leak G7 guards against is not reopened.
+  handleFor("t-chat", "w-bg", "s-1");
+  chatIsOver("s-1");
+  const old = Date.now() - BG_VERDICT_TTL_MS - 60_000;
+  bucketHolding({
+    [handsSessionKey("s-1")]: parkedEntry("w-bg", {
+      idleSince: old, idleEpoch: old, idleRev: 7,
+      lastPositiveCountAt: old - 1,
+    }),
+  });
+
+  await reapOrphanHandles();
+
+  assert.deepEqual(stopped, ["w-bg"], "a count from a previous idle period is not evidence about this one");
 });
