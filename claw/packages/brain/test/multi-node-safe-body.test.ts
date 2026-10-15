@@ -4,6 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  buildAtomWorkloadBody,
   buildInferaWorkloadBody,
   buildRayJobWorkloadBody,
   inferaFrontendPort,
@@ -278,6 +279,69 @@ test("buildInferaWorkloadBody marks a role multinode when its TP exceeds one pod
     pdDecodeTp: 8,
   }) as Record<string, any>;
   assert.deepStrictEqual(body.inferaOptions.multinodeRoles, ["prefill"]);
+});
+
+test("buildAtomWorkloadBody creates router, prefill and decode from the prompt spec", () => {
+  const body = buildAtomWorkloadBody({
+    ...COMMON,
+    displayName: "msg1-atom",
+    model: "/shared_nfs/models/Qwen3-14B-FP8",
+    framework: "sglang",
+    kvTransferBackend: "mooncake",
+    pdPrefillNodes: 1,
+    pdDecodeNodes: 1,
+    pdPrefillTp: 1,
+    pdDecodeTp: 1,
+    memGiPerNode: 128,
+    cpusPerNode: 16,
+    ephemeralGiPerNode: 50,
+    extraEnv: { NCCL_IB_GID_INDEX: "1" },
+  }) as Record<string, any>;
+
+  assert.deepStrictEqual(body.groupVersionKind, { group: "amd.com", kind: "Atom", version: "v1" });
+  assert.equal(body.useWorkspaceStorage, true);
+  assert.equal(body.workloadId, "msg1");
+  assert.equal(body.resources.length, 3);
+  assert.equal(body.resources[0].gpu, undefined);
+  assert.equal(body.resources[0].cpu, "4");
+  assert.equal(body.resources[0].sharedMemory, "4Gi");
+  assert.equal(body.resources[1].replica, 1);
+  assert.equal(body.resources[1].gpu, "8");
+  assert.equal(body.resources[1].memory, "128Gi");
+  assert.equal(body.resources[1].sharedMemory, "64Gi");
+  assert.equal(body.resources[1].rdmaResource, "1k");
+  assert.equal(body.resources[2].rdmaResource, "1k");
+  assert.equal(body.images.length, 3);
+  assert.equal(body.service.port, 8000);
+  assert.equal(body.service.targetPort, 8000);
+  assert.equal(body.env.PRIMUS_CLAW_MN_BACKEND, "atom");
+  assert.equal(body.env.NCCL_IB_GID_INDEX, "1");
+  assert.equal(body.env.MN_SSH_AUTHORIZED_KEY, undefined);
+  assert.equal(body.inferaOptions, undefined);
+
+  const router = decodeEp(body.entryPoints[0]);
+  const prefill = decodeEp(body.entryPoints[1]);
+  const decode = decodeEp(body.entryPoints[2]);
+  assert.match(router, /atomesh launch/);
+  assert.match(router, /--backend sglang/);
+  assert.match(prefill, /--model-path '\/shared_nfs\/models\/Qwen3-14B-FP8'/);
+  assert.match(prefill, /--disaggregation-mode prefill/);
+  assert.match(prefill, /--disaggregation-bootstrap-port 8998/);
+  assert.match(prefill, /--disaggregation-transfer-backend mooncake/);
+  assert.match(decode, /--disaggregation-mode decode/);
+  assert.match(decode, /--disaggregation-bootstrap-port 9098/);
+});
+
+test("buildAtomWorkloadBody rejects a missing model", () => {
+  assert.throws(
+    () => buildAtomWorkloadBody({
+      ...COMMON,
+      model: "  ",
+      framework: "sglang",
+      kvTransferBackend: "mooncake",
+    }),
+    /model is required/,
+  );
 });
 
 test("buildInferaWorkloadBody rejects a missing model or authorized key", () => {

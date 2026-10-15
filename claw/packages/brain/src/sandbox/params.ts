@@ -154,11 +154,12 @@ export function resourcesMapToWorkloadArray(map: Record<string, string>): Array<
  * other sandbox callers authenticate with. Hyperloom keys the hand-off purely off
  * `HYPERLOOM_MN_EXT_SERVICE_URL`, so no credential variable selects the mode.
  *
- * The two backends drive the cluster through entirely different control planes:
- * rayjob talks to the head over Ray Dashboard REST (:8265) / GCS (:6379) and
- * needs no pod IPs, while infera SSHes into the GPU pods directly and needs
- * their IPs plus a private key. Only the variables the active backend reads are
- * set, since Hyperloom infers the mode from which ones are present.
+ * The backends drive the cluster through different control planes: rayjob talks
+ * to the head over Ray Dashboard REST (:8265) / GCS (:6379) and needs no pod
+ * IPs, infera SSHes into the GPU pods directly and needs their IPs plus a
+ * private key, and atom serves on the router Service with no SSH control plane.
+ * Only the variables the active backend reads are set, since Hyperloom infers
+ * the mode from which ones are present.
  *
  * Nothing about the shared filesystem is set here. `USER_DATA_PATH` is the
  * workspace root Hyperloom resolves its session directories from, and SaFE's
@@ -182,6 +183,10 @@ export function applyMultiNodeExternalEnv(env: Record<string, string>, ctx: Mult
     if (ctx.dashboardToken) env.HYPERLOOM_MN_EXT_RAY_DASHBOARD_TOKEN = ctx.dashboardToken;
     return;
   }
+
+  // atom launches router, prefill and decode itself. The sandbox only needs the
+  // router Service; there is no SSH control plane to hand over.
+  if (ctx.backend === "atom") return;
 
   // infera: the optimizer SSHes into the GPU pods to relaunch the engine, so it
   // needs the key path plus at least one role's pod IPs.
