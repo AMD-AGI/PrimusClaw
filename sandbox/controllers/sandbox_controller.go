@@ -15,6 +15,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -73,7 +74,7 @@ type SandboxReconciler struct {
 //+kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch
-//+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -455,13 +456,25 @@ func (r *SandboxReconciler) reconcileService(ctx context.Context, sandbox *sandb
 // reconcilePDB keeps a PodDisruptionBudget over the sandbox's Pod, as for any
 // single-replica stateful workload: the Eviction API (kubectl drain, a
 // descheduler) is refused with 429 while the Pod is Ready. A Pod deleted
-// outright, or lost with its node, is not affected.
+// outright, or lost with its node, is not affected. A budget of the Sandbox's
+// name that this Sandbox does not control is refused, never adopted.
 func (r *SandboxReconciler) reconcilePDB(ctx context.Context, sandbox *sandboxv1alpha1.Sandbox, nameHash string) error {
 	log := log.FromContext(ctx)
+	want := sandboxPDBSpec(nameHash)
 	pdb := &policyv1.PodDisruptionBudget{}
 	err := r.Get(ctx, types.NamespacedName{Name: sandbox.Name, Namespace: sandbox.Namespace}, pdb)
 	if err == nil {
-		return nil
+		if !metav1.IsControlledBy(pdb, sandbox) {
+			return fmt.Errorf("PodDisruptionBudget %s/%s exists and is not controlled by this Sandbox",
+				pdb.Namespace, pdb.Name)
+		}
+		if pdbSpecHolds(pdb.Spec, want) {
+			return nil
+		}
+		log.Info("Restoring the PodDisruptionBudget's spec", "PodDisruptionBudget.Namespace", pdb.Namespace,
+			"PodDisruptionBudget.Name", pdb.Name)
+		pdb.Spec = want
+		return r.Update(ctx, pdb, client.FieldOwner(sandboxControllerFieldOwner))
 	}
 	if !k8serrors.IsNotFound(err) {
 		return fmt.Errorf("PodDisruptionBudget Get Failed: %w", err)
@@ -475,16 +488,7 @@ func (r *SandboxReconciler) reconcilePDB(ctx context.Context, sandbox *sandboxv1
 			Namespace: sandbox.Namespace,
 			Labels:    map[string]string{sandboxLabel: nameHash},
 		},
-		Spec: policyv1.PodDisruptionBudgetSpec{
-			// An integer minAvailable is counted against the selected Pods.
-			// maxUnavailable would read the Sandbox's scale subresource, which
-			// fails while spec.replicas is unset.
-			MinAvailable: ptr.To(intstr.FromInt32(1)),
-			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{sandboxLabel: nameHash}},
-			// A Pod that is not Ready serves no session; keeping it evictable
-			// means a stuck sandbox never blocks a node drain.
-			UnhealthyPodEvictionPolicy: ptr.To(policyv1.AlwaysAllow),
-		},
+		Spec: want,
 	}
 	pdb.SetGroupVersionKind(policyv1.SchemeGroupVersion.WithKind("PodDisruptionBudget"))
 	if err := ctrl.SetControllerReference(sandbox, pdb, r.Scheme); err != nil {
@@ -496,6 +500,28 @@ func (r *SandboxReconciler) reconcilePDB(ctx context.Context, sandbox *sandboxv1
 		return err
 	}
 	return nil
+}
+
+func sandboxPDBSpec(nameHash string) policyv1.PodDisruptionBudgetSpec {
+	return policyv1.PodDisruptionBudgetSpec{
+		// An integer minAvailable is counted against the selected Pods.
+		// maxUnavailable would read the Sandbox's scale subresource, which
+		// fails while spec.replicas is unset.
+		MinAvailable: ptr.To(intstr.FromInt32(1)),
+		Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{sandboxLabel: nameHash}},
+		// A Pod that is not Ready serves no session; keeping it evictable
+		// means a stuck sandbox never blocks a node drain.
+		UnhealthyPodEvictionPolicy: ptr.To(policyv1.AlwaysAllow),
+	}
+}
+
+// pdbSpecHolds compares only the fields sandboxPDBSpec sets, so a field the
+// API server fills in never reads as drift to correct on every reconcile.
+func pdbSpecHolds(got, want policyv1.PodDisruptionBudgetSpec) bool {
+	return equality.Semantic.DeepEqual(got.MinAvailable, want.MinAvailable) &&
+		got.MaxUnavailable == nil &&
+		equality.Semantic.DeepEqual(got.Selector, want.Selector) &&
+		equality.Semantic.DeepEqual(got.UnhealthyPodEvictionPolicy, want.UnhealthyPodEvictionPolicy)
 }
 
 // setServiceStatus updates the sandbox status with the service name and FQDN.

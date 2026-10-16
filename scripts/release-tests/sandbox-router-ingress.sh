@@ -12,7 +12,8 @@
 #   - a namespace selector renders the env var and get/list/watch on namespaces;
 #   - an enabled Ingress without a selector refuses to render;
 #   - the control plane's ClusterRole, rendered and in both plain manifests,
-#     grants every rule the controllers' RBAC markers generate.
+#     grants every rule the controllers' RBAC markers declare, and the
+#     generated roles say exactly what the markers do.
 #
 # The renders are parsed as YAML, not grepped, so "exactly one" is a count of
 # objects and paths rather than of matching lines.
@@ -48,6 +49,7 @@ render() {
 check() {
   REPO_ROOT="$repo_root" python3 - "$1" "$2" <<'PY'
 import os
+import re
 import sys
 import yaml
 
@@ -82,10 +84,31 @@ def grants(docs):
 def load(rel):
     return [d for d in yaml.safe_load_all(open(os.path.join(os.environ["REPO_ROOT"], rel))) if d]
 
+def marker_grants():
+    out = set()
+    for sub in ("controllers", "extensions/controllers"):
+        for dirpath, _, files in os.walk(os.path.join(os.environ["REPO_ROOT"], "sandbox", sub)):
+            for f in sorted(files):
+                if not f.endswith(".go") or f.endswith("_test.go"):
+                    continue
+                for m in re.finditer(r"^//\s*\+kubebuilder:rbac:(\S+)", open(os.path.join(dirpath, f)).read(), re.M):
+                    fields = dict(kv.split("=", 1) for kv in m.group(1).split(","))
+                    for g in fields["groups"].split(";"):
+                        for res in fields["resources"].split(";"):
+                            for v in fields["verbs"].split(";"):
+                                out.add(("" if g in ("core", '""') else g, res, v))
+    return out
+
 if case == "defaults":
     # The markers are what the controllers watch and write; a grant missing
     # here fails their cache sync, and the control plane never starts.
-    wanted = grants(load("sandbox/k8s/rbac.generated.yaml") + load("sandbox/k8s/extensions-rbac.generated.yaml"))
+    wanted = marker_grants()
+    if ("", "pods", "create") not in wanted:
+        fail(f"read no Pod grant from the controllers' RBAC markers, so nothing was checked: {sorted(wanted)}")
+    generated = grants(load("sandbox/k8s/rbac.generated.yaml") + load("sandbox/k8s/extensions-rbac.generated.yaml"))
+    if generated != wanted:
+        fail(f"sandbox/k8s/*rbac.generated.yaml is not what the markers declare (run go generate in sandbox/): "
+             f"missing {sorted(wanted - generated)}, extra {sorted(generated - wanted)}")
     roles = [d for d in kind("ClusterRole") if d["metadata"]["name"].startswith("agent-sandbox-controlplane")]
     for name, granted in (("the chart", grants(roles)),
                           ("deploy/k8s", grants(load("sandbox/deploy/k8s/controlplane.yaml"))),

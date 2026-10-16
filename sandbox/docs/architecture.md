@@ -86,6 +86,13 @@ answered `429 Too Many Requests`, and the session keeps running.
   so the drain deletes Pods instead of evicting them.
 - Preemption by kube-scheduler is not an eviction: it prefers victims whose
   budgets allow a disruption, and can still preempt a lower-priority sandbox.
+- A budget edited away from that spec is restored. One with the Sandbox's name
+  that the Sandbox does not control is left alone and reported as a reconcile
+  error, never adopted.
+- The selector is the name hash the headless Service also selects by, so two
+  Sandboxes of one namespace whose names hash alike share Pods there too; each
+  Pod is then under two budgets, and the API server refuses its eviction with
+  a 500 rather than a 429.
 
 The control plane's ClusterRole grants `poddisruptionbudgets` in the `policy`
 group (the chart and both plain manifests): the controller watches the budgets

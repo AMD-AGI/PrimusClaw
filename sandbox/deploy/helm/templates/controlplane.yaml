@@ -76,7 +76,7 @@ rules:
   # One PodDisruptionBudget per Sandbox, owned by it (controllers/sandbox_controller.go reconcilePDB).
   - apiGroups: ["policy"]
     resources: ["poddisruptionbudgets"]
-    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+    verbs: ["create", "delete", "get", "list", "update", "watch"]
   - apiGroups: ["runtime.agent-sandbox.io"]
     resources: ["codeinterpreters"]
     verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
