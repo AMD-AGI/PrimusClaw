@@ -10,7 +10,9 @@
 #   - an enabled Ingress renders exactly one rule with exactly one Prefix path,
 #     backed by the chart's own router Service and port;
 #   - a namespace selector renders the env var and get/list/watch on namespaces;
-#   - an enabled Ingress without a selector refuses to render.
+#   - an enabled Ingress without a selector refuses to render;
+#   - the control plane's ClusterRole, rendered and in both plain manifests,
+#     grants every rule the controllers' RBAC markers generate.
 #
 # The renders are parsed as YAML, not grepped, so "exactly one" is a count of
 # objects and paths rather than of matching lines.
@@ -44,7 +46,8 @@ render() {
 
 # check <render> <case> -- runs the Python assertions for one case.
 check() {
-  python3 - "$1" "$2" <<'PY'
+  REPO_ROOT="$repo_root" python3 - "$1" "$2" <<'PY'
+import os
 import sys
 import yaml
 
@@ -72,7 +75,23 @@ def namespace_rules():
                 out.append(r)
     return out
 
+def grants(docs):
+    return {(g, res, v) for d in docs if d.get("kind") == "ClusterRole" for r in d.get("rules", [])
+            for g in r.get("apiGroups", []) for res in r.get("resources", []) for v in r.get("verbs", [])}
+
+def load(rel):
+    return [d for d in yaml.safe_load_all(open(os.path.join(os.environ["REPO_ROOT"], rel))) if d]
+
 if case == "defaults":
+    # The markers are what the controllers watch and write; a grant missing
+    # here fails their cache sync, and the control plane never starts.
+    wanted = grants(load("sandbox/k8s/rbac.generated.yaml") + load("sandbox/k8s/extensions-rbac.generated.yaml"))
+    roles = [d for d in kind("ClusterRole") if d["metadata"]["name"].startswith("agent-sandbox-controlplane")]
+    for name, granted in (("the chart", grants(roles)),
+                          ("deploy/k8s", grants(load("sandbox/deploy/k8s/controlplane.yaml"))),
+                          ("deploy/k8s-kata", grants(load("sandbox/deploy/k8s-kata/controlplane.yaml")))):
+        if not wanted <= granted:
+            fail(f"{name}'s control-plane ClusterRole lacks {sorted(wanted - granted)}")
     if kind("Ingress"):
         fail("default values rendered an Ingress")
     if namespace_rules():

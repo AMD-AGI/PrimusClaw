@@ -14,14 +14,17 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -70,6 +73,7 @@ type SandboxReconciler struct {
 //+kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch
+//+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -201,7 +205,9 @@ func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox
 		applyPodTerminalConditions(sandbox, pod)
 	}
 
-	return allErrors
+	// After Ready is set: the budget guards the Pod and plays no part in
+	// serving it, so failing to keep one is retried without failing Ready.
+	return errors.Join(allErrors, r.reconcilePDB(ctx, sandbox, nameHash))
 }
 
 // applyPodTerminalConditions records Succeeded/Failed from the Pod phase so
@@ -444,6 +450,52 @@ func (r *SandboxReconciler) reconcileService(ctx context.Context, sandbox *sandb
 
 	setServiceStatus(sandbox, service)
 	return service, nil
+}
+
+// reconcilePDB keeps a PodDisruptionBudget over the sandbox's Pod, as for any
+// single-replica stateful workload: the Eviction API (kubectl drain, a
+// descheduler) is refused with 429 while the Pod is Ready. A Pod deleted
+// outright, or lost with its node, is not affected.
+func (r *SandboxReconciler) reconcilePDB(ctx context.Context, sandbox *sandboxv1alpha1.Sandbox, nameHash string) error {
+	log := log.FromContext(ctx)
+	pdb := &policyv1.PodDisruptionBudget{}
+	err := r.Get(ctx, types.NamespacedName{Name: sandbox.Name, Namespace: sandbox.Namespace}, pdb)
+	if err == nil {
+		return nil
+	}
+	if !k8serrors.IsNotFound(err) {
+		return fmt.Errorf("PodDisruptionBudget Get Failed: %w", err)
+	}
+
+	log.Info("Creating a new PodDisruptionBudget", "PodDisruptionBudget.Namespace", sandbox.Namespace,
+		"PodDisruptionBudget.Name", sandbox.Name)
+	pdb = &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandbox.Name,
+			Namespace: sandbox.Namespace,
+			Labels:    map[string]string{sandboxLabel: nameHash},
+		},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			// An integer minAvailable is counted against the selected Pods.
+			// maxUnavailable would read the Sandbox's scale subresource, which
+			// fails while spec.replicas is unset.
+			MinAvailable: ptr.To(intstr.FromInt32(1)),
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{sandboxLabel: nameHash}},
+			// A Pod that is not Ready serves no session; keeping it evictable
+			// means a stuck sandbox never blocks a node drain.
+			UnhealthyPodEvictionPolicy: ptr.To(policyv1.AlwaysAllow),
+		},
+	}
+	pdb.SetGroupVersionKind(policyv1.SchemeGroupVersion.WithKind("PodDisruptionBudget"))
+	if err := ctrl.SetControllerReference(sandbox, pdb, r.Scheme); err != nil {
+		return fmt.Errorf("SetControllerReference for PodDisruptionBudget failed: %w", err)
+	}
+	if err := r.Create(ctx, pdb, client.FieldOwner(sandboxControllerFieldOwner)); err != nil {
+		log.Error(err, "Failed to create", "PodDisruptionBudget.Namespace", pdb.Namespace,
+			"PodDisruptionBudget.Name", pdb.Name)
+		return err
+	}
+	return nil
 }
 
 // setServiceStatus updates the sandbox status with the service name and FQDN.
@@ -806,6 +858,16 @@ func (r *SandboxReconciler) handleSandboxExpiry(ctx context.Context, sandbox *sa
 		allErrors = errors.Join(allErrors, fmt.Errorf("failed to delete service: %w", err))
 	}
 
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandbox.Name,
+			Namespace: sandbox.Namespace,
+		},
+	}
+	if err := r.Delete(ctx, pdb); err != nil && !k8serrors.IsNotFound(err) {
+		allErrors = errors.Join(allErrors, fmt.Errorf("failed to delete PodDisruptionBudget: %w", err))
+	}
+
 	if sandbox.Spec.ShutdownPolicy != nil && *sandbox.Spec.ShutdownPolicy == sandboxv1alpha1.ShutdownPolicyDelete {
 		if err := r.Delete(ctx, sandbox); err != nil && !k8serrors.IsNotFound(err) {
 			allErrors = errors.Join(allErrors, fmt.Errorf("failed to delete sandbox: %w", err))
@@ -881,5 +943,9 @@ func (r *SandboxReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&sandboxv1alpha1.Sandbox{}).
 		Owns(&corev1.Pod{}, builder.WithPredicates(labelSelectorPredicate)).
 		Owns(&corev1.Service{}, builder.WithPredicates(labelSelectorPredicate)).
+		// Spec changes and deletion only: the budget's status moves with the
+		// Pod's readiness, which the Pod's own events already reconcile.
+		Owns(&policyv1.PodDisruptionBudget{},
+			builder.WithPredicates(labelSelectorPredicate, predicate.GenerationChangedPredicate{})).
 		Complete(r)
 }

@@ -13,12 +13,14 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -377,6 +379,25 @@ func TestReconcile(t *testing.T) {
 						ClusterIP: "None",
 					},
 				},
+				// Verify PodDisruptionBudget
+				&policyv1.PodDisruptionBudget{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            sandboxName,
+						Namespace:       sandboxNs,
+						ResourceVersion: "1",
+						Labels: map[string]string{
+							"agents.x-k8s.io/sandbox-name-hash": "ab179450",
+						},
+						OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
+					},
+					Spec: policyv1.PodDisruptionBudgetSpec{
+						MinAvailable: ptr.To(intstr.FromInt32(1)),
+						Selector: &metav1.LabelSelector{MatchLabels: map[string]string{
+							"agents.x-k8s.io/sandbox-name-hash": "ab179450",
+						}},
+						UnhealthyPodEvictionPolicy: ptr.To(policyv1.AlwaysAllow),
+					},
+				},
 			},
 		},
 		{
@@ -519,6 +540,12 @@ func TestReconcile(t *testing.T) {
 						Namespace: sandboxNs,
 					},
 				},
+				&policyv1.PodDisruptionBudget{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      sandboxName,
+						Namespace: sandboxNs,
+					},
+				},
 			},
 			sandboxSpec: sandboxv1alpha1.SandboxSpec{
 				PodTemplate: sandboxv1alpha1.PodTemplate{
@@ -549,6 +576,7 @@ func TestReconcile(t *testing.T) {
 			wantDeletedObjs: []client.Object{
 				&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: sandboxName, Namespace: sandboxNs}},
 				&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: sandboxName, Namespace: sandboxNs}},
+				&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: sandboxName, Namespace: sandboxNs}},
 			},
 		},
 		{
@@ -561,6 +589,12 @@ func TestReconcile(t *testing.T) {
 					},
 				},
 				&corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      sandboxName,
+						Namespace: sandboxNs,
+					},
+				},
+				&policyv1.PodDisruptionBudget{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      sandboxName,
 						Namespace: sandboxNs,
@@ -585,6 +619,7 @@ func TestReconcile(t *testing.T) {
 			wantDeletedObjs: []client.Object{
 				&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: sandboxName, Namespace: sandboxNs}},
 				&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: sandboxName, Namespace: sandboxNs}},
+				&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: sandboxName, Namespace: sandboxNs}},
 				&sandboxv1alpha1.Sandbox{ObjectMeta: metav1.ObjectMeta{Name: sandboxName, Namespace: sandboxNs}},
 			},
 			expectSandboxDeleted: true,

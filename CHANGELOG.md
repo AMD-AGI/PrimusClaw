@@ -205,6 +205,14 @@ record it.
   numbers — they were wrong.
 
 ### Added
+- A PodDisruptionBudget for every Sandbox (`minAvailable: 1` over its Pod,
+  `unhealthyPodEvictionPolicy: AlwaysAllow`), created and owned by the Sandbox
+  controller and removed with the Sandbox. An Eviction API call for a Ready
+  sandbox Pod (`kubectl drain`, a descheduler) is now refused with 429 instead
+  of ending the session; deleting a sandbox, its expiry, node loss and
+  scheduler preemption are unchanged. The control plane's ClusterRole gains
+  `poddisruptionbudgets` (chart and plain manifests); upgrade the role with the
+  image. See `sandbox/docs/architecture.md`, "Eviction".
 - `terminal.failure_reason` on `GET /v1/runs`: Claw's own code for how the run
   failed. `class` and `kill_reason` report a run whose sandbox never became usable
   as `failed` / `""`, exactly like an agent that ran and broke; the provisioning

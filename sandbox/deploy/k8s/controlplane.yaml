@@ -66,6 +66,10 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  # One PodDisruptionBudget per Sandbox, owned by it (controllers/sandbox_controller.go reconcilePDB).
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
   - apiGroups: ["runtime.agent-sandbox.io"]
     resources: ["codeinterpreters"]
     verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]

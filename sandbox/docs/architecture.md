@@ -63,3 +63,30 @@ flowchart TB
 - **Port forward** — direct access to a sandbox port via the Router's port proxy.
 
 See [API.md](./API.md) for the concrete HTTP routes.
+
+## Eviction
+
+A sandbox is a single-replica stateful workload: evicting its Pod ends the
+session in it. So the Sandbox controller keeps a PodDisruptionBudget for every
+Sandbox, the guard Kubernetes gives such a workload. It has the Sandbox's name,
+the Sandbox owns it as it owns the Pod and the headless Service, and it selects
+the Pod by its `agents.x-k8s.io/sandbox-name-hash` label with `minAvailable: 1`
+and `unhealthyPodEvictionPolicy: AlwaysAllow`. An Eviction API call for a Ready
+sandbox Pod (`kubectl drain`, a descheduler, any voluntary-disruption tool) is
+answered `429 Too Many Requests`, and the session keeps running.
+
+- Deleting the Pod or its Sandbox, a Sandbox's `shutdownTime`, and losing the
+  node all delete the Pod directly and are not affected. The budget goes with
+  its Sandbox through garbage collection, and with the Pod and Service when the
+  Sandbox expires.
+- A Pod that is Pending, has finished, or is Running but not Ready can still be
+  evicted, so a broken sandbox never holds up a node drain.
+- `kubectl drain` of a node that runs a Ready sandbox waits until the sandbox
+  ends. To drain sooner, delete the sandbox first, or pass `--disable-eviction`
+  so the drain deletes Pods instead of evicting them.
+- Preemption by kube-scheduler is not an eviction: it prefers victims whose
+  budgets allow a disruption, and can still preempt a lower-priority sandbox.
+
+The control plane's ClusterRole grants `poddisruptionbudgets` in the `policy`
+group (the chart and both plain manifests): the controller watches the budgets
+it owns, and cannot sync its caches without that grant.
