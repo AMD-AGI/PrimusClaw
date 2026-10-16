@@ -7,10 +7,12 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -21,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
@@ -151,4 +154,50 @@ func TestAPDBFailureIsRetriedWithoutFailingReady(t *testing.T) {
 
 	require.ErrorIs(t, reconcileSandbox(t, r, sb), forbidden)
 	requireReady(t, c, sb)
+}
+
+// Expiry deletes the budget this Sandbox controls and no other: a Sandbox
+// named like another workload's budget must not delete it on the
+// controller's authority. The Sandbox still expires.
+func TestExpiryLeavesABudgetTheSandboxDoesNotControl(t *testing.T) {
+	for _, policy := range []sandboxv1alpha1.ShutdownPolicy{sandboxv1alpha1.ShutdownPolicyRetain,
+		sandboxv1alpha1.ShutdownPolicyDelete} {
+		for name, owners := range map[string][]metav1.OwnerReference{
+			"no owner": nil,
+			"another workload's": {{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "db", UID: "7a1e-db",
+				Controller: ptr.To(true)}},
+		} {
+			t.Run(string(policy)+"/"+name, func(t *testing.T) {
+				sb, _ := readySandbox()
+				sb.Spec.ShutdownTime = ptr.To(metav1.NewTime(time.Now().Add(-time.Minute)))
+				sb.Spec.ShutdownPolicy = ptr.To(policy)
+				other := &policyv1.PodDisruptionBudget{
+					ObjectMeta: metav1.ObjectMeta{Name: "sb", Namespace: "sb-ns", OwnerReferences: owners},
+					Spec:       policyv1.PodDisruptionBudgetSpec{MinAvailable: ptr.To(intstr.FromInt32(1))},
+				}
+				r := &SandboxReconciler{Client: newFakeClient(sb, other), Scheme: Scheme, Tracer: asmetrics.NewNoOp()}
+				require.NoError(t, reconcileSandbox(t, r, sb))
+
+				live := &policyv1.PodDisruptionBudget{}
+				require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(other), live))
+				require.Equal(t, other.Spec, live.Spec)
+				gone := r.Get(t.Context(), client.ObjectKeyFromObject(sb), &sandboxv1alpha1.Sandbox{})
+				require.Equal(t, policy == sandboxv1alpha1.ShutdownPolicyDelete, k8serrors.IsNotFound(gone), "%v", gone)
+			})
+		}
+	}
+}
+
+// A budget's spec edit reconciles its owner even with the budget's own labels
+// edited away, which would otherwise hide the drift; its status updates do not.
+func TestABudgetSpecEditReachesItsOwnerWithoutItsLabel(t *testing.T) {
+	old := &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: "sb", Namespace: "sb-ns", Generation: 1,
+		Labels: map[string]string{sandboxLabel: NameHash("sb")}}}
+	edited := old.DeepCopy()
+	edited.Generation, edited.Labels = 2, nil
+	require.True(t, pdbChanges.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: edited}))
+	status := old.DeepCopy()
+	status.Status.DisruptionsAllowed = 1
+	require.False(t, pdbChanges.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: status}))
+	require.True(t, pdbChanges.Delete(event.DeleteEvent{Object: edited}))
 }

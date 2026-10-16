@@ -542,8 +542,9 @@ func TestReconcile(t *testing.T) {
 				},
 				&policyv1.PodDisruptionBudget{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      sandboxName,
-						Namespace: sandboxNs,
+						Name:            sandboxName,
+						Namespace:       sandboxNs,
+						OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
 					},
 				},
 			},
@@ -596,8 +597,9 @@ func TestReconcile(t *testing.T) {
 				},
 				&policyv1.PodDisruptionBudget{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      sandboxName,
-						Namespace: sandboxNs,
+						Name:            sandboxName,
+						Namespace:       sandboxNs,
+						OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sandboxName)},
 					},
 				},
 			},

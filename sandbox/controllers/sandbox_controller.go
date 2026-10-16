@@ -502,6 +502,30 @@ func (r *SandboxReconciler) reconcilePDB(ctx context.Context, sandbox *sandboxv1
 	return nil
 }
 
+// deleteOwnedPDB deletes the sandbox's budget when it expires, and only one
+// this Sandbox controls: deleting a same-name budget on a Sandbox's say would
+// let anyone who may create a Sandbox remove another workload's budget.
+func (r *SandboxReconciler) deleteOwnedPDB(ctx context.Context, sandbox *sandboxv1alpha1.Sandbox) error {
+	pdb := &policyv1.PodDisruptionBudget{}
+	err := r.Get(ctx, types.NamespacedName{Name: sandbox.Name, Namespace: sandbox.Namespace}, pdb)
+	if k8serrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to read PodDisruptionBudget: %w", err)
+	}
+	if !metav1.IsControlledBy(pdb, sandbox) {
+		log.FromContext(ctx).Info("Leaving a PodDisruptionBudget this Sandbox does not control",
+			"PodDisruptionBudget.Namespace", pdb.Namespace, "PodDisruptionBudget.Name", pdb.Name)
+		return nil
+	}
+	err = r.Delete(ctx, pdb, client.Preconditions{UID: &pdb.UID})
+	if err != nil && !k8serrors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete PodDisruptionBudget: %w", err)
+	}
+	return nil
+}
+
 func sandboxPDBSpec(nameHash string) policyv1.PodDisruptionBudgetSpec {
 	return policyv1.PodDisruptionBudgetSpec{
 		// An integer minAvailable is counted against the selected Pods.
@@ -884,15 +908,7 @@ func (r *SandboxReconciler) handleSandboxExpiry(ctx context.Context, sandbox *sa
 		allErrors = errors.Join(allErrors, fmt.Errorf("failed to delete service: %w", err))
 	}
 
-	pdb := &policyv1.PodDisruptionBudget{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      sandbox.Name,
-			Namespace: sandbox.Namespace,
-		},
-	}
-	if err := r.Delete(ctx, pdb); err != nil && !k8serrors.IsNotFound(err) {
-		allErrors = errors.Join(allErrors, fmt.Errorf("failed to delete PodDisruptionBudget: %w", err))
-	}
+	allErrors = errors.Join(allErrors, r.deleteOwnedPDB(ctx, sandbox))
 
 	if sandbox.Spec.ShutdownPolicy != nil && *sandbox.Spec.ShutdownPolicy == sandboxv1alpha1.ShutdownPolicyDelete {
 		if err := r.Delete(ctx, sandbox); err != nil && !k8serrors.IsNotFound(err) {
@@ -950,6 +966,12 @@ func sandboxMarkedExpired(sandbox *sandboxv1alpha1.Sandbox) bool {
 	return cond != nil && cond.Reason == sandboxv1alpha1.SandboxReasonExpired
 }
 
+// pdbChanges is which budget events reconcile its owner: spec changes and
+// deletion, by owner reference alone. Its status moves with the Pod's
+// readiness, which the Pod's own events reconcile; and a label is not asked
+// for, since one edited away would hide the very drift to restore.
+var pdbChanges = predicate.GenerationChangedPredicate{}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *SandboxReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	labelSelectorPredicate, err := predicate.LabelSelectorPredicate(metav1.LabelSelector{
@@ -969,9 +991,6 @@ func (r *SandboxReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&sandboxv1alpha1.Sandbox{}).
 		Owns(&corev1.Pod{}, builder.WithPredicates(labelSelectorPredicate)).
 		Owns(&corev1.Service{}, builder.WithPredicates(labelSelectorPredicate)).
-		// Spec changes and deletion only: the budget's status moves with the
-		// Pod's readiness, which the Pod's own events already reconcile.
-		Owns(&policyv1.PodDisruptionBudget{},
-			builder.WithPredicates(labelSelectorPredicate, predicate.GenerationChangedPredicate{})).
+		Owns(&policyv1.PodDisruptionBudget{}, builder.WithPredicates(pdbChanges)).
 		Complete(r)
 }

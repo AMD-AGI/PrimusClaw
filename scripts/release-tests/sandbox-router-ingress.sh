@@ -77,9 +77,15 @@ def namespace_rules():
                 out.append(r)
     return out
 
+# A grant is (group, resource, verb, resourceNames): a rule narrowed to names
+# does not stand in for one that is not, which an informer's list/watch needs.
 def grants(docs):
-    return {(g, res, v) for d in docs if d.get("kind") == "ClusterRole" for r in d.get("rules", [])
+    return {(g, res, v, tuple(sorted(r.get("resourceNames") or [])))
+            for d in docs if d.get("kind") == "ClusterRole" for r in d.get("rules", [])
             for g in r.get("apiGroups", []) for res in r.get("resources", []) for v in r.get("verbs", [])}
+
+def lacking(wanted, granted):
+    return sorted(w for w in wanted if w not in granted and w[:3] + ((),) not in granted)
 
 def load(rel):
     return [d for d in yaml.safe_load_all(open(os.path.join(os.environ["REPO_ROOT"], rel))) if d]
@@ -93,17 +99,18 @@ def marker_grants():
                     continue
                 for m in re.finditer(r"^//\s*\+kubebuilder:rbac:(\S+)", open(os.path.join(dirpath, f)).read(), re.M):
                     fields = dict(kv.split("=", 1) for kv in m.group(1).split(","))
+                    names = tuple(sorted(n for n in fields.get("resourceNames", "").split(";") if n))
                     for g in fields["groups"].split(";"):
                         for res in fields["resources"].split(";"):
                             for v in fields["verbs"].split(";"):
-                                out.add(("" if g in ("core", '""') else g, res, v))
+                                out.add(("" if g in ("core", '""') else g, res, v, names))
     return out
 
 if case == "defaults":
     # The markers are what the controllers watch and write; a grant missing
     # here fails their cache sync, and the control plane never starts.
     wanted = marker_grants()
-    if ("", "pods", "create") not in wanted:
+    if ("", "pods", "create", ()) not in wanted:
         fail(f"read no Pod grant from the controllers' RBAC markers, so nothing was checked: {sorted(wanted)}")
     generated = grants(load("sandbox/k8s/rbac.generated.yaml") + load("sandbox/k8s/extensions-rbac.generated.yaml"))
     if generated != wanted:
@@ -113,8 +120,8 @@ if case == "defaults":
     for name, granted in (("the chart", grants(roles)),
                           ("deploy/k8s", grants(load("sandbox/deploy/k8s/controlplane.yaml"))),
                           ("deploy/k8s-kata", grants(load("sandbox/deploy/k8s-kata/controlplane.yaml")))):
-        if not wanted <= granted:
-            fail(f"{name}'s control-plane ClusterRole lacks {sorted(wanted - granted)}")
+        if lacking(wanted, granted):
+            fail(f"{name}'s control-plane ClusterRole lacks {lacking(wanted, granted)}")
     if kind("Ingress"):
         fail("default values rendered an Ingress")
     if namespace_rules():
