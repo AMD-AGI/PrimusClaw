@@ -118,7 +118,9 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		// Note: The sandbox won't be deleted if shutdown policy is changed to delete after expiration.
 		//       To delete an expired sandbox, the user should delete the sandbox instead of updating it.
 		//       This keeps the controller code simple.
-		return ctrl.Result{}, nil
+		// A budget created just before expiry can reach the cache only after
+		// it, through its own create event; it is deleted then.
+		return ctrl.Result{}, r.deleteOwnedPDB(ctx, sandbox)
 	}
 
 	// Initialize trace ID for active resources missing an ID

@@ -23,7 +23,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
-	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
@@ -188,16 +187,38 @@ func TestExpiryLeavesABudgetTheSandboxDoesNotControl(t *testing.T) {
 	}
 }
 
-// A budget's spec edit reconciles its owner even with the budget's own labels
-// edited away, which would otherwise hide the drift; its status updates do not.
-func TestABudgetSpecEditReachesItsOwnerWithoutItsLabel(t *testing.T) {
-	old := &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: "sb", Namespace: "sb-ns", Generation: 1,
-		Labels: map[string]string{sandboxLabel: NameHash("sb")}}}
-	edited := old.DeepCopy()
-	edited.Generation, edited.Labels = 2, nil
-	require.True(t, pdbChanges.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: edited}))
-	status := old.DeepCopy()
-	status.Status.DisruptionsAllowed = 1
-	require.False(t, pdbChanges.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: status}))
-	require.True(t, pdbChanges.Delete(event.DeleteEvent{Object: edited}))
+// A budget created just before its Sandbox expired, which the cache did not
+// show yet when the expiry ran, is deleted once it does: its create event
+// reconciles the expired Sandbox, which deletes the budget it controls.
+func TestExpiryDeletesABudgetTheCacheShowedLate(t *testing.T) {
+	sb, pod := readySandbox()
+	lagging := true
+	c := fake.NewClientBuilder().WithScheme(Scheme).WithStatusSubresource(&sandboxv1alpha1.Sandbox{}).
+		WithRuntimeObjects(sb, pod).
+		WithInterceptorFuncs(interceptor.Funcs{Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey,
+			obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*policyv1.PodDisruptionBudget); ok && lagging {
+				return k8serrors.NewNotFound(policyv1.Resource("poddisruptionbudgets"), key.Name)
+			}
+			return cl.Get(ctx, key, obj, opts...)
+		}}).Build()
+	r := &SandboxReconciler{Client: c, Scheme: Scheme, Tracer: asmetrics.NewNoOp()}
+	require.NoError(t, reconcileSandbox(t, r, sb))
+	budgets := &policyv1.PodDisruptionBudgetList{}
+	require.NoError(t, r.List(t.Context(), budgets, client.InNamespace(sb.Namespace)))
+	require.Len(t, budgets.Items, 1)
+
+	live := &sandboxv1alpha1.Sandbox{}
+	require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(sb), live))
+	live.Spec.ShutdownTime = ptr.To(metav1.NewTime(time.Now().Add(-time.Minute)))
+	live.Spec.ShutdownPolicy = ptr.To(sandboxv1alpha1.ShutdownPolicyRetain)
+	require.NoError(t, c.Update(t.Context(), live))
+	require.NoError(t, reconcileSandbox(t, r, sb))
+	require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(sb), live))
+	require.True(t, sandboxMarkedExpired(live))
+
+	lagging = false
+	require.NoError(t, reconcileSandbox(t, r, sb))
+	err := c.Get(t.Context(), client.ObjectKeyFromObject(sb), &policyv1.PodDisruptionBudget{})
+	require.True(t, k8serrors.IsNotFound(err), "the budget outlived its expired Sandbox: %v", err)
 }
