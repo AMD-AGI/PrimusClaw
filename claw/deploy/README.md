@@ -102,6 +102,7 @@ exist before the first session runs, or workspace sync has nowhere to write.
 | `SANDBOX_NAMESPACE`            | SaFE sandbox namespace                   | `example-sandbox`                                     |
 | `ANTHROPIC_BASE_URL`           | LLM gateway URL                          | `https://cluster.example.com/llm-gateway`   |
 | `S3_ENDPOINT`                  | MinIO / S3 endpoint                      | `http://minio.minio.svc.cluster.local:9000`          |
+| `S3_SANDBOX_ENDPOINT`          | S3 endpoint as sandboxes reach it, for presigned URLs (default: `S3_API_ENDPOINT`) | `https://cluster.example.com` |
 | `S3_BUCKET`                    | S3 bucket name                           | `claw`                                               |
 | `MAX_TURNS`                    | Agent loop max turns                     | `2000`                                               |
 | `MAX_CONCURRENT`               | Max concurrent Brain sessions            | `3`                                                  |
@@ -128,7 +129,7 @@ exist before the first session runs, or workspace sync has nowhere to write.
 | `secret.multiNodeDefaultTimeoutSeconds` / `secret.sandboxDefaultTimeoutSeconds` | Total lifetime when a request supplies no timeout. Defaults do not receive an additional shutdown buffer. |
 | `defaultSandbox.image` / `.cpu` / `.memory` | Seeded by the API migration into the `resources` table as the `type='default'` row when that row is absent. This is the bottom of the image/size resolution chain (`metadata` > plugin row > default). The row is always seeded, because `cpu`/`memory` bottom out here too and a request that names only an image still needs them; leaving `image` empty just means every caller must pass `sandbox_image` itself. Editing the row afterwards wins; the seed only fills an empty table. |
 | `tls.insecureSkipVerify` | Sets `NODE_TLS_REJECT_UNAUTHORIZED=0` on api and brain, disabling certificate verification for *every* outbound connection. Off by default. To reach an endpoint behind a private CA, add the anchor to the image trust store instead — the runtime stage already wires `NODE_EXTRA_CA_CERTS`. |
-| `postgres.sslNoVerify` | Sends `POSTGRES_SSLMODE=no-verify` to api, keeping the PG connection encrypted while skipping server-certificate validation. Off by default, so api validates the certificate. Turn it on (`PG_SSL_NO_VERIFY=true` for `deploy.sh`) against a PGO-managed database, whose CA is absent from the image trust store; the alternative is adding that CA to the trust store and leaving this off. |
+| `postgres.sslNoVerify` | Sends `POSTGRES_SSLMODE=no-verify` to api, keeping the PG connection encrypted while skipping server-certificate validation. Off by default, so api validates the certificate. Turn it on (`PG_SSL_NO_VERIFY=true`, recorded in `values.<ns>.env` so `upgrade.sh` keeps it) against a PGO-managed database, whose CA is absent from the image trust store; the alternative is adding that CA to the trust store and leaving this off. |
 
 ### PostgreSQL Connection
 

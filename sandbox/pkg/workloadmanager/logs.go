@@ -46,6 +46,9 @@ func (s *Server) handleGetLogs(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
 		return
 	}
+	if !s.admitSession(c, info) {
+		return
+	}
 
 	if !canViewAll(c) {
 		if uid := currentUserID(c); uid != "" && info.UserID != uid {
@@ -136,12 +139,36 @@ func (s *Server) handleInternalAudit(c *gin.Context) {
 		Namespace:   info.Namespace,
 		UserID:      info.UserID,
 		UserName:    info.UserName,
-		Timestamp:   time.Now().UTC(),
+		Timestamp:   observedTimestamp(req.Metadata, time.Now().UTC(), info.CreatedAt),
 		Egress:      req.Egress,
 		Metadata:    req.Metadata,
 	})
 
 	c.Status(http.StatusAccepted)
+}
+
+// maxAuditBackdate is how far before its arrival a reported event may always
+// be stamped; an event may also go back to its sandbox's creation.
+const maxAuditBackdate = 24 * time.Hour
+
+// observedTimestamp is when the reporter observed an internal audit event:
+// envd holds events while it has no token WM accepts, and the audit index is
+// ordered by this time. A missing, unparsable or future value, or one older
+// than both the sandbox's creation and maxAuditBackdate, falls back to now,
+// the arrival time.
+func observedTimestamp(metadata map[string]string, now, created time.Time) time.Time {
+	observed, err := time.Parse(time.RFC3339Nano, metadata[audit.MetadataObservedAt])
+	if err != nil || observed.After(now) {
+		return now
+	}
+	earliest := now.Add(-maxAuditBackdate)
+	if !created.IsZero() && created.Before(earliest) {
+		earliest = created
+	}
+	if observed.Before(earliest) {
+		return now
+	}
+	return observed.UTC()
 }
 
 func parsePositiveInt(raw string, defaultValue int, maxValue int) int {

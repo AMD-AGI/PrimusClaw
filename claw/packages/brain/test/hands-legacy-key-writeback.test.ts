@@ -13,6 +13,7 @@
  * is pinned here rather than left to the migration alone.
  */
 
+import "./reclaim-single-reading-env.js";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { StringCodec, type KV } from "nats";

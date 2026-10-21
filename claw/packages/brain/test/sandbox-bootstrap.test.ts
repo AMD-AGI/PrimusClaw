@@ -18,11 +18,16 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   bootstrapHandsInSandbox, handsBinarySources, handsBaseEnv, HANDS_ENV_FILE,
-  HANDS_LOG_PATH, HANDS_STATE_DIR,
+  HANDS_ENV_PAYLOAD_ENV, HANDS_TOKEN_ENV, writeEnvFileCmd, brainAssetCurl,
+  handsBinaryDownloadCmd, HANDS_LOG_PATH, HANDS_STATE_DIR,
   inImageStartCmd, type SandboxExecFn,
+  HANDS_DOWNLOAD_ATTEMPTS, HANDS_DOWNLOAD_RETRY_DELAY_SEC,
 } from "../src/sandbox/bootstrap.js";
 import type { SandboxExecOptions } from "../src/sandbox/provider.js";
-import { CLAW_DEPLOY_ROOT, BRAIN_HTTP_URL } from "../src/config.js";
+import {
+  CLAW_DEPLOY_ROOT, BRAIN_HTTP_URL, HANDS_BOOTSTRAP_START_TIMEOUT, HANDS_ENV_FILE_WAIT_SEC,
+} from "../src/config.js";
+import { createServer, type Socket } from "node:net";
 
 const SESSION = "sess-bootstrap";
 const TOKEN = "tok-abc";
@@ -30,6 +35,27 @@ const PORT = "9100";
 
 const ok = { exitCode: 0, stdout: "started_pid=42", stderr: "" };
 const fail = (stderr: string) => ({ exitCode: 1, stdout: "", stderr });
+
+/** Run a shell snippet from a file. The snippet is not a process argument. */
+async function runSnippet(
+  cmd: string,
+  env: NodeJS.ProcessEnv,
+  opts?: { timeout?: number; killSignal?: NodeJS.Signals },
+): Promise<{ code: number; stderr: string }> {
+  const dir = await mkdtemp(path.join(tmpdir(), "bootstrap-snippet-"));
+  const script = path.join(dir, "snippet.sh");
+  await writeFile(script, `#!/bin/sh\n${cmd}`);
+  await chmod(script, 0o755);
+  return new Promise((resolve) => {
+    execFile(script, [], {
+      env,
+      timeout: opts?.timeout,
+      killSignal: opts?.killSignal,
+    }, (err, _out, stderrText) => {
+      resolve({ code: err ? Number(err.code ?? -1) : 0, stderr: stderrText });
+    });
+  });
+}
 
 /** Record every command the bootstrap runs, and reply from a scripted list. */
 function recorder(replies: Array<{ exitCode: number; stdout: string; stderr: string }>) {
@@ -62,7 +88,7 @@ function startAttempts(cmds: string[]): string[] {
 }
 
 test("the free in-image source is tried on every image, not just recognised ones", () => {
-  const sources = handsBinarySources(handsBaseEnv(SESSION, PORT, TOKEN), TOKEN);
+  const sources = handsBinarySources(handsBaseEnv(SESSION, PORT));
 
   assert.equal(sources[0]?.name, "in_image",
     "the source that costs nothing must be attempted before the ones that do");
@@ -71,7 +97,7 @@ test("the free in-image source is tried on every image, not just recognised ones
 });
 
 test("configured sources follow in ascending cost, unconfigured ones are absent", () => {
-  const names = handsBinarySources(handsBaseEnv(SESSION, PORT, TOKEN), TOKEN).map((s) => s.name);
+  const names = handsBinarySources(handsBaseEnv(SESSION, PORT)).map((s) => s.name);
 
   assert.deepEqual(names, [
     "in_image",
@@ -81,8 +107,8 @@ test("configured sources follow in ascending cost, unconfigured ones are absent"
 });
 
 test("every source launches with the same env and the same liveness check", () => {
-  const baseEnv = handsBaseEnv(SESSION, PORT, TOKEN);
-  for (const source of handsBinarySources(baseEnv, TOKEN)) {
+  const baseEnv = handsBaseEnv(SESSION, PORT);
+  for (const source of handsBinarySources(baseEnv)) {
     assert.ok(source.cmd.includes(baseEnv),
       `${source.name} must pass the token, session and port through to the binary`);
     assert.match(source.cmd, /kill -0 \$PID/,
@@ -153,7 +179,7 @@ test("an image without the binary falls through to the next source", async (t) =
 });
 
 test("when no source works the error names each one that was tried", async () => {
-  const sourceCount = handsBinarySources(handsBaseEnv(SESSION, PORT, TOKEN), TOKEN).length;
+  const sourceCount = handsBinarySources(handsBaseEnv(SESSION, PORT)).length;
   const r = recorder([ok, ...Array(sourceCount).fill(fail("boom"))]);
 
   await assert.rejects(
@@ -195,12 +221,15 @@ test("the caller's environment is handed to the sandbox, not left in the pod spe
     ANTHROPIC_API_KEY: "sk-test",
   });
 
-  const write = r.cmds.find((c) => c.includes(HANDS_ENV_FILE) && c.includes("base64 -d"));
-  assert.ok(write, "the environment has to reach the sandbox somehow");
-  assert.ok(!write!.includes("hf-secret"),
+  const writeAt = r.cmds.findIndex((c) => c.includes(HANDS_ENV_FILE) && c.includes("base64 -d"));
+  assert.ok(writeAt >= 0, "the environment has to reach the sandbox somehow");
+  const write = r.cmds[writeAt]!;
+  assert.ok(!write.includes("hf-secret"),
     "encoded rather than interpolated: values contain quotes, newlines and $(...)");
 
-  const payload = /printf '%s' '([A-Za-z0-9+/=]+)'/.exec(write!)?.[1] ?? "";
+  const payload = r.opts[writeAt]?.env?.[HANDS_ENV_PAYLOAD_ENV] ?? "";
+  assert.ok(payload && !write.includes(payload),
+    "the payload rides in the request env, not in the logged command");
   assert.deepEqual(JSON.parse(Buffer.from(payload, "base64").toString("utf8")), {
     HF_TOKEN: "hf-secret",
     ANTHROPIC_API_KEY: "sk-test",
@@ -213,7 +242,7 @@ test("the caller's environment is handed to the sandbox, not left in the pod spe
 test("a sandbox with no environment to hand over is bootstrapped as before", () => {
   // Every deployment that does not use the pool is on this path, and adding a
   // round trip to it would be a cost paid for nothing.
-  assert.ok(!handsBaseEnv(SESSION, PORT, TOKEN).includes("HANDS_ENV_FILE"));
+  assert.ok(!handsBaseEnv(SESSION, PORT).includes("HANDS_ENV_FILE"));
 });
 
 test("the environment file is put back before each source, not written once", async (t) => {
@@ -386,7 +415,7 @@ test("the guard counts in the shell rather than through seq", () => {
   // an image without coreutils has no `seq`: `for _ in $(seq N)` expands to an
   // empty list there, checks once, and fails a healthy Hands with a message
   // about a binary that is too old.
-  const cmd = inImageStartCmd(handsBaseEnv(SESSION, PORT, TOKEN), undefined, undefined, "/tmp/.hands-env");
+  const cmd = inImageStartCmd(handsBaseEnv(SESSION, PORT), undefined, undefined, "/tmp/.hands-env");
   assert.doesNotMatch(cmd, /\bseq\b/, "seq is not on every image this now probes");
   assert.match(cmd, /while \[ \$_w -lt \d+ \]/, "the wait is a shell-arithmetic loop");
   assert.match(cmd, /kill -9 -\$PID/,
@@ -408,7 +437,7 @@ test("the guard counts in the shell rather than through seq", () => {
 test("the production probe carries a bound", () => {
   // The parameters above are for the test; this is the command a sandbox gets.
   assert.match(
-    inImageStartCmd(handsBaseEnv(SESSION, PORT, TOKEN)),
+    inImageStartCmd(handsBaseEnv(SESSION, PORT)),
     /timeout -k 2 \d+ \/app\/hands-binary --self-check/,
     "an unbounded probe is the failure this pins",
   );
@@ -457,12 +486,12 @@ test("the child-isolation declaration reaches the sandbox, and nothing is substi
   delete process.env.HANDS_CHILD_UID_MAX;
   delete process.env.HANDS_CHILD_ISOLATION;
   try {
-    assert.ok(!handsBaseEnv(SESSION, PORT, TOKEN).includes("HANDS_CHILD"),
+    assert.ok(!handsBaseEnv(SESSION, PORT).includes("HANDS_CHILD"),
       "an undeclared posture stays undeclared");
 
     process.env.HANDS_CHILD_UID_MIN = "65500";
     process.env.HANDS_CHILD_UID_MAX = "65533";
-    const env = handsBaseEnv(SESSION, PORT, TOKEN);
+    const env = handsBaseEnv(SESSION, PORT);
     assert.match(env, /HANDS_CHILD_UID_MIN=65500/);
     assert.match(env, /HANDS_CHILD_UID_MAX=65533/);
   } finally {
@@ -471,4 +500,191 @@ test("the child-isolation declaration reaches the sandbox, and nothing is substi
       else process.env[key] = value;
     }
   }
+});
+
+/**
+ * The Router and EnvD log the command string of every execute. The per-sandbox
+ * token and the user's environment used to be interpolated into it -- the
+ * token as a curl header and as an `AUTH_CLAW_TOKEN=` prefix, the environment
+ * as base64 -- and so landed in the control-plane log in the clear. They now
+ * travel in the execute request's env map, which nothing logs.
+ */
+test("no command carries the token or the environment; the request env does", async () => {
+  const secretToken = "f".repeat(64);
+  const r = recorder([ok, ok, fail("no usable hands-binary at /app/hands-binary"), ok, ok, ok, ok]);
+  await bootstrapHandsInSandbox(r.exec, SESSION, PORT, secretToken, { HF_TOKEN: "hf-secret" }).catch(() => {});
+  assert.ok(r.cmds.length >= 3, "precondition: the bootstrap ran its steps");
+  for (const [i, cmd] of r.cmds.entries()) {
+    assert.ok(!cmd.includes(secretToken), `the token must not be in a command:\n${cmd}`);
+    assert.ok(!cmd.includes("hf-secret"), `a user value must not be in a command:\n${cmd}`);
+    const payload = r.opts[i]?.env?.[HANDS_ENV_PAYLOAD_ENV];
+    if (payload) assert.ok(!cmd.includes(payload), "nor its encoding");
+  }
+  const starts = r.cmds.map((c, i) => ({ c, o: r.opts[i] })).filter(({ o }) => o?.hands);
+  assert.ok(starts.length > 0);
+  for (const { o } of starts) {
+    assert.equal(o?.env?.[HANDS_TOKEN_ENV], secretToken,
+      "every Hands start must be handed the token, or Hands comes up with no credential");
+  }
+});
+
+/**
+ * The download is the command that leaked: run it against a stand-in curl that
+ * records its argv, so what is proven is the header curl actually receives,
+ * not the shape of a string.
+ */
+test("the download sends the token from the request env, and the command never holds it", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "bootstrap-curl-"));
+  const argvOut = path.join(dir, "argv");
+  await writeFile(path.join(dir, "curl"), `#!/bin/sh\nfor a in "$@"; do printf '%s\\n' "$a"; done > ${argvOut}\n`);
+  await chmod(path.join(dir, "curl"), 0o755);
+  const secretToken = "b".repeat(64);
+  const cmd = brainAssetCurl("/internal/assets/hands-binary", "http://brain.invalid:8100");
+  assert.ok(!cmd.includes(secretToken));
+  assert.ok(cmd.includes(`\${${HANDS_TOKEN_ENV}}`), cmd);
+  const code = await new Promise<number>((resolve) => {
+    const child = execFile("sh", ["-c", cmd], {
+      env: { PATH: `${dir}:/usr/bin:/bin`, [HANDS_TOKEN_ENV]: secretToken },
+    }, () => {});
+    child.on("exit", (c) => resolve(c ?? -1));
+  });
+  assert.equal(code, 0);
+  const argv = (await readFile(argvOut, "utf8")).split("\n").filter(Boolean);
+  const h = argv.indexOf("-H");
+  assert.ok(h >= 0, argv.join(" | "));
+  assert.equal(argv[h + 1], `Authorization: Bearer ${secretToken}`, "the header curl receives is the expanded token");
+  assert.deepEqual(argv.slice(-1), ["http://brain.invalid:8100/internal/assets/hands-binary"]);
+});
+
+/**
+ * A rejected download comes back in under a second, and curl's `--retry` does
+ * not cover a 4xx: one 403 used to fail the sandbox, with only "download
+ * failed" to say why. Run the download against a stand-in curl that refuses a
+ * set number of times.
+ */
+async function downloadWithRefusals(refusals: number) {
+  const dir = await mkdtemp(path.join(tmpdir(), "bootstrap-retry-"));
+  const count = path.join(dir, "count");
+  const dest = path.join(dir, "hands-binary");
+  await writeFile(path.join(dir, "curl"), [
+    "#!/bin/sh",
+    `n=$(cat ${count} 2>/dev/null || echo 0); n=$((n+1)); echo $n > ${count}`,
+    `if [ $n -le ${refusals} ]; then echo "curl: (22) The requested URL returned error: 403" >&2; exit 22; fi`,
+    `while [ $# -gt 0 ]; do if [ "$1" = "-o" ]; then printf binary > "$2"; fi; shift; done`,
+    "",
+  ].join("\n"));
+  await chmod(path.join(dir, "curl"), 0o755);
+  const cmd = handsBinaryDownloadCmd(dest, 3, 0, "http://brain.invalid:8100");
+  const { code, stderr } = await new Promise<{ code: number; stderr: string }>((resolve) => {
+    execFile("sh", ["-c", cmd], {
+      env: { PATH: `${dir}:/usr/bin:/bin`, [HANDS_TOKEN_ENV]: TOKEN },
+    }, (err, _out, stderrText) => resolve({ code: err ? Number(err.code) : 0, stderr: stderrText }));
+  });
+  const attempts = Number((await readFile(count, "utf8")).trim());
+  const downloaded = await readFile(dest, "utf8").catch(() => "");
+  return { code, stderr, attempts, downloaded };
+}
+
+test("a refused download is tried again, and succeeds when a later attempt does", async () => {
+  const r = await downloadWithRefusals(2);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.attempts, 3);
+  assert.equal(r.downloaded, "binary");
+});
+
+test("a download refused every time stops at its limit and says what curl said", async () => {
+  const r = await downloadWithRefusals(99);
+  assert.equal(r.code, 1);
+  assert.equal(r.attempts, 3, "bounded, so the source fails inside its exec budget");
+  assert.match(r.stderr, /hands-binary download failed after 3 attempts: curl: \(22\) .*403/);
+});
+
+/**
+ * A connection that opens and then stalls used to hold curl until the exec
+ * budget abandoned the whole step: no further attempt ran, and the failure
+ * carried nothing from curl. Run the real curl against a server that accepts
+ * and never answers, with short bounds so the test is quick.
+ */
+test("a stalled download times out per attempt, is retried, and fails with curl's own error", async () => {
+  const sockets: Socket[] = [];
+  let connections = 0;
+  const server = createServer((sock) => { connections += 1; sockets.push(sock); });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as { port: number }).port;
+  const dir = await mkdtemp(path.join(tmpdir(), "bootstrap-stall-"));
+  const cmd = handsBinaryDownloadCmd(path.join(dir, "hands-binary"), 2, 0, `http://127.0.0.1:${port}`, 1, 1);
+  const started = Date.now();
+  try {
+    // The kill bounds the test, not the command: an unbounded curl is killed
+    // here and the assertions below say so.
+    const { code, stderr } = await runSnippet(cmd, { PATH: "/usr/bin:/bin", [HANDS_TOKEN_ENV]: TOKEN }, {
+      timeout: 20_000, killSignal: "SIGKILL",
+    });
+    const elapsed = Date.now() - started;
+    assert.equal(code, 1, `the download must fail on its own, not be killed (stderr=${stderr})`);
+    assert.ok(elapsed < 15_000, `two 1s attempts took ${elapsed}ms`);
+    assert.equal(connections, 2, "each attempt opened its own connection");
+    assert.match(stderr, /hands-binary download failed after 2 attempts: curl: \(28\) /);
+  } finally {
+    for (const s of sockets) s.destroy();
+    server.close();
+  }
+});
+
+/**
+ * Every attempt, the gaps between them and the launch that follows must fit in
+ * the one exec that runs the source. A bound read from the argv curl actually
+ * receives, so a flag that is lost in the command fails here too.
+ */
+test("the default download is bounded per attempt and its attempts fit the exec budget", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "bootstrap-bound-"));
+  const argvOut = path.join(dir, "argv");
+  await writeFile(path.join(dir, "curl"), `#!/bin/sh\nfor a in "$@"; do printf '%s\\n' "$a"; done > ${argvOut}\n`);
+  await chmod(path.join(dir, "curl"), 0o755);
+  const cmd = handsBinaryDownloadCmd(path.join(dir, "hands-binary"));
+  const { code } = await runSnippet(cmd, { PATH: `${dir}:/usr/bin:/bin`, [HANDS_TOKEN_ENV]: TOKEN });
+  assert.equal(code, 0);
+  const argv = (await readFile(argvOut, "utf8")).split("\n").filter(Boolean);
+  const flag = (name: string) => {
+    const i = argv.indexOf(name);
+    assert.ok(i >= 0, `${name} missing from curl argv: ${argv.join(" ")}`);
+    const v = Number(argv[i + 1]);
+    assert.ok(Number.isFinite(v) && v > 0, `${name} ${argv[i + 1]}`);
+    return v;
+  };
+  const maxTime = flag("--max-time");
+  const connect = flag("--connect-timeout");
+  assert.ok(connect <= maxTime, "connecting is part of the attempt");
+  assert.ok(maxTime >= 25, `--max-time ${maxTime}s leaves no headroom over the 21s downloads measured`);
+  // curl's own retries would run each bounded attempt up to four times over.
+  assert.ok(!argv.some((a) => a.startsWith("--retry")), argv.join(" "));
+  const budget = /^(\d+)s$/.exec(HANDS_BOOTSTRAP_START_TIMEOUT);
+  assert.ok(budget, HANDS_BOOTSTRAP_START_TIMEOUT);
+  const worst = HANDS_DOWNLOAD_ATTEMPTS * maxTime
+    + (HANDS_DOWNLOAD_ATTEMPTS - 1) * HANDS_DOWNLOAD_RETRY_DELAY_SEC
+    + 1 + HANDS_ENV_FILE_WAIT_SEC; // launch liveness check, then the env-file guard
+  assert.ok(worst < Number(budget[1]), `worst case ${worst}s does not fit the ${budget[1]}s exec budget`);
+});
+
+/** Run the real commands in a local shell, so the expansion is proven, not assumed. */
+test("the shell expands the request env into the env file and the launched process", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "bootstrap-env-"));
+  const out = path.join(dir, "seen");
+  const bin = path.join(dir, "fake-hands");
+  await writeFile(bin, `#!/bin/sh\nprintf '%s' "$${HANDS_TOKEN_ENV}" > ${out}\n`);
+  await chmod(bin, 0o755);
+  const secretToken = "a".repeat(64);
+  const run = (cmd: string, env: Record<string, string>) => new Promise<number>((resolve) => {
+    const child = execFile("sh", ["-c", cmd], { env: { PATH: "/usr/bin:/bin", ...env } }, () => {});
+    child.on("exit", (code) => resolve(code ?? -1));
+  });
+  // The launch path the sources share: prefix env, then the binary.
+  const launch = `${handsBaseEnv(SESSION, PORT)} ${bin}`;
+  assert.equal(await run(launch, { [HANDS_TOKEN_ENV]: secretToken }), 0);
+  assert.equal(await readFile(out, "utf8"), secretToken);
+
+  const write = writeEnvFileCmd({ HF_TOKEN: "it's \"quoted\"\n$(nope)" });
+  const target = path.join(dir, "env.json");
+  assert.equal(await run(write.cmd.split(HANDS_ENV_FILE).join(target), write.env), 0);
+  assert.deepEqual(JSON.parse(await readFile(target, "utf8")), { HF_TOKEN: "it's \"quoted\"\n$(nope)" });
 });

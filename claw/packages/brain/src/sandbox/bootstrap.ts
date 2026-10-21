@@ -65,13 +65,94 @@ export const HANDS_DOWNLOADED_BINARY = "/tmp/.hands-binary";
  */
 const SELF_CHECK_TIMEOUT_SEC = 10;
 
+/**
+ * The execute-request env var that carries the per-sandbox token.
+ *
+ * The same name Hands reads its MCP credential from, so the process a source
+ * launches inherits it from the shell and nothing has to restate it.
+ */
+export const HANDS_TOKEN_ENV = "AUTH_CLAW_TOKEN";
+
+/** The execute-request env var that carries the base64 env-file payload. */
+export const HANDS_ENV_PAYLOAD_ENV = "CLAW_HANDS_ENV_B64";
+
+/**
+ * Seconds one Hands download attempt may spend connecting to Brain.
+ *
+ * Brain is an in-cluster Service; a connection that has not opened in this long
+ * is not going to, and waiting longer only takes time from the next attempt.
+ */
+export const HANDS_DOWNLOAD_CONNECT_TIMEOUT_SEC = 10;
+
+/**
+ * Seconds one Hands download attempt may run in total, connect included.
+ *
+ * Measured downloads of the ~90MB binary took 4-21s. Without a bound, a
+ * connection that opened and then stalled held curl until the exec budget
+ * (HANDS_BOOTSTRAP_START_TIMEOUT, 150s) abandoned the whole step: no retry
+ * ran, and the step failed with nothing from curl to say why. 30s is half
+ * again the slowest download seen, and three attempts of it still finish
+ * inside the budget with room for the launch that follows.
+ */
+export const HANDS_DOWNLOAD_MAX_TIME_SEC = 30;
+
 /** Build the curl command that downloads a Brain-served asset into the sandbox.
  *  Uses BRAIN_HTTP_URL (in-cluster brain ClusterIP svc) so the request
- *  load-balances across brain pods and survives rolling updates. */
-function brainAssetCurl(endpoint: string, token: string): string {
-  return `curl -sfL --retry 3 --retry-delay 2 `
-    + `-H 'Authorization: Bearer ${token}' `
-    + `${BRAIN_HTTP_URL}${endpoint}`;
+ *  load-balances across brain pods and survives rolling updates.
+ *
+ *  The token is a shell reference, not a value. The command string is logged
+ *  by the Router and by EnvD on every execute; the request's `env` map is not,
+ *  so the credential travels there and is expanded inside the sandbox.
+ *
+ *  One bounded request, no `--retry`: the caller retries every failure in
+ *  shell, and curl's own retries would multiply each attempt's time bound by
+ *  four and push the attempts back past the exec budget. */
+export function brainAssetCurl(
+  endpoint: string,
+  baseUrl: string = BRAIN_HTTP_URL,
+  maxTimeSec: number = HANDS_DOWNLOAD_MAX_TIME_SEC,
+  connectTimeoutSec: number = HANDS_DOWNLOAD_CONNECT_TIMEOUT_SEC,
+): string {
+  return `curl -sSfL --connect-timeout ${connectTimeoutSec} --max-time ${maxTimeSec} `
+    + `-H "Authorization: Bearer \${${HANDS_TOKEN_ENV}}" `
+    + `${baseUrl}${endpoint}`;
+}
+
+/** How many times the Hands download is attempted before its source gives up. */
+export const HANDS_DOWNLOAD_ATTEMPTS = 3;
+
+/**
+ * Seconds between Hands download attempts.
+ *
+ * curl's own `--retry` covers timeouts and 5xx, not a refused connection or a
+ * 4xx, and those come back in under a second: one rejected request was enough
+ * to fail the sandbox. The gap outlasts the 5s `deniedTokens` window in
+ * registry.ts, so a retried 403 is checked again rather than answered from it.
+ */
+export const HANDS_DOWNLOAD_RETRY_DELAY_SEC = 6;
+
+/**
+ * Shell snippet: download the Hands binary to `dest`, retrying any failure.
+ *
+ * Retried in shell rather than with `--retry-all-errors`, which needs curl 7.71
+ * and would make an older curl reject the whole command. curl's own message is
+ * kept, so a failure names the status or error rather than only that the
+ * download did not happen. Each attempt is time-bounded (see
+ * HANDS_DOWNLOAD_MAX_TIME_SEC), so a stalled connection becomes curl's timeout
+ * error and the next attempt, instead of the exec budget running out silently.
+ */
+export function handsBinaryDownloadCmd(
+  dest: string,
+  attempts: number = HANDS_DOWNLOAD_ATTEMPTS,
+  delaySec: number = HANDS_DOWNLOAD_RETRY_DELAY_SEC,
+  baseUrl: string = BRAIN_HTTP_URL,
+  maxTimeSec: number = HANDS_DOWNLOAD_MAX_TIME_SEC,
+  connectTimeoutSec: number = HANDS_DOWNLOAD_CONNECT_TIMEOUT_SEC,
+): string {
+  const curl = brainAssetCurl("/internal/assets/hands-binary", baseUrl, maxTimeSec, connectTimeoutSec);
+  return `_try=1; until _err=$(${curl} -o ${dest} 2>&1); do `
+    + `if [ $_try -ge ${attempts} ]; then echo "hands-binary download failed after $_try attempts: $_err" >&2; exit 1; fi; `
+    + `_try=$((_try+1)); sleep ${delaySec}; done; `;
 }
 
 /**
@@ -187,7 +268,7 @@ function sharedStorageStartCmd(baseEnv: string, envFile?: string): string {
 /** Shell snippet: download binary from Brain via curl, then run.
  *  Stored under /tmp (root-owned, world-writable but auto-cleaned on reboot)
  *  to keep it out of the user-visible /workspace mount. */
-function brainDownloadStartCmd(baseEnv: string, handsToken: string, envFile?: string): string {
+function brainDownloadStartCmd(baseEnv: string, envFile?: string): string {
   const binPath = HANDS_DOWNLOADED_BINARY;
   // Download + chmod + size-check run in the FOREGROUND (synchronous) so a slow
   // or failed fetch surfaces as a non-zero exit and bootstrap throws the real
@@ -199,7 +280,7 @@ function brainDownloadStartCmd(baseEnv: string, handsToken: string, envFile?: st
   // `sandbox_health_failed` with "hands.log: No such file or directory"). Only
   // the final binary launch is backgrounded, then verified alive, mirroring
   // sharedStorageStartCmd.
-  return `${brainAssetCurl("/internal/assets/hands-binary", handsToken)} -o ${binPath} || { echo "hands-binary download failed" >&2; exit 1; }; `
+  return handsBinaryDownloadCmd(binPath)
     + `chmod +x ${binPath} || { echo "chmod hands-binary failed" >&2; exit 1; }; `
     + `test -s ${binPath} || { echo "hands-binary is empty after download" >&2; exit 1; }; `
     + launchCmd(baseEnv, binPath, envFile);
@@ -219,7 +300,6 @@ function brainDownloadStartCmd(baseEnv: string, handsToken: string, envFile?: st
  */
 export function handsBinarySources(
   baseEnv: string,
-  handsToken: string,
   envFile?: string,
 ): HandsBinarySource[] {
   const sources: HandsBinarySource[] = [
@@ -229,7 +309,7 @@ export function handsBinarySources(
     sources.push({ name: "shared_storage", cmd: sharedStorageStartCmd(baseEnv, envFile) });
   }
   if (BRAIN_HTTP_URL) {
-    sources.push({ name: "brain_http", cmd: brainDownloadStartCmd(baseEnv, handsToken, envFile) });
+    sources.push({ name: "brain_http", cmd: brainDownloadStartCmd(baseEnv, envFile) });
   }
   return sources;
 }
@@ -258,14 +338,18 @@ export function handsBinarySources(
  * Hands clamping waits to a different number would leave the run waiting on a
  * call that has returned. `WAIT_DEFAULT_SEC` goes with it for the reason
  * `BASH_DEFAULT_TIMEOUT_SEC` does: the schema states the default too.
+ *
+ * `AUTH_CLAW_TOKEN` is deliberately absent. Everything here ends up in the
+ * command string, which the Router and EnvD log per execute; the token goes in
+ * the execute request's `env` map instead (see `handsStartExecEnv`), and the
+ * launched binary inherits it from the shell.
  */
 export function handsBaseEnv(
   sessionId: string,
   mcpPort: string,
-  handsToken: string,
   envFile?: string,
 ): string {
-  return `AUTH_CLAW_TOKEN=${handsToken} CLAW_SESSION_ID=${sessionId} `
+  return `CLAW_SESSION_ID=${sessionId} `
     + `MCP_PORT=${mcpPort} WORKSPACE_PATH=/workspace `
     + `BG_SHELL_ENABLED=${BG_SHELL_ENABLED ? "true" : "false"} `
     + `BASH_MAX_TIMEOUT_SEC=${toolTimeoutCeilingSec("bash")} `
@@ -319,12 +403,26 @@ export const HANDS_ENV_FILE = "/tmp/.hands-env";
  * always headed.
  *
  * JSON, base64-encoded for transport: values contain newlines, quotes and
- * shell metacharacters, and neither a `KEY=VALUE` file sourced by the shell
- * nor an argv-length-limited command line survives those intact.
+ * shell metacharacters, and a `KEY=VALUE` file sourced by the shell does not
+ * survive those intact.
+ *
+ * The payload rides in the execute request's `env` map, never in the command:
+ * the command string is logged by the Router and EnvD on every execute, and
+ * base64 is an encoding, not a mask -- the user's keys would be one decode away
+ * in the control-plane log. `printf` is a shell builtin, so the value is not an
+ * argv of any process either.
  */
-export function writeEnvFileCmd(env: Record<string, string>): string {
+export function writeEnvFileCmd(env: Record<string, string>): { cmd: string; env: Record<string, string> } {
   const payload = Buffer.from(JSON.stringify(env), "utf8").toString("base64");
-  return `printf '%s' '${payload}' | base64 -d > ${HANDS_ENV_FILE} && chmod 600 ${HANDS_ENV_FILE}`;
+  return {
+    cmd: `printf '%s' "\$${HANDS_ENV_PAYLOAD_ENV}" | (umask 077 && base64 -d > ${HANDS_ENV_FILE}) && chmod 600 ${HANDS_ENV_FILE}`,
+    env: { [HANDS_ENV_PAYLOAD_ENV]: payload },
+  };
+}
+
+/** The execute-request env for a source's start command: the token, by value. */
+export function handsStartExecEnv(handsToken: string): Record<string, string> {
+  return { [HANDS_TOKEN_ENV]: handsToken };
 }
 
 export async function bootstrapHandsInSandbox(
@@ -353,8 +451,9 @@ export async function bootstrapHandsInSandbox(
 
   const envToPlace = env && Object.keys(env).length ? env : undefined;
   const envFile = envToPlace ? HANDS_ENV_FILE : undefined;
-  const baseEnv = handsBaseEnv(sessionId, mcpPort, handsToken, envFile);
-  const sources = handsBinarySources(baseEnv, handsToken, envFile);
+  const baseEnv = handsBaseEnv(sessionId, mcpPort, envFile);
+  const sources = handsBinarySources(baseEnv, envFile);
+  const startEnv = handsStartExecEnv(handsToken);
   const failures: string[] = [];
 
   try {
@@ -368,7 +467,8 @@ export async function bootstrapHandsInSandbox(
       // Housekeeping like the mkdir above: kept off the job roster so a probe
       // landing on it does not reset the sandbox's idle window.
       if (envToPlace) {
-        const wrote = await execFn(writeEnvFileCmd(envToPlace), "30s", { untracked: true });
+        const write = writeEnvFileCmd(envToPlace);
+        const wrote = await execFn(write.cmd, "30s", { untracked: true, env: write.env });
         if (wrote.exitCode !== 0) {
           // Fatal rather than degraded: a sandbox without the user's environment
           // fails later, further away, and looks like the user's own mistake.
@@ -380,7 +480,7 @@ export async function bootstrapHandsInSandbox(
       // Marked as the Hands start so EnvD accounts for the supervisor as
       // infrastructure. Left to be inferred from the script, it would be
       // counted as user work and hold the sandbox open past every idle window.
-      const r = await execFn(source.cmd, HANDS_BOOTSTRAP_START_TIMEOUT, { hands: true });
+      const r = await execFn(source.cmd, HANDS_BOOTSTRAP_START_TIMEOUT, { hands: true, env: startEnv });
       if (r.exitCode === 0) {
         logger.info(
           { sessionId, source: source.name, stdout: r.stdout.slice(0, 200) },

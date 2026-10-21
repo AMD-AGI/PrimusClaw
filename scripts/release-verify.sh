@@ -7,12 +7,16 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 image="${RELEASE_IMAGE:-primus-claw:release-smoke}"
 
-for tool in bash rg; do
+for tool in bash rg python3; do
   command -v "$tool" >/dev/null 2>&1 || {
     echo "error: $tool is required for release verification" >&2
     exit 1
   }
 done
+python3 -c 'import yaml' 2>/dev/null || {
+  echo "error: python3 PyYAML is required for release verification" >&2
+  exit 1
+}
 
 echo "==> public tree hygiene"
 bash "$repo_root/scripts/release-tests/public-tree-scan.sh"
@@ -62,6 +66,9 @@ bash "$repo_root/scripts/release-tests/helm-values-schema.sh"
 
 echo "==> PromQL rollout gates"
 bash "$repo_root/scripts/release-tests/promql-gates.sh"
+
+echo "==> sandbox chart: namespace admission and router Ingress"
+bash "$repo_root/scripts/release-tests/sandbox-router-ingress.sh"
 
 echo "==> Helm lint and render"
 helm lint "$repo_root/sandbox/deploy/helm" \

@@ -157,13 +157,17 @@ test("a replica killed between claim and bind holds its slot until the reclaim h
   const shared = sharedStore();
   const a = shared.store("replica-a");
   const b = shared.store("replica-b");
+  // The claim stamps its own clock reading, at or after this one. Timing the
+  // sweep from it, not from a later Date.now(), keeps the sweep inside the
+  // horizon however long the claim took.
+  const beforeClaim = Date.now();
   const claim = await claimProvisionalSlot(a, CONFIG);
   assert.ok(claim.ok);
 
   // Another replica sweeping inside the horizon must not take the reservation:
   // the horizon exceeds both one sweep span and the declared provisioning
   // ceiling, so neither a slow sweeper nor a slow but live create loses it.
-  await renewAndReap(b, configFor("replica-b"), new Set(), Date.now() + CONFIG.reclaimHorizonMs - 1);
+  await renewAndReap(b, configFor("replica-b"), new Set(), beforeClaim + CONFIG.reclaimHorizonMs - 1);
   assert.equal(shared.peek()!.entries.length, 1, "held throughout the provisioning ceiling");
 
   await renewAndReap(b, configFor("replica-b"), new Set(), Date.now() + CONFIG.reclaimHorizonMs + 1);

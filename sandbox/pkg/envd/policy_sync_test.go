@@ -32,6 +32,9 @@ func TestPolicySyncerSyncsAllowedInternalHostsToSSRFChecker(t *testing.T) {
 		if r.URL.Path != "/v1/internal/policy/sess_test" {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
+		if got := r.Header.Get("Authorization"); got != "Bearer router-token" {
+			t.Fatalf("unexpected Authorization: %q", got)
+		}
 		_ = json.NewEncoder(w).Encode(egressPolicyResponse{
 			RuntimePolicy:        "agent-default",
 			PolicyMode:           "enforce",
@@ -42,7 +45,8 @@ func TestPolicySyncerSyncsAllowedInternalHostsToSSRFChecker(t *testing.T) {
 	}))
 	defer server.Close()
 
-	syncer := NewPolicySyncer(engine, ssrf, server.URL, "sess_test", "")
+	wm := &inferenceKeyCache{wmURL: server.URL, sessionID: "sess_test", jwtToken: "router-token"}
+	syncer := NewPolicySyncer(engine, ssrf, wm)
 	syncer.syncOnce(context.Background())
 
 	cfg := engine.GetConfig()

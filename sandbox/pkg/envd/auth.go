@@ -7,6 +7,7 @@
 package envd
 
 import (
+	"context"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
@@ -69,16 +70,14 @@ func (am *authManager) loadFromEnv() error {
 	return nil
 }
 
+// verifiedSessionIDKey carries, in a request's context, the session ID of the
+// Router token jwtMiddleware verified for it.
+type verifiedSessionIDKey struct{}
+
 // jwtMiddleware validates the JWT token signed by the Router.
 // If publicKey is nil (ENVD_AUTH_PUBLIC_KEY not set → authMode=none), auth is skipped.
 func (s *Server) jwtMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Health check is always public
-		if r.URL.Path == "/health" {
-			next.ServeHTTP(w, r)
-			return
-		}
-
 		s.auth.mu.RLock()
 		pubKey := s.auth.publicKey
 		s.auth.mu.RUnlock()
@@ -147,6 +146,6 @@ func (s *Server) jwtMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), verifiedSessionIDKey{}, tokenSessionID)))
 	})
 }

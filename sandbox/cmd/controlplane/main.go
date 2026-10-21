@@ -15,6 +15,7 @@ import (
 
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/dynamic"
@@ -24,7 +25,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/controllers"
@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
 	"sigs.k8s.io/agent-sandbox/pkg/builder"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
+	"sigs.k8s.io/agent-sandbox/pkg/nsadmission"
 	"sigs.k8s.io/agent-sandbox/pkg/router"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 	"sigs.k8s.io/agent-sandbox/pkg/workloadmanager"
@@ -70,6 +71,34 @@ func checkAuthPosture(cfg *router.Config) error {
 	return nil
 }
 
+// namespaceSelectorFromEnv returns the namespace selector to enforce: the
+// NAMESPACE_SELECTOR environment variable (how the chart passes it) when set,
+// otherwise the --namespace-selector flag value. An unparseable selector is an
+// error, never "no selector", so a typo cannot fail open.
+func namespaceSelectorFromEnv(flagValue string) (labels.Selector, error) {
+	if v := os.Getenv(nsadmission.EnvVar); v != "" {
+		flagValue = v
+	}
+	return nsadmission.ParseSelector(flagValue)
+}
+
+// wireNamespaceAdmission starts one Admitter for selector and hands it to both
+// the Router and the Workload Manager. A nil selector leaves both unset, which
+// admits every namespace.
+func wireNamespaceAdmission(ctx context.Context, client kubernetes.Interface, selector labels.Selector,
+	routerCfg *router.Config, wmCfg *workloadmanager.Config) *nsadmission.Admitter {
+	admitter := nsadmission.New(client, selector)
+	if admitter == nil {
+		log.Info("namespace admission disabled: no namespace selector, every namespace is served")
+		return nil
+	}
+	admitter.Start(ctx)
+	routerCfg.Namespaces = admitter
+	wmCfg.Namespaces = admitter
+	log.Info("namespace admission enabled", "selector", admitter.Selector())
+	return admitter
+}
+
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(sandboxv1alpha1.AddToScheme(scheme))
@@ -86,6 +115,7 @@ func main() {
 	var metricsAddr string
 	var probeAddr string
 	var enableLeaderElection bool
+	var stopGrace time.Duration
 	var enableExtensions bool
 	// Accepted and ignored for one release. Sandbox idle reclaim is Brain's,
 	// driven by EnvD's jobs roster, and nothing here reads this any more --
@@ -94,6 +124,7 @@ func main() {
 	// would take the whole control plane down on an image bump alone, so it is
 	// parsed and reported rather than refused. Remove in the next release.
 	var deprecatedSessionTimeout time.Duration
+	var namespaceSelector string
 	var deprecatedEnableIdleGC bool
 
 	routerPort = 8080
@@ -104,6 +135,9 @@ func main() {
 	flag.IntVar(&routerCfg.MaxConcurrentRequests, "max-concurrent-requests", routerCfg.MaxConcurrentRequests, "Max concurrent Router requests")
 	flag.BoolVar(&routerCfg.EnableAuth, "enable-auth", routerCfg.EnableAuth, "Enable SaFE API Key authentication")
 	flag.StringVar(&routerCfg.SafeAPIURL, "safe-api-url", routerCfg.SafeAPIURL, "SaFE API server URL")
+	flag.StringVar(&namespaceSelector, "namespace-selector", "",
+		"Label selector (kubectl -l syntax) of the namespaces the Router and Workload Manager serve; "+
+			"empty serves every namespace. Overridden by "+nsadmission.EnvVar)
 	flag.StringVar(&wmCfg.Namespace, "namespace", wmCfg.Namespace, "K8s namespace for system components")
 	flag.DurationVar(&wmCfg.GCInterval, "gc-interval", wmCfg.GCInterval, "GC scan interval")
 	flag.DurationVar(&wmCfg.DefaultTTL, "default-ttl", wmCfg.DefaultTTL, "Default sandbox TTL")
@@ -118,6 +152,14 @@ func main() {
 	// not wired: LastActivity is not refreshed, and Brain owns idle reclaim.
 	flag.BoolVar(&deprecatedEnableIdleGC, "enable-idle-gc", false,
 		"Deprecated and ignored: sandbox idle reclaim is owned by Brain")
+	flag.DurationVar(&routerCfg.ShutdownDelay, "shutdown-delay", 0,
+		"After SIGTERM, keep accepting Router requests this long with /health/ready failing, "+
+			"so endpoints and the gateway drop the replica before the listener closes")
+	flag.DurationVar(&routerCfg.ShutdownTimeout, "shutdown-timeout", router.DefaultShutdownTimeout,
+		"After the shutdown delay, how long in-flight Router requests may run before they are closed")
+	flag.DurationVar(&stopGrace, "shutdown-stop-grace", defaultStopGrace,
+		"After the Router has drained, how long the Workload Manager and controllers may take to stop. "+
+			"terminationGracePeriodSeconds must cover preStop + shutdown-delay + shutdown-timeout + this")
 	flag.Parse()
 
 	// Said out loud, because the environment variable never failed at all: a
@@ -156,6 +198,13 @@ func main() {
 	}
 	if v := os.Getenv("SAFE_API_URL"); v != "" {
 		routerCfg.SafeAPIURL = v
+	}
+	// Parsed before anything starts: a selector that does not parse must stop
+	// the process, not degrade to admitting every namespace.
+	nsSelector, err := namespaceSelectorFromEnv(namespaceSelector)
+	if err != nil {
+		log.Error("namespace admission refused", "error", err)
+		os.Exit(1)
 	}
 	if v := os.Getenv("GC_INTERVAL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
@@ -198,19 +247,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	// sigCtx ends on the signal and drives only the Router's drain; ctx is the
+	// lifetime of everything the Router depends on and ends after the drain
+	// (see runUntilSignal). During startup a signal still aborts at once.
+	sigCtx, sigCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer sigCancel()
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	stopStartupAbort := context.AfterFunc(sigCtx, cancel)
 
 	k8sCfg := ctrl.GetConfigOrDie()
-	mgr, err := ctrl.NewManager(k8sCfg, ctrl.Options{
-		Scheme: scheme,
-		Metrics: metricsserver.Options{
-			BindAddress: metricsAddr,
-		},
-		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "agent-sandbox-controlplane.agent-sandbox.io",
-	})
+	mgr, err := ctrl.NewManager(k8sCfg, managerOptions(metricsAddr, probeAddr, enableLeaderElection))
 	if err != nil {
 		log.Error("unable to create manager", "error", err)
 		os.Exit(1)
@@ -233,9 +280,28 @@ func main() {
 	if wmCfg.Audit.Enabled {
 		if rs, ok := st.(*store.RedisStore); ok {
 			auditStore = audit.NewRedisStore(rs.Client(), wmCfg.Audit.RetentionDays)
+			// AUDIT_ENABLED=true plus a store that constructs cleanly is not
+			// proof the backend actually accepts and returns writes -- see
+			// L639: that exact combination shipped silently for days with
+			// zero events landing. Round-trip one synthetic event now, so a
+			// broken backend is a loud startup log line and a 0-valued
+			// audit_backend_up metric instead of a forensic dead end the
+			// next time an audit record is needed.
+			selfCheckCtx, selfCheckCancel := context.WithTimeout(ctx, 10*time.Second)
+			if err := audit.SelfCheck(selfCheckCtx, auditStore); err != nil {
+				log.Error("audit backend self-check failed: AUDIT_ENABLED=true but events are not landing",
+					"error", err)
+				audit.BackendUp.Set(0)
+			} else {
+				audit.BackendUp.Set(1)
+			}
+			selfCheckCancel()
 		} else {
 			log.Warn("audit logging requires Redis store; disabled in memory mode")
+			audit.BackendUp.Set(0)
 		}
+	} else {
+		audit.BackendUp.Set(0)
 	}
 
 	clientset, err := kubernetes.NewForConfig(k8sCfg)
@@ -245,6 +311,13 @@ func main() {
 	}
 
 	workloadmanager.InitPublicKeyCache(ctx, clientset)
+
+	// Shared by the Router and the Workload Manager. Not waited for here: until
+	// it syncs every namespaced request is refused with 503 and the Router's
+	// readiness probe fails, so the replica takes no traffic it cannot judge.
+	// Only readiness waits for it; the startup and liveness probes do not, so a
+	// cache that never syncs leaves the replica unready rather than restarting.
+	wireNamespaceAdmission(ctx, clientset, nsSelector, &routerCfg, &wmCfg)
 
 	dynamicClient, err := dynamic.NewForConfig(k8sCfg)
 	if err != nil {
@@ -369,32 +442,20 @@ func main() {
 		go watcher.Run(ctx)
 	}
 
-	errCh := make(chan error, 3)
-	go func() {
-		log.Info("router starting", "port", routerCfg.Port)
-		if err := routerServer.Run(ctx); err != nil && err.Error() != "http: Server closed" {
-			errCh <- fmt.Errorf("router: %w", err)
-		}
-	}()
-	go func() {
-		log.Info("workload-manager API starting", "port", wmCfg.Port)
-		if err := apiServer.Run(ctx); err != nil && err.Error() != "http: Server closed" {
-			errCh <- fmt.Errorf("workload-manager: %w", err)
-		}
-	}()
-	go func() {
-		log.Info("controller manager starting", "metrics", metricsAddr, "probe", probeAddr)
-		if err := mgr.Start(ctx); err != nil {
-			errCh <- fmt.Errorf("manager: %w", err)
-		}
-	}()
-
-	select {
-	case <-ctx.Done():
-		log.Info("controlplane shutdown complete")
-	case err := <-errCh:
+	if !stopStartupAbort() {
+		log.Info("controlplane stopped during startup")
+		return
+	}
+	err = runUntilSignal(sigCtx, ctx, cancel,
+		component{name: "router", run: routerServer.Run},
+		[]component{
+			{name: "workload-manager API", run: apiServer.Run},
+			managerComponent(mgr.Start),
+		},
+		stopGrace)
+	if err != nil {
 		log.Error("controlplane exited with error", "error", err)
-		cancel()
 		os.Exit(1)
 	}
+	log.Info("controlplane shutdown complete")
 }

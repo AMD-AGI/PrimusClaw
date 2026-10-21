@@ -95,12 +95,16 @@ test("only shell-literal-safe absolute binary paths reach the proc scanner", () 
 });
 
 /** Record every command the restart runs, answering each with exit 0. */
+const execEnvs: Array<Record<string, string> | undefined> = [];
+
 function execRecorder(over: (cmd: string) => SandboxExecResult | null = () => null) {
   const cmds: string[] = [];
+  execEnvs.length = 0;
   restore = bindContainerProbeEffects({
     readHandsEntry: async () => ENTRY,
-    exec: async (_inst, cmd) => {
+    exec: async (_inst, cmd, _timeout, _signal, opts) => {
       cmds.push(cmd);
+      execEnvs.push(opts?.env);
       return over(cmd) ?? { exitCode: 0, stdout: "started_pid=1", stderr: "" };
     },
   });
@@ -227,9 +231,11 @@ test("a restart that comes up healthy is reported as such", async () => {
   assert.deepEqual(r, { ok: true, detail: "healthy" });
   assert.ok(cmds.some((c) => /\/proc\/\[0-9\]\*/.test(c)), "the stale process is killed first");
   assert.ok(
-    cmds.some((c) => /AUTH_CLAW_TOKEN=tok-1/.test(c)),
+    execEnvs.some((e) => e?.AUTH_CLAW_TOKEN === "tok-1"),
     "the sandbox is restarted with the token the run is already holding",
   );
+  assert.ok(!cmds.some((c) => c.includes("tok-1")),
+    "and the token travels in the request env, never in the logged command");
   assert.ok(
     cmds.some((c) => /MCP_PORT=9100/.test(c)),
     "and on the port the run is already talking to",

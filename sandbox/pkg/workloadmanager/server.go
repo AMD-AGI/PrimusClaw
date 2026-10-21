@@ -29,7 +29,9 @@ import (
 	"sigs.k8s.io/agent-sandbox/pkg/api"
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
 	"sigs.k8s.io/agent-sandbox/pkg/builder"
+	"sigs.k8s.io/agent-sandbox/pkg/cmdlog"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
+	"sigs.k8s.io/agent-sandbox/pkg/nsadmission"
 	"sigs.k8s.io/agent-sandbox/pkg/policy"
 	"sigs.k8s.io/agent-sandbox/pkg/safe"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
@@ -60,6 +62,9 @@ type Config struct {
 	DefaultTTL time.Duration
 	Inference  InferenceConfig
 	Audit      AuditConfig
+	// Namespaces decides which namespaces this Workload Manager serves: see
+	// package nsadmission for the routes it covers. nil admits every namespace.
+	Namespaces *nsadmission.Admitter
 }
 
 // DefaultConfig returns sensible defaults.
@@ -183,7 +188,8 @@ func (s *Server) emitAudit(ctx context.Context, event *audit.AuditEvent) {
 // setupRoutes configures HTTP routes.
 func (s *Server) setupRoutes() {
 	s.router = gin.New()
-	s.router.Use(gin.Recovery())
+	// The default recovery dumps request headers and masks only Authorization.
+	s.router.Use(gin.RecoveryWithWriter(cmdlog.RedactingWriter(gin.DefaultErrorWriter)))
 
 	// Health check (no auth required)
 	s.router.GET("/health", s.handleHealthDeep)
@@ -236,6 +242,11 @@ func (s *Server) setupRoutes() {
 	internal.POST("/audit/:sessionId", s.handleInternalAudit)
 }
 
+// Handler returns the HTTP handler serving every Workload Manager route.
+func (s *Server) Handler() http.Handler {
+	return s.router
+}
+
 // Run starts the HTTP server and the GC loop.
 // Uses h2c (HTTP/2 cleartext) for efficient internal communication.
 func (s *Server) Run(ctx context.Context) error {
@@ -247,7 +258,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 	// h2c wraps Gin handler with HTTP/2 cleartext support
 	h2s := &http2.Server{}
-	h2cHandler := h2c.NewHandler(s.router, h2s)
+	h2cHandler := h2c.NewHandler(s.Handler(), h2s)
 
 	srv := &http.Server{
 		Addr:        fmt.Sprintf(":%d", s.cfg.Port),
@@ -313,6 +324,20 @@ func (s *Server) handleHealthDeep(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "checks": checks})
 }
 
+// admitNamespace applies namespace admission to a request in namespace: a
+// namespace outside the selector gets 403 namespace_not_admitted (see package
+// nsadmission for why not 404). It returns true when the request may proceed.
+func (s *Server) admitNamespace(c *gin.Context, namespace string) bool {
+	return s.cfg.Namespaces.Gate(c, namespace)
+}
+
+// admitSession applies namespace admission to a request keyed by session ID,
+// judged by the namespace the session's sandbox lives in. It returns true when
+// the request may proceed.
+func (s *Server) admitSession(c *gin.Context, info *store.SandboxInfo) bool {
+	return s.cfg.Namespaces.Gate(c, info.Namespace)
+}
+
 // handleCodeInterpreterCreate handles POST /v1/code-interpreter.
 func (s *Server) handleCodeInterpreterCreate(c *gin.Context) {
 	s.handleCreate(c, store.CodeInterpreterKind)
@@ -347,6 +372,10 @@ func (s *Server) handleCodeInterpreterCreateStream(c *gin.Context) {
 	createTemplate = req.Name
 	if req.Namespace == "" {
 		req.Namespace = s.cfg.Namespace
+	}
+	// Before the SSE headers: once they are flushed a 403 can no longer be sent.
+	if !s.admitNamespace(c, req.Namespace) {
+		return
 	}
 
 	// Setup SSE headers (after body is fully consumed)
@@ -478,6 +507,9 @@ func (s *Server) handleCreate(c *gin.Context, kind string) {
 	}
 	if req.Namespace == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "namespace is required"})
+		return
+	}
+	if !s.admitNamespace(c, req.Namespace) {
 		return
 	}
 
@@ -701,6 +733,9 @@ func (s *Server) handleListSandboxes(c *gin.Context) {
 		}
 	}
 
+	if !s.cfg.Namespaces.GateReady(c) {
+		return
+	}
 	all, err := s.store.ListAllSandboxes(c.Request.Context(), 10000)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list sandboxes: " + err.Error()})
@@ -721,6 +756,10 @@ func (s *Server) handleListSandboxes(c *gin.Context) {
 			continue
 		}
 		if req.Namespace != "" && info.Namespace != req.Namespace {
+			continue
+		}
+		// Sessions in namespaces this deployment does not serve are not listed.
+		if !s.cfg.Namespaces.Filter(info.Namespace) {
 			continue
 		}
 		if req.Status != "" && info.Status != req.Status {
@@ -826,6 +865,9 @@ func (s *Server) handleGetSandbox(c *gin.Context) {
 			return
 		}
 		info, restoreRecovered = recovered, true
+	}
+	if !s.admitSession(c, info) {
+		return
 	}
 
 	// Permission check: non-admin users can only see their own sandboxes
@@ -974,6 +1016,9 @@ func (s *Server) handleDeleteSandbox(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "session not found: " + err.Error()})
 		return
 	}
+	if !s.admitSession(c, info) {
+		return
+	}
 
 	// Permission check: non-admin users can only delete their own sandboxes
 	if !canWriteAll(c) {
@@ -1096,6 +1141,10 @@ func (s *Server) handleTemplateCreate(c *gin.Context) {
 	if req.Namespace == "" {
 		req.Namespace = "default"
 	}
+	// Before the image build: a denied namespace must not cost a kaniko run.
+	if !s.admitNamespace(c, req.Namespace) {
+		return
+	}
 
 	// Extract user identity from auth middleware
 	var user *UserIdentity
@@ -1201,6 +1250,9 @@ func (s *Server) handleTemplateCreateStream(c *gin.Context) {
 	}
 	if req.Namespace == "" {
 		req.Namespace = "default"
+	}
+	if !s.admitNamespace(c, req.Namespace) {
+		return
 	}
 
 	var user *UserIdentity
@@ -1329,6 +1381,9 @@ func (s *Server) handleTemplateList(c *gin.Context) {
 	// K8s Label Selectors don't support OR (user.id=X OR public=true),
 	// so server-side (Go) filtering is the simplest correct approach.
 	// Template count is typically small (<1000), so this is efficient enough.
+	if !s.cfg.Namespaces.GateReady(c) {
+		return
+	}
 	result, err := s.k8s.ListTemplates(c.Request.Context(), req.Namespace, "")
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -1341,6 +1396,10 @@ func (s *Server) handleTemplateList(c *gin.Context) {
 	// ── Filter ──
 	filtered := make([]runtimev1alpha1.CodeInterpreter, 0, len(result.Items))
 	for _, ci := range result.Items {
+		// Templates in namespaces this deployment does not serve are not listed.
+		if !s.cfg.Namespaces.Filter(ci.Namespace) {
+			continue
+		}
 		// Permission filter: default users see only own + public templates
 		if !viewAll && uid != "" {
 			isOwner := ci.Labels != nil && ci.Labels[userIDLabelKey] == uid
@@ -1418,6 +1477,9 @@ func (s *Server) handleTemplateGet(c *gin.Context) {
 	}
 	name := c.Param("name")
 	namespace := c.Param("namespace")
+	if !s.admitNamespace(c, namespace) {
+		return
+	}
 	ci, err := s.k8s.GetTemplate(c.Request.Context(), name, namespace)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
@@ -1442,6 +1504,9 @@ func (s *Server) handleTemplateUpdate(c *gin.Context) {
 	}
 	name := c.Param("name")
 	namespace := c.Param("namespace")
+	if !s.admitNamespace(c, namespace) {
+		return
+	}
 	var req UpdateTemplateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: " + err.Error()})
@@ -1484,6 +1549,9 @@ func (s *Server) handleTemplateDelete(c *gin.Context) {
 	}
 	name := c.Param("name")
 	namespace := c.Param("namespace")
+	if !s.admitNamespace(c, namespace) {
+		return
+	}
 
 	// Fetch existing template for permission check
 	existing, err := s.k8s.GetTemplate(c.Request.Context(), name, namespace)
@@ -1630,6 +1698,9 @@ func (s *Server) handleGetPolicy(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
 		return
 	}
+	if !s.admitSession(c, info) {
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"sessionId":            info.SessionID,
@@ -1665,6 +1736,9 @@ func (s *Server) handleUpdatePolicy(c *gin.Context) {
 	info, err := s.store.GetSandboxBySessionID(c.Request.Context(), sessionID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
+		return
+	}
+	if !s.admitSession(c, info) {
 		return
 	}
 

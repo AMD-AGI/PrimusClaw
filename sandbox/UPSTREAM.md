@@ -45,7 +45,7 @@ boilerplate comes from the Kubernetes code generators, which emit that header.
 | `pkg/` | majority | substantial | Upstream primitives plus the AMD additions below |
 | `cmd/` | some | majority | `cmd/controlplane` is the AMD unified control plane |
 | `deploy/` | — | all | Entirely AMD: Helm chart, manifests, install/test scripts |
-| `sdk-python/`, `docker/` | — | all | Neither directory exists upstream |
+| `sdk-python/`, `docker/` | — | all | Neither path exists upstream. Upstream's own Python client (`clients/python/`) and its Dockerfiles are separate code; these directories share no substantial content with them |
 | `hack/` | mixed | mixed | |
 
 The significant AMD additions are:
@@ -58,8 +58,8 @@ The significant AMD additions are:
   type, GC/TTL reconciliation, audit, authorization.
 - **`pkg/envd/egress`** — in-process transparent egress proxy with SSRF and
   DNS-rebinding protection.
-- **`pkg/policy`** — embedded OPA policy engine and the `ClusterSandboxPolicy`
-  presets.
+- **`pkg/policy`** — built-in egress policy evaluator (an embedded OPA engine
+  is planned, not yet implemented) and the `ClusterSandboxPolicy` presets.
 - **`pkg/store`, `pkg/audit`** — Redis-backed session state and the audit trail.
 - **AMD GPU support** (`amd.com/gpu` resources, MI300X / MI325X / MI355X) and
   the Kata Containers runtime path.

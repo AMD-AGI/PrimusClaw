@@ -11,7 +11,7 @@ import {
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import {
-  S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET, S3_REGION, S3_API_ENDPOINT,
+  S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET, S3_REGION, S3_API_ENDPOINT, S3_SANDBOX_ENDPOINT,
   S3_PRUNE_MAX_OBJECTS,
 } from "../config.js";
 import { HandsClient } from "../clients/hands.js";
@@ -166,20 +166,38 @@ function getS3Client(): S3Client {
   return _s3;
 }
 
+let _presigner: S3Client | null = null;
+
+/** The client that signs the URLs a sandbox fetches: the same credentials,
+ *  addressed at S3_SANDBOX_ENDPOINT, because a presigned URL carries the host
+ *  it was signed for and the sandbox must be able to reach it. */
+function getPresignClient(): S3Client {
+  if (S3_SANDBOX_ENDPOINT === S3_API_ENDPOINT) return getS3Client();
+  if (!_presigner) {
+    _presigner = new S3Client({
+      region: S3_REGION,
+      endpoint: S3_SANDBOX_ENDPOINT || undefined,
+      forcePathStyle: true,
+      credentials: { accessKeyId: S3_ACCESS_KEY, secretAccessKey: S3_SECRET_KEY },
+    });
+  }
+  return _presigner;
+}
+
 /** Generate a pre-signed PUT URL for uploading to S3. */
-async function presignPut(
+export async function presignPut(
   s3Key: string,
   tagging?: string,
   expiresIn = PRESIGN_EXPIRES_SEC,
 ): Promise<string> {
-  const client = getS3Client();
+  const client = getPresignClient();
   const cmd = new PutObjectCommand({ Bucket: S3_BUCKET, Key: s3Key, Tagging: tagging });
   return getSignedUrl(client, cmd, { expiresIn });
 }
 
 /** Generate a pre-signed GET URL for downloading from S3. */
-async function presignGet(s3Key: string, expiresIn = PRESIGN_EXPIRES_SEC): Promise<string> {
-  const client = getS3Client();
+export async function presignGet(s3Key: string, expiresIn = PRESIGN_EXPIRES_SEC): Promise<string> {
+  const client = getPresignClient();
   const cmd = new GetObjectCommand({ Bucket: S3_BUCKET, Key: s3Key });
   return getSignedUrl(client, cmd, { expiresIn });
 }

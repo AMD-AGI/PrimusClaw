@@ -133,7 +133,7 @@ test("without background shells, the ceiling is the one that lets work finish", 
   assert.equal(rawSetting, 36_000);
 
   const { handsBaseEnv } = await import("../src/sandbox/bootstrap.js");
-  const env = handsBaseEnv("s-1", "9100", "tok");
+  const env = handsBaseEnv("s-1", "9100");
   assert.match(env, new RegExp(`BASH_MAX_TIMEOUT_SEC=${toolTimeoutCeilingSec("bash")}`),
     "Hands is what enforces the limit, so it is told the number the schema "
       + "states and the deadline is built from: the setting held under the MCP "
@@ -176,7 +176,7 @@ test("the ceiling function's own answers are pinned, not only agreement with it"
   // three together and satisfies every such comparison. These two literals are
   // the subject rather than a copy of one.
   assert.equal(toolTimeoutCeilingSec("bash"), 3540);
-  assert.equal(toolTimeoutCeilingSec("wait"), 1800);
+  assert.equal(toolTimeoutCeilingSec("wait"), 100);
 });
 
 test("schema, deadline and forwarded env all state the one held ceiling", () => {
@@ -191,7 +191,7 @@ test("schema, deadline and forwarded env all state the one held ceiling", () => 
     held * 1000 + MCP_DEADLINE_SLACK_MS,
     "a request above the ceiling is deadlined at the ceiling, not at the request",
   );
-  assert.match(handsBaseEnv("s-1", "9100", "tok"), new RegExp(`BASH_MAX_TIMEOUT_SEC=${held}(\\s|$)`));
+  assert.match(handsBaseEnv("s-1", "9100"), new RegExp(`BASH_MAX_TIMEOUT_SEC=${held}(\\s|$)`));
 });
 
 test("the closed-state forwarding tuple is asserted whole, not key by key", () => {
@@ -199,7 +199,7 @@ test("the closed-state forwarding tuple is asserted whole, not key by key", () =
   // asserting one key at a time cannot. Every value is read from its source, so
   // a surface holding its own copy of a number fails here rather than agreeing
   // with itself.
-  const env = handsBaseEnv("s-1", "9100", "tok");
+  const env = handsBaseEnv("s-1", "9100");
   const pairs = Object.fromEntries(
     env.split(" ").filter((p) => p.includes("=")).map((p) => {
       const i = p.indexOf("=");

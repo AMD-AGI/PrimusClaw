@@ -33,10 +33,11 @@ code running inside a sandbox is hostile. A production deployment must:
 - use Kata (or an equivalent VM-backed runtime) when tenant code must be
   isolated from the host kernel;
 - scope, rate-limit, rotate, and revoke each user's model/platform credentials;
-- rebuild the images with your own CA anchors if your egress is behind a
-  TLS-intercepting proxy (`--build-arg EXTRA_CA_CERT_URLS=...`), rather than
-  setting `tls.insecureSkipVerify`, which disables certificate verification for
-  every outbound connection the image makes;
+- if your egress is behind a TLS-intercepting proxy, supply your CA anchors
+  instead of setting `tls.insecureSkipVerify`, which disables certificate
+  verification for every outbound connection the image makes. For sandboxes,
+  use a ConfigMap (`SANDBOX_EXTRA_CA_CONFIGMAP`, see sandbox/README.md). For
+  the Claw images, rebuild with `--build-arg EXTRA_CA_CERT_URLS=...`;
 - use the Helm-backed installers. `sandbox/deploy/k8s*` files are templates
   with unresolved placeholders, not supported standalone installations.
 

@@ -187,6 +187,7 @@ env HOME="$tmp/home" PATH="$tmp/bin:$PATH" HELM_CAPTURE="$capture" \
   AGENT_SANDBOX_MAX_SESSION_DURATION="48h" \
   BG_SHELL_ENABLED="true" \
   BASH_MAX_TIMEOUT_SEC="240" \
+  PG_SSL_NO_VERIFY="true" \
   bash "$repo_root/claw/deploy/deploy.sh" \
     --skip-pgo --skip-nats --skip-pg --skip-lifecycle --skip-shared-assets \
     >"$tmp/deploy.log" 2>&1 || { command cat "$tmp/deploy.log" >&2; exit 1; }
@@ -203,7 +204,7 @@ grep -q '^AGENT_SANDBOX_MAX_SESSION_DURATION="48h"$' "$values_file" || {
   command cat "$values_file" >&2
   exit 1
 }
-for _pair in 'BG_SHELL_ENABLED="true"' 'BASH_MAX_TIMEOUT_SEC="240"'; do
+for _pair in 'BG_SHELL_ENABLED="true"' 'BASH_MAX_TIMEOUT_SEC="240"' 'PG_SSL_NO_VERIFY="true"'; do
   grep -q "^${_pair}\$" "$values_file" || {
     echo "first install did not persist ${_pair%%=*}" >&2
     command cat "$values_file" >&2
@@ -216,18 +217,28 @@ with open(sys.argv[1], encoding="utf-8") as f:
     values = json.load(f)
 assert values["features"]["backgroundShell"] == "true", values.get("features")
 assert values["brain"]["bashMaxTimeoutSec"] == "240", values["brain"]
+assert values["postgres"]["sslNoVerify"] is True, values["postgres"]
 PY
 
 # ── The upgrade an operator actually runs: `env -i`, no knobs re-passed ──
 # The empty environment is the point. If the values file is not carrying the
 # choice, there is nowhere else for it to come from.
 : >"$capture"
+upgrade_apply="$tmp/upgrade-apply.yaml"
 env -i HOME="$tmp/home" PATH="$tmp/bin:/usr/bin:/bin" HELM_CAPTURE="$capture" \
-  MOCK_HELM_STATUS=0 TAG="release-test-2" \
+  KUBECTL_APPLY_BODY="$upgrade_apply" MOCK_HELM_STATUS=0 TAG="release-test-2" \
   bash "$repo_root/claw/deploy/upgrade.sh" -n "$namespace" --dry-run \
     >"$tmp/upgrade.log" 2>&1 || { command cat "$tmp/upgrade.log" >&2; exit 1; }
 
 assert_rendered_with "upgrade with no env" "6h" "48h"
+
+# Asserted on the rendered API rather than on the helm arguments: a knob
+# forwarded under a key the chart does not read passes an argument check and
+# still rolls the API back to verify-full, which a PGO database's own CA fails.
+grep -A1 -- '- name: POSTGRES_SSLMODE' "$upgrade_apply" | grep -q 'value: no-verify' || {
+  echo "upgrade with no env rendered the API without POSTGRES_SSLMODE=no-verify" >&2
+  exit 1
+}
 
 # ── An install that set neither knob, and a later upgrade that sets one ──
 # The file carries the keys, empty. Empty means "the file has no opinion", so

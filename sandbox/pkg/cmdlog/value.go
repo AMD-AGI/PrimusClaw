@@ -15,6 +15,9 @@ const maxLoggedValueLen = 256
 
 // Value makes a request-derived string safe to place in a log record.
 //
+// Credentials are masked first (see Redact), before the length cap can cut a
+// value in two and leave half of it unrecognisable.
+//
 // Client IP, session id, user agent, request path, template name, upstream URL
 // -- all of these are caller-controlled bytes. A newline in one of them forges
 // a second, fully-formed log line, and an unbounded one pushes real records out
@@ -42,6 +45,7 @@ const maxLoggedValueLen = 256
 // log-injection query recognises as a barrier, so any caller of this function
 // is analyzable without a suppression.
 func Value(v string) string {
+	v = Redact(v)
 	v = strings.ReplaceAll(v, "\n", "<LF>")
 	v = strings.ReplaceAll(v, "\r", "<CR>")
 	v = unsafeRunes.Replace(v)

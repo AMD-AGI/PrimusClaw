@@ -2,6 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 {{- if .Values.controlplane.enabled }}
+{{- with .Values.router.config.namespaceSelector }}
+{{- if not (trim .) }}
+{{- fail "router.config.namespaceSelector is only whitespace: leave it empty to serve every namespace, or set a label selector" }}
+{{- end }}
+{{- end }}
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -77,6 +82,12 @@ rules:
   - apiGroups: ["runtime.agent-sandbox.io"]
     resources: ["clustersandboxpolicies"]
     verbs: ["get", "list", "watch"]
+  {{- if .Values.router.config.namespaceSelector }}
+  # Namespace admission (router.config.namespaceSelector) watches Namespaces.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -151,6 +162,17 @@ spec:
         prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: agent-sandbox-controlplane
+      {{- $sd := .Values.controlplane.shutdown }}
+      {{- $drain := add (int $sd.preStopSleepSeconds) (int $sd.delaySeconds) (int $sd.timeoutSeconds) }}
+      {{- $need := add $drain (int $sd.stopGraceSeconds) 10 }}
+      {{- $grace := $need }}
+      {{- if not (kindIs "invalid" $sd.terminationGracePeriodSeconds) }}
+      {{- $grace = int $sd.terminationGracePeriodSeconds }}
+      {{- if lt $grace $need }}
+      {{- fail (printf "controlplane.shutdown.terminationGracePeriodSeconds=%d is shorter than preStopSleepSeconds+delaySeconds+timeoutSeconds+stopGraceSeconds+10=%d: kubelet would kill the Pod mid-shutdown" $grace $need) }}
+      {{- end }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ $grace }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets: {{ toYaml . | nindent 8 }}
       {{- end }}
@@ -175,6 +197,9 @@ spec:
             - --leader-elect={{ ternary "true" "false" .Values.controlplane.config.leaderElect }}
             - --extensions={{ ternary "true" "false" .Values.controlplane.config.extensions }}
             - --namespace={{ .Release.Namespace }}
+            - --shutdown-delay={{ int .Values.controlplane.shutdown.delaySeconds }}s
+            - --shutdown-timeout={{ int .Values.controlplane.shutdown.timeoutSeconds }}s
+            - --shutdown-stop-grace={{ int .Values.controlplane.shutdown.stopGraceSeconds }}s
             {{- if .Values.router.config.enableAuth }}
             - --enable-auth=true
             - --safe-api-url={{ .Values.router.config.safeApiUrl }}
@@ -198,6 +223,10 @@ spec:
               value: {{ ternary "true" "false" .Values.router.config.enableAuth | quote }}
             - name: SAFE_API_URL
               value: {{ .Values.router.config.safeApiUrl | quote }}
+            {{- if .Values.router.config.namespaceSelector }}
+            - name: NAMESPACE_SELECTOR
+              value: {{ .Values.router.config.namespaceSelector | quote }}
+            {{- end }}
             - name: ALLOW_INSECURE_NO_AUTH
               value: {{ ternary "true" "false" .Values.security.allowInsecureNoAuth | quote }}
             - name: EGRESS_ENABLED
@@ -226,6 +255,14 @@ spec:
             - name: SANDBOX_IMAGE_REGISTRY
               value: {{ .Values.controlplane.config.sandboxImageRegistry | quote }}
             {{- end }}
+            {{- if .Values.controlplane.config.sandboxExtraCAConfigMap }}
+            - name: SANDBOX_EXTRA_CA_CONFIGMAP
+              value: {{ .Values.controlplane.config.sandboxExtraCAConfigMap | quote }}
+            {{- end }}
+            {{- if .Values.controlplane.config.sandboxExtraCARequired }}
+            - name: SANDBOX_EXTRA_CA_REQUIRED
+              value: "true"
+            {{- end }}
             {{- if .Values.controlplane.config.registrySecret }}
             - name: REGISTRY_SECRET
               value: {{ .Values.controlplane.config.registrySecret | quote }}
@@ -252,13 +289,24 @@ spec:
               name: manager-metrics
             - containerPort: {{ .Values.controlplane.ports.managerHealth }}
               name: manager-health
+          {{- if gt (int .Values.controlplane.shutdown.preStopSleepSeconds) 0 }}
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: {{ int .Values.controlplane.shutdown.preStopSleepSeconds }}
+          {{- end }}
           # 30 * 2s = 60s. The router port stays closed until the JWT identity
           # is reconciled against the envd-router-identity Secret, so this has
           # to cover identityReconcileBudget (pkg/router/jwt.go, 30s) plus the
           # rest of startup. Shortening it kills the container mid-retry.
+          # It asks /health/live, not /health/ready: readiness also waits for
+          # the namespace admission cache, and a cache that cannot sync (e.g.
+          # namespace RBAC managed outside this chart and missing) must keep
+          # the replica out of the Service, not restart the whole control
+          # plane in a loop.
           startupProbe:
             httpGet:
-              path: /health/ready
+              path: /health/live
               port: router
             failureThreshold: 30
             periodSeconds: 2

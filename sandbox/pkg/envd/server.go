@@ -53,7 +53,6 @@ type Server struct {
 	egressProxy   *egress.TransparentProxy // §4.1: transparent proxy for outbound traffic control
 	egressEnabled bool
 	policyEngine  *policy.Engine // §4.1: egress policy engine (nil when egress disabled)
-	policySyncer  *PolicySyncer  // §4.1: periodic policy pull from WM
 	auditReporter *egressAuditReporter
 	drainTimeout  time.Duration
 	jobs          *jobRegistry
@@ -68,7 +67,7 @@ type Config struct {
 	TMuxWidth       int
 	TMuxHeight      int
 	EgressEnabled   bool     // §4.1: enable transparent proxy + SSRF protection
-	ExtraBlockCIDRs []string // §4.1: additional CIDRs to block (e.g. 169.254.0.0/16)
+	ExtraBlockCIDRs []string // §4.1: additional CIDRs to block, beyond the built-in lists in egress/ssrf.go
 	// Shutdown drain budget; zero takes defaultShutdownDrainTimeout. Must stay
 	// under the pod's termination grace, or the drain ends in a SIGKILL.
 	ShutdownDrainTimeout time.Duration
@@ -142,9 +141,6 @@ func New(cfg Config) (*Server, error) {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	// Health check (unauthenticated)
-	mux.HandleFunc("/health", s.handleHealth)
-
 	// Command execution
 	mux.HandleFunc("/api/execute", s.handleExecute)
 	mux.HandleFunc("/api/execute/stream", s.handleExecuteStream)
@@ -204,13 +200,19 @@ func (s *Server) Handler() http.Handler {
 	// GPU
 	mux.HandleFunc("/api/gpu/status", s.handleGPUStatus)
 
-	// Middleware chain (outer runs first): JWT auth → session capture → handler
-	return s.jwtMiddleware(s.sessionCaptureMiddleware(mux))
+	// Middleware chain (outer runs first): JWT auth → session capture → handler.
+	// The health check is public, so it stays outside: a bearer it carries was
+	// never verified, and must not become the token envd sends to WM.
+	root := http.NewServeMux()
+	root.HandleFunc("/health", s.handleHealth)
+	root.Handle("/", s.jwtMiddleware(s.sessionCaptureMiddleware(mux)))
+	return root
 }
 
 // sessionCaptureMiddleware captures the session ID and Router JWT from the incoming
 // request headers. The JWT is reused by EnvD to authenticate against WM's internal
-// policy API (replacing the previous static INTERNAL_API_TOKEN approach).
+// policy API (replacing the previous static INTERNAL_API_TOKEN approach); the
+// Router signs a fresh one for every request, and the newest is kept.
 // Runs after jwtMiddleware — the Authorization header is still readable.
 //
 // IMPORTANT: JWT must be captured BEFORE setSessionID, because setSessionID
@@ -220,8 +222,17 @@ func (s *Server) sessionCaptureMiddleware(next http.Handler) http.Handler {
 		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
 			s.inference.setJWTToken(auth[len("Bearer "):])
 		}
-		if sid := r.Header.Get("x-session-id"); sid != "" {
+		// With a verification key the session comes from the token
+		// jwtMiddleware verified, not from a header anyone could have set.
+		sid := r.Header.Get("x-session-id")
+		if verified, ok := r.Context().Value(verifiedSessionIDKey{}).(string); ok {
+			sid = verified
+		}
+		if sid != "" {
 			s.inference.setSessionID(sid)
+		}
+		if s.auditReporter != nil {
+			s.auditReporter.wake()
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -231,9 +242,6 @@ func (s *Server) sessionCaptureMiddleware(next http.Handler) http.Handler {
 func (s *Server) Run(ctx context.Context) error {
 	// §4.1: Init phase — add envd-proxy GID, set up iptables, start transparent proxy.
 	if s.egressEnabled {
-		if s.auditReporter != nil {
-			go s.auditReporter.Run(ctx)
-		}
 		log.Info("egress: init phase — adding envd-proxy supplementary group")
 		if err := egress.AddEnvDProxyGroup(); err != nil {
 			return fmt.Errorf("egress add proxy group: %w", err)
@@ -255,26 +263,7 @@ func (s *Server) Run(ctx context.Context) error {
 			}
 		}()
 
-		// Start policy syncer — pulls egress policy from WM every 30s.
-		// Uses session ID and JWT captured by sessionCaptureMiddleware.
-		if s.policyEngine != nil {
-			go func() {
-				// Wait for first request to capture session ID and JWT
-				log.Info("egress: policy syncer waiting for session ID from first request...")
-				s.inference.waitForReady()
-				sid := s.inference.getSessionID()
-				jwt := s.inference.getJWTToken()
-				wmURL := s.inference.getWMURL()
-				if sid != "" && wmURL != "" {
-					syncer := NewPolicySyncer(s.policyEngine, s.egressProxy.SSRFChecker(), wmURL, sid, jwt)
-					s.policySyncer = syncer
-					log.Info("egress: starting policy syncer", "sessionId", sid)
-					syncer.Run(ctx)
-				} else {
-					log.Warn("egress: policy syncer not started (no session ID or WM URL)")
-				}
-			}()
-		}
+		s.startWMSync(ctx)
 	}
 
 	srv := &http.Server{
@@ -339,6 +328,31 @@ func (s *Server) Run(ctx context.Context) error {
 	case err := <-errCh:
 		return err
 	}
+}
+
+// startWMSync starts the egress audit uploader and the policy syncer, which
+// pulls egress policy from WM every 30s. Both call WM with the session ID and
+// the newest JWT captured by sessionCaptureMiddleware.
+func (s *Server) startWMSync(ctx context.Context) {
+	if s.auditReporter != nil {
+		go s.auditReporter.Run(ctx)
+	}
+	if s.policyEngine != nil {
+		go s.runPolicySync(ctx, s.egressProxy.SSRFChecker())
+	}
+}
+
+func (s *Server) runPolicySync(ctx context.Context, updater allowedInternalUpdater) {
+	log.Info("egress: policy syncer waiting for session ID from first request...")
+	if !s.inference.waitForReady(ctx) {
+		return
+	}
+	if s.inference.getWMURL() == "" {
+		log.Warn("egress: policy syncer not started (no WM URL)")
+		return
+	}
+	log.Info("egress: starting policy syncer", "sessionId", s.inference.getSessionID())
+	NewPolicySyncer(s.policyEngine, updater, s.inference).Run(ctx)
 }
 
 // handleHealth handles GET /health

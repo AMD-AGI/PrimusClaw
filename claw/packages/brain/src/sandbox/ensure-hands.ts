@@ -28,6 +28,7 @@ import {
 import { getSystemEnv } from "../infra/system-env.js";
 import { resolveRequestLlmKey } from "../llm/key-source.js";
 import { checkHandsHealth } from "./hands-health.js";
+import { safeHandsBaseUrl } from "./sandbox-router.js";
 import type { HandsHealthResult } from "./hands-health.js";
 import { destroyHands } from "./reaper.js";
 import {
@@ -2045,6 +2046,9 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
  * so reusing this sandbox would put a ping target back on the fleet holding no
  * slot and carry the target set past the ceiling.
  */
+/** Re-read-and-retry attempts for clearing the idle markers after a lost CAS. */
+const IDLE_MARKER_CLEAR_ATTEMPTS = 3;
+
 async function clearIdleMarkers(
   kv: ReuseAttempt["kv"],
   sessionId: string,
@@ -2095,6 +2099,9 @@ async function clearIdleMarkers(
   delete info.keepalive;
   delete info.idleSince;
   delete info.quiescedAt;
+  // A destroy streak is evidence about the idle period this ends; carried into
+  // the next one it could complete there. See sandbox/reclaim-evidence.ts.
+  delete info.reclaimStreak;
   if (restamp && held) {
     info.taskId = held.taskId;
     info.attemptId = held.attemptId;
@@ -2113,83 +2120,93 @@ async function clearIdleMarkers(
       return true;
     }
   }
-  try {
-    const latest = await kv.get(key);
-    // Absent or tombstoned: the sweep won the race and took the slot with it.
-    //
-    // Only a write that was clearing markers may read this as a reason to
-    // refuse the reuse. A write that was only re-stamping the holder has no
-    // claim on that verdict -- the sandbox answered its health check, and a key
-    // that is missing HERE may simply have been migrated to its canonical name
-    // by `reconcileReservedKeys` mid-rollout. Refusing then would rebuild a
-    // live container to fix a record.
-    if (!latest || isTombstone(latest)) {
-      if (!clearingMarkers) {
-        logger.warn({ sessionId, key }, "ensureHands.holder_restamp_skipped_key_moved");
+  // Bounded, and re-read each time: the markers (the streak among them) end
+  // the idle period a destroy streak was built in, so one more heartbeat
+  // landing during the retry must not leave them on the record. A clear that
+  // still cannot land leaves the handle parked under this turn's run lease,
+  // which every confirm-path destroy reads fail-closed before it acts.
+  for (let attempt = 1; attempt <= IDLE_MARKER_CLEAR_ATTEMPTS; attempt++) {
+    try {
+      const latest = await kv.get(key);
+      // Absent or tombstoned: the sweep won the race and took the slot with it.
+      //
+      // Only a write that was clearing markers may read this as a reason to
+      // refuse the reuse. A write that was only re-stamping the holder has no
+      // claim on that verdict -- the sandbox answered its health check, and a key
+      // that is missing HERE may simply have been migrated to its canonical name
+      // by `reconcileReservedKeys` mid-rollout. Refusing then would rebuild a
+      // live container to fix a record.
+      if (!latest || isTombstone(latest)) {
+        if (!clearingMarkers) {
+          logger.warn({ sessionId, key }, "ensureHands.holder_restamp_skipped_key_moved");
+          return true;
+        }
+        logger.warn({ sessionId, key }, "ensureHands.reuse_record_deleted_under_us");
+        return false;
+      }
+      // The markers are not part of the identity HandsProbeEntry describes, but
+      // they live on the same value and this is the writer that removes them.
+      const current = parseHandsProbeValue(sc.decode(latest.value)) as HandsProbeEntry
+        & {
+          keepalive?: boolean;
+          idleSince?: unknown;
+          quiescedAt?: unknown;
+          sessionDeleted?: boolean;
+          status?: string;
+        };
+      // Parked by a session delete while we were losing the race. Same sandbox,
+      // so the identity check below would pass -- but clearing `keepalive:false`
+      // here un-parks it, and eligibleForClusterReclaim refuses any entry whose
+      // keepalive is not false, so the session's GPU clusters would never be
+      // reclaimed. The single-shot CAS this retry replaced simply lost and left
+      // it alone; the retry has to do the same deliberately.
+      if (current.sessionDeleted === true) {
+        logger.warn({ sessionId }, "ensureHands.idle_markers_left_parked");
         return true;
       }
-      logger.warn({ sessionId, key }, "ensureHands.reuse_record_deleted_under_us");
-      return false;
-    }
-    // The markers are not part of the identity HandsProbeEntry describes, but
-    // they live on the same value and this is the writer that removes them.
-    const current = parseHandsProbeValue(sc.decode(latest.value)) as HandsProbeEntry
-      & {
-        keepalive?: boolean;
-        idleSince?: unknown;
-        quiescedAt?: unknown;
-        sessionDeleted?: boolean;
-        status?: string;
-      };
-    // Parked by a session delete while we were losing the race. Same sandbox,
-    // so the identity check below would pass -- but clearing `keepalive:false`
-    // here un-parks it, and eligibleForClusterReclaim refuses any entry whose
-    // keepalive is not false, so the session's GPU clusters would never be
-    // reclaimed. The single-shot CAS this retry replaced simply lost and left
-    // it alone; the retry has to do the same deliberately.
-    if (current.sessionDeleted === true) {
-      logger.warn({ sessionId }, "ensureHands.idle_markers_left_parked");
+      if (current.status === "closing" || current.status === "reclaiming") {
+        logger.info({ sessionId }, "ensureHands.idle_markers_left_closing");
+        return false;
+      }
+      if (!sameHandsSandbox(identity, current)) {
+        // Someone else's sandbox now. Reusing ours is still correct -- it passed
+        // its own health check under its own identity -- but its markers are not
+        // ours to clear.
+        logger.warn({ sessionId }, "ensureHands.idle_markers_owner_changed");
+        return true;
+      }
+      // The stamp travels with the retry. It was applied to the value the first
+      // CAS lost, and re-reading discards that value -- so a single ordinary
+      // heartbeat landing during the health check was enough to leave the holder
+      // naming whoever held it last.
+      const stamped = restamp && held
+        ? { taskId: held.taskId, attemptId: held.attemptId }
+        : {};
+      const stillNeedsMarkers = current.keepalive !== undefined
+        || current.idleSince != null
+        || current.quiescedAt != null;
+      if (!stillNeedsMarkers && !restamp) return true;
+      await kv.update(key, sc.encode(JSON.stringify({
+        ...current,
+        ...stamped,
+        keepalive: undefined,
+        idleSince: undefined,
+        quiescedAt: undefined,
+        reclaimStreak: undefined,
+      })), latest.revision);
+      return true;
+    } catch (err) {
+      if (isRevisionConflict(err) && attempt < IDLE_MARKER_CLEAR_ATTEMPTS) continue;
+      // Left parked at worst: the ticker will not ping it, and the next request
+      // reactivates it. Not a reason to refuse a sandbox that answered.
+      logger.warn(
+        { err: String(err), sessionId },
+        "ensureHands.idle_markers_not_cleared",
+      );
       return true;
     }
-    if (current.status === "closing" || current.status === "reclaiming") {
-      logger.info({ sessionId }, "ensureHands.idle_markers_left_closing");
-      return false;
-    }
-    if (!sameHandsSandbox(identity, current)) {
-      // Someone else's sandbox now. Reusing ours is still correct -- it passed
-      // its own health check under its own identity -- but its markers are not
-      // ours to clear.
-      logger.warn({ sessionId }, "ensureHands.idle_markers_owner_changed");
-      return true;
-    }
-    // The stamp travels with the retry. It was applied to the value the first
-    // CAS lost, and re-reading discards that value -- so a single ordinary
-    // heartbeat landing during the health check was enough to leave the holder
-    // naming whoever held it last.
-    const stamped = restamp && held
-      ? { taskId: held.taskId, attemptId: held.attemptId }
-      : {};
-    const stillNeedsMarkers = current.keepalive !== undefined
-      || current.idleSince != null
-      || current.quiescedAt != null;
-    if (!stillNeedsMarkers && !restamp) return true;
-    await kv.update(key, sc.encode(JSON.stringify({
-      ...current,
-      ...stamped,
-      keepalive: undefined,
-      idleSince: undefined,
-      quiescedAt: undefined,
-    })), latest.revision);
-    return true;
-  } catch (err) {
-    // Left parked at worst: the ticker will not ping it, and the next request
-    // reactivates it. Not a reason to refuse a sandbox that answered.
-    logger.warn(
-      { err: String(err), sessionId },
-      "ensureHands.idle_markers_not_cleared",
-    );
-    return true;
   }
+  return true;
 }
 
 
@@ -2739,7 +2756,9 @@ async function provisionHands(
   let admitted = false;
   try {
   const workloadId = inst.id;
-  const handsBaseUrl = `http://${workloadId}.${nsForSandbox}.svc.cluster.local:${mcpPort}`;
+  // The cluster DNS name unless Hands is reached through the Router, in which
+  // case the Router's port proxy for this sandbox (see sandbox-router.ts).
+  const handsBaseUrl = safeHandsBaseUrl(nsForSandbox, workloadId, mcpPort);
 
   logger.info({ sessionId, workloadId, handsBaseUrl }, "ensureHands.bootstrap_start");
   await bootstrapHandsInSandbox(
@@ -2753,7 +2772,9 @@ async function provisionHands(
   let handsHealthy = false;
   for (let i = 0; i < HANDS_HEALTH_MAX_TRIES; i++) {
     try {
-      const hr = await fetch(`${handsBaseUrl}/health`, { signal: AbortSignal.timeout(3000) });
+      // The shared probe, so a routed URL carries the session header the
+      // Router needs and fails over between Router bases like every other call.
+      const hr = await checkHandsHealth(`${handsBaseUrl}/mcp`, 3000);
       if (hr.ok) { handsHealthy = true; break; }
     } catch { /* retry */ }
     await sleep(HANDS_HEALTH_INTERVAL_MS);

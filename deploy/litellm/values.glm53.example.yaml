@@ -14,3 +14,6 @@ modelList:
       api_key: dummy
     model_info:
       supports_native_streaming: true
+      # Anthropic /v1/messages is forwarded to the upstream native endpoint.
+      supported_endpoints:
+        - /v1/messages

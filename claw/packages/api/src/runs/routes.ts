@@ -148,7 +148,7 @@ export function toRunView(row: RunRow): RunView {
     run_id: row.task_id,
     session_id: row.session_id,
     phase: phaseOf(row.status),
-    terminal,
+    terminal: terminal && { ...terminal, failure_reason: row.failure_reason ?? "" },
     timestamps: {
       created_at: iso(row.created_at),
       started_at: iso(row.started_at),

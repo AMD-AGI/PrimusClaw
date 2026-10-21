@@ -19,6 +19,7 @@ import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import type { KV } from "nats";
 import { createHash, timingSafeEqual } from "crypto";
 import pino from "pino";
+import { drainKeys } from "../infra/kv-keys.js";
 import {
   BRAIN_REGISTRY_BUCKET,
   BRAIN_CHECKPOINTS_BUCKET,
@@ -184,10 +185,11 @@ async function listRecentCheckpoints(
     // bug, no error log. The reaper module already encodes the same
     // prefix in workspace/reaper.ts; keep all three call sites in sync.
     // `>` rather than `*` because the key spans more than one token now.
-    const iter = await kvCkpt.keys("task-ckpt.>");
-    let i = 0;
-    for await (const key of iter) {
-      if (i++ >= limit) break;
+    // Drained before any checkpoint is read: a `get` inside the open listing
+    // ends it after the first key (see drainKeys), so this answered with one
+    // checkpoint however many there were.
+    const keys = (await drainKeys(await kvCkpt.keys("task-ckpt.>"))).slice(0, limit);
+    for (const key of keys) {
       const entry = await kvCkpt.get(key).catch(() => null);
       if (!entry) continue;
       try {

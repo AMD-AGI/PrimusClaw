@@ -10,7 +10,7 @@
 # ──────────────────────────────────────────────────────────────────────
 
 # ========== Stage 1: build ==========
-FROM node:26-bookworm-slim@sha256:582460f614631b59b824ac6020533b9bf339c7fdf3a6d7db31abb6b4065f0212 AS builder
+FROM node:26-bookworm-slim@sha256:86f07bc9c5dce4578cf37e5a418b7bfc7f817cda25cde66e2b66e95ed86c4567 AS builder
 WORKDIR /app
 
 # ============ Extra CA anchors (opt-in) ============
@@ -136,7 +136,7 @@ RUN npm run build -w packages/utils \
 #
 # Uses AlmaLinux 8 (glibc 2.28) so the binary runs on older base images like
 # sglang/ROCm and PyTorch without relying on an end-of-life build distribution.
-FROM almalinux:8-minimal@sha256:6cafa4a66d9a241a580cb6f2a20744f03ed1d1c4a882bb9eef81075c8131c8a8 AS bun-builder
+FROM almalinux:10-minimal@sha256:77aeeeef6889af731a91d83f65b08ef9930bde10332ae2e3fd6e0f0c47066a7b AS bun-builder
 WORKDIR /app
 
 # Nothing in this stage touches the network, and that is the point. This base
@@ -166,13 +166,15 @@ RUN bun build packages/hands/src/index.ts \
 
 # ========== Stage 2: runtime ==========
 # node:26-slim (Debian/glibc) — Node.js runs API and Brain processes.
-FROM node:26-bookworm-slim@sha256:582460f614631b59b824ac6020533b9bf339c7fdf3a6d7db31abb6b4065f0212 AS runtime
+FROM node:26-bookworm-slim@sha256:86f07bc9c5dce4578cf37e5a418b7bfc7f817cda25cde66e2b66e95ed86c4567 AS runtime
 WORKDIR /app
 ENV NODE_ENV=production \
     WORKSPACE_PATH=/workspace
 
+# perl-base is already present; naming it makes apt pull the patched build
+# (5.36.0-7+deb12u4) even when the base image has not been rebuilt yet.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends tini ca-certificates bash curl xz-utils \
+ && apt-get install -y --no-install-recommends tini ca-certificates bash curl xz-utils perl-base \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /workspace
 

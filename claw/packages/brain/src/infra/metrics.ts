@@ -603,7 +603,36 @@ const sessionCleanupIncompleteTotal = new Counter({
   registers: [registry],
 });
 
+// ─── Keepalive idle reclaim: destroys and the holds that refused them ─
+// A destroy from the jobs probe used to need one reading; now it needs several
+// agreeing ones and a quiet window after any failure. The pair says how often
+// each kind of evidence destroyed a sandbox and how often an unconfirmed
+// reading was held back -- a fleet of holds after a node-agent restart is the
+// event this exists for.
+const keepaliveReclaimTotal = new Counter({
+  name: "claw_brain_keepalive_reclaim_total",
+  help: "Sandboxes destroyed by keepalive idle reclaim, by the evidence that authorised it.",
+  // reason: "idle_empty" | "instance_replaced" | "terminal" | "absent"
+  labelNames: ["reason"] as const,
+  registers: [registry],
+});
+const keepaliveReclaimHeldTotal = new Counter({
+  name: "claw_brain_keepalive_reclaim_held_total",
+  help: "Destructive jobs-probe readings keepalive held back, by reading and hold.",
+  // hold: "awaiting_confirmation" | "recent_probe_failure" | "recent_positive_count"
+  labelNames: ["reason", "hold"] as const,
+  registers: [registry],
+});
+
 export const metrics = {
+  /** One sandbox destroyed by keepalive idle reclaim. */
+  onKeepaliveReclaim(reason: "idle_empty" | "instance_replaced" | "terminal" | "absent"): void {
+    keepaliveReclaimTotal.inc({ reason });
+  },
+  /** One destructive jobs-probe reading held back pending confirmation. */
+  onKeepaliveReclaimHeld(reason: "idle_empty" | "instance_replaced", hold: string): void {
+    keepaliveReclaimHeldTotal.inc({ reason, hold });
+  },
   /** One park site that could not park under a key the ledger knows. */
   onParkKeyUnusable(site: string, reason: "absent" | "untracked"): void {
     parkKeyUnusableTotal.inc({ site, reason });

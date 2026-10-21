@@ -42,6 +42,7 @@
  */
 import pino from "pino";
 import { sleep } from "@claw/utils";
+import { routedHandsPort } from "@claw/protocol";
 import {
   AGENT_SANDBOX_WARM_POOL_SIZE,
   LOCAL_MODE_HANDS_BINARY,
@@ -240,8 +241,13 @@ export function restartPreservesEnvironment(inst: SandboxInstance): boolean {
   return inst.provider !== "agent-sandbox" || AGENT_SANDBOX_WARM_POOL_SIZE === 0;
 }
 
-/** The port a Hands MCP url points at. */
+/**
+ * The port a Hands MCP url points at. For a Router port-proxy url that is the
+ * port in the proxy path; the host's port there is the Router's.
+ */
 export function mcpPortFromUrl(handsUrl: string): string {
+  const routed = routedHandsPort(handsUrl);
+  if (routed) return routed;
   try {
     return new URL(handsUrl).port || DEFAULT_MCP_PORT;
   } catch {

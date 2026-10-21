@@ -14,6 +14,7 @@
  * directly, so what is asserted is that a real tick both admits the target and
  * pings it.
  */
+import "./reclaim-single-reading-env.js";
 import test, { afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { StringCodec, type KV } from "nats";

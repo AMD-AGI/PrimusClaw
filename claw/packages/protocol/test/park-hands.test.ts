@@ -16,6 +16,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  parkHandsHandle,
   parkHandsAfterRun,
   applyRunEndedIdleFields,
   type RevisionedKv,
@@ -189,4 +190,21 @@ test("unreadable ownership data is not evidence that no sandbox is referenced", 
     { outcome: "skipped", reason: "unreadable" },
   );
   assert.equal(writes.length, 0, "leave it for operator repair and the bucket's TTL");
+});
+
+test("a removed handle is gone, not a parse failure or an unreadable entry", async () => {
+  // NATS KV answers `get` on a deleted key with its delete marker -- an empty
+  // value and operation DEL -- rather than with nothing. Parsed as a handle it
+  // failed as "Unexpected end of JSON input", and the teardown that parks a
+  // session retried a session whose sandbox never came up, every sweep.
+  for (const operation of ["DEL", "PURGE"]) {
+    const writes: unknown[] = [];
+    const kv = {
+      async get() { return { value: new Uint8Array(), revision: REVISION, operation }; },
+      async update(_key: string, value: Uint8Array) { writes.push(value); return REVISION + 1; },
+    };
+    assert.deepEqual(await parkHandsHandle(kv, SESSION), { outcome: "gone" }, operation);
+    assert.deepEqual(await parkHandsAfterRun(kv, SESSION), { outcome: "gone" }, operation);
+    assert.equal(writes.length, 0, `${operation}: a removed handle must not be written back`);
+  }
 });

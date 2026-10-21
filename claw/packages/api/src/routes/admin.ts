@@ -14,7 +14,7 @@ import { SAFE_API_URL } from "../config.js";
 import { getUser, internalTokenAuth as internalAuth } from "../auth/middleware.js";
 import { canWriteSessionAsOperator } from "../auth/models.js";
 import { collectSandboxInventory } from "./sandbox-inventory.js";
-import { sessionIdFromHandsKey } from "@claw/protocol";
+import { handsRouteHeaders, sessionIdFromHandsKey } from "@claw/protocol";
 import { listDagHandles } from "../infra/dag-handles.js";
 
 async function readKvString(key: string): Promise<string | null> {
@@ -126,6 +126,8 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
         probeHealth: async (handsUrl) => {
           try {
             const r = await fetch(`${handsUrl.replace(/\/mcp\/?$/, "")}/health`, {
+              // A Router port-proxy URL needs its session header to be routed.
+              headers: handsRouteHeaders(handsUrl),
               signal: AbortSignal.timeout(3000),
             });
             return r.ok;

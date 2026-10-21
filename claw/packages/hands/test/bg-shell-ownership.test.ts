@@ -245,12 +245,12 @@ test("a reaped run stops counting, which is how a finished DAG node releases the
 });
 
 test("with background shells on, the foreground ceiling is the tight one and points at them", async () => {
-  // The pairing, from the enabled side: 120s is the ceiling that keeps a
+  // The pairing, from the enabled side: 100s is the ceiling that keeps a
   // handover between replicas clean, and it is affordable only because long work
   // has this feature to go to -- which is why the timeout message names it. The
   // disabled side is in bg-shell-disabled and foreground-ceiling.
   const { bash } = await import("../src/tools/shell/bash.js");
-  assert.match(bash.zodSchema.timeout.description!, /capped at 120/);
+  assert.match(bash.zodSchema.timeout.description!, /capped at 100\b/);
 
   const res = await bash.execute({ command: "sleep 5", timeout: 1 });
   assert.match(res.content[0]!.text!, /run_in_background=true/);

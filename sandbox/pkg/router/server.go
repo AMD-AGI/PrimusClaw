@@ -11,11 +11,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -23,6 +25,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/agent-sandbox/pkg/cmdlog"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
+	"sigs.k8s.io/agent-sandbox/pkg/nsadmission"
 	"sigs.k8s.io/agent-sandbox/pkg/safe"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
@@ -35,7 +38,27 @@ type Config struct {
 	SafeAPIURL            string
 	WorkloadManagerURL    string
 	Namespace             string
+	// Namespaces decides which namespaces /v1/namespaces/:namespace serves.
+	// nil admits every namespace.
+	Namespaces *nsadmission.Admitter
+
+	// ShutdownDelay is how long the Router keeps accepting new requests after
+	// Run's context ends, while /health/ready already answers 503 -- the
+	// in-process counterpart of kube-apiserver's --shutdown-delay-duration. It
+	// covers the time the Service endpoints and the gateway in front of them
+	// need to stop sending this replica new requests. A preStop sleep does the
+	// same before the signal arrives; this is the part that still works where
+	// preStop is unavailable.
+	ShutdownDelay time.Duration
+	// ShutdownTimeout bounds how long in-flight requests (proxied sandbox
+	// calls, SSE streams) may run after the listener closes. When it expires
+	// the remaining connections are closed. Zero means DefaultShutdownTimeout.
+	// terminationGracePeriodSeconds must cover preStop + ShutdownDelay + this.
+	ShutdownTimeout time.Duration
 }
+
+// DefaultShutdownTimeout is used when Config.ShutdownTimeout is zero.
+const DefaultShutdownTimeout = 30 * time.Second
 
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
@@ -61,6 +84,13 @@ type Server struct {
 	wasReady       bool
 	notReadySince  time.Time
 	lastUnreadyLog time.Time
+
+	// draining is set once Run's context ends: from then on /health/ready
+	// answers 503 so the replica leaves every endpoint list, while requests
+	// already in flight are allowed to finish.
+	draining atomic.Bool
+	// shutdownDelayHook, when set, replaces time.After for the shutdown delay.
+	shutdownDelayHook func(time.Duration) <-chan time.Time
 }
 
 // New creates a new Router server.
@@ -120,7 +150,8 @@ func New(
 // - Control-plane routes (code-interpreter CRUD, templates) are reverse-proxied to Workload Manager.
 func (s *Server) setupRoutes() {
 	s.engine = gin.New()
-	s.engine.Use(gin.Recovery())
+	// The default recovery dumps request headers and masks only Authorization.
+	s.engine.Use(gin.RecoveryWithWriter(cmdlog.RedactingWriter(gin.DefaultErrorWriter)))
 	s.engine.Use(metricsMiddleware())
 
 	// Health check endpoints (no concurrency limit)
@@ -150,11 +181,18 @@ func (s *Server) setupRoutes() {
 	// POST: execute commands, upload files, create sessions
 	// DELETE: delete files, destroy sessions
 	// PUT/PATCH: reserved for future use
-	v1.GET("/namespaces/:namespace/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
-	v1.POST("/namespaces/:namespace/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
-	v1.DELETE("/namespaces/:namespace/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
-	v1.PUT("/namespaces/:namespace/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
-	v1.PATCH("/namespaces/:namespace/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
+	//
+	// Namespace admission (403 namespace_not_admitted, see package
+	// nsadmission): a request without a session ID is judged by the URL
+	// namespace in this middleware, before the auto-create; a request with one
+	// is judged in handleInvoke by the namespace its sandbox lives in, before
+	// any invocation, port proxy or tunnel.
+	namespaced := v1.Group("/namespaces/:namespace", s.namespaceAdmissionMiddleware())
+	namespaced.GET("/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
+	namespaced.POST("/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
+	namespaced.DELETE("/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
+	namespaced.PUT("/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
+	namespaced.PATCH("/code-interpreters/:name/invocations/*path", s.handleCodeInterpreterInvoke)
 
 	// ── Control plane: proxied to Workload Manager ───────────────────────
 	// Sandbox session management
@@ -181,23 +219,93 @@ func (s *Server) setupRoutes() {
 	v1.GET("/health", s.proxyToWM)
 }
 
-// Run starts the HTTP server.
-func (s *Server) Run(ctx context.Context) error {
-	srv := &http.Server{
-		Addr:    fmt.Sprintf(":%d", s.cfg.Port),
-		Handler: s.engine,
+// namespaceAdmissionMiddleware rejects a request without a session ID whose
+// URL namespace the configured selector does not admit; such a request would
+// create a sandbox in that namespace. A request with a session ID passes: the
+// URL namespace says nothing about where its sandbox lives (clients put a
+// default namespace there), so handleInvoke judges the session's own
+// namespace instead. See package nsadmission for the status codes.
+func (s *Server) namespaceAdmissionMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.GetHeader("x-session-id") == "" && !s.cfg.Namespaces.Gate(c, c.Param("namespace")) {
+			return
+		}
+		c.Next()
 	}
+}
+
+// Run starts the HTTP server and, when ctx ends, drains it.
+func (s *Server) Run(ctx context.Context) error {
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", s.cfg.Port))
+	if err != nil {
+		return err
+	}
+	return s.Serve(ctx, ln)
+}
+
+// Serve serves on ln until ctx ends, then drains the way a Kubernetes Pod is
+// expected to: readiness fails at once, new requests are still accepted for
+// ShutdownDelay, then the listener closes and in-flight requests get up to
+// ShutdownTimeout to finish. Only connections still open after that are cut.
+// Cutting them is returned as ErrDrainIncomplete so the process exits non-zero
+// and says which component failed to drain.
+//
+// Before this, Run called Shutdown the moment the signal arrived and main
+// returned without waiting for it, so a rollout cut every proxied request in
+// flight (two Hands MCP calls, and ~1 s of 503 at the gateway, on 2026-10-10).
+//
+// Hijacked connections (WebSocket tunnels, upgraded port-proxy streams) are not
+// tracked by http.Server.Shutdown and end when the process exits.
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	srv := &http.Server{Handler: s.engine}
 	errCh := make(chan error, 1)
 	go func() {
-		log.Info("router listening", "port", s.cfg.Port)
-		errCh <- srv.ListenAndServe()
+		log.Info("router listening", "addr", ln.Addr().String())
+		errCh <- srv.Serve(ln)
 	}()
 	select {
 	case <-ctx.Done():
-		return srv.Shutdown(context.Background())
 	case err := <-errCh:
 		return err
 	}
+
+	s.draining.Store(true)
+	log.Info("router.drain.started", "shutdownDelay", s.cfg.ShutdownDelay.String(),
+		"shutdownTimeout", s.shutdownTimeout().String())
+	if s.cfg.ShutdownDelay > 0 {
+		<-s.delayAfter(s.cfg.ShutdownDelay)
+	}
+
+	shutCtx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout())
+	defer cancel()
+	start := time.Now()
+	if err := srv.Shutdown(shutCtx); err != nil {
+		log.Warn("router.drain.timeout: closing connections still in flight",
+			"waitedSeconds", time.Since(start).Seconds(), "error", err)
+		_ = srv.Close()
+		return fmt.Errorf("%w after %s: %w", ErrDrainIncomplete, s.shutdownTimeout(), err)
+	}
+	log.Info("router.drain.complete", "waitedSeconds", time.Since(start).Seconds())
+	return nil
+}
+
+// ErrDrainIncomplete is returned by Serve when requests were still in flight
+// at ShutdownTimeout and their connections had to be closed.
+var ErrDrainIncomplete = errors.New("router drain incomplete: in-flight connections closed")
+
+// delayAfter waits out ShutdownDelay; tests replace it to control the window.
+func (s *Server) delayAfter(d time.Duration) <-chan time.Time {
+	if s.shutdownDelayHook != nil {
+		return s.shutdownDelayHook(d)
+	}
+	return time.After(d)
+}
+
+func (s *Server) shutdownTimeout() time.Duration {
+	if s.cfg.ShutdownTimeout > 0 {
+		return s.cfg.ShutdownTimeout
+	}
+	return DefaultShutdownTimeout
 }
 
 // ─── Handlers ────────────────────────────────────────────────────────────────
@@ -285,6 +393,14 @@ const unreadyHeartbeat = 5 * time.Minute
 func (s *Server) handleHealthReady(c *gin.Context) {
 	ctx := c.Request.Context()
 
+	// Checked first: a draining replica must leave the endpoints even though
+	// every dependency below is still healthy.
+	if s.draining.Load() {
+		s.noteReadiness(false, "shutdown", "draining", "router is draining")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready", "reason": "draining"})
+		return
+	}
+
 	if err := s.store.Ping(ctx); err != nil {
 		s.noteReadiness(false, "store", "error", err.Error())
 		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready", "reason": "store: " + err.Error()})
@@ -317,6 +433,14 @@ func (s *Server) handleHealthReady(c *gin.Context) {
 		detail := "status " + strconv.Itoa(resp.StatusCode)
 		s.noteReadiness(false, "workload_manager", "status", detail)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready", "reason": "workload-manager: " + detail})
+		return
+	}
+
+	// A replica whose namespace cache is cold would answer every namespaced
+	// request with 503; keep it out of the Service until it can answer.
+	if !s.cfg.Namespaces.Ready() {
+		s.noteReadiness(false, "namespace_admission", "not_synced", "namespace informer not synced")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready", "reason": "namespace admission: cache not synced"})
 		return
 	}
 
@@ -382,6 +506,16 @@ func (s *Server) handleInvoke(c *gin.Context, kind string) {
 			"kind", kind, "name", name, "sessionId", sessionID, "error", err)
 		errMsg := err.Error()
 
+		// A Workload Manager refusal or transient condition is relayed as is.
+		var wmErr *wmStatusError
+		if errors.As(err, &wmErr) {
+			if wmErr.RetryAfter != "" {
+				c.Header("Retry-After", wmErr.RetryAfter)
+			}
+			c.Data(wmErr.Status, "application/json; charset=utf-8", wmErr.Body)
+			return
+		}
+
 		// Session not found (expired/deleted, not recoverable from K8s either)
 		if strings.Contains(errMsg, "session") && strings.Contains(errMsg, "not found") {
 			c.JSON(http.StatusNotFound, gin.H{"error": errMsg})
@@ -403,6 +537,17 @@ func (s *Server) handleInvoke(c *gin.Context, kind string) {
 			return
 		}
 		c.JSON(http.StatusBadGateway, gin.H{"error": errMsg})
+		return
+	}
+	// Admission is judged on the namespace the sandbox actually lives in, not
+	// the one the URL names: a session ID resolves to its sandbox wherever it
+	// is, so judging the URL would let a session from a non-admitted namespace
+	// through any admitted one (and unlabelling a namespace would not cut off
+	// its live sessions), while refusing a URL that merely differs would break
+	// clients that name a default namespace for every session. For an
+	// auto-created sandbox this repeats the middleware's check on the same
+	// namespace.
+	if !s.cfg.Namespaces.Gate(c, info.Namespace) {
 		return
 	}
 	sessionID = info.SessionID

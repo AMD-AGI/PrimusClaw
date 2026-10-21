@@ -49,6 +49,6 @@ test("an operator-set ceiling moves every surface together, with the switch off"
     callDeadlineMs("bash", { command: "x", timeout: 36_000 }),
     OVERRIDE_SEC * 1000 + MCP_DEADLINE_SLACK_MS,
   );
-  assert.match(handsBaseEnv("s-1", "9100", "tok"),
+  assert.match(handsBaseEnv("s-1", "9100"),
     new RegExp(`BASH_MAX_TIMEOUT_SEC=${OVERRIDE_SEC}(\\s|$)`));
 });

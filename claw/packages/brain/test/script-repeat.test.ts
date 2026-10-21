@@ -20,6 +20,7 @@
  *   G2 an absent or unstructured result is not satisfaction
  *   G3 both bounds stop the loop, and giving up is a failure
  *   G4 an error ends the repetition rather than being retried through
+ *   G4b-G4d a call lost in transit is sent again, within a bound
  *   G6-G9 cancellation, interval waits, late success, and wait timeout wiring
  */
 import test from "node:test";
@@ -145,6 +146,56 @@ test("G4 an error ends the repetition rather than being retried through", async 
   const result = await runScript(request(WAIT_STEP), { hands: hands.client }, async () => {});
   assert.equal(hands.calls.length, 1, "it retried through an error");
   assert.match(result.failureReason ?? "", /shell not found/);
+});
+
+/** A Hands client whose calls fail in transit where the plan says `lost`. */
+function flakyHands(plan: Array<"lost" | { finished: boolean }>) {
+  let calls = 0;
+  return {
+    calls: () => calls,
+    client: {
+      callToolFull: async () => {
+        const next = plan[Math.min(calls++, plan.length - 1)];
+        if (next === "lost") throw new Error("Streamable HTTP error: sandbox service unreachable on port 9100");
+        return { text: "", structured: next, isError: false };
+      },
+    } as never,
+  };
+}
+
+test("G4b a call lost in transit is sent again rather than ending the repetition", async () => {
+  // REGRESSION GUARD. The proxy in front of a sandbox resets its connections every
+  // few minutes; a forge run that was working failed on the first reset.
+  const hands = flakyHands([{ finished: false }, "lost", { finished: true }]);
+  const result = await runScript(request(WAIT_STEP), { hands: hands.client }, async () => {});
+  assert.equal(hands.calls(), 3);
+  assert.equal(result.failureReason, undefined);
+});
+
+test("G4c losses in a row are bounded in time, so a sandbox that is gone still fails", async () => {
+  // Re-sent at 1s, then after the 1.5s left of a 2.5s budget; the third loss is past it.
+  const hands = flakyHands(["lost"]);
+  const result = await runScript(
+    request(WAIT_STEP), { hands: hands.client, transportLossBudgetMs: 2_500 }, async () => {},
+  );
+  assert.equal(hands.calls(), 3);
+  assert.equal(result.abortReason, "script_step_failed");
+  assert.match(result.failureReason ?? "", /unreachable/);
+});
+
+test("G4d an answer between losses restarts the budget", async () => {
+  // The first run of losses spends the whole 3.5s budget (pauses of 1s, 2s, then the
+  // 0.5s left). Had the answer not restarted it, the next loss would end the step.
+  const step: ScriptStep = {
+    ...WAIT_STEP,
+    repeat: { until: { path: "finished", equals: true }, max_attempts: 10, max_seconds: 60 },
+  };
+  const hands = flakyHands(["lost", "lost", "lost", { finished: false }, "lost", { finished: true }]);
+  const result = await runScript(
+    request(step), { hands: hands.client, transportLossBudgetMs: 3_500 }, async () => {},
+  );
+  assert.equal(hands.calls(), 6);
+  assert.equal(result.failureReason, undefined);
 });
 
 test("G5 a step with no repeat still runs exactly once", async () => {

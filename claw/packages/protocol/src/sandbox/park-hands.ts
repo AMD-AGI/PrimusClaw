@@ -20,8 +20,13 @@ import { SHARED_VERDICT_FIELDS } from "./bg-verdict.js";
  * stays NATS-free, matching the approach in kv/store.ts.
  */
 export interface RevisionedKv {
-  get(key: string): Promise<{ value: Uint8Array; revision: number } | null>;
+  get(key: string): Promise<{ value: Uint8Array; revision: number; operation?: string } | null>;
   update(key: string, value: Uint8Array, revision: number): Promise<number>;
+}
+
+/** NATS KV answers `get` on a deleted key with its delete marker, not with nothing. */
+function isRemovalMarker(entry: { operation?: string }): boolean {
+  return entry.operation === "DEL" || entry.operation === "PURGE";
 }
 
 /**
@@ -87,7 +92,7 @@ export async function parkHandsHandle(
   const key = `hands.${sessionId}`;
   try {
     const entry = await kv.get(key);
-    if (!entry) return { outcome: "gone" };
+    if (!entry || isRemovalMarker(entry)) return { outcome: "gone" };
     const info = JSON.parse(new TextDecoder().decode(entry.value)) as Record<string, unknown>;
     info.keepalive = false;
     info.idleSince = Date.now();
@@ -174,7 +179,7 @@ export async function parkHandsAfterRun(
   const key = handsSessionKey(sessionId);
   try {
     const entry = await kv.get(key);
-    if (!entry) return { outcome: "gone" };
+    if (!entry || isRemovalMarker(entry)) return { outcome: "gone" };
     let info: Record<string, unknown>;
     try {
       info = JSON.parse(new TextDecoder().decode(entry.value)) as Record<string, unknown>;

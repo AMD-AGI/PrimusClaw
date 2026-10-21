@@ -7,11 +7,11 @@ import {
   AUTH_INTERNAL_TOKEN,
   SAFE_API_URL,
   SANDBOX_NAMESPACE,
-  SANDBOX_ROUTER_URL,
 } from "../config.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
 import type { SandboxInstance, SandboxStatus } from "./provider.js";
 import { SandboxRuntimeTerminalError } from "./errors.js";
+import { fetchThroughRouters, sandboxRouterBases } from "./sandbox-router.js";
 
 export interface JobProbeEntry {
   provider?: "safe-workload" | "agent-sandbox";
@@ -111,18 +111,42 @@ function parseJobsBody(body: unknown): JobsProbeResult {
   return { count, podUid, instanceId };
 }
 
+/**
+ * The jobs roster answered from a different Pod or EnvD process than the one
+ * the handle was bound to.
+ *
+ * Carries both sides and the count the new process reported, because keepalive
+ * no longer acts on this from one reading: an EnvD restart beside a data-path
+ * blip answers with a new instance id while the user's work is still running,
+ * and the destroy decision has to log what it was shown.
+ */
+export class SandboxInstanceReplacedError extends SandboxRuntimeTerminalError {
+  readonly instanceReplaced = true;
+  constructor(
+    message: string,
+    readonly before: { podUid?: string; instanceId?: string },
+    readonly after: JobsProbeResult,
+  ) {
+    super("sandbox_instance_replaced", message);
+    this.name = "SandboxInstanceReplacedError";
+  }
+}
+
 /** Bind jobs to one EnvD process; a rebuilt Pod must not look idle. */
 function assertSameInstance(entry: JobProbeEntry, result: JobsProbeResult): void {
+  const before = { podUid: entry.podUid, instanceId: entry.envdInstanceId };
   if (entry.podUid && result.podUid && entry.podUid !== result.podUid) {
-    throw new SandboxRuntimeTerminalError(
-      "sandbox_instance_replaced",
+    throw new SandboxInstanceReplacedError(
       `sandbox Pod UID changed from ${entry.podUid} to ${result.podUid}`,
+      before,
+      result,
     );
   }
   if (entry.envdInstanceId && result.instanceId && entry.envdInstanceId !== result.instanceId) {
-    throw new SandboxRuntimeTerminalError(
-      "sandbox_instance_replaced",
+    throw new SandboxInstanceReplacedError(
       `EnvD instance changed from ${entry.envdInstanceId} to ${result.instanceId}`,
+      before,
+      result,
     );
   }
 }
@@ -200,15 +224,16 @@ export async function inspectSandboxJobs(
   const deadline = Date.now() + timeoutMs;
   await withinBudget(assertSandboxRunning(entry), deadline, "workload status read");
 
+  // SaFE mode may list several Router bases (see sandbox-router.ts); the
+  // agent-sandbox provider and the no-Router ingress each have one.
+  const routers = agent ? [] : sandboxRouterBases();
   const base = agent
     ? AGENT_SANDBOX_ROUTER_URL.replace(/\/+$/, "")
-    : (SANDBOX_ROUTER_URL.trim()
-      ? SANDBOX_ROUTER_URL.replace(/\/+$/, "")
-      : `${SAFE_API_URL}/sandbox`);
+    : (routers.length > 0 ? routers[0] : `${SAFE_API_URL}/sandbox`);
   if (!base) throw new Error("sandbox jobs probe router URL is not configured");
 
   const name = agent ? inst.sandboxName : inst.id;
-  const url = `${base}/v1/namespaces/${inst.namespace}/code-interpreters/${name}/invocations/api/jobs`;
+  const path = `/v1/namespaces/${inst.namespace}/code-interpreters/${name}/invocations/api/jobs`;
   const headers: Record<string, string> = { "x-session-id": inst.id };
   if (agent) {
     if (inst.userId) headers.userId = inst.userId;
@@ -221,11 +246,14 @@ export async function inspectSandboxJobs(
   if (remaining <= 0) {
     throw new Error("sandbox jobs probe budget expired before the roster read");
   }
-  const response = await fetch(url, {
+  const init: RequestInit = {
     method: "GET",
     headers,
     signal: AbortSignal.timeout(remaining),
-  });
+  };
+  const response = routers.length > 0
+    ? await fetchThroughRouters(routers, path, init, fetch)
+    : await fetch(`${base}${path}`, init);
   if (!response.ok) {
     if (response.status === 404 || response.status === 405 || response.status === 501) {
       throw new SandboxJobsUnavailableError(response.status);

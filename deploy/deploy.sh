@@ -72,6 +72,8 @@ Sandbox env:
   SAFE_API_URL=https://<safe-api>       # required unless --insecure-sandbox
   SANDBOX_EGRESS_ENABLED=true
   SANDBOX_EGRESS_EXTRA_BLOCKED_CIDRS=10.0.0.0/8,192.168.0.0/16
+  SANDBOX_EXTRA_CA_CONFIGMAP=<your-ca-configmap>  # optional; PEM CA certs trusted in every sandbox
+  SANDBOX_EXTRA_CA_NAMESPACES=<ns>[,<ns>]  # where it must exist; defaults to SANDBOX_WORKLOAD_NAMESPACE or default
 
 LiteLLM env (deployed AFTER Claw so it can reuse Claw's PGO database):
   LITELLM_NAMESPACE=<NAMESPACE>        # defaults to $NAMESPACE (shares Claw's namespace)
@@ -332,6 +334,13 @@ if [ "$DEPLOY_SANDBOX" = "true" ]; then
   [ -n "${STORAGE_CLASS:-}" ] && sandbox_env+=("REDIS_STORAGE_CLASS=$STORAGE_CLASS")
   [ -n "${SANDBOX_EGRESS_ENABLED:-}" ] && sandbox_env+=("EGRESS_ENABLED=$SANDBOX_EGRESS_ENABLED")
   [ -n "${SANDBOX_EGRESS_EXTRA_BLOCKED_CIDRS:-}" ] && sandbox_env+=("EGRESS_EXTRA_BLOCKED_CIDRS=$SANDBOX_EGRESS_EXTRA_BLOCKED_CIDRS")
+  if [ -n "${SANDBOX_EXTRA_CA_CONFIGMAP:-}" ]; then
+    sandbox_env+=(
+      "SANDBOX_EXTRA_CA_CONFIGMAP=$SANDBOX_EXTRA_CA_CONFIGMAP"
+      "SANDBOX_EXTRA_CA_NAMESPACES=${SANDBOX_EXTRA_CA_NAMESPACES:-${SANDBOX_WORKLOAD_NAMESPACE:-default}}"
+    )
+  fi
+  [ -n "${SANDBOX_EXTRA_CA_REQUIRED:-}" ] && sandbox_env+=("SANDBOX_EXTRA_CA_REQUIRED=$SANDBOX_EXTRA_CA_REQUIRED")
   [ "$DRY_RUN" = "true" ] && sandbox_env+=("DRY_RUN=true")
   log "+ env ${sandbox_env[*]} bash $REPO_ROOT/sandbox/deploy/scripts/install.sh"
   env "${sandbox_env[@]}" bash "$REPO_ROOT/sandbox/deploy/scripts/install.sh"

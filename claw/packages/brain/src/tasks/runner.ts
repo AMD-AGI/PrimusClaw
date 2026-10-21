@@ -61,13 +61,13 @@ import type { ContainerProbeVerdict, HandsProbeEntry } from "../sandbox/containe
 import { checkHandsHealth } from "../sandbox/hands-health.js";
 import { restartHandsInSandbox } from "../sandbox/hands-restart.js";
 import { resolveSandboxAction } from "../sandbox/params.js";
-import { SandboxProvisionTerminalError } from "../sandbox/errors.js";
-import { runScript } from "./script-runner.js";
+import { provisionTerminalOf } from "../sandbox/errors.js";
+import { runScript, type ScriptProgress } from "./script-runner.js";
 import {
   AgentDoneDeliveryError, postAgentDone, postRunLease, postTaskRunning, sandboxForLease,
   type LeaseRenewal, type RunAttemptToken,
 } from "./callback.js";
-import type { RunTimeReport } from "@claw/protocol";
+import { taskSubject, type RunTimeReport } from "@claw/protocol";
 import { randomUUID } from "node:crypto";
 import { declareFinalReport } from "../delivery/doorbell-delivery.js";
 import { settleClaimedRun } from "../clients/run-claim.js";
@@ -92,6 +92,14 @@ import { readHandsEntry } from "../sandbox/registry.js";
 
 const logger = pino({ name: "task-runner" });
 const sc = StringCodec();
+
+/**
+ * How often a repeating script step re-writes the run's progress while it goes
+ * on. Far inside the checkpoint TTL, so a step that waits for a day still has a
+ * checkpoint to be taken over from; the progress itself changes only when a
+ * step finishes, which is always written at once.
+ */
+const SCRIPT_PROGRESS_REFRESH_MS = 5 * 60 * 1000;
 
 /**
  * The v4 seal key, decoded once.
@@ -455,6 +463,8 @@ export interface TaskRunnerSideEffects {
   postRunLease: typeof postRunLease;
   settleRunAttempt: typeof settleClaimedRun;
   runScript: typeof runScript;
+  /** Publish a task message again, as a new message on the same subject. */
+  republishTask: (subject: string, data: Uint8Array) => Promise<void>;
   refreshTaskLock: typeof refreshTaskLock;
   releaseTaskLock: typeof releaseTaskLock;
   flushTranscript: typeof flushTranscript;
@@ -485,6 +495,9 @@ const REAL_SIDE_EFFECTS: TaskRunnerSideEffects = {
   postRunLease,
   settleRunAttempt: settleClaimedRun,
   runScript,
+  republishTask: async (subject, data) => {
+    await getDeps().emitter.nc.jetstream().publish(subject, data);
+  },
   refreshTaskLock,
   releaseTaskLock,
   // Hoisted function declaration: the binding exists before this const runs.
@@ -1164,6 +1177,9 @@ class TaskRunner {
   private inflightCkptInProgress = false;
 
   private resumeCheckpoint: CheckpointState | undefined;
+  /** Which script progress was last written, and when; see `onScriptProgress`. */
+  private scriptProgressKey = "";
+  private scriptProgressAt = 0;
   private resumeMode: "sandbox_reuse" | "workspace_restore"
                     | "no_data_turn0" | "skip_no_ckpt" = "skip_no_ckpt";
   // Read from KV before any provisioning and consumed by the sandbox attach,
@@ -1317,6 +1333,54 @@ class TaskRunner {
       ? { has_workspace_sync: true, last_sync_turn: this.lastSyncedTurn }
       : undefined;
   }
+
+  /**
+   * Record a script run's progress in the run's checkpoint.
+   *
+   * The same checkpoint a conversation is resumed from, read back the same way
+   * by whichever worker takes the run over; a script's state is just smaller.
+   * Written when a step finishes, and again while a repeating step goes on --
+   * at most every SCRIPT_PROGRESS_REFRESH_MS, enough to keep the entry inside
+   * its TTL through a step that waits for a day.
+   *
+   * Not skipped once the run is aborted, unlike a turn's checkpoint: a step
+   * that finished just as a drain began still has to be recorded as done, or
+   * the worker taking over runs it again.
+   *
+   * Only into a sealed (v4) checkpoint. Progress is tool results verbatim --
+   * captures and the last structured result, fields a conversation checkpoint
+   * never holds -- and the v3 format is plaintext behind its redactor, which
+   * both leaves values it does not recognise readable and rewrites the ones it
+   * does, so a later step would read `<redacted>` where it needs the value.
+   * Without it a takeover starts from the first step again, as before; a
+   * background start there resolves to the shell already running (see
+   * `allocateStartIdentity`), which is what keeps a long job attached.
+   */
+  private readonly onScriptProgress = async (progress: ScriptProgress): Promise<void> => {
+    if (this.taskFinished || CHECKPOINT_WRITE_VERSION !== 4) return;
+    const now = Date.now();
+    // A new step, or the first call of a repetition, is written at once: the
+    // repetition's start time is what keeps its bounds across a takeover.
+    const key = `${progress.step}:${progress.repeat_started_at ?? ""}`;
+    if (key === this.scriptProgressKey
+      && now - this.scriptProgressAt < SCRIPT_PROGRESS_REFRESH_MS) return;
+    const state: CheckpointState = {
+      messages: [],
+      turns_completed: progress.step,
+      usage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, turns: 0 },
+      text_parts: [],
+      error_count: 0,
+      tool_calls_by_name: {},
+      total_tool_calls: 0,
+      elapsed_ms_before: this.elapsedMsForRun(),
+      setup_commands: [],
+      script: progress,
+    };
+    if (await this.writeKvCheckpoint(state)) {
+      this.scriptProgressKey = key;
+      this.scriptProgressAt = now;
+    }
+  };
 
   private readonly onCheckpoint = async (state: CheckpointState): Promise<void> => {
     if (this.abortCtrl.signal.aborted || this.taskFinished) {
@@ -2521,6 +2585,18 @@ class TaskRunner {
    * for dev-path sessions (no hex user id) or a failed workspace restore.
    */
   private async resolveResumeState(ckpt: TaskCheckpoint | null, created: boolean): Promise<void> {
+    // A script run taken over part-way is continued in the sandbox it was
+    // running in, because that is where its earlier steps' work is -- a
+    // background job still running, files a later step reads. A new sandbox
+    // has none of it, so carrying on there would report the steps after it as
+    // done over work that never happened. That is the one case in which the run
+    // is lost, and it fails saying so.
+    if (ckpt?.script && created) {
+      throw new Error(
+        `script_sandbox_lost: the sandbox this script was running in is gone, so it cannot `
+        + `continue from step ${ckpt.script.step}; its earlier steps' work went with the sandbox`,
+      );
+    }
     if (!ckpt) {
       // No prior progress: still run S3 baseline restore for new sandboxes
       // so any pre-Plan-Y persisted workspace materializes back into
@@ -2706,7 +2782,12 @@ class TaskRunner {
         // AgentHook fire(...) is wired by the engine layer; the hooks runtime
         // lives behind agent-loop, so pass undefined here to avoid dragging
         // it into the script-mode path.
-        result = await fx().runScript(this.request, { hands: this.hands!, signal: this.abortCtrl.signal }, this.onEvent);
+        result = await fx().runScript(this.request, {
+          hands: this.hands!,
+          signal: this.abortCtrl.signal,
+          resume: this.resumeCheckpoint?.script,
+          onProgress: this.onScriptProgress,
+        }, this.onEvent);
       } else {
         result = await this.engine.execute(this.request, this.onEvent, this.abortCtrl.signal, this.hands, {
           recreateHands: this.recreateHands,
@@ -3300,7 +3381,48 @@ class TaskRunner {
       (Date.now() - sigtermStartedAt) / 1000,
       sigtermSyncResult,
     );
+    if (this.request.mode === "script" && !this.claimed) {
+      await this.handOverScriptRun();
+      return;
+    }
     await this.nakAfterAttempt(0);
+  }
+
+  /**
+   * Give a draining pod's script run to another worker now.
+   *
+   * A nak cannot be relied on to do it. The task stream's `max_age` removes a
+   * message by age alone, whether or not a worker is still on it, so a run
+   * older than the retention -- about 2h41m on the default budget, and a DAG
+   * script step can run for a day -- has no message left to redeliver: the nak
+   * lands nowhere, nothing takes the run over, and the reaper closes it as
+   * `worker_lost` while its sandbox is still running the job.
+   *
+   * So the same request goes out again as a new message, and this delivery is
+   * acked. The lease is given back first, exactly as `nakAfterAttempt` does it,
+   * so the new message's first renewal finds it free; the worker that takes it
+   * reads this run's progress from the checkpoint and carries on in the same
+   * sandbox. Falls back to the nak if the publish fails, which is still right
+   * for a run young enough to be redelivered.
+   */
+  private async handOverScriptRun(): Promise<void> {
+    await this.releaseAttempt();
+    try {
+      await fx().republishTask(this.msg.subject || taskSubject(), this.msg.data);
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error)?.message ?? err, sessionId: this.sessionId, taskId: this.request.task_id },
+        "task.sigterm.handover_publish_failed",
+      );
+      this.msg.nak(0);
+      return;
+    }
+    logger.info(
+      { sessionId: this.sessionId, taskId: this.request.task_id,
+        progress: this.scriptProgressKey },
+      "task.sigterm.script_handed_over",
+    );
+    this.msg.ack();
   }
 
   // ── User interrupt (existing behavior) ─────────────────────────────
@@ -3591,9 +3713,7 @@ class TaskRunner {
     const rawMsg = String(err?.message || err);
     // A SandboxProvisionTerminalError carries an authoritative machine reason
     // (e.g. sandbox_workload_terminal); else fall back to the message-regex classifier.
-    const sandboxReason = err instanceof SandboxProvisionTerminalError
-      ? err.reason
-      : classifySandboxFailure(rawMsg);
+    const sandboxReason = provisionTerminalOf(err)?.reason ?? classifySandboxFailure(rawMsg);
     if (sandboxReason) {
       await this.onEvent({
         type: "sandboxStatus",
@@ -3765,11 +3885,7 @@ class TaskRunner {
       logger.warn({ sessionId: this.sessionId, deadlineAt: raw }, "task.deadline_unparseable");
       return () => {};
     }
-    // Already past it on arrival: a redelivery of a task whose budget expired
-    // while it was queued. Firing on the next tick rather than immediately so
-    // the abort lands after run() has entered its try block and can catch it.
-    const delay = Math.max(0, deadlineMs - Date.now());
-    const timer = setTimeout(() => {
+    const fire = (): void => {
       if (this.abortCtrl.signal.aborted) return;
       logger.warn(
         {
@@ -3783,7 +3899,18 @@ class TaskRunner {
         "task.deadline_exceeded",
       );
       this.abortCtrl.abort(DEADLINE_EXCEEDED_ABORT_REASON);
-    }, delay);
+    };
+    // Already past it on arrival: a redelivery, or a hand-over, of a run whose
+    // budget expired meanwhile. Aborted now rather than on the next tick, which
+    // a run with nothing left to do -- a script taken over after its last step
+    // -- could finish ahead of, reporting a completion after its deadline. This
+    // is called from executeRun, inside run()'s try, so the abort is caught.
+    const delay = deadlineMs - Date.now();
+    if (delay <= 0) {
+      fire();
+      return () => {};
+    }
+    const timer = setTimeout(fire, delay);
     timer.unref();
     return () => clearTimeout(timer);
   }
@@ -3867,6 +3994,12 @@ class TaskRunner {
    * lease that refuses the redelivery's first heartbeat until it lapses.
    */
   private async nakAfterAttempt(delayMs: number): Promise<void> {
+    await this.releaseAttempt();
+    this.msg.nak(delayMs);
+  }
+
+  /** End this attempt's hold on the row, so the next delivery can take it at once. */
+  private async releaseAttempt(): Promise<void> {
     if (this.claimed) this.declareCoverage();
     else {
       // Through `settlementTaskIdOf`, not `request.task_id` alone. Reading the
@@ -3882,7 +4015,6 @@ class TaskRunner {
         );
       }
     }
-    this.msg.nak(delayMs);
   }
 
   /**
@@ -4132,6 +4264,11 @@ class TaskRunner {
     const result = await this.executeEngine();
 
     // MCP SDK 1.12 does not propagate AbortSignal through callTool.
+    //
+    // A script is handed over here even if it reached its end just as the
+    // drain began: every step it finished is recorded, so the next worker runs
+    // nothing again and reports the outcome with the time it needs, rather than
+    // this pod racing its grace period through the terminal path.
     if (this.abortCtrl.signal.reason === SIGTERM_ABORT_REASON) {
       logger.info(
         { sessionId: this.sessionId, messageId: this.messageId,
@@ -4160,7 +4297,7 @@ class TaskRunner {
     if (this.abortCtrl.signal.reason === DEADLINE_EXCEEDED_ABORT_REASON) return "failed";
     if (this.abortCtrl.signal.aborted) return "interrupted";
     if (err instanceof AgentDoneDeliveryError) return "retryable";
-    if (err instanceof SandboxProvisionTerminalError) return "failed";
+    if (provisionTerminalOf(err)) return "failed";
     return isRetryable(err) ? "retryable" : "failed";
   }
 
@@ -4210,7 +4347,7 @@ class TaskRunner {
       this.msg.nak(5_000);
       return;
     }
-    if (err instanceof SandboxProvisionTerminalError) {
+    if (provisionTerminalOf(err)) {
       await this.settleTerminal(
         () => this.handleFatalError(err),
         "task.provision_terminal_agent_done_delivery_exhausted",

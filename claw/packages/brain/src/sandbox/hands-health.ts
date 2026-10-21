@@ -18,7 +18,12 @@
  * reusable and the recovery that decides it is repairable must not be able to
  * disagree about whether Hands is answering.
  */
+import { handsRouteHeaders } from "@claw/protocol";
 import { handsEndpoint } from "../clients/hands.js";
+import { withRouterFailover } from "./sandbox-router.js";
+
+// Late-bound so whatever `fetch` is at call time is the one used.
+const healthFetch = withRouterFailover((input: string, init?: RequestInit) => fetch(input, init));
 
 export interface HandsHealthResult {
   /** True only when Hands answered its health route with a 2xx. */
@@ -40,7 +45,8 @@ export async function checkHandsHealth(
 ): Promise<HandsHealthResult> {
   if (!handsMcpUrl) return { ok: false, detail: "no_url" };
   try {
-    const resp = await fetch(handsEndpoint(handsMcpUrl, "/health"), {
+    const resp = await healthFetch(handsEndpoint(handsMcpUrl, "/health"), {
+      headers: handsRouteHeaders(handsMcpUrl),
       signal: signal
         ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
         : AbortSignal.timeout(timeoutMs),

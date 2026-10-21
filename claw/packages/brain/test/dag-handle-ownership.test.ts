@@ -920,11 +920,11 @@ test("H24 a handle written before its workload can serve anything is not a ping 
   // scans, and the other two do not read DAG_HANDLES at all.
   const end = ka.indexOf("keepalive.dag_handle_scan_failed");
   assert.notEqual(end, -1, "expected the DAG handle scan");
-  const census = ka.slice(ka.lastIndexOf("for await", end), end);
+  const census = ka.slice(ka.lastIndexOf("async function collectDagTargets", end), end);
   assert.match(census, /if \(info\.pending\) continue;/,
     "and the census that pings what handles name has to skip those");
-  // The DAG census's own `add`, which is the last one before the scan's catch;
-  // an earlier one in this slice belongs to the session-row scan above it.
+  // The DAG census's own `add`; the slice starts at that census's function, so
+  // no other scan's `add` is in it.
   assert.ok(
     census.indexOf("if (info.pending) continue;") < census.lastIndexOf("census.seenIdentities.add"),
     "skipped before it becomes a ping target, not after",

@@ -193,6 +193,18 @@ func (m *defaultSessionManager) recoverSessionFromWM(ctx context.Context, sessio
 	}, nil
 }
 
+// wmStatusError is a Workload Manager answer the Router relays as it is:
+// status, body and Retry-After.
+type wmStatusError struct {
+	Status     int
+	Body       []byte
+	RetryAfter string
+}
+
+func (e *wmStatusError) Error() string {
+	return fmt.Sprintf("WM returned %d: %s", e.Status, string(e.Body))
+}
+
 // createSandbox calls WorkloadManager to create a new sandbox.
 func (m *defaultSessionManager) createSandbox(ctx context.Context, namespace, name, kind string) (*store.SandboxInfo, error) {
 	endpoint := m.wmURL + "/v1/code-interpreter"
@@ -227,6 +239,17 @@ func (m *defaultSessionManager) createSandbox(ctx context.Context, namespace, na
 	// Also check BadRequest with "not found" message (backward compatibility)
 	if resp.StatusCode == http.StatusBadRequest && strings.Contains(string(body), "not found") {
 		return nil, fmt.Errorf("%s %q not found in namespace %q", kind, name, namespace)
+	}
+	// A refusal (403, e.g. namespace_not_admitted) or a transient condition
+	// (503, e.g. namespace_admission_unavailable) keeps its status: wrapped as
+	// a plain error it would reach the client as 502, which says neither "not
+	// served here" nor "retry".
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusServiceUnavailable {
+		return nil, &wmStatusError{
+			Status:     resp.StatusCode,
+			Body:       body,
+			RetryAfter: resp.Header.Get("Retry-After"),
+		}
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("WM returned %d: %s", resp.StatusCode, string(body))

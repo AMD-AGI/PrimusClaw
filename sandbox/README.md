@@ -60,7 +60,8 @@ workloadmanager:
     safeApiUrl: https://<your-safe-api>
 egress:
   enabled: true                  # transparent proxy + SSRF protection
-  extraBlockedCIDRs: "169.254.0.0/16,100.64.0.0/10"
+  # 169.254.0.0/16 and 100.64.0.0/10 are blocked without any setting; use
+  # extraBlockedCIDRs only for ranges the built-in list does not cover.
 ```
 
 In addition:
@@ -73,6 +74,140 @@ In addition:
   to revoke them — in-sandbox code can read the key of the user who invoked it.
 - Apply a restricted Pod Security Standard to the sandbox namespace, and keep
   sandbox namespaces separate from the control-plane namespace.
+
+#### Extra CA certificates
+
+If sandbox egress goes through a TLS-intercepting proxy, give the sandboxes your
+organisation's CA from a ConfigMap. You do not need to rebuild an image or
+commit the certificate. Each key is one PEM certificate; a bundle produced by
+trust-manager works too. Create it in every namespace sandboxes run in:
+
+```bash
+kubectl -n <sandbox-namespace> create configmap <your-ca-configmap> \
+  --from-file=ca.crt=/path/to/your-root-ca.pem
+```
+
+##### Configuration
+
+| Setting | Where | Meaning |
+|---|---|---|
+| `SANDBOX_EXTRA_CA_CONFIGMAP` | `install.sh` / `deploy.sh` env; controller env | Name of the ConfigMap of PEM certificates. Empty (default): no ConfigMap. |
+| `controlplane.config.sandboxExtraCAConfigMap` | Helm value | The same, set on the chart directly. |
+| `SANDBOX_EXTRA_CA_NAMESPACES` | `install.sh` / `deploy.sh` env | Comma-separated namespaces `install.sh` checks for the ConfigMap. |
+| `SANDBOX_EXTRA_CA_REQUIRED` / `controlplane.config.sandboxExtraCARequired` | env / Helm value | `true`: require an anchor from the injector image alone, without a ConfigMap. |
+| `EXTRA_CA_REQUIRED` | main-container env, read by the script | `true`: fail when no extra anchor is found (the controller sets it). |
+| `EXTRA_CA_IMAGE_BUNDLE` | main-container env, read by the script | Path of the image-baked bundle; default `/shared/bin/extra-ca-bundle.pem`. |
+| `/etc/claw/extra-ca` | mount path | Where the ConfigMap is mounted; the script reads every file in it. |
+| `EXTRA_CA_CERT_URLS` | `docker build --build-arg` of the envd-injector image | Space-separated URLs of PEM certificates baked into `/extra-ca-bundle.pem`. Empty by default. |
+
+##### How it works
+
+Both ways of starting a sandbox below use the same script from the
+envd-injector image, `/setup-extra-ca.sh`. It merges
+
+- `/shared/bin/extra-ca-bundle.pem`, the bundle baked into the injector image at
+  build time with `--build-arg EXTRA_CA_CERT_URLS=...` (empty by default), and
+- every file in `/etc/claw/extra-ca`, where you mount the ConfigMap,
+
+with the user image's system bundle into `/shared/bin/ca-bundle.pem`.
+
+The container is *configured to use the bundle* when `SSL_CERT_FILE`,
+`CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE` or `NODE_EXTRA_CA_CERTS` is
+`/shared/bin/ca-bundle.pem`, or `EXTRA_CA_REQUIRED=true`. Then, if neither
+source holds a certificate, the script exits non-zero with
+`setup-extra-ca: error: ...` naming both paths, and envd does not start. A mounted
+file that is not a PEM certificate is an error too. When the container is not
+configured to use the bundle and finds no certificate, the script skips and
+exits 0.
+
+##### From the controller (CodeInterpreter) and the chart
+
+```bash
+SANDBOX_EXTRA_CA_CONFIGMAP=<your-ca-configmap> \
+SANDBOX_EXTRA_CA_NAMESPACES=<sandbox-namespace> \
+deploy/scripts/install.sh   # together with your usual install settings
+```
+
+`install.sh` skips a release that is already fully ready, so to add or change
+the ConfigMap on an existing install, run it with `FORCE_SANDBOX=1` as well.
+
+With Helm directly, set `controlplane.config.sandboxExtraCAConfigMap`. Every
+sandbox the controller creates then mounts the ConfigMap at `/etc/claw/extra-ca`,
+copies `/setup-extra-ca.sh` and `/extra-ca-bundle.pem` from the injector, runs
+the script before the build steps and envd, and points the four variables above
+at the bundle unless the template already sets them. The main container gets
+`terminationMessagePolicy: FallbackToLogsOnError`, so `kubectl describe pod`
+shows the script's error.
+
+A misconfiguration does not start a sandbox that cannot verify TLS:
+
+- `install.sh` refuses to install if the ConfigMap is missing from a listed
+  namespace, or holds no certificate;
+- a sandbox in a namespace without the ConfigMap stays in `ContainerCreating`
+  with a `FailedMount` event naming it;
+- a sandbox that finds no certificate, or a key that is not PEM, exits before
+  envd starts with the reason in its termination message;
+- an injector image older than this support fails too: one without
+  `/setup-extra-ca.sh` fails the initContainer's copy, and a script that exits
+  without writing the bundle is caught by the controller's own check.
+
+To rely on anchors baked into the injector image alone, without a ConfigMap,
+set `SANDBOX_EXTRA_CA_REQUIRED=true` (`controlplane.config.sandboxExtraCARequired`).
+With neither setting, sandbox pods are unchanged.
+
+##### From a pod template you maintain
+
+Some platforms render sandbox pods from their own, self-maintained sandbox
+templates instead of through the CodeInterpreter controller. Such a template
+lives outside this repository; this repository only fixes the injector image's
+side of the contract: the image ships `/setup-extra-ca.sh` and
+`/extra-ca-bundle.pem` at those paths, and the script reads
+`/etc/claw/extra-ca`. A template uses it like this (placeholders only):
+
+```yaml
+initContainers:
+- name: envd-injector
+  image: <registry>/agent-sandbox-envd-injector:<tag>
+  command: ["sh", "-c"]
+  args:
+  - |
+    cp /envd /shared/bin/envd
+    # ... tmux, iptables, musl loader as in codeinterpreter_controller.go ...
+    cp /setup-extra-ca.sh /extra-ca-bundle.pem /shared/bin/
+  volumeMounts: [{name: envd-bin, mountPath: /shared/bin}]
+containers:
+- name: <main>
+  image: <user-image>
+  command: ["/bin/sh", "-c"]
+  args: ["/shared/bin/setup-extra-ca.sh && exec /shared/bin/envd --port=8080 --workspace=<workspace>"]
+  env:
+  - {name: SSL_CERT_FILE,       value: /shared/bin/ca-bundle.pem}
+  - {name: REQUESTS_CA_BUNDLE,  value: /shared/bin/ca-bundle.pem}
+  - {name: CURL_CA_BUNDLE,      value: /shared/bin/ca-bundle.pem}
+  - {name: NODE_EXTRA_CA_CERTS, value: /shared/bin/ca-bundle.pem}
+  terminationMessagePolicy: FallbackToLogsOnError
+  volumeMounts:
+  - {name: envd-bin, mountPath: /shared/bin}
+  - {name: extra-ca, mountPath: /etc/claw/extra-ca, readOnly: true}
+volumes:
+- {name: envd-bin, emptyDir: {}}
+- name: extra-ca
+  configMap: {name: <your-ca-configmap>}   # not optional: a missing one holds the pod
+```
+
+**Deprecated compatibility paths.** The injector image also ships the same
+script as `/setup-amd-ca.sh` and the same bundle as `/amd-bundle.pem`, for
+self-maintained sandbox templates written before the generic names existed.
+A template that copies and runs those names keeps working unchanged and behaves
+exactly the same (the script finds the bundle under either name). New templates
+should use `/setup-extra-ca.sh` and `/extra-ca-bundle.pem`.
+
+Mounting the ConfigMap is optional for this contract: a template that already
+works with an injector image built with your CA keeps working unchanged. Once
+the template points the variables at the bundle, though, an injector image with
+no baked CA and no ConfigMap mounted stops the sandbox before envd starts,
+instead of starting one whose every https call fails. Mount the ConfigMap (or
+build the image with your CA) before rolling out such an image.
 
 ## Sandbox Type: CodeInterpreter
 
@@ -112,13 +247,13 @@ A high-frequency, short-task code-execution environment that also supports long-
 
 envd runs a **transparent proxy** as a goroutine inside the process (no extra sidecar or daemon). `iptables REDIRECT` forces all outbound TCP through the proxy; during init envd configures the rules with `CAP_NET_ADMIN`, then drops `CAP_NET_ADMIN`/`CAP_NET_RAW` so user processes cannot bypass it. Each connection goes through: recover the original destination (`SO_ORIGINAL_DST`) → extract the domain (TLS SNI / HTTP Host) → **SSRF check** → DNS-rebinding defense → policy evaluation → connect using the validated IP.
 
-- **SSRF protection** (security baseline; not bypassable by in-sandbox code once the proxy is running, since `CAP_NET_ADMIN`/`CAP_NET_RAW` are dropped after init): always blocks loopback and IPv6 link-local/unique-local; by default blocks private ranges (`10/8`, `172.16/12`, `192.168/16`); extendable via Helm `extraBlockedCIDRs`. Applies even in `audit` mode — but not at all when `egress.enabled: false`.
+- **SSRF protection** (security baseline; not bypassable by in-sandbox code once the proxy is running, since `CAP_NET_ADMIN`/`CAP_NET_RAW` are dropped after init): always blocks loopback, IPv4 link-local `169.254/16` (cloud metadata endpoints) and IPv6 link-local/unique-local; by default blocks private ranges (`10/8`, `172.16/12`, `192.168/16`) and carrier-grade NAT (`100.64/10`); extendable via Helm `extraBlockedCIDRs`. Applies even in `audit` mode — but not at all when `egress.enabled: false`.
 - **DNS-rebinding defense**: once a hostname resolves to a safe IP, the proxy dials that exact IP rather than re-resolving the name.
 - Source: `pkg/envd/egress/` (`ssrf.go`, proxy, dns, sni).
 
 ### Policy engine
 
-An embedded **OPA (Open Policy Agent) Go SDK** evaluates `allow`/`deny`/`audit` at L4 (domain + port) — no external OPA daemon. Policies are cluster-scoped `ClusterSandboxPolicy` CRDs shipped as platform presets via the Helm chart; a CodeInterpreter template references one through `spec.runtimePolicy` (defaults to `agent-default`).
+A built-in Go evaluator (`pkg/policy`), running inside envd, decides `allow`/`deny`/`audit` for each outbound connection from its destination IP and domain (TLS SNI / HTTP Host) — there is no external policy daemon. Evaluating policies with an embedded **OPA (Open Policy Agent)** engine is planned, not yet implemented; the `PolicyEvaluator` interface in `pkg/envd/egress/proxy.go` is the extension point reserved for it. Policies are cluster-scoped `ClusterSandboxPolicy` CRDs shipped as platform presets via the Helm chart; a CodeInterpreter template references one through `spec.runtimePolicy` (defaults to `agent-default`).
 
 | Preset            | Use case            | External egress      | Internal egress     |
 | ----------------- | ------------------- | -------------------- | ------------------- |
@@ -131,7 +266,7 @@ An embedded **OPA (Open Policy Agent) Go SDK** evaluates `allow`/`deny`/`audit` 
 
 ### Policy hot reload
 
-Allow-lists can be changed on a running sandbox without restarting the Pod. envd periodically **pulls** the latest policy from the Workload Manager (default every 30s, via Router, reusing the existing JWT channel) and atomically swaps it through the OPA SDK when the version changes. Two change sources: platform-level edits to `ClusterSandboxPolicy`, and per-sandbox developer updates via SDK/CLI/API (`PATCH /v1/sandbox/sessions/{id}/policy`, overwrite semantics). If the pull fails, the last good policy stays in effect. Source: `pkg/envd/policy_sync.go`.
+Allow-lists can be changed on a running sandbox without restarting the Pod. envd periodically **pulls** the latest policy from the Workload Manager (default every 30s, via Router, reusing the existing JWT channel) and atomically swaps it into the policy evaluator (`policy.Engine.UpdateConfig`) when the version changes. Two change sources: platform-level edits to `ClusterSandboxPolicy`, and per-sandbox developer updates via SDK/CLI/API (`PATCH /v1/sandbox/sessions/{id}/policy`, overwrite semantics). If the pull fails, the last good policy stays in effect. Source: `pkg/envd/policy_sync.go`.
 
 ## Unified Inference Egress
 

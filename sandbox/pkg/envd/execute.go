@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"sigs.k8s.io/agent-sandbox/pkg/cmdlog"
+	"sigs.k8s.io/agent-sandbox/pkg/envd/egress"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
@@ -503,9 +504,11 @@ func (w *sseFieldWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// stripEnvDProxyGroup sets the child process's supplementary groups to only
-// the primary group, removing EnvDProxyGID so its traffic is subject to
-// iptables REDIRECT rules instead of being exempted like EnvD itself.
+// stripEnvDProxyGroup gives the child EnvD's supplementary groups minus
+// EnvDProxyGID, so its traffic is subject to iptables REDIRECT rules instead
+// of being exempted like EnvD itself. The other groups are the Pod's
+// supplementalGroups; a command that loses them is denied what the Pod itself
+// may access, such as a group-writable shared volume.
 // Setpgid is required so that background processes started via
 // `setsid ... &` inside `sh -c` survive after the parent shell exits;
 // without it Go's exec.CommandContext (Go 1.21+) may kill the entire
@@ -513,12 +516,26 @@ func (w *sseFieldWriter) Write(p []byte) (int, error) {
 func stripEnvDProxyGroup(cmd *exec.Cmd) {
 	uid := uint32(os.Getuid())
 	gid := uint32(os.Getgid())
+	groups := []uint32{gid}
+	if current, err := syscall.Getgroups(); err == nil {
+		groups = withoutEnvDProxyGroup(current)
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
 		Credential: &syscall.Credential{
 			Uid:    uid,
 			Gid:    gid,
-			Groups: []uint32{gid},
+			Groups: groups,
 		},
 	}
+}
+
+func withoutEnvDProxyGroup(groups []int) []uint32 {
+	kept := make([]uint32, 0, len(groups))
+	for _, g := range groups {
+		if g != egress.EnvDProxyGID {
+			kept = append(kept, uint32(g))
+		}
+	}
+	return kept
 }

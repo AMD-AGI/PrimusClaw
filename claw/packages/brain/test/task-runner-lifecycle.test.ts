@@ -38,6 +38,7 @@ import type { NatsEmitter } from "../src/events/emitter.js";
 import { SIGTERM_ABORT_REASON, activeAbort } from "../src/tasks/abort-registry.js";
 import { AgentDoneDeliveryError } from "../src/tasks/callback.js";
 import { SandboxProvisionTerminalError } from "../src/sandbox/errors.js";
+import { SandboxAttachError } from "../src/agent/attach-error.js";
 import { TASK_MAX_DELIVER } from "../src/config.js";
 import { forgetDeletedSessions, markSessionDeleted } from "../src/infra/deleted-sessions.js";
 
@@ -342,6 +343,28 @@ test("a terminal sandbox-provisioning error acks with failed=true and never retr
   assert.equal(r.completion?.failed, true);
   assert.ok(!r.calls.includes("markRetryPending"), "a terminal outcome must not mark retry-pending");
   assert.ok(!r.calls.includes("engine.execute"), "the engine must never run when provisioning failed terminally");
+  const failedEvt = r.events.find((e) => e.type === "sandboxStatus" && e.status === "failed");
+  assert.equal(failedEvt?.reason, "sandbox_status_unreadable", "the machine reason must be surfaced");
+});
+
+test("a terminal provisioning error wrapped by a lazy sandbox open is still terminal", async () => {
+  // The lazy open reaches the runner as SandboxAttachError around the give-up,
+  // and the wrapper's class is not the one the routing matches on. Unwrapped by
+  // class alone, this failed as `agent_error`, and a give-up whose message names
+  // a retryable status was naked back into the queue it had just given up on.
+  const r = await runScenario({
+    engineBehavior: async () => {
+      throw new SandboxAttachError(new SandboxProvisionTerminalError(
+        "sandbox_status_unreadable",
+        "workload w-1 status unreadable for 300s (last: HTTP 503)",
+      ));
+    },
+  });
+
+  assert.deepEqual(r.verdicts, ["ack"], "a terminal provisioning outcome must ack, never redeliver");
+  assert.ok(!r.calls.includes("markRetryPending"), "a terminal outcome must not mark retry-pending");
+  assert.equal(r.completion?.failure_reason, "sandbox_status_unreadable",
+    "the give-up's own reason, not a generic agent_error");
   const failedEvt = r.events.find((e) => e.type === "sandboxStatus" && e.status === "failed");
   assert.equal(failedEvt?.reason, "sandbox_status_unreadable", "the machine reason must be surfaced");
 });
