@@ -564,6 +564,25 @@ function shellSingleQuote(value: string): string {
 }
 
 /**
+ * SGLang model-gateway command.
+ *
+ * SaFE replaces `{prefill}` and `{decode}` with the engine Service URLs. The
+ * bootstrap port stays in the command because it is the Mooncake port, not
+ * part of that URL.
+ */
+function sglangRouterEntrypoint(): string {
+  return [
+    "set -euo pipefail",
+    "exec python3 -m sglang_router.launch_router \\",
+    "  --pd-disaggregation \\",
+    `  --prefill {prefill} ${ATOM_PREFILL_BOOTSTRAP_PORT} \\`,
+    "  --decode {decode} \\",
+    "  --host 0.0.0.0 \\",
+    "  --port \"${ATOM_SERVER_PORT}\"",
+  ].join("\n");
+}
+
+/**
  * Router command. SaFE injects ATOM_SERVER_PORT and the role endpoints.
  *
  * @param framework atomesh `--backend` value from the prompt.
@@ -641,18 +660,31 @@ export interface AtomWorkloadParams extends CommonWorkloadParams {
   rdmaResource?: string;
 }
 
+interface PdClusterBodyOptions {
+  /** SaFE GroupVersionKind.kind. */
+  kind: "Atom" | "SGLangRouter";
+  /** Correlation label and env value. */
+  backend: "atom" | "sglangrouter";
+  /** Router command, base64-encoded by the builder. */
+  routerEntrypoint: string;
+}
+
 /**
- * SaFE CreateWorkloadRequest for a multi-node Atom workload.
+ * SaFE CreateWorkloadRequest for a router, prefill, decode cluster.
  *
- * Roles are fixed as router, prefill, decode. The router is a CPU process;
- * both engine roles request GPUs and RDMA because the KV transfer plane needs
- * a device. Entry points start the servers directly, so there is no idle SSH
- * control plane.
+ * The router is a CPU process. Both engine roles request GPUs and RDMA because
+ * the KV transfer plane needs a device. Entry points start the servers directly.
+ *
+ * @param p Prompt-derived sizes, image, model, and env.
+ * @param opts Kind and router command. Engine commands are shared.
  */
-export function buildAtomWorkloadBody(p: AtomWorkloadParams): Record<string, unknown> {
+function buildPdClusterWorkloadBody(
+  p: AtomWorkloadParams,
+  opts: PdClusterBodyOptions,
+): Record<string, unknown> {
   assertCommon(p);
   if (!p.model.trim()) {
-    throw new Error("model is required (atom prefill/decode --model-path)");
+    throw new Error(`model is required (${opts.backend} prefill/decode --model-path)`);
   }
 
   const model = p.model.trim();
@@ -680,11 +712,11 @@ export function buildAtomWorkloadBody(p: AtomWorkloadParams): Record<string, unk
   });
 
   const env = sanitizeEnv(p.extraEnv);
-  applyCorrelationEnv(env, "atom", p.sessionId, p.messageId);
+  applyCorrelationEnv(env, opts.backend, p.sessionId, p.messageId);
 
   const body: Record<string, unknown> = {
-    ...baseBody("Atom"),
-    groupVersionKind: { group: "amd.com", kind: "Atom", version: "v1" },
+    ...baseBody(opts.kind),
+    groupVersionKind: { group: "amd.com", kind: opts.kind, version: "v1" },
     useWorkspaceStorage: true,
     timeout: workloadTimeout(p.timeoutSec, p.defaultTimeoutSec),
     displayName: p.displayName,
@@ -692,12 +724,12 @@ export function buildAtomWorkloadBody(p: AtomWorkloadParams): Record<string, unk
     resources: [routerResource, gpuResource(prefillReplica), gpuResource(decodeReplica)],
     images: [p.image, p.image, p.image],
     entryPoints: [
-      b64(atomRouterEntrypoint(p.framework)),
+      b64(opts.routerEntrypoint),
       b64(atomEngineEntrypoint("prefill", model, prefillTp, p.kvTransferBackend)),
       b64(atomEngineEntrypoint("decode", model, decodeTp, p.kvTransferBackend)),
     ],
     env,
-    labels: correlationLabels(p.extraLabels, "atom", p.sessionId, p.messageId),
+    labels: correlationLabels(p.extraLabels, opts.backend, p.sessionId, p.messageId),
     service: {
       protocol: "TCP",
       port: ATOM_ROUTER_PORT,
@@ -709,6 +741,33 @@ export function buildAtomWorkloadBody(p: AtomWorkloadParams): Record<string, unk
   if (p.description) body.description = p.description;
   if (p.ownerId) body.ownerId = p.ownerId;
   return body;
+}
+
+/**
+ * SaFE CreateWorkloadRequest for a multi-node Atom workload.
+ *
+ * Roles are fixed as router, prefill, decode. The router runs atomesh.
+ */
+export function buildAtomWorkloadBody(p: AtomWorkloadParams): Record<string, unknown> {
+  return buildPdClusterWorkloadBody(p, {
+    kind: "Atom",
+    backend: "atom",
+    routerEntrypoint: atomRouterEntrypoint(p.framework),
+  });
+}
+
+/**
+ * SaFE CreateWorkloadRequest for a multi-node SGLangRouter workload.
+ *
+ * Same three roles as Atom. The router runs sglang_router and leaves
+ * `{prefill}` and `{decode}` for SaFE to replace with Service URLs.
+ */
+export function buildSGLangRouterWorkloadBody(p: AtomWorkloadParams): Record<string, unknown> {
+  return buildPdClusterWorkloadBody(p, {
+    kind: "SGLangRouter",
+    backend: "sglangrouter",
+    routerEntrypoint: sglangRouterEntrypoint(),
+  });
 }
 
 /** Positional serviceRoles for a topology; must match the builders above. */

@@ -186,7 +186,7 @@ function logTaskReceived(request: ExecuteRequest, msg: JsMsg): void {
         messageId: request.message_id,
         requestedNodes,
       },
-      "task.multi_node_ignored: --nodes >= 2 needs --mn-backend rayjob|infera|atom; running single-node",
+      "task.multi_node_ignored: --nodes >= 2 needs --mn-backend rayjob|infera|atom|sglangrouter; running single-node",
     );
   }
 }

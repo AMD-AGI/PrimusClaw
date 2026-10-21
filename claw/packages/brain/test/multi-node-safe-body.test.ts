@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import {
   buildAtomWorkloadBody,
   buildInferaWorkloadBody,
+  buildSGLangRouterWorkloadBody,
   buildRayJobWorkloadBody,
   inferaFrontendPort,
   inferaSshPortBase,
@@ -330,6 +331,45 @@ test("buildAtomWorkloadBody creates router, prefill and decode from the prompt s
   assert.match(prefill, /--disaggregation-transfer-backend mooncake/);
   assert.match(decode, /--disaggregation-mode decode/);
   assert.match(decode, /--disaggregation-bootstrap-port 9098/);
+});
+
+test("buildSGLangRouterWorkloadBody uses the model gateway and the same engine roles", () => {
+  const body = buildSGLangRouterWorkloadBody({
+    ...COMMON,
+    displayName: "msg1-sglangrouter",
+    model: "/models/Qwen3-14B",
+    framework: "sglang",
+    kvTransferBackend: "mooncake",
+    pdPrefillNodes: 1,
+    pdDecodeNodes: 1,
+    extraEnv: { MC_GID_INDEX: "1" },
+  }) as Record<string, any>;
+
+  assert.deepStrictEqual(body.groupVersionKind, {
+    group: "amd.com",
+    kind: "SGLangRouter",
+    version: "v1",
+  });
+  assert.equal(body.resources.length, 3);
+  assert.equal(body.resources[1].rdmaResource, "1k");
+  assert.equal(body.resources[2].rdmaResource, "1k");
+  assert.equal(body.service.port, 8000);
+  assert.equal(body.env.PRIMUS_CLAW_MN_BACKEND, "sglangrouter");
+  assert.equal(body.env.MC_GID_INDEX, "1");
+  assert.equal(body.labels["primus-claw/mn-backend"], "sglangrouter");
+
+  const router = decodeEp(body.entryPoints[0]);
+  const prefill = decodeEp(body.entryPoints[1]);
+  const decode = decodeEp(body.entryPoints[2]);
+  assert.match(router, /sglang_router\.launch_router/);
+  assert.match(router, /--prefill \{prefill\} 8998/);
+  assert.match(router, /--decode \{decode\}/);
+  assert.equal(router.includes("atomesh"), false);
+  assert.match(prefill, /--model-path '\/models\/Qwen3-14B'/);
+  assert.match(prefill, /--disaggregation-mode prefill/);
+  assert.match(decode, /--disaggregation-mode decode/);
+  assert.equal(prefill.includes("atomesh"), false);
+  assert.equal(decode.includes("atomesh"), false);
 });
 
 test("buildAtomWorkloadBody rejects a missing model", () => {

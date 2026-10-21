@@ -31,7 +31,7 @@
 import { PG_INT4_MAX } from "@claw/utils";
 
 /** The engines a multi-node run can be provisioned onto. */
-export const TOPOLOGY_BACKENDS = ["rayjob", "infera", "atom"] as const;
+export const TOPOLOGY_BACKENDS = ["rayjob", "infera", "atom", "sglangrouter"] as const;
 export type TopologyBackend = (typeof TOPOLOGY_BACKENDS)[number];
 
 export const TOPOLOGY_FRAMEWORKS = ["sglang", "vllm"] as const;
@@ -54,7 +54,7 @@ export interface EnvironmentTopology {
   mem_per_node_gib?: number;
   /** Cluster image; falls back to the sandbox image when absent. */
   image?: string;
-  /** Model path or id. Required by the infera frontend and the atom engines, unused by rayjob. */
+  /** Model path or id. Required by infera, atom, and sglangrouter engines, unused by rayjob. */
   model?: string;
   framework?: (typeof TOPOLOGY_FRAMEWORKS)[number];
   pd_transfer_backend?: (typeof TOPOLOGY_KV_BACKENDS)[number];
@@ -165,7 +165,7 @@ export function validateTopology(input: unknown): TopologyValidation {
     // No default: `--nodes` alone used to be enough to provision a cluster on
     // whichever engine happened to be first, which is a large thing to get by
     // omission.
-    errors.push("topology.backend is required: rayjob, infera, or atom");
+    errors.push("topology.backend is required: rayjob, infera, atom, or sglangrouter");
   }
   if (typeof raw.nodes === "number" && raw.nodes < 1) {
     errors.push("topology.nodes must be at least 1");
@@ -185,10 +185,13 @@ export function validateTopology(input: unknown): TopologyValidation {
     }
   }
 
-  if ((raw.backend === "infera" || raw.backend === "atom") && !String(raw.model ?? "").trim()) {
-    // Infera's frontend takes it as --router-tokenizer-path, and Atom's prefill
-    // and decode take it as --model-path. Without it the cluster comes up and
-    // the serving process cannot start.
+  if (
+    (raw.backend === "infera" || raw.backend === "atom" || raw.backend === "sglangrouter")
+    && !String(raw.model ?? "").trim()
+  ) {
+    // Infera's frontend takes it as --router-tokenizer-path. Atom and
+    // SGLangRouter prefill and decode take it as --model-path. Without it the
+    // cluster comes up and the serving process cannot start.
     errors.push(`topology.model is required when backend is ${raw.backend}`);
   }
 

@@ -157,7 +157,8 @@ export function resourcesMapToWorkloadArray(map: Record<string, string>): Array<
  * The backends drive the cluster through different control planes: rayjob talks
  * to the head over Ray Dashboard REST (:8265) / GCS (:6379) and needs no pod
  * IPs, infera SSHes into the GPU pods directly and needs their IPs plus a
- * private key, and atom serves on the router Service with no SSH control plane.
+ * private key, and atom and sglangrouter serve on the router Service with no
+ * SSH control plane.
  * Only the variables the active backend reads are set, since Hyperloom infers
  * the mode from which ones are present.
  *
@@ -184,9 +185,9 @@ export function applyMultiNodeExternalEnv(env: Record<string, string>, ctx: Mult
     return;
   }
 
-  // atom launches router, prefill and decode itself. The sandbox only needs the
-  // router Service; there is no SSH control plane to hand over.
-  if (ctx.backend === "atom") return;
+  // atom and sglangrouter launch router, prefill and decode themselves. The
+  // sandbox only needs the router Service; there is no SSH control plane to hand over.
+  if (ctx.backend === "atom" || ctx.backend === "sglangrouter") return;
 
   // infera: the optimizer SSHes into the GPU pods to relaunch the engine, so it
   // needs the key path plus at least one role's pod IPs.

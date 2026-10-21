@@ -3,7 +3,7 @@
 
 /**
  * Multi-node provider for `CLAW_DEPLOY_MODE=safe`: the cluster is a SaFE
- * workload (RayJob, InferaDeployment, or Atom) created with the requesting user's
+ * workload (RayJob, InferaDeployment, Atom, or SGLangRouter) created with the requesting user's
  * platform key, exactly as Hyperloom's own `multi_node` CLI would create it.
  *
  * Everything goes through the SaFE API; Brain never talks to Kubernetes. The
@@ -36,6 +36,7 @@ import {
   ATOM_ROUTER_PORT,
   buildAtomWorkloadBody,
   buildInferaWorkloadBody,
+  buildSGLangRouterWorkloadBody,
   buildRayJobWorkloadBody,
   inferaFrontendPort,
   inferaSshPortBase,
@@ -97,7 +98,7 @@ const ACTIVE_PHASES = "Pending,Running,Updating,NotReady";
  * SaFE kinds that are GPU clusters. Used to spare the session's own sandbox,
  * which carries the same `CLAW_SESSION_ID` env and would otherwise be swept.
  */
-const CLUSTER_KINDS = new Set(["RayJob", "InferaDeployment", "Atom"]);
+const CLUSTER_KINDS = new Set(["RayJob", "InferaDeployment", "Atom", "SGLangRouter"]);
 
 /** Where the Infera private key is materialised inside the sandbox. */
 const SANDBOX_SSH_KEY_PATH = "/tmp/primus-claw-mn-ssh-key";
@@ -611,8 +612,8 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
         pdPrefillTp: spec.pdPrefillTp,
         pdDecodeTp: spec.pdDecodeTp,
       });
-    } else if (spec.backend === "atom") {
-      body = buildAtomWorkloadBody({
+    } else if (spec.backend === "atom" || spec.backend === "sglangrouter") {
+      const pd = {
         ...common,
         model: spec.model,
         framework: spec.framework,
@@ -621,7 +622,8 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
         pdDecodeNodes: spec.pdDecodeNodes,
         pdPrefillTp: spec.pdPrefillTp,
         pdDecodeTp: spec.pdDecodeTp,
-      });
+      };
+      body = spec.backend === "atom" ? buildAtomWorkloadBody(pd) : buildSGLangRouterWorkloadBody(pd);
     } else {
       body = buildRayJobWorkloadBody(common);
     }
@@ -712,8 +714,9 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
       logPrefix: "mn.safe",
       isReady: (detail) => {
         if (String(detail.phase ?? "").toLowerCase() !== "running") return false;
-        // Atom reports Running only after router, prefill and decode are all up,
-        // so the phase is the readiness signal. Infera still needs live pod IPs.
+        // Atom and SGLangRouter report Running only after router, prefill and
+        // decode are all up, so the phase is the readiness signal. Infera still
+        // needs live pod IPs.
         if (spec.backend !== "infera") return true;
         return gpuPodsReady(
           discoverRolePods(detail, spec.pdMode, inferaSshPortBase(displayName)),
@@ -798,7 +801,7 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
       };
     }
 
-    if (spec.backend === "atom") {
+    if (spec.backend === "atom" || spec.backend === "sglangrouter") {
       return {
         ...base,
         serviceUrl: `http://${host}:${ATOM_ROUTER_PORT}`,

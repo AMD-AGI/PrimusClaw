@@ -265,6 +265,18 @@ test("assertMultiNodeInferaModel rejects infera without --model", () => {
   );
 });
 
+test("parseMultiNodePromptFlags accepts sglangrouter and still requires --model", () => {
+  const spec = parseMultiNodePromptFlags(
+    "--nodes 2 --mn-backend sglangrouter --model /models/Qwen3-14B --pd-transfer-backend mooncake",
+  );
+  assert.ok(spec);
+  assert.equal(spec.backend, "sglangrouter");
+  assert.doesNotThrow(() => assertMultiNodeInferaModel(spec));
+  const missing = parseMultiNodePromptFlags("--nodes 2 --mn-backend sglangrouter");
+  assert.ok(missing);
+  assert.throws(() => assertMultiNodeInferaModel(missing), /model is required/);
+});
+
 test("parseMultiNodePromptFlags accepts atom and still requires --model", () => {
   const spec = parseMultiNodePromptFlags(
     "--nodes 2 --mn-backend atom --model /shared_nfs/models/Qwen3-14B-FP8 --pd-transfer-backend mooncake",
