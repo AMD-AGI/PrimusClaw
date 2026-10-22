@@ -48,6 +48,27 @@ func TestSandboxInfoFromCRIgnoresSpoofedSessionIDAnnotation(t *testing.T) {
 	}
 }
 
+func TestSandboxInfoFromCRKeepsLegacyOpaqueSessionID(t *testing.T) {
+	t.Parallel()
+	const legacy = "sess_legacy_release"
+	sb := &sandboxv1alpha1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "old",
+			Namespace: "sandboxes",
+			Annotations: map[string]string{
+				sessionIDAnnotationKey: legacy,
+			},
+		},
+	}
+	info, err := sandboxInfoFromCR(sb)
+	if err != nil {
+		t.Fatalf("sandboxInfoFromCR: %v", err)
+	}
+	if info.SessionID != legacy {
+		t.Fatalf("SessionID = %q, want legacy %q", info.SessionID, legacy)
+	}
+}
+
 func TestSandboxInfoFromCRUsesAdoptedPodName(t *testing.T) {
 	t.Parallel()
 	sb := &sandboxv1alpha1.Sandbox{

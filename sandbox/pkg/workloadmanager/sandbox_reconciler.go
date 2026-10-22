@@ -4,15 +4,16 @@
 // SandboxReconciler watches Sandbox resources and notifies waiting HTTP handlers
 // when a Sandbox reaches Running state (event-driven, replaces polling).
 //
-// When a Sandbox reaches Running it also backfills session-id / ShutdownTime /
-// default policy annotations so kubectl-applied sandboxes are routable by
-// namespace/name like API-created ones.
+// When a Sandbox reaches Running it also backfills a missing session-id /
+// ShutdownTime and ensures a SandboxPolicy CR exists. Existing session-id
+// annotations (including legacy sess_*) are left in place for dual-read release.
 package workloadmanager
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,9 +23,11 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/api"
+	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
@@ -168,18 +171,18 @@ func (r *SandboxReconciler) onSandboxDeleted(ctx context.Context, key types.Name
 	return nil
 }
 
-// ensureSessionRegistered backfills session-id, ShutdownTime, and default
-// egress policy on Sandbox CRs that omit them (e.g. kubectl apply). Routing
-// reads the CR directly; no separate session store write is required.
+// ensureSessionRegistered backfills session-id and ShutdownTime on Sandbox CRs
+// that omit them (e.g. kubectl apply). Egress policy lives on the SandboxPolicy
+// CR, not on Sandbox annotations.
 //
-// Default policy is never written onto SandboxClaim-owned sandboxes: the claim
-// path applies the template policy, and racing a default patch would downgrade
-// agent-restricted sandboxes to agent-default.
+// Dual-read upgrade: new sandboxes get namespace/name. Existing annotations
+// (including legacy sess_*) are preserved so Brain can still DELETE by the id
+// it already holds.
 func (r *SandboxReconciler) ensureSessionRegistered(ctx context.Context, sandbox *sandboxv1alpha1.Sandbox) error {
 	canonicalID := api.FormatSandboxID(sandbox.Namespace, sandbox.Name)
 	sessionID := ""
 	if sandbox.Annotations != nil {
-		sessionID = sandbox.Annotations[sessionIDAnnotationKey]
+		sessionID = strings.TrimSpace(sandbox.Annotations[sessionIDAnnotationKey])
 	}
 
 	ownedByClaim := false
@@ -191,7 +194,7 @@ func (r *SandboxReconciler) ensureSessionRegistered(ctx context.Context, sandbox
 	}
 
 	needsPatch := false
-	if sessionID != canonicalID {
+	if sessionID == "" {
 		sessionID = canonicalID
 		needsPatch = true
 		log.V(2).Infof("SandboxReconciler: binding sandbox id %s for %s/%s",
@@ -207,12 +210,6 @@ func (r *SandboxReconciler) ensureSessionRegistered(ctx context.Context, sandbox
 		needsPatch = true
 	}
 
-	needDefaultPolicy := !ownedByClaim &&
-		(sandbox.Annotations == nil || sandbox.Annotations[runtimePolicyAnnotationKey] == "")
-	if needDefaultPolicy {
-		needsPatch = true
-	}
-
 	if needsPatch {
 		base := sandbox.DeepCopy()
 		if sandbox.Annotations == nil {
@@ -222,19 +219,21 @@ func (r *SandboxReconciler) ensureSessionRegistered(ctx context.Context, sandbox
 		if defaultShutdown != nil {
 			sandbox.Spec.Lifecycle.ShutdownTime = defaultShutdown
 		}
-		if needDefaultPolicy {
-			writePolicyAnnotations(sandbox.Annotations, defaultSandboxPolicy())
-		}
 		patch := client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})
 		if err := r.Patch(ctx, sandbox, patch); err != nil {
-			if apierrors.IsConflict(err) {
-				// Concurrent claim metadata or another reconciler won; retry next event.
-				return nil
-			}
+			// Conflict: requeue via error so the next reconcile retries.
 			return fmt.Errorf("patch sandbox defaults: %w", err)
 		}
 		log.V(2).Infof("SandboxReconciler: patched defaults onto %s/%s (session=%s, shutdown=%v)",
 			sandbox.Namespace, sandbox.Name, sessionID, defaultShutdown)
+	}
+
+	// Claim path writes SandboxPolicy at claim time. kubectl-applied sandboxes
+	// get a default policy CR here.
+	if !ownedByClaim {
+		if err := r.ensureDefaultSandboxPolicy(ctx, sandbox); err != nil {
+			return err
+		}
 	}
 
 	// Optional MemoryStore mirror for tests / local-dev without a CR reader.
@@ -268,6 +267,33 @@ func (r *SandboxReconciler) ensureSessionRegistered(ctx context.Context, sandbox
 		info.UserName = sandbox.Annotations[userNameAnnotationKey]
 	}
 	_ = r.Store.StoreSandbox(ctx, info)
+	return nil
+}
+
+// ensureDefaultSandboxPolicy creates a SandboxPolicy CR when none exists.
+func (r *SandboxReconciler) ensureDefaultSandboxPolicy(ctx context.Context, sandbox *sandboxv1alpha1.Sandbox) error {
+	key := types.NamespacedName{Namespace: sandbox.Namespace, Name: sandbox.Name}
+	existing := &runtimev1alpha1.SandboxPolicy{}
+	if err := r.Get(ctx, key, existing); err == nil {
+		return nil
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get SandboxPolicy: %w", err)
+	}
+	obj := &runtimev1alpha1.SandboxPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandbox.Name,
+			Namespace: sandbox.Namespace,
+		},
+		Spec: policyToSpec(defaultSandboxPolicy()),
+	}
+	if r.Scheme != nil {
+		if err := controllerutil.SetControllerReference(sandbox, obj, r.Scheme); err != nil {
+			return fmt.Errorf("set SandboxPolicy owner: %w", err)
+		}
+	}
+	if err := r.Create(ctx, obj); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create SandboxPolicy: %w", err)
+	}
 	return nil
 }
 

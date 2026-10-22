@@ -199,6 +199,10 @@ func (s *Server) setupRoutes() {
 	v1.POST("/code-interpreter", s.proxyToWM)
 	v1.POST("/code-interpreter/stream", s.proxyToWM) // SSE streaming sandbox creation
 	v1.GET("/code-interpreter/sessions", s.proxyToWM)
+	// Dual-read: one segment is a legacy opaque id; two segments are namespace/name.
+	// Gin requires the same wildcard name at each depth (:namespace).
+	v1.GET("/code-interpreter/sessions/:namespace", s.proxyToWM)
+	v1.DELETE("/code-interpreter/sessions/:namespace", s.proxyToWM)
 	v1.GET("/code-interpreter/sessions/:namespace/:name", s.proxyToWM)
 	v1.DELETE("/code-interpreter/sessions/:namespace/:name", s.proxyToWM)
 

@@ -335,10 +335,10 @@ func (c *K8sSandboxCreator) createDirect(ctx context.Context, ci *runtimev1alpha
 	//   userId  → Label  (queryable via selector, no special chars)
 	//   userName → Annotation (may contain commas, no char restrictions)
 	//   sessionId → Annotation (canonical namespace/name routing key)
+	pol := sandboxPolicyFromTemplate(ci)
 	annotations := map[string]string{
 		sessionIDAnnotationKey: sessionID,
 	}
-	writePolicyAnnotations(annotations, sandboxPolicyFromTemplate(ci))
 	if podTemplate.ObjectMeta.Annotations == nil {
 		podTemplate.ObjectMeta.Annotations = make(map[string]string)
 	}
@@ -389,6 +389,9 @@ func (c *K8sSandboxCreator) createDirect(ctx context.Context, ci *runtimev1alpha
 
 	if err := c.client.Create(ctx, sandbox); err != nil {
 		return nil, fmt.Errorf("create Sandbox: %w", err)
+	}
+	if err := c.UpsertSandboxPolicy(ctx, sandbox, pol); err != nil {
+		return nil, fmt.Errorf("create SandboxPolicy: %w", err)
 	}
 
 	podIP, err := c.waitForSandboxPodRunning(ctx, sandboxName, namespace)
@@ -525,10 +528,10 @@ func (c *K8sSandboxCreator) createViaClaim(ctx context.Context, ci *runtimev1alp
 	// Build labels + annotations for the SandboxClaim — following SaFE convention.
 	// sessionID is always written as the canonical namespace/name routing key.
 	claimLabels := map[string]string{}
+	claimPol := sandboxPolicyFromTemplate(ci)
 	claimAnnotations := map[string]string{
 		sessionIDAnnotationKey: sessionID,
 	}
-	writePolicyAnnotations(claimAnnotations, sandboxPolicyFromTemplate(ci))
 	if user != nil {
 		if user.UserID != "" {
 			claimLabels[userIDLabelKey] = user.UserID
@@ -576,7 +579,6 @@ func (c *K8sSandboxCreator) createViaClaim(ctx context.Context, ci *runtimev1alp
 				patchAnnotations := map[string]string{
 					sessionIDAnnotationKey: sessionID,
 				}
-				writePolicyAnnotations(patchAnnotations, sandboxPolicyFromTemplate(ci))
 				// User override takes precedence over template default.
 				if overrides != nil && overrides.SessionTimeout != "" {
 					if userDur, err := time.ParseDuration(overrides.SessionTimeout); err == nil && userDur > 0 {
@@ -620,6 +622,9 @@ func (c *K8sSandboxCreator) createViaClaim(ctx context.Context, ci *runtimev1alp
 							"namespace", namespace, "sandbox", sandboxName, "error", rbErr)
 					}
 					return nil, fmt.Errorf("warm-pool sandbox %s/%s: %w", namespace, sandboxName, err)
+				}
+				if err := c.UpsertSandboxPolicy(waitCtx, createdSandbox, claimPol); err != nil {
+					return nil, fmt.Errorf("create SandboxPolicy for warm-pool sandbox %s/%s: %w", namespace, sandboxName, err)
 				}
 				if ci.Spec.AuthMode != runtimev1alpha1.AuthModeNone {
 					podName := createdSandbox.Annotations["agents.x-k8s.io/pod-name"]
@@ -1333,15 +1338,21 @@ func applyOverrides(
 
 // GetSandbox loads a Sandbox CR by namespace and name.
 // Prefers the manager cache when attached so Router/WM hot paths avoid
-// uncached API Server GETs per request.
+// uncached API Server GETs per request. A cache miss falls back to a live
+// API Server GET so a rolling restart cannot answer 404 for a sandbox that
+// still exists (Brain treats 404/410 as absent and would reclaim Hands).
 func (c *K8sSandboxCreator) GetSandbox(ctx context.Context, namespace, name string) (*sandboxv1alpha1.Sandbox, error) {
 	sb := &sandboxv1alpha1.Sandbox{}
 	key := types.NamespacedName{Name: name, Namespace: namespace}
 	if c.cachedReader != nil {
-		if err := c.cachedReader.Get(ctx, key, sb); err != nil {
+		err := c.cachedReader.Get(ctx, key, sb)
+		if err == nil {
+			return sb, nil
+		}
+		if !k8serrors.IsNotFound(err) {
 			return nil, err
 		}
-		return sb, nil
+		return c.getSandboxLive(ctx, namespace, name)
 	}
 	if err := c.client.Get(ctx, key, sb); err != nil {
 		return nil, err
@@ -1359,41 +1370,6 @@ func (c *K8sSandboxCreator) getSandboxLive(ctx context.Context, namespace, name 
 	return sb, nil
 }
 
-// PatchSandboxPolicy applies mutate to the current CR policy and writes it back.
-// Each attempt re-reads the live CR, so concurrent PATCHes merge instead of
-// clobbering, and PolicyVersion always advances from the latest value.
-func (c *K8sSandboxCreator) PatchSandboxPolicy(
-	ctx context.Context, namespace, name string, mutate func(*sandboxPolicy) error,
-) (sandboxPolicy, error) {
-	var empty sandboxPolicy
-	const maxAttempts = 5
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		sb, err := c.getSandboxLive(ctx, namespace, name)
-		if err != nil {
-			return empty, err
-		}
-		pol := readPolicyAnnotations(sb)
-		if err := mutate(&pol); err != nil {
-			return empty, err
-		}
-		pol.PolicyVersion++
-		base := sb.DeepCopy()
-		if sb.Annotations == nil {
-			sb.Annotations = make(map[string]string)
-		}
-		writePolicyAnnotations(sb.Annotations, pol)
-		patch := ctrlclient.MergeFromWithOptions(base, ctrlclient.MergeFromWithOptimisticLock{})
-		if err := c.client.Patch(ctx, sb, patch); err != nil {
-			if k8serrors.IsConflict(err) && attempt+1 < maxAttempts {
-				continue
-			}
-			return empty, err
-		}
-		return pol, nil
-	}
-	return empty, fmt.Errorf("patch sandbox policy %s/%s: exhausted retries", namespace, name)
-}
-
 // RecoverSessionFromK8s rebuilds a SandboxInfo from the Sandbox CR for sessionID.
 func (c *K8sSandboxCreator) RecoverSessionFromK8s(ctx context.Context, sessionID string) (*store.SandboxInfo, error) {
 	sb, err := c.findSandboxBySessionID(ctx, sessionID)
@@ -1404,6 +1380,11 @@ func (c *K8sSandboxCreator) RecoverSessionFromK8s(ctx context.Context, sessionID
 	if err != nil {
 		return nil, err
 	}
+	pol, _, polErr := c.GetSandboxPolicy(ctx, sb.Namespace, sb.Name)
+	if polErr != nil {
+		return nil, polErr
+	}
+	applyPolicyToInfo(info, pol)
 	if info.PodIP != "" {
 		return info, nil
 	}
@@ -1423,13 +1404,14 @@ func (c *K8sSandboxCreator) RecoverSessionFromK8s(ctx context.Context, sessionID
 // sandboxInfoFromCR maps a Sandbox CR to SandboxInfo without a PodIP lookup.
 // PodIP is ServiceFQDN/Service DNS when present; otherwise empty.
 //
-// SessionID is always namespace/name. The session-id annotation is user-writable
-// and must not be trusted for JWT binding or internal policy/audit routing.
+// SessionID prefers namespace/name. A legacy opaque annotation (e.g. sess_*) is
+// kept so dual-read clients can release by the id they already hold. Another
+// object's namespace/name in the annotation is ignored (spoof protection).
 func sandboxInfoFromCR(sb *sandboxv1alpha1.Sandbox) (*store.SandboxInfo, error) {
 	if sb == nil {
 		return nil, fmt.Errorf("sandbox is nil")
 	}
-	sessionID := api.FormatSandboxID(sb.Namespace, sb.Name)
+	sessionID := effectiveSessionID(sb)
 
 	podIP := ""
 	if sb.Status.ServiceFQDN != "" {
@@ -1479,22 +1461,45 @@ func sandboxInfoFromCR(sb *sandboxv1alpha1.Sandbox) (*store.SandboxInfo, error) 
 	if sb.Annotations != nil {
 		info.UserName = sb.Annotations[userNameAnnotationKey]
 	}
-	pol := readPolicyAnnotations(sb)
-	info.RuntimePolicy = pol.RuntimePolicy
-	info.PolicyMode = pol.PolicyMode
-	info.AllowedEgressHosts = pol.AllowedEgressHosts
-	info.AllowedInternalHosts = pol.AllowedInternalHosts
-	info.PolicyVersion = pol.PolicyVersion
+	// Policy comes from the SandboxPolicy CR (see RecoverSessionFromK8s /
+	// attachSandboxPolicy). Annotations are not authoritative.
 	return info, nil
+}
+
+// effectiveSessionID returns the id clients should use for this Sandbox.
+// New sessions use namespace/name; legacy opaque annotations are preserved.
+func effectiveSessionID(sb *sandboxv1alpha1.Sandbox) string {
+	if sb == nil {
+		return ""
+	}
+	canonical := api.FormatSandboxID(sb.Namespace, sb.Name)
+	if sb.Annotations == nil {
+		return canonical
+	}
+	ann := strings.TrimSpace(sb.Annotations[sessionIDAnnotationKey])
+	if ann == "" || ann == canonical {
+		return canonical
+	}
+	// Spoof protection: never adopt another object's namespace/name from the
+	// user-writable annotation.
+	if _, _, ok := api.ParseSandboxID(ann); ok {
+		return canonical
+	}
+	return ann
 }
 
 // findSandboxBySessionID resolves a session id to its Sandbox.
 //
-// Prefers the indexed cache: this runs once per keepalive poll per session while
-// the store cannot answer, and a List of every Sandbox at that rate turns a store
-// outage into API server load. Falls back to that List when the cache cannot
-// serve the query -- before it has synced, or in a deployment wired without a
-// reader or without the index -- so the worst case is what this path did before.
+// Dual-read: namespace/name resolves by object identity. Opaque ids (legacy
+// sess_*) resolve via the session-id annotation index so pre-upgrade sessions
+// remain releasable without Redis.
+//
+// Prefers the indexed cache for non-canonical lookups: this runs once per
+// keepalive poll per session while the store cannot answer, and a List of every
+// Sandbox at that rate turns a store outage into API server load. Falls back to
+// that List when the cache cannot serve the query -- before it has synced, or in
+// a deployment wired without a reader or without the index -- so the worst case
+// is what this path did before.
 //
 // A cache read can lag a creation by the length of a watch delivery. Recovery
 // only ever asks about sandboxes that already outlived their stored record, so

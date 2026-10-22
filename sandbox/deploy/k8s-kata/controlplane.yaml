@@ -75,6 +75,9 @@ rules:
   - apiGroups: ["runtime.agent-sandbox.io"]
     resources: ["clustersandboxpolicies"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["runtime.agent-sandbox.io"]
+    resources: ["sandboxpolicies"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

@@ -200,15 +200,19 @@ func (s *Server) setupRoutes() {
 		log.Info("WM: SaFE API Key auth middleware enabled on /v1/ routes")
 	}
 
-	// CodeInterpreter sandbox session endpoints (control plane)
+	// CodeInterpreter sandbox session endpoints (control plane).
+	// Dual-read: a single path segment is a legacy opaque id (sess_*); two
+	// segments are the canonical namespace/name. Gin requires the same wildcard
+	// name at each depth, so the one-segment route reuses :namespace.
 	v1.POST("/code-interpreter", s.handleCodeInterpreterCreate)
 	v1.POST("/code-interpreter/stream", s.handleCodeInterpreterCreateStream)
 	v1.GET("/code-interpreter/sessions", s.handleListSandboxes)
+	v1.GET("/code-interpreter/sessions/:namespace/recover", s.handleRecoverSession)
+	v1.GET("/code-interpreter/sessions/:namespace/:name/recover", s.handleRecoverSession)
+	v1.GET("/code-interpreter/sessions/:namespace", s.handleGetSandbox)
+	v1.DELETE("/code-interpreter/sessions/:namespace", s.handleDeleteSandbox)
 	v1.GET("/code-interpreter/sessions/:namespace/:name", s.handleGetSandbox)
 	v1.DELETE("/code-interpreter/sessions/:namespace/:name", s.handleDeleteSandbox)
-
-	// Session recovery: rebuild session→pod mapping from the Sandbox CR.
-	v1.GET("/code-interpreter/sessions/:namespace/:name/recover", s.handleRecoverSession)
 
 	// Template management endpoints — CRUD for CodeInterpreter CRD objects.
 	// Allows clients to manage templates without direct kubectl access.
@@ -228,7 +232,10 @@ func (s *Server) setupRoutes() {
 	// Internal APIs — called by EnvD within the cluster.
 	// Uses a separate route group to bypass safeAuthMiddleware.
 	// Authenticated via Router-signed JWT (same RSA key pair used for Router→EnvD auth).
+	// Dual-read: EnvD embeds the session id from its annotation (sess_* or ns/name).
 	internal := s.router.Group("/v1/internal", s.internalJWTMiddleware())
+	internal.GET("/policy/:namespace", s.handleInternalPolicy)
+	internal.POST("/audit/:namespace", s.handleInternalAudit)
 	internal.GET("/policy/:namespace/:name", s.handleInternalPolicy)
 	internal.POST("/audit/:namespace/:name", s.handleInternalAudit)
 }
@@ -784,16 +791,65 @@ func pathSandboxRef(c *gin.Context) (namespace, name, id string, ok bool) {
 	return namespace, name, api.FormatSandboxID(namespace, name), true
 }
 
-// handleGetSandbox handles GET /v1/code-interpreter/sessions/:namespace/:name.
+// pathSessionID returns the session id from route params.
+// One segment (:namespace only) is a legacy opaque id; two segments are
+// canonical namespace/name.
+func pathSessionID(c *gin.Context) (string, bool) {
+	ns := strings.TrimSpace(c.Param("namespace"))
+	name := strings.TrimSpace(c.Param("name"))
+	if ns == "" {
+		return "", false
+	}
+	if name == "" {
+		return ns, true
+	}
+	return api.FormatSandboxID(ns, name), true
+}
+
+// resolvePathSandbox returns namespace/name for handlers that need object
+// identity. Canonical routes supply them directly; legacy one-segment routes
+// resolve via the session store / Sandbox CR annotation index.
+func (s *Server) resolvePathSandbox(c *gin.Context) (namespace, name, sessionID string, ok bool) {
+	if ns, n, id, ok := pathSandboxRef(c); ok {
+		return ns, n, id, true
+	}
+	sessionID, ok = pathSessionID(c)
+	if !ok {
+		return "", "", "", false
+	}
+	if ns, n, parsed := api.ParseSandboxID(sessionID); parsed {
+		return ns, n, sessionID, true
+	}
+	ctx := c.Request.Context()
+	if s.store != nil {
+		info, err := s.store.GetSandboxBySessionID(ctx, sessionID)
+		if err == nil {
+			return info.Namespace, info.SandboxName, sessionID, true
+		}
+		if !errors.Is(err, store.ErrNotFound) {
+			return "", "", "", false
+		}
+	}
+	if s.k8s != nil {
+		info, err := s.k8s.RecoverSessionFromK8s(ctx, sessionID)
+		if err == nil {
+			return info.Namespace, info.SandboxName, sessionID, true
+		}
+	}
+	return "", "", "", false
+}
+
+// handleGetSandbox handles GET /v1/code-interpreter/sessions/:sessionId and
+// /sessions/:namespace/:name.
 // Returns detail info for a single sandbox session.
 // Permission: default users can only get their own sandboxes.
 //
 // LastActivity is returned as stored metadata for listing/sort; this GET does
 // not refresh it. Sandbox lifetime is owned by Brain jobs reclaim.
 func (s *Server) handleGetSandbox(c *gin.Context) {
-	_, _, sessionID, ok := pathSandboxRef(c)
+	sessionID, ok := pathSessionID(c)
 	if !ok {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "namespace and name are required"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "session id is required"})
 		return
 	}
 
@@ -801,13 +857,10 @@ func (s *Server) handleGetSandbox(c *gin.Context) {
 	restoreRecovered := false
 	if err != nil {
 		// Only a confirmed missing record justifies a rebuild. An unreadable
-		// store is a different fact: the real record, with the policy state
-		// the CR cannot reproduce, is still there. Rebuilding on
-		// a timeout or a reset would overwrite it with the thirteen fields
-		// RecoverSessionFromK8s can reconstruct, dropping the egress whitelist
-		// and downgrading an agent-restricted sandbox to the permissive default.
+		// store is a different fact: the real record may still be there.
+		// Policy lives on the SandboxPolicy CR and is loaded with recovery.
 		// This endpoint is polled every 60s per session, so a brief store blip
-		// would do that fleet-wide.
+		// must not rebuild fleet-wide from a partial view.
 		if !errors.Is(err, store.ErrNotFound) {
 			log.Warn("session store unreadable; not rebuilding from the CR",
 				"sessionId", sessionID, "error", err)
@@ -892,7 +945,8 @@ func (s *Server) restoreRecoveredSession(ctx context.Context, info *store.Sandbo
 		"sessionId", info.SessionID, "sandbox", info.SandboxName)
 }
 
-// handleRecoverSession handles GET /v1/code-interpreter/sessions/:namespace/:name/recover.
+// handleRecoverSession handles GET .../sessions/:sessionId/recover and
+// .../sessions/:namespace/:name/recover.
 // The Router calls this to resolve a session from the Sandbox CR when the local
 // store path cannot answer.
 //
@@ -901,9 +955,9 @@ func (s *Server) restoreRecoveredSession(ctx context.Context, info *store.Sandbo
 //  2. If found, reconstruct SandboxInfo (CRStore writes are no-ops)
 //  3. Return the recovered SandboxInfo to the Router
 func (s *Server) handleRecoverSession(c *gin.Context) {
-	_, _, sessionID, ok := pathSandboxRef(c)
+	sessionID, ok := pathSessionID(c)
 	if !ok {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "namespace and name are required"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "session id is required"})
 		return
 	}
 
@@ -965,12 +1019,13 @@ func (s *Server) handleRecoverSession(c *gin.Context) {
 	})
 }
 
-// handleDeleteSandbox handles DELETE /v1/{kind}/sessions/:sessionId.
+// handleDeleteSandbox handles DELETE .../sessions/:sessionId and
+// .../sessions/:namespace/:name.
 // Permission: default/readonly users can only delete their own sandboxes; system-admin can delete any.
 func (s *Server) handleDeleteSandbox(c *gin.Context) {
-	_, _, sessionID, ok := pathSandboxRef(c)
+	sessionID, ok := pathSessionID(c)
 	if !ok {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "namespace and name are required"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "session id is required"})
 		return
 	}
 
@@ -1576,7 +1631,8 @@ func (s *Server) internalJWTMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		// Bind JWT session_id claim to the requested :sessionId path parameter.
+		// Bind JWT session_id claim to the requested path session id
+		// (legacy :sessionId or canonical :namespace/:name).
 		// Prevents IDOR: a JWT for session A cannot be used to read session B's policy.
 		claims, ok := token.Claims.(jwt.MapClaims)
 		if !ok {
@@ -1585,8 +1641,8 @@ func (s *Server) internalJWTMiddleware() gin.HandlerFunc {
 			return
 		}
 		jwtSessionID, _ := claims["session_id"].(string)
-		_, _, pathSessionID, ok := pathSandboxRef(c)
-		if ok && jwtSessionID != pathSessionID {
+		reqSessionID, ok := pathSessionID(c)
+		if ok && jwtSessionID != reqSessionID {
 			c.JSON(http.StatusForbidden, gin.H{"error": "JWT session_id does not match requested sandbox"})
 			c.Abort()
 			return
@@ -1596,23 +1652,27 @@ func (s *Server) internalJWTMiddleware() gin.HandlerFunc {
 	}
 }
 
-// handleInternalPolicy serves GET /v1/internal/policy/{namespace}/{name}.
-// EnvD polls this to pick up egress policy changes made on the Sandbox CR.
+// handleInternalPolicy serves GET /v1/internal/policy/{sessionId} and
+// /policy/{namespace}/{name}. EnvD polls this for SandboxPolicy CR updates.
 func (s *Server) handleInternalPolicy(c *gin.Context) {
-	namespace, name, sessionID, ok := pathSandboxRef(c)
+	namespace, name, sessionID, ok := s.resolvePathSandbox(c)
 	if !ok {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "namespace and name are required"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "sandbox not found"})
 		return
 	}
 
 	pol := defaultSandboxPolicy()
 	if s.k8s != nil {
-		sb, err := s.k8s.GetSandbox(c.Request.Context(), namespace, name)
-		if err != nil {
+		if _, err := s.k8s.GetSandbox(c.Request.Context(), namespace, name); err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "sandbox not found"})
 			return
 		}
-		pol = readPolicyAnnotations(sb)
+		loaded, _, err := s.k8s.GetSandboxPolicy(c.Request.Context(), namespace, name)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query policy"})
+			return
+		}
+		pol = loaded
 	} else if s.store != nil {
 		// Dev/test without a K8s client: serve the policy mirrored in the store.
 		info, err := s.store.GetSandboxBySessionID(c.Request.Context(), sessionID)
@@ -1670,7 +1730,12 @@ func (s *Server) handleGetPolicy(c *gin.Context) {
 		if sb.Labels != nil {
 			ownerUserID = sb.Labels[userIDLabelKey]
 		}
-		pol = readPolicyAnnotations(sb)
+		loaded, _, err := s.k8s.GetSandboxPolicy(c.Request.Context(), namespace, name)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query policy"})
+			return
+		}
+		pol = loaded
 	} else if s.store != nil {
 		info, err := s.store.GetSandboxBySessionID(c.Request.Context(), sessionID)
 		if err != nil {

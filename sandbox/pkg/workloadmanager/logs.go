@@ -104,9 +104,9 @@ func (s *Server) handleInternalAudit(c *gin.Context) {
 		return
 	}
 
-	_, _, sessionID, ok := pathSandboxRef(c)
+	sessionID, ok := pathSessionID(c)
 	if !ok || sessionID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "namespace and name are required"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "session id is required"})
 		return
 	}
 

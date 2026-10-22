@@ -82,6 +82,9 @@ rules:
   - apiGroups: ["runtime.agent-sandbox.io"]
     resources: ["clustersandboxpolicies"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["runtime.agent-sandbox.io"]
+    resources: ["sandboxpolicies"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
   {{- if .Values.router.config.namespaceSelector }}
   # Namespace admission (router.config.namespaceSelector) watches Namespaces.
   - apiGroups: [""]

@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
+	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
 
@@ -50,6 +51,7 @@ func deleteTestReconciler(t *testing.T, st store.Store, objs ...ctrlclient.Objec
 	t.Helper()
 	scheme := k8sruntime.NewScheme()
 	utilruntime.Must(sandboxv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(runtimev1alpha1.AddToScheme(scheme))
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 	return &SandboxReconciler{Client: c, Scheme: scheme, Store: st}
 }
@@ -63,8 +65,7 @@ func runningSandbox(sessionID string) *sandboxv1alpha1.Sandbox {
 			Name:      delTestSandbox,
 			Namespace: delTestNS,
 			Annotations: map[string]string{
-				sessionIDAnnotationKey:     sessionID,
-				runtimePolicyAnnotationKey: "agent-default",
+				sessionIDAnnotationKey: sessionID,
 			},
 			ResourceVersion: "1",
 		},
@@ -95,6 +96,28 @@ func delTestSessionExists(t *testing.T, st store.Store, sessionID string) bool {
 	t.Helper()
 	info, err := st.GetSandboxBySessionID(context.Background(), sessionID)
 	return err == nil && info != nil
+}
+
+func TestEnsureSessionRegisteredPreservesLegacyOpaqueID(t *testing.T) {
+	const legacy = "sess_pre_upgrade"
+	st := store.NewMemoryStore()
+	r := deleteTestReconciler(t, st, runningSandbox(legacy))
+	reconcileDelTest(t, r)
+
+	var got sandboxv1alpha1.Sandbox
+	if err := r.Get(context.Background(), delTestKey(), &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Annotations[sessionIDAnnotationKey] != legacy {
+		t.Fatalf("annotation = %q, want preserved legacy %q",
+			got.Annotations[sessionIDAnnotationKey], legacy)
+	}
+	if !delTestSessionExists(t, st, legacy) {
+		t.Fatal("legacy session id must remain resolvable after reconcile")
+	}
+	if delTestSessionExists(t, st, delTestSession) {
+		t.Fatal("must not re-register under an overwritten canonical id")
+	}
 }
 
 func TestDeletedSandboxDeregistersItsSession(t *testing.T) {
