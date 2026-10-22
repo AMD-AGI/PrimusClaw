@@ -300,6 +300,17 @@ test("restart needs a backoff when it allows restarts", () => {
   refused(mutate((m) => { m.restart.backoff_sec = [30, 0]; }), "restart.backoff_sec[1]", ">= 1");
 });
 
+test("names that Object.prototype also has are not mistaken for declared fields", () => {
+  for (const k of ["constructor", "toString", "hasOwnProperty"]) {
+    refused(mutate((m) => { m[k] = 1; }), k, "unknown field");
+    refused(mutate((m) => { m.env[k] = 42; }), `env.${k}`, "must be a string");
+    refused(mutate((m) => { m.sandbox_roles[k] = ["runner"]; }), `sandbox_roles.${k}`, "unknown field");
+    const noName = mutate((m) => { delete m.name; });
+    assert.ok(paths({ ...(noName as object), [k]: 1 }).includes("name"));
+  }
+  refused(JSON.parse('{"__proto__": 1}'), "__proto__", "unknown field");
+});
+
 test("every problem is reported, not the first", () => {
   const found = paths(mutate((m) => {
     m.container.image_from_input = "bad";

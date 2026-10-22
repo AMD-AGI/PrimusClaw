@@ -36,6 +36,8 @@ const KEYWORDS = new Set([
   "minItems", "uniqueItems", "minLength", "pattern", "minimum", "maximum", "oneOf",
 ]);
 
+// Own-key checks throughout: `in` also finds Object.prototype members, so a
+// field named `constructor` would be taken for a declared property.
 const isObj = (v: unknown): v is Record<string, unknown> =>
   typeof v === "object" && v !== null && !Array.isArray(v);
 
@@ -131,10 +133,10 @@ export function validateAgainstSchema(root: SchemaNode, value: unknown): SchemaI
     if (isObj(v)) {
       const props = (schema.properties ?? {}) as Record<string, SchemaNode>;
       for (const k of (schema.required ?? []) as string[]) {
-        if (!(k in v)) issues.push({ path: joinPath(path, k), reason: "required" });
+        if (!Object.hasOwn(v, k)) issues.push({ path: joinPath(path, k), reason: "required" });
       }
       for (const [k, val] of Object.entries(v)) {
-        if (k in props) visit(props[k]!, val, joinPath(path, k));
+        if (Object.hasOwn(props, k)) visit(props[k]!, val, joinPath(path, k));
         else if (isObj(schema.additionalProperties)) visit(schema.additionalProperties as SchemaNode, val, joinPath(path, k));
         else if (schema.additionalProperties === false) issues.push({ path: joinPath(path, k), reason: "unknown field" });
       }

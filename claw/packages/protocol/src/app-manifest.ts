@@ -488,12 +488,12 @@ export function validateAppManifest(value: unknown): AppManifestIssue[] {
   }
   if (!isObj(value.mcp)) {
     for (const f of ["mcp_port", "mcp_token", "mcp_public_url"]) {
-      if (f in envMap) bad(`env_map.${f}`, "needs mcp to be declared");
+      if (Object.hasOwn(envMap, f)) bad(`env_map.${f}`, "needs mcp to be declared");
     }
-  } else if ("mcp_public_url" in envMap && value.mcp.public !== true) {
+  } else if (Object.hasOwn(envMap, "mcp_public_url") && value.mcp.public !== true) {
     bad("env_map.mcp_public_url", "needs mcp.public to be true");
   }
-  if ("sandbox_templates" in envMap && !Array.isArray(value.sandbox_templates)) {
+  if (Object.hasOwn(envMap, "sandbox_templates") && !Array.isArray(value.sandbox_templates)) {
     bad("env_map.sandbox_templates", "needs sandbox_templates to be declared");
   }
 
