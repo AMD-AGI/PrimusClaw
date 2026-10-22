@@ -214,7 +214,11 @@ func (s *Server) setupRoutes() {
 	v1.PUT("/templates/:namespace/:name", s.proxyToWM)
 	v1.DELETE("/templates/:namespace/:name", s.proxyToWM)
 
-	// Sandbox policy management (proxied to WM)
+	// Sandbox policy management (proxied to WM).
+	// Dual-read: one segment is a legacy or percent-encoded session id.
+	v1.GET("/sandbox/sessions/:namespace/policy", s.proxyToWM)
+	v1.PATCH("/sandbox/sessions/:namespace/policy", s.proxyToWM)
+	v1.GET("/sandbox/sessions/:namespace/logs", s.proxyToWM)
 	v1.GET("/sandbox/sessions/:namespace/:name/policy", s.proxyToWM)
 	v1.PATCH("/sandbox/sessions/:namespace/:name/policy", s.proxyToWM)
 	v1.GET("/sandbox/sessions/:namespace/:name/logs", s.proxyToWM)

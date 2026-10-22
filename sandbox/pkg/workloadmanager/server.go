@@ -224,7 +224,12 @@ func (s *Server) setupRoutes() {
 	templates.PUT("/:namespace/:name", s.handleTemplateUpdate)
 	templates.DELETE("/:namespace/:name", s.handleTemplateDelete)
 
-	// Sandbox policy management (§4.1 egress control) — stored on the Sandbox CR.
+	// Sandbox policy management (§4.1 egress control) — stored on the SandboxPolicy CR.
+	// Dual-read, same wildcard rule as sessions: the SDK percent-encodes the
+	// session id into one path segment (sess_* or ns%2Fname).
+	v1.GET("/sandbox/sessions/:namespace/policy", s.handleGetPolicy)
+	v1.PATCH("/sandbox/sessions/:namespace/policy", s.handleUpdatePolicy)
+	v1.GET("/sandbox/sessions/:namespace/logs", s.handleGetLogs)
 	v1.GET("/sandbox/sessions/:namespace/:name/policy", s.handleGetPolicy)
 	v1.PATCH("/sandbox/sessions/:namespace/:name/policy", s.handleUpdatePolicy)
 	v1.GET("/sandbox/sessions/:namespace/:name/logs", s.handleGetLogs)
@@ -1708,11 +1713,12 @@ func (s *Server) handleInternalPolicy(c *gin.Context) {
 
 // ─── Policy management handlers (§4.1) ──────────────────────────────────────
 
-// handleGetPolicy handles GET /v1/sandbox/sessions/:namespace/:name/policy.
+// handleGetPolicy handles GET /v1/sandbox/sessions/:namespace/policy and
+// /sessions/:namespace/:name/policy.
 func (s *Server) handleGetPolicy(c *gin.Context) {
-	namespace, name, sessionID, ok := pathSandboxRef(c)
+	namespace, name, sessionID, ok := s.resolvePathSandbox(c)
 	if !ok {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "namespace and name are required"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "sandbox not found"})
 		return
 	}
 
@@ -1771,18 +1777,20 @@ func (s *Server) handleGetPolicy(c *gin.Context) {
 	})
 }
 
-// UpdatePolicyRequest is the request body for PATCH /v1/sandbox/sessions/:namespace/:name/policy.
+// UpdatePolicyRequest is the request body for PATCH /v1/sandbox/sessions/:namespace/policy
+// and /sessions/:namespace/:name/policy.
 type UpdatePolicyRequest struct {
 	AllowedEgressHosts   *[]string `json:"allowedEgressHosts,omitempty"`
 	AllowedInternalHosts *[]string `json:"allowedInternalHosts,omitempty"`
 	PolicyMode           *string   `json:"policyMode,omitempty"`
 }
 
-// handleUpdatePolicy handles PATCH /v1/sandbox/sessions/:namespace/:name/policy.
+// handleUpdatePolicy handles PATCH /v1/sandbox/sessions/:namespace/policy and
+// /sessions/:namespace/:name/policy.
 func (s *Server) handleUpdatePolicy(c *gin.Context) {
-	namespace, name, sessionID, ok := pathSandboxRef(c)
+	namespace, name, sessionID, ok := s.resolvePathSandbox(c)
 	if !ok {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "namespace and name are required"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "sandbox not found"})
 		return
 	}
 

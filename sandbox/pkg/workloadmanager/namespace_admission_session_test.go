@@ -105,6 +105,58 @@ func TestWMSessionRoutesJudgeTheSessionNamespace(t *testing.T) {
 	}
 }
 
+// Single-segment policy and logs URLs are what the Python SDK sends: quote()
+// keeps sess_* as one segment and encodes namespace/name as ns%2Fname.
+func TestPolicyAndLogsAcceptSingleSegmentSessionID(t *testing.T) {
+	rig := newWMRig(t, wmAdmitter(t, true), false)
+	seedSessions(t, rig)
+	now := time.Now()
+	storeOne := func(id, ns, name string) {
+		t.Helper()
+		if err := rig.store.StoreSandbox(context.Background(), &store.SandboxInfo{
+			SessionID: id, SandboxName: name, Namespace: ns, Status: "running",
+			CreatedAt: now, LastActivity: now, ExpiresAt: now.Add(time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	storeOne("sess_legacy", "admitted", "sb-legacy")
+	storeOne("sess_denied", "denied", "sb-denied")
+
+	for _, path := range []string{
+		"/v1/sandbox/sessions/sess_legacy/policy",
+		"/v1/sandbox/sessions/admitted%2Fsb-admitted/policy",
+	} {
+		w := rig.serve(http.MethodGet, path, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET %s: got %d %s", path, w.Code, w.Body)
+		}
+	}
+
+	w := rig.serve(http.MethodPatch, "/v1/sandbox/sessions/sess_legacy/policy", `{"policyMode":"audit"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("PATCH legacy: got %d %s", w.Code, w.Body)
+	}
+	if info := rig.session(t, "sess_legacy"); info == nil || info.PolicyMode != "audit" {
+		t.Fatalf("legacy policy was not updated: %+v", info)
+	}
+
+	w = rig.serve(http.MethodGet, "/v1/sandbox/sessions/sess_legacy/logs", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET logs: got %d %s", w.Code, w.Body)
+	}
+
+	w = rig.serve(http.MethodPatch, "/v1/sandbox/sessions/sess_denied/policy", `{"policyMode":"audit"}`)
+	var body map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &body)
+	if w.Code != http.StatusForbidden || body["code"] != "namespace_not_admitted" {
+		t.Fatalf("denied legacy: got %d %s", w.Code, w.Body)
+	}
+	if info := rig.session(t, "sess_denied"); info == nil || info.PolicyVersion != 0 {
+		t.Fatalf("denied legacy policy changed: %+v", info)
+	}
+}
+
 func TestWMSessionRoutesFailClosedWhenUnsynced(t *testing.T) {
 	admittedID := api.FormatSandboxID("admitted", "sb-admitted")
 	for _, sr := range sessionRoutes() {
