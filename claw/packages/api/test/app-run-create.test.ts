@@ -225,6 +225,22 @@ describe("mode=app task creation", { skip }, () => {
     });
   });
 
+  test("the schema refuses a second run for one (session, key) even without the lock, and only then", async () => {
+    const mk = async (taskId: string, session: string, key: string | null) => {
+      await q(`INSERT INTO claw_tasks (task_id, session_id, name, status, mode) VALUES ($1, $2, 't', 'queued', 'app')`, [taskId, session]);
+      await q(
+        `INSERT INTO claw_app_runs (task_id, session_id, plugin_id, manifest, idempotency_key, state, mcp_token_enc)
+         VALUES ($1, $2, 1, '{}'::jsonb, $3, 'provisioning', 'x')`,
+        [taskId, session, key],
+      );
+    };
+    await mk("kt-1", "s1", "dup");
+    await assert.rejects(mk("kt-2", "s1", "dup"), (e: any) => e.code === "23505");
+    await mk("kt-3", "s2", "dup");
+    await mk("kt-4", "s1", null);
+    await mk("kt-5", "s1", null);
+  });
+
   describe("one unfinished run per session", () => {
     test("a second run is refused, naming the first, and writes nothing", async () => {
       const first = await create("s1");
