@@ -96,6 +96,29 @@ func TestPatchSandboxPolicyMissingCRDoesNotCreateDefault(t *testing.T) {
 	}
 }
 
+func TestGetPolicyMissingCRIsNotFound(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	scheme := runtime.NewScheme()
+	utilruntime.Must(sandboxv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(runtimev1alpha1.AddToScheme(scheme))
+	sb := &sandboxv1alpha1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "sb-1", Namespace: "ns"},
+	}
+	s := &Server{k8s: &K8sSandboxCreator{
+		client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(sb).Build(),
+	}}
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/sandbox/sessions/ns/sb-1/policy", nil)
+	c.Params = gin.Params{{Key: "namespace", Value: "ns"}, {Key: "name", Value: "sb-1"}}
+
+	s.handleGetPolicy(c)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("missing policy: got %d %s, want 404", rec.Code, rec.Body)
+	}
+}
+
 func TestInternalPolicyMissingCRIsNotFound(t *testing.T) {
 	t.Parallel()
 	gin.SetMode(gin.TestMode)

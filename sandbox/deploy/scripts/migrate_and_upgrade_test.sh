@@ -82,4 +82,24 @@ fi
     require_helm
 ) || fail "Helm 3.14 was rejected"
 
+out="$( (
+    # shellcheck disable=SC1090
+    source "${UPGRADE}"
+    SANDBOX_NAMESPACE=agent-sandbox-system
+    CONTROLPLANE_PAUSED=true
+    trap report_paused_controlplane EXIT
+    exit 1
+) 2>&1 || true)"
+[[ "${out}" == *"still scaled to 0"* && "${out}" == *"rerun deploy/upgrade.sh"* ]] \
+    || fail "a failure after pausing the control plane did not say so: ${out}"
+
+out="$( (
+    # shellcheck disable=SC1090
+    source "${UPGRADE}"
+    CONTROLPLANE_PAUSED=true
+    trap report_paused_controlplane EXIT
+    exit 0
+) 2>&1)"
+[[ -z "${out}" ]] || fail "a successful run reported a paused control plane: ${out}"
+
 printf 'ok\n'

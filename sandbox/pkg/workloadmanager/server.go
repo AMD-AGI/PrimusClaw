@@ -1746,9 +1746,13 @@ func (s *Server) handleGetPolicy(c *gin.Context) {
 		if sb.Labels != nil {
 			ownerUserID = sb.Labels[userIDLabelKey]
 		}
-		loaded, _, err := s.k8s.GetSandboxPolicy(c.Request.Context(), namespace, name)
+		loaded, found, err := s.k8s.GetSandboxPolicy(c.Request.Context(), namespace, name)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query policy"})
+			return
+		}
+		if !found {
+			c.JSON(http.StatusNotFound, gin.H{"error": "sandbox policy not found"})
 			return
 		}
 		pol = loaded

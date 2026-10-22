@@ -152,10 +152,22 @@ require_helm() {
     fi
 }
 
+CONTROLPLANE_PAUSED=false
+
+# Report a control plane left at 0 replicas when the run stops early.
+report_paused_controlplane() {
+    local rc=$?
+    if [[ "${rc}" -ne 0 && "${CONTROLPLANE_PAUSED}" == "true" ]]; then
+        printf '[upgrade] ERROR: agent-sandbox-controlplane in %s is still scaled to 0. Fix the error above and rerun deploy/upgrade.sh; it resumes the migration and restores the control plane.\n' \
+            "${SANDBOX_NAMESPACE}" >&2
+    fi
+}
+
 # Stop writers before the Redis copy. This changes the live replica count
 # only; Helm values are unchanged, and the upgrade restores them.
 pause_sandbox_controlplane() {
     log "scaling agent-sandbox-controlplane to 0"
+    CONTROLPLANE_PAUSED=true
     kubectl -n "${SANDBOX_NAMESPACE}" scale deployment/agent-sandbox-controlplane --replicas=0
     kubectl -n "${SANDBOX_NAMESPACE}" rollout status deployment/agent-sandbox-controlplane --timeout=3m
 }
@@ -238,6 +250,7 @@ main() {
     elif [[ "${DRY_RUN}" == "true" ]]; then
         log "dry-run: would scale agent-sandbox-controlplane to 0, migrate Redis session policies once, then upgrade images"
     else
+        trap report_paused_controlplane EXIT
         pause_sandbox_controlplane
         log "migrating SandboxPolicy from Redis (once)"
         NAMESPACE="${SANDBOX_NAMESPACE}" bash "${MIGRATE}"
@@ -245,6 +258,7 @@ main() {
     fi
 
     upgrade_sandbox
+    CONTROLPLANE_PAUSED=false
     upgrade_claw
     log "upgrade finished"
 }
