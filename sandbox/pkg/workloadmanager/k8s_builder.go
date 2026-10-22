@@ -391,6 +391,7 @@ func (c *K8sSandboxCreator) createDirect(ctx context.Context, ci *runtimev1alpha
 		return nil, fmt.Errorf("create Sandbox: %w", err)
 	}
 	if err := c.UpsertSandboxPolicy(ctx, sandbox, pol); err != nil {
+		c.rollbackDirectSandbox(ctx, namespace, sandboxName)
 		return nil, fmt.Errorf("create SandboxPolicy: %w", err)
 	}
 
@@ -419,6 +420,35 @@ func (c *K8sSandboxCreator) createDirect(ctx context.Context, ci *runtimev1alpha
 // Generous: it is deleting three objects, and the alternative to it finishing
 // is a Pod held out of the pool until its absolute deadline.
 const claimRollbackTimeout = 30 * time.Second
+
+// rollbackDirectSandbox deletes a Sandbox whose create did not finish.
+// The deadline is detached from the request so a cancelled caller still deletes it.
+func (c *K8sSandboxCreator) rollbackDirectSandbox(ctx context.Context, namespace, sandboxName string) {
+	rbCtx, rbCancel := context.WithTimeout(context.WithoutCancel(ctx), claimRollbackTimeout)
+	defer rbCancel()
+	if err := c.DeleteSandbox(rbCtx, &store.SandboxInfo{
+		Namespace:   namespace,
+		SandboxName: sandboxName,
+	}); err != nil {
+		log.Error("sandbox rollback failed",
+			"namespace", namespace, "sandbox", sandboxName, "error", err)
+	}
+}
+
+// rollbackWarmPoolClaim deletes the Claim, adopted Pod, and Sandbox left by a
+// claim that did not finish. The deadline is detached from the request so a
+// cancelled caller still releases the Pod.
+func (c *K8sSandboxCreator) rollbackWarmPoolClaim(ctx context.Context, namespace, sandboxName string) {
+	rbCtx, rbCancel := context.WithTimeout(context.WithoutCancel(ctx), claimRollbackTimeout)
+	defer rbCancel()
+	if err := c.DeleteSandboxClaim(rbCtx, &store.SandboxInfo{
+		Namespace:   namespace,
+		SandboxName: sandboxName,
+	}); err != nil {
+		log.Error("warm-pool claim rollback failed; pod may be held until its deadline",
+			"namespace", namespace, "sandbox", sandboxName, "error", err)
+	}
+}
 
 // applyClaimMetadataWithRetry gives the patch a few goes before giving up on
 // the whole claim.
@@ -610,20 +640,11 @@ func (c *K8sSandboxCreator) createViaClaim(ctx context.Context, ci *runtimev1alp
 					// is cancelled before it deletes anything, in precisely the
 					// case it exists for. Detached, with its own deadline so a
 					// wedged API server cannot hold the request open either.
-					rbCtx, rbCancel := context.WithTimeout(
-						context.WithoutCancel(ctx), claimRollbackTimeout)
-					rbErr := c.DeleteSandboxClaim(rbCtx, &store.SandboxInfo{
-						Namespace:   namespace,
-						SandboxName: sandboxName,
-					})
-					rbCancel()
-					if rbErr != nil {
-						log.Error("warm-pool claim rollback failed; pod may be held until its deadline",
-							"namespace", namespace, "sandbox", sandboxName, "error", rbErr)
-					}
+					c.rollbackWarmPoolClaim(ctx, namespace, sandboxName)
 					return nil, fmt.Errorf("warm-pool sandbox %s/%s: %w", namespace, sandboxName, err)
 				}
 				if err := c.UpsertSandboxPolicy(waitCtx, createdSandbox, claimPol); err != nil {
+					c.rollbackWarmPoolClaim(ctx, namespace, sandboxName)
 					return nil, fmt.Errorf("create SandboxPolicy for warm-pool sandbox %s/%s: %w", namespace, sandboxName, err)
 				}
 				if ci.Spec.AuthMode != runtimev1alpha1.AuthModeNone {

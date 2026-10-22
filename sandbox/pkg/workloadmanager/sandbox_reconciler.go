@@ -100,6 +100,7 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.ensureSessionRegistered(ctx, sandbox); err != nil {
 		log.Warnf("SandboxReconciler: session defaults patch failed for %s/%s: %v",
 			sandbox.Namespace, sandbox.Name, err)
+		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{}, nil

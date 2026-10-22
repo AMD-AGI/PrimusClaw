@@ -31,6 +31,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
@@ -289,5 +290,29 @@ func TestDeregistrationSparesAReusedSession(t *testing.T) {
 	}
 	if r.peekSession(delTestKey()) != "" {
 		t.Error("the stale recording must still be dropped")
+	}
+}
+
+// A conflict while writing session-id or ShutdownTime has to come back to the
+// work queue. Dropping it leaves a kubectl-applied Sandbox without those
+// defaults until some later watch event happens to retry the reconcile.
+func TestReconcileReturnsSessionRegistrationError(t *testing.T) {
+	scheme := k8sruntime.NewScheme()
+	utilruntime.Must(sandboxv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(runtimev1alpha1.AddToScheme(scheme))
+	sb := runningSandbox(delTestSession)
+	sb.Annotations = nil
+	sb.Spec.Lifecycle.ShutdownTime = nil
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sb).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(context.Context, ctrlclient.WithWatch, ctrlclient.Object, ctrlclient.Patch, ...ctrlclient.PatchOption) error {
+				return errors.New("conflict")
+			},
+		}).Build()
+	r := &SandboxReconciler{Client: c, Scheme: scheme}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: delTestKey()})
+	if err == nil {
+		t.Fatal("a failed session-defaults patch must be returned so the reconcile is retried")
 	}
 }
