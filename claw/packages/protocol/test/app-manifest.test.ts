@@ -294,6 +294,19 @@ test("paths and placeholders stay inside their directory", () => {
   refused(mutate((m) => { m.bootstrap.content_b64 = "not base64!"; }), "bootstrap.content_b64", "must match");
 });
 
+test("state_dir placeholder scan is linear on hostile input", () => {
+  const time = (dir: string): number => {
+    const t0 = performance.now();
+    validateAppManifest(mutate((m) => { m.state_dir = dir; }));
+    return performance.now() - t0;
+  };
+  for (const unit of ["${", "${{", "${{|", "}${"]) {
+    const ms = time(unit.repeat(Math.ceil(100_000 / unit.length)));
+    assert.ok(ms < 50, `${JSON.stringify(unit)} x1e5 took ${ms.toFixed(1)}ms`);
+  }
+  refused(mutate((m) => { m.state_dir = "${USER_DATA_PATH}/${run_id}/${x}"; }), "state_dir", "${x}");
+});
+
 test("restart needs a backoff when it allows restarts", () => {
   refused(mutate((m) => { m.restart.backoff_sec = []; }), "restart.backoff_sec", "at least 1");
   assert.deepEqual(paths(mutate((m) => { m.restart = { max_restarts: 0, backoff_sec: [] }; })), []);

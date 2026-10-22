@@ -499,8 +499,15 @@ export function validateAppManifest(value: unknown): AppManifestIssue[] {
 
   // Paths and placeholders stay where they are meant to.
   if (typeof value.state_dir === "string") {
-    for (const m of value.state_dir.matchAll(/\$\{([^}]*)\}/g)) {
-      if (!STATE_DIR_VARS.has(m[1]!)) bad("state_dir", `unknown placeholder \${${m[1]}}; only \${USER_DATA_PATH} and \${run_id} are expanded`);
+    // A scan, not a regex: each step moves past what it consumed, so the cost
+    // is linear however many `${` the string repeats.
+    const dir = value.state_dir;
+    for (let at = dir.indexOf("${"); at !== -1; at = dir.indexOf("${", at)) {
+      const close = dir.indexOf("}", at + 2);
+      if (close === -1) break;
+      const name = dir.slice(at + 2, close);
+      if (!STATE_DIR_VARS.has(name)) bad("state_dir", `unknown placeholder \${${name}}; only \${USER_DATA_PATH} and \${run_id} are expanded`);
+      at = close + 1;
     }
   }
   const bootstrap = obj(value.bootstrap);
