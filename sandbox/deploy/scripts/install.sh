@@ -132,9 +132,36 @@ ensure_helm() {
     ok "helm installed: $(helm version --short 2>&1 | command head -1)"
 }
 
+# Apply core and runtime CRDs, then require each one to exist.
+# kubectl apply is idempotent. The Ready-release shortcut below still calls
+# this: a control plane that already reads SandboxPolicy must not skip the
+# CRD that was added after the release was first installed.
+ensure_crds() {
+    [[ -d "${CORE_CRD_DIR}"    ]] || err "missing ${CORE_CRD_DIR}"
+    [[ -d "${RUNTIME_CRD_DIR}" ]] || err "missing ${RUNTIME_CRD_DIR}"
+    run "kubectl apply -f \"${CORE_CRD_DIR}/\""
+    run "kubectl apply -f \"${RUNTIME_CRD_DIR}/\""
+
+    local c
+    for c in sandboxes.agents.x-k8s.io \
+             sandboxclaims.extensions.agents.x-k8s.io \
+             sandboxtemplates.extensions.agents.x-k8s.io \
+             sandboxwarmpools.extensions.agents.x-k8s.io \
+             codeinterpreters.runtime.agent-sandbox.io \
+             clustersandboxpolicies.runtime.agent-sandbox.io \
+             sandboxpolicies.runtime.agent-sandbox.io; do
+        if [[ "${DRY_RUN}" != "true" ]]; then
+            kubectl get crd "$c" >/dev/null 2>&1 || err "CRD $c not Established"
+        fi
+    done
+    ok "7 CRDs Established"
+}
+
 # ── Idempotency guard: skip when Sandbox is already installed ─────────────────
 # Treat Sandbox as installed only when its controlplane Deployment is Ready, so
 # a half-broken install is still repaired. FORCE_SANDBOX=1 overrides.
+# CRDs are still applied: they are outside the Helm release, and a new CRD
+# (SandboxPolicy) has to land on an already-Ready cluster.
 FORCE_SANDBOX="${FORCE_SANDBOX:-false}"
 if command -v kubectl >/dev/null 2>&1 \
    && [[ "${FORCE_SANDBOX}" != "1" && "${FORCE_SANDBOX}" != "true" && "${DRY_RUN}" != "true" ]]; then
@@ -146,7 +173,9 @@ if command -v kubectl >/dev/null 2>&1 \
        && "${INSTANCE}" == "${RELEASE}" \
        && "${DESIRED}" =~ ^[1-9][0-9]*$ \
        && "${READY_REPLICAS}" == "${DESIRED}" ]]; then
-        ok "Sandbox Helm release ${RELEASE} is fully ready in ${NAMESPACE} — skipping (set FORCE_SANDBOX=1 to reinstall)"
+        ok "Sandbox Helm release ${RELEASE} is fully ready in ${NAMESPACE} — applying CRDs, then skipping the rest (set FORCE_SANDBOX=1 to reinstall)"
+        section "CRDs"
+        ensure_crds
         exit 0
     fi
 fi
@@ -211,22 +240,7 @@ log "Dry-run:         ${DRY_RUN}"
 
 # ── Step 1: CRDs ──────────────────────────────────────────────────────────────
 section "Step 1: Apply CRDs"
-[[ -d "${CORE_CRD_DIR}"    ]] || err "missing ${CORE_CRD_DIR}"
-[[ -d "${RUNTIME_CRD_DIR}" ]] || err "missing ${RUNTIME_CRD_DIR}"
-run "kubectl apply -f \"${CORE_CRD_DIR}/\""
-run "kubectl apply -f \"${RUNTIME_CRD_DIR}/\""
-
-for c in sandboxes.agents.x-k8s.io \
-         sandboxclaims.extensions.agents.x-k8s.io \
-         sandboxtemplates.extensions.agents.x-k8s.io \
-    sandboxwarmpools.extensions.agents.x-k8s.io \
-         codeinterpreters.runtime.agent-sandbox.io \
-         clustersandboxpolicies.runtime.agent-sandbox.io; do
-    if [[ "${DRY_RUN}" != "true" ]]; then
-        kubectl get crd "$c" >/dev/null 2>&1 || err "CRD $c not Established"
-    fi
-done
-ok "6 CRDs Established"
+ensure_crds
 
 # ── Step 2: Namespace ─────────────────────────────────────────────────────────
 section "Step 2: Namespace"
@@ -522,7 +536,7 @@ section "Install complete"
 cat <<EOF
 
   Resources installed:
-    - 6 CRDs (sandboxes / sandboxclaims / sandboxtemplates / sandboxwarmpools / codeinterpreters / clustersandboxpolicies)
+    - 7 CRDs (sandboxes / sandboxclaims / sandboxtemplates / sandboxwarmpools / codeinterpreters / clustersandboxpolicies / sandboxpolicies)
     - Namespace ${NAMESPACE}
     - Secret envd-router-identity (mode=${ENVD_KEY_SOURCE})
     - Helm release ${RELEASE}:

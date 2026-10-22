@@ -28,6 +28,7 @@ kubectl delete sandboxwarmpools --all -A --ignore-not-found 2>/dev/null || true
 kubectl delete sandboxtemplates --all -A --ignore-not-found 2>/dev/null || true
 kubectl delete codeinterpreters --all -A --ignore-not-found 2>/dev/null || true
 kubectl delete clustersandboxpolicies --all --ignore-not-found 2>/dev/null || true
+kubectl delete sandboxpolicies --all -A --ignore-not-found 2>/dev/null || true
 
 head "Helm uninstall"
 helm uninstall "${RELEASE}" --namespace "${NAMESPACE}" 2>/dev/null \

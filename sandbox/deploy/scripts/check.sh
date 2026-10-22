@@ -5,7 +5,7 @@
 # check.sh — Read-only health verification for the agent-sandbox install.
 #
 # Verifies that an agent-sandbox deployment matches the reference shape running
-# on the the cluster: 6 CRDs Established, 1 Helm release, controlplane Ready,
+# on the the cluster: 7 CRDs Established, 1 Helm release, controlplane Ready,
 # two Services with endpoints, envd-router-identity Secret with the right keys,
 # and live /healthz probes returning 200.
 #
@@ -53,14 +53,15 @@ kubectl cluster-info >/dev/null 2>&1 \
     && pass "cluster reachable" \
     || { fail "kubectl cannot reach cluster"; exit 1; }
 
-# ── 1. CRDs (6 expected, Established) ─────────────────────────────────────────
+# ── 1. CRDs (7 expected, Established) ─────────────────────────────────────────
 section "1. CRDs"
 for c in sandboxes.agents.x-k8s.io \
          sandboxclaims.extensions.agents.x-k8s.io \
          sandboxtemplates.extensions.agents.x-k8s.io \
          sandboxwarmpools.extensions.agents.x-k8s.io \
          codeinterpreters.runtime.agent-sandbox.io \
-         clustersandboxpolicies.runtime.agent-sandbox.io; do
+         clustersandboxpolicies.runtime.agent-sandbox.io \
+         sandboxpolicies.runtime.agent-sandbox.io; do
     cond="$(kubectl get crd "$c" -o jsonpath='{.status.conditions[?(@.type=="Established")].status}' 2>/dev/null)"
     if [[ "${cond}" == "True" ]]; then
         pass "CRD ${c}"
