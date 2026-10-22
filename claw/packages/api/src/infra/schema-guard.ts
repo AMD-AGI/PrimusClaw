@@ -128,6 +128,17 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     ],
   },
   {
+    table: "claw_app_runs",
+    // Written in the same transaction as every `mode='app'` task, so a database
+    // that lost the table or a grant column refuses app creation outright rather
+    // than leaving a task row with no run behind it.
+    columns: [
+      "task_id", "session_id", "plugin_id", "manifest", "idempotency_key", "state",
+      "mcp_token_enc", "grant_id", "grant_keys_enc", "grant_limits",
+      "grant_expires_at", "grant_revoked_at",
+    ],
+  },
+  {
     table: "claw_workspaces",
     // Every write against these is best-effort, so a missing table costs no
     // request -- which is exactly why it belongs here. The damage shows up

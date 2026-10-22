@@ -1777,6 +1777,50 @@ export async function initDb(): Promise<void> {
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_tasks_session ON claw_tasks(session_id)",
     ).catch(() => {});
+
+    // A hosted application's run: one row per `mode='app'` task, holding what
+    // the app runner needs to resume it (the manifest as it was at creation, the
+    // MCP token, the grant) so a replacement Brain can pick it up from here.
+    //
+    // `manifest` is a copy, not a reference: editing the plugin afterwards must
+    // not change a run that is already under way. `mcp_token_enc` and
+    // `grant_keys_enc` are sealed (see crypto/app-run-secrets.ts); nothing in
+    // this table is a credential in the clear. `archive` is reserved for the
+    // result archive and is not written yet.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS claw_app_runs (
+        task_id              TEXT PRIMARY KEY REFERENCES claw_tasks(task_id),
+        session_id           TEXT NOT NULL,
+        plugin_id            BIGINT NOT NULL,
+        manifest             JSONB NOT NULL,
+        idempotency_key      TEXT,
+        state_dir            TEXT,
+        state                TEXT NOT NULL,
+        restarts             INT  NOT NULL DEFAULT 0,
+        last_exit            JSONB,
+        events_cursor        JSONB NOT NULL DEFAULT '{}'::jsonb,
+        sandbox_workload_id  TEXT,
+        mcp_token_enc        TEXT NOT NULL,
+        archive              JSONB,
+        grant_id             TEXT,
+        grant_keys_enc       TEXT,
+        grant_limits         JSONB,
+        grant_expires_at     TIMESTAMPTZ,
+        grant_revoked_at     TIMESTAMPTZ,
+        created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(
+      "CREATE INDEX IF NOT EXISTS idx_app_runs_session ON claw_app_runs(session_id)",
+    );
+    // The durable half of Idempotency-Key for app runs: the response cache
+    // expires and can lose a write, this does not. Per session, matching the
+    // scope the key has on the route.
+    await client.query(
+      `CREATE UNIQUE INDEX IF NOT EXISTS uq_app_runs_idempotency
+         ON claw_app_runs(session_id, idempotency_key) WHERE idempotency_key IS NOT NULL`,
+    );
     // The sweeper's backstop scan: non-terminal rows ordered by when their
     // budget runs out. Partial, because rows past their deadline are the rare
     // case and terminal rows are the overwhelming majority of the table.

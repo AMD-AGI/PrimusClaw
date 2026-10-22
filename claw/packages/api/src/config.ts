@@ -364,6 +364,13 @@ export const CLAW_SKILL_EVOLUTION_ENABLED = envBool("CLAW_SKILL_EVOLUTION_ENABLE
  * On by default. The capability floor keeps each API on fat dispatch until the
  * fleet explicitly asserts support for this binary's semantics version.
  */
+/**
+ * Accept `mode: "app"` on `POST /v1/sessions/:sessionId/tasks`. Off by default:
+ * until the Brain side runs apps, an admitted app run is refused there as not
+ * implemented, so nothing is gained by taking one in.
+ */
+export const APP_RUNS_ENABLED = envBool("APP_RUNS_ENABLED", false);
+
 export const RUN_DOORBELL_DISPATCH = envBool("RUN_DOORBELL_DISPATCH", true);
 
 /**

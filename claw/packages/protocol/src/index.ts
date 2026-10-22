@@ -51,3 +51,4 @@ export { DagHandleMap, HANDLE_MAP_PREFIX } from "./sandbox/handle-map.js";
 export type { HandleInfo } from "./sandbox/handle-map.js";
 export { getHandleEntry, setHandleEntry } from "./sandbox/handle-map.js";
 export * from "./app-manifest.js";
+export * from "./json-pointer.js";

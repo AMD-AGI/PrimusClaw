@@ -29,6 +29,7 @@ import { getTaskDag } from "../tasks/dags/db.js";
 import type { UserInfo } from "../auth/models.js";
 import { MissingPlatformKeyError, stampSessionCredentials } from "../auth/session-credentials.js";
 import { withAdmissionTransaction } from "../tasks/admission.js";
+import { createAppRun } from "./app-run-create.js";
 import {
   createSingleTask, expandDag, isCreateRefusal, isTopologyRefusal,
   type CreateRefusal, type ExpandResult,
@@ -118,6 +119,8 @@ async function sendCreateRefusal(reply: FastifyReply, refusal: CreateRefusal): P
 }
 
 interface CreateTaskBody {
+  /** `"app"` creates a hosted application run; anything else is the task path below. */
+  mode?: unknown;
   dag_id?: string;
   plugin_id?: number;
   input?: Record<string, unknown>;
@@ -271,6 +274,14 @@ export async function registerTaskCreateRoute(app: FastifyInstance): Promise<voi
       // may inspect and stop tenant work, but submitting here would replace the
       // owner's credentials while their queued tasks still read from this row.
       if (!await requireSessionAccess(req, reply, sessionId, true, true)) return reply;
+
+      // A hosted application run has its own admission (tasks/app-run.ts) and
+      // its own Idempotency-Key handling; the session check above is the
+      // ownership gate for it too.
+      if (body.mode === "app") {
+        const out = await createAppRun(req, sessionId, user, body);
+        return reply.status(out.statusCode).send(out.response);
+      }
 
       const target = await resolveCreateTarget(body, user);
       if ("status" in target) return reply.status(target.status).send({ ok: false, error: target.error });
