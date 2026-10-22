@@ -18,8 +18,8 @@ import (
 
 // fakeAuditStore is an in-memory audit.AuditStore for unit tests that only
 // need to observe which events Store was called with -- the L639 gap this
-// package closes is "was Store ever called at all", which the real Redis
-// round trip (pkg/audit's own tests) already covers end to end.
+// package closes is "was Store ever called at all". Production audit is
+// process-log only (audit.LogEvent); this fake is for controller unit tests.
 type fakeAuditStore struct {
 	mu      sync.Mutex
 	events  []*audit.AuditEvent
