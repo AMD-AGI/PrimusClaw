@@ -10,6 +10,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -72,7 +73,7 @@ func (s *Server) e2bAccessGate(c *gin.Context) {
 		c.Abort()
 		return
 	}
-	proxyEnvD(c, info)
+	s.proxyEnvD(c, info, ref)
 	c.Abort()
 }
 
@@ -86,17 +87,45 @@ func (s *Server) proxyE2B(c *gin.Context) {
 	s.proxyToWM(c)
 }
 
-func proxyEnvD(c *gin.Context, info *store.SandboxInfo) {
+func (s *Server) proxyEnvD(c *gin.Context, info *store.SandboxInfo, ref runtimev1alpha1.GrantSandboxRef) {
 	port := info.PodPort
 	if port == 0 {
 		port = 8080
 	}
 	target := &url.URL{Scheme: "http", Host: net.JoinHostPort(info.PodIP, strconv.Itoa(port))}
+	sandboxID := c.GetHeader("E2b-Sandbox-Id")
+	bearer := ""
+	if s.jwt != nil {
+		token, err := s.jwt.GenerateToken(sandboxID)
+		if err != nil {
+			log.Error("JWT: failed to sign token; refusing to proxy", "error", err, "session_id", sandboxID)
+			writeGate(c, http.StatusServiceUnavailable, "sandbox_unavailable", "sandbox authentication unavailable")
+			return
+		}
+		bearer = "Bearer " + token
+	}
 	proxy := &httputil.ReverseProxy{
+		FlushInterval: -1,
 		Director: func(req *http.Request) {
 			req.URL.Scheme = target.Scheme
 			req.URL.Host = target.Host
 			req.Host = target.Host
+			if bearer != "" {
+				req.Header.Set("Authorization", bearer)
+			}
+			if sandboxID != "" {
+				req.Header.Set("x-session-id", sandboxID)
+			}
+			// The client can send these. The grant, not the caller, decides them.
+			if ref.Sealed {
+				req.Header.Set(e2b.HeaderSealed, "true")
+				req.Header.Set(e2b.HeaderInputs, strings.Join(ref.Inputs, ","))
+				req.Header.Set(e2b.HeaderOutputs, strings.Join(ref.Outputs, ","))
+			} else {
+				req.Header.Set(e2b.HeaderSealed, "false")
+				req.Header.Del(e2b.HeaderInputs)
+				req.Header.Del(e2b.HeaderOutputs)
+			}
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Error("envd proxy: upstream error", "podIP", info.PodIP, "port", port, "error", err)

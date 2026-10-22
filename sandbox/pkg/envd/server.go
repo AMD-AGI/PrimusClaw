@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"sigs.k8s.io/agent-sandbox/pkg/envd/e2b"
 	"sigs.k8s.io/agent-sandbox/pkg/envd/egress"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/policy"
@@ -196,6 +197,9 @@ func (s *Server) Handler() http.Handler {
 	// Files
 	mux.HandleFunc("/api/files", s.handleFiles)
 	mux.HandleFunc("/api/files/", s.handleFiles)
+
+	// E2B Connect RPC (process and filesystem) and HTTP /files.
+	e2b.Mount(mux, s.workspace, s.startE2BCommand)
 
 	// GPU
 	mux.HandleFunc("/api/gpu/status", s.handleGPUStatus)

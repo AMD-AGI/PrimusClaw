@@ -26,7 +26,9 @@ import (
 
 func TestE2BGateChecksTokenAndSealedPath(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	var got http.Header
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("from-envd"))
 	}))
@@ -68,7 +70,11 @@ func TestE2BGateChecksTokenAndSealedPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := &Server{store: st, grants: gs}
+	mgr, err := NewJWTManager(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{store: st, grants: gs, jwt: mgr}
 	srv.engine = gin.New()
 	srv.engine.Use(srv.e2bAccessGate)
 	srv.engine.POST("/api/execute", func(c *gin.Context) { c.String(http.StatusTeapot, "local") })
@@ -83,6 +89,15 @@ func TestE2BGateChecksTokenAndSealedPath(t *testing.T) {
 	file := gateRequest(t, front.URL+"/api/files?path=/in/a", token)
 	if file.code != http.StatusOK || file.body != "from-envd" {
 		t.Fatalf("file=%d %s", file.code, file.body)
+	}
+	if got.Get("X-Sandbox-Sealed") != "true" || got.Get("X-Sandbox-Inputs") != "/in" || got.Get("X-Sandbox-Outputs") != "/out" {
+		t.Fatalf("sealed headers: %#v", got)
+	}
+	if !strings.HasPrefix(got.Get("Authorization"), "Bearer ") {
+		t.Fatalf("auth %q", got.Get("Authorization"))
+	}
+	if got.Get("x-session-id") != "sbx-1" {
+		t.Fatalf("session %q", got.Get("x-session-id"))
 	}
 	plain := gateRequest(t, front.URL+"/api/execute", "")
 	if plain.code != http.StatusTeapot {

@@ -299,6 +299,18 @@ func TestSealedAllowsFilesOnly(t *testing.T) {
 	if !SealedAllows(http.MethodPut, "/api/files/out/b", true, []string{"/in"}, []string{"/out"}) {
 		t.Fatal("output write denied")
 	}
+	if SealedAllows(http.MethodPost, "/process.Process/Start", true, nil, nil) {
+		t.Fatal("sealed process rpc")
+	}
+	if !SealedAllows(http.MethodPost, "/filesystem.Filesystem/Stat", true, []string{"/in"}, []string{"/out"}) {
+		t.Fatal("filesystem rpc path is enforced in envd")
+	}
+	if !SealedFileAllows(http.MethodGet, "/in/a", []string{"/in"}, []string{"/out"}) {
+		t.Fatal("read input")
+	}
+	if SealedFileAllows(http.MethodPost, "/in/a", []string{"/in"}, []string{"/out"}) {
+		t.Fatal("write input")
+	}
 	if !SealedAllows(http.MethodPost, "/api/execute", false, nil, nil) {
 		t.Fatal("unsealed denied")
 	}

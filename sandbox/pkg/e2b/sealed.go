@@ -9,9 +9,21 @@ import (
 	"strings"
 )
 
+const (
+	// HeaderSealed is set by the Router on the EnvD request.
+	// EnvD trusts it because the Router overwrites any client value.
+	HeaderSealed = "X-Sandbox-Sealed"
+	// HeaderInputs lists sealed read roots, comma-separated.
+	HeaderInputs = "X-Sandbox-Inputs"
+	// HeaderOutputs lists sealed write roots, comma-separated.
+	HeaderOutputs = "X-Sandbox-Outputs"
+)
+
 // SealedAllows reports whether a sealed sandbox may serve this request.
 // Process and execute paths are refused. File paths must sit under inputs
 // for reads and outputs for writes. An empty allow-list refuses file access.
+// Filesystem Connect RPCs carry the path in the body, so the URL is allowed
+// and EnvD applies SealedFileAllows using the headers above.
 func SealedAllows(method, rawPath string, sealed bool, inputs, outputs []string) bool {
 	if !sealed {
 		return true
@@ -19,6 +31,9 @@ func SealedAllows(method, rawPath string, sealed bool, inputs, outputs []string)
 	path := strings.ToLower(rawPath)
 	if strings.Contains(path, "/execute") || strings.Contains(path, "/process") {
 		return false
+	}
+	if strings.Contains(path, "/filesystem.") {
+		return true
 	}
 	if !strings.Contains(path, "/file") {
 		return true
@@ -56,6 +71,17 @@ func filePathOf(rawPath string) string {
 		return "/"
 	}
 	return rest
+}
+
+// SealedFileAllows reports whether a sealed sandbox may read or write filePath.
+// Reads may use inputs or outputs. Writes may use outputs only.
+func SealedFileAllows(method, filePath string, inputs, outputs []string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead:
+		return pathAllowed(filePath, inputs) || pathAllowed(filePath, outputs)
+	default:
+		return pathAllowed(filePath, outputs)
+	}
 }
 
 func pathAllowed(filePath string, allow []string) bool {

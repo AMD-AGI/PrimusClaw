@@ -26,11 +26,13 @@ func (s *Server) startTrackedCommand(
 	workDir string,
 	env []string,
 	stdout, stderr io.Writer,
+	stdin io.Reader,
 	tracking jobTracking,
 ) (int, <-chan int, <-chan struct{}, func(), error) {
 	cmd := exec.Command(command[0], command[1:]...)
 	cmd.Dir = workDir
 	cmd.Env = env
+	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	stripEnvDProxyGroup(cmd)
