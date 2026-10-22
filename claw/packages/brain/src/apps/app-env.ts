@@ -96,7 +96,9 @@ const START_LOCK = ".start.lock";
  *
  *  - `mkdir` is the lock (atomic). A contender prints `busy` and leaves the
  *    decision to the next tick's probe. A lock whose holder is no longer alive is
- *    taken over.
+ *    taken over. Known limit: two contenders taking over the same dead lock at
+ *    the same instant can both proceed; closing that needs `flock`, which the
+ *    sandbox images are not guaranteed to have.
  *  - Under the lock, a live process of this sandbox, whatever its restart
  *    generation, means `already`: the marker is moved to this generation, so the
  *    probe agrees with reality, and nothing is launched.
