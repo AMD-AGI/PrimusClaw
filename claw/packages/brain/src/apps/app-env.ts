@@ -70,6 +70,17 @@ export function probeCommand(stateDir: string, tag: string): string {
     + `elif kill -0 "$(cat ${d}/${PID_FILE} 2>/dev/null)" 2>/dev/null; then echo alive; else echo dead; fi`;
 }
 
+/**
+ * SIGTERM to the application of this generation (finishing step 1). Guarded by
+ * the same marker as the probe, so a pid left by a gone container is not
+ * signalled: `kill -TERM $(cat app.pid)` would hit whatever holds the number.
+ */
+export function stopCommand(stateDir: string, tag: string): string {
+  const d = shq(stateDir);
+  return `if [ "$(cat ${d}/${MARKER_FILE} 2>/dev/null)" = ${shq(tag)} ]; then `
+    + `kill -TERM "$(cat ${d}/${PID_FILE} 2>/dev/null)" 2>/dev/null; echo sent; else echo none; fi`;
+}
+
 export function parseProbe(stdout: string): ProbeVerdict | null {
   const word = stdout.trim();
   return word === "alive" || word === "dead" || word === "none" ? word : null;

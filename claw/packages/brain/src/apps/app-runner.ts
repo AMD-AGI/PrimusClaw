@@ -30,12 +30,19 @@
  *    the probe runs before every start, and the start command checks again inside
  *    the sandbox ({@link startCommand}).
  *
+ * Ending from outside the machine (hosting design 5.3.2, "any state -> finishing"):
+ * a cancel, a deleted session and a run past `limits.max_runtime_sec` all go to
+ * `finishing`, whose step 1 sends SIGTERM to the application and waits up to
+ * `stop_grace_sec` for it to exit, so an application that writes `final` within
+ * the grace keeps its own result. The wait spans ticks and its start is on the
+ * row (`last_exit.stop_at`), as is every finished step (`last_exit.finish_done`):
+ * a Brain that takes a finishing run over carries on instead of starting over.
+ *
  * Seams for work that is not in this change are the optional members of
- * {@link AppRunnerSeams}: event tailing, MCP registration, and the cancel path
- * (SIGTERM and `stop_grace_sec`), which belongs to the takeover/cancel change.
+ * {@link AppRunnerSeams}: event tailing and MCP registration.
  */
 import pino from "pino";
-import type { AppManifestV1, AppSandboxRole } from "@claw/protocol";
+import { APP_MANIFEST_DEFAULTS, type AppManifestV1, type AppSandboxRole } from "@claw/protocol";
 import type {
   SandboxExecOptions, SandboxExecResult, SandboxInstance, SandboxStatus,
 } from "../sandbox/provider.js";
@@ -47,7 +54,7 @@ import {
 } from "./app-run-store.js";
 import {
   EXIT_ABSENT, INPUT_FILE, buildAppEnv, expandStateDirCommand, generationTag, isUsableStateDir,
-  parseProbe, probeCommand, readExitCommand, scrub, secretValuesOf, startCommand, writeFileCommand,
+  parseProbe, probeCommand, readExitCommand, scrub, secretValuesOf, startCommand, stopCommand, writeFileCommand,
   type ProbeVerdict,
 } from "./app-env.js";
 
@@ -85,7 +92,11 @@ export interface AppGrantEnv {
 
 /**
  * Grant hook points (sandbox-layering #4). `env` runs at `starting`, `revoke`
- * at `finishing` step 3; both default to doing nothing. `issue` is the API's.
+ * at `finishing` step 3; both default to doing nothing. `issue` is the API's, at
+ * run creation: the runner never issues a grant, so a run taken over with its
+ * `grantId` already on the row cannot be given a second one. `revoke` is called
+ * once per run end, and once more only if a Brain dies between the call and the
+ * write that records it, so an implementation must tolerate a repeat.
  */
 export interface AppGrantRunHooks {
   env(run: AppGrantRun): Promise<AppGrantEnv>;
@@ -112,8 +123,6 @@ export interface AppRunnerSeams {
   tailEvents?(ctx: AppRunContext): Promise<void>;
   /** While running: register the application's MCP once it answers (C2-10). */
   registerMcp?(ctx: AppRunContext): Promise<void>;
-  /** Finishing step 1, for a cancel: SIGTERM and `stop_grace_sec` (takeover/cancel change). */
-  stopApplication?(ctx: AppRunContext, cause: AppLastExit["cause"]): Promise<void>;
   /** Finishing step 2: read the events that are left (C2-09). */
   drainEvents?(ctx: AppRunContext): Promise<void>;
   /** Finishing step 4: unregister the session-level MCP (C2-10). */
@@ -147,11 +156,13 @@ export interface AppRunOutcome {
   success: boolean;
   /** Short, free of secrets; goes into the run's failure reason. */
   reason: string;
+  /** For the run's `captures` (5.3.2 finishing step 6): `session_dir` and `stop_reason`. */
+  captures?: Record<string, string>;
 }
 
 /** The application ended the run as failed. Terminal: the run's row already says `ended`. */
 export class AppRunFailedError extends Error {
-  constructor(reason: string) {
+  constructor(reason: string, readonly captures?: Record<string, string>) {
     super(reason);
     this.name = "AppRunFailedError";
   }
@@ -174,14 +185,31 @@ type ExitRead =
 const clip = (s: string): string => (s.length > TEXT_MAX ? `${s.slice(0, TEXT_MAX)}...` : s);
 
 /** Succeeded means `exit.json` said `final` with return code 0, and nothing less. */
-export function outcomeOf(exit: AppLastExit | null): AppRunOutcome {
-  if (exit?.final === true && exit.returncode === 0) return { success: true, reason: "app finished" };
-  if (!exit) return { success: false, reason: "app run ended without an exit record" };
+export function outcomeOf(exit: AppLastExit | null, stateDir: string | null = null): AppRunOutcome {
+  const captures: Record<string, string> = {};
+  if (stateDir) captures.session_dir = stateDir;
+  const stop = exit?.stop_reason ?? (exit && exit.cause !== "exit" ? exit.cause : undefined);
+  if (stop) captures.stop_reason = clip(stop);
+  const withCaptures = Object.keys(captures).length > 0 ? { captures } : {};
+  if (exit?.final === true && exit.returncode === 0) return { success: true, reason: "app finished", ...withCaptures };
+  if (!exit) return { success: false, reason: "app run ended without an exit record", ...withCaptures };
   const detail = exit.cause === "exit"
     ? `app exited final with return code ${exit.returncode ?? "unknown"}`
     : `app run ended: ${exit.cause.replace(/_/g, " ")}`;
-  return { success: false, reason: exit.stop_reason ? `${detail} (${clip(exit.stop_reason)})` : detail };
+  return {
+    success: false,
+    reason: exit.stop_reason ? `${detail} (${clip(exit.stop_reason)})` : detail,
+    ...withCaptures,
+  };
 }
+
+/** The runner was told to let go of the run (lease released, drain): it must not write or start anything more. */
+class RunnerHalted extends Error {
+  constructor() { super("app runner halted"); this.name = "RunnerHalted"; }
+}
+
+/** What a finishing step returns to say "not yet": the step is retried on the next tick. */
+const STEP_PENDING = Symbol("step_pending");
 
 /** Seconds to wait before restart number `restarts` (1-based): backoff_sec[min(n - 1, length - 1)]. */
 export function backoffMs(manifest: AppManifestV1, restarts: number): number {
@@ -199,6 +227,8 @@ export class AppRunner {
   private unparseableExits = 0;
   private readonly finishAttempts = new Map<string, number>();
   private readonly finishDone = new Set<string>();
+  /** Set when the signal given to `run` fires; cleared by `finishNow`, which ends the run on purpose. */
+  private halted = false;
   private secrets: string[] = [];
   private readonly grant: AppGrantRunHooks;
   private readonly seams: AppRunnerSeams;
@@ -220,20 +250,34 @@ export class AppRunner {
 
   // ---- driving ------------------------------------------------------------
 
-  /** Reconcile until the run ends, the signal fires, or another worker takes the run. */
+  /**
+   * Reconcile until the run ends, the signal fires, or another worker takes the
+   * run. When the signal fires (the lease is being released, the Brain is
+   * draining) the runner stops for good: a tick still in flight may finish the
+   * call it is in, but it writes nothing to the row and starts nothing, so the
+   * Brain that takes the run over is the only one moving it.
+   */
   async run(signal: AbortSignal): Promise<AppRunResult> {
-    while (!signal.aborted) {
-      try {
-        const tick = await abortable(this.reconcile(), signal);
-        if (tick === ABORTED) break;
-        if (tick.done) return { kind: "ended", outcome: tick.outcome };
-      } catch (err) {
-        if (err instanceof AppRunWriteRefused && err.superseded) return { kind: "superseded" };
-        this.warnTickFailure(err);
+    this.halted = signal.aborted;
+    const halt = (): void => { this.halted = true; };
+    signal.addEventListener("abort", halt, { once: true });
+    try {
+      while (!signal.aborted) {
+        try {
+          const tick = await abortable(this.reconcile(), signal);
+          if (tick === ABORTED) break;
+          if (tick.done) return { kind: "ended", outcome: tick.outcome };
+        } catch (err) {
+          if (err instanceof RunnerHalted) break;
+          if (err instanceof AppRunWriteRefused && err.superseded) return { kind: "superseded" };
+          this.warnTickFailure(err);
+        }
+        await this.sleep(this.tickMs, signal);
       }
-      await this.sleep(this.tickMs, signal);
+      return { kind: "aborted" };
+    } finally {
+      signal.removeEventListener("abort", halt);
     }
-    return { kind: "aborted" };
   }
 
   /**
@@ -250,13 +294,17 @@ export class AppRunner {
   /**
    * End the run now, from outside the machine: a cancel, the deadline, or a run
    * row that went terminal. Moves the row to `finishing` and drives the finishing
-   * steps to `ended`. The SIGTERM-and-grace stop of a cancel is the
-   * `stopApplication` seam.
+   * steps to `ended`, which for a cancel includes SIGTERM and the
+   * `stop_grace_sec` wait (the ticks here are what poll it).
+   *
+   * Throws {@link AppRunWriteRefused} when another worker holds the run: this
+   * one must not go on finishing what it no longer owns.
    */
   async finishNow(cause: "cancelled" | "deadline" | "row_terminal"): Promise<AppRunOutcome> {
     // A tick the caller stopped waiting for may still be running; it finishes
     // first, or its write could land on top of the one below.
     await this.inflight?.catch(() => undefined);
+    this.halted = false;
     this.rec = await this.deps.store.load(this.runId);
     if (this.rec.state !== "finishing" && this.rec.state !== "ended") {
       this.rec = await this.deps.store.patch(
@@ -269,6 +317,7 @@ export class AppRunner {
         if (tick.done) return tick.outcome;
         failures = 0;
       } catch (err) {
+        if (err instanceof AppRunWriteRefused && err.superseded) throw err;
         if (++failures >= FINISH_NOW_MAX_FAILURES) throw err;
         this.warnTickFailure(err);
       }
@@ -279,15 +328,31 @@ export class AppRunner {
   // ---- the machine --------------------------------------------------------
 
   private async tick(): Promise<TickResult> {
+    if (this.halted) throw new RunnerHalted();
     this.rec = await this.deps.store.load(this.runId);
+    if (this.pastDeadline()) {
+      // Any state but the last two: the same road a cancel takes, so the
+      // application gets its SIGTERM and its grace, and the grant is revoked.
+      await this.move({ state: "finishing", last_exit: { at: this.iso(), cause: "deadline", final: false } }, this.rec.state);
+      return { done: false };
+    }
     switch (this.rec.state) {
       case "provisioning": return this.inProvisioning();
       case "starting": return this.inStarting();
       case "running": return this.inRunning();
       case "restarting": return this.inRestarting();
       case "finishing": return this.inFinishing();
-      case "ended": return { done: true, outcome: outcomeOf(this.rec.last_exit) };
+      case "ended": return { done: true, outcome: outcomeOf(this.rec.last_exit, this.rec.state_dir) };
     }
+  }
+
+  /** `limits.max_runtime_sec` counts from the run's creation, so a takeover keeps the same deadline. */
+  private pastDeadline(): boolean {
+    if (this.rec.state === "finishing" || this.rec.state === "ended") return false;
+    const max = this.rec.manifest.limits?.max_runtime_sec;
+    if (typeof max !== "number" || !(max > 0)) return false;
+    const created = Date.parse(this.rec.created_at);
+    return Number.isFinite(created) && this.now() >= created + max * 1000;
   }
 
   private async inProvisioning(): Promise<TickResult> {
@@ -395,9 +460,12 @@ export class AppRunner {
     }
 
     try {
+      this.assertActive();
       await this.writeFiles(inst, stateDir);
+      this.assertActive();
       await this.startApplication(inst, stateDir);
     } catch (err) {
+      if (err instanceof RunnerHalted) throw err;
       return this.onStartFailure(err);
     }
     this.startFailures = 0;
@@ -408,6 +476,7 @@ export class AppRunner {
   /** `input.json`, the bootstrap file, and (in the start command) the events directory. */
   private async writeFiles(inst: SandboxInstance, stateDir: string): Promise<void> {
     const put = async (rel: string, content: Buffer, mode: string): Promise<void> => {
+      this.assertActive();
       const r = await this.deps.sandbox.exec(
         inst, writeFileCommand(`${stateDir}/${rel}`, mode), EXEC_TIMEOUT,
         { untracked: true, env: { CLAW_FILE_B64: content.toString("base64") } },
@@ -585,7 +654,11 @@ export class AppRunner {
 
   // ---- finishing ----------------------------------------------------------
 
-  /** The finishing steps, in the design's order. Each is retried a few ticks and then given up. */
+  /**
+   * The finishing steps, in the design's order. Each is retried a few ticks and
+   * then given up, and each that is done is written to the row, so a Brain that
+   * takes a finishing run over starts at the step the last one stopped at.
+   */
   private async inFinishing(): Promise<TickResult> {
     const rec = this.rec;
     const inst = this.instance();
@@ -594,15 +667,87 @@ export class AppRunner {
     const cause = rec.last_exit?.cause ?? "exit";
     const cancelled = cause === "cancelled" || cause === "deadline" || cause === "row_terminal";
 
-    if (cancelled) await this.step("stop_application", () => this.seams.stopApplication?.(ctx, cause));
+    if (cancelled && !(await this.step("stop_application", () => this.stopApplication(inst)))) return { done: false };
     await this.step("drain_events", () => this.seams.drainEvents?.(ctx));
     await this.step("revoke_grant", () => this.grant.revoke(run));
     await this.step("unregister_mcp", () => this.seams.unregisterMcp?.(ctx));
     await this.step("stop_sandbox", () => this.stopSandboxes(inst));
 
     await this.move({ state: "ended" });
-    logger.info({ runId: this.runId, cause, restarts: rec.restarts }, "app_run.ended");
-    return { done: true, outcome: outcomeOf(rec.last_exit) };
+    logger.info({ runId: this.runId, cause, restarts: this.rec.restarts }, "app_run.ended");
+    return { done: true, outcome: outcomeOf(this.rec.last_exit, this.rec.state_dir) };
+  }
+
+  /**
+   * Finishing step 1: SIGTERM, then up to `stop_grace_sec` for the application
+   * to exit, which it may use to write `exit.json` with `final: true` (that
+   * result is kept). The wait is polled, one look per tick, so it never holds
+   * a tick open. After the grace, or once the process is gone, the run goes on
+   * and step 5 stops the sandbox. Returns {@link STEP_PENDING} while waiting.
+   */
+  private async stopApplication(inst: SandboxInstance | null): Promise<typeof STEP_PENDING | undefined> {
+    const stateDir = this.rec.state_dir;
+    // Never got as far as a sandbox and a state directory: nothing to signal.
+    if (!inst || !stateDir) return undefined;
+    const graceMs = (this.rec.manifest.stop_grace_sec ?? APP_MANIFEST_DEFAULTS.stop_grace_sec) * 1000;
+    const sentAt = Date.parse(this.rec.last_exit?.stop_at ?? "");
+    const signalled = Number.isFinite(sentAt);
+
+    let status: SandboxStatus | null = null;
+    try { status = await this.deps.sandbox.status(inst); } catch { /* cannot tell: look at the process */ }
+    const sandboxGone = status !== null && (status.state === "terminal" || status.state === "absent");
+
+    let verdict: ProbeVerdict | "unknown" = "none";
+    if (!sandboxGone) {
+      verdict = await this.probe(inst, stateDir);
+      if (!signalled) {
+        if (verdict === "unknown") throw new Error("could not tell whether the application is running");
+        if (verdict === "alive") {
+          this.assertActive();
+          await this.sendTerm(inst, stateDir);
+          const last = this.rec.last_exit ?? { at: this.iso(), cause: "cancelled" as const, final: false };
+          await this.move({ last_exit: { ...last, stop_at: this.iso() } });
+          logger.info({ runId: this.runId, graceSec: graceMs / 1000 }, "app_run.sigterm_sent");
+          return STEP_PENDING;
+        }
+      } else if (verdict !== "dead" && verdict !== "none" && this.now() < sentAt + graceMs) {
+        return STEP_PENDING;
+      }
+    }
+    // The process exited, never ran, or the grace is over: an application that
+    // wrote `final` keeps its own return code and stop reason.
+    return this.adoptFinalExit(inst, stateDir, sandboxGone);
+  }
+
+  private async sendTerm(inst: SandboxInstance, stateDir: string): Promise<void> {
+    const r = await this.deps.sandbox.exec(inst, stopCommand(stateDir, this.tag()), EXEC_TIMEOUT, { untracked: true });
+    if (r.exitCode !== 0) throw new Error(`SIGTERM command failed (exit ${r.exitCode})`);
+  }
+
+  /**
+   * Take the application's own `final` result as the run's, over the cancel's.
+   * A sandbox that is gone can still leave one: the state directory is shared.
+   */
+  private async adoptFinalExit(inst: SandboxInstance, stateDir: string, sandboxGone: boolean): Promise<undefined> {
+    if (sandboxGone) return undefined;
+    const exit = await this.readExit(inst, stateDir);
+    if (exit.kind === "unreadable") throw new Error("exit.json could not be read");
+    if (exit.kind !== "exit" || !exit.final) return undefined;
+    const done = this.rec.last_exit?.finish_done;
+    await this.move({ last_exit: { ...this.exitRecord(exit, "exit"), ...(done ? { finish_done: done } : {}) } });
+    return undefined;
+  }
+
+  private doneSteps(): Set<string> {
+    return new Set([...(this.rec.last_exit?.finish_done ?? []), ...this.finishDone]);
+  }
+
+  /** Record finished steps on the row; a no-op when the row already has them all. */
+  private async persistDone(): Promise<void> {
+    const have = new Set(this.rec.last_exit?.finish_done ?? []);
+    if ([...this.finishDone].every((n) => have.has(n))) return;
+    const last = this.rec.last_exit ?? { at: this.iso(), cause: "exit" as const, final: false };
+    await this.move({ last_exit: { ...last, finish_done: [...this.doneSteps()] } });
   }
 
   /**
@@ -625,12 +770,16 @@ export class AppRunner {
     if (failures.length > 0) throw failures[0];
   }
 
-  private async step(name: string, fn: () => Promise<unknown> | undefined): Promise<void> {
-    if (this.finishDone.has(name)) return;
+  /** Run a finishing step once; false while it asks to be retried on the next tick. */
+  private async step(name: string, fn: () => Promise<unknown> | undefined): Promise<boolean> {
+    await this.persistDone();
+    if (this.doneSteps().has(name)) return true;
+    this.assertActive();
     try {
-      await fn();
+      if ((await fn()) === STEP_PENDING) return false;
       this.finishDone.add(name);
     } catch (err) {
+      if (err instanceof RunnerHalted || (err instanceof AppRunWriteRefused)) throw err;
       const attempts = (this.finishAttempts.get(name) ?? 0) + 1;
       this.finishAttempts.set(name, attempts);
       logger.warn({ runId: this.runId, step: name, attempt: attempts, err: this.safeText(err) }, "app_run.finish_step_failed");
@@ -638,12 +787,15 @@ export class AppRunner {
       logger.error({ runId: this.runId, step: name }, "app_run.finish_step_abandoned");
       this.finishDone.add(name);
     }
+    await this.persistDone();
+    return true;
   }
 
   // ---- row writes and small helpers ---------------------------------------
 
   /** Persist a transition, compare-and-set on `from` when given. */
   private async move(patch: AppRunPatch, from?: AppRunState): Promise<void> {
+    this.assertActive();
     this.rec = await this.deps.store.patch(this.runId, patch, from);
     logger.info(
       { runId: this.runId, state: this.rec.state, restarts: this.rec.restarts, cause: patch.last_exit?.cause },
@@ -657,6 +809,10 @@ export class AppRunner {
       ...(exit.stop_reason ? { stop_reason: clip(this.scrubbed(exit.stop_reason)) } : {}),
       ...(exit.error ? { error: clip(this.scrubbed(exit.error)) } : {}),
     };
+  }
+
+  private assertActive(): void {
+    if (this.halted) throw new RunnerHalted();
   }
 
   private tag(): string {

@@ -69,7 +69,7 @@ import {
   destroyHands, parkForIdleReclaim, readSessionPlatformKey, releaseLocalHandsState,
   startMultiNodeSweeper, startSandboxSweeper,
 } from "./sandbox/reaper.js";
-import { activeAbort, resolveAbortTargets, SIGTERM_ABORT_REASON } from "./tasks/abort-registry.js";
+import { activeAbort, gracefulStop, resolveAbortTargets, SIGTERM_ABORT_REASON } from "./tasks/abort-registry.js";
 import { markSessionDeleted } from "./infra/deleted-sessions.js";
 import {
   releaseTaskLock, bindTaskLockKv, lockContentionNakMs, lockExpiresBetweenRenewals,
@@ -647,6 +647,7 @@ function installInterruptSubscriber(): void {
         // The SDK may not propagate abort through an in-flight tool RPC.
         setTimeout(() => {
           if (activeAbort.get(lockKey) !== ctrl) return;
+          if (gracefulStop.has(ctrl)) return;
           logger.error({ address, lockKey }, "task.interrupt_force_release");
           activeAbort.delete(lockKey);
           releaseTaskLock(lockKey).catch(() => {});

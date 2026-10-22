@@ -40,6 +40,13 @@ export const activeAbort = new Map<string, AbortController>();
  * but that is a consequence of one workspace per session rather than a rule,
  * and "stop this session" means all of them either way.
  */
+/**
+ * Runs that were told to stop and are winding down on purpose, for longer than
+ * the interrupt handler's force-release timeout: an app run's SIGTERM grace
+ * (`stop_grace_sec`, minutes). Not stuck, so not released by force.
+ */
+export const gracefulStop = new WeakSet<AbortController>();
+
 const lockKeysByAddress = new Map<string, Set<string>>();
 const addressesByLockKey = new Map<string, string[]>();
 

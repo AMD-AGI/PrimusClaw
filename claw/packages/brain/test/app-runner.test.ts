@@ -127,7 +127,7 @@ test("T5 running -> finishing -> ended when exit.json is final with return code 
   assert.equal(h.world.rec.state, "finishing");
   assert.equal(h.world.rec.restarts, 0);
   const r = await h.runner.reconcile();
-  assert.deepEqual(r, { done: true, outcome: { success: true, reason: "app finished" } });
+  assert.deepEqual(r, { done: true, outcome: { success: true, reason: "app finished", captures: { session_dir: STATE_DIR, stop_reason: "target reached" } } });
   assert.equal(h.world.rec.state, "ended");
   assert.equal(h.world.starts.length, 1);
   assert.deepEqual(h.world.stopped, [wl]);
@@ -292,7 +292,7 @@ test("T14b a final exit hidden by a lost sandbox is found even with the budget s
   await until(h, "finishing");
   assert.equal(h.world.rec.last_exit?.final, true);
   const r = await h.runner.reconcile();
-  assert.deepEqual(r, { done: true, outcome: { success: true, reason: "app finished" } });
+  assert.deepEqual(r, { done: true, outcome: { success: true, reason: "app finished", captures: { session_dir: STATE_DIR } } });
   assert.equal(h.world.starts.length, 1, "FINAL is not run again");
   assert.equal(h.world.rec.restarts, 0);
 });
@@ -610,7 +610,7 @@ test("R1 run() drives the whole life to ended and reports the outcome", async ()
     },
   });
   const result = await runner.run(ctrl.signal);
-  assert.deepEqual(result, { kind: "ended", outcome: { success: true, reason: "app finished" } });
+  assert.deepEqual(result, { kind: "ended", outcome: { success: true, reason: "app finished", captures: { session_dir: STATE_DIR } } });
   assert.equal(h.world.rec.state, "ended");
 });
 
@@ -631,16 +631,15 @@ test("R3 run() reports a lost lease: the API refuses the write because another w
   assert.deepEqual(result, { kind: "superseded" });
 });
 
-test("R4 finishNow(cancelled) finishes a running run: stop-application seam, revoke, stop sandbox", async () => {
+test("R4 finishNow(cancelled) finishes a running run: SIGTERM, revoke, stop sandbox", async () => {
   const order: string[] = [];
-  const seams: AppRunnerSeams = { stopApplication: async (_c, cause) => { order.push(`stop-app:${cause}`); } };
   const grant: AppGrantRunHooks = { env: async () => ({}), revoke: async () => { order.push("revoke"); } };
-  const h = harness({ seams, grant });
+  const h = harness({ grant });
   const wl = await toRunning(h);
   const outcome = await h.runner.finishNow("cancelled");
   assert.equal(outcome.success, false);
   assert.match(outcome.reason, /cancelled/);
-  assert.deepEqual(order, ["stop-app:cancelled", "revoke"]);
+  assert.deepEqual(order, ["revoke"]);
   assert.deepEqual(h.world.stopped, [wl]);
   assert.equal(h.world.rec.state, "ended");
 });
