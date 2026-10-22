@@ -6,9 +6,11 @@
 #
 # One command. It does not call install.sh.
 #
-#   1. Once: apply the SandboxPolicy CRD and copy Redis session:* policies.
-#      A ConfigMap records that this finished. Later runs skip it, including
-#      after Redis has been removed.
+#   1. Once: stop the sandbox control plane, apply the SandboxPolicy CRD, and
+#      copy Redis session:* policies. A ConfigMap records that this finished.
+#      Later runs skip it, including after Redis has been removed. The
+#      following helm upgrade restores the control-plane replica count from
+#      the release values.
 #   2. helm upgrade the sandbox chart with the control-plane image and the
 #      envd injector image. The chart no longer ships Redis, so this upgrade
 #      deletes the Redis objects that belonged to the release.
@@ -136,6 +138,28 @@ require_release() {
         || die "Helm release ${release} not found in ${namespace}"
 }
 
+# --reset-then-reuse-values exists from Helm 3.14.
+require_helm() {
+    command -v helm >/dev/null 2>&1 || die "helm not found"
+    local raw major minor
+    raw="$(helm version --template '{{.Version}}' 2>/dev/null || true)"
+    raw="${raw#v}"
+    raw="${raw%%+*}"
+    raw="${raw%%-*}"
+    IFS=. read -r major minor _ <<<"${raw}"
+    if [[ -z "${major}" || -z "${minor}" ]] || (( major < 3 || (major == 3 && minor < 14) )); then
+        die "helm ${raw:-unknown} is too old; --reset-then-reuse-values needs Helm 3.14 or newer"
+    fi
+}
+
+# Stop writers before the Redis copy. This changes the live replica count
+# only; Helm values are unchanged, and the upgrade restores them.
+pause_sandbox_controlplane() {
+    log "scaling agent-sandbox-controlplane to 0"
+    kubectl -n "${SANDBOX_NAMESPACE}" scale deployment/agent-sandbox-controlplane --replicas=0
+    kubectl -n "${SANDBOX_NAMESPACE}" rollout status deployment/agent-sandbox-controlplane --timeout=3m
+}
+
 migration_done() {
     kubectl -n "${SANDBOX_NAMESPACE}" get configmap "${MIGRATION_CONFIGMAP}" >/dev/null 2>&1
 }
@@ -197,7 +221,7 @@ main() {
     [[ -n "${CLAW_IMAGE}" && -n "${SANDBOX_IMAGE}" && -n "${ENVD_IMAGE}" ]] \
         || die "required: --claw-image, --sandbox-image, --envd-image"
     command -v kubectl >/dev/null 2>&1 || die "kubectl not found"
-    command -v helm >/dev/null 2>&1 || die "helm not found"
+    require_helm
     command -v python3 >/dev/null 2>&1 || die "python3 not found"
     [[ -x "${MIGRATE}" ]] || die "missing ${MIGRATE}"
     [[ -d "${SANDBOX_CHART}" && -d "${CLAW_CHART}" ]] || die "helm charts not found"
@@ -212,8 +236,9 @@ main() {
     if migration_done; then
         log "SandboxPolicy migration already recorded; skipping Redis"
     elif [[ "${DRY_RUN}" == "true" ]]; then
-        log "dry-run: would migrate Redis session policies once, then upgrade images"
+        log "dry-run: would scale agent-sandbox-controlplane to 0, migrate Redis session policies once, then upgrade images"
     else
+        pause_sandbox_controlplane
         log "migrating SandboxPolicy from Redis (once)"
         NAMESPACE="${SANDBOX_NAMESPACE}" bash "${MIGRATE}"
         mark_migration_done
@@ -224,4 +249,6 @@ main() {
     log "upgrade finished"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

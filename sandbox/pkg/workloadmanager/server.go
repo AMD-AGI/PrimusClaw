@@ -21,6 +21,7 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 
@@ -1036,7 +1037,12 @@ func (s *Server) handleDeleteSandbox(c *gin.Context) {
 
 	info, err := s.store.GetSandboxBySessionID(c.Request.Context(), sessionID)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "session not found: " + err.Error()})
+		if errors.Is(err, store.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "session not found: " + err.Error()})
+			return
+		}
+		log.Warn("delete session lookup failed", "sessionId", sessionID, "error", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "failed to query session"})
 		return
 	}
 	if !s.admitSession(c, info) {
@@ -1672,9 +1678,13 @@ func (s *Server) handleInternalPolicy(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "sandbox not found"})
 			return
 		}
-		loaded, _, err := s.k8s.GetSandboxPolicy(c.Request.Context(), namespace, name)
+		loaded, found, err := s.k8s.GetSandboxPolicy(c.Request.Context(), namespace, name)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query policy"})
+			return
+		}
+		if !found {
+			c.JSON(http.StatusNotFound, gin.H{"error": "sandbox policy not found"})
 			return
 		}
 		pol = loaded
@@ -1845,6 +1855,10 @@ func (s *Server) handleUpdatePolicy(c *gin.Context) {
 		}
 		pol, err = s.k8s.PatchSandboxPolicy(c.Request.Context(), namespace, name, applyReq)
 		if err != nil {
+			if apierrors.IsNotFound(err) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "sandbox policy not found"})
+				return
+			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update policy: " + err.Error()})
 			return
 		}

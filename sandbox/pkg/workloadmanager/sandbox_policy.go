@@ -188,22 +188,6 @@ func (c *K8sSandboxCreator) PatchSandboxPolicy(
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		obj := &runtimev1alpha1.SandboxPolicy{}
 		if err := c.client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, obj); err != nil {
-			if k8serrors.IsNotFound(err) {
-				// Create from the Sandbox so EnvD has an authoritative object.
-				sb, sbErr := c.getSandboxLive(ctx, namespace, name)
-				if sbErr != nil {
-					return empty, sbErr
-				}
-				pol := defaultSandboxPolicy()
-				if err := mutate(&pol); err != nil {
-					return empty, err
-				}
-				pol.PolicyVersion++
-				if err := c.UpsertSandboxPolicy(ctx, sb, pol); err != nil {
-					return empty, err
-				}
-				return pol, nil
-			}
 			return empty, err
 		}
 		pol := policyFromSpec(obj.Spec)

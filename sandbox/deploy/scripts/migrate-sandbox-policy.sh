@@ -8,9 +8,8 @@
 # the SandboxPolicy CRD, then copies Redis session:* policies. Redis still holds
 # those keys during the upgrade; the sandbox chart upgrade removes Redis.
 # policyVersion is copied and not incremented. An existing SandboxPolicy is left
-# unchanged. The reconciler creates agent-default only when a SandboxPolicy is
-# absent. A running EnvD ignores the copied version until the sandbox pod
-# restarts, then loads this object instead of the default policy.
+# unchanged. A running EnvD ignores the copied version until the sandbox pod
+# restarts, then loads this object.
 #
 # Usage:
 #   ./migrate-sandbox-policy.sh
@@ -210,10 +209,24 @@ PY
     log "using redis-cli in pod ${NAMESPACE}/${REDIS_POD} db=${REDIS_DB}"
 }
 
+# sandbox_uid prints the Sandbox uid.
+# Return 2 when the Sandbox does not exist, 3 when it is deleting, 1 on any
+# other kubectl failure.
 sandbox_uid() {
-    local namespace="$1" name="$2" line uid deleting
+    local namespace="$1" name="$2" line uid deleting errf rc=0
+    errf="$(mktemp)"
     line="$(kubectl -n "${namespace}" get sandbox.agents.x-k8s.io "${name}" \
-        -o jsonpath='{.metadata.uid}|{.metadata.deletionTimestamp}' 2>/dev/null || true)"
+        -o jsonpath='{.metadata.uid}|{.metadata.deletionTimestamp}' 2>"${errf}")" || rc=$?
+    if [[ "${rc}" -ne 0 ]]; then
+        if grep -q 'NotFound' "${errf}"; then
+            rm -f "${errf}"
+            return 2
+        fi
+        warn "kubectl get sandbox ${namespace}/${name} failed: $(tr '\n' ' ' <"${errf}")"
+        rm -f "${errf}"
+        return 1
+    fi
+    rm -f "${errf}"
     uid="${line%%|*}"
     deleting="${line#*|}"
     if [[ -z "${uid}" ]]; then
@@ -309,6 +322,15 @@ ensure_crd() {
     ok "SandboxPolicy CRD applied"
 }
 
+# copy_session_keys writes one Redis session key per line.
+# A failed scan fails the migration; a partial key list is not success.
+copy_session_keys() {
+    local dest="$1"
+    if ! redis_cli --scan --pattern 'session:*' >"${dest}"; then
+        err "Redis SCAN failed"
+    fi
+}
+
 main() {
     command -v python3 >/dev/null 2>&1 || err "python3 not found"
     command -v kubectl >/dev/null 2>&1 || err "kubectl not found"
@@ -316,12 +338,15 @@ main() {
     resolve_redis
     redis_cli PING >/dev/null || err "Redis did not answer PING"
 
-    local key
+    local key keys
+    keys="$(mktemp)"
+    copy_session_keys "${keys}"
     while IFS= read -r key; do
         [[ -n "${key}" ]] || continue
         [[ "${key}" == session:* ]] || continue
         migrate_one "${key}"
-    done < <(redis_cli --scan --pattern 'session:*')
+    done <"${keys}"
+    rm -f "${keys}"
 
     log "created=${CREATED} already_present=${SKIPPED_EXISTS} sandbox_gone=${SKIPPED_NO_SANDBOX} invalid=${SKIPPED_INVALID} failed=${FAILED}"
     if [[ "${FAILED}" -ne 0 ]]; then

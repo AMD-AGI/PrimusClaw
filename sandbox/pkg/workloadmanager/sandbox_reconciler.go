@@ -194,6 +194,18 @@ func (r *SandboxReconciler) ensureSessionRegistered(ctx context.Context, sandbox
 		}
 	}
 
+	// A Sandbox that already has a session id was created through the API or
+	// copied by migration. Leave a missing SandboxPolicy missing so a copied
+	// policy can still be written. A Sandbox with no session id is
+	// kubectl-applied and gets the default policy. Create that policy before
+	// the session-id patch: a failed create then retries while the annotation
+	// is still empty.
+	if !ownedByClaim && sessionID == "" {
+		if err := r.ensureDefaultSandboxPolicy(ctx, sandbox); err != nil {
+			return err
+		}
+	}
+
 	needsPatch := false
 	if sessionID == "" {
 		sessionID = canonicalID
@@ -227,14 +239,6 @@ func (r *SandboxReconciler) ensureSessionRegistered(ctx context.Context, sandbox
 		}
 		log.V(2).Infof("SandboxReconciler: patched defaults onto %s/%s (session=%s, shutdown=%v)",
 			sandbox.Namespace, sandbox.Name, sessionID, defaultShutdown)
-	}
-
-	// Claim path writes SandboxPolicy at claim time. kubectl-applied sandboxes
-	// get a default policy CR here.
-	if !ownedByClaim {
-		if err := r.ensureDefaultSandboxPolicy(ctx, sandbox); err != nil {
-			return err
-		}
 	}
 
 	// Optional MemoryStore mirror for tests / local-dev without a CR reader.

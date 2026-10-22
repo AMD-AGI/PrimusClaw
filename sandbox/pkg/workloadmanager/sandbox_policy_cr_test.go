@@ -5,8 +5,12 @@ package workloadmanager
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/gin-gonic/gin"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -61,5 +65,56 @@ func TestSandboxPolicyCRIsAuthoritativeOverAnnotations(t *testing.T) {
 	}
 	if pol.PolicyVersion != 3 {
 		t.Fatalf("PolicyVersion=%d, want 3", pol.PolicyVersion)
+	}
+}
+
+func TestPatchSandboxPolicyMissingCRDoesNotCreateDefault(t *testing.T) {
+	t.Parallel()
+	scheme := runtime.NewScheme()
+	utilruntime.Must(sandboxv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(runtimev1alpha1.AddToScheme(scheme))
+	sb := &sandboxv1alpha1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "sb-1", Namespace: "ns"},
+	}
+	c := &K8sSandboxCreator{
+		client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(sb).Build(),
+	}
+
+	_, err := c.PatchSandboxPolicy(context.Background(), "ns", "sb-1", func(p *sandboxPolicy) error {
+		p.PolicyMode = "audit"
+		return nil
+	})
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("missing policy: got %v, want NotFound", err)
+	}
+	var list runtimev1alpha1.SandboxPolicyList
+	if err := c.client.List(context.Background(), &list); err != nil {
+		t.Fatalf("list policies: %v", err)
+	}
+	if len(list.Items) != 0 {
+		t.Fatalf("missing policy was created: %+v", list.Items)
+	}
+}
+
+func TestInternalPolicyMissingCRIsNotFound(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+	scheme := runtime.NewScheme()
+	utilruntime.Must(sandboxv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(runtimev1alpha1.AddToScheme(scheme))
+	sb := &sandboxv1alpha1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "sb-1", Namespace: "ns"},
+	}
+	s := &Server{k8s: &K8sSandboxCreator{
+		client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(sb).Build(),
+	}}
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/internal/policy/ns/sb-1", nil)
+	c.Params = gin.Params{{Key: "namespace", Value: "ns"}, {Key: "name", Value: "sb-1"}}
+
+	s.handleInternalPolicy(c)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("missing policy: got %d %s, want 404", rec.Code, rec.Body)
 	}
 }

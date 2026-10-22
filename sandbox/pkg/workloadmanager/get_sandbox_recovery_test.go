@@ -12,6 +12,7 @@ package workloadmanager
 import (
 	"context"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 
@@ -81,6 +82,38 @@ func getSandboxAs(t *testing.T, s *Server, userID, role string) *httptest.Respon
 	}
 	s.handleGetSandbox(c)
 	return rec
+}
+
+func deleteSandboxAs(t *testing.T, s *Server) *httptest.ResponseRecorder {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodDelete, "/v1/code-interpreter/sessions/default/sandbox-under-test", nil)
+	c.Params = gin.Params{
+		{Key: "namespace", Value: "default"},
+		{Key: "name", Value: "sandbox-under-test"},
+	}
+	s.handleDeleteSandbox(c)
+	return rec
+}
+
+func TestDeleteSandboxDoesNotTreatLookupFailureAsGone(t *testing.T) {
+	t.Parallel()
+	s := &Server{store: &recoveryTestStore{Store: store.NewMemoryStore(), getErr: errors.New("apiserver timeout")}}
+	rec := deleteSandboxAs(t, s)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("lookup failure: got %d %s, want 503", rec.Code, rec.Body)
+	}
+}
+
+func TestDeleteSandboxNotFoundIs404(t *testing.T) {
+	t.Parallel()
+	s := &Server{store: &recoveryTestStore{Store: store.NewMemoryStore(), getErr: store.ErrNotFound}}
+	rec := deleteSandboxAs(t, s)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("missing session: got %d %s, want 404", rec.Code, rec.Body)
+	}
 }
 
 // TestGetSandboxDoesNotRebuildOnAnUnreadableStore is the one that matters: a

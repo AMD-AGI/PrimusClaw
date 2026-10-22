@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -314,5 +315,37 @@ func TestReconcileReturnsSessionRegistrationError(t *testing.T) {
 	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: delTestKey()})
 	if err == nil {
 		t.Fatal("a failed session-defaults patch must be returned so the reconcile is retried")
+	}
+}
+
+func TestReconcileLeavesExistingSessionWithoutADefaultPolicy(t *testing.T) {
+	r := deleteTestReconciler(t, store.NewMemoryStore(), runningSandbox("sess_pre_upgrade"))
+	reconcileDelTest(t, r)
+
+	err := r.Get(context.Background(), delTestKey(), &runtimev1alpha1.SandboxPolicy{})
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("a sandbox that already has a session id must not gain an agent-default policy, got %v", err)
+	}
+}
+
+func TestReconcileCreatesDefaultPolicyForUnidentifiedSandbox(t *testing.T) {
+	sb := runningSandbox("")
+	sb.Annotations = nil
+	r := deleteTestReconciler(t, nil, sb)
+	reconcileDelTest(t, r)
+
+	var pol runtimev1alpha1.SandboxPolicy
+	if err := r.Get(context.Background(), delTestKey(), &pol); err != nil {
+		t.Fatalf("kubectl-applied sandbox should receive a default policy: %v", err)
+	}
+	if pol.Spec.RuntimePolicy != "agent-default" {
+		t.Fatalf("RuntimePolicy=%q, want agent-default", pol.Spec.RuntimePolicy)
+	}
+	var got sandboxv1alpha1.Sandbox
+	if err := r.Get(context.Background(), delTestKey(), &got); err != nil {
+		t.Fatalf("Get sandbox: %v", err)
+	}
+	if got.Annotations[sessionIDAnnotationKey] != delTestSession {
+		t.Fatalf("session id = %q, want %q", got.Annotations[sessionIDAnnotationKey], delTestSession)
 	}
 }
