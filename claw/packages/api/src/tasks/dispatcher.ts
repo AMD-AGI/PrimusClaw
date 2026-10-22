@@ -17,7 +17,7 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import { taskSubject } from "@claw/protocol";
-import type { ExecuteRequest, ScriptStep } from "@claw/protocol";
+import type { ExecuteRequest, ScriptStep, TaskMode } from "@claw/protocol";
 import {
   MissingPlatformKeyError,
   readTrustedSessionCredentials,
@@ -383,7 +383,7 @@ function buildExecuteRequest(opts: {
     run_lease: updated.callback_url
       ? { url: `${updated.callback_url}/lease`, token: internalToken }
       : undefined,
-    mode: (updated.mode as "llm" | "script") ?? "llm",
+    mode: (updated.mode as TaskMode) ?? "llm",
     workspace_throwaway: updated.workspace_throwaway === true ? true : undefined,
     sandbox_spec: sandboxSpecForBrain,
     workspace_id: extractSandboxNamespace(sandboxSpecForBrain) || session.workspace_id || undefined,

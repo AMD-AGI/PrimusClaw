@@ -950,6 +950,53 @@ async function maybeRunSandboxlessTask(
   return true;
 }
 
+/** Why a task of mode `app` is refused: the AppRunner is not part of this build. */
+export const APP_MODE_NOT_IMPLEMENTED =
+  'task mode "app" is not implemented in this Brain build (the AppRunner lands in a later change)';
+
+/**
+ * A task whose mode this Brain cannot run is failed outright. Without this an
+ * `app` task would fall through to the LLM engine, which would run the app's
+ * input as a chat prompt. Only `llm`, `script` and an omitted mode go on.
+ */
+export async function refuseUnsupportedMode(
+  msg: JsMsg,
+  request: ExecuteRequest,
+  sessionId: string,
+  lockKey: string,
+): Promise<boolean> {
+  if (request.mode === undefined || request.mode === "llm" || request.mode === "script") return false;
+  const { kvCkpt } = getDeps();
+  logger.error({ sessionId, taskId: request.task_id, mode: request.mode }, "task.mode_not_implemented");
+  try {
+    await deliverAgentDone(kvCkpt, request, {
+      finalText: "",
+      tokenUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, turns: 0 },
+      turns: 0,
+      pendingMemories: [],
+      pendingSkills: [],
+      skillsUsed: {},
+      errorCount: 1,
+      toolStats: { total_calls: 0, error_calls: 1, by_tool: {} },
+      elapsedMs: 0,
+      abortReason: "error",
+      failureReason: APP_MODE_NOT_IMPLEMENTED,
+    });
+    await ackAndClearCallback(msg, kvCkpt, request);
+  } catch (err) {
+    if (err instanceof AgentDoneDeliveryError) {
+      logger.error({ err, taskId: request.task_id }, "task.mode_refusal_delivery_exhausted");
+      msg.nak(5_000);
+    } else {
+      throw err;
+    }
+  } finally {
+    activeAbort.delete(lockKey);
+    await fx().releaseTaskLock(lockKey).catch(() => {});
+  }
+  return true;
+}
+
 /**
  * What the post-task park did, plus the case the shared type has no room for:
  * a turn that never built a sandbox, so there was no handle to park.
@@ -2777,6 +2824,11 @@ class TaskRunner {
     const checkpointTimer = this.startInflightCheckpointTimer();
     let result: ExecuteResult;
     try {
+      if (this.request.mode === "app") {
+        // runHandleTask refuses this before a TaskRunner exists; keep the
+        // engine from ever treating an app task as a chat turn.
+        throw new Error(APP_MODE_NOT_IMPLEMENTED);
+      }
       if (this.request.mode === "script") {
         // mode=script: predefined tool sequence, no LLM (task-design.md §7.3).
         // AgentHook fire(...) is wired by the engine layer; the hooks runtime
@@ -4421,6 +4473,7 @@ export async function runHandleTask(
   claim: RunClaim = null,
 ): Promise<void> {
   if (await replayPendingCallback(msg, request, lockKey)) return;
+  if (await refuseUnsupportedMode(msg, request, sessionId, lockKey)) return;
   if (await maybeRunSandboxlessTask(msg, request, sessionId, lockKey, abortCtrl)) return;
   await new TaskRunner(
     msg, request, sessionId, lockKey, messageId, userId, abortCtrl, claim,
