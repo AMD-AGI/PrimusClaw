@@ -71,6 +71,12 @@ const FINISH_STEP_ATTEMPTS = 5;
 /** Consecutive failed ticks, with the store or SaFE unreachable, before finishNow gives up. */
 const FINISH_NOW_MAX_FAILURES = 60;
 const TEXT_MAX = 300;
+/**
+ * Hard ceiling on the SIGTERM grace, whatever the manifest asks for: the wait
+ * keeps the run's lock and its sandbox, so an application cannot name an hour
+ * count of its own.
+ */
+export const MAX_STOP_GRACE_SEC = 3600;
 
 // ---------------------------------------------------------------------------
 // Ports
@@ -689,7 +695,9 @@ export class AppRunner {
     const stateDir = this.rec.state_dir;
     // Never got as far as a sandbox and a state directory: nothing to signal.
     if (!inst || !stateDir) return undefined;
-    const graceMs = (this.rec.manifest.stop_grace_sec ?? APP_MANIFEST_DEFAULTS.stop_grace_sec) * 1000;
+    const graceMs = Math.min(
+      this.rec.manifest.stop_grace_sec ?? APP_MANIFEST_DEFAULTS.stop_grace_sec, MAX_STOP_GRACE_SEC,
+    ) * 1000;
     const sentAt = Date.parse(this.rec.last_exit?.stop_at ?? "");
     const signalled = Number.isFinite(sentAt);
 

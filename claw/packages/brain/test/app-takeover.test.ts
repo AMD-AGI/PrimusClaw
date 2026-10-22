@@ -19,7 +19,7 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { AppRunner } from "../src/apps/app-runner.js";
+import { AppRunner, MAX_STOP_GRACE_SEC } from "../src/apps/app-runner.js";
 import { stopCommand, probeCommand } from "../src/apps/app-env.js";
 import { AppRunWriteRefused } from "../src/apps/app-run-store.js";
 import type { AppGrantRunHooks, AppRunnerSeams } from "../src/apps/app-runner.js";
@@ -179,6 +179,16 @@ test("G4b stop_grace_sec 0 signals and goes on at the next look", async () => {
   await h.runner.finishNow("cancelled");
   assert.equal(h.world.terms.length, 1);
   assert.ok(h.world.stoppedAt[0]! - at <= 2 * TICK);
+});
+
+test("G4c a manifest cannot ask for a grace beyond the platform ceiling", async () => {
+  const h = harness({ manifest: withManifest({ stop_grace_sec: 10 ** 9 }) });
+  await toRunning(h);
+  h.world.onTerm = () => {};
+  const at = h.world.clock;
+  await h.runner.finishNow("cancelled");
+  const waited = h.world.stoppedAt[0]! - at;
+  assert.ok(waited >= MAX_STOP_GRACE_SEC * 1000 && waited < MAX_STOP_GRACE_SEC * 1000 + 2 * TICK, `waited ${waited} ms`);
 });
 
 test("G5 a cancel before there is an application signals nothing and still revokes and ends", async () => {
