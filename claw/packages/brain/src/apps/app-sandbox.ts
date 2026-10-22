@@ -133,6 +133,29 @@ export async function findLiveAppSandboxes(
   throw new Error("app sandbox lookup failed: more workloads than one run can own");
 }
 
+const appSandboxNamespace = (run: Pick<AppSandboxRun, "workspaceId">): string =>
+  run.workspaceId?.trim() || SANDBOX_NAMESPACE;
+
+/**
+ * The handle of an app sandbox whose workload id is already known: a run being
+ * reconciled after a restart or a takeover reads the id from its row and needs
+ * the instance without creating anything.
+ */
+export function appSandboxInstance(
+  run: Pick<AppSandboxRun, "workspaceId" | "platformKey">,
+  workloadId: string,
+): SandboxInstance {
+  const ns = appSandboxNamespace(run);
+  return {
+    provider: "safe-workload",
+    id: workloadId,
+    sandboxName: workloadId,
+    namespace: ns,
+    handsBaseUrl: safeHandsBaseUrl(ns, workloadId, "9100"),
+    platformKey: run.platformKey,
+  };
+}
+
 /**
  * The run's sandbox: an existing live one, or a fresh one. Returns once the
  * sandbox is Running.
@@ -143,16 +166,9 @@ export async function ensureAppSandbox(run: AppSandboxRun, deps: AppSandboxDeps)
   }
   if (!run.platformKey) throw new Error("ensureAppSandbox: platformKey is required");
   if (!run.sandboxSpec?.image?.trim()) throw new Error("ensureAppSandbox: sandbox_spec has no image");
-  const ns = run.workspaceId?.trim() || SANDBOX_NAMESPACE;
+  const ns = appSandboxNamespace(run);
   const wait = deps.waitRunning ?? ((id, key) => pollWorkloadUntilRunning(id, key));
-  const instanceFor = (id: string): SandboxInstance => ({
-    provider: "safe-workload",
-    id,
-    sandboxName: id,
-    namespace: ns,
-    handsBaseUrl: safeHandsBaseUrl(ns, id, "9100"),
-    platformKey: run.platformKey,
-  });
+  const instanceFor = (id: string): SandboxInstance => appSandboxInstance(run, id);
 
   const live = await findLiveAppSandboxes(run.runId, run.platformKey, deps.fetch);
   if (live.length > 0) {
