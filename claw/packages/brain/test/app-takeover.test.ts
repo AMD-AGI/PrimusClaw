@@ -529,6 +529,25 @@ test("H1 when the signal fires the runner returns at once and a tick still in fl
   assert.equal(h.world.starts.length, 1);
 });
 
+test("H1b a signal that arrives while the environment is being built stops the launch before the start command", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const grant = grantSpy();
+  grant.env = async () => { grant.envs++; await gate; return {}; };
+  const h = harness({ grant });
+  await until(h, "starting", 3);
+  const ac = new AbortController();
+  const run = h.runner.run(ac.signal);
+  for (let i = 0; i < 50 && grant.envs === 0; i++) await new Promise((r) => setImmediate(r));
+  assert.equal(grant.envs, 1, "the launch reached the environment lookup");
+  ac.abort();
+  assert.deepEqual(await run, { kind: "aborted" });
+  release();
+  for (let i = 0; i < 50; i++) await new Promise((r) => setImmediate(r));
+  assert.equal(h.world.execs.filter((e) => e.command.includes("setsid")).length, 0, "no start command after the signal");
+  assert.equal(h.world.starts.length, 0);
+});
+
 test("H2 a cancel after the signal still finishes the run: finishNow is the one road that writes", async () => {
   const h = harness();
   await toRunning(h);

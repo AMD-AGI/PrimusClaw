@@ -496,6 +496,8 @@ export class AppRunner {
 
   private async startApplication(inst: SandboxInstance, stateDir: string): Promise<void> {
     const env = await this.applicationEnv(stateDir);
+    // The lookups above can outlast the signal; a runner told to let go starts nothing.
+    this.assertActive();
     const r = await this.deps.sandbox.exec(
       inst, startCommand(this.rec.manifest, stateDir, this.tag()), EXEC_TIMEOUT, { env },
     );
