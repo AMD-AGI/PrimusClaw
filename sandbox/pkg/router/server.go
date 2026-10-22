@@ -24,6 +24,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/agent-sandbox/pkg/cmdlog"
+	"sigs.k8s.io/agent-sandbox/pkg/grant"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/nsadmission"
 	"sigs.k8s.io/agent-sandbox/pkg/safe"
@@ -77,6 +78,7 @@ type Server struct {
 	engine         *gin.Engine
 	jwt            *JWTManager
 	safeClient     *safe.Client // SaFE API Key verification client (nil when auth disabled)
+	grants         *grant.Service
 
 	// Readiness edge tracking, so the log records transitions rather than every
 	// probe. Guarded because readiness is served concurrently.
@@ -153,6 +155,8 @@ func (s *Server) setupRoutes() {
 	// The default recovery dumps request headers and masks only Authorization.
 	s.engine.Use(gin.RecoveryWithWriter(cmdlog.RedactingWriter(gin.DefaultErrorWriter)))
 	s.engine.Use(metricsMiddleware())
+	// E2B data plane. Runs before other routes and only when both headers are set.
+	s.engine.Use(s.e2bAccessGate)
 
 	// Health check endpoints (no concurrency limit)
 	s.engine.GET("/health/live", s.handleHealthLive)
@@ -217,6 +221,24 @@ func (s *Server) setupRoutes() {
 
 	// WM health (proxied for unified /v1/health)
 	v1.GET("/health", s.proxyToWM)
+
+	// Grant admin API. Outside /v1 so --enable-auth does not replace the
+	// caller service-account token. Workload Manager checks that token.
+	grants := s.engine.Group("/internal/v1/grants")
+	grants.POST("", s.proxyToWM)
+	grants.GET("/:grantId", s.proxyToWM)
+	grants.DELETE("/:grantId", s.proxyToWM)
+	grants.PATCH("/:grantId", s.proxyToWM)
+
+	// E2B control plane. Outside /v1 so SaFE auth does not replace X-API-KEY.
+	// Workload Manager resolves the key. A missing key is rejected here.
+	s.engine.POST("/sandboxes", s.proxyE2B)
+	s.engine.GET("/sandboxes", s.proxyE2B)
+	s.engine.GET("/v2/sandboxes", s.proxyE2B)
+	s.engine.GET("/sandboxes/:sandboxID", s.proxyE2B)
+	s.engine.DELETE("/sandboxes/:sandboxID", s.proxyE2B)
+	s.engine.POST("/sandboxes/:sandboxID/connect", s.proxyE2B)
+	s.engine.POST("/sandboxes/:sandboxID/timeout", s.proxyE2B)
 }
 
 // namespaceAdmissionMiddleware rejects a request without a session ID whose

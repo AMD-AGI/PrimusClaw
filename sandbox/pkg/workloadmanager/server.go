@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
 	"sigs.k8s.io/agent-sandbox/pkg/builder"
 	"sigs.k8s.io/agent-sandbox/pkg/cmdlog"
+	"sigs.k8s.io/agent-sandbox/pkg/grant"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/nsadmission"
 	"sigs.k8s.io/agent-sandbox/pkg/policy"
@@ -171,6 +172,42 @@ func (s *Server) WithAuditStore(as audit.AuditStore) *Server {
 func (s *Server) WithBuilder(b *builder.Builder) *Server {
 	s.builder = b
 	return s
+}
+
+// WithGrants serves the grant admin API. The caller token is checked inside
+// the grant service, not by the SaFE middleware on /v1.
+func (s *Server) WithGrants(svc *grant.Service) *Server {
+	if svc == nil || s.router == nil {
+		return s
+	}
+	grant.NewHandler(svc).Mount(s.router.Group("/internal/v1/grants"))
+	return s
+}
+
+// Record stores a grant audit event and writes one process-log line.
+func (s *Server) Record(ctx context.Context, event *audit.AuditEvent) {
+	s.emitAudit(ctx, event)
+	if event == nil {
+		return
+	}
+	log.Info("grant audit", "event_type", event.EventType, "session_id", event.SessionID, "user_id", event.UserID)
+}
+
+// ReclaimSession deletes the sandbox for a session because its grant ended.
+// A missing session is already reclaimed.
+func (s *Server) ReclaimSession(ctx context.Context, sessionID string) error {
+	if sessionID == "" {
+		return nil
+	}
+	info, err := s.store.GetSandboxBySessionID(ctx, sessionID)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	s.deleteSandboxAndSession(ctx, info, audit.ReasonGrantReclaim)
+	return nil
 }
 
 // emitAudit records an audit event (fire-and-forget, never blocks the caller).

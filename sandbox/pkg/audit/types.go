@@ -17,6 +17,13 @@ const (
 	EventDeleted        = "sandbox.deleted"
 	EventResourceReport = "sandbox.resource_report"
 	EventEgress         = "sandbox.egress"
+
+	// Grant lifecycle. The grant id is metadata["grantId"].
+	EventGrantCreated     = "grant.created"
+	EventGrantRevoked     = "grant.revoked"
+	EventGrantExpired     = "grant.expired"
+	EventSandboxReclaimed = "sandbox.reclaimed"
+	EventSandboxDenied    = "sandbox.denied"
 )
 
 // Source constants for log filtering.
@@ -24,6 +31,7 @@ const (
 	SourceLifecycle = "lifecycle"
 	SourceResource  = "resource"
 	SourceEgress    = "egress"
+	SourceGrant     = "grant"
 )
 
 // Delete reason constants for sandbox.deleted events.
@@ -41,6 +49,8 @@ const (
 	// records that it happened and when, so the deletion itself is not
 	// invisible to audit even when its cause is.
 	ReasonExternal = "external"
+	// ReasonGrantReclaim marks a sandbox deleted because its grant was revoked or expired.
+	ReasonGrantReclaim = "grant_reclaim"
 )
 
 // AnnDeleteAuditIssued marks a Sandbox object as already accounted for by a

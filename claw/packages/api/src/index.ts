@@ -34,6 +34,7 @@ import { registerTaskDagRoutes } from "./routes/task-dags.js";
 import { registerTaskRoutes } from "./routes/tasks.js";
 import { registerRunRoutes } from "./runs/routes.js";
 import { registerWorkbenchRoutes } from "./workbenches/routes.js";
+import { registerAppRunGrantRoutes } from "./routes/app-run-grants.js";
 import { startScheduler } from "./tasks/scheduler.js";
 import { startSweeper } from "./tasks/sweeper.js";
 import { startExternalResolver } from "./tasks/external-resolver.js";
@@ -268,6 +269,7 @@ async function main() {
   await registerTaskRoutes(app);
   await registerRunRoutes(app);
   await registerWorkbenchRoutes(app);
+  await registerAppRunGrantRoutes(app);
 
   // Reconcile SYSTEM_ENV KV with DB at boot so brain sees current global env
   // even if no admin write happens during this process lifetime.

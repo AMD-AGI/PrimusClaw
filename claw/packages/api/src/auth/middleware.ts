@@ -82,6 +82,7 @@ const ANONYMOUS_PATHS = new Set([
   "/metrics",
   "/.well-known/agent-card.json",
   "/.well-known/agent.json",
+  "/.well-known/jwks.json",
   "/a2a/.well-known/agent-card.json",
   "/a2a/.well-known/agent.json",
   "/a2a/health",

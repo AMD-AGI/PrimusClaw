@@ -157,6 +157,13 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
       "access_count", "created_at", "last_accessed", "deleted_at", "kind",
     ],
   },
+  {
+    table: "claw_app_run_grants",
+    columns: [
+      "app_run_id", "grant_id", "user_id", "session_id", "expires_at",
+      "keys_ciphertext", "attestation", "state", "claims", "created_at", "updated_at",
+    ],
+  },
 ];
 
 /**

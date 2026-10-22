@@ -1,0 +1,239 @@
+// SPDX-FileCopyrightText: Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+package e2b
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
+	"sigs.k8s.io/agent-sandbox/pkg/grant"
+)
+
+const (
+	defaultTimeoutSec  int64 = 300
+	defaultPendingWait       = 15 * time.Minute
+	envdVersion              = "0.1.0"
+	defaultListLimit         = 100
+)
+
+// callerMetadataKeys may be set by the SDK without a reserved prefix.
+var callerMetadataKeys = map[string]struct{}{
+	"idempotency-key": {},
+	"avoid-nodes":     {},
+	"priority":        {},
+}
+
+// reservedMetadataKeys are assigned by the platform and rejected from callers.
+var reservedMetadataKeys = map[string]struct{}{
+	"node-name":          {},
+	"signing-public-key": {},
+	"same-node":          {},
+	"nodes":              {},
+}
+
+// checkMetadata accepts caller keys and the agent-sandbox.io/ and claw.io/ prefixes.
+func checkMetadata(md map[string]string) error {
+	for key := range md {
+		if _, ok := reservedMetadataKeys[key]; ok {
+			return grant.Op(http.StatusForbidden, "metadata_reserved", key)
+		}
+		if _, ok := callerMetadataKeys[key]; ok {
+			continue
+		}
+		if strings.HasPrefix(key, "agent-sandbox.io/") || strings.HasPrefix(key, "claw.io/") {
+			continue
+		}
+		return grant.Op(http.StatusForbidden, "metadata_not_allowed", key)
+	}
+	return nil
+}
+
+type resolvedTemplate struct {
+	ID           string
+	Alias        string
+	GPUs         int32
+	Sealed       bool
+	Inputs       []string
+	Outputs      []string
+	AcceptedEnvs []string
+	Pending      time.Duration
+}
+
+// resolveTemplate matches an expanded name, or a short name with one expansion.
+func resolveTemplate(snap grant.Snapshot, role, requested string) (resolvedTemplate, error) {
+	if requested == "" {
+		return resolvedTemplate{}, grant.Op(http.StatusBadRequest, "invalid_sandbox", "templateID is required")
+	}
+	cap, ok := snap.Roles[role]
+	if !ok {
+		return resolvedTemplate{}, grant.Op(http.StatusForbidden, "role_not_allowed", role)
+	}
+	if contains(cap.Templates, requested) {
+		tpl, spec := templateForExpansion(snap, requested)
+		body, err := parseSpec(spec)
+		if err != nil {
+			return resolvedTemplate{}, err
+		}
+		alias := requested
+		if tpl.Name != "" {
+			alias = tpl.Name
+		}
+		return resolvedFrom(requested, alias, body), nil
+	}
+	var matches []string
+	var spec string
+	for _, tpl := range snap.Templates {
+		if tpl.Name != requested {
+			continue
+		}
+		for _, name := range expandNames(snap.AppRunID, tpl) {
+			if contains(cap.Templates, name) {
+				matches = append(matches, name)
+				spec = tpl.Spec
+			}
+		}
+	}
+	if len(matches) == 1 {
+		body, err := parseSpec(spec)
+		if err != nil {
+			return resolvedTemplate{}, err
+		}
+		return resolvedFrom(matches[0], requested, body), nil
+	}
+	if len(matches) > 1 {
+		return resolvedTemplate{}, grant.Op(http.StatusForbidden, "template_not_allowed", requested+" matches more than one gpu size")
+	}
+	return resolvedTemplate{}, grant.Op(http.StatusForbidden, "template_not_allowed", requested)
+}
+
+func resolvedFrom(id, alias string, body specBody) resolvedTemplate {
+	pending := defaultPendingWait
+	if body.PendingTimeoutSec > 0 {
+		pending = time.Duration(body.PendingTimeoutSec) * time.Second
+	}
+	return resolvedTemplate{
+		ID:           id,
+		Alias:        alias,
+		GPUs:         gpusFromName(id),
+		Sealed:       body.Sealed,
+		Inputs:       body.Inputs,
+		Outputs:      body.Outputs,
+		AcceptedEnvs: body.AcceptedEnvs,
+		Pending:      pending,
+	}
+}
+
+func templateForExpansion(snap grant.Snapshot, expanded string) (runtimev1alpha1.GrantTemplate, string) {
+	for _, tpl := range snap.Templates {
+		for _, name := range expandNames(snap.AppRunID, tpl) {
+			if name == expanded {
+				return tpl, tpl.Spec
+			}
+		}
+	}
+	return runtimev1alpha1.GrantTemplate{}, ""
+}
+
+func expandNames(appRunID string, tpl runtimev1alpha1.GrantTemplate) []string {
+	if len(tpl.PerGPUCount) == 0 {
+		return []string{appRunID + "-" + tpl.Name}
+	}
+	names := make([]string, 0, len(tpl.PerGPUCount))
+	for _, n := range tpl.PerGPUCount {
+		names = append(names, appRunID+"-"+tpl.Name+"-g"+strconv.FormatInt(int64(n), 10))
+	}
+	return names
+}
+
+func gpusFromName(name string) int32 {
+	i := strings.LastIndex(name, "-g")
+	if i < 0 || i+2 >= len(name) {
+		return 0
+	}
+	n, err := strconv.Atoi(name[i+2:])
+	if err != nil || n < 0 {
+		return 0
+	}
+	return int32(n)
+}
+
+type specBody struct {
+	Sealed            bool     `json:"sealed"`
+	AcceptedEnvs      []string `json:"acceptedEnvs"`
+	Inputs            []string `json:"inputs"`
+	Outputs           []string `json:"outputs"`
+	PendingTimeoutSec int64    `json:"pendingTimeoutSec"`
+}
+
+func parseSpec(spec string) (specBody, error) {
+	if spec == "" {
+		return specBody{}, nil
+	}
+	var body specBody
+	if err := json.Unmarshal([]byte(spec), &body); err != nil {
+		return specBody{}, grant.Op(http.StatusInternalServerError, "template_spec_invalid", "template spec is not JSON")
+	}
+	return body, nil
+}
+
+// checkEnv rejects every env var when acceptedEnvs is empty, and any key outside the list.
+func checkEnv(accepted []string, env map[string]string) error {
+	if len(env) == 0 {
+		return nil
+	}
+	if len(accepted) == 0 {
+		return grant.Op(http.StatusForbidden, "env_not_allowed", "template accepts no env vars")
+	}
+	for key := range env {
+		if !contains(accepted, key) {
+			return grant.Op(http.StatusForbidden, "env_not_allowed", key)
+		}
+	}
+	return nil
+}
+
+func contains(list []string, want string) bool {
+	for _, item := range list {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
+// parseMetadataQuery reads the double-encoded metadata query value.
+func parseMetadataQuery(raw string) (map[string]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	decoded, err := url.QueryUnescape(raw)
+	if err != nil {
+		return nil, grant.Op(http.StatusBadRequest, "invalid_metadata_query", "metadata query is not encoded")
+	}
+	values, err := url.ParseQuery(decoded)
+	if err != nil {
+		return nil, grant.Op(http.StatusBadRequest, "invalid_metadata_query", "metadata query is not encoded")
+	}
+	out := make(map[string]string, len(values))
+	for key, vals := range values {
+		if len(vals) > 0 {
+			out[key] = vals[0]
+		}
+	}
+	return out, nil
+}
+
+func metadataMatch(md, want map[string]string) bool {
+	for key, val := range want {
+		if md[key] != val {
+			return false
+		}
+	}
+	return true
+}
