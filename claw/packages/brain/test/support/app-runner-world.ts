@@ -200,9 +200,14 @@ export class World {
     }
     if (command.includes("setsid")) {
       const tag = /printf %s '([^']*)' >app\.sandbox/.exec(command)![1]!;
-      if (this.files.get(`${dir}/app.sandbox`) === tag) {
+      const marker = this.files.get(`${dir}/app.sandbox`);
+      // Under the start lock: a live process of this sandbox, of any restart generation, is "already".
+      if (marker !== undefined && marker.slice(0, marker.lastIndexOf(":")) === tag.slice(0, tag.lastIndexOf(":"))) {
         const pid = this.files.get(`${dir}/app.pid`);
-        if (pid !== undefined && this.procs.has(`${wl}:${pid}`)) return ok("already\n");
+        if (pid !== undefined && this.procs.has(`${wl}:${pid}`)) {
+          this.files.set(`${dir}/app.sandbox`, tag);
+          return ok("already\n");
+        }
       }
       this.files.set(`${dir}/app.sandbox`, tag);
       const pid = String(this.nextPid++);

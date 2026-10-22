@@ -26,6 +26,12 @@ export interface AppLastExit {
   returncode?: number | null;
   stop_reason?: string;
   error?: string;
+  /**
+   * The restart budget is spent and the sandbox was lost: one more sandbox is
+   * made only to read `exit.json`, because the application may have written
+   * `final` just before it went. Nothing is started in it.
+   */
+  recovery?: boolean;
 }
 
 export interface AppRunRecord {

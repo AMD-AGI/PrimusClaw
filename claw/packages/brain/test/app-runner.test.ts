@@ -260,7 +260,7 @@ test("T13 sandbox lost in starting and in restarting also goes to provisioning, 
   assert.equal(g.world.rec.restarts, 2);
 });
 
-test("T14 a lost sandbox past max_restarts ends the run as failed instead of provisioning again", async () => {
+test("T14 a lost sandbox past max_restarts ends the run as failed, never above the bound, never starting again", async () => {
   const h = harness({ manifest: { ...MANIFEST, restart: { max_restarts: 1, backoff_sec: [1] } } });
   let wl = await toRunning(h);
   h.world.killWorkload(wl, "terminal");
@@ -270,9 +270,53 @@ test("T14 a lost sandbox past max_restarts ends the run as failed instead of pro
   assert.equal(h.world.rec.restarts, 1);
   h.world.killWorkload(wl, "terminal");
   await h.runner.reconcile();
-  assert.equal(h.world.rec.state, "finishing");
+  // The budget is spent: one more sandbox only to look for a final exit, restarts unchanged.
+  assert.equal(h.world.rec.state, "provisioning");
   assert.equal(h.world.rec.restarts, 1);
-  assert.deepEqual(h.world.created, ["wl-1", "wl-2"], "no third sandbox");
+  assert.equal(h.world.rec.last_exit?.recovery, true);
+  await until(h, "finishing");
+  assert.equal(h.world.rec.restarts, 1);
+  assert.equal(h.world.rec.last_exit?.cause, "restarts_exhausted");
+  assert.equal(h.world.starts.length, 2, "the recovery sandbox starts nothing");
+  const r = await h.runner.reconcile();
+  assert.equal(r.done && r.outcome.success, false);
+});
+
+test("T14b a final exit hidden by a lost sandbox is found even with the budget spent: success, not 'exhausted'", async () => {
+  const h = harness({ manifest: { ...MANIFEST, restart: { max_restarts: 0, backoff_sec: [] } } });
+  const wl = await toRunning(h);
+  h.world.appExits(wl, finalExit(0));
+  h.world.killWorkload(wl, "terminal");
+  await h.runner.reconcile();
+  assert.equal(h.world.rec.state, "provisioning");
+  await until(h, "finishing");
+  assert.equal(h.world.rec.last_exit?.final, true);
+  const r = await h.runner.reconcile();
+  assert.deepEqual(r, { done: true, outcome: { success: true, reason: "app finished" } });
+  assert.equal(h.world.starts.length, 1, "FINAL is not run again");
+  assert.equal(h.world.rec.restarts, 0);
+});
+
+test("T14c losing the recovery sandbox too ends the run as failed: one look, not a loop", async () => {
+  const h = harness({ manifest: { ...MANIFEST, restart: { max_restarts: 0, backoff_sec: [] } } });
+  const wl = await toRunning(h);
+  h.world.killWorkload(wl, "terminal");
+  await h.runner.reconcile();
+  assert.equal(h.world.rec.state, "provisioning");
+  await h.runner.reconcile(); // provisioning -> starting
+  h.world.killWorkload(h.world.rec.sandbox_workload_id!, "terminal");
+  await h.runner.reconcile();
+  assert.equal(h.world.rec.state, "finishing");
+  assert.equal(h.world.rec.last_exit?.cause, "restarts_exhausted");
+  assert.deepEqual(h.world.created, ["wl-1", "wl-2"]);
+});
+
+test("T14d a sandbox lost before the app ever started (no state dir) has nothing to recover", async () => {
+  const h = harness({ manifest: { ...MANIFEST, restart: { max_restarts: 0, backoff_sec: [] } } });
+  await h.runner.reconcile(); // provisioning -> starting, state_dir still null
+  h.world.killWorkload(h.world.rec.sandbox_workload_id!, "terminal");
+  await h.runner.reconcile();
+  assert.equal(h.world.rec.state, "finishing");
 });
 
 test("T15 a sandbox lost after the app finished ends the run, it does not repeat it", async () => {

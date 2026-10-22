@@ -138,6 +138,52 @@ test("the start command refuses a second process while its generation is alive",
   process.kill(w.readPid());
 });
 
+test("many starts at once launch the application once: the start command serialises itself", async () => {
+  const w = realWorld('echo run >> "$APP_STATE_DIR/starts.txt"; sleep 30');
+  await w.runner.reconcile();
+  await w.runner.reconcile(); // state dir known, files written, one start done; remove it and race fresh starts
+  pids.push(w.readPid());
+  process.kill(w.readPid());
+  await w.exec(`rm -f ${w.stateDir}/app.sandbox ${w.stateDir}/app.pid ${w.stateDir}/starts.txt`);
+  const tag = generationTag("wl-1", 5);
+  const cmd = startCommand(w.world.rec.manifest, w.stateDir, tag);
+  const env = { APP_STATE_DIR: w.stateDir };
+  const results = await Promise.all(Array.from({ length: 12 }, () => w.exec(cmd, env)));
+  const words = results.map((r) => r.stdout.trim());
+  assert.equal(words.filter((x) => x === "started").length, 1, words.join(","));
+  assert.ok(words.every((x) => ["started", "busy", "already"].includes(x)), words.join(","));
+  pids.push(w.readPid());
+  await new Promise((r) => setTimeout(r, 400));
+  assert.equal(readFileSync(`${w.stateDir}/starts.txt`, "utf8").trim().split("\n").length, 1, "one process, not several");
+  process.kill(w.readPid());
+});
+
+test("a live process of this sandbox under an older generation is 'already', and the marker follows", async () => {
+  const w = realWorld('echo run >> "$APP_STATE_DIR/starts.txt"; sleep 30');
+  await w.runner.reconcile();
+  await w.runner.reconcile();
+  pids.push(w.readPid());
+  const next = await w.exec(startCommand(w.world.rec.manifest, w.stateDir, generationTag("wl-1", 1)));
+  assert.equal(next.stdout.trim(), "already");
+  assert.equal(readFileSync(`${w.stateDir}/app.sandbox`, "utf8"), generationTag("wl-1", 1));
+  // A different sandbox's pid file is not a live process here.
+  await w.exec(`printf %s ${generationTag("wl-OLD", 0)} > ${w.stateDir}/app.sandbox`);
+  const other = await w.exec(startCommand(w.world.rec.manifest, w.stateDir, generationTag("wl-2", 1)), { APP_STATE_DIR: w.stateDir });
+  assert.equal(other.stdout.trim(), "started");
+  pids.push(w.readPid());
+  process.kill(w.readPid());
+});
+
+test("a start lock left by a holder that died does not block starting for ever", async () => {
+  const w = realWorld('echo run >> "$APP_STATE_DIR/starts.txt"; sleep 30');
+  await w.exec(`mkdir -p ${w.stateDir}/.start.lock && echo 999999 > ${w.stateDir}/.start.lock/pid`);
+  const r = await w.exec(startCommand(w.world.rec.manifest, w.stateDir, generationTag("wl-1", 0)), { APP_STATE_DIR: w.stateDir });
+  assert.equal(r.stdout.trim(), "started");
+  pids.push(w.readPid());
+  process.kill(w.readPid());
+  assert.equal(existsSync(`${w.stateDir}/.start.lock`), false, "and the lock is released");
+});
+
 test("the state_dir expansion refuses (exit 4) when USER_DATA_PATH is unset, rather than answer a root path", async () => {
   const w = realWorld("sleep 0");
   const unset = await w.exec(expandStateDirCommand("${USER_DATA_PATH}/.claw-apps/${run_id}", RUN_ID), { USER_DATA_PATH: "" });

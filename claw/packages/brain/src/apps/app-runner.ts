@@ -387,6 +387,12 @@ export class AppRunner {
     const prior = await this.readExit(inst, stateDir);
     if (prior.kind === "unreadable") return { done: false };
     if (prior.kind === "exit" && prior.final) return this.finishFromExit(prior);
+    if (this.rec.last_exit?.recovery === true) {
+      // The budget was spent when the sandbox went, and nothing final is there:
+      // the run ends as the failure it was already going to be.
+      await this.move({ state: "finishing", last_exit: { at: this.iso(), cause: "restarts_exhausted", final: false } });
+      return { done: false };
+    }
 
     try {
       await this.writeFiles(inst, stateDir);
@@ -497,7 +503,8 @@ export class AppRunner {
 
   /**
    * The one road to `restarting` or back to `provisioning`: counted, and bounded
-   * by `max_restarts`. At the bound the run is finishing, as failed.
+   * by `max_restarts`. At the bound the run is finishing, as failed -- after one
+   * look for a `final` that a lost sandbox may have hidden.
    */
   private async countedRestart(
     cause: "exit" | "sandbox_lost" | "start_failed",
@@ -506,6 +513,14 @@ export class AppRunner {
     const rec = this.rec;
     const lastExit: AppLastExit = last ?? { at: this.iso(), cause, final: false };
     if (rec.restarts >= maxRestarts(rec.manifest)) {
+      // A sandbox lost with the budget spent may have taken a finished run with
+      // it: `final` is on shared storage and cannot be read without a sandbox.
+      // Failing the run here would report a success as a failure, so one more
+      // sandbox is made, once, to look (`launch` reads it and starts nothing).
+      if (cause === "sandbox_lost" && rec.state_dir && rec.last_exit?.recovery !== true) {
+        await this.move({ state: "provisioning", sandbox_workload_id: null, last_exit: { ...lastExit, recovery: true } });
+        return { done: false };
+      }
       await this.move({ state: "finishing", last_exit: { ...lastExit, cause: "restarts_exhausted" } });
       return { done: false };
     }

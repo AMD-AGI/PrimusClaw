@@ -83,20 +83,45 @@ export function readExitCommand(stateDir: string): string {
   return `if [ -f ${f} ]; then cat ${f}; else exit ${EXIT_ABSENT}; fi`;
 }
 
+/** Seconds are not needed: a holder that is alive is told by its pid, not by the clock. */
+const START_LOCK = ".start.lock";
+
 /**
- * Start the application detached, unless this generation already has a live
- * process. The check is inside the command on purpose: two reconciles, or two
- * Brains, can both have decided to start, and only the sandbox can serialise them.
+ * Start the application detached, unless it is already running here.
+ *
+ * Two things can reach this command at once: two Brains (a takeover while the
+ * old Brain's last tick is still in flight), and a tick that wrongly concluded
+ * the process was dead. So it serialises and it checks, both inside the sandbox,
+ * which is the only place that can:
+ *
+ *  - `mkdir` is the lock (atomic). A contender prints `busy` and leaves the
+ *    decision to the next tick's probe. A lock whose holder is no longer alive is
+ *    taken over.
+ *  - Under the lock, a live process of this sandbox, whatever its restart
+ *    generation, means `already`: the marker is moved to this generation, so the
+ *    probe agrees with reality, and nothing is launched.
+ *
  * The marker is written before the launch so a launch that is never recorded
  * still names its generation.
  */
 export function startCommand(manifest: AppManifestV1, stateDir: string, tag: string): string {
   const d = shq(stateDir);
+  const workload = tag.slice(0, tag.lastIndexOf(":"));
   const argv = manifest.command.map(shq).join(" ");
   const events = manifest.events ? `mkdir -p ${shq(`${stateDir}/${manifest.events.dir}`)} && ` : "";
   return [
     `mkdir -p ${d} && ${events}cd ${d} || exit 1`,
-    `if [ "$(cat ${MARKER_FILE} 2>/dev/null)" = ${shq(tag)} ] && kill -0 "$(cat ${PID_FILE} 2>/dev/null)" 2>/dev/null; then echo already; exit 0; fi`,
+    `if ! mkdir ${START_LOCK} 2>/dev/null; then`,
+    `  holder=$(cat ${START_LOCK}/pid 2>/dev/null)`,
+    `  if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then echo busy; exit 0; fi`,
+    `  rm -rf ${START_LOCK}; mkdir ${START_LOCK} 2>/dev/null || { echo busy; exit 0; }`,
+    `fi`,
+    `echo $$ >${START_LOCK}/pid`,
+    `trap 'rm -rf ${START_LOCK}' EXIT`,
+    `marker=$(cat ${MARKER_FILE} 2>/dev/null)`,
+    `if [ "\${marker%:*}" = ${shq(workload)} ] && kill -0 "$(cat ${PID_FILE} 2>/dev/null)" 2>/dev/null; then`,
+    `  printf %s ${shq(tag)} >${MARKER_FILE}; echo already; exit 0`,
+    `fi`,
     `printf %s ${shq(tag)} >${MARKER_FILE}`,
     `setsid ${argv} >>${LOG_FILE} 2>&1 </dev/null & echo $! >${PID_FILE}`,
     "echo started",
