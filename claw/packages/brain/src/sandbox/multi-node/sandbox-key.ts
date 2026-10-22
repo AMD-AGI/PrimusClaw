@@ -31,3 +31,26 @@ export async function writeSandboxSshKey(
     throw new Error(`failed to write multi-node SSH key (exit ${res.exitCode}): ${res.stderr.slice(0, 200)}`);
   }
 }
+
+/**
+ * Write `content` to `path` with the given permission bits, creating parent
+ * directories (0700) as needed. Same transport as {@link writeSandboxSshKey}.
+ * The file is created under a restrictive umask and renamed into place, so it is
+ * never visible half-written or with wider permissions than `mode`.
+ */
+export async function writeSandboxFile(
+  exec: SandboxExec,
+  path: string,
+  content: string,
+  mode: "600" | "644",
+): Promise<void> {
+  const encoded = Buffer.from(content, "utf-8").toString("base64");
+  const dir = path.slice(0, path.lastIndexOf("/")) || "/";
+  const command =
+    `umask 077 && mkdir -p '${dir}' && printf '%s' '${encoded}' | base64 -d > '${path}.tmp' ` +
+    `&& chmod ${mode} '${path}.tmp' && mv '${path}.tmp' '${path}'`;
+  const res = await exec(command, "30s");
+  if (res.exitCode !== 0) {
+    throw new Error(`failed to write ${path} (exit ${res.exitCode}): ${res.stderr.slice(0, 200)}`);
+  }
+}

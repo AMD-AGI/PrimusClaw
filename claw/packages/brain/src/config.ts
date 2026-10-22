@@ -514,6 +514,13 @@ export const MULTI_NODE_DEFAULT_TIMEOUT_SECONDS = envInt(
   "MULTI_NODE_DEFAULT_TIMEOUT_SECONDS",
   24 * 60 * 60,
 );
+// Multi-node runs hand their cluster topology to the sandbox as a file named by
+// CLAW_TOPOLOGY_FILE. While this is true the same facts are also set as the
+// older HYPERLOOM_MN_EXT_* / INFERENCE_OPTIMIZER_MN_BACKEND /
+// INFERENCE_OPTIMIZER_NODES variables, so a reader that has not moved to the
+// file keeps working. Default true for this release; to be flipped to false and
+// then removed once readers use the file.
+export const LEGACY_TOPOLOGY_ENV = envBool("LEGACY_TOPOLOGY_ENV", true);
 export const SANDBOX_DEFAULT_TIMEOUT_SECONDS = envInt(
   "SANDBOX_DEFAULT_TIMEOUT_SECONDS",
   24 * 60 * 60,

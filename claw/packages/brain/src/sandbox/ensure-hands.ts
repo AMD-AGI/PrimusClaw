@@ -36,11 +36,12 @@ import {
   resourcesMapToWorkloadArray,
   assertImageDigest,
   applyMultiNodeExternalEnv,
+  buildTopologyHandoff,
 } from "./params.js";
 import type { SandboxAction } from "./params.js";
 import { resourcesJsonToWorkloadArray } from "./workload-resources.js";
 import type { MultiNodeContext } from "./multi-node/types.js";
-import { writeSandboxSshKey } from "./multi-node/sandbox-key.js";
+import { writeSandboxFile, writeSandboxSshKey } from "./multi-node/sandbox-key.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
 import { dagHoldsWorkload, handleIdentityKey, lookupDagHandle, releaseHandlesForWorkload, replaceDagHandle, workloadHeldByOtherDag } from "./handles.js";
 import { getHandsKv, registerHandsToken } from "./registry.js";
@@ -2630,7 +2631,6 @@ async function provisionHands(
     ...(action.params.env ?? {}),
     AUTH_CLAW_TOKEN: handsToken,
     CLAW_SESSION_ID: sessionId,
-    INFERENCE_OPTIMIZER_SESSION_LAYOUT: "per_model_ts",
     MCP_PORT: mcpPort,
     WORKSPACE_PATH: "/workspace",
     SAFE_API_URL: SAFE_API_URL,
@@ -2805,6 +2805,24 @@ async function provisionHands(
       multiNodeContext.sshPrivateKey,
     );
     logger.info({ sessionId, workloadId, keyPath: multiNodeContext.sshKeyPath }, "ensureHands.mn_ssh_key_written");
+  }
+
+  // The topology handoff goes after the key it points at. Only paths are logged:
+  // the files carry credentials or cluster addresses, never the log.
+  if (multiNodeContext) {
+    const { files } = buildTopologyHandoff(multiNodeContext, env.WORKSPACE_PATH);
+    for (const f of files) {
+      await writeSandboxFile(
+        (cmd, t) => getSafeWorkloadProvider().exec(inst, cmd, t, undefined, { untracked: true }),
+        f.path,
+        f.content,
+        f.mode,
+      );
+    }
+    logger.info(
+      { sessionId, workloadId, topologyFile: env.CLAW_TOPOLOGY_FILE },
+      "ensureHands.mn_topology_written",
+    );
   }
 
   // Store in NATS KV (shared across Brain instances).

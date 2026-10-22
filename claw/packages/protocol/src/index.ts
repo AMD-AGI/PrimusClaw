@@ -9,6 +9,7 @@ export * from "./run-lease.js";
 export * from "./run-identity.js";
 export * from "./run-time.js";
 export * from "./topology.js";
+export * from "./apps.js";
 export * from "./run-doorbell.js";
 export * from "./sandbox/base32.js";
 export * from "./sandbox/hands-key.js";

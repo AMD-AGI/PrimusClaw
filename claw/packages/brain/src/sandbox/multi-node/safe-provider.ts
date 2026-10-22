@@ -772,6 +772,7 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
       name: workloadId,
       namespace,
       nodeCount: spec.nodes,
+      gpusPerNode: spec.gpusPerNode,
       serviceUrl: "",
     };
 

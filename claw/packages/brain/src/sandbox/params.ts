@@ -15,6 +15,12 @@
  * construct a real `sandbox_spec`.
  */
 import type { ExecuteRequest, SandboxSpec, SandboxSpecCreate, SandboxSpecUse } from "@claw/protocol";
+import {
+  TOPOLOGY_HANDOFF_RELATIVE_PATH,
+  TOPOLOGY_HANDOFF_SCHEMA,
+  type TopologyHandoffV1,
+} from "@claw/protocol";
+import { LEGACY_TOPOLOGY_ENV } from "../config.js";
 import { normalizeWorkloadResourcesEntry } from "./workload-resources.js";
 // Type-only: avoids a runtime import cycle (ensure.ts -> sandbox/ensure-hands.ts -> sandbox/params.ts).
 import type { MultiNodeContext } from "./multi-node/types.js";
@@ -168,8 +174,18 @@ export function resourcesMapToWorkloadArray(map: Record<string, string>): Array<
  * alone -- and the two are computed differently, so ours could quietly redirect
  * a workspace root that was already correct.
  */
-export function applyMultiNodeExternalEnv(env: Record<string, string>, ctx: MultiNodeContext): void {
+export function applyMultiNodeExternalEnv(
+  env: Record<string, string>,
+  ctx: MultiNodeContext,
+  opts: { legacyTopologyEnv?: boolean } = {},
+): void {
   delete env.SAFE_API_URL;
+  // The handoff file is the contract; its content and the files it points at are
+  // written once the sandbox is healthy (see `buildTopologyHandoff`).
+  env.CLAW_TOPOLOGY_FILE = topologyHandoffPath(env.WORKSPACE_PATH);
+
+  if (!(opts.legacyTopologyEnv ?? LEGACY_TOPOLOGY_ENV)) return;
+
   env.INFERENCE_OPTIMIZER_MN_BACKEND = ctx.backend;
   env.INFERENCE_OPTIMIZER_NODES = String(ctx.nodeCount);
   // Required: presence alone is what flips Hyperloom into external mode.
@@ -190,6 +206,81 @@ export function applyMultiNodeExternalEnv(env: Record<string, string>, ctx: Mult
   if (ctx.prefillIps?.length) env.HYPERLOOM_MN_EXT_PREFILL_IPS = ctx.prefillIps.join(",");
   if (ctx.decodeIps?.length) env.HYPERLOOM_MN_EXT_DECODE_IPS = ctx.decodeIps.join(",");
   if (ctx.workerIps?.length) env.HYPERLOOM_MN_EXT_WORKER_IPS = ctx.workerIps.join(",");
+}
+
+const DEFAULT_WORKSPACE_PATH = "/workspace";
+
+/** Where the topology handoff lives for a sandbox whose workspace is `workspacePath`. */
+export function topologyHandoffPath(workspacePath: string | undefined): string {
+  const root = (workspacePath || DEFAULT_WORKSPACE_PATH).replace(/\/+$/, "");
+  return `${root}/${TOPOLOGY_HANDOFF_RELATIVE_PATH}`;
+}
+
+/** A file to materialise inside the sandbox. */
+export interface TopologyFile {
+  path: string;
+  content: string;
+  /** Octal permission bits as a string. Secrets are 600. */
+  mode: "600" | "644";
+}
+
+export interface TopologyHandoffBuild {
+  handoff: TopologyHandoffV1;
+  /** Files in write order: everything the handoff points at, then the handoff. */
+  files: TopologyFile[];
+}
+
+/**
+ * Build the TopologyHandoff v1 document for a provisioned cluster, plus the files
+ * it needs. The document carries paths only: the Ray Dashboard token becomes its
+ * own 0600 file, and the infera SSH key is the file Brain already writes at
+ * `ctx.sshKeyPath`. The handoff is last in `files` so a reader that sees it also
+ * sees everything it names.
+ */
+export function buildTopologyHandoff(
+  ctx: MultiNodeContext,
+  workspacePath: string | undefined,
+): TopologyHandoffBuild {
+  const root = (workspacePath || DEFAULT_WORKSPACE_PATH).replace(/\/+$/, "");
+  const dir = `${root}/.claw`;
+  const files: TopologyFile[] = [];
+  const handoff: TopologyHandoffV1 = {
+    schema: TOPOLOGY_HANDOFF_SCHEMA,
+    backend: ctx.backend,
+    nodes: ctx.nodeCount,
+    gpus_per_node: ctx.gpusPerNode,
+    service_url: ctx.serviceUrl,
+  };
+
+  if (ctx.backend === "rayjob") {
+    const ray: NonNullable<TopologyHandoffV1["ray"]> = {};
+    if (ctx.headHost) ray.head_ip = ctx.headHost;
+    if (ctx.dashboardToken) {
+      ray.dashboard_token_file = `${dir}/ray-token`;
+      files.push({ path: ray.dashboard_token_file, content: ctx.dashboardToken, mode: "600" });
+    }
+    handoff.ray = ray;
+  } else {
+    const infera: NonNullable<TopologyHandoffV1["infera"]> = {
+      prefill_ips: [...(ctx.prefillIps ?? [])],
+      decode_ips: [...(ctx.decodeIps ?? [])],
+      worker_ips: [...(ctx.workerIps ?? [])],
+    };
+    if (ctx.sshKeyPath) infera.ssh_key_file = ctx.sshKeyPath;
+    if (ctx.sshPortBase) infera.ssh_port_base = ctx.sshPortBase;
+    infera.known_hosts_file = `${dir}/ssh/known_hosts`;
+    // Empty: Claw holds no host keys for these pods. The file exists so the path
+    // is usable by `ssh -o UserKnownHostsFile=...` without the reader creating it.
+    files.push({ path: infera.known_hosts_file, content: "", mode: "600" });
+    handoff.infera = infera;
+  }
+
+  files.push({
+    path: `${dir}/topology.json`,
+    content: `${JSON.stringify(handoff, null, 2)}\n`,
+    mode: "644",
+  });
+  return { handoff, files };
 }
 
 /**
