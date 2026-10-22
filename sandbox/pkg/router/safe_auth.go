@@ -75,7 +75,7 @@ func setUserContext(c *gin.Context, user *safe.UserInfo) {
 
 // safeAuthMiddleware returns a Gin middleware that supports two authentication paths:
 //
-		//  1. SaFE cookie (browser): reads Token cookie → validates against SaFE /api/v1/users/self → cached.
+//  1. SaFE cookie (browser): reads Token cookie → validates against SaFE /api/v1/users/self → cached.
 //  2. API Key (SDK/CLI): reads "Authorization: Bearer ak-xxx" → validates against SaFE → cached.
 func (s *Server) safeAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {

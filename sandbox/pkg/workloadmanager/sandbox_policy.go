@@ -11,6 +11,7 @@ import (
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/policy"
+	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
 
 const (
@@ -99,6 +100,26 @@ func readPolicyAnnotations(sb *sandboxv1alpha1.Sandbox) sandboxPolicy {
 		p.AllowedInternalHosts = hosts
 	}
 	return p
+}
+
+// policyFromInfo maps store.SandboxInfo policy fields onto sandboxPolicy.
+func policyFromInfo(info *store.SandboxInfo) sandboxPolicy {
+	pol := defaultSandboxPolicy()
+	if info == nil {
+		return pol
+	}
+	if info.RuntimePolicy != "" {
+		pol.RuntimePolicy = info.RuntimePolicy
+	}
+	if info.PolicyMode != "" {
+		pol.PolicyMode = info.PolicyMode
+	}
+	pol.AllowedEgressHosts = info.AllowedEgressHosts
+	pol.AllowedInternalHosts = info.AllowedInternalHosts
+	if info.PolicyVersion > 0 {
+		pol.PolicyVersion = info.PolicyVersion
+	}
+	return pol
 }
 
 func encodeStringList(values []string) string {

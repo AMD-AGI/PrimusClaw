@@ -1332,7 +1332,26 @@ func applyOverrides(
 }
 
 // GetSandbox loads a Sandbox CR by namespace and name.
+// Prefers the manager cache when attached so Router/WM hot paths avoid
+// uncached API Server GETs per request.
 func (c *K8sSandboxCreator) GetSandbox(ctx context.Context, namespace, name string) (*sandboxv1alpha1.Sandbox, error) {
+	sb := &sandboxv1alpha1.Sandbox{}
+	key := types.NamespacedName{Name: name, Namespace: namespace}
+	if c.cachedReader != nil {
+		if err := c.cachedReader.Get(ctx, key, sb); err != nil {
+			return nil, err
+		}
+		return sb, nil
+	}
+	if err := c.client.Get(ctx, key, sb); err != nil {
+		return nil, err
+	}
+	return sb, nil
+}
+
+// getSandboxLive loads a Sandbox CR from the API Server, bypassing the cache.
+// Use for write/patch bases that need a fresh resourceVersion.
+func (c *K8sSandboxCreator) getSandboxLive(ctx context.Context, namespace, name string) (*sandboxv1alpha1.Sandbox, error) {
 	sb := &sandboxv1alpha1.Sandbox{}
 	if err := c.client.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, sb); err != nil {
 		return nil, err
@@ -1340,18 +1359,39 @@ func (c *K8sSandboxCreator) GetSandbox(ctx context.Context, namespace, name stri
 	return sb, nil
 }
 
-// PatchSandboxPolicy writes egress policy annotations onto a Sandbox CR.
-func (c *K8sSandboxCreator) PatchSandboxPolicy(ctx context.Context, namespace, name string, p sandboxPolicy) error {
-	sb, err := c.GetSandbox(ctx, namespace, name)
-	if err != nil {
-		return err
+// PatchSandboxPolicy applies mutate to the current CR policy and writes it back.
+// Each attempt re-reads the live CR, so concurrent PATCHes merge instead of
+// clobbering, and PolicyVersion always advances from the latest value.
+func (c *K8sSandboxCreator) PatchSandboxPolicy(
+	ctx context.Context, namespace, name string, mutate func(*sandboxPolicy) error,
+) (sandboxPolicy, error) {
+	var empty sandboxPolicy
+	const maxAttempts = 5
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		sb, err := c.getSandboxLive(ctx, namespace, name)
+		if err != nil {
+			return empty, err
+		}
+		pol := readPolicyAnnotations(sb)
+		if err := mutate(&pol); err != nil {
+			return empty, err
+		}
+		pol.PolicyVersion++
+		base := sb.DeepCopy()
+		if sb.Annotations == nil {
+			sb.Annotations = make(map[string]string)
+		}
+		writePolicyAnnotations(sb.Annotations, pol)
+		patch := ctrlclient.MergeFromWithOptions(base, ctrlclient.MergeFromWithOptimisticLock{})
+		if err := c.client.Patch(ctx, sb, patch); err != nil {
+			if k8serrors.IsConflict(err) && attempt+1 < maxAttempts {
+				continue
+			}
+			return empty, err
+		}
+		return pol, nil
 	}
-	patch := ctrlclient.MergeFrom(sb.DeepCopy())
-	if sb.Annotations == nil {
-		sb.Annotations = make(map[string]string)
-	}
-	writePolicyAnnotations(sb.Annotations, p)
-	return c.client.Patch(ctx, sb, patch)
+	return empty, fmt.Errorf("patch sandbox policy %s/%s: exhausted retries", namespace, name)
 }
 
 // RecoverSessionFromK8s rebuilds a SandboxInfo from the Sandbox CR for sessionID.
@@ -1382,17 +1422,14 @@ func (c *K8sSandboxCreator) RecoverSessionFromK8s(ctx context.Context, sessionID
 
 // sandboxInfoFromCR maps a Sandbox CR to SandboxInfo without a PodIP lookup.
 // PodIP is ServiceFQDN/Service DNS when present; otherwise empty.
+//
+// SessionID is always namespace/name. The session-id annotation is user-writable
+// and must not be trusted for JWT binding or internal policy/audit routing.
 func sandboxInfoFromCR(sb *sandboxv1alpha1.Sandbox) (*store.SandboxInfo, error) {
 	if sb == nil {
 		return nil, fmt.Errorf("sandbox is nil")
 	}
-	sessionID := ""
-	if sb.Annotations != nil {
-		sessionID = sb.Annotations[sessionIDAnnotationKey]
-	}
-	if sessionID == "" {
-		sessionID = api.FormatSandboxID(sb.Namespace, sb.Name)
-	}
+	sessionID := api.FormatSandboxID(sb.Namespace, sb.Name)
 
 	podIP := ""
 	if sb.Status.ServiceFQDN != "" {
@@ -1414,6 +1451,13 @@ func sandboxInfoFromCR(sb *sandboxv1alpha1.Sandbox) (*store.SandboxInfo, error) 
 		expiresAt = sb.Spec.Lifecycle.ShutdownTime.Time
 	}
 
+	podName := sb.Name
+	if sb.Annotations != nil {
+		if annotated := strings.TrimSpace(sb.Annotations["agents.x-k8s.io/pod-name"]); annotated != "" {
+			podName = annotated
+		}
+	}
+
 	info := &store.SandboxInfo{
 		Kind:        kind,
 		SessionID:   sessionID,
@@ -1421,9 +1465,10 @@ func sandboxInfoFromCR(sb *sandboxv1alpha1.Sandbox) (*store.SandboxInfo, error) 
 		Namespace:   sb.Namespace,
 		PodIP:       podIP,
 		PodPort:     8080,
+		PodName:     podName,
 		CreatedAt:   sb.CreationTimestamp.Time,
 		ExpiresAt:   expiresAt,
-		Status:      "running",
+		Status:      getSandboxPodPhase(sb),
 	}
 	if podIP != "" {
 		info.EntryPoints = map[string]string{"/": fmt.Sprintf("%s:%d", podIP, 8080)}
@@ -1468,6 +1513,10 @@ func (c *K8sSandboxCreator) findSandboxBySessionID(
 		if !k8serrors.IsNotFound(err) {
 			return nil, err
 		}
+		// Canonical namespace/name ids resolve only by object identity. Do not
+		// fall through to annotation search: session-id annotations are
+		// user-writable and must not hijack another ns/name.
+		return nil, fmt.Errorf("no sandbox found with session-id %q", sessionID)
 	}
 
 	if c.cachedReader != nil {
@@ -1528,13 +1577,18 @@ func (c *K8sSandboxCreator) confirmSandbox(
 	return confirmed, nil
 }
 
+// errSandboxTerminating marks a Sandbox that has a DeletionTimestamp.
+// Callers map it to store.ErrNotFound so clients treat the session as gone
+// rather than as a transient store failure.
+var errSandboxTerminating = errors.New("sandbox is being deleted")
+
 // rejectIfTerminating refuses a Sandbox on its way out. Rebuilding a session record
 // for one would answer the caller with an address about to stop serving, and leave
 // the mapping behind after it does.
 func rejectIfTerminating(sessionID string, sb *sandboxv1alpha1.Sandbox) error {
 	if !sb.DeletionTimestamp.IsZero() {
-		return fmt.Errorf("sandbox %s/%s for session %q is being deleted",
-			sb.Namespace, sb.Name, sessionID)
+		return fmt.Errorf("sandbox %s/%s for session %q: %w",
+			sb.Namespace, sb.Name, sessionID, errSandboxTerminating)
 	}
 	return nil
 }

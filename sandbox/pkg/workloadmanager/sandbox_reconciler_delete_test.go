@@ -39,7 +39,7 @@ import (
 const (
 	delTestNS      = "sandboxes"
 	delTestSandbox = "sbx-1"
-	delTestSession = "sess-1"
+	delTestSession = "sandboxes/sbx-1"
 )
 
 func delTestKey() types.NamespacedName {
@@ -60,9 +60,13 @@ func runningSandbox(sessionID string) *sandboxv1alpha1.Sandbox {
 	shutdown := metav1.NewTime(time.Now().Add(24 * time.Hour))
 	return &sandboxv1alpha1.Sandbox{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        delTestSandbox,
-			Namespace:   delTestNS,
-			Annotations: map[string]string{sessionIDAnnotationKey: sessionID},
+			Name:      delTestSandbox,
+			Namespace: delTestNS,
+			Annotations: map[string]string{
+				sessionIDAnnotationKey:     sessionID,
+				runtimePolicyAnnotationKey: "agent-default",
+			},
+			ResourceVersion: "1",
 		},
 		Spec: sandboxv1alpha1.SandboxSpec{
 			Lifecycle: sandboxv1alpha1.Lifecycle{ShutdownTime: &shutdown},

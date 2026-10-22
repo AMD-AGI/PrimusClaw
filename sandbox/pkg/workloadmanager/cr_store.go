@@ -5,6 +5,7 @@ package workloadmanager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -21,6 +22,9 @@ import (
 // create/delete paths already mutate it through K8sSandboxCreator.
 type CRStore struct {
 	creator *K8sSandboxCreator
+	// admitNamespace reports whether a namespace is in this WM's scope.
+	// nil admits every namespace (dev / single-WM deployments).
+	admitNamespace func(string) bool
 }
 
 // NewCRStore returns a Store backed by Sandbox CRs.
@@ -28,18 +32,31 @@ func NewCRStore(creator *K8sSandboxCreator) *CRStore {
 	return &CRStore{creator: creator}
 }
 
+// WithNamespaceFilter limits list/GC results to namespaces the admitter allows.
+func (s *CRStore) WithNamespaceFilter(admit func(string) bool) *CRStore {
+	s.admitNamespace = admit
+	return s
+}
+
 func (s *CRStore) Ping(ctx context.Context) error {
 	if s.creator == nil || s.creator.client == nil {
 		return fmt.Errorf("CR store has no Kubernetes client")
 	}
 	var list sandboxv1alpha1.SandboxList
-	return s.creator.client.List(ctx, &list, ctrlclient.Limit(1))
+	return s.listReader().List(ctx, &list, ctrlclient.Limit(1))
+}
+
+func (s *CRStore) listReader() ctrlclient.Reader {
+	if s.creator.cachedReader != nil {
+		return s.creator.cachedReader
+	}
+	return s.creator.client
 }
 
 func (s *CRStore) GetSandboxBySessionID(ctx context.Context, sessionID string) (*store.SandboxInfo, error) {
 	info, err := s.creator.RecoverSessionFromK8s(ctx, sessionID)
 	if err != nil {
-		if apierrors.IsNotFound(err) || isSandboxNotFound(err) {
+		if apierrors.IsNotFound(err) || errors.Is(err, errSandboxTerminating) || isSandboxNotFound(err) {
 			return nil, store.ErrNotFound
 		}
 		return nil, err
@@ -93,14 +110,25 @@ func (s *CRStore) Close() error { return nil }
 
 func (s *CRStore) listSandboxInfos(ctx context.Context) ([]*store.SandboxInfo, error) {
 	var list sandboxv1alpha1.SandboxList
-	if err := s.creator.client.List(ctx, &list); err != nil {
+	if err := s.listReader().List(ctx, &list); err != nil {
 		return nil, err
 	}
 	out := make([]*store.SandboxInfo, 0, len(list.Items))
 	for i := range list.Items {
 		sb := &list.Items[i]
+		if !sb.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if s.admitNamespace != nil && !s.admitNamespace(sb.Namespace) {
+			continue
+		}
 		info, err := sandboxInfoFromCR(sb)
 		if err != nil {
+			continue
+		}
+		// Pending / non-ready sandboxes are not active sessions for list,
+		// metrics, or the health watcher.
+		if info.Status != "running" {
 			continue
 		}
 		out = append(out, info)
@@ -111,6 +139,9 @@ func (s *CRStore) listSandboxInfos(ctx context.Context) ([]*store.SandboxInfo, e
 func isSandboxNotFound(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, errSandboxTerminating) {
+		return true
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "no sandbox found with session-id")

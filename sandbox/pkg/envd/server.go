@@ -46,7 +46,7 @@ var shutdownHardExitGrace = 2 * time.Second
 type Server struct {
 	workspace     string
 	port          int
-	auth          *authManager       // Phase 3: JWT auth manager (nil publicKey = auth disabled)
+	auth          *authManager    // Phase 3: JWT auth manager (nil publicKey = auth disabled)
 	session       *sessionContext // sandbox id + Router JWT captured from the first request
 	tmuxWidth     int
 	tmuxHeight    int

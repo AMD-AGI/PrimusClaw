@@ -24,8 +24,11 @@ type SandboxInfo struct {
 	SessionID   string `json:"session_id"`
 	SandboxName string `json:"sandbox_name"`
 	Namespace   string `json:"namespace"`
-	PodIP       string `json:"pod_ip"`
-	PodPort     int    `json:"pod_port"`
+	// PodName is the workload Pod name when it differs from SandboxName
+	// (warm-pool adoption via agents.x-k8s.io/pod-name). Empty means use SandboxName.
+	PodName string `json:"pod_name,omitempty"`
+	PodIP   string `json:"pod_ip"`
+	PodPort int    `json:"pod_port"`
 	// EntryPoints maps path prefix → "ip:port" for multi-port routing.
 	// e.g. {"/": "10.1.2.3:8080", "/metrics": "10.1.2.3:9090"}
 	EntryPoints  map[string]string `json:"entry_points,omitempty"`

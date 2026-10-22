@@ -814,6 +814,12 @@ func (s *Server) handleGetSandbox(c *gin.Context) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "session store unavailable"})
 			return
 		}
+		// CRStore already resolves from the Sandbox CR; a second recover is the
+		// same lookup and only adds API Server load.
+		if _, ok := s.store.(*CRStore); ok {
+			c.JSON(http.StatusNotFound, gin.H{"error": "session not found: " + err.Error()})
+			return
+		}
 		// Rebuild from the Sandbox CR — the same source the Router recovery path uses.
 		recovered, recoverErr := s.recoverSessionRecord(c.Request.Context(), sessionID)
 		if recoverErr != nil {
@@ -1615,19 +1621,7 @@ func (s *Server) handleInternalPolicy(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query session"})
 			return
 		}
-		if info != nil {
-			if info.RuntimePolicy != "" {
-				pol.RuntimePolicy = info.RuntimePolicy
-			}
-			if info.PolicyMode != "" {
-				pol.PolicyMode = info.PolicyMode
-			}
-			pol.AllowedEgressHosts = info.AllowedEgressHosts
-			pol.AllowedInternalHosts = info.AllowedInternalHosts
-			if info.PolicyVersion > 0 {
-				pol.PolicyVersion = info.PolicyVersion
-			}
-		}
+		pol = policyFromInfo(info)
 	}
 
 	type policyResponse struct {
@@ -1663,6 +1657,7 @@ func (s *Server) handleGetPolicy(c *gin.Context) {
 	}
 
 	var pol sandboxPolicy
+	var ownerUserID string
 	if s.k8s != nil {
 		sb, err := s.k8s.GetSandbox(c.Request.Context(), namespace, name)
 		if err != nil {
@@ -1671,6 +1666,9 @@ func (s *Server) handleGetPolicy(c *gin.Context) {
 		}
 		if !s.admitNamespace(c, namespace) {
 			return
+		}
+		if sb.Labels != nil {
+			ownerUserID = sb.Labels[userIDLabelKey]
 		}
 		pol = readPolicyAnnotations(sb)
 	} else if s.store != nil {
@@ -1686,20 +1684,15 @@ func (s *Server) handleGetPolicy(c *gin.Context) {
 		if !s.admitNamespace(c, namespace) {
 			return
 		}
-		pol = defaultSandboxPolicy()
-		if info.RuntimePolicy != "" {
-			pol.RuntimePolicy = info.RuntimePolicy
-		}
-		if info.PolicyMode != "" {
-			pol.PolicyMode = info.PolicyMode
-		}
-		pol.AllowedEgressHosts = info.AllowedEgressHosts
-		pol.AllowedInternalHosts = info.AllowedInternalHosts
-		if info.PolicyVersion > 0 {
-			pol.PolicyVersion = info.PolicyVersion
-		}
+		ownerUserID = info.UserID
+		pol = policyFromInfo(info)
 	} else {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "K8s not available in dev mode"})
+		return
+	}
+
+	if !canViewAll(c) && !canMutateSandbox(c, ownerUserID) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "you can only view your own sandbox policy"})
 		return
 	}
 
@@ -1733,6 +1726,31 @@ func (s *Server) handleUpdatePolicy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: " + err.Error()})
 		return
 	}
+	if req.AllowedInternalHosts != nil {
+		for _, cidr := range *req.AllowedInternalHosts {
+			if err := policy.ValidateInternalCIDR(cidr); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+		}
+	}
+	if req.PolicyMode != nil && *req.PolicyMode != "enforce" && *req.PolicyMode != "audit" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "policyMode must be 'enforce' or 'audit'"})
+		return
+	}
+
+	applyReq := func(pol *sandboxPolicy) error {
+		if req.AllowedInternalHosts != nil {
+			pol.AllowedInternalHosts = *req.AllowedInternalHosts
+		}
+		if req.AllowedEgressHosts != nil {
+			pol.AllowedEgressHosts = *req.AllowedEgressHosts
+		}
+		if req.PolicyMode != nil {
+			pol.PolicyMode = *req.PolicyMode
+		}
+		return nil
+	}
 
 	var pol sandboxPolicy
 	if s.k8s != nil {
@@ -1744,7 +1762,19 @@ func (s *Server) handleUpdatePolicy(c *gin.Context) {
 		if !s.admitNamespace(c, namespace) {
 			return
 		}
-		pol = readPolicyAnnotations(sb)
+		ownerUserID := ""
+		if sb.Labels != nil {
+			ownerUserID = sb.Labels[userIDLabelKey]
+		}
+		if !canMutateSandbox(c, ownerUserID) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "you can only update your own sandbox policy"})
+			return
+		}
+		pol, err = s.k8s.PatchSandboxPolicy(c.Request.Context(), namespace, name, applyReq)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update policy: " + err.Error()})
+			return
+		}
 	} else if s.store != nil {
 		info, err := s.store.GetSandboxBySessionID(c.Request.Context(), sessionID)
 		if err != nil {
@@ -1758,55 +1788,13 @@ func (s *Server) handleUpdatePolicy(c *gin.Context) {
 		if !s.admitNamespace(c, namespace) {
 			return
 		}
-		pol = defaultSandboxPolicy()
-		if info.RuntimePolicy != "" {
-			pol.RuntimePolicy = info.RuntimePolicy
-		}
-		if info.PolicyMode != "" {
-			pol.PolicyMode = info.PolicyMode
-		}
-		pol.AllowedEgressHosts = info.AllowedEgressHosts
-		pol.AllowedInternalHosts = info.AllowedInternalHosts
-		if info.PolicyVersion > 0 {
-			pol.PolicyVersion = info.PolicyVersion
-		}
-	} else {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "K8s not available in dev mode"})
-		return
-	}
-
-	if req.AllowedInternalHosts != nil {
-		for _, cidr := range *req.AllowedInternalHosts {
-			if err := policy.ValidateInternalCIDR(cidr); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-				return
-			}
-		}
-		pol.AllowedInternalHosts = *req.AllowedInternalHosts
-	}
-	if req.AllowedEgressHosts != nil {
-		pol.AllowedEgressHosts = *req.AllowedEgressHosts
-	}
-	if req.PolicyMode != nil {
-		if *req.PolicyMode != "enforce" && *req.PolicyMode != "audit" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "policyMode must be 'enforce' or 'audit'"})
+		if !canMutateSandbox(c, info.UserID) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "you can only update your own sandbox policy"})
 			return
 		}
-		pol.PolicyMode = *req.PolicyMode
-	}
-
-	pol.PolicyVersion++
-	if s.k8s != nil {
-		if err := s.k8s.PatchSandboxPolicy(c.Request.Context(), namespace, name, pol); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update policy: " + err.Error()})
-			return
-		}
-	} else {
-		info, err := s.store.GetSandboxBySessionID(c.Request.Context(), sessionID)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query session"})
-			return
-		}
+		pol = policyFromInfo(info)
+		_ = applyReq(&pol)
+		pol.PolicyVersion++
 		info.RuntimePolicy = pol.RuntimePolicy
 		info.PolicyMode = pol.PolicyMode
 		info.AllowedEgressHosts = pol.AllowedEgressHosts
@@ -1816,6 +1804,9 @@ func (s *Server) handleUpdatePolicy(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update policy: " + err.Error()})
 			return
 		}
+	} else {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "K8s not available in dev mode"})
+		return
 	}
 
 	policyUpdateTotal.WithLabelValues(sessionID).Inc()

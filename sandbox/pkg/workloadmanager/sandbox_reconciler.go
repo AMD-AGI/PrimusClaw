@@ -171,15 +171,27 @@ func (r *SandboxReconciler) onSandboxDeleted(ctx context.Context, key types.Name
 // ensureSessionRegistered backfills session-id, ShutdownTime, and default
 // egress policy on Sandbox CRs that omit them (e.g. kubectl apply). Routing
 // reads the CR directly; no separate session store write is required.
+//
+// Default policy is never written onto SandboxClaim-owned sandboxes: the claim
+// path applies the template policy, and racing a default patch would downgrade
+// agent-restricted sandboxes to agent-default.
 func (r *SandboxReconciler) ensureSessionRegistered(ctx context.Context, sandbox *sandboxv1alpha1.Sandbox) error {
+	canonicalID := api.FormatSandboxID(sandbox.Namespace, sandbox.Name)
 	sessionID := ""
 	if sandbox.Annotations != nil {
 		sessionID = sandbox.Annotations[sessionIDAnnotationKey]
 	}
-	canonicalID := api.FormatSandboxID(sandbox.Namespace, sandbox.Name)
+
+	ownedByClaim := false
+	for _, ref := range sandbox.OwnerReferences {
+		if ref.Kind == "SandboxClaim" {
+			ownedByClaim = true
+			break
+		}
+	}
 
 	needsPatch := false
-	if sessionID == "" {
+	if sessionID != canonicalID {
 		sessionID = canonicalID
 		needsPatch = true
 		log.V(2).Infof("SandboxReconciler: binding sandbox id %s for %s/%s",
@@ -195,12 +207,14 @@ func (r *SandboxReconciler) ensureSessionRegistered(ctx context.Context, sandbox
 		needsPatch = true
 	}
 
-	if sandbox.Annotations == nil || sandbox.Annotations[runtimePolicyAnnotationKey] == "" {
+	needDefaultPolicy := !ownedByClaim &&
+		(sandbox.Annotations == nil || sandbox.Annotations[runtimePolicyAnnotationKey] == "")
+	if needDefaultPolicy {
 		needsPatch = true
 	}
 
 	if needsPatch {
-		patch := client.MergeFrom(sandbox.DeepCopy())
+		base := sandbox.DeepCopy()
 		if sandbox.Annotations == nil {
 			sandbox.Annotations = make(map[string]string)
 		}
@@ -208,10 +222,15 @@ func (r *SandboxReconciler) ensureSessionRegistered(ctx context.Context, sandbox
 		if defaultShutdown != nil {
 			sandbox.Spec.Lifecycle.ShutdownTime = defaultShutdown
 		}
-		if _, ok := sandbox.Annotations[runtimePolicyAnnotationKey]; !ok {
+		if needDefaultPolicy {
 			writePolicyAnnotations(sandbox.Annotations, defaultSandboxPolicy())
 		}
+		patch := client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})
 		if err := r.Patch(ctx, sandbox, patch); err != nil {
+			if apierrors.IsConflict(err) {
+				// Concurrent claim metadata or another reconciler won; retry next event.
+				return nil
+			}
 			return fmt.Errorf("patch sandbox defaults: %w", err)
 		}
 		log.V(2).Infof("SandboxReconciler: patched defaults onto %s/%s (session=%s, shutdown=%v)",
@@ -228,11 +247,8 @@ func (r *SandboxReconciler) ensureSessionRegistered(ctx context.Context, sandbox
 		return nil
 	}
 	kind := store.SandboxKind
-	for _, ref := range sandbox.OwnerReferences {
-		if ref.Kind == "SandboxClaim" {
-			kind = store.SandboxClaimKind
-			break
-		}
+	if ownedByClaim {
+		kind = store.SandboxClaimKind
 	}
 	expiresAt := time.Now().Add(DefaultMaxSessionDuration)
 	if sandbox.Spec.Lifecycle.ShutdownTime != nil && !sandbox.Spec.Lifecycle.ShutdownTime.IsZero() {
@@ -242,7 +258,7 @@ func (r *SandboxReconciler) ensureSessionRegistered(ctx context.Context, sandbox
 		Kind: kind, SessionID: sessionID, SandboxName: sandbox.Name, Namespace: sandbox.Namespace,
 		PodIP: podAddr, PodPort: 8080,
 		EntryPoints: map[string]string{"/": fmt.Sprintf("%s:%d", podAddr, 8080)},
-		CreatedAt: sandbox.CreationTimestamp.Time, LastActivity: time.Now(),
+		CreatedAt:   sandbox.CreationTimestamp.Time, LastActivity: time.Now(),
 		ExpiresAt: expiresAt, Status: "running",
 	}
 	if sandbox.Labels != nil {

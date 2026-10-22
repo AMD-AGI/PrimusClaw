@@ -348,7 +348,11 @@ func main() {
 		} else {
 			k8s.WithCachedReader(mgr.GetClient())
 		}
-		st = workloadmanager.NewCRStore(k8s)
+		crStore := workloadmanager.NewCRStore(k8s)
+		if wmCfg.Namespaces != nil {
+			crStore.WithNamespaceFilter(wmCfg.Namespaces.Filter)
+		}
+		st = crStore
 	}
 	defer st.Close()
 
