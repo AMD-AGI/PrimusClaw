@@ -33,11 +33,10 @@ head "Helm uninstall"
 helm uninstall "${RELEASE}" --namespace "${NAMESPACE}" 2>/dev/null \
     || log "helm release '${RELEASE}' not found (OK if it was installed some other way)"
 
-head "Delete ancillary resources (ingress / runtimeclass / redis secret)"
+head "Delete ancillary resources (ingress / runtimeclass)"
 kubectl delete -f "${DEPLOY_DIR}/k8s/deployments/ingress.yaml"   --ignore-not-found 2>/dev/null || true
 kubectl delete -f "${DEPLOY_DIR}/k8s-kata/deployments/ingress.yaml" --ignore-not-found 2>/dev/null || true
 kubectl delete -f "${DEPLOY_DIR}/k8s/kata/runtimeclass.yaml"     --ignore-not-found 2>/dev/null || true
-kubectl delete secret agent-sandbox-redis -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || true
 
 if [[ "${DELETE_CRDS:-false}" == "true" ]]; then
     head "Delete CRDs (destructive)"

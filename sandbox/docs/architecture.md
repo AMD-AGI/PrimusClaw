@@ -14,7 +14,7 @@ flowchart TB
     subgraph Platform["Platform services"]
         WM["Workload Manager<br/>+ image builder"]
         Router["Router<br/>+ SSRF protection<br/>+ port proxy"]
-        Store["Redis Store<br/>+ max-duration GC"]
+        Store["Sandbox CR store<br/>+ process-log audit"]
     end
 
     SDK & CLI & HTTP -->|control plane| WM
@@ -23,7 +23,7 @@ flowchart TB
 
     WM -->|K8s API| Pod
     Router -->|HTTP| Pod
-    Store -.->|session state / GC| Router
+    Store -.->|session state / audit| Router
 
     subgraph Pod["Sandbox Pod"]
         subgraph EnvD["EnvD (runtime agent)"]
@@ -47,7 +47,7 @@ flowchart TB
 | **Port Forward CLI** | Forwards a local port to a sandbox port through the Router's port proxy. |
 | **Workload Manager** | Control plane: template/sandbox lifecycle on the K8s API, plus on-demand image building. |
 | **Router** | Unified API gateway: routes data-plane invocations to the target Pod, with SSRF protection and port proxying. |
-| **Redis Store** | Session/state store, with a background GC that deletes sandboxes past their `maxSessionDuration`. Nothing reclaims a sandbox for being idle. |
+| **Sandbox CR / process-log audit** | Session and lifecycle state live on Sandbox custom resources (CRStore). Audit events are written to process logs. A background GC deletes sandboxes past their `maxSessionDuration`; nothing reclaims a sandbox for being idle. |
 | **EnvD** | In-Pod runtime agent (port `8080`) exposing command execution, file operations, terminal sessions and GPU status, plus an egress proxy with a policy engine and hot policy reload. |
 | **Workload container(s)** | The user's base image / sidecars running alongside EnvD. |
 

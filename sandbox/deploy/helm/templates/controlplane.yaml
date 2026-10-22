@@ -209,16 +209,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-            - name: REDIS_ADDR
-              valueFrom:
-                secretKeyRef:
-                  name: agent-sandbox-redis
-                  key: addr
-            - name: REDIS_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: agent-sandbox-redis
-                  key: password
             - name: ENABLE_AUTH
               value: {{ ternary "true" "false" .Values.router.config.enableAuth | quote }}
             - name: SAFE_API_URL

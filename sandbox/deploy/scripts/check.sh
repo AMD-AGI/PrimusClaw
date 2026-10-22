@@ -5,9 +5,9 @@
 # check.sh — Read-only health verification for the agent-sandbox install.
 #
 # Verifies that an agent-sandbox deployment matches the reference shape running
-# on the the cluster: 6 CRDs Established, 1 Helm release, controlplane +
-# Redis pods Ready, three Services with endpoints, two Secrets with the right
-# keys, and live /healthz probes returning 200.
+# on the the cluster: 6 CRDs Established, 1 Helm release, controlplane Ready,
+# two Services with endpoints, envd-router-identity Secret with the right keys,
+# and live /healthz probes returning 200.
 #
 # This script does NOT modify any resource. Run it after install.sh on a new
 # cluster (or any time, as a smoke test) to confirm everything is wired.
@@ -93,7 +93,7 @@ else
     fail "helm release ${RELEASE}" "no helm release Secret found in ns; was this installed via 'kubectl apply' instead of helm?"
 fi
 
-# ── 4. Workloads (Deployment + StatefulSet) ───────────────────────────────────
+# ── 4. Workloads (Deployment) ─────────────────────────────────────────────────
 section "4. Workloads"
 CP_READY="$(kget get deploy agent-sandbox-controlplane -o jsonpath='{.status.readyReplicas}/{.spec.replicas}')"
 CP_IMAGE="$(kget get deploy agent-sandbox-controlplane -o jsonpath='{.spec.template.spec.containers[0].image}')"
@@ -108,19 +108,9 @@ fi
 [[ "${CP_MANAGED_BY}" == "Helm" ]] \
     || warn_ "deploy not managed-by Helm" "managed-by=${CP_MANAGED_BY:-<none>} — likely flat-yaml install, will diverge from chart"
 
-REDIS_READY="$(kget get sts redis -o jsonpath='{.status.readyReplicas}/{.spec.replicas}')"
-REDIS_IMAGE="$(kget get sts redis -o jsonpath='{.spec.template.spec.containers[0].image}')"
-if [[ "${REDIS_READY}" == "1/1" ]]; then
-    pass "sts/redis" "ready=${REDIS_READY} image=${REDIS_IMAGE}"
-elif [[ -z "${REDIS_READY}" || "${REDIS_READY}" == "/" ]]; then
-    fail "sts/redis" "not found — Helm chart did not render redis (check redis.deploy=true was set)"
-else
-    fail "sts/redis" "ready=${REDIS_READY}"
-fi
-
 # ── 5. Services with endpoints ────────────────────────────────────────────────
 section "5. Services + Endpoints"
-for svc_port in workloadmanager:8080 agent-sandbox-router:8080 redis:6379; do
+for svc_port in workloadmanager:8080 agent-sandbox-router:8080; do
     svc="${svc_port%%:*}"
     port="${svc_port##*:}"
     cluster_ip="$(kget get svc "${svc}" -o jsonpath='{.spec.clusterIP}')"
@@ -134,32 +124,8 @@ for svc_port in workloadmanager:8080 agent-sandbox-router:8080 redis:6379; do
     fi
 done
 
-# ── 6. PVC for redis ──────────────────────────────────────────────────────────
-section "6. PVC"
-PVC_STATUS="$(kget get pvc data-redis-0 -o jsonpath='{.status.phase}')"
-PVC_SC="$(kget get pvc data-redis-0 -o jsonpath='{.spec.storageClassName}')"
-PVC_SIZE="$(kget get pvc data-redis-0 -o jsonpath='{.status.capacity.storage}')"
-if [[ "${PVC_STATUS}" == "Bound" ]]; then
-    pass "pvc/data-redis-0" "Bound size=${PVC_SIZE} sc=${PVC_SC}"
-elif [[ -z "${PVC_STATUS}" ]]; then
-    fail "pvc/data-redis-0" "not found"
-else
-    fail "pvc/data-redis-0" "status=${PVC_STATUS} sc=${PVC_SC} (kubectl describe pvc data-redis-0 -n ${NAMESPACE})"
-fi
-
-# ── 7. Secrets (keys + structure) ─────────────────────────────────────────────
-section "7. Secrets"
-# agent-sandbox-redis must carry addr + password
-REDIS_KEYS="$(kget get secret agent-sandbox-redis -o jsonpath='{.data}' \
-    | python3 -c 'import sys,json; d=json.loads(sys.stdin.read() or "{}"); print(",".join(sorted(d.keys())))' 2>/dev/null)"
-if [[ -z "${REDIS_KEYS}" ]]; then
-    fail "secret/agent-sandbox-redis" "not found"
-elif [[ "${REDIS_KEYS}" == *"password"* && "${REDIS_KEYS}" == *"addr"* ]]; then
-    pass "secret/agent-sandbox-redis" "keys=${REDIS_KEYS}"
-else
-    fail "secret/agent-sandbox-redis" "missing required keys (got: ${REDIS_KEYS}, want: addr,password)"
-fi
-
+# ── 6. Secrets (keys + structure) ─────────────────────────────────────────────
+section "6. Secrets"
 # envd-router-identity must carry private.pem + public.pem
 ENVD_KEYS="$(kget get secret envd-router-identity -o jsonpath='{.data}' \
     | python3 -c 'import sys,json; d=json.loads(sys.stdin.read() or "{}"); print(",".join(sorted(d.keys())))' 2>/dev/null)"
@@ -171,8 +137,8 @@ else
     fail "secret/envd-router-identity" "missing required keys (got: ${ENVD_KEYS}, want: private.pem,public.pem)"
 fi
 
-# ── 8. RBAC + NetworkPolicy (presence check) ──────────────────────────────────
-section "8. RBAC + NetworkPolicy"
+# ── 7. RBAC + NetworkPolicy (presence check) ──────────────────────────────────
+section "7. RBAC + NetworkPolicy"
 kget get sa agent-sandbox-controlplane >/dev/null \
     && pass "sa/agent-sandbox-controlplane" \
     || fail "sa/agent-sandbox-controlplane" "not found"
@@ -191,8 +157,8 @@ kget get networkpolicy agent-sandbox-controlplane >/dev/null \
     && pass "networkpolicy/agent-sandbox-controlplane" \
     || warn_ "networkpolicy/agent-sandbox-controlplane" "missing — not fatal, but ingress is unrestricted"
 
-# ── 9. Pod runtime (env injection + restart count) ────────────────────────────
-section "9. Pod runtime"
+# ── 8. Pod runtime (restart count) ────────────────────────────────────────────
+section "8. Pod runtime"
 CP_POD="$(kget get pod -l app=agent-sandbox-controlplane -o jsonpath='{.items[0].metadata.name}')"
 if [[ -n "${CP_POD}" ]]; then
     RESTARTS="$(kget get pod "${CP_POD}" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
@@ -201,19 +167,12 @@ if [[ -n "${CP_POD}" ]]; then
     else
         warn_ "controlplane pod restarts" "pod=${CP_POD} restarts=${RESTARTS} (high — investigate logs)"
     fi
-    # Verify REDIS_ADDR/REDIS_PASSWORD env are wired from the Secret
-    if kget get pod "${CP_POD}" -o yaml | grep -q 'secretKeyRef:' \
-       && kget get pod "${CP_POD}" -o yaml | grep -q 'name: agent-sandbox-redis'; then
-        pass "controlplane reads REDIS_* from Secret"
-    else
-        fail "controlplane env" "REDIS_ADDR/PASSWORD not bound to Secret/agent-sandbox-redis"
-    fi
 else
     fail "controlplane pod" "no pod matches app=agent-sandbox-controlplane"
 fi
 
-# ── 10. In-cluster /healthz probe (optional) ──────────────────────────────────
-section "10. In-cluster /healthz"
+# ── 9. In-cluster /healthz probe (optional) ──────────────────────────────────
+section "9. In-cluster /healthz"
 if [[ "${SKIP_HEALTHZ}" == "true" ]]; then
     warn_ "/healthz probe" "skipped (SKIP_HEALTHZ=true)"
 else
@@ -228,8 +187,8 @@ else
     fi
 fi
 
-# ── 11. SaFE integration hint (informational) ─────────────────────────────────
-section "11. SaFE integration (informational)"
+# ── 10. SaFE integration hint (informational) ─────────────────────────────────
+section "10. SaFE integration (informational)"
 if [[ -n "${SAFE_API_URL:-}" ]]; then
     pass "SaFE API configured" "${SAFE_API_URL}"
 else

@@ -175,16 +175,6 @@ spec:
               value: ""
             - name: SANDBOX_TOLERATIONS
               value: "[]"
-            - name: REDIS_ADDR
-              valueFrom:
-                secretKeyRef:
-                  name: agent-sandbox-redis
-                  key: addr
-            - name: REDIS_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: agent-sandbox-redis
-                  key: password
             - name: SANDBOX_IMAGE_REGISTRY
               value: "harbor.example.com/agent-sandbox/"
             - name: REGISTRY_SECRET

@@ -141,7 +141,7 @@ func TestEmitUnaccountedDeleteAudit_SkipsOnShutdownExpiryMarker(t *testing.T) {
 
 // TestEmitUnaccountedDeleteAudit_NilStoreIsNoop confirms the audit path
 // never panics or blocks reconciliation in a deployment where Audit is nil
-// (store.NewFromEnv returned a non-Redis store, or AUDIT_ENABLED=false --
+// (AUDIT_ENABLED=false, or no AuditLog sink --
 // see cmd/controlplane/main.go).
 func TestEmitUnaccountedDeleteAudit_NilStoreIsNoop(t *testing.T) {
 	r := &SandboxReconciler{}
@@ -157,8 +157,7 @@ func TestEmitUnaccountedDeleteAudit_NilStoreIsNoop(t *testing.T) {
 // fire-and-forget contract: a failed write (what L639 could never observe,
 // since nothing surfaced it) must not be mistaken for success -- the
 // idempotency annotation is only set once Store actually returns nil, and
-// RedisAuditStore.Store's own audit_store_write_errors_total counter (see
-// pkg/audit/redis_store.go) is what makes the failure itself visible.
+// A store failure is logged and must not block reconciliation.
 func TestEmitUnaccountedDeleteAudit_StoreFailureDoesNotPatch(t *testing.T) {
 	store := &fakeAuditStore{failAll: true}
 	r := &SandboxReconciler{Audit: store}

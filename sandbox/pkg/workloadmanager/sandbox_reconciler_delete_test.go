@@ -162,13 +162,13 @@ func TestUnknownSandboxDeletionTouchesNothing(t *testing.T) {
 	}
 }
 
-// TestDeletionWithoutAStoreIsInert keeps dev mode (no Redis) working.
+// TestDeletionWithoutAStoreIsInert keeps Store-nil mode working.
 func TestDeletionWithoutAStoreIsInert(t *testing.T) {
 	r := deleteTestReconciler(t, nil)
 	reconcileDelTest(t, r) // must not panic on a nil Store
 }
 
-// flakyStore fails deletes until healed, standing in for a Redis blip.
+// flakyStore fails deletes until healed, standing in for a transient store blip.
 type flakyStore struct {
 	store.Store
 	deleteErr error
@@ -190,7 +190,7 @@ func (f *flakyStore) DeleteSandboxBySessionID(ctx context.Context, sessionID str
 // Consuming it eagerly would silently fall back to the key's own TTL.
 func TestFailedDeregistrationIsRetriedNotDropped(t *testing.T) {
 	base := store.NewMemoryStore()
-	st := &flakyStore{Store: base, deleteErr: errors.New("redis: connection refused")}
+	st := &flakyStore{Store: base, deleteErr: errors.New("store: connection refused")}
 	r := deleteTestReconciler(t, st, runningSandbox(delTestSession))
 
 	reconcileDelTest(t, r)
@@ -209,7 +209,7 @@ func TestFailedDeregistrationIsRetriedNotDropped(t *testing.T) {
 		t.Fatal("nothing should have been removed yet")
 	}
 
-	// Redis comes back; the retried reconcile finishes the job.
+	// Store recovers; the retried reconcile finishes the job.
 	st.deleteErr = nil
 	reconcileDelTest(t, r)
 
@@ -228,7 +228,7 @@ func TestFailedDeregistrationIsRetriedNotDropped(t *testing.T) {
 // sandbox until its next reconcile.
 func TestDeregistrationSparesAReusedSession(t *testing.T) {
 	base := store.NewMemoryStore()
-	st := &flakyStore{Store: base, deleteErr: errors.New("redis: down")}
+	st := &flakyStore{Store: base, deleteErr: errors.New("store: down")}
 	r := deleteTestReconciler(t, st, runningSandbox(delTestSession))
 
 	reconcileDelTest(t, r)

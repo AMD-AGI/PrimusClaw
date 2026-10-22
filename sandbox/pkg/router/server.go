@@ -491,8 +491,8 @@ func (s *Server) handleInvoke(c *gin.Context, kind string) {
 
 	// Get or create sandbox — delegate to SessionManager.
 	// The SessionManager has a 3-layer lookup:
-	//   1. Redis store (fast path)
-	//   2. WM recovery endpoint → K8s Sandbox annotation (fallback when Redis data is lost)
+	//   1. Session store (CR-backed in production)
+	//   2. WM recovery endpoint → Sandbox CR (fallback)
 	//   3. Error with actionable message
 	// Auto-creation (when sessionID is empty) only happens for POST requests (guarded above).
 	requestContext := withCallerCredentials(
@@ -528,7 +528,7 @@ func (s *Server) handleInvoke(c *gin.Context, kind string) {
 			})
 			return
 		}
-		// Store connection error (Redis unreachable AND K8s recovery also failed)
+		// Store connection error (and K8s recovery also failed)
 		if strings.Contains(errMsg, "store lookup failed") {
 			c.JSON(http.StatusServiceUnavailable, gin.H{
 				"error":  "session store temporarily unavailable, please retry",

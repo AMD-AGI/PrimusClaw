@@ -23,7 +23,6 @@ cat >"$tmp/repo/sandbox/deploy/scripts/install.sh" <<'EOF'
 #!/usr/bin/env bash
 printf 'SAFE_API_URL=%s\n' "${SAFE_API_URL:-}" >"$CAPTURE"
 printf 'ALLOW_INSECURE_NO_AUTH=%s\n' "${ALLOW_INSECURE_NO_AUTH:-}" >>"$CAPTURE"
-printf 'REDIS_STORAGE_CLASS=%s\n' "${REDIS_STORAGE_CLASS:-}" >>"$CAPTURE"
 printf 'EGRESS_ENABLED=%s\n' "${EGRESS_ENABLED:-}" >>"$CAPTURE"
 printf 'EGRESS_EXTRA_BLOCKED_CIDRS=%s\n' "${EGRESS_EXTRA_BLOCKED_CIDRS:-}" >>"$CAPTURE"
 printf 'DRY_RUN=%s\n' "${DRY_RUN:-}" >>"$CAPTURE"
@@ -53,7 +52,6 @@ env "${common_env[@]}" CAPTURE="$capture" SAFE_API_URL="https://safe.example" \
   bash "$tmp/repo/deploy/deploy.sh" --yes --skip-litellm --skip-sandbox-check >/dev/null
 grep -qx 'SAFE_API_URL=https://safe.example' "$capture"
 grep -qx 'ALLOW_INSECURE_NO_AUTH=' "$capture"
-grep -qx 'REDIS_STORAGE_CLASS=release-sc' "$capture"
 grep -qx 'EGRESS_ENABLED=false' "$capture"
 grep -qx 'EGRESS_EXTRA_BLOCKED_CIDRS=10.0.0.0/8,192.168.0.0/16' "$capture"
 grep -qx 'SANDBOX_EXTRA_CA_CONFIGMAP=' "$capture"
@@ -75,7 +73,6 @@ env "${common_env[@]}" CAPTURE="$capture" \
   bash "$tmp/repo/deploy/deploy.sh" --config "$tmp/profile.env" \
   --yes --skip-litellm --skip-sandbox-check >/dev/null
 grep -qx 'SAFE_API_URL=https://profile-safe.example' "$capture"
-grep -qx 'REDIS_STORAGE_CLASS=release-sc' "$capture"
 grep -qx 'DRY_RUN=' "$capture"
 
 cat >"$tmp/unsafe-profile.env" <<'EOF'

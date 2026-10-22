@@ -285,7 +285,7 @@ func (c *K8sSandboxCreator) CreateSandbox(
 		return nil, err
 	}
 
-	// Propagate maxSessionDuration → SandboxResult → Redis ExpiresAt.
+	// Propagate maxSessionDuration → SandboxResult → ExpiresAt / ShutdownTime.
 	// Priority: user override > template default > DefaultMaxSessionDuration (24h).
 	// No hard cap — users can request lifetimes longer than 24h.
 	if overrides != nil && overrides.MaxSessionDuration != "" {
@@ -334,7 +334,7 @@ func (c *K8sSandboxCreator) createDirect(ctx context.Context, ci *runtimev1alpha
 	// Build annotations + labels — following SaFE convention:
 	//   userId  → Label  (queryable via selector, no special chars)
 	//   userName → Annotation (may contain commas, no char restrictions)
-	//   sessionId → Annotation (enables session recovery from K8s when Redis data is lost)
+	//   sessionId → Annotation (canonical namespace/name routing key)
 	annotations := map[string]string{
 		sessionIDAnnotationKey: sessionID,
 	}
@@ -523,7 +523,7 @@ func (c *K8sSandboxCreator) createViaClaim(ctx context.Context, ci *runtimev1alp
 	}
 
 	// Build labels + annotations for the SandboxClaim — following SaFE convention.
-	// sessionID is always written for session recovery from K8s when Redis data is lost.
+	// sessionID is always written as the canonical namespace/name routing key.
 	claimLabels := map[string]string{}
 	claimAnnotations := map[string]string{
 		sessionIDAnnotationKey: sessionID,
@@ -568,7 +568,7 @@ func (c *K8sSandboxCreator) createViaClaim(ctx context.Context, ci *runtimev1alp
 					return nil, fmt.Errorf("sandbox reconciler returned nil sandbox for %s/%s", namespace, sandboxName)
 				}
 				// Patch labels + annotations onto the Sandbox created by WarmPool controller:
-				// - session-id annotation: enables session recovery from K8s when Redis is lost
+				// - session-id annotation: canonical namespace/name routing key
 				// - idle-timeout annotation: recorded, not enforced
 				// - user.id label: queryable user identity (SaFE convention)
 				// - user.name annotation: display name with possible special chars
@@ -1354,40 +1354,53 @@ func (c *K8sSandboxCreator) PatchSandboxPolicy(ctx context.Context, namespace, n
 	return c.client.Patch(ctx, sb, patch)
 }
 
-// RecoverSessionFromK8s rebuilds a SandboxInfo by searching K8s for a Sandbox
-// with a matching session-id annotation. This is the fallback path when Redis
-// data is lost (e.g. Redis restart without persistence).
-//
-// Returns the recovered SandboxInfo or an error if not found.
+// RecoverSessionFromK8s rebuilds a SandboxInfo from the Sandbox CR for sessionID.
 func (c *K8sSandboxCreator) RecoverSessionFromK8s(ctx context.Context, sessionID string) (*store.SandboxInfo, error) {
 	sb, err := c.findSandboxBySessionID(ctx, sessionID)
 	if err != nil {
 		return nil, err
 	}
+	info, err := sandboxInfoFromCR(sb)
+	if err != nil {
+		return nil, err
+	}
+	if info.PodIP != "" {
+		return info, nil
+	}
+	podName := sb.Name
+	if annotated, ok := sb.Annotations["agents.x-k8s.io/pod-name"]; ok && annotated != "" {
+		podName = annotated
+	}
+	ip, err := c.GetSandboxPodIP(ctx, sb.Namespace, sb.Name, podName)
+	if err != nil {
+		return nil, fmt.Errorf("sandbox %s/%s found but pod IP unavailable: %w", sb.Namespace, sb.Name, err)
+	}
+	info.PodIP = ip
+	info.EntryPoints = map[string]string{"/": fmt.Sprintf("%s:%d", ip, 8080)}
+	return info, nil
+}
 
-	sandboxName := sb.Name
-	namespace := sb.Namespace
+// sandboxInfoFromCR maps a Sandbox CR to SandboxInfo without a PodIP lookup.
+// PodIP is ServiceFQDN/Service DNS when present; otherwise empty.
+func sandboxInfoFromCR(sb *sandboxv1alpha1.Sandbox) (*store.SandboxInfo, error) {
+	if sb == nil {
+		return nil, fmt.Errorf("sandbox is nil")
+	}
+	sessionID := ""
+	if sb.Annotations != nil {
+		sessionID = sb.Annotations[sessionIDAnnotationKey]
+	}
+	if sessionID == "" {
+		sessionID = api.FormatSandboxID(sb.Namespace, sb.Name)
+	}
 
-	// Prefer ServiceFQDN (stable across Pod restarts).
-	var podIP string
+	podIP := ""
 	if sb.Status.ServiceFQDN != "" {
 		podIP = sb.Status.ServiceFQDN
 	} else if sb.Status.Service != "" {
-		podIP = fmt.Sprintf("%s.%s.svc.cluster.local", sb.Status.Service, namespace)
-	} else {
-		// Fallback: get Pod IP from the pod.
-		podName := sandboxName
-		if annotated, ok := sb.Annotations["agents.x-k8s.io/pod-name"]; ok && annotated != "" {
-			podName = annotated
-		}
-		ip, err := c.GetSandboxPodIP(ctx, namespace, sandboxName, podName)
-		if err != nil {
-			return nil, fmt.Errorf("sandbox %s/%s found but pod IP unavailable: %w", namespace, sandboxName, err)
-		}
-		podIP = ip
+		podIP = fmt.Sprintf("%s.%s.svc.cluster.local", sb.Status.Service, sb.Namespace)
 	}
 
-	// Determine Kind from ownerReferences (SandboxClaim → "SandboxClaim", else → "Sandbox")
 	kind := store.SandboxKind
 	for _, ref := range sb.OwnerReferences {
 		if ref.Kind == "SandboxClaim" {
@@ -1396,41 +1409,37 @@ func (c *K8sSandboxCreator) RecoverSessionFromK8s(ctx context.Context, sessionID
 		}
 	}
 
-	// Reconstruct SandboxInfo.
+	expiresAt := time.Now().Add(DefaultMaxSessionDuration)
+	if sb.Spec.Lifecycle.ShutdownTime != nil && !sb.Spec.Lifecycle.ShutdownTime.IsZero() {
+		expiresAt = sb.Spec.Lifecycle.ShutdownTime.Time
+	}
+
 	info := &store.SandboxInfo{
-		Kind:         kind,
-		SessionID:    sessionID,
-		SandboxName:  sandboxName,
-		Namespace:    namespace,
-		PodIP:        podIP,
-		PodPort:      8080,
-		EntryPoints:  map[string]string{"/": fmt.Sprintf("%s:%d", podIP, 8080)},
-		CreatedAt:    sb.CreationTimestamp.Time,
-		LastActivity: time.Now(),
-		ExpiresAt:    time.Now().Add(DefaultMaxSessionDuration), // default; Lifecycle overrides below
-		Status:       "running",
+		Kind:        kind,
+		SessionID:   sessionID,
+		SandboxName: sb.Name,
+		Namespace:   sb.Namespace,
+		PodIP:       podIP,
+		PodPort:     8080,
+		CreatedAt:   sb.CreationTimestamp.Time,
+		ExpiresAt:   expiresAt,
+		Status:      "running",
 	}
-
-	// Recover user identity from annotations/labels.
-	if uid, ok := sb.Labels[userIDLabelKey]; ok {
-		info.UserID = uid
+	if podIP != "" {
+		info.EntryPoints = map[string]string{"/": fmt.Sprintf("%s:%d", podIP, 8080)}
 	}
-	if uname, ok := sb.Annotations[userNameAnnotationKey]; ok {
-		info.UserName = uname
+	if sb.Labels != nil {
+		info.UserID = sb.Labels[userIDLabelKey]
 	}
-
+	if sb.Annotations != nil {
+		info.UserName = sb.Annotations[userNameAnnotationKey]
+	}
 	pol := readPolicyAnnotations(sb)
 	info.RuntimePolicy = pol.RuntimePolicy
 	info.PolicyMode = pol.PolicyMode
 	info.AllowedEgressHosts = pol.AllowedEgressHosts
 	info.AllowedInternalHosts = pol.AllowedInternalHosts
 	info.PolicyVersion = pol.PolicyVersion
-
-	// Use Lifecycle.ShutdownTime for accurate ExpiresAt.
-	if !sb.Spec.Lifecycle.ShutdownTime.IsZero() {
-		info.ExpiresAt = sb.Spec.Lifecycle.ShutdownTime.Time
-	}
-
 	return info, nil
 }
 

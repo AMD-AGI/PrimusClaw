@@ -158,11 +158,19 @@ func (s *Server) WithBuilder(b *builder.Builder) *Server {
 }
 
 // emitAudit records an audit event (fire-and-forget, never blocks the caller).
+// Production writes to the process log when Audit.Enabled; an optional
+// auditStore is only for tests that assert on Store.
 func (s *Server) emitAudit(ctx context.Context, event *audit.AuditEvent) {
-	if s.auditStore == nil {
+	if !s.cfg.Audit.Enabled && s.auditStore == nil {
 		return
 	}
 	audit.NormalizeEvent(event)
+	if s.cfg.Audit.Enabled {
+		audit.LogEvent(event)
+	}
+	if s.auditStore == nil {
+		return
+	}
 	if err := s.auditStore.Store(ctx, event); err != nil {
 		log.Warn("audit event store failed", "event_type", event.EventType,
 			"session_id", event.SessionID, "error", err)
@@ -199,7 +207,7 @@ func (s *Server) setupRoutes() {
 	v1.GET("/code-interpreter/sessions/:namespace/:name", s.handleGetSandbox)
 	v1.DELETE("/code-interpreter/sessions/:namespace/:name", s.handleDeleteSandbox)
 
-	// Session recovery: when Redis data is lost, rebuild session→pod mapping from the Sandbox CR.
+	// Session recovery: rebuild session→pod mapping from the Sandbox CR.
 	v1.GET("/code-interpreter/sessions/:namespace/:name/recover", s.handleRecoverSession)
 
 	// Template management endpoints — CRUD for CodeInterpreter CRD objects.
@@ -288,11 +296,11 @@ func (s *Server) handleHealthDeep(c *gin.Context) {
 	checks := gin.H{}
 
 	if err := s.store.Ping(ctx); err != nil {
-		checks["redis"] = err.Error()
+		checks["store"] = err.Error()
 		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "degraded", "checks": checks})
 		return
 	}
-	checks["redis"] = "ok"
+	checks["store"] = "ok"
 
 	if s.k8s != nil && s.k8s.kubeClient != nil {
 		if _, err := s.k8s.kubeClient.CoreV1().Namespaces().List(ctx, metav1.ListOptions{Limit: 1}); err != nil {
@@ -556,8 +564,8 @@ func (s *Server) handleCreate(c *gin.Context, kind string) {
 	}
 
 	// Update placeholder with real sandbox info.
-	// sessionTimeout is not stored in Redis; it lives on the Sandbox annotation
-	// as metadata. Idle reclaim is Brain's jobs probe, not Agentd idle-GC.
+	// sessionTimeout lives on the Sandbox annotation as metadata.
+	// Idle reclaim is Brain's jobs probe, not a control-plane idle-GC.
 	info := &store.SandboxInfo{
 		Kind:         sandboxKind,
 		SessionID:    sessionID,
@@ -798,7 +806,7 @@ func (s *Server) handleGetSandbox(c *gin.Context) {
 		// a timeout or a reset would overwrite it with the thirteen fields
 		// RecoverSessionFromK8s can reconstruct, dropping the egress whitelist
 		// and downgrading an agent-restricted sandbox to the permissive default.
-		// This endpoint is polled every 60s per session, so a brief Redis blip
+		// This endpoint is polled every 60s per session, so a brief store blip
 		// would do that fleet-wide.
 		if !errors.Is(err, store.ErrNotFound) {
 			log.Warn("session store unreadable; not rebuilding from the CR",
@@ -806,13 +814,7 @@ func (s *Server) handleGetSandbox(c *gin.Context) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "session store unavailable"})
 			return
 		}
-		// The keepalive loop polls this endpoint every 60s, which makes it the
-		// first thing to meet a store that lost its records: Redis keeps only
-		// RDB snapshots, so an ungraceful restart drops every write since the
-		// last one while the sandboxes keep serving. Answering 404 left the
-		// mapping lost, and idle-gc then reads a live sandbox as one with no
-		// activity at all. Rebuild from the Sandbox annotations instead, the
-		// same source the Router's recovery path uses.
+		// Rebuild from the Sandbox CR — the same source the Router recovery path uses.
 		recovered, recoverErr := s.recoverSessionRecord(c.Request.Context(), sessionID)
 		if recoverErr != nil {
 			log.Warn("session lookup and recovery both failed",
@@ -859,9 +861,9 @@ func (s *Server) handleGetSandbox(c *gin.Context) {
 
 // recoverSessionRecord rebuilds a session mapping from the Sandbox CR.
 //
-// The CR outlives the store's memory of it, so its annotations are the one source
-// that survives a Redis restart. This only reads: persisting the result is left to
-// the caller, which has to authorise the request before it writes anything.
+// The Sandbox CR is the source of truth for routing. This only reads: persisting
+// the result is left to the caller, which has to authorise the request before it
+// writes anything.
 func (s *Server) recoverSessionRecord(ctx context.Context, sessionID string) (*store.SandboxInfo, error) {
 	if s.k8s == nil {
 		return nil, errors.New("k8s sandbox creator unavailable")
@@ -884,13 +886,13 @@ func (s *Server) restoreRecoveredSession(ctx context.Context, info *store.Sandbo
 		"sessionId", info.SessionID, "sandbox", info.SandboxName)
 }
 
-// handleRecoverSession handles GET /v1/code-interpreter/sessions/:sessionId/recover.
-// When Redis data is lost (e.g. Redis restart without persistence), the Router calls this
-// endpoint to rebuild the session→pod mapping from K8s Sandbox annotations.
+// handleRecoverSession handles GET /v1/code-interpreter/sessions/:namespace/:name/recover.
+// The Router calls this to resolve a session from the Sandbox CR when the local
+// store path cannot answer.
 //
 // Flow:
-//  1. List all Sandbox CRs with annotation runtime.agent-sandbox.io/session-id == sessionID
-//  2. If found AND pod is Running, reconstruct SandboxInfo and re-store in Redis
+//  1. Resolve the Sandbox CR by namespace/name (or session-id annotation)
+//  2. If found, reconstruct SandboxInfo (CRStore writes are no-ops)
 //  3. Return the recovered SandboxInfo to the Router
 func (s *Server) handleRecoverSession(c *gin.Context) {
 	_, _, sessionID, ok := pathSandboxRef(c)
@@ -899,7 +901,7 @@ func (s *Server) handleRecoverSession(c *gin.Context) {
 		return
 	}
 
-	// Quick check: is the session already in the store (Redis came back)?
+	// Quick check: is the session already resolvable from the store?
 	if info, err := s.store.GetSandboxBySessionID(c.Request.Context(), sessionID); err == nil {
 		if !canMutateSandbox(c, info.UserID) {
 			c.JSON(http.StatusForbidden, gin.H{"error": "session recovery denied"})
@@ -937,11 +939,10 @@ func (s *Server) handleRecoverSession(c *gin.Context) {
 		return
 	}
 
-	// Re-store recovered session in Redis (best-effort, Redis may still be down).
 	if storeErr := s.store.StoreSandbox(c.Request.Context(), info); storeErr != nil {
-		log.Warn("failed to re-store recovered session in Redis", "sessionId", sessionID, "error", storeErr)
+		log.Warn("failed to re-store recovered session", "sessionId", sessionID, "error", storeErr)
 	} else {
-		log.Info("session recovered from K8s and re-stored", "sessionId", sessionID, "sandbox", info.SandboxName)
+		log.Info("session recovered from K8s", "sessionId", sessionID, "sandbox", info.SandboxName)
 	}
 
 	c.JSON(http.StatusOK, gin.H{

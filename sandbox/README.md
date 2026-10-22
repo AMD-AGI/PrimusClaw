@@ -266,7 +266,7 @@ Allow-lists can be changed on a running sandbox without restarting the Pod. envd
 
 ## Custom Image Build
 
-Instead of installing dependencies via `steps` on every start, a template can supply a Dockerfile (`build.dockerfile`) and the platform builds the image with **kaniko**, pushing to an internal registry and updating `fromImage`. Build caching is two-tiered: an image-hash index (identical Dockerfile → reuse) and kaniko layer cache (`--cache-repo`). Build Pods are sandboxed (no ServiceAccount token, no platform credentials, resource limits, build timeout). Source: `pkg/builder/`. (The Workload Manager also returns a warning when it detects `pip/apt/npm install` in `steps`, suggesting a custom image or `warmPoolSize`.)
+Instead of installing dependencies via `steps` on every start, a template can supply a Dockerfile (`build.dockerfile`) and the platform builds the image with **kaniko**, pushing to an internal registry and updating `fromImage`. Optional layer reuse uses kaniko's `--cache-repo` when configured. Build Pods are sandboxed (no ServiceAccount token, no platform credentials, resource limits, build timeout). Source: `pkg/builder/`. (The Workload Manager also returns a warning when it detects `pip/apt/npm install` in `steps`, suggesting a custom image or `warmPoolSize`.)
 
 ## In-Sandbox Service Access
 

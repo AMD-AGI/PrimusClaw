@@ -84,7 +84,7 @@ func getSandboxAs(t *testing.T, s *Server, userID, role string) *httptest.Respon
 }
 
 // TestGetSandboxDoesNotRebuildOnAnUnreadableStore is the one that matters: a
-// Redis timeout does not mean the record is gone, and rebuilding on one replaces
+// A store timeout does not mean the record is gone, and rebuilding on one replaces
 // a complete record with the subset the CR can reproduce. The policy fields are
 // the evidence -- an emptied RuntimePolicy falls through the engine's switch to
 // agent-default, so an agent-restricted sandbox silently loses egress confinement.
@@ -104,7 +104,7 @@ func TestGetSandboxDoesNotRebuildOnAnUnreadableStore(t *testing.T) {
 		t.Fatalf("seed store: %v", err)
 	}
 
-	st := &recoveryTestStore{Store: base, getErr: errors.New("redis GET: i/o timeout")}
+	st := &recoveryTestStore{Store: base, getErr: errors.New("store GET: i/o timeout")}
 	s := &Server{store: st, k8s: &K8sSandboxCreator{
 		client:       indexedClient(t, ownedSandbox(recoverySession, recoveryOwner)),
 		cachedReader: indexedClient(t, ownedSandbox(recoverySession, recoveryOwner)),
