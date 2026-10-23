@@ -47,6 +47,7 @@ export const USER_ENV_DENY_LIST: ReadonlySet<string> = new Set([
   "USER_ID_HEX",
   "USER_DATA_PATH",
   "SAFE_API_URL",
+  "TOPOLOGY_HANDOFF_FILE",
   "SAFE_API_KEY",
   // NOTE: ANTHROPIC_BASE_URL / OPENAI_BASE_URL are intentionally NOT denied.
   // Brain no longer injects an LLM gateway URL (see brain/src/index.ts), and
