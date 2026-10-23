@@ -42,6 +42,7 @@ import { resourcesJsonToWorkloadArray } from "./workload-resources.js";
 import type { MultiNodeContext } from "./multi-node/types.js";
 import { writeSandboxSshKey } from "./multi-node/sandbox-key.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
+import { openSandboxGrant } from "./grant-client.js";
 import { dagHoldsWorkload, handleIdentityKey, lookupDagHandle, releaseHandlesForWorkload, replaceDagHandle, workloadHeldByOtherDag } from "./handles.js";
 import { getHandsKv, registerHandsToken } from "./registry.js";
 import { bootstrapHandsInSandbox, HANDS_LOG_PATH, HANDS_STATE_DIR } from "./bootstrap.js";
@@ -73,6 +74,12 @@ const sc = StringCodec();
 /** Idle TTL create falls back to when the spec names none. */
 const DEFAULT_SANDBOX_TTL_SEC = 10;
 const SANDBOX_IMAGE_RE = /(?:^|\s)sandboximage:\s*(\S+)/im;
+
+/** sandboxGrantEnabled gates delegation to the Agent Sandbox grant service. */
+function sandboxGrantEnabled(): boolean {
+  const raw = (process.env.AGENT_SANDBOX_GRANT_ENABLED ?? "").trim().toLowerCase();
+  return raw === "true" || raw === "1" || raw === "yes";
+}
 
 export function resolveSandboxImageFromRequest(request: ExecuteRequest): string {
   const direct = String(request.sandbox_image ?? "").trim();
@@ -2674,7 +2681,7 @@ async function provisionHands(
     }
     return await ensureHandsAgentSandbox(
       sessionId, request, action, workloadImage, env, handsToken, mcpPort, onEvent,
-      options.attemptId ?? null, requestedSpec,
+      options.attemptId ?? null, requestedSpec, apiKey,
     );
   }
 
@@ -3521,6 +3528,7 @@ async function ensureHandsAgentSandbox(
    * kubernetes path to miss and rebuild.
    */
   requestedSpec: string,
+  platformKey: string,
 ): Promise<EnsureHandsResult> {
   const kv = getHandsKv();
   const provider = getAgentSandboxProvider();
@@ -3530,6 +3538,11 @@ async function ensureHandsAgentSandbox(
   const userId = isKubernetesMode()
     ? await deriveByokUserId(resolveRequestLlmKey(request))
     : (request.user_id?.trim() || "default");
+  if (sandboxGrantEnabled()) {
+    const grant = await openSandboxGrant(sessionId, request, workloadImage, platformKey);
+    Object.assign(env, grant.values);
+    logger.info({ sessionId, appRunId: grant.appRunId }, "ensureHands.agent.grant_opened");
+  }
 
   // BYOK env: no SaFE credentials reach this path; inject platform LLM base url
   // (DK2-A). Only the URL needs deleting -- the base env carries no SaFE key, and
