@@ -142,7 +142,12 @@ function checkKeys(schema: Node, docs: unknown[], at: string, seen: { objects: n
   if (schema.properties) {
     seen.objects++;
     const have = new Set(objs.flatMap((o) => Object.keys(o)));
-    assert.deepEqual([...have].sort(), Object.keys(schema.properties).sort(), `keys at ${at || "(root)"}`);
+    if (schema.additionalProperties === false) {
+      assert.deepEqual([...have].sort(), Object.keys(schema.properties).sort(), `keys at ${at || "(root)"}`);
+    } else {
+      // An open object (a sandbox template): the schema names what Claw reads, the rest passes through.
+      for (const k of Object.keys(schema.properties)) assert.ok(have.has(k), `${at}: ${k} is not exercised`);
+    }
     for (const [k, sub] of Object.entries(schema.properties as Node)) {
       checkKeys(sub, objs.filter((o) => k in o).map((o) => o[k]), at ? `${at}.${k}` : k, seen);
     }
@@ -154,8 +159,11 @@ function checkKeys(schema: Node, docs: unknown[], at: string, seen: { objects: n
 
 test("JSON schema keys equal the type's keys at every object", () => {
   const seen = { objects: 0 };
-  checkKeys(S as Node, [FULL], "", seen);
-  assert.equal(seen.objects, 18, "the walk must reach every fixed-key object in the schema");
+  // The container takes exactly one of image / image_from_input, so the document that sets every key comes in two.
+  const withImage = { ...FULL, container: { ...FULL.container, image_from_input: undefined, image: "registry.example.invalid/app:1" } };
+  delete (withImage.container as Record<string, unknown>).image_from_input;
+  checkKeys(S as Node, [FULL, withImage], "", seen);
+  assert.equal(seen.objects, 15, "the walk must reach every fixed-key object in the schema");
 });
 
 test("the schema's closed sets equal the exported constants", () => {
@@ -196,7 +204,6 @@ test("not an object, wrong schema string, unknown field, missing required", () =
   refused(mutate((m) => { m.schema = "claw.app-manifest/v2"; }), "schema", "must be");
   refused(mutate((m) => { m.extra = 1; }), "extra", "unknown field");
   for (const k of S.required) refused(mutate((m) => { delete m[k]; }), k, "required");
-  refused(mutate((m) => { delete m.container.image_from_input; }), "container.image_from_input", "required");
 });
 
 test("a pointer that is not an RFC 6901 pointer is refused wherever one is read", () => {
@@ -208,8 +215,6 @@ test("a pointer that is not an RFC 6901 pointer is refused wherever one is read"
     ["env_from_input.APP_SOURCE_SHA", (m) => { m.env_from_input.APP_SOURCE_SHA = "/source/~"; }],
     ["grant_from_input.max_hours", (m) => { m.grant_from_input.max_hours = "budget.max_hours"; }],
     ["grant_from_input.subrun.max_sandboxes", (m) => { m.grant_from_input["subrun.max_sandboxes"] = "multibranch"; }],
-    ["sandbox_templates[0].image_from_input", (m) => { m.sandbox_templates[0].image_from_input = "x"; }],
-    ["sandbox_templates[0].start.env_from_input.APP_SOURCE_REPO", (m) => { m.sandbox_templates[0].start.env_from_input.APP_SOURCE_REPO = "no-slash"; }],
   ];
   for (const [path, f] of where) {
     // The dotted key `subrun.max_sandboxes` is one key; its path prints with the dot.
@@ -232,10 +237,37 @@ test("a template a role names but nothing defines is refused", () => {
   refused(mutate((m) => { delete m.sandbox_templates; delete m.env_map.sandbox_templates; }), "sandbox_roles.measurement[0]", "is not defined");
 });
 
-test("a template defined twice, or with gpus and per_gpu_count, or timeouts out of order, is refused", () => {
+test("a template defined twice, or without a valid name, is refused", () => {
   refused(mutate((m) => { m.sandbox_templates[3].name = "runner"; }), "sandbox_templates[3].name", "defined twice");
-  refused(mutate((m) => { m.sandbox_templates[0].gpus = 1; }), "sandbox_templates[0].per_gpu_count", "cannot be combined");
-  refused(mutate((m) => { m.sandbox_templates[0].pending_timeout_sec = 99999; }), "sandbox_templates[0].pending_timeout_sec", "max_timeout_sec");
+  refused(mutate((m) => { delete m.sandbox_templates[3].name; }), "sandbox_templates[3].name", "required");
+  refused(mutate((m) => { m.sandbox_templates[3].name = "Bad Name"; }), "sandbox_templates[3].name", "must match");
+});
+
+test("template fields Claw does not read pass through unvalidated and unchanged", () => {
+  const odd = {
+    name: "future", made_up: { nested: [1, "x", null] }, gpus: -3, per_gpu_count: [1, 2], provider: 7,
+    start: "not-even-an-object", pending_timeout_sec: 99999, max_timeout_sec: 1,
+  };
+  const m = mutate((x) => { x.sandbox_templates.push(odd); x.sandbox_roles.dev.push("future"); });
+  assert.deepEqual(validateAppManifest(m), []);
+  assert.deepEqual((m as any).sandbox_templates[4], odd);
+  // A template with only a name is enough.
+  assert.deepEqual(paths(mutate((x) => { x.sandbox_templates.push({ name: "bare" }); })), []);
+});
+
+test("per_gpu_count, which Claw reads, must be a list of positive integers", () => {
+  refused(mutate((m) => { m.sandbox_templates[0].per_gpu_count = [0]; }), "sandbox_templates[0].per_gpu_count[0]", "must be >= 1");
+  refused(mutate((m) => { m.sandbox_templates[0].per_gpu_count = "8"; }), "sandbox_templates[0].per_gpu_count", "must be an array");
+  refused(mutate((m) => { m.sandbox_templates[0].per_gpu_count = [1, 1]; }), "sandbox_templates[0].per_gpu_count[1]", "duplicates");
+});
+
+test("the container image is exactly one of image and image_from_input", () => {
+  assert.deepEqual(paths(mutate((m) => { delete m.container.image_from_input; m.container.image = "registry.example.invalid/app:1"; })), []);
+  assert.deepEqual(paths(mutate(() => {})), []);
+  refused(mutate((m) => { m.container.image = "registry.example.invalid/app:1"; }), "container.image", "cannot be combined with container.image_from_input");
+  refused(mutate((m) => { delete m.container.image_from_input; }), "container", "needs exactly one of image or image_from_input");
+  refused(mutate((m) => { delete m.container.image_from_input; m.container.image = ""; }), "container.image", "must not be empty");
+  refused(mutate((m) => { delete m.container.image_from_input; m.container.image = 3; }), "container.image", "must be a string");
 });
 
 test("anything keyed by a role needs that role declared", () => {

@@ -179,6 +179,29 @@ function readString(
   return { value: hit.value.trim() };
 }
 
+/**
+ * A template's other fields are Agent Sandbox's and are not validated by the
+ * manifest, but Claw reads `workspace_from_input` to check the caller's access
+ * to the workspace it names, so a value that is not a pointer (or a list of
+ * them) is refused here rather than skipped: a skipped check would let the
+ * template reach a workspace nobody checked.
+ */
+function templateWorkspacePointers(
+  t: { [field: string]: unknown },
+  index: number,
+  problems: AppInputProblem[],
+): string | string[] | undefined {
+  const v = t.workspace_from_input;
+  if (v === undefined) return undefined;
+  const isPointer = (x: unknown): x is string => typeof x === "string" && x.startsWith("/");
+  if (isPointer(v) || (Array.isArray(v) && v.length > 0 && v.every(isPointer))) return v as string | string[];
+  problems.push({
+    pointer: `sandbox_templates[${index}].workspace_from_input`,
+    reason: "must be a JSON Pointer or a non-empty list of them, so the workspace can be access-checked",
+  });
+  return undefined;
+}
+
 function readQuantity(
   input: Record<string, unknown>,
   pointer: string,
@@ -206,7 +229,13 @@ export function planAppRun(
   const problems: AppInputProblem[] = [];
   const c = manifest.container;
 
-  const image = readString(input, c.image_from_input, "the container image", true);
+  // The manifest validator guarantees exactly one of the two forms: a fixed
+  // image, or a pointer into the input.
+  const image: { value?: string; problem?: AppInputProblem } = c.image !== undefined
+    ? c.image.trim()
+      ? { value: c.image.trim() }
+      : { problem: { pointer: "container.image", reason: "the container image must be a non-empty string" } }
+    : readString(input, c.image_from_input, "the container image", true);
   if (image.problem) problems.push(image.problem);
 
   const resources: Record<string, string> = { ...(c.resources ?? {}) };
@@ -229,7 +258,7 @@ export function planAppRun(
   const workspaceIds: string[] = [];
   const pointerSets: Array<string | string[] | undefined> = [
     c.workspace_from_input,
-    ...(manifest.sandbox_templates ?? []).map((t) => t.workspace_from_input),
+    ...(manifest.sandbox_templates ?? []).map((t, i) => templateWorkspacePointers(t, i, problems)),
   ];
   let primary: string | null = null;
   pointerSets.forEach((pointers, i) => {
