@@ -36,6 +36,7 @@ import {
   isGpuResourceKey,
   resolveAppResources,
   validateAppManifest,
+  type AppContainerCaps,
   type AppGrantLimits,
   type AppManifestIssue,
   type AppManifestV1,
@@ -43,10 +44,10 @@ import {
   type AppSandboxRole,
   type ResolvedAppResources,
 } from "@claw/protocol";
-import { APP_RUNS_ENABLED, APP_SANDBOX_CAPS, SAFE_API_URL, isKubernetesMode } from "../config.js";
+import { APP_CONTAINER_CAPS, APP_GRANT_ISSUE_TIMEOUT_MS, APP_RUNS_ENABLED, APP_SANDBOX_CAPS, SAFE_API_URL, isKubernetesMode } from "../config.js";
 import { devAuthBypassEnabled } from "../auth/middleware.js";
 import { isAdmin, type UserInfo } from "../auth/models.js";
-import { MissingPlatformKeyError, stampSessionCredentials } from "../auth/session-credentials.js";
+import { assertSessionCredentialsForDispatch, MissingPlatformKeyError, stampSessionCredentials } from "../auth/session-credentials.js";
 import { newMcpToken, sealAppRunSecret } from "../crypto/app-run-secrets.js";
 import { db } from "../infra/db.js";
 import { canViewPlugin } from "../marketplace/plugins.js";
@@ -66,7 +67,7 @@ export const APP_INPUT_MAX_BYTES_DEFAULT = 1024 * 1024;
 
 /** What the grant hook is told about the run it is issuing for. */
 export interface AppGrantRun {
-  /** Generated before the transaction; the same on every retry of one Idempotency-Key. */
+  /** New for every attempt (never derived from the Idempotency-Key). */
   grantId: string;
   /** Generated before the transaction and used as the task's id when it is created. */
   taskId: string;
@@ -99,26 +100,32 @@ export interface AppGrantRequest {
  *
  * `issue` runs BEFORE the creation transaction, outside the fleet-wide admission
  * lock and the per-session lock, so a slow or hung grant service cannot hold
- * either. The task id is generated up front and handed in; the task row does not
- * exist yet. If `issue` throws, nothing was written and the request answers 503.
- * `grantId` is derived from the Idempotency-Key when there is one, so a retry
- * issues the same grant; without a key it is generated per request.
+ * either; it is also given an AbortSignal that fires after
+ * `APP_GRANT_ISSUE_TIMEOUT_MS`, and a call that outlasts it is treated as failed
+ * (503). The task id is generated up front and handed in; the task row does not
+ * exist yet.
  *
- * If the transaction then refuses or fails and no run row was recorded for the
- * task, `revoke` is called with the same run (best effort, logged, never fails
- * the request) so a grant signed for a run that does not exist does not linger.
- * It must be idempotent and treat an unknown grant as done. It is not called when
- * the run row exists, nor when the failure is the idempotency unique index (the
- * run that won owns the same grant id). The default does nothing: no grant is
- * issued and none is stored.
+ * `grantId` is NEW FOR EVERY ATTEMPT. It is not derived from the
+ * Idempotency-Key: a retry after a refusal or failure signs a different grant,
+ * and the id is bound to a run only when that run is committed. So `issue` is
+ * never asked for an id that was revoked, and an attempt only ever revokes the id
+ * it signed itself, which no other attempt can hold. (A key that already has a run
+ * is answered by replay before any attempt is made.)
+ *
+ * If the transaction then refuses or fails and the database has no run row for
+ * this attempt's task, `revoke` is called with the same run (best effort, with
+ * the same timeout, logged, never fails the request). It must be idempotent and
+ * treat an unknown grant as done. It is not called when this attempt's run row
+ * exists. The default does nothing: no grant is issued and none is stored.
  */
 export interface AppGrantHooks {
   issue(
     run: AppGrantRun,
     manifest: AppManifestV1,
     request: AppGrantRequest,
+    signal?: AbortSignal,
   ): Promise<AppGrantIssued | void>;
-  revoke?(run: AppGrantRun): Promise<void>;
+  revoke?(run: AppGrantRun, signal?: AbortSignal): Promise<void>;
 }
 
 export type WorkspaceVerdict = "ok" | "not_found" | "forbidden";
@@ -137,6 +144,8 @@ export interface AppRunPorts {
   enabled(): boolean;
   /** The platform caps on a grant (`APP_SANDBOX_CAPS`); an item with no cap is not capped. */
   caps(): AppGrantLimits;
+  /** The most one app container may ask for (`APP_CONTAINER_CAPS`; one node by default). */
+  containerCaps(): AppContainerCaps;
   /** Whether `workspaceId` exists and `caller` may use it. Throws WorkspaceCheckUnavailableError when it cannot tell. */
   workspaceAccess(auth: CallerAuth, workspaceId: string): Promise<WorkspaceVerdict>;
   grant: AppGrantHooks;
@@ -185,6 +194,7 @@ export async function safeWorkspaceAccess(
 export const appRunPorts: AppRunPorts = {
   enabled: () => APP_RUNS_ENABLED,
   caps: () => APP_SANDBOX_CAPS,
+  containerCaps: () => APP_CONTAINER_CAPS,
   workspaceAccess: safeWorkspaceAccess,
   grant: { issue: async () => undefined },
 };
@@ -226,11 +236,27 @@ export function planAppRun(manifest: AppManifestV1, r: ResolvedAppResources): Ap
   return { sandboxSpec, workspaceId: r.workspace, workspaceIds };
 }
 
-/** Stable per Idempotency-Key, so a retry after a rolled-back create reuses the grant. */
-export function deriveGrantId(sessionId: string, idemKey: string | null): string {
-  if (!idemKey) return `grt_${ulid().toLowerCase()}`;
-  const h = createHash("sha256").update(`claw.app-grant/v1\n${sessionId}\n${idemKey}`).digest("hex");
-  return `grt_${h.slice(0, 32)}`;
+/** A grant id for one attempt. Never reused, never derived from the Idempotency-Key. */
+export function newGrantId(): string {
+  return `grt_${ulid().toLowerCase()}`;
+}
+
+/** Run `fn` with an AbortSignal that fires after `ms`; a call that has not returned by then fails. */
+async function withTimeout<T>(ms: number, what: string, fn: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const ctl = new AbortController();
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(`${what} timed out after ${ms}ms`);
+      ctl.abort(err);
+      reject(err);
+    }, ms);
+  });
+  try {
+    return await Promise.race([fn(ctl.signal), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -243,6 +269,8 @@ export interface AppRunRequest {
   auth: CallerAuth;
   body: { plugin_id?: unknown; input?: unknown; resources?: unknown };
   idemKey: string | null;
+  /** Hash of the request body, computed once by the route (see appRunRequestHash). */
+  requestHash: string;
 }
 
 export interface AppRunOutcome {
@@ -345,7 +373,7 @@ export async function checkAppRunRequest(
   if (size > limit) return refuse(413, "input_too_large", { max_bytes: limit });
 
   // 3. The resources, requested explicitly and clamped to the platform caps.
-  const resolvedOrIssues = resolveAppResources(manifest, req.body.resources, ports.caps());
+  const resolvedOrIssues = resolveAppResources(manifest, req.body.resources, ports.caps(), ports.containerCaps());
   if ("issues" in resolvedOrIssues) {
     return refuse(400, "app_resources_invalid", { problems: resolvedOrIssues.issues as AppResourcesIssue[] });
   }
@@ -383,8 +411,20 @@ export async function admitAppRun(
   if ("statusCode" in checked) return checked;
   const { pluginId, manifest, input, resolved, plan } = checked;
   const taskId = newTaskId();
-  const grantId = deriveGrantId(req.sessionId, req.idemKey);
+  const grantId = newGrantId();
   const grantRun: AppGrantRun = { grantId, taskId, sessionId: req.sessionId, userId: req.user.userId, pluginId };
+
+  // A caller with no platform key is refused the same way inside the transaction;
+  // say so before a grant is signed for a run that cannot be created.
+  try {
+    assertSessionCredentialsForDispatch(req.sessionId, req.user);
+  } catch (err) {
+    if (err instanceof MissingPlatformKeyError) {
+      logger.warn({ sessionId: req.sessionId, userId: req.user.userId }, "app_run.submit_without_platform_key");
+      return refuse(403, "missing_platform_key");
+    }
+    throw err;
+  }
 
   // A run already active is the common refusal and costs nothing to find: say so
   // before signing a grant. The transaction decides it again under its lock.
@@ -395,14 +435,16 @@ export async function admitAppRun(
   // never wait on a remote service. See AppGrantHooks.
   let issued: AppGrantIssued | void;
   try {
-    issued = await ports.grant.issue(grantRun, manifest, { resources: resolved, templates: appGrantTemplates(manifest, resolved) });
+    issued = await withTimeout(APP_GRANT_ISSUE_TIMEOUT_MS, "grant issue", (signal) => ports.grant.issue(
+      grantRun, manifest, { resources: resolved, templates: appGrantTemplates(manifest, resolved) }, signal,
+    ));
   } catch (err) {
     logger.error(
       { sessionId: req.sessionId, grantId, err: err instanceof Error ? err.message : String(err) },
       "app_run.grant_issue_failed",
     );
     // `issue` may have signed something before it failed; same rule as below.
-    await revokeUnlessRecorded(ports, grantRun, undefined, req.idemKey);
+    await revokeUnlessRecorded(ports, grantRun, undefined);
     return refuse(503, "grant_issue_failed");
   }
 
@@ -451,7 +493,7 @@ export async function admitAppRun(
           issued ? JSON.stringify(issued.limits ?? resolved.grant) : null,
           issued?.expiresAt ?? null,
           req.user.userId,
-          appRunRequestHash(req.body),
+          req.requestHash,
         ],
       );
       logger.info({ sessionId: req.sessionId, taskId, pluginId }, "app_run.created");
@@ -464,11 +506,9 @@ export async function admitAppRun(
   if (failure === undefined && outcome?.statusCode === 200) return outcome;
 
   // Refused, or failed: the task row is not committed (or its commit is unknown).
-  // The grant, if one was signed, is revoked unless a run row proves it is in use.
-  // A unique-violation on the idempotency index means a concurrent request with
-  // the same key won, and the grant id is the same one: leave it.
-  const code = (failure as { code?: string } | undefined)?.code;
-  if (!(code === "23505" && req.idemKey)) await revokeUnlessRecorded(ports, grantRun, issued, req.idemKey);
+  // The grant, if one was signed, is this attempt's own and is revoked unless its
+  // run row proves it was committed.
+  await revokeUnlessRecorded(ports, grantRun, issued);
   if (failure !== undefined) {
     if (failure instanceof MissingPlatformKeyError) {
       logger.warn({ sessionId: req.sessionId, userId: req.user.userId }, "app_run.submit_without_platform_key");
@@ -480,33 +520,25 @@ export async function admitAppRun(
 }
 
 /**
- * Revoke a grant signed for a run that has no row. Whether the row exists is asked
- * of the database, because a failed COMMIT does not say whether it applied; if that
- * question cannot be answered the grant is left alone (revoking a live run's grant
- * is the worse error) and the fact is logged. Never throws.
+ * Revoke the grant this attempt signed, unless this attempt's own run row exists.
+ * Whether it does is asked of the database, because a failed COMMIT does not say
+ * whether it applied; if that cannot be answered the grant is left alone (revoking
+ * a live run's grant is the worse error) and the fact is logged. The grant id is
+ * unique to the attempt, so no other attempt can be holding it: there is nothing
+ * to race with. Never throws.
  */
-export async function revokeUnlessRecorded(
-  ports: AppRunPorts,
-  run: AppGrantRun,
-  issued: AppGrantIssued | void,
-  idemKey: string | null = null,
-): Promise<void> {
-  if (!ports.grant.revoke) return;
+export async function revokeUnlessRecorded(ports: AppRunPorts, run: AppGrantRun, issued: AppGrantIssued | void): Promise<void> {
+  const revoke = ports.grant.revoke;
+  if (!revoke) return;
   try {
-    // By task id, and by Idempotency-Key as well: the grant id is derived from the
-    // key, so a run another attempt committed under the same key (possible when
-    // this attempt's lock was lost during the grant call) owns the same grant.
-    const recorded = await db.query(
-      "SELECT 1 FROM claw_app_runs WHERE task_id = $1 OR ($2::text IS NOT NULL AND session_id = $3 AND idempotency_key = $2)",
-      [run.taskId, idemKey, run.sessionId],
-    );
+    const recorded = await db.query("SELECT 1 FROM claw_app_runs WHERE task_id = $1", [run.taskId]);
     if (recorded.rows.length > 0) return;
   } catch (err) {
     logger.error({ grantId: run.grantId, err: err instanceof Error ? err.message : String(err) }, "app_run.grant_revoke_skipped_unknown_state");
     return;
   }
   try {
-    await ports.grant.revoke(run);
+    await withTimeout(APP_GRANT_ISSUE_TIMEOUT_MS, "grant revoke", (signal) => revoke.call(ports.grant, run, signal));
     logger.info({ grantId: run.grantId, issued: Boolean(issued) }, "app_run.grant_revoked");
   } catch (err) {
     logger.error({ grantId: run.grantId, err: err instanceof Error ? err.message : String(err) }, "app_run.grant_revoke_failed");
