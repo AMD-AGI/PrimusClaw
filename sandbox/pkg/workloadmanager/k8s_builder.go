@@ -31,6 +31,7 @@ import (
 
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	extensionsv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
+	"sigs.k8s.io/agent-sandbox/pkg/api"
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
@@ -57,7 +58,9 @@ type SandboxResult struct {
 	// MaxSessionDuration is read from CodeInterpreter.spec.maxSessionDuration.
 	// WM uses this to set SandboxInfo.ExpiresAt (hard upper bound on session lifetime).
 	MaxSessionDuration time.Duration
-	// Policy fields propagated from CodeInterpreter spec to Redis SandboxInfo.
+	// SessionID is namespace/name, the cluster-facing sandbox id.
+	SessionID string
+	// Policy fields copied from the template onto the Sandbox CR.
 	RuntimePolicy        string
 	AllowedEgressHosts   []string
 	AllowedInternalHosts []string
@@ -82,10 +85,8 @@ const (
 	// Following SaFE convention: userName → Annotation (may contain special chars).
 	userNameAnnotationKey = "runtime.agent-sandbox.io/user.name"
 
-	// sessionIDAnnotationKey stores the session ID on the Sandbox object.
-	// This enables session recovery from K8s when Redis data is lost (e.g. Redis restart).
-	// The Router can ask WM to look up a Sandbox by this annotation to rebuild the
-	// session→pod mapping without requiring Redis persistence.
+	// sessionIDAnnotationKey stores the sandbox id (namespace/name) on the Sandbox
+	// and Pod. EnvD JWT binding reads this via the downward API.
 	sessionIDAnnotationKey = "runtime.agent-sandbox.io/session-id"
 )
 
@@ -252,7 +253,6 @@ func validatePodIP(pod *corev1.Pod) (string, error) {
 // Safe parameters can be overridden via the overrides argument.
 func (c *K8sSandboxCreator) CreateSandbox(
 	ctx context.Context,
-	sessionID string,
 	ciName string,
 	namespace string,
 	user *UserIdentity,
@@ -272,6 +272,7 @@ func (c *K8sSandboxCreator) CreateSandbox(
 	// Note: CodeInterpreter names must NOT contain dots (e.g. use "python-311-runc"
 	// instead of "python-3.11-runc") to satisfy DNS-1035 Service naming rules.
 	sandboxName := ciName + "-" + randString(8)
+	sessionID := api.FormatSandboxID(namespace, sandboxName)
 
 	var result *SandboxResult
 	var err error
@@ -284,7 +285,7 @@ func (c *K8sSandboxCreator) CreateSandbox(
 		return nil, err
 	}
 
-	// Propagate maxSessionDuration → SandboxResult → Redis ExpiresAt.
+	// Propagate maxSessionDuration → SandboxResult → ExpiresAt / ShutdownTime.
 	// Priority: user override > template default > DefaultMaxSessionDuration (24h).
 	// No hard cap — users can request lifetimes longer than 24h.
 	if overrides != nil && overrides.MaxSessionDuration != "" {
@@ -298,7 +299,8 @@ func (c *K8sSandboxCreator) CreateSandbox(
 		result.MaxSessionDuration = DefaultMaxSessionDuration
 	}
 
-	// Propagate egress policy from CodeInterpreter spec → SandboxResult → Redis SandboxInfo.
+	result.SessionID = sessionID
+	// Propagate egress policy from CodeInterpreter spec onto the result (also stamped on the CR).
 	result.RuntimePolicy = ci.Spec.RuntimePolicy
 	if result.RuntimePolicy == "" {
 		result.RuntimePolicy = "agent-default"
@@ -332,7 +334,8 @@ func (c *K8sSandboxCreator) createDirect(ctx context.Context, ci *runtimev1alpha
 	// Build annotations + labels — following SaFE convention:
 	//   userId  → Label  (queryable via selector, no special chars)
 	//   userName → Annotation (may contain commas, no char restrictions)
-	//   sessionId → Annotation (enables session recovery from K8s when Redis data is lost)
+	//   sessionId → Annotation (canonical namespace/name routing key)
+	pol := sandboxPolicyFromTemplate(ci)
 	annotations := map[string]string{
 		sessionIDAnnotationKey: sessionID,
 	}
@@ -387,6 +390,10 @@ func (c *K8sSandboxCreator) createDirect(ctx context.Context, ci *runtimev1alpha
 	if err := c.client.Create(ctx, sandbox); err != nil {
 		return nil, fmt.Errorf("create Sandbox: %w", err)
 	}
+	if err := c.UpsertSandboxPolicy(ctx, sandbox, pol); err != nil {
+		c.rollbackDirectSandbox(ctx, namespace, sandboxName)
+		return nil, fmt.Errorf("create SandboxPolicy: %w", err)
+	}
 
 	podIP, err := c.waitForSandboxPodRunning(ctx, sandboxName, namespace)
 	if err != nil {
@@ -413,6 +420,35 @@ func (c *K8sSandboxCreator) createDirect(ctx context.Context, ci *runtimev1alpha
 // Generous: it is deleting three objects, and the alternative to it finishing
 // is a Pod held out of the pool until its absolute deadline.
 const claimRollbackTimeout = 30 * time.Second
+
+// rollbackDirectSandbox deletes a Sandbox whose create did not finish.
+// The deadline is detached from the request so a cancelled caller still deletes it.
+func (c *K8sSandboxCreator) rollbackDirectSandbox(ctx context.Context, namespace, sandboxName string) {
+	rbCtx, rbCancel := context.WithTimeout(context.WithoutCancel(ctx), claimRollbackTimeout)
+	defer rbCancel()
+	if err := c.DeleteSandbox(rbCtx, &store.SandboxInfo{
+		Namespace:   namespace,
+		SandboxName: sandboxName,
+	}); err != nil {
+		log.Error("sandbox rollback failed",
+			"namespace", namespace, "sandbox", sandboxName, "error", err)
+	}
+}
+
+// rollbackWarmPoolClaim deletes the Claim, adopted Pod, and Sandbox left by a
+// claim that did not finish. The deadline is detached from the request so a
+// cancelled caller still releases the Pod.
+func (c *K8sSandboxCreator) rollbackWarmPoolClaim(ctx context.Context, namespace, sandboxName string) {
+	rbCtx, rbCancel := context.WithTimeout(context.WithoutCancel(ctx), claimRollbackTimeout)
+	defer rbCancel()
+	if err := c.DeleteSandboxClaim(rbCtx, &store.SandboxInfo{
+		Namespace:   namespace,
+		SandboxName: sandboxName,
+	}); err != nil {
+		log.Error("warm-pool claim rollback failed; pod may be held until its deadline",
+			"namespace", namespace, "sandbox", sandboxName, "error", err)
+	}
+}
 
 // applyClaimMetadataWithRetry gives the patch a few goes before giving up on
 // the whole claim.
@@ -520,8 +556,9 @@ func (c *K8sSandboxCreator) createViaClaim(ctx context.Context, ci *runtimev1alp
 	}
 
 	// Build labels + annotations for the SandboxClaim — following SaFE convention.
-	// sessionID is always written for session recovery from K8s when Redis data is lost.
+	// sessionID is always written as the canonical namespace/name routing key.
 	claimLabels := map[string]string{}
+	claimPol := sandboxPolicyFromTemplate(ci)
 	claimAnnotations := map[string]string{
 		sessionIDAnnotationKey: sessionID,
 	}
@@ -564,7 +601,7 @@ func (c *K8sSandboxCreator) createViaClaim(ctx context.Context, ci *runtimev1alp
 					return nil, fmt.Errorf("sandbox reconciler returned nil sandbox for %s/%s", namespace, sandboxName)
 				}
 				// Patch labels + annotations onto the Sandbox created by WarmPool controller:
-				// - session-id annotation: enables session recovery from K8s when Redis is lost
+				// - session-id annotation: canonical namespace/name routing key
 				// - idle-timeout annotation: recorded, not enforced
 				// - user.id label: queryable user identity (SaFE convention)
 				// - user.name annotation: display name with possible special chars
@@ -603,18 +640,12 @@ func (c *K8sSandboxCreator) createViaClaim(ctx context.Context, ci *runtimev1alp
 					// is cancelled before it deletes anything, in precisely the
 					// case it exists for. Detached, with its own deadline so a
 					// wedged API server cannot hold the request open either.
-					rbCtx, rbCancel := context.WithTimeout(
-						context.WithoutCancel(ctx), claimRollbackTimeout)
-					rbErr := c.DeleteSandboxClaim(rbCtx, &store.SandboxInfo{
-						Namespace:   namespace,
-						SandboxName: sandboxName,
-					})
-					rbCancel()
-					if rbErr != nil {
-						log.Error("warm-pool claim rollback failed; pod may be held until its deadline",
-							"namespace", namespace, "sandbox", sandboxName, "error", rbErr)
-					}
+					c.rollbackWarmPoolClaim(ctx, namespace, sandboxName)
 					return nil, fmt.Errorf("warm-pool sandbox %s/%s: %w", namespace, sandboxName, err)
+				}
+				if err := c.UpsertSandboxPolicy(waitCtx, createdSandbox, claimPol); err != nil {
+					c.rollbackWarmPoolClaim(ctx, namespace, sandboxName)
+					return nil, fmt.Errorf("create SandboxPolicy for warm-pool sandbox %s/%s: %w", namespace, sandboxName, err)
 				}
 				if ci.Spec.AuthMode != runtimev1alpha1.AuthModeNone {
 					podName := createdSandbox.Annotations["agents.x-k8s.io/pod-name"]
@@ -1326,40 +1357,90 @@ func applyOverrides(
 	}
 }
 
-// RecoverSessionFromK8s rebuilds a SandboxInfo by searching K8s for a Sandbox
-// with a matching session-id annotation. This is the fallback path when Redis
-// data is lost (e.g. Redis restart without persistence).
-//
-// Returns the recovered SandboxInfo or an error if not found.
+// GetSandbox loads a Sandbox CR by namespace and name.
+// Prefers the manager cache when attached so Router/WM hot paths avoid
+// uncached API Server GETs per request. A cache miss falls back to a live
+// API Server GET so a rolling restart cannot answer 404 for a sandbox that
+// still exists (Brain treats 404/410 as absent and would reclaim Hands).
+func (c *K8sSandboxCreator) GetSandbox(ctx context.Context, namespace, name string) (*sandboxv1alpha1.Sandbox, error) {
+	sb := &sandboxv1alpha1.Sandbox{}
+	key := types.NamespacedName{Name: name, Namespace: namespace}
+	if c.cachedReader != nil {
+		err := c.cachedReader.Get(ctx, key, sb)
+		if err == nil {
+			return sb, nil
+		}
+		if !k8serrors.IsNotFound(err) {
+			return nil, err
+		}
+		return c.getSandboxLive(ctx, namespace, name)
+	}
+	if err := c.client.Get(ctx, key, sb); err != nil {
+		return nil, err
+	}
+	return sb, nil
+}
+
+// getSandboxLive loads a Sandbox CR from the API Server, bypassing the cache.
+// Use for write/patch bases that need a fresh resourceVersion.
+func (c *K8sSandboxCreator) getSandboxLive(ctx context.Context, namespace, name string) (*sandboxv1alpha1.Sandbox, error) {
+	sb := &sandboxv1alpha1.Sandbox{}
+	if err := c.client.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, sb); err != nil {
+		return nil, err
+	}
+	return sb, nil
+}
+
+// RecoverSessionFromK8s rebuilds a SandboxInfo from the Sandbox CR for sessionID.
 func (c *K8sSandboxCreator) RecoverSessionFromK8s(ctx context.Context, sessionID string) (*store.SandboxInfo, error) {
 	sb, err := c.findSandboxBySessionID(ctx, sessionID)
 	if err != nil {
 		return nil, err
 	}
+	info, err := sandboxInfoFromCR(sb)
+	if err != nil {
+		return nil, err
+	}
+	pol, _, polErr := c.GetSandboxPolicy(ctx, sb.Namespace, sb.Name)
+	if polErr != nil {
+		return nil, polErr
+	}
+	applyPolicyToInfo(info, pol)
+	if info.PodIP != "" {
+		return info, nil
+	}
+	podName := sb.Name
+	if annotated, ok := sb.Annotations["agents.x-k8s.io/pod-name"]; ok && annotated != "" {
+		podName = annotated
+	}
+	ip, err := c.GetSandboxPodIP(ctx, sb.Namespace, sb.Name, podName)
+	if err != nil {
+		return nil, fmt.Errorf("sandbox %s/%s found but pod IP unavailable: %w", sb.Namespace, sb.Name, err)
+	}
+	info.PodIP = ip
+	info.EntryPoints = map[string]string{"/": fmt.Sprintf("%s:%d", ip, 8080)}
+	return info, nil
+}
 
-	sandboxName := sb.Name
-	namespace := sb.Namespace
+// sandboxInfoFromCR maps a Sandbox CR to SandboxInfo without a PodIP lookup.
+// PodIP is ServiceFQDN/Service DNS when present; otherwise empty.
+//
+// SessionID prefers namespace/name. A legacy opaque annotation (e.g. sess_*) is
+// kept so dual-read clients can release by the id they already hold. Another
+// object's namespace/name in the annotation is ignored (spoof protection).
+func sandboxInfoFromCR(sb *sandboxv1alpha1.Sandbox) (*store.SandboxInfo, error) {
+	if sb == nil {
+		return nil, fmt.Errorf("sandbox is nil")
+	}
+	sessionID := effectiveSessionID(sb)
 
-	// Prefer ServiceFQDN (stable across Pod restarts).
-	var podIP string
+	podIP := ""
 	if sb.Status.ServiceFQDN != "" {
 		podIP = sb.Status.ServiceFQDN
 	} else if sb.Status.Service != "" {
-		podIP = fmt.Sprintf("%s.%s.svc.cluster.local", sb.Status.Service, namespace)
-	} else {
-		// Fallback: get Pod IP from the pod.
-		podName := sandboxName
-		if annotated, ok := sb.Annotations["agents.x-k8s.io/pod-name"]; ok && annotated != "" {
-			podName = annotated
-		}
-		ip, err := c.GetSandboxPodIP(ctx, namespace, sandboxName, podName)
-		if err != nil {
-			return nil, fmt.Errorf("sandbox %s/%s found but pod IP unavailable: %w", namespace, sandboxName, err)
-		}
-		podIP = ip
+		podIP = fmt.Sprintf("%s.%s.svc.cluster.local", sb.Status.Service, sb.Namespace)
 	}
 
-	// Determine Kind from ownerReferences (SandboxClaim → "SandboxClaim", else → "Sandbox")
 	kind := store.SandboxKind
 	for _, ref := range sb.OwnerReferences {
 		if ref.Kind == "SandboxClaim" {
@@ -1368,44 +1449,78 @@ func (c *K8sSandboxCreator) RecoverSessionFromK8s(ctx context.Context, sessionID
 		}
 	}
 
-	// Reconstruct SandboxInfo.
+	expiresAt := time.Now().Add(DefaultMaxSessionDuration)
+	if sb.Spec.Lifecycle.ShutdownTime != nil && !sb.Spec.Lifecycle.ShutdownTime.IsZero() {
+		expiresAt = sb.Spec.Lifecycle.ShutdownTime.Time
+	}
+
+	podName := sb.Name
+	if sb.Annotations != nil {
+		if annotated := strings.TrimSpace(sb.Annotations["agents.x-k8s.io/pod-name"]); annotated != "" {
+			podName = annotated
+		}
+	}
+
 	info := &store.SandboxInfo{
-		Kind:         kind,
-		SessionID:    sessionID,
-		SandboxName:  sandboxName,
-		Namespace:    namespace,
-		PodIP:        podIP,
-		PodPort:      8080,
-		EntryPoints:  map[string]string{"/": fmt.Sprintf("%s:%d", podIP, 8080)},
-		CreatedAt:    sb.CreationTimestamp.Time,
-		LastActivity: time.Now(),
-		ExpiresAt:    time.Now().Add(DefaultMaxSessionDuration), // default; Lifecycle overrides below
-		Status:       "running",
+		Kind:        kind,
+		SessionID:   sessionID,
+		SandboxName: sb.Name,
+		Namespace:   sb.Namespace,
+		PodIP:       podIP,
+		PodPort:     8080,
+		PodName:     podName,
+		CreatedAt:   sb.CreationTimestamp.Time,
+		ExpiresAt:   expiresAt,
+		Status:      getSandboxPodPhase(sb),
 	}
-
-	// Recover user identity from annotations/labels.
-	if uid, ok := sb.Labels[userIDLabelKey]; ok {
-		info.UserID = uid
+	if podIP != "" {
+		info.EntryPoints = map[string]string{"/": fmt.Sprintf("%s:%d", podIP, 8080)}
 	}
-	if uname, ok := sb.Annotations[userNameAnnotationKey]; ok {
-		info.UserName = uname
+	if sb.Labels != nil {
+		info.UserID = sb.Labels[userIDLabelKey]
 	}
-
-	// Use Lifecycle.ShutdownTime for accurate ExpiresAt.
-	if !sb.Spec.Lifecycle.ShutdownTime.IsZero() {
-		info.ExpiresAt = sb.Spec.Lifecycle.ShutdownTime.Time
+	if sb.Annotations != nil {
+		info.UserName = sb.Annotations[userNameAnnotationKey]
 	}
-
+	// Policy comes from the SandboxPolicy CR (see RecoverSessionFromK8s /
+	// attachSandboxPolicy). Annotations are not authoritative.
 	return info, nil
+}
+
+// effectiveSessionID returns the id clients should use for this Sandbox.
+// New sessions use namespace/name; legacy opaque annotations are preserved.
+func effectiveSessionID(sb *sandboxv1alpha1.Sandbox) string {
+	if sb == nil {
+		return ""
+	}
+	canonical := api.FormatSandboxID(sb.Namespace, sb.Name)
+	if sb.Annotations == nil {
+		return canonical
+	}
+	ann := strings.TrimSpace(sb.Annotations[sessionIDAnnotationKey])
+	if ann == "" || ann == canonical {
+		return canonical
+	}
+	// Spoof protection: never adopt another object's namespace/name from the
+	// user-writable annotation.
+	if _, _, ok := api.ParseSandboxID(ann); ok {
+		return canonical
+	}
+	return ann
 }
 
 // findSandboxBySessionID resolves a session id to its Sandbox.
 //
-// Prefers the indexed cache: this runs once per keepalive poll per session while
-// the store cannot answer, and a List of every Sandbox at that rate turns a store
-// outage into API server load. Falls back to that List when the cache cannot
-// serve the query -- before it has synced, or in a deployment wired without a
-// reader or without the index -- so the worst case is what this path did before.
+// Dual-read: namespace/name resolves by object identity. Opaque ids (legacy
+// sess_*) resolve via the session-id annotation index so pre-upgrade sessions
+// remain releasable without Redis.
+//
+// Prefers the indexed cache for non-canonical lookups: this runs once per
+// keepalive poll per session while the store cannot answer, and a List of every
+// Sandbox at that rate turns a store outage into API server load. Falls back to
+// that List when the cache cannot serve the query -- before it has synced, or in
+// a deployment wired without a reader or without the index -- so the worst case
+// is what this path did before.
 //
 // A cache read can lag a creation by the length of a watch delivery. Recovery
 // only ever asks about sandboxes that already outlived their stored record, so
@@ -1413,6 +1528,23 @@ func (c *K8sSandboxCreator) RecoverSessionFromK8s(ctx context.Context, sessionID
 func (c *K8sSandboxCreator) findSandboxBySessionID(
 	ctx context.Context, sessionID string,
 ) (*sandboxv1alpha1.Sandbox, error) {
+	if ns, name, ok := api.ParseSandboxID(sessionID); ok {
+		sb, err := c.GetSandbox(ctx, ns, name)
+		if err == nil {
+			if err := rejectIfTerminating(sessionID, sb); err != nil {
+				return nil, err
+			}
+			return sb, nil
+		}
+		if !k8serrors.IsNotFound(err) {
+			return nil, err
+		}
+		// Canonical namespace/name ids resolve only by object identity. Do not
+		// fall through to annotation search: session-id annotations are
+		// user-writable and must not hijack another ns/name.
+		return nil, fmt.Errorf("no sandbox found with session-id %q", sessionID)
+	}
+
 	if c.cachedReader != nil {
 		indexed := &sandboxv1alpha1.SandboxList{}
 		err := c.cachedReader.List(ctx, indexed, ctrlclient.MatchingFields{SessionIDIndexField: sessionID})
@@ -1471,13 +1603,18 @@ func (c *K8sSandboxCreator) confirmSandbox(
 	return confirmed, nil
 }
 
+// errSandboxTerminating marks a Sandbox that has a DeletionTimestamp.
+// Callers map it to store.ErrNotFound so clients treat the session as gone
+// rather than as a transient store failure.
+var errSandboxTerminating = errors.New("sandbox is being deleted")
+
 // rejectIfTerminating refuses a Sandbox on its way out. Rebuilding a session record
 // for one would answer the caller with an address about to stop serving, and leave
 // the mapping behind after it does.
 func rejectIfTerminating(sessionID string, sb *sandboxv1alpha1.Sandbox) error {
 	if !sb.DeletionTimestamp.IsZero() {
-		return fmt.Errorf("sandbox %s/%s for session %q is being deleted",
-			sb.Namespace, sb.Name, sessionID)
+		return fmt.Errorf("sandbox %s/%s for session %q: %w",
+			sb.Namespace, sb.Name, sessionID, errSandboxTerminating)
 	}
 	return nil
 }

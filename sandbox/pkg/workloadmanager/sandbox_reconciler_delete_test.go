@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -31,15 +32,17 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
+	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
 
 const (
 	delTestNS      = "sandboxes"
 	delTestSandbox = "sbx-1"
-	delTestSession = "sess-1"
+	delTestSession = "sandboxes/sbx-1"
 )
 
 func delTestKey() types.NamespacedName {
@@ -50,6 +53,7 @@ func deleteTestReconciler(t *testing.T, st store.Store, objs ...ctrlclient.Objec
 	t.Helper()
 	scheme := k8sruntime.NewScheme()
 	utilruntime.Must(sandboxv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(runtimev1alpha1.AddToScheme(scheme))
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 	return &SandboxReconciler{Client: c, Scheme: scheme, Store: st}
 }
@@ -60,9 +64,12 @@ func runningSandbox(sessionID string) *sandboxv1alpha1.Sandbox {
 	shutdown := metav1.NewTime(time.Now().Add(24 * time.Hour))
 	return &sandboxv1alpha1.Sandbox{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        delTestSandbox,
-			Namespace:   delTestNS,
-			Annotations: map[string]string{sessionIDAnnotationKey: sessionID},
+			Name:      delTestSandbox,
+			Namespace: delTestNS,
+			Annotations: map[string]string{
+				sessionIDAnnotationKey: sessionID,
+			},
+			ResourceVersion: "1",
 		},
 		Spec: sandboxv1alpha1.SandboxSpec{
 			Lifecycle: sandboxv1alpha1.Lifecycle{ShutdownTime: &shutdown},
@@ -91,6 +98,28 @@ func delTestSessionExists(t *testing.T, st store.Store, sessionID string) bool {
 	t.Helper()
 	info, err := st.GetSandboxBySessionID(context.Background(), sessionID)
 	return err == nil && info != nil
+}
+
+func TestEnsureSessionRegisteredPreservesLegacyOpaqueID(t *testing.T) {
+	const legacy = "sess_pre_upgrade"
+	st := store.NewMemoryStore()
+	r := deleteTestReconciler(t, st, runningSandbox(legacy))
+	reconcileDelTest(t, r)
+
+	var got sandboxv1alpha1.Sandbox
+	if err := r.Get(context.Background(), delTestKey(), &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Annotations[sessionIDAnnotationKey] != legacy {
+		t.Fatalf("annotation = %q, want preserved legacy %q",
+			got.Annotations[sessionIDAnnotationKey], legacy)
+	}
+	if !delTestSessionExists(t, st, legacy) {
+		t.Fatal("legacy session id must remain resolvable after reconcile")
+	}
+	if delTestSessionExists(t, st, delTestSession) {
+		t.Fatal("must not re-register under an overwritten canonical id")
+	}
 }
 
 func TestDeletedSandboxDeregistersItsSession(t *testing.T) {
@@ -162,13 +191,13 @@ func TestUnknownSandboxDeletionTouchesNothing(t *testing.T) {
 	}
 }
 
-// TestDeletionWithoutAStoreIsInert keeps dev mode (no Redis) working.
+// TestDeletionWithoutAStoreIsInert keeps Store-nil mode working.
 func TestDeletionWithoutAStoreIsInert(t *testing.T) {
 	r := deleteTestReconciler(t, nil)
 	reconcileDelTest(t, r) // must not panic on a nil Store
 }
 
-// flakyStore fails deletes until healed, standing in for a Redis blip.
+// flakyStore fails deletes until healed, standing in for a transient store blip.
 type flakyStore struct {
 	store.Store
 	deleteErr error
@@ -190,7 +219,7 @@ func (f *flakyStore) DeleteSandboxBySessionID(ctx context.Context, sessionID str
 // Consuming it eagerly would silently fall back to the key's own TTL.
 func TestFailedDeregistrationIsRetriedNotDropped(t *testing.T) {
 	base := store.NewMemoryStore()
-	st := &flakyStore{Store: base, deleteErr: errors.New("redis: connection refused")}
+	st := &flakyStore{Store: base, deleteErr: errors.New("store: connection refused")}
 	r := deleteTestReconciler(t, st, runningSandbox(delTestSession))
 
 	reconcileDelTest(t, r)
@@ -209,7 +238,7 @@ func TestFailedDeregistrationIsRetriedNotDropped(t *testing.T) {
 		t.Fatal("nothing should have been removed yet")
 	}
 
-	// Redis comes back; the retried reconcile finishes the job.
+	// Store recovers; the retried reconcile finishes the job.
 	st.deleteErr = nil
 	reconcileDelTest(t, r)
 
@@ -228,7 +257,7 @@ func TestFailedDeregistrationIsRetriedNotDropped(t *testing.T) {
 // sandbox until its next reconcile.
 func TestDeregistrationSparesAReusedSession(t *testing.T) {
 	base := store.NewMemoryStore()
-	st := &flakyStore{Store: base, deleteErr: errors.New("redis: down")}
+	st := &flakyStore{Store: base, deleteErr: errors.New("store: down")}
 	r := deleteTestReconciler(t, st, runningSandbox(delTestSession))
 
 	reconcileDelTest(t, r)
@@ -262,5 +291,61 @@ func TestDeregistrationSparesAReusedSession(t *testing.T) {
 	}
 	if r.peekSession(delTestKey()) != "" {
 		t.Error("the stale recording must still be dropped")
+	}
+}
+
+// A conflict while writing session-id or ShutdownTime has to come back to the
+// work queue. Dropping it leaves a kubectl-applied Sandbox without those
+// defaults until some later watch event happens to retry the reconcile.
+func TestReconcileReturnsSessionRegistrationError(t *testing.T) {
+	scheme := k8sruntime.NewScheme()
+	utilruntime.Must(sandboxv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(runtimev1alpha1.AddToScheme(scheme))
+	sb := runningSandbox(delTestSession)
+	sb.Annotations = nil
+	sb.Spec.Lifecycle.ShutdownTime = nil
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sb).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(context.Context, ctrlclient.WithWatch, ctrlclient.Object, ctrlclient.Patch, ...ctrlclient.PatchOption) error {
+				return errors.New("conflict")
+			},
+		}).Build()
+	r := &SandboxReconciler{Client: c, Scheme: scheme}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: delTestKey()})
+	if err == nil {
+		t.Fatal("a failed session-defaults patch must be returned so the reconcile is retried")
+	}
+}
+
+func TestReconcileLeavesExistingSessionWithoutADefaultPolicy(t *testing.T) {
+	r := deleteTestReconciler(t, store.NewMemoryStore(), runningSandbox("sess_pre_upgrade"))
+	reconcileDelTest(t, r)
+
+	err := r.Get(context.Background(), delTestKey(), &runtimev1alpha1.SandboxPolicy{})
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("a sandbox that already has a session id must not gain an agent-default policy, got %v", err)
+	}
+}
+
+func TestReconcileCreatesDefaultPolicyForUnidentifiedSandbox(t *testing.T) {
+	sb := runningSandbox("")
+	sb.Annotations = nil
+	r := deleteTestReconciler(t, nil, sb)
+	reconcileDelTest(t, r)
+
+	var pol runtimev1alpha1.SandboxPolicy
+	if err := r.Get(context.Background(), delTestKey(), &pol); err != nil {
+		t.Fatalf("kubectl-applied sandbox should receive a default policy: %v", err)
+	}
+	if pol.Spec.RuntimePolicy != "agent-default" {
+		t.Fatalf("RuntimePolicy=%q, want agent-default", pol.Spec.RuntimePolicy)
+	}
+	var got sandboxv1alpha1.Sandbox
+	if err := r.Get(context.Background(), delTestKey(), &got); err != nil {
+		t.Fatalf("Get sandbox: %v", err)
+	}
+	if got.Annotations[sessionIDAnnotationKey] != delTestSession {
+		t.Fatalf("session id = %q, want %q", got.Annotations[sessionIDAnnotationKey], delTestSession)
 	}
 }

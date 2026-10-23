@@ -30,14 +30,17 @@ type internalAuditRequest struct {
 }
 
 func (s *Server) handleGetLogs(c *gin.Context) {
+	// Production audit is process logs only; query APIs need a durable store.
 	if s.auditStore == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "audit logging is not enabled"})
+		c.JSON(http.StatusNotImplemented, gin.H{
+			"error": "audit events are written to process logs; session log query is not available",
+		})
 		return
 	}
 
-	sessionID := c.Param("sessionId")
-	if sessionID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "sessionId is required"})
+	sessionID, ok := pathSessionID(c)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "session id is required"})
 		return
 	}
 
@@ -96,14 +99,14 @@ func (s *Server) handleGetLogs(c *gin.Context) {
 }
 
 func (s *Server) handleInternalAudit(c *gin.Context) {
-	if s.auditStore == nil {
+	if !s.cfg.Audit.Enabled && s.auditStore == nil {
 		c.Status(http.StatusAccepted)
 		return
 	}
 
-	sessionID := c.Param("sessionId")
-	if sessionID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "sessionId is required"})
+	sessionID, ok := pathSessionID(c)
+	if !ok || sessionID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "session id is required"})
 		return
 	}
 

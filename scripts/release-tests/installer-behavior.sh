@@ -13,15 +13,22 @@ cat >"$tmp/bin/kubectl" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
   *"config current-context"*) echo release-test ;;
-  *"get sc -o jsonpath="*) printf 'fast\nslow\n' ;;
   *"get deploy agent-sandbox-controlplane"*)
-    [[ "${MOCK_READY:-false}" == "true" ]] && printf 'Helm|agent-sandbox|1|1' || exit 1
-    ;;
-  *"get statefulset redis"*)
-    [[ "${MOCK_READY:-false}" == "true" ]] && printf '1|1' || exit 1
-    ;;
-  *"get secret agent-sandbox-redis"*)
-    [[ "${MOCK_READY:-false}" == "true" || -f "${MOCK_HELM_APPLIED:-/nonexistent}" ]] || exit 1
+    ready="${MOCK_READY:-false}"
+    applied=false
+    [[ -f "${MOCK_HELM_APPLIED:-/nonexistent}" ]] && applied=true
+    if [[ "$ready" != "true" && "$applied" != "true" ]]; then
+      exit 1
+    fi
+    case "$*" in
+      *managed-by*instance*)
+        # Idempotency skip path wants readyReplicas == desired.
+        [[ "$ready" == "true" ]] && printf 'Helm|agent-sandbox|1|1' || printf 'Helm|agent-sandbox|1|0'
+        ;;
+      *managed-by*) printf 'Helm' ;;
+      *instance*) printf 'agent-sandbox' ;;
+      *) ;; # bare existence check
+    esac
     ;;
   *"get secret envd-router-identity"*) exit 1 ;;
   *"get ns "*) exit 1 ;;
@@ -48,10 +55,6 @@ chmod +x "$tmp/bin/kubectl"
 cat >"$tmp/bin/openssl" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "version" ]]; then echo "OpenSSL mock"; exit 0; fi
-if [[ "${1:-}" == "rand" ]]; then
-  echo "0123456789abcdefghijklmnopqrstuvwxyz"
-  exit 0
-fi
 if [[ "${1:-}" == "genrsa" ]]; then
   out=""
   for ((i=1; i<=$#; i++)); do
@@ -120,43 +123,24 @@ if ! env PATH="$tmp/bin:$PATH" \
   exit 1
 fi
 
-grep -q -- '--set redis.storage.storageClassName=fast' "$capture"
 grep -q -- '--set router.config.safeApiUrl=https://safe.example' "$capture"
+grep -q -- '--set redis\.' "$capture" && {
+  echo "installer still passes redis.* Helm sets" >&2
+  exit 1
+}
 python3 - "$values_capture" <<'PY'
 import json
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as f:
     values = json.load(f)
-assert values["redis"]["password"] == "0123456789abcdefghijklmnopqrstuv"
+assert "redis" not in values
 assert values["egress"]["enabled"] is True
 PY
-if grep -q '════════.*redis.password\|════════.*storageClassName' "$capture"; then
+if grep -q '════════.*storageClassName\|════════.*redis' "$capture"; then
   echo "section formatting leaked into a Helm value" >&2
   exit 1
 fi
-
-if ! env PATH="$tmp/bin:$PATH" \
-  HELM_CAPTURE="$capture" \
-  HELM_VALUES_CAPTURE="$values_capture" \
-  MOCK_HELM_APPLIED="$tmp/helm.applied" \
-  SAFE_API_URL="https://safe.example" \
-  REDIS_PASSWORD='pa,ss\word={x}' \
-  FORCE_SANDBOX=true \
-  AUTO_INSTALL_HELM=false \
-  NAMESPACE=release-test \
-  bash "$repo_root/sandbox/deploy/scripts/install.sh" >"$output" 2>&1; then
-  command cat "$output" >&2
-  exit 1
-fi
-python3 - "$values_capture" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as f:
-    values = json.load(f)
-assert values["redis"]["password"] == r"pa,ss\word={x}"
-PY
 
 # Extra CA ConfigMap: forwarded to the chart when present, and a missing or
 # certificate-less one stops the install before Helm runs.

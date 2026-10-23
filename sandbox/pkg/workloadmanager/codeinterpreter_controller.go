@@ -458,22 +458,10 @@ func (r *CodeInterpreterReconciler) buildPodTemplate(ci *runtimev1alpha1.CodeInt
 		}
 	}
 
-	// Inject unified inference gateway env vars.
-	// Only OPENAI_BASE_URL (LiteLLM address) is injected via Pod env — it's global and same for all sandboxes.
-	// OPENAI_API_KEY is per-user and injected by EnvD at process level (from Redis session data).
-	if inferenceEnabled() {
-		if endpoint := inferenceLiteLLMEndpoint(); endpoint != "" {
-			envVars = append(envVars, corev1.EnvVar{
-				Name:  "OPENAI_BASE_URL",
-				Value: endpoint,
-			})
-		}
-	}
-
-	// EnvD needs WM URL for both inference key fetch and egress policy sync.
-	// Authentication uses Router-signed JWT (captured from incoming request),
-	// so no static token injection is needed.
-	if inferenceEnabled() || egressEnabled() {
+	// EnvD needs the WM URL to pull egress policy. Authentication uses the
+	// Router-signed JWT captured from the incoming request, so no static token
+	// injection is needed.
+	if egressEnabled() {
 		wmURL := fmt.Sprintf("http://%s.%s.svc.cluster.local:%s",
 			workloadManagerServiceName(),
 			os.Getenv("AGENT_SANDBOX_NAMESPACE"),
@@ -924,18 +912,6 @@ func egressEnabled() bool {
 // egressExtraBlockedCIDRs returns comma-separated extra CIDRs to block.
 func egressExtraBlockedCIDRs() string {
 	return os.Getenv("EGRESS_EXTRA_BLOCKED_CIDRS")
-}
-
-// inferenceEnabled returns true when the unified inference gateway is configured.
-// Reads INFERENCE_ENABLED env var set on the Workload Manager Deployment.
-func inferenceEnabled() bool {
-	return os.Getenv("INFERENCE_ENABLED") == "true"
-}
-
-// inferenceLiteLLMEndpoint returns the LiteLLM gateway URL
-// (e.g. http://litellm.agent-sandbox-system:4000/v1).
-func inferenceLiteLLMEndpoint() string {
-	return os.Getenv("INFERENCE_LITELLM_ENDPOINT")
 }
 
 // workloadManagerServiceName returns the Service DNS name used by EnvD to reach

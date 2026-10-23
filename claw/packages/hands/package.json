@@ -13,7 +13,7 @@
   "dependencies": {
     "@claw/protocol": "*",
     "@claw/utils": "*",
-    "@modelcontextprotocol/sdk": "^1.31.0",
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "fastify": "^5.12.5",
     "minimatch": "^10.2.6",
     "zod": "^4.6.5"

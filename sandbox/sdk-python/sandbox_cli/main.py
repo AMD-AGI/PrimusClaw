@@ -175,15 +175,7 @@ if HAS_CLICK:
     @click.option("--stream", is_flag=True, default=False,
                   help="Stream creation progress in real-time via SSE")
     def sandbox_create(template, namespace, env, session_timeout, max_duration, runtime_class, label, annotation, stream):
-        """Create a new sandbox session with optional parameter overrides.
-
-        When the platform has inference enabled, OPENAI_BASE_URL is injected as
-        a Pod env var, and OPENAI_API_KEY is injected at process level by EnvD.
-        Use 'import openai' inside the sandbox directly.
-
-        Note: Inference gateway requires API Key auth (SDK/CLI). Cookie auth
-        (browser) does not support inference — OPENAI_API_KEY will not be set.
-        """
+        """Create a new sandbox session with optional parameter overrides."""
         ns = namespace or get_config_value("namespace", "default")
         cp = get_cp_client()
 

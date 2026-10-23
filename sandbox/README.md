@@ -36,7 +36,6 @@ once the relevant controls are turned on. The values shipped in
 | `egress.enabled` | `false` | envd does not start the transparent proxy at all, so there is **no** SSRF protection and **no** outbound filtering |
 | Network policy | n/a (Flannel) | There is no network-level backstop for the item above |
 | Default egress policy preset | `agent-default` allows external traffic | Even with the proxy on, outbound internet is permitted unless you tighten the policy |
-| Credentials in the sandbox | caller's per-user gateway key is injected | In-sandbox code can read and spend the invoking user's own key (upstream provider keys stay in LiteLLM) |
 
 To stop the unauthenticated case from happening silently, the control plane
 **refuses to start** when `enableAuth` is false unless you also set
@@ -70,8 +69,6 @@ In addition:
   escape does not reach the host kernel.
 - Tighten the egress policy away from the permissive `agent-default` preset to an
   allowlist appropriate to your workloads.
-- Scope and rate-limit the per-user gateway keys at the SaFE layer, and be ready
-  to revoke them — in-sandbox code can read the key of the user who invoked it.
 - Apply a restricted Pod Security Standard to the sandbox namespace, and keep
   sandbox namespaces separate from the control-plane namespace.
 
@@ -230,7 +227,6 @@ A high-frequency, short-task code-execution environment that also supports long-
 - Persistent shell sessions (tmux-backed) that retain cwd, env vars and background processes.
 - Interactive terminal: send key sequences, capture screen snapshots.
 - AMD GPU status queries.
-- OpenAI-compatible: `OPENAI_BASE_URL` injected for in-sandbox model calls via the platform LLM proxy.
 - Optional egress control (transparent proxy + SSRF protection) with policy synced from the Workload Manager.
 - Session lifecycle management with max-duration auto-reclamation.
 - Auth: SaFE Cookie (browser) or API Key (`ak-` prefix, for SDK / CLI).
@@ -268,13 +264,9 @@ A built-in Go evaluator (`pkg/policy`), running inside envd, decides `allow`/`de
 
 Allow-lists can be changed on a running sandbox without restarting the Pod. envd periodically **pulls** the latest policy from the Workload Manager (default every 30s, via Router, reusing the existing JWT channel) and atomically swaps it into the policy evaluator (`policy.Engine.UpdateConfig`) when the version changes. Two change sources: platform-level edits to `ClusterSandboxPolicy`, and per-sandbox developer updates via SDK/CLI/API (`PATCH /v1/sandbox/sessions/{id}/policy`, overwrite semantics). If the pull fails, the last good policy stays in effect. Source: `pkg/envd/policy_sync.go`.
 
-## Unified Inference Egress
-
-The sandbox Pod never holds a real *upstream provider* key. The Workload Manager injects `OPENAI_BASE_URL` (pointing at the in-cluster **LiteLLM** gateway) and a per-user `OPENAI_API_KEY` (SaFE API Key or LiteLLM Virtual Key); the real backend keys stay in LiteLLM. Note that the injected per-user key is a real credential belonging to the invoking user — in-sandbox code can read it, so scope and rate-limit it upstream. In-sandbox code can just `import openai` and call models, with per-user metering and isolation. This is optional — code may also override `base_url`/`api_key` to use a public or internal LLM directly (subject to egress policy).
-
 ## Custom Image Build
 
-Instead of installing dependencies via `steps` on every start, a template can supply a Dockerfile (`build.dockerfile`) and the platform builds the image with **kaniko**, pushing to an internal registry and updating `fromImage`. Build caching is two-tiered: an image-hash index (identical Dockerfile → reuse) and kaniko layer cache (`--cache-repo`). Build Pods are sandboxed (no ServiceAccount token, no platform credentials, resource limits, build timeout). Source: `pkg/builder/`. (The Workload Manager also returns a warning when it detects `pip/apt/npm install` in `steps`, suggesting a custom image or `warmPoolSize`.)
+Instead of installing dependencies via `steps` on every start, a template can supply a Dockerfile (`build.dockerfile`) and the platform builds the image with **kaniko**, pushing to an internal registry and updating `fromImage`. Optional layer reuse uses kaniko's `--cache-repo` when configured. Build Pods are sandboxed (no ServiceAccount token, no platform credentials, resource limits, build timeout). Source: `pkg/builder/`. (The Workload Manager also returns a warning when it detects `pip/apt/npm install` in `steps`, suggesting a custom image or `warmPoolSize`.)
 
 ## In-Sandbox Service Access
 
