@@ -8,7 +8,6 @@ import {
   APP_MANIFEST_SCHEMA,
   APP_PLATFORM_ENV,
   isReservedAppEnv,
-  isGpuResourceKey,
   validateAppManifest,
   type AppManifestV1,
 } from "../src/app-manifest.js";
@@ -242,7 +241,6 @@ test("per_gpu_count, which Claw reads, must be a list of positive integers", () 
 test("anything keyed by a role needs that role declared", () => {
   const noDev = (m: any) => { delete m.sandbox_roles.dev; };
   refused(mutate(noDev), "env_map.sandbox_keys.dev", "not declared in sandbox_roles");
-  const noSub = (m: any) => { delete m.sandbox_roles.subrun; };
 });
 
 test("two things writing one variable, and platform-owned names, are refused", () => {

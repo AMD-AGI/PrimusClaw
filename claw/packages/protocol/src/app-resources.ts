@@ -136,8 +136,7 @@ const QUANTITY_SUFFIX: Record<string, number> = {
   Ki: 1024, Mi: 1024 ** 2, Gi: 1024 ** 3, Ti: 1024 ** 4, Pi: 1024 ** 5, Ei: 1024 ** 6,
 };
 /** A Kubernetes quantity ("8", "500m", "32Gi", "1e3", "1G") as a number; undefined when not one. */
-function quantity(q: string | undefined): number | undefined {
-  if (q === undefined) return undefined;
+function quantity(q: string): number | undefined {
   const m = /^([0-9]+(?:\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+|[numkMGTPE]|Ki|Mi|Gi|Ti|Pi|Ei)?$/.exec(q.trim());
   if (!m) return undefined;
   const n = Number(m[1]) * (m[2] === undefined ? 1 : /^[eE][+-]?[0-9]/.test(m[2]) ? 10 ** Number(m[2].slice(1)) : QUANTITY_SUFFIX[m[2]]!);
