@@ -167,7 +167,7 @@ test("cpu and memory above what the manifest declares are refused, naming the fi
   // A declared maximum that cannot be read refuses a request for it rather than lifting the limit.
   const junk = { ...m, container: { image: "i", resources: { cpu: "lots", memory: "32Gi" } } };
   refused({ ...GOOD, cpu: 1 }, "resources.cpu", "not a readable quantity", {}, junk);
-  ok({ ...GOOD, memory_gi: 1 }, {}, junk);
+  refused({ ...GOOD, memory_gi: 1 }, "resources.cpu", "manifest default", {}, junk); // the unreadable cpu default is what the pod would get
   // A resource the manifest does not declare has no manifest maximum.
   const none = { ...m, container: { image: "i" } };
   ok({ ...GOOD, cpu: 200, memory_gi: 2000 }, {}, none);
@@ -202,4 +202,16 @@ test("APP_CONTAINER_CAPS: unset is one node, items default individually, bad val
   for (const bad of ["nope", "[]", '{"gpus":0}', '{"gpus":1.5}', '{"cpu":-1}', '{"memory_gi":1e30}', '{"disk":1}', '{"gpus":"8"}']) {
     assert.throws(() => parseAppContainerCaps(bad), /APP_CONTAINER_CAPS/, bad);
   }
+});
+
+test("a manifest default above the platform caps is refused when the request does not override it", () => {
+  const huge = { ...MANIFEST, container: { image: "i", resources: { cpu: "1000", memory: "8192Gi" } } };
+  refused(GOOD, "resources.cpu", "manifest default 1000 exceeds the platform maximum 256", {}, huge);
+  refused(GOOD, "resources.memory_gi", "manifest default 8192Gi exceeds the platform maximum 4096", {}, huge);
+  // Overriding with a value inside both the manifest maximum and the caps is fine.
+  refused({ ...GOOD, cpu: 8, memory_gi: 8 }, "resources.cpu", "exceeds", {}, huge, { gpus: 8, cpu: 4, memory_gi: 4096 });
+  ok({ ...GOOD, cpu: 8, memory_gi: 8 }, {}, huge);
+  // Defaults inside the caps, and an unreadable default, behave sensibly.
+  ok(GOOD, {}, { ...MANIFEST, container: { image: "i", resources: { cpu: "32", memory: "128Gi" } } });
+  refused(GOOD, "resources.cpu", "not a readable quantity", {}, { ...MANIFEST, container: { image: "i", resources: { cpu: "lots" } } });
 });
