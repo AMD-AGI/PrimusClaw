@@ -21,7 +21,7 @@ import {
 } from "./admission.js";
 import { insertEdge, insertTask } from "./db.js";
 import { newTaskId } from "./ids.js";
-import { gpuNodesFromSpec, topologyErrors } from "./run-spec.js";
+import { appGpuNodesFromSpec, gpuNodesFromSpec, topologyErrors } from "./run-spec.js";
 import type { DagNode, NodeSandbox, TaskDagDef } from "./dags/types.js";
 
 // The URL Brain (and other workers) should call back into for agent_done /
@@ -362,8 +362,8 @@ export async function createSingleTask(opts: {
   workspace_throwaway?: boolean;
 }, client?: PoolClient): Promise<{ task_id: string } | CreateRefusal> {
   const input = opts.input ?? {};
-  // An app's input is the application's own document: Claw does not read it
-  // except through the manifest's pointers, so a key that happens to be called
+  // An app's input is the application's own document: Claw does not read it,
+  // so a key that happens to be called
   // `topology` is not a declared topology and must not be validated or counted
   // as one.
   const isApp = opts.mode === "app";
@@ -378,7 +378,7 @@ export async function createSingleTask(opts: {
     origin: "task",
     newRunRoots: 1,
     sandboxes: opts.sandbox_spec != null && JSON.stringify(opts.sandbox_spec) !== '"none"' ? 1 : 0,
-    gpuNodes: isApp ? 0 : gpuNodesFromSpec(input),
+    gpuNodes: isApp ? appGpuNodesFromSpec(opts.sandbox_spec) : gpuNodesFromSpec(input),
   };
   const decision = await decideAdmission(ask, client ?? db);
   if (decision.kind === "reject") return { admitted: false, reason: decision.reason };
