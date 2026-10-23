@@ -101,6 +101,18 @@ export function gpuNodesFromSpec(task: Record<string, unknown>): number {
   return Math.min(nodes, PG_INT4_MAX);
 }
 
+/**
+ * GPU nodes an app run holds: its sandbox is one pod, so a spec that asks for
+ * GPUs occupies one node. Read from the sandbox spec Claw itself wrote from the
+ * request's `resources`, never from the app's input (`topology` in an app input
+ * is the app's own key and counts for nothing).
+ */
+export function appGpuNodesFromSpec(spec: unknown): number {
+  const resources = (spec as { resources?: Record<string, unknown> } | null | undefined)?.resources;
+  const gpus = resources?.["amd.com/gpu"];
+  return typeof gpus === "string" && /^[1-9][0-9]*$/.test(gpus) ? 1 : 0;
+}
+
 export function wantsSandboxFromSpec(task: Record<string, unknown>): boolean {
   if (typeof task.sandbox_image === "string" && task.sandbox_image.trim()) return true;
   const spec = task.sandbox_spec;
