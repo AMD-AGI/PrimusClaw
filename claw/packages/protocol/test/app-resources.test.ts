@@ -5,7 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { APP_MANIFEST_SCHEMA, type AppManifestV1 } from "../src/app-manifest.js";
 import {
-  appGrantTemplates, parseAppSandboxCaps, resolveAppResources, type ResolvedAppResources,
+  appGrantTemplates, DEFAULT_APP_CONTAINER_CAPS, parseAppContainerCaps, parseAppSandboxCaps, resolveAppResources, type ResolvedAppResources,
 } from "../src/app-resources.js";
 
 /** A generic app: two roles, a default image, defaults and a maximum in `limits`. */
@@ -22,13 +22,13 @@ const MANIFEST: AppManifestV1 = {
 };
 const GOOD = { gpus: 8, workspace: "ws-app" };
 
-const ok = (raw: unknown, caps = {}, m = MANIFEST): ResolvedAppResources => {
-  const r = resolveAppResources(m, raw, caps);
+const ok = (raw: unknown, caps = {}, m = MANIFEST, cc = DEFAULT_APP_CONTAINER_CAPS): ResolvedAppResources => {
+  const r = resolveAppResources(m, raw, caps, cc);
   assert.ok("resources" in r, JSON.stringify(r));
   return r.resources;
 };
-const refused = (raw: unknown, field: string, reason: string, caps = {}, m = MANIFEST): void => {
-  const r = resolveAppResources(m, raw, caps);
+const refused = (raw: unknown, field: string, reason: string, caps = {}, m = MANIFEST, cc = DEFAULT_APP_CONTAINER_CAPS): void => {
+  const r = resolveAppResources(m, raw, caps, cc);
   assert.ok("issues" in r, `expected a refusal, got ${JSON.stringify(r)}`);
   const hit = r.issues.filter((i) => i.field === field);
   assert.ok(hit.some((i) => i.reason.includes(reason)), `${field}: ${JSON.stringify(r.issues)} lacks "${reason}"`);
@@ -66,8 +66,8 @@ test("types are checked and nothing negative passes", () => {
   refused({ ...GOOD, gpus: "8" }, "resources.gpus", "whole number");
   refused({ ...GOOD, workspace: 7 }, "resources.workspace", "non-empty string");
   refused({ ...GOOD, image: "" }, "resources.image", "non-empty string");
-  refused({ ...GOOD, cpu: 0 }, "resources.cpu", "> 0");
-  refused({ ...GOOD, memory_gi: -4 }, "resources.memory_gi", "> 0");
+  refused({ ...GOOD, cpu: 0 }, "resources.cpu", "plain decimal");
+  refused({ ...GOOD, memory_gi: -4 }, "resources.memory_gi", "plain decimal");
   refused({ ...GOOD, grant: { gpu_hours: -1 } }, "resources.grant.gpu_hours", ">= 0");
   refused({ ...GOOD, grant: { max_runtime_sec: "x" } }, "resources.grant.max_runtime_sec", ">= 0");
   refused({ ...GOOD, grant: { max_sandboxes: -1 } }, "resources.grant.max_sandboxes", "whole number");
@@ -170,7 +170,36 @@ test("cpu and memory above what the manifest declares are refused, naming the fi
   ok({ ...GOOD, memory_gi: 1 }, {}, junk);
   // A resource the manifest does not declare has no manifest maximum.
   const none = { ...m, container: { image: "i" } };
-  ok({ ...GOOD, gpus: 64, cpu: 999, memory_gi: 9999 }, {}, none);
+  ok({ ...GOOD, cpu: 200, memory_gi: 2000 }, {}, none);
   const onlyMem = { ...m, container: { image: "i", resources: { memory: "32Gi" } } };
-  ok({ ...GOOD, gpus: 64, cpu: 999 }, {}, onlyMem);
+  ok({ ...GOOD, cpu: 200 }, {}, onlyMem);
+});
+
+test("gpus, cpu and memory are bounded by the platform's container caps whatever the manifest says", () => {
+  const none = { ...MANIFEST, container: { image: "i" } };
+  refused({ ...GOOD, gpus: 100000 }, "resources.gpus", "exceeds the platform maximum 8", {}, none);
+  refused({ ...GOOD, cpu: 257 }, "resources.cpu", "exceeds the platform maximum 256", {}, none);
+  refused({ ...GOOD, memory_gi: 4097 }, "resources.memory_gi", "exceeds the platform maximum 4096", {}, none);
+  ok({ ...GOOD, gpus: 8, cpu: 256, memory_gi: 4096 }, {}, none);
+  // Configured caps replace the defaults, per item.
+  const big = { gpus: 16, cpu: 512, memory_gi: 8192 };
+  ok({ ...GOOD, gpus: 16, cpu: 512, memory_gi: 8192 }, {}, none, big);
+  refused({ ...GOOD, gpus: 17 }, "resources.gpus", "exceeds the platform maximum 16", {}, none, big);
+});
+
+test("cpu and memory_gi must be plain decimals: no exponent form, nothing that rounds to zero", () => {
+  for (const [f, v] of [["cpu", 1e21], ["cpu", 1e-7], ["cpu", 0.0001], ["memory_gi", 1e-7], ["memory_gi", 0.0000005], ["memory_gi", 1.1234567], ["cpu", 0], ["memory_gi", -1], ["cpu", NaN], ["cpu", Infinity]] as const) {
+    refused({ ...GOOD, [f]: v }, `resources.${f}`, "plain decimal");
+  }
+  ok({ ...GOOD, cpu: 0.001, memory_gi: 0.5 });
+  ok({ ...GOOD, cpu: 2.5, memory_gi: 8.123456 });
+});
+
+test("APP_CONTAINER_CAPS: unset is one node, items default individually, bad values stop start-up", () => {
+  assert.deepEqual(parseAppContainerCaps(undefined), DEFAULT_APP_CONTAINER_CAPS);
+  assert.deepEqual(parseAppContainerCaps(" "), DEFAULT_APP_CONTAINER_CAPS);
+  assert.deepEqual(parseAppContainerCaps('{"gpus":16}'), { ...DEFAULT_APP_CONTAINER_CAPS, gpus: 16 });
+  for (const bad of ["nope", "[]", '{"gpus":0}', '{"gpus":1.5}', '{"cpu":-1}', '{"memory_gi":1e30}', '{"disk":1}', '{"gpus":"8"}']) {
+    assert.throws(() => parseAppContainerCaps(bad), /APP_CONTAINER_CAPS/, bad);
+  }
 });

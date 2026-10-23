@@ -79,7 +79,57 @@ export interface ResolvedAppResources {
 const isObj = (v: unknown): v is Record<string, unknown> =>
   typeof v === "object" && v !== null && !Array.isArray(v);
 const isCount = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
-const isQuantity = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v > 0;
+/**
+ * A cpu or memory request as a plain decimal in [min, max]: no exponent form (the
+ * value is written into the spec as `String(n)` plus a unit, and `1e-7Gi` is not a
+ * Kubernetes quantity), at most six fractional digits, and nothing so small it
+ * rounds to zero in the unit it is sent in.
+ */
+const isPlainQuantity = (v: unknown, min: number): v is number =>
+  typeof v === "number" && Number.isFinite(v) && v >= min && /^[0-9]+(?:\.[0-9]{1,6})?$/.test(String(v));
+
+/** What one app container may ask for on the platform, whatever its manifest says. */
+export interface AppContainerCaps {
+  /** GPUs of one app container. A pod runs on one node, so this is at most a node's GPUs. */
+  gpus: number;
+  cpu: number;
+  memory_gi: number;
+}
+
+/**
+ * Applied when `APP_CONTAINER_CAPS` is not set: one node of the fleet's usual
+ * shape (8 GPUs). A cap that is never configured must not mean "unlimited": a
+ * request for more GPUs than any node has can never be scheduled and would sit on
+ * the session's one app-run slot for ever.
+ */
+export const DEFAULT_APP_CONTAINER_CAPS: AppContainerCaps = { gpus: 8, cpu: 256, memory_gi: 4096 };
+
+/**
+ * Parse `APP_CONTAINER_CAPS`: a JSON object with any of `gpus`, `cpu`, `memory_gi`
+ * (positive numbers; `gpus` a whole number). An item left out keeps its default. Throws on
+ * anything else, so a misconfigured platform fails at start-up.
+ */
+export function parseAppContainerCaps(raw: string | undefined): AppContainerCaps {
+  if (raw === undefined || raw.trim() === "") return { ...DEFAULT_APP_CONTAINER_CAPS };
+  let v: unknown;
+  try {
+    v = JSON.parse(raw);
+  } catch {
+    throw new Error("APP_CONTAINER_CAPS is not valid JSON");
+  }
+  if (!isObj(v)) throw new Error("APP_CONTAINER_CAPS must be a JSON object");
+  const problems: string[] = [];
+  for (const k of Object.keys(v)) if (!(k in DEFAULT_APP_CONTAINER_CAPS)) problems.push(`${k}: unknown field`);
+  const out = { ...DEFAULT_APP_CONTAINER_CAPS };
+  for (const k of ["gpus", "cpu", "memory_gi"] as const) {
+    if (v[k] === undefined) continue;
+    const ok = k === "gpus" ? isCount(v[k]) && (v[k] as number) > 0 : isPlainQuantity(v[k], 0.001);
+    if (ok) out[k] = v[k] as number;
+    else problems.push(`${k}: must be a positive ${k === "gpus" ? "whole number" : "plain decimal number"}`);
+  }
+  if (problems.length > 0) throw new Error(`APP_CONTAINER_CAPS is invalid: ${problems.join("; ")}`);
+  return out;
+}
 const isNonNeg = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0;
 const isName = (v: unknown): v is string => typeof v === "string" && v.trim().length > 0;
 
@@ -153,8 +203,10 @@ function quantity(q: string): number | undefined {
  *
  * Defaults, in order: the request, then the manifest. A run with no image, no
  * GPU count or no workspace from either is refused rather than started with a
- * guess; `gpus` has no manifest default (the manifest cannot carry a GPU key). A
- * `cpu` or `memory_gi` above what the manifest declares for that resource in
+ * guess; `gpus` has no manifest default (the manifest cannot carry a GPU key).
+ * Every one of `gpus`, `cpu` and `memory_gi` is also bounded by the platform's
+ * `containerCaps` (default: one node), whether or not the manifest declares
+ * anything. A `cpu` or `memory_gi` above what the manifest declares for that resource in
  * `container.resources` is refused, naming the field. The grant: each
  * item is the smallest of the request, the manifest's `limits` value (where the
  * manifest has one: `max_sandboxes`, `max_runtime_sec`) and the platform cap; an
@@ -164,6 +216,7 @@ export function resolveAppResources(
   manifest: AppManifestV1,
   raw: unknown,
   caps: AppGrantLimits = {},
+  containerCaps: AppContainerCaps = DEFAULT_APP_CONTAINER_CAPS,
 ): { resources: ResolvedAppResources } | { issues: AppResourcesIssue[] } {
   const issues: AppResourcesIssue[] = [];
   if (raw !== undefined && !isObj(raw)) return { issues: [{ field: "resources", reason: "must be an object" }] };
@@ -182,8 +235,10 @@ export function resolveAppResources(
 
   let gpus: number | undefined;
   if (r.gpus !== undefined) {
-    if (isCount(r.gpus)) gpus = r.gpus;
-    else issues.push({ field: "resources.gpus", reason: "must be a whole number >= 0" });
+    if (!isCount(r.gpus)) issues.push({ field: "resources.gpus", reason: "must be a whole number >= 0" });
+    else if (r.gpus > containerCaps.gpus) {
+      issues.push({ field: "resources.gpus", reason: `exceeds the platform maximum ${containerCaps.gpus} GPUs for one app container` });
+    } else gpus = r.gpus;
   } else {
     issues.push({ field: "resources.gpus", reason: "required: the GPU count comes only from the request" });
   }
@@ -199,8 +254,13 @@ export function resolveAppResources(
     else issues.push({ field: "resources.sandbox_workspace", reason: "must be a non-empty string" });
   }
 
-  if (r.cpu !== undefined && !isQuantity(r.cpu)) issues.push({ field: "resources.cpu", reason: "must be a number > 0" });
-  if (r.memory_gi !== undefined && !isQuantity(r.memory_gi)) issues.push({ field: "resources.memory_gi", reason: "must be a number > 0" });
+  const quantityIssue = (field: string, v: unknown, min: number, max: number): void => {
+    if (v === undefined) return;
+    if (!isPlainQuantity(v, min)) issues.push({ field, reason: `must be a plain decimal number >= ${min} (no exponent, at most 6 decimals)` });
+    else if (v > max) issues.push({ field, reason: `exceeds the platform maximum ${max}` });
+  };
+  quantityIssue("resources.cpu", r.cpu, 0.001, containerCaps.cpu);
+  quantityIssue("resources.memory_gi", r.memory_gi, 0.001, containerCaps.memory_gi);
 
   // The manifest's container resources are also the most a request may ask for.
   const declared = manifest.container.resources ?? {};

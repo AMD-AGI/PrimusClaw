@@ -9,6 +9,7 @@ import {
   DEFAULT_TASK_MAX_ACK_PENDING,
   DEFAULT_TASK_MAX_DELIVER,
   MIN_RENEWAL_INTERVAL_MS,
+  parseAppContainerCaps,
   parseAppSandboxCaps,
   resolveLeaseReapGraceSec,
   resolveTaskDeliveryBudget,
@@ -372,6 +373,23 @@ export const APP_RUNS_ENABLED = envBool("APP_RUNS_ENABLED", false);
  * has one) and its cap; an item with none of them is unbounded. A value that is not that shape stops start-up.
  */
 export const APP_SANDBOX_CAPS = parseAppSandboxCaps(process.env.APP_SANDBOX_CAPS);
+
+/**
+ * The most one app container may ask for, as JSON: `{"gpus":8,"cpu":256,"memory_gi":4096}`.
+ * An item left out keeps its default (one node: 8 GPUs, 256 cpu, 4096 GiB), so
+ * "not configured" is never "unlimited": a pod asking for more GPUs than a node
+ * has can never be scheduled and would hold the session's one app-run slot for
+ * ever. A request above it is refused with a 400 naming the field. A value that is
+ * not that shape stops start-up.
+ */
+export const APP_CONTAINER_CAPS = parseAppContainerCaps(process.env.APP_CONTAINER_CAPS);
+
+/**
+ * How long the grant service gets to answer `issue` (and `revoke`) before the
+ * attempt counts as failed. The Idempotency-Key lock and its connection are held
+ * for the whole call, so it must be bounded.
+ */
+export const APP_GRANT_ISSUE_TIMEOUT_MS = envInt("APP_GRANT_ISSUE_TIMEOUT_MS", 10_000);
 
 /**
  * Chat (and queued-chat) dispatch publishes a doorbell and injects credentials
