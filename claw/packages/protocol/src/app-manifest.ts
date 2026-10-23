@@ -31,6 +31,8 @@
  * defaults are in {@link APP_MANIFEST_DEFAULTS}.
  */
 import { validateAgainstSchema, type SchemaNode } from "./json-schema-lite.js";
+import { parseQuantity } from "./app-resources.js";
+import { isBashFuncInjection, isClawInternalEnv, isHandsInternalEnv, USER_ENV_DENY_LIST } from "./user-env.js";
 
 export const APP_MANIFEST_SCHEMA = "claw.app-manifest/v1" as const;
 
@@ -311,8 +313,8 @@ export interface AppManifestIssue {
 /**
  * The variables Claw itself sets in an application's sandbox. Code that injects
  * one of them uses this table, not a literal, so a new one is a new entry here and
- * is reserved by construction (a brain test also scans the injection code for
- * names missing from it).
+ * is reserved by construction (the brain test `app-reserved-env.test.ts`, added
+ * with the runner, also scans the injection code for names missing from the rules).
  */
 export const APP_PLATFORM_ENV = {
   session_id: "CLAW_SESSION_ID",
@@ -323,8 +325,27 @@ export const APP_PLATFORM_ENV = {
 } as const;
 
 const RESERVED_ENV_NAMES: ReadonlySet<string> = new Set(Object.values(APP_PLATFORM_ENV));
-/** Families the platform and Agent Sandbox own wholesale: `E2B_*`, `AWS_*`, `CLAW_*`. */
-const RESERVED_ENV_PREFIXES = ["E2B_", "AWS_", "CLAW_"] as const;
+/**
+ * Families the platform and Agent Sandbox own wholesale: `E2B_*`, `AWS_*`, the
+ * multi-node variables Brain injects (`HYPERLOOM_MN_EXT_*`, `INFERENCE_OPTIMIZER_*`).
+ * (`CLAW_*`, `HANDS_*` and `BASH_FUNC_*` come from the user-env rules below.)
+ */
+const RESERVED_ENV_PREFIXES = ["E2B_", "AWS_", "HYPERLOOM_MN_EXT_", "INFERENCE_OPTIMIZER_"] as const;
+
+/**
+ * True when a manifest may not set or map this variable: the platform owns it.
+ * One source with user env: everything `USER_ENV_DENY_LIST` (the linker, shell and
+ * runtime hooks, the platform's credentials and contracts), the `CLAW_*`, `HANDS_*`
+ * and `BASH_FUNC_*` families, plus what only an app run injects.
+ */
+export function isReservedAppEnv(name: string): boolean {
+  return RESERVED_ENV_NAMES.has(name)
+    || USER_ENV_DENY_LIST.has(name)
+    || isClawInternalEnv(name)
+    || isHandsInternalEnv(name)
+    || isBashFuncInjection(name)
+    || RESERVED_ENV_PREFIXES.some((p) => name.startsWith(p));
+}
 
 /** True for a resource name that counts GPUs: `gpu`, `amd.com/gpu`, `nvidia.com/gpu`, ... */
 export function isGpuResourceKey(key: string): boolean {
@@ -332,10 +353,8 @@ export function isGpuResourceKey(key: string): boolean {
   return k === "gpu" || k.endsWith("/gpu");
 }
 
-/** True when a manifest may not set or map this variable: the platform owns it. */
-export function isReservedAppEnv(name: string): boolean {
-  return RESERVED_ENV_NAMES.has(name) || RESERVED_ENV_PREFIXES.some((p) => name.startsWith(p));
-}
+/** `name` or `prefix/name`, as Kubernetes spells a resource: lower-case DNS-like prefix, then a name. */
+const RESOURCE_NAME_RE = /^(?:[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?\/)?[A-Za-z0-9](?:[-A-Za-z0-9_.]*[A-Za-z0-9])?$/;
 const STATE_DIR_VARS = new Set(["USER_DATA_PATH", "run_id"]);
 
 const isObj = (v: unknown): v is Record<string, unknown> =>
@@ -390,10 +409,18 @@ export function validateAppManifest(value: unknown): AppManifestIssue[] {
   };
   for (const role of Object.keys(obj(obj(value.env_map).sandbox_keys))) needRole("env_map.sandbox_keys", role, role);
 
-  // The GPU count is the request's alone.
-  for (const k of Object.keys(obj(obj(value.container).resources))) {
+  // container.resources: no GPU key (the count is the request's alone), a Kubernetes
+  // resource name for every key, and a readable quantity for every value, so a
+  // manifest that could never run is refused when it is registered and not on every
+  // submitter's request.
+  for (const [k, v] of Object.entries(obj(obj(value.container).resources))) {
     if (isGpuResourceKey(k)) {
       bad(`container.resources.${k}`, "a GPU key is not allowed here: the GPU count comes only from the request's resources.gpus");
+      continue;
+    }
+    if (!RESOURCE_NAME_RE.test(k)) bad(`container.resources.${k}`, "not a Kubernetes resource name");
+    if (typeof v === "string" && parseQuantity(v) === undefined) {
+      bad(`container.resources.${k}`, `${JSON.stringify(v)} is not a readable quantity (for example "8", "500m", "32Gi")`);
     }
   }
 
@@ -440,6 +467,13 @@ export function validateAppManifest(value: unknown): AppManifestIssue[] {
     // spellings `${USER_DATA_PATH}` and `${run_id}` may contain a `$`.
     const dir = value.state_dir;
     const only = "only ${USER_DATA_PATH} and ${run_id} are expanded";
+    // The contract: a path under `${USER_DATA_PATH}/` or an absolute path, with no `..`
+    // segment, and `${run_id}` in it so two runs of one app never share a directory.
+    if (dir.split("/").includes("..")) bad("state_dir", "must not contain a .. segment");
+    if (!dir.startsWith("/") && !dir.startsWith("${USER_DATA_PATH}/")) {
+      bad("state_dir", "must be an absolute path or start with ${USER_DATA_PATH}/");
+    }
+    if (!dir.includes("${run_id}")) bad("state_dir", "must contain ${run_id}, or concurrent runs of one app share a directory");
     for (let at = dir.indexOf("$"); at !== -1; ) {
       if (dir.startsWith("${", at)) {
         const close = dir.indexOf("}", at + 2);

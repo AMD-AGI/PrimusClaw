@@ -395,7 +395,7 @@ describe("mode=app task creation", { skip }, () => {
         const res = await create("s1", { resources: { image: "i:1", gpus: 0, workspace: "ws-ok" } });
         assert.equal(res.statusCode, 200, res.body);
         const r = (await q("SELECT grant_limits FROM claw_app_runs")).rows[0] as any;
-        assert.deepEqual(r.grant_limits, { max_sandboxes: 2, max_runtime_sec: 7200 });
+        assert.deepEqual(r.grant_limits, { max_sandboxes: 2, max_gpus: 64, gpu_hours: 1000, max_runtime_sec: 7200 }, "a grant nobody capped is bounded by the platform defaults");
         const t = (await q("SELECT sandbox_spec FROM claw_tasks")).rows[0] as any;
         assert.deepEqual(t.sandbox_spec, { handle: "app", image: "i:1", namespace: "ws-ok", resources: { cpu: "32", memory: "128Gi" } });
       });
