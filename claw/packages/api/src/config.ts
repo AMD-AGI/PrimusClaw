@@ -389,7 +389,29 @@ export const APP_CONTAINER_CAPS = parseAppContainerCaps(process.env.APP_CONTAINE
  * attempt counts as failed. The Idempotency-Key lock and its connection are held
  * for the whole call, so it must be bounded.
  */
-export const APP_GRANT_ISSUE_TIMEOUT_MS = envInt("APP_GRANT_ISSUE_TIMEOUT_MS", 10_000);
+export const APP_GRANT_ISSUE_TIMEOUT_MS = parseAppGrantTimeoutMs(process.env.APP_GRANT_ISSUE_TIMEOUT_MS, 10_000, "APP_GRANT_ISSUE_TIMEOUT_MS");
+
+/**
+ * After `issue` fails or times out, the grant service may still finish signing the
+ * grant it was asked for, so the attempt's revoke is tried once more after this
+ * long. The first revoke goes out at once (it covers the common case); this second
+ * one covers a late signature. Past both, the grant lapses at its own expiry.
+ */
+export const APP_GRANT_REVOKE_RETRY_MS = parseAppGrantTimeoutMs(process.env.APP_GRANT_REVOKE_RETRY_MS, 30_000, "APP_GRANT_REVOKE_RETRY_MS");
+
+/**
+ * A whole number of milliseconds between 1000 and 300000, or start-up fails: 0 or a
+ * negative value would time every grant call out at once and make every app run a
+ * 503, and a huge one would hold the Idempotency-Key lock for as long.
+ */
+export function parseAppGrantTimeoutMs(raw: string | undefined, fallback: number, name: string): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1_000 || n > 300_000) {
+    throw new Error(`${name} must be a whole number of milliseconds between 1000 and 300000, got ${JSON.stringify(raw)}`);
+  }
+  return n;
+}
 
 /**
  * Chat (and queued-chat) dispatch publishes a doorbell and injects credentials
