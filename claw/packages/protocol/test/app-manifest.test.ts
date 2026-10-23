@@ -73,7 +73,7 @@ const EXAMPLE = {
   restart: { max_restarts: 5, backoff_sec: [30, 120, 600] },
   stop_grace_sec: 900,
   limits: {
-    max_sandboxes: { measurement: 8, subrun: 16, dev: 4 },
+    max_sandboxes: 16,
     max_runtime_sec: 172800,
     input_max_bytes: 262144,
   },
@@ -143,13 +143,12 @@ function checkKeys(schema: Node, docs: unknown[], at: string, seen: { objects: n
 test("JSON schema keys equal the type's keys at every object", () => {
   const seen = { objects: 0 };
   checkKeys(S as Node, [FULL], "", seen);
-  assert.equal(seen.objects, 12, "the walk must reach every fixed-key object in the schema");
+  assert.equal(seen.objects, 11, "the walk must reach every fixed-key object in the schema");
 });
 
 test("the schema's closed sets equal the exported constants", () => {
   const p = S.properties;
   assert.deepEqual(Object.keys(p.sandbox_roles.properties), ["measurement", "subrun", "dev"]);
-  assert.deepEqual(Object.keys(p.limits.properties.max_sandboxes.properties), Object.keys(p.env_map.properties.sandbox_keys.properties));
 });
 
 // ---- the valid cases ---------------------------------------------------------
@@ -227,6 +226,10 @@ test("template fields Claw does not read pass through unvalidated and unchanged"
   assert.deepEqual(paths(mutate((x) => { x.sandbox_templates.push({ name: "bare" }); })), []);
 });
 
+test("limits.max_sandboxes is one number, not a map by role", () => {
+  refused(mutate((m) => { m.limits.max_sandboxes = { measurement: 2 }; }), "limits.max_sandboxes", "must be");
+});
+
 test("per_gpu_count, which Claw reads, must be a list of positive integers", () => {
   refused(mutate((m) => { m.sandbox_templates[0].per_gpu_count = [0]; }), "sandbox_templates[0].per_gpu_count[0]", "must be >= 1");
   refused(mutate((m) => { m.sandbox_templates[0].per_gpu_count = "8"; }), "sandbox_templates[0].per_gpu_count", "must be an array");
@@ -236,7 +239,6 @@ test("per_gpu_count, which Claw reads, must be a list of positive integers", () 
 test("anything keyed by a role needs that role declared", () => {
   const noDev = (m: any) => { delete m.sandbox_roles.dev; };
   refused(mutate(noDev), "env_map.sandbox_keys.dev", "not declared in sandbox_roles");
-  refused(mutate(noDev), "limits.max_sandboxes.dev", "not declared in sandbox_roles");
   const noSub = (m: any) => { delete m.sandbox_roles.subrun; };
 });
 
@@ -257,7 +259,7 @@ test("mcp facilities need mcp, and the public url needs mcp.public", () => {
 });
 
 test("mapping the template list needs templates to declare", () => {
-  const none = (m: any) => { delete m.sandbox_templates; m.sandbox_roles = {}; m.env_map.sandbox_keys = {}; m.limits.max_sandboxes = {}; };
+  const none = (m: any) => { delete m.sandbox_templates; m.sandbox_roles = {}; m.env_map.sandbox_keys = {}; };
   refused(mutate(none), "env_map.sandbox_templates", "needs sandbox_templates");
 });
 

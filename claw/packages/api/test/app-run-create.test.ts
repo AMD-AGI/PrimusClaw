@@ -40,7 +40,7 @@ const MANIFEST = {
     { name: "runner", provider: "safe-pytorchjob", gpus: 1, data_plane: { mode: "open" } },
   ],
   sandbox_roles: { measurement: ["runner"] },
-  limits: { input_max_bytes: 400, max_sandboxes: { measurement: 2 }, max_runtime_sec: 7200 },
+  limits: { input_max_bytes: 400, max_sandboxes: 2, max_runtime_sec: 7200 },
 };
 
 /**
@@ -58,7 +58,7 @@ const GOOD_INPUT = {
 /** What the submitter asks for. */
 const GOOD_RES = {
   image: "registry.example.invalid/fw:1", gpus: 8, workspace: "ws-ok", cpu: 4, memory_gi: 16,
-  grant: { roles: { measurement: { max_sandboxes: 1, max_gpus: 8 } }, gpu_hours: 10, max_runtime_sec: 600 },
+  grant: { max_sandboxes: 1, max_gpus: 8, gpu_hours: 10, max_runtime_sec: 600 },
 };
 
 interface Ctx { h: AdmissionCluster; app: FastifyInstance; ports: any; secrets: any; send: (o: any) => Promise<any> }
@@ -146,7 +146,7 @@ describe("mode=app task creation", { skip }, () => {
     assert.equal(r.session_id, "s1");
     assert.equal(r.state, "provisioning");
     assert.deepEqual(r.manifest, MANIFEST);
-    assert.deepEqual(r.grant_limits, { roles: { measurement: { max_sandboxes: 1, max_gpus: 8 } }, gpu_hours: 10, max_runtime_sec: 600 },
+    assert.deepEqual(r.grant_limits, { max_sandboxes: 1, max_gpus: 8, gpu_hours: 10, max_runtime_sec: 600 },
       "the effective grant is stored (no cap configured here: the request as it is)");
     assert.deepEqual(asked, ["ws-ok"], "only the requested workspace is asked about, never one found inside the input");
     assert.equal(r.grant_id, null, "the default hook issues nothing, so no grant is recorded");
@@ -364,10 +364,10 @@ describe("mode=app task creation", { skip }, () => {
         assert.deepEqual(problems(res).sort(), ["resources.gpus", "resources.image", "resources.workspace"]);
         await refused(await create("s1", { resources: [1] }), 400, "app_resources_invalid");
       });
-      test("an unknown role in grant.roles is refused", async () => {
-        const res = await create("s1", { resources: { ...GOOD_RES, grant: { roles: { dev: { max_sandboxes: 1 } } } } });
+      test("a request still carrying grant.roles is refused as an unknown field", async () => {
+        const res = await create("s1", { resources: { ...GOOD_RES, grant: { roles: { measurement: { max_sandboxes: 1 } } } } });
         await refused(res, 400, "app_resources_invalid");
-        assert.deepEqual(problems(res), ["resources.grant.roles.dev"]);
+        assert.deepEqual(problems(res), ["resources.grant.roles"]);
       });
       test("negative and mistyped items are refused", async () => {
         const bad = await create("s1", { resources: { ...GOOD_RES, gpus: -1, grant: { gpu_hours: -5 } } });
@@ -375,19 +375,19 @@ describe("mode=app task creation", { skip }, () => {
         assert.deepEqual(problems(bad).sort(), ["resources.gpus", "resources.grant.gpu_hours"]);
       });
       test("a request above the platform cap gets the cap, item by item, and the cap is what is stored", async () => {
-        ctx.ports.caps = () => ({ roles: { measurement: { max_sandboxes: 3, max_gpus: 4 } }, gpu_hours: 5, max_runtime_sec: 7200 });
-        const res = await create("s1", { resources: { ...GOOD_RES, grant: { roles: { measurement: { max_sandboxes: 50, max_gpus: 2 } }, gpu_hours: 1e6, max_runtime_sec: 99999 } } });
+        ctx.ports.caps = () => ({ max_sandboxes: 3, max_gpus: 4, gpu_hours: 5, max_runtime_sec: 7200 });
+        const res = await create("s1", { resources: { ...GOOD_RES, grant: { max_sandboxes: 50, max_gpus: 2, gpu_hours: 1e6, max_runtime_sec: 99999 } } });
         assert.equal(res.statusCode, 200, res.body);
         const r = (await q("SELECT grant_limits FROM claw_app_runs")).rows[0] as any;
         assert.deepEqual(r.grant_limits, {
-          roles: { measurement: { max_sandboxes: 3, max_gpus: 2 } }, gpu_hours: 5, max_runtime_sec: 7200,
+          max_sandboxes: 3, max_gpus: 2, gpu_hours: 5, max_runtime_sec: 7200,
         }, "max_sandboxes and gpu_hours clamped, max_gpus below its cap kept, runtime = min(request, manifest 7200, cap 7200)");
       });
       test("absent items take the manifest defaults", async () => {
         const res = await create("s1", { resources: { image: "i:1", gpus: 0, workspace: "ws-ok" } });
         assert.equal(res.statusCode, 200, res.body);
         const r = (await q("SELECT grant_limits FROM claw_app_runs")).rows[0] as any;
-        assert.deepEqual(r.grant_limits, { roles: { measurement: { max_sandboxes: 2 } }, max_runtime_sec: 7200 });
+        assert.deepEqual(r.grant_limits, { max_sandboxes: 2, max_runtime_sec: 7200 });
         const t = (await q("SELECT sandbox_spec FROM claw_tasks")).rows[0] as any;
         assert.deepEqual(t.sandbox_spec, { handle: "app", image: "i:1", namespace: "ws-ok", resources: { cpu: "32", memory: "128Gi" } });
       });

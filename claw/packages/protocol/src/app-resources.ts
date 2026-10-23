@@ -22,19 +22,19 @@
  * leaving it out must not mean "unlimited". The effective grant is what Claw
  * stores and what the app sees through `env_map.grant_limits`.
  */
-import { APP_SANDBOX_ROLES, type AppManifestV1, type AppSandboxRole } from "./app-manifest.js";
+import type { AppManifestV1 } from "./app-manifest.js";
 
 /** The GPU resource name a sandbox spec carries. */
 export const APP_GPU_RESOURCE = "amd.com/gpu";
 
-export interface AppRoleGrant {
+/**
+ * A grant request, an effective grant and a platform cap all have this shape:
+ * one set of totals for the whole run. How an app divides them between its own
+ * roles is the app's business, not Claw's.
+ */
+export interface AppGrantLimits {
   max_sandboxes?: number;
   max_gpus?: number;
-}
-
-/** A grant request, an effective grant and a platform cap all have this shape. */
-export interface AppGrantLimits {
-  roles?: { [R in AppSandboxRole]?: AppRoleGrant };
   gpu_hours?: number;
   max_runtime_sec?: number;
 }
@@ -55,7 +55,7 @@ export interface AppResourcesRequest {
 }
 
 export interface AppResourcesIssue {
-  /** Dotted path under the request, e.g. `resources.grant.roles.dev.max_gpus`. */
+  /** Dotted path under the request, e.g. `resources.grant.max_gpus`. */
   field: string;
   reason: string;
 }
@@ -79,8 +79,7 @@ const isNonNeg = (v: unknown): v is number => typeof v === "number" && Number.is
 const isName = (v: unknown): v is string => typeof v === "string" && v.trim().length > 0;
 
 const RESOURCE_KEYS = ["image", "gpus", "workspace", "sandbox_workspace", "cpu", "memory_gi", "grant"];
-const GRANT_KEYS = ["roles", "gpu_hours", "max_runtime_sec"];
-const ROLE_KEYS = ["max_sandboxes", "max_gpus"];
+const GRANT_KEYS = ["max_sandboxes", "max_gpus", "gpu_hours", "max_runtime_sec"];
 
 function unknownKeys(at: string, v: Record<string, unknown>, known: string[], out: AppResourcesIssue[]): void {
   for (const k of Object.keys(v)) {
@@ -88,54 +87,25 @@ function unknownKeys(at: string, v: Record<string, unknown>, known: string[], ou
   }
 }
 
-/**
- * Check the shape of a grant (a request's `grant`, or the platform caps).
- * `roles` may only name roles in `declaredRoles`.
- */
-export function validateAppGrantLimits(
-  at: string,
-  v: unknown,
-  declaredRoles: readonly string[],
-  out: AppResourcesIssue[],
-): void {
+/** Check the shape of a grant (a request's `grant`, or the platform caps). */
+export function validateAppGrantLimits(at: string, v: unknown, out: AppResourcesIssue[]): void {
   if (!isObj(v)) {
     out.push({ field: at, reason: "must be an object" });
     return;
   }
   unknownKeys(at, v, GRANT_KEYS, out);
+  for (const k of ["max_sandboxes", "max_gpus"]) {
+    if (v[k] !== undefined && !isCount(v[k])) out.push({ field: `${at}.${k}`, reason: "must be a whole number >= 0" });
+  }
   if (v.gpu_hours !== undefined && !isNonNeg(v.gpu_hours)) out.push({ field: `${at}.gpu_hours`, reason: "must be a number >= 0" });
   if (v.max_runtime_sec !== undefined && !isNonNeg(v.max_runtime_sec)) {
     out.push({ field: `${at}.max_runtime_sec`, reason: "must be a number >= 0" });
   }
-  if (v.roles === undefined) return;
-  if (!isObj(v.roles)) {
-    out.push({ field: `${at}.roles`, reason: "must be an object" });
-    return;
-  }
-  for (const [role, g] of Object.entries(v.roles)) {
-    const rat = `${at}.roles.${role}`;
-    if (!declaredRoles.includes(role)) {
-      out.push({ field: rat, reason: `role ${JSON.stringify(role)} is not declared in the manifest's sandbox_roles` });
-      continue;
-    }
-    if (!isObj(g)) {
-      out.push({ field: rat, reason: "must be an object" });
-      continue;
-    }
-    unknownKeys(rat, g, ROLE_KEYS, out);
-    for (const k of ROLE_KEYS) {
-      if (g[k] !== undefined && !isCount(g[k])) out.push({ field: `${rat}.${k}`, reason: "must be a whole number >= 0" });
-    }
-  }
 }
 
-/** The roles a manifest declares. */
-export const declaredRolesOf = (m: AppManifestV1): AppSandboxRole[] =>
-  APP_SANDBOX_ROLES.filter((r) => Array.isArray(m.sandbox_roles?.[r]));
-
 /**
- * Parse `APP_SANDBOX_CAPS`: a JSON object of the grant shape (`roles`,
- * `gpu_hours`, `max_runtime_sec`); any item left out has no cap. Throws on a
+ * Parse `APP_SANDBOX_CAPS`: a JSON object of the grant shape (`max_sandboxes`,
+ * `max_gpus`, `gpu_hours`, `max_runtime_sec`); any item left out has no cap. Throws on a
  * value that is not that, so a misconfigured platform fails at start-up
  * rather than silently capping nothing.
  */
@@ -148,7 +118,7 @@ export function parseAppSandboxCaps(raw: string | undefined): AppGrantLimits {
     throw new Error("APP_SANDBOX_CAPS is not valid JSON");
   }
   const issues: AppResourcesIssue[] = [];
-  validateAppGrantLimits("APP_SANDBOX_CAPS", v, APP_SANDBOX_ROLES, issues);
+  validateAppGrantLimits("APP_SANDBOX_CAPS", v, issues);
   if (issues.length > 0) {
     throw new Error(`APP_SANDBOX_CAPS is invalid: ${issues.map((i) => `${i.field}: ${i.reason}`).join("; ")}`);
   }
@@ -175,7 +145,6 @@ export function resolveAppResources(
   caps: AppGrantLimits = {},
 ): { resources: ResolvedAppResources } | { issues: AppResourcesIssue[] } {
   const issues: AppResourcesIssue[] = [];
-  const roles = declaredRolesOf(manifest);
   if (raw !== undefined && !isObj(raw)) return { issues: [{ field: "resources", reason: "must be an object" }] };
   const r = (raw ?? {}) as Record<string, unknown>;
   unknownKeys("resources", r, RESOURCE_KEYS, issues);
@@ -217,25 +186,17 @@ export function resolveAppResources(
   const req: AppGrantLimits = {};
   if (r.grant !== undefined) {
     const before = issues.length;
-    validateAppGrantLimits("resources.grant", r.grant, roles, issues);
+    validateAppGrantLimits("resources.grant", r.grant, issues);
     if (issues.length === before) Object.assign(req, r.grant as AppGrantLimits);
   }
 
   if (issues.length > 0 || image === undefined || gpus === undefined || workspace === undefined) return { issues };
 
   const grant: AppGrantLimits = {};
-  const outRoles: NonNullable<AppGrantLimits["roles"]> = {};
-  for (const role of roles) {
-    const asked = req.roles?.[role];
-    const cap = caps.roles?.[role];
-    const item: AppRoleGrant = {};
-    const sandboxes = capped(asked?.max_sandboxes ?? manifest.limits?.max_sandboxes?.[role], cap?.max_sandboxes);
-    const g = capped(asked?.max_gpus, cap?.max_gpus);
-    if (sandboxes !== undefined) item.max_sandboxes = sandboxes;
-    if (g !== undefined) item.max_gpus = g;
-    if (Object.keys(item).length > 0) outRoles[role] = item;
-  }
-  if (Object.keys(outRoles).length > 0) grant.roles = outRoles;
+  const sandboxes = capped(req.max_sandboxes ?? manifest.limits?.max_sandboxes, caps.max_sandboxes);
+  if (sandboxes !== undefined) grant.max_sandboxes = sandboxes;
+  const gpuTotal = capped(req.max_gpus, caps.max_gpus);
+  if (gpuTotal !== undefined) grant.max_gpus = gpuTotal;
   const hours = capped(req.gpu_hours, caps.gpu_hours);
   if (hours !== undefined) grant.gpu_hours = hours;
   const runtime = [req.max_runtime_sec, manifest.limits?.max_runtime_sec, caps.max_runtime_sec]
