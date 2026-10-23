@@ -6,7 +6,7 @@ go 1.26.0
 // The `go` directive above is only a language-version floor and does not pin
 // what actually compiles the code; without this, a build on go1.26.0 picks up
 // 21 reachable stdlib advisories that govulncheck then reports.
-toolchain go1.26.9
+toolchain go1.26.10
 
 require (
 	github.com/coreos/go-iptables v0.8.0
