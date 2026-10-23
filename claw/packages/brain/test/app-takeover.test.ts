@@ -17,7 +17,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { AppRunner, MAX_STOP_GRACE_SEC } from "../src/apps/app-runner.js";
 import { stopCommand, probeCommand } from "../src/apps/app-env.js";
@@ -212,9 +212,51 @@ test("G6 the sandbox disappearing during the grace ends the wait; a final left o
   h.world.at(h.world.clock + 15_000, () => { h.world.appExits(wl, finalExit(0)); h.world.killWorkload(wl, "terminal"); });
   const outcome = await finishing;
   assert.ok(h.world.stoppedAt[0]! - T0 < GRACE * 1000 + 60_000);
-  assert.equal(typeof outcome.success, "boolean");
+  assert.equal(outcome.success, true, "the final written just before the sandbox went is the run's result, not the cancel");
+  assert.equal(h.world.rec.last_exit?.cause, "exit");
+  assert.equal(h.world.rec.last_exit?.final, true);
   assert.equal(h.world.rec.state, "ended");
   assert.equal(h.grant.revokes.length, 1);
+  assert.deepEqual(h.world.stopped.sort(), h.world.created.slice().sort(), "the sandbox made to read it is stopped too");
+});
+
+test("G6b the same read happens once, and a sandbox gone with no final leaves the cancel as it was", async () => {
+  const h = harness();
+  const wl = await toRunning(h);
+  h.world.onTerm = () => {};
+  const finishing = h.runner.finishNow("cancelled");
+  h.world.at(h.world.clock + 15_000, () => { h.world.killWorkload(wl, "terminal"); });
+  const outcome = await finishing;
+  assert.equal(outcome.success, false);
+  assert.equal(h.world.rec.last_exit?.cause, "cancelled");
+  assert.equal(h.world.created.length, 2, "exactly one extra sandbox, to read the file");
+});
+
+test("G9 SIGTERM goes to the application's whole process group, children included", async () => {
+  const dir = mkdtempSync(`${tmpdir()}/c2-03c-`);
+  // A launcher (session leader, like `setsid` makes it) with a worker child that would not get a leader-only signal.
+  const leader = spawn("sh", ["-c", `sleep 30 & echo $! > ${dir}/child.pid; wait`], { stdio: "ignore", detached: true });
+  // A zombie nobody reaped is dead for this purpose.
+  const alive = (pid: number) => {
+    try { return !/^\d+ \(.*\) Z/.test(readFileSync(`/proc/${pid}/stat`, "utf8")); } catch { return false; }
+  };
+  try {
+    writeFileSync(`${dir}/app.pid`, String(leader.pid));
+    writeFileSync(`${dir}/app.sandbox`, "wl-1:0");
+    let child = 0;
+    for (let i = 0; i < 50 && !child; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      try { child = Number(readFileSync(`${dir}/child.pid`, "utf8")); } catch { /* not written yet */ }
+    }
+    assert.ok(child > 0 && alive(child));
+    const sent = spawnSync("sh", ["-c", stopCommand(dir, "wl-1:0")], { encoding: "utf8" });
+    assert.equal(sent.stdout.trim(), "sent");
+    for (let i = 0; i < 50 && alive(child); i++) await new Promise((r) => setTimeout(r, 100));
+    assert.equal(alive(child), false, "the worker was signalled with its launcher");
+  } finally {
+    try { process.kill(-leader.pid!, "SIGKILL"); } catch { /* already gone */ }
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("G7 cancelling a run that is already finishing on its own final result keeps that result and sends no SIGTERM", async () => {

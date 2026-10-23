@@ -97,13 +97,45 @@ test("X6 a hook answer that is not later than the stored expiry is not stored", 
   assert.equal(h.world.rec.grant_expires_at, T_OLD);
 });
 
-test("X7 a run with no expiry yet takes the first one; a run with no grant calls nothing", async () => {
+test("X7 a run with no expiry is not given one (it does not lapse); a run with no grant calls nothing", async () => {
   const a = harness({ grant_expires_at: null }, echo);
-  assert.equal((await a.runner.extendGrant(T_NEW)).extended, true);
-  assert.equal(a.world.rec.grant_expires_at, T_NEW);
+  assert.deepEqual(await a.runner.extendGrant(T_NEW), { extended: false, reason: "no_expiry" });
+  assert.equal(a.calls.length, 0);
+  assert.equal(a.world.rec.grant_expires_at, null, "a grant that never lapses is not shortened");
   const b = harness({ grant_id: null }, echo);
   assert.deepEqual(await b.runner.extendGrant(T_NEW), { extended: false, reason: "no_grant" });
   assert.equal(b.calls.length, 0);
+});
+
+test("X9 a run that is finishing or ended is never extended, whether or not the revoke was recorded", async () => {
+  for (const state of ["finishing", "ended"]) {
+    const h = harness({ state }, echo);
+    assert.deepEqual(await h.runner.extendGrant(T_NEW), { extended: false, reason: "finishing" }, state);
+    assert.equal(h.calls.length, 0);
+  }
+});
+
+test("X10 finishing records the revoke on the row, and the grant cannot be extended afterwards", async () => {
+  const revokes: string[] = [];
+  const grant: AppGrantRunHooks = { ...noopAppGrant, revoke: async (run) => { revokes.push(run.grantId ?? ""); } };
+  const world = new World(MANIFEST, { grant_id: "grt-1", grant_expires_at: T_OLD, state: "finishing", last_exit: { at: "2026-01-01T00:00:00Z", cause: "exit", final: true, returncode: 0 }, sandbox_workload_id: null });
+  const runner = new AppRunner(RUN_ID, "pk", { store: world.store, sandbox: world.sandbox, grant, now: world.now, sleep: world.sleep, tickMs: 5000 });
+  for (let i = 0; i < 6 && world.rec.state !== "ended"; i++) await runner.reconcile();
+  assert.equal(world.rec.state, "ended");
+  assert.deepEqual(revokes, ["grt-1"], "revoked once");
+  assert.ok(world.rec.grant_revoked_at, "the row says so");
+  assert.ok(world.patches.some((p) => p.patch.grant_revoked === true));
+  // Even if a caller got in after the row was ended, nothing is extended.
+  world.rec = { ...world.rec, state: "running" };
+  const late = await runner.extendGrant(T_NEW);
+  assert.deepEqual(late, { extended: false, reason: "revoked" });
+});
+
+test("X11 a run with no grant records no revoke", async () => {
+  const world = new World(MANIFEST, { grant_id: null, state: "finishing", last_exit: { at: "2026-01-01T00:00:00Z", cause: "exit", final: true, returncode: 0 }, sandbox_workload_id: null });
+  const runner = new AppRunner(RUN_ID, "pk", { store: world.store, sandbox: world.sandbox, now: world.now, sleep: world.sleep, tickMs: 5000 });
+  for (let i = 0; i < 6 && world.rec.state !== "ended"; i++) await runner.reconcile();
+  assert.ok(!world.patches.some((p) => p.patch.grant_revoked === true));
 });
 
 test("X8 the default hook returns the time it was given", async () => {

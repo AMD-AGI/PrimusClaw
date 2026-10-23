@@ -64,7 +64,7 @@ import { resolveSandboxAction } from "../sandbox/params.js";
 import { provisionTerminalOf } from "../sandbox/errors.js";
 import { runScript, type ScriptProgress } from "./script-runner.js";
 import { createAppRunner } from "../apps/app-runner-wiring.js";
-import { AppRunFailedError } from "../apps/app-runner.js";
+import { AppRunFailedError, type AppRunOutcome } from "../apps/app-runner.js";
 import {
   AgentDoneDeliveryError, postAgentDone, postRunLease, postTaskRunning, sandboxForLease,
   type LeaseRenewal, type RunAttemptToken,
@@ -76,7 +76,7 @@ import { settleClaimedRun } from "../clients/run-claim.js";
 import { beginRun, endRun, phaseOf, runTimeOf } from "./run-phase.js";
 import { resolveRunIdentity, type RunIdentity, taskIdFromLease } from "./run-identity.js";
 import {
-  activeAbort, gracefulStop, LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON,
+  activeAbort, markGracefulStop, LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON,
   DEADLINE_EXCEEDED_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON,
 } from "./abort-registry.js";
 import { pickRunScope, pickShellRun, refreshTaskLock, releaseTaskLock } from "./lock.js";
@@ -4386,18 +4386,7 @@ class TaskRunner {
     const result = await runner.run(this.abortCtrl.signal);
     if (result.kind === "ended") {
       if (!result.outcome.success) throw new AppRunFailedError(result.outcome.reason, result.outcome.captures);
-      await this.finalizeSuccess({
-        finalText: result.outcome.reason,
-        tokenUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, turns: 0 },
-        turns: 0,
-        pendingMemories: [],
-        pendingSkills: [],
-        skillsUsed: {},
-        errorCount: 0,
-        toolStats: { total_calls: 0, error_calls: 0, by_tool: {} },
-        elapsedMs: this.elapsedMsForRun(),
-        ...(result.outcome.captures ? { captures: result.outcome.captures } : {}),
-      });
+      await this.finalizeAppSuccess(result.outcome);
       return;
     }
 
@@ -4410,13 +4399,38 @@ class TaskRunner {
     if (!handedOver) {
       // The grace wait of a cancel can outlast the 30 s the interrupt handler
       // gives a run before it releases the lock by force; this run is not stuck.
-      gracefulStop.add(this.abortCtrl);
+      markGracefulStop(this.abortCtrl);
       const cause = reason === DEADLINE_EXCEEDED_ABORT_REASON ? "deadline"
         : reason === RUN_ROW_TERMINAL_ABORT_REASON ? "row_terminal" : "cancelled";
-      await runner.finishNow(cause).catch((err) =>
-        logger.error({ err: String(err?.message ?? err), taskId: this.request.task_id }, "task.app_finish_failed"));
+      const outcome = await runner.finishNow(cause).catch((err) => {
+        logger.error({ err: String(err?.message ?? err), taskId: this.request.task_id }, "task.app_finish_failed");
+        return null;
+      });
+      // An application that wrote a successful `final` within its grace keeps its
+      // own result: reported as the success it is, with its captures, not as the
+      // cancel that asked it to stop.
+      if (outcome?.success) {
+        await this.finalizeAppSuccess(outcome);
+        return;
+      }
     }
     throw reason ?? new Error("cancelled by user");
+  }
+
+  /** Report an app run that ended as a success. */
+  private async finalizeAppSuccess(outcome: AppRunOutcome): Promise<void> {
+    await this.finalizeSuccess({
+      finalText: outcome.reason,
+      tokenUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, turns: 0 },
+      turns: 0,
+      pendingMemories: [],
+      pendingSkills: [],
+      skillsUsed: {},
+      errorCount: 0,
+      toolStats: { total_calls: 0, error_calls: 0, by_tool: {} },
+      elapsedMs: this.elapsedMsForRun(),
+      ...(outcome.captures ? { captures: outcome.captures } : {}),
+    });
   }
 
   private failureOutcome(err: unknown): TaskOutcome {

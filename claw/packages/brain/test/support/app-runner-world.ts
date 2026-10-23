@@ -161,7 +161,8 @@ export class World {
       if (injected) throw injected;
       if (this.rec.state === "ended") throw new AppRunWriteRefused("ended", "ended");
       if (expect && this.rec.state !== expect) throw new AppRunWriteRefused("state_mismatch", this.rec.state);
-      this.rec = { ...this.rec, ...patch } as AppRunRecord;
+      const { grant_revoked, ...fields } = patch;
+      this.rec = { ...this.rec, ...fields, ...(grant_revoked ? { grant_revoked_at: new Date(this.now()).toISOString() } : {}) } as AppRunRecord;
       return structuredClone(this.rec);
     },
     secrets: async (): Promise<AppRunSecrets> => ({ mcp_token: TOKEN, grant_keys: { measurement: KEY_M } }),

@@ -240,8 +240,8 @@ export interface GrantExtension {
   extended: boolean;
   /** The expiry now stored, when extended. */
   expiresAt?: string;
-  /** Why not, when not extended; no hook was called for `revoked`, `no_grant` and `not_later`. */
-  reason?: "revoked" | "no_grant" | "not_later" | "failed";
+  /** Why not, when not extended; no hook was called for `revoked`, `no_grant`, `no_expiry`, `finishing` and `not_later`. */
+  reason?: "revoked" | "no_grant" | "no_expiry" | "finishing" | "not_later" | "failed";
 }
 
 export class AppRunner {
@@ -323,7 +323,8 @@ export class AppRunner {
    * whoever adds one calls this, and the run's own extension must not wait on
    * or fail with it (this never throws).
    *
-   * Refused without calling the hook when the grant is revoked, `expiresAt` is
+   * Refused without calling the hook when the grant is revoked, the run is
+   * finishing or ended, the grant has no expiry, `expiresAt` is
    * not a time, or it is not later than the stored expiry. A hook that throws,
    * answers something that is not a later time, or a row write that fails,
    * leaves the stored expiry as it was and is logged as a warning.
@@ -338,9 +339,14 @@ export class AppRunner {
       return kept("failed");
     }
     const asked = Date.parse(expiresAt);
-    const current = rec.grant_expires_at ? Date.parse(rec.grant_expires_at) : -Infinity;
     if (rec.grant_revoked_at) return kept("revoked");
     if (!rec.grant_id) return kept("no_grant");
+    // A run that is winding up has revoked (or is about to revoke) its grant: it is
+    // never extended, whether or not the row has recorded the revoke yet.
+    if (rec.state === "finishing" || rec.state === "ended") return kept("finishing");
+    // No expiry means the grant does not lapse: any finite time would shorten it.
+    if (!rec.grant_expires_at) return kept("no_expiry");
+    const current = Date.parse(rec.grant_expires_at);
     if (!Number.isFinite(asked) || !(asked > current)) return kept("not_later");
     const run: AppGrantRun = { runId: this.runId, sessionId: rec.session_id, grantId: rec.grant_id, manifest: rec.manifest };
     try {
@@ -790,7 +796,12 @@ export class AppRunner {
 
     if (cancelled && !(await this.step("stop_application", () => this.stopApplication(inst)))) return { done: false };
     await this.step("drain_events", () => this.seams.drainEvents?.(ctx));
-    await this.step("revoke_grant", () => this.grant.revoke(run));
+    await this.step("revoke_grant", async () => {
+      await this.grant.revoke(run);
+      // Recorded on the row as well, so extendGrant refuses it from here on (and
+      // from any Brain that takes the run over). Only for a run that had a grant.
+      if (rec.grant_id && !this.rec.grant_revoked_at) await this.move({ grant_revoked: true });
+    });
     await this.step("unregister_mcp", () => this.seams.unregisterMcp?.(ctx));
     await this.step("stop_sandbox", () => this.stopSandboxes(inst));
 
@@ -841,6 +852,25 @@ export class AppRunner {
     return this.adoptFinalExit(inst, stateDir, sandboxGone);
   }
 
+  /**
+   * The sandbox is gone but the state directory is not: it is shared storage. The
+   * only way to read `exit.json` from it is a sandbox, so one is made, once (the
+   * `recovery` mark on the row says it was done, across takeovers), as the restart
+   * path does for a lost sandbox: the application may have written `final` in its
+   * grace just before the sandbox went, and not reading it would report a finished
+   * run as the cancel it was. The sandbox is stopped by the finishing step that
+   * stops every sandbox of the run.
+   */
+  private async readFinalFromSharedStorage(stateDir: string): Promise<Extract<ExitRead, { kind: "exit" }> | null> {
+    if (this.rec.last_exit?.recovery === true) return null;
+    const last = this.rec.last_exit ?? { at: this.iso(), cause: "cancelled" as const, final: false };
+    await this.move({ last_exit: { ...last, recovery: true } });
+    const reader = await this.deps.sandbox.ensure(this.sandboxRun());
+    const exit = await this.readExit(reader.instance, stateDir);
+    if (exit.kind === "unreadable") throw new Error("exit.json could not be read");
+    return exit.kind === "exit" ? exit : null;
+  }
+
   private async sendTerm(inst: SandboxInstance, stateDir: string): Promise<void> {
     const r = await this.deps.sandbox.exec(inst, stopCommand(stateDir, this.tag()), EXEC_TIMEOUT, { untracked: true });
     if (r.exitCode !== 0) throw new Error(`SIGTERM command failed (exit ${r.exitCode})`);
@@ -851,8 +881,13 @@ export class AppRunner {
    * A sandbox that is gone can still leave one: the state directory is shared.
    */
   private async adoptFinalExit(inst: SandboxInstance, stateDir: string, sandboxGone: boolean): Promise<undefined> {
-    if (sandboxGone) return undefined;
-    const exit = await this.readExit(inst, stateDir);
+    let exit: ExitRead | null;
+    if (sandboxGone) {
+      exit = await this.readFinalFromSharedStorage(stateDir);
+      if (exit === null) return undefined;
+    } else {
+      exit = await this.readExit(inst, stateDir);
+    }
     if (exit.kind === "unreadable") throw new Error("exit.json could not be read");
     if (exit.kind !== "exit" || !exit.final) return undefined;
     const done = this.rec.last_exit?.finish_done;
@@ -894,7 +929,7 @@ export class AppRunner {
 
   /** Run a finishing step once; false while it asks to be retried on the next tick. */
   private async step(name: string, fn: () => Promise<unknown> | undefined): Promise<boolean> {
-    await this.persistDone();
+    // No persist here: the end of the previous step already wrote what it finished.
     if (this.doneSteps().has(name)) return true;
     this.assertActive();
     try {

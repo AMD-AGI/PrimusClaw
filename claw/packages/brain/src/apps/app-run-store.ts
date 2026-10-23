@@ -75,6 +75,8 @@ export interface AppRunPatch {
   state_dir?: string;
   sandbox_workload_id?: string | null;
   grant_expires_at?: string;
+  /** Record that the grant was revoked, so it is never extended. */
+  grant_revoked?: true;
 }
 
 export interface AppRunStore {

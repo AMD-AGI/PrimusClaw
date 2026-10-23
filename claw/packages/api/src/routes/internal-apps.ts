@@ -35,7 +35,7 @@ const STATE_DIR_MAX = 4096;
 const WORKLOAD_ID_MAX = 200;
 const RESTARTS_MAX = 1_000_000;
 const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
-const PATCH_KEYS = new Set(["brain_id", "claim_count", "expect_state", "state", "restarts", "last_exit", "state_dir", "sandbox_workload_id", "grant_expires_at"]);
+const PATCH_KEYS = new Set(["brain_id", "claim_count", "expect_state", "state", "restarts", "last_exit", "state_dir", "sandbox_workload_id", "grant_expires_at", "grant_revoked"]);
 
 /** The patch in `body`, or the reason it was refused. */
 export function parseAppRunPatch(
@@ -84,6 +84,10 @@ export function parseAppRunPatch(
     }
     patch.grant_expires_at = t;
   }
+  if (body.grant_revoked !== undefined) {
+    if (body.grant_revoked !== true) return { ok: false, error: "grant_revoked_invalid" };
+    patch.grant_revoked = true;
+  }
   if (body.last_exit !== undefined) {
     const e = body.last_exit;
     if (e !== null && !isObj(e)) return { ok: false, error: "last_exit_invalid" };
@@ -97,6 +101,7 @@ const REFUSALS = {
   not_found: { status: 404, error: "not_found" },
   not_holder: { status: 409, error: "not_holder" },
   state_mismatch: { status: 409, error: "state_mismatch" },
+  grant_refused: { status: 409, error: "grant_refused" },
   ended: { status: 409, error: "ended" },
   empty: { status: 400, error: "empty_patch" },
 } as const;

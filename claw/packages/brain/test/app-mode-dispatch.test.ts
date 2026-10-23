@@ -33,6 +33,8 @@ const { activeAbort, SIGTERM_ABORT_REASON, LEASE_LOST_ABORT_REASON, DEADLINE_EXC
 interface FakeRunner {
   runs: number;
   finishes: string[];
+  /** What finishNow answers; default: a failure carrying the cause. */
+  finishOutcome?: AppRunOutcome;
   /** The platform key and epoch each createAppRunner call got, and how often the row was closed without a runner. */
   made: Array<{ platformKey: string; epoch: number }>;
   closed: string[];
@@ -67,7 +69,7 @@ function harness(runner?: FakeRunner) {
       return {
         markEnded: async (why: string) => { runner?.closed.push(why); return true; },
         run: async (signal: AbortSignal) => { runner!.runs++; return runner!.script(signal); },
-        finishNow: async (cause: string): Promise<AppRunOutcome> => { runner!.finishes.push(cause); return { success: false, reason: cause }; },
+        finishNow: async (cause: string): Promise<AppRunOutcome> => { runner!.finishes.push(cause); return runner!.finishOutcome ?? { success: false, reason: cause }; },
       } as unknown as AppRunner;
     }) as never,
   } as unknown as Partial<TaskRunnerSideEffects>;
@@ -166,6 +168,24 @@ test("A1c a user cancel finishes the run; a drain or a lost lease leaves it to t
     left.script = async () => { c.abort(reason); return { kind: "aborted" }; };
     await runHandleTask(h.msg, request("app"), "s-app", "lock.s-app", "m1", "u1", c);
     assert.deepEqual(left.finishes, [], `${String(reason)}: the successor reconciles it; nothing is stopped here`);
+  }
+});
+
+test("A1c2 a cancel whose application wrote a successful final in its grace is reported as that success, with its captures", async () => {
+  for (const make of [
+    () => { const c = new AbortController(); return { ctrl: c, fire: () => c.abort() }; },
+  ]) {
+    const { ctrl, fire } = make();
+    const runner = fakeRunner(async () => { fire(); return { kind: "aborted" }; });
+    runner.finishOutcome = { success: true, reason: "app finished", captures: { session_dir: "/state/run-1", stop_reason: "done" } };
+    const h = harness(runner);
+    activeAbort.set("lock.s-app", ctrl);
+    await runHandleTask(h.msg, request("app"), "s-app", "lock.s-app", "m1", "u1", ctrl);
+    assert.deepEqual(runner.finishes, ["cancelled"]);
+    assert.equal(h.done.length, 1);
+    assert.equal(h.done[0]!.abortReason, undefined, "a success, not an interruption");
+    assert.equal(h.done[0]!.finalText, "app finished");
+    assert.deepEqual((h.done[0] as { captures?: unknown }).captures, { session_dir: "/state/run-1", stop_reason: "done" });
   }
 });
 
