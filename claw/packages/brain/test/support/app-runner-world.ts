@@ -34,12 +34,11 @@ export const MANIFEST: AppManifestV1 = {
   schema: APP_MANIFEST_SCHEMA,
   name: "demo-app",
   version: "1.0.0",
-  container: { image_from_input: "/image" },
+  container: { image: "img:1" },
   state_dir: "${USER_DATA_PATH}/.claw-apps/${run_id}",
   command: ["python", "-m", "app", "--name", "it's"],
   bootstrap: { file: "boot/start.sh", content_b64: b64("#!/bin/sh\necho boot\n") },
   env: { STATIC: "1", OVERRIDE_ME: "from-manifest" },
-  env_from_input: { OVERRIDE_ME: "/knobs/mode", FROM_INPUT: "/knobs/count", ABSENT: "/knobs/nothing" },
   env_map: {
     run_id: "APP_RUN_ID",
     run_created_at: "APP_CREATED_AT",

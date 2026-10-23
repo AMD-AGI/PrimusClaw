@@ -485,8 +485,7 @@ test("E1 the environment is exactly what env_map says, with the platform's names
   const env = h.world.starts[0]!.env;
   assert.deepEqual(env, {
     STATIC: "1",
-    OVERRIDE_ME: "from-input", // env_from_input beats env
-    FROM_INPUT: "3",           // a number is rendered, and an absent pointer sets nothing (no ABSENT)
+    OVERRIDE_ME: "from-manifest", // nothing in the run input (knobs.mode = "from-input") reaches the env
     APP_RUN_ID: RUN_ID,
     APP_CREATED_AT: new Date(T0).toISOString(),
     APP_STATE_DIR: STATE_DIR,
@@ -502,10 +501,10 @@ test("E1 the environment is exactly what env_map says, with the platform's names
 
 test("E2 only declared facilities are injected: no mcp block, no mcp variables; unmapped means unset", () => {
   const base = {
-    runId: "r", sessionId: "s", createdAt: "t", input: {}, stateDir: "/d", mcpToken: TOKEN,
+    runId: "r", sessionId: "s", createdAt: "t", stateDir: "/d", mcpToken: TOKEN,
     grantKeys: {}, grantLimits: null, nodeName: null,
   };
-  const noMcp = { ...MANIFEST, mcp: undefined, env: undefined, env_from_input: undefined, events: undefined };
+  const noMcp = { ...MANIFEST, mcp: undefined, env: undefined, events: undefined };
   const env = buildAppEnv({ ...base, manifest: noMcp });
   assert.equal(env.APP_MCP_PORT, undefined);
   assert.equal(env.APP_MCP_TOKEN, undefined);
