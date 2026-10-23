@@ -38,7 +38,7 @@ test("the request's image wins over the manifest's default; the default is used 
 });
 
 test("container.resources are defaults; zero gpus drops a defaulted GPU key; a request overrides its own key only", () => {
-  const m = manifest({ image: "i", resources: { cpu: "32", memory: "128Gi", "amd.com/gpu": "2", "ephemeral-storage": "500Gi" } });
+  const m = manifest({ image: "i", resources: { cpu: "32", memory: "128Gi", "amd.com/gpu": "8", "ephemeral-storage": "500Gi" } });
   assert.deepEqual(plan(m, { gpus: 0, workspace: "w", cpu: 4 }).sandboxSpec.resources, { cpu: "4", memory: "128Gi", "ephemeral-storage": "500Gi" });
   assert.deepEqual(plan(m, { gpus: 8, workspace: "w" }).sandboxSpec.resources, { cpu: "32", memory: "128Gi", "amd.com/gpu": "8", "ephemeral-storage": "500Gi" });
 });

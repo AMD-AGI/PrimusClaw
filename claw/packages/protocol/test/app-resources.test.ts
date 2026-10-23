@@ -93,16 +93,17 @@ test("grant.roles is not a field: a request still carrying it is refused, whatev
 test("each grant item is the smaller of the request and the cap", () => {
   const caps = { max_sandboxes: 6, max_gpus: 8, gpu_hours: 100, max_runtime_sec: 7200 };
   const r = ok({ ...GOOD, grant: { max_sandboxes: 50, max_gpus: 4, gpu_hours: 1e6, max_runtime_sec: 99999 } }, caps);
-  assert.deepEqual(r.grant, { max_sandboxes: 6, max_gpus: 4, gpu_hours: 100, max_runtime_sec: 3600 }, "above the cap -> the cap; below it -> the request");
+  assert.deepEqual(r.grant, { max_sandboxes: 4, max_gpus: 4, gpu_hours: 100, max_runtime_sec: 3600 }, "above the cap -> the cap; below it -> the request; max_sandboxes: the manifest limit 4 is below the cap 6");
   const small = ok({ ...GOOD, grant: { max_sandboxes: 2, max_gpus: 9, gpu_hours: 3 } }, caps);
   assert.deepEqual(small.grant, { max_sandboxes: 2, max_gpus: 8, gpu_hours: 3, max_runtime_sec: 3600 });
 });
 
 test("with no cap configured the request goes through as it is", () => {
-  const r = ok({ ...GOOD, grant: { max_sandboxes: 999, max_gpus: 64, gpu_hours: 12345 } });
+  const m = { ...MANIFEST, limits: { max_runtime_sec: 3600 } };
+  const r = ok({ ...GOOD, grant: { max_sandboxes: 999, max_gpus: 64, gpu_hours: 12345 } }, {}, m);
   assert.deepEqual(r.grant, { max_sandboxes: 999, max_gpus: 64, gpu_hours: 12345, max_runtime_sec: 3600 });
   // A cap on one item does not touch the others.
-  const some = ok({ ...GOOD, grant: { max_sandboxes: 999, max_gpus: 64 } }, { max_gpus: 8 });
+  const some = ok({ ...GOOD, grant: { max_sandboxes: 999, max_gpus: 64 } }, { max_gpus: 8 }, m);
   assert.deepEqual(some.grant, { max_sandboxes: 999, max_gpus: 8, max_runtime_sec: 3600 });
 });
 
@@ -136,4 +137,33 @@ test("APP_SANDBOX_CAPS parses the grant shape, and a bad value fails loudly", ()
   assert.throws(() => parseAppSandboxCaps("{"), /not valid JSON/);
   assert.throws(() => parseAppSandboxCaps('{"gpu_hours":-1}'), /gpu_hours/);
   assert.throws(() => parseAppSandboxCaps('{"typo":1}'), /typo/);
+});
+
+test("max_sandboxes is a default and an upper bound: min(request, manifest, cap)", () => {
+  // MANIFEST.limits.max_sandboxes = 4
+  assert.equal(ok({ ...GOOD, grant: { max_sandboxes: 99 } }).grant.max_sandboxes, 4, "request above the manifest limit");
+  assert.equal(ok({ ...GOOD, grant: { max_sandboxes: 2 } }).grant.max_sandboxes, 2, "request below it");
+  assert.equal(ok(GOOD).grant.max_sandboxes, 4, "no request -> the manifest value");
+  assert.equal(ok(GOOD, { max_sandboxes: 3 }).grant.max_sandboxes, 3, "no request -> the smaller of manifest and cap");
+  assert.equal(ok({ ...GOOD, grant: { max_sandboxes: 99 } }, { max_sandboxes: 3 }).grant.max_sandboxes, 3);
+  assert.equal(ok({ ...GOOD, grant: { max_sandboxes: 99 } }, { max_sandboxes: 9 }).grant.max_sandboxes, 4);
+});
+
+test("gpus, cpu and memory above what the manifest declares are refused, naming the field", () => {
+  const m = { ...MANIFEST, container: { image: "i", resources: { "amd.com/gpu": "8", cpu: "8", memory: "32Gi" } } };
+  refused({ ...GOOD, gpus: 9 }, "resources.gpus", "exceeds the manifest maximum 8", {}, m);
+  refused({ ...GOOD, cpu: 8.5 }, "resources.cpu", "exceeds the manifest maximum 8", {}, m);
+  refused({ ...GOOD, memory_gi: 33 }, "resources.memory_gi", "exceeds the manifest maximum 32Gi", {}, m);
+  // At the maximum, below it, and in other units of the same quantity: allowed.
+  ok({ ...GOOD, gpus: 8, cpu: 8, memory_gi: 32 }, {}, m);
+  ok({ ...GOOD, cpu: 1, memory_gi: 1 }, {}, m);
+  const small = { ...m, container: { image: "i", resources: { cpu: "500m", memory: "512Mi" } } };
+  refused({ ...GOOD, cpu: 1 }, "resources.cpu", "exceeds", {}, small);
+  refused({ ...GOOD, memory_gi: 1 }, "resources.memory_gi", "exceeds", {}, small);
+  ok({ ...GOOD, cpu: 0.5, memory_gi: 0.5 }, {}, small);
+  // A resource the manifest does not declare has no manifest maximum.
+  const none = { ...m, container: { image: "i" } };
+  ok({ ...GOOD, gpus: 64, cpu: 999, memory_gi: 9999 }, {}, none);
+  const onlyMem = { ...m, container: { image: "i", resources: { memory: "32Gi" } } };
+  ok({ ...GOOD, gpus: 64, cpu: 999 }, {}, onlyMem);
 });

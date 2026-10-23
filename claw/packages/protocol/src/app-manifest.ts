@@ -46,7 +46,13 @@ export const APP_MANIFEST_DEFAULTS = {
 export interface AppContainer {
   /** The default image; `resources.image` in the request wins. Optional. */
   image?: string;
-  /** Default container resources (also the hard limits); `resources.cpu` / `memory_gi` in the request win. */
+  /**
+   * Default container resources, and the most a request may ask for in each key
+   * the manifest declares (`amd.com/gpu`, `cpu`, `memory`): a larger
+   * `resources.gpus` / `cpu` / `memory_gi` is refused. Whatever is finally
+   * dispatched, SaFE enforces as the container's hard limit (exceeding memory is
+   * an OOM kill). A key the manifest leaves out has no manifest maximum.
+   */
   resources?: Record<string, string>;
 }
 
@@ -135,7 +141,11 @@ export interface AppRestart {
 }
 
 export interface AppLimits {
-  /** Default for the grant's `max_sandboxes` when the request omits it; the platform cap applies after. */
+  /**
+   * Default and upper bound of the grant's `max_sandboxes`: the request's value
+   * when it gives one, else this, and never more than this or the platform cap
+   * (the smallest of the three that are set).
+   */
   max_sandboxes?: number;
   /** Maximum run time: the grant's `max_runtime_sec` is the smaller of this and the request. */
   max_runtime_sec?: number;
@@ -169,6 +179,7 @@ export interface AppManifestV1 {
 // ---------------------------------------------------------------------------
 
 const ENV_NAME_PATTERN = "^[A-Za-z_][A-Za-z0-9_]*$";
+const ENV_NAME_RE = new RegExp(ENV_NAME_PATTERN);
 const B64_PATTERN = "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$";
 
 const ref = (name: string) => ({ $ref: `#/$defs/${name}` });
@@ -295,8 +306,28 @@ export interface AppManifestIssue {
   reason: string;
 }
 
-/** Variable names a manifest may not set: the platform owns them. */
-const RESERVED_ENV = /^(?:E2B_.*|AWS_.*|CLAW_.*|NODE_NAME|USER_DATA_PATH)$/;
+/**
+ * The variables Claw itself sets in an application's sandbox. Code that injects
+ * one of them uses this table, not a literal, so a new one is a new entry here and
+ * is reserved by construction (a brain test also scans the injection code for
+ * names missing from it).
+ */
+export const APP_PLATFORM_ENV = {
+  session_id: "CLAW_SESSION_ID",
+  app_run_id: "CLAW_APP_RUN_ID",
+  node_name: "NODE_NAME",
+  user_data_path: "USER_DATA_PATH",
+  topology_handoff_file: "TOPOLOGY_HANDOFF_FILE",
+} as const;
+
+const RESERVED_ENV_NAMES: ReadonlySet<string> = new Set(Object.values(APP_PLATFORM_ENV));
+/** Families the platform and Agent Sandbox own wholesale: `E2B_*`, `AWS_*`, `CLAW_*`. */
+const RESERVED_ENV_PREFIXES = ["E2B_", "AWS_", "CLAW_"] as const;
+
+/** True when a manifest may not set or map this variable: the platform owns it. */
+export function isReservedAppEnv(name: string): boolean {
+  return RESERVED_ENV_NAMES.has(name) || RESERVED_ENV_PREFIXES.some((p) => name.startsWith(p));
+}
 const STATE_DIR_VARS = new Set(["USER_DATA_PATH", "run_id"]);
 
 const isObj = (v: unknown): v is Record<string, unknown> =>
@@ -356,7 +387,7 @@ export function validateAppManifest(value: unknown): AppManifestIssue[] {
   const targets = new Map<string, string>();
   const mapTarget = (path: string, name: unknown): void => {
     if (typeof name !== "string") return;
-    if (RESERVED_ENV.test(name)) bad(path, `${name} is reserved for the platform and cannot be mapped`);
+    if (isReservedAppEnv(name)) bad(path, `${name} is reserved for the platform and cannot be mapped`);
     const prior = targets.get(name);
     if (prior) bad(path, `${name} is already the target of ${prior}`);
     else targets.set(name, path);
@@ -371,7 +402,8 @@ export function validateAppManifest(value: unknown): AppManifestIssue[] {
   {
     for (const k of Object.keys(obj(value.env))) {
       const p = `env.${k}`;
-      if (RESERVED_ENV.test(k)) bad(p, `${k} is reserved for the platform and cannot be set`);
+      if (!ENV_NAME_RE.test(k)) bad(p, `${JSON.stringify(k)} is not a valid variable name; must match ${ENV_NAME_PATTERN}`);
+      else if (isReservedAppEnv(k)) bad(p, `${k} is reserved for the platform and cannot be set`);
       else if (targets.has(k)) bad(p, `${k} is also the target of ${targets.get(k)}`);
     }
   }
@@ -389,14 +421,24 @@ export function validateAppManifest(value: unknown): AppManifestIssue[] {
   // Paths and placeholders stay where they are meant to.
   if (typeof value.state_dir === "string") {
     // A scan, not a regex: each step moves past what it consumed, so the cost
-    // is linear however many `${` the string repeats.
+    // is linear however many `$` the string repeats. Only the two complete
+    // spellings `${USER_DATA_PATH}` and `${run_id}` may contain a `$`.
     const dir = value.state_dir;
-    for (let at = dir.indexOf("${"); at !== -1; at = dir.indexOf("${", at)) {
-      const close = dir.indexOf("}", at + 2);
-      if (close === -1) break;
-      const name = dir.slice(at + 2, close);
-      if (!STATE_DIR_VARS.has(name)) bad("state_dir", `unknown placeholder \${${name}}; only \${USER_DATA_PATH} and \${run_id} are expanded`);
-      at = close + 1;
+    const only = "only ${USER_DATA_PATH} and ${run_id} are expanded";
+    for (let at = dir.indexOf("$"); at !== -1; ) {
+      if (dir.startsWith("${", at)) {
+        const close = dir.indexOf("}", at + 2);
+        if (close === -1) {
+          bad("state_dir", `unterminated placeholder at offset ${at}; ${only}`);
+          break;
+        }
+        const name = dir.slice(at + 2, close);
+        if (!STATE_DIR_VARS.has(name)) bad("state_dir", `unknown placeholder \${${name.slice(0, 40)}}; ${only}`);
+        at = dir.indexOf("$", close + 1);
+      } else {
+        bad("state_dir", `a bare $ at offset ${at} is not allowed; ${only}`);
+        break;
+      }
     }
   }
   const bootstrap = obj(value.bootstrap);
