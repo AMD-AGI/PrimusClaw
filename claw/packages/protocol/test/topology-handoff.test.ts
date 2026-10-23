@@ -82,3 +82,21 @@ test("rejects unknown fields, wrong schema string and bad numbers", () => {
   assert.ok(validateTopologyHandoff({ ...FULL, ray: { token: "inline" } }).length > 0);
   assert.ok(validateTopologyHandoff("nope").length > 0);
 });
+
+test("prototype-chain names are not fields: only own keys count", () => {
+  // JSON.parse makes "constructor" and "__proto__" own keys; a plain `in` test would accept them.
+  const withKey = (k: string, extra: Record<string, unknown> = {}): unknown =>
+    JSON.parse(JSON.stringify({ ...FULL, ...extra }).replace(/^\{/, `{${JSON.stringify(k)}:1,`));
+  for (const k of ["constructor", "toString", "hasOwnProperty", "__proto__"]) {
+    assert.ok(validateTopologyHandoff(withKey(k)).some((p) => p.startsWith(k)), `${k} is an unknown field`);
+  }
+  // An inherited name is not a present field: required is not satisfied by the prototype.
+  const base = Object.create({ nodes: 1, schema: TOPOLOGY_HANDOFF_SCHEMA }) as Record<string, unknown>;
+  Object.assign(base, { backend: "rayjob", gpus_per_node: 1, service_url: "u", ray: {} });
+  const problems = validateTopologyHandoff(base);
+  assert.ok(problems.some((p) => p.startsWith("nodes")) && problems.some((p) => p.startsWith("schema")), problems.join("; "));
+  // The backend rule reads own keys too.
+  const inheritedInfera = Object.assign(Object.create({ infera: {} }), { ...FULL, backend: "rayjob", infera: undefined });
+  delete inheritedInfera.infera;
+  assert.deepEqual(validateTopologyHandoff(inheritedInfera), []);
+});

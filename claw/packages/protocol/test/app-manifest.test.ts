@@ -6,6 +6,8 @@ import assert from "node:assert/strict";
 import {
   APP_MANIFEST_JSON_SCHEMA as S,
   APP_MANIFEST_SCHEMA,
+  APP_PLATFORM_ENV,
+  isReservedAppEnv,
   validateAppManifest,
   type AppManifestV1,
 } from "../src/app-manifest.js";
@@ -283,11 +285,43 @@ test("state_dir placeholder scan is linear on hostile input", () => {
     validateAppManifest(mutate((m) => { m.state_dir = dir; }));
     return performance.now() - t0;
   };
-  for (const unit of ["${", "${{", "${{|", "}${"]) {
+  for (const unit of ["${", "${{", "${{|", "}${", "$", "$a", "${run_id"]) {
     const ms = time(unit.repeat(Math.ceil(100_000 / unit.length)));
     assert.ok(ms < 50, `${JSON.stringify(unit)} x1e5 took ${ms.toFixed(1)}ms`);
   }
   refused(mutate((m) => { m.state_dir = "${USER_DATA_PATH}/${run_id}/${x}"; }), "state_dir", "${x}");
+});
+
+test("variable names are checked in env and env_map", () => {
+  refused(mutate((m) => { m.env["1BAD"] = "x"; }), "env.1BAD", "not a valid variable name");
+  refused(mutate((m) => { m.env["A-B"] = "x"; }), "env.A-B", "not a valid variable name");
+  refused(mutate((m) => { m.env["A=B"] = "x"; }), "env.A=B", "not a valid variable name");
+  refused(mutate((m) => { m.env_map.run_id = "A B"; }), "env_map.run_id", "must match");
+  refused(mutate((m) => { m.env_map.sandbox_keys.dev = "x-y"; }), "env_map.sandbox_keys.dev", "must match");
+  assert.deepEqual(paths(mutate((m) => { m.env._OK_9 = "x"; })), []);
+});
+
+test("every platform-injected variable is reserved, mapped or set", () => {
+  // Literal on purpose: an oracle built from the table would move with it.
+  const injected = ["CLAW_SESSION_ID", "CLAW_APP_RUN_ID", "NODE_NAME", "USER_DATA_PATH", "TOPOLOGY_HANDOFF_FILE"];
+  assert.deepEqual([...Object.values(APP_PLATFORM_ENV)].sort(), [...injected].sort());
+  for (const name of [...injected, "E2B_API_URL", "AWS_REGION", "CLAW_ANYTHING"]) {
+    assert.ok(isReservedAppEnv(name), name);
+    refused(mutate((m) => { m.env[name] = "x"; }), `env.${name}`, "reserved");
+    refused(mutate((m) => { m.env_map.run_id = name; }), "env_map.run_id", "reserved");
+  }
+  assert.ok(!isReservedAppEnv("APP_RUN_ID"));
+});
+
+test("state_dir allows only the two complete placeholders; any other $ is refused", () => {
+  const dir = (d: string) => paths(mutate((m) => { m.state_dir = d; })).filter((p) => p.startsWith("state_dir"));
+  assert.deepEqual(dir("${USER_DATA_PATH}/a/${run_id}"), []);
+  assert.deepEqual(dir("/state/${run_id}/x"), []);
+  for (const bad of ["${run_id", "/a/${run_id/b", "$run_id", "$USER_DATA_PATH/x", "/a/$", "${USER_DATA_PATH}/$run_id", "$${run_id}", "${ run_id}", "${run_id }"]) {
+    assert.ok(dir(bad).length > 0, `${bad} should be refused`);
+  }
+  refused(mutate((m) => { m.state_dir = "${run_id"; }), "state_dir", "unterminated");
+  refused(mutate((m) => { m.state_dir = "$run_id"; }), "state_dir", "bare $");
 });
 
 test("restart needs a backoff when it allows restarts", () => {
