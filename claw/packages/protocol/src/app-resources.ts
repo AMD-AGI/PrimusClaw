@@ -275,6 +275,17 @@ export function resolveAppResources(
   over("resources.cpu", r.cpu, declared.cpu, (q) => q);
   over("resources.memory_gi", r.memory_gi, declared.memory, (q) => q / 1024 ** 3);
 
+  // The effective cpu and memory are the request's, or else the manifest's own
+  // default, which reaches the pod unchanged: it is held to the platform caps too.
+  const effective = (field: string, asked: unknown, text: string | undefined, max: (q: number) => number, cap: number): void => {
+    if (asked !== undefined || text === undefined) return;
+    const q = quantity(text);
+    if (q === undefined) issues.push({ field, reason: `the manifest default ${JSON.stringify(text)} is not a readable quantity; request a value` });
+    else if (max(q) > cap) issues.push({ field, reason: `the manifest default ${text} exceeds the platform maximum ${cap}; request a smaller value` });
+  };
+  effective("resources.cpu", r.cpu, declared.cpu, (q) => q, containerCaps.cpu);
+  effective("resources.memory_gi", r.memory_gi, declared.memory, (q) => q / 1024 ** 3, containerCaps.memory_gi);
+
   const req: AppGrantLimits = {};
   if (r.grant !== undefined) {
     const before = issues.length;
