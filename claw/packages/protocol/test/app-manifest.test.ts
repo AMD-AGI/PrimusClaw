@@ -166,7 +166,7 @@ test("a document with every field set validates", () => {
 test("the smallest manifest validates", () => {
   const min = {
     schema: APP_MANIFEST_SCHEMA, name: "a", version: "0.1.0",
-    container: {}, state_dir: "/state", command: ["run"],
+    container: {}, state_dir: "/state/${run_id}", command: ["run"],
   };
   assert.deepEqual(validateAppManifest(min), []);
 });
@@ -354,4 +354,42 @@ test("every problem is reported, not the first", () => {
     m.limits.max_runtime_sec = 0;
   }));
   assert.deepEqual(found.sort(), ["container.image", "limits.max_runtime_sec", "sandbox_roles.subrun[2]"]);
+});
+
+test("the reserved names include everything user env refuses, from the same source", async () => {
+  const { USER_ENV_DENY_LIST } = await import("../src/user-env.js");
+  for (const name of USER_ENV_DENY_LIST) assert.ok(isReservedAppEnv(name), name);
+  for (const name of [
+    "SAFE_API_KEY", "MCP_PORT", "WORKSPACE_PATH", "USER_ID_HEX", "AUTH_CLAW_TOKEN", "LD_PRELOAD", "PATH",
+    "HANDS_STATE_DIR", "HANDS_CHILD_ISOLATION", "BASH_FUNC_foo", "HYPERLOOM_MN_EXT_SSH_KEY", "INFERENCE_OPTIMIZER_NODES",
+    "E2B_API_URL", "AWS_SECRET_ACCESS_KEY", "CLAW_SESSION_ID", "TOPOLOGY_HANDOFF_FILE",
+  ]) {
+    assert.ok(isReservedAppEnv(name), name);
+    refused(mutate((m) => { m.env[name] = "x"; }), `env.${name}`, "reserved");
+    refused(mutate((m) => { m.env_map.run_id = name; }), "env_map.run_id", "reserved");
+  }
+  // Ordinary application names are not caught.
+  for (const name of ["APP_RUN_ID", "MODEL_NAME", "Mixed_Case_1"]) assert.equal(isReservedAppEnv(name), false, name);
+});
+
+test("container.resources is checked when the manifest is registered: names and quantities", () => {
+  const withRes = (r: Record<string, string>) => mutate((m) => { m.container.resources = r; });
+  refused(withRes({ cpu: "lots" }), "container.resources.cpu", "not a readable quantity");
+  refused(withRes({ memory: "32 GB" }), "container.resources.memory", "not a readable quantity");
+  refused(withRes({ "ephemeral-storage": "" }), "container.resources.ephemeral-storage", "not a readable quantity");
+  refused(withRes({ "Not A Name": "1" }), "container.resources.Not A Name", "not a Kubernetes resource name");
+  refused(withRes({ "a/b/c": "1" }), "container.resources.a/b/c", "not a Kubernetes resource name");
+  assert.deepEqual(paths(withRes({ cpu: "500m", memory: "32Gi", "ephemeral-storage": "500Gi", "example.com/widget": "2", hugepages: "1" })), []);
+});
+
+test("state_dir: no .. segment, absolute or under ${USER_DATA_PATH}/, and per run", () => {
+  const dir = (d: string) => paths(mutate((m) => { m.state_dir = d; })).filter((p) => p.startsWith("state_dir"));
+  assert.ok(dir("${USER_DATA_PATH}/../other/${run_id}").length > 0, "escapes the user's data directory");
+  assert.ok(dir("/state/../etc/${run_id}").length > 0);
+  assert.ok(dir("${USER_DATA_PATH}/a/..").length > 0);
+  assert.ok(dir("relative/${run_id}").length > 0, "neither absolute nor under USER_DATA_PATH");
+  assert.ok(dir("${USER_DATA_PATH}/shared").length > 0, "no ${run_id}: concurrent runs would share it");
+  assert.deepEqual(dir("${USER_DATA_PATH}/.claw-apps/${run_id}"), []);
+  assert.deepEqual(dir("/state/${run_id}/x"), []);
+  assert.deepEqual(dir("${USER_DATA_PATH}/a..b/${run_id}"), [], "a dotted name is not a .. segment");
 });

@@ -5,14 +5,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { APP_MANIFEST_SCHEMA, type AppManifestV1 } from "../src/app-manifest.js";
 import {
-  appGrantTemplates, DEFAULT_APP_CONTAINER_CAPS, parseAppContainerCaps, parseAppSandboxCaps, resolveAppResources, type ResolvedAppResources,
+  appGrantTemplates, DEFAULT_APP_CONTAINER_CAPS, DEFAULT_APP_SANDBOX_CAPS, parseAppContainerCaps, parseAppSandboxCaps, resolveAppResources, type ResolvedAppResources,
 } from "../src/app-resources.js";
 
 /** A generic app: two roles, a default image, defaults and a maximum in `limits`. */
 const MANIFEST: AppManifestV1 = {
   schema: APP_MANIFEST_SCHEMA, name: "example-app", version: "1.0.0",
   container: { image: "registry.example.invalid/app:default", resources: { cpu: "8", memory: "32Gi" } },
-  state_dir: "/state", command: ["run"],
+  state_dir: "/state/${run_id}", command: ["run"],
   sandbox_templates: [
     { name: "runner", per_gpu_count: [1, 2], provider: "p" },
     { name: "pinned", image: "registry.example.invalid/own:1", workspace: "ws-own" },
@@ -129,9 +129,13 @@ test("templates inherit the run's image and workspace unless they set their own;
 });
 
 test("APP_SANDBOX_CAPS parses the grant shape, and a bad value fails loudly", () => {
-  assert.deepEqual(parseAppSandboxCaps(undefined), {});
-  assert.deepEqual(parseAppSandboxCaps(" "), {});
-  assert.deepEqual(parseAppSandboxCaps('{"max_sandboxes":8,"max_gpus":2,"gpu_hours":10}'), { max_sandboxes: 8, max_gpus: 2, gpu_hours: 10 });
+  assert.deepEqual(parseAppSandboxCaps(undefined), DEFAULT_APP_SANDBOX_CAPS);
+  assert.deepEqual(parseAppSandboxCaps(" "), DEFAULT_APP_SANDBOX_CAPS);
+  assert.deepEqual(
+    parseAppSandboxCaps('{"max_sandboxes":8,"max_gpus":2,"gpu_hours":10}'),
+    { ...DEFAULT_APP_SANDBOX_CAPS, max_sandboxes: 8, max_gpus: 2, gpu_hours: 10 },
+    "an item left out keeps its default",
+  );
   assert.throws(() => parseAppSandboxCaps("{"), /not valid JSON/);
   assert.throws(() => parseAppSandboxCaps('{"gpu_hours":-1}'), /gpu_hours/);
   assert.throws(() => parseAppSandboxCaps('{"typo":1}'), /typo/);
@@ -214,4 +218,21 @@ test("a manifest default above the platform caps is refused when the request doe
   // Defaults inside the caps, and an unreadable default, behave sensibly.
   ok(GOOD, {}, { ...MANIFEST, container: { image: "i", resources: { cpu: "32", memory: "128Gi" } } });
   refused(GOOD, "resources.cpu", "not a readable quantity", {}, { ...MANIFEST, container: { image: "i", resources: { cpu: "lots" } } });
+});
+
+test("an unconfigured grant is bounded: max_gpus and gpu_hours have defaults, asked or not", () => {
+  // No caps argument at all: the platform defaults apply.
+  const big = resolveAppResources(MANIFEST, { ...GOOD, grant: { max_gpus: 100000, gpu_hours: 1e9, max_sandboxes: 500, max_runtime_sec: 1e9 } });
+  assert.ok("resources" in big);
+  const g = (big as { resources: ResolvedAppResources }).resources.grant;
+  assert.equal(g.max_gpus, DEFAULT_APP_SANDBOX_CAPS.max_gpus);
+  assert.equal(g.gpu_hours, DEFAULT_APP_SANDBOX_CAPS.gpu_hours);
+  assert.equal(g.max_sandboxes, MANIFEST.limits!.max_sandboxes, "the manifest's own limit is lower still");
+  // A request that says nothing gets the default, not "unlimited".
+  const none = resolveAppResources(MANIFEST, GOOD);
+  const n = (none as { resources: ResolvedAppResources }).resources.grant;
+  assert.equal(n.max_gpus, DEFAULT_APP_SANDBOX_CAPS.max_gpus);
+  assert.equal(n.gpu_hours, DEFAULT_APP_SANDBOX_CAPS.gpu_hours);
+  // Explicit caps replace the defaults per item; an explicit empty set is the caller saying "no cap" (tests only).
+  assert.equal(ok({ ...GOOD, grant: { max_gpus: 5 } }, { max_gpus: 3 }).grant.max_gpus, 3);
 });
