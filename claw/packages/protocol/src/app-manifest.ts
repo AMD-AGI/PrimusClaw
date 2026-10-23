@@ -21,7 +21,9 @@
  *    the grant's `templates` and `roles` when the grant is issued.
  *  - `grant_from_input` maps a limit of the grant to a pointer into the input.
  *    `grant_extra` is added after pointer resolution (for example one slot for
- *    a sub-run). The granted limits are injected back through
+ *    a sub-run), and the platform limit then caps the sum; GPU-hours are
+ *    multiplied by `limits.gpu_hours_headroom` before that cap. The granted
+ *    limits are injected back through
  *    `env_map.grant_limits` so the app can plan within what it actually got.
  *
  * Optional fields are omitted rather than written as empty. The documented
@@ -61,8 +63,10 @@ export interface AppContainerResourcesFromInput {
 }
 
 export interface AppContainer {
-  /** Required: a hosted app's image is chosen per run, from the input. */
-  image_from_input: JsonPointer;
+  /** A fixed image. Exactly one of `image` and `image_from_input` is given. */
+  image?: string;
+  /** The image is read from the run input at this pointer. */
+  image_from_input?: JsonPointer;
   gpus_from_input?: JsonPointer;
   workspace_from_input?: JsonPointer | JsonPointer[];
   /** A value found here overrides the same key in `resources`. */
@@ -130,27 +134,17 @@ export interface AppSandboxTemplateDataPlane {
 }
 
 /**
- * A sandbox template, passed to Agent Sandbox as part of the grant. Its field
- * shape follows Agent Sandbox's template definition; this package checks the
- * Claw-side invariants only.
+ * A sandbox template, passed to Agent Sandbox as part of the grant. Its fields
+ * are owned by the Agent Sandbox design, not by Claw: Claw reads `name`
+ * (roles refer to it) and `per_gpu_count`, and hands every other field through
+ * unvalidated and unchanged (Agent Sandbox stores them whole as the template's
+ * `spec`).
  */
 export interface AppSandboxTemplate {
   name: string;
-  provider: string;
-  /** Allowed GPU counts per sandbox. Mutually exclusive with `gpus`. */
+  /** Allowed GPU counts per sandbox; Agent Sandbox's `perGpuCount`. */
   per_gpu_count?: number[];
-  gpus?: number;
-  image_from_input?: JsonPointer;
-  workspace_from_input?: JsonPointer | JsonPointer[];
-  resources?: Record<string, string>;
-  mounts?: Record<string, "ro" | "rw">;
-  egress?: string[];
-  start?: AppSandboxTemplateStart;
-  data_plane?: AppSandboxTemplateDataPlane;
-  signing_identity?: { key_file_env: string };
-  pending_timeout_sec?: number;
-  max_timeout_sec?: number;
-  preheat?: boolean;
+  [field: string]: unknown;
 }
 
 export type AppSandboxRoles = { [R in AppSandboxRole]?: string[] };
@@ -167,12 +161,13 @@ export interface AppRestart {
 }
 
 export interface AppLimits {
-  /** Defaults for the per-role sandbox ceiling; the input may lower or raise it via `grant_from_input`. */
+  /** Defaults for the per-role sandbox ceiling; `grant_from_input` and `grant_extra` apply first, then the platform limit caps the result. */
   max_sandboxes?: { [R in AppSandboxRole]?: number };
   max_runtime_sec?: number;
   input_max_bytes?: number;
   /**
-   * Multiplier from the planned GPU-hours to the granted budget (default 1.3).
+   * Multiplier from the planned GPU-hours to the granted budget (default 1.3),
+   * applied before the platform limit caps the budget.
    * Measurement sandboxes are per test; headroom covers cold start, PRELUDE
    * and withdrawn tests.
    */
@@ -241,44 +236,14 @@ export const APP_MANIFEST_JSON_SCHEMA = {
     envName: { type: "string", pattern: ENV_NAME_PATTERN },
     stringMap: { type: "object", additionalProperties: nonEmptyStr },
     base64: { type: "string", minLength: 1, pattern: B64_PATTERN },
+    // Only what Claw reads (name, per_gpu_count) is checked; the rest of a template is Agent
+    // Sandbox's and passes through (no additionalProperties restriction).
     template: {
       type: "object",
-      additionalProperties: false,
-      required: ["name", "provider"],
+      required: ["name"],
       properties: {
         name: { type: "string", pattern: "^[a-z][a-z0-9_-]{0,62}$" },
-        provider: nonEmptyStr,
         per_gpu_count: { type: "array", minItems: 1, uniqueItems: true, items: posInt },
-        gpus: nonNegInt,
-        image_from_input: ref("pointer"),
-        workspace_from_input: ref("pointerOrList"),
-        resources: ref("stringMap"),
-        mounts: { type: "object", additionalProperties: { enum: ["ro", "rw"] } },
-        egress: { type: "array", items: nonEmptyStr },
-        start: {
-          type: "object",
-          additionalProperties: false,
-          properties: { script_b64: ref("base64"), env_from_input: ref("pointerMap") },
-        },
-        data_plane: {
-          type: "object",
-          additionalProperties: false,
-          required: ["mode"],
-          properties: {
-            mode: { enum: ["sealed", "open"] },
-            inputs: { type: "array", items: nonEmptyStr },
-            outputs: { type: "array", items: nonEmptyStr },
-          },
-        },
-        signing_identity: {
-          type: "object",
-          additionalProperties: false,
-          required: ["key_file_env"],
-          properties: { key_file_env: ref("envName") },
-        },
-        pending_timeout_sec: posInt,
-        max_timeout_sec: posInt,
-        preheat: { type: "boolean" },
       },
     },
   },
@@ -289,8 +254,8 @@ export const APP_MANIFEST_JSON_SCHEMA = {
     container: {
       type: "object",
       additionalProperties: false,
-      required: ["image_from_input"],
       properties: {
+        image: nonEmptyStr,
         image_from_input: ref("pointer"),
         gpus_from_input: ref("pointer"),
         workspace_from_input: ref("pointerOrList"),
@@ -412,7 +377,15 @@ export function validateAppManifest(value: unknown): AppManifestIssue[] {
   const bad = (path: string, reason: string): void => void issues.push({ path, reason });
   const obj = (v: unknown): Record<string, unknown> => (isObj(v) ? v : {});
 
-  // Templates: unique names, sane counts and timeouts.
+  // The image: exactly one of a fixed string or a pointer into the input.
+  const container = obj(value.container);
+  if (Object.hasOwn(container, "image") && Object.hasOwn(container, "image_from_input")) {
+    bad("container.image", "cannot be combined with container.image_from_input; give exactly one");
+  } else if (isObj(value.container) && !Object.hasOwn(container, "image") && !Object.hasOwn(container, "image_from_input")) {
+    bad("container", "needs exactly one of image or image_from_input; neither is given");
+  }
+
+  // Templates: unique names (the only thing Claw reads besides the roles).
   const defined = new Set<string>();
   if (Array.isArray(value.sandbox_templates)) {
     value.sandbox_templates.forEach((t, i) => {
@@ -421,15 +394,6 @@ export function validateAppManifest(value: unknown): AppManifestIssue[] {
       if (typeof t.name === "string") {
         if (defined.has(t.name)) bad(`${at}.name`, `template ${JSON.stringify(t.name)} is defined twice`);
         defined.add(t.name);
-      }
-      if (t.gpus !== undefined && t.per_gpu_count !== undefined) {
-        bad(`${at}.per_gpu_count`, "cannot be combined with gpus; use one or the other");
-      }
-      if (
-        typeof t.pending_timeout_sec === "number" && typeof t.max_timeout_sec === "number" &&
-        t.pending_timeout_sec > t.max_timeout_sec
-      ) {
-        bad(`${at}.pending_timeout_sec`, "must not exceed max_timeout_sec");
       }
     });
   }
