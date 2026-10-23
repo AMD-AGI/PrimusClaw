@@ -223,6 +223,24 @@ const holdLease = (id: string) => q(
       assert.equal((await patch({ brain_id: "brain-A", state: "running" })).json().error, "claim_count_required");
     });
 
+    test("a takeover that commits while a write waits is seen: the stale holder does not write", async () => {
+      const client = await h.app.db.db.pool.connect();
+      try {
+        // The new claim is in flight: it holds the task row and has not committed.
+        await client.query("BEGIN");
+        await client.query("UPDATE claw_tasks SET lease_owner = 'brain-B', claim_count = claim_count + 1 WHERE task_id = $1", [taskId]);
+        const stale = patch(brain({ state: "starting" })); // brain-A at the old epoch: blocks on the row lock
+        await new Promise((r) => setTimeout(r, 300));
+        await client.query("COMMIT");
+        const res = await stale;
+        assert.equal(res.statusCode, 409, res.body);
+        assert.equal(res.json().error, "not_holder");
+        assert.equal((await row()).state, "provisioning", "the stale write changed nothing");
+      } finally {
+        client.release();
+      }
+    });
+
     test("restarts only move forward, and the answer is the row as written", async () => {
       assert.equal((await patch(brain({ restarts: 2, state: "restarting" }))).statusCode, 200);
       const back = await patch(brain({ restarts: 1, state: "starting" }));
