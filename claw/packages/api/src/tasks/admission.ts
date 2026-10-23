@@ -26,6 +26,7 @@ import { PG_INT4_MAX } from "@claw/utils";
 
 import { db, type StatementRunner } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
+import { appGpuNodesFromSpec } from "./run-spec.js";
 import type { ClawTaskRow } from "./types.js";
 
 const logger = pino({ name: "admission" });
@@ -424,6 +425,8 @@ const SANDBOX_ROW_SQL = `sandbox_spec IS NOT NULL AND sandbox_spec::text <> '"no
 function gpuSumSql(statusParam: string): string {
   return `LEAST(COALESCE(SUM(
          CASE
+           WHEN status = ANY(${statusParam}::text[]) AND mode = 'app'
+           THEN CASE WHEN sandbox_spec->'resources'->>'amd.com/gpu' ~ '^[1-9][0-9]*$' THEN 1 ELSE 0 END
            WHEN status = ANY(${statusParam}::text[])
             AND jsonb_typeof(input->'topology'->'nodes') = 'number'
            THEN LEAST((input->'topology'->>'nodes')::numeric, ${PG_INT4_MAX})
@@ -643,6 +646,8 @@ function rowWantsSandbox(row: ClawTaskRow): boolean {
 // The SQL's `jsonb_typeof(...) = 'number'` guard, in TypeScript: an ask that
 // counts what the aggregate does not is an ask compared against nothing.
 function rowGpuNodes(row: ClawTaskRow): number {
+  // An app run's GPU demand is its sandbox spec's; its input is opaque and is not read.
+  if (row.mode === "app") return appGpuNodesFromSpec(row.sandbox_spec);
   const topology = (row.input as { topology?: { nodes?: unknown } } | null)?.topology;
   const nodes = topology?.nodes;
   if (typeof nodes !== "number" || !Number.isInteger(nodes) || nodes <= 0) return 0;
