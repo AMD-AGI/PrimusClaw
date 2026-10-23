@@ -59,8 +59,8 @@ test("rayjob: every legacy variable equals its handoff field", () => {
   assert.equal(env.HYPERLOOM_MN_EXT_RAY_DASHBOARD_TOKEN, byPath.get(tokenFile)?.content, "ray token via file");
   assert.equal(handoff.gpus_per_node, 8, "gpus_per_node");
   assert.equal(handoff.infera, undefined);
-  assert.equal(handoff.schema, "claw.topology-handoff/v1");
-  assert.equal(env.CLAW_TOPOLOGY_FILE, `${WS}/.claw/topology.json`);
+  assert.equal(handoff.schema, "topology-handoff/v1");
+  assert.equal(env.TOPOLOGY_HANDOFF_FILE, `${WS}/.claw/topology.json`);
 });
 
 test("infera: every legacy variable equals its handoff field", () => {
@@ -121,7 +121,7 @@ test("legacy variables follow LEGACY_TOPOLOGY_ENV; the file variable does not", 
   applyMultiNodeExternalEnv(def, INFERA);
   assert.equal(def.HYPERLOOM_MN_EXT_SERVICE_URL, INFERA.serviceUrl);
   assert.equal(def.INFERENCE_OPTIMIZER_NODES, "3");
-  assert.equal(def.CLAW_TOPOLOGY_FILE, "/workspace/.claw/topology.json");
+  assert.equal(def.TOPOLOGY_HANDOFF_FILE, "/workspace/.claw/topology.json");
 
   const off: Record<string, string> = { SAFE_API_URL: "x" };
   applyMultiNodeExternalEnv(off, INFERA, { legacyTopologyEnv: false });
@@ -130,6 +130,6 @@ test("legacy variables follow LEGACY_TOPOLOGY_ENV; the file variable does not", 
   }
   assert.equal(off.INFERENCE_OPTIMIZER_MN_BACKEND, undefined);
   assert.equal(off.INFERENCE_OPTIMIZER_NODES, undefined);
-  assert.equal(off.CLAW_TOPOLOGY_FILE, "/workspace/.claw/topology.json");
+  assert.equal(off.TOPOLOGY_HANDOFF_FILE, "/workspace/.claw/topology.json");
   assert.equal(off.SAFE_API_URL, undefined, "external mode is still forced");
 });
