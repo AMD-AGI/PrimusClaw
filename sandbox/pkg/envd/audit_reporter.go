@@ -54,18 +54,18 @@ const (
 )
 
 type egressAuditReporter struct {
-	cache  *inferenceKeyCache
-	client *http.Client
-	wakeCh chan struct{}
+	session *sessionContext
+	client  *http.Client
+	wakeCh  chan struct{}
 
 	mu      sync.Mutex
 	held    []timedDecision // oldest first
 	nextSeq uint64
 }
 
-func newEgressAuditReporter(cache *inferenceKeyCache) *egressAuditReporter {
+func newEgressAuditReporter(session *sessionContext) *egressAuditReporter {
 	return &egressAuditReporter{
-		cache: cache,
+		session: session,
 		client: &http.Client{
 			Timeout: 5 * time.Second,
 		},
@@ -179,7 +179,7 @@ func (r *egressAuditReporter) send(ctx context.Context, event timedDecision) sen
 	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	resp, err := r.cache.callWM(reqCtx, r.client, http.MethodPost, "audit", bytes.NewReader(body))
+	resp, err := r.session.callWM(reqCtx, r.client, http.MethodPost, "audit", bytes.NewReader(body))
 	switch {
 	case errors.Is(err, errAwaitingToken):
 		return sendAwaitToken

@@ -107,7 +107,7 @@ func TestHandlerCapturesOnlyAuthenticatedTokens(t *testing.T) {
 		// Each case runs before any token is held, and after one is.
 		for _, earlier := range []string{"", "earlier"} {
 			t.Run(fmt.Sprintf("%s/held=%q", tc.name, earlier), func(t *testing.T) {
-				s := &Server{auth: &authManager{}, inference: &inferenceKeyCache{jwtToken: earlier, ready: make(chan struct{})}}
+				s := &Server{auth: &authManager{}, session: &sessionContext{jwtToken: earlier, ready: make(chan struct{})}}
 				if tc.verify {
 					s.auth.publicKey = &key.PublicKey
 				}
@@ -120,7 +120,7 @@ func TestHandlerCapturesOnlyAuthenticatedTokens(t *testing.T) {
 				if tc.wantKept {
 					want = tc.token
 				}
-				require.Equal(t, want, s.inference.jwtToken)
+				require.Equal(t, want, s.session.jwtToken)
 			})
 		}
 	}
@@ -151,7 +151,7 @@ func TestSessionIDComesFromTheVerifiedToken(t *testing.T) {
 		{name: "no verification key", want: "session-other"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := &Server{auth: &authManager{}, inference: &inferenceKeyCache{ready: make(chan struct{})}}
+			s := &Server{auth: &authManager{}, session: &sessionContext{ready: make(chan struct{})}}
 			if tc.verify {
 				s.auth.publicKey = &key.PublicKey
 			}
@@ -161,7 +161,7 @@ func TestSessionIDComesFromTheVerifiedToken(t *testing.T) {
 			rec := httptest.NewRecorder()
 			s.Handler().ServeHTTP(rec, req)
 			require.Equal(t, http.StatusOK, rec.Code)
-			require.Equal(t, tc.want, s.inference.getSessionID())
+			require.Equal(t, tc.want, s.session.getSessionID())
 		})
 	}
 }

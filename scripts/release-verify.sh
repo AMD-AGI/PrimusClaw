@@ -81,9 +81,12 @@ trap 'rm -f "$sandbox_render" "$claw_render" "$memory_render" "$background_rende
 helm template sandbox-release "$repo_root/sandbox/deploy/helm" \
   --namespace agent-sandbox-system \
   --values "$repo_root/scripts/release-tests/values/sandbox-release.yaml" >"$sandbox_render"
-rg -q '^kind: StatefulSet$' "$sandbox_render"
-rg -q '^kind: Secret$' "$sandbox_render"
+rg -q '^kind: Deployment$' "$sandbox_render"
 rg -q 'example.invalid/agent-sandbox-controlplane:release-test@sha256:1111111111111111111111111111111111111111111111111111111111111111' "$sandbox_render"
+if rg -q 'agent-sandbox-redis|^[[:space:]]*name: redis$|kind: StatefulSet' "$sandbox_render"; then
+  echo "sandbox release render still contains Redis resources" >&2
+  exit 1
+fi
 if rg '^[[:space:]]*image:' "$sandbox_render" | rg -v '@sha256:'; then
   echo "sandbox release render contains a mutable image reference" >&2
   exit 1

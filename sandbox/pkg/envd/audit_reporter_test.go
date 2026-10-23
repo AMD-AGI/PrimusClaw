@@ -95,8 +95,8 @@ func TestEgressAuditReporterHoldsEventsUntilWMAcceptsAToken(t *testing.T) {
 			}))
 			defer server.Close()
 
-			cache := &inferenceKeyCache{wmURL: server.URL, ready: make(chan struct{}), fetchStarted: true}
-			r := newEgressAuditReporter(cache)
+			session := &sessionContext{wmURL: server.URL, ready: make(chan struct{})}
+			r := newEgressAuditReporter(session)
 			ctx := context.Background()
 			base := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 			at := map[string]time.Time{}
@@ -108,8 +108,8 @@ func TestEgressAuditReporterHoldsEventsUntilWMAcceptsAToken(t *testing.T) {
 					r.hold(egress.DecisionEvent{Action: "deny", Stage: "policy", Domain: arg}, at[arg])
 					r.flush(ctx)
 				case "token":
-					cache.setJWTToken(arg)
-					cache.setSessionID("sess-a")
+					session.setJWTToken(arg)
+					session.setSessionID("sess-a")
 					r.flush(ctx)
 				}
 			}

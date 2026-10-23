@@ -17,7 +17,7 @@
     "@aws-sdk/s3-request-presigner": "^3.1142.0",
     "@claw/protocol": "*",
     "@claw/utils": "*",
-    "@modelcontextprotocol/sdk": "^1.31.0",
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "adm-zip": "^0.6.1",
     "axios": "^1.20.0",
     "dotenv": "^18.0.4",
