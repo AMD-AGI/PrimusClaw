@@ -185,7 +185,17 @@ export async function ensureAppSandbox(run: AppSandboxRun, deps: AppSandboxDeps)
     // Recorded before the wait, as on the create path: a wait that gives up must
     // leave the id behind for whoever cleans up.
     if (run.sandboxWorkloadId !== adopted.id) await deps.recordWorkloadId(run.runId, adopted.id);
-    if (adopted.phase !== "running") await wait(adopted.id, run.platformKey);
+    if (adopted.phase !== "running") {
+      try {
+        await wait(adopted.id, run.platformKey);
+      } catch (err) {
+        // A workload that cannot be brought to Running (queued past the ceiling, or
+        // gone terminal) is stopped, as on the create path: left live, the next
+        // attempt would find and adopt it again, for ever.
+        await reclaim(adopted.id, "adopted_wait_failed");
+        throw err;
+      }
+    }
     logger.info({ runId: run.runId, workloadId: adopted.id, surplus: live.length - 1 }, "app_sandbox.adopted");
     return { instance: instanceFor(adopted.id), workloadId: adopted.id, created: false };
   }
