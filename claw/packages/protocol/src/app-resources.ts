@@ -88,6 +88,20 @@ const isCount = (v: unknown): v is number => typeof v === "number" && Number.isS
 const isPlainQuantity = (v: unknown, min: number): v is number =>
   typeof v === "number" && Number.isFinite(v) && v >= min && /^[0-9]+(?:\.[0-9]{1,6})?$/.test(String(v));
 
+/**
+ * Applied to each grant item `APP_SANDBOX_CAPS` does not name (all of them when it
+ * is unset). The grant is what the app may later ask Agent Sandbox for, which is
+ * where most of a run's GPUs go, so it is bounded by default exactly as the app's
+ * own container is: a cap that is never configured must not mean unlimited. The
+ * values are conservative starting points, meant to be set per platform.
+ */
+export const DEFAULT_APP_SANDBOX_CAPS: Readonly<Required<AppGrantLimits>> = {
+  max_sandboxes: 8,
+  max_gpus: 64,
+  gpu_hours: 1000,
+  max_runtime_sec: 172_800,
+};
+
 /** What one app container may ask for on the platform, whatever its manifest says. */
 export interface AppContainerCaps {
   /** GPUs of one app container. A pod runs on one node, so this is at most a node's GPUs. */
@@ -160,12 +174,12 @@ export function validateAppGrantLimits(at: string, v: unknown, out: AppResources
 
 /**
  * Parse `APP_SANDBOX_CAPS`: a JSON object of the grant shape (`max_sandboxes`,
- * `max_gpus`, `gpu_hours`, `max_runtime_sec`); any item left out has no cap. Throws on a
+ * `max_gpus`, `gpu_hours`, `max_runtime_sec`); an item left out keeps its default ({@link DEFAULT_APP_SANDBOX_CAPS}). Throws on a
  * value that is not that, so a misconfigured platform fails at start-up
  * rather than silently capping nothing.
  */
 export function parseAppSandboxCaps(raw: string | undefined): AppGrantLimits {
-  if (raw === undefined || raw.trim() === "") return {};
+  if (raw === undefined || raw.trim() === "") return { ...DEFAULT_APP_SANDBOX_CAPS };
   let v: unknown;
   try {
     v = JSON.parse(raw);
@@ -177,7 +191,8 @@ export function parseAppSandboxCaps(raw: string | undefined): AppGrantLimits {
   if (issues.length > 0) {
     throw new Error(`APP_SANDBOX_CAPS is invalid: ${issues.map((i) => `${i.field}: ${i.reason}`).join("; ")}`);
   }
-  return v as AppGrantLimits;
+  // An item left out keeps its default: "not configured" is never "unlimited".
+  return { ...DEFAULT_APP_SANDBOX_CAPS, ...(v as AppGrantLimits) };
 }
 
 /** The smallest of the values that are set: a bound alone stands in for an absent request. */
@@ -191,7 +206,7 @@ const QUANTITY_SUFFIX: Record<string, number> = {
   Ki: 1024, Mi: 1024 ** 2, Gi: 1024 ** 3, Ti: 1024 ** 4, Pi: 1024 ** 5, Ei: 1024 ** 6,
 };
 /** A Kubernetes quantity ("8", "500m", "32Gi", "1e3", "1G") as a number; undefined when not one. */
-function quantity(q: string): number | undefined {
+export function parseQuantity(q: string): number | undefined {
   const m = /^([0-9]+(?:\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+|[numkMGTPE]|Ki|Mi|Gi|Ti|Pi|Ei)?$/.exec(q.trim());
   if (!m) return undefined;
   const n = Number(m[1]) * (m[2] === undefined ? 1 : /^[eE][+-]?[0-9]/.test(m[2]) ? 10 ** Number(m[2].slice(1)) : QUANTITY_SUFFIX[m[2]]!);
@@ -215,7 +230,7 @@ function quantity(q: string): number | undefined {
 export function resolveAppResources(
   manifest: AppManifestV1,
   raw: unknown,
-  caps: AppGrantLimits = {},
+  caps: AppGrantLimits = DEFAULT_APP_SANDBOX_CAPS,
   containerCaps: AppContainerCaps = DEFAULT_APP_CONTAINER_CAPS,
 ): { resources: ResolvedAppResources } | { issues: AppResourcesIssue[] } {
   const issues: AppResourcesIssue[] = [];
@@ -268,7 +283,7 @@ export function resolveAppResources(
   // cannot be read is a refusal of any request for that resource, never "no maximum".
   const over = (field: string, asked: unknown, text: string | undefined, max: (q: number) => number): void => {
     if (typeof asked !== "number" || text === undefined) return;
-    const q = quantity(text);
+    const q = parseQuantity(text);
     if (q === undefined) issues.push({ field, reason: `the manifest maximum ${JSON.stringify(text)} is not a readable quantity` });
     else if (asked > max(q)) issues.push({ field, reason: `exceeds the manifest maximum ${text}` });
   };
@@ -279,7 +294,7 @@ export function resolveAppResources(
   // default, which reaches the pod unchanged: it is held to the platform caps too.
   const effective = (field: string, asked: unknown, text: string | undefined, max: (q: number) => number, cap: number): void => {
     if (asked !== undefined || text === undefined) return;
-    const q = quantity(text);
+    const q = parseQuantity(text);
     if (q === undefined) issues.push({ field, reason: `the manifest default ${JSON.stringify(text)} is not a readable quantity; request a value` });
     else if (max(q) > cap) issues.push({ field, reason: `the manifest default ${text} exceeds the platform maximum ${cap}; request a smaller value` });
   };
