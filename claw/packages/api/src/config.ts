@@ -374,7 +374,7 @@ export const APP_RUNS_ENABLED = envBool("APP_RUNS_ENABLED", false);
 
 /**
  * Platform caps on what an app run's grant may carry, as JSON of the grant
- * shape: `{"roles":{"measurement":{"max_sandboxes":8,"max_gpus":8}},"gpu_hours":500,"max_runtime_sec":172800}`.
+ * shape: `{"max_sandboxes":8,"max_gpus":8,"gpu_hours":500,"max_runtime_sec":172800}`.
  * Each grant item is the smaller of the request and its cap; an item with no
  * cap is the request as it is. A value that is not that shape stops start-up.
  */
