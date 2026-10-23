@@ -31,7 +31,6 @@ test("isAnonymousPath: A2A discovery stays anonymous on both prefixes", () => {
   assert.equal(isAnonymousPath("/.well-known/agent-card.json"), true);
   assert.equal(isAnonymousPath("/a2a/.well-known/agent-card.json"), true);
   assert.equal(isAnonymousPath("/.well-known/agent.json"), true);
-  assert.equal(isAnonymousPath("/.well-known/jwks.json"), true);
   assert.equal(isAnonymousPath("/a2a/.well-known/agent.json"), true);
 });
 

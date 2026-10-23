@@ -2001,25 +2001,6 @@ export async function initDb(): Promise<void> {
     // sandbox as a fallback layer (see system-env-design.md). One row per
     // key_name; key_name is the primary key.
     await client.query(`
-      CREATE TABLE IF NOT EXISTS claw_app_run_grants (
-        app_run_id       TEXT PRIMARY KEY,
-        grant_id         TEXT NOT NULL,
-        user_id          TEXT NOT NULL,
-        session_id       TEXT NOT NULL DEFAULT '',
-        expires_at       TIMESTAMPTZ NOT NULL,
-        keys_ciphertext  TEXT NOT NULL DEFAULT '',
-        attestation      TEXT NOT NULL DEFAULT '',
-        state            TEXT NOT NULL DEFAULT 'pending',
-        claims           JSONB NOT NULL DEFAULT '{}'::jsonb,
-        created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-    await client.query(
-      "CREATE INDEX IF NOT EXISTS idx_app_run_grants_grant_id ON claw_app_run_grants(grant_id)",
-    ).catch(() => {});
-
-    await client.query(`
       CREATE TABLE IF NOT EXISTS claw_system_env_vars (
         key_name       TEXT PRIMARY KEY,
         key_value_enc  TEXT NOT NULL,

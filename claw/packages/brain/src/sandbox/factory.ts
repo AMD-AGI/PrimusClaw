@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * Sandbox provider factory. Single-node create uses AgentSandboxProvider.
- * SafeWorkloadProvider remains for multi-node Hands pods and for sandboxes
- * already recorded as safe-workload. Providers are singletons.
+ * Sandbox provider factory. safe mode → SafeWorkloadProvider (SaFE Workload
+ * API); kubernetes mode → AgentSandboxProvider (PrimusClaw/Sandbox router).
+ * Providers are singletons.
  */
 
 import { CLAW_DEPLOY_MODE } from "../config.js";

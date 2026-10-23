@@ -42,7 +42,6 @@ import { resourcesJsonToWorkloadArray } from "./workload-resources.js";
 import type { MultiNodeContext } from "./multi-node/types.js";
 import { writeSandboxSshKey } from "./multi-node/sandbox-key.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
-import { openSandboxGrant, reconcileSandboxGrant } from "./grant-client.js";
 import { dagHoldsWorkload, handleIdentityKey, lookupDagHandle, releaseHandlesForWorkload, replaceDagHandle, workloadHeldByOtherDag } from "./handles.js";
 import { getHandsKv, registerHandsToken } from "./registry.js";
 import { bootstrapHandsInSandbox, HANDS_LOG_PATH, HANDS_STATE_DIR } from "./bootstrap.js";
@@ -74,12 +73,6 @@ const sc = StringCodec();
 /** Idle TTL create falls back to when the spec names none. */
 const DEFAULT_SANDBOX_TTL_SEC = 10;
 const SANDBOX_IMAGE_RE = /(?:^|\s)sandboximage:\s*(\S+)/im;
-
-/** sandboxGrantEnabled gates delegation to the Agent Sandbox grant service. */
-function sandboxGrantEnabled(): boolean {
-  const raw = (process.env.AGENT_SANDBOX_GRANT_ENABLED ?? "").trim().toLowerCase();
-  return raw === "true" || raw === "1" || raw === "yes";
-}
 
 export function resolveSandboxImageFromRequest(request: ExecuteRequest): string {
   const direct = String(request.sandbox_image ?? "").trim();
@@ -503,8 +496,6 @@ export interface ReuseAttempt {
    * skip the gate rather than be made to invent one.
    */
   action?: SandboxAction;
-  /** Platform key used when a takeover has to reissue the grant. */
-  platformKey?: string;
 }
 
 function reuseIdentity(info: any): SandboxEntry {
@@ -2024,19 +2015,6 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
 
   const health = await checkHandsHealth(info.handsUrl as string, REUSE_HEALTH_TIMEOUT_MS, signal);
   if (health.ok && hasToken) {
-    if (sandboxGrantEnabled()) {
-      const grantKey = isKubernetesMode() ? resolveRequestLlmKey(request) : (a.platformKey || "");
-      const image = typeof info.sandboxImage === "string" ? info.sandboxImage : "";
-      const decision = await reconcileSandboxGrant(sessionId, request, image, grantKey, false);
-      if (decision.restart) {
-        logger.info({ sessionId }, "ensureHands.grant_reissued");
-        await reuseEffects.destroyHands(sessionId, identity, info.token);
-        return null;
-      }
-      if (decision.reason === "copy_unavailable") {
-        logger.warn({ sessionId }, "ensureHands.grant_copy_unavailable");
-      }
-    }
     logger.info(
       { sessionId, handsUrl: info.handsUrl, specMatch: verdict.reason },
       "ensureHands.reusing_existing",
@@ -2581,7 +2559,6 @@ async function provisionHands(
   if (!options.skipSessionReuse) {
     const reused = await tryReuseSessionSandbox({
       kv, sessionId, request, multiNodeContext, requestedSpec, onEvent,
-      platformKey,
       attemptId: options.attemptId ?? null,
       // The resolved action, so the reuse decision can start from the record
       // that is actually keyed by "which sandbox is this DAG's <handle>"
@@ -2688,24 +2665,15 @@ async function provisionHands(
     sessionEnv: request.session_env ?? {},
   });
 
-  // Every sandbox Claw starts gets a grant. Sandboxes that one then creates
-  // through E2B are not granted here.
-  if (sandboxGrantEnabled()) {
-    const grant = await openSandboxGrant(sessionId, request, workloadImage, apiKey);
-    Object.assign(env, grant.values);
-    logger.info({ sessionId, appRunId: grant.appRunId }, "ensureHands.agent.grant_opened");
-  }
-
-  // Single-node sandboxes are created through Agent Sandbox. A multi-node
-  // request still creates its Hands pod as a SaFE Workload; the GPU cluster
-  // is provisioned separately and is not handled here.
-  if (isKubernetesMode() || !multiNodeContext) {
+  // ── kubernetes/BYOK mode: agent-sandbox provider path (design §16.5). ──
+  // safe mode falls through to the SaFE Workload path below (unchanged).
+  if (isKubernetesMode()) {
     if (action.kind !== "create") {
       throw new Error("agent-sandbox requires a create action");
     }
     return await ensureHandsAgentSandbox(
       sessionId, request, action, workloadImage, env, handsToken, mcpPort, onEvent,
-      options.attemptId ?? null, requestedSpec, apiKey,
+      options.attemptId ?? null, requestedSpec,
     );
   }
 
@@ -3552,16 +3520,12 @@ async function ensureHandsAgentSandbox(
    * kubernetes path to miss and rebuild.
    */
   requestedSpec: string,
-  platformKey: string,
 ): Promise<EnsureHandsResult> {
   const kv = getHandsKv();
   const provider = getAgentSandboxProvider();
   const ns = sandboxNamespaceFor(request);
-  // kubernetes/BYOK forwards a fingerprint. A safe-mode single-node sandbox
-  // uses the request's user id, the same fallback the task runner records.
-  const userId = isKubernetesMode()
-    ? await deriveByokUserId(resolveRequestLlmKey(request))
-    : (request.user_id?.trim() || "default");
+  // BYOK identity forwarded to the Router as `userId` header for ownership/audit (#5).
+  const userId = await deriveByokUserId(resolveRequestLlmKey(request));
 
   // BYOK env: no SaFE credentials reach this path; inject platform LLM base url
   // (DK2-A). Only the URL needs deleting -- the base env carries no SaFE key, and

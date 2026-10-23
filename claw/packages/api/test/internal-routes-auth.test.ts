@@ -34,14 +34,12 @@ import { registerInternalTaskRoutes } from "../src/routes/internal-tasks.js";
 import { registerAdminRoutes } from "../src/routes/admin.js";
 import { registerInternalWorkspaceRoutes } from "../src/routes/internal-workspaces.js";
 import { registerInternalRunRoutes } from "../src/routes/internal-runs.js";
-import { registerAppRunGrantRoutes } from "../src/routes/app-run-grants.js";
 
 const REGISTRARS: Array<(app: FastifyInstance) => Promise<void>> = [
   registerInternalTaskRoutes,
   registerAdminRoutes,
   registerInternalWorkspaceRoutes,
   registerInternalRunRoutes,
-  registerAppRunGrantRoutes,
 ];
 
 interface DiscoveredRoute {

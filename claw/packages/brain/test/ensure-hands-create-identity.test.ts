@@ -12,8 +12,6 @@
  * key, which every sibling on the session shares, so a node's probe answers
  * about whichever sibling wrote last and its rebuild stops that sibling's
  * live workload. That is the failure the identity-scoping work exists to end.
- *
- * Single-node create uses Agent Sandbox. Multi-node still creates a SaFE Workload.
  */
 import test, { afterEach, before } from "node:test";
 import assert from "node:assert/strict";
@@ -140,8 +138,7 @@ test("the create path returns the identity it registered", async () => {
     "the caller has to be handed the same identity that was registered; without "
     + "it every later probe and teardown falls back to the session-wide key that "
     + "DAG siblings share");
-  assert.equal(res.identity?.provider, "agent-sandbox");
-  assert.equal(res.identity?.sessionId, "wl-created");
+  assert.equal(res.identity?.workloadId, "wl-created");
 });
 
 test("the caller's abort signal reaches the reuse path", async () => {
