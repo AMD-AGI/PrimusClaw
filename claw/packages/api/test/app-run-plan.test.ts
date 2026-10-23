@@ -13,7 +13,7 @@ import { planAppRun } from "../src/tasks/app-run.js";
 
 const manifest = (container: AppManifestV1["container"]): AppManifestV1 => ({
   schema: APP_MANIFEST_SCHEMA, name: "generic-app", version: "1.0.0",
-  container, state_dir: "/state", command: ["run"],
+  container, state_dir: "/state/${run_id}", command: ["run"],
 });
 const plan = (m: AppManifestV1, raw: unknown) => {
   const r = resolveAppResources(m, raw);
