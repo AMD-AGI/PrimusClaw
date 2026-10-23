@@ -763,9 +763,8 @@ export class AppRunner {
     try { status = await this.deps.sandbox.status(inst); } catch { /* cannot tell: look at the process */ }
     const sandboxGone = status !== null && (status.state === "terminal" || status.state === "absent");
 
-    let verdict: ProbeVerdict | "unknown" = "none";
     if (!sandboxGone) {
-      verdict = await this.probe(inst, stateDir);
+      const verdict = await this.probe(inst, stateDir);
       if (!signalled) {
         if (verdict === "unknown") throw new Error("could not tell whether the application is running");
         if (verdict === "alive") {
