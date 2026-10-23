@@ -1793,7 +1793,18 @@ export async function initDb(): Promise<void> {
     // `grant_keys_enc` are sealed (see crypto/app-run-secrets.ts); nothing in
     // this table is a credential in the clear. `archive` is reserved for the
     // result archive and is not written yet.
-    await client.query(`
+    // With APP_RUNS_ENABLED off, a table that cannot be created or indexed (an old
+    // database missing a column an index names) must not stop the API: it is
+    // logged and skipped, and the schema guard decides what is fatal.
+    const appRunsDdl = async (statement: string): Promise<void> => {
+      try {
+        await client.query(statement);
+      } catch (err) {
+        if (APP_RUNS_ENABLED) throw err;
+        logger.warn({ err: err instanceof Error ? err.message : String(err) }, "db.app_runs_ddl_skipped (APP_RUNS_ENABLED is off)");
+      }
+    };
+    await appRunsDdl(`
       CREATE TABLE IF NOT EXISTS claw_app_runs (
         task_id              TEXT PRIMARY KEY REFERENCES claw_tasks(task_id),
         session_id           TEXT NOT NULL,
@@ -1821,15 +1832,18 @@ export async function initDb(): Promise<void> {
     `);
     // Who created the run and a hash of the request, so an Idempotency-Key replay
     // can refuse another user and a different request body.
-    await client.query("ALTER TABLE claw_app_runs ADD COLUMN IF NOT EXISTS created_by TEXT").catch(() => {});
-    await client.query("ALTER TABLE claw_app_runs ADD COLUMN IF NOT EXISTS request_hash TEXT").catch(() => {});
-    await client.query(
-      "CREATE INDEX IF NOT EXISTS idx_app_runs_session ON claw_app_runs(session_id)",
-    );
+    // (Errors are logged, not swallowed: a lock timeout here shows up later only as
+    // a missing column in the schema guard, with no cause.)
+    for (const col of ["created_by", "request_hash"]) {
+      await client.query(`ALTER TABLE claw_app_runs ADD COLUMN IF NOT EXISTS ${col} TEXT`).catch((err: unknown) => {
+        logger.warn({ column: col, err: err instanceof Error ? err.message : String(err) }, "db.app_runs_alter_failed");
+      });
+    }
+    await appRunsDdl("CREATE INDEX IF NOT EXISTS idx_app_runs_session ON claw_app_runs(session_id)");
     // The durable half of Idempotency-Key for app runs: the response cache
     // expires and can lose a write, this does not. Per session, matching the
     // scope the key has on the route.
-    await client.query(
+    await appRunsDdl(
       `CREATE UNIQUE INDEX IF NOT EXISTS uq_app_runs_idempotency
          ON claw_app_runs(session_id, idempotency_key) WHERE idempotency_key IS NOT NULL`,
     );

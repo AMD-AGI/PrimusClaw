@@ -76,6 +76,22 @@ describe("app run GPU admission", { skip }, () => {
     assert.deepEqual(spec.sandbox_spec.resources, { "amd.com/gpu": "8" });
   });
 
+  test("rows ahead are counted by the same rule: an app's GPUs from its spec, its input never", async () => {
+    const { loadUsageAhead, loadUsage } = await import("../src/tasks/admission.js");
+    const ahead = async (sid: string) => {
+      const t = (await q("SELECT task_id FROM claw_tasks WHERE session_id = $1", [sid])).rows[0] as any;
+      return (await loadUsageAhead(t.task_id)).gpuNodes;
+    };
+    // A holds a GPU node; B and C ask for none but carry a huge `topology.nodes` in their own input.
+    assert.equal((await create("s1", res(8))).statusCode, 200);
+    const hostile = { topology: { nodes: 1000000 } };
+    assert.equal((await create("s2", res(0), hostile)).statusCode, 200);
+    assert.equal((await create("s3", res(0), hostile)).statusCode, 200);
+    assert.equal(await ahead("s2"), 1, "A's GPU is counted although its input has no topology");
+    assert.equal(await ahead("s3"), 1, "B's input topology counts for nothing");
+    assert.equal((await loadUsage()).gpuNodes, 1, "and the totals agree");
+  });
+
   test("a run asking for GPUs holds a GPU node; the next one over the ceiling is refused", async () => {
     assert.equal((await create("s1", res(8))).statusCode, 200);
     const second = await create("s2", res(8));
