@@ -26,13 +26,15 @@
  */
 import pino from "pino";
 import type { SandboxSpecCreate } from "@claw/protocol";
-import { SAFE_API_URL, SANDBOX_NAMESPACE, isKubernetesMode } from "../config.js";
+import { SAFE_API_URL, SANDBOX_DEFAULT_TIMEOUT_SECONDS, SANDBOX_NAMESPACE, isKubernetesMode } from "../config.js";
 import {
   DEFAULT_SANDBOX_TTL_SEC, composeSandboxLabels, createSafeWorkloadSandbox, SESSION_ID_LABEL, COMPONENT_LABEL,
 } from "../sandbox/create-sandbox.js";
 import { fetchPlatformFacts } from "../sandbox/platform-facts-read.js";
 import { parseWorkloadListPage } from "../sandbox/multi-node/workload-parse.js";
-import { safeHandsBaseUrl } from "../sandbox/sandbox-router.js";
+import { getSafeWorkloadProvider } from "../sandbox/factory.js";
+import { SESSION_ENV } from "../sandbox/multi-node/safe-body.js";
+import { ACTIVE_PHASES, TERMINAL_PHASES } from "../sandbox/workload-wait.js";
 import { pollWorkloadUntilRunning } from "../sandbox/safe-workload-provider.js";
 import type { SandboxInstance } from "../sandbox/provider.js";
 
@@ -42,8 +44,6 @@ export const APP_COMPONENT = "app";
 export const APP_RUN_ID_LABEL = "primus-claw/app-run-id";
 /** Env twin of the label: the one SaFE's workload list can match on. */
 export const APP_RUN_ID_ENV = "CLAW_APP_RUN_ID";
-const SESSION_ENV = "CLAW_SESSION_ID";
-const ACTIVE_PHASES = "Pending,Running,Updating,NotReady";
 const LIST_PAGE_SIZE = 50;
 const LIST_MAX_PAGES = 4;
 const LIST_TIMEOUT_MS = 30_000;
@@ -71,6 +71,8 @@ export interface AppSandboxDeps {
   waitRunning?: (workloadId: string, apiKey: string) => Promise<void>;
   /** Create through the shared path; defaults to the real provider. */
   create?: typeof createSafeWorkloadSandbox;
+  /** Stop a workload this call created or found surplus; defaults to the SaFE provider. */
+  stop?: (workloadId: string) => Promise<void>;
 }
 
 export interface AppSandbox {
@@ -108,6 +110,7 @@ export async function findLiveAppSandboxes(
   fetchImpl: typeof globalThis.fetch = globalThis.fetch,
 ): Promise<Array<{ id: string; phase: string }>> {
   const found: Array<{ id: string; phase: string }> = [];
+  let seen = 0;
   for (let page = 0; page < LIST_MAX_PAGES; page++) {
     const query = new URLSearchParams({
       envKey: APP_RUN_ID_ENV,
@@ -127,8 +130,16 @@ export async function findLiveAppSandboxes(
     }
     const parsed = parseWorkloadListPage(await resp.json().catch(() => null));
     if (!parsed) throw new Error("app sandbox lookup failed: unrecognised workload list");
-    for (const w of parsed.items) if (w.kind === "Sandbox" || w.kind === "") found.push({ id: w.id, phase: w.phase });
-    if (parsed.items.length === 0 || found.length >= parsed.totalCount) return found;
+    seen += parsed.items.length;
+    // The server was asked for active phases only, but that filter is not
+    // guaranteed to apply (a SaFE version without it, or a phase it does not know):
+    // a terminal workload is skipped here as well, or the run would adopt a dead
+    // one for ever.
+    for (const w of parsed.items) {
+      if ((w.kind === "Sandbox" || w.kind === "") && w.id && !TERMINAL_PHASES.has(w.phase)) found.push({ id: w.id, phase: w.phase });
+    }
+    // Items seen, not workloads kept, against the unfiltered total: the same unit.
+    if (parsed.items.length === 0 || seen >= parsed.totalCount) return found;
   }
   throw new Error("app sandbox lookup failed: more workloads than one run can own");
 }
@@ -151,7 +162,8 @@ export function appSandboxInstance(
     id: workloadId,
     sandboxName: workloadId,
     namespace: ns,
-    handsBaseUrl: safeHandsBaseUrl(ns, workloadId, "9100"),
+    // An app sandbox has no Hands in it, so there is no Hands URL to give.
+    handsBaseUrl: "",
     platformKey: run.platformKey,
   };
 }
@@ -168,43 +180,69 @@ export async function ensureAppSandbox(run: AppSandboxRun, deps: AppSandboxDeps)
   if (!run.sandboxSpec?.image?.trim()) throw new Error("ensureAppSandbox: sandbox_spec has no image");
   const ns = appSandboxNamespace(run);
   const wait = deps.waitRunning ?? ((id, key) => pollWorkloadUntilRunning(id, key));
+  // An app sandbox has no Hands in it, so there is no Hands URL to give.
   const instanceFor = (id: string): SandboxInstance => appSandboxInstance(run, id);
+  const stop = deps.stop ?? ((id: string) => getSafeWorkloadProvider().stop(instanceFor(id)));
+  /** Stop a workload nothing else will; a failed stop is logged with the id, never hidden. */
+  const reclaim = async (workloadId: string, why: string): Promise<void> => {
+    try {
+      await stop(workloadId);
+      logger.warn({ runId: run.runId, workloadId, why }, "app_sandbox.reclaimed");
+    } catch (err) {
+      logger.error({ runId: run.runId, workloadId, why, err: err instanceof Error ? err.message : String(err) }, "app_sandbox.reclaim_failed");
+    }
+  };
 
   const live = await findLiveAppSandboxes(run.runId, run.platformKey, deps.fetch);
   if (live.length > 0) {
     // Newest first. More than one means an earlier create was never seen by the
-    // run (so it was never stopped); adopt the newest and say so.
+    // run (so it was never recorded or stopped): adopt the newest and stop the rest.
     const adopted = live[0]!;
-    if (live.length > 1) {
-      logger.warn({ runId: run.runId, workloadIds: live.map((w) => w.id) }, "app_sandbox.multiple_live");
-    }
-    if (adopted.phase !== "running") await wait(adopted.id, run.platformKey);
+    for (const extra of live.slice(1)) await reclaim(extra.id, "surplus_live_workload");
+    // Recorded before the wait, as on the create path: a wait that gives up must
+    // leave the id behind for whoever cleans up.
     if (run.sandboxWorkloadId !== adopted.id) await deps.recordWorkloadId(run.runId, adopted.id);
-    logger.info({ runId: run.runId, workloadId: adopted.id }, "app_sandbox.adopted");
+    if (adopted.phase !== "running") await wait(adopted.id, run.platformKey);
+    logger.info({ runId: run.runId, workloadId: adopted.id, surplus: live.length - 1 }, "app_sandbox.adopted");
     return { instance: instanceFor(adopted.id), workloadId: adopted.id, created: false };
   }
 
   const spec = run.sandboxSpec;
-  const resources = Object.fromEntries(
-    Object.entries(spec.resources ?? {}).map(([k, v]) => [k, String(v)]),
-  );
+  // The resources are the run's: an empty set would be sent to SaFE as such and
+  // either be refused there with an opaque 400 or scheduled on a default.
+  const resources = spec.resources;
+  if (!resources || Object.keys(resources).length === 0) {
+    throw new Error("ensureAppSandbox: sandbox_spec has no resources");
+  }
   const create = deps.create ?? createSafeWorkloadSandbox;
-  const inst = await create({
-    sessionId: run.sessionId,
-    namespace: ns,
-    image: spec.image,
-    resources,
-    env: { ...(spec.env ?? {}), [SESSION_ENV]: run.sessionId, [APP_RUN_ID_ENV]: run.runId },
-    labels: appSandboxLabels(run),
-    timeoutSec: spec.timeout,
-    ttlSec: spec.ttl_sec ?? DEFAULT_SANDBOX_TTL_SEC,
-    platformKey: run.platformKey,
-    // Recorded before the wait for Running, so a Brain that dies while the
-    // workload queues leaves the id behind rather than an unrecorded workload.
-    onProvisioned: (id) => deps.recordWorkloadId(run.runId, id),
-  });
-  logger.info({ runId: run.runId, workloadId: inst.id }, "app_sandbox.created");
-  return { instance: inst, workloadId: inst.id, created: true };
+  let createdId: string | undefined;
+  try {
+    const inst = await create({
+      sessionId: run.sessionId,
+      namespace: ns,
+      image: spec.image,
+      resources,
+      env: { ...(spec.env ?? {}), [SESSION_ENV]: run.sessionId, [APP_RUN_ID_ENV]: run.runId },
+      labels: appSandboxLabels(run),
+      // A manifest that names no timeout still gets the platform's default, not the
+      // longest session the provider allows.
+      timeoutSec: spec.timeout ?? SANDBOX_DEFAULT_TIMEOUT_SECONDS,
+      ttlSec: spec.ttl_sec ?? DEFAULT_SANDBOX_TTL_SEC,
+      platformKey: run.platformKey,
+      // The id is remembered here first, then recorded, then waited on: a failed
+      // record or a wait that gives up (Pending past the ceiling) still knows what
+      // to stop. There is no hands.* entry or sweeper for this sandbox.
+      onProvisioned: async (id) => {
+        createdId = id;
+        await deps.recordWorkloadId(run.runId, id);
+      },
+    });
+    logger.info({ runId: run.runId, workloadId: inst.id }, "app_sandbox.created");
+    return { instance: inst, workloadId: inst.id, created: true };
+  } catch (err) {
+    if (createdId !== undefined) await reclaim(createdId, "create_failed");
+    throw err;
+  }
 }
 
 /**

@@ -15,6 +15,7 @@ import { StringCodec, type KV } from "nats";
 import { listingEndsOnOtherOps } from "./kv-listing-stub.js";
 import { filterToRegExp } from "./nats-kv-stub.js";
 import { ensureAppSandbox, readSandboxNodeName, type AppSandboxRun } from "../src/apps/app-sandbox.js";
+import { SANDBOX_DEFAULT_TIMEOUT_SECONDS } from "../src/config.js";
 import { bindHandsKv } from "../src/sandbox/registry.js";
 import { bindSandboxProviders } from "../src/sandbox/factory.js";
 import { bindClusterReclaimForTest, sweepStaleHandsForTest } from "../src/sandbox/reaper.js";
@@ -34,6 +35,9 @@ function fakeSafe() {
   const created: SandboxCreateParams[] = [];
   const stopped: string[] = [];
   let listStatus = 200;
+  let extraItems: Array<Record<string, unknown>> = [];
+  let listCalls = 0;
+  let createFailsAfterProvisioned: Error | null = null;
   const provider = {
     kind: "safe-workload",
     async create(p: SandboxCreateParams): Promise<SandboxInstance> {
@@ -41,6 +45,7 @@ function fakeSafe() {
       const id = `wl-${workloads.length + 1}`;
       workloads.push({ id, env: p.env, phase: "Running" });
       await p.onProvisioned?.(id);
+      if (createFailsAfterProvisioned) throw createFailsAfterProvisioned;
       return { provider: "safe-workload", id, sandboxName: id, namespace: p.namespace, handsBaseUrl: "", platformKey: p.platformKey };
     },
     async stop(inst: { id: string }) { stopped.push(inst.id); },
@@ -51,12 +56,23 @@ function fakeSafe() {
     const url = new URL(String(input), "http://safe.test");
     if (listStatus !== 200) return new Response("nope", { status: listStatus });
     const envValue = url.searchParams.get("envValue");
-    const items = workloads
+    listCalls++;
+    // Newest first, like the real list. The phase filter is deliberately NOT
+    // applied: a SaFE where it does not take effect returns every phase.
+    const items = [...workloads].reverse()
       .filter((w) => w.env[url.searchParams.get("envKey") ?? ""] === envValue)
       .map((w) => ({ workloadId: w.id, phase: w.phase, groupVersionKind: { kind: "Sandbox" } }));
-    return new Response(JSON.stringify({ totalCount: items.length, items }), { status: 200 });
+    const all = [...items, ...extraItems];
+    const offset = Number(url.searchParams.get("offset") ?? 0), limit = Number(url.searchParams.get("limit") ?? 50);
+    return new Response(JSON.stringify({ totalCount: all.length, items: all.slice(offset, offset + limit) }), { status: 200 });
   }) as typeof globalThis.fetch;
-  return { workloads, created, stopped, fetch, failList() { listStatus = 503; } };
+  return {
+    workloads, created, stopped, fetch,
+    get listCalls() { return listCalls; },
+    failList() { listStatus = 503; },
+    withExtraItems(x: Array<Record<string, unknown>>) { extraItems = x; },
+    failCreateAfterProvisioned(e: Error) { createFailsAfterProvisioned = e; },
+  };
 }
 
 function run(over: Partial<AppSandboxRun> = {}): AppSandboxRun {
@@ -140,6 +156,123 @@ test("a lost sandbox is replaced; the stale recorded id does not stand in for it
   const b = await ensureAppSandbox(run({ sandboxWorkloadId: a.workloadId }), deps);
   assert.notEqual(b.workloadId, a.workloadId);
   assert.equal(b.created, true);
+});
+
+test("a terminal workload in the list is never adopted, whatever the server filtered", async () => {
+  const safe = fakeSafe();
+  const deps = { fetch: safe.fetch, recordWorkloadId: async () => {} };
+  const a = await ensureAppSandbox(run(), deps);
+  safe.workloads[0]!.phase = "Failed"; // still carries the run's env, and still in the list
+  const b = await ensureAppSandbox(run({ sandboxWorkloadId: a.workloadId }), deps);
+  assert.notEqual(b.workloadId, a.workloadId, "the dead workload is not adopted");
+  assert.equal(b.created, true);
+  for (const phase of ["Stopped", "Succeeded", "Terminated", "Cancelled"]) {
+    safe.workloads[safe.workloads.length - 1]!.phase = phase;
+    const c = await ensureAppSandbox(run({ sandboxWorkloadId: b.workloadId }), deps);
+    assert.equal(c.created, true, `${phase} is terminal too`);
+  }
+});
+
+test("surplus live workloads are stopped; the newest is adopted and recorded", async () => {
+  const safe = fakeSafe();
+  const deps = { fetch: safe.fetch, recordWorkloadId: async () => {} };
+  await ensureAppSandbox(run(), deps); // wl-1
+  safe.workloads.push({ id: "wl-2", env: { ...safe.workloads[0]!.env }, phase: "Running" });
+  safe.workloads.push({ id: "wl-3", env: { ...safe.workloads[0]!.env }, phase: "Running" });
+  const recorded: string[] = [];
+  const out = await ensureAppSandbox(run({ sandboxWorkloadId: "wl-1" }), { ...deps, recordWorkloadId: async (_r, w) => { recorded.push(w); } });
+  assert.equal(out.workloadId, "wl-3");
+  assert.deepEqual(safe.stopped.sort(), ["wl-1", "wl-2"]);
+  assert.deepEqual(recorded, ["wl-3"]);
+});
+
+test("a stop that fails does not fail the run, and is not hidden", async () => {
+  const safe = fakeSafe();
+  const deps = { fetch: safe.fetch, recordWorkloadId: async () => {} };
+  await ensureAppSandbox(run(), deps);
+  safe.workloads.push({ id: "wl-2", env: { ...safe.workloads[0]!.env }, phase: "Running" });
+  const out = await ensureAppSandbox(run(), { ...deps, stop: async () => { throw new Error("SaFE down"); } });
+  assert.equal(out.workloadId, "wl-2");
+});
+
+test("adopting a Pending workload records its id before the wait, so a failed wait still leaves it", async () => {
+  const safe = fakeSafe();
+  await ensureAppSandbox(run(), { fetch: safe.fetch, recordWorkloadId: async () => {} });
+  safe.workloads[0]!.phase = "Pending";
+  const recorded: string[] = [];
+  await assert.rejects(
+    ensureAppSandbox(run({ sandboxWorkloadId: null }), {
+      fetch: safe.fetch,
+      recordWorkloadId: async (_r, w) => { recorded.push(w); },
+      waitRunning: async () => { throw new Error("sandbox_pending_timeout"); },
+    }),
+    /sandbox_pending_timeout/,
+  );
+  assert.deepEqual(recorded, ["wl-1"]);
+});
+
+test("a create that fails after the workload exists stops it", async () => {
+  for (const [name, mk] of [
+    ["the wait gives up", (safe: ReturnType<typeof fakeSafe>) => safe.failCreateAfterProvisioned(new Error("sandbox_pending_timeout"))],
+  ] as const) {
+    const safe = fakeSafe();
+    mk(safe);
+    await assert.rejects(ensureAppSandbox(run(), { fetch: safe.fetch, recordWorkloadId: async () => {} }), /sandbox_pending_timeout/, name);
+    assert.deepEqual(safe.stopped, ["wl-1"], name);
+  }
+  // The record itself fails: the id was known, so it is still stopped.
+  const safe = fakeSafe();
+  await assert.rejects(
+    ensureAppSandbox(run(), { fetch: safe.fetch, recordWorkloadId: async () => { throw new Error("db down"); } }),
+    /db down/,
+  );
+  assert.deepEqual(safe.stopped, ["wl-1"]);
+  // A create that fails before any workload exists has nothing to stop.
+  const none = fakeSafe();
+  await assert.rejects(ensureAppSandbox(run(), { fetch: none.fetch, recordWorkloadId: async () => {}, create: async () => { throw new Error("400"); } }), /400/);
+  assert.deepEqual(none.stopped, []);
+});
+
+test("no resources is an error in Brain, not an empty POST", async () => {
+  for (const resources of [undefined, {}]) {
+    const safe = fakeSafe();
+    const r = run();
+    await assert.rejects(
+      ensureAppSandbox({ ...r, sandboxSpec: { ...r.sandboxSpec, resources } as never }, { fetch: safe.fetch, recordWorkloadId: async () => {} }),
+      /no resources/,
+    );
+    assert.equal(safe.created.length, 0);
+  }
+});
+
+test("a spec with no timeout gets the platform default, not the provider's maximum", async () => {
+  const safe = fakeSafe();
+  const r = run();
+  const { timeout: _t, ...spec } = r.sandboxSpec as Record<string, unknown>;
+  await ensureAppSandbox({ ...r, sandboxSpec: spec as never }, { fetch: safe.fetch, recordWorkloadId: async () => {} });
+  assert.equal(safe.created[0]!.timeoutSec, SANDBOX_DEFAULT_TIMEOUT_SECONDS);
+  assert.ok(Number(safe.created[0]!.timeoutSec) > 0);
+});
+
+test("the pagination stop compares items seen with the total: other kinds and id-less rows do not cause extra pages or a false overflow", async () => {
+  const safe = fakeSafe();
+  await ensureAppSandbox(run(), { fetch: safe.fetch, recordWorkloadId: async () => {} });
+  // 200 rows the lookup must ignore (wrong kind), more than LIST_MAX_PAGES * page size would allow if it counted kept rows.
+  safe.withExtraItems(Array.from({ length: 150 }, (_, i) => ({ workloadId: `job-${i}`, phase: "Running", groupVersionKind: { kind: "PyTorchJob" } })));
+  const before = safe.listCalls;
+  const out = await ensureAppSandbox(run({ sandboxWorkloadId: "wl-1" }), { fetch: safe.fetch, recordWorkloadId: async () => {} });
+  assert.equal(out.workloadId, "wl-1");
+  assert.equal(out.created, false);
+  assert.equal(safe.listCalls - before, 4, "151 rows at 50 a page: the pages that exist, no more");
+});
+
+test("an adopted instance names no Hands URL: there is no Hands in an app sandbox", async () => {
+  const safe = fakeSafe();
+  const deps = { fetch: safe.fetch, recordWorkloadId: async () => {} };
+  await ensureAppSandbox(run(), deps);
+  const out = await ensureAppSandbox(run(), deps);
+  assert.equal(out.created, false);
+  assert.equal(out.instance.handsBaseUrl, "");
 });
 
 // --- the hands keyspace and the reaper ------------------------------------
