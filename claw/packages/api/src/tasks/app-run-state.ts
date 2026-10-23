@@ -226,13 +226,24 @@ export async function patchAppRun(
   if (sets.length === 0) return { ok: false, reason: "empty" };
   sets.push("updated_at = NOW()");
 
+  // The task row is locked FIRST (`FOR UPDATE` in the CTE) and its lease is checked
+  // after the lock is held: a takeover that commits a new claim while this write
+  // waits is seen, because Postgres re-evaluates the locked row's condition once the
+  // lock is granted. Checking the lease through a plain join would test a snapshot
+  // from before the wait, and a stale holder could still write.
   const updated = await db.query(
-    `UPDATE claw_app_runs r SET ${sets.join(", ")}
-       FROM claw_tasks t
-      WHERE r.task_id = $1 AND t.task_id = r.task_id
-        AND t.lease_owner = $2
-        AND t.lease_expires_at > NOW()
-        AND t.claim_count = $4::int
+    `WITH t AS (
+       SELECT task_id, input, sandbox_spec, workspace_id
+         FROM claw_tasks
+        WHERE task_id = $1
+          AND lease_owner = $2
+          AND lease_expires_at > NOW()
+          AND claim_count = $4::int
+          FOR UPDATE
+     )
+     UPDATE claw_app_runs r SET ${sets.join(", ")}
+       FROM t
+      WHERE r.task_id = t.task_id
         AND r.state <> 'ended'
         AND ($3::text IS NULL OR r.state = $3)
         AND ($5::int IS NULL OR $5::int >= r.restarts)
