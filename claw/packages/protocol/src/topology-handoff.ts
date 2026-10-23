@@ -9,9 +9,11 @@
  * `TOPOLOGY_HANDOFF_FILE` in the sandbox env. Claw owns this contract; a reader
  * needs nothing but this shape.
  *
- * Credentials are never carried inline. A token or a private key is its own
- * file and the document holds only the path to it, so the document can be read,
- * logged or attached to a report without exposing a secret.
+ * Credentials are never carried inline. A private key is its own file and the
+ * document holds only the path to it, so the document can be read, logged or
+ * attached to a report without exposing a secret. The files live in a
+ * sandbox-local directory outside the synced workspace, so a workspace snapshot
+ * never carries them and a restore never overwrites them.
  *
  * Only the block of the active backend is present: `ray` for `rayjob`, `infera`
  * for `infera`. Optional fields are omitted when Claw has no value for them
@@ -20,15 +22,10 @@
 
 export const TOPOLOGY_HANDOFF_SCHEMA = "topology-handoff/v1" as const;
 
-/** Workspace-relative location of the handoff file. */
-export const TOPOLOGY_HANDOFF_RELATIVE_PATH = ".claw/topology.json";
-
 export type TopologyHandoffBackend = "rayjob" | "infera";
 
 export interface TopologyHandoffRay {
   head_ip?: string;
-  /** File holding the Ray Dashboard token (mode 0600). Never the token itself. */
-  dashboard_token_file?: string;
 }
 
 export interface TopologyHandoffInfera {
@@ -61,6 +58,17 @@ export const TOPOLOGY_HANDOFF_JSON_SCHEMA = {
   type: "object",
   additionalProperties: false,
   required: ["schema", "backend", "nodes", "gpus_per_node", "service_url"],
+  // The block of the active backend, and only that block.
+  allOf: [
+    {
+      if: { properties: { backend: { const: "rayjob" } } },
+      then: { required: ["ray"], not: { required: ["infera"] } },
+    },
+    {
+      if: { properties: { backend: { const: "infera" } } },
+      then: { required: ["infera"], not: { required: ["ray"] } },
+    },
+  ],
   properties: {
     schema: { const: TOPOLOGY_HANDOFF_SCHEMA },
     backend: { enum: ["rayjob", "infera"] },
@@ -72,7 +80,6 @@ export const TOPOLOGY_HANDOFF_JSON_SCHEMA = {
       additionalProperties: false,
       properties: {
         head_ip: { type: "string", minLength: 1 },
-        dashboard_token_file: { type: "string", minLength: 1 },
       },
     },
     infera: {
@@ -158,5 +165,12 @@ export function validateTopologyHandoff(value: unknown): string[] {
         break;
     }
   });
+  // Backend/block consistency (the schema's allOf). Only checked once the
+  // backend itself is valid, so one mistake is not reported twice.
+  if (isObj(value) && (value.backend === "rayjob" || value.backend === "infera")) {
+    const [want, other] = value.backend === "rayjob" ? (["ray", "infera"] as const) : (["infera", "ray"] as const);
+    if (!(want in value)) problems.push(`${want}: required when backend is ${value.backend}`);
+    if (other in value) problems.push(`${other}: not allowed when backend is ${value.backend}`);
+  }
   return problems;
 }
