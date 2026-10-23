@@ -518,7 +518,7 @@ test("E2 only declared facilities are injected: no mcp block, no mcp variables; 
 test("E3 the grant hook adds keys and limits through env_map; its keys beat the stored ones", async () => {
   const seen: unknown[] = [];
   const grant: AppGrantRunHooks = {
-    env: async (run) => { seen.push(run); return { keys: { subrun: KEY_S, measurement: "e2b_overridden-by-the-hook-0123456" }, limits: { max_hours: 4 } }; },
+    env: async (run) => { seen.push(run); return { keys: { subrun: KEY_S, measurement: "e2b_overridden-by-the-hook-0123456" }, limits: { max_sandboxes: 4, max_gpus: 8 } }; },
     revoke: async () => undefined,
   };
   const h = harness({ grant });
@@ -526,7 +526,7 @@ test("E3 the grant hook adds keys and limits through env_map; its keys beat the 
   const env = h.world.starts[0]!.env;
   assert.equal(env.APP_KEY_SUBRUN, KEY_S);
   assert.equal(env.APP_KEY_MEASUREMENT, "e2b_overridden-by-the-hook-0123456");
-  assert.equal(env.APP_GRANT_LIMITS, JSON.stringify({ max_hours: 4 }));
+  assert.equal(env.APP_GRANT_LIMITS, JSON.stringify({ max_sandboxes: 4, max_gpus: 8 }));
   assert.deepEqual(seen, [{ runId: RUN_ID, sessionId: "sess-1", grantId: null, manifest: MANIFEST }]);
 });
 
