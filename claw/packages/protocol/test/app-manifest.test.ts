@@ -18,17 +18,13 @@ const EXAMPLE = {
   name: "example-app",
   version: "1.0.0",
   container: {
-    image_from_input: "/framework/image",
-    gpus_from_input: "/placement/container_gpus",
-    workspace_from_input: ["/placement/app_workspace", "/placement/gpu_workspace"],
-    resources_from_input: { cpu: "/placement/container_cpu", memory_gi: "/placement/container_memory_gi" },
+    image: "registry.example.invalid/app:default",
     resources: { cpu: "32", memory: "128Gi", "ephemeral-storage": "500Gi" },
   },
   state_dir: "${USER_DATA_PATH}/.claw-apps/${run_id}",
   command: ["sh", "-c", 'exec "$APP_STATE_DIR/bootstrap.sh" run'],
   bootstrap: { file: "bootstrap.sh", content_b64: B64 },
   env: { APP_SOURCE_REPO: "https://example.invalid/app.git", APP_SOURCE_SHA: "pinned-by-the-plugin" },
-  env_from_input: { APP_SOURCE_REPO: "/source/repo", APP_SOURCE_SHA: "/source/sha" },
   env_map: {
     run_id: "APP_RUN_ID",
     run_created_at: "APP_RUN_CREATED_AT",
@@ -53,12 +49,12 @@ const EXAMPLE = {
       name: "runner",
       per_gpu_count: [1, 2, 4, 8],
       provider: "safe-pytorchjob",
-      image_from_input: "/framework/image",
-      workspace_from_input: "/placement/gpu_workspace",
+      image: "registry.example.invalid/runner:1",
+      workspace: "gpu-ws",
       resources: { cpu: "32", memory: "256Gi", "ephemeral-storage": "500Gi" },
       mounts: { shared: "rw" },
       egress: ["git", "pypi-mirror"],
-      start: { script_b64: B64, env_from_input: { APP_SOURCE_REPO: "/source/repo" } },
+      start: { script_b64: B64 },
       data_plane: { mode: "sealed", inputs: ["/in"], outputs: ["/out"] },
       signing_identity: { key_file_env: "APP_SIGNING_KEY_FILE" },
       pending_timeout_sec: 3600,
@@ -66,29 +62,20 @@ const EXAMPLE = {
       preheat: true,
     },
     {
-      name: "specialist_gpu", provider: "safe-pytorchjob", gpus: 1, image_from_input: "/framework/image",
-      workspace_from_input: "/placement/subrun_gpu_workspace", mounts: { shared: "ro" },
+      name: "specialist_gpu", provider: "safe-pytorchjob", gpus: 1,
+      mounts: { shared: "ro" },
       egress: ["model-gateway", "pypi-mirror"], data_plane: { mode: "open" }, max_timeout_sec: 86400,
     },
     { name: "builder", provider: "safe-pytorchjob", gpus: 0, data_plane: { mode: "open" } },
     { name: "dev", provider: "safe-pytorchjob", gpus: 1, data_plane: { mode: "open" } },
   ],
   sandbox_roles: { measurement: ["runner"], subrun: ["specialist_gpu", "builder"], dev: ["dev"] },
-  grant_from_input: {
-    "measurement.max_sandboxes": "/placement/max_parallel_tests",
-    "measurement.gpus_per_sandbox": "/hardware/tp",
-    gpu_hours_budget: "/budget/max_gpu_hours",
-    max_hours: "/budget/max_hours",
-    "subrun.max_sandboxes": "/multibranch/max_branches",
-  },
-  grant_extra: { "subrun.max_sandboxes": 1 },
   restart: { max_restarts: 5, backoff_sec: [30, 120, 600] },
   stop_grace_sec: 900,
   limits: {
     max_sandboxes: { measurement: 8, subrun: 16, dev: 4 },
     max_runtime_sec: 172800,
     input_max_bytes: 262144,
-    gpu_hours_headroom: 1.3,
   },
 } satisfies AppManifestV1;
 
@@ -97,10 +84,6 @@ const FULL = {
   ...EXAMPLE,
   env_map: { ...EXAMPLE.env_map, mcp_public_url: "APP_MCP_PUBLIC_URL" },
   mcp: { ...EXAMPLE.mcp, public: true },
-  grant_extra: {
-    "measurement.max_sandboxes": 0, "measurement.gpus_per_sandbox": 0,
-    gpu_hours_budget: 0, max_hours: 0.5, "subrun.max_sandboxes": 1,
-  },
 } satisfies AppManifestV1;
 
 const clone = <T>(v: T): T => structuredClone(v);
@@ -159,17 +142,13 @@ function checkKeys(schema: Node, docs: unknown[], at: string, seen: { objects: n
 
 test("JSON schema keys equal the type's keys at every object", () => {
   const seen = { objects: 0 };
-  // The container takes exactly one of image / image_from_input, so the document that sets every key comes in two.
-  const withImage = { ...FULL, container: { ...FULL.container, image_from_input: undefined, image: "registry.example.invalid/app:1" } };
-  delete (withImage.container as Record<string, unknown>).image_from_input;
-  checkKeys(S as Node, [FULL, withImage], "", seen);
-  assert.equal(seen.objects, 15, "the walk must reach every fixed-key object in the schema");
+  checkKeys(S as Node, [FULL], "", seen);
+  assert.equal(seen.objects, 12, "the walk must reach every fixed-key object in the schema");
 });
 
 test("the schema's closed sets equal the exported constants", () => {
   const p = S.properties;
   assert.deepEqual(Object.keys(p.sandbox_roles.properties), ["measurement", "subrun", "dev"]);
-  assert.deepEqual(Object.keys(p.grant_from_input.properties), Object.keys(p.grant_extra.properties));
   assert.deepEqual(Object.keys(p.limits.properties.max_sandboxes.properties), Object.keys(p.env_map.properties.sandbox_keys.properties));
 });
 
@@ -186,15 +165,30 @@ test("a document with every field set validates", () => {
 test("the smallest manifest validates", () => {
   const min = {
     schema: APP_MANIFEST_SCHEMA, name: "a", version: "0.1.0",
-    container: { image_from_input: "/image" }, state_dir: "/state", command: ["run"],
+    container: {}, state_dir: "/state", command: ["run"],
   };
   assert.deepEqual(validateAppManifest(min), []);
 });
 
-test("grant constants and pointers can name the same limit; the headroom default is documented", () => {
-  assert.equal(S.properties.limits.properties.gpu_hours_headroom.default, 1.3);
+test("the documented defaults are in the schema", () => {
   assert.equal(S.properties.stop_grace_sec.default, 900);
-  assert.deepEqual(paths(mutate((m) => { m.grant_extra = { "subrun.max_sandboxes": 1, max_hours: 0.5 }; })), []);
+});
+
+test("the container image is only a default and may be absent", () => {
+  assert.deepEqual(paths(mutate((m) => { delete m.container.image; })), []);
+  refused(mutate((m) => { m.container.image = ""; }), "container.image", "must not be empty");
+  refused(mutate((m) => { m.container.image = 3; }), "container.image", "must be a string");
+});
+
+test("the fields that read the run input are gone: each is an unknown field", () => {
+  refused(mutate((m) => { m.container.image_from_input = "/a"; }), "container.image_from_input", "unknown field");
+  refused(mutate((m) => { m.container.gpus_from_input = "/a"; }), "container.gpus_from_input", "unknown field");
+  refused(mutate((m) => { m.container.workspace_from_input = "/a"; }), "container.workspace_from_input", "unknown field");
+  refused(mutate((m) => { m.container.resources_from_input = {}; }), "container.resources_from_input", "unknown field");
+  refused(mutate((m) => { m.env_from_input = {}; }), "env_from_input", "unknown field");
+  refused(mutate((m) => { m.grant_from_input = {}; }), "grant_from_input", "unknown field");
+  refused(mutate((m) => { m.grant_extra = {}; }), "grant_extra", "unknown field");
+  refused(mutate((m) => { m.limits.gpu_hours_headroom = 1.3; }), "limits.gpu_hours_headroom", "unknown field");
 });
 
 // ---- the refusals, one each --------------------------------------------------
@@ -204,28 +198,6 @@ test("not an object, wrong schema string, unknown field, missing required", () =
   refused(mutate((m) => { m.schema = "claw.app-manifest/v2"; }), "schema", "must be");
   refused(mutate((m) => { m.extra = 1; }), "extra", "unknown field");
   for (const k of S.required) refused(mutate((m) => { delete m[k]; }), k, "required");
-});
-
-test("a pointer that is not an RFC 6901 pointer is refused wherever one is read", () => {
-  const where: Array<[string, (m: any) => void]> = [
-    ["container.image_from_input", (m) => { m.container.image_from_input = "framework/image"; }],
-    ["container.gpus_from_input", (m) => { m.container.gpus_from_input = ""; }],
-    ["container.workspace_from_input[1]", (m) => { m.container.workspace_from_input[1] = "gpu_workspace"; }],
-    ["container.resources_from_input.cpu", (m) => { m.container.resources_from_input.cpu = "/a~2b"; }],
-    ["env_from_input.APP_SOURCE_SHA", (m) => { m.env_from_input.APP_SOURCE_SHA = "/source/~"; }],
-    ["grant_from_input.max_hours", (m) => { m.grant_from_input.max_hours = "budget.max_hours"; }],
-    ["grant_from_input.subrun.max_sandboxes", (m) => { m.grant_from_input["subrun.max_sandboxes"] = "multibranch"; }],
-  ];
-  for (const [path, f] of where) {
-    // The dotted key `subrun.max_sandboxes` is one key; its path prints with the dot.
-    refused(mutate(f), path, "JSON Pointer");
-  }
-});
-
-test("valid pointers are accepted, including escapes and the empty key", () => {
-  for (const ok of ["/a", "/a/b", "/a~0b", "/a~1b", "/", "//", "/a/0"]) {
-    assert.deepEqual(paths(mutate((m) => { m.container.image_from_input = ok; })), [], ok);
-  }
 });
 
 test("an unknown role in sandbox_roles is refused", () => {
@@ -261,34 +233,11 @@ test("per_gpu_count, which Claw reads, must be a list of positive integers", () 
   refused(mutate((m) => { m.sandbox_templates[0].per_gpu_count = [1, 1]; }), "sandbox_templates[0].per_gpu_count[1]", "duplicates");
 });
 
-test("the container image is exactly one of image and image_from_input", () => {
-  assert.deepEqual(paths(mutate((m) => { delete m.container.image_from_input; m.container.image = "registry.example.invalid/app:1"; })), []);
-  assert.deepEqual(paths(mutate(() => {})), []);
-  refused(mutate((m) => { m.container.image = "registry.example.invalid/app:1"; }), "container.image", "cannot be combined with container.image_from_input");
-  refused(mutate((m) => { delete m.container.image_from_input; }), "container", "needs exactly one of image or image_from_input");
-  refused(mutate((m) => { delete m.container.image_from_input; m.container.image = ""; }), "container.image", "must not be empty");
-  refused(mutate((m) => { delete m.container.image_from_input; m.container.image = 3; }), "container.image", "must be a string");
-});
-
 test("anything keyed by a role needs that role declared", () => {
   const noDev = (m: any) => { delete m.sandbox_roles.dev; };
   refused(mutate(noDev), "env_map.sandbox_keys.dev", "not declared in sandbox_roles");
   refused(mutate(noDev), "limits.max_sandboxes.dev", "not declared in sandbox_roles");
   const noSub = (m: any) => { delete m.sandbox_roles.subrun; };
-  refused(mutate(noSub), "grant_from_input.subrun.max_sandboxes", "not declared in sandbox_roles");
-  refused(mutate(noSub), "grant_extra.subrun.max_sandboxes", "not declared in sandbox_roles");
-});
-
-test("a grant key Claw does not know, and a bad grant constant, are refused", () => {
-  refused(mutate((m) => { m.grant_from_input.max_gpus = "/x"; }), "grant_from_input.max_gpus", "unknown field");
-  refused(mutate((m) => { m.grant_extra.bogus = 1; }), "grant_extra.bogus", "unknown field");
-  refused(mutate((m) => { m.grant_extra["subrun.max_sandboxes"] = 1.5; }), "grant_extra.subrun.max_sandboxes", "must be an integer");
-  refused(mutate((m) => { m.grant_extra["subrun.max_sandboxes"] = -1; }), "grant_extra.subrun.max_sandboxes", ">= 0");
-});
-
-test("the headroom is a number of at least 1", () => {
-  refused(mutate((m) => { m.limits.gpu_hours_headroom = 0.9; }), "limits.gpu_hours_headroom", ">= 1");
-  refused(mutate((m) => { m.limits.gpu_hours_headroom = "1.3"; }), "limits.gpu_hours_headroom", "must be a number");
 });
 
 test("two things writing one variable, and platform-owned names, are refused", () => {
@@ -308,7 +257,7 @@ test("mcp facilities need mcp, and the public url needs mcp.public", () => {
 });
 
 test("mapping the template list needs templates to declare", () => {
-  const none = (m: any) => { delete m.sandbox_templates; m.sandbox_roles = {}; m.env_map.sandbox_keys = {}; m.limits.max_sandboxes = {}; m.grant_from_input = {}; m.grant_extra = {}; };
+  const none = (m: any) => { delete m.sandbox_templates; m.sandbox_roles = {}; m.env_map.sandbox_keys = {}; m.limits.max_sandboxes = {}; };
   refused(mutate(none), "env_map.sandbox_templates", "needs sandbox_templates");
 });
 
@@ -358,9 +307,9 @@ test("names that Object.prototype also has are not mistaken for declared fields"
 
 test("every problem is reported, not the first", () => {
   const found = paths(mutate((m) => {
-    m.container.image_from_input = "bad";
+    m.container.image = "";
     m.sandbox_roles.subrun.push("ghost");
-    m.limits.gpu_hours_headroom = 0.5;
+    m.limits.max_runtime_sec = 0;
   }));
-  assert.deepEqual(found.sort(), ["container.image_from_input", "limits.gpu_hours_headroom", "sandbox_roles.subrun[2]"]);
+  assert.deepEqual(found.sort(), ["container.image", "limits.max_runtime_sec", "sandbox_roles.subrun[2]"]);
 });
