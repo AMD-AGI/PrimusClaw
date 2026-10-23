@@ -86,7 +86,7 @@ rules:
     verbs: ["get"]
   - apiGroups: ["amd.com"]
     resources: ["workloads"]
-    verbs: ["create", "delete", "get", "list", "watch"]
+    verbs: ["create", "delete", "get", "list", "update", "watch"]
   - apiGroups: ["runtime.agent-sandbox.io"]
     resources: ["clustersandboxpolicies"]
     verbs: ["get", "list", "watch"]
