@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 
 import {
   REQUIRED_SCHEMA,
+  classifySchemaProblems,
   missingSchemaObjects,
   type PresentColumn,
 } from "../src/infra/schema-guard.js";
@@ -195,4 +196,20 @@ test("reports all three dispatch columns at once, since one migration adds them"
     "claw_pending_messages is missing column(s): dispatch_task_id",
     "claw_tasks is missing column(s): dispatch_reconcile_at, dispatch_reconcile_action",
   ]);
+});
+
+test("a missing app-run table stops start-up only when app runs are enabled", () => {
+  const present = without([["claw_app_runs", "request_hash"], ["claw_app_runs", "created_by"]]);
+  const on = classifySchemaProblems(REQUIRED_SCHEMA, present, true);
+  assert.deepEqual(on.fatal, ["claw_app_runs is missing column(s): created_by, request_hash"]);
+  assert.deepEqual(on.warnings, []);
+  const off = classifySchemaProblems(REQUIRED_SCHEMA, present, false);
+  assert.deepEqual(off.fatal, []);
+  assert.deepEqual(off.warnings, on.fatal);
+  // The whole table gone, and every other table's gap, stays as it was.
+  const noTable = fullSchema().filter((c) => c.table_name !== "claw_app_runs");
+  assert.deepEqual(classifySchemaProblems(REQUIRED_SCHEMA, noTable, false).fatal, []);
+  assert.deepEqual(classifySchemaProblems(REQUIRED_SCHEMA, noTable, true).fatal, ["table claw_app_runs is missing"]);
+  const other = without([["claw_tasks", "queued_at"]]);
+  assert.deepEqual(classifySchemaProblems(REQUIRED_SCHEMA, other, false).fatal, ["claw_tasks is missing column(s): queued_at"]);
 });

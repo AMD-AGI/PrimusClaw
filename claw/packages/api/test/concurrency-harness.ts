@@ -146,7 +146,7 @@ export async function startConcurrencyHarness(): Promise<ConcurrencyHarness> {
       if (!r.rowCount) throw new Error("could not mark the claim index invalid");
     },
     async clearTasks() {
-      await observer.query("TRUNCATE claw_tasks");
+      await observer.query("TRUNCATE claw_tasks, claw_app_runs");
     },
     async stop() {
       await app.endPools();

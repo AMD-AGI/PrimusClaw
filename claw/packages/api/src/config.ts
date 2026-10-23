@@ -9,6 +9,8 @@ import {
   DEFAULT_TASK_MAX_ACK_PENDING,
   DEFAULT_TASK_MAX_DELIVER,
   MIN_RENEWAL_INTERVAL_MS,
+  parseAppContainerCaps,
+  parseAppSandboxCaps,
   resolveLeaseReapGraceSec,
   resolveTaskDeliveryBudget,
   RUN_LEASE_HEARTBEATS_PER_TTL,
@@ -356,6 +358,60 @@ export const CLAW_MEMORY_ENABLED = envBool("CLAW_MEMORY_ENABLED", false);
 // When false: skill selection, save, mutation, feedback, evolution, pattern
 // recording, evolve worker, and skill-files cleanup are all short-circuited.
 export const CLAW_SKILL_EVOLUTION_ENABLED = envBool("CLAW_SKILL_EVOLUTION_ENABLED", false);
+
+/**
+ * Accept `mode: "app"` on `POST /v1/sessions/:sessionId/tasks`. Off by default:
+ * until the Brain side runs apps, an admitted app run is refused there as not
+ * implemented, so nothing is gained by taking one in.
+ */
+export const APP_RUNS_ENABLED = envBool("APP_RUNS_ENABLED", false);
+
+/**
+ * Platform caps on what an app run's grant may carry, as JSON of the grant
+ * shape: `{"max_sandboxes":8,"max_gpus":8,"gpu_hours":500,"max_runtime_sec":172800}`.
+ * Each grant item is the smallest of the request, the manifest's limit (where it
+ * has one) and its cap; an item with none of them is unbounded. A value that is not that shape stops start-up.
+ */
+export const APP_SANDBOX_CAPS = parseAppSandboxCaps(process.env.APP_SANDBOX_CAPS);
+
+/**
+ * The most one app container may ask for, as JSON: `{"gpus":8,"cpu":256,"memory_gi":4096}`.
+ * An item left out keeps its default (one node: 8 GPUs, 256 cpu, 4096 GiB), so
+ * "not configured" is never "unlimited": a pod asking for more GPUs than a node
+ * has can never be scheduled and would hold the session's one app-run slot for
+ * ever. A request above it is refused with a 400 naming the field. A value that is
+ * not that shape stops start-up.
+ */
+export const APP_CONTAINER_CAPS = parseAppContainerCaps(process.env.APP_CONTAINER_CAPS);
+
+/**
+ * How long the grant service gets to answer `issue` (and `revoke`) before the
+ * attempt counts as failed. The Idempotency-Key lock and its connection are held
+ * for the whole call, so it must be bounded.
+ */
+export const APP_GRANT_ISSUE_TIMEOUT_MS = parseAppGrantTimeoutMs(process.env.APP_GRANT_ISSUE_TIMEOUT_MS, 10_000, "APP_GRANT_ISSUE_TIMEOUT_MS");
+
+/**
+ * After `issue` fails or times out, the grant service may still finish signing the
+ * grant it was asked for, so the attempt's revoke is tried once more after this
+ * long. The first revoke goes out at once (it covers the common case); this second
+ * one covers a late signature. Past both, the grant lapses at its own expiry.
+ */
+export const APP_GRANT_REVOKE_RETRY_MS = parseAppGrantTimeoutMs(process.env.APP_GRANT_REVOKE_RETRY_MS, 30_000, "APP_GRANT_REVOKE_RETRY_MS");
+
+/**
+ * A whole number of milliseconds between 1000 and 300000, or start-up fails: 0 or a
+ * negative value would time every grant call out at once and make every app run a
+ * 503, and a huge one would hold the Idempotency-Key lock for as long.
+ */
+export function parseAppGrantTimeoutMs(raw: string | undefined, fallback: number, name: string): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1_000 || n > 300_000) {
+    throw new Error(`${name} must be a whole number of milliseconds between 1000 and 300000, got ${JSON.stringify(raw)}`);
+  }
+  return n;
+}
 
 /**
  * Chat (and queued-chat) dispatch publishes a doorbell and injects credentials
