@@ -54,6 +54,17 @@ Manual `.env` or non-Helm deployments upgrading to this version must set
 gateways, or `anthropic` for the native Anthropic API. Helm and the one-click
 deployment script populate this value automatically.
 
+### Upgrade Note: Multi-Node Topology Handoff
+
+Multi-node sandboxes now also receive their cluster topology as a file,
+`/tmp/claw-topology/topology.json` (directory mode 0700, outside the synced
+workspace), named by `TOPOLOGY_HANDOFF_FILE`. The older `HYPERLOOM_MN_EXT_*`,
+`INFERENCE_OPTIMIZER_MN_BACKEND` and `INFERENCE_OPTIMIZER_NODES` variables are
+still set while `LEGACY_TOPOLOGY_ENV` is `true` (the default). Do not set
+`LEGACY_TOPOLOGY_ENV=false` until every reader of the topology has moved to the
+file: the released reader does not read it yet, so turning the flag off breaks
+multi-node runs.
+
 ### Upgrade Note: Multi-Node Default Timeout
 
 The multi-node workload lifetime used when a request carries no timeout is now
