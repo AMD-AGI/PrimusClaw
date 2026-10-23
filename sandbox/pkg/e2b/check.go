@@ -207,16 +207,13 @@ func contains(list []string, want string) bool {
 	return false
 }
 
-// parseMetadataQuery reads the double-encoded metadata query value.
+// parseMetadataQuery reads a metadata query string.
+// The HTTP server has already decoded the parameter once.
 func parseMetadataQuery(raw string) (map[string]string, error) {
 	if raw == "" {
 		return nil, nil
 	}
-	decoded, err := url.QueryUnescape(raw)
-	if err != nil {
-		return nil, grant.Op(http.StatusBadRequest, "invalid_metadata_query", "metadata query is not encoded")
-	}
-	values, err := url.ParseQuery(decoded)
+	values, err := url.ParseQuery(raw)
 	if err != nil {
 		return nil, grant.Op(http.StatusBadRequest, "invalid_metadata_query", "metadata query is not encoded")
 	}

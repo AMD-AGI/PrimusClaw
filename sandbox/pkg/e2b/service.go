@@ -147,7 +147,7 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 	})
 	var replay *grant.Replay
 	if errors.As(err, &replay) {
-		return s.replay(ctx, grantID, ref)
+		return s.replay(ref)
 	}
 	if err != nil {
 		if denied(err) {
@@ -194,18 +194,11 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 	return createdResponse(ref, token), http.StatusCreated, nil
 }
 
-func (s *Service) replay(ctx context.Context, grantID string, ref runtimev1alpha1.GrantSandboxRef) (SandboxResponse, int, error) {
+func (s *Service) replay(ref runtimev1alpha1.GrantSandboxRef) (SandboxResponse, int, error) {
 	if ref.State == runtimev1alpha1.SandboxEnded {
 		return SandboxResponse{}, 0, grant.Op(http.StatusGone, "idempotency_key_spent", ref.ID)
 	}
-	token, hash, err := newAccessToken()
-	if err != nil {
-		return SandboxResponse{}, 0, grant.Op(http.StatusInternalServerError, "sandbox_create_failed", "token")
-	}
-	if err := s.grants.RotateToken(ctx, grantID, ref.ID, hash); err != nil {
-		return SandboxResponse{}, 0, err
-	}
-	return createdResponse(ref, token), http.StatusOK, nil
+	return createdResponse(ref, ""), http.StatusOK, nil
 }
 
 // Get returns one sandbox for this key's role. Other roles are not found.
@@ -257,13 +250,7 @@ func (s *Service) List(ctx context.Context, apiKey, metadataQuery, state, nextTo
 		filtered = append(filtered, ref)
 	}
 	sort.Slice(filtered, func(i, j int) bool { return filtered[i].ID < filtered[j].ID })
-	if offset > len(filtered) {
-		offset = len(filtered)
-	}
-	end := offset + limit
-	if end > len(filtered) {
-		end = len(filtered)
-	}
+	offset, end := pageBounds(offset, limit, len(filtered))
 	page := filtered[offset:end]
 	out := ListResponse{Sandboxes: make([]SandboxResponse, 0, len(page))}
 	for _, ref := range page {
@@ -288,13 +275,17 @@ func (s *Service) Kill(ctx context.Context, apiKey, sandboxID string) error {
 	if ref.State == runtimev1alpha1.SandboxEnded {
 		return nil
 	}
+	if s.runner == nil {
+		return grant.Op(http.StatusServiceUnavailable, "sandbox_unavailable", "runner is not configured")
+	}
 	if err := s.runner.Delete(ctx, sandboxID); err != nil {
 		return grant.Op(http.StatusInternalServerError, "sandbox_delete_failed", err.Error())
 	}
 	return s.grants.EndSandbox(ctx, grantID, sandboxID, "killed")
 }
 
-// Connect rotates the access token of a live sandbox.
+// Connect returns a live sandbox. It does not replace the access token,
+// so other clients holding that token keep working.
 func (s *Service) Connect(ctx context.Context, apiKey, sandboxID string) (SandboxResponse, error) {
 	grantID, role, err := s.grants.LookupKey(ctx, apiKey)
 	if err != nil {
@@ -307,14 +298,21 @@ func (s *Service) Connect(ctx context.Context, apiKey, sandboxID string) (Sandbo
 	if ref.State == runtimev1alpha1.SandboxEnded {
 		return SandboxResponse{}, grant.Op(http.StatusNotFound, "sandbox_not_found", sandboxID)
 	}
-	token, hash, err := newAccessToken()
-	if err != nil {
-		return SandboxResponse{}, grant.Op(http.StatusInternalServerError, "sandbox_create_failed", "token")
+	return createdResponse(ref, ""), nil
+}
+
+// pageBounds returns a slice range that cannot overflow.
+func pageBounds(offset, limit, n int) (int, int) {
+	if offset > n {
+		offset = n
 	}
-	if err := s.grants.RotateToken(ctx, grantID, sandboxID, hash); err != nil {
-		return SandboxResponse{}, err
+	if offset < 0 {
+		offset = 0
 	}
-	return createdResponse(ref, token), nil
+	if limit < 0 || limit > n-offset {
+		return offset, n
+	}
+	return offset, offset + limit
 }
 
 // Timeout sets a new lifetime from now. A value over the grant cap is refused.

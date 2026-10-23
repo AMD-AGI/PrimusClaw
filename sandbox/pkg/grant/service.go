@@ -431,6 +431,9 @@ func (s *Service) reclaimAll(ctx context.Context, grantID string) (int, error) {
 	}
 	remaining := 0
 	for _, ref := range append([]runtimev1alpha1.GrantSandboxRef(nil), g.Status.Sandboxes...) {
+		if ref.State == runtimev1alpha1.SandboxEnded {
+			continue
+		}
 		sb := SandboxRef{ID: ref.ID, Role: ref.Role, GPUs: ref.GPUs, SessionID: ref.SessionID}
 		if s.reclaimer != nil {
 			if err := s.reclaimer.Reclaim(ctx, sb); err != nil {
@@ -439,7 +442,7 @@ func (s *Service) reclaimAll(ctx context.Context, grantID string) (int, error) {
 				continue
 			}
 		}
-		if err := s.Release(ctx, grantID, ref.ID, 0); err != nil {
+		if err := s.EndSandbox(ctx, grantID, ref.ID, "reclaimed"); err != nil && !IsReason(err, "sandbox_not_found") {
 			remaining++
 			continue
 		}

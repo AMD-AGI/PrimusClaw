@@ -63,7 +63,7 @@ func (s *Server) Create(ctx context.Context, req e2b.CreateRequest) (e2b.CreateR
 	case s.workloads != nil:
 		result, err := s.workloads.Create(ctx, req)
 		if err != nil {
-			_ = s.store.DeleteSandboxBySessionID(ctx, req.SandboxID)
+			_ = s.store.DeleteSandboxBySessionID(context.WithoutCancel(ctx), req.SandboxID)
 			if errors.Is(err, ErrTemplateNotFound) {
 				return e2b.CreateResult{}, e2b.ErrTemplateMissing
 			}
@@ -84,7 +84,7 @@ func (s *Server) Create(ctx context.Context, req e2b.CreateRequest) (e2b.CreateR
 		nodeName = result.NodeName
 		policy = result
 	case s.k8s != nil:
-		_ = s.store.DeleteSandboxBySessionID(ctx, req.SandboxID)
+		_ = s.store.DeleteSandboxBySessionID(context.WithoutCancel(ctx), req.SandboxID)
 		return e2b.CreateResult{}, fmt.Errorf("safe workload client is not configured")
 	}
 
@@ -111,7 +111,7 @@ func (s *Server) Create(ctx context.Context, req e2b.CreateRequest) (e2b.CreateR
 		info.PolicyVersion = 1
 	}
 	if err := s.store.UpdateSandbox(ctx, info); err != nil {
-		s.deleteSandboxAndSession(ctx, info, "e2b-create-failed")
+		_ = s.deleteSandboxAndSession(context.WithoutCancel(ctx), info, "e2b-create-failed")
 		return e2b.CreateResult{}, err
 	}
 	return e2b.CreateResult{

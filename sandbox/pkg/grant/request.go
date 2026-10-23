@@ -121,11 +121,32 @@ func validateIssue(req IssueRequest, now time.Time) error {
 		return opErr(http.StatusBadRequest, "invalid_grant", "budgets must be >= 0")
 	}
 	for role, cap := range req.Roles {
-		if role == "" || cap.MaxSandboxes < 0 || cap.MaxGPUs < 0 {
+		if !roleLabel(role) {
+			return opErr(http.StatusBadRequest, "invalid_grant", "role "+role+" is not a workload display name")
+		}
+		if cap.MaxSandboxes < 0 || cap.MaxGPUs < 0 {
 			return opErr(http.StatusBadRequest, "invalid_grant", "role caps must be >= 0")
 		}
 	}
 	return nil
+}
+
+// roleLabel reports whether name can be a SaFE Workload display name.
+// That label is a DNS label of at most 40 characters.
+func roleLabel(name string) bool {
+	const maxRoleLabel = 40
+	if name == "" || len(name) > maxRoleLabel {
+		return false
+	}
+	for i, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+		case r == '-' && i > 0 && i < len(name)-1:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // expandTemplates rewrites role template names to the registered names.

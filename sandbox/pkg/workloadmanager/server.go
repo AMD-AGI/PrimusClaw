@@ -213,8 +213,7 @@ func (s *Server) ReclaimSession(ctx context.Context, sessionID string) error {
 	if err != nil {
 		return err
 	}
-	s.deleteSandboxAndSession(ctx, info, audit.ReasonGrantReclaim)
-	return nil
+	return s.deleteSandboxAndSession(ctx, info, audit.ReasonGrantReclaim)
 }
 
 // emitAudit records an audit event (fire-and-forget, never blocks the caller).
@@ -1122,7 +1121,9 @@ func (s *Server) gcOnce(ctx context.Context) {
 	if expired, err := s.store.ListExpiredSandboxes(ctx, now, 100); err == nil {
 		for _, info := range expired {
 			log.Info("GC: deleting expired sandbox", "session", info.SessionID, "sandbox", info.SandboxName)
-			s.deleteSandboxAndSession(ctx, info, audit.ReasonGCTTL)
+			if err := s.deleteSandboxAndSession(ctx, info, audit.ReasonGCTTL); err != nil {
+				log.Warn("GC: sandbox delete failed", "session", info.SessionID, "sandbox", info.SandboxName, "error", err)
+			}
 		}
 	}
 
@@ -1137,25 +1138,17 @@ func (s *Server) gcOnce(ctx context.Context) {
 	}
 }
 
-// deleteSandboxAndSession deletes both the K8s resource and the Store entry.
-func (s *Server) deleteSandboxAndSession(ctx context.Context, info *store.SandboxInfo, reason string) {
-	// Audit: sandbox.deleted (GC-initiated)
-	s.emitAudit(ctx, &audit.AuditEvent{
-		ID: audit.NewEventID(), EventType: audit.EventDeleted,
-		SessionID: info.SessionID, SandboxName: info.SandboxName, Namespace: info.Namespace,
-		UserID: info.UserID, UserName: info.UserName,
-		Timestamp: time.Now(), DeleteReason: reason,
-		DurationMs: time.Since(info.CreatedAt).Milliseconds(),
-	})
-	sandboxDeleteTotal.WithLabelValues(reason).Inc()
-
+// deleteSandboxAndSession deletes the workload and then the session record.
+// A failed workload delete keeps the session so the caller can retry.
+func (s *Server) deleteSandboxAndSession(ctx context.Context, info *store.SandboxInfo, reason string) error {
 	switch {
 	case info.Kind == store.WorkloadKind:
-		if s.workloads != nil {
-			if err := s.workloads.Delete(ctx, info.SandboxName); err != nil {
-				log.Warn("GC: failed to delete workload",
-					"workload", info.SandboxName, "error", err)
-			}
+		if s.workloads == nil {
+			return fmt.Errorf("safe workload client is not configured")
+		}
+		if err := s.workloads.Delete(ctx, info.SandboxName); err != nil {
+			log.Warn("failed to delete workload", "workload", info.SandboxName, "error", err)
+			return err
 		}
 	case s.k8s != nil:
 		var err error
@@ -1165,11 +1158,20 @@ func (s *Server) deleteSandboxAndSession(ctx context.Context, info *store.Sandbo
 			err = s.k8s.DeleteSandbox(ctx, info)
 		}
 		if err != nil {
-			log.Warn("GC: failed to delete K8s resource",
+			log.Warn("failed to delete K8s resource",
 				"kind", info.Kind, "sandbox", info.SandboxName, "error", err)
+			return err
 		}
 	}
-	_ = s.store.DeleteSandboxBySessionID(ctx, info.SessionID)
+	s.emitAudit(ctx, &audit.AuditEvent{
+		ID: audit.NewEventID(), EventType: audit.EventDeleted,
+		SessionID: info.SessionID, SandboxName: info.SandboxName, Namespace: info.Namespace,
+		UserID: info.UserID, UserName: info.UserName,
+		Timestamp: time.Now(), DeleteReason: reason,
+		DurationMs: time.Since(info.CreatedAt).Milliseconds(),
+	})
+	sandboxDeleteTotal.WithLabelValues(reason).Inc()
+	return s.store.DeleteSandboxBySessionID(ctx, info.SessionID)
 }
 
 // ─── Template management handlers ────────────────────────────────────────────

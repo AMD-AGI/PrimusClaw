@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -174,8 +175,14 @@ func TestCreateReplayKillAndQuota(t *testing.T) {
 	second, status, err := svc.Create(context.Background(), key, CreateBody{
 		TemplateID: "runner", Metadata: map[string]string{"idempotency-key": "once"},
 	})
-	if err != nil || status != http.StatusOK || second.SandboxID != first.SandboxID || second.EnvdAccessToken == first.EnvdAccessToken {
+	if err != nil || status != http.StatusOK || second.SandboxID != first.SandboxID || second.EnvdAccessToken != "" {
 		t.Fatalf("status=%d err=%v second=%+v", status, err, second)
+	}
+	if _, err := svc.Connect(context.Background(), key, first.SandboxID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.grants.LookupAccess(context.Background(), first.SandboxID, first.EnvdAccessToken); err != nil {
+		t.Fatalf("token rejected after connect: %v", err)
 	}
 	if len(runner.created) != 1 {
 		t.Fatalf("replay created again: %d", len(runner.created))
@@ -337,5 +344,49 @@ func TestSealedAllowsFilesOnly(t *testing.T) {
 	}
 	if !SealedAllows(http.MethodPost, "/api/execute", false, nil, nil) {
 		t.Fatal("unsealed denied")
+	}
+}
+
+func TestListLimitAndMetadataLiterals(t *testing.T) {
+	svc, _, keys := testPlane(t, 600, []int32{1}, 4)
+	key := keys["measurement"]
+	_, _, err := svc.Create(context.Background(), key, CreateBody{
+		TemplateID: "ar-01ja-runner-g1",
+		Metadata: map[string]string{
+			"idempotency-key":  "plus",
+			"hyperloom.run-id": "a+b",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed, err := svc.List(context.Background(), key, "hyperloom.run-id=a%2Bb", "", "", math.MaxInt)
+	if err != nil || len(listed.Sandboxes) != 1 || listed.Sandboxes[0].Metadata["hyperloom.run-id"] != "a+b" {
+		t.Fatalf("listed=%+v err=%v", listed, err)
+	}
+	listed, err = svc.List(context.Background(), key, "", "", encodeOffset(math.MaxInt), math.MaxInt)
+	if err != nil || len(listed.Sandboxes) != 0 {
+		t.Fatalf("listed=%+v err=%v", listed, err)
+	}
+	got, err := parseMetadataQuery("hyperloom.run-id=a%26b&hyperloom.purpose=a%3Db&note=a%25b")
+	if err != nil || got["hyperloom.run-id"] != "a&b" || got["hyperloom.purpose"] != "a=b" || got["note"] != "a%b" {
+		t.Fatalf("got=%v err=%v", got, err)
+	}
+}
+
+func TestKillWithoutRunner(t *testing.T) {
+	svc, _, keys := testPlane(t, 600, []int32{1}, 1)
+	key := keys["measurement"]
+	created, _, err := svc.Create(context.Background(), key, CreateBody{TemplateID: "ar-01ja-runner-g1", Timeout: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.runner = nil
+	if err := svc.Kill(context.Background(), key, created.SandboxID); !grant.IsReason(err, "sandbox_unavailable") {
+		t.Fatalf("err=%v", err)
+	}
+	got, err := svc.Get(context.Background(), key, created.SandboxID)
+	if err != nil || got.State != runtimev1alpha1.SandboxRunning {
+		t.Fatalf("got=%+v err=%v", got, err)
 	}
 }

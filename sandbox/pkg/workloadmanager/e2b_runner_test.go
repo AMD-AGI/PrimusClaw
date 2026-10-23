@@ -5,6 +5,7 @@ package workloadmanager
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -13,10 +14,22 @@ import (
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynfake "k8s.io/client-go/dynamic/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"sigs.k8s.io/agent-sandbox/pkg/e2b"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
+
+type cancelDeleteStore struct {
+	store.Store
+}
+
+func (s cancelDeleteStore) DeleteSandboxBySessionID(ctx context.Context, sessionID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.Store.DeleteSandboxBySessionID(ctx, sessionID)
+}
 
 func TestCreateE2BSkipsInferenceKey(t *testing.T) {
 	st := store.NewMemoryStore()
@@ -87,5 +100,42 @@ func TestSetTimeoutUpdatesWorkloadWithinCap(t *testing.T) {
 	high := workloadTimeoutSeconds(started, time.Now(), 300*time.Second)
 	if timeout < low || timeout > high {
 		t.Fatalf("timeout=%d want %d..%d", timeout, low, high)
+	}
+}
+
+func TestCreateDropsPlaceholderWhenContextIsCanceled(t *testing.T) {
+	base := store.NewMemoryStore()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	srv := New(Config{Namespace: "ns", DefaultTTL: time.Minute}, cancelDeleteStore{Store: base})
+	srv.workloads = NewSafeWorkloadCreator(nil, nil)
+	_, err := srv.Create(ctx, e2b.CreateRequest{SandboxID: "sbx-1", TemplateID: "runner", Namespace: "ns"})
+	if err == nil {
+		t.Fatal("expected create error")
+	}
+	if _, err := base.GetSandboxBySessionID(context.Background(), "sbx-1"); err == nil {
+		t.Fatal("placeholder remains")
+	}
+}
+
+func TestDeleteKeepsSessionWhenWorkloadDeleteFails(t *testing.T) {
+	st := store.NewMemoryStore()
+	if err := st.StoreSandbox(context.Background(), &store.SandboxInfo{
+		Kind: store.WorkloadKind, SessionID: "sbx-1", SandboxName: "sbx-1", Namespace: "ns", Status: "running",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dc := dynfake.NewSimpleDynamicClientWithCustomListKinds(k8sruntime.NewScheme(), map[schema.GroupVersionResource]string{
+		workloadGVR: "WorkloadList",
+	})
+	dc.PrependReactor("delete", "workloads", func(k8stesting.Action) (bool, k8sruntime.Object, error) {
+		return true, nil, fmt.Errorf("denied")
+	})
+	srv := New(Config{Namespace: "ns"}, st).WithSafeWorkloads(NewSafeWorkloadCreator(dc, nil))
+	if err := srv.Delete(context.Background(), "sbx-1"); err == nil {
+		t.Fatal("expected delete error")
+	}
+	if _, err := st.GetSandboxBySessionID(context.Background(), "sbx-1"); err != nil {
+		t.Fatalf("session removed: %v", err)
 	}
 }

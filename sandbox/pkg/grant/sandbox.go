@@ -154,6 +154,8 @@ func (s *Service) EndSandbox(ctx context.Context, grantID, sandboxID, reason str
 }
 
 // SetSandboxTimeout replaces the lifetime requested for a live sandbox.
+// The new duration is measured from now, and the sandbox still cannot run
+// longer than MaxSandboxSeconds from the time it started.
 func (s *Service) SetSandboxTimeout(ctx context.Context, grantID, role, sandboxID string, timeoutSec int64) error {
 	if timeoutSec <= 0 {
 		return opErr(http.StatusBadRequest, "invalid_sandbox", "timeout must be > 0")
@@ -162,10 +164,6 @@ func (s *Service) SetSandboxTimeout(ctx context.Context, grantID, role, sandboxI
 		if err := usable(g, s.now()); err != nil {
 			return err
 		}
-		if g.Spec.MaxSandboxSeconds > 0 && timeoutSec > g.Spec.MaxSandboxSeconds {
-			return opErr(http.StatusForbidden, "timeout_not_allowed",
-				fmtDetail("%d > %d", timeoutSec, g.Spec.MaxSandboxSeconds))
-		}
 		for i, ref := range g.Status.Sandboxes {
 			if ref.ID != sandboxID || ref.Role != role {
 				continue
@@ -173,12 +171,32 @@ func (s *Service) SetSandboxTimeout(ctx context.Context, grantID, role, sandboxI
 			if ref.State == runtimev1alpha1.SandboxEnded {
 				return opErr(http.StatusNotFound, "sandbox_not_found", sandboxID)
 			}
+			if g.Spec.MaxSandboxSeconds > 0 && !timeoutWithinLifetime(ref.StartedAt.Time, s.now(), timeoutSec, g.Spec.MaxSandboxSeconds) {
+				return opErr(http.StatusForbidden, "timeout_not_allowed",
+					fmtDetail("%d > %d", timeoutSec, g.Spec.MaxSandboxSeconds))
+			}
 			ref.TimeoutSec = timeoutSec
 			g.Status.Sandboxes[i] = ref
 			return nil
 		}
 		return opErr(http.StatusNotFound, "sandbox_not_found", sandboxID)
 	})
+}
+
+// timeoutWithinLifetime reports whether now plus timeoutSec is still within
+// maxSec after started. A zero start time compares timeoutSec with maxSec.
+func timeoutWithinLifetime(started, now time.Time, timeoutSec, maxSec int64) bool {
+	if maxSec <= 0 {
+		return true
+	}
+	if timeoutSec > maxSec {
+		return false
+	}
+	if started.IsZero() {
+		return true
+	}
+	deadline := started.Add(time.Duration(maxSec) * time.Second)
+	return !now.Add(time.Duration(timeoutSec) * time.Second).After(deadline)
 }
 
 // Sandbox returns one sandbox when it belongs to the role. Other roles are not found.
@@ -227,6 +245,9 @@ func (s *Service) LookupAccess(ctx context.Context, sandboxID, token string) (ru
 				continue
 			}
 			if subtle.ConstantTimeCompare([]byte(ref.AccessTokenHash), []byte(want)) == 1 {
+				if err := usable(&list[i], s.now()); err != nil {
+					return runtimev1alpha1.GrantSandboxRef{}, err
+				}
 				return ref, nil
 			}
 			return runtimev1alpha1.GrantSandboxRef{}, opErr(http.StatusUnauthorized, "invalid_token", "access token does not match")

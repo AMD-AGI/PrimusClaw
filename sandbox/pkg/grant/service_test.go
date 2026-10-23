@@ -559,3 +559,117 @@ func TestIssueRegistersFromImage(t *testing.T) {
 		t.Fatalf("err=%v", err)
 	}
 }
+
+func TestIssueRejectsRoleName(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, role := range []string{"Planner", "code_runner", strings.Repeat("a", 41)} {
+		svc, priv, _, _ := testService(t, now)
+		req := sampleRequest(now.Add(time.Hour))
+		req.Roles = map[string]RoleRequest{role: {Templates: []string{"runner"}, MaxSandboxes: 1, MaxGPUs: 1}}
+		req.Attestation = signGrant(t, priv, req)
+		_, _, err := svc.Issue(context.Background(), req)
+		if !IsReason(err, "invalid_grant") || !strings.Contains(err.Error(), "display name") {
+			t.Fatalf("role %s err=%v", role, err)
+		}
+	}
+}
+
+func TestTimeoutCannotOutliveGrant(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	clock := now
+	svc, priv, _, _ := testService(t, now)
+	svc.now = func() time.Time { return clock }
+	req := sampleRequest(now.Add(time.Hour))
+	req.MaxSandboxSeconds = 600
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.BeginSandbox(context.Background(), BeginRequest{
+		GrantID: req.GrantID, Role: "measurement", SandboxID: "sbx-1",
+		TemplateID: "ar-01ja-runner-g1", GPUs: 1, TimeoutSec: 600,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clock = now.Add(500 * time.Second)
+	err := svc.SetSandboxTimeout(context.Background(), req.GrantID, "measurement", "sbx-1", 101)
+	if !IsReason(err, "timeout_not_allowed") {
+		t.Fatalf("err=%v", err)
+	}
+	if err := svc.SetSandboxTimeout(context.Background(), req.GrantID, "measurement", "sbx-1", 100); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReclaimCountsLiveGPUSecondsOnce(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	clock := now
+	svc, priv, _, reclaimer := testService(t, now)
+	svc.now = func() time.Time { return clock }
+	req := sampleRequest(now.Add(time.Hour))
+	req.GPUHoursBudget = 10
+	req.Roles["measurement"] = RoleRequest{Templates: []string{"runner"}, MaxSandboxes: 2, MaxGPUs: 8}
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.BeginSandbox(context.Background(), BeginRequest{
+		GrantID: req.GrantID, Role: "measurement", SandboxID: "sbx-1",
+		TemplateID: "ar-01ja-runner-g1", GPUs: 2, TimeoutSec: 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clock = now.Add(10 * time.Second)
+	if err := svc.EndSandbox(context.Background(), req.GrantID, "sbx-1", "killed"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.BeginSandbox(context.Background(), BeginRequest{
+		GrantID: req.GrantID, Role: "measurement", SandboxID: "sbx-2",
+		TemplateID: "ar-01ja-runner-g1", GPUs: 4, TimeoutSec: 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clock = now.Add(15 * time.Second)
+	resp, err := svc.Revoke(context.Background(), req.GrantID)
+	if err != nil || resp.Remaining != 0 {
+		t.Fatalf("resp=%+v err=%v", resp, err)
+	}
+	view, err := svc.Get(context.Background(), req.GrantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.GPUSeconds != 40 || view.Usage["measurement"].Sandboxes != 0 || len(view.Sandboxes) != 2 {
+		t.Fatalf("view gpu=%d usage=%+v sandboxes=%d", view.GPUSeconds, view.Usage["measurement"], len(view.Sandboxes))
+	}
+	if len(reclaimer.ids) != 1 || reclaimer.ids[0] != "sbx-2" {
+		t.Fatalf("reclaimed=%v", reclaimer.ids)
+	}
+}
+
+func TestLookupAccessRejectsRevokedGrant(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	svc, priv, _, _ := testService(t, now)
+	req := sampleRequest(now.Add(time.Hour))
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	const token = "sat_test"
+	if _, err := svc.BeginSandbox(context.Background(), BeginRequest{
+		GrantID: req.GrantID, Role: "measurement", SandboxID: "sbx-1",
+		TemplateID: "ar-01ja-runner-g1", GPUs: 1, TimeoutSec: 60,
+		AccessTokenHash: HashKey(token),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.LookupAccess(context.Background(), "sbx-1", token); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Revoke(context.Background(), req.GrantID); err != nil {
+		t.Fatal(err)
+	}
+	_, err := svc.LookupAccess(context.Background(), "sbx-1", token)
+	if !IsReason(err, "grant_revoked") {
+		t.Fatalf("err=%v", err)
+	}
+}
