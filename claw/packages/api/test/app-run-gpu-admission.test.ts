@@ -18,7 +18,7 @@ const skip = postgresSkipReason();
 const OWNER = { userId: "u1", userName: "u1", roles: ["default"], platformKey: "pk-u1", virtualKey: "vk-u1" };
 const MANIFEST = {
   schema: APP_MANIFEST_SCHEMA, name: "example-app", version: "1.0.0",
-  container: {}, state_dir: "/state", command: ["run"],
+  container: {}, state_dir: "/state/${run_id}", command: ["run"],
 };
 
 describe("app run GPU admission", { skip }, () => {
