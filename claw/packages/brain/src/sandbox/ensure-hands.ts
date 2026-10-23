@@ -36,6 +36,8 @@ import {
   resourcesMapToWorkloadArray,
   assertImageDigest,
   applyMultiNodeExternalEnv,
+  writeTopologyHandoff,
+  hasSshKeyFile,
 } from "./params.js";
 import type { SandboxAction } from "./params.js";
 import { resourcesJsonToWorkloadArray } from "./workload-resources.js";
@@ -2630,7 +2632,6 @@ async function provisionHands(
     ...(action.params.env ?? {}),
     AUTH_CLAW_TOKEN: handsToken,
     CLAW_SESSION_ID: sessionId,
-    INFERENCE_OPTIMIZER_SESSION_LAYOUT: "per_model_ts",
     MCP_PORT: mcpPort,
     WORKSPACE_PATH: "/workspace",
     SAFE_API_URL: SAFE_API_URL,
@@ -2798,13 +2799,29 @@ async function provisionHands(
 
   // infera drives its GPU pods over SSH, so the key Brain derived for this
   // cluster has to exist as a file here before the optimizer runs.
-  if (multiNodeContext?.sshPrivateKey && multiNodeContext.sshKeyPath) {
+  if (multiNodeContext && hasSshKeyFile(multiNodeContext)) {
     await writeSandboxSshKey(
       (cmd, t) => getSafeWorkloadProvider().exec(inst, cmd, t, undefined, { untracked: true }),
-      multiNodeContext.sshKeyPath,
-      multiNodeContext.sshPrivateKey,
+      multiNodeContext.sshKeyPath!,
+      multiNodeContext.sshPrivateKey!,
     );
     logger.info({ sessionId, workloadId, keyPath: multiNodeContext.sshKeyPath }, "ensureHands.mn_ssh_key_written");
+  }
+
+  // The topology handoff goes after the key it points at, outside the synced
+  // workspace. During the transition the legacy env is sufficient on its own, so
+  // a write failure is a warning, not a failed sandbox. Only paths are logged.
+  if (multiNodeContext) {
+    const r = await writeTopologyHandoff(
+      (cmd, t) => getSafeWorkloadProvider().exec(inst, cmd, t, undefined, { untracked: true }),
+      multiNodeContext,
+      env,
+    );
+    if (r.written) {
+      logger.info({ sessionId, workloadId, topologyFile: env.TOPOLOGY_HANDOFF_FILE }, "ensureHands.mn_topology_written");
+    } else {
+      logger.warn({ sessionId, workloadId, err: r.error }, "ensureHands.mn_topology_write_failed");
+    }
   }
 
   // Store in NATS KV (shared across Brain instances).
