@@ -335,7 +335,7 @@ test("T15 a sandbox lost after the app finished ends the run, it does not repeat
 
 test("T16 finishing: seams in order, revoke before the sandbox is stopped, then ended", async () => {
   const order: string[] = [];
-  const grant: AppGrantRunHooks = { env: async () => ({}), revoke: async (run) => { order.push(`revoke:${run.runId}`); } };
+  const grant: AppGrantRunHooks = { env: async () => ({}), revoke: async (run) => { order.push(`revoke:${run.runId}`); }, extend: noopAppGrant.extend };
   const seams: AppRunnerSeams = {
     drainEvents: async () => { order.push("drain"); },
     unregisterMcp: async () => { order.push("unregister"); },
@@ -521,6 +521,7 @@ test("E3 the grant hook adds keys and limits through env_map; its keys beat the 
   const grant: AppGrantRunHooks = {
     env: async (run) => { seen.push(run); return { keys: { subrun: KEY_S, measurement: "e2b_overridden-by-the-hook-0123456" }, limits: { max_hours: 4 } }; },
     revoke: async () => undefined,
+    extend: noopAppGrant.extend,
   };
   const h = harness({ grant });
   await until(h, "running");
@@ -542,7 +543,7 @@ test("E4 the default grant hooks do nothing", async () => {
 
 test("E5 the grant is revoked once, at finishing, before the sandbox stops; a failing revoke is retried and then given up on", async () => {
   let calls = 0;
-  const grant: AppGrantRunHooks = { env: async () => ({}), revoke: async () => { calls++; throw new Error("auth down"); } };
+  const grant: AppGrantRunHooks = { env: async () => ({}), revoke: async () => { calls++; throw new Error("auth down"); }, extend: noopAppGrant.extend };
   const h = harness({ grant });
   const wl = await toRunning(h);
   h.world.appExits(wl, finalExit(0));
@@ -633,7 +634,7 @@ test("R3 run() reports a lost lease: the API refuses the write because another w
 
 test("R4 finishNow(cancelled) finishes a running run: SIGTERM, revoke, stop sandbox", async () => {
   const order: string[] = [];
-  const grant: AppGrantRunHooks = { env: async () => ({}), revoke: async () => { order.push("revoke"); } };
+  const grant: AppGrantRunHooks = { env: async () => ({}), revoke: async () => { order.push("revoke"); }, extend: noopAppGrant.extend };
   const h = harness({ grant });
   const wl = await toRunning(h);
   const outcome = await h.runner.finishNow("cancelled");

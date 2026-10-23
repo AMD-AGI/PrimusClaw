@@ -103,15 +103,22 @@ export interface AppGrantEnv {
  * `grantId` already on the row cannot be given a second one. `revoke` is called
  * once per run end, and once more only if a Brain dies between the call and the
  * write that records it, so an implementation must tolerate a repeat.
+ *
+ * `extend` asks the grant to last until `expiresAt` (ISO time, later than the
+ * grant's current expiry) and answers the time it actually granted, which may
+ * be earlier than asked. It is called by {@link AppRunner.extendGrant}, never
+ * for a revoked grant or a time that is not later than the current one.
  */
 export interface AppGrantRunHooks {
   env(run: AppGrantRun): Promise<AppGrantEnv>;
   revoke(run: AppGrantRun): Promise<void>;
+  extend(run: AppGrantRun, expiresAt: string): Promise<{ expiresAt: string }>;
 }
 
 export const noopAppGrant: AppGrantRunHooks = {
   env: async () => ({}),
   revoke: async () => undefined,
+  extend: async (_run, expiresAt) => ({ expiresAt }),
 };
 
 /** What a seam is told. `instance` is null before a sandbox exists. */
@@ -226,6 +233,14 @@ export function backoffMs(manifest: AppManifestV1, restarts: number): number {
 
 const maxRestarts = (m: AppManifestV1): number => m.restart?.max_restarts ?? 0;
 
+export interface GrantExtension {
+  extended: boolean;
+  /** The expiry now stored, when extended. */
+  expiresAt?: string;
+  /** Why not, when not extended; no hook was called for `revoked`, `no_grant` and `not_later`. */
+  reason?: "revoked" | "no_grant" | "not_later" | "failed";
+}
+
 export class AppRunner {
   private rec!: AppRunRecord;
   private inflight: Promise<TickResult> | null = null;
@@ -295,6 +310,48 @@ export class AppRunner {
     const tick = this.tick().finally(() => { this.inflight = null; });
     this.inflight = tick;
     return tick;
+  }
+
+  /**
+   * Extend the run's grant to `expiresAt`, for the run's own deadline having
+   * been extended. Nothing in the app-run path moves that deadline today
+   * (`limits.max_runtime_sec` counts from creation), so no caller exists yet:
+   * whoever adds one calls this, and the run's own extension must not wait on
+   * or fail with it (this never throws).
+   *
+   * Refused without calling the hook when the grant is revoked, `expiresAt` is
+   * not a time, or it is not later than the stored expiry. A hook that throws,
+   * answers something that is not a later time, or a row write that fails,
+   * leaves the stored expiry as it was and is logged as a warning.
+   */
+  async extendGrant(expiresAt: string): Promise<GrantExtension> {
+    const kept = (reason: GrantExtension["reason"]): GrantExtension => ({ extended: false, reason });
+    let rec: AppRunRecord;
+    try {
+      rec = await this.deps.store.load(this.runId);
+    } catch (err) {
+      logger.warn({ runId: this.runId, err: this.safeText(err) }, "app_run.grant_extend_failed");
+      return kept("failed");
+    }
+    const asked = Date.parse(expiresAt);
+    const current = rec.grant_expires_at ? Date.parse(rec.grant_expires_at) : -Infinity;
+    if (rec.grant_revoked_at) return kept("revoked");
+    if (!rec.grant_id) return kept("no_grant");
+    if (!Number.isFinite(asked) || !(asked > current)) return kept("not_later");
+    const run: AppGrantRun = { runId: this.runId, sessionId: rec.session_id, grantId: rec.grant_id, manifest: rec.manifest };
+    try {
+      const granted = await this.grant.extend(run, expiresAt);
+      const at = Date.parse(granted?.expiresAt);
+      if (!Number.isFinite(at) || !(at > current)) {
+        logger.warn({ runId: this.runId, grantId: rec.grant_id }, "app_run.grant_extend_not_later");
+        return kept("failed");
+      }
+      await this.deps.store.patch(this.runId, { grant_expires_at: granted.expiresAt });
+      return { extended: true, expiresAt: granted.expiresAt };
+    } catch (err) {
+      logger.warn({ runId: this.runId, grantId: rec.grant_id, err: this.safeText(err) }, "app_run.grant_extend_failed");
+      return kept("failed");
+    }
   }
 
   /**

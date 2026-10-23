@@ -56,6 +56,10 @@ export interface AppRunRecord {
   manifest: AppManifestV1;
   grant_id: string | null;
   grant_limits: Record<string, unknown> | null;
+  /** ISO time the grant lapses; null when it has no expiry or none was issued. */
+  grant_expires_at: string | null;
+  /** ISO time the grant was revoked; set means it is never extended. */
+  grant_revoked_at: string | null;
   created_at: string;
   input: Record<string, unknown>;
   sandbox_spec: SandboxSpecCreate | null;
@@ -73,6 +77,7 @@ export interface AppRunPatch {
   last_exit?: AppLastExit | null;
   state_dir?: string;
   sandbox_workload_id?: string | null;
+  grant_expires_at?: string;
 }
 
 export interface AppRunStore {

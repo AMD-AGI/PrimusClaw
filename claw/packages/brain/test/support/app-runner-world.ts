@@ -105,6 +105,8 @@ export class World {
       manifest,
       grant_id: null,
       grant_limits: null,
+      grant_expires_at: null,
+      grant_revoked_at: null,
       created_at: new Date(T0).toISOString(),
       input: { image: "img:1", knobs: { mode: "from-input", count: 3 } },
       sandbox_spec: { handle: "app", image: "img:1" } as never,

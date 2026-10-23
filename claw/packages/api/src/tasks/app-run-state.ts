@@ -45,6 +45,10 @@ export interface AppRunView {
   manifest: Record<string, unknown>;
   grant_id: string | null;
   grant_limits: Record<string, unknown> | null;
+  /** ISO time the grant lapses, when one was issued with an expiry. */
+  grant_expires_at: string | null;
+  /** ISO time the grant was revoked; set means it must not be extended. */
+  grant_revoked_at: string | null;
   created_at: string;
   /** From the task row: what the run was asked to do and where. */
   input: Record<string, unknown>;
@@ -63,6 +67,8 @@ interface RunRow {
   manifest: Record<string, unknown>;
   grant_id: string | null;
   grant_limits: Record<string, unknown> | null;
+  grant_expires_at: Date | null;
+  grant_revoked_at: Date | null;
   created_at: Date;
   input: Record<string, unknown>;
   sandbox_spec: Record<string, unknown> | null;
@@ -71,7 +77,7 @@ interface RunRow {
 
 const VIEW_SQL = `
   SELECT r.task_id, r.session_id, r.state, r.restarts, r.last_exit, r.state_dir,
-         r.sandbox_workload_id, r.manifest, r.grant_id, r.grant_limits, r.created_at,
+         r.sandbox_workload_id, r.manifest, r.grant_id, r.grant_limits, r.grant_expires_at, r.grant_revoked_at, r.created_at,
          t.input, t.sandbox_spec, t.workspace_id
     FROM claw_app_runs r JOIN claw_tasks t ON t.task_id = r.task_id`;
 
@@ -87,6 +93,8 @@ function toView(row: RunRow): AppRunView {
     manifest: row.manifest,
     grant_id: row.grant_id,
     grant_limits: row.grant_limits,
+    grant_expires_at: row.grant_expires_at ? row.grant_expires_at.toISOString() : null,
+    grant_revoked_at: row.grant_revoked_at ? row.grant_revoked_at.toISOString() : null,
     created_at: row.created_at.toISOString(),
     input: row.input ?? {},
     sandbox_spec: row.sandbox_spec,
@@ -127,6 +135,8 @@ export interface AppRunPatch {
   last_exit?: Record<string, unknown> | null;
   state_dir?: string;
   sandbox_workload_id?: string | null;
+  /** ISO time; written when the grant hook extends the grant (never cleared here). */
+  grant_expires_at?: string;
 }
 
 export type PatchOutcome =
@@ -182,6 +192,7 @@ export async function patchAppRun(
   if (patch.restarts !== undefined) add("restarts", patch.restarts);
   if (patch.state_dir !== undefined) add("state_dir", patch.state_dir);
   if (patch.sandbox_workload_id !== undefined) add("sandbox_workload_id", patch.sandbox_workload_id);
+  if (patch.grant_expires_at !== undefined) add("grant_expires_at", patch.grant_expires_at, "::timestamptz");
   if (patch.last_exit !== undefined) {
     const scrubbed = patch.last_exit === null
       ? null

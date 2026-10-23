@@ -259,6 +259,26 @@ describe("internal app-run routes", { skip }, () => {
       assert.equal(r.last_exit, null);
     });
 
+    test("grant_expires_at is stored and read back; a bad value is refused and changes nothing", async () => {
+      taskId = await createRun(true);
+      const before = await get(`/v1/internal/app-runs/${taskId}`);
+      assert.equal(before.json().run.grant_revoked_at, null);
+      const T = "2026-03-01T12:00:00.000Z";
+      const ok = await patch(brain({ grant_expires_at: T }));
+      assert.equal(ok.statusCode, 200, ok.body);
+      assert.equal(ok.json().run.grant_expires_at, T);
+      assert.equal(new Date((await row()).grant_expires_at).toISOString(), T);
+      for (const bad of ["tomorrow", "2026-13-45T00:00:00Z", 12345, null, ""]) {
+        const res = await patch(brain({ grant_expires_at: bad }));
+        assert.equal(res.statusCode, 400, `${JSON.stringify(bad)}: ${res.body}`);
+        assert.equal(res.json().error, "grant_expires_at_invalid");
+      }
+      assert.equal(new Date((await row()).grant_expires_at).toISOString(), T, "refusals changed nothing");
+      await q("UPDATE claw_app_runs SET grant_revoked_at = '2026-03-01T13:00:00Z' WHERE task_id = $1", [taskId]);
+      const rev = await get(`/v1/internal/app-runs/${taskId}`);
+      assert.equal(rev.json().run.grant_revoked_at, "2026-03-01T13:00:00.000Z");
+    });
+
     test("an unknown run is 404", async () => {
       const res = await app.inject({ method: "PATCH", url: "/v1/internal/app-runs/nope", headers: auth, payload: brain({ state: "starting" }) });
       assert.equal(res.statusCode, 404);

@@ -38,6 +38,7 @@ function grantSpy(): GrantSpy {
     revokes: [], envs: 0,
     env: async () => { spy.envs++; return { keys: { measurement: "e2b_measurementKEY0123456789abcdef" } }; },
     revoke: async (run) => { spy.revokes.push(run.grantId ?? "none"); },
+    extend: async (_run, expiresAt) => ({ expiresAt }),
     // The runner has no business issuing a grant: the API did, at run creation.
     issue: () => { throw new Error("a grant was issued by the runner"); },
   };
