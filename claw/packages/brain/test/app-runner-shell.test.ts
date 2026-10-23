@@ -21,7 +21,7 @@ import { execFile } from "node:child_process";
 import { mkdtempSync, readFileSync, existsSync, statSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { APP_MANIFEST_SCHEMA, type AppManifestV1 } from "@claw/protocol";
+import { type AppManifestV1 } from "@claw/protocol";
 
 import { AppRunner } from "../src/apps/app-runner.js";
 import { startCommand, generationTag, expandStateDirCommand } from "../src/apps/app-env.js";
