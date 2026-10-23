@@ -19,8 +19,9 @@
  *
  * Only a success is cached. A refusal leaves nothing behind, and the retry
  * the caller makes with the same key is meant to run the checks again -- in
- * particular a grant that failed to issue has to be tried again, under the same
- * grant id.
+ * particular a grant that failed to issue has to be tried again. Each attempt
+ * signs its own new grant id (it is not derived from the key), and an attempt that
+ * does not commit revokes only its own.
  */
 import type { FastifyRequest } from "fastify";
 import pino from "pino";
