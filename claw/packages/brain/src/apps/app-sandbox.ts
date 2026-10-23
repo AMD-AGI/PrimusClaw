@@ -144,6 +144,30 @@ export async function findLiveAppSandboxes(
   throw new Error("app sandbox lookup failed: more workloads than one run can own");
 }
 
+const appSandboxNamespace = (run: Pick<AppSandboxRun, "workspaceId">): string =>
+  run.workspaceId?.trim() || SANDBOX_NAMESPACE;
+
+/**
+ * The handle of an app sandbox whose workload id is already known: a run being
+ * reconciled after a restart or a takeover reads the id from its row and needs
+ * the instance without creating anything.
+ */
+export function appSandboxInstance(
+  run: Pick<AppSandboxRun, "workspaceId" | "platformKey">,
+  workloadId: string,
+): SandboxInstance {
+  const ns = appSandboxNamespace(run);
+  return {
+    provider: "safe-workload",
+    id: workloadId,
+    sandboxName: workloadId,
+    namespace: ns,
+    // An app sandbox has no Hands in it, so there is no Hands URL to give.
+    handsBaseUrl: "",
+    platformKey: run.platformKey,
+  };
+}
+
 /**
  * The run's sandbox: an existing live one, or a fresh one. Returns once the
  * sandbox is Running.
@@ -154,17 +178,10 @@ export async function ensureAppSandbox(run: AppSandboxRun, deps: AppSandboxDeps)
   }
   if (!run.platformKey) throw new Error("ensureAppSandbox: platformKey is required");
   if (!run.sandboxSpec?.image?.trim()) throw new Error("ensureAppSandbox: sandbox_spec has no image");
-  const ns = run.workspaceId?.trim() || SANDBOX_NAMESPACE;
+  const ns = appSandboxNamespace(run);
   const wait = deps.waitRunning ?? ((id, key) => pollWorkloadUntilRunning(id, key));
   // An app sandbox has no Hands in it, so there is no Hands URL to give.
-  const instanceFor = (id: string): SandboxInstance => ({
-    provider: "safe-workload",
-    id,
-    sandboxName: id,
-    namespace: ns,
-    handsBaseUrl: "",
-    platformKey: run.platformKey,
-  });
+  const instanceFor = (id: string): SandboxInstance => appSandboxInstance(run, id);
   const stop = deps.stop ?? ((id: string) => getSafeWorkloadProvider().stop(instanceFor(id)));
   /** Stop a workload nothing else will; a failed stop is logged with the id, never hidden. */
   const reclaim = async (workloadId: string, why: string): Promise<void> => {
