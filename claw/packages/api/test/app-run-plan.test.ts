@@ -37,10 +37,18 @@ test("the request's image wins over the manifest's default; the default is used 
   assert.equal(plan(m, { gpus: 0, workspace: "w" }).sandboxSpec.image, "registry.example.invalid/default:1");
 });
 
-test("container.resources are defaults; zero gpus drops a defaulted GPU key; a request overrides its own key only", () => {
-  const m = manifest({ image: "i", resources: { cpu: "32", memory: "128Gi", "amd.com/gpu": "8", "ephemeral-storage": "500Gi" } });
+test("container.resources are defaults; the GPU key comes from the request only; a request overrides its own key only", () => {
+  const m = manifest({ image: "i", resources: { cpu: "32", memory: "128Gi", "ephemeral-storage": "500Gi" } });
   assert.deepEqual(plan(m, { gpus: 0, workspace: "w", cpu: 4 }).sandboxSpec.resources, { cpu: "4", memory: "128Gi", "ephemeral-storage": "500Gi" });
   assert.deepEqual(plan(m, { gpus: 8, workspace: "w" }).sandboxSpec.resources, { cpu: "32", memory: "128Gi", "amd.com/gpu": "8", "ephemeral-storage": "500Gi" });
+});
+
+test("whatever GPU key a manifest carries is dropped: the spec has one GPU key, from the request", () => {
+  for (const key of ["gpu", "amd.com/gpu", "GPU", "nvidia.com/gpu"]) {
+    const m = manifest({ image: "i", resources: { cpu: "2", [key]: "8" } });
+    assert.deepEqual(plan(m, { gpus: 0, workspace: "w" }).sandboxSpec.resources, { cpu: "2" }, `${key} with gpus=0`);
+    assert.deepEqual(plan(m, { gpus: 2, workspace: "w" }).sandboxSpec.resources, { cpu: "2", "amd.com/gpu": "2" }, `${key} with gpus=2`);
+  }
 });
 
 test("the sandbox workspace is checked as well when it differs", () => {

@@ -360,6 +360,8 @@ export async function createSingleTask(opts: {
   /** SaFE workspace the run's sandbox lands in; the session's own when absent. */
   workspace_id?: string | null;
   workspace_throwaway?: boolean;
+  /** Use this id instead of generating one (the app run issues its grant for it first). */
+  task_id?: string;
 }, client?: PoolClient): Promise<{ task_id: string } | CreateRefusal> {
   const input = opts.input ?? {};
   // An app's input is the application's own document: Claw does not read it,
@@ -383,7 +385,7 @@ export async function createSingleTask(opts: {
   const decision = await decideAdmission(ask, client ?? db);
   if (decision.kind === "reject") return { admitted: false, reason: decision.reason };
 
-  const tid = newTaskId();
+  const tid = opts.task_id ?? newTaskId();
   await insertTask({
     task_id: tid,
     session_id: opts.session_id,

@@ -61,6 +61,9 @@ const GOOD_RES = {
   grant: { max_sandboxes: 1, max_gpus: 8, gpu_hours: 10, max_runtime_sec: 600 },
 };
 
+/** A grant hook that signs nothing but records the limits it was asked for, as the grant's limits. */
+const LIMITS_HOOK = { issue: async (_r: unknown, _m: unknown, req: any) => ({ limits: req.resources.grant }) };
+
 interface Ctx { h: AdmissionCluster; app: FastifyInstance; ports: any; secrets: any; send: (o: any) => Promise<any> }
 
 describe("mode=app task creation", { skip }, () => {
@@ -146,8 +149,9 @@ describe("mode=app task creation", { skip }, () => {
     assert.equal(r.session_id, "s1");
     assert.equal(r.state, "provisioning");
     assert.deepEqual(r.manifest, MANIFEST);
-    assert.deepEqual(r.grant_limits, { max_sandboxes: 1, max_gpus: 8, gpu_hours: 10, max_runtime_sec: 600 },
-      "the effective grant is stored (no cap configured here: the request as it is)");
+    assert.equal(r.grant_limits, null, "no grant was signed, so there are no grant limits to store");
+    assert.equal(r.created_by, "u1");
+    assert.match(r.request_hash, /^[0-9a-f]{64}$/);
     assert.deepEqual(asked, ["ws-ok"], "only the requested workspace is asked about, never one found inside the input");
     assert.equal(r.grant_id, null, "the default hook issues nothing, so no grant is recorded");
     assert.equal(r.grant_keys_enc, null);
@@ -376,14 +380,16 @@ describe("mode=app task creation", { skip }, () => {
       });
       test("a request above the platform cap gets the cap, item by item, and the cap is what is stored", async () => {
         ctx.ports.caps = () => ({ max_sandboxes: 3, max_gpus: 4, gpu_hours: 5, max_runtime_sec: 7200 });
+        ctx.ports.grant = LIMITS_HOOK;
         const res = await create("s1", { resources: { ...GOOD_RES, grant: { max_sandboxes: 50, max_gpus: 2, gpu_hours: 1e6, max_runtime_sec: 99999 } } });
         assert.equal(res.statusCode, 200, res.body);
         const r = (await q("SELECT grant_limits FROM claw_app_runs")).rows[0] as any;
         assert.deepEqual(r.grant_limits, {
-          max_sandboxes: 3, max_gpus: 2, gpu_hours: 5, max_runtime_sec: 7200,
-        }, "max_sandboxes and gpu_hours clamped, max_gpus below its cap kept, runtime = min(request, manifest 7200, cap 7200)");
+          max_sandboxes: 2, max_gpus: 2, gpu_hours: 5, max_runtime_sec: 7200,
+        }, "max_sandboxes = min(request 50, manifest 2, cap 3); gpu_hours clamped, max_gpus below its cap kept, runtime = min(request, manifest 7200, cap 7200)");
       });
       test("absent items take the manifest defaults", async () => {
+        ctx.ports.grant = LIMITS_HOOK;
         const res = await create("s1", { resources: { image: "i:1", gpus: 0, workspace: "ws-ok" } });
         assert.equal(res.statusCode, 200, res.body);
         const r = (await q("SELECT grant_limits FROM claw_app_runs")).rows[0] as any;
@@ -392,6 +398,7 @@ describe("mode=app task creation", { skip }, () => {
         assert.deepEqual(t.sandbox_spec, { handle: "app", image: "i:1", namespace: "ws-ok", resources: { cpu: "32", memory: "128Gi" } });
       });
       test("the input does not affect the resources: same request, different input, same run shape", async () => {
+        ctx.ports.grant = LIMITS_HOOK;
         const shapes: unknown[] = [];
         for (const input of [GOOD_INPUT, { note: "clean" }, { placement: { gpus: 0 }, framework: { image: "x" }, resources: { gpus: 1 } }, {}]) {
           await q("DELETE FROM claw_app_runs"); await q("DELETE FROM claw_tasks");
@@ -404,6 +411,21 @@ describe("mode=app task creation", { skip }, () => {
         for (const x of shapes) assert.deepEqual(x, shapes[0]);
       });
     });
+    test("every workspace is asked at once, and the refusal follows the order they were named in", async () => {
+      const started: string[] = [];
+      let release!: () => void;
+      const gate = new Promise<void>((r) => { release = r; });
+      ctx.ports.workspaceAccess = async (_a: unknown, ws: string) => {
+        started.push(ws);
+        if (started.length === 2) release();
+        await gate; // returns only once both calls are in flight: serial asking would never get here
+        return ws === "ws-ok" ? "ok" : "forbidden";
+      };
+      const res = await create("s1", { resources: { ...GOOD_RES, sandbox_workspace: "ws-denied" } });
+      assert.equal(res.statusCode, 403, res.body);
+      assert.deepEqual(started.sort(), ["ws-denied", "ws-ok"]);
+      assert.equal(res.json().workspace, "ws-denied");
+    });
     test("SaFE cannot be asked", async () => {
       ctx.ports.workspaceAccess = async () => { throw new (await import("../src/tasks/app-run.js")).WorkspaceCheckUnavailableError("x"); };
       const res = await create("s1");
@@ -414,6 +436,118 @@ describe("mode=app task creation", { skip }, () => {
       assert.equal(res.statusCode, 403);
       assert.deepEqual(await counts(), { tasks: 0, runs: 0 });
       assert.equal((await create("no-such-session")).statusCode, 404);
+    });
+  });
+
+  describe("replay", () => {
+    test("the same key and the same request replay, whatever order its keys were written in", async () => {
+      const a = await create("s1", { input: { a: 1, b: { c: 2, d: 3 } } }, { "idempotency-key": "r-1" });
+      const b = await create("s1", { input: { b: { d: 3, c: 2 }, a: 1 } }, { "idempotency-key": "r-1" });
+      assert.equal(a.statusCode, 200); assert.equal(b.statusCode, 200);
+      assert.equal(b.json().task_id, a.json().task_id);
+    });
+    for (const cache of ["cached", "cache lost"]) {
+      test(`the same key with a different input is refused (${cache})`, async () => {
+        const a = await create("s1", { input: { n: 1 } }, { "idempotency-key": "r-2" });
+        assert.equal(a.statusCode, 200);
+        if (cache === "cache lost") await q("DELETE FROM claw_idempotency_keys");
+        const b = await create("s1", { input: { n: 2 } }, { "idempotency-key": "r-2" });
+        assert.equal(b.statusCode, 422, b.body);
+        assert.equal(b.json().error, "idempotency_key_reused");
+        assert.deepEqual(await counts(), { tasks: 1, runs: 1 });
+      });
+    }
+    test("the same key with different resources is refused", async () => {
+      await create("s1", {}, { "idempotency-key": "r-3" });
+      const b = await create("s1", { resources: { ...GOOD_RES, gpus: 4 } }, { "idempotency-key": "r-3" });
+      assert.equal(b.statusCode, 422, b.body);
+    });
+    test("a key that another principal created is refused, cached or not", async () => {
+      // The route's session-ownership check already turns other users away at the
+      // door (403), so this row can only be reached through shared access to a
+      // session; the replay refuses it anyway rather than rely on that.
+      const a = await create("s1", {}, { "idempotency-key": "r-4" });
+      assert.equal(a.statusCode, 200);
+      await q("UPDATE claw_app_runs SET created_by = 'u2'");
+      for (const lose of [false, true]) {
+        if (lose) await q("DELETE FROM claw_idempotency_keys");
+        const b = await create("s1", {}, { "idempotency-key": "r-4" });
+        assert.equal(b.statusCode, 409, b.body);
+        assert.equal(b.json().error, "idempotency_key_conflict");
+        assert.ok(!b.body.includes(a.json().task_id), "the other run's id is not disclosed");
+      }
+      assert.deepEqual(await counts(), { tasks: 1, runs: 1 });
+    });
+  });
+
+  describe("grant lifecycle", () => {
+    const hook = (over: Record<string, unknown> = {}) => {
+      const log: Array<{ op: string; run: any; during?: any }> = [];
+      ctx.ports.grant = {
+        issue: async (run: any) => {
+          // Not inside the admission transaction: no task row yet, no open
+          // transaction on this database holding the admission lock.
+          const t = (await q("SELECT 1 FROM claw_tasks WHERE task_id = $1", [run.taskId])).rowCount;
+          const idle = (await q("SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname = current_database() AND state = 'idle in transaction'")).rows[0] as any;
+          log.push({ op: "issue", run, during: { task: t, openTransactions: idle.n } });
+          return { limits: { x: 1 } };
+        },
+        revoke: async (run: any) => { log.push({ op: "revoke", run }); },
+        ...over,
+      };
+      return log;
+    };
+    test("issue runs before the task exists and outside any open transaction; the task takes the id it was given", async () => {
+      const log = hook();
+      const res = await create("s1");
+      assert.equal(res.statusCode, 200, res.body);
+      assert.deepEqual(log.map((l) => l.op), ["issue"], "nothing is revoked on success");
+      assert.deepEqual(log[0]!.during, { task: 0, openTransactions: 0 });
+      assert.equal(log[0]!.run.taskId, res.json().task_id);
+    });
+    test("a transaction that fails after the grant was signed revokes it", async () => {
+      const log = hook();
+      caller = { ...OWNER, platformKey: "", virtualKey: "" } as typeof caller;
+      const res = await create("s1");
+      assert.equal(res.statusCode, 403, res.body);
+      assert.deepEqual(await counts(), { tasks: 0, runs: 0 });
+      assert.deepEqual(log.map((l) => l.op), ["issue", "revoke"]);
+      assert.equal(log[1]!.run.grantId, log[0]!.run.grantId);
+    });
+    test("a revoke that throws does not change the answer", async () => {
+      const log = hook({ revoke: async () => { throw new Error("revoke down"); } });
+      caller = { ...OWNER, platformKey: "", virtualKey: "" } as typeof caller;
+      const res = await create("s1");
+      assert.equal(res.statusCode, 403, res.body);
+      assert.equal(log.length, 1);
+    });
+    test("a run already active is refused before any grant is signed", async () => {
+      const log = hook();
+      assert.equal((await create("s1")).statusCode, 200);
+      log.length = 0;
+      const again = await create("s1");
+      assert.equal(again.statusCode, 409, again.body);
+      assert.deepEqual(log, [], "no issue, no revoke");
+    });
+    test("an issue that throws answers 503, writes nothing and asks for a revoke of whatever it signed", async () => {
+      const log = hook({ issue: async (run: any) => { log.push({ op: "issue", run }); throw new Error("boom"); } });
+      const res = await create("s1");
+      assert.equal(res.statusCode, 503, res.body);
+      assert.equal(res.json().error, "grant_issue_failed");
+      assert.deepEqual(await counts(), { tasks: 0, runs: 0 });
+      assert.deepEqual(log.map((l) => l.op), ["issue", "revoke"]);
+    });
+    test("grant_limits is written exactly when a grant was signed", async () => {
+      ctx.ports.grant = original.grant;
+      assert.equal((await create("s1")).statusCode, 200);
+      const none = (await q("SELECT grant_id, grant_limits FROM claw_app_runs")).rows[0] as any;
+      assert.deepEqual([none.grant_id, none.grant_limits], [null, null]);
+      await q("DELETE FROM claw_app_runs"); await q("DELETE FROM claw_tasks");
+      hook();
+      assert.equal((await create("s1")).statusCode, 200);
+      const some = (await q("SELECT grant_id, grant_limits FROM claw_app_runs")).rows[0] as any;
+      assert.ok(some.grant_id);
+      assert.deepEqual(some.grant_limits, { x: 1 });
     });
   });
 

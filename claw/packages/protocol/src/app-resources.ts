@@ -26,6 +26,11 @@ import type { AppManifestV1 } from "./app-manifest.js";
 
 /** The GPU resource name a sandbox spec carries. */
 export const APP_GPU_RESOURCE = "amd.com/gpu";
+/**
+ * The spelling of a GPU count that admission counts as "this pod wants GPUs". Used by
+ * the TypeScript read and bound into the SQL aggregate, so the two cannot differ.
+ */
+export const APP_GPU_COUNT_PATTERN = "^[1-9][0-9]*$";
 
 /**
  * A grant request, an effective grant and a platform cap all have this shape:

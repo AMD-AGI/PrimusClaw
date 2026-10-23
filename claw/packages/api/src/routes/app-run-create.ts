@@ -28,7 +28,7 @@ import type { UserInfo } from "../auth/models.js";
 import { connectionLost, db } from "../infra/db.js";
 import { singleflightCreate, type FlightResult } from "../shared/singleflight.js";
 import {
-  admitAppRun, findAppRunByIdempotencyKey, type AppRunOutcome, type CallerAuth,
+  admitAppRun, appRunRequestHash, findAppRunByIdempotencyKey, type AppRunByKey, type AppRunOutcome, type CallerAuth,
 } from "../tasks/app-run.js";
 import {
   acquireIdempotencyLock, extractIdempotencyKey, IDEM_BUSY_POLL_MS, IDEM_BUSY_POLL_TRIES,
@@ -71,7 +71,27 @@ export async function createAppRun(
   const userId = user.userId;
   const route = `POST /v1/sessions/${sessionId}/tasks`;
   let lock: IdempotencyLock | null = null;
-  const replay = (taskId: string): FlightResult => ({ statusCode: 200, response: { ok: true, task_id: taskId } });
+  const requestHash = appRunRequestHash(body);
+  // A replay answers with the run the key created, but only to the user who
+  // created it and for the same request: another user's key, or the same key
+  // reused for a different plugin, input or resources, is refused rather than
+  // answered with a run that is not what was asked for.
+  const replay = (row: AppRunByKey): FlightResult => {
+    if (row.createdBy !== null && row.createdBy !== userId) {
+      return { statusCode: 409, response: { ok: false, error: "idempotency_key_conflict", message: "this Idempotency-Key belongs to another request" } };
+    }
+    if (row.requestHash !== null && row.requestHash !== requestHash) {
+      return { statusCode: 422, response: { ok: false, error: "idempotency_key_reused", message: "this Idempotency-Key was used with a different request body" } };
+    }
+    return { statusCode: 200, response: { ok: true, task_id: row.taskId } };
+  };
+  // A cached 200 is checked against the run row too: the cache does not carry
+  // the request, the row does.
+  const cached = async (hit: { statusCode: number; response: unknown }): Promise<FlightResult> => {
+    if (hit.statusCode !== 200) return { statusCode: hit.statusCode, response: hit.response };
+    const row = await findAppRunByIdempotencyKey(sessionId, idemKey);
+    return row ? replay(row) : { statusCode: hit.statusCode, response: hit.response };
+  };
 
   const execute = async (): Promise<FlightResult> => {
     try {
@@ -79,7 +99,7 @@ export async function createAppRun(
       if (!lock) {
         for (let i = 0; i < IDEM_BUSY_POLL_TRIES; i++) {
           const busy = await readIdempotency(db, userId, route, idemKey);
-          if (busy) return { statusCode: busy.statusCode, response: busy.response };
+          if (busy) return await cached(busy);
           const row = await findAppRunByIdempotencyKey(sessionId, idemKey);
           if (row) return replay(row);
           await sleep(IDEM_BUSY_POLL_MS);
@@ -90,11 +110,11 @@ export async function createAppRun(
         };
       }
       const hit = await readIdempotency(lock.client, userId, route, idemKey);
-      if (hit) return { statusCode: hit.statusCode, response: hit.response };
+      if (hit) return await cached(hit);
       const existing = await findAppRunByIdempotencyKey(sessionId, idemKey);
       if (existing) {
         const r = replay(existing);
-        await saveIdempotencyBestEffort(lock, userId, route, idemKey, 200, r.response);
+        if (r.statusCode === 200) await saveIdempotencyBestEffort(lock, userId, route, idemKey, 200, r.response);
         return r;
       }
       // Nothing durable exists yet, so this is the last point at which a lost

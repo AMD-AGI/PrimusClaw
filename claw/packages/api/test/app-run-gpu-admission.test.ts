@@ -53,6 +53,29 @@ describe("app run GPU admission", { skip }, () => {
   after(async () => { await app?.close(); await h?.stop(); });
   beforeEach(async () => { await q("DELETE FROM claw_app_runs"); await q("DELETE FROM claw_tasks"); });
 
+  test("a manifest cannot hand its pod GPUs behind admission's back: any GPU key in container.resources is refused", async () => {
+    for (const key of ["gpu", "amd.com/gpu"]) {
+      const p = Number(((await q(
+        `INSERT INTO plugins (name, version, resource, owner_user_id, is_public)
+         VALUES ($1, '1', $2::jsonb, 'u1', true) RETURNING id`,
+        [`gpukey-${key}`, JSON.stringify({ app: { manifest: { ...MANIFEST, container: { resources: { [key]: "8" } } } } })],
+      )).rows[0] as { id: string }).id);
+      const r = await app.inject({
+        method: "POST", url: "/v1/sessions/s1/tasks",
+        payload: { mode: "app", plugin_id: p, input: {}, resources: res(0) },
+      });
+      assert.equal(r.statusCode, 422, r.body);
+      assert.equal(r.json().error, "app_manifest_invalid");
+      assert.ok(r.json().issues.some((i: any) => i.path === `container.resources.${key}`), r.body);
+    }
+    const rows = (await q("SELECT count(*)::int AS n FROM claw_tasks")).rows[0] as any;
+    assert.equal(rows.n, 0);
+    // Admission still sees exactly the GPUs the request named.
+    assert.equal((await create("s1", res(8))).statusCode, 200);
+    const spec = (await q("SELECT sandbox_spec FROM claw_tasks")).rows[0] as any;
+    assert.deepEqual(spec.sandbox_spec.resources, { "amd.com/gpu": "8" });
+  });
+
   test("a run asking for GPUs holds a GPU node; the next one over the ceiling is refused", async () => {
     assert.equal((await create("s1", res(8))).statusCode, 200);
     const second = await create("s2", res(8));
