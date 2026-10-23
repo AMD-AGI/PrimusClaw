@@ -54,7 +54,7 @@ test("every schema-required field is enforced by the validator", () => {
 
 test("rejects unknown fields, wrong schema string and bad numbers", () => {
   assert.ok(validateTopologyHandoff({ ...FULL, extra: 1 }).length > 0);
-  assert.ok(validateTopologyHandoff({ ...FULL, schema: "claw.topology-handoff/v2" }).length > 0);
+  assert.ok(validateTopologyHandoff({ ...FULL, schema: "topology-handoff/v2" }).length > 0);
   assert.ok(validateTopologyHandoff({ ...FULL, nodes: 0 }).length > 0);
   assert.ok(validateTopologyHandoff({ ...FULL, gpus_per_node: 1.5 }).length > 0);
   assert.ok(validateTopologyHandoff({ ...FULL, infera: { ...FULL.infera, ssh_port_base: 70000 } }).length > 0);
