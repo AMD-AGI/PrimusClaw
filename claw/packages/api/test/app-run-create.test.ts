@@ -83,7 +83,7 @@ describe("mode=app task creation", { skip }, () => {
   before(async () => {
     assert.deepEqual(validateAppManifest(MANIFEST), [], "the fixture manifest must be valid, or every refusal below is vacuous");
     process.env.CLAW_DEPLOY_MODE = "safe";
-    ctx.h = await startAdmissionCluster({ APP_RUNS_ENABLED: "true" });
+    ctx.h = await startAdmissionCluster({ APP_RUNS_ENABLED: "true", APP_GRANT_ISSUE_TIMEOUT_MS: "400" });
     (await import("../src/crypto/user-env.js")).initUserEnvCrypto();
     ctx.ports = (await import("../src/tasks/app-run.js")).appRunPorts;
     ctx.secrets = await import("../src/crypto/app-run-secrets.js");
@@ -118,6 +118,8 @@ describe("mode=app task creation", { skip }, () => {
     original.grant ??= ctx.ports.grant;
     ctx.ports.enabled = () => true;
     ctx.ports.caps = original.caps;
+    original.containerCaps ??= ctx.ports.containerCaps;
+    ctx.ports.containerCaps = original.containerCaps;
     asked.length = 0;
     ctx.ports.workspaceAccess = async (_a: unknown, ws: string) => (asked.push(ws), ws === "ws-ok") ? "ok" : ws === "ws-missing" ? "not_found" : "forbidden";
     ctx.ports.grant = original.grant;
@@ -480,6 +482,56 @@ describe("mode=app task creation", { skip }, () => {
     });
   });
 
+  describe("replay of rows that cannot be attributed", () => {
+    for (const col of ["created_by", "request_hash"]) {
+      test(`a row with NULL ${col} is not replayed to anyone, cached or not`, async () => {
+        const a = await create("s1", {}, { "idempotency-key": "r-null" });
+        assert.equal(a.statusCode, 200);
+        await q(`UPDATE claw_app_runs SET ${col} = NULL`);
+        for (const lose of [false, true]) {
+          if (lose) await q("DELETE FROM claw_idempotency_keys");
+          const b = await create("s1", {}, { "idempotency-key": "r-null" });
+          assert.equal(b.statusCode, 409, b.body);
+          assert.ok(!b.body.includes(a.json().task_id));
+        }
+      });
+    }
+  });
+
+  describe("container caps", () => {
+    const problems = (res: any) => res.json().problems.map((p: any) => p.field);
+    test("gpus above one node is a 400 naming the field, and nothing is written", async () => {
+      const res = await create("s1", { resources: { ...GOOD_RES, gpus: 100000 } });
+      assert.equal(res.statusCode, 400, res.body);
+      assert.deepEqual(problems(res), ["resources.gpus"]);
+      assert.deepEqual(await counts(), { tasks: 0, runs: 0 });
+    });
+    test("cpu and memory above the caps, and exponent forms, are 400s", async () => {
+      for (const [k, v] of [["cpu", 1e21], ["cpu", 100000], ["memory_gi", 1e-7], ["memory_gi", 100000]] as const) {
+        const res = await create("s1", { resources: { ...GOOD_RES, [k]: v, grant: undefined } });
+        assert.equal(res.statusCode, 400, `${k}=${v}: ${res.body}`);
+        assert.deepEqual([...new Set(problems(res))], [`resources.${k}`]);
+      }
+    });
+    test("configured caps replace the defaults", async () => {
+      ctx.ports.containerCaps = () => ({ gpus: 16, cpu: 256, memory_gi: 4096 });
+      assert.equal((await create("s1", { resources: { ...GOOD_RES, gpus: 16 } })).statusCode, 200);
+    });
+  });
+
+  describe("caller credential", () => {
+    test("the forwarded credential is the one the middleware accepts, in its order", async () => {
+      const { callerAuthOf } = await import("../src/routes/app-run-create.js");
+      const req = (headers: Record<string, unknown>, cookies: Record<string, string> = {}) => ({ headers, cookies }) as any;
+      assert.deepEqual(callerAuthOf(req({ authorization: "Bearer gateway-token", "x-api-key": "ak-user" })), { authorization: "Bearer ak-user" });
+      assert.deepEqual(callerAuthOf(req({ authorization: "Bearer ak-b", "x-api-key": "ak-x" })), { authorization: "Bearer ak-b" });
+      assert.deepEqual(callerAuthOf(req({ "x-api-key": ["ak-first", "ak-second"] })), { authorization: "Bearer ak-first" });
+      assert.deepEqual(callerAuthOf(req({ cookie: "Token=t; userType=default", authorization: "Bearer ak-b" }, { Token: "t" })), { cookie: "Token=t; userType=default" });
+      assert.deepEqual(callerAuthOf(req({ authorization: "Bearer gateway-token" })), {});
+      assert.deepEqual(callerAuthOf(req({})), {});
+    });
+  });
+
   describe("grant lifecycle", () => {
     const hook = (over: Record<string, unknown> = {}) => {
       const log: Array<{ op: string; run: any; during?: any }> = [];
@@ -506,32 +558,113 @@ describe("mode=app task creation", { skip }, () => {
       assert.equal(log[0]!.run.taskId, res.json().task_id);
     });
     test("a transaction that fails after the grant was signed revokes it", async () => {
+      // Make the transaction fail for real: a second run for the session appears while this one is signing.
+      const log = hook();
+      const inner = ctx.ports.grant;
+      ctx.ports.grant = {
+        ...inner,
+        issue: async (run: any, m: unknown, r: unknown) => {
+          const out = await inner.issue(run, m, r);
+          ctx.ports.grant = original.grant;
+          await create("s1", {}, { "idempotency-key": "k-inner" });
+          ctx.ports.grant = { ...inner, issue: inner.issue };
+          return out;
+        },
+      };
+      const res = await create("s1");
+      assert.equal(res.statusCode, 409, res.body);
+      assert.deepEqual(log.map((l) => l.op), ["issue", "revoke"]);
+      assert.equal(log[1]!.run.grantId, log[0]!.run.grantId);
+    });
+    test("every attempt signs its own id, and a refused attempt revokes only that id", async () => {
+      const issued: string[] = [], revoked: string[] = [];
+      ctx.ports.grant = {
+        issue: async (run: any) => {
+          issued.push(run.grantId);
+          if (issued.length === 1) {
+            // Another attempt for the same session wins while this one is signing.
+            const other = ctx.ports.grant;
+            ctx.ports.grant = { issue: async (r: any) => { issued.push(r.grantId); return { limits: {} }; }, revoke: async (r: any) => { revoked.push(r.grantId); } };
+            assert.equal((await create("s1", {}, { "idempotency-key": "k-other" })).statusCode, 200);
+            ctx.ports.grant = other;
+          }
+          return { limits: {} };
+        },
+        revoke: async (run: any) => { revoked.push(run.grantId); },
+      };
+      const loser = await create("s1", {}, { "idempotency-key": "k-loser" });
+      assert.equal(loser.statusCode, 409, loser.body);
+      assert.equal(issued.length, 2);
+      assert.notEqual(issued[0], issued[1]);
+      assert.deepEqual(revoked, [issued[0]], "the loser revoked its own id and not the winner's");
+      const rows = (await q("SELECT grant_id FROM claw_app_runs")).rows as any[];
+      assert.deepEqual(rows.map((r) => r.grant_id), [issued[1]], "the winner's grant is the recorded one");
+    });
+    test("a retry after a refusal never re-issues the revoked id", async () => {
+      const issued: string[] = [], revoked: string[] = [];
+      let occupy = true;
+      ctx.ports.grant = {
+        issue: async (run: any) => {
+          issued.push(run.grantId);
+          if (occupy) {
+            occupy = false;
+            const hold = ctx.ports.grant;
+            ctx.ports.grant = original.grant;
+            assert.equal((await create("s1", {}, { "idempotency-key": "k-holder" })).statusCode, 200);
+            ctx.ports.grant = hold;
+          }
+          return { limits: {} };
+        },
+        revoke: async (run: any) => { revoked.push(run.grantId); },
+      };
+      const first = await create("s1", {}, { "idempotency-key": "k-retry" });
+      assert.equal(first.statusCode, 409);
+      await q("DELETE FROM claw_app_runs"); await q("DELETE FROM claw_tasks");
+      const second = await create("s1", {}, { "idempotency-key": "k-retry" });
+      assert.equal(second.statusCode, 200, second.body);
+      assert.equal(issued.length, 2);
+      assert.ok(!issued.slice(1).some((id) => revoked.includes(id)), "no id is issued after it was revoked");
+    });
+    test("a grant service that hangs is cut off: 503, aborted, revoked", async () => {
+      let aborted = false;
+      const revoked: string[] = [];
+      ctx.ports.grant = {
+        issue: (run: any, _m: unknown, _r: unknown, signal: AbortSignal) => new Promise(() => { signal.addEventListener("abort", () => { aborted = true; }); }),
+        revoke: async (run: any) => { revoked.push(run.grantId); },
+      };
+      const t0 = Date.now();
+      const res = await create("s1");
+      assert.equal(res.statusCode, 503, res.body);
+      assert.equal(res.json().error, "grant_issue_failed");
+      assert.ok(Date.now() - t0 < 5000, "the request did not wait for ever");
+      assert.equal(aborted, true);
+      assert.equal(revoked.length, 1);
+      assert.deepEqual(await counts(), { tasks: 0, runs: 0 });
+    });
+    test("a caller with no platform key is refused before any grant is signed", async () => {
       const log = hook();
       caller = { ...OWNER, platformKey: "", virtualKey: "" } as typeof caller;
       const res = await create("s1");
       assert.equal(res.statusCode, 403, res.body);
-      assert.deepEqual(await counts(), { tasks: 0, runs: 0 });
-      assert.deepEqual(log.map((l) => l.op), ["issue", "revoke"]);
-      assert.equal(log[1]!.run.grantId, log[0]!.run.grantId);
-    });
-    test("a grant is not revoked while a run under the same Idempotency-Key owns it", async () => {
-      // The grant id comes from the key, so a run another attempt committed under
-      // the same key (this attempt's lock lost during the grant call) shares it.
-      const { revokeUnlessRecorded, deriveGrantId } = await import("../src/tasks/app-run.js");
-      assert.equal((await create("s1", {}, { "idempotency-key": "r-9" })).statusCode, 200);
-      const calls: string[] = [];
-      const ports = { grant: { revoke: async (r: any) => { calls.push(r.grantId); } } } as any;
-      const loser = { grantId: deriveGrantId("s1", "r-9"), taskId: "task-that-never-existed", sessionId: "s1", userId: "u1", pluginId: goodPlugin };
-      await revokeUnlessRecorded(ports, loser, { limits: {} }, "r-9");
-      assert.deepEqual(calls, [], "the live run's grant is left alone");
-      await revokeUnlessRecorded(ports, { ...loser, grantId: "grt_other" }, { limits: {} }, "r-other");
-      assert.deepEqual(calls, ["grt_other"], "an unrelated unrecorded grant is revoked");
+      assert.equal(res.json().error, "missing_platform_key");
+      assert.deepEqual(log, [], "no issue, no revoke");
     });
     test("a revoke that throws does not change the answer", async () => {
       const log = hook({ revoke: async () => { throw new Error("revoke down"); } });
-      caller = { ...OWNER, platformKey: "", virtualKey: "" } as typeof caller;
+      const inner = ctx.ports.grant;
+      ctx.ports.grant = {
+        ...inner,
+        issue: async (run: any, m: unknown, r: unknown) => {
+          const out = await inner.issue(run, m, r);
+          const keep = ctx.ports.grant;
+          ctx.ports.grant = original.grant;
+          await create("s1", {}, { "idempotency-key": "k-inner2" });
+          ctx.ports.grant = keep;
+          return out;
+        },
+      };
       const res = await create("s1");
-      assert.equal(res.statusCode, 403, res.body);
+      assert.equal(res.statusCode, 409, res.body);
       assert.equal(log.length, 1);
     });
     test("a run already active is refused before any grant is signed", async () => {
@@ -574,7 +707,7 @@ describe("mode=app task creation", { skip }, () => {
       assert.deepEqual(await counts(), { tasks: 0, runs: 0 });
     });
 
-    test("a retry under the same key reuses the grant id; the grant is recorded sealed", async () => {
+    test("a retry under the same key signs a new grant; the committed one is recorded sealed", async () => {
       const seen: any[] = [];
       let fail = true;
       ctx.ports.grant = {
@@ -594,8 +727,8 @@ describe("mode=app task creation", { skip }, () => {
       const b = await create("s1", {}, { "idempotency-key": "grant-key" });
       assert.equal(b.statusCode, 200, b.body);
       assert.equal(seen.length, 2);
-      assert.equal(seen[0].run.grantId, seen[1].run.grantId);
-      assert.match(seen[1].run.grantId, /^grt_[0-9a-f]{32}$/);
+      assert.notEqual(seen[0].run.grantId, seen[1].run.grantId, "an attempt never re-issues an id an earlier attempt used");
+      assert.match(seen[1].run.grantId, /^grt_[0-9a-z]{26}$/);
       assert.deepEqual(seen[1].manifest, MANIFEST);
       assert.ok(!JSON.stringify(seen[1]).includes("attacker.example"), "the grant hook is never given the input");
       assert.equal(seen[1].request.resources.image, GOOD_RES.image);

@@ -255,17 +255,13 @@ export async function loadUsageAhead(
        COUNT(DISTINCT COALESCE(t.dag_root_task_id, t.task_id))::int AS run_roots,
        COUNT(*) FILTER (WHERE ${SANDBOX_ROW_SQL.replace(/\b(sandbox_spec|metadata)\b/g, "t.$1")})::int
          AS sandboxes,
-       LEAST(COALESCE(SUM(
-         CASE WHEN jsonb_typeof(t.input->'topology'->'nodes') = 'number'
-              THEN LEAST((t.input->'topology'->>'nodes')::numeric, ${PG_INT4_MAX})
-              ELSE 0 END
-       ), 0), ${PG_INT4_MAX})::int AS gpu_nodes
+       LEAST(COALESCE(SUM(${gpuNodesSql("t.", "$3", "$4")}), 0), ${PG_INT4_MAX})::int AS gpu_nodes
      FROM claw_tasks t, self
       WHERE t.executor = 'brain'
         AND t.status = ANY($1::text[])
         AND t.task_id <> self.task_id
         AND (t.created_at, t.task_id) < (self.created_at, self.task_id)`,
-    [OCCUPYING, taskId],
+    [OCCUPYING, taskId, APP_GPU_RESOURCE, APP_GPU_COUNT_PATTERN],
   );
   const row = (r.rows[0] ?? {}) as { run_roots?: number; sandboxes?: number; gpu_nodes?: number };
   return {
@@ -423,16 +419,27 @@ const SANDBOX_ROW_SQL = `sandbox_spec IS NOT NULL AND sandbox_spec::text <> '"no
  * admission. `COALESCE` around the `SUM` because `LEAST` ignores NULL and would
  * read an empty set as the cap.
  */
+/**
+ * The GPU nodes one `claw_tasks` row holds, in SQL; the single rule both the
+ * running totals ({@link gpuSumSql}) and the rows-ahead count
+ * ({@link loadUsageAhead}) use, so the two cannot disagree. An app run's demand
+ * is its sandbox spec's (one node when it asks for any GPUs): its input is the
+ * app's own document and is never read. Every other row is its declared
+ * `topology.nodes`. `prefix` is a table alias with its dot, or "".
+ */
+function gpuNodesSql(prefix: string, keyParam: string, patternParam: string): string {
+  return `CASE
+           WHEN ${prefix}mode = 'app'
+           THEN CASE WHEN ${prefix}sandbox_spec->'resources'->>${keyParam}::text ~ ${patternParam}::text THEN 1 ELSE 0 END
+           WHEN jsonb_typeof(${prefix}input->'topology'->'nodes') = 'number'
+           THEN LEAST((${prefix}input->'topology'->>'nodes')::numeric, ${PG_INT4_MAX})
+           ELSE 0
+         END`;
+}
+
 function gpuSumSql(statusParam: string, keyParam: string, patternParam: string): string {
   return `LEAST(COALESCE(SUM(
-         CASE
-           WHEN status = ANY(${statusParam}::text[]) AND mode = 'app'
-           THEN CASE WHEN sandbox_spec->'resources'->>${keyParam}::text ~ ${patternParam}::text THEN 1 ELSE 0 END
-           WHEN status = ANY(${statusParam}::text[])
-            AND jsonb_typeof(input->'topology'->'nodes') = 'number'
-           THEN LEAST((input->'topology'->>'nodes')::numeric, ${PG_INT4_MAX})
-           ELSE 0
-         END
+         CASE WHEN status = ANY(${statusParam}::text[]) THEN ${gpuNodesSql("", keyParam, patternParam)} ELSE 0 END
        ), 0), ${PG_INT4_MAX})::int`;
 }
 

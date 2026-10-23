@@ -25,6 +25,7 @@
 import type { FastifyRequest } from "fastify";
 import pino from "pino";
 import type { UserInfo } from "../auth/models.js";
+import { isApiKey } from "../auth/safe-client.js";
 import { connectionLost, db } from "../infra/db.js";
 import { singleflightCreate, type FlightResult } from "../shared/singleflight.js";
 import {
@@ -40,15 +41,25 @@ const logger = pino({ name: "app-run-create" });
 const inflightAppCreates = new Map<string, Promise<FlightResult>>();
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** The caller's own credentials, to be asked of SaFE on the caller's behalf. */
+/**
+ * The caller's own credential, the one the auth middleware actually accepted, to
+ * be asked of SaFE on the caller's behalf. The middleware tries, in order: the
+ * session cookie (`Token`), `Authorization: Bearer ak-...`, then `x-api-key`
+ * (first value, `ak-...`). Forwarding the first thing that is present instead
+ * would, for a gateway's own Bearer token beside the user's `x-api-key`, ask SaFE
+ * with a credential that was never the caller's.
+ */
 export function callerAuthOf(req: FastifyRequest): CallerAuth {
-  const auth: CallerAuth = {};
+  const cookies = req.cookies as Record<string, string> | undefined;
+  if (cookies?.Token && typeof req.headers.cookie === "string") return { cookie: req.headers.cookie };
   const authorization = req.headers.authorization;
-  const apiKey = req.headers["x-api-key"];
-  if (typeof authorization === "string" && authorization) auth.authorization = authorization;
-  else if (typeof apiKey === "string" && apiKey) auth.authorization = `Bearer ${apiKey}`;
-  if (typeof req.headers.cookie === "string" && req.headers.cookie) auth.cookie = req.headers.cookie;
-  return auth;
+  if (typeof authorization === "string" && authorization.startsWith("Bearer ") && isApiKey(authorization.slice(7))) {
+    return { authorization };
+  }
+  const header = req.headers["x-api-key"];
+  const apiKey = Array.isArray(header) ? header[0] : header;
+  if (typeof apiKey === "string" && isApiKey(apiKey)) return { authorization: `Bearer ${apiKey}` };
+  return {};
 }
 
 const isClientGone = (req: FastifyRequest): boolean => {
@@ -63,24 +74,28 @@ export async function createAppRun(
   body: { plugin_id?: unknown; input?: unknown; resources?: unknown },
 ): Promise<AppRunOutcome> {
   const idemKey = extractIdempotencyKey(req);
+  // Computed once: it walks the whole input, which may be 1 MiB.
+  const requestHash = appRunRequestHash(body);
   const run = (): Promise<AppRunOutcome> => admitAppRun({
-    sessionId, user, auth: callerAuthOf(req), body, idemKey,
+    sessionId, user, auth: callerAuthOf(req), body, idemKey, requestHash,
   });
   if (!idemKey) return await run();
 
   const userId = user.userId;
   const route = `POST /v1/sessions/${sessionId}/tasks`;
   let lock: IdempotencyLock | null = null;
-  const requestHash = appRunRequestHash(body);
   // A replay answers with the run the key created, but only to the user who
   // created it and for the same request: another user's key, or the same key
   // reused for a different plugin, input or resources, is refused rather than
   // answered with a run that is not what was asked for.
   const replay = (row: AppRunByKey): FlightResult => {
-    if (row.createdBy !== null && row.createdBy !== userId) {
+    // A row that does not say who made it or for what request (a development
+    // database, or one written outside this code) cannot be shown to be this
+    // caller's, so it is not replayed to anyone.
+    if (row.createdBy === null || row.requestHash === null || row.createdBy !== userId) {
       return { statusCode: 409, response: { ok: false, error: "idempotency_key_conflict", message: "this Idempotency-Key belongs to another request" } };
     }
-    if (row.requestHash !== null && row.requestHash !== requestHash) {
+    if (row.requestHash !== requestHash) {
       return { statusCode: 422, response: { ok: false, error: "idempotency_key_reused", message: "this Idempotency-Key was used with a different request body" } };
     }
     return { statusCode: 200, response: { ok: true, task_id: row.taskId } };
