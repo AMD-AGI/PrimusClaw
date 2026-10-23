@@ -161,6 +161,16 @@ test("gpus, cpu and memory above what the manifest declares are refused, naming 
   refused({ ...GOOD, cpu: 1 }, "resources.cpu", "exceeds", {}, small);
   refused({ ...GOOD, memory_gi: 1 }, "resources.memory_gi", "exceeds", {}, small);
   ok({ ...GOOD, cpu: 0.5, memory_gi: 0.5 }, {}, small);
+  // Other spellings of a quantity are read, not skipped.
+  const exp = { ...m, container: { image: "i", resources: { cpu: "1e1", memory: "1e12", "amd.com/gpu": "8" } } };
+  refused({ ...GOOD, cpu: 11 }, "resources.cpu", "exceeds", {}, exp);
+  refused({ ...GOOD, memory_gi: 1000 }, "resources.memory_gi", "exceeds", {}, exp);
+  ok({ ...GOOD, cpu: 10, memory_gi: 900 }, {}, exp);
+  refused({ ...GOOD, memory_gi: 2000 }, "resources.memory_gi", "exceeds", {}, { ...exp, container: { image: "i", resources: { memory: "1T" } } });
+  // A declared maximum that cannot be read refuses a request for it rather than lifting the limit.
+  const junk = { ...m, container: { image: "i", resources: { cpu: "lots", memory: "32Gi" } } };
+  refused({ ...GOOD, cpu: 1 }, "resources.cpu", "not a readable quantity", {}, junk);
+  ok({ ...GOOD, memory_gi: 1 }, {}, junk);
   // A resource the manifest does not declare has no manifest maximum.
   const none = { ...m, container: { image: "i" } };
   ok({ ...GOOD, gpus: 64, cpu: 999, memory_gi: 9999 }, {}, none);
