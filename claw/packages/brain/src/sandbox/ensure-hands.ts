@@ -2665,9 +2665,10 @@ async function provisionHands(
     sessionEnv: request.session_env ?? {},
   });
 
-  // ── kubernetes/BYOK mode: agent-sandbox provider path (design §16.5). ──
-  // safe mode falls through to the SaFE Workload path below (unchanged).
-  if (isKubernetesMode()) {
+  // Single-node sandboxes are created through Agent Sandbox. A multi-node
+  // request still creates its Hands pod as a SaFE Workload; the GPU cluster
+  // is provisioned separately and is not handled here.
+  if (isKubernetesMode() || !multiNodeContext) {
     if (action.kind !== "create") {
       throw new Error("agent-sandbox requires a create action");
     }
@@ -3524,8 +3525,11 @@ async function ensureHandsAgentSandbox(
   const kv = getHandsKv();
   const provider = getAgentSandboxProvider();
   const ns = sandboxNamespaceFor(request);
-  // BYOK identity forwarded to the Router as `userId` header for ownership/audit (#5).
-  const userId = await deriveByokUserId(resolveRequestLlmKey(request));
+  // kubernetes/BYOK forwards a fingerprint. A safe-mode single-node sandbox
+  // uses the request's user id, the same fallback the task runner records.
+  const userId = isKubernetesMode()
+    ? await deriveByokUserId(resolveRequestLlmKey(request))
+    : (request.user_id?.trim() || "default");
 
   // BYOK env: no SaFE credentials reach this path; inject platform LLM base url
   // (DK2-A). Only the URL needs deleting -- the base env carries no SaFE key, and
