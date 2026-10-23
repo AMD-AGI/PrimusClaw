@@ -44,7 +44,7 @@ import {
   type AppSandboxRole,
   type ResolvedAppResources,
 } from "@claw/protocol";
-import { APP_CONTAINER_CAPS, APP_GRANT_ISSUE_TIMEOUT_MS, APP_RUNS_ENABLED, APP_SANDBOX_CAPS, SAFE_API_URL, isKubernetesMode } from "../config.js";
+import { APP_CONTAINER_CAPS, APP_GRANT_ISSUE_TIMEOUT_MS, APP_GRANT_REVOKE_RETRY_MS, APP_RUNS_ENABLED, APP_SANDBOX_CAPS, SAFE_API_URL, isKubernetesMode } from "../config.js";
 import { devAuthBypassEnabled } from "../auth/middleware.js";
 import { isAdmin, type UserInfo } from "../auth/models.js";
 import { assertSessionCredentialsForDispatch, MissingPlatformKeyError, stampSessionCredentials } from "../auth/session-credentials.js";
@@ -443,8 +443,11 @@ export async function admitAppRun(
       { sessionId: req.sessionId, grantId, err: err instanceof Error ? err.message : String(err) },
       "app_run.grant_issue_failed",
     );
-    // `issue` may have signed something before it failed; same rule as below.
+    // `issue` may have signed something before it failed; same rule as below. It
+    // may also still be signing: the service can finish after this gave up, so the
+    // revoke is tried once more later (see APP_GRANT_REVOKE_RETRY_MS).
     await revokeUnlessRecorded(ports, grantRun, undefined);
+    scheduleRevokeRetry(ports, grantRun);
     return refuse(503, "grant_issue_failed");
   }
 
@@ -517,6 +520,11 @@ export async function admitAppRun(
     throw failure;
   }
   return outcome!;
+}
+
+/** One more revoke after a delay, for a grant the service signed after the attempt gave up. Never throws, never keeps the process alive. */
+export function scheduleRevokeRetry(ports: AppRunPorts, run: AppGrantRun, delayMs: number = APP_GRANT_REVOKE_RETRY_MS): void {
+  setTimeout(() => { void revokeUnlessRecorded(ports, run, undefined); }, delayMs).unref();
 }
 
 /**
