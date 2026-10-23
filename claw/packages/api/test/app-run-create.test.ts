@@ -83,7 +83,7 @@ describe("mode=app task creation", { skip }, () => {
   before(async () => {
     assert.deepEqual(validateAppManifest(MANIFEST), [], "the fixture manifest must be valid, or every refusal below is vacuous");
     process.env.CLAW_DEPLOY_MODE = "safe";
-    ctx.h = await startAdmissionCluster({ APP_RUNS_ENABLED: "true", APP_GRANT_ISSUE_TIMEOUT_MS: "400" });
+    ctx.h = await startAdmissionCluster({ APP_RUNS_ENABLED: "true", APP_GRANT_ISSUE_TIMEOUT_MS: "1000", APP_GRANT_REVOKE_RETRY_MS: "1000" });
     (await import("../src/crypto/user-env.js")).initUserEnvCrypto();
     ctx.ports = (await import("../src/tasks/app-run.js")).appRunPorts;
     ctx.secrets = await import("../src/crypto/app-run-secrets.js");
@@ -519,6 +519,19 @@ describe("mode=app task creation", { skip }, () => {
     });
   });
 
+  describe("grant timeouts are validated at start-up", () => {
+    test("below one second, above five minutes or not a whole number stops start-up; unset is the default", async () => {
+      const { parseAppGrantTimeoutMs } = await import("../src/config.js");
+      for (const bad of ["0", "-5", "999", "300001", "1.5", "abc", "1e9"]) {
+        assert.throws(() => parseAppGrantTimeoutMs(bad, 10_000, "APP_GRANT_ISSUE_TIMEOUT_MS"), /APP_GRANT_ISSUE_TIMEOUT_MS must be/, bad);
+      }
+      assert.equal(parseAppGrantTimeoutMs(undefined, 10_000, "X"), 10_000);
+      assert.equal(parseAppGrantTimeoutMs(" ", 10_000, "X"), 10_000);
+      assert.equal(parseAppGrantTimeoutMs("1000", 10_000, "X"), 1000);
+      assert.equal(parseAppGrantTimeoutMs("300000", 10_000, "X"), 300000);
+    });
+  });
+
   describe("caller credential", () => {
     test("the forwarded credential is the one the middleware accepts, in its order", async () => {
       const { callerAuthOf } = await import("../src/routes/app-run-create.js");
@@ -638,7 +651,11 @@ describe("mode=app task creation", { skip }, () => {
       assert.equal(res.json().error, "grant_issue_failed");
       assert.ok(Date.now() - t0 < 5000, "the request did not wait for ever");
       assert.equal(aborted, true);
-      assert.equal(revoked.length, 1);
+      assert.equal(revoked.length, 1, "revoked at once");
+      // The service may finish signing after the attempt gave up: the revoke is tried once more.
+      await new Promise((r) => setTimeout(r, 1500));
+      assert.equal(revoked.length, 2, "and once more later");
+      assert.equal(revoked[0], revoked[1], "the same attempt id both times");
       assert.deepEqual(await counts(), { tasks: 0, runs: 0 });
     });
     test("a caller with no platform key is refused before any grant is signed", async () => {
