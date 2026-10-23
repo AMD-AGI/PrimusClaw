@@ -121,6 +121,8 @@ async function sendCreateRefusal(reply: FastifyReply, refusal: CreateRefusal): P
 interface CreateTaskBody {
   /** `"app"` creates a hosted application run; anything else is the task path below. */
   mode?: unknown;
+  /** With `mode: "app"`: what the run gets, requested explicitly. */
+  resources?: unknown;
   dag_id?: string;
   plugin_id?: number;
   input?: Record<string, unknown>;

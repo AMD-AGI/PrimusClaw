@@ -7,24 +7,25 @@
  * A manifest is registered as a plugin (`resource.app.manifest`) and kept by
  * the plugin administrator; the application and the AI it runs cannot change
  * it. It says what to start and what to hand it, in terms of Claw's own
- * facilities. Claw reads values out of the run's input by JSON Pointer and
- * does not know what any field means; the left side of `env_map` is the only
- * vocabulary Claw owns, and the names on the right are the application's.
+ * facilities. It does not say where the app's resources come from: the image,
+ * GPU count, workspace and grant limits are requested explicitly by whoever
+ * creates the run (see app-resources.ts), the way a Kubernetes Pod spells out
+ * its resources apart from the container's arguments. Claw never reads the
+ * run's `input`; it only hands it to the app. The left side of `env_map` is the
+ * only vocabulary Claw owns, and the names on the right are the application's.
  *
  * Contract points that are easy to get wrong:
  *
- *  - Every `*_from_input` value, and every `grant_from_input` value, is a JSON
- *    Pointer (RFC 6901) into the run input. An array of pointers means "the
- *    first one that exists".
+ *  - `container.image` is only a default; `resources.image` in the request
+ *    wins. A run with neither is refused.
  *  - `sandbox_templates` and `sandbox_roles` stay in the manifest, but Claw
  *    does not register templates itself: they are handed to Agent Sandbox as
- *    the grant's `templates` and `roles` when the grant is issued.
- *  - `grant_from_input` maps a limit of the grant to a pointer into the input.
- *    `grant_extra` is added after pointer resolution (for example one slot for
- *    a sub-run), and the platform limit then caps the sum; GPU-hours are
- *    multiplied by `limits.gpu_hours_headroom` before that cap. The granted
- *    limits are injected back through
- *    `env_map.grant_limits` so the app can plan within what it actually got.
+ *    the grant's `templates` and `roles` when the grant is issued. A template
+ *    that sets no `image` or `workspace` inherits the run's.
+ *  - `limits` are defaults and maxima for the request's `resources.grant`; the
+ *    platform cap (`APP_SANDBOX_CAPS`) then caps each item. The limits actually
+ *    granted are injected back through `env_map.grant_limits` so the app can
+ *    plan within what it got.
  *
  * Optional fields are omitted rather than written as empty. The documented
  * defaults are in {@link APP_MANIFEST_DEFAULTS}.
@@ -37,41 +38,15 @@ export const APP_MANIFEST_SCHEMA = "claw.app-manifest/v1" as const;
 export const APP_SANDBOX_ROLES = ["measurement", "subrun", "dev"] as const;
 export type AppSandboxRole = (typeof APP_SANDBOX_ROLES)[number];
 
-/** The limits of a grant that the manifest can set from the input or from a constant. */
-export const APP_GRANT_KEYS = [
-  "measurement.max_sandboxes",
-  "measurement.gpus_per_sandbox",
-  "gpu_hours_budget",
-  "max_hours",
-  "subrun.max_sandboxes",
-] as const;
-export type AppGrantKey = (typeof APP_GRANT_KEYS)[number];
-
 /** Defaults Claw applies when the manifest omits the field. */
 export const APP_MANIFEST_DEFAULTS = {
   stop_grace_sec: 900,
-  gpu_hours_headroom: 1.3,
 } as const;
 
-/** A JSON Pointer (RFC 6901) into the run input. */
-export type JsonPointer = string;
-
-export interface AppContainerResourcesFromInput {
-  cpu?: JsonPointer;
-  /** Gi of memory; Claw renders it as `<n>Gi`. */
-  memory_gi?: JsonPointer;
-}
-
 export interface AppContainer {
-  /** A fixed image. Exactly one of `image` and `image_from_input` is given. */
+  /** The default image; `resources.image` in the request wins. Optional. */
   image?: string;
-  /** The image is read from the run input at this pointer. */
-  image_from_input?: JsonPointer;
-  gpus_from_input?: JsonPointer;
-  workspace_from_input?: JsonPointer | JsonPointer[];
-  /** A value found here overrides the same key in `resources`. */
-  resources_from_input?: AppContainerResourcesFromInput;
-  /** Hard limits of the app container; the platform enforces them. */
+  /** Default container resources (also the hard limits); `resources.cpu` / `memory_gi` in the request win. */
   resources?: Record<string, string>;
 }
 
@@ -124,7 +99,6 @@ export interface AppMcp {
 
 export interface AppSandboxTemplateStart {
   script_b64?: string;
-  env_from_input?: Record<string, JsonPointer>;
 }
 
 export interface AppSandboxTemplateDataPlane {
@@ -161,17 +135,12 @@ export interface AppRestart {
 }
 
 export interface AppLimits {
-  /** Defaults for the per-role sandbox ceiling; `grant_from_input` and `grant_extra` apply first, then the platform limit caps the result. */
+  /** Default per-role sandbox ceiling when the request's `grant` omits it; the platform cap applies after. */
   max_sandboxes?: { [R in AppSandboxRole]?: number };
+  /** Maximum run time: the grant's `max_runtime_sec` is the smaller of this and the request. */
   max_runtime_sec?: number;
+  /** The only thing Claw checks about `input`: its size. */
   input_max_bytes?: number;
-  /**
-   * Multiplier from the planned GPU-hours to the granted budget (default 1.3),
-   * applied before the platform limit caps the budget.
-   * Measurement sandboxes are per test; headroom covers cold start, PRELUDE
-   * and withdrawn tests.
-   */
-  gpu_hours_headroom?: number;
 }
 
 export interface AppManifestV1 {
@@ -184,16 +153,11 @@ export interface AppManifestV1 {
   command: string[];
   bootstrap?: AppBootstrap;
   env?: Record<string, string>;
-  /** A value found overrides the same key in `env`. */
-  env_from_input?: Record<string, JsonPointer>;
   env_map?: AppEnvMap;
   events?: AppEvents;
   mcp?: AppMcp;
   sandbox_templates?: AppSandboxTemplate[];
   sandbox_roles?: AppSandboxRoles;
-  grant_from_input?: { [K in AppGrantKey]?: JsonPointer };
-  /** Constants added to the granted limits after pointer resolution. */
-  grant_extra?: { [K in AppGrantKey]?: number };
   restart?: AppRestart;
   /** Seconds to wait after SIGTERM on cancel. Default 900. */
   stop_grace_sec?: number;
@@ -204,7 +168,6 @@ export interface AppManifestV1 {
 // JSON Schema
 // ---------------------------------------------------------------------------
 
-const POINTER_PATTERN = "^(?:/(?:[^~/]|~[01])*)+$";
 const ENV_NAME_PATTERN = "^[A-Za-z_][A-Za-z0-9_]*$";
 const B64_PATTERN = "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$";
 
@@ -228,11 +191,6 @@ export const APP_MANIFEST_JSON_SCHEMA = {
   additionalProperties: false,
   required: ["schema", "name", "version", "container", "state_dir", "command"],
   $defs: {
-    pointer: { type: "string", format: "json-pointer", pattern: POINTER_PATTERN },
-    pointerOrList: {
-      oneOf: [ref("pointer"), { type: "array", minItems: 1, items: ref("pointer") }],
-    },
-    pointerMap: { type: "object", additionalProperties: ref("pointer") },
     envName: { type: "string", pattern: ENV_NAME_PATTERN },
     stringMap: { type: "object", additionalProperties: nonEmptyStr },
     base64: { type: "string", minLength: 1, pattern: B64_PATTERN },
@@ -256,14 +214,6 @@ export const APP_MANIFEST_JSON_SCHEMA = {
       additionalProperties: false,
       properties: {
         image: nonEmptyStr,
-        image_from_input: ref("pointer"),
-        gpus_from_input: ref("pointer"),
-        workspace_from_input: ref("pointerOrList"),
-        resources_from_input: {
-          type: "object",
-          additionalProperties: false,
-          properties: { cpu: ref("pointer"), memory_gi: ref("pointer") },
-        },
         resources: ref("stringMap"),
       },
     },
@@ -276,7 +226,6 @@ export const APP_MANIFEST_JSON_SCHEMA = {
       properties: { file: nonEmptyStr, content_b64: ref("base64") },
     },
     env: ref("stringMap"),
-    env_from_input: ref("pointerMap"),
     env_map: {
       type: "object",
       additionalProperties: false,
@@ -314,8 +263,6 @@ export const APP_MANIFEST_JSON_SCHEMA = {
     },
     sandbox_templates: { type: "array", minItems: 1, items: ref("template") },
     sandbox_roles: closedSet(APP_SANDBOX_ROLES, { type: "array", minItems: 1, items: nonEmptyStr }),
-    grant_from_input: closedSet(APP_GRANT_KEYS, ref("pointer")),
-    grant_extra: closedSet(APP_GRANT_KEYS, { type: "number", minimum: 0 }),
     restart: {
       type: "object",
       additionalProperties: false,
@@ -333,7 +280,6 @@ export const APP_MANIFEST_JSON_SCHEMA = {
         max_sandboxes: closedSet(APP_SANDBOX_ROLES, posInt),
         max_runtime_sec: posInt,
         input_max_bytes: posInt,
-        gpu_hours_headroom: { type: "number", minimum: 1, default: APP_MANIFEST_DEFAULTS.gpu_hours_headroom },
       },
     },
   },
@@ -352,9 +298,6 @@ export interface AppManifestIssue {
 /** Variable names a manifest may not set: the platform owns them. */
 const RESERVED_ENV = /^(?:E2B_.*|AWS_.*|CLAW_.*|NODE_NAME|USER_DATA_PATH)$/;
 const STATE_DIR_VARS = new Set(["USER_DATA_PATH", "run_id"]);
-const COUNT_GRANT_KEYS = new Set<string>([
-  "measurement.max_sandboxes", "measurement.gpus_per_sandbox", "subrun.max_sandboxes",
-]);
 
 const isObj = (v: unknown): v is Record<string, unknown> =>
   typeof v === "object" && v !== null && !Array.isArray(v);
@@ -376,14 +319,6 @@ export function validateAppManifest(value: unknown): AppManifestIssue[] {
   if (!isObj(value)) return issues;
   const bad = (path: string, reason: string): void => void issues.push({ path, reason });
   const obj = (v: unknown): Record<string, unknown> => (isObj(v) ? v : {});
-
-  // The image: exactly one of a fixed string or a pointer into the input.
-  const container = obj(value.container);
-  if (Object.hasOwn(container, "image") && Object.hasOwn(container, "image_from_input")) {
-    bad("container.image", "cannot be combined with container.image_from_input; give exactly one");
-  } else if (isObj(value.container) && !Object.hasOwn(container, "image") && !Object.hasOwn(container, "image_from_input")) {
-    bad("container", "needs exactly one of image or image_from_input; neither is given");
-  }
 
   // Templates: unique names (the only thing Claw reads besides the roles).
   const defined = new Set<string>();
@@ -416,15 +351,6 @@ export function validateAppManifest(value: unknown): AppManifestIssue[] {
   };
   for (const role of Object.keys(obj(obj(value.env_map).sandbox_keys))) needRole("env_map.sandbox_keys", role, role);
   for (const role of Object.keys(obj(obj(value.limits).max_sandboxes))) needRole("limits.max_sandboxes", role, role);
-  for (const section of ["grant_from_input", "grant_extra"] as const) {
-    for (const [key, v] of Object.entries(obj(value[section]))) {
-      const role = key.includes(".") ? key.split(".")[0]! : null;
-      if (role) needRole(section, key, role);
-      if (section === "grant_extra" && typeof v === "number" && COUNT_GRANT_KEYS.has(key) && !Number.isInteger(v)) {
-        bad(`grant_extra.${key}`, "must be an integer");
-      }
-    }
-  }
 
   // Variables: no collisions, nothing the platform owns.
   const envMap = obj(value.env_map);
@@ -443,9 +369,9 @@ export function validateAppManifest(value: unknown): AppManifestIssue[] {
       mapTarget(`env_map.${facility}`, name);
     }
   }
-  for (const section of ["env", "env_from_input"] as const) {
-    for (const k of Object.keys(obj(value[section]))) {
-      const p = `${section}.${k}`;
+  {
+    for (const k of Object.keys(obj(value.env))) {
+      const p = `env.${k}`;
       if (RESERVED_ENV.test(k)) bad(p, `${k} is reserved for the platform and cannot be set`);
       else if (targets.has(k)) bad(p, `${k} is also the target of ${targets.get(k)}`);
     }

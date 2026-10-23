@@ -30,32 +30,35 @@ const MANIFEST = {
   schema: APP_MANIFEST_SCHEMA,
   name: "example-app",
   version: "1.0.0",
-  container: {
-    image_from_input: "/framework/image",
-    gpus_from_input: "/placement/gpus",
-    workspace_from_input: ["/placement/app_workspace", "/placement/gpu_workspace"],
-    resources_from_input: { cpu: "/placement/cpu", memory_gi: "/placement/memory_gi" },
-    resources: { cpu: "32", memory: "128Gi" },
-  },
+  // No default image: a run has to name one.
+  container: { resources: { cpu: "32", memory: "128Gi" } },
   state_dir: "${USER_DATA_PATH}/.claw-apps/${run_id}",
   command: ["sh", "-c", "exec app run"],
   env_map: { run_id: "APP_RUN_ID", mcp_token: "APP_MCP_TOKEN" },
   mcp: { port: 8765, path: "/mcp", token_header: "X-App-Token" },
   sandbox_templates: [
-    {
-      name: "runner", provider: "safe-pytorchjob", gpus: 1,
-      image_from_input: "/framework/image", workspace_from_input: "/placement/runner_workspace",
-      data_plane: { mode: "open" },
-    },
+    { name: "runner", provider: "safe-pytorchjob", gpus: 1, data_plane: { mode: "open" } },
   ],
   sandbox_roles: { measurement: ["runner"] },
-  limits: { input_max_bytes: 400 },
+  limits: { input_max_bytes: 400, max_sandboxes: { measurement: 2 }, max_runtime_sec: 7200 },
 };
 
+/**
+ * The app's own request. It carries every name that used to be a pointer
+ * target, set to values that would be wrong or refused if anything read them:
+ * Claw hands this to the app and does not look inside.
+ */
 const GOOD_INPUT = {
-  framework: { image: "registry.example.invalid/fw:1" },
-  placement: { gpus: 8, app_workspace: "ws-ok", cpu: 4, memory_gi: 16 },
+  framework: { image: "attacker.example.invalid/other:1" },
+  placement: { gpus: 99, app_workspace: "ws-denied", gpu_workspace: "ws-missing", runner_workspace: "ws-denied", cpu: 1000, memory_gi: 9999 },
+  budget: { max_gpu_hours: 1e9, max_hours: 1e6 },
+  resources: { image: "attacker.example.invalid/nested:1" },
   note: "campaign",
+};
+/** What the submitter asks for. */
+const GOOD_RES = {
+  image: "registry.example.invalid/fw:1", gpus: 8, workspace: "ws-ok", cpu: 4, memory_gi: 16,
+  grant: { roles: { measurement: { max_sandboxes: 1, max_gpus: 8 } }, gpu_hours: 10, max_runtime_sec: 600 },
 };
 
 interface Ctx { h: AdmissionCluster; app: FastifyInstance; ports: any; secrets: any; send: (o: any) => Promise<any> }
@@ -72,7 +75,7 @@ describe("mode=app task creation", { skip }, () => {
   const post = (sessionId: string, payload: unknown, headers: Record<string, string> = {}) =>
     ctx.app.inject({ method: "POST", url: `/v1/sessions/${sessionId}/tasks`, payload: payload as object, headers });
   const create = (sessionId: string, over: Record<string, unknown> = {}, headers: Record<string, string> = {}) =>
-    post(sessionId, { mode: "app", plugin_id: goodPlugin, input: GOOD_INPUT, ...over }, headers);
+    post(sessionId, { mode: "app", plugin_id: goodPlugin, input: GOOD_INPUT, resources: GOOD_RES, ...over }, headers);
 
   before(async () => {
     assert.deepEqual(validateAppManifest(MANIFEST), [], "the fixture manifest must be valid, or every refusal below is vacuous");
@@ -103,14 +106,17 @@ describe("mode=app task creation", { skip }, () => {
   after(async () => { await ctx.app?.close(); await ctx.h?.stop(); });
 
   const original = {} as Record<string, unknown>;
+  const asked: string[] = [];
   beforeEach(async () => {
     caller = OWNER;
     original.enabled ??= ctx.ports.enabled;
     original.access ??= ctx.ports.workspaceAccess;
+    original.caps ??= ctx.ports.caps;
     original.grant ??= ctx.ports.grant;
     ctx.ports.enabled = () => true;
-    ctx.ports.workspaceAccess = async (_a: unknown, ws: string) =>
-      ws === "ws-ok" ? "ok" : ws === "ws-missing" ? "not_found" : "forbidden";
+    ctx.ports.caps = original.caps;
+    asked.length = 0;
+    ctx.ports.workspaceAccess = async (_a: unknown, ws: string) => (asked.push(ws), ws === "ws-ok") ? "ok" : ws === "ws-missing" ? "not_found" : "forbidden";
     ctx.ports.grant = original.grant;
     await q("DELETE FROM claw_app_runs");
     await q("DELETE FROM claw_tasks");
@@ -140,6 +146,9 @@ describe("mode=app task creation", { skip }, () => {
     assert.equal(r.session_id, "s1");
     assert.equal(r.state, "provisioning");
     assert.deepEqual(r.manifest, MANIFEST);
+    assert.deepEqual(r.grant_limits, { roles: { measurement: { max_sandboxes: 1, max_gpus: 8 } }, gpu_hours: 10, max_runtime_sec: 600 },
+      "the effective grant is stored (no cap configured here: the request as it is)");
+    assert.deepEqual(asked, ["ws-ok"], "only the requested workspace is asked about, never one found inside the input");
     assert.equal(r.grant_id, null, "the default hook issues nothing, so no grant is recorded");
     assert.equal(r.grant_keys_enc, null);
 
@@ -218,7 +227,7 @@ describe("mode=app task creation", { skip }, () => {
     });
 
     test("a refusal is not cached: the retry with that key runs the checks again", async () => {
-      const a = await create("s1", { input: { ...GOOD_INPUT, placement: { ...GOOD_INPUT.placement, app_workspace: "ws-denied" } } }, { "idempotency-key": "key-8" });
+      const a = await create("s1", { resources: { ...GOOD_RES, workspace: "ws-denied" } }, { "idempotency-key": "key-8" });
       assert.equal(a.statusCode, 403);
       const b = await create("s1", {}, { "idempotency-key": "key-8" });
       assert.equal(b.statusCode, 200, b.body);
@@ -313,27 +322,87 @@ describe("mode=app task creation", { skip }, () => {
       assert.equal((await create("s1")).statusCode, 200, "the same request within the limit is admitted");
     });
     test("a workspace the caller may not use", async () => {
-      const input = { ...GOOD_INPUT, placement: { ...GOOD_INPUT.placement, app_workspace: "ws-denied" } };
-      const res = await create("s1", { input });
+      const res = await create("s1", { resources: { ...GOOD_RES, workspace: "ws-denied" } });
       await refused(res, 403, "workspace_access_denied");
       assert.equal(res.json().workspace, "ws-denied");
     });
     test("a workspace that does not exist", async () => {
-      const input = { ...GOOD_INPUT, placement: { ...GOOD_INPUT.placement, app_workspace: "ws-missing" } };
-      await refused(await create("s1", { input }), 404, "workspace_not_found");
+      await refused(await create("s1", { resources: { ...GOOD_RES, workspace: "ws-missing" } }), 404, "workspace_not_found");
     });
-    test("a workspace named only by a template pointer is checked too", async () => {
-      const input = { ...GOOD_INPUT, placement: { ...GOOD_INPUT.placement, runner_workspace: "ws-denied" } };
-      await refused(await create("s1", { input }), 403, "workspace_access_denied");
-      const ok = { ...GOOD_INPUT, placement: { ...GOOD_INPUT.placement, runner_workspace: "ws-ok" } };
-      assert.equal((await create("s1", { input: ok })).statusCode, 200);
+    test("the sandbox workspace is checked too", async () => {
+      await refused(await create("s1", { resources: { ...GOOD_RES, sandbox_workspace: "ws-denied" } }), 403, "workspace_access_denied");
+      assert.equal((await create("s1", { resources: { ...GOOD_RES, sandbox_workspace: "ws-ok" } })).statusCode, 200);
     });
-    test("a pointer that names a non-string workspace", async () => {
-      const input = { ...GOOD_INPUT, placement: { ...GOOD_INPUT.placement, app_workspace: 7 } };
-      await refused(await create("s1", { input }), 400, "app_input_invalid");
+    test("the workspace check uses resources.workspace, not anything in the input", async () => {
+      // The input names a workspace nobody may use, in every place a pointer once read.
+      const res = await create("s1");
+      assert.equal(res.statusCode, 200, res.body);
+      assert.deepEqual(asked, ["ws-ok"]);
+      await q("DELETE FROM claw_app_runs"); await q("DELETE FROM claw_tasks"); asked.length = 0;
+      await refused(await create("s1", { resources: { ...GOOD_RES, workspace: "ws-denied" }, input: { note: "clean" } }), 403, "workspace_access_denied");
+      assert.deepEqual(asked, ["ws-denied"]);
     });
-    test("an input without the container image", async () => {
-      await refused(await create("s1", { input: { placement: GOOD_INPUT.placement } }), 400, "app_input_invalid");
+    describe("resources", () => {
+      const problems = (res: any) => res.json().problems.map((p: any) => p.field);
+      test("a non-string workspace", async () => {
+        const res = await create("s1", { resources: { ...GOOD_RES, workspace: 7 } });
+        await refused(res, 400, "app_resources_invalid");
+        assert.deepEqual(problems(res), ["resources.workspace"]);
+      });
+      test("no image anywhere (none requested, no manifest default) is a specific refusal", async () => {
+        const { image: _i, ...noImage } = GOOD_RES;
+        const res = await create("s1", { resources: noImage });
+        await refused(res, 400, "app_resources_invalid");
+        assert.deepEqual(problems(res), ["resources.image"]);
+        assert.match(res.json().problems[0].reason, /no image/);
+        // The image in the input does not stand in for it.
+        assert.ok(!JSON.stringify(GOOD_INPUT).includes("fw:1"));
+      });
+      test("no resources at all lists what is missing, writes nothing", async () => {
+        const res = await create("s1", { resources: undefined });
+        await refused(res, 400, "app_resources_invalid");
+        assert.deepEqual(problems(res).sort(), ["resources.gpus", "resources.image", "resources.workspace"]);
+        await refused(await create("s1", { resources: [1] }), 400, "app_resources_invalid");
+      });
+      test("an unknown role in grant.roles is refused", async () => {
+        const res = await create("s1", { resources: { ...GOOD_RES, grant: { roles: { dev: { max_sandboxes: 1 } } } } });
+        await refused(res, 400, "app_resources_invalid");
+        assert.deepEqual(problems(res), ["resources.grant.roles.dev"]);
+      });
+      test("negative and mistyped items are refused", async () => {
+        const bad = await create("s1", { resources: { ...GOOD_RES, gpus: -1, grant: { gpu_hours: -5 } } });
+        await refused(bad, 400, "app_resources_invalid");
+        assert.deepEqual(problems(bad).sort(), ["resources.gpus", "resources.grant.gpu_hours"]);
+      });
+      test("a request above the platform cap gets the cap, item by item, and the cap is what is stored", async () => {
+        ctx.ports.caps = () => ({ roles: { measurement: { max_sandboxes: 3, max_gpus: 4 } }, gpu_hours: 5, max_runtime_sec: 7200 });
+        const res = await create("s1", { resources: { ...GOOD_RES, grant: { roles: { measurement: { max_sandboxes: 50, max_gpus: 2 } }, gpu_hours: 1e6, max_runtime_sec: 99999 } } });
+        assert.equal(res.statusCode, 200, res.body);
+        const r = (await q("SELECT grant_limits FROM claw_app_runs")).rows[0] as any;
+        assert.deepEqual(r.grant_limits, {
+          roles: { measurement: { max_sandboxes: 3, max_gpus: 2 } }, gpu_hours: 5, max_runtime_sec: 7200,
+        }, "max_sandboxes and gpu_hours clamped, max_gpus below its cap kept, runtime = min(request, manifest 7200, cap 7200)");
+      });
+      test("absent items take the manifest defaults", async () => {
+        const res = await create("s1", { resources: { image: "i:1", gpus: 0, workspace: "ws-ok" } });
+        assert.equal(res.statusCode, 200, res.body);
+        const r = (await q("SELECT grant_limits FROM claw_app_runs")).rows[0] as any;
+        assert.deepEqual(r.grant_limits, { roles: { measurement: { max_sandboxes: 2 } }, max_runtime_sec: 7200 });
+        const t = (await q("SELECT sandbox_spec FROM claw_tasks")).rows[0] as any;
+        assert.deepEqual(t.sandbox_spec, { handle: "app", image: "i:1", namespace: "ws-ok", resources: { cpu: "32", memory: "128Gi" } });
+      });
+      test("the input does not affect the resources: same request, different input, same run shape", async () => {
+        const shapes: unknown[] = [];
+        for (const input of [GOOD_INPUT, { note: "clean" }, { placement: { gpus: 0 }, framework: { image: "x" }, resources: { gpus: 1 } }, {}]) {
+          await q("DELETE FROM claw_app_runs"); await q("DELETE FROM claw_tasks");
+          const res = await create("s1", { input });
+          assert.equal(res.statusCode, 200, res.body);
+          const t = (await q("SELECT sandbox_spec, workspace_id FROM claw_tasks")).rows[0] as any;
+          const r = (await q("SELECT grant_limits FROM claw_app_runs")).rows[0] as any;
+          shapes.push({ spec: t.sandbox_spec, ws: t.workspace_id, grant: r.grant_limits });
+        }
+        for (const x of shapes) assert.deepEqual(x, shapes[0]);
+      });
     });
     test("SaFE cannot be asked", async () => {
       ctx.ports.workspaceAccess = async () => { throw new (await import("../src/tasks/app-run.js")).WorkspaceCheckUnavailableError("x"); };
@@ -362,8 +431,8 @@ describe("mode=app task creation", { skip }, () => {
       const seen: any[] = [];
       let fail = true;
       ctx.ports.grant = {
-        issue: async (run: any, manifest: any, input: any) => {
-          seen.push({ run, manifest, input });
+        issue: async (run: any, manifest: any, request: any) => {
+          seen.push({ run, manifest, request });
           if (fail) throw new Error("down");
           return {
             keys: { measurement: "e2b_aaaa", subrun: "e2b_bbbb" },
@@ -381,7 +450,13 @@ describe("mode=app task creation", { skip }, () => {
       assert.equal(seen[0].run.grantId, seen[1].run.grantId);
       assert.match(seen[1].run.grantId, /^grt_[0-9a-f]{32}$/);
       assert.deepEqual(seen[1].manifest, MANIFEST);
-      assert.deepEqual(seen[1].input, GOOD_INPUT);
+      assert.ok(!JSON.stringify(seen[1]).includes("attacker.example"), "the grant hook is never given the input");
+      assert.equal(seen[1].request.resources.image, GOOD_RES.image);
+      assert.deepEqual(seen[1].request.resources.grant, GOOD_RES.grant);
+      assert.deepEqual(seen[1].request.templates, [{
+        name: "runner", provider: "safe-pytorchjob", gpus: 1, data_plane: { mode: "open" },
+        image: GOOD_RES.image, workspace: "ws-ok",
+      }], "a template that sets no image or workspace inherits the run's");
       assert.equal(seen[1].run.taskId, b.json().task_id);
 
       const r = (await q("SELECT * FROM claw_app_runs")).rows[0] as any;
