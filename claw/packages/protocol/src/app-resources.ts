@@ -26,6 +26,11 @@ import type { AppManifestV1 } from "./app-manifest.js";
 
 /** The GPU resource name a sandbox spec carries. */
 export const APP_GPU_RESOURCE = "amd.com/gpu";
+/**
+ * The spelling of a GPU count that admission counts as "this pod wants GPUs". Used by
+ * the TypeScript read and bound into the SQL aggregate, so the two cannot differ.
+ */
+export const APP_GPU_COUNT_PATTERN = "^[1-9][0-9]*$";
 
 /**
  * A grant request, an effective grant and a platform cap all have this shape:
@@ -149,8 +154,9 @@ function quantity(q: string | undefined): number | undefined {
  *
  * Defaults, in order: the request, then the manifest. A run with no image, no
  * GPU count or no workspace from either is refused rather than started with a
- * guess. A `gpus`, `cpu` or `memory_gi` above what the manifest declares for that
- * resource in `container.resources` is refused, naming the field. The grant: each
+ * guess; `gpus` has no manifest default (the manifest cannot carry a GPU key). A
+ * `cpu` or `memory_gi` above what the manifest declares for that resource in
+ * `container.resources` is refused, naming the field. The grant: each
  * item is the smallest of the request, the manifest's `limits` value (where the
  * manifest has one: `max_sandboxes`, `max_runtime_sec`) and the platform cap; an
  * absent request takes the smaller of the other two.
@@ -180,9 +186,7 @@ export function resolveAppResources(
     if (isCount(r.gpus)) gpus = r.gpus;
     else issues.push({ field: "resources.gpus", reason: "must be a whole number >= 0" });
   } else {
-    const d = manifest.container.resources?.[APP_GPU_RESOURCE];
-    if (d !== undefined && /^[0-9]+$/.test(d)) gpus = Number(d);
-    else issues.push({ field: "resources.gpus", reason: "required: the request gives none and the manifest has no default" });
+    issues.push({ field: "resources.gpus", reason: "required: the GPU count comes only from the request" });
   }
 
   let workspace: string | undefined;
@@ -209,7 +213,6 @@ export function resolveAppResources(
     if (q === undefined) issues.push({ field, reason: `the manifest maximum ${JSON.stringify(text)} is not a readable quantity` });
     else if (asked > max(q)) issues.push({ field, reason: `exceeds the manifest maximum ${text}` });
   };
-  over("resources.gpus", r.gpus, declared[APP_GPU_RESOURCE], (q) => q);
   over("resources.cpu", r.cpu, declared.cpu, (q) => q);
   over("resources.memory_gi", r.memory_gi, declared.memory, (q) => q / 1024 ** 3);
 

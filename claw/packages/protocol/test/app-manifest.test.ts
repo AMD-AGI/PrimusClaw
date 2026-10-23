@@ -8,6 +8,7 @@ import {
   APP_MANIFEST_SCHEMA,
   APP_PLATFORM_ENV,
   isReservedAppEnv,
+  isGpuResourceKey,
   validateAppManifest,
   type AppManifestV1,
 } from "../src/app-manifest.js";
@@ -322,6 +323,13 @@ test("state_dir allows only the two complete placeholders; any other $ is refuse
   }
   refused(mutate((m) => { m.state_dir = "${run_id"; }), "state_dir", "unterminated");
   refused(mutate((m) => { m.state_dir = "$run_id"; }), "state_dir", "bare $");
+});
+
+test("a GPU key in container.resources is refused, whichever spelling", () => {
+  for (const key of ["amd.com/gpu", "gpu", "GPU", "nvidia.com/gpu"]) {
+    refused(mutate((m) => { m.container.resources = { ...m.container.resources, [key]: "8" }; }), `container.resources.${key}`, "GPU key");
+  }
+  assert.deepEqual(paths(mutate((m) => { m.container.resources = { cpu: "8", memory: "32Gi" }; })), []);
 });
 
 test("restart needs a backoff when it allows restarts", () => {

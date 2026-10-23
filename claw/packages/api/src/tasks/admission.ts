@@ -22,6 +22,7 @@ import {
   ADMIT_TREE_MAX_DEPTH,
   ADMIT_TREE_MAX_NODES,
 } from "../config.js";
+import { APP_GPU_COUNT_PATTERN, APP_GPU_RESOURCE } from "@claw/protocol";
 import { PG_INT4_MAX } from "@claw/utils";
 
 import { db, type StatementRunner } from "../infra/db.js";
@@ -422,11 +423,11 @@ const SANDBOX_ROW_SQL = `sandbox_spec IS NOT NULL AND sandbox_spec::text <> '"no
  * admission. `COALESCE` around the `SUM` because `LEAST` ignores NULL and would
  * read an empty set as the cap.
  */
-function gpuSumSql(statusParam: string): string {
+function gpuSumSql(statusParam: string, keyParam: string, patternParam: string): string {
   return `LEAST(COALESCE(SUM(
          CASE
            WHEN status = ANY(${statusParam}::text[]) AND mode = 'app'
-           THEN CASE WHEN sandbox_spec->'resources'->>'amd.com/gpu' ~ '^[1-9][0-9]*$' THEN 1 ELSE 0 END
+           THEN CASE WHEN sandbox_spec->'resources'->>${keyParam}::text ~ ${patternParam}::text THEN 1 ELSE 0 END
            WHEN status = ANY(${statusParam}::text[])
             AND jsonb_typeof(input->'topology'->'nodes') = 'number'
            THEN LEAST((input->'topology'->>'nodes')::numeric, ${PG_INT4_MAX})
@@ -463,12 +464,12 @@ export async function loadUsage(client?: StatementRunner): Promise<AdmissionUsag
          AS sandboxes,
        COUNT(*) FILTER (WHERE status = ANY($2::text[]) AND (${SANDBOX_ROW_SQL}))::int
          AS executing_sandboxes,
-       ${gpuSumSql("$1")} AS gpu_nodes,
-       ${gpuSumSql("$2")} AS executing_gpu_nodes
+       ${gpuSumSql("$1", "$3", "$4")} AS gpu_nodes,
+       ${gpuSumSql("$2", "$3", "$4")} AS executing_gpu_nodes
      FROM claw_tasks
      WHERE executor = 'brain'
        AND status = ANY($1::text[])`,
-    [OCCUPYING, EXECUTING],
+    [OCCUPYING, EXECUTING, APP_GPU_RESOURCE, APP_GPU_COUNT_PATTERN],
   );
   return usageFromRow((r.rows[0] ?? {}) as UsageRow);
 }
@@ -606,8 +607,8 @@ export async function loadUsageWithRoots(
          AS sandboxes,
        COUNT(*) FILTER (WHERE status = ANY($2::text[]) AND (${SANDBOX_ROW_SQL}))::int
          AS executing_sandboxes,
-       ${gpuSumSql("$1")} AS gpu_nodes,
-       ${gpuSumSql("$2")} AS executing_gpu_nodes,
+       ${gpuSumSql("$1", "$4", "$5")} AS gpu_nodes,
+       ${gpuSumSql("$2", "$4", "$5")} AS executing_gpu_nodes,
        COALESCE(
          array_agg(DISTINCT COALESCE(dag_root_task_id, task_id))
            FILTER (WHERE status = ANY($3::text[])),
@@ -616,7 +617,7 @@ export async function loadUsageWithRoots(
      FROM claw_tasks
      WHERE executor = 'brain'
        AND status = ANY($1::text[])`,
-    [OCCUPYING, EXECUTING, scopeStatuses],
+    [OCCUPYING, EXECUTING, scopeStatuses, APP_GPU_RESOURCE, APP_GPU_COUNT_PATTERN],
   );
   const row = (r.rows[0] ?? {}) as UsageRow & { scope_roots?: string[] };
   return { usage: usageFromRow(row), roots: new Set(row.scope_roots ?? []) };

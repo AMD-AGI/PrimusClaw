@@ -34,6 +34,11 @@
 export interface SchemaRequirement {
   table: string;
   columns: string[];
+  /**
+   * Needed only when `APP_RUNS_ENABLED` is true. Absent otherwise it is a warning
+   * at start-up, not a refusal to serve.
+   */
+  onlyWhenAppRuns?: boolean;
 }
 
 /** A column somewhere in the database, as `information_schema` reports it. */
@@ -129,13 +134,15 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
   },
   {
     table: "claw_app_runs",
-    // Written in the same transaction as every `mode='app'` task, so a database
-    // that lost the table or a grant column refuses app creation outright rather
-    // than leaving a task row with no run behind it.
+    // Written in the same transaction as every `mode='app'` task. With
+    // APP_RUNS_ENABLED on, a database that lost the table or a column refuses to
+    // start: creation would otherwise fail on the first app run. With it off the
+    // table is not used, so the same gap is only warned about.
+    onlyWhenAppRuns: true,
     columns: [
       "task_id", "session_id", "plugin_id", "manifest", "idempotency_key", "state",
       "mcp_token_enc", "grant_id", "grant_keys_enc", "grant_limits",
-      "grant_expires_at", "grant_revoked_at",
+      "grant_expires_at", "grant_revoked_at", "created_by", "request_hash",
     ],
   },
   {
@@ -204,4 +211,19 @@ export function missingSchemaObjects(
     }
   }
   return problems;
+}
+
+/**
+ * The problems that stop start-up and the ones that are only warned about. A
+ * table marked `onlyWhenAppRuns` is fatal when app runs are enabled and a
+ * warning when they are not; everything else is always fatal.
+ */
+export function classifySchemaProblems(
+  required: SchemaRequirement[],
+  present: PresentColumn[],
+  appRunsEnabled: boolean,
+): { fatal: string[]; warnings: string[] } {
+  const fatal = missingSchemaObjects(required.filter((r) => !r.onlyWhenAppRuns), present);
+  const app = missingSchemaObjects(required.filter((r) => r.onlyWhenAppRuns), present);
+  return appRunsEnabled ? { fatal: [...fatal, ...app], warnings: [] } : { fatal, warnings: app };
 }

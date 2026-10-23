@@ -54,12 +54,10 @@ test("no image from the request or the manifest is a specific refusal, not a gue
   assert.equal(ok({ ...GOOD, image: "img:1" }, {}, m).image, "img:1", "the request alone is enough");
 });
 
-test("gpus and workspace are required; a manifest gpu default is accepted for gpus only", () => {
+test("gpus and workspace are required, and gpus has no manifest default", () => {
   refused({ workspace: "w" }, "resources.gpus", "required");
   refused({ gpus: 1 }, "resources.workspace", "required");
-  const m = { ...MANIFEST, container: { image: "i", resources: { "amd.com/gpu": "2" } } };
-  assert.equal(ok({ workspace: "w" }, {}, m).gpus, 2);
-  assert.equal(ok({ workspace: "w", gpus: 0 }, {}, m).gpus, 0, "an explicit 0 beats the default");
+  assert.equal(ok({ workspace: "w", gpus: 0 }, {}).gpus, 0, "an explicit 0 is a request");
 });
 
 test("types are checked and nothing negative passes", () => {
@@ -149,20 +147,19 @@ test("max_sandboxes is a default and an upper bound: min(request, manifest, cap)
   assert.equal(ok({ ...GOOD, grant: { max_sandboxes: 99 } }, { max_sandboxes: 9 }).grant.max_sandboxes, 4);
 });
 
-test("gpus, cpu and memory above what the manifest declares are refused, naming the field", () => {
-  const m = { ...MANIFEST, container: { image: "i", resources: { "amd.com/gpu": "8", cpu: "8", memory: "32Gi" } } };
-  refused({ ...GOOD, gpus: 9 }, "resources.gpus", "exceeds the manifest maximum 8", {}, m);
+test("cpu and memory above what the manifest declares are refused, naming the field", () => {
+  const m = { ...MANIFEST, container: { image: "i", resources: { cpu: "8", memory: "32Gi" } } };
   refused({ ...GOOD, cpu: 8.5 }, "resources.cpu", "exceeds the manifest maximum 8", {}, m);
   refused({ ...GOOD, memory_gi: 33 }, "resources.memory_gi", "exceeds the manifest maximum 32Gi", {}, m);
   // At the maximum, below it, and in other units of the same quantity: allowed.
-  ok({ ...GOOD, gpus: 8, cpu: 8, memory_gi: 32 }, {}, m);
+  ok({ ...GOOD, cpu: 8, memory_gi: 32 }, {}, m);
   ok({ ...GOOD, cpu: 1, memory_gi: 1 }, {}, m);
   const small = { ...m, container: { image: "i", resources: { cpu: "500m", memory: "512Mi" } } };
   refused({ ...GOOD, cpu: 1 }, "resources.cpu", "exceeds", {}, small);
   refused({ ...GOOD, memory_gi: 1 }, "resources.memory_gi", "exceeds", {}, small);
   ok({ ...GOOD, cpu: 0.5, memory_gi: 0.5 }, {}, small);
   // Other spellings of a quantity are read, not skipped.
-  const exp = { ...m, container: { image: "i", resources: { cpu: "1e1", memory: "1e12", "amd.com/gpu": "8" } } };
+  const exp = { ...m, container: { image: "i", resources: { cpu: "1e1", memory: "1e12" } } };
   refused({ ...GOOD, cpu: 11 }, "resources.cpu", "exceeds", {}, exp);
   refused({ ...GOOD, memory_gi: 1000 }, "resources.memory_gi", "exceeds", {}, exp);
   ok({ ...GOOD, cpu: 10, memory_gi: 900 }, {}, exp);
