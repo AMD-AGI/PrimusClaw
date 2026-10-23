@@ -12,7 +12,7 @@
  * Secrets travel in the execute request's `env` map, never in the command
  * string: the Router and EnvD log every command string and neither logs the map.
  */
-import { resolveFirstJsonPointer, type AppManifestV1, type AppSandboxRole } from "@claw/protocol";
+import { type AppManifestV1, type AppSandboxRole } from "@claw/protocol";
 import { APP_SANDBOX_ROLES } from "@claw/protocol";
 
 /** Single-quote `s` for `sh`. */
@@ -141,28 +141,10 @@ export function startCommand(manifest: AppManifestV1, stateDir: string, tag: str
   ].join("\n");
 }
 
-function asEnvString(v: unknown): string {
-  return typeof v === "string" ? v : typeof v === "object" ? JSON.stringify(v) : String(v);
-}
-
-/** The values the manifest's `env_from_input` pointers find; a pointer that finds nothing sets nothing. */
-export function resolveEnvFromInput(
-  pointers: Record<string, string> | undefined,
-  input: Record<string, unknown>,
-): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [name, pointer] of Object.entries(pointers ?? {})) {
-    const hit = resolveFirstJsonPointer(input, pointer);
-    if (hit.found && hit.value !== null && hit.value !== undefined) out[name] = asEnvString(hit.value);
-  }
-  return out;
-}
-
 export interface AppEnvSources {
   runId: string;
   sessionId: string;
   createdAt: string;
-  input: Record<string, unknown>;
   manifest: AppManifestV1;
   stateDir: string;
   mcpToken: string;
@@ -173,7 +155,7 @@ export interface AppEnvSources {
 
 /**
  * The application's environment. Later sources win, in this order: the
- * manifest's `env`, `env_from_input`, the facilities `env_map` names, and last
+ * manifest's `env`, the facilities `env_map` names, and last
  * the two names the platform owns (`CLAW_SESSION_ID`, `NODE_NAME`), which a
  * manifest cannot set at all (validateAppManifest reserves them).
  *
@@ -184,10 +166,9 @@ export interface AppEnvSources {
 export function buildAppEnv(s: AppEnvSources): Record<string, string> {
   const { manifest } = s;
   const map = manifest.env_map ?? {};
-  const env: Record<string, string> = {
-    ...(manifest.env ?? {}),
-    ...resolveEnvFromInput(manifest.env_from_input, s.input),
-  };
+  // The run input is not a source: Claw hands it to the app as a file
+  // (`env_map.input_file`) and never reads a value out of it.
+  const env: Record<string, string> = { ...(manifest.env ?? {}) };
   const set = (name: string | undefined, value: string | undefined): void => {
     if (name && value !== undefined) env[name] = value;
   };

@@ -573,7 +573,6 @@ export class AppRunner {
       runId: this.runId,
       sessionId: rec.session_id,
       createdAt: rec.created_at,
-      input: rec.input,
       manifest: rec.manifest,
       stateDir,
       mcpToken: stored.mcp_token,

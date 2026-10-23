@@ -60,7 +60,7 @@ export async function createAppRun(
   req: FastifyRequest,
   sessionId: string,
   user: UserInfo,
-  body: { plugin_id?: unknown; input?: unknown },
+  body: { plugin_id?: unknown; input?: unknown; resources?: unknown },
 ): Promise<AppRunOutcome> {
   const idemKey = extractIdempotencyKey(req);
   const run = (): Promise<AppRunOutcome> => admitAppRun({

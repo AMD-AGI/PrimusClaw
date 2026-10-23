@@ -104,12 +104,7 @@ export function validateAgainstSchema(root: SchemaNode, value: unknown): SchemaI
       if (typeof schema.minLength === "number" && v.length < schema.minLength) {
         issues.push({ path: at, reason: schema.minLength === 1 ? "must not be empty" : `must be at least ${schema.minLength} characters` });
       } else if (typeof schema.pattern === "string" && !new RegExp(schema.pattern).test(v)) {
-        issues.push({
-          path: at,
-          reason: schema.format === "json-pointer"
-            ? `${JSON.stringify(v)} is not a JSON Pointer (RFC 6901: starts with "/", "~" only as "~0" or "~1")`
-            : `must match ${schema.pattern}`,
-        });
+        issues.push({ path: at, reason: `must match ${schema.pattern}` });
       }
     }
     if (typeof v === "number") {
