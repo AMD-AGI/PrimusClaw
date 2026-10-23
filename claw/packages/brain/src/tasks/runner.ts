@@ -4359,10 +4359,26 @@ class TaskRunner {
    */
   private async executeAppRun(): Promise<void> {
     const runId = this.request.task_id;
-    if (!runId) throw new AppRunFailedError("an app run needs a task id");
+    // Not an AppRunFailedError: that means the app run is already `ended` on its row
+    // (see handleRunFailure), and these two are refusals made before anything ran.
+    if (!runId) throw new Error("an app run needs a task id");
+    const epoch = this.heldGeneration();
     // Without it SaFE cannot be asked for anything, and every tick would fail the same way.
-    if (!this.platformKey) throw new AppRunFailedError("an app run needs the session owner's platform key");
-    const runner = fx().createAppRunner(runId, this.platformKey);
+    if (!this.platformKey) {
+      const closed = await fx().createAppRunner(runId, "", epoch)
+        .markEnded("the session owner's platform key is not available to this worker")
+        .catch((err) => { logger.error({ err: String(err?.message ?? err), taskId: runId }, "task.app_run_close_failed"); return false; });
+      // Any sandbox an earlier worker made is not stopped from here (no key to
+      // stop it with); it ends with its workload time limit.
+      if (!closed) {
+        // The row was not closed (another worker holds it, or it could not be written):
+        // it is not `ended`, so this is not the terminal AppRunFailedError.
+        logger.error({ taskId: runId }, "task.app_run_row_left_open_no_platform_key");
+        throw new Error("an app run needs the session owner's platform key");
+      }
+      throw new AppRunFailedError("an app run needs the session owner's platform key");
+    }
+    const runner = fx().createAppRunner(runId, this.platformKey, epoch);
     await this.onEvent({ type: "statusUpdate", agentStatus: "running" });
     await fx().postTaskRunning(this.request, { brainId: BRAIN_ID, attempt: this.attempt });
 

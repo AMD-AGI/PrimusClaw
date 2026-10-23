@@ -157,6 +157,9 @@ export class AppRunFailedError extends Error {
   }
 }
 
+/** The state directory could not be expanded in the sandbox: a configuration fault, not a transient one. */
+class StateDirError extends Error {}
+
 export type TickResult = { done: false } | { done: true; outcome: AppRunOutcome };
 
 export type AppRunResult =
@@ -200,6 +203,7 @@ export class AppRunner {
   private readonly finishAttempts = new Map<string, number>();
   private readonly finishDone = new Set<string>();
   private secrets: string[] = [];
+  private secretsLoaded = false;
   private readonly grant: AppGrantRunHooks;
   private readonly seams: AppRunnerSeams;
   private readonly now: () => number;
@@ -269,6 +273,9 @@ export class AppRunner {
         if (tick.done) return tick.outcome;
         failures = 0;
       } catch (err) {
+        // Another worker holds the run now: there is nothing left here to finish,
+        // and retrying a write that cannot succeed only holds the caller.
+        if (err instanceof AppRunWriteRefused && err.superseded) throw err;
         if (++failures >= FINISH_NOW_MAX_FAILURES) throw err;
         this.warnTickFailure(err);
       }
@@ -276,10 +283,29 @@ export class AppRunner {
     }
   }
 
+  /**
+   * Close the run's row as ended without running the finishing steps, for a run
+   * that cannot be driven at all (no platform key to reach SaFE with). Nothing
+   * is stopped: the caller says so. A refusal (another worker holds the run, or it
+   * already ended) is returned as false, not thrown.
+   */
+  async markEnded(error: string): Promise<boolean> {
+    try {
+      this.rec = await this.deps.store.patch(
+        this.runId, { state: "ended", last_exit: { at: this.iso(), cause: "start_failed", final: false, error: clip(error) } },
+      );
+      return true;
+    } catch (err) {
+      if (err instanceof AppRunWriteRefused) return false;
+      throw err;
+    }
+  }
+
   // ---- the machine --------------------------------------------------------
 
   private async tick(): Promise<TickResult> {
     this.rec = await this.deps.store.load(this.runId);
+    await this.loadSecrets();
     switch (this.rec.state) {
       case "provisioning": return this.inProvisioning();
       case "starting": return this.inStarting();
@@ -287,6 +313,23 @@ export class AppRunner {
       case "restarting": return this.inRestarting();
       case "finishing": return this.inFinishing();
       case "ended": return { done: true, outcome: outcomeOf(this.rec.last_exit) };
+    }
+  }
+
+  /**
+   * The run's secret values, for scrubbing what this worker logs and stores. Not
+   * only at launch: a worker that takes over a run already running, or restarts,
+   * never launches, and would print an application's error text unscrubbed. A
+   * failure is not fatal (the tick goes on, the next one asks again).
+   */
+  private async loadSecrets(): Promise<void> {
+    if (this.secretsLoaded) return;
+    try {
+      const stored = await this.deps.store.secrets(this.runId);
+      this.secrets = secretValuesOf({ mcpToken: stored.mcp_token, grantKeys: stored.grant_keys ?? {} });
+      this.secretsLoaded = true;
+    } catch (err) {
+      logger.warn({ runId: this.runId, err: this.safeText(err) }, "app_run.secrets_unavailable_for_scrub");
     }
   }
 
@@ -309,7 +352,17 @@ export class AppRunner {
     const lost = await this.sandboxLost();
     if (lost) return lost;
     const inst = this.instance()!;
-    const stateDir = await this.ensureStateDir(inst);
+    let stateDir: string;
+    try {
+      stateDir = await this.ensureStateDir(inst);
+    } catch (err) {
+      // A directory that cannot be expanded is the same on every tick: counted like
+      // a launch that keeps failing, so the run reaches the restart bound and ends
+      // instead of sitting in starting for ever. A transport failure (the exec
+      // itself) is not this, and is retried.
+      if (err instanceof StateDirError) return this.onStartFailure(err);
+      throw err;
+    }
     const verdict = await this.probe(inst, stateDir);
     if (verdict === "alive") {
       this.startFailures = 0;
@@ -362,7 +415,7 @@ export class AppRunner {
     );
     const dir = r.stdout.trim();
     if (r.exitCode !== 0 || !isUsableStateDir(dir)) {
-      throw new Error(`state_dir could not be expanded in the sandbox (exit ${r.exitCode})`);
+      throw new StateDirError(`state_dir could not be expanded in the sandbox (exit ${r.exitCode})`);
     }
     this.rec = await this.deps.store.patch(this.runId, { state_dir: dir });
     return dir;
@@ -394,9 +447,14 @@ export class AppRunner {
       return { done: false };
     }
 
+    // The environment comes from the platform (the API's secrets, the grant
+    // service, SaFE): a failure there is the platform's, not the application's. It
+    // is thrown, so the tick fails and the next one tries again, and it never
+    // counts toward the restart budget.
+    const env = await this.applicationEnv(stateDir);
     try {
       await this.writeFiles(inst, stateDir);
-      await this.startApplication(inst, stateDir);
+      await this.startApplication(inst, stateDir, env);
     } catch (err) {
       return this.onStartFailure(err);
     }
@@ -419,8 +477,7 @@ export class AppRunner {
     if (bootstrap) await put(bootstrap.file, Buffer.from(bootstrap.content_b64, "base64"), "700");
   }
 
-  private async startApplication(inst: SandboxInstance, stateDir: string): Promise<void> {
-    const env = await this.applicationEnv(stateDir);
+  private async startApplication(inst: SandboxInstance, stateDir: string, env: Record<string, string>): Promise<void> {
     const r = await this.deps.sandbox.exec(
       inst, startCommand(this.rec.manifest, stateDir, this.tag()), EXEC_TIMEOUT, { env },
     );
@@ -447,6 +504,7 @@ export class AppRunner {
       nodeName,
     };
     this.secrets = secretValuesOf(sources);
+    this.secretsLoaded = true;
     if (!nodeName) logger.warn({ runId: this.runId }, "app_run.node_name_unavailable");
     return buildAppEnv(sources);
   }

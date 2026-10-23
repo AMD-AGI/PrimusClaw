@@ -77,6 +77,8 @@ export class World {
   stopped: string[] = [];
   patches: Array<{ patch: AppRunPatch; expect?: AppRunState }> = [];
   /** fail the next N execs matching this predicate, as a transport error */
+  /** When set, the state directory expansion answers with this exit status. */
+  stateDirExit: number | null = null;
   failExec: { left: number; when: (cmd: string) => boolean } | null = null;
   failStore: ((patch: AppRunPatch) => Error | null) | null = null;
   private nextWl = 1;
@@ -181,7 +183,9 @@ export class World {
     const ok = (stdout = "") => ({ exitCode: 0, stdout, stderr: "" });
     const dir = STATE_DIR;
 
-    if (command.includes("USER_DATA_PATH") && command.includes("printf %s")) return ok(dir);
+    if (command.includes("USER_DATA_PATH") && command.includes("printf %s")) {
+      return this.stateDirExit === null ? ok(dir) : { exitCode: this.stateDirExit, stdout: "", stderr: "" };
+    }
     if (command.includes("base64 -d")) {
       const path = /> '([^']+)'\.tmp/.exec(command)![1]!;
       this.files.set(path, Buffer.from(opts!.env!.CLAW_FILE_B64!, "base64").toString("utf8"));
@@ -192,10 +196,6 @@ export class World {
       if (this.files.get(`${dir}/app.sandbox`) !== want) return ok("none\n");
       const pid = this.files.get(`${dir}/app.pid`);
       return ok(pid !== undefined && (this.procs.has(`${wl}:${pid}`) || this.strangers.has(`${wl}:${pid}`)) ? "alive\n" : "dead\n");
-    }
-    if (command.includes("exit.json") && command.includes("cat")) {
-      const exit = this.files.get(`${dir}/exit.json`);
-      return exit === undefined ? { exitCode: 3, stdout: "", stderr: "" } : ok(exit);
     }
     if (command.includes("setsid")) {
       const tag = /printf %s '([^']*)' >app\.sandbox/.exec(command)![1]!;
@@ -208,12 +208,18 @@ export class World {
           return ok("already\n");
         }
       }
+      // The start command removes the previous generation's exit record before launching.
+      if (command.includes("rm -f 'exit.json'")) this.files.delete(`${dir}/exit.json`);
       this.files.set(`${dir}/app.sandbox`, tag);
       const pid = String(this.nextPid++);
       this.files.set(`${dir}/app.pid`, pid);
       this.procs.add(`${wl}:${pid}`);
       this.starts.push({ wl, tag, env: { ...(opts?.env ?? {}) }, command });
       return ok("started\n");
+    }
+    if (command.includes("exit.json") && command.includes("cat")) {
+      const exit = this.files.get(`${dir}/exit.json`);
+      return exit === undefined ? { exitCode: 3, stdout: "", stderr: "" } : ok(exit);
     }
     throw new Error(`the fake does not know this command: ${command.slice(0, 80)}`);
   }

@@ -38,8 +38,9 @@ export function bindAppRunnerExtensions(ext: { grant?: AppGrantRunHooks; seams?:
   if (ext.seams) boundSeams = ext.seams;
 }
 
-export function createAppRunner(runId: string, platformKey: string): AppRunner {
-  const store = httpAppRunStore();
+/** `claimCount` is the epoch the caller holds the run at; every write to the row quotes it. */
+export function createAppRunner(runId: string, platformKey: string, claimCount: number): AppRunner {
+  const store = httpAppRunStore({ claimCount });
   return new AppRunner(runId, platformKey, {
     store, sandbox: realAppSandbox(store), grant: boundGrant, seams: boundSeams,
   });
