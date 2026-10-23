@@ -218,6 +218,33 @@ describe("mode=app task creation", { skip }, () => {
       assert.deepEqual(await counts(), { tasks: 1, runs: 1 });
     });
 
+    test("concurrent requests with one key and different bodies: one run, the other is idempotency_key_reused", async () => {
+      const all = await Promise.all([
+        create("s1", { input: { n: 1 } }, { "idempotency-key": "key-diff" }),
+        create("s1", { input: { n: 2 } }, { "idempotency-key": "key-diff" }),
+      ]);
+      assert.deepEqual(all.map((r) => r.statusCode).sort(), [200, 422], all.map((r) => r.body).join(" | "));
+      assert.equal(all.find((r) => r.statusCode === 422)!.json().error, "idempotency_key_reused");
+      assert.deepEqual(await counts(), { tasks: 1, runs: 1 });
+    });
+
+    test("with the feature off a keyed request is 501: no replay, and no read of a table that may not exist", async () => {
+      const a = await create("s1", {}, { "idempotency-key": "key-off" });
+      assert.equal(a.statusCode, 200);
+      ctx.ports.enabled = () => false;
+      const replayed = await create("s1", {}, { "idempotency-key": "key-off" });
+      assert.equal(replayed.statusCode, 501, replayed.body);
+      assert.equal(replayed.json().error, "app_runs_disabled");
+      // The schema guard lets claw_app_runs be absent when the flag is off.
+      await q("ALTER TABLE claw_app_runs RENAME TO claw_app_runs_away");
+      try {
+        const missing = await create("s1", {}, { "idempotency-key": "key-off-2" });
+        assert.equal(missing.statusCode, 501, missing.body);
+      } finally {
+        await q("ALTER TABLE claw_app_runs_away RENAME TO claw_app_runs");
+      }
+    });
+
     test("a different key on the same session is a second run and is refused while the first is open", async () => {
       await create("s1", {}, { "idempotency-key": "key-5" });
       const b = await create("s1", {}, { "idempotency-key": "key-6" });

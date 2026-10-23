@@ -46,7 +46,7 @@ const logger = pino({ name: "safe-workload-provider" });
 const HANDS_MCP_PORT = "9100";
 
 /** The run deadline gets an hour of room to be stopped in; a ceiling does not. */
-const SHUTDOWN_BUFFER_SECONDS = 3600;
+export const SHUTDOWN_BUFFER_SECONDS = 3600;
 
 /**
  * How long SaFE lets this workload run, in seconds.
@@ -306,13 +306,15 @@ export async function pollWorkloadUntilRunning(
   apiKey: string,
   onEvent?: (evt: Record<string, unknown>) => Promise<void>,
   deps?: PollDeps,
+  /** Event-name prefix of the wait's logs (`<prefix>.poll_error`); `hands` unless another owner says so. */
+  logPrefix = "hands",
 ): Promise<void> {
   await onEvent?.({ type: "sandboxStatus", event: "phase", phase: "Creating", status: "creating", log: "" });
 
   await waitForWorkloadReady({
     workloadId,
     apiKey,
-    logPrefix: "hands",
+    logPrefix,
     isReady: (detail) => String(detail.phase ?? "").toLowerCase() === "running",
     onReady: async ({ queuePosition }) => {
       await onEvent?.({ type: "sandboxStatus", event: "phase", phase: "Running", status: "running", queuePosition });

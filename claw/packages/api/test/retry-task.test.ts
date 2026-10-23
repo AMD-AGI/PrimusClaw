@@ -77,3 +77,41 @@ test("the retried_into marker rides the caller's transaction", async () => {
   // top of retryTask, so a concurrent metadata writer is not reverted.
   assert.match(marker, /\|\| jsonb_build_object\('retried_into', \$2::text\)/);
 });
+
+/**
+ * An app run is a task row plus a claw_app_runs row, a frozen manifest and a
+ * grant, all made by the app admission path. The clone makes none of them, and
+ * would be a queued twin with no grant that the one-active-run check cannot see.
+ */
+test("a failed app row is not cloned", async () => {
+  const seen: string[] = [];
+  db.query = (async (text: string, params: unknown[] = []) => {
+    seen.push(text.replace(/\s+/g, " ").trim());
+    if (/SELECT \* FROM claw_tasks WHERE task_id/.test(text)) {
+      return {
+        rows: [{ task_id: params[0], status: "failed", origin: "task", mode: "app", dag_root_task_id: null, metadata: {}, input: {} }],
+        rowCount: 1,
+      };
+    }
+    throw new Error(`unexpected query: ${text}`);
+  }) as typeof db.query;
+
+  assert.deepEqual(await retryTask("ktsk_app"), { ok: false });
+  assert.equal(seen.length, 1, "must not INSERT a replacement after refusing");
+});
+
+test("control: the same failed row in an ordinary mode is cloned", async () => {
+  db.query = (async () => { throw new Error("pool must not be used"); }) as typeof db.query;
+  const client = {
+    query: async (text: string, params: unknown[] = []) => {
+      if (/SELECT \* FROM claw_tasks WHERE task_id/.test(text)) {
+        return {
+          rows: [{ task_id: params[0], status: "failed", origin: "task", mode: "llm", dag_root_task_id: null, metadata: {}, input: {} }],
+          rowCount: 1,
+        };
+      }
+      return { rows: [], rowCount: 1 };
+    },
+  };
+  assert.equal((await retryTask("ktsk_llm", client as unknown as PoolClient)).ok, true);
+});

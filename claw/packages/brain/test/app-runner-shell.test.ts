@@ -208,7 +208,7 @@ test("a manifest argument with a quote and a space reaches the process intact", 
 
 test("a start lock left by another sandbox is stale, even when its pid is alive here", async () => {
   const w = realWorld("sleep 30");
-  const { mkdirSync, writeFileSync } = await import("node:fs");
+  const { mkdirSync } = await import("node:fs");
   mkdirSync(w.stateDir, { recursive: true });
   // A lock from a gone container whose pid number is, by bad luck, a live process in this one: this test's own.
   const { symlinkSync } = await import("node:fs");
@@ -230,7 +230,7 @@ test("a lock directory left by an older version is stale, not a holder", async (
 
 test("a live lock of this sandbox still says busy", async () => {
   const w = realWorld("sleep 30");
-  const { mkdirSync, writeFileSync } = await import("node:fs");
+  const { mkdirSync } = await import("node:fs");
   mkdirSync(w.stateDir, { recursive: true });
   const { symlinkSync } = await import("node:fs");
   symlinkSync(`${process.pid}|wl-1`, `${w.stateDir}/.start.lock`);
