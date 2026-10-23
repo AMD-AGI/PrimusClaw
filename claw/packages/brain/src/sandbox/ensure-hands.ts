@@ -2822,7 +2822,7 @@ async function provisionHands(
       );
     }
     logger.info(
-      { sessionId, workloadId, topologyFile: env.CLAW_TOPOLOGY_FILE },
+      { sessionId, workloadId, topologyFile: env.TOPOLOGY_HANDOFF_FILE },
       "ensureHands.mn_topology_written",
     );
   }

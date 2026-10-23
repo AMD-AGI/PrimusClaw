@@ -6,7 +6,7 @@
  * already provisioned for the run.
  *
  * It is delivered as a JSON file, and the file's path is the value of
- * `CLAW_TOPOLOGY_FILE` in the sandbox env. Claw owns this contract; a reader
+ * `TOPOLOGY_HANDOFF_FILE` in the sandbox env. Claw owns this contract; a reader
  * needs nothing but this shape.
  *
  * Credentials are never carried inline. A token or a private key is its own
@@ -18,7 +18,7 @@
  * rather than written as empty strings.
  */
 
-export const TOPOLOGY_HANDOFF_SCHEMA = "claw.topology-handoff/v1" as const;
+export const TOPOLOGY_HANDOFF_SCHEMA = "topology-handoff/v1" as const;
 
 /** Workspace-relative location of the handoff file. */
 export const TOPOLOGY_HANDOFF_RELATIVE_PATH = ".claw/topology.json";
