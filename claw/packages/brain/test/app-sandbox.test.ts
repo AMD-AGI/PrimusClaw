@@ -209,6 +209,7 @@ test("adopting a Pending workload records its id before the wait, so a failed wa
     /sandbox_pending_timeout/,
   );
   assert.deepEqual(recorded, ["wl-1"]);
+  assert.deepEqual(safe.stopped, ["wl-1"], "a workload that cannot be brought to Running is stopped, not adopted again for ever");
 });
 
 test("a create that fails after the workload exists stops it", async () => {
