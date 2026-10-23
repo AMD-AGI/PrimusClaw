@@ -359,13 +359,6 @@ export const CLAW_MEMORY_ENABLED = envBool("CLAW_MEMORY_ENABLED", false);
 export const CLAW_SKILL_EVOLUTION_ENABLED = envBool("CLAW_SKILL_EVOLUTION_ENABLED", false);
 
 /**
- * Chat (and queued-chat) dispatch publishes a doorbell and injects credentials
- * at claim time, instead of putting the full execute request on JetStream.
- *
- * On by default. The capability floor keeps each API on fat dispatch until the
- * fleet explicitly asserts support for this binary's semantics version.
- */
-/**
  * Accept `mode: "app"` on `POST /v1/sessions/:sessionId/tasks`. Off by default:
  * until the Brain side runs apps, an admitted app run is refused there as not
  * implemented, so nothing is gained by taking one in.
@@ -375,11 +368,18 @@ export const APP_RUNS_ENABLED = envBool("APP_RUNS_ENABLED", false);
 /**
  * Platform caps on what an app run's grant may carry, as JSON of the grant
  * shape: `{"max_sandboxes":8,"max_gpus":8,"gpu_hours":500,"max_runtime_sec":172800}`.
- * Each grant item is the smaller of the request and its cap; an item with no
- * cap is the request as it is. A value that is not that shape stops start-up.
+ * Each grant item is the smallest of the request, the manifest's limit (where it
+ * has one) and its cap; an item with none of them is unbounded. A value that is not that shape stops start-up.
  */
 export const APP_SANDBOX_CAPS = parseAppSandboxCaps(process.env.APP_SANDBOX_CAPS);
 
+/**
+ * Chat (and queued-chat) dispatch publishes a doorbell and injects credentials
+ * at claim time, instead of putting the full execute request on JetStream.
+ *
+ * On by default. The capability floor keeps each API on fat dispatch until the
+ * fleet explicitly asserts support for this binary's semantics version.
+ */
 export const RUN_DOORBELL_DISPATCH = envBool("RUN_DOORBELL_DISPATCH", true);
 
 /**

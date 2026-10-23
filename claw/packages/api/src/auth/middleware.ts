@@ -40,7 +40,7 @@ let devBypassWarned = false;
  * value shipped in `.env.example`, so any deployment that copied the example
  * file served every anonymous caller a `system-admin` identity.
  */
-function devAuthBypassEnabled(): boolean {
+export function devAuthBypassEnabled(): boolean {
   const optIn = (process.env.CLAW_INSECURE_DEV_AUTH ?? "").trim() === "1";
   if (!optIn) return false;
   if (!isDevMode()) {
