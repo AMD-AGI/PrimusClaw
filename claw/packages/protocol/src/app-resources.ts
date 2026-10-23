@@ -16,8 +16,8 @@
  *    (what the app may later ask Agent Sandbox for).
  *
  * Claw validates `resources` against the manifest, fills absent items from the
- * manifest's defaults, and takes each grant item as the smaller of the request
- * and the platform cap (`APP_SANDBOX_CAPS`). An item with no cap configured is
+ * manifest's defaults, and takes each grant item as the smallest of the request,
+ * the manifest's `limits` and the platform cap (`APP_SANDBOX_CAPS`). An item with no bound is
  * the request as it is. An item the request omits but a cap names is the cap:
  * leaving it out must not mean "unlimited". The effective grant is what Claw
  * stores and what the app sees through `env_map.grant_limits`.
@@ -125,9 +125,26 @@ export function parseAppSandboxCaps(raw: string | undefined): AppGrantLimits {
   return v as AppGrantLimits;
 }
 
-/** An item is the smaller of request and cap; a cap alone stands in for an absent request. */
-const capped = (request: number | undefined, cap: number | undefined): number | undefined =>
-  cap === undefined ? request : request === undefined ? cap : Math.min(request, cap);
+/** The smallest of the values that are set: a bound alone stands in for an absent request. */
+const smallest = (...values: Array<number | undefined>): number | undefined => {
+  const set = values.filter((x): x is number => x !== undefined);
+  return set.length === 0 ? undefined : Math.min(...set);
+};
+
+/** A Kubernetes cpu quantity ("8", "2.5", "500m") in cores; undefined when not one. */
+function cpuCores(q: string | undefined): number | undefined {
+  const m = q === undefined ? null : /^([0-9]+(?:\.[0-9]+)?)(m?)$/.exec(q.trim());
+  return m ? Number(m[1]) / (m[2] ? 1000 : 1) : undefined;
+}
+
+const MEMORY_UNITS: Record<string, number> = {
+  "": 1, K: 1e3, M: 1e6, G: 1e9, T: 1e12, Ki: 1024, Mi: 1024 ** 2, Gi: 1024 ** 3, Ti: 1024 ** 4,
+};
+/** A Kubernetes memory quantity ("32Gi", "512Mi", "1G") in GiB; undefined when not one. */
+function memoryGi(q: string | undefined): number | undefined {
+  const m = q === undefined ? null : /^([0-9]+(?:\.[0-9]+)?)(Ki|Mi|Gi|Ti|K|M|G|T)?$/.exec(q.trim());
+  return m ? (Number(m[1]) * MEMORY_UNITS[m[2] ?? ""]!) / 1024 ** 3 : undefined;
+}
 
 /**
  * Validate `resources` and work out what the run gets. `{ issues }` lists every
@@ -135,9 +152,11 @@ const capped = (request: number | undefined, cap: number | undefined): number | 
  *
  * Defaults, in order: the request, then the manifest. A run with no image, no
  * GPU count or no workspace from either is refused rather than started with a
- * guess. The grant: the request's item (or the manifest's `limits` default),
- * then the platform cap per item; `max_runtime_sec` is also bounded by the
- * manifest's `limits.max_runtime_sec`.
+ * guess. A `gpus`, `cpu` or `memory_gi` above what the manifest declares for that
+ * resource in `container.resources` is refused, naming the field. The grant: each
+ * item is the smallest of the request, the manifest's `limits` value (where the
+ * manifest has one: `max_sandboxes`, `max_runtime_sec`) and the platform cap; an
+ * absent request takes the smaller of the other two.
  */
 export function resolveAppResources(
   manifest: AppManifestV1,
@@ -183,6 +202,17 @@ export function resolveAppResources(
   if (r.cpu !== undefined && !isQuantity(r.cpu)) issues.push({ field: "resources.cpu", reason: "must be a number > 0" });
   if (r.memory_gi !== undefined && !isQuantity(r.memory_gi)) issues.push({ field: "resources.memory_gi", reason: "must be a number > 0" });
 
+  // The manifest's container resources are also the most a request may ask for.
+  const declared = manifest.container.resources ?? {};
+  const over = (field: string, asked: unknown, max: number | undefined, text: string | undefined): void => {
+    if (typeof asked === "number" && max !== undefined && asked > max) {
+      issues.push({ field, reason: `exceeds the manifest maximum ${text}` });
+    }
+  };
+  over("resources.gpus", r.gpus, /^[0-9]+$/.test(declared[APP_GPU_RESOURCE] ?? "") ? Number(declared[APP_GPU_RESOURCE]) : undefined, declared[APP_GPU_RESOURCE]);
+  over("resources.cpu", r.cpu, cpuCores(declared.cpu), declared.cpu);
+  over("resources.memory_gi", r.memory_gi, memoryGi(declared.memory), declared.memory);
+
   const req: AppGrantLimits = {};
   if (r.grant !== undefined) {
     const before = issues.length;
@@ -193,15 +223,14 @@ export function resolveAppResources(
   if (issues.length > 0 || image === undefined || gpus === undefined || workspace === undefined) return { issues };
 
   const grant: AppGrantLimits = {};
-  const sandboxes = capped(req.max_sandboxes ?? manifest.limits?.max_sandboxes, caps.max_sandboxes);
+  const sandboxes = smallest(req.max_sandboxes, manifest.limits?.max_sandboxes, caps.max_sandboxes);
   if (sandboxes !== undefined) grant.max_sandboxes = sandboxes;
-  const gpuTotal = capped(req.max_gpus, caps.max_gpus);
+  const gpuTotal = smallest(req.max_gpus, caps.max_gpus);
   if (gpuTotal !== undefined) grant.max_gpus = gpuTotal;
-  const hours = capped(req.gpu_hours, caps.gpu_hours);
+  const hours = smallest(req.gpu_hours, caps.gpu_hours);
   if (hours !== undefined) grant.gpu_hours = hours;
-  const runtime = [req.max_runtime_sec, manifest.limits?.max_runtime_sec, caps.max_runtime_sec]
-    .filter((x): x is number => x !== undefined);
-  if (runtime.length > 0) grant.max_runtime_sec = Math.min(...runtime);
+  const runtime = smallest(req.max_runtime_sec, manifest.limits?.max_runtime_sec, caps.max_runtime_sec);
+  if (runtime !== undefined) grant.max_runtime_sec = runtime;
 
   const out: ResolvedAppResources = { image, gpus, workspace, sandboxWorkspace: sandboxWorkspace ?? workspace, grant };
   if (r.cpu !== undefined) out.cpu = r.cpu as number;
