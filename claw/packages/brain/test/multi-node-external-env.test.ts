@@ -61,6 +61,43 @@ test("rayjob env points Hyperloom at the head's dashboard/GCS control plane", ()
   assert.equal(env.HYPERLOOM_MN_EXT_PREFILL_IPS, undefined);
 });
 
+test("sglangrouter env points at the router and does not hand over an SSH control plane", () => {
+  const env: Record<string, string> = { SAFE_API_URL: "https://safe.example" };
+  applyMultiNodeExternalEnv(env, {
+    backend: "sglangrouter",
+    provider: "safe",
+    name: "msg1-sglangrouter",
+    namespace: "test-workspace",
+    nodeCount: 2,
+    serviceUrl: "http://msg1-sglangrouter.test-workspace.svc.cluster.local:8000",
+  });
+  assert.equal(env.INFERENCE_OPTIMIZER_MN_BACKEND, "sglangrouter");
+  assert.equal(env.HYPERLOOM_MN_EXT_SSH_KEY, undefined);
+  assert.equal(env.HYPERLOOM_MN_EXT_PREFILL_IPS, undefined);
+});
+
+test("atom env points at the router and does not hand over an SSH control plane", () => {
+  const env: Record<string, string> = { SAFE_API_URL: "https://safe.example" };
+  const ctx: MultiNodeContext = {
+    backend: "atom",
+    provider: "safe",
+    name: "msg1-atom",
+    namespace: "test-workspace",
+    nodeCount: 2,
+    serviceUrl: "http://msg1-atom.test-workspace.svc.cluster.local:8000",
+  };
+  applyMultiNodeExternalEnv(env, ctx);
+
+  assert.equal(env.SAFE_API_URL, undefined);
+  assert.equal(env.INFERENCE_OPTIMIZER_MN_BACKEND, "atom");
+  assert.equal(env.INFERENCE_OPTIMIZER_NODES, "2");
+  assert.equal(env.HYPERLOOM_MN_EXT_SERVICE_URL, ctx.serviceUrl);
+  assert.equal(env.HYPERLOOM_MN_EXT_SSH_KEY, undefined);
+  assert.equal(env.HYPERLOOM_MN_EXT_SSH_PORT, undefined);
+  assert.equal(env.HYPERLOOM_MN_EXT_PREFILL_IPS, undefined);
+  assert.equal(env.HYPERLOOM_MN_EXT_HEAD_IP, undefined);
+});
+
 test("infera env exposes the SSH control plane and per-role pod IPs", () => {
   const env: Record<string, string> = { SAFE_API_URL: "https://safe.example" };
   applyMultiNodeExternalEnv(env, INFERA_CTX);

@@ -14,12 +14,12 @@
 // Flag names, units and defaults mirror Hyperloom
 // `inference_optimizer/cli/parser.py`:
 //   --nodes                total GPU nodes (head + workers), default 1
-//   --mn-backend           rayjob | infera; no default, required for multi-node
+//   --mn-backend           rayjob | infera | atom | sglangrouter; no default, required for multi-node
 //   --mn-image             cluster image; falls back to the sandbox image
 //   --gpus-per-node        default 8
 //   --cpus-per-node        default 96
 //   --mem-per-node         GiB, default 1024
-//   --model                model path/id (infera frontend --router-tokenizer-path)
+//   --model                model path/id (infera frontend, or atom/sglangrouter --model-path)
 //   --framework            infera backend framework: sglang | vllm, default sglang
 //   --pd-transfer-backend  infera KV transfer: nixl | mori | mooncake, default mori
 //   --pd-mode              aggregated | disaggregated, default aggregated
@@ -59,7 +59,7 @@ const RESERVED_EXTRA_ENV = new Set([
   "MN_SSH_PORT",
 ]);
 
-export type MultiNodeBackendFlag = "rayjob" | "infera";
+export type MultiNodeBackendFlag = "rayjob" | "infera" | "atom" | "sglangrouter";
 export type PdMode = "aggregated" | "disaggregated";
 
 export interface MultiNodePromptSpec {
@@ -74,7 +74,7 @@ export interface MultiNodePromptSpec {
   image: string;
   /** `--extra-env K=V` entries (repeatable), injected into the cluster containers. */
   extraEnv: Record<string, string>;
-  /** `--model`; required by the infera frontend, unused by rayjob. */
+  /** `--model`; required by infera, atom, and sglangrouter, unused by rayjob. */
   model: string;
   /** `--framework`, validated against the Infera enum. */
   framework: string;
@@ -189,7 +189,7 @@ export function requestedNodeCount(prompt: string): number {
 /** `--mn-backend`, or null when the flag is absent or outside the enum. */
 function readBackendFlag(prompt: string): MultiNodeBackendFlag | null {
   const raw = (readFlag(prompt, "mn-backend") ?? "").toLowerCase();
-  return raw === "rayjob" || raw === "infera" ? raw : null;
+  return raw === "rayjob" || raw === "infera" || raw === "atom" || raw === "sglangrouter" ? raw : null;
 }
 
 /**
@@ -239,13 +239,20 @@ export function parseMultiNodePromptFlags(prompt: string): MultiNodePromptSpec |
   };
 }
 
-/** Fail fast when infera multi-node is missing the required --model flag. */
+/**
+ * Fail fast when a backend that launches from `--model` is missing it.
+ *
+ * Infera's frontend takes the path as `--router-tokenizer-path`. Atom and
+ * SGLangRouter prefill and decode take it as `--model-path`. Either cluster
+ * would otherwise come up and then fail to serve.
+ */
 export function assertMultiNodeInferaModel(spec: MultiNodePromptSpec): void {
-  if (spec.backend === "infera" && !spec.model.trim()) {
-    throw new Error(
-      "multi-node infera request requires --model (infera frontend --router-tokenizer-path)",
-    );
-  }
+  if (spec.backend === "rayjob") return;
+  if (spec.model.trim()) return;
+  const where = spec.backend === "infera"
+    ? "infera frontend --router-tokenizer-path"
+    : `${spec.backend} prefill/decode --model-path`;
+  throw new Error(`model is required (${where})`);
 }
 
 /** Ephemeral storage per node in GiB, for the SaFE workload bodies. */

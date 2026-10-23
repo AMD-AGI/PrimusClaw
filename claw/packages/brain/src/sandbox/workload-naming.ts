@@ -10,6 +10,8 @@
  *   claw-1785291793209-sandbox    the Hands sandbox (session-scoped)
  *   claw-1785291151001-ray        a multi-node RayJob cluster (message-scoped)
  *   claw-1785291151001-infera     a multi-node InferaDeployment (message-scoped)
+ *   claw-1785291151001-atom       a multi-node Atom workload (message-scoped)
+ *   claw-1785291151001-sglangrouter  a multi-node SGLangRouter workload (message-scoped)
  *
  * SaFE appends its own random suffix to derive the workload id, so these names
  * are prefixes of the ids seen in the cluster.
@@ -31,9 +33,15 @@ export function sandboxWorkloadName(now: number = Date.now()): string {
  * `claw-<epoch-ms>`) rather than the clock, so a redelivered message maps onto
  * the same name.
  */
-export function multiNodeWorkloadName(messageId: string, backend: "rayjob" | "infera"): string {
+export function multiNodeWorkloadName(
+  messageId: string,
+  backend: "rayjob" | "infera" | "atom" | "sglangrouter",
+): string {
   const base = sanitizeMessageIdBase(messageId);
-  const suffix = backend === "infera" ? "-infera" : "-ray";
+  const suffix = backend === "infera" ? "-infera"
+    : backend === "atom" ? "-atom"
+    : backend === "sglangrouter" ? "-sglangrouter"
+    : "-ray";
   const maxBaseLen = MAX_NAME_LEN - suffix.length;
   const trimmed = base.length > maxBaseLen ? base.slice(0, maxBaseLen).replace(/-+$/, "") : base;
   return `${trimmed}${suffix}`;

@@ -62,6 +62,16 @@ test("the backend has to be stated", () => {
   assert.ok(errs({ nodes: 4 }).some((m) => m.includes("backend")));
 });
 
+test("sglangrouter without a model is refused at declaration time", () => {
+  assert.ok(errs({ nodes: 2, backend: "sglangrouter" }).some((m) => m.includes("model")));
+  ok({ nodes: 2, backend: "sglangrouter", model: "/models/Qwen3-14B" });
+});
+
+test("atom without a model is refused at declaration time", () => {
+  assert.ok(errs({ nodes: 2, backend: "atom" }).some((m) => m.includes("model")));
+  ok({ nodes: 2, backend: "atom", model: "/shared_nfs/models/Qwen3-14B-FP8" });
+});
+
 test("infera without a model is refused at declaration time", () => {
   // The frontend takes it as --router-tokenizer-path. Without it the cluster
   // comes up, costs money, and the frontend cannot start.
