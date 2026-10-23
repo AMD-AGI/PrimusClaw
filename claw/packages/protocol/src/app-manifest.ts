@@ -135,8 +135,8 @@ export interface AppRestart {
 }
 
 export interface AppLimits {
-  /** Default per-role sandbox ceiling when the request's `grant` omits it; the platform cap applies after. */
-  max_sandboxes?: { [R in AppSandboxRole]?: number };
+  /** Default for the grant's `max_sandboxes` when the request omits it; the platform cap applies after. */
+  max_sandboxes?: number;
   /** Maximum run time: the grant's `max_runtime_sec` is the smaller of this and the request. */
   max_runtime_sec?: number;
   /** The only thing Claw checks about `input`: its size. */
@@ -277,7 +277,7 @@ export const APP_MANIFEST_JSON_SCHEMA = {
       type: "object",
       additionalProperties: false,
       properties: {
-        max_sandboxes: closedSet(APP_SANDBOX_ROLES, posInt),
+        max_sandboxes: posInt,
         max_runtime_sec: posInt,
         input_max_bytes: posInt,
       },
@@ -350,7 +350,6 @@ export function validateAppManifest(value: unknown): AppManifestIssue[] {
     if (!hasRole(role)) bad(`${section}.${key}`, `role ${JSON.stringify(role)} is not declared in sandbox_roles`);
   };
   for (const role of Object.keys(obj(obj(value.env_map).sandbox_keys))) needRole("env_map.sandbox_keys", role, role);
-  for (const role of Object.keys(obj(obj(value.limits).max_sandboxes))) needRole("limits.max_sandboxes", role, role);
 
   // Variables: no collisions, nothing the platform owns.
   const envMap = obj(value.env_map);
