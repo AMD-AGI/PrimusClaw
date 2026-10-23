@@ -25,14 +25,15 @@ const MANIFEST = {
   schema: APP_MANIFEST_SCHEMA,
   name: "example-app",
   version: "1.0.0",
-  container: { image_from_input: "/image", workspace_from_input: "/ws" },
+  container: {},
   state_dir: "${USER_DATA_PATH}/.claw-apps/${run_id}",
   command: ["sh", "-c", "exec app"],
   restart: { max_restarts: 2, backoff_sec: [5] },
   env_map: { mcp_token: "APP_MCP_TOKEN" },
   mcp: { port: 8765, path: "/mcp", token_header: "X-App-Token" },
 };
-const INPUT = { image: "registry.example.invalid/app:1", ws: "ws-ok" };
+const INPUT = { note: "the app's own request; Claw does not read it" };
+const RESOURCES = { image: "registry.example.invalid/app:1", gpus: 0, workspace: "ws-ok" };
 
 describe("internal app-run routes", { skip }, () => {
   let h: AdmissionCluster;
@@ -82,7 +83,7 @@ describe("internal app-run routes", { skip }, () => {
       : { issue: async () => undefined };
     const res = await app.inject({
       method: "POST", url: "/v1/sessions/s1/tasks",
-      payload: { mode: "app", plugin_id: plugin, input: INPUT },
+      payload: { mode: "app", plugin_id: plugin, input: INPUT, resources: RESOURCES },
     });
     assert.equal(res.statusCode, 200, res.body);
     return res.json().task_id as string;
@@ -133,7 +134,7 @@ describe("internal app-run routes", { skip }, () => {
       assert.deepEqual(run.manifest, MANIFEST);
       assert.deepEqual(run.input, INPUT);
       assert.equal(run.workspace_id, "ws-ok");
-      assert.equal(run.sandbox_spec.image, INPUT.image);
+      assert.equal(run.sandbox_spec.image, RESOURCES.image);
       assert.ok(typeof run.created_at === "string" && !Number.isNaN(Date.parse(run.created_at)));
       const token = secrets.openAppRunSecret((await row()).mcp_token_enc, taskId, "mcp_token");
       assert.ok(!res.body.includes(token), "the state read never carries the token");
