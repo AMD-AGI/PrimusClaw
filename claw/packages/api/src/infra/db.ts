@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: MIT
 
 import pg from "pg";
-import { DATABASE_URL, envInt } from "../config.js";
+import { APP_RUNS_ENABLED, DATABASE_URL, envInt } from "../config.js";
 import pino from "pino";
 import {
   REQUIRED_SCHEMA,
-  missingSchemaObjects,
+  classifySchemaProblems,
   type PresentColumn,
 } from "./schema-guard.js";
 
@@ -420,7 +420,13 @@ async function assertSchema(client: pg.PoolClient): Promise<void> {
         AND table_name = ANY($1)`,
     [tables],
   );
-  const problems = missingSchemaObjects(REQUIRED_SCHEMA, present.rows as PresentColumn[]);
+  // The app-run tables are needed only where app runs are accepted: with
+  // APP_RUNS_ENABLED off they are a warning, so a database that has not been
+  // migrated for them still serves everything else.
+  const { fatal: problems, warnings } = classifySchemaProblems(
+    REQUIRED_SCHEMA, present.rows as PresentColumn[], APP_RUNS_ENABLED,
+  );
+  if (warnings.length > 0) logger.warn({ problems: warnings }, "db.app_run_schema_incomplete (APP_RUNS_ENABLED is off: not fatal)");
   if (problems.length > 0) {
     logger.error({ problems }, "db.schema_incomplete");
     throw new Error(`database schema is incomplete after migration: ${problems.join("; ")}`);
@@ -1807,10 +1813,16 @@ export async function initDb(): Promise<void> {
         grant_limits         JSONB,
         grant_expires_at     TIMESTAMPTZ,
         grant_revoked_at     TIMESTAMPTZ,
+        created_by           TEXT,
+        request_hash         TEXT,
         created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
+    // Who created the run and a hash of the request, so an Idempotency-Key replay
+    // can refuse another user and a different request body.
+    await client.query("ALTER TABLE claw_app_runs ADD COLUMN IF NOT EXISTS created_by TEXT").catch(() => {});
+    await client.query("ALTER TABLE claw_app_runs ADD COLUMN IF NOT EXISTS request_hash TEXT").catch(() => {});
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_app_runs_session ON claw_app_runs(session_id)",
     );
