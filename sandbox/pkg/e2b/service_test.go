@@ -225,6 +225,28 @@ func TestCreateReplayKillAndQuota(t *testing.T) {
 	}
 }
 
+func TestListFiltersHyperloomMetadata(t *testing.T) {
+	svc, _, keys := testPlane(t, 600, []int32{1}, 4)
+	key := keys["measurement"]
+	for _, purpose := range []string{"measure", "other"} {
+		_, _, err := svc.Create(context.Background(), key, CreateBody{
+			TemplateID: "ar-01ja-runner-g1",
+			Metadata: map[string]string{
+				"idempotency-key":   purpose,
+				"hyperloom.run-id":  "run-9",
+				"hyperloom.purpose": purpose,
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	listed, err := svc.List(context.Background(), key, "hyperloom.run-id=run-9&hyperloom.purpose=measure", "", "", 0)
+	if err != nil || len(listed.Sandboxes) != 1 || listed.Sandboxes[0].Metadata["hyperloom.purpose"] != "measure" {
+		t.Fatalf("listed=%+v err=%v", listed, err)
+	}
+}
+
 func TestCreateRefusesMetadataEnvAndTimeout(t *testing.T) {
 	svc, _, keys := testPlane(t, 600, []int32{1, 8}, 4)
 	key := keys["measurement"]

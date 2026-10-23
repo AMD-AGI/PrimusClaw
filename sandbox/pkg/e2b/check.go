@@ -37,7 +37,7 @@ var reservedMetadataKeys = map[string]struct{}{
 	"nodes":              {},
 }
 
-// checkMetadata accepts caller keys and the agent-sandbox.io/ and claw.io/ prefixes.
+// checkMetadata accepts caller keys and the agent-sandbox.io/, claw.io/, and hyperloom. prefixes.
 func checkMetadata(md map[string]string) error {
 	for key := range md {
 		if _, ok := reservedMetadataKeys[key]; ok {
@@ -46,7 +46,7 @@ func checkMetadata(md map[string]string) error {
 		if _, ok := callerMetadataKeys[key]; ok {
 			continue
 		}
-		if strings.HasPrefix(key, "agent-sandbox.io/") || strings.HasPrefix(key, "claw.io/") {
+		if strings.HasPrefix(key, "agent-sandbox.io/") || strings.HasPrefix(key, "claw.io/") || strings.HasPrefix(key, "hyperloom.") {
 			continue
 		}
 		return grant.Op(http.StatusForbidden, "metadata_not_allowed", key)
