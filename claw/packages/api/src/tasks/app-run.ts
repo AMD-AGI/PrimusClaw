@@ -9,12 +9,15 @@
  * this module owns the decisions, in the order the design gives them:
  *
  *   1. the plugin exists, the caller may use it, and its manifest is valid;
- *   2. the input is a JSON object within the manifest's size limit;
- *   3. every workspace a `*_from_input` pointer names exists and the caller may
- *      use it;
- *   4. the session has no other unfinished app run.
+ *   2. the input is a JSON object within the manifest's size limit (its size is
+ *      the only thing looked at: Claw never parses the input, it hands it to the
+ *      app as it came);
+ *   3. `resources` (image, gpus, workspace, cpu, memory, grant) is valid for the
+ *      manifest, and the grant is clamped to the platform caps;
+ *   4. every workspace `resources` names exists and the caller may use it;
+ *   5. the session has no other unfinished app run.
  *
- * Checks 1-3 read only, and run before any transaction is opened. Check 4 and
+ * Checks 1-4 read only, and run before any transaction is opened. Check 5 and
  * the writes run inside `withAdmissionTransaction`, so a refusal at any point
  * leaves no `claw_tasks` row and no `claw_app_runs` row behind.
  *
@@ -25,14 +28,19 @@
 import { createHash } from "node:crypto";
 import type { PoolClient } from "pg";
 import {
+  APP_GPU_RESOURCE,
   APP_SANDBOX_ROLES,
-  resolveFirstJsonPointer,
+  appGrantTemplates,
+  resolveAppResources,
   validateAppManifest,
+  type AppGrantLimits,
   type AppManifestIssue,
   type AppManifestV1,
+  type AppResourcesIssue,
   type AppSandboxRole,
+  type ResolvedAppResources,
 } from "@claw/protocol";
-import { APP_RUNS_ENABLED, SAFE_API_URL } from "../config.js";
+import { APP_RUNS_ENABLED, APP_SANDBOX_CAPS, SAFE_API_URL } from "../config.js";
 import { isAdmin, type UserInfo } from "../auth/models.js";
 import { MissingPlatformKeyError, stampSessionCredentials } from "../auth/session-credentials.js";
 import { newMcpToken, sealAppRunSecret } from "../crypto/app-run-secrets.js";
@@ -71,6 +79,14 @@ export interface AppGrantIssued {
   expiresAt?: Date | string | null;
 }
 
+/** What the grant is issued from: the run's effective resources and the templates it hands over. */
+export interface AppGrantRequest {
+  /** Validated, defaulted and clamped; `resources.grant` is what to issue. */
+  resources: ResolvedAppResources;
+  /** The manifest's templates, with the run's image and workspace filled in where a template sets none. */
+  templates: Array<Record<string, unknown>>;
+}
+
 /**
  * Grant hook points (sandbox-layering #4). Only `issue` exists here; `env`,
  * `extend` and `revoke` belong to the places that call them and arrive with
@@ -84,7 +100,7 @@ export interface AppGrantHooks {
   issue(
     run: AppGrantRun,
     manifest: AppManifestV1,
-    input: Record<string, unknown>,
+    request: AppGrantRequest,
   ): Promise<AppGrantIssued | void>;
 }
 
@@ -100,6 +116,8 @@ export class WorkspaceCheckUnavailableError extends Error {}
 
 export interface AppRunPorts {
   enabled(): boolean;
+  /** The platform caps on a grant (`APP_SANDBOX_CAPS`); an item with no cap is not capped. */
+  caps(): AppGrantLimits;
   /** Whether `workspaceId` exists and `caller` may use it. Throws WorkspaceCheckUnavailableError when it cannot tell. */
   workspaceAccess(auth: CallerAuth, workspaceId: string): Promise<WorkspaceVerdict>;
   grant: AppGrantHooks;
@@ -138,6 +156,7 @@ export async function safeWorkspaceAccess(
 
 export const appRunPorts: AppRunPorts = {
   enabled: () => APP_RUNS_ENABLED,
+  caps: () => APP_SANDBOX_CAPS,
   workspaceAccess: safeWorkspaceAccess,
   grant: { issue: async () => undefined },
 };
@@ -148,133 +167,32 @@ export const appRunPorts: AppRunPorts = {
 
 export interface AppRunPlan {
   sandboxSpec: Record<string, unknown>;
-  /** The workspace the app container lands in, when the input names one. */
-  workspaceId: string | null;
-  /** Every distinct workspace a pointer named, container first. */
+  /** The workspace the app container lands in. */
+  workspaceId: string;
+  /** Every distinct workspace `resources` names, the container's first. */
   workspaceIds: string[];
-}
-
-export interface AppInputProblem {
-  pointer: string;
-  reason: string;
 }
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> =>
   typeof v === "object" && v !== null && !Array.isArray(v);
 
-function readString(
-  input: Record<string, unknown>,
-  pointers: string | string[] | undefined,
-  what: string,
-  required: boolean,
-): { value?: string; problem?: AppInputProblem } {
-  const hit = resolveFirstJsonPointer(input, pointers);
-  const at = Array.isArray(pointers) ? pointers.join(" | ") : String(pointers ?? "");
-  if (!hit.found) {
-    return required ? { problem: { pointer: at, reason: `${what} is missing from the input` } } : {};
-  }
-  if (typeof hit.value !== "string" || !hit.value.trim()) {
-    return { problem: { pointer: at, reason: `${what} must be a non-empty string` } };
-  }
-  return { value: hit.value.trim() };
-}
-
 /**
- * A template's other fields are Agent Sandbox's and are not validated by the
- * manifest, but Claw reads `workspace_from_input` to check the caller's access
- * to the workspace it names, so a value that is not a pointer (or a list of
- * them) is refused here rather than skipped: a skipped check would let the
- * template reach a workspace nobody checked.
+ * The sandbox spec and workspaces of a run, from its resolved resources. The
+ * manifest's `container.resources` are the defaults; a requested cpu or memory
+ * replaces its own key and the requested GPU count replaces the GPU key.
+ * Nothing here sees the input.
  */
-function templateWorkspacePointers(
-  t: { [field: string]: unknown },
-  index: number,
-  problems: AppInputProblem[],
-): string | string[] | undefined {
-  const v = t.workspace_from_input;
-  if (v === undefined) return undefined;
-  const isPointer = (x: unknown): x is string => typeof x === "string" && x.startsWith("/");
-  if (isPointer(v) || (Array.isArray(v) && v.length > 0 && v.every(isPointer))) return v as string | string[];
-  problems.push({
-    pointer: `sandbox_templates[${index}].workspace_from_input`,
-    reason: "must be a JSON Pointer or a non-empty list of them, so the workspace can be access-checked",
-  });
-  return undefined;
-}
-
-function readQuantity(
-  input: Record<string, unknown>,
-  pointer: string,
-  what: string,
-  allowZero: boolean,
-  integer: boolean,
-): { value?: number; problem?: AppInputProblem } {
-  const hit = resolveFirstJsonPointer(input, pointer);
-  if (!hit.found) return {};
-  const v = hit.value;
-  const ok = typeof v === "number" && Number.isFinite(v)
-    && (allowZero ? v >= 0 : v > 0) && (!integer || Number.isInteger(v));
-  return ok ? { value: v as number } : { problem: { pointer, reason: `${what} must be a ${integer ? "whole " : ""}number${allowZero ? " >= 0" : " > 0"}` } };
-}
-
-/**
- * The sandbox spec and workspaces a manifest asks for, read from the input by
- * pointer. Claw does not know what any of these fields mean, only where they
- * are; `{problems}` names the pointer that did not hold what it was meant to.
- */
-export function planAppRun(
-  manifest: AppManifestV1,
-  input: Record<string, unknown>,
-): AppRunPlan | { problems: AppInputProblem[] } {
-  const problems: AppInputProblem[] = [];
-  const c = manifest.container;
-
-  // The manifest validator guarantees exactly one of the two forms: a fixed
-  // image, or a pointer into the input.
-  const image: { value?: string; problem?: AppInputProblem } = c.image !== undefined
-    ? c.image.trim()
-      ? { value: c.image.trim() }
-      : { problem: { pointer: "container.image", reason: "the container image must be a non-empty string" } }
-    : readString(input, c.image_from_input, "the container image", true);
-  if (image.problem) problems.push(image.problem);
-
-  const resources: Record<string, string> = { ...(c.resources ?? {}) };
-  if (c.gpus_from_input) {
-    const g = readQuantity(input, c.gpus_from_input, "the GPU count", true, true);
-    if (g.problem) problems.push(g.problem);
-    else if (g.value !== undefined && g.value > 0) resources["amd.com/gpu"] = String(g.value);
-  }
-  if (c.resources_from_input?.cpu) {
-    const r = readQuantity(input, c.resources_from_input.cpu, "the cpu count", false, false);
-    if (r.problem) problems.push(r.problem);
-    else if (r.value !== undefined) resources.cpu = String(r.value);
-  }
-  if (c.resources_from_input?.memory_gi) {
-    const r = readQuantity(input, c.resources_from_input.memory_gi, "the memory size", false, false);
-    if (r.problem) problems.push(r.problem);
-    else if (r.value !== undefined) resources.memory = `${r.value}Gi`;
-  }
-
-  const workspaceIds: string[] = [];
-  const pointerSets: Array<string | string[] | undefined> = [
-    c.workspace_from_input,
-    ...(manifest.sandbox_templates ?? []).map((t, i) => templateWorkspacePointers(t, i, problems)),
-  ];
-  let primary: string | null = null;
-  pointerSets.forEach((pointers, i) => {
-    if (!pointers) return;
-    const w = readString(input, pointers, "the workspace", false);
-    if (w.problem) problems.push(w.problem);
-    if (!w.value) return;
-    if (i === 0) primary = w.value;
-    if (!workspaceIds.includes(w.value)) workspaceIds.push(w.value);
-  });
-
-  if (problems.length > 0 || !image.value) return { problems };
-  const sandboxSpec: Record<string, unknown> = { handle: "app", image: image.value };
+export function planAppRun(manifest: AppManifestV1, r: ResolvedAppResources): AppRunPlan {
+  const resources: Record<string, string> = { ...(manifest.container.resources ?? {}) };
+  delete resources[APP_GPU_RESOURCE];
+  if (r.gpus > 0) resources[APP_GPU_RESOURCE] = String(r.gpus);
+  if (r.cpu !== undefined) resources.cpu = String(r.cpu);
+  if (r.memoryGi !== undefined) resources.memory = `${r.memoryGi}Gi`;
+  const sandboxSpec: Record<string, unknown> = { handle: "app", image: r.image, namespace: r.workspace };
   if (Object.keys(resources).length > 0) sandboxSpec.resources = resources;
-  if (primary) sandboxSpec.namespace = primary;
-  return { sandboxSpec, workspaceId: primary, workspaceIds };
+  const workspaceIds = [r.workspace];
+  if (!workspaceIds.includes(r.sandboxWorkspace)) workspaceIds.push(r.sandboxWorkspace);
+  return { sandboxSpec, workspaceId: r.workspace, workspaceIds };
 }
 
 /** Stable per Idempotency-Key, so a retry after a rolled-back create reuses the grant. */
@@ -292,7 +210,7 @@ export interface AppRunRequest {
   sessionId: string;
   user: UserInfo;
   auth: CallerAuth;
-  body: { plugin_id?: unknown; input?: unknown };
+  body: { plugin_id?: unknown; input?: unknown; resources?: unknown };
   idemKey: string | null;
 }
 
@@ -341,7 +259,10 @@ const issueText = (issues: AppManifestIssue[]) => issues.slice(0, 20);
 export async function checkAppRunRequest(
   req: AppRunRequest,
   ports: AppRunPorts = appRunPorts,
-): Promise<AppRunOutcome | { pluginId: number; manifest: AppManifestV1; input: Record<string, unknown>; plan: AppRunPlan }> {
+): Promise<AppRunOutcome | {
+  pluginId: number; manifest: AppManifestV1; input: Record<string, unknown>;
+  resolved: ResolvedAppResources; plan: AppRunPlan;
+}> {
   if (!ports.enabled()) return refuse(501, "app_runs_disabled");
 
   const pluginId = req.body.plugin_id;
@@ -371,10 +292,16 @@ export async function checkAppRunRequest(
   const limit = manifest.limits?.input_max_bytes ?? APP_INPUT_MAX_BYTES_DEFAULT;
   const size = Buffer.byteLength(JSON.stringify(input), "utf8");
   if (size > limit) return refuse(413, "input_too_large", { max_bytes: limit });
-  const plan = planAppRun(manifest, input);
-  if ("problems" in plan) return refuse(400, "app_input_invalid", { problems: plan.problems });
 
-  // 3. Every workspace the input names.
+  // 3. The resources, requested explicitly and clamped to the platform caps.
+  const resolvedOrIssues = resolveAppResources(manifest, req.body.resources, ports.caps());
+  if ("issues" in resolvedOrIssues) {
+    return refuse(400, "app_resources_invalid", { problems: resolvedOrIssues.issues as AppResourcesIssue[] });
+  }
+  const resolved = resolvedOrIssues.resources;
+  const plan = planAppRun(manifest, resolved);
+
+  // 4. Every workspace the resources name.
   for (const workspaceId of plan.workspaceIds) {
     let verdict: WorkspaceVerdict;
     try {
@@ -387,7 +314,7 @@ export async function checkAppRunRequest(
     if (verdict !== "ok") return refuse(403, "workspace_access_denied", { workspace: workspaceId });
   }
 
-  return { pluginId, manifest, input, plan };
+  return { pluginId, manifest, input, resolved, plan };
 }
 
 /**
@@ -400,7 +327,7 @@ export async function admitAppRun(
 ): Promise<AppRunOutcome> {
   const checked = await checkAppRunRequest(req, ports);
   if ("statusCode" in checked) return checked;
-  const { pluginId, manifest, input, plan } = checked;
+  const { pluginId, manifest, input, resolved, plan } = checked;
   const grantId = deriveGrantId(req.sessionId, req.idemKey);
 
   try {
@@ -437,7 +364,7 @@ export async function admitAppRun(
         issued = await ports.grant.issue(
           { grantId, taskId, sessionId: req.sessionId, userId: req.user.userId, pluginId },
           manifest,
-          input,
+          { resources: resolved, templates: appGrantTemplates(manifest, resolved) },
         );
       } catch (err) {
         throw new AppGrantIssueError(err);
@@ -453,7 +380,7 @@ export async function admitAppRun(
           sealAppRunSecret(newMcpToken(), taskId, "mcp_token"),
           issued ? grantId : null,
           issued?.keys ? sealAppRunSecret(JSON.stringify(sanitiseKeys(issued.keys)), taskId, "grant_keys") : null,
-          issued?.limits ? JSON.stringify(issued.limits) : null,
+          JSON.stringify(issued?.limits ?? resolved.grant),
           issued?.expiresAt ?? null,
         ],
       );

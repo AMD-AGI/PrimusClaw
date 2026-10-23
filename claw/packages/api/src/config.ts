@@ -9,6 +9,7 @@ import {
   DEFAULT_TASK_MAX_ACK_PENDING,
   DEFAULT_TASK_MAX_DELIVER,
   MIN_RENEWAL_INTERVAL_MS,
+  parseAppSandboxCaps,
   resolveLeaseReapGraceSec,
   resolveTaskDeliveryBudget,
   RUN_LEASE_HEARTBEATS_PER_TTL,
@@ -370,6 +371,14 @@ export const CLAW_SKILL_EVOLUTION_ENABLED = envBool("CLAW_SKILL_EVOLUTION_ENABLE
  * implemented, so nothing is gained by taking one in.
  */
 export const APP_RUNS_ENABLED = envBool("APP_RUNS_ENABLED", false);
+
+/**
+ * Platform caps on what an app run's grant may carry, as JSON of the grant
+ * shape: `{"roles":{"measurement":{"max_sandboxes":8,"max_gpus":8}},"gpu_hours":500,"max_runtime_sec":172800}`.
+ * Each grant item is the smaller of the request and its cap; an item with no
+ * cap is the request as it is. A value that is not that shape stops start-up.
+ */
+export const APP_SANDBOX_CAPS = parseAppSandboxCaps(process.env.APP_SANDBOX_CAPS);
 
 export const RUN_DOORBELL_DISPATCH = envBool("RUN_DOORBELL_DISPATCH", true);
 
