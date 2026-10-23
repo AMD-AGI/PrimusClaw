@@ -514,6 +514,19 @@ describe("mode=app task creation", { skip }, () => {
       assert.deepEqual(log.map((l) => l.op), ["issue", "revoke"]);
       assert.equal(log[1]!.run.grantId, log[0]!.run.grantId);
     });
+    test("a grant is not revoked while a run under the same Idempotency-Key owns it", async () => {
+      // The grant id comes from the key, so a run another attempt committed under
+      // the same key (this attempt's lock lost during the grant call) shares it.
+      const { revokeUnlessRecorded, deriveGrantId } = await import("../src/tasks/app-run.js");
+      assert.equal((await create("s1", {}, { "idempotency-key": "r-9" })).statusCode, 200);
+      const calls: string[] = [];
+      const ports = { grant: { revoke: async (r: any) => { calls.push(r.grantId); } } } as any;
+      const loser = { grantId: deriveGrantId("s1", "r-9"), taskId: "task-that-never-existed", sessionId: "s1", userId: "u1", pluginId: goodPlugin };
+      await revokeUnlessRecorded(ports, loser, { limits: {} }, "r-9");
+      assert.deepEqual(calls, [], "the live run's grant is left alone");
+      await revokeUnlessRecorded(ports, { ...loser, grantId: "grt_other" }, { limits: {} }, "r-other");
+      assert.deepEqual(calls, ["grt_other"], "an unrelated unrecorded grant is revoked");
+    });
     test("a revoke that throws does not change the answer", async () => {
       const log = hook({ revoke: async () => { throw new Error("revoke down"); } });
       caller = { ...OWNER, platformKey: "", virtualKey: "" } as typeof caller;

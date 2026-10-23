@@ -402,7 +402,7 @@ export async function admitAppRun(
       "app_run.grant_issue_failed",
     );
     // `issue` may have signed something before it failed; same rule as below.
-    await revokeUnlessRecorded(ports, grantRun, undefined);
+    await revokeUnlessRecorded(ports, grantRun, undefined, req.idemKey);
     return refuse(503, "grant_issue_failed");
   }
 
@@ -468,7 +468,7 @@ export async function admitAppRun(
   // A unique-violation on the idempotency index means a concurrent request with
   // the same key won, and the grant id is the same one: leave it.
   const code = (failure as { code?: string } | undefined)?.code;
-  if (!(code === "23505" && req.idemKey)) await revokeUnlessRecorded(ports, grantRun, issued);
+  if (!(code === "23505" && req.idemKey)) await revokeUnlessRecorded(ports, grantRun, issued, req.idemKey);
   if (failure !== undefined) {
     if (failure instanceof MissingPlatformKeyError) {
       logger.warn({ sessionId: req.sessionId, userId: req.user.userId }, "app_run.submit_without_platform_key");
@@ -485,10 +485,21 @@ export async function admitAppRun(
  * question cannot be answered the grant is left alone (revoking a live run's grant
  * is the worse error) and the fact is logged. Never throws.
  */
-async function revokeUnlessRecorded(ports: AppRunPorts, run: AppGrantRun, issued: AppGrantIssued | void): Promise<void> {
+export async function revokeUnlessRecorded(
+  ports: AppRunPorts,
+  run: AppGrantRun,
+  issued: AppGrantIssued | void,
+  idemKey: string | null = null,
+): Promise<void> {
   if (!ports.grant.revoke) return;
   try {
-    const recorded = await db.query("SELECT 1 FROM claw_app_runs WHERE task_id = $1", [run.taskId]);
+    // By task id, and by Idempotency-Key as well: the grant id is derived from the
+    // key, so a run another attempt committed under the same key (possible when
+    // this attempt's lock was lost during the grant call) owns the same grant.
+    const recorded = await db.query(
+      "SELECT 1 FROM claw_app_runs WHERE task_id = $1 OR ($2::text IS NOT NULL AND session_id = $3 AND idempotency_key = $2)",
+      [run.taskId, idemKey, run.sessionId],
+    );
     if (recorded.rows.length > 0) return;
   } catch (err) {
     logger.error({ grantId: run.grantId, err: err instanceof Error ? err.message : String(err) }, "app_run.grant_revoke_skipped_unknown_state");
