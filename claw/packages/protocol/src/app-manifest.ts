@@ -48,8 +48,10 @@ export interface AppContainer {
   image?: string;
   /**
    * Default container resources, and the most a request may ask for in each key
-   * the manifest declares (`amd.com/gpu`, `cpu`, `memory`): a larger
-   * `resources.gpus` / `cpu` / `memory_gi` is refused. Whatever is finally
+   * the manifest declares (`cpu`, `memory`): a larger `resources.cpu` /
+   * `memory_gi` is refused. No GPU key may appear here (`amd.com/gpu`, `gpu`, or
+   * any key ending in `/gpu`): the GPU count comes only from the request's `resources.gpus`,
+   * so admission, which counts that one key, sees every GPU the pod gets. Whatever is finally
    * dispatched, SaFE enforces as the container's hard limit (exceeding memory is
    * an OOM kill). A key the manifest leaves out has no manifest maximum.
    */
@@ -324,6 +326,12 @@ const RESERVED_ENV_NAMES: ReadonlySet<string> = new Set(Object.values(APP_PLATFO
 /** Families the platform and Agent Sandbox own wholesale: `E2B_*`, `AWS_*`, `CLAW_*`. */
 const RESERVED_ENV_PREFIXES = ["E2B_", "AWS_", "CLAW_"] as const;
 
+/** True for a resource name that counts GPUs: `gpu`, `amd.com/gpu`, `nvidia.com/gpu`, ... */
+export function isGpuResourceKey(key: string): boolean {
+  const k = key.trim().toLowerCase();
+  return k === "gpu" || k.endsWith("/gpu");
+}
+
 /** True when a manifest may not set or map this variable: the platform owns it. */
 export function isReservedAppEnv(name: string): boolean {
   return RESERVED_ENV_NAMES.has(name) || RESERVED_ENV_PREFIXES.some((p) => name.startsWith(p));
@@ -381,6 +389,13 @@ export function validateAppManifest(value: unknown): AppManifestIssue[] {
     if (!hasRole(role)) bad(`${section}.${key}`, `role ${JSON.stringify(role)} is not declared in sandbox_roles`);
   };
   for (const role of Object.keys(obj(obj(value.env_map).sandbox_keys))) needRole("env_map.sandbox_keys", role, role);
+
+  // The GPU count is the request's alone.
+  for (const k of Object.keys(obj(obj(value.container).resources))) {
+    if (isGpuResourceKey(k)) {
+      bad(`container.resources.${k}`, "a GPU key is not allowed here: the GPU count comes only from the request's resources.gpus");
+    }
+  }
 
   // Variables: no collisions, nothing the platform owns.
   const envMap = obj(value.env_map);
