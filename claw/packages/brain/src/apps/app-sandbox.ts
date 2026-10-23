@@ -35,7 +35,7 @@ import { parseWorkloadListPage } from "../sandbox/multi-node/workload-parse.js";
 import { getSafeWorkloadProvider } from "../sandbox/factory.js";
 import { SESSION_ENV } from "../sandbox/multi-node/safe-body.js";
 import { ACTIVE_PHASES, TERMINAL_PHASES } from "../sandbox/workload-wait.js";
-import { pollWorkloadUntilRunning } from "../sandbox/safe-workload-provider.js";
+import { pollWorkloadUntilRunning, SHUTDOWN_BUFFER_SECONDS } from "../sandbox/safe-workload-provider.js";
 import type { SandboxInstance } from "../sandbox/provider.js";
 
 const logger = pino({ name: "app-sandbox" });
@@ -136,12 +136,23 @@ export async function findLiveAppSandboxes(
     // a terminal workload is skipped here as well, or the run would adopt a dead
     // one for ever.
     for (const w of parsed.items) {
-      if ((w.kind === "Sandbox" || w.kind === "") && w.id && !TERMINAL_PHASES.has(w.phase)) found.push({ id: w.id, phase: w.phase });
+      if (!(w.kind === "Sandbox" || w.kind === "") || !w.id || TERMINAL_PHASES.has(w.phase)) continue;
+      // The env match alone would also take a Hands sandbox whose env happens to
+      // carry the same variable. When the entry reports its labels they must say
+      // this run's app sandbox; an entry that reports none is judged by the env.
+      if (w.labels && (w.labels[COMPONENT_LABEL] !== APP_COMPONENT || w.labels[APP_RUN_ID_LABEL] !== runId)) continue;
+      found.push({ id: w.id, phase: w.phase });
     }
     // Items seen, not workloads kept, against the unfiltered total: the same unit.
     if (parsed.items.length === 0 || seen >= parsed.totalCount) return found;
   }
   throw new Error("app sandbox lookup failed: more workloads than one run can own");
+}
+
+/** The spec's env without the session correlation variable, which a manifest must not set either. */
+function withoutSessionEnv(env: Record<string, string> | undefined): Record<string, string> {
+  const { [SESSION_ENV]: _dropped, ...rest } = env ?? {};
+  return rest;
 }
 
 const appSandboxNamespace = (run: Pick<AppSandboxRun, "workspaceId">): string =>
@@ -179,7 +190,7 @@ export async function ensureAppSandbox(run: AppSandboxRun, deps: AppSandboxDeps)
   if (!run.platformKey) throw new Error("ensureAppSandbox: platformKey is required");
   if (!run.sandboxSpec?.image?.trim()) throw new Error("ensureAppSandbox: sandbox_spec has no image");
   const ns = appSandboxNamespace(run);
-  const wait = deps.waitRunning ?? ((id, key) => pollWorkloadUntilRunning(id, key));
+  const wait = deps.waitRunning ?? ((id, key) => pollWorkloadUntilRunning(id, key, undefined, undefined, "app"));
   // An app sandbox has no Hands in it, so there is no Hands URL to give.
   const instanceFor = (id: string): SandboxInstance => appSandboxInstance(run, id);
   const stop = deps.stop ?? ((id: string) => getSafeWorkloadProvider().stop(instanceFor(id)));
@@ -195,10 +206,15 @@ export async function ensureAppSandbox(run: AppSandboxRun, deps: AppSandboxDeps)
 
   const live = await findLiveAppSandboxes(run.runId, run.platformKey, deps.fetch);
   if (live.length > 0) {
-    // Newest first. More than one means an earlier create was never seen by the
-    // run (so it was never recorded or stopped): adopt the newest and stop the rest.
-    const adopted = live[0]!;
-    for (const extra of live.slice(1)) await reclaim(extra.id, "surplus_live_workload");
+    // `live` is newest first. More than one means an earlier create was never seen
+    // by the run (so it was never recorded or stopped). Which one is the run's:
+    // the recorded one that is still live, else one already Running (an
+    // application may be in it), only then the newest. The newest alone would stop
+    // a running sandbox in favour of a Pending twin.
+    const adopted = live.find((w) => w.id === run.sandboxWorkloadId)
+      ?? live.find((w) => w.phase === "running")
+      ?? live[0]!;
+    const surplus = live.filter((w) => w.id !== adopted.id);
     // Recorded before the wait, as on the create path: a wait that gives up must
     // leave the id behind for whoever cleans up.
     if (run.sandboxWorkloadId !== adopted.id) await deps.recordWorkloadId(run.runId, adopted.id);
@@ -208,12 +224,17 @@ export async function ensureAppSandbox(run: AppSandboxRun, deps: AppSandboxDeps)
       } catch (err) {
         // A workload that cannot be brought to Running (queued past the ceiling, or
         // gone terminal) is stopped, as on the create path: left live, the next
-        // attempt would find and adopt it again, for ever.
+        // attempt would find and adopt it again, for ever. The surplus is left for
+        // that next attempt: it is not known to be bad, and stopping it too would
+        // leave the run with nothing.
         await reclaim(adopted.id, "adopted_wait_failed");
         throw err;
       }
     }
-    logger.info({ runId: run.runId, workloadId: adopted.id, surplus: live.length - 1 }, "app_sandbox.adopted");
+    // Only once the adopted one is Running are the others given up; reclaim
+    // swallows its errors, so they go together.
+    await Promise.all(surplus.map((extra) => reclaim(extra.id, "surplus_live_workload")));
+    logger.info({ runId: run.runId, workloadId: adopted.id, surplus: surplus.length }, "app_sandbox.adopted");
     return { instance: instanceFor(adopted.id), workloadId: adopted.id, created: false };
   }
 
@@ -232,11 +253,16 @@ export async function ensureAppSandbox(run: AppSandboxRun, deps: AppSandboxDeps)
       namespace: ns,
       image: spec.image,
       resources,
-      env: { ...(spec.env ?? {}), [SESSION_ENV]: run.sessionId, [APP_RUN_ID_ENV]: run.runId },
+      // No CLAW_SESSION_ID: SaFE's session lookup (multi-node/safe-provider
+      // findSessionWorkloads) matches on exactly that env, and session teardown
+      // deletes what it finds. This sandbox is the run's AppRunner's alone, so it
+      // must not be reachable that way (the session label still attributes it).
+      env: { ...withoutSessionEnv(spec.env), [APP_RUN_ID_ENV]: run.runId },
       labels: appSandboxLabels(run),
       // A manifest that names no timeout still gets the platform's default, not the
-      // longest session the provider allows.
-      timeoutSec: spec.timeout ?? SANDBOX_DEFAULT_TIMEOUT_SECONDS,
+      // longest session the provider allows. The provider adds its shutdown buffer to
+      // an explicit timeout, so the buffer is taken off here: SaFE receives the default.
+      timeoutSec: spec.timeout ?? Math.max(1, SANDBOX_DEFAULT_TIMEOUT_SECONDS - SHUTDOWN_BUFFER_SECONDS),
       ttlSec: spec.ttl_sec ?? DEFAULT_SANDBOX_TTL_SEC,
       platformKey: run.platformKey,
       // The id is remembered here first, then recorded, then waited on: a failed
@@ -248,7 +274,9 @@ export async function ensureAppSandbox(run: AppSandboxRun, deps: AppSandboxDeps)
       },
     });
     logger.info({ runId: run.runId, workloadId: inst.id }, "app_sandbox.created");
-    return { instance: inst, workloadId: inst.id, created: true };
+    // The handle is built here, as on the adopt path: the provider's carries a Hands
+    // URL, and the same run must not get one when created and none when adopted.
+    return { instance: instanceFor(inst.id), workloadId: inst.id, created: true };
   } catch (err) {
     if (createdId !== undefined) await reclaim(createdId, "create_failed");
     throw err;

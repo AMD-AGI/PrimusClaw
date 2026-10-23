@@ -107,18 +107,13 @@ func (m *defaultSessionManager) GetSandboxBySession(
 		return m.createSandbox(ctx, namespace, name, kind)
 	}
 
-	// Session ID provided → look up in store (Redis)
+	// Session ID provided → look up in store (CR-backed in production).
 	info, err := m.storeClient.GetSandboxBySessionID(ctx, sessionID)
 	if err == nil {
 		return info, nil
 	}
 
-	// Store lookup failed — could be:
-	//   1. ErrNotFound: session key doesn't exist (expired, or Redis data lost)
-	//   2. Connection error: Redis temporarily unreachable (restarting)
-	//
-	// In both cases, try to recover from K8s via the WM recovery endpoint.
-	// The WM lists Sandbox CRs by session-id annotation, which survives Redis restarts.
+	// Store miss or error: try WM recovery, which reads the Sandbox CR.
 	log.Warnf("store lookup failed for session %q (err: %v), attempting K8s recovery via WM", sessionID, err)
 
 	recovered, recoverErr := m.recoverSessionFromWM(ctx, sessionID)
@@ -137,7 +132,7 @@ func (m *defaultSessionManager) GetSandboxBySession(
 
 // recoverSessionFromWM calls the WM session recovery endpoint to rebuild
 // session→pod mapping from K8s Sandbox annotations.
-// This is the fallback when Redis data is lost (e.g. Redis restart without persistence).
+// recoverSessionFromWM asks the Workload Manager to resolve the session from its Sandbox CR.
 func (m *defaultSessionManager) recoverSessionFromWM(ctx context.Context, sessionID string) (*store.SandboxInfo, error) {
 	endpoint := m.wmURL + "/v1/code-interpreter/sessions/" + sessionID + "/recover"
 

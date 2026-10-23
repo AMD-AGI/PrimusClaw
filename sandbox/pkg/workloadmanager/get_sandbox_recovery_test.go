@@ -2,10 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // The keepalive GET rebuilds a session from its Sandbox CR when the store has
-// lost the record. The rebuild is lossy -- the CR cannot reproduce the egress
-// policy or the inference key -- and it writes, so two things decide whether it
-// helps or harms: it must fire only for a record that is confirmed absent, and
-// it must not write before the caller is authorised. These tests pin both.
+// lost the record. The rebuild writes, so two things decide whether it helps or
+// harms: it must fire only for a record that is confirmed absent, and it must
+// not write before the caller is authorised. These tests pin both.
 //
 // Each builds its own store and client and shares no state, so they run in parallel.
 package workloadmanager
@@ -13,6 +12,7 @@ package workloadmanager
 import (
 	"context"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 
@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	recoverySession = "keepalive-session"
+	recoverySession = "default/sandbox-under-test"
 	recoveryOwner   = "owner-1"
 )
 
@@ -71,18 +71,53 @@ func getSandboxAs(t *testing.T, s *Server, userID, role string) *httptest.Respon
 	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
-	c.Request = httptest.NewRequest("GET", "/v1/code-interpreter/sessions/"+recoverySession, nil)
+	c.Request = httptest.NewRequest("GET", "/v1/code-interpreter/sessions/default/sandbox-under-test", nil)
 	if userID != "" {
 		c.Request.Header.Set(UserIDHeader, userID)
 		c.Request.Header.Set(UserRoleHeader, role)
 	}
-	c.Params = gin.Params{{Key: "sessionId", Value: recoverySession}}
+	c.Params = gin.Params{
+		{Key: "namespace", Value: "default"},
+		{Key: "name", Value: "sandbox-under-test"},
+	}
 	s.handleGetSandbox(c)
 	return rec
 }
 
+func deleteSandboxAs(t *testing.T, s *Server) *httptest.ResponseRecorder {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodDelete, "/v1/code-interpreter/sessions/default/sandbox-under-test", nil)
+	c.Params = gin.Params{
+		{Key: "namespace", Value: "default"},
+		{Key: "name", Value: "sandbox-under-test"},
+	}
+	s.handleDeleteSandbox(c)
+	return rec
+}
+
+func TestDeleteSandboxDoesNotTreatLookupFailureAsGone(t *testing.T) {
+	t.Parallel()
+	s := &Server{store: &recoveryTestStore{Store: store.NewMemoryStore(), getErr: errors.New("apiserver timeout")}}
+	rec := deleteSandboxAs(t, s)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("lookup failure: got %d %s, want 503", rec.Code, rec.Body)
+	}
+}
+
+func TestDeleteSandboxNotFoundIs404(t *testing.T) {
+	t.Parallel()
+	s := &Server{store: &recoveryTestStore{Store: store.NewMemoryStore(), getErr: store.ErrNotFound}}
+	rec := deleteSandboxAs(t, s)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("missing session: got %d %s, want 404", rec.Code, rec.Body)
+	}
+}
+
 // TestGetSandboxDoesNotRebuildOnAnUnreadableStore is the one that matters: a
-// Redis timeout does not mean the record is gone, and rebuilding on one replaces
+// A store timeout does not mean the record is gone, and rebuilding on one replaces
 // a complete record with the subset the CR can reproduce. The policy fields are
 // the evidence -- an emptied RuntimePolicy falls through the engine's switch to
 // agent-default, so an agent-restricted sandbox silently loses egress confinement.
@@ -97,13 +132,12 @@ func TestGetSandboxDoesNotRebuildOnAnUnreadableStore(t *testing.T) {
 		RuntimePolicy:      "agent-restricted",
 		PolicyMode:         "enforce",
 		AllowedEgressHosts: []string{"api.internal.example"},
-		InferenceApiKey:    "sk-do-not-lose-me",
 	}
 	if err := base.StoreSandbox(context.Background(), complete); err != nil {
 		t.Fatalf("seed store: %v", err)
 	}
 
-	st := &recoveryTestStore{Store: base, getErr: errors.New("redis GET: i/o timeout")}
+	st := &recoveryTestStore{Store: base, getErr: errors.New("store GET: i/o timeout")}
 	s := &Server{store: st, k8s: &K8sSandboxCreator{
 		client:       indexedClient(t, ownedSandbox(recoverySession, recoveryOwner)),
 		cachedReader: indexedClient(t, ownedSandbox(recoverySession, recoveryOwner)),
@@ -121,9 +155,8 @@ func TestGetSandboxDoesNotRebuildOnAnUnreadableStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("record must survive: %v", err)
 	}
-	if kept.RuntimePolicy != "agent-restricted" || kept.InferenceApiKey != "sk-do-not-lose-me" {
-		t.Errorf("record was overwritten by a rebuild: policy=%q key=%q",
-			kept.RuntimePolicy, kept.InferenceApiKey)
+	if kept.RuntimePolicy != "agent-restricted" {
+		t.Errorf("record was overwritten by a rebuild: policy=%q", kept.RuntimePolicy)
 	}
 	if len(kept.AllowedEgressHosts) != 1 {
 		t.Errorf("egress whitelist lost: %v", kept.AllowedEgressHosts)

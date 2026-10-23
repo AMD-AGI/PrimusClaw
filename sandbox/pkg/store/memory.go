@@ -11,7 +11,7 @@ import (
 )
 
 // MemoryStore is an in-memory Store implementation for development and testing.
-// It does NOT persist across restarts. Use RedisStore for production.
+// It does NOT persist across restarts. Production uses a CR-backed Store.
 type MemoryStore struct {
 	mu   sync.RWMutex
 	data map[string]*SandboxInfo

@@ -243,6 +243,18 @@ async function renderTaskForDispatch(
   locked: ClawTaskRow,
   started: number,
 ): Promise<RenderedTask> {
+  // An app run is dispatched exactly as it was admitted. Its sandbox spec is the
+  // platform's resolved answer (image, resources, workspace, grant template), and
+  // the run's input is the app's own business: expanding `${task.input...}` in the
+  // spec here would let that input change the image after admission, and the
+  // platform never interprets app input. Nothing of an app run is templated.
+  if (locked.mode === "app") {
+    return {
+      prompt: locked.prompt ?? null,
+      script: (locked.script as unknown[] | null) ?? null,
+      sandbox_spec: locked.sandbox_spec,
+    };
+  }
   const ctx = await withTimeout("buildRenderContext", buildRenderContext(taskId));
   logger.info({ taskId, elapsedMs: Date.now() - started }, "task.dispatch_stage.render_context");
   const rendered: RenderedTask = {

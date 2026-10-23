@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
+	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 )
 
 const lookupSession = "session-under-test"
@@ -42,6 +43,7 @@ func lookupScheme(t *testing.T) *k8sruntime.Scheme {
 	t.Helper()
 	scheme := k8sruntime.NewScheme()
 	utilruntime.Must(sandboxv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(runtimev1alpha1.AddToScheme(scheme))
 	return scheme
 }
 
@@ -89,6 +91,21 @@ func TestFindSandboxBySessionIDUsesTheIndex(t *testing.T) {
 	}
 	if fallback.lists != 0 {
 		t.Errorf("listed %d times; an indexed lookup must resolve without listing", fallback.lists)
+	}
+}
+
+func TestFindSandboxBySessionIDResolvesLegacySessPrefix(t *testing.T) {
+	t.Parallel()
+	const legacy = "sess_dual_read_release"
+	sb := sandboxWithSession("legacy-sbx", legacy)
+	c := &K8sSandboxCreator{client: indexedClient(t, sb), cachedReader: indexedClient(t, sb)}
+
+	found, err := c.findSandboxBySessionID(context.Background(), legacy)
+	if err != nil {
+		t.Fatalf("findSandboxBySessionID: %v", err)
+	}
+	if found.Name != "legacy-sbx" {
+		t.Fatalf("found %q, want legacy-sbx", found.Name)
 	}
 }
 

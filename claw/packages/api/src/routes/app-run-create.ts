@@ -30,7 +30,7 @@ import { isApiKey } from "../auth/safe-client.js";
 import { connectionLost, db } from "../infra/db.js";
 import { singleflightCreate, type FlightResult } from "../shared/singleflight.js";
 import {
-  admitAppRun, appRunRequestHash, findAppRunByIdempotencyKey, type AppRunByKey, type AppRunOutcome, type CallerAuth,
+  admitAppRun, appRunPorts, appRunRequestHash, findAppRunByIdempotencyKey, type AppRunByKey, type AppRunOutcome, type CallerAuth,
 } from "../tasks/app-run.js";
 import {
   acquireIdempotencyLock, extractIdempotencyKey, IDEM_BUSY_POLL_MS, IDEM_BUSY_POLL_TRIES,
@@ -74,6 +74,10 @@ export async function createAppRun(
   user: UserInfo,
   body: { plugin_id?: unknown; input?: unknown; resources?: unknown },
 ): Promise<AppRunOutcome> {
+  // First of all: with app runs off, `claw_app_runs` and its columns may not exist
+  // (the schema guard allows that), so a keyed request must not read the cache or
+  // the table, and an existing run must not replay.
+  if (!appRunPorts.enabled()) return { statusCode: 501, response: { ok: false, error: "app_runs_disabled" } };
   const idemKey = extractIdempotencyKey(req);
   // Computed once: it walks the whole input, which may be 1 MiB.
   const requestHash = appRunRequestHash(body);
@@ -164,5 +168,5 @@ export async function createAppRun(
     }
   };
 
-  return await singleflightCreate(inflightAppCreates, `${userId}:${route}:${idemKey}`, execute, () => isClientGone(req)) as AppRunOutcome;
+  return await singleflightCreate(inflightAppCreates, `${userId}:${route}:${idemKey}:${requestHash}`, execute, () => isClientGone(req)) as AppRunOutcome;
 }

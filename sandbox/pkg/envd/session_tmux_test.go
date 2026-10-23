@@ -17,7 +17,7 @@ import (
 
 func newSessionTestServer(t *testing.T) *Server {
 	t.Helper()
-	return &Server{workspace: t.TempDir(), inference: &inferenceKeyCache{}, tmuxWidth: 80, tmuxHeight: 24}
+	return &Server{workspace: t.TempDir(), session: &sessionContext{ready: make(chan struct{})}, tmuxWidth: 80, tmuxHeight: 24}
 }
 
 // useTmux points the session handlers at bin for the duration of the test.

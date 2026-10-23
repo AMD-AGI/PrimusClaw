@@ -31,7 +31,7 @@ var (
 	sandboxActiveGauge = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "wm_sandbox_active",
-			Help: "Number of active sandboxes in Redis",
+			Help: "Number of active sandboxes tracked by the session store",
 		},
 	)
 
