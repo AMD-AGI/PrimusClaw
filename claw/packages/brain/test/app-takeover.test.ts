@@ -232,6 +232,20 @@ test("G6b the same read happens once, and a sandbox gone with no final leaves th
   assert.equal(h.world.created.length, 2, "exactly one extra sandbox, to read the file");
 });
 
+test("G6c a recovery sandbox that cannot be made yet is retried, and the final is still read", async () => {
+  const h = harness();
+  const wl = await toRunning(h);
+  h.world.onTerm = () => {};
+  const realEnsure = h.world.sandbox.ensure;
+  let failures = 2;
+  h.world.sandbox.ensure = async (run) => { if (failures-- > 0) throw new Error("SaFE unavailable"); return realEnsure(run); };
+  const finishing = h.runner.finishNow("cancelled");
+  h.world.at(h.world.clock + 15_000, () => { h.world.appExits(wl, finalExit(0)); h.world.killWorkload(wl, "terminal"); });
+  const outcome = await finishing;
+  assert.equal(outcome.success, true, "the failed attempts did not use up the one look at shared storage");
+  assert.equal(h.world.rec.state, "ended");
+});
+
 test("G9 SIGTERM goes to the application's whole process group, children included", async () => {
   const dir = mkdtempSync(`${tmpdir()}/c2-03c-`);
   // A launcher (session leader, like `setsid` makes it) with a worker child that would not get a leader-only signal.

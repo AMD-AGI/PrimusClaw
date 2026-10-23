@@ -863,12 +863,16 @@ export class AppRunner {
    */
   private async readFinalFromSharedStorage(stateDir: string): Promise<Extract<ExitRead, { kind: "exit" }> | null> {
     if (this.rec.last_exit?.recovery === true) return null;
-    const last = this.rec.last_exit ?? { at: this.iso(), cause: "cancelled" as const, final: false };
-    await this.move({ last_exit: { ...last, recovery: true } });
     const reader = await this.deps.sandbox.ensure(this.sandboxRun());
     const exit = await this.readExit(reader.instance, stateDir);
+    // A read that failed (the sandbox could not be made, the file could not be
+    // read) is retried by the finishing step and is NOT marked done: the mark says
+    // "the shared storage was looked at", and only a look that happened earns it.
     if (exit.kind === "unreadable") throw new Error("exit.json could not be read");
-    return exit.kind === "exit" ? exit : null;
+    if (exit.kind === "exit") return exit;
+    const last = this.rec.last_exit ?? { at: this.iso(), cause: "cancelled" as const, final: false };
+    await this.move({ last_exit: { ...last, recovery: true } });
+    return null;
   }
 
   private async sendTerm(inst: SandboxInstance, stateDir: string): Promise<void> {
