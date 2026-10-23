@@ -82,6 +82,9 @@ rules:
   - apiGroups: ["runtime.agent-sandbox.io"]
     resources: ["clustersandboxpolicies"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["runtime.agent-sandbox.io"]
+    resources: ["sandboxpolicies"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
   {{- if .Values.router.config.namespaceSelector }}
   # Namespace admission (router.config.namespaceSelector) watches Namespaces.
   - apiGroups: [""]
@@ -209,16 +212,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-            - name: REDIS_ADDR
-              valueFrom:
-                secretKeyRef:
-                  name: agent-sandbox-redis
-                  key: addr
-            - name: REDIS_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: agent-sandbox-redis
-                  key: password
             - name: ENABLE_AUTH
               value: {{ ternary "true" "false" .Values.router.config.enableAuth | quote }}
             - name: SAFE_API_URL
@@ -237,10 +230,6 @@ spec:
             - name: SANDBOX_NODE_SELECTOR
               value: {{ .Values.controlplane.config.sandboxNodeSelector | quote }}
             {{- end }}
-            - name: INFERENCE_ENABLED
-              value: {{ ternary "true" "false" .Values.inference.enabled | quote }}
-            - name: INFERENCE_LITELLM_ENDPOINT
-              value: {{ .Values.inference.litellmEndpoint | quote }}
             - name: ENVD_INJECTOR_IMAGE
               value: {{ .Values.controlplane.config.envdInjectorImage | quote }}
             - name: WORKLOAD_MANAGER_SERVICE_NAME

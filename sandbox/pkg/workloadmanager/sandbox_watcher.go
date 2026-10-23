@@ -144,7 +144,11 @@ func (w *SandboxWatcher) scan(ctx context.Context) {
 			ns = "default"
 		}
 
-		pod, err := w.k8s.CoreV1().Pods(ns).Get(ctx, sess.SandboxName, metav1.GetOptions{})
+		podName := sess.SandboxName
+		if sess.PodName != "" {
+			podName = sess.PodName
+		}
+		pod, err := w.k8s.CoreV1().Pods(ns).Get(ctx, podName, metav1.GetOptions{})
 		if err != nil {
 			w.markUnhealthy(sess, "", "PodNotFound", fmt.Sprintf("get pod failed: %v", err))
 			continue
