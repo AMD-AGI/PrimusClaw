@@ -125,7 +125,8 @@ type CreateSandboxResponse struct {
 type Server struct {
 	cfg        Config
 	store      store.Store
-	k8s        *K8sSandboxCreator // nil in dev mode
+	k8s        *K8sSandboxCreator   // nil in dev mode; native API only
+	workloads  *SafeWorkloadCreator // nil until the SaFE Workload client is attached
 	router     *gin.Engine
 	wg         sync.WaitGroup
 	safeClient *safe.Client     // SaFE API Key verification client (nil when auth disabled)
@@ -159,6 +160,12 @@ func New(cfg Config, st store.Store) *Server {
 // WithK8s attaches a K8s sandbox creator (for production use).
 func (s *Server) WithK8s(k8s *K8sSandboxCreator) *Server {
 	s.k8s = k8s
+	return s
+}
+
+// WithSafeWorkloads attaches the SaFE Workload writer used by the E2B control plane.
+func (s *Server) WithSafeWorkloads(creator *SafeWorkloadCreator) *Server {
+	s.workloads = creator
 	return s
 }
 
@@ -1142,7 +1149,15 @@ func (s *Server) deleteSandboxAndSession(ctx context.Context, info *store.Sandbo
 	})
 	sandboxDeleteTotal.WithLabelValues(reason).Inc()
 
-	if s.k8s != nil {
+	switch {
+	case info.Kind == store.WorkloadKind:
+		if s.workloads != nil {
+			if err := s.workloads.Delete(ctx, info.SandboxName); err != nil {
+				log.Warn("GC: failed to delete workload",
+					"workload", info.SandboxName, "error", err)
+			}
+		}
+	case s.k8s != nil:
 		var err error
 		if info.Kind == store.SandboxClaimKind {
 			err = s.k8s.DeleteSandboxClaim(ctx, info)

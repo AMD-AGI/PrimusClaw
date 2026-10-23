@@ -56,7 +56,8 @@ func reserveOne(g *runtimev1alpha1.SandboxGrant, role, sandboxID, sessionID stri
 			fmtDetail("%s %d/%d gpus", role, usage.GPUs, limit.MaxGPUs))
 	}
 	if overBudget(g) {
-		return opErr(http.StatusForbidden, "grant_budget_exhausted", g.Name)
+		return opErr(http.StatusTooManyRequests, "grant_quota_exceeded",
+			fmtDetail("%s gpu hours", g.Name))
 	}
 	if g.Status.Usage == nil {
 		g.Status.Usage = map[string]runtimev1alpha1.GrantRoleUsage{}

@@ -166,7 +166,9 @@ func TestCreateReplayKillAndQuota(t *testing.T) {
 	if first.TemplateID != "ar-01ja-runner-g1" || first.EnvdVersion != "0.1.0" {
 		t.Fatalf("first=%+v", first)
 	}
-	if len(runner.created) != 1 || runner.created[0].Env["FOO"] != "1" || runner.created[0].UserID != "u-123" {
+	created := runner.created[0]
+	if len(runner.created) != 1 || created.Env["FOO"] != "1" || created.UserID != "u-123" ||
+		created.Role != "measurement" || created.SessionID != "s-8f2a" || created.Workspace != "top-models" {
 		t.Fatalf("created=%+v", runner.created)
 	}
 	second, status, err := svc.Create(context.Background(), key, CreateBody{

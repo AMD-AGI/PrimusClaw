@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -108,7 +109,7 @@ func testService(t *testing.T, now time.Time) (*Service, *ecdsa.PrivateKey, *mem
 		Authn:      staticAuth{},
 		Attest:     checker,
 		Identity:   staticIdentity{},
-		Membership: staticMembership{allow: []string{"top-models"}},
+		Membership: staticMembership{allow: []string{"top-models", "lab"}},
 		Reclaimer:  reclaimer,
 		Record:     rec,
 		Now:        func() time.Time { return now },
@@ -215,6 +216,72 @@ func TestIssueReturnsKeysOnce(t *testing.T) {
 	}
 }
 
+func TestIssueReplayMatchesExecutionSpec(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	svc, priv, _, _ := testService(t, now)
+	req := sampleRequest(now.Add(time.Hour))
+	req.MaxSandboxSeconds = 600
+	req.Templates[0].Spec = json.RawMessage(`{"fromImage":"image:v1"}`)
+	req.Attestation = signGrant(t, priv, req)
+	ctx := context.Background()
+	if _, status, err := svc.Issue(ctx, req); err != nil || status != 201 {
+		t.Fatalf("issue status=%d err=%v", status, err)
+	}
+
+	resigned := cloneIssue(req)
+	resigned.Attestation = signGrant(t, priv, resigned)
+	if resigned.Attestation == req.Attestation {
+		t.Fatal("re-sign produced the same token")
+	}
+	again, status, err := svc.Issue(ctx, resigned)
+	if err != nil || status != 200 || again.Keys != nil {
+		t.Fatalf("resigned replay status=%d keys=%v err=%v", status, again.Keys, err)
+	}
+
+	cases := []struct {
+		name string
+		edit func(*IssueRequest)
+	}{
+		{"session", func(r *IssueRequest) { r.Issuer.SessionID = "s-other" }},
+		{"app run", func(r *IssueRequest) { r.Issuer.AppRunID = "ar-other" }},
+		{"workspace", func(r *IssueRequest) { r.Owner.Workspaces = []string{"lab"} }},
+		{"budget", func(r *IssueRequest) { r.GPUHoursBudget = 2 }},
+		{"lifetime", func(r *IssueRequest) { r.MaxSandboxSeconds = 60 }},
+		{"cards", func(r *IssueRequest) { r.Templates[0].PerGPUCount = []int32{1} }},
+		{"image", func(r *IssueRequest) { r.Templates[0].Spec = json.RawMessage(`{"fromImage":"image:v2"}`) }},
+		{"caps", func(r *IssueRequest) {
+			r.Roles["measurement"] = RoleRequest{Templates: []string{"runner"}, MaxSandboxes: 1, MaxGPUs: 1}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			next := cloneIssue(req)
+			tc.edit(&next)
+			next.Attestation = signGrant(t, priv, next)
+			_, _, err := svc.Issue(ctx, next)
+			if !IsReason(err, "grant_conflict") {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	}
+}
+
+func cloneIssue(req IssueRequest) IssueRequest {
+	out := req
+	out.Owner.Workspaces = append([]string(nil), req.Owner.Workspaces...)
+	out.Roles = make(map[string]RoleRequest, len(req.Roles))
+	for role, cap := range req.Roles {
+		cap.Templates = append([]string(nil), cap.Templates...)
+		out.Roles[role] = cap
+	}
+	out.Templates = append([]TemplateRequest(nil), req.Templates...)
+	for i := range out.Templates {
+		out.Templates[i].PerGPUCount = append([]int32(nil), req.Templates[i].PerGPUCount...)
+		out.Templates[i].Spec = append(json.RawMessage(nil), req.Templates[i].Spec...)
+	}
+	return out
+}
+
 func TestIssueRejectsBadWorkspace(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	svc, priv, _, _ := testService(t, now)
@@ -277,7 +344,8 @@ func TestBudgetExhausted(t *testing.T) {
 		t.Fatal(err)
 	}
 	err := svc.Reserve(context.Background(), req.GrantID, "measurement", "sbx-2", "sess-2", 1)
-	if !IsReason(err, "grant_budget_exhausted") {
+	oe, ok := err.(*OpError)
+	if !ok || oe.Status != http.StatusTooManyRequests || oe.Reason != "grant_quota_exceeded" || !strings.Contains(oe.Error(), "grant_quota_exceeded") {
 		t.Fatalf("err=%v", err)
 	}
 }

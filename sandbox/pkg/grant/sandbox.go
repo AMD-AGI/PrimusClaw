@@ -49,6 +49,8 @@ type Snapshot struct {
 	UserID            string
 	UserName          string
 	AppRunID          string
+	SessionID         string
+	Workspaces        []string
 	MaxSandboxSeconds int64
 	Roles             map[string]runtimev1alpha1.GrantRole
 	Templates         []runtimev1alpha1.GrantTemplate
@@ -79,6 +81,8 @@ func (s *Service) Snapshot(ctx context.Context, grantID string) (Snapshot, error
 		UserID:            g.Spec.Owner.UserID,
 		UserName:          g.Spec.Owner.UserName,
 		AppRunID:          g.Spec.Issuer.AppRunID,
+		SessionID:         g.Spec.Issuer.SessionID,
+		Workspaces:        append([]string(nil), g.Spec.Owner.Workspaces...),
 		MaxSandboxSeconds: g.Spec.MaxSandboxSeconds,
 		Roles:             roles,
 		Templates:         templates,
@@ -283,7 +287,8 @@ func beginOne(g *runtimev1alpha1.SandboxGrant, req BeginRequest, now time.Time) 
 			fmtDetail("%s %d/%d gpus", req.Role, usage.GPUs, limit.MaxGPUs))
 	}
 	if overBudget(g) {
-		return opErr(http.StatusForbidden, "grant_budget_exhausted", g.Name)
+		return opErr(http.StatusTooManyRequests, "grant_quota_exceeded",
+			fmtDetail("%s gpu hours", g.Name))
 	}
 	if g.Status.Usage == nil {
 		g.Status.Usage = map[string]runtimev1alpha1.GrantRoleUsage{}

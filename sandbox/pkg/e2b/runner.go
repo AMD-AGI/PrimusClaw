@@ -22,7 +22,13 @@ type CreateRequest struct {
 	Timeout    time.Duration
 	UserID     string
 	UserName   string
-	Env        map[string]string
+	// Role is the grant role and the Workload display name.
+	Role string
+	// SessionID is the Claw session copied onto the Workload label.
+	SessionID string
+	// Workspace is the SaFE workspace the Workload runs in.
+	Workspace string
+	Env       map[string]string
 }
 
 // CreateResult is the running sandbox address.

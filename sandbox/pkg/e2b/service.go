@@ -69,6 +69,14 @@ type ListResponse struct {
 	NextToken string            `json:"nextToken,omitempty"`
 }
 
+// firstWorkspace is the workspace the child workload runs in.
+func firstWorkspace(names []string) (string, error) {
+	if len(names) == 0 || names[0] == "" {
+		return "", grant.Op(http.StatusBadRequest, "invalid_grant", "workspace is required")
+	}
+	return names[0], nil
+}
+
 // Create starts a sandbox, or replays an idempotency key.
 // The access token is returned on this call and on connect, then only as a hash.
 func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (SandboxResponse, int, error) {
@@ -92,6 +100,15 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 	if err := checkEnv(tpl.AcceptedEnvs, body.EnvVars); err != nil {
 		s.grants.AuditDenied(ctx, grantID, "")
 		return SandboxResponse{}, 0, err
+	}
+	workspace, err := firstWorkspace(snap.Workspaces)
+	if err != nil {
+		s.grants.AuditDenied(ctx, grantID, "")
+		return SandboxResponse{}, 0, err
+	}
+	if snap.SessionID == "" {
+		s.grants.AuditDenied(ctx, grantID, "")
+		return SandboxResponse{}, 0, grant.Op(http.StatusBadRequest, "invalid_grant", "session is required")
 	}
 	timeoutSec := body.Timeout
 	if timeoutSec == 0 {
@@ -151,6 +168,9 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		Timeout:    time.Duration(timeoutSec) * time.Second,
 		UserID:     snap.UserID,
 		UserName:   snap.UserName,
+		Role:       role,
+		SessionID:  snap.SessionID,
+		Workspace:  workspace,
 		Env:        body.EnvVars,
 	})
 	if runErr != nil {

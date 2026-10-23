@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"regexp"
+	"slices"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -238,19 +239,44 @@ func sandboxViews(in []runtimev1alpha1.GrantSandboxRef) []runtimev1alpha1.GrantS
 	return out
 }
 
+// specMatches reports whether an existing grant has the same execution spec as
+// a retry. Attestation text and the sealed platform key are excluded: the JWT
+// is verified on every call, and sealing uses a fresh nonce.
 func specMatches(got *runtimev1alpha1.SandboxGrant, want runtimev1alpha1.SandboxGrantSpec) bool {
-	if got.Spec.Owner.UserID != want.Owner.UserID || got.Spec.Issuer.AppRunID != want.Issuer.AppRunID {
+	if got.Spec.Owner.UserID != want.Owner.UserID || !slices.Equal(got.Spec.Owner.Workspaces, want.Owner.Workspaces) {
+		return false
+	}
+	if got.Spec.Issuer.SessionID != want.Issuer.SessionID || got.Spec.Issuer.AppRunID != want.Issuer.AppRunID {
 		return false
 	}
 	if !sameExpiry(got.Spec.ExpiresAt.Time, want.ExpiresAt.Time) {
 		return false
 	}
-	if len(got.Spec.Roles) != len(want.Roles) {
+	if got.Spec.GPUHoursBudget != want.GPUHoursBudget || got.Spec.MaxSandboxSeconds != want.MaxSandboxSeconds {
 		return false
 	}
-	for role, cap := range want.Roles {
-		have, ok := got.Spec.Roles[role]
-		if !ok || have.MaxSandboxes != cap.MaxSandboxes || have.MaxGPUs != cap.MaxGPUs {
+	return sameRoles(got.Spec.Roles, want.Roles) && sameTemplates(got.Spec.Templates, want.Templates)
+}
+
+func sameRoles(got, want map[string]runtimev1alpha1.GrantRole) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for name, role := range want {
+		have, ok := got[name]
+		if !ok || have.MaxSandboxes != role.MaxSandboxes || have.MaxGPUs != role.MaxGPUs || !slices.Equal(have.Templates, role.Templates) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameTemplates(got, want []runtimev1alpha1.GrantTemplate) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range want {
+		if got[i].Name != want[i].Name || got[i].Spec != want[i].Spec || !slices.Equal(got[i].PerGPUCount, want[i].PerGPUCount) {
 			return false
 		}
 	}

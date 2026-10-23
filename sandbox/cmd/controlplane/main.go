@@ -427,6 +427,7 @@ func main() {
 	} else {
 		log.Warn("K8s sandbox creator init failed; running in dev mode", "error", err)
 	}
+	apiServer.WithSafeWorkloads(workloadmanager.NewSafeWorkloadCreator(dynamicClient, mgr.GetClient()))
 
 	grants, err := startGrants(ctx, mgr.GetClient(), clientset, dynamicClient, apiServer, st, wmCfg.Namespace)
 	if err != nil {

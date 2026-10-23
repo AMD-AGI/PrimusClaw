@@ -107,7 +107,8 @@ func (s *Service) Authenticate(ctx context.Context, token string) error {
 }
 
 // Issue creates a grant or, when the same id was already issued with the same
-// spec, returns it without keys. Keys are returned only by the call that
+// execution spec, returns it without keys. A new attestation for that spec is
+// accepted after it is verified. Keys are returned only by the call that
 // creates the CR.
 func (s *Service) Issue(ctx context.Context, req IssueRequest) (IssueResponse, int, error) {
 	if err := validateIssue(req, s.now()); err != nil {

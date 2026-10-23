@@ -55,21 +55,13 @@ func (s *Server) Create(ctx context.Context, req e2b.CreateRequest) (e2b.CreateR
 	podIP := "127.0.0.1"
 	sandboxName := req.TemplateID
 	sandboxKind := store.SandboxKind
+	namespace := req.Namespace
 	port := 8080
+	nodeName := ""
 	var policy *SandboxResult
-	if s.k8s != nil {
-		var overrides *SandboxOverrides
-		if len(req.Env) > 0 || req.Timeout > 0 {
-			overrides = &SandboxOverrides{Environment: req.Env}
-			if req.Timeout > 0 {
-				overrides.MaxSessionDuration = req.Timeout.String()
-			}
-		}
-		var user *UserIdentity
-		if req.UserID != "" {
-			user = &UserIdentity{UserID: req.UserID, UserName: req.UserName}
-		}
-		result, err := s.k8s.CreateSandbox(ctx, req.SandboxID, req.TemplateID, req.Namespace, user, overrides)
+	switch {
+	case s.workloads != nil:
+		result, err := s.workloads.Create(ctx, req)
 		if err != nil {
 			_ = s.store.DeleteSandboxBySessionID(ctx, req.SandboxID)
 			if errors.Is(err, ErrTemplateNotFound) {
@@ -80,20 +72,27 @@ func (s *Server) Create(ctx context.Context, req e2b.CreateRequest) (e2b.CreateR
 		podIP = result.PodIP
 		sandboxName = result.SandboxName
 		sandboxKind = result.Kind
+		if result.Namespace != "" {
+			namespace = result.Namespace
+		}
 		if result.PodPort > 0 {
 			port = result.PodPort
 		}
 		if result.MaxSessionDuration > 0 {
 			ttl = result.MaxSessionDuration
 		}
+		nodeName = result.NodeName
 		policy = result
+	case s.k8s != nil:
+		_ = s.store.DeleteSandboxBySessionID(ctx, req.SandboxID)
+		return e2b.CreateResult{}, fmt.Errorf("safe workload client is not configured")
 	}
 
 	info := &store.SandboxInfo{
 		Kind:         sandboxKind,
 		SessionID:    req.SandboxID,
 		SandboxName:  sandboxName,
-		Namespace:    req.Namespace,
+		Namespace:    namespace,
 		PodIP:        podIP,
 		PodPort:      port,
 		CreatedAt:    now,
@@ -117,9 +116,10 @@ func (s *Server) Create(ctx context.Context, req e2b.CreateRequest) (e2b.CreateR
 	}
 	return e2b.CreateResult{
 		SandboxName: sandboxName,
-		Namespace:   req.Namespace,
+		Namespace:   namespace,
 		PodIP:       podIP,
 		PodPort:     port,
+		NodeName:    nodeName,
 	}, nil
 }
 
@@ -129,6 +129,8 @@ func (s *Server) Delete(ctx context.Context, sandboxID string) error {
 }
 
 // SetTimeout moves the session expiry to now plus timeout.
+// The caller only reaches this after the grant accepts the new duration.
+// A SaFE Workload stores that same lifetime as a duration from its start time.
 func (s *Server) SetTimeout(ctx context.Context, sandboxID string, timeout time.Duration) error {
 	info, err := s.store.GetSandboxBySessionID(ctx, sandboxID)
 	if err != nil {
@@ -137,6 +139,15 @@ func (s *Server) SetTimeout(ctx context.Context, sandboxID string, timeout time.
 	if timeout <= 0 {
 		return fmt.Errorf("timeout must be > 0")
 	}
-	info.ExpiresAt = time.Now().Add(timeout)
+	now := time.Now()
+	if info.Kind == store.WorkloadKind {
+		if s.workloads == nil {
+			return fmt.Errorf("safe workload client is not configured")
+		}
+		if err := s.workloads.AlignTimeout(ctx, info.SandboxName, timeout, now); err != nil {
+			return err
+		}
+	}
+	info.ExpiresAt = now.Add(timeout)
 	return s.store.UpdateSandbox(ctx, info)
 }
