@@ -38,7 +38,7 @@ render() {
   local out="$1"
   shift
   helm template sbx "$chart_dir" --namespace sandbox-test \
-    --set redis.password=render-test --set security.allowInsecureNoAuth=true \
+    --set security.allowInsecureNoAuth=true \
     "$@" >"$out"
 }
 

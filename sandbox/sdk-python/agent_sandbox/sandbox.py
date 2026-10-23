@@ -43,24 +43,6 @@ class Sandbox:
         sbx.exec("...")
         sbx.close()
 
-    LLM Inference (unified inference gateway)::
-
-        When the platform has inference enabled (inference.enabled=true in Helm
-        values), OPENAI_BASE_URL is injected as a Pod env var (pointing to the
-        platform LiteLLM gateway), and OPENAI_API_KEY is injected at process
-        level by EnvD when executing commands (from the user's SaFE API Key
-        stored in Redis). Code inside the sandbox can use ``import openai``
-        directly without any additional configuration.
-
-        **Limitation**: The unified inference gateway requires API Key
-        authentication (SDK / CLI). Sandboxes created via Cookie authentication
-        (browser) do NOT receive OPENAI_API_KEY injection.
-
-        Three usage patterns:
-        - **Platform LLM (default)**: ``import openai`` works out of the box
-        - **Own public LLM**: Override base_url/api_key in your code
-        - **Own internal LLM**: Declare allowedInternalHosts in template
-
     Egress Traffic Governance (transparent proxy + SSRF protection)::
 
         When egress is enabled (egress.enabled=true), all outbound TCP traffic

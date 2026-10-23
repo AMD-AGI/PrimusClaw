@@ -199,8 +199,12 @@ func (s *Server) setupRoutes() {
 	v1.POST("/code-interpreter", s.proxyToWM)
 	v1.POST("/code-interpreter/stream", s.proxyToWM) // SSE streaming sandbox creation
 	v1.GET("/code-interpreter/sessions", s.proxyToWM)
-	v1.GET("/code-interpreter/sessions/:sessionId", s.proxyToWM)
-	v1.DELETE("/code-interpreter/sessions/:sessionId", s.proxyToWM)
+	// Dual-read: one segment is a legacy opaque id; two segments are namespace/name.
+	// Gin requires the same wildcard name at each depth (:namespace).
+	v1.GET("/code-interpreter/sessions/:namespace", s.proxyToWM)
+	v1.DELETE("/code-interpreter/sessions/:namespace", s.proxyToWM)
+	v1.GET("/code-interpreter/sessions/:namespace/:name", s.proxyToWM)
+	v1.DELETE("/code-interpreter/sessions/:namespace/:name", s.proxyToWM)
 
 	// Template management (CRUD)
 	v1.POST("/templates", s.proxyToWM)
@@ -210,10 +214,14 @@ func (s *Server) setupRoutes() {
 	v1.PUT("/templates/:namespace/:name", s.proxyToWM)
 	v1.DELETE("/templates/:namespace/:name", s.proxyToWM)
 
-	// Sandbox policy management (proxied to WM)
-	v1.GET("/sandbox/sessions/:sessionId/policy", s.proxyToWM)
-	v1.PATCH("/sandbox/sessions/:sessionId/policy", s.proxyToWM)
-	v1.GET("/sandbox/sessions/:sessionId/logs", s.proxyToWM)
+	// Sandbox policy management (proxied to WM).
+	// Dual-read: one segment is a legacy or percent-encoded session id.
+	v1.GET("/sandbox/sessions/:namespace/policy", s.proxyToWM)
+	v1.PATCH("/sandbox/sessions/:namespace/policy", s.proxyToWM)
+	v1.GET("/sandbox/sessions/:namespace/logs", s.proxyToWM)
+	v1.GET("/sandbox/sessions/:namespace/:name/policy", s.proxyToWM)
+	v1.PATCH("/sandbox/sessions/:namespace/:name/policy", s.proxyToWM)
+	v1.GET("/sandbox/sessions/:namespace/:name/logs", s.proxyToWM)
 
 	// WM health (proxied for unified /v1/health)
 	v1.GET("/health", s.proxyToWM)
@@ -491,8 +499,8 @@ func (s *Server) handleInvoke(c *gin.Context, kind string) {
 
 	// Get or create sandbox — delegate to SessionManager.
 	// The SessionManager has a 3-layer lookup:
-	//   1. Redis store (fast path)
-	//   2. WM recovery endpoint → K8s Sandbox annotation (fallback when Redis data is lost)
+	//   1. Session store (CR-backed in production)
+	//   2. WM recovery endpoint → Sandbox CR (fallback)
 	//   3. Error with actionable message
 	// Auto-creation (when sessionID is empty) only happens for POST requests (guarded above).
 	requestContext := withCallerCredentials(
@@ -528,7 +536,7 @@ func (s *Server) handleInvoke(c *gin.Context, kind string) {
 			})
 			return
 		}
-		// Store connection error (Redis unreachable AND K8s recovery also failed)
+		// Store connection error (and K8s recovery also failed)
 		if strings.Contains(errMsg, "store lookup failed") {
 			c.JSON(http.StatusServiceUnavailable, gin.H{
 				"error":  "session store temporarily unavailable, please retry",

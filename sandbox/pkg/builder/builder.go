@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package builder provides Dockerfile-based image building for sandbox templates.
-// It uses kaniko to build images inside the K8s cluster, with content-based
-// caching to avoid redundant builds.
+// It uses kaniko to build images inside the K8s cluster. An optional ImageCache
+// can skip rebuilds for identical Dockerfiles; production uses NopCache and
+// relies on kaniko's --cache-repo for layer reuse when configured.
 package builder
 
 import (
@@ -65,8 +66,12 @@ type ImageCache interface {
 	Delete(ctx context.Context, hash string) error
 }
 
-// New creates a Builder.
+// New creates a Builder. A nil cache is treated as NopCache (every build runs;
+// kaniko layer cache via CacheRepo still applies when set).
 func New(cfg Config, k8sClient client.Client, cache ImageCache) *Builder {
+	if cache == nil {
+		cache = NewNopCache()
+	}
 	return &Builder{cfg: cfg, client: k8sClient, cache: cache}
 }
 

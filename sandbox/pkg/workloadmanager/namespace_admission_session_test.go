@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"sigs.k8s.io/agent-sandbox/pkg/api"
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
@@ -23,14 +24,15 @@ func (stubAuditStore) QueryBySession(context.Context, string) ([]*audit.AuditEve
 	return nil, nil
 }
 
-// seedSessions stores one running session in "admitted" (sid-admitted) and
-// one in "denied" (sid-denied).
+// seedSessions stores one running session in "admitted" and one in "denied",
+// each identified by namespace/name.
 func seedSessions(t *testing.T, r *wmRig) {
 	t.Helper()
 	now := time.Now()
 	for _, ns := range []string{"admitted", "denied"} {
+		name := "sb-" + ns
 		if err := r.store.StoreSandbox(context.Background(), &store.SandboxInfo{
-			SessionID: "sid-" + ns, SandboxName: "sb-" + ns, Namespace: ns, Status: "running",
+			SessionID: api.FormatSandboxID(ns, name), SandboxName: name, Namespace: ns, Status: "running",
 			CreatedAt: now, LastActivity: now, ExpiresAt: now.Add(time.Hour),
 		}); err != nil {
 			t.Fatal(err)
@@ -78,41 +80,96 @@ func (sr sessionRoute) url(sid string) string { return fmt.Sprintf(sr.path, sid)
 // in: a session in an admitted namespace is served, one in a namespace this
 // deployment does not serve gets 403 namespace_not_admitted with no effect.
 func TestWMSessionRoutesJudgeTheSessionNamespace(t *testing.T) {
+	admittedID := api.FormatSandboxID("admitted", "sb-admitted")
+	deniedID := api.FormatSandboxID("denied", "sb-denied")
 	for _, sr := range sessionRoutes() {
 		t.Run(sr.name, func(t *testing.T) {
 			rig := newWMRig(t, wmAdmitter(t, true), false)
 			seedSessions(t, rig)
 
-			w := rig.serve(sr.method, sr.url("sid-admitted"), sr.body)
+			w := rig.serve(sr.method, sr.url(admittedID), sr.body)
 			if w.Code != sr.admittedCode {
 				t.Fatalf("admitted: got %d %s, want %d", w.Code, w.Body, sr.admittedCode)
 			}
 
-			w = rig.serve(sr.method, sr.url("sid-denied"), sr.body)
+			w = rig.serve(sr.method, sr.url(deniedID), sr.body)
 			var body map[string]any
 			_ = json.Unmarshal(w.Body.Bytes(), &body)
 			if w.Code != http.StatusForbidden || body["code"] != "namespace_not_admitted" {
 				t.Fatalf("denied: got %d %s, want 403 namespace_not_admitted", w.Code, w.Body)
 			}
-			if !sr.unchanged(t, rig, "sid-denied") {
+			if !sr.unchanged(t, rig, deniedID) {
 				t.Fatal("a session in a non-admitted namespace was changed")
 			}
 		})
 	}
 }
 
+// Single-segment policy and logs URLs are what the Python SDK sends: quote()
+// keeps sess_* as one segment and encodes namespace/name as ns%2Fname.
+func TestPolicyAndLogsAcceptSingleSegmentSessionID(t *testing.T) {
+	rig := newWMRig(t, wmAdmitter(t, true), false)
+	seedSessions(t, rig)
+	now := time.Now()
+	storeOne := func(id, ns, name string) {
+		t.Helper()
+		if err := rig.store.StoreSandbox(context.Background(), &store.SandboxInfo{
+			SessionID: id, SandboxName: name, Namespace: ns, Status: "running",
+			CreatedAt: now, LastActivity: now, ExpiresAt: now.Add(time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	storeOne("sess_legacy", "admitted", "sb-legacy")
+	storeOne("sess_denied", "denied", "sb-denied")
+
+	for _, path := range []string{
+		"/v1/sandbox/sessions/sess_legacy/policy",
+		"/v1/sandbox/sessions/admitted%2Fsb-admitted/policy",
+	} {
+		w := rig.serve(http.MethodGet, path, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET %s: got %d %s", path, w.Code, w.Body)
+		}
+	}
+
+	w := rig.serve(http.MethodPatch, "/v1/sandbox/sessions/sess_legacy/policy", `{"policyMode":"audit"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("PATCH legacy: got %d %s", w.Code, w.Body)
+	}
+	if info := rig.session(t, "sess_legacy"); info == nil || info.PolicyMode != "audit" {
+		t.Fatalf("legacy policy was not updated: %+v", info)
+	}
+
+	w = rig.serve(http.MethodGet, "/v1/sandbox/sessions/sess_legacy/logs", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET logs: got %d %s", w.Code, w.Body)
+	}
+
+	w = rig.serve(http.MethodPatch, "/v1/sandbox/sessions/sess_denied/policy", `{"policyMode":"audit"}`)
+	var body map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &body)
+	if w.Code != http.StatusForbidden || body["code"] != "namespace_not_admitted" {
+		t.Fatalf("denied legacy: got %d %s", w.Code, w.Body)
+	}
+	if info := rig.session(t, "sess_denied"); info == nil || info.PolicyVersion != 0 {
+		t.Fatalf("denied legacy policy changed: %+v", info)
+	}
+}
+
 func TestWMSessionRoutesFailClosedWhenUnsynced(t *testing.T) {
+	admittedID := api.FormatSandboxID("admitted", "sb-admitted")
 	for _, sr := range sessionRoutes() {
 		t.Run(sr.name, func(t *testing.T) {
 			rig := newWMRig(t, wmAdmitter(t, false), false)
 			seedSessions(t, rig)
-			w := rig.serve(sr.method, sr.url("sid-admitted"), sr.body)
+			w := rig.serve(sr.method, sr.url(admittedID), sr.body)
 			var body map[string]any
 			_ = json.Unmarshal(w.Body.Bytes(), &body)
 			if w.Code != http.StatusServiceUnavailable || body["code"] != "namespace_admission_unavailable" {
 				t.Fatalf("unsynced: got %d %s, want 503", w.Code, w.Body)
 			}
-			if !sr.unchanged(t, rig, "sid-admitted") {
+			if !sr.unchanged(t, rig, admittedID) {
 				t.Fatal("an unsynced cache let a change through")
 			}
 		})
