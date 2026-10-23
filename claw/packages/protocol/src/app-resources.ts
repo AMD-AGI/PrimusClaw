@@ -131,21 +131,18 @@ const smallest = (...values: Array<number | undefined>): number | undefined => {
   return set.length === 0 ? undefined : Math.min(...set);
 };
 
-/** A Kubernetes cpu quantity ("8", "2.5", "500m") in cores; undefined when not one. */
-function cpuCores(q: string | undefined): number | undefined {
-  const m = q === undefined ? null : /^([0-9]+(?:\.[0-9]+)?)(m?)$/.exec(q.trim());
-  return m ? Number(m[1]) / (m[2] ? 1000 : 1) : undefined;
-}
-
-const MEMORY_UNITS: Record<string, number> = {
-  "": 1, K: 1e3, M: 1e6, G: 1e9, T: 1e12, Ki: 1024, Mi: 1024 ** 2, Gi: 1024 ** 3, Ti: 1024 ** 4,
+const QUANTITY_SUFFIX: Record<string, number> = {
+  n: 1e-9, u: 1e-6, m: 1e-3, k: 1e3, M: 1e6, G: 1e9, T: 1e12, P: 1e15, E: 1e18,
+  Ki: 1024, Mi: 1024 ** 2, Gi: 1024 ** 3, Ti: 1024 ** 4, Pi: 1024 ** 5, Ei: 1024 ** 6,
 };
-/** A Kubernetes memory quantity ("32Gi", "512Mi", "1G") in GiB; undefined when not one. */
-function memoryGi(q: string | undefined): number | undefined {
-  const m = q === undefined ? null : /^([0-9]+(?:\.[0-9]+)?)(Ki|Mi|Gi|Ti|K|M|G|T)?$/.exec(q.trim());
-  return m ? (Number(m[1]) * MEMORY_UNITS[m[2] ?? ""]!) / 1024 ** 3 : undefined;
+/** A Kubernetes quantity ("8", "500m", "32Gi", "1e3", "1G") as a number; undefined when not one. */
+function quantity(q: string | undefined): number | undefined {
+  if (q === undefined) return undefined;
+  const m = /^([0-9]+(?:\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+|[numkMGTPE]|Ki|Mi|Gi|Ti|Pi|Ei)?$/.exec(q.trim());
+  if (!m) return undefined;
+  const n = Number(m[1]) * (m[2] === undefined ? 1 : /^[eE][+-]?[0-9]/.test(m[2]) ? 10 ** Number(m[2].slice(1)) : QUANTITY_SUFFIX[m[2]]!);
+  return Number.isFinite(n) ? n : undefined;
 }
-
 /**
  * Validate `resources` and work out what the run gets. `{ issues }` lists every
  * problem; the request is refused as a whole.
@@ -204,14 +201,17 @@ export function resolveAppResources(
 
   // The manifest's container resources are also the most a request may ask for.
   const declared = manifest.container.resources ?? {};
-  const over = (field: string, asked: unknown, max: number | undefined, text: string | undefined): void => {
-    if (typeof asked === "number" && max !== undefined && asked > max) {
-      issues.push({ field, reason: `exceeds the manifest maximum ${text}` });
-    }
+  // `max` converts a declared quantity to the request's unit. A declared value that
+  // cannot be read is a refusal of any request for that resource, never "no maximum".
+  const over = (field: string, asked: unknown, text: string | undefined, max: (q: number) => number): void => {
+    if (typeof asked !== "number" || text === undefined) return;
+    const q = quantity(text);
+    if (q === undefined) issues.push({ field, reason: `the manifest maximum ${JSON.stringify(text)} is not a readable quantity` });
+    else if (asked > max(q)) issues.push({ field, reason: `exceeds the manifest maximum ${text}` });
   };
-  over("resources.gpus", r.gpus, /^[0-9]+$/.test(declared[APP_GPU_RESOURCE] ?? "") ? Number(declared[APP_GPU_RESOURCE]) : undefined, declared[APP_GPU_RESOURCE]);
-  over("resources.cpu", r.cpu, cpuCores(declared.cpu), declared.cpu);
-  over("resources.memory_gi", r.memory_gi, memoryGi(declared.memory), declared.memory);
+  over("resources.gpus", r.gpus, declared[APP_GPU_RESOURCE], (q) => q);
+  over("resources.cpu", r.cpu, declared.cpu, (q) => q);
+  over("resources.memory_gi", r.memory_gi, declared.memory, (q) => q / 1024 ** 3);
 
   const req: AppGrantLimits = {};
   if (r.grant !== undefined) {
