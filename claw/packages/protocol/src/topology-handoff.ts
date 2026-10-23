@@ -117,9 +117,9 @@ export function validateTopologyHandoff(value: unknown): string[] {
       problems.push(`${path || "(root)"}: must be an object`);
       return;
     }
-    for (const k of schema.required ?? []) if (!(k in v)) problems.push(`${path}${k}: required`);
+    for (const k of schema.required ?? []) if (!Object.hasOwn(v, k)) problems.push(`${path}${k}: required`);
     for (const [k, val] of Object.entries(v)) {
-      if (!(k in schema.properties)) problems.push(`${path}${k}: unknown field`);
+      if (!Object.hasOwn(schema.properties, k)) problems.push(`${path}${k}: unknown field`);
       else check(k, val);
     }
   };
@@ -169,8 +169,8 @@ export function validateTopologyHandoff(value: unknown): string[] {
   // backend itself is valid, so one mistake is not reported twice.
   if (isObj(value) && (value.backend === "rayjob" || value.backend === "infera")) {
     const [want, other] = value.backend === "rayjob" ? (["ray", "infera"] as const) : (["infera", "ray"] as const);
-    if (!(want in value)) problems.push(`${want}: required when backend is ${value.backend}`);
-    if (other in value) problems.push(`${other}: not allowed when backend is ${value.backend}`);
+    if (!Object.hasOwn(value, want)) problems.push(`${want}: required when backend is ${value.backend}`);
+    if (Object.hasOwn(value, other)) problems.push(`${other}: not allowed when backend is ${value.backend}`);
   }
   return problems;
 }
