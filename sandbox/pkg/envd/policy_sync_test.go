@@ -29,7 +29,7 @@ func TestPolicySyncerSyncsAllowedInternalHostsToSSRFChecker(t *testing.T) {
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/internal/policy/sess_test" {
+		if r.URL.Path != "/v1/internal/policy/default/sbx" {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer router-token" {
@@ -45,8 +45,8 @@ func TestPolicySyncerSyncsAllowedInternalHostsToSSRFChecker(t *testing.T) {
 	}))
 	defer server.Close()
 
-	wm := &inferenceKeyCache{wmURL: server.URL, sessionID: "sess_test", jwtToken: "router-token"}
-	syncer := NewPolicySyncer(engine, ssrf, wm)
+	session := &sessionContext{wmURL: server.URL, sessionID: "default/sbx", jwtToken: "router-token", ready: make(chan struct{})}
+	syncer := NewPolicySyncer(engine, ssrf, session)
 	syncer.syncOnce(context.Background())
 
 	cfg := engine.GetConfig()

@@ -2,16 +2,15 @@
 # SPDX-FileCopyrightText: Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-# install.sh — One-shot installer for the agent-sandbox stack (CRDs + namespace + envd identity + Helm release with Redis)
+# install.sh — One-shot installer for the agent-sandbox stack (CRDs + namespace + envd identity + Helm release)
 #
-# This is the validated path used on the the cluster: Helm chart provisions
-# controlplane + Redis StatefulSet + Redis Secret atomically; CRDs and the envd
-# router identity Secret are bootstrapped outside the chart.
+# This is the validated path used on the the cluster: Helm chart provisions the
+# controlplane Deployment; CRDs and the envd router identity Secret are
+# bootstrapped outside the chart. Session state lives on Sandbox CRs; audit is
+# written to process logs (no Redis).
 #
 # Usage:
-#   REDIS_PASSWORD='YourStrongPass1234567890abcd' \
 #   IMAGE_TAG=202605041641 \
-#   REDIS_STORAGE_CLASS=local-path \
 #   ./install.sh                               # default recommended example
 #
 # Env overrides (defaults shown):
@@ -20,11 +19,6 @@
 #   IMAGE_REGISTRY=primussafe/
 #   IMAGE_TAG=latest
 #   IMAGE_PULL_SECRET=                        # name of pre-created docker-registry secret
-#   REDIS_IMAGE_REPOSITORY=redis              # Docker Hub by default; override for private registry mirror
-#   REDIS_IMAGE_TAG=7-alpine
-#   REDIS_PASSWORD=                           # empty = auto-generate (or reuse existing)
-#   REDIS_STORAGE_CLASS=                      # empty = auto-detect cluster default; fail-fast if none
-#   REDIS_STORAGE_SIZE=20Gi
 #   ENVD_KEY_SOURCE=regen                     # regen | copy | skip
 #   ENVD_KEY_SRC_KUBECONFIG=                  # required when ENVD_KEY_SOURCE=copy
 #   ENVD_KEY_SRC_NAMESPACE=agent-sandbox-system
@@ -58,11 +52,6 @@ RELEASE="${RELEASE:-agent-sandbox}"
 IMAGE_REGISTRY="${IMAGE_REGISTRY:-primussafe/}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
 IMAGE_PULL_SECRET="${IMAGE_PULL_SECRET:-}"
-REDIS_IMAGE_REPOSITORY="${REDIS_IMAGE_REPOSITORY:-redis}"
-REDIS_IMAGE_TAG="${REDIS_IMAGE_TAG:-7-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2}"
-REDIS_PASSWORD="${REDIS_PASSWORD:-}"
-REDIS_STORAGE_CLASS="${REDIS_STORAGE_CLASS:-}"
-REDIS_STORAGE_SIZE="${REDIS_STORAGE_SIZE:-20Gi}"
 ENVD_KEY_SOURCE="${ENVD_KEY_SOURCE:-regen}"
 ENVD_KEY_SRC_KUBECONFIG="${ENVD_KEY_SRC_KUBECONFIG:-}"
 ENVD_KEY_SRC_NAMESPACE="${ENVD_KEY_SRC_NAMESPACE:-agent-sandbox-system}"
@@ -143,29 +132,50 @@ ensure_helm() {
     ok "helm installed: $(helm version --short 2>&1 | command head -1)"
 }
 
+# Apply core and runtime CRDs, then require each one to exist.
+# kubectl apply is idempotent. The Ready-release shortcut below still calls
+# this: a control plane that already reads SandboxPolicy must not skip the
+# CRD that was added after the release was first installed.
+ensure_crds() {
+    [[ -d "${CORE_CRD_DIR}"    ]] || err "missing ${CORE_CRD_DIR}"
+    [[ -d "${RUNTIME_CRD_DIR}" ]] || err "missing ${RUNTIME_CRD_DIR}"
+    run "kubectl apply -f \"${CORE_CRD_DIR}/\""
+    run "kubectl apply -f \"${RUNTIME_CRD_DIR}/\""
+
+    local c
+    for c in sandboxes.agents.x-k8s.io \
+             sandboxclaims.extensions.agents.x-k8s.io \
+             sandboxtemplates.extensions.agents.x-k8s.io \
+             sandboxwarmpools.extensions.agents.x-k8s.io \
+             codeinterpreters.runtime.agent-sandbox.io \
+             clustersandboxpolicies.runtime.agent-sandbox.io \
+             sandboxpolicies.runtime.agent-sandbox.io; do
+        if [[ "${DRY_RUN}" != "true" ]]; then
+            kubectl get crd "$c" >/dev/null 2>&1 || err "CRD $c not Established"
+        fi
+    done
+    ok "7 CRDs Established"
+}
+
 # ── Idempotency guard: skip when Sandbox is already installed ─────────────────
-# Re-running against an existing Helm release can fail on immutable StatefulSet
-# fields (e.g. redis volumeClaimTemplates.storageClassName when the StorageClass
-# changed). Treat Sandbox as installed only when its controlplane Deployment is
-# Ready, so a half-broken install is still repaired. FORCE_SANDBOX=1 overrides.
+# Treat Sandbox as installed only when its controlplane Deployment is Ready, so
+# a half-broken install is still repaired. FORCE_SANDBOX=1 overrides.
+# CRDs are still applied: they are outside the Helm release, and a new CRD
+# (SandboxPolicy) has to land on an already-Ready cluster.
 FORCE_SANDBOX="${FORCE_SANDBOX:-false}"
 if command -v kubectl >/dev/null 2>&1 \
    && [[ "${FORCE_SANDBOX}" != "1" && "${FORCE_SANDBOX}" != "true" && "${DRY_RUN}" != "true" ]]; then
     DEPLOY_STATE="$(kubectl -n "${NAMESPACE}" get deploy agent-sandbox-controlplane \
         -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}|{.metadata.labels.app\.kubernetes\.io/instance}|{.spec.replicas}|{.status.readyReplicas}' \
         2>/dev/null || true)"
-    REDIS_STATE="$(kubectl -n "${NAMESPACE}" get statefulset redis \
-        -o jsonpath='{.spec.replicas}|{.status.readyReplicas}' 2>/dev/null || true)"
     IFS='|' read -r MANAGED_BY INSTANCE DESIRED READY_REPLICAS <<<"${DEPLOY_STATE}"
-    IFS='|' read -r REDIS_DESIRED REDIS_READY <<<"${REDIS_STATE}"
     if [[ "${MANAGED_BY}" == "Helm" \
        && "${INSTANCE}" == "${RELEASE}" \
        && "${DESIRED}" =~ ^[1-9][0-9]*$ \
-       && "${READY_REPLICAS}" == "${DESIRED}" \
-       && "${REDIS_DESIRED}" =~ ^[1-9][0-9]*$ \
-       && "${REDIS_READY}" == "${REDIS_DESIRED}" ]] \
-       && kubectl -n "${NAMESPACE}" get secret agent-sandbox-redis >/dev/null 2>&1; then
-        ok "Sandbox Helm release ${RELEASE} is fully ready in ${NAMESPACE} — skipping (set FORCE_SANDBOX=1 to reinstall)"
+       && "${READY_REPLICAS}" == "${DESIRED}" ]]; then
+        ok "Sandbox Helm release ${RELEASE} is fully ready in ${NAMESPACE} — applying CRDs, then skipping the rest (set FORCE_SANDBOX=1 to reinstall)"
+        section "CRDs"
+        ensure_crds
         exit 0
     fi
 fi
@@ -201,42 +211,10 @@ if [[ -n "${SANDBOX_EXTRA_CA_CONFIGMAP}" ]]; then
     done
 fi
 
-# If a redis StatefulSet already exists, its volumeClaimTemplates.storageClassName
-# is immutable — reuse the deployed value and ignore the requested one so re-runs
-# never attempt a forbidden StatefulSet patch. Only brand-new installs use the
-# requested (unified) REDIS_STORAGE_CLASS.
-REDIS_SC_FROM_LIVE=false
-if [[ "${DRY_RUN}" != "true" ]] && kubectl -n "${NAMESPACE}" get statefulset redis >/dev/null 2>&1; then
-    EXISTING_REDIS_SC="$(kubectl -n "${NAMESPACE}" get statefulset redis \
-        -o jsonpath='{.spec.volumeClaimTemplates[0].spec.storageClassName}' 2>/dev/null || true)"
-    if [[ -n "${REDIS_STORAGE_CLASS}" && "${REDIS_STORAGE_CLASS}" != "${EXISTING_REDIS_SC}" ]]; then
-        warn "redis already deployed with storageClassName='${EXISTING_REDIS_SC:-<unset>}'; keeping it, ignoring requested '${REDIS_STORAGE_CLASS}' (StatefulSet volumeClaimTemplates are immutable)"
-    else
-        log "redis already deployed; keeping its storageClassName='${EXISTING_REDIS_SC:-<unset>}'"
-    fi
-    REDIS_STORAGE_CLASS="${EXISTING_REDIS_SC}"
-    REDIS_SC_FROM_LIVE=true
-fi
-
-# Auto-detect default StorageClass when user did not pin one — new clusters often have none,
-# in which case Redis PVC will hang in Pending forever.
-if [[ -z "${REDIS_STORAGE_CLASS}" ]] && [[ "${DRY_RUN}" != "true" ]] && [[ "${REDIS_SC_FROM_LIVE}" != "true" ]]; then
-    DEFAULT_SC="$(kubectl get sc -o jsonpath='{range .items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")]}{.metadata.name}{"\n"}{end}' 2>/dev/null | command head -1)"
-    if [[ -n "${DEFAULT_SC}" ]]; then
-        REDIS_STORAGE_CLASS="${DEFAULT_SC}"
-        log "Auto-detected default StorageClass: ${REDIS_STORAGE_CLASS}"
-    else
-        ALL_SC="$(kubectl get sc -o name 2>/dev/null | sed 's|storageclass.storage.k8s.io/||' | paste -sd ',' -)"
-        warn "no default StorageClass found in cluster (available: ${ALL_SC:-<none>})"
-        warn "Redis PVC will Pending — please rerun with REDIS_STORAGE_CLASS=<name>"
-        err  "missing StorageClass blocks Redis StatefulSet; aborting before Helm install"
-    fi
-fi
-
 # Fail-fast if the namespace already has a controlplane Deployment that is NOT helm-managed.
 # This catches the case where a user previously ran "kubectl apply -f deploy/k8s/controlplane.yaml"
-# (flat manifest path) — that path does not install Redis and pins a nodeSelector that breaks
-# scheduling on clusters without the profile's configured node label.
+# (flat manifest path) — that path pins a nodeSelector that breaks scheduling on clusters
+# without the profile's configured node label.
 if [[ "${DRY_RUN}" != "true" ]] && kubectl -n "${NAMESPACE}" get deploy agent-sandbox-controlplane >/dev/null 2>&1; then
     MANAGER="$(kubectl -n "${NAMESPACE}" get deploy agent-sandbox-controlplane \
                  -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null)"
@@ -245,7 +223,7 @@ if [[ "${DRY_RUN}" != "true" ]] && kubectl -n "${NAMESPACE}" get deploy agent-sa
     if [[ "${MANAGER}" != "Helm" ]]; then
         warn "found agent-sandbox-controlplane Deployment NOT managed by Helm (managed-by='${MANAGER:-<none>}')"
         warn "this was likely created via 'kubectl apply -f deploy/k8s/controlplane.yaml' (flat manifest)"
-        warn "the flat manifest does NOT install Redis and pins a nodeSelector that breaks new clusters"
+        warn "the flat manifest pins a nodeSelector that breaks new clusters"
         err  "clean up first: kubectl -n ${NAMESPACE} delete deploy,svc,sa,role,rolebinding -l 'app=agent-sandbox-controlplane' && kubectl delete clusterrole,clusterrolebinding agent-sandbox-controlplane"
     elif [[ -n "${INSTANCE}" && "${INSTANCE}" != "${RELEASE}" ]]; then
         err "controlplane Deployment owned by Helm release '${INSTANCE}', not '${RELEASE}'; either set RELEASE=${INSTANCE} or remove the conflicting release"
@@ -257,29 +235,12 @@ log "Namespace:       ${NAMESPACE}"
 log "Release:         ${RELEASE}"
 log "Image:           ${IMAGE_REGISTRY}agent-sandbox-controlplane:${IMAGE_TAG}"
 log "Envd injector:   ${IMAGE_REGISTRY}agent-sandbox-envd-injector:${IMAGE_TAG}"
-log "Redis image:     ${REDIS_IMAGE_REPOSITORY}:${REDIS_IMAGE_TAG}"
-log "Redis storage:   ${REDIS_STORAGE_SIZE} (class=${REDIS_STORAGE_CLASS:-<cluster-default>})"
 log "Envd keys:       ${ENVD_KEY_SOURCE}"
 log "Dry-run:         ${DRY_RUN}"
 
 # ── Step 1: CRDs ──────────────────────────────────────────────────────────────
 section "Step 1: Apply CRDs"
-[[ -d "${CORE_CRD_DIR}"    ]] || err "missing ${CORE_CRD_DIR}"
-[[ -d "${RUNTIME_CRD_DIR}" ]] || err "missing ${RUNTIME_CRD_DIR}"
-run "kubectl apply -f \"${CORE_CRD_DIR}/\""
-run "kubectl apply -f \"${RUNTIME_CRD_DIR}/\""
-
-for c in sandboxes.agents.x-k8s.io \
-         sandboxclaims.extensions.agents.x-k8s.io \
-         sandboxtemplates.extensions.agents.x-k8s.io \
-    sandboxwarmpools.extensions.agents.x-k8s.io \
-         codeinterpreters.runtime.agent-sandbox.io \
-         clustersandboxpolicies.runtime.agent-sandbox.io; do
-    if [[ "${DRY_RUN}" != "true" ]]; then
-        kubectl get crd "$c" >/dev/null 2>&1 || err "CRD $c not Established"
-    fi
-done
-ok "6 CRDs Established"
+ensure_crds
 
 # ── Step 2: Namespace ─────────────────────────────────────────────────────────
 section "Step 2: Namespace"
@@ -355,25 +316,11 @@ esac
 
 # ── Step 4: Helm install ──────────────────────────────────────────────────────
 section "Step 4: Helm install/upgrade"
-# Resolve / reuse Redis password
-if [[ -z "${REDIS_PASSWORD}" ]] && [[ "${DRY_RUN}" != "true" ]]; then
-    EXISTING="$(kubectl -n "${NAMESPACE}" get secret agent-sandbox-redis \
-                  -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)"
-    if [[ -n "${EXISTING}" ]]; then
-        REDIS_PASSWORD="${EXISTING}"
-        log "Reusing existing Redis password from Secret"
-    else
-        REDIS_PASSWORD="$(openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | command head -c 32)"
-        log "Generated new 32-char Redis password"
-    fi
-fi
-[[ -n "${REDIS_PASSWORD}" ]] || REDIS_PASSWORD="dry-run-placeholder"
-REDIS_VALUES_FILE="$(mktemp /tmp/agent-sandbox-redis-values.XXXXXX.json)"
-chmod 600 "${REDIS_VALUES_FILE}"
-REDIS_PASSWORD_FOR_VALUES="${REDIS_PASSWORD}" \
+VALUES_FILE="$(mktemp /tmp/agent-sandbox-values.XXXXXX.json)"
+chmod 600 "${VALUES_FILE}"
 EGRESS_ENABLED_FOR_VALUES="${EGRESS_ENABLED}" \
 EGRESS_CIDRS_FOR_VALUES="${EGRESS_EXTRA_BLOCKED_CIDRS}" \
-python3 - "${REDIS_VALUES_FILE}" <<'PY'
+python3 - "${VALUES_FILE}" <<'PY'
 import json
 import os
 import sys
@@ -382,27 +329,20 @@ enabled = os.environ["EGRESS_ENABLED_FOR_VALUES"].lower() == "true"
 cidrs = ",".join(item.strip() for item in os.environ["EGRESS_CIDRS_FOR_VALUES"].split(",") if item.strip())
 with open(sys.argv[1], "w", encoding="utf-8") as f:
     json.dump({
-        "redis": {"password": os.environ["REDIS_PASSWORD_FOR_VALUES"]},
         "egress": {"enabled": enabled, "extraBlockedCIDRs": cidrs},
     }, f)
 PY
-trap 'rm -f "${REDIS_VALUES_FILE:-}"' EXIT
+trap 'rm -f "${VALUES_FILE:-}"' EXIT
 
 # Build helm --set args
 HELM_ARGS=(
     upgrade --install "${RELEASE}" "${CHART_DIR}"
     --namespace "${NAMESPACE}"
-    --values "${REDIS_VALUES_FILE}"
+    --values "${VALUES_FILE}"
     --set "controlplane.image.repository=${IMAGE_REGISTRY}agent-sandbox-controlplane"
     --set "controlplane.image.tag=${IMAGE_TAG}"
     --set "controlplane.config.envdInjectorImage=${IMAGE_REGISTRY}agent-sandbox-envd-injector:${IMAGE_TAG}"
-    --set "redis.deploy=true"
-    --set "redis.secret.create=true"
-    --set "redis.image.repository=${REDIS_IMAGE_REPOSITORY}"
-    --set "redis.image.tag=${REDIS_IMAGE_TAG}"
-    --set "redis.storage.size=${REDIS_STORAGE_SIZE}"
 )
-[[ -n "${REDIS_STORAGE_CLASS}" ]] && HELM_ARGS+=( --set "redis.storage.storageClassName=${REDIS_STORAGE_CLASS}" )
 [[ -n "${IMAGE_PULL_SECRET}"   ]] && HELM_ARGS+=( --set "imagePullSecrets[0].name=${IMAGE_PULL_SECRET}" )
 [[ -n "${SANDBOX_EXTRA_CA_CONFIGMAP}" ]] && HELM_ARGS+=(
     --set-string "controlplane.config.sandboxExtraCAConfigMap=${SANDBOX_EXTRA_CA_CONFIGMAP}"
@@ -486,27 +426,26 @@ else
 fi
 ok "Helm release ${RELEASE} applied"
 
-# Verify Redis resources actually rendered (catches silent chart-template issues)
+# Verify controlplane resources actually rendered (catches silent chart-template issues)
 if [[ "${DRY_RUN}" != "true" ]]; then
-    if ! kubectl -n "${NAMESPACE}" get sts redis >/dev/null 2>&1; then
-        warn "redis StatefulSet NOT found after helm install — chart may not have rendered redis.yaml"
+    if ! kubectl -n "${NAMESPACE}" get deploy agent-sandbox-controlplane >/dev/null 2>&1; then
+        warn "agent-sandbox-controlplane Deployment NOT found after helm install — chart may not have rendered"
         log  "current helm release values:"
         helm -n "${NAMESPACE}" get values "${RELEASE}" 2>&1 | sed 's/^/    /'
-        err  "redis missing — verify redis.deploy=true was propagated"
+        err  "controlplane missing — verify controlplane.enabled=true was propagated"
     fi
-    if ! kubectl -n "${NAMESPACE}" get svc redis >/dev/null 2>&1; then
-        err "redis Service NOT found after helm install"
+    if ! kubectl -n "${NAMESPACE}" get svc workloadmanager >/dev/null 2>&1; then
+        err "workloadmanager Service NOT found after helm install"
     fi
-    if ! kubectl -n "${NAMESPACE}" get secret agent-sandbox-redis >/dev/null 2>&1; then
-        err "Secret agent-sandbox-redis NOT found after helm install"
+    if ! kubectl -n "${NAMESPACE}" get svc agent-sandbox-router >/dev/null 2>&1; then
+        err "agent-sandbox-router Service NOT found after helm install"
     fi
-    ok "redis StatefulSet + Service + Secret confirmed"
+    ok "controlplane Deployment + Services confirmed"
 fi
 
-# Dump diagnostic info for a failed rollout: PVC state, recent events, pod status
+# Dump diagnostic info for a failed rollout: recent events, pod status
 diagnose_ns() {
     warn "── Diagnostic dump for ns=${NAMESPACE} ──"
-    kubectl -n "${NAMESPACE}" get pvc           2>&1 | sed 's/^/  pvc:   /'
     kubectl -n "${NAMESPACE}" get pods -o wide  2>&1 | sed 's/^/  pods:  /'
     kubectl -n "${NAMESPACE}" get events --sort-by=.lastTimestamp 2>&1 \
         | tail -20 | sed 's/^/  evt:   /'
@@ -521,11 +460,6 @@ else
     if ! kubectl -n "${NAMESPACE}" rollout status deploy/agent-sandbox-controlplane --timeout=300s; then
         diagnose_ns
         err "controlplane not Ready in 5m — see diagnostic dump above"
-    fi
-    log "redis rollout ..."
-    if ! kubectl -n "${NAMESPACE}" rollout status statefulset/redis --timeout=300s; then
-        diagnose_ns
-        err "redis not Ready in 5m — common causes: (a) PVC Pending (no working StorageClass), (b) image pull (set REDIS_IMAGE_REPOSITORY to a reachable mirror)"
     fi
     ok "all workloads Ready"
 fi
@@ -602,16 +536,13 @@ section "Install complete"
 cat <<EOF
 
   Resources installed:
-    - 6 CRDs (sandboxes / sandboxclaims / sandboxtemplates / sandboxwarmpools / codeinterpreters / clustersandboxpolicies)
+    - 7 CRDs (sandboxes / sandboxclaims / sandboxtemplates / sandboxwarmpools / codeinterpreters / clustersandboxpolicies / sandboxpolicies)
     - Namespace ${NAMESPACE}
     - Secret envd-router-identity (mode=${ENVD_KEY_SOURCE})
     - Helm release ${RELEASE}:
         Deployment   agent-sandbox-controlplane
         Service      workloadmanager:8080
         Service      agent-sandbox-router:8080
-        StatefulSet  redis (${REDIS_STORAGE_SIZE})
-        Service      redis:6379
-        Secret       agent-sandbox-redis
     - RuntimeClass kata-qemu     (INSTALL_RUNTIMECLASS=${INSTALL_RUNTIMECLASS})
     - Higress Ingress            (INSTALL_INGRESS=${INSTALL_INGRESS}, variant=${INGRESS_VARIANT})
     - Default templates          (INSTALL_DEFAULT_TEMPLATES=${INSTALL_DEFAULT_TEMPLATES}, variant=${TEMPLATES_VARIANT})

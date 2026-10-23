@@ -440,7 +440,7 @@ step "20. EGRESS_ENABLED=false backward compatibility"
 log "Creating second sandbox (expected to use default EGRESS_ENABLED config)..."
 log "This test verifies sandbox basic functionality is not affected by egress config"
 RESULT=$(exec_in_sandbox "backward compat check" \
-    '{"command":["python3","-c","import os\nprint(\"COMPAT_OK\")\nfor k in [\"EGRESS_ENABLED\",\"OPENAI_BASE_URL\",\"PATH\"]:\n    v=os.environ.get(k,\"NOT_SET\")\n    print(f\"  {k}={v[:50]}\")"],"timeout":"10s"}')
+    '{"command":["python3","-c","import os\nprint(\"COMPAT_OK\")\nfor k in [\"EGRESS_ENABLED\",\"PATH\"]:\n    v=os.environ.get(k,\"NOT_SET\")\n    print(f\"  {k}={v[:50]}\")"],"timeout":"10s"}')
 
 if echo "${RESULT}" | grep -q "COMPAT_OK"; then
     record_pass "Sandbox basic functionality OK (exec API not affected by egress proxy)"

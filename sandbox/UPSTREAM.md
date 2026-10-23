@@ -60,7 +60,8 @@ The significant AMD additions are:
   DNS-rebinding protection.
 - **`pkg/policy`** — built-in egress policy evaluator (an embedded OPA engine
   is planned, not yet implemented) and the `ClusterSandboxPolicy` presets.
-- **`pkg/store`, `pkg/audit`** — Redis-backed session state and the audit trail.
+- **`pkg/store`, `pkg/audit`** — Sandbox CR-backed session state (CRStore) and
+  process-log audit trail.
 - **AMD GPU support** (`amd.com/gpu` resources, MI300X / MI325X / MI355X) and
   the Kata Containers runtime path.
 - **`deploy/`** — the entire deployment surface.

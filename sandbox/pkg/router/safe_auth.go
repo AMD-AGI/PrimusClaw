@@ -15,7 +15,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"sigs.k8s.io/agent-sandbox/pkg/api"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/safe"
 )
@@ -82,10 +81,6 @@ func (s *Server) safeAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// ── Path 1: SaFE cookie authentication (browser) ──
 		// Browser carries Token cookie set by SaFE login. Validate against SaFE apiserver.
-		// NOTE: Cookie auth does NOT set api.SandboxApiKeyHeader — browser users have no
-		// API Key, so the unified inference gateway (§4.2) is not available for
-		// sandboxes created via Cookie auth. Use SDK/CLI (API Key) to create
-		// sandboxes that need LLM inference.
 		if tokenCookie, err := c.Cookie("Token"); err == nil && tokenCookie != "" {
 			userType, _ := c.Cookie("userType")
 			user, verifyErr := s.safeClient.VerifyCookie(c.Request.Context(), tokenCookie, userType)
@@ -126,9 +121,6 @@ func (s *Server) safeAuthMiddleware() gin.HandlerFunc {
 					return
 				}
 				setUserContext(c, user)
-				// Forward the original API Key for unified inference gateway (§4.2).
-				// WM stores this in Redis; EnvD pulls it and injects as OPENAI_API_KEY.
-				c.Request.Header.Set(api.SandboxApiKeyHeader, apiKey)
 				log.Debug("auth OK (API Key)", "userId", user.UserID,
 					"role", resolveRoleFromSaFERoles(user.Roles), "path", c.Request.URL.Path)
 				c.Next()
