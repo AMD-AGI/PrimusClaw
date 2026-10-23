@@ -182,7 +182,7 @@ export function applyMultiNodeExternalEnv(
   delete env.SAFE_API_URL;
   // The handoff file is the contract; its content and the files it points at are
   // written once the sandbox is healthy (see `buildTopologyHandoff`).
-  env.CLAW_TOPOLOGY_FILE = topologyHandoffPath(env.WORKSPACE_PATH);
+  env.TOPOLOGY_HANDOFF_FILE = topologyHandoffPath(env.WORKSPACE_PATH);
 
   if (!(opts.legacyTopologyEnv ?? LEGACY_TOPOLOGY_ENV)) return;
 
