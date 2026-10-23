@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * Grant caps are the smaller of the demand, the hosting defaults, and the
- * platform ceiling in APP_SANDBOX_CAPS.
+ * Issued grant caps are the smaller of the request and APP_SANDBOX_CAPS,
+ * field by field. Sandbox and GPU counts are per role. GPU hours are one
+ * shared budget. A field omitted from the request takes the platform value.
  */
 
 export interface RoleCap {
@@ -11,32 +12,23 @@ export interface RoleCap {
   maxGpus: number;
 }
 
-export interface PlatformCaps {
-  measurement?: RoleCap;
-  subrun?: RoleCap;
-  dev?: RoleCap;
-  maxSandboxSeconds?: number;
-  gpuHoursBudget?: number;
-  graceMinutes?: number;
-  maxHours?: number;
+export interface RoleGrant {
+  max_sandboxes?: number;
+  max_gpus?: number;
 }
 
-export interface HostingLimits {
-  maxParallelTests?: number;
-  tp?: number;
-  maxGpuHours?: number;
-  maxHours?: number;
-  maxBranches?: number;
-  devMaxSandboxes?: number;
-  devMaxGpus?: number;
+export interface GrantRequest {
+  roles?: {
+    measurement?: RoleGrant;
+    subrun?: RoleGrant;
+    dev?: RoleGrant;
+  };
+  gpu_hours?: number;
+  max_runtime_sec?: number;
 }
 
-export interface Demand {
-  placement?: { max_parallel_tests?: number };
-  hardware?: { tp?: number };
-  budget?: { max_gpu_hours?: number; max_hours?: number };
-  multibranch?: { max_branches?: number };
-}
+/** APP_SANDBOX_CAPS uses the same shape as the grant request. */
+export type PlatformCaps = GrantRequest;
 
 export interface GrantCaps {
   roles: {
@@ -50,8 +42,8 @@ export interface GrantCaps {
   maxGpusPerSandbox: number;
 }
 
-const DEFAULT_GRACE_MINUTES = 30;
-const DEFAULT_MAX_HOURS = 24;
+const DEFAULT_GRANT_HOURS = 24;
+const ROLES = ["measurement", "subrun", "dev"] as const;
 
 /** Parse APP_SANDBOX_CAPS. An empty value is an empty ceiling. */
 export function parsePlatformCaps(raw: string | undefined): PlatformCaps {
@@ -66,69 +58,42 @@ export function parsePlatformCaps(raw: string | undefined): PlatformCaps {
  * A zero GPU-hour budget means the grant has no GPU-hour cap.
  */
 export function computeCaps(
-  demand: Demand,
-  limits: HostingLimits,
+  request: GrantRequest,
   platform: PlatformCaps,
   start: Date,
   perGpuCounts: number[],
 ): GrantCaps {
-  const parallel = lesser(
-    demand.placement?.max_parallel_tests,
-    limits.maxParallelTests,
-    platform.measurement?.maxSandboxes,
-  );
-  const tp = positive(demand.hardware?.tp ?? limits.tp) || 1;
-  const measurement: RoleCap = {
-    maxSandboxes: parallel,
-    maxGpus: lesser(parallel * tp, undefined, platform.measurement?.maxGpus),
+  const roles = {
+    measurement: roleCap(request, platform, "measurement"),
+    subrun: roleCap(request, platform, "subrun"),
+    dev: roleCap(request, platform, "dev"),
   };
-  const branches = lesser(
-    demand.multibranch?.max_branches,
-    limits.maxBranches,
-    platform.subrun?.maxSandboxes,
-  );
-  const subrun: RoleCap = {
-    maxSandboxes: branches,
-    maxGpus: lesser(branches * tp, undefined, platform.subrun?.maxGpus),
-  };
-  const dev: RoleCap = {
-    maxSandboxes: lesser(undefined, limits.devMaxSandboxes, platform.dev?.maxSandboxes),
-    maxGpus: lesser(undefined, limits.devMaxGpus, platform.dev?.maxGpus),
-  };
-  const hours = lesser(
-    demand.budget?.max_hours,
-    limits.maxHours ?? platform.maxHours,
-    undefined,
-  ) || DEFAULT_MAX_HOURS;
-  const graceMin = platform.graceMinutes ?? DEFAULT_GRACE_MINUTES;
-  const expiresAt = new Date(start.getTime() + (hours * 60 + graceMin) * 60 * 1000);
   const fromTemplates = perGpuCounts.filter((n) => n > 0);
-  const maxGpusPerSandbox = fromTemplates.length > 0 ? Math.max(...fromTemplates) : tp;
+  const maxGpusPerSandbox = fromTemplates.length > 0 ? Math.max(...fromTemplates) : 0;
   return {
-    roles: { measurement, subrun, dev },
-    gpuHoursBudget: lesser(
-      demand.budget?.max_gpu_hours,
-      limits.maxGpuHours,
-      platform.gpuHoursBudget,
-    ),
-    maxSandboxSeconds: platform.maxSandboxSeconds ?? 0,
-    expiresAt,
+    roles,
+    gpuHoursBudget: capField(request.gpu_hours, platform.gpu_hours),
+    maxSandboxSeconds: capField(request.max_runtime_sec, platform.max_runtime_sec),
+    expiresAt: new Date(start.getTime() + DEFAULT_GRANT_HOURS * 60 * 60 * 1000),
     maxGpusPerSandbox,
   };
 }
 
-function lesser(demand: number | undefined, fallback: number | undefined, ceiling: number | undefined): number {
-  const asked = defined(demand) ? demand : fallback;
+function roleCap(request: GrantRequest, platform: PlatformCaps, role: (typeof ROLES)[number]): RoleCap {
+  return {
+    maxSandboxes: capField(request.roles?.[role]?.max_sandboxes, platform.roles?.[role]?.max_sandboxes),
+    maxGpus: capField(request.roles?.[role]?.max_gpus, platform.roles?.[role]?.max_gpus),
+  };
+}
+
+/** Keep the smaller of the request and the ceiling. An omitted request uses the ceiling. */
+function capField(asked: number | undefined, ceiling: number | undefined): number {
   if (!defined(asked) && !defined(ceiling)) return 0;
   if (!defined(asked)) return ceiling as number;
-  if (!defined(ceiling)) return asked as number;
-  return Math.min(asked as number, ceiling as number);
+  if (!defined(ceiling)) return asked;
+  return Math.min(asked, ceiling as number);
 }
 
 function defined(n: number | undefined): n is number {
   return typeof n === "number" && Number.isFinite(n) && n >= 0;
-}
-
-function positive(n: number | undefined): number {
-  return defined(n) && n > 0 ? n : 0;
 }

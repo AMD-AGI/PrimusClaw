@@ -43,8 +43,14 @@ export interface IssueGrantResult {
   status: number;
 }
 
+export interface GrantCopy {
+  state: string;
+}
+
 export interface GrantCaller {
   issue(body: IssueGrantBody): Promise<IssueGrantResult>;
+  /** Null when the execution copy is gone. Other failures throw. */
+  get(grantId: string): Promise<GrantCopy | null>;
   extend(grantId: string, body: { expiresAt: string; attestation: string }): Promise<void>;
   revoke(grantId: string): Promise<void>;
 }
@@ -68,6 +74,18 @@ export function grantCallerFromEnv(env: NodeJS.ProcessEnv = process.env, fetchFn
         ? (res.body as { keys?: Record<string, string> }).keys
         : undefined;
       return { grantId: body.grantId, keys, status: res.status };
+    },
+    async get(grantId) {
+      try {
+        const res = await call("GET", `/internal/v1/grants/${encodeURIComponent(grantId)}`);
+        const state = res.body && typeof res.body === "object"
+          ? (res.body as { state?: string }).state
+          : undefined;
+        return { state: state || "active" };
+      } catch (err) {
+        if (err instanceof GrantClientError && err.status === 404) return null;
+        throw err;
+      }
     },
     async extend(grantId, body) {
       await call("PATCH", `/internal/v1/grants/${encodeURIComponent(grantId)}`, body);

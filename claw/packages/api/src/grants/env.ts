@@ -1,6 +1,8 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import type { GrantRequest } from "./caps.js";
+
 /**
  * Environment injected into an app run so it talks to the E2B control plane
  * with the grant's role keys.
@@ -17,6 +19,7 @@ export function grantEnv(input: {
   apiUrl: string;
   sandboxUrl: string;
   keys: Record<string, string>;
+  limits?: GrantRequest;
 }): Record<string, string> {
   const env: Record<string, string> = {
     E2B_API_URL: input.apiUrl,
@@ -26,5 +29,6 @@ export function grantEnv(input: {
     const name = ROLE_ENV[role];
     if (name && value) env[name] = value;
   }
+  if (input.limits) env.grant_limits = JSON.stringify(input.limits);
   return env;
 }

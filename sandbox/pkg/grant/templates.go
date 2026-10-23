@@ -6,11 +6,14 @@ package grant
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -23,12 +26,20 @@ const grantIDKey = "agent-sandbox.io/grant-id"
 // gpuResourceName is the extended resource set on a per-GPU template.
 const gpuResourceName = "amd.com/gpu"
 
+// Per-card size applied to every GPU expansion. Card count scales these linearly.
+const (
+	cpuPerGPU      = 27
+	memoryGiPerGPU = 250
+	shmGiPerGPU    = 125
+	imageDigestEnv = "HYPERLOOM_ACTIVE_IMAGE_DIGEST"
+)
+
 // registerTemplates creates a CodeInterpreter for each expansion whose spec
 // names a fromImage. Specs without fromImage are skipped.
 func (s *Service) registerTemplates(ctx context.Context, grantID, appRunID string, templates []runtimev1alpha1.GrantTemplate) error {
 	var created []string
 	for _, tpl := range templates {
-		image, ok, err := fromImage(tpl.Spec)
+		base, ok, err := templateFromSpec(tpl.Spec)
 		if err != nil {
 			s.deleteNamedTemplates(ctx, grantID, created)
 			return opWrap(http.StatusBadRequest, "invalid_grant", "template spec is not JSON", err)
@@ -37,7 +48,7 @@ func (s *Service) registerTemplates(ctx context.Context, grantID, appRunID strin
 			continue
 		}
 		for _, name := range expandOne(appRunID, TemplateRequest{Name: tpl.Name, PerGPUCount: tpl.PerGPUCount}) {
-			ci := codeInterpreter(grantID, name, image, gpusFromName(name), s.namespace)
+			ci := codeInterpreter(grantID, name, base, gpusFromName(name), s.namespace)
 			if err := s.client.Create(ctx, ci); err != nil {
 				s.deleteNamedTemplates(ctx, grantID, created)
 				if apierrors.IsAlreadyExists(err) {
@@ -82,22 +93,41 @@ func expandedNames(g *runtimev1alpha1.SandboxGrant) []string {
 	return names
 }
 
-func codeInterpreter(grantID, name, image string, gpus int32, namespace string) *runtimev1alpha1.CodeInterpreter {
+func codeInterpreter(grantID, name string, base *runtimev1alpha1.CodeInterpreterSandboxTemplate, gpus int32, namespace string) *runtimev1alpha1.CodeInterpreter {
+	tmpl := &runtimev1alpha1.CodeInterpreterSandboxTemplate{}
+	base.DeepCopyInto(tmpl)
+	if gpus > 0 {
+		cpu := resource.MustParse(fmt.Sprintf("%d", cpuPerGPU*gpus))
+		mem := resource.MustParse(fmt.Sprintf("%dGi", memoryGiPerGPU*gpus))
+		tmpl.Resources.Requests = corev1.ResourceList{
+			corev1.ResourceCPU:    cpu,
+			corev1.ResourceMemory: mem,
+		}
+		tmpl.Resources.Limits = corev1.ResourceList{
+			corev1.ResourceCPU:    cpu,
+			corev1.ResourceMemory: mem,
+		}
+	}
+	if digest := digestOf(tmpl.FromImage); digest != "" {
+		tmpl.Environment = append(tmpl.Environment, corev1.EnvVar{Name: imageDigestEnv, Value: digest})
+	}
 	ci := &runtimev1alpha1.CodeInterpreter{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        name,
 			Namespace:   namespace,
 			Annotations: map[string]string{grantIDKey: grantID},
 		},
-		Spec: runtimev1alpha1.CodeInterpreterSpec{
-			Template: &runtimev1alpha1.CodeInterpreterSandboxTemplate{FromImage: image},
-		},
+		Spec: runtimev1alpha1.CodeInterpreterSpec{Template: tmpl},
 	}
 	if len(grantID) <= 63 {
 		ci.Labels = map[string]string{grantIDKey: grantID}
 	}
 	if gpus > 0 {
-		ci.Spec.GPU = &runtimev1alpha1.GPUConfig{Count: int(gpus), ResourceName: gpuResourceName}
+		ci.Spec.GPU = &runtimev1alpha1.GPUConfig{
+			Count:        int(gpus),
+			ResourceName: gpuResourceName,
+			SharedMemory: fmt.Sprintf("%dGi", shmGiPerGPU*gpus),
+		}
 	}
 	return ci
 }
@@ -109,26 +139,41 @@ func ownedByGrant(ci *runtimev1alpha1.CodeInterpreter, grantID string) bool {
 	return ci.Annotations != nil && ci.Annotations[grantIDKey] == grantID
 }
 
-func fromImage(spec string) (string, bool, error) {
+func templateFromSpec(spec string) (*runtimev1alpha1.CodeInterpreterSandboxTemplate, bool, error) {
 	if spec == "" {
-		return "", false, nil
+		return nil, false, nil
 	}
 	var body struct {
-		FromImage string `json:"fromImage"`
-		Template  *struct {
-			FromImage string `json:"fromImage"`
-		} `json:"template"`
+		FromImage string                                          `json:"fromImage"`
+		Template  *runtimev1alpha1.CodeInterpreterSandboxTemplate `json:"template"`
 	}
 	if err := json.Unmarshal([]byte(spec), &body); err != nil {
-		return "", false, err
+		return nil, false, err
 	}
 	if body.Template != nil && body.Template.FromImage != "" {
-		return body.Template.FromImage, true, nil
+		return body.Template, true, nil
 	}
-	if body.FromImage != "" {
-		return body.FromImage, true, nil
+	if body.FromImage == "" {
+		return nil, false, nil
 	}
-	return "", false, nil
+	var flat runtimev1alpha1.CodeInterpreterSandboxTemplate
+	if err := json.Unmarshal([]byte(spec), &flat); err != nil {
+		return nil, false, err
+	}
+	return &flat, true, nil
+}
+
+func digestOf(image string) string {
+	const marker = "@sha256:"
+	i := strings.Index(image, marker)
+	if i < 0 {
+		return ""
+	}
+	digest := image[i+1:]
+	if len(digest) <= len("sha256:") {
+		return ""
+	}
+	return digest
 }
 
 // gpusFromName reads the -gN suffix of an expanded template name.

@@ -10,7 +10,7 @@ import { atSecond, jwksDocument, signAttestation } from "../src/grants/attestati
 import { computeCaps } from "../src/grants/caps.js";
 import { grantCallerFromEnv, GrantClientError } from "../src/grants/client.js";
 import { grantEnv } from "../src/grants/env.js";
-import { extendAppRunGrant, openAppRunGrant, revokeAppRunGrant, type GrantRuntime } from "../src/grants/lifecycle.js";
+import { extendAppRunGrant, openAppRunGrant, reconcileAppRunGrant, revokeAppRunGrant, type GrantRuntime } from "../src/grants/lifecycle.js";
 import type { Querier } from "../src/infra/db.js";
 
 function pem(): string {
@@ -57,23 +57,55 @@ test("signAttestation is ES256 and the previous key stays in the JWKS", () => {
   assert.equal(doc.keys[0].crv, "P-256");
 });
 
-test("computeCaps takes the smaller of demand and the platform ceiling", () => {
+test("computeCaps takes the smaller of resources.grant and the platform ceiling", () => {
   const start = new Date("2026-10-22T00:00:00Z");
   const caps = computeCaps(
-    { placement: { max_parallel_tests: 32 }, hardware: { tp: 8 }, budget: { max_gpu_hours: 100, max_hours: 4 }, multibranch: { max_branches: 3 } },
-    { devMaxSandboxes: 2, devMaxGpus: 2 },
-    { measurement: { maxSandboxes: 16, maxGpus: 64 }, subrun: { maxSandboxes: 8, maxGpus: 8 }, gpuHoursBudget: 10, maxSandboxSeconds: 600 },
+    {
+      roles: {
+        measurement: { max_sandboxes: 32, max_gpus: 64 },
+        subrun: { max_sandboxes: 3, max_gpus: 1 },
+        dev: { max_sandboxes: 4, max_gpus: 8 },
+      },
+      gpu_hours: 100,
+      max_runtime_sec: 7200,
+    },
+    {
+      roles: {
+        measurement: { max_sandboxes: 16, max_gpus: 32 },
+        subrun: { max_sandboxes: 8, max_gpus: 8 },
+        dev: { max_sandboxes: 2, max_gpus: 4 },
+      },
+      gpu_hours: 10,
+      max_runtime_sec: 600,
+    },
     start,
     [1, 8],
   );
   assert.equal(caps.roles.measurement.maxSandboxes, 16);
-  assert.equal(caps.roles.measurement.maxGpus, 64);
+  assert.equal(caps.roles.measurement.maxGpus, 32);
   assert.equal(caps.roles.subrun.maxSandboxes, 3);
   assert.equal(caps.roles.dev.maxSandboxes, 2);
+  assert.equal(caps.roles.dev.maxGpus, 4);
   assert.equal(caps.gpuHoursBudget, 10);
   assert.equal(caps.maxSandboxSeconds, 600);
   assert.equal(caps.maxGpusPerSandbox, 8);
-  assert.equal(caps.expiresAt.toISOString(), "2026-10-22T04:30:00.000Z");
+  assert.equal(caps.expiresAt.toISOString(), "2026-10-23T00:00:00.000Z");
+});
+
+test("computeCaps uses the platform value when the request omits a field", () => {
+  const start = new Date("2026-10-22T00:00:00Z");
+  const caps = computeCaps(
+    { roles: { measurement: { max_sandboxes: 1 } } },
+    { roles: { measurement: { max_gpus: 8 }, dev: { max_sandboxes: 1, max_gpus: 8 } }, gpu_hours: 4 },
+    start,
+    [],
+  );
+  assert.equal(caps.roles.measurement.maxSandboxes, 1);
+  assert.equal(caps.roles.measurement.maxGpus, 8);
+  assert.equal(caps.roles.dev.maxSandboxes, 1);
+  assert.equal(caps.roles.subrun.maxGpus, 0);
+  assert.equal(caps.gpuHoursBudget, 4);
+  assert.equal(caps.maxSandboxSeconds, 0);
 });
 
 test("grantEnv maps the three role keys", () => {
@@ -127,6 +159,7 @@ test("open reuses keys, extend moves expiry, and a keyless replay issues a new i
         if (seen.length === 1) return { grantId: body.grantId, status: 200 };
         return { grantId: body.grantId, status: 201, keys: { measurement: "e2b_m", subrun: "e2b_s", dev: "e2b_d" } };
       },
+      async get() { return { state: "active" }; },
       async extend() {},
       async revoke() {},
     }),
@@ -143,7 +176,13 @@ test("open reuses keys, extend moves expiry, and a keyless replay issues a new i
     workspaces: ["top-models"],
     platformKey: "ak-test",
     sessionId: "s-1",
-    templates: [{ name: "runner", perGpuCount: [1] }],
+    input: { task: "chat" },
+    resources: {
+      image: "cpu:1",
+      workspace: "top-models",
+      grant: { roles: { measurement: { max_sandboxes: 1, max_gpus: 1 } } },
+      templates: [{ name: "runner", perGpuCount: [1] }],
+    },
   };
   const first = await openAppRunGrant(input, rt, mem.transact);
   assert.equal(first.reused, false);
@@ -162,6 +201,94 @@ test("open reuses keys, extend moves expiry, and a keyless replay issues a new i
   assert.equal(seen.length, 3);
   assert.equal(reissued.env.HYPERLOOM_SANDBOX_KEY_DEV, "e2b_d");
 });
+
+test("reconcile reissues only a missing copy of a sandbox that is still running", async () => {
+  const key = pem();
+  const mem = memoryGrants();
+  const calls = { get: 0, issue: 0 };
+  let copy: { state: string } | null = { state: "active" };
+  let failGet = false;
+  const rt = reconcileRuntime(key, {
+    async get() {
+      calls.get += 1;
+      if (failGet) throw new GrantClientError(503, "grant_unavailable", "unavailable");
+      return copy;
+    },
+    async issue(body) {
+      calls.issue += 1;
+      return { grantId: body.grantId, status: 201, keys: { measurement: "e2b_new" } };
+    },
+  });
+  const input = {
+    appRunId: "ar-1",
+    userId: "u-1",
+    userName: "alice",
+    workspaces: ["top-models"],
+    platformKey: "ak-test",
+    sessionId: "s-1",
+    input: {},
+    resources: {
+      grant: { roles: { measurement: { max_sandboxes: 1, max_gpus: 1 } } },
+      templates: [{ name: "gpu", perGpuCount: [1], spec: { template: { fromImage: "image:1" } } }],
+    },
+  };
+  const opened = await openAppRunGrant(input, rt, mem.transact);
+  assert.equal(calls.issue, 1);
+
+  const ended = await reconcileAppRunGrant({ ...input, runEnded: true }, rt, mem.transact);
+  assert.equal(ended.action, "leave");
+  assert.equal(ended.reason, "run_ended");
+  assert.equal(calls.get, 0);
+
+  const kept = await reconcileAppRunGrant({ ...input, runEnded: false }, rt, mem.transact);
+  assert.equal(kept.action, "keep");
+  assert.equal(kept.grantId, opened.grantId);
+  assert.equal(calls.issue, 1);
+
+  copy = { state: "revoked" };
+  const revoked = await reconcileAppRunGrant({ ...input, runEnded: false }, rt, mem.transact);
+  assert.equal(revoked.action, "leave");
+  assert.equal(revoked.reason, "revoked");
+  assert.equal(calls.issue, 1);
+
+  failGet = true;
+  const down = await reconcileAppRunGrant({ ...input, runEnded: false }, rt, mem.transact);
+  assert.equal(down.action, "leave");
+  assert.equal(down.reason, "copy_unavailable");
+  assert.equal(calls.issue, 1);
+
+  failGet = false;
+  copy = null;
+  const replaced = await reconcileAppRunGrant({ ...input, runEnded: false }, rt, mem.transact);
+  assert.equal(replaced.action, "reissued");
+  assert.notEqual(replaced.grantId, opened.grantId);
+  assert.equal(replaced.env?.HYPERLOOM_SANDBOX_KEY_MEASUREMENT, "e2b_new");
+  assert.equal(calls.issue, 2);
+});
+
+function reconcileRuntime(
+  key: string,
+  caller: {
+    get: () => Promise<{ state: string } | null>;
+    issue: (body: { grantId: string }) => Promise<{ grantId: string; status: number; keys?: Record<string, string> }>;
+  },
+): GrantRuntime {
+  return {
+    now: () => new Date("2026-10-22T00:00:00Z"),
+    sign: (claims) => signAttestation(claims, { GRANT_SIGNING_KEY: key, GRANT_SIGNING_KID: "claw-1" }),
+    caller: () => ({
+      issue: caller.issue,
+      get: caller.get,
+      async extend() {},
+      async revoke() {},
+    }),
+    seal: (plain) => `seal:${plain}`,
+    open: (sealed) => sealed.replace(/^seal:/, ""),
+    apiUrl: "https://api.example",
+    sandboxUrl: "https://sbx.example",
+    platformCapsRaw: "",
+  };
+}
 
 function issueBody() {
   return {

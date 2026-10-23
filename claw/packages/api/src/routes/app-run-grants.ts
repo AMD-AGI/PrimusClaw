@@ -6,6 +6,7 @@
  *
  *   GET  /.well-known/jwks.json
  *   POST   /v1/internal/app-runs/:appRunId/grant
+ *   POST   /v1/internal/app-runs/:appRunId/grant/reconcile
  *   GET    /v1/internal/app-runs/:appRunId/grant
  *   PATCH  /v1/internal/app-runs/:appRunId/grant
  *   DELETE /v1/internal/app-runs/:appRunId/grant
@@ -17,7 +18,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { internalTokenAuth } from "../auth/middleware.js";
 import { GrantClientError } from "../grants/client.js";
 import { jwksDocument } from "../grants/attestation.js";
-import { extendAppRunGrant, openAppRunGrant, readAppRunGrant, revokeAppRunGrant, type OpenAppRunInput } from "../grants/lifecycle.js";
+import { extendAppRunGrant, openAppRunGrant, readAppRunGrant, reconcileAppRunGrant, revokeAppRunGrant, type OpenAppRunInput } from "../grants/lifecycle.js";
 
 /** Register the JWKS document and the app-run grant routes. */
 export async function registerAppRunGrantRoutes(app: FastifyInstance): Promise<void> {
@@ -39,6 +40,14 @@ export async function registerAppRunGrantRoutes(app: FastifyInstance): Promise<v
       const body = (req.body ?? {}) as Partial<OpenAppRunInput>;
       const opened = await openAppRunGrant(openInput(req, body));
       return reply.status(opened.reused ? 200 : 201).send(opened);
+    } catch (err) {
+      return sendGrantError(reply, err);
+    }
+  });
+  app.post("/v1/internal/app-runs/:appRunId/grant/reconcile", auth, async (req, reply) => {
+    try {
+      const body = (req.body ?? {}) as Partial<OpenAppRunInput> & { runEnded?: boolean };
+      return await reconcileAppRunGrant({ ...openInput(req, body), runEnded: body.runEnded === true });
     } catch (err) {
       return sendGrantError(reply, err);
     }
@@ -80,9 +89,8 @@ function openInput(req: FastifyRequest, body: Partial<OpenAppRunInput>): OpenApp
     workspaces: body.workspaces || [],
     platformKey: body.platformKey || "",
     sessionId: body.sessionId || "",
-    demand: body.demand,
-    limits: body.limits,
-    templates: body.templates,
+    input: body.input,
+    resources: body.resources,
     kinds: body.kinds,
     startAt: body.startAt ? new Date(body.startAt) : undefined,
   };

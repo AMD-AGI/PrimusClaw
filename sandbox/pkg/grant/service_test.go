@@ -10,14 +10,18 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"errors"
+
 	"github.com/golang-jwt/jwt/v5"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -418,11 +422,29 @@ func TestEndKeepsSandboxRef(t *testing.T) {
 	}
 }
 
+func assertQuantity(t *testing.T, list corev1.ResourceList, cpu, memory string) {
+	t.Helper()
+	gotCPU := list[corev1.ResourceCPU]
+	gotMemory := list[corev1.ResourceMemory]
+	if gotCPU.Cmp(resource.MustParse(cpu)) != 0 || gotMemory.Cmp(resource.MustParse(memory)) != 0 {
+		t.Fatalf("resources=%v", list)
+	}
+}
+
+func envValue(env []corev1.EnvVar, name string) string {
+	for _, item := range env {
+		if item.Name == name {
+			return item.Value
+		}
+	}
+	return ""
+}
+
 func TestIssueRegistersFromImage(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	svc, priv, _, _ := testService(t, now)
 	req := sampleRequest(now.Add(time.Hour))
-	req.Templates[0].Spec = json.RawMessage(`{"template":{"fromImage":"python:3.11"}}`)
+	req.Templates[0].Spec = json.RawMessage(`{"template":{"fromImage":"example@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"type":"run","args":["echo pth"]}]}}`)
 	req.Attestation = signGrant(t, priv, req)
 	if _, _, err := svc.Issue(context.Background(), req); err != nil {
 		t.Fatal(err)
@@ -432,8 +454,11 @@ func TestIssueRegistersFromImage(t *testing.T) {
 		if err := svc.client.Get(context.Background(), types.NamespacedName{Name: name, Namespace: svc.namespace}, ci); err != nil {
 			t.Fatal(name, err)
 		}
-		if ci.Spec.Template == nil || ci.Spec.Template.FromImage != "python:3.11" {
+		if ci.Spec.Template == nil || !strings.HasPrefix(ci.Spec.Template.FromImage, "example@sha256:") {
 			t.Fatalf("%s image=%+v", name, ci.Spec.Template)
+		}
+		if len(ci.Spec.Template.Steps) != 1 || ci.Spec.Template.Steps[0].Args[0] != "echo pth" {
+			t.Fatalf("%s steps=%+v", name, ci.Spec.Template.Steps)
 		}
 		if ci.Annotations["agent-sandbox.io/grant-id"] != req.GrantID || ci.Spec.GPU == nil || ci.Spec.GPU.ResourceName != "amd.com/gpu" {
 			t.Fatalf("%s ci=%+v", name, ci)
@@ -443,9 +468,21 @@ func TestIssueRegistersFromImage(t *testing.T) {
 	if err := svc.client.Get(context.Background(), types.NamespacedName{Name: "ar-01ja-runner-g1", Namespace: svc.namespace}, g1); err != nil {
 		t.Fatal(err)
 	}
-	if g1.Spec.GPU.Count != 1 {
-		t.Fatalf("count=%d", g1.Spec.GPU.Count)
+	if g1.Spec.GPU.Count != 1 || g1.Spec.GPU.SharedMemory != "125Gi" {
+		t.Fatalf("gpu=%+v", g1.Spec.GPU)
 	}
+	assertQuantity(t, g1.Spec.Template.Resources.Requests, "27", "250Gi")
+	if digest := envValue(g1.Spec.Template.Environment, "HYPERLOOM_ACTIVE_IMAGE_DIGEST"); digest != "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Fatalf("digest=%q", digest)
+	}
+	g8 := &runtimev1alpha1.CodeInterpreter{}
+	if err := svc.client.Get(context.Background(), types.NamespacedName{Name: "ar-01ja-runner-g8", Namespace: svc.namespace}, g8); err != nil {
+		t.Fatal(err)
+	}
+	if g8.Spec.GPU.Count != 8 || g8.Spec.GPU.SharedMemory != "1000Gi" {
+		t.Fatalf("gpu=%+v", g8.Spec.GPU)
+	}
+	assertQuantity(t, g8.Spec.Template.Resources.Requests, "216", "2000Gi")
 	if _, err := svc.Revoke(context.Background(), req.GrantID); err != nil {
 		t.Fatal(err)
 	}

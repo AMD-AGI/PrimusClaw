@@ -53,7 +53,7 @@ type MembershipChecker interface {
 	Check(ctx context.Context, userID string, workspaces []string) error
 }
 
-// UserCRMembership reads users.amd.com and compares spec.resources.workspace.
+// UserCRMembership reads users.amd.com and compares the workspace list.
 type UserCRMembership struct {
 	client dynamic.Interface
 }
@@ -61,6 +61,21 @@ type UserCRMembership struct {
 // NewUserCRMembership reads cluster-scoped User objects named by user id.
 func NewUserCRMembership(client dynamic.Interface) *UserCRMembership {
 	return &UserCRMembership{client: client}
+}
+
+// listedWorkspaces reads spec.resources.workspaces, which is the key SaFE writes.
+// spec.resources.workspace is accepted when that key is absent.
+func listedWorkspaces(obj *unstructured.Unstructured) ([]string, error) {
+	for _, key := range []string{"workspaces", "workspace"} {
+		got, found, err := unstructured.NestedStringSlice(obj.Object, "spec", "resources", key)
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			return got, nil
+		}
+	}
+	return nil, nil
 }
 
 // Check rejects a missing user and any workspace not listed on the User.
@@ -72,7 +87,7 @@ func (m *UserCRMembership) Check(ctx context.Context, userID string, workspaces 
 	if err != nil {
 		return opErr(http.StatusForbidden, "user_not_in_workspace", "user was not found")
 	}
-	got, _, err := unstructured.NestedStringSlice(obj.Object, "spec", "resources", "workspace")
+	got, err := listedWorkspaces(obj)
 	if err != nil {
 		return opWrap(http.StatusForbidden, "user_not_in_workspace", "workspace list is unreadable", err)
 	}

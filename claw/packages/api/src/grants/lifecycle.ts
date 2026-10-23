@@ -5,13 +5,14 @@
  * Issue, inject, extend, and revoke the grant for one app run.
  *
  * A retry of the same app run keeps the grant id and the stored keys.
- * A takeover reads that row and does not issue again. A revoked row, or an
- * issue whose keys were not stored, starts a new grant id.
+ * A takeover asks the execution copy once. A missing copy is reissued only
+ * while the app sandbox is still running. A revoked copy is not reissued.
+ * A failed extend leaves the stored expiry unchanged.
  */
 import { inTransaction, type Querier } from "../infra/db.js";
 import { decryptUserEnvValue, encryptUserEnvValue } from "../crypto/user-env.js";
 import { atSecond, newGrantId, signAttestation } from "./attestation.js";
-import { computeCaps, parsePlatformCaps, type Demand, type HostingLimits } from "./caps.js";
+import { computeCaps, parsePlatformCaps, type GrantCaps, type GrantRequest } from "./caps.js";
 import { GrantClientError, grantCallerFromEnv, type GrantCaller, type GrantTemplateBody, type IssueGrantBody } from "./client.js";
 import { grantEnv } from "./env.js";
 import { insertPending, lockGrant, markActive, markExtended, markRevoked, type StoredClaims } from "./store.js";
@@ -23,6 +24,17 @@ export interface AppRunTemplate {
   roles?: string[];
 }
 
+/** Resources Claw reads. input is the application's own document and is not read here. */
+export interface AppRunResources {
+  image?: string;
+  cpu?: string;
+  memory?: string;
+  gpus?: number;
+  workspace?: string;
+  grant?: GrantRequest;
+  templates?: AppRunTemplate[];
+}
+
 export interface OpenAppRunInput {
   appRunId: string;
   userId: string;
@@ -30,9 +42,9 @@ export interface OpenAppRunInput {
   workspaces: string[];
   platformKey: string;
   sessionId: string;
-  demand?: Demand;
-  limits?: HostingLimits;
-  templates?: AppRunTemplate[];
+  /** Passed through to the application. Caps are not taken from this object. */
+  input?: unknown;
+  resources?: AppRunResources;
   kinds?: string[];
   startAt?: Date;
 }
@@ -42,6 +54,14 @@ export interface OpenAppRunResult {
   expiresAt: string;
   reused: boolean;
   env: Record<string, string>;
+}
+
+export interface ReconcileResult {
+  action: "leave" | "keep" | "reissued";
+  reason?: "run_ended" | "revoked" | "inactive" | "copy_unavailable" | "no_grant";
+  grantId?: string;
+  expiresAt?: string;
+  env?: Record<string, string>;
 }
 
 export interface GrantRuntime {
@@ -98,11 +118,33 @@ export async function readAppRunGrant(
     if (!row || row.state !== "active" || !row.keysCiphertext) {
       throw new GrantClientError(404, "grant_not_found", "app run has no active grant");
     }
-    return resultOf(row.grantId, row.expiresAt, true, rt.open(row.keysCiphertext), rt);
+    return resultOf(row.grantId, row.expiresAt, true, rt.open(row.keysCiphertext), rt, row.claims.grantLimits);
   });
 }
 
-/** Push the grant expiry later and store the new attestation. */
+/**
+ * Decide what a takeover does with the grant.
+ * An ended app sandbox is left alone. A missing execution copy is reissued
+ * only while that sandbox is still running. Timeouts and 503 keep the old grant.
+ */
+export async function reconcileAppRunGrant(
+  input: OpenAppRunInput & { runEnded: boolean },
+  rt: GrantRuntime = runtimeFromEnv(),
+  transact: Transact = inTransaction,
+): Promise<ReconcileResult> {
+  if (input.runEnded) return { action: "leave", reason: "run_ended" };
+  requireUrls(rt);
+  return transact(async (query) => {
+    try {
+      return await reconcileLocked(query, input, rt);
+    } catch (err) {
+      if (copyUnavailable(err)) return { action: "leave", reason: "copy_unavailable" };
+      throw err;
+    }
+  });
+}
+
+/** Push the grant expiry later and store the new attestation. A failure leaves the previous expiry. */
 export async function extendAppRunGrant(
   appRunId: string,
   expiresAt: Date,
@@ -130,7 +172,7 @@ export async function extendAppRunGrant(
     });
     await rt.caller().extend(row.grantId, { expiresAt: expiry.toISOString(), attestation });
     await markExtended(query, appRunId, expiry, attestation);
-    return resultOf(row.grantId, expiry, true, rt.open(row.keysCiphertext), rt);
+    return resultOf(row.grantId, expiry, true, rt.open(row.keysCiphertext), rt, row.claims.grantLimits);
   });
 }
 
@@ -150,10 +192,69 @@ export async function revokeAppRunGrant(
   });
 }
 
+async function reconcileLocked(query: Querier, input: OpenAppRunInput, rt: GrantRuntime): Promise<ReconcileResult> {
+  const existing = await lockGrant(query, input.appRunId);
+  if (!existing || existing.state !== "active" || !existing.keysCiphertext) {
+    return { action: "leave", reason: existing?.state === "revoked" ? "revoked" : "no_grant" };
+  }
+  const copy = await rt.caller().get(existing.grantId);
+  if (!copy) {
+    validateOpen(input);
+    const built = buildIssue(input, rt, newGrantId());
+    const issued = await issueOrReplace(query, input, rt, built);
+    return {
+      action: "reissued",
+      grantId: issued.grantId,
+      expiresAt: issued.expiresAt.toISOString(),
+      env: grantEnv({ apiUrl: rt.apiUrl, sandboxUrl: rt.sandboxUrl, keys: issued.keys, limits: built.claims.grantLimits }),
+    };
+  }
+  if (copy.state === "active") {
+    return {
+      action: "keep",
+      grantId: existing.grantId,
+      expiresAt: existing.expiresAt.toISOString(),
+      env: grantEnv({
+        apiUrl: rt.apiUrl,
+        sandboxUrl: rt.sandboxUrl,
+        keys: JSON.parse(rt.open(existing.keysCiphertext)) as Record<string, string>,
+        limits: existing.claims.grantLimits,
+      }),
+    };
+  }
+  return { action: "leave", reason: copy.state === "revoked" ? "revoked" : "inactive" };
+}
+
+/** Reuse stored keys when the copy is active or the check itself failed. Null means the copy is gone. */
+async function keptCopy(
+  grantId: string,
+  expiresAt: Date,
+  keysCiphertext: string,
+  limits: GrantRequest | undefined,
+  rt: GrantRuntime,
+): Promise<OpenAppRunResult | null> {
+  try {
+    const copy = await rt.caller().get(grantId);
+    if (!copy) return null;
+    return resultOf(grantId, expiresAt, true, rt.open(keysCiphertext), rt, limits);
+  } catch (err) {
+    if (copyUnavailable(err)) return resultOf(grantId, expiresAt, true, rt.open(keysCiphertext), rt, limits);
+    throw err;
+  }
+}
+
+function copyUnavailable(err: unknown): boolean {
+  if (err instanceof GrantClientError) {
+    return err.status === 408 || (err.status >= 502 && err.status <= 504);
+  }
+  return err instanceof Error && (err.name === "AbortError" || err.name === "TypeError");
+}
+
 async function openLocked(query: Querier, input: OpenAppRunInput, rt: GrantRuntime): Promise<OpenAppRunResult> {
   const existing = await lockGrant(query, input.appRunId);
   if (existing?.state === "active" && existing.keysCiphertext) {
-    return resultOf(existing.grantId, existing.expiresAt, true, rt.open(existing.keysCiphertext), rt);
+    const kept = await keptCopy(existing.grantId, existing.expiresAt, existing.keysCiphertext, existing.claims.grantLimits, rt);
+    if (kept) return kept;
   }
   const built = buildIssue(input, rt, existing?.state === "pending" ? existing.grantId : newGrantId());
   if (!existing) {
@@ -165,7 +266,7 @@ async function openLocked(query: Querier, input: OpenAppRunInput, rt: GrantRunti
     });
   }
   const issued = await issueOrReplace(query, input, rt, built);
-  return resultOf(issued.grantId, issued.expiresAt, false, issued.keys, rt);
+  return resultOf(issued.grantId, issued.expiresAt, false, issued.keys, rt, built.claims.grantLimits);
 }
 
 async function issueOrReplace(
@@ -224,11 +325,10 @@ interface BuiltIssue {
 }
 
 function buildIssue(input: OpenAppRunInput, rt: GrantRuntime, grantId: string): BuiltIssue {
-  const templates = input.templates ?? [];
+  const templates = input.resources?.templates ?? [];
   const counts = templates.flatMap((tpl) => tpl.perGpuCount ?? []);
   const caps = computeCaps(
-    input.demand ?? {},
-    input.limits ?? {},
+    input.resources?.grant ?? {},
     parsePlatformCaps(rt.platformCapsRaw),
     atSecond(input.startAt ?? rt.now()),
     counts,
@@ -242,6 +342,7 @@ function buildIssue(input: OpenAppRunInput, rt: GrantRuntime, grantId: string): 
     sessionId: input.sessionId,
     kinds,
     maxGpusPerSandbox: caps.maxGpusPerSandbox,
+    grantLimits: issuedLimits(caps),
   };
   const attestation = rt.sign({
     grantId,
@@ -298,13 +399,32 @@ function templateBody(tpl: AppRunTemplate): GrantTemplateBody {
   return { name: tpl.name, perGpuCount: tpl.perGpuCount, spec: tpl.spec };
 }
 
-function resultOf(grantId: string, expiresAt: Date, reused: boolean, keysJson: string | Record<string, string>, rt: GrantRuntime): OpenAppRunResult {
+function issuedLimits(caps: GrantCaps): GrantRequest {
+  return {
+    roles: {
+      measurement: { max_sandboxes: caps.roles.measurement.maxSandboxes, max_gpus: caps.roles.measurement.maxGpus },
+      subrun: { max_sandboxes: caps.roles.subrun.maxSandboxes, max_gpus: caps.roles.subrun.maxGpus },
+      dev: { max_sandboxes: caps.roles.dev.maxSandboxes, max_gpus: caps.roles.dev.maxGpus },
+    },
+    gpu_hours: caps.gpuHoursBudget,
+    max_runtime_sec: caps.maxSandboxSeconds,
+  };
+}
+
+function resultOf(
+  grantId: string,
+  expiresAt: Date,
+  reused: boolean,
+  keysJson: string | Record<string, string>,
+  rt: GrantRuntime,
+  limits?: GrantRequest,
+): OpenAppRunResult {
   const keys = typeof keysJson === "string" ? JSON.parse(keysJson) as Record<string, string> : keysJson;
   return {
     grantId,
     expiresAt: expiresAt.toISOString(),
     reused,
-    env: grantEnv({ apiUrl: rt.apiUrl, sandboxUrl: rt.sandboxUrl, keys }),
+    env: grantEnv({ apiUrl: rt.apiUrl, sandboxUrl: rt.sandboxUrl, keys, limits }),
   };
 }
 
@@ -315,6 +435,8 @@ function requireUrls(rt: GrantRuntime): void {
 }
 
 function validateOpen(input: OpenAppRunInput): void {
+  const workspace = input.resources?.workspace;
+  if (workspace && input.workspaces.length === 0) input.workspaces = [workspace];
   if (!input.appRunId || !input.userId || !input.platformKey || input.workspaces.length === 0) {
     throw new GrantClientError(400, "invalid_grant", "appRunId, userId, platformKey, and workspaces are required");
   }

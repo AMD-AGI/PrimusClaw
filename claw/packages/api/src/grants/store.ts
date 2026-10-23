@@ -6,6 +6,7 @@
  * role keys sealed so a retry or a takeover can inject them again.
  */
 import type { Querier } from "../infra/db.js";
+import type { GrantRequest } from "./caps.js";
 
 export type GrantRowState = "pending" | "active" | "revoked";
 
@@ -16,6 +17,7 @@ export interface StoredClaims {
   sessionId: string;
   kinds: string[];
   maxGpusPerSandbox: number;
+  grantLimits?: GrantRequest;
 }
 
 export interface GrantRow {
