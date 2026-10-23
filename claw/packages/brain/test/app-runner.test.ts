@@ -684,3 +684,88 @@ test("P2 outcomeOf: success needs final and return code 0", () => {
   assert.equal(outcomeOf({ at: "t", cause: "restarts_exhausted", final: false, returncode: 0 }).success, false);
   assert.equal(outcomeOf(null).success, false);
 });
+
+// ---------------------------------------------------------------------------
+// Weilei's review round: platform failures, the state dir, supersession, takeover scrubbing
+// ---------------------------------------------------------------------------
+
+test("P1 a platform failure while building the environment is not the application failing: no restart is spent", async () => {
+  // max_restarts 0: one counted failure would end the run.
+  const h = harness({ manifest: { ...MANIFEST, restart: undefined } });
+  await until(h, "starting");
+  let down = 10;
+  const secrets = h.world.store.secrets;
+  h.world.store.secrets = async (id) => { if (down-- > 0) throw new Error("API unavailable"); return secrets(id); };
+  for (let i = 0; i < 6; i++) await h.runner.reconcile().catch(() => undefined);
+  assert.equal(h.world.rec.state, "starting", "still starting, not finishing");
+  assert.equal(h.world.rec.restarts, 0);
+  assert.equal(h.world.starts.length, 0);
+  assert.notEqual(h.world.rec.last_exit?.cause, "start_failed");
+  down = 0;
+  await h.runner.reconcile();
+  await h.runner.reconcile();
+  assert.equal(h.world.starts.length, 1, "once the platform answers, the app starts");
+  assert.equal(h.world.rec.state, "running");
+});
+
+test("P2 a failing grant hook is the platform's failure too", async () => {
+  let down = true;
+  const grant: AppGrantRunHooks = { env: async () => { if (down) throw new Error("grant service down"); return {}; }, revoke: async () => undefined };
+  const h = harness({ manifest: { ...MANIFEST, restart: undefined }, grant });
+  await until(h, "starting");
+  for (let i = 0; i < 6; i++) await h.runner.reconcile().catch(() => undefined);
+  assert.equal(h.world.rec.state, "starting");
+  assert.equal(h.world.rec.restarts, 0);
+  down = false;
+  await h.runner.reconcile();
+  assert.equal(h.world.starts.length, 1);
+});
+
+test("P3 a real start failure still counts", async () => {
+  const h = harness({ manifest: { ...MANIFEST, restart: undefined } });
+  await until(h, "starting");
+  h.world.failExec = { left: 100, when: (c) => c.includes("setsid") };
+  for (let i = 0; i < 3; i++) await h.runner.reconcile();
+  assert.equal(h.world.rec.state, "finishing");
+});
+
+test("P4 a state_dir that cannot be expanded is counted, and the run ends instead of sitting in starting", async () => {
+  const h = harness({ manifest: { ...MANIFEST, restart: { max_restarts: 1, backoff_sec: [1] } } });
+  await until(h, "starting");
+  h.world.stateDirExit = 4; // USER_DATA_PATH is empty in the sandbox
+  for (let i = 0; i < 40 && h.world.rec.state !== "ended"; i++) { h.world.clock += 5_000; await h.runner.reconcile().catch(() => undefined); }
+  assert.equal(h.world.rec.state, "ended");
+  assert.equal(h.world.rec.last_exit?.cause, "restarts_exhausted");
+  assert.equal(h.world.starts.length, 0);
+});
+
+test("P5 finishNow stops at once when another worker holds the run", async () => {
+  const h = harness();
+  await toRunning(h);
+  // Already finishing: the loop inside finishNow is what drives the steps, and its writes are refused.
+  h.world.rec = { ...h.world.rec, state: "finishing", last_exit: { at: "2026-01-01T00:00:00Z", cause: "cancelled", final: false } };
+  h.world.failStore = () => new AppRunWriteRefused("not_holder");
+  const before = h.world.patches.length;
+  await assert.rejects(h.runner.finishNow("cancelled"), (e: unknown) => e instanceof AppRunWriteRefused && e.superseded);
+  assert.equal(h.world.patches.length - before, 1, "one refused write, not sixty");
+});
+
+test("P6 a worker that takes over a running run scrubs the secrets from what it stores", async () => {
+  const h = harness();
+  const wl = await toRunning(h);
+  const takeover = h.newRunner(); // a fresh worker: it has never launched anything
+  h.world.appExits(wl, { final: false, returncode: 2, error: `crashed with token ${TOKEN} in the message` });
+  await takeover.reconcile();
+  assert.equal(h.world.rec.state, "restarting");
+  assert.ok(!JSON.stringify(h.world.rec.last_exit).includes(TOKEN), "the token is not stored");
+  assert.match(String(h.world.rec.last_exit?.error), /\[redacted\]/);
+});
+
+test("P7 markEnded closes the row without a sandbox, and reports a refusal instead of throwing", async () => {
+  const h = harness();
+  assert.equal(await h.runner.markEnded("no key"), true);
+  assert.equal(h.world.rec.state, "ended");
+  const again = harness();
+  again.world.failStore = () => new AppRunWriteRefused("not_holder");
+  assert.equal(await again.runner.markEnded("no key"), false);
+});

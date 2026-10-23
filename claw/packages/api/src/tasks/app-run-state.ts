@@ -12,10 +12,14 @@
  * Two rules live here rather than in the route, because they are about the
  * data and not about HTTP:
  *
- *  - A write is fenced. It lands only if the caller is the run's lease holder
- *    (or nobody holds it), so a Brain that lost the run and has not noticed yet
- *    cannot move the state of a run another Brain now drives; and an optional
- *    `expectState` makes a transition compare-and-set.
+ *  - A write is fenced. It lands only if the caller holds the run's lease NOW:
+ *    `lease_owner` is the caller, the lease has not expired, and the row's
+ *    `claim_count` is the epoch the caller was given when it took the run. The
+ *    epoch is quoted by the caller, never read from the row, so a Brain that lost
+ *    the run (even to a second attempt of its own pod) and has not noticed yet
+ *    cannot move the state of a run another attempt now drives. A released lease
+ *    (no owner) lets nobody write. An optional `expectState` makes a transition
+ *    compare-and-set, and `restarts` can only move forward.
  *  - `ended` is final. Nothing moves a run out of it.
  *
  * The plaintext of the run's secrets is read here and handed to the caller
@@ -23,13 +27,14 @@
  * is stored, so a value the application printed into its own exit record cannot
  * end up in the database.
  */
+import { APP_RUN_STATES, scrubSecrets, type AppRunState } from "@claw/protocol";
+import pino from "pino";
 import { db } from "../infra/db.js";
 import { openAppRunSecret } from "../crypto/app-run-secrets.js";
 
-export const APP_RUN_STATES = [
-  "provisioning", "starting", "running", "restarting", "finishing", "ended",
-] as const;
-export type AppRunState = (typeof APP_RUN_STATES)[number];
+const logger = pino({ name: "app-run-state" });
+
+export { APP_RUN_STATES, type AppRunState };
 
 /** Largest `last_exit` document stored, serialised. */
 export const LAST_EXIT_MAX_BYTES = 4096;
@@ -143,47 +148,57 @@ export type PatchOutcome =
   | { ok: true; run: AppRunView }
   | { ok: false; reason: "not_found" | "not_holder" | "state_mismatch" | "ended" | "empty"; current?: AppRunState };
 
-/**
- * Replace every occurrence of a secret's plaintext in `value`, which is
- * serialised, scrubbed and read back, so it works at any depth. Secrets
- * shorter than eight characters are not hunted: they would shred ordinary text
- * and a real token is far longer.
- */
-export function scrubSecrets<T>(value: T, secrets: string[]): T {
-  let text = JSON.stringify(value);
-  for (const secret of secrets) {
-    if (secret.length < 8) continue;
-    // JSON-escaped form too: a secret with a quote or backslash does not appear
-    // verbatim inside a serialised string.
-    const escaped = JSON.stringify(secret).slice(1, -1);
-    text = text.split(secret).join("[redacted]");
-    if (escaped !== secret) text = text.split(escaped).join("[redacted]");
-  }
-  return JSON.parse(text) as T;
-}
-
 async function secretValues(taskId: string): Promise<string[]> {
   const secrets = await readAppRunSecrets(taskId);
   if (!secrets) return [];
   return [secrets.mcp_token, ...Object.values(secrets.grant_keys ?? {})];
 }
 
+/** Who is writing: the lease holder and the epoch (`claw_tasks.claim_count`) it was given when it took the run. */
+export interface AppRunFence {
+  brainId: string;
+  claimCount: number;
+}
+
+/** The `last_exit` fields that carry free text, the only ones a secret can ride in. */
+const LAST_EXIT_TEXT_FIELDS = ["stop_reason", "error"] as const;
+
 /**
- * Apply `patch` as `brainId`.
+ * `last_exit` with secrets removed. The secrets are opened only when there is text
+ * to scrub, and a failure to open them does not block the write: the free-text
+ * fields are dropped instead (a value that cannot be checked is not stored) and the
+ * fact is logged. A state move that cannot be made because a key will not open
+ * would leave the run stuck.
+ */
+async function scrubbedLastExit(taskId: string, lastExit: Record<string, unknown>): Promise<Record<string, unknown>> {
+  if (!LAST_EXIT_TEXT_FIELDS.some((f) => typeof lastExit[f] === "string")) return lastExit;
+  try {
+    return scrubSecrets(lastExit, await secretValues(taskId));
+  } catch (err) {
+    logger.error({ taskId, errorClass: (err as Error)?.constructor?.name }, "app_run.last_exit_scrub_unavailable");
+    const kept = { ...lastExit };
+    for (const f of LAST_EXIT_TEXT_FIELDS) delete kept[f];
+    return kept;
+  }
+}
+
+/**
+ * Apply `patch` as `fence.brainId` at epoch `fence.claimCount`.
  *
- * One conditional UPDATE does the fencing, the compare-and-set and the
- * `ended` rule together, so there is no window between checking and writing.
- * When it matches nothing, a second read says which rule refused, for the
- * caller's benefit only: the decision was already made by the UPDATE.
+ * One conditional UPDATE does the fencing, the compare-and-set, the `ended` rule
+ * and the monotonic `restarts` together, and returns the new row, so there is no
+ * window between checking and writing and no second read. When it matches
+ * nothing, a read says which rule refused, for the caller's benefit only: the
+ * decision was already made by the UPDATE.
  */
 export async function patchAppRun(
   taskId: string,
-  brainId: string,
+  fence: AppRunFence,
   patch: AppRunPatch,
   expectState?: AppRunState,
 ): Promise<PatchOutcome> {
   const sets: string[] = [];
-  const params: unknown[] = [taskId, brainId, expectState ?? null];
+  const params: unknown[] = [taskId, fence.brainId, expectState ?? null, fence.claimCount, patch.restarts ?? null];
   const add = (column: string, value: unknown, cast = "") => {
     params.push(value);
     sets.push(`${column} = $${params.length}${cast}`);
@@ -194,9 +209,7 @@ export async function patchAppRun(
   if (patch.sandbox_workload_id !== undefined) add("sandbox_workload_id", patch.sandbox_workload_id);
   if (patch.grant_expires_at !== undefined) add("grant_expires_at", patch.grant_expires_at, "::timestamptz");
   if (patch.last_exit !== undefined) {
-    const scrubbed = patch.last_exit === null
-      ? null
-      : scrubSecrets(patch.last_exit, await secretValues(taskId));
+    const scrubbed = patch.last_exit === null ? null : await scrubbedLastExit(taskId, patch.last_exit);
     add("last_exit", scrubbed === null ? null : JSON.stringify(scrubbed), "::jsonb");
   }
   if (sets.length === 0) return { ok: false, reason: "empty" };
@@ -206,24 +219,31 @@ export async function patchAppRun(
     `UPDATE claw_app_runs r SET ${sets.join(", ")}
        FROM claw_tasks t
       WHERE r.task_id = $1 AND t.task_id = r.task_id
-        AND (t.lease_owner = $2 OR t.lease_owner IS NULL)
+        AND t.lease_owner = $2
+        AND t.lease_expires_at > NOW()
+        AND t.claim_count = $4::int
         AND r.state <> 'ended'
         AND ($3::text IS NULL OR r.state = $3)
-      RETURNING r.task_id`,
+        AND ($5::int IS NULL OR $5::int >= r.restarts)
+      RETURNING r.task_id, r.session_id, r.state, r.restarts, r.last_exit, r.state_dir,
+                r.sandbox_workload_id, r.manifest, r.grant_id, r.grant_limits, r.grant_expires_at, r.grant_revoked_at, r.created_at,
+                t.input, t.sandbox_spec, t.workspace_id`,
     params,
   );
-  if (updated.rowCount === 1) {
-    const run = await readAppRun(taskId);
-    return run ? { ok: true, run } : { ok: false, reason: "not_found" };
-  }
+  if (updated.rowCount === 1) return { ok: true, run: toView(updated.rows[0] as RunRow) };
   const why = await db.query(
-    `SELECT r.state, t.lease_owner FROM claw_app_runs r JOIN claw_tasks t ON t.task_id = r.task_id
+    `SELECT r.state, r.restarts, t.lease_owner, t.claim_count,
+            (t.lease_expires_at > NOW()) AS lease_live
+       FROM claw_app_runs r JOIN claw_tasks t ON t.task_id = r.task_id
       WHERE r.task_id = $1`,
     [taskId],
   );
-  const row = why.rows[0] as { state: AppRunState; lease_owner: string | null } | undefined;
+  const row = why.rows[0] as
+    { state: AppRunState; restarts: number; lease_owner: string | null; claim_count: number; lease_live: boolean | null } | undefined;
   if (!row) return { ok: false, reason: "not_found" };
-  if (row.lease_owner !== null && row.lease_owner !== brainId) return { ok: false, reason: "not_holder", current: row.state };
+  if (row.lease_owner !== fence.brainId || row.lease_live !== true || Number(row.claim_count) !== fence.claimCount) {
+    return { ok: false, reason: "not_holder", current: row.state };
+  }
   if (row.state === "ended") return { ok: false, reason: "ended", current: row.state };
   return { ok: false, reason: "state_mismatch", current: row.state };
 }

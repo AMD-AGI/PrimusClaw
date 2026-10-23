@@ -13,7 +13,7 @@
  * string: the Router and EnvD log every command string and neither logs the map.
  */
 import { type AppManifestV1, type AppSandboxRole } from "@claw/protocol";
-import { APP_SANDBOX_ROLES } from "@claw/protocol";
+import { APP_SANDBOX_ROLES, scrubText } from "@claw/protocol";
 
 /** Single-quote `s` for `sh`. */
 export const shq = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
@@ -105,7 +105,7 @@ const START_LOCK = ".start.lock";
  * the process was dead. So it serialises and it checks, both inside the sandbox,
  * which is the only place that can:
  *
- *  - `mkdir` is the lock (atomic). A contender prints `busy` and leaves the
+ *  - A symlink is the lock (creating one is atomic and writes its holder). A contender prints `busy` and leaves the
  *    decision to the next tick's probe. A lock whose holder is no longer alive is
  *    taken over. Known limit: two contenders taking over the same dead lock at
  *    the same instant can both proceed; closing that needs `flock`, which the
@@ -124,17 +124,26 @@ export function startCommand(manifest: AppManifestV1, stateDir: string, tag: str
   const events = manifest.events ? `mkdir -p ${shq(`${stateDir}/${manifest.events.dir}`)} && ` : "";
   return [
     `mkdir -p ${d} && ${events}cd ${d} || exit 1`,
-    `if ! mkdir ${START_LOCK} 2>/dev/null; then`,
-    `  holder=$(cat ${START_LOCK}/pid 2>/dev/null)`,
-    `  if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then echo busy; exit 0; fi`,
-    `  rm -rf ${START_LOCK}; mkdir ${START_LOCK} 2>/dev/null || { echo busy; exit 0; }`,
+    // The lock is a symlink whose target is "<pid>|<sandbox>": creating it is one
+    // atomic step that also writes the holder, so a contender never sees a lock with
+    // no owner written yet. It lives on shared storage and outlives containers, and a
+    // pid left by a gone container can be a live, unrelated process in the next one,
+    // so a holder only counts when it is of THIS sandbox as well as alive: a lock
+    // of another sandbox is stale. (A directory left by an older version reads as
+    // an owner-less, stale lock.)
+    `if ! ln -s "$$|"${shq(workload)} ${START_LOCK} 2>/dev/null; then`,
+    `  held=$(readlink ${START_LOCK} 2>/dev/null); holder=\${held%%|*}; lockwl=\${held#*|}`,
+    `  if [ -n "$held" ] && [ "$lockwl" = ${shq(workload)} ] && kill -0 "$holder" 2>/dev/null; then echo busy; exit 0; fi`,
+    `  rm -rf ${START_LOCK}; ln -s "$$|"${shq(workload)} ${START_LOCK} 2>/dev/null || { echo busy; exit 0; }`,
     `fi`,
-    `echo $$ >${START_LOCK}/pid`,
     `trap 'rm -rf ${START_LOCK}' EXIT`,
     `marker=$(cat ${MARKER_FILE} 2>/dev/null)`,
     `if [ "\${marker%:*}" = ${shq(workload)} ] && kill -0 "$(cat ${PID_FILE} 2>/dev/null)" 2>/dev/null; then`,
     `  printf %s ${shq(tag)} >${MARKER_FILE}; echo already; exit 0`,
     `fi`,
+    // The previous generation's exit record is not this one's: a generation that
+    // dies without writing one must read as having none, not as the last one's.
+    `rm -f ${shq(EXIT_FILE)}`,
     `printf %s ${shq(tag)} >${MARKER_FILE}`,
     `setsid ${argv} >>${LOG_FILE} 2>&1 </dev/null & echo $! >${PID_FILE}`,
     "echo started",
@@ -193,10 +202,7 @@ export function secretValuesOf(s: Pick<AppEnvSources, "mcpToken" | "grantKeys">)
   return [s.mcpToken, ...Object.values(s.grantKeys)].filter((v): v is string => typeof v === "string" && v.length > 0);
 }
 
-/** `text` with every secret value replaced. */
+/** `text` with every secret value replaced (the shared rule; see protocol `scrubText`). */
 export function scrub(text: string, secrets: readonly string[]): string {
-  let out = text;
-  for (const secret of secrets) if (secret.length >= 8) out = out.split(secret).join("[redacted]");
-  return out;
+  return scrubText(text, secrets);
 }
-

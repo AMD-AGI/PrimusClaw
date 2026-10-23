@@ -7,14 +7,11 @@
  * database of its own, so this is also what makes a run takeable by another
  * Brain: everything the runner needs to carry on is in the row.
  */
-import type { AppManifestV1, AppSandboxRole, SandboxSpecCreate } from "@claw/protocol";
+import { APP_RUN_STATES, type AppManifestV1, type AppRunState, type AppSandboxRole, type SandboxSpecCreate } from "@claw/protocol";
 import { BRAIN_ID } from "../config.js";
 import { apiBase, claimHeaders } from "../clients/run-claim.js";
 
-export const APP_RUN_STATES = [
-  "provisioning", "starting", "running", "restarting", "finishing", "ended",
-] as const;
-export type AppRunState = (typeof APP_RUN_STATES)[number];
+export { APP_RUN_STATES, type AppRunState };
 
 /** What `exit.json` and the runner's own endings leave on the row. Never a secret. */
 export interface AppLastExit {
@@ -102,11 +99,17 @@ export interface HttpStoreOptions {
   baseUrl?: () => string;
   headers?: () => Record<string, string>;
   brainId?: string;
+  /**
+   * The epoch this worker holds the run at (`claw_tasks.claim_count`, the
+   * generation its claim minted). Quoted on every write, never read back from the
+   * row: it is what tells this attempt from another attempt of the same pod.
+   */
+  claimCount: number;
 }
 
 const TIMEOUT_MS = 10_000;
 
-export function httpAppRunStore(opts: HttpStoreOptions = {}): AppRunStore {
+export function httpAppRunStore(opts: HttpStoreOptions): AppRunStore {
   const doFetch = opts.fetch ?? globalThis.fetch;
   const base = opts.baseUrl ?? apiBase;
   const headers = opts.headers ?? claimHeaders;
@@ -136,7 +139,7 @@ export function httpAppRunStore(opts: HttpStoreOptions = {}): AppRunStore {
     async patch(runId, patch, expectState) {
       const r = await call(url(runId), {
         method: "PATCH",
-        body: JSON.stringify({ brain_id: brainId, ...(expectState ? { expect_state: expectState } : {}), ...patch }),
+        body: JSON.stringify({ brain_id: brainId, claim_count: opts.claimCount, ...(expectState ? { expect_state: expectState } : {}), ...patch }),
       });
       if (r.status === 200 && r.body?.run) return r.body.run as AppRunRecord;
       if (r.status === 409) throw new AppRunWriteRefused(String(r.body?.error ?? "conflict"), r.body?.current_state);

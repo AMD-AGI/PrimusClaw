@@ -6,11 +6,12 @@
  *
  *   GET   /v1/internal/app-runs/:taskId           the run row plus what it was asked to do
  *   GET   /v1/internal/app-runs/:taskId/secrets   the MCP token and grant keys, opened
- *   PATCH /v1/internal/app-runs/:taskId           fenced state update
+ *   PATCH /v1/internal/app-runs/:taskId           fenced state update (lease holder + claim epoch)
  *
  * Authentication is the cluster internal token, like the claim surface: there
  * is no per-run token because a Brain taking a run over does not yet hold one,
- * and the fence on writes is the lease (`brain_id` must be the holder).
+ * and the fence on writes is the lease: `brain_id` must be the holder, the lease live,
+ * and `claim_count` the epoch the caller took the run at.
  *
  * The secrets are a separate GET, not part of the row read, so the AppRunner
  * asks for them once, at the point it builds the application's environment, and
@@ -34,16 +35,20 @@ const STATE_DIR_MAX = 4096;
 const WORKLOAD_ID_MAX = 200;
 const RESTARTS_MAX = 1_000_000;
 const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
-const PATCH_KEYS = new Set(["brain_id", "expect_state", "state", "restarts", "last_exit", "state_dir", "sandbox_workload_id", "grant_expires_at"]);
+const PATCH_KEYS = new Set(["brain_id", "claim_count", "expect_state", "state", "restarts", "last_exit", "state_dir", "sandbox_workload_id", "grant_expires_at"]);
 
 /** The patch in `body`, or the reason it was refused. */
 export function parseAppRunPatch(
   body: unknown,
-): { ok: true; brainId: string; expect?: AppRunState; patch: AppRunPatch } | { ok: false; error: string } {
+): { ok: true; brainId: string; claimCount: number; expect?: AppRunState; patch: AppRunPatch } | { ok: false; error: string } {
   if (!isObj(body)) return { ok: false, error: "body_must_be_object" };
   for (const key of Object.keys(body)) if (!PATCH_KEYS.has(key)) return { ok: false, error: `unknown_field:${key}` };
   const brainId = typeof body.brain_id === "string" ? body.brain_id.trim() : "";
   if (!brainId) return { ok: false, error: "brain_id_required" };
+  const claimCount = body.claim_count;
+  if (typeof claimCount !== "number" || !Number.isInteger(claimCount) || claimCount < 0 || claimCount > 2_000_000_000) {
+    return { ok: false, error: "claim_count_required" };
+  }
 
   const patch: AppRunPatch = {};
   let expect: AppRunState | undefined;
@@ -85,7 +90,7 @@ export function parseAppRunPatch(
     if (e !== null && Buffer.byteLength(JSON.stringify(e), "utf8") > LAST_EXIT_MAX_BYTES) return { ok: false, error: "last_exit_too_large" };
     patch.last_exit = e as Record<string, unknown> | null;
   }
-  return { ok: true, brainId, expect, patch };
+  return { ok: true, brainId, claimCount, expect, patch };
 }
 
 const REFUSALS = {
@@ -130,7 +135,7 @@ export async function registerInternalAppRoutes(app: FastifyInstance): Promise<v
     async (req, reply) => {
       const parsed = parseAppRunPatch(req.body);
       if (!parsed.ok) return reply.status(400).send({ ok: false, error: parsed.error });
-      const outcome = await patchAppRun(req.params.taskId, parsed.brainId, parsed.patch, parsed.expect);
+      const outcome = await patchAppRun(req.params.taskId, { brainId: parsed.brainId, claimCount: parsed.claimCount }, parsed.patch, parsed.expect);
       if (outcome.ok) {
         logger.info({ taskId: req.params.taskId, state: outcome.run.state, restarts: outcome.run.restarts }, "app_run.patched");
         return { ok: true, run: outcome.run };

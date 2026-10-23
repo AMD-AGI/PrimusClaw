@@ -33,6 +33,9 @@ const { activeAbort, SIGTERM_ABORT_REASON, LEASE_LOST_ABORT_REASON, DEADLINE_EXC
 interface FakeRunner {
   runs: number;
   finishes: string[];
+  /** The platform key and epoch each createAppRunner call got, and how often the row was closed without a runner. */
+  made: Array<{ platformKey: string; epoch: number }>;
+  closed: string[];
   /** What run() answers. It may also fire the abort first, as a real cancel would. */
   script: (signal: AbortSignal) => Promise<AppRunResult>;
 }
@@ -57,11 +60,12 @@ function harness(runner?: FakeRunner) {
     releaseTaskLock: (async () => { released++; }) as never,
     flushTranscript: (async () => undefined) as never,
     runScript: (async () => { engineCalls++; throw new Error("script must not run"); }) as never,
-    createAppRunner: ((runId: string, platformKey: string) => {
+    createAppRunner: ((runId: string, platformKey: string, epoch: number) => {
       created++;
       assert.equal(runId, "t-app");
-      assert.equal(platformKey, "pk");
+      runner?.made.push({ platformKey, epoch });
       return {
+        markEnded: async (why: string) => { runner?.closed.push(why); return true; },
         run: async (signal: AbortSignal) => { runner!.runs++; return runner!.script(signal); },
         finishNow: async (cause: string): Promise<AppRunOutcome> => { runner!.finishes.push(cause); return { success: false, reason: cause }; },
       } as unknown as AppRunner;
@@ -78,7 +82,7 @@ function harness(runner?: FakeRunner) {
 const request = (mode: unknown): ExecuteRequest =>
   ({ session_id: "s-app", task_id: "t-app", prompt: "hi", user_id: "u1", platform_key: "pk", mode }) as ExecuteRequest;
 
-const fakeRunner = (script: FakeRunner["script"]): FakeRunner => ({ runs: 0, finishes: [], script });
+const fakeRunner = (script: FakeRunner["script"]): FakeRunner => ({ runs: 0, finishes: [], made: [], closed: [], script });
 
 async function runApp(h: ReturnType<typeof harness>) {
   const abortCtrl = new AbortController();
@@ -101,6 +105,28 @@ test("A1 an app task goes to the AppRunner; a finished run is reported once, wit
   assert.equal(h.acked(), 1);
   assert.equal(h.released(), 1);
   assert.equal(activeAbort.has("lock.s-app"), false);
+});
+
+test("A1a the runner is made with the epoch this attempt holds the run at", async () => {
+  const runner = fakeRunner(async () => ({ kind: "ended", outcome: { success: true, reason: "app finished" } }));
+  const h = harness(runner);
+  await runApp(h);
+  assert.equal(runner.made.length, 1);
+  assert.equal(runner.made[0]!.platformKey, "pk");
+  assert.equal(typeof runner.made[0]!.epoch, "number");
+});
+
+test("A1f no platform key: the row is closed and the task fails", async () => {
+  const runner = fakeRunner(async () => { throw new Error("must not run"); });
+  const h = harness(runner);
+  const abortCtrl = new AbortController();
+  activeAbort.set("lock.s-app", abortCtrl);
+  await runHandleTask(h.msg, { ...request("app"), platform_key: undefined } as ExecuteRequest, "s-app", "lock.s-app", "m1", "u1", abortCtrl);
+  assert.equal(runner.runs, 0);
+  assert.equal(runner.made[0]?.platformKey, "", "a runner is made only to close the row");
+  assert.equal(runner.closed.length, 1, "the row is ended, not left running");
+  assert.equal(h.done.length, 1);
+  assert.equal(h.done[0]!.abortReason, "error");
 });
 
 test("A1b a failed app run is reported as a failure with the runner's reason, and not retried", async () => {

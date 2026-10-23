@@ -48,7 +48,12 @@ describe("internal app-run routes", { skip }, () => {
   const get = (url: string, headers: Record<string, string> = auth) => app.inject({ method: "GET", url, headers });
   const patch = (body: unknown, headers: Record<string, string> = auth) =>
     app.inject({ method: "PATCH", url: `/v1/internal/app-runs/${taskId}`, payload: body as object, headers });
-  const brain = (extra: Record<string, unknown>) => ({ brain_id: "brain-A", ...extra });
+  const EPOCH = 3;
+const brain = (extra: Record<string, unknown>) => ({ brain_id: "brain-A", claim_count: EPOCH, ...extra });
+/** The run's lease as a live worker holds it: brain-A, valid for an hour, at epoch EPOCH. */
+const holdLease = (id: string) => q(
+  "UPDATE claw_tasks SET lease_owner = 'brain-A', lease_expires_at = NOW() + interval '1 hour', claim_count = $2 WHERE task_id = $1", [id, EPOCH],
+);
 
   before(async () => {
     process.env.CLAW_DEPLOY_MODE = "safe";
@@ -86,7 +91,9 @@ describe("internal app-run routes", { skip }, () => {
       payload: { mode: "app", plugin_id: plugin, input: INPUT, resources: RESOURCES },
     });
     assert.equal(res.statusCode, 200, res.body);
-    return res.json().task_id as string;
+    const id = res.json().task_id as string;
+    await holdLease(id);
+    return id;
   }
   beforeEach(async () => { taskId = await createRun(); });
 
@@ -195,16 +202,48 @@ describe("internal app-run routes", { skip }, () => {
       assert.equal((await patch(brain({ expect_state: "provisioning", state: "starting" }))).statusCode, 200);
     });
 
-    test("the fence: only the lease holder writes; with nobody holding it anyone may", async () => {
-      await q("UPDATE claw_tasks SET lease_owner = 'brain-A' WHERE task_id = $1", [taskId]);
-      const other = await patch({ brain_id: "brain-B", state: "starting" });
-      assert.equal(other.statusCode, 409);
-      assert.equal(other.json().error, "not_holder");
-      assert.equal((await row()).state, "provisioning", "the stale writer changed nothing");
-      assert.equal((await patch(brain({ state: "starting" }))).statusCode, 200);
+    test("the fence: the live lease holder at the epoch it quoted, and nobody else", async () => {
+      const refused = async (body: Record<string, unknown>, why: string) => {
+        const res = await patch(body);
+        assert.equal(res.statusCode, 409, `${why}: ${res.body}`);
+        assert.equal(res.json().error, "not_holder", why);
+        assert.equal((await row()).state, "provisioning", `${why}: the stale writer changed nothing`);
+      };
+      await refused({ brain_id: "brain-B", claim_count: EPOCH, state: "starting" }, "another brain");
+      await refused({ brain_id: "brain-A", claim_count: EPOCH - 1, state: "starting" }, "an earlier attempt of the same brain");
+      await refused({ brain_id: "brain-A", claim_count: EPOCH + 1, state: "starting" }, "a later epoch than the row has");
+      await q("UPDATE claw_tasks SET lease_expires_at = NOW() - interval '1 second' WHERE task_id = $1", [taskId]);
+      await refused(brain({ state: "starting" }), "an expired lease");
+      await q("UPDATE claw_tasks SET lease_owner = NULL, lease_expires_at = NOW() + interval '1 hour' WHERE task_id = $1", [taskId]);
+      await refused(brain({ state: "starting" }), "a released lease: nobody holds it, so nobody writes");
+      await refused({ brain_id: "brain-B", claim_count: EPOCH, state: "running" }, "a released lease, any brain");
+      await holdLease(taskId);
+      assert.equal((await patch(brain({ state: "starting" }))).statusCode, 200, "the holder, at its epoch, writes");
+      assert.equal((await patch({ brain_id: "brain-A", state: "running" })).statusCode, 400, "an epoch must be quoted");
+      assert.equal((await patch({ brain_id: "brain-A", state: "running" })).json().error, "claim_count_required");
+    });
 
-      await q("UPDATE claw_tasks SET lease_owner = NULL WHERE task_id = $1", [taskId]);
-      assert.equal((await patch({ brain_id: "brain-B", state: "running" })).statusCode, 200);
+    test("restarts only move forward, and the answer is the row as written", async () => {
+      assert.equal((await patch(brain({ restarts: 2, state: "restarting" }))).statusCode, 200);
+      const back = await patch(brain({ restarts: 1, state: "starting" }));
+      assert.equal(back.statusCode, 409);
+      assert.equal(back.json().error, "state_mismatch");
+      const same = await patch(brain({ restarts: 2, state: "starting" }));
+      assert.equal(same.statusCode, 200);
+      const r = await row();
+      assert.equal(r.restarts, 2);
+      assert.equal(same.json().run.restarts, 2);
+      assert.equal(same.json().run.state, "starting");
+      assert.equal(same.json().run.workspace_id, "ws-ok", "the answer carries the joined task fields without a second read");
+    });
+
+    test("a secret that cannot be opened does not block a transition: the free text is dropped, the rest is stored", async () => {
+      await q("UPDATE claw_app_runs SET mcp_token_enc = 'not-a-sealed-secret' WHERE task_id = $1", [taskId]);
+      const plain = await patch(brain({ state: "finishing", last_exit: { at: "t", cause: "exit", final: false, returncode: 4 } }));
+      assert.equal(plain.statusCode, 200, "no free text, so nothing needed opening");
+      const texty = await patch(brain({ last_exit: { at: "t", cause: "exit", final: false, returncode: 4, stop_reason: "x", error: "rate limit" } }));
+      assert.equal(texty.statusCode, 200, texty.body);
+      assert.deepEqual((await row()).last_exit, { at: "t", cause: "exit", final: false, returncode: 4 });
     });
 
     test("ended is final: nothing moves a run out of it", async () => {
@@ -236,7 +275,10 @@ describe("internal app-run routes", { skip }, () => {
 
     test("malformed patches are refused with a reason, and change nothing", async () => {
       const bad: Array<[string, unknown]> = [
-        ["brain_id_required", { state: "starting" }],
+        ["brain_id_required", { state: "starting", claim_count: EPOCH }],
+        ["claim_count_required", { brain_id: "brain-A", state: "starting" }],
+        ["claim_count_required", { brain_id: "brain-A", claim_count: -1, state: "starting" }],
+        ["claim_count_required", { brain_id: "brain-A", claim_count: 1.5, state: "starting" }],
         ["state_invalid", brain({ state: "exploded" })],
         ["expect_state_invalid", brain({ expect_state: 3, state: "starting" })],
         ["restarts_invalid", brain({ restarts: -1 })],

@@ -203,3 +203,56 @@ test("a manifest argument with a quote and a space reaches the process intact", 
   assert.equal(readFileSync(`${w.stateDir}/arg.txt`, "utf8"), "it's a \"test\" $HOME");
 });
 
+
+// --- the start lock and the previous generation's exit record ---------------
+
+test("a start lock left by another sandbox is stale, even when its pid is alive here", async () => {
+  const w = realWorld("sleep 30");
+  const { mkdirSync, writeFileSync } = await import("node:fs");
+  mkdirSync(w.stateDir, { recursive: true });
+  // A lock from a gone container whose pid number is, by bad luck, a live process in this one: this test's own.
+  const { symlinkSync } = await import("node:fs");
+  symlinkSync(`${process.pid}|wl-from-another-container`, `${w.stateDir}/.start.lock`);
+  const out = await w.exec(startCommand(MANIFEST, w.stateDir, generationTag("wl-1", 0)));
+  assert.equal(out.stdout.trim(), "started", out.stderr);
+  pids.push(Number(readFileSync(`${w.stateDir}/app.pid`, "utf8")));
+});
+
+test("a lock directory left by an older version is stale, not a holder", async () => {
+  const w = realWorld("sleep 30");
+  const { mkdirSync, writeFileSync } = await import("node:fs");
+  mkdirSync(`${w.stateDir}/.start.lock`, { recursive: true });
+  writeFileSync(`${w.stateDir}/.start.lock/pid`, String(process.pid));
+  const out = await w.exec(startCommand(MANIFEST, w.stateDir, generationTag("wl-1", 0)));
+  assert.equal(out.stdout.trim(), "started", out.stderr);
+  pids.push(Number(readFileSync(`${w.stateDir}/app.pid`, "utf8")));
+});
+
+test("a live lock of this sandbox still says busy", async () => {
+  const w = realWorld("sleep 30");
+  const { mkdirSync, writeFileSync } = await import("node:fs");
+  mkdirSync(w.stateDir, { recursive: true });
+  const { symlinkSync } = await import("node:fs");
+  symlinkSync(`${process.pid}|wl-1`, `${w.stateDir}/.start.lock`);
+  const out = await w.exec(startCommand(MANIFEST, w.stateDir, generationTag("wl-1", 0)));
+  assert.equal(out.stdout.trim(), "busy");
+  assert.equal(existsSync(`${w.stateDir}/app.pid`), false, "nothing was started");
+});
+
+test("starting a new generation removes the previous generation's exit.json; an already-running one keeps it", async () => {
+  const w = realWorld("sleep 30");
+  const { mkdirSync, writeFileSync } = await import("node:fs");
+  mkdirSync(w.stateDir, { recursive: true });
+  writeFileSync(`${w.stateDir}/exit.json`, '{"final":false,"returncode":2,"stop_reason":"x"}');
+  const out = await w.exec(startCommand(MANIFEST, w.stateDir, generationTag("wl-1", 1)));
+  assert.equal(out.stdout.trim(), "started", out.stderr);
+  pids.push(Number(readFileSync(`${w.stateDir}/app.pid`, "utf8")));
+  assert.equal(existsSync(`${w.stateDir}/exit.json`), false, "the new generation starts with no exit record");
+  // The same sandbox, next generation, process still alive (this test's own pid stands in): `already`, nothing removed.
+  writeFileSync(`${w.stateDir}/app.pid`, String(process.pid));
+  writeFileSync(`${w.stateDir}/app.sandbox`, generationTag("wl-1", 1));
+  writeFileSync(`${w.stateDir}/exit.json`, '{"final":false}');
+  const again = await w.exec(startCommand(MANIFEST, w.stateDir, generationTag("wl-1", 2)));
+  assert.equal(again.stdout.trim(), "already");
+  assert.equal(existsSync(`${w.stateDir}/exit.json`), true);
+});
