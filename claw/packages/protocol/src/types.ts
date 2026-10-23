@@ -16,11 +16,12 @@ export interface Message {
  *
  *   - "llm"    classic agent loop driven by an LLM
  *   - "script" predefined tool sequence, no LLM invocations
+ *   - "app"    a hosted application run under an AppManifest (see app-manifest.ts)
  *
  * Note: the virtual DAG root row uses `mode='dag'` at the DB layer but is never
  * dispatched to Brain, so we do not list it here.
  */
-export type TaskMode = "llm" | "script";
+export type TaskMode = "llm" | "script" | "app";
 
 /**
  * Sandbox specification rendered by Backend Dispatcher and shipped to Brain
