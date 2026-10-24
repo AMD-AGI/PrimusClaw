@@ -23,7 +23,7 @@ import {
 } from "../../config.js";
 import { normalizeWorkloadTimeout, resolveSandboxImageFromRequest } from "../ensure-hands.js";
 import {
-  assertMultiNodeInferaModel,
+  assertMultiNodeModel,
   ephemeralGiPerNode,
   resolveTopology,
   type MultiNodePromptSpec,
@@ -336,7 +336,7 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
   ): Promise<MultiNodeContext> {
     const spec = resolveTopology(request);
     if (!spec) throw new Error("SafeMultiNodeProvider.ensure called for a single-node request");
-    assertMultiNodeInferaModel(spec);
+    assertMultiNodeModel(spec);
 
     const messageId = request.message_id?.trim();
     if (!messageId) throw new Error("multi-node request requires message_id");
@@ -618,6 +618,7 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
         model: spec.model,
         framework: spec.framework,
         kvTransferBackend: spec.kvTransferBackend,
+        pdMode: spec.pdMode,
         pdPrefillNodes: spec.pdPrefillNodes,
         pdDecodeNodes: spec.pdDecodeNodes,
         pdPrefillTp: spec.pdPrefillTp,

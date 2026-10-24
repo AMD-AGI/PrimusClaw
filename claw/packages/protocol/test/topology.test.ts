@@ -64,12 +64,23 @@ test("the backend has to be stated", () => {
 
 test("sglangrouter without a model is refused at declaration time", () => {
   assert.ok(errs({ nodes: 2, backend: "sglangrouter" }).some((m) => m.includes("model")));
-  ok({ nodes: 2, backend: "sglangrouter", model: "/models/Qwen3-14B" });
+  ok({ nodes: 2, backend: "sglangrouter", model: "/models/Qwen3-14B", pd_mode: "disaggregated" });
 });
 
 test("atom without a model is refused at declaration time", () => {
   assert.ok(errs({ nodes: 2, backend: "atom" }).some((m) => m.includes("model")));
-  ok({ nodes: 2, backend: "atom", model: "/shared_nfs/models/Qwen3-14B-FP8" });
+  ok({ nodes: 2, backend: "atom", model: "/shared_nfs/models/Qwen3-14B-FP8", pd_mode: "disaggregated" });
+});
+
+test("atom and sglangrouter refuse aggregated pd_mode at declaration time", () => {
+  assert.ok(
+    errs({ nodes: 2, backend: "atom", model: "/models/m", pd_mode: "aggregated" })
+      .some((m) => m.includes("pd_mode")),
+  );
+  assert.ok(
+    errs({ nodes: 2, backend: "sglangrouter", model: "/models/m", pd_mode: "aggregated" })
+      .some((m) => m.includes("pd_mode")),
+  );
 });
 
 test("infera without a model is refused at declaration time", () => {

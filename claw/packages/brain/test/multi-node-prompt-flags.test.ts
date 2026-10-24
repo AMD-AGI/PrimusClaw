@@ -4,7 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  assertMultiNodeInferaModel,
+  assertMultiNodeModel,
   isMultiNodeRequest,
   parseMultiNodePromptFlags,
   requestedNodeCount,
@@ -256,49 +256,62 @@ test("isMultiNodeRequest follows the prompt flags, not the request body", () => 
   assert.equal(isMultiNodeRequest({}), false);
 });
 
-test("assertMultiNodeInferaModel rejects infera without --model", () => {
+test("assertMultiNodeModel rejects infera without --model", () => {
   const spec = parseMultiNodePromptFlags("--nodes 2 --mn-backend infera");
   assert.ok(spec);
   assert.throws(
-    () => assertMultiNodeInferaModel(spec),
+    () => assertMultiNodeModel(spec),
     /model is required/,
   );
 });
 
 test("parseMultiNodePromptFlags accepts sglangrouter and still requires --model", () => {
   const spec = parseMultiNodePromptFlags(
-    "--nodes 2 --mn-backend sglangrouter --model /models/Qwen3-14B --pd-transfer-backend mooncake",
+    "--nodes 2 --mn-backend sglangrouter --model /models/Qwen3-14B --pd-transfer-backend mooncake --pd-mode disaggregated",
   );
   assert.ok(spec);
   assert.equal(spec.backend, "sglangrouter");
-  assert.doesNotThrow(() => assertMultiNodeInferaModel(spec));
-  const missing = parseMultiNodePromptFlags("--nodes 2 --mn-backend sglangrouter");
+  assert.doesNotThrow(() => assertMultiNodeModel(spec));
+  const missing = parseMultiNodePromptFlags(
+    "--nodes 2 --mn-backend sglangrouter --pd-mode disaggregated",
+  );
   assert.ok(missing);
-  assert.throws(() => assertMultiNodeInferaModel(missing), /model is required/);
+  assert.throws(() => assertMultiNodeModel(missing), /model is required/);
 });
 
 test("parseMultiNodePromptFlags accepts atom and still requires --model", () => {
   const spec = parseMultiNodePromptFlags(
-    "--nodes 2 --mn-backend atom --model /shared_nfs/models/Qwen3-14B-FP8 --pd-transfer-backend mooncake",
+    "--nodes 2 --mn-backend atom --model /shared_nfs/models/Qwen3-14B-FP8 --pd-transfer-backend mooncake --pd-mode disaggregated",
   );
   assert.ok(spec);
   assert.equal(spec.backend, "atom");
   assert.equal(spec.kvTransferBackend, "mooncake");
-  assert.doesNotThrow(() => assertMultiNodeInferaModel(spec));
-  const missing = parseMultiNodePromptFlags("--nodes 2 --mn-backend atom");
+  assert.doesNotThrow(() => assertMultiNodeModel(spec));
+  const missing = parseMultiNodePromptFlags(
+    "--nodes 2 --mn-backend atom --pd-mode disaggregated",
+  );
   assert.ok(missing);
-  assert.throws(() => assertMultiNodeInferaModel(missing), /model is required/);
+  assert.throws(() => assertMultiNodeModel(missing), /model is required/);
 });
 
-test("assertMultiNodeInferaModel allows infera with --model", () => {
+test("assertMultiNodeModel rejects atom without disaggregated pd-mode", () => {
+  const spec = parseMultiNodePromptFlags(
+    "--nodes 2 --mn-backend atom --model /models/m --pd-transfer-backend mooncake",
+  );
+  assert.ok(spec);
+  assert.equal(spec.pdMode, "aggregated");
+  assert.throws(() => assertMultiNodeModel(spec), /requires --pd-mode disaggregated/);
+});
+
+test("assertMultiNodeModel allows infera with --model", () => {
   const spec = parseMultiNodePromptFlags(
     "--nodes 2 --mn-backend infera --model /models/Qwen3-30B-A3B",
   );
   assert.ok(spec);
-  assert.doesNotThrow(() => assertMultiNodeInferaModel(spec));
+  assert.doesNotThrow(() => assertMultiNodeModel(spec));
 });
 
-test("classifySandboxFailure maps infera model errors", () => {
+test("classifySandboxFailure maps model errors by backend", () => {
   assert.equal(
     classifySandboxFailure(
       "multi-node infera request requires --model (infera frontend --router-tokenizer-path)",
@@ -308,6 +321,14 @@ test("classifySandboxFailure maps infera model errors", () => {
   assert.equal(
     classifySandboxFailure("model is required (infera frontend --router-tokenizer-path)"),
     "infera_model_missing",
+  );
+  assert.equal(
+    classifySandboxFailure("model is required (atom prefill/decode --model-path)"),
+    "mn_model_missing",
+  );
+  assert.equal(
+    classifySandboxFailure("model is required (sglangrouter prefill/decode --model-path)"),
+    "mn_model_missing",
   );
 });
 

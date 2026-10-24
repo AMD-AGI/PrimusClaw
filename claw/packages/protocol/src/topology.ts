@@ -34,6 +34,16 @@ import { PG_INT4_MAX } from "@claw/utils";
 export const TOPOLOGY_BACKENDS = ["rayjob", "infera", "atom", "sglangrouter"] as const;
 export type TopologyBackend = (typeof TOPOLOGY_BACKENDS)[number];
 
+/** Backends that launch from a model path/id and must refuse a missing `--model`. */
+export function backendRequiresModel(backend: TopologyBackend): boolean {
+  return backend === "infera" || backend === "atom" || backend === "sglangrouter";
+}
+
+/** Atom and SGLangRouter are always router+prefill+decode; aggregated is not offered. */
+export function backendRequiresDisaggregatedPd(backend: TopologyBackend): boolean {
+  return backend === "atom" || backend === "sglangrouter";
+}
+
 export const TOPOLOGY_FRAMEWORKS = ["sglang", "vllm"] as const;
 export const TOPOLOGY_KV_BACKENDS = ["nixl", "mori", "mooncake"] as const;
 export const TOPOLOGY_PD_MODES = ["aggregated", "disaggregated"] as const;
@@ -186,13 +196,24 @@ export function validateTopology(input: unknown): TopologyValidation {
   }
 
   if (
-    (raw.backend === "infera" || raw.backend === "atom" || raw.backend === "sglangrouter")
+    typeof raw.backend === "string"
+    && (TOPOLOGY_BACKENDS as readonly string[]).includes(raw.backend)
+    && backendRequiresModel(raw.backend as TopologyBackend)
     && !String(raw.model ?? "").trim()
   ) {
     // Infera's frontend takes it as --router-tokenizer-path. Atom and
     // SGLangRouter prefill and decode take it as --model-path. Without it the
     // cluster comes up and the serving process cannot start.
     errors.push(`topology.model is required when backend is ${raw.backend}`);
+  }
+
+  if (
+    typeof raw.backend === "string"
+    && (TOPOLOGY_BACKENDS as readonly string[]).includes(raw.backend)
+    && backendRequiresDisaggregatedPd(raw.backend as TopologyBackend)
+    && raw.pd_mode === "aggregated"
+  ) {
+    errors.push(`topology.pd_mode aggregated is not supported when backend is ${raw.backend}`);
   }
 
   if (errors.length) return { ok: false, errors };

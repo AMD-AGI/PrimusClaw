@@ -16,6 +16,9 @@
  * load deterministic builders without inheriting process environment.
  */
 
+import {
+  resolvePdClusterReplicas,
+} from "./prompt-flags.js";
 import type { MultiNodeBackend } from "./types.js";
 
 /** RayJob head serves the inference server here; matches the Claw template. */
@@ -649,10 +652,12 @@ function atomEngineEntrypoint(
 export interface AtomWorkloadParams extends CommonWorkloadParams {
   /** Model path for prefill and decode `--model-path`. */
   model: string;
-  /** atomesh `--backend` on the router. */
+  /** atomesh `--backend` on the router; engines always run sglang. */
   framework: string;
   /** KV transfer backend for both engine roles. */
   kvTransferBackend: string;
+  /** Must be disaggregated; Atom/SGLangRouter have no aggregated shape. */
+  pdMode: "aggregated" | "disaggregated";
   pdPrefillNodes?: number;
   pdDecodeNodes?: number;
   pdPrefillTp?: number;
@@ -686,12 +691,41 @@ function buildPdClusterWorkloadBody(
   if (!p.model.trim()) {
     throw new Error(`model is required (${opts.backend} prefill/decode --model-path)`);
   }
+  if (p.pdMode !== "disaggregated") {
+    throw new Error(
+      `${opts.backend} requires --pd-mode disaggregated (got ${p.pdMode})`,
+    );
+  }
+  if (p.framework !== "sglang") {
+    throw new Error(
+      `${opts.backend} engines always run sglang; --framework must be sglang (got ${p.framework})`,
+    );
+  }
 
   const model = p.model.trim();
-  const prefillReplica = Math.max(1, p.pdPrefillNodes ?? 0);
-  const decodeReplica = Math.max(1, p.pdDecodeNodes ?? 0);
-  const prefillTp = p.pdPrefillTp && p.pdPrefillTp > 0 ? p.pdPrefillTp : 1;
-  const decodeTp = p.pdDecodeTp && p.pdDecodeTp > 0 ? p.pdDecodeTp : 1;
+  const { prefill: prefillReplica, decode: decodeReplica } = resolvePdClusterReplicas({
+    nodes: p.nodes,
+    pdPrefillNodes: p.pdPrefillNodes ?? 0,
+    pdDecodeNodes: p.pdDecodeNodes ?? 0,
+    backend: opts.backend,
+  });
+  if (p.nodes !== prefillReplica + decodeReplica) {
+    throw new Error(
+      `${opts.backend}: --nodes (${p.nodes}) must equal prefill+decode GPU nodes (${prefillReplica + decodeReplica})`,
+    );
+  }
+
+  // Default TP to every GPU on the pod. Cross-pod TP is not supported here.
+  const prefillTp = p.pdPrefillTp && p.pdPrefillTp > 0 ? p.pdPrefillTp : p.gpusPerNode;
+  const decodeTp = p.pdDecodeTp && p.pdDecodeTp > 0 ? p.pdDecodeTp : p.gpusPerNode;
+  for (const [role, tp] of [["prefill", prefillTp], ["decode", decodeTp]] as const) {
+    if (tp > p.gpusPerNode) {
+      throw new Error(
+        `${opts.backend}: --pd-${role}-tp (${tp}) exceeds --gpus-per-node (${p.gpusPerNode}); cross-pod TP is not supported`,
+      );
+    }
+  }
+
   const sharedMemoryGi = Math.max(1, Math.floor(p.memGiPerNode / 2));
 
   const routerResource = {
@@ -714,10 +748,11 @@ function buildPdClusterWorkloadBody(
   const env = sanitizeEnv(p.extraEnv);
   applyCorrelationEnv(env, opts.backend, p.sessionId, p.messageId);
 
+  // useWorkspaceStorage stays absent: SaFE defaults an absent *bool to true
+  // (see baseBody). Sending it could only ever turn the mount off.
   const body: Record<string, unknown> = {
     ...baseBody(opts.kind),
     groupVersionKind: { group: "amd.com", kind: opts.kind, version: "v1" },
-    useWorkspaceStorage: true,
     timeout: workloadTimeout(p.timeoutSec, p.defaultTimeoutSec),
     displayName: p.displayName,
     workspaceId: p.workspace,

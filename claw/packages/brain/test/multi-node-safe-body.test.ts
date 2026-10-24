@@ -73,6 +73,20 @@ test("neither body claims the workspace-storage field", () => {
   for (const [name, body] of [
     ["rayjob", buildRayJobWorkloadBody(COMMON)],
     ["infera", buildInferaWorkloadBody({ ...INFERA_COMMON, pdMode: "aggregated" })],
+    ["atom", buildAtomWorkloadBody({
+      ...COMMON,
+      model: "/models/m",
+      framework: "sglang",
+      kvTransferBackend: "mooncake",
+      pdMode: "disaggregated",
+    })],
+    ["sglangrouter", buildSGLangRouterWorkloadBody({
+      ...COMMON,
+      model: "/models/m",
+      framework: "sglang",
+      kvTransferBackend: "mooncake",
+      pdMode: "disaggregated",
+    })],
   ] as const) {
     assert.ok(
       !("useWorkspaceStorage" in (body as Record<string, unknown>)),
@@ -289,10 +303,11 @@ test("buildAtomWorkloadBody creates router, prefill and decode from the prompt s
     model: "/shared_nfs/models/Qwen3-14B-FP8",
     framework: "sglang",
     kvTransferBackend: "mooncake",
+    pdMode: "disaggregated",
     pdPrefillNodes: 1,
     pdDecodeNodes: 1,
-    pdPrefillTp: 1,
-    pdDecodeTp: 1,
+    pdPrefillTp: 8,
+    pdDecodeTp: 8,
     memGiPerNode: 128,
     cpusPerNode: 16,
     ephemeralGiPerNode: 50,
@@ -300,7 +315,7 @@ test("buildAtomWorkloadBody creates router, prefill and decode from the prompt s
   }) as Record<string, any>;
 
   assert.deepStrictEqual(body.groupVersionKind, { group: "amd.com", kind: "Atom", version: "v1" });
-  assert.equal(body.useWorkspaceStorage, true);
+  assert.equal(body.useWorkspaceStorage, undefined);
   assert.equal(body.workloadId, "msg1");
   assert.equal(body.resources.length, 3);
   assert.equal(body.resources[0].gpu, undefined);
@@ -326,11 +341,57 @@ test("buildAtomWorkloadBody creates router, prefill and decode from the prompt s
   assert.match(router, /atomesh launch/);
   assert.match(router, /--backend sglang/);
   assert.match(prefill, /--model-path '\/shared_nfs\/models\/Qwen3-14B-FP8'/);
+  assert.match(prefill, /--tp-size 8/);
   assert.match(prefill, /--disaggregation-mode prefill/);
   assert.match(prefill, /--disaggregation-bootstrap-port 8998/);
   assert.match(prefill, /--disaggregation-transfer-backend mooncake/);
   assert.match(decode, /--disaggregation-mode decode/);
   assert.match(decode, /--disaggregation-bootstrap-port 9098/);
+});
+
+test("buildAtomWorkloadBody splits --nodes across prefill and decode when pd counts are omitted", () => {
+  const body = buildAtomWorkloadBody({
+    ...COMMON,
+    nodes: 4,
+    model: "/models/m",
+    framework: "sglang",
+    kvTransferBackend: "mooncake",
+    pdMode: "disaggregated",
+  }) as Record<string, any>;
+  assert.equal(body.resources[1].replica, 2);
+  assert.equal(body.resources[2].replica, 2);
+  assert.match(decodeEp(body.entryPoints[1]), /--tp-size 8/);
+});
+
+test("buildAtomWorkloadBody rejects aggregated pd-mode, vllm framework, and cross-pod TP", () => {
+  const base = {
+    ...COMMON,
+    model: "/models/m",
+    framework: "sglang" as const,
+    kvTransferBackend: "mooncake",
+    pdMode: "disaggregated" as const,
+  };
+  assert.throws(
+    () => buildAtomWorkloadBody({ ...base, pdMode: "aggregated" }),
+    /requires --pd-mode disaggregated/,
+  );
+  assert.throws(
+    () => buildAtomWorkloadBody({ ...base, framework: "vllm" }),
+    /--framework must be sglang/,
+  );
+  assert.throws(
+    () => buildAtomWorkloadBody({ ...base, pdPrefillTp: 16 }),
+    /cross-pod TP is not supported/,
+  );
+  assert.throws(
+    () => buildAtomWorkloadBody({
+      ...base,
+      nodes: 4,
+      pdPrefillNodes: 1,
+      pdDecodeNodes: 1,
+    }),
+    /must equal prefill\+decode/,
+  );
 });
 
 test("buildSGLangRouterWorkloadBody uses the model gateway and the same engine roles", () => {
@@ -340,6 +401,7 @@ test("buildSGLangRouterWorkloadBody uses the model gateway and the same engine r
     model: "/models/Qwen3-14B",
     framework: "sglang",
     kvTransferBackend: "mooncake",
+    pdMode: "disaggregated",
     pdPrefillNodes: 1,
     pdDecodeNodes: 1,
     extraEnv: { MC_GID_INDEX: "1" },
@@ -366,6 +428,7 @@ test("buildSGLangRouterWorkloadBody uses the model gateway and the same engine r
   assert.match(router, /--decode \{decode\}/);
   assert.equal(router.includes("atomesh"), false);
   assert.match(prefill, /--model-path '\/models\/Qwen3-14B'/);
+  assert.match(prefill, /--tp-size 8/);
   assert.match(prefill, /--disaggregation-mode prefill/);
   assert.match(decode, /--disaggregation-mode decode/);
   assert.equal(prefill.includes("atomesh"), false);
@@ -379,6 +442,7 @@ test("buildAtomWorkloadBody rejects a missing model", () => {
       model: "  ",
       framework: "sglang",
       kvTransferBackend: "mooncake",
+      pdMode: "disaggregated",
     }),
     /model is required/,
   );

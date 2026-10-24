@@ -30,7 +30,12 @@
 // Imports are limited to types and pure protocol helpers, so tests can load
 // this without pulling in the k8s client.
 import {
-  validateTopology, type EnvironmentTopology,
+  TOPOLOGY_BACKENDS,
+  backendRequiresDisaggregatedPd,
+  backendRequiresModel,
+  validateTopology,
+  type EnvironmentTopology,
+  type TopologyBackend,
 } from "@claw/protocol";
 
 /** Ephemeral storage per node; not expressible as a Hyperloom flag. */
@@ -59,7 +64,7 @@ const RESERVED_EXTRA_ENV = new Set([
   "MN_SSH_PORT",
 ]);
 
-export type MultiNodeBackendFlag = "rayjob" | "infera" | "atom" | "sglangrouter";
+export type MultiNodeBackendFlag = TopologyBackend;
 export type PdMode = "aggregated" | "disaggregated";
 
 export interface MultiNodePromptSpec {
@@ -189,7 +194,9 @@ export function requestedNodeCount(prompt: string): number {
 /** `--mn-backend`, or null when the flag is absent or outside the enum. */
 function readBackendFlag(prompt: string): MultiNodeBackendFlag | null {
   const raw = (readFlag(prompt, "mn-backend") ?? "").toLowerCase();
-  return raw === "rayjob" || raw === "infera" || raw === "atom" || raw === "sglangrouter" ? raw : null;
+  return (TOPOLOGY_BACKENDS as readonly string[]).includes(raw)
+    ? (raw as MultiNodeBackendFlag)
+    : null;
 }
 
 /**
@@ -240,19 +247,100 @@ export function parseMultiNodePromptFlags(prompt: string): MultiNodePromptSpec |
 }
 
 /**
- * Fail fast when a backend that launches from `--model` is missing it.
+ * Fail fast when a backend that launches from `--model` is missing it, and when
+ * Atom/SGLangRouter are asked for a topology they cannot provision.
  *
  * Infera's frontend takes the path as `--router-tokenizer-path`. Atom and
  * SGLangRouter prefill and decode take it as `--model-path`. Either cluster
  * would otherwise come up and then fail to serve.
  */
-export function assertMultiNodeInferaModel(spec: MultiNodePromptSpec): void {
-  if (spec.backend === "rayjob") return;
-  if (spec.model.trim()) return;
-  const where = spec.backend === "infera"
-    ? "infera frontend --router-tokenizer-path"
-    : `${spec.backend} prefill/decode --model-path`;
-  throw new Error(`model is required (${where})`);
+export function assertMultiNodeModel(spec: MultiNodePromptSpec): void {
+  if (backendRequiresModel(spec.backend)) {
+    if (!spec.model.trim()) {
+      const where = spec.backend === "infera"
+        ? "infera frontend --router-tokenizer-path"
+        : `${spec.backend} prefill/decode --model-path`;
+      throw new Error(`model is required (${where})`);
+    }
+  }
+  if (backendRequiresDisaggregatedPd(spec.backend)) {
+    assertPdClusterPrompt(spec);
+  }
+}
+
+/** @deprecated Use assertMultiNodeModel. */
+export const assertMultiNodeInferaModel = assertMultiNodeModel;
+
+/**
+ * Atom/SGLangRouter are always a router + prefill + decode PD cluster: no
+ * aggregated mode, engines are sglang only, and `--nodes` must match the GPU
+ * roles that will actually be created.
+ */
+export function assertPdClusterPrompt(spec: MultiNodePromptSpec): void {
+  if (spec.pdMode !== "disaggregated") {
+    throw new Error(
+      `${spec.backend} requires --pd-mode disaggregated (got ${spec.pdMode})`,
+    );
+  }
+  if (spec.framework !== "sglang") {
+    throw new Error(
+      `${spec.backend} engines always run sglang; --framework must be sglang (got ${spec.framework})`,
+    );
+  }
+  const { prefill, decode } = resolvePdClusterReplicas(spec);
+  const total = prefill + decode;
+  if (spec.nodes !== total) {
+    throw new Error(
+      `${spec.backend}: --nodes (${spec.nodes}) must equal prefill+decode GPU nodes (${total})`,
+    );
+  }
+  assertPdClusterTp(spec, "prefill", spec.pdPrefillTp);
+  assertPdClusterTp(spec, "decode", spec.pdDecodeTp);
+}
+
+/**
+ * Prefill/decode replica counts for an Atom/SGLangRouter cluster.
+ *
+ * Explicit `--pd-*-nodes` win when either is set (both required). Otherwise
+ * `--nodes` is split evenly across the two GPU roles so Hyperloom's
+ * INFERENCE_OPTIMIZER_NODES matches the pods that will exist.
+ */
+export function resolvePdClusterReplicas(spec: {
+  nodes: number;
+  pdPrefillNodes: number;
+  pdDecodeNodes: number;
+  backend?: string;
+}): { prefill: number; decode: number } {
+  const label = spec.backend ?? "pd-cluster";
+  const hasPrefill = spec.pdPrefillNodes > 0;
+  const hasDecode = spec.pdDecodeNodes > 0;
+  if (hasPrefill || hasDecode) {
+    if (!hasPrefill || !hasDecode) {
+      throw new Error(
+        `${label} requires both --pd-prefill-nodes and --pd-decode-nodes when either is set`,
+      );
+    }
+    return { prefill: spec.pdPrefillNodes, decode: spec.pdDecodeNodes };
+  }
+  if (spec.nodes < 2) {
+    throw new Error(`${label} requires --nodes >= 2`);
+  }
+  const prefill = Math.floor(spec.nodes / 2);
+  const decode = spec.nodes - prefill;
+  return { prefill, decode };
+}
+
+function assertPdClusterTp(
+  spec: MultiNodePromptSpec,
+  role: "prefill" | "decode",
+  tp: number,
+): void {
+  if (tp <= 0) return;
+  if (tp > spec.gpusPerNode) {
+    throw new Error(
+      `${spec.backend}: --pd-${role}-tp (${tp}) exceeds --gpus-per-node (${spec.gpusPerNode}); cross-pod TP is not supported`,
+    );
+  }
 }
 
 /** Ephemeral storage per node in GiB, for the SaFE workload bodies. */

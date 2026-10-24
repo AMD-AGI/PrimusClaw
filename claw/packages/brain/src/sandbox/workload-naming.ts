@@ -16,12 +16,22 @@
  * SaFE appends its own random suffix to derive the workload id, so these names
  * are prefixes of the ids seen in the cluster.
  *
- * Kept import-free so it is directly testable (the providers that consume it
- * pull in the k8s HTTP client, which cannot load under tsx here).
+ * Suffixes are keyed by TopologyBackend so a new backend fails to compile here
+ * until it gets a name, rather than silently falling through to `-ray`.
  */
+
+import type { TopologyBackend } from "@claw/protocol";
 
 /** Longest name SaFE/Kubernetes will accept for a workload. */
 const MAX_NAME_LEN = 63;
+
+/** Display-name suffix for each multi-node engine. */
+const MULTI_NODE_NAME_SUFFIX: Record<TopologyBackend, string> = {
+  rayjob: "-ray",
+  infera: "-infera",
+  atom: "-atom",
+  sglangrouter: "-sglangrouter",
+};
 
 /** Session-scoped Hands sandbox. Timestamped at create time: a session has no message of its own. */
 export function sandboxWorkloadName(now: number = Date.now()): string {
@@ -35,13 +45,10 @@ export function sandboxWorkloadName(now: number = Date.now()): string {
  */
 export function multiNodeWorkloadName(
   messageId: string,
-  backend: "rayjob" | "infera" | "atom" | "sglangrouter",
+  backend: TopologyBackend,
 ): string {
   const base = sanitizeMessageIdBase(messageId);
-  const suffix = backend === "infera" ? "-infera"
-    : backend === "atom" ? "-atom"
-    : backend === "sglangrouter" ? "-sglangrouter"
-    : "-ray";
+  const suffix = MULTI_NODE_NAME_SUFFIX[backend];
   const maxBaseLen = MAX_NAME_LEN - suffix.length;
   const trimmed = base.length > maxBaseLen ? base.slice(0, maxBaseLen).replace(/-+$/, "") : base;
   return `${trimmed}${suffix}`;

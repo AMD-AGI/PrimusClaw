@@ -11,10 +11,10 @@
  * (see sandbox/params.ts applyMultiNodeExternalEnv).
  */
 
-import type { ExecuteRequest } from "@claw/protocol";
+import type { ExecuteRequest, TopologyBackend } from "@claw/protocol";
 
 /** Engine topology, from the prompt's `--mn-backend`. */
-export type MultiNodeBackend = "rayjob" | "infera" | "atom" | "sglangrouter";
+export type MultiNodeBackend = TopologyBackend;
 
 /** Which mechanism provisioned the cluster. */
 export type MultiNodeProviderKind = "safe";
