@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
 	"sigs.k8s.io/agent-sandbox/pkg/builder"
 	"sigs.k8s.io/agent-sandbox/pkg/cmdlog"
+	"sigs.k8s.io/agent-sandbox/pkg/grant"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/nsadmission"
 	"sigs.k8s.io/agent-sandbox/pkg/policy"
@@ -114,7 +115,8 @@ type CreateSandboxResponse struct {
 type Server struct {
 	cfg        Config
 	store      store.Store
-	k8s        *K8sSandboxCreator // nil in dev mode
+	k8s        *K8sSandboxCreator   // nil in dev mode; native API only
+	workloads  *SafeWorkloadCreator // nil until the SaFE Workload client is attached
 	router     *gin.Engine
 	wg         sync.WaitGroup
 	safeClient *safe.Client     // SaFE API Key verification client (nil when auth disabled)
@@ -146,6 +148,12 @@ func (s *Server) WithK8s(k8s *K8sSandboxCreator) *Server {
 	return s
 }
 
+// WithSafeWorkloads attaches the SaFE Workload writer used by the E2B control plane.
+func (s *Server) WithSafeWorkloads(creator *SafeWorkloadCreator) *Server {
+	s.workloads = creator
+	return s
+}
+
 // WithAuditStore attaches an audit event store for lifecycle auditing.
 func (s *Server) WithAuditStore(as audit.AuditStore) *Server {
 	s.auditStore = as
@@ -156,6 +164,41 @@ func (s *Server) WithAuditStore(as audit.AuditStore) *Server {
 func (s *Server) WithBuilder(b *builder.Builder) *Server {
 	s.builder = b
 	return s
+}
+
+// WithGrants serves the grant admin API. The caller token is checked inside
+// the grant service, not by the SaFE middleware on /v1.
+func (s *Server) WithGrants(svc *grant.Service) *Server {
+	if svc == nil || s.router == nil {
+		return s
+	}
+	grant.NewHandler(svc).Mount(s.router.Group("/internal/v1/grants"))
+	return s
+}
+
+// Record stores a grant audit event and writes one process-log line.
+func (s *Server) Record(ctx context.Context, event *audit.AuditEvent) {
+	s.emitAudit(ctx, event)
+	if event == nil {
+		return
+	}
+	log.Info("grant audit", "event_type", event.EventType, "session_id", event.SessionID, "user_id", event.UserID)
+}
+
+// ReclaimSession deletes the sandbox for a session because its grant ended.
+// A missing session is already reclaimed.
+func (s *Server) ReclaimSession(ctx context.Context, sessionID string) error {
+	if sessionID == "" {
+		return nil
+	}
+	info, err := s.store.GetSandboxBySessionID(ctx, sessionID)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return s.deleteSandboxAndSession(ctx, info, audit.ReasonGrantReclaim)
 }
 
 // emitAudit records an audit event (fire-and-forget, never blocks the caller).
@@ -1107,7 +1150,9 @@ func (s *Server) gcOnce(ctx context.Context) {
 	if expired, err := s.store.ListExpiredSandboxes(ctx, now, 100); err == nil {
 		for _, info := range expired {
 			log.Info("GC: deleting expired sandbox", "session", info.SessionID, "sandbox", info.SandboxName)
-			s.deleteSandboxAndSession(ctx, info, audit.ReasonGCTTL)
+			if err := s.deleteSandboxAndSession(ctx, info, audit.ReasonGCTTL); err != nil {
+				log.Warn("GC: sandbox delete failed", "session", info.SessionID, "sandbox", info.SandboxName, "error", err)
+			}
 		}
 	}
 
@@ -1122,9 +1167,31 @@ func (s *Server) gcOnce(ctx context.Context) {
 	}
 }
 
-// deleteSandboxAndSession deletes both the K8s resource and the Store entry.
-func (s *Server) deleteSandboxAndSession(ctx context.Context, info *store.SandboxInfo, reason string) {
-	// Audit: sandbox.deleted (GC-initiated)
+// deleteSandboxAndSession deletes the workload and then the session record.
+// A failed workload delete keeps the session so the caller can retry.
+func (s *Server) deleteSandboxAndSession(ctx context.Context, info *store.SandboxInfo, reason string) error {
+	switch {
+	case info.Kind == store.WorkloadKind:
+		if s.workloads == nil {
+			return fmt.Errorf("safe workload client is not configured")
+		}
+		if err := s.workloads.Delete(ctx, info.SandboxName); err != nil {
+			log.Warn("failed to delete workload", "workload", info.SandboxName, "error", err)
+			return err
+		}
+	case s.k8s != nil:
+		var err error
+		if info.Kind == store.SandboxClaimKind {
+			err = s.k8s.DeleteSandboxClaim(ctx, info)
+		} else {
+			err = s.k8s.DeleteSandbox(ctx, info)
+		}
+		if err != nil {
+			log.Warn("failed to delete K8s resource",
+				"kind", info.Kind, "sandbox", info.SandboxName, "error", err)
+			return err
+		}
+	}
 	s.emitAudit(ctx, &audit.AuditEvent{
 		ID: audit.NewEventID(), EventType: audit.EventDeleted,
 		SessionID: info.SessionID, SandboxName: info.SandboxName, Namespace: info.Namespace,
@@ -1133,20 +1200,7 @@ func (s *Server) deleteSandboxAndSession(ctx context.Context, info *store.Sandbo
 		DurationMs: time.Since(info.CreatedAt).Milliseconds(),
 	})
 	sandboxDeleteTotal.WithLabelValues(reason).Inc()
-
-	if s.k8s != nil {
-		var err error
-		if info.Kind == store.SandboxClaimKind {
-			err = s.k8s.DeleteSandboxClaim(ctx, info)
-		} else {
-			err = s.k8s.DeleteSandbox(ctx, info)
-		}
-		if err != nil {
-			log.Warn("GC: failed to delete K8s resource",
-				"kind", info.Kind, "sandbox", info.SandboxName, "error", err)
-		}
-	}
-	_ = s.store.DeleteSandboxBySessionID(ctx, info.SessionID)
+	return s.store.DeleteSandboxBySessionID(ctx, info.SessionID)
 }
 
 // ─── Template management handlers ────────────────────────────────────────────

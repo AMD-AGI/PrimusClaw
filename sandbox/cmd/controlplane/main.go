@@ -23,6 +23,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
@@ -34,9 +35,12 @@ import (
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
 	"sigs.k8s.io/agent-sandbox/pkg/builder"
+	"sigs.k8s.io/agent-sandbox/pkg/e2b"
+	"sigs.k8s.io/agent-sandbox/pkg/grant"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/nsadmission"
 	"sigs.k8s.io/agent-sandbox/pkg/router"
+	"sigs.k8s.io/agent-sandbox/pkg/safe"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 	"sigs.k8s.io/agent-sandbox/pkg/workloadmanager"
 )
@@ -396,11 +400,26 @@ func main() {
 	if k8s != nil {
 		apiServer.WithK8s(k8s)
 	}
+	apiServer.WithSafeWorkloads(workloadmanager.NewSafeWorkloadCreator(dynamicClient, mgr.GetClient()))
+
+	grants, err := startGrants(ctx, mgr.GetClient(), clientset, dynamicClient, apiServer, st, wmCfg.Namespace)
+	if err != nil {
+		log.Error("grant service init failed", "error", err)
+		os.Exit(1)
+	}
 
 	routerServer, err := router.New(ctx, routerCfg, st, clientset)
 	if err != nil {
 		log.Error("router init failed", "error", err)
 		os.Exit(1)
+	}
+	if grants != nil {
+		routerServer.WithGrants(grants)
+		apiServer.WithE2B(e2b.New(e2b.Options{
+			Grants:    grants,
+			Runner:    apiServer,
+			Namespace: grant.Namespace(wmCfg.Namespace),
+		}))
 	}
 
 	// Sandbox health watcher — exposes pod health as Prometheus metrics
@@ -431,4 +450,50 @@ func main() {
 		os.Exit(1)
 	}
 	log.Info("controlplane shutdown complete")
+}
+
+// startGrants serves the grant admin API from SandboxGrant CRs and reaps
+// expired grants. Claw remains the authority; this process keeps the
+// execution copy.
+func startGrants(ctx context.Context, cl ctrlclient.Client, clientset kubernetes.Interface, dyn dynamic.Interface, api *workloadmanager.Server, st store.Store, namespace string) (*grant.Service, error) {
+	dataKey, err := grant.DataKeyFromEnv()
+	if err != nil {
+		return nil, fmt.Errorf("GRANT_DATA_KEY: %w", err)
+	}
+	jwks, err := grant.JWKSFromEnv()
+	if err != nil {
+		return nil, fmt.Errorf("grant JWKS: %w", err)
+	}
+	var attest grant.AttestationChecker
+	if len(jwks) > 0 {
+		attest, err = grant.NewJWKSChecker(jwks)
+		if err != nil {
+			return nil, fmt.Errorf("grant JWKS: %w", err)
+		}
+	}
+	var identity grant.IdentityChecker
+	if url := os.Getenv("SAFE_API_URL"); url != "" {
+		identity = grant.NewSafeIdentityChecker(safe.NewClient(url))
+	}
+	var membership grant.MembershipChecker
+	if dyn != nil {
+		membership = grant.NewUserCRMembership(dyn)
+	}
+	ns := grant.Namespace(namespace)
+	svc := grant.New(grant.Options{
+		Client:     cl,
+		Namespace:  ns,
+		DataKey:    dataKey,
+		Authn:      grant.NewTokenReviewAuthenticator(clientset, grant.AllowedCallersFromEnv()),
+		Attest:     attest,
+		Identity:   identity,
+		Membership: membership,
+		Reclaimer:  workloadmanager.NewGrantReclaimer(api),
+		Exists:     workloadmanager.NewGrantExists(st),
+		Record:     api,
+	})
+	api.WithGrants(svc)
+	go svc.Run(ctx, 30*time.Second)
+	log.Info("grant service started", "namespace", ns)
+	return svc, nil
 }
