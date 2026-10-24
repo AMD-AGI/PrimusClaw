@@ -508,6 +508,11 @@ export async function retryTask(taskId: string, client?: PoolClient): Promise<Re
   // becomes a NULL-origin queued row the generic scheduler dispatches as an
   // ordinary task, over a payload only the A2A consumer understands.
   if (task.origin === "a2a") return { ok: false };
+  // An app run is more than its task row: the claw_app_runs row, the frozen
+  // manifest and the grant are made together by the app admission path, and the
+  // clone below makes none of them -- a queued twin with no grant, invisible to
+  // the one-active-run check. Only the app-aware path may start another run.
+  if (task.mode === "app") return { ok: false };
   // A replacement row does not rewire downstream depends_on IDs or reopen the
   // virtual root. Until attempts are modelled explicitly, reject DAG retries
   // instead of returning a task that can never repair the graph.
