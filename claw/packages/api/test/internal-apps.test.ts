@@ -320,6 +320,72 @@ const holdLease = (id: string) => q(
       assert.equal(r.last_exit, null);
     });
 
+    test("grant_expires_at is stored and read back; a bad value is refused and changes nothing", async () => {
+      taskId = await createRun(true);
+      const before = await get(`/v1/internal/app-runs/${taskId}`);
+      assert.equal(before.json().run.grant_revoked_at, null);
+      const T = "2026-03-01T12:00:00.000Z";
+      await q("UPDATE claw_app_runs SET grant_expires_at = '2026-02-01T00:00:00Z' WHERE task_id = $1", [taskId]);
+      const ok = await patch(brain({ grant_expires_at: T }));
+      assert.equal(ok.statusCode, 200, ok.body);
+      assert.equal(ok.json().run.grant_expires_at, T);
+      assert.equal(new Date((await row()).grant_expires_at).toISOString(), T);
+      for (const bad of ["tomorrow", "2026-13-45T00:00:00Z", 12345, null, ""]) {
+        const res = await patch(brain({ grant_expires_at: bad }));
+        assert.equal(res.statusCode, 400, `${JSON.stringify(bad)}: ${res.body}`);
+        assert.equal(res.json().error, "grant_expires_at_invalid");
+      }
+      assert.equal(new Date((await row()).grant_expires_at).toISOString(), T, "refusals changed nothing");
+      await q("UPDATE claw_app_runs SET grant_revoked_at = '2026-03-01T13:00:00Z' WHERE task_id = $1", [taskId]);
+      const rev = await get(`/v1/internal/app-runs/${taskId}`);
+      assert.equal(rev.json().run.grant_revoked_at, "2026-03-01T13:00:00.000Z");
+    });
+
+    test("a grant's expiry only moves later, and only for a live grant that has an expiry", async () => {
+      taskId = await createRun(true);
+      const T1 = "2026-03-01T12:00:00.000Z", T2 = "2026-03-02T12:00:00.000Z";
+      // A grant with no expiry does not lapse: nothing is set on it.
+      assert.equal((await row()).grant_expires_at, null);
+      const none = await patch(brain({ grant_expires_at: T1 }));
+      assert.equal(none.statusCode, 409, none.body);
+      assert.equal(none.json().error, "grant_refused");
+      assert.equal((await row()).grant_expires_at, null);
+      await q("UPDATE claw_app_runs SET grant_expires_at = $2 WHERE task_id = $1", [taskId, T1]);
+      for (const earlier of [T1, "2026-02-01T00:00:00.000Z"]) {
+        const res = await patch(brain({ grant_expires_at: earlier }));
+        assert.equal(res.statusCode, 409, `${earlier}: ${res.body}`);
+        assert.equal(res.json().error, "grant_refused");
+      }
+      assert.equal(new Date((await row()).grant_expires_at).toISOString(), T1);
+      assert.equal((await patch(brain({ grant_expires_at: T2 }))).statusCode, 200);
+      assert.equal(new Date((await row()).grant_expires_at).toISOString(), T2);
+    });
+
+    test("a run with no grant takes no expiry and records no revoke; a revoke is stamped once", async () => {
+      taskId = await createRun(false);
+      assert.equal((await row()).grant_id, null);
+      for (const body of [{ grant_expires_at: "2027-01-01T00:00:00.000Z" }, { grant_revoked: true }]) {
+        const res = await patch(brain(body));
+        assert.equal(res.statusCode, 409, JSON.stringify(body));
+        assert.equal(res.json().error, "grant_refused");
+      }
+      taskId = await createRun(true);
+      await q("UPDATE claw_app_runs SET grant_expires_at = '2026-03-01T00:00:00Z' WHERE task_id = $1", [taskId]);
+      const first = await patch(brain({ grant_revoked: true }));
+      assert.equal(first.statusCode, 200, first.body);
+      const stamp = (await row()).grant_revoked_at;
+      assert.ok(stamp);
+      assert.equal(first.json().run.grant_revoked_at, new Date(stamp).toISOString());
+      await new Promise((r) => setTimeout(r, 20));
+      assert.equal((await patch(brain({ grant_revoked: true }))).statusCode, 200);
+      assert.equal(new Date((await row()).grant_revoked_at).getTime(), new Date(stamp).getTime(), "stamped once");
+      // And once revoked, the expiry is not moved.
+      const later = await patch(brain({ grant_expires_at: "2030-01-01T00:00:00.000Z" }));
+      assert.equal(later.statusCode, 409);
+      assert.equal(later.json().error, "grant_refused");
+      assert.equal((await patch(brain({ grant_revoked: false }))).json().error, "grant_revoked_invalid");
+    });
+
     test("an unknown run is 404", async () => {
       const res = await app.inject({ method: "PATCH", url: "/v1/internal/app-runs/nope", headers: auth, payload: brain({ state: "starting" }) });
       assert.equal(res.statusCode, 404);

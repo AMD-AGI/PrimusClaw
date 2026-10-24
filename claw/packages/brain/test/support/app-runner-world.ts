@@ -75,12 +75,22 @@ export class World {
   starts: StartRecord[] = [];
   created: string[] = [];
   stopped: string[] = [];
+  /** The fake clock when each sandbox was stopped, in the same order as `stopped`. */
+  stoppedAt: number[] = [];
+  /** Park every exec matching `when` until `release()` (a Brain that is slow when told to let go). */
+  hold: { when: (cmd: string) => boolean; gate: Promise<void>; release: () => void } | null = null;
   patches: Array<{ patch: AppRunPatch; expect?: AppRunState }> = [];
   /** fail the next N execs matching this predicate, as a transport error */
   /** When set, the state directory expansion answers with this exit status. */
   stateDirExit: number | null = null;
   failExec: { left: number; when: (cmd: string) => boolean } | null = null;
   failStore: ((patch: AppRunPatch) => Error | null) | null = null;
+  /** SIGTERMs delivered to a live application, by workload. */
+  terms: string[] = [];
+  /** What the application does on SIGTERM; the default is to die at once without writing `final`. */
+  onTerm: ((wl: string) => void) | null = null;
+  /** Things that happen when the fake clock reaches a time (an app writing `final` mid-grace). */
+  private timers: Array<{ at: number; fn: () => void }> = [];
   private nextWl = 1;
   private nextPid = 100;
 
@@ -96,6 +106,8 @@ export class World {
       manifest,
       grant_id: null,
       grant_limits: null,
+      grant_expires_at: null,
+      grant_revoked_at: null,
       created_at: new Date(T0).toISOString(),
       input: { image: "img:1", knobs: { mode: "from-input", count: 3 } },
       sandbox_spec: { handle: "app", image: "img:1" } as never,
@@ -104,8 +116,20 @@ export class World {
     };
   }
 
+  holdExecs(when: (cmd: string) => boolean): void {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    this.hold = { when, gate, release };
+  }
+
   now = (): number => this.clock;
-  sleep = async (ms: number): Promise<void> => { this.clock += ms; };
+  sleep = async (ms: number): Promise<void> => {
+    this.clock += ms;
+    for (const t of this.timers.filter((x) => x.at <= this.clock)) { this.timers.splice(this.timers.indexOf(t), 1); t.fn(); }
+  };
+
+  /** Run `fn` when the fake clock first reaches `atMs` (checked at every sleep). */
+  at(atMs: number, fn: () => void): void { this.timers.push({ at: atMs, fn }); }
 
   /** The application writes `exit.json` and exits. */
   appExits(wl: string, exit?: Record<string, unknown> | string): void {
@@ -137,7 +161,8 @@ export class World {
       if (injected) throw injected;
       if (this.rec.state === "ended") throw new AppRunWriteRefused("ended", "ended");
       if (expect && this.rec.state !== expect) throw new AppRunWriteRefused("state_mismatch", this.rec.state);
-      this.rec = { ...this.rec, ...patch } as AppRunRecord;
+      const { grant_revoked, ...fields } = patch;
+      this.rec = { ...this.rec, ...fields, ...(grant_revoked ? { grant_revoked_at: new Date(this.now()).toISOString() } : {}) } as AppRunRecord;
       return structuredClone(this.rec);
     },
     secrets: async (): Promise<AppRunSecrets> => ({ mcp_token: TOKEN, grant_keys: { measurement: KEY_M } }),
@@ -164,7 +189,7 @@ export class World {
         : { running: false, healthy: false, state: phase };
     },
     exec: async (inst, command, _timeout, opts) => this.exec(inst.id, command, opts),
-    stop: async (inst) => { this.stopped.push(inst.id); this.killWorkload(inst.id, "terminal"); },
+    stop: async (inst) => { this.stopped.push(inst.id); this.stoppedAt.push(this.clock); this.killWorkload(inst.id, "terminal"); },
     liveIds: async () => [...this.workloads].filter(([, p]) => p === "running").map(([id]) => id),
     nodeName: async () => "node-7",
   };
@@ -175,6 +200,7 @@ export class World {
 
   private async exec(wl: string, command: string, opts?: SandboxExecOptions) {
     this.execs.push({ wl, command, env: { ...(opts?.env ?? {}) }, untracked: opts?.untracked === true });
+    if (this.hold?.when(command)) await this.hold.gate;
     if (this.failExec && this.failExec.left > 0 && this.failExec.when(command)) {
       this.failExec.left -= 1;
       throw new Error("transport error");
@@ -190,6 +216,16 @@ export class World {
       const path = /> '([^']+)'\.tmp/.exec(command)![1]!;
       this.files.set(path, Buffer.from(opts!.env!.CLAW_FILE_B64!, "base64").toString("utf8"));
       return ok();
+    }
+    if (command.includes("kill -TERM")) {
+      const want = /= '([^']*)'/.exec(command)![1]!;
+      if (this.files.get(`${dir}/app.sandbox`) !== want) return ok("none\n");
+      const pid = this.files.get(`${dir}/app.pid`);
+      if (pid !== undefined && this.procs.has(`${wl}:${pid}`)) {
+        this.terms.push(wl);
+        if (this.onTerm) this.onTerm(wl); else this.appExits(wl);
+      }
+      return ok("sent\n");
     }
     if (command.includes("echo none")) {
       const want = /!= '([^']*)'/.exec(command)![1]!;

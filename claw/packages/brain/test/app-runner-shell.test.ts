@@ -73,7 +73,7 @@ test("a real run: input and bootstrap are written, the env reaches the process, 
     'env | grep "^APP_" | sort > "$APP_STATE_DIR/env.txt"; echo "$0 $1" > "$APP_STATE_DIR/argv.txt"; sleep 0.5; printf \'{"final":true,"returncode":0}\' > "$APP_STATE_DIR/exit.json"',
   );
   const result = await w.runner.run(SECS(30));
-  assert.deepEqual(result, { kind: "ended", outcome: { success: true, reason: "app finished" } });
+  assert.deepEqual(result, { kind: "ended", outcome: { success: true, reason: "app finished", captures: { session_dir: w.stateDir } } });
   assert.equal(w.world.rec.state, "ended");
 
   assert.equal(readFileSync(`${w.stateDir}/input.json`, "utf8"), JSON.stringify(w.world.rec.input));
@@ -119,7 +119,7 @@ test("a crash without final restarts, and the second run finishes it, for real",
     'echo run >> "$APP_STATE_DIR/starts.txt"; if [ -f "$APP_STATE_DIR/crashed" ]; then printf \'{"final":true,"returncode":0}\' > "$APP_STATE_DIR/exit.json"; else touch "$APP_STATE_DIR/crashed"; exit 9; fi',
   );
   const result = await w.runner.run(SECS(40));
-  assert.deepEqual(result, { kind: "ended", outcome: { success: true, reason: "app finished" } });
+  assert.deepEqual(result, { kind: "ended", outcome: { success: true, reason: "app finished", captures: { session_dir: w.stateDir } } });
   assert.equal(w.world.rec.restarts, 1);
   assert.equal(readFileSync(`${w.stateDir}/starts.txt`, "utf8").trim().split("\n").length, 2);
 });

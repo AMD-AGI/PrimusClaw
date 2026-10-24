@@ -29,6 +29,17 @@ export interface AppLastExit {
    * `final` just before it went. Nothing is started in it.
    */
   recovery?: boolean;
+  /**
+   * Finishing: when SIGTERM was sent to the application. Present means the
+   * signal went out, so a Brain that takes the run over keeps waiting out the
+   * same `stop_grace_sec` instead of signalling again and starting a new wait.
+   */
+  stop_at?: string;
+  /**
+   * Finishing steps that are done, by name. Kept on the row so a Brain that
+   * takes a finishing run over does not repeat one (the grant is revoked once).
+   */
+  finish_done?: string[];
 }
 
 export interface AppRunRecord {
@@ -42,6 +53,10 @@ export interface AppRunRecord {
   manifest: AppManifestV1;
   grant_id: string | null;
   grant_limits: Record<string, unknown> | null;
+  /** ISO time the grant lapses; null when it has no expiry or none was issued. */
+  grant_expires_at: string | null;
+  /** ISO time the grant was revoked; set means it is never extended. */
+  grant_revoked_at: string | null;
   created_at: string;
   input: Record<string, unknown>;
   sandbox_spec: SandboxSpecCreate | null;
@@ -59,6 +74,9 @@ export interface AppRunPatch {
   last_exit?: AppLastExit | null;
   state_dir?: string;
   sandbox_workload_id?: string | null;
+  grant_expires_at?: string;
+  /** Record that the grant was revoked, so it is never extended. */
+  grant_revoked?: true;
 }
 
 export interface AppRunStore {
