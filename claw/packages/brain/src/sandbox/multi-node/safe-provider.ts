@@ -30,7 +30,7 @@ import {
 } from "./prompt-flags.js";
 import { multiNodeWorkloadName } from "../workload-naming.js";
 import { SandboxProvisionTerminalError } from "../errors.js";
-import { TERMINAL_PHASES, waitForWorkloadReady, type WorkloadWaitDeps } from "../workload-wait.js";
+import { ACTIVE_PHASES, TERMINAL_PHASES, waitForWorkloadReady, type WorkloadWaitDeps } from "../workload-wait.js";
 import { parseWorkloadListPage, type WorkloadRef } from "./workload-parse.js";
 import {
   buildInferaWorkloadBody,
@@ -68,28 +68,6 @@ const SESSION_PAGE_SIZE = 200;
  * clean.
  */
 const SESSION_MAX_PAGES = 20;
-
-/**
- * SaFE's non-terminal WorkloadPhase values, in SaFE's own casing.
- *
- * Sent to the list endpoint so a session's finished workloads stay out of both the
- * page and its totalCount. Nothing ever removes them from that list -- a sandbox is
- * retired with `stop`, which only moves it to `Stopped`, and only an actual DELETE
- * sets `is_deleted` -- so unfiltered they accumulate for the life of a session.
- *
- * A whitelist over a closed set: WorkloadPhase in SaFE's api package
- * (apis/pkg/apis/amd/v1/workload_types.go) defines exactly Succeeded, Failed,
- * Pending, Running, Updating, NotReady and Stopped, and the four non-terminal ones
- * are listed here.
- *
- * It has to be updated alongside that enum, in a different repository, and getting
- * that wrong is silent: a new non-terminal phase left out would be filtered from
- * the page AND from totalCount, so the shortfall check -- which compares exactly
- * those two -- could not notice it either. The session would report clean and its
- * clusters would run to the workload's own timeout. The client-side TERMINAL_PHASES
- * skip stays for that reason, covering the case where this filter does not apply.
- */
-const ACTIVE_PHASES = "Pending,Running,Updating,NotReady";
 
 /**
  * SaFE kinds that are GPU clusters. Used to spare the session's own sandbox,
@@ -772,6 +750,7 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
       name: workloadId,
       namespace,
       nodeCount: spec.nodes,
+      gpusPerNode: spec.gpusPerNode,
       serviceUrl: "",
     };
 

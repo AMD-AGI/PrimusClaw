@@ -36,12 +36,17 @@ import {
   resourcesMapToWorkloadArray,
   assertImageDigest,
   applyMultiNodeExternalEnv,
+  writeTopologyHandoff,
+  hasSshKeyFile,
 } from "./params.js";
 import type { SandboxAction } from "./params.js";
 import { resourcesJsonToWorkloadArray } from "./workload-resources.js";
 import type { MultiNodeContext } from "./multi-node/types.js";
 import { writeSandboxSshKey } from "./multi-node/sandbox-key.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
+import {
+  DEFAULT_SANDBOX_TTL_SEC, composeSandboxLabels, createSafeWorkloadSandbox,
+} from "./create-sandbox.js";
 import { dagHoldsWorkload, handleIdentityKey, lookupDagHandle, releaseHandlesForWorkload, replaceDagHandle, workloadHeldByOtherDag } from "./handles.js";
 import { getHandsKv, registerHandsToken } from "./registry.js";
 import { bootstrapHandsInSandbox, HANDS_LOG_PATH, HANDS_STATE_DIR } from "./bootstrap.js";
@@ -70,8 +75,6 @@ import { pingTargetIdentity } from "./keepalive.js";
 
 const logger = pino({ name: "ensure-hands" });
 const sc = StringCodec();
-/** Idle TTL create falls back to when the spec names none. */
-const DEFAULT_SANDBOX_TTL_SEC = 10;
 const SANDBOX_IMAGE_RE = /(?:^|\s)sandboximage:\s*(\S+)/im;
 
 export function resolveSandboxImageFromRequest(request: ExecuteRequest): string {
@@ -2630,7 +2633,6 @@ async function provisionHands(
     ...(action.params.env ?? {}),
     AUTH_CLAW_TOKEN: handsToken,
     CLAW_SESSION_ID: sessionId,
-    INFERENCE_OPTIMIZER_SESSION_LAYOUT: "per_model_ts",
     MCP_PORT: mcpPort,
     WORKSPACE_PATH: "/workspace",
     SAFE_API_URL: SAFE_API_URL,
@@ -2680,16 +2682,17 @@ async function provisionHands(
   const nsForSandbox = sandboxNamespaceFor(request);
   // Sweeper relies on `dag-root` + `sandbox-handle` to reconcile orphan
   // workloads against the DagHandleMap KV (see task-design.md §9.4 sweeper).
-  const labels: Record<string, string> = {
-    "primus-claw/session-id": sessionId,
-    "primus-claw/component": "hands",
-    "primus-claw/plugin-id": request.plugin_id != null ? String(request.plugin_id) : "",
-    "primus-claw/dag-root": request.dag_root_task_id ?? request.task_id ?? "",
-    "primus-claw/dag-node": request.dag_node_id ?? "single",
-    "primus-claw/sandbox-handle": action.handle,
-    "team": "primus-claw",
-    ...(action.params.labels ?? {}),
-  };
+  const labels = composeSandboxLabels({
+    sessionId,
+    component: "hands",
+    own: {
+      "primus-claw/plugin-id": request.plugin_id != null ? String(request.plugin_id) : "",
+      "primus-claw/dag-root": request.dag_root_task_id ?? request.task_id ?? "",
+      "primus-claw/dag-node": request.dag_node_id ?? "single",
+      "primus-claw/sandbox-handle": action.handle,
+    },
+    extra: action.params.labels,
+  });
   const ttlSeconds = action.params.ttl_sec ?? DEFAULT_SANDBOX_TTL_SEC;
   // Business timeout = the sandbox's max RUNNING lifetime (seconds). It is
   // forwarded to SaFE, whose timeout is counted from Status.StartTime (written
@@ -2731,7 +2734,7 @@ async function provisionHands(
 
   let inst;
   try {
-    inst = await getSafeWorkloadProvider().create({
+    inst = await createSafeWorkloadSandbox({
       sessionId,
       namespace: nsForSandbox,
       image: workloadImage,
@@ -2798,13 +2801,29 @@ async function provisionHands(
 
   // infera drives its GPU pods over SSH, so the key Brain derived for this
   // cluster has to exist as a file here before the optimizer runs.
-  if (multiNodeContext?.sshPrivateKey && multiNodeContext.sshKeyPath) {
+  if (multiNodeContext && hasSshKeyFile(multiNodeContext)) {
     await writeSandboxSshKey(
       (cmd, t) => getSafeWorkloadProvider().exec(inst, cmd, t, undefined, { untracked: true }),
-      multiNodeContext.sshKeyPath,
-      multiNodeContext.sshPrivateKey,
+      multiNodeContext.sshKeyPath!,
+      multiNodeContext.sshPrivateKey!,
     );
     logger.info({ sessionId, workloadId, keyPath: multiNodeContext.sshKeyPath }, "ensureHands.mn_ssh_key_written");
+  }
+
+  // The topology handoff goes after the key it points at, outside the synced
+  // workspace. During the transition the legacy env is sufficient on its own, so
+  // a write failure is a warning, not a failed sandbox. Only paths are logged.
+  if (multiNodeContext) {
+    const r = await writeTopologyHandoff(
+      (cmd, t) => getSafeWorkloadProvider().exec(inst, cmd, t, undefined, { untracked: true }),
+      multiNodeContext,
+      env,
+    );
+    if (r.written) {
+      logger.info({ sessionId, workloadId, topologyFile: env.TOPOLOGY_HANDOFF_FILE }, "ensureHands.mn_topology_written");
+    } else {
+      logger.warn({ sessionId, workloadId, err: r.error }, "ensureHands.mn_topology_write_failed");
+    }
   }
 
   // Store in NATS KV (shared across Brain instances).
@@ -3535,12 +3554,9 @@ async function ensureHandsAgentSandbox(
   if (ANTHROPIC_BASE_URL) env.ANTHROPIC_BASE_URL = ANTHROPIC_BASE_URL;
   if (OPENAI_BASE_URL) env.OPENAI_BASE_URL = OPENAI_BASE_URL;
 
-  const labels: Record<string, string> = {
-    "primus-claw/session-id": sessionId,
-    "primus-claw/component": "hands",
-    "team": "primus-claw",
-    ...(action.params.labels ?? {}),
-  };
+  const labels = composeSandboxLabels({
+    sessionId, component: "hands", extra: action.params.labels,
+  });
 
   await onEvent({ type: "sandboxStatus", event: "phase", phase: "Creating", status: "creating", log: "" });
   // Claimed before the provider is called, so two provisions racing the last

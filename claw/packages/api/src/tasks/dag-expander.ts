@@ -21,7 +21,7 @@ import {
 } from "./admission.js";
 import { insertEdge, insertTask } from "./db.js";
 import { newTaskId } from "./ids.js";
-import { gpuNodesFromSpec, topologyErrors } from "./run-spec.js";
+import { appGpuNodesFromSpec, gpuNodesFromSpec, topologyErrors } from "./run-spec.js";
 import type { DagNode, NodeSandbox, TaskDagDef } from "./dags/types.js";
 
 // The URL Brain (and other workers) should call back into for agent_done /
@@ -355,12 +355,21 @@ export async function createSingleTask(opts: {
   plugin_id?: number | null;
   input?: Record<string, unknown>;
   prompt?: string;
-  mode?: "llm" | "script";
+  mode?: "llm" | "script" | "app";
   sandbox_spec?: unknown;
+  /** SaFE workspace the run's sandbox lands in; the session's own when absent. */
+  workspace_id?: string | null;
   workspace_throwaway?: boolean;
+  /** Use this id instead of generating one (the app run issues its grant for it first). */
+  task_id?: string;
 }, client?: PoolClient): Promise<{ task_id: string } | CreateRefusal> {
   const input = opts.input ?? {};
-  const invalid = topologyErrors(input);
+  // An app's input is the application's own document: Claw does not read it,
+  // so a key that happens to be called
+  // `topology` is not a declared topology and must not be validated or counted
+  // as one.
+  const isApp = opts.mode === "app";
+  const invalid = isApp ? null : topologyErrors(input);
   if (invalid) return { admitted: false, invalidTopology: invalid };
   if (!client && anyAdmissionCeilingSet(envAdmitLimits())) {
     return await withOwnedAdmissionLock((ownedClient) => createSingleTask(opts, ownedClient));
@@ -371,12 +380,12 @@ export async function createSingleTask(opts: {
     origin: "task",
     newRunRoots: 1,
     sandboxes: opts.sandbox_spec != null && JSON.stringify(opts.sandbox_spec) !== '"none"' ? 1 : 0,
-    gpuNodes: gpuNodesFromSpec(input),
+    gpuNodes: isApp ? appGpuNodesFromSpec(opts.sandbox_spec) : gpuNodesFromSpec(input),
   };
   const decision = await decideAdmission(ask, client ?? db);
   if (decision.kind === "reject") return { admitted: false, reason: decision.reason };
 
-  const tid = newTaskId();
+  const tid = opts.task_id ?? newTaskId();
   await insertTask({
     task_id: tid,
     session_id: opts.session_id,
@@ -389,6 +398,7 @@ export async function createSingleTask(opts: {
     executor: "brain",
     mode: opts.mode ?? "llm",
     workspace_throwaway: opts.workspace_throwaway ?? false,
+    workspace_id: opts.workspace_id ?? null,
     sandbox_spec: opts.sandbox_spec,
     callback_url: `${INTERNAL_BACKEND_URL}/v1/internal/tasks/${tid}`,
     backend_mcp_url: `${INTERNAL_BACKEND_URL}/v1/internal/tasks/${tid}/backend-mcp`,

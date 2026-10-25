@@ -578,8 +578,8 @@ const IDEM_LOCK_TIMEOUT_MS = Number(process.env.IDEM_LOCK_TIMEOUT_MS) || 15000;
 // After lock_timeout, briefly poll the idempotency cache (holding NO connection)
 // to catch a holder that finishes just after our wait expired, before failing
 // transiently. Tries × interval bounds the extra latency on the slow path only.
-const IDEM_BUSY_POLL_MS = Number(process.env.IDEM_BUSY_POLL_MS) || 200;
-const IDEM_BUSY_POLL_TRIES = Number(process.env.IDEM_BUSY_POLL_TRIES) || 5;
+export const IDEM_BUSY_POLL_MS = Number(process.env.IDEM_BUSY_POLL_MS) || 200;
+export const IDEM_BUSY_POLL_TRIES = Number(process.env.IDEM_BUSY_POLL_TRIES) || 5;
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 // A (singleflight): in-process de-dup of concurrent same-key creates, keyed by
 // `${userId}:${route}:${idemKey}`. The first request runs the create; all
@@ -588,7 +588,7 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 // entry is always removed in the leader's finally, bounding the map's size.
 const inflightCreates = new Map<string, Promise<FlightResult>>();
 
-interface IdempotencyHit {
+export interface IdempotencyHit {
   statusCode: number;
   response: unknown;
 }
@@ -597,13 +597,13 @@ interface QueryRunner {
   query: typeof db.query;
 }
 
-interface IdempotencyLock {
+export interface IdempotencyLock {
   client: PoolClient;
   lockScope: string;
   key: string;
 }
 
-function extractIdempotencyKey(req: { headers: Record<string, unknown> }): string | null {
+export function extractIdempotencyKey(req: { headers: Record<string, unknown> }): string | null {
   const raw = req.headers["idempotency-key"] ?? req.headers["Idempotency-Key"];
   if (typeof raw !== "string") return null;
   const k = raw.trim();
@@ -637,7 +637,7 @@ function isClientGone(req: FastifyRequest): boolean {
  * client before it creates anything -- see execute() -- and again before it
  * writes the key's cache entry.
  */
-async function acquireIdempotencyLock(
+export async function acquireIdempotencyLock(
   userId: string,
   route: string,
   key: string,
@@ -657,7 +657,7 @@ async function acquireIdempotencyLock(
 }
 
 /** Release the per-key advisory lock and return the pooled client. */
-async function releaseIdempotencyLock(lock: IdempotencyLock): Promise<void> {
+export async function releaseIdempotencyLock(lock: IdempotencyLock): Promise<void> {
   try {
     await lock.client.query("SELECT pg_advisory_unlock(hashtext($1), hashtext($2))", [lock.lockScope, lock.key]);
     lock.client.release();
@@ -670,7 +670,7 @@ async function releaseIdempotencyLock(lock: IdempotencyLock): Promise<void> {
   }
 }
 
-async function readIdempotency(
+export async function readIdempotency(
   client: QueryRunner,
   userId: string,
   route: string,
@@ -928,7 +928,7 @@ async function saveIdempotency(
  * Best-effort either way: a create the client already completed is not failed
  * because the note about it did not land.
  */
-async function saveIdempotencyBestEffort(
+export async function saveIdempotencyBestEffort(
   lock: IdempotencyLock,
   userId: string,
   route: string,

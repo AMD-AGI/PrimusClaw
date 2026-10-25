@@ -2544,6 +2544,26 @@ export async function reapOrphanHandles(lease?: LeaderLease): Promise<number> {
           deferred++;
           continue;
         }
+        if (bg.workSeenAt !== undefined) {
+          // The bound below is for a fleet that never measures. This sandbox
+          // WAS measured in this idle period and had live work; the verdict is
+          // missing because the probe stopped getting answers (a NotReady node,
+          // a network partition), and that is unknown, not empty. Kubernetes
+          // does not delete a pod because its node stopped reporting. Keep it
+          // and ask again next tick. This is not a new unbounded hold: a
+          // sandbox that answers again gets a verdict this sweep acts on, Brain's
+          // keepalive still expires a handle it finds gone or idle past its
+          // reuse window, and the workload's own maximum lifetime still ends it.
+          logger.warn(
+            {
+              dagRoot, sessionId, workloadId: bg.workloadId, sinceMs: bg.sinceMs,
+              workSeenAt: bg.workSeenAt,
+            },
+            "sweeper.orphan_handles_background_unreachable",
+          );
+          deferred++;
+          continue;
+        }
         logger.warn(
           {
             dagRoot, sessionId, workloadId: bg.workloadId, sinceMs: bg.sinceMs,

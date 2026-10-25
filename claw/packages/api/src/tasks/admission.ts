@@ -22,10 +22,12 @@ import {
   ADMIT_TREE_MAX_DEPTH,
   ADMIT_TREE_MAX_NODES,
 } from "../config.js";
+import { APP_GPU_COUNT_PATTERN, APP_GPU_RESOURCE } from "@claw/protocol";
 import { PG_INT4_MAX } from "@claw/utils";
 
 import { db, type StatementRunner } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
+import { appGpuNodesFromSpec } from "./run-spec.js";
 import type { ClawTaskRow } from "./types.js";
 
 const logger = pino({ name: "admission" });
@@ -253,17 +255,13 @@ export async function loadUsageAhead(
        COUNT(DISTINCT COALESCE(t.dag_root_task_id, t.task_id))::int AS run_roots,
        COUNT(*) FILTER (WHERE ${SANDBOX_ROW_SQL.replace(/\b(sandbox_spec|metadata)\b/g, "t.$1")})::int
          AS sandboxes,
-       LEAST(COALESCE(SUM(
-         CASE WHEN jsonb_typeof(t.input->'topology'->'nodes') = 'number'
-              THEN LEAST((t.input->'topology'->>'nodes')::numeric, ${PG_INT4_MAX})
-              ELSE 0 END
-       ), 0), ${PG_INT4_MAX})::int AS gpu_nodes
+       LEAST(COALESCE(SUM(${gpuNodesSql("t.", "$3", "$4")}), 0), ${PG_INT4_MAX})::int AS gpu_nodes
      FROM claw_tasks t, self
       WHERE t.executor = 'brain'
         AND t.status = ANY($1::text[])
         AND t.task_id <> self.task_id
         AND (t.created_at, t.task_id) < (self.created_at, self.task_id)`,
-    [OCCUPYING, taskId],
+    [OCCUPYING, taskId, APP_GPU_RESOURCE, APP_GPU_COUNT_PATTERN],
   );
   const row = (r.rows[0] ?? {}) as { run_roots?: number; sandboxes?: number; gpu_nodes?: number };
   return {
@@ -421,14 +419,27 @@ const SANDBOX_ROW_SQL = `sandbox_spec IS NOT NULL AND sandbox_spec::text <> '"no
  * admission. `COALESCE` around the `SUM` because `LEAST` ignores NULL and would
  * read an empty set as the cap.
  */
-function gpuSumSql(statusParam: string): string {
-  return `LEAST(COALESCE(SUM(
-         CASE
-           WHEN status = ANY(${statusParam}::text[])
-            AND jsonb_typeof(input->'topology'->'nodes') = 'number'
-           THEN LEAST((input->'topology'->>'nodes')::numeric, ${PG_INT4_MAX})
+/**
+ * The GPU nodes one `claw_tasks` row holds, in SQL; the single rule both the
+ * running totals ({@link gpuSumSql}) and the rows-ahead count
+ * ({@link loadUsageAhead}) use, so the two cannot disagree. An app run's demand
+ * is its sandbox spec's (one node when it asks for any GPUs): its input is the
+ * app's own document and is never read. Every other row is its declared
+ * `topology.nodes`. `prefix` is a table alias with its dot, or "".
+ */
+function gpuNodesSql(prefix: string, keyParam: string, patternParam: string): string {
+  return `CASE
+           WHEN ${prefix}mode = 'app'
+           THEN CASE WHEN ${prefix}sandbox_spec->'resources'->>${keyParam}::text ~ ${patternParam}::text THEN 1 ELSE 0 END
+           WHEN jsonb_typeof(${prefix}input->'topology'->'nodes') = 'number'
+           THEN LEAST((${prefix}input->'topology'->>'nodes')::numeric, ${PG_INT4_MAX})
            ELSE 0
-         END
+         END`;
+}
+
+function gpuSumSql(statusParam: string, keyParam: string, patternParam: string): string {
+  return `LEAST(COALESCE(SUM(
+         CASE WHEN status = ANY(${statusParam}::text[]) THEN ${gpuNodesSql("", keyParam, patternParam)} ELSE 0 END
        ), 0), ${PG_INT4_MAX})::int`;
 }
 
@@ -460,12 +471,12 @@ export async function loadUsage(client?: StatementRunner): Promise<AdmissionUsag
          AS sandboxes,
        COUNT(*) FILTER (WHERE status = ANY($2::text[]) AND (${SANDBOX_ROW_SQL}))::int
          AS executing_sandboxes,
-       ${gpuSumSql("$1")} AS gpu_nodes,
-       ${gpuSumSql("$2")} AS executing_gpu_nodes
+       ${gpuSumSql("$1", "$3", "$4")} AS gpu_nodes,
+       ${gpuSumSql("$2", "$3", "$4")} AS executing_gpu_nodes
      FROM claw_tasks
      WHERE executor = 'brain'
        AND status = ANY($1::text[])`,
-    [OCCUPYING, EXECUTING],
+    [OCCUPYING, EXECUTING, APP_GPU_RESOURCE, APP_GPU_COUNT_PATTERN],
   );
   return usageFromRow((r.rows[0] ?? {}) as UsageRow);
 }
@@ -603,8 +614,8 @@ export async function loadUsageWithRoots(
          AS sandboxes,
        COUNT(*) FILTER (WHERE status = ANY($2::text[]) AND (${SANDBOX_ROW_SQL}))::int
          AS executing_sandboxes,
-       ${gpuSumSql("$1")} AS gpu_nodes,
-       ${gpuSumSql("$2")} AS executing_gpu_nodes,
+       ${gpuSumSql("$1", "$4", "$5")} AS gpu_nodes,
+       ${gpuSumSql("$2", "$4", "$5")} AS executing_gpu_nodes,
        COALESCE(
          array_agg(DISTINCT COALESCE(dag_root_task_id, task_id))
            FILTER (WHERE status = ANY($3::text[])),
@@ -613,7 +624,7 @@ export async function loadUsageWithRoots(
      FROM claw_tasks
      WHERE executor = 'brain'
        AND status = ANY($1::text[])`,
-    [OCCUPYING, EXECUTING, scopeStatuses],
+    [OCCUPYING, EXECUTING, scopeStatuses, APP_GPU_RESOURCE, APP_GPU_COUNT_PATTERN],
   );
   const row = (r.rows[0] ?? {}) as UsageRow & { scope_roots?: string[] };
   return { usage: usageFromRow(row), roots: new Set(row.scope_roots ?? []) };
@@ -643,6 +654,8 @@ function rowWantsSandbox(row: ClawTaskRow): boolean {
 // The SQL's `jsonb_typeof(...) = 'number'` guard, in TypeScript: an ask that
 // counts what the aggregate does not is an ask compared against nothing.
 function rowGpuNodes(row: ClawTaskRow): number {
+  // An app run's GPU demand is its sandbox spec's; its input is opaque and is not read.
+  if (row.mode === "app") return appGpuNodesFromSpec(row.sandbox_spec);
   const topology = (row.input as { topology?: { nodes?: unknown } } | null)?.topology;
   const nodes = topology?.nodes;
   if (typeof nodes !== "number" || !Number.isInteger(nodes) || nodes <= 0) return 0;

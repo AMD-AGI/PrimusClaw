@@ -47,8 +47,8 @@ var shutdownHardExitGrace = 2 * time.Second
 type Server struct {
 	workspace     string
 	port          int
-	auth          *authManager       // Phase 3: JWT auth manager (nil publicKey = auth disabled)
-	inference     *inferenceKeyCache // §4.2: caches inference API Key from WM (one-time fetch)
+	auth          *authManager    // Phase 3: JWT auth manager (nil publicKey = auth disabled)
+	session       *sessionContext // sandbox id + Router JWT captured from the first request
 	tmuxWidth     int
 	tmuxHeight    int
 	egressProxy   *egress.TransparentProxy // §4.1: transparent proxy for outbound traffic control
@@ -105,7 +105,7 @@ func New(cfg Config) (*Server, error) {
 		workspace:     cfg.Workspace,
 		port:          cfg.Port,
 		auth:          am,
-		inference:     newInferenceKeyCache(),
+		session:       newSessionContext(),
 		tmuxWidth:     cfg.TMuxWidth,
 		tmuxHeight:    cfg.TMuxHeight,
 		egressEnabled: cfg.EgressEnabled,
@@ -130,7 +130,7 @@ func New(cfg Config) (*Server, error) {
 		if err != nil {
 			return nil, fmt.Errorf("init egress proxy: %w", err)
 		}
-		reporter := newEgressAuditReporter(s.inference)
+		reporter := newEgressAuditReporter(s.session)
 		s.auditReporter = reporter
 		s.egressProxy = proxy.WithEventReporter(reporter)
 	}
@@ -213,18 +213,15 @@ func (s *Server) Handler() http.Handler {
 	return root
 }
 
-// sessionCaptureMiddleware captures the session ID and Router JWT from the incoming
-// request headers. The JWT is reused by EnvD to authenticate against WM's internal
-// policy API (replacing the previous static INTERNAL_API_TOKEN approach); the
-// Router signs a fresh one for every request, and the newest is kept.
+// sessionCaptureMiddleware captures the sandbox id and Router JWT from the
+// incoming request headers. The JWT is reused by EnvD to authenticate against
+// WM's internal APIs (replacing the previous static INTERNAL_API_TOKEN approach);
+// the Router signs a fresh one for every request, and the newest is kept.
 // Runs after jwtMiddleware — the Authorization header is still readable.
-//
-// IMPORTANT: JWT must be captured BEFORE setSessionID, because setSessionID
-// triggers the policy fetch goroutine which needs the JWT for WM authentication.
 func (s *Server) sessionCaptureMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-			s.inference.setJWTToken(auth[len("Bearer "):])
+			s.session.setJWTToken(auth[len("Bearer "):])
 		}
 		// With a verification key the session comes from the token
 		// jwtMiddleware verified, not from a header anyone could have set.
@@ -233,7 +230,7 @@ func (s *Server) sessionCaptureMiddleware(next http.Handler) http.Handler {
 			sid = verified
 		}
 		if sid != "" {
-			s.inference.setSessionID(sid)
+			s.session.setSessionID(sid)
 		}
 		if s.auditReporter != nil {
 			s.auditReporter.wake()
@@ -348,15 +345,15 @@ func (s *Server) startWMSync(ctx context.Context) {
 
 func (s *Server) runPolicySync(ctx context.Context, updater allowedInternalUpdater) {
 	log.Info("egress: policy syncer waiting for session ID from first request...")
-	if !s.inference.waitForReady(ctx) {
+	if !s.session.waitForReady(ctx) {
 		return
 	}
-	if s.inference.getWMURL() == "" {
+	if s.session.getWMURL() == "" {
 		log.Warn("egress: policy syncer not started (no WM URL)")
 		return
 	}
-	log.Info("egress: starting policy syncer", "sessionId", s.inference.getSessionID())
-	NewPolicySyncer(s.policyEngine, updater, s.inference).Run(ctx)
+	log.Info("egress: starting policy syncer", "sessionId", s.session.getSessionID())
+	NewPolicySyncer(s.policyEngine, updater, s.session).Run(ctx)
 }
 
 // handleHealth handles GET /health

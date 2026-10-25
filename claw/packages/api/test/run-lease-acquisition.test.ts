@@ -151,7 +151,7 @@ after(async () => {
 
 beforeEach(async () => {
   if (skip) return;
-  await observer.query("TRUNCATE claw_tasks");
+  await observer.query("TRUNCATE claw_tasks, claw_app_runs");
 });
 
 describe("acceptance of a fat row nobody holds", () => {
@@ -322,7 +322,7 @@ describe("renewal", () => {
     await seed({ taskId: "t-1", leaseOwner: null, leaseIn: 5, fenced: true, claimCount: 1 });
     assert.equal((await renew("t-1", "brain-7", 1)).status, 409);
 
-    await observer.query("TRUNCATE claw_tasks");
+    await observer.query("TRUNCATE claw_tasks, claw_app_runs");
     await seed({ taskId: "t-1", leaseOwner: "brain-9", leaseIn: 5, fenced: true, claimCount: 1 });
     assert.equal((await renew("t-1", "brain-7", 1)).status, 409);
   });

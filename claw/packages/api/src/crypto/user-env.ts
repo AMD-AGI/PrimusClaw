@@ -65,6 +65,15 @@ function getKey(): Buffer {
 }
 
 /**
+ * The boot-validated master key, for callers that seal with `@claw/utils`
+ * (which binds a blob to its owner through AAD) instead of the helpers below.
+ * Same key, same lifecycle: there is no second secret to provision or rotate.
+ */
+export function userEnvMasterKey(): Buffer {
+  return getKey();
+}
+
+/**
  * Encrypt a plaintext value and return the base64-encoded storage blob.
  * Each call uses a fresh random nonce — never reuse for the same key.
  */

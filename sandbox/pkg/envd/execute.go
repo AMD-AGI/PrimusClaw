@@ -248,19 +248,11 @@ func (s *Server) handleExecuteStream(w http.ResponseWriter, r *http.Request) {
 }
 
 // buildChildEnv constructs the environment for a child process.
-// Inherits the current process env, applies user overrides, and injects
-// OPENAI_API_KEY from the policy puller if available (§4.2 unified inference gateway).
+// Inherits the current process env and applies the caller's overrides. Any
+// credential a command needs is supplied by the caller, per request.
 func (s *Server) buildChildEnv(userEnv map[string]string) []string {
 	env := os.Environ()
 
-	// Inject inference API Key (only if not already set by the user)
-	if _, userSet := userEnv["OPENAI_API_KEY"]; !userSet {
-		if apiKey := s.inference.getApiKey(); apiKey != "" {
-			env = append(env, "OPENAI_API_KEY="+apiKey)
-		}
-	}
-
-	// Apply user-provided overrides last (highest priority)
 	for k, v := range userEnv {
 		env = append(env, k+"="+v)
 	}

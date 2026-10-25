@@ -11,6 +11,11 @@ export interface WorkloadRef {
   phase: string;
   /** `groupVersionKind.kind`, e.g. `RayJob`; "" when absent. */
   kind: string;
+  /**
+   * The workload's labels, when the list entry carries them (string values
+   * only); undefined when it does not, which is not the same as "no labels".
+   */
+  labels?: Record<string, string>;
 }
 
 /** One page of a SaFE workload list. */
@@ -47,10 +52,19 @@ export function parseWorkloadListPage(body: unknown): WorkloadListPage | null {
     const id = typeof obj.workloadId === "string" ? obj.workloadId : "";
     if (!id) continue;
     const gvk = obj.groupVersionKind as Record<string, unknown> | undefined;
+    const rawLabels = obj.labels;
+    let labels: Record<string, string> | undefined;
+    if (rawLabels && typeof rawLabels === "object" && !Array.isArray(rawLabels)) {
+      labels = {};
+      for (const [k, v] of Object.entries(rawLabels as Record<string, unknown>)) {
+        if (typeof v === "string") labels[k] = v;
+      }
+    }
     out.push({
       id,
       phase: typeof obj.phase === "string" ? obj.phase.toLowerCase() : "",
       kind: typeof gvk?.kind === "string" ? gvk.kind : "",
+      ...(labels ? { labels } : {}),
     });
   }
   const reported = (body as { totalCount?: unknown })?.totalCount;

@@ -96,7 +96,7 @@ func TestTimeoutNoticeFollowsTheCommandsLastStderr(t *testing.T) {
 	// the output the exit status overtook has drained, the command's last lines
 	// land after it and the marker is no longer the tail.
 	s := newTestServer()
-	s.inference = &inferenceKeyCache{}
+	s.session = &sessionContext{ready: make(chan struct{})}
 	s.workspace = t.TempDir()
 	// Writing until killed leaves stderr in the pipe that the copy goroutine
 	// only delivers after the exit status.

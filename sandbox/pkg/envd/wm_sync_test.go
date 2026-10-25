@@ -170,10 +170,8 @@ func (*recordingAuditStore) QueryByTimeRange(context.Context, time.Time, time.Ti
 
 func (*recordingAuditStore) DeleteBefore(context.Context, time.Time) (int64, error) { return 0, nil }
 
-const (
-	syncSessionID    = "sess_wm_sync"
-	syncInferenceKey = "sk-wm-sync"
-)
+// syncSessionID is namespace/name, matching WM's internal and policy routes.
+const syncSessionID = "default/sbx"
 
 // wmSyncHarness is one sandbox: an EnvD built by New with egress on, the
 // Router's signer, and Workload Manager's real routes behind the in-process
@@ -193,11 +191,9 @@ func newWMSyncHarness(t *testing.T, jm *router.JWTManager) *wmSyncHarness {
 		SessionID: syncSessionID, SandboxName: "sbx", Namespace: "default",
 		RuntimePolicy: "agent-default", PolicyMode: "enforce",
 		AllowedEgressHosts: []string{"v1.example"}, PolicyVersion: 1,
-		InferenceApiKey: syncInferenceKey,
 	}))
 	audits := &recordingAuditStore{}
 	cfg := workloadmanager.DefaultConfig()
-	cfg.Inference.Enabled = true
 	wm := workloadmanager.New(cfg, st).WithAuditStore(audits).Handler()
 	wmTransport.use(wm)
 
@@ -237,17 +233,6 @@ func (h *wmSyncHarness) patchPolicy(host string) {
 
 func (h *wmSyncHarness) deny(domain string) {
 	h.envd.auditReporter.ReportDecision(egress.DecisionEvent{Action: "deny", Stage: "policy", Domain: domain})
-}
-
-// childHasInferenceKey reports whether a command started now gets the session's
-// inference API key.
-func (h *wmSyncHarness) childHasInferenceKey() bool {
-	for _, kv := range h.envd.buildChildEnv(nil) {
-		if kv == "OPENAI_API_KEY="+syncInferenceKey {
-			return true
-		}
-	}
-	return false
 }
 
 func (h *wmSyncHarness) appliedHosts() []string {
@@ -356,9 +341,10 @@ func TestEnvDStaysInSyncWithWMPastRouterTokenTTL(t *testing.T) {
 			},
 		},
 		{
-			// WM refuses the token of the first fetch: its key cache has not
-			// caught up with a rotated Router key, or a concurrent audit
-			// upload had the same token refused first.
+			// WM refuses the token of the first policy sync: its key cache has
+			// not caught up with a rotated Router key, or a concurrent audit
+			// upload had the same token refused first. The next proxied
+			// request brings a fresh token and the sync succeeds.
 			name: "first policy fetch refused",
 			run: func(t *testing.T, h *wmSyncHarness) {
 				wmTransport.setFault("policy", wmFault{refuse: 1})
@@ -367,7 +353,6 @@ func TestEnvDStaysInSyncWithWMPastRouterTokenTTL(t *testing.T) {
 				time.Sleep(time.Minute)
 				h.routerRequest()
 				synctest.Wait()
-				assert.True(t, h.childHasInferenceKey(), "inference API key never fetched; WM answered: %s", wmTransport.summary())
 				time.Sleep(31 * time.Second)
 				synctest.Wait()
 				assert.Equal(t, []string{"v1.example"}, h.appliedHosts(), "WM answered: %s", wmTransport.summary())

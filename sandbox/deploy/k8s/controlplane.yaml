@@ -90,6 +90,9 @@ rules:
   - apiGroups: ["runtime.agent-sandbox.io"]
     resources: ["clustersandboxpolicies"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["runtime.agent-sandbox.io"]
+    resources: ["sandboxpolicies"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -201,16 +204,6 @@ spec:
               value: ""
             - name: SANDBOX_TOLERATIONS
               value: "[]"
-            - name: REDIS_ADDR
-              valueFrom:
-                secretKeyRef:
-                  name: agent-sandbox-redis
-                  key: addr
-            - name: REDIS_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: agent-sandbox-redis
-                  key: password
             - name: SANDBOX_IMAGE_REGISTRY
               value: "harbor.example.com/agent-sandbox/"
             - name: REGISTRY_SECRET
@@ -229,10 +222,6 @@ spec:
             # isolated development cluster; production must use SAFE_API_URL.
             - name: ALLOW_INSECURE_NO_AUTH
               value: "__ALLOW_INSECURE_NO_AUTH__"
-            - name: INFERENCE_ENABLED
-              value: "__INFERENCE_ENABLED__"
-            - name: INFERENCE_LITELLM_ENDPOINT
-              value: "__INFERENCE_LITELLM_ENDPOINT__"
             - name: EGRESS_ENABLED
               value: "__EGRESS_ENABLED__"
             - name: EGRESS_EXTRA_BLOCKED_CIDRS
