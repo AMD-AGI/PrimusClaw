@@ -520,7 +520,8 @@ func TestEndKeepsSandboxRef(t *testing.T) {
 	ref, err := svc.BeginSandbox(context.Background(), BeginRequest{
 		GrantID: req.GrantID, Role: "measurement", SandboxID: "sbx-1",
 		TemplateID: "ar-01ja-runner-g1", GPUs: 1, TimeoutSec: 60, IdempotencyKey: "once",
-		AccessTokenHash: "abc",
+		AccessTokenHash: "abc", Metadata: map[string]string{"large": strings.Repeat("x", 1024)},
+		Inputs: []string{"/in"}, Outputs: []string{"/out"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -540,6 +541,9 @@ func TestEndKeepsSandboxRef(t *testing.T) {
 	}
 	if view.Usage["measurement"].Sandboxes != 0 || view.Sandboxes[0].AccessTokenHash != "" {
 		t.Fatalf("usage=%+v hash=%q", view.Usage, view.Sandboxes[0].AccessTokenHash)
+	}
+	if len(view.Sandboxes[0].Metadata) != 0 || len(view.Sandboxes[0].Inputs) != 0 || len(view.Sandboxes[0].Outputs) != 0 {
+		t.Fatalf("ended ref was not compacted: %+v", view.Sandboxes[0])
 	}
 	_, err = svc.BeginSandbox(context.Background(), BeginRequest{
 		GrantID: req.GrantID, Role: "measurement", SandboxID: "sbx-2",

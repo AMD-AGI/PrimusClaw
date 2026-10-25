@@ -393,6 +393,12 @@ func endOne(g *runtimev1alpha1.SandboxGrant, sandboxID, reason string, now time.
 	ref.EndedAt = metav1.NewTime(now)
 	ref.AccessTokenHash = ""
 	ref.AccessTokenHashes = nil
+	ref.SandboxName = ""
+	ref.Namespace = ""
+	ref.NodeName = ""
+	ref.Metadata = nil
+	ref.Inputs = nil
+	ref.Outputs = nil
 	g.Status.Sandboxes[idx] = ref
 	if g.Status.Usage != nil {
 		usage := g.Status.Usage[ref.Role]
