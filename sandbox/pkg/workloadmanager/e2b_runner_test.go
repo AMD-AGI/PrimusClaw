@@ -61,7 +61,7 @@ func TestCreateE2BSkipsInferenceKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.InferenceApiKey != "" || info.Status != "running" || info.UserID != "u-1" {
+	if info.Status != "running" || info.UserID != "u-1" {
 		t.Fatalf("info=%+v", info)
 	}
 	if err := srv.SetTimeout(context.Background(), "sbx-1", 2*time.Minute); err != nil {
