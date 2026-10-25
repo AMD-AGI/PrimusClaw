@@ -17,6 +17,7 @@
  */
 
 import {
+  assertPdClusterPrompt,
   resolvePdClusterReplicas,
 } from "./prompt-flags.js";
 import type { MultiNodeBackend } from "./types.js";
@@ -691,16 +692,17 @@ function buildPdClusterWorkloadBody(
   if (!p.model.trim()) {
     throw new Error(`model is required (${opts.backend} prefill/decode --model-path)`);
   }
-  if (p.pdMode !== "disaggregated") {
-    throw new Error(
-      `${opts.backend} requires --pd-mode disaggregated (got ${p.pdMode})`,
-    );
-  }
-  if (p.framework !== "sglang") {
-    throw new Error(
-      `${opts.backend} engines always run sglang; --framework must be sglang (got ${p.framework})`,
-    );
-  }
+  assertPdClusterPrompt({
+    backend: opts.backend,
+    pdMode: p.pdMode,
+    framework: p.framework,
+    nodes: p.nodes,
+    gpusPerNode: p.gpusPerNode,
+    pdPrefillNodes: p.pdPrefillNodes ?? 0,
+    pdDecodeNodes: p.pdDecodeNodes ?? 0,
+    pdPrefillTp: p.pdPrefillTp ?? 0,
+    pdDecodeTp: p.pdDecodeTp ?? 0,
+  });
 
   const model = p.model.trim();
   const { prefill: prefillReplica, decode: decodeReplica } = resolvePdClusterReplicas({
@@ -709,22 +711,10 @@ function buildPdClusterWorkloadBody(
     pdDecodeNodes: p.pdDecodeNodes ?? 0,
     backend: opts.backend,
   });
-  if (p.nodes !== prefillReplica + decodeReplica) {
-    throw new Error(
-      `${opts.backend}: --nodes (${p.nodes}) must equal prefill+decode GPU nodes (${prefillReplica + decodeReplica})`,
-    );
-  }
 
-  // Default TP to every GPU on the pod. Cross-pod TP is not supported here.
+  // Default TP to every GPU on the pod. An explicit size above that was already rejected.
   const prefillTp = p.pdPrefillTp && p.pdPrefillTp > 0 ? p.pdPrefillTp : p.gpusPerNode;
   const decodeTp = p.pdDecodeTp && p.pdDecodeTp > 0 ? p.pdDecodeTp : p.gpusPerNode;
-  for (const [role, tp] of [["prefill", prefillTp], ["decode", decodeTp]] as const) {
-    if (tp > p.gpusPerNode) {
-      throw new Error(
-        `${opts.backend}: --pd-${role}-tp (${tp}) exceeds --gpus-per-node (${p.gpusPerNode}); cross-pod TP is not supported`,
-      );
-    }
-  }
 
   const sharedMemoryGi = Math.max(1, Math.floor(p.memGiPerNode / 2));
 

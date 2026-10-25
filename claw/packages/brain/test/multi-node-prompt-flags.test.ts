@@ -8,6 +8,7 @@ import {
   isMultiNodeRequest,
   parseMultiNodePromptFlags,
   requestedNodeCount,
+  specFromTopology,
 } from "../src/sandbox/multi-node/prompt-flags.js";
 import { classifySandboxFailure } from "../src/sandbox/reaper.js";
 
@@ -294,9 +295,20 @@ test("parseMultiNodePromptFlags accepts atom and still requires --model", () => 
   assert.throws(() => assertMultiNodeModel(missing), /model is required/);
 });
 
-test("assertMultiNodeModel rejects atom without disaggregated pd-mode", () => {
+test("atom and sglangrouter default to disaggregated mooncake", () => {
+  const spec = parseMultiNodePromptFlags("--nodes 2 --mn-backend atom --model /models/m");
+  assert.ok(spec);
+  assert.equal(spec.pdMode, "disaggregated");
+  assert.equal(spec.kvTransferBackend, "mooncake");
+  assert.doesNotThrow(() => assertMultiNodeModel(spec));
+  const declared = specFromTopology({ nodes: 2, backend: "atom", model: "/m" });
+  assert.equal(declared.pdMode, "disaggregated");
+  assert.equal(declared.kvTransferBackend, "mooncake");
+});
+
+test("assertMultiNodeModel rejects an explicit aggregated pd-mode for atom", () => {
   const spec = parseMultiNodePromptFlags(
-    "--nodes 2 --mn-backend atom --model /models/m --pd-transfer-backend mooncake",
+    "--nodes 2 --mn-backend atom --model /models/m --pd-mode aggregated",
   );
   assert.ok(spec);
   assert.equal(spec.pdMode, "aggregated");
@@ -329,6 +341,26 @@ test("classifySandboxFailure maps model errors by backend", () => {
   assert.equal(
     classifySandboxFailure("model is required (sglangrouter prefill/decode --model-path)"),
     "mn_model_missing",
+  );
+  assert.equal(
+    classifySandboxFailure("invalid topology: topology.model is required when backend is atom"),
+    "mn_model_missing",
+  );
+  assert.equal(
+    classifySandboxFailure("atom requires --pd-mode disaggregated (got aggregated)"),
+    "mn_config_invalid",
+  );
+  assert.equal(
+    classifySandboxFailure("atom engines always run sglang; --framework must be sglang (got vllm)"),
+    "mn_config_invalid",
+  );
+  assert.equal(
+    classifySandboxFailure("atom: --nodes (4) must equal prefill+decode GPU nodes (2)"),
+    "mn_config_invalid",
+  );
+  assert.equal(
+    classifySandboxFailure("atom: --pd-prefill-tp (16) exceeds --gpus-per-node (8); cross-pod TP is not supported"),
+    "mn_config_invalid",
   );
 });
 

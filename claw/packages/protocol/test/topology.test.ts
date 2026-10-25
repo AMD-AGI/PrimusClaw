@@ -72,6 +72,22 @@ test("atom without a model is refused at declaration time", () => {
   ok({ nodes: 2, backend: "atom", model: "/shared_nfs/models/Qwen3-14B-FP8", pd_mode: "disaggregated" });
 });
 
+test("atom accepts an omitted pd_mode and refuses a shape it cannot provision", () => {
+  ok({ nodes: 2, backend: "atom", model: "/m" });
+  assert.ok(
+    errs({ nodes: 2, backend: "atom", model: "/m", framework: "vllm" })
+      .some((m) => m.includes("framework")),
+  );
+  assert.ok(
+    errs({ nodes: 4, backend: "atom", model: "/m", pd_prefill_nodes: 1, pd_decode_nodes: 1 })
+      .some((m) => m.includes("prefill+decode")),
+  );
+  assert.ok(
+    errs({ nodes: 2, backend: "sglangrouter", model: "/m", pd_prefill_tp: 16 })
+      .some((m) => m.includes("cross-pod TP")),
+  );
+});
+
 test("atom and sglangrouter refuse aggregated pd_mode at declaration time", () => {
   assert.ok(
     errs({ nodes: 2, backend: "atom", model: "/models/m", pd_mode: "aggregated" })

@@ -195,29 +195,66 @@ export function validateTopology(input: unknown): TopologyValidation {
     }
   }
 
-  if (
-    typeof raw.backend === "string"
+  const backend = typeof raw.backend === "string"
     && (TOPOLOGY_BACKENDS as readonly string[]).includes(raw.backend)
-    && backendRequiresModel(raw.backend as TopologyBackend)
-    && !String(raw.model ?? "").trim()
-  ) {
+    ? raw.backend as TopologyBackend
+    : undefined;
+
+  if (backend && backendRequiresModel(backend) && !String(raw.model ?? "").trim()) {
     // Infera's frontend takes it as --router-tokenizer-path. Atom and
     // SGLangRouter prefill and decode take it as --model-path. Without it the
     // cluster comes up and the serving process cannot start.
-    errors.push(`topology.model is required when backend is ${raw.backend}`);
+    errors.push(`topology.model is required when backend is ${backend}`);
   }
 
-  if (
-    typeof raw.backend === "string"
-    && (TOPOLOGY_BACKENDS as readonly string[]).includes(raw.backend)
-    && backendRequiresDisaggregatedPd(raw.backend as TopologyBackend)
-    && raw.pd_mode === "aggregated"
-  ) {
-    errors.push(`topology.pd_mode aggregated is not supported when backend is ${raw.backend}`);
+  if (backend && backendRequiresDisaggregatedPd(backend)) {
+    if (raw.pd_mode === "aggregated") {
+      errors.push(`topology.pd_mode aggregated is not supported when backend is ${backend}`);
+    }
+    errors.push(...pdClusterShapeErrors(raw, backend));
   }
 
   if (errors.length) return { ok: false, errors };
   return { ok: true, value: raw as unknown as EnvironmentTopology };
+}
+
+/** Matches the prompt default when gpus_per_node is omitted. */
+const DEFAULT_GPUS_PER_NODE = 8;
+
+/**
+ * Shape rules Atom and SGLangRouter also enforce when the workload is built.
+ * A missing pd_mode is accepted: the builder defaults it to disaggregated.
+ */
+function pdClusterShapeErrors(
+  raw: Record<string, unknown>,
+  backend: TopologyBackend,
+): string[] {
+  const errors: string[] = [];
+  if (raw.framework !== undefined && raw.framework !== "sglang") {
+    errors.push(`topology.framework must be sglang when backend is ${backend}`);
+  }
+  const gpus = typeof raw.gpus_per_node === "number" ? raw.gpus_per_node : DEFAULT_GPUS_PER_NODE;
+  const nodes = typeof raw.nodes === "number" ? raw.nodes : 0;
+  const prefill = typeof raw.pd_prefill_nodes === "number" ? raw.pd_prefill_nodes : 0;
+  const decode = typeof raw.pd_decode_nodes === "number" ? raw.pd_decode_nodes : 0;
+  if ((prefill > 0) !== (decode > 0)) {
+    errors.push(
+      `topology.pd_prefill_nodes and topology.pd_decode_nodes must both be set when backend is ${backend}`,
+    );
+  } else if (prefill > 0 && nodes !== prefill + decode) {
+    errors.push(
+      `topology.nodes (${nodes}) must equal prefill+decode GPU nodes (${prefill + decode}) when backend is ${backend}`,
+    );
+  }
+  for (const field of ["pd_prefill_tp", "pd_decode_tp"] as const) {
+    const value = raw[field];
+    if (typeof value === "number" && value > gpus) {
+      errors.push(
+        `topology.${field} (${value}) exceeds gpus_per_node (${gpus}); cross-pod TP is not supported`,
+      );
+    }
+  }
+  return errors;
 }
 
 /**

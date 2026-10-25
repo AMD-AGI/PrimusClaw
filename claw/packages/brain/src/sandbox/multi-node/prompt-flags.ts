@@ -21,8 +21,10 @@
 //   --mem-per-node         GiB, default 1024
 //   --model                model path/id (infera frontend, or atom/sglangrouter --model-path)
 //   --framework            infera backend framework: sglang | vllm, default sglang
-//   --pd-transfer-backend  infera KV transfer: nixl | mori | mooncake, default mori
-//   --pd-mode              aggregated | disaggregated, default aggregated
+//   --pd-transfer-backend  nixl | mori | mooncake. Default mori, except atom and
+//                          sglangrouter, whose engine script is Mooncake.
+//   --pd-mode              aggregated | disaggregated. Default aggregated, except
+//                          atom and sglangrouter, which can only be disaggregated.
 //   --pd-prefill-nodes / --pd-decode-nodes    PD group node counts
 //   --pd-prefill-tp    / --pd-decode-tp       PD group tensor-parallel sizes
 //   --extra-env K=V    repeatable; the only way to reach the GPU pods' env
@@ -47,6 +49,8 @@ const DEFAULT_CPUS_PER_NODE = 96;
 const DEFAULT_MEM_PER_NODE_GIB = 1024;
 const DEFAULT_FRAMEWORK = "sglang";
 const DEFAULT_KV_TRANSFER_BACKEND = "mori";
+/** Engine entrypoints set Mooncake aux TCP and bootstrap ports. */
+const PD_CLUSTER_KV_TRANSFER_BACKEND = "mooncake";
 
 /** Enum values mirrored from the SaFE Infera webhook. */
 const INFERA_FRAMEWORKS = new Set(["sglang", "vllm"]);
@@ -191,6 +195,18 @@ export function requestedNodeCount(prompt: string): number {
   return readIntFlag(String(prompt ?? ""), "nodes", DEFAULT_NODES);
 }
 
+/** Default PD mode. Atom and SGLangRouter have no aggregated shape. */
+function defaultPdMode(backend: MultiNodeBackendFlag): PdMode {
+  return backendRequiresDisaggregatedPd(backend) ? "disaggregated" : "aggregated";
+}
+
+/** Default KV transfer. Atom and SGLangRouter engines are written for Mooncake. */
+function defaultKvTransferBackend(backend: MultiNodeBackendFlag): string {
+  return backendRequiresDisaggregatedPd(backend)
+    ? PD_CLUSTER_KV_TRANSFER_BACKEND
+    : DEFAULT_KV_TRANSFER_BACKEND;
+}
+
 /** `--mn-backend`, or null when the flag is absent or outside the enum. */
 function readBackendFlag(prompt: string): MultiNodeBackendFlag | null {
   const raw = (readFlag(prompt, "mn-backend") ?? "").toLowerCase();
@@ -217,10 +233,10 @@ export function parseMultiNodePromptFlags(prompt: string): MultiNodePromptSpec |
   const backend = readBackendFlag(text);
   if (!backend) return null;
 
-  const pdMode: PdMode =
-    (readFlag(text, "pd-mode") ?? "").toLowerCase() === "disaggregated"
-      ? "disaggregated"
-      : "aggregated";
+  const pdModeFlag = (readFlag(text, "pd-mode") ?? "").toLowerCase();
+  const pdMode: PdMode = pdModeFlag === "disaggregated" || pdModeFlag === "aggregated"
+    ? pdModeFlag
+    : defaultPdMode(backend);
 
   return {
     nodes,
@@ -236,7 +252,7 @@ export function parseMultiNodePromptFlags(prompt: string): MultiNodePromptSpec |
       text,
       "pd-transfer-backend",
       INFERA_KV_BACKENDS,
-      DEFAULT_KV_TRANSFER_BACKEND,
+      defaultKvTransferBackend(backend),
     ),
     pdMode,
     pdPrefillNodes: readIntFlag(text, "pd-prefill-nodes", 0),
@@ -268,15 +284,22 @@ export function assertMultiNodeModel(spec: MultiNodePromptSpec): void {
   }
 }
 
-/** @deprecated Use assertMultiNodeModel. */
-export const assertMultiNodeInferaModel = assertMultiNodeModel;
-
 /**
  * Atom/SGLangRouter are always a router + prefill + decode PD cluster: no
  * aggregated mode, engines are sglang only, and `--nodes` must match the GPU
  * roles that will actually be created.
  */
-export function assertPdClusterPrompt(spec: MultiNodePromptSpec): void {
+export function assertPdClusterPrompt(spec: {
+  backend: string;
+  pdMode: string;
+  framework: string;
+  nodes: number;
+  gpusPerNode: number;
+  pdPrefillNodes: number;
+  pdDecodeNodes: number;
+  pdPrefillTp: number;
+  pdDecodeTp: number;
+}): void {
   if (spec.pdMode !== "disaggregated") {
     throw new Error(
       `${spec.backend} requires --pd-mode disaggregated (got ${spec.pdMode})`,
@@ -370,8 +393,8 @@ export function specFromTopology(topology: EnvironmentTopology): MultiNodePrompt
     extraEnv,
     model: (topology.model ?? "").trim(),
     framework: topology.framework ?? DEFAULT_FRAMEWORK,
-    kvTransferBackend: topology.pd_transfer_backend ?? DEFAULT_KV_TRANSFER_BACKEND,
-    pdMode: topology.pd_mode ?? "aggregated",
+    kvTransferBackend: topology.pd_transfer_backend ?? defaultKvTransferBackend(topology.backend),
+    pdMode: topology.pd_mode ?? defaultPdMode(topology.backend),
     pdPrefillNodes: topology.pd_prefill_nodes ?? 0,
     pdDecodeNodes: topology.pd_decode_nodes ?? 0,
     pdPrefillTp: topology.pd_prefill_tp ?? 0,
