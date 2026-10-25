@@ -26,7 +26,7 @@ type allowedInternalUpdater interface {
 type PolicySyncer struct {
 	engine                 *policy.Engine
 	allowedInternalUpdater allowedInternalUpdater
-	wm                     *inferenceKeyCache
+	session                *sessionContext
 	interval               time.Duration
 
 	mu             sync.Mutex
@@ -35,12 +35,12 @@ type PolicySyncer struct {
 }
 
 // NewPolicySyncer creates a syncer that polls WM for policy updates with the
-// session and Router token wm holds at each poll.
-func NewPolicySyncer(engine *policy.Engine, updater allowedInternalUpdater, wm *inferenceKeyCache) *PolicySyncer {
+// session and Router token session holds at each poll.
+func NewPolicySyncer(engine *policy.Engine, updater allowedInternalUpdater, session *sessionContext) *PolicySyncer {
 	return &PolicySyncer{
 		engine:                 engine,
 		allowedInternalUpdater: updater,
-		wm:                     wm,
+		session:                session,
 		interval:               30 * time.Second,
 	}
 }
@@ -74,7 +74,7 @@ func (s *PolicySyncer) syncOnce(ctx context.Context) {
 	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	resp, err := s.wm.callWM(reqCtx, http.DefaultClient, http.MethodGet, "policy", nil)
+	resp, err := s.session.callWM(reqCtx, http.DefaultClient, http.MethodGet, "policy", nil)
 	if errors.Is(err, errNoWM) || errors.Is(err, errAwaitingToken) {
 		return
 	}

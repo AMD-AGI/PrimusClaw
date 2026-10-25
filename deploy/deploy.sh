@@ -331,7 +331,6 @@ if [ "$DEPLOY_SANDBOX" = "true" ]; then
   else
     sandbox_env+=("SAFE_API_URL=$SAFE_API_URL")
   fi
-  [ -n "${STORAGE_CLASS:-}" ] && sandbox_env+=("REDIS_STORAGE_CLASS=$STORAGE_CLASS")
   [ -n "${SANDBOX_EGRESS_ENABLED:-}" ] && sandbox_env+=("EGRESS_ENABLED=$SANDBOX_EGRESS_ENABLED")
   [ -n "${SANDBOX_EGRESS_EXTRA_BLOCKED_CIDRS:-}" ] && sandbox_env+=("EGRESS_EXTRA_BLOCKED_CIDRS=$SANDBOX_EGRESS_EXTRA_BLOCKED_CIDRS")
   if [ -n "${SANDBOX_EXTRA_CA_CONFIGMAP:-}" ]; then

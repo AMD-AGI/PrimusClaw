@@ -15,9 +15,12 @@
  * construct a real `sandbox_spec`.
  */
 import type { ExecuteRequest, SandboxSpec, SandboxSpecCreate, SandboxSpecUse } from "@claw/protocol";
+import { TOPOLOGY_HANDOFF_SCHEMA, type TopologyHandoffV1 } from "@claw/protocol";
+import { LEGACY_TOPOLOGY_ENV } from "../config.js";
 import { normalizeWorkloadResourcesEntry } from "./workload-resources.js";
 // Type-only: avoids a runtime import cycle (ensure.ts -> sandbox/ensure-hands.ts -> sandbox/params.ts).
 import type { MultiNodeContext } from "./multi-node/types.js";
+import { writeSandboxFiles, type SandboxExec, type SandboxFile } from "./multi-node/sandbox-key.js";
 
 /** Decision Brain takes about sandbox provisioning at task entry. */
 export type SandboxAction =
@@ -170,8 +173,18 @@ export function resourcesMapToWorkloadArray(map: Record<string, string>): Array<
  * alone -- and the two are computed differently, so ours could quietly redirect
  * a workspace root that was already correct.
  */
-export function applyMultiNodeExternalEnv(env: Record<string, string>, ctx: MultiNodeContext): void {
+export function applyMultiNodeExternalEnv(
+  env: Record<string, string>,
+  ctx: MultiNodeContext,
+  opts: { legacyTopologyEnv?: boolean } = {},
+): void {
   delete env.SAFE_API_URL;
+  // The handoff file is the contract; its content and the files it points at are
+  // written once the sandbox is healthy (see `buildTopologyHandoff`).
+  env.TOPOLOGY_HANDOFF_FILE = TOPOLOGY_HANDOFF_PATH;
+
+  if (!(opts.legacyTopologyEnv ?? LEGACY_TOPOLOGY_ENV)) return;
+
   env.INFERENCE_OPTIMIZER_MN_BACKEND = ctx.backend;
   env.INFERENCE_OPTIMIZER_NODES = String(ctx.nodeCount);
   // Required: presence alone is what flips Hyperloom into external mode.
@@ -199,6 +212,80 @@ export function applyMultiNodeExternalEnv(env: Record<string, string>, ctx: Mult
 }
 
 /**
+ * Where the handoff files live inside the sandbox: a directory of its own,
+ * created 0700, outside the synced workspace. Outside, because a workspace
+ * snapshot (shared disk or S3) would otherwise carry cluster addresses and host
+ * keys away with it, and a restore after a sandbox rebuild would overwrite the
+ * freshly written files with the previous sandbox's. /tmp is not part of any
+ * snapshot, and the files are rewritten on every sandbox creation.
+ */
+export const TOPOLOGY_HANDOFF_DIR = "/tmp/claw-topology";
+/** Value of `TOPOLOGY_HANDOFF_FILE`. */
+export const TOPOLOGY_HANDOFF_PATH = `${TOPOLOGY_HANDOFF_DIR}/topology.json`;
+const TOPOLOGY_KNOWN_HOSTS_PATH = `${TOPOLOGY_HANDOFF_DIR}/known_hosts`;
+
+/**
+ * True when Brain writes the infera SSH key file. The one condition for both the
+ * write and the `ssh_key_file` field, so the document never names a file that
+ * was not written.
+ */
+export function hasSshKeyFile(ctx: MultiNodeContext): boolean {
+  return Boolean(ctx.sshPrivateKey && ctx.sshKeyPath);
+}
+
+/** A file to materialise inside the sandbox. */
+export type TopologyFile = SandboxFile;
+
+export interface TopologyHandoffBuild {
+  handoff: TopologyHandoffV1;
+  /** Files in write order: everything the handoff points at, then the handoff. */
+  files: TopologyFile[];
+}
+
+/**
+ * Build the TopologyHandoff v1 document for a provisioned cluster, plus the files
+ * it needs. The document carries paths only: the infera SSH key is the file
+ * Brain already writes at `ctx.sshKeyPath`. The handoff is last in `files` so a reader that sees it also
+ * sees everything it names.
+ */
+export function buildTopologyHandoff(ctx: MultiNodeContext): TopologyHandoffBuild {
+  const files: TopologyFile[] = [];
+  const handoff: TopologyHandoffV1 = {
+    schema: TOPOLOGY_HANDOFF_SCHEMA,
+    backend: ctx.backend,
+    nodes: ctx.nodeCount,
+    gpus_per_node: ctx.gpusPerNode,
+    service_url: ctx.serviceUrl,
+  };
+
+  if (ctx.backend === "rayjob") {
+    const ray: NonNullable<TopologyHandoffV1["ray"]> = {};
+    if (ctx.headHost) ray.head_ip = ctx.headHost;
+    handoff.ray = ray;
+  } else {
+    const infera: NonNullable<TopologyHandoffV1["infera"]> = {
+      prefill_ips: [...(ctx.prefillIps ?? [])],
+      decode_ips: [...(ctx.decodeIps ?? [])],
+      worker_ips: [...(ctx.workerIps ?? [])],
+    };
+    if (hasSshKeyFile(ctx)) infera.ssh_key_file = ctx.sshKeyPath;
+    if (ctx.sshPortBase) infera.ssh_port_base = ctx.sshPortBase;
+    infera.known_hosts_file = TOPOLOGY_KNOWN_HOSTS_PATH;
+    // Empty: Claw holds no host keys for these pods. The file exists so the path
+    // is usable by `ssh -o UserKnownHostsFile=...` without the reader creating it.
+    files.push({ path: infera.known_hosts_file, content: "", mode: "600" });
+    handoff.infera = infera;
+  }
+
+  files.push({
+    path: TOPOLOGY_HANDOFF_PATH,
+    content: `${JSON.stringify(handoff, null, 2)}\n`,
+    mode: "644",
+  });
+  return { handoff, files };
+}
+
+/**
  * platform-trust guard: when `image_digest_allowlist` is set, the rendered
  * `image` MUST contain a digest from the allow-list. Other trust levels are
  * not allowed to set the field at all (admission rejects them upstream).
@@ -214,4 +301,25 @@ export function assertImageDigest(spec: SandboxSpec | undefined, image: string):
     throw new Error(`sandbox image '${image}' does not match any digest in image_digest_allowlist`);
   }
   return image;
+}
+
+/**
+ * Write the handoff files into the sandbox. During the transition the legacy env
+ * is sufficient on its own, so a failure is returned, not thrown: the caller logs
+ * it and carries on. On failure `TOPOLOGY_HANDOFF_FILE` is removed from `env`, so
+ * nothing Brain carries on with names a file that was not written. (The sandbox's
+ * own env is fixed at creation; a reader treats an absent file as no handoff.)
+ */
+export async function writeTopologyHandoff(
+  exec: SandboxExec,
+  ctx: MultiNodeContext,
+  env: Record<string, string>,
+): Promise<{ written: true } | { written: false; error: string }> {
+  try {
+    await writeSandboxFiles(exec, TOPOLOGY_HANDOFF_DIR, buildTopologyHandoff(ctx).files);
+    return { written: true };
+  } catch (err) {
+    delete env.TOPOLOGY_HANDOFF_FILE;
+    return { written: false, error: err instanceof Error ? err.message : String(err) };
+  }
 }

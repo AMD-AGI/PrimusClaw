@@ -16,7 +16,7 @@
  * that they may be written in the clear.
  */
 
-import { validateTopology, type EnvironmentTopology } from "@claw/protocol";
+import { APP_GPU_COUNT_PATTERN, APP_GPU_RESOURCE, validateTopology, type EnvironmentTopology } from "@claw/protocol";
 import { PG_INT4_MAX } from "@claw/utils";
 
 /** Top-level fields stripped before the spec is written to `claw_tasks.input`. */
@@ -99,6 +99,20 @@ export function gpuNodesFromSpec(task: Record<string, unknown>): number {
   // value is not something the row's own cast could have produced.
   if (typeof nodes !== "number" || !Number.isInteger(nodes) || nodes <= 0) return 0;
   return Math.min(nodes, PG_INT4_MAX);
+}
+
+/**
+ * GPU nodes an app run holds: its sandbox is one pod, and a pod runs on one
+ * node, so a spec that asks for GPUs (any number of them) occupies one node;
+ * the unit of the ceilings is nodes, not cards. The one GPU key is
+ * `APP_GPU_RESOURCE`, written by `planAppRun` from `resources.gpus` alone. Read from the sandbox spec Claw itself wrote from the
+ * request's `resources`, never from the app's input (`topology` in an app input
+ * is the app's own key and counts for nothing).
+ */
+export function appGpuNodesFromSpec(spec: unknown): number {
+  const resources = (spec as { resources?: Record<string, unknown> } | null | undefined)?.resources;
+  const gpus = resources?.[APP_GPU_RESOURCE];
+  return typeof gpus === "string" && new RegExp(APP_GPU_COUNT_PATTERN).test(gpus) ? 1 : 0;
 }
 
 export function wantsSandboxFromSpec(task: Record<string, unknown>): boolean {

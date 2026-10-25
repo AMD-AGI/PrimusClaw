@@ -12,6 +12,7 @@ const RAYJOB_CTX: MultiNodeContext = {
   name: "msg1-rayjob",
   namespace: "test-workspace",
   nodeCount: 2,
+  gpusPerNode: 8,
   serviceUrl: "http://msg1-rayjob.test-workspace.svc.cluster.local:8888",
   headHost: "msg1-rayjob.test-workspace.svc.cluster.local",
   dashboardToken: "tok",
@@ -23,6 +24,7 @@ const INFERA_CTX: MultiNodeContext = {
   name: "msg1-infera",
   namespace: "test-workspace",
   nodeCount: 2,
+  gpusPerNode: 8,
   serviceUrl: "http://msg1-infera.test-workspace.svc.cluster.local:8000",
   sshKeyPath: "/tmp/primus-claw-mn-ssh-key",
   sshPortBase: 2222,
@@ -69,6 +71,7 @@ test("sglangrouter env points at the router and does not hand over an SSH contro
     name: "msg1-sglangrouter",
     namespace: "test-workspace",
     nodeCount: 2,
+    gpusPerNode: 8,
     serviceUrl: "http://msg1-sglangrouter.test-workspace.svc.cluster.local:8000",
   });
   assert.equal(env.INFERENCE_OPTIMIZER_MN_BACKEND, "sglangrouter");
@@ -84,6 +87,7 @@ test("atom env points at the router and does not hand over an SSH control plane"
     name: "msg1-atom",
     namespace: "test-workspace",
     nodeCount: 2,
+    gpusPerNode: 8,
     serviceUrl: "http://msg1-atom.test-workspace.svc.cluster.local:8000",
   };
   applyMultiNodeExternalEnv(env, ctx);

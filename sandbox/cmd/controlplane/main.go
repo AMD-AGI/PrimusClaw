@@ -217,10 +217,6 @@ func main() {
 		}
 	}
 
-	if os.Getenv("INFERENCE_ENABLED") == "true" {
-		wmCfg.Inference.Enabled = true
-		wmCfg.Inference.LiteLLMEndpoint = os.Getenv("INFERENCE_LITELLM_ENDPOINT")
-	}
 	wmCfg.Audit.Enabled = os.Getenv("AUDIT_ENABLED") != "false"
 	wmCfg.Audit.RetentionDays = 30
 	if v := os.Getenv("AUDIT_RETENTION_DAYS"); v != "" {
@@ -263,43 +259,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	st, err := store.NewFromEnv()
-	if err != nil {
-		log.Error("failed to initialize store", "error", err)
-		os.Exit(1)
-	}
-	defer st.Close()
-
-	if err := st.Ping(ctx); err != nil {
-		log.Error("store ping failed", "error", err)
-		os.Exit(1)
-	}
-
-	// Shared audit backend (API, agentd, sandbox runtime controller). nil when disabled or non-Redis store.
-	var auditStore audit.AuditStore
+	// Audit events go to process logs (see audit.LogEvent). No durable store.
 	if wmCfg.Audit.Enabled {
-		if rs, ok := st.(*store.RedisStore); ok {
-			auditStore = audit.NewRedisStore(rs.Client(), wmCfg.Audit.RetentionDays)
-			// AUDIT_ENABLED=true plus a store that constructs cleanly is not
-			// proof the backend actually accepts and returns writes -- see
-			// L639: that exact combination shipped silently for days with
-			// zero events landing. Round-trip one synthetic event now, so a
-			// broken backend is a loud startup log line and a 0-valued
-			// audit_backend_up metric instead of a forensic dead end the
-			// next time an audit record is needed.
-			selfCheckCtx, selfCheckCancel := context.WithTimeout(ctx, 10*time.Second)
-			if err := audit.SelfCheck(selfCheckCtx, auditStore); err != nil {
-				log.Error("audit backend self-check failed: AUDIT_ENABLED=true but events are not landing",
-					"error", err)
-				audit.BackendUp.Set(0)
-			} else {
-				audit.BackendUp.Set(1)
-			}
-			selfCheckCancel()
-		} else {
-			log.Warn("audit logging requires Redis store; disabled in memory mode")
-			audit.BackendUp.Set(0)
-		}
+		audit.BackendUp.Set(1)
 	} else {
 		audit.BackendUp.Set(0)
 	}
@@ -334,10 +296,10 @@ func main() {
 	tracer := asmetrics.NewNoOp()
 
 	if err := (&controllers.SandboxReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Tracer: tracer,
-		Audit:  auditStore,
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Tracer:   tracer,
+		AuditLog: wmCfg.Audit.Enabled,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error("unable to setup Sandbox controller", "error", err)
 		os.Exit(1)
@@ -370,6 +332,30 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Session routing reads Sandbox CRs (namespace/name). MemoryStore is only
+	// for the rare path where the K8s client cannot be constructed.
+	var (
+		st  store.Store
+		k8s *workloadmanager.K8sSandboxCreator
+	)
+	if creator, err := workloadmanager.NewK8sSandboxCreator(k8sCfg); err != nil {
+		log.Warn("K8s sandbox creator init failed; using in-memory session store", "error", err)
+		st = store.NewMemoryStore()
+	} else {
+		k8s = creator.WithInformers(crdInformers)
+		if err := workloadmanager.IndexSandboxesBySessionID(ctx, mgr.GetFieldIndexer()); err != nil {
+			log.Warn("session-id index unavailable; lookups will list sandboxes instead", "error", err)
+		} else {
+			k8s.WithCachedReader(mgr.GetClient())
+		}
+		crStore := workloadmanager.NewCRStore(k8s)
+		if wmCfg.Namespaces != nil {
+			crStore.WithNamespaceFilter(wmCfg.Namespaces.Filter)
+		}
+		st = crStore
+	}
+	defer st.Close()
+
 	wmSandboxReconciler := &workloadmanager.SandboxReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
@@ -378,6 +364,9 @@ func main() {
 	if err := wmSandboxReconciler.SetupWithManager(mgr); err != nil {
 		log.Error("unable to setup session Sandbox controller", "error", err)
 		os.Exit(1)
+	}
+	if k8s != nil {
+		k8s.WithReconciler(wmSandboxReconciler)
 	}
 
 	// Sandbox idle-GC is not wired: Brain reclaim (GET /api/jobs + idle window)
@@ -393,9 +382,6 @@ func main() {
 	}
 
 	apiServer := workloadmanager.New(wmCfg, st)
-	if auditStore != nil {
-		apiServer.WithAuditStore(auditStore)
-	}
 	if registry := os.Getenv("SANDBOX_IMAGE_REGISTRY"); registry != "" {
 		builderCfg := builder.DefaultConfig()
 		builderCfg.Registry = registry
@@ -403,25 +389,12 @@ func main() {
 		if secret := os.Getenv("REGISTRY_SECRET"); secret != "" {
 			builderCfg.RegistrySecret = secret
 		}
-		if rs, ok := st.(*store.RedisStore); ok {
-			apiServer.WithBuilder(builder.New(builderCfg, mgr.GetClient(), builder.NewRedisCache(rs.Client())))
-		}
+		// Content-hash cache is optional (NopCache). Kaniko's --cache-repo
+		// still applies when builderCfg.CacheRepo is set.
+		apiServer.WithBuilder(builder.New(builderCfg, mgr.GetClient(), builder.NewNopCache()))
 	}
-	if k8s, err := workloadmanager.NewK8sSandboxCreator(k8sCfg); err == nil {
-		k8s.WithReconciler(wmSandboxReconciler)
-		k8s.WithInformers(crdInformers)
-		// Session recovery resolves a session id to its Sandbox, which the keepalive
-		// poll reaches once per session per minute while the store cannot answer.
-		// Registered against the cache the controllers already fill, so this costs
-		// no extra watch; without the index the lookup falls back to listing.
-		if err := workloadmanager.IndexSandboxesBySessionID(ctx, mgr.GetFieldIndexer()); err != nil {
-			log.Warn("session-id index unavailable; recovery will list sandboxes instead", "error", err)
-		} else {
-			k8s.WithCachedReader(mgr.GetClient())
-		}
+	if k8s != nil {
 		apiServer.WithK8s(k8s)
-	} else {
-		log.Warn("K8s sandbox creator init failed; running in dev mode", "error", err)
 	}
 
 	routerServer, err := router.New(ctx, routerCfg, st, clientset)

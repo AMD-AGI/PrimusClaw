@@ -91,12 +91,6 @@ egress proxy, outbound traffic from your code reaches public endpoints but is
 blocked from RFC 1918 ranges and cloud metadata addresses. Code that needs an
 internal host must have it declared on the template.
 
-**Inference credentials are injected, not configured.** Where the platform runs
-an inference gateway, `OPENAI_BASE_URL` and `OPENAI_API_KEY` are supplied to the
-sandbox process, so `import openai` works with no setup. This injection happens
-for API-key authenticated sandboxes only — one created through browser cookie
-auth does not get the key.
-
 ## Tests
 
 ```bash

@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: MIT
 
 import pg from "pg";
-import { DATABASE_URL, envInt } from "../config.js";
+import { APP_RUNS_ENABLED, DATABASE_URL, envInt } from "../config.js";
 import pino from "pino";
 import {
   REQUIRED_SCHEMA,
-  missingSchemaObjects,
+  classifySchemaProblems,
   type PresentColumn,
 } from "./schema-guard.js";
 
@@ -420,7 +420,13 @@ async function assertSchema(client: pg.PoolClient): Promise<void> {
         AND table_name = ANY($1)`,
     [tables],
   );
-  const problems = missingSchemaObjects(REQUIRED_SCHEMA, present.rows as PresentColumn[]);
+  // The app-run tables are needed only where app runs are accepted: with
+  // APP_RUNS_ENABLED off they are a warning, so a database that has not been
+  // migrated for them still serves everything else.
+  const { fatal: problems, warnings } = classifySchemaProblems(
+    REQUIRED_SCHEMA, present.rows as PresentColumn[], APP_RUNS_ENABLED,
+  );
+  if (warnings.length > 0) logger.warn({ problems: warnings }, "db.app_run_schema_incomplete (APP_RUNS_ENABLED is off: not fatal)");
   if (problems.length > 0) {
     logger.error({ problems }, "db.schema_incomplete");
     throw new Error(`database schema is incomplete after migration: ${problems.join("; ")}`);
@@ -1777,6 +1783,70 @@ export async function initDb(): Promise<void> {
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_tasks_session ON claw_tasks(session_id)",
     ).catch(() => {});
+
+    // A hosted application's run: one row per `mode='app'` task, holding what
+    // the app runner needs to resume it (the manifest as it was at creation, the
+    // MCP token, the grant) so a replacement Brain can pick it up from here.
+    //
+    // `manifest` is a copy, not a reference: editing the plugin afterwards must
+    // not change a run that is already under way. `mcp_token_enc` and
+    // `grant_keys_enc` are sealed (see crypto/app-run-secrets.ts); nothing in
+    // this table is a credential in the clear. `archive` is reserved for the
+    // result archive and is not written yet.
+    // With APP_RUNS_ENABLED off, a table that cannot be created or indexed (an old
+    // database missing a column an index names) must not stop the API: it is
+    // logged and skipped, and the schema guard decides what is fatal.
+    const appRunsDdl = async (statement: string): Promise<void> => {
+      try {
+        await client.query(statement);
+      } catch (err) {
+        if (APP_RUNS_ENABLED) throw err;
+        logger.warn({ err: err instanceof Error ? err.message : String(err) }, "db.app_runs_ddl_skipped (APP_RUNS_ENABLED is off)");
+      }
+    };
+    await appRunsDdl(`
+      CREATE TABLE IF NOT EXISTS claw_app_runs (
+        task_id              TEXT PRIMARY KEY REFERENCES claw_tasks(task_id),
+        session_id           TEXT NOT NULL,
+        plugin_id            BIGINT NOT NULL,
+        manifest             JSONB NOT NULL,
+        idempotency_key      TEXT,
+        state_dir            TEXT,
+        state                TEXT NOT NULL,
+        restarts             INT  NOT NULL DEFAULT 0,
+        last_exit            JSONB,
+        events_cursor        JSONB NOT NULL DEFAULT '{}'::jsonb,
+        sandbox_workload_id  TEXT,
+        mcp_token_enc        TEXT NOT NULL,
+        archive              JSONB,
+        grant_id             TEXT,
+        grant_keys_enc       TEXT,
+        grant_limits         JSONB,
+        grant_expires_at     TIMESTAMPTZ,
+        grant_revoked_at     TIMESTAMPTZ,
+        created_by           TEXT,
+        request_hash         TEXT,
+        created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    // Who created the run and a hash of the request, so an Idempotency-Key replay
+    // can refuse another user and a different request body.
+    // (Errors are logged, not swallowed: a lock timeout here shows up later only as
+    // a missing column in the schema guard, with no cause.)
+    for (const col of ["created_by", "request_hash"]) {
+      await client.query(`ALTER TABLE claw_app_runs ADD COLUMN IF NOT EXISTS ${col} TEXT`).catch((err: unknown) => {
+        logger.warn({ column: col, err: err instanceof Error ? err.message : String(err) }, "db.app_runs_alter_failed");
+      });
+    }
+    await appRunsDdl("CREATE INDEX IF NOT EXISTS idx_app_runs_session ON claw_app_runs(session_id)");
+    // The durable half of Idempotency-Key for app runs: the response cache
+    // expires and can lose a write, this does not. Per session, matching the
+    // scope the key has on the route.
+    await appRunsDdl(
+      `CREATE UNIQUE INDEX IF NOT EXISTS uq_app_runs_idempotency
+         ON claw_app_runs(session_id, idempotency_key) WHERE idempotency_key IS NOT NULL`,
+    );
     // The sweeper's backstop scan: non-terminal rows ordered by when their
     // budget runs out. Partial, because rows past their deadline are the rare
     // case and terminal rows are the overwhelming majority of the table.

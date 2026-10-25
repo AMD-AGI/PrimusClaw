@@ -57,6 +57,28 @@ export const TERMINAL_PHASES = new Set([
 ]);
 
 /**
+ * SaFE's non-terminal WorkloadPhase values, in SaFE's own casing.
+ *
+ * Sent to the list endpoint so a session's finished workloads stay out of both the
+ * page and its totalCount. Nothing ever removes them from that list -- a sandbox is
+ * retired with `stop`, which only moves it to `Stopped`, and only an actual DELETE
+ * sets `is_deleted` -- so unfiltered they accumulate for the life of a session.
+ *
+ * A whitelist over a closed set: WorkloadPhase in SaFE's api package
+ * (apis/pkg/apis/amd/v1/workload_types.go) defines exactly Succeeded, Failed,
+ * Pending, Running, Updating, NotReady and Stopped, and the four non-terminal ones
+ * are listed here.
+ *
+ * It has to be updated alongside that enum, in a different repository, and getting
+ * that wrong is silent: a new non-terminal phase left out would be filtered from
+ * the page AND from totalCount, so the shortfall check -- which compares exactly
+ * those two -- could not notice it either. The session would report clean and its
+ * clusters would run to the workload's own timeout. The client-side TERMINAL_PHASES
+ * skip stays for that reason, covering the case where this filter does not apply.
+ */
+export const ACTIVE_PHASES = "Pending,Running,Updating,NotReady";
+
+/**
  * Seams for the wait loop, defaulted to the real runtime.
  *
  * Present so the rules below can be tested with a scripted status sequence and a

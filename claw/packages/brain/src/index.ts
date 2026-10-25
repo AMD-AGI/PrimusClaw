@@ -69,7 +69,7 @@ import {
   destroyHands, parkForIdleReclaim, readSessionPlatformKey, releaseLocalHandsState,
   startMultiNodeSweeper, startSandboxSweeper,
 } from "./sandbox/reaper.js";
-import { activeAbort, resolveAbortTargets, SIGTERM_ABORT_REASON } from "./tasks/abort-registry.js";
+import { activeAbort, gracefulStopRemainingMs, resolveAbortTargets, SIGTERM_ABORT_REASON } from "./tasks/abort-registry.js";
 import { markSessionDeleted } from "./infra/deleted-sessions.js";
 import {
   releaseTaskLock, bindTaskLockKv, lockContentionNakMs, lockExpiresBetweenRenewals,
@@ -645,12 +645,17 @@ function installInterruptSubscriber(): void {
         ctrl.abort();
         logger.info({ address, lockKey }, "task.interrupted");
         // The SDK may not propagate abort through an in-flight tool RPC.
-        setTimeout(() => {
+        const forceRelease = (): void => {
           if (activeAbort.get(lockKey) !== ctrl) return;
+          // A run winding down on purpose (an app run's SIGTERM grace) is given the
+          // time it asked for, and no more: when that is up it is released like any other.
+          const left = gracefulStopRemainingMs(ctrl);
+          if (left > 0) { setTimeout(forceRelease, left).unref(); return; }
           logger.error({ address, lockKey }, "task.interrupt_force_release");
           activeAbort.delete(lockKey);
           releaseTaskLock(lockKey).catch(() => {});
-        }, 30_000).unref();
+        };
+        setTimeout(forceRelease, 30_000).unref();
       }
     }
   })();

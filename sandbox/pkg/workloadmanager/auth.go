@@ -15,7 +15,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"sigs.k8s.io/agent-sandbox/pkg/api"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/safe"
 )
@@ -97,8 +96,6 @@ func (s *Server) safeAuthMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		// Forward the original API Key for unified inference gateway (§4.2).
-		c.Request.Header.Set(api.SandboxApiKeyHeader, token)
 		setVerifiedUser(c, user)
 
 		log.Debug("WM: SaFE auth OK",

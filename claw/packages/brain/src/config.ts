@@ -514,6 +514,16 @@ export const MULTI_NODE_DEFAULT_TIMEOUT_SECONDS = envInt(
   "MULTI_NODE_DEFAULT_TIMEOUT_SECONDS",
   24 * 60 * 60,
 );
+// Multi-node runs hand their cluster topology to the sandbox as a file named by
+// TOPOLOGY_HANDOFF_FILE. While this is true the same facts are also set as the
+// older HYPERLOOM_MN_EXT_* / INFERENCE_OPTIMIZER_MN_BACKEND /
+// INFERENCE_OPTIMIZER_NODES variables, so a reader that has not moved to the
+// file keeps working. Default true for this release. DO NOT set it to false
+// until every reader has migrated to the file: with it off, SAFE_API_URL is
+// already removed and the HYPERLOOM_MN_EXT_* variables are not set, so a reader
+// that does not yet read the file (the released one does not) loses multi-node.
+// Remove the flag together with the legacy variables once readers have moved.
+export const LEGACY_TOPOLOGY_ENV = envBool("LEGACY_TOPOLOGY_ENV", true);
 export const SANDBOX_DEFAULT_TIMEOUT_SECONDS = envInt(
   "SANDBOX_DEFAULT_TIMEOUT_SECONDS",
   24 * 60 * 60,

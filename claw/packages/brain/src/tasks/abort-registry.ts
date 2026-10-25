@@ -40,6 +40,32 @@ export const activeAbort = new Map<string, AbortController>();
  * but that is a consequence of one workspace per session rather than a rule,
  * and "stop this session" means all of them either way.
  */
+/**
+ * Runs that were told to stop and are winding down on purpose, for longer than
+ * the interrupt handler's force-release timeout: an app run's SIGTERM grace
+ * (`stop_grace_sec`, minutes). Not stuck, so not released by force.
+ */
+export const gracefulStop = new WeakMap<AbortController, number>();
+
+/** The longest a graceful stop may hold a run's lock past the interrupt: the app grace at its maximum, plus room to finish. */
+export const GRACEFUL_STOP_MAX_MS = (3600 + 600) * 1000;
+
+/** Mark `ctrl` as winding down on purpose, until `now + maxMs`. */
+export function markGracefulStop(ctrl: AbortController, now: number = Date.now(), maxMs: number = GRACEFUL_STOP_MAX_MS): void {
+  gracefulStop.set(ctrl, now + maxMs);
+}
+
+/**
+ * How long the interrupt handler should wait before force-releasing the lock of
+ * `ctrl`: 0 when it is not winding down gracefully, or its graceful time is up;
+ * otherwise what is left of it. A run that is stuck in its finish therefore does
+ * not hold the session's lock for ever.
+ */
+export function gracefulStopRemainingMs(ctrl: AbortController, now: number = Date.now()): number {
+  const until = gracefulStop.get(ctrl);
+  return until === undefined ? 0 : Math.max(0, until - now);
+}
+
 const lockKeysByAddress = new Map<string, Set<string>>();
 const addressesByLockKey = new Map<string, string[]>();
 

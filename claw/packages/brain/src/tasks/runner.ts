@@ -63,6 +63,8 @@ import { restartHandsInSandbox } from "../sandbox/hands-restart.js";
 import { resolveSandboxAction } from "../sandbox/params.js";
 import { provisionTerminalOf } from "../sandbox/errors.js";
 import { runScript, type ScriptProgress } from "./script-runner.js";
+import { createAppRunner } from "../apps/app-runner-wiring.js";
+import { AppRunFailedError, type AppRunOutcome } from "../apps/app-runner.js";
 import {
   AgentDoneDeliveryError, postAgentDone, postRunLease, postTaskRunning, sandboxForLease,
   type LeaseRenewal, type RunAttemptToken,
@@ -74,7 +76,7 @@ import { settleClaimedRun } from "../clients/run-claim.js";
 import { beginRun, endRun, phaseOf, runTimeOf } from "./run-phase.js";
 import { resolveRunIdentity, type RunIdentity, taskIdFromLease } from "./run-identity.js";
 import {
-  activeAbort, LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON,
+  activeAbort, markGracefulStop, LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON,
   DEADLINE_EXCEEDED_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON,
 } from "./abort-registry.js";
 import { pickRunScope, pickShellRun, refreshTaskLock, releaseTaskLock } from "./lock.js";
@@ -463,6 +465,8 @@ export interface TaskRunnerSideEffects {
   postRunLease: typeof postRunLease;
   settleRunAttempt: typeof settleClaimedRun;
   runScript: typeof runScript;
+  /** The AppRunner for a run of mode `app`. */
+  createAppRunner: typeof createAppRunner;
   /** Publish a task message again, as a new message on the same subject. */
   republishTask: (subject: string, data: Uint8Array) => Promise<void>;
   refreshTaskLock: typeof refreshTaskLock;
@@ -495,6 +499,7 @@ const REAL_SIDE_EFFECTS: TaskRunnerSideEffects = {
   postRunLease,
   settleRunAttempt: settleClaimedRun,
   runScript,
+  createAppRunner,
   republishTask: async (subject, data) => {
     await getDeps().emitter.nc.jetstream().publish(subject, data);
   },
@@ -944,6 +949,54 @@ async function maybeRunSandboxlessTask(
   } finally {
     // Drop the in-process abort handle and release the per-task lock so
     // the next DAG step (or unrelated task) can be picked up immediately.
+    activeAbort.delete(lockKey);
+    await fx().releaseTaskLock(lockKey).catch(() => {});
+  }
+  return true;
+}
+
+/** Why a task of a mode this Brain does not run is refused. */
+export const unsupportedModeReason = (mode: unknown): string =>
+  `task mode "${String(mode)}" is not implemented in this Brain build`;
+
+/**
+ * A task whose mode this Brain cannot run is failed outright. Without this, a
+ * mode the dispatch below does not know would fall through to the LLM engine,
+ * which would answer the task's input as a chat prompt. Only `llm`, `script`,
+ * `app` and an omitted mode go on.
+ */
+export async function refuseUnsupportedMode(
+  msg: JsMsg,
+  request: ExecuteRequest,
+  sessionId: string,
+  lockKey: string,
+): Promise<boolean> {
+  if (request.mode === undefined || request.mode === "llm" || request.mode === "script" || request.mode === "app") return false;
+  const { kvCkpt } = getDeps();
+  logger.error({ sessionId, taskId: request.task_id, mode: request.mode }, "task.mode_not_implemented");
+  try {
+    await deliverAgentDone(kvCkpt, request, {
+      finalText: "",
+      tokenUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, turns: 0 },
+      turns: 0,
+      pendingMemories: [],
+      pendingSkills: [],
+      skillsUsed: {},
+      errorCount: 1,
+      toolStats: { total_calls: 0, error_calls: 1, by_tool: {} },
+      elapsedMs: 0,
+      abortReason: "error",
+      failureReason: unsupportedModeReason(request.mode),
+    });
+    await ackAndClearCallback(msg, kvCkpt, request);
+  } catch (err) {
+    if (err instanceof AgentDoneDeliveryError) {
+      logger.error({ err, taskId: request.task_id }, "task.mode_refusal_delivery_exhausted");
+      msg.nak(5_000);
+    } else {
+      throw err;
+    }
+  } finally {
     activeAbort.delete(lockKey);
     await fx().releaseTaskLock(lockKey).catch(() => {});
   }
@@ -2777,6 +2830,11 @@ class TaskRunner {
     const checkpointTimer = this.startInflightCheckpointTimer();
     let result: ExecuteResult;
     try {
+      if (this.request.mode === "app") {
+        // executeRun hands app runs to the AppRunner before this point; keep
+        // the engine from ever treating an app task as a chat turn.
+        throw new Error("an app run reached the chat engine");
+      }
       if (this.request.mode === "script") {
         // mode=script: predefined tool sequence, no LLM (task-design.md §7.3).
         // AgentHook fire(...) is wired by the engine layer; the hooks runtime
@@ -3816,6 +3874,7 @@ class TaskRunner {
           elapsedMs: elapsedMsAtFailure,
           abortReason: "error",
           failureReason: sandboxReason || rawMsg.slice(0, 500),
+          ...(err instanceof AppRunFailedError && err.captures ? { captures: err.captures } : {}),
         }),
         runtimeSecrets(this.request, this.platformKey),
       ),
@@ -4254,6 +4313,10 @@ class TaskRunner {
     // arming earlier could not have cut any of them short, and both KV reads
     // are inside try/catch behind the client's own request timeout.
     this.cancelDeadline = this.armDeadline();
+    if (this.request.mode === "app") {
+      await this.executeAppRun();
+      return;
+    }
     if (this.needsSandboxUpFront(this.pendingResumeCkpt)) {
       await this.attachHands();
     } else {
@@ -4284,7 +4347,94 @@ class TaskRunner {
     await this.finalizeSuccess(result);
   }
 
+  /**
+   * A run of mode `app`: the AppRunner drives the application in its own
+   * sandbox under this run's lease, which the heartbeat started in `run()`
+   * keeps renewing. There is no Hands, no engine and no workspace sync here.
+   *
+   * How it ends decides who owns the sandbox afterwards. A finished run was
+   * wound up by the AppRunner itself. A run that lost its lease or is being
+   * drained for a restart is left exactly as it is, for the Brain that takes it
+   * over to reconcile. Anything else -- a cancel, the deadline, a row that went
+   * terminal -- is a run nobody else will finish, so it is finished here.
+   */
+  private async executeAppRun(): Promise<void> {
+    const runId = this.request.task_id;
+    // Not an AppRunFailedError: that means the app run is already `ended` on its row
+    // (see handleRunFailure), and these two are refusals made before anything ran.
+    if (!runId) throw new Error("an app run needs a task id");
+    const epoch = this.heldGeneration();
+    // Without it SaFE cannot be asked for anything, and every tick would fail the same way.
+    if (!this.platformKey) {
+      const closed = await fx().createAppRunner(runId, "", epoch)
+        .markEnded("the session owner's platform key is not available to this worker")
+        .catch((err) => { logger.error({ err: String(err?.message ?? err), taskId: runId }, "task.app_run_close_failed"); return false; });
+      // Any sandbox an earlier worker made is not stopped from here (no key to
+      // stop it with); it ends with its workload time limit.
+      if (!closed) {
+        // The row was not closed (another worker holds it, or it could not be written):
+        // it is not `ended`, so this is not the terminal AppRunFailedError.
+        logger.error({ taskId: runId }, "task.app_run_row_left_open_no_platform_key");
+        throw new Error("an app run needs the session owner's platform key");
+      }
+      throw new AppRunFailedError("an app run needs the session owner's platform key");
+    }
+    const runner = fx().createAppRunner(runId, this.platformKey, epoch);
+    await this.onEvent({ type: "statusUpdate", agentStatus: "running" });
+    await fx().postTaskRunning(this.request, { brainId: BRAIN_ID, attempt: this.attempt });
+
+    const result = await runner.run(this.abortCtrl.signal);
+    if (result.kind === "ended") {
+      if (!result.outcome.success) throw new AppRunFailedError(result.outcome.reason, result.outcome.captures);
+      await this.finalizeAppSuccess(result.outcome);
+      return;
+    }
+
+    if (result.kind === "superseded" && !this.abortCtrl.signal.aborted) {
+      this.leaseLost = true;
+      this.abortCtrl.abort(LEASE_LOST_ABORT_REASON);
+    }
+    const reason = this.abortCtrl.signal.reason;
+    const handedOver = reason === SIGTERM_ABORT_REASON || reason === LEASE_LOST_ABORT_REASON;
+    if (!handedOver) {
+      // The grace wait of a cancel can outlast the 30 s the interrupt handler
+      // gives a run before it releases the lock by force; this run is not stuck.
+      markGracefulStop(this.abortCtrl);
+      const cause = reason === DEADLINE_EXCEEDED_ABORT_REASON ? "deadline"
+        : reason === RUN_ROW_TERMINAL_ABORT_REASON ? "row_terminal" : "cancelled";
+      const outcome = await runner.finishNow(cause).catch((err) => {
+        logger.error({ err: String(err?.message ?? err), taskId: this.request.task_id }, "task.app_finish_failed");
+        return null;
+      });
+      // An application that wrote a successful `final` within its grace keeps its
+      // own result: reported as the success it is, with its captures, not as the
+      // cancel that asked it to stop.
+      if (outcome?.success) {
+        await this.finalizeAppSuccess(outcome);
+        return;
+      }
+    }
+    throw reason ?? new Error("cancelled by user");
+  }
+
+  /** Report an app run that ended as a success. */
+  private async finalizeAppSuccess(outcome: AppRunOutcome): Promise<void> {
+    await this.finalizeSuccess({
+      finalText: outcome.reason,
+      tokenUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, turns: 0 },
+      turns: 0,
+      pendingMemories: [],
+      pendingSkills: [],
+      skillsUsed: {},
+      errorCount: 0,
+      toolStats: { total_calls: 0, error_calls: 0, by_tool: {} },
+      elapsedMs: this.elapsedMsForRun(),
+      ...(outcome.captures ? { captures: outcome.captures } : {}),
+    });
+  }
+
   private failureOutcome(err: unknown): TaskOutcome {
+    if (err instanceof AppRunFailedError && this.stillOwnsLock()) return "failed";
     if (this.abortCtrl.signal.reason === SIGTERM_ABORT_REASON) return "retryable";
     // `stillOwnsLock()` rather than the abort reason alone: the reason belongs
     // to whoever aborted first, so a run interrupted normally and THEN
@@ -4345,6 +4495,15 @@ class TaskRunner {
       );
       await this.releaseAfterTerminal();
       this.msg.nak(5_000);
+      return;
+    }
+    if (err instanceof AppRunFailedError) {
+      // Terminal by construction: the app run is already `ended` on its row, so
+      // a redelivery could only report the same failure again.
+      await this.settleTerminal(
+        () => this.handleFatalError(err),
+        "task.app_run_failed_agent_done_delivery_exhausted",
+      );
       return;
     }
     if (provisionTerminalOf(err)) {
@@ -4421,6 +4580,7 @@ export async function runHandleTask(
   claim: RunClaim = null,
 ): Promise<void> {
   if (await replayPendingCallback(msg, request, lockKey)) return;
+  if (await refuseUnsupportedMode(msg, request, sessionId, lockKey)) return;
   if (await maybeRunSandboxlessTask(msg, request, sessionId, lockKey, abortCtrl)) return;
   await new TaskRunner(
     msg, request, sessionId, lockKey, messageId, userId, abortCtrl, claim,

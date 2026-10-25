@@ -28,6 +28,8 @@ export interface MultiNodeContext {
   namespace: string;
   /** Total GPU nodes; drives INFERENCE_OPTIMIZER_NODES. */
   nodeCount: number;
+  /** GPUs on each node; carried to the sandbox in the topology handoff. */
+  gpusPerNode: number;
   /** Base URL benchmarks target: Ray head :8888, the Infera frontend, or the Atom/SGLangRouter router :8000. */
   serviceUrl: string;
   /** rayjob: host serving Ray Dashboard :8265 and GCS :6379. */

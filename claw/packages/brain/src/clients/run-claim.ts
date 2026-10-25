@@ -18,7 +18,7 @@ const logger = pino({ name: "run-claim-client" });
  * is never the address we POST the cluster token to. The payload may name a
  * host; this replica already knows its own.
  */
-function apiBase(): string {
+export function apiBase(): string {
   return (process.env.INTERNAL_BACKEND_URL ?? "").trim().replace(/\/$/, "");
 }
 
@@ -245,7 +245,7 @@ async function postClaim(url: string): Promise<ClaimedRun | null> {
   return { request: data.request, claimCount };
 }
 
-function claimHeaders(): Record<string, string> {
+export function claimHeaders(): Record<string, string> {
   return {
     "Content-Type": "application/json",
     Authorization: `Bearer ${AUTH_INTERNAL_TOKEN}`,

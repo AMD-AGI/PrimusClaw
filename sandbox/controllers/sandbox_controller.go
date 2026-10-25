@@ -60,8 +60,10 @@ type SandboxReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 	Tracer asmetrics.Instrumenter
-	// Audit records sandbox.deleted when ShutdownTime expires (nil skips, e.g. memory store).
-	Audit audit.AuditStore
+	// AuditLog enables process-log audit for delete paths. Optional Audit is
+	// only for tests that assert on Store.
+	AuditLog bool
+	Audit    audit.AuditStore
 }
 
 //+kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes,verbs=get;list;watch;create;update;patch;delete
@@ -658,7 +660,7 @@ func (r *SandboxReconciler) reconcilePVCs(ctx context.Context, sandbox *sandboxv
 // down resources because spec.lifecycle.shutdownTime has passed. Fire-and-forget:
 // failures are logged and never block expiry cleanup.
 func (r *SandboxReconciler) emitShutdownExpiryAudit(ctx context.Context, sandbox *sandboxv1alpha1.Sandbox) {
-	if r.Audit == nil {
+	if !r.AuditLog && r.Audit == nil {
 		return
 	}
 	if sandbox.Annotations != nil && sandbox.Annotations[annShutdownExpiryAuditIssued] != "" {
@@ -693,10 +695,15 @@ func (r *SandboxReconciler) emitShutdownExpiryAudit(ctx context.Context, sandbox
 	if !created.IsZero() {
 		event.DurationMs = time.Since(created).Milliseconds()
 	}
-	audit.NormalizeEvent(event)
-	if err := r.Audit.Store(ctx, event); err != nil {
-		log.Error(err, "failed to emit shutdown expiry audit", "sandbox", sandbox.Name, "namespace", sandbox.Namespace)
-		return
+	if r.AuditLog {
+		audit.LogEvent(event)
+	}
+	if r.Audit != nil {
+		audit.NormalizeEvent(event)
+		if err := r.Audit.Store(ctx, event); err != nil {
+			log.Error(err, "failed to emit shutdown expiry audit", "sandbox", sandbox.Name, "namespace", sandbox.Namespace)
+			return
+		}
 	}
 	patchBase := sandbox.DeepCopy()
 	if sandbox.Annotations == nil {
@@ -723,13 +730,12 @@ func (r *SandboxReconciler) emitShutdownExpiryAudit(ctx context.Context, sandbox
 // Sandbox object -- which is exactly the shape of the L639 incident: a
 // Sandbox disappeared and none of our own delete paths had touched it.
 //
-// Fire-and-forget like its siblings: a store failure is logged (and counted
-// by RedisAuditStore.Store's metric) but never blocks reconciliation. Who
-// actually issued the delete is not recoverable from here -- this only
-// records that an unaccounted deletion happened and when, so it leaves a
-// trail instead of the silence L639 found.
+// Fire-and-forget like its siblings: a sink failure is logged but never
+// blocks reconciliation. Who actually issued the delete is not recoverable
+// from here -- this only records that an unaccounted deletion happened and
+// when, so it leaves a trail instead of the silence L639 found.
 func (r *SandboxReconciler) emitUnaccountedDeleteAudit(ctx context.Context, sandbox *sandboxv1alpha1.Sandbox) {
-	if r.Audit == nil {
+	if !r.AuditLog && r.Audit == nil {
 		return
 	}
 	if sandbox.Annotations != nil &&
@@ -766,10 +772,15 @@ func (r *SandboxReconciler) emitUnaccountedDeleteAudit(ctx context.Context, sand
 	if !created.IsZero() {
 		event.DurationMs = time.Since(created).Milliseconds()
 	}
-	audit.NormalizeEvent(event)
-	if err := r.Audit.Store(ctx, event); err != nil {
-		log.Error(err, "failed to emit external-delete audit", "sandbox", sandbox.Name, "namespace", sandbox.Namespace)
-		return
+	if r.AuditLog {
+		audit.LogEvent(event)
+	}
+	if r.Audit != nil {
+		audit.NormalizeEvent(event)
+		if err := r.Audit.Store(ctx, event); err != nil {
+			log.Error(err, "failed to emit external-delete audit", "sandbox", sandbox.Name, "namespace", sandbox.Namespace)
+			return
+		}
 	}
 	patchBase := sandbox.DeepCopy()
 	if sandbox.Annotations == nil {

@@ -67,7 +67,7 @@ before(async () => {
 
 beforeEach(async () => {
   if (skip) return;
-  await client.query("TRUNCATE claw_tasks");
+  await client.query("TRUNCATE claw_tasks, claw_app_runs");
 });
 
 after(async () => {

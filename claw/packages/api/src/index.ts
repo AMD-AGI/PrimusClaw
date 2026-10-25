@@ -29,6 +29,7 @@ import { registerSystemEnvVarRoutes, publishSystemEnvToKv } from "./routes/syste
 import { registerMcpRoutes } from "./routes/mcp.js";
 import { registerInternalTaskRoutes } from "./routes/internal-tasks.js";
 import { registerInternalRunRoutes } from "./routes/internal-runs.js";
+import { registerInternalAppRoutes } from "./routes/internal-apps.js";
 import { registerInternalWorkspaceRoutes } from "./routes/internal-workspaces.js";
 import { registerTaskDagRoutes } from "./routes/task-dags.js";
 import { registerTaskRoutes } from "./routes/tasks.js";
@@ -263,6 +264,7 @@ async function main() {
   await registerMcpRoutes(app);
   await registerInternalTaskRoutes(app);
   await registerInternalRunRoutes(app);
+  await registerInternalAppRoutes(app);
   await registerInternalWorkspaceRoutes(app);
   await registerTaskDagRoutes(app);
   await registerTaskRoutes(app);
