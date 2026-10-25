@@ -23,6 +23,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -82,6 +83,18 @@ func (m *memReclaimer) Reclaim(_ context.Context, ref SandboxRef) error {
 	m.mu.Lock()
 	m.ids = append(m.ids, ref.ID)
 	m.mu.Unlock()
+	return nil
+}
+
+type failOnceReclaimer struct {
+	calls int
+}
+
+func (r *failOnceReclaimer) Reclaim(_ context.Context, _ SandboxRef) error {
+	r.calls++
+	if r.calls == 1 {
+		return errors.New("temporary delete failure")
+	}
 	return nil
 }
 
@@ -405,6 +418,54 @@ func TestReapExpiresGrant(t *testing.T) {
 	}
 }
 
+func TestExpiredGrantRetriesReclaimAndCleansSecrets(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	clock := now
+	svc, priv, _, _ := testService(t, now)
+	reclaimer := &failOnceReclaimer{}
+	svc.reclaimer = reclaimer
+	svc.now = func() time.Time { return clock }
+	req := sampleRequest(now.Add(time.Minute))
+	req.Templates[0].Spec = json.RawMessage(`{"fromImage":"example:latest"}`)
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.BeginSandbox(context.Background(), BeginRequest{
+		GrantID: req.GrantID, Role: "measurement", SandboxID: "sbx-1",
+		TemplateID: "ar-01ja-runner-g1", GPUs: 1, TimeoutSec: 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clock = now.Add(2 * time.Minute)
+	svc.ReapOnce(context.Background())
+	first, err := svc.get(context.Background(), req.GrantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Status.State != runtimev1alpha1.GrantStateExpired ||
+		first.Status.Sandboxes[0].State == runtimev1alpha1.SandboxEnded {
+		t.Fatalf("first=%+v", first.Status)
+	}
+	svc.ReapOnce(context.Background())
+	second, err := svc.get(context.Background(), req.GrantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Status.Sandboxes[0].State != runtimev1alpha1.SandboxEnded ||
+		second.Spec.PlatformKeyCiphertext != "" ||
+		reclaimer.calls != 2 {
+		t.Fatalf("second=%+v calls=%d", second, reclaimer.calls)
+	}
+	ci := &runtimev1alpha1.CodeInterpreter{}
+	err = svc.reader.Get(context.Background(), types.NamespacedName{
+		Name: "ar-01ja-runner-g1", Namespace: svc.namespace,
+	}, ci)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("template still present: %v", err)
+	}
+}
+
 func TestReconcileDropsMissingSandbox(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	svc, priv, _, _ := testService(t, now)
@@ -560,6 +621,64 @@ func TestIssueRegistersFromImage(t *testing.T) {
 	}
 }
 
+func TestIssueUsesStructuredGPUCountForExistingTemplate(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	svc, priv, _, _ := testService(t, now)
+	ci := &runtimev1alpha1.CodeInterpreter{
+		ObjectMeta: metav1.ObjectMeta{Name: "ar-01ja-eval-g8", Namespace: svc.namespace},
+		Spec: runtimev1alpha1.CodeInterpreterSpec{
+			GPU: &runtimev1alpha1.GPUConfig{Count: 3},
+		},
+	}
+	if err := svc.client.Create(context.Background(), ci); err != nil {
+		t.Fatal(err)
+	}
+	req := sampleRequest(now.Add(time.Hour))
+	req.Roles = map[string]RoleRequest{
+		"measurement": {Templates: []string{"eval-g8"}, MaxSandboxes: 1, MaxGPUs: 3},
+	}
+	req.Templates = []TemplateRequest{{Name: "eval-g8"}}
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	g, err := svc.get(context.Background(), req.GrantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := g.Spec.Templates[0].GPUCounts; len(got) != 1 || got[0] != 3 {
+		t.Fatalf("gpuCounts=%v", got)
+	}
+}
+
+func TestCompactEndedRefsBoundsStatus(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	g := &runtimev1alpha1.SandboxGrant{}
+	g.Status.Sandboxes = append(g.Status.Sandboxes, runtimev1alpha1.GrantSandboxRef{
+		ID: "live", State: runtimev1alpha1.SandboxRunning,
+	})
+	g.Status.Sandboxes = append(g.Status.Sandboxes, runtimev1alpha1.GrantSandboxRef{
+		ID: "old", State: runtimev1alpha1.SandboxEnded,
+		EndedAt: metav1.NewTime(now.Add(-retention - time.Second)),
+	})
+	for i := 0; i < maxEndedSandboxRefs+2; i++ {
+		g.Status.Sandboxes = append(g.Status.Sandboxes, runtimev1alpha1.GrantSandboxRef{
+			ID:      idOf(i),
+			State:   runtimev1alpha1.SandboxEnded,
+			EndedAt: metav1.NewTime(now),
+		})
+	}
+	if !compactEndedRefs(g, now) {
+		t.Fatal("refs were not compacted")
+	}
+	if len(g.Status.Sandboxes) != maxEndedSandboxRefs+1 || g.Status.Sandboxes[0].ID != "live" {
+		t.Fatalf("refs=%d first=%s", len(g.Status.Sandboxes), g.Status.Sandboxes[0].ID)
+	}
+	if g.Status.Sandboxes[1].ID != idOf(2) {
+		t.Fatalf("oldest retained=%s", g.Status.Sandboxes[1].ID)
+	}
+}
+
 func TestIssueRejectsRoleName(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	for _, role := range []string{"Planner", "code_runner", strings.Repeat("a", 41)} {
@@ -649,6 +768,7 @@ func TestReclaimCountsLiveGPUSecondsOnce(t *testing.T) {
 func TestLookupAccessRejectsRevokedGrant(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	svc, priv, _, _ := testService(t, now)
+	svc.reclaimer = &failOnceReclaimer{}
 	req := sampleRequest(now.Add(time.Hour))
 	req.Attestation = signGrant(t, priv, req)
 	if _, _, err := svc.Issue(context.Background(), req); err != nil {

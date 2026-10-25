@@ -50,6 +50,7 @@ type Recorder interface {
 // Service is the grant admin API backed by SandboxGrant CRs.
 type Service struct {
 	client     ctrlclient.Client
+	reader     ctrlclient.Reader
 	namespace  string
 	dataKey    []byte
 	authn      Authenticator
@@ -65,6 +66,7 @@ type Service struct {
 // Options configures a Service.
 type Options struct {
 	Client     ctrlclient.Client
+	Reader     ctrlclient.Reader
 	Namespace  string
 	DataKey    []byte
 	Authn      Authenticator
@@ -83,8 +85,13 @@ func New(opt Options) *Service {
 	if now == nil {
 		now = time.Now
 	}
+	reader := opt.Reader
+	if reader == nil {
+		reader = opt.Client
+	}
 	return &Service{
 		client:     opt.Client,
+		reader:     reader,
 		namespace:  opt.Namespace,
 		dataKey:    opt.DataKey,
 		authn:      opt.Authn,
@@ -138,6 +145,9 @@ func (s *Service) Issue(ctx context.Context, req IssueRequest) (IssueResponse, i
 	}
 	roles, expanded, stored, err := expandTemplates(req.Issuer.AppRunID, req.Roles, req.Templates)
 	if err != nil {
+		return IssueResponse{}, 0, err
+	}
+	if err := s.resolveTemplateGPUCounts(ctx, req.Issuer.AppRunID, stored); err != nil {
 		return IssueResponse{}, 0, err
 	}
 	if len(s.dataKey) == 0 {
@@ -368,6 +378,14 @@ func (s *Service) ReapOnce(ctx context.Context) {
 	now := s.now()
 	for i := range list {
 		g := &list[i]
+		if refsNeedCompaction(g, now) {
+			if err := s.setStatus(ctx, g.Name, func(cur *runtimev1alpha1.SandboxGrant) error {
+				compactEndedRefs(cur, now)
+				return nil
+			}); err != nil {
+				log.Warn("grant sandbox history cleanup failed", "grant", g.Name, "error", err)
+			}
+		}
 		if g.Status.State == runtimev1alpha1.GrantStateActive && !g.Spec.ExpiresAt.IsZero() && !now.Before(g.Spec.ExpiresAt.Time) {
 			if err := s.setStatus(ctx, g.Name, func(cur *runtimev1alpha1.SandboxGrant) error {
 				cur.Status.State = runtimev1alpha1.GrantStateExpired
@@ -376,20 +394,52 @@ func (s *Service) ReapOnce(ctx context.Context) {
 				log.Warn("grant expire failed", "grant", g.Name, "error", err)
 				continue
 			}
-			_, _ = s.reclaimAll(ctx, g.Name)
 			s.audit(ctx, audit.EventGrantExpired, g.Name, g.Spec.Issuer.SessionID, g.Spec.Issuer.AppRunID, g.Spec.Owner.UserID, g.Spec.Owner.UserName, "")
-			continue
+			g.Status.State = runtimev1alpha1.GrantStateExpired
 		}
 		if s.exists != nil && g.Status.State == runtimev1alpha1.GrantStateActive {
 			s.dropMissing(ctx, g)
 		}
 		ended := g.Status.State == runtimev1alpha1.GrantStateRevoked || g.Status.State == runtimev1alpha1.GrantStateExpired
+		remaining := 0
+		if ended {
+			var reclaimErr error
+			remaining, reclaimErr = s.reclaimAll(ctx, g.Name)
+			if reclaimErr != nil {
+				log.Warn("grant reclaim failed", "grant", g.Name, "error", reclaimErr)
+				continue
+			}
+			if err := s.clearPlatformKey(ctx, g.Name); err != nil && !IsReason(err, "grant_not_found") {
+				log.Warn("grant key cleanup failed", "grant", g.Name, "error", err)
+			}
+			if err := s.deleteTemplates(ctx, g); err != nil {
+				log.Warn("grant template cleanup failed", "grant", g.Name, "error", err)
+			}
+		}
 		if ended && !g.Spec.ExpiresAt.IsZero() && now.After(g.Spec.ExpiresAt.Time.Add(retention)) {
+			if remaining > 0 {
+				continue
+			}
 			if err := s.client.Delete(ctx, g); err != nil && !apierrors.IsNotFound(err) {
 				log.Warn("grant retention delete failed", "grant", g.Name, "error", err)
 			}
 		}
 	}
+}
+
+func refsNeedCompaction(g *runtimev1alpha1.SandboxGrant, now time.Time) bool {
+	ended := 0
+	cutoff := now.Add(-retention)
+	for _, ref := range g.Status.Sandboxes {
+		if ref.State != runtimev1alpha1.SandboxEnded {
+			continue
+		}
+		ended++
+		if !ref.EndedAt.IsZero() && ref.EndedAt.Time.Before(cutoff) {
+			return true
+		}
+	}
+	return ended > maxEndedSandboxRefs
 }
 
 // Run reaps until ctx ends.
@@ -467,7 +517,7 @@ func (s *Service) clearPlatformKey(ctx context.Context, grantID string) error {
 
 func (s *Service) get(ctx context.Context, name string) (*runtimev1alpha1.SandboxGrant, error) {
 	g := &runtimev1alpha1.SandboxGrant{}
-	err := s.client.Get(ctx, types.NamespacedName{Name: name, Namespace: s.namespace}, g)
+	err := s.reader.Get(ctx, types.NamespacedName{Name: name, Namespace: s.namespace}, g)
 	if apierrors.IsNotFound(err) {
 		return nil, opErr(http.StatusNotFound, "grant_not_found", name)
 	}
@@ -479,7 +529,7 @@ func (s *Service) get(ctx context.Context, name string) (*runtimev1alpha1.Sandbo
 
 func (s *Service) list(ctx context.Context) ([]runtimev1alpha1.SandboxGrant, error) {
 	var list runtimev1alpha1.SandboxGrantList
-	if err := s.client.List(ctx, &list, ctrlclient.InNamespace(s.namespace)); err != nil {
+	if err := s.reader.List(ctx, &list, ctrlclient.InNamespace(s.namespace)); err != nil {
 		return nil, opWrap(http.StatusInternalServerError, "grant_list_failed", "", err)
 	}
 	return list.Items, nil

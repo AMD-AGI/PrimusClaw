@@ -14,6 +14,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -175,14 +176,17 @@ func TestCreateReplayKillAndQuota(t *testing.T) {
 	second, status, err := svc.Create(context.Background(), key, CreateBody{
 		TemplateID: "runner", Metadata: map[string]string{"idempotency-key": "once"},
 	})
-	if err != nil || status != http.StatusOK || second.SandboxID != first.SandboxID || second.EnvdAccessToken != "" {
+	if err != nil || status != http.StatusOK || second.SandboxID != first.SandboxID || second.EnvdAccessToken == "" {
 		t.Fatalf("status=%d err=%v second=%+v", status, err, second)
 	}
-	if _, err := svc.Connect(context.Background(), key, first.SandboxID); err != nil {
+	connected, err := svc.Connect(context.Background(), key, first.SandboxID)
+	if err != nil || connected.EnvdAccessToken == "" {
 		t.Fatal(err)
 	}
-	if _, err := svc.grants.LookupAccess(context.Background(), first.SandboxID, first.EnvdAccessToken); err != nil {
-		t.Fatalf("token rejected after connect: %v", err)
+	for _, token := range []string{first.EnvdAccessToken, second.EnvdAccessToken, connected.EnvdAccessToken} {
+		if _, err := svc.grants.LookupAccess(context.Background(), first.SandboxID, token); err != nil {
+			t.Fatalf("token rejected after connect: %v", err)
+		}
 	}
 	if len(runner.created) != 1 {
 		t.Fatalf("replay created again: %d", len(runner.created))
@@ -279,6 +283,19 @@ func TestCreateRefusesMetadataEnvAndTimeout(t *testing.T) {
 	}
 }
 
+func TestCreateClampsDefaultTimeoutToGrant(t *testing.T) {
+	svc, runner, keys := testPlane(t, 120, []int32{1}, 1)
+	_, status, err := svc.Create(context.Background(), keys["measurement"], CreateBody{
+		TemplateID: "ar-01ja-runner-g1",
+	})
+	if err != nil || status != http.StatusCreated {
+		t.Fatalf("status=%d err=%v", status, err)
+	}
+	if len(runner.created) != 1 || runner.created[0].Timeout != 120*time.Second {
+		t.Fatalf("created=%+v", runner.created)
+	}
+}
+
 func TestTemplateMissingIsUnavailable(t *testing.T) {
 	svc, runner, keys := testPlane(t, 0, []int32{1}, 2)
 	runner.fail = ErrTemplateMissing
@@ -333,6 +350,17 @@ func TestSealedAllowsFilesOnly(t *testing.T) {
 	if SealedAllows(http.MethodPost, "/process.Process/Start", true, nil, nil) {
 		t.Fatal("sealed process rpc")
 	}
+	for _, rawPath := range []string{
+		"/api/session/create",
+		"/api/session/s1/exec",
+		"/api/terminal/t1/send_keys",
+		"/api/jobs",
+		"/health",
+	} {
+		if SealedAllows(http.MethodPost, rawPath, true, []string{"/in"}, []string{"/out"}) {
+			t.Fatalf("sealed route allowed: %s", rawPath)
+		}
+	}
 	if !SealedAllows(http.MethodPost, "/filesystem.Filesystem/Stat", true, []string{"/in"}, []string{"/out"}) {
 		t.Fatal("filesystem rpc path is enforced in envd")
 	}
@@ -341,6 +369,14 @@ func TestSealedAllowsFilesOnly(t *testing.T) {
 	}
 	if SealedFileAllows(http.MethodPost, "/in/a", []string{"/in"}, []string{"/out"}) {
 		t.Fatal("write input")
+	}
+	for _, filePath := range []string{"/in/../secret", "/in/sub/../../secret"} {
+		if SealedFileAllows(http.MethodGet, filePath, []string{"/in"}, []string{"/out"}) {
+			t.Fatalf("traversal allowed: %s", filePath)
+		}
+		if SealedAllows(http.MethodGet, "/api/files?path="+url.QueryEscape(filePath), true, []string{"/in"}, []string{"/out"}) {
+			t.Fatalf("HTTP traversal allowed: %s", filePath)
+		}
 	}
 	if !SealedAllows(http.MethodPost, "/api/execute", false, nil, nil) {
 		t.Fatal("unsealed denied")

@@ -102,6 +102,10 @@ func (in *GrantTemplate) DeepCopyInto(out *GrantTemplate) {
 		out.PerGPUCount = make([]int32, len(in.PerGPUCount))
 		copy(out.PerGPUCount, in.PerGPUCount)
 	}
+	if in.GPUCounts != nil {
+		out.GPUCounts = make([]int32, len(in.GPUCounts))
+		copy(out.GPUCounts, in.GPUCounts)
+	}
 }
 
 // DeepCopyInto copies the receiver into out.
@@ -142,6 +146,9 @@ func (in *GrantSandboxRef) DeepCopyInto(out *GrantSandboxRef) {
 	*out = *in
 	in.StartedAt.DeepCopyInto(&out.StartedAt)
 	in.EndedAt.DeepCopyInto(&out.EndedAt)
+	if in.AccessTokenHashes != nil {
+		out.AccessTokenHashes = append([]string(nil), in.AccessTokenHashes...)
+	}
 	if in.Inputs != nil {
 		out.Inputs = append([]string(nil), in.Inputs...)
 	}

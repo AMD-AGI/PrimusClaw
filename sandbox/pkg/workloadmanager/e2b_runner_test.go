@@ -6,9 +6,12 @@ package workloadmanager
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
@@ -29,6 +32,16 @@ func (s cancelDeleteStore) DeleteSandboxBySessionID(ctx context.Context, session
 		return err
 	}
 	return s.Store.DeleteSandboxBySessionID(ctx, sessionID)
+}
+
+type expiredLimitStore struct {
+	store.Store
+	limit int64
+}
+
+func (s *expiredLimitStore) ListExpiredSandboxes(ctx context.Context, before time.Time, limit int64) ([]*store.SandboxInfo, error) {
+	s.limit = limit
+	return s.Store.ListExpiredSandboxes(ctx, before, limit)
 }
 
 func TestCreateE2BSkipsInferenceKey(t *testing.T) {
@@ -137,5 +150,63 @@ func TestDeleteKeepsSessionWhenWorkloadDeleteFails(t *testing.T) {
 	}
 	if _, err := st.GetSandboxBySessionID(context.Background(), "sbx-1"); err != nil {
 		t.Fatalf("session removed: %v", err)
+	}
+}
+
+func TestGCScansPastFailedFirstPage(t *testing.T) {
+	base := store.NewMemoryStore()
+	st := &expiredLimitStore{Store: base}
+	now := time.Now()
+	for i := 0; i < 101; i++ {
+		id := fmt.Sprintf("sbx-%03d", i)
+		if err := base.StoreSandbox(context.Background(), &store.SandboxInfo{
+			Kind: store.WorkloadKind, SessionID: id, SandboxName: id,
+			Namespace: "ns", ExpiresAt: now.Add(-time.Minute), Status: "running",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dc := dynfake.NewSimpleDynamicClientWithCustomListKinds(k8sruntime.NewScheme(), map[schema.GroupVersionResource]string{
+		workloadGVR: "WorkloadList",
+	})
+	srv := New(Config{Namespace: "ns"}, st).WithSafeWorkloads(NewSafeWorkloadCreator(dc, nil))
+	srv.gcOnce(context.Background())
+	if st.limit != 0 {
+		t.Fatalf("limit=%d", st.limit)
+	}
+	if _, err := base.GetSandboxBySessionID(context.Background(), "sbx-100"); err == nil {
+		t.Fatal("record after the old first page was not collected")
+	}
+}
+
+func TestNativeDeleteRemovesSafeWorkload(t *testing.T) {
+	st := store.NewMemoryStore()
+	if err := st.StoreSandbox(context.Background(), &store.SandboxInfo{
+		Kind: store.WorkloadKind, SessionID: "sbx-1", SandboxName: "sbx-1",
+		Namespace: "project1-dev", Status: "running",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "amd.com/v1",
+		"kind":       "Workload",
+		"metadata":   map[string]any{"name": "sbx-1"},
+	}}
+	dc := dynfake.NewSimpleDynamicClientWithCustomListKinds(k8sruntime.NewScheme(), map[schema.GroupVersionResource]string{
+		workloadGVR: "WorkloadList",
+	}, obj)
+	srv := New(DefaultConfig(), st).WithSafeWorkloads(NewSafeWorkloadCreator(dc, nil))
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/v1/code-interpreter/sessions/sbx-1", nil)
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	_, err := dc.Resource(workloadGVR).Get(context.Background(), "sbx-1", metav1.GetOptions{})
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("workload still present: %v", err)
+	}
+	if _, err := st.GetSandboxBySessionID(context.Background(), "sbx-1"); err == nil {
+		t.Fatal("session still present")
 	}
 }

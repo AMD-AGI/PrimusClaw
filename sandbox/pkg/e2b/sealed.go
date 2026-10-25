@@ -6,6 +6,7 @@ package e2b
 import (
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 )
 
@@ -20,23 +21,24 @@ const (
 )
 
 // SealedAllows reports whether a sealed sandbox may serve this request.
-// Process and execute paths are refused. File paths must sit under inputs
-// for reads and outputs for writes. An empty allow-list refuses file access.
-// Filesystem Connect RPCs carry the path in the body, so the URL is allowed
-// and EnvD applies SealedFileAllows using the headers above.
+// Only file APIs are reachable. File paths must sit under inputs for reads and
+// outputs for writes. Filesystem RPC paths are checked from their request body.
 func SealedAllows(method, rawPath string, sealed bool, inputs, outputs []string) bool {
 	if !sealed {
 		return true
 	}
-	path := strings.ToLower(rawPath)
-	if strings.Contains(path, "/execute") || strings.Contains(path, "/process") {
+	requestPath := rawPath
+	if i := strings.IndexByte(requestPath, '?'); i >= 0 {
+		requestPath = requestPath[:i]
+	}
+	switch {
+	case strings.HasPrefix(requestPath, "/filesystem.Filesystem/"):
+		return true
+	case requestPath != "/files" &&
+		!strings.HasPrefix(requestPath, "/files/") &&
+		requestPath != "/api/files" &&
+		!strings.HasPrefix(requestPath, "/api/files/"):
 		return false
-	}
-	if strings.Contains(path, "/filesystem.") {
-		return true
-	}
-	if !strings.Contains(path, "/file") {
-		return true
 	}
 	filePath := filePathOf(rawPath)
 	switch method {
@@ -88,14 +90,20 @@ func pathAllowed(filePath string, allow []string) bool {
 	if filePath == "" {
 		return false
 	}
+	cleaned := cleanPolicyPath(filePath)
 	for _, item := range allow {
 		if item == "" {
 			continue
 		}
-		base := strings.TrimRight(item, "/")
-		if filePath == item || filePath == base || strings.HasPrefix(filePath, base+"/") {
+		base := cleanPolicyPath(item)
+		if base == "/" || cleaned == base || strings.HasPrefix(cleaned, base+"/") {
 			return true
 		}
 	}
 	return false
+}
+
+// cleanPolicyPath normalizes a caller path before allow-list comparison.
+func cleanPolicyPath(value string) string {
+	return path.Clean("/" + strings.TrimPrefix(value, "/"))
 }

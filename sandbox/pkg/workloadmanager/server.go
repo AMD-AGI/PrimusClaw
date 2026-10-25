@@ -1071,29 +1071,10 @@ func (s *Server) handleDeleteSandbox(c *gin.Context) {
 		}
 	}
 
-	if s.k8s != nil {
-		if info.Kind == store.SandboxClaimKind {
-			err = s.k8s.DeleteSandboxClaim(c.Request.Context(), info)
-		} else {
-			err = s.k8s.DeleteSandbox(c.Request.Context(), info)
-		}
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete sandbox: " + err.Error()})
-			return
-		}
+	if err := s.deleteSandboxAndSession(c.Request.Context(), info, audit.ReasonUserDelete); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete sandbox: " + err.Error()})
+		return
 	}
-
-	// Audit: sandbox.deleted (user-initiated)
-	s.emitAudit(c.Request.Context(), &audit.AuditEvent{
-		ID: audit.NewEventID(), EventType: audit.EventDeleted,
-		SessionID: info.SessionID, SandboxName: info.SandboxName, Namespace: info.Namespace,
-		UserID: info.UserID, UserName: info.UserName,
-		Timestamp: time.Now(), DeleteReason: audit.ReasonUserDelete,
-		DurationMs: time.Since(info.CreatedAt).Milliseconds(),
-	})
-	sandboxDeleteTotal.WithLabelValues(audit.ReasonUserDelete).Inc()
-
-	_ = s.store.DeleteSandboxBySessionID(c.Request.Context(), sessionID)
 	c.Status(http.StatusNoContent)
 }
 
@@ -1116,9 +1097,9 @@ func (s *Server) gcOnce(ctx context.Context) {
 	gcCycleTotal.Inc()
 	now := time.Now()
 
-	// Delete sessions past their hard ExpiresAt (maxSessionDuration).
-	// Idle reclaim is Brain's jobs probe; this path is the hard TTL backstop.
-	if expired, err := s.store.ListExpiredSandboxes(ctx, now, 100); err == nil {
+	// Delete every session past its hard ExpiresAt. A fixed first-page limit
+	// would let persistent failures starve later records indefinitely.
+	if expired, err := s.store.ListExpiredSandboxes(ctx, now, 0); err == nil {
 		for _, info := range expired {
 			log.Info("GC: deleting expired sandbox", "session", info.SessionID, "sandbox", info.SandboxName)
 			if err := s.deleteSandboxAndSession(ctx, info, audit.ReasonGCTTL); err != nil {

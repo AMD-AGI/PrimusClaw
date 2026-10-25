@@ -129,7 +129,8 @@ func (s *Service) MarkRunning(ctx context.Context, grantID, sandboxID string, up
 	})
 }
 
-// RotateToken stores a new access-token hash. The raw token is not stored.
+// RotateToken adds an access-token hash while retaining recent tokens.
+// Raw tokens are never stored.
 func (s *Service) RotateToken(ctx context.Context, grantID, sandboxID, hash string) error {
 	if hash == "" {
 		return opErr(http.StatusBadRequest, "invalid_sandbox", "access token hash is required")
@@ -139,7 +140,19 @@ func (s *Service) RotateToken(ctx context.Context, grantID, sandboxID, hash stri
 		if idx < 0 || ref.State == runtimev1alpha1.SandboxEnded {
 			return opErr(http.StatusNotFound, "sandbox_not_found", sandboxID)
 		}
-		ref.AccessTokenHash = hash
+		hashes := tokenHashes(ref)
+		for _, existing := range hashes {
+			if existing == hash {
+				return nil
+			}
+		}
+		const retainedAccessTokens = 8
+		hashes = append(hashes, hash)
+		if len(hashes) > retainedAccessTokens {
+			hashes = hashes[len(hashes)-retainedAccessTokens:]
+		}
+		ref.AccessTokenHash = ""
+		ref.AccessTokenHashes = hashes
 		g.Status.Sandboxes[idx] = ref
 		return nil
 	})
@@ -149,7 +162,12 @@ func (s *Service) RotateToken(ctx context.Context, grantID, sandboxID, hash stri
 // Ending an already ended sandbox is a no-op.
 func (s *Service) EndSandbox(ctx context.Context, grantID, sandboxID, reason string) error {
 	return s.setStatus(ctx, grantID, func(g *runtimev1alpha1.SandboxGrant) error {
-		return endOne(g, sandboxID, reason, s.now())
+		now := s.now()
+		if err := endOne(g, sandboxID, reason, now); err != nil {
+			return err
+		}
+		compactEndedRefs(g, now)
+		return nil
 	})
 }
 
@@ -241,10 +259,10 @@ func (s *Service) LookupAccess(ctx context.Context, sandboxID, token string) (ru
 	}
 	for i := range list {
 		for _, ref := range list[i].Status.Sandboxes {
-			if ref.ID != sandboxID || ref.AccessTokenHash == "" {
+			if ref.ID != sandboxID || (ref.AccessTokenHash == "" && len(ref.AccessTokenHashes) == 0) {
 				continue
 			}
-			if subtle.ConstantTimeCompare([]byte(ref.AccessTokenHash), []byte(want)) == 1 {
+			if tokenHashMatches(ref, want) {
 				if err := usable(&list[i], s.now()); err != nil {
 					return runtimev1alpha1.GrantSandboxRef{}, err
 				}
@@ -254,6 +272,23 @@ func (s *Service) LookupAccess(ctx context.Context, sandboxID, token string) (ru
 		}
 	}
 	return runtimev1alpha1.GrantSandboxRef{}, opErr(http.StatusUnauthorized, "invalid_token", "access token does not match")
+}
+
+func tokenHashes(ref runtimev1alpha1.GrantSandboxRef) []string {
+	hashes := make([]string, 0, 1+len(ref.AccessTokenHashes))
+	if ref.AccessTokenHash != "" {
+		hashes = append(hashes, ref.AccessTokenHash)
+	}
+	hashes = append(hashes, ref.AccessTokenHashes...)
+	return hashes
+}
+
+func tokenHashMatches(ref runtimev1alpha1.GrantSandboxRef, want string) bool {
+	matched := 0
+	for _, hash := range tokenHashes(ref) {
+		matched |= subtle.ConstantTimeCompare([]byte(hash), []byte(want))
+	}
+	return matched == 1
 }
 
 // AuditDenied records a create that the grant refused.
@@ -356,6 +391,8 @@ func endOne(g *runtimev1alpha1.SandboxGrant, sandboxID, reason string, now time.
 	ref.State = runtimev1alpha1.SandboxEnded
 	ref.EndReason = reason
 	ref.EndedAt = metav1.NewTime(now)
+	ref.AccessTokenHash = ""
+	ref.AccessTokenHashes = nil
 	g.Status.Sandboxes[idx] = ref
 	if g.Status.Usage != nil {
 		usage := g.Status.Usage[ref.Role]
@@ -373,6 +410,35 @@ func endOne(g *runtimev1alpha1.SandboxGrant, sandboxID, reason string, now time.
 		g.Status.GPUSeconds += seconds
 	}
 	return nil
+}
+
+const maxEndedSandboxRefs = 1000
+
+// compactEndedRefs retains recent ended refs for idempotency and audit while
+// bounding the status size. Live refs are never removed.
+func compactEndedRefs(g *runtimev1alpha1.SandboxGrant, now time.Time) bool {
+	cutoff := now.Add(-retention)
+	kept := make([]runtimev1alpha1.GrantSandboxRef, 0, len(g.Status.Sandboxes))
+	ended := make([]runtimev1alpha1.GrantSandboxRef, 0, len(g.Status.Sandboxes))
+	for _, ref := range g.Status.Sandboxes {
+		if ref.State != runtimev1alpha1.SandboxEnded {
+			kept = append(kept, ref)
+			continue
+		}
+		if !ref.EndedAt.IsZero() && ref.EndedAt.Time.Before(cutoff) {
+			continue
+		}
+		ended = append(ended, ref)
+	}
+	if len(ended) > maxEndedSandboxRefs {
+		ended = ended[len(ended)-maxEndedSandboxRefs:]
+	}
+	kept = append(kept, ended...)
+	if len(kept) == len(g.Status.Sandboxes) {
+		return false
+	}
+	g.Status.Sandboxes = kept
+	return true
 }
 
 func findSandbox(g *runtimev1alpha1.SandboxGrant, sandboxID string) (runtimev1alpha1.GrantSandboxRef, int) {

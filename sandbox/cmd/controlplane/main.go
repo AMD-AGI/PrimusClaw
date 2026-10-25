@@ -429,7 +429,7 @@ func main() {
 	}
 	apiServer.WithSafeWorkloads(workloadmanager.NewSafeWorkloadCreator(dynamicClient, mgr.GetClient()))
 
-	grants, err := startGrants(ctx, mgr.GetClient(), clientset, dynamicClient, apiServer, st, wmCfg.Namespace)
+	grants, err := startGrants(ctx, mgr.GetClient(), mgr.GetAPIReader(), clientset, dynamicClient, apiServer, st, wmCfg.Namespace)
 	if err != nil {
 		log.Error("grant service init failed", "error", err)
 		os.Exit(1)
@@ -482,7 +482,7 @@ func main() {
 // startGrants serves the grant admin API from SandboxGrant CRs and reaps
 // expired grants. Claw remains the authority; this process keeps the
 // execution copy.
-func startGrants(ctx context.Context, cl ctrlclient.Client, clientset kubernetes.Interface, dyn dynamic.Interface, api *workloadmanager.Server, st store.Store, namespace string) (*grant.Service, error) {
+func startGrants(ctx context.Context, cl ctrlclient.Client, reader ctrlclient.Reader, clientset kubernetes.Interface, dyn dynamic.Interface, api *workloadmanager.Server, st store.Store, namespace string) (*grant.Service, error) {
 	dataKey, err := grant.DataKeyFromEnv()
 	if err != nil {
 		return nil, fmt.Errorf("GRANT_DATA_KEY: %w", err)
@@ -509,6 +509,7 @@ func startGrants(ctx context.Context, cl ctrlclient.Client, clientset kubernetes
 	ns := grant.Namespace(namespace)
 	svc := grant.New(grant.Options{
 		Client:     cl,
+		Reader:     reader,
 		Namespace:  ns,
 		DataKey:    dataKey,
 		Authn:      grant.NewTokenReviewAuthenticator(clientset, grant.AllowedCallersFromEnv()),

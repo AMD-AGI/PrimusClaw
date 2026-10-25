@@ -107,6 +107,8 @@ type GrantRole struct {
 type GrantTemplate struct {
 	Name        string  `json:"name"`
 	PerGPUCount []int32 `json:"perGpuCount,omitempty"`
+	// GPUCounts aligns with the expanded template names and drives quota.
+	GPUCounts []int32 `json:"gpuCounts,omitempty"`
 	// Spec is the template body as JSON. Stored as a string so fields that
 	// CodeInterpreter does not know yet are not dropped.
 	Spec string `json:"spec,omitempty"`
@@ -134,26 +136,27 @@ type GrantRoleUsage struct {
 
 // GrantSandboxRef is one sandbox charged to the grant.
 type GrantSandboxRef struct {
-	ID              string            `json:"id"`
-	Role            string            `json:"role"`
-	GPUs            int32             `json:"gpus"`
-	SessionID       string            `json:"sessionId,omitempty"`
-	StartedAt       metav1.Time       `json:"startedAt,omitempty"`
-	EndedAt         metav1.Time       `json:"endedAt,omitempty"`
-	Alias           string            `json:"alias,omitempty"`
-	TemplateID      string            `json:"templateID,omitempty"`
-	Namespace       string            `json:"namespace,omitempty"`
-	SandboxName     string            `json:"sandboxName,omitempty"`
-	State           string            `json:"state,omitempty"`
-	EndReason       string            `json:"endReason,omitempty"`
-	TimeoutSec      int64             `json:"timeoutSec,omitempty"`
-	IdempotencyKey  string            `json:"idempotencyKey,omitempty"`
-	AccessTokenHash string            `json:"accessTokenHash,omitempty"`
-	NodeName        string            `json:"nodeName,omitempty"`
-	Sealed          bool              `json:"sealed,omitempty"`
-	Inputs          []string          `json:"inputs,omitempty"`
-	Outputs         []string          `json:"outputs,omitempty"`
-	Metadata        map[string]string `json:"metadata,omitempty"`
+	ID                string            `json:"id"`
+	Role              string            `json:"role"`
+	GPUs              int32             `json:"gpus"`
+	SessionID         string            `json:"sessionId,omitempty"`
+	StartedAt         metav1.Time       `json:"startedAt,omitempty"`
+	EndedAt           metav1.Time       `json:"endedAt,omitempty"`
+	Alias             string            `json:"alias,omitempty"`
+	TemplateID        string            `json:"templateID,omitempty"`
+	Namespace         string            `json:"namespace,omitempty"`
+	SandboxName       string            `json:"sandboxName,omitempty"`
+	State             string            `json:"state,omitempty"`
+	EndReason         string            `json:"endReason,omitempty"`
+	TimeoutSec        int64             `json:"timeoutSec,omitempty"`
+	IdempotencyKey    string            `json:"idempotencyKey,omitempty"`
+	AccessTokenHash   string            `json:"accessTokenHash,omitempty"`
+	AccessTokenHashes []string          `json:"accessTokenHashes,omitempty"`
+	NodeName          string            `json:"nodeName,omitempty"`
+	Sealed            bool              `json:"sealed,omitempty"`
+	Inputs            []string          `json:"inputs,omitempty"`
+	Outputs           []string          `json:"outputs,omitempty"`
+	Metadata          map[string]string `json:"metadata,omitempty"`
 }
 
 // +kubebuilder:object:root=true

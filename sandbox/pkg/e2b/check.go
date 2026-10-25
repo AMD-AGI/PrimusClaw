@@ -75,7 +75,7 @@ func resolveTemplate(snap grant.Snapshot, role, requested string) (resolvedTempl
 		return resolvedTemplate{}, grant.Op(http.StatusForbidden, "role_not_allowed", role)
 	}
 	if contains(cap.Templates, requested) {
-		tpl, spec := templateForExpansion(snap, requested)
+		tpl, spec, gpus := templateForExpansion(snap, requested)
 		body, err := parseSpec(spec)
 		if err != nil {
 			return resolvedTemplate{}, err
@@ -84,18 +84,20 @@ func resolveTemplate(snap grant.Snapshot, role, requested string) (resolvedTempl
 		if tpl.Name != "" {
 			alias = tpl.Name
 		}
-		return resolvedFrom(requested, alias, body), nil
+		return resolvedFrom(requested, alias, gpus, body), nil
 	}
 	var matches []string
 	var spec string
+	var gpus int32
 	for _, tpl := range snap.Templates {
 		if tpl.Name != requested {
 			continue
 		}
-		for _, name := range expandNames(snap.AppRunID, tpl) {
+		for i, name := range expandNames(snap.AppRunID, tpl) {
 			if contains(cap.Templates, name) {
 				matches = append(matches, name)
 				spec = tpl.Spec
+				gpus = templateGPUCount(tpl, i)
 			}
 		}
 	}
@@ -104,7 +106,7 @@ func resolveTemplate(snap grant.Snapshot, role, requested string) (resolvedTempl
 		if err != nil {
 			return resolvedTemplate{}, err
 		}
-		return resolvedFrom(matches[0], requested, body), nil
+		return resolvedFrom(matches[0], requested, gpus, body), nil
 	}
 	if len(matches) > 1 {
 		return resolvedTemplate{}, grant.Op(http.StatusForbidden, "template_not_allowed", requested+" matches more than one gpu size")
@@ -112,7 +114,7 @@ func resolveTemplate(snap grant.Snapshot, role, requested string) (resolvedTempl
 	return resolvedTemplate{}, grant.Op(http.StatusForbidden, "template_not_allowed", requested)
 }
 
-func resolvedFrom(id, alias string, body specBody) resolvedTemplate {
+func resolvedFrom(id, alias string, gpus int32, body specBody) resolvedTemplate {
 	pending := defaultPendingWait
 	if body.PendingTimeoutSec > 0 {
 		pending = time.Duration(body.PendingTimeoutSec) * time.Second
@@ -120,7 +122,7 @@ func resolvedFrom(id, alias string, body specBody) resolvedTemplate {
 	return resolvedTemplate{
 		ID:           id,
 		Alias:        alias,
-		GPUs:         gpusFromName(id),
+		GPUs:         gpus,
 		Sealed:       body.Sealed,
 		Inputs:       body.Inputs,
 		Outputs:      body.Outputs,
@@ -129,15 +131,15 @@ func resolvedFrom(id, alias string, body specBody) resolvedTemplate {
 	}
 }
 
-func templateForExpansion(snap grant.Snapshot, expanded string) (runtimev1alpha1.GrantTemplate, string) {
+func templateForExpansion(snap grant.Snapshot, expanded string) (runtimev1alpha1.GrantTemplate, string, int32) {
 	for _, tpl := range snap.Templates {
-		for _, name := range expandNames(snap.AppRunID, tpl) {
+		for i, name := range expandNames(snap.AppRunID, tpl) {
 			if name == expanded {
-				return tpl, tpl.Spec
+				return tpl, tpl.Spec, templateGPUCount(tpl, i)
 			}
 		}
 	}
-	return runtimev1alpha1.GrantTemplate{}, ""
+	return runtimev1alpha1.GrantTemplate{}, "", 0
 }
 
 func expandNames(appRunID string, tpl runtimev1alpha1.GrantTemplate) []string {
@@ -151,16 +153,14 @@ func expandNames(appRunID string, tpl runtimev1alpha1.GrantTemplate) []string {
 	return names
 }
 
-func gpusFromName(name string) int32 {
-	i := strings.LastIndex(name, "-g")
-	if i < 0 || i+2 >= len(name) {
-		return 0
+func templateGPUCount(tpl runtimev1alpha1.GrantTemplate, index int) int32 {
+	if index >= 0 && index < len(tpl.GPUCounts) {
+		return tpl.GPUCounts[index]
 	}
-	n, err := strconv.Atoi(name[i+2:])
-	if err != nil || n < 0 {
-		return 0
+	if index >= 0 && index < len(tpl.PerGPUCount) {
+		return tpl.PerGPUCount[index]
 	}
-	return int32(n)
+	return 0
 }
 
 type specBody struct {

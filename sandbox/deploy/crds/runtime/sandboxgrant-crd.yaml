@@ -94,6 +94,10 @@ spec:
                         type: array
                         items:
                           type: integer
+                      gpuCounts:
+                        type: array
+                        items:
+                          type: integer
                       spec:
                         type: string
                 gpuHoursBudget:
@@ -166,6 +170,10 @@ spec:
                         type: string
                       accessTokenHash:
                         type: string
+                      accessTokenHashes:
+                        type: array
+                        items:
+                          type: string
                       nodeName:
                         type: string
                       sealed:

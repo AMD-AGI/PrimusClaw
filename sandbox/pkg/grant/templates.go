@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -47,8 +46,8 @@ func (s *Service) registerTemplates(ctx context.Context, grantID, appRunID strin
 		if !ok {
 			continue
 		}
-		for _, name := range expandOne(appRunID, TemplateRequest{Name: tpl.Name, PerGPUCount: tpl.PerGPUCount}) {
-			ci := codeInterpreter(grantID, name, base, gpusFromName(name), s.namespace)
+		for i, name := range expandOne(appRunID, TemplateRequest{Name: tpl.Name, PerGPUCount: tpl.PerGPUCount}) {
+			ci := codeInterpreter(grantID, name, base, templateGPUCount(tpl, i), s.namespace)
 			if err := s.client.Create(ctx, ci); err != nil {
 				s.deleteNamedTemplates(ctx, grantID, created)
 				if apierrors.IsAlreadyExists(err) {
@@ -62,6 +61,49 @@ func (s *Service) registerTemplates(ctx context.Context, grantID, appRunID strin
 	return nil
 }
 
+// resolveTemplateGPUCounts records quota counts independently of template names.
+func (s *Service) resolveTemplateGPUCounts(ctx context.Context, appRunID string, templates []runtimev1alpha1.GrantTemplate) error {
+	for i := range templates {
+		tpl := &templates[i]
+		if len(tpl.PerGPUCount) > 0 {
+			tpl.GPUCounts = append([]int32(nil), tpl.PerGPUCount...)
+			continue
+		}
+		_, generated, err := templateFromSpec(tpl.Spec)
+		if err != nil {
+			return opWrap(http.StatusBadRequest, "invalid_grant", "template spec is not JSON", err)
+		}
+		if generated {
+			tpl.GPUCounts = []int32{0}
+			continue
+		}
+		name := expandOne(appRunID, TemplateRequest{Name: tpl.Name})[0]
+		ci := &runtimev1alpha1.CodeInterpreter{}
+		if err := s.reader.Get(ctx, types.NamespacedName{Name: name, Namespace: s.namespace}, ci); err != nil {
+			if apierrors.IsNotFound(err) {
+				return opErr(http.StatusBadRequest, "invalid_grant", "template "+name+" does not exist")
+			}
+			return opWrap(http.StatusInternalServerError, "template_get_failed", name, err)
+		}
+		count := int32(0)
+		if ci.Spec.GPU != nil {
+			count = int32(ci.Spec.GPU.Count)
+		}
+		tpl.GPUCounts = []int32{count}
+	}
+	return nil
+}
+
+func templateGPUCount(tpl runtimev1alpha1.GrantTemplate, index int) int32 {
+	if index >= 0 && index < len(tpl.GPUCounts) {
+		return tpl.GPUCounts[index]
+	}
+	if index >= 0 && index < len(tpl.PerGPUCount) {
+		return tpl.PerGPUCount[index]
+	}
+	return 0
+}
+
 // deleteTemplates removes CodeInterpreters this grant registered.
 func (s *Service) deleteTemplates(ctx context.Context, g *runtimev1alpha1.SandboxGrant) error {
 	s.deleteNamedTemplates(ctx, g.Name, expandedNames(g))
@@ -71,7 +113,7 @@ func (s *Service) deleteTemplates(ctx context.Context, g *runtimev1alpha1.Sandbo
 func (s *Service) deleteNamedTemplates(ctx context.Context, grantID string, names []string) {
 	for _, name := range names {
 		ci := &runtimev1alpha1.CodeInterpreter{}
-		err := s.client.Get(ctx, types.NamespacedName{Name: name, Namespace: s.namespace}, ci)
+		err := s.reader.Get(ctx, types.NamespacedName{Name: name, Namespace: s.namespace}, ci)
 		if apierrors.IsNotFound(err) {
 			continue
 		}
@@ -174,17 +216,4 @@ func digestOf(image string) string {
 		return ""
 	}
 	return digest
-}
-
-// gpusFromName reads the -gN suffix of an expanded template name.
-func gpusFromName(name string) int32 {
-	i := strings.LastIndex(name, "-g")
-	if i < 0 || i+2 >= len(name) {
-		return 0
-	}
-	n, err := strconv.Atoi(name[i+2:])
-	if err != nil || n < 0 {
-		return 0
-	}
-	return int32(n)
 }

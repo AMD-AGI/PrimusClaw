@@ -256,6 +256,7 @@ func sandboxViews(in []runtimev1alpha1.GrantSandboxRef) []runtimev1alpha1.GrantS
 	for i := range in {
 		in[i].DeepCopyInto(&out[i])
 		out[i].AccessTokenHash = ""
+		out[i].AccessTokenHashes = nil
 	}
 	return out
 }
@@ -297,7 +298,10 @@ func sameTemplates(got, want []runtimev1alpha1.GrantTemplate) bool {
 		return false
 	}
 	for i := range want {
-		if got[i].Name != want[i].Name || got[i].Spec != want[i].Spec || !slices.Equal(got[i].PerGPUCount, want[i].PerGPUCount) {
+		if got[i].Name != want[i].Name ||
+			got[i].Spec != want[i].Spec ||
+			!slices.Equal(got[i].PerGPUCount, want[i].PerGPUCount) ||
+			!slices.Equal(got[i].GPUCounts, want[i].GPUCounts) {
 			return false
 		}
 	}
