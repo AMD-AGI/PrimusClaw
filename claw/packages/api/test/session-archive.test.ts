@@ -145,6 +145,19 @@ test("A2 a parent with a running team member is left alone", async () => {
   assert.equal(await statusOf("parent-2"), "archived");
 });
 
+test("A2b owner archive of a parent is refused while a team member runs", async () => {
+  await seed({ id: "parent", idleDays: 0 });
+  await seed({ id: "child", idleDays: 0, agent: "running", parent: "parent" });
+  const server = await app();
+  try {
+    const res = await server.inject({ method: "POST", url: "/v1/sessions/parent/archive" });
+    assert.equal(res.statusCode, 409);
+    assert.equal(await statusOf("parent"), "active");
+  } finally {
+    await server.close();
+  }
+});
+
 test("A3 days = 0 disables the sweep", async () => {
   await seed({ id: "old", idleDays: 400 });
   assert.equal(await archiveIdleSessions(0), 0);

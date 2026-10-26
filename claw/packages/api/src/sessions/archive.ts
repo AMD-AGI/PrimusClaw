@@ -18,6 +18,16 @@ const logger = pino({ name: "session-archive" });
 
 type Queryable = Pick<typeof db, "query">;
 
+/** True for a session no run is in flight on, itself or in a team member. */
+const NO_RUN_IN_FLIGHT = `
+  s.agent_status IS DISTINCT FROM 'running'
+  AND NOT EXISTS (
+    SELECT 1 FROM claw_sessions c
+     WHERE c.parent_session_id = s.session_id
+       AND c.deleted_at IS NULL
+       AND c.agent_status = 'running'
+  )`;
+
 /**
  * Archive the sessions that have been idle for `days` days.
  *
@@ -33,14 +43,8 @@ export async function archiveIdleSessions(days: number, q: Queryable = db): Prom
         SET status = 'archived'
       WHERE s.deleted_at IS NULL
         AND COALESCE(s.status, 'active') = 'active'
-        AND s.agent_status IS DISTINCT FROM 'running'
         AND s.updated_at < NOW() - ($1::int * INTERVAL '1 day')
-        AND NOT EXISTS (
-          SELECT 1 FROM claw_sessions c
-           WHERE c.parent_session_id = s.session_id
-             AND c.deleted_at IS NULL
-             AND c.agent_status = 'running'
-        )`,
+        AND ${NO_RUN_IN_FLIGHT}`,
     [days],
   );
   const archived = r.rowCount ?? 0;
@@ -50,12 +54,12 @@ export async function archiveIdleSessions(days: number, q: Queryable = db): Prom
 
 export type ArchiveResult = "ok" | "running" | "not_found";
 
-/** Owner-requested archive. Refused while a run is in flight; idempotent otherwise. */
+/** Owner-requested archive. Refused while a run is in flight (here or in a team member); idempotent otherwise. */
 export async function archiveSession(sessionId: string, q: Queryable = db): Promise<ArchiveResult> {
   const r = await q.query(
-    `UPDATE claw_sessions SET status = 'archived'
-      WHERE session_id = $1 AND deleted_at IS NULL
-        AND agent_status IS DISTINCT FROM 'running'`,
+    `UPDATE claw_sessions s SET status = 'archived'
+      WHERE s.session_id = $1 AND s.deleted_at IS NULL
+        AND ${NO_RUN_IN_FLIGHT}`,
     [sessionId],
   );
   if ((r.rowCount ?? 0) > 0) return "ok";
