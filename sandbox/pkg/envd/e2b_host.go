@@ -5,7 +5,6 @@ package envd
 
 import (
 	"io"
-	"os"
 
 	e2brpc "sigs.k8s.io/agent-sandbox/pkg/envd/e2b"
 )
@@ -66,12 +65,5 @@ func (s *Server) startE2BCommand(argv []string, dir string, env map[string]strin
 
 // childEnv builds the environment passed to an E2B command.
 func (s *Server) childEnv(env map[string]string) []string {
-	if s != nil && s.inference != nil {
-		return s.buildChildEnv(env)
-	}
-	out := os.Environ()
-	for k, v := range env {
-		out = append(out, k+"="+v)
-	}
-	return out
+	return s.buildChildEnv(env)
 }

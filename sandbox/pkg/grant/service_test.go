@@ -604,7 +604,10 @@ func TestIssueRegistersFromImage(t *testing.T) {
 	if g1.Spec.GPU.Count != 1 || g1.Spec.GPU.SharedMemory != "125Gi" {
 		t.Fatalf("gpu=%+v", g1.Spec.GPU)
 	}
-	assertQuantity(t, g1.Spec.Template.Resources.Requests, "27", "250Gi")
+	assertQuantity(t, g1.Spec.Template.Resources.Requests, "24", "256Gi")
+	if got := g1.Spec.Template.Resources.Requests[corev1.ResourceEphemeralStorage]; got.Cmp(resource.MustParse("187.5Gi")) != 0 {
+		t.Fatalf("storage=%s", got.String())
+	}
 	if digest := envValue(g1.Spec.Template.Environment, "HYPERLOOM_ACTIVE_IMAGE_DIGEST"); digest != "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
 		t.Fatalf("digest=%q", digest)
 	}
@@ -615,7 +618,10 @@ func TestIssueRegistersFromImage(t *testing.T) {
 	if g8.Spec.GPU.Count != 8 || g8.Spec.GPU.SharedMemory != "1000Gi" {
 		t.Fatalf("gpu=%+v", g8.Spec.GPU)
 	}
-	assertQuantity(t, g8.Spec.Template.Resources.Requests, "216", "2000Gi")
+	assertQuantity(t, g8.Spec.Template.Resources.Requests, "192", "2048Gi")
+	if got := g8.Spec.Template.Resources.Requests[corev1.ResourceEphemeralStorage]; got.Cmp(resource.MustParse("1500Gi")) != 0 {
+		t.Fatalf("storage=%s", got.String())
+	}
 	if _, err := svc.Revoke(context.Background(), req.GrantID); err != nil {
 		t.Fatal(err)
 	}
@@ -795,5 +801,17 @@ func TestLookupAccessRejectsRevokedGrant(t *testing.T) {
 	_, err := svc.LookupAccess(context.Background(), "sbx-1", token)
 	if !IsReason(err, "grant_revoked") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestMeasurementTemplateDeniesEgress(t *testing.T) {
+	base := &runtimev1alpha1.CodeInterpreterSandboxTemplate{FromImage: "image:v1"}
+	measurement := codeInterpreter("gr", "ar-01ja-measurement-g8", base, 8, "ns")
+	if measurement.Spec.RuntimePolicy != "agent-restricted" {
+		t.Fatalf("policy=%s", measurement.Spec.RuntimePolicy)
+	}
+	dev := codeInterpreter("gr", "ar-01ja-dev-g1", base, 1, "ns")
+	if dev.Spec.RuntimePolicy != "" {
+		t.Fatalf("dev policy=%s", dev.Spec.RuntimePolicy)
 	}
 }

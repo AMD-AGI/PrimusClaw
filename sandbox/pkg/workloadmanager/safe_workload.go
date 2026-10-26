@@ -294,7 +294,7 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 		"replica":          int64(1),
 		"cpu":              cpu,
 		"memory":           memory,
-		"ephemeralStorage": workloadEphemeralStorage,
+		"ephemeralStorage": ephemeralStorage(ci.Spec.Template.Resources),
 	}
 	if ci.Spec.GPU != nil && ci.Spec.GPU.Count > 0 {
 		resource["gpu"] = strconv.Itoa(ci.Spec.GPU.Count)
@@ -341,6 +341,17 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 		"spec": spec,
 	}}
 	return obj, nil
+}
+
+// ephemeralStorage returns the template pod storage, or the default when unset.
+func ephemeralStorage(req corev1.ResourceRequirements) string {
+	if s := quantityString(req.Limits, corev1.ResourceEphemeralStorage); s != "" {
+		return s
+	}
+	if s := quantityString(req.Requests, corev1.ResourceEphemeralStorage); s != "" {
+		return s
+	}
+	return workloadEphemeralStorage
 }
 
 func resourcePair(req corev1.ResourceRequirements) (string, string) {

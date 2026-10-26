@@ -26,12 +26,23 @@ const grantIDKey = "agent-sandbox.io/grant-id"
 const gpuResourceName = "amd.com/gpu"
 
 // Per-card size applied to every GPU expansion. Card count scales these linearly.
+// Eight cards are 192 CPU, 2048Gi memory, and 1500Gi pod storage.
 const (
-	cpuPerGPU      = 27
-	memoryGiPerGPU = 250
+	cpuPerGPU      = 24
+	memoryGiPerGPU = 256
 	shmGiPerGPU    = 125
 	imageDigestEnv = "HYPERLOOM_ACTIVE_IMAGE_DIGEST"
 )
+
+// storagePerGPU is the pod ephemeral storage for one GPU.
+var storagePerGPU = resource.MustParse("187.5Gi")
+
+// scaledStorage returns pod storage for the given card count.
+func scaledStorage(gpus int32) resource.Quantity {
+	q := storagePerGPU.DeepCopy()
+	q.Mul(int64(gpus))
+	return q
+}
 
 // registerTemplates creates a CodeInterpreter for each expansion whose spec
 // names a fromImage. Specs without fromImage are skipped.
@@ -141,13 +152,16 @@ func codeInterpreter(grantID, name string, base *runtimev1alpha1.CodeInterpreter
 	if gpus > 0 {
 		cpu := resource.MustParse(fmt.Sprintf("%d", cpuPerGPU*gpus))
 		mem := resource.MustParse(fmt.Sprintf("%dGi", memoryGiPerGPU*gpus))
+		storage := scaledStorage(gpus)
 		tmpl.Resources.Requests = corev1.ResourceList{
-			corev1.ResourceCPU:    cpu,
-			corev1.ResourceMemory: mem,
+			corev1.ResourceCPU:              cpu,
+			corev1.ResourceMemory:           mem,
+			corev1.ResourceEphemeralStorage: storage,
 		}
 		tmpl.Resources.Limits = corev1.ResourceList{
-			corev1.ResourceCPU:    cpu,
-			corev1.ResourceMemory: mem,
+			corev1.ResourceCPU:              cpu,
+			corev1.ResourceMemory:           mem,
+			corev1.ResourceEphemeralStorage: storage.DeepCopy(),
 		}
 	}
 	if digest := digestOf(tmpl.FromImage); digest != "" {
@@ -171,7 +185,32 @@ func codeInterpreter(grantID, name string, base *runtimev1alpha1.CodeInterpreter
 			SharedMemory: fmt.Sprintf("%dGi", shmGiPerGPU*gpus),
 		}
 	}
+	if measurementTemplate(name) {
+		ci.Spec.RuntimePolicy = "agent-restricted"
+	}
 	return ci
+}
+
+// measurementTemplate reports whether name is the measurement template or one
+// of its per-GPU expansions, such as ar-01ja-measurement-g8.
+func measurementTemplate(name string) bool {
+	base := name
+	if i := strings.LastIndex(name, "-g"); i > 0 && digitsOnly(name[i+2:]) {
+		base = name[:i]
+	}
+	return base == "measurement" || strings.HasSuffix(base, "-measurement")
+}
+
+func digitsOnly(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func ownedByGrant(ci *runtimev1alpha1.CodeInterpreter, grantID string) bool {

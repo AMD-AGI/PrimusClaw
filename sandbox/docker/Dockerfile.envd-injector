@@ -134,11 +134,10 @@ ARG EXTRA_CA_CERT_URLS=""
 
 RUN apk add --no-cache ca-certificates wget
 
-# The output files are always created, empty when no URLs were given, so the
-# final stage's COPY instructions succeed either way. setup-extra-ca.sh treats
-# an empty bundle as "no anchors from the image".
-RUN mkdir -p /extra-ca \
-    && : > /extra-ca/ca-bundle.pem \
+# docker/certs holds the AMD root and issuing CAs. They are always in the
+# bundle. EXTRA_CA_CERT_URLS appends more anchors when set.
+COPY docker/certs/amd-root-ca.crt docker/certs/amd-issuing-ca.crt /extra-ca/
+RUN cat /extra-ca/amd-root-ca.crt /extra-ca/amd-issuing-ca.crt > /extra-ca/ca-bundle.pem \
     && if [ -n "$EXTRA_CA_CERT_URLS" ]; then \
          i=0; \
          for url in $EXTRA_CA_CERT_URLS; do \
@@ -151,7 +150,7 @@ RUN mkdir -p /extra-ca \
          done; \
          echo "bundled $i extra CA anchor(s)."; \
        else \
-         echo "no extra CA anchors requested (EXTRA_CA_CERT_URLS empty)."; \
+         echo "AMD CAs bundled; EXTRA_CA_CERT_URLS empty."; \
        fi
 
 # ── Stage 4: Final injector image ─────────────────────────────────────────────────────
@@ -161,8 +160,9 @@ COPY --from=envd-builder /envd /envd
 COPY --from=tmux-builder /tmux /tmux
 COPY --from=iptables-builder /iptables /iptables
 COPY --from=iptables-builder /musl-ld.so /musl-ld.so
-# Empty unless the build opted in via EXTRA_CA_CERT_URLS. Paths are a contract
-# (see Stage 3); sandbox/pkg/workloadmanager/extra_ca_test.go pins them.
+# The bundle always contains the AMD CAs from docker/certs, plus any anchors
+# requested with EXTRA_CA_CERT_URLS. Paths are a contract (see Stage 3);
+# sandbox/pkg/workloadmanager/extra_ca_test.go pins them.
 COPY --from=ca-fetcher /extra-ca/ca-bundle.pem /extra-ca-bundle.pem
 COPY docker/scripts/setup-extra-ca.sh          /setup-extra-ca.sh
 # Deprecated compatibility copies of the two files above, same content, for

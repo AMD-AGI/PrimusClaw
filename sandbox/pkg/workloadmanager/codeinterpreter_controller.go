@@ -347,7 +347,7 @@ func shellSingleQuote(s string) string {
 //
 // Example output:
 //
-//	mkdir -p /home/sandbox && pip install numpy -q && exec /shared/bin/envd --port=8080 --workspace=/home/sandbox
+//	mkdir -p /app/work && pip install numpy -q && exec /shared/bin/envd --port=8080 --workspace=/app/work
 func buildStartupScript(steps []runtimev1alpha1.SandboxBuildStep, workspace string) string {
 	var parts []string
 	// Create workspace directory — it may not exist in the base image.
@@ -396,7 +396,7 @@ func codeInterpreterVolumeMountToCore(vm runtimev1alpha1.CodeInterpreterVolumeMo
 // errors when the workspace path doesn't exist in the base image.
 func (r *CodeInterpreterReconciler) buildPodTemplate(ci *runtimev1alpha1.CodeInterpreter) sandboxv1alpha1.PodTemplate {
 	tmpl := ci.Spec.Template
-	workspace := "/home/sandbox"
+	workspace := "/app/work"
 
 	// Normalize RuntimeClassName
 	runtimeClass := tmpl.RuntimeClassName
