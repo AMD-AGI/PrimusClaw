@@ -6,7 +6,7 @@ import { getUser } from "../auth/middleware.js";
 import { canAccessSessionAsOperator } from "../auth/models.js";
 import { db } from "../infra/db.js";
 import { createSessionSubscription } from "../events/store.js";
-import { appEventKey } from "../events/app-events.js";
+import { appEventIdentity, appEventKey } from "../events/app-events.js";
 import { redactPublicJson } from "../events/redaction.js";
 /**
  * V2-native SSE event stream: Brain events are forwarded verbatim (raw V2
@@ -59,6 +59,29 @@ function shouldForward(evt: Record<string, unknown>, opts: ForwardOpts): boolean
  * ends, because it is the one that stops reading the table and starts reading
  * the subscription.
  */
+/**
+ * True when `evt` (live, as stream message `liveId`) is a repeat of an app event
+ * the database already holds under another stream sequence. The database is the
+ * authority on what was already stored, whichever connection this is and however
+ * long ago the first copy was published (hosting design 5.7). Names no `data`
+ * column: it asks only for the kept row's event_id.
+ */
+export async function isRepeatOfStoredAppEvent(
+  sessionId: string, evt: Record<string, unknown>, liveId: string,
+): Promise<boolean> {
+  const identity = appEventIdentity(evt);
+  if (!identity) return false;
+  const r = await db.query(
+    `SELECT event_id FROM claw_session_events
+      WHERE session_id = $1 AND event = 'appEvent' AND deleted_at IS NULL
+        AND data->>'app_task_id' = $2 AND (data->'event')->>'id' = $3
+      ORDER BY id LIMIT 1`,
+    [sessionId, identity.appTaskId, identity.eventId],
+  );
+  const kept = r.rows[0] as { event_id: string } | undefined;
+  return kept !== undefined && kept.event_id !== liveId;
+}
+
 export const HISTORY_COMPLETE_EVENT = "historyComplete";
 
 interface HistorySegment {
@@ -237,6 +260,7 @@ export async function registerEventRoutes(app: FastifyInstance): Promise<void> {
           if (appKey !== null) {
             if (seenAppEvents.has(appKey)) continue;
             seenAppEvents.add(appKey);
+            if (await isRepeatOfStoredAppEvent(sessionId, evt, liveId).catch(() => false)) continue;
           }
           if (!sseWrite(`id: ${liveId}\nevent: ${name}\ndata: ${JSON.stringify(evt)}\n\n`)) break;
         }

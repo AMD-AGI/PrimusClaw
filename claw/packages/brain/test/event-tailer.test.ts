@@ -20,7 +20,7 @@ import { join } from "node:path";
 
 import { AppRunner } from "../src/apps/app-runner.js";
 import {
-  EVENTS_PER_ROUND, EVENTS_READ_BYTES, EVENT_MAX_BYTES, checkEnvelope, createEventTailer, scanLines, tailOnce,
+  EVENTS_PER_ROUND, EVENTS_READ_BYTES, PUBLISH_CONCURRENCY, EVENT_MAX_BYTES, checkEnvelope, createEventTailer, scanLines, tailOnce,
   type AppEventMessage, type EventTailerDeps,
 } from "../src/apps/event-tailer.js";
 import type { AppEventsCursor, AppRunRecord } from "../src/apps/app-run-store.js";
@@ -59,10 +59,13 @@ function rig(opts: { failPublishAt?: number } = {}) {
       published.push(message);
     },
   };
-  const ctx = (): AppRunContext => ({ record: world.rec as AppRunRecord, instance: { id: "wl-1" } as never });
+  let execCalls = 0;
+  const counted = deps.exec;
+  deps.exec = (inst, command, timeout) => { execCalls += 1; return counted(inst, command, timeout); };
+  const ctx = (): AppRunContext => ({ record: world.rec as AppRunRecord, instance: { id: "wl-1" } as never, scrub: (t) => t });
   const ids = (): string[] => published.map((m) => String((m.event as { id: string }).id));
   const file = (n: number): string => `${eventsDir}/${seg(n)}`;
-  return { world, deps, ctx, published, ids, file, eventsDir, calls: () => publishCalls };
+  return { world, deps, ctx, published, ids, file, eventsDir, calls: () => publishCalls, execs: () => execCalls };
 }
 type Rig = ReturnType<typeof rig>;
 
@@ -171,14 +174,27 @@ test("the cursor is on the row, so a new tailer (another Brain, or a restart) ca
   assert.deepEqual(r.ids(), ["1", "2", "3"], "only the new event is published after the resume");
 });
 
-test("a failed publish keeps what was published, and the next round resumes at the one that failed", async () => {
+test("a failed publish keeps what came before it; the next round resumes at the one that failed (at least once)", async () => {
   const r = rig({ failPublishAt: 3 });
   writeFileSync(r.file(1), `${ev(1)}\n${ev(2)}\n${ev(3)}\n${ev(4)}\n`);
   await assert.rejects(tail(r), /nats down/);
-  assert.deepEqual(r.ids(), ["1", "2"]);
-  assert.equal(r.world.rec.events_cursor.last_id, "2", "the cursor moved over the two that went out");
+  assert.equal(r.world.rec.events_cursor.last_id, "2", "the cursor moved over the two that went out before the failure");
+  assert.deepEqual(r.ids().slice(0, 2), ["1", "2"]);
   await tail(r);
-  assert.deepEqual(r.ids(), ["1", "2", "3", "4"]);
+  const tailIds = r.ids();
+  for (const id of ["1", "2", "3", "4"]) assert.ok(tailIds.includes(id), `id ${id} was published`);
+  assert.equal(r.world.rec.events_cursor.last_id, "4");
+});
+
+test("events go out in order and several at a time: a batch is not one round trip each", async () => {
+  const r = rig();
+  let inFlight = 0; let peak = 0;
+  const slow = r.deps.publish;
+  r.deps.publish = async (sid, m) => { inFlight++; peak = Math.max(peak, inFlight); await new Promise((x) => setTimeout(x, 5)); inFlight--; return slow(sid, m); };
+  writeFileSync(r.file(1), Array.from({ length: 100 }, (_, i) => ev(i + 1)).join("\n") + "\n");
+  await tail(r);
+  assert.deepEqual(r.ids(), Array.from({ length: 100 }, (_, i) => String(i + 1)));
+  assert.ok(peak > 1 && peak <= PUBLISH_CONCURRENCY, `peak concurrency ${peak}`);
 });
 
 test("a cursor write that fails after the publish means a repeat on the next round, never a loss", async () => {
@@ -336,4 +352,71 @@ test("tailOnce answers where the cursor ended and whether it moved", async () =>
   const again = await tailOnce(r.deps, r.ctx(), first.cursor);
   assert.equal(again.progressed, false);
   assert.equal(r.calls(), 1);
+});
+
+// ---------------------------------------------------------------------------
+// review follow-ups
+// ---------------------------------------------------------------------------
+
+test("without the run's secrets nothing is read and the cursor stays: a line is never forwarded unscrubbed", async () => {
+  const r = rig();
+  writeFileSync(r.file(1), `${ev(1, { data: { note: "SECRET-VALUE-123" } })}\n`);
+  const unarmed = { ...r.ctx(), scrub: undefined };
+  await createEventTailer(r.deps).tailEvents!(unarmed);
+  assert.equal(r.published.length, 0);
+  assert.deepEqual(r.world.rec.events_cursor, {});
+  assert.equal(r.execs(), 0, "not even read");
+  await assert.rejects(createEventTailer(r.deps).drainEvents!(unarmed), /secrets/, "a drain must fail (and be retried), not finish having read nothing");
+  // Armed later, the same line goes out, scrubbed.
+  await createEventTailer(r.deps).tailEvents!({ ...r.ctx(), scrub: (t) => t.split("SECRET-VALUE-123").join("[redacted]") });
+  assert.equal(r.published.length, 1);
+  assert.doesNotMatch(JSON.stringify(r.published), /SECRET-VALUE-123/);
+});
+
+test("segment numbering that goes back (directory emptied, numbers start again) starts over at the oldest segment", async () => {
+  const r = rig();
+  writeFileSync(r.file(5), `${ev(1)}\n${ev(2)}\n`);
+  await tail(r);
+  assert.equal(r.world.rec.events_cursor.segment, seg(5));
+  rmSync(r.file(5));
+  writeFileSync(r.file(0), `${ev(2)}\n${ev(3)}\n${ev(4)}\n`);
+  await tail(r);
+  assert.equal(r.world.rec.events_cursor.segment, seg(0), "no longer stuck on a segment that is never coming back");
+  assert.deepEqual(r.ids(), ["1", "2", "3", "4"], "last_id drops what was forwarded already (2), the rest goes out");
+});
+
+test("an idle round is one exec, not two", async () => {
+  const r = rig();
+  writeFileSync(r.file(1), `${ev(1)}\n`);
+  await tail(r);
+  const before = r.execs();
+  await tail(r);
+  assert.equal(r.execs() - before, 1);
+});
+
+test("the listing is taken before the read inside the one exec, so a roll-over cannot lose the old tail", async () => {
+  const r = rig();
+  writeFileSync(r.file(1), `${ev(1)}\n`);
+  await tail(r);
+  appendFileSync(r.file(1), `${ev(2)}\n`);
+  writeFileSync(r.file(2), `${ev(3)}\n`);
+  await tail(r);
+  await tail(r);
+  assert.deepEqual(r.ids(), ["1", "2", "3"]);
+});
+
+test("appStatus carries the outcome only, and appEvent goes out with a stream de-duplication id", async () => {
+  const r = rig();
+  const out: Array<{ msg: Record<string, unknown>; opts?: { msgID?: string } }> = [];
+  const sandbox = { ...r.world.sandbox, exec: (i: never, c: string, t: string) => r.deps.exec(i, c, t) };
+  const seams = eventForwardingSeams(r.world.store, sandbox as never, async (_s, msg, opts) => { out.push({ msg, opts }); });
+  await seams.stateChanged!({
+    ...(r.world.rec as AppRunRecord), state: "finishing",
+    last_exit: { at: "t", cause: "cancelled", final: false, stop_at: "t2", finish_done: ["x"], recovery: true, stop_reason: "why" },
+  });
+  assert.deepEqual(out[0]!.msg.last_exit, { at: "t", cause: "cancelled", final: false, stop_reason: "why" });
+
+  writeFileSync(r.file(1), `${ev(7)}\n`);
+  await seams.tailEvents!(r.ctx());
+  assert.equal(out[1]!.opts?.msgID, `${RUN_ID}:7`);
 });

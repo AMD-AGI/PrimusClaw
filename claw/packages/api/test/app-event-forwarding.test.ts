@@ -13,10 +13,11 @@
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach } from "node:test";
 
+import { APP_EVENT_ID, APP_EVENT_SEGMENT_NAME } from "@claw/protocol";
 import { consumeEventDelivery, tombstoneReader } from "../src/events/consumer.js";
 import { APP_EVENT_UNIQUE_INDEX_SQL } from "../src/infra/db.js";
 import { appEventIdentity, appEventKey } from "../src/events/app-events.js";
-import { historySegment } from "../src/routes/events.js";
+import { historySegment, isRepeatOfStoredAppEvent } from "../src/routes/events.js";
 import { parseAppRunPatch } from "../src/routes/internal-apps.js";
 import { patchAppRun, readAppRun } from "../src/tasks/app-run-state.js";
 import { startHarness, type Harness } from "./scenario-harness.js";
@@ -163,4 +164,32 @@ test("the lease holder's cursor write is stored and read back; another worker's 
   const other = await patchAppRun("t1", { brainId: "brain-2", claimCount: 3 }, { events_cursor: { offset: 1 } });
   assert.equal(other.ok, false);
   assert.deepEqual((await readAppRun("t1"))!.events_cursor, cursor, "a refused write changes nothing");
+});
+
+test("an appEvent the identity check rejects but the index still keys is absorbed, not nak'd for ever", async () => {
+  // A numeric id and an empty app_task_id: appEventIdentity says null, the index has keys for both.
+  const numeric = { type: "appEvent", app_task_id: "t1", event: { id: 42 } };
+  const emptyTask = { type: "appEvent", app_task_id: "", event: { id: "42" } };
+  for (const e of [numeric, emptyTask]) {
+    assert.deepEqual(await deliver(e, 1), ["ack"]);
+    assert.deepEqual(await deliver(e, 2), ["ack"], "the second copy is acked, not retried");
+  }
+  assert.equal((await rows()).length, 2, "one row each");
+});
+
+test("a live app event is a repeat when the database holds it under another stream sequence", async () => {
+  await deliver(appEvent("t1", "42"), 90);
+  const evt = appEvent("t1", "42");
+  assert.equal(await isRepeatOfStoredAppEvent("s1", evt, "claw-130"), true, "published again after a takeover");
+  assert.equal(await isRepeatOfStoredAppEvent("s1", evt, "claw-90"), false, "the kept copy itself is shown");
+  assert.equal(await isRepeatOfStoredAppEvent("s1", appEvent("t1", "43"), "claw-131"), false);
+  assert.equal(await isRepeatOfStoredAppEvent("s2", evt, "claw-130"), false, "another session's history is not this one's");
+  assert.equal(await isRepeatOfStoredAppEvent("s1", { type: "toolUsed" }, "claw-1"), false);
+});
+
+test("the shared cursor shapes are the protocol's", () => {
+  assert.equal(APP_EVENT_SEGMENT_NAME.test("0000000001.jsonl"), true);
+  assert.equal(APP_EVENT_SEGMENT_NAME.test("1.jsonl"), false);
+  assert.equal(APP_EVENT_ID.test("18446744073709551615"), true);
+  assert.equal(APP_EVENT_ID.test("1".repeat(21)), false);
 });

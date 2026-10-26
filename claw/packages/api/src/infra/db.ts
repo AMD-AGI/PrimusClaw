@@ -489,7 +489,7 @@ async function readIndexValidity(
  * can be published again under a new stream sequence. Exported so a test builds
  * this very index and not a copy of it.
  */
-export const APP_EVENT_UNIQUE_INDEX_SQL = `CREATE UNIQUE INDEX IF NOT EXISTS uq_session_events_app_event
+export const APP_EVENT_UNIQUE_INDEX_SQL = `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS uq_session_events_app_event
   ON claw_session_events(session_id, (data->>'app_task_id'), ((data->'event')->>'id'))
   WHERE event = 'appEvent'`;
 
@@ -1292,9 +1292,28 @@ export async function initDb(): Promise<void> {
 
     // An application's progress event is forwarded at least once (hosting design
     // 5.7); the consumer stores it once per (session, app run, CloudEvents id).
-    // Not swallowed: the consumer's bare `ON CONFLICT DO NOTHING` is only a
-    // de-duplication while this index exists.
-    await client.query(APP_EVENT_UNIQUE_INDEX_SQL);
+    //
+    // CONCURRENTLY, like idx_events_session_recent below: a plain build takes SHARE
+    // on the table the event-consumer writes for every Brain event. And not fatal:
+    // a build that fails (a lock or statement timeout, or a duplicate pair already
+    // stored) is logged and the API starts without it. Until the index is valid the
+    // consumer's bare `ON CONFLICT DO NOTHING` de-duplicates nothing, so a repeated
+    // app event is stored twice, which is the degraded mode and not an outage.
+    // A killed or failed build leaves an INVALID index that IF NOT EXISTS then
+    // skips; dropping only that leftover lets the next boot retry.
+    try {
+      await client.query(APP_EVENT_UNIQUE_INDEX_SQL);
+    } catch (err) {
+      logger.warn({ err: (err as Error)?.message }, "db.uq_session_events_app_event_failed (repeated app events are not de-duplicated until it builds)");
+      const leftover = await client.query(
+        `SELECT indisvalid FROM pg_index i
+           JOIN pg_class c ON c.oid = i.indexrelid
+          WHERE c.relname = 'uq_session_events_app_event'`,
+      ).catch(() => ({ rows: [] as Array<{ indisvalid: boolean }> }));
+      if (leftover.rows[0]?.indisvalid === false) {
+        await client.query("DROP INDEX CONCURRENTLY IF EXISTS uq_session_events_app_event").catch(() => {});
+      }
+    }
 
     // The turn a completion produced, named by the message that asked for it.
     //

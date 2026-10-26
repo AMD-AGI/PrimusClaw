@@ -10,7 +10,7 @@ import { getSafeWorkloadProvider } from "../sandbox/factory.js";
 import {
   AppRunner, noopAppGrant, type AppGrantRunHooks, type AppRunnerSeams, type AppSandboxOps,
 } from "./app-runner.js";
-import { httpAppRunStore, type AppRunStore } from "./app-run-store.js";
+import { httpAppRunStore, type AppRunRecord, type AppRunStore } from "./app-run-store.js";
 import { createEventTailer } from "./event-tailer.js";
 import {
   appSandboxInstance, ensureAppSandbox, findLiveAppSandboxes, readSandboxNodeName,
@@ -40,7 +40,17 @@ export function bindAppRunnerExtensions(ext: { grant?: AppGrantRunHooks; seams?:
 }
 
 /** To the session's event stream (`events.<sessionId>`). */
-export type AppEventPublisher = (sessionId: string, event: Record<string, unknown>) => Promise<void>;
+export type AppEventPublisher = (sessionId: string, event: Record<string, unknown>, opts?: { msgID?: string }) => Promise<void>;
+
+/** What `last_exit` shows a client: the outcome, not the runner's bookkeeping (`finish_done`, `stop_at`, `recovery`). */
+export function publicLastExit(exit: AppRunRecord["last_exit"]): Record<string, unknown> | null {
+  if (!exit) return null;
+  const out: Record<string, unknown> = {};
+  for (const key of ["at", "cause", "final", "returncode", "stop_reason", "error"] as const) {
+    if (exit[key] !== undefined) out[key] = exit[key];
+  }
+  return out;
+}
 
 /**
  * The seams that forward the application's events (5.7): its progress events as
@@ -54,13 +64,14 @@ export function eventForwardingSeams(
   const tailer = createEventTailer({
     exec: (inst, command, timeout) => sandbox.exec(inst, command, timeout),
     store,
-    publish,
+    // The same event published again (a takeover re-reads a batch) is dropped by the stream itself.
+    publish: (sessionId, message) => publish(sessionId, message, { msgID: `${message.app_task_id}:${String(message.event.id)}` }),
   });
   return {
     ...tailer,
     stateChanged: async (rec) => {
       await publish(rec.session_id, {
-        type: "appStatus", app_task_id: rec.run_id, state: rec.state, restarts: rec.restarts, last_exit: rec.last_exit,
+        type: "appStatus", app_task_id: rec.run_id, state: rec.state, restarts: rec.restarts, last_exit: publicLastExit(rec.last_exit),
       });
     },
   };

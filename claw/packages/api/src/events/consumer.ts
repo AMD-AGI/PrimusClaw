@@ -397,16 +397,21 @@ export async function consumeEventDelivery(msg: {
     let rowId: number | null = null;
     // An application's progress event is published at least once (hosting design
     // 5.7), so the same one can arrive under a new stream sequence. It is stored
-    // once per (session, app run, event id): the unique index `uq_session_events_app_event`.
-    // Bare ON CONFLICT, because that index is a second way the insert can conflict.
+    // once per (session, app run, event id) by the unique index
+    // `uq_session_events_app_event`. Every `appEvent` takes the bare ON CONFLICT,
+    // not only one with a well-formed identity: the index's own predicate is
+    // wider than the identity check (a numeric id, an empty app_task_id still have
+    // index keys), and a targeted `ON CONFLICT (event_id, session_id)` does not
+    // absorb that index's 23505, which would nak the message for ever.
+    const isAppEvent = event.type === "appEvent";
     const appEvent = appEventIdentity(event);
     try {
       const insertResult = await db.query(
-        `INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, $3, $4) ON CONFLICT ${appEvent ? "" : "(event_id, session_id) "}DO NOTHING RETURNING id`,
+        `INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, $3, $4) ON CONFLICT ${isAppEvent ? "" : "(event_id, session_id) "}DO NOTHING RETURNING id`,
         [eventId, sessionId, (event.type as string) || "message", event],
       );
-      if (appEvent && !insertResult.rowCount) {
-        logger.info({ sessionId, appTaskId: appEvent.appTaskId, appEventId: appEvent.eventId }, "event-consumer.app_event_duplicate_dropped");
+      if (isAppEvent && !insertResult.rowCount) {
+        logger.info({ sessionId, appTaskId: appEvent?.appTaskId, appEventId: appEvent?.eventId }, "event-consumer.app_event_duplicate_dropped");
         msg.ack();
         return;
       }

@@ -125,7 +125,10 @@ export const noopAppGrant: AppGrantRunHooks = {
 export interface AppRunContext {
   record: AppRunRecord;
   instance: SandboxInstance | null;
-  /** `text` with the run's secret values replaced; for anything that reads what the application wrote. */
+  /**
+   * `text` with the run's secret values replaced; for anything that reads what the application wrote.
+   * Absent until the secrets have loaded: a seam that needs it waits for it.
+   */
   scrub?(text: string): string;
 }
 
@@ -384,9 +387,7 @@ export class AppRunner {
     this.halted = false;
     this.rec = await this.deps.store.load(this.runId);
     if (this.rec.state !== "finishing" && this.rec.state !== "ended") {
-      this.rec = await this.deps.store.patch(
-        this.runId, { state: "finishing", last_exit: { at: this.iso(), cause, final: false } },
-      );
+      await this.commit({ state: "finishing", last_exit: { at: this.iso(), cause, final: false } });
     }
     for (let failures = 0; ; ) {
       try {
@@ -412,9 +413,7 @@ export class AppRunner {
    */
   async markEnded(error: string): Promise<boolean> {
     try {
-      this.rec = await this.deps.store.patch(
-        this.runId, { state: "ended", last_exit: { at: this.iso(), cause: "start_failed", final: false, error: clip(error) } },
-      );
+      await this.commit({ state: "ended", last_exit: { at: this.iso(), cause: "start_failed", final: false, error: clip(error) } });
       return true;
     } catch (err) {
       if (err instanceof AppRunWriteRefused) return false;
@@ -757,6 +756,12 @@ export class AppRunner {
     return this.countedRestart("sandbox_lost");
   }
 
+  /** False only when SaFE says the workload is terminal or absent; a status that cannot be read throws, and the step retries. */
+  private async sandboxPresent(inst: SandboxInstance): Promise<boolean> {
+    const status = await this.deps.sandbox.status(inst);
+    return status.state !== "terminal" && status.state !== "absent";
+  }
+
   private instance(): SandboxInstance | null {
     const id = this.rec.sandbox_workload_id;
     return id ? this.deps.sandbox.instance(this.sandboxRun(), id) : null;
@@ -777,7 +782,9 @@ export class AppRunner {
   // ---- running ------------------------------------------------------------
 
   private seamContext(instance: SandboxInstance | null): AppRunContext {
-    return { record: this.rec, instance, scrub: (text) => this.scrubbed(text) };
+    // `scrub` exists only once the run's secret values are known: a seam that reads
+    // what the application wrote must not forward it while it cannot clean it.
+    return { record: this.rec, instance, ...(this.secretsLoaded ? { scrub: (text: string) => this.scrubbed(text) } : {}) };
   }
 
   private async runningSeams(ctx: AppRunContext): Promise<void> {
@@ -803,7 +810,15 @@ export class AppRunner {
     const cancelled = cause === "cancelled" || cause === "deadline" || cause === "row_terminal";
 
     if (cancelled && !(await this.step("stop_application", () => this.stopApplication(inst)))) return { done: false };
-    await this.step("drain_events", () => this.seams.drainEvents?.(ctx));
+    await this.step("drain_events", async () => {
+      if (!this.seams.drainEvents) return;
+      // A sandbox that is gone cannot be read: say what was left, do not spend the step's attempts on it.
+      if (inst && !(await this.sandboxPresent(inst))) {
+        logger.warn({ runId: this.runId, workloadId: inst.id, cursor: rec.events_cursor }, "app_run.events_not_drained_sandbox_gone");
+        return;
+      }
+      await this.seams.drainEvents(ctx);
+    });
     await this.step("revoke_grant", async () => {
       await this.grant.revoke(run);
       // Recorded on the row as well, so extendGrant refuses it from here on (and
@@ -965,15 +980,29 @@ export class AppRunner {
   /** Persist a transition, compare-and-set on `from` when given. */
   private async move(patch: AppRunPatch, from?: AppRunState): Promise<void> {
     this.assertActive();
-    const before = this.rec?.state;
-    this.rec = await this.deps.store.patch(this.runId, patch, from);
-    if (this.rec.state !== before && this.seams.stateChanged) {
-      try { await this.seams.stateChanged(this.rec); } catch (err) { logger.warn({ runId: this.runId, seam: "state_changed", err: this.safeText(err) }, "app_run.seam_failed"); }
-    }
+    await this.commit(patch, from);
     logger.info(
       { runId: this.runId, state: this.rec.state, restarts: this.rec.restarts, cause: patch.last_exit?.cause },
       "app_run.transition",
     );
+  }
+
+  /**
+   * The one place a write to the row becomes `this.rec`: every state change,
+   * from `move` and from `finishNow` and `markEnded`, goes through here, and
+   * a changed state is announced to the `stateChanged` seam from here. The
+   * announcement is not awaited (a slow event stream must not slow the machine)
+   * and its failure is only logged.
+   */
+  private async commit(patch: AppRunPatch, from?: AppRunState): Promise<void> {
+    const before = this.rec?.state;
+    this.rec = await this.deps.store.patch(this.runId, patch, from);
+    const seam = this.seams.stateChanged;
+    if (!seam || this.rec.state === before) return;
+    const record = this.rec;
+    void Promise.resolve().then(() => seam(record)).catch((err) => {
+      logger.warn({ runId: this.runId, seam: "state_changed", err: this.safeText(err) }, "app_run.seam_failed");
+    });
   }
 
   private exitRecord(exit: Extract<ExitRead, { kind: "exit" }>, cause: AppLastExit["cause"]): AppLastExit {

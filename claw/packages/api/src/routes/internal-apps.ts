@@ -20,6 +20,7 @@
  */
 import type { FastifyInstance } from "fastify";
 import pino from "pino";
+import { APP_EVENT_ID, APP_EVENT_SEGMENT_NAME } from "@claw/protocol";
 import { internalTokenAuth } from "../auth/middleware.js";
 import {
   APP_RUN_STATES, LAST_EXIT_MAX_BYTES, patchAppRun, readAppRun, readAppRunSecrets,
@@ -35,8 +36,6 @@ const STATES = new Set<string>(APP_RUN_STATES);
 const STATE_DIR_MAX = 4096;
 const WORKLOAD_ID_MAX = 200;
 const RESTARTS_MAX = 1_000_000;
-const SEGMENT_NAME = /^\d{10}\.jsonl$/;
-const EVENT_ID = /^\d{1,20}$/;
 const OFFSET_MAX = 2 ** 53 - 1;
 const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
 const PATCH_KEYS = new Set(["brain_id", "claim_count", "expect_state", "state", "restarts", "last_exit", "events_cursor", "state_dir", "sandbox_workload_id", "grant_expires_at", "grant_revoked"]);
@@ -96,11 +95,11 @@ export function parseAppRunPatch(
     const c = body.events_cursor;
     if (!isObj(c)) return { ok: false, error: "events_cursor_invalid" };
     for (const key of Object.keys(c)) if (key !== "segment" && key !== "offset" && key !== "last_id") return { ok: false, error: "events_cursor_invalid" };
-    if (c.segment !== undefined && (typeof c.segment !== "string" || !SEGMENT_NAME.test(c.segment))) return { ok: false, error: "events_cursor_invalid" };
+    if (c.segment !== undefined && (typeof c.segment !== "string" || !APP_EVENT_SEGMENT_NAME.test(c.segment))) return { ok: false, error: "events_cursor_invalid" };
     if (c.offset !== undefined && (typeof c.offset !== "number" || !Number.isInteger(c.offset) || c.offset < 0 || c.offset > OFFSET_MAX)) {
       return { ok: false, error: "events_cursor_invalid" };
     }
-    if (c.last_id !== undefined && (typeof c.last_id !== "string" || !EVENT_ID.test(c.last_id))) return { ok: false, error: "events_cursor_invalid" };
+    if (c.last_id !== undefined && (typeof c.last_id !== "string" || !APP_EVENT_ID.test(c.last_id))) return { ok: false, error: "events_cursor_invalid" };
     patch.events_cursor = c;
   }
   if (body.last_exit !== undefined) {
