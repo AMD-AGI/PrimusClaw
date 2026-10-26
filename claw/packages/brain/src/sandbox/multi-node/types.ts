@@ -55,6 +55,8 @@ export interface MultiNodeEnsureOptions {
   deliveryCount?: number;
   /** SaFE API key of the requesting user; required by the safe provider. */
   platformKey?: string;
+  /** The run's cancel signal: aborting ends the wait for the cluster and deletes it. */
+  signal?: AbortSignal;
 }
 
 /** Emitted to the client while provisioning progresses. */

@@ -2467,7 +2467,7 @@ class TaskRunner {
         this.sessionId,
         this.request,
         this.onEvent,
-        { deliveryCount: this.msg.info.deliveryCount, platformKey: this.platformKey },
+        { deliveryCount: this.msg.info.deliveryCount, platformKey: this.platformKey, signal: this.abortCtrl.signal },
       );
     }
 

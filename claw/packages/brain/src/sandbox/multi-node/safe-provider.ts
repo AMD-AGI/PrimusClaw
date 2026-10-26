@@ -360,7 +360,7 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
         }).catch(() => {});
       }
 
-      const detail = await this.waitForRunning(sessionId, workloadId, displayName, apiKey, namespace, spec, onEvent);
+      const detail = await this.waitForRunning(sessionId, workloadId, displayName, apiKey, namespace, spec, onEvent, undefined, opts?.signal);
 
       logger.info({ sessionId, workloadId, backend: spec.backend }, "mn.safe_ready");
       await onEvent({
@@ -670,9 +670,11 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
     spec: MultiNodePromptSpec,
     onEvent: MultiNodeEventSink,
     deps?: WorkloadWaitDeps,
+    signal?: AbortSignal,
   ): Promise<Record<string, unknown>> {
     return await waitForWorkloadReady({
       workloadId,
+      signal,
       apiKey,
       logPrefix: "mn.safe",
       isReady: (detail) => {

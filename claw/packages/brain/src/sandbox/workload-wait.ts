@@ -22,7 +22,9 @@
 
 import pino from "pino";
 import { sleep } from "@claw/utils";
-import { SAFE_API_URL, SANDBOX_POLL_TIMEOUT_MS, SANDBOX_PENDING_TIMEOUT_MS } from "../config.js";
+import {
+  SAFE_API_URL, SANDBOX_POLL_TIMEOUT_MS, SANDBOX_PENDING_TIMEOUT_MS, SANDBOX_START_TIMEOUT_MS,
+} from "../config.js";
 import { SandboxProvisionTerminalError, classifyWorkloadTerminalReason } from "./errors.js";
 
 const logger = pino({ name: "workload-wait" });
@@ -97,6 +99,8 @@ export interface WorkloadWaitDeps {
   unreadableTimeoutMs?: number;
   /** 0 disables the ceiling (queue forever). */
   pendingTimeoutMs?: number;
+  /** 0 disables the ceiling (a dispatched workload may stay short of ready forever). */
+  startTimeoutMs?: number;
   /** Consecutive 404s that mean the workload is gone. */
   notFoundLimit?: number;
   /** Minimum gap between progress events. */
@@ -139,7 +143,36 @@ export interface WorkloadWaitOptions {
    * however the wait ended, rather than only on the reasons it thought of.
    */
   onGiveUp?: (g: { reason: string; phase: string }) => Promise<void>;
+  /**
+   * The run's cancel signal. Aborting it ends the wait at once with
+   * `sandbox_wait_interrupted` -- during the sleep between reads and during a
+   * read in flight -- and runs `onGiveUp`, so the workload this wait was
+   * provisioning is reclaimed instead of left for the sweeper.
+   */
+  signal?: AbortSignal;
   deps?: WorkloadWaitDeps;
+}
+
+/**
+ * `sleep`, cut short when the signal aborts. The timer behind `sleep` is left
+ * to run out; only the wait on it is abandoned.
+ */
+async function sleepUnlessAborted(
+  doSleep: (ms: number) => Promise<void>,
+  ms: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (!signal) return await doSleep(ms);
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<void>((resolve) => {
+    onAbort = resolve;
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    await Promise.race([doSleep(ms), aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort!);
+  }
 }
 
 /**
@@ -157,8 +190,13 @@ export interface WorkloadWaitOptions {
  *     blip one and a single sample must not be terminal), fetch failures, or a
  *     2xx whose body carries no phase;
  *   - Pending past the ceiling         -> sandbox_pending_timeout, counted only
- *     while queued and reset on dispatch, because from dispatch on the
- *     workload's own SaFE timeout governs.
+ *     while queued and reset on dispatch;
+ *   - dispatched but not ready past its own ceiling -> sandbox_start_timeout,
+ *     counted from the first read that is not Pending and reset if the workload
+ *     falls back to Pending. SaFE reports a container's waiting state nowhere
+ *     (an image that can never be pulled reads as an ordinary slow start), so
+ *     the only honest signal that a start will not finish is time;
+ *   - the run's signal aborting        -> sandbox_wait_interrupted.
  *
  * Any readable status refreshes the unreadable deadline, so healthy queuing and
  * a dark SaFE are never confused for one another.
@@ -174,6 +212,7 @@ export async function waitForWorkloadReady(
   const REQUEST_TIMEOUT_MS = deps?.requestTimeoutMs ?? 15_000;
   const UNREADABLE_TIMEOUT_MS = deps?.unreadableTimeoutMs ?? SANDBOX_POLL_TIMEOUT_MS;
   const PENDING_TIMEOUT_MS = deps?.pendingTimeoutMs ?? SANDBOX_PENDING_TIMEOUT_MS;
+  const START_TIMEOUT_MS = deps?.startTimeoutMs ?? SANDBOX_START_TIMEOUT_MS;
   const NOT_FOUND_LIMIT = deps?.notFoundLimit ?? 12;
   const NOTIFY_INTERVAL_MS = deps?.notifyIntervalMs ?? 600_000;
 
@@ -186,6 +225,10 @@ export async function waitForWorkloadReady(
   // When the workload was first seen queued. Measured only while it is still
   // Pending; leaving Pending stops the clock for good.
   let pendingSince: number | null = null;
+  // When the workload was first seen dispatched (a readable phase other than
+  // Pending) and still short of ready. Cleared on a fall back to Pending.
+  let dispatchedSince: number | null = null;
+  const signal = opts.signal;
 
   /** Run the caller's last-chance hook, then end the wait terminally. */
   const giveUp = async (reason: string, phase: string, message: string): Promise<never> => {
@@ -197,8 +240,18 @@ export async function waitForWorkloadReady(
     throw new SandboxProvisionTerminalError(reason, message);
   };
 
+  /** End the wait because the run was cancelled, reclaiming what it created. */
+  const interrupted = async (phase: string): Promise<never> =>
+    await giveUp(
+      "sandbox_wait_interrupted",
+      phase,
+      `workload ${workloadId} startup was interrupted before it became ready`,
+    );
+
   while (true) {
-    await doSleep(POLL_MS);
+    if (signal?.aborted) return await interrupted("");
+    await sleepUnlessAborted(doSleep, POLL_MS, signal);
+    if (signal?.aborted) return await interrupted("");
     const elapsed = ((now() - pollStart) / 1000).toFixed(1);
 
     if (UNREADABLE_TIMEOUT_MS > 0 && now() - lastReadableMs > UNREADABLE_TIMEOUT_MS) {
@@ -219,7 +272,9 @@ export async function waitForWorkloadReady(
     try {
       const resp = await doFetch(detailUrl, {
         headers: { Authorization: `Bearer ${apiKey}` },
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        signal: signal
+          ? AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)])
+          : AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
       if (!resp.ok) {
         if (resp.status === 404) {
@@ -259,6 +314,8 @@ export async function waitForWorkloadReady(
       }
     } catch (e: any) {
       if (e instanceof SandboxProvisionTerminalError) throw e;
+      // A read cut short by the cancel is the cancel, not an unreadable status.
+      if (signal?.aborted) return await interrupted("");
       // A fetch exception is not a 404, so it breaks the streak, and it leaves
       // the status unreadable rather than refreshing the deadline.
       consecutiveNotFound = 0;
@@ -322,6 +379,7 @@ export async function waitForWorkloadReady(
     // An unreadable phase leaves the clock alone; that case belongs to the
     // backstop above.
     if (phase === "pending") {
+      dispatchedSince = null;
       if (pendingSince === null) pendingSince = now();
       if (PENDING_TIMEOUT_MS > 0 && now() - pendingSince > PENDING_TIMEOUT_MS) {
         const pendingFor = ((now() - pendingSince) / 1000).toFixed(1);
@@ -333,6 +391,16 @@ export async function waitForWorkloadReady(
       }
     } else if (phase) {
       pendingSince = null;
+      // Dispatched and still short of ready (the terminal and ready cases left
+      // above), so the start has to finish within its own ceiling.
+      if (dispatchedSince === null) dispatchedSince = now();
+      if (START_TIMEOUT_MS > 0 && now() - dispatchedSince > START_TIMEOUT_MS) {
+        const startingFor = ((now() - dispatchedSince) / 1000).toFixed(1);
+        const message = `workload ${workloadId} was scheduled but did not become ready within ${startingFor}s`
+          + " (phase=" + phase + ") -- its container may be unable to start, for example an image that cannot be pulled";
+        await opts.onTerminal?.({ phase, status: "failed", reason: "sandbox_start_timeout" }).catch(() => {});
+        return await giveUp("sandbox_start_timeout", phase, message);
+      }
     }
 
     const nowMs = now();

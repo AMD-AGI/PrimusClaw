@@ -2747,6 +2747,7 @@ async function provisionHands(
       platformKey: apiKey,
       onProvisioned,
       onEvent,
+      signal: options.signal,
     });
   } catch (err) {
     await hold.release();
