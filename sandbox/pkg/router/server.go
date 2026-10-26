@@ -240,13 +240,18 @@ func (s *Server) setupRoutes() {
 
 	// E2B control plane. Outside /v1 so SaFE auth does not replace X-API-KEY.
 	// Workload Manager resolves the key. A missing key is rejected here.
-	s.engine.POST("/sandboxes", s.proxyE2B)
-	s.engine.GET("/sandboxes", s.proxyE2B)
-	s.engine.GET("/v2/sandboxes", s.proxyE2B)
-	s.engine.GET("/sandboxes/:sandboxID", s.proxyE2B)
-	s.engine.DELETE("/sandboxes/:sandboxID", s.proxyE2B)
-	s.engine.POST("/sandboxes/:sandboxID/connect", s.proxyE2B)
-	s.engine.POST("/sandboxes/:sandboxID/timeout", s.proxyE2B)
+	// /sandboxes and /v2/sandboxes are the same control plane. SDK 2.51+
+	// uses POST /v2/sandboxes and POST /v2/sandboxes/{id}/connect.
+	// PATCH sets the timeout.
+	for _, prefix := range []string{"/sandboxes", "/v2/sandboxes"} {
+		s.engine.POST(prefix, s.proxyE2B)
+		s.engine.GET(prefix, s.proxyE2B)
+		s.engine.GET(prefix+"/:sandboxID", s.proxyE2B)
+		s.engine.DELETE(prefix+"/:sandboxID", s.proxyE2B)
+		s.engine.PATCH(prefix+"/:sandboxID", s.proxyE2B)
+		s.engine.POST(prefix+"/:sandboxID/connect", s.proxyE2B)
+		s.engine.POST(prefix+"/:sandboxID/timeout", s.proxyE2B)
+	}
 }
 
 // namespaceAdmissionMiddleware rejects a request without a session ID whose

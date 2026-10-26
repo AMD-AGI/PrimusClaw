@@ -334,6 +334,40 @@ func TestQuotaMessageBody(t *testing.T) {
 	}
 }
 
+func TestV2RoutesReachHandlers(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc, _, keys := testPlane(t, 600, []int32{1}, 2)
+	h := NewHandler(svc)
+	r := gin.New()
+	h.Mount(r)
+	key := keys["measurement"]
+	body := `{"templateID":"ar-01ja-runner-g1","timeout":30}`
+	cases := []struct {
+		method string
+		path   string
+		want   int
+	}{
+		{http.MethodPost, "/v2/sandboxes", http.StatusCreated},
+		{http.MethodGet, "/v2/sandboxes", http.StatusOK},
+		{http.MethodGet, "/v2/sandboxes/missing", http.StatusNotFound},
+		{http.MethodDelete, "/v2/sandboxes/missing", http.StatusNotFound},
+		{http.MethodPatch, "/v2/sandboxes/missing", http.StatusNotFound},
+		{http.MethodPost, "/v2/sandboxes/missing/connect", http.StatusNotFound},
+		{http.MethodPost, "/v2/sandboxes/missing/timeout", http.StatusNotFound},
+		{http.MethodPatch, "/sandboxes/missing", http.StatusNotFound},
+	}
+	for _, tc := range cases {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-API-KEY", key)
+		r.ServeHTTP(w, req)
+		if w.Code != tc.want || strings.Contains(w.Body.String(), "page not found") {
+			t.Fatalf("%s %s=%d %s", tc.method, tc.path, w.Code, w.Body.String())
+		}
+	}
+}
+
 func TestSealedAllowsFilesOnly(t *testing.T) {
 	if SealedAllows(http.MethodPost, "/api/execute", true, []string{"/in"}, []string{"/out"}) {
 		t.Fatal("execute allowed")

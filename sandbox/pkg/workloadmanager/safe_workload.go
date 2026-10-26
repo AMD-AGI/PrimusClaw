@@ -178,6 +178,29 @@ func workloadStartTime(obj *unstructured.Unstructured) time.Time {
 	return time.Time{}
 }
 
+// Present reports whether an E2B Workload still occupies its grant.
+// A missing object or a finished phase does not. Pending and empty phases
+// still count: status may not be written in the first seconds after create.
+func (c *SafeWorkloadCreator) Present(ctx context.Context, name string) (bool, error) {
+	if c == nil || c.dynamic == nil || name == "" {
+		return false, nil
+	}
+	obj, err := c.dynamic.Resource(workloadGVR).Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	phase, _, _ := unstructured.NestedString(obj.Object, "status", "phase")
+	switch phase {
+	case "Failed", "Succeeded", "Stopped":
+		return false, nil
+	default:
+		return true, nil
+	}
+}
+
 // Delete removes the Workload. A missing object is already gone.
 func (c *SafeWorkloadCreator) Delete(ctx context.Context, name string) error {
 	if c == nil || c.dynamic == nil || name == "" {

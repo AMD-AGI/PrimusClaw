@@ -24,14 +24,18 @@ func NewHandler(svc *Service) *Handler {
 }
 
 // Mount registers the E2B routes on the engine root.
+// Both prefixes serve the same operations. SDK 2.51+ creates and connects on /v2.
+// PATCH sets the timeout, the same operation as POST .../timeout.
 func (h *Handler) Mount(r gin.IRoutes) {
-	r.POST("/sandboxes", h.create)
-	r.GET("/sandboxes", h.list)
-	r.GET("/v2/sandboxes", h.list)
-	r.GET("/sandboxes/:sandboxID", h.get)
-	r.DELETE("/sandboxes/:sandboxID", h.kill)
-	r.POST("/sandboxes/:sandboxID/connect", h.connect)
-	r.POST("/sandboxes/:sandboxID/timeout", h.timeout)
+	for _, prefix := range []string{"/sandboxes", "/v2/sandboxes"} {
+		r.POST(prefix, h.create)
+		r.GET(prefix, h.list)
+		r.GET(prefix+"/:sandboxID", h.get)
+		r.DELETE(prefix+"/:sandboxID", h.kill)
+		r.PATCH(prefix+"/:sandboxID", h.timeout)
+		r.POST(prefix+"/:sandboxID/connect", h.connect)
+		r.POST(prefix+"/:sandboxID/timeout", h.timeout)
+	}
 }
 
 func (h *Handler) create(c *gin.Context) {
