@@ -22,6 +22,7 @@ import {
   maybeRecordTaskPattern,
   checkProbationGraduation,
 } from "../marketplace/skill-service.js";
+import { appEventIdentity } from "./app-events.js";
 import { enqueueEvolutionJob } from "../marketplace/evolve-worker.js";
 import { callMemoryLLM } from "../llm/client.js";
 import { CLAW_MEMORY_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
@@ -394,11 +395,21 @@ export async function consumeEventDelivery(msg: {
     const seq = (msg as any).seq ?? (msg as any).info?.streamSequence;
     const eventId = makeEventId(seq);
     let rowId: number | null = null;
+    // An application's progress event is published at least once (hosting design
+    // 5.7), so the same one can arrive under a new stream sequence. It is stored
+    // once per (session, app run, event id): the unique index `uq_session_events_app_event`.
+    // Bare ON CONFLICT, because that index is a second way the insert can conflict.
+    const appEvent = appEventIdentity(event);
     try {
       const insertResult = await db.query(
-        "INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, $3, $4) ON CONFLICT (event_id, session_id) DO NOTHING RETURNING id",
+        `INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, $3, $4) ON CONFLICT ${appEvent ? "" : "(event_id, session_id) "}DO NOTHING RETURNING id`,
         [eventId, sessionId, (event.type as string) || "message", event],
       );
+      if (appEvent && !insertResult.rowCount) {
+        logger.info({ sessionId, appTaskId: appEvent.appTaskId, appEventId: appEvent.eventId }, "event-consumer.app_event_duplicate_dropped");
+        msg.ack();
+        return;
+      }
       if (insertResult.rowCount && insertResult.rows[0]) {
         metrics.onEventPersisted("ok");
         rowId = insertResult.rows[0].id;

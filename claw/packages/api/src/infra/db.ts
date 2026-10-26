@@ -484,6 +484,16 @@ async function readIndexValidity(
 }
 
 /**
+ * One stored row per application progress event (hosting design 5.7): the
+ * forwarding is at least once, so the same (session, app run, CloudEvents id)
+ * can be published again under a new stream sequence. Exported so a test builds
+ * this very index and not a copy of it.
+ */
+export const APP_EVENT_UNIQUE_INDEX_SQL = `CREATE UNIQUE INDEX IF NOT EXISTS uq_session_events_app_event
+  ON claw_session_events(session_id, (data->>'app_task_id'), ((data->'event')->>'id'))
+  WHERE event = 'appEvent'`;
+
+/**
  * Returned rather than executed so the schema tests drive this migration itself:
  * a fixture that restates the DDL passes whatever the production statements do.
  */
@@ -1279,6 +1289,12 @@ export async function initDb(): Promise<void> {
     // processed_at marks completion: NULL = pending, NOT NULL = handleComplete done.
     await client.query("ALTER TABLE claw_session_events ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ DEFAULT NULL").catch(() => {});
     await client.query("CREATE INDEX IF NOT EXISTS idx_events_unprocessed ON claw_session_events(event) WHERE processed_at IS NULL AND deleted_at IS NULL").catch(() => {});
+
+    // An application's progress event is forwarded at least once (hosting design
+    // 5.7); the consumer stores it once per (session, app run, CloudEvents id).
+    // Not swallowed: the consumer's bare `ON CONFLICT DO NOTHING` is only a
+    // de-duplication while this index exists.
+    await client.query(APP_EVENT_UNIQUE_INDEX_SQL);
 
     // The turn a completion produced, named by the message that asked for it.
     //

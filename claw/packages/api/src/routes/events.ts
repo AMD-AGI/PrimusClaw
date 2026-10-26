@@ -6,6 +6,7 @@ import { getUser } from "../auth/middleware.js";
 import { canAccessSessionAsOperator } from "../auth/models.js";
 import { db } from "../infra/db.js";
 import { createSessionSubscription } from "../events/store.js";
+import { appEventKey } from "../events/app-events.js";
 import { redactPublicJson } from "../events/redaction.js";
 /**
  * V2-native SSE event stream: Brain events are forwarded verbatim (raw V2
@@ -84,6 +85,8 @@ interface HistorySegment {
 export function historySegment(
   rows: Array<{ event_id: unknown; data: unknown }>,
   opts: ForwardOpts,
+  /** App events already shown, by identity (see events/app-events.ts); filled as frames are made. */
+  seenAppEvents: Set<string> = new Set(),
 ): HistorySegment {
   const frames: string[] = [];
   const seenIds: string[] = [];
@@ -94,6 +97,11 @@ export function historySegment(
     const name = eventName(data);
     if (!name) continue;
     if (!shouldForward(data, opts)) continue;
+    const appKey = appEventKey(data);
+    if (appKey !== null) {
+      if (seenAppEvents.has(appKey)) continue;
+      seenAppEvents.add(appKey);
+    }
     const eid = row.event_id as string;
     seenIds.push(eid);
     frames.push(`id: ${eid}\nevent: ${name}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -179,6 +187,7 @@ export async function registerEventRoutes(app: FastifyInstance): Promise<void> {
       // in the window between DB read and subscription start.
       const subscription = createSessionSubscription(sessionId);
       const seenIds = new Set<string>();
+      const seenAppEvents = new Set<string>();
 
       // 1. Push history from DB — one SSE frame per row.
       const afterEventId = req.query.after || null;
@@ -192,7 +201,7 @@ export async function registerEventRoutes(app: FastifyInstance): Promise<void> {
             [sessionId],
           )).rows;
 
-      const history = historySegment(historyRows, fwdOpts);
+      const history = historySegment(historyRows, fwdOpts, seenAppEvents);
       for (const eid of history.seenIds) seenIds.add(eid);
       for (const frame of history.frames) sseWrite(frame);
 
@@ -223,6 +232,12 @@ export async function registerEventRoutes(app: FastifyInstance): Promise<void> {
           const liveId = `claw-${seq}`;
           if (seenIds.has(liveId)) continue;
           seenIds.add(liveId);
+          // A forwarded app event published twice has two stream sequences and one identity.
+          const appKey = appEventKey(evt);
+          if (appKey !== null) {
+            if (seenAppEvents.has(appKey)) continue;
+            seenAppEvents.add(appKey);
+          }
           if (!sseWrite(`id: ${liveId}\nevent: ${name}\ndata: ${JSON.stringify(evt)}\n\n`)) break;
         }
       } catch { /* subscription ended or client disconnected */ }

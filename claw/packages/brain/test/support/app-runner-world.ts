@@ -101,6 +101,7 @@ export class World {
       state: "provisioning",
       restarts: 0,
       last_exit: null,
+      events_cursor: {},
       state_dir: null,
       sandbox_workload_id: null,
       manifest,

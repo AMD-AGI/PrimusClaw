@@ -125,6 +125,8 @@ export const noopAppGrant: AppGrantRunHooks = {
 export interface AppRunContext {
   record: AppRunRecord;
   instance: SandboxInstance | null;
+  /** `text` with the run's secret values replaced; for anything that reads what the application wrote. */
+  scrub?(text: string): string;
 }
 
 /**
@@ -140,6 +142,8 @@ export interface AppRunnerSeams {
   drainEvents?(ctx: AppRunContext): Promise<void>;
   /** Finishing step 4: unregister the session-level MCP (C2-10). */
   unregisterMcp?(ctx: AppRunContext): Promise<void>;
+  /** The run's state moved (5.7: published as `appStatus`). Best effort: a failure is logged and the machine goes on. */
+  stateChanged?(record: AppRunRecord): Promise<void>;
 }
 
 /** The sandbox, as the runner uses it. The real one is {@link realAppSandbox}. */
@@ -524,7 +528,7 @@ export class AppRunner {
       await this.move({ state: "starting" }, "running");
       return { done: false };
     }
-    if (verdict === "alive") await this.runningSeams({ record: this.rec, instance: inst });
+    if (verdict === "alive") await this.runningSeams(this.seamContext(inst));
     return { done: false };
   }
 
@@ -772,6 +776,10 @@ export class AppRunner {
 
   // ---- running ------------------------------------------------------------
 
+  private seamContext(instance: SandboxInstance | null): AppRunContext {
+    return { record: this.rec, instance, scrub: (text) => this.scrubbed(text) };
+  }
+
   private async runningSeams(ctx: AppRunContext): Promise<void> {
     for (const [name, seam] of [["tail_events", this.seams.tailEvents], ["register_mcp", this.seams.registerMcp]] as const) {
       if (!seam) continue;
@@ -789,7 +797,7 @@ export class AppRunner {
   private async inFinishing(): Promise<TickResult> {
     const rec = this.rec;
     const inst = this.instance();
-    const ctx: AppRunContext = { record: rec, instance: inst };
+    const ctx = this.seamContext(inst);
     const run: AppGrantRun = { runId: this.runId, sessionId: rec.session_id, grantId: rec.grant_id, manifest: rec.manifest };
     const cause = rec.last_exit?.cause ?? "exit";
     const cancelled = cause === "cancelled" || cause === "deadline" || cause === "row_terminal";
@@ -957,7 +965,11 @@ export class AppRunner {
   /** Persist a transition, compare-and-set on `from` when given. */
   private async move(patch: AppRunPatch, from?: AppRunState): Promise<void> {
     this.assertActive();
+    const before = this.rec?.state;
     this.rec = await this.deps.store.patch(this.runId, patch, from);
+    if (this.rec.state !== before && this.seams.stateChanged) {
+      try { await this.seams.stateChanged(this.rec); } catch (err) { logger.warn({ runId: this.runId, seam: "state_changed", err: this.safeText(err) }, "app_run.seam_failed"); }
+    }
     logger.info(
       { runId: this.runId, state: this.rec.state, restarts: this.rec.restarts, cause: patch.last_exit?.cause },
       "app_run.transition",

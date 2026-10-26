@@ -6,7 +6,8 @@
  *
  *   GET   /v1/internal/app-runs/:taskId           the run row plus what it was asked to do
  *   GET   /v1/internal/app-runs/:taskId/secrets   the MCP token and grant keys, opened
- *   PATCH /v1/internal/app-runs/:taskId           fenced state update (lease holder + claim epoch)
+ *   PATCH /v1/internal/app-runs/:taskId           fenced state update (lease holder + claim epoch), including
+ *                                                 the event-forwarding cursor (5.7)
  *
  * Authentication is the cluster internal token, like the claim surface: there
  * is no per-run token because a Brain taking a run over does not yet hold one,
@@ -34,8 +35,11 @@ const STATES = new Set<string>(APP_RUN_STATES);
 const STATE_DIR_MAX = 4096;
 const WORKLOAD_ID_MAX = 200;
 const RESTARTS_MAX = 1_000_000;
+const SEGMENT_NAME = /^\d{10}\.jsonl$/;
+const EVENT_ID = /^\d{1,20}$/;
+const OFFSET_MAX = 2 ** 53 - 1;
 const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
-const PATCH_KEYS = new Set(["brain_id", "claim_count", "expect_state", "state", "restarts", "last_exit", "state_dir", "sandbox_workload_id", "grant_expires_at", "grant_revoked"]);
+const PATCH_KEYS = new Set(["brain_id", "claim_count", "expect_state", "state", "restarts", "last_exit", "events_cursor", "state_dir", "sandbox_workload_id", "grant_expires_at", "grant_revoked"]);
 
 /** The patch in `body`, or the reason it was refused. */
 export function parseAppRunPatch(
@@ -87,6 +91,17 @@ export function parseAppRunPatch(
   if (body.grant_revoked !== undefined) {
     if (body.grant_revoked !== true) return { ok: false, error: "grant_revoked_invalid" };
     patch.grant_revoked = true;
+  }
+  if (body.events_cursor !== undefined) {
+    const c = body.events_cursor;
+    if (!isObj(c)) return { ok: false, error: "events_cursor_invalid" };
+    for (const key of Object.keys(c)) if (key !== "segment" && key !== "offset" && key !== "last_id") return { ok: false, error: "events_cursor_invalid" };
+    if (c.segment !== undefined && (typeof c.segment !== "string" || !SEGMENT_NAME.test(c.segment))) return { ok: false, error: "events_cursor_invalid" };
+    if (c.offset !== undefined && (typeof c.offset !== "number" || !Number.isInteger(c.offset) || c.offset < 0 || c.offset > OFFSET_MAX)) {
+      return { ok: false, error: "events_cursor_invalid" };
+    }
+    if (c.last_id !== undefined && (typeof c.last_id !== "string" || !EVENT_ID.test(c.last_id))) return { ok: false, error: "events_cursor_invalid" };
+    patch.events_cursor = c;
   }
   if (body.last_exit !== undefined) {
     const e = body.last_exit;

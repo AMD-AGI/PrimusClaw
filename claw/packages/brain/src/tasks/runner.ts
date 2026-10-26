@@ -499,7 +499,8 @@ const REAL_SIDE_EFFECTS: TaskRunnerSideEffects = {
   postRunLease,
   settleRunAttempt: settleClaimedRun,
   runScript,
-  createAppRunner,
+  createAppRunner: (runId, platformKey, claimCount) =>
+    createAppRunner(runId, platformKey, claimCount, (sessionId, event) => getDeps().emitter.emit(sessionId, event)),
   republishTask: async (subject, data) => {
     await getDeps().emitter.nc.jetstream().publish(subject, data);
   },
