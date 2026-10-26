@@ -74,6 +74,12 @@ spec:
         runAsNonRoot: true
         runAsUser: 1000
         fsGroup: 1000
+      {{- if .Values.tls.extraCACertsConfigMap }}
+      volumes:
+      - name: extra-ca
+        configMap:
+          name: {{ .Values.tls.extraCACertsConfigMap | quote }}
+      {{- end }}
       containers:
       - name: api
         image: {{ include "primus-claw.image" . | quote }}
@@ -147,6 +153,10 @@ spec:
         - name: NODE_TLS_REJECT_UNAUTHORIZED
           value: "0"
         {{- end }}
+        {{- if .Values.tls.extraCACertsConfigMap }}
+        - name: NODE_EXTRA_CA_CERTS
+          value: /etc/claw-ca/{{ .Values.tls.extraCACertsKey }}
+        {{- end }}
         # The startup budget has to cover a schema migration, because initDb runs
         # before the server listens: nothing answers /health while a migration is
         # in flight, on the replica doing it and on every replica waiting behind
@@ -155,6 +165,12 @@ spec:
         # longest migration the code permits could never finish -- the pod was
         # killed and the next one started the same statement again. 120 x 3s is
         # 360s, which leaves the statement its whole budget plus connect time.
+        {{- if .Values.tls.extraCACertsConfigMap }}
+        volumeMounts:
+        - name: extra-ca
+          mountPath: /etc/claw-ca
+          readOnly: true
+        {{- end }}
         startupProbe:
           httpGet: { path: /health, port: http }
           periodSeconds: 3
