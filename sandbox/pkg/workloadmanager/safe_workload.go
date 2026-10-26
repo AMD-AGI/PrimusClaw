@@ -26,17 +26,19 @@ import (
 )
 
 const (
-	workloadAPIVersion       = "amd.com/v1"
-	workloadKind             = "Workload"
-	safeDisplayNameLabel     = "primus-safe.display.name"
-	safeUserIDLabel          = "primus-safe.user.id"
-	safeUserNameAnnotation   = "primus-safe.user.name"
-	safeWorkloadIDLabel      = "primus-safe.workload.id"
-	sessionIDLabel           = "primus-claw/session-id"
-	workloadEphemeralStorage = "50Gi"
-	workloadPriority         = int64(2)
-	workloadTTLSeconds       = int64(10)
-	envdPort                 = 8080
+	workloadAPIVersion         = "amd.com/v1"
+	workloadKind               = "Workload"
+	safeDisplayNameLabel       = "primus-safe.display.name"
+	safeUserIDLabel            = "primus-safe.user.id"
+	safeUserNameAnnotation     = "primus-safe.user.name"
+	safeWorkloadIDLabel        = "primus-safe.workload.id"
+	sessionIDLabel             = "primus-claw/session-id"
+	grantIDLabel               = "agent-sandbox.io/grant-id"
+	grantAttestationAnnotation = "agent-sandbox.io/grant-attestation"
+	workloadEphemeralStorage   = "50Gi"
+	workloadPriority           = int64(2)
+	workloadTTLSeconds         = int64(10)
+	envdPort                   = 8080
 	// platformInferenceKey is not copied onto a grant sandbox.
 	platformInferenceKey = "OPENAI_API_KEY"
 	// safeGeneratedNameLength is SaFE MaxGeneratedNameLength: a 63-character
@@ -302,6 +304,12 @@ func validateWorkloadRequest(req e2b.CreateRequest) error {
 	if req.UserID != "" && !labelValue(req.UserID) {
 		return fmt.Errorf("user id %q is not a label value", req.UserID)
 	}
+	if !labelValue(req.GrantID) {
+		return fmt.Errorf("grant id %q is not a label value", req.GrantID)
+	}
+	if req.Attestation == "" {
+		return fmt.Errorf("grant attestation is required")
+	}
 	return nil
 }
 
@@ -349,9 +357,15 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 	if req.UserID != "" {
 		labels[safeUserIDLabel] = req.UserID
 	}
+	if req.GrantID != "" {
+		labels[grantIDLabel] = req.GrantID
+	}
 	annotations := map[string]any{}
 	if req.UserName != "" {
 		annotations[safeUserNameAnnotation] = req.UserName
+	}
+	if req.Attestation != "" {
+		annotations[grantAttestationAnnotation] = req.Attestation
 	}
 	obj := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": workloadAPIVersion,

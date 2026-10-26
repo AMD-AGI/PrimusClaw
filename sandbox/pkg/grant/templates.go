@@ -105,6 +105,22 @@ func (s *Service) resolveTemplateGPUCounts(ctx context.Context, appRunID string,
 	return nil
 }
 
+// checkResolvedGPUs rejects a template whose card count exceeds the attestation.
+func (s *Service) checkResolvedGPUs(token string, templates []runtimev1alpha1.GrantTemplate) error {
+	limit, err := s.attest.GPULimit(token)
+	if err != nil {
+		return err
+	}
+	for _, tpl := range templates {
+		for _, n := range tpl.GPUCounts {
+			if int(n) > limit {
+				return opErr(http.StatusBadRequest, "attestation_invalid", "maxGpusPerSandbox is below a template card count")
+			}
+		}
+	}
+	return nil
+}
+
 func templateGPUCount(tpl runtimev1alpha1.GrantTemplate, index int) int32 {
 	if index >= 0 && index < len(tpl.GPUCounts) {
 		return tpl.GPUCounts[index]

@@ -33,6 +33,8 @@ type grantClaims struct {
 type AttestationChecker interface {
 	// Check reports whether token authorizes req.
 	Check(token string, req IssueRequest) error
+	// GPULimit returns maxGpusPerSandbox from a verified token.
+	GPULimit(token string) (int, error)
 }
 
 // JWKSChecker verifies ES256 attestations against a JWKS document.
@@ -72,25 +74,12 @@ func NewJWKSChecker(jwks []byte) (*JWKSChecker, error) {
 }
 
 // Check verifies signature, issuer, audience, expiry, and the claims that must
-// match the issue request.
+// match the issue request. kinds must include Sandbox, and maxGpusPerSandbox
+// must cover every perGpuCount on the request.
 func (c *JWKSChecker) Check(token string, req IssueRequest) error {
-	claims := &grantClaims{}
-	parsed, err := jwt.ParseWithClaims(token, claims, func(t *jwt.Token) (any, error) {
-		if t.Method != jwt.SigningMethodES256 {
-			return nil, fmt.Errorf("unexpected signing method")
-		}
-		kid, _ := t.Header["kid"].(string)
-		pub := c.keys[kid]
-		if pub == nil {
-			return nil, fmt.Errorf("unknown kid")
-		}
-		return pub, nil
-	}, jwt.WithIssuer(attestationIssuer), jwt.WithAudience(attestationAudience), jwt.WithExpirationRequired())
+	claims, err := c.parse(token)
 	if err != nil {
-		return opErr(http.StatusBadRequest, "attestation_invalid", err.Error())
-	}
-	if !parsed.Valid {
-		return opErr(http.StatusBadRequest, "attestation_invalid", "token is not valid")
+		return err
 	}
 	if claims.ID != req.GrantID {
 		return opErr(http.StatusBadRequest, "attestation_invalid", "jti does not match grantId")
@@ -106,7 +95,58 @@ func (c *JWKSChecker) Check(token string, req IssueRequest) error {
 			return opErr(http.StatusBadRequest, "attestation_invalid", "workspace is not in the attestation")
 		}
 	}
+	if !contains(claims.Kinds, "Sandbox") {
+		return opErr(http.StatusBadRequest, "attestation_invalid", "kinds does not include Sandbox")
+	}
+	if claims.MaxGPUsPerSandbox < maxRequestedCards(req) {
+		return opErr(http.StatusBadRequest, "attestation_invalid", "maxGpusPerSandbox is below a template card count")
+	}
 	return nil
+}
+
+// GPULimit returns maxGpusPerSandbox from a verified token.
+func (c *JWKSChecker) GPULimit(token string) (int, error) {
+	claims, err := c.parse(token)
+	if err != nil {
+		return 0, err
+	}
+	return claims.MaxGPUsPerSandbox, nil
+}
+
+// parse verifies the token and returns its claims.
+func (c *JWKSChecker) parse(token string) (*grantClaims, error) {
+	claims := &grantClaims{}
+	parsed, err := jwt.ParseWithClaims(token, claims, func(t *jwt.Token) (any, error) {
+		if t.Method != jwt.SigningMethodES256 {
+			return nil, fmt.Errorf("unexpected signing method")
+		}
+		kid, _ := t.Header["kid"].(string)
+		pub := c.keys[kid]
+		if pub == nil {
+			return nil, fmt.Errorf("unknown kid")
+		}
+		return pub, nil
+	}, jwt.WithIssuer(attestationIssuer), jwt.WithAudience(attestationAudience), jwt.WithExpirationRequired())
+	if err != nil {
+		return nil, opErr(http.StatusBadRequest, "attestation_invalid", err.Error())
+	}
+	if !parsed.Valid {
+		return nil, opErr(http.StatusBadRequest, "attestation_invalid", "token is not valid")
+	}
+	return claims, nil
+}
+
+// maxRequestedCards is the largest perGpuCount on the issue request.
+func maxRequestedCards(req IssueRequest) int {
+	maxCard := 0
+	for _, tpl := range req.Templates {
+		for _, n := range tpl.PerGPUCount {
+			if int(n) > maxCard {
+				maxCard = int(n)
+			}
+		}
+	}
+	return maxCard
 }
 
 func p256FromXY(xB64, yB64 string) (*ecdsa.PublicKey, error) {

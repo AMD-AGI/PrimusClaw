@@ -156,6 +156,11 @@ func jwksFor(t *testing.T, pub *ecdsa.PublicKey) []byte {
 
 func signGrant(t *testing.T, priv *ecdsa.PrivateKey, req IssueRequest) string {
 	t.Helper()
+	return signGrantShape(t, priv, req, []string{"PyTorchJob", "Sandbox"}, 8)
+}
+
+func signGrantShape(t *testing.T, priv *ecdsa.PrivateKey, req IssueRequest, kinds []string, maxGPUs int) string {
+	t.Helper()
 	claims := grantClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    attestationIssuer,
@@ -166,8 +171,8 @@ func signGrant(t *testing.T, priv *ecdsa.PrivateKey, req IssueRequest) string {
 			IssuedAt:  jwt.NewNumericDate(req.ExpiresAt.Add(-time.Hour)),
 		},
 		Workspaces:        req.Owner.Workspaces,
-		Kinds:             []string{"PyTorchJob", "Sandbox"},
-		MaxGPUsPerSandbox: 8,
+		Kinds:             kinds,
+		MaxGPUsPerSandbox: maxGPUs,
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
 	token.Header["kid"] = "test"
@@ -293,6 +298,55 @@ func cloneIssue(req IssueRequest) IssueRequest {
 		out.Templates[i].Spec = append(json.RawMessage(nil), req.Templates[i].Spec...)
 	}
 	return out
+}
+
+func TestIssueRejectsAttestationShape(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	svc, priv, _, _ := testService(t, now)
+	req := sampleRequest(now.Add(time.Hour))
+	req.Attestation = signGrantShape(t, priv, req, []string{"PyTorchJob"}, 8)
+	if _, _, err := svc.Issue(context.Background(), req); !IsReason(err, "attestation_invalid") {
+		t.Fatalf("kinds err=%v", err)
+	}
+	req.Attestation = signGrantShape(t, priv, req, []string{"Sandbox"}, 1)
+	if _, _, err := svc.Issue(context.Background(), req); !IsReason(err, "attestation_invalid") {
+		t.Fatalf("gpu err=%v", err)
+	}
+}
+
+func TestIssueRejectsExistingTemplateAboveGPUCap(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	svc, priv, _, _ := testService(t, now)
+	ci := &runtimev1alpha1.CodeInterpreter{
+		ObjectMeta: metav1.ObjectMeta{Name: "ar-01ja-eval-g8", Namespace: svc.namespace},
+		Spec: runtimev1alpha1.CodeInterpreterSpec{
+			GPU: &runtimev1alpha1.GPUConfig{Count: 16},
+		},
+	}
+	if err := svc.client.Create(context.Background(), ci); err != nil {
+		t.Fatal(err)
+	}
+	req := sampleRequest(now.Add(time.Hour))
+	req.GrantID = "gr-gpu-cap"
+	req.Roles = map[string]RoleRequest{
+		"measurement": {Templates: []string{"eval-g8"}, MaxSandboxes: 1, MaxGPUs: 16},
+	}
+	req.Templates = []TemplateRequest{{Name: "eval-g8"}}
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); !IsReason(err, "attestation_invalid") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestIssueRejectsLongGrantID(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	svc, priv, _, _ := testService(t, now)
+	req := sampleRequest(now.Add(time.Hour))
+	req.GrantID = "g" + strings.Repeat("r", 63)
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); !IsReason(err, "invalid_grant") {
+		t.Fatalf("err=%v", err)
+	}
 }
 
 func TestIssueRejectsBadWorkspace(t *testing.T) {

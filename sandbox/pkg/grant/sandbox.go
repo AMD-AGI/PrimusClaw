@@ -44,8 +44,9 @@ type Replay struct {
 func (r *Replay) Error() string { return "idempotency replay" }
 
 // Snapshot is the grant spec the E2B control plane is allowed to see.
-// It has no platform key and no attestation.
+// It has no platform key. Attestation is copied onto each Workload.
 type Snapshot struct {
+	GrantID           string
 	UserID            string
 	UserName          string
 	AppRunID          string
@@ -54,6 +55,7 @@ type Snapshot struct {
 	MaxSandboxSeconds int64
 	Roles             map[string]runtimev1alpha1.GrantRole
 	Templates         []runtimev1alpha1.GrantTemplate
+	Attestation       string
 }
 
 // RunningUpdate is the data-plane address recorded once a sandbox is up.
@@ -78,6 +80,7 @@ func (s *Service) Snapshot(ctx context.Context, grantID string) (Snapshot, error
 		g.Spec.Templates[i].DeepCopyInto(&templates[i])
 	}
 	return Snapshot{
+		GrantID:           g.Name,
 		UserID:            g.Spec.Owner.UserID,
 		UserName:          g.Spec.Owner.UserName,
 		AppRunID:          g.Spec.Issuer.AppRunID,
@@ -86,6 +89,7 @@ func (s *Service) Snapshot(ctx context.Context, grantID string) (Snapshot, error
 		MaxSandboxSeconds: g.Spec.MaxSandboxSeconds,
 		Roles:             roles,
 		Templates:         templates,
+		Attestation:       g.Spec.Attestation,
 	}, nil
 }
 
@@ -172,8 +176,9 @@ func (s *Service) EndSandbox(ctx context.Context, grantID, sandboxID, reason str
 }
 
 // SetSandboxTimeout replaces the lifetime requested for a live sandbox.
-// The new duration is measured from now, and the sandbox still cannot run
-// longer than MaxSandboxSeconds from the time it started.
+// The caller must be the role that created it. The new duration is measured
+// from now, and the sandbox still cannot run longer than MaxSandboxSeconds
+// from the time it started.
 func (s *Service) SetSandboxTimeout(ctx context.Context, grantID, role, sandboxID string, timeoutSec int64) error {
 	if timeoutSec <= 0 {
 		return opErr(http.StatusBadRequest, "invalid_sandbox", "timeout must be > 0")

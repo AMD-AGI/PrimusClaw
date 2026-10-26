@@ -28,7 +28,11 @@ type CreateRequest struct {
 	SessionID string
 	// Workspace is the SaFE workspace the Workload runs in.
 	Workspace string
-	Env       map[string]string
+	// GrantID is the SandboxGrant name copied onto the Workload label.
+	GrantID string
+	// Attestation is the Claw JWT copied onto the Workload annotation.
+	Attestation string
+	Env         map[string]string
 }
 
 // CreateResult is the running sandbox address.

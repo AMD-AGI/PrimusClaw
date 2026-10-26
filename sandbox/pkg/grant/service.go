@@ -150,6 +150,9 @@ func (s *Service) Issue(ctx context.Context, req IssueRequest) (IssueResponse, i
 	if err := s.resolveTemplateGPUCounts(ctx, req.Issuer.AppRunID, stored); err != nil {
 		return IssueResponse{}, 0, err
 	}
+	if err := s.checkResolvedGPUs(req.Attestation, stored); err != nil {
+		return IssueResponse{}, 0, err
+	}
 	if len(s.dataKey) == 0 {
 		return IssueResponse{}, 0, opErr(http.StatusServiceUnavailable, "grant_data_key_missing", "GRANT_DATA_KEY is not configured")
 	}

@@ -27,14 +27,16 @@ import (
 func TestWorkloadObjectUsesTemplateResources(t *testing.T) {
 	ci := testCodeInterpreter()
 	obj, err := workloadObject("dev-fixed", e2b.CreateRequest{
-		TemplateID: "ar-run-dev-g2",
-		Role:       "dev",
-		SessionID:  "s-8f2a",
-		Workspace:  "top-models",
-		UserID:     "u-123",
-		UserName:   "alice",
-		Timeout:    60 * time.Second,
-		Env:        map[string]string{"FOO": "1", platformInferenceKey: "secret"},
+		TemplateID:  "ar-run-dev-g2",
+		Role:        "dev",
+		SessionID:   "s-8f2a",
+		Workspace:   "top-models",
+		UserID:      "u-123",
+		UserName:    "alice",
+		GrantID:     "gr-01jb7m9k2x",
+		Attestation: "eyJ.test",
+		Timeout:     60 * time.Second,
+		Env:         map[string]string{"FOO": "1", platformInferenceKey: "secret"},
 	}, ci)
 	if err != nil {
 		t.Fatal(err)
@@ -42,10 +44,10 @@ func TestWorkloadObjectUsesTemplateResources(t *testing.T) {
 	if _, found, _ := unstructured.NestedFieldNoCopy(obj.Object, "spec", "entryPoints"); found {
 		t.Fatal("entryPoints must stay unset")
 	}
-	if obj.GetLabels()[safeDisplayNameLabel] != "dev" || obj.GetLabels()[sessionIDLabel] != "s-8f2a" || obj.GetLabels()[safeUserIDLabel] != "u-123" {
+	if obj.GetLabels()[safeDisplayNameLabel] != "dev" || obj.GetLabels()[sessionIDLabel] != "s-8f2a" || obj.GetLabels()[safeUserIDLabel] != "u-123" || obj.GetLabels()[grantIDLabel] != "gr-01jb7m9k2x" {
 		t.Fatalf("labels=%v", obj.GetLabels())
 	}
-	if obj.GetAnnotations()[safeUserNameAnnotation] != "alice" {
+	if obj.GetAnnotations()[safeUserNameAnnotation] != "alice" || obj.GetAnnotations()[grantAttestationAnnotation] != "eyJ.test" {
 		t.Fatalf("annotations=%v", obj.GetAnnotations())
 	}
 	if _, ok := obj.GetAnnotations()["primus-safe.workload.use.workspace.storage"]; ok {
@@ -117,15 +119,17 @@ func TestCreateWorkloadWaitsForPod(t *testing.T) {
 	})
 	creator := NewSafeWorkloadCreator(dc, cl)
 	result, err := creator.Create(context.Background(), e2b.CreateRequest{
-		SandboxID:  sandboxID,
-		TemplateID: ci.Name,
-		Namespace:  ci.Namespace,
-		Role:       "dev",
-		SessionID:  "s-8f2a",
-		Workspace:  "top-models",
-		UserID:     "u-123",
-		UserName:   "alice",
-		Timeout:    time.Minute,
+		SandboxID:   sandboxID,
+		TemplateID:  ci.Name,
+		Namespace:   ci.Namespace,
+		Role:        "dev",
+		SessionID:   "s-8f2a",
+		Workspace:   "top-models",
+		UserID:      "u-123",
+		UserName:    "alice",
+		GrantID:     "gr-01jb7m9k2x",
+		Attestation: "eyJ.test",
+		Timeout:     time.Minute,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -167,14 +171,16 @@ func TestCreateDeletesFailedWorkload(t *testing.T) {
 		return true, obj, nil
 	})
 	_, err := NewSafeWorkloadCreator(dc, cl).Create(context.Background(), e2b.CreateRequest{
-		SandboxID:  sandboxID,
-		TemplateID: "ar-run-dev-g2",
-		Namespace:  "agent-sandbox-system",
-		Role:       "dev",
-		SessionID:  "s-8f2a",
-		Workspace:  "top-models",
-		UserID:     "u-123",
-		Timeout:    time.Minute,
+		SandboxID:   sandboxID,
+		TemplateID:  "ar-run-dev-g2",
+		Namespace:   "agent-sandbox-system",
+		Role:        "dev",
+		SessionID:   "s-8f2a",
+		Workspace:   "top-models",
+		UserID:      "u-123",
+		GrantID:     "gr-01jb7m9k2x",
+		Attestation: "eyJ.test",
+		Timeout:     time.Minute,
 	})
 	if err == nil {
 		t.Fatal("expected failure")
@@ -192,6 +198,7 @@ func TestWorkloadNameMatchesSandboxID(t *testing.T) {
 	req := e2b.CreateRequest{
 		SandboxID: sandboxID, TemplateID: "tpl", Namespace: "ns",
 		Role: "dev", SessionID: "s-8f2a", Workspace: "top-models",
+		GrantID: "gr-01jb7m9k2x", Attestation: "eyJ.test",
 	}
 	if err := validateWorkloadRequest(req); err != nil {
 		t.Fatal(err)
@@ -217,9 +224,18 @@ func TestAlignTimeoutAddsElapsed(t *testing.T) {
 	obj := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "amd.com/v1",
 		"kind":       "Workload",
-		"metadata":   map[string]any{"name": "measurement-1"},
-		"spec":       map[string]any{"timeout": int64(120)},
-		"status":     map[string]any{"startTime": started.Format(time.RFC3339)},
+		"metadata": map[string]any{
+			"name": "measurement-1",
+			"labels": map[string]any{
+				safeUserIDLabel: "u-123",
+				grantIDLabel:    "gr-01jb7m9k2x",
+			},
+			"annotations": map[string]any{
+				grantAttestationAnnotation: "eyJ.test",
+			},
+		},
+		"spec":   map[string]any{"timeout": int64(120)},
+		"status": map[string]any{"startTime": started.Format(time.RFC3339)},
 	}}
 	if _, err := dc.Resource(workloadGVR).Create(context.Background(), obj, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
@@ -234,6 +250,9 @@ func TestAlignTimeoutAddsElapsed(t *testing.T) {
 	timeout, _, _ := unstructured.NestedInt64(got.Object, "spec", "timeout")
 	if timeout != 390 {
 		t.Fatalf("timeout=%d", timeout)
+	}
+	if got.GetLabels()[safeUserIDLabel] != "u-123" || got.GetLabels()[grantIDLabel] != "gr-01jb7m9k2x" || got.GetAnnotations()[grantAttestationAnnotation] != "eyJ.test" {
+		t.Fatalf("metadata=%v %v", got.GetLabels(), got.GetAnnotations())
 	}
 }
 

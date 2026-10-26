@@ -96,8 +96,8 @@ type RevokeResponse struct {
 }
 
 func validateIssue(req IssueRequest, now time.Time) error {
-	if !grantName.MatchString(req.GrantID) || len(req.GrantID) > 253 {
-		return opErr(http.StatusBadRequest, "invalid_grant", "grantId is not a DNS-1123 name")
+	if !grantName.MatchString(req.GrantID) || len(req.GrantID) > 63 {
+		return opErr(http.StatusBadRequest, "invalid_grant", "grantId is not a label value")
 	}
 	if req.Owner.UserID == "" || len(req.Owner.Workspaces) == 0 {
 		return opErr(http.StatusBadRequest, "invalid_grant", "owner userId and workspaces are required")

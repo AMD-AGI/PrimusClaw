@@ -170,7 +170,8 @@ func TestCreateReplayKillAndQuota(t *testing.T) {
 	}
 	created := runner.created[0]
 	if len(runner.created) != 1 || created.Env["FOO"] != "1" || created.UserID != "u-123" ||
-		created.Role != "measurement" || created.SessionID != "s-8f2a" || created.Workspace != "top-models" {
+		created.Role != "measurement" || created.SessionID != "s-8f2a" || created.Workspace != "top-models" ||
+		created.GrantID != "gr-01jb7m9k2x" || created.Attestation == "" {
 		t.Fatalf("created=%+v", runner.created)
 	}
 	second, status, err := svc.Create(context.Background(), key, CreateBody{

@@ -165,16 +165,18 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 	runCtx, cancel := context.WithTimeout(ctx, tpl.Pending)
 	defer cancel()
 	result, runErr := s.runner.Create(runCtx, CreateRequest{
-		SandboxID:  sandboxID,
-		TemplateID: tpl.ID,
-		Namespace:  s.namespace,
-		Timeout:    time.Duration(timeoutSec) * time.Second,
-		UserID:     snap.UserID,
-		UserName:   snap.UserName,
-		Role:       role,
-		SessionID:  snap.SessionID,
-		Workspace:  workspace,
-		Env:        body.EnvVars,
+		SandboxID:   sandboxID,
+		TemplateID:  tpl.ID,
+		Namespace:   s.namespace,
+		Timeout:     time.Duration(timeoutSec) * time.Second,
+		UserID:      snap.UserID,
+		UserName:    snap.UserName,
+		Role:        role,
+		SessionID:   snap.SessionID,
+		Workspace:   workspace,
+		GrantID:     snap.GrantID,
+		Attestation: snap.Attestation,
+		Env:         body.EnvVars,
 	})
 	if runErr != nil {
 		_ = s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, sandboxID, "create_failed")
@@ -336,7 +338,8 @@ func pageBounds(offset, limit, n int) (int, int) {
 	return offset, offset + limit
 }
 
-// Timeout sets a new lifetime from now. A value over the grant cap is refused.
+// Timeout sets a new lifetime from now. Only the role that created the sandbox
+// can change it. A value over the grant cap is refused.
 func (s *Service) Timeout(ctx context.Context, apiKey, sandboxID string, timeoutSec int64) error {
 	grantID, role, err := s.grants.LookupKey(ctx, apiKey)
 	if err != nil {
