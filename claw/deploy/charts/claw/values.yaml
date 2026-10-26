@@ -26,6 +26,8 @@ tls:
   # its built-in roots. Empty (the default) changes nothing. Note it replaces,
   # for these two containers, the image's own NODE_EXTRA_CA_CERTS value, so put
   # in the ConfigMap every anchor the image would otherwise have supplied.
+  # Node reads the file once at start-up: after changing the ConfigMap's
+  # contents, restart api and brain (kubectl rollout restart) to pick it up.
   extraCACertsConfigMap: ""
   extraCACertsKey: ca.crt
 api:
