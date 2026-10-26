@@ -1,0 +1,30 @@
+{
+  "schema": "claw.app-manifest/v1",
+  "name": "hyperloom",
+  "version": "1.0.0",
+  "container": {
+    "image": "harbor.global.primus-safe.amd.com/library/hyperloom-hosted-app:sglang-0.5.22-rocm10-mi30x-23c73b7",
+    "resources": { "cpu": "32", "memory": "256Gi", "ephemeral-storage": "200Gi" }
+  },
+  "state_dir": "${USER_DATA_PATH}/.claw-apps/${run_id}",
+  "command": ["/opt/hyperloom-host/app_bootstrap.sh"],
+  "env": {
+    "HYPERLOOM_SOURCE_REPO": "AMD-AGI/Hyperloom",
+    "HYPERLOOM_SOURCE_SHA": "23c73b709abf9ea320932b8127ab36b2c403dd23",
+    "HYPERLOOM_SPECIALIST_USER": "hl-specialist"
+  },
+  "env_map": {
+    "run_id": "HYPERLOOM_RUN_ID",
+    "run_created_at": "HYPERLOOM_RUN_CREATED_AT",
+    "state_dir": "HYPERLOOM_STATE_DIR",
+    "input_file": "HYPERLOOM_INPUT_FILE",
+    "events_dir": "HYPERLOOM_EVENTS_DIR",
+    "mcp_port": "HYPERLOOM_MCP_PORT",
+    "mcp_token": "HYPERLOOM_MCP_TOKEN",
+    "grant_limits": "HYPERLOOM_GRANT_LIMITS"
+  },
+  "events": { "dir": "events", "format": "cloudevents/v1" },
+  "mcp": { "port": 8765, "path": "/mcp", "token_header": "X-Hyperloom-Token" },
+  "restart": { "max_restarts": 5, "backoff_sec": [30, 120, 600] },
+  "limits": { "input_max_bytes": 262144 }
+}
