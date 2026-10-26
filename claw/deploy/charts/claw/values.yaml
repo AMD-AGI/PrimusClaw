@@ -369,6 +369,9 @@ secret:
   # Max time a sandbox may stay Pending/Creating before the message fails with
   # reason sandbox_pending_timeout. 0 = wait forever. Default 3h.
   sandboxPendingTimeoutSeconds: "10800"
+  # Max time a scheduled sandbox may stay not-ready (image pull, container start)
+  # before the message fails with reason sandbox_start_timeout. 0 = wait forever. Default 15m.
+  sandboxStartTimeoutSeconds: "900"
   # How long a Running sandbox with an empty GET /api/jobs roster stays up
   # before Brain idle-reclaims it. Default 15 minutes.
   sandboxIdleReuseSeconds: "900"

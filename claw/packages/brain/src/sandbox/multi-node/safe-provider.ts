@@ -392,6 +392,10 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
       // naming nothing is what would leave one holding GPUs with no handle to
       // look it up by or delete it with.
       const workloadName = workloadId ?? (create.posted ? messageId : "");
+      // A user's Stop is not a cluster that failed to come up: the wait has
+      // already deleted what it was waiting on, and the run's own cancel path
+      // reports the ending.
+      if (opts?.signal?.aborted) throw err;
       await onEvent({
         type: "sandboxStatus",
         status: mnStatus(spec.backend, "failed"),
