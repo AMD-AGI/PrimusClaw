@@ -3,7 +3,6 @@
   "name": "hyperloom",
   "version": "1.0.0",
   "container": {
-    "image": "harbor.global.primus-safe.amd.com/library/hyperloom-hosted-app:sglang-0.5.22-rocm10-mi30x-23c73b7",
     "resources": { "cpu": "32", "memory": "256Gi", "ephemeral-storage": "200Gi" }
   },
   "state_dir": "${USER_DATA_PATH}/.claw-apps/${run_id}",
