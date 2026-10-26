@@ -84,29 +84,39 @@ export class HitlController {
       return { action: "allow", input: req.input, by: "auto_allow" };
     }
 
-    await this.onEvent({
-      type: "permissionRequest",
-      actionId: req.actionId,
-      // The web client keys on tool_use_id (same value as actionId).
-      tool_use_id: req.actionId,
-      tool: req.tool,
-      input: req.input,
-      description: `${req.tool}: ${JSON.stringify(req.input).slice(0, 200)}`,
-      timeout_ms: HITL_DECISION_TIMEOUT_MS,
-      ts: Date.now(),
-    });
-
     // Non-null by the guard above: willAsk() is false when there is no
     // dispatcher, because there is then nobody who could answer.
     const dispatcher = this.dispatcher!;
+    // Registered before the request is shown: an answer that arrives first
+    // would otherwise find nothing pending and be dropped.
+    const pending = dispatcher.register({
+      actionId: req.actionId,
+      type: "decision",
+      timeoutMs: HITL_DECISION_TIMEOUT_MS,
+      signal: req.signal,
+    });
+    pending.catch(() => { /* consumed below; this only keeps an early failure from being unhandled */ });
+
+    try {
+      await this.onEvent({
+        type: "permissionRequest",
+        actionId: req.actionId,
+        // The web client keys on tool_use_id (same value as actionId).
+        tool_use_id: req.actionId,
+        tool: req.tool,
+        input: req.input,
+        description: `${req.tool}: ${JSON.stringify(req.input).slice(0, 200)}`,
+        timeout_ms: HITL_DECISION_TIMEOUT_MS,
+        ts: Date.now(),
+      });
+    } catch (err) {
+      dispatcher.deregister(req.actionId, "decision");
+      throw err;
+    }
+
     let msg: NatsDecisionMessage;
     try {
-      msg = await dispatcher.register({
-        actionId: req.actionId,
-        type: "decision",
-        timeoutMs: HITL_DECISION_TIMEOUT_MS,
-        signal: req.signal,
-      });
+      msg = await pending;
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
       if (errMsg === "decision_timeout") {
