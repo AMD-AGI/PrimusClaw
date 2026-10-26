@@ -38,6 +38,7 @@ import {
   applyMultiNodeExternalEnv,
   writeTopologyHandoff,
   hasSshKeyFile,
+  applyPlatformKeyEnv,
 } from "./params.js";
 import type { SandboxAction } from "./params.js";
 import { resourcesJsonToWorkloadArray } from "./workload-resources.js";
@@ -2645,10 +2646,9 @@ async function provisionHands(
   // is the caller's per-user `ak-...` SaFE platform key, which means cost
   // tracking + auditing stays per-user at the SaFE layer instead of through
   // a shared virtualKey relay.
-  if (apiKey) {
-    env.ANTHROPIC_API_KEY = apiKey;
-    env.OPENAI_API_KEY = apiKey;
-  }
+  // In safe mode the same key is also SAFE_API_KEY (platform-owned; the deny
+  // lists keep user/system env from overriding it).
+  applyPlatformKeyEnv(env, apiKey, isKubernetesMode());
 
   // Multi-node: point Hyperloom's SaFE-less external mode at the cluster Brain
   // already provisioned instead of the per-user SaFE workload it would
