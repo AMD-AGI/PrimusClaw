@@ -8,9 +8,11 @@ import {
   isMultiNodeRequest,
   parseMultiNodePromptFlags,
   requestedNodeCount,
+  resolveTopology,
   specFromTopology,
 } from "../src/sandbox/multi-node/prompt-flags.js";
 import { classifySandboxFailure } from "../src/sandbox/reaper.js";
+import { SandboxFailure, sandboxFailureOf } from "../src/sandbox/errors.js";
 
 /** Synthetic prompt preserving the parser's nested flags and continuations. */
 const REAL_PROMPT = `Use the skill at /shared/skills/inference_optimizer/SKILL.md to optimize inference performance.
@@ -101,6 +103,10 @@ test("parseMultiNodePromptFlags reads the real optimize prompt", () => {
     pdDecodeNodes: 0,
     pdPrefillTp: 0,
     pdDecodeTp: 0,
+    serverArgs: "--attention-backend aiter --mem-fraction-static 0.8 --max-running-requests 1024",
+    pdPrefillExtraArgs: "",
+    pdDecodeExtraArgs: "",
+    pdIbDevice: "",
   });
 });
 
@@ -136,6 +142,10 @@ test("parseMultiNodePromptFlags applies Hyperloom's own defaults for omitted fla
     pdDecodeNodes: 0,
     pdPrefillTp: 0,
     pdDecodeTp: 0,
+    serverArgs: "",
+    pdPrefillExtraArgs: "",
+    pdDecodeExtraArgs: "",
+    pdIbDevice: "",
   });
 });
 
@@ -178,6 +188,9 @@ test("parseMultiNodePromptFlags reads the infera backend and its PD topology", (
     spec.image,
     "registry.example.com/primus-claw/sglang:test",
   );
+  assert.match(spec.pdPrefillExtraArgs, /--mem-fraction-static 0\.78/);
+  assert.match(spec.pdDecodeExtraArgs, /--mem-fraction-static 0\.82/);
+  assert.equal(spec.nodes, 2);
 });
 
 test("parseMultiNodePromptFlags is not confused by --pd-*-nodes when reading --nodes", () => {
@@ -323,45 +336,51 @@ test("assertMultiNodeModel allows infera with --model", () => {
   assert.doesNotThrow(() => assertMultiNodeModel(spec));
 });
 
-test("classifySandboxFailure maps model errors by backend", () => {
+function failureCode(run: () => void): string | undefined {
+  try {
+    run();
+  } catch (err) {
+    return sandboxFailureOf(err)?.code;
+  }
+  return undefined;
+}
+
+test("model and shape refusals carry a code that does not depend on the message", () => {
+  const infera = parseMultiNodePromptFlags("--nodes 2 --mn-backend infera");
+  assert.equal(failureCode(() => assertMultiNodeModel(infera!)), "infera_model_missing");
+  const atom = parseMultiNodePromptFlags("--nodes 2 --mn-backend atom");
+  assert.equal(failureCode(() => assertMultiNodeModel(atom!)), "mn_model_missing");
+  const sglang = parseMultiNodePromptFlags("--nodes 2 --mn-backend sglangrouter");
+  assert.equal(failureCode(() => assertMultiNodeModel(sglang!)), "mn_model_missing");
   assert.equal(
-    classifySandboxFailure(
-      "multi-node infera request requires --model (infera frontend --router-tokenizer-path)",
-    ),
-    "infera_model_missing",
-  );
-  assert.equal(
-    classifySandboxFailure("model is required (infera frontend --router-tokenizer-path)"),
-    "infera_model_missing",
-  );
-  assert.equal(
-    classifySandboxFailure("model is required (atom prefill/decode --model-path)"),
+    failureCode(() => resolveTopology({ topology: { nodes: 2, backend: "atom" } })),
     "mn_model_missing",
   );
-  assert.equal(
-    classifySandboxFailure("model is required (sglangrouter prefill/decode --model-path)"),
-    "mn_model_missing",
+  const aggregated = parseMultiNodePromptFlags(
+    "--nodes 2 --mn-backend atom --model /models/m --pd-mode aggregated",
   );
+  assert.equal(failureCode(() => assertMultiNodeModel(aggregated!)), "mn_config_invalid");
   assert.equal(
-    classifySandboxFailure("invalid topology: topology.model is required when backend is atom"),
-    "mn_model_missing",
-  );
-  assert.equal(
-    classifySandboxFailure("atom requires --pd-mode disaggregated (got aggregated)"),
+    failureCode(() => resolveTopology({
+      topology: { nodes: 4, backend: "atom", model: "/m", pd_prefill_nodes: 1, pd_decode_nodes: 1 },
+    })),
     "mn_config_invalid",
   );
   assert.equal(
-    classifySandboxFailure("atom engines always run sglang; --framework must be sglang (got vllm)"),
+    failureCode(() => resolveTopology({
+      topology: { nodes: 2, backend: "atom", model: "/m", pd_prefill_tp: 16 },
+    })),
     "mn_config_invalid",
   );
-  assert.equal(
-    classifySandboxFailure("atom: --nodes (4) must equal prefill+decode GPU nodes (2)"),
-    "mn_config_invalid",
-  );
-  assert.equal(
-    classifySandboxFailure("atom: --pd-prefill-tp (16) exceeds --gpus-per-node (8); cross-pod TP is not supported"),
-    "mn_config_invalid",
-  );
+  let caught: unknown;
+  try {
+    assertMultiNodeModel(aggregated!);
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof SandboxFailure);
+  assert.equal(sandboxFailureOf(new Error("wrapped", { cause: caught }))?.code, "mn_config_invalid");
+  assert.equal(classifySandboxFailure((caught as Error).message), null);
 });
 
 test("classifySandboxFailure maps multi-node cluster provisioning errors", () => {

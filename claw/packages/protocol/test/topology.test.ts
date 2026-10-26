@@ -74,9 +74,9 @@ test("atom without a model is refused at declaration time", () => {
 
 test("atom accepts an omitted pd_mode and refuses a shape it cannot provision", () => {
   ok({ nodes: 2, backend: "atom", model: "/m" });
+  ok({ nodes: 2, backend: "atom", model: "/m", framework: "vllm" });
   assert.ok(
-    errs({ nodes: 2, backend: "atom", model: "/m", framework: "vllm" })
-      .some((m) => m.includes("framework")),
+    errs({ nodes: 1, backend: "atom", model: "/m" }).some((m) => m.includes("at least 2")),
   );
   assert.ok(
     errs({ nodes: 4, backend: "atom", model: "/m", pd_prefill_nodes: 1, pd_decode_nodes: 1 })

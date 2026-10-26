@@ -20,6 +20,7 @@ import {
   assertPdClusterPrompt,
   resolvePdClusterReplicas,
 } from "./prompt-flags.js";
+import { SandboxFailure } from "../errors.js";
 import type { MultiNodeBackend } from "./types.js";
 
 /** RayJob head serves the inference server here; matches the Claw template. */
@@ -439,7 +440,10 @@ export interface InferaWorkloadParams extends CommonWorkloadParams {
 export function buildInferaWorkloadBody(p: InferaWorkloadParams): Record<string, unknown> {
   assertCommon(p);
   if (!p.model.trim()) {
-    throw new Error("model is required (infera frontend --router-tokenizer-path)");
+    throw new SandboxFailure(
+      "infera_model_missing",
+      "model is required (infera frontend --router-tokenizer-path)",
+    );
   }
   if (!p.sshAuthorizedKey.trim()) {
     throw new Error("sshAuthorizedKey is required for the Infera idle-pod control plane");
@@ -471,7 +475,7 @@ export function buildInferaWorkloadBody(p: InferaWorkloadParams): Record<string,
 
   const frontendEp = b64(
     `python3 -m infera.server --host 0.0.0.0 --port ${frontendPort} ` +
-    `--router-policy round-robin --router-tokenizer-path ${p.model.trim()} --enable-profiling`,
+    `--router-tokenizer-path ${shellSingleQuote(p.model.trim())}`,
   );
 
   let resources: Record<string, unknown>[];
@@ -588,8 +592,7 @@ function sglangRouterEntrypoint(): string {
 
 /**
  * Router command. SaFE injects ATOM_SERVER_PORT and the role endpoints.
- *
- * @param framework atomesh `--backend` value from the prompt.
+ * `--backend` is the prompt's `--framework`.
  */
 function atomRouterEntrypoint(framework: string): string {
   return [
@@ -600,61 +603,66 @@ function atomRouterEntrypoint(framework: string): string {
     "  --pd-disaggregation \\",
     `  --prefill "\${ATOM_PREFILL_ENDPOINT}" ${ATOM_PREFILL_BOOTSTRAP_PORT} \\`,
     "  --decode \"${ATOM_DECODE_ENDPOINT}\" \\",
-    "  --policy random \\",
-    `  --backend ${framework} \\`,
-    "  --log-level info",
+    `  --backend ${shellSingleQuote(framework)}`,
   ].join("\n");
 }
 
+/** Split a prompt arg string into shell words. Quotes are already removed. */
+function shellWords(raw: string): string[] {
+  return raw.trim().split(/\s+/).filter((word) => word.length > 0);
+}
+
 /**
- * Prefill or decode SGLang command. The model path and transfer backend come
- * from the prompt; the listen port is the one SaFE injects.
- *
- * @param role Engine role, also the disaggregation mode.
- * @param model Model path passed to `--model-path`.
- * @param tp Tensor-parallel size for this role.
- * @param kvTransferBackend KV transfer backend from the prompt.
+ * Prefill or decode command. Model, TP, transfer backend, IB device, and the
+ * extra server flags all come from the prompt. The listen port is the one SaFE
+ * injects. Bootstrap ports are the pair this workload's router command uses.
  */
 function atomEngineEntrypoint(
   role: "prefill" | "decode",
   model: string,
   tp: number,
   kvTransferBackend: string,
+  ibDevice: string,
+  serverArgs: string,
+  roleArgs: string,
 ): string {
   const bootstrap = role === "prefill" ? ATOM_PREFILL_BOOTSTRAP_PORT : ATOM_DECODE_BOOTSTRAP_PORT;
-  return [
+  const lines = [
     "set -euo pipefail",
     "export SGLANG_HOST_IP=\"${POD_IP:-$(hostname -i | awk '{print $1}')}\"",
-    "export SGLANG_MOONCAKE_SEND_AUX_TCP=1",
-    "export MC_TCP_ENABLE_CONNECTION_POOL=true",
-    "ib=\"$(ls /sys/class/infiniband 2>/dev/null | paste -sd, || true)\"",
     "args=(",
     "  python3 -m sglang.launch_server",
     `  --model-path ${shellSingleQuote(model)}`,
     "  --host 0.0.0.0",
     "  --port \"${ATOM_SERVER_PORT}\"",
-    "  --trust-remote-code",
     `  --tp-size ${tp}`,
-    "  --mem-fraction-static 0.8",
-    "  --disable-radix-cache",
-    "  --watchdog-timeout 3600",
-    "  --log-level info",
     `  --disaggregation-mode ${role}`,
-    `  --disaggregation-transfer-backend ${kvTransferBackend}`,
+    `  --disaggregation-transfer-backend ${shellSingleQuote(kvTransferBackend)}`,
     `  --disaggregation-bootstrap-port ${bootstrap}`,
-    ")",
-    "if [ -n \"$ib\" ]; then",
-    "  args+=(--disaggregation-ib-device \"$ib\")",
-    "fi",
-    "exec \"${args[@]}\"",
-  ].join("\n");
+  ];
+  if (ibDevice.trim()) {
+    lines.push(`  --disaggregation-ib-device ${shellSingleQuote(ibDevice.trim())}`);
+  }
+  for (const word of [...shellWords(serverArgs), ...shellWords(roleArgs)]) {
+    lines.push(`  ${shellSingleQuote(word)}`);
+  }
+  lines.push(")", "exec \"${args[@]}\"");
+  return lines.join("\n");
 }
 
 export interface AtomWorkloadParams extends CommonWorkloadParams {
   /** Model path for prefill and decode `--model-path`. */
   model: string;
-  /** atomesh `--backend` on the router; engines always run sglang. */
+  /** Prompt `--framework`, passed to atomesh `--backend`. */
   framework: string;
+  /** Prompt `--server-args`. */
+  serverArgs?: string;
+  /** Prompt `--pd-prefill-extra-args`. */
+  pdPrefillExtraArgs?: string;
+  /** Prompt `--pd-decode-extra-args`. */
+  pdDecodeExtraArgs?: string;
+  /** Prompt `--pd-ib-device`. */
+  pdIbDevice?: string;
   /** KV transfer backend for both engine roles. */
   kvTransferBackend: string;
   /** Must be disaggregated; Atom/SGLangRouter have no aggregated shape. */
@@ -690,7 +698,10 @@ function buildPdClusterWorkloadBody(
 ): Record<string, unknown> {
   assertCommon(p);
   if (!p.model.trim()) {
-    throw new Error(`model is required (${opts.backend} prefill/decode --model-path)`);
+    throw new SandboxFailure(
+      "mn_model_missing",
+      `model is required (${opts.backend} prefill/decode --model-path)`,
+    );
   }
   assertPdClusterPrompt({
     backend: opts.backend,
@@ -750,8 +761,14 @@ function buildPdClusterWorkloadBody(
     images: [p.image, p.image, p.image],
     entryPoints: [
       b64(opts.routerEntrypoint),
-      b64(atomEngineEntrypoint("prefill", model, prefillTp, p.kvTransferBackend)),
-      b64(atomEngineEntrypoint("decode", model, decodeTp, p.kvTransferBackend)),
+      b64(atomEngineEntrypoint(
+        "prefill", model, prefillTp, p.kvTransferBackend,
+        p.pdIbDevice ?? "", p.serverArgs ?? "", p.pdPrefillExtraArgs ?? "",
+      )),
+      b64(atomEngineEntrypoint(
+        "decode", model, decodeTp, p.kvTransferBackend,
+        p.pdIbDevice ?? "", p.serverArgs ?? "", p.pdDecodeExtraArgs ?? "",
+      )),
     ],
     env,
     labels: correlationLabels(p.extraLabels, opts.backend, p.sessionId, p.messageId),

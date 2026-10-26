@@ -601,6 +601,10 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
         pdDecodeNodes: spec.pdDecodeNodes,
         pdPrefillTp: spec.pdPrefillTp,
         pdDecodeTp: spec.pdDecodeTp,
+        serverArgs: spec.serverArgs,
+        pdPrefillExtraArgs: spec.pdPrefillExtraArgs,
+        pdDecodeExtraArgs: spec.pdDecodeExtraArgs,
+        pdIbDevice: spec.pdIbDevice,
       };
       body = spec.backend === "atom" ? buildAtomWorkloadBody(pd) : buildSGLangRouterWorkloadBody(pd);
     } else {

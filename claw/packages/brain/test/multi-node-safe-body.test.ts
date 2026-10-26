@@ -249,8 +249,11 @@ test("buildInferaWorkloadBody deploys aggregated workers idle with a role-scoped
 
   assert.match(
     decodeEp(body.entryPoints[0]),
-    new RegExp(`infera\\.server .*--port ${port} .*--router-tokenizer-path /models/Qwen3-30B-A3B`),
+    new RegExp(`infera\\.server .*--port ${port} .*--router-tokenizer-path '/models/Qwen3-30B-A3B'`),
   );
+  const frontend = decodeEp(body.entryPoints[0]);
+  assert.equal(frontend.includes("--router-policy"), false);
+  assert.equal(frontend.includes("--enable-profiling"), false);
   // The worker never starts an engine at deploy time; the optimizer SSHes in.
   assert.equal(
     decodeEp(body.entryPoints[1]),
@@ -339,12 +342,14 @@ test("buildAtomWorkloadBody creates router, prefill and decode from the prompt s
   const prefill = decodeEp(body.entryPoints[1]);
   const decode = decodeEp(body.entryPoints[2]);
   assert.match(router, /atomesh launch/);
-  assert.match(router, /--backend sglang/);
+  assert.match(router, /--backend 'sglang'/);
+  assert.equal(router.includes("--policy"), false);
+  assert.equal(prefill.includes("--mem-fraction-static"), false);
   assert.match(prefill, /--model-path '\/shared_nfs\/models\/Qwen3-14B-FP8'/);
   assert.match(prefill, /--tp-size 8/);
   assert.match(prefill, /--disaggregation-mode prefill/);
   assert.match(prefill, /--disaggregation-bootstrap-port 8998/);
-  assert.match(prefill, /--disaggregation-transfer-backend mooncake/);
+  assert.match(prefill, /--disaggregation-transfer-backend 'mooncake'/);
   assert.match(decode, /--disaggregation-mode decode/);
   assert.match(decode, /--disaggregation-bootstrap-port 9098/);
 });
@@ -363,7 +368,35 @@ test("buildAtomWorkloadBody splits --nodes across prefill and decode when pd cou
   assert.match(decodeEp(body.entryPoints[1]), /--tp-size 8/);
 });
 
-test("buildAtomWorkloadBody rejects aggregated pd-mode, vllm framework, and cross-pod TP", () => {
+test("buildAtomWorkloadBody uses the prompt framework and engine args", () => {
+  const body = buildAtomWorkloadBody({
+    ...COMMON,
+    model: "/models/m",
+    framework: "vllm",
+    kvTransferBackend: "nixl",
+    pdMode: "disaggregated",
+    serverArgs: "--mem-fraction-static 0.8",
+    pdPrefillExtraArgs: "--watchdog-timeout 3600",
+    pdDecodeExtraArgs: "--max-running-requests 4",
+    pdIbDevice: "mlx5_0",
+  }) as Record<string, any>;
+  const router = decodeEp(body.entryPoints[0]);
+  const prefill = decodeEp(body.entryPoints[1]);
+  const decode = decodeEp(body.entryPoints[2]);
+  assert.match(router, /--backend 'vllm'/);
+  assert.match(prefill, /--disaggregation-transfer-backend 'nixl'/);
+  assert.ok(prefill.includes("'--mem-fraction-static'"));
+  assert.ok(prefill.includes("'0.8'"));
+  assert.ok(prefill.includes("'--watchdog-timeout'"));
+  assert.ok(prefill.includes("'3600'"));
+  assert.match(prefill, /--disaggregation-ib-device 'mlx5_0'/);
+  assert.equal(prefill.includes("max-running-requests"), false);
+  assert.ok(decode.includes("'--max-running-requests'"));
+  assert.ok(decode.includes("'4'"));
+  assert.equal(decode.includes("watchdog-timeout"), false);
+});
+
+test("buildAtomWorkloadBody rejects aggregated pd-mode and cross-pod TP", () => {
   const base = {
     ...COMMON,
     model: "/models/m",
@@ -374,10 +407,6 @@ test("buildAtomWorkloadBody rejects aggregated pd-mode, vllm framework, and cros
   assert.throws(
     () => buildAtomWorkloadBody({ ...base, pdMode: "aggregated" }),
     /requires --pd-mode disaggregated/,
-  );
-  assert.throws(
-    () => buildAtomWorkloadBody({ ...base, framework: "vllm" }),
-    /--framework must be sglang/,
   );
   assert.throws(
     () => buildAtomWorkloadBody({ ...base, pdPrefillTp: 16 }),

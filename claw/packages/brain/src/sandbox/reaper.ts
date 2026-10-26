@@ -1359,24 +1359,7 @@ export function classifySandboxFailure(msg: string): string | null {
   if (/multi-node workload .* not ready within/i.test(msg)) return "mn_cluster_timeout";
   if (/RayJob create failed/i.test(msg)) return "rayjob_create_failed";
   if (/multi-node (request )?requires/i.test(msg)) return "rayjob_config_invalid";
-  if (/model is required \(atom\b/i.test(msg) || /model is required \(sglangrouter\b/i.test(msg)) {
-    return "mn_model_missing";
-  }
-  if (/model is required when backend is (atom|sglangrouter)\b/i.test(msg)) {
-    return "mn_model_missing";
-  }
-  if (
-    /requires --pd-mode disaggregated/i.test(msg)
-    || /--framework must be sglang/i.test(msg)
-    || /must equal prefill\+decode GPU nodes/i.test(msg)
-    || /cross-pod TP is not supported/i.test(msg)
-    || /topology\.framework must be sglang/i.test(msg)
-    || /topology\.pd_mode aggregated is not supported/i.test(msg)
-  ) {
-    return "mn_config_invalid";
-  }
-  if (/model is required/i.test(msg) || /multi-node infera request requires/i.test(msg)) {
-    return "infera_model_missing";
-  }
+  // mn_model_missing, mn_config_invalid and infera_model_missing are
+  // SandboxFailure codes. The runner reads those off the error.
   return null;
 }
