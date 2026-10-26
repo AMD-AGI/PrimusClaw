@@ -3,7 +3,10 @@
 
 /**
  * HitlController — Human-In-The-Loop approval for tool calls.
- * Disabled by default (HITL_ENABLED=false); when off, all calls auto-allow.
+ * Disabled by default (HITL_ENABLED=false); when off, all calls auto-allow,
+ * except tools a per-server policy (approval-policy.ts) marks as requiring
+ * approval: those are always held for a person, and fail closed (denied) when
+ * no one answers or there is no channel to ask on.
  */
 
 import {
@@ -31,6 +34,11 @@ export interface HitlRequest {
   signal?: AbortSignal;
 }
 
+export interface HitlOptions {
+  /** Tools that must be approved regardless of HITL_ENABLED / HITL_AUTO_ALLOW. */
+  requireApproval?: (tool: string) => boolean;
+}
+
 export class HitlController {
   private autoAllowSet: Set<string>;
   private alwaysAllow = new Set<string>();
@@ -38,6 +46,7 @@ export class HitlController {
   constructor(
     private dispatcher: DecisionDispatcher | null,
     private onEvent: EventCallback,
+    private opts: HitlOptions = {},
   ) {
     this.autoAllowSet = new Set(
       HITL_AUTO_ALLOW.split(",").map((s) => s.trim()).filter(Boolean),
@@ -56,11 +65,21 @@ export class HitlController {
    * The same question `beforeToolUse` asks itself, so the two cannot drift.
    */
   willAsk(tool: string): boolean {
-    if (!HITL_ENABLED || !this.dispatcher) return false;
+    if (!this.dispatcher) return false;
+    if (this.mustAsk(tool)) return !this.alwaysAllow.has(tool);
+    if (!HITL_ENABLED) return false;
     return !this.autoAllowSet.has(tool) && !this.alwaysAllow.has(tool);
   }
 
+  private mustAsk(tool: string): boolean {
+    return this.opts.requireApproval?.(tool) === true;
+  }
+
   async beforeToolUse(req: HitlRequest): Promise<HitlResult> {
+    if (!this.dispatcher && this.mustAsk(req.tool)) {
+      // Nobody could answer, and the policy says a person must. Not an allow.
+      return { action: "deny", reason: "approval required but no approval channel is available", by: "timeout" };
+    }
     if (!this.willAsk(req.tool)) {
       return { action: "allow", input: req.input, by: "auto_allow" };
     }
@@ -68,6 +87,8 @@ export class HitlController {
     await this.onEvent({
       type: "permissionRequest",
       actionId: req.actionId,
+      // The web client keys on tool_use_id (same value as actionId).
+      tool_use_id: req.actionId,
       tool: req.tool,
       input: req.input,
       description: `${req.tool}: ${JSON.stringify(req.input).slice(0, 200)}`,
@@ -89,7 +110,8 @@ export class HitlController {
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
       if (errMsg === "decision_timeout") {
-        const result: HitlResult = HITL_DECISION_DEFAULT === "deny"
+        // A mandatory approval never times out into an allow.
+        const result: HitlResult = HITL_DECISION_DEFAULT === "deny" || this.mustAsk(req.tool)
           ? { action: "deny", reason: "timed out waiting for approval", by: "timeout" }
           : { action: "allow", input: req.input, by: "timeout" };
         await this.emitDecisionResult(req.actionId, result);
@@ -140,7 +162,9 @@ export class HitlController {
     await this.onEvent({
       type: "decisionResult",
       actionId,
+      tool_use_id: actionId,
       decision: result.action,
+      action: result.action,
       by: result.by,
       ...(result.action === "deny" || result.action === "skip"
         ? { feedback: result.reason }

@@ -13,6 +13,9 @@ import { resolveToolIds } from "../tools/resolve.js";
 import { marketplaceToolIds, resolvePluginToolsFromMessage } from "../tasks/plugin-from-message.js";
 import { loadRules } from "./rules.js";
 import { normalizeMcpConfigs } from "../clients/mcp-config.js";
+import { approvalPolicyFromMcp } from "./approval-policy.js";
+import { HitlController } from "./hitl.js";
+import { DecisionDispatcher } from "../delivery/decision-dispatcher.js";
 import { connectPlatformMcp } from "../clients/mcp.js";
 import { buildPrompt } from "./prompt.js";
 import { resolveRequestLlmKey } from "../llm/key-source.js";
@@ -179,6 +182,17 @@ export class AgentEngine {
     const mcpResult = Object.keys(mergedMcp).length > 0
       ? await connectPlatformMcp(mergedMcp)
       : { clients: new Map(), schemas: [], closeAll: async () => {} };
+
+    // Tools a server's `requires_approval` policy holds for a person. Built
+    // only when some server declares one: without a rule the loop gets no
+    // controller and behaves exactly as before.
+    const approval = approvalPolicyFromMcp(mergedMcp);
+    const decisions = approval.active && extras?.natsConnection
+      ? new DecisionDispatcher(extras.natsConnection, sessionId)
+      : null;
+    const hitl = approval.active
+      ? new HitlController(decisions, onEvent, { requireApproval: (t) => approval.requiresApproval(t) })
+      : undefined;
 
     try {
       // Web tools (native web_search + Haiku web_fetch summarization) are
@@ -371,6 +385,7 @@ export class AgentEngine {
           platformMcpClients: mcpResult.clients,
           recreateHands: extras?.recreateHands,
           hooks: hookRunner,
+          hitl,
           onCheckpoint: extras?.onCheckpoint,
           onCacheUse: extras?.onCacheUse,
           resumeFrom: extras?.resumeCheckpoint,
@@ -423,6 +438,7 @@ export class AgentEngine {
       };
     } finally {
       await mcpResult.closeAll();
+      await decisions?.close().catch(() => {});
       try { fs.rmSync(pluginWorkRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
   }

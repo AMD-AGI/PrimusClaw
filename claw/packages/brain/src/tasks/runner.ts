@@ -2854,6 +2854,7 @@ class TaskRunner {
           resumeCheckpoint: this.resumeCheckpoint,
           attachHands: this.attachHands,
           runIdentity: this.runIdentity,
+          natsConnection: getDeps().emitter.nc,
         });
       }
     } finally {
