@@ -8,7 +8,7 @@ import multipart from "@fastify/multipart";
 import {
   API_PORT, APP_ENV, SAFE_API_URL, DATABASE_URL, resolveCorsOrigin,
   AUTH_INTERNAL_TOKEN, NATS_URL,
-  CLAW_MEMORY_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED,
+  CLAW_MEMORY_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
   runLeaseTiming, envSettingProblems, assertAdmissionSettings,
 } from "./config.js";
 import { runLeaseTimingProblems } from "@claw/protocol";
@@ -41,6 +41,7 @@ import { startExternalResolver } from "./tasks/external-resolver.js";
 import { startEventConsumer } from "./events/consumer.js";
 import { startEvolveWorker } from "./marketplace/evolve-worker.js";
 import { startUploadSweeper } from "./sessions/upload-sweeper.js";
+import { archiveIdleSessions } from "./sessions/archive.js";
 import { decayMemory } from "./memory/service.js";
 import { cleanupOrphanSkillFiles, cleanupOldPatterns } from "./marketplace/skill-service.js";
 import { registry as metricsRegistry } from "./infra/metrics.js";
@@ -305,12 +306,13 @@ async function main() {
     if (CLAW_MEMORY_ENABLED) {
       decayMemory().catch(err => logger.error({ err }, "memory.decay_failed"));
     }
+    archiveIdleSessions(SESSION_AUTO_ARCHIVE_DAYS).catch(err => logger.error({ err }, "session_archive.failed"));
     if (CLAW_SKILL_EVOLUTION_ENABLED) {
       cleanupOrphanSkillFiles().catch(err => logger.error({ err }, "skill_files.cleanup_failed"));
       cleanupOldPatterns().catch(err => logger.error({ err }, "skill_patterns.cleanup_failed"));
     }
   };
-  if (CLAW_MEMORY_ENABLED || CLAW_SKILL_EVOLUTION_ENABLED) {
+  if (CLAW_MEMORY_ENABLED || CLAW_SKILL_EVOLUTION_ENABLED || SESSION_AUTO_ARCHIVE_DAYS > 0) {
     setTimeout(() => {
       runMaintenance();
       setInterval(runMaintenance, 24 * 60 * 60 * 1000);
