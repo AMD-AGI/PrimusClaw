@@ -57,6 +57,14 @@ const MAX_SHELL_DEPTH = 3;
  * malformed: every bash command is held and a warning is logged.
  */
 export const UNAVAILABLE_RULES = "bash approval rules unavailable";
+/**
+ * Stands in for a plugin's whole tool list when the task message named a plugin
+ * and did not carry the list. The rules are unknown rather than malformed, and
+ * the label says so, because the fix for one is a different message and for the
+ * other a different rule.
+ */
+export const PLUGIN_TOOLS_MISSING = "plugin tool list missing from the task message";
+export const PLUGIN_TOOLS_MISSING_LABEL = "plugin tool list missing from the task message; every bash command is held";
 export const MALFORMED_LABEL = "bash approval rules are malformed; every bash command is held";
 
 interface Segment {
@@ -413,8 +421,18 @@ export interface BashApprovalSource {
 export function bashApprovalPolicyFrom(sources: BashApprovalSource[]): BashApprovalPolicy {
   const rules: Rule[] = [];
   let holdAll = false;
+  /** Why everything is held, for the first cause found; what `check` reports. */
+  let holdLabel = MALFORMED_LABEL;
   for (const { source, value } of sources) {
     if (value === undefined || value === null || value === false) continue;
+    // One source value, not an entry of a rule list: the engine hands each item
+    // of a plugin's `bashApproval` over as a source of its own.
+    if (value === PLUGIN_TOOLS_MISSING) {
+      if (!holdAll) holdLabel = PLUGIN_TOOLS_MISSING_LABEL;
+      holdAll = true;
+      logger.warn({ source, reason: PLUGIN_TOOLS_MISSING }, "bash_approval.plugin_tools_missing_holding_all_commands");
+      continue;
+    }
     if (!Array.isArray(value) || value.length === 0) {
       logger.warn({ source, valueType: Array.isArray(value) ? "empty array" : typeof value },
         "bash_approval.invalid_holding_all_commands");
@@ -433,7 +451,7 @@ export function bashApprovalPolicyFrom(sources: BashApprovalSource[]): BashAppro
   return {
     active: holdAll || rules.length > 0,
     check(command: unknown): string | null {
-      if (holdAll) return MALFORMED_LABEL;
+      if (holdAll) return holdLabel;
       if (typeof command !== "string" || command.length > MAX_COMMAND_CHARS) return "unreadable bash command";
       const segments = parseSegments(command);
       if (segments.some((sg) => sg.program === TOO_DEEP)) return "command nested too deeply to inspect";
