@@ -2483,6 +2483,20 @@ export async function reapOrphanHandles(lease?: LeaderLease): Promise<number> {
       // reports idle. It would not be coherent on the cancel path, where there
       // is no next time and deferring means never stopping, which is why the
       // guard is here and not inside `stopAllHandlesForDag`.
+      // A terminal the owner has open holds the sandbox, and so does one that is
+      // unreadable. The claim lapses on its own, so this defers rather than
+      // keeps: the next tick after the expiry reaps it like any other orphan.
+      if (sessionId) {
+        const termHold = await handleRegistry.terminalHold(sessionId);
+        if (termHold.state !== "none") {
+          logger.info(
+            { dagRoot, sessionId, hold: termHold.state },
+            "sweeper.orphan_handles_terminal_hold",
+          );
+          deferred++;
+          continue;
+        }
+      }
       const bg = sessionId
         ? await handleRegistry.backgroundWork(sessionId, [...workloads])
         : { state: "clear" as const, reason: "no_workload" as const };

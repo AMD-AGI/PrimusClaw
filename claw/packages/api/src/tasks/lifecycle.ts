@@ -21,7 +21,7 @@ import {
 import { cancelUnheldRun } from "./chat-run.js";
 import { applyTaskStatusTransition, getTask, transitionStatus } from "./db.js";
 import { topologyErrors } from "./run-spec.js";
-import { type ReleaseOutcome, stopAllHandlesForDag, stopSandboxByHandle } from "./sandbox-stopper.js";
+import { type ReleaseOutcome, handleRegistry, stopAllHandlesForDag, stopSandboxByHandle } from "./sandbox-stopper.js";
 import { newTaskId } from "./ids.js";
 import { decodeRunTimeReport } from "@claw/protocol";
 import { settleRunTime } from "./run-time-ledger.js";
@@ -254,6 +254,18 @@ async function maybeStopHandlesForLastUser(
     logger.info(
       { dagRootTaskId, dagNodeId, handles: owned.map(([h]) => h) },
       "sandbox.last_user_deferred_siblings_live",
+    );
+    return;
+  }
+
+  // A terminal the owner has open is a use of this sandbox the run's own end
+  // does not account for. Declining leaves the mapping in place, so the orphan
+  // sweep (which asks the same question) reaps it once the claim has lapsed.
+  const termHold = await handleRegistry.terminalHold(sessionId);
+  if (termHold.state !== "none") {
+    logger.info(
+      { dagRootTaskId, dagNodeId, sessionId, hold: termHold.state, handles: owned.map(([h]) => h) },
+      "sandbox.last_user_stop_deferred_terminal_hold",
     );
     return;
   }
