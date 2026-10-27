@@ -249,7 +249,7 @@ test("R6 the drain offers liveness and sandbox failures without requiring a row 
   for (const reason of [
     "brain_timeout", "worker_lost", "sandbox_workload_terminal", "sandbox_pending_timeout",
     "sandbox_timed_out", "sandbox_exited_before_ready", "sandbox_gone", "sandbox_status_unreadable",
-    "sandbox_health_failed", "sandbox_bootstrap_failed",
+    "sandbox_health_failed", "sandbox_bootstrap_failed", "sandbox_start_timeout",
   ]) assert.ok(sel!.includes(`'${reason}'`), `missing ${reason}`);
   for (const reason of ["agent_error", "dispatch_failed", "session_deleted"]) {
     assert.ok(!sel!.includes(`'${reason}'`), `unrelated ${reason} must stay out`);

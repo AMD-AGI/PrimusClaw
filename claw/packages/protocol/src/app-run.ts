@@ -13,6 +13,14 @@ export const APP_RUN_STATES = [
 ] as const;
 export type AppRunState = (typeof APP_RUN_STATES)[number];
 
+/**
+ * The `cloudevents/v1` event cursor's two shapes (hosting design 5.7), shared by
+ * Brain, which writes the cursor, and the API, which validates it: a segment file
+ * name, and a CloudEvents `id` (a decimal string).
+ */
+export const APP_EVENT_SEGMENT_NAME = /^\d{10}\.jsonl$/;
+export const APP_EVENT_ID = /^\d{1,20}$/;
+
 /** Secrets shorter than this are not hunted: they would shred ordinary text, and a real token is far longer. */
 export const SCRUB_MIN_SECRET_LENGTH = 8;
 

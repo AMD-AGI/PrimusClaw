@@ -32,7 +32,7 @@ import { resourcesMapToWorkloadArray } from "./params.js";
 import { EXEC_TRANSPORT_SLACK_MS, parseExecTimeoutMs } from "./provider.js";
 import { sandboxWorkloadName } from "./workload-naming.js";
 import { fetchThroughRouters, safeHandsBaseUrl, sandboxRouterBases } from "./sandbox-router.js";
-import { waitForWorkloadReady, type WorkloadWaitDeps } from "./workload-wait.js";
+import { waitForWorkloadReady, type WorkloadWaitDeps, type WorkloadWaitOptions } from "./workload-wait.js";
 import type {
   SandboxProvider,
   SandboxCreateParams,
@@ -141,7 +141,21 @@ export class SafeWorkloadProvider implements SandboxProvider {
     // bounded only by the queue ceiling. The ways the wait ends terminally are
     // documented on waitForWorkloadReady, beside the code that enforces them,
     // rather than listed again here.
-    await pollWorkloadUntilRunning(workloadId, apiKey, params.onEvent);
+    await pollWorkloadUntilRunning(workloadId, apiKey, params.onEvent, undefined, "hands", {
+      signal: params.signal,
+      reclaimOnAbort: params.reclaimOnAbort,
+      // Only for a cancelled run, which the failure path does not reap. Every
+      // other ending keeps its existing handling: the failure path reaps the
+      // PENDING workload after it has read the platform's account of it
+      // (sandbox_start_timeout included), and the reaper covers the rest.
+      onGiveUp: async ({ reason }) => {
+        if (reason !== "sandbox_wait_interrupted") return;
+        await this.stop({
+          provider: "safe-workload", id: workloadId, sandboxName: workloadId,
+          namespace: ns, handsBaseUrl: "", platformKey: apiKey,
+        });
+      },
+    });
 
     return {
       provider: "safe-workload",
@@ -298,9 +312,10 @@ export type PollDeps = WorkloadWaitDeps;
  *  (the phase, and nothing beyond it) and translates the loop's states into the
  *  event shape this path's consumers already parse.
  *
- *  Nothing is done to the workload when the wait is given up: a sandbox that
- *  never came up is left to the reaper, which is where its lifecycle already
- *  lived. */
+ *  Unless the caller passes `onGiveUp`, nothing is done to the workload when the
+ *  wait is given up: a sandbox that never came up is left to the reaper, which is
+ *  where its lifecycle already lived. `signal` is the run's cancel: aborting it
+ *  ends the wait with `sandbox_wait_interrupted`. */
 export async function pollWorkloadUntilRunning(
   workloadId: string,
   apiKey: string,
@@ -308,6 +323,8 @@ export async function pollWorkloadUntilRunning(
   deps?: PollDeps,
   /** Event-name prefix of the wait's logs (`<prefix>.poll_error`); `hands` unless another owner says so. */
   logPrefix = "hands",
+  /** The run's cancel signal, and what to do with the workload when the wait is given up. */
+  wait?: Pick<WorkloadWaitOptions, "signal" | "onGiveUp" | "reclaimOnAbort">,
 ): Promise<void> {
   await onEvent?.({ type: "sandboxStatus", event: "phase", phase: "Creating", status: "creating", log: "" });
 
@@ -332,6 +349,9 @@ export async function pollWorkloadUntilRunning(
         log: `Waiting in queue (position ${queuePosition})`,
       });
     },
+    signal: wait?.signal,
+    reclaimOnAbort: wait?.reclaimOnAbort,
+    onGiveUp: wait?.onGiveUp,
     deps,
   });
 }

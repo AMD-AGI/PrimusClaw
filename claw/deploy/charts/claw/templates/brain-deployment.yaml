@@ -151,7 +151,7 @@ spec:
                 matchLabels:
                   app: primus-claw
                   component: primus-claw-brain
-      {{- if or (and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml) .Values.grantSigningKey.enabled }}
+      {{- if or (and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml) .Values.tls.extraCACertsConfigMap .Values.grantSigningKey.enabled }}
       volumes:
       {{- if and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
       - name: sandbox-template
@@ -162,6 +162,14 @@ spec:
       - name: grant-signing-key
         secret:
           secretName: {{ .Values.grantSigningKey.secretName }}
+      {{- end }}
+      {{- if .Values.tls.extraCACertsConfigMap }}
+      - name: extra-ca
+        configMap:
+          name: {{ .Values.tls.extraCACertsConfigMap | quote }}
+          items:
+          - key: {{ required "tls.extraCACertsKey must be set when tls.extraCACertsConfigMap is set" .Values.tls.extraCACertsKey | quote }}
+            path: ca.crt
       {{- end }}
       {{- end }}
       containers:
@@ -237,6 +245,10 @@ spec:
         {{- if .Values.tls.insecureSkipVerify }}
         - name: NODE_TLS_REJECT_UNAUTHORIZED
           value: "0"
+        {{- end }}
+        {{- if .Values.tls.extraCACertsConfigMap }}
+        - name: NODE_EXTRA_CA_CERTS
+          value: /etc/claw-ca/ca.crt
         {{- end }}
         {{- if and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
         - name: AGENT_SANDBOX_TEMPLATE_FILE
@@ -323,7 +335,7 @@ spec:
         - name: E2B_SANDBOX_URL
           value: {{ .Values.grantSigningKey.e2bSandboxUrl | quote }}
         {{- end }}
-        {{- if or (and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml) .Values.grantSigningKey.enabled }}
+        {{- if or (and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml) .Values.tls.extraCACertsConfigMap .Values.grantSigningKey.enabled }}
         volumeMounts:
         {{- if and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
         - name: sandbox-template
@@ -333,6 +345,11 @@ spec:
         {{- if .Values.grantSigningKey.enabled }}
         - name: grant-signing-key
           mountPath: /var/run/claw/grant
+          readOnly: true
+        {{- end }}
+        {{- if .Values.tls.extraCACertsConfigMap }}
+        - name: extra-ca
+          mountPath: /etc/claw-ca
           readOnly: true
         {{- end }}
         {{- end }}

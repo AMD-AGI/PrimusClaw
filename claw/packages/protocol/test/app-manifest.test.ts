@@ -275,6 +275,12 @@ test("paths and placeholders stay inside their directory", () => {
   refused(mutate((m) => { m.bootstrap.file = "/etc/x"; }), "bootstrap.file", "relative");
   refused(mutate((m) => { m.events.dir = "a/../../b"; }), "events.dir", "not contain ..");
   refused(mutate((m) => { m.mcp.path = "mcp"; }), "mcp.path", 'start with "/"');
+  for (const h of ["Authorization", "authorization", "X-Session-Id", "Content-Type", "Host"]) {
+    refused(mutate((m) => { m.mcp.token_header = h; }), "mcp.token_header", "platform sets");
+  }
+  for (const h of ["bad header", "x:y", "a\nb"]) {
+    refused(mutate((m) => { m.mcp.token_header = h; }), "mcp.token_header", "RFC 7230");
+  }
   refused(mutate((m) => { m.bootstrap.content_b64 = "not base64!"; }), "bootstrap.content_b64", "must match");
 });
 

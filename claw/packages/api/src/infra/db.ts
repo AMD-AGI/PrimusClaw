@@ -484,6 +484,38 @@ async function readIndexValidity(
 }
 
 /**
+ * One stored row per application progress event (hosting design 5.7): the
+ * forwarding is at least once, so the same (session, app run, producer epoch,
+ * CloudEvents id) can be published again under a new stream sequence. Exported so a test builds
+ * this very index and not a copy of it.
+ */
+export const APP_EVENT_UNIQUE_INDEX_SQL = `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS uq_session_events_app_event
+  ON claw_session_events(session_id, (data->>'app_task_id'), (COALESCE(data->>'epoch', '0')), ((data->'event')->>'id'))
+  WHERE event = 'appEvent'`;
+
+/**
+ * Delete the later copies of every app event stored more than once, keeping the
+ * earliest row (lowest id) of each (session, app run, CloudEvents id). Only run
+ * when the unique index could not be built because such pairs exist, which is
+ * how the degraded mode (index missing, repeats stored) ends instead of lasting.
+ */
+export const APP_EVENT_DEDUP_SQL = `DELETE FROM claw_session_events a
+  USING claw_session_events b
+  WHERE a.event = 'appEvent' AND b.event = 'appEvent'
+    AND a.session_id = b.session_id
+    AND a.data->>'app_task_id' = b.data->>'app_task_id'
+    AND COALESCE(a.data->>'epoch', '0') = COALESCE(b.data->>'epoch', '0')
+    AND (a.data->'event')->>'id' = (b.data->'event')->>'id'
+    AND a.id > b.id`;
+
+/** The app-event unique index, repairing stored repeats first if they are what stops it. */
+export function buildAppEventIndex(client: pg.PoolClient): Promise<void> {
+  return ensureConcurrentIndexOrWarn(client, "uq_session_events_app_event", APP_EVENT_UNIQUE_INDEX_SQL, {
+    onUniqueViolation: async () => { await client.query(APP_EVENT_DEDUP_SQL); },
+  });
+}
+
+/**
  * Returned rather than executed so the schema tests drive this migration itself:
  * a fixture that restates the DDL passes whatever the production statements do.
  */
@@ -661,10 +693,16 @@ function queueAccrualSql(out: string[]): void {
         WHERE run_time_epoch_at IS NULL AND queued_at IS NOT NULL`);
 }
 
+/** `onUniqueViolation` repairs the rows that stop a UNIQUE build (23505); the build is then tried once more. */
+export interface ConcurrentIndexOptions {
+  onUniqueViolation?: () => Promise<void>;
+}
+
 async function ensureConcurrentIndex(
   client: pg.PoolClient,
   name: string,
   createSql: string,
+  opts: ConcurrentIndexOptions = {},
 ): Promise<void> {
   if (!/^[a-z_][a-z0-9_]*$/.test(name)) {
     throw new Error(`unsafe index name: ${name}`);
@@ -695,7 +733,20 @@ async function ensureConcurrentIndex(
   // statement only, and restored afterwards whatever happens.
   await client.query(`SET statement_timeout = ${CONCURRENT_INDEX_TIMEOUT_MS}`);
   try {
-    await client.query(createSql);
+    try {
+      await client.query(createSql);
+    } catch (err) {
+      if ((err as { code?: string })?.code !== "23505" || !opts.onUniqueViolation) throw err;
+      // A unique index cannot be built over rows that already break it. The caller repairs the
+      // data (under the same lifted timeout), the unusable leftover goes, and the build is tried once more.
+      logger.error({ index: name, err: (err as Error)?.message }, "db.concurrent_index_unique_violation_repairing");
+      await opts.onUniqueViolation();
+      const leftover = await readValidity();
+      if (leftover.rowCount && !leftover.rows[0].indisvalid) {
+        await client.query(`DROP INDEX CONCURRENTLY IF EXISTS "${name}"`).catch(() => {});
+      }
+      await client.query(createSql);
+    }
   } finally {
     await client.query(`SET statement_timeout = ${MIGRATION_STATEMENT_TIMEOUT_MS}`)
       .catch(() => { /* the caller's next statement will fail loudly enough */ });
@@ -751,8 +802,9 @@ export async function ensureConcurrentIndexOrWarn(
   client: pg.PoolClient,
   name: string,
   createSql: string,
+  opts: ConcurrentIndexOptions = {},
 ): Promise<void> {
-  await ensureConcurrentIndex(client, name, createSql).catch((err: unknown) => {
+  await ensureConcurrentIndex(client, name, createSql, opts).catch((err: unknown) => {
     if (typeof (err as { code?: unknown })?.code !== "string") throw err;
     logger.warn({ index: name, err }, "db.concurrent_index_build_failed");
   });
@@ -1280,6 +1332,21 @@ export async function initDb(): Promise<void> {
     await client.query("ALTER TABLE claw_session_events ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ DEFAULT NULL").catch(() => {});
     await client.query("CREATE INDEX IF NOT EXISTS idx_events_unprocessed ON claw_session_events(event) WHERE processed_at IS NULL AND deleted_at IS NULL").catch(() => {});
 
+    // An application's progress event is forwarded at least once (hosting design
+    // 5.7); the consumer stores it once per (session, app run, CloudEvents id).
+    //
+    // CONCURRENTLY, like idx_events_session_recent below: a plain build takes SHARE
+    // on the table the event-consumer writes for every Brain event. And not fatal:
+    // a build that fails (a lock or statement timeout) is logged and the API starts
+    // without it; a build stopped by repeats already stored deletes the later copies
+    // (keeping the earliest) and builds again, so the degraded mode ends; an INVALID
+    // leftover of a killed build is dropped before the build. Until the index is valid the
+    // consumer's bare `ON CONFLICT DO NOTHING` de-duplicates nothing, so a repeated
+    // app event is stored twice, which is the degraded mode and not an outage.
+    // A killed or failed build leaves an INVALID index that IF NOT EXISTS then
+    // skips; dropping only that leftover lets the next boot retry.
+    await buildAppEventIndex(client);
+
     // The turn a completion produced, named by the message that asked for it.
     //
     // The gate above recognises one published event delivered twice, which is
@@ -1397,23 +1464,11 @@ export async function initDb(): Promise<void> {
     // this function commits on its own, which is what CONCURRENTLY requires.
     // A killed build leaves an INVALID index that IF NOT EXISTS then skips;
     // dropping only that leftover lets the next boot retry.
-    try {
-      await client.query(
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_session_recent ON claw_session_events(session_id, created_at DESC)",
-      );
-    } catch (err) {
-      logger.warn({ err: (err as Error)?.message }, "db.idx_events_session_recent_failed");
-      const leftover = await client.query(
-        `SELECT indisvalid FROM pg_index i
-           JOIN pg_class c ON c.oid = i.indexrelid
-          WHERE c.relname = 'idx_events_session_recent'`,
-      ).catch(() => ({ rows: [] as Array<{ indisvalid: boolean }> }));
-      if (leftover.rows[0]?.indisvalid === false) {
-        await client.query(
-          "DROP INDEX CONCURRENTLY IF EXISTS idx_events_session_recent",
-        ).catch(() => {});
-      }
-    }
+    await ensureConcurrentIndexOrWarn(
+      client,
+      "idx_events_session_recent",
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_session_recent ON claw_session_events(session_id, created_at DESC)",
+    );
 
     // E2: skill sub-files (multi-file skill support).
     // No FK on purpose — soft-delete the parent skill, orphan rows cleaned by
@@ -1747,8 +1802,8 @@ export async function initDb(): Promise<void> {
     ).catch(() => {});
     await ensureConcurrentIndexOrWarn(
       client,
-      "idx_tasks_platform_facts_pending_v2",
-      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_platform_facts_pending_v2
+      "idx_tasks_platform_facts_pending_v3",
+      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_platform_facts_pending_v3
          ON claw_tasks(
            platform_facts_next_retry_at ASC NULLS FIRST,
            completed_at ASC,
@@ -1758,24 +1813,32 @@ export async function initDb(): Promise<void> {
          AND failure_reason IN (
            'brain_timeout','worker_lost','sandbox_workload_terminal','sandbox_pending_timeout',
            'sandbox_timed_out','sandbox_exited_before_ready','sandbox_gone',
-           'sandbox_status_unreadable','sandbox_health_failed','sandbox_bootstrap_failed'
+           'sandbox_status_unreadable','sandbox_health_failed','sandbox_bootstrap_failed',
+           'sandbox_start_timeout'
          )
          AND platform_facts_resolved_at IS NULL`,
     );
-    // The name this one replaced, removed once the replacement is provably
-    // there. Safe to remove at all because v2 strictly widens v1: identical key
-    // columns in identical order, eight more failure reasons in the `IN` list,
-    // and `sandbox_workload_id IS NOT NULL` dropped from the predicate. Every
-    // row v1 indexed is a row v2 indexes, and v1's predicate implies v2's, so a
-    // pod still running the older code has its narrower scan served by v2
-    // throughout a rolling upgrade rather than falling back to a sequential one.
+    // The names this one replaced, removed once the replacement is provably
+    // there. Safe to remove at all because each version strictly widens the one
+    // before: identical key columns in identical order, and a failure-reason
+    // `IN` list that only grows (v2 added eight reasons and dropped
+    // `sandbox_workload_id IS NOT NULL` from the predicate; v3 adds
+    // `sandbox_start_timeout`). Every row an older version indexed is a row v3
+    // indexes, and its predicate implies v3's, so a pod still running older code
+    // has its narrower scan served by v3 throughout a rolling upgrade rather
+    // than falling back to a sequential one.
     //
     // The retention rule below still holds for the indexes it names; what it
-    // refuses is an *unguarded* drop, and the guard is what this call adds.
+    // refuses is an *unguarded* drop, and the guard is what these calls add.
     await dropSupersededIndexWhenReplaced(
       client,
       "idx_tasks_platform_facts_pending",
+      "idx_tasks_platform_facts_pending_v3",
+    );
+    await dropSupersededIndexWhenReplaced(
+      client,
       "idx_tasks_platform_facts_pending_v2",
+      "idx_tasks_platform_facts_pending_v3",
     );
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_tasks_workspace ON claw_tasks(workspace_id) WHERE workspace_id IS NOT NULL",
@@ -1839,6 +1902,21 @@ export async function initDb(): Promise<void> {
         logger.warn({ column: col, err: err instanceof Error ? err.message : String(err) }, "db.app_runs_alter_failed");
       });
     }
+    // Where a running application's session-level MCP answers (hosting design 5.8).
+    // The address and the sandbox's session id only: the MCP token stays sealed in
+    // claw_app_runs and is opened when a turn is dispatched.
+    await appRunsDdl(`
+      CREATE TABLE IF NOT EXISTS claw_session_app_mcp (
+        session_id           TEXT NOT NULL,
+        name                 TEXT NOT NULL,
+        app_task_id          TEXT NOT NULL,
+        url                  TEXT NOT NULL,
+        sandbox_session_id   TEXT NOT NULL,
+        updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (session_id, name)
+      )
+    `);
+    await appRunsDdl("CREATE INDEX IF NOT EXISTS idx_session_app_mcp_task ON claw_session_app_mcp(app_task_id)");
     await appRunsDdl("CREATE INDEX IF NOT EXISTS idx_app_runs_session ON claw_app_runs(session_id)");
     // The durable half of Idempotency-Key for app runs: the response cache
     // expires and can lose a write, this does not. Per session, matching the

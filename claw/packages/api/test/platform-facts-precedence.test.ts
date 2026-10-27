@@ -167,3 +167,15 @@ test("agent and dispatch failures stay failures without platform evidence", () =
     );
   }
 });
+
+test("the start ceiling is a provisioning deadline when the platform said nothing, and yields to the pod when it did", () => {
+  assert.deepEqual(
+    terminalFacts({ status: "failed", failure_reason: "sandbox_start_timeout" }),
+    { class: "killed", kill_reason: "deadline", exit_code: null, signal: "" },
+  );
+  const withPod = terminalFacts({
+    status: "failed", failure_reason: "sandbox_start_timeout",
+    pod_failed_message: "Preempted, the node was reclaimed while the pod was starting",
+  });
+  assert.notEqual(withPod?.kill_reason, "deadline");
+});

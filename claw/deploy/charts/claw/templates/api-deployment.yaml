@@ -74,6 +74,22 @@ spec:
         runAsNonRoot: true
         runAsUser: 1000
         fsGroup: 1000
+      {{- if or .Values.tls.extraCACertsConfigMap .Values.grantSigningKey.enabled }}
+      volumes:
+      {{- if .Values.tls.extraCACertsConfigMap }}
+      - name: extra-ca
+        configMap:
+          name: {{ .Values.tls.extraCACertsConfigMap | quote }}
+          items:
+          - key: {{ required "tls.extraCACertsKey must be set when tls.extraCACertsConfigMap is set" .Values.tls.extraCACertsKey | quote }}
+            path: ca.crt
+      {{- end }}
+      {{- if .Values.grantSigningKey.enabled }}
+      - name: grant-signing-key
+        secret:
+          secretName: {{ .Values.grantSigningKey.secretName }}
+      {{- end }}
+      {{- end }}
       containers:
       - name: api
         image: {{ include "primus-claw.image" . | quote }}
@@ -153,6 +169,10 @@ spec:
         - name: AGENT_SANDBOX_GRANT_URL
           value: {{ .Values.grantSigningKey.url | quote }}
         {{- end }}
+        {{- if .Values.tls.extraCACertsConfigMap }}
+        - name: NODE_EXTRA_CA_CERTS
+          value: /etc/claw-ca/ca.crt
+        {{- end }}
         # The startup budget has to cover a schema migration, because initDb runs
         # before the server listens: nothing answers /health while a migration is
         # in flight, on the replica doing it and on every replica waiting behind
@@ -161,6 +181,19 @@ spec:
         # longest migration the code permits could never finish -- the pod was
         # killed and the next one started the same statement again. 120 x 3s is
         # 360s, which leaves the statement its whole budget plus connect time.
+        {{- if or .Values.tls.extraCACertsConfigMap .Values.grantSigningKey.enabled }}
+        volumeMounts:
+        {{- if .Values.tls.extraCACertsConfigMap }}
+        - name: extra-ca
+          mountPath: /etc/claw-ca
+          readOnly: true
+        {{- end }}
+        {{- if .Values.grantSigningKey.enabled }}
+        - name: grant-signing-key
+          mountPath: /var/run/claw/grant
+          readOnly: true
+        {{- end }}
+        {{- end }}
         startupProbe:
           httpGet: { path: /health, port: http }
           periodSeconds: 3
@@ -175,15 +208,3 @@ spec:
           failureThreshold: 2
         resources:
           {{- toYaml .Values.api.resources | nindent 10 }}
-        {{- if .Values.grantSigningKey.enabled }}
-        volumeMounts:
-        - name: grant-signing-key
-          mountPath: /var/run/claw/grant
-          readOnly: true
-        {{- end }}
-      {{- if .Values.grantSigningKey.enabled }}
-      volumes:
-      - name: grant-signing-key
-        secret:
-          secretName: {{ .Values.grantSigningKey.secretName }}
-      {{- end }}

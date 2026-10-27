@@ -336,6 +336,13 @@ export const UPLOAD_TTL_DAYS = envInt("UPLOAD_TTL_DAYS", 7);
 // Sweep cadence in minutes.
 export const UPLOAD_SWEEP_INTERVAL_MIN = envInt("UPLOAD_SWEEP_INTERVAL_MIN", 60);
 
+// --- Session auto-archive ---
+// A session with no activity for this many days, and no run in flight, is
+// archived by the daily maintenance pass. 0 disables it. Archiving only changes
+// `claw_sessions.status`; the session stays readable and a new message to it
+// makes it active again.
+export const SESSION_AUTO_ARCHIVE_DAYS = envInt("SESSION_AUTO_ARCHIVE_DAYS", 7, { min: 0 });
+
 // --- Memory / Skill LLM ---
 export const MEMORY_LLM_MODEL = env("MEMORY_LLM_MODEL", env("DEFAULT_MODEL", "claude-opus-4-6"));
 export const MEMORY_LLM_API_KEY = env("MEMORY_LLM_API_KEY", env("ANTHROPIC_AUTH_TOKEN", env("ANTHROPIC_API_KEY")));
@@ -365,6 +372,15 @@ export const CLAW_SKILL_EVOLUTION_ENABLED = envBool("CLAW_SKILL_EVOLUTION_ENABLE
  * implemented, so nothing is gained by taking one in.
  */
 export const APP_RUNS_ENABLED = envBool("APP_RUNS_ENABLED", false);
+
+/**
+ * Whether the sandbox Router runs with `--enable-auth`. It decides what an
+ * application's session-level MCP carries as `token` when a turn is dispatched:
+ * with auth on, the `<SAFE_API_KEY>` placeholder, which Brain expands to the
+ * session owner's platform key; with auth off, the run's MCP token. Must match
+ * Brain's setting of the same name.
+ */
+export const SANDBOX_ROUTER_AUTH_ENABLED = envBool("SANDBOX_ROUTER_AUTH_ENABLED", false);
 
 /**
  * Platform caps on what an app run's grant may carry, as JSON of the grant
