@@ -4,6 +4,7 @@
 import { db } from "../infra/db.js";
 import { callMemoryLLM } from "../llm/client.js";
 import pino from "pino";
+import { CLAW_MEMORY_ENABLED } from "../config.js";
 
 const logger = pino({ name: "memory-service" });
 
@@ -38,6 +39,21 @@ export async function getMemoryPreference(userId: string): Promise<boolean> {
     "SELECT enabled FROM claw_user_memory_prefs WHERE user_id = $1", [userId],
   )).rows[0];
   return row?.enabled === true;
+}
+
+/**
+ * Whether memory writes will actually persist for this user: the deployment
+ * flag and the user's own preference. Sent to Brain so it can stop offering
+ * save_memory when the write would be dropped. A failed read counts as off.
+ */
+export async function isMemoryActive(userId: string): Promise<boolean> {
+  if (!CLAW_MEMORY_ENABLED) return false;
+  try {
+    return await getMemoryPreference(userId);
+  } catch (err) {
+    logger.error({ err, userId }, "memory.preference_read_failed");
+    return false;
+  }
 }
 
 export async function setMemoryPreference(userId: string, enabled: boolean): Promise<void> {

@@ -220,6 +220,7 @@ export class AgentEngine {
         // a2a bearer: keep the platform_key fallback so safe-mode dispatch
         // (empty llm_api_key) still authenticates sub-agent calls.
       }, resolveRequestLlmKey(request) || request.platform_key || "", sandbox);
+      router.memoryEnabled = request.memory_enabled !== false;
       const allToolSchemas = [...router.getToolSchemas(), ...mcpResult.schemas];
 
       const messages = [...(request.history || [])];

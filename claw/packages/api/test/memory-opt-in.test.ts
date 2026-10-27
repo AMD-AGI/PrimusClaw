@@ -172,3 +172,12 @@ test("routes: a user cannot see, delete or toggle another user's memory", async 
   const r = await bob.inject({ method: "GET", url: "/v1/users/me/memories" });
   assert.equal(r.json().data.length, 0);
 });
+
+test("isMemoryActive follows the user's preference (flag is on in this file)", async () => {
+  const { isMemoryActive } = await import("../src/memory/service.js");
+  assert.equal(await isMemoryActive("u-active"), false);
+  prefs.set("u-active", true);
+  assert.equal(await isMemoryActive("u-active"), true);
+  prefs.set("u-active", false);
+  assert.equal(await isMemoryActive("u-active"), false);
+});

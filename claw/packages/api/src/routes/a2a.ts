@@ -18,6 +18,7 @@ import { applySessionGateTransition, openChatRun } from "../tasks/chat-run.js";
 import { applyTaskStatusTransition } from "../tasks/db.js";
 import { gpuNodesFromSpec, topologyErrors } from "../tasks/run-spec.js";
 import type { EnvironmentTopology } from "@claw/protocol";
+import { isMemoryActive } from "../memory/service.js";
 import type { PoolClient } from "pg";
 import { ErrorCode, NatsError } from "nats";
 import pino from "pino";
@@ -686,6 +687,7 @@ async function publishA2AExecuteTask(
     message_id: spec.messageId,
     prompt: text,
     history: [],
+    memory_enabled: await isMemoryActive(auth.userId || "a2a"),
     user_id: auth.userId || "a2a",
     platform_key: auth.platformKey,
     llm_api_key: auth.virtualKey,
