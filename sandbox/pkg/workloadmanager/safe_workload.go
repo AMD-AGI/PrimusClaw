@@ -27,13 +27,16 @@ import (
 )
 
 const (
-	workloadAPIVersion         = "amd.com/v1"
-	workloadKind               = "Workload"
-	safeDisplayNameLabel       = "primus-safe.display.name"
-	safeUserIDLabel            = "primus-safe.user.id"
-	safeUserNameAnnotation     = "primus-safe.user.name"
-	safeWorkloadIDLabel        = "primus-safe.workload.id"
-	sessionIDLabel             = "primus-claw/session-id"
+	workloadAPIVersion     = "amd.com/v1"
+	workloadKind           = "Workload"
+	safeDisplayNameLabel   = "primus-safe.display.name"
+	safeUserIDLabel        = "primus-safe.user.id"
+	safeUserNameAnnotation = "primus-safe.user.name"
+	safeWorkloadIDLabel    = "primus-safe.workload.id"
+	// ownerSessionIDLabel records the issuing Claw session. Pulse reads
+	// primus-claw/session-id as the session's own sandbox, so a grant workload
+	// must not use that key.
+	ownerSessionIDLabel        = "primus-claw/owner-session-id"
 	grantIDLabel               = "agent-sandbox.io/grant-id"
 	sandboxIDLabel             = "agent-sandbox.io/sandbox-id"
 	grantAttestationAnnotation = "agent-sandbox.io/grant-attestation"
@@ -220,7 +223,7 @@ func (c *SafeWorkloadCreator) Session(ctx context.Context, name string) (*store.
 		return nil, err
 	}
 	labels := obj.GetLabels()
-	if _, ok := labels[sessionIDLabel]; !ok || obj.GetDeletionTimestamp() != nil {
+	if _, ok := labels[ownerSessionIDLabel]; !ok || obj.GetDeletionTimestamp() != nil {
 		return nil, store.ErrNotFound
 	}
 	phase, _, _ := unstructured.NestedString(obj.Object, "status", "phase")
@@ -392,6 +395,7 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 		"images":                  []any{ci.Spec.Template.FromImage},
 		"priority":                workloadPriority,
 		"ttlSecondsAfterFinished": workloadTTLSeconds,
+		"maxRetry":                int64(0),
 		"groupVersionKind": map[string]any{
 			"kind":    "Sandbox",
 			"version": "v1",
@@ -406,7 +410,7 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 	}
 	labels := map[string]any{
 		safeDisplayNameLabel: req.Role,
-		sessionIDLabel:       req.SessionID,
+		ownerSessionIDLabel:  req.SessionID,
 		sandboxIDLabel:       name,
 	}
 	if req.UserID != "" {

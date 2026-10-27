@@ -46,7 +46,7 @@ func TestWorkloadObjectUsesTemplateResources(t *testing.T) {
 	if _, found, _ := unstructured.NestedFieldNoCopy(obj.Object, "spec", "entryPoints"); found {
 		t.Fatal("entryPoints must stay unset")
 	}
-	if obj.GetLabels()[safeDisplayNameLabel] != "dev" || obj.GetLabels()[sessionIDLabel] != "s-8f2a" || obj.GetLabels()[safeUserIDLabel] != "u-123" || obj.GetLabels()[grantIDLabel] != "gr-01jb7m9k2x" || obj.GetLabels()[sandboxIDLabel] != sandboxID {
+	if obj.GetLabels()[safeDisplayNameLabel] != "dev" || obj.GetLabels()[ownerSessionIDLabel] != "s-8f2a" || obj.GetLabels()["primus-claw/session-id"] != "" || obj.GetLabels()[safeUserIDLabel] != "u-123" || obj.GetLabels()[grantIDLabel] != "gr-01jb7m9k2x" || obj.GetLabels()[sandboxIDLabel] != sandboxID {
 		t.Fatalf("labels=%v", obj.GetLabels())
 	}
 	if obj.GetAnnotations()[safeUserNameAnnotation] != "alice" || obj.GetAnnotations()[grantAttestationAnnotation] != "eyJ.test" {
@@ -61,8 +61,9 @@ func TestWorkloadObjectUsesTemplateResources(t *testing.T) {
 	}
 	priority, _, _ := unstructured.NestedInt64(obj.Object, "spec", "priority")
 	ttl, _, _ := unstructured.NestedInt64(obj.Object, "spec", "ttlSecondsAfterFinished")
-	if priority != workloadPriority || ttl != workloadTTLSeconds {
-		t.Fatalf("priority=%d ttl=%d", priority, ttl)
+	retry, _, _ := unstructured.NestedInt64(obj.Object, "spec", "maxRetry")
+	if priority != workloadPriority || ttl != workloadTTLSeconds || retry != 0 {
+		t.Fatalf("priority=%d ttl=%d retry=%d", priority, ttl, retry)
 	}
 	resources, _, _ := unstructured.NestedSlice(obj.Object, "spec", "resources")
 	res, _ := resources[0].(map[string]any)

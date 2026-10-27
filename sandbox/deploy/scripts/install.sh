@@ -23,7 +23,7 @@
 #   ENVD_KEY_SRC_KUBECONFIG=                  # required when ENVD_KEY_SOURCE=copy
 #   ENVD_KEY_SRC_NAMESPACE=agent-sandbox-system
 #   INSTALL_RUNTIMECLASS=false                # apply Kata RuntimeClass (kata-qemu)
-#   INGRESS_HOST=                             # existing public host, e.g. global.primus-safe.amd.com; unset skips the Ingress
+#   INGRESS_HOST=                             # existing public host, e.g. sandbox.example.com; unset skips the Ingress
 #   INGRESS_CLASS=higress                     # Ingress class for that host
 #   INSTALL_DEFAULT_TEMPLATES=false           # apply CodeInterpreter examples
 #   TEMPLATES_VARIANT=default                 # default | kata (both use default-templates.yaml)
@@ -170,12 +170,12 @@ dns_name_ok() {
 prompt_ingress_host() {
     [[ -t 0 ]] || return 0
     [[ -z "${INGRESS_HOST}" ]] || return 0
-    read -r -p "Public host (for example global.primus-safe.amd.com, Enter to skip): " INGRESS_HOST || INGRESS_HOST=""
+    read -r -p "Public host (for example sandbox.example.com, Enter to skip): " INGRESS_HOST || INGRESS_HOST=""
 }
 
 # apply_router_ingress mounts the router on an existing public host.
 # The host is whatever already resolves for that cluster, for example
-# global.primus-safe.amd.com. E2B uses absolute paths, so the routes are
+# sandbox.example.com. E2B uses absolute paths, so the routes are
 # /sandboxes and the data-plane prefixes, not a path prefix in front of them.
 # An unset host skips creation and installation continues.
 apply_router_ingress() {

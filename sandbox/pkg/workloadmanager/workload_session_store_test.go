@@ -51,7 +51,7 @@ func e2bWorkload(name, phase string, labels map[string]any) *unstructured.Unstru
 }
 
 func e2bLabels() map[string]any {
-	return map[string]any{sessionIDLabel: "claw-session", safeUserIDLabel: "u-1"}
+	return map[string]any{ownerSessionIDLabel: "claw-session", safeUserIDLabel: "u-1"}
 }
 
 func workloadStoreClient(objs ...k8sruntime.Object) *dynfake.FakeDynamicClient {

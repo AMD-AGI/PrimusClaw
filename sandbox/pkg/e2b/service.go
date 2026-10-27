@@ -200,7 +200,16 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 	return createdResponse(ref, token), http.StatusCreated, nil
 }
 
+// replayPoll is how often a queued idempotency key is read again.
+var replayPoll = 200 * time.Millisecond
+
+// replay returns a finished attempt. A key that is still pending keeps waiting
+// until the sandbox is running or the request ends.
 func (s *Service) replay(ctx context.Context, grantID string, ref runtimev1alpha1.GrantSandboxRef) (SandboxResponse, int, error) {
+	ref, err := s.waitReplay(ctx, grantID, ref)
+	if err != nil {
+		return SandboxResponse{}, 0, err
+	}
 	if ref.State == runtimev1alpha1.SandboxEnded {
 		return SandboxResponse{}, 0, grant.Op(http.StatusGone, "idempotency_key_spent", ref.ID)
 	}
@@ -209,6 +218,25 @@ func (s *Service) replay(ctx context.Context, grantID string, ref runtimev1alpha
 		return SandboxResponse{}, 0, err
 	}
 	return createdResponse(ref, token), http.StatusOK, nil
+}
+
+// waitReplay blocks while the sandbox is still queued.
+func (s *Service) waitReplay(ctx context.Context, grantID string, ref runtimev1alpha1.GrantSandboxRef) (runtimev1alpha1.GrantSandboxRef, error) {
+	for ref.State == runtimev1alpha1.SandboxPending {
+		current, err := s.grants.Sandbox(ctx, grantID, ref.Role, ref.ID)
+		if err != nil {
+			return ref, err
+		}
+		if current.State != runtimev1alpha1.SandboxPending {
+			return current, nil
+		}
+		select {
+		case <-ctx.Done():
+			return ref, grant.Op(http.StatusServiceUnavailable, "sandbox_unavailable", "sandbox is still pending")
+		case <-time.After(replayPoll):
+		}
+	}
+	return ref, nil
 }
 
 // Get returns one sandbox for this key's role. Other roles are not found.

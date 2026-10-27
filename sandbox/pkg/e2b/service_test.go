@@ -32,10 +32,23 @@ type fakeRunner struct {
 	fail    error
 	created []CreateRequest
 	deleted []string
+	started chan struct{}
+	hold    chan struct{}
 }
 
-func (f *fakeRunner) Create(_ context.Context, req CreateRequest) (CreateResult, error) {
+func (f *fakeRunner) Create(ctx context.Context, req CreateRequest) (CreateResult, error) {
 	f.created = append(f.created, req)
+	if f.started != nil {
+		close(f.started)
+		f.started = nil
+	}
+	if f.hold != nil {
+		select {
+		case <-f.hold:
+		case <-ctx.Done():
+			return CreateResult{}, ctx.Err()
+		}
+	}
 	if f.fail != nil {
 		return CreateResult{}, f.fail
 	}
@@ -150,6 +163,33 @@ func (allowIdentity) Check(context.Context, string, string) (string, error) { re
 type allowMember struct{}
 
 func (allowMember) Check(context.Context, string, []string) error { return nil }
+
+func TestReplayWaitsWhilePending(t *testing.T) {
+	svc, runner, keys := testPlane(t, 600, []int32{1}, 1)
+	runner.started = make(chan struct{})
+	runner.hold = make(chan struct{})
+	body := CreateBody{TemplateID: "runner", Timeout: 60, Metadata: map[string]string{"idempotency-key": "once"}}
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := svc.Create(context.Background(), keys["measurement"], body)
+		done <- err
+	}()
+	select {
+	case <-runner.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("create did not start")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, _, err := svc.Create(ctx, keys["measurement"], body)
+	if !grant.IsReason(err, "sandbox_unavailable") {
+		t.Fatalf("err=%v", err)
+	}
+	close(runner.hold)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestCreateReplayKillAndQuota(t *testing.T) {
 	svc, runner, keys := testPlane(t, 600, []int32{1}, 1)
