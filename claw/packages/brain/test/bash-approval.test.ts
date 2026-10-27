@@ -70,6 +70,19 @@ test("http url_regex sees the URL as written, so a variable base still matches",
   assert.equal(p.check('curl -X POST "$C/v1/public/x"'), null);
 });
 
+test("curl -T / --upload-file is a PUT, so a PUT rule holds it", () => {
+  const p = bashApprovalPolicyFrom([{ source: "t", value: [
+    { label: "put", http: { methods: ["PUT"], url_prefix: "console.example.invalid/api" } },
+  ] }]);
+  for (const c of [
+    "curl -T f.bin https://console.example.invalid/api/up",
+    "curl --upload-file f.bin https://console.example.invalid/api/up",
+    "curl -Tf.bin https://console.example.invalid/api/up",
+    "curl --upload-file=f.bin https://console.example.invalid/api/up",
+  ]) assert.equal(p.check(c), "put", c);
+  assert.equal(p.check("curl -d x https://console.example.invalid/api/up"), null);
+});
+
 test("program + args_regex rule, and a whole-line regex rule", () => {
   const p = policy();
   assert.equal(p.check("python3 client.py POST /plans/20/stop"), "console client write");

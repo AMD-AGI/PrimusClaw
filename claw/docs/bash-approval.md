@@ -33,7 +33,7 @@ A list of objects. All fields present in one rule must match.
 | `flags` | Optional regex flags: any of `i`, `m`, `s`. |
 | `program` | Program name or list; a trailing `*` matches a prefix. Wrappers such as `sudo`, `env`, `time`, `VAR=x` and `bash -c "..."` are looked through. |
 | `args_regex` | Tested against the arguments of one simple command (the program itself excluded). |
-| `http.methods` | For `curl` / `wget`: the method is `-X` / `--method`, else `POST` when a body flag is present, else `GET`. |
+| `http.methods` | For `curl` / `wget`: the method is `-X` / `--method`, else `PUT` for `-T` / `--upload-file`, `POST` when a body flag is present, else `GET`. |
 | `http.url_prefix` | URL prefix without scheme, case-insensitive, e.g. `api.example.invalid/v1`. |
 | `http.url_regex` | Tested against the URL as written, so `$BASE/v1/x` can be matched. |
 

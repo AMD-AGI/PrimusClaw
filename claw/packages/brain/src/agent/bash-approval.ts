@@ -135,13 +135,14 @@ const CURL_VALUE_FLAGS = new Set([
   "-w", "--write-out", "--connect-timeout", "--retry", "--cacert", "--cert", "--key", "--resolve", "--json",
   "-K", "--config", "-X", "--request", "--url", "-E", "--proxy-user", "-r", "--range", "-z", "--time-cond",
 ]);
-const CURL_BODY_FLAGS = /^(-d|--data(-raw|-binary|-ascii|-urlencode)?|-F|--form(-string)?|-T|--upload-file|--json)$/;
+const CURL_BODY_FLAGS = /^(-d|--data(-raw|-binary|-ascii|-urlencode)?|-F|--form(-string)?|--json)$/;
+const CURL_UPLOAD_FLAGS = /^(-T|--upload-file)$/;
 
 interface Http { method: string; urls: string[] }
 
 function curlInfo(argv: string[]): Http {
   let method: string | null = null;
-  let body = false, get = false, head = false;
+  let body = false, get = false, head = false, upload = false;
   const urls: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -153,13 +154,16 @@ function curlInfo(argv: string[]): Http {
     if (a.startsWith("--url=")) { urls.push(a.slice(6)); continue; }
     if (a === "-G" || a === "--get") { get = true; continue; }
     if (a === "-I" || a === "--head") { head = true; continue; }
+    // -T / --upload-file is a PUT in curl, not a POST.
+    if (CURL_UPLOAD_FLAGS.test(a)) { upload = true; i++; continue; }
+    if (/^-T./.test(a) || /^--upload-file=/.test(a)) { upload = true; continue; }
     if (CURL_BODY_FLAGS.test(a)) { body = true; i++; continue; }
-    if (/^-[dFT]./.test(a) || /^--(data|form|json|upload-file)[^=]*=/.test(a)) { body = true; continue; }
+    if (/^-[dF]./.test(a) || /^--(data|form|json)[^=]*=/.test(a)) { body = true; continue; }
     if (CURL_VALUE_FLAGS.has(a)) { i++; continue; }
     if (a.startsWith("-")) continue;
     urls.push(a);
   }
-  return { method: method || (head ? "HEAD" : body && !get ? "POST" : "GET"), urls };
+  return { method: method || (head ? "HEAD" : upload ? "PUT" : body && !get ? "POST" : "GET"), urls };
 }
 
 function wgetInfo(argv: string[]): Http {
