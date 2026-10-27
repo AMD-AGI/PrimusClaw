@@ -397,3 +397,10 @@ test("a bare pwd argument is a credential here (a tool argument, not the shell's
   assert.equal(out.PWD, "[hidden]");
   assert.equal(out.cwd, "/work");
 });
+
+test("a credential value repeated in ANOTHER argument is hidden there too, in the prompt", () => {
+  const prompt = summaryPrompt("mcp__ops__rotate", { password: "hunter2", reason: "rotate hunter2 now", note: { text: "x hunter2 y" } }, {});
+  assert.ok(!prompt.includes("hunter2"), prompt);
+  assert.match(prompt, /"reason":"rotate \[hidden\] now"/);
+  assert.deepEqual(maskArguments({ a: "keep hunter2" }, ["hunter2"]), { a: "keep [hidden]" });
+});

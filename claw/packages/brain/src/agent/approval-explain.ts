@@ -129,14 +129,16 @@ export function scrub(text: string, secrets: readonly string[]): string {
  * as a credential is replaced whole, string values are masked by shape and
  * clipped, and depth and width are bounded.
  */
-export function maskArguments(value: unknown, depth = 0): unknown {
-  if (typeof value === "string") return safePreview(value, ARG_VALUE_MAX_CHARS);
+export function maskArguments(value: unknown, secrets: readonly string[] = [], depth = 0): unknown {
+  // `secrets`: the values typed under credential-named arguments; one repeated in another field
+  // (a reason that says "rotate <the password>") is replaced there too.
+  if (typeof value === "string") return scrub(safePreview(value, ARG_VALUE_MAX_CHARS), secrets);
   if (value === null || typeof value !== "object") return value;
   if (depth >= MAX_DEPTH) return "…";
-  if (Array.isArray(value)) return value.slice(0, MAX_ITEMS).map((v) => maskArguments(v, depth + 1));
+  if (Array.isArray(value)) return value.slice(0, MAX_ITEMS).map((v) => maskArguments(v, secrets, depth + 1));
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(value as Record<string, unknown>).slice(0, MAX_ITEMS)) {
-    out[k] = isCredentialName(k) ? HIDDEN : maskArguments(v, depth + 1);
+    out[k] = isCredentialName(k) ? HIDDEN : maskArguments(v, secrets, depth + 1);
   }
   return out;
 }
@@ -166,8 +168,8 @@ export const SUMMARY_SYSTEM = [
 ].join("\n");
 
 export function summaryPrompt(tool: string, input: Record<string, unknown>, ctx: ApprovalExplainContext): string {
-  const args = JSON.stringify(maskArguments(input));
   const secrets = credentialValues(input);
+  const args = JSON.stringify(maskArguments(input, secrets));
   return [
     `Tool: ${tool}`,
     `Tool description: ${firstSentence(ctx.toolDescription) ?? "(none)"}`,
