@@ -1,0 +1,218 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+/**
+ * The trigger routes and loop against a real Postgres whose schema `initDb`
+ * built with CLAW_TRIGGERS_ENABLED on. The dispatch is a stub that records what
+ * it was asked to start, because what matters here is who the run is started as
+ * and how often, not Brain.
+ */
+import assert from "node:assert/strict";
+import test, { after, before, beforeEach, describe } from "node:test";
+import Fastify, { type FastifyInstance } from "fastify";
+
+import { postgresSkipReason } from "./support/pg-cluster.js";
+import { startAdmissionCluster, type AdmissionCluster } from "./support/admission-cluster.js";
+
+const skip = postgresSkipReason();
+const user = (id: string, key = `pk-${id}`) => ({
+  userId: id, userName: id, roles: ["default"], platformKey: key, virtualKey: `vk-${id}`,
+});
+
+describe("scheduled triggers", { skip }, () => {
+  let h: AdmissionCluster;
+  let app: FastifyInstance;
+  let caller = user("u1");
+  let sched: typeof import("../src/triggers/scheduler.js");
+  let fire: typeof import("../src/triggers/fire.js");
+  let crypto: typeof import("../src/crypto/user-env.js");
+  const dispatched: any[] = [];
+  const interrupts: string[] = [];
+  const q = (sql: string, params: unknown[] = []) => h.app.db.db.query(sql, params);
+
+  const create = (over: Record<string, unknown> = {}) => app.inject({
+    method: "POST", url: "/v1/triggers",
+    payload: { name: "brief", prompt: "summarise my runs", schedule: "0 8 * * *", timezone: "Asia/Shanghai", ...over },
+  });
+  const makeDue = (id: string, at = "2026-10-27T00:00:00Z") =>
+    q("UPDATE claw_triggers SET next_fire_at = $2 WHERE trigger_id = $1", [id, at]);
+  const NOW = new Date("2026-10-27T00:00:30Z");
+
+  before(async () => {
+    process.env.CLAW_DEPLOY_MODE = "safe";
+    h = await startAdmissionCluster({
+      CLAW_TRIGGERS_ENABLED: "true", TRIGGER_DAILY_LIMIT_PER_USER: "2", TRIGGER_RUN_TIME_LIMIT_SECONDS: "60",
+      TRIGGER_MAX_PER_USER: "4", TRIGGER_MAX_CONSECUTIVE_FAILURES: "2",
+    });
+    crypto = await import("../src/crypto/user-env.js");
+    crypto.initUserEnvCrypto();
+    sched = await import("../src/triggers/scheduler.js");
+    fire = await import("../src/triggers/fire.js");
+    const chat = await import("../src/tasks/chat-run.js");
+    chat.chatRunPorts.publishInterrupt = (s: string) => { interrupts.push(s); };
+    fire.triggerPorts.dispatch = (async (input: any) => {
+      dispatched.push(input);
+      return { kind: "dispatched", messageId: input.messageId, sandboxImage: undefined, runId: "run-" + dispatched.length };
+    }) as any;
+    const routes = await import("../src/routes/triggers.js");
+    app = Fastify();
+    app.addHook("preHandler", async (req) => { (req as any).user = caller; });
+    await routes.registerTriggerRoutes(app);
+    await app.ready();
+  });
+  after(async () => { await app?.close(); await h?.stop(); });
+  beforeEach(async () => {
+    caller = user("u1");
+    dispatched.length = 0; interrupts.length = 0;
+    await q("DELETE FROM claw_trigger_fires");
+    await q("DELETE FROM claw_triggers");
+    await q("DELETE FROM claw_sessions");
+  });
+
+  test("creation computes the first firing in the owner's timezone and refuses a too-frequent schedule", async () => {
+    const ok = await create();
+    assert.equal(ok.statusCode, 200, ok.body);
+    const next = new Date(ok.json().data.next_fire_at);
+    assert.equal(next.getUTCHours(), 0, "08:00 Shanghai is 00:00 UTC");
+    for (const schedule of ["* * * * *", "*/10 * * * *"]) {
+      const r = await create({ schedule });
+      assert.equal(r.statusCode, 400, schedule);
+    }
+    assert.equal((await create({ timezone: "Mars/Olympus" })).statusCode, 400);
+    assert.equal((await q("SELECT COUNT(*)::int AS n FROM claw_triggers")).rows[0].n, 1, "refusals stored nothing");
+  });
+
+  test("the stored credential is encrypted, and the API never returns it", async () => {
+    const r = await create();
+    assert.ok(!JSON.stringify(r.json()).includes("pk-u1"));
+    const row = (await q("SELECT credential_enc FROM claw_triggers")).rows[0] as any;
+    assert.ok(!row.credential_enc.includes("pk-u1"));
+    assert.ok(crypto.decryptUserEnvValue(row.credential_enc).includes("pk-u1"));
+  });
+
+  test("a firing runs as the creator, with the creator's stamped credentials and no admin role", async () => {
+    caller = user("u1", "pk-creator");
+    const id = (await create()).json().data.trigger_id;
+    caller = user("u2", "pk-someone-else"); // a different caller must not matter at fire time
+    await makeDue(id);
+    await sched.tickTriggers(NOW);
+    assert.equal(dispatched.length, 1);
+    const input = dispatched[0];
+    assert.equal(input.userId, "u1");
+    assert.equal(input.user.userId, "u1");
+    assert.equal(input.user.platformKey, "pk-creator");
+    assert.deepEqual(input.user.roles, ["default"]);
+    assert.equal(input.content, "summarise my runs");
+    assert.equal(input.requestTimeout, 60, "the per-run limit travels with the dispatch");
+    const s = (await q("SELECT user_id, config FROM claw_sessions")).rows[0] as any;
+    assert.equal(s.user_id, "u1");
+    assert.equal(s.config.platform_key, "pk-creator");
+    assert.equal(s.config._server_managed_credentials, true);
+    assert.equal(s.config.trigger_id, id);
+    const f = (await q("SELECT status, session_id FROM claw_trigger_fires")).rows[0] as any;
+    assert.equal(f.status, "started");
+    const t = (await q("SELECT next_fire_at FROM claw_triggers")).rows[0] as any;
+    assert.ok(new Date(t.next_fire_at) > NOW, "scheduled forward");
+  });
+
+  test("two replicas ticking at once fire a due trigger once", async () => {
+    const id = (await create()).json().data.trigger_id;
+    await makeDue(id);
+    await Promise.all([sched.tickTriggers(NOW), sched.tickTriggers(NOW), sched.tickTriggers(NOW)]);
+    assert.equal(dispatched.length, 1);
+    assert.equal((await q("SELECT COUNT(*)::int AS n FROM claw_trigger_fires")).rows[0].n, 1);
+  });
+
+  test("the per-user daily limit skips and pauses, and does not touch another user", async () => {
+    const ids: string[] = [];
+    for (let i = 0; i < 3; i++) ids.push((await create({ name: `t${i}` })).json().data.trigger_id);
+    caller = user("u2");
+    const other = (await create({ name: "other" })).json().data.trigger_id;
+    for (const [i, id] of [...ids, other].entries()) await makeDue(id, `2026-10-27T00:00:0${i}Z`);
+    await sched.tickTriggers(NOW);
+    const fires = (await q("SELECT f.status, t.owner_user_id FROM claw_trigger_fires f JOIN claw_triggers t USING (trigger_id)")).rows as any[];
+    const u1 = fires.filter((f) => f.owner_user_id === "u1").map((f) => f.status).sort();
+    assert.deepEqual(u1, ["skipped_quota", "started", "started"]);
+    assert.deepEqual(fires.filter((f) => f.owner_user_id === "u2").map((f) => f.status), ["started"]);
+    assert.equal(dispatched.length, 3);
+    const paused = (await q("SELECT trigger_id FROM claw_triggers WHERE paused_reason = 'quota'")).rows;
+    assert.ok(paused.length >= 1);
+  });
+
+  test("a run that outlives its limit is stopped once", async () => {
+    const id = (await create()).json().data.trigger_id;
+    await makeDue(id);
+    await sched.tickTriggers(NOW);
+    assert.equal(await sched.enforceRunTimeLimit(new Date(NOW.getTime() + 30_000)), 0, "inside the limit");
+    assert.equal(await sched.enforceRunTimeLimit(new Date(NOW.getTime() + 120_000)), 1);
+    assert.equal(interrupts.length, 1);
+    assert.equal(await sched.enforceRunTimeLimit(new Date(NOW.getTime() + 240_000)), 0, "not stopped twice");
+  });
+
+  test("a missed firing older than the stale window is skipped, not run late", async () => {
+    const id = (await create()).json().data.trigger_id;
+    await makeDue(id, "2026-10-26T00:00:00Z");
+    await sched.tickTriggers(NOW);
+    assert.equal(dispatched.length, 0);
+    assert.equal((await q("SELECT status FROM claw_trigger_fires")).rows[0].status, "skipped_stale");
+  });
+
+  test("a trigger whose previous run is still open skips the next firing", async () => {
+    const id = (await create()).json().data.trigger_id;
+    await makeDue(id);
+    await sched.tickTriggers(NOW);
+    await makeDue(id, "2026-10-27T00:00:10Z");
+    await sched.tickTriggers(new Date(NOW.getTime() + 5000));
+    const st = (await q("SELECT status FROM claw_trigger_fires ORDER BY fired_at")).rows.map((r: any) => r.status);
+    assert.deepEqual(st, ["started", "skipped_overlap"]);
+    assert.equal(dispatched.length, 1);
+  });
+
+  test("a trigger saved without a platform key does not run and does not fall back to a shared one", async () => {
+    const id = (await create()).json().data.trigger_id;
+    await q("UPDATE claw_triggers SET credential_enc = $2 WHERE trigger_id = $1",
+      [id, crypto.encryptUserEnvValue(JSON.stringify({ platformKey: "", virtualKey: "", userName: "u1" }))]);
+    await makeDue(id);
+    await sched.tickTriggers(NOW);
+    assert.equal(dispatched.length, 0);
+    const t = (await q("SELECT paused_reason FROM claw_triggers")).rows[0] as any;
+    assert.equal(t.paused_reason, "credential_invalid");
+    assert.equal((await q("SELECT COUNT(*)::int AS n FROM claw_sessions")).rows[0].n, 0);
+  });
+
+  test("consecutive failed starts pause the trigger", async () => {
+    const id = (await create()).json().data.trigger_id;
+    const real = fire.triggerPorts.dispatch;
+    fire.triggerPorts.dispatch = (async (_i: any, rollback: () => Promise<void>) => { await rollback(); return { kind: "publish_failed", messageId: "m", error: new Error("x") }; }) as any;
+    try {
+      await makeDue(id, "2026-10-27T00:00:00Z");
+      await sched.tickTriggers(NOW);
+      await makeDue(id, "2026-10-27T00:00:10Z");
+      await sched.tickTriggers(new Date(NOW.getTime() + 5000));
+    } finally { fire.triggerPorts.dispatch = real; }
+    assert.equal(((await q("SELECT paused_reason FROM claw_triggers")).rows[0] as any).paused_reason, "failures");
+  });
+
+  test("only the creator can see or change a trigger, and the cap is enforced", async () => {
+    const id = (await create()).json().data.trigger_id;
+    caller = user("u2");
+    assert.equal((await app.inject({ method: "GET", url: `/v1/triggers/${id}` })).statusCode, 404);
+    assert.equal((await app.inject({ method: "DELETE", url: `/v1/triggers/${id}` })).statusCode, 404);
+    assert.equal((await app.inject({ method: "POST", url: `/v1/triggers/${id}/pause` })).statusCode, 404);
+    assert.equal((await app.inject({ method: "GET", url: "/v1/triggers" })).json().data.length, 0);
+    caller = user("u1");
+    for (let i = 0; i < 3; i++) assert.equal((await create({ name: `n${i}` })).statusCode, 200);
+    assert.equal((await create({ name: "over" })).statusCode, 409);
+  });
+
+  test("a paused trigger does not fire and resumes from a future time", async () => {
+    const id = (await create()).json().data.trigger_id;
+    await app.inject({ method: "POST", url: `/v1/triggers/${id}/pause` });
+    await makeDue(id);
+    await sched.tickTriggers(NOW);
+    assert.equal(dispatched.length, 0);
+    const r = await app.inject({ method: "POST", url: `/v1/triggers/${id}/resume` });
+    assert.equal(r.json().data.paused_reason, null);
+    assert.ok(new Date(r.json().data.next_fire_at) > new Date());
+  });
+});

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import pg from "pg";
-import { APP_RUNS_ENABLED, DATABASE_URL, envInt } from "../config.js";
+import { APP_RUNS_ENABLED, CLAW_TRIGGERS_ENABLED, DATABASE_URL, envInt } from "../config.js";
 import pino from "pino";
 import {
   REQUIRED_SCHEMA,
@@ -1484,6 +1484,46 @@ export async function initDb(): Promise<void> {
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_evolution_jobs_running ON claw_evolution_jobs(started_at) WHERE status = 'running'"
     );
+
+    // --- Scheduled triggers (only when CLAW_TRIGGERS_ENABLED) ---
+    // With the flag off nothing here exists, so a deployment that never turns
+    // triggers on has the same schema it had before.
+    if (CLAW_TRIGGERS_ENABLED) {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS claw_triggers (
+          trigger_id           TEXT PRIMARY KEY,
+          owner_user_id        TEXT NOT NULL,
+          name                 TEXT NOT NULL,
+          kind                 TEXT NOT NULL DEFAULT 'cron',
+          prompt               TEXT NOT NULL,
+          schedule             TEXT NOT NULL,
+          timezone             TEXT NOT NULL,
+          enabled              BOOLEAN NOT NULL DEFAULT TRUE,
+          paused_reason        TEXT,
+          next_fire_at         TIMESTAMPTZ,
+          last_fire_at         TIMESTAMPTZ,
+          consecutive_failures INT NOT NULL DEFAULT 0,
+          credential_enc       TEXT NOT NULL,
+          created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await client.query("CREATE INDEX IF NOT EXISTS idx_triggers_owner ON claw_triggers(owner_user_id)");
+      await client.query("CREATE INDEX IF NOT EXISTS idx_triggers_due ON claw_triggers(next_fire_at) WHERE enabled AND paused_reason IS NULL");
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS claw_trigger_fires (
+          trigger_id  TEXT NOT NULL,
+          fire_key    TEXT NOT NULL,
+          owner_user_id TEXT NOT NULL,
+          session_id  TEXT,
+          status      TEXT NOT NULL,
+          fired_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          detail      TEXT,
+          PRIMARY KEY (trigger_id, fire_key)
+        )
+      `);
+      await client.query("CREATE INDEX IF NOT EXISTS idx_trigger_fires_owner ON claw_trigger_fires(owner_user_id, fired_at)");
+    }
 
     // --- Marketplace (ported from the original Python implementation) ---
     await client.query(`
