@@ -24,6 +24,7 @@ export * from "./sandbox/terminal-hold.js";
 // rules is a defect waiting for the two to drift.
 export {
   BG_VERDICT_TTL_MS,
+  DEFAULT_SANDBOX_IDLE_REUSE_SECONDS,
   SHARED_VERDICT_FIELDS,
   measuredUnderThisIdlePeriod,
   reuseWindowStart,

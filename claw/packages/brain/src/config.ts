@@ -4,6 +4,7 @@
 import "dotenv/config";
 import {
   DEFAULT_BRAIN_REGISTRY_TTL_MS,
+  DEFAULT_SANDBOX_IDLE_REUSE_SECONDS,
   DEFAULT_RUN_LEASE_HEARTBEAT_MS,
   DEFAULT_RUN_LEASE_TTL_MS,
   DEFAULT_TASK_MAX_ACK_PENDING,
@@ -908,7 +909,9 @@ export const BRAIN_LAZY_SANDBOX = envBool("BRAIN_LAZY_SANDBOX", true);
 // workload is Running, Brain waits this long from quiescedAt then CAS-es
 // ready→closing and destroyHands. Operators set SANDBOX_IDLE_REUSE_SECONDS
 // (default 900). Values below 1s are refused and this default is used.
-export const SANDBOX_IDLE_REUSE_MS = envInt("SANDBOX_IDLE_REUSE_SECONDS", 15 * 60, { min: 1 }) * 1000;
+export const SANDBOX_IDLE_REUSE_MS = envInt(
+  "SANDBOX_IDLE_REUSE_SECONDS", DEFAULT_SANDBOX_IDLE_REUSE_SECONDS, { min: 1 },
+) * 1000;
 // The setting used to be named for milliseconds. A deployment still carrying
 // the old name is not reading the default it thinks it is -- the new name is
 // in seconds, so even a copied value would mean something else -- and a
