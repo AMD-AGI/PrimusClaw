@@ -317,3 +317,29 @@ export async function writeTopologyHandoff(
     return { written: false, error: err instanceof Error ? err.message : String(err) };
   }
 }
+
+/**
+ * Inject the caller's LLM/platform key into the sandbox base env.
+ *
+ * The key is exposed as `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` in every mode.
+ * In safe mode it is the caller's per-user SaFE platform key, so it is also
+ * exposed as `SAFE_API_KEY` for tools that authenticate against the platform
+ * API directly. In kubernetes/BYOK mode the key is a bring-your-own LLM key and
+ * is never a platform credential, so `SAFE_API_KEY` is not set there.
+ *
+ * `SAFE_API_KEY` is always cleared first: the base env is seeded from the
+ * sandbox spec's own env, and a spec must not be able to plant a platform
+ * credential (the user/system layers are already blocked by the deny list).
+ * The value is never logged.
+ */
+export function applyPlatformKeyEnv(
+  env: Record<string, string>,
+  apiKey: string | undefined,
+  kubernetesMode: boolean,
+): void {
+  delete env.SAFE_API_KEY;
+  if (!apiKey) return;
+  env.ANTHROPIC_API_KEY = apiKey;
+  env.OPENAI_API_KEY = apiKey;
+  if (!kubernetesMode) env.SAFE_API_KEY = apiKey;
+}
