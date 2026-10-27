@@ -164,7 +164,7 @@ function toSegment(tokens: string[], echoRuns: boolean): Segment | null {
     const t = tokens[i];
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) { i++; continue; }
     const base = t.split("/").pop()!;
-    const w = WRAPPERS[base];
+    const w = Object.hasOwn(WRAPPERS, base) ? WRAPPERS[base] : undefined;
     if (!w && !(echoRuns && ECHO_WRAPPERS.has(base))) break;
     i++;
     if (!w) continue;

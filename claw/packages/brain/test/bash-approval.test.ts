@@ -117,6 +117,11 @@ test("a command nested deeper than the parser follows is held, not run", () => {
   assert.notEqual(p.check(c), null);
 });
 
+test("program names that are Object.prototype keys do not crash the parser", () => {
+  const p = bashApprovalPolicyFrom([{ source: "t", value: POST_RULE }]);
+  for (const c of ["constructor -x curl", "toString -a", "__proto__ x", "hasOwnProperty -n 1 ls"]) assert.equal(p.check(c), null, c);
+});
+
 test("curl -T / --upload-file is a PUT, so a PUT rule holds it", () => {
   const p = bashApprovalPolicyFrom([{ source: "t", value: [
     { label: "put", http: { methods: ["PUT"], url_prefix: "console.example.invalid/api" } },
