@@ -23,7 +23,7 @@ default; with `PLATFORM_DEFAULTS_FILE` unset, chats are built exactly as before.
     "example": {
       "type": "http",
       "url": "https://mcp.example.com/mcp",
-      "headers": { "Authorization": "Bearer <SAFE_API_KEY>" }
+      "token": "<SAFE_API_KEY>"
     }
   }
 }
@@ -32,8 +32,11 @@ default; with `PLATFORM_DEFAULTS_FILE` unset, chats are built exactly as before.
 - `skills` reference **marketplace tool ids** (type `skill`). Array order is the
   order in the prompt. `name` overrides the directory name under `.skills/`; it
   must match `[A-Za-z0-9][A-Za-z0-9._-]*`.
-- `mcp_servers` has the same schema as a request's `mcp_servers`. `<SAFE_API_KEY>`
-  is replaced inside Brain with the calling user's own key.
+- `mcp_servers` has the same schema as a request's `mcp_servers`. A server needs a
+  `token` (or `api_key`); Brain sends it as `Authorization: Bearer <token>`, and
+  extra `headers` are merged on top. `<SAFE_API_KEY>` is replaced inside Brain
+  with the calling user's own key, so `"token": "<SAFE_API_KEY>"` authenticates
+  as the caller. A server without a token is rejected at connect time.
 
 Mount order, lowest priority first: platform defaults, request `mcp_servers`,
 `tool_ids`, plugin. A skill the request already supplies (plugin, local, or

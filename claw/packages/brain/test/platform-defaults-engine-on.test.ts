@@ -17,7 +17,7 @@ import { startWorld, skillZip, fakeHands, baseRequest } from "./support/platform
 const BODY = "SECRET-BODY-LINE-ONLY-IN-FILE";
 const world = await startWorld({
   skills: [{ tool_id: 11 }, { tool_id: 12 }],
-  mcp_servers: { safe: { type: "http", url: "http://127.0.0.1:1/mcp" } },
+  mcp_servers: { safe: { type: "http", url: "http://127.0.0.1:1/mcp", token: "<SAFE_API_KEY>" } },
 });
 process.env.PROGRESSIVE_SKILLS_ENABLED = "true";
 world.setTools([

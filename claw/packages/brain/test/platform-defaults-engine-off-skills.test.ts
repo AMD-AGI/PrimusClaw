@@ -11,7 +11,7 @@ import { startWorld, skillZip, fakeHands, baseRequest } from "./support/platform
 
 const world = await startWorld({
   skills: [{ tool_id: 11 }],
-  mcp_servers: { safe: { type: "http", url: "http://127.0.0.1:1/mcp" } },
+  mcp_servers: { safe: { type: "http", url: "http://127.0.0.1:1/mcp", token: "<SAFE_API_KEY>" } },
 });
 world.setTools([{ id: 11, name: "fleet-ops", zip: skillZip("fleet-ops", "BODY", "Operate the GPU fleet") }]);
 const { AgentEngine } = await import("../src/agent/engine.js");
