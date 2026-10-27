@@ -216,7 +216,7 @@ const OWN_REASONS: ReadonlyMap<string, KillReason> = new Map([
  * `sandbox_pending_timeout` was ranked with the owned deadlines above, and that
  * cancelled out the reason the rest of this work exists. This deployment goes and
  * fetches the pod's account for exactly these rows on purpose:
- * `drainPendingPlatformFacts` names the reason, `idx_tasks_platform_facts_pending_v2`
+ * `drainPendingPlatformFacts` names the reason, `idx_tasks_platform_facts_pending_v3`
  * is indexed for it, and Brain's `capturePlatformFacts` reads the workload before
  * `reapPendingHands` stops it, precisely because a run that dies before its first
  * heartbeat is the family the platform is the only witness to. Ranked above the
@@ -229,6 +229,7 @@ const OWN_REASONS: ReadonlyMap<string, KillReason> = new Map([
 const WEAK_REASONS: ReadonlyMap<string, KillReason> = new Map([
   ["sandbox_pending_timeout", "deadline"],
   ["sandbox_timed_out", "deadline"],
+  ["sandbox_start_timeout", "deadline"],
 ]);
 
 /**

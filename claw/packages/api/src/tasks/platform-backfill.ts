@@ -496,7 +496,7 @@ export async function drainPendingPlatformFacts(): Promise<number> {
             'brain_timeout', 'worker_lost',
             'sandbox_workload_terminal', 'sandbox_pending_timeout', 'sandbox_timed_out',
             'sandbox_exited_before_ready', 'sandbox_gone', 'sandbox_status_unreadable',
-            'sandbox_health_failed', 'sandbox_bootstrap_failed'
+            'sandbox_health_failed', 'sandbox_bootstrap_failed', 'sandbox_start_timeout'
           )
           AND platform_facts_resolved_at IS NULL
           -- A row that names no sandbox and did not come from chat can never

@@ -32,6 +32,12 @@ export interface SandboxCreateParams {
   onProvisioned?: (id: string) => Promise<void>;
   /** Provisioning-phase events (safe-workload poll emits Creating/Running/queue). */
   onEvent?: (evt: Record<string, unknown>) => Promise<void>;
+  /** The run's cancel signal. safe-workload: aborting ends the wait for the
+   *  sandbox to start and stops the workload this call created. */
+  signal?: AbortSignal;
+  /** False when that signal's abort is not a cancel (restart, successor, deadline):
+   *  the workload is then left for the run's own handling. Absent: reclaim. */
+  reclaimOnAbort?: () => boolean;
   /** safe-workload: pre-built SaFE workload resources array (overrides `resources`
    *  when set), preserving the legacy JSON fallback path. */
   resourcesArray?: Array<Record<string, string | number>>;

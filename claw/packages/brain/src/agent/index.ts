@@ -201,6 +201,9 @@ export interface ExecuteExtras {
   attachHands?: () => Promise<HandsClient>;
   /** Optional only because this interface is: TaskRunner always sets it. */
   runIdentity?: RunIdentity;
+  /** Where `decision.<sessionId>` answers arrive; without it a tool that
+   *  requires approval is denied rather than run unasked. */
+  natsConnection?: import("nats").NatsConnection;
 }
 
 export interface Engine {
