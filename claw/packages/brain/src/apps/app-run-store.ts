@@ -42,12 +42,29 @@ export interface AppLastExit {
   finish_done?: string[];
 }
 
+/**
+ * Where event forwarding stopped (hosting design 5.7): the segment file, the
+ * byte offset after the last line handled, and the last forwarded event id.
+ * `{}` before anything was read. Opaque to Claw beyond these three fields.
+ */
+export interface AppEventsCursor {
+  segment?: string;
+  offset?: number;
+  /** Decimal string, as the CloudEvents `id` is. */
+  last_id?: string;
+  /** Producer epoch (see the tailer): bumped when the events' ids start again. Absent means 0. */
+  epoch?: number;
+  /** Segment numbering went back and whether the ids restarted is not decided yet. */
+  reset_pending?: boolean;
+}
+
 export interface AppRunRecord {
   run_id: string;
   session_id: string;
   state: AppRunState;
   restarts: number;
   last_exit: AppLastExit | null;
+  events_cursor: AppEventsCursor;
   state_dir: string | null;
   sandbox_workload_id: string | null;
   manifest: AppManifestV1;
@@ -72,6 +89,7 @@ export interface AppRunPatch {
   state?: AppRunState;
   restarts?: number;
   last_exit?: AppLastExit | null;
+  events_cursor?: AppEventsCursor;
   state_dir?: string;
   sandbox_workload_id?: string | null;
   grant_expires_at?: string;
