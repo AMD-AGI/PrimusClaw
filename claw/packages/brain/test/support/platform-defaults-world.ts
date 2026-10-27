@@ -31,6 +31,8 @@ export interface World {
   listCalls: number;
   setTools(t: Array<{ id: number; name: string; zip?: Buffer; fail?: boolean; type?: string; version?: string | null; hang?: boolean; delayMs?: number }>): void;
   byIdCalls: number[];
+  /** Every request path the marketplace saw, in order. */
+  paths: string[];
   script(turns: Turn[]): void;
   close(): Promise<void>;
 }
@@ -57,31 +59,34 @@ export async function startWorld(defaultsFile?: object): Promise<World> {
   let turns: Turn[] = [];
   let turnN = 0;
   const world: World = {
-    llmBodies: [], downloads: [], listCalls: 0, byIdCalls: [],
+    llmBodies: [], downloads: [], listCalls: 0, byIdCalls: [], paths: [],
     setTools(t) { tools = t; },
     script(t) { turns = t; turnN = 0; },
     close: async () => { await new Promise<void>((r) => server.close(() => r())); },
   };
   const server = http.createServer((req, res) => {
     const url = req.url ?? "";
-    const byId = url.match(/^\/claw-api\/v1\/tools\/(\d+)$/);
+    world.paths.push(url);
+    // The SaFE apiserver does not route the by-id read under /claw-api.
+    if (/^\/claw-api\/v1\/tools\/\d+$/.test(url)) { res.statusCode = 404; res.end("404 page not found"); return; }
+    const byId = url.match(/^\/v1\/tools\/(\d+)$/);
     if (byId) {
       const id = Number(byId[1]);
       world.byIdCalls.push(id);
       const t = tools.find((x) => x.id === id);
       if (t?.hang) return;
       res.setHeader("content-type", "application/json");
-      if (!t) { res.statusCode = 404; res.end(JSON.stringify({ ok: false })); return; }
+      if (!t) { res.statusCode = 404; res.end(JSON.stringify({ ok: false, error: "not_found", message: "tool not found" })); return; }
       res.end(JSON.stringify({ ok: true, data: { id: t.id, name: t.name, type: t.type ?? "skill", ...(t.version === null ? {} : { updated_at: t.version ?? "v1" }) } }));
       return;
     }
-    if (url.startsWith("/claw-api/v1/tools") && !url.includes("/download")) {
+    if (/^(\/claw-api)?\/v1\/tools\?/.test(url)) {
       world.listCalls++;
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify({ data: { tools: tools.map((t) => ({ id: t.id, name: t.name, type: t.type ?? "skill", updated_at: "v1" })) } }));
       return;
     }
-    const dl = url.match(/\/tools\/(\d+)\/download/);
+    const dl = url.match(/^(?:\/claw-api)?\/v1\/tools\/(\d+)\/download/);
     if (dl) {
       const id = Number(dl[1]);
       world.downloads.push(id);
@@ -106,6 +111,7 @@ export async function startWorld(defaultsFile?: object): Promise<World> {
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   process.env.SAFE_API_URL = base;
+  process.env.INTERNAL_BACKEND_URL = base;
   process.env.ANTHROPIC_BASE_URL = base;
   process.env.ANTHROPIC_API_KEY = "test-key";
   process.env.WEB_SEARCH_PROVIDER = "disabled";

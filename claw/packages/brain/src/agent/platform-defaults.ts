@@ -253,7 +253,7 @@ async function stageCached(toolId: number, name: string, version: string, apiKey
   try {
     // Same download + zip-slip-guarded extraction as a tool_ids skill, staged
     // here instead of being uploaded to a sandbox.
-    await withTimeout(downloadSkill(toolId, name, apiKey, undefined, undefined, dir), timeouts.stageMs, "download");
+    await withTimeout(downloadSkill(toolId, name, apiKey, undefined, undefined, dir, platformToolsBase()), timeouts.stageMs, "download");
     if (!locateSkillRoot(dir)) throw new Error("SKILL.md not found after extraction");
   } catch (err) {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -271,27 +271,71 @@ function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
   return Promise.race([p, timeout]).finally(() => clearTimeout(t));
 }
 
-type LookupResult =
-  | { ok: true; tool: Record<string, unknown> }
-  | { ok: false; reason: "not_visible" | "lookup" };
+/**
+ * Why a default tool could not be looked up. The first three say something
+ * about the tool or the caller; `endpoint_unreachable` says the request never
+ * reached the Tools API at all (wrong base URL, a proxy that does not route
+ * it), which an operator fixes in configuration, not in the marketplace.
+ */
+type LookupFailure = "not_found" | "forbidden" | "endpoint_unreachable" | "lookup";
+type LookupResult = { ok: true; tool: Record<string, unknown> } | { ok: false; reason: LookupFailure };
+
+/**
+ * The Tools API base for default skills: the in-cluster API (the same
+ * INTERNAL_BACKEND_URL Brain already uses to reach it for run claims), whose
+ * routes live at `/v1/tools`. The `/claw-api` prefix is only the public
+ * ingress's, and the SaFE apiserver behind SAFE_API_URL does not route it.
+ * Without INTERNAL_BACKEND_URL (single-host setups) the gateway path is kept.
+ * Read at call time.
+ */
+export function platformToolsBase(): string {
+  const b = (process.env.INTERNAL_BACKEND_URL ?? "").trim().replace(/\/$/, "");
+  return b ? `${b}/v1/tools` : TOOLS_API_URL;
+}
+
+/** An error answer from the Claw API itself: `{ ok: false, error: "<code>" }`. */
+async function isClawApiError(resp: Response): Promise<boolean> {
+  try {
+    const body = (await resp.json()) as Record<string, unknown>;
+    return body?.ok === false && typeof body.error === "string";
+  } catch {
+    return false;
+  }
+}
 
 /** One tool, by id, with the caller's own key and a deadline. */
 async function lookupTool(toolId: number, platformKey: string): Promise<LookupResult> {
+  const url = `${platformToolsBase()}/${toolId}`;
   try {
-    const resp = await fetch(`${TOOLS_API_URL}/${toolId}`, {
+    const resp = await fetch(url, {
       headers: { Authorization: `Bearer ${platformKey}` },
       signal: AbortSignal.timeout(timeouts.lookupMs),
     });
-    if (resp.status === 404 || resp.status === 403) return { ok: false, reason: "not_visible" };
+    if (resp.status === 401 || resp.status === 403) return { ok: false, reason: "forbidden" };
+    if (resp.status === 404) {
+      // A 404 is "no such tool" only when the Claw API said so. Anything else
+      // (an HTML or empty 404 from a gateway that does not route this path)
+      // means we never reached the endpoint.
+      if (await isClawApiError(resp)) return { ok: false, reason: "not_found" };
+      logger.error({ toolId, url: url.replace(/\/\d+$/, "/<id>"), status: 404 }, "platform_defaults.endpoint_unreachable");
+      return { ok: false, reason: "endpoint_unreachable" };
+    }
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = (await resp.json()) as { data?: Record<string, unknown> };
-    if (!data.data || typeof data.data !== "object") return { ok: false, reason: "not_visible" };
+    if (!data.data || typeof data.data !== "object") return { ok: false, reason: "endpoint_unreachable" };
     return { ok: true, tool: data.data };
   } catch (err) {
     logger.error({ toolId, err: (err as Error).message }, "platform_defaults.lookup_failed");
     return { ok: false, reason: "lookup" };
   }
 }
+
+const LOOKUP_BRIEF: Record<LookupFailure, string> = {
+  not_found: "not found",
+  forbidden: "not readable by this user",
+  endpoint_unreachable: "lookup endpoint unreachable (check the Tools API base URL)",
+  lookup: "lookup failed",
+};
 
 /**
  * Resolve the default skills for one chat: look each configured tool up by id
@@ -323,7 +367,8 @@ export async function resolveDefaultSkills(
       return null;
     };
     if (!found.ok) {
-      return fail(found.reason === "lookup" ? "failed" : "skipped", found.reason, `Default skill ${entry.toolId} is unavailable (${found.reason === "lookup" ? "lookup failed" : "not found or not readable"})`);
+      const infra = found.reason === "endpoint_unreachable" || found.reason === "lookup";
+      return fail(infra ? "failed" : "skipped", found.reason, `Default skill ${entry.toolId} is unavailable (${LOOKUP_BRIEF[found.reason]})`);
     }
     const tool = found.tool;
     if (tool.type !== "skill") return fail("skipped", "not_skill", `Default tool ${entry.toolId} is not a skill`);
