@@ -45,6 +45,8 @@ export interface AppRunView {
   state: AppRunState;
   restarts: number;
   last_exit: Record<string, unknown> | null;
+  /** Where event forwarding stopped (5.7); `{}` before the first event. */
+  events_cursor: Record<string, unknown>;
   state_dir: string | null;
   sandbox_workload_id: string | null;
   manifest: Record<string, unknown>;
@@ -67,6 +69,7 @@ interface RunRow {
   state: AppRunState;
   restarts: number;
   last_exit: Record<string, unknown> | null;
+  events_cursor: Record<string, unknown> | null;
   state_dir: string | null;
   sandbox_workload_id: string | null;
   manifest: Record<string, unknown>;
@@ -81,7 +84,7 @@ interface RunRow {
 }
 
 const VIEW_SQL = `
-  SELECT r.task_id, r.session_id, r.state, r.restarts, r.last_exit, r.state_dir,
+  SELECT r.task_id, r.session_id, r.state, r.restarts, r.last_exit, r.events_cursor, r.state_dir,
          r.sandbox_workload_id, r.manifest, r.grant_id, r.grant_limits, r.grant_expires_at, r.grant_revoked_at, r.created_at,
          t.input, t.sandbox_spec, t.workspace_id
     FROM claw_app_runs r JOIN claw_tasks t ON t.task_id = r.task_id`;
@@ -93,6 +96,7 @@ function toView(row: RunRow): AppRunView {
     state: row.state,
     restarts: Number(row.restarts),
     last_exit: row.last_exit,
+    events_cursor: row.events_cursor ?? {},
     state_dir: row.state_dir,
     sandbox_workload_id: row.sandbox_workload_id,
     manifest: row.manifest,
@@ -138,6 +142,8 @@ export interface AppRunPatch {
   state?: AppRunState;
   restarts?: number;
   last_exit?: Record<string, unknown> | null;
+  /** Event forwarding's cursor (5.7): replaced as a whole. */
+  events_cursor?: Record<string, unknown>;
   state_dir?: string;
   sandbox_workload_id?: string | null;
   /**
@@ -211,6 +217,7 @@ export async function patchAppRun(
   };
   if (patch.state !== undefined) add("state", patch.state);
   if (patch.restarts !== undefined) add("restarts", patch.restarts);
+  if (patch.events_cursor !== undefined) add("events_cursor", JSON.stringify(patch.events_cursor), "::jsonb");
   if (patch.state_dir !== undefined) add("state_dir", patch.state_dir);
   if (patch.sandbox_workload_id !== undefined) add("sandbox_workload_id", patch.sandbox_workload_id);
   let grantExpiryParam = "NULL";
@@ -253,7 +260,7 @@ export async function patchAppRun(
               r.grant_id IS NOT NULL AND r.grant_revoked_at IS NULL
               AND r.grant_expires_at IS NOT NULL AND r.grant_expires_at < ${grantExpiryParam}))
         AND (${patch.grant_revoked === true ? "r.grant_id IS NOT NULL" : "TRUE"})
-      RETURNING r.task_id, r.session_id, r.state, r.restarts, r.last_exit, r.state_dir,
+      RETURNING r.task_id, r.session_id, r.state, r.restarts, r.last_exit, r.events_cursor, r.state_dir,
                 r.sandbox_workload_id, r.manifest, r.grant_id, r.grant_limits, r.grant_expires_at, r.grant_revoked_at, r.created_at,
                 t.input, t.sandbox_spec, t.workspace_id`,
     params,
