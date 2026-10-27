@@ -55,7 +55,7 @@ function hostileZip(names: string[]): Buffer {
   return Buffer.from(bytes, "latin1");
 }
 
-/** Stand in for the SaFE Tools API: one skill, whose download is `body`. */
+/** Stand in for the Tools API (by-id read + download): one skill, whose download is `body`. */
 function stubToolsApi(body: Buffer): () => void {
   const real = globalThis.fetch;
   globalThis.fetch = (async (input: string | URL | Request) => {
@@ -67,7 +67,7 @@ function stubToolsApi(body: Buffer): () => void {
       });
     }
     return new Response(
-      JSON.stringify({ data: { tools: [{ id: TOOL_ID, name: "hostile-skill", type: "skill" }] } }),
+      JSON.stringify({ data: { id: TOOL_ID, name: "hostile-skill", type: "skill" } }),
       { status: 200, headers: { "content-type": "application/json" } },
     );
   }) as typeof globalThis.fetch;
