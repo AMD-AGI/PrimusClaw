@@ -51,7 +51,7 @@ export class CompletionLockLost extends Error {
   }
 }
 
-async function isSandboxOnlyRun(sessionId: string, messageId: string): Promise<boolean> {
+export async function isSandboxOnlyRun(sessionId: string, messageId: string): Promise<boolean> {
   const r = await db.query(
     `SELECT 1 FROM claw_tasks
       WHERE session_id = $1 AND metadata->>'message_id' = $2
