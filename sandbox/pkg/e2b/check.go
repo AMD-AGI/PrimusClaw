@@ -26,6 +26,12 @@ const metadataPrefix = "agent-sandbox.io/"
 // idempotencyMetadataKey is the caller key that replays one create.
 const idempotencyMetadataKey = metadataPrefix + "idempotency-key"
 
+// signingPublicKeyMetadata is the Ed25519 public key of this sandbox, PKIX PEM.
+const signingPublicKeyMetadata = metadataPrefix + "signing-public-key"
+
+// nodeNameMetadata is the node the sandbox pod was scheduled onto.
+const nodeNameMetadata = metadataPrefix + "node-name"
+
 // callerMetadataKeys may be set by the SDK under agent-sandbox.io/.
 var callerMetadataKeys = map[string]struct{}{
 	"idempotency-key": {},

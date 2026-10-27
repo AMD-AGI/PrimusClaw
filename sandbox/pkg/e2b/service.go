@@ -5,10 +5,13 @@ package e2b
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"net/http"
 	"regexp"
@@ -165,6 +168,15 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 	if err != nil {
 		return SandboxResponse{}, 0, grant.Op(http.StatusInternalServerError, "sandbox_create_failed", "token")
 	}
+	publicKey, privateKey, err := newSigningIdentity()
+	if err != nil {
+		return SandboxResponse{}, 0, grant.Op(http.StatusInternalServerError, "sandbox_create_failed", "signing key")
+	}
+	metadata := make(map[string]string, len(body.Metadata)+1)
+	for key, value := range body.Metadata {
+		metadata[key] = value
+	}
+	metadata[signingPublicKeyMetadata] = publicKey
 	ref, err := s.grants.BeginSandbox(ctx, grant.BeginRequest{
 		GrantID:           grantID,
 		Role:              role,
@@ -175,9 +187,9 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		GPUs:              tpl.GPUs,
 		TimeoutSec:        timeoutSec,
 		PendingTimeoutSec: int64(tpl.Pending / time.Second),
-		IdempotencyKey:    body.Metadata[idempotencyMetadataKey],
+		IdempotencyKey:    metadata[idempotencyMetadataKey],
 		AccessTokenHash:   hash,
-		Metadata:          body.Metadata,
+		Metadata:          metadata,
 		Sealed:            tpl.Sealed,
 		Inputs:            tpl.Inputs,
 		Outputs:           tpl.Outputs,
@@ -202,18 +214,19 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 	runCtx, cancel := context.WithTimeout(ctx, tpl.Pending)
 	defer cancel()
 	result, runErr := s.runner.Create(runCtx, CreateRequest{
-		SandboxID:   sandboxID,
-		TemplateID:  tpl.ID,
-		Namespace:   s.namespace,
-		Timeout:     time.Duration(timeoutSec) * time.Second,
-		UserID:      snap.UserID,
-		UserName:    snap.UserName,
-		Role:        role,
-		SessionID:   snap.SessionID,
-		Workspace:   workspace,
-		GrantID:     snap.GrantID,
-		Attestation: snap.Attestation,
-		Env:         body.EnvVars,
+		SandboxID:     sandboxID,
+		TemplateID:    tpl.ID,
+		Namespace:     s.namespace,
+		Timeout:       time.Duration(timeoutSec) * time.Second,
+		UserID:        snap.UserID,
+		UserName:      snap.UserName,
+		Role:          role,
+		SessionID:     snap.SessionID,
+		Workspace:     workspace,
+		GrantID:       snap.GrantID,
+		Attestation:   snap.Attestation,
+		Env:           body.EnvVars,
+		SigningKeyPEM: privateKey,
 	})
 	if runErr != nil {
 		_ = s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, sandboxID, "create_failed")
@@ -222,11 +235,15 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		}
 		return SandboxResponse{}, 0, grant.Op(http.StatusInternalServerError, "sandbox_create_failed", runErr.Error())
 	}
-	if err := s.grants.MarkRunning(ctx, grantID, sandboxID, grant.RunningUpdate{
+	running := grant.RunningUpdate{
 		SandboxName: result.SandboxName,
 		Namespace:   result.Namespace,
 		NodeName:    result.NodeName,
-	}); err != nil {
+	}
+	if result.NodeName != "" {
+		running.Metadata = map[string]string{nodeNameMetadata: result.NodeName}
+	}
+	if err := s.grants.MarkRunning(ctx, grantID, sandboxID, running); err != nil {
 		_ = s.runner.Delete(context.WithoutCancel(ctx), sandboxID)
 		_ = s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, sandboxID, "create_failed")
 		return SandboxResponse{}, 0, err
@@ -517,6 +534,26 @@ func denied(err error) bool {
 		return false
 	}
 	return oe.Status == http.StatusForbidden || oe.Status == http.StatusTooManyRequests
+}
+
+// newSigningIdentity returns a new Ed25519 key pair as PEM.
+// The public key is PKIX. The private key is PKCS#8.
+func newSigningIdentity() (publicPEM, privatePEM string, err error) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return "", "", err
+	}
+	publicDER, err := x509.MarshalPKIXPublicKey(public)
+	if err != nil {
+		return "", "", err
+	}
+	privateDER, err := x509.MarshalPKCS8PrivateKey(private)
+	if err != nil {
+		return "", "", err
+	}
+	publicPEM = string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: publicDER}))
+	privatePEM = string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateDER}))
+	return publicPEM, privatePEM, nil
 }
 
 func newSandboxID() (string, error) {

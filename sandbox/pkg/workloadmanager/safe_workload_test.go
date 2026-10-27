@@ -28,17 +28,18 @@ func TestWorkloadObjectUsesTemplateResources(t *testing.T) {
 	ci := testCodeInterpreter()
 	const sandboxID = "sbx-7a9b9b693452f613877992145c818d29"
 	obj, err := workloadObject(sandboxID, e2b.CreateRequest{
-		SandboxID:   sandboxID,
-		TemplateID:  "ar-run-dev-g2",
-		Role:        "dev",
-		SessionID:   "s-8f2a",
-		Workspace:   "top-models",
-		UserID:      "u-123",
-		UserName:    "alice",
-		GrantID:     "gr-01jb7m9k2x",
-		Attestation: "eyJ.test",
-		Timeout:     60 * time.Second,
-		Env:         map[string]string{"FOO": "1", platformInferenceKey: "secret"},
+		SandboxID:     sandboxID,
+		TemplateID:    "ar-run-dev-g2",
+		Role:          "dev",
+		SessionID:     "s-8f2a",
+		Workspace:     "top-models",
+		UserID:        "u-123",
+		UserName:      "alice",
+		GrantID:       "gr-01jb7m9k2x",
+		Attestation:   "eyJ.test",
+		SigningKeyPEM: "test-private-key",
+		Timeout:       60 * time.Second,
+		Env:           map[string]string{"FOO": "1", platformInferenceKey: "secret"},
 	}, ci)
 	if err != nil {
 		t.Fatal(err)
@@ -71,7 +72,7 @@ func TestWorkloadObjectUsesTemplateResources(t *testing.T) {
 		t.Fatalf("resources=%v", res)
 	}
 	env, _, _ := unstructured.NestedMap(obj.Object, "spec", "env")
-	if env["FOO"] != "1" || env["HYPERLOOM_ACTIVE_IMAGE_DIGEST"] != "sha256:aa" {
+	if env["FOO"] != "1" || env["HYPERLOOM_ACTIVE_IMAGE_DIGEST"] != "sha256:aa" || env["E2B_SANDBOX_ID"] != sandboxID || env["HYPERLOOM_SIGNING_KEY_FILE"] != "/app/signing-key.pem" || env["HYPERLOOM_SIGNING_KEY_PEM"] != "test-private-key" || env["ROCR_VISIBLE_DEVICES"] != "0,1" {
 		t.Fatalf("env=%v", env)
 	}
 	if _, ok := env[platformInferenceKey]; ok {
@@ -309,6 +310,12 @@ func TestWorkloadObjectCarriesStepsAndHostPaths(t *testing.T) {
 	paths, _, _ := unstructured.NestedStringSlice(obj.Object, "spec", "hostpath")
 	if len(paths) != 1 || paths[0] != "/data/runner-cache" {
 		t.Fatalf("hostpath=%v", paths)
+	}
+}
+
+func TestROCRVisibleDevices(t *testing.T) {
+	if rocrVisibleDevices(0) != "" || rocrVisibleDevices(1) != "0" || rocrVisibleDevices(2) != "0,1" {
+		t.Fatalf("0=%q 1=%q 2=%q", rocrVisibleDevices(0), rocrVisibleDevices(1), rocrVisibleDevices(2))
 	}
 }
 

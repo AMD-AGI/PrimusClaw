@@ -64,6 +64,8 @@ type RunningUpdate struct {
 	SandboxName string
 	Namespace   string
 	NodeName    string
+	// Metadata is merged into the sandbox record. Empty values are skipped.
+	Metadata map[string]string
 }
 
 // Snapshot returns the grant fields needed to authorize a create.
@@ -128,6 +130,15 @@ func (s *Service) MarkRunning(ctx context.Context, grantID, sandboxID string, up
 		}
 		if up.NodeName != "" {
 			ref.NodeName = up.NodeName
+		}
+		for key, value := range up.Metadata {
+			if key == "" || value == "" {
+				continue
+			}
+			if ref.Metadata == nil {
+				ref.Metadata = map[string]string{}
+			}
+			ref.Metadata[key] = value
 		}
 		g.Status.Sandboxes[idx] = ref
 		return nil

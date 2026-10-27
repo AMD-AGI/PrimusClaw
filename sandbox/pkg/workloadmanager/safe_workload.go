@@ -414,6 +414,9 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 	}
 	env := sandboxEnv(ci.Spec.Template.Environment, req.Env)
 	applyTemplateRuntime(ci.Spec.Template, env)
+	for key, value := range platformSandboxEnv(req, gpuCount(ci)) {
+		env[key] = value
+	}
 	if len(env) > 0 {
 		spec["env"] = env
 	}
@@ -480,6 +483,43 @@ func quantityString(list corev1.ResourceList, name corev1.ResourceName) string {
 		return ""
 	}
 	return q.String()
+}
+
+// gpuCount is the number of GPUs the template requests.
+func gpuCount(ci *runtimev1alpha1.CodeInterpreter) int {
+	if ci == nil || ci.Spec.GPU == nil || ci.Spec.GPU.Count < 1 {
+		return 0
+	}
+	return ci.Spec.GPU.Count
+}
+
+// rocrVisibleDevices lists GPU indexes from zero. One GPU is "0".
+func rocrVisibleDevices(count int) string {
+	if count < 1 {
+		return ""
+	}
+	parts := make([]string, count)
+	for i := range parts {
+		parts[i] = strconv.Itoa(i)
+	}
+	return strings.Join(parts, ",")
+}
+
+// platformSandboxEnv sets the sandbox id, the signing key, and visible GPUs.
+// These win over template and caller env.
+func platformSandboxEnv(req e2b.CreateRequest, gpus int) map[string]string {
+	env := map[string]string{}
+	if req.SandboxID != "" {
+		env["E2B_SANDBOX_ID"] = req.SandboxID
+	}
+	if req.SigningKeyPEM != "" {
+		env["HYPERLOOM_SIGNING_KEY_PEM"] = req.SigningKeyPEM
+		env["HYPERLOOM_SIGNING_KEY_FILE"] = "/app/signing-key.pem"
+	}
+	if devices := rocrVisibleDevices(gpus); devices != "" {
+		env["ROCR_VISIBLE_DEVICES"] = devices
+	}
+	return env
 }
 
 func sandboxEnv(template []corev1.EnvVar, extra map[string]string) map[string]any {

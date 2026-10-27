@@ -53,7 +53,7 @@ func (f *fakeRunner) Create(ctx context.Context, req CreateRequest) (CreateResul
 	if f.fail != nil {
 		return CreateResult{}, f.fail
 	}
-	return CreateResult{SandboxName: "pod-" + req.SandboxID, Namespace: req.Namespace, PodIP: "10.0.0.8", PodPort: 8080}, nil
+	return CreateResult{SandboxName: "pod-" + req.SandboxID, Namespace: req.Namespace, PodIP: "10.0.0.8", PodPort: 8080, NodeName: "node-a"}, nil
 }
 
 func (f *fakeRunner) Delete(_ context.Context, sandboxID string) error {
@@ -219,6 +219,7 @@ func TestCreateReplayKillAndQuota(t *testing.T) {
 	if err != nil || ref.PendingTimeoutSec != int64(defaultPendingWait/time.Second) {
 		t.Fatalf("ref=%+v err=%v", ref, err)
 	}
+	firstPublicKey := ref.Metadata["agent-sandbox.io/signing-public-key"]
 	second, status, err := svc.Create(context.Background(), key, CreateBody{
 		TemplateID: "runner", Metadata: map[string]string{"agent-sandbox.io/idempotency-key": "once"},
 	})
@@ -243,6 +244,12 @@ func TestCreateReplayKillAndQuota(t *testing.T) {
 	}
 	if listed.Sandboxes[0].StartedAt == "" || listed.Sandboxes[0].EndAt == "" || listed.Sandboxes[0].CPUCount < 1 || listed.Sandboxes[0].MemoryMB < 128 || listed.Sandboxes[0].Metadata["agent-sandbox.io/team"] != "a" {
 		t.Fatalf("listed=%+v", listed.Sandboxes[0])
+	}
+	if listed.Sandboxes[0].Metadata["agent-sandbox.io/signing-public-key"] != firstPublicKey || !strings.Contains(firstPublicKey, "BEGIN PUBLIC KEY") || listed.Sandboxes[0].Metadata["agent-sandbox.io/node-name"] != "node-a" {
+		t.Fatalf("metadata=%v", listed.Sandboxes[0].Metadata)
+	}
+	if !strings.Contains(created.SigningKeyPEM, "BEGIN PRIVATE KEY") || strings.Contains(created.SigningKeyPEM, "BEGIN PUBLIC KEY") {
+		t.Fatal("signing private key was not passed to the workload")
 	}
 	_, _, err = svc.Create(context.Background(), key, CreateBody{
 		TemplateID: "runner", Metadata: map[string]string{"agent-sandbox.io/idempotency-key": "other"},
@@ -319,6 +326,10 @@ func TestCreateRefusesMetadataEnvAndTimeout(t *testing.T) {
 	_, _, err = svc.Create(context.Background(), key, CreateBody{TemplateID: "runner", Metadata: map[string]string{"agent-sandbox.io/node-name": "n1"}})
 	if !grant.IsReason(err, "metadata_reserved") {
 		t.Fatalf("prefixed node-name err=%v", err)
+	}
+	_, _, err = svc.Create(context.Background(), key, CreateBody{TemplateID: "runner", Metadata: map[string]string{"agent-sandbox.io/signing-public-key": "pem"}})
+	if !grant.IsReason(err, "metadata_reserved") {
+		t.Fatalf("signing public key err=%v", err)
 	}
 	_, _, err = svc.Create(context.Background(), key, CreateBody{TemplateID: "runner", Metadata: map[string]string{"idempotency-key": "once"}})
 	if !grant.IsReason(err, "metadata_not_allowed") {
