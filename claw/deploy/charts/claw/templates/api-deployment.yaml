@@ -79,6 +79,9 @@ spec:
       - name: extra-ca
         configMap:
           name: {{ .Values.tls.extraCACertsConfigMap | quote }}
+          items:
+          - key: {{ required "tls.extraCACertsKey must be set when tls.extraCACertsConfigMap is set" .Values.tls.extraCACertsKey | quote }}
+            path: ca.crt
       {{- end }}
       containers:
       - name: api
@@ -155,7 +158,7 @@ spec:
         {{- end }}
         {{- if .Values.tls.extraCACertsConfigMap }}
         - name: NODE_EXTRA_CA_CERTS
-          value: /etc/claw-ca/{{ .Values.tls.extraCACertsKey }}
+          value: /etc/claw-ca/ca.crt
         {{- end }}
         # The startup budget has to cover a schema migration, because initDb runs
         # before the server listens: nothing answers /health while a migration is

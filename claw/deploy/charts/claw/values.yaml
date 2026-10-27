@@ -28,6 +28,10 @@ tls:
   # in the ConfigMap every anchor the image would otherwise have supplied.
   # Node reads the file once at start-up: after changing the ConfigMap's
   # contents, restart api and brain (kubectl rollout restart) to pick it up.
+  # upgrade.sh renders from values.<ns>.env, not from this file: set
+  # EXTRA_CA_CERTS_CONFIGMAP / EXTRA_CA_CERTS_KEY there (see values.example.env).
+  # The key is projected to /etc/claw-ca/ca.crt, so a key missing from the
+  # ConfigMap fails the pod mount instead of being silently ignored.
   extraCACertsConfigMap: ""
   extraCACertsKey: ca.crt
 api:
