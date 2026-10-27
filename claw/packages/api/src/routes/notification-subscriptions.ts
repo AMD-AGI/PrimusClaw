@@ -122,6 +122,7 @@ export async function registerNotificationSubscriptionRoutes(app: FastifyInstanc
               sources = COALESCE($4::text[], sources),
               enabled = COALESCE($5::boolean, enabled),
               consecutive_failures = CASE WHEN $5::boolean IS TRUE THEN 0 ELSE consecutive_failures END,
+              failing_since = CASE WHEN $5::boolean IS TRUE THEN NULL ELSE failing_since END,
               updated_at = NOW()
         WHERE subscription_id = $1 AND owner_user_id = $2
         RETURNING *`,

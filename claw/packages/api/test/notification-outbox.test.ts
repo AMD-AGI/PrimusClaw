@@ -199,43 +199,66 @@ describe("notification outbox", { skip }, () => {
       assert.deepEqual(await deliver(), { delivered: 0, failed: 0 });
     });
 
-    test("a subscription that keeps failing is disabled at the limit; a success before that resets the streak", async () => {
+    test("a receiver down for 30 minutes loses nothing: the subscription stays enabled and everything queued is delivered on recovery", async () => {
       const sub = await subscribe();
-      const subRow = async () => (await q("SELECT enabled, consecutive_failures FROM claw_notification_subscriptions WHERE subscription_id = $1", [sub.id])).rows[0] as any;
-      const addRows = async (n: number, tag: string) => {
-        for (let i = 0; i < n; i++) {
-          await q("INSERT INTO claw_notification_outbox (event_id, subscription_id, payload) VALUES ($1, $2, '{}'::jsonb)", [`${tag}-${i}`, sub.id]);
-        }
-      };
-      // Five failures, then one success: the streak is back to zero.
-      await addRows(5, "a");
-      status = 500;
+      const subRow = async () => (await q("SELECT enabled, consecutive_failures, failing_since FROM claw_notification_subscriptions WHERE subscription_id = $1", [sub.id])).rows[0] as any;
+      for (let i = 0; i < 30; i++) {
+        await q("INSERT INTO claw_notification_outbox (event_id, subscription_id, payload) VALUES ($1, $2, '{}'::jsonb)", [`ev-${i}`, sub.id]);
+      }
+      status = 503;
+      // Far more failed attempts than the old attempt-count limit, over simulated half an hour.
+      for (let pass = 0; pass < 6; pass++) { await deliver(); await makeDue(); }
+      await q("UPDATE claw_notification_subscriptions SET failing_since = NOW() - interval '30 minutes'");
       await deliver();
-      assert.equal((await subRow()).consecutive_failures, 5);
-      await q("DELETE FROM claw_notification_outbox");
-      await addRows(1, "b");
+      const mid = await subRow();
+      assert.equal(mid.enabled, true, "still enabled");
+      assert.ok(mid.consecutive_failures > 20, `attempts well past the old limit: ${mid.consecutive_failures}`);
       status = 200;
-      await deliver();
-      assert.deepEqual(await subRow(), { enabled: true, consecutive_failures: 0 });
-      // The limit minus one failure leaves it enabled; the next one disables it.
-      await q("DELETE FROM claw_notification_outbox");
-      await addRows(outbox.SUBSCRIPTION_FAILURE_LIMIT - 1, "c");
+      await makeDue();
+      for (let pass = 0; pass < 4; pass++) { await deliver(); await makeDue(); }
+      assert.equal(((await q("SELECT COUNT(*)::int AS n FROM claw_notification_outbox WHERE delivered_at IS NOT NULL")).rows[0] as any).n, 30, "every queued event arrived");
+      const after = await subRow();
+      assert.equal(after.consecutive_failures, 0);
+      assert.equal(after.failing_since, null, "recovery clears the outage clock");
+    });
+
+    test("a subscription with no success for more than a day is disabled, and its pending rows are then dropped", async () => {
+      const sub = await subscribe();
+      await q("INSERT INTO claw_notification_outbox (event_id, subscription_id, payload) VALUES ('ev-x', $1, '{}'::jsonb)", [sub.id]);
       status = 500;
-      // Ten rows are claimed per pass and a failed one waits out its backoff, so two passes make nineteen attempts.
       await deliver();
+      assert.equal(((await q("SELECT enabled FROM claw_notification_subscriptions")).rows[0] as any).enabled, true, "first failure only starts the clock");
+      await q("UPDATE claw_notification_subscriptions SET failing_since = NOW() - interval '25 hours'");
+      await makeDue();
       await deliver();
-      assert.deepEqual(await subRow(), { enabled: true, consecutive_failures: outbox.SUBSCRIPTION_FAILURE_LIMIT - 1 });
-      await q("DELETE FROM claw_notification_outbox");
-      await addRows(1, "d");
-      await deliver();
-      assert.equal((await subRow()).enabled, false, "disabled at the failure limit");
-      // A disabled subscription is dropped, not sent to.
-      await q("DELETE FROM claw_notification_outbox");
-      await addRows(1, "e");
+      assert.equal(((await q("SELECT enabled FROM claw_notification_subscriptions")).rows[0] as any).enabled, false);
+      await makeDue();
       sent.length = 0;
       await deliver();
       assert.equal(sent.length, 0);
-      assert.equal(((await rows())[0]).last_status, "subscription_gone");
+    });
+
+    test("one slow receiver does not hold up another subscription's delivery", async () => {
+      const slow = await subscribe("u1", "https://slow.example.com/x");
+      const fast = await subscribe("u2", "https://fast.example.com/x");
+      for (const [sid, tid, owner] of [["s-slow", "t-slow", "u1"], ["s-fast", "t-fast", "u2"]]) {
+        await seedRun({ sid, tid, owner, trigger: "trg" });
+        await outbox.recordRunFinished({ sessionId: sid, taskIds: [tid], outcome: "completed" });
+      }
+      const finished: string[] = [];
+      const t0 = Date.now();
+      const times: Record<string, number> = {};
+      const slowTransport: Transport = async (req) => {
+        const host = req.target.url.hostname;
+        if (host === "slow.example.com") await new Promise((r) => setTimeout(r, 1500));
+        finished.push(host);
+        times[host] = Date.now() - t0;
+        return 200;
+      };
+      await outbox.deliverDue({ transport: slowTransport, resolve: pub, allowedHosts: new Set() });
+      assert.deepEqual(finished, ["fast.example.com", "slow.example.com"], "the fast receiver is not queued behind the slow one");
+      assert.ok(times["fast.example.com"] < 1000, `fast delivered after ${times["fast.example.com"]}ms`);
+      void slow; void fast;
     });
 
     test("a subscription pointing at a private address is refused at delivery, not connected to", async () => {

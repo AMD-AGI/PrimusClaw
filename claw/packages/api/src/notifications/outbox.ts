@@ -31,9 +31,15 @@ const logger = pino({ name: "notification-outbox" });
 export const RETRY_BACKOFF_SECONDS = [1, 5, 30, 300];
 /** A row that has not been delivered this long after it was created is dropped. */
 export const GIVE_UP_AFTER_HOURS = 24;
-/** Consecutive failed deliveries after which a subscription stops being tried. */
-export const SUBSCRIPTION_FAILURE_LIMIT = 20;
-const CLAIM_LEASE_SECONDS = 60;
+/**
+ * A subscription that has not had a single delivery succeed for this long is
+ * disabled. Measured in time rather than attempts: attempts pile up quickly
+ * across queued events, and the retry window is what promises a receiver that is
+ * down for a few hours loses nothing.
+ */
+export const SUBSCRIPTION_DISABLE_AFTER_HOURS = GIVE_UP_AFTER_HOURS;
+/** Longer than the slowest group of sequential sends in one claimed batch. */
+const CLAIM_LEASE_SECONDS = 120;
 const CLAIM_BATCH = 10;
 const SUMMARY_MAX = 500;
 
@@ -181,11 +187,12 @@ async function recordFailure(row: Claimed, status: string): Promise<void> {
   const sub = (await db.query(
     `UPDATE claw_notification_subscriptions
         SET consecutive_failures = consecutive_failures + 1,
-            enabled = enabled AND consecutive_failures + 1 < $2,
+            failing_since = COALESCE(failing_since, NOW()),
+            enabled = enabled AND COALESCE(failing_since, NOW()) > NOW() - make_interval(hours => $2),
             updated_at = NOW()
       WHERE subscription_id = $1
       RETURNING enabled`,
-    [row.subscription_id, SUBSCRIPTION_FAILURE_LIMIT],
+    [row.subscription_id, SUBSCRIPTION_DISABLE_AFTER_HOURS],
   )).rows[0];
   if (sub && !sub.enabled) {
     logger.warn({ subscriptionId: row.subscription_id }, "notification.subscription_disabled_after_failures");
@@ -199,7 +206,7 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
   const nowSeconds = deps.now ?? (() => Math.floor(Date.now() / 1000));
   let delivered = 0;
   let failed = 0;
-  for (const row of await claimDue()) {
+  const sendOne = async (row: Claimed): Promise<void> => {
     const sub = (await db.query(
       `SELECT url, secret_enc, enabled FROM claw_notification_subscriptions WHERE subscription_id = $1`,
       [row.subscription_id],
@@ -209,7 +216,7 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
         `UPDATE claw_notification_outbox SET dropped_at = NOW(), last_status = 'subscription_gone' WHERE id = $1`,
         [row.id],
       );
-      continue;
+      return;
     }
     let status = "";
     try {
@@ -234,11 +241,11 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
             [row.id, String(code)],
           );
           await db.query(
-            `UPDATE claw_notification_subscriptions SET consecutive_failures = 0 WHERE subscription_id = $1 AND consecutive_failures <> 0`,
+            `UPDATE claw_notification_subscriptions SET consecutive_failures = 0, failing_since = NULL WHERE subscription_id = $1 AND (consecutive_failures <> 0 OR failing_since IS NOT NULL)`,
             [row.subscription_id],
           );
           delivered += 1;
-          continue;
+          return;
         }
         status = `http_${code}`;
       }
@@ -247,7 +254,18 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
     }
     failed += 1;
     await recordFailure(row, status);
+  };
+  // One receiver's slowness must not hold up the others: each subscription's rows
+  // are sent in order, and the subscriptions run side by side.
+  const bySub = new Map<string, Claimed[]>();
+  for (const row of await claimDue()) {
+    const list = bySub.get(row.subscription_id) ?? [];
+    list.push(row);
+    bySub.set(row.subscription_id, list);
   }
+  await Promise.all([...bySub.values()].map(async (rows) => {
+    for (const row of rows) await sendOne(row);
+  }));
   return { delivered, failed };
 }
 

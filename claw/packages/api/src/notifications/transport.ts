@@ -9,6 +9,8 @@ import http from "node:http";
 import https from "node:https";
 import type { GuardResult } from "./url-guard.js";
 
+/** The whole exchange, connect to status line, not an idle gap: a receiver that
+ *  trickles a byte at a time must not be able to hold a delivery open. */
 export const DELIVERY_TIMEOUT_MS = 5000;
 
 export interface OutboundRequest {
@@ -39,13 +41,14 @@ export const httpTransport: Transport = ({ target, headers, body, timeoutMs }) =
         "content-type": "application/json",
         "content-length": String(Buffer.byteLength(body)),
       },
-      timeout: timeoutMs ?? DELIVERY_TIMEOUT_MS,
     }, (res) => {
-      // Only the status matters; drop the body unread.
-      res.resume();
-      resolve(res.statusCode ?? 0);
+      // Only the status matters; drop the body unread, and the connection with it.
+      clearTimeout(deadline);
+      const code = res.statusCode ?? 0;
+      res.destroy();
+      resolve(code);
     });
-    req.on("timeout", () => req.destroy(new Error("timeout")));
-    req.on("error", reject);
+    const deadline = setTimeout(() => req.destroy(new Error("deadline")), timeoutMs ?? DELIVERY_TIMEOUT_MS);
+    req.on("error", (err) => { clearTimeout(deadline); reject(err); });
     req.end(body);
   });
