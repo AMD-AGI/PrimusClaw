@@ -38,7 +38,7 @@ process.env.S3_BUCKET = "claw";
 
 const { syncWorkspaceToS3, syncLeftSnapshot } = await import("../src/workspace/s3-uploader.js");
 const {
-  invalidateSyncManifest, parseDigestListing, parseStatListing, planUploadDelta, SYNC_STATE_DIR,
+  finishedOutput, invalidateSyncManifest, parseDigestListing, parseStatListing, planUploadDelta, SYNC_STATE_DIR,
 } = await import("../src/workspace/sync-delta.js");
 const { findExcludeArgs, s3Excludes } = await import("../src/workspace/excludes.js");
 import type { HandsClient } from "../src/clients/hands.js";
@@ -57,6 +57,14 @@ class Sandbox {
   failPaths = new Set<string>();
   /** When set, `stat` is unusable in this sandbox. */
   noStat = false;
+  /** Every `write` call's path. */
+  writes: string[] = [];
+  /** Shell text run in front of every bash command, to make one of its programs misbehave. */
+  prelude = "";
+  /** Answers a bash call before the shell sees it, as Hands answers one that never finished. */
+  reply: ((command: string) => string | undefined) | undefined;
+  /** When set, `write` refuses, the way Hands' does: as text, not by throwing. */
+  writeRefused = false;
   uploadDelayMs = 0;
   inFlight = 0;
   maxInFlight = 0;
@@ -95,16 +103,29 @@ class Sandbox {
     return out.replaceAll(this.state, SYNC_STATE_DIR).replaceAll(this.root, "/workspace");
   }
 
+  /** What the shell prints for a command, and how it exited: the real thing, no Hands around it. */
+  run(command: string, prelude = ""): { stdout: string; stderr: string; status: number | null } {
+    const r = spawnSync("bash", ["-c", prelude + this.local(command)], { encoding: "utf-8" });
+    return { stdout: this.remote(r.stdout ?? ""), stderr: this.remote(r.stderr ?? ""), status: r.status };
+  }
+
   readonly client = {
     callTool: async (tool: string, args: Record<string, unknown>): Promise<string> => {
       if (tool === "bash") {
         const command = String(args.command);
         this.commands.push(command);
+        const early = this.reply?.(command);
+        if (early !== undefined) return early;
         if (this.noStat && command.includes("stat -c")) return "";
-        const r = spawnSync("bash", ["-c", this.local(command)], { encoding: "utf-8" });
-        return this.remote(r.stdout ?? "");
+        const r = this.run(command, this.prelude);
+        if (r.status === 0) return r.stdout;
+        // What Hands answers for a command that exited non-zero -- and all that
+        // `callTool` passes on: the `isError` it is sent with is dropped on the way.
+        return `exit ${r.status}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`;
       }
       if (tool === "write") {
+        this.writes.push(String(args.path));
+        if (this.writeRefused) return `Error writing ${args.path}: EACCES: permission denied`;
         const p = this.local(String(args.path));
         mkdirSync(dirname(p), { recursive: true });
         writeFileSync(p, String(args.contents));
@@ -355,6 +376,218 @@ test("D12 the record is dropped before the first upload, so a crash mid-sync lea
   assert.equal(manifestsWhenUploading, 0, "the old record was gone by the time the first byte went up");
   assert.ok(sb.manifestFiles().length > 0, "and a record is written back once everything is up");
 });
+
+// ===== a command that did not work is not one that did =====
+//
+// `callTool` returns the text of Hands' answer and drops `isError`, and Hands
+// reports a failed command as text -- `exit N\nstdout: ...\nstderr: ...`, `timeout
+// after Ns ...`, `Error: ...` -- rather than throwing. The sandbox stand-in above
+// answers the same way, and the cases below break one program or one answer at a
+// time and read what the sync then does about it.
+
+const PREFIX = "users/user-1/sessions/sess-1/";
+const THREE = ["/workspace/a.txt", "/workspace/dir/b.txt", "/workspace/dir/c.txt"];
+const MARKER = "__claw_sync_done__";
+/** `rm` as a sandbox whose command identity cannot unlink Hands' files has it. */
+const RM_EACCES = `rm() { echo "rm: cannot remove: Permission denied" >&2; return 1; }; `;
+/** `rm` that says it worked and removed nothing. */
+const RM_NOOP = "rm() { return 0; }; ";
+const timedOut = (sec: number, stdout: string): string =>
+  `timeout after ${sec}s (killed the whole process group, so nothing survived). `
+  + `Split it into steps that each finish inside the limit.\nstdout: ${stdout}\nstderr: `;
+
+interface RemovalCase {
+  name: string;
+  setup: (sb: Sandbox) => void;
+  /** What `invalidateSyncManifest` answers. */
+  want: boolean;
+  /** `write` calls made while it did. */
+  writes: number;
+  /** Whether a sync that finds every file matching still believes the record afterwards. */
+  trusted?: boolean;
+}
+
+const REMOVAL_CASES: RemovalCase[] = [
+  { name: "rm works", setup: () => {}, want: true, writes: 0, trusted: false },
+  {
+    name: "rm exits non-zero (EACCES); the overwrite works",
+    setup: (sb) => { sb.prelude = RM_EACCES; }, want: true, writes: 1, trusted: false,
+  },
+  {
+    name: "rm exits non-zero (EACCES); the overwrite is refused",
+    setup: (sb) => { sb.prelude = RM_EACCES; sb.writeRefused = true; }, want: false, writes: 1,
+  },
+  {
+    name: "rm exits zero and leaves the shards; the overwrite works",
+    setup: (sb) => { sb.prelude = RM_NOOP; }, want: true, writes: 1, trusted: false,
+  },
+  {
+    name: "rm exits zero and leaves the shards; the overwrite is refused",
+    setup: (sb) => { sb.prelude = RM_NOOP; sb.writeRefused = true; }, want: false, writes: 1,
+  },
+  {
+    name: "Hands times the command out",
+    setup: (sb) => { sb.reply = (c) => (c.startsWith("rm -f") ? timedOut(20, "") : undefined); },
+    want: true, writes: 1, trusted: false,
+  },
+  {
+    name: "Hands refuses the call as text",
+    setup: (sb) => { sb.reply = (c) => (c.startsWith("rm -f") ? "Error: sandbox busy" : undefined); },
+    want: true, writes: 1, trusted: false,
+  },
+  {
+    name: "the call never comes back: nobody answered, so the overwrite is not tried either",
+    setup: (sb) => { sb.reply = (c) => { if (c.startsWith("rm -f")) throw new Error("fetch failed"); return undefined; }; },
+    want: false, writes: 0,
+  },
+];
+for (const c of REMOVAL_CASES) {
+  test(`F1 invalidateSyncManifest: ${c.name}`, async () => {
+    const sb = threeFiles();
+    await sb.sync();
+    assert.ok(sb.manifestFiles().length > 0, "a record to remove");
+    sb.writes = [];
+    c.setup(sb);
+
+    assert.equal(await invalidateSyncManifest(sb.client, PREFIX), c.want);
+    assert.equal(sb.writes.length, c.writes);
+
+    if (c.trusted !== undefined) {
+      const plan = await planUploadDelta(sb.client, PREFIX, THREE, findExcludeArgs(s3Excludes()));
+      assert.equal(
+        (plan?.unchanged ?? 0) === 3, c.trusted,
+        c.trusted ? "the record is still believed" : "no sync believes the record any more",
+      );
+    }
+  });
+}
+
+const STALE_RECORD_CASES = [
+  { name: "rm exits non-zero; the overwrite works", prelude: RM_EACCES, writeRefused: false },
+  { name: "rm exits zero and removes nothing; the overwrite works", prelude: RM_NOOP, writeRefused: false },
+  { name: "rm exits non-zero; the overwrite is refused", prelude: RM_EACCES, writeRefused: true },
+];
+for (const c of STALE_RECORD_CASES) {
+  test(`F2 a record that could not be removed is never what a later sync trusts: ${c.name}`, async () => {
+    // Sync 0 records config.py = A. Turn 1 makes it B and sync 1 never lands
+    // (every upload of it fails), so nothing is committed. Turn 2 puts A back
+    // under a new mtime. S3 holds B; a record still saying A would call the file
+    // unchanged and leave it there.
+    const sb = new Sandbox();
+    sb.put("config.py", "A");
+    sb.put("other.py", "o");
+    await sb.sync();
+
+    sb.put("config.py", "B");
+    sb.prelude = c.prelude;
+    sb.writeRefused = c.writeRefused;
+    sb.failPaths.add("/workspace/config.py");
+    sb.resetUploads();
+    const one = await sb.sync();
+    assert.equal(one.exhausted, true);
+
+    if (c.writeRefused) {
+      // Not removable by either route: this sync does not use the record at all.
+      assert.deepEqual([...new Set(sb.uploaded)], ["/workspace/config.py", "/workspace/other.py"], "everything goes, as without a record");
+      assert.equal(one.unchanged, undefined);
+      return;
+    }
+
+    sb.failPaths.clear();
+    sb.put("config.py", "A");
+    sb.resetUploads();
+    await sb.sync();
+    assert.ok(sb.uploaded.includes("/workspace/config.py"), "S3 holds B, so A has to be sent again");
+  });
+}
+
+/** A command's real output, with and without the line it ends on. */
+function realOutput(sb: Sandbox, command: string): { whole: string; cut: string } {
+  const whole = sb.run(command).stdout;
+  return { whole, cut: whole.replace(new RegExp(`${MARKER}\\n?$`), "") };
+}
+
+interface UnfinishedCase {
+  name: string;
+  /** What Hands answers instead of the command's own output. */
+  answer: (real: { whole: string; cut: string }) => string;
+}
+const UNFINISHED: UnfinishedCase[] = [
+  { name: "timed out with part of the output", answer: (r) => timedOut(60, r.cut) },
+  { name: "refused as text", answer: () => "Error: sandbox busy" },
+  { name: "all of the output and no last line", answer: (r) => r.cut },
+];
+
+interface ReadCall {
+  call: string;
+  /** Which of the sandbox's commands this is. */
+  hit: string;
+  /** Moves the sandbox so that this call is the one the next sync leans on. */
+  prepare: (sb: Sandbox) => void;
+  /** What a sync that cannot rely on the answer uploads, and the `unchanged` it reports. */
+  uploaded: string[];
+  unchanged: number | undefined;
+}
+const READ_CALLS: ReadCall[] = [
+  { call: "stat", hit: "stat -c", prepare: () => {}, uploaded: THREE, unchanged: undefined },
+  {
+    call: "digest", hit: "sha256sum",
+    prepare: (sb) => { for (const f of ["a.txt", "dir/b.txt", "dir/c.txt"]) sb.touch(f); },
+    uploaded: THREE, unchanged: 0,
+  },
+  // The record is not read, so every file is a candidate: none is vouched for.
+  { call: "manifest read", hit: "cat ", prepare: () => {}, uploaded: THREE, unchanged: 0 },
+];
+for (const rc of READ_CALLS) {
+  for (const u of UNFINISHED) {
+    // The manifest read has no envelope that parses as a manifest, so the rows that
+    // are not whole answers hold with or without the check; the last one is the
+    // one only the check catches.
+    test(`F3 ${rc.call} that ${u.name} is not a basis for skipping an upload`, async () => {
+      const sb = threeFiles();
+      await sb.sync();
+      rc.prepare(sb);
+      sb.reply = (command) => (command.includes(rc.hit) ? u.answer(realOutput(sb, command)) : undefined);
+      sb.resetUploads();
+
+      const r = await sb.sync();
+
+      assert.deepEqual(sb.uploaded, rc.uploaded);
+      assert.equal(r.unchanged, rc.unchanged);
+    });
+  }
+}
+
+test("F4 every bash call in the sync-delta module states its own completion", () => {
+  // The calls are counted, not listed: a call added without the marker, or one that
+  // goes back to `; true` (which turns every outcome into a clean-looking answer),
+  // changes one count and not the other.
+  const here = dirname(fileURLToPath(import.meta.url));
+  const src = readFileSync(join(here, "../src/workspace/sync-delta.ts"), "utf-8");
+  const calls = src.match(/\bawait bash\(/g)?.length ?? 0;
+  const markers = src.match(/\$\{DONE\}/g)?.length ?? 0;
+  assert.ok(calls > 0);
+  assert.equal(markers, calls, "one marker in the command of every bash call");
+  assert.doesNotMatch(src, /\/dev\/null; true/, "no command that forces its own exit status to zero");
+});
+
+const FINISHED_CASES: Array<{ name: string; raw: string; want: string | null }> = [
+  { name: "output, then the marker", raw: `x\ny\n${MARKER}\n`, want: "x\ny" },
+  { name: "the marker alone", raw: `${MARKER}\n`, want: "" },
+  { name: "carriage returns", raw: `x\r\n${MARKER}\r\n`, want: "x" },
+  { name: "no marker", raw: "x\ny\n", want: null },
+  { name: "nothing at all", raw: "", want: null },
+  { name: "a non-zero exit, even one that printed the marker before failing", raw: `exit 1\nstdout: ${MARKER}\nstderr: boom`, want: null },
+  { name: "a timeout", raw: timedOut(60, "x\n"), want: null },
+  { name: "a refusal", raw: "Error: sandbox busy", want: null },
+  { name: "the marker in the middle", raw: `${MARKER}\nmore\n`, want: null },
+  { name: "output Hands truncated: its notice is after the marker", raw: `x\n${MARKER}\n[stdout truncated; 4096 bytes dropped]`, want: null },
+];
+for (const c of FINISHED_CASES) {
+  test(`P3 finishedOutput: ${c.name}`, () => {
+    assert.equal(finishedOutput(c.raw), c.want);
+  });
+}
 
 // ===== uploads =====
 

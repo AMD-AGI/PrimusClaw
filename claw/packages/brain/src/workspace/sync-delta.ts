@@ -43,6 +43,10 @@
  * not, so a manifest is removed before the first byte of an upload that would
  * make it false and only written back once every pending file is up. A crash in
  * between leaves no manifest, and the next sync does the full upload.
+ *
+ * "Removed" has to be something the sandbox said, not something nobody objected
+ * to: see `bash` below for why a call that came back is not a command that
+ * worked, and `invalidateSyncManifest` for what happens when `rm` cannot.
  */
 
 import { createHash, randomBytes } from "node:crypto";
@@ -65,6 +69,38 @@ const STAT_TIMEOUT_SEC = 60;
 const DIGEST_TIMEOUT_SEC = 120;
 const STATE_TIMEOUT_SEC = 20;
 
+/**
+ * What a command prints, last, when the shell ran it to the end.
+ *
+ * `HandsClient.callTool` returns the text of the answer and drops `isError`, and
+ * Hands does not throw for a command that went wrong: a non-zero exit comes back
+ * as `exit N\nstdout: ...\nstderr: ...`, a deadline as `timeout after Ns ...`,
+ * a refused call as `Error: ...` -- all returned, all `isError: true`, none of it
+ * distinguishable from a success by whether the call threw. So a call that came
+ * back is not a command that worked, and nothing in this module reads it as one:
+ * the command says so itself, in the one place an envelope cannot put it, the
+ * last line of stdout. (`callToolFull` would keep `isError`, but it is not
+ * wrapped in the deadline `withHandsTimeout` puts on every RPC here; the
+ * workspace listing in s3-uploader fences its `find` with a marker for the same
+ * reason.)
+ */
+const DONE = "__claw_sync_done__";
+
+/**
+ * The output of a command that ran to its marker, without the marker; null for
+ * anything else -- a non-zero exit, a timeout, a refusal, output cut short, or
+ * output Hands truncated (its notice follows the marker, so the marker is not
+ * last). The envelopes Hands wraps a failure in always end with `stderr: ...`,
+ * so none of them can end with the marker.
+ */
+export function finishedOutput(raw: string): string | null {
+  const lines = raw.split("\n").map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l));
+  let end = lines.length;
+  while (end > 0 && lines[end - 1] === "") end--;
+  if (end === 0 || lines[end - 1] !== DONE) return null;
+  return lines.slice(0, end - 1).join("\n");
+}
+
 /** [size, mtime, digest]; the digest is "" for a file that was not digested. */
 type Entry = [string, string, string];
 
@@ -78,6 +114,9 @@ interface FileStat {
  * command's. Every RPC in this module goes through `withHandsTimeout`, like the
  * rest of the workspace code: the post-turn sync also runs from the SIGTERM path,
  * where a wedged sandbox must not be able to hold the grace window open.
+ *
+ * Returns the answer's text and nothing about whether the command succeeded; the
+ * callers read that off `finishedOutput`.
  */
 function bash(hands: HandsClient, command: string, timeoutSec: number): Promise<string> {
   return withHandsTimeout<string>(hands, "bash", { command, timeout: timeoutSec }, (timeoutSec + 5) * 1000);
@@ -117,11 +156,18 @@ export function parseStatListing(raw: string): Map<string, FileStat> | null {
 
 async function statFiles(hands: HandsClient, excludeArgs: string): Promise<Map<string, FileStat> | null> {
   try {
-    const raw = await bash(
+    // `; echo` rather than `; true`: individual files may fail to stat, which
+    // just leaves them out, but a command that did not finish is a listing that
+    // is not whole, and half a listing is not "the files that changed".
+    const raw = finishedOutput(await bash(
       hands,
-      `find /workspace -type f ${excludeArgs} -exec stat -c '%s %y %n' {} + 2>/dev/null; true`,
+      `find /workspace -type f ${excludeArgs} -exec stat -c '%s %y %n' {} + 2>/dev/null; echo ${DONE}`,
       STAT_TIMEOUT_SEC,
-    );
+    ));
+    if (raw === null) {
+      logger.warn("s3.sync_delta.stat_unfinished");
+      return null;
+    }
     return parseStatListing(raw);
   } catch (e) {
     logger.warn({ err: (e as Error)?.message ?? String(e) }, "s3.sync_delta.stat_failed");
@@ -149,7 +195,14 @@ async function digestFiles(hands: HandsClient, paths: string[]): Promise<Map<str
     chunk = [];
     bytes = 0;
     try {
-      const raw = await bash(hands, `sha256sum -- ${args} 2>/dev/null; true`, DIGEST_TIMEOUT_SEC);
+      const raw = finishedOutput(
+        await bash(hands, `sha256sum -- ${args} 2>/dev/null; echo ${DONE}`, DIGEST_TIMEOUT_SEC),
+      );
+      if (raw === null) {
+        // A chunk that did not finish contributes no digests, not the ones it got to.
+        logger.warn("s3.sync_delta.digest_unfinished");
+        return;
+      }
       for (const [p, d] of parseDigestListing(raw)) out.set(p, d);
     } catch (e) {
       // Not fatal: a file without a digest is uploaded when its mtime moved.
@@ -167,13 +220,13 @@ async function digestFiles(hands: HandsClient, paths: string[]): Promise<Map<str
 
 /** The manifest for this prefix, or null when there is none or it is not whole. */
 async function readManifest(hands: HandsClient, s3Prefix: string): Promise<Map<string, Entry> | null> {
-  let raw: string;
+  let raw: string | null;
   try {
-    raw = await bash(hands, `cat ${statePrefix(s3Prefix)}.*.json 2>/dev/null; true`, STATE_TIMEOUT_SEC);
+    raw = finishedOutput(await bash(hands, `cat ${statePrefix(s3Prefix)}.*.json 2>/dev/null; echo ${DONE}`, STATE_TIMEOUT_SEC));
   } catch {
     return null;
   }
-  if (TRUNCATED_FOOTER.test(raw)) return null;
+  if (raw === null || TRUNCATED_FOOTER.test(raw)) return null;
   const files = new Map<string, Entry>();
   const seen = new Set<number>();
   let gen: string | undefined;
@@ -205,22 +258,60 @@ async function readManifest(hands: HandsClient, s3Prefix: string): Promise<Map<s
 }
 
 /**
- * Remove this prefix's manifest. True when the sandbox confirmed it is gone.
+ * Make this prefix's manifest unusable. True only when the sandbox confirmed it.
  *
  * Exported for the paths that rewrite the S3 prefix behind the sync's back (the
  * in-flight checkpoint recovery copies an older snapshot over it), after which
  * the manifest would be vouching for objects that are no longer what it says.
+ *
+ * The confirmation is the command's own: `rm` exited zero and a second look finds
+ * nothing left under the name, and only then does it print the marker. Hands
+ * reports a failed `rm` (EACCES, EROFS) as text, so "the call returned" says
+ * nothing about it.
+ *
+ * `bash` is not necessarily the identity that wrote the shards. Where the sandbox
+ * runs commands under a per-run identity, the `write` tool that created them is
+ * Hands' own, and the other cannot unlink what the first made. A manifest that
+ * stays on disk is trusted again by whichever sync next finds every file matching
+ * it -- e.g. after a file went back to content the manifest remembers -- so
+ * "do not use it for this sync" is not enough. When `rm` could not, the identity
+ * that wrote it overwrites the first shard with one `readManifest` refuses, which
+ * is as unusable as a missing one (every shard has to be present and of one write).
+ * Only when both fail is the answer false, and the caller does not use it.
  */
 export async function invalidateSyncManifest(
   hands: HandsClient, s3Prefix: string, timeoutSec: number = STATE_TIMEOUT_SEC,
 ): Promise<boolean> {
+  const shards = `${statePrefix(s3Prefix)}.*.json`;
+  let answered: string;
   try {
-    await bash(hands, `rm -f ${statePrefix(s3Prefix)}.*.json`, timeoutSec);
-    return true;
+    answered = await bash(
+      hands, `rm -f ${shards} && ! ls ${shards} >/dev/null 2>&1 && echo ${DONE}`, timeoutSec,
+    );
   } catch (e) {
+    // Nobody answered, so the same sandbox will not answer a second call either.
     logger.warn({ err: (e as Error)?.message ?? String(e) }, "s3.sync_delta.invalidate_failed");
     return false;
   }
+  if (finishedOutput(answered) !== null) return true;
+  logger.warn({ s3Prefix, answer: answered.slice(0, 200) }, "s3.sync_delta.invalidate_unconfirmed");
+  try {
+    const out = await withHandsTimeout<string>(
+      hands,
+      "write",
+      {
+        path: `${statePrefix(s3Prefix)}.0.json`,
+        contents: `${JSON.stringify({ v: 0, invalidated: true })}\n`,
+      },
+      (timeoutSec + 5) * 1000,
+    );
+    // `write` reports a failure as text rather than by throwing.
+    if (/^Written to /.test(out)) return true;
+    logger.warn({ s3Prefix, answer: out.slice(0, 200) }, "s3.sync_delta.invalidate_overwrite_refused");
+  } catch (e) {
+    logger.warn({ err: (e as Error)?.message ?? String(e) }, "s3.sync_delta.invalidate_failed");
+  }
+  return false;
 }
 
 async function writeManifest(
