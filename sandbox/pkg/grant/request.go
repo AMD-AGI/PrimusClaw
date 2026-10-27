@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"regexp"
 	"slices"
+	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -194,15 +195,40 @@ func expandTemplates(appRunID string, roles map[string]RoleRequest, templates []
 	return out, expanded, stored, nil
 }
 
+// TemplateNames is the CodeInterpreter names one template expands to.
+func TemplateNames(appRunID, name string, perGPU []int32) []string {
+	return expandOne(appRunID, TemplateRequest{Name: name, PerGPUCount: perGPU})
+}
+
 func expandOne(appRunID string, tpl TemplateRequest) []string {
+	// A task id such as ktsk_01ABC is not a DNS-1123 label. Fold it before it
+	// becomes a CodeInterpreter name.
+	id := dnsLabel(appRunID)
 	if len(tpl.PerGPUCount) == 0 {
-		return []string{appRunID + "-" + tpl.Name}
+		return []string{id + "-" + tpl.Name}
 	}
 	names := make([]string, 0, len(tpl.PerGPUCount))
 	for _, n := range tpl.PerGPUCount {
-		names = append(names, appRunID+"-"+tpl.Name+"-g"+itoa(int(n)))
+		names = append(names, id+"-"+tpl.Name+"-g"+itoa(int(n)))
 	}
 	return names
+}
+
+// dnsLabel lowercases ASCII letters and turns every other character into a hyphen.
+func dnsLabel(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z' || r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteByte(byte(r - 'A' + 'a'))
+		default:
+			b.WriteByte('-')
+		}
+	}
+	return b.String()
 }
 
 func itoa(n int) string {
