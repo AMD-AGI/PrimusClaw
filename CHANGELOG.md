@@ -27,6 +27,13 @@ record it.
 
 ## [Unreleased]
 
+### Added
+- Deployment-level platform defaults: `PLATFORM_DEFAULTS_FILE` lists default skills
+  (by marketplace tool id) and MCP servers mounted into every chat, behind
+  `PROGRESSIVE_SKILLS_ENABLED` for skills. Default skills are listed by name and
+  description only and written into the sandbox on first read. Off by default;
+  see `claw/docs/platform-defaults.md`.
+
 ### Security
 - Credential redaction no longer treats every `user_env` / `session_env` value
   as a secret to cut out of transcripts, and no longer misses short or
