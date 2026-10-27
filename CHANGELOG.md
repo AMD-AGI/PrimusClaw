@@ -34,6 +34,14 @@ record it.
   description only and written into the sandbox on first read. Off by default;
   see `claw/docs/platform-defaults.md`.
 
+### Changed
+- A turn of a session with plugin tools no longer starts a sandbox before its
+  first model call unless the plugin has a hooks-type tool: plugin skill files
+  are written into the sandbox on the first sandbox call that names `.skills`,
+  so a turn that only calls MCP tools opens none. With
+  `PROGRESSIVE_SKILLS_ENABLED`, plugin skills are listed by name and description
+  like the platform defaults instead of being inlined.
+
 ### Security
 - Credential redaction no longer treats every `user_env` / `session_env` value
   as a secret to cut out of transcripts, and no longer misses short or

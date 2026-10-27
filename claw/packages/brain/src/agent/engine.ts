@@ -10,7 +10,7 @@ import { HandsClient } from "../clients/hands.js";
 import { ToolRouter } from "../tools/router.js";
 import { agentLoop } from "./agent-loop.js";
 import { resolveToolIds } from "../tools/resolve.js";
-import { marketplaceToolIds, resolvePluginToolsFromMessage } from "../tasks/plugin-from-message.js";
+import { marketplaceToolIds, pluginToolsHaveHooks, resolvePluginToolsFromMessage } from "../tasks/plugin-from-message.js";
 import { loadRules } from "./rules.js";
 import { normalizeMcpConfigs } from "../clients/mcp-config.js";
 import { approvalPolicyFromMcp } from "./approval-policy.js";
@@ -18,8 +18,8 @@ import { HitlController } from "./hitl.js";
 import { bashApprovalFromEnvValue, bashApprovalPolicyFrom } from "./bash-approval.js";
 import { DecisionDispatcher } from "../delivery/decision-dispatcher.js";
 import { connectPlatformMcp } from "../clients/mcp.js";
-import { buildPrompt, buildProgressiveSkillHint } from "./prompt.js";
-import { loadPlatformDefaults, resolveDefaultSkills, LazyDefaultSkills } from "./platform-defaults.js";
+import { buildPrompt, buildProgressiveSkillHint, listProgressiveSkills } from "./prompt.js";
+import { loadPlatformDefaults, resolveDefaultSkills, skillDescription, LazyDefaultSkills, type DefaultSkill } from "./platform-defaults.js";
 import { metrics } from "../infra/metrics.js";
 import { resolveRequestLlmKey } from "../llm/key-source.js";
 import {
@@ -129,8 +129,14 @@ export class AgentEngine {
     );
     const hasPlugin = typeof request.plugin_id === "number" && request.plugin_id > 0
       && Array.isArray(request.plugin_tools) && request.plugin_tools.length > 0;
+    // Only a hooks-type plugin tool needs the sandbox while the plugin is being
+    // resolved (it stages its scripts there). Skills, rules and MCP servers are
+    // resolved on Brain, so a plugin without hooks starts no sandbox here: a
+    // turn that only calls MCP tools never pays for one. See the plugin skill
+    // block below for how its skill files reach the sandbox when they are needed.
+    const pluginNeedsSandbox = hasPlugin && pluginToolsHaveHooks(request);
     const pluginLayer = await resolvePluginToolsFromMessage(
-      request, onEvent, pluginWorkRoot, hasPlugin ? await sandbox() : undefined,
+      request, onEvent, pluginWorkRoot, pluginNeedsSandbox ? await sandbox() : undefined,
     );
 
     const envOverrides: Record<string, string> = {};
@@ -169,22 +175,57 @@ export class AgentEngine {
     // Default skills: described in the prompt, written to the sandbox only when
     // read. Anything the request already supplies under the same name wins and
     // stays inlined.
-    const progressiveSkills = defaults && PROGRESSIVE_SKILLS_ENABLED && defaults.skills.length
+    const defaultProgressive = defaults && PROGRESSIVE_SKILLS_ENABLED && defaults.skills.length
       ? (await resolveDefaultSkills(defaults, platformKey, onEvent)).filter((s) => {
           if (!allSkills[s.name]) return true;
           logger.info({ skillName: s.name }, "skill.platform_default_overridden");
           return false;
         })
       : [];
-    const lazySkills = progressiveSkills.length ? new LazyDefaultSkills(progressiveSkills, onEvent, sessionDir) : undefined;
-    if (progressiveSkills.length) {
-      metrics.onPlatformDefaultChat(buildProgressiveSkillHint(progressiveSkills, sessionDir).length);
+
+    // Plugin skills, staged on Brain by resolvePluginToolsFromMessage. A skill
+    // the request overrode under the same name (local / marketplace) is not the
+    // plugin's any more and is left to the paths that own it.
+    const pluginSkills: DefaultSkill[] = Object.entries(pluginLayer.skillDirs || {})
+      .filter(([name]) => skillSources[name] === "plugin")
+      .map(([name, localDir]) => ({
+        name,
+        localDir,
+        toolId: pluginLayer.skillToolIds?.[name] ?? 0,
+        description: skillDescription(pluginLayer.skillContents[name] ?? "", name),
+        source: "plugin" as const,
+      }));
+    // With progressive skills on, plugin skills are listed by name and
+    // description like the platform defaults (same hint, same on-demand read)
+    // instead of having every SKILL.md body inlined. The list has a size cap
+    // and stops at the first entry that does not fit; a plugin skill it has no
+    // room for stays inlined, because a skill the prompt neither lists nor
+    // contains is one the agent cannot know to use.
+    const pluginProgressive = PROGRESSIVE_SKILLS_ENABLED
+      ? (() => {
+          const fits = new Set(listProgressiveSkills([...defaultProgressive, ...pluginSkills], sessionDir).listed.map((s) => s.name));
+          return pluginSkills.filter((s) => fits.has(s.name));
+        })()
+      : [];
+    const progressiveSkills = [...defaultProgressive, ...pluginProgressive];
+    const listedPlugin = new Set(pluginProgressive.map((s) => s.name));
+    const inlineSkills = listedPlugin.size
+      ? Object.fromEntries(Object.entries(allSkills).filter(([name]) => !listedPlugin.has(name)))
+      : allSkills;
+    // What is written into the sandbox on first need: the progressive defaults,
+    // and the plugin skills of a plugin with no hooks tool. A hooks plugin has a
+    // sandbox for its scripts regardless, and keeps writing its skills up front
+    // (below), so it is not also handed to the lazy writer.
+    const lazySkillList = [...defaultProgressive, ...(pluginNeedsSandbox ? [] : pluginSkills)];
+    const lazySkills = lazySkillList.length ? new LazyDefaultSkills(lazySkillList, onEvent, sessionDir) : undefined;
+    if (defaultProgressive.length) {
+      metrics.onPlatformDefaultChat(buildProgressiveSkillHint(defaultProgressive, sessionDir).length);
     }
 
     const rules = loadRules();
     const fullPrompt = buildPrompt(
       request.prompt ?? "",
-      allSkills,
+      inlineSkills,
       Object.keys(mergedMcp),
       model,
       sessionDir,
@@ -201,6 +242,8 @@ export class AgentEngine {
     logger.info({
       sessionId,
       skillCount: Object.keys(allSkills).length,
+      inlineSkillCount: Object.keys(inlineSkills).length,
+      progressiveSkillCount: progressiveSkills.length,
       mcpServerCount: Object.keys(mergedMcp).length,
       promptLen: fullPrompt.length,
     }, "engine.tools_resolved");
@@ -292,13 +335,13 @@ export class AgentEngine {
       messages.push({ role: "user" as const, content: fullPrompt });
 
       {
-        const activePluginSkillDirs = Object.fromEntries(
-          Object.entries(pluginLayer.skillDirs || {})
-            .filter(([name]) => skillSources[name] === "plugin"),
-        );
-
-        // Plugin skills — write each file from Brain local dir to sandbox
-        for (const [name, localDir] of Object.entries(activePluginSkillDirs)) {
+        // Plugin skills of a hooks plugin — write each file from Brain local dir
+        // to the sandbox now, as always. Every other plugin's skills are written
+        // by `lazySkills` the first time a sandbox tool names `.skills`, before
+        // that call (router.ts), so supporting files are on disk by the first
+        // bash/read that needs them and a turn that never reads one starts no
+        // sandbox.
+        for (const { name, localDir } of pluginNeedsSandbox ? pluginSkills : []) {
           const sandboxBase = `${sessionDir}/.skills/${name}`;
           const upload = await uploadDirToSandbox(await sandbox(), localDir, sandboxBase);
           for (const item of upload.skips) {

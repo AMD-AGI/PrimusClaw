@@ -277,12 +277,37 @@ export function marketplaceToolIds(request: ExecuteRequest): number[] {
   return request.tool_ids?.length ? request.tool_ids : [];
 }
 
+/** `plugin_tools` type strings (already lower-cased) that name a hooks tool. */
+function isHooksToolType(type: string): boolean {
+  return type === "hooks" || type === "hook";
+}
+
+/**
+ * True when the request's `plugin_tools` carries a hooks-type tool.
+ *
+ * That is the only kind that needs a sandbox while the plugin is being
+ * resolved: its scripts are staged there and its commands run there. Skills,
+ * rules and MCP servers are resolved entirely on Brain, so a plugin without a
+ * hooks tool must not make the turn wait for a sandbox it may never use.
+ * Shares `isHooksToolType` with `resolvePluginToolsFromMessage`, so the two
+ * cannot disagree about which rows count.
+ */
+export function pluginToolsHaveHooks(request: ExecuteRequest): boolean {
+  const raw = request.plugin_tools;
+  if (!Array.isArray(raw)) return false;
+  return raw.some((item) =>
+    !!item && typeof item === "object"
+    && isHooksToolType(String((item as PluginToolRow).type || "").toLowerCase()));
+}
+
 export interface PluginFromMessageResult {
   mcpServers: Record<string, Record<string, unknown>>;
   /** Inlined into the user prompt via ``buildPrompt`` (SKILL blocks). */
   skillContents: Record<string, string>;
   /** Local directory path for each skill (to be tar'd and sent to sandbox). */
   skillDirs: Record<string, string>;
+  /** The `plugin_tools` row id each skill in `skillDirs` came from. */
+  skillToolIds: Record<string, number>;
   /** Concatenated rule bodies; engines pass this into ``buildPrompt`` (user turn), not system. */
   rulesContent: string;
   /** Merged hook registry across all `hooks` plugin_tools; empty when none. */
@@ -372,13 +397,14 @@ export async function resolvePluginToolsFromMessage(
   const mcpServers: Record<string, Record<string, unknown>> = {};
   const skillContents: Record<string, string> = {};
   const skillDirs: Record<string, string> = {};
+  const skillToolIds: Record<string, number> = {};
   const ruleParts: string[] = [];
   const hookRegistries: HookRegistry[] = [];
   const bashApproval: unknown[] = [];
 
   const pid = request.plugin_id;
   if (!(typeof pid === "number" && Number.isFinite(pid) && pid > 0)) {
-    return { mcpServers, skillContents, skillDirs, rulesContent: "", hooks: {}, bashApproval: [] };
+    return { mcpServers, skillContents, skillDirs, skillToolIds, rulesContent: "", hooks: {}, bashApproval: [] };
   }
 
   const raw = request.plugin_tools;
@@ -398,7 +424,7 @@ export async function resolvePluginToolsFromMessage(
         reason: PLUGIN_TOOLS_MISSING,
       }, "plugin.tool_list_missing_holding_bash");
     }
-    return { mcpServers, skillContents, skillDirs, rulesContent: "", hooks: {}, bashApproval: unknown ? [PLUGIN_TOOLS_MISSING] : [] };
+    return { mcpServers, skillContents, skillDirs, skillToolIds, rulesContent: "", hooks: {}, bashApproval: unknown ? [PLUGIN_TOOLS_MISSING] : [] };
   }
 
   const stageRoot = createPrivateStagingRoot(workRoot);
@@ -470,6 +496,7 @@ export async function resolvePluginToolsFromMessage(
         }
         skillContents[name] = fs.readFileSync(skillMdPath, "utf-8");
         skillDirs[name] = path.dirname(skillMdPath);
+        skillToolIds[name] = tool.id;
 
         if (onEvent) {
           await onEvent({
@@ -525,7 +552,7 @@ export async function resolvePluginToolsFromMessage(
       continue;
     }
 
-    if (type === "hooks" || type === "hook") {
+    if (isHooksToolType(type)) {
       const s3Key = cfg.s3_key as string | undefined;
       if (!s3Key) {
         logger.warn({ toolId: tool.id }, "plugin.hooks.missing_s3_key");
@@ -628,6 +655,7 @@ export async function resolvePluginToolsFromMessage(
     mcpServers,
     skillContents,
     skillDirs,
+    skillToolIds,
     rulesContent: ruleParts.join("\n\n"),
     hooks: mergeHookRegistries(...hookRegistries),
     bashApproval,
