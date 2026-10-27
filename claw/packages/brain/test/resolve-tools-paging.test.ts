@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * resolveToolIds finds a tool that is not on the first page of the marketplace
+ * resolveToolIds finds a tool (via the paged-list fallback) that is not on the first page of the marketplace
  * list. The list endpoint is paged; a lookup that reads only the first page
  * reports every later tool as "not found" and silently drops it.
  */
@@ -21,6 +21,8 @@ test("a tool past the first marketplace page is resolved", async () => {
   const real = globalThis.fetch;
   globalThis.fetch = (async (input: string | URL | Request) => {
     const u = new URL(String(input instanceof Request ? input.url : input), "http://tools.test");
+    // No by-id route behind this gateway: the lookup falls back to the paged list.
+    if (/\/\d+$/.test(u.pathname)) return new Response("not found", { status: 404 });
     const offset = Number(u.searchParams.get("offset") ?? 0);
     const limit = Math.min(100, Number(u.searchParams.get("limit") ?? 50));
     return new Response(

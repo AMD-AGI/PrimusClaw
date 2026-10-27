@@ -55,7 +55,7 @@ never writes one and never starts a sandbox on their account.
 Limits: 50 entries and 8000 characters of list; further skills are summarized
 as "N more skills not listed". Keep SKILL.md short (about 300 lines) and move
 detail into files next to it, which the agent reads only when SKILL.md points
-to them. Skills from plugins and `tool_ids` are unchanged and stay inlined.
+to them. Skills from plugins stay inlined; `tool_ids` skills are looked up and downloaded through the same resolver and base URL.
 
 ## Publishing default tools
 
