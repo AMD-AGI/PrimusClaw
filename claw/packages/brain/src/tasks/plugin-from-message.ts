@@ -23,7 +23,7 @@ import {
 } from "../config.js";
 import { isSafeRelativePath } from "../sandbox/write.js";
 import type { HandsClient } from "../clients/hands.js";
-import { UNAVAILABLE_RULES, bashApprovalFromToolConfig } from "../agent/bash-approval.js";
+import { PLUGIN_TOOLS_MISSING, UNAVAILABLE_RULES, bashApprovalFromToolConfig } from "../agent/bash-approval.js";
 import {
   type HookRegistry,
   buildRegistryFromHooksField,
@@ -412,9 +412,19 @@ export async function resolvePluginToolsFromMessage(
     logger.warn({ pluginId: pid }, "plugin.no_plugin_tools_in_message");
     // A plugin was named but its tool list did not arrive (null = missing or
     // denied): its rules are unknown, so hold bash. An empty list declares none.
+    // Brain cannot tell the sender that left the list off from one that was
+    // refused it, so the line names the message, and carries what is needed to
+    // find the path that published it.
     const unknown = !Array.isArray(raw);
-    if (unknown) logger.warn({ pluginId: pid }, "plugin.tool_unreadable_holding_bash");
-    return { mcpServers, skillContents, skillDirs, skillToolIds, rulesContent: "", hooks: {}, bashApproval: unknown ? [UNAVAILABLE_RULES] : [] };
+    if (unknown) {
+      logger.warn({
+        pluginId: pid,
+        sessionId: request.session_id,
+        messageId: request.message_id,
+        reason: PLUGIN_TOOLS_MISSING,
+      }, "plugin.tool_list_missing_holding_bash");
+    }
+    return { mcpServers, skillContents, skillDirs, skillToolIds, rulesContent: "", hooks: {}, bashApproval: unknown ? [PLUGIN_TOOLS_MISSING] : [] };
   }
 
   const stageRoot = createPrivateStagingRoot(workRoot);
