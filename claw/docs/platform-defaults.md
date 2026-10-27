@@ -59,16 +59,21 @@ to them. Skills from plugins and `tool_ids` are unchanged and stay inlined.
 
 ## Publishing default tools
 
-Brain lists the marketplace with the **calling user's** key, so a default skill
-is mounted only for users who can see its tool. Publish each default tool with
-`is_public` true (the upload default, `is_public=true` on `/v1/tools/upload`, or
-public in the import flow) so every user can read it; a tool a user cannot see
-is skipped for that user and counted. The marketplace list is read with
-`limit=100`, newest first, so a default tool must be among the 100 most recent
-tools visible to the user.
+Brain looks each default up **by id** with the **calling user's** key (10 s
+deadline), so a default skill is mounted only for users who can read its tool,
+however many other tools exist. Publish each default tool with `is_public` true
+(the upload default, `is_public=true` on `/v1/tools/upload`, or public in the
+import flow) so every user can read it; a tool a user cannot read is skipped for
+that user.
 
-A failed or invisible default never blocks the chat: it emits an error event
-(`platform_defaults`) and increments a counter.
+The skill archive may be flat or wrapped in a single top-level folder; either
+way the directory that contains `SKILL.md` is what appears as
+`.skills/<name>/` in the sandbox. Staged copies are kept on Brain for up to 24 h
+(a chat can read its skill long after it started) and are re-staged if missing.
+
+A failed or unreadable default never blocks the chat, but it is never silent: it
+is logged at error level, emits an error event (`platform_defaults`) and
+increments a counter.
 
 ## Metrics
 
