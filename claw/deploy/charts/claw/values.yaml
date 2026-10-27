@@ -36,6 +36,18 @@ tls:
   extraCACertsKey: ca.crt
 api:
   replicas: 4
+  # Generic pass-through for settings this chart has no dedicated key for.
+  # extraEnv entries render after every other env entry of the api container, so
+  # a name set here also replaces the same name arriving through envFrom. Each
+  # entry is a Kubernetes EnvVar ({name, value} or {name, valueFrom}).
+  # extraVolumes / extraVolumeMounts are Kubernetes Volume / VolumeMount lists
+  # appended to the pod and the api container. upgrade.sh builds these from
+  # EXTRA_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* in values.<ns>.env (see
+  # values.example.env); a bare `helm upgrade --set` is dropped by the next
+  # upgrade.sh. Empty by default, which changes nothing.
+  extraEnv: []
+  extraVolumes: []
+  extraVolumeMounts: []
   port: 8200
   # Browser origins allowed to call the API with credentials, comma-separated
   # and including the scheme -- "https://claw.example.com,https://admin.example.com".
@@ -104,6 +116,18 @@ api:
 
 brain:
   replicas: 3
+  # Generic pass-through for settings this chart has no dedicated key for.
+  # extraEnv entries render after every other env entry of the brain container, so
+  # a name set here also replaces the same name arriving through envFrom. Each
+  # entry is a Kubernetes EnvVar ({name, value} or {name, valueFrom}).
+  # extraVolumes / extraVolumeMounts are Kubernetes Volume / VolumeMount lists
+  # appended to the pod and the brain container. upgrade.sh builds these from
+  # EXTRA_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* in values.<ns>.env (see
+  # values.example.env); a bare `helm upgrade --set` is dropped by the next
+  # upgrade.sh. Empty by default, which changes nothing.
+  extraEnv: []
+  extraVolumes: []
+  extraVolumeMounts: []
   port: 8100
   # Which checkpoint format to WRITE; readers always accept 3 and 4.
   #

@@ -80,8 +80,11 @@ export interface RunFinished {
  * Record notifications for runs that just finished.
  *
  * Which runs: those started by a trigger (the session carries `trigger_id`),
- * and those that ran at least `NOTIFY_MIN_RUN_SECONDS`. A short interactive
- * turn is not announced, or every chat message would push one.
+ * and those in a session that opted in with `config.notify_on_finish === true`
+ * and ran at least `NOTIFY_MIN_RUN_SECONDS`. A short interactive turn is not
+ * announced, or every chat message would push one, and a session that did not
+ * opt in is never announced as a long run, or every API-created session of a
+ * shared account would.
  *
  * Returns how many outbox rows were newly written.
  */
@@ -89,6 +92,7 @@ export async function recordRunFinished(input: RunFinished): Promise<number> {
   if (!input.taskIds.length) return 0;
   const rows = (await db.query(
     `SELECT t.task_id, s.user_id, s.name, s.config->>'trigger_id' AS trigger_id,
+            (s.config->'notify_on_finish' = 'true'::jsonb) AS notify_on_finish,
             COALESCE(t.completed_at, NOW()) AS finished_at,
             EXTRACT(EPOCH FROM (COALESCE(t.completed_at, NOW()) - COALESCE(t.started_at, t.created_at))) AS seconds
        FROM claw_tasks t JOIN claw_sessions s ON s.session_id = t.session_id
@@ -101,7 +105,7 @@ export async function recordRunFinished(input: RunFinished): Promise<number> {
     if (!row.user_id || row.user_id === "default") continue;
     const sources: string[] = [];
     if (row.trigger_id) sources.push("trigger");
-    if (Number(row.seconds) >= NOTIFY_MIN_RUN_SECONDS) sources.push("long_run");
+    if (row.notify_on_finish === true && Number(row.seconds) >= NOTIFY_MIN_RUN_SECONDS) sources.push("long_run");
     if (!sources.length) continue;
     const subs = (await db.query(
       `SELECT subscription_id FROM claw_notification_subscriptions
@@ -189,6 +193,10 @@ async function recordFailure(row: Claimed, status: string): Promise<void> {
         SET consecutive_failures = consecutive_failures + 1,
             failing_since = COALESCE(failing_since, NOW()),
             enabled = enabled AND COALESCE(failing_since, NOW()) > NOW() - make_interval(hours => $2),
+            -- Remember that it was the failure path that turned it off, so a
+            -- delivery already in flight on another replica can turn it back on.
+            auto_disabled = auto_disabled
+              OR (enabled AND NOT (COALESCE(failing_since, NOW()) > NOW() - make_interval(hours => $2))),
             updated_at = NOW()
       WHERE subscription_id = $1
       RETURNING enabled`,
@@ -241,7 +249,14 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
             [row.id, String(code)],
           );
           await db.query(
-            `UPDATE claw_notification_subscriptions SET consecutive_failures = 0, failing_since = NULL WHERE subscription_id = $1 AND (consecutive_failures <> 0 OR failing_since IS NOT NULL)`,
+            `UPDATE claw_notification_subscriptions
+                SET consecutive_failures = 0, failing_since = NULL,
+                    -- A 2xx proves the receiver works. If another replica's failure
+                    -- disabled the subscription while this send was in flight, undo
+                    -- that; a subscription the owner disabled is left alone.
+                    enabled = enabled OR auto_disabled, auto_disabled = FALSE
+              WHERE subscription_id = $1
+                AND (consecutive_failures <> 0 OR failing_since IS NOT NULL OR auto_disabled)`,
             [row.subscription_id],
           );
           delivered += 1;

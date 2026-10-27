@@ -121,6 +121,7 @@ export async function registerNotificationSubscriptionRoutes(app: FastifyInstanc
           SET event_types = COALESCE($3::text[], event_types),
               sources = COALESCE($4::text[], sources),
               enabled = COALESCE($5::boolean, enabled),
+              auto_disabled = CASE WHEN $5::boolean IS NULL THEN auto_disabled ELSE FALSE END,
               consecutive_failures = CASE WHEN $5::boolean IS TRUE THEN 0 ELSE consecutive_failures END,
               failing_since = CASE WHEN $5::boolean IS TRUE THEN NULL ELSE failing_since END,
               updated_at = NOW()
