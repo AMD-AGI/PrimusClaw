@@ -34,8 +34,9 @@ describe("notification outbox", { skip }, () => {
   const deliver = () => outbox.deliverDue({ transport, resolve: pub, allowedHosts: new Set() });
   const makeDue = () => q("UPDATE claw_notification_outbox SET next_attempt_at = NOW() - interval '1 second' WHERE delivered_at IS NULL AND dropped_at IS NULL");
 
-  async function seedRun(opts: { sid: string; tid: string; owner?: string; trigger?: string; seconds?: number }) {
-    const cfg = opts.trigger ? { trigger_id: opts.trigger } : {};
+  async function seedRun(opts: { sid: string; tid: string; owner?: string; trigger?: string; seconds?: number; notify?: unknown }) {
+    const cfg: Record<string, unknown> = opts.trigger ? { trigger_id: opts.trigger } : {};
+    if (opts.notify !== undefined) cfg.notify_on_finish = opts.notify;
     await q(
       "INSERT INTO claw_sessions (session_id, name, user_id, mode, config) VALUES ($1, 'nightly', $2, 'claw', $3::jsonb) ON CONFLICT DO NOTHING",
       [opts.sid, opts.owner ?? "u1", JSON.stringify(cfg)],
@@ -84,7 +85,7 @@ describe("notification outbox", { skip }, () => {
       await subscribe();
       await seedRun({ sid: "s-trig", tid: "t-trig", trigger: "trg-1", seconds: 3 });
       await seedRun({ sid: "s-chat", tid: "t-chat", seconds: 3 });
-      await seedRun({ sid: "s-long", tid: "t-long", seconds: 120 });
+      await seedRun({ sid: "s-long", tid: "t-long", seconds: 120, notify: true });
       for (const [sid, tid] of [["s-trig", "t-trig"], ["s-chat", "t-chat"], ["s-long", "t-long"]]) {
         await outbox.recordRunFinished({ sessionId: sid, taskIds: [tid], outcome: "completed" });
       }
@@ -95,6 +96,24 @@ describe("notification outbox", { skip }, () => {
       assert.equal(trig.type, "run.completed");
       assert.equal(trig.user_id, "u1");
       assert.match(trig.link, /\/sessions\/s-trig$/);
+    });
+
+    test("long_run requires the session's notify_on_finish opt-in", async () => {
+      const cases: Array<{ name: string; seconds: number; notify?: unknown; trigger?: string; announced: boolean }> = [
+        { name: "long run, no flag", seconds: 120, announced: false },
+        { name: "long run, flag true", seconds: 120, notify: true, announced: true },
+        { name: "long run, flag false", seconds: 120, notify: false, announced: false },
+        { name: "long run, flag is the string 'true'", seconds: 120, notify: "true", announced: false },
+        { name: "trigger session, no flag", seconds: 3, trigger: "trg-1", announced: true },
+        { name: "short run, flag true", seconds: 3, notify: true, announced: false },
+      ];
+      await subscribe();
+      for (const [i, c] of cases.entries()) {
+        await q("DELETE FROM claw_notification_outbox");
+        await seedRun({ sid: `s-c${i}`, tid: `t-c${i}`, seconds: c.seconds, notify: c.notify, trigger: c.trigger });
+        await outbox.recordRunFinished({ sessionId: `s-c${i}`, taskIds: [`t-c${i}`], outcome: "completed" });
+        assert.equal((await rows()).length, c.announced ? 1 : 0, c.name);
+      }
     });
 
     test("a failure carries a redacted, clipped summary and type run.failed", async () => {

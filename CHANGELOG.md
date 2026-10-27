@@ -216,7 +216,9 @@ record it.
 - Outbound run notifications, off by default (`CLAW_NOTIFICATIONS_ENABLED`).
   A user subscribes an https URL through `/v1/notification-subscriptions` and
   receives `run.completed` / `run.failed` events for runs started by a trigger
-  and for runs that took at least `NOTIFY_MIN_RUN_SECONDS` (default 60). Events
+  and for runs that took at least `NOTIFY_MIN_RUN_SECONDS` (default 60) in a
+  session created with `config.notify_on_finish: true` (sessions without it
+  are never announced as long runs). Events
   go through a database outbox with retry, a stable `event_id` for receiver-side
   dedup, and an HMAC-SHA256 signature over `<timestamp>.<body>`
   (`X-Claw-Timestamp`, `X-Claw-Signature`, `X-Claw-Event-Id`). Subscription URLs
