@@ -18,6 +18,22 @@ tls:
   # into the image trust store, which the runtime stage of the Dockerfile
   # already does with NODE_EXTRA_CA_CERTS.
   insecureSkipVerify: false
+  # Name of an existing ConfigMap in the release namespace holding PEM
+  # certificates (root and any intermediates) for a private CA. It is mounted
+  # read-only into api and brain and NODE_EXTRA_CA_CERTS is pointed at the key
+  # below, so outbound HTTPS to an endpoint behind that CA verifies without
+  # rebuilding the image and without disabling verification. Node adds these to
+  # its built-in roots. Empty (the default) changes nothing. Note it replaces,
+  # for these two containers, the image's own NODE_EXTRA_CA_CERTS value, so put
+  # in the ConfigMap every anchor the image would otherwise have supplied.
+  # Node reads the file once at start-up: after changing the ConfigMap's
+  # contents, restart api and brain (kubectl rollout restart) to pick it up.
+  # upgrade.sh renders from values.<ns>.env, not from this file: set
+  # EXTRA_CA_CERTS_CONFIGMAP / EXTRA_CA_CERTS_KEY there (see values.example.env).
+  # The key is projected to /etc/claw-ca/ca.crt, so a key missing from the
+  # ConfigMap fails the pod mount instead of being silently ignored.
+  extraCACertsConfigMap: ""
+  extraCACertsKey: ca.crt
 api:
   replicas: 4
   port: 8200
@@ -374,6 +390,12 @@ secret:
   # Max time a sandbox may stay Pending/Creating before the message fails with
   # reason sandbox_pending_timeout. 0 = wait forever. Default 3h.
   sandboxPendingTimeoutSeconds: "10800"
+  # Max time a scheduled sandbox may stay not-ready (image pull, container start)
+  # before the message fails with reason sandbox_start_timeout. 0 = wait forever. Default 15m.
+  sandboxStartTimeoutSeconds: "900"
+  # The same ceiling for multi-node GPU clusters (giving up deletes the cluster).
+  # 0 = off, the default: large images and Infera role pods routinely take longer.
+  multiNodeStartTimeoutSeconds: "0"
   # How long a Running sandbox with an empty GET /api/jobs roster stays up
   # before Brain idle-reclaims it. Default 15 minutes.
   sandboxIdleReuseSeconds: "900"

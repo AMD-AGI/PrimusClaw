@@ -56,6 +56,9 @@ PG_SUPERUSER_SECRET="${PG_SUPERUSER_SECRET:-${PG_CLUSTER}-pguser-postgres}"
 # Skip server-certificate validation on api's PG connection (still encrypted).
 # Needed against a PGO-managed database, whose CA no client trust store carries.
 PG_SSL_NO_VERIFY="${PG_SSL_NO_VERIFY:-false}"
+# Private-CA trust for api and brain: see tls.extraCACertsConfigMap in the chart.
+EXTRA_CA_CERTS_CONFIGMAP="${EXTRA_CA_CERTS_CONFIGMAP:-}"
+EXTRA_CA_CERTS_KEY="${EXTRA_CA_CERTS_KEY:-ca.crt}"
 PG_WAIT_TIMEOUT="${PG_WAIT_TIMEOUT:-600}"
 PGO_RELEASE="${PGO_RELEASE:-primus-pgo}"
 NATS_RELEASE="${NATS_RELEASE:-primus-claw-nats}"
@@ -471,6 +474,7 @@ export NATS_PASSWORD_API NATS_PASSWORD_BRAIN NATS_PASSWORD_REAPER NATS_PASSWORD_
 export CHECKPOINT_WRITE_VERSION
 export S3_ENDPOINT S3_API_ENDPOINT S3_ACCESS_KEY S3_SECRET_KEY
 export CLAW_DEPLOY_MODE PG_CLUSTER PG_APP_USER PG_APP_DB PG_USER_SECRET PG_SSL_NO_VERIFY
+export EXTRA_CA_CERTS_CONFIGMAP EXTRA_CA_CERTS_KEY
 export SANDBOX_NAMESPACE SANDBOX_WORKLOAD_NAMESPACE SANDBOX_ROUTER_URL SANDBOX_HANDS_VIA_ROUTER SANDBOX_ROUTER_AUTH_ENABLED
 export WORKSPACE_PERSIST_BASE LITELLM_API_BASE
 export SAFE_DEFAULT_WORKSPACE
@@ -557,6 +561,10 @@ values = {
         "storageClass": env("STORAGE_CLASS"),
         "sslNoVerify": env("PG_SSL_NO_VERIFY", "false").lower() == "true",
     },
+    "tls": {
+        "extraCACertsConfigMap": env("EXTRA_CA_CERTS_CONFIGMAP", ""),
+        "extraCACertsKey": env("EXTRA_CA_CERTS_KEY", "") or "ca.crt",
+    },
     "ingress": {
         "enabled": True,
         # Higress is what this repo's reference cluster runs, not a
@@ -608,6 +616,8 @@ values = {
         "sandboxWorkloadPriority": env("SANDBOX_WORKLOAD_PRIORITY", "0"),
         "sandboxDefaultTimeoutSeconds": env("SANDBOX_DEFAULT_TIMEOUT_SECONDS", "86400"),
         "sandboxPendingTimeoutSeconds": env("SANDBOX_PENDING_TIMEOUT_SECONDS", "10800"),
+        "sandboxStartTimeoutSeconds": env("SANDBOX_START_TIMEOUT_SECONDS", "900"),
+        "multiNodeStartTimeoutSeconds": env("MULTI_NODE_START_TIMEOUT_SECONDS", "0"),
         "sandboxIdleReuseSeconds": env("SANDBOX_IDLE_REUSE_SECONDS", "900"),
         "multiNodeDefaultTimeoutSeconds": env(
             "MULTI_NODE_DEFAULT_TIMEOUT_SECONDS",
