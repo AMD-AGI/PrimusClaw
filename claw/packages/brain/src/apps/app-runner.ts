@@ -54,7 +54,7 @@ import {
 } from "./app-run-store.js";
 import {
   EXIT_ABSENT, INPUT_FILE, buildAppEnv, expandStateDirCommand, generationTag, isUsableStateDir,
-  parseProbe, probeCommand, readExitCommand, scrub, secretValuesOf, startCommand, stopCommand, writeFileCommand,
+  killCommand, parseProbe, probeCommand, readExitCommand, scrub, secretValuesOf, startCommand, stopCommand, writeFileCommand,
   type ProbeVerdict,
 } from "./app-env.js";
 
@@ -88,19 +88,30 @@ export interface AppGrantRun {
   sessionId: string;
   grantId: string | null;
   manifest: AppManifestV1;
+  userId?: string;
+  platformKey?: string;
+  workspaceId?: string | null;
+  limits?: Record<string, unknown> | null;
+  expiresAt?: string | null;
 }
 
 /** What a grant adds to the application's environment. */
 export interface AppGrantEnv {
   keys?: Partial<Record<AppSandboxRole, string>>;
   limits?: Record<string, unknown>;
+  /** Injected under the fixed name `E2B_API_URL`. */
+  e2bApiUrl?: string;
+  /** Injected under the fixed name `E2B_SANDBOX_URL`. */
+  e2bSandboxUrl?: string;
 }
 
 /**
  * Grant hook points (sandbox-layering #4). `env` runs at `starting`, `revoke`
  * at `finishing` step 3; both default to doing nothing. `issue` is the API's, at
- * run creation: the runner never issues a grant, so a run taken over with its
- * `grantId` already on the row cannot be given a second one. `revoke` is called
+ * run creation. The runner does not mint a grant id. When `inspect` says the
+ * execution copy is gone and the grant was not revoked, `reissue` signs the
+ * same id and the application is started again so the new keys are injected.
+ * `revoke` is called
  * once per run end, and once more only if a Brain dies between the call and the
  * write that records it, so an implementation must tolerate a repeat.
  *
@@ -113,6 +124,10 @@ export interface AppGrantRunHooks {
   env(run: AppGrantRun): Promise<AppGrantEnv>;
   revoke(run: AppGrantRun): Promise<void>;
   extend(run: AppGrantRun, expiresAt: string): Promise<{ expiresAt: string }>;
+  /** Whether the execution copy is still there. Absent means the runner does not check. */
+  inspect?(run: AppGrantRun): Promise<"active" | "missing" | "revoked">;
+  /** Sign the same grant id again after the execution copy is gone. Returns the new keys. */
+  reissue?(run: AppGrantRun): Promise<{ keys: Partial<Record<AppSandboxRole, string>>; expiresAt: string }>;
 }
 
 export const noopAppGrant: AppGrantRunHooks = {
@@ -348,7 +363,7 @@ export class AppRunner {
     if (!rec.grant_expires_at) return kept("no_expiry");
     const current = Date.parse(rec.grant_expires_at);
     if (!Number.isFinite(asked) || !(asked > current)) return kept("not_later");
-    const run: AppGrantRun = { runId: this.runId, sessionId: rec.session_id, grantId: rec.grant_id, manifest: rec.manifest };
+    const run: AppGrantRun = this.grantRun(rec);
     try {
       const granted = await this.grant.extend(run, expiresAt);
       const at = Date.parse(granted?.expiresAt);
@@ -430,6 +445,8 @@ export class AppRunner {
       await this.move({ state: "finishing", last_exit: { at: this.iso(), cause: "deadline", final: false } }, this.rec.state);
       return { done: false };
     }
+    const held = await this.ensureGrantCopy();
+    if (held) return held;
     switch (this.rec.state) {
       case "provisioning": return this.inProvisioning();
       case "starting": return this.inStarting();
@@ -438,6 +455,92 @@ export class AppRunner {
       case "finishing": return this.inFinishing();
       case "ended": return { done: true, outcome: outcomeOf(this.rec.last_exit, this.rec.state_dir) };
     }
+  }
+
+  /**
+   * Keep the execution copy of the grant. A live copy is left alone. A missing
+   * one is signed again under the same id, then the application is stopped so
+   * the existing restart path injects the new keys. A revoked grant is not signed.
+   */
+  private async ensureGrantCopy(): Promise<TickResult | null> {
+    if (this.rec.state === "finishing" || this.rec.state === "ended") return null;
+    if (this.rec.last_exit?.grant_restart === true) return this.driveGrantRestart();
+    if (!this.grant.inspect || !this.grant.reissue || !this.rec.grant_id || this.rec.grant_revoked_at) return null;
+    let presence: "active" | "missing" | "revoked";
+    try {
+      presence = await this.grant.inspect(this.grantRun());
+    } catch (err) {
+      logger.warn({ runId: this.runId, grantId: this.rec.grant_id, err: this.safeText(err) }, "app_run.grant_inspect_failed");
+      return null;
+    }
+    if (presence !== "missing") return null;
+    try {
+      const issued = await this.grant.reissue(this.grantRun());
+      await this.deps.store.patch(this.runId, { grant_keys: issued.keys });
+      this.secretsLoaded = false;
+      const last = this.rec.last_exit ?? { at: this.iso(), cause: "exit" as const, final: false };
+      await this.move({ last_exit: { ...last, grant_restart: true } });
+    } catch (err) {
+      logger.warn({ runId: this.runId, grantId: this.rec.grant_id, err: this.safeText(err) }, "app_run.grant_reissue_failed");
+      return null;
+    }
+    return this.driveGrantRestart();
+  }
+
+  /**
+   * Stop the application after a re-issue. Once it is gone the flag is cleared
+   * and the state machine restarts it, which is what injects the new keys.
+   */
+  private async driveGrantRestart(): Promise<TickResult | null> {
+    const inst = this.instance();
+    const stateDir = this.rec.state_dir;
+    if (!inst || !stateDir || this.rec.state === "provisioning") {
+      await this.clearGrantRestart();
+      return null;
+    }
+    let verdict = await this.probe(inst, stateDir);
+    if (verdict === "alive") {
+      const sentAt = Date.parse(this.rec.last_exit?.stop_at ?? "");
+      if (!Number.isFinite(sentAt)) {
+        await this.sendTerm(inst, stateDir);
+        await this.move({ last_exit: { ...this.rec.last_exit!, stop_at: this.iso() } });
+      } else if (this.now() >= sentAt + this.stopGraceMs()) {
+        await this.deps.sandbox.exec(inst, killCommand(stateDir, this.tag()), EXEC_TIMEOUT, { untracked: true });
+      }
+      verdict = await this.probe(inst, stateDir);
+    }
+    if (verdict !== "dead" && verdict !== "none") return { done: false };
+    await this.clearGrantRestart();
+    return null;
+  }
+
+  private stopGraceMs(): number {
+    return Math.min(this.rec.manifest.stop_grace_sec ?? APP_MANIFEST_DEFAULTS.stop_grace_sec, MAX_STOP_GRACE_SEC) * 1000;
+  }
+
+  /** Drop the re-issue mark so the ordinary restart path can move the run. */
+  private async clearGrantRestart(): Promise<void> {
+    if (this.rec.last_exit?.grant_restart !== true) return;
+    const last: AppLastExit = { ...this.rec.last_exit };
+    delete last.grant_restart;
+    delete last.stop_at;
+    await this.move({ last_exit: last });
+  }
+
+  /** The grant hooks' view of the current row, including what a re-issue needs. */
+  private grantRun(rec: AppRunRecord = this.rec): AppGrantRun {
+  const run: AppGrantRun = {
+    runId: this.runId,
+    sessionId: rec.session_id,
+    grantId: rec.grant_id,
+    manifest: rec.manifest,
+  };
+  if (rec.user_id) run.userId = rec.user_id;
+  if (this.platformKey) run.platformKey = this.platformKey;
+  if (rec.workspace_id) run.workspaceId = rec.workspace_id;
+  if (rec.grant_limits) run.limits = rec.grant_limits;
+  if (rec.grant_expires_at) run.expiresAt = rec.grant_expires_at;
+  return run;
   }
 
   /** `limits.max_runtime_sec` counts from the run's creation, so a takeover keeps the same deadline. */
@@ -625,7 +728,7 @@ export class AppRunner {
 
   private async applicationEnv(stateDir: string): Promise<Record<string, string>> {
     const rec = this.rec;
-    const run: AppGrantRun = { runId: this.runId, sessionId: rec.session_id, grantId: rec.grant_id, manifest: rec.manifest };
+    const run: AppGrantRun = this.grantRun(rec);
     const [stored, granted, nodeName] = await Promise.all([
       this.deps.store.secrets(this.runId),
       this.grant.env(run),
@@ -641,6 +744,8 @@ export class AppRunner {
       grantKeys: { ...(stored.grant_keys ?? {}), ...(granted.keys ?? {}) },
       grantLimits: granted.limits ?? rec.grant_limits,
       nodeName,
+      e2bApiUrl: granted.e2bApiUrl,
+      e2bSandboxUrl: granted.e2bSandboxUrl,
     };
     this.secrets = secretValuesOf(sources);
     this.secretsLoaded = true;
@@ -790,7 +895,7 @@ export class AppRunner {
     const rec = this.rec;
     const inst = this.instance();
     const ctx: AppRunContext = { record: rec, instance: inst };
-    const run: AppGrantRun = { runId: this.runId, sessionId: rec.session_id, grantId: rec.grant_id, manifest: rec.manifest };
+    const run: AppGrantRun = this.grantRun(rec);
     const cause = rec.last_exit?.cause ?? "exit";
     const cancelled = cause === "cancelled" || cause === "deadline" || cause === "row_terminal";
 

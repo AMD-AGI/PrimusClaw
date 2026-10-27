@@ -93,6 +93,7 @@ import {
 } from "./infra/metrics.js";
 import { startWatchdog } from "./infra/watchdog.js";
 import { registerAdminCheckpointRoutes } from "./routes/admin.js";
+import { bindBrainAppGrant } from "./apps/app-grant.js";
 import { DrainState, versionDrainAction } from "./infra/drain-state.js";
 
 const logger = pino({ name: "brain" });
@@ -530,6 +531,7 @@ async function initializeInfrastructure(): Promise<JetStreamManager> {
   await assertReservedKeysFree(kv);
   bindTaskLockKv(kv);
   bindTaskRunnerDeps({ kv, kvCkpt, emitter, engine });
+  bindBrainAppGrant();
   let kvTombstones: KV | undefined;
   try {
     // views.kv creates or attaches; without bindOnly, brain-first boot creates max_age=0 (no expiry).

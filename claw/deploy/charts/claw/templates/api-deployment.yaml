@@ -147,6 +147,12 @@ spec:
         - name: NODE_TLS_REJECT_UNAUTHORIZED
           value: "0"
         {{- end }}
+        {{- if .Values.grantSigningKey.enabled }}
+        - name: GRANT_SIGNING_KEY_FILE
+          value: /var/run/claw/grant/signing-key.pem
+        - name: AGENT_SANDBOX_GRANT_URL
+          value: {{ .Values.grantSigningKey.url | quote }}
+        {{- end }}
         # The startup budget has to cover a schema migration, because initDb runs
         # before the server listens: nothing answers /health while a migration is
         # in flight, on the replica doing it and on every replica waiting behind
@@ -169,3 +175,15 @@ spec:
           failureThreshold: 2
         resources:
           {{- toYaml .Values.api.resources | nindent 10 }}
+        {{- if .Values.grantSigningKey.enabled }}
+        volumeMounts:
+        - name: grant-signing-key
+          mountPath: /var/run/claw/grant
+          readOnly: true
+        {{- end }}
+      {{- if .Values.grantSigningKey.enabled }}
+      volumes:
+      - name: grant-signing-key
+        secret:
+          secretName: {{ .Values.grantSigningKey.secretName }}
+      {{- end }}

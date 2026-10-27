@@ -35,7 +35,7 @@ const STATE_DIR_MAX = 4096;
 const WORKLOAD_ID_MAX = 200;
 const RESTARTS_MAX = 1_000_000;
 const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
-const PATCH_KEYS = new Set(["brain_id", "claim_count", "expect_state", "state", "restarts", "last_exit", "state_dir", "sandbox_workload_id", "grant_expires_at", "grant_revoked"]);
+const PATCH_KEYS = new Set(["brain_id", "claim_count", "expect_state", "state", "restarts", "last_exit", "state_dir", "sandbox_workload_id", "grant_expires_at", "grant_revoked", "grant_keys"]);
 
 /** The patch in `body`, or the reason it was refused. */
 export function parseAppRunPatch(
@@ -88,6 +88,11 @@ export function parseAppRunPatch(
     if (body.grant_revoked !== true) return { ok: false, error: "grant_revoked_invalid" };
     patch.grant_revoked = true;
   }
+  if (body.grant_keys !== undefined) {
+    const keys = parseGrantKeys(body.grant_keys);
+    if (!keys) return { ok: false, error: "grant_keys_invalid" };
+    patch.grant_keys = keys;
+  }
   if (body.last_exit !== undefined) {
     const e = body.last_exit;
     if (e !== null && !isObj(e)) return { ok: false, error: "last_exit_invalid" };
@@ -95,6 +100,22 @@ export function parseAppRunPatch(
     patch.last_exit = e as Record<string, unknown> | null;
   }
   return { ok: true, brainId, claimCount, expect, patch };
+}
+
+const GRANT_KEY_ROLES = new Set(["measurement", "subrun", "dev"]);
+
+/** Role keys only. Values are not echoed when this refuses. */
+function parseGrantKeys(value: unknown): Record<string, string> | null {
+  if (!isObj(value)) return null;
+  const names = Object.keys(value);
+  if (names.length === 0 || names.length > GRANT_KEY_ROLES.size) return null;
+  const out: Record<string, string> = {};
+  for (const name of names) {
+    const key = value[name];
+    if (!GRANT_KEY_ROLES.has(name) || typeof key !== "string" || !key || key.length > 200) return null;
+    out[name] = key;
+  }
+  return out;
 }
 
 const REFUSALS = {

@@ -86,6 +86,14 @@ export function stopCommand(stateDir: string, tag: string): string {
     + `kill -TERM "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null; echo sent; else echo none; fi`;
 }
 
+/** SIGKILL the application of this generation after the TERM grace has passed. */
+export function killCommand(stateDir: string, tag: string): string {
+  const d = shq(stateDir);
+  return `if [ "$(cat ${d}/${MARKER_FILE} 2>/dev/null)" = ${shq(tag)} ]; then `
+    + `p="$(cat ${d}/${PID_FILE} 2>/dev/null)"; `
+    + `kill -KILL "-$p" 2>/dev/null || kill -KILL "$p" 2>/dev/null; echo sent; else echo none; fi`;
+}
+
 export function parseProbe(stdout: string): ProbeVerdict | null {
   const word = stdout.trim();
   return word === "alive" || word === "dead" || word === "none" ? word : null;
@@ -165,6 +173,9 @@ export interface AppEnvSources {
   grantKeys: Partial<Record<AppSandboxRole, string>>;
   grantLimits: Record<string, unknown> | null;
   nodeName: string | null;
+  /** Set under the fixed names `E2B_API_URL` and `E2B_SANDBOX_URL`. */
+  e2bApiUrl?: string;
+  e2bSandboxUrl?: string;
 }
 
 /**
@@ -174,8 +185,8 @@ export interface AppEnvSources {
  * manifest cannot set at all (validateAppManifest reserves them).
  *
  * Only facilities the manifest maps are injected, and the MCP ones only when
- * `mcp` is declared. `mcp_public_url`, `sandbox_templates` and `result_archive`
- * are not provided by this change and stay unset.
+ * `mcp` is declared. `E2B_API_URL` and `E2B_SANDBOX_URL` are fixed names.
+ * `mcp_public_url` and `result_archive` stay unset.
  */
 export function buildAppEnv(s: AppEnvSources): Record<string, string> {
   const { manifest } = s;
@@ -197,6 +208,9 @@ export function buildAppEnv(s: AppEnvSources): Record<string, string> {
   }
   for (const role of APP_SANDBOX_ROLES) set(map.sandbox_keys?.[role], s.grantKeys[role]);
   set(map.grant_limits, s.grantLimits ? JSON.stringify(s.grantLimits) : undefined);
+  set(map.sandbox_templates, manifest.sandbox_templates ? JSON.stringify(manifest.sandbox_templates) : undefined);
+  if (s.e2bApiUrl) env.E2B_API_URL = s.e2bApiUrl;
+  if (s.e2bSandboxUrl) env.E2B_SANDBOX_URL = s.e2bSandboxUrl;
   env.CLAW_SESSION_ID = s.sessionId;
   if (s.nodeName) env.NODE_NAME = s.nodeName;
   return env;

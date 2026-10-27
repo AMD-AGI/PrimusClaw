@@ -151,11 +151,18 @@ spec:
                 matchLabels:
                   app: primus-claw
                   component: primus-claw-brain
-      {{- if and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
+      {{- if or (and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml) .Values.grantSigningKey.enabled }}
       volumes:
+      {{- if and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
       - name: sandbox-template
         configMap:
           name: {{ .Values.sandboxTemplate.name }}
+      {{- end }}
+      {{- if .Values.grantSigningKey.enabled }}
+      - name: grant-signing-key
+        secret:
+          secretName: {{ .Values.grantSigningKey.secretName }}
+      {{- end }}
       {{- end }}
       containers:
       - name: brain
@@ -302,11 +309,32 @@ spec:
         # of them and the sandbox never starts.
         - name: HANDS_ENV_FILE_WAIT_SEC
           value: {{ .Values.brain.handsEnvFileWaitSec | quote }}
-        {{- if and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
+        {{- if .Values.grantSigningKey.enabled }}
+        - name: GRANT_SIGNING_KEY_FILE
+          value: /var/run/claw/grant/signing-key.pem
+        - name: AGENT_SANDBOX_GRANT_URL
+          value: {{ .Values.grantSigningKey.url | quote }}
+        {{- end }}
+        {{- if .Values.grantSigningKey.e2bApiUrl }}
+        - name: E2B_API_URL
+          value: {{ .Values.grantSigningKey.e2bApiUrl | quote }}
+        {{- end }}
+        {{- if .Values.grantSigningKey.e2bSandboxUrl }}
+        - name: E2B_SANDBOX_URL
+          value: {{ .Values.grantSigningKey.e2bSandboxUrl | quote }}
+        {{- end }}
+        {{- if or (and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml) .Values.grantSigningKey.enabled }}
         volumeMounts:
+        {{- if and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
         - name: sandbox-template
           mountPath: /etc/claw
           readOnly: true
+        {{- end }}
+        {{- if .Values.grantSigningKey.enabled }}
+        - name: grant-signing-key
+          mountPath: /var/run/claw/grant
+          readOnly: true
+        {{- end }}
         {{- end }}
         startupProbe:
           httpGet: { path: /health, port: http }
