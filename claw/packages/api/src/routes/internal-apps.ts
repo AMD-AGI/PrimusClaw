@@ -6,7 +6,8 @@
  *
  *   GET   /v1/internal/app-runs/:taskId           the run row plus what it was asked to do
  *   GET   /v1/internal/app-runs/:taskId/secrets   the MCP token and grant keys, opened
- *   PATCH /v1/internal/app-runs/:taskId           fenced state update (lease holder + claim epoch)
+ *   PATCH /v1/internal/app-runs/:taskId           fenced state update (lease holder + claim epoch), including
+ *                                                 the event-forwarding cursor (5.7)
  *   PUT   /v1/internal/app-runs/:taskId/mcp       record where the app's session MCP answers (fenced)
  *   DELETE /v1/internal/app-runs/:taskId/mcp      remove that record (fenced; brain_id, claim_count in the query)
  *
@@ -21,6 +22,7 @@
  */
 import type { FastifyInstance } from "fastify";
 import pino from "pino";
+import { APP_EVENT_ID, APP_EVENT_SEGMENT_NAME } from "@claw/protocol";
 import { internalTokenAuth } from "../auth/middleware.js";
 import { MCP_URL_MAX, SANDBOX_SESSION_ID_MAX, recordSessionAppMcp, removeSessionAppMcp } from "../tasks/session-app-mcp.js";
 import {
@@ -37,8 +39,9 @@ const STATES = new Set<string>(APP_RUN_STATES);
 const STATE_DIR_MAX = 4096;
 const WORKLOAD_ID_MAX = 200;
 const RESTARTS_MAX = 1_000_000;
+const OFFSET_MAX = 2 ** 53 - 1;
 const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
-const PATCH_KEYS = new Set(["brain_id", "claim_count", "expect_state", "state", "restarts", "last_exit", "state_dir", "sandbox_workload_id", "grant_expires_at", "grant_revoked"]);
+const PATCH_KEYS = new Set(["brain_id", "claim_count", "expect_state", "state", "restarts", "last_exit", "events_cursor", "state_dir", "sandbox_workload_id", "grant_expires_at", "grant_revoked"]);
 
 /** The patch in `body`, or the reason it was refused. */
 export function parseAppRunPatch(
@@ -90,6 +93,21 @@ export function parseAppRunPatch(
   if (body.grant_revoked !== undefined) {
     if (body.grant_revoked !== true) return { ok: false, error: "grant_revoked_invalid" };
     patch.grant_revoked = true;
+  }
+  if (body.events_cursor !== undefined) {
+    const c = body.events_cursor;
+    if (!isObj(c)) return { ok: false, error: "events_cursor_invalid" };
+    for (const key of Object.keys(c)) if (key !== "segment" && key !== "offset" && key !== "last_id" && key !== "epoch" && key !== "reset_pending") return { ok: false, error: "events_cursor_invalid" };
+    if (c.segment !== undefined && (typeof c.segment !== "string" || !APP_EVENT_SEGMENT_NAME.test(c.segment))) return { ok: false, error: "events_cursor_invalid" };
+    if (c.offset !== undefined && (typeof c.offset !== "number" || !Number.isInteger(c.offset) || c.offset < 0 || c.offset > OFFSET_MAX)) {
+      return { ok: false, error: "events_cursor_invalid" };
+    }
+    if (c.last_id !== undefined && (typeof c.last_id !== "string" || !APP_EVENT_ID.test(c.last_id))) return { ok: false, error: "events_cursor_invalid" };
+    if (c.epoch !== undefined && (typeof c.epoch !== "number" || !Number.isInteger(c.epoch) || c.epoch < 0 || c.epoch > 1_000_000)) {
+      return { ok: false, error: "events_cursor_invalid" };
+    }
+    if (c.reset_pending !== undefined && c.reset_pending !== true) return { ok: false, error: "events_cursor_invalid" };
+    patch.events_cursor = c;
   }
   if (body.last_exit !== undefined) {
     const e = body.last_exit;
