@@ -13,7 +13,8 @@ import { pendingSecretColumns } from "../tasks/run-secrets.js";
 import {
   forceIdleAfterInterrupt, releaseSessionGateForTurn, stopSessionRuns, takeSessionGate,
 } from "../tasks/chat-run.js";
-import { kv } from "../infra/nats.js";
+import { kv, nc, sc } from "../infra/nats.js";
+import { buildDecisionMessage } from "../sessions/decision-message.js";
 import { getUser } from "../auth/middleware.js";
 import {
   canAccessSession,
@@ -1673,8 +1674,20 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     }
 
     if (messageType === "decision") {
-      // V2 agent-loop has no interactive tool-permission gate yet.
-      return reply.status(501).send({ ok: false, error: "decision messages not supported on v2 sessions" });
+      // The answer to a pending tool-approval request (Brain's approval gate,
+      // agent/hitl.ts). Only a person who may write to the session can give it.
+      const row = (await db.query(
+        "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
+        [sessionId],
+      )).rows[0];
+      if (!row) return reply.status(404).send({ ok: false, error: "session not found" });
+      if (!canWriteSessionAsOperator(row.user_id, user)) {
+        return reply.status(403).send({ ok: false, error: "access denied" });
+      }
+      const built = buildDecisionMessage(sessionId, userId, body);
+      if (!built.ok) return reply.status(400).send({ ok: false, error: built.error });
+      nc.publish(`decision.${sessionId}`, sc.encode(JSON.stringify(built.message)));
+      return { ok: true, session_id: sessionId, action_id: built.message.action_id, decision: built.message.decision };
     }
 
     // messageType: "text" | "inject" | default → require content.
