@@ -187,6 +187,7 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		SandboxName: result.SandboxName,
 		Namespace:   result.Namespace,
 		NodeName:    result.NodeName,
+		Cluster:     result.Cluster,
 	}); err != nil {
 		_ = s.runner.Delete(context.WithoutCancel(ctx), sandboxID)
 		_ = s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, sandboxID, "create_failed")

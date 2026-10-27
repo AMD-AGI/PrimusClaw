@@ -176,6 +176,8 @@ spec:
                           type: string
                       nodeName:
                         type: string
+                      cluster:
+                        type: string
                       sealed:
                         type: boolean
                       inputs:

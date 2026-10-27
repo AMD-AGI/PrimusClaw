@@ -136,27 +136,30 @@ type GrantRoleUsage struct {
 
 // GrantSandboxRef is one sandbox charged to the grant.
 type GrantSandboxRef struct {
-	ID                string            `json:"id"`
-	Role              string            `json:"role"`
-	GPUs              int32             `json:"gpus"`
-	SessionID         string            `json:"sessionId,omitempty"`
-	StartedAt         metav1.Time       `json:"startedAt,omitempty"`
-	EndedAt           metav1.Time       `json:"endedAt,omitempty"`
-	Alias             string            `json:"alias,omitempty"`
-	TemplateID        string            `json:"templateID,omitempty"`
-	Namespace         string            `json:"namespace,omitempty"`
-	SandboxName       string            `json:"sandboxName,omitempty"`
-	State             string            `json:"state,omitempty"`
-	EndReason         string            `json:"endReason,omitempty"`
-	TimeoutSec        int64             `json:"timeoutSec,omitempty"`
-	IdempotencyKey    string            `json:"idempotencyKey,omitempty"`
-	AccessTokenHash   string            `json:"accessTokenHash,omitempty"`
-	AccessTokenHashes []string          `json:"accessTokenHashes,omitempty"`
-	NodeName          string            `json:"nodeName,omitempty"`
-	Sealed            bool              `json:"sealed,omitempty"`
-	Inputs            []string          `json:"inputs,omitempty"`
-	Outputs           []string          `json:"outputs,omitempty"`
-	Metadata          map[string]string `json:"metadata,omitempty"`
+	ID                string      `json:"id"`
+	Role              string      `json:"role"`
+	GPUs              int32       `json:"gpus"`
+	SessionID         string      `json:"sessionId,omitempty"`
+	StartedAt         metav1.Time `json:"startedAt,omitempty"`
+	EndedAt           metav1.Time `json:"endedAt,omitempty"`
+	Alias             string      `json:"alias,omitempty"`
+	TemplateID        string      `json:"templateID,omitempty"`
+	Namespace         string      `json:"namespace,omitempty"`
+	SandboxName       string      `json:"sandboxName,omitempty"`
+	State             string      `json:"state,omitempty"`
+	EndReason         string      `json:"endReason,omitempty"`
+	TimeoutSec        int64       `json:"timeoutSec,omitempty"`
+	IdempotencyKey    string      `json:"idempotencyKey,omitempty"`
+	AccessTokenHash   string      `json:"accessTokenHash,omitempty"`
+	AccessTokenHashes []string    `json:"accessTokenHashes,omitempty"`
+	NodeName          string      `json:"nodeName,omitempty"`
+	// Cluster is the SaFE cluster id copied from the Workload label.
+	// The data plane uses it to choose a Router entry. Empty means this cluster.
+	Cluster  string            `json:"cluster,omitempty"`
+	Sealed   bool              `json:"sealed,omitempty"`
+	Inputs   []string          `json:"inputs,omitempty"`
+	Outputs  []string          `json:"outputs,omitempty"`
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // +kubebuilder:object:root=true

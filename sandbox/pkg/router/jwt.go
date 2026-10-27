@@ -29,6 +29,10 @@ const (
 	jwtExpiration = 5 * time.Minute
 	jwtIssuer     = "agent-sandbox-router"
 	jwtAudience   = "agent-sandbox-envd"
+	// hopAudience is the data-plane hop from the managing Router to the cluster Router.
+	// EnvD rejects this audience, so a hop token cannot be replayed at a sandbox.
+	hopAudience   = "agent-sandbox-dataplane"
+	hopExpiration = time.Minute
 
 	// IdentitySecretName is the K8s Secret that stores the Router's RSA key pair.
 	IdentitySecretName = "envd-router-identity" //nolint:gosec // name reference, not credential
@@ -123,6 +127,38 @@ func (jm *JWTManager) GenerateToken(sessionID string) (string, error) {
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 	return token.SignedString(jm.privateKey)
+}
+
+// GenerateHopToken signs a short-lived token for one sandbox on one cluster.
+// The receiving Router checks the cluster claim and then signs its own EnvD token.
+func (jm *JWTManager) GenerateHopToken(sandboxID, cluster string) (string, error) {
+	if jm == nil || jm.privateKey == nil {
+		return "", fmt.Errorf("JWT private key is unavailable")
+	}
+	if sandboxID == "" || cluster == "" {
+		return "", fmt.Errorf("sandbox id and cluster are required")
+	}
+	if err := jm.privateKey.Validate(); err != nil {
+		return "", fmt.Errorf("invalid JWT private key: %w", err)
+	}
+	claims := jwt.MapClaims{
+		"iss":        jwtIssuer,
+		"aud":        hopAudience,
+		"iat":        time.Now().Unix(),
+		"exp":        time.Now().Add(hopExpiration).Unix(),
+		"sandbox_id": sandboxID,
+		"cluster":    cluster,
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	return token.SignedString(jm.privateKey)
+}
+
+// PublicKey returns the key a peer uses to verify tokens from this Router.
+func (jm *JWTManager) PublicKey() *rsa.PublicKey {
+	if jm == nil {
+		return nil
+	}
+	return jm.publicKey
 }
 
 // GetPublicKeyPEM returns the public key in PEM format (injected into EnvD env).

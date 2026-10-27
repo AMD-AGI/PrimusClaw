@@ -61,6 +61,8 @@ type RunningUpdate struct {
 	SandboxName string
 	Namespace   string
 	NodeName    string
+	// Cluster is the SaFE cluster id from the Workload. Empty leaves the stored value unchanged.
+	Cluster string
 }
 
 // Snapshot returns the grant fields needed to authorize a create.
@@ -123,6 +125,9 @@ func (s *Service) MarkRunning(ctx context.Context, grantID, sandboxID string, up
 		}
 		if up.NodeName != "" {
 			ref.NodeName = up.NodeName
+		}
+		if up.Cluster != "" {
+			ref.Cluster = up.Cluster
 		}
 		g.Status.Sandboxes[idx] = ref
 		return nil

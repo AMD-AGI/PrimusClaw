@@ -79,6 +79,8 @@ type Server struct {
 	jwt            *JWTManager
 	safeClient     *safe.Client // SaFE API Key verification client (nil when auth disabled)
 	grants         *grant.Service
+	// dp is the cross-cluster data-plane hop. Empty routes keep every sandbox local.
+	dp dataPlane
 
 	// Readiness edge tracking, so the log records transitions rather than every
 	// probe. Guarded because readiness is served concurrently.
@@ -237,6 +239,10 @@ func (s *Server) setupRoutes() {
 	grants.GET("/:grantId", s.proxyToWM)
 	grants.DELETE("/:grantId", s.proxyToWM)
 	grants.PATCH("/:grantId", s.proxyToWM)
+
+	// Data-plane hop from the managing cluster. The caller is another Router,
+	// authenticated by a hop token, not by an E2B access token.
+	s.engine.Any("/internal/v1/dataplane/:sandboxID/*proxyPath", s.handleDataPlaneHop)
 
 	// E2B control plane. Outside /v1 so SaFE auth does not replace X-API-KEY.
 	// Workload Manager resolves the key. A missing key is rejected here.

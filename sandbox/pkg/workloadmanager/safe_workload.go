@@ -32,6 +32,7 @@ const (
 	safeUserIDLabel          = "primus-safe.user.id"
 	safeUserNameAnnotation   = "primus-safe.user.name"
 	safeWorkloadIDLabel      = "primus-safe.workload.id"
+	safeClusterIDLabel       = "primus-safe.cluster.id"
 	sessionIDLabel           = "primus-claw/session-id"
 	workloadEphemeralStorage = "50Gi"
 	workloadPriority         = int64(2)
@@ -55,6 +56,24 @@ var workloadPollInterval = time.Second
 type SafeWorkloadCreator struct {
 	dynamic dynamic.Interface
 	client  ctrlclient.Client
+	// remoteClusters are SaFE cluster ids whose pods this control plane cannot address.
+	// A Running Workload in one of them is ready without a pod IP.
+	remoteClusters map[string]struct{}
+}
+
+// SetRemoteClusters records SaFE cluster ids that are reached through another Router.
+// Create treats a Running Workload in one of those clusters as ready.
+func (c *SafeWorkloadCreator) SetRemoteClusters(ids []string) {
+	if c == nil {
+		return
+	}
+	remote := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id != "" {
+			remote[id] = struct{}{}
+		}
+	}
+	c.remoteClusters = remote
 }
 
 // NewSafeWorkloadCreator uses the dynamic client for Workloads and the controller client for templates and pods.
@@ -62,8 +81,9 @@ func NewSafeWorkloadCreator(dyn dynamic.Interface, client ctrlclient.Client) *Sa
 	return &SafeWorkloadCreator{dynamic: dyn, client: client}
 }
 
-// Create writes one Sandbox Workload from the CodeInterpreter and waits until it is Running
-// and a pod address is visible. It does not set entryPoints; the Sandbox template starts envd.
+// Create writes one Sandbox Workload from the CodeInterpreter and waits until it is Running.
+// A Workload in a remote cluster is ready at Running; this cluster also waits for a pod address.
+// It does not set entryPoints; the Sandbox template starts envd.
 func (c *SafeWorkloadCreator) Create(ctx context.Context, req e2b.CreateRequest) (*SandboxResult, error) {
 	if c == nil || c.dynamic == nil || c.client == nil {
 		return nil, fmt.Errorf("safe workload client is not configured")
@@ -91,15 +111,15 @@ func (c *SafeWorkloadCreator) Create(ctx context.Context, req e2b.CreateRequest)
 	}
 	name = created.GetName()
 	var (
-		podIP, nodeName string
-		waitErr         error
+		podIP, nodeName, cluster string
+		waitErr                  error
 	)
 	defer func() {
 		if waitErr != nil {
 			_ = c.Delete(context.WithoutCancel(ctx), name)
 		}
 	}()
-	podIP, nodeName, waitErr = c.waitRunning(ctx, name, req.Workspace)
+	podIP, nodeName, cluster, waitErr = c.waitRunning(ctx, name, req.Workspace)
 	if waitErr != nil {
 		return nil, waitErr
 	}
@@ -109,6 +129,7 @@ func (c *SafeWorkloadCreator) Create(ctx context.Context, req e2b.CreateRequest)
 		PodIP:                podIP,
 		PodPort:              envdPort,
 		NodeName:             nodeName,
+		Cluster:              cluster,
 		Kind:                 store.WorkloadKind,
 		MaxSessionDuration:   req.Timeout,
 		RuntimePolicy:        ci.Spec.RuntimePolicy,
@@ -213,18 +234,24 @@ func (c *SafeWorkloadCreator) Delete(ctx context.Context, name string) error {
 	return err
 }
 
-func (c *SafeWorkloadCreator) waitRunning(ctx context.Context, name, workspace string) (string, string, error) {
-	var podIP, nodeName string
+func (c *SafeWorkloadCreator) waitRunning(ctx context.Context, name, workspace string) (string, string, string, error) {
+	var podIP, nodeName, cluster string
 	err := wait.PollUntilContextCancel(ctx, workloadPollInterval, true, func(ctx context.Context) (bool, error) {
 		obj, err := c.dynamic.Resource(workloadGVR).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
+		cluster = obj.GetLabels()[safeClusterIDLabel]
 		phase, _, _ := unstructured.NestedString(obj.Object, "status", "phase")
 		switch phase {
 		case "Failed", "Succeeded", "Stopped":
 			return false, fmt.Errorf("workload %s phase %s", name, phase)
 		case "Running":
+			if _, remote := c.remoteClusters[cluster]; remote && cluster != "" {
+				podIP = ""
+				nodeName = nodeFromUsage(obj)
+				return true, nil
+			}
 			ip, node, ok := c.address(ctx, obj, workspace, name)
 			if !ok {
 				return false, nil
@@ -236,9 +263,28 @@ func (c *SafeWorkloadCreator) waitRunning(ctx context.Context, name, workspace s
 		}
 	})
 	if err != nil {
-		return "", "", err
+		return "", "", cluster, err
 	}
-	return podIP, nodeName, nil
+	return podIP, nodeName, cluster, nil
+}
+
+// nodeFromUsage reads the first admin node recorded on an offloaded Workload.
+func nodeFromUsage(obj *unstructured.Unstructured) string {
+	usage, found, err := unstructured.NestedSlice(obj.Object, "status", "nodeUsage")
+	if err != nil || !found {
+		return ""
+	}
+	for _, item := range usage {
+		raw, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		node, _, _ := unstructured.NestedString(raw, "node")
+		if node != "" {
+			return node
+		}
+	}
+	return ""
 }
 
 // address reads the pod IP from workload status, then from a pod labeled with the workload id.

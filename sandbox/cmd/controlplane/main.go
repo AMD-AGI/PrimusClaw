@@ -422,6 +422,22 @@ func main() {
 			Namespace: grant.Namespace(wmCfg.Namespace),
 		}))
 	}
+	if err := routerServer.ConfigureDataPlane(
+		os.Getenv(router.EnvClusterID),
+		os.Getenv(router.EnvClusterRoutes),
+		os.Getenv(router.EnvUpstreamPublicKey),
+		workloadmanager.NewPodAddressFinder(mgr.GetClient()).PodAddress,
+	); err != nil {
+		log.Error("dataplane route config failed", "error", err)
+		os.Exit(1)
+	}
+	if routes, err := router.ParseClusterRoutes(os.Getenv(router.EnvClusterRoutes)); err == nil {
+		ids := make([]string, 0, len(routes))
+		for id := range routes {
+			ids = append(ids, id)
+		}
+		workloads.SetRemoteClusters(ids)
+	}
 
 	// Sandbox health watcher — exposes pod health as Prometheus metrics
 	watcherCfg := workloadmanager.DefaultWatcherConfig()

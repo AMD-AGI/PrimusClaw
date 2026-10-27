@@ -38,6 +38,8 @@ type CreateResult struct {
 	PodIP       string
 	PodPort     int
 	NodeName    string
+	// Cluster is the SaFE cluster id copied from the Workload, when known.
+	Cluster string
 }
 
 // Runner creates and deletes sandboxes. It must not inject a platform inference key.
