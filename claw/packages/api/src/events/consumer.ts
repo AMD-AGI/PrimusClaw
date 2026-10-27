@@ -24,7 +24,8 @@ import {
 } from "../marketplace/skill-service.js";
 import { enqueueEvolutionJob } from "../marketplace/evolve-worker.js";
 import { callMemoryLLM } from "../llm/client.js";
-import { CLAW_MEMORY_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
+import { CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
+import { recordRunFinished } from "../notifications/outbox.js";
 import {
   markChatRunRunning, closeChatRun, gateOwnershipEnforced, queuedMessageId,
   retireDispatchReconcileForReport,
@@ -762,6 +763,8 @@ async function handleComplete(
   // that question. `closeChatRun` is safe to run first: with no message id it
   // only closes a row that is the single open one, so it cannot take a
   // concurrent run's row with it.
+  // Runs this completion ended, for the notification outbox below.
+  let endedRunIds: string[] = [];
   if (provenance !== "foreign") {
     const closed = await closeChatRun(
       sessionId,
@@ -770,6 +773,7 @@ async function handleComplete(
       failed ? String(failure_reason ?? "agent_error") : undefined,
       { taskId: provenance ?? undefined, runClaim: runClaimOf(event) },
     );
+    endedRunIds = closed.length ? closed : (provenance ? [provenance] : []);
     // A zero match classifies the event; it is not a yes/no gate. This
     // delivery may be its own redelivery, in which case every step below is
     // still owed and each is idempotent -- but it may equally be a report the
@@ -1074,6 +1078,22 @@ async function handleComplete(
       await enqueueEvolutionJob(sessionId, userId, event as Record<string, unknown>);
     } catch (err) {
       logger.error({ err, sessionId }, "evolve.enqueue_failed");
+    }
+  }
+
+  // 8. Notify subscribers that a run ended. Opt-in (flag and a subscription),
+  //    best-effort, and idempotent: the outbox row key is derived from the run,
+  //    so a redelivered completion records nothing new.
+  if (CLAW_NOTIFICATIONS_ENABLED && !interrupted && endedRunIds.length) {
+    try {
+      await recordRunFinished({
+        sessionId,
+        taskIds: endedRunIds,
+        outcome: failed ? "failed" : "completed",
+        failureReason: failed ? String(failure_reason ?? "agent_error") : undefined,
+      });
+    } catch (err) {
+      logger.error({ err, sessionId }, "notification.record_failed");
     }
   }
 

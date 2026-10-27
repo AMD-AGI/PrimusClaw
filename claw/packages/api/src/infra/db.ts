@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 import pg from "pg";
-import { APP_RUNS_ENABLED, DATABASE_URL, envInt } from "../config.js";
+import { APP_RUNS_ENABLED, CLAW_NOTIFICATIONS_ENABLED, DATABASE_URL, envInt } from "../config.js";
+import { ensureNotificationSchema } from "../notifications/schema.js";
 import pino from "pino";
 import {
   REQUIRED_SCHEMA,
@@ -2079,6 +2080,9 @@ export async function initDb(): Promise<void> {
         updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
+
+    // Off by default: a deployment that has not opted in gets no new tables.
+    if (CLAW_NOTIFICATIONS_ENABLED) await ensureNotificationSchema(client);
 
     await assertSchema(client);
     logger.info("db.migrated");
