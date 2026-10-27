@@ -14,7 +14,7 @@ import {
 } from "../marketplace/plugins.js";
 
 import { buildMessages } from "../sessions/context-builder.js";
-import { maybeExtractMemory, insertMemoryEntry, scanMemoryContent, maybeUpdateUserProfile } from "../memory/service.js";
+import { maybeExtractMemory, insertMemoryEntry, isMemoryActive, scanMemoryContent, maybeUpdateUserProfile } from "../memory/service.js";
 import {
   saveSkill, recordSkillFeedback,
   selectSkillsForTask,
@@ -874,8 +874,11 @@ async function handleComplete(
       const blocked = scanMemoryContent(mem.content);
       if (blocked) { logger.warn({ reason: blocked }, "memory.blocked"); continue; }
       try {
-        await insertMemoryEntry(userId, { ...mem, sourceSession: sessionId, sourceType: "explicit" });
-        explicitMemorySaved = true;
+        if (await insertMemoryEntry(userId, { ...mem, sourceSession: sessionId, sourceType: "explicit" })) {
+          explicitMemorySaved = true;
+        } else {
+          logger.warn({ sessionId }, "memory.write_skipped_user_opted_out");
+        }
       } catch (err) {
         logger.error({ err, sessionId }, "memory.save_failed");
       }
@@ -1242,6 +1245,7 @@ if (pending) {
     message_id: pendingMessageId,
     prompt: pending.content,
     history,
+    memory_enabled: await isMemoryActive(pendingUserId),
     user_id: pendingUserId,
     llm_api_key: typeof pending.llm_api_key === "string" ? pending.llm_api_key : "",
     platform_key: typeof pending.platform_key === "string" ? pending.platform_key : "",

@@ -4,6 +4,7 @@
 import { db } from "../infra/db.js";
 import { callMemoryLLM } from "../llm/client.js";
 import pino from "pino";
+import { CLAW_MEMORY_ENABLED } from "../config.js";
 
 const logger = pino({ name: "memory-service" });
 
@@ -22,6 +23,45 @@ export interface MemoryEntry {
   scope?: Record<string, string>;
   // Legacy slash-delimited form, e.g. "org:claw/user:abc". Still accepted.
   scopePath?: string;
+}
+
+// ===== Per-user opt-in =====
+
+/**
+ * Whether this user has opted in to long-term memory. Default is no: a user
+ * with no row is off. Deliberately not wrapped in a catch -- when the preference
+ * cannot be read, the caller must fail closed (nothing injected, nothing stored).
+ * This is the user's choice; CLAW_MEMORY_ENABLED stays the deployment-wide switch
+ * and both must be on for memory to be used.
+ */
+export async function getMemoryPreference(userId: string): Promise<boolean> {
+  const row = (await db.query(
+    "SELECT enabled FROM claw_user_memory_prefs WHERE user_id = $1", [userId],
+  )).rows[0];
+  return row?.enabled === true;
+}
+
+/**
+ * Whether memory writes will actually persist for this user: the deployment
+ * flag and the user's own preference. Sent to Brain so it can stop offering
+ * save_memory when the write would be dropped. A failed read counts as off.
+ */
+export async function isMemoryActive(userId: string): Promise<boolean> {
+  if (!CLAW_MEMORY_ENABLED) return false;
+  try {
+    return await getMemoryPreference(userId);
+  } catch (err) {
+    logger.error({ err, userId }, "memory.preference_read_failed");
+    return false;
+  }
+}
+
+export async function setMemoryPreference(userId: string, enabled: boolean): Promise<void> {
+  await db.query(`
+    INSERT INTO claw_user_memory_prefs (user_id, enabled, updated_at)
+    VALUES ($1, $2, NOW())
+    ON CONFLICT (user_id) DO UPDATE SET enabled = $2, updated_at = NOW()
+  `, [userId, enabled]);
 }
 
 // ===== CRUD =====
@@ -48,8 +88,14 @@ export async function getMemoryEntries(userId: string, limit = 30): Promise<any[
   `, [userId, limit])).rows;
 }
 
-export async function insertMemoryEntry(userId: string, entry: MemoryEntry): Promise<void> {
-  if (isRemote) return getStorageClient().insert(userId, entry);
+/**
+ * Store one memory. Returns false, writing nothing, when the user has not opted
+ * in. Every writer (explicit save, background extraction, manual add) passes
+ * through here, so this is the one place the preference is enforced on writes.
+ */
+export async function insertMemoryEntry(userId: string, entry: MemoryEntry): Promise<boolean> {
+  if (!(await getMemoryPreference(userId))) return false;
+  if (isRemote) { await getStorageClient().insert(userId, entry); return true; }
   const count = (await db.query(
     "SELECT COUNT(*) as cnt FROM claw_memory_entries WHERE user_id = $1 AND deleted_at IS NULL", [userId]
   )).rows[0].cnt;
@@ -70,6 +116,7 @@ export async function insertMemoryEntry(userId: string, entry: MemoryEntry): Pro
     VALUES ($1, $2, $3, $4, $5, $6)
   `, [userId, entry.category, entry.content, entry.importance,
       entry.sourceSession || null, entry.sourceType || "auto"]);
+  return true;
 }
 
 export async function deleteMemoryEntry(userId: string, entryId: number | string): Promise<boolean> {
@@ -129,6 +176,7 @@ export async function getProfileEntry(userId: string): Promise<string> {
 }
 
 async function upsertProfile(userId: string, content: string): Promise<void> {
+  if (!(await getMemoryPreference(userId))) return;
   if (isRemote) {
     await getStorageClient().upsertProfile(userId, content);
     return;
@@ -168,6 +216,7 @@ Rules:
 Return JSON: { "entries": [{ "category": "...", "content": "...", "importance": 0.8 }] }`;
 
 export async function maybeExtractMemory(sessionId: string, userId: string): Promise<void> {
+  if (!(await getMemoryPreference(userId))) return;
   const turnCount = (await db.query(
     "SELECT COUNT(*) as cnt FROM claw_conversation_turns WHERE session_id = $1", [sessionId]
   )).rows[0].cnt;

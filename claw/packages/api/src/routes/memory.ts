@@ -3,7 +3,7 @@
 
 import type { FastifyInstance } from "fastify";
 import { getUser } from "../auth/middleware.js";
-import { getMemoryEntries, insertMemoryEntry, updateMemoryEntry, deleteMemoryEntry, deleteAllMemories, scanMemoryContent, maybeUpdateUserProfile } from "../memory/service.js";
+import { getMemoryEntries, insertMemoryEntry, updateMemoryEntry, deleteMemoryEntry, deleteAllMemories, scanMemoryContent, maybeUpdateUserProfile, getMemoryPreference, setMemoryPreference } from "../memory/service.js";
 import { CLAW_MEMORY_ENABLED } from "../config.js";
 import pino from "pino";
 
@@ -35,6 +35,25 @@ export async function registerMemoryRoutes(app: FastifyInstance): Promise<void> 
     return userId;
   }
 
+  // Opt-in preference. Off by default; `available` says whether the deployment
+  // has memory at all (CLAW_MEMORY_ENABLED), so a UI can explain a dead toggle.
+  app.get<{ Params: { userId: string } }>("/v1/users/:userId/memory-settings", async (req, reply) => {
+    const userId = resolveUserId(req, reply);
+    if (!userId) return;
+    return { ok: true, data: { enabled: await getMemoryPreference(userId), available: CLAW_MEMORY_ENABLED } };
+  });
+
+  app.put<{ Params: { userId: string } }>("/v1/users/:userId/memory-settings", async (req, reply) => {
+    const userId = resolveUserId(req, reply);
+    if (!userId) return;
+    const enabled = (req.body as Record<string, unknown> | undefined)?.enabled;
+    if (typeof enabled !== "boolean") {
+      return reply.status(400).send({ ok: false, error: "enabled (boolean) required" });
+    }
+    await setMemoryPreference(userId, enabled);
+    return { ok: true, data: { enabled, available: CLAW_MEMORY_ENABLED } };
+  });
+
   app.get<{ Params: { userId: string } }>("/v1/users/:userId/memories", async (req, reply) => {
     const userId = resolveUserId(req, reply);
     if (!userId) return;
@@ -61,7 +80,10 @@ export async function registerMemoryRoutes(app: FastifyInstance): Promise<void> 
       return reply.status(400).send({ ok: false, error: blocked });
     }
 
-    await insertMemoryEntry(userId, { category, content, importance, sourceType: "manual" });
+    const stored = await insertMemoryEntry(userId, { category, content, importance, sourceType: "manual" });
+    if (!stored) {
+      return reply.status(409).send({ ok: false, error: "memory_disabled", message: "turn memory on before adding memories" });
+    }
     scheduleProfileRefresh(userId);
     return { ok: true };
   });
@@ -69,6 +91,12 @@ export async function registerMemoryRoutes(app: FastifyInstance): Promise<void> 
   app.put<{ Params: { userId: string; id: string } }>("/v1/users/:userId/memories/:id", async (req, reply) => {
     const userId = resolveUserId(req, reply);
     if (!userId) return;
+
+    // Editing writes memory content, so it needs the opt-in like any other write.
+    // Deleting stays allowed whatever the preference.
+    if (!(await getMemoryPreference(userId))) {
+      return reply.status(409).send({ ok: false, error: "memory_disabled", message: "turn memory on before editing memories" });
+    }
 
     const entryId = req.params.id;
     const body = req.body as Record<string, unknown>;
