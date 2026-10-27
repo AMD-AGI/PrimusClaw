@@ -30,7 +30,7 @@ import { safePreview } from "@claw/utils";
 import { HandsClient, isHandsNetworkError, isHandsToolTimeout, explainHandsError, handsNetworkErrorReason } from "../clients/hands.js";
 import { isSandboxTool } from "../tools/hands.js";
 import type { HookRunner } from "./hooks.js";
-import type { HitlController } from "./hitl.js";
+import { refusalMessage, type HitlController } from "./hitl.js";
 import { metrics } from "../infra/metrics.js";
 import { isTrackedRun, whileRecovering, whileWaiting, type WaitMode } from "../tasks/run-phase.js";
 import pino from "pino";
@@ -1837,11 +1837,13 @@ class AgentLoopRunner {
       // awaiting anything: parking around it would hand the slot back and take
       // it again on every tool call, admitting a run each time until the
       // resident ceiling stopped it.
-      const hitlResult = this.opts.hitl.willAsk(toolName)
+      const hitlResult = this.opts.hitl.willAsk(toolName, finalInput)
         ? await whileWaiting(this.runIdentityKeyFor("approval"), "approval", this.waitMode, decide)
         : await decide();
         if (hitlResult.action === "deny" || hitlResult.action === "skip") {
-          const reason = `Error: ${hitlResult.reason}`;
+          // One shared wording for MCP and bash: the model must be told the
+          // action was refused and not run, never left to read it as a failure.
+          const reason = refusalMessage(hitlResult);
         await this.onEvent({ type: "toolUsed", tool: toolName, actionId: toolId, status: "error", description: reason });
           resultByToolId.set(toolId, reason);
           return;

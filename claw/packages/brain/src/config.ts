@@ -1744,6 +1744,11 @@ export const HITL_ENABLED = envBool("HITL_ENABLED", false);
 export const HITL_AUTO_ALLOW = env("HITL_AUTO_ALLOW", "read,glob,grep,ls,todo_write,web_search,save_memory");
 export const HITL_DECISION_TIMEOUT_MS = envInt("HITL_DECISION_TIMEOUT_MS", 300_000);
 export const HITL_DECISION_DEFAULT = env("HITL_DECISION_DEFAULT", "allow");
+/**
+ * Deployment-wide bash approval rules, a JSON list (see agent/bash-approval.ts).
+ * Unset means none; set but unparsable holds every bash command.
+ */
+export const BASH_APPROVAL_RULES = process.env.BASH_APPROVAL_RULES;
 
 // --- Rules ---
 export const RULES_ENABLED = envBool("RULES_ENABLED", false);

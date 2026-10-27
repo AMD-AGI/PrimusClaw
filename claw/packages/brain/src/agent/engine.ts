@@ -15,6 +15,7 @@ import { loadRules } from "./rules.js";
 import { normalizeMcpConfigs } from "../clients/mcp-config.js";
 import { approvalPolicyFromMcp } from "./approval-policy.js";
 import { HitlController } from "./hitl.js";
+import { bashApprovalFromEnvValue, bashApprovalPolicyFrom } from "./bash-approval.js";
 import { DecisionDispatcher } from "../delivery/decision-dispatcher.js";
 import { connectPlatformMcp } from "../clients/mcp.js";
 import { buildPrompt, buildProgressiveSkillHint } from "./prompt.js";
@@ -31,6 +32,7 @@ import {
   ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY, OPENAI_BASE_URL, OPENAI_API_KEY, LLM_API_STYLE,
   DEFAULT_MODEL, MAX_TURNS,
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED,
+  BASH_APPROVAL_RULES,
   PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED,
 } from "../config.js";
 import { WebSearchService, WebFetchService, SimpleSessionCostTracker } from "../tools/web/index.js";
@@ -211,11 +213,21 @@ export class AgentEngine {
     // only when some server declares one: without a rule the loop gets no
     // controller and behaves exactly as before.
     const approval = approvalPolicyFromMcp(mergedMcp);
-    const decisions = approval.active && extras?.natsConnection
+    // Bash commands a rule holds, from plugin / marketplace tool configs and
+    // the deployment's BASH_APPROVAL_RULES. Same gate, same semantics.
+    const bashPolicy = bashApprovalPolicyFrom([
+      ...[...pluginLayer.bashApproval, ...resolved.bashApproval].map((value) => ({ source: "tool_config", value })),
+      { source: "BASH_APPROVAL_RULES", value: bashApprovalFromEnvValue(BASH_APPROVAL_RULES) },
+    ]);
+    const anyApproval = approval.active || bashPolicy.active;
+    const decisions = anyApproval && extras?.natsConnection
       ? new DecisionDispatcher(extras.natsConnection, sessionId)
       : null;
-    const hitl = approval.active
-      ? new HitlController(decisions, onEvent, { requireApproval: (t) => approval.requiresApproval(t) })
+    const hitl = anyApproval
+      ? new HitlController(decisions, onEvent, {
+          requireApproval: (t) => approval.requiresApproval(t),
+          requireApprovalFor: (t, input) => (t.toLowerCase() === "bash" ? bashPolicy.check(input.command) : null),
+        })
       : undefined;
 
     try {
