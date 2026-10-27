@@ -236,8 +236,16 @@ async function stageCached(toolId: number, name: string, version: string, apiKey
   const key = `${toolId}:${version}`;
   const hit = stagedIndex.get(key);
   if (hit && (version || Date.now() - hit.at < UNVERSIONED_TTL_MS)) {
-    const root = locateSkillRoot(hit.dir);
+    // The directory can vanish under the index (a tmp cleaner, an operator).
+    // That is a cache miss, not an error: drop the entry and stage again.
+    let root: string | null = null;
+    try { root = locateSkillRoot(hit.dir); } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
     if (root) return root;
+    stagedIndex.delete(key);
+    const i = stagedAll.indexOf(hit);
+    if (i >= 0) stagedAll.splice(i, 1);
   }
   gcStaged();
   fs.mkdirSync(cacheRoot(), { recursive: true });

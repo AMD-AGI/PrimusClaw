@@ -332,6 +332,19 @@ const RESERVED_ENV_NAMES: ReadonlySet<string> = new Set(Object.values(APP_PLATFO
  */
 const RESERVED_ENV_PREFIXES = ["E2B_", "AWS_", "HYPERLOOM_MN_EXT_", "INFERENCE_OPTIMIZER_"] as const;
 
+/** RFC 7230 `token`: what a header name may be made of. */
+const HTTP_HEADER_TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+
+/**
+ * Headers the platform sets on a request to the application's MCP, or that the
+ * transport owns. The MCP token's header may not shadow one of them: the config's
+ * `headers` are applied over `Authorization` and `x-session-id`.
+ */
+const RESERVED_MCP_HEADERS: ReadonlySet<string> = new Set([
+  "authorization", "x-session-id", "x-internal-token", "x-hands-token", "mcp-session-id",
+  "host", "content-type", "content-length", "accept", "connection", "transfer-encoding", "upgrade", "cookie",
+]);
+
 /**
  * True when a manifest may not set or map this variable: the platform owns it.
  * One source with user env: everything `USER_ENV_DENY_LIST` (the linker, shell and
@@ -500,6 +513,12 @@ export function validateAppManifest(value: unknown): AppManifestIssue[] {
   }
   const mcp = obj(value.mcp);
   if (typeof mcp.path === "string" && !mcp.path.startsWith("/")) bad("mcp.path", 'must start with "/"');
+  if (typeof mcp.token_header === "string") {
+    if (!HTTP_HEADER_TOKEN.test(mcp.token_header)) bad("mcp.token_header", "must be an HTTP header name (RFC 7230 token)");
+    else if (RESERVED_MCP_HEADERS.has(mcp.token_header.toLowerCase())) {
+      bad("mcp.token_header", "must not be a header the platform sets on the request");
+    }
+  }
 
   // Restart needs a backoff to apply.
   const restart = obj(value.restart);

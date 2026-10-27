@@ -193,6 +193,13 @@ export const SANDBOX_HANDS_VIA_ROUTER = envBool("SANDBOX_HANDS_VIA_ROUTER", fals
 export function handsBehindRouterProxy(): boolean {
   return SANDBOX_HANDS_VIA_ROUTER && /[^\s,]/.test(SANDBOX_ROUTER_URL);
 }
+/**
+ * Whether the sandbox Router runs with `--enable-auth`. It decides what an
+ * application's session-level MCP carries as `token`: with auth on, the
+ * `<SAFE_API_KEY>` placeholder (the Router authenticates the session owner);
+ * with auth off, the run's MCP token. Must match the API's setting.
+ */
+export const SANDBOX_ROUTER_AUTH_ENABLED = envBool("SANDBOX_ROUTER_AUTH_ENABLED", false);
 export const SANDBOX_NAMESPACE = env("SANDBOX_NAMESPACE", "default");
 export const SANDBOX_CLUSTER_ID = env("SANDBOX_CLUSTER_ID");
 

@@ -372,6 +372,12 @@ export interface ExecuteRequest {
   // ── mode=llm payload ──────────────────────────────────────────────────
   prompt?: string;
   history?: Message[];
+  /**
+   * Whether long-term memory is active for this user (deployment flag AND the
+   * user's own preference). `false` means Brain must not offer save_memory.
+   * Absent means an API that predates the field: the tool stays offered.
+   */
+  memory_enabled?: boolean;
   system_append?: string;
   rules_text?: string;
   model?: string;

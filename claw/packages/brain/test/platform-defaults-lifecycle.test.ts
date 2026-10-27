@@ -137,3 +137,19 @@ test("a defaults file with more than the supported number of skills is refused",
   fs.utimesSync(f, new Date(), new Date(Date.now() + 5000));
   assert.equal(loadPlatformDefaults(f)?.skills.length, 50);
 });
+
+test("a cache hit whose staged directory is gone is a miss: it re-stages instead of throwing", async () => {
+  world.setTools([{ id: 11, name: "fleet-ops", version: "v1", zip: skillZip("fleet-ops", "B", "d") }]);
+  const [a] = await resolveDefaultSkills(defs(), "ak", onEvent as never);
+  fs.rmSync(a.localDir, { recursive: true, force: true });
+  const [b] = await resolveDefaultSkills(defs(), "ak", onEvent as never);
+  assert.ok(b, "the default is still mounted");
+  assert.ok(fs.existsSync(b.localDir));
+  assert.equal(world.downloads.length, 2, "it downloaded again");
+  assert.equal(events.filter((e) => e.status === "error").length, 0);
+  // and the lazy restage path survives the same loss
+  fs.rmSync(b.localDir, { recursive: true, force: true });
+  const h = fakeHands();
+  await new LazyDefaultSkills([b], onEvent as never).ensure(h as never, ".skills/fleet-ops");
+  assert.equal(writePaths(h).length, 2);
+});

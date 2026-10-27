@@ -259,6 +259,7 @@ export class AgentEngine {
         // (empty llm_api_key) still authenticates sub-agent calls.
       }, resolveRequestLlmKey(request) || request.platform_key || "", sandbox);
       router.lazySkillWriter = lazySkills;
+      router.memoryEnabled = request.memory_enabled !== false;
       const allToolSchemas = [...router.getToolSchemas(), ...mcpResult.schemas];
 
       const messages = [...(request.history || [])];
