@@ -51,6 +51,17 @@ export class CompletionLockLost extends Error {
   }
 }
 
+async function isSandboxOnlyRun(sessionId: string, messageId: string): Promise<boolean> {
+  const r = await db.query(
+    `SELECT 1 FROM claw_tasks
+      WHERE session_id = $1 AND metadata->>'message_id' = $2
+        AND input->>'sandbox_only' = 'true'
+      LIMIT 1`,
+    [sessionId, messageId],
+  );
+  return (r.rows?.length ?? 0) > 0;
+}
+
 export async function recordCompletionTurns(
   sessionId: string,
   event: Record<string, unknown>,
@@ -59,6 +70,14 @@ export async function recordCompletionTurns(
 ): Promise<void> {
   const { final_text, failed, prompt, interrupted, failure_reason } = event as any;
   if (!final_text && !interrupted && !failed) return;
+  // A sandbox-only run (see `DispatchInput.sandboxOnly`) is not a conversation
+  // turn on any outcome: a failure or a Stop would otherwise write a user turn
+  // carrying the synthetic prompt and an assistant turn "[Task failed: ...]",
+  // and the next real message would hand both to the model as history. Read
+  // from the run row, not from the event, so the placeholder a sweeper writes
+  // for a reaped run is covered as well. A row that cannot be read is not a
+  // sandbox-only run: the read throws, and the redelivery redoes it.
+  if (messageId && await isSandboxOnlyRun(sessionId, messageId)) return;
   // Thrown, not returned. A plain return is indistinguishable from "saved",
   // and the caller goes on to dispatch the next queued message with a history
   // this turn is missing from -- a payload no later write can correct, because

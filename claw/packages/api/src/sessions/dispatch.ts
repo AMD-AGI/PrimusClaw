@@ -336,6 +336,9 @@ export async function dispatchTaskToBrain(
       // then has nothing to run: the run ends with the sandbox up and parked.
       task.mode = "script";
       task.script = [];
+      // Persisted on the run row (`claw_tasks.input`), which is how the
+      // completion writer recognises the run whatever way it ends.
+      task.sandbox_only = true;
     }
     const sessionMeta = (await db.query(
       "SELECT parent_session_id, team_role FROM claw_sessions WHERE session_id = $1",

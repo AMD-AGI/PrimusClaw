@@ -129,6 +129,9 @@ test("the creator starts a sandbox: one sandbox-only run, no transcript entry, c
   assert.equal(published.length, 1);
   assert.equal(published[0].mode, "script");
   assert.deepEqual(published[0].script, []);
+  assert.equal(published[0].sandbox_only, true, "the completion writer recognises the run by this flag");
+  const row = await h.sql("SELECT input FROM claw_tasks WHERE session_id = 's1'");
+  assert.equal((row[0].input as Record<string, unknown>).sandbox_only, true, "and finds it on the run row");
   assert.deepEqual(claims, ["s1"]);
   const events = await h.sql("SELECT event FROM claw_session_events WHERE session_id = 's1'");
   assert.equal(events.length, 0, "a sandbox start is not a conversation turn");
