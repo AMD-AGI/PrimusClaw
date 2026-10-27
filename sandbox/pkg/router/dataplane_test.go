@@ -205,6 +205,52 @@ func TestSealedDenyDoesNotForward(t *testing.T) {
 	}
 }
 
+func TestDataPlaneEnvDPathReachesEnvD(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	globalJWT := mustJWT(t)
+	var gotPath, gotSealed string
+	envd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotSealed = r.Header.Get("X-Sandbox-Sealed")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer envd.Close()
+	crusoe := &Server{store: store.NewMemoryStore(), jwt: mustJWT(t)}
+	crusoe.engine = gin.New()
+	crusoe.engine.Any("/files", crusoe.handleLocalEnvD)
+	crusoe.engine.Any("/process.Process/*path", crusoe.handleLocalEnvD)
+	if err := crusoe.ConfigureDataPlane("crusoe", "", string(mustPEM(t, globalJWT)), func(ctx context.Context, sandboxID string) (string, int, error) {
+		return envdHost(t, envd), envdPort(t, envd), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	token, err := globalJWT.generateHopToken("sbx-1", "crusoe", true, []string{"/in"}, []string{"/out"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	front := httptest.NewServer(crusoe.engine)
+	defer front.Close()
+	for _, path := range []string{"/files?path=/out/a", "/process.Process/Start"} {
+		req, err := http.NewRequest(http.MethodPost, front.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := front.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent || strings.Contains(string(body), "page not found") {
+			t.Fatalf("%s status=%d body=%s", path, resp.StatusCode, body)
+		}
+	}
+	if gotPath != "/process.Process/Start" || gotSealed != "true" {
+		t.Fatalf("path=%s sealed=%s", gotPath, gotSealed)
+	}
+}
+
 func grantServer(t *testing.T, token, cluster string, sealed bool) *Server {
 	t.Helper()
 	scheme := runtime.NewScheme()

@@ -32,10 +32,11 @@ func TestConnectStartFilesAndSignal(t *testing.T) {
 	}
 
 	wrote := postRaw(t, srv.URL+"/files?path=/out/a.txt", "text/plain", []byte("hi"))
-	if wrote.StatusCode != http.StatusOK {
-		t.Fatalf("upload %d", wrote.StatusCode)
-	}
+	wroteBody, _ := io.ReadAll(wrote.Body)
 	_ = wrote.Body.Close()
+	if wrote.StatusCode != http.StatusOK || !strings.Contains(string(wroteBody), `"name":"a.txt"`) || !strings.HasPrefix(strings.TrimSpace(string(wroteBody)), "[") {
+		t.Fatalf("upload %d %s", wrote.StatusCode, wroteBody)
+	}
 	got := getRaw(t, srv.URL+"/files?path=/out/a.txt")
 	if got != "hi" {
 		t.Fatalf("download %q", got)

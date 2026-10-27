@@ -108,12 +108,13 @@ func (s *Server) forwardTarget(cluster string) (string, bool) {
 
 // forwardDataPlane sends an already-authorized data-plane request to the cluster Router.
 // The E2B credentials are removed. The hop token is the only credential on the next hop.
-func (s *Server) forwardDataPlane(c *gin.Context, sandboxID, base, cluster string) {
+func (s *Server) forwardDataPlane(c *gin.Context, sandboxID, base string, ref runtimev1alpha1.GrantSandboxRef) {
 	if s.jwt == nil {
 		writeGate(c, http.StatusServiceUnavailable, "sandbox_unavailable", "sandbox authentication unavailable")
 		return
 	}
-	token, err := s.jwt.GenerateHopToken(sandboxID, cluster)
+	cluster := ref.Cluster
+	token, err := s.jwt.generateHopToken(sandboxID, cluster, ref.Sealed, ref.Inputs, ref.Outputs)
 	if err != nil {
 		log.Error("dataplane: failed to sign hop token", "error", err, "sandbox", sandboxID, "cluster", cluster)
 		writeGate(c, http.StatusServiceUnavailable, "sandbox_unavailable", "sandbox authentication unavailable")
@@ -170,7 +171,8 @@ func (s *Server) handleDataPlaneHop(c *gin.Context) {
 		return
 	}
 	raw := bearerToken(c.GetHeader("Authorization"))
-	if err := verifyHopToken(s.dp.upstream, raw, sandboxID, s.dp.clusterID); err != nil {
+	ref, err := verifyHopToken(s.dp.upstream, raw, sandboxID, s.dp.clusterID)
+	if err != nil {
 		writeGate(c, http.StatusUnauthorized, "invalid_token", "hop token is not valid for this cluster")
 		return
 	}
@@ -190,7 +192,47 @@ func (s *Server) handleDataPlaneHop(c *gin.Context) {
 		c.Request.RequestURI += "?" + c.Request.URL.RawQuery
 	}
 	c.Request.Header.Set("E2b-Sandbox-Id", sandboxID)
-	s.proxyEnvD(c, info, runtimev1alpha1.GrantSandboxRef{})
+	s.proxyEnvD(c, info, ref)
+}
+
+// handleLocalEnvD proxies an envd path that reached this Router without the hop prefix.
+// The hop token still names the sandbox. A missing token is not a data-plane call.
+func (s *Server) handleLocalEnvD(c *gin.Context) {
+	if s.dp.upstream == nil || s.dp.clusterID == "" {
+		writeGate(c, http.StatusNotFound, "sandbox_not_found", "dataplane hop is not configured")
+		return
+	}
+	raw := bearerToken(c.GetHeader("Authorization"))
+	ref, err := verifyHopToken(s.dp.upstream, raw, "", s.dp.clusterID)
+	if err != nil || ref.ID == "" {
+		writeGate(c, http.StatusUnauthorized, "invalid_token", "hop token is not valid for this cluster")
+		return
+	}
+	info, err := s.localSandbox(c.Request.Context(), ref.ID)
+	if err != nil || info == nil || info.PodIP == "" {
+		writeGate(c, http.StatusBadGateway, "sandbox_unavailable", ref.ID)
+		return
+	}
+	c.Request.Header.Set("E2b-Sandbox-Id", ref.ID)
+	s.proxyEnvD(c, info, ref)
+}
+
+// envdProxyPath strips a hop prefix so envd sees /files or /process.Process/Start.
+func envdProxyPath(path string) string {
+	const marker = "/internal/v1/dataplane/"
+	i := strings.Index(path, marker)
+	if i < 0 {
+		if path == "" {
+			return "/"
+		}
+		return path
+	}
+	rest := path[i+len(marker):]
+	slash := strings.Index(rest, "/")
+	if slash < 0 {
+		return "/"
+	}
+	return rest[slash:]
 }
 
 // localSandbox finds the envd address in this cluster.
@@ -224,9 +266,11 @@ func bearerToken(header string) string {
 }
 
 // verifyHopToken checks the managing Router's signature, audience, sandbox id, and cluster.
-func verifyHopToken(pub *rsa.PublicKey, raw, sandboxID, cluster string) error {
+// An empty sandboxID accepts the id carried in the token, which is how an envd
+// path with no id in the URL is routed.
+func verifyHopToken(pub *rsa.PublicKey, raw, sandboxID, cluster string) (runtimev1alpha1.GrantSandboxRef, error) {
 	if pub == nil || raw == "" {
-		return errors.New("missing hop token")
+		return runtimev1alpha1.GrantSandboxRef{}, errors.New("missing hop token")
 	}
 	token, err := jwt.Parse(raw, func(token *jwt.Token) (interface{}, error) {
 		return pub, nil
@@ -239,16 +283,30 @@ func verifyHopToken(pub *rsa.PublicKey, raw, sandboxID, cluster string) error {
 		jwt.WithLeeway(5*time.Second),
 	)
 	if err != nil || !token.Valid {
-		return errors.New("invalid hop token")
+		return runtimev1alpha1.GrantSandboxRef{}, errors.New("invalid hop token")
 	}
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok {
-		return errors.New("invalid hop token")
+		return runtimev1alpha1.GrantSandboxRef{}, errors.New("invalid hop token")
 	}
 	gotSandbox, _ := claims["sandbox_id"].(string)
 	gotCluster, _ := claims["cluster"].(string)
-	if gotSandbox != sandboxID || gotCluster != cluster {
-		return errors.New("hop token does not match this sandbox")
+	if gotSandbox == "" || gotCluster != cluster || (sandboxID != "" && gotSandbox != sandboxID) {
+		return runtimev1alpha1.GrantSandboxRef{}, errors.New("hop token does not match this sandbox")
 	}
-	return nil
+	ref := runtimev1alpha1.GrantSandboxRef{ID: gotSandbox}
+	if sealed, _ := claims["sealed"].(bool); sealed {
+		ref.Sealed = true
+		ref.Inputs = splitClaim(claims["inputs"])
+		ref.Outputs = splitClaim(claims["outputs"])
+	}
+	return ref, nil
+}
+
+func splitClaim(v any) []string {
+	s, _ := v.(string)
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, "\n")
 }

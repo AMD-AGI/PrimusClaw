@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -132,6 +133,12 @@ func (jm *JWTManager) GenerateToken(sessionID string) (string, error) {
 // GenerateHopToken signs a short-lived token for one sandbox on one cluster.
 // The receiving Router checks the cluster claim and then signs its own EnvD token.
 func (jm *JWTManager) GenerateHopToken(sandboxID, cluster string) (string, error) {
+	return jm.generateHopToken(sandboxID, cluster, false, nil, nil)
+}
+
+// generateHopToken signs a hop token. Sealed inputs and outputs travel in the
+// token so the cluster Router can set them. A client header cannot.
+func (jm *JWTManager) generateHopToken(sandboxID, cluster string, sealed bool, inputs, outputs []string) (string, error) {
 	if jm == nil || jm.privateKey == nil {
 		return "", fmt.Errorf("JWT private key is unavailable")
 	}
@@ -148,6 +155,11 @@ func (jm *JWTManager) GenerateHopToken(sandboxID, cluster string) (string, error
 		"exp":        time.Now().Add(hopExpiration).Unix(),
 		"sandbox_id": sandboxID,
 		"cluster":    cluster,
+	}
+	if sealed {
+		claims["sealed"] = true
+		claims["inputs"] = strings.Join(inputs, "\n")
+		claims["outputs"] = strings.Join(outputs, "\n")
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 	return token.SignedString(jm.privateKey)

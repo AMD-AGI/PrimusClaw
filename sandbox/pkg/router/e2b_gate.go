@@ -63,7 +63,7 @@ func (s *Server) e2bAccessGate(c *gin.Context) {
 		return
 	}
 	if base, ok := s.forwardTarget(ref.Cluster); ok {
-		s.forwardDataPlane(c, sandboxID, base, ref.Cluster)
+		s.forwardDataPlane(c, sandboxID, base, ref)
 		c.Abort()
 		return
 	}
@@ -112,6 +112,8 @@ func (s *Server) proxyEnvD(c *gin.Context, info *store.SandboxInfo, ref runtimev
 	proxy := &httputil.ReverseProxy{
 		FlushInterval: -1,
 		Director: func(req *http.Request) {
+			req.URL.Path = envdProxyPath(req.URL.Path)
+			req.URL.RawPath = ""
 			req.URL.Scheme = target.Scheme
 			req.URL.Host = target.Host
 			req.Host = target.Host
