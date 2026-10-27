@@ -366,6 +366,17 @@ export const CLAW_MEMORY_ENABLED = envBool("CLAW_MEMORY_ENABLED", false);
 // recording, evolve worker, and skill-files cleanup are all short-circuited.
 export const CLAW_SKILL_EVOLUTION_ENABLED = envBool("CLAW_SKILL_EVOLUTION_ENABLED", false);
 
+// --- Outbound notifications (default OFF) ---
+// When false: no notification tables, routes, outbox writes or delivery loop.
+export const CLAW_NOTIFICATIONS_ENABLED = envBool("CLAW_NOTIFICATIONS_ENABLED", false);
+// Comma-separated hosts a subscription may name even though they resolve to a
+// private address (an in-cluster receiver). The only hosts where http is accepted.
+export const NOTIFY_WEBHOOK_ALLOWED_HOSTS = env("NOTIFY_WEBHOOK_ALLOWED_HOSTS");
+// A run that is not trigger-started is announced only once it ran this long.
+export const NOTIFY_MIN_RUN_SECONDS = envInt("NOTIFY_MIN_RUN_SECONDS", 60);
+// Prefix of the `link` field in a notification, relative to the web UI origin.
+export const NOTIFY_LINK_BASE = env("NOTIFY_LINK_BASE", "/primus-claw");
+
 /**
  * Accept `mode: "app"` on `POST /v1/sessions/:sessionId/tasks`. Off by default:
  * until the Brain side runs apps, an admitted app run is refused there as not
