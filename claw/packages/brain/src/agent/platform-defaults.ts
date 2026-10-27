@@ -371,13 +371,19 @@ export class LazyDefaultSkills {
   /** Names of default skills this writer manages. */
   get names(): string[] { return this.skills.map((s) => s.name); }
 
-  /** Write the skills `text` refers to (all pending ones if it names none). */
+  /**
+   * Write the skills `text` refers to (all pending ones if it names none).
+   * A call that names only skills already written has nothing to write: with a
+   * dozen plugin skills behind one writer, re-reading a file of a skill that is
+   * on disk must not upload the other eleven.
+   */
   async ensure(hands: HandsClient, text: string, coldSandbox = false): Promise<void> {
     if (hands !== this.lastHands) { this.written.clear(); this.lastHands = hands; }
     const pending = this.skills.filter((s) => !this.written.has(s.name));
     if (!pending.length) return;
     const named = pending.filter((s) => text.includes(s.name));
-    const todo = named.length ? named : pending;
+    const namesAWrittenSkill = this.skills.some((s) => this.written.has(s.name) && text.includes(s.name));
+    const todo = named.length ? named : namesAWrittenSkill ? [] : pending;
     const rel = this.sessionDir === "/workspace" ? "" : this.sessionDir.replace(/^\/workspace\/?/, "").replace(/^\/+/, "");
     for (const s of todo) {
       const t0 = Date.now();
