@@ -67,6 +67,13 @@ test("private, loopback and link-local addresses are recognised, mapped ones inc
   for (const a of ["8.8.8.8", "93.184.216.34", "2606:4700:4700::1111"]) assert.equal(isPrivateAddress(a), false, a);
 });
 
+test("the URL parser's hex form of a mapped private address is refused too", async () => {
+  // `new URL("https://[::ffff:127.0.0.1]/").hostname` is `[::ffff:7f00:1]`.
+  for (const u of ["https://[::ffff:127.0.0.1]/x", "https://[::ffff:7f00:1]/x", "https://[::ffff:a00:1]/x", "https://[64:ff9b::7f00:1]/x"]) {
+    assert.deepEqual(await guardWebhookUrl(u, new Set()), { ok: false, reason: "private_address" }, u);
+  }
+});
+
 test("only https to a public address passes; the operator's allow-list is the one exception", async () => {
   const pub = async () => [{ address: "93.184.216.34", family: 4 }];
   const priv = async () => [{ address: "10.0.0.7", family: 4 }];

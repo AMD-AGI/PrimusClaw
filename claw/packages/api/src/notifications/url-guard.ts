@@ -17,15 +17,21 @@
 import { lookup } from "node:dns/promises";
 import { BlockList, isIP } from "node:net";
 
-const BLOCKED = new BlockList();
+// Two lists, because BlockList.check() on an IPv4 address also consults IPv6 rules,
+// and a ::ffff:0:0/96 rule would then match every IPv4 address.
+const BLOCKED_V4 = new BlockList();
+const BLOCKED_V6 = new BlockList();
 for (const [net, prefix] of [
   ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8],
   ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.168.0.0", 16],
   ["198.18.0.0", 15], ["224.0.0.0", 4], ["240.0.0.0", 4],
-] as const) BLOCKED.addSubnet(net, prefix, "ipv4");
+] as const) BLOCKED_V4.addSubnet(net, prefix, "ipv4");
 for (const [net, prefix] of [
   ["::", 128], ["::1", 128], ["fc00::", 7], ["fe80::", 10], ["ff00::", 8],
-] as const) BLOCKED.addSubnet(net, prefix, "ipv6");
+  // IPv4-mapped and NAT64: the URL parser rewrites ::ffff:127.0.0.1 as
+  // ::ffff:7f00:1, which no dotted-quad match sees, so the whole range is refused.
+  ["::ffff:0:0", 96], ["64:ff9b::", 96],
+] as const) BLOCKED_V6.addSubnet(net, prefix, "ipv6");
 
 /** IPv4-mapped IPv6 (`::ffff:a.b.c.d`) is judged by the IPv4 address inside it. */
 function unmapped(address: string): { address: string; family: "ipv4" | "ipv6" } {
@@ -36,7 +42,7 @@ function unmapped(address: string): { address: string; family: "ipv4" | "ipv6" }
 
 export function isPrivateAddress(address: string): boolean {
   const u = unmapped(address);
-  return BLOCKED.check(u.address, u.family);
+  return (u.family === "ipv4" ? BLOCKED_V4 : BLOCKED_V6).check(u.address, u.family);
 }
 
 export function parseAllowedHosts(raw: string): Set<string> {
