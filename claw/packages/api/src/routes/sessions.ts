@@ -8,7 +8,7 @@ import { singleflightCreate, type FlightResult } from "../shared/singleflight.js
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions/dispatch.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
-import { RUN_DOORBELL_DISPATCH } from "../config.js";
+import { RUN_DOORBELL_DISPATCH, SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
 import {
   forceIdleAfterInterrupt, releaseSessionGateForTurn, stopSessionRuns, takeSessionGate,
@@ -47,7 +47,7 @@ import { Upload } from "@aws-sdk/lib-storage";
 import { ZipArchive } from "archiver";
 import { Readable, PassThrough } from "node:stream";
 import pino from "pino"
-import { handsSessionKey } from "@claw/protocol";
+import { handsSessionKey, putTerminalHold } from "@claw/protocol";
 
 const logger = pino({ name: "sessions" });
 
@@ -1010,6 +1010,42 @@ function parseSessionEnv(
 // now lives in ../session-dispatch.js — shared with
 // routes/anthropic-managed-agents.ts. See that module for the implementation.
 
+/** Min gap between two accepted terminal keepalives of one session. */
+const SANDBOX_KEEPALIVE_MIN_GAP_MS = 10_000;
+const sandboxKeepaliveLastAt = new Map<string, number>();
+
+/**
+ * The two registry reads/writes the sandbox routes make, behind a seam: `kv` is
+ * a live binding the tests cannot substitute, and the routes' own behaviour
+ * (owner check, gate, dispatch, throttle) is what they exercise.
+ */
+export const sandboxStartPorts = {
+  /** Claim the session's sandbox for an open terminal. False when it could not be recorded. */
+  async claim(sessionId: string): Promise<boolean> {
+    try {
+      await putTerminalHold(kv, sessionId, SESSION_SANDBOX_HOLD_MS);
+      return true;
+    } catch (err) {
+      logger.warn({ sessionId, err: (err as Error)?.message }, "sandbox.terminal_claim_failed");
+      return false;
+    }
+  },
+  /** What the registry says about the session's sandbox; unreadable reads as not ready. */
+  async readBinding(sessionId: string): Promise<{ ready: boolean; workloadId: string | null }> {
+    try {
+      const entry = await kv.get(handsSessionKey(sessionId));
+      if (!entry || entry.operation === "DEL" || entry.operation === "PURGE" || entry.value.length === 0) {
+        return { ready: false, workloadId: null };
+      }
+      const info = JSON.parse(new TextDecoder().decode(entry.value)) as { status?: string; workloadId?: string };
+      const workloadId = typeof info.workloadId === "string" && info.workloadId ? info.workloadId : null;
+      return { ready: info.status === "ready" && workloadId !== null, workloadId };
+    } catch {
+      return { ready: false, workloadId: null };
+    }
+  },
+};
+
 export async function registerSessionRoutes(app: FastifyInstance): Promise<void> {
 
   // --- Create Session ---
@@ -1829,6 +1865,150 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       // above returns before this and carries no id on purpose: that message is
       // in `claw_pending_messages` and no run exists to name yet.
       run_id: dispatch.runId,
+    };
+  });
+
+  // --- Start the session's sandbox without a turn (creator-only) ---
+  //
+  // The terminal and file panels need a sandbox, and a sandbox is otherwise
+  // created lazily by the first tool call of a turn. Asking a person to prompt
+  // the agent just to open a shell is the thing this removes. It does not
+  // reimplement provisioning: it takes the session gate the way a message does
+  // and dispatches a sandbox-only run (see `DispatchInput.sandboxOnly`), so the
+  // sandbox is created or reused by the same code, with the same credentials
+  // and the same admission, as a turn's.
+  //
+  // Concurrency is the gate's. A turn, or an earlier call of this route, that
+  // is still holding the gate means a sandbox is already on its way: this call
+  // dispatches nothing, which is what keeps two callers from making two.
+  //
+  // It also claims the sandbox for the terminal (see `terminal-hold.ts`), up
+  // front, because the sandbox it starts is otherwise stopped when this very
+  // run ends.
+  app.post<{ Params: { id: string } }>("/v1/sessions/:id/sandbox", async (req, reply) => {
+    if (!SESSION_SANDBOX_START_ENABLED) {
+      return reply.status(404).send({ ok: false, error: "not found" });
+    }
+    const sessionId = req.params.id;
+    const user = getUser(req);
+    const userId = user?.userId ?? "default";
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    // The caller's own lookup found nothing, so a binding on record is stale.
+    const refresh = body.refresh === true;
+
+    const client = await db.pool.connect();
+    let dispatchUserEnv: Record<string, string> = {};
+    let turnMessageId: string | null = null;
+    try {
+      await client.query("BEGIN");
+      const lock = await client.query(
+        "SELECT agent_status, user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL FOR UPDATE",
+        [sessionId],
+      );
+      if (!lock.rows.length) {
+        await client.query("ROLLBACK");
+        return reply.status(404).send({ ok: false, error: "session not found" });
+      }
+      const row = lock.rows[0];
+      // Creator only, no operator override: this spends the creator's quota and
+      // credentials, which the admin read-access to sessions does not extend to.
+      if (!canAccessSession(row.user_id, userId)) {
+        await client.query("ROLLBACK");
+        return reply.status(403).send({ ok: false, error: "only the session creator can start its sandbox" });
+      }
+      const binding = await sandboxStartPorts.readBinding(sessionId);
+      const claimed = await sandboxStartPorts.claim(sessionId);
+      if (!claimed) {
+        await client.query("ROLLBACK");
+        return reply.status(503).send({ ok: false, error: "sandbox claim not recorded" });
+      }
+      if (row.agent_status === "running") {
+        // A turn (or an earlier start) holds the gate: a sandbox is, or will be,
+        // there if the turn wants one. Dispatching again is what would make two.
+        await client.query("ROLLBACK");
+        return { ok: true, session_id: sessionId, state: binding.ready ? "running" : "starting", workload_id: binding.workloadId };
+      }
+      if (binding.ready && !refresh) {
+        await client.query("ROLLBACK");
+        return { ok: true, session_id: sessionId, state: "running", workload_id: binding.workloadId };
+      }
+      dispatchUserEnv = await loadUserEnvSnapshot(client, userId, logger);
+      turnMessageId = newChatMessageId();
+      await takeSessionGate(sessionId, turnMessageId, client);
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
+
+    const messageId = turnMessageId as string;
+    const dispatch = await dispatchTaskToBrain(
+      {
+        sessionId, userId, user,
+        content: "[sandbox start]", messageType: "text", toolIds: [], pluginId: undefined,
+        requestImage: undefined, requestResource: undefined, requestTimeout: undefined, topology: undefined,
+        workspaceId: undefined, mcpServers: undefined,
+        capturedUserEnvSnapshot: dispatchUserEnv,
+        capturedSessionEnv: {},
+        messageId,
+        sandboxOnly: true,
+      },
+      async () => { await releaseSessionGateForTurn(sessionId, messageId); },
+    );
+    if (dispatch.kind === "publish_failed" || dispatch.kind === "publish_unknown") {
+      return reply.status(503).send({ ok: false, error: "task dispatch failed", detail: dispatch.error?.message });
+    }
+    if (dispatch.kind === "rejected") {
+      return reply.status(429).send({ ok: false, error: "admission_rejected", reason: dispatch.reason });
+    }
+    const binding = await sandboxStartPorts.readBinding(sessionId);
+    return reply.status(202).send({
+      ok: true, session_id: sessionId, state: "starting", workload_id: binding.workloadId,
+      message_id: dispatch.messageId, run_id: dispatch.runId,
+    });
+  });
+
+  // --- Keep the sandbox for an open terminal (creator-only) ---
+  //
+  // A shell in the browser is not on the jobs roster that idle reclaim reads, so
+  // without this the sandbox is reclaimed under an open terminal. The panel
+  // calls it on a timer while it is open; a panel that goes away stops calling
+  // and the claim lapses by itself.
+  app.post<{ Params: { id: string } }>("/v1/sessions/:id/sandbox/keepalive", async (req, reply) => {
+    if (!SESSION_SANDBOX_START_ENABLED) {
+      return reply.status(404).send({ ok: false, error: "not found" });
+    }
+    const sessionId = req.params.id;
+    const userId = getUser(req)?.userId ?? "default";
+    const row = (await db.query(
+      "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
+      [sessionId],
+    )).rows[0];
+    if (!row) return reply.status(404).send({ ok: false, error: "session not found" });
+    if (!canAccessSession(row.user_id, userId)) {
+      return reply.status(403).send({ ok: false, error: "only the session creator can keep its sandbox" });
+    }
+    // Rate-limited per session, in this replica's memory: a limit that is
+    // slightly loose across replicas still bounds the write rate, and the
+    // claim itself is idempotent.
+    const nowMs = Date.now();
+    const last = sandboxKeepaliveLastAt.get(sessionId) ?? 0;
+    if (nowMs - last < SANDBOX_KEEPALIVE_MIN_GAP_MS) {
+      const binding = await sandboxStartPorts.readBinding(sessionId);
+      return { ok: true, session_id: sessionId, throttled: true, workload_id: binding.workloadId };
+    }
+    if (sandboxKeepaliveLastAt.size > 10_000) sandboxKeepaliveLastAt.clear();
+    sandboxKeepaliveLastAt.set(sessionId, nowMs);
+    if (!await sandboxStartPorts.claim(sessionId)) {
+      sandboxKeepaliveLastAt.delete(sessionId);
+      return reply.status(503).send({ ok: false, error: "sandbox claim not recorded" });
+    }
+    const binding = await sandboxStartPorts.readBinding(sessionId);
+    return {
+      ok: true, session_id: sessionId, throttled: false, workload_id: binding.workloadId,
+      hold_ms: SESSION_SANDBOX_HOLD_MS,
     };
   });
 

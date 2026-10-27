@@ -92,6 +92,14 @@ export interface DispatchInput {
    * either absent or well-formed.
    */
   topology?: EnvironmentTopology;
+  /**
+   * Run the dispatch as a sandbox-only run: bring up (or reuse) the session's
+   * sandbox exactly as a turn would, then finish, with no model call and no
+   * message in the transcript. It rides the existing `mode: "script"` with an
+   * empty script, which Brain already provisions a sandbox for up front, so
+   * provisioning, reuse, credentials and admission are the turn's own.
+   */
+  sandboxOnly?: boolean;
 }
 
 /**
@@ -146,6 +154,7 @@ export async function dispatchTaskToBrain(
     requestImage, requestResource, requestTimeout, workspaceId,
     mcpServers, capturedUserEnvSnapshot, capturedSessionEnv, topology,
   } = input;
+  const sandboxOnly = input.sandboxOnly === true;
 
   const messageId = input.messageId ?? newChatMessageId();
   let subject = "";
@@ -226,17 +235,21 @@ export async function dispatchTaskToBrain(
     };
     // Synchronously persist UserMessage to DB so the SSE history segment
     // includes it even if the consumer hasn't yet subscribed.
-    await db.query(
-      "INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, $3, $4) ON CONFLICT (event_id, session_id) DO NOTHING",
-      [messageId, sessionId, "UserMessage", userEvent],
-    );
-    sessionDispatchPorts.publishSse(sessionId, JSON.stringify(userEvent));
+    // A sandbox-only run is not a conversation turn: nothing is added to the
+    // transcript, and so nothing is handed to the model as history later.
+    if (!sandboxOnly) {
+      await db.query(
+        "INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, $3, $4) ON CONFLICT (event_id, session_id) DO NOTHING",
+        [messageId, sessionId, "UserMessage", userEvent],
+      );
+      sessionDispatchPorts.publishSse(sessionId, JSON.stringify(userEvent));
+    }
 
-    const history = await buildMessages(sessionId, content, userId);
+    const history = sandboxOnly ? [] : await buildMessages(sessionId, content, userId);
 
     let localSkills: Record<string, { content: string; enabled: boolean; version?: number; description?: string; files?: Array<{ path: string; content: string; is_binary?: boolean }> }> = {};
     try {
-      const activeSkills = await selectSkillsForTask(userId, content);
+      const activeSkills = sandboxOnly ? {} : await selectSkillsForTask(userId, content);
       for (const [name, bundle] of Object.entries(activeSkills)) {
         localSkills[name] = {
           content: bundle.content,
@@ -317,6 +330,12 @@ export async function dispatchTaskToBrain(
     };
     if (pluginTools !== undefined) {
       task.plugin_tools = pluginTools;
+    }
+    if (sandboxOnly) {
+      // Brain opens the sandbox up front for script mode and the empty script
+      // then has nothing to run: the run ends with the sandbox up and parked.
+      task.mode = "script";
+      task.script = [];
     }
     const sessionMeta = (await db.query(
       "SELECT parent_session_id, team_role FROM claw_sessions WHERE session_id = $1",

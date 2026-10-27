@@ -4,7 +4,7 @@
 import { randomBytes } from "node:crypto";
 import { StringCodec, type KV } from "nats";
 import { isRevisionConflict } from "@claw/utils";
-import { applyRunEndedIdleFields, type RunEndedParkResult } from "@claw/protocol";
+import { applyRunEndedIdleFields, readTerminalHold, type RunEndedParkResult } from "@claw/protocol";
 // The verdict rules are imported, never restated. `usableSharedVerdict` is read
 // here and by the API's orphan-handle sweep, which must not stop a sandbox this
 // file is still holding for background work; one definition is what keeps the
@@ -590,6 +590,23 @@ async function confirmReclaim(
   reading?: ObservedReading,
 ): Promise<boolean> {
   const now = (deps.now ?? Date.now)();
+  // A terminal the owner has open is a use of the sandbox that no jobs roster
+  // shows. Only idleness is held back: a replaced or dead instance is not
+  // something a person's terminal can make worth keeping. The claim lapses on
+  // its own (see `terminal-hold.ts`), so this is bounded by the panel that
+  // renews it, and an unreadable claim holds for the same reason an unreadable
+  // reclaim hold does.
+  if (reason === "idle_empty") {
+    const term = await readTerminalHold(deps.kv, sessionId, now);
+    if (term.state !== "none") {
+      metrics.onKeepaliveReclaimHeld(reason, "terminal_hold");
+      logger.info(
+        { sessionId, hold: term.state, ...(term.state === "held" ? { until: term.until } : {}) },
+        "keepalive.reclaim_held_terminal",
+      );
+      return false;
+    }
+  }
   // Through what this process has seen, too: a hold whose write was lost is
   // still a hold here (see LocalHold).
   info = withLocalHolds(identity, info, now);

@@ -200,6 +200,23 @@ export const BRAIN_REGISTRY_TTL_MS = envInt(
   DEFAULT_BRAIN_REGISTRY_TTL_MS,
 );
 
+// --- Starting a session's sandbox without a turn ---
+// `POST /v1/sessions/:id/sandbox` brings up (or reuses) the sandbox through the
+// same run path a turn uses, so it asks for nothing a turn would not and is on
+// by default; setting this false answers 404 as if the route did not exist,
+// which clients treat as "not available" and fall back from.
+export const SESSION_SANDBOX_START_ENABLED = envBool("SESSION_SANDBOX_START_ENABLED", true);
+// How long one start or keepalive claims the sandbox for an interactive
+// terminal. The claim lives in the registry bucket, whose entries are dropped
+// after BRAIN_REGISTRY_TTL_MS without a write, so a longer claim would be
+// forgotten early: the value is capped there, and renewing it is the client's
+// job while the terminal stays open. A client that goes away stops renewing and
+// the claim lapses on its own, after which ordinary idle reclaim applies.
+export const SESSION_SANDBOX_HOLD_MS = Math.min(
+  envInt("SESSION_SANDBOX_HOLD_SECONDS", 300, { min: 30 }) * 1000,
+  BRAIN_REGISTRY_TTL_MS,
+);
+
 // Replica counts for the KV buckets this process creates, read from the same
 // variables brain reads for the two it shares -- same reasoning as the TTL
 // above, and the same failure when they disagree.
