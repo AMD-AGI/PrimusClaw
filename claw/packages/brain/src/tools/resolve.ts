@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import AdmZip from "adm-zip";
 import pino from "pino";
-import { TOOLS_API_URL } from "../config.js";
+import { lookupTool, platformToolsBase } from "./lookup.js";
 import type { EventCallback } from "@claw/protocol";
 import type { HandsClient } from "../clients/hands.js";
 import { isSafeRelativePath, uploadDirToSandbox } from "../sandbox/write.js";
@@ -44,26 +44,18 @@ export async function resolveToolIds(
     await onEvent({ type: "toolUsed", tool: "resolve_tools", actionId: "resolve_tools_fetch", status: "running", brief: `Fetching tool configuration`, description: `Fetching configuration for ${toolIds.length} tools from the marketplace...` });
   }
 
-  let tools: Record<number, Record<string, unknown>> = {};
-  try {
-    const resp = await fetch(`${TOOLS_API_URL}?offset=0&limit=100&order=desc`, {
-      headers: { Authorization: `Bearer ${apiKey}` },
-    });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = (await resp.json()) as { data?: { tools?: Record<string, unknown>[] } };
-    for (const t of data.data?.tools ?? []) {
-      tools[t.id as number] = t;
-    }
-  } catch (err) {
-    logger.error({ err }, "resolve_tools.fetch_failed");
-    if (onEvent) {
-      await onEvent({ type: "toolUsed", tool: "resolve_tools", actionId: "resolve_tools_fetch", status: "error", brief: "Failed to fetch tool configuration" });
-    }
-    return { mcpServers, skillContents };
-  }
-
+  // Each id goes through the shared by-id lookup (same base URL and the same
+  // 404 classification as the platform-default skills), not a paged list.
+  const looked = await Promise.all(toolIds.map((tid) => lookupTool(tid, apiKey)));
+  const tools: Record<number, Record<string, unknown>> = {};
+  toolIds.forEach((tid, i) => {
+    const r = looked[i];
+    if (r.ok) tools[tid] = r.tool;
+    else logger.warn({ tid, reason: r.reason }, "resolve_tools.lookup_failed");
+  });
   if (onEvent) {
-    await onEvent({ type: "toolUsed", tool: "resolve_tools", actionId: "resolve_tools_fetch", status: "success", brief: "Fetched tool configuration" });
+    const failed = looked.filter((r) => !r.ok && (r.reason === "endpoint_unreachable" || r.reason === "lookup")).length;
+    await onEvent({ type: "toolUsed", tool: "resolve_tools", actionId: "resolve_tools_fetch", status: failed === toolIds.length ? "error" : "success", brief: failed === toolIds.length ? "Failed to fetch tool configuration" : "Fetched tool configuration" });
   }
 
   for (const tid of toolIds) {
@@ -120,8 +112,8 @@ export async function downloadSkill(
   hands?: HandsClient,
   /** Stage into this existing Brain-local directory instead of a fresh temp one. */
   stageDir?: string,
-  /** Tools API base; defaults to the SaFE-gateway path used by `tool_ids`. */
-  toolsBase: string = TOOLS_API_URL,
+  /** Tools API base; defaults to the in-cluster API (`platformToolsBase()`). */
+  toolsBase: string = platformToolsBase(),
 ): Promise<string> {
   const downloadUrl = `${toolsBase}/${toolId}/download`;
   const resp = await fetch(downloadUrl, { headers: { Authorization: `Bearer ${apiKey}` } });
