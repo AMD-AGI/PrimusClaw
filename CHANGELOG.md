@@ -28,6 +28,15 @@ record it.
 ## [Unreleased]
 
 ### Added
+- A `permissionRequest` now says in words what the call is, so an approval card
+  can show something a person can judge instead of a raw request body:
+  `tool_description` (the tool's own first sentence), `intent` (what the agent
+  said just before the call) and `summary` (one plain sentence in the user's
+  language, written by one small call on the run's own model, within
+  `HITL_SUMMARY_TIMEOUT_MS`; `summary_by: "model"` marks it as machine-written).
+  Credential-named arguments never reach that call. A timeout, an error or
+  `HITL_SUMMARY_ENABLED=false` just omit the fields; approval semantics are
+  unchanged and `input` is still sent as before.
 - Deployment-level platform defaults: `PLATFORM_DEFAULTS_FILE` lists default skills
   (by marketplace tool id) and MCP servers mounted into every chat, behind
   `PROGRESSIVE_SKILLS_ENABLED` for skills. Default skills are listed by name and
