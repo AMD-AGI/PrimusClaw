@@ -24,7 +24,7 @@ import {
 } from "../auth/models.js";
 import { getContextUsageSnapshot } from "../sessions/context-builder.js";
 import { publicSessionRow } from "../events/redaction.js";
-import { archiveSession, reactivateIfArchived, unarchiveSession } from "../sessions/archive.js";
+import { archiveSession, unarchiveSession } from "../sessions/archive.js";
 import {
   isUserEnvKeyAllowed,
   validateTopology, type EnvironmentTopology,
@@ -1712,7 +1712,6 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         return reply.status(403).send({ ok: false, error: "only the session creator can send messages" });
       }
 
-      await reactivateIfArchived(sessionId, client);
       const status = lockResult.rows[0].agent_status;
       // Snapshot per-user env at message creation time. Decrypted once here,
       // frozen on the pending_messages row (queue path) or NATS task body

@@ -9,6 +9,9 @@
  * activity clock is `updated_at`, which every run-gate transition and rename
  * already bumps; archiving leaves it alone and unarchiving resets it, so a
  * session someone just brought back is not swept again the next day.
+ *
+ * A run starting on an archived session reactivates it in the run-gate take
+ * (applySessionGateTransition in tasks/chat-run.ts), so every entry point does.
  */
 import pino from "pino";
 
@@ -32,7 +35,10 @@ const NO_RUN_IN_FLIGHT = `
  * Archive the sessions that have been idle for `days` days.
  *
  * Only `active` sessions, never one with a run in flight (`agent_status =
- * 'running'`), and never a parent whose team members are still running.
+ * 'running'`), never a parent whose team members are still running, and never
+ * a session made through the Anthropic-compatible API: for those `archived`
+ * already means `terminated` and hides the session from that API's list, which
+ * an automatic sweep must not do to a client that never asked for it.
  *
  * @returns how many sessions were archived
  */
@@ -43,6 +49,7 @@ export async function archiveIdleSessions(days: number, q: Queryable = db): Prom
         SET status = 'archived'
       WHERE s.deleted_at IS NULL
         AND COALESCE(s.status, 'active') = 'active'
+        AND NOT COALESCE(s.config ? 'primus_anthropic_compat', false)
         AND s.updated_at < NOW() - ($1::int * INTERVAL '1 day')
         AND ${NO_RUN_IN_FLIGHT}`,
     [days],
@@ -79,15 +86,4 @@ export async function unarchiveSession(sessionId: string, q: Queryable = db): Pr
     [sessionId],
   );
   return (r.rowCount ?? 0) > 0;
-}
-
-/**
- * A message is activity: an archived session it lands on becomes active again.
- * Runs on the sender's transaction connection, after the owner check.
- */
-export async function reactivateIfArchived(sessionId: string, q: Queryable): Promise<void> {
-  await q.query(
-    "UPDATE claw_sessions SET status = 'active' WHERE session_id = $1 AND status = 'archived'",
-    [sessionId],
-  );
 }

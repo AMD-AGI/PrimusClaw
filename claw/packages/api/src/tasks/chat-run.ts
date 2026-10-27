@@ -1964,7 +1964,7 @@ export async function applySessionGateTransition(input: {
   const alsoCols = Object.keys(input.also ?? {});
   for (const c of alsoCols) {
     if (!/^[a-z_][a-z0-9_]*$/.test(c)
-        || c === "agent_status" || c === "agent_gate_message_id" || c === "updated_at") {
+        || c === "status" || c === "agent_status" || c === "agent_gate_message_id" || c === "updated_at") {
       throw new Error(`applySessionGateTransition: unsafe extra column ${c}`);
     }
   }
@@ -1979,7 +1979,10 @@ export async function applySessionGateTransition(input: {
     if (input.expectReleaser === false) return false;
     const r = await q.query(
       `UPDATE claw_sessions
-          SET agent_status = $3, agent_gate_message_id = $2, updated_at = NOW()${extra(4)}
+          SET agent_status = $3, agent_gate_message_id = $2, updated_at = NOW(),
+              -- A run starting on an archived session makes it active again, whichever
+              -- entry point started it (native message, compat event, A2A, app run).
+              status = CASE WHEN status = 'archived' THEN 'active' ELSE status END${extra(4)}
         WHERE session_id = $1 AND deleted_at IS NULL
           AND ($4::boolean
                OR agent_gate_message_id IS NULL

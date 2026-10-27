@@ -17,7 +17,9 @@
  *   B1 owner archive / unarchive, refusal while running, other users refused
  *   B2 unarchive restarts the idle clock so the next sweep does not undo it
  *   C1 list filter: active, archived, all, default, invalid
- *   D1 a message to an archived session reactivates it before dispatch
+ *   E1 compat sessions are not swept and the compat API is unchanged by the sweep
+ *   D1 every gate take reactivates an archived session (three entry points)
+ *   D2 the native message route takes the gate with the reactivating statement
  */
 import test, { afterEach, before, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
@@ -29,6 +31,8 @@ import { db } from "../src/infra/db.js";
 import type { UserInfo } from "../src/auth/models.js";
 import { initUserEnvCrypto } from "../src/crypto/user-env.js";
 import { registerSessionRoutes } from "../src/routes/sessions.js";
+import { registerAnthropicManagedAgentsRoutes } from "../src/routes/anthropic-managed-agents.js";
+import { applySessionGateTransition, takeSessionGate, takeSessionGateIfUnowned } from "../src/tasks/chat-run.js";
 import { archiveIdleSessions } from "../src/sessions/archive.js";
 import { sessionDispatchPorts } from "../src/sessions/dispatch.js";
 import { closedDoorbellBarrier } from "./doorbell-barrier-stub.js";
@@ -55,6 +59,11 @@ before(async () => {
       agent_status TEXT DEFAULT 'idle',
       status TEXT DEFAULT 'active',
       parent_session_id TEXT,
+      agent_gate_message_id TEXT,
+      config JSONB DEFAULT '{}'::jsonb,
+      mode TEXT DEFAULT 'claw',
+      agent_id TEXT DEFAULT '',
+      system_prompt TEXT DEFAULT '',
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW(),
       deleted_at TIMESTAMPTZ
@@ -85,15 +94,18 @@ interface Seed {
   user?: string;
   parent?: string;
   deleted?: boolean;
+  compat?: boolean;
+  config?: string | null;
 }
 
 async function seed(s: Seed): Promise<void> {
   await pg.query(
-    `INSERT INTO claw_sessions (session_id, user_id, agent_status, status, parent_session_id, created_at, updated_at, deleted_at)
-     VALUES ($1, $2, $3, $4, $5, NOW() - ($6::int * INTERVAL '1 day'), NOW() - ($6::int * INTERVAL '1 day'),
+    `INSERT INTO claw_sessions (session_id, user_id, agent_status, status, parent_session_id, config, created_at, updated_at, deleted_at)
+     VALUES ($1, $2, $3, $4, $5, $8::jsonb, NOW() - ($6::int * INTERVAL '1 day'), NOW() - ($6::int * INTERVAL '1 day'),
              CASE WHEN $7::boolean THEN NOW() ELSE NULL END)`,
     [s.id, s.user ?? OWNER.userId, s.agent ?? "idle", s.status === undefined ? "active" : s.status,
-     s.parent ?? null, s.idleDays, s.deleted ?? false],
+     s.parent ?? null, s.idleDays, s.deleted ?? false,
+     s.compat ? JSON.stringify({ primus_anthropic_compat: {} }) : (s.config === undefined ? "{}" : s.config)],
   );
 }
 
@@ -120,6 +132,8 @@ test("A1 the sweep archives idle sessions and only those", async () => {
     { name: "recent and idle", seed: { id: "recent", idleDays: 1 }, archived: false },
     { name: "just under the threshold", seed: { id: "edge", idleDays: 6 }, archived: false },
     { name: "already archived", seed: { id: "gone-already", idleDays: 30, status: "archived" }, archived: true },
+    { name: "created through the compat API", seed: { id: "compat", idleDays: 30, compat: true }, archived: false },
+    { name: "config is NULL", seed: { id: "null-config", idleDays: 30, config: null }, archived: true },
     { name: "deleted", seed: { id: "deleted", idleDays: 30, deleted: true }, archived: false },
   ];
   for (const c of cases) await seed(c.seed);
@@ -130,7 +144,7 @@ test("A1 the sweep archives idle sessions and only those", async () => {
     const got = (await statusOf(c.seed.id)) === "archived";
     assert.equal(got, c.archived, `${c.name}: archived=${got}`);
   }
-  assert.equal(n, 2, "only the two newly archived rows are counted");
+  assert.equal(n, 3, "only the newly archived rows are counted");
 });
 
 test("A2 a parent with a running team member is left alone", async () => {
@@ -239,7 +253,57 @@ test("C1 the list filters by status and defaults to everything", async () => {
   }
 });
 
-test("D1 a message to an archived session reactivates it before dispatch", async () => {
+test("E1 compat sessions are not swept and the compat API reads them as before", async () => {
+  await seed({ id: "compat", idleDays: 30, compat: true });
+  await seed({ id: "native", idleDays: 30 });
+  await archiveIdleSessions(7);
+  assert.equal(await statusOf("compat"), "active");
+
+  const instance = Fastify();
+  instance.addHook("preHandler", async (req) => {
+    (req as unknown as { user: UserInfo }).user = caller;
+  });
+  await registerAnthropicManagedAgentsRoutes(instance);
+  await instance.ready();
+  try {
+    const list = await instance.inject({ method: "GET", url: "/anthropic/v1/sessions" });
+    assert.equal(list.statusCode, 200);
+    const ids = (list.json() as { data: Array<{ id: string }> }).data.map((d) => d.id);
+    assert.ok(ids.includes("compat"), "the compat session is still listed");
+    assert.ok(!ids.includes("native"), "a swept native session is hidden there, as for any archived row");
+    const one = await instance.inject({ method: "GET", url: "/anthropic/v1/sessions/compat" });
+    const body = one.json() as { status: string; archived_at: unknown };
+    assert.equal(body.status, "idle");
+    assert.equal(body.archived_at, null);
+  } finally {
+    await instance.close();
+  }
+});
+
+test("D1 every gate take reactivates an archived session", async () => {
+  const entries: Array<[string, (id: string) => Promise<unknown>]> = [
+    ["native/app take (takeSessionGate)", (id) => takeSessionGate(id, "m1")],
+    ["drain take (takeSessionGateIfUnowned)", (id) => takeSessionGateIfUnowned(id, "m2")],
+    ["compat/A2A take (applySessionGateTransition, forced)", (id) => applySessionGateTransition({
+      sessionId: id, actor: "m3", intent: "take", status: "running", force: true, expectReleaser: true,
+    })],
+  ];
+  for (const [name, take] of entries) {
+    await pg.exec("TRUNCATE claw_sessions");
+    await seed({ id: "arch", idleDays: 30, status: "archived" });
+    await seed({ id: "act", idleDays: 30 });
+    await take("arch");
+    await take("act");
+    assert.equal(await statusOf("arch"), "active", `${name}: archived became active`);
+    assert.equal(await statusOf("act"), "active", `${name}: active stays active`);
+  }
+  await pg.exec("TRUNCATE claw_sessions");
+  await seed({ id: "arch", idleDays: 30, status: "archived" });
+  await applySessionGateTransition({ sessionId: "arch", actor: "m", intent: "release", status: "idle", force: true });
+  assert.equal(await statusOf("arch"), "archived", "a release does not reactivate");
+});
+
+test("D2 the native message route takes the gate with the reactivating statement", async () => {
   process.env.USER_ENV_ENCRYPTION_KEY = randomBytes(32).toString("base64");
   initUserEnvCrypto();
   sessionDispatchPorts.publishSse = () => {};
@@ -272,9 +336,9 @@ test("D1 a message to an archived session reactivates it before dispatch", async
     });
     assert.equal(res.statusCode, 200);
     const lock = stub.seen.findIndex((q) => /FOR UPDATE/.test(q.sql));
-    const react = stub.seen.findIndex((q) => /SET status = 'active' WHERE session_id = \$1 AND status = 'archived'/.test(q.sql));
-    assert.ok(react > lock && lock >= 0, "reactivation runs after the owner-checked lock");
-    assert.equal(stub.seen[react].conn, stub.seen[lock].conn, "on the same transaction connection");
+    const take = stub.seen.findIndex((q) => /SET agent_status = \$3, agent_gate_message_id = \$2/.test(q.sql));
+    assert.ok(take > lock && lock >= 0, "the gate is taken after the owner-checked lock");
+    assert.match(stub.seen[take].sql, /status = CASE WHEN status = 'archived' THEN 'active'/);
   } finally {
     await server.close();
   }
