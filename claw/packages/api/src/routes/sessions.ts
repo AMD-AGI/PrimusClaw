@@ -1923,10 +1923,12 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         return reply.status(503).send({ ok: false, error: "sandbox claim not recorded" });
       }
       if (row.agent_status === "running") {
-        // A turn (or an earlier start) holds the gate: a sandbox is, or will be,
-        // there if the turn wants one. Dispatching again is what would make two.
+        // A turn (or an earlier start) holds the gate. Dispatching again is what
+        // would make two sandboxes, so nothing is dispatched; and "busy" is not
+        // "starting", because a turn that never calls a tool never opens one.
+        // The caller asks again once the gate is free, which is idempotent.
         await client.query("ROLLBACK");
-        return { ok: true, session_id: sessionId, state: binding.ready ? "running" : "starting", workload_id: binding.workloadId };
+        return { ok: true, session_id: sessionId, state: binding.ready ? "running" : "busy", workload_id: binding.workloadId };
       }
       if (binding.ready && !refresh) {
         await client.query("ROLLBACK");

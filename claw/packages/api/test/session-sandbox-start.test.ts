@@ -163,7 +163,7 @@ test("two concurrent calls dispatch one run: the second sees the gate taken", as
   const codes = [a.statusCode, b.statusCode].sort();
   assert.deepEqual(codes, [200, 202]);
   const second = a.statusCode === 200 ? a : b;
-  assert.equal(second.json().state, "starting");
+  assert.equal(second.json().state, "busy");
 });
 
 test("a turn already holding the gate is not raced: nothing dispatched", async () => {
@@ -171,10 +171,20 @@ test("a turn already holding the gate is not raced: nothing dispatched", async (
   const app = await appAs(OWNER);
   const res = await app.inject({ method: "POST", url: "/v1/sessions/s1/sandbox", payload: {} });
   assert.equal(res.statusCode, 200);
-  assert.equal(res.json().state, "starting");
+  assert.equal(res.json().state, "busy", "a turn that never calls a tool never opens a sandbox, so this is not 'starting'");
   assert.equal(published.length, 0);
   assert.deepEqual(claims, ["s1"], "the terminal is still claimed, so the turn's end does not stop it");
   assert.equal((await gate("s1")).agent_gate_message_id, "claw-1");
+});
+
+test("once the turn has ended the same call starts the sandbox the turn never needed", async () => {
+  await seedSession(h, "s1", { agentStatus: "running", gateOwner: "claw-1" });
+  const app = await appAs(OWNER);
+  assert.equal((await app.inject({ method: "POST", url: "/v1/sessions/s1/sandbox", payload: {} })).json().state, "busy");
+  await h.sql("UPDATE claw_sessions SET agent_status = 'idle', agent_gate_message_id = NULL WHERE session_id = 's1'");
+  const res = await app.inject({ method: "POST", url: "/v1/sessions/s1/sandbox", payload: {} });
+  assert.equal(res.statusCode, 202);
+  assert.equal(published.length, 1);
 });
 
 test("a sandbox that already runs is reused: no run, workload reported", async () => {
