@@ -491,7 +491,19 @@ func (h *handler) serveFiles(w http.ResponseWriter, r *http.Request) {
 			writeRPCError(w, err)
 			return
 		}
+		ent, err := h.files.stat(userPath)
+		if err != nil {
+			writeRPCError(w, err)
+			return
+		}
+		payload, err := json.Marshal([]map[string]any{httpEntry(ent)})
+		if err != nil {
+			writeRPCError(w, err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(payload)
 	default:
 		writeRPCError(w, rpcErr("unimplemented", "method not allowed"))
 	}
@@ -735,6 +747,15 @@ func listJSON(items []procInfo) []map[string]any {
 		})
 	}
 	return out
+}
+
+// httpEntry is the JSON object POST /files returns. The SDK reads an array of these.
+func httpEntry(ent fileEntry) map[string]any {
+	kind := "file"
+	if ent.Type == fileTypeDir {
+		kind = "dir"
+	}
+	return map[string]any{"path": ent.Path, "name": ent.Name, "type": kind}
 }
 
 func entryJSON(ent fileEntry) map[string]any {
