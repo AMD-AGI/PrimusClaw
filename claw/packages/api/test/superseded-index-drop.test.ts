@@ -204,14 +204,20 @@ test("the migration drops the platform-facts predecessor, after building its rep
   // than of the helper: the helper cannot tell whether the CREATE it is being
   // asked to follow has been issued yet.
   const INIT = SRC.slice(SRC.indexOf("export async function initDb"));
-  const createAt = INIT.indexOf("idx_tasks_platform_facts_pending_v2");
+  const createAt = INIT.indexOf("idx_tasks_platform_facts_pending_v3");
   const dropAt = INIT.indexOf("dropSupersededIndexWhenReplaced(");
   assert.ok(createAt >= 0, "the replacement is built in the migration");
   assert.ok(dropAt > createAt, "and the predecessor is dropped strictly after that build");
   assert.match(
     INIT.slice(dropAt, dropAt + 200),
-    /"idx_tasks_platform_facts_pending",\s*\n\s*"idx_tasks_platform_facts_pending_v2",/,
-    "the superseded name is the argument, and the v2 name is what it is checked against",
+    /"idx_tasks_platform_facts_pending",\s*\n\s*"idx_tasks_platform_facts_pending_v3",/,
+    "the superseded name is the argument, and the v3 name is what it is checked against",
+  );
+  const dropV2At = INIT.indexOf("dropSupersededIndexWhenReplaced(", dropAt + 10);
+  assert.match(
+    INIT.slice(dropV2At, dropV2At + 200),
+    /"idx_tasks_platform_facts_pending_v2",\s*\n\s*"idx_tasks_platform_facts_pending_v3",/,
+    "v2 is dropped against v3 as well",
   );
 });
 
@@ -228,4 +234,13 @@ test("the retention comment no longer tells a reader every older variant is kept
     "the comment has to name the mechanism that now removes one");
   assert.match(rule, /unguarded/,
     "and say that what it refuses is the unguarded drop, not every drop");
+});
+
+test("the platform-facts index predicate names every reason the drain selects, sandbox_start_timeout included", () => {
+  const at = SRC.indexOf("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_platform_facts_pending_v3");
+  assert.ok(at >= 0, "the v3 index is built");
+  const stmt = SRC.slice(at, SRC.indexOf("platform_facts_resolved_at IS NULL", at));
+  for (const r of ["brain_timeout", "sandbox_pending_timeout", "sandbox_start_timeout"]) {
+    assert.ok(stmt.includes(`'${r}'`), `the predicate must include ${r}`);
+  }
 });
