@@ -222,7 +222,7 @@ func TestCreateReplayKillAndQuota(t *testing.T) {
 	second, status, err := svc.Create(context.Background(), key, CreateBody{
 		TemplateID: "runner", Metadata: map[string]string{"agent-sandbox.io/idempotency-key": "once"},
 	})
-	if err != nil || status != http.StatusOK || second.SandboxID != first.SandboxID || second.EnvdAccessToken == "" {
+	if err != nil || status != http.StatusCreated || second.SandboxID != first.SandboxID || second.EnvdAccessToken == "" {
 		t.Fatalf("status=%d err=%v second=%+v", status, err, second)
 	}
 	connected, err := svc.Connect(context.Background(), key, first.SandboxID)
@@ -241,7 +241,7 @@ func TestCreateReplayKillAndQuota(t *testing.T) {
 	if err != nil || len(listed.Sandboxes) != 1 || listed.Sandboxes[0].State != runtimev1alpha1.SandboxRunning {
 		t.Fatalf("listed=%+v err=%v", listed, err)
 	}
-	if listed.Sandboxes[0].StartedAt == "" || listed.Sandboxes[0].Metadata["agent-sandbox.io/team"] != "a" {
+	if listed.Sandboxes[0].StartedAt == "" || listed.Sandboxes[0].EndAt == "" || listed.Sandboxes[0].CPUCount < 1 || listed.Sandboxes[0].MemoryMB < 128 || listed.Sandboxes[0].Metadata["agent-sandbox.io/team"] != "a" {
 		t.Fatalf("listed=%+v", listed.Sandboxes[0])
 	}
 	_, _, err = svc.Create(context.Background(), key, CreateBody{
@@ -264,7 +264,7 @@ func TestCreateReplayKillAndQuota(t *testing.T) {
 		t.Fatalf("deleted=%v", runner.deleted)
 	}
 	got, err := svc.Get(context.Background(), key, first.SandboxID)
-	if err != nil || got.State != runtimev1alpha1.SandboxEnded || got.CPUCount != 0 || got.ClientID != first.SandboxID {
+	if got.SandboxID != "" || !grant.IsReason(err, "sandbox_not_found") {
 		t.Fatalf("got=%+v err=%v", got, err)
 	}
 	_, err = svc.grants.LookupAccess(context.Background(), first.SandboxID, first.EnvdAccessToken)
@@ -434,14 +434,23 @@ func TestSealedAllowsFilesOnly(t *testing.T) {
 	if SealedAllows(http.MethodPost, "/api/execute", true, []string{"/in"}, []string{"/out"}) {
 		t.Fatal("execute allowed")
 	}
-	if !SealedAllows(http.MethodGet, "/api/files?path=/in/a", true, []string{"/in"}, []string{"/out"}) {
-		t.Fatal("input read denied")
+	if SealedAllows(http.MethodGet, "/api/files?path=/in/a", true, []string{"/in"}, []string{"/out"}) {
+		t.Fatal("input read allowed")
 	}
-	if SealedAllows(http.MethodPut, "/api/files?path=/in/a", true, []string{"/in"}, []string{"/out"}) {
-		t.Fatal("input write allowed")
+	if !SealedAllows(http.MethodPut, "/api/files?path=/in/a", true, []string{"/in"}, []string{"/out"}) {
+		t.Fatal("input write denied")
 	}
-	if !SealedAllows(http.MethodPut, "/api/files/out/b", true, []string{"/in"}, []string{"/out"}) {
-		t.Fatal("output write denied")
+	if SealedAllows(http.MethodPut, "/api/files?path=/in", true, []string{"/in"}, []string{"/out"}) {
+		t.Fatal("input root write allowed")
+	}
+	if SealedAllows(http.MethodPut, "/api/files/out/b", true, []string{"/in"}, []string{"/out"}) {
+		t.Fatal("output write allowed")
+	}
+	if !SealedAllows(http.MethodGet, "/api/files?path=/out/b", true, []string{"/in"}, []string{"/out"}) {
+		t.Fatal("output read denied")
+	}
+	if SealedAllows(http.MethodGet, "/api/files?path=/out/../in/a", true, []string{"/in"}, []string{"/out"}) {
+		t.Fatal("traversal read allowed")
 	}
 	if SealedAllows(http.MethodPost, "/process.Process/Start", true, nil, nil) {
 		t.Fatal("sealed process rpc")
@@ -460,11 +469,14 @@ func TestSealedAllowsFilesOnly(t *testing.T) {
 	if !SealedAllows(http.MethodPost, "/filesystem.Filesystem/Stat", true, []string{"/in"}, []string{"/out"}) {
 		t.Fatal("filesystem rpc path is enforced in envd")
 	}
-	if !SealedFileAllows(http.MethodGet, "/in/a", []string{"/in"}, []string{"/out"}) {
+	if SealedFileAllows(http.MethodGet, "/in/a", []string{"/in"}, []string{"/out"}) {
 		t.Fatal("read input")
 	}
-	if SealedFileAllows(http.MethodPost, "/in/a", []string{"/in"}, []string{"/out"}) {
+	if !SealedFileAllows(http.MethodPost, "/in/a", []string{"/in"}, []string{"/out"}) {
 		t.Fatal("write input")
+	}
+	if SealedFileAllows(http.MethodPost, "/in", []string{"/in"}, []string{"/out"}) {
+		t.Fatal("write input root")
 	}
 	for _, filePath := range []string{"/in/../secret", "/in/sub/../../secret"} {
 		if SealedFileAllows(http.MethodGet, filePath, []string{"/in"}, []string{"/out"}) {

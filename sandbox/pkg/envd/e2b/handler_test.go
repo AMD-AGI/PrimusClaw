@@ -95,7 +95,7 @@ func TestConnectStartFilesAndSignal(t *testing.T) {
 	}
 	_ = sealed.Body.Close()
 
-	denied := postHeader(t, srv.URL+"/files?path=/in/a.txt", "text/plain", []byte("x"), map[string]string{
+	denied := postHeader(t, srv.URL+"/files?path=/out/a.txt", "text/plain", []byte("x"), map[string]string{
 		"X-Sandbox-Sealed":  "true",
 		"X-Sandbox-Inputs":  "/in",
 		"X-Sandbox-Outputs": "/out",

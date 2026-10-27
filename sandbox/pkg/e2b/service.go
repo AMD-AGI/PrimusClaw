@@ -8,15 +8,48 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/grant"
 )
+
+// sandboxDiskDefaultMB is the workload's 50Gi ephemeral storage, in MiB.
+const sandboxDiskDefaultMB = 50 * 1024
+
+// idempotencyHeaderPattern is the official Idempotency-Key alphabet.
+var idempotencyHeaderPattern = regexp.MustCompile(`^[a-z0-9-]+$`)
+
+// applyIdempotencyHeader copies a valid Idempotency-Key onto the metadata key.
+// The metadata key remains the stored identity. A header that disagrees with
+// it is rejected.
+func applyIdempotencyHeader(body *CreateBody, header string) error {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return nil
+	}
+	if len(header) > 255 || !idempotencyHeaderPattern.MatchString(header) {
+		return grant.Op(http.StatusBadRequest, "invalid_sandbox", "Idempotency-Key must be 1 to 255 characters of a-z, 0-9, or -")
+	}
+	if body.Metadata == nil {
+		body.Metadata = map[string]string{}
+	}
+	if existing := body.Metadata[idempotencyMetadataKey]; existing != "" && existing != header {
+		return grant.Op(http.StatusConflict, "idempotency_request_mismatch", "Idempotency-Key does not match the metadata key")
+	}
+	body.Metadata[idempotencyMetadataKey] = header
+	return nil
+}
 
 // Service is the E2B control plane. Authorization is the caller's grant key.
 type Service struct {
@@ -151,6 +184,9 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 	})
 	var replay *grant.Replay
 	if errors.As(err, &replay) {
+		if ref.TemplateID != tpl.ID || (body.Timeout > 0 && ref.TimeoutSec != timeoutSec) {
+			return SandboxResponse{}, 0, grant.Op(http.StatusConflict, "idempotency_request_mismatch", ref.ID)
+		}
 		return s.replay(ctx, grantID, ref)
 	}
 	if err != nil {
@@ -217,7 +253,7 @@ func (s *Service) replay(ctx context.Context, grantID string, ref runtimev1alpha
 	if err != nil {
 		return SandboxResponse{}, 0, err
 	}
-	return createdResponse(ref, token), http.StatusOK, nil
+	return createdResponse(ref, token), http.StatusCreated, nil
 }
 
 // waitReplay blocks while the sandbox is still queued.
@@ -249,11 +285,14 @@ func (s *Service) Get(ctx context.Context, apiKey, sandboxID string) (SandboxRes
 	if err != nil {
 		return SandboxResponse{}, err
 	}
-	return detailResponse(ref), nil
+	if ref.State != runtimev1alpha1.SandboxRunning {
+		return SandboxResponse{}, grant.Op(http.StatusNotFound, "sandbox_not_found", sandboxID)
+	}
+	return s.detail(ctx, grantID, ref), nil
 }
 
-// List returns sandboxes for this key's role. Ended sandboxes are omitted
-// unless state is "ended".
+// List returns running sandboxes for this key's role.
+// state is empty, running, or paused. Ended sandboxes are not listed.
 func (s *Service) List(ctx context.Context, apiKey, metadataQuery, state, nextToken string, limit int) (ListResponse, error) {
 	grantID, role, err := s.grants.LookupKey(ctx, apiKey)
 	if err != nil {
@@ -270,16 +309,16 @@ func (s *Service) List(ctx context.Context, apiKey, metadataQuery, state, nextTo
 	if limit <= 0 {
 		limit = defaultListLimit
 	}
+	if state != "" && state != runtimev1alpha1.SandboxRunning && state != "paused" {
+		return ListResponse{}, grant.Op(http.StatusBadRequest, "invalid_sandbox", "state must be running or paused")
+	}
 	refs, err := s.grants.ListRoleSandboxes(ctx, grantID, role)
 	if err != nil {
 		return ListResponse{}, err
 	}
 	var filtered []runtimev1alpha1.GrantSandboxRef
 	for _, ref := range refs {
-		if state == "" && ref.State == runtimev1alpha1.SandboxEnded {
-			continue
-		}
-		if state != "" && ref.State != state {
+		if ref.State != runtimev1alpha1.SandboxRunning || state == "paused" {
 			continue
 		}
 		if !metadataMatch(ref.Metadata, want) {
@@ -292,7 +331,7 @@ func (s *Service) List(ctx context.Context, apiKey, metadataQuery, state, nextTo
 	page := filtered[offset:end]
 	out := ListResponse{Sandboxes: make([]SandboxResponse, 0, len(page))}
 	for _, ref := range page {
-		out.Sandboxes = append(out.Sandboxes, detailResponse(ref))
+		out.Sandboxes = append(out.Sandboxes, s.detail(ctx, grantID, ref))
 	}
 	if end < len(filtered) {
 		out.NextToken = encodeOffset(end)
@@ -397,26 +436,79 @@ func createdResponse(ref runtimev1alpha1.GrantSandboxRef, token string) SandboxR
 	}
 }
 
-func detailResponse(ref runtimev1alpha1.GrantSandboxRef) SandboxResponse {
-	resp := SandboxResponse{
+// detail is the SandboxDetail body. endAt is the expiry, startedAt plus the
+// sandbox timeout, and state is running. cpuCount and memoryMB meet the
+// schema minimum when the template does not set them.
+func (s *Service) detail(ctx context.Context, grantID string, ref runtimev1alpha1.GrantSandboxRef) SandboxResponse {
+	spec := ""
+	if snap, err := s.grants.Snapshot(ctx, grantID); err == nil {
+		if tpl, _, _ := templateForExpansion(snap, ref.TemplateID); tpl.Spec != "" {
+			spec = tpl.Spec
+		}
+	}
+	cpu, mem, disk := sandboxSize(spec)
+	started := ref.StartedAt.Time
+	if started.IsZero() {
+		started = time.Now()
+	}
+	started = started.UTC()
+	end := started.Add(time.Duration(ref.TimeoutSec) * time.Second)
+	return SandboxResponse{
 		TemplateID:  ref.TemplateID,
 		Alias:       ref.Alias,
 		SandboxID:   ref.ID,
 		ClientID:    ref.ID,
 		EnvdVersion: envdVersion,
-		State:       ref.State,
+		StartedAt:   started.Format(time.RFC3339),
+		EndAt:       end.Format(time.RFC3339),
+		State:       runtimev1alpha1.SandboxRunning,
 		Metadata:    ref.Metadata,
-		CPUCount:    0,
-		MemoryMB:    0,
-		DiskSizeMB:  0,
+		CPUCount:    cpu,
+		MemoryMB:    mem,
+		DiskSizeMB:  disk,
 	}
-	if !ref.StartedAt.IsZero() {
-		resp.StartedAt = ref.StartedAt.UTC().Format(time.RFC3339)
+}
+
+// sandboxSize reads cpu cores, memory MiB, and disk MiB from a template spec.
+func sandboxSize(spec string) (int, int, int) {
+	cpu, mem, disk := 1, 128, sandboxDiskDefaultMB
+	if spec == "" {
+		return cpu, mem, disk
 	}
-	if !ref.EndedAt.IsZero() {
-		resp.EndAt = ref.EndedAt.UTC().Format(time.RFC3339)
+	var body struct {
+		Resources corev1.ResourceRequirements `json:"resources"`
 	}
-	return resp
+	if err := json.Unmarshal([]byte(spec), &body); err != nil {
+		return cpu, mem, disk
+	}
+	if q, ok := resourceQuantity(body.Resources, corev1.ResourceCPU); ok {
+		cores := int((q.MilliValue() + 999) / 1000)
+		if cores < 1 {
+			cores = 1
+		}
+		cpu = cores
+	}
+	if q, ok := resourceQuantity(body.Resources, corev1.ResourceMemory); ok {
+		mb := int((q.Value() + (1 << 20) - 1) / (1 << 20))
+		if mb < 128 {
+			mb = 128
+		}
+		mem = mb
+	}
+	if q, ok := resourceQuantity(body.Resources, corev1.ResourceEphemeralStorage); ok {
+		disk = int((q.Value() + (1 << 20) - 1) / (1 << 20))
+	}
+	return cpu, mem, disk
+}
+
+func resourceQuantity(req corev1.ResourceRequirements, name corev1.ResourceName) (resource.Quantity, bool) {
+	if q, ok := req.Limits[name]; ok {
+		return q, true
+	}
+	if q, ok := req.Requests[name]; ok {
+		return q, true
+	}
+	return resource.Quantity{}, false
 }
 
 func denied(err error) bool {

@@ -14,15 +14,18 @@ const (
 	// HeaderSealed is set by the Router on the EnvD request.
 	// EnvD trusts it because the Router overwrites any client value.
 	HeaderSealed = "X-Sandbox-Sealed"
-	// HeaderInputs lists sealed read roots, comma-separated.
+	// HeaderInputs lists sealed write roots, comma-separated. Callers may write
+	// children of these paths and may not read them.
 	HeaderInputs = "X-Sandbox-Inputs"
-	// HeaderOutputs lists sealed write roots, comma-separated.
+	// HeaderOutputs lists sealed read roots, comma-separated. Callers may read
+	// these paths and may not write them.
 	HeaderOutputs = "X-Sandbox-Outputs"
 )
 
 // SealedAllows reports whether a sealed sandbox may serve this request.
-// Only file APIs are reachable. File paths must sit under inputs for reads and
-// outputs for writes. Filesystem RPC paths are checked from their request body.
+// Only file APIs are reachable. Reads must sit under outputs. Writes must sit
+// strictly inside inputs, so the input root itself is not a file write.
+// Filesystem RPC paths are checked from their request body.
 func SealedAllows(method, rawPath string, sealed bool, inputs, outputs []string) bool {
 	if !sealed {
 		return true
@@ -41,12 +44,7 @@ func SealedAllows(method, rawPath string, sealed bool, inputs, outputs []string)
 		return false
 	}
 	filePath := filePathOf(rawPath)
-	switch method {
-	case http.MethodGet, http.MethodHead:
-		return pathAllowed(filePath, inputs) || pathAllowed(filePath, outputs)
-	default:
-		return pathAllowed(filePath, outputs)
-	}
+	return sealedFileAllowed(method, filePath, inputs, outputs)
 }
 
 func filePathOf(rawPath string) string {
@@ -76,13 +74,18 @@ func filePathOf(rawPath string) string {
 }
 
 // SealedFileAllows reports whether a sealed sandbox may read or write filePath.
-// Reads may use inputs or outputs. Writes may use outputs only.
+// Reads may use outputs, including the output root. Writes may use a child of
+// an input root, not the root itself.
 func SealedFileAllows(method, filePath string, inputs, outputs []string) bool {
+	return sealedFileAllowed(method, filePath, inputs, outputs)
+}
+
+func sealedFileAllowed(method, filePath string, inputs, outputs []string) bool {
 	switch method {
 	case http.MethodGet, http.MethodHead:
-		return pathAllowed(filePath, inputs) || pathAllowed(filePath, outputs)
-	default:
 		return pathAllowed(filePath, outputs)
+	default:
+		return pathInside(filePath, inputs)
 	}
 }
 
@@ -97,6 +100,28 @@ func pathAllowed(filePath string, allow []string) bool {
 		}
 		base := cleanPolicyPath(item)
 		if base == "/" || cleaned == base || strings.HasPrefix(cleaned, base+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// pathInside reports whether filePath is strictly below an allow root.
+// The root itself is a directory, so writing it is not a file write.
+func pathInside(filePath string, allow []string) bool {
+	if filePath == "" {
+		return false
+	}
+	cleaned := cleanPolicyPath(filePath)
+	for _, item := range allow {
+		if item == "" {
+			continue
+		}
+		base := cleanPolicyPath(item)
+		if base == "/" {
+			return cleaned != "/"
+		}
+		if strings.HasPrefix(cleaned, base+"/") {
 			return true
 		}
 	}
