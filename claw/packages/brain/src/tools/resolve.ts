@@ -134,8 +134,10 @@ export async function downloadSkill(
   hands?: HandsClient,
   /** Stage into this existing Brain-local directory instead of a fresh temp one. */
   stageDir?: string,
+  /** Tools API base; defaults to the SaFE-gateway path used by `tool_ids`. */
+  toolsBase: string = TOOLS_API_URL,
 ): Promise<string> {
-  const downloadUrl = `${TOOLS_API_URL}/${toolId}/download`;
+  const downloadUrl = `${toolsBase}/${toolId}/download`;
   const resp = await fetch(downloadUrl, { headers: { Authorization: `Bearer ${apiKey}` } });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
 

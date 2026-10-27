@@ -59,12 +59,15 @@ to them. Skills from plugins and `tool_ids` are unchanged and stay inlined.
 
 ## Publishing default tools
 
-Brain looks each default up **by id** with the **calling user's** key (10 s
+Brain looks each default up **by id** through the in-cluster API (`INTERNAL_BACKEND_URL`, route `/v1/tools/<id>`; the gateway `SAFE_API_URL/claw-api` path is used only when it is unset) with the **calling user's** key (10 s
 deadline), so a default skill is mounted only for users who can read its tool,
 however many other tools exist. Publish each default tool with `is_public` true
 (the upload default, `is_public=true` on `/v1/tools/upload`, or public in the
 import flow) so every user can read it; a tool a user cannot read is skipped for
-that user.
+that user. An answer that did not come from the Claw API (for example a gateway
+404 for a path it does not route) is reported as `endpoint_unreachable`, not as a
+missing or unreadable tool; the metric `reason` label distinguishes `not_found`,
+`forbidden`, `endpoint_unreachable` and `lookup`.
 
 The skill archive may be flat or wrapped in a single top-level folder; either
 way the directory that contains `SKILL.md` is what appears as
