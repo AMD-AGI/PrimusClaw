@@ -6,8 +6,8 @@
  *
  * Claw signs an ES256 attestation and calls `/internal/v1/grants` with the
  * pod service-account token. A repeated issue of the same id returns 200 and
- * no keys; that answer is a failure here, and the id is revoked so the caller
- * can try a new one.
+ * no keys. A fresh id is revoked so the caller can try another; a reissue of
+ * an id the run keeps is not revoked.
  */
 import { createPrivateKey, sign as signRaw, type KeyObject } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -20,6 +20,8 @@ export const GRANT_AUDIENCE = "agent-sandbox-workload";
 export const DEFAULT_GRANT_URL = "http://agent-sandbox-router.agent-sandbox-system.svc.cluster.local:8080/internal/v1/grants";
 /** Brain's revoke waits this long for the sandboxes under the grant to go. */
 export const GRANT_REVOKE_TIMEOUT_MS = 60_000;
+/** Bound for inspect, extend, and reissue. A stuck grant service must not hold a runner tick open. */
+export const GRANT_CALL_TIMEOUT_MS = 10_000;
 const TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token";
 const ROLES = new Set<string>(APP_SANDBOX_ROLES);
 
@@ -132,22 +134,32 @@ export class SandboxGrantClient {
   private readonly now: () => Date;
 
   constructor(private readonly opts: SandboxGrantClientOptions) {
-    this.baseUrl = (opts.baseUrl ?? process.env.AGENT_SANDBOX_GRANT_URL ?? DEFAULT_GRANT_URL).replace(/\/$/, "");
+    const configured = opts.baseUrl ?? process.env.AGENT_SANDBOX_GRANT_URL?.trim();
+    if (!configured) throw new Error("AGENT_SANDBOX_GRANT_URL is required");
+    this.baseUrl = configured.replace(/\/$/, "");
     this.fetch = opts.fetch ?? globalThis.fetch;
     this.now = opts.now ?? (() => new Date());
   }
 
   /**
    * Sign and create the grant. One transport retry uses the same id.
-   * A 200 without keys revokes that id and throws {@link GrantKeysMissingError}.
+   * `create` is a fresh id: a 200 without keys revokes that id, because the
+   * keys were lost and the id will not be tried again.
+   * `reissue` is an id the run keeps: the same 200 means the grant is already
+   * there, and deleting it would revoke the run's only grant. The call fails
+   * and leaves the grant in place.
    */
-  async issue(material: SandboxGrantMaterial, signal?: AbortSignal): Promise<{ keys: Record<string, string>; expiresAt: Date }> {
+  async issue(
+    material: SandboxGrantMaterial,
+    signal?: AbortSignal,
+    mode: "create" | "reissue" = "create",
+  ): Promise<{ keys: Record<string, string>; expiresAt: Date }> {
     const built = buildSandboxGrant(material, this.now());
     const body = { ...built.body, attestation: this.opts.signer.sign(built.claims, this.now()) };
     const resp = await this.postRetry(body, signal);
     const keys = keysOf(resp);
     if (!keys) {
-      await this.revoke(material.grantId, signal).catch(() => undefined);
+      if (mode === "create") await this.revoke(material.grantId, signal).catch(() => undefined);
       throw new GrantKeysMissingError(material.grantId);
     }
     return { keys, expiresAt: built.claims.expiresAt };
@@ -230,10 +242,15 @@ export class SandboxGrantClient {
 export function openSandboxGrantClient(fetchImpl?: typeof fetch): SandboxGrantClient | null {
   const signer = loadGrantSignerFromEnv();
   if (!signer) return null;
+  // No silent default. The in-cluster route named by DEFAULT_GRANT_URL is served
+  // by the sandbox router, and calling it before that route exists would fail every grant.
+  const baseUrl = process.env.AGENT_SANDBOX_GRANT_URL?.trim();
+  if (!baseUrl) return null;
   return new SandboxGrantClient({
     signer,
     fetch: fetchImpl,
     token: clusterServiceAccountToken,
+    baseUrl,
   });
 }
 
