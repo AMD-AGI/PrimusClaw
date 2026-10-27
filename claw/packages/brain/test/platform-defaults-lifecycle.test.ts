@@ -26,7 +26,7 @@ const events: Array<Record<string, unknown>> = [];
 const onEvent = async (e: unknown) => { events.push(e as Record<string, unknown>); };
 
 test.after(() => world.close());
-test.beforeEach(() => { pd.resetStagedIndexForTest(); events.length = 0; world.downloads.length = 0; world.byIdCalls.length = 0; world.listCalls = 0; });
+test.beforeEach(() => { pd.resetStagedIndexForTest(); events.length = 0; world.downloads.length = 0; world.byIdCalls.length = 0; world.listCalls = 0; world.paths.length = 0; });
 
 const writePaths = (h: ReturnType<typeof fakeHands>) =>
   h.calls.filter((c) => c.name === "write").map((c) => String(c.args.path)).sort();
@@ -152,4 +152,54 @@ test("a cache hit whose staged directory is gone is a miss: it re-stages instead
   const h = fakeHands();
   await new LazyDefaultSkills([b], onEvent as never).ensure(h as never, ".skills/fleet-ops");
   assert.equal(writePaths(h).length, 2);
+});
+
+test("defaults go to the in-cluster API at /v1/tools, never the gateway /claw-api path (literal URLs)", async () => {
+  world.setTools([{ id: 11, name: "fleet-ops", zip: skillZip("fleet-ops", "B", "d") }]);
+  const out = await resolveDefaultSkills(defs(), "ak", onEvent as never);
+  assert.equal(out.length, 1);
+  assert.deepEqual(world.paths, ["/v1/tools/11", "/v1/tools/11/download"]);
+});
+
+test("without INTERNAL_BACKEND_URL the gateway base is kept", async () => {
+  const saved = process.env.INTERNAL_BACKEND_URL;
+  delete process.env.INTERNAL_BACKEND_URL;
+  try {
+    assert.equal(pd.platformToolsBase(), `${process.env.SAFE_API_URL}/claw-api/v1/tools`);
+  } finally { process.env.INTERNAL_BACKEND_URL = saved; }
+  assert.equal(pd.platformToolsBase(), `${saved}/v1/tools`);
+});
+
+test("a 404 from the Claw API is 'not_found'; a 404 from a gateway that does not route it is 'endpoint_unreachable'", async () => {
+  // per-tool: the API answers with its error envelope
+  world.setTools([]);
+  await resolveDefaultSkills(defs(), "ak", onEvent as never);
+  const perTool = events.map((e) => String(e.brief));
+  assert.ok(perTool.some((b) => b.includes("not found") && !b.includes("unreachable")), perTool.join("|"));
+  // endpoint-level: point the base at the path the apiserver 404s
+  events.length = 0;
+  const saved = process.env.INTERNAL_BACKEND_URL;
+  process.env.INTERNAL_BACKEND_URL = `${process.env.SAFE_API_URL}/claw-api`;
+  try {
+    world.setTools([{ id: 11, name: "fleet-ops", zip: skillZip("fleet-ops", "B", "d") }]);
+    const out = await resolveDefaultSkills(defs(), "ak", onEvent as never);
+    assert.deepEqual(out, []);
+  } finally { process.env.INTERNAL_BACKEND_URL = saved; }
+  const endpoint = events.map((e) => String(e.brief));
+  assert.ok(endpoint.some((b) => b.includes("lookup endpoint unreachable")), endpoint.join("|"));
+  assert.ok(!endpoint.some((b) => b.includes("not found")));
+});
+
+test("the two failures are counted under different reasons", async () => {
+  const { registry } = await import("../src/infra/metrics.js");
+  const reasons = async () => ((await registry.getMetricsAsJSON()).find((m) => m.name === "claw_platform_default_total") as unknown as { values: Array<{ labels: Record<string, string>; value: number }> })
+    .values.filter((v) => v.labels.kind === "skill").map((v) => `${v.labels.outcome}/${v.labels.reason}`);
+  world.setTools([]);
+  await resolveDefaultSkills(defs(), "ak", onEvent as never);
+  const saved = process.env.INTERNAL_BACKEND_URL;
+  process.env.INTERNAL_BACKEND_URL = `${process.env.SAFE_API_URL}/claw-api`;
+  try { await resolveDefaultSkills(defs(), "ak", onEvent as never); } finally { process.env.INTERNAL_BACKEND_URL = saved; }
+  const r = await reasons();
+  assert.ok(r.includes("skipped/not_found"), r.join(","));
+  assert.ok(r.includes("failed/endpoint_unreachable"), r.join(","));
 });
