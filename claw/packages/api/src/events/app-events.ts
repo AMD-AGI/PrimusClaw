@@ -34,3 +34,26 @@ export function appEventKey(event: Record<string, unknown>): string | null {
   const identity = appEventIdentity(event);
   return identity ? `${identity.appTaskId}\u0000${identity.eventId}` : null;
 }
+
+/**
+ * Which live app events are worth asking the database about. Ids of one run only
+ * go up on first publication, so a repeat (a takeover re-reads a batch) always
+ * has an id at or below one already shown. An event above the highest seen for
+ * its run on this connection is new and costs no query; the first one seen for a
+ * run is checked, because this connection may have missed the original.
+ */
+export class AppEventOrder {
+  private readonly highest = new Map<string, bigint>();
+
+  mayBeRepeat(identity: AppEventIdentity): boolean {
+    let id: bigint;
+    try { id = BigInt(identity.eventId); } catch { return true; }
+    const top = this.highest.get(identity.appTaskId);
+    if (top === undefined || id <= top) {
+      if (top === undefined || id > top) this.highest.set(identity.appTaskId, id);
+      return true;
+    }
+    this.highest.set(identity.appTaskId, id);
+    return false;
+  }
+}

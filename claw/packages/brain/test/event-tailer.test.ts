@@ -373,16 +373,48 @@ test("without the run's secrets nothing is read and the cursor stays: a line is 
   assert.doesNotMatch(JSON.stringify(r.published), /SECRET-VALUE-123/);
 });
 
-test("segment numbering that goes back (directory emptied, numbers start again) starts over at the oldest segment", async () => {
+test("segment numbering that goes back, ids carrying on: starts over at the oldest segment and last_id still drops repeats", async () => {
   const r = rig();
   writeFileSync(r.file(5), `${ev(1)}\n${ev(2)}\n`);
   await tail(r);
   assert.equal(r.world.rec.events_cursor.segment, seg(5));
   rmSync(r.file(5));
-  writeFileSync(r.file(0), `${ev(2)}\n${ev(3)}\n${ev(4)}\n`);
+  writeFileSync(r.file(0), `${ev(3)}\n${ev(4)}\n`);
   await tail(r);
   assert.equal(r.world.rec.events_cursor.segment, seg(0), "no longer stuck on a segment that is never coming back");
-  assert.deepEqual(r.ids(), ["1", "2", "3", "4"], "last_id drops what was forwarded already (2), the rest goes out");
+  assert.deepEqual(r.ids(), ["1", "2", "3", "4"]);
+});
+
+test("numbering went back AND ids restarted (directory wiped, new sandbox): last_id is reset, nothing is dropped for the rest of the run", async () => {
+  const r = rig();
+  writeFileSync(r.file(5), `${ev(1)}\n${ev(2)}\n${ev(3)}\n`);
+  await tail(r);
+  rmSync(r.file(5));
+  writeFileSync(r.file(0), `${ev(1)}\n${ev(2)}\n`);
+  await tail(r);
+  assert.deepEqual(r.ids(), ["1", "2", "3", "1", "2"], "the new epoch's events are forwarded");
+  assert.equal(r.world.rec.events_cursor.last_id, "2");
+  appendFileSync(r.file(0), `${ev(3)}\n${ev(4)}\n`);
+  await tail(r);
+  assert.deepEqual(r.ids().slice(-2), ["3", "4"], "and the run goes on from there");
+});
+
+test("a read that failed is not the end of the segment: no roll-over, no cursor move, and it is read again next round", async () => {
+  const r = rig();
+  writeFileSync(r.file(1), `${ev(1)}\n${ev(2)}\n`);
+  await tail(r);
+  appendFileSync(r.file(1), `${ev(3)}\n`);
+  writeFileSync(r.file(2), `${ev(4)}\n`); // a newer segment exists, so an empty read would roll over
+  const real = r.deps.exec;
+  r.deps.exec = (inst, command, timeout) => real(inst, command.replace("tail -c", "false -c"), timeout);
+  const before = { ...r.world.rec.events_cursor };
+  await tail(r);
+  assert.deepEqual(r.world.rec.events_cursor, before, "the cursor did not move, in particular did not roll to segment 2");
+  assert.deepEqual(r.ids(), ["1", "2"]);
+  r.deps.exec = real;
+  await tail(r);
+  await tail(r);
+  assert.deepEqual(r.ids(), ["1", "2", "3", "4"], "nothing was skipped");
 });
 
 test("an idle round is one exec, not two", async () => {
@@ -419,4 +451,15 @@ test("appStatus carries the outcome only, and appEvent goes out with a stream de
   writeFileSync(r.file(1), `${ev(7)}\n`);
   await seams.tailEvents!(r.ctx());
   assert.equal(out[1]!.opts?.msgID, `${RUN_ID}:7`);
+});
+
+test("the tailer's exec is untracked: a forwarding round is not registered as a user job", async () => {
+  const r = rig();
+  const seen: Array<{ untracked?: boolean } | undefined> = [];
+  const sandbox = { ...r.world.sandbox, exec: (i: never, c: string, t: string, o?: { untracked?: boolean }) => { seen.push(o); return r.deps.exec(i, c, t); } };
+  const seams = eventForwardingSeams(r.world.store, sandbox as never, async () => undefined);
+  writeFileSync(r.file(1), `${ev(1)}\n`);
+  await seams.tailEvents!(r.ctx());
+  assert.ok(seen.length >= 1);
+  assert.ok(seen.every((o) => o?.untracked === true), JSON.stringify(seen));
 });

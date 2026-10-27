@@ -494,6 +494,69 @@ export const APP_EVENT_UNIQUE_INDEX_SQL = `CREATE UNIQUE INDEX CONCURRENTLY IF N
   WHERE event = 'appEvent'`;
 
 /**
+ * Delete the later copies of every app event stored more than once, keeping the
+ * earliest row (lowest id) of each (session, app run, CloudEvents id). Only run
+ * when the unique index could not be built because such pairs exist, which is
+ * how the degraded mode (index missing, repeats stored) ends instead of lasting.
+ */
+export const APP_EVENT_DEDUP_SQL = `DELETE FROM claw_session_events a
+  USING claw_session_events b
+  WHERE a.event = 'appEvent' AND b.event = 'appEvent'
+    AND a.session_id = b.session_id
+    AND a.data->>'app_task_id' = b.data->>'app_task_id'
+    AND (a.data->'event')->>'id' = (b.data->'event')->>'id'
+    AND a.id > b.id`;
+
+/**
+ * Build an index CONCURRENTLY, never fatally. A failure is logged, and an INVALID
+ * leftover (which IF NOT EXISTS would then skip for ever) is dropped so the next
+ * boot retries. `onUniqueViolation`, for a unique index, repairs the data that
+ * broke the build and the build is tried once more.
+ */
+export async function buildIndexConcurrently(
+  client: StatementRunner,
+  name: string,
+  createSql: string,
+  opts: { onUniqueViolation?: () => Promise<void> } = {},
+): Promise<"built" | "failed"> {
+  let failure: unknown = null;
+  try {
+    await client.query(createSql);
+    return "built";
+  } catch (err) {
+    failure = err;
+  }
+  if ((failure as { code?: string })?.code === "23505" && opts.onUniqueViolation) {
+    logger.error({ index: name, err: (failure as Error)?.message }, "db.index_unique_violation_repairing");
+    try {
+      await opts.onUniqueViolation();
+      await dropInvalidIndex(client, name);
+      await client.query(createSql);
+      return "built";
+    } catch (err) {
+      failure = err;
+    }
+  }
+  logger.warn({ err: (failure as Error)?.message, index: name }, "db.index_build_failed");
+  await dropInvalidIndex(client, name);
+  return "failed";
+}
+
+async function dropInvalidIndex(client: StatementRunner, name: string): Promise<void> {
+  const leftover = await readIndexValidity(client, name).catch(() => ({ rows: [] as Array<{ indisvalid: boolean }> }));
+  if (leftover.rows[0]?.indisvalid === false) {
+    await client.query(`DROP INDEX CONCURRENTLY IF EXISTS ${name}`).catch(() => {});
+  }
+}
+
+/** The app-event unique index, repairing stored repeats first if they are what stops it. */
+export function buildAppEventIndex(client: StatementRunner): Promise<"built" | "failed"> {
+  return buildIndexConcurrently(client, "uq_session_events_app_event", APP_EVENT_UNIQUE_INDEX_SQL, {
+    onUniqueViolation: async () => { await client.query(APP_EVENT_DEDUP_SQL); },
+  });
+}
+
+/**
  * Returned rather than executed so the schema tests drive this migration itself:
  * a fixture that restates the DDL passes whatever the production statements do.
  */
@@ -1295,25 +1358,14 @@ export async function initDb(): Promise<void> {
     //
     // CONCURRENTLY, like idx_events_session_recent below: a plain build takes SHARE
     // on the table the event-consumer writes for every Brain event. And not fatal:
-    // a build that fails (a lock or statement timeout, or a duplicate pair already
-    // stored) is logged and the API starts without it. Until the index is valid the
+    // a build that fails (a lock or statement timeout) is logged and the API starts
+    // without it; a build stopped by repeats already stored deletes the later copies
+    // (keeping the earliest) and builds again, so the degraded mode ends. Until the index is valid the
     // consumer's bare `ON CONFLICT DO NOTHING` de-duplicates nothing, so a repeated
     // app event is stored twice, which is the degraded mode and not an outage.
     // A killed or failed build leaves an INVALID index that IF NOT EXISTS then
     // skips; dropping only that leftover lets the next boot retry.
-    try {
-      await client.query(APP_EVENT_UNIQUE_INDEX_SQL);
-    } catch (err) {
-      logger.warn({ err: (err as Error)?.message }, "db.uq_session_events_app_event_failed (repeated app events are not de-duplicated until it builds)");
-      const leftover = await client.query(
-        `SELECT indisvalid FROM pg_index i
-           JOIN pg_class c ON c.oid = i.indexrelid
-          WHERE c.relname = 'uq_session_events_app_event'`,
-      ).catch(() => ({ rows: [] as Array<{ indisvalid: boolean }> }));
-      if (leftover.rows[0]?.indisvalid === false) {
-        await client.query("DROP INDEX CONCURRENTLY IF EXISTS uq_session_events_app_event").catch(() => {});
-      }
-    }
+    await buildAppEventIndex(client);
 
     // The turn a completion produced, named by the message that asked for it.
     //
@@ -1432,23 +1484,11 @@ export async function initDb(): Promise<void> {
     // this function commits on its own, which is what CONCURRENTLY requires.
     // A killed build leaves an INVALID index that IF NOT EXISTS then skips;
     // dropping only that leftover lets the next boot retry.
-    try {
-      await client.query(
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_session_recent ON claw_session_events(session_id, created_at DESC)",
-      );
-    } catch (err) {
-      logger.warn({ err: (err as Error)?.message }, "db.idx_events_session_recent_failed");
-      const leftover = await client.query(
-        `SELECT indisvalid FROM pg_index i
-           JOIN pg_class c ON c.oid = i.indexrelid
-          WHERE c.relname = 'idx_events_session_recent'`,
-      ).catch(() => ({ rows: [] as Array<{ indisvalid: boolean }> }));
-      if (leftover.rows[0]?.indisvalid === false) {
-        await client.query(
-          "DROP INDEX CONCURRENTLY IF EXISTS idx_events_session_recent",
-        ).catch(() => {});
-      }
-    }
+    await buildIndexConcurrently(
+      client,
+      "idx_events_session_recent",
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_session_recent ON claw_session_events(session_id, created_at DESC)",
+    );
 
     // E2: skill sub-files (multi-file skill support).
     // No FK on purpose — soft-delete the parent skill, orphan rows cleaned by

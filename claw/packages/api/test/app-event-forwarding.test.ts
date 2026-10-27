@@ -15,8 +15,9 @@ import test, { after, before, beforeEach } from "node:test";
 
 import { APP_EVENT_ID, APP_EVENT_SEGMENT_NAME } from "@claw/protocol";
 import { consumeEventDelivery, tombstoneReader } from "../src/events/consumer.js";
-import { APP_EVENT_UNIQUE_INDEX_SQL } from "../src/infra/db.js";
-import { appEventIdentity, appEventKey } from "../src/events/app-events.js";
+import { APP_EVENT_UNIQUE_INDEX_SQL, buildAppEventIndex, buildIndexConcurrently } from "../src/infra/db.js";
+import { db } from "../src/infra/db.js";
+import { AppEventOrder, appEventIdentity, appEventKey } from "../src/events/app-events.js";
 import { historySegment, isRepeatOfStoredAppEvent } from "../src/routes/events.js";
 import { parseAppRunPatch } from "../src/routes/internal-apps.js";
 import { patchAppRun, readAppRun } from "../src/tasks/app-run-state.js";
@@ -192,4 +193,50 @@ test("the shared cursor shapes are the protocol's", () => {
   assert.equal(APP_EVENT_SEGMENT_NAME.test("1.jsonl"), false);
   assert.equal(APP_EVENT_ID.test("18446744073709551615"), true);
   assert.equal(APP_EVENT_ID.test("1".repeat(21)), false);
+});
+
+// ---------------------------------------------------------------------------
+// the degraded mode ends
+// ---------------------------------------------------------------------------
+
+test("with repeats already stored, the index build deletes the later copies (keeping the earliest) and succeeds", async () => {
+  await harness.sql("DROP INDEX IF EXISTS uq_session_events_app_event");
+  await deliver(appEvent("t1", "7"), 1);
+  await deliver(appEvent("t1", "7"), 2); // stored twice: no index, the degraded mode
+  await deliver(appEvent("t1", "7"), 3);
+  await deliver(appEvent("t1", "8"), 4);
+  await deliver(appEvent("t2", "7"), 5);
+  assert.equal((await rows()).length, 5);
+
+  assert.equal(await buildAppEventIndex(db as never), "built");
+  const kept = await rows();
+  assert.deepEqual(kept.map((r) => r.event_id), ["claw-1", "claw-4", "claw-5"], "the earliest of each identity stays");
+  const valid = await harness.sql("SELECT indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = 'uq_session_events_app_event'");
+  assert.equal(valid[0]!.indisvalid, true);
+  assert.deepEqual(await deliver(appEvent("t1", "7"), 9), ["ack"]);
+  assert.equal((await rows()).length, 3, "de-duplication is back");
+});
+
+test("buildIndexConcurrently reports a failure without throwing, and without a repair hook does not touch the data", async () => {
+  await harness.sql("DROP INDEX IF EXISTS uq_session_events_app_event");
+  await deliver(appEvent("t1", "7"), 1);
+  await deliver(appEvent("t1", "7"), 2);
+  const result = await buildIndexConcurrently(db as never, "uq_session_events_app_event", APP_EVENT_UNIQUE_INDEX_SQL);
+  assert.equal(result, "failed");
+  assert.equal((await rows()).length, 2);
+  await harness.reset();
+  await harness.sql(APP_EVENT_UNIQUE_INDEX_SQL);
+});
+
+test("a live app event is checked against the database only when it could be a repeat: first of its run on the connection, or not above the highest id seen", () => {
+  const order = new AppEventOrder();
+  const id = (task: string, n: string) => appEventIdentity(appEvent(task, n))!;
+  assert.equal(order.mayBeRepeat(id("t1", "5")), true, "first of its run on this connection");
+  assert.equal(order.mayBeRepeat(id("t1", "6")), false, "above the highest seen: new");
+  assert.equal(order.mayBeRepeat(id("t1", "7")), false);
+  assert.equal(order.mayBeRepeat(id("t1", "7")), true, "not above the highest: a repeat is possible");
+  assert.equal(order.mayBeRepeat(id("t1", "3")), true);
+  assert.equal(order.mayBeRepeat(id("t1", "100")), false, "numeric, not text, order");
+  assert.equal(order.mayBeRepeat(id("t2", "1")), true, "another run starts its own order");
+  assert.equal(order.mayBeRepeat({ appTaskId: "t3", eventId: "not-a-number" }), true, "anything unreadable is checked");
 });

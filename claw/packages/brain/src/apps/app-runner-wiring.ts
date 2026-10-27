@@ -62,7 +62,8 @@ export function eventForwardingSeams(
 ): AppRunnerSeams {
   if (!publish) return {};
   const tailer = createEventTailer({
-    exec: (inst, command, timeout) => sandbox.exec(inst, command, timeout),
+    // Untracked, like every other exec the runner makes: a forwarding round is not user work.
+    exec: (inst, command, timeout) => sandbox.exec(inst, command, timeout, { untracked: true }),
     store,
     // The same event published again (a takeover re-reads a batch) is dropped by the stream itself.
     publish: (sessionId, message) => publish(sessionId, message, { msgID: `${message.app_task_id}:${String(message.event.id)}` }),

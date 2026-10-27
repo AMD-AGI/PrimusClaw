@@ -61,6 +61,8 @@ import {
 const logger = pino({ name: "app-runner" });
 
 export const RECONCILE_INTERVAL_MS = 5_000;
+/** How long the `ended` announcement is waited for before the run goes on without it. */
+export const STATUS_PUBLISH_TIMEOUT_MS = 5_000;
 const EXEC_TIMEOUT = "30s";
 /** Consecutive failed launches in one sandbox before it counts as the application failing. */
 const START_FAILURES_BEFORE_RESTART = 3;
@@ -170,6 +172,7 @@ export interface AppRunnerDeps {
   now?: () => number;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   tickMs?: number;
+  statusTimeoutMs?: number;
 }
 
 export interface AppRunOutcome {
@@ -1000,9 +1003,17 @@ export class AppRunner {
     const seam = this.seams.stateChanged;
     if (!seam || this.rec.state === before) return;
     const record = this.rec;
-    void Promise.resolve().then(() => seam(record)).catch((err) => {
+    const announce = Promise.resolve().then(() => seam(record)).catch((err) => {
       logger.warn({ runId: this.runId, seam: "state_changed", err: this.safeText(err) }, "app_run.seam_failed");
     });
+    // The last state is waited for (bounded): the caller goes on to finish the task,
+    // and a client that follows `appStatus` must see `ended` before that completion,
+    // not instead of it. Every other change is announced without waiting.
+    if (record.state === "ended") {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([announce, new Promise<void>((resolve) => { timer = setTimeout(resolve, this.deps.statusTimeoutMs ?? STATUS_PUBLISH_TIMEOUT_MS); })]);
+      clearTimeout(timer);
+    }
   }
 
   private exitRecord(exit: Extract<ExitRead, { kind: "exit" }>, cause: AppLastExit["cause"]): AppLastExit {

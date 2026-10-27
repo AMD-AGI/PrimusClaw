@@ -836,3 +836,24 @@ test("S3 the seams get a scrub only once the run's secrets are loaded", async ()
   assert.equal(seen.length, 1);
   assert.equal(seen[0], undefined, "no scrub, so a seam that needs one must not read");
 });
+
+test("S4 the ended announcement is out before finishNow returns; a hung one is given up on after the bound", async () => {
+  const order: string[] = [];
+  const slow: AppRunnerSeams = {
+    stateChanged: async (rec) => { if (rec.state === "ended") { await new Promise((r) => setTimeout(r, 30)); order.push("appStatus ended"); } },
+  };
+  const h = harness({ seams: slow });
+  await toRunning(h);
+  await h.runner.finishNow("cancelled");
+  order.push("finishNow returned");
+  assert.deepEqual(order, ["appStatus ended", "finishNow returned"]);
+
+  const hung = new World(MANIFEST);
+  const runner = new AppRunner(RUN_ID, "pk", {
+    store: hung.store, sandbox: hung.sandbox, seams: { stateChanged: (rec) => (rec.state === "ended" ? new Promise<void>(() => undefined) : Promise.resolve()) },
+    now: hung.now, sleep: hung.sleep, tickMs: 5000, statusTimeoutMs: 20,
+  });
+  const started = Date.now();
+  assert.equal(await runner.markEnded("no key"), true);
+  assert.ok(Date.now() - started < 2000, "gave up on the hung announcement");
+});

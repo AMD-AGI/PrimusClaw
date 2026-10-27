@@ -6,7 +6,7 @@ import { getUser } from "../auth/middleware.js";
 import { canAccessSessionAsOperator } from "../auth/models.js";
 import { db } from "../infra/db.js";
 import { createSessionSubscription } from "../events/store.js";
-import { appEventIdentity, appEventKey } from "../events/app-events.js";
+import { AppEventOrder, appEventIdentity, appEventKey } from "../events/app-events.js";
 import { redactPublicJson } from "../events/redaction.js";
 /**
  * V2-native SSE event stream: Brain events are forwarded verbatim (raw V2
@@ -211,6 +211,7 @@ export async function registerEventRoutes(app: FastifyInstance): Promise<void> {
       const subscription = createSessionSubscription(sessionId);
       const seenIds = new Set<string>();
       const seenAppEvents = new Set<string>();
+      const appEventOrder = new AppEventOrder();
 
       // 1. Push history from DB — one SSE frame per row.
       const afterEventId = req.query.after || null;
@@ -260,7 +261,8 @@ export async function registerEventRoutes(app: FastifyInstance): Promise<void> {
           if (appKey !== null) {
             if (seenAppEvents.has(appKey)) continue;
             seenAppEvents.add(appKey);
-            if (await isRepeatOfStoredAppEvent(sessionId, evt, liveId).catch(() => false)) continue;
+            const identity = appEventIdentity(evt);
+            if (identity && appEventOrder.mayBeRepeat(identity) && await isRepeatOfStoredAppEvent(sessionId, evt, liveId).catch(() => false)) continue;
           }
           if (!sseWrite(`id: ${liveId}\nevent: ${name}\ndata: ${JSON.stringify(evt)}\n\n`)) break;
         }

@@ -56,6 +56,8 @@ export interface EventTailerDeps {
   store: Pick<AppRunStore, "patch">;
   /** To the session's event stream, `events.<sessionId>`. */
   publish(sessionId: string, message: AppEventMessage): Promise<void>;
+  /** Runs already warned about waiting for their secrets (see tailOnce); the tailer creates it. */
+  waitingForSecrets?: Set<string>;
 }
 
 export interface Scan {
@@ -95,14 +97,19 @@ export function checkEnvelope(value: unknown): { ok: true; id: bigint } | { ok: 
 const toBigInt = (id: string | undefined): bigint | null => (id !== undefined && DECIMAL_ID.test(id) ? BigInt(id) : null);
 
 /**
- * Bytes of one segment from `offset`, at most `limit`, as one line of base64 (so
- * the byte count survives the exec text channel). Prints nothing when the file is not there.
+ * Bytes of one segment from `offset`, at most `limit`, as base64 (so the byte
+ * count survives the exec text channel), then a line `OK`. The `OK` is printed
+ * only when every step succeeded: a pipeline's status is its last command's, so
+ * a `tail` that failed would otherwise read as an empty, finished segment.
+ * Each step writes a temporary file and is checked on its own. A file that is
+ * not there prints just `OK` (nothing to read).
  */
 export function readCommand(file: string, offset: number, limit: number): string {
   const f = shq(file);
-  return `if [ -f ${f} ]; then tail -c +${offset + 1} ${f} | head -c ${limit} | base64 | tr -d '\\n'; fi`;
+  return `if [ -f ${f} ]; then t=$(mktemp) && u=$(mktemp) && tail -c +${offset + 1} ${f} >"$t" && head -c ${limit} "$t" >"$u" && b=$(base64 "$u") && { printf '%s\\n' "$b"; echo ${OK_MARK}; }; rm -f "$t" "$u"; else echo ${OK_MARK}; fi`;
 }
 
+const OK_MARK = "OK";
 const SEPARATOR = "@@claw-events-read@@";
 
 /**
@@ -111,15 +118,41 @@ const SEPARATOR = "@@claw-events-read@@";
  * (see the second rule in the header), because one shell runs them in order.
  */
 export function roundCommand(dir: string, cursorSegment: string | undefined, offset: number, limit: number): string {
-  const read = cursorSegment ? readCommand(`${dir}/${cursorSegment}`, offset, limit) : "true";
+  const read = cursorSegment ? readCommand(`${dir}/${cursorSegment}`, offset, limit) : `echo ${OK_MARK}`;
   return `ls -1 ${shq(dir)} 2>/dev/null; echo ${SEPARATOR}; ${read}`;
 }
 
-function splitRound(stdout: string): { listing: string; payload: string } | null {
-  const at = stdout.indexOf(`${SEPARATOR}\n`);
-  const end = at < 0 ? stdout.indexOf(SEPARATOR) : at;
-  if (end < 0) return null;
-  return { listing: stdout.slice(0, end), payload: stdout.slice(end + SEPARATOR.length).trim() };
+/** The listing, and the payload as base64 text; `payload` is null when the read did not report success. */
+function splitRound(stdout: string): { listing: string; payload: string | null } | null {
+  const at = stdout.indexOf(SEPARATOR);
+  if (at < 0) return null;
+  return { listing: stdout.slice(0, at), payload: payloadOf(stdout.slice(at + SEPARATOR.length)) };
+}
+
+function payloadOf(text: string): string | null {
+  const lines = text.split("\n").map((l) => l.trim()).filter((l) => l !== "");
+  if (lines.at(-1) !== OK_MARK) return null;
+  return lines.slice(0, -1).join("");
+}
+
+/** The first complete line's id, when it is an event; null otherwise. */
+function firstEventId(scan: Scan): bigint | null {
+  for (const line of scan.lines) {
+    if (line.text.length === 0) continue;
+    try {
+      const envelope = checkEnvelope(JSON.parse(line.text.toString("utf8")));
+      return envelope.ok ? envelope.id : null;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+function readFailed(runId: string, segment: string, idle: { cursor: AppEventsCursor; progressed: boolean }) {
+  // The cursor stays and nothing is rolled over: what could not be read is read again next round.
+  logger.warn({ runId, segment }, "app_events.read_failed");
+  return idle;
 }
 
 function sameCursor(a: AppEventsCursor, b: AppEventsCursor): boolean {
@@ -157,9 +190,12 @@ export async function tailOnce(
   if (!where) return idle;
   const { record } = where;
   if (!ctx.scrub) {
-    logger.warn({ runId: record.run_id }, "app_events.waiting_for_secrets");
+    // Once per run until the secrets load; the runner already warns about the load each tick.
+    if (!deps.waitingForSecrets?.has(record.run_id)) logger.warn({ runId: record.run_id }, "app_events.waiting_for_secrets");
+    deps.waitingForSecrets?.add(record.run_id);
     return idle;
   }
+  deps.waitingForSecrets?.delete(record.run_id);
   const scrub = ctx.scrub;
 
   // The listing comes first: see the second rule in the header.
@@ -174,10 +210,12 @@ export async function tailOnce(
   let segment: string;
   let offset: number;
   let payload: string | null = null;
+  let numberingWentBack = false;
   if (from.segment && segments.includes(from.segment)) {
     segment = from.segment;
     offset = startOffset;
     payload = round.payload;
+    if (payload === null) return readFailed(record.run_id, segment, idle);
   } else if (!from.segment) {
     segment = segments[0]!;
     offset = 0;
@@ -190,6 +228,7 @@ export async function tailOnce(
       // Every segment is older than the cursor: the directory was emptied, or numbering started again.
       // Start over at the oldest one; `last_id` still drops what was forwarded already.
       segment = segments[0]!;
+      numberingWentBack = true;
       logger.warn({ runId: record.run_id, was: from.segment, now: segment }, "app_events.segment_numbering_went_back");
     }
     offset = 0;
@@ -199,7 +238,8 @@ export async function tailOnce(
   if (payload === null) {
     const read = await deps.exec(where.instance, readCommand(`${where.dir}/${segment}`, offset, EVENTS_READ_BYTES), EXEC_TIMEOUT);
     if (read.exitCode !== 0) return idle;
-    payload = read.stdout.trim();
+    payload = payloadOf(read.stdout);
+    if (payload === null) return readFailed(record.run_id, segment, idle);
   }
   const buf = Buffer.from(payload, "base64");
   const atEnd = buf.length < EVENTS_READ_BYTES;
@@ -208,6 +248,18 @@ export async function tailOnce(
   // First look at every line (cheap, no I/O): what is skipped, what is an event.
   let lastId = toBigInt(from.last_id);
   const plan: Planned[] = [];
+  let baseLastId = from.last_id;
+  if (numberingWentBack && lastId !== null) {
+    // Numbering went back. If the oldest segment's first event is also at or below
+    // `last_id`, the ids started again (directory wiped, or a new sandbox): a new
+    // producer epoch, where keeping `last_id` would drop every event from here on.
+    const firstId = firstEventId(scan);
+    if (firstId !== null && firstId <= lastId) {
+      logger.error({ runId: record.run_id, lastId: from.last_id, firstId: String(firstId) }, "app_events.event_ids_restarted_last_id_reset");
+      lastId = null;
+      baseLastId = undefined;
+    }
+  }
   for (const line of scan.lines) {
     const skip = (reason: string, id?: string): void => {
       logger.warn({ runId: record.run_id, segment, reason, ...(id ? { id } : {}) }, "app_events.skipped");
@@ -231,7 +283,7 @@ export async function tailOnce(
   }
 
   const cursorAfter = (count: number): AppEventsCursor => {
-    let lastForwarded = from.last_id;
+    let lastForwarded = baseLastId;
     for (const p of plan.slice(0, count)) if (p.event) lastForwarded = p.event.id;
     return {
       segment, offset: offset + (count > 0 ? plan[count - 1]!.end : 0),
@@ -279,7 +331,8 @@ export async function tailOnce(
 }
 
 /** The AppRunner's seams for event forwarding: one round per tick while running, and a bounded drain at finishing. */
-export function createEventTailer(deps: EventTailerDeps): Pick<AppRunnerSeams, "tailEvents" | "drainEvents"> {
+export function createEventTailer(given: EventTailerDeps): Pick<AppRunnerSeams, "tailEvents" | "drainEvents"> {
+  const deps: EventTailerDeps = { waitingForSecrets: new Set(), ...given };
   return {
     async tailEvents(ctx) {
       await tailOnce(deps, ctx, ctx.record.events_cursor ?? {});
