@@ -10,7 +10,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { startWorld, fakeHands, baseRequest } from "./support/platform-defaults-world.js";
-import { startPluginWorld, skillRow, mcpRow } from "./support/plugin-world.js";
+import { startPluginWorld, uniqueSession, skillRow, mcpRow } from "./support/plugin-world.js";
 
 const world = await startWorld();
 const pw = await startPluginWorld();
@@ -27,7 +27,7 @@ async function run(script: Parameters<typeof world.script>[0]) {
   world.script(script);
   world.llmBodies.length = 0;
   await new AgentEngine().execute(
-    baseRequest({ plugin_id: 5, plugin_tools: [skillRow(2, "board-ops"), mcpRow(17, pw.mcpUrl)] }),
+    baseRequest({ session_id: uniqueSession(), plugin_id: 5, plugin_tools: [skillRow(2, "board-ops"), mcpRow(17, pw.mcpUrl)] }),
     (async () => {}) as never, undefined, null as never, extras as never,
   );
   return { attached, calls: made.flatMap((h) => h.calls), prompt: world.llmBodies[0] ?? "" };

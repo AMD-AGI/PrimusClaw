@@ -95,3 +95,14 @@ export function mcpRow(id: number, url: string) {
 export function hooksRow(id: number, type = "hooks") {
   return { id, type, name: "guard", config: { s3_key: `hooks/h${id}` } };
 }
+
+let sessionSeq = 0;
+/**
+ * A session id no other test process shares. Brain stages a session's plugin
+ * files under `<tmp>/claw-plugin-work/<session_id>` and removes that directory
+ * when the run ends, so two test files (they run in parallel processes) using
+ * the same id delete each other's files mid-download.
+ */
+export function uniqueSession(): string {
+  return `plugin-test-${process.pid}-${++sessionSeq}`;
+}

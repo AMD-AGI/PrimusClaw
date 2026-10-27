@@ -22,7 +22,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { startWorld, skillZip, fakeHands, baseRequest, type Turn } from "./support/platform-defaults-world.js";
-import { startPluginWorld, skillRow, mcpRow, hooksRow } from "./support/plugin-world.js";
+import { startPluginWorld, uniqueSession, skillRow, mcpRow, hooksRow } from "./support/plugin-world.js";
 
 const world = await startWorld({ skills: [{ tool_id: 11 }, { tool_id: 12 }] });
 const pw = await startPluginWorld();
@@ -67,7 +67,7 @@ async function run(over: Record<string, unknown>, script: Turn[]) {
   const extras = { attachHands: async () => { attached++; const h = fakeHands(); made.push(h); return h as never; } };
   world.script(script);
   world.llmBodies.length = 0;
-  await new AgentEngine().execute(baseRequest(over), onEvent as never, undefined, null as never, extras as never);
+  await new AgentEngine().execute(baseRequest({ session_id: uniqueSession(), ...over }), onEvent as never, undefined, null as never, extras as never);
   return { attached, calls: made.flatMap((h) => h.calls), prompt: world.llmBodies[0] ?? "" };
 }
 
