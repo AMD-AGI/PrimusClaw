@@ -16,6 +16,8 @@ import { HitlController, refusalMessage } from "../src/agent/hitl.js";
 import {
   bashApprovalFromEnvValue, bashApprovalFromToolConfig, bashApprovalPolicyFrom, MALFORMED_LABEL,
 } from "../src/agent/bash-approval.js";
+import { resolveToolIds } from "../src/tools/resolve.js";
+import { resolvePluginToolsFromMessage } from "../src/tasks/plugin-from-message.js";
 import type { NatsDecisionMessage } from "../src/delivery/decision-dispatcher.js";
 
 // Generic example rules; nothing here names a real service.
@@ -338,4 +340,85 @@ test("refusalMessage: one helper, distinct and unambiguous per cause", () => {
   assert.match(refusalMessage({ cause: "timeout" }), /No decision was received in time; this action was not executed/);
   assert.match(refusalMessage({ cause: "no_channel" }), /not executed/);
   assert.match(refusalMessage({ reason: "legacy" }), /not executed: legacy/);
+});
+
+// ── compound commands, shell-string wrappers, unresolved tools ───────────────
+
+const FAMILY_TABLE: Array<[string, string]> = [
+  ["if", `if curl -fsS -X POST ${U}; then echo ok; fi`],
+  ["if with !", `if ! curl -X POST ${U}; then echo failed; fi`],
+  ["elif / else", `if false; then :; elif curl -X POST ${U}; then :; else :; fi`],
+  ["while", `while curl -sX POST ${U}; do sleep 1; done`],
+  ["until", `until curl -X POST ${U}; do sleep 1; done`],
+  ["for ... do", `for i in 1 2; do curl -X POST ${U}; done`],
+  ["brace group", `{ curl -X POST ${U}; } > out`],
+  ["bare !", `! curl -X POST ${U}`],
+  ["subshell", `( curl -X POST ${U} )`],
+  ["case arm", `case $x in a) curl -X POST ${U} ;; esac`],
+  ["function body", `f() { curl -X POST ${U}; }; f`],
+  ["watch with a quoted command", `watch -n 5 'curl -X POST ${U}'`],
+  ["watch with bare words", `watch -n 5 curl -X POST ${U}`],
+  ["flock -c", `flock /tmp/l -c 'curl -X POST ${U}'`],
+  ["flock with a command", `flock /tmp/l curl -X POST ${U}`],
+  ["su -c", `su -c 'curl -X POST ${U}' svc`],
+  ["su user -c", `su - svc -c "curl -sX POST ${U}"`],
+  ["sudo sh -c", `sudo sh -c 'curl -X POST ${U}'`],
+  ["ssh host command", `ssh -p 22 -i key host 'curl -X POST ${U}'`],
+  ["ssh host bare words", `ssh host curl -X POST ${U}`],
+  ["kubectl exec --", `kubectl -n ns exec -i deploy/x -- curl -X POST ${U}`],
+];
+test("compound commands and shell-string wrappers are looked into", () => {
+  const p = bashApprovalPolicyFrom([{ source: "t", value: POST_RULE }]);
+  for (const [why, cmd] of FAMILY_TABLE) assert.equal(p.check(cmd), "post", `${why}: ${cmd}`);
+});
+
+test("the same shapes with a read-only call still run", () => {
+  const p = bashApprovalPolicyFrom([{ source: "t", value: POST_RULE }]);
+  for (const cmd of [
+    `if curl -fsS ${U}; then echo ok; fi`, `for i in 1 2; do curl ${U}; done`, `watch -n 5 'curl ${U}'`,
+    `flock /tmp/l -c 'ls'`, `ssh host ls`, `su -c 'ls' svc`, `kubectl get pods`, `! false`,
+  ]) assert.equal(p.check(cmd), null, cmd);
+});
+
+function stubTools(handler: () => Response) {
+  const real = globalThis.fetch;
+  globalThis.fetch = (async () => handler()) as typeof globalThis.fetch;
+  return () => { globalThis.fetch = real; };
+}
+const rulesOf = (r: { bashApproval: unknown[] }) =>
+  bashApprovalPolicyFrom(r.bashApproval.map((value) => ({ source: "tool_config", value })));
+
+test("marketplace tools that cannot be resolved hold every bash command", async () => {
+  const listing = (tools: unknown[]) => () => new Response(JSON.stringify({ data: { tools } }), { status: 200 });
+  const cases: Array<[string, () => Response]> = [
+    ["tools API 500", () => new Response("boom", { status: 500 })],
+    ["tools API unreachable", () => { throw new Error("ECONNRESET"); }],
+    ["selected tool absent from the listing", listing([{ id: 7, name: "other", type: "mcp", config: {} }])],
+  ];
+  for (const [why, handler] of cases) {
+    const restore = stubTools(handler);
+    try {
+      const policy = rulesOf(await resolveToolIds([42], "k"));
+      assert.equal(policy.active, true, why);
+      assert.equal(policy.check("ls"), MALFORMED_LABEL, why);
+    } finally { restore(); }
+  }
+  // Resolved fine, with rules: those rules apply and nothing else is held.
+  const restore = stubTools(() => new Response(JSON.stringify({ data: { tools: [
+    { id: 42, name: "t", type: "mcp", config: { mcpServers: {}, bash_approval: RULES } },
+  ] } }), { status: 200 }));
+  try {
+    const policy = rulesOf(await resolveToolIds([42], "k"));
+    assert.equal(policy.check("ls"), null);
+    assert.equal(policy.check("rm -rf /data/x"), "rm of data");
+  } finally { restore(); }
+});
+
+test("a plugin tool row that cannot be read holds every bash command", async () => {
+  const req = (tools: unknown[]) => ({ plugin_id: 9, plugin_tools: tools, session_id: "s" }) as never;
+  const bad = await resolvePluginToolsFromMessage(req([null, { type: "rule" }]), undefined, "/tmp/ba-plugin-work/s");
+  assert.equal(rulesOf(bad).check("ls"), MALFORMED_LABEL);
+  const ok = await resolvePluginToolsFromMessage(
+    req([{ id: 1, type: "mcp", config: { mcpServers: {}, bash_approval: RULES } }]), undefined, "/tmp/ba-plugin-work/s2");
+  assert.equal(rulesOf(ok).check("ls"), null);
 });

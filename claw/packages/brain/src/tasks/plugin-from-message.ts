@@ -23,7 +23,7 @@ import {
 } from "../config.js";
 import { isSafeRelativePath } from "../sandbox/write.js";
 import type { HandsClient } from "../clients/hands.js";
-import { bashApprovalFromToolConfig } from "../agent/bash-approval.js";
+import { UNAVAILABLE_RULES, bashApprovalFromToolConfig } from "../agent/bash-approval.js";
 import {
   type HookRegistry,
   buildRegistryFromHooksField,
@@ -390,9 +390,13 @@ export async function resolvePluginToolsFromMessage(
   const stageRoot = createPrivateStagingRoot(workRoot);
 
   for (const item of raw) {
-    if (!item || typeof item !== "object") continue;
+    // A declared tool we cannot read may carry bash approval rules: hold bash.
+    if (!item || typeof item !== "object" || typeof (item as PluginToolRow).id !== "number") {
+      logger.warn({ pluginId: pid }, "plugin.tool_unreadable_holding_bash");
+      bashApproval.push(UNAVAILABLE_RULES);
+      continue;
+    }
     const tool = item as PluginToolRow;
-    if (typeof tool.id !== "number") continue;
     const cfg = (tool.config ?? {}) as Record<string, unknown>;
     const type = String(tool.type || "").toLowerCase();
     bashApproval.push(...bashApprovalFromToolConfig(cfg));

@@ -7,7 +7,7 @@ import path from "node:path";
 import AdmZip from "adm-zip";
 import pino from "pino";
 import { TOOLS_API_URL } from "../config.js";
-import { bashApprovalFromToolConfig } from "../agent/bash-approval.js";
+import { UNAVAILABLE_RULES, bashApprovalFromToolConfig } from "../agent/bash-approval.js";
 import type { EventCallback } from "@claw/protocol";
 import type { HandsClient } from "../clients/hands.js";
 import { isSafeRelativePath, uploadDirToSandbox } from "../sandbox/write.js";
@@ -63,6 +63,10 @@ export async function resolveToolIds(
     if (onEvent) {
       await onEvent({ type: "toolUsed", tool: "resolve_tools", actionId: "resolve_tools_fetch", status: "error", brief: "Failed to fetch tool configuration" });
     }
+    // The rules of the tools we could not read are unknown, so none is assumed:
+    // every bash command is held for this run rather than run unguarded.
+    logger.warn({ toolIds }, "resolve_tools.rules_unavailable_holding_bash");
+    bashApproval.push(UNAVAILABLE_RULES);
     return { mcpServers, skillContents, bashApproval };
   }
 
@@ -72,7 +76,12 @@ export async function resolveToolIds(
 
   for (const tid of toolIds) {
     const tool = tools[tid];
-    if (!tool) { logger.warn({ tid }, "resolve_tools.not_found"); continue; }
+    if (!tool) {
+      logger.warn({ tid }, "resolve_tools.not_found");
+      logger.warn({ tid }, "resolve_tools.rules_unavailable_holding_bash");
+      bashApproval.push(UNAVAILABLE_RULES);
+      continue;
+    }
     const toolName = (tool.name as string) ?? `tool_${tid}`;
     bashApproval.push(...bashApprovalFromToolConfig(tool.config));
 

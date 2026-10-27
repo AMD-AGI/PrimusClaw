@@ -51,9 +51,15 @@ export interface BashApprovalPolicy {
 /** Longer than any command a person would approve by reading; held unread. */
 const MAX_COMMAND_CHARS = 100_000;
 const MAX_SHELL_DEPTH = 3;
+/**
+ * Stands in for rules that should have been loaded and were not (a marketplace
+ * tool that could not be resolved). Not a rule list, so the policy treats it as
+ * malformed: every bash command is held and a warning is logged.
+ */
+export const UNAVAILABLE_RULES = "bash approval rules unavailable";
 export const MALFORMED_LABEL = "bash approval rules are malformed; every bash command is held";
 
-interface Segment { program: string; argv: string[] }
+interface Segment { program: string; argv: string[]; /** Shell text this command hands to a shell, parsed as nested commands. */ nested?: string }
 type RuleFn = (command: string, segments: Segment[]) => boolean;
 interface Rule { label: string; test: RuleFn }
 
@@ -63,7 +69,7 @@ const RULE_KEYS = new Set(["label", "regex", "flags", "program", "args_regex", "
  * their flags take a separate value / how many positional words come before the
  * command. Seen through, so `timeout 5 curl ...` is a curl.
  */
-const WRAPPERS: Record<string, { valueFlags: string[]; positional: number }> = {
+const WRAPPERS: Record<string, { valueFlags: string[]; positional: number; shell?: boolean; shellFlag?: string[] }> = {
   env: { valueFlags: ["-u", "-C", "-S"], positional: 0 },
   sudo: { valueFlags: ["-u", "-g", "-C", "-h", "-p", "-r", "-t", "-U", "-D", "-R", "-T"], positional: 0 },
   doas: { valueFlags: ["-u", "-C"], positional: 0 },
@@ -76,13 +82,18 @@ const WRAPPERS: Record<string, { valueFlags: string[]; positional: number }> = {
   stdbuf: { valueFlags: ["-i", "-o", "-e"], positional: 0 },
   setsid: { valueFlags: [], positional: 0 },
   timeout: { valueFlags: ["-k", "-s", "--kill-after", "--signal"], positional: 1 },
-  watch: { valueFlags: ["-n", "--interval", "-d"], positional: 0 },
-  flock: { valueFlags: ["-w", "-E", "--timeout"], positional: 1 },
+  // watch runs its words through `sh -c`; flock -c takes a shell string.
+  watch: { valueFlags: ["-n", "--interval", "-d"], positional: 0, shell: true },
+  flock: { valueFlags: ["-w", "-E", "--timeout"], positional: 1, shellFlag: ["-c", "--command"] },
   xargs: { valueFlags: ["-I", "-n", "-P", "-d", "-L", "-l", "-s", "-E", "-a", "-J", "--max-args", "--max-procs", "--delimiter", "--replace", "--arg-file"], positional: 0 },
 };
 /** Only inside `eval` / `shell -c`, where `echo cmd` output is what runs. */
 const ECHO_WRAPPERS = new Set(["echo", "printf"]);
-const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh"]);
+const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "su"]);
+/** Reserved words and grouping tokens that precede a command: `if curl ...; then`, `{ curl ...; }`. */
+const KEYWORDS = new Set(["if", "then", "elif", "else", "do", "while", "until", "!", "{", "}", "select", "coproc", "function"]);
+/** ssh flags that take a separate value, so the host and the remote command can be found. */
+const SSH_VALUE_FLAGS = new Set(["-p", "-i", "-l", "-o", "-F", "-J", "-L", "-R", "-D", "-b", "-c", "-e", "-m", "-O", "-S", "-w", "-E", "-B", "-I", "-W", "-Q"]);
 const TOO_DEEP = "<too-deep>";
 
 function closeOf(text: string, from: number, open: string, close: string): number {
@@ -112,6 +123,7 @@ export function parseSegments(text: string, depth = 0, echoRuns = false): Segmen
       const seg = toSegment(tokens, echoRuns);
       if (seg) {
         segments.push(seg);
+        if (seg.nested !== undefined) segments.push(...parseSegments(seg.nested, depth + 1, true));
         if (SHELLS.has(seg.program)) {
           const i = seg.argv.findIndex((a) => /^-[a-z]*c[a-z]*$/.test(a));
           if (i >= 0 && seg.argv[i + 1] !== undefined) segments.push(...parseSegments(seg.argv[i + 1], depth + 1, true));
@@ -160,23 +172,46 @@ export function parseSegments(text: string, depth = 0, echoRuns = false): Segmen
 
 function toSegment(tokens: string[], echoRuns: boolean): Segment | null {
   let i = 0;
+  let nested: string | undefined;
   while (i < tokens.length) {
     const t = tokens[i];
-    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) { i++; continue; }
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t) || KEYWORDS.has(t)) { i++; continue; }
     const base = t.split("/").pop()!;
     const w = Object.hasOwn(WRAPPERS, base) ? WRAPPERS[base] : undefined;
     if (!w && !(echoRuns && ECHO_WRAPPERS.has(base))) break;
     i++;
     if (!w) continue;
+    let viaFlag = false;
     while (i < tokens.length && tokens[i].startsWith("-") && tokens[i] !== "-") {
       const f = tokens[i++];
       if (f === "--") break;
+      if (w.shellFlag?.includes(f)) { nested = tokens.slice(i).join(" "); viaFlag = true; i = tokens.length; break; }
       if (w.valueFlags.includes(f)) i++;
     }
+    if (viaFlag) break;
     for (let n = 0; n < w.positional && i < tokens.length; n++) i++;
+    // flock puts -c after the lock file, not before it.
+    if (w.shellFlag && i < tokens.length && w.shellFlag.includes(tokens[i])) {
+      nested = tokens.slice(i + 1).join(" "); i = tokens.length; break;
+    }
+    if (w.shell && i < tokens.length) { nested = tokens.slice(i).join(" "); }
   }
-  if (i >= tokens.length) return null;
-  return { program: tokens[i].split("/").pop() ?? tokens[i], argv: tokens.slice(i + 1) };
+  if (i >= tokens.length) {
+    // `flock f -c 'cmd'` leaves no program word; the nested text is the command.
+    return nested === undefined ? null : { program: "flock", argv: [], nested };
+  }
+  const program = tokens[i].split("/").pop() ?? tokens[i];
+  const argv = tokens.slice(i + 1);
+  // Remote / container shells: the words after the host (ssh) or `--` (kubectl exec) are a command line.
+  if (program === "ssh") {
+    let k = 0;
+    while (k < argv.length && argv[k].startsWith("-")) k += SSH_VALUE_FLAGS.has(argv[k]) ? 2 : 1;
+    if (k + 1 < argv.length) nested = argv.slice(k + 1).join(" ");
+  } else if (program === "kubectl" || program === "oc") {
+    const d = argv.indexOf("--");
+    if (d >= 0 && d + 1 < argv.length) nested = argv.slice(d + 1).join(" ");
+  }
+  return { program, argv, ...(nested !== undefined ? { nested } : {}) };
 }
 
 /**
