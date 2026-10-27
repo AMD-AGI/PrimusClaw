@@ -1503,7 +1503,7 @@ const SETTLED_REASON_SQL =
  * this call is core NATS, so if the worker has not subscribed yet it is simply
  * lost, and the run carries on with nothing recording it.
  */
-export async function interruptUnstartedChatRuns(sessionId: string): Promise<number> {
+export async function interruptUnstartedChatRuns(sessionId: string, onlyMessageId?: string): Promise<number> {
   let rows: Array<{
     task_id: string; message_id: string | null; user_id: string | null; prompt: string | null;
     prior_status: string; queued_since: string | null;
@@ -1529,8 +1529,8 @@ export async function interruptUnstartedChatRuns(sessionId: string): Promise<num
           AND (
             status = 'queued'
             OR (status = 'preparing' AND lease_owner IS NULL)
-          )`,
-      params: [sessionId],
+          )${onlyMessageId === undefined ? "" : "\n          AND metadata->>'message_id' = $2"}`,
+      params: onlyMessageId === undefined ? [sessionId] : [sessionId, onlyMessageId],
     });
     rows = cancelled.map((row) => ({
       task_id: row.task_id,
@@ -1676,6 +1676,38 @@ export async function stopSessionRuns(sessionId: string): Promise<number> {
     logger.warn({ err, sessionId }, "chat_run.interrupt_publish_failed");
   }
   return await interruptSessionRuns(sessionId);
+}
+
+/**
+ * Stop the runs of ONE turn on a session, not the session's runs.
+ *
+ * For a caller that decided to stop a particular turn (the trigger time limit)
+ * and must not take out a turn that started after it decided. The decision is
+ * made against the turn's own rows: only rows carrying `messageId` are
+ * cancelled, and the wire interrupt -- which can only be addressed to the whole
+ * session -- is sent only when one of those rows was still live. A turn that has
+ * already ended leaves nothing to match, so a user's next turn in the same
+ * session is never touched.
+ */
+export async function stopTurnRuns(sessionId: string, messageId: string): Promise<number> {
+  const queued = await interruptUnstartedChatRuns(sessionId, messageId);
+  const live = (await db.query(
+    `SELECT task_id FROM claw_tasks
+      WHERE session_id = $1 AND origin = 'chat'
+        AND metadata->>'message_id' = $2
+        AND status IN ('preparing','running')`,
+    [sessionId, messageId],
+  )).rows as Array<{ task_id: string }>;
+  let moved = 0;
+  for (const row of live) if (await cancelUnheldRun(row.task_id)) moved += 1;
+  if (moved > 0) {
+    try {
+      chatRunPorts.publishInterrupt(interruptSubject(sessionId));
+    } catch (err) {
+      logger.warn({ err, sessionId }, "chat_run.interrupt_publish_failed");
+    }
+  }
+  return queued + moved;
 }
 
 /**

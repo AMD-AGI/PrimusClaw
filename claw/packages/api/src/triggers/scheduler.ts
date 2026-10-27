@@ -19,7 +19,7 @@ import {
   TRIGGER_RUN_TIME_LIMIT_SECONDS, TRIGGER_STALE_AFTER_SECONDS,
 } from "../config.js";
 import { db } from "../infra/db.js";
-import { stopSessionRuns } from "../tasks/chat-run.js";
+import { stopTurnRuns } from "../tasks/chat-run.js";
 import { fireTrigger, type TriggerRow } from "./fire.js";
 import { nextFireAfter } from "./schedule.js";
 
@@ -153,12 +153,14 @@ export async function enforceRunTimeLimit(now: Date = new Date()): Promise<numbe
         AND EXISTS (SELECT 1 FROM claw_sessions s
                      WHERE s.session_id = f.session_id AND s.agent_status = 'running'
                        AND s.agent_gate_message_id = f.message_id)
-      RETURNING f.session_id`,
+      RETURNING f.session_id, f.message_id`,
     [new Date(now.getTime() - TRIGGER_RUN_TIME_LIMIT_SECONDS * 1000)],
-  )).rows as Array<{ session_id: string }>;
+  )).rows as Array<{ session_id: string; message_id: string }>;
   for (const r of over) {
     try {
-      await stopSessionRuns(r.session_id);
+      // Scoped to the trigger's own turn: the gate match above can be stale by
+      // now, and a session-wide stop would take out a turn the user just began.
+      await stopTurnRuns(r.session_id, r.message_id);
       logger.warn({ sessionId: r.session_id }, "trigger.run_time_limit_stop");
     } catch (err) {
       logger.error({ err, sessionId: r.session_id }, "trigger.run_time_limit_stop_failed");

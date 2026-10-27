@@ -189,6 +189,10 @@ async function recordFailure(row: Claimed, status: string): Promise<void> {
         SET consecutive_failures = consecutive_failures + 1,
             failing_since = COALESCE(failing_since, NOW()),
             enabled = enabled AND COALESCE(failing_since, NOW()) > NOW() - make_interval(hours => $2),
+            -- Remember that it was the failure path that turned it off, so a
+            -- delivery already in flight on another replica can turn it back on.
+            auto_disabled = auto_disabled
+              OR (enabled AND NOT (COALESCE(failing_since, NOW()) > NOW() - make_interval(hours => $2))),
             updated_at = NOW()
       WHERE subscription_id = $1
       RETURNING enabled`,
@@ -241,7 +245,14 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
             [row.id, String(code)],
           );
           await db.query(
-            `UPDATE claw_notification_subscriptions SET consecutive_failures = 0, failing_since = NULL WHERE subscription_id = $1 AND (consecutive_failures <> 0 OR failing_since IS NOT NULL)`,
+            `UPDATE claw_notification_subscriptions
+                SET consecutive_failures = 0, failing_since = NULL,
+                    -- A 2xx proves the receiver works. If another replica's failure
+                    -- disabled the subscription while this send was in flight, undo
+                    -- that; a subscription the owner disabled is left alone.
+                    enabled = enabled OR auto_disabled, auto_disabled = FALSE
+              WHERE subscription_id = $1
+                AND (consecutive_failures <> 0 OR failing_since IS NOT NULL OR auto_disabled)`,
             [row.subscription_id],
           );
           delivered += 1;
