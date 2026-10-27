@@ -35,6 +35,13 @@ record it.
   see `claw/docs/platform-defaults.md`.
 
 ### Changed
+- Brain no longer fetches every plugin skill again on every turn. Downloaded skill
+  files are held in memory (bounded by `SKILL_CACHE_MAX_BYTES`, 64 MiB by default,
+  `0` turns it off) and reused while the skill is unchanged: a plugin skill is
+  validated with one object-store listing per turn (per-object ETag and size, so
+  an in-place upsert of the same version is picked up), a marketplace `tool_ids`
+  skill by its record's `version` and `updated_at`. A turn that finds a plugin
+  skill unchanged reads no object and reports no `download_skill` event for it.
 - A turn of a session with plugin tools no longer starts a sandbox before its
   first model call unless the plugin has a hooks-type tool: plugin skill files
   are written into the sandbox on the first sandbox call that names `.skills`,

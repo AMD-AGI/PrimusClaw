@@ -10,6 +10,7 @@ default; with `PLATFORM_DEFAULTS_FILE` unset, chats are built exactly as before.
 |---|---|---|
 | `PLATFORM_DEFAULTS_FILE` | unset | Path to the defaults file below. Unset, missing, unreadable or malformed means "not enabled" (a malformed file is logged and counted, and never fails a chat). Re-read when its mtime changes. |
 | `PROGRESSIVE_SKILLS_ENABLED` | `false` | Whether the file's `skills` apply. Off: only its `mcp_servers` are mounted and no skill is fetched. Also decides how a plugin's skills reach the prompt: on, they are listed by name and description like the defaults; off, every SKILL.md body is inlined. |
+| `SKILL_CACHE_MAX_BYTES` | `67108864` (64 MiB) | Bytes of downloaded skill files Brain keeps in memory between turns (plugin skills and `tool_ids` skills; not the platform default skills, which are staged separately). `0` turns the cache off and every turn downloads every skill. See "Skill cache". |
 
 ## The file
 
@@ -74,6 +75,34 @@ files included), and a plugin without a hooks-type tool starts no sandbox at the
 start of a turn: a turn that only calls MCP tools never opens one. A plugin with a
 hooks tool keeps its sandbox and skill writes at the start of the turn.
 
+### Skill cache
+
+A plugin skill used to be listed and read from the object store again on every
+turn. Brain now holds the files of each skill it has downloaded and reuses them
+while the skill is unchanged, so a turn that finds a plugin skill unchanged reads
+no object and reports no `download_skill` event for it.
+
+- **Plugin skills** (`config.s3_key`): the held copy is keyed by tool id and
+  `s3_key` (which carries the version) and validated every turn by one listing
+  of the skill's prefix, fingerprinted by each object's ETag and size. An in-place
+  upsert of the same version rewrites the objects under the same keys, so the
+  version string alone would not show it; the ETag does. The listings of all of a
+  turn's skills run at once.
+- **`tool_ids` skills**: keyed by tool id and validated by the tool record's
+  `version` and `updated_at`, which Brain already reads each turn and every
+  in-place update bumps. The skill is still installed for the turn every time; only
+  the fetch and the unpacking are saved.
+- A skill is downloaded, and not held, whenever it cannot be told apart from a
+  changed one: a store that returns no ETag, a failed listing, a record with no
+  `updated_at`, or an archive that has no `SKILL.md`. Concurrent turns that need
+  the same unheld version share one download.
+- The cache holds bytes, never directories: each turn gets its own copy in its own
+  private staging directory, so no turn can change another's files. It is bounded
+  by `SKILL_CACHE_MAX_BYTES` (least recently used out first; a skill larger than a
+  quarter of the bound is never held) and is per Brain process.
+- `claw_skill_stage_total{source,outcome}` counts skills staged per turn by
+  `source` (`plugin`, `tool`) and `outcome` (`hit`, `joined`, `downloaded`).
+
 ## Publishing default tools
 
 Brain looks each default up **by id** through the in-cluster API (`INTERNAL_BACKEND_URL`, route `/v1/tools/<id>`; the gateway `SAFE_API_URL/claw-api` path is used only when it is unset) with the **calling user's** key (10 s
@@ -105,3 +134,4 @@ increments a counter.
 | `claw_platform_skill_read_total{skill}` | Default skills the agent actually read. |
 | `claw_platform_skill_lazy_write_total{outcome,cold_sandbox}` | Lazy writes; `cold_sandbox` marks writes that came with a sandbox started by the same call. |
 | `claw_platform_skill_lazy_write_duration_seconds` | Time of one lazy write. |
+| `claw_skill_stage_total{source,outcome}` | Skills staged for a turn: `hit` (held copy), `joined` (a concurrent turn's download), `downloaded`. |
