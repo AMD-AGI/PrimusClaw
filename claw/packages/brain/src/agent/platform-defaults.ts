@@ -8,7 +8,7 @@ import YAML from "yaml";
 import pino from "pino";
 import { PLATFORM_DEFAULTS_FILE, TOOLS_API_URL } from "../config.js";
 import { metrics } from "../infra/metrics.js";
-import { findSkillMd, stageSkillArchive } from "../tools/resolve.js";
+import { downloadSkill, findSkillMd } from "../tools/resolve.js";
 import { uploadDirToSandbox } from "../sandbox/write.js";
 import { createPrivateStagingRoot } from "../tasks/plugin-from-message.js";
 import type { HandsClient } from "../clients/hands.js";
@@ -51,20 +51,29 @@ let cache: { file: string; mtimeMs: number; value: PlatformDefaults | null } | n
 export function loadPlatformDefaults(file: string = PLATFORM_DEFAULTS_FILE): PlatformDefaults | null {
   if (!file) return null;
   let mtimeMs: number;
+  let text: string;
   try {
-    mtimeMs = fs.statSync(file).mtimeMs;
+    // One descriptor for both the mtime and the bytes, so the cache key always
+    // describes the content that was read.
+    const fd = fs.openSync(file, "r");
+    try {
+      mtimeMs = fs.fstatSync(fd).mtimeMs;
+      if (cache && cache.file === file && cache.mtimeMs === mtimeMs) return cache.value;
+      text = fs.readFileSync(fd, "utf-8");
+    } finally {
+      fs.closeSync(fd);
+    }
   } catch (err) {
-    if (!cache || cache.file !== file || cache.value !== null || cache.mtimeMs !== -1) {
+    if (!cache || cache.file !== file || cache.mtimeMs !== -1) {
       logger.error({ file, err: (err as Error).message }, "platform_defaults.file_unreadable");
     }
     metrics.onPlatformDefault("config", "failed", "unreadable");
     cache = { file, mtimeMs: -1, value: null };
     return null;
   }
-  if (cache && cache.file === file && cache.mtimeMs === mtimeMs) return cache.value;
   let value: PlatformDefaults | null = null;
   try {
-    value = parseDefaults(JSON.parse(fs.readFileSync(file, "utf-8")));
+    value = parseDefaults(JSON.parse(text));
     metrics.onPlatformDefault("config", "ok", "loaded");
   } catch (err) {
     logger.error({ file, err: (err as Error).message }, "platform_defaults.file_invalid");
@@ -169,15 +178,12 @@ async function stageCached(toolId: number, name: string, version: string, apiKey
     fs.rmSync(final, { recursive: true, force: true });
   } catch { /* not cached */ }
 
-  const resp = await fetch(`${TOOLS_API_URL}/${toolId}/download`, { headers: { Authorization: `Bearer ${apiKey}` } });
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-  const buf = Buffer.from(await resp.arrayBuffer());
-  const contentType = resp.headers.get("content-type") ?? "";
   fs.mkdirSync(cacheRoot(), { recursive: true });
   const tmp = fs.mkdtempSync(path.join(cacheRoot(), `.stage-${toolId}-`));
   try {
-    stageSkillArchive(tmp, buf, contentType, toolId, name);
-    if (!findSkillMd(tmp)) throw new Error("SKILL.md not found after extraction");
+    // Same download + zip-slip-guarded extraction as a tool_ids skill, staged
+    // here instead of being uploaded to a sandbox.
+    await downloadSkill(toolId, name, apiKey, undefined, undefined, tmp);
     try {
       fs.renameSync(tmp, final);
     } catch {
