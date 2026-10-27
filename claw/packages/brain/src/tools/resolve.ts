@@ -117,12 +117,14 @@ export async function resolveToolIds(
  * Otherwise, files are written to a Brain-local temp directory (legacy path).
  * Returns SKILL.md contents.
  */
-async function downloadSkill(
+export async function downloadSkill(
   toolId: number,
   skillName: string,
   apiKey: string,
   sessionDir?: string,
   hands?: HandsClient,
+  /** Stage into this existing Brain-local directory instead of a fresh temp one. */
+  stageDir?: string,
 ): Promise<string> {
   const downloadUrl = `${TOOLS_API_URL}/${toolId}/download`;
   const resp = await fetch(downloadUrl, { headers: { Authorization: `Bearer ${apiKey}` } });
@@ -132,7 +134,7 @@ async function downloadSkill(
   const contentType = resp.headers.get("content-type") ?? "";
 
   // Always stage to a Brain-local temp dir so we can read SKILL.md locally.
-  const localDir = fs.mkdtempSync(path.join(os.tmpdir(), `claw-skill-${toolId}-`));
+  const localDir = stageDir ?? fs.mkdtempSync(path.join(os.tmpdir(), `claw-skill-${toolId}-`));
 
   // ZIP file (PK header or application/zip content-type)
   const isZip = (buf[0] === 0x50 && buf[1] === 0x4b) || contentType.includes("zip") || contentType.includes("octet-stream");
@@ -226,7 +228,7 @@ function copyDirSync(srcDir: string, dstDir: string): void {
 }
 
 /** Recursively find SKILL.md in a directory. */
-function findSkillMd(dir: string): string | null {
+export function findSkillMd(dir: string): string | null {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {

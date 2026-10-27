@@ -70,6 +70,53 @@ test("http url_regex sees the URL as written, so a variable base still matches",
   assert.equal(p.check('curl -X POST "$C/v1/public/x"'), null);
 });
 
+// Each row: a command a reviewer showed (or the same family) that must be held by a POST rule.
+const POST_RULE = [{ label: "post", http: { methods: ["POST"], url_prefix: "api.example.invalid" } }];
+const U = "https://api.example.invalid/v1/items";
+const BYPASS_TABLE: Array<[string, string]> = [
+  ["bundled -sX with the value as the next word", `curl -sX POST ${U}`],
+  ["bundled -sXPOST with the value attached", `curl -sXPOST ${U}`],
+  ["bundled -sd implies POST", `curl -sd @body.json ${U}`],
+  ["bundled -fsSL -X", `curl -fsSL -X POST ${U}`],
+  ["bundled -fsSLXPOST", `curl -fsSLXPOST ${U}`],
+  ["bundled body flag after others", `curl -sSd '{}' ${U}`],
+  ["--request=POST", `curl --request=POST ${U}`],
+  ["--request POST", `curl --request POST ${U}`],
+  ["$(...) inside double quotes", `RESP="$(curl -s -X POST ${U} -d '{}')"`],
+  ["backticks inside double quotes", `echo "\`curl -X POST ${U}\`"`],
+  ["nested substitution in double quotes", `echo "got: $(echo $(curl -X POST ${U}))"`],
+  ["timeout wrapper", `timeout 30 curl -X POST ${U}`],
+  ["timeout with flags", `timeout -k 5 -s KILL 30 curl -X POST ${U}`],
+  ["xargs wrapper", `echo x | xargs curl -X POST ${U}`],
+  ["xargs with its own flags", `echo x | xargs -n 1 -P 4 curl -sX POST ${U}`],
+  ["nice / nohup / stdbuf / time", `nice -n 5 nohup stdbuf -oL time curl -X POST ${U}`],
+  ["env then timeout", `env A=1 timeout 5 curl -sXPOST ${U}`],
+  ["bash -c with an inner substitution built by echo", `bash -c "$(echo curl -X POST ${U})"`],
+  ["eval of the same", `eval "curl -X POST ${U}"`],
+  ["sh -c with bundled flags", `sh -c 'curl -sX POST ${U}'`],
+  ["sudo with a flag value", `sudo -u svc curl -X POST ${U}`],
+];
+test("bypasses shown in review are held by a POST rule", () => {
+  const p = bashApprovalPolicyFrom([{ source: "t", value: POST_RULE }]);
+  for (const [why, cmd] of BYPASS_TABLE) assert.equal(p.check(cmd), "post", `${why}: ${cmd}`);
+});
+
+test("the same families with a non-matching method or host still run", () => {
+  const p = bashApprovalPolicyFrom([{ source: "t", value: POST_RULE }]);
+  for (const cmd of [
+    `curl -sX GET ${U}`, `curl -fsSL ${U}`, `timeout 30 curl ${U}`, `RESP="$(curl -s ${U})"`,
+    `curl -sX POST https://elsewhere.example.invalid/x`, `xargs echo hi`, `bash -c "$(echo ls)"`,
+    `curl -sG -d q=1 ${U}`,
+  ]) assert.equal(p.check(cmd), null, cmd);
+});
+
+test("a command nested deeper than the parser follows is held, not run", () => {
+  const p = bashApprovalPolicyFrom([{ source: "t", value: POST_RULE }]);
+  let c = `curl -X POST ${U}`;
+  for (let i = 0; i < 6; i++) c = `bash -c "${c.replace(/(["\\$`])/g, "\\$1")}"`;
+  assert.notEqual(p.check(c), null);
+});
+
 test("curl -T / --upload-file is a PUT, so a PUT rule holds it", () => {
   const p = bashApprovalPolicyFrom([{ source: "t", value: [
     { label: "put", http: { methods: ["PUT"], url_prefix: "console.example.invalid/api" } },

@@ -58,13 +58,49 @@ type RuleFn = (command: string, segments: Segment[]) => boolean;
 interface Rule { label: string; test: RuleFn }
 
 const RULE_KEYS = new Set(["label", "regex", "flags", "program", "args_regex", "http"]);
-const WRAPPERS = new Set(["env", "sudo", "doas", "time", "nohup", "command", "exec", "nice", "stdbuf", "setsid"]);
-/** Wrapper flags that take a value, so `sudo -u x curl` still finds curl. */
-const WRAPPER_VALUE_FLAGS = new Set(["-u", "-g", "-C", "-h", "-p", "-r", "-t", "-U", "-n", "-S", "-i", "-o", "-e", "-c", "-s"]);
+/**
+ * Programs that run another program given in their arguments, and which of
+ * their flags take a separate value / how many positional words come before the
+ * command. Seen through, so `timeout 5 curl ...` is a curl.
+ */
+const WRAPPERS: Record<string, { valueFlags: string[]; positional: number }> = {
+  env: { valueFlags: ["-u", "-C", "-S"], positional: 0 },
+  sudo: { valueFlags: ["-u", "-g", "-C", "-h", "-p", "-r", "-t", "-U", "-D", "-R", "-T"], positional: 0 },
+  doas: { valueFlags: ["-u", "-C"], positional: 0 },
+  time: { valueFlags: ["-f", "-o", "--format", "--output"], positional: 0 },
+  nohup: { valueFlags: [], positional: 0 },
+  command: { valueFlags: [], positional: 0 },
+  exec: { valueFlags: ["-a"], positional: 0 },
+  nice: { valueFlags: ["-n", "--adjustment"], positional: 0 },
+  ionice: { valueFlags: ["-c", "-n", "-p", "-P", "-u"], positional: 0 },
+  stdbuf: { valueFlags: ["-i", "-o", "-e"], positional: 0 },
+  setsid: { valueFlags: [], positional: 0 },
+  timeout: { valueFlags: ["-k", "-s", "--kill-after", "--signal"], positional: 1 },
+  watch: { valueFlags: ["-n", "--interval", "-d"], positional: 0 },
+  flock: { valueFlags: ["-w", "-E", "--timeout"], positional: 1 },
+  xargs: { valueFlags: ["-I", "-n", "-P", "-d", "-L", "-l", "-s", "-E", "-a", "-J", "--max-args", "--max-procs", "--delimiter", "--replace", "--arg-file"], positional: 0 },
+};
+/** Only inside `eval` / `shell -c`, where `echo cmd` output is what runs. */
+const ECHO_WRAPPERS = new Set(["echo", "printf"]);
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh"]);
+const TOO_DEEP = "<too-deep>";
+
+function closeOf(text: string, from: number, open: string, close: string): number {
+  let depth = 1;
+  for (let i = from; i < text.length; i++) {
+    const c = text[i];
+    if (c === "\\") { i++; continue; }
+    if (c === "'" && open === "(") { const j = text.indexOf("'", i + 1); if (j < 0) return text.length; i = j; continue; }
+    if (open === close) { if (c === close) return i; continue; }
+    if (c === open) depth++;
+    else if (c === close && --depth === 0) return i;
+  }
+  return text.length;
+}
 
 /** Split shell text into simple commands, each as program + argv. */
-export function parseSegments(text: string, depth = 0): Segment[] {
+export function parseSegments(text: string, depth = 0, echoRuns = false): Segment[] {
+  if (depth > MAX_SHELL_DEPTH) return [{ program: TOO_DEEP, argv: [] }];
   const segments: Segment[] = [];
   let tokens: string[] = [];
   let cur = "";
@@ -73,12 +109,14 @@ export function parseSegments(text: string, depth = 0): Segment[] {
   const endSegment = () => {
     endToken();
     if (tokens.length) {
-      const seg = toSegment(tokens);
+      const seg = toSegment(tokens, echoRuns);
       if (seg) {
         segments.push(seg);
-        if (depth < MAX_SHELL_DEPTH && SHELLS.has(seg.program)) {
+        if (SHELLS.has(seg.program)) {
           const i = seg.argv.findIndex((a) => /^-[a-z]*c[a-z]*$/.test(a));
-          if (i >= 0 && seg.argv[i + 1] !== undefined) segments.push(...parseSegments(seg.argv[i + 1], depth + 1));
+          if (i >= 0 && seg.argv[i + 1] !== undefined) segments.push(...parseSegments(seg.argv[i + 1], depth + 1, true));
+        } else if (seg.program === "eval") {
+          segments.push(...parseSegments(seg.argv.join(" "), depth + 1, true));
         }
       }
     }
@@ -95,8 +133,20 @@ export function parseSegments(text: string, depth = 0): Segment[] {
     if (c === '"') {
       i++;
       for (; i < text.length && text[i] !== '"'; i++) {
-        if (text[i] === "\\" && i + 1 < text.length && /["\\$`\n]/.test(text[i + 1])) i++;
-        cur += text[i];
+        const d = text[i];
+        if (d === "\\" && i + 1 < text.length && /["\\$`\n]/.test(text[i + 1])) { i++; cur += text[i]; continue; }
+        // A substitution inside double quotes still runs: its body is a command.
+        if (d === "$" && text[i + 1] === "(") {
+          const end = closeOf(text, i + 2, "(", ")");
+          segments.push(...parseSegments(text.slice(i + 2, end), depth + 1, echoRuns));
+          cur += text.slice(i, end + 1); i = end; continue;
+        }
+        if (d === "`") {
+          const end = closeOf(text, i + 1, "`", "`");
+          segments.push(...parseSegments(text.slice(i + 1, end), depth + 1, echoRuns));
+          cur += text.slice(i, end + 1); i = end; continue;
+        }
+        cur += d;
       }
       has = true; continue;
     }
@@ -108,24 +158,48 @@ export function parseSegments(text: string, depth = 0): Segment[] {
   return segments;
 }
 
-function toSegment(tokens: string[]): Segment | null {
+function toSegment(tokens: string[], echoRuns: boolean): Segment | null {
   let i = 0;
-  for (; i < tokens.length; i++) {
+  while (i < tokens.length) {
     const t = tokens[i];
-    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) continue;
-    if (WRAPPERS.has(t.split("/").pop()!)) {
-      const w = t.split("/").pop()!;
-      while (i + 1 < tokens.length && tokens[i + 1].startsWith("-")) {
-        i++;
-        // env -i / nice -n 5 etc: only sudo-family and nice take a value after a flag.
-        if ((w === "sudo" || w === "doas" || w === "nice" || w === "stdbuf") && WRAPPER_VALUE_FLAGS.has(tokens[i]) && i + 1 < tokens.length) i++;
-      }
-      continue;
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) { i++; continue; }
+    const base = t.split("/").pop()!;
+    const w = WRAPPERS[base];
+    if (!w && !(echoRuns && ECHO_WRAPPERS.has(base))) break;
+    i++;
+    if (!w) continue;
+    while (i < tokens.length && tokens[i].startsWith("-") && tokens[i] !== "-") {
+      const f = tokens[i++];
+      if (f === "--") break;
+      if (w.valueFlags.includes(f)) i++;
     }
-    break;
+    for (let n = 0; n < w.positional && i < tokens.length; n++) i++;
   }
   if (i >= tokens.length) return null;
   return { program: tokens[i].split("/").pop() ?? tokens[i], argv: tokens.slice(i + 1) };
+}
+
+/**
+ * Split bundled short options the way curl / getopt do: `-sXPOST` is `-s -X
+ * POST` and `-sX POST` is `-s -X` with the next word as its value. A letter in
+ * `valueLetters` takes the rest of the token, or the next word when it is last.
+ */
+export function expandShortFlags(argv: string[], valueLetters: string): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--") { out.push(...argv.slice(i)); break; }
+    if (!/^-[A-Za-z0-9]{2,}/.test(a) || a.startsWith("--")) { out.push(a); continue; }
+    for (let k = 1; k < a.length; k++) {
+      const letter = a[k];
+      out.push(`-${letter}`);
+      if (valueLetters.includes(letter)) {
+        if (k + 1 < a.length) out.push(a.slice(k + 1));
+        break;
+      }
+    }
+  }
+  return out;
 }
 
 const CURL_VALUE_FLAGS = new Set([
@@ -140,7 +214,8 @@ const CURL_UPLOAD_FLAGS = /^(-T|--upload-file)$/;
 
 interface Http { method: string; urls: string[] }
 
-function curlInfo(argv: string[]): Http {
+function curlInfo(rawArgv: string[]): Http {
+  const argv = expandShortFlags(rawArgv, "XdFTHuoAebcmxwrzEK");
   let method: string | null = null;
   let body = false, get = false, head = false, upload = false;
   const urls: string[] = [];
@@ -166,7 +241,8 @@ function curlInfo(argv: string[]): Http {
   return { method: method || (head ? "HEAD" : upload ? "PUT" : body && !get ? "POST" : "GET"), urls };
 }
 
-function wgetInfo(argv: string[]): Http {
+function wgetInfo(rawArgv: string[]): Http {
+  const argv = expandShortFlags(rawArgv, "OoaiegtTwPUQBlIAXDRGHFN");
   let method: string | null = null;
   let body = false;
   const urls: string[] = [];
@@ -290,6 +366,7 @@ export function bashApprovalPolicyFrom(sources: BashApprovalSource[]): BashAppro
       if (holdAll) return MALFORMED_LABEL;
       if (typeof command !== "string" || command.length > MAX_COMMAND_CHARS) return "unreadable bash command";
       const segments = parseSegments(command);
+      if (segments.some((sg) => sg.program === TOO_DEEP)) return "command nested too deeply to inspect";
       for (const rule of rules) if (rule.test(command, segments)) return rule.label;
       return null;
     },

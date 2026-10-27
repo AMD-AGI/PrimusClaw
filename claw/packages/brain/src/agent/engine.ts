@@ -18,7 +18,9 @@ import { HitlController } from "./hitl.js";
 import { bashApprovalFromEnvValue, bashApprovalPolicyFrom } from "./bash-approval.js";
 import { DecisionDispatcher } from "../delivery/decision-dispatcher.js";
 import { connectPlatformMcp } from "../clients/mcp.js";
-import { buildPrompt } from "./prompt.js";
+import { buildPrompt, buildProgressiveSkillHint } from "./prompt.js";
+import { loadPlatformDefaults, resolveDefaultSkills, LazyDefaultSkills } from "./platform-defaults.js";
+import { metrics } from "../infra/metrics.js";
 import { resolveRequestLlmKey } from "../llm/key-source.js";
 import {
   isSafeRelativePath,
@@ -31,6 +33,7 @@ import {
   DEFAULT_MODEL, MAX_TURNS,
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED,
   BASH_APPROVAL_RULES,
+  PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED,
 } from "../config.js";
 import { WebSearchService, WebFetchService, SimpleSessionCostTracker } from "../tools/web/index.js";
 import type { ExecuteRequest, ExecuteResult, EventCallback } from "@claw/protocol";
@@ -132,7 +135,12 @@ export class AgentEngine {
 
     const envOverrides: Record<string, string> = {};
     if (platformKey) envOverrides.SAFE_API_KEY = platformKey;
+    // Platform defaults sit under everything else: a request, tool or plugin
+    // server of the same name wins. Unset file -> `defaults` is null and none
+    // of this runs.
+    const defaults = PLATFORM_DEFAULTS_FILE ? loadPlatformDefaults() : null;
     const mergedMcp = normalizeMcpConfigs({
+      ...(defaults?.mcpServers || {}),
       ...(request.mcp_servers || {}),
       ...resolved.mcpServers,
       ...pluginLayer.mcpServers,
@@ -158,6 +166,21 @@ export class AgentEngine {
       skillSources[name] = "marketplace";
     }
 
+    // Default skills: described in the prompt, written to the sandbox only when
+    // read. Anything the request already supplies under the same name wins and
+    // stays inlined.
+    const progressiveSkills = defaults && PROGRESSIVE_SKILLS_ENABLED && defaults.skills.length
+      ? (await resolveDefaultSkills(defaults, platformKey, onEvent)).filter((s) => {
+          if (!allSkills[s.name]) return true;
+          logger.info({ skillName: s.name }, "skill.platform_default_overridden");
+          return false;
+        })
+      : [];
+    const lazySkills = progressiveSkills.length ? new LazyDefaultSkills(progressiveSkills, onEvent, sessionDir) : undefined;
+    if (progressiveSkills.length) {
+      metrics.onPlatformDefaultChat(buildProgressiveSkillHint(progressiveSkills, sessionDir).length);
+    }
+
     const rules = loadRules();
     const fullPrompt = buildPrompt(
       request.prompt ?? "",
@@ -172,6 +195,7 @@ export class AgentEngine {
         parentSessionId: request.parent_session_id,
         teamRole: request.team_role,
       },
+      progressiveSkills,
     );
 
     logger.info({
@@ -246,6 +270,7 @@ export class AgentEngine {
         // a2a bearer: keep the platform_key fallback so safe-mode dispatch
         // (empty llm_api_key) still authenticates sub-agent calls.
       }, resolveRequestLlmKey(request) || request.platform_key || "", sandbox);
+      router.lazySkillWriter = lazySkills;
       router.memoryEnabled = request.memory_enabled !== false;
       const allToolSchemas = [...router.getToolSchemas(), ...mcpResult.schemas];
 
@@ -423,7 +448,10 @@ export class AgentEngine {
       //     skills that were merely loaded into context but ignored by the Agent.
       const skillsUsed: Record<string, number> = {};
       for (const name of router.skillsRead) {
-        if (!allSkills[name]) continue; // skill read but unknown — ignore
+        if (!allSkills[name]) {
+          if (lazySkills?.names.includes(name)) metrics.onPlatformSkillRead(name);
+          continue; // skill read but unknown — ignore
+        }
         const reqSkill = (request.skills || {})[name];
         skillsUsed[name] = reqSkill?.version || 1;
       }
