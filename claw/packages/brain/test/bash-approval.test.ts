@@ -14,7 +14,7 @@ import type { ToolRouter } from "../src/tools/router.js";
 import { agentLoop, type LoopOptions } from "../src/agent/agent-loop.js";
 import { HitlController, refusalMessage } from "../src/agent/hitl.js";
 import {
-  bashApprovalFromEnvValue, bashApprovalFromToolConfig, bashApprovalPolicyFrom, MALFORMED_LABEL,
+  bashApprovalFromEnvValue, bashApprovalFromToolConfig, bashApprovalPolicyFrom, MALFORMED_LABEL, PLUGIN_TOOLS_MISSING_LABEL,
 } from "../src/agent/bash-approval.js";
 import { resolveToolIds } from "../src/tools/resolve.js";
 import { resolvePluginToolsFromMessage } from "../src/tasks/plugin-from-message.js";
@@ -462,7 +462,10 @@ test("a plugin tool row that cannot be read holds every bash command", async () 
   assert.equal(rulesOf(bad).check("ls"), MALFORMED_LABEL);
   for (const missing of [null, undefined]) {
     const r = await resolvePluginToolsFromMessage({ plugin_id: 9, plugin_tools: missing, session_id: "s" } as never, undefined, "/tmp/ba-plugin-work/s3");
-    assert.equal(rulesOf(r).check("ls"), MALFORMED_LABEL, `plugin_tools ${missing}`);
+    // Held all the same, and said as what it is: the message did not carry the
+    // list, which is not the same fault as a rule that does not parse.
+    assert.equal(rulesOf(r).check("ls"), PLUGIN_TOOLS_MISSING_LABEL, `plugin_tools ${missing}`);
+    assert.notEqual(PLUGIN_TOOLS_MISSING_LABEL, MALFORMED_LABEL);
   }
   const none = await resolvePluginToolsFromMessage({ plugin_id: 9, plugin_tools: [], session_id: "s" } as never, undefined, "/tmp/ba-plugin-work/s4");
   assert.equal(rulesOf(none).active, false, "a plugin that declares no tools holds nothing");
