@@ -23,6 +23,7 @@ import {
 } from "../config.js";
 import { isSafeRelativePath } from "../sandbox/write.js";
 import type { HandsClient } from "../clients/hands.js";
+import { bashApprovalFromToolConfig } from "../agent/bash-approval.js";
 import {
   type HookRegistry,
   buildRegistryFromHooksField,
@@ -286,6 +287,8 @@ export interface PluginFromMessageResult {
   rulesContent: string;
   /** Merged hook registry across all `hooks` plugin_tools; empty when none. */
   hooks: HookRegistry;
+  /** `bash_approval` values from any plugin tool's config, unvalidated (see agent/bash-approval.ts). */
+  bashApproval: unknown[];
 }
 
 /** Sandbox root where hook scripts are staged, per-plugin-tool-id. */
@@ -371,16 +374,17 @@ export async function resolvePluginToolsFromMessage(
   const skillDirs: Record<string, string> = {};
   const ruleParts: string[] = [];
   const hookRegistries: HookRegistry[] = [];
+  const bashApproval: unknown[] = [];
 
   const pid = request.plugin_id;
   if (!(typeof pid === "number" && Number.isFinite(pid) && pid > 0)) {
-    return { mcpServers, skillContents, skillDirs, rulesContent: "", hooks: {} };
+    return { mcpServers, skillContents, skillDirs, rulesContent: "", hooks: {}, bashApproval: [] };
   }
 
   const raw = request.plugin_tools;
   if (!Array.isArray(raw) || raw.length === 0) {
     logger.warn({ pluginId: pid }, "plugin.no_plugin_tools_in_message");
-    return { mcpServers, skillContents, skillDirs, rulesContent: "", hooks: {} };
+    return { mcpServers, skillContents, skillDirs, rulesContent: "", hooks: {}, bashApproval: [] };
   }
 
   const stageRoot = createPrivateStagingRoot(workRoot);
@@ -391,6 +395,7 @@ export async function resolvePluginToolsFromMessage(
     if (typeof tool.id !== "number") continue;
     const cfg = (tool.config ?? {}) as Record<string, unknown>;
     const type = String(tool.type || "").toLowerCase();
+    bashApproval.push(...bashApprovalFromToolConfig(cfg));
 
     if (type === "mcp") {
       const servers = (cfg.mcpServers ?? {}) as Record<string, Record<string, unknown>>;
@@ -607,5 +612,6 @@ export async function resolvePluginToolsFromMessage(
     skillDirs,
     rulesContent: ruleParts.join("\n\n"),
     hooks: mergeHookRegistries(...hookRegistries),
+    bashApproval,
   };
 }

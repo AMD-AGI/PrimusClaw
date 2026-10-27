@@ -7,6 +7,7 @@ import path from "node:path";
 import AdmZip from "adm-zip";
 import pino from "pino";
 import { TOOLS_API_URL } from "../config.js";
+import { bashApprovalFromToolConfig } from "../agent/bash-approval.js";
 import type { EventCallback } from "@claw/protocol";
 import type { HandsClient } from "../clients/hands.js";
 import { isSafeRelativePath, uploadDirToSandbox } from "../sandbox/write.js";
@@ -16,6 +17,8 @@ const logger = pino({ name: "resolve-tools" });
 interface ResolvedTools {
   mcpServers: Record<string, Record<string, unknown>>;
   skillContents: Record<string, string>;
+  /** `bash_approval` values from the tools' configs, unvalidated (see agent/bash-approval.ts). */
+  bashApproval: unknown[];
 }
 
 // Sandbox workspace root: Hands' path-guard treats paths as relative to this.
@@ -34,10 +37,11 @@ export async function resolveToolIds(
   sessionDir?: string,
   hands?: HandsClient,
 ): Promise<ResolvedTools> {
-  if (!toolIds.length) return { mcpServers: {}, skillContents: {} };
+  if (!toolIds.length) return { mcpServers: {}, skillContents: {}, bashApproval: [] };
 
   const mcpServers: Record<string, Record<string, unknown>> = {};
   const skillContents: Record<string, string> = {};
+  const bashApproval: unknown[] = [];
   const apiKey = platformKey;
 
   if (onEvent) {
@@ -59,7 +63,7 @@ export async function resolveToolIds(
     if (onEvent) {
       await onEvent({ type: "toolUsed", tool: "resolve_tools", actionId: "resolve_tools_fetch", status: "error", brief: "Failed to fetch tool configuration" });
     }
-    return { mcpServers, skillContents };
+    return { mcpServers, skillContents, bashApproval };
   }
 
   if (onEvent) {
@@ -70,6 +74,7 @@ export async function resolveToolIds(
     const tool = tools[tid];
     if (!tool) { logger.warn({ tid }, "resolve_tools.not_found"); continue; }
     const toolName = (tool.name as string) ?? `tool_${tid}`;
+    bashApproval.push(...bashApprovalFromToolConfig(tool.config));
 
     if (tool.type === "mcp") {
       const servers = ((tool.config as Record<string, unknown>)?.mcpServers ?? {}) as Record<string, Record<string, unknown>>;
@@ -102,7 +107,7 @@ export async function resolveToolIds(
     }
   }
 
-  return { mcpServers, skillContents };
+  return { mcpServers, skillContents, bashApproval };
 }
 
 /**
