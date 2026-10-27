@@ -10,7 +10,7 @@ default; with `PLATFORM_DEFAULTS_FILE` unset, chats are built exactly as before.
 |---|---|---|
 | `PLATFORM_DEFAULTS_FILE` | unset | Path to the defaults file below. Unset, missing, unreadable or malformed means "not enabled" (a malformed file is logged and counted, and never fails a chat). Re-read when its mtime changes. |
 | `PROGRESSIVE_SKILLS_ENABLED` | `false` | Whether the file's `skills` apply. Off: only its `mcp_servers` are mounted and no skill is fetched. Also decides how a plugin's skills reach the prompt: on, they are listed by name and description like the defaults; off, every SKILL.md body is inlined. |
-| `SKILL_CACHE_MAX_BYTES` | `67108864` (64 MiB) | Bytes of downloaded skill files Brain keeps in memory between turns (plugin skills and `tool_ids` skills; not the platform default skills, which are staged separately). `0` turns the cache off and every turn downloads every skill. See "Skill cache". |
+| `SKILL_CACHE_MAX_BYTES` | `67108864` (64 MiB) | Budget for the downloaded skill files Brain keeps in memory between turns (plugin skills and `tool_ids` skills; not the platform default skills, which are staged separately). A held skill is charged its content bytes plus 256 B per file and 1 KiB per skill, so even empty skills have a price. `0` turns the cache off and every turn downloads every skill. See "Skill cache". |
 
 ## The file
 
@@ -98,8 +98,9 @@ no object and reports no `download_skill` event for it.
   the same unheld version share one download.
 - The cache holds bytes, never directories: each turn gets its own copy in its own
   private staging directory, so no turn can change another's files. It is bounded
-  by `SKILL_CACHE_MAX_BYTES` (least recently used out first; a skill larger than a
-  quarter of the bound is never held) and is per Brain process.
+  by `SKILL_CACHE_MAX_BYTES`, counted as content plus a fixed price per file and
+  per skill (least recently used out first; a skill that costs more than a quarter
+  of the bound is never held) and is per Brain process.
 - `claw_skill_stage_total{source,outcome}` counts skills staged per turn by
   `source` (`plugin`, `tool`) and `outcome` (`hit`, `joined`, `downloaded`).
 

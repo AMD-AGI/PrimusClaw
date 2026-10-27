@@ -40,6 +40,23 @@ interface SkillFile { rel: string; bytes: Buffer }
 interface Entry { fingerprint: string; files: SkillFile[]; size: number }
 
 /**
+ * What a held skill costs against the bound beyond its content bytes: per file a
+ * path string, a Buffer and an array slot, per entry the key, the fingerprint
+ * and the map's bookkeeping. Charging content alone would let any number of
+ * empty or tiny skills sit under the bound, and the maps behind it grow without
+ * limit. Deliberately generous: the point is that every entry has a real price,
+ * so that `maxBytes` bounds how many there can be as well as how large.
+ */
+export const ENTRY_OVERHEAD_BYTES = 1024;
+export const FILE_OVERHEAD_BYTES = 256;
+
+/** What `stage` charges for a skill held under `key` at `fingerprint` with files of these content sizes. */
+export function skillCost(key: string, fingerprint: string, fileSizes: number[]): number {
+  return ENTRY_OVERHEAD_BYTES + 2 * (key.length + fingerprint.length)
+    + fileSizes.reduce((n, size) => n + size + FILE_OVERHEAD_BYTES, 0);
+}
+
+/**
  * What `stage` did: `hit` served the held copy, `joined` waited for another
  * caller's identical download in flight, `downloaded` ran `download` itself.
  */
@@ -60,15 +77,16 @@ export class SkillCache {
   private flights = new Map<string, Promise<SkillFile[] | null>>();
 
   /**
-   * @param maxBytes Upper bound on the bytes held; 0 turns the cache off and
-   *   every skill is downloaded as it was before the cache existed. One skill
-   *   bigger than a quarter of the bound is never held.
+   * @param maxBytes Upper bound on what is held, counted by `skillCost` (content
+   *   plus a fixed price per file and per entry); 0 turns the cache off and every
+   *   skill is downloaded as it was before the cache existed. One skill costing
+   *   more than a quarter of the bound is never held.
    */
   constructor(private readonly maxBytes: number) {}
 
   get enabled(): boolean { return this.maxBytes > 0; }
 
-  /** Bytes currently held (test and diagnostics). */
+  /** Cost currently held, in the bound's own units (test and diagnostics). */
   get size(): number { return this.held; }
 
   clear(): void {
@@ -119,9 +137,10 @@ export class SkillCache {
 
     const flight = (async (): Promise<SkillFile[] | null> => {
       if (!(await download(dir))) return null;
-      const files = readFiles(dir, this.maxBytes / 4);
-      if (files) this.admit(key, { fingerprint, files, size: files.reduce((n, f) => n + f.bytes.length, 0) });
-      return files;
+      const read = readFiles(dir, this.maxBytes / 4 - skillCost(key, fingerprint, []));
+      if (!read) return null;
+      this.admit(key, { fingerprint, files: read.files, size: skillCost(key, fingerprint, read.sizes) });
+      return read.files;
     })();
     this.flights.set(flightKey, flight);
     try {
@@ -150,8 +169,12 @@ export class SkillCache {
   }
 }
 
-/** Every regular file under `dir`, or null when they add up to more than `limit` bytes. */
-function readFiles(dir: string, limit: number): SkillFile[] | null {
+/**
+ * Every regular file under `dir`, or null when what they cost (content plus
+ * `FILE_OVERHEAD_BYTES` each) is more than `limit`. Stops counting at the limit,
+ * so a directory of a million files is refused after reading names, not bytes.
+ */
+function readFiles(dir: string, limit: number): { files: SkillFile[]; sizes: number[] } | null {
   const found: Array<{ full: string; size: number }> = [];
   let total = 0;
   const stack = [dir];
@@ -162,12 +185,13 @@ function readFiles(dir: string, limit: number): SkillFile[] | null {
       if (entry.isDirectory()) { stack.push(full); continue; }
       if (!entry.isFile()) continue;
       const size = fs.statSync(full).size;
-      total += size;
+      total += size + FILE_OVERHEAD_BYTES;
       if (total > limit) return null;
       found.push({ full, size });
     }
   }
-  return found.map(({ full }) => ({ rel: path.relative(dir, full), bytes: fs.readFileSync(full) }));
+  const files = found.map(({ full }) => ({ rel: path.relative(dir, full), bytes: fs.readFileSync(full) }));
+  return { files, sizes: files.map((f) => f.bytes.length) };
 }
 
 function writeFiles(files: SkillFile[], dir: string): void {

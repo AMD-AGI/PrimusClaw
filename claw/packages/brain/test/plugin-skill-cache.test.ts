@@ -31,8 +31,8 @@ import os from "node:os";
 import path from "node:path";
 import { startPluginWorld, skillRow } from "./support/plugin-world.js";
 
-// An 8000-byte budget makes a skill over 2000 bytes "oversize" (a quarter of it).
-process.env.SKILL_CACHE_MAX_BYTES = "8000";
+// A 40000 budget makes a skill that costs over 10000 "oversize" (a quarter of it); see skillCost.
+process.env.SKILL_CACHE_MAX_BYTES = "40000";
 const pw = await startPluginWorld();
 const { resolvePluginToolsFromMessage } = await import("../src/tasks/plugin-from-message.js");
 const { skillCache } = await import("../src/tools/skill-cache.js");
@@ -286,18 +286,21 @@ test("each turn gets files of its own: changing them does not change the next tu
   assert.deepEqual(tree(second.result.skillDirs.own), filesOf("own", "O"));
 });
 
-test("the bytes held stay under the bound, and a skill over a quarter of it is never held", async () => {
+test("what is held stays under the bound, and a skill over a quarter of it is never held", async () => {
+  // Twelve skills of ~5.5K each (66K) against a bound of 40000, one of ~11K (over the 10000 cap).
   const small = Array.from({ length: 12 }, (_, i) => {
-    pw.put(`t11/s${i}/SKILL.md`, skillMd(`s${i}`, "p".repeat(850)));
+    pw.put(`t11/s${i}/SKILL.md`, skillMd(`s${i}`, "p".repeat(4000)));
     return prefixRow(1100 + i, `s${i}`, `t11/s${i}`);
   });
-  pw.put("t11/big/SKILL.md", skillMd("big", "q".repeat(2500)));
+  pw.put("t11/big/SKILL.md", skillMd("big", "q".repeat(11000)));
   const big = prefixRow(1200, "big", "t11/big");
   const first = await turn([...small, big]);
   assert.equal(Object.keys(first.result.skillContents).length, 13, "every skill still arrives");
-  assert.ok(skillCache.size > 0 && skillCache.size <= 8000, `held ${skillCache.size} bytes against a bound of 8000`);
+  assert.ok(skillCache.size > 0 && skillCache.size <= 40000, `held ${skillCache.size} against a bound of 40000`);
+  assert.ok(skillCache.size > 20000, "and a good part of it is in use: the small skills were held until the bound");
   assert.equal((await turn([small[11]])).gets.length, 0, "the most recent small skill is held");
+  assert.equal((await turn([small[0]])).gets.length, 1, "the oldest was let go");
   assert.equal((await turn([big])).gets.length, 1, "the oversize one is read every time");
   assert.equal((await turn([big])).gets.length, 1);
-  assert.ok(skillCache.size <= 8000);
+  assert.ok(skillCache.size <= 40000);
 });

@@ -16,7 +16,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { SkillCache, type SkillDownload } from "../src/tools/skill-cache.js";
+import { SkillCache, skillCost, type SkillDownload } from "../src/tools/skill-cache.js";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "claw-skill-cache-"));
 test.after(() => fs.rmSync(ROOT, { recursive: true, force: true }));
@@ -187,44 +187,68 @@ test("a failed download is not held, rejects its caller, and the callers waiting
   assert.equal(cache.size, 0, "the waiters were not cacheable either: their dirs came from separate downloads");
 });
 
-test("the bytes held stay under the bound, and the least recently used skill goes first", async () => {
-  const body = (n: number) => ({ "SKILL.md": String(n).padStart(250, "x") });
-  const cache = new SkillCache(1000);
+test("what is held stays under the bound, and the least recently used skill goes first", async () => {
+  // Entries that cost 2000 each against a bound of 8000: exactly four fit.
+  const body = (n: number) => ({ "SKILL.md": String(n).padStart(2000 - skillCost("k0", "fp", [0]), "x") });
+  const cache = new SkillCache(8000);
   const dls = Array.from({ length: 5 }, (_, i) => download(body(i)));
   for (let i = 0; i < 4; i++) await cache.stage(`k${i}`, "fp", freshDir(), dls[i]);
-  assert.equal(cache.size, 1000);
+  assert.equal(cache.size, 8000);
   // k0 is used again, so k1 is now the oldest.
   assert.equal(await cache.stage("k0", "fp", freshDir(), dls[0]), "hit");
   await cache.stage("k4", "fp", freshDir(), dls[4]);
-  assert.ok(cache.size <= 1000, `held ${cache.size} > 1000`);
+  assert.ok(cache.size <= 8000, `held ${cache.size} > 8000`);
   for (const k of ["k0", "k2", "k3", "k4"]) {
     assert.equal(await cache.stage(k, "fp", freshDir(), dls[Number(k[1])]), "hit", `${k} is still held`);
   }
   assert.equal(await cache.stage("k1", "fp", freshDir(), dls[1]), "downloaded", "k1 was the least recently used");
-  assert.ok(cache.size <= 1000);
+  assert.ok(cache.size <= 8000);
 });
 
-test("replacing a skill's entry does not count its old bytes twice", async () => {
-  const cache = new SkillCache(1000);
+test("replacing a skill's entry does not count its old cost twice", async () => {
+  const cache = new SkillCache(40000);
   for (let v = 0; v < 20; v++) {
     await cache.stage("k", `fp${v}`, freshDir(), download({ "SKILL.md": "y".repeat(200) }));
   }
-  assert.equal(cache.size, 200);
+  assert.equal(cache.size, skillCost("k", "fp19", [200]));
 });
 
-test("a skill over a quarter of the bound is served to its caller but never held", async () => {
-  const cache = new SkillCache(1000);
-  const big = download({ "SKILL.md": "z".repeat(251) });
+test("a skill costing more than a quarter of the bound is served to its caller but never held", async () => {
+  const cache = new SkillCache(40000);
+  const cap = 10000;
+  const fixed = skillCost("k", "fp", [0]);
+  const big = download({ "SKILL.md": "z".repeat(cap - fixed + 1) });
   const d = freshDir();
   assert.equal(await cache.stage("k", "fp", d, big), "downloaded");
-  assert.equal(fs.readFileSync(path.join(d, "SKILL.md"), "utf-8").length, 251, "the caller still has all of it");
+  assert.equal(fs.readFileSync(path.join(d, "SKILL.md"), "utf-8").length, cap - fixed + 1, "the caller still has all of it");
   assert.equal(cache.size, 0);
   assert.equal(await cache.stage("k", "fp", freshDir(), big), "downloaded");
   assert.equal(big.calls, 2);
   // The boundary itself is held.
-  const edge = download({ "SKILL.md": "z".repeat(250) });
-  await cache.stage("e", "fp", freshDir(), edge);
-  assert.equal(await cache.stage("e", "fp", freshDir(), edge), "hit");
+  const edge = download({ "SKILL.md": "z".repeat(cap - fixed) });
+  await cache.stage("k", "fp", freshDir(), edge);
+  assert.equal(cache.size, cap);
+  assert.equal(await cache.stage("k", "fp", freshDir(), edge), "hit");
+});
+
+test("skills with nothing in them still have a price: any number of them cannot outgrow the bound", async () => {
+  const cache = new SkillCache(40000);
+  const dls = Array.from({ length: 200 }, () => download({ "SKILL.md": "" }));
+  for (let i = 0; i < 200; i++) await cache.stage(`tool-${i}`, "fp", freshDir(), dls[i]);
+  assert.ok(cache.size > 0 && cache.size <= 40000, `held ${cache.size}`);
+  assert.equal(await cache.stage("tool-199", "fp", freshDir(), dls[199]), "hit", "the newest is held");
+  assert.equal(await cache.stage("tool-0", "fp", freshDir(), dls[0]), "downloaded", "and the oldest was let go, though it weighed no bytes");
+  assert.ok(cache.size <= 40000);
+});
+
+test("a skill of very many tiny files is refused on its file count, not held", async () => {
+  const cache = new SkillCache(40000);
+  const many: Record<string, string> = { "SKILL.md": "# s\n" };
+  for (let i = 0; i < 200; i++) many[`refs/f${i}.md`] = "";
+  const dl = download(many);
+  assert.equal(await cache.stage("k", "fp", freshDir(), dl), "downloaded");
+  assert.equal(cache.size, 0);
+  assert.equal(await cache.stage("k", "fp", freshDir(), dl), "downloaded");
 });
 
 test("a directory that already holds files is neither served from nor added to the cache", async () => {
