@@ -418,6 +418,12 @@ test("a plugin tool row that cannot be read holds every bash command", async () 
   const req = (tools: unknown[]) => ({ plugin_id: 9, plugin_tools: tools, session_id: "s" }) as never;
   const bad = await resolvePluginToolsFromMessage(req([null, { type: "rule" }]), undefined, "/tmp/ba-plugin-work/s");
   assert.equal(rulesOf(bad).check("ls"), MALFORMED_LABEL);
+  for (const missing of [null, undefined]) {
+    const r = await resolvePluginToolsFromMessage({ plugin_id: 9, plugin_tools: missing, session_id: "s" } as never, undefined, "/tmp/ba-plugin-work/s3");
+    assert.equal(rulesOf(r).check("ls"), MALFORMED_LABEL, `plugin_tools ${missing}`);
+  }
+  const none = await resolvePluginToolsFromMessage({ plugin_id: 9, plugin_tools: [], session_id: "s" } as never, undefined, "/tmp/ba-plugin-work/s4");
+  assert.equal(rulesOf(none).active, false, "a plugin that declares no tools holds nothing");
   const ok = await resolvePluginToolsFromMessage(
     req([{ id: 1, type: "mcp", config: { mcpServers: {}, bash_approval: RULES } }]), undefined, "/tmp/ba-plugin-work/s2");
   assert.equal(rulesOf(ok).check("ls"), null);

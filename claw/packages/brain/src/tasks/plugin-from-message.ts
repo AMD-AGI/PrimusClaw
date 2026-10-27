@@ -384,7 +384,11 @@ export async function resolvePluginToolsFromMessage(
   const raw = request.plugin_tools;
   if (!Array.isArray(raw) || raw.length === 0) {
     logger.warn({ pluginId: pid }, "plugin.no_plugin_tools_in_message");
-    return { mcpServers, skillContents, skillDirs, rulesContent: "", hooks: {}, bashApproval: [] };
+    // A plugin was named but its tool list did not arrive (null = missing or
+    // denied): its rules are unknown, so hold bash. An empty list declares none.
+    const unknown = !Array.isArray(raw);
+    if (unknown) logger.warn({ pluginId: pid }, "plugin.tool_unreadable_holding_bash");
+    return { mcpServers, skillContents, skillDirs, rulesContent: "", hooks: {}, bashApproval: unknown ? [UNAVAILABLE_RULES] : [] };
   }
 
   const stageRoot = createPrivateStagingRoot(workRoot);
