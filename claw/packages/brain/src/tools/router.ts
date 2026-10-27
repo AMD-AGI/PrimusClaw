@@ -44,6 +44,9 @@ function validateSubFilePath(filePath: string): string | null {
   return null;
 }
 
+/** A sandbox tool input that touches the skills directory. */
+const SKILLS_PATH_RE = /\.skills\b/;
+
 const BRAIN_NETWORK_TOOLS = new Set(["web_search", "web_fetch"]);
 
 const BG_SHELL_TOOLS = new Set(["bash_output", "kill_shell", "wait"]);
@@ -173,6 +176,14 @@ export class ToolRouter {
    */
   private attachHands?: () => Promise<HandsClient>;
 
+  /**
+   * Platform-default skills are written into the sandbox on first need, not at
+   * run start. Set by the engine only when defaults are mounted; absent, the
+   * sandbox branch of route() is exactly what it was. Inherited by children so
+   * a sub-agent reading a default skill triggers the same write.
+   */
+  lazySkillWriter?: { ensure(hands: HandsClient, text: string, coldSandbox: boolean): Promise<void> };
+
   constructor(
     private hands: HandsClient | null,
     private platformMcp: Map<string, { callTool: (name: string, args: Record<string, unknown>) => Promise<string> }> = new Map(),
@@ -248,6 +259,7 @@ export class ToolRouter {
 
   /** Register a child router so subsequent setHands() cascades to it. */
   registerChild(child: ToolRouter): void {
+    child.lazySkillWriter = this.lazySkillWriter;
     this.children.add(child);
   }
 
@@ -405,7 +417,15 @@ export class ToolRouter {
       // and the file was missing (e.g. Pi/Codex don't materialize skills to disk),
       // the skill name still landed in skillsRead and polluted feedback / probation /
       // evolution stats with attribution to a skill that never actually loaded.
-      const answered = await (await this.requireHands()).callToolFull(name, input, signal, ctx);
+      const coldSandbox = !this.hands;
+      const sandboxHands = await this.requireHands();
+      // First touch of a platform-default skill: write it before the call that
+      // would read it. Tied to the call naming `.skills`, so a chat that never
+      // goes there never pays for the upload.
+      if (this.lazySkillWriter && SKILLS_PATH_RE.test(JSON.stringify(input))) {
+        await this.lazySkillWriter.ensure(sandboxHands, JSON.stringify(input), coldSandbox);
+      }
+      const answered = await sandboxHands.callToolFull(name, input, signal, ctx);
       if (outcome) {
         outcome.isError = answered.isError;
         // The durable state of a shell is a field, not a sentence. Dropping it
