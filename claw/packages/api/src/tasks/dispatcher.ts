@@ -23,6 +23,7 @@ import {
   readTrustedSessionCredentials,
 } from "../auth/session-credentials.js";
 import { CLAW_DEPLOY_MODE } from "../config.js";
+import { isMemoryActive } from "../memory/service.js";
 import { db } from "../infra/db.js";
 import { js, sc, publishCertainlyFailed } from "../infra/nats.js";
 import pino from "pino";
@@ -362,8 +363,9 @@ function buildExecuteRequest(opts: {
   session: Awaited<ReturnType<typeof loadSessionCredentials>>;
   internalToken: string;
   filesWorkspaceId: string;
+  memoryEnabled: boolean;
 }): ExecuteRequest {
-  const { updated, rendered, session, internalToken, filesWorkspaceId } = opts;
+  const { updated, rendered, session, internalToken, filesWorkspaceId, memoryEnabled } = opts;
   const sandboxSpecForBrain = (rendered.sandbox_spec ?? "none") as ExecuteRequest["sandbox_spec"];
   // Lift per-user env snapshot from task.input back to the top-level
   // ExecuteRequest field Brain expects. expandDag embedded it under
@@ -407,6 +409,7 @@ function buildExecuteRequest(opts: {
     plugin_tools: null,
     prompt: rendered.prompt ?? undefined,
     history: [],
+    memory_enabled: memoryEnabled,
     script: rendered.script as ExecuteRequest["script"] | undefined,
     tools_allowlist: (updated.tools_allowlist as string[]) ?? undefined,
     model: updated.model ?? undefined,
@@ -579,6 +582,7 @@ export async function dispatchPreparedRow(locked: ClawTaskRow): Promise<Dispatch
     );
     const req = buildExecuteRequest({
       updated, rendered, session, internalToken, filesWorkspaceId,
+      memoryEnabled: await isMemoryActive(session.user_id || ""),
     });
 
     // 5. Publish. Serialised first, and the flag set only once there is

@@ -4,7 +4,7 @@
 import { db } from "../infra/db.js";
 import type { Message } from "@claw/protocol";
 
-import { getMemoryEntries, getProfileEntry } from "../memory/service.js";
+import { getMemoryEntries, getProfileEntry, getMemoryPreference } from "../memory/service.js";
 import { CLAW_MEMORY_ENABLED } from "../config.js";
 import pino from "pino";
 import { estimateTokens } from "../shared/tokens.js";
@@ -138,7 +138,12 @@ function parseJsonbArray(v: unknown): any[] {
 
 const MEMORY_BUDGET = 3_000;
 
-async function buildSystemContextParts(
+/** Tells the agent that save_memory will not persist, so it does not claim otherwise. */
+export const MEMORY_OFF_NOTICE =
+  "## Long-term Memory\nLong-term memory is turned off for this user, so save_memory does not store anything. " +
+  "If the user asks you to remember something, say that memory is off and that they can turn it on in the chat settings.";
+
+export async function buildSystemContextParts(
   sessionId: string,
   userId: string,
   rulesText = "",
@@ -159,7 +164,21 @@ async function buildSystemContextParts(
 
   // Long-term memory injection (profile + entries) is gated by CLAW_MEMORY_ENABLED.
   // When OFF: skip both DB queries and emit nothing — system prompt drops these sections.
+  // A second gate, per user: memory is opt-in, so a user who has not turned it on
+  // gets neither injection nor a way to write (see insertMemoryEntry). If the
+  // preference cannot be read, treat it as off.
+  let memoryOptIn = false;
   if (CLAW_MEMORY_ENABLED) {
+    try {
+      memoryOptIn = await getMemoryPreference(userId);
+    } catch (err: any) {
+      logger.error({ err, userId }, "memory.preference_read_failed");
+    }
+    if (!memoryOptIn) {
+      parts.push(MEMORY_OFF_NOTICE);
+    }
+  }
+  if (CLAW_MEMORY_ENABLED && memoryOptIn) {
     // 1. User profile
     try {
       const profileContent = await getProfileEntry(userId);
