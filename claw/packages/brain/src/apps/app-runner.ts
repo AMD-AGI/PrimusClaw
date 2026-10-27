@@ -42,7 +42,7 @@
  * {@link AppRunnerSeams}: event tailing and MCP registration.
  */
 import pino from "pino";
-import { APP_MANIFEST_DEFAULTS, type AppManifestV1, type AppSandboxRole } from "@claw/protocol";
+import { APP_MANIFEST_DEFAULTS, type AppManifestV1, type AppSandboxRole, type SandboxSpecCreate } from "@claw/protocol";
 import type {
   SandboxExecOptions, SandboxExecResult, SandboxInstance, SandboxStatus,
 } from "../sandbox/provider.js";
@@ -61,6 +61,8 @@ import {
 const logger = pino({ name: "app-runner" });
 
 export const RECONCILE_INTERVAL_MS = 5_000;
+/** How often a running app's grant is looked up again. Takeover still checks on its first tick. */
+export const GRANT_INSPECT_INTERVAL_MS = 60_000;
 /** How long the `ended` announcement is waited for before the run goes on without it. */
 export const STATUS_PUBLISH_TIMEOUT_MS = 5_000;
 const EXEC_TIMEOUT = "30s";
@@ -95,6 +97,8 @@ export interface AppGrantRun {
   workspaceId?: string | null;
   limits?: Record<string, unknown> | null;
   expiresAt?: string | null;
+  /** The sandbox spec admission stored, including the resolved image. */
+  sandboxSpec?: SandboxSpecCreate | null;
 }
 
 /** What a grant adds to the application's environment. */
@@ -293,6 +297,8 @@ export class AppRunner {
   private readonly now: () => number;
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly tickMs: number;
+  /** Fake-clock time before which a grant that was already seen is not looked up again. */
+  private grantInspectAfter = 0;
 
   constructor(
     private readonly runId: string,
@@ -473,29 +479,39 @@ export class AppRunner {
   }
 
   /**
-   * Keep the execution copy of the grant. A live copy is left alone. A missing
-   * one is signed again under the same id, then the application is stopped so
-   * the existing restart path injects the new keys. A revoked grant is not signed.
+   * Keep the execution copy of the grant. A live copy is left alone, and looked
+   * up again only every {@link GRANT_INSPECT_INTERVAL_MS} once the app is running.
+   * A missing one is signed again under the same id, and the new keys and the
+   * restart mark are written together. The application is then started again
+   * without spending a restart and without treating its exit as final.
+   * A revoked grant is not signed.
    */
   private async ensureGrantCopy(): Promise<TickResult | null> {
     if (this.rec.state === "finishing" || this.rec.state === "ended") return null;
     if (this.rec.last_exit?.grant_restart === true) return this.driveGrantRestart();
     if (!this.grant.inspect || !this.grant.reissue || !this.rec.grant_id || this.rec.grant_revoked_at) return null;
+    if (this.grantInspectAfter > this.now()) return null;
     let presence: "active" | "missing" | "revoked";
     try {
       presence = await this.grant.inspect(this.grantRun());
     } catch (err) {
+      this.grantInspectAfter = this.now() + GRANT_INSPECT_INTERVAL_MS;
       logger.warn({ runId: this.runId, grantId: this.rec.grant_id, err: this.safeText(err) }, "app_run.grant_inspect_failed");
       return null;
     }
-    if (presence !== "missing") return null;
+    if (presence !== "missing") {
+      if (presence === "active" && (this.rec.state === "running" || this.rec.state === "restarting")) {
+        this.grantInspectAfter = this.now() + GRANT_INSPECT_INTERVAL_MS;
+      }
+      return null;
+    }
     try {
       const issued = await this.grant.reissue(this.grantRun());
-      await this.deps.store.patch(this.runId, { grant_keys: issued.keys });
-      this.secretsLoaded = false;
       const last = this.rec.last_exit ?? { at: this.iso(), cause: "exit" as const, final: false };
-      await this.move({ last_exit: { ...last, grant_restart: true } });
+      await this.move({ grant_keys: issued.keys, last_exit: { ...last, grant_restart: true } });
+      this.secretsLoaded = false;
     } catch (err) {
+      this.grantInspectAfter = this.now() + GRANT_INSPECT_INTERVAL_MS;
       logger.warn({ runId: this.runId, grantId: this.rec.grant_id, err: this.safeText(err) }, "app_run.grant_reissue_failed");
       return null;
     }
@@ -503,8 +519,10 @@ export class AppRunner {
   }
 
   /**
-   * Stop the application after a re-issue. Once it is gone the flag is cleared
-   * and the state machine restarts it, which is what injects the new keys.
+   * Stop the application after a re-issue, then start it again on the same
+   * generation budget. The stop is not an application failure: `final` in the
+   * exit record is the application's answer to SIGTERM, not a completed run.
+   * A sandbox that is already gone is handled by the ordinary lost-sandbox road.
    */
   private async driveGrantRestart(): Promise<TickResult | null> {
     const inst = this.instance();
@@ -513,20 +531,33 @@ export class AppRunner {
       await this.clearGrantRestart();
       return null;
     }
+    if (await this.sandboxGone(inst)) {
+      await this.clearGrantRestart();
+      return null;
+    }
     let verdict = await this.probe(inst, stateDir);
     if (verdict === "alive") {
       const sentAt = Date.parse(this.rec.last_exit?.stop_at ?? "");
       if (!Number.isFinite(sentAt)) {
         await this.sendTerm(inst, stateDir);
-        await this.move({ last_exit: { ...this.rec.last_exit!, stop_at: this.iso() } });
+        await this.move({ last_exit: { ...this.rec.last_exit!, stop_at: this.iso(), grant_restart: true } });
       } else if (this.now() >= sentAt + this.stopGraceMs()) {
         await this.deps.sandbox.exec(inst, killCommand(stateDir, this.tag()), EXEC_TIMEOUT, { untracked: true });
       }
       verdict = await this.probe(inst, stateDir);
     }
     if (verdict !== "dead" && verdict !== "none") return { done: false };
-    await this.clearGrantRestart();
-    return null;
+    return this.launch(inst, stateDir, { replace: true });
+  }
+
+  /** True when SaFE says the workload is terminal or absent. An unreadable status is not gone. */
+  private async sandboxGone(inst: SandboxInstance): Promise<boolean> {
+    try {
+      const status = await this.deps.sandbox.status(inst);
+      return status.state === "terminal" || status.state === "absent";
+    } catch {
+      return false;
+    }
   }
 
   private stopGraceMs(): number {
@@ -544,18 +575,19 @@ export class AppRunner {
 
   /** The grant hooks' view of the current row, including what a re-issue needs. */
   private grantRun(rec: AppRunRecord = this.rec): AppGrantRun {
-  const run: AppGrantRun = {
-    runId: this.runId,
-    sessionId: rec.session_id,
-    grantId: rec.grant_id,
-    manifest: rec.manifest,
-  };
-  if (rec.user_id) run.userId = rec.user_id;
-  if (this.platformKey) run.platformKey = this.platformKey;
-  if (rec.workspace_id) run.workspaceId = rec.workspace_id;
-  if (rec.grant_limits) run.limits = rec.grant_limits;
-  if (rec.grant_expires_at) run.expiresAt = rec.grant_expires_at;
-  return run;
+    const run: AppGrantRun = {
+      runId: this.runId,
+      sessionId: rec.session_id,
+      grantId: rec.grant_id,
+      manifest: rec.manifest,
+    };
+    if (rec.user_id) run.userId = rec.user_id;
+    if (this.platformKey) run.platformKey = this.platformKey;
+    if (rec.workspace_id) run.workspaceId = rec.workspace_id;
+    if (rec.grant_limits) run.limits = rec.grant_limits;
+    if (rec.grant_expires_at) run.expiresAt = rec.grant_expires_at;
+    if (rec.sandbox_spec) run.sandboxSpec = rec.sandbox_spec;
+    return run;
   }
 
   /** `limits.max_runtime_sec` counts from the run's creation, so a takeover keeps the same deadline. */
@@ -684,18 +716,22 @@ export class AppRunner {
     }
   }
 
-  private async launch(inst: SandboxInstance, stateDir: string): Promise<TickResult> {
+  private async launch(inst: SandboxInstance, stateDir: string, opts?: { replace?: boolean }): Promise<TickResult> {
     // A run whose application already finished must not be started again. This
     // is how a sandbox lost right after `final` ends the run instead of
     // repeating it: the state directory outlives the sandbox.
-    const prior = await this.readExit(inst, stateDir);
-    if (prior.kind === "unreadable") return { done: false };
-    if (prior.kind === "exit" && prior.final) return this.finishFromExit(prior);
-    if (this.rec.last_exit?.recovery === true) {
-      // The budget was spent when the sandbox went, and nothing final is there:
-      // the run ends as the failure it was already going to be.
-      await this.move({ state: "finishing", last_exit: { at: this.iso(), cause: "restarts_exhausted", final: false } });
-      return { done: false };
+    // A grant re-issue is the exception: the exit record is the application's
+    // answer to the SIGTERM that was sent so the new keys could be injected.
+    if (!opts?.replace) {
+      const prior = await this.readExit(inst, stateDir);
+      if (prior.kind === "unreadable") return { done: false };
+      if (prior.kind === "exit" && prior.final) return this.finishFromExit(prior);
+      if (this.rec.last_exit?.recovery === true) {
+        // The budget was spent when the sandbox went, and nothing final is there:
+        // the run ends as the failure it was already going to be.
+        await this.move({ state: "finishing", last_exit: { at: this.iso(), cause: "restarts_exhausted", final: false } });
+        return { done: false };
+      }
     }
 
     // The environment comes from the platform (the API's secrets, the grant
@@ -710,9 +746,14 @@ export class AppRunner {
       await this.startApplication(inst, stateDir, env);
     } catch (err) {
       if (err instanceof RunnerHalted) throw err;
+      if (opts?.replace) {
+        logger.warn({ runId: this.runId, err: this.safeText(err) }, "app_run.grant_restart_failed");
+        return { done: false };
+      }
       return this.onStartFailure(err);
     }
     this.startFailures = 0;
+    if (opts?.replace) await this.clearGrantRestart();
     logger.info({ runId: this.runId, workloadId: this.rec.sandbox_workload_id, restarts: this.rec.restarts }, "app_run.started");
     return { done: false };
   }

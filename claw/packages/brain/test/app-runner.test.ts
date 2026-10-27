@@ -532,7 +532,8 @@ test("E3 the grant hook adds keys and limits through env_map; its keys beat the 
   assert.equal(env.APP_GRANT_LIMITS, JSON.stringify({ max_sandboxes: 4, max_gpus: 8 }));
   assert.deepEqual(seen, [{
     runId: RUN_ID, sessionId: "sess-1", grantId: null, manifest: MANIFEST,
-    platformKey: "pk", workspaceId: "ws-1",
+    platformKey: PLATFORM_KEY, workspaceId: "ws-1",
+    sandboxSpec: { handle: "app", image: "img:1" },
   }]);
 });
 
@@ -821,13 +822,70 @@ test("a missing grant is signed again and the application restarts with the new 
   await runner.reconcile();
   assert.equal(reissues, 1);
   assert.equal(world.terms.length, 1);
-  assert.equal(world.rec.state, "restarting");
+  assert.equal(world.rec.state, "running");
+  assert.equal(world.rec.restarts, 0, "a grant restart is not an application crash");
   assert.equal(world.rec.last_exit?.grant_restart, undefined);
-  world.clock += 11_000;
-  for (let i = 0; i < 6 && world.starts.length < 2; i++) await runner.reconcile();
+  const signed = world.patches.filter((p) => p.patch.grant_keys);
+  assert.equal(signed.length, 1);
+  assert.equal(signed[0]!.patch.last_exit?.grant_restart, true, "the new keys and the restart mark are one write");
   assert.equal(world.starts.length, 2);
   assert.equal(world.starts[1]!.env.APP_KEY_MEASUREMENT, fresh);
   assert.equal(reissues, 1, "an active copy is not signed again");
+});
+
+test("a grant restart with max_restarts 0 starts again, and a final exit does not end the run", async () => {
+  const manifest = { ...MANIFEST, restart: { max_restarts: 0, backoff_sec: [] } };
+  const world = new World(manifest, {
+    grant_id: "gr-01arz3ndektsv4rrffq69g5fav",
+    user_id: "user-1",
+    grant_limits: { max_sandboxes: 2, max_gpus: 4, gpu_hours: 1, max_runtime_sec: 3600 },
+    grant_expires_at: "2026-01-02T00:00:00.000Z",
+  });
+  let armed = true;
+  world.onTerm = (wl) => world.appExits(wl, { final: true, returncode: 0 });
+  const grant: AppGrantRunHooks = {
+    env: async () => ({}),
+    revoke: async () => undefined,
+    extend: noopAppGrant.extend,
+    inspect: async () => (world.rec.state === "running" && armed ? (armed = false, "missing") : "active"),
+    reissue: async () => ({ keys: { measurement: "e2b_newkey0123456789abcdef0123456789abcd" }, expiresAt: "2026-01-02T00:00:00.000Z" }),
+  };
+  const runner = new AppRunner(RUN_ID, "pk", {
+    store: world.store, sandbox: world.sandbox, grant, now: world.now, sleep: world.sleep, tickMs: 5000,
+  });
+  for (let i = 0; i < 12 && world.rec.state !== "running"; i++) await runner.reconcile();
+  await runner.reconcile();
+  assert.equal(world.rec.state, "running");
+  assert.equal(world.rec.restarts, 0);
+  assert.notEqual(world.rec.last_exit?.cause, "restarts_exhausted");
+  assert.equal(world.starts.length, 2);
+});
+
+test("a grant restart whose sandbox is already gone takes the lost-sandbox road", async () => {
+  const world = new World(MANIFEST, {
+    grant_id: "gr-01arz3ndektsv4rrffq69g5fav",
+    grant_limits: { max_sandboxes: 1, max_gpus: 1, gpu_hours: 1, max_runtime_sec: 3600 },
+  });
+  const grant: AppGrantRunHooks = {
+    env: async () => ({}),
+    revoke: async () => undefined,
+    extend: noopAppGrant.extend,
+    inspect: async () => "active",
+    reissue: async () => { throw new Error("the sandbox is gone; the grant is not signed again"); },
+  };
+  const runner = new AppRunner(RUN_ID, "pk", {
+    store: world.store, sandbox: world.sandbox, grant, now: world.now, sleep: world.sleep, tickMs: 5000,
+  });
+  for (let i = 0; i < 12 && world.rec.state !== "running"; i++) await runner.reconcile();
+  world.rec = {
+    ...world.rec,
+    last_exit: { at: "2026-01-01T00:00:00.000Z", cause: "exit", final: false, grant_restart: true },
+  };
+  world.killWorkload(world.liveWorkload(), "absent");
+  await runner.reconcile();
+  assert.equal(world.rec.last_exit?.grant_restart, undefined);
+  assert.equal(world.rec.state, "provisioning");
+  assert.equal(world.rec.restarts, 1);
 });
 
 test("a revoked grant is not signed again", async () => {

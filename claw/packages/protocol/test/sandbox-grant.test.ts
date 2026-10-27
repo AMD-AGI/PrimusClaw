@@ -147,6 +147,35 @@ test("GET 404 is missing and a revoked copy stays revoked", async () => {
   assert.equal(await c.inspect("revoked"), "revoked");
 });
 
+test("reissue of a 200 without keys does not revoke the id", async () => {
+  const methods: string[] = [];
+  const c = client(async (req) => {
+    methods.push(req.method);
+    if (req.method === "POST") return { status: 200, json: { grantId: material().grantId } };
+    return { status: 200 };
+  });
+  await assert.rejects(() => c.issue(material(), undefined, "reissue"), (err: unknown) => err instanceof GrantKeysMissingError);
+  assert.deepEqual(methods, ["POST"]);
+});
+
+test("a client is not opened without an explicit grant url", async () => {
+  const { openSandboxGrantClient } = await import("../src/sandbox-grant.js");
+  const prevKey = process.env.GRANT_SIGNING_KEY;
+  const prevUrl = process.env.AGENT_SANDBOX_GRANT_URL;
+  process.env.GRANT_SIGNING_KEY = pem;
+  delete process.env.AGENT_SANDBOX_GRANT_URL;
+  try {
+    assert.equal(openSandboxGrantClient(), null);
+    process.env.AGENT_SANDBOX_GRANT_URL = "http://grant.local/internal/v1/grants";
+    assert.ok(openSandboxGrantClient());
+  } finally {
+    if (prevKey === undefined) delete process.env.GRANT_SIGNING_KEY;
+    else process.env.GRANT_SIGNING_KEY = prevKey;
+    if (prevUrl === undefined) delete process.env.AGENT_SANDBOX_GRANT_URL;
+    else process.env.AGENT_SANDBOX_GRANT_URL = prevUrl;
+  }
+});
+
 test("the signer rejects a non-EC key", () => {
   assert.throws(() => new GrantSigner(publicKey), /EC private key/);
 });

@@ -7,8 +7,8 @@
  * Bound at startup only when a signing key is configured.
  */
 import {
-  GRANT_REVOKE_TIMEOUT_MS, appGrantTemplates, grantWorkspaces, openSandboxGrantClient,
-  type SandboxGrantClient, type SandboxGrantMaterial,
+  GRANT_CALL_TIMEOUT_MS, GRANT_REVOKE_TIMEOUT_MS, appGrantTemplates, grantWorkspaces, openSandboxGrantClient,
+  type SandboxGrantClient, type SandboxGrantMaterial, type SandboxSpecCreate,
 } from "@claw/protocol";
 import { bindAppRunnerExtensions } from "./app-runner-wiring.js";
 import type { AppGrantRun, AppGrantRunHooks } from "./app-runner.js";
@@ -32,39 +32,44 @@ export function brainGrantHooks(client: SandboxGrantClient): AppGrantRunHooks {
     },
     async extend(run, expiresAt) {
       const at = new Date(expiresAt);
-      return client.extend(materialOf(run, at), at);
+      return client.extend(materialOf(run, at), at, AbortSignal.timeout(GRANT_CALL_TIMEOUT_MS));
     },
     inspect(run) {
       if (!run.grantId) return Promise.resolve("missing");
-      return client.inspect(run.grantId);
+      return client.inspect(run.grantId, AbortSignal.timeout(GRANT_CALL_TIMEOUT_MS));
     },
     async reissue(run) {
       if (!run.grantId) throw new Error("grant id is required");
       const expiresAt = run.expiresAt ? new Date(run.expiresAt) : undefined;
-      const issued = await client.issue(materialOf(run, expiresAt));
+      const issued = await client.issue(materialOf(run, expiresAt), AbortSignal.timeout(GRANT_CALL_TIMEOUT_MS), "reissue");
       return { keys: issued.keys, expiresAt: issued.expiresAt.toISOString() };
     },
   };
 }
 
 function materialOf(run: AppGrantRun, expiresAt?: Date): SandboxGrantMaterial {
-  const workspaceId = run.workspaceId ?? undefined;
-  const templates = appGrantTemplates(run.manifest, {
-    image: run.manifest.container.image ?? "",
-    sandboxWorkspace: workspaceId ?? "",
-  });
+  const image = run.sandboxSpec?.image?.trim() || run.manifest.container.image || "";
+  const workspace = run.workspaceId ?? "";
+  const sandboxWorkspace = sandboxWorkspaceOf(run.sandboxSpec) || workspace;
+  const templates = appGrantTemplates(run.manifest, { image, sandboxWorkspace });
   return {
     grantId: run.grantId ?? "",
     appRunId: run.runId,
     sessionId: run.sessionId,
     userId: run.userId ?? "",
     platformKey: run.platformKey ?? "",
-    workspaces: grantWorkspaces(workspaceId, workspaceId, templates),
+    workspaces: grantWorkspaces(workspace, sandboxWorkspace, templates),
     limits: (run.limits ?? {}) as SandboxGrantMaterial["limits"],
     templates,
     roles: run.manifest.sandbox_roles,
     expiresAt,
   };
+}
+
+/** The workspace sandbox templates run in, when admission stored one apart from the app workspace. */
+function sandboxWorkspaceOf(spec: SandboxSpecCreate | null | undefined): string {
+  const value = (spec as { sandbox_workspace?: unknown } | null | undefined)?.sandbox_workspace;
+  return typeof value === "string" ? value.trim() : "";
 }
 
 function envText(name: string): string | undefined {

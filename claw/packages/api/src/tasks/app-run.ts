@@ -234,6 +234,9 @@ export function planAppRun(manifest: AppManifestV1, r: ResolvedAppResources): Ap
   if (r.cpu !== undefined) resources.cpu = String(r.cpu);
   if (r.memoryGi !== undefined) resources.memory = `${r.memoryGi}Gi`;
   const sandboxSpec: Record<string, unknown> = { handle: "app", image: r.image, namespace: r.workspace };
+  // Kept for a later reissue. Omitted when it is the app workspace, which is
+  // already `namespace`, so an older spec still means "the same workspace".
+  if (r.sandboxWorkspace !== r.workspace) sandboxSpec.sandbox_workspace = r.sandboxWorkspace;
   if (Object.keys(resources).length > 0) sandboxSpec.resources = resources;
   const workspaceIds = [r.workspace];
   if (!workspaceIds.includes(r.sandboxWorkspace)) workspaceIds.push(r.sandboxWorkspace);
