@@ -131,9 +131,9 @@ test("slow downloads are staged in parallel, so the chat waits for one, not the 
 test("a defaults file with more than the supported number of skills is refused", async () => {
   const dir = fs.mkdtempSync((await import("node:os")).tmpdir() + "/pd-max-");
   const f = dir + "/d.json";
-  fs.writeFileSync(f, JSON.stringify({ skills: Array.from({ length: pd.MAX_DEFAULT_SKILLS + 1 }, (_, i) => ({ tool_id: i + 1 })) }));
+  fs.writeFileSync(f, JSON.stringify({ skills: Array.from({ length: 51 }, (_, i) => ({ tool_id: i + 1 })) }));
   assert.equal(loadPlatformDefaults(f), null);
-  fs.writeFileSync(f, JSON.stringify({ skills: Array.from({ length: pd.MAX_DEFAULT_SKILLS }, (_, i) => ({ tool_id: i + 1 })) }));
+  fs.writeFileSync(f, JSON.stringify({ skills: Array.from({ length: 50 }, (_, i) => ({ tool_id: i + 1 })) }));
   fs.utimesSync(f, new Date(), new Date(Date.now() + 5000));
-  assert.equal(loadPlatformDefaults(f)?.skills.length, pd.MAX_DEFAULT_SKILLS);
+  assert.equal(loadPlatformDefaults(f)?.skills.length, 50);
 });
