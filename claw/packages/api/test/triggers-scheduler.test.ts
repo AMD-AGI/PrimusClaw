@@ -123,7 +123,7 @@ describe("scheduled triggers", { skip }, () => {
     assert.equal((await q("SELECT COUNT(*)::int AS n FROM claw_trigger_fires")).rows[0].n, 1);
   });
 
-  test("the per-user daily limit skips and pauses, and does not touch another user", async () => {
+  test("the per-user daily limit skips firings without pausing anything, does not touch another user, and lifts when the window rolls", async () => {
     const ids: string[] = [];
     for (let i = 0; i < 3; i++) ids.push((await create({ name: `t${i}` })).json().data.trigger_id);
     caller = user("u2");
@@ -135,8 +135,21 @@ describe("scheduled triggers", { skip }, () => {
     assert.deepEqual(u1, ["skipped_quota", "started", "started"]);
     assert.deepEqual(fires.filter((f) => f.owner_user_id === "u2").map((f) => f.status), ["started"]);
     assert.equal(dispatched.length, 3);
-    const paused = (await q("SELECT trigger_id FROM claw_triggers WHERE paused_reason = 'quota'")).rows;
-    assert.ok(paused.length >= 1);
+    const skipped = (await q("SELECT detail FROM claw_trigger_fires WHERE status = 'skipped_quota'")).rows as any[];
+    assert.deepEqual(skipped.map((r) => r.detail), ["daily_limit"], "the skip says why");
+    const paused = (await q("SELECT trigger_id FROM claw_triggers WHERE paused_reason IS NOT NULL")).rows;
+    assert.deepEqual(paused, [], "hitting the limit pauses no trigger");
+    // Still inside the window: the next firing of every u1 trigger is skipped again, not run.
+    for (const id of ids) await makeDue(id, "2026-10-27T06:00:00Z");
+    await sched.tickTriggers(new Date("2026-10-27T06:00:30Z"));
+    assert.equal(dispatched.length, 3, "nothing new starts while the count is at the limit");
+    assert.deepEqual((await q("SELECT trigger_id FROM claw_triggers WHERE paused_reason IS NOT NULL")).rows, []);
+    // A day later the earlier runs have finished and aged out, and the same triggers run again.
+    await q("UPDATE claw_sessions SET agent_status = 'idle'");
+    for (const id of ids) await makeDue(id, "2026-10-28T08:00:00Z");
+    await sched.tickTriggers(new Date("2026-10-28T08:00:30Z"));
+    assert.equal(dispatched.length, 5, "two more runs fit under the limit once the window has rolled");
+    assert.deepEqual((await q("SELECT trigger_id FROM claw_triggers WHERE paused_reason IS NOT NULL")).rows, []);
   });
 
   test("a run that outlives its limit is stopped once", async () => {

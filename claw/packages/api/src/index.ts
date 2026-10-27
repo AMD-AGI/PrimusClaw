@@ -8,7 +8,7 @@ import multipart from "@fastify/multipart";
 import {
   API_PORT, APP_ENV, SAFE_API_URL, DATABASE_URL, resolveCorsOrigin,
   AUTH_INTERNAL_TOKEN, NATS_URL,
-  CLAW_MEMORY_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
+  CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
   runLeaseTiming, envSettingProblems, assertAdmissionSettings,
 } from "./config.js";
 import { runLeaseTimingProblems } from "@claw/protocol";
@@ -25,6 +25,8 @@ import { registerSkillRoutes } from "./routes/skills.js";
 import { registerA2ARoutes } from "./routes/a2a.js";
 import { registerPluginRoutes } from "./routes/plugins.js";
 import { registerUserEnvVarRoutes } from "./routes/user-env-vars.js";
+import { registerNotificationSubscriptionRoutes } from "./routes/notification-subscriptions.js";
+import { startNotificationWorker } from "./notifications/outbox.js";
 import { registerSystemEnvVarRoutes, publishSystemEnvToKv } from "./routes/system-env-vars.js";
 import { registerMcpRoutes } from "./routes/mcp.js";
 import { registerInternalTaskRoutes } from "./routes/internal-tasks.js";
@@ -263,6 +265,7 @@ async function main() {
   await registerA2ARoutes(app);
   await registerPluginRoutes(app);
   await registerUserEnvVarRoutes(app);
+  await registerNotificationSubscriptionRoutes(app);
   await registerSystemEnvVarRoutes(app);
   await registerMcpRoutes(app);
   await registerInternalTaskRoutes(app);
@@ -303,6 +306,9 @@ async function main() {
   startUploadSweeper();
 
   if (CLAW_TRIGGERS_ENABLED) startTriggerScheduler();
+  // Outbound notification delivery (HMAC-signed webhooks from the outbox).
+  // Gated: with the flag off no table exists and nothing polls.
+  if (CLAW_NOTIFICATIONS_ENABLED) startNotificationWorker();
 
   // Daily maintenance crons (every 24h, first run 1 min after startup).
   // Memory decay gated by CLAW_MEMORY_ENABLED, skill cleanups gated by

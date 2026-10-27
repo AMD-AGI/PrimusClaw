@@ -97,12 +97,10 @@ export async function tickTriggers(now: Date = new Date()): Promise<void> {
       [t.owner_user_id, new Date(now.getTime() - DAY_MS)],
     )).rows[0].n);
     if (used >= TRIGGER_DAILY_LIMIT_PER_USER) {
-      await recordFire(t.trigger_id, key, t.owner_user_id, "skipped_quota", null, null);
-      await db.query(
-        `UPDATE claw_triggers SET paused_reason = 'quota', updated_at = NOW()
-          WHERE owner_user_id = $1 AND paused_reason IS NULL`,
-        [t.owner_user_id],
-      );
+      // A rolling limit, not a kill switch: this firing is skipped and recorded
+      // with its reason, and the next one is judged again once runs age out of
+      // the 24-hour window. Nothing is paused.
+      await recordFire(t.trigger_id, key, t.owner_user_id, "skipped_quota", null, "daily_limit");
       logger.warn({ triggerId: t.trigger_id }, "trigger.daily_limit_reached");
       continue;
     }
