@@ -167,6 +167,12 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     columns: ["workspace_id", "ref_kind", "ref_id", "created_at", "released_at"],
   },
   {
+    table: "claw_user_memory_prefs",
+    // Read on every prompt build and every memory write; an absent table makes
+    // both fail closed, i.e. memory silently off for everyone.
+    columns: ["user_id", "enabled"],
+  },
+  {
     table: "claw_memory_entries",
     // The reason this guard exists, found the long way round. `kind` separates
     // the rows decay is allowed to forget from the KB rows it must not touch,

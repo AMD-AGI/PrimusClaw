@@ -17,6 +17,7 @@ import { js, sc, nc, publishCertainlyFailed } from "../infra/nats.js";
 import { isAdmin, type UserInfo } from "../auth/models.js";
 import { stampSessionCredentials } from "../auth/session-credentials.js";
 import { buildMessages } from "./context-builder.js";
+import { isMemoryActive } from "../memory/service.js";
 import { selectSkillsForTask } from "../marketplace/skill-service.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { eventSubject, taskSubject, type EnvironmentTopology } from "@claw/protocol";
@@ -310,6 +311,7 @@ export async function dispatchTaskToBrain(
       message_id: messageId,
       prompt: content,
       history,
+      memory_enabled: await isMemoryActive(userId),
       user_id: userId,
       llm_api_key: resolveUserLlmKey(user),
       platform_key: user?.platformKey || "",

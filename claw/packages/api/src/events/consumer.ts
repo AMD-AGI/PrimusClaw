@@ -14,7 +14,7 @@ import {
 } from "../marketplace/plugins.js";
 
 import { buildMessages } from "../sessions/context-builder.js";
-import { maybeExtractMemory, insertMemoryEntry, scanMemoryContent, maybeUpdateUserProfile } from "../memory/service.js";
+import { maybeExtractMemory, insertMemoryEntry, isMemoryActive, scanMemoryContent, maybeUpdateUserProfile } from "../memory/service.js";
 import {
   saveSkill, recordSkillFeedback,
   selectSkillsForTask,
@@ -25,7 +25,8 @@ import {
 import { appEventIdentity } from "./app-events.js";
 import { enqueueEvolutionJob } from "../marketplace/evolve-worker.js";
 import { callMemoryLLM } from "../llm/client.js";
-import { CLAW_MEMORY_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
+import { CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
+import { recordRunFinished } from "../notifications/outbox.js";
 import {
   markChatRunRunning, closeChatRun, gateOwnershipEnforced, queuedMessageId,
   retireDispatchReconcileForReport,
@@ -778,6 +779,8 @@ async function handleComplete(
   // that question. `closeChatRun` is safe to run first: with no message id it
   // only closes a row that is the single open one, so it cannot take a
   // concurrent run's row with it.
+  // Runs this completion ended, for the notification outbox below.
+  let endedRunIds: string[] = [];
   if (provenance !== "foreign") {
     const closed = await closeChatRun(
       sessionId,
@@ -786,6 +789,7 @@ async function handleComplete(
       failed ? String(failure_reason ?? "agent_error") : undefined,
       { taskId: provenance ?? undefined, runClaim: runClaimOf(event) },
     );
+    endedRunIds = closed.length ? closed : (provenance ? [provenance] : []);
     // A zero match classifies the event; it is not a yes/no gate. This
     // delivery may be its own redelivery, in which case every step below is
     // still owed and each is idempotent -- but it may equally be a report the
@@ -874,8 +878,11 @@ async function handleComplete(
       const blocked = scanMemoryContent(mem.content);
       if (blocked) { logger.warn({ reason: blocked }, "memory.blocked"); continue; }
       try {
-        await insertMemoryEntry(userId, { ...mem, sourceSession: sessionId, sourceType: "explicit" });
-        explicitMemorySaved = true;
+        if (await insertMemoryEntry(userId, { ...mem, sourceSession: sessionId, sourceType: "explicit" })) {
+          explicitMemorySaved = true;
+        } else {
+          logger.warn({ sessionId }, "memory.write_skipped_user_opted_out");
+        }
       } catch (err) {
         logger.error({ err, sessionId }, "memory.save_failed");
       }
@@ -1093,6 +1100,22 @@ async function handleComplete(
     }
   }
 
+  // 8. Notify subscribers that a run ended. Opt-in (flag and a subscription),
+  //    best-effort, and idempotent: the outbox row key is derived from the run,
+  //    so a redelivered completion records nothing new.
+  if (CLAW_NOTIFICATIONS_ENABLED && !interrupted && endedRunIds.length) {
+    try {
+      await recordRunFinished({
+        sessionId,
+        taskIds: endedRunIds,
+        outcome: failed ? "failed" : "completed",
+        failureReason: failed ? String(failure_reason ?? "agent_error") : undefined,
+      });
+    } catch (err) {
+      logger.error({ err, sessionId }, "notification.record_failed");
+    }
+  }
+
   logger.info({ sessionId, failed, userId }, "exec_complete.handled");
 }
 
@@ -1242,6 +1265,7 @@ if (pending) {
     message_id: pendingMessageId,
     prompt: pending.content,
     history,
+    memory_enabled: await isMemoryActive(pendingUserId),
     user_id: pendingUserId,
     llm_api_key: typeof pending.llm_api_key === "string" ? pending.llm_api_key : "",
     platform_key: typeof pending.platform_key === "string" ? pending.platform_key : "",

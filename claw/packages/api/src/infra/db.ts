@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 import pg from "pg";
-import { APP_RUNS_ENABLED, DATABASE_URL, envInt } from "../config.js";
+import { APP_RUNS_ENABLED, CLAW_NOTIFICATIONS_ENABLED, DATABASE_URL, envInt } from "../config.js";
+import { ensureNotificationSchema } from "../notifications/schema.js";
 import pino from "pino";
 import {
   REQUIRED_SCHEMA,
@@ -1271,6 +1272,15 @@ export async function initDb(): Promise<void> {
       ON claw_memory_entries(user_id) WHERE category = 'user_profile'
     `).catch(() => {});
 
+    // Per-user opt-in for long-term memory. No row means off.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS claw_user_memory_prefs (
+        user_id     TEXT PRIMARY KEY,
+        enabled     BOOLEAN NOT NULL DEFAULT FALSE,
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
     // Skill storage + version management (Phase 3)
     await client.query(`
       CREATE TABLE IF NOT EXISTS claw_skills (
@@ -2157,6 +2167,9 @@ export async function initDb(): Promise<void> {
         updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
+
+    // Off by default: a deployment that has not opted in gets no new tables.
+    if (CLAW_NOTIFICATIONS_ENABLED) await ensureNotificationSchema(client);
 
     await assertSchema(client);
     logger.info("db.migrated");
