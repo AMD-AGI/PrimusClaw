@@ -490,7 +490,6 @@ for (const c of STALE_RECORD_CASES) {
       // Not removable by either route: this sync does not use the record at all.
       assert.deepEqual([...new Set(sb.uploaded)], ["/workspace/config.py", "/workspace/other.py"], "everything goes, as without a record");
       assert.equal(one.unchanged, undefined);
-      return;
     }
 
     sb.failPaths.clear();
@@ -500,6 +499,57 @@ for (const c of STALE_RECORD_CASES) {
     assert.ok(sb.uploaded.includes("/workspace/config.py"), "S3 holds B, so A has to be sent again");
   });
 }
+
+test("F5 a sync whose only change is a deleted file drops the record before the prune, not after", async () => {
+  // The prune deletes the object the record still lists. It runs between the plan
+  // and `commit`, so a record that is only replaced at `commit` is false for that
+  // whole stretch, and a sync that dies in it leaves the false record behind.
+  const sb = threeFiles();
+  await sb.sync();
+  assert.ok(sb.manifestFiles().length > 0);
+
+  sb.remove("dir/c.txt");
+  const plan = await planUploadDelta(sb.client, PREFIX, THREE.slice(0, 2), findExcludeArgs(s3Excludes()));
+
+  assert.deepEqual(plan?.pending, [], "nothing to upload");
+  assert.deepEqual(sb.manifestFiles(), [], "and the record is already gone, before the prune would run");
+  await plan?.commit();
+  assert.ok(sb.manifestFiles().length > 0, "written back once the sync is done");
+});
+
+test("F6 a record that cannot be neutralised is not believed by the syncs after it either", async () => {
+  // Neither rm nor write works. The sync that deletes c.txt prunes its object while
+  // the record still lists it; when c.txt comes back with the content and size the
+  // record remembers, believing the record would leave S3 without it.
+  const sb = threeFiles();
+  await sb.sync();
+
+  sb.remove("dir/c.txt");
+  sb.prelude = RM_EACCES;
+  sb.writeRefused = true;
+  sb.resetUploads();
+  const gone = await sb.sync();
+  assert.equal(gone.unchanged, undefined, "this sync did not use the record");
+  assert.deepEqual(sb.uploaded, ["/workspace/a.txt", "/workspace/dir/b.txt"], "a full upload of what is left");
+
+  sb.put("dir/c.txt", "charlie"); // same bytes, new mtime: the digest matches the record
+  sb.resetUploads();
+  const back = await sb.sync();
+  assert.ok(sb.uploaded.includes("/workspace/dir/c.txt"), "S3 no longer has it, so it has to be sent");
+  assert.equal(back.unchanged, undefined, "still not trusting it");
+
+  // The sandbox is fixed: the record is taken away, everything goes up once,
+  // and from then on only what changed does.
+  sb.prelude = "";
+  sb.writeRefused = false;
+  sb.resetUploads();
+  await sb.sync();
+  assert.equal(sb.uploaded.length, 3);
+  sb.resetUploads();
+  const settled = await sb.sync();
+  assert.deepEqual(sb.uploaded, []);
+  assert.equal(settled.unchanged, 3);
+});
 
 /** A command's real output, with and without the line it ends on. */
 function realOutput(sb: Sandbox, command: string): { whole: string; cut: string } {

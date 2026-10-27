@@ -258,6 +258,25 @@ async function readManifest(hands: HandsClient, s3Prefix: string): Promise<Map<s
 }
 
 /**
+ * Prefixes whose record this process could not neutralise, per sandbox client.
+ *
+ * A record that can neither be removed nor overwritten stays on disk, and the
+ * next sync that finds every file matching it believes it -- after S3 has moved
+ * on (a pruned object whose file comes back, an upload that did not finish). The
+ * sandbox cannot be asked to remember that, since whatever stopped it taking the
+ * record away stops it holding a note too, so this process does, for as long as
+ * it talks to that sandbox: a poisoned prefix is not planned from until the
+ * record has been confirmed gone.
+ */
+const unneutralised = new WeakMap<HandsClient, Set<string>>();
+
+function markUnneutralised(hands: HandsClient, s3Prefix: string, yes: boolean): void {
+  let set = unneutralised.get(hands);
+  if (!set) unneutralised.set(hands, (set = new Set()));
+  if (yes) set.add(s3Prefix); else set.delete(s3Prefix);
+}
+
+/**
  * Make this prefix's manifest unusable. True only when the sandbox confirmed it.
  *
  * Exported for the paths that rewrite the S3 prefix behind the sync's back (the
@@ -277,11 +296,19 @@ async function readManifest(hands: HandsClient, s3Prefix: string): Promise<Map<s
  * "do not use it for this sync" is not enough. When `rm` could not, the identity
  * that wrote it overwrites the first shard with one `readManifest` refuses, which
  * is as unusable as a missing one (every shard has to be present and of one write).
- * Only when both fail is the answer false, and the caller does not use it.
+ * Only when both fail is the answer false: the caller does not use the record,
+ * and this process stops planning from that prefix until a later call confirms it
+ * gone (`unneutralised`).
  */
 export async function invalidateSyncManifest(
   hands: HandsClient, s3Prefix: string, timeoutSec: number = STATE_TIMEOUT_SEC,
 ): Promise<boolean> {
+  const ok = await tryInvalidate(hands, s3Prefix, timeoutSec);
+  markUnneutralised(hands, s3Prefix, !ok);
+  return ok;
+}
+
+async function tryInvalidate(hands: HandsClient, s3Prefix: string, timeoutSec: number): Promise<boolean> {
   const shards = `${statePrefix(s3Prefix)}.*.json`;
   let answered: string;
   try {
@@ -365,6 +392,9 @@ export async function planUploadDelta(
 ): Promise<UploadDelta | null> {
   if (files.length === 0) return null;
   const shardFiles = opts.shardFiles ?? SHARD_FILES;
+  // A record this process could not take away is not planned from, and is taken
+  // away again first: the sandbox may have been fixed since.
+  if (unneutralised.get(hands)?.has(s3Prefix) && !(await invalidateSyncManifest(hands, s3Prefix))) return null;
   const stats = await statFiles(hands, excludeArgs);
   // A sandbox that cannot stat gets no optimisation and no manifest, not a guess.
   if (!stats || stats.size === 0) return null;
@@ -404,10 +434,14 @@ export async function planUploadDelta(
 
   const toUpload = files.filter((p) => pending.has(p));
   let dropped = false;
-  if (toUpload.length > 0) {
-    // Before the first upload, not after the last: once an object is replaced the
-    // manifest's claim about it is false, and a sync that dies in the middle must
-    // not leave that claim behind. If it cannot be removed, do not use it.
+  // Nothing to upload but a file gone is still a sync that changes S3: the prune
+  // that follows deletes its object, and the record would go on saying it is there.
+  const forgets = prev !== null && toUpload.length === 0 && prev.size !== entries.size;
+  if (toUpload.length > 0 || forgets) {
+    // Before the first upload (or the prune), not after the last: once an object is
+    // replaced or deleted the manifest's claim about it is false, and a sync that
+    // dies in the middle must not leave that claim behind. If it cannot be
+    // removed, do not use it -- here, or in a later sync of this process.
     dropped = await invalidateSyncManifest(hands, s3Prefix);
     if (!dropped) return null;
   }
