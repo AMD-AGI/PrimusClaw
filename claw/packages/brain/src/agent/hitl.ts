@@ -66,7 +66,8 @@ export class HitlController {
    */
   willAsk(tool: string): boolean {
     if (!this.dispatcher) return false;
-    if (this.mustAsk(tool)) return !this.alwaysAllow.has(tool);
+    // A policy-held tool is asked about every time: no session-wide allow.
+    if (this.mustAsk(tool)) return true;
     if (!HITL_ENABLED) return false;
     return !this.autoAllowSet.has(tool) && !this.alwaysAllow.has(tool);
   }
@@ -136,7 +137,7 @@ export class HitlController {
     const result = this.normalizeDecision(msg, req.input);
 
     // Handle "remember" for session-scoped always_allow
-    if (msg.remember && result.action === "allow") {
+    if (msg.remember && result.action === "allow" && !this.mustAsk(req.tool)) {
       this.alwaysAllow.add(req.tool);
       logger.info({ tool: req.tool, sessionId: req.sessionId }, "hitl.always_allow_set");
     }

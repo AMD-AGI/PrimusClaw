@@ -34,12 +34,27 @@ test("a list holds exactly the named tools, of that server only", () => {
   assert.equal(p.requiresApproval("workload_stop"), false);
 });
 
-test("true holds every tool of the server; junk values hold nothing", () => {
+test("true holds every tool of the server; false and null are no rule", () => {
   const all = approvalPolicyFromMcp({ safe: { ...base, requires_approval: true } });
   assert.equal(all.requiresApproval("mcp__safe__anything"), true);
-  for (const bad of ["yes", 1, {}, [], [""], [5], null]) {
-    assert.equal(approvalPolicyFromMcp({ safe: { ...base, requires_approval: bad } }).active, false, JSON.stringify(bad));
+  for (const none of [false, null]) {
+    assert.equal(approvalPolicyFromMcp({ safe: { ...base, requires_approval: none } }).active, false);
   }
+});
+
+test("a malformed value fails closed: every tool of that server is held", () => {
+  for (const bad of ["workload_stop", "true", 1, {}, [], [""], [5], ["ok", 5]]) {
+    const p = approvalPolicyFromMcp({ safe: { ...base, requires_approval: bad }, other: { ...base } });
+    assert.equal(p.active, true, JSON.stringify(bad));
+    assert.equal(p.requiresApproval("mcp__safe__workload_get"), true, JSON.stringify(bad));
+    assert.equal(p.requiresApproval("mcp__other__workload_get"), false, JSON.stringify(bad));
+  }
+});
+
+test("one spelling cannot hide the other", () => {
+  const p = approvalPolicyFromMcp({ safe: { ...base, requires_approval: false, requiresApproval: ["workload_stop"] } });
+  assert.equal(p.requiresApproval("mcp__safe__workload_stop"), true);
+  assert.equal(p.requiresApproval("mcp__safe__workload_get"), false);
 });
 
 test("the field survives normalizeMcpConfigs", () => {
@@ -110,4 +125,13 @@ test("no approval channel at all is a deny, not a silent run", async () => {
 test("an unknown decision value is a deny", async () => {
   const { c } = controller(fakeDispatcher({ decision: "maybe" }));
   assert.equal((await c.beforeToolUse(req("mcp__safe__workload_stop"))).action, "deny");
+});
+
+test("always_allow / remember never turns a held tool into an auto-allow", async () => {
+  const d = fakeDispatcher({ decision: "allow", remember: true });
+  const { c } = controller(d);
+  assert.equal((await c.beforeToolUse(req("mcp__safe__workload_stop"))).action, "allow");
+  assert.equal(c.willAsk("mcp__safe__workload_stop"), true);
+  await c.beforeToolUse({ ...req("mcp__safe__workload_stop"), actionId: "toolu_2" });
+  assert.deepEqual(d.registered, ["toolu_1", "toolu_2"]);
 });
