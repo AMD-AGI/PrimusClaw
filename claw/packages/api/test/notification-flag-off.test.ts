@@ -42,7 +42,7 @@ describe("notifications flag off", { skip }, () => {
 
 test("the completion handler reaches the outbox only behind the flag, and the worker starts only behind it", () => {
   const consumer = readFileSync(new URL("../src/events/consumer.ts", import.meta.url), "utf8");
-  assert.match(consumer, /if \(CLAW_NOTIFICATIONS_ENABLED && !interrupted && endedRunIds\.length\) \{\s*try \{\s*await recordRunFinished/);
+  assert.match(consumer, /if \(CLAW_NOTIFICATIONS_ENABLED && !interrupted && endedRunIds\.length\) \{\s*try \{\s*await completionPorts\.recordRunFinished/);
   const index = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
   assert.match(index, /if \(CLAW_NOTIFICATIONS_ENABLED\) startNotificationWorker\(\)/);
   const db = readFileSync(new URL("../src/infra/db.ts", import.meta.url), "utf8");

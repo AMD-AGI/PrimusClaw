@@ -9,7 +9,7 @@ default; with `PLATFORM_DEFAULTS_FILE` unset, chats are built exactly as before.
 | Variable | Default | Effect |
 |---|---|---|
 | `PLATFORM_DEFAULTS_FILE` | unset | Path to the defaults file below. Unset, missing, unreadable or malformed means "not enabled" (a malformed file is logged and counted, and never fails a chat). Re-read when its mtime changes. |
-| `PROGRESSIVE_SKILLS_ENABLED` | `false` | Whether the file's `skills` apply. Off: only its `mcp_servers` are mounted and no skill is fetched. |
+| `PROGRESSIVE_SKILLS_ENABLED` | `false` | Whether the file's `skills` apply. Off: only its `mcp_servers` are mounted and no skill is fetched. Also decides how a plugin's skills reach the prompt: on, they are listed by name and description like the defaults; off, every SKILL.md body is inlined. |
 
 ## The file
 
@@ -40,7 +40,9 @@ default; with `PLATFORM_DEFAULTS_FILE` unset, chats are built exactly as before.
 
 Mount order, lowest priority first: platform defaults, request `mcp_servers`,
 `tool_ids`, plugin. A skill the request already supplies (plugin, local, or
-`tool_ids`) under the same name wins and stays fully inlined.
+`tool_ids`) under the same name wins over the default; a plugin skill is then
+listed like any other plugin skill (see below), a local or `tool_ids` skill stays
+fully inlined.
 
 ## How skills load (progressive disclosure)
 
@@ -52,10 +54,25 @@ sandbox tool call names `.skills`, immediately before that call, and the agent
 reads it with its normal `read` tool. A chat that never reads a default skill
 never writes one and never starts a sandbox on their account.
 
-Limits: 50 entries and 8000 characters of list; further skills are summarized
-as "N more skills not listed". Keep SKILL.md short (about 300 lines) and move
-detail into files next to it, which the agent reads only when SKILL.md points
-to them. Skills from plugins and `tool_ids` are unchanged and stay inlined.
+Limits: 50 entries and 8000 characters of list; further default skills are
+summarized as "N more skills not listed". Keep SKILL.md short (about 300 lines)
+and move detail into files next to it, which the agent reads only when SKILL.md
+points to them. `tool_ids` skills are looked up and downloaded through the same
+resolver and base URL and stay inlined.
+
+### Plugin skills
+
+With `PROGRESSIVE_SKILLS_ENABLED=true`, a plugin's skills use the same list and
+the same on-demand write instead of inlining every SKILL.md body. A plugin skill
+the capped list has no room for stays inlined, so no skill is ever neither listed
+nor contained in the prompt. With the flag off, plugin skills are inlined as
+before.
+
+Independently of the flag, a plugin's skill files are written into the sandbox on
+the first sandbox call that names `.skills` (immediately before it, supporting
+files included), and a plugin without a hooks-type tool starts no sandbox at the
+start of a turn: a turn that only calls MCP tools never opens one. A plugin with a
+hooks tool keeps its sandbox and skill writes at the start of the turn.
 
 ## Publishing default tools
 

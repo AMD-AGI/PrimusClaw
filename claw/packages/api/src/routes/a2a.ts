@@ -7,9 +7,9 @@ import { metrics } from "../infra/metrics.js";
 import { js, sc, nc } from "../infra/nats.js";
 import { sanitizeSessionEvent } from "../events/store.js";
 import { getUser } from "../auth/middleware.js";
-import { canWriteSessionAsOperator, type UserInfo } from "../auth/models.js";
+import { canWriteSessionAsOperator, isAdmin, type UserInfo } from "../auth/models.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
-import { formatPluginRow, pluginSandboxImage } from "../marketplace/plugins.js";
+import { resolveTaskPlugin } from "../marketplace/plugins.js";
 import {
   decideAdmission, envAdmitLimits, sessionTreeShape, withOwnedAdmissionLock,
   type AdmissionAsk,
@@ -391,7 +391,8 @@ interface A2ARunSpec {
   resources?: Record<string, unknown>;
   topology?: EnvironmentTopology;
   pluginId?: number;
-  pluginTools?: unknown[];
+  /** null: the plugin is missing or the caller may not see it. Brain holds bash on null. */
+  pluginTools?: unknown[] | null;
   workspaceId?: string;
   parentSessionId?: string;
   teamRole?: string;
@@ -399,24 +400,27 @@ interface A2ARunSpec {
 
 async function resolveA2ARunSpec(
   messageId: string,
-  metadata?: Record<string, unknown>,
+  metadata: Record<string, unknown> | undefined,
+  auth: A2AAuthContext,
 ): Promise<{ spec: A2ARunSpec } | { invalidTopology: string[] }> {
   const invalid = topologyErrors(metadata);
   if (invalid) return { invalidTopology: invalid };
 
   const rawPluginId = metadata?.plugin_id !== undefined ? Number(metadata.plugin_id) : undefined;
   const pluginId = rawPluginId !== undefined && Number.isFinite(rawPluginId) ? rawPluginId : undefined;
-  let pluginTools: unknown[] | undefined;
+  let pluginTools: unknown[] | null | undefined;
   let pluginImage: string | undefined;
   let pluginResource: Record<string, unknown> | undefined;
   if (pluginId !== undefined) {
-    const pluginRow = await MarketplaceDb.pluginGetById(pluginId, false);
-    if (pluginRow) {
-      const formatted = await formatPluginRow(pluginRow, true);
-      pluginTools = (formatted.tools as unknown[]) ?? [];
-      pluginImage = pluginSandboxImage(formatted.images) || undefined;
-      pluginResource = asJsonObject(formatted.resource);
-    }
+    // `metadata.plugin_id` is the caller's to name, so the plugin is read as the
+    // caller sees it, exactly as a chat message does: a plugin they may not view
+    // resolves to null here, never to its tools, skills and rules.
+    const plugin = await resolveTaskPlugin(
+      pluginId, auth.userId, isAdmin({ ...auth, userName: auth.userId }),
+    );
+    pluginTools = plugin.tools;
+    pluginImage = plugin.image;
+    pluginResource = plugin.resource;
   }
 
   // Resolution order, as in routes/sessions.ts: metadata > plugin > default.
@@ -697,7 +701,9 @@ async function publishA2AExecuteTask(
   };
   if (spec.pluginId !== undefined) {
     payload.plugin_id = spec.pluginId;
-    payload.plugin_tools = spec.pluginTools ?? [];
+    // Never defaulted to []: that says "this plugin declares no rules", where a
+    // plugin the caller cannot see, or that does not exist, has rules nobody read.
+    payload.plugin_tools = spec.pluginTools ?? null;
   }
   if (spec.topology) payload.topology = spec.topology;
   // Brain ensureHands requires `sandbox_image` to create a K8s workload, and
@@ -810,7 +816,7 @@ async function handleSendMessage(
     return makeJsonRpcError(rpcId, JSON_RPC_INVALID_PARAMS, "No text content found in message parts");
   }
 
-  const resolved = await resolveA2ARunSpec(message.messageId, metadata as Record<string, unknown> | undefined);
+  const resolved = await resolveA2ARunSpec(message.messageId, metadata as Record<string, unknown> | undefined, auth);
   if ("invalidTopology" in resolved) {
     return makeJsonRpcError(rpcId, JSON_RPC_INVALID_PARAMS, resolved.invalidTopology.join("; "));
   }
@@ -1212,7 +1218,7 @@ async function handleSendStreamingMessage(
     return;
   }
 
-  const resolved = await resolveA2ARunSpec(message.messageId, metadata as Record<string, unknown> | undefined);
+  const resolved = await resolveA2ARunSpec(message.messageId, metadata as Record<string, unknown> | undefined, auth);
   if ("invalidTopology" in resolved) {
     reply.status(400).send(
       makeJsonRpcError(rpcId, JSON_RPC_INVALID_PARAMS, resolved.invalidTopology.join("; ")),

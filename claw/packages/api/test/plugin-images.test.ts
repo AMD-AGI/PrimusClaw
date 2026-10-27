@@ -118,12 +118,17 @@ test("no path selects or reads the retired image column", () => {
     );
   }
 
-  // The three message-path call sites resolve through the formatted row.
+  // The message-path call sites resolve through the formatted row, by way of
+  // `resolveTaskPlugin`, the one reader the immediate dispatch, the queue drain
+  // and A2A share, so the read itself is asserted where it lives.
+  assert.match(
+    src("marketplace/plugins.ts"),
+    /pluginSandboxImage\(formatted\.images\)/,
+    "marketplace/plugins.ts must resolve through the list",
+  );
   for (const rel of ["sessions/dispatch.ts", "events/consumer.ts", "routes/a2a.ts"]) {
-    assert.match(
-      src(rel),
-      /pluginSandboxImage\(formatted\.images\)/,
-      `${rel} must resolve through the list`,
-    );
+    const text = src(rel);
+    assert.match(text, /resolveTaskPlugin\(/, `${rel} must read the plugin through resolveTaskPlugin`);
+    assert.doesNotMatch(text, /MarketplaceDb\.pluginGetById/, `${rel} must not read the plugin row itself`);
   }
 });

@@ -57,6 +57,10 @@ const { db } = await import("../src/infra/db.js");
 const {
   handleRegistry, readSessionBackgroundWork,
 } = await import("../src/tasks/sandbox-stopper.js");
+
+// The terminal claim is read from the registry bucket, which these suites do not
+// stand up; no claim is in force unless a case says so.
+handleRegistry.terminalHold = async () => ({ state: "none" });
 const { reapOrphanHandles } = await import("../src/tasks/sweeper.js");
 
 let h: Harness;

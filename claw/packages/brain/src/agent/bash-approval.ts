@@ -1,0 +1,480 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+/**
+ * Configurable "hold this bash command for a person" policy.
+ *
+ * Writes made through the bash tool (an HTTP client, a helper script) do not
+ * pass through an MCP server, so `requires_approval` (approval-policy.ts)
+ * cannot see them. This policy matches the command line itself, and a matching
+ * call goes through the same HitlController gate: a permissionRequest, a
+ * decision, denied when nobody answers, and no remember / always_allow.
+ *
+ * LIMITS, stated plainly. This is a guard against ACCIDENTAL writes, not a
+ * sandbox boundary. It reads shell text; a determined model can defeat it
+ * (eval, base64 pipes, a script written to a file and run, variable-built
+ * URLs, an HTTP client the rules do not know). Server-side authorization stays
+ * the real control; this only makes the common honest case ask first.
+ *
+ * Configuration: a list of rules, from a plugin tool's `config.bash_approval`
+ * (or `bashApproval`) and/or the deployment's BASH_APPROVAL_RULES (JSON). Each
+ * rule is an object:
+ *
+ *   label        required, shown to the user and logged
+ *   regex        tested against the whole command line
+ *   flags        optional regex flags, any of "i" "m" "s"
+ *   program      program name (or list); a trailing `*` matches a prefix
+ *   args_regex   tested against the arguments of one simple command
+ *   http         { methods?: ["POST", ...], url_prefix?: "host/path",
+ *                url_regex?: "..." } for curl / wget; the method is -X /
+ *                --method, else implied by a body flag (POST), else GET; the
+ *                scheme is ignored in url_prefix; url_regex is tested against
+ *                the URL as written, so it also sees `$BASE/path`
+ *
+ * All fields present in a rule must match (`program`, `args_regex`, `http`
+ * within the same simple command). A rule with none of regex / program /
+ * args_regex / http, an unknown key, a bad type or an unparsable regex is
+ * malformed. Malformed configuration fails closed: every bash command is held,
+ * and a warning is logged. `false` / null / absent mean no rule.
+ */
+import pino from "pino";
+
+const logger = pino({ name: "bash-approval" });
+
+export interface BashApprovalPolicy {
+  /** True when at least one rule (or a malformed config) is in force. */
+  readonly active: boolean;
+  /** The label of the first rule the command matches, or null to run it. */
+  check(command: unknown): string | null;
+}
+
+/** Longer than any command a person would approve by reading; held unread. */
+const MAX_COMMAND_CHARS = 100_000;
+const MAX_SHELL_DEPTH = 3;
+/**
+ * Stands in for rules that should have been loaded and were not (a marketplace
+ * tool that could not be resolved). Not a rule list, so the policy treats it as
+ * malformed: every bash command is held and a warning is logged.
+ */
+export const UNAVAILABLE_RULES = "bash approval rules unavailable";
+/**
+ * Stands in for a plugin's whole tool list when the task message named a plugin
+ * and did not carry the list. The rules are unknown rather than malformed, and
+ * the label says so, because the fix for one is a different message and for the
+ * other a different rule.
+ */
+export const PLUGIN_TOOLS_MISSING = "plugin tool list missing from the task message";
+export const PLUGIN_TOOLS_MISSING_LABEL = "plugin tool list missing from the task message; every bash command is held";
+export const MALFORMED_LABEL = "bash approval rules are malformed; every bash command is held";
+
+interface Segment {
+  program: string; argv: string[];
+  /** Shell text this command hands to a shell, parsed as nested commands. */
+  nested?: string;
+  /** Already-split words of a command this one runs (kubectl exec -- ...); quoting is kept. */
+  inner?: string[];
+}
+type RuleFn = (command: string, segments: Segment[]) => boolean;
+interface Rule { label: string; test: RuleFn }
+
+const RULE_KEYS = new Set(["label", "regex", "flags", "program", "args_regex", "http"]);
+/**
+ * Programs that run another program given in their arguments, and which of
+ * their flags take a separate value / how many positional words come before the
+ * command. Seen through, so `timeout 5 curl ...` is a curl.
+ */
+const WRAPPERS: Record<string, { valueFlags: string[]; positional: number; shell?: boolean; shellFlag?: string[] }> = {
+  // env -S STRING is a command line, split by env itself.
+  env: { valueFlags: ["-u", "-C", "--unset", "--chdir"], positional: 0, shellFlag: ["-S", "--split-string"] },
+  sudo: { valueFlags: ["-u", "-g", "-C", "-h", "-p", "-r", "-t", "-U", "-D", "-R", "-T", "--user", "--group", "--close-from", "--host", "--prompt", "--role", "--type", "--other-user", "--chdir", "--chroot", "--command-timeout"], positional: 0 },
+  doas: { valueFlags: ["-u", "-C"], positional: 0 },
+  time: { valueFlags: ["-f", "-o", "--format", "--output"], positional: 0 },
+  nohup: { valueFlags: [], positional: 0 },
+  command: { valueFlags: [], positional: 0 },
+  exec: { valueFlags: ["-a"], positional: 0 },
+  nice: { valueFlags: ["-n", "--adjustment"], positional: 0 },
+  ionice: { valueFlags: ["-c", "-n", "-p", "-P", "-u"], positional: 0 },
+  stdbuf: { valueFlags: ["-i", "-o", "-e", "--input", "--output", "--error"], positional: 0 },
+  setsid: { valueFlags: [], positional: 0 },
+  timeout: { valueFlags: ["-k", "-s", "--kill-after", "--signal"], positional: 1 },
+  // watch runs its words through `sh -c`; flock -c takes a shell string.
+  // watch -d / --differences[=permanent] takes no separate value (procps man page).
+  watch: { valueFlags: ["-n", "--interval", "-q", "--equexit"], positional: 0, shell: true },
+  flock: { valueFlags: ["-w", "-E", "--timeout", "--wait", "--conflict-exit-code"], positional: 1, shellFlag: ["-c", "--command"] },
+  // xargs -i / -l / --replace / --max-lines take an optional ATTACHED value only.
+  xargs: { valueFlags: ["-I", "-n", "-P", "-d", "-L", "-s", "-E", "-a", "-J", "--max-args", "--max-procs", "--delimiter", "--arg-file", "--max-chars", "--eof"], positional: 0 },
+};
+/** Only inside `eval` / `shell -c`, where `echo cmd` output is what runs. */
+const ECHO_WRAPPERS = new Set(["echo", "printf"]);
+const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "su"]);
+/** Reserved words and grouping tokens that precede a command: `if curl ...; then`, `{ curl ...; }`. */
+const KEYWORDS = new Set(["if", "then", "elif", "else", "do", "while", "until", "!", "{", "}", "select", "coproc", "function"]);
+/** ssh flags that take a separate value, so the host and the remote command can be found. */
+const SSH_VALUE_FLAGS = new Set(["-p", "-i", "-l", "-o", "-F", "-J", "-L", "-R", "-D", "-b", "-c", "-e", "-m", "-O", "-S", "-w", "-E", "-B", "-I", "-W", "-Q"]);
+const TOO_DEEP = "<too-deep>";
+
+function closeOf(text: string, from: number, open: string, close: string): number {
+  let depth = 1;
+  for (let i = from; i < text.length; i++) {
+    const c = text[i];
+    if (c === "\\") { i++; continue; }
+    if (c === "'" && open === "(") { const j = text.indexOf("'", i + 1); if (j < 0) return text.length; i = j; continue; }
+    if (open === close) { if (c === close) return i; continue; }
+    if (c === open) depth++;
+    else if (c === close && --depth === 0) return i;
+  }
+  return text.length;
+}
+
+/** Split shell text into simple commands, each as program + argv. */
+export function parseSegments(text: string, depth = 0, echoRuns = false): Segment[] {
+  if (depth > MAX_SHELL_DEPTH) return [{ program: TOO_DEEP, argv: [] }];
+  const segments: Segment[] = [];
+  let tokens: string[] = [];
+  let cur = "";
+  let has = false;
+  const endToken = () => { if (has) tokens.push(cur); cur = ""; has = false; };
+  const emit = (words: string[], level: number) => {
+    if (level > MAX_SHELL_DEPTH) { segments.push({ program: TOO_DEEP, argv: [] }); return; }
+    const seg = toSegment(words, echoRuns || level > 0);
+    if (!seg) return;
+    segments.push(seg);
+    if (seg.nested !== undefined) segments.push(...parseSegments(seg.nested, depth + 1, true));
+    if (seg.inner) emit(seg.inner, level + 1);
+    if (SHELLS.has(seg.program)) {
+      const i = seg.argv.findIndex((a) => /^-[a-z]*c[a-z]*$/.test(a));
+      if (i >= 0 && seg.argv[i + 1] !== undefined) segments.push(...parseSegments(seg.argv[i + 1], depth + 1, true));
+    } else if (seg.program === "eval") {
+      segments.push(...parseSegments(seg.argv.join(" "), depth + 1, true));
+    }
+  };
+  const endSegment = () => {
+    endToken();
+    if (tokens.length) emit(tokens, 0);
+    tokens = [];
+  };
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === "\\") { if (i + 1 < text.length) { cur += text[++i]; has = true; } continue; }
+    if (c === "'") {
+      const j = text.indexOf("'", i + 1);
+      const end = j < 0 ? text.length : j;
+      cur += text.slice(i + 1, end); has = true; i = end; continue;
+    }
+    if (c === '"') {
+      i++;
+      for (; i < text.length && text[i] !== '"'; i++) {
+        const d = text[i];
+        if (d === "\\" && i + 1 < text.length && /["\\$`\n]/.test(text[i + 1])) { i++; cur += text[i]; continue; }
+        // A substitution inside double quotes still runs: its body is a command.
+        if (d === "$" && text[i + 1] === "(") {
+          const end = closeOf(text, i + 2, "(", ")");
+          segments.push(...parseSegments(text.slice(i + 2, end), depth + 1, echoRuns));
+          cur += text.slice(i, end + 1); i = end; continue;
+        }
+        if (d === "`") {
+          const end = closeOf(text, i + 1, "`", "`");
+          segments.push(...parseSegments(text.slice(i + 1, end), depth + 1, echoRuns));
+          cur += text.slice(i, end + 1); i = end; continue;
+        }
+        cur += d;
+      }
+      has = true; continue;
+    }
+    if (c === ";" || c === "&" || c === "|" || c === "\n" || c === "(" || c === ")" || c === "`") { endSegment(); continue; }
+    if (c === " " || c === "\t" || c === "\r") { endToken(); continue; }
+    cur += c; has = true;
+  }
+  endSegment();
+  return segments;
+}
+
+function toSegment(tokens: string[], echoRuns: boolean): Segment | null {
+  let i = 0;
+  let nested: string | undefined;
+  let wrapper = "";
+  while (i < tokens.length) {
+    const t = tokens[i];
+    // `function NAME` defines a function: neither word is the program; the body follows.
+    if (t === "function") { i += 2; continue; }
+    // A leading redirection (`> out curl ...`, `2>/dev/null curl ...`) is not the program.
+    if (/^\d*(>>?|<<?<?|>&|<&|>\||<>)/.test(t)) { i += /^\d*(>>?|<<?<?|>&|<&|>\||<>)$/.test(t) ? 2 : 1; continue; }
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t) || KEYWORDS.has(t)) { i++; continue; }
+    const base = t.split("/").pop()!;
+    const w = Object.hasOwn(WRAPPERS, base) ? WRAPPERS[base] : undefined;
+    if (!w && !(echoRuns && ECHO_WRAPPERS.has(base))) break;
+    i++;
+    if (!w) continue;
+    wrapper = base;
+    // Flags before the command, and again after the positional words (flock puts
+    // -c / --command after the lock file). Returns true when a shell-string flag
+    // took the rest of the words as nested shell text.
+    const flags = (): boolean => {
+      while (i < tokens.length && tokens[i].startsWith("-") && tokens[i] !== "-") {
+        const f = tokens[i++];
+        if (f === "--") return false;
+        const eq = f.indexOf("=");
+        if (eq > 0 && w.shellFlag?.includes(f.slice(0, eq))) { nested = [f.slice(eq + 1), ...tokens.slice(i)].join(" "); i = tokens.length; return true; }
+        if (w.shellFlag?.includes(f)) { nested = tokens.slice(i).join(" "); i = tokens.length; return true; }
+        if (w.valueFlags.includes(f)) { i++; continue; }
+        // Bundled short flags: `-dn 5`, `-nc 'cmd'`, `-uroot`. The first letter that takes a value ends the token.
+        if (/^-[A-Za-z0-9]{2,}$/.test(f)) {
+          for (let k = 1; k < f.length; k++) {
+            const flag = `-${f[k]}`;
+            const attached = f.slice(k + 1);
+            if (w.shellFlag?.includes(flag)) { nested = [attached, ...tokens.slice(i)].filter(Boolean).join(" "); i = tokens.length; return true; }
+            if (w.valueFlags.includes(flag)) { if (!attached) i++; break; }
+          }
+        }
+      }
+      return false;
+    };
+    if (flags()) break;
+    for (let n = 0; n < w.positional && i < tokens.length; n++) i++;
+    if (w.shellFlag && flags()) break;
+    if (w.shell && i < tokens.length) { nested = tokens.slice(i).join(" "); }
+  }
+  if (i >= tokens.length) {
+    // `flock f -c 'cmd'` / `env -S 'cmd'` leave no program word; the nested text is the command.
+    return nested === undefined ? null : { program: wrapper, argv: [], nested };
+  }
+  const program = tokens[i].split("/").pop() ?? tokens[i];
+  const argv = tokens.slice(i + 1);
+  // Remote / container shells: the words after the host (ssh) or `--` (kubectl exec) are a command line.
+  if (program === "ssh") {
+    let k = 0;
+    while (k < argv.length && argv[k].startsWith("-")) k += SSH_VALUE_FLAGS.has(argv[k]) ? 2 : 1;
+    if (k + 1 < argv.length) nested = argv.slice(k + 1).join(" ");
+  } else if (program === "kubectl" || program === "oc") {
+    const d = argv.indexOf("--");
+    // The words after `--` are already split; keep them so `sh -c '<cmd>'` hands its real argument on.
+    if (d >= 0 && d + 1 < argv.length) return { program, argv, inner: argv.slice(d + 1) };
+  }
+  return { program, argv, ...(nested !== undefined ? { nested } : {}) };
+}
+
+/**
+ * Split bundled short options the way curl / getopt do: `-sXPOST` is `-s -X
+ * POST` and `-sX POST` is `-s -X` with the next word as its value. A letter in
+ * `valueLetters` takes the rest of the token, or the next word when it is last.
+ */
+export function expandShortFlags(argv: string[], valueLetters: string): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--") { out.push(...argv.slice(i)); break; }
+    if (!/^-[A-Za-z0-9]{2,}/.test(a) || a.startsWith("--")) { out.push(a); continue; }
+    for (let k = 1; k < a.length; k++) {
+      const letter = a[k];
+      out.push(`-${letter}`);
+      if (valueLetters.includes(letter)) {
+        if (k + 1 < a.length) out.push(a.slice(k + 1));
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+const CURL_VALUE_FLAGS = new Set([
+  "-H", "--header", "-d", "--data", "--data-raw", "--data-binary", "--data-ascii", "--data-urlencode",
+  "-F", "--form", "--form-string", "-u", "--user", "-o", "--output", "-A", "--user-agent", "-e", "--referer",
+  "-b", "--cookie", "-c", "--cookie-jar", "-m", "--max-time", "-x", "--proxy", "-T", "--upload-file",
+  "-w", "--write-out", "--connect-timeout", "--retry", "--cacert", "--cert", "--key", "--resolve", "--json",
+  "-K", "--config", "-X", "--request", "--url", "-E", "--proxy-user", "-r", "--range", "-z", "--time-cond",
+]);
+const CURL_BODY_FLAGS = /^(-d|--data(-raw|-binary|-ascii|-urlencode)?|-F|--form(-string)?|--json)$/;
+const CURL_UPLOAD_FLAGS = /^(-T|--upload-file)$/;
+
+/** `opaque`: the request is described by a file this matcher cannot read (curl -K), so any http rule holds it. */
+interface Http { method: string; urls: string[]; opaque?: boolean }
+
+function curlInfo(rawArgv: string[]): Http {
+  const argv = expandShortFlags(rawArgv, "XdFTHuoAebcmxwrzEK");
+  let method: string | null = null;
+  let body = false, get = false, head = false, upload = false;
+  const urls: string[] = [];
+  let opaque = false;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--") { urls.push(...argv.slice(i + 1)); break; }
+    if (a === "-K" || a === "--config" || a.startsWith("--config=")) { opaque = true; if (!a.includes("=")) i++; continue; }
+    if (a === "-X" || a === "--request") { method = (argv[++i] ?? "").toUpperCase(); continue; }
+    if (a.startsWith("--request=")) { method = a.slice(10).toUpperCase(); continue; }
+    if (/^-X./.test(a)) { method = a.slice(2).toUpperCase(); continue; }
+    if (a === "--url") { if (argv[i + 1]) urls.push(argv[++i]); continue; }
+    if (a.startsWith("--url=")) { urls.push(a.slice(6)); continue; }
+    if (a === "-G" || a === "--get") { get = true; continue; }
+    if (a === "-I" || a === "--head") { head = true; continue; }
+    // -T / --upload-file is a PUT in curl, not a POST.
+    if (CURL_UPLOAD_FLAGS.test(a)) { upload = true; i++; continue; }
+    if (/^-T./.test(a) || /^--upload-file=/.test(a)) { upload = true; continue; }
+    if (CURL_BODY_FLAGS.test(a)) { body = true; i++; continue; }
+    if (/^-[dF]./.test(a) || /^--(data|form|json)[^=]*=/.test(a)) { body = true; continue; }
+    if (CURL_VALUE_FLAGS.has(a)) { i++; continue; }
+    if (a.startsWith("-")) continue;
+    urls.push(a);
+  }
+  return { method: method || (head ? "HEAD" : upload ? "PUT" : body && !get ? "POST" : "GET"), urls, ...(opaque ? { opaque } : {}) };
+}
+
+function wgetInfo(rawArgv: string[]): Http {
+  const argv = expandShortFlags(rawArgv, "OoaiegtTwPUQBlIAXDRGHFN");
+  let method: string | null = null;
+  let body = false;
+  const urls: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--method") { method = (argv[++i] ?? "").toUpperCase(); continue; }
+    if (a.startsWith("--method=")) { method = a.slice(9).toUpperCase(); continue; }
+    if (/^--(post|body)-(data|file)(=|$)/.test(a)) { body = true; if (!a.includes("=")) i++; continue; }
+    if (a.startsWith("-")) continue;
+    urls.push(a);
+  }
+  return { method: method || (body ? "POST" : "GET"), urls };
+}
+
+function httpInfo(seg: Segment): Http | null {
+  if (seg.program === "curl") return curlInfo(seg.argv);
+  if (seg.program === "wget") return wgetInfo(seg.argv);
+  return null;
+}
+
+const bare = (u: string) => u.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "").toLowerCase();
+
+function fail(msg: string): never { throw new Error(msg); }
+
+function compileRegex(v: unknown, flags: string, field: string): RegExp {
+  if (typeof v !== "string" || !v) fail(`${field} must be a non-empty string`);
+  return new RegExp(v, flags);
+}
+
+function stringList(v: unknown, field: string): string[] {
+  const list = typeof v === "string" ? [v] : v;
+  if (!Array.isArray(list) || !list.length || list.some((s) => typeof s !== "string" || !s.trim())) {
+    fail(`${field} must be a non-empty string or list of non-empty strings`);
+  }
+  return (list as string[]).map((s) => s.trim());
+}
+
+/** Throws on anything it cannot read; the caller turns that into hold-all. */
+function compileRule(raw: unknown): Rule {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) fail("rule must be an object");
+  const r = raw as Record<string, unknown>;
+  for (const k of Object.keys(r)) if (!RULE_KEYS.has(k)) fail(`unknown key ${k}`);
+  if (typeof r.label !== "string" || !r.label.trim()) fail("label is required");
+  const label = r.label.trim();
+  const flags = r.flags === undefined ? "" : typeof r.flags === "string" && /^[ims]*$/.test(r.flags) ? r.flags : fail("flags");
+  if (r.regex === undefined && r.program === undefined && r.args_regex === undefined && r.http === undefined) {
+    fail("rule needs at least one of regex, program, args_regex, http");
+  }
+  const full = r.regex === undefined ? null : compileRegex(r.regex, flags, "regex");
+  const args = r.args_regex === undefined ? null : compileRegex(r.args_regex, flags, "args_regex");
+  const programs = r.program === undefined ? null : stringList(r.program, "program");
+  let methods: string[] | null = null;
+  let prefixes: string[] | null = null;
+  let urlRe: RegExp | null = null;
+  const hasHttp = r.http !== undefined;
+  if (hasHttp) {
+    const h = r.http;
+    if (!h || typeof h !== "object" || Array.isArray(h)) fail("http must be an object");
+    const ho = h as Record<string, unknown>;
+    for (const k of Object.keys(ho)) if (k !== "methods" && k !== "url_prefix" && k !== "url_regex") fail(`unknown http key ${k}`);
+    if (ho.methods === undefined && ho.url_prefix === undefined && ho.url_regex === undefined) fail("http needs methods, url_prefix or url_regex");
+    if (ho.url_regex !== undefined) urlRe = compileRegex(ho.url_regex, flags, "http.url_regex");
+    if (ho.methods !== undefined) methods = stringList(ho.methods, "http.methods").map((m) => m.toUpperCase());
+    if (ho.url_prefix !== undefined) prefixes = stringList(ho.url_prefix, "http.url_prefix").map(bare);
+  }
+  const progMatch = (p: string) => !programs || programs.some((x) => (x.endsWith("*") ? p.startsWith(x.slice(0, -1)) : p === x));
+  const segmentLevel = programs || args || hasHttp;
+  const test: RuleFn = (command, segments) => {
+    if (full && !full.test(command)) return false;
+    if (!segmentLevel) return true;
+    return segments.some((seg) => {
+      if (!progMatch(seg.program)) return false;
+      if (args && !args.test(seg.argv.join(" "))) return false;
+      if (hasHttp) {
+        const info = httpInfo(seg);
+        if (!info) return false;
+        if (info.opaque) return true;
+        if (methods && !methods.includes(info.method)) return false;
+        if (prefixes && !info.urls.some((u) => prefixes!.some((p) => bare(u).startsWith(p)))) return false;
+        if (urlRe && !info.urls.some((u) => urlRe!.test(u))) return false;
+      }
+      return true;
+    });
+  };
+  return { label, test };
+}
+
+export interface BashApprovalSource {
+  /** Where the value came from, for the log only. */
+  source: string;
+  value: unknown;
+}
+
+/**
+ * Build the policy from every configured source. A source that is absent
+ * (undefined / null / false) contributes nothing; one that is present but not
+ * a non-empty list of well-formed rules holds every bash command.
+ */
+export function bashApprovalPolicyFrom(sources: BashApprovalSource[]): BashApprovalPolicy {
+  const rules: Rule[] = [];
+  let holdAll = false;
+  /** Why everything is held, for the first cause found; what `check` reports. */
+  let holdLabel = MALFORMED_LABEL;
+  for (const { source, value } of sources) {
+    if (value === undefined || value === null || value === false) continue;
+    // One source value, not an entry of a rule list: the engine hands each item
+    // of a plugin's `bashApproval` over as a source of its own.
+    if (value === PLUGIN_TOOLS_MISSING) {
+      if (!holdAll) holdLabel = PLUGIN_TOOLS_MISSING_LABEL;
+      holdAll = true;
+      logger.warn({ source, reason: PLUGIN_TOOLS_MISSING }, "bash_approval.plugin_tools_missing_holding_all_commands");
+      continue;
+    }
+    if (!Array.isArray(value) || value.length === 0) {
+      logger.warn({ source, valueType: Array.isArray(value) ? "empty array" : typeof value },
+        "bash_approval.invalid_holding_all_commands");
+      holdAll = true;
+      continue;
+    }
+    value.forEach((raw, index) => {
+      try {
+        rules.push(compileRule(raw));
+      } catch (err) {
+        logger.warn({ source, index, reason: (err as Error).message }, "bash_approval.invalid_holding_all_commands");
+        holdAll = true;
+      }
+    });
+  }
+  return {
+    active: holdAll || rules.length > 0,
+    check(command: unknown): string | null {
+      if (holdAll) return holdLabel;
+      if (typeof command !== "string" || command.length > MAX_COMMAND_CHARS) return "unreadable bash command";
+      const segments = parseSegments(command);
+      if (segments.some((sg) => sg.program === TOO_DEEP)) return "command nested too deeply to inspect";
+      for (const rule of rules) if (rule.test(command, segments)) return rule.label;
+      return null;
+    },
+  };
+}
+
+/** Env form: "" is unset; JSON that does not parse is malformed (held), not ignored. */
+export function bashApprovalFromEnvValue(raw: string | undefined): unknown {
+  const text = raw?.trim();
+  if (!text) return undefined;
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return text;
+  }
+}
+
+/** Both spellings are read, so one cannot hide the other. */
+export function bashApprovalFromToolConfig(cfg: unknown): unknown[] {
+  if (!cfg || typeof cfg !== "object") return [];
+  const c = cfg as Record<string, unknown>;
+  return ["bash_approval", "bashApproval"].map((k) => c[k]).filter((v) => v !== undefined && v !== null);
+}

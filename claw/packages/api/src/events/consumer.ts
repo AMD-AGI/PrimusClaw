@@ -7,11 +7,7 @@ import {
   rememberSessionDeleted,
 } from "../sessions/deleted-cache.js";
 import { db, MarketplaceDb } from "../infra/db.js";
-import {
-  canViewPlugin,
-  formatPluginRow,
-  pluginSandboxImage,
-} from "../marketplace/plugins.js";
+import { resolveTaskPlugin } from "../marketplace/plugins.js";
 
 import { buildMessages } from "../sessions/context-builder.js";
 import { maybeExtractMemory, insertMemoryEntry, isMemoryActive, scanMemoryContent, maybeUpdateUserProfile } from "../memory/service.js";
@@ -39,7 +35,7 @@ import { metrics } from "../infra/metrics.js";
 import { publishSummaryIfCurrent } from "./summary.js";
 import { completionAlreadyProcessed } from "./store.js";
 import { withCompletionLock } from "./completion-lock.js";
-import { recordCompletionTurns } from "./completion-turns.js";
+import { isSandboxOnlyRun, recordCompletionTurns } from "./completion-turns.js";
 
 export { recordCompletionTurns } from "./completion-turns.js";
 // Re-exported: this predicate lived here until it gained a second caller, and
@@ -746,6 +742,23 @@ function runClaimOf(event: Record<string, unknown>): number | undefined {
   return typeof raw === "number" && Number.isInteger(raw) ? raw : undefined;
 }
 
+/**
+ * The completion's side effects, behind a seam so a test can see which of them
+ * a given run triggers (the functions are imported bindings, which cannot be
+ * substituted). Production reads every one from here.
+ */
+export const completionPorts = {
+  insertMemoryEntry,
+  saveSkill,
+  recordSkillFeedback,
+  checkProbationGraduation,
+  maybeSummarize: (sessionId: string, userId: string) => maybeSummarize(sessionId, userId),
+  maybeExtractMemory,
+  maybeRecordTaskPattern,
+  enqueueEvolutionJob,
+  recordRunFinished,
+};
+
 async function handleComplete(
   sessionId: string,
   event: Record<string, unknown>,
@@ -855,6 +868,13 @@ async function handleComplete(
   // unnamed completion would otherwise only ever match an unnamed gate.
   const gateTurn = messageId
     ?? (provenance && provenance !== "foreign" ? await turnOfChatRow(sessionId, provenance) : null);
+  // Classified once, here. A sandbox-only run (the terminal's start) is not a
+  // conversation turn, so after the gate is released and the run row closed --
+  // the lifecycle -- none of the completion's side effects apply to it: no
+  // transcript turns, summaries, memory, skill feedback or evolution, and no
+  // run.completed / run.failed notification. Everything below that is such a
+  // side effect is gated on this one answer, or follows the early return.
+  const sandboxOnly = messageId !== null && await isSandboxOnlyRun(sessionId, messageId);
   const gateOpened = await releaseSessionGateIfLastRun(
     sessionId, gateTurn, Boolean(failed),
     provenance !== "foreign" ? provenance : null,
@@ -868,7 +888,7 @@ async function handleComplete(
   // Brain's save_memory tool stays in the schema, so the LLM may still call it;
   // this is the silent-discard contract documented in the feature flag.
   let explicitMemorySaved = false;
-  const memoriesToSave = (event as any).memories_to_save || [];
+  const memoriesToSave = sandboxOnly ? [] : (event as any).memories_to_save || [];
   if (!CLAW_MEMORY_ENABLED) {
     if (memoriesToSave.length) {
       logger.warn({ sessionId, count: memoriesToSave.length }, "memory.write_skipped_flag_off");
@@ -878,7 +898,7 @@ async function handleComplete(
       const blocked = scanMemoryContent(mem.content);
       if (blocked) { logger.warn({ reason: blocked }, "memory.blocked"); continue; }
       try {
-        if (await insertMemoryEntry(userId, { ...mem, sourceSession: sessionId, sourceType: "explicit" })) {
+        if (await completionPorts.insertMemoryEntry(userId, { ...mem, sourceSession: sessionId, sourceType: "explicit" })) {
           explicitMemorySaved = true;
         } else {
           logger.warn({ sessionId }, "memory.write_skipped_user_opted_out");
@@ -895,8 +915,8 @@ async function handleComplete(
 
   // 4 + 4.5. Skill writes (save_skill tool, skill_file mutations).
   // Gated by CLAW_SKILL_EVOLUTION_ENABLED. When OFF: drop, warn for audit.
-  const skillsToSave = (event as any).skills_to_save || [];
-  const skillFileMutations = (event as any).skill_file_mutations || [];
+  const skillsToSave = sandboxOnly ? [] : (event as any).skills_to_save || [];
+  const skillFileMutations = sandboxOnly ? [] : (event as any).skill_file_mutations || [];
   if (!CLAW_SKILL_EVOLUTION_ENABLED) {
     if (skillsToSave.length || skillFileMutations.length) {
       logger.warn({
@@ -912,7 +932,7 @@ async function handleComplete(
       const blocked = scanMemoryContent(skill.content, 5000);
       if (blocked) { logger.warn({ reason: blocked }, "skill.blocked"); continue; }
       try {
-        await saveSkill(skill.skill_name, userId, skill.content, "manual", sessionId, skill.description || "");
+        await completionPorts.saveSkill(skill.skill_name, userId, skill.content, "manual", sessionId, skill.description || "");
         logger.info({ skillName: skill.skill_name, sessionId }, "skill.saved");
 
         // Sub-files passed in the same save_skill call (rare path; usually they come via mutations)
@@ -976,6 +996,11 @@ async function handleComplete(
     logger.info({ sessionId, messageId }, "chat.pending_drain_deferred_session_busy");
   }
   if (gateOpened) await drainOldestPendingMessage(sessionId, userId);
+
+  if (sandboxOnly) {
+    logger.info({ sessionId, messageId, failed }, "exec_complete.handled_sandbox_only");
+    return;
+  }
 
   // 6. Record skill effectiveness feedback (synchronous DB update, no LLM).
   //    Score: failed = -1, mixed quality = 0, clean success = +1.
@@ -1059,8 +1084,8 @@ async function handleComplete(
       else score = 1;
       try {
         for (const name of primarySkills) {
-          await recordSkillFeedback(userId, [name], score);
-          await checkProbationGraduation(userId, name);
+          await completionPorts.recordSkillFeedback(userId, [name], score);
+          await completionPorts.checkProbationGraduation(userId, name);
         }
       } catch (err) {
         logger.error({ err, sessionId }, "skill.feedback_failed");
@@ -1075,14 +1100,14 @@ async function handleComplete(
   //     Memory extraction gated by CLAW_MEMORY_ENABLED; pattern recording
   //     gated by CLAW_SKILL_EVOLUTION_ENABLED. Summary stays unconditional.
   setImmediate(() => {
-    maybeSummarize(sessionId, userId).catch(err =>
+    completionPorts.maybeSummarize(sessionId, userId).catch(err =>
       logger.error({ err, sessionId }, "summarize_failed"));
     if (CLAW_MEMORY_ENABLED && !explicitMemorySaved) {
-      maybeExtractMemory(sessionId, userId).catch(err =>
+      completionPorts.maybeExtractMemory(sessionId, userId).catch(err =>
         logger.error({ err, sessionId }, "memory.extraction_failed"));
     }
     if (CLAW_SKILL_EVOLUTION_ENABLED) {
-      maybeRecordTaskPattern(sessionId, userId, event).catch(err =>
+      completionPorts.maybeRecordTaskPattern(sessionId, userId, event).catch(err =>
         logger.error({ err, sessionId }, "skill.pattern_record_failed"));
     }
   });
@@ -1094,7 +1119,7 @@ async function handleComplete(
   //     with retries and crash recovery. Gated by CLAW_SKILL_EVOLUTION_ENABLED.
   if (CLAW_SKILL_EVOLUTION_ENABLED) {
     try {
-      await enqueueEvolutionJob(sessionId, userId, event as Record<string, unknown>);
+      await completionPorts.enqueueEvolutionJob(sessionId, userId, event as Record<string, unknown>);
     } catch (err) {
       logger.error({ err, sessionId }, "evolve.enqueue_failed");
     }
@@ -1105,7 +1130,7 @@ async function handleComplete(
   //    so a redelivered completion records nothing new.
   if (CLAW_NOTIFICATIONS_ENABLED && !interrupted && endedRunIds.length) {
     try {
-      await recordRunFinished({
+      await completionPorts.recordRunFinished({
         sessionId,
         taskIds: endedRunIds,
         outcome: failed ? "failed" : "completed",
@@ -1230,17 +1255,25 @@ if (pending) {
   const defaultImage = String(defaultResourceRow?.image ?? "").trim() || undefined;
   let pluginImage: string | undefined;
   let pluginResource: Record<string, unknown> | undefined;
+  // What the immediate path attaches (`undefined` = the message names no plugin).
+  // A message that names a plugin and leaves this out reaches Brain with
+  // `plugin_id` set and no tool list, so Brain loads nothing from the plugin
+  // and holds every bash command.
+  let pluginTools: unknown[] | null | undefined;
   if (pluginId !== undefined && Number.isFinite(pluginId)) {
     try {
-      const pluginRow = await MarketplaceDb.pluginGetById(pluginId, false);
-      if (pluginRow && canViewPlugin(pluginRow, pendingUserId, false)) {
-        const formatted = await formatPluginRow(pluginRow, true);
-        const imageFromPlugin = pluginSandboxImage(formatted.images);
-        if (imageFromPlugin) pluginImage = imageFromPlugin;
-        const resourceFromPlugin = asJsonObject(formatted.resource);
-        if (resourceFromPlugin) pluginResource = resourceFromPlugin;
-      }
+      // The session owner's own view. The roles of whoever sent this message
+      // are not stored on the queue row and are not guessed at here, so the
+      // admin override the immediate path applies is not applied: this can
+      // only ever show the owner less than the immediate path would.
+      const plugin = await resolveTaskPlugin(pluginId, pendingUserId, false);
+      pluginTools = plugin.tools;
+      pluginImage = plugin.image;
+      pluginResource = plugin.resource;
     } catch (err) {
+      // Not undefined: that would say the message named no plugin. Null says
+      // the tool list could not be had, and Brain fails closed on it.
+      pluginTools = null;
       logger.warn({ err, sessionId, pluginId }, "pending.plugin_resource_resolve_failed");
     }
   }
@@ -1272,6 +1305,7 @@ if (pending) {
     skills: pendingSkills,
     tool_ids: toolIds.length ? toolIds : undefined,
     plugin_id: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
+    ...(pluginTools !== undefined ? { plugin_tools: pluginTools } : {}),
     workspace_id: workspaceId,
     sandbox_image: finalSandboxImage,
     resources: finalResources,

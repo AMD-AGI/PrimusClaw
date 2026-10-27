@@ -29,7 +29,9 @@ import {
   legacyHandsKey,
   reuseWindowStart,
   usableSharedVerdict,
+  readTerminalHold,
   type SharedVerdictFields,
+  type TerminalHoldState,
 } from "@claw/protocol";
 import type { KVStore } from "@claw/utils";
 import { createHash } from "node:crypto";
@@ -665,6 +667,18 @@ export const handleRegistry = {
     sessionId: string, workloadIds: readonly string[],
   ): Promise<SessionBackgroundWork> {
     return readSessionBackgroundWork(kv as unknown as HandsReadKv, sessionId, workloadIds);
+  },
+  /**
+   * Is someone using this session's sandbox through an interactive terminal?
+   *
+   * Same seam as `backgroundWork`, and the same rule about who may ask: the
+   * answer licenses "not this time" only, so it belongs to the last-user stop
+   * and the periodic sweep, which both come back, and never to a cancel or a
+   * session delete, which do not. The claim lapses by itself (see
+   * `terminal-hold.ts`), so a deferral here is bounded by its own expiry.
+   */
+  terminalHold(sessionId: string): Promise<TerminalHoldState> {
+    return readTerminalHold(kv as unknown as Parameters<typeof readTerminalHold>[0], sessionId);
   },
   /**
    * Every DAG the registry has a key for, readable or not.
