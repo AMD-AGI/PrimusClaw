@@ -772,7 +772,7 @@ describe("mode=app task creation", { skip }, () => {
       assert.equal(b.statusCode, 200, b.body);
       assert.equal(seen.length, 2);
       assert.notEqual(seen[0].run.grantId, seen[1].run.grantId, "an attempt never re-issues an id an earlier attempt used");
-      assert.match(seen[1].run.grantId, /^grt_[0-9a-z]{26}$/);
+      assert.match(seen[1].run.grantId, /^gr-[0-9a-z]{26}$/);
       assert.deepEqual(seen[1].manifest, MANIFEST);
       assert.ok(!JSON.stringify(seen[1]).includes("attacker.example"), "the grant hook is never given the input");
       assert.equal(seen[1].request.resources.image, GOOD_RES.image);

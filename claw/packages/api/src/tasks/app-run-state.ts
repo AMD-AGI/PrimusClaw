@@ -30,7 +30,7 @@
 import { APP_RUN_STATES, scrubSecrets, type AppRunState } from "@claw/protocol";
 import pino from "pino";
 import { db } from "../infra/db.js";
-import { openAppRunSecret } from "../crypto/app-run-secrets.js";
+import { openAppRunSecret, sealAppRunSecret } from "../crypto/app-run-secrets.js";
 import { dropSessionAppMcpOfRun } from "./session-app-mcp.js";
 
 const logger = pino({ name: "app-run-state" });
@@ -62,6 +62,8 @@ export interface AppRunView {
   input: Record<string, unknown>;
   sandbox_spec: Record<string, unknown> | null;
   workspace_id: string | null;
+  /** The user the grant is signed for (`claw_app_runs.created_by`). */
+  user_id: string | null;
 }
 
 interface RunRow {
@@ -82,12 +84,13 @@ interface RunRow {
   input: Record<string, unknown>;
   sandbox_spec: Record<string, unknown> | null;
   workspace_id: string | null;
+  created_by: string | null;
 }
 
 const VIEW_SQL = `
   SELECT r.task_id, r.session_id, r.state, r.restarts, r.last_exit, r.events_cursor, r.state_dir,
          r.sandbox_workload_id, r.manifest, r.grant_id, r.grant_limits, r.grant_expires_at, r.grant_revoked_at, r.created_at,
-         t.input, t.sandbox_spec, t.workspace_id
+         r.created_by, t.input, t.sandbox_spec, t.workspace_id
     FROM claw_app_runs r JOIN claw_tasks t ON t.task_id = r.task_id`;
 
 function toView(row: RunRow): AppRunView {
@@ -109,6 +112,7 @@ function toView(row: RunRow): AppRunView {
     input: row.input ?? {},
     sandbox_spec: row.sandbox_spec,
     workspace_id: row.workspace_id,
+    user_id: row.created_by,
   };
 }
 
@@ -155,6 +159,8 @@ export interface AppRunPatch {
   grant_expires_at?: string;
   /** Record that the grant was revoked (stamps `grant_revoked_at` once). Only for a run that has a grant. */
   grant_revoked?: true;
+  /** Replacement keys after the same grant id is signed again. Sealed before they are stored. */
+  grant_keys?: Record<string, string>;
 }
 
 export type PatchOutcome =
@@ -227,6 +233,9 @@ export async function patchAppRun(
     grantExpiryParam = `$${params.length}::timestamptz`;
   }
   if (patch.grant_revoked === true) sets.push("grant_revoked_at = COALESCE(r.grant_revoked_at, NOW())");
+  if (patch.grant_keys !== undefined) {
+    add("grant_keys_enc", sealAppRunSecret(JSON.stringify(patch.grant_keys), taskId, "grant_keys"));
+  }
   if (patch.last_exit !== undefined) {
     const scrubbed = patch.last_exit === null ? null : await scrubbedLastExit(taskId, patch.last_exit);
     add("last_exit", scrubbed === null ? null : JSON.stringify(scrubbed), "::jsonb");
@@ -261,9 +270,10 @@ export async function patchAppRun(
               r.grant_id IS NOT NULL AND r.grant_revoked_at IS NULL
               AND r.grant_expires_at IS NOT NULL AND r.grant_expires_at < ${grantExpiryParam}))
         AND (${patch.grant_revoked === true ? "r.grant_id IS NOT NULL" : "TRUE"})
+        AND (${patch.grant_keys !== undefined ? "r.grant_id IS NOT NULL" : "TRUE"})
       RETURNING r.task_id, r.session_id, r.state, r.restarts, r.last_exit, r.events_cursor, r.state_dir,
                 r.sandbox_workload_id, r.manifest, r.grant_id, r.grant_limits, r.grant_expires_at, r.grant_revoked_at, r.created_at,
-                t.input, t.sandbox_spec, t.workspace_id`,
+                r.created_by, t.input, t.sandbox_spec, t.workspace_id`,
     params,
   );
   if (updated.rowCount === 1) {
@@ -292,7 +302,7 @@ export async function patchAppRun(
     return { ok: false, reason: "not_holder", current: row.state };
   }
   if (row.state === "ended") return { ok: false, reason: "ended", current: row.state };
-  if (patch.grant_expires_at !== undefined || patch.grant_revoked === true) {
+  if (patch.grant_expires_at !== undefined || patch.grant_revoked === true || patch.grant_keys !== undefined) {
     // Not the state (a state mismatch would have been the same query): the grant rule refused it.
     const g = await db.query("SELECT grant_id, grant_revoked_at, grant_expires_at FROM claw_app_runs WHERE task_id = $1", [taskId]);
     const grant = g.rows[0] as { grant_id: string | null; grant_revoked_at: Date | null; grant_expires_at: Date | null } | undefined;

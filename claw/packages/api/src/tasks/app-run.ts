@@ -91,6 +91,10 @@ export interface AppGrantRequest {
   resources: ResolvedAppResources;
   /** The manifest's templates, with the run's image and workspace filled in where a template sets none. */
   templates: Array<Record<string, unknown>>;
+  /** The caller's SaFE platform key. The grant service seals it. */
+  platformKey?: string;
+  /** Display name stored on the grant. The user id is used when this is empty. */
+  userName?: string;
 }
 
 /**
@@ -236,9 +240,12 @@ export function planAppRun(manifest: AppManifestV1, r: ResolvedAppResources): Ap
   return { sandboxSpec, workspaceId: r.workspace, workspaceIds };
 }
 
-/** A grant id for one attempt. Never reused, never derived from the Idempotency-Key. */
+/**
+ * A grant id for one attempt. Never reused, never derived from the Idempotency-Key.
+ * A DNS-1123 label (`gr-` plus a ulid): Agent Sandbox stores it as the grant's name.
+ */
 export function newGrantId(): string {
-  return `grt_${ulid().toLowerCase()}`;
+  return `gr-${ulid().toLowerCase()}`;
 }
 
 /** Run `fn` with an AbortSignal that fires after `ms`; a call that has not returned by then fails. */
@@ -436,7 +443,15 @@ export async function admitAppRun(
   let issued: AppGrantIssued | void;
   try {
     issued = await withTimeout(APP_GRANT_ISSUE_TIMEOUT_MS, "grant issue", (signal) => ports.grant.issue(
-      grantRun, manifest, { resources: resolved, templates: appGrantTemplates(manifest, resolved) }, signal,
+      grantRun,
+      manifest,
+      {
+        resources: resolved,
+        templates: appGrantTemplates(manifest, resolved),
+        platformKey: req.user.platformKey,
+        userName: req.user.userName,
+      },
+      signal,
     ));
   } catch (err) {
     logger.error(

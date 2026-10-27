@@ -530,7 +530,10 @@ test("E3 the grant hook adds keys and limits through env_map; its keys beat the 
   assert.equal(env.APP_KEY_SUBRUN, KEY_S);
   assert.equal(env.APP_KEY_MEASUREMENT, "e2b_overridden-by-the-hook-0123456");
   assert.equal(env.APP_GRANT_LIMITS, JSON.stringify({ max_sandboxes: 4, max_gpus: 8 }));
-  assert.deepEqual(seen, [{ runId: RUN_ID, sessionId: "sess-1", grantId: null, manifest: MANIFEST }]);
+  assert.deepEqual(seen, [{
+    runId: RUN_ID, sessionId: "sess-1", grantId: null, manifest: MANIFEST,
+    platformKey: "pk", workspaceId: "ws-1",
+  }]);
 });
 
 test("E4 the default grant hooks do nothing", async () => {
@@ -770,6 +773,78 @@ test("P7 markEnded closes the row without a sandbox, and reports a refusal inste
   const again = harness();
   again.world.failStore = () => new AppRunWriteRefused("not_holder");
   assert.equal(await again.runner.markEnded("no key"), false);
+});
+
+test("fixed E2B urls and the template list are injected when supplied", () => {
+  const env = buildAppEnv({
+    runId: "r", sessionId: "s", createdAt: "t", stateDir: "/d", mcpToken: TOKEN,
+    grantKeys: {}, grantLimits: { max_sandboxes: 2 }, nodeName: null,
+    e2bApiUrl: "http://e2b.local", e2bSandboxUrl: "http://e2b.local/sandboxes",
+    manifest: { ...MANIFEST, env: undefined, env_map: { sandbox_templates: "APP_TEMPLATES", grant_limits: "APP_GRANT_LIMITS" } },
+  });
+  assert.equal(env.E2B_API_URL, "http://e2b.local");
+  assert.equal(env.E2B_SANDBOX_URL, "http://e2b.local/sandboxes");
+  assert.equal(env.APP_TEMPLATES, JSON.stringify(MANIFEST.sandbox_templates));
+  assert.equal(env.APP_GRANT_LIMITS, JSON.stringify({ max_sandboxes: 2 }));
+  assert.equal(env.CLAW_SESSION_ID, "s");
+});
+
+test("a missing grant is signed again and the application restarts with the new key", async () => {
+  const world = new World(MANIFEST, {
+    grant_id: "gr-01arz3ndektsv4rrffq69g5fav",
+    user_id: "user-1",
+    grant_limits: { max_sandboxes: 2, max_gpus: 4, gpu_hours: 1, max_runtime_sec: 3600 },
+    grant_expires_at: "2026-01-02T00:00:00.000Z",
+  });
+  let armed = true;
+  let reissues = 0;
+  const fresh = "e2b_newkey0123456789abcdef0123456789abcd";
+  const grant: AppGrantRunHooks = {
+    env: async () => ({}),
+    revoke: async () => undefined,
+    extend: noopAppGrant.extend,
+    inspect: async () => (world.rec.state === "running" && armed ? (armed = false, "missing") : "active"),
+    reissue: async (run) => {
+      reissues += 1;
+      assert.equal(run.userId, "user-1");
+      assert.equal(run.platformKey, "pk");
+      assert.equal(run.grantId, "gr-01arz3ndektsv4rrffq69g5fav");
+      return { keys: { measurement: fresh }, expiresAt: "2026-01-02T00:00:00.000Z" };
+    },
+  };
+  const runner = new AppRunner(RUN_ID, "pk", {
+    store: world.store, sandbox: world.sandbox, grant, now: world.now, sleep: world.sleep, tickMs: 5000,
+  });
+  for (let i = 0; i < 12 && world.rec.state !== "running"; i++) await runner.reconcile();
+  assert.equal(world.rec.state, "running");
+  assert.equal(reissues, 0, "a live copy is not signed again on the way up");
+  await runner.reconcile();
+  assert.equal(reissues, 1);
+  assert.equal(world.terms.length, 1);
+  assert.equal(world.rec.state, "restarting");
+  assert.equal(world.rec.last_exit?.grant_restart, undefined);
+  world.clock += 11_000;
+  for (let i = 0; i < 6 && world.starts.length < 2; i++) await runner.reconcile();
+  assert.equal(world.starts.length, 2);
+  assert.equal(world.starts[1]!.env.APP_KEY_MEASUREMENT, fresh);
+  assert.equal(reissues, 1, "an active copy is not signed again");
+});
+
+test("a revoked grant is not signed again", async () => {
+  const h = harness({
+    over: { grant_id: "gr-01arz3ndektsv4rrffq69g5fav", grant_revoked_at: "2026-01-01T00:00:00.000Z" },
+    grant: {
+      env: async () => ({}),
+      revoke: async () => undefined,
+      extend: noopAppGrant.extend,
+      inspect: async () => "missing",
+      reissue: async () => { throw new Error("revoked grants are not re-signed"); },
+    },
+  });
+  await toRunning(h);
+  await h.runner.reconcile();
+  assert.equal(h.world.rec.state, "running");
+  assert.equal(h.world.starts.length, 1);
 });
 
 test("P6 the session owner's platform key, which the sandbox carries as the model credential, is scrubbed too", async () => {

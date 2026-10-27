@@ -40,6 +40,11 @@ export interface AppLastExit {
    * takes a finishing run over does not repeat one (the grant is revoked once).
    */
   finish_done?: string[];
+  /**
+   * The execution copy was signed again. The application is stopped so the next
+   * start injects the new keys. Cleared once the process is gone.
+   */
+  grant_restart?: true;
 }
 
 /**
@@ -78,6 +83,8 @@ export interface AppRunRecord {
   input: Record<string, unknown>;
   sandbox_spec: SandboxSpecCreate | null;
   workspace_id: string | null;
+  /** The user the grant is signed for. */
+  user_id?: string | null;
 }
 
 export interface AppRunSecrets {
@@ -95,6 +102,8 @@ export interface AppRunPatch {
   grant_expires_at?: string;
   /** Record that the grant was revoked, so it is never extended. */
   grant_revoked?: true;
+  /** Keys from signing the same grant id again. */
+  grant_keys?: Partial<Record<AppSandboxRole, string>>;
 }
 
 export interface AppRunStore {

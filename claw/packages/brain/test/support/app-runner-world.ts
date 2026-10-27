@@ -87,6 +87,8 @@ export class World {
   failStore: ((patch: AppRunPatch) => Error | null) | null = null;
   /** SIGTERMs delivered to a live application, by workload. */
   terms: string[] = [];
+  /** Keys written by a grant re-issue. Absent means the fixture's original key. */
+  grantKeys: AppRunSecrets["grant_keys"] = null;
   /** What the application does on SIGTERM; the default is to die at once without writing `final`. */
   onTerm: ((wl: string) => void) | null = null;
   /** Things that happen when the fake clock reaches a time (an app writing `final` mid-grace). */
@@ -162,11 +164,12 @@ export class World {
       if (injected) throw injected;
       if (this.rec.state === "ended") throw new AppRunWriteRefused("ended", "ended");
       if (expect && this.rec.state !== expect) throw new AppRunWriteRefused("state_mismatch", this.rec.state);
-      const { grant_revoked, ...fields } = patch;
+      const { grant_revoked, grant_keys, ...fields } = patch;
+      if (grant_keys) this.grantKeys = grant_keys;
       this.rec = { ...this.rec, ...fields, ...(grant_revoked ? { grant_revoked_at: new Date(this.now()).toISOString() } : {}) } as AppRunRecord;
       return structuredClone(this.rec);
     },
-    secrets: async (): Promise<AppRunSecrets> => ({ mcp_token: TOKEN, grant_keys: { measurement: KEY_M } }),
+    secrets: async (): Promise<AppRunSecrets> => ({ mcp_token: TOKEN, grant_keys: this.grantKeys ?? { measurement: KEY_M } }),
     putMcp: async (_id, mcp) => { this.mcpRecord = { ...mcp }; },
     deleteMcp: async () => { this.mcpRecord = null; },
   };
@@ -221,6 +224,13 @@ export class World {
       const path = /> '([^']+)'\.tmp/.exec(command)![1]!;
       this.files.set(path, Buffer.from(opts!.env!.CLAW_FILE_B64!, "base64").toString("utf8"));
       return ok();
+    }
+    if (command.includes("kill -KILL")) {
+      const want = /= '([^']*)'/.exec(command)![1]!;
+      if (this.files.get(`${dir}/app.sandbox`) !== want) return ok("none\n");
+      const pid = this.files.get(`${dir}/app.pid`);
+      if (pid !== undefined && this.procs.has(`${wl}:${pid}`)) this.appExits(wl);
+      return ok("sent\n");
     }
     if (command.includes("kill -TERM")) {
       const want = /= '([^']*)'/.exec(command)![1]!;
