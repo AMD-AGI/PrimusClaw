@@ -39,12 +39,14 @@ import type { AppManifestV1 } from "@claw/protocol";
 test("the fixture manifest is valid, or every case below is vacuous", () => {
   assert.deepEqual(validateAppManifest(MANIFEST), []);
 });
+const PLATFORM_KEY = "ak-platform-key-0123456789";
+
 
 function harness(opts: {
   manifest?: AppManifestV1; grant?: AppGrantRunHooks; seams?: AppRunnerSeams; over?: object;
 } = {}) {
   const world = new World(opts.manifest ?? MANIFEST, opts.over);
-  const runner = () => new AppRunner(RUN_ID, "pk", {
+  const runner = () => new AppRunner(RUN_ID, PLATFORM_KEY, {
     store: world.store, sandbox: world.sandbox, grant: opts.grant, seams: opts.seams,
     now: world.now, sleep: world.sleep, tickMs: 5000,
   });
@@ -768,4 +770,14 @@ test("P7 markEnded closes the row without a sandbox, and reports a refusal inste
   const again = harness();
   again.world.failStore = () => new AppRunWriteRefused("not_holder");
   assert.equal(await again.runner.markEnded("no key"), false);
+});
+
+test("P6 the session owner's platform key, which the sandbox carries as the model credential, is scrubbed too", async () => {
+  const h = harness();
+  const wl = await toRunning(h);
+  const takeover = h.newRunner();
+  h.world.appExits(wl, { final: false, returncode: 2, error: `401 from gateway for key ${PLATFORM_KEY}` });
+  await takeover.reconcile();
+  assert.ok(!JSON.stringify(h.world.rec.last_exit).includes(PLATFORM_KEY), "the platform key is not stored");
+  assert.match(String(h.world.rec.last_exit?.error), /\[redacted\]/);
 });

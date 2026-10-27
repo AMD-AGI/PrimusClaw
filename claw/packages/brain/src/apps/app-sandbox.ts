@@ -37,6 +37,7 @@ import { SESSION_ENV } from "../sandbox/multi-node/safe-body.js";
 import { ACTIVE_PHASES, TERMINAL_PHASES } from "../sandbox/workload-wait.js";
 import { pollWorkloadUntilRunning, SHUTDOWN_BUFFER_SECONDS } from "../sandbox/safe-workload-provider.js";
 import type { SandboxInstance } from "../sandbox/provider.js";
+import { modelGatewayEnv, type GatewayUrls } from "../sandbox/model-gateway-env.js";
 
 const logger = pino({ name: "app-sandbox" });
 
@@ -71,6 +72,8 @@ export interface AppSandboxDeps {
   waitRunning?: (workloadId: string, apiKey: string) => Promise<void>;
   /** Create through the shared path; defaults to the real provider. */
   create?: typeof createSafeWorkloadSandbox;
+  /** Model gateway URLs; defaults to the deployment's configuration. */
+  gateway?: GatewayUrls;
   /** Stop a workload this call created or found surplus; defaults to the SaFE provider. */
   stop?: (workloadId: string) => Promise<void>;
 }
@@ -153,6 +156,23 @@ export async function findLiveAppSandboxes(
 function withoutSessionEnv(env: Record<string, string> | undefined): Record<string, string> {
   const { [SESSION_ENV]: _dropped, ...rest } = env ?? {};
   return rest;
+}
+
+/**
+ * The env the sandbox is created with: the spec's, the run's identity, and the
+ * model-gateway credentials a Hands sandbox gets (sandbox/model-gateway-env).
+ * The platform's names win over the spec's, as the Hands base env does.
+ * `platformKey` is the session owner's key, which is what Hands passes too.
+ */
+export function appSandboxEnv(
+  run: Pick<AppSandboxRun, "runId" | "sandboxSpec" | "platformKey">,
+  gateway?: GatewayUrls,
+): Record<string, string> {
+  return {
+    ...withoutSessionEnv(run.sandboxSpec.env),
+    ...modelGatewayEnv(run.platformKey, gateway),
+    [APP_RUN_ID_ENV]: run.runId,
+  };
 }
 
 const appSandboxNamespace = (run: Pick<AppSandboxRun, "workspaceId">): string =>
@@ -257,7 +277,7 @@ export async function ensureAppSandbox(run: AppSandboxRun, deps: AppSandboxDeps)
       // findSessionWorkloads) matches on exactly that env, and session teardown
       // deletes what it finds. This sandbox is the run's AppRunner's alone, so it
       // must not be reachable that way (the session label still attributes it).
-      env: { ...withoutSessionEnv(spec.env), [APP_RUN_ID_ENV]: run.runId },
+      env: appSandboxEnv(run, deps.gateway),
       labels: appSandboxLabels(run),
       // A manifest that names no timeout still gets the platform's default, not the
       // longest session the provider allows. The provider adds its shutdown buffer to

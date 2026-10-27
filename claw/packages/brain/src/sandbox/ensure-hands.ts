@@ -22,9 +22,10 @@ import {
 } from "./attribution.js";
 import {
   HANDS_MCP_URL, SAFE_API_URL, SANDBOX_NAMESPACE, AUTH_INTERNAL_TOKEN,
-  ANTHROPIC_BASE_URL, OPENAI_BASE_URL, isKubernetesMode, AGENT_SANDBOX_NAMESPACE,
+  isKubernetesMode, AGENT_SANDBOX_NAMESPACE,
   HANDS_HEALTH_MAX_TRIES, HANDS_HEALTH_INTERVAL_MS,
 } from "../config.js";
+import { modelKeyEnv, modelBaseUrlEnv } from "./model-gateway-env.js";
 import { getSystemEnv } from "../infra/system-env.js";
 import { resolveRequestLlmKey } from "../llm/key-source.js";
 import { checkHandsHealth } from "./hands-health.js";
@@ -2645,10 +2646,7 @@ async function provisionHands(
   // is the caller's per-user `ak-...` SaFE platform key, which means cost
   // tracking + auditing stays per-user at the SaFE layer instead of through
   // a shared virtualKey relay.
-  if (apiKey) {
-    env.ANTHROPIC_API_KEY = apiKey;
-    env.OPENAI_API_KEY = apiKey;
-  }
+  Object.assign(env, modelKeyEnv(apiKey));
 
   // Multi-node: point Hyperloom's SaFE-less external mode at the cluster Brain
   // already provisioned instead of the per-user SaFE workload it would
@@ -3551,8 +3549,7 @@ async function ensureHandsAgentSandbox(
   // protocol's deny list stops a caller supplying one. Anything SaFE-ish added to
   // the base env later has to be dropped here too.
   delete env.SAFE_API_URL;
-  if (ANTHROPIC_BASE_URL) env.ANTHROPIC_BASE_URL = ANTHROPIC_BASE_URL;
-  if (OPENAI_BASE_URL) env.OPENAI_BASE_URL = OPENAI_BASE_URL;
+  Object.assign(env, modelBaseUrlEnv());
 
   const labels = composeSandboxLabels({
     sessionId, component: "hands", extra: action.params.labels,

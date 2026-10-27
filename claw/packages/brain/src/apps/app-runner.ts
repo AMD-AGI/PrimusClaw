@@ -459,7 +459,7 @@ export class AppRunner {
     if (this.secretsLoaded) return;
     try {
       const stored = await this.deps.store.secrets(this.runId);
-      this.secrets = secretValuesOf({ mcpToken: stored.mcp_token, grantKeys: stored.grant_keys ?? {} });
+      this.secrets = secretValuesOf({ mcpToken: stored.mcp_token, grantKeys: stored.grant_keys ?? {}, platformKey: this.platformKey });
       this.secretsLoaded = true;
     } catch (err) {
       logger.warn({ runId: this.runId, err: this.safeText(err) }, "app_run.secrets_unavailable_for_scrub");
@@ -642,7 +642,7 @@ export class AppRunner {
       grantLimits: granted.limits ?? rec.grant_limits,
       nodeName,
     };
-    this.secrets = secretValuesOf(sources);
+    this.secrets = secretValuesOf({ ...sources, platformKey: this.platformKey });
     this.secretsLoaded = true;
     if (!nodeName) logger.warn({ runId: this.runId }, "app_run.node_name_unavailable");
     return buildAppEnv(sources);
