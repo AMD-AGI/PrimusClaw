@@ -162,6 +162,20 @@ export interface SyncWorkspaceResult {
   unchanged?: number;
 }
 
+/**
+ * Whether a sync that did not fail leaves a snapshot of the workspace in the
+ * prefix it wrote to.
+ *
+ * `uploaded > 0` used to say so, and stopped being true when the upload became a
+ * delta: a sync that finds everything already there uploads nothing and leaves
+ * the prefix exactly as whole as it was. The in-flight checkpoint reads this to
+ * know there is something to recover from, and a redelivered run writes to the
+ * same checkpoint prefix as the one before it.
+ */
+export function syncLeftSnapshot(r: SyncWorkspaceResult): boolean {
+  return !r.empty && (r.uploaded > 0 || (r.unchanged ?? 0) > 0);
+}
+
 let _s3: S3Client | null = null;
 
 function getS3Client(): S3Client {

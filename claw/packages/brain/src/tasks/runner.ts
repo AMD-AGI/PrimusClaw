@@ -19,7 +19,7 @@ import {
   type OutstandingReconciliation, type ReclaimCause,
 } from "../clients/hands.js";
 import {
-  syncWorkspaceToS3, syncWorkspaceFromS3, archiveRunToS3, copyS3Prefix, TRANSCRIPT_PREFIX,
+  syncWorkspaceToS3, syncWorkspaceFromS3, archiveRunToS3, copyS3Prefix, syncLeftSnapshot, TRANSCRIPT_PREFIX,
 } from "../workspace/s3-uploader.js";
 import { invalidateSyncManifest } from "../workspace/sync-delta.js";
 import { syncWorkspace, restoreWorkspace } from "../workspace/sync.js";
@@ -2051,7 +2051,7 @@ class TaskRunner {
         // sandbox's record of what it last uploaded there is no longer true.
         // Forgetting it makes the next sync upload everything, which is what
         // makes S3 match the workspace again.
-        await invalidateSyncManifest(this.hands, sessionPrefix);
+        await invalidateSyncManifest(this.hands, sessionPrefix, 5);
       }
       if (rec.copied > 0) {
         await this.onEvent({
@@ -2833,7 +2833,7 @@ class TaskRunner {
           const r = await fx().syncWorkspaceToS3(currentHands, this.sessionId, this.userIdForSync, {
             s3PrefixOverride: this.inflightCkptPrefix,
           });
-          if (r.uploaded > 0) this.inflightCkptHasData = true;
+          if (syncLeftSnapshot(r)) this.inflightCkptHasData = true;
           logger.info(
             { sessionId: this.sessionId, uploaded: r.uploaded, total: r.totalFiles, exhausted: r.exhausted },
             "s3.checkpoint.synced",

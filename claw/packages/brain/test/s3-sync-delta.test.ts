@@ -36,7 +36,7 @@ process.env.S3_ACCESS_KEY = "AK";
 process.env.S3_SECRET_KEY = "SK";
 process.env.S3_BUCKET = "claw";
 
-const { syncWorkspaceToS3 } = await import("../src/workspace/s3-uploader.js");
+const { syncWorkspaceToS3, syncLeftSnapshot } = await import("../src/workspace/s3-uploader.js");
 const {
   invalidateSyncManifest, parseDigestListing, parseStatListing, planUploadDelta, SYNC_STATE_DIR,
 } = await import("../src/workspace/sync-delta.js");
@@ -417,7 +417,51 @@ test("P2 the digest listing takes both sha256sum spellings and ignores what it c
   assert.deepEqual([...got], [["/workspace/a.txt", h], ["/workspace/b.bin", h]]);
 });
 
+// ===== what the in-flight checkpoint may assume =====
+
+test("C1 a sync that found everything already in S3 still left a snapshot there", async () => {
+  // A redelivered run writes its in-flight checkpoint to the same prefix as the run
+  // before it, in a sandbox that may still hold that run's record. The second
+  // checkpoint sync then uploads nothing -- and the prefix is exactly as whole as
+  // it was. Reading "uploaded nothing" as "holds nothing" skipped the recovery
+  // copy when the terminal sync later failed.
+  const sb = threeFiles();
+  const first = await sb.sync("checkpoints/sess-1/msg-1/inflight/");
+  const again = await sb.sync("checkpoints/sess-1/msg-1/inflight/");
+
+  assert.equal(first.uploaded, 3);
+  assert.equal(again.uploaded, 0);
+  assert.equal(again.unchanged, 3);
+  assert.equal(syncLeftSnapshot(first), true);
+  assert.equal(syncLeftSnapshot(again), true, "nothing to upload is not nothing there");
+});
+
+const SNAPSHOT_CASES: Array<{
+  name: string;
+  r: { uploaded: number; totalFiles: number; failedCount: number; exhausted: boolean; empty: boolean; unchanged?: number };
+  want: boolean;
+}> = [
+  { name: "uploaded files", r: { uploaded: 3, totalFiles: 3, failedCount: 0, exhausted: false, empty: false }, want: true },
+  { name: "nothing uploaded, files unchanged", r: { uploaded: 0, totalFiles: 3, failedCount: 0, exhausted: false, empty: false, unchanged: 3 }, want: true },
+  { name: "an empty workspace", r: { uploaded: 0, totalFiles: 0, failedCount: 0, exhausted: false, empty: true }, want: false },
+  { name: "nothing uploaded and nothing unchanged", r: { uploaded: 0, totalFiles: 2, failedCount: 2, exhausted: true, empty: false, unchanged: 0 }, want: false },
+];
+for (const c of SNAPSHOT_CASES) {
+  test(`C2 syncLeftSnapshot: ${c.name}`, () => {
+    assert.equal(syncLeftSnapshot(c.r), c.want);
+  });
+}
+
 // ===== wiring =====
+
+test("W2 the in-flight checkpoint decides it holds data with syncLeftSnapshot, not by counting uploads", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const src = readFileSync(join(here, "../src/tasks/runner.ts"), "utf-8");
+  const at = src.indexOf("private startInflightCheckpointTimer");
+  const body = src.slice(at, src.indexOf("private async executeEngine"));
+  assert.match(body, /if \(syncLeftSnapshot\(r\)\) this\.inflightCkptHasData = true;/);
+  assert.doesNotMatch(body, /r\.uploaded > 0/);
+});
 
 test("W1 the checkpoint recovery forgets the record after it copies a snapshot over the session prefix", () => {
   // A guard on a wiring whose failure is silent: without it a recovered prefix
@@ -427,7 +471,7 @@ test("W1 the checkpoint recovery forgets the record after it copies a snapshot o
   const at = src.indexOf("private async recoverInflightCheckpoint");
   const body = src.slice(at, src.indexOf("private async resolvePlatformKey"));
   const copy = body.indexOf("copyS3Prefix");
-  const call = body.search(/await invalidateSyncManifest\(this\.hands, sessionPrefix\)/);
+  const call = body.search(/await invalidateSyncManifest\(this\.hands, sessionPrefix(, \d+)?\)/);
   assert.ok(copy > 0);
   assert.ok(call > copy, "the record for the session prefix is invalidated, after the copy");
 });

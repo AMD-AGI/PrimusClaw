@@ -80,7 +80,7 @@ interface FileStat {
  * where a wedged sandbox must not be able to hold the grace window open.
  */
 function bash(hands: HandsClient, command: string, timeoutSec: number): Promise<string> {
-  return withHandsTimeout<string>(hands, "bash", { command, timeout: timeoutSec }, (timeoutSec + 10) * 1000);
+  return withHandsTimeout<string>(hands, "bash", { command, timeout: timeoutSec }, (timeoutSec + 5) * 1000);
 }
 
 const rel = (path: string): string =>
@@ -211,9 +211,11 @@ async function readManifest(hands: HandsClient, s3Prefix: string): Promise<Map<s
  * in-flight checkpoint recovery copies an older snapshot over it), after which
  * the manifest would be vouching for objects that are no longer what it says.
  */
-export async function invalidateSyncManifest(hands: HandsClient, s3Prefix: string): Promise<boolean> {
+export async function invalidateSyncManifest(
+  hands: HandsClient, s3Prefix: string, timeoutSec: number = STATE_TIMEOUT_SEC,
+): Promise<boolean> {
   try {
-    await bash(hands, `rm -f ${statePrefix(s3Prefix)}.*.json`, STATE_TIMEOUT_SEC);
+    await bash(hands, `rm -f ${statePrefix(s3Prefix)}.*.json`, timeoutSec);
     return true;
   } catch (e) {
     logger.warn({ err: (e as Error)?.message ?? String(e) }, "s3.sync_delta.invalidate_failed");
