@@ -143,11 +143,13 @@ export class SafeWorkloadProvider implements SandboxProvider {
     // rather than listed again here.
     await pollWorkloadUntilRunning(workloadId, apiKey, params.onEvent, undefined, "hands", {
       signal: params.signal,
-      // Only for the endings where nobody is left to use or reap this workload
-      // by another route: a cancelled run and a start that will not finish. The
-      // other endings keep their existing handling (the reaper / the caller).
+      isHandover: params.isHandover,
+      // Only for a cancelled run, which the failure path does not reap. Every
+      // other ending keeps its existing handling: the failure path reaps the
+      // PENDING workload after it has read the platform's account of it
+      // (sandbox_start_timeout included), and the reaper covers the rest.
       onGiveUp: async ({ reason }) => {
-        if (reason !== "sandbox_wait_interrupted" && reason !== "sandbox_start_timeout") return;
+        if (reason !== "sandbox_wait_interrupted") return;
         await this.stop({
           provider: "safe-workload", id: workloadId, sandboxName: workloadId,
           namespace: ns, handsBaseUrl: "", platformKey: apiKey,
@@ -322,7 +324,7 @@ export async function pollWorkloadUntilRunning(
   /** Event-name prefix of the wait's logs (`<prefix>.poll_error`); `hands` unless another owner says so. */
   logPrefix = "hands",
   /** The run's cancel signal, and what to do with the workload when the wait is given up. */
-  wait?: Pick<WorkloadWaitOptions, "signal" | "onGiveUp">,
+  wait?: Pick<WorkloadWaitOptions, "signal" | "onGiveUp" | "isHandover">,
 ): Promise<void> {
   await onEvent?.({ type: "sandboxStatus", event: "phase", phase: "Creating", status: "creating", log: "" });
 
@@ -348,6 +350,7 @@ export async function pollWorkloadUntilRunning(
       });
     },
     signal: wait?.signal,
+    isHandover: wait?.isHandover,
     onGiveUp: wait?.onGiveUp,
     deps,
   });

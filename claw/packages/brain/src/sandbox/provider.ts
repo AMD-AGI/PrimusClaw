@@ -35,6 +35,9 @@ export interface SandboxCreateParams {
   /** The run's cancel signal. safe-workload: aborting ends the wait for the
    *  sandbox to start and stops the workload this call created. */
   signal?: AbortSignal;
+  /** True when that signal's abort is a handover (restart, successor) rather than
+   *  a cancel: the workload is then left for the next run to adopt. */
+  isHandover?: () => boolean;
   /** safe-workload: pre-built SaFE workload resources array (overrides `resources`
    *  when set), preserving the legacy JSON fallback path. */
   resourcesArray?: Array<Record<string, string | number>>;

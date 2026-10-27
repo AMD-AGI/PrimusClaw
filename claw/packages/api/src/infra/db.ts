@@ -1747,8 +1747,8 @@ export async function initDb(): Promise<void> {
     ).catch(() => {});
     await ensureConcurrentIndexOrWarn(
       client,
-      "idx_tasks_platform_facts_pending_v2",
-      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_platform_facts_pending_v2
+      "idx_tasks_platform_facts_pending_v3",
+      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_platform_facts_pending_v3
          ON claw_tasks(
            platform_facts_next_retry_at ASC NULLS FIRST,
            completed_at ASC,
@@ -1758,24 +1758,32 @@ export async function initDb(): Promise<void> {
          AND failure_reason IN (
            'brain_timeout','worker_lost','sandbox_workload_terminal','sandbox_pending_timeout',
            'sandbox_timed_out','sandbox_exited_before_ready','sandbox_gone',
-           'sandbox_status_unreadable','sandbox_health_failed','sandbox_bootstrap_failed'
+           'sandbox_status_unreadable','sandbox_health_failed','sandbox_bootstrap_failed',
+           'sandbox_start_timeout'
          )
          AND platform_facts_resolved_at IS NULL`,
     );
-    // The name this one replaced, removed once the replacement is provably
-    // there. Safe to remove at all because v2 strictly widens v1: identical key
-    // columns in identical order, eight more failure reasons in the `IN` list,
-    // and `sandbox_workload_id IS NOT NULL` dropped from the predicate. Every
-    // row v1 indexed is a row v2 indexes, and v1's predicate implies v2's, so a
-    // pod still running the older code has its narrower scan served by v2
-    // throughout a rolling upgrade rather than falling back to a sequential one.
+    // The names this one replaced, removed once the replacement is provably
+    // there. Safe to remove at all because each version strictly widens the one
+    // before: identical key columns in identical order, and a failure-reason
+    // `IN` list that only grows (v2 added eight reasons and dropped
+    // `sandbox_workload_id IS NOT NULL` from the predicate; v3 adds
+    // `sandbox_start_timeout`). Every row an older version indexed is a row v3
+    // indexes, and its predicate implies v3's, so a pod still running older code
+    // has its narrower scan served by v3 throughout a rolling upgrade rather
+    // than falling back to a sequential one.
     //
     // The retention rule below still holds for the indexes it names; what it
-    // refuses is an *unguarded* drop, and the guard is what this call adds.
+    // refuses is an *unguarded* drop, and the guard is what these calls add.
     await dropSupersededIndexWhenReplaced(
       client,
       "idx_tasks_platform_facts_pending",
+      "idx_tasks_platform_facts_pending_v3",
+    );
+    await dropSupersededIndexWhenReplaced(
+      client,
       "idx_tasks_platform_facts_pending_v2",
+      "idx_tasks_platform_facts_pending_v3",
     );
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_tasks_workspace ON claw_tasks(workspace_id) WHERE workspace_id IS NOT NULL",

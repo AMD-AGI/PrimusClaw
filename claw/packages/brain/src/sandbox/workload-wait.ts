@@ -146,10 +146,19 @@ export interface WorkloadWaitOptions {
   /**
    * The run's cancel signal. Aborting it ends the wait at once with
    * `sandbox_wait_interrupted` -- during the sleep between reads and during a
-   * read in flight -- and runs `onGiveUp`, so the workload this wait was
-   * provisioning is reclaimed instead of left for the sweeper.
+   * read in flight -- and, for a cancel (see `isHandover`), runs `onGiveUp`, so
+   * the workload this wait was provisioning is reclaimed instead of left for the
+   * sweeper.
    */
   signal?: AbortSignal;
+  /**
+   * Whether the abort that ended the wait is a handover rather than a cancel:
+   * a graceful restart or a successor taking the run over. A handover leaves the
+   * workload exactly as it is, for whoever picks the run up to adopt, so
+   * `onGiveUp` is not run for it. Read when the abort is seen, not when the wait
+   * starts. Absent means every abort is a cancel.
+   */
+  isHandover?: () => boolean;
   deps?: WorkloadWaitDeps;
 }
 
@@ -241,12 +250,14 @@ export async function waitForWorkloadReady(
   };
 
   /** End the wait because the run was cancelled, reclaiming what it created. */
-  const interrupted = async (phase: string): Promise<never> =>
-    await giveUp(
-      "sandbox_wait_interrupted",
-      phase,
-      `workload ${workloadId} startup was interrupted before it became ready`,
-    );
+  const interrupted = async (phase: string): Promise<never> => {
+    const message = `workload ${workloadId} startup was interrupted before it became ready`;
+    if (opts.isHandover?.()) {
+      logger.info({ workloadId }, `${logPrefix}.wait_handed_over`);
+      throw new SandboxProvisionTerminalError("sandbox_wait_interrupted", message);
+    }
+    return await giveUp("sandbox_wait_interrupted", phase, message);
+  };
 
   while (true) {
     if (signal?.aborted) return await interrupted("");

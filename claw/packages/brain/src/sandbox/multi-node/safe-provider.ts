@@ -19,6 +19,7 @@ import type { ExecuteRequest } from "@claw/protocol";
 import {
   AUTH_INTERNAL_TOKEN,
   MULTI_NODE_DEFAULT_TIMEOUT_SECONDS,
+  MULTI_NODE_START_TIMEOUT_MS,
   SAFE_API_URL,
 } from "../../config.js";
 import { normalizeWorkloadTimeout, resolveSandboxImageFromRequest } from "../ensure-hands.js";
@@ -360,7 +361,7 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
         }).catch(() => {});
       }
 
-      const detail = await this.waitForRunning(sessionId, workloadId, displayName, apiKey, namespace, spec, onEvent, undefined, opts?.signal);
+      const detail = await this.waitForRunning(sessionId, workloadId, displayName, apiKey, namespace, spec, onEvent, undefined, opts?.signal, opts?.isHandover);
 
       logger.info({ sessionId, workloadId, backend: spec.backend }, "mn.safe_ready");
       await onEvent({
@@ -675,10 +676,12 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
     onEvent: MultiNodeEventSink,
     deps?: WorkloadWaitDeps,
     signal?: AbortSignal,
+    isHandover?: () => boolean,
   ): Promise<Record<string, unknown>> {
     return await waitForWorkloadReady({
       workloadId,
       signal,
+      isHandover,
       apiKey,
       logPrefix: "mn.safe",
       isReady: (detail) => {
@@ -708,7 +711,8 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
           mn_backend: spec.backend,
         }).catch(() => {});
       },
-      deps,
+      // This path's own ceiling, not the sandbox's: see MULTI_NODE_START_TIMEOUT_MS.
+      deps: { ...deps, startTimeoutMs: deps?.startTimeoutMs ?? MULTI_NODE_START_TIMEOUT_MS },
     });
   }
 

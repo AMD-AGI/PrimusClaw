@@ -57,6 +57,9 @@ export interface MultiNodeEnsureOptions {
   platformKey?: string;
   /** The run's cancel signal: aborting ends the wait for the cluster and deletes it. */
   signal?: AbortSignal;
+  /** True when that signal's abort is a handover (restart, successor), which must
+   *  leave the cluster for the next run to adopt; only a cancel deletes it. */
+  isHandover?: () => boolean;
 }
 
 /** Emitted to the client while provisioning progresses. */

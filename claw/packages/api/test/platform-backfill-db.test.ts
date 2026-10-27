@@ -134,7 +134,7 @@ test("the drain selects actual sandbox failures, including KV-only rows, and exc
   const reasons = [
     "brain_timeout", "worker_lost", "sandbox_workload_terminal", "sandbox_pending_timeout",
     "sandbox_timed_out", "sandbox_exited_before_ready", "sandbox_gone", "sandbox_status_unreadable",
-    "sandbox_health_failed", "sandbox_bootstrap_failed",
+    "sandbox_health_failed", "sandbox_bootstrap_failed", "sandbox_start_timeout",
   ];
   for (const reason of reasons) await seed(reason, reason);
   await seed("pending-kv", "sandbox_workload_terminal", { handle: null, config: {} });

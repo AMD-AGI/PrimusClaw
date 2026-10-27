@@ -171,6 +171,17 @@ export const RUN_ROW_TERMINAL_ABORT_REASON = Symbol("run_row_terminal");
 export const DEADLINE_EXCEEDED_ABORT_REASON = Symbol("deadline_exceeded");
 
 /**
+ * Whether an abort reason hands the run to someone else -- a graceful restart or
+ * a successor taking over -- rather than ending it. Whatever the run was
+ * provisioning is then the next run's to adopt, so nothing may reclaim it. Every
+ * other reason (a user's Stop, the deadline, a terminal run row) is the run's own
+ * ending.
+ */
+export function isHandoverAbortReason(reason: unknown): boolean {
+  return reason === SIGTERM_ABORT_REASON || reason === LEASE_LOST_ABORT_REASON;
+}
+
+/**
  * Externally abort the in-flight task for a session, if any. Used by
  * sandbox-keepalive when consecutive ping failures indicate the Hands
  * sandbox is gone — without this the agent loop happily blocks for up to

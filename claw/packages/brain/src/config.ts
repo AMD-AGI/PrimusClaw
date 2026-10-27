@@ -1051,6 +1051,14 @@ export const SANDBOX_PENDING_TIMEOUT_MS = envInt("SANDBOX_PENDING_TIMEOUT_SECOND
 // 0 waits indefinitely. Stored in ms; configured in seconds like the siblings.
 export const SANDBOX_START_TIMEOUT_MS = envInt("SANDBOX_START_TIMEOUT_SECONDS", 15 * 60) * 1000;
 
+// The same ceiling for a multi-node GPU cluster, off by default. A cluster's
+// start is routinely longer than a single sandbox's -- large GPU images, and an
+// Infera cluster is not ready until every role pod is up while the workload
+// already reads Running -- and giving up on one DELETEs the cluster, so a
+// ceiling sized for a sandbox would delete healthy clusters. Set it only above
+// the slowest legitimate cluster start. 0 waits indefinitely.
+export const MULTI_NODE_START_TIMEOUT_MS = envInt("MULTI_NODE_START_TIMEOUT_SECONDS", 0) * 1000;
+
 // How long a PENDING `hands.<sid>` entry may sit there with nobody running for
 // it before the sweeper treats it as abandoned, stops its workload and deletes
 // the entry. Configured in seconds like the ceiling above, stored in ms. Set

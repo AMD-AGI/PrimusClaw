@@ -12,6 +12,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 process.env.SAFE_API_URL = "http://safe.test";
+// Read when the config module loads; the create-path ceiling test below waits it out in real time.
+process.env.SANDBOX_START_TIMEOUT_SECONDS = "1";
 const { waitForWorkloadReady } = await import("../src/sandbox/workload-wait.js");
 const { SandboxProvisionTerminalError } = await import("../src/sandbox/errors.js");
 const { __test__ } = await import("../src/sandbox/safe-workload-provider.js");
@@ -230,4 +232,64 @@ test("a cancelled create stops the workload it created, naming that workload", {
   });
   assert.equal(await outcome(created), "sandbox_wait_interrupted");
   assert.ok(calls.includes("POST /api/v1/workloads/wl-created/stop"), `calls: ${calls.join(", ")}`);
+});
+
+test("a handover abort leaves the workload alone, in the wait and through create", { timeout: 5000 }, async (t) => {
+  const { SafeWorkloadProvider } = await import("../src/sandbox/safe-workload-provider.js");
+  // The wait: isHandover true means onGiveUp is not run, but the abort still ends the wait.
+  const gaveUp: string[] = [];
+  const ctl2 = new AbortController();
+  let polls2 = 0;
+  const direct = waitForWorkloadReady({
+    workloadId: "wl-1", apiKey: "k", logPrefix: "test", isReady: isRunning,
+    signal: ctl2.signal, isHandover: () => true,
+    onGiveUp: async ({ reason }) => { gaveUp.push(reason); },
+    deps: {
+      fetchImpl: scriptedFetch([notReady]),
+      sleepImpl: async () => { if (++polls2 === 2) ctl2.abort(); if (polls2 > 50) throw new Error("abort ignored"); },
+      nowImpl: () => 0, pollMs: 5000, startTimeoutMs: 0,
+    },
+  });
+  assert.equal(await outcome(direct), "sandbox_wait_interrupted");
+  assert.deepEqual(gaveUp, [], "a handover must not run the give-up hook");
+
+  // Through create: no stop request.
+  const calls: string[] = [];
+  const realFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = realFetch; });
+  globalThis.fetch = (async (url: string, init?: { method?: string }) => {
+    calls.push(`${init?.method ?? "GET"} ${new URL(url).pathname}`);
+    if (String(url).endsWith("/api/v1/workloads")) {
+      return { ok: true, status: 200, json: async () => ({ workloadId: "wl-created" }) };
+    }
+    return { ok: true, status: 200, json: async () => ({}), text: async () => "" };
+  }) as unknown as typeof fetch;
+  const ctl3 = new AbortController();
+  const created = new SafeWorkloadProvider().create({
+    sessionId: "s1", namespace: "ns", image: "img:tag", resources: { cpu: "1" }, env: {},
+    platformKey: "key", signal: ctl3.signal, isHandover: () => true,
+    onProvisioned: async () => { ctl3.abort(); },
+  });
+  assert.equal(await outcome(created), "sandbox_wait_interrupted");
+  assert.ok(!calls.some((c) => c.endsWith("/stop")), `no stop on a handover: ${calls.join(", ")}`);
+});
+
+test("create does not stop the workload on sandbox_start_timeout: the failure path reaps it after reading its facts", { timeout: 30_000 }, async (t) => {
+  const { SafeWorkloadProvider } = await import("../src/sandbox/safe-workload-provider.js");
+  const calls: string[] = [];
+  const realFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = realFetch; });
+  globalThis.fetch = (async (url: string, init?: { method?: string }) => {
+    calls.push(`${init?.method ?? "GET"} ${new URL(url).pathname}`);
+    if (String(url).endsWith("/api/v1/workloads")) {
+      return { ok: true, status: 200, json: async () => ({ workloadId: "wl-created" }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ phase: "NotReady" }), text: async () => "" };
+  }) as unknown as typeof fetch;
+  // Real poll interval (5s): the first NotReady read starts the 1s ceiling, the next trips it.
+  const created = new SafeWorkloadProvider().create({
+    sessionId: "s1", namespace: "ns", image: "img:tag", resources: { cpu: "1" }, env: {}, platformKey: "key",
+  });
+  assert.equal(await outcome(created), "sandbox_start_timeout");
+  assert.ok(!calls.some((c) => c.endsWith("/stop")), `the wait must leave the workload for the runner: ${calls.join(", ")}`);
 });

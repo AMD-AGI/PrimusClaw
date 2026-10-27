@@ -291,6 +291,14 @@ export interface EnsureHandsOptions {
    * cancel pass none.
    */
   signal?: AbortSignal;
+  /**
+   * Whether an abort of `signal` is a handover (a graceful restart, or a
+   * successor taking the run over) rather than a cancel. A wait for the sandbox
+   * to start that is cut short by a handover leaves the workload and its PENDING
+   * entry for the next run; only a cancel reclaims it. Absent: every abort is a
+   * cancel.
+   */
+  isHandover?: () => boolean;
 }
 
 /**
@@ -2748,6 +2756,7 @@ async function provisionHands(
       onProvisioned,
       onEvent,
       signal: options.signal,
+      isHandover: options.isHandover,
     });
   } catch (err) {
     await hold.release();
