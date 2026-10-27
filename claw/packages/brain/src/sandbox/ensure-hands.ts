@@ -25,7 +25,7 @@ import {
   isKubernetesMode, AGENT_SANDBOX_NAMESPACE,
   HANDS_HEALTH_MAX_TRIES, HANDS_HEALTH_INTERVAL_MS,
 } from "../config.js";
-import { modelKeyEnv, modelBaseUrlEnv } from "./model-gateway-env.js";
+import { modelBaseUrlEnv } from "./model-gateway-env.js";
 import { getSystemEnv } from "../infra/system-env.js";
 import { resolveRequestLlmKey } from "../llm/key-source.js";
 import { checkHandsHealth } from "./hands-health.js";
@@ -39,6 +39,7 @@ import {
   applyMultiNodeExternalEnv,
   writeTopologyHandoff,
   hasSshKeyFile,
+  applyPlatformKeyEnv,
 } from "./params.js";
 import type { SandboxAction } from "./params.js";
 import { resourcesJsonToWorkloadArray } from "./workload-resources.js";
@@ -2646,7 +2647,9 @@ async function provisionHands(
   // is the caller's per-user `ak-...` SaFE platform key, which means cost
   // tracking + auditing stays per-user at the SaFE layer instead of through
   // a shared virtualKey relay.
-  Object.assign(env, modelKeyEnv(apiKey));
+  // In safe mode the same key is also SAFE_API_KEY (platform-owned; the deny
+  // lists keep user/system env from overriding it).
+  applyPlatformKeyEnv(env, apiKey, isKubernetesMode());
 
   // Multi-node: point Hyperloom's SaFE-less external mode at the cluster Brain
   // already provisioned instead of the per-user SaFE workload it would

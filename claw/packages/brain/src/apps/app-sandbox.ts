@@ -37,7 +37,8 @@ import { SESSION_ENV } from "../sandbox/multi-node/safe-body.js";
 import { ACTIVE_PHASES, TERMINAL_PHASES } from "../sandbox/workload-wait.js";
 import { pollWorkloadUntilRunning, SHUTDOWN_BUFFER_SECONDS } from "../sandbox/safe-workload-provider.js";
 import type { SandboxInstance } from "../sandbox/provider.js";
-import { modelGatewayEnv, type GatewayUrls } from "../sandbox/model-gateway-env.js";
+import { applyPlatformKeyEnv } from "../sandbox/params.js";
+import { modelBaseUrlEnv, type GatewayUrls } from "../sandbox/model-gateway-env.js";
 
 const logger = pino({ name: "app-sandbox" });
 
@@ -160,7 +161,7 @@ function withoutSessionEnv(env: Record<string, string> | undefined): Record<stri
 
 /**
  * The env the sandbox is created with: the spec's, the run's identity, and the
- * model-gateway credentials a Hands sandbox gets (sandbox/model-gateway-env).
+ * model-gateway credentials a Hands sandbox gets (applyPlatformKeyEnv, model-gateway-env).
  * The platform's names win over the spec's, as the Hands base env does.
  * `platformKey` is the session owner's key, which is what Hands passes too.
  */
@@ -168,11 +169,12 @@ export function appSandboxEnv(
   run: Pick<AppSandboxRun, "runId" | "sandboxSpec" | "platformKey">,
   gateway?: GatewayUrls,
 ): Record<string, string> {
-  return {
-    ...withoutSessionEnv(run.sandboxSpec.env),
-    ...modelGatewayEnv(run.platformKey, gateway),
-    [APP_RUN_ID_ENV]: run.runId,
-  };
+  const env: Record<string, string> = { ...withoutSessionEnv(run.sandboxSpec.env), [APP_RUN_ID_ENV]: run.runId };
+  // The same function Hands applies to its base env (safe mode: also SAFE_API_KEY,
+  // which a spec cannot plant), then the gateway URLs.
+  applyPlatformKeyEnv(env, run.platformKey, false);
+  Object.assign(env, modelBaseUrlEnv(gateway));
+  return env;
 }
 
 const appSandboxNamespace = (run: Pick<AppSandboxRun, "workspaceId">): string =>

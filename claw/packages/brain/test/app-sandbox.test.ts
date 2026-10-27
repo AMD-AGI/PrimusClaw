@@ -16,7 +16,8 @@ import { listingEndsOnOtherOps } from "./kv-listing-stub.js";
 import { filterToRegExp } from "./nats-kv-stub.js";
 import fs from "node:fs";
 import { secretValuesOf } from "../src/apps/app-env.js";
-import { modelKeyEnv, modelBaseUrlEnv } from "../src/sandbox/model-gateway-env.js";
+import { applyPlatformKeyEnv } from "../src/sandbox/params.js";
+import { modelBaseUrlEnv } from "../src/sandbox/model-gateway-env.js";
 import { ensureAppSandbox, readSandboxNodeName, type AppSandboxRun } from "../src/apps/app-sandbox.js";
 import { SANDBOX_DEFAULT_TIMEOUT_SECONDS } from "../src/config.js";
 import { workloadTimeoutSeconds } from "../src/sandbox/safe-workload-provider.js";
@@ -458,7 +459,9 @@ test("an app sandbox is created with the model-gateway variables, exactly as Han
   assert.equal(env.ANTHROPIC_BASE_URL, GATEWAY.anthropic);
   assert.equal(env.OPENAI_BASE_URL, GATEWAY.openai);
   // Hands' own builder gives the same four for the same owner and config.
-  const hands = { ...modelKeyEnv("ak-owner"), ...modelBaseUrlEnv(GATEWAY) };
+  const hands: Record<string, string> = {};
+  applyPlatformKeyEnv(hands, "ak-owner", false);
+  Object.assign(hands, modelBaseUrlEnv(GATEWAY));
   for (const [k, v] of Object.entries(hands)) assert.equal(env[k], v, k);
   assert.equal(env.FROM_SPEC, "1");
   assert.equal(env.CLAW_APP_RUN_ID, "run-1");
@@ -481,7 +484,6 @@ test("absent gateway config: keys only, no empty URL variables, as Hands", async
   const env = safe.created[0]!.env;
   assert.equal(env.ANTHROPIC_API_KEY, "ak-owner");
   assert.ok(!("ANTHROPIC_BASE_URL" in env) && !("OPENAI_BASE_URL" in env));
-  assert.deepEqual(modelKeyEnv(""), {});
   assert.deepEqual(modelBaseUrlEnv({}), {});
 });
 
