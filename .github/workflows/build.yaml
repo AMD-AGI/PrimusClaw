@@ -56,8 +56,11 @@ jobs:
         if [[ $GITHUB_REF == refs/tags/* ]]; then
           TAG=${GITHUB_REF#refs/tags/}
           echo "image_version=$TAG" >> $GITHUB_OUTPUT
-        else
+        elif [[ $GITHUB_REF == refs/heads/main ]]; then
           echo "image_version=latest" >> $GITHUB_OUTPUT
+        else
+          # deploy-only build from a non-main ref: never move the shared latest tag
+          echo "image_version=${GITHUB_REF_NAME//\//-}" >> $GITHUB_OUTPUT
         fi
 
     - name: Get Current Time
@@ -77,6 +80,14 @@ jobs:
           echo "workflow_changed=true" >> "$GITHUB_OUTPUT"
           echo "claw_changed=true" >> "$GITHUB_OUTPUT"
           echo "memory_service_changed=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          echo "Manual dispatch: building the claw image only"
+          echo "workflow_changed=false" >> "$GITHUB_OUTPUT"
+          echo "claw_changed=true" >> "$GITHUB_OUTPUT"
+          echo "memory_service_changed=false" >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
