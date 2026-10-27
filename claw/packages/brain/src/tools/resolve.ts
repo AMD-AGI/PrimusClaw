@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import AdmZip from "adm-zip";
 import pino from "pino";
+import { TOOLS_API_URL } from "../config.js";
 import { lookupTool, platformToolsBase } from "./lookup.js";
 import type { EventCallback } from "@claw/protocol";
 import type { HandsClient } from "../clients/hands.js";
@@ -53,9 +54,23 @@ export async function resolveToolIds(
     if (r.ok) tools[tid] = r.tool;
     else logger.warn({ tid, reason: r.reason }, "resolve_tools.lookup_failed");
   });
+  // Without INTERNAL_BACKEND_URL the by-id route may not exist behind the
+  // gateway: keep the paged list there (as before) for ids the lookup could
+  // not reach, so a single-host setup does not lose its tool_ids.
+  if (looked.some((r) => !r.ok && r.reason === "endpoint_unreachable")) {
+    try {
+      const resp = await fetch(`${TOOLS_API_URL}?offset=0&limit=100&order=desc`, { headers: { Authorization: `Bearer ${apiKey}` } });
+      if (resp.ok) {
+        const data = (await resp.json()) as { data?: { tools?: Record<string, unknown>[] } };
+        for (const t of data.data?.tools ?? []) if (toolIds.includes(t.id as number) && !tools[t.id as number]) tools[t.id as number] = t;
+      }
+    } catch (err) {
+      logger.warn({ err }, "resolve_tools.list_fallback_failed");
+    }
+  }
   if (onEvent) {
     const failed = looked.filter((r) => !r.ok && (r.reason === "endpoint_unreachable" || r.reason === "lookup")).length;
-    await onEvent({ type: "toolUsed", tool: "resolve_tools", actionId: "resolve_tools_fetch", status: failed === toolIds.length ? "error" : "success", brief: failed === toolIds.length ? "Failed to fetch tool configuration" : "Fetched tool configuration" });
+    await onEvent({ type: "toolUsed", tool: "resolve_tools", actionId: "resolve_tools_fetch", status: toolIds.every((t) => !tools[t]) && failed > 0 ? "error" : "success", brief: toolIds.every((t) => !tools[t]) && failed > 0 ? "Failed to fetch tool configuration" : "Fetched tool configuration" });
   }
 
   for (const tid of toolIds) {

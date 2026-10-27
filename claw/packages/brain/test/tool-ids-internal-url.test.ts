@@ -42,3 +42,13 @@ test("the shared lookup classifies a gateway 404 as endpoint_unreachable and a C
     assert.deepEqual(world.paths.slice(-1), ["/claw-api/v1/tools/5"]);
   } finally { process.env.INTERNAL_BACKEND_URL = saved; }
 });
+
+test("without INTERNAL_BACKEND_URL tool_ids still resolve through the gateway list", async () => {
+  world.setTools([{ id: 21, name: "fleet-ops", zip: skillZip("fleet-ops", "BODY", "Operate") }]);
+  const saved = process.env.INTERNAL_BACKEND_URL;
+  delete process.env.INTERNAL_BACKEND_URL;
+  try {
+    const r = await resolveToolIds([21], "ak-user");
+    assert.match(r.skillContents["fleet-ops"] ?? "", /BODY/);
+  } finally { process.env.INTERNAL_BACKEND_URL = saved; }
+});
