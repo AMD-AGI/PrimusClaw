@@ -17,10 +17,11 @@ import AdmZip from "adm-zip";
 
 export type Turn = { text: string } | { tool: string; input: Record<string, unknown> };
 
-export function skillZip(name: string, body: string, description: string): Buffer {
+export function skillZip(name: string, body: string, description: string, wrap = ""): Buffer {
   const zip = new AdmZip();
-  zip.addFile("SKILL.md", Buffer.from(`---\nname: ${name}\ndescription: ${description}\n---\n${body}\n`));
-  zip.addFile("references/extra.md", Buffer.from("extra"));
+  const pre = wrap ? `${wrap}/` : "";
+  zip.addFile(`${pre}SKILL.md`, Buffer.from(`---\nname: ${name}\ndescription: ${description}\n---\n${body}\n`));
+  zip.addFile(`${pre}references/extra.md`, Buffer.from("extra"));
   return zip.toBuffer();
 }
 
@@ -28,7 +29,8 @@ export interface World {
   llmBodies: string[];
   downloads: number[];
   listCalls: number;
-  setTools(t: Array<{ id: number; name: string; zip?: Buffer; fail?: boolean; type?: string }>): void;
+  setTools(t: Array<{ id: number; name: string; zip?: Buffer; fail?: boolean; type?: string; version?: string | null; hang?: boolean }>): void;
+  byIdCalls: number[];
   script(turns: Turn[]): void;
   close(): Promise<void>;
 }
@@ -55,13 +57,24 @@ export async function startWorld(defaultsFile?: object): Promise<World> {
   let turns: Turn[] = [];
   let turnN = 0;
   const world: World = {
-    llmBodies: [], downloads: [], listCalls: 0,
+    llmBodies: [], downloads: [], listCalls: 0, byIdCalls: [],
     setTools(t) { tools = t; },
     script(t) { turns = t; turnN = 0; },
     close: async () => { await new Promise<void>((r) => server.close(() => r())); },
   };
   const server = http.createServer((req, res) => {
     const url = req.url ?? "";
+    const byId = url.match(/^\/claw-api\/v1\/tools\/(\d+)$/);
+    if (byId) {
+      const id = Number(byId[1]);
+      world.byIdCalls.push(id);
+      const t = tools.find((x) => x.id === id);
+      if (t?.hang) return;
+      res.setHeader("content-type", "application/json");
+      if (!t) { res.statusCode = 404; res.end(JSON.stringify({ ok: false })); return; }
+      res.end(JSON.stringify({ ok: true, data: { id: t.id, name: t.name, type: t.type ?? "skill", ...(t.version === null ? {} : { updated_at: t.version ?? "v1" }) } }));
+      return;
+    }
     if (url.startsWith("/claw-api/v1/tools") && !url.includes("/download")) {
       world.listCalls++;
       res.setHeader("content-type", "application/json");

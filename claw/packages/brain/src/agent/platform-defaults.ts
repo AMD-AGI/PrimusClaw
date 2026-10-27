@@ -8,7 +8,7 @@ import YAML from "yaml";
 import pino from "pino";
 import { PLATFORM_DEFAULTS_FILE, TOOLS_API_URL } from "../config.js";
 import { metrics } from "../infra/metrics.js";
-import { downloadSkill, findSkillMd } from "../tools/resolve.js";
+import { downloadSkill } from "../tools/resolve.js";
 import { uploadDirToSandbox } from "../sandbox/write.js";
 import { createPrivateStagingRoot } from "../tasks/plugin-from-message.js";
 import type { HandsClient } from "../clients/hands.js";
@@ -32,8 +32,14 @@ export interface DefaultSkill {
   name: string;
   description: string;
   toolId: number;
-  /** Brain-local staged copy; uploaded to the sandbox only when first needed. */
+  /**
+   * Brain-local directory that directly contains SKILL.md (the archive's own
+   * root, even if it was wrapped in a folder); uploaded as `.skills/<name>/`
+   * only when first needed.
+   */
   localDir: string;
+  /** Stage again when `localDir` is gone (e.g. the Brain restarted its cache). */
+  restage?: () => Promise<string>;
 }
 
 const SKILL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
@@ -160,59 +166,134 @@ function cacheRoot(): string {
 }
 /** Without a version field on the tool record, a staged copy is trusted this long. */
 const UNVERSIONED_TTL_MS = 5 * 60_000;
+/**
+ * A staged directory is never deleted while a chat may still hold it: it is
+ * only garbage-collected once older than this, which must exceed the longest
+ * chat (the lazy upload can happen long after the prompt was built).
+ */
+const STAGE_GC_AGE_MS = 24 * 3_600_000;
+/** Mutable only so a test can shorten them. */
+export const timeouts = { lookupMs: 10_000, stageMs: 60_000 };
 
 function versionKey(tool: Record<string, unknown>): string {
   const v = tool.updated_at ?? tool.updatedAt ?? tool.version ?? "";
   return String(v).replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 64);
 }
 
-/**
- * Stage one default skill under the Brain-local cache, keyed by tool id and
- * version, so concurrent chats do not each download it. Returns the staged dir.
- */
-async function stageCached(toolId: number, name: string, version: string, apiKey: string): Promise<string> {
-  const final = path.join(cacheRoot(), `${toolId}-${version || "unversioned"}`);
-  try {
-    const st = fs.statSync(final);
-    if (version || Date.now() - st.mtimeMs < UNVERSIONED_TTL_MS) return final;
-    fs.rmSync(final, { recursive: true, force: true });
-  } catch { /* not cached */ }
+/** key -> staged dir. The index, not the filesystem, answers "is it cached". */
+const stagedIndex = new Map<string, { dir: string; at: number }>();
+const stagedAll: Array<{ dir: string; at: number }> = [];
 
-  fs.mkdirSync(cacheRoot(), { recursive: true });
-  const tmp = fs.mkdtempSync(path.join(cacheRoot(), `.stage-${toolId}-`));
-  try {
-    // Same download + zip-slip-guarded extraction as a tool_ids skill, staged
-    // here instead of being uploaded to a sandbox.
-    await downloadSkill(toolId, name, apiKey, undefined, undefined, tmp);
-    try {
-      fs.renameSync(tmp, final);
-    } catch {
-      // Another chat staged the same version first; its copy is equivalent.
-      fs.rmSync(tmp, { recursive: true, force: true });
-    }
-  } catch (err) {
-    fs.rmSync(tmp, { recursive: true, force: true });
-    throw err;
-  }
-  // Older versions of this tool are dead weight now.
-  try {
-    for (const e of fs.readdirSync(cacheRoot())) {
-      if (e.startsWith(`${toolId}-`) && path.join(cacheRoot(), e) !== final) {
-        fs.rmSync(path.join(cacheRoot(), e), { recursive: true, force: true });
-      }
-    }
-  } catch { /* best-effort */ }
-  return final;
+export function resetStagedIndexForTest(): void {
+  stagedIndex.clear();
+  stagedAll.length = 0;
 }
 
 /**
- * Resolve the default skills for one chat: list the marketplace with the
- * caller's own key (so access control stays the marketplace's), stage each
- * permitted skill on Brain, and read its description. No sandbox is touched.
+ * Locate the directory that holds SKILL.md: the archive root if it has one,
+ * else the shallowest directory that does (a `zip -r skill.zip skill/` archive
+ * wraps everything in a top-level folder). Breadth-first so a SKILL.md deep in
+ * references/ can never win over the real one.
+ */
+export function locateSkillRoot(dir: string): string | null {
+  let level = [dir];
+  while (level.length) {
+    const next: string[] = [];
+    for (const d of level) {
+      const entries = fs.readdirSync(d, { withFileTypes: true });
+      if (entries.some((e) => e.isFile() && e.name === "SKILL.md")) return d;
+      for (const e of entries) if (e.isDirectory()) next.push(path.join(d, e.name));
+    }
+    level = next;
+  }
+  return null;
+}
+
+/** Delete staged dirs older than the GC age. Never touches a younger one. */
+function gcStaged(now = Date.now()): void {
+  for (let i = stagedAll.length - 1; i >= 0; i--) {
+    const e = stagedAll[i];
+    if (now - e.at > STAGE_GC_AGE_MS) {
+      fs.rmSync(e.dir, { recursive: true, force: true });
+      stagedAll.splice(i, 1);
+      for (const [k, v] of stagedIndex) if (v.dir === e.dir) stagedIndex.delete(k);
+    }
+  }
+}
+
+/** Test hook: GC as if `now` were this time. */
+export function gcStagedForTest(now: number): void { gcStaged(now); }
+
+/**
+ * Stage one default skill under the Brain-local cache, keyed by tool id and
+ * version, so concurrent chats do not each download it. Every stage gets its
+ * own fresh directory and a published version is never replaced in place, so a
+ * chat that was handed a directory keeps a valid one. Returns the SKILL.md root.
+ */
+async function stageCached(toolId: number, name: string, version: string, apiKey: string): Promise<string> {
+  const key = `${toolId}:${version}`;
+  const hit = stagedIndex.get(key);
+  if (hit && (version || Date.now() - hit.at < UNVERSIONED_TTL_MS)) {
+    const root = locateSkillRoot(hit.dir);
+    if (root) return root;
+  }
+  gcStaged();
+  fs.mkdirSync(cacheRoot(), { recursive: true });
+  const dir = fs.mkdtempSync(path.join(cacheRoot(), `${toolId}-`));
+  try {
+    // Same download + zip-slip-guarded extraction as a tool_ids skill, staged
+    // here instead of being uploaded to a sandbox.
+    await withTimeout(downloadSkill(toolId, name, apiKey, undefined, undefined, dir), timeouts.stageMs, "download");
+    if (!locateSkillRoot(dir)) throw new Error("SKILL.md not found after extraction");
+  } catch (err) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    throw err;
+  }
+  const entry = { dir, at: Date.now() };
+  stagedIndex.set(key, entry);
+  stagedAll.push(entry);
+  return locateSkillRoot(dir) as string;
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  let t: NodeJS.Timeout;
+  const timeout = new Promise<never>((_, rej) => { t = setTimeout(() => rej(new Error(`${what} timed out`)), ms); });
+  return Promise.race([p, timeout]).finally(() => clearTimeout(t));
+}
+
+type LookupResult =
+  | { ok: true; tool: Record<string, unknown> }
+  | { ok: false; reason: "not_visible" | "lookup" };
+
+/** One tool, by id, with the caller's own key and a deadline. */
+async function lookupTool(toolId: number, platformKey: string): Promise<LookupResult> {
+  try {
+    const resp = await fetch(`${TOOLS_API_URL}/${toolId}`, {
+      headers: { Authorization: `Bearer ${platformKey}` },
+      signal: AbortSignal.timeout(timeouts.lookupMs),
+    });
+    if (resp.status === 404 || resp.status === 403) return { ok: false, reason: "not_visible" };
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = (await resp.json()) as { data?: Record<string, unknown> };
+    if (!data.data || typeof data.data !== "object") return { ok: false, reason: "not_visible" };
+    return { ok: true, tool: data.data };
+  } catch (err) {
+    logger.error({ toolId, err: (err as Error).message }, "platform_defaults.lookup_failed");
+    return { ok: false, reason: "lookup" };
+  }
+}
+
+/**
+ * Resolve the default skills for one chat: look each configured tool up by id
+ * with the caller's own key (so access control stays the marketplace's, and
+ * the result does not depend on how many other tools the caller can see),
+ * stage each permitted skill on Brain, and read its description. No sandbox is
+ * touched.
  *
- * Failures never block the chat; each is a visible event and a counted reason.
- * A tool the caller cannot see is skipped, which is why an operator must
- * publish default tools as readable by every user.
+ * Failures never block the chat, but none is silent: an unresolvable default is
+ * logged at error level, counted by reason, and raised as an error event. A
+ * tool the caller cannot see is skipped, which is why an operator must publish
+ * default tools as readable by every user.
  */
 export async function resolveDefaultSkills(
   defaults: PlatformDefaults,
@@ -220,46 +301,43 @@ export async function resolveDefaultSkills(
   onEvent?: EventCallback,
 ): Promise<DefaultSkill[]> {
   if (!defaults.skills.length) return [];
-  const tools: Record<number, Record<string, unknown>> = {};
-  try {
-    const resp = await fetch(`${TOOLS_API_URL}?offset=0&limit=100&order=desc`, {
-      headers: { Authorization: `Bearer ${platformKey}` },
-    });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = (await resp.json()) as { data?: { tools?: Record<string, unknown>[] } };
-    for (const t of data.data?.tools ?? []) tools[t.id as number] = t;
-  } catch (err) {
-    logger.error({ err: (err as Error).message }, "platform_defaults.list_failed");
-    for (const _s of defaults.skills) metrics.onPlatformDefault("skill", "failed", "list");
-    await onEvent?.({ type: "toolUsed", tool: "platform_defaults", actionId: "platform_defaults_list", status: "error", brief: "Failed to load platform default skills" });
-    return [];
-  }
-
+  const looked = await Promise.all(defaults.skills.map((e) => lookupTool(e.toolId, platformKey)));
   const out: DefaultSkill[] = [];
   const seen = new Set<string>();
-  for (const entry of defaults.skills) {
-    const tool = tools[entry.toolId];
-    if (!tool || tool.type !== "skill") {
-      logger.warn({ toolId: entry.toolId }, "platform_defaults.skill_not_visible");
-      metrics.onPlatformDefault("skill", "skipped", tool ? "not_skill" : "not_visible");
+  for (let i = 0; i < defaults.skills.length; i++) {
+    const entry = defaults.skills[i];
+    const found = looked[i];
+    const fail = async (outcome: "failed" | "skipped", reason: string, brief: string) => {
+      logger.error({ toolId: entry.toolId, reason }, "platform_defaults.skill_unresolved");
+      metrics.onPlatformDefault("skill", outcome, reason);
+      await onEvent?.({ type: "toolUsed", tool: "platform_defaults", actionId: `platform_default_${entry.toolId}`, status: "error", brief });
+    };
+    if (!found.ok) {
+      await fail(found.reason === "lookup" ? "failed" : "skipped", found.reason, `Default skill ${entry.toolId} is unavailable (${found.reason === "lookup" ? "lookup failed" : "not found or not readable"})`);
       continue;
     }
+    const tool = found.tool;
+    if (tool.type !== "skill") { await fail("skipped", "not_skill", `Default tool ${entry.toolId} is not a skill`); continue; }
     const name = entry.name ?? String(tool.name ?? `tool_${entry.toolId}`);
     if (!SKILL_NAME_RE.test(name) || seen.has(name)) {
-      metrics.onPlatformDefault("skill", "skipped", seen.has(name) ? "duplicate_name" : "bad_name");
+      await fail("skipped", seen.has(name) ? "duplicate_name" : "bad_name", `Default skill ${entry.toolId} has an unusable name`);
       continue;
     }
+    const toolId = entry.toolId;
+    const version = versionKey(tool);
     try {
-      const localDir = await stageCached(entry.toolId, name, versionKey(tool), platformKey);
-      const md = findSkillMd(localDir);
-      if (!md) throw new Error("SKILL.md missing");
-      out.push({ name, toolId: entry.toolId, localDir, description: skillDescription(fs.readFileSync(md, "utf-8"), name) });
+      const localDir = await stageCached(toolId, name, version, platformKey);
+      const md = path.join(localDir, "SKILL.md");
+      out.push({
+        name, toolId, localDir,
+        description: skillDescription(fs.readFileSync(md, "utf-8"), name),
+        restage: () => stageCached(toolId, name, version, platformKey),
+      });
       seen.add(name);
       metrics.onPlatformDefault("skill", "ok", "staged");
     } catch (err) {
-      logger.warn({ toolId: entry.toolId, name, err: (err as Error).message }, "platform_defaults.skill_failed");
-      metrics.onPlatformDefault("skill", "failed", "download");
-      await onEvent?.({ type: "toolUsed", tool: "platform_defaults", actionId: `platform_default_${entry.toolId}`, status: "error", brief: `Failed to load default skill: ${name}` });
+      logger.warn({ toolId, name, err: (err as Error).message }, "platform_defaults.skill_failed");
+      await fail("failed", "download", `Failed to load default skill: ${name}`);
     }
   }
   return out;
@@ -298,9 +376,20 @@ export class LazyDefaultSkills {
       const t0 = Date.now();
       try {
         const base = rel ? path.posix.join(rel, ".skills", s.name) : path.posix.join(".skills", s.name);
-        const up = await uploadDirToSandbox(hands, s.localDir, base);
-        const shippable = up.total - up.skipped;
-        if (up.failed > 0 || (shippable > 0 && up.uploaded === 0)) throw new Error("upload failed");
+        const attempt = async () => {
+          const up = await uploadDirToSandbox(hands, s.localDir, base);
+          const shippable = up.total - up.skipped;
+          if (up.failed > 0 || (shippable > 0 && up.uploaded === 0) || up.total === 0) throw new Error("upload failed");
+        };
+        try {
+          await attempt();
+        } catch (first) {
+          // The staged copy may be gone; stage again rather than leave the
+          // agent with a skill the prompt promised.
+          if (!s.restage) throw first;
+          s.localDir = await s.restage();
+          await attempt();
+        }
         this.written.add(s.name);
         metrics.onPlatformSkillLazyWrite("ok", (Date.now() - t0) / 1000, coldSandbox);
       } catch (err) {
