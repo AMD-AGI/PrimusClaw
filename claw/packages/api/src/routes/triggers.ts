@@ -107,10 +107,13 @@ export async function registerTriggerRoutes(app: FastifyInstance): Promise<void>
     if (!check.ok) return reply.status(400).send({ ok: false, error: check.error });
     const r = await db.query(
       `UPDATE claw_triggers SET name=$3, prompt=$4, schedule=$5, timezone=$6, next_fire_at=$7,
-              credential_enc=$8, updated_at=NOW()
+              updated_at=NOW()
         WHERE trigger_id = $1 AND owner_user_id = $2 RETURNING ${PUBLIC_COLUMNS}`,
+      // The stored credential is left alone: only create and resume re-seal it,
+      // and both check that this request carries a key. An edit from a client
+      // that forwards none must not replace a working key with an empty one.
       [id, user.userId, name, prompt, schedule, timezone,
-        nextFireAfter(schedule, timezone, new Date()), sealCredentials(user)],
+        nextFireAfter(schedule, timezone, new Date())],
     );
     return { ok: true, data: r.rows[0] };
   });

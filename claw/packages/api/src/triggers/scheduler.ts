@@ -31,11 +31,12 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 
 async function recordFire(
   triggerId: string, key: string, owner: string, status: string, sessionId: string | null, detail: string | null,
+  messageId: string | null = null,
 ): Promise<void> {
   await db.query(
-    `UPDATE claw_trigger_fires SET status = $3, session_id = $4, detail = $5
+    `UPDATE claw_trigger_fires SET status = $3, session_id = $4, detail = $5, message_id = $6
       WHERE trigger_id = $1 AND fire_key = $2`,
-    [triggerId, key, status, sessionId, detail],
+    [triggerId, key, status, sessionId, detail, messageId],
   );
   void owner;
 }
@@ -112,7 +113,7 @@ export async function tickTriggers(now: Date = new Date()): Promise<void> {
 
     const outcome = await fireTrigger(t, planned);
     if (outcome.status === "started") {
-      await recordFire(t.trigger_id, key, t.owner_user_id, "started", outcome.sessionId, null);
+      await recordFire(t.trigger_id, key, t.owner_user_id, "started", outcome.sessionId, null, outcome.messageId);
       await db.query("UPDATE claw_triggers SET consecutive_failures = 0 WHERE trigger_id = $1", [t.trigger_id]);
       continue;
     }
@@ -147,8 +148,13 @@ export async function enforceRunTimeLimit(now: Date = new Date()): Promise<numbe
       WHERE f.status = 'started' AND f.session_id IS NOT NULL
         AND f.detail IS DISTINCT FROM 'time_limit'
         AND f.fired_at < $1
+        AND f.message_id IS NOT NULL
+        -- The turn this trigger started, not whichever turn the session is running
+        -- now: a user who continues the conversation later holds the gate under a
+        -- different message id, and that turn is theirs to run for as long as they like.
         AND EXISTS (SELECT 1 FROM claw_sessions s
-                     WHERE s.session_id = f.session_id AND s.agent_status = 'running')
+                     WHERE s.session_id = f.session_id AND s.agent_status = 'running'
+                       AND s.agent_gate_message_id = f.message_id)
       RETURNING f.session_id`,
     [new Date(now.getTime() - TRIGGER_RUN_TIME_LIMIT_SECONDS * 1000)],
   )).rows as Array<{ session_id: string }>;

@@ -1583,9 +1583,12 @@ export async function initDb(): Promise<void> {
           status      TEXT NOT NULL,
           fired_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           detail      TEXT,
+          message_id  TEXT,
           PRIMARY KEY (trigger_id, fire_key)
         )
       `);
+      // The turn the trigger started, so the time limit can tell it from a turn the user starts later.
+      await client.query("ALTER TABLE claw_trigger_fires ADD COLUMN IF NOT EXISTS message_id TEXT");
       await client.query("CREATE INDEX IF NOT EXISTS idx_trigger_fires_owner ON claw_trigger_fires(owner_user_id, fired_at)");
     }
 

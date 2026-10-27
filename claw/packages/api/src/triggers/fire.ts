@@ -59,7 +59,7 @@ export const triggerPorts = {
 };
 
 export type FireOutcome =
-  | { status: "started"; sessionId: string }
+  | { status: "started"; sessionId: string; messageId: string }
   | { status: "failed_start"; detail: string; credentialInvalid: boolean };
 
 export async function fireTrigger(trigger: TriggerRow, plannedAt: Date): Promise<FireOutcome> {
@@ -76,6 +76,17 @@ export async function fireTrigger(trigger: TriggerRow, plannedAt: Date): Promise
     throw err;
   }
   const messageId = newChatMessageId();
+  // The session is inserted already `running`, so anything that ends the fire
+  // without a run behind it has to take the row away again: left in place it
+  // makes `previousRunOpen` true for ever and the trigger silently never fires.
+  let inserted = false;
+  const rollback = async () => {
+    if (await releaseSessionRefs(sessionId) === "failed") {
+      logger.error({ sessionId }, "trigger.rollback_ref_release_failed");
+    }
+    await db.query("DELETE FROM claw_session_events WHERE session_id = $1", [sessionId]);
+    await db.query("DELETE FROM claw_sessions WHERE session_id = $1", [sessionId]);
+  };
   try {
     await insertSessionRow(db, {
       sessionId,
@@ -89,6 +100,7 @@ export async function fireTrigger(trigger: TriggerRow, plannedAt: Date): Promise
       role: "",
       gateMessageId: messageId,
     }, { parentSid: null });
+    inserted = true;
     const snapshot = await loadUserEnvSnapshot(db, user.userId, logger);
     const dispatch = await triggerPorts.dispatch(
       {
@@ -106,27 +118,22 @@ export async function fireTrigger(trigger: TriggerRow, plannedAt: Date): Promise
         capturedSessionEnv: {},
         reconcileAction: "delete_created_session",
       },
-      async () => {
-        if (await releaseSessionRefs(sessionId) === "failed") {
-          logger.error({ sessionId }, "trigger.rollback_ref_release_failed");
-        }
-        await db.query("DELETE FROM claw_session_events WHERE session_id = $1", [sessionId]);
-        await db.query("DELETE FROM claw_sessions WHERE session_id = $1", [sessionId]);
-      },
+      rollback,
     );
     if (dispatch.kind === "dispatched" || dispatch.kind === "queued" || dispatch.kind === "publish_unknown") {
-      return { status: "started", sessionId };
+      return { status: "started", sessionId, messageId };
     }
     if (dispatch.kind === "rejected") {
       // Admission said no; the session was created running and nothing will release it.
-      await db.query(
-        "DELETE FROM claw_session_events WHERE session_id = $1", [sessionId]);
-      await db.query("DELETE FROM claw_sessions WHERE session_id = $1", [sessionId]);
+      await rollback();
       return { status: "failed_start", detail: `admission_rejected: ${dispatch.reason}`.slice(0, 200), credentialInvalid: false };
     }
+    // The rollback callback has normally run already; deleting twice is harmless.
+    await rollback().catch((err) => logger.error({ err, sessionId }, "trigger.rollback_failed"));
     return { status: "failed_start", detail: "dispatch_failed", credentialInvalid: false };
   } catch (err) {
     logger.error({ err, triggerId: trigger.trigger_id }, "trigger.fire_failed");
+    if (inserted) await rollback().catch((e) => logger.error({ err: e, sessionId }, "trigger.rollback_failed"));
     return { status: "failed_start", detail: "internal_error", credentialInvalid: false };
   }
 }
