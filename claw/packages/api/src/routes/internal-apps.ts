@@ -7,6 +7,8 @@
  *   GET   /v1/internal/app-runs/:taskId           the run row plus what it was asked to do
  *   GET   /v1/internal/app-runs/:taskId/secrets   the MCP token and grant keys, opened
  *   PATCH /v1/internal/app-runs/:taskId           fenced state update (lease holder + claim epoch)
+ *   PUT   /v1/internal/app-runs/:taskId/mcp       record where the app's session MCP answers (fenced)
+ *   DELETE /v1/internal/app-runs/:taskId/mcp      remove that record (fenced; brain_id, claim_count in the query)
  *
  * Authentication is the cluster internal token, like the claim surface: there
  * is no per-run token because a Brain taking a run over does not yet hold one,
@@ -20,6 +22,7 @@
 import type { FastifyInstance } from "fastify";
 import pino from "pino";
 import { internalTokenAuth } from "../auth/middleware.js";
+import { MCP_URL_MAX, SANDBOX_SESSION_ID_MAX, recordSessionAppMcp, removeSessionAppMcp } from "../tasks/session-app-mcp.js";
 import {
   APP_RUN_STATES, LAST_EXIT_MAX_BYTES, patchAppRun, readAppRun, readAppRunSecrets,
   type AppRunPatch, type AppRunState,
@@ -106,6 +109,29 @@ const REFUSALS = {
   empty: { status: 400, error: "empty_patch" },
 } as const;
 
+const MCP_REFUSALS = {
+  not_found: { status: 404, error: "not_found" },
+  not_holder: { status: 409, error: "not_holder" },
+  ended: { status: 409, error: "ended" },
+  no_mcp: { status: 409, error: "no_mcp" },
+} as const;
+
+function parseFence(brainId: unknown, claimCount: unknown): { brainId: string; claimCount: number } | null {
+  if (typeof brainId !== "string" || !brainId || brainId.length > 200) return null;
+  if (typeof claimCount !== "number" || !Number.isInteger(claimCount) || claimCount < 0) return null;
+  return { brainId, claimCount };
+}
+
+/** http(s), a host, no credentials in the URL. */
+function isCleanHttpUrl(v: string): boolean {
+  try {
+    const u = new URL(v);
+    return (u.protocol === "http:" || u.protocol === "https:") && !!u.host && !u.username && !u.password;
+  } catch {
+    return false;
+  }
+}
+
 export async function registerInternalAppRoutes(app: FastifyInstance): Promise<void> {
   app.get<{ Params: { taskId: string } }>(
     "/v1/internal/app-runs/:taskId",
@@ -147,6 +173,33 @@ export async function registerInternalAppRoutes(app: FastifyInstance): Promise<v
       }
       const refusal = REFUSALS[outcome.reason];
       return reply.status(refusal.status).send({ ok: false, error: refusal.error, current_state: outcome.current });
+    },
+  );
+  app.put<{ Params: { taskId: string }; Body: unknown }>(
+    "/v1/internal/app-runs/:taskId/mcp",
+    { preHandler: internalTokenAuth },
+    async (req, reply) => {
+      const b = isObj(req.body) ? req.body : {};
+      const fence = parseFence(b.brain_id, b.claim_count);
+      if (!fence) return reply.status(400).send({ ok: false, error: "fence_invalid" });
+      const { url, sandbox_session_id: sid } = b;
+      if (typeof url !== "string" || url.length > MCP_URL_MAX || !isCleanHttpUrl(url)) return reply.status(400).send({ ok: false, error: "url_invalid" });
+      if (typeof sid !== "string" || !sid || sid.length > SANDBOX_SESSION_ID_MAX) return reply.status(400).send({ ok: false, error: "sandbox_session_id_invalid" });
+      const out = await recordSessionAppMcp(req.params.taskId, fence, { url, sandbox_session_id: sid });
+      if (out.ok) return { ok: true };
+      return reply.status(MCP_REFUSALS[out.reason].status).send({ ok: false, error: MCP_REFUSALS[out.reason].error });
+    },
+  );
+
+  app.delete<{ Params: { taskId: string }; Querystring: { brain_id?: string; claim_count?: string } }>(
+    "/v1/internal/app-runs/:taskId/mcp",
+    { preHandler: internalTokenAuth },
+    async (req, reply) => {
+      const fence = parseFence(req.query.brain_id, /^\d+$/.test(req.query.claim_count ?? "") ? Number(req.query.claim_count) : undefined);
+      if (!fence) return reply.status(400).send({ ok: false, error: "fence_invalid" });
+      const out = await removeSessionAppMcp(req.params.taskId, fence);
+      if (out.ok) return { ok: true, removed: out.removed ?? 0 };
+      return reply.status(MCP_REFUSALS[out.reason].status).send({ ok: false, error: MCP_REFUSALS[out.reason].error });
     },
   );
 }

@@ -367,6 +367,15 @@ export const CLAW_SKILL_EVOLUTION_ENABLED = envBool("CLAW_SKILL_EVOLUTION_ENABLE
 export const APP_RUNS_ENABLED = envBool("APP_RUNS_ENABLED", false);
 
 /**
+ * Whether the sandbox Router runs with `--enable-auth`. It decides what an
+ * application's session-level MCP carries as `token` when a turn is dispatched:
+ * with auth on, the `<SAFE_API_KEY>` placeholder, which Brain expands to the
+ * session owner's platform key; with auth off, the run's MCP token. Must match
+ * Brain's setting of the same name.
+ */
+export const SANDBOX_ROUTER_AUTH_ENABLED = envBool("SANDBOX_ROUTER_AUTH_ENABLED", false);
+
+/**
  * Platform caps on what an app run's grant may carry, as JSON of the grant
  * shape: `{"max_sandboxes":8,"max_gpus":8,"gpu_hours":500,"max_runtime_sec":172800}`.
  * Each grant item is the smallest of the request, the manifest's limit (where it

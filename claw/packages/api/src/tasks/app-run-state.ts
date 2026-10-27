@@ -31,6 +31,7 @@ import { APP_RUN_STATES, scrubSecrets, type AppRunState } from "@claw/protocol";
 import pino from "pino";
 import { db } from "../infra/db.js";
 import { openAppRunSecret } from "../crypto/app-run-secrets.js";
+import { dropSessionAppMcpOfRun } from "./session-app-mcp.js";
 
 const logger = pino({ name: "app-run-state" });
 
@@ -258,7 +259,11 @@ export async function patchAppRun(
                 t.input, t.sandbox_spec, t.workspace_id`,
     params,
   );
-  if (updated.rowCount === 1) return { ok: true, run: toView(updated.rows[0] as RunRow) };
+  if (updated.rowCount === 1) {
+    // The session's MCP of an ended run is gone with it, whoever ended it.
+    if (patch.state === "ended") await dropSessionAppMcpOfRun(taskId);
+    return { ok: true, run: toView(updated.rows[0] as RunRow) };
+  }
   const why = await db.query(
     `SELECT r.state, r.restarts, t.lease_owner, t.claim_count,
             (t.lease_expires_at > NOW()) AS lease_live

@@ -1839,6 +1839,21 @@ export async function initDb(): Promise<void> {
         logger.warn({ column: col, err: err instanceof Error ? err.message : String(err) }, "db.app_runs_alter_failed");
       });
     }
+    // Where a running application's session-level MCP answers (hosting design 5.8).
+    // The address and the sandbox's session id only: the MCP token stays sealed in
+    // claw_app_runs and is opened when a turn is dispatched.
+    await appRunsDdl(`
+      CREATE TABLE IF NOT EXISTS claw_session_app_mcp (
+        session_id           TEXT NOT NULL,
+        name                 TEXT NOT NULL,
+        app_task_id          TEXT NOT NULL,
+        url                  TEXT NOT NULL,
+        sandbox_session_id   TEXT NOT NULL,
+        updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (session_id, name)
+      )
+    `);
+    await appRunsDdl("CREATE INDEX IF NOT EXISTS idx_session_app_mcp_task ON claw_session_app_mcp(app_task_id)");
     await appRunsDdl("CREATE INDEX IF NOT EXISTS idx_app_runs_session ON claw_app_runs(session_id)");
     // The durable half of Idempotency-Key for app runs: the response cache
     // expires and can lose a write, this does not. Per session, matching the

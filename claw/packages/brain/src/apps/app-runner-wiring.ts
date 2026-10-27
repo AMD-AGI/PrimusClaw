@@ -10,6 +10,7 @@ import { getSafeWorkloadProvider } from "../sandbox/factory.js";
 import {
   AppRunner, noopAppGrant, type AppGrantRunHooks, type AppRunnerSeams, type AppSandboxOps,
 } from "./app-runner.js";
+import { appMcpSeams } from "./app-mcp.js";
 import { httpAppRunStore, type AppRunStore } from "./app-run-store.js";
 import {
   appSandboxInstance, ensureAppSandbox, findLiveAppSandboxes, readSandboxNodeName,
@@ -31,11 +32,11 @@ export function realAppSandbox(store: AppRunStore): AppSandboxOps {
 
 /** What a grant implementation or a later change plugs into. Bound once, at boot. */
 let boundGrant: AppGrantRunHooks = noopAppGrant;
-let boundSeams: AppRunnerSeams = {};
+let boundSeams: AppRunnerSeams = { ...appMcpSeams() };
 
 export function bindAppRunnerExtensions(ext: { grant?: AppGrantRunHooks; seams?: AppRunnerSeams }): void {
   if (ext.grant) boundGrant = ext.grant;
-  if (ext.seams) boundSeams = ext.seams;
+  if (ext.seams) boundSeams = { ...boundSeams, ...ext.seams };
 }
 
 /** `claimCount` is the epoch the caller holds the run at; every write to the row quotes it. */

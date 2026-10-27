@@ -166,7 +166,11 @@ export class World {
       return structuredClone(this.rec);
     },
     secrets: async (): Promise<AppRunSecrets> => ({ mcp_token: TOKEN, grant_keys: { measurement: KEY_M } }),
+    putMcp: async (_id, mcp) => { this.mcpRecord = { ...mcp }; },
+    deleteMcp: async () => { this.mcpRecord = null; },
   };
+  /** What the API holds in `claw_session_app_mcp` for the run. */
+  mcpRecord: { url: string; sandbox_session_id: string } | null = null;
 
   sandbox: AppSandboxOps = {
     ensure: async (run) => {

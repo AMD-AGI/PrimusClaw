@@ -30,6 +30,7 @@ import type { PoolClient } from "pg";
 import { decideAdmission, withOwnedAdmissionLock } from "../tasks/admission.js";
 import { admissionAskFor } from "../tasks/run-dispatch.js";
 import { stripRunSecrets } from "../tasks/run-spec.js";
+import { mergeAppMcpServers, sessionAppMcpServers } from "./app-mcp.js";
 import { ensureSessionWorkspace, requireWorkspaceBinding } from "../workspace/store.js";
 import pino from "pino";
 
@@ -143,7 +144,7 @@ export async function dispatchTaskToBrain(
   const {
     sessionId, userId, user, content, toolIds, pluginId,
     requestImage, requestResource, requestTimeout, workspaceId,
-    mcpServers, capturedUserEnvSnapshot, capturedSessionEnv, topology,
+    capturedUserEnvSnapshot, capturedSessionEnv, topology,
   } = input;
 
   const messageId = input.messageId ?? newChatMessageId();
@@ -290,6 +291,11 @@ export async function dispatchTaskToBrain(
       await db.query("UPDATE claw_sessions SET mode = 'local', updated_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL", [sessionId]);
     }
     logger.info({ sessionId, messageId, content: content.slice(0, 500), sandboxImage: finalSandboxImage || null }, "message.sandbox_image_parse");
+
+    // The session's hosted application MCP, at the lowest priority: a server of the
+    // same name in the request wins. Built now, not stored, so a queued turn never
+    // carries a token and an ended run's server is not offered.
+    const mcpServers = mergeAppMcpServers(await sessionAppMcpServers(sessionId), input.mcpServers);
 
     const task: Record<string, unknown> = {
       session_id: sessionId,

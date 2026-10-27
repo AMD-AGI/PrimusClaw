@@ -360,6 +360,11 @@ secret:
   # SaFE API key, so a Router with auth on answers 401 and Hands provisioning fails its
   # health check.
   sandboxHandsViaRouter: "false"
+  # Set "true" when the sandbox Router runs with --enable-auth (SANDBOX_ROUTER_AUTH_ENABLED).
+  # A hosted application's session-level MCP then carries the <SAFE_API_KEY> placeholder as
+  # its token, which Brain expands to the session owner's platform key; otherwise it carries
+  # the run's MCP token.
+  sandboxRouterAuthEnabled: "false"
   clawDeployRoot: ""
   workspacePersistBase: ""
   litellmApiBase: ""

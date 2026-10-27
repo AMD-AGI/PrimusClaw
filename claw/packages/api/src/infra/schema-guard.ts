@@ -146,6 +146,11 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     ],
   },
   {
+    table: "claw_session_app_mcp",
+    onlyWhenAppRuns: true,
+    columns: ["session_id", "name", "app_task_id", "url", "sandbox_session_id", "updated_at"],
+  },
+  {
     table: "claw_workspaces",
     // Every write against these is best-effort, so a missing table costs no
     // request -- which is exactly why it belongs here. The damage shows up

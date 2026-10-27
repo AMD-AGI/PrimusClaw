@@ -125,6 +125,10 @@ export const noopAppGrant: AppGrantRunHooks = {
 export interface AppRunContext {
   record: AppRunRecord;
   instance: SandboxInstance | null;
+  /** The run's store, at the epoch this worker holds the run at. */
+  store: AppRunStore;
+  /** The submitter's platform key: what the sandbox Router authenticates, when it does. */
+  platformKey: string;
 }
 
 /**
@@ -524,7 +528,7 @@ export class AppRunner {
       await this.move({ state: "starting" }, "running");
       return { done: false };
     }
-    if (verdict === "alive") await this.runningSeams({ record: this.rec, instance: inst });
+    if (verdict === "alive") await this.runningSeams(this.seamContext(inst));
     return { done: false };
   }
 
@@ -772,6 +776,10 @@ export class AppRunner {
 
   // ---- running ------------------------------------------------------------
 
+  private seamContext(instance: SandboxInstance | null): AppRunContext {
+    return { record: this.rec, instance, store: this.deps.store, platformKey: this.platformKey };
+  }
+
   private async runningSeams(ctx: AppRunContext): Promise<void> {
     for (const [name, seam] of [["tail_events", this.seams.tailEvents], ["register_mcp", this.seams.registerMcp]] as const) {
       if (!seam) continue;
@@ -789,7 +797,7 @@ export class AppRunner {
   private async inFinishing(): Promise<TickResult> {
     const rec = this.rec;
     const inst = this.instance();
-    const ctx: AppRunContext = { record: rec, instance: inst };
+    const ctx = this.seamContext(inst);
     const run: AppGrantRun = { runId: this.runId, sessionId: rec.session_id, grantId: rec.grant_id, manifest: rec.manifest };
     const cause = rec.last_exit?.cause ?? "exit";
     const cancelled = cause === "cancelled" || cause === "deadline" || cause === "row_terminal";
