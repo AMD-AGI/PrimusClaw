@@ -39,12 +39,14 @@ import type { AppManifestV1 } from "@claw/protocol";
 test("the fixture manifest is valid, or every case below is vacuous", () => {
   assert.deepEqual(validateAppManifest(MANIFEST), []);
 });
+const PLATFORM_KEY = "ak-platform-key-0123456789";
+
 
 function harness(opts: {
   manifest?: AppManifestV1; grant?: AppGrantRunHooks; seams?: AppRunnerSeams; over?: object;
 } = {}) {
   const world = new World(opts.manifest ?? MANIFEST, opts.over);
-  const runner = () => new AppRunner(RUN_ID, "pk", {
+  const runner = () => new AppRunner(RUN_ID, PLATFORM_KEY, {
     store: world.store, sandbox: world.sandbox, grant: opts.grant, seams: opts.seams,
     now: world.now, sleep: world.sleep, tickMs: 5000,
   });
@@ -530,7 +532,7 @@ test("E3 the grant hook adds keys and limits through env_map; its keys beat the 
   assert.equal(env.APP_GRANT_LIMITS, JSON.stringify({ max_sandboxes: 4, max_gpus: 8 }));
   assert.deepEqual(seen, [{
     runId: RUN_ID, sessionId: "sess-1", grantId: null, manifest: MANIFEST,
-    platformKey: "pk", workspaceId: "ws-1",
+    platformKey: PLATFORM_KEY, workspaceId: "ws-1",
   }]);
 });
 
@@ -845,6 +847,28 @@ test("a revoked grant is not signed again", async () => {
   assert.equal(h.world.starts.length, 1);
 });
 
+test("P6 the session owner's platform key, which the sandbox carries as the model credential, is scrubbed too", async () => {
+  const h = harness();
+  const wl = await toRunning(h);
+  const takeover = h.newRunner();
+  h.world.appExits(wl, { final: false, returncode: 2, error: `401 from gateway for key ${PLATFORM_KEY}` });
+  await takeover.reconcile();
+  assert.ok(!JSON.stringify(h.world.rec.last_exit).includes(PLATFORM_KEY), "the platform key is not stored");
+  assert.match(String(h.world.rec.last_exit?.error), /\[redacted\]/);
+});
+
+test("P6 the platform key is scrubbed even when the store's secrets cannot be read, and no text goes out half-scrubbed", async () => {
+  const h = harness();
+  const wl = await toRunning(h);
+  const takeover = h.newRunner();
+  h.world.store.secrets = async () => { throw new Error("API unavailable"); };
+  h.world.appExits(wl, { final: false, returncode: 2, error: `401 for key ${PLATFORM_KEY} and token ${TOKEN}` });
+  await takeover.reconcile().catch(() => undefined);
+  const stored = JSON.stringify(h.world.rec.last_exit ?? {});
+  assert.ok(!stored.includes(PLATFORM_KEY), "the platform key is not stored");
+  assert.ok(!stored.includes(TOKEN), "nor is anything else the unread set would have caught");
+});
+
 // ---------------------------------------------------------------------------
 // C2-09 review follow-ups: the status announcement, the drain, the scrub gate
 // ---------------------------------------------------------------------------
@@ -902,6 +926,7 @@ test("S3 the seams get a scrub only once the run's secrets are loaded", async ()
   const armed = seen.at(-1);
   assert.ok(armed, "armed once the secrets are known");
   assert.doesNotMatch(armed(`x ${TOKEN} y`), new RegExp(TOKEN));
+  assert.doesNotMatch(armed(`x ${PLATFORM_KEY} y`), new RegExp(PLATFORM_KEY), "the event tailer's scrub covers the platform key");
 
   // Another Brain takes the run over while the API cannot open the secrets.
   h.world.store.secrets = async () => { throw new Error("secrets unavailable"); };

@@ -1,6 +1,13 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+/**
+ * The Kubernetes spelling of the AMD GPU resource, which an app run's sandbox
+ * spec carries (`APP_GPU_RESOURCE` in @claw/protocol). SaFE's workload API takes
+ * the count as `gpu` and fills `gpuName` itself, exactly as it does for Hands.
+ */
+const GPU_RESOURCE_KEY = "amd.com/gpu";
+
 /** One element of POST /api/v1/workloads `resources` (SaFE shape). */
 export type WorkloadResourceEntry = Record<string, string | number>;
 
@@ -19,6 +26,7 @@ export function normalizeWorkloadResourcesEntry(d: unknown): WorkloadResourceEnt
   const out: WorkloadResourceEntry = {};
   if ("cpu" in obj) out.cpu = String(obj.cpu);
   if ("gpu" in obj) out.gpu = String(obj.gpu);
+  else if (GPU_RESOURCE_KEY in obj) out.gpu = String(obj[GPU_RESOURCE_KEY]);
   if ("memory" in obj) out.memory = String(obj.memory);
   if ("ephemeral-storage" in obj) {
     out.ephemeralStorage = String(obj["ephemeral-storage"]);
@@ -33,6 +41,7 @@ export function normalizeWorkloadResourcesEntry(d: unknown): WorkloadResourceEnt
     ) {
       continue;
     }
+    if (sk === GPU_RESOURCE_KEY) continue;
     if (sk.includes("/")) {
       out[sk] = String(val);
     }

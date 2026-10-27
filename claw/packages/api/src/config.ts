@@ -366,6 +366,36 @@ export const CLAW_MEMORY_ENABLED = envBool("CLAW_MEMORY_ENABLED", false);
 // recording, evolve worker, and skill-files cleanup are all short-circuited.
 export const CLAW_SKILL_EVOLUTION_ENABLED = envBool("CLAW_SKILL_EVOLUTION_ENABLED", false);
 
+// --- Outbound notifications (default OFF) ---
+// When false: no notification tables, routes, outbox writes or delivery loop.
+export const CLAW_NOTIFICATIONS_ENABLED = envBool("CLAW_NOTIFICATIONS_ENABLED", false);
+// Comma-separated hosts a subscription may name even though they resolve to a
+// private address (an in-cluster receiver). The only hosts where http is accepted.
+export const NOTIFY_WEBHOOK_ALLOWED_HOSTS = env("NOTIFY_WEBHOOK_ALLOWED_HOSTS");
+// A run that is not trigger-started is announced only once it ran this long.
+export const NOTIFY_MIN_RUN_SECONDS = envInt("NOTIFY_MIN_RUN_SECONDS", 60);
+// Prefix of the `link` field in a notification, relative to the web UI origin.
+export const NOTIFY_LINK_BASE = env("NOTIFY_LINK_BASE", "/primus-claw");
+
+/**
+ * Scheduled triggers: a cron schedule that starts a run as the user who created
+ * it. Off by default; when off no table is created, no route is registered and no
+ * loop is started.
+ */
+export const CLAW_TRIGGERS_ENABLED = envBool("CLAW_TRIGGERS_ENABLED", false);
+/** Smallest allowed gap between two firings of one schedule. */
+export const TRIGGER_MIN_INTERVAL_MINUTES = envInt("TRIGGER_MIN_INTERVAL_MINUTES", 15, { min: 1 });
+/** Triggers one user may own. */
+export const TRIGGER_MAX_PER_USER = envInt("TRIGGER_MAX_PER_USER", 20, { min: 1 });
+/** Runs one user's triggers may start in a rolling 24 hours. */
+export const TRIGGER_DAILY_LIMIT_PER_USER = envInt("TRIGGER_DAILY_LIMIT_PER_USER", 100, { min: 1 });
+/** How long a trigger-started run may take before the scheduler stops it. */
+export const TRIGGER_RUN_TIME_LIMIT_SECONDS = envInt("TRIGGER_RUN_TIME_LIMIT_SECONDS", 1800, { min: 1 });
+/** A planned firing older than this when the scheduler reaches it is skipped, not run late. */
+export const TRIGGER_STALE_AFTER_SECONDS = envInt("TRIGGER_STALE_AFTER_SECONDS", 900, { min: 1 });
+/** Consecutive failed starts before a trigger pauses itself. */
+export const TRIGGER_MAX_CONSECUTIVE_FAILURES = envInt("TRIGGER_MAX_CONSECUTIVE_FAILURES", 3, { min: 1 });
+
 /**
  * Accept `mode: "app"` on `POST /v1/sessions/:sessionId/tasks`. Off by default:
  * until the Brain side runs apps, an admitted app run is refused there as not

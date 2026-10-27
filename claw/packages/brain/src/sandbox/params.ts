@@ -339,7 +339,17 @@ export function applyPlatformKeyEnv(
 ): void {
   delete env.SAFE_API_KEY;
   if (!apiKey) return;
+  applyModelKeyEnv(env, apiKey);
+  if (!kubernetesMode) env.SAFE_API_KEY = apiKey;
+}
+
+/**
+ * Only the two model variables, under the conventional Anthropic / OpenAI
+ * names, without `SAFE_API_KEY`. In safe mode the value is still the caller's
+ * platform key (see applyPlatformKeyEnv).
+ */
+export function applyModelKeyEnv(env: Record<string, string>, apiKey: string | undefined): void {
+  if (!apiKey) return;
   env.ANTHROPIC_API_KEY = apiKey;
   env.OPENAI_API_KEY = apiKey;
-  if (!kubernetesMode) env.SAFE_API_KEY = apiKey;
 }

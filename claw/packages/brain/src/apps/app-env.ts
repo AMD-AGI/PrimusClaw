@@ -217,8 +217,9 @@ export function buildAppEnv(s: AppEnvSources): Record<string, string> {
 }
 
 /** Every secret value an environment built from these sources carries. */
-export function secretValuesOf(s: Pick<AppEnvSources, "mcpToken" | "grantKeys">): string[] {
-  return [s.mcpToken, ...Object.values(s.grantKeys)].filter((v): v is string => typeof v === "string" && v.length > 0);
+export function secretValuesOf(s: Pick<AppEnvSources, "mcpToken" | "grantKeys"> & { platformKey?: string }): string[] {
+  // platformKey: the session owner's key the sandbox carries as the model credential.
+  return [s.mcpToken, s.platformKey, ...Object.values(s.grantKeys)].filter((v): v is string => typeof v === "string" && v.length > 0);
 }
 
 /** `text` with every secret value replaced (the shared rule; see protocol `scrubText`). */
