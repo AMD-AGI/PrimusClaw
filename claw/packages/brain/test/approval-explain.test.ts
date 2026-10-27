@@ -15,13 +15,14 @@ import type { ToolRouter } from "../src/tools/router.js";
 import { agentLoop, type LoopOptions } from "../src/agent/agent-loop.js";
 import { HitlController } from "../src/agent/hitl.js";
 import {
-  cleanSummary, clipIntent, explainApproval, firstSentence, latestUserText, maskArguments, summaryPrompt,
+  cleanSummary, clipIntent, credentialValues, explainApproval, firstSentence, latestUserText, maskArguments, scrub,
+  summaryPrompt,
   type ApprovalExplainContext,
 } from "../src/agent/approval-explain.js";
 import type { NatsDecisionMessage } from "../src/delivery/decision-dispatcher.js";
 
 const TOOL = "mcp__ops__patch_plans_plan_id_labels";
-const INPUT = { plan_id: 85, labels: { env: "test" }, reason: "ui check", api_token: "tok-SECRET-VALUE-123456" };
+const INPUT = { plan_id: 85, labels: { tier: "test" }, reason: "ui check", api_token: "tok-SECRET-VALUE-123456" };
 
 // --- the pure helpers, as tables -------------------------------------------------------------
 
@@ -323,4 +324,76 @@ test("the loop's summary call is the session's own complete(), with the user's l
   assert.match(seen[0].user, /给计划 85 加个标签/);
   assert.ok(seen[0].max <= 200);
   assert.ok(seen[0].signal, "a budget signal is passed");
+});
+
+// --- review round 1: the decision window, an abort during the summary, a value the user typed -----------
+
+test("the decision window opens after the explanation: register() is called once the summary has settled", async () => {
+  const order: string[] = [];
+  const d = {
+    register: async (req: { actionId: string }) => {
+      order.push("register");
+      return { type: "decision", session_id: "s", action_id: req.actionId, decision: "allow" } as NatsDecisionMessage;
+    },
+  };
+  const events: Array<Record<string, unknown>> = [];
+  const c = new HitlController(d as never, async (e) => { order.push(String(e.type)); events.push(e as never); },
+    { requireApproval: (t) => t === TOOL });
+  await c.beforeToolUse(request(ctx(async () => { await new Promise((r) => setTimeout(r, 120)); order.push("summary"); return "Stop it"; })));
+  assert.deepEqual(order, ["summary", "register", "permissionRequest", "decisionResult"]);
+});
+
+test("a run aborted while the summary is being written is denied as aborted, never asked and never left waiting", { timeout: 15_000 }, async () => {
+  const registered: string[] = [];
+  const d = { register: async (req: { actionId: string }) => { registered.push(req.actionId); return new Promise<NatsDecisionMessage>(() => {}); } };
+  const events: Array<Record<string, unknown>> = [];
+  const c = new HitlController(d as never, async (e) => { events.push(e as never); }, { requireApproval: (t) => t === TOOL });
+  const controller = new AbortController();
+  const started = Date.now();
+  const result = c.beforeToolUse({ ...request(ctx(() => new Promise<string>(() => {}))), signal: controller.signal });
+  setTimeout(() => controller.abort(), 50);
+  const r = await result;
+  assert.deepEqual([r.action, (r as { cause?: string }).cause], ["deny", "aborted"]);
+  assert.ok(Date.now() - started < 1500, `took ${Date.now() - started} ms`);
+  assert.deepEqual(registered, [], "nothing was registered for a request that was never shown");
+  assert.ok(!events.some((e) => e.type === "permissionRequest"));
+});
+
+test("a value typed under a credential-named argument is not repeated in the prompt, the intent or the summary", async () => {
+  const input = { workload_id: "w1", password: "hunter2", nested: { api_key: "k-abcd-1234" }, reason: "rotate" };
+  const seen: string[] = [];
+  const out = await explainApproval("mcp__ops__rotate", input, {
+    intent: "I will set the password to hunter2 and the key to k-abcd-1234 on w1",
+    userText: "please set password hunter2 on w1",
+    complete: async (_s, user) => { seen.push(user); return "Set the password hunter2 on w1 (key k-abcd-1234)"; },
+  }, { enabled: true, timeoutMs: 1000 });
+  assert.ok(!seen[0].includes("hunter2") && !seen[0].includes("k-abcd-1234"), seen[0]);
+  assert.match(seen[0], /w1/);
+  const text = JSON.stringify(out);
+  assert.ok(!text.includes("hunter2") && !text.includes("k-abcd-1234"), text);
+  assert.match(out.summary!, /Set the password \[hidden\] on w1/);
+});
+
+test("credentialValues and scrub, as a table", () => {
+  const rows: Array<[unknown, string[]]> = [
+    [{ password: "hunter2" }, ["hunter2"]],
+    [{ pwd: "p4ss" }, ["p4ss"]],
+    [{ a: { token: { x: ["abcd", "ef"] } } }, ["abcd"]],           // under a credential name, at any depth; under 4 chars is not hunted
+    [{ plan_id: 85, reason: "why" }, []],
+    [{ token: 12345 }, ["12345"]],
+    [null, []],
+    ["plain", []],
+  ];
+  for (const [input, want] of rows) assert.deepEqual(credentialValues(input), want, JSON.stringify(input));
+  assert.equal(scrub("a hunter2 b hunter2-long", ["hunter2", "hunter2-long"]), "a [hidden] b [hidden]");
+  assert.equal(scrub("nothing here", []), "nothing here");
+  assert.equal(clipIntent("use hunter2", ["hunter2"]), "use [hidden]");
+  assert.equal(cleanSummary("use hunter2", ["hunter2"]), "use [hidden]");
+});
+
+test("a bare pwd argument is a credential here (a tool argument, not the shell's working directory)", () => {
+  const out = maskArguments({ pwd: "hunter2", cwd: "/work", PWD: "x" }) as Record<string, unknown>;
+  assert.equal(out.pwd, "[hidden]");
+  assert.equal(out.PWD, "[hidden]");
+  assert.equal(out.cwd, "/work");
 });

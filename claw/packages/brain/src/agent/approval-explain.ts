@@ -86,9 +86,42 @@ export function firstSentence(description: unknown, max = DESCRIPTION_MAX_CHARS)
 }
 
 /** The agent's own words before the call: one line, credential shapes masked, clipped. */
-export function clipIntent(text: unknown): string | undefined {
-  const line = flat(text);
+export function clipIntent(text: unknown, secrets: readonly string[] = []): string | undefined {
+  const line = scrub(flat(text), secrets);
   return line ? clip(redactSecrets(line).text, INTENT_MAX_CHARS) : undefined;
+}
+
+/** Whether an argument NAME reads as a credential: the rule events are redacted with, plus a bare `pwd`, which
+ *  the event rule leaves out because `PWD` is the shell's working directory in an environment, but which as the
+ *  name of a tool argument is a password far more often than a path. */
+function isCredentialName(key: string): boolean {
+  return isSensitiveKey(key) || key.toLowerCase() === "pwd";
+}
+
+const MIN_SECRET_CHARS = 4;
+
+/** Every string under a credential-named argument, at any depth: the values that must never be repeated in any
+ *  text about the call (the agent's words, the user's request, the summary). */
+export function credentialValues(value: unknown, underSecret = false, depth = 0, out: string[] = []): string[] {
+  if (depth > 6 || value === null || value === undefined) return out;
+  if (typeof value === "string" || typeof value === "number") {
+    const text = String(value);
+    if (underSecret && text.length >= MIN_SECRET_CHARS) out.push(text);
+  } else if (Array.isArray(value)) {
+    for (const v of value.slice(0, 100)) credentialValues(v, underSecret, depth + 1, out);
+  } else if (typeof value === "object") {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>).slice(0, 100)) {
+      credentialValues(v, underSecret || isCredentialName(k), depth + 1, out);
+    }
+  }
+  return out;
+}
+
+/** `text` with every occurrence of each secret replaced; longest first, so one inside another goes whole. */
+export function scrub(text: string, secrets: readonly string[]): string {
+  let out = text;
+  for (const secret of [...new Set(secrets)].sort((a, b) => b.length - a.length)) out = out.split(secret).join(HIDDEN);
+  return out;
 }
 
 /**
@@ -103,7 +136,7 @@ export function maskArguments(value: unknown, depth = 0): unknown {
   if (Array.isArray(value)) return value.slice(0, MAX_ITEMS).map((v) => maskArguments(v, depth + 1));
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(value as Record<string, unknown>).slice(0, MAX_ITEMS)) {
-    out[k] = isSensitiveKey(k) ? HIDDEN : maskArguments(v, depth + 1);
+    out[k] = isCredentialName(k) ? HIDDEN : maskArguments(v, depth + 1);
   }
   return out;
 }
@@ -134,19 +167,20 @@ export const SUMMARY_SYSTEM = [
 
 export function summaryPrompt(tool: string, input: Record<string, unknown>, ctx: ApprovalExplainContext): string {
   const args = JSON.stringify(maskArguments(input));
+  const secrets = credentialValues(input);
   return [
     `Tool: ${tool}`,
     `Tool description: ${firstSentence(ctx.toolDescription) ?? "(none)"}`,
     `Arguments (JSON, secrets hidden): ${clip(args, ARGS_MAX_CHARS)}`,
-    `The agent said just before the call: ${clipIntent(ctx.intent) ?? "(nothing)"}`,
-    `The user's request, for language only: ${ctx.userText ? clip(redactSecrets(flat(ctx.userText)).text, USER_TEXT_MAX_CHARS) : "(unknown)"}`,
+    `The agent said just before the call: ${clipIntent(ctx.intent, secrets) ?? "(nothing)"}`,
+    `The user's request, for language only: ${ctx.userText ? clip(redactSecrets(scrub(flat(ctx.userText), secrets)).text, USER_TEXT_MAX_CHARS) : "(unknown)"}`,
   ].join("\n");
 }
 
 /** One line of plain text: no markdown emphasis, no wrapping quotes, bounded. */
-export function cleanSummary(raw: string): string | undefined {
+export function cleanSummary(raw: string, secrets: readonly string[] = []): string | undefined {
   let s = flat(raw).replace(/[*_`#]+/g, "").replace(/^["'“”‘’「」]+|["'“”‘’「」]+$/gu, "").trim();
-  s = redactSecrets(s).text;
+  s = redactSecrets(scrub(s, secrets)).text;
   return s ? clip(s, SUMMARY_MAX_CHARS) : undefined;
 }
 
@@ -164,16 +198,24 @@ async function summarize(
   const signal = outer ? AbortSignal.any([outer, budget]) : budget;
   const started = Date.now();
   let timer: NodeJS.Timeout | undefined;
+  let onAbort: (() => void) | undefined;
   try {
-    // The race is the budget; the signal also stops the request itself. A
-    // completer that ignores the signal still cannot hold the card back.
+    // The race is the budget, and a stopped run ends it at once; the signal also stops the
+    // request itself. A completer that ignores the signal still cannot hold the card back.
     const call = (async () => complete(SUMMARY_SYSTEM, summaryPrompt(tool, input, ctx), SUMMARY_MAX_TOKENS, signal))();
     call.catch(() => { /* settled below or abandoned by the race; never unhandled */ });
+    const stopped = new Promise<never>((_, reject) => {
+      if (!outer) return;
+      onAbort = () => reject(new Error("summary_aborted"));
+      outer.addEventListener("abort", onAbort, { once: true });
+    });
+    stopped.catch(() => { /* only ever awaited through the race */ });
     const raw = await Promise.race([
       call,
+      stopped,
       new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("summary_timeout")), timeoutMs); }),
     ]);
-    const summary = cleanSummary(raw);
+    const summary = cleanSummary(raw, credentialValues(input));
     logger.info({ tool, ms: Date.now() - started, outcome: summary ? "ok" : "empty" }, "approval.summary");
     return summary;
   } catch (err) {
@@ -183,6 +225,7 @@ async function summarize(
     return undefined;
   } finally {
     if (timer) clearTimeout(timer);
+    if (onAbort) outer?.removeEventListener("abort", onAbort);
   }
 }
 
@@ -198,7 +241,7 @@ export async function explainApproval(
     const out: ApprovalExplanation = {};
     const description = firstSentence(ctx.toolDescription);
     if (description) out.tool_description = description;
-    const intent = clipIntent(ctx.intent);
+    const intent = clipIntent(ctx.intent, credentialValues(input));
     if (intent) out.intent = intent;
     if (opts.enabled ?? HITL_SUMMARY_ENABLED) {
       const summary = await summarize(tool, input, ctx, opts.timeoutMs ?? HITL_SUMMARY_TIMEOUT_MS, opts.signal);

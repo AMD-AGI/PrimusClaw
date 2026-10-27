@@ -138,6 +138,16 @@ export class HitlController {
     // Non-null by the guard above: willAsk() is false when there is no
     // dispatcher, because there is then nobody who could answer.
     const dispatcher = this.dispatcher!;
+    // Words for the person who has to decide, within a fixed budget. It runs BEFORE the
+    // decision window opens: nobody can answer a request that has not been shown, so
+    // the time it takes must not be taken from the person's time (with a short
+    // HITL_DECISION_TIMEOUT_MS and the default "allow" on timeout, it would otherwise
+    // expire before anyone was asked). It never throws; without it the request below
+    // is exactly what it was.
+    const explained = await explainApproval(req.tool, req.input, req.explain, { signal: req.signal });
+    // register() only hears an abort that happens after it, so one that came during
+    // the explanation is answered here, the way the abort path answers it.
+    if (req.signal?.aborted) return { action: "deny", reason: "aborted", by: "timeout", cause: "aborted" };
     // Registered before the request is shown: an answer that arrives first
     // would otherwise find nothing pending and be dropped.
     const pending = dispatcher.register({
@@ -149,9 +159,6 @@ export class HitlController {
     pending.catch(() => { /* consumed below; this only keeps an early failure from being unhandled */ });
 
     try {
-      // Words for the person who has to decide, within a fixed budget; it
-      // never throws, and without it the request below is exactly what it was.
-      const explained = await explainApproval(req.tool, req.input, req.explain, { signal: req.signal });
       await this.onEvent({
         type: "permissionRequest",
         ...explained,
