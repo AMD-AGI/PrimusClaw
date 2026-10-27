@@ -151,7 +151,7 @@ spec:
                 matchLabels:
                   app: primus-claw
                   component: primus-claw-brain
-      {{- if or (and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml) .Values.tls.extraCACertsConfigMap }}
+      {{- if or (and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml) .Values.tls.extraCACertsConfigMap .Values.brain.extraVolumes }}
       volumes:
       {{- if and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
       - name: sandbox-template
@@ -165,6 +165,9 @@ spec:
           items:
           - key: {{ required "tls.extraCACertsKey must be set when tls.extraCACertsConfigMap is set" .Values.tls.extraCACertsKey | quote }}
             path: ca.crt
+      {{- end }}
+      {{- with .Values.brain.extraVolumes }}
+      {{- toYaml . | nindent 6 }}
       {{- end }}
       {{- end }}
       containers:
@@ -316,7 +319,10 @@ spec:
         # of them and the sandbox never starts.
         - name: HANDS_ENV_FILE_WAIT_SEC
           value: {{ .Values.brain.handsEnvFileWaitSec | quote }}
-        {{- if or (and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml) .Values.tls.extraCACertsConfigMap }}
+        {{- with .Values.brain.extraEnv }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if or (and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml) .Values.tls.extraCACertsConfigMap .Values.brain.extraVolumeMounts }}
         volumeMounts:
         {{- if and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
         - name: sandbox-template
@@ -327,6 +333,9 @@ spec:
         - name: extra-ca
           mountPath: /etc/claw-ca
           readOnly: true
+        {{- end }}
+        {{- with .Values.brain.extraVolumeMounts }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
         {{- end }}
         startupProbe:
