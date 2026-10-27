@@ -37,6 +37,7 @@ import { SESSION_ENV } from "../sandbox/multi-node/safe-body.js";
 import { ACTIVE_PHASES, TERMINAL_PHASES } from "../sandbox/workload-wait.js";
 import { pollWorkloadUntilRunning, SHUTDOWN_BUFFER_SECONDS } from "../sandbox/safe-workload-provider.js";
 import type { SandboxInstance } from "../sandbox/provider.js";
+import { applyModelKeyEnv } from "../sandbox/params.js";
 
 const logger = pino({ name: "app-sandbox" });
 
@@ -155,6 +156,28 @@ function withoutSessionEnv(env: Record<string, string> | undefined): Record<stri
   return rest;
 }
 
+/**
+ * The env the sandbox is created with: the spec's, the run's identity, and the
+ * model credential Hands sandboxes get: `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`
+ * (applyModelKeyEnv; platform-owned, so it wins over the spec).
+ *
+ * In SaFE mode that key is the session owner's SaFE platform key. Code in the
+ * sandbox can use it to call the SaFE API as the session owner, exactly as it can
+ * in a Hands sandbox. The run's AppRunner scrubs it from forwarded output and it
+ * is never stored in `claw_app_runs`.
+ *
+ * Only those two variables carry it: `SAFE_API_KEY` is not set (and one a spec
+ * supplies is dropped), and no gateway URL is injected (the SaFE path leaves URLs
+ * to the image / the manifest's env, so a manifest can point its agent elsewhere;
+ * see ensureHands).
+ */
+export function appSandboxEnv(run: Pick<AppSandboxRun, "runId" | "sandboxSpec" | "platformKey">): Record<string, string> {
+  const env: Record<string, string> = { ...withoutSessionEnv(run.sandboxSpec.env), [APP_RUN_ID_ENV]: run.runId };
+  delete env.SAFE_API_KEY;
+  applyModelKeyEnv(env, run.platformKey);
+  return env;
+}
+
 const appSandboxNamespace = (run: Pick<AppSandboxRun, "workspaceId">): string =>
   run.workspaceId?.trim() || SANDBOX_NAMESPACE;
 
@@ -257,7 +280,7 @@ export async function ensureAppSandbox(run: AppSandboxRun, deps: AppSandboxDeps)
       // findSessionWorkloads) matches on exactly that env, and session teardown
       // deletes what it finds. This sandbox is the run's AppRunner's alone, so it
       // must not be reachable that way (the session label still attributes it).
-      env: { ...withoutSessionEnv(spec.env), [APP_RUN_ID_ENV]: run.runId },
+      env: appSandboxEnv(run),
       labels: appSandboxLabels(run),
       // A manifest that names no timeout still gets the platform's default, not the
       // longest session the provider allows. The provider adds its shutdown buffer to
