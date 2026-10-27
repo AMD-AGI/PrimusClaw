@@ -76,7 +76,7 @@ import { settleClaimedRun } from "../clients/run-claim.js";
 import { beginRun, endRun, phaseOf, runTimeOf } from "./run-phase.js";
 import { resolveRunIdentity, type RunIdentity, taskIdFromLease } from "./run-identity.js";
 import {
-  activeAbort, markGracefulStop, LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON,
+  activeAbort, markGracefulStop, LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON, isUserCancelReason,
   DEADLINE_EXCEEDED_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON,
 } from "./abort-registry.js";
 import { pickRunScope, pickShellRun, refreshTaskLock, releaseTaskLock } from "./lock.js";
@@ -1803,6 +1803,7 @@ class TaskRunner {
     const { handsUrl: newUrl, token: newToken, identity: newIdentity } = await fx().ensureHands(
       this.sessionId, this.request, this.platformKey, this.onEvent, this.multiNodeContext ?? undefined,
       { skipSessionReuse: true, signal: this.abortCtrl.signal,
+        reclaimOnAbort: () => this.abortReclaimsSandbox(),
         attemptId: this.attempt.attemptId },
     );
     const newHands = fx().makeHandsClient(
@@ -1997,6 +1998,16 @@ class TaskRunner {
    * is what aborted us; `leaseLost` carries it when something else had already
    * aborted and taken that slot.
    */
+  /**
+   * Whether a sandbox wait cut short by this run's abort may reclaim what it was
+   * provisioning: only for a user's cancel, and only while this replica still
+   * owns the run. A restart or a lease loss hands the sandbox to the next run, and
+   * a deadline or terminal row is settled by the failure path.
+   */
+  private abortReclaimsSandbox(): boolean {
+    return this.stillOwnsLock() && isUserCancelReason(this.abortCtrl.signal.reason);
+  }
+
   private stillOwnsLock(): boolean {
     return !this.leaseLost
       && this.abortCtrl.signal.reason !== LEASE_LOST_ABORT_REASON;
@@ -2468,7 +2479,8 @@ class TaskRunner {
         this.sessionId,
         this.request,
         this.onEvent,
-        { deliveryCount: this.msg.info.deliveryCount, platformKey: this.platformKey },
+        { deliveryCount: this.msg.info.deliveryCount, platformKey: this.platformKey, signal: this.abortCtrl.signal,
+          reclaimOnAbort: () => this.abortReclaimsSandbox() },
       );
     }
 
@@ -2488,7 +2500,8 @@ class TaskRunner {
     this.sandboxAsked = true;
     const { handsUrl, created, token: handsToken, identity } = await fx().ensureHands(
       this.sessionId, this.request, this.platformKey, this.onEvent, this.multiNodeContext ?? undefined,
-      { signal: this.abortCtrl.signal, attemptId: this.attempt.attemptId },
+      { signal: this.abortCtrl.signal, reclaimOnAbort: () => this.abortReclaimsSandbox(),
+        attemptId: this.attempt.attemptId },
     );
     logger.info({ sessionId: this.sessionId, messageId: this.messageId, created, handsUrl }, "task.sandbox_ready");
     this.handsUrl = handsUrl;
@@ -2855,6 +2868,7 @@ class TaskRunner {
           resumeCheckpoint: this.resumeCheckpoint,
           attachHands: this.attachHands,
           runIdentity: this.runIdentity,
+          natsConnection: getDeps().emitter.nc,
         });
       }
     } finally {

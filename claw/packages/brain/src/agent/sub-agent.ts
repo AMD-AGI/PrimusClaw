@@ -58,6 +58,8 @@ export interface RunSubagentOptions {
   parentSchemas: ToolSchema[];
   hands: HandsClient;
   platformMcpClients?: Map<string, { callTool: (name: string, args: Record<string, unknown>) => Promise<string> }>;
+  /** The parent's approval gate: a sub-agent must not be a way around it. */
+  hitl?: import("./hitl.js").HitlController;
   onEvent: EventCallback;
   signal?: AbortSignal;
   /** Parent agent-loop's ToolRouter. When supplied, the sub-agent's router is
@@ -205,6 +207,7 @@ export async function runSubagent(opts: RunSubagentOptions): Promise<SubagentRes
       // Sub-agents forbid further nesting (enforced by agent-loop via depth).
       depth: opts.depth,
       hooks: opts.hooks,
+      hitl: opts.hitl,
       // Forwarded, never re-derived: these waits belong to the parent's run.
       runIdentity: opts.runIdentity,
     });

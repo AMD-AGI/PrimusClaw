@@ -171,6 +171,21 @@ export const RUN_ROW_TERMINAL_ABORT_REASON = Symbol("run_row_terminal");
 export const DEADLINE_EXCEEDED_ABORT_REASON = Symbol("deadline_exceeded");
 
 /**
+ * Whether an abort reason is a user's cancel, as against a reason the run settles
+ * on its own: a handover (graceful restart, a successor taking over -- the next
+ * run adopts what this one was provisioning) or the run's own ending (deadline,
+ * terminal row -- the failure path reads the platform's account of the sandbox
+ * before it reaps it). Only a cancel may have a sandbox wait reclaim what it was
+ * waiting on.
+ */
+export function isUserCancelReason(reason: unknown): boolean {
+  return reason !== SIGTERM_ABORT_REASON
+    && reason !== LEASE_LOST_ABORT_REASON
+    && reason !== RUN_ROW_TERMINAL_ABORT_REASON
+    && reason !== DEADLINE_EXCEEDED_ABORT_REASON;
+}
+
+/**
  * Externally abort the in-flight task for a session, if any. Used by
  * sandbox-keepalive when consecutive ping failures indicate the Hands
  * sandbox is gone — without this the agent loop happily blocks for up to

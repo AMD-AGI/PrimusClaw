@@ -19,6 +19,7 @@ import type { ExecuteRequest } from "@claw/protocol";
 import {
   AUTH_INTERNAL_TOKEN,
   MULTI_NODE_DEFAULT_TIMEOUT_SECONDS,
+  MULTI_NODE_START_TIMEOUT_MS,
   SAFE_API_URL,
 } from "../../config.js";
 import { normalizeWorkloadTimeout, resolveSandboxImageFromRequest } from "../ensure-hands.js";
@@ -360,7 +361,7 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
         }).catch(() => {});
       }
 
-      const detail = await this.waitForRunning(sessionId, workloadId, displayName, apiKey, namespace, spec, onEvent);
+      const detail = await this.waitForRunning(sessionId, workloadId, displayName, apiKey, namespace, spec, onEvent, undefined, opts?.signal, opts?.reclaimOnAbort);
 
       logger.info({ sessionId, workloadId, backend: spec.backend }, "mn.safe_ready");
       await onEvent({
@@ -392,6 +393,10 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
       // naming nothing is what would leave one holding GPUs with no handle to
       // look it up by or delete it with.
       const workloadName = workloadId ?? (create.posted ? messageId : "");
+      // A user's Stop is not a cluster that failed to come up: the wait has
+      // already deleted what it was waiting on, and the run's own cancel path
+      // reports the ending.
+      if (opts?.signal?.aborted) throw err;
       await onEvent({
         type: "sandboxStatus",
         status: mnStatus(spec.backend, "failed"),
@@ -670,9 +675,13 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
     spec: MultiNodePromptSpec,
     onEvent: MultiNodeEventSink,
     deps?: WorkloadWaitDeps,
+    signal?: AbortSignal,
+    reclaimOnAbort?: () => boolean,
   ): Promise<Record<string, unknown>> {
     return await waitForWorkloadReady({
       workloadId,
+      signal,
+      reclaimOnAbort,
       apiKey,
       logPrefix: "mn.safe",
       isReady: (detail) => {
@@ -702,7 +711,8 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
           mn_backend: spec.backend,
         }).catch(() => {});
       },
-      deps,
+      // This path's own ceiling, not the sandbox's: see MULTI_NODE_START_TIMEOUT_MS.
+      deps: { ...deps, startTimeoutMs: deps?.startTimeoutMs ?? MULTI_NODE_START_TIMEOUT_MS },
     });
   }
 
