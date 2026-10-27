@@ -189,6 +189,8 @@ function toSegment(tokens: string[], echoRuns: boolean): Segment | null {
     const t = tokens[i];
     // `function NAME` defines a function: neither word is the program; the body follows.
     if (t === "function") { i += 2; continue; }
+    // A leading redirection (`> out curl ...`, `2>/dev/null curl ...`) is not the program.
+    if (/^\d*(>>?|<<?<?|>&|<&|>\||<>)/.test(t)) { i += /^\d*(>>?|<<?<?|>&|<&|>\||<>)$/.test(t) ? 2 : 1; continue; }
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t) || KEYWORDS.has(t)) { i++; continue; }
     const base = t.split("/").pop()!;
     const w = Object.hasOwn(WRAPPERS, base) ? WRAPPERS[base] : undefined;
@@ -276,16 +278,19 @@ const CURL_VALUE_FLAGS = new Set([
 const CURL_BODY_FLAGS = /^(-d|--data(-raw|-binary|-ascii|-urlencode)?|-F|--form(-string)?|--json)$/;
 const CURL_UPLOAD_FLAGS = /^(-T|--upload-file)$/;
 
-interface Http { method: string; urls: string[] }
+/** `opaque`: the request is described by a file this matcher cannot read (curl -K), so any http rule holds it. */
+interface Http { method: string; urls: string[]; opaque?: boolean }
 
 function curlInfo(rawArgv: string[]): Http {
   const argv = expandShortFlags(rawArgv, "XdFTHuoAebcmxwrzEK");
   let method: string | null = null;
   let body = false, get = false, head = false, upload = false;
   const urls: string[] = [];
+  let opaque = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--") { urls.push(...argv.slice(i + 1)); break; }
+    if (a === "-K" || a === "--config" || a.startsWith("--config=")) { opaque = true; if (!a.includes("=")) i++; continue; }
     if (a === "-X" || a === "--request") { method = (argv[++i] ?? "").toUpperCase(); continue; }
     if (a.startsWith("--request=")) { method = a.slice(10).toUpperCase(); continue; }
     if (/^-X./.test(a)) { method = a.slice(2).toUpperCase(); continue; }
@@ -302,7 +307,7 @@ function curlInfo(rawArgv: string[]): Http {
     if (a.startsWith("-")) continue;
     urls.push(a);
   }
-  return { method: method || (head ? "HEAD" : upload ? "PUT" : body && !get ? "POST" : "GET"), urls };
+  return { method: method || (head ? "HEAD" : upload ? "PUT" : body && !get ? "POST" : "GET"), urls, ...(opaque ? { opaque } : {}) };
 }
 
 function wgetInfo(rawArgv: string[]): Http {
@@ -383,6 +388,7 @@ function compileRule(raw: unknown): Rule {
       if (hasHttp) {
         const info = httpInfo(seg);
         if (!info) return false;
+        if (info.opaque) return true;
         if (methods && !methods.includes(info.method)) return false;
         if (prefixes && !info.urls.some((u) => prefixes!.some((p) => bare(u).startsWith(p)))) return false;
         if (urlRe && !info.urls.some((u) => urlRe!.test(u))) return false;

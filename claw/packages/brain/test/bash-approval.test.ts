@@ -397,6 +397,11 @@ const REVIEW_TABLE: Array<[string, string]> = [
   ["function keyword, no parens", `function retry { curl -X POST ${U}; }; retry`],
   ["function keyword with parens", `function retry() { curl -X POST ${U}; }; retry`],
   ["function keyword on one line after another command", `echo hi; function f { curl -X POST ${U}; }`],
+  ["leading redirection", `> /tmp/out curl -X POST ${U}`],
+  ["leading fd redirection", `2>/dev/null curl -X POST ${U}`],
+  ["redirection then wrapper", `>> /tmp/o sudo curl -X POST ${U}`],
+  ["curl --config file (opaque)", `curl --config /tmp/c.cfg`],
+  ["curl -K file (opaque)", `curl -K /tmp/c.cfg`],
   ["xargs -l is not a value flag", `echo x | xargs -l curl -X POST ${U}`],
   ["xargs --replace is not a value flag", `echo x | xargs --replace curl -X POST ${U}`],
 ];
