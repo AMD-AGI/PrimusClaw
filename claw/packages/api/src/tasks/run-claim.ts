@@ -10,6 +10,7 @@
  * CAS on an expired-or-absent lease.
  */
 
+import { applyAppMcpToTask } from "../sessions/app-mcp.js";
 import { createHash, randomBytes } from "node:crypto";
 import type { ExecuteRequest, RunFailClaimReason, RunLease } from "@claw/protocol";
 import pino from "pino";
@@ -860,6 +861,11 @@ async function hydrateExecuteRequest(row: ClawTaskRow, leaseToken: string): Prom
   if (creds.mcp_servers !== undefined) {
     (request as unknown as Record<string, unknown>).mcp_servers = creds.mcp_servers;
   }
+  // The session's hosted application MCP, from the live record at the moment of the
+  // claim and at the lowest priority. Never read from the sealed credentials: a turn
+  // that waited must not carry a token stored with it, a run that ended meanwhile
+  // must not be offered, and a replaced sandbox must be addressed by its new id.
+  await applyAppMcpToTask(request as unknown as Record<string, unknown>, row.session_id);
   // The column and the spec are written from the same string, but the spec is
   // kept as a fallback: an empty prompt here would not fail, it would quietly
   // send the model a turn with nothing in it.

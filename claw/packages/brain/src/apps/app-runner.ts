@@ -127,6 +127,10 @@ export const noopAppGrant: AppGrantRunHooks = {
 export interface AppRunContext {
   record: AppRunRecord;
   instance: SandboxInstance | null;
+  /** The run's store, at the epoch this worker holds the run at. */
+  store: AppRunStore;
+  /** The submitter's platform key: what the sandbox Router authenticates, when it does. */
+  platformKey: string;
   /**
    * `text` with the run's secret values replaced; for anything that reads what the application wrote.
    * Absent until the secrets have loaded: a seam that needs it waits for it.
@@ -787,7 +791,10 @@ export class AppRunner {
   private seamContext(instance: SandboxInstance | null): AppRunContext {
     // `scrub` exists only once the run's secret values are known: a seam that reads
     // what the application wrote must not forward it while it cannot clean it.
-    return { record: this.rec, instance, ...(this.secretsLoaded ? { scrub: (text: string) => this.scrubbed(text) } : {}) };
+    return {
+      record: this.rec, instance, store: this.deps.store, platformKey: this.platformKey,
+      ...(this.secretsLoaded ? { scrub: (text: string) => this.scrubbed(text) } : {}),
+    };
   }
 
   private async runningSeams(ctx: AppRunContext): Promise<void> {

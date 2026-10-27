@@ -10,6 +10,7 @@ import { getSafeWorkloadProvider } from "../sandbox/factory.js";
 import {
   AppRunner, noopAppGrant, type AppGrantRunHooks, type AppRunnerSeams, type AppSandboxOps,
 } from "./app-runner.js";
+import { appMcpSeams } from "./app-mcp.js";
 import { httpAppRunStore, type AppRunRecord, type AppRunStore } from "./app-run-store.js";
 import { createEventTailer } from "./event-tailer.js";
 import {
@@ -32,11 +33,11 @@ export function realAppSandbox(store: AppRunStore): AppSandboxOps {
 
 /** What a grant implementation or a later change plugs into. Bound once, at boot. */
 let boundGrant: AppGrantRunHooks = noopAppGrant;
-let boundSeams: AppRunnerSeams = {};
+let boundSeams: AppRunnerSeams = { ...appMcpSeams() };
 
 export function bindAppRunnerExtensions(ext: { grant?: AppGrantRunHooks; seams?: AppRunnerSeams }): void {
   if (ext.grant) boundGrant = ext.grant;
-  if (ext.seams) boundSeams = ext.seams;
+  if (ext.seams) boundSeams = { ...boundSeams, ...ext.seams };
 }
 
 /** To the session's event stream (`events.<sessionId>`). */

@@ -30,6 +30,7 @@ import type { PoolClient } from "pg";
 import { decideAdmission, withOwnedAdmissionLock } from "../tasks/admission.js";
 import { admissionAskFor } from "../tasks/run-dispatch.js";
 import { stripRunSecrets } from "../tasks/run-spec.js";
+import { applyAppMcpToTask } from "./app-mcp.js";
 import { ensureSessionWorkspace, requireWorkspaceBinding } from "../workspace/store.js";
 import pino from "pino";
 
@@ -473,6 +474,12 @@ export async function dispatchTaskToBrain(
     // A gate, not a note: an unrecorded `attempted` leaves a row denying a
     // message already on the stream, so a throw here must stop the publish.
     await sessionDispatchPorts.recordPublishState(run.taskId, "attempted");
+    // The session's hosted application MCP, at the lowest priority (a server of the
+    // same name in the request wins). Only here, on the branch that publishes the
+    // task itself: a doorbell turn seals its credentials onto the row, and the
+    // application's servers are built from the live record when it is claimed
+    // (tasks/run-claim.ts), so no token is stored and a replaced sandbox is not offered.
+    await applyAppMcpToTask(task, sessionId);
     const payload = JSON.stringify(task);
     const seq = await publishRunMessage(
       () => sessionDispatchPorts.publishTask(subject, payload),
