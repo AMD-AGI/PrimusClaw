@@ -8,12 +8,16 @@ import AdmZip from "adm-zip";
 import pino from "pino";
 import { TOOLS_API_URL } from "../config.js";
 import { UNAVAILABLE_RULES, bashApprovalFromToolConfig } from "../agent/bash-approval.js";
+import { fetchWithTimeout } from "../infra/retry.js";
 import { lookupTool, platformToolsBase } from "./lookup.js";
 import type { EventCallback } from "@claw/protocol";
 import type { HandsClient } from "../clients/hands.js";
 import { isSafeRelativePath, uploadDirToSandbox } from "../sandbox/write.js";
 
 const logger = pino({ name: "resolve-tools" });
+
+// Hard bound on the list fallback, in case the endpoint ignores `offset`.
+const LIST_FALLBACK_MAX_PAGES = 50;
 
 interface ResolvedTools {
   mcpServers: Record<string, Record<string, unknown>>;
@@ -62,14 +66,24 @@ export async function resolveToolIds(
   // gateway: keep the paged list there (as before) for ids the lookup could
   // not reach, so a single-host setup does not lose its tool_ids.
   if (looked.some((r) => !r.ok && r.reason === "endpoint_unreachable")) {
-    try {
-      const resp = await fetch(`${TOOLS_API_URL}?offset=0&limit=100&order=desc`, { headers: { Authorization: `Bearer ${apiKey}` } });
-      if (resp.ok) {
-        const data = (await resp.json()) as { data?: { tools?: Record<string, unknown>[] } };
-        for (const t of data.data?.tools ?? []) if (toolIds.includes(t.id as number) && !tools[t.id as number]) tools[t.id as number] = t;
+    // The list is paged: read until every id is found, the reported total is
+    // reached, or a short page / the page cap ends it. A failure on a later page
+    // keeps the tools already collected (the per-id not_found path reports the rest).
+    const pageSize = 100;
+    for (let page = 0; page < LIST_FALLBACK_MAX_PAGES; page++) {
+      const offset = page * pageSize;
+      try {
+        const resp = await fetchWithTimeout(`${TOOLS_API_URL}?offset=${offset}&limit=${pageSize}&order=desc`, { headers: { Authorization: `Bearer ${apiKey}` } });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = (await resp.json()) as { data?: { tools?: Record<string, unknown>[]; total?: number } };
+        const rows = data.data?.tools ?? [];
+        for (const t of rows) if (toolIds.includes(t.id as number) && !tools[t.id as number]) tools[t.id as number] = t;
+        const total = data.data?.total;
+        if (rows.length < pageSize || toolIds.every((id) => tools[id]) || (typeof total === "number" && offset + rows.length >= total)) break;
+      } catch (err) {
+        logger.warn({ err, page }, "resolve_tools.list_fallback_failed");
+        break;
       }
-    } catch (err) {
-      logger.warn({ err }, "resolve_tools.list_fallback_failed");
     }
   }
   if (onEvent) {

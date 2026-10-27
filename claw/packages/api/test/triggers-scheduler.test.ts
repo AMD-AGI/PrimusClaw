@@ -66,6 +66,7 @@ describe("scheduled triggers", { skip }, () => {
     dispatched.length = 0; interrupts.length = 0;
     await q("DELETE FROM claw_trigger_fires");
     await q("DELETE FROM claw_triggers");
+    await q("DELETE FROM claw_tasks");
     await q("DELETE FROM claw_sessions");
   });
 
@@ -156,6 +157,10 @@ describe("scheduled triggers", { skip }, () => {
     const id = (await create()).json().data.trigger_id;
     await makeDue(id);
     await sched.tickTriggers(NOW);
+    const live = (await q("SELECT session_id, message_id FROM claw_trigger_fires")).rows[0] as any;
+    await q("UPDATE claw_sessions SET agent_status = 'running', agent_gate_message_id = $2 WHERE session_id = $1", [live.session_id, live.message_id]);
+    await q("INSERT INTO claw_tasks (task_id, session_id, name, status, origin, metadata, lease_owner) VALUES ('trg-live', $1, 'run', 'running', 'chat', $2::jsonb, 'w1')",
+      [live.session_id, JSON.stringify({ message_id: live.message_id })]);
     assert.equal(await sched.enforceRunTimeLimit(new Date(NOW.getTime() + 30_000)), 0, "inside the limit");
     assert.equal(await sched.enforceRunTimeLimit(new Date(NOW.getTime() + 120_000)), 1);
     assert.equal(interrupts.length, 1);
@@ -171,6 +176,37 @@ describe("scheduled triggers", { skip }, () => {
     await q("UPDATE claw_sessions SET agent_status = 'running', agent_gate_message_id = 'claw-user-turn' WHERE session_id = $1", [sid]);
     assert.equal(await sched.enforceRunTimeLimit(new Date(NOW.getTime() + 3600_000)), 0);
     assert.equal(interrupts.length, 0, "the user's own turn is left alone");
+  });
+
+  test("a trigger turn that has ended does not take the user's next turn down with it", async () => {
+    const id = (await create()).json().data.trigger_id;
+    await makeDue(id);
+    await sched.tickTriggers(NOW);
+    const fireRow = (await q("SELECT session_id, message_id FROM claw_trigger_fires")).rows[0] as any;
+    // The gate still names the trigger's turn (the read the limit acted on), but
+    // that turn has ended and the user's has begun in the same session.
+    await q("UPDATE claw_sessions SET agent_status = 'running', agent_gate_message_id = $2 WHERE session_id = $1", [fireRow.session_id, fireRow.message_id]);
+    await q(`INSERT INTO claw_tasks (task_id, session_id, name, status, origin, metadata) VALUES
+             ('trg-turn', $1, 'run', 'completed', 'chat', $2::jsonb),
+             ('user-turn', $1, 'run', 'running', 'chat', '{"message_id":"claw-user-turn"}'::jsonb)`,
+      [fireRow.session_id, JSON.stringify({ message_id: fireRow.message_id })]);
+    await sched.enforceRunTimeLimit(new Date(NOW.getTime() + 120_000));
+    assert.equal(interrupts.length, 0, "no interrupt reaches the session");
+    assert.equal(((await q("SELECT status FROM claw_tasks WHERE task_id = 'user-turn'")).rows[0] as any).status, "running");
+  });
+
+  test("the time limit still stops the trigger's own live turn", async () => {
+    const id = (await create()).json().data.trigger_id;
+    await makeDue(id);
+    await sched.tickTriggers(NOW);
+    const fireRow = (await q("SELECT session_id, message_id FROM claw_trigger_fires")).rows[0] as any;
+    await q("UPDATE claw_sessions SET agent_status = 'running', agent_gate_message_id = $2 WHERE session_id = $1", [fireRow.session_id, fireRow.message_id]);
+    await q(`INSERT INTO claw_tasks (task_id, session_id, name, status, origin, metadata, lease_owner) VALUES
+             ('trg-turn', $1, 'run', 'running', 'chat', $2::jsonb, 'w1')`,
+      [fireRow.session_id, JSON.stringify({ message_id: fireRow.message_id })]);
+    await sched.enforceRunTimeLimit(new Date(NOW.getTime() + 120_000));
+    assert.equal(interrupts.length, 1);
+    assert.equal(((await q("SELECT status FROM claw_tasks WHERE task_id = 'trg-turn'")).rows[0] as any).status, "cancelling");
   });
 
   describe("a fire that fails after the session row exists", () => {
