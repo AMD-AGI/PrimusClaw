@@ -46,13 +46,19 @@ export async function resolveToolIds(
 
   let tools: Record<number, Record<string, unknown>> = {};
   try {
-    const resp = await fetch(`${TOOLS_API_URL}?offset=0&limit=100&order=desc`, {
-      headers: { Authorization: `Bearer ${apiKey}` },
-    });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = (await resp.json()) as { data?: { tools?: Record<string, unknown>[] } };
-    for (const t of data.data?.tools ?? []) {
-      tools[t.id as number] = t;
+    // The marketplace list is paged; a tool beyond the first page must still be found.
+    const pageSize = 100;
+    for (let offset = 0; ; offset += pageSize) {
+      const resp = await fetch(`${TOOLS_API_URL}?offset=${offset}&limit=${pageSize}&order=desc`, {
+        headers: { Authorization: `Bearer ${apiKey}` },
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = (await resp.json()) as { data?: { tools?: Record<string, unknown>[]; total?: number } };
+      const page = data.data?.tools ?? [];
+      for (const t of page) {
+        tools[t.id as number] = t;
+      }
+      if (page.length < pageSize || toolIds.every((id) => id in tools)) break;
     }
   } catch (err) {
     logger.error({ err }, "resolve_tools.fetch_failed");
