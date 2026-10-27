@@ -17,6 +17,7 @@ import {
 import { HandsClient } from "../clients/hands.js";
 import { isSessionDeletedLocally } from "../infra/deleted-sessions.js";
 import { s3Excludes, findExcludeArgs } from "./excludes.js";
+import { planUploadDelta } from "./sync-delta.js";
 import pino from "pino";
 
 const logger = pino({ name: "s3-uploader" });
@@ -29,6 +30,11 @@ const MAX_UPLOAD_ROUNDS = 3;
  *  Hands' fastify body limit (~1MB) even when /workspace has hundreds of files
  *  and presigned URLs are ~700B each. Empirically 100 paths × ~800B ≈ 80KB. */
 const UPLOAD_BATCH_SIZE = 100;
+/** Sub-batches in flight at once. Hands uploads the files of one batch one after
+ *  another, so a round of N batches took N times a batch; running a few side by
+ *  side keeps that from growing with the workspace without opening more than a
+ *  handful of PUTs against the object store per sync. */
+const UPLOAD_BATCH_CONCURRENCY = 4;
 /** Sandbox liveness probe timeout. Long enough to absorb a TCP retry, short
  *  enough that a dead sandbox fails fast instead of holding the sync open for
  *  the deadline of the `find` below. */
@@ -150,6 +156,10 @@ export interface SyncWorkspaceResult {
   /** True when /workspace had zero files at sync time (sandbox tear-down
    *  in progress, or a genuinely empty workspace). */
   empty: boolean;
+  /** Files left out of the upload because the last sync that landed already put
+   *  them in S3 as they are now. `uploaded + unchanged + failedCount` is
+   *  `totalFiles`; absent when every file was a candidate. */
+  unchanged?: number;
 }
 
 let _s3: S3Client | null = null;
@@ -245,21 +255,41 @@ async function uploadRound(
   s3Prefix: string,
   tagging?: string,
 ): Promise<UploadBatchResult> {
+  const slices: string[][] = [];
+  for (let i = 0; i < paths.length; i += UPLOAD_BATCH_SIZE) {
+    slices.push(paths.slice(i, i + UPLOAD_BATCH_SIZE));
+  }
+  // One result per slice, written to its own slot, so the order of `ok` and
+  // `failed` does not depend on which batch happened to finish first.
+  const results: UploadBatchResult[] = new Array(slices.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < slices.length) {
+      const idx = next++;
+      const slice = slices[idx];
+      try {
+        results[idx] = await uploadSubBatch(hands, slice, s3Prefix, tagging);
+      } catch (e: unknown) {
+        // A whole sub-batch threw (transport error, 413, etc.). Treat every
+        // path in the slice as failed so the outer retry loop reschedules
+        // them; otherwise we'd silently drop them.
+        const msg = (e as { message?: string })?.message ?? String(e);
+        results[idx] = {
+          ok: [],
+          failed: slice.map((p) => ({ path: p, status: -1, error: msg.slice(0, 200) })),
+          total: slice.length,
+        };
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(UPLOAD_BATCH_CONCURRENCY, slices.length) }, worker),
+  );
   const ok: string[] = [];
   const failed: UploadBatchResult["failed"] = [];
-  for (let i = 0; i < paths.length; i += UPLOAD_BATCH_SIZE) {
-    const slice = paths.slice(i, i + UPLOAD_BATCH_SIZE);
-    try {
-      const r = await uploadSubBatch(hands, slice, s3Prefix, tagging);
-      ok.push(...r.ok);
-      failed.push(...r.failed);
-    } catch (e: unknown) {
-      // A whole sub-batch threw (transport error, 413, etc.). Treat every
-      // path in the slice as failed so the outer retry loop reschedules
-      // them; otherwise we'd silently drop them.
-      const msg = (e as { message?: string })?.message ?? String(e);
-      for (const p of slice) failed.push({ path: p, status: -1, error: msg.slice(0, 200) });
-    }
+  for (const r of results) {
+    ok.push(...r.ok);
+    failed.push(...r.failed);
   }
   return { ok, failed, total: paths.length };
 }
@@ -673,9 +703,46 @@ export async function syncWorkspaceToS3(
   }
   await logUploadManifestToHandsLog(hands, sessionId, s3Prefix, files);
 
-  let pending = files;
+  // Only what changed since the last sync that landed, when the sandbox can say;
+  // everything otherwise. `files` stays the authority for what exists, so the
+  // prune below is exactly what it was. Only for a listing that proved itself: a
+  // doubtful one is uploaded whole, as before, and decides nothing about what is
+  // already in S3.
+  const delta = listing.trusted
+    ? await planUploadDelta(hands, s3Prefix, files, findExcludeArgs(s3Excludes()))
+    : null;
+  let pending = delta ? delta.pending : files;
+  const unchanged = delta?.unchanged ?? 0;
   let uploaded = 0;
   let lastFailures: UploadBatchResult["failed"] = [];
+
+  // Reached with every pending file up -- which is also the case for a sync with
+  // nothing pending, where deleted files still have to be pruned.
+  const finishSynced = async (round: number): Promise<SyncWorkspaceResult> => {
+    // Only once every file is up. A prune after a partial upload would be
+    // deleting the old copy of something whose new copy did not arrive.
+    const pruned = await pruneRemovedObjects(sessionId, s3Prefix, listing)
+      .catch((e: unknown) => {
+      logger.warn(
+        { sessionId, err: (e as { message?: string })?.message ?? String(e) },
+        "s3.prune.failed",
+      );
+      return 0;
+    });
+    // After the prune, so a sync that dies in it leaves no manifest rather than
+    // one claiming a state S3 was not left in.
+    await delta?.commit();
+    logger.info(
+      { sessionId, round, totalUploaded: uploaded, unchanged, total: files.length, pruned, s3Prefix },
+      "s3.synced",
+    );
+    return {
+      uploaded, totalFiles: files.length, failedCount: 0, exhausted: false, empty: false,
+      ...(delta ? { unchanged } : {}),
+    };
+  };
+
+  if (pending.length === 0) return finishSynced(0);
 
   for (let round = 1; round <= MAX_UPLOAD_ROUNDS && pending.length > 0; round++) {
     const result = await uploadRound(
@@ -686,20 +753,7 @@ export async function syncWorkspaceToS3(
     );
     uploaded += result.ok.length;
     lastFailures = result.failed;
-    if (result.failed.length === 0) {
-      // Only once every file is up. A prune after a partial upload would be
-      // deleting the old copy of something whose new copy did not arrive.
-      const pruned = await pruneRemovedObjects(sessionId, s3Prefix, listing)
-        .catch((e: unknown) => {
-        logger.warn(
-          { sessionId, err: (e as { message?: string })?.message ?? String(e) },
-          "s3.prune.failed",
-        );
-        return 0;
-      });
-      logger.info({ sessionId, round, totalUploaded: uploaded, total: files.length, pruned, s3Prefix }, "s3.synced");
-      return { uploaded, totalFiles: files.length, failedCount: 0, exhausted: false, empty: false };
-    }
+    if (result.failed.length === 0) return finishSynced(round);
     logger.warn(
       { sessionId, round, ok: result.ok.length, failed: result.failed.length, sample: result.failed.slice(0, 3) },
       "s3.sync.round_failed",
@@ -731,6 +785,7 @@ export async function syncWorkspaceToS3(
     failedCount: lastFailures.length,
     exhausted: true,
     empty: false,
+    ...(delta ? { unchanged } : {}),
   };
 }
 

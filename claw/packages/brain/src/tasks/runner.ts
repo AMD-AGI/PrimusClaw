@@ -21,6 +21,7 @@ import {
 import {
   syncWorkspaceToS3, syncWorkspaceFromS3, archiveRunToS3, copyS3Prefix, TRANSCRIPT_PREFIX,
 } from "../workspace/s3-uploader.js";
+import { invalidateSyncManifest } from "../workspace/sync-delta.js";
 import { syncWorkspace, restoreWorkspace } from "../workspace/sync.js";
 import {
   workspaceSyncSemaphore,
@@ -2045,6 +2046,13 @@ class TaskRunner {
     try {
       const sessionPrefix = `users/${this.userIdForSync}/sessions/${this.sessionId}/`;
       const rec = await fx().copyS3Prefix(this.sessionId, this.inflightCkptPrefix, sessionPrefix);
+      if (rec.copied > 0 && this.hands) {
+        // The copy has just put an older snapshot over the session prefix, so the
+        // sandbox's record of what it last uploaded there is no longer true.
+        // Forgetting it makes the next sync upload everything, which is what
+        // makes S3 match the workspace again.
+        await invalidateSyncManifest(this.hands, sessionPrefix);
+      }
       if (rec.copied > 0) {
         await this.onEvent({
           type: "sandboxStatus",
@@ -3083,7 +3091,9 @@ class TaskRunner {
             type: "sandboxStatus",
             status: "workspace_sync_partial",
             reason: "upload_exhausted",
-            message: `uploaded=${r.uploaded}/${r.totalFiles}, failed=${r.failedCount}`,
+            // Out of what this sync tried to upload: files the last sync that
+            // landed already put in S3 are not attempts.
+            message: `uploaded=${r.uploaded}/${r.totalFiles - (r.unchanged ?? 0)}, failed=${r.failedCount}`,
             message_id: this.messageId,
           });
         }
