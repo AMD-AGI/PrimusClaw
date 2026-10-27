@@ -545,6 +545,43 @@ func TestReconcileDropsMissingSandbox(t *testing.T) {
 	}
 }
 
+func TestReconcileKeepsMissingPendingSandboxWithinTemplateWindow(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	clock := now
+	svc, priv, _, _ := testService(t, now)
+	svc.now = func() time.Time { return clock }
+	svc.exists = memExists{gone: map[string]bool{"sbx-1": true}}
+	req := sampleRequest(now.Add(time.Hour))
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.BeginSandbox(context.Background(), BeginRequest{
+		GrantID: req.GrantID, Role: "measurement", SandboxID: "sbx-1",
+		TemplateID: "ar-01ja-runner-g1", GPUs: 4, TimeoutSec: 60, PendingTimeoutSec: 90,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	svc.ReapOnce(context.Background())
+	view, err := svc.Get(context.Background(), req.GrantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Sandboxes[0].State != runtimev1alpha1.SandboxPending || view.Usage["measurement"].GPUs != 4 {
+		t.Fatalf("pending sandbox was reclaimed: %+v", view)
+	}
+	clock = now.Add(90 * time.Second)
+	svc.ReapOnce(context.Background())
+	view, err = svc.Get(context.Background(), req.GrantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Sandboxes[0].State != runtimev1alpha1.SandboxEnded || view.Sandboxes[0].EndReason != "missing" ||
+		view.Usage["measurement"].Sandboxes != 0 || view.Usage["measurement"].GPUs != 0 {
+		t.Fatalf("expired pending sandbox was not reclaimed: %+v", view)
+	}
+}
+
 func TestExtendRejectsEarlierExpiry(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	svc, priv, _, _ := testService(t, now)

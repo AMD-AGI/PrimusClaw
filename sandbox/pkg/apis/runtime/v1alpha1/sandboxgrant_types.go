@@ -149,6 +149,7 @@ type GrantSandboxRef struct {
 	State             string            `json:"state,omitempty"`
 	EndReason         string            `json:"endReason,omitempty"`
 	TimeoutSec        int64             `json:"timeoutSec,omitempty"`
+	PendingTimeoutSec int64             `json:"pendingTimeoutSec,omitempty"`
 	IdempotencyKey    string            `json:"idempotencyKey,omitempty"`
 	AccessTokenHash   string            `json:"accessTokenHash,omitempty"`
 	AccessTokenHashes []string          `json:"accessTokenHashes,omitempty"`

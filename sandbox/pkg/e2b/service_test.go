@@ -174,6 +174,10 @@ func TestCreateReplayKillAndQuota(t *testing.T) {
 		created.GrantID != "gr-01jb7m9k2x" || created.Attestation == "" {
 		t.Fatalf("created=%+v", runner.created)
 	}
+	ref, err := svc.grants.Sandbox(context.Background(), "gr-01jb7m9k2x", "measurement", first.SandboxID)
+	if err != nil || ref.PendingTimeoutSec != int64(defaultPendingWait/time.Second) {
+		t.Fatalf("ref=%+v err=%v", ref, err)
+	}
 	second, status, err := svc.Create(context.Background(), key, CreateBody{
 		TemplateID: "runner", Metadata: map[string]string{"idempotency-key": "once"},
 	})

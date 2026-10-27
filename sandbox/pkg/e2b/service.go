@@ -133,20 +133,21 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		return SandboxResponse{}, 0, grant.Op(http.StatusInternalServerError, "sandbox_create_failed", "token")
 	}
 	ref, err := s.grants.BeginSandbox(ctx, grant.BeginRequest{
-		GrantID:         grantID,
-		Role:            role,
-		SandboxID:       sandboxID,
-		Alias:           tpl.Alias,
-		TemplateID:      tpl.ID,
-		Namespace:       s.namespace,
-		GPUs:            tpl.GPUs,
-		TimeoutSec:      timeoutSec,
-		IdempotencyKey:  body.Metadata["idempotency-key"],
-		AccessTokenHash: hash,
-		Metadata:        body.Metadata,
-		Sealed:          tpl.Sealed,
-		Inputs:          tpl.Inputs,
-		Outputs:         tpl.Outputs,
+		GrantID:           grantID,
+		Role:              role,
+		SandboxID:         sandboxID,
+		Alias:             tpl.Alias,
+		TemplateID:        tpl.ID,
+		Namespace:         s.namespace,
+		GPUs:              tpl.GPUs,
+		TimeoutSec:        timeoutSec,
+		PendingTimeoutSec: int64(tpl.Pending / time.Second),
+		IdempotencyKey:    body.Metadata["idempotency-key"],
+		AccessTokenHash:   hash,
+		Metadata:          body.Metadata,
+		Sealed:            tpl.Sealed,
+		Inputs:            tpl.Inputs,
+		Outputs:           tpl.Outputs,
 	})
 	var replay *grant.Replay
 	if errors.As(err, &replay) {

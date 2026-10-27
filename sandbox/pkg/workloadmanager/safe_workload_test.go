@@ -26,7 +26,9 @@ import (
 
 func TestWorkloadObjectUsesTemplateResources(t *testing.T) {
 	ci := testCodeInterpreter()
-	obj, err := workloadObject("dev-fixed", e2b.CreateRequest{
+	const sandboxID = "sbx-7a9b9b693452f613877992145c818d29"
+	obj, err := workloadObject(sandboxID, e2b.CreateRequest{
+		SandboxID:   sandboxID,
 		TemplateID:  "ar-run-dev-g2",
 		Role:        "dev",
 		SessionID:   "s-8f2a",
@@ -44,7 +46,7 @@ func TestWorkloadObjectUsesTemplateResources(t *testing.T) {
 	if _, found, _ := unstructured.NestedFieldNoCopy(obj.Object, "spec", "entryPoints"); found {
 		t.Fatal("entryPoints must stay unset")
 	}
-	if obj.GetLabels()[safeDisplayNameLabel] != "dev" || obj.GetLabels()[sessionIDLabel] != "s-8f2a" || obj.GetLabels()[safeUserIDLabel] != "u-123" || obj.GetLabels()[grantIDLabel] != "gr-01jb7m9k2x" {
+	if obj.GetLabels()[safeDisplayNameLabel] != "dev" || obj.GetLabels()[sessionIDLabel] != "s-8f2a" || obj.GetLabels()[safeUserIDLabel] != "u-123" || obj.GetLabels()[grantIDLabel] != "gr-01jb7m9k2x" || obj.GetLabels()[sandboxIDLabel] != sandboxID {
 		t.Fatalf("labels=%v", obj.GetLabels())
 	}
 	if obj.GetAnnotations()[safeUserNameAnnotation] != "alice" || obj.GetAnnotations()[grantAttestationAnnotation] != "eyJ.test" {

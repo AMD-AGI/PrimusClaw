@@ -464,6 +464,9 @@ func (s *Service) Run(ctx context.Context, every time.Duration) {
 
 func (s *Service) dropMissing(ctx context.Context, g *runtimev1alpha1.SandboxGrant) {
 	for _, ref := range g.Status.Sandboxes {
+		if pendingWithinDeadline(ref, s.now()) {
+			continue
+		}
 		ok, err := s.exists.Exists(ctx, SandboxRef{ID: ref.ID, Role: ref.Role, GPUs: ref.GPUs, SessionID: ref.SessionID})
 		if err != nil || ok || ref.State == runtimev1alpha1.SandboxEnded {
 			continue
@@ -472,6 +475,14 @@ func (s *Service) dropMissing(ctx context.Context, g *runtimev1alpha1.SandboxGra
 			log.Warn("grant reconcile end failed", "grant", g.Name, "sandbox", ref.ID, "error", err)
 		}
 	}
+}
+
+// pendingWithinDeadline reports whether a pending sandbox may still be creating.
+func pendingWithinDeadline(ref runtimev1alpha1.GrantSandboxRef, now time.Time) bool {
+	if ref.State != runtimev1alpha1.SandboxPending || ref.PendingTimeoutSec <= 0 || ref.StartedAt.IsZero() {
+		return false
+	}
+	return now.Before(ref.StartedAt.Time.Add(time.Duration(ref.PendingTimeoutSec) * time.Second))
 }
 
 func (s *Service) reclaimAll(ctx context.Context, grantID string) (int, error) {

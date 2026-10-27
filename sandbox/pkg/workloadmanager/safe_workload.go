@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -34,11 +35,13 @@ const (
 	safeWorkloadIDLabel        = "primus-safe.workload.id"
 	sessionIDLabel             = "primus-claw/session-id"
 	grantIDLabel               = "agent-sandbox.io/grant-id"
+	sandboxIDLabel             = "agent-sandbox.io/sandbox-id"
 	grantAttestationAnnotation = "agent-sandbox.io/grant-attestation"
 	workloadEphemeralStorage   = "50Gi"
 	workloadPriority           = int64(2)
 	workloadTTLSeconds         = int64(10)
 	envdPort                   = 8080
+	e2bSandboxPrefix           = "sbx-"
 	// platformInferenceKey is not copied onto a grant sandbox.
 	platformInferenceKey = "OPENAI_API_KEY"
 	// safeGeneratedNameLength is SaFE MaxGeneratedNameLength: a 63-character
@@ -203,6 +206,57 @@ func (c *SafeWorkloadCreator) Present(ctx context.Context, name string) (bool, e
 	}
 }
 
+// Session rebuilds the session record of an E2B Workload named by the sandbox id.
+// A missing Workload, a finished phase, or a Workload not created for E2B is store.ErrNotFound.
+func (c *SafeWorkloadCreator) Session(ctx context.Context, name string) (*store.SandboxInfo, error) {
+	if c == nil || c.dynamic == nil || !strings.HasPrefix(name, e2bSandboxPrefix) || !dnsLabel(name, safeGeneratedNameLength) {
+		return nil, store.ErrNotFound
+	}
+	obj, err := c.dynamic.Resource(workloadGVR).Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	labels := obj.GetLabels()
+	if _, ok := labels[sessionIDLabel]; !ok || obj.GetDeletionTimestamp() != nil {
+		return nil, store.ErrNotFound
+	}
+	phase, _, _ := unstructured.NestedString(obj.Object, "status", "phase")
+	switch phase {
+	case "Failed", "Succeeded", "Stopped":
+		return nil, store.ErrNotFound
+	}
+	workspace, _, _ := unstructured.NestedString(obj.Object, "spec", "workspace")
+	info := &store.SandboxInfo{
+		Kind:        store.WorkloadKind,
+		SessionID:   name,
+		SandboxName: name,
+		Namespace:   workspace,
+		PodPort:     envdPort,
+		CreatedAt:   obj.GetCreationTimestamp().Time,
+		Status:      "creating",
+		UserID:      labels[safeUserIDLabel],
+		UserName:    obj.GetAnnotations()[safeUserNameAnnotation],
+	}
+	started := workloadStartTime(obj)
+	if seconds, _, _ := unstructured.NestedInt64(obj.Object, "spec", "timeout"); seconds > 0 && !started.IsZero() {
+		info.ExpiresAt = started.Add(time.Duration(seconds) * time.Second)
+	}
+	if phase == "Running" {
+		ip, _, ok := addressFromStatus(obj)
+		if !ok && c.client != nil {
+			ip, _, ok = c.address(ctx, obj, workspace, name)
+		}
+		if ok {
+			info.PodIP = ip
+			info.Status = "running"
+		}
+	}
+	return info, nil
+}
+
 // Delete removes the Workload. A missing object is already gone.
 func (c *SafeWorkloadCreator) Delete(ctx context.Context, name string) error {
 	if c == nil || c.dynamic == nil || name == "" {
@@ -353,6 +407,7 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 	labels := map[string]any{
 		safeDisplayNameLabel: req.Role,
 		sessionIDLabel:       req.SessionID,
+		sandboxIDLabel:       name,
 	}
 	if req.UserID != "" {
 		labels[safeUserIDLabel] = req.UserID

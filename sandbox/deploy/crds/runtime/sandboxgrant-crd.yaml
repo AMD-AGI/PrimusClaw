@@ -166,6 +166,8 @@ spec:
                         type: string
                       timeoutSec:
                         type: integer
+                      pendingTimeoutSec:
+                        type: integer
                       idempotencyKey:
                         type: string
                       accessTokenHash:

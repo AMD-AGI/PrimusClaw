@@ -18,20 +18,21 @@ import (
 
 // BeginRequest charges one sandbox and records its E2B control-plane fields.
 type BeginRequest struct {
-	GrantID         string
-	Role            string
-	SandboxID       string
-	Alias           string
-	TemplateID      string
-	Namespace       string
-	GPUs            int32
-	TimeoutSec      int64
-	IdempotencyKey  string
-	AccessTokenHash string
-	Metadata        map[string]string
-	Sealed          bool
-	Inputs          []string
-	Outputs         []string
+	GrantID           string
+	Role              string
+	SandboxID         string
+	Alias             string
+	TemplateID        string
+	Namespace         string
+	GPUs              int32
+	TimeoutSec        int64
+	PendingTimeoutSec int64
+	IdempotencyKey    string
+	AccessTokenHash   string
+	Metadata          map[string]string
+	Sealed            bool
+	Inputs            []string
+	Outputs           []string
 }
 
 // Replay is returned when the idempotency key already names a sandbox.
@@ -313,8 +314,8 @@ func beginOne(g *runtimev1alpha1.SandboxGrant, req BeginRequest, now time.Time) 
 	if req.SandboxID == "" || req.Role == "" || req.TemplateID == "" {
 		return opErr(http.StatusBadRequest, "invalid_sandbox", "sandbox id, role, and template are required")
 	}
-	if req.TimeoutSec < 0 {
-		return opErr(http.StatusBadRequest, "invalid_sandbox", "timeout must be >= 0")
+	if req.TimeoutSec < 0 || req.PendingTimeoutSec < 0 {
+		return opErr(http.StatusBadRequest, "invalid_sandbox", "timeouts must be >= 0")
 	}
 	for _, ref := range g.Status.Sandboxes {
 		if req.IdempotencyKey != "" && ref.IdempotencyKey == req.IdempotencyKey {
@@ -358,22 +359,23 @@ func beginOne(g *runtimev1alpha1.SandboxGrant, req BeginRequest, now time.Time) 
 	usage.GPUs += req.GPUs
 	g.Status.Usage[req.Role] = usage
 	g.Status.Sandboxes = append(g.Status.Sandboxes, runtimev1alpha1.GrantSandboxRef{
-		ID:              req.SandboxID,
-		Role:            req.Role,
-		GPUs:            req.GPUs,
-		SessionID:       req.SandboxID,
-		StartedAt:       metav1.NewTime(now),
-		Alias:           req.Alias,
-		TemplateID:      req.TemplateID,
-		Namespace:       req.Namespace,
-		State:           runtimev1alpha1.SandboxPending,
-		TimeoutSec:      req.TimeoutSec,
-		IdempotencyKey:  req.IdempotencyKey,
-		AccessTokenHash: req.AccessTokenHash,
-		Sealed:          req.Sealed,
-		Inputs:          append([]string(nil), req.Inputs...),
-		Outputs:         append([]string(nil), req.Outputs...),
-		Metadata:        copyMap(req.Metadata),
+		ID:                req.SandboxID,
+		Role:              req.Role,
+		GPUs:              req.GPUs,
+		SessionID:         req.SandboxID,
+		StartedAt:         metav1.NewTime(now),
+		Alias:             req.Alias,
+		TemplateID:        req.TemplateID,
+		Namespace:         req.Namespace,
+		State:             runtimev1alpha1.SandboxPending,
+		TimeoutSec:        req.TimeoutSec,
+		PendingTimeoutSec: req.PendingTimeoutSec,
+		IdempotencyKey:    req.IdempotencyKey,
+		AccessTokenHash:   req.AccessTokenHash,
+		Sealed:            req.Sealed,
+		Inputs:            append([]string(nil), req.Inputs...),
+		Outputs:           append([]string(nil), req.Outputs...),
+		Metadata:          copyMap(req.Metadata),
 	})
 	return nil
 }
