@@ -92,6 +92,12 @@ export async function registerMemoryRoutes(app: FastifyInstance): Promise<void> 
     const userId = resolveUserId(req, reply);
     if (!userId) return;
 
+    // Editing writes memory content, so it needs the opt-in like any other write.
+    // Deleting stays allowed whatever the preference.
+    if (!(await getMemoryPreference(userId))) {
+      return reply.status(409).send({ ok: false, error: "memory_disabled", message: "turn memory on before editing memories" });
+    }
+
     const entryId = req.params.id;
     const body = req.body as Record<string, unknown>;
     const content = body.content as string | undefined;

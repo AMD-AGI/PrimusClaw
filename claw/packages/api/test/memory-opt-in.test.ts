@@ -139,6 +139,19 @@ test("routes: toggle, list, delete; manual add is refused while off", async () =
   assert.equal(r.json().data.length, 0);
 });
 
+test("routes: editing is refused while off, deleting is not", async () => {
+  await setMemoryPreference("alice", true);
+  await insertMemoryEntry("alice", entry);
+  await setMemoryPreference("alice", false);
+  const app = await appAs("alice");
+  let r = await app.inject({ method: "PUT", url: "/v1/users/me/memories/1", payload: { content: "changed" } });
+  assert.equal(r.statusCode, 409);
+  assert.equal(memories[0].content, "likes tabs over spaces");
+  r = await app.inject({ method: "DELETE", url: "/v1/users/me/memories/1" });
+  assert.equal(r.statusCode, 200);
+  assert.ok(memories[0].deleted_at);
+});
+
 test("routes: a user cannot see, delete or toggle another user's memory", async () => {
   await setMemoryPreference("alice", true);
   await insertMemoryEntry("alice", entry);
