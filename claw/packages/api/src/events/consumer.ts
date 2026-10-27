@@ -14,7 +14,7 @@ import {
 } from "../marketplace/plugins.js";
 
 import { buildMessages } from "../sessions/context-builder.js";
-import { maybeExtractMemory, insertMemoryEntry, scanMemoryContent, maybeUpdateUserProfile } from "../memory/service.js";
+import { maybeExtractMemory, insertMemoryEntry, isMemoryActive, scanMemoryContent, maybeUpdateUserProfile } from "../memory/service.js";
 import {
   saveSkill, recordSkillFeedback,
   selectSkillsForTask,
@@ -1229,6 +1229,7 @@ if (pending) {
     message_id: pendingMessageId,
     prompt: pending.content,
     history,
+    memory_enabled: await isMemoryActive(pendingUserId),
     user_id: pendingUserId,
     llm_api_key: typeof pending.llm_api_key === "string" ? pending.llm_api_key : "",
     platform_key: typeof pending.platform_key === "string" ? pending.platform_key : "",

@@ -1616,7 +1616,7 @@ async function handleLegacyInvoke(
   // caller-supplied task or message id it is the difference between a skipped
   // compensation and a `taskId` that does not exist.
   try {
-    const payload = { session_id: target.taskId, prompt: text, history: [], user_id: "a2a" };
+    const payload = { session_id: target.taskId, prompt: text, history: [], memory_enabled: await isMemoryActive("a2a"), user_id: "a2a" };
     await js.publish("tasks.execute", sc.encode(JSON.stringify(payload)));
   } catch (err: unknown) {
     if (entry.kind === "opened") await rollbackA2AAdmission(target, entry.taskId, err);
