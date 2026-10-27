@@ -380,22 +380,52 @@ test("the same shapes with a read-only call still run", () => {
   ]) assert.equal(p.check(cmd), null, cmd);
 });
 
-function stubTools(handler: () => Response) {
+const REVIEW_TABLE: Array<[string, string]> = [
+  ["kubectl exec sh -c", `kubectl exec -it p -- sh -c 'curl -X POST ${U}'`],
+  ["kubectl exec bash -c double quotes", `kubectl exec -it p -- bash -c "curl -X POST ${U}"`],
+  ["kubectl exec /bin/sh -c", `kubectl -n ns exec p -- /bin/sh -c 'curl -X POST ${U}'`],
+  ["oc exec sh -c", `oc exec -it p -- sh -c 'curl -sX POST ${U}'`],
+  ["kubectl exec env then curl", `kubectl exec p -- env A=1 curl -X POST ${U}`],
+  ["watch -d with a quoted command", `watch -d 'curl -X POST ${U}'`],
+  ["watch --differences", `watch --differences curl -X POST ${U}`],
+  ["watch --differences=permanent", `watch --differences=permanent 'curl -X POST ${U}'`],
+  ["watch -d -n 5 bare words", `watch -d -n 5 curl -X POST ${U}`],
+  ["watch -dn 5", `watch -dn 5 'curl -X POST ${U}'`],
+  ["flock --command=", `flock /tmp/l --command='curl -X POST ${U}'`],
+  ["flock -nc bundled", `flock /tmp/l -nc 'curl -X POST ${U}'`],
+  ["env -S", `env -S 'curl -X POST ${U}'`],
+  ["function keyword, no parens", `function retry { curl -X POST ${U}; }; retry`],
+  ["function keyword with parens", `function retry() { curl -X POST ${U}; }; retry`],
+  ["function keyword on one line after another command", `echo hi; function f { curl -X POST ${U}; }`],
+  ["xargs -l is not a value flag", `echo x | xargs -l curl -X POST ${U}`],
+  ["xargs --replace is not a value flag", `echo x | xargs --replace curl -X POST ${U}`],
+];
+test("review round 4: exec -- quoting, watch -d, bundled flags, function keyword", () => {
+  const p = bashApprovalPolicyFrom([{ source: "t", value: POST_RULE }]);
+  for (const [why, cmd] of REVIEW_TABLE) assert.equal(p.check(cmd), "post", `${why}: ${cmd}`);
+  for (const cmd of [
+    `kubectl exec -it p -- sh -c 'ls /tmp'`, `watch -d 'curl ${U}'`, `watch -dn 5 ls`, `flock /tmp/l --command='ls'`,
+    `function retry { curl ${U}; }; retry`, `env -S 'ls -l'`,
+  ]) assert.equal(p.check(cmd), null, cmd);
+});
+
+function stubTools(handler: (url: string) => Response) {
   const real = globalThis.fetch;
-  globalThis.fetch = (async () => handler()) as typeof globalThis.fetch;
+  globalThis.fetch = (async (input: unknown) => handler(String(input))) as typeof globalThis.fetch;
   return () => { globalThis.fetch = real; };
 }
 const rulesOf = (r: { bashApproval: unknown[] }) =>
   bashApprovalPolicyFrom(r.bashApproval.map((value) => ({ source: "tool_config", value })));
 
-test("marketplace tools that cannot be resolved hold every bash command", async () => {
-  const listing = (tools: unknown[]) => () => new Response(JSON.stringify({ data: { tools } }), { status: 200 });
-  const cases: Array<[string, () => Response]> = [
+test("marketplace tools that failed to resolve hold every bash command; a deleted tool does not", async () => {
+  const claw404 = () => new Response(JSON.stringify({ ok: false, error: "not_found" }), { status: 404 });
+  const holds: Array<[string, () => Response]> = [
     ["tools API 500", () => new Response("boom", { status: 500 })],
     ["tools API unreachable", () => { throw new Error("ECONNRESET"); }],
-    ["selected tool absent from the listing", listing([{ id: 7, name: "other", type: "mcp", config: {} }])],
+    ["forbidden", () => new Response("no", { status: 403 })],
+    ["gateway 404 with no listing entry", () => new Response("<html>", { status: 404 })],
   ];
-  for (const [why, handler] of cases) {
+  for (const [why, handler] of holds) {
     const restore = stubTools(handler);
     try {
       const policy = rulesOf(await resolveToolIds([42], "k"));
@@ -403,10 +433,17 @@ test("marketplace tools that cannot be resolved hold every bash command", async 
       assert.equal(policy.check("ls"), MALFORMED_LABEL, why);
     } finally { restore(); }
   }
+  // Deleted tool (the API says so): skipped, nothing is held.
+  let restore = stubTools(claw404);
+  try {
+    const policy = rulesOf(await resolveToolIds([42], "k"));
+    assert.equal(policy.active, false, "deleted tool");
+    assert.equal(policy.check("ls"), null);
+  } finally { restore(); }
   // Resolved fine, with rules: those rules apply and nothing else is held.
-  const restore = stubTools(() => new Response(JSON.stringify({ data: { tools: [
+  restore = stubTools(() => new Response(JSON.stringify({ data:
     { id: 42, name: "t", type: "mcp", config: { mcpServers: {}, bash_approval: RULES } },
-  ] } }), { status: 200 }));
+  }), { status: 200 }));
   try {
     const policy = rulesOf(await resolveToolIds([42], "k"));
     assert.equal(policy.check("ls"), null);

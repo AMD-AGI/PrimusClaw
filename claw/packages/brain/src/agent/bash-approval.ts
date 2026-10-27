@@ -59,7 +59,13 @@ const MAX_SHELL_DEPTH = 3;
 export const UNAVAILABLE_RULES = "bash approval rules unavailable";
 export const MALFORMED_LABEL = "bash approval rules are malformed; every bash command is held";
 
-interface Segment { program: string; argv: string[]; /** Shell text this command hands to a shell, parsed as nested commands. */ nested?: string }
+interface Segment {
+  program: string; argv: string[];
+  /** Shell text this command hands to a shell, parsed as nested commands. */
+  nested?: string;
+  /** Already-split words of a command this one runs (kubectl exec -- ...); quoting is kept. */
+  inner?: string[];
+}
 type RuleFn = (command: string, segments: Segment[]) => boolean;
 interface Rule { label: string; test: RuleFn }
 
@@ -70,8 +76,9 @@ const RULE_KEYS = new Set(["label", "regex", "flags", "program", "args_regex", "
  * command. Seen through, so `timeout 5 curl ...` is a curl.
  */
 const WRAPPERS: Record<string, { valueFlags: string[]; positional: number; shell?: boolean; shellFlag?: string[] }> = {
-  env: { valueFlags: ["-u", "-C", "-S"], positional: 0 },
-  sudo: { valueFlags: ["-u", "-g", "-C", "-h", "-p", "-r", "-t", "-U", "-D", "-R", "-T"], positional: 0 },
+  // env -S STRING is a command line, split by env itself.
+  env: { valueFlags: ["-u", "-C", "--unset", "--chdir"], positional: 0, shellFlag: ["-S", "--split-string"] },
+  sudo: { valueFlags: ["-u", "-g", "-C", "-h", "-p", "-r", "-t", "-U", "-D", "-R", "-T", "--user", "--group", "--close-from", "--host", "--prompt", "--role", "--type", "--other-user", "--chdir", "--chroot", "--command-timeout"], positional: 0 },
   doas: { valueFlags: ["-u", "-C"], positional: 0 },
   time: { valueFlags: ["-f", "-o", "--format", "--output"], positional: 0 },
   nohup: { valueFlags: [], positional: 0 },
@@ -79,13 +86,15 @@ const WRAPPERS: Record<string, { valueFlags: string[]; positional: number; shell
   exec: { valueFlags: ["-a"], positional: 0 },
   nice: { valueFlags: ["-n", "--adjustment"], positional: 0 },
   ionice: { valueFlags: ["-c", "-n", "-p", "-P", "-u"], positional: 0 },
-  stdbuf: { valueFlags: ["-i", "-o", "-e"], positional: 0 },
+  stdbuf: { valueFlags: ["-i", "-o", "-e", "--input", "--output", "--error"], positional: 0 },
   setsid: { valueFlags: [], positional: 0 },
   timeout: { valueFlags: ["-k", "-s", "--kill-after", "--signal"], positional: 1 },
   // watch runs its words through `sh -c`; flock -c takes a shell string.
-  watch: { valueFlags: ["-n", "--interval", "-d"], positional: 0, shell: true },
-  flock: { valueFlags: ["-w", "-E", "--timeout"], positional: 1, shellFlag: ["-c", "--command"] },
-  xargs: { valueFlags: ["-I", "-n", "-P", "-d", "-L", "-l", "-s", "-E", "-a", "-J", "--max-args", "--max-procs", "--delimiter", "--replace", "--arg-file"], positional: 0 },
+  // watch -d / --differences[=permanent] takes no separate value (procps man page).
+  watch: { valueFlags: ["-n", "--interval", "-q", "--equexit"], positional: 0, shell: true },
+  flock: { valueFlags: ["-w", "-E", "--timeout", "--wait", "--conflict-exit-code"], positional: 1, shellFlag: ["-c", "--command"] },
+  // xargs -i / -l / --replace / --max-lines take an optional ATTACHED value only.
+  xargs: { valueFlags: ["-I", "-n", "-P", "-d", "-L", "-s", "-E", "-a", "-J", "--max-args", "--max-procs", "--delimiter", "--arg-file", "--max-chars", "--eof"], positional: 0 },
 };
 /** Only inside `eval` / `shell -c`, where `echo cmd` output is what runs. */
 const ECHO_WRAPPERS = new Set(["echo", "printf"]);
@@ -117,21 +126,23 @@ export function parseSegments(text: string, depth = 0, echoRuns = false): Segmen
   let cur = "";
   let has = false;
   const endToken = () => { if (has) tokens.push(cur); cur = ""; has = false; };
+  const emit = (words: string[], level: number) => {
+    if (level > MAX_SHELL_DEPTH) { segments.push({ program: TOO_DEEP, argv: [] }); return; }
+    const seg = toSegment(words, echoRuns || level > 0);
+    if (!seg) return;
+    segments.push(seg);
+    if (seg.nested !== undefined) segments.push(...parseSegments(seg.nested, depth + 1, true));
+    if (seg.inner) emit(seg.inner, level + 1);
+    if (SHELLS.has(seg.program)) {
+      const i = seg.argv.findIndex((a) => /^-[a-z]*c[a-z]*$/.test(a));
+      if (i >= 0 && seg.argv[i + 1] !== undefined) segments.push(...parseSegments(seg.argv[i + 1], depth + 1, true));
+    } else if (seg.program === "eval") {
+      segments.push(...parseSegments(seg.argv.join(" "), depth + 1, true));
+    }
+  };
   const endSegment = () => {
     endToken();
-    if (tokens.length) {
-      const seg = toSegment(tokens, echoRuns);
-      if (seg) {
-        segments.push(seg);
-        if (seg.nested !== undefined) segments.push(...parseSegments(seg.nested, depth + 1, true));
-        if (SHELLS.has(seg.program)) {
-          const i = seg.argv.findIndex((a) => /^-[a-z]*c[a-z]*$/.test(a));
-          if (i >= 0 && seg.argv[i + 1] !== undefined) segments.push(...parseSegments(seg.argv[i + 1], depth + 1, true));
-        } else if (seg.program === "eval") {
-          segments.push(...parseSegments(seg.argv.join(" "), depth + 1, true));
-        }
-      }
-    }
+    if (tokens.length) emit(tokens, 0);
     tokens = [];
   };
   for (let i = 0; i < text.length; i++) {
@@ -173,32 +184,49 @@ export function parseSegments(text: string, depth = 0, echoRuns = false): Segmen
 function toSegment(tokens: string[], echoRuns: boolean): Segment | null {
   let i = 0;
   let nested: string | undefined;
+  let wrapper = "";
   while (i < tokens.length) {
     const t = tokens[i];
+    // `function NAME` defines a function: neither word is the program; the body follows.
+    if (t === "function") { i += 2; continue; }
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t) || KEYWORDS.has(t)) { i++; continue; }
     const base = t.split("/").pop()!;
     const w = Object.hasOwn(WRAPPERS, base) ? WRAPPERS[base] : undefined;
     if (!w && !(echoRuns && ECHO_WRAPPERS.has(base))) break;
     i++;
     if (!w) continue;
-    let viaFlag = false;
-    while (i < tokens.length && tokens[i].startsWith("-") && tokens[i] !== "-") {
-      const f = tokens[i++];
-      if (f === "--") break;
-      if (w.shellFlag?.includes(f)) { nested = tokens.slice(i).join(" "); viaFlag = true; i = tokens.length; break; }
-      if (w.valueFlags.includes(f)) i++;
-    }
-    if (viaFlag) break;
+    wrapper = base;
+    // Flags before the command, and again after the positional words (flock puts
+    // -c / --command after the lock file). Returns true when a shell-string flag
+    // took the rest of the words as nested shell text.
+    const flags = (): boolean => {
+      while (i < tokens.length && tokens[i].startsWith("-") && tokens[i] !== "-") {
+        const f = tokens[i++];
+        if (f === "--") return false;
+        const eq = f.indexOf("=");
+        if (eq > 0 && w.shellFlag?.includes(f.slice(0, eq))) { nested = [f.slice(eq + 1), ...tokens.slice(i)].join(" "); i = tokens.length; return true; }
+        if (w.shellFlag?.includes(f)) { nested = tokens.slice(i).join(" "); i = tokens.length; return true; }
+        if (w.valueFlags.includes(f)) { i++; continue; }
+        // Bundled short flags: `-dn 5`, `-nc 'cmd'`, `-uroot`. The first letter that takes a value ends the token.
+        if (/^-[A-Za-z0-9]{2,}$/.test(f)) {
+          for (let k = 1; k < f.length; k++) {
+            const flag = `-${f[k]}`;
+            const attached = f.slice(k + 1);
+            if (w.shellFlag?.includes(flag)) { nested = [attached, ...tokens.slice(i)].filter(Boolean).join(" "); i = tokens.length; return true; }
+            if (w.valueFlags.includes(flag)) { if (!attached) i++; break; }
+          }
+        }
+      }
+      return false;
+    };
+    if (flags()) break;
     for (let n = 0; n < w.positional && i < tokens.length; n++) i++;
-    // flock puts -c after the lock file, not before it.
-    if (w.shellFlag && i < tokens.length && w.shellFlag.includes(tokens[i])) {
-      nested = tokens.slice(i + 1).join(" "); i = tokens.length; break;
-    }
+    if (w.shellFlag && flags()) break;
     if (w.shell && i < tokens.length) { nested = tokens.slice(i).join(" "); }
   }
   if (i >= tokens.length) {
-    // `flock f -c 'cmd'` leaves no program word; the nested text is the command.
-    return nested === undefined ? null : { program: "flock", argv: [], nested };
+    // `flock f -c 'cmd'` / `env -S 'cmd'` leave no program word; the nested text is the command.
+    return nested === undefined ? null : { program: wrapper, argv: [], nested };
   }
   const program = tokens[i].split("/").pop() ?? tokens[i];
   const argv = tokens.slice(i + 1);
@@ -209,7 +237,8 @@ function toSegment(tokens: string[], echoRuns: boolean): Segment | null {
     if (k + 1 < argv.length) nested = argv.slice(k + 1).join(" ");
   } else if (program === "kubectl" || program === "oc") {
     const d = argv.indexOf("--");
-    if (d >= 0 && d + 1 < argv.length) nested = argv.slice(d + 1).join(" ");
+    // The words after `--` are already split; keep them so `sh -c '<cmd>'` hands its real argument on.
+    if (d >= 0 && d + 1 < argv.length) return { program, argv, inner: argv.slice(d + 1) };
   }
   return { program, argv, ...(nested !== undefined ? { nested } : {}) };
 }
