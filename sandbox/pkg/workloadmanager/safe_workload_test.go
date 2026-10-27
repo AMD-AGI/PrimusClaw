@@ -81,6 +81,9 @@ func TestWorkloadObjectUsesTemplateResources(t *testing.T) {
 	if len(images) != 1 || images[0] != "example@sha256:aa" {
 		t.Fatalf("images=%v", images)
 	}
+	if _, found, _ := unstructured.NestedFieldNoCopy(obj.Object, "spec", "timeout"); found {
+		t.Fatal("timeout must wait until the workload is running")
+	}
 }
 
 func TestCreateWorkloadWaitsForPod(t *testing.T) {
@@ -140,6 +143,14 @@ func TestCreateWorkloadWaitsForPod(t *testing.T) {
 	if result.SandboxName != sandboxID || result.Namespace != "top-models" || result.PodIP != "10.2.0.4" ||
 		result.PodPort != envdPort || result.NodeName != "node-b" || result.Kind != store.WorkloadKind {
 		t.Fatalf("result=%+v", result)
+	}
+	stored, err := dc.Tracker().Get(workloadGVR, "", sandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	timeout, _, _ := unstructured.NestedInt64(stored.(*unstructured.Unstructured).Object, "spec", "timeout")
+	if timeout != 60 {
+		t.Fatalf("timeout=%d", timeout)
 	}
 	if err := creator.Delete(context.Background(), result.SandboxName); err != nil {
 		t.Fatal(err)
@@ -269,6 +280,35 @@ func TestWorkloadTimeoutSeconds(t *testing.T) {
 	}
 	if got := workloadTimeoutSeconds(now.Add(-1500*time.Millisecond), now, 2*time.Second); got != 4 {
 		t.Fatalf("rounded=%d", got)
+	}
+}
+
+func TestWorkloadObjectCarriesStepsAndHostPaths(t *testing.T) {
+	ci := testCodeInterpreter()
+	ci.Spec.Template.Steps = []runtimev1alpha1.SandboxBuildStep{
+		{Type: "env", Args: []string{"RUNNER_CACHE=1"}},
+		{Type: "workdir", Args: []string{"/opt/runner"}},
+		{Type: "run", Args: []string{"install-runner"}},
+	}
+	ci.Spec.Template.Volumes = []corev1.Volume{{
+		Name:         "cache",
+		VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/data/runner-cache"}},
+	}}
+	const sandboxID = "sbx-7a9b9b693452f613877992145c818d29"
+	obj, err := workloadObject(sandboxID, e2b.CreateRequest{
+		SandboxID: sandboxID, TemplateID: ci.Name, Role: "dev", SessionID: "s-8f2a",
+		Workspace: "top-models", GrantID: "gr-01jb7m9k2x", Attestation: "eyJ.test",
+	}, ci)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, _, _ := unstructured.NestedMap(obj.Object, "spec", "env")
+	if env["RUNNER_CACHE"] != "1" || env[startupEnv] != "cd '/opt/runner' && install-runner" {
+		t.Fatalf("env=%v", env)
+	}
+	paths, _, _ := unstructured.NestedStringSlice(obj.Object, "spec", "hostpath")
+	if len(paths) != 1 || paths[0] != "/data/runner-cache" {
+		t.Fatalf("hostpath=%v", paths)
 	}
 }
 

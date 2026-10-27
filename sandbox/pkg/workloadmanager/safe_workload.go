@@ -47,6 +47,8 @@ const (
 	e2bSandboxPrefix           = "sbx-"
 	// platformInferenceKey is not copied onto a grant sandbox.
 	platformInferenceKey = "OPENAI_API_KEY"
+	// startupEnv is a shell snippet the Sandbox template evals before exec envd.
+	startupEnv = "SANDBOX_STARTUP"
 	// safeGeneratedNameLength is SaFE MaxGeneratedNameLength: a 63-character
 	// DNS label minus a 5-character suffix and the separating hyphen.
 	// The Workload name is copied onto the Sandbox, its Pod, its Service, and a label.
@@ -110,6 +112,14 @@ func (c *SafeWorkloadCreator) Create(ctx context.Context, req e2b.CreateRequest)
 	podIP, nodeName, waitErr = c.waitRunning(ctx, name, req.Workspace)
 	if waitErr != nil {
 		return nil, waitErr
+	}
+	// The Workload timeout is measured from dispatch. Set it only after Running
+	// so the E2B lifetime starts once the sandbox is up.
+	if req.Timeout > 0 {
+		waitErr = c.AlignTimeout(ctx, name, req.Timeout, time.Now())
+		if waitErr != nil {
+			return nil, waitErr
+		}
 	}
 	result := &SandboxResult{
 		SandboxName:          name,
@@ -402,11 +412,13 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 		},
 		"resources": []any{resource},
 	}
-	if req.Timeout > 0 {
-		spec["timeout"] = int64(req.Timeout / time.Second)
-	}
-	if env := sandboxEnv(ci.Spec.Template.Environment, req.Env); len(env) > 0 {
+	env := sandboxEnv(ci.Spec.Template.Environment, req.Env)
+	applyTemplateRuntime(ci.Spec.Template, env)
+	if len(env) > 0 {
 		spec["env"] = env
+	}
+	if paths := templateHostPaths(ci.Spec.Template); len(paths) > 0 {
+		spec["hostpath"] = paths
 	}
 	labels := map[string]any{
 		safeDisplayNameLabel: req.Role,
@@ -473,18 +485,69 @@ func quantityString(list corev1.ResourceList, name corev1.ResourceName) string {
 func sandboxEnv(template []corev1.EnvVar, extra map[string]string) map[string]any {
 	env := map[string]any{}
 	for _, item := range template {
-		if item.Name == "" || item.Name == platformInferenceKey || item.Value == "" {
+		if item.Name == "" || item.Name == platformInferenceKey || item.Name == startupEnv || item.Value == "" {
 			continue
 		}
 		env[item.Name] = item.Value
 	}
 	for key, value := range extra {
-		if key == "" || key == platformInferenceKey {
+		if key == "" || key == platformInferenceKey || key == startupEnv {
 			continue
 		}
 		env[key] = value
 	}
 	return env
+}
+
+// applyTemplateRuntime copies env and workdir/run steps onto the Workload.
+// SaFE has no steps field. Env steps become spec.env. Run and workdir steps
+// become SANDBOX_STARTUP, which the Sandbox template evals before exec envd.
+func applyTemplateRuntime(tmpl *runtimev1alpha1.CodeInterpreterSandboxTemplate, env map[string]any) {
+	if tmpl == nil {
+		return
+	}
+	var steps []string
+	for _, step := range tmpl.Steps {
+		if len(step.Args) == 0 || step.Args[0] == "" {
+			continue
+		}
+		switch step.Type {
+		case "env":
+			key, value, ok := strings.Cut(step.Args[0], "=")
+			if ok && key != "" && key != platformInferenceKey && key != startupEnv {
+				env[key] = value
+			}
+		case "workdir":
+			steps = append(steps, "cd "+shellSingleQuote(step.Args[0]))
+		case "run":
+			steps = append(steps, step.Args[0])
+		}
+	}
+	if script := strings.Join(steps, " && "); script != "" {
+		env[startupEnv] = script
+	}
+}
+
+// templateHostPaths returns host paths SaFE mounts at the same path.
+// A Sandbox host path is read-only. Volumes that are not hostPath have no
+// Workload field.
+func templateHostPaths(tmpl *runtimev1alpha1.CodeInterpreterSandboxTemplate) []any {
+	if tmpl == nil {
+		return nil
+	}
+	var out []any
+	seen := map[string]struct{}{}
+	for _, vol := range tmpl.Volumes {
+		if vol.HostPath == nil || vol.HostPath.Path == "" {
+			continue
+		}
+		if _, ok := seen[vol.HostPath.Path]; ok {
+			continue
+		}
+		seen[vol.HostPath.Path] = struct{}{}
+		out = append(out, vol.HostPath.Path)
+	}
+	return out
 }
 
 func dnsLabel(value string, max int) bool {

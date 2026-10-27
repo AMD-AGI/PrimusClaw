@@ -88,7 +88,11 @@ func (h *Handler) list(c *gin.Context) {
 		writeErr(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, resp)
+	if resp.NextToken != "" {
+		c.Header("X-Next-Token", resp.NextToken)
+	}
+	// The E2B SDK decodes the list body as a JSON array.
+	c.JSON(http.StatusOK, resp.Sandboxes)
 }
 
 func (h *Handler) kill(c *gin.Context) {

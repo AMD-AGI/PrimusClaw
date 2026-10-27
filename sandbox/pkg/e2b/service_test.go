@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -168,7 +169,7 @@ func TestReplayWaitsWhilePending(t *testing.T) {
 	svc, runner, keys := testPlane(t, 600, []int32{1}, 1)
 	runner.started = make(chan struct{})
 	runner.hold = make(chan struct{})
-	body := CreateBody{TemplateID: "runner", Timeout: 60, Metadata: map[string]string{"idempotency-key": "once"}}
+	body := CreateBody{TemplateID: "runner", Timeout: 60, Metadata: map[string]string{"agent-sandbox.io/idempotency-key": "once"}}
 	done := make(chan error, 1)
 	go func() {
 		_, _, err := svc.Create(context.Background(), keys["measurement"], body)
@@ -196,7 +197,7 @@ func TestCreateReplayKillAndQuota(t *testing.T) {
 	key := keys["measurement"]
 	first, status, err := svc.Create(context.Background(), key, CreateBody{
 		TemplateID: "runner", Timeout: 60,
-		Metadata: map[string]string{"idempotency-key": "once", "agent-sandbox.io/team": "a"},
+		Metadata: map[string]string{"agent-sandbox.io/idempotency-key": "once", "agent-sandbox.io/team": "a"},
 		EnvVars:  map[string]string{"FOO": "1"},
 	})
 	if err != nil || status != http.StatusCreated {
@@ -219,7 +220,7 @@ func TestCreateReplayKillAndQuota(t *testing.T) {
 		t.Fatalf("ref=%+v err=%v", ref, err)
 	}
 	second, status, err := svc.Create(context.Background(), key, CreateBody{
-		TemplateID: "runner", Metadata: map[string]string{"idempotency-key": "once"},
+		TemplateID: "runner", Metadata: map[string]string{"agent-sandbox.io/idempotency-key": "once"},
 	})
 	if err != nil || status != http.StatusOK || second.SandboxID != first.SandboxID || second.EnvdAccessToken == "" {
 		t.Fatalf("status=%d err=%v second=%+v", status, err, second)
@@ -244,7 +245,7 @@ func TestCreateReplayKillAndQuota(t *testing.T) {
 		t.Fatalf("listed=%+v", listed.Sandboxes[0])
 	}
 	_, _, err = svc.Create(context.Background(), key, CreateBody{
-		TemplateID: "runner", Metadata: map[string]string{"idempotency-key": "other"},
+		TemplateID: "runner", Metadata: map[string]string{"agent-sandbox.io/idempotency-key": "other"},
 	})
 	if !grant.IsReason(err, "grant_quota_exceeded") || !strings.HasPrefix(err.Error(), "grant_quota_exceeded") {
 		t.Fatalf("err=%v", err)
@@ -263,15 +264,20 @@ func TestCreateReplayKillAndQuota(t *testing.T) {
 		t.Fatalf("deleted=%v", runner.deleted)
 	}
 	got, err := svc.Get(context.Background(), key, first.SandboxID)
-	if err != nil || got.State != runtimev1alpha1.SandboxEnded || got.CPUCount != 0 {
+	if err != nil || got.State != runtimev1alpha1.SandboxEnded || got.CPUCount != 0 || got.ClientID != first.SandboxID {
 		t.Fatalf("got=%+v err=%v", got, err)
+	}
+	_, err = svc.grants.LookupAccess(context.Background(), first.SandboxID, first.EnvdAccessToken)
+	var ended *grant.OpError
+	if !errors.As(err, &ended) || ended.Status != http.StatusGone {
+		t.Fatalf("killed data plane err=%v", err)
 	}
 	listed, err = svc.List(context.Background(), key, "", "", "", 0)
 	if err != nil || len(listed.Sandboxes) != 0 {
 		t.Fatalf("listed=%+v err=%v", listed, err)
 	}
 	_, _, err = svc.Create(context.Background(), key, CreateBody{
-		TemplateID: "ar-01ja-runner-g1", Metadata: map[string]string{"idempotency-key": "once"},
+		TemplateID: "ar-01ja-runner-g1", Metadata: map[string]string{"agent-sandbox.io/idempotency-key": "once"},
 	})
 	if !grant.IsReason(err, "idempotency_key_spent") || !strings.Contains(err.Error(), first.SandboxID) {
 		t.Fatalf("err=%v", err)
@@ -288,9 +294,9 @@ func TestListFiltersHyperloomMetadata(t *testing.T) {
 		_, _, err := svc.Create(context.Background(), key, CreateBody{
 			TemplateID: "ar-01ja-runner-g1",
 			Metadata: map[string]string{
-				"idempotency-key":   purpose,
-				"hyperloom.run-id":  "run-9",
-				"hyperloom.purpose": purpose,
+				"agent-sandbox.io/idempotency-key": purpose,
+				"hyperloom.run-id":                 "run-9",
+				"hyperloom.purpose":                purpose,
 			},
 		})
 		if err != nil {
@@ -309,6 +315,14 @@ func TestCreateRefusesMetadataEnvAndTimeout(t *testing.T) {
 	_, _, err := svc.Create(context.Background(), key, CreateBody{TemplateID: "runner", Metadata: map[string]string{"node-name": "n1"}})
 	if !grant.IsReason(err, "metadata_reserved") {
 		t.Fatalf("err=%v", err)
+	}
+	_, _, err = svc.Create(context.Background(), key, CreateBody{TemplateID: "runner", Metadata: map[string]string{"agent-sandbox.io/node-name": "n1"}})
+	if !grant.IsReason(err, "metadata_reserved") {
+		t.Fatalf("prefixed node-name err=%v", err)
+	}
+	_, _, err = svc.Create(context.Background(), key, CreateBody{TemplateID: "runner", Metadata: map[string]string{"idempotency-key": "once"}})
+	if !grant.IsReason(err, "metadata_not_allowed") {
+		t.Fatalf("unprefixed idempotency err=%v", err)
 	}
 	_, _, err = svc.Create(context.Background(), key, CreateBody{TemplateID: "runner", Metadata: map[string]string{"other": "x"}})
 	if !grant.IsReason(err, "metadata_not_allowed") {
@@ -410,6 +424,9 @@ func TestV2RoutesReachHandlers(t *testing.T) {
 		if w.Code != tc.want || strings.Contains(w.Body.String(), "page not found") {
 			t.Fatalf("%s %s=%d %s", tc.method, tc.path, w.Code, w.Body.String())
 		}
+		if tc.method == http.MethodGet && tc.path == "/v2/sandboxes" && !strings.HasPrefix(strings.TrimSpace(w.Body.String()), "[") {
+			t.Fatalf("list body %s", w.Body.String())
+		}
 	}
 }
 
@@ -468,8 +485,8 @@ func TestListLimitAndMetadataLiterals(t *testing.T) {
 	_, _, err := svc.Create(context.Background(), key, CreateBody{
 		TemplateID: "ar-01ja-runner-g1",
 		Metadata: map[string]string{
-			"idempotency-key":  "plus",
-			"hyperloom.run-id": "a+b",
+			"agent-sandbox.io/idempotency-key": "plus",
+			"hyperloom.run-id":                 "a+b",
 		},
 	})
 	if err != nil {
