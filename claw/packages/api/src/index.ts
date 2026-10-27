@@ -8,7 +8,7 @@ import multipart from "@fastify/multipart";
 import {
   API_PORT, APP_ENV, SAFE_API_URL, DATABASE_URL, resolveCorsOrigin,
   AUTH_INTERNAL_TOKEN, NATS_URL,
-  CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
+  CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
   runLeaseTiming, envSettingProblems, assertAdmissionSettings,
 } from "./config.js";
 import { runLeaseTimingProblems } from "@claw/protocol";
@@ -37,6 +37,8 @@ import { registerTaskDagRoutes } from "./routes/task-dags.js";
 import { registerTaskRoutes } from "./routes/tasks.js";
 import { registerRunRoutes } from "./runs/routes.js";
 import { registerWorkbenchRoutes } from "./workbenches/routes.js";
+import { registerTriggerRoutes } from "./routes/triggers.js";
+import { startTriggerScheduler } from "./triggers/scheduler.js";
 import { startScheduler } from "./tasks/scheduler.js";
 import { startSweeper } from "./tasks/sweeper.js";
 import { startExternalResolver } from "./tasks/external-resolver.js";
@@ -274,6 +276,8 @@ async function main() {
   await registerTaskRoutes(app);
   await registerRunRoutes(app);
   await registerWorkbenchRoutes(app);
+  // Scheduled triggers: nothing is registered unless the deployment turns them on.
+  if (CLAW_TRIGGERS_ENABLED) await registerTriggerRoutes(app);
 
   // Reconcile SYSTEM_ENV KV with DB at boot so brain sees current global env
   // even if no admin write happens during this process lifetime.
@@ -301,6 +305,7 @@ async function main() {
   // Background upload TTL sweeper (deletes user uploads > UPLOAD_TTL_DAYS old)
   startUploadSweeper();
 
+  if (CLAW_TRIGGERS_ENABLED) startTriggerScheduler();
   // Outbound notification delivery (HMAC-signed webhooks from the outbox).
   // Gated: with the flag off no table exists and nothing polls.
   if (CLAW_NOTIFICATIONS_ENABLED) startNotificationWorker();
