@@ -363,11 +363,10 @@ config:
                   - "_INBOX.>"
                   - "interrupt.*"
                   - "cleanup.*"
-                  # `decision.*` is deliberately absent. Nothing constructs the
-                  # decision dispatcher today, and a permission granted for a
-                  # subscriber that does not exist is scope that no test and no
-                  # reader can justify. Add it back in the change that wires
-                  # the HITL path up, where it can be seen to be needed.
+                  # The approval gate (agent/hitl.ts) subscribes to
+                  # `decision.<sessionId>` for the run's pending approvals; the
+                  # api is the only publisher (publish list above).
+                  - "decision.*"
 
           # Reads two buckets, writes nothing. It is a CronJob that deletes
           # directories, so the smallest possible grant matters. It is

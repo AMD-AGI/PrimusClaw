@@ -24,3 +24,14 @@ test("the bound is the maximum app grace plus room to finish, so a stuck finish 
   markGracefulStop(ctrl, 0);
   assert.equal(gracefulStopRemainingMs(ctrl, 0), GRACEFUL_STOP_MAX_MS);
 });
+
+test("only a user's cancel reclaims; a handover and the run's own endings do not", async () => {
+  const { isUserCancelReason, SIGTERM_ABORT_REASON, LEASE_LOST_ABORT_REASON,
+    RUN_ROW_TERMINAL_ABORT_REASON, DEADLINE_EXCEEDED_ABORT_REASON } = await import("../src/tasks/abort-registry.js");
+  assert.equal(isUserCancelReason(SIGTERM_ABORT_REASON), false);
+  assert.equal(isUserCancelReason(LEASE_LOST_ABORT_REASON), false);
+  assert.equal(isUserCancelReason(RUN_ROW_TERMINAL_ABORT_REASON), false);
+  assert.equal(isUserCancelReason(DEADLINE_EXCEEDED_ABORT_REASON), false);
+  assert.equal(isUserCancelReason(undefined), true, "an abort with no reason is a user's Stop");
+  assert.equal(isUserCancelReason(new Error("cancelled by user")), true);
+});

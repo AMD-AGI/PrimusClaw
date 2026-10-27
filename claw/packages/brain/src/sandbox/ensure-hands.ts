@@ -292,6 +292,14 @@ export interface EnsureHandsOptions {
    * cancel pass none.
    */
   signal?: AbortSignal;
+  /**
+   * Whether an abort of `signal` is a cancel the sandbox wait should reclaim for.
+   * A graceful restart, a successor taking the run over, a deadline and a
+   * terminal run row are not: the workload and its PENDING entry are then left
+   * for the next run to adopt or for the failure path to reap. Absent: every
+   * abort is a cancel.
+   */
+  reclaimOnAbort?: () => boolean;
 }
 
 /**
@@ -2747,6 +2755,8 @@ async function provisionHands(
       platformKey: apiKey,
       onProvisioned,
       onEvent,
+      signal: options.signal,
+      reclaimOnAbort: options.reclaimOnAbort,
     });
   } catch (err) {
     await hold.release();

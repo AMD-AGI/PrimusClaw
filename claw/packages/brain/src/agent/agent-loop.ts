@@ -2213,6 +2213,7 @@ class AgentLoopRunner {
         userId: this.userId, sessionId: this.sessionId,
         depth: this.depth + 1,
         hooks: this.opts.hooks,
+        hitl: this.opts.hitl,
         runIdentity: this.opts.runIdentity,
         webToolServices: this.router.getWebToolServices?.(),
         });

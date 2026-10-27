@@ -1035,6 +1035,30 @@ export const SANDBOX_POLL_TIMEOUT_MS = envInt("SANDBOX_POLL_TIMEOUT_MS", 60 * 60
 // the lease is its liveness signal and this setting remains provisioning policy.
 export const SANDBOX_PENDING_TIMEOUT_MS = envInt("SANDBOX_PENDING_TIMEOUT_SECONDS", 3 * 60 * 60) * 1000;
 
+// Maximum duration of a SINGLE continuous "dispatched but not ready" wait: the
+// workload has left Pending (it was scheduled) and is still short of ready --
+// pulling an image, starting a container, or stuck in a state that will never
+// resolve, such as an image that cannot be pulled. The message is failed
+// terminally with reason `sandbox_start_timeout` and the workload is reclaimed.
+//
+// Why a ceiling rather than reading the cause: SaFE's workload detail reports
+// container state only for pods that have already terminated, so a container
+// waiting on a failed image pull is indistinguishable, from the API, from one
+// that is still pulling. Without this the wait ended only at the workload's own
+// timeout, hours later, with the user's Stop doing nothing (it is also honoured
+// now, see waitForWorkloadReady). The clock RESETS if the workload falls back to
+// Pending. Set it above the slowest legitimate image pull for the deployment.
+// 0 waits indefinitely. Stored in ms; configured in seconds like the siblings.
+export const SANDBOX_START_TIMEOUT_MS = envInt("SANDBOX_START_TIMEOUT_SECONDS", 15 * 60) * 1000;
+
+// The same ceiling for a multi-node GPU cluster, off by default. A cluster's
+// start is routinely longer than a single sandbox's -- large GPU images, and an
+// Infera cluster is not ready until every role pod is up while the workload
+// already reads Running -- and giving up on one DELETEs the cluster, so a
+// ceiling sized for a sandbox would delete healthy clusters. Set it only above
+// the slowest legitimate cluster start. 0 waits indefinitely.
+export const MULTI_NODE_START_TIMEOUT_MS = envInt("MULTI_NODE_START_TIMEOUT_SECONDS", 0) * 1000;
+
 // How long a PENDING `hands.<sid>` entry may sit there with nobody running for
 // it before the sweeper treats it as abandoned, stops its workload and deletes
 // the entry. Configured in seconds like the ceiling above, stored in ms. Set

@@ -151,11 +151,21 @@ spec:
                 matchLabels:
                   app: primus-claw
                   component: primus-claw-brain
-      {{- if and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
+      {{- if or (and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml) .Values.tls.extraCACertsConfigMap }}
       volumes:
+      {{- if and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
       - name: sandbox-template
         configMap:
           name: {{ .Values.sandboxTemplate.name }}
+      {{- end }}
+      {{- if .Values.tls.extraCACertsConfigMap }}
+      - name: extra-ca
+        configMap:
+          name: {{ .Values.tls.extraCACertsConfigMap | quote }}
+          items:
+          - key: {{ required "tls.extraCACertsKey must be set when tls.extraCACertsConfigMap is set" .Values.tls.extraCACertsKey | quote }}
+            path: ca.crt
+      {{- end }}
       {{- end }}
       containers:
       - name: brain
@@ -231,6 +241,10 @@ spec:
         - name: NODE_TLS_REJECT_UNAUTHORIZED
           value: "0"
         {{- end }}
+        {{- if .Values.tls.extraCACertsConfigMap }}
+        - name: NODE_EXTRA_CA_CERTS
+          value: /etc/claw-ca/ca.crt
+        {{- end }}
         {{- if and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
         - name: AGENT_SANDBOX_TEMPLATE_FILE
           value: /etc/claw/codeinterpreter-base.yaml
@@ -302,11 +316,18 @@ spec:
         # of them and the sandbox never starts.
         - name: HANDS_ENV_FILE_WAIT_SEC
           value: {{ .Values.brain.handsEnvFileWaitSec | quote }}
-        {{- if and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
+        {{- if or (and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml) .Values.tls.extraCACertsConfigMap }}
         volumeMounts:
+        {{- if and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
         - name: sandbox-template
           mountPath: /etc/claw
           readOnly: true
+        {{- end }}
+        {{- if .Values.tls.extraCACertsConfigMap }}
+        - name: extra-ca
+          mountPath: /etc/claw-ca
+          readOnly: true
+        {{- end }}
         {{- end }}
         startupProbe:
           httpGet: { path: /health, port: http }
