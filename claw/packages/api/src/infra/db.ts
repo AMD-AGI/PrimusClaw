@@ -1219,6 +1219,15 @@ export async function initDb(): Promise<void> {
       ON claw_memory_entries(user_id) WHERE category = 'user_profile'
     `).catch(() => {});
 
+    // Per-user opt-in for long-term memory. No row means off.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS claw_user_memory_prefs (
+        user_id     TEXT PRIMARY KEY,
+        enabled     BOOLEAN NOT NULL DEFAULT FALSE,
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
     // Skill storage + version management (Phase 3)
     await client.query(`
       CREATE TABLE IF NOT EXISTS claw_skills (

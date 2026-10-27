@@ -858,8 +858,11 @@ async function handleComplete(
       const blocked = scanMemoryContent(mem.content);
       if (blocked) { logger.warn({ reason: blocked }, "memory.blocked"); continue; }
       try {
-        await insertMemoryEntry(userId, { ...mem, sourceSession: sessionId, sourceType: "explicit" });
-        explicitMemorySaved = true;
+        if (await insertMemoryEntry(userId, { ...mem, sourceSession: sessionId, sourceType: "explicit" })) {
+          explicitMemorySaved = true;
+        } else {
+          logger.warn({ sessionId }, "memory.write_skipped_user_opted_out");
+        }
       } catch (err) {
         logger.error({ err, sessionId }, "memory.save_failed");
       }
