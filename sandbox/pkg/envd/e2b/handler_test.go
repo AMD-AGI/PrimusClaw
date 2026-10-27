@@ -185,6 +185,45 @@ func TestEnvelopedStart(t *testing.T) {
 	}
 }
 
+func TestStartOmitsStdinEnds(t *testing.T) {
+	ws := t.TempDir()
+	mux := http.NewServeMux()
+	Mount(mux, ws, execStarter(ws))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	body := protoStartStdin("sh", nil, "-c", "printf hello")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/process.Process/Start", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/proto")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	events, err := readEvents(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	ended := false
+	for _, ev := range events {
+		if len(ev.data) > 0 && !ev.err {
+			out.Write(ev.data)
+		}
+		if ev.end {
+			ended = true
+		}
+	}
+	if !ended || out.String() != "hello" {
+		t.Fatalf("stdout=%q ended=%v", out.String(), ended)
+	}
+}
+
 func TestStdinAndSignal(t *testing.T) {
 	ws := t.TempDir()
 	mux := http.NewServeMux()
