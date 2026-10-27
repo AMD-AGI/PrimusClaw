@@ -32,7 +32,7 @@ export async function startPluginWorld(): Promise<PluginWorld> {
       res.setHeader("content-type", "application/xml");
       res.end(
         `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`
-        + `<Name>plugins</Name><Prefix>${prefix}</Prefix><KeyCount>${keys.length}</KeyCount><MaxKeys>1000</MaxKeys>`
+        + `<Name>plugins</Name><KeyCount>${keys.length}</KeyCount><MaxKeys>1000</MaxKeys>`
         + `<IsTruncated>false</IsTruncated>${keys.map((k) => `<Contents><Key>${k}</Key></Contents>`).join("")}</ListBucketResult>`,
       );
       return;

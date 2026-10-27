@@ -39,7 +39,8 @@ pw.put("hooks/h30/hooks.json", JSON.stringify({ hooks: { SessionStart: [{ comman
 pw.put("hooks/h30/start.sh", "#!/bin/sh\necho '{}'\n");
 
 const { AgentEngine } = await import("../src/agent/engine.js");
-const onEvent = async () => {};
+let events: Array<Record<string, unknown>> = [];
+const onEvent = async (e: unknown) => { events.push(e as Record<string, unknown>); };
 
 const SKILL_ROWS = [skillRow(2, "board-ops"), skillRow(3, "fleet-ops")];
 const BOARD_FILES = ["SKILL.md", "scripts/api.py", "references/extra.md"].map((f) => `.skills/board-ops/${f}`);
@@ -58,10 +59,11 @@ function skillWrites(calls: Call[]): Array<{ at: number; file: string }> {
   return out;
 }
 
-async function run(over: Record<string, unknown>) {
+async function run(over: Record<string, unknown>, shape?: (h: ReturnType<typeof fakeHands>) => void) {
   let attached = 0;
   const made: Array<ReturnType<typeof fakeHands>> = [];
-  const extras = { attachHands: async () => { attached++; const h = fakeHands(); made.push(h); return h as never; } };
+  const extras = { attachHands: async () => { attached++; const h = fakeHands(); shape?.(h); made.push(h); return h as never; } };
+  events = [];
   world.llmBodies.length = 0;
   const result = await new AgentEngine().execute(baseRequest(over), onEvent as never, undefined, null as never, extras as never);
   return { attached, made, result, prompt: world.llmBodies[0] ?? "" };
@@ -191,4 +193,27 @@ test("a request-local skill of the same name wins; the plugin's copy is never wr
   });
   assert.ok(r.prompt.includes("LOCAL-BODY-MARKER") && !r.prompt.includes("BOARD-BODY-MARKER"));
   assert.deepEqual(skillWrites(r.made.flatMap((h) => h.calls)).filter((w) => w.file.startsWith(".skills/board-ops")), []);
+});
+
+test("a failed write of a plugin skill fails the call that needed it, names the skill, and is retried by repeating the call", async () => {
+  // The first three writes (the three files of board-ops) are refused, later ones succeed.
+  let refused = 0;
+  const shape = (h: ReturnType<typeof fakeHands>) => {
+    const real = h.callTool;
+    h.callTool = async (name: string, args: Record<string, unknown>) => {
+      const out = await real(name, args);
+      if (name === "write" && refused < 3) { refused++; return `Error writing ${String(args.path)}: disk full`; }
+      return out;
+    };
+  };
+  const cat = { tool: "bash", input: { command: "cat /workspace/.skills/board-ops/SKILL.md" } } as const;
+  world.script([cat, cat, { text: "done" }]);
+  const r = await run({ plugin_id: 5, plugin_tools: [...SKILL_ROWS] }, shape);
+  const calls = r.made.flatMap((h) => h.calls);
+  const bashAt = calls.map((c, i) => ({ c, i })).filter(({ c }) => c.name === "bash").map(({ i }) => i);
+  assert.equal(bashAt.length, 1, "the first call was not run; the repeat was");
+  assert.ok(skillWrites(calls).filter((w) => w.at < bashAt[0]).length >= 6, "the repeat re-wrote the skill (3 refused + 3 written) before running");
+  const second = world.llmBodies[1] ?? "";
+  assert.ok(second.includes("Failed to write plugin skill 'board-ops' into the sandbox"), "the model is told which skill and that the call did not run");
+  assert.ok(events.some((e) => e.status === "error" && e.actionId === "plugin_skill_2" && String(e.brief).includes("board-ops")), "a visible error event");
 });

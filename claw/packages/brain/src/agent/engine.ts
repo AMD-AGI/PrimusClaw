@@ -193,6 +193,7 @@ export class AgentEngine {
         localDir,
         toolId: pluginLayer.skillToolIds?.[name] ?? 0,
         description: skillDescription(pluginLayer.skillContents[name] ?? "", name),
+        source: "plugin" as const,
       }));
     // With progressive skills on, plugin skills are listed by name and
     // description like the platform defaults (same hint, same on-demand read)

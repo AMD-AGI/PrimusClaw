@@ -42,6 +42,11 @@ export interface DefaultSkill {
   localDir: string;
   /** Stage again when `localDir` is gone (e.g. the Brain restarted its cache). */
   restage?: () => Promise<string>;
+  /**
+   * A skill that came with the request's plugin rather than from the platform
+   * defaults. Its write must not fail quietly: see `LazyDefaultSkills.ensure`.
+   */
+  source?: "plugin";
 }
 
 const SKILL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
@@ -376,6 +381,15 @@ export class LazyDefaultSkills {
    * A call that names only skills already written has nothing to write: with a
    * dozen plugin skills behind one writer, re-reading a file of a skill that is
    * on disk must not upload the other eleven.
+   *
+   * A failed write of a platform default is reported and swallowed (see the
+   * class comment). A failed write of a PLUGIN skill throws after every skill
+   * the call needed has been tried: the plugin's skills used to be written up
+   * front and a failure failed the turn, and the plugin's instructions may be
+   * only in the file (progressive listing), so running the call on without them
+   * would hand the agent a bare file-not-found for a skill it was told to use.
+   * The throw fails that one tool call, with a message naming the skill; the
+   * skill stays pending, so repeating the call writes it again.
    */
   async ensure(hands: HandsClient, text: string, coldSandbox = false): Promise<void> {
     if (hands !== this.lastHands) { this.written.clear(); this.lastHands = hands; }
@@ -385,8 +399,10 @@ export class LazyDefaultSkills {
     const namesAWrittenSkill = this.skills.some((s) => this.written.has(s.name) && text.includes(s.name));
     const todo = named.length ? named : namesAWrittenSkill ? [] : pending;
     const rel = this.sessionDir === "/workspace" ? "" : this.sessionDir.replace(/^\/workspace\/?/, "").replace(/^\/+/, "");
+    const failedPlugin: string[] = [];
     for (const s of todo) {
       const t0 = Date.now();
+      const plugin = s.source === "plugin";
       try {
         const base = rel ? path.posix.join(rel, ".skills", s.name) : path.posix.join(".skills", s.name);
         const attempt = async () => {
@@ -404,13 +420,28 @@ export class LazyDefaultSkills {
           await attempt();
         }
         this.written.add(s.name);
-        metrics.onPlatformSkillLazyWrite("ok", (Date.now() - t0) / 1000, coldSandbox);
+        // Plugin skills are not platform defaults: they stay out of the
+        // platform-default metrics, as they stay out of its events below.
+        if (plugin) logger.info({ name: s.name, toolId: s.toolId, elapsedMs: Date.now() - t0 }, "skill.plugin_written_to_sandbox");
+        else metrics.onPlatformSkillLazyWrite("ok", (Date.now() - t0) / 1000, coldSandbox);
       } catch (err) {
+        if (plugin) {
+          logger.warn({ name: s.name, toolId: s.toolId, err: (err as Error).message }, "skill.plugin_write_failed");
+          failedPlugin.push(s.name);
+          await this.onEvent?.({ type: "toolUsed", tool: "download_skill", actionId: `plugin_skill_${s.toolId}`, status: "error", brief: `Failed to write plugin skill: ${s.name}` });
+          continue;
+        }
         logger.warn({ name: s.name, err: (err as Error).message }, "platform_defaults.lazy_write_failed");
         metrics.onPlatformSkillLazyWrite("failed", (Date.now() - t0) / 1000, coldSandbox);
         metrics.onPlatformDefault("skill", "failed", "lazy_write");
         await this.onEvent?.({ type: "toolUsed", tool: "platform_defaults", actionId: `platform_default_write_${s.toolId}`, status: "error", brief: `Failed to write default skill: ${s.name}` });
       }
+    }
+    if (failedPlugin.length) {
+      throw new Error(
+        `Failed to write plugin skill ${failedPlugin.map((n) => `'${n}'`).join(", ")} into the sandbox; `
+        + `this call was not run. Repeat it to retry the write.`,
+      );
     }
   }
 }
