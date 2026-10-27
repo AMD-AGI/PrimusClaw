@@ -182,6 +182,7 @@ Claw has a separate queue cap, unrelated to the idle window:
 |--------|---------|------|
 | `SANDBOX_IDLE_REUSE_SECONDS` | **15 minutes** (`900`) | Running sandbox, empty `GET /api/jobs`, no in-flight message. Clock starts at `quiescedAt`. Then CAS `ready`→`closing` and `destroyHands`. |
 | `SANDBOX_PENDING_TIMEOUT_SECONDS` | **3 hours** | Sandbox Workload **phase=Pending** queued longer than this → terminal failure `sandbox_pending_timeout` to the frontend. The clock stops after leaving Pending (scheduled). Image pull is not Pending. `0` waits on the queue indefinitely. |
+| `SANDBOX_START_TIMEOUT_SECONDS` | **15 minutes** (`900`) | Workload has left Pending (scheduled) but is still not ready for longer than this → terminal failure `sandbox_start_timeout`, workload stopped. Catches a container that can never start (for example an image that cannot be pulled), which SaFE does not report as a distinct state. The clock restarts if the workload falls back to Pending. `0` disables it. |
 | `SANDBOX_POLL_TIMEOUT_MS` | 1 hour | Ends only when SaFE **status is unreadable** (sustained 5xx, network failure, no phase), reason `sandbox_status_unreadable`. Readable Pending does not trigger it. |
 | SaFE Workload `timeout` | value on the task request (e.g. 46800s) | Hard cap from **StartTime / Running**, excluding queue time. |
 | `RUN_QUEUE_MAX_SEC` (API) | 2 hours | Task row never claimed by a worker; not sandbox Workload Pending. |

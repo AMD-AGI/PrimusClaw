@@ -13,7 +13,8 @@ import { pendingSecretColumns } from "../tasks/run-secrets.js";
 import {
   forceIdleAfterInterrupt, releaseSessionGateForTurn, stopSessionRuns, takeSessionGate,
 } from "../tasks/chat-run.js";
-import { kv } from "../infra/nats.js";
+import { kv, nc, sc } from "../infra/nats.js";
+import { buildDecisionMessage } from "../sessions/decision-message.js";
 import { getUser } from "../auth/middleware.js";
 import {
   canAccessSession,
@@ -24,6 +25,7 @@ import {
 } from "../auth/models.js";
 import { getContextUsageSnapshot } from "../sessions/context-builder.js";
 import { publicSessionRow } from "../events/redaction.js";
+import { archiveSession, unarchiveSession } from "../sessions/archive.js";
 import {
   isUserEnvKeyAllowed,
   validateTopology, type EnvironmentTopology,
@@ -1405,11 +1407,18 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
   // --- List Sessions (with A2A children inlined) ---
   // scope=all is restricted to admin (system-admin / system-admin-readonly);
   // any other user passing scope=all silently falls back to their own sessions.
-  app.get("/v1/sessions", async (req) => {
+  app.get("/v1/sessions", async (req, reply) => {
     const user = getUser(req);
     const userId = user?.userId ?? "default";
-    const q = req.query as { scope?: string; limit?: string; offset?: string } | undefined;
+    const q = req.query as { scope?: string; limit?: string; offset?: string; status?: string } | undefined;
     const scope = q?.scope;
+    // `status` filters by archive state: active (not archived), archived, or
+    // all. Omitted means all, which is what this endpoint returned before the
+    // filter existed, so existing callers see no change.
+    const statusFilter = q?.status ?? "all";
+    if (!["active", "archived", "all"].includes(statusFilter)) {
+      return reply.status(400).send({ ok: false, error: "status must be active, archived or all" });
+    }
     const wantAll = scope === "all" && !!user && isAdmin(user);
 
     // Pagination (project convention: limit/offset, mirrors /v1/resources).
@@ -1418,9 +1427,11 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     const limit = Math.min(200, Math.max(1, Number(q?.limit) || 50));
     const offset = Math.max(0, Number(q?.offset) || 0);
 
-    const whereSql = wantAll
+    const statusSql = statusFilter === "active" ? " AND COALESCE(status, 'active') <> 'archived'"
+      : statusFilter === "archived" ? " AND status = 'archived'" : "";
+    const whereSql = (wantAll
       ? "deleted_at IS NULL"
-      : "user_id = $1 AND deleted_at IS NULL";
+      : "user_id = $1 AND deleted_at IS NULL") + statusSql;
     const whereParams: unknown[] = wantAll ? [] : [userId];
 
     const total = Number(
@@ -1524,6 +1535,32 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     );
     return { ok: true, data: { session_id: sessionId, name: newName.slice(0, 255) } };
   });
+
+  // --- Archive / unarchive (owner only; reversible, only flips `status`) ---
+  for (const action of ["archive", "unarchive"] as const) {
+    app.post<{ Params: { id: string } }>(`/v1/sessions/:id/${action}`, async (req, reply) => {
+      const sessionId = req.params.id;
+      const user = getUser(req);
+      const row = (await db.query(
+        "SELECT session_id, user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
+        [sessionId],
+      )).rows[0];
+      if (!row) return reply.status(404).send({ ok: false, error: "session not found" });
+      if (!canAccessSession(row.user_id, user?.userId ?? "default") && !(!row.user_id && user && isSystemAdmin(user))) {
+        return reply.status(403).send({ ok: false, error: `only the session owner can ${action}` });
+      }
+      if (action === "archive") {
+        const res = await archiveSession(sessionId);
+        if (res === "running") {
+          return reply.status(409).send({ ok: false, error: "session_running" });
+        }
+        if (res === "not_found") return reply.status(404).send({ ok: false, error: "session not found" });
+      } else if (!await unarchiveSession(sessionId)) {
+        return reply.status(404).send({ ok: false, error: "session not found" });
+      }
+      return { ok: true, data: { session_id: sessionId, status: action === "archive" ? "archived" : "active" } };
+    });
+  }
 
   // --- Send Message (V1/V2 split) ---
   app.post<{ Params: { id: string } }>("/v1/sessions/:id/messages", async (req, reply) => {
@@ -1637,8 +1674,20 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     }
 
     if (messageType === "decision") {
-      // V2 agent-loop has no interactive tool-permission gate yet.
-      return reply.status(501).send({ ok: false, error: "decision messages not supported on v2 sessions" });
+      // The answer to a pending tool-approval request (Brain's approval gate,
+      // agent/hitl.ts). Only a person who may write to the session can give it.
+      const row = (await db.query(
+        "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
+        [sessionId],
+      )).rows[0];
+      if (!row) return reply.status(404).send({ ok: false, error: "session not found" });
+      if (!canWriteSessionAsOperator(row.user_id, user)) {
+        return reply.status(403).send({ ok: false, error: "access denied" });
+      }
+      const built = buildDecisionMessage(sessionId, userId, body);
+      if (!built.ok) return reply.status(400).send({ ok: false, error: built.error });
+      nc.publish(`decision.${sessionId}`, sc.encode(JSON.stringify(built.message)));
+      return { ok: true, session_id: sessionId, action_id: built.message.action_id, decision: built.message.decision };
     }
 
     // messageType: "text" | "inject" | default → require content.
