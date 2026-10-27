@@ -1717,4 +1717,12 @@ export const HITL_DECISION_DEFAULT = env("HITL_DECISION_DEFAULT", "allow");
 // --- Rules ---
 export const RULES_ENABLED = envBool("RULES_ENABLED", false);
 export const RULES_DIR = env("RULES_DIR", "/app/rules");
+
+// --- Platform defaults ---
+// Deployment-level skills and MCP servers mounted into every chat. The file is
+// JSON ({"skills":[{"tool_id":N,"name"?:"x"}],"mcp_servers":{...}}); unset or
+// unreadable means the feature is off and chats are built exactly as before.
+export const PLATFORM_DEFAULTS_FILE = env("PLATFORM_DEFAULTS_FILE");
+// Whether the file's `skills` apply. Off: only its MCP servers are mounted.
+export const PROGRESSIVE_SKILLS_ENABLED = envBool("PROGRESSIVE_SKILLS_ENABLED", false);
 export const SAFETY_PREAMBLE_ENABLED = envBool("SAFETY_PREAMBLE_ENABLED", true);

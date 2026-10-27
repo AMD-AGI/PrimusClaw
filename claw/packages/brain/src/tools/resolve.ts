@@ -128,7 +128,54 @@ async function downloadSkill(
 
   // Always stage to a Brain-local temp dir so we can read SKILL.md locally.
   const localDir = fs.mkdtempSync(path.join(os.tmpdir(), `claw-skill-${toolId}-`));
+  stageSkillArchive(localDir, buf, contentType, toolId, skillName);
 
+  // Mirror files into the target (sandbox via Hands, or Brain-local fallback).
+  if (hands && sessionDir) {
+    // Sandbox path-guard resolves paths relative to /workspace. Compute a
+    // relative path: "/workspace" → "", "/workspace/foo" → "foo".
+    let rel: string;
+    if (sessionDir === SANDBOX_WORKSPACE) rel = "";
+    else if (sessionDir.startsWith(SANDBOX_WORKSPACE + "/")) rel = sessionDir.slice(SANDBOX_WORKSPACE.length + 1);
+    else rel = sessionDir.replace(/^\/+/, "");
+    const skillRel = rel ? path.posix.join(rel, ".skills", skillName) : path.posix.join(".skills", skillName);
+    const upload = await uploadDirToSandbox(hands, localDir, skillRel);
+    for (const item of upload.skips) {
+      logger.warn({ toolId, skillName, file: item.file, reason: item.reason }, "skill.upload.skipped");
+    }
+    for (const item of upload.failures) {
+      logger.warn({ toolId, skillName, file: item.file, err: item.error }, "skill.upload.failed");
+    }
+    const shippable = upload.total - upload.skipped;
+    if (upload.failed > 0 || (shippable > 0 && upload.uploaded === 0)) {
+      logger.error({ toolId, skillName, ...upload, sandboxRel: skillRel }, "skill.upload.failed_required");
+      throw new Error(`Failed to upload skill '${skillName}' to sandbox`);
+    }
+    logger.info({ toolId, skillName, ...upload, sandboxRel: skillRel }, "skill.upload.done");
+  } else if (sessionDir) {
+    // Legacy path: copy Brain-local (works only when Brain and sandbox share fs).
+    const outDir = path.join(sessionDir, ".skills", skillName);
+    fs.mkdirSync(outDir, { recursive: true });
+    copyDirSync(localDir, outDir);
+  }
+
+  const skillMd = findSkillMd(localDir);
+  if (!skillMd) throw new Error(`SKILL.md not found after extraction`);
+  return fs.readFileSync(skillMd, "utf-8");
+}
+
+/**
+ * Unpack a downloaded skill payload (ZIP, or a bare SKILL.md) into `localDir`
+ * on Brain's filesystem. Shared by the per-request path above and the
+ * platform-default staging cache, so the zip-slip guards live in one place.
+ */
+export function stageSkillArchive(
+  localDir: string,
+  buf: Buffer,
+  contentType: string,
+  toolId: number,
+  skillName: string,
+): void {
   // ZIP file (PK header or application/zip content-type)
   const isZip = (buf[0] === 0x50 && buf[1] === 0x4b) || contentType.includes("zip") || contentType.includes("octet-stream");
   if (isZip) {
@@ -171,39 +218,6 @@ async function downloadSkill(
   } else {
     fs.writeFileSync(path.join(localDir, "SKILL.md"), buf);
   }
-
-  // Mirror files into the target (sandbox via Hands, or Brain-local fallback).
-  if (hands && sessionDir) {
-    // Sandbox path-guard resolves paths relative to /workspace. Compute a
-    // relative path: "/workspace" → "", "/workspace/foo" → "foo".
-    let rel: string;
-    if (sessionDir === SANDBOX_WORKSPACE) rel = "";
-    else if (sessionDir.startsWith(SANDBOX_WORKSPACE + "/")) rel = sessionDir.slice(SANDBOX_WORKSPACE.length + 1);
-    else rel = sessionDir.replace(/^\/+/, "");
-    const skillRel = rel ? path.posix.join(rel, ".skills", skillName) : path.posix.join(".skills", skillName);
-    const upload = await uploadDirToSandbox(hands, localDir, skillRel);
-    for (const item of upload.skips) {
-      logger.warn({ toolId, skillName, file: item.file, reason: item.reason }, "skill.upload.skipped");
-    }
-    for (const item of upload.failures) {
-      logger.warn({ toolId, skillName, file: item.file, err: item.error }, "skill.upload.failed");
-    }
-    const shippable = upload.total - upload.skipped;
-    if (upload.failed > 0 || (shippable > 0 && upload.uploaded === 0)) {
-      logger.error({ toolId, skillName, ...upload, sandboxRel: skillRel }, "skill.upload.failed_required");
-      throw new Error(`Failed to upload skill '${skillName}' to sandbox`);
-    }
-    logger.info({ toolId, skillName, ...upload, sandboxRel: skillRel }, "skill.upload.done");
-  } else if (sessionDir) {
-    // Legacy path: copy Brain-local (works only when Brain and sandbox share fs).
-    const outDir = path.join(sessionDir, ".skills", skillName);
-    fs.mkdirSync(outDir, { recursive: true });
-    copyDirSync(localDir, outDir);
-  }
-
-  const skillMd = findSkillMd(localDir);
-  if (!skillMd) throw new Error(`SKILL.md not found after extraction`);
-  return fs.readFileSync(skillMd, "utf-8");
 }
 
 /** Copy an entire directory tree. Used for the legacy non-Hands path. */
@@ -221,7 +235,7 @@ function copyDirSync(srcDir: string, dstDir: string): void {
 }
 
 /** Recursively find SKILL.md in a directory. */
-function findSkillMd(dir: string): string | null {
+export function findSkillMd(dir: string): string | null {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
