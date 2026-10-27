@@ -30,7 +30,7 @@ import type { PoolClient } from "pg";
 import { decideAdmission, withOwnedAdmissionLock } from "../tasks/admission.js";
 import { admissionAskFor } from "../tasks/run-dispatch.js";
 import { stripRunSecrets } from "../tasks/run-spec.js";
-import { mergeAppMcpServers, sessionAppMcpServers } from "./app-mcp.js";
+import { applyAppMcpToTask } from "./app-mcp.js";
 import { ensureSessionWorkspace, requireWorkspaceBinding } from "../workspace/store.js";
 import pino from "pino";
 
@@ -144,7 +144,7 @@ export async function dispatchTaskToBrain(
   const {
     sessionId, userId, user, content, toolIds, pluginId,
     requestImage, requestResource, requestTimeout, workspaceId,
-    capturedUserEnvSnapshot, capturedSessionEnv, topology,
+    mcpServers, capturedUserEnvSnapshot, capturedSessionEnv, topology,
   } = input;
 
   const messageId = input.messageId ?? newChatMessageId();
@@ -291,11 +291,6 @@ export async function dispatchTaskToBrain(
       await db.query("UPDATE claw_sessions SET mode = 'local', updated_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL", [sessionId]);
     }
     logger.info({ sessionId, messageId, content: content.slice(0, 500), sandboxImage: finalSandboxImage || null }, "message.sandbox_image_parse");
-
-    // The session's hosted application MCP, at the lowest priority: a server of the
-    // same name in the request wins. Built now, not stored, so a queued turn never
-    // carries a token and an ended run's server is not offered.
-    const mcpServers = mergeAppMcpServers(await sessionAppMcpServers(sessionId), input.mcpServers);
 
     const task: Record<string, unknown> = {
       session_id: sessionId,
@@ -479,6 +474,12 @@ export async function dispatchTaskToBrain(
     // A gate, not a note: an unrecorded `attempted` leaves a row denying a
     // message already on the stream, so a throw here must stop the publish.
     await sessionDispatchPorts.recordPublishState(run.taskId, "attempted");
+    // The session's hosted application MCP, at the lowest priority (a server of the
+    // same name in the request wins). Only here, on the branch that publishes the
+    // task itself: a doorbell turn seals its credentials onto the row, and the
+    // application's servers are built from the live record when it is claimed
+    // (tasks/run-claim.ts), so no token is stored and a replaced sandbox is not offered.
+    await applyAppMcpToTask(task, sessionId);
     const payload = JSON.stringify(task);
     const seq = await publishRunMessage(
       () => sessionDispatchPorts.publishTask(subject, payload),

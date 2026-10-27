@@ -95,3 +95,17 @@ export async function sessionAppMcpServers(
   }
   return out;
 }
+
+/**
+ * Put the session's live application servers into a turn that is built here, on
+ * the wire (the fat branch). A turn that is parked and claimed later is resolved
+ * when it is claimed instead (`tasks/run-claim.ts`), so that nothing sealed on the
+ * row holds the MCP token and a stale record is never offered.
+ */
+export async function applyAppMcpToTask(task: Record<string, unknown>, sessionId: string): Promise<void> {
+  const merged = mergeAppMcpServers(
+    await sessionAppMcpServers(sessionId),
+    task.mcp_servers as McpServers | undefined,
+  );
+  if (merged !== undefined) task.mcp_servers = merged;
+}

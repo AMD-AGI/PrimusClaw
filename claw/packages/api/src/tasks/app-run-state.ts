@@ -261,7 +261,14 @@ export async function patchAppRun(
   );
   if (updated.rowCount === 1) {
     // The session's MCP of an ended run is gone with it, whoever ended it.
-    if (patch.state === "ended") await dropSessionAppMcpOfRun(taskId);
+    // Best effort: the state change has committed, so a failed delete must not turn
+    // the answer into a 500 for a write that landed. A record left behind is never
+    // served (the dispatch and claim reads ignore ended runs) and holds no token.
+    if (patch.state === "ended") {
+      await dropSessionAppMcpOfRun(taskId).catch((err: unknown) => {
+        logger.warn({ taskId, code: (err as { code?: string })?.code ?? "" }, "app_run.session_mcp_drop_failed");
+      });
+    }
     return { ok: true, run: toView(updated.rows[0] as RunRow) };
   }
   const why = await db.query(

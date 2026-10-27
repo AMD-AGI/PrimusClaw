@@ -204,6 +204,24 @@ describe("session-level app MCP", { skip }, () => {
       assert.equal((await records()).length, 0);
     });
 
+    test("a failed delete does not turn a committed end into a 500", async () => {
+      await register();
+      const realQuery = h.app.db.db.query.bind(h.app.db.db);
+      (h.app.db.db as any).query = async (text: string, params?: unknown[]) => {
+        if (/^\s*DELETE FROM claw_session_app_mcp WHERE app_task_id = \$1\s*$/.test(text)) throw new Error("transient");
+        return realQuery(text, params);
+      };
+      try {
+        const res = await app.inject({
+          method: "PATCH", url: `/v1/internal/app-runs/${taskId}`, headers: auth,
+          payload: brain({ state: "ended", last_exit: { at: "t", cause: "exit", final: true, returncode: 0 } }),
+        });
+        assert.equal(res.statusCode, 200, res.body);
+      } finally { (h.app.db.db as any).query = realQuery; }
+      assert.equal(((await q("SELECT state FROM claw_app_runs WHERE task_id = $1", [taskId])).rows[0] as any).state, "ended");
+      assert.equal((await records()).length, 1, "the record is left, and never served");
+    });
+
     test("another run's record of the same name survives this run's removal", async () => {
       await register();
       const other = "other-run";
@@ -290,6 +308,59 @@ describe("session-level app MCP", { skip }, () => {
       assert.equal((await turn()).mcp_servers, undefined);
     });
 
+    /** A doorbell dispatch of one turn: what is sealed on the row, then what a claim hands Brain. */
+    async function doorbellTurn(mcpServers?: Record<string, Record<string, unknown>>) {
+      const p = ports0();
+      Object.assign(p, pristine());
+      p.doorbellDispatch = () => ({ release() {} });
+      p.publishSse = () => {};
+      p.admit = async () => ({ kind: "admit" } as any);
+      p.publishTask = async () => 1;
+      await q("DELETE FROM claw_tasks WHERE task_id <> $1", [taskId]);
+      const result = await dispatch.dispatchTaskToBrain({
+        sessionId: "s1", userId: "u1",
+        user: { userId: "u1", userName: "u1", roles: ["default"], platformKey: PLATFORM_KEY, virtualKey: "vk" },
+        content: "hello", messageType: "text", toolIds: [], pluginId: undefined, requestImage: undefined,
+        requestResource: undefined, requestTimeout: undefined, workspaceId: undefined, mcpServers,
+        capturedUserEnvSnapshot: {}, capturedSessionEnv: {},
+      } as any, async () => {});
+      assert.equal(result.kind, "dispatched", JSON.stringify(result));
+      return (result as any).runId as string;
+    }
+    async function claim() {
+      const runClaim = await import("../src/tasks/run-claim.js");
+      runClaim.runClaimPorts.buildHistory = async () => [];
+      const { DOORBELL_SEMANTICS_VERSION } = await import("@claw/protocol");
+      const claimed = await runClaim.claimNextRun("brain-claim", DOORBELL_SEMANTICS_VERSION);
+      assert.ok(claimed, "a queued doorbell row was claimed");
+      return claimed!.request as any;
+    }
+    const rowSpec = async (id: string) => JSON.stringify(((await q("SELECT input FROM claw_tasks WHERE task_id = $1", [id])).rows[0] as any).input);
+
+    test("a doorbell turn seals no application server; the claim builds it from the live record", async () => {
+      await register();
+      const id = await doorbellTurn({ mine: { type: "http", url: "http://m/mcp" } });
+      const { RUN_CREDENTIALS_FIELD } = await import("../src/tasks/run-spec.js");
+      const input = (await q("SELECT input FROM claw_tasks WHERE task_id = $1", [id])).rows[0] as any;
+      const sealed = await import("../src/tasks/run-secrets.js");
+      const creds = sealed.openRunCredentials(input.input[RUN_CREDENTIALS_FIELD]);
+      assert.deepEqual(Object.keys((creds as any).mcp_servers ?? {}), ["mine"], "only the request's own servers are sealed");
+      assert.ok(!(await rowSpec(id)).includes(token));
+      // The sandbox is replaced between the send and the claim: the claim sees the new record.
+      assert.equal((await put(brain({ url: `${mcpUrl()}?new`, sandbox_session_id: "wl-9" }))).statusCode, 200);
+      const request = await claim();
+      assert.equal(request.mcp_servers["example-app"].url, `${mcpUrl()}?new`);
+      assert.equal(request.mcp_servers["example-app"].headers["x-session-id"], "wl-9");
+      assert.equal(request.mcp_servers.mine.url, "http://m/mcp");
+    });
+
+    test("a turn that waited for its claim is not offered the server of a run that ended meanwhile", async () => {
+      await register();
+      await doorbellTurn();
+      await q("UPDATE claw_app_runs SET state = 'ended' WHERE task_id = $1", [taskId]);
+      assert.equal((await claim()).mcp_servers, undefined);
+    });
+
     test("the dispatched config is usable against a Streamable-HTTP server, with Router auth off and on", async () => {
       for (const routerAuth of [false, true]) {
         await stub.close();
@@ -309,6 +380,43 @@ describe("session-level app MCP", { skip }, () => {
         assert.equal(resp.headers.get("mcp-session-id"), "stub-session");
         assert.ok((await resp.json() as any).result.serverInfo);
       }
+    });
+  });
+
+  describe("a pending message drained while the session was busy", () => {
+    test("a fat-branch drain carries the application server, the request's own winning on a clash", async () => {
+      await register();
+      const { dispatchPendingMessage, pendingDispatchPorts } = await import("../src/tasks/pending-dispatch.js");
+      const original = { ...pendingDispatchPorts };
+      const realQuery = h.app.db.db.query.bind(h.app.db.db);
+      const published: string[] = [];
+      try {
+        Object.assign(pendingDispatchPorts, {
+          doorbellDispatch: () => null,
+          admit: async () => ({ kind: "admit" }),
+          bindWorkspace: async () => "kws_1",
+          requireWorkspaceBinding: (w?: string) => w as string,
+          publishSessionEvent: async () => {},
+          openChatRun: async () => ({ taskId: "ktsk_p", workspaceId: "kws_1", lease: { url: "http://api/lease", token: "t" } }),
+          publish: async (_s: string, payload: string) => { published.push(payload); return published.length; },
+        });
+        (h.app.db.db as any).query = async (text: string, params: unknown[] = []) =>
+          /SET dispatch_task_id = COALESCE/.test(text) ? { rows: [{ dispatch_task_id: params[1] }], rowCount: 1 }
+            // The stubbed run has no row to arm, so its publish bookkeeping is acknowledged.
+            : /UPDATE claw_tasks/.test(text) ? { rows: [], rowCount: 1 }
+            : realQuery(text, params);
+        await dispatchPendingMessage({
+          sessionId: "s1", pendingId: 1, userId: "u1", messageId: "queued-1", prompt: "later",
+          task: { session_id: "s1", message_id: "queued-1", prompt: "later", mcp_servers: { other: { type: "sse", url: "http://o/sse" } } },
+        });
+      } finally {
+        (h.app.db.db as any).query = realQuery;
+        Object.assign(pendingDispatchPorts, original);
+      }
+      assert.equal(published.length, 1);
+      const sent = JSON.parse(published[0]!);
+      assert.deepEqual(Object.keys(sent.mcp_servers).sort(), ["example-app", "other"]);
+      assert.equal(sent.mcp_servers["example-app"].token, token);
     });
   });
 });
