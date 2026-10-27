@@ -17,7 +17,6 @@ import { filterToRegExp } from "./nats-kv-stub.js";
 import fs from "node:fs";
 import { secretValuesOf } from "../src/apps/app-env.js";
 import { applyPlatformKeyEnv } from "../src/sandbox/params.js";
-import { modelBaseUrlEnv } from "../src/sandbox/model-gateway-env.js";
 import { ensureAppSandbox, readSandboxNodeName, type AppSandboxRun } from "../src/apps/app-sandbox.js";
 import { SANDBOX_DEFAULT_TIMEOUT_SECONDS } from "../src/config.js";
 import { workloadTimeoutSeconds } from "../src/sandbox/safe-workload-provider.js";
@@ -444,47 +443,42 @@ test("the node name comes from the workload detail, and is null when there is no
   assert.equal(await readSandboxNodeName("wl-1", "pk", (async () => new Response("", { status: 500 })) as typeof fetch), null);
 });
 
-// ── model-gateway credentials: the same ones a Hands sandbox gets ─────────────
+// ── model credentials: the keys a Hands sandbox gets ─────────────
 
-const GATEWAY = { anthropic: "https://gw.example/anthropic", openai: "https://gw.example/openai" };
-
-test("an app sandbox is created with the model-gateway variables, exactly as Hands builds them", async () => {
+test("an app sandbox is created with the two model keys Hands gets, and nothing more of the platform's", async () => {
   const safe = fakeSafe();
-  await ensureAppSandbox(run({ platformKey: "ak-owner" }), {
-    fetch: safe.fetch, gateway: GATEWAY, recordWorkloadId: async () => {},
-  });
+  await ensureAppSandbox(run({ platformKey: "ak-owner" }), { fetch: safe.fetch, recordWorkloadId: async () => {} });
   const env = safe.created[0]!.env;
   assert.equal(env.ANTHROPIC_API_KEY, "ak-owner");
   assert.equal(env.OPENAI_API_KEY, "ak-owner");
-  assert.equal(env.ANTHROPIC_BASE_URL, GATEWAY.anthropic);
-  assert.equal(env.OPENAI_BASE_URL, GATEWAY.openai);
-  // Hands' own builder gives the same four for the same owner and config.
+  // Hands' builder gives the same two for the same owner (plus SAFE_API_KEY, which an app must not hold).
   const hands: Record<string, string> = {};
   applyPlatformKeyEnv(hands, "ak-owner", false);
-  Object.assign(hands, modelBaseUrlEnv(GATEWAY));
-  for (const [k, v] of Object.entries(hands)) assert.equal(env[k], v, k);
+  for (const k of ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]) assert.equal(env[k], hands[k], k);
+  assert.ok(!("SAFE_API_KEY" in env), "the owner's SaFE platform key does not reach app code");
   assert.equal(env.FROM_SPEC, "1");
   assert.equal(env.CLAW_APP_RUN_ID, "run-1");
 });
 
-test("a spec cannot replace the platform's model credentials, as with the Hands base env", async () => {
+test("a spec can neither replace the model keys nor plant SAFE_API_KEY", async () => {
   const safe = fakeSafe();
   const r = run({ platformKey: "ak-owner" });
-  r.sandboxSpec = { ...r.sandboxSpec, env: { ANTHROPIC_API_KEY: "spec-key", OPENAI_BASE_URL: "http://evil" } };
-  await ensureAppSandbox(r, { fetch: safe.fetch, gateway: GATEWAY, recordWorkloadId: async () => {} });
+  r.sandboxSpec = { ...r.sandboxSpec, env: { ANTHROPIC_API_KEY: "spec-key", SAFE_API_KEY: "planted" } };
+  await ensureAppSandbox(r, { fetch: safe.fetch, recordWorkloadId: async () => {} });
   assert.equal(safe.created[0]!.env.ANTHROPIC_API_KEY, "ak-owner");
-  assert.equal(safe.created[0]!.env.OPENAI_BASE_URL, GATEWAY.openai);
+  assert.ok(!("SAFE_API_KEY" in safe.created[0]!.env));
 });
 
-test("absent gateway config: keys only, no empty URL variables, as Hands", async () => {
+test("the gateway URLs are the image's or the manifest's: Brain injects none, and a spec's pass through", async () => {
   const safe = fakeSafe();
-  await ensureAppSandbox(run({ platformKey: "ak-owner" }), {
-    fetch: safe.fetch, gateway: {}, recordWorkloadId: async () => {},
-  });
+  await ensureAppSandbox(run({ platformKey: "ak-owner" }), { fetch: safe.fetch, recordWorkloadId: async () => {} });
   const env = safe.created[0]!.env;
-  assert.equal(env.ANTHROPIC_API_KEY, "ak-owner");
   assert.ok(!("ANTHROPIC_BASE_URL" in env) && !("OPENAI_BASE_URL" in env));
-  assert.deepEqual(modelBaseUrlEnv({}), {});
+  const r = run({ platformKey: "ak-owner" });
+  r.sandboxSpec = { ...r.sandboxSpec, env: { OPENAI_BASE_URL: "https://own.example/v1" } };
+  const safe2 = fakeSafe();
+  await ensureAppSandbox(r, { fetch: safe2.fetch, recordWorkloadId: async () => {} });
+  assert.equal(safe2.created[0]!.env.OPENAI_BASE_URL, "https://own.example/v1");
 });
 
 test("the model key is in the run's scrub set", () => {
@@ -510,7 +504,7 @@ test("creating an app sandbox never writes the model key to a log", async () => 
   restore.push(() => { (fs as { writeSync: unknown }).writeSync = realWrite; (fs as { write: unknown }).write = realAsync; process.stdout.write = realOut; });
   const safe = fakeSafe();
   await ensureAppSandbox(run({ platformKey: "ak-LEAKCANARY" }), {
-    fetch: safe.fetch, gateway: GATEWAY, recordWorkloadId: async () => {},
+    fetch: safe.fetch, recordWorkloadId: async () => {},
   });
   await new Promise((r) => setTimeout(r, 100));
   const out = written.join("");

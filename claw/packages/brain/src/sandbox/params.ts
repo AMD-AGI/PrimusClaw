@@ -339,7 +339,17 @@ export function applyPlatformKeyEnv(
 ): void {
   delete env.SAFE_API_KEY;
   if (!apiKey) return;
+  applyModelKeyEnv(env, apiKey);
+  if (!kubernetesMode) env.SAFE_API_KEY = apiKey;
+}
+
+/**
+ * Only the two model keys, under the conventional Anthropic / OpenAI names.
+ * For sandboxes that run code which is not the platform's own (an app sandbox):
+ * they get the model credential but never the SaFE platform key.
+ */
+export function applyModelKeyEnv(env: Record<string, string>, apiKey: string | undefined): void {
+  if (!apiKey) return;
   env.ANTHROPIC_API_KEY = apiKey;
   env.OPENAI_API_KEY = apiKey;
-  if (!kubernetesMode) env.SAFE_API_KEY = apiKey;
 }

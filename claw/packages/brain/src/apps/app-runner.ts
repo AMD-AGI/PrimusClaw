@@ -253,7 +253,11 @@ export class AppRunner {
   private readonly finishDone = new Set<string>();
   /** Set when the signal given to `run` fires; cleared by `finishNow`, which ends the run on purpose. */
   private halted = false;
-  private secrets: string[] = [];
+  /**
+   * Seeded with the platform key, which is a constructor argument and needs no
+   * read: it is in the set from the first moment, whatever the store does.
+   */
+  private secrets: string[];
   private secretsLoaded = false;
   private readonly grant: AppGrantRunHooks;
   private readonly seams: AppRunnerSeams;
@@ -266,6 +270,7 @@ export class AppRunner {
     private readonly platformKey: string,
     private readonly deps: AppRunnerDeps,
   ) {
+    this.secrets = secretValuesOf({ mcpToken: "", grantKeys: {}, platformKey });
     this.grant = deps.grant ?? noopAppGrant;
     this.seams = deps.seams ?? {};
     this.now = deps.now ?? Date.now;
@@ -462,7 +467,7 @@ export class AppRunner {
       this.secrets = secretValuesOf({ mcpToken: stored.mcp_token, grantKeys: stored.grant_keys ?? {}, platformKey: this.platformKey });
       this.secretsLoaded = true;
     } catch (err) {
-      logger.warn({ runId: this.runId, err: this.safeText(err) }, "app_run.secrets_unavailable_for_scrub");
+      logger.warn({ runId: this.runId, err: clip(scrub(err instanceof Error ? err.message : String(err), this.secrets)) }, "app_run.secrets_unavailable_for_scrub");
     }
   }
 
@@ -982,7 +987,14 @@ export class AppRunner {
 
   private iso(): string { return new Date(this.now()).toISOString(); }
 
-  private scrubbed(text: string): string { return scrub(text, this.secrets); }
+  /**
+   * Until the run's own secrets (MCP token, grant keys) have been read the set is
+   * incomplete, and text from the application is not forwarded at all rather than
+   * forwarded partly scrubbed.
+   */
+  private scrubbed(text: string): string {
+    return this.secretsLoaded ? scrub(text, this.secrets) : "[withheld: scrub set incomplete]";
+  }
 
   private safeText(err: unknown): string {
     return clip(this.scrubbed(err instanceof Error ? err.message : String(err)));

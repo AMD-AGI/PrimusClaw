@@ -781,3 +781,15 @@ test("P6 the session owner's platform key, which the sandbox carries as the mode
   assert.ok(!JSON.stringify(h.world.rec.last_exit).includes(PLATFORM_KEY), "the platform key is not stored");
   assert.match(String(h.world.rec.last_exit?.error), /\[redacted\]/);
 });
+
+test("P6 the platform key is scrubbed even when the store's secrets cannot be read, and no text goes out half-scrubbed", async () => {
+  const h = harness();
+  const wl = await toRunning(h);
+  const takeover = h.newRunner();
+  h.world.store.secrets = async () => { throw new Error("API unavailable"); };
+  h.world.appExits(wl, { final: false, returncode: 2, error: `401 for key ${PLATFORM_KEY} and token ${TOKEN}` });
+  await takeover.reconcile().catch(() => undefined);
+  const stored = JSON.stringify(h.world.rec.last_exit ?? {});
+  assert.ok(!stored.includes(PLATFORM_KEY), "the platform key is not stored");
+  assert.ok(!stored.includes(TOKEN), "nor is anything else the unread set would have caught");
+});
