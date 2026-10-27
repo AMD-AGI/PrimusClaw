@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"regexp"
 	"slices"
+	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -194,15 +195,43 @@ func expandTemplates(appRunID string, roles map[string]RoleRequest, templates []
 	return out, expanded, stored, nil
 }
 
-func expandOne(appRunID string, tpl TemplateRequest) []string {
-	if len(tpl.PerGPUCount) == 0 {
-		return []string{appRunID + "-" + tpl.Name}
+// TemplateNames is the CodeInterpreter name registered for one grant template.
+func TemplateNames(appRunID, templateName string, perGPU []int32) []string {
+	if len(perGPU) == 0 {
+		return []string{templateObjectName(appRunID, templateName, "")}
 	}
-	names := make([]string, 0, len(tpl.PerGPUCount))
-	for _, n := range tpl.PerGPUCount {
-		names = append(names, appRunID+"-"+tpl.Name+"-g"+itoa(int(n)))
+	names := make([]string, 0, len(perGPU))
+	for _, n := range perGPU {
+		names = append(names, templateObjectName(appRunID, templateName, "g"+itoa(int(n))))
 	}
 	return names
+}
+
+func expandOne(appRunID string, tpl TemplateRequest) []string {
+	return TemplateNames(appRunID, tpl.Name, tpl.PerGPUCount)
+}
+
+// templateObjectName builds a DNS-1123 name. Run ids may contain underscores.
+func templateObjectName(appRunID, templateName, suffix string) string {
+	raw := appRunID + "-" + templateName
+	if suffix != "" {
+		raw += "-" + suffix
+	}
+	return dnsName(raw)
+}
+
+// dnsName keeps lowercase letters, digits, and hyphens.
+func dnsName(value string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(value) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	return strings.Trim(b.String(), "-")
 }
 
 func itoa(n int) string {

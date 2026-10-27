@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
@@ -143,14 +142,7 @@ func templateForExpansion(snap grant.Snapshot, expanded string) (runtimev1alpha1
 }
 
 func expandNames(appRunID string, tpl runtimev1alpha1.GrantTemplate) []string {
-	if len(tpl.PerGPUCount) == 0 {
-		return []string{appRunID + "-" + tpl.Name}
-	}
-	names := make([]string, 0, len(tpl.PerGPUCount))
-	for _, n := range tpl.PerGPUCount {
-		names = append(names, appRunID+"-"+tpl.Name+"-g"+strconv.FormatInt(int64(n), 10))
-	}
-	return names
+	return grant.TemplateNames(appRunID, tpl.Name, tpl.PerGPUCount)
 }
 
 func templateGPUCount(tpl runtimev1alpha1.GrantTemplate, index int) int32 {

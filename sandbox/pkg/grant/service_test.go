@@ -199,6 +199,23 @@ func sampleRequest(expires time.Time) IssueRequest {
 	}
 }
 
+func TestExpandTemplatesUsesDNSName(t *testing.T) {
+	const runID = "ktsk_01m5y2heq8zekk0js2n9nw51ey"
+	roles, expanded, _, err := expandTemplates(runID, map[string]RoleRequest{
+		"measurement": {Templates: []string{"runner"}, MaxSandboxes: 1, MaxGPUs: 1},
+	}, []TemplateRequest{{Name: "runner", PerGPUCount: []int32{1}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "ktsk-01m5y2heq8zekk0js2n9nw51ey-runner-g1"
+	if got := expanded["runner"]; len(got) != 1 || got[0] != want || strings.Contains(got[0], "_") {
+		t.Fatalf("expanded=%v", got)
+	}
+	if roles["measurement"].Templates[0] != want {
+		t.Fatalf("role=%v", roles["measurement"].Templates)
+	}
+}
+
 func TestIssueReturnsKeysOnce(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	svc, priv, rec, _ := testService(t, now)
