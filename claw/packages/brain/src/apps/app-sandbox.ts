@@ -158,13 +158,18 @@ function withoutSessionEnv(env: Record<string, string> | undefined): Record<stri
 
 /**
  * The env the sandbox is created with: the spec's, the run's identity, and the
- * model credential Hands sandboxes get: the owner's key as `ANTHROPIC_API_KEY` /
- * `OPENAI_API_KEY` (applyModelKeyEnv; platform-owned, so it wins over the spec).
+ * model credential Hands sandboxes get: `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`
+ * (applyModelKeyEnv; platform-owned, so it wins over the spec).
  *
- * Deliberately not set: `SAFE_API_KEY` (an app runs manifest-supplied code and
- * must not hold the owner's platform key; a spec cannot plant one either) and the
- * gateway URLs (the SaFE path leaves them to the image / the manifest's env, so a
- * manifest can point its agent elsewhere; see ensureHands).
+ * In SaFE mode that key is the session owner's SaFE platform key. Code in the
+ * sandbox can use it to call the SaFE API as the session owner, exactly as it can
+ * in a Hands sandbox. The run's AppRunner scrubs it from forwarded output and it
+ * is never stored in `claw_app_runs`.
+ *
+ * Only those two variables carry it: `SAFE_API_KEY` is not set (and one a spec
+ * supplies is dropped), and no gateway URL is injected (the SaFE path leaves URLs
+ * to the image / the manifest's env, so a manifest can point its agent elsewhere;
+ * see ensureHands).
  */
 export function appSandboxEnv(run: Pick<AppSandboxRun, "runId" | "sandboxSpec" | "platformKey">): Record<string, string> {
   const env: Record<string, string> = { ...withoutSessionEnv(run.sandboxSpec.env), [APP_RUN_ID_ENV]: run.runId };

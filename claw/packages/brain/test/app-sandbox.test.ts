@@ -445,22 +445,22 @@ test("the node name comes from the workload detail, and is null when there is no
 
 // ── model credentials: the keys a Hands sandbox gets ─────────────
 
-test("an app sandbox is created with the two model keys Hands gets, and nothing more of the platform's", async () => {
+test("an app sandbox is created with the two model variables Hands gets, and no SAFE_API_KEY name", async () => {
   const safe = fakeSafe();
   await ensureAppSandbox(run({ platformKey: "ak-owner" }), { fetch: safe.fetch, recordWorkloadId: async () => {} });
   const env = safe.created[0]!.env;
   assert.equal(env.ANTHROPIC_API_KEY, "ak-owner");
   assert.equal(env.OPENAI_API_KEY, "ak-owner");
-  // Hands' builder gives the same two for the same owner (plus SAFE_API_KEY, which an app must not hold).
+  // Hands' builder gives the same two for the same owner (plus SAFE_API_KEY, which is not set here).
   const hands: Record<string, string> = {};
   applyPlatformKeyEnv(hands, "ak-owner", false);
   for (const k of ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]) assert.equal(env[k], hands[k], k);
-  assert.ok(!("SAFE_API_KEY" in env), "the owner's SaFE platform key does not reach app code");
+  assert.ok(!("SAFE_API_KEY" in env), "only the two model variables are set, not a SAFE_API_KEY");
   assert.equal(env.FROM_SPEC, "1");
   assert.equal(env.CLAW_APP_RUN_ID, "run-1");
 });
 
-test("a spec can neither replace the model keys nor plant SAFE_API_KEY", async () => {
+test("a spec can neither replace the model keys nor supply SAFE_API_KEY", async () => {
   const safe = fakeSafe();
   const r = run({ platformKey: "ak-owner" });
   r.sandboxSpec = { ...r.sandboxSpec, env: { ANTHROPIC_API_KEY: "spec-key", SAFE_API_KEY: "planted" } };

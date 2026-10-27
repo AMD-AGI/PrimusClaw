@@ -344,9 +344,9 @@ export function applyPlatformKeyEnv(
 }
 
 /**
- * Only the two model keys, under the conventional Anthropic / OpenAI names.
- * For sandboxes that run code which is not the platform's own (an app sandbox):
- * they get the model credential but never the SaFE platform key.
+ * Only the two model variables, under the conventional Anthropic / OpenAI
+ * names, without `SAFE_API_KEY`. In safe mode the value is still the caller's
+ * platform key (see applyPlatformKeyEnv).
  */
 export function applyModelKeyEnv(env: Record<string, string>, apiKey: string | undefined): void {
   if (!apiKey) return;
