@@ -765,7 +765,7 @@ func listJSON(items []procInfo) []map[string]any {
 func httpEntry(ent fileEntry) map[string]any {
 	kind := "file"
 	if ent.Type == fileTypeDir {
-		kind = "dir"
+		kind = "directory"
 	}
 	return map[string]any{"path": ent.Path, "name": ent.Name, "type": kind}
 }

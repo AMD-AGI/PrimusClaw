@@ -372,14 +372,23 @@ func TestSealedAllowsFilesOnly(t *testing.T) {
 	if SealedAllows(http.MethodPost, "/api/execute", true, []string{"/in"}, []string{"/out"}) {
 		t.Fatal("execute allowed")
 	}
-	if !SealedAllows(http.MethodGet, "/api/files?path=/in/a", true, []string{"/in"}, []string{"/out"}) {
-		t.Fatal("input read denied")
+	if SealedAllows(http.MethodGet, "/api/files?path=/in/a", true, []string{"/in"}, []string{"/out"}) {
+		t.Fatal("input read allowed")
 	}
-	if SealedAllows(http.MethodPut, "/api/files?path=/in/a", true, []string{"/in"}, []string{"/out"}) {
-		t.Fatal("input write allowed")
+	if !SealedAllows(http.MethodPut, "/api/files?path=/in/a", true, []string{"/in"}, []string{"/out"}) {
+		t.Fatal("input write denied")
 	}
-	if !SealedAllows(http.MethodPut, "/api/files/out/b", true, []string{"/in"}, []string{"/out"}) {
-		t.Fatal("output write denied")
+	if SealedAllows(http.MethodPut, "/api/files?path=/in", true, []string{"/in"}, []string{"/out"}) {
+		t.Fatal("input root write allowed")
+	}
+	if SealedAllows(http.MethodPut, "/api/files/out/b", true, []string{"/in"}, []string{"/out"}) {
+		t.Fatal("output write allowed")
+	}
+	if !SealedAllows(http.MethodGet, "/api/files?path=/out/b", true, []string{"/in"}, []string{"/out"}) {
+		t.Fatal("output read denied")
+	}
+	if SealedAllows(http.MethodGet, "/api/files?path=/out/../in/a", true, []string{"/in"}, []string{"/out"}) {
+		t.Fatal("traversal read allowed")
 	}
 	if SealedAllows(http.MethodPost, "/process.Process/Start", true, nil, nil) {
 		t.Fatal("sealed process rpc")
@@ -398,11 +407,14 @@ func TestSealedAllowsFilesOnly(t *testing.T) {
 	if !SealedAllows(http.MethodPost, "/filesystem.Filesystem/Stat", true, []string{"/in"}, []string{"/out"}) {
 		t.Fatal("filesystem rpc path is enforced in envd")
 	}
-	if !SealedFileAllows(http.MethodGet, "/in/a", []string{"/in"}, []string{"/out"}) {
+	if SealedFileAllows(http.MethodGet, "/in/a", []string{"/in"}, []string{"/out"}) {
 		t.Fatal("read input")
 	}
-	if SealedFileAllows(http.MethodPost, "/in/a", []string{"/in"}, []string{"/out"}) {
+	if !SealedFileAllows(http.MethodPost, "/in/a", []string{"/in"}, []string{"/out"}) {
 		t.Fatal("write input")
+	}
+	if SealedFileAllows(http.MethodPost, "/in", []string{"/in"}, []string{"/out"}) {
+		t.Fatal("write input root")
 	}
 	for _, filePath := range []string{"/in/../secret", "/in/sub/../../secret"} {
 		if SealedFileAllows(http.MethodGet, filePath, []string{"/in"}, []string{"/out"}) {
