@@ -25,6 +25,7 @@ export async function ensureNotificationSchema(client: pg.PoolClient): Promise<v
     )
   `);
   await client.query("ALTER TABLE claw_notification_subscriptions ADD COLUMN IF NOT EXISTS failing_since TIMESTAMPTZ");
+  await client.query("ALTER TABLE claw_notification_subscriptions ADD COLUMN IF NOT EXISTS auto_disabled BOOLEAN NOT NULL DEFAULT FALSE");
   await client.query(
     "CREATE INDEX IF NOT EXISTS idx_notification_subs_owner ON claw_notification_subscriptions(owner_user_id) WHERE enabled",
   );

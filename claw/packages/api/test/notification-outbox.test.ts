@@ -257,6 +257,37 @@ describe("notification outbox", { skip }, () => {
       assert.equal(sent.length, 0);
     });
 
+    test("a success in flight when another replica disables the subscription turns it back on", async () => {
+      const sub = await subscribe();
+      await q("UPDATE claw_notification_subscriptions SET failing_since = NOW() - interval '25 hours', consecutive_failures = 3");
+      await q("INSERT INTO claw_notification_outbox (event_id, subscription_id, payload) VALUES ('ev-a', $1, '{}'::jsonb)", [sub.id]);
+      await q("INSERT INTO claw_notification_outbox (event_id, subscription_id, payload, next_attempt_at) VALUES ('ev-b', $1, '{}'::jsonb, NOW() + interval '1 hour')", [sub.id]);
+      const racing: Transport = async (req) => {
+        if (req.headers[EVENT_ID_HEADER] !== "ev-a") return 200;
+        // Meanwhile another replica fails ev-b past the 24h boundary.
+        await q("UPDATE claw_notification_outbox SET next_attempt_at = NOW() - interval '1 second' WHERE event_id = 'ev-b'");
+        await outbox.deliverDue({ transport: async () => 500, resolve: pub, allowedHosts: new Set() });
+        assert.equal(((await q("SELECT enabled FROM claw_notification_subscriptions")).rows[0] as any).enabled, false, "the other replica disabled it");
+        return 200;
+      };
+      await outbox.deliverDue({ transport: racing, resolve: pub, allowedHosts: new Set() });
+      const row = (await q("SELECT enabled, failing_since FROM claw_notification_subscriptions")).rows[0] as any;
+      assert.equal(row.enabled, true, "a working receiver must not stay disabled");
+      assert.equal(row.failing_since, null);
+    });
+
+    test("a subscription its owner disabled stays disabled when a delivery in flight succeeds", async () => {
+      const sub = await subscribe();
+      await q("INSERT INTO claw_notification_outbox (event_id, subscription_id, payload) VALUES ('ev-a', $1, '{}'::jsonb)", [sub.id]);
+      const racing: Transport = async () => {
+        const r = await app.inject({ method: "PATCH", url: `/v1/notification-subscriptions/${sub.id}`, payload: { enabled: false } });
+        assert.equal(r.statusCode, 200, r.body);
+        return 200;
+      };
+      await outbox.deliverDue({ transport: racing, resolve: pub, allowedHosts: new Set() });
+      assert.equal(((await q("SELECT enabled FROM claw_notification_subscriptions")).rows[0] as any).enabled, false);
+    });
+
     test("one slow receiver does not hold up another subscription's delivery", async () => {
       const slow = await subscribe("u1", "https://slow.example.com/x");
       const fast = await subscribe("u2", "https://fast.example.com/x");
