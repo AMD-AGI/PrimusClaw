@@ -67,6 +67,11 @@ func (s *Server) e2bAccessGate(c *gin.Context) {
 		c.Abort()
 		return
 	}
+	if base, ok := s.forwardTarget(ref.Cluster); ok {
+		s.forwardDataPlane(c, sandboxID, base, ref.Cluster)
+		c.Abort()
+		return
+	}
 	if s.store == nil {
 		writeGate(c, http.StatusBadGateway, "sandbox_unavailable", "session store is not configured")
 		c.Abort()
