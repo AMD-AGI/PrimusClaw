@@ -94,12 +94,16 @@ export function parseAppRunPatch(
   if (body.events_cursor !== undefined) {
     const c = body.events_cursor;
     if (!isObj(c)) return { ok: false, error: "events_cursor_invalid" };
-    for (const key of Object.keys(c)) if (key !== "segment" && key !== "offset" && key !== "last_id") return { ok: false, error: "events_cursor_invalid" };
+    for (const key of Object.keys(c)) if (key !== "segment" && key !== "offset" && key !== "last_id" && key !== "epoch" && key !== "reset_pending") return { ok: false, error: "events_cursor_invalid" };
     if (c.segment !== undefined && (typeof c.segment !== "string" || !APP_EVENT_SEGMENT_NAME.test(c.segment))) return { ok: false, error: "events_cursor_invalid" };
     if (c.offset !== undefined && (typeof c.offset !== "number" || !Number.isInteger(c.offset) || c.offset < 0 || c.offset > OFFSET_MAX)) {
       return { ok: false, error: "events_cursor_invalid" };
     }
     if (c.last_id !== undefined && (typeof c.last_id !== "string" || !APP_EVENT_ID.test(c.last_id))) return { ok: false, error: "events_cursor_invalid" };
+    if (c.epoch !== undefined && (typeof c.epoch !== "number" || !Number.isInteger(c.epoch) || c.epoch < 0 || c.epoch > 1_000_000)) {
+      return { ok: false, error: "events_cursor_invalid" };
+    }
+    if (c.reset_pending !== undefined && c.reset_pending !== true) return { ok: false, error: "events_cursor_invalid" };
     patch.events_cursor = c;
   }
   if (body.last_exit !== undefined) {

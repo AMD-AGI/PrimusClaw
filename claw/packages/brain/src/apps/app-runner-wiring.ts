@@ -66,7 +66,7 @@ export function eventForwardingSeams(
     exec: (inst, command, timeout) => sandbox.exec(inst, command, timeout, { untracked: true }),
     store,
     // The same event published again (a takeover re-reads a batch) is dropped by the stream itself.
-    publish: (sessionId, message) => publish(sessionId, message, { msgID: `${message.app_task_id}:${String(message.event.id)}` }),
+    publish: (sessionId, message) => publish(sessionId, message, { msgID: `${message.app_task_id}:${message.epoch}:${String(message.event.id)}` }),
   });
   return {
     ...tailer,

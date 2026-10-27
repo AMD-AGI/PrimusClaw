@@ -74,9 +74,9 @@ export async function isRepeatOfStoredAppEvent(
   const r = await db.query(
     `SELECT event_id FROM claw_session_events
       WHERE session_id = $1 AND event = 'appEvent' AND deleted_at IS NULL
-        AND data->>'app_task_id' = $2 AND (data->'event')->>'id' = $3
+        AND data->>'app_task_id' = $2 AND COALESCE(data->>'epoch', '0') = $3 AND (data->'event')->>'id' = $4
       ORDER BY id LIMIT 1`,
-    [sessionId, identity.appTaskId, identity.eventId],
+    [sessionId, identity.appTaskId, identity.epoch, identity.eventId],
   );
   const kept = r.rows[0] as { event_id: string } | undefined;
   return kept !== undefined && kept.event_id !== liveId;

@@ -15,7 +15,7 @@ import test, { after, before, beforeEach } from "node:test";
 
 import { APP_EVENT_ID, APP_EVENT_SEGMENT_NAME } from "@claw/protocol";
 import { consumeEventDelivery, tombstoneReader } from "../src/events/consumer.js";
-import { APP_EVENT_UNIQUE_INDEX_SQL, buildAppEventIndex, buildIndexConcurrently } from "../src/infra/db.js";
+import { APP_EVENT_UNIQUE_INDEX_SQL, buildAppEventIndex, ensureConcurrentIndexOrWarn } from "../src/infra/db.js";
 import { db } from "../src/infra/db.js";
 import { AppEventOrder, appEventIdentity, appEventKey } from "../src/events/app-events.js";
 import { historySegment, isRepeatOfStoredAppEvent } from "../src/routes/events.js";
@@ -38,8 +38,8 @@ after(async () => {
   await harness.close();
 });
 
-const appEvent = (task: string, id: string, data: Record<string, unknown> = {}) => ({
-  type: "appEvent", app_task_id: task,
+const appEvent = (task: string, id: string, data: Record<string, unknown> = {}, epoch = 0) => ({
+  type: "appEvent", app_task_id: task, epoch,
   event: { specversion: "1.0", id, source: "app/run", type: "x.y", data },
 });
 
@@ -94,7 +94,7 @@ test("an appEvent without an identity is stored like any other event", async () 
 });
 
 test("appEventIdentity reads the envelope and nothing in data", () => {
-  assert.deepEqual(appEventIdentity(appEvent("t1", "7", { id: "decoy" })), { appTaskId: "t1", eventId: "7" });
+  assert.deepEqual(appEventIdentity(appEvent("t1", "7", { id: "decoy" })), { appTaskId: "t1", epoch: "0", eventId: "7" });
   for (const bad of [
     { type: "toolUsed" },
     { type: "appEvent", event: { id: "7" } },
@@ -208,7 +208,7 @@ test("with repeats already stored, the index build deletes the later copies (kee
   await deliver(appEvent("t2", "7"), 5);
   assert.equal((await rows()).length, 5);
 
-  assert.equal(await buildAppEventIndex(db as never), "built");
+  await buildAppEventIndex(db as never);
   const kept = await rows();
   assert.deepEqual(kept.map((r) => r.event_id), ["claw-1", "claw-4", "claw-5"], "the earliest of each identity stays");
   const valid = await harness.sql("SELECT indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = 'uq_session_events_app_event'");
@@ -217,15 +217,48 @@ test("with repeats already stored, the index build deletes the later copies (kee
   assert.equal((await rows()).length, 3, "de-duplication is back");
 });
 
-test("buildIndexConcurrently reports a failure without throwing, and without a repair hook does not touch the data", async () => {
+test("without a repair hook a build stopped by repeats is reported, not thrown, and the data is untouched", async () => {
   await harness.sql("DROP INDEX IF EXISTS uq_session_events_app_event");
   await deliver(appEvent("t1", "7"), 1);
   await deliver(appEvent("t1", "7"), 2);
-  const result = await buildIndexConcurrently(db as never, "uq_session_events_app_event", APP_EVENT_UNIQUE_INDEX_SQL);
-  assert.equal(result, "failed");
+  await ensureConcurrentIndexOrWarn(db as never, "uq_session_events_app_event", APP_EVENT_UNIQUE_INDEX_SQL);
   assert.equal((await rows()).length, 2);
   await harness.reset();
   await harness.sql(APP_EVENT_UNIQUE_INDEX_SQL);
+});
+
+test("an INVALID leftover of a killed build is replaced by a valid index", async () => {
+  await harness.sql(APP_EVENT_UNIQUE_INDEX_SQL);
+  await harness.sql("UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'uq_session_events_app_event'::regclass");
+  const state = async () => (await harness.sql("SELECT indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = 'uq_session_events_app_event'"))[0]!.indisvalid;
+  assert.equal(await state(), false);
+  await buildAppEventIndex(db as never);
+  assert.equal(await state(), true, "IF NOT EXISTS alone would have left it invalid for good");
+});
+
+test("the same ids under a later producer epoch are different events, at every layer", async () => {
+  assert.deepEqual(await deliver(appEvent("t1", "1", {}, 0), 1), ["ack"]);
+  assert.deepEqual(await deliver(appEvent("t1", "1", {}, 1), 2), ["ack"]);
+  assert.deepEqual(await deliver(appEvent("t1", "1", {}, 1), 3), ["ack"], "a repeat within the epoch is still dropped");
+  assert.equal((await rows()).length, 2, "stored once per epoch");
+  const e0 = appEvent("t1", "1", {}, 0);
+  const e1 = appEvent("t1", "1", {}, 1);
+  assert.notEqual(appEventKey(e0), appEventKey(e1));
+  assert.equal(await isRepeatOfStoredAppEvent("s1", e1, "claw-2"), false, "the epoch-1 copy is itself");
+  assert.equal(await isRepeatOfStoredAppEvent("s1", e1, "claw-9"), true);
+  assert.equal(await isRepeatOfStoredAppEvent("s1", appEvent("t1", "1", {}, 2), "claw-9"), false, "an epoch not stored is new");
+  const order = new AppEventOrder();
+  assert.equal(order.mayBeRepeat(appEventIdentity(appEvent("t1", "5", {}, 0))!), true);
+  assert.equal(order.mayBeRepeat(appEventIdentity(appEvent("t1", "1", {}, 1))!), true, "its own epoch, first of it");
+  assert.equal(order.mayBeRepeat(appEventIdentity(appEvent("t1", "2", {}, 1))!), false);
+});
+
+test("the cursor's epoch and pending flag are validated", () => {
+  const base = { brain_id: "b1", claim_count: 1 };
+  for (const ok of [{ epoch: 0 }, { epoch: 3, reset_pending: true }]) assert.equal(parseAppRunPatch({ ...base, events_cursor: ok }).ok, true);
+  for (const bad of [{ epoch: -1 }, { epoch: 1.5 }, { epoch: "1" }, { reset_pending: false }, { reset_pending: 1 }]) {
+    assert.deepEqual(parseAppRunPatch({ ...base, events_cursor: bad }), { ok: false, error: "events_cursor_invalid" }, JSON.stringify(bad));
+  }
 });
 
 test("a live app event is checked against the database only when it could be a repeat: first of its run on the connection, or not above the highest id seen", () => {
@@ -238,5 +271,5 @@ test("a live app event is checked against the database only when it could be a r
   assert.equal(order.mayBeRepeat(id("t1", "3")), true);
   assert.equal(order.mayBeRepeat(id("t1", "100")), false, "numeric, not text, order");
   assert.equal(order.mayBeRepeat(id("t2", "1")), true, "another run starts its own order");
-  assert.equal(order.mayBeRepeat({ appTaskId: "t3", eventId: "not-a-number" }), true, "anything unreadable is checked");
+  assert.equal(order.mayBeRepeat({ appTaskId: "t3", epoch: "0", eventId: "not-a-number" }), true, "anything unreadable is checked");
 });

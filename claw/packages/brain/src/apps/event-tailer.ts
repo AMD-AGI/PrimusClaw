@@ -48,6 +48,11 @@ const DECIMAL_ID = APP_EVENT_ID;
 export type AppEventMessage = {
   type: "appEvent";
   app_task_id: string;
+  /**
+   * Producer epoch of the run: 0 until the events' ids start again (see tailOnce). An event's
+   * identity downstream (stream msgID, stored row, live stream) is (app_task_id, epoch, event.id).
+   */
+  epoch: number;
   event: Record<string, unknown>;
 };
 
@@ -98,15 +103,20 @@ const toBigInt = (id: string | undefined): bigint | null => (id !== undefined &&
 
 /**
  * Bytes of one segment from `offset`, at most `limit`, as base64 (so the byte
- * count survives the exec text channel), then a line `OK`. The `OK` is printed
- * only when every step succeeded: a pipeline's status is its last command's, so
- * a `tail` that failed would otherwise read as an empty, finished segment.
- * Each step writes a temporary file and is checked on its own. A file that is
- * not there prints just `OK` (nothing to read).
+ * count survives the exec text channel), then a line `OK`.
+ *
+ * Bounded: `tail` streams into `head -c limit`, which stops it (SIGPIPE) once it
+ * has its window, so a segment of any size costs at most `limit` bytes of disk
+ * and I/O. The `OK` is printed only when every step succeeded, because a
+ * pipeline's status is its last command's and a `tail` that failed would
+ * otherwise read as an empty, finished segment: the group's `tail` status goes
+ * to a file, and only 0 and 141 (SIGPIPE, the normal end when the segment is
+ * longer than the window) count. Temporary files are removed by a trap. A file
+ * that is not there prints just `OK` (nothing to read).
  */
 export function readCommand(file: string, offset: number, limit: number): string {
   const f = shq(file);
-  return `if [ -f ${f} ]; then t=$(mktemp) && u=$(mktemp) && tail -c +${offset + 1} ${f} >"$t" && head -c ${limit} "$t" >"$u" && b=$(base64 "$u") && { printf '%s\\n' "$b"; echo ${OK_MARK}; }; rm -f "$t" "$u"; else echo ${OK_MARK}; fi`;
+  return `if [ -f ${f} ]; then s=$(mktemp) && u=$(mktemp) && trap 'rm -f "$s" "$u"' EXIT && { tail -c +${offset + 1} ${f} 2>/dev/null; echo $? >"$s"; } | head -c ${limit} >"$u" && r=$(cat "$s") && { [ "$r" = 0 ] || [ "$r" = 141 ]; } && b=$(base64 "$u") && { printf '%s\\n' "$b"; echo ${OK_MARK}; }; else echo ${OK_MARK}; fi`;
 }
 
 const OK_MARK = "OK";
@@ -141,7 +151,7 @@ function firstEventId(scan: Scan): bigint | null {
     if (line.text.length === 0) continue;
     try {
       const envelope = checkEnvelope(JSON.parse(line.text.toString("utf8")));
-      return envelope.ok ? envelope.id : null;
+      if (envelope.ok) return envelope.id;
     } catch {
       continue;
     }
@@ -156,7 +166,8 @@ function readFailed(runId: string, segment: string, idle: { cursor: AppEventsCur
 }
 
 function sameCursor(a: AppEventsCursor, b: AppEventsCursor): boolean {
-  return a.segment === b.segment && a.offset === b.offset && a.last_id === b.last_id;
+  return a.segment === b.segment && a.offset === b.offset && a.last_id === b.last_id
+    && (a.epoch ?? 0) === (b.epoch ?? 0) && (a.reset_pending === true) === (b.reset_pending === true);
 }
 
 interface Where { dir: string; instance: SandboxInstance; record: AppRunRecord }
@@ -249,15 +260,25 @@ export async function tailOnce(
   let lastId = toBigInt(from.last_id);
   const plan: Planned[] = [];
   let baseLastId = from.last_id;
-  if (numberingWentBack && lastId !== null) {
-    // Numbering went back. If the oldest segment's first event is also at or below
-    // `last_id`, the ids started again (directory wiped, or a new sandbox): a new
-    // producer epoch, where keeping `last_id` would drop every event from here on.
+  let epoch = from.epoch ?? 0;
+  // Numbering went back: whether the ids restarted too is decided on the first
+  // event actually seen, which may be a later round (the restarted writer may
+  // not have finished its first line yet), so the question is kept in the cursor.
+  let pending = from.reset_pending === true || (numberingWentBack && lastId !== null);
+  if (pending && lastId === null) pending = false;
+  if (pending) {
     const firstId = firstEventId(scan);
-    if (firstId !== null && firstId <= lastId) {
-      logger.error({ runId: record.run_id, lastId: from.last_id, firstId: String(firstId) }, "app_events.event_ids_restarted_last_id_reset");
-      lastId = null;
-      baseLastId = undefined;
+    if (firstId !== null) {
+      pending = false;
+      if (firstId <= (lastId as bigint)) {
+        // The ids started again (directory wiped, or a new sandbox): a new producer epoch. Keeping `last_id`
+        // would drop every event from here on, and the same ids under the old epoch's identity would be
+        // taken for repeats downstream, so the epoch is part of an event's identity (see AppEventMessage).
+        epoch += 1;
+        logger.error({ runId: record.run_id, lastId: from.last_id, firstId: String(firstId), epoch }, "app_events.event_ids_restarted_new_epoch");
+        lastId = null;
+        baseLastId = undefined;
+      }
     }
   }
   for (const line of scan.lines) {
@@ -285,11 +306,14 @@ export async function tailOnce(
   const cursorAfter = (count: number): AppEventsCursor => {
     let lastForwarded = baseLastId;
     for (const p of plan.slice(0, count)) if (p.event) lastForwarded = p.event.id;
-    return {
-      segment, offset: offset + (count > 0 ? plan[count - 1]!.end : 0),
-      ...(lastForwarded !== undefined ? { last_id: lastForwarded } : {}),
-    };
+    return makeCursor(segment, offset + (count > 0 ? plan[count - 1]!.end : 0), lastForwarded);
   };
+  const makeCursor = (seg: string, off: number, last: string | undefined): AppEventsCursor => ({
+    segment: seg, offset: off,
+    ...(last !== undefined ? { last_id: last } : {}),
+    ...(epoch > 0 ? { epoch } : {}),
+    ...(pending ? { reset_pending: true } : {}),
+  });
   const persist = async (cursor: AppEventsCursor): Promise<void> => {
     if (!sameCursor(cursor, from)) await deps.store.patch(record.run_id, { events_cursor: cursor });
   };
@@ -302,7 +326,7 @@ export async function tailOnce(
     const batch: Array<{ index: number; p: Promise<void> }> = [];
     while (upto < plan.length && batch.length < PUBLISH_CONCURRENCY) {
       const event = plan[upto]!.event;
-      if (event) batch.push({ index: upto, p: deps.publish(record.session_id, { type: "appEvent", app_task_id: record.run_id, event: event.body }) });
+      if (event) batch.push({ index: upto, p: deps.publish(record.session_id, { type: "appEvent", app_task_id: record.run_id, epoch, event: event.body }) });
       upto++;
     }
     const settled = await Promise.allSettled(batch.map((b) => b.p));
@@ -324,7 +348,7 @@ export async function tailOnce(
   } else if (atEnd && !scan.capped && later) {
     // End of a finished segment: whatever is left is a write that never completed.
     if (scan.rest > 0) logger.warn({ runId: record.run_id, segment, bytes: scan.rest }, "app_events.unfinished_tail_dropped");
-    cursor = { segment: later, offset: 0, ...(lastForwarded !== undefined ? { last_id: lastForwarded } : {}) };
+    cursor = makeCursor(later, 0, lastForwarded);
   }
   await persist(cursor);
   return { cursor, progressed: !sameCursor(cursor, from) };

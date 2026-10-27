@@ -393,6 +393,7 @@ test("numbering went back AND ids restarted (directory wiped, new sandbox): last
   writeFileSync(r.file(0), `${ev(1)}\n${ev(2)}\n`);
   await tail(r);
   assert.deepEqual(r.ids(), ["1", "2", "3", "1", "2"], "the new epoch's events are forwarded");
+  assert.deepEqual(r.published.map((m) => m.epoch), [0, 0, 0, 1, 1], "under a new epoch, which is part of their identity downstream");
   assert.equal(r.world.rec.events_cursor.last_id, "2");
   appendFileSync(r.file(0), `${ev(3)}\n${ev(4)}\n`);
   await tail(r);
@@ -450,7 +451,7 @@ test("appStatus carries the outcome only, and appEvent goes out with a stream de
 
   writeFileSync(r.file(1), `${ev(7)}\n`);
   await seams.tailEvents!(r.ctx());
-  assert.equal(out[1]!.opts?.msgID, `${RUN_ID}:7`);
+  assert.equal(out[1]!.opts?.msgID, `${RUN_ID}:0:7`, "run, epoch, event id");
 });
 
 test("the tailer's exec is untracked: a forwarding round is not registered as a user job", async () => {
@@ -462,4 +463,57 @@ test("the tailer's exec is untracked: a forwarding round is not registered as a 
   await seams.tailEvents!(r.ctx());
   assert.ok(seen.length >= 1);
   assert.ok(seen.every((o) => o?.untracked === true), JSON.stringify(seen));
+});
+
+test("the writer restarted and has not finished its first line yet: the question stays in the cursor and is decided on the first event", async () => {
+  const r = rig();
+  writeFileSync(r.file(5), `${ev(1)}\n${ev(2)}\n${ev(3)}\n`);
+  await tail(r);
+  rmSync(r.file(5));
+  writeFileSync(r.file(0), ""); // created, nothing written yet
+  await tail(r);
+  assert.equal(r.world.rec.events_cursor.segment, seg(0));
+  assert.equal(r.world.rec.events_cursor.reset_pending, true, "not decided: no event to compare yet");
+  await tail(r);
+  assert.equal(r.published.length, 3);
+
+  appendFileSync(r.file(0), `not json\n${ev(1)}\n${ev(2)}\n`);
+  await tail(r);
+  assert.deepEqual(r.published.slice(3).map((m) => [m.epoch, (m.event as { id: string }).id]), [[1, "1"], [1, "2"]]);
+  assert.equal(r.world.rec.events_cursor.epoch, 1);
+  assert.equal(r.world.rec.events_cursor.reset_pending, undefined, "decided");
+  appendFileSync(r.file(0), `${ev(3)}\n`);
+  await tail(r);
+  assert.equal(r.published.at(-1)!.epoch, 1, "and the run goes on in the new epoch");
+});
+
+test("numbering went back with ids carrying on: the same epoch, and the pending question closes", async () => {
+  const r = rig();
+  writeFileSync(r.file(5), `${ev(1)}\n${ev(2)}\n`);
+  await tail(r);
+  rmSync(r.file(5));
+  writeFileSync(r.file(0), "");
+  await tail(r);
+  appendFileSync(r.file(0), `${ev(3)}\n`);
+  await tail(r);
+  assert.deepEqual(r.published.map((m) => m.epoch), [0, 0, 0]);
+  assert.equal(r.world.rec.events_cursor.reset_pending, undefined);
+});
+
+test("a round over a huge segment reads only the window: no file in the sandbox grows past it", async () => {
+  const r = rig();
+  // 12 MiB with increasing ids.
+  const lines: string[] = [];
+  for (let i = 1, size = 0; size < 12 * 1024 * 1024; i += 1) {
+    const l = `${ev(i, { data: { pad: "x".repeat(200) } })}\n`;
+    lines.push(l);
+    size += l.length;
+  }
+  writeFileSync(r.file(1), lines.join(""));
+  const real = r.deps.exec;
+  // No file may exceed 2 MiB (ulimit -f counts 512-byte blocks): the whole rest of the segment would.
+  r.deps.exec = (inst, command, timeout) => real(inst, `ulimit -f 4096; ${command}`, timeout);
+  await tail(r);
+  assert.equal(r.published.length, EVENTS_PER_ROUND, "the round was read, not failed");
+  assert.ok((r.world.rec.events_cursor.offset ?? 0) <= EVENTS_READ_BYTES);
 });

@@ -14,6 +14,8 @@
 
 export interface AppEventIdentity {
   appTaskId: string;
+  /** The producer epoch: the same ids under a later epoch are different events. "0" when the message has none. */
+  epoch: string;
   eventId: string;
 }
 
@@ -26,13 +28,14 @@ export function appEventIdentity(event: Record<string, unknown>): AppEventIdenti
   if (typeof inner !== "object" || inner === null) return null;
   const eventId = (inner as Record<string, unknown>).id;
   if (typeof eventId !== "string" || eventId === "") return null;
-  return { appTaskId, eventId };
+  const epoch = event.epoch;
+  return { appTaskId, epoch: typeof epoch === "number" && Number.isInteger(epoch) && epoch >= 0 ? String(epoch) : "0", eventId };
 }
 
 /** One string for a Set: the identity, or null for any other event. */
 export function appEventKey(event: Record<string, unknown>): string | null {
   const identity = appEventIdentity(event);
-  return identity ? `${identity.appTaskId}\u0000${identity.eventId}` : null;
+  return identity ? `${identity.appTaskId}\u0000${identity.epoch}\u0000${identity.eventId}` : null;
 }
 
 /**
@@ -48,12 +51,13 @@ export class AppEventOrder {
   mayBeRepeat(identity: AppEventIdentity): boolean {
     let id: bigint;
     try { id = BigInt(identity.eventId); } catch { return true; }
-    const top = this.highest.get(identity.appTaskId);
+    const key = `${identity.appTaskId}\u0000${identity.epoch}`;
+    const top = this.highest.get(key);
     if (top === undefined || id <= top) {
-      if (top === undefined || id > top) this.highest.set(identity.appTaskId, id);
+      if (top === undefined || id > top) this.highest.set(key, id);
       return true;
     }
-    this.highest.set(identity.appTaskId, id);
+    this.highest.set(key, id);
     return false;
   }
 }

@@ -52,6 +52,10 @@ export interface AppEventsCursor {
   offset?: number;
   /** Decimal string, as the CloudEvents `id` is. */
   last_id?: string;
+  /** Producer epoch (see the tailer): bumped when the events' ids start again. Absent means 0. */
+  epoch?: number;
+  /** Segment numbering went back and whether the ids restarted is not decided yet. */
+  reset_pending?: boolean;
 }
 
 export interface AppRunRecord {
