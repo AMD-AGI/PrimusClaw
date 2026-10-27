@@ -19,7 +19,7 @@
  * working after that node goes away.
  */
 import pino from "pino";
-import { SANDBOX_HANDS_VIA_ROUTER, SANDBOX_ROUTER_URL } from "../config.js";
+import { SAFE_API_URL, SANDBOX_HANDS_VIA_ROUTER, SANDBOX_ROUTER_URL } from "../config.js";
 
 const logger = pino({ name: "sandbox-router" });
 
@@ -67,6 +67,18 @@ export function safeHandsBaseUrl(namespace: string, workloadId: string, port: st
   const base = orderedBases(CONFIGURED_BASES)[0];
   return `${base}/v1/namespaces/${encodeURIComponent(namespace)}/code-interpreters/`
     + `${encodeURIComponent(workloadId)}/invocations/proxy/${port}`;
+}
+
+/**
+ * The Router base a port-proxy URL is built on: the configured Router (the one
+ * that last answered, when several are listed), else the public ingress
+ * `${SAFE_API_URL}/sandbox` that `exec` falls back to. Null when neither is set.
+ */
+export function routerBaseForPortProxy(): string | null {
+  const configured = orderedBases(CONFIGURED_BASES)[0];
+  if (configured) return configured;
+  const api = SAFE_API_URL.trim().replace(/\/+$/, "");
+  return api ? `${api}/sandbox` : null;
 }
 
 // Errors that mean the request never left: nothing listened, nothing routed,
