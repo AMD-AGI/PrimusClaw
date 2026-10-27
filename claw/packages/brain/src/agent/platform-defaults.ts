@@ -44,6 +44,7 @@ export interface DefaultSkill {
 
 const SKILL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 export const DESCRIPTION_MAX = 300;
+export const MAX_DEFAULT_SKILLS = 50;
 
 let cache: { file: string; mtimeMs: number; value: PlatformDefaults | null } | null = null;
 
@@ -102,6 +103,7 @@ function parseDefaults(raw: unknown): PlatformDefaults {
   const skills: PlatformDefaults["skills"] = [];
   if (raw.skills !== undefined) {
     if (!Array.isArray(raw.skills)) throw new Error("skills must be an array");
+    if (raw.skills.length > MAX_DEFAULT_SKILLS) throw new Error(`at most ${MAX_DEFAULT_SKILLS} default skills are supported`);
     for (const s of raw.skills) {
       const id = isRecord(s) ? s.tool_id : undefined;
       if (typeof id !== "number" || !Number.isInteger(id) || id <= 0) {
@@ -302,43 +304,52 @@ export async function resolveDefaultSkills(
 ): Promise<DefaultSkill[]> {
   if (!defaults.skills.length) return [];
   const looked = await Promise.all(defaults.skills.map((e) => lookupTool(e.toolId, platformKey)));
-  const out: DefaultSkill[] = [];
-  const seen = new Set<string>();
-  for (let i = 0; i < defaults.skills.length; i++) {
-    const entry = defaults.skills[i];
+  // Stage in parallel: the chat waits for the slowest one, bounded by the
+  // per-stage deadline, not for the sum.
+  const staged = await Promise.all(defaults.skills.map(async (entry, i): Promise<DefaultSkill | null> => {
     const found = looked[i];
     const fail = async (outcome: "failed" | "skipped", reason: string, brief: string) => {
       logger.error({ toolId: entry.toolId, reason }, "platform_defaults.skill_unresolved");
       metrics.onPlatformDefault("skill", outcome, reason);
       await onEvent?.({ type: "toolUsed", tool: "platform_defaults", actionId: `platform_default_${entry.toolId}`, status: "error", brief });
+      return null;
     };
     if (!found.ok) {
-      await fail(found.reason === "lookup" ? "failed" : "skipped", found.reason, `Default skill ${entry.toolId} is unavailable (${found.reason === "lookup" ? "lookup failed" : "not found or not readable"})`);
-      continue;
+      return fail(found.reason === "lookup" ? "failed" : "skipped", found.reason, `Default skill ${entry.toolId} is unavailable (${found.reason === "lookup" ? "lookup failed" : "not found or not readable"})`);
     }
     const tool = found.tool;
-    if (tool.type !== "skill") { await fail("skipped", "not_skill", `Default tool ${entry.toolId} is not a skill`); continue; }
+    if (tool.type !== "skill") return fail("skipped", "not_skill", `Default tool ${entry.toolId} is not a skill`);
     const name = entry.name ?? String(tool.name ?? `tool_${entry.toolId}`);
-    if (!SKILL_NAME_RE.test(name) || seen.has(name)) {
-      await fail("skipped", seen.has(name) ? "duplicate_name" : "bad_name", `Default skill ${entry.toolId} has an unusable name`);
-      continue;
-    }
+    if (!SKILL_NAME_RE.test(name)) return fail("skipped", "bad_name", `Default skill ${entry.toolId} has an unusable name`);
     const toolId = entry.toolId;
     const version = versionKey(tool);
     try {
       const localDir = await stageCached(toolId, name, version, platformKey);
       const md = path.join(localDir, "SKILL.md");
-      out.push({
+      const skill: DefaultSkill = {
         name, toolId, localDir,
         description: skillDescription(fs.readFileSync(md, "utf-8"), name),
         restage: () => stageCached(toolId, name, version, platformKey),
-      });
-      seen.add(name);
+      };
       metrics.onPlatformDefault("skill", "ok", "staged");
+      return skill;
     } catch (err) {
       logger.warn({ toolId, name, err: (err as Error).message }, "platform_defaults.skill_failed");
-      await fail("failed", "download", `Failed to load default skill: ${name}`);
+      return fail("failed", "download", `Failed to load default skill: ${name}`);
     }
+  }));
+  const out: DefaultSkill[] = [];
+  const seen = new Set<string>();
+  for (const sk of staged) {
+    if (!sk) continue;
+    if (seen.has(sk.name)) {
+      logger.error({ toolId: sk.toolId, name: sk.name }, "platform_defaults.skill_unresolved");
+      metrics.onPlatformDefault("skill", "skipped", "duplicate_name");
+      await onEvent?.({ type: "toolUsed", tool: "platform_defaults", actionId: `platform_default_${sk.toolId}`, status: "error", brief: `Default skill ${sk.toolId} duplicates the name ${sk.name}` });
+      continue;
+    }
+    seen.add(sk.name);
+    out.push(sk);
   }
   return out;
 }

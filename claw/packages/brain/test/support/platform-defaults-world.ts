@@ -29,7 +29,7 @@ export interface World {
   llmBodies: string[];
   downloads: number[];
   listCalls: number;
-  setTools(t: Array<{ id: number; name: string; zip?: Buffer; fail?: boolean; type?: string; version?: string | null; hang?: boolean }>): void;
+  setTools(t: Array<{ id: number; name: string; zip?: Buffer; fail?: boolean; type?: string; version?: string | null; hang?: boolean; delayMs?: number }>): void;
   byIdCalls: number[];
   script(turns: Turn[]): void;
   close(): Promise<void>;
@@ -88,7 +88,7 @@ export async function startWorld(defaultsFile?: object): Promise<World> {
       const t = tools.find((x) => x.id === id);
       if (!t || t.fail) { res.statusCode = 500; res.end("boom"); return; }
       res.setHeader("content-type", "application/zip");
-      res.end(t.zip);
+      setTimeout(() => res.end(t.zip), t.delayMs ?? 0);
       return;
     }
     if (url.includes("/v1/messages")) {

@@ -118,3 +118,22 @@ test("a hanging marketplace is bounded by the deadline", async () => {
   assert.ok(Date.now() - t0 < 3000);
   assert.ok(events.some((e) => e.status === "error"));
 });
+
+test("slow downloads are staged in parallel, so the chat waits for one, not the sum", async () => {
+  const d = { skills: [{ tool_id: 21 }, { tool_id: 22 }, { tool_id: 23 }] };
+  world.setTools([21, 22, 23].map((id) => ({ id, name: `s${id}`, delayMs: 400, zip: skillZip(`s${id}`, "B", "d") })));
+  const t0 = Date.now();
+  const out = await resolveDefaultSkills({ skills: d.skills.map((s) => ({ toolId: s.tool_id })), mcpServers: {} }, "ak", onEvent as never);
+  assert.equal(out.length, 3);
+  assert.ok(Date.now() - t0 < 1000, `took ${Date.now() - t0}ms; sequential staging would be >=1200ms`);
+});
+
+test("a defaults file with more than the supported number of skills is refused", async () => {
+  const dir = fs.mkdtempSync((await import("node:os")).tmpdir() + "/pd-max-");
+  const f = dir + "/d.json";
+  fs.writeFileSync(f, JSON.stringify({ skills: Array.from({ length: pd.MAX_DEFAULT_SKILLS + 1 }, (_, i) => ({ tool_id: i + 1 })) }));
+  assert.equal(loadPlatformDefaults(f), null);
+  fs.writeFileSync(f, JSON.stringify({ skills: Array.from({ length: pd.MAX_DEFAULT_SKILLS }, (_, i) => ({ tool_id: i + 1 })) }));
+  fs.utimesSync(f, new Date(), new Date(Date.now() + 5000));
+  assert.equal(loadPlatformDefaults(f)?.skills.length, pd.MAX_DEFAULT_SKILLS);
+});
