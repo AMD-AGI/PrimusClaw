@@ -102,6 +102,17 @@ export interface AppRunStore {
   /** `expectState` makes the write a compare-and-set on the row's state. */
   patch(runId: string, patch: AppRunPatch, expectState?: AppRunState): Promise<AppRunRecord>;
   secrets(runId: string): Promise<AppRunSecrets>;
+  /** Record where the run's MCP answers, for the session it belongs to. No token goes with it. */
+  putMcp(runId: string, mcp: AppMcpRegistration): Promise<void>;
+  /** Remove that record. Removing one that is not there is not an error. */
+  deleteMcp(runId: string): Promise<void>;
+}
+
+export interface AppMcpRegistration {
+  /** The Router port-proxy URL of the application's MCP port. */
+  url: string;
+  /** The `x-session-id` the Router needs to route to the sandbox. */
+  sandbox_session_id: string;
 }
 
 /** The API refused a write: another worker holds the run, the state moved, or the run ended. */
@@ -169,6 +180,22 @@ export function httpAppRunStore(opts: HttpStoreOptions): AppRunStore {
       const r = await call(url(runId, "/secrets"), { method: "GET" });
       if (r.status !== 200 || typeof r.body?.mcp_token !== "string") return fail("secrets read", r);
       return { mcp_token: r.body.mcp_token, grant_keys: r.body.grant_keys ?? null };
+    },
+    async putMcp(runId, mcp) {
+      const r = await call(url(runId, "/mcp"), {
+        method: "PUT",
+        body: JSON.stringify({ brain_id: brainId, claim_count: opts.claimCount, ...mcp }),
+      });
+      if (r.status === 200) return;
+      if (r.status === 409) throw new AppRunWriteRefused(String(r.body?.error ?? "conflict"), r.body?.current_state);
+      fail("mcp register", r);
+    },
+    async deleteMcp(runId) {
+      const q = new URLSearchParams({ brain_id: brainId, claim_count: String(opts.claimCount) });
+      const r = await call(url(runId, `/mcp?${q}`), { method: "DELETE" });
+      if (r.status === 200) return;
+      if (r.status === 409) throw new AppRunWriteRefused(String(r.body?.error ?? "conflict"), r.body?.current_state);
+      fail("mcp unregister", r);
     },
   };
 }

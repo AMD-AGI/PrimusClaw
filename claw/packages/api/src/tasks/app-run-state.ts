@@ -31,6 +31,7 @@ import { APP_RUN_STATES, scrubSecrets, type AppRunState } from "@claw/protocol";
 import pino from "pino";
 import { db } from "../infra/db.js";
 import { openAppRunSecret } from "../crypto/app-run-secrets.js";
+import { dropSessionAppMcpOfRun } from "./session-app-mcp.js";
 
 const logger = pino({ name: "app-run-state" });
 
@@ -265,7 +266,18 @@ export async function patchAppRun(
                 t.input, t.sandbox_spec, t.workspace_id`,
     params,
   );
-  if (updated.rowCount === 1) return { ok: true, run: toView(updated.rows[0] as RunRow) };
+  if (updated.rowCount === 1) {
+    // The session's MCP of an ended run is gone with it, whoever ended it.
+    // Best effort: the state change has committed, so a failed delete must not turn
+    // the answer into a 500 for a write that landed. A record left behind is never
+    // served (the dispatch and claim reads ignore ended runs) and holds no token.
+    if (patch.state === "ended") {
+      await dropSessionAppMcpOfRun(taskId).catch((err: unknown) => {
+        logger.warn({ taskId, code: (err as { code?: string })?.code ?? "" }, "app_run.session_mcp_drop_failed");
+      });
+    }
+    return { ok: true, run: toView(updated.rows[0] as RunRow) };
+  }
   const why = await db.query(
     `SELECT r.state, r.restarts, t.lease_owner, t.claim_count,
             (t.lease_expires_at > NOW()) AS lease_live
