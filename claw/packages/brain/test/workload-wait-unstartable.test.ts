@@ -234,15 +234,15 @@ test("a cancelled create stops the workload it created, naming that workload", {
   assert.ok(calls.includes("POST /api/v1/workloads/wl-created/stop"), `calls: ${calls.join(", ")}`);
 });
 
-test("a handover abort leaves the workload alone, in the wait and through create", { timeout: 5000 }, async (t) => {
+test("an abort that is not a cancel leaves the workload alone, in the wait and through create", { timeout: 5000 }, async (t) => {
   const { SafeWorkloadProvider } = await import("../src/sandbox/safe-workload-provider.js");
-  // The wait: isHandover true means onGiveUp is not run, but the abort still ends the wait.
+  // The wait: reclaimOnAbort false means onGiveUp is not run, but the abort still ends the wait.
   const gaveUp: string[] = [];
   const ctl2 = new AbortController();
   let polls2 = 0;
   const direct = waitForWorkloadReady({
     workloadId: "wl-1", apiKey: "k", logPrefix: "test", isReady: isRunning,
-    signal: ctl2.signal, isHandover: () => true,
+    signal: ctl2.signal, reclaimOnAbort: () => false,
     onGiveUp: async ({ reason }) => { gaveUp.push(reason); },
     deps: {
       fetchImpl: scriptedFetch([notReady]),
@@ -267,7 +267,7 @@ test("a handover abort leaves the workload alone, in the wait and through create
   const ctl3 = new AbortController();
   const created = new SafeWorkloadProvider().create({
     sessionId: "s1", namespace: "ns", image: "img:tag", resources: { cpu: "1" }, env: {},
-    platformKey: "key", signal: ctl3.signal, isHandover: () => true,
+    platformKey: "key", signal: ctl3.signal, reclaimOnAbort: () => false,
     onProvisioned: async () => { ctl3.abort(); },
   });
   assert.equal(await outcome(created), "sandbox_wait_interrupted");

@@ -48,7 +48,7 @@ function clock() {
 
 const notReady = () => new Response(JSON.stringify({ phase: "NotReady", pods: [] }), { status: 200 });
 
-function wait(opts: { signal?: AbortSignal; isHandover?: () => boolean; sleepAborts?: AbortController; deps?: Partial<WorkloadWaitDeps> }) {
+function wait(opts: { signal?: AbortSignal; reclaimOnAbort?: () => boolean; sleepAborts?: AbortController; deps?: Partial<WorkloadWaitDeps> }) {
   const c = clock();
   let polls = 0;
   return new SafeMultiNodeProvider().waitForRunning(
@@ -61,7 +61,7 @@ function wait(opts: { signal?: AbortSignal; isHandover?: () => boolean; sleepAbo
       nowImpl: c.now, pollMs: 5000, unreadableTimeoutMs: 0, pendingTimeoutMs: 0, ...opts.deps,
     },
     opts.signal,
-    opts.isHandover,
+    opts.reclaimOnAbort,
   );
 }
 
@@ -69,17 +69,17 @@ test("a cancel during the wait deletes the cluster", { timeout: 5000 }, async (t
   const seen = recordSafe(t, (m) => (m === "DELETE" ? new Response("", { status: 204 }) : notReady()));
   const ctl = new AbortController();
   await assert.rejects(
-    wait({ signal: ctl.signal, sleepAborts: ctl, isHandover: () => false }),
+    wait({ signal: ctl.signal, sleepAborts: ctl, reclaimOnAbort: () => true }),
     (e: unknown) => e instanceof SandboxProvisionTerminalError && e.reason === "sandbox_wait_interrupted",
   );
   assert.ok(seen.includes("DELETE"), `requests: ${seen.join(",")}`);
 });
 
-test("a handover abort (restart or lease loss) leaves the cluster alone", { timeout: 5000 }, async (t) => {
+test("an abort that is not a cancel (restart or lease loss) leaves the cluster alone", { timeout: 5000 }, async (t) => {
   const seen = recordSafe(t, (m) => (m === "DELETE" ? new Response("", { status: 204 }) : notReady()));
   const ctl = new AbortController();
   await assert.rejects(
-    wait({ signal: ctl.signal, sleepAborts: ctl, isHandover: () => true }),
+    wait({ signal: ctl.signal, sleepAborts: ctl, reclaimOnAbort: () => false }),
     (e: unknown) => e instanceof SandboxProvisionTerminalError && e.reason === "sandbox_wait_interrupted",
   );
   assert.ok(!seen.includes("DELETE"), `the cluster must not be deleted: ${seen.join(",")}`);

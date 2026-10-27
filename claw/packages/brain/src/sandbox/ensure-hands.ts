@@ -292,13 +292,13 @@ export interface EnsureHandsOptions {
    */
   signal?: AbortSignal;
   /**
-   * Whether an abort of `signal` is a handover (a graceful restart, or a
-   * successor taking the run over) rather than a cancel. A wait for the sandbox
-   * to start that is cut short by a handover leaves the workload and its PENDING
-   * entry for the next run; only a cancel reclaims it. Absent: every abort is a
-   * cancel.
+   * Whether an abort of `signal` is a cancel the sandbox wait should reclaim for.
+   * A graceful restart, a successor taking the run over, a deadline and a
+   * terminal run row are not: the workload and its PENDING entry are then left
+   * for the next run to adopt or for the failure path to reap. Absent: every
+   * abort is a cancel.
    */
-  isHandover?: () => boolean;
+  reclaimOnAbort?: () => boolean;
 }
 
 /**
@@ -2756,7 +2756,7 @@ async function provisionHands(
       onProvisioned,
       onEvent,
       signal: options.signal,
-      isHandover: options.isHandover,
+      reclaimOnAbort: options.reclaimOnAbort,
     });
   } catch (err) {
     await hold.release();

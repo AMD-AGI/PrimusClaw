@@ -152,8 +152,8 @@ test("the drain selects actual sandbox failures, including KV-only rows, and exc
     handle: null, metadata: { sandbox: { provider: "agent-sandbox", handle: "agent-session" } },
   });
 
-  assert.equal(await drainPendingPlatformFacts(), 11);
-  assert.equal(fetched.length, 11);
+  assert.equal(await drainPendingPlatformFacts(), 12);
+  assert.equal(fetched.length, 12);
   for (const id of [...reasons, "pending-kv"]) {
     const actual = await row(id);
     assert.equal(actual.platform_facts_attempts, 1, id);

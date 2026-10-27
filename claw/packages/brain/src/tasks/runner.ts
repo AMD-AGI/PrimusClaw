@@ -76,7 +76,7 @@ import { settleClaimedRun } from "../clients/run-claim.js";
 import { beginRun, endRun, phaseOf, runTimeOf } from "./run-phase.js";
 import { resolveRunIdentity, type RunIdentity, taskIdFromLease } from "./run-identity.js";
 import {
-  activeAbort, markGracefulStop, LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON, isHandoverAbortReason,
+  activeAbort, markGracefulStop, LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON, isUserCancelReason,
   DEADLINE_EXCEEDED_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON,
 } from "./abort-registry.js";
 import { pickRunScope, pickShellRun, refreshTaskLock, releaseTaskLock } from "./lock.js";
@@ -1802,7 +1802,7 @@ class TaskRunner {
     const { handsUrl: newUrl, token: newToken, identity: newIdentity } = await fx().ensureHands(
       this.sessionId, this.request, this.platformKey, this.onEvent, this.multiNodeContext ?? undefined,
       { skipSessionReuse: true, signal: this.abortCtrl.signal,
-        isHandover: () => this.abortIsHandover(),
+        reclaimOnAbort: () => this.abortReclaimsSandbox(),
         attemptId: this.attempt.attemptId },
     );
     const newHands = fx().makeHandsClient(
@@ -1998,14 +1998,13 @@ class TaskRunner {
    * aborted and taken that slot.
    */
   /**
-   * Whether this run's abort is a handover -- a graceful restart or a successor
-   * taking the run over -- rather than a cancel. A handover must leave the
-   * sandbox or cluster this run was provisioning alone: the next delivery adopts
-   * it, and on lease loss it already has.
+   * Whether a sandbox wait cut short by this run's abort may reclaim what it was
+   * provisioning: only for a user's cancel, and only while this replica still
+   * owns the run. A restart or a lease loss hands the sandbox to the next run, and
+   * a deadline or terminal row is settled by the failure path.
    */
-  private abortIsHandover(): boolean {
-    const reason = this.abortCtrl.signal.reason;
-    return !this.stillOwnsLock() || isHandoverAbortReason(reason);
+  private abortReclaimsSandbox(): boolean {
+    return this.stillOwnsLock() && isUserCancelReason(this.abortCtrl.signal.reason);
   }
 
   private stillOwnsLock(): boolean {
@@ -2480,7 +2479,7 @@ class TaskRunner {
         this.request,
         this.onEvent,
         { deliveryCount: this.msg.info.deliveryCount, platformKey: this.platformKey, signal: this.abortCtrl.signal,
-          isHandover: () => this.abortIsHandover() },
+          reclaimOnAbort: () => this.abortReclaimsSandbox() },
       );
     }
 
@@ -2500,7 +2499,7 @@ class TaskRunner {
     this.sandboxAsked = true;
     const { handsUrl, created, token: handsToken, identity } = await fx().ensureHands(
       this.sessionId, this.request, this.platformKey, this.onEvent, this.multiNodeContext ?? undefined,
-      { signal: this.abortCtrl.signal, isHandover: () => this.abortIsHandover(),
+      { signal: this.abortCtrl.signal, reclaimOnAbort: () => this.abortReclaimsSandbox(),
         attemptId: this.attempt.attemptId },
     );
     logger.info({ sessionId: this.sessionId, messageId: this.messageId, created, handsUrl }, "task.sandbox_ready");

@@ -143,7 +143,7 @@ export class SafeWorkloadProvider implements SandboxProvider {
     // rather than listed again here.
     await pollWorkloadUntilRunning(workloadId, apiKey, params.onEvent, undefined, "hands", {
       signal: params.signal,
-      isHandover: params.isHandover,
+      reclaimOnAbort: params.reclaimOnAbort,
       // Only for a cancelled run, which the failure path does not reap. Every
       // other ending keeps its existing handling: the failure path reaps the
       // PENDING workload after it has read the platform's account of it
@@ -324,7 +324,7 @@ export async function pollWorkloadUntilRunning(
   /** Event-name prefix of the wait's logs (`<prefix>.poll_error`); `hands` unless another owner says so. */
   logPrefix = "hands",
   /** The run's cancel signal, and what to do with the workload when the wait is given up. */
-  wait?: Pick<WorkloadWaitOptions, "signal" | "onGiveUp" | "isHandover">,
+  wait?: Pick<WorkloadWaitOptions, "signal" | "onGiveUp" | "reclaimOnAbort">,
 ): Promise<void> {
   await onEvent?.({ type: "sandboxStatus", event: "phase", phase: "Creating", status: "creating", log: "" });
 
@@ -350,7 +350,7 @@ export async function pollWorkloadUntilRunning(
       });
     },
     signal: wait?.signal,
-    isHandover: wait?.isHandover,
+    reclaimOnAbort: wait?.reclaimOnAbort,
     onGiveUp: wait?.onGiveUp,
     deps,
   });

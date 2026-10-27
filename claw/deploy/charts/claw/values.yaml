@@ -372,6 +372,9 @@ secret:
   # Max time a scheduled sandbox may stay not-ready (image pull, container start)
   # before the message fails with reason sandbox_start_timeout. 0 = wait forever. Default 15m.
   sandboxStartTimeoutSeconds: "900"
+  # The same ceiling for multi-node GPU clusters (giving up deletes the cluster).
+  # 0 = off, the default: large images and Infera role pods routinely take longer.
+  multiNodeStartTimeoutSeconds: "0"
   # How long a Running sandbox with an empty GET /api/jobs roster stays up
   # before Brain idle-reclaims it. Default 15 minutes.
   sandboxIdleReuseSeconds: "900"

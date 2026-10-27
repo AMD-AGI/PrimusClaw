@@ -146,19 +146,22 @@ export interface WorkloadWaitOptions {
   /**
    * The run's cancel signal. Aborting it ends the wait at once with
    * `sandbox_wait_interrupted` -- during the sleep between reads and during a
-   * read in flight -- and, for a cancel (see `isHandover`), runs `onGiveUp`, so
+   * read in flight -- and, for a cancel (see `reclaimOnAbort`), runs `onGiveUp`, so
    * the workload this wait was provisioning is reclaimed instead of left for the
    * sweeper.
    */
   signal?: AbortSignal;
   /**
-   * Whether the abort that ended the wait is a handover rather than a cancel:
-   * a graceful restart or a successor taking the run over. A handover leaves the
-   * workload exactly as it is, for whoever picks the run up to adopt, so
-   * `onGiveUp` is not run for it. Read when the abort is seen, not when the wait
-   * starts. Absent means every abort is a cancel.
+   * Whether the abort that ended the wait is a cancel the wait itself should
+   * reclaim for. False for everything the caller will settle on its own -- a
+   * graceful restart or a successor taking the run over (the next run adopts the
+   * workload), and a deadline or a terminal run row (the failure path reads the
+   * platform's account of the workload before it reaps it) -- so `onGiveUp` is
+   * not run for those and the workload is left exactly as it is. Read when the
+   * abort is seen, not when the wait starts. Absent means every abort is a
+   * cancel.
    */
-  isHandover?: () => boolean;
+  reclaimOnAbort?: () => boolean;
   deps?: WorkloadWaitDeps;
 }
 
@@ -252,8 +255,8 @@ export async function waitForWorkloadReady(
   /** End the wait because the run was cancelled, reclaiming what it created. */
   const interrupted = async (phase: string): Promise<never> => {
     const message = `workload ${workloadId} startup was interrupted before it became ready`;
-    if (opts.isHandover?.()) {
-      logger.info({ workloadId }, `${logPrefix}.wait_handed_over`);
+    if (opts.reclaimOnAbort && !opts.reclaimOnAbort()) {
+      logger.info({ workloadId }, `${logPrefix}.wait_left_to_caller`);
       throw new SandboxProvisionTerminalError("sandbox_wait_interrupted", message);
     }
     return await giveUp("sandbox_wait_interrupted", phase, message);

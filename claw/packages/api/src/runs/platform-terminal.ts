@@ -229,6 +229,7 @@ const OWN_REASONS: ReadonlyMap<string, KillReason> = new Map([
 const WEAK_REASONS: ReadonlyMap<string, KillReason> = new Map([
   ["sandbox_pending_timeout", "deadline"],
   ["sandbox_timed_out", "deadline"],
+  ["sandbox_start_timeout", "deadline"],
 ]);
 
 /**
