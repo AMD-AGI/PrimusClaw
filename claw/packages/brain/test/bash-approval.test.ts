@@ -60,6 +60,16 @@ test("http rule: method plus url prefix, with implied methods and quoting", () =
   for (const c of run) assert.equal(p.check(c), null, c);
 });
 
+test("http url_regex sees the URL as written, so a variable base still matches", () => {
+  const p = bashApprovalPolicyFrom([{ source: "t", value: [
+    { label: "admin write", http: { methods: ["POST", "PUT", "DELETE"], url_regex: "/v1/admin/" } },
+  ] }]);
+  assert.equal(p.check('curl -sS -X POST -H "Content-Type: application/json" -d \'{"a":1}\' "$C/v1/admin/pools/x/limits"'), "admin write");
+  assert.equal(p.check('curl -sS -d x "$C/v1/admin/pools/x/limits"'), "admin write");
+  assert.equal(p.check('curl -sS "$C/v1/admin/pools"'), null);
+  assert.equal(p.check('curl -X POST "$C/v1/public/x"'), null);
+});
+
 test("program + args_regex rule, and a whole-line regex rule", () => {
   const p = policy();
   assert.equal(p.check("python3 client.py POST /plans/20/stop"), "console client write");

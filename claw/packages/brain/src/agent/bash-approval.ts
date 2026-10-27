@@ -25,9 +25,11 @@
  *   flags        optional regex flags, any of "i" "m" "s"
  *   program      program name (or list); a trailing `*` matches a prefix
  *   args_regex   tested against the arguments of one simple command
- *   http         { methods?: ["POST", ...], url_prefix?: "host/path" } for
- *                curl / wget; the method is -X / --method, else implied by a
- *                body flag (POST), else GET; scheme is ignored in url_prefix
+ *   http         { methods?: ["POST", ...], url_prefix?: "host/path",
+ *                url_regex?: "..." } for curl / wget; the method is -X /
+ *                --method, else implied by a body flag (POST), else GET; the
+ *                scheme is ignored in url_prefix; url_regex is tested against
+ *                the URL as written, so it also sees `$BASE/path`
  *
  * All fields present in a rule must match (`program`, `args_regex`, `http`
  * within the same simple command). A rule with none of regex / program /
@@ -214,13 +216,15 @@ function compileRule(raw: unknown): Rule {
   const programs = r.program === undefined ? null : stringList(r.program, "program");
   let methods: string[] | null = null;
   let prefixes: string[] | null = null;
+  let urlRe: RegExp | null = null;
   const hasHttp = r.http !== undefined;
   if (hasHttp) {
     const h = r.http;
     if (!h || typeof h !== "object" || Array.isArray(h)) fail("http must be an object");
     const ho = h as Record<string, unknown>;
-    for (const k of Object.keys(ho)) if (k !== "methods" && k !== "url_prefix") fail(`unknown http key ${k}`);
-    if (ho.methods === undefined && ho.url_prefix === undefined) fail("http needs methods or url_prefix");
+    for (const k of Object.keys(ho)) if (k !== "methods" && k !== "url_prefix" && k !== "url_regex") fail(`unknown http key ${k}`);
+    if (ho.methods === undefined && ho.url_prefix === undefined && ho.url_regex === undefined) fail("http needs methods, url_prefix or url_regex");
+    if (ho.url_regex !== undefined) urlRe = compileRegex(ho.url_regex, flags, "http.url_regex");
     if (ho.methods !== undefined) methods = stringList(ho.methods, "http.methods").map((m) => m.toUpperCase());
     if (ho.url_prefix !== undefined) prefixes = stringList(ho.url_prefix, "http.url_prefix").map(bare);
   }
@@ -237,6 +241,7 @@ function compileRule(raw: unknown): Rule {
         if (!info) return false;
         if (methods && !methods.includes(info.method)) return false;
         if (prefixes && !info.urls.some((u) => prefixes!.some((p) => bare(u).startsWith(p)))) return false;
+        if (urlRe && !info.urls.some((u) => urlRe!.test(u))) return false;
       }
       return true;
     });
