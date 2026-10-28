@@ -912,6 +912,37 @@ func TestLookupAccessRejectsRevokedGrant(t *testing.T) {
 	}
 }
 
+type recordingPromoter struct {
+	ids []string
+}
+
+func (p *recordingPromoter) PromotePending(_ context.Context, _ string, ref runtimev1alpha1.GrantSandboxRef) error {
+	p.ids = append(p.ids, ref.ID)
+	return nil
+}
+
+func TestReaperPromotesPendingSandbox(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	svc, priv, _, _ := testService(t, now)
+	promoter := &recordingPromoter{}
+	svc.SetPromoter(promoter)
+	req := sampleRequest(now.Add(time.Hour))
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.BeginSandbox(context.Background(), BeginRequest{
+		GrantID: req.GrantID, Role: "measurement", SandboxID: "sbx-1",
+		TemplateID: "ar-01ja-runner-g1", GPUs: 1, TimeoutSec: 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	svc.ReapOnce(context.Background())
+	if len(promoter.ids) != 1 || promoter.ids[0] != "sbx-1" {
+		t.Fatalf("promoted=%v", promoter.ids)
+	}
+}
+
 func TestMeasurementTemplateDeniesEgress(t *testing.T) {
 	base := &runtimev1alpha1.CodeInterpreterSandboxTemplate{FromImage: "image:v1"}
 	measurement := codeInterpreter("gr", "ar-01ja-measurement-g8", base, 8, "ns")

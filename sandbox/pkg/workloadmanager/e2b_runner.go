@@ -128,6 +128,14 @@ func (s *Server) Create(ctx context.Context, req e2b.CreateRequest) (e2b.CreateR
 	}, nil
 }
 
+// Observe reads a sandbox Workload without creating one.
+func (s *Server) Observe(ctx context.Context, sandboxID string) (e2b.CreateResult, string, error) {
+	if s == nil || s.workloads == nil {
+		return e2b.CreateResult{}, e2b.WorkloadPending, nil
+	}
+	return s.workloads.Observe(ctx, sandboxID)
+}
+
 // Delete removes the sandbox session charged to a grant.
 func (s *Server) Delete(ctx context.Context, sandboxID string) error {
 	return s.ReclaimSession(ctx, sandboxID)
