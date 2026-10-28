@@ -383,12 +383,9 @@ func signingSecretName(sandboxID string) string {
 	return sandboxID
 }
 
-// signingKeyFile is the private key after the init container copies it onto a writable emptyDir.
-// The Secret mount itself stays on the init container.
-const signingKeyFilePath = "/run/signing-key/" + signingSecretKey
-
-func signingKeyFile(string) string {
-	return signingKeyFilePath
+// signingKeyFile is the Secret SaFE mounts on the sandbox container.
+func signingKeyFile(sandboxID string) string {
+	return signingSecretMountRoot + "/" + signingSecretName(sandboxID) + "/" + signingSecretKey
 }
 
 // createSigningSecret writes the private key where SaFE mirrors workspace secrets.

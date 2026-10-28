@@ -73,7 +73,7 @@ func TestWorkloadObjectUsesTemplateResources(t *testing.T) {
 		t.Fatalf("resources=%v", res)
 	}
 	env, _, _ := unstructured.NestedMap(obj.Object, "spec", "env")
-	if env["FOO"] != "1" || env["HYPERLOOM_ACTIVE_IMAGE_DIGEST"] != "sha256:aa" || env["E2B_SANDBOX_ID"] != sandboxID || env["HYPERLOOM_SIGNING_KEY_FILE"] != "/run/signing-key/signing-key.pem" || env["ROCR_VISIBLE_DEVICES"] != "0,1" {
+	if env["FOO"] != "1" || env["HYPERLOOM_ACTIVE_IMAGE_DIGEST"] != "sha256:aa" || env["E2B_SANDBOX_ID"] != sandboxID || env["HYPERLOOM_SIGNING_KEY_FILE"] != "/etc/secrets/"+sandboxID+"/signing-key.pem" || env["ROCR_VISIBLE_DEVICES"] != "0,1" {
 		t.Fatalf("env=%v", env)
 	}
 	if _, ok := env["HYPERLOOM_SIGNING_KEY_PEM"]; ok {
