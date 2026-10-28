@@ -245,9 +245,14 @@ async function postClaim(url: string): Promise<ClaimedRun | null> {
   return { request: data.request, claimCount };
 }
 
-export function claimHeaders(): Record<string, string> {
+/**
+ * Headers for a call to the API's internal routes. `Content-Type: application/json`
+ * is sent only with a body: Fastify answers 400 FST_ERR_CTP_EMPTY_JSON_BODY to a
+ * bodyless request that claims a JSON body (every bodyless DELETE, for one).
+ */
+export function claimHeaders(hasBody = true): Record<string, string> {
   return {
-    "Content-Type": "application/json",
+    ...(hasBody ? { "Content-Type": "application/json" } : {}),
     Authorization: `Bearer ${AUTH_INTERNAL_TOKEN}`,
   };
 }
