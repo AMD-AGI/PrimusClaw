@@ -569,26 +569,14 @@ func uploadBody(r *http.Request) (io.Reader, func(), error) {
 	return io.LimitReader(r.Body, 32<<20+1), noop, nil
 }
 
+// policyOf returns the sealed allow-list from the verified Router token.
+// X-Sandbox-Sealed and the path headers are ignored.
 func policyOf(r *http.Request) (bool, []string, []string) {
-	if !strings.EqualFold(strings.TrimSpace(r.Header.Get(e2bapi.HeaderSealed)), "true") {
+	policy, ok := e2bapi.PolicyFrom(r.Context())
+	if !ok || !policy.Sealed {
 		return false, nil, nil
 	}
-	return true, splitList(r.Header.Get(e2bapi.HeaderInputs)), splitList(r.Header.Get(e2bapi.HeaderOutputs))
-}
-
-func splitList(raw string) []string {
-	if strings.TrimSpace(raw) == "" {
-		return nil
-	}
-	parts := strings.Split(raw, ",")
-	out := make([]string, 0, len(parts))
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part != "" {
-			out = append(out, part)
-		}
-	}
-	return out
+	return true, policy.Inputs, policy.Outputs
 }
 
 func readBody(r *http.Request) ([]byte, bool, error) {

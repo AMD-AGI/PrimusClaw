@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"google.golang.org/protobuf/encoding/protowire"
+
+	e2bapi "sigs.k8s.io/agent-sandbox/pkg/e2b"
 )
 
 func TestConnectStartFilesAndSignal(t *testing.T) {
@@ -84,21 +86,35 @@ func TestConnectStartFilesAndSignal(t *testing.T) {
 	}
 	_ = escaped.Body.Close()
 
-	sealedBody := protoStart("sh", "-c", "printf no")
-	sealed := postHeader(t, srv.URL+"/process.Process/Start", "application/proto", sealedBody, map[string]string{
+	headerOnly := postHeader(t, srv.URL+"/process.Process/Start", "application/proto", protoStart("sh", "-c", "printf no"), map[string]string{
 		"X-Sandbox-Sealed":  "true",
 		"X-Sandbox-Inputs":  "/in",
 		"X-Sandbox-Outputs": "/out",
+	})
+	if headerOnly.StatusCode == http.StatusForbidden {
+		t.Fatal("sealed headers must not restrict the sandbox")
+	}
+	_ = headerOnly.Body.Close()
+
+	sealedMux := http.NewServeMux()
+	Mount(sealedMux, ws, execStarter(ws))
+	sealedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sealedMux.ServeHTTP(w, r.WithContext(e2bapi.WithRequestPolicy(r.Context(), e2bapi.RequestPolicy{
+			Sealed: true, Inputs: []string{"/in"}, Outputs: []string{"/out"},
+		})))
+	}))
+	defer sealedSrv.Close()
+
+	sealed := postHeader(t, sealedSrv.URL+"/process.Process/Start", "application/proto", protoStart("sh", "-c", "printf no"), map[string]string{
+		"X-Sandbox-Sealed": "false",
 	})
 	if sealed.StatusCode != http.StatusForbidden {
 		t.Fatalf("sealed process %d", sealed.StatusCode)
 	}
 	_ = sealed.Body.Close()
 
-	denied := postHeader(t, srv.URL+"/files?path=/in/a.txt", "text/plain", []byte("x"), map[string]string{
-		"X-Sandbox-Sealed":  "true",
-		"X-Sandbox-Inputs":  "/in",
-		"X-Sandbox-Outputs": "/out",
+	denied := postHeader(t, sealedSrv.URL+"/files?path=/in/a.txt", "text/plain", []byte("x"), map[string]string{
+		"X-Sandbox-Sealed": "false",
 	})
 	if denied.StatusCode != http.StatusForbidden {
 		t.Fatalf("sealed write %d", denied.StatusCode)

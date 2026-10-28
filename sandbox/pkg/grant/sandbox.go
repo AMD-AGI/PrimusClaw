@@ -223,6 +223,26 @@ func timeoutWithinLifetime(started, now time.Time, timeoutSec, maxSec int64) boo
 	return !now.Add(time.Duration(timeoutSec) * time.Second).After(deadline)
 }
 
+// SandboxByID returns the sandbox recorded on any grant.
+// The bool is false when no grant has that id.
+func (s *Service) SandboxByID(ctx context.Context, sandboxID string) (runtimev1alpha1.GrantSandboxRef, bool, error) {
+	if s == nil || sandboxID == "" {
+		return runtimev1alpha1.GrantSandboxRef{}, false, nil
+	}
+	grants, err := s.list(ctx)
+	if err != nil {
+		return runtimev1alpha1.GrantSandboxRef{}, false, err
+	}
+	for i := range grants {
+		for _, ref := range grants[i].Status.Sandboxes {
+			if ref.ID == sandboxID {
+				return ref, true, nil
+			}
+		}
+	}
+	return runtimev1alpha1.GrantSandboxRef{}, false, nil
+}
+
 // Sandbox returns one sandbox when it belongs to the role. Other roles are not found.
 func (s *Service) Sandbox(ctx context.Context, grantID, role, sandboxID string) (runtimev1alpha1.GrantSandboxRef, error) {
 	g, err := s.get(ctx, grantID)
