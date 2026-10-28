@@ -53,6 +53,16 @@ export interface ExchangeSettings {
   http: HttpSettings;
 }
 
+/**
+ * An answer that ends the authority of a token already held: the provider
+ * refused the request (a decision, such as a withdrawn binding) or refused this
+ * client. An outage ends nothing, so it is not one.
+ */
+function withdrawsHeldToken(err: unknown): boolean {
+  return err instanceof IdentityExchangeRefusedError ||
+    (err instanceof IdentityUnavailableError && err.reason === "client_rejected");
+}
+
 function scopeString(scope: ExchangeRequest["scope"]): string {
   return Array.isArray(scope) ? scope.join(" ") : (scope as string | undefined) ?? "";
 }
@@ -66,7 +76,12 @@ function scopeString(scope: ExchangeRequest["scope"]): string {
  * digested into the key rather than stored in it.
  *
  * Nothing is cached about a refusal: a binding revoked a second ago must stop
- * working on the next call, and one granted a second ago must start.
+ * working on the next call, and one granted a second ago must start. So a token
+ * the provider refuses to replace is dropped, not merely left unreplaced: an
+ * `invalid_grant` or a rejected client, and any `forceRefresh` (whose caller says
+ * the held token was refused downstream), evict what was cached for that request,
+ * whether or not the new call then succeeds. After that, neither a plain call nor
+ * the stale-if-error path can hand the old token out again.
  */
 export class ExchangeClient {
   private readonly cache = new Map<string, ExchangedToken>();
@@ -90,6 +105,9 @@ export class ExchangeClient {
       req.resource ?? "", req.requestedTokenType ?? "",
     );
     const now = this.deps.now();
+    // The caller is replacing a token it says was refused downstream. Drop it
+    // before asking, so a failed replacement leaves nothing to be served later.
+    if (req.forceRefresh) this.cache.delete(key);
     const held = this.cache.get(key);
     const minRemaining = req.minRemainingMs ?? this.s.refreshSkewMs;
     if (!req.forceRefresh && held && held.expiresAt !== null && held.expiresAt - now > minRemaining) {
@@ -102,7 +120,18 @@ export class ExchangeClient {
       this.deps.metrics.onCache("exchange", "coalesced");
     } else {
       this.deps.metrics.onCache("exchange", "miss");
-      const started = this.fetchAndStore(key, req, now);
+      // Only the newest flight for a key may touch the cache: an older one that
+      // finishes late must not overwrite what a forced refresh stored since.
+      const started: Promise<ExchangedToken> = this.fetchToken(req, now).then(
+        (token) => {
+          if (this.inflight.get(key) === started) this.store(key, token);
+          return token;
+        },
+        (err: unknown) => {
+          if (this.inflight.get(key) === started && withdrawsHeldToken(err)) this.cache.delete(key);
+          throw err;
+        },
+      );
       flight = started;
       this.inflight.set(key, started);
       const clear = (): void => { if (this.inflight.get(key) === started) this.inflight.delete(key); };
@@ -114,8 +143,11 @@ export class ExchangeClient {
       // The upstream could not be asked, and the token already held is still
       // inside its lifetime: handing it out beats failing. Not for a refusal (a
       // decision), not for a rejected client (it must stop), not on forceRefresh.
+      // And only if it is still the cached one: a refusal or a forced refresh that
+      // ran while this call waited has evicted it, and that eviction stands.
       if (
-        !req.forceRefresh && held && held.expiresAt !== null && held.expiresAt > this.deps.now() &&
+        !req.forceRefresh && held && this.cache.get(key) === held && held.expiresAt !== null &&
+        held.expiresAt > this.deps.now() &&
         err instanceof IdentityUnavailableError && err.reason !== "client_rejected"
       ) {
         this.deps.metrics.onStaleServed("exchange");
@@ -126,7 +158,7 @@ export class ExchangeClient {
     }
   }
 
-  private async fetchAndStore(key: string, req: ExchangeRequest, startedAt: number): Promise<ExchangedToken> {
+  private async fetchToken(req: ExchangeRequest, startedAt: number): Promise<ExchangedToken> {
     const answer = await observe(this.deps, "exchange", async () => {
       const url = await this.endpoints.token();
       const form = new URLSearchParams({
@@ -189,7 +221,6 @@ export class ExchangeClient {
       throw new IdentityUnavailableError("exchange", reason, status);
     });
     if (answer instanceof IdentityExchangeRefusedError) throw answer;
-    this.store(key, answer);
     return answer;
   }
 

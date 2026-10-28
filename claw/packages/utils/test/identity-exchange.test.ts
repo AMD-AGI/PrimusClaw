@@ -236,6 +236,113 @@ test("a rejected client is not covered by a cached token, and neither is a refus
   });
 });
 
+/**
+ * What a refusal does to the NEXT call. The tests above check the call that
+ * fails; a token the provider has refused to renew must also stop being served by
+ * the call after it, from the cache and from the stale-if-error path alike.
+ */
+const OK_BODY = (token: string): { body: unknown } => ({ body: { access_token: token, token_type: "Bearer", expires_in: 300 } });
+
+test("a forced refresh that is refused evicts the held token: the next plain call asks upstream", async () => {
+  await withHarness({}, async ({ fake, client }) => {
+    const first = await client.exchange(REQ);
+    fake.token = () => ({ status: 400, body: { error: "invalid_grant" } });
+    await assert.rejects(client.exchange({ ...REQ, forceRefresh: true }), IdentityExchangeRefusedError);
+    fake.token = () => OK_BODY("tok-after");
+    const next = await client.exchange(REQ);
+    assert.notEqual(next.accessToken, first.accessToken, "the refused token came back from the cache");
+    assert.equal(next.accessToken, "tok-after");
+    assert.equal(fake.count("/oauth/token"), 3);
+  });
+});
+
+test("a forced refresh that fails on a 5xx leaves nothing for a later plain call, hit or stale", async () => {
+  await withHarness({}, async ({ fake, metrics, client }) => {
+    await client.exchange(REQ);
+    fake.token = () => ({ status: 503, body: "" });
+    await assert.rejects(client.exchange({ ...REQ, forceRefresh: true }), unavailable("http_5xx"));
+    // 270 s of the token's life remain, far above the skew: a cache hit if it were still held.
+    await assert.rejects(client.exchange(REQ), unavailable("http_5xx"));
+    assert.equal(fake.count("/oauth/token"), 3, "the plain call has to ask upstream, not hit");
+    assert.equal(metrics.staleCount("exchange"), 0);
+  });
+});
+
+test("a token inside the skew window is not served stale after the provider refused it", async () => {
+  await withHarness({}, async ({ fake, clock, metrics, client }) => {
+    await client.exchange(REQ);
+    clock.advance(280_000);                       // 20 s left: below the skew, still valid
+    fake.token = () => ({ status: 400, body: { error: "invalid_grant", error_description: "binding withdrawn" } });
+    await assert.rejects(client.exchange(REQ), IdentityExchangeRefusedError);
+    fake.token = () => ({ status: 503, body: "" });
+    await assert.rejects(client.exchange(REQ), unavailable("http_5xx"), "the refused token was served from the stale path");
+    assert.equal(metrics.staleCount("exchange"), 0);
+  });
+});
+
+test("a rejected client (401) evicts the held token: neither a hit nor an outage serves it afterwards", async () => {
+  await withHarness({}, async ({ fake, clock, metrics, client }) => {
+    // In the skew window, so the plain call asks upstream and is turned away.
+    await client.exchange(REQ);
+    clock.advance(280_000);
+    fake.token = () => ({ status: 401, body: { error: "invalid_client" } });
+    await assert.rejects(client.exchange(REQ), unavailable("client_rejected"));
+    fake.token = () => ({ status: 503, body: "" });
+    await assert.rejects(client.exchange(REQ), unavailable("http_5xx"));
+    assert.equal(metrics.staleCount("exchange"), 0);
+  });
+  await withHarness({}, async ({ fake, client }) => {
+    // A forced refresh turned away with 403: a fresh token with life left must not remain either.
+    await client.exchange(REQ);
+    fake.token = () => ({ status: 403, body: "" });
+    await assert.rejects(client.exchange({ ...REQ, forceRefresh: true }), unavailable("client_rejected"));
+    fake.token = () => OK_BODY("tok-after");
+    assert.equal((await client.exchange(REQ)).accessToken, "tok-after");
+  });
+});
+
+test("an outage that is not a refusal still falls back to the held token on the next call", async () => {
+  // The other side of the eviction: only a refusal or a forced refresh drops the token.
+  await withHarness({}, async ({ fake, clock, metrics, client }) => {
+    const a = await client.exchange(REQ);
+    clock.advance(280_000);
+    fake.token = () => ({ status: 503, body: "" });
+    assert.equal((await client.exchange(REQ)).accessToken, a.accessToken);
+    assert.equal((await client.exchange(REQ)).accessToken, a.accessToken);
+    assert.equal(metrics.staleCount("exchange"), 2);
+  });
+});
+
+test("a call that was waiting on a 5xx does not serve a token a refusal or forced refresh evicted meanwhile", async () => {
+  await withHarness({}, async ({ fake, clock, metrics, client }) => {
+    await client.exchange(REQ);
+    clock.advance(280_000);                       // the plain call below goes upstream with a token to fall back to
+    let asked = 0;
+    fake.token = () => (++asked === 1
+      ? { status: 503, body: "", delayMs: 80 }
+      : { status: 400, body: { error: "invalid_grant" } });
+    const waiting = client.exchange(REQ);
+    const forced = client.exchange({ ...REQ, forceRefresh: true });
+    await assert.rejects(forced, IdentityExchangeRefusedError);
+    await assert.rejects(waiting, unavailable("http_5xx"));
+    assert.equal(metrics.staleCount("exchange"), 0);
+  });
+});
+
+test("an exchange that finishes late does not overwrite the token a forced refresh stored since", async () => {
+  await withHarness({}, async ({ fake, client }) => {
+    let asked = 0;
+    fake.token = () => (++asked === 1 ? { ...OK_BODY("tok-old"), delayMs: 80 } : OK_BODY("tok-new"));
+    const slow = client.exchange(REQ);
+    const forced = client.exchange({ ...REQ, forceRefresh: true });
+    assert.equal((await forced).accessToken, "tok-new");
+    assert.equal((await slow).accessToken, "tok-old", "the slow caller still gets the answer it waited for");
+    const next = await client.exchange(REQ);
+    assert.equal(next.accessToken, "tok-new", "the older answer replaced the newer one in the cache");
+    assert.equal(fake.count("/oauth/token"), 2);
+  });
+});
+
 test("a failed exchange for a subject never seen has nothing to fall back to", async () => {
   await withHarness({}, async ({ fake, client }) => {
     fake.token = () => ({ status: 503, body: "" });
