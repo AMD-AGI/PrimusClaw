@@ -806,6 +806,7 @@ export class AppRunner {
       mcpToken: stored.mcp_token,
       grantKeys: { ...(stored.grant_keys ?? {}), ...(granted.keys ?? {}) },
       grantLimits: granted.limits ?? rec.grant_limits,
+      sandboxTemplates: rec.grant_templates,
       nodeName,
       e2bApiUrl: granted.e2bApiUrl,
       e2bSandboxUrl: granted.e2bSandboxUrl,

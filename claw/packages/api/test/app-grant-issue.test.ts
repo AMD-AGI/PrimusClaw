@@ -41,12 +41,12 @@ function manifest(roles: AppManifestV1["sandbox_roles"]): AppManifestV1 {
   return out;
 }
 
-function hooks() {
+function hooks(answered: Record<string, string[]> | null = { measurement: ["r1-runner"] }) {
   const calls: SandboxGrantMaterial[] = [];
   const client = {
     async issue(material: SandboxGrantMaterial) {
       calls.push(material);
-      return { keys: { measurement: "e2b_a" }, expiresAt: new Date("2026-10-28T00:00:00.000Z") };
+      return { keys: { measurement: "e2b_a" }, expiresAt: new Date("2026-10-28T00:00:00.000Z"), templates: answered ?? undefined };
     },
     async revoke() { return undefined; },
   };
@@ -69,4 +69,21 @@ test("a declared sandbox role is issued", async () => {
   assert.deepEqual(h.calls[0]!.roles, { measurement: ["runner"] });
   assert.equal(issued?.keys?.measurement, "e2b_a");
   assert.deepEqual(issued?.limits, request.resources.grant);
+  assert.deepEqual(issued?.templates, { measurement: { "0": "r1-runner" } }, "the names the service returned, by role and card count");
+});
+
+test("per_gpu_count templates map each card count to the name the service returned", async () => {
+  const h = hooks({ measurement: ["r1-runner-g1", "r1-runner-g8"] });
+  const issued = await h.hooks.issue(run, manifest({ measurement: ["runner"] }), { ...request, templates: [{ name: "runner", per_gpu_count: [1, 8] }] });
+  assert.deepEqual(issued?.templates, { measurement: { "1": "r1-runner-g1", "8": "r1-runner-g8" } });
+});
+
+test("a response whose names do not line up with the manifest fails the issue", async () => {
+  for (const answered of [null, { measurement: ["r1-other"] }, { measurement: ["r1-runner", "r1-runner-g4"] }]) {
+    const h = hooks(answered);
+    await assert.rejects(
+      () => h.hooks.issue(run, manifest({ measurement: ["runner"] }), request),
+      (err: unknown) => err instanceof Error && /sandbox templates/.test(err.message),
+    );
+  }
 });
