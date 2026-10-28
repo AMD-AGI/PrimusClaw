@@ -69,7 +69,7 @@ test("sglangrouter without a model is refused at declaration time", () => {
 
 test("atom without a model is refused at declaration time", () => {
   assert.ok(errs({ nodes: 2, backend: "atom" }).some((m) => m.includes("model")));
-  ok({ nodes: 2, backend: "atom", model: "/shared_nfs/models/Qwen3-14B-FP8", pd_mode: "disaggregated" });
+  ok({ nodes: 2, backend: "atom", model: "/models/Qwen3-14B-FP8", pd_mode: "disaggregated" });
 });
 
 test("atom accepts an omitted pd_mode and refuses a shape it cannot provision", () => {

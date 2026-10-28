@@ -262,7 +262,7 @@ export function buildTopologyHandoff(ctx: MultiNodeContext): TopologyHandoffBuil
     const ray: NonNullable<TopologyHandoffV1["ray"]> = {};
     if (ctx.headHost) ray.head_ip = ctx.headHost;
     handoff.ray = ray;
-  } else {
+  } else if (ctx.backend === "infera") {
     const infera: NonNullable<TopologyHandoffV1["infera"]> = {
       prefill_ips: [...(ctx.prefillIps ?? [])],
       decode_ips: [...(ctx.decodeIps ?? [])],

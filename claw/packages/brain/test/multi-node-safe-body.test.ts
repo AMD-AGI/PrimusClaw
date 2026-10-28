@@ -303,7 +303,7 @@ test("buildAtomWorkloadBody creates router, prefill and decode from the prompt s
   const body = buildAtomWorkloadBody({
     ...COMMON,
     displayName: "msg1-atom",
-    model: "/shared_nfs/models/Qwen3-14B-FP8",
+    model: "/models/Qwen3-14B-FP8",
     framework: "sglang",
     kvTransferBackend: "mooncake",
     pdMode: "disaggregated",
@@ -345,7 +345,7 @@ test("buildAtomWorkloadBody creates router, prefill and decode from the prompt s
   assert.match(router, /--backend 'sglang'/);
   assert.equal(router.includes("--policy"), false);
   assert.equal(prefill.includes("--mem-fraction-static"), false);
-  assert.match(prefill, /--model-path '\/shared_nfs\/models\/Qwen3-14B-FP8'/);
+  assert.match(prefill, /--model-path '\/models\/Qwen3-14B-FP8'/);
   assert.match(prefill, /--tp-size 8/);
   assert.match(prefill, /--disaggregation-mode prefill/);
   assert.match(prefill, /--disaggregation-bootstrap-port 8998/);

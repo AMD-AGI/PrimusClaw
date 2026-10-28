@@ -249,6 +249,15 @@ test("parseMultiNodePromptFlags reads flags wrapped in markdown backticks", () =
   assert.equal(isMultiNodeRequest({ prompt: BULLET_PROMPT }), true);
 });
 
+test("parseMultiNodePromptFlags closes an escaped-quote server-args value", () => {
+  const spec = parseMultiNodePromptFlags(
+    '--nodes 2 --mn-backend atom --server-args \\"--mem-fraction-static 0.8\\" --model /models/Qwen3-14B-FP8',
+  );
+  assert.ok(spec);
+  assert.equal(spec.serverArgs, "--mem-fraction-static 0.8");
+  assert.equal(spec.model, "/models/Qwen3-14B-FP8");
+});
+
 test("parseMultiNodePromptFlags keeps separators inside a value", () => {
   // Only the outermost decoration goes, so a comma-separated list survives it.
   const spec = parseMultiNodePromptFlags(
@@ -295,7 +304,7 @@ test("parseMultiNodePromptFlags accepts sglangrouter and still requires --model"
 
 test("parseMultiNodePromptFlags accepts atom and still requires --model", () => {
   const spec = parseMultiNodePromptFlags(
-    "--nodes 2 --mn-backend atom --model /shared_nfs/models/Qwen3-14B-FP8 --pd-transfer-backend mooncake --pd-mode disaggregated",
+    "--nodes 2 --mn-backend atom --model /models/Qwen3-14B-FP8 --pd-transfer-backend mooncake --pd-mode disaggregated",
   );
   assert.ok(spec);
   assert.equal(spec.backend, "atom");

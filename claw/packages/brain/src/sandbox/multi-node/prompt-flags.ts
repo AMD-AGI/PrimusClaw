@@ -172,13 +172,18 @@ function readArgString(prompt: string, flag: string): string {
   const found = re.exec(prompt);
   if (!found) return "";
   let i = found.index + found[0].length;
-  if (prompt[i] === "\\") i += 1;
+  // A leading backslash belongs to an escaped opener (`\"...\"`), not to the value.
+  const openerEscaped = prompt[i] === "\\";
+  if (openerEscaped) i += 1;
   const quote = prompt[i];
   if (quote === "\"" || quote === "'") {
     i += 1;
     let out = "";
     while (i < prompt.length) {
       const ch = prompt[i];
+      // The same escape that opened the value closes it. A plain quote still
+      // treats \" as a literal quote inside the value.
+      if (openerEscaped && ch === "\\" && prompt[i + 1] === quote) break;
       if (ch === "\\" && (prompt[i + 1] === quote || prompt[i + 1] === "\\")) {
         out += prompt[i + 1];
         i += 2;
