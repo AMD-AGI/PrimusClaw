@@ -1749,11 +1749,21 @@ export const HITL_DECISION_TIMEOUT_MS = envInt("HITL_DECISION_TIMEOUT_MS", 300_0
 export const HITL_DECISION_DEFAULT = env("HITL_DECISION_DEFAULT", "allow");
 /**
  * The plain-language summary added to a permissionRequest (agent/approval-explain.ts):
- * one short model call on the run's own model, never longer than this budget. On a
+ * one short model call (on the run's own model unless HITL_SUMMARY_MODEL names another;
+ * see below), never longer than this budget. On a
  * timeout or an error the request goes out without it; approval itself is unaffected.
  */
 export const HITL_SUMMARY_ENABLED = envBool("HITL_SUMMARY_ENABLED", true);
 export const HITL_SUMMARY_TIMEOUT_MS = envInt("HITL_SUMMARY_TIMEOUT_MS", 2_000, { min: 200, max: 10_000 });
+/**
+ * The model that writes that summary. Empty (the default) means the run's own model, as before.
+ * A reasoning model with unbounded thinking cannot answer inside the budget, so a deployment names
+ * a small, fast one here. The call still authenticates with the key the run itself uses (the
+ * asking user's own key, or the platform key in proxy mode), so the tokens are billed exactly as
+ * the run's are. A model that key may not call (401/403/404) leaves the card without a summary;
+ * it never switches key.
+ */
+export const HITL_SUMMARY_MODEL = env("HITL_SUMMARY_MODEL", "").trim();
 /**
  * Deployment-wide bash approval rules, a JSON list (see agent/bash-approval.ts).
  * Unset means none; set but unparsable holds every bash command.

@@ -13,6 +13,7 @@ import {
 } from "./config.js";
 import { runLeaseTimingProblems } from "@claw/protocol";
 import { initDb } from "./infra/db.js";
+import { bindApiAppGrant } from "./grants/app-grant.js";
 import { initNats } from "./infra/nats.js";
 import { initUserEnvCrypto } from "./crypto/user-env.js";
 import { authLogPath, authMiddleware } from "./auth/middleware.js";
@@ -153,6 +154,7 @@ async function main() {
   // fast-fail if the K8s Secret is misconfigured (missing or wrong length),
   // not a runtime surprise on the first PUT /v1/users/me/env-vars/* call.
   initUserEnvCrypto();
+  bindApiAppGrant();
   await initDb();
   await initNats();
 

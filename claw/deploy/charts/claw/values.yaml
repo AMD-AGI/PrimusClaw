@@ -483,6 +483,17 @@ secret:
   # to log and let the platform's own idle/TTL GC reclaim confirmed orphans.
   sandboxKeepaliveFailLimit: "0"
 
+# Signing key for Agent Sandbox grants. The private key lives in
+# agent-sandbox-system/agent-sandbox-grant, key signing-key.pem. Copy that key
+# into this namespace as `secretName` before setting enabled. Only the API
+# mounts it. Brain asks the API to extend and reissue.
+grantSigningKey:
+  enabled: false
+  secretName: primus-claw-grant-signing-key
+  url: http://agent-sandbox-router.agent-sandbox-system.svc.cluster.local:8080/internal/v1/grants
+  e2bApiUrl: ""
+  e2bSandboxUrl: ""
+
 sandboxTemplate:
   enabled: true
   name: primus-claw-sandbox-template

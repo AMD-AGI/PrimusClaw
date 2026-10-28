@@ -145,7 +145,7 @@ test("the lease holder's cursor write is stored and read back; another worker's 
     task_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, state TEXT NOT NULL, restarts INT NOT NULL DEFAULT 0,
     last_exit JSONB, events_cursor JSONB NOT NULL DEFAULT '{}'::jsonb, state_dir TEXT, sandbox_workload_id TEXT,
     manifest JSONB NOT NULL, grant_id TEXT, grant_limits JSONB, grant_expires_at TIMESTAMPTZ, grant_revoked_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+    created_by TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
   await harness.sql("DELETE FROM claw_app_runs");
   await harness.sql(
     `INSERT INTO claw_tasks (task_id, session_id, name, status, lease_owner, lease_expires_at, claim_count)

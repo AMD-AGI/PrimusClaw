@@ -28,6 +28,12 @@ record it.
 ## [Unreleased]
 
 ### Added
+- `HITL_SUMMARY_MODEL` names the model that writes an approval card's one-sentence summary, so a
+  small, fast model can do it instead of the run's own reasoning model, which could not answer inside
+  `HITL_SUMMARY_TIMEOUT_MS`. Unset keeps the run's own model. The call authenticates with the key the run
+  itself uses (the asking user's, or the platform key in proxy mode), so the tokens are billed as the
+  run's are. A model that key may not call (401/403/404) leaves the card without a summary and counts
+  `claw_brain_approval_summary_model_refused_total`; it never falls back to another key.
 - A `permissionRequest` now says in words what the call is, so an approval card
   can show something a person can judge instead of a raw request body:
   `tool_description` (the tool's own first sentence), `intent` (what the agent
@@ -155,6 +161,18 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- A session no longer becomes unusable after a turn that called a tool whose name
+  reads as a credential field (for example `mcp__*__apikey_*`). Brain's redactor
+  replaced such a tool's whole `argumentsDetail` entry with the string
+  `"<redacted>"`; that string was stored with the turn and replayed to the model as
+  the call's input, the model endpoint answered 400 ("function.arguments must be a
+  JSON object") to the whole request, and every later turn of the session failed
+  the same way within two seconds. The entry now stays an object with every value
+  still masked; `reconstructHistory` turns any stored non-object input (including
+  rows already written) into one; both model providers send object inputs on the
+  wire and store streamed calls whose arguments decode to `[]` or `null` as
+  objects; and a 400 of that kind repairs the history and retries once
+  (`claw_brain_llm_tool_args_rejected_total`, `claw_brain_llm_tool_input_repaired_total`).
 - `deploy/upgrade.sh` no longer drops `PG_SSL_NO_VERIFY`. Only `deploy.sh`
   read it, so the first upgrade of a deployment installed with it re-rendered
   the API at verify-full, and against a PGO-managed database every new API pod

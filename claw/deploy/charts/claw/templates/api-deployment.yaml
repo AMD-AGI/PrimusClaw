@@ -74,7 +74,7 @@ spec:
         runAsNonRoot: true
         runAsUser: 1000
         fsGroup: 1000
-      {{- if or .Values.tls.extraCACertsConfigMap .Values.api.extraVolumes }}
+      {{- if or .Values.tls.extraCACertsConfigMap .Values.grantSigningKey.enabled .Values.api.extraVolumes }}
       volumes:
       {{- if .Values.tls.extraCACertsConfigMap }}
       - name: extra-ca
@@ -83,6 +83,11 @@ spec:
           items:
           - key: {{ required "tls.extraCACertsKey must be set when tls.extraCACertsConfigMap is set" .Values.tls.extraCACertsKey | quote }}
             path: ca.crt
+      {{- end }}
+      {{- if .Values.grantSigningKey.enabled }}
+      - name: grant-signing-key
+        secret:
+          secretName: {{ .Values.grantSigningKey.secretName }}
       {{- end }}
       {{- with .Values.api.extraVolumes }}
       {{- toYaml . | nindent 6 }}
@@ -161,6 +166,12 @@ spec:
         - name: NODE_TLS_REJECT_UNAUTHORIZED
           value: "0"
         {{- end }}
+        {{- if .Values.grantSigningKey.enabled }}
+        - name: GRANT_SIGNING_KEY_FILE
+          value: /var/run/claw/grant/signing-key.pem
+        - name: AGENT_SANDBOX_GRANT_URL
+          value: {{ .Values.grantSigningKey.url | quote }}
+        {{- end }}
         {{- if .Values.tls.extraCACertsConfigMap }}
         - name: NODE_EXTRA_CA_CERTS
           value: /etc/claw-ca/ca.crt
@@ -176,11 +187,16 @@ spec:
         # longest migration the code permits could never finish -- the pod was
         # killed and the next one started the same statement again. 120 x 3s is
         # 360s, which leaves the statement its whole budget plus connect time.
-        {{- if or .Values.tls.extraCACertsConfigMap .Values.api.extraVolumeMounts }}
+        {{- if or .Values.tls.extraCACertsConfigMap .Values.grantSigningKey.enabled .Values.api.extraVolumeMounts }}
         volumeMounts:
         {{- if .Values.tls.extraCACertsConfigMap }}
         - name: extra-ca
           mountPath: /etc/claw-ca
+          readOnly: true
+        {{- end }}
+        {{- if .Values.grantSigningKey.enabled }}
+        - name: grant-signing-key
+          mountPath: /var/run/claw/grant
           readOnly: true
         {{- end }}
         {{- with .Values.api.extraVolumeMounts }}

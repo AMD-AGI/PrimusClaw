@@ -12,7 +12,8 @@
  *                     schema the model was given; nothing here knows any server)
  *   intent            what the agent itself said just before the call
  *   summary           one plain sentence in the user's language, written by ONE
- *                     small model call on the run's own model and gateway
+ *                     small model call on the run's own gateway and key, with the
+ *                     run's own model or the one HITL_SUMMARY_MODEL names
  *   summary_by        "model" whenever `summary` is present, so a client can say
  *                     the sentence is machine-written and not authoritative
  *

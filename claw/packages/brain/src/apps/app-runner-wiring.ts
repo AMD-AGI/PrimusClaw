@@ -87,6 +87,6 @@ export function createAppRunner(runId: string, platformKey: string, claimCount: 
   const store = httpAppRunStore({ claimCount });
   const sandbox = realAppSandbox(store);
   return new AppRunner(runId, platformKey, {
-    store, sandbox, grant: boundGrant, seams: { ...eventForwardingSeams(store, sandbox, publish), ...boundSeams },
+    store, sandbox, claimCount, grant: boundGrant, seams: { ...eventForwardingSeams(store, sandbox, publish), ...boundSeams },
   });
 }

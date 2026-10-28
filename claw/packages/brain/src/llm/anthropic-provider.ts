@@ -11,6 +11,7 @@ import type {
 import { LLM_CACHE_TTL, PROMPT_CACHE_ENABLED, STREAM_FIRST_BYTE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS } from "../config.js";
 import { looksLikeCacheRejection } from "./cache-rejection.js";
 import { requiredArgToolNames } from "./tool-schema.js";
+import { parseToolArguments, sanitizeToolUseInputs } from "./tool-input.js";
 import { prepareAnthropicRequest, stripCacheControl, type PreparedAnthropicRequest } from "./anthropic-cache.js";
 import type { Message } from "@claw/protocol";
 import type { LlmCacheReport, LlmContentBlock, LlmProvider, LlmSession, LlmSessionOptions, LlmTurnResult } from "./provider.js";
@@ -87,7 +88,15 @@ async function streamingTurn(
   // right, so it must survive PROMPT_CACHE_ENABLED=false and the session latch
   // -- otherwise turning caching off silently reverts the request to a shape
   // the API does not accept. Only the markers are gated.
-  const prepared = prepareAnthropicRequest(messages as unknown as Message[], { ttl: LLM_CACHE_TTL });
+  // Every replayed tool_use must carry an object input or the API refuses the
+  // whole request ("tool_use.input: Input should be an object"). Done on the
+  // wire copy so the caller's history is untouched.
+  const sanitized = sanitizeToolUseInputs(messages as unknown as Message[]);
+  if (sanitized.repaired > 0) {
+    metrics.onToolInputRepaired("wire", sanitized.repaired);
+    logger.warn({ repaired: sanitized.repaired }, "llm.tool_input.repaired_on_wire");
+  }
+  const prepared = prepareAnthropicRequest(sanitized.messages, { ttl: LLM_CACHE_TTL });
   const useMarkers = PROMPT_CACHE_ENABLED && !cacheState.disabled;
   const decorated = useMarkers ? prepared : stripCacheControl(prepared);
 
@@ -252,12 +261,14 @@ async function streamingTurn(
           const cur = blocks[evt.index];
           if (cur && cur.type === "tool_use") {
             const buf = toolJsonBuf.get(evt.index) ?? "";
-            try {
-              cur.input = buf.length ? JSON.parse(buf) : {};
-            } catch (e) {
+            // Valid JSON that is not an object is coerced rather than stored:
+            // a replayed tool_use whose input is not an object makes the API
+            // reject every later turn of the session.
+            const parsed = parseToolArguments(buf);
+            if (parsed.malformed) {
               logger.warn({ idx: evt.index, buf: buf.slice(0, 500) }, "tool_use.json_parse_failed");
-              cur.input = { _raw: buf };
             }
+            cur.input = parsed.input;
             toolJsonBuf.delete(evt.index);
           }
           break;
@@ -455,12 +466,13 @@ export function buildAnthropicSession(
         capture,
         cacheState,
       ),
-      async complete(systemPrompt, userText, maxTokens, signal) {
+      async complete(systemPrompt, userText, maxTokens, signal, options) {
         const resp = await client.messages.create({
           model,
           max_tokens: maxTokens,
           system: systemPrompt,
           messages: [{ role: "user", content: userText }],
+          ...(options?.effort ? { output_config: { effort: options.effort } } : {}),
         }, signal ? { signal } : undefined);
         const text = resp.content
           .filter((b) => b.type === "text")
