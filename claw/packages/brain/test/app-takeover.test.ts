@@ -250,9 +250,11 @@ test("G9 SIGTERM goes to the application's whole process group, children include
   const dir = mkdtempSync(`${tmpdir()}/c2-03c-`);
   // A launcher (session leader, like `setsid` makes it) with a worker child that would not get a leader-only signal.
   const leader = spawn("sh", ["-c", `sleep 30 & echo $! > ${dir}/child.pid; wait`], { stdio: "ignore", detached: true });
-  // A zombie nobody reaped is dead for this purpose.
+  // Alive means /proc says the process is in a running state. A zombie nobody reaped is dead for this
+  // purpose, and so is a read that fails or comes back empty: a process in the middle of exiting can
+  // answer a read of its stat with nothing at all, which "not a zombie" used to count as alive.
   const alive = (pid: number) => {
-    try { return !/^\d+ \(.*\) Z/.test(readFileSync(`/proc/${pid}/stat`, "utf8")); } catch { return false; }
+    try { return /^\d+ \(.*\) [RSDTtI] /.test(readFileSync(`/proc/${pid}/stat`, "utf8")); } catch { return false; }
   };
   try {
     writeFileSync(`${dir}/app.pid`, String(leader.pid));
@@ -265,8 +267,11 @@ test("G9 SIGTERM goes to the application's whole process group, children include
     assert.ok(child > 0 && alive(child));
     const sent = spawnSync("sh", ["-c", stopCommand(dir, "wl-1:0")], { encoding: "utf8" });
     assert.equal(sent.stdout.trim(), "sent");
-    for (let i = 0; i < 50 && alive(child); i++) await new Promise((r) => setTimeout(r, 100));
-    assert.equal(alive(child), false, "the worker was signalled with its launcher");
+    // Wait on the condition with a deadline, and judge by the poll that ended the wait, not by a second look.
+    const deadline = Date.now() + 10_000;
+    let gone = !alive(child);
+    while (!gone && Date.now() < deadline) { await new Promise((r) => setTimeout(r, 20)); gone = !alive(child); }
+    assert.equal(gone, true, "the worker was signalled with its launcher");
   } finally {
     try { process.kill(-leader.pid!, "SIGKILL"); } catch { /* already gone */ }
     rmSync(dir, { recursive: true, force: true });

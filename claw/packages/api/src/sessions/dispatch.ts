@@ -12,7 +12,7 @@
 // ─────────────────────────────────────────────────────────────────
 
 import { db, MarketplaceDb } from "../infra/db.js";
-import { canViewPlugin, formatPluginRow, pluginSandboxImage } from "../marketplace/plugins.js";
+import { resolveTaskPlugin } from "../marketplace/plugins.js";
 import { js, sc, nc, publishCertainlyFailed } from "../infra/nats.js";
 import { isAdmin, type UserInfo } from "../auth/models.js";
 import { stampSessionCredentials } from "../auth/session-credentials.js";
@@ -274,22 +274,10 @@ export async function dispatchTaskToBrain(
     let pluginResource: Record<string, unknown> | undefined;
 
     if (pluginId !== undefined) {
-      const pluginRow = await MarketplaceDb.pluginGetById(pluginId, false);
-      if (pluginRow && canViewPlugin(pluginRow, userId, admin)) {
-        const formatted = await formatPluginRow(pluginRow, true);
-        pluginTools = (formatted.tools as unknown[]) ?? [];
-        const imageFromPlugin = pluginSandboxImage(formatted.images);
-        if (imageFromPlugin) pluginImage = imageFromPlugin;
-        const resourceFromPlugin = asJsonObject(formatted.resource);
-        // Same empty-object-is-truthy footgun as the session-config resources
-        // normalization in routes/anthropic-managed-agents.ts: a plugin
-        // created without an explicit `resource` defaults to `{}` (not
-        // null/undefined), which would otherwise permanently mask
-        // defaultResource below in the `||` fallback chain.
-        if (resourceFromPlugin && Object.keys(resourceFromPlugin).length > 0) pluginResource = resourceFromPlugin;
-      } else {
-        pluginTools = null;
-      }
+      const plugin = await resolveTaskPlugin(pluginId, userId, admin);
+      pluginTools = plugin.tools;
+      pluginImage = plugin.image;
+      pluginResource = plugin.resource;
     } else {
       pluginTools = undefined;
     }

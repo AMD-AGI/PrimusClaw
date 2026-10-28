@@ -28,11 +28,41 @@ record it.
 ## [Unreleased]
 
 ### Added
+- `HITL_SUMMARY_MODEL` names the model that writes an approval card's one-sentence summary, so a
+  small, fast model can do it instead of the run's own reasoning model, which could not answer inside
+  `HITL_SUMMARY_TIMEOUT_MS`. Unset keeps the run's own model. The call authenticates with the key the run
+  itself uses (the asking user's, or the platform key in proxy mode), so the tokens are billed as the
+  run's are. A model that key may not call (401/403/404) leaves the card without a summary and counts
+  `claw_brain_approval_summary_model_refused_total`; it never falls back to another key.
+- A `permissionRequest` now says in words what the call is, so an approval card
+  can show something a person can judge instead of a raw request body:
+  `tool_description` (the tool's own first sentence), `intent` (what the agent
+  said just before the call) and `summary` (one plain sentence in the user's
+  language, written by one small call on the run's own model, within
+  `HITL_SUMMARY_TIMEOUT_MS`; `summary_by: "model"` marks it as machine-written).
+  Credential-named arguments never reach that call. A timeout, an error or
+  `HITL_SUMMARY_ENABLED=false` just omit the fields; approval semantics are
+  unchanged and `input` is still sent as before.
 - Deployment-level platform defaults: `PLATFORM_DEFAULTS_FILE` lists default skills
   (by marketplace tool id) and MCP servers mounted into every chat, behind
   `PROGRESSIVE_SKILLS_ENABLED` for skills. Default skills are listed by name and
   description only and written into the sandbox on first read. Off by default;
   see `claw/docs/platform-defaults.md`.
+
+### Changed
+- Brain no longer fetches every plugin skill again on every turn. Downloaded skill
+  files are held in memory (bounded by `SKILL_CACHE_MAX_BYTES`, 64 MiB by default,
+  `0` turns it off) and reused while the skill is unchanged: a plugin skill is
+  validated with one object-store listing per turn (per-object ETag and size, so
+  an in-place upsert of the same version is picked up), a marketplace `tool_ids`
+  skill by its record's `version` and `updated_at`. A turn that finds a plugin
+  skill unchanged reads no object and reports no `download_skill` event for it.
+- A turn of a session with plugin tools no longer starts a sandbox before its
+  first model call unless the plugin has a hooks-type tool: plugin skill files
+  are written into the sandbox on the first sandbox call that names `.skills`,
+  so a turn that only calls MCP tools opens none. With
+  `PROGRESSIVE_SKILLS_ENABLED`, plugin skills are listed by name and description
+  like the platform defaults instead of being inlined.
 
 ### Security
 - Credential redaction no longer treats every `user_env` / `session_env` value
@@ -131,6 +161,18 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- A session no longer becomes unusable after a turn that called a tool whose name
+  reads as a credential field (for example `mcp__*__apikey_*`). Brain's redactor
+  replaced such a tool's whole `argumentsDetail` entry with the string
+  `"<redacted>"`; that string was stored with the turn and replayed to the model as
+  the call's input, the model endpoint answered 400 ("function.arguments must be a
+  JSON object") to the whole request, and every later turn of the session failed
+  the same way within two seconds. The entry now stays an object with every value
+  still masked; `reconstructHistory` turns any stored non-object input (including
+  rows already written) into one; both model providers send object inputs on the
+  wire and store streamed calls whose arguments decode to `[]` or `null` as
+  objects; and a 400 of that kind repairs the history and retries once
+  (`claw_brain_llm_tool_args_rejected_total`, `claw_brain_llm_tool_input_repaired_total`).
 - `deploy/upgrade.sh` no longer drops `PG_SSL_NO_VERIFY`. Only `deploy.sh`
   read it, so the first upgrade of a deployment installed with it re-rendered
   the API at verify-full, and against a PGO-managed database every new API pod

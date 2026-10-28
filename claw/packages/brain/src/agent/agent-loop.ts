@@ -13,7 +13,7 @@ import {
   TODO_WRITE_ENABLED, EXIT_PLAN_MODE_ENABLED,
   COMPACTION_TRIGGER_INPUT_TOKENS,
   CHECKPOINT_TURN_INTERVAL, CHECKPOINT_MAX_WALL_GAP_MS,
-  LLM_CACHE_TTL,
+  LLM_CACHE_TTL, HITL_SUMMARY_MODEL,
 } from "../config.js";
 import {
   HandsRebuildFailed,
@@ -31,12 +31,15 @@ import { HandsClient, isHandsNetworkError, isHandsToolTimeout, explainHandsError
 import { isSandboxTool } from "../tools/hands.js";
 import type { HookRunner } from "./hooks.js";
 import { refusalMessage, type HitlController } from "./hitl.js";
+import { latestUserText, type Completer } from "./approval-explain.js";
+import { summaryCompleter, summarySessionId } from "./summary-completer.js";
 import { metrics } from "../infra/metrics.js";
 import { isTrackedRun, whileRecovering, whileWaiting, type WaitMode } from "../tasks/run-phase.js";
 import pino from "pino";
 import { randomUUID } from "node:crypto";
 import { getProvider } from "../llm/index.js";
 import type { LlmSession } from "../llm/provider.js";
+import { looksLikeToolArgumentsRejection, sanitizeToolUseInputs } from "../llm/tool-input.js";
 
 const logger = pino({ name: "agent-loop" });
 
@@ -324,6 +327,8 @@ export interface LoopOptions {
    *  else the loop needs already arrives through this interface, and that one
    *  module-level call was what made the file untestable. */
   llmSession?: LlmSession;
+  /** Test seam: HITL_SUMMARY_MODEL for this loop, where the deployment's setting is read at import. */
+  hitlSummaryModel?: string;
 }
 
 // ── P1: todo_write in-loop state ──
@@ -632,6 +637,8 @@ class AgentLoopRunner {
   private readonly signal?: AbortSignal;
   private readonly userId?: string;
   private readonly sessionId?: string;
+  /** Built on the first approval and kept, so a refused summary model is refused once per run. */
+  private summaryComplete?: Completer;
   private readonly depth: number;
   /** A sub-agent runs inside the slot its parent holds, so its waits must not
    *  park: that would hand back a slot this loop never acquired. */
@@ -645,6 +652,9 @@ class AgentLoopRunner {
   // --- Resume: pre-populated from checkpoint in the constructor ---
   private workingMessages: Message[];
   private textParts: string[];
+  /** The visible text of the latest model response: what the agent said it was about to do, which an
+   *  approval card shows next to the call that response issued. Never hidden reasoning. */
+  private turnText = "";
   /** Whether the previous turn was empty and was answered with EMPTY_TURN_NUDGE. */
   private emptyTurnNudged = false;
   private usage: TokenUsage;
@@ -865,6 +875,27 @@ class AgentLoopRunner {
     // seam is opts.llmSession (tests only), which does not change the
     // configured protocol and therefore cannot mislabel a real deployment.
     this.wireProtocol = getProvider().name;
+  }
+
+  /**
+   * The completer for an approval card's summary. With HITL_SUMMARY_MODEL set it is a session on that
+   * model on THIS run's gateway with THIS run's key (`this.apiKey`, already resolved by
+   * resolveRequestLlmKey: the user's own key, or the platform key in proxy mode); no other key is in
+   * scope here. The id the gateway pins a backend by is NOT the run's: see summarySessionId. Unset, it is
+   * the run's own session, as it always was, with the run's own id.
+   */
+  private summaryCompleter(): Completer {
+    this.summaryComplete ??= summaryCompleter({
+      model: this.opts.hitlSummaryModel ?? HITL_SUMMARY_MODEL,
+      runSession: this.session,
+      open: (model) => getProvider().createSession({
+        model, apiUrl: this.apiUrl, apiKey: this.apiKey, userId: this.userId,
+        // Not the run's own id: this is a different model, and the gateway's session affinity keys on it.
+        sessionId: summarySessionId(this.sessionId),
+      }),
+      onRefused: (_model, status) => metrics.onApprovalSummaryModelRefused(status),
+    });
+    return this.summaryComplete;
   }
 
   async run(): Promise<LoopResult> {
@@ -1431,6 +1462,7 @@ class AgentLoopRunner {
       avg_output_tps: Math.round(avgOutputTps * 10) / 10,
       ...(routedModel ? { routed_model: routedModel } : {}),
     };
+    this.turnText = content.filter((b: any) => b.type === "text").map((b: any) => String(b.text ?? "")).join(" ");
     for (const b of content) {
       if ((b as any).type === "text") {
         const text = (b as any).text as string;
@@ -1728,6 +1760,13 @@ class AgentLoopRunner {
     // Backoff (ms) per attempt index. Jittered ±50% to spread reconnect storms
     // across concurrent agent loops in the same brain pod / cluster.
     const STREAM_BACKOFF_MS = [5_000, 15_000, 30_000];
+    // The model endpoint refuses a request whose replayed history holds a tool
+    // call with non-object arguments, and the history is replayed every turn,
+    // so the refusal repeats forever. The providers already coerce on the way
+    // out; this is the second line, for a shape they did not catch. Once per
+    // call: a second refusal after repairing is not something more repairing
+    // can fix.
+    let sanitizedRetryUsed = false;
     for (let attempt = 0; ; attempt++) {
       try {
         // Filter accumulated [system-notice]: messages before each
@@ -1739,6 +1778,27 @@ class AgentLoopRunner {
       } catch (err: any) {
         let code = err?.code as string | undefined;
         const errMsg = err?.message || String(err);
+        if (!sanitizedRetryUsed && !this.signal?.aborted && looksLikeToolArgumentsRejection(err)) {
+          sanitizedRetryUsed = true;
+          const repaired = sanitizeToolUseInputs(this.workingMessages);
+          // Repairing nothing means the request that comes next is byte-for-byte
+          // the one that was just refused; say so and fail as before.
+          metrics.onToolArgsRejected(repaired.repaired > 0 ? "retried" : "nothing_to_repair");
+          logger.error(
+            { err: errMsg.slice(0, 300), code, turn, sessionId: this.sessionId, repaired: repaired.repaired },
+            "agent-loop.tool_args_rejected",
+          );
+          if (repaired.repaired > 0) {
+            metrics.onToolInputRepaired("retry", repaired.repaired);
+            // In place, so the checkpoint written at the end of the turn carries
+            // the repaired history instead of the poisoned one.
+            this.workingMessages.length = 0;
+            this.workingMessages.push(...repaired.messages);
+            // The refusal was ours to fix, not a transient: it spends no retry.
+            attempt--;
+            continue;
+          }
+        }
         const isTruncated = code === "STREAM_TRUNCATED"
           || code === "TOOL_INPUT_EMPTY"
           || code === "TOOL_INPUT_PARSE_FAILED";
@@ -1829,6 +1889,12 @@ class AgentLoopRunner {
       const decide = () => this.opts.hitl!.beforeToolUse({
         sessionId: this.sessionId ?? "", userId: this.userId, actionId: toolId,
         tool: toolName, input: finalInput, signal: this.signal,
+        explain: {
+          toolDescription: this.tools.find((t) => t.name === toolName)?.description,
+          intent: this.turnText,
+          userText: latestUserText(this.workingMessages),
+          complete: this.summaryCompleter(),
+        },
       });
       // Waiting on a person, which is the longest wait a run has and the one
       // least related to how much work it is doing -- but only when there is

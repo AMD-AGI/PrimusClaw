@@ -4,6 +4,7 @@
 import "dotenv/config";
 import {
   DEFAULT_BRAIN_REGISTRY_TTL_MS,
+  DEFAULT_SANDBOX_IDLE_REUSE_SECONDS,
   DEFAULT_RUN_LEASE_HEARTBEAT_MS,
   DEFAULT_RUN_LEASE_TTL_MS,
   DEFAULT_TASK_MAX_ACK_PENDING,
@@ -908,7 +909,9 @@ export const BRAIN_LAZY_SANDBOX = envBool("BRAIN_LAZY_SANDBOX", true);
 // workload is Running, Brain waits this long from quiescedAt then CAS-es
 // ready→closing and destroyHands. Operators set SANDBOX_IDLE_REUSE_SECONDS
 // (default 900). Values below 1s are refused and this default is used.
-export const SANDBOX_IDLE_REUSE_MS = envInt("SANDBOX_IDLE_REUSE_SECONDS", 15 * 60, { min: 1 }) * 1000;
+export const SANDBOX_IDLE_REUSE_MS = envInt(
+  "SANDBOX_IDLE_REUSE_SECONDS", DEFAULT_SANDBOX_IDLE_REUSE_SECONDS, { min: 1 },
+) * 1000;
 // The setting used to be named for milliseconds. A deployment still carrying
 // the old name is not reading the default it thinks it is -- the new name is
 // in seconds, so even a copied value would mean something else -- and a
@@ -1745,6 +1748,23 @@ export const HITL_AUTO_ALLOW = env("HITL_AUTO_ALLOW", "read,glob,grep,ls,todo_wr
 export const HITL_DECISION_TIMEOUT_MS = envInt("HITL_DECISION_TIMEOUT_MS", 300_000);
 export const HITL_DECISION_DEFAULT = env("HITL_DECISION_DEFAULT", "allow");
 /**
+ * The plain-language summary added to a permissionRequest (agent/approval-explain.ts):
+ * one short model call (on the run's own model unless HITL_SUMMARY_MODEL names another;
+ * see below), never longer than this budget. On a
+ * timeout or an error the request goes out without it; approval itself is unaffected.
+ */
+export const HITL_SUMMARY_ENABLED = envBool("HITL_SUMMARY_ENABLED", true);
+export const HITL_SUMMARY_TIMEOUT_MS = envInt("HITL_SUMMARY_TIMEOUT_MS", 2_000, { min: 200, max: 10_000 });
+/**
+ * The model that writes that summary. Empty (the default) means the run's own model, as before.
+ * A reasoning model with unbounded thinking cannot answer inside the budget, so a deployment names
+ * a small, fast one here. The call still authenticates with the key the run itself uses (the
+ * asking user's own key, or the platform key in proxy mode), so the tokens are billed exactly as
+ * the run's are. A model that key may not call (401/403/404) leaves the card without a summary;
+ * it never switches key.
+ */
+export const HITL_SUMMARY_MODEL = env("HITL_SUMMARY_MODEL", "").trim();
+/**
  * Deployment-wide bash approval rules, a JSON list (see agent/bash-approval.ts).
  * Unset means none; set but unparsable holds every bash command.
  */
@@ -1761,4 +1781,9 @@ export const RULES_DIR = env("RULES_DIR", "/app/rules");
 export const PLATFORM_DEFAULTS_FILE = env("PLATFORM_DEFAULTS_FILE");
 // Whether the file's `skills` apply. Off: only its MCP servers are mounted.
 export const PROGRESSIVE_SKILLS_ENABLED = envBool("PROGRESSIVE_SKILLS_ENABLED", false);
+// Budget for the downloaded skill files (plugin skills and marketplace tool_ids
+// skills) Brain keeps in memory between turns, so a skill version is fetched once
+// per process instead of once per turn (see tools/skill-cache.ts). Counted as
+// content bytes plus a fixed price per file and per skill. 0 turns it off.
+export const SKILL_CACHE_MAX_BYTES = envInt("SKILL_CACHE_MAX_BYTES", 64 * 1024 * 1024, { min: 0 });
 export const SAFETY_PREAMBLE_ENABLED = envBool("SAFETY_PREAMBLE_ENABLED", true);

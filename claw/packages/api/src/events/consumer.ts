@@ -7,11 +7,7 @@ import {
   rememberSessionDeleted,
 } from "../sessions/deleted-cache.js";
 import { db, MarketplaceDb } from "../infra/db.js";
-import {
-  canViewPlugin,
-  formatPluginRow,
-  pluginSandboxImage,
-} from "../marketplace/plugins.js";
+import { resolveTaskPlugin } from "../marketplace/plugins.js";
 
 import { buildMessages } from "../sessions/context-builder.js";
 import { maybeExtractMemory, insertMemoryEntry, isMemoryActive, scanMemoryContent, maybeUpdateUserProfile } from "../memory/service.js";
@@ -493,6 +489,20 @@ export async function consumeEventDelivery(msg: {
 }
 
 /**
+ * Whether a lifecycle event is an app run's. Brain stamps `message_id` with the
+ * run's task id for anything that is not a chat turn, so the id names the row.
+ */
+async function isAppRunEvent(sessionId: string, event: Record<string, unknown>): Promise<boolean> {
+  const taskId = event.message_id;
+  if (typeof taskId !== "string" || !taskId) return false;
+  const r = await db.query(
+    "SELECT 1 FROM claw_tasks WHERE task_id = $1 AND session_id = $2 AND mode = 'app'",
+    [taskId, sessionId],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
+/**
  * Apply a brain-emitted lifecycle event to claw_sessions.agent_status,
  * gated by the monotonic status_event_at column added in migration 0042.
  *
@@ -509,6 +519,16 @@ async function handleStatusEvent(
   const wall = Number(event.wallclock_ms);
   if (!Number.isFinite(wall) || wall <= 0) {
     logger.warn({ sessionId, type: event.type }, "status_event.bad_wallclock_skip");
+    return;
+  }
+  // An app run is not the session's foreground turn. `agent_status` is the gate on
+  // the conversation (`running` parks every message in `claw_pending_messages`), and
+  // a hosted application runs for hours beside it: a `taskResumed` from a redelivered
+  // app run used to set `running` with no turn to complete and no marker, so nothing
+  // released it and the application's own events kept the stuck-session reaper off.
+  // The run's lifecycle is on its row and in `appStatus`; the gate is not its to move.
+  if (await isAppRunEvent(sessionId, event)) {
+    logger.info({ sessionId, type: event.type, taskId: event.message_id }, "status_event.app_run_ignored");
     return;
   }
   const nextStatus = event.type === "taskInterrupted" ? "interrupted" : "running";
@@ -1259,17 +1279,25 @@ if (pending) {
   const defaultImage = String(defaultResourceRow?.image ?? "").trim() || undefined;
   let pluginImage: string | undefined;
   let pluginResource: Record<string, unknown> | undefined;
+  // What the immediate path attaches (`undefined` = the message names no plugin).
+  // A message that names a plugin and leaves this out reaches Brain with
+  // `plugin_id` set and no tool list, so Brain loads nothing from the plugin
+  // and holds every bash command.
+  let pluginTools: unknown[] | null | undefined;
   if (pluginId !== undefined && Number.isFinite(pluginId)) {
     try {
-      const pluginRow = await MarketplaceDb.pluginGetById(pluginId, false);
-      if (pluginRow && canViewPlugin(pluginRow, pendingUserId, false)) {
-        const formatted = await formatPluginRow(pluginRow, true);
-        const imageFromPlugin = pluginSandboxImage(formatted.images);
-        if (imageFromPlugin) pluginImage = imageFromPlugin;
-        const resourceFromPlugin = asJsonObject(formatted.resource);
-        if (resourceFromPlugin) pluginResource = resourceFromPlugin;
-      }
+      // The session owner's own view. The roles of whoever sent this message
+      // are not stored on the queue row and are not guessed at here, so the
+      // admin override the immediate path applies is not applied: this can
+      // only ever show the owner less than the immediate path would.
+      const plugin = await resolveTaskPlugin(pluginId, pendingUserId, false);
+      pluginTools = plugin.tools;
+      pluginImage = plugin.image;
+      pluginResource = plugin.resource;
     } catch (err) {
+      // Not undefined: that would say the message named no plugin. Null says
+      // the tool list could not be had, and Brain fails closed on it.
+      pluginTools = null;
       logger.warn({ err, sessionId, pluginId }, "pending.plugin_resource_resolve_failed");
     }
   }
@@ -1301,6 +1329,7 @@ if (pending) {
     skills: pendingSkills,
     tool_ids: toolIds.length ? toolIds : undefined,
     plugin_id: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
+    ...(pluginTools !== undefined ? { plugin_tools: pluginTools } : {}),
     workspace_id: workspaceId,
     sandbox_image: finalSandboxImage,
     resources: finalResources,

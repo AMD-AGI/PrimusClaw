@@ -9,10 +9,13 @@ import type {
   ChatCompletionTool,
 } from "openai/resources/chat/completions";
 import type { Message, ToolSchema } from "@claw/protocol";
+import { coerceToolInput } from "@claw/utils";
 import { LLM_CACHE_STYLE, LLM_CACHE_TTL, OPENAI_CACHE_MARKERS, STREAM_FIRST_BYTE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS } from "../config.js";
 
+import { metrics } from "../infra/metrics.js";
 import { looksLikeCacheRejection } from "./cache-rejection.js";
 import { requiredArgToolNames } from "./tool-schema.js";
+import { parseToolArguments, sanitizeToolUseInputs } from "./tool-input.js";
 import { PROMPT_CACHE_OPTIONS, renderOpenAiCacheMarkers } from "./openai-cache.js";
 import type {
   LlmContentBlock,
@@ -65,7 +68,9 @@ export function toOpenAiMessages(messages: Message[]): ChatCompletionMessagePara
         .map((b) => ({
           id: String(b.id),
           type: "function" as const,
-          function: { name: String(b.name), arguments: JSON.stringify(b.input ?? {}) },
+          // Always a JSON object: the backend rejects the whole request for
+          // any other shape, and a replayed history is sent again every turn.
+          function: { name: String(b.name), arguments: JSON.stringify(coerceToolInput(b.input)) },
         }));
       out.push({
         role: "assistant",
@@ -156,7 +161,12 @@ async function streamingTurn(
   // Only when the deployment has said what this endpoint is. Left at its
   // "native" default nothing is sent, because guessing wrong toward markers
   // puts an unrecognised key in every request to a real OpenAI endpoint.
-  const wire = toOpenAiMessages(messages);
+  const sanitized = sanitizeToolUseInputs(messages);
+  if (sanitized.repaired > 0) {
+    metrics.onToolInputRepaired("wire", sanitized.repaired);
+    logger.warn({ repaired: sanitized.repaired }, "llm.tool_input.repaired_on_wire");
+  }
+  const wire = toOpenAiMessages(sanitized.messages);
   const useMarkers = OPENAI_CACHE_MARKERS && !cacheState.markersDisabled && !markersRefusedByModel.has(model);
   const rendered = useMarkers
     ? renderOpenAiCacheMarkers(wire as unknown as Array<Record<string, unknown>>,
@@ -376,12 +386,10 @@ async function streamingTurn(
   if (thinkingBlock) content.push(thinkingBlock);
   if (textBlock) content.push(textBlock);
   const toolUseBlocks: LlmToolUseBlock[] = [...toolCallBuf.values()].map((tc) => {
-    let input: Record<string, unknown>;
-    try {
-      input = tc.argsBuf.length ? JSON.parse(tc.argsBuf) : {};
-    } catch {
-      input = { _raw: tc.argsBuf };
-    }
+    // Not a bare JSON.parse: valid JSON that is not an object (`[]`, `null`) used
+    // to be stored as-is and replayed, which the backend refuses for every
+    // later turn of the session.
+    const { input } = parseToolArguments(tc.argsBuf);
     return { type: "tool_use", id: tc.id, name: tc.name, input };
   });
   content.push(...toolUseBlocks);
@@ -509,7 +517,7 @@ export function buildOpenAiSession(
   return {
     streamTurn: (messages, tools, signal) =>
       streamingTurn(client, model, messages, tools, signal, capture, cacheState),
-      async complete(systemPrompt, userText, maxTokens) {
+      async complete(systemPrompt, userText, maxTokens, signal, options) {
         const resp = await client.chat.completions.create({
           model,
           max_tokens: maxTokens,
@@ -517,7 +525,8 @@ export function buildOpenAiSession(
             { role: "system", content: systemPrompt },
             { role: "user", content: userText },
           ],
-        });
+          ...(options?.effort ? { reasoning_effort: options.effort } : {}),
+        }, signal ? { signal } : undefined);
         const text = resp.choices[0]?.message?.content?.trim();
         if (!text) throw new Error("completion returned empty text");
         return text;

@@ -56,6 +56,12 @@ const platformDefaultTotal = new Counter({
   labelNames: ["kind", "outcome", "reason"] as const,
   registers: [registry],
 });
+const skillStageTotal = new Counter({
+  name: "claw_skill_stage_total",
+  help: "Skills staged on Brain for a turn, by source and where the files came from (cache hit, a download shared with a concurrent turn, or a fresh download).",
+  labelNames: ["source", "outcome"] as const,
+  registers: [registry],
+});
 const platformDefaultChatsTotal = new Counter({
   name: "claw_platform_default_chats_total",
   help: "Chats that were offered at least one platform-default skill.",
@@ -396,6 +402,24 @@ const llmCacheDisabledTotal = new Counter({
   help: "Sessions that stopped sending cache markers after the gateway rejected them.",
   registers: [registry],
 });
+// Replayed tool calls whose input was not a JSON object. The model endpoint
+// refuses the whole request for one, so a non-zero rate means some writer is
+// still storing or streaming a bad input, and `stage` says which side caught it.
+const llmToolInputRepairedTotal = new Counter({
+  name: "claw_brain_llm_tool_input_repaired_total",
+  help: "Replayed tool-call inputs that were not a JSON object and were rewritten before reaching the model, by stage (wire: request build; retry: after the endpoint refused).",
+  labelNames: ["stage"] as const,
+  registers: [registry],
+});
+// The endpoint refused a replayed tool call's arguments anyway. `retried`
+// means the history held something to repair and the turn was sent again;
+// `nothing_to_repair` means the refusal came from something this pass cannot fix.
+const llmToolArgsRejectedTotal = new Counter({
+  name: "claw_brain_llm_tool_args_rejected_total",
+  help: "Model-endpoint 400s about tool-call arguments not being a JSON object, by what the sanitizing retry did.",
+  labelNames: ["outcome"] as const,
+  registers: [registry],
+});
 // Turns whose prompt size nobody could measure.
 //
 // Compaction is the only context-size guard here and it needs a number to
@@ -638,6 +662,16 @@ const sessionCleanupIncompleteTotal = new Counter({
   registers: [registry],
 });
 
+// The approval summary's own model (HITL_SUMMARY_MODEL) was refused by the gateway for the run's key.
+// The card goes out without a summary; this is how an operator learns that some users' keys cannot call
+// the model that was configured. Steady state is 0.
+const approvalSummaryModelRefusedTotal = new Counter({
+  name: "claw_brain_approval_summary_model_refused_total",
+  help: "Runs whose approval-summary model the gateway refused for the run's key, by HTTP status.",
+  labelNames: ["status"] as const,
+  registers: [registry],
+});
+
 // ─── Keepalive idle reclaim: destroys and the holds that refused them ─
 // A destroy from the jobs probe used to need one reading; now it needs several
 // agreeing ones and a quiet window after any failure. The pair says how often
@@ -663,6 +697,10 @@ export const metrics = {
   /** One platform-default item resolved, skipped or failed. */
   onPlatformDefault(kind: "skill" | "mcp" | "config", outcome: "ok" | "failed" | "skipped", reason: string): void {
     platformDefaultTotal.inc({ kind, outcome, reason });
+  },
+  /** One skill staged for a turn: `outcome` says whether its files were downloaded. */
+  onSkillStage(source: "plugin" | "tool", outcome: "hit" | "joined" | "downloaded"): void {
+    skillStageTotal.inc({ source, outcome });
   },
   /** A chat whose prompt carries a progressive platform-skill list. */
   onPlatformDefaultChat(listChars: number): void {
@@ -786,6 +824,14 @@ export const metrics = {
   onLlmCacheDisabled(): void {
     llmCacheDisabledTotal.inc();
   },
+  /** Replayed tool-call inputs rewritten into objects before reaching the model. */
+  onToolInputRepaired(stage: "wire" | "retry", count: number): void {
+    if (count > 0) llmToolInputRepairedTotal.inc({ stage }, count);
+  },
+  /** The endpoint refused a tool call's arguments; what the sanitizing retry did. */
+  onToolArgsRejected(outcome: "retried" | "nothing_to_repair"): void {
+    llmToolArgsRejectedTotal.inc({ outcome });
+  },
   /** Whether compaction still fires. Moving its trigger without this is a
    *  behaviour change nobody can see. */
   onCompaction(result: "compacted" | "noop" | "failed"): void {
@@ -837,6 +883,10 @@ export const metrics = {
    */
   onSessionCleanupIncomplete(reason: SessionCleanupIncompleteReason): void {
     sessionCleanupIncompleteTotal.inc({ reason });
+  },
+
+  onApprovalSummaryModelRefused(status: number): void {
+    approvalSummaryModelRefusedTotal.inc({ status: String(status) });
   },
 
   // ─── Plan Y v2 checkpoint helpers ────────────────────────────────

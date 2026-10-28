@@ -721,8 +721,12 @@ export class HandsClient {
    * replaced, which is the only property a generation is asked for. A weaker
    * reading of it -- two creations coinciding -- would cost a `lost` answer its
    * distinction, never a second execution.
+   *
+   * Public because a run builds a new client around a sandbox that already served
+   * earlier runs: what Brain remembers about a sandbox across runs is keyed by this
+   * and not by the client object (see `unneutralised` in workspace/sync-delta.ts).
    */
-  private get generation(): string {
+  get generation(): string {
     return this.url;
   }
 

@@ -69,10 +69,11 @@ import {
   destroyHands, parkForIdleReclaim, readSessionPlatformKey, releaseLocalHandsState,
   startMultiNodeSweeper, startSandboxSweeper,
 } from "./sandbox/reaper.js";
-import { activeAbort, gracefulStopRemainingMs, resolveAbortTargets, SIGTERM_ABORT_REASON } from "./tasks/abort-registry.js";
+import { activeAbort, SIGTERM_ABORT_REASON } from "./tasks/abort-registry.js";
+import { abortRunsOfDeletedSession, interruptRunsAt } from "./tasks/interrupt.js";
 import { markSessionDeleted } from "./infra/deleted-sessions.js";
 import {
-  releaseTaskLock, bindTaskLockKv, lockContentionNakMs, lockExpiresBetweenRenewals,
+  bindTaskLockKv, lockContentionNakMs, lockExpiresBetweenRenewals,
 } from "./tasks/lock.js";
 import { bindTaskRunnerDeps } from "./tasks/runner.js";
 import { handleTask, bindTaskDispatchKv, inflightTasks, handleClaimedRequest } from "./tasks/dispatch.js";
@@ -640,42 +641,14 @@ function installInterruptSubscriber(): void {
   (async () => {
     for await (const msg of intSub) {
       const parts = msg.subject.split(".");
-      const address = parts[parts.length - 1];
-      for (const lockKey of resolveAbortTargets(address)) {
-        const ctrl = activeAbort.get(lockKey);
-        if (!ctrl) continue;
-        ctrl.abort();
-        logger.info({ address, lockKey }, "task.interrupted");
-        // The SDK may not propagate abort through an in-flight tool RPC.
-        const forceRelease = (): void => {
-          if (activeAbort.get(lockKey) !== ctrl) return;
-          // A run winding down on purpose (an app run's SIGTERM grace) is given the
-          // time it asked for, and no more: when that is up it is released like any other.
-          const left = gracefulStopRemainingMs(ctrl);
-          if (left > 0) { setTimeout(forceRelease, left).unref(); return; }
-          logger.error({ address, lockKey }, "task.interrupt_force_release");
-          activeAbort.delete(lockKey);
-          releaseTaskLock(lockKey).catch(() => {});
-        };
-        setTimeout(forceRelease, 30_000).unref();
-      }
+      interruptRunsAt(parts[parts.length - 1]);
     }
   })();
 }
 
 async function cleanupSession(sid: string, payload: Uint8Array): Promise<void> {
   markSessionDeleted(sid);
-  const lockKeys = resolveAbortTargets(sid);
-  for (const lockKey of lockKeys) {
-    const ctrl = activeAbort.get(lockKey);
-    if (!ctrl) continue;
-    ctrl.abort();
-    activeAbort.delete(lockKey);
-    logger.info({ sessionId: sid, lockKey }, "session.cleanup_aborted_task");
-  }
-  for (const lockKey of lockKeys.length ? lockKeys : [sid]) {
-    await releaseTaskLock(lockKey);
-  }
+  await abortRunsOfDeletedSession(sid);
 
   const platformKey = decodeCleanupPayload(payload.length ? sc.decode(payload) : "").platformKey
     || (await readSessionPlatformKey(sid));

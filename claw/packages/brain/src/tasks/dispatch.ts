@@ -28,7 +28,7 @@ import { resolveSandboxImageFromRequest } from "../sandbox/ensure-hands.js";
 import {
   requestedNodeCount, resolveTopology,
 } from "../sandbox/multi-node/prompt-flags.js";
-import { activeAbort, forgetRunAddresses, registerRunAddresses } from "./abort-registry.js";
+import { activeAbort, forgetRunAddresses, registerRunAddressesFor } from "./abort-registry.js";
 import { markSessionDeleted } from "../infra/deleted-sessions.js";
 import {
   pickLockKey, acquireTaskLock, gateBindingError, lockContentionNakMs, readTaskLock,
@@ -610,7 +610,7 @@ async function handleResolvedRequest(
   // The names this run can be interrupted by, taken from the same request the
   // gate key was computed from. Nobody publishes to a gate key: the stop
   // button, cancelTask and the sweeper all address a session or a DAG root.
-  registerRunAddresses(lockKey, [request.session_id, request.dag_root_task_id]);
+  registerRunAddressesFor(lockKey, request);
   // Track promise for graceful drain.
   const taskPromise = runHandleTask(
     msg, request, sessionId, lockKey, messageId, userId, abortCtrl,

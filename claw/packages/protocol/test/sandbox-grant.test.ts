@@ -9,7 +9,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createVerify, generateKeyPairSync } from "node:crypto";
 import {
-  GRANT_AUDIENCE, GRANT_ISSUER, GRANT_KID, GrantHttpError, GrantKeysMissingError, GrantSigner,
+  GRANT_AUDIENCE, GRANT_ISSUER, GRANT_KID, GRANT_KINDS, GrantHttpError, GrantKeysMissingError, GrantSigner,
   SandboxGrantClient, buildSandboxGrant, loadGrantSigner, type SandboxGrantMaterial,
 } from "../src/sandbox-grant.js";
 
@@ -56,7 +56,7 @@ test("the attestation is ES256 and matches the issue body", () => {
   assert.equal(payload.jti, material().grantId);
   assert.equal(payload.sub, "user-1");
   assert.deepEqual(payload.workspaces, ["ws-a", "ws-b"]);
-  assert.deepEqual(payload.kinds, ["Sandbox"]);
+  assert.deepEqual(payload.kinds, [...GRANT_KINDS]);
   assert.equal(payload.maxGpusPerSandbox, 8);
   assert.equal(payload.exp, NOW.getTime() / 1000 + 3600);
   const verify = createVerify("SHA256");
@@ -65,8 +65,10 @@ test("the attestation is ES256 and matches the issue body", () => {
   assert.equal(verify.verify({ key: publicKey, dsaEncoding: "ieee-p1363" }, Buffer.from(s!, "base64url")), true);
   assert.equal((built.body.expiresAt as string), new Date(NOW.getTime() + 3600 * 1000).toISOString());
   const roles = built.body.roles as Record<string, { maxSandboxes: number; maxGpus: number }>;
-  assert.equal(roles.measurement.maxSandboxes, 4);
+  assert.equal(roles.measurement.maxSandboxes, 3);
   assert.equal(roles.measurement.maxGpus, 8);
+  assert.equal(roles.subrun.maxSandboxes, 1);
+  assert.equal(roles.subrun.maxGpus, 0);
   assert.equal(roles.dev, undefined);
   const tpl = (built.body.templates as Array<{ spec: { data_plane: { mode: string } } }>)[0]!;
   assert.equal(tpl.spec.data_plane.mode, "sealed");
@@ -147,7 +149,45 @@ test("GET 404 is missing and a revoked copy stays revoked", async () => {
   assert.equal(await c.inspect("revoked"), "revoked");
 });
 
-test("reissue of a 200 without keys does not revoke the id", async () => {
+test("a single declared role keeps the whole budget", () => {
+  const built = buildSandboxGrant({ ...material(), roles: { measurement: ["runner"] } }, NOW);
+  const roles = built.body.roles as Record<string, { maxSandboxes: number; maxGpus: number }>;
+  assert.equal(roles.measurement.maxSandboxes, 4);
+  assert.equal(roles.measurement.maxGpus, 8);
+  assert.equal(roles.subrun, undefined);
+});
+
+test("dev does not receive the measurement GPU cap", () => {
+  const built = buildSandboxGrant({
+    ...material(),
+    roles: { measurement: ["runner"], subrun: ["runner"], dev: ["runner"] },
+  }, NOW);
+  const roles = built.body.roles as Record<string, { maxSandboxes: number; maxGpus: number }>;
+  assert.equal(roles.measurement.maxGpus, 8);
+  assert.equal(roles.subrun.maxGpus, 0);
+  assert.equal(roles.dev.maxGpus, 0);
+  assert.equal(roles.measurement.maxSandboxes + roles.subrun.maxSandboxes + roles.dev.maxSandboxes, 4);
+});
+
+test("reissue of a 200 without keys revokes and posts once more", async () => {
+  const methods: string[] = [];
+  let posts = 0;
+  const c = client(async (req) => {
+    methods.push(req.method);
+    if (req.method === "POST") {
+      posts += 1;
+      if (posts === 1) return { status: 200, json: { grantId: material().grantId } };
+      return { status: 201, json: { keys: { measurement: "e2b_a", subrun: "e2b_b" } } };
+    }
+    assert.equal(req.method, "DELETE");
+    return { status: 200 };
+  });
+  const issued = await c.issue(material(), undefined, "reissue");
+  assert.equal(issued.keys.measurement, "e2b_a");
+  assert.deepEqual(methods, ["POST", "DELETE", "POST"]);
+});
+
+test("a second reissue without keys does not revoke again", async () => {
   const methods: string[] = [];
   const c = client(async (req) => {
     methods.push(req.method);
@@ -155,7 +195,7 @@ test("reissue of a 200 without keys does not revoke the id", async () => {
     return { status: 200 };
   });
   await assert.rejects(() => c.issue(material(), undefined, "reissue"), (err: unknown) => err instanceof GrantKeysMissingError);
-  assert.deepEqual(methods, ["POST"]);
+  assert.deepEqual(methods, ["POST", "DELETE", "POST"]);
 });
 
 test("a client is not opened without an explicit grant url", async () => {

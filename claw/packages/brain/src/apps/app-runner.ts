@@ -99,6 +99,8 @@ export interface AppGrantRun {
   expiresAt?: string | null;
   /** The sandbox spec admission stored, including the resolved image. */
   sandboxSpec?: SandboxSpecCreate | null;
+  /** The lease epoch this worker holds, quoted when the API signs. */
+  claimCount?: number;
 }
 
 /** What a grant adds to the application's environment. */
@@ -196,6 +198,8 @@ export interface AppRunnerDeps {
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   tickMs?: number;
   statusTimeoutMs?: number;
+  /** Epoch quoted to the API when it signs an extend or a reissue. */
+  claimCount?: number;
 }
 
 export interface AppRunOutcome {
@@ -297,6 +301,7 @@ export class AppRunner {
   private readonly now: () => number;
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly tickMs: number;
+  private readonly claimCount: number;
   /** Fake-clock time before which a grant that was already seen is not looked up again. */
   private grantInspectAfter = 0;
 
@@ -311,6 +316,7 @@ export class AppRunner {
     this.now = deps.now ?? Date.now;
     this.sleep = deps.sleep ?? defaultSleep;
     this.tickMs = deps.tickMs ?? RECONCILE_INTERVAL_MS;
+    this.claimCount = deps.claimCount ?? 0;
   }
 
   // ---- driving ------------------------------------------------------------
@@ -587,6 +593,7 @@ export class AppRunner {
     if (rec.grant_limits) run.limits = rec.grant_limits;
     if (rec.grant_expires_at) run.expiresAt = rec.grant_expires_at;
     if (rec.sandbox_spec) run.sandboxSpec = rec.sandbox_spec;
+    if (this.claimCount > 0) run.claimCount = this.claimCount;
     return run;
   }
 

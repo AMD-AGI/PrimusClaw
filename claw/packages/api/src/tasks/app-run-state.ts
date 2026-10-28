@@ -179,6 +179,21 @@ export interface AppRunFence {
   claimCount: number;
 }
 
+/** Whether this caller holds the run now. A finished run is not signed again. */
+export async function appRunHeldBy(taskId: string, fence: AppRunFence): Promise<"ok" | "not_found" | "not_holder" | "ended"> {
+  const why = await db.query(
+    `SELECT r.state, t.lease_owner, t.claim_count, (t.lease_expires_at > NOW()) AS lease_live
+       FROM claw_app_runs r JOIN claw_tasks t ON t.task_id = r.task_id
+      WHERE r.task_id = $1`,
+    [taskId],
+  );
+  const row = why.rows[0] as { state: AppRunState; lease_owner: string | null; claim_count: number; lease_live: boolean | null } | undefined;
+  if (!row) return "not_found";
+  if (row.lease_owner !== fence.brainId || row.lease_live !== true || Number(row.claim_count) !== fence.claimCount) return "not_holder";
+  if (row.state === "ended" || row.state === "finishing") return "ended";
+  return "ok";
+}
+
 /** The `last_exit` fields that carry free text, the only ones a secret can ride in. */
 const LAST_EXIT_TEXT_FIELDS = ["stop_reason", "error"] as const;
 
