@@ -31,8 +31,19 @@ interface DiscoveryDocument {
   jwksUri?: string;
 }
 
+/**
+ * `s` without its trailing slashes. A scan from the end, not `/\/+$/`: that
+ * pattern retries from every slash of a long run and is quadratic on a value an
+ * operator or a document supplies.
+ */
+function trimTrailingSlashes(s: string): string {
+  let end = s.length;
+  while (end > 0 && s.charCodeAt(end - 1) === 0x2f) end--;
+  return s.slice(0, end);
+}
+
 export function defaultDiscoveryUrl(issuer: string): string {
-  return `${issuer.replace(/\/+$/, "")}/.well-known/openid-configuration`;
+  return `${trimTrailingSlashes(issuer)}/.well-known/openid-configuration`;
 }
 
 /** An endpoint the document advertises, or a refusal to use a document that advertises nonsense. */

@@ -9,6 +9,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { IdentityClient, IdentityUnavailableError } from "../src/index.js";
+import { defaultDiscoveryUrl } from "../src/identity/discovery.js";
 import { FakeIdentity, activeAnswer, harness, settingsFor, testKey, type Harness } from "./identity-fake.js";
 
 async function withHarness(over: Parameters<typeof harness>[0], run: (h: Harness) => Promise<void>): Promise<void> {
@@ -51,6 +52,26 @@ test("an issuer with a trailing slash still finds the document", async () => {
   } finally {
     await fake.close();
   }
+});
+
+test("the default discovery address drops every trailing slash and nothing else", () => {
+  const well = "/.well-known/openid-configuration";
+  assert.equal(defaultDiscoveryUrl("https://idp.example.com"), `https://idp.example.com${well}`);
+  assert.equal(defaultDiscoveryUrl("https://idp.example.com/"), `https://idp.example.com${well}`);
+  assert.equal(defaultDiscoveryUrl("https://idp.example.com/realms/a///"), `https://idp.example.com/realms/a${well}`);
+  assert.equal(defaultDiscoveryUrl("https://idp.example.com//realms//a"), `https://idp.example.com//realms//a${well}`);
+  assert.equal(defaultDiscoveryUrl(""), well);
+  assert.equal(defaultDiscoveryUrl("///"), well);
+});
+
+test("a long run of slashes in the issuer is trimmed in linear time", () => {
+  // `issuer.replace(/\/+$/, "")` takes ~0.8 s on this input (quadratic); a scan from the end takes microseconds.
+  const issuer = `https://idp.example.com${"/".repeat(30_000)}x`;
+  const started = process.hrtime.bigint();
+  assert.equal(defaultDiscoveryUrl(issuer), `${issuer}/.well-known/openid-configuration`);
+  assert.equal(defaultDiscoveryUrl(`${"/".repeat(30_000)}`), "/.well-known/openid-configuration");
+  const ms = Number(process.hrtime.bigint() - started) / 1e6;
+  assert.ok(ms < 250, `took ${ms.toFixed(0)} ms`);
 });
 
 test("a document whose issuer is not the configured one is not used", async () => {
