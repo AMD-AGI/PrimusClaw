@@ -258,6 +258,43 @@ func (c *SafeWorkloadCreator) Present(ctx context.Context, name string) (bool, e
 	}
 }
 
+// Observe reports whether a sandbox Workload is running, still pending, finished, or gone.
+func (c *SafeWorkloadCreator) Observe(ctx context.Context, sandboxID string) (e2b.CreateResult, string, error) {
+	if c == nil || c.dynamic == nil || !strings.HasPrefix(sandboxID, e2bSandboxPrefix) {
+		return e2b.CreateResult{}, e2b.WorkloadMissing, nil
+	}
+	obj, err := c.dynamic.Resource(workloadGVR).Get(ctx, sandboxID, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return e2b.CreateResult{}, e2b.WorkloadMissing, nil
+	}
+	if err != nil {
+		return e2b.CreateResult{}, "", err
+	}
+	if obj.GetDeletionTimestamp() != nil {
+		return e2b.CreateResult{}, e2b.WorkloadFinished, nil
+	}
+	phase, _, _ := unstructured.NestedString(obj.Object, "status", "phase")
+	switch phase {
+	case "Failed", "Succeeded", "Stopped":
+		return e2b.CreateResult{}, e2b.WorkloadFinished, nil
+	case "Running":
+		workspace, _, _ := unstructured.NestedString(obj.Object, "spec", "workspace")
+		ip, node, ok := c.address(ctx, obj, workspace, sandboxID)
+		if !ok {
+			return e2b.CreateResult{}, e2b.WorkloadPending, nil
+		}
+		return e2b.CreateResult{
+			SandboxName: sandboxID,
+			Namespace:   workspace,
+			PodIP:       ip,
+			PodPort:     envdPort,
+			NodeName:    node,
+		}, e2b.WorkloadRunning, nil
+	default:
+		return e2b.CreateResult{}, e2b.WorkloadPending, nil
+	}
+}
+
 // Session rebuilds the session record of an E2B Workload named by the sandbox id.
 // A missing Workload, a finished phase, or a Workload not created for E2B is store.ErrNotFound.
 func (c *SafeWorkloadCreator) Session(ctx context.Context, name string) (*store.SandboxInfo, error) {
@@ -314,9 +351,12 @@ func signingSecretName(sandboxID string) string {
 	return sandboxID
 }
 
-// signingKeyFile is the mounted private key. The path is not the key material.
-func signingKeyFile(sandboxID string) string {
-	return signingSecretMountRoot + "/" + signingSecretName(sandboxID) + "/" + signingSecretKey
+// signingKeyFile is the private key after the init container copies it onto a writable emptyDir.
+// The Secret mount itself stays on the init container.
+const signingKeyFilePath = "/run/signing-key/" + signingSecretKey
+
+func signingKeyFile(string) string {
+	return signingKeyFilePath
 }
 
 // createSigningSecret writes the private key where SaFE mirrors workspace secrets.

@@ -30,11 +30,13 @@ import (
 )
 
 type fakeRunner struct {
-	fail    error
-	created []CreateRequest
-	deleted []string
-	started chan struct{}
-	hold    chan struct{}
+	fail     error
+	created  []CreateRequest
+	deleted  []string
+	started  chan struct{}
+	hold     chan struct{}
+	observed string
+	node     string
 }
 
 func (f *fakeRunner) Create(ctx context.Context, req CreateRequest) (CreateResult, error) {
@@ -54,6 +56,17 @@ func (f *fakeRunner) Create(ctx context.Context, req CreateRequest) (CreateResul
 		return CreateResult{}, f.fail
 	}
 	return CreateResult{SandboxName: "pod-" + req.SandboxID, Namespace: req.Namespace, PodIP: "10.0.0.8", PodPort: 8080, NodeName: "node-a"}, nil
+}
+
+func (f *fakeRunner) Observe(_ context.Context, sandboxID string) (CreateResult, string, error) {
+	if f.observed == "" || f.observed == WorkloadPending {
+		return CreateResult{}, WorkloadPending, nil
+	}
+	node := f.node
+	if node == "" {
+		node = "node-a"
+	}
+	return CreateResult{SandboxName: "pod-" + sandboxID, Namespace: "ns", PodIP: "10.0.0.8", PodPort: 8080, NodeName: node}, f.observed, nil
 }
 
 func (f *fakeRunner) Delete(_ context.Context, sandboxID string) error {
@@ -236,6 +249,43 @@ func TestCallerCancelKeepsThePendingSandbox(t *testing.T) {
 	}
 	if len(runner.deleted) != 0 || len(runner.created) != 1 {
 		t.Fatalf("created=%d deleted=%v", len(runner.created), runner.deleted)
+	}
+}
+
+func TestReplayAdoptsARunningWorkload(t *testing.T) {
+	svc, runner, keys := testPlane(t, 600, []int32{1}, 1)
+	runner.started = make(chan struct{})
+	runner.hold = make(chan struct{})
+	body := CreateBody{TemplateID: "runner", Timeout: 60, Metadata: map[string]string{
+		idempotencyMetadataKey: "once",
+		avoidNodesMetadata:     "elsewhere,node-a",
+	}}
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := svc.Create(context.Background(), keys["measurement"], body)
+		done <- err
+	}()
+	select {
+	case <-runner.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("create did not start")
+	}
+	runner.observed = WorkloadRunning
+	runner.node = "node-a"
+	got, status, err := svc.Create(context.Background(), keys["measurement"], body)
+	if err != nil || status != http.StatusCreated {
+		t.Fatalf("status=%d err=%v", status, err)
+	}
+	detail, err := svc.Get(context.Background(), keys["measurement"], got.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Metadata[sameNodeMetadata] != "true" || detail.Metadata[nodeNameMetadata] != "node-a" {
+		t.Fatalf("metadata=%v", detail.Metadata)
+	}
+	close(runner.hold)
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 

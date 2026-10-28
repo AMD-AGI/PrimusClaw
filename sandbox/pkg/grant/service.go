@@ -59,8 +59,21 @@ type Service struct {
 	membership MembershipChecker
 	reclaimer  Reclaimer
 	exists     SandboxExists
+	promoter   PendingPromoter
 	record     Recorder
 	now        func() time.Time
+}
+
+// PendingPromoter finishes a pending sandbox whose Workload the create goroutine no longer owns.
+type PendingPromoter interface {
+	PromotePending(ctx context.Context, grantID string, ref runtimev1alpha1.GrantSandboxRef) error
+}
+
+// SetPromoter adopts pending sandboxes that are already running after a control-plane restart.
+func (s *Service) SetPromoter(p PendingPromoter) {
+	if s != nil {
+		s.promoter = p
+	}
 }
 
 // Options configures a Service.
@@ -400,6 +413,9 @@ func (s *Service) ReapOnce(ctx context.Context) {
 			s.audit(ctx, audit.EventGrantExpired, g.Name, g.Spec.Issuer.SessionID, g.Spec.Issuer.AppRunID, g.Spec.Owner.UserID, g.Spec.Owner.UserName, "")
 			g.Status.State = runtimev1alpha1.GrantStateExpired
 		}
+		if g.Status.State == runtimev1alpha1.GrantStateActive {
+			s.promotePending(ctx, g)
+		}
 		if s.exists != nil && g.Status.State == runtimev1alpha1.GrantStateActive {
 			s.dropMissing(ctx, g)
 		}
@@ -458,6 +474,21 @@ func (s *Service) Run(ctx context.Context, every time.Duration) {
 			return
 		case <-ticker.C:
 			s.ReapOnce(ctx)
+		}
+	}
+}
+
+// promotePending asks the control plane to adopt a pending sandbox that is already running.
+func (s *Service) promotePending(ctx context.Context, g *runtimev1alpha1.SandboxGrant) {
+	if s == nil || s.promoter == nil {
+		return
+	}
+	for _, ref := range g.Status.Sandboxes {
+		if ref.State != runtimev1alpha1.SandboxPending {
+			continue
+		}
+		if err := s.promoter.PromotePending(ctx, g.Name, ref); err != nil {
+			log.Warn("pending sandbox adopt failed", "grant", g.Name, "sandbox", ref.ID, "error", err)
 		}
 	}
 }

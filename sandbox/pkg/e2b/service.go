@@ -285,9 +285,56 @@ func (s *Service) replay(ctx context.Context, grantID string, ref runtimev1alpha
 	return createdResponse(ref, token), http.StatusCreated, nil
 }
 
+// PromotePending adopts a pending sandbox whose Workload is already running or finished.
+func (s *Service) PromotePending(ctx context.Context, grantID string, ref runtimev1alpha1.GrantSandboxRef) error {
+	_, _, err := s.adoptPending(ctx, grantID, ref)
+	return err
+}
+
+// adoptPending marks a pending sandbox running, or ended when its Workload has finished.
+// The second result is true when the grant record was updated.
+func (s *Service) adoptPending(ctx context.Context, grantID string, ref runtimev1alpha1.GrantSandboxRef) (runtimev1alpha1.GrantSandboxRef, bool, error) {
+	observer, ok := s.runner.(WorkloadObserver)
+	if !ok || ref.State != runtimev1alpha1.SandboxPending {
+		return ref, false, nil
+	}
+	result, phase, err := observer.Observe(ctx, ref.ID)
+	if err != nil || phase == WorkloadPending || phase == WorkloadMissing || phase == "" {
+		return ref, false, err
+	}
+	if phase == WorkloadFinished {
+		if err := s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, ref.ID, "create_failed"); err != nil {
+			return ref, false, err
+		}
+		ref.State = runtimev1alpha1.SandboxEnded
+		return ref, true, nil
+	}
+	if phase != WorkloadRunning {
+		return ref, false, nil
+	}
+	up := grant.RunningUpdate{SandboxName: result.SandboxName, Namespace: result.Namespace, NodeName: result.NodeName}
+	if result.NodeName != "" {
+		up.Metadata = map[string]string{nodeNameMetadata: result.NodeName}
+		if landedOnAvoidedNode(result.NodeName, ref.Metadata[avoidNodesMetadata]) {
+			up.Metadata[sameNodeMetadata] = "true"
+		}
+	}
+	if err := s.grants.MarkRunning(context.WithoutCancel(ctx), grantID, ref.ID, up); err != nil {
+		return ref, false, err
+	}
+	ref.State = runtimev1alpha1.SandboxRunning
+	ref.SandboxName = result.SandboxName
+	ref.NodeName = result.NodeName
+	return ref, true, nil
+}
+
 // waitReplay blocks while the sandbox is still queued.
+// A Workload that is already running is adopted, so a restarted control plane does not wait out the pending timeout.
 func (s *Service) waitReplay(ctx context.Context, grantID string, ref runtimev1alpha1.GrantSandboxRef) (runtimev1alpha1.GrantSandboxRef, error) {
 	for ref.State == runtimev1alpha1.SandboxPending {
+		if next, done, err := s.adoptPending(ctx, grantID, ref); err != nil || done {
+			return next, err
+		}
 		current, err := s.grants.Sandbox(ctx, grantID, ref.Role, ref.ID)
 		if err != nil {
 			return ref, err

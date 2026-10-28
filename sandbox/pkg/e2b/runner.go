@@ -54,6 +54,19 @@ type Runner interface {
 	Delete(ctx context.Context, sandboxID string) error
 }
 
+// Workload phases returned by WorkloadObserver.
+const (
+	WorkloadRunning  = "running"
+	WorkloadPending  = "pending"
+	WorkloadFinished = "finished"
+	WorkloadMissing  = "missing"
+)
+
+// WorkloadObserver reads a sandbox Workload left behind by a restarted control plane.
+type WorkloadObserver interface {
+	Observe(ctx context.Context, sandboxID string) (CreateResult, string, error)
+}
+
 // TimeoutRunner updates the stored lifetime of a sandbox.
 type TimeoutRunner interface {
 	SetTimeout(ctx context.Context, sandboxID string, timeout time.Duration) error

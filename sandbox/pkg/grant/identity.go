@@ -78,7 +78,20 @@ func listedWorkspaces(obj *unstructured.Unstructured) ([]string, error) {
 	return nil, nil
 }
 
+// systemAdminRole matches SaFE's system-admin role. That role is not limited to listed workspaces.
+const systemAdminRole = "system-admin"
+
+// isSystemAdmin reports whether spec.roles contains the system-admin role.
+func isSystemAdmin(obj *unstructured.Unstructured) bool {
+	roles, _, err := unstructured.NestedStringSlice(obj.Object, "spec", "roles")
+	if err != nil {
+		return false
+	}
+	return contains(roles, systemAdminRole)
+}
+
 // Check rejects a missing user and any workspace not listed on the User.
+// A system admin is accepted for every workspace.
 func (m *UserCRMembership) Check(ctx context.Context, userID string, workspaces []string) error {
 	if m == nil || m.client == nil {
 		return opErr(http.StatusServiceUnavailable, "membership_unavailable", "User client is not configured")
@@ -86,6 +99,9 @@ func (m *UserCRMembership) Check(ctx context.Context, userID string, workspaces 
 	obj, err := m.client.Resource(userGVR).Get(ctx, userID, metav1.GetOptions{})
 	if err != nil {
 		return opErr(http.StatusForbidden, "user_not_in_workspace", "user was not found")
+	}
+	if isSystemAdmin(obj) {
+		return nil
 	}
 	got, err := listedWorkspaces(obj)
 	if err != nil {
