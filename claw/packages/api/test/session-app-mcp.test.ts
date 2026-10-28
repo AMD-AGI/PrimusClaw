@@ -194,6 +194,30 @@ describe("session-level app MCP", { skip }, () => {
       assert.equal((await del()).statusCode, 200, "removing it again is not an error");
     });
 
+    test("Brain's own unregister call, built as Brain builds it, is not refused by the body parser", async () => {
+      await register();
+      // The real client, with its fetch answered by the real app: the request it
+      // builds (method, headers, no body) is what reaches Fastify.
+      const seen: Array<{ method: string; headers: Record<string, string> }> = [];
+      const viaApp: typeof fetch = async (input, init) => {
+        const u = new URL(String(input));
+        const headers = Object.fromEntries(new Headers(init?.headers).entries());
+        seen.push({ method: String(init?.method), headers });
+        const res = await app.inject({
+          method: init?.method as "DELETE", url: u.pathname + u.search, headers,
+          ...(init?.body ? { payload: String(init.body) } : {}),
+        });
+        return new Response(res.body, { status: res.statusCode, headers: { "content-type": "application/json" } });
+      };
+      process.env.INTERNAL_BACKEND_URL = "http://api.invalid";
+      const { httpAppRunStore } = await import("../../brain/src/apps/app-run-store.js");
+      const store = httpAppRunStore({ fetch: viaApp, brainId: "brain-A", claimCount: EPOCH });
+      await store.deleteMcp(taskId);
+      assert.equal(seen[0].method, "DELETE");
+      assert.equal(seen[0].headers["content-type"], undefined, "a bodyless DELETE claims no content type");
+      assert.equal((await records()).length, 0, "the record is gone");
+    });
+
     test("the run moving to ended removes it, whoever ended it", async () => {
       await register();
       const res = await app.inject({

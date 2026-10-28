@@ -139,7 +139,8 @@ export class AppRunWriteRefused extends Error {
 export interface HttpStoreOptions {
   fetch?: typeof globalThis.fetch;
   baseUrl?: () => string;
-  headers?: () => Record<string, string>;
+  /** `hasBody` is false for a GET or DELETE: such a request must not claim a JSON content type. */
+  headers?: (hasBody: boolean) => Record<string, string>;
   brainId?: string;
   /**
    * The epoch this worker holds the run at (`claw_tasks.claim_count`, the
@@ -163,7 +164,7 @@ export function httpAppRunStore(opts: HttpStoreOptions): AppRunStore {
     return `${b}/v1/internal/app-runs/${encodeURIComponent(runId)}${suffix}`;
   };
   const call = async (u: string, init: RequestInit): Promise<{ status: number; body: any }> => {
-    const resp = await doFetch(u, { ...init, headers: headers(), signal: AbortSignal.timeout(TIMEOUT_MS) });
+    const resp = await doFetch(u, { ...init, headers: headers(init.body != null), signal: AbortSignal.timeout(TIMEOUT_MS) });
     const body = await resp.json().catch(() => null);
     return { status: resp.status, body };
   };
