@@ -3,11 +3,17 @@
 
 import {
   buildIdentityClient as build, startIdentityClient as start,
-  type IdentityClient, type IdentityStartupLog,
+  type IdentityClient, type IdentityProcessMetrics, type IdentityStartupLog,
 } from "@claw/utils";
 import { metrics } from "../infra/metrics.js";
 
 export type { IdentityStartupLog };
+
+/** This process's registry, in the shape the shared start-up helper takes. */
+const processMetrics: IdentityProcessMetrics = {
+  identity: metrics.identity,
+  setIdentityClientEnabled: (enabled) => metrics.setIdentityClientEnabled(enabled),
+};
 
 let instance: IdentityClient | null = null;
 
@@ -29,11 +35,11 @@ export function buildIdentityClient(
   env: Readonly<Record<string, string | undefined>>,
   log: IdentityStartupLog,
 ): IdentityClient | null {
-  return build(env, log, metrics);
+  return build(env, log, processMetrics);
 }
 
 /** Build the process's client from its environment and keep it for {@link identityClient}. */
 export function startIdentityClient(log: IdentityStartupLog): IdentityClient | null {
-  instance = start(process.env, log, metrics);
+  instance = start(process.env, log, processMetrics);
   return instance;
 }
