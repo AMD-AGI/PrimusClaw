@@ -10,6 +10,7 @@
  * only used after the execution copy was missing: a 200 without keys then
  * revokes that id and posts once more, so the new keys can be stored.
  */
+import { grantedTemplateNamesOf, type GrantedTemplateNames } from "./app-sandbox-templates.js";
 import { createPrivateKey, sign as signRaw, type KeyObject } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { APP_SANDBOX_ROLES, type AppSandboxRole, type AppSandboxRoles } from "./app-manifest.js";
@@ -156,7 +157,7 @@ export class SandboxGrantClient {
     material: SandboxGrantMaterial,
     signal?: AbortSignal,
     mode: "create" | "reissue" = "create",
-  ): Promise<{ keys: Record<string, string>; expiresAt: Date }> {
+  ): Promise<{ keys: Record<string, string>; expiresAt: Date; templates?: GrantedTemplateNames }> {
     const signer = this.opts.signer;
     if (!signer) throw new Error("grant signing key is not configured");
     const built = buildSandboxGrant(material, this.now());
@@ -172,7 +173,8 @@ export class SandboxGrantClient {
       if (mode === "create") await this.revoke(material.grantId, signal).catch(() => undefined);
       throw new GrantKeysMissingError(material.grantId);
     }
-    return { keys, expiresAt: built.claims.expiresAt };
+    const templates = grantedTemplateNamesOf(payload);
+    return { keys, expiresAt: built.claims.expiresAt, ...(templates ? { templates } : {}) };
   }
 
   /** The execution copy. 404 is `missing`. A revoked copy is not re-signed. */

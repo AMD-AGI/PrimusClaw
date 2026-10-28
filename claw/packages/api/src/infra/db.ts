@@ -1950,6 +1950,11 @@ export async function initDb(): Promise<void> {
     // can refuse another user and a different request body.
     // (Errors are logged, not swallowed: a lock timeout here shows up later only as
     // a missing column in the schema guard, with no cause.)
+    // The template names the run's grant made available (no secret): a Brain taking the run
+    // over injects the same ones.
+    await client.query("ALTER TABLE claw_app_runs ADD COLUMN IF NOT EXISTS grant_templates JSONB").catch((err: unknown) => {
+      logger.warn({ column: "grant_templates", err: err instanceof Error ? err.message : String(err) }, "db.app_runs_alter_failed");
+    });
     for (const col of ["created_by", "request_hash"]) {
       await client.query(`ALTER TABLE claw_app_runs ADD COLUMN IF NOT EXISTS ${col} TEXT`).catch((err: unknown) => {
         logger.warn({ column: col, err: err instanceof Error ? err.message : String(err) }, "db.app_runs_alter_failed");

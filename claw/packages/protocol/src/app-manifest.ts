@@ -21,7 +21,10 @@
  *  - `sandbox_templates` and `sandbox_roles` stay in the manifest, but Claw
  *    does not register templates itself: they are handed to Agent Sandbox as
  *    the grant's `templates` and `roles` when the grant is issued. A template
- *    that sets no `image` or `workspace` inherits the run's.
+ *    that sets no `image` or `workspace` inherits the run's. The names Agent
+ *    Sandbox stored them under come back in the grant response and are injected
+ *    through `env_map.sandbox_templates` as `{ role: { cards: name } }` (see
+ *    app-sandbox-templates.ts); a manifest with no `sandbox_roles` gets none.
  *  - `limits` are defaults and maxima for the request's `resources.grant`; the
  *    platform cap (`APP_SANDBOX_CAPS`) then caps each item. The limits actually
  *    granted are injected back through `env_map.grant_limits` so the app can
@@ -86,6 +89,11 @@ export interface AppEnvMap {
   mcp_port?: string;
   mcp_token?: string;
   mcp_public_url?: string;
+  /**
+   * The template names the grant made available, as JSON: `{ role: { cards: name } }`
+   * (see app-sandbox-templates.ts). Injected only when a grant was issued; the
+   * names are the ones Agent Sandbox returned, never derived from the manifest.
+   */
   sandbox_templates?: string;
   sandbox_keys?: AppEnvMapSandboxKeys;
   result_archive?: string;

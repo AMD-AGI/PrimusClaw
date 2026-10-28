@@ -75,6 +75,8 @@ export interface AppRunRecord {
   manifest: AppManifestV1;
   grant_id: string | null;
   grant_limits: Record<string, unknown> | null;
+  /** The template names the grant made available, `{ role: { cards: name } }`; null when no grant was issued. */
+  grant_templates: Record<string, Record<string, string>> | null;
   /** ISO time the grant lapses; null when it has no expiry or none was issued. */
   grant_expires_at: string | null;
   /** ISO time the grant was revoked; set means it is never extended. */

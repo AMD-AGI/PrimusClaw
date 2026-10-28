@@ -219,3 +219,10 @@ test("a client is not opened without an explicit grant url", async () => {
 test("the signer rejects a non-EC key", () => {
   assert.throws(() => new GrantSigner(publicKey), /EC private key/);
 });
+
+test("issue returns the template names the response carries, and none when it carries none", async () => {
+  const withNames = client(() => ({ status: 200, json: { keys: { measurement: "k" }, templates: { measurement: ["r-runner-g1", "r-runner-g8"] } } }));
+  assert.deepEqual((await withNames.issue(material())).templates, { measurement: ["r-runner-g1", "r-runner-g8"] });
+  const without = client(() => ({ status: 200, json: { keys: { measurement: "k" } } }));
+  assert.equal((await without.issue(material())).templates, undefined);
+});

@@ -6,7 +6,7 @@
  * Bound at startup only when a signing key is configured.
  */
 import {
-  APP_SANDBOX_ROLES, appGrantTemplates, grantWorkspaces, openSandboxGrantClient,
+  APP_SANDBOX_ROLES, appGrantTemplates, buildSandboxTemplateEnv, grantWorkspaces, openSandboxGrantClient,
   type AppGrantLimits, type AppManifestV1, type AppSandboxRoles, type SandboxGrantClient, type SandboxGrantMaterial,
 } from "@claw/protocol";
 import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
@@ -36,7 +36,10 @@ export function apiGrantHooks(client: SandboxGrantClient): AppGrantHooks {
       // No declared role means this run creates no child sandbox, so nothing is signed or stored.
       if (!declaredSandboxRole(manifest.sandbox_roles)) return;
       const issued = await client.issue(materialOf(run, manifest, request), signal);
-      return { keys: issued.keys, limits: { ...request.resources.grant }, expiresAt: issued.expiresAt };
+      // The names the service stored the templates under, matched to the manifest; a
+      // response that does not line up fails the issue (the grant is revoked by the caller).
+      const templates = buildSandboxTemplateEnv({ sandbox_roles: manifest.sandbox_roles, sandbox_templates: request.templates }, issued.templates);
+      return { keys: issued.keys, limits: { ...request.resources.grant }, expiresAt: issued.expiresAt, templates };
     },
     async revoke(run, signal) {
       await client.revoke(run.grantId, signal);

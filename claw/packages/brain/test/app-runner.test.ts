@@ -780,12 +780,13 @@ test("fixed E2B urls and the template list are injected when supplied", () => {
   const env = buildAppEnv({
     runId: "r", sessionId: "s", createdAt: "t", stateDir: "/d", mcpToken: TOKEN,
     grantKeys: {}, grantLimits: { max_sandboxes: 2 }, nodeName: null,
+    sandboxTemplates: { measurement: { "1": "r1-runner-g1" } },
     e2bApiUrl: "http://e2b.local", e2bSandboxUrl: "http://e2b.local/sandboxes",
     manifest: { ...MANIFEST, env: undefined, env_map: { sandbox_templates: "APP_TEMPLATES", grant_limits: "APP_GRANT_LIMITS" } },
   });
   assert.equal(env.E2B_API_URL, "http://e2b.local");
   assert.equal(env.E2B_SANDBOX_URL, "http://e2b.local/sandboxes");
-  assert.equal(env.APP_TEMPLATES, JSON.stringify(MANIFEST.sandbox_templates));
+  assert.equal(env.APP_TEMPLATES, JSON.stringify({ measurement: { "1": "r1-runner-g1" } }), "the grant's names, not the manifest's array");
   assert.equal(env.APP_GRANT_LIMITS, JSON.stringify({ max_sandboxes: 2 }));
   assert.equal(env.CLAW_SESSION_ID, "s");
 });

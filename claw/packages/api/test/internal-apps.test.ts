@@ -84,7 +84,7 @@ const holdLease = (id: string) => q(
     await q("DELETE FROM claw_app_runs");
     await q("DELETE FROM claw_tasks");
     ports.grant = grant
-      ? { issue: async () => ({ keys: { measurement: KEY }, limits: { max_hours: 4 } }) }
+      ? { issue: async () => ({ keys: { measurement: KEY }, limits: { max_hours: 4 }, templates: { measurement: { "1": "r1-runner-g1" } } }) }
       : { issue: async () => undefined };
     const res = await app.inject({
       method: "POST", url: "/v1/sessions/s1/tasks",
@@ -159,11 +159,16 @@ const holdLease = (id: string) => q(
       assert.equal(plain.mcp_token, secrets.openAppRunSecret((await row()).mcp_token_enc, taskId, "mcp_token"));
       assert.match(plain.mcp_token, /^cmt_/);
       assert.equal(plain.grant_keys, null);
+      assert.equal((await row()).grant_templates, null, "no grant, no template names");
 
       taskId = await createRun(true);
       const granted = (await get(`/v1/internal/app-runs/${taskId}/secrets`)).json();
       assert.deepEqual(granted.grant_keys, { measurement: KEY });
       assert.deepEqual((await get(`/v1/internal/app-runs/${taskId}`)).json().run.grant_limits, { max_hours: 4 });
+      // The template names are stored on the row, unencrypted, and read back for a takeover.
+      assert.deepEqual((await row()).grant_templates, { measurement: { "1": "r1-runner-g1" } });
+      assert.deepEqual((await get(`/v1/internal/app-runs/${taskId}`)).json().run.grant_templates, { measurement: { "1": "r1-runner-g1" } });
+      assert.ok(!(await row()).grant_keys_enc.includes("r1-runner-g1"));
     });
   });
 
