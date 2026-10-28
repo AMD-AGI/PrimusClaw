@@ -26,6 +26,7 @@ import {
 import { getContextUsageSnapshot } from "../sessions/context-builder.js";
 import { publicSessionRow } from "../events/redaction.js";
 import { archiveSession, unarchiveSession } from "../sessions/archive.js";
+import { parseSessionModel } from "../sessions/session-model.js";
 import {
   isUserEnvKeyAllowed,
   validateTopology, type EnvironmentTopology,
@@ -73,6 +74,12 @@ export interface NewSessionRow {
    * once ownership is enforced, and it waits out `reapStuckSessions` instead.
    */
   gateMessageId?: string | null;
+  /**
+   * The model this session's turns ask for, or null/absent for the deployment's
+   * default. Already validated by `parseSessionModel`: this is the write, not
+   * the check.
+   */
+  model?: string | null;
 }
 
 // A value rather than a boolean, carrying the parent it was issued for, so a
@@ -99,12 +106,12 @@ export async function insertSessionRow(
   }
   await q.query(
     `INSERT INTO claw_sessions
-     (session_id, name, user_id, mode, agent_status, agent_gate_message_id, agent_id, system_prompt, status, config, parent_session_id, team_role, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $10, 'agent_default', $6, 'active', $7::jsonb, $8, $9, NOW(), NOW())`,
+     (session_id, name, user_id, mode, agent_status, agent_gate_message_id, agent_id, system_prompt, status, config, parent_session_id, team_role, model, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $10, 'agent_default', $6, 'active', $7::jsonb, $8, $9, $11, NOW(), NOW())`,
     [
       row.sessionId, row.name, row.userId, row.mode, row.agentStatus,
       row.systemPrompt, JSON.stringify(row.config), row.parentSid, row.role,
-      row.gateMessageId ?? null,
+      row.gateMessageId ?? null, row.model ?? null,
     ],
   );
 }
@@ -1093,6 +1100,19 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       });
     }
 
+    // The model this session's turns ask for. Checked here, before any row or
+    // run exists, so a malformed name leaves nothing behind. Absent and null both
+    // mean no choice; whether the gateway serves the name is its answer to give,
+    // on the first turn that uses it.
+    let sessionModel: string | null = null;
+    if (body.model !== undefined) {
+      const parsedModel = parseSessionModel(body.model);
+      if (!parsedModel.ok) {
+        return reply.status(400).send({ ok: false, error: parsedModel.error });
+      }
+      sessionModel = parsedModel.model;
+    }
+
     if (parentSid && !user) {
       return reply.status(401).send({ ok: false, error: "authentication required" });
     }
@@ -1289,6 +1309,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
           config: sessionConfig,
           parentSid, role,
           gateMessageId: firstMessageId,
+          model: sessionModel,
         };
         // A create with no parent grows no existing tree; every create that
         // names one adds a node to it, so it is decided against the ceiling
@@ -1310,6 +1331,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
             data: {
               session_id: sessionId, name, user_id: userId, mode: dispMode,
               agent_status: "idle", parent_session_id: parentSid, team_role: role,
+              model: sessionModel,
             },
           };
           if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock, userId, route, idemKey, 200, response);
@@ -1400,6 +1422,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
           data: {
             session_id: sessionId, name, user_id: userId, mode: dispMode,
             agent_status: "running", parent_session_id: parentSid, team_role: role,
+            model: sessionModel,
             message: {
               message_id: dispatch.messageId,
               dispatched: true,
@@ -1545,14 +1568,33 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     return { ok: true, data: rows.map(mapSessionForDisplay) };
   });
 
-  // --- Update Session (rename) ---
+  // --- Update Session (rename, choose the model) ---
+  //
+  // Either field alone, or both. `name` is the old contract unchanged. `model`
+  // is the model this session's turns ask the gateway for: a string sets it, null
+  // clears it back to the deployment's default, and a turn reads it when it is
+  // dispatched, so a change made while a turn runs takes effect from the next one.
   app.patch<{ Params: { id: string } }>("/v1/sessions/:id", async (req, reply) => {
     const sessionId = req.params.id;
     const user = getUser(req);
     const userId = user?.userId ?? "default";
-    const body = req.body as Record<string, unknown>;
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const wantsName = body.name !== undefined;
+    const wantsModel = body.model !== undefined;
     const newName = ((body.name as string) || "").trim();
-    if (!newName) return reply.status(400).send({ ok: false, error: "name is required" });
+    // With no `model` in the body this is exactly the rename it always was,
+    // including its refusal of a blank name.
+    if ((wantsName || !wantsModel) && !newName) {
+      return reply.status(400).send({ ok: false, error: "name is required" });
+    }
+    let newModel: string | null = null;
+    if (wantsModel) {
+      const parsedModel = parseSessionModel(body.model);
+      if (!parsedModel.ok) {
+        return reply.status(400).send({ ok: false, error: parsedModel.error });
+      }
+      newModel = parsedModel.model;
+    }
 
     const row = (await db.query(
       "SELECT session_id, user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
@@ -1560,16 +1602,38 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     )).rows[0];
     if (!row) return reply.status(404).send({ ok: false, error: "session not found" });
     // Creator-only, like send-message and delete: the same rule those two express
-    // through canAccessSession, rather than a second inline copy of it.
+    // through canAccessSession, rather than a second inline copy of it. Choosing
+    // the model is held to it as well -- it decides what the owner's key is spent
+    // on, and the owner is the only one who can send a turn.
     if (!canAccessSession(row.user_id, userId) && !(!row.user_id && user && isSystemAdmin(user))) {
-      return reply.status(403).send({ ok: false, error: "only the session owner can rename" });
+      return reply.status(403).send({
+        ok: false,
+        error: wantsModel ? "only the session owner can update it" : "only the session owner can rename",
+      });
     }
 
-    await db.query(
-      "UPDATE claw_sessions SET name = $1, updated_at = NOW() WHERE session_id = $2 AND deleted_at IS NULL",
-      [newName.slice(0, 255), sessionId],
-    );
-    return { ok: true, data: { session_id: sessionId, name: newName.slice(0, 255) } };
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    if (wantsName) {
+      params.push(newName.slice(0, 255));
+      sets.push(`name = $${params.length}`);
+    }
+    if (wantsModel) {
+      params.push(newModel);
+      sets.push(`model = $${params.length}`);
+    }
+    params.push(sessionId);
+    const updated = (await db.query(
+      `UPDATE claw_sessions SET ${sets.join(", ")}, updated_at = NOW() `
+        + `WHERE session_id = $${params.length} AND deleted_at IS NULL RETURNING name, model`,
+      params,
+    )).rows[0];
+    // Deleted between the read above and the write: there is nothing to report.
+    if (!updated) return reply.status(404).send({ ok: false, error: "session not found" });
+    return {
+      ok: true,
+      data: { session_id: sessionId, name: updated.name, model: updated.model ?? null },
+    };
   });
 
   // --- Archive / unarchive (owner only; reversible, only flips `status`) ---

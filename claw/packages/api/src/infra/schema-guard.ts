@@ -59,6 +59,8 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
       "cleanup_state", "cleanup_attempts", "cleanup_next_at", "cleanup_error",
       // Absent, every gate acquisition fails and no turn can start at all.
       "agent_gate_message_id",
+      // Absent, the read that gives a turn its model fails, and so does every turn.
+      "model",
     ],
   },
   {

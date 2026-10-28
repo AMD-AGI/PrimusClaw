@@ -116,6 +116,13 @@ test("names the session gate owner column before a request tries to write it", (
   assert.deepEqual(problems, ["claw_sessions is missing column(s): agent_gate_message_id"]);
 });
 
+test("names the session model column before a turn tries to read it", () => {
+  // Every dispatch selects it and every create writes it, so a database without
+  // it must stop the start-up rather than fail each turn at run time.
+  const problems = missingSchemaObjects(REQUIRED_SCHEMA, without([["claw_sessions", "model"]]));
+  assert.deepEqual(problems, ["claw_sessions is missing column(s): model"]);
+});
+
 for (const column of [
   "attempt_id",
   "attempt_generation",
