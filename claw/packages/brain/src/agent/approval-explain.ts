@@ -184,9 +184,13 @@ export function summaryPrompt(tool: string, input: Record<string, unknown>, ctx:
 // and the approver must read each of them exactly as the call has it.
 /** A heading marker (`# `..`###### `) at the start of a line; `#12` has no space after it and stays. */
 const HEADING_MARK = /^[ \t]{0,3}#{1,6}[ \t]+/gm;
-/** `**bold**`: paired, hugging non-space text, and not touching a word character or another `*` on the outside
- *  (so `2**10`, `a ** b` and the leading `**` of a glob are not bold). */
-const BOLD = /(?<![\p{L}\p{N}_*])\*\*(?=[^\s*])([^*\n]*[^\s*])\*\*(?![\p{L}\p{N}_*])/gu;
+// `**bold**`: paired, hugging non-space text, and standing on its own. The opening `**` follows the start of the
+// text, whitespace or an opening bracket or quote; the closing `**` is followed by the end of the text, whitespace,
+// a closing bracket or quote, or sentence punctuation (Latin or CJK). Anything else next to a `**` makes it a
+// character of the text: `2**10`, `a ** b`, and the `**` of a glob, both the leading one (`**/*.tmp`) and the
+// inner one (`a/**/b.tmp and c/**/d.log`, whose two would otherwise pair across the sentence). The inside must
+// not start or end with `/` either, so `**/node_modules/**` stays a glob and does not become a bold path.
+const BOLD = /(?<=^|[\s(\[{"'“‘「『（【《])\*\*(?=[^\s*\/])([^*\n]*[^\s*\/])\*\*(?=$|[\s)\]}"'”’」』）】》.,;:!?，。；：！？、…])/gu;
 /** `` `code` ``: a pair; a lone backtick stays. */
 const CODE_SPAN = /`([^`\n]+)`/g;
 /** Quote characters that count as one kind of wrapping quote. */

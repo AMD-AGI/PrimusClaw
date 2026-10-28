@@ -92,6 +92,14 @@ test("cleanSummary: never changes a character inside an identifier, a path, a gl
     "Delete *.log,*.tmp and *log* under /data",                  // single `*` in globs
     "Compute 2**10 and 3**4",                                    // exponent, not bold
     "Set a ** b to 4",                                           // spaced stars hug nothing
+    "2**10",                                                     // bare exponent
+    "Delete a/**/b.tmp and c/**/d.log",                          // two inner-`**` globs in one sentence (reviewer's round-2 case)
+    "Delete src/**/*.ts and lib/**/*.js",                        // `**/*` globs, `**` after a `/`
+    "Delete **/node_modules/** and **/dist/**",                  // leading-and-trailing `**` globs
+    "Remove (**/tmp/**) and (**/cache/**)",                      // the same inside parentheses
+    "Name is pre**x**post and a**b**c",                          // glued to word characters on both sides
+    "Open x**y**: z",                                            // opening `**` after a word character
+    "Delete **/*.tmp, **/*.log",                                 // leading `**` globs, comma-separated
     "Rewrite the C# and F# files",                               // `#` after a word
     "Stop `w1 in prod",                                          // a lone backtick pairs with nothing
     "Stop workload 'prod_a'",                                    // quotes inside the text stay
@@ -108,6 +116,16 @@ test("cleanSummary: paired markdown goes, the text inside it stays", () => {
     ["**`train_70b_v2`**", "train_70b_v2"],
     ["Set `env=test` on `plan_85`", "Set env=test on plan_85"],
     ["**停止** `train_70b_v2`", "停止 train_70b_v2"],
+    ["**Stop** workload w1", "Stop workload w1"],                  // at line start
+    ["Stop workload **w1**", "Stop workload w1"],                  // at line end
+    ["Stop (**w1**) now", "Stop (w1) now"],                        // inside parentheses
+    ["Stop [**w1**] and {**w2**}", "Stop [w1] and {w2}"],          // inside brackets
+    ["Stop \"**w1**\" now", "Stop \"w1\" now"],                    // inside quotes
+    ["已停止 **w1**，请确认", "已停止 w1，请确认"],                // before CJK punctuation
+    ["**停止**：w1", "停止：w1"],
+    ["已停止（**w1**）。", "已停止（w1）。"],                      // inside full-width parentheses, CJK full stop
+    ["Stopped **w1**. Next **w2**, then **w3**; **w4**: done! **w5**?", "Stopped w1. Next w2, then w3; w4: done! w5?"],
+    ["a **b** and c/**/d.log and **e**", "a b and c/**/d.log and e"],   // a glob between two real bold spans is untouched
     ["# Stop workload w1", "Stop workload w1"],
     ["### Stop workload train_70b_v2", "Stop workload train_70b_v2"],
     ["## Plan\nStop #12", "Plan Stop #12"],
