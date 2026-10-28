@@ -5,7 +5,7 @@
 // duplicated: both passes mask the same agent-loop events (here on the way into
 // NATS, there on the way out over SSE), and a sensitive name added to one copy
 // would have left the other leaking.
-import { isSensitiveKey, looksLikeCredentialValue, looksLikeVersionString, redactSecrets } from "@claw/utils";
+import { isSensitiveKey, looksLikeVersionString, redactSecrets } from "@claw/utils";
 
 /**
  * Whether a credential value is distinctive enough to hunt by substring.
@@ -339,10 +339,10 @@ function isToolInputObject(v: unknown): v is Record<string, unknown> {
  * tool call whose arguments are not a JSON object, rejects the entire request,
  * and the session fails every later turn.
  *
- * A name that looks like a credential is still a reason to withhold the
- * values, so a sensitive tool name masks every leaf instead of collapsing the
- * subtree. Keys and nesting stay, so the entry is still an object, and no value
- * under it survives.
+ * A name that looks like a credential is still a reason to withhold what was
+ * passed, so a sensitive tool name masks every leaf AND every key instead of
+ * collapsing the subtree. Nesting and entry count stay, so the entry is still an
+ * object, and nothing the caller put in it survives.
  */
 function redactToolArguments(
   toolName: string,
@@ -351,50 +351,32 @@ function redactToolArguments(
   runtimeSecrets: RuntimeSecrets,
 ): unknown {
   if (!isSensitiveKey(toolName)) return redactValue(input, seen, runtimeSecrets, toolName);
-  return maskLeaves(input, seen, runtimeSecrets);
+  return maskLeaves(input, seen);
 }
 
-function maskLeaves(value: unknown, seen: WeakSet<object>, runtimeSecrets: RuntimeSecrets): unknown {
+function maskLeaves(value: unknown, seen: WeakSet<object>): unknown {
   if (value === null || value === undefined || value === "") return value;
   if (typeof value !== "object") return "<redacted>";
   if (seen.has(value)) return "<redacted:cyclic>";
   seen.add(value);
   let out: unknown;
   if (Array.isArray(value)) {
-    out = value.map((item) => maskLeaves(item, seen, runtimeSecrets));
+    out = value.map((item) => maskLeaves(item, seen));
   } else {
+    // Keys are hidden as well as values. The whole input used to be masked, and
+    // a key can carry exactly what a value can (a map keyed by token, a
+    // `hunter2`); no test of a key's shape can tell a name from a secret, so
+    // none is attempted. What stays is the shape: an object, one entry per
+    // argument, which is all a replay needs.
     const keyed: Record<string, unknown> = {};
-    let hidden = 0;
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      const shown = maskableKey(k, runtimeSecrets);
-      // Two hidden keys must not collapse into one entry.
-      keyed[shown ?? `<redacted-key-${++hidden}>`] = maskLeaves(v, seen, runtimeSecrets);
+    let n = 0;
+    for (const v of Object.values(value as Record<string, unknown>)) {
+      keyed[`<redacted-key-${++n}>`] = maskLeaves(v, seen);
     }
     out = keyed;
   }
   seen.delete(value);
   return out;
-}
-
-/**
- * The key to show for a masked entry, or undefined when it must be hidden too.
- *
- * Keys are kept because they are what makes the entry still read as the call's
- * arguments, but the whole input used to be masked, so a key must not be able
- * to carry what a value cannot: a credential used AS a key (a dynamic map keyed
- * by token) would otherwise survive. A key is shown only if it reads as an
- * argument NAME -- short, letters/digits joined by underscores, no long
- * digit-bearing run, not credential-shaped, and unchanged by the string
- * redactor (exact runtime secrets, vendor-shaped tokens). Anything else is
- * hidden; losing the name of an odd argument costs nothing, showing a token
- * costs the token.
- */
-const ARGUMENT_NAME_RE = /^[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)*$/;
-function maskableKey(key: string, runtimeSecrets: RuntimeSecrets): string | undefined {
-  if (key.length > 40 || !ARGUMENT_NAME_RE.test(key)) return undefined;
-  if (/\d/.test(key) && /[A-Za-z0-9]{16,}/.test(key)) return undefined;
-  if (looksLikeCredentialValue(key)) return undefined;
-  return redactString(key, runtimeSecrets) === key ? key : undefined;
 }
 
 /**
