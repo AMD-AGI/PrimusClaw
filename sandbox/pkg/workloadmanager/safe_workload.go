@@ -10,10 +10,12 @@ import (
 	"strings"
 	"time"
 
+	"encoding/base64"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -53,7 +55,14 @@ const (
 	// DNS label minus a 5-character suffix and the separating hyphen.
 	// The Workload name is copied onto the Sandbox, its Pod, its Service, and a label.
 	safeGeneratedNameLength = 63 - 5 - 1
+	// signingSecretKey is the data key mounted from the per-sandbox Secret.
+	signingSecretKey = "signing-key.pem"
+	// signingSecretMountRoot is the SaFE path for a general Secret volume.
+	signingSecretMountRoot = "/etc/secrets"
 )
+
+// secretGVR is a namespace-scoped Secret in the sandbox workspace.
+var secretGVR = schema.GroupVersionResource{Version: "v1", Resource: "secrets"}
 
 // workloadGVR is the cluster-scoped SaFE Workload.
 var workloadGVR = schema.GroupVersionResource{Group: "amd.com", Version: "v1", Resource: "workloads"}
@@ -95,11 +104,28 @@ func (c *SafeWorkloadCreator) Create(ctx context.Context, req e2b.CreateRequest)
 	if err != nil {
 		return nil, err
 	}
+	secretName := ""
+	if req.SigningKeyPEM != "" {
+		secretName = signingSecretName(name)
+		if err := c.createSigningSecret(ctx, req.Workspace, secretName, req.SigningKeyPEM); err != nil {
+			return nil, fmt.Errorf("create signing secret: %w", err)
+		}
+	}
 	created, err := c.dynamic.Resource(workloadGVR).Create(ctx, obj, metav1.CreateOptions{})
 	if err != nil {
+		if secretName != "" {
+			_ = c.deleteSigningSecret(context.WithoutCancel(ctx), req.Workspace, secretName)
+		}
 		return nil, fmt.Errorf("create workload: %w", err)
 	}
 	name = created.GetName()
+	if secretName != "" {
+		if err := c.adoptSigningSecret(ctx, req.Workspace, secretName, created); err != nil {
+			_ = c.Delete(context.WithoutCancel(ctx), name)
+			_ = c.deleteSigningSecret(context.WithoutCancel(ctx), req.Workspace, secretName)
+			return nil, fmt.Errorf("adopt signing secret: %w", err)
+		}
+	}
 	var (
 		podIP, nodeName string
 		waitErr         error
@@ -107,6 +133,9 @@ func (c *SafeWorkloadCreator) Create(ctx context.Context, req e2b.CreateRequest)
 	defer func() {
 		if waitErr != nil {
 			_ = c.Delete(context.WithoutCancel(ctx), name)
+			if secretName != "" {
+				_ = c.deleteSigningSecret(context.WithoutCancel(ctx), req.Workspace, secretName)
+			}
 		}
 	}()
 	podIP, nodeName, waitErr = c.waitRunning(ctx, name, req.Workspace)
@@ -270,6 +299,64 @@ func (c *SafeWorkloadCreator) Session(ctx context.Context, name string) (*store.
 	return info, nil
 }
 
+// signingSecretName is the Secret in the workspace, one per sandbox.
+func signingSecretName(sandboxID string) string {
+	return sandboxID
+}
+
+// signingKeyFile is the mounted private key. The path is not the key material.
+func signingKeyFile(sandboxID string) string {
+	return signingSecretMountRoot + "/" + signingSecretName(sandboxID) + "/" + signingSecretKey
+}
+
+// createSigningSecret writes the sandbox private key into the workspace.
+func (c *SafeWorkloadCreator) createSigningSecret(ctx context.Context, namespace, name, pem string) error {
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Secret",
+		"metadata": map[string]any{
+			"name":      name,
+			"namespace": namespace,
+		},
+		"type": "Opaque",
+		"data": map[string]any{
+			signingSecretKey: base64.StdEncoding.EncodeToString([]byte(pem)),
+		},
+	}}
+	_, err := c.dynamic.Resource(secretGVR).Namespace(namespace).Create(ctx, obj, metav1.CreateOptions{})
+	return err
+}
+
+// adoptSigningSecret makes the Workload the Secret owner so deleting the Workload deletes the key.
+func (c *SafeWorkloadCreator) adoptSigningSecret(ctx context.Context, namespace, name string, owner *unstructured.Unstructured) error {
+	secret, err := c.dynamic.Resource(secretGVR).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	refs := []any{map[string]any{
+		"apiVersion":         workloadAPIVersion,
+		"kind":               workloadKind,
+		"name":               owner.GetName(),
+		"uid":                string(owner.GetUID()),
+		"controller":         true,
+		"blockOwnerDeletion": true,
+	}}
+	if err := unstructured.SetNestedSlice(secret.Object, refs, "metadata", "ownerReferences"); err != nil {
+		return err
+	}
+	_, err = c.dynamic.Resource(secretGVR).Namespace(namespace).Update(ctx, secret, metav1.UpdateOptions{})
+	return err
+}
+
+// deleteSigningSecret removes the key. A missing Secret is already gone.
+func (c *SafeWorkloadCreator) deleteSigningSecret(ctx context.Context, namespace, name string) error {
+	err := c.dynamic.Resource(secretGVR).Namespace(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
 // Delete removes the Workload. A missing object is already gone.
 func (c *SafeWorkloadCreator) Delete(ctx context.Context, name string) error {
 	if c == nil || c.dynamic == nil || name == "" {
@@ -426,6 +513,9 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 	if nodes := strings.TrimSpace(req.AvoidNodes); nodes != "" {
 		spec["customerLabels"] = map[string]any{"excluded-nodes": nodes}
 	}
+	if req.SigningKeyPEM != "" {
+		spec["secrets"] = []any{map[string]any{"id": signingSecretName(req.SandboxID), "type": "general"}}
+	}
 	labels := map[string]any{
 		safeDisplayNameLabel: req.Role,
 		ownerSessionIDLabel:  req.SessionID,
@@ -516,8 +606,7 @@ func platformSandboxEnv(req e2b.CreateRequest, gpus int) map[string]string {
 		env["E2B_SANDBOX_ID"] = req.SandboxID
 	}
 	if req.SigningKeyPEM != "" {
-		env["HYPERLOOM_SIGNING_KEY_PEM"] = req.SigningKeyPEM
-		env["HYPERLOOM_SIGNING_KEY_FILE"] = "/app/signing-key.pem"
+		env["HYPERLOOM_SIGNING_KEY_FILE"] = signingKeyFile(req.SandboxID)
 	}
 	if devices := rocrVisibleDevices(gpus); devices != "" {
 		env["ROCR_VISIBLE_DEVICES"] = devices
