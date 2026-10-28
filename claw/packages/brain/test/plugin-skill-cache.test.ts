@@ -29,7 +29,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { startPluginWorld, skillRow } from "./support/plugin-world.js";
+import { startPluginWorld } from "./support/plugin-world.js";
 
 // A 40000 budget makes a skill that costs over 10000 "oversize" (a quarter of it); see skillCost.
 process.env.SKILL_CACHE_MAX_BYTES = "40000";
