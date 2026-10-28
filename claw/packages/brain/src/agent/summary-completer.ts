@@ -36,12 +36,23 @@ export function modelRefusalStatus(err: unknown): number | undefined {
   return undefined;
 }
 
+/**
+ * The affinity key of the summary session. The gateway's Auto Router pins a session to one backend by
+ * the id in `x-litellm-session-id`, and moving a conversation to another backend breaks thinking replay
+ * and splits the prompt cache. A summary on HITL_SUMMARY_MODEL is a different model, so it must not
+ * carry the run's own id: it gets a stable id of its own, derived from it, and the run's pin is left
+ * alone. Spend still attributes to the run through the end-user id and the key. No run id, no header.
+ */
+export function summarySessionId(runSessionId: string | undefined): string | undefined {
+  return runSessionId ? `${runSessionId}:approval-summary` : undefined;
+}
+
 export interface SummaryCompleterDeps {
   /** HITL_SUMMARY_MODEL; empty means the run's own model. */
   model: string;
   /** The run's own session: what answers when no summary model is configured. */
   runSession: Pick<LlmSession, "complete">;
-  /** A session on `model`, on the run's gateway and with the run's key. */
+  /** A session on `model`, on the run's gateway and with the run's key, under its own affinity key. */
   open: (model: string) => Pick<LlmSession, "complete">;
   /** Called once per completer, the first time the gateway refuses the configured model. */
   onRefused?: (model: string, status: number) => void;

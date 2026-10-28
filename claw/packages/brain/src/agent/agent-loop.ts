@@ -32,7 +32,7 @@ import { isSandboxTool } from "../tools/hands.js";
 import type { HookRunner } from "./hooks.js";
 import { refusalMessage, type HitlController } from "./hitl.js";
 import { latestUserText, type Completer } from "./approval-explain.js";
-import { summaryCompleter } from "./summary-completer.js";
+import { summaryCompleter, summarySessionId } from "./summary-completer.js";
 import { metrics } from "../infra/metrics.js";
 import { isTrackedRun, whileRecovering, whileWaiting, type WaitMode } from "../tasks/run-phase.js";
 import pino from "pino";
@@ -880,14 +880,17 @@ class AgentLoopRunner {
    * The completer for an approval card's summary. With HITL_SUMMARY_MODEL set it is a session on that
    * model on THIS run's gateway with THIS run's key (`this.apiKey`, already resolved by
    * resolveRequestLlmKey: the user's own key, or the platform key in proxy mode); no other key is in
-   * scope here. Unset, it is the run's own session, as it always was.
+   * scope here. The id the gateway pins a backend by is NOT the run's: see summarySessionId. Unset, it is
+   * the run's own session, as it always was, with the run's own id.
    */
   private summaryCompleter(): Completer {
     this.summaryComplete ??= summaryCompleter({
       model: this.opts.hitlSummaryModel ?? HITL_SUMMARY_MODEL,
       runSession: this.session,
       open: (model) => getProvider().createSession({
-        model, apiUrl: this.apiUrl, apiKey: this.apiKey, userId: this.userId, sessionId: this.sessionId,
+        model, apiUrl: this.apiUrl, apiKey: this.apiKey, userId: this.userId,
+        // Not the run's own id: this is a different model, and the gateway's session affinity keys on it.
+        sessionId: summarySessionId(this.sessionId),
       }),
       onRefused: (_model, status) => metrics.onApprovalSummaryModelRefused(status),
     });

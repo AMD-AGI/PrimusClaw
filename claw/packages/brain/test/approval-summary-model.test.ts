@@ -29,7 +29,8 @@ const { agentLoop } = await import("../src/agent/agent-loop.js");
 type LoopOptions = import("../src/agent/agent-loop.js").LoopOptions;
 const { HitlController } = await import("../src/agent/hitl.js");
 const { registry } = await import("../src/infra/metrics.js");
-const { modelRefusalStatus, summaryCompleter } = await import("../src/agent/summary-completer.js");
+const { modelRefusalStatus, summaryCompleter, summarySessionId } = await import("../src/agent/summary-completer.js");
+const { getProvider } = await import("../src/llm/index.js");
 
 const TOOL = "mcp__ops__stop_workload";
 const INPUT = { workload_id: "train-70b", reason: "stuck" };
@@ -86,7 +87,13 @@ function runSession(turns: Array<Partial<LlmTurnResult>>, completeCalls: unknown
 }
 
 /** One run with one approval-gated call per turn. Returns each permissionRequest it raised. */
-async function run(o: { apiKey: string; model?: string; calls?: number; parallel?: boolean }) {
+async function run(o: {
+  apiKey: string; model?: string; calls?: number; parallel?: boolean;
+  /** The run's session id; `null` is a run that has none. */
+  sessionId?: string | null;
+  /** Let the run's own completions go over the wire (real provider), so the header they carry can be read. */
+  runOnWire?: boolean;
+}) {
   const events: Array<Record<string, unknown>> = [];
   const onEvent = async (e: unknown) => { events.push(e as Record<string, unknown>); };
   const dispatcher = {
@@ -103,9 +110,14 @@ async function run(o: { apiKey: string; model?: string; calls?: number; parallel
   turns.push({ content: [text("done")], stopReason: "end_turn" });
   const completeCalls: unknown[][] = [];
   const tools = [{ name: TOOL, description: "Stop a workload.", input_schema: { type: "object", properties: {} } }] as unknown as ToolSchema[];
+  const sessionId = o.sessionId === null ? undefined : (o.sessionId ?? "s");
+  const scripted = runSession(turns, completeCalls);
+  const wire = o.runOnWire
+    ? getProvider().createSession({ model: "run-model", apiUrl: API_URL, apiKey: o.apiKey, userId: "u", sessionId })
+    : undefined;
   const opts = {
-    model: "run-model", apiUrl: API_URL, apiKey: o.apiKey, maxTurns: 10, router, onEvent, sessionId: "s", userId: "u",
-    llmSession: runSession(turns, completeCalls), hitl, hitlSummaryModel: o.model,
+    model: "run-model", apiUrl: API_URL, apiKey: o.apiKey, maxTurns: 10, router, onEvent, sessionId, userId: "u",
+    llmSession: wire ? { ...scripted, complete: wire.complete.bind(wire) } : scripted, hitl, hitlSummaryModel: o.model,
   } as unknown as LoopOptions;
   await agentLoop([{ role: "user", content: "停掉 train-70b" } as Message], tools, opts);
   return { asks: events.filter((e) => e.type === "permissionRequest"), executed, completeCalls };
@@ -153,6 +165,44 @@ test("concurrent runs for two users each pay with their own key", async () => {
   reset();
   await Promise.all([run({ apiKey: "user-key-alice", model: "small-fast" }), run({ apiKey: "user-key-bob", model: "small-fast" })]);
   assert.deepEqual(seen.map((s) => s.headers["x-api-key"]).sort(), ["user-key-alice", "user-key-bob"]);
+});
+
+// --- the affinity key ---------------------------------------------------------------------------
+
+test("the summary call carries its own x-litellm-session-id when it is a different model, and the run's own when it is not", async () => {
+  // The gateway's Auto Router pins a session to one backend by this header, and a different model under the run's
+  // id would re-pin it: the run's next turn lands on another backend (thinking replay 400s, the prompt cache is lost).
+  // Read off the wire, from the real provider, not from what the loop meant to pass.
+  const rows: Array<{ name: string; o: Parameters<typeof run>[0]; header: string; metaSessionId: string }> = [
+    { name: "summary model set", o: { model: "small-fast", sessionId: "s" }, header: "s:approval-summary", metaSessionId: "s:approval-summary" },
+    { name: "summary model set, another run id", o: { model: "small-fast", sessionId: "run-42" }, header: "run-42:approval-summary", metaSessionId: "run-42:approval-summary" },
+    { name: "summary model set, run has no id", o: { model: "small-fast", sessionId: null }, header: "", metaSessionId: "" },
+    { name: "summary model unset: the run's own model, the run's own id", o: { runOnWire: true, sessionId: "s" }, header: "s", metaSessionId: "s" },
+    { name: "summary model blank: the same as unset", o: { runOnWire: true, model: "   ", sessionId: "s" }, header: "s", metaSessionId: "s" },
+  ];
+  for (const { name, o, header, metaSessionId } of rows) {
+    reset();
+    const { asks } = await run({ apiKey: "user-key-alice", calls: 2, ...o });
+    assert.equal(asks.length, 2, name);
+    assert.ok(seen.length >= 1, `${name}: the summary went over the wire`);
+    for (const s of seen) {
+      assert.equal(s.headers["x-litellm-session-id"] ?? "", header, `${name}: x-litellm-session-id`);
+      assert.equal(JSON.parse(String(s.headers["x-litellm-spend-logs-metadata"])).session_id, metaSessionId, `${name}: spend-logs session_id`);
+      assert.equal(s.headers["x-litellm-end-user-id"], "u", `${name}: spend still attributes to the user`);
+    }
+    if (o.model === "small-fast") {
+      assert.equal(seen[0].body.model, "small-fast", `${name}: it is the summary model on the wire`);
+      if (o.sessionId) assert.notEqual(seen[0].headers["x-litellm-session-id"], o.sessionId, `${name}: not the run's own id`);
+    }
+  }
+});
+
+test("summarySessionId: derived from the run's id, stable, and empty when the run has none", () => {
+  assert.equal(summarySessionId("s"), "s:approval-summary");
+  assert.equal(summarySessionId("s"), summarySessionId("s"));
+  assert.notEqual(summarySessionId("a"), summarySessionId("b"));
+  assert.equal(summarySessionId(undefined), undefined);
+  assert.equal(summarySessionId(""), undefined);
 });
 
 // --- 2. unset: exactly what it was ------------------------------------------------------------
