@@ -37,7 +37,7 @@ import type { KVStore } from "@claw/utils";
 import { createHash } from "node:crypto";
 import pino from "pino";
 import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
-import { isKubernetesMode, SAFE_API_URL } from "../config.js";
+import { isKubernetesMode, SANDBOX_IDLE_REUSE_MS, SAFE_API_URL } from "../config.js";
 import { DAG_HANDLES_BUCKET, jsm, kv, kvDagHandles, nc } from "../infra/nats.js";
 import { db } from "../infra/db.js";
 
@@ -427,7 +427,70 @@ export type SessionBackgroundWork =
      */
     workSeenAt?: number;
   }
-  | { state: "unreadable"; reason: string };
+  | { state: "unreadable"; reason: string }
+  | {
+    /**
+     * Parked and idle, inside the window in which the session's next message is
+     * expected to reuse it. Not evidence about background work in either
+     * direction -- it is the absence of a reason to reclaim yet.
+     */
+    state: "reusable";
+    workloadId: string;
+    /** How long the sandbox has been idle, by the anchor the window runs from. */
+    idleForMs: number;
+    remainingMs: number;
+  };
+
+/**
+ * How much of its reuse window a parked sandbox still has, or null when the
+ * window does not apply to it.
+ *
+ * The window is Brain's `SANDBOX_IDLE_REUSE_SECONDS`: a finished turn leaves its
+ * sandbox parked so the next message in the session picks it up instead of
+ * paying a cold start (10-14 s). Brain's keepalive sweep is what ends it -- it
+ * reclaims a handle that has been quiet for the whole window -- so a sweep here
+ * that reaps on "the DAG that created it is terminal and nothing is running in
+ * it" is reaping the very state the window exists to keep. That was the defect:
+ * Brain publishes its first idle verdict one keepalive interval (60 s) after
+ * the turn, the next tick of this sweep read it as `verdict_idle`, and the
+ * sandbox was gone 56-90 s after every turn, inside a 15 minute window.
+ *
+ * The window runs from the later of the three stamps a parked handle carries:
+ * `idleSince` (the park), `workSeenAt` (the last sweep that found work in it)
+ * and `quiescedAt` (Brain's first confirmed-empty jobs roster, which is the
+ * anchor Brain's own expiry uses). Taking the latest means this sweep never
+ * reaps before Brain would have reclaimed, and when Brain does reclaim it first
+ * this sweep finds nothing left to stop.
+ *
+ * Null, so that the sweep falls through to its established rules, for every
+ * entry that is not a parked, live, still-wanted sandbox:
+ *   - no window configured (0), which is the old behaviour;
+ *   - no `idleSince`: the entry has not been parked, so there is no idle period
+ *     to measure a window from -- a task is running in it or it is mid-start;
+ *   - `sessionDeleted`: the owner is gone and there is no next message, so
+ *     nothing is waiting for it and holding it only costs capacity;
+ *   - a status other than ready, or a recorded terminal reason: the sandbox is
+ *     closing or dead, and there is nothing to reuse.
+ * After the window the sweep acts exactly as before, so an idle sandbox is still
+ * reclaimed and this is a delay, not a leak.
+ */
+export function reuseWindowRemaining(
+  info: Record<string, unknown>, now: number, windowMs: number,
+): { idleForMs: number; remainingMs: number } | null {
+  if (!(windowMs > 0)) return null;
+  if (info.sessionDeleted === true) return null;
+  if (info.status !== undefined && info.status !== "ready") return null;
+  if (typeof info.terminalReason === "string" && info.terminalReason) return null;
+  if (typeof info.idleSince !== "number") return null;
+  const quiescedAt = typeof info.quiescedAt === "number" ? info.quiescedAt : 0;
+  const anchor = Math.max(reuseWindowStart(info as SharedVerdictFields), quiescedAt);
+  // A stamp from a replica whose clock runs ahead reads as the future. Capping
+  // the idle time at zero bounds the hold at one window from now rather than
+  // letting skew stretch it.
+  const idleForMs = Math.max(0, now - anchor);
+  const remainingMs = windowMs - idleForMs;
+  return remainingMs > 0 ? { idleForMs, remainingMs } : null;
+}
 
 /**
  * Read a session's binding through both names it can live under.
@@ -503,6 +566,7 @@ export async function readSessionBackgroundWork(
   sessionId: string,
   workloadIds: readonly string[],
   now: number = Date.now(),
+  reuseWindowMs: number = SANDBOX_IDLE_REUSE_MS,
 ): Promise<SessionBackgroundWork> {
   const wanted = new Set(workloadIds.filter((w) => !!w));
   if (!sessionId || wanted.size === 0) return { state: "clear", reason: "no_workload" };
@@ -522,6 +586,11 @@ export async function readSessionBackgroundWork(
   if (verdict?.state === "running") {
     return { state: "running", workloadId, running: verdict.running, at: verdict.at };
   }
+  // After `running`, which holds a sandbox for as long as the shells last, and
+  // before every answer that lets the caller stop one: an idle verdict says
+  // nothing is running in there, not that nothing is going to want it.
+  const reuse = reuseWindowRemaining(info, now, reuseWindowMs);
+  if (reuse) return { state: "reusable", workloadId, ...reuse };
   if (verdict) {
     return { state: "clear", reason: "verdict_idle", workloadId, running: verdict.running };
   }
