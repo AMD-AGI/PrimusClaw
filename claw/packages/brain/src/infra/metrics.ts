@@ -402,6 +402,24 @@ const llmCacheDisabledTotal = new Counter({
   help: "Sessions that stopped sending cache markers after the gateway rejected them.",
   registers: [registry],
 });
+// Replayed tool calls whose input was not a JSON object. The model endpoint
+// refuses the whole request for one, so a non-zero rate means some writer is
+// still storing or streaming a bad input, and `stage` says which side caught it.
+const llmToolInputRepairedTotal = new Counter({
+  name: "claw_brain_llm_tool_input_repaired_total",
+  help: "Replayed tool-call inputs that were not a JSON object and were rewritten before reaching the model, by stage (wire: request build; retry: after the endpoint refused).",
+  labelNames: ["stage"] as const,
+  registers: [registry],
+});
+// The endpoint refused a replayed tool call's arguments anyway. `retried`
+// means the history held something to repair and the turn was sent again;
+// `nothing_to_repair` means the refusal came from something this pass cannot fix.
+const llmToolArgsRejectedTotal = new Counter({
+  name: "claw_brain_llm_tool_args_rejected_total",
+  help: "Model-endpoint 400s about tool-call arguments not being a JSON object, by what the sanitizing retry did.",
+  labelNames: ["outcome"] as const,
+  registers: [registry],
+});
 // Turns whose prompt size nobody could measure.
 //
 // Compaction is the only context-size guard here and it needs a number to
@@ -805,6 +823,14 @@ export const metrics = {
   },
   onLlmCacheDisabled(): void {
     llmCacheDisabledTotal.inc();
+  },
+  /** Replayed tool-call inputs rewritten into objects before reaching the model. */
+  onToolInputRepaired(stage: "wire" | "retry", count: number): void {
+    if (count > 0) llmToolInputRepairedTotal.inc({ stage }, count);
+  },
+  /** The endpoint refused a tool call's arguments; what the sanitizing retry did. */
+  onToolArgsRejected(outcome: "retried" | "nothing_to_repair"): void {
+    llmToolArgsRejectedTotal.inc({ outcome });
   },
   /** Whether compaction still fires. Moving its trigger without this is a
    *  behaviour change nobody can see. */

@@ -118,3 +118,123 @@ test("an absent credential field keeps its shape", () => {
   const event = redactPersistedEvent({ accessToken: null, apiKey: "", sessionToken: "real" });
   assert.deepEqual(event, { accessToken: null, apiKey: "", sessionToken: "<redacted>" });
 });
+
+// A tool named like a credential field (`mcp__safe__apikey_list`) used to have
+// its whole argumentsDetail entry collapsed to the string "<redacted>". That
+// string is persisted with the turn and replayed to the model as the tool
+// call's input; the endpoint refuses a tool call whose arguments are not a JSON
+// object and then fails every later turn of the session. The entry must stay
+// an object while still withholding every value under it.
+const credentialNamedTools: Array<{
+  name: string;
+  tool: string;
+  input: unknown;
+  want: unknown;
+}> = [
+  { name: "no-argument call stays an empty object", tool: "mcp__safe__apikey_list", input: {}, want: {} },
+  {
+    name: "flat input stays an object with keys and values hidden",
+    tool: "mcp__safe__apikey_create",
+    input: { name: "ci-key", ttl_days: 30 },
+    want: { "<redacted-key-1>": "<redacted>", "<redacted-key-2>": "<redacted>" },
+  },
+  {
+    name: "nested input keeps its shape",
+    tool: "mcp__safe__apikey_update",
+    input: { id: 5, opts: { labels: ["a", "b"], note: "n" }, empty: "", none: null },
+    want: {
+      "<redacted-key-1>": "<redacted>",
+      "<redacted-key-2>": { "<redacted-key-1>": ["<redacted>", "<redacted>"], "<redacted-key-2>": "<redacted>" },
+      "<redacted-key-3>": "",
+      "<redacted-key-4>": null,
+    },
+  },
+  {
+    name: "token-named tool",
+    tool: "mcp__vault__read_token",
+    input: { path: "kv/data/app" },
+    want: { "<redacted-key-1>": "<redacted>" },
+  },
+];
+
+for (const c of credentialNamedTools) {
+  test(`credential-named tool keeps an object input: ${c.name}`, () => {
+    const event = redactPersistedEvent({
+      type: "toolUsed",
+      tool: c.tool,
+      status: "start",
+      argumentsDetail: { [c.tool]: c.input },
+    });
+    const got = (event.argumentsDetail as Record<string, unknown>)[c.tool];
+    assert.deepEqual(got, c.want);
+    assert.equal(typeof got, "object");
+    assert.equal(Array.isArray(got), false);
+  });
+}
+
+test("credential-named tool never lets a value through, even a vendor-shaped one", () => {
+  const event = redactPersistedEvent({
+    type: "toolUsed",
+    tool: "mcp__safe__apikey_create",
+    argumentsDetail: { mcp__safe__apikey_create: { name: "ak-live-1234567890abcdef", extra: { k: "visible?" } } },
+  });
+  const serialized = JSON.stringify(event);
+  assert.equal(serialized.includes("ak-live-1234567890abcdef"), false);
+  assert.equal(serialized.includes("visible?"), false);
+});
+
+test("a tool name that is not credential-like keeps field-level masking only", () => {
+  const event = redactPersistedEvent({
+    type: "toolUsed",
+    tool: "mcp__safe__workload_list",
+    argumentsDetail: { mcp__safe__workload_list: { workspace: "w1", apiKey: "k-123" } },
+  });
+  assert.deepEqual(
+    (event.argumentsDetail as Record<string, unknown>).mcp__safe__workload_list,
+    { workspace: "w1", apiKey: "<redacted>" },
+  );
+});
+
+test("a non-object value under a credential-named tool is still withheld", () => {
+  const event = redactPersistedEvent({
+    type: "toolUsed",
+    argumentsDetail: { mcp__safe__apikey_list: "raw-string-input" },
+  });
+  assert.equal((event.argumentsDetail as any).mcp__safe__apikey_list, "<redacted>");
+});
+
+// The whole input of a credential-named tool used to be masked, so a credential
+// carried as an object KEY (a dynamic map keyed by token) was hidden too. A key
+// can hold what a value can and no test of its shape can tell a name from a
+// secret, so under a credential-named tool no key survives.
+const hostileKeys: Array<{ name: string; key: string }> = [
+  { name: "hyphenated live-key shape", key: "sk-live-abcdefghijklmnopqrstuvwxyz0123" },
+  { name: "vendor-shaped token", key: "ghp_abcdefghijklmnopqrstuvwxyz0123456789" },
+  { name: "AWS access key id", key: "AKIAIOSFODNN7EXAMPLE" },
+  { name: "long hex run", key: "0123456789abcdef0123456789abcdef" },
+  { name: "word with digits on the end", key: "hunter2" },
+  { name: "plain word", key: "swordfish" },
+  { name: "exact runtime secret", key: "tenant-runtime-key-123" },
+  { name: "very long key", key: "a".repeat(80) },
+  { name: "key with a space", key: "has space" },
+  { name: "prototype-shaped key", key: "__proto__" },
+];
+
+for (const c of hostileKeys) {
+  test(`credential-named tool does not show a key: ${c.name}`, () => {
+    const input = JSON.parse(`{${JSON.stringify(c.key)}: "v", "other": {"nested_${c.key.length}": 1}}`) as Record<string, unknown>;
+    const event = redactPersistedEvent({
+      type: "toolUsed",
+      argumentsDetail: { mcp__svc__apikey_create: input },
+    }, ["tenant-runtime-key-123"]);
+    const got = (event.argumentsDetail as Record<string, Record<string, unknown>>).mcp__svc__apikey_create;
+    const serialized = JSON.stringify(event);
+    assert.equal(serialized.includes(c.key), false, "the key must not be serialized");
+    assert.equal(serialized.includes("other"), false);
+    assert.equal(serialized.includes("nested_"), false);
+    assert.deepEqual(got, {
+      "<redacted-key-1>": "<redacted>",
+      "<redacted-key-2>": { "<redacted-key-1>": "<redacted>" },
+    });
+  });
+}
