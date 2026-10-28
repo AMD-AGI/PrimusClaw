@@ -126,6 +126,17 @@ test("cleanSummary: a credential value that holds marker characters is still hid
   assert.equal(cleanSummary("use `my_secret_key_9`", ["my_secret_key_9"]), "use [hidden]");
 });
 
+test("cleanSummary: a credential value that is itself a markdown span, or becomes whole once a span is opened, is hidden", () => {
+  const rows: Array<[string, string, string]> = [
+    ["use **hunter2** now", "**hunter2**", "use [hidden] now"],      // the value carries its own `**` pair
+    ["use `hunter2` now", "`hunter2`", "use [hidden] now"],          // ... or its own backticks
+    ["use **hunter2** now", "hunter2", "use [hidden] now"],           // the value is inside a span
+    ["use hunt`er`2 now", "hunter2", "use [hidden] now"],             // whole only after the code pair is removed
+    ["# use hunter2", "hunter2", "use [hidden]"],
+  ];
+  for (const [raw, secret, want] of rows) assert.equal(cleanSummary(raw, [secret]), want, `${raw} / ${secret}`);
+});
+
 test("latestUserText: the newest real user text; tool results and notices are skipped", () => {
   const msgs: Message[] = [
     { role: "user", content: "给计划 85 加个标签" },

@@ -207,10 +207,13 @@ function unwrapQuotes(text: string): string {
 /** One line of plain text: no markdown emphasis, code or heading marker, no wrapping quotes, bounded. Only
  *  paired markers go; nothing inside an identifier, path, glob or number is touched. */
 export function cleanSummary(raw: string, secrets: readonly string[] = []): string | undefined {
+  const hide = (text: string): string => redactSecrets(scrub(text, secrets)).text;
+  // A credential value is hidden before the markers are taken off, or a value that is itself a complete span
+  // (`**hunter2**`) would lose its markers first and no longer match; and again after, for one that only
+  // becomes whole once a marker pair in the middle of it is gone (hunt`er`2).
   // Headings are per line, so they go before the lines are joined.
-  let s = flat(String(raw ?? "").replace(HEADING_MARK, "")).replace(BOLD, "$1").replace(CODE_SPAN, "$1");
-  s = unwrapQuotes(s).trim();
-  s = redactSecrets(scrub(s, secrets)).text;
+  let s = flat(hide(String(raw ?? "")).replace(HEADING_MARK, "")).replace(BOLD, "$1").replace(CODE_SPAN, "$1");
+  s = hide(unwrapQuotes(s).trim());
   return s ? clip(s, SUMMARY_MAX_CHARS) : undefined;
 }
 
