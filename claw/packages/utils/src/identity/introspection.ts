@@ -118,7 +118,8 @@ function parseActive(raw: Record<string, unknown>): ActiveIntrospection {
  *    {@link IdentityUnavailableError}. An outage is NEVER turned into
  *    `{active:false}`, and an inactive answer is NEVER served stale.
  *  - A refusal of this client's own credentials (401/403) is not an outage and
- *    is never answered from a stale entry.
+ *    is never answered from a stale entry. The entry for that credential is
+ *    dropped on the refusal, so a later outage cannot serve it either.
  */
 export class Introspector {
   private readonly entries = new Map<string, Entry>();
@@ -195,7 +196,22 @@ export class Introspector {
     params: [string, string][],
     startedAt: number,
   ): Promise<IntrospectionResult> {
-    const result = await observe(this.deps, "introspection", async () => {
+    let result: IntrospectionResult;
+    try {
+      result = await this.ask(token, hint, params);
+    } catch (err) {
+      // The provider turned this client away. That is not an outage, so no entry
+      // may stand in for it later: a request that times out a moment after a 401
+      // must not be answered with the active answer cached before the 401.
+      if (err instanceof IdentityUnavailableError && err.reason === "client_rejected") this.entries.delete(key);
+      throw err;
+    }
+    this.store(key, result, startedAt);
+    return result;
+  }
+
+  private ask(token: string, hint: string | undefined, params: [string, string][]): Promise<IntrospectionResult> {
+    return observe(this.deps, "introspection", async () => {
       const url = await this.endpoints.introspection();
       const form = new URLSearchParams({ token });
       if (hint) form.set("token_type_hint", hint);
@@ -215,8 +231,6 @@ export class Introspector {
       if (!raw.active) return { value: INACTIVE as IntrospectionResult, outcome: "inactive" as const };
       return { value: parseActive(raw) as IntrospectionResult, outcome: "ok" as const };
     });
-    this.store(key, result, startedAt);
-    return result;
   }
 
   private store(key: string, result: IntrospectionResult, startedAt: number): void {

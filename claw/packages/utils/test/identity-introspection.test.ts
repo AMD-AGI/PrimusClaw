@@ -391,6 +391,31 @@ test("a refusal of the client's own credentials is not an outage and is not cove
   }
 });
 
+test("after the client is refused, a later outage does not serve the entry cached before the refusal", async () => {
+  for (const [name, status, later] of [
+    ["401 then 503", 401, { status: 503, body: "" }],
+    ["403 then 503", 403, { status: 503, body: "" }],
+    ["401 then a timeout-like drop", 401, { destroy: true }],
+  ] as const) {
+    await seeded({}, async ({ fake, clock, metrics, client }) => {
+      clock.advance(31_000);                      // the entry is stale: the next call goes upstream
+      fake.introspect = () => ({ status, body: { error: "invalid_client" } });
+      await assert.rejects(introspect(client), unavailable("client_rejected", status), name);
+      fake.introspect = () => later;
+      await assert.rejects(introspect(client), (err: unknown) => {
+        assert.ok(err instanceof IdentityUnavailableError, `${name}: served ${String(err)}`);
+        assert.notEqual(err.reason, "client_rejected");
+        return true;
+      }, name);
+      assert.equal(metrics.staleCount("introspection"), 0, name);
+      // Dropped, not merely not served once: with the provider back, the credential is asked about afresh.
+      fake.introspect = () => ({ body: activeAnswer() });
+      assert.equal((await introspect(client)).active, true);
+      assert.equal(fake.count("/oauth/introspect"), 4, name);
+    });
+  }
+});
+
 test("when the upstream recovers the next answer replaces the stale one", async () => {
   await seeded({}, async ({ fake, clock, client }) => {
     fake.introspect = () => ({ status: 503, body: "" });
