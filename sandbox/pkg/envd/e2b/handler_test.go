@@ -122,6 +122,20 @@ func TestConnectStartFilesAndSignal(t *testing.T) {
 	_ = denied.Body.Close()
 }
 
+func TestFilesystemErrorOmitsTheContainerPath(t *testing.T) {
+	ws := t.TempDir()
+	mux := http.NewServeMux()
+	Mount(mux, ws, execStarter(ws))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	resp := postRaw(t, srv.URL+"/filesystem.Filesystem/Stat", "application/proto", appendString(nil, 1, "/in/sub"))
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusNotFound || strings.Contains(string(body), ws) || strings.Contains(string(body), "/app") {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	}
+}
+
 func TestEnvelopedStart(t *testing.T) {
 	ws := t.TempDir()
 	mux := http.NewServeMux()

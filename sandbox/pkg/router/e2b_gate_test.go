@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -141,6 +142,98 @@ func gateRequest(t *testing.T, rawURL, token string) gateResult {
 		t.Fatal(err)
 	}
 	return gateResult{code: resp.StatusCode, body: string(body)}
+}
+
+func TestE2BGateRejectsSealedDirectoryReads(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var hits atomic.Int32
+	var gotBody string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer up.Close()
+	host, portStr, err := net.SplitHostPort(up.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheme := runtime.NewScheme()
+	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&runtimev1alpha1.SandboxGrant{}).Build()
+	token := "sat_dir"
+	g := &runtimev1alpha1.SandboxGrant{ObjectMeta: metav1.ObjectMeta{Name: "gr-dir", Namespace: "ns"}}
+	if err := cl.Create(context.Background(), g); err != nil {
+		t.Fatal(err)
+	}
+	g.Status.Sandboxes = []runtimev1alpha1.GrantSandboxRef{{
+		ID: "sbx-1", Role: "measurement", State: runtimev1alpha1.SandboxRunning,
+		AccessTokenHash: grant.HashKey(token), Sealed: true,
+		Inputs: []string{"/in"}, Outputs: []string{"/out"},
+	}}
+	if err := cl.Status().Update(context.Background(), g); err != nil {
+		t.Fatal(err)
+	}
+	st := store.NewMemoryStore()
+	if err := st.StoreSandbox(context.Background(), &store.SandboxInfo{
+		SessionID: "sbx-1", PodIP: host, PodPort: port, Status: "running",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{store: st, grants: grant.New(grant.Options{Client: cl, Namespace: "ns", Now: time.Now})}
+	srv.engine = gin.New()
+	srv.engine.Use(srv.e2bAccessGate)
+	front := httptest.NewServer(srv.engine)
+	defer front.Close()
+
+	denied := []struct{ path, body string }{
+		{"/filesystem.Filesystem/ListDir", `{"path":"/in"}`},
+		{"/filesystem.Filesystem/Stat", `{"path":"/in/.."}`},
+		{"/filesystem.Filesystem/ListDir", `{"path":"/"}`},
+		{"/filesystem.Filesystem/Stat", `{"path":"/work"}`},
+	}
+	for _, tc := range denied {
+		before := hits.Load()
+		code, respBody := postGate(t, front.URL+tc.path, token, "application/json", []byte(tc.body))
+		if code != http.StatusForbidden || !strings.Contains(respBody, "sealed_denied") || hits.Load() != before {
+			t.Fatalf("%s %s status=%d hits=%d body=%s", tc.path, tc.body, code, hits.Load(), respBody)
+		}
+		if strings.Contains(respBody, "/app") {
+			t.Fatalf("container path leaked: %s", respBody)
+		}
+	}
+	code, respBody := postGate(t, front.URL+"/filesystem.Filesystem/ListDir", token, "application/json", []byte(`{"path":"/out"}`))
+	if code != http.StatusNoContent || hits.Load() != 1 || !strings.Contains(gotBody, "/out") {
+		t.Fatalf("allowed status=%d hits=%d upstream=%s body=%s", code, hits.Load(), gotBody, respBody)
+	}
+}
+
+func postGate(t *testing.T, rawURL, token, contentType string, body []byte) (int, string) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, rawURL, strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("E2b-Sandbox-Id", "sbx-1")
+	req.Header.Set("X-Access-Token", token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp.StatusCode, string(raw)
 }
 
 func claimList(value any) string {

@@ -323,16 +323,17 @@ func fsErr(err error) error {
 	if err == nil {
 		return nil
 	}
+	// The operating-system error names the resolved container path.
 	if os.IsNotExist(err) {
-		return rpcErr("not_found", err.Error())
+		return rpcErr("not_found", "path does not exist")
 	}
 	if os.IsPermission(err) {
-		return rpcErr("permission_denied", err.Error())
+		return rpcErr("permission_denied", "path is not permitted")
 	}
 	if os.IsExist(err) {
-		return rpcErr("already_exists", err.Error())
+		return rpcErr("already_exists", "path already exists")
 	}
-	return rpcErr("internal", err.Error())
+	return rpcErr("internal", "filesystem request failed")
 }
 
 func encodeEntry(ent fileEntry) []byte {

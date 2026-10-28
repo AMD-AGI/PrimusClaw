@@ -10,6 +10,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"math"
@@ -188,6 +189,63 @@ func (allowIdentity) Check(context.Context, string, string) (string, error) { re
 type allowMember struct{}
 
 func (allowMember) Check(context.Context, string, []string) error { return nil }
+
+func TestOriginalCreateReportsFailureBeforeReplay(t *testing.T) {
+	cases := []struct {
+		name string
+		fail error
+		want string
+	}{
+		{name: "workload failed", fail: errors.New("workload sbx-1 phase Failed: allocation generation is Lost"), want: "Lost"},
+		{name: "pending timeout", fail: context.DeadlineExceeded, want: "deadline exceeded"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, runner, keys := testPlane(t, 600, []int32{1}, 1)
+			runner.fail = tc.fail
+			body := CreateBody{TemplateID: "runner", Timeout: 60, Metadata: map[string]string{idempotencyMetadataKey: "once"}}
+			_, _, err := svc.Create(context.Background(), keys["measurement"], body)
+			var oe *grant.OpError
+			if !errors.As(err, &oe) || oe.Status != http.StatusInternalServerError || oe.Reason != "sandbox_create_failed" || !strings.Contains(oe.Detail, tc.want) {
+				t.Fatalf("create=%v", err)
+			}
+			_, _, err = svc.Create(context.Background(), keys["measurement"], body)
+			if !errors.As(err, &oe) || oe.Status != http.StatusGone || oe.Reason != "idempotency_key_spent" {
+				t.Fatalf("replay=%v", err)
+			}
+		})
+	}
+}
+
+func TestSealedFilesystemReadFollowsOutputs(t *testing.T) {
+	inputs, outputs := []string{"/in"}, []string{"/out"}
+	for _, filePath := range []string{"/in", "/in/..", "/", "/work", "/out/../in"} {
+		body := []byte(`{"path":"` + filePath + `"}`)
+		if SealedFilesystemRead("application/json", body, inputs, outputs) {
+			t.Fatalf("json read allowed: %s", filePath)
+		}
+		if SealedFilesystemRead("application/connect+proto", connectPath(filePath), inputs, outputs) {
+			t.Fatalf("proto read allowed: %s", filePath)
+		}
+	}
+	if !SealedFilesystemRead("application/json", []byte(`{"path":"/out"}`), inputs, outputs) {
+		t.Fatal("output root denied")
+	}
+	if !SealedFilesystemRead("application/connect+proto", connectPath("/out/a"), inputs, outputs) {
+		t.Fatal("output child denied")
+	}
+	if SealedFilesystemRead("application/json", []byte("{"), inputs, outputs) {
+		t.Fatal("malformed body allowed")
+	}
+}
+
+func connectPath(filePath string) []byte {
+	msg := append([]byte{0x0a, byte(len(filePath))}, filePath...)
+	out := make([]byte, 5+len(msg))
+	binary.BigEndian.PutUint32(out[1:5], uint32(len(msg)))
+	copy(out[5:], msg)
+	return out
+}
 
 func TestReplayWaitsWhilePending(t *testing.T) {
 	svc, runner, keys := testPlane(t, 600, []int32{1}, 1)
