@@ -10,6 +10,7 @@ import { db, MarketplaceDb } from "../infra/db.js";
 import { resolveTaskPlugin } from "../marketplace/plugins.js";
 
 import { buildMessages } from "../sessions/context-builder.js";
+import { sessionModelFromRow } from "../sessions/session-model.js";
 import { maybeExtractMemory, insertMemoryEntry, isMemoryActive, scanMemoryContent, maybeUpdateUserProfile } from "../memory/service.js";
 import {
   saveSkill, recordSkillFeedback,
@@ -1252,8 +1253,12 @@ export async function drainOldestPendingMessage(
   sessionId: string,
   userId: string,
 ): Promise<void> {
+  // `session_model` is read with the row rather than stored on it: the message
+  // may have waited behind a long turn, and the model that applies is the one the
+  // session has when the message is sent on, which is what a change "from the next
+  // turn" means for a turn that was already parked.
   const pending = (await db.query(
-  "SELECT id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology FROM claw_pending_messages WHERE session_id = $1 ORDER BY created_at LIMIT 1",
+  "SELECT id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology, (SELECT model FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_model FROM claw_pending_messages WHERE session_id = $1 ORDER BY created_at LIMIT 1",
   [sessionId],
 )).rows[0];
 
@@ -1338,6 +1343,10 @@ if (pending) {
     session_env: pendingSessionEnv && Object.keys(pendingSessionEnv).length ? pendingSessionEnv : undefined,
     topology: asJsonObject(pending.topology),
   };
+  // Same rule as the immediate path in sessions/dispatch.ts: no field at all for
+  // a session with no choice, so Brain falls back on its own default.
+  const pendingModel = sessionModelFromRow({ model: pending.session_model });
+  if (pendingModel) task.model = pendingModel;
   const credentialsReadable = await applyPendingCredentials(task, pending, {
     sessionId, userId: pendingUserId, messageId: pendingMessageId,
   });

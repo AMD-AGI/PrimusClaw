@@ -28,6 +28,16 @@ record it.
 ## [Unreleased]
 
 ### Added
+- A session can choose its own model. `POST /v1/sessions` accepts an optional `model`,
+  `PATCH /v1/sessions/:id` accepts `model` (a string, or `null` to go back to the default) alone or
+  beside `name`, and `GET /v1/sessions/:id` and the session list report it (`null` is the
+  deployment's `DEFAULT_MODEL`). Every LLM call of the session's turns -- the loop, its sub-agents and
+  compaction -- uses it, a change applies from the next turn (a message already parked behind a running
+  turn is sent on the model the session has when it is sent on), and the key that pays is still the
+  asking user's. The name is checked for shape only (non-empty, at most 128 characters,
+  `[A-Za-z0-9._:/-]`): the gateway decides which models exist, and a name it refuses comes back as the
+  gateway's error on the turn. `HITL_SUMMARY_MODEL` and the memory model are not affected. The column
+  (`claw_sessions.model`) is added by the same idempotent start-up migration as the others.
 - `HITL_SUMMARY_MODEL` names the model that writes an approval card's one-sentence summary, so a
   small, fast model can do it instead of the run's own reasoning model, which could not answer inside
   `HITL_SUMMARY_TIMEOUT_MS`. Unset keeps the run's own model. The call authenticates with the key the run
