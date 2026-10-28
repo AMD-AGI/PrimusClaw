@@ -4,6 +4,10 @@
 export { IdentityClient, IDENTITY_DEFAULTS, type IdentityClientSettings } from "./client.js";
 export { readIdentityConfig, type IdentityConfig } from "./config.js";
 export {
+  buildIdentityClient, startIdentityClient,
+  type IdentityProcessMetrics, type IdentityStartupLog,
+} from "./startup.js";
+export {
   IdentityExchangeRefusedError, IdentityUnavailableError, JwtVerificationError,
   type JwtFailure, type UnavailableReason,
 } from "./errors.js";
