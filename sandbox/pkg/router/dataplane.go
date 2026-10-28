@@ -185,6 +185,9 @@ func (s *Server) handleDataPlaneHop(c *gin.Context) {
 	if suffix == "" {
 		suffix = "/"
 	}
+	if !hopSealedAllows(c, suffix, ref) {
+		return
+	}
 	c.Request.URL.Path = suffix
 	c.Request.URL.RawPath = ""
 	c.Request.RequestURI = suffix
@@ -208,6 +211,9 @@ func (s *Server) handleLocalEnvD(c *gin.Context) {
 		writeGate(c, http.StatusUnauthorized, "invalid_token", "hop token is not valid for this cluster")
 		return
 	}
+	if !hopSealedAllows(c, c.Request.URL.Path, ref) {
+		return
+	}
 	info, err := s.localSandbox(c.Request.Context(), ref.ID)
 	if err != nil || info == nil || info.PodIP == "" {
 		writeGate(c, http.StatusBadGateway, "sandbox_unavailable", ref.ID)
@@ -215,6 +221,20 @@ func (s *Server) handleLocalEnvD(c *gin.Context) {
 	}
 	c.Request.Header.Set("E2b-Sandbox-Id", ref.ID)
 	s.proxyEnvD(c, info, ref)
+}
+
+// hopSealedAllows applies the sealed allow-list carried by a verified hop token
+// to the envd path. A denied request is answered with 403.
+func hopSealedAllows(c *gin.Context, path string, ref runtimev1alpha1.GrantSandboxRef) bool {
+	rawPath := path
+	if c.Request.URL.RawQuery != "" {
+		rawPath += "?" + c.Request.URL.RawQuery
+	}
+	if e2b.SealedAllows(c.Request.Method, rawPath, ref.Sealed, ref.Inputs, ref.Outputs) {
+		return true
+	}
+	writeGate(c, http.StatusForbidden, "sealed_denied", "path is outside the sealed allow-list")
+	return false
 }
 
 // envdProxyPath strips a hop prefix so envd sees /files or /process.Process/Start.

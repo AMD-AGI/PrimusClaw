@@ -5,6 +5,7 @@ package router
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -208,10 +209,11 @@ func TestSealedDenyDoesNotForward(t *testing.T) {
 func TestDataPlaneEnvDPathReachesEnvD(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	globalJWT := mustJWT(t)
-	var gotPath, gotSealed string
+	var gotPath, gotAuth, gotSealedHeader string
 	envd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
-		gotSealed = r.Header.Get("X-Sandbox-Sealed")
+		gotAuth = r.Header.Get("Authorization")
+		gotSealedHeader = r.Header.Get("X-Sandbox-Sealed")
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer envd.Close()
@@ -224,13 +226,18 @@ func TestDataPlaneEnvDPathReachesEnvD(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	token, err := globalJWT.generateHopToken("sbx-1", "crusoe", true, []string{"/in"}, []string{"/out"})
+	sealedToken, err := globalJWT.generateHopToken("sbx-1", "crusoe", true, []string{"/in"}, []string{"/out"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	openToken, err := globalJWT.generateHopToken("sbx-1", "crusoe", false, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	front := httptest.NewServer(crusoe.engine)
 	defer front.Close()
-	for _, path := range []string{"/files?path=/out/a", "/process.Process/Start"} {
+	send := func(path, token string, want int) {
+		t.Helper()
 		req, err := http.NewRequest(http.MethodPost, front.URL+path, nil)
 		if err != nil {
 			t.Fatal(err)
@@ -242,12 +249,48 @@ func TestDataPlaneEnvDPathReachesEnvD(t *testing.T) {
 		}
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if resp.StatusCode != http.StatusNoContent || strings.Contains(string(body), "page not found") {
+		if resp.StatusCode != want || strings.Contains(string(body), "page not found") {
 			t.Fatalf("%s status=%d body=%s", path, resp.StatusCode, body)
 		}
 	}
-	if gotPath != "/process.Process/Start" || gotSealed != "true" {
-		t.Fatalf("path=%s sealed=%s", gotPath, gotSealed)
+	send("/process.Process/Start", openToken, http.StatusNoContent)
+	if gotPath != "/process.Process/Start" {
+		t.Fatalf("path=%s", gotPath)
+	}
+	gotPath = ""
+	send("/process.Process/Start", sealedToken, http.StatusForbidden)
+	if gotPath != "" {
+		t.Fatalf("sealed process call reached envd: %s", gotPath)
+	}
+	send("/files?path=/out/a", sealedToken, http.StatusForbidden)
+	send("/files?path=/in/a", sealedToken, http.StatusNoContent)
+	if gotPath != "/files" || gotSealedHeader != "" {
+		t.Fatalf("path=%s sealedHeader=%s", gotPath, gotSealedHeader)
+	}
+	parsed, err := jwt.Parse(strings.TrimPrefix(gotAuth, "Bearer "), func(token *jwt.Token) (any, error) {
+		return crusoe.jwt.publicKey, nil
+	}, jwt.WithValidMethods([]string{"RS256"}))
+	if err != nil || !parsed.Valid {
+		t.Fatalf("envd token: %v", err)
+	}
+	claims, _ := parsed.Claims.(jwt.MapClaims)
+	if claims["sealed"] != true || fmtClaim(claims["inputs"]) != "/in" || fmtClaim(claims["outputs"]) != "/out" {
+		t.Fatalf("claims=%v", claims)
+	}
+}
+
+func fmtClaim(v any) string {
+	switch item := v.(type) {
+	case string:
+		return item
+	case []any:
+		parts := make([]string, 0, len(item))
+		for _, one := range item {
+			parts = append(parts, fmt.Sprint(one))
+		}
+		return strings.Join(parts, ",")
+	default:
+		return ""
 	}
 }
 
