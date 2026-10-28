@@ -101,6 +101,8 @@ export function readExitCommand(stateDir: string): string {
 
 /** Seconds are not needed: a holder that is alive is told by its pid, not by the clock. */
 const START_LOCK = ".start.lock";
+/** Held only while a stale {@link START_LOCK} is being removed. */
+const BREAK_LOCK = ".start.lock.break";
 
 /**
  * Start the application detached, unless it is already running here.
@@ -112,9 +114,9 @@ const START_LOCK = ".start.lock";
  *
  *  - A symlink is the lock (creating one is atomic and writes its holder). A contender prints `busy` and leaves the
  *    decision to the next tick's probe. A lock whose holder is no longer alive is
- *    taken over. Known limit: two contenders taking over the same dead lock at
- *    the same instant can both proceed; closing that needs `flock`, which the
- *    sandbox images are not guaranteed to have.
+ *    taken over, through a second symlink that only one contender can hold, so
+ *    two contenders taking over the same dead lock cannot both proceed and a
+ *    fresh lock is never removed as stale (no `flock`: the images need not have it).
  *  - Under the lock, a live process of this sandbox, whatever its restart
  *    generation, means `already`: the marker is moved to this generation, so the
  *    probe agrees with reality, and nothing is launched.
@@ -139,7 +141,19 @@ export function startCommand(manifest: AppManifestV1, stateDir: string, tag: str
     `if ! ln -s "$$|"${shq(workload)} ${START_LOCK} 2>/dev/null; then`,
     `  held=$(readlink ${START_LOCK} 2>/dev/null); holder=\${held%%|*}; lockwl=\${held#*|}`,
     `  if [ -n "$held" ] && [ "$lockwl" = ${shq(workload)} ] && kill -0 "$holder" 2>/dev/null; then echo busy; exit 0; fi`,
-    `  rm -rf ${START_LOCK}; ln -s "$$|"${shq(workload)} ${START_LOCK} 2>/dev/null || { echo busy; exit 0; }`,
+    // Breaking a stale lock is itself serialised: `rm -rf` of a lock judged stale a moment ago can
+    // delete a fresh lock another contender created in between, and then both proceed. Only the
+    // holder of the break link may remove the lock, and only while it is still the very one judged stale.
+    `  if ! ln -s "$$|"${shq(workload)} ${BREAK_LOCK} 2>/dev/null; then`,
+    `    bheld=$(readlink ${BREAK_LOCK} 2>/dev/null); bholder=\${bheld%%|*}; bwl=\${bheld#*|}`,
+    `    if [ -n "$bheld" ] && [ "$bwl" = ${shq(workload)} ] && kill -0 "$bholder" 2>/dev/null; then echo busy; exit 0; fi`,
+    `    rm -f ${BREAK_LOCK}; ln -s "$$|"${shq(workload)} ${BREAK_LOCK} 2>/dev/null || { echo busy; exit 0; }`,
+    `  fi`,
+    `  now=$(readlink ${START_LOCK} 2>/dev/null)`,
+    `  if [ "$now" = "$held" ]; then rm -rf ${START_LOCK}; fi`,
+    `  ln -s "$$|"${shq(workload)} ${START_LOCK} 2>/dev/null; got=$?`,
+    `  rm -f ${BREAK_LOCK}`,
+    `  if [ "$got" -ne 0 ]; then echo busy; exit 0; fi`,
     `fi`,
     `trap 'rm -rf ${START_LOCK}' EXIT`,
     `marker=$(cat ${MARKER_FILE} 2>/dev/null)`,
