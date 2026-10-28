@@ -6,6 +6,7 @@ import {
   DEFAULT_BRAIN_REGISTRY_TTL_MS,
   DEFAULT_RUN_LEASE_HEARTBEAT_MS,
   DEFAULT_RUN_LEASE_TTL_MS,
+  DEFAULT_SANDBOX_IDLE_REUSE_SECONDS,
   DEFAULT_TASK_MAX_ACK_PENDING,
   DEFAULT_TASK_MAX_DELIVER,
   MIN_RENEWAL_INTERVAL_MS,
@@ -216,6 +217,20 @@ export const SESSION_SANDBOX_HOLD_MS = Math.min(
   envInt("SESSION_SANDBOX_HOLD_SECONDS", 300, { min: 30 }) * 1000,
   BRAIN_REGISTRY_TTL_MS,
 );
+
+// --- How long an idle sandbox stays reusable ---
+// Brain's setting, read here under the same name and default because the orphan
+// sweep has to agree with Brain about when an idle sandbox stops being worth
+// keeping: a sweep that reaps earlier than Brain would reclaim defeats the reuse
+// window, one that reaps later only delays a reclaim Brain already owns. Both
+// deployments take primus-claw-secrets, so one operator value reaches both.
+//
+// This is the capacity knob for parked sandboxes. Each one holds a workload slot
+// for up to this long after the session's last turn; lowering it returns the slot
+// sooner and makes more turns cold-start (10-15 s), raising it does the reverse.
+export const SANDBOX_IDLE_REUSE_MS = envInt(
+  "SANDBOX_IDLE_REUSE_SECONDS", DEFAULT_SANDBOX_IDLE_REUSE_SECONDS, { min: 1 },
+) * 1000;
 
 // Replica counts for the KV buckets this process creates, read from the same
 // variables brain reads for the two it shares -- same reasoning as the TTL

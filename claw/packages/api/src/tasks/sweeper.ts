@@ -260,7 +260,7 @@ async function resolveLiveWorkHoldings(sessionId: string): Promise<SessionHoldin
  */
 function bindingNamesOneOf(bg: SessionBackgroundWork): boolean | "unknown" {
   if (bg.state === "unreadable") return "unknown";
-  if (bg.state === "running" || bg.state === "awaiting") return true;
+  if (bg.state === "running" || bg.state === "awaiting" || bg.state === "reusable") return true;
   return bg.reason !== "no_binding" && bg.reason !== "other_sandbox"
     && bg.reason !== "no_workload";
 }
@@ -2529,6 +2529,23 @@ export async function reapOrphanHandles(lease?: LeaderLease): Promise<number> {
         logger.info(
           { dagRoot, sessionId, workloadId: bg.workloadId, running: bg.running, measuredAt: bg.at },
           "sweeper.orphan_handles_background_work",
+        );
+        deferred++;
+        continue;
+      }
+      // A finished turn leaves its sandbox parked for the session's next message
+      // (Brain's SANDBOX_IDLE_REUSE_SECONDS). The DAG row being terminal and
+      // nothing running inside is the normal state of such a sandbox, not
+      // evidence that it is an orphan: reaping on it threw the sandbox away
+      // 56-90 s after each turn and cold-started the next one. Deferred until
+      // the window closes, and then reaped by the rules below like any other.
+      if (bg.state === "reusable") {
+        logger.info(
+          {
+            dagRoot, sessionId, workloadId: bg.workloadId,
+            idleForMs: bg.idleForMs, remainingMs: bg.remainingMs,
+          },
+          "sweeper.orphan_handles_reuse_window",
         );
         deferred++;
         continue;

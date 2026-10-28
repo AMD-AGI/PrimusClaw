@@ -56,6 +56,12 @@ const platformDefaultTotal = new Counter({
   labelNames: ["kind", "outcome", "reason"] as const,
   registers: [registry],
 });
+const skillStageTotal = new Counter({
+  name: "claw_skill_stage_total",
+  help: "Skills staged on Brain for a turn, by source and where the files came from (cache hit, a download shared with a concurrent turn, or a fresh download).",
+  labelNames: ["source", "outcome"] as const,
+  registers: [registry],
+});
 const platformDefaultChatsTotal = new Counter({
   name: "claw_platform_default_chats_total",
   help: "Chats that were offered at least one platform-default skill.",
@@ -663,6 +669,10 @@ export const metrics = {
   /** One platform-default item resolved, skipped or failed. */
   onPlatformDefault(kind: "skill" | "mcp" | "config", outcome: "ok" | "failed" | "skipped", reason: string): void {
     platformDefaultTotal.inc({ kind, outcome, reason });
+  },
+  /** One skill staged for a turn: `outcome` says whether its files were downloaded. */
+  onSkillStage(source: "plugin" | "tool", outcome: "hit" | "joined" | "downloaded"): void {
+    skillStageTotal.inc({ source, outcome });
   },
   /** A chat whose prompt carries a progressive platform-skill list. */
   onPlatformDefaultChat(listChars: number): void {

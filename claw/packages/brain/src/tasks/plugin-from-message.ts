@@ -7,6 +7,7 @@
  * No DB or HTTP plugin API — API must send `plugin_tools` on ExecuteRequest.
  */
 
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -22,6 +23,8 @@ import {
   S3_FORCE_PATH_STYLE,
 } from "../config.js";
 import { isSafeRelativePath } from "../sandbox/write.js";
+import { metrics } from "../infra/metrics.js";
+import { skillCache, type StageOutcome } from "../tools/skill-cache.js";
 import type { HandsClient } from "../clients/hands.js";
 import { PLUGIN_TOOLS_MISSING, UNAVAILABLE_RULES, bashApprovalFromToolConfig } from "../agent/bash-approval.js";
 import {
@@ -243,21 +246,101 @@ function findSkillMd(dir: string): string | null {
   return null;
 }
 
+/** Where a plugin skill lives in the object store: a prefix of files, or one object. */
+function pluginSkillSource(cfg: Record<string, unknown>, s3Key: string): { isPrefix: boolean; prefix: string } {
+  const isPrefix = cfg.is_prefix === true || s3Key.endsWith("/");
+  return { isPrefix, prefix: isPrefix ? (s3Key.endsWith("/") ? s3Key : `${s3Key}/`) : s3Key };
+}
+
 async function downloadPluginSkill(
   cfg: Record<string, unknown>,
   s3Key: string,
   skillDir: string,
 ): Promise<void> {
   fs.mkdirSync(skillDir, { recursive: true });
-  const isPrefix = cfg.is_prefix === true || s3Key.endsWith("/");
+  const { isPrefix, prefix } = pluginSkillSource(cfg, s3Key);
   const bucket = S3_PLUGINS_BUCKET;
   if (isPrefix) {
-    const prefix = s3Key.endsWith("/") ? s3Key : `${s3Key}/`;
     await syncS3PrefixToLocal(prefix, skillDir, bucket);
   } else {
     const outPath = path.join(skillDir, path.basename(s3Key));
     await downloadS3File(s3Key, outPath, bucket);
   }
+}
+
+/**
+ * What the object store says a plugin skill is right now: one listing, no
+ * bodies. The hash covers every object's key, ETag and size, so a skill that is
+ * rewritten in place under the same key and the same version string (an upsert
+ * of the same version) changes it, which `s3_key` alone never would.
+ *
+ * Null when it cannot be told: an empty listing, an object listed without an
+ * ETag (a store that does not report one), or a listing that failed. The caller
+ * then downloads, so a failed check is never read as "unchanged". Never rejects.
+ */
+async function pluginSkillFingerprint(
+  toolId: number,
+  cfg: Record<string, unknown>,
+  s3Key: string,
+): Promise<string | null> {
+  try {
+    const { isPrefix, prefix } = pluginSkillSource(cfg, s3Key);
+    const resp = await getS3().send(new ListObjectsV2Command({ Bucket: S3_PLUGINS_BUCKET, Prefix: prefix }));
+    // A single-object skill lists by its own key as the prefix; take only that key.
+    const objects = (resp.Contents ?? []).filter((o) => isPrefix || o.Key === s3Key);
+    if (!objects.length || objects.some((o) => !o.Key || !o.ETag)) return null;
+    const hash = createHash("sha256");
+    for (const o of [...objects].sort((a, b) => (a.Key! < b.Key! ? -1 : 1))) {
+      hash.update(`${o.Key}\t${o.ETag!.replace(/^W\//, "").replaceAll('"', "")}\t${o.Size ?? ""}\n`);
+    }
+    return hash.digest("hex");
+  } catch (err) {
+    logger.warn({ err, toolId, s3Key }, "plugin.skill.fingerprint_failed");
+    return null;
+  }
+}
+
+/**
+ * Start every skill's validating listing at once, so a plugin with a dozen
+ * skills spends one round trip on them instead of a dozen in a row. Purely a
+ * head start: `stagePluginSkill` lists for itself any skill that is not here.
+ */
+function prefetchSkillFingerprints(items: unknown[]): Map<number, Promise<string | null>> {
+  const out = new Map<number, Promise<string | null>>();
+  if (!skillCache.enabled) return out;
+  for (const item of items) {
+    const tool = item as PluginToolRow | null;
+    if (!tool || typeof tool !== "object" || typeof tool.id !== "number") continue;
+    if (String(tool.type || "").toLowerCase() !== "skill") continue;
+    const cfg = (tool.config ?? {}) as Record<string, unknown>;
+    if (typeof cfg.s3_key === "string" && cfg.s3_key) out.set(tool.id, pluginSkillFingerprint(tool.id, cfg, cfg.s3_key));
+  }
+  return out;
+}
+
+/**
+ * Put a plugin skill's files into `skillDir`, downloading them only when this
+ * process does not already hold the bytes the object store has now (see
+ * tools/skill-cache.ts). `onDownload` runs just before a download starts, so a
+ * turn that is served from the cache reports no download.
+ */
+async function stagePluginSkill(
+  toolId: number,
+  cfg: Record<string, unknown>,
+  s3Key: string,
+  skillDir: string,
+  prefetched: Promise<string | null> | undefined,
+  onDownload: () => Promise<void>,
+): Promise<StageOutcome> {
+  const fingerprint = skillCache.enabled ? await (prefetched ?? pluginSkillFingerprint(toolId, cfg, s3Key)) : null;
+  const key = `plugin:${toolId}:${pluginSkillSource(cfg, s3Key).prefix}`;
+  const outcome = await skillCache.stage(key, fingerprint, skillDir, async (dir) => {
+    await onDownload();
+    await downloadPluginSkill(cfg, s3Key, dir);
+    return findSkillMd(dir) !== null;
+  });
+  metrics.onSkillStage("plugin", outcome);
+  return outcome;
 }
 
 /**
@@ -428,6 +511,7 @@ export async function resolvePluginToolsFromMessage(
   }
 
   const stageRoot = createPrivateStagingRoot(workRoot);
+  const fingerprints = prefetchSkillFingerprints(raw);
 
   for (const item of raw) {
     // A declared tool we cannot read may carry bash approval rules: hold bash.
@@ -470,7 +554,8 @@ export async function resolvePluginToolsFromMessage(
           : skillNameFromS3Key(s3Key, String(tool.id));
       const skillDir = path.join(stageRoot, "skills", name);
       try {
-        if (onEvent) {
+        const staged = await stagePluginSkill(tool.id, cfg, s3Key, skillDir, fingerprints.get(tool.id), async () => {
+          if (!onEvent) return;
           await onEvent({
             type: "toolUsed",
             tool: "download_skill",
@@ -478,8 +563,7 @@ export async function resolvePluginToolsFromMessage(
             status: "running",
             brief: `Downloading plugin skill: ${name}`,
           });
-        }
-        await downloadPluginSkill(cfg, s3Key, skillDir);
+        });
         const skillMdPath = findSkillMd(skillDir);
         if (!skillMdPath) {
           logger.warn({ toolId: tool.id, name, skillDir }, "plugin.skill.no_SKILL_md");
@@ -498,7 +582,9 @@ export async function resolvePluginToolsFromMessage(
         skillDirs[name] = path.dirname(skillMdPath);
         skillToolIds[name] = tool.id;
 
-        if (onEvent) {
+        // A skill served from memory was not downloaded, so there is no
+        // download to report (and none was announced above).
+        if (onEvent && staged === "downloaded") {
           await onEvent({
             type: "toolUsed",
             tool: "download_skill",
