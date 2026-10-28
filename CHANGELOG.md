@@ -28,6 +28,12 @@ record it.
 ## [Unreleased]
 
 ### Added
+- `HITL_SUMMARY_MODEL` names the model that writes an approval card's one-sentence summary, so a
+  small, fast model can do it instead of the run's own reasoning model, which could not answer inside
+  `HITL_SUMMARY_TIMEOUT_MS`. Unset keeps the run's own model. The call authenticates with the key the run
+  itself uses (the asking user's, or the platform key in proxy mode), so the tokens are billed as the
+  run's are. A model that key may not call (401/403/404) leaves the card without a summary and counts
+  `claw_brain_approval_summary_model_refused_total`; it never falls back to another key.
 - A `permissionRequest` now says in words what the call is, so an approval card
   can show something a person can judge instead of a raw request body:
   `tool_description` (the tool's own first sentence), `intent` (what the agent

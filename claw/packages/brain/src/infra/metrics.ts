@@ -644,6 +644,16 @@ const sessionCleanupIncompleteTotal = new Counter({
   registers: [registry],
 });
 
+// The approval summary's own model (HITL_SUMMARY_MODEL) was refused by the gateway for the run's key.
+// The card goes out without a summary; this is how an operator learns that some users' keys cannot call
+// the model that was configured. Steady state is 0.
+const approvalSummaryModelRefusedTotal = new Counter({
+  name: "claw_brain_approval_summary_model_refused_total",
+  help: "Runs whose approval-summary model the gateway refused for the run's key, by HTTP status.",
+  labelNames: ["status"] as const,
+  registers: [registry],
+});
+
 // ─── Keepalive idle reclaim: destroys and the holds that refused them ─
 // A destroy from the jobs probe used to need one reading; now it needs several
 // agreeing ones and a quiet window after any failure. The pair says how often
@@ -847,6 +857,10 @@ export const metrics = {
    */
   onSessionCleanupIncomplete(reason: SessionCleanupIncompleteReason): void {
     sessionCleanupIncompleteTotal.inc({ reason });
+  },
+
+  onApprovalSummaryModelRefused(status: number): void {
+    approvalSummaryModelRefusedTotal.inc({ status: String(status) });
   },
 
   // ─── Plan Y v2 checkpoint helpers ────────────────────────────────

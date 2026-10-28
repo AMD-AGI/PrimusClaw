@@ -509,7 +509,7 @@ export function buildOpenAiSession(
   return {
     streamTurn: (messages, tools, signal) =>
       streamingTurn(client, model, messages, tools, signal, capture, cacheState),
-      async complete(systemPrompt, userText, maxTokens, signal) {
+      async complete(systemPrompt, userText, maxTokens, signal, options) {
         const resp = await client.chat.completions.create({
           model,
           max_tokens: maxTokens,
@@ -517,6 +517,7 @@ export function buildOpenAiSession(
             { role: "system", content: systemPrompt },
             { role: "user", content: userText },
           ],
+          ...(options?.effort ? { reasoning_effort: options.effort } : {}),
         }, signal ? { signal } : undefined);
         const text = resp.choices[0]?.message?.content?.trim();
         if (!text) throw new Error("completion returned empty text");

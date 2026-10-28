@@ -146,7 +146,18 @@ export interface LlmSession {
   /** Non-streaming single-shot completion used for conversation compaction.
    *  Returns the plain summary text; throws on failure so the caller can
    *  fall back to the uncompacted messages. `signal` cancels the request. */
-  complete(systemPrompt: string, userText: string, maxTokens: number, signal?: AbortSignal): Promise<string>;
+  complete(
+    systemPrompt: string, userText: string, maxTokens: number, signal?: AbortSignal, options?: CompleteOptions,
+  ): Promise<string>;
+}
+
+/** Per-call knobs for `LlmSession.complete`. Absent means the gateway's own defaults, which is what every
+ *  caller before the approval summary got. */
+export interface CompleteOptions {
+  /** Ask a reasoning model to spend as little on thinking as it can. A short answer under a small
+   *  `maxTokens` otherwise comes back as thinking only, or late. Sent as the provider's own field
+   *  (Anthropic `output_config.effort`, OpenAI `reasoning_effort`). */
+  effort?: "low";
 }
 
 export interface LlmSessionOptions {
