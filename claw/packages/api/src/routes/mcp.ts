@@ -67,9 +67,9 @@ function promptApiBaseParam(defaultApiBase: string) {
 function createMcpServer(app: FastifyInstance, authHeader: string): McpServer {
   const mcp = new McpServer({ name: "PrimusClaw", version: "2.0.0" });
 
-  const injectHeaders: Record<string, string> = {
-    "content-type": "application/json",
-  };
+  // No content-type here: it is added per call, and only with a body (Fastify
+  // answers 400 to a bodyless request that claims a JSON body).
+  const injectHeaders: Record<string, string> = {};
   if (authHeader) injectHeaders["authorization"] = authHeader;
 
   async function api(
@@ -80,7 +80,7 @@ function createMcpServer(app: FastifyInstance, authHeader: string): McpServer {
     const resp = await app.inject({
       method,
       url,
-      headers: injectHeaders,
+      headers: payload !== undefined ? { ...injectHeaders, "content-type": "application/json" } : injectHeaders,
       ...(payload !== undefined ? { payload: JSON.stringify(payload) } : {}),
     });
     return unwrapInject(resp);
