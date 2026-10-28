@@ -37,6 +37,12 @@ type fakeRunner struct {
 	hold     chan struct{}
 	observed string
 	node     string
+	adopted  []time.Duration
+}
+
+func (f *fakeRunner) Adopt(_ context.Context, _ string, _ CreateResult, timeout time.Duration) error {
+	f.adopted = append(f.adopted, timeout)
+	return nil
 }
 
 func (f *fakeRunner) Create(ctx context.Context, req CreateRequest) (CreateResult, error) {
@@ -287,6 +293,40 @@ func TestReplayAdoptsARunningWorkload(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestPromotePendingAppliesTheTimeout(t *testing.T) {
+	svc, runner, keys := testPlane(t, 600, []int32{1}, 1)
+	started := make(chan struct{})
+	runner.started = started
+	runner.hold = make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := svc.Create(context.Background(), keys["measurement"], CreateBody{TemplateID: "runner", Timeout: 300})
+		done <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("create did not start")
+	}
+	refs, err := svc.grants.ListRoleSandboxes(context.Background(), "gr-01jb7m9k2x", "measurement")
+	if err != nil || len(refs) != 1 || refs[0].State != runtimev1alpha1.SandboxPending {
+		t.Fatalf("refs=%+v err=%v", refs, err)
+	}
+	runner.observed = WorkloadRunning
+	if err := svc.PromotePending(context.Background(), "gr-01jb7m9k2x", refs[0]); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.adopted) != 1 || runner.adopted[0] != 300*time.Second {
+		t.Fatalf("adopted=%v", runner.adopted)
+	}
+	ref, err := svc.grants.Sandbox(context.Background(), "gr-01jb7m9k2x", "measurement", refs[0].ID)
+	if err != nil || ref.State != runtimev1alpha1.SandboxRunning {
+		t.Fatalf("ref=%+v err=%v", ref, err)
+	}
+	close(runner.hold)
+	<-done
 }
 
 func TestSameNodeMarksOnlyAnAvoidedNode(t *testing.T) {

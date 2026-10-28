@@ -116,6 +116,59 @@ func TestSetTimeoutUpdatesWorkloadWithinCap(t *testing.T) {
 	}
 }
 
+func TestAdoptStoresTimeoutAndRunningSession(t *testing.T) {
+	st := store.NewMemoryStore()
+	now := time.Now().UTC().Truncate(time.Second)
+	started := now.Add(-90 * time.Second)
+	if err := st.StoreSandbox(context.Background(), &store.SandboxInfo{
+		SessionID: "sbx-1", SandboxName: "runner-pending", Namespace: "project1-dev",
+		CreatedAt: started, ExpiresAt: started.Add(time.Minute), Status: "creating", UserID: "u-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dc := dynfake.NewSimpleDynamicClientWithCustomListKinds(k8sruntime.NewScheme(), map[schema.GroupVersionResource]string{
+		workloadGVR: "WorkloadList",
+	})
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "amd.com/v1",
+		"kind":       "Workload",
+		"metadata":   map[string]any{"name": "sbx-1"},
+		"status":     map[string]any{"phase": "Running", "startTime": started.Format(time.RFC3339)},
+	}}
+	if _, err := dc.Resource(workloadGVR).Create(context.Background(), obj, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	srv := New(Config{Namespace: "ns"}, st).WithSafeWorkloads(NewSafeWorkloadCreator(dc, nil))
+	before := time.Now()
+	err := srv.Adopt(context.Background(), "sbx-1", e2b.CreateResult{
+		SandboxName: "sbx-1", Namespace: "project1-dev", PodIP: "10.0.0.9", PodPort: 8080,
+	}, 300*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := dc.Resource(workloadGVR).Get(context.Background(), "sbx-1", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	timeout, _, _ := unstructured.NestedInt64(got.Object, "spec", "timeout")
+	low := workloadTimeoutSeconds(started, before, 300*time.Second)
+	high := workloadTimeoutSeconds(started, time.Now(), 300*time.Second)
+	if timeout < low || timeout > high {
+		t.Fatalf("timeout=%d want %d..%d", timeout, low, high)
+	}
+	info, err := st.GetSandboxBySessionID(context.Background(), "sbx-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Status != "running" || info.PodIP != "10.0.0.9" || info.SandboxName != "sbx-1" ||
+		info.Kind != store.WorkloadKind || info.UserID != "u-1" {
+		t.Fatalf("info=%+v", info)
+	}
+	if info.ExpiresAt.Before(before.Add(300*time.Second)) || info.ExpiresAt.After(time.Now().Add(300*time.Second)) {
+		t.Fatalf("expiresAt=%v", info.ExpiresAt)
+	}
+}
+
 func TestCreateDropsPlaceholderWhenContextIsCanceled(t *testing.T) {
 	base := store.NewMemoryStore()
 	ctx, cancel := context.WithCancel(context.Background())

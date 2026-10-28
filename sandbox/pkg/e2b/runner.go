@@ -67,6 +67,12 @@ type WorkloadObserver interface {
 	Observe(ctx context.Context, sandboxID string) (CreateResult, string, error)
 }
 
+// Adopter finishes a running sandbox whose create call no longer runs.
+// It stores the timeout, measured from now, and the running session record.
+type Adopter interface {
+	Adopt(ctx context.Context, sandboxID string, result CreateResult, timeout time.Duration) error
+}
+
 // TimeoutRunner updates the stored lifetime of a sandbox.
 type TimeoutRunner interface {
 	SetTimeout(ctx context.Context, sandboxID string, timeout time.Duration) error

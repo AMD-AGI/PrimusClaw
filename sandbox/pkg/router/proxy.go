@@ -4,6 +4,7 @@
 package router
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -248,18 +249,74 @@ func (s *Server) proxyRequest(c *gin.Context, targetURL string, sessionID string
 	}
 }
 
+// errGrantRecordMissing reports a grant sandbox id that no grant records.
+var errGrantRecordMissing = errors.New("sandbox grant record is missing")
+
+// grantPolicyTTL bounds how long a grant sandbox policy is reused.
+// The policy is fixed when the sandbox is created.
+const grantPolicyTTL = time.Minute
+
+// grantPolicyCacheLimit bounds the policy cache before expired entries are dropped.
+const grantPolicyCacheLimit = 4096
+
+type cachedPolicy struct {
+	policy  e2b.RequestPolicy
+	expires time.Time
+}
+
 // sessionPolicy returns the sealed allow-list recorded for a grant sandbox.
-// Other sessions stay unsealed. A grant lookup failure refuses the proxy.
+// Other sessions stay unsealed. A grant sandbox without a grant record is
+// errGrantRecordMissing, and a grant lookup failure is returned as is.
 func (s *Server) sessionPolicy(c *gin.Context, sessionID string) (e2b.RequestPolicy, error) {
-	if s.grants == nil || !strings.HasPrefix(sessionID, "sbx-") {
+	if !strings.HasPrefix(sessionID, "sbx-") {
 		return e2b.RequestPolicy{}, nil
+	}
+	if s.grants == nil {
+		return e2b.RequestPolicy{}, errGrantRecordMissing
+	}
+	now := time.Now()
+	if policy, ok := s.cachedPolicy(sessionID, now); ok {
+		return policy, nil
 	}
 	ref, ok, err := s.grants.SandboxByID(c.Request.Context(), sessionID)
 	if err != nil {
 		return e2b.RequestPolicy{}, err
 	}
 	if !ok {
-		return e2b.RequestPolicy{}, nil
+		return e2b.RequestPolicy{}, errGrantRecordMissing
 	}
-	return e2b.RequestPolicy{Sealed: ref.Sealed, Inputs: ref.Inputs, Outputs: ref.Outputs}, nil
+	policy := e2b.RequestPolicy{Sealed: ref.Sealed, Inputs: ref.Inputs, Outputs: ref.Outputs}
+	s.storePolicy(sessionID, policy, now)
+	return policy, nil
+}
+
+// cachedPolicy returns a policy that has not expired.
+func (s *Server) cachedPolicy(sessionID string, now time.Time) (e2b.RequestPolicy, bool) {
+	s.policyMu.Lock()
+	defer s.policyMu.Unlock()
+	entry, ok := s.policies[sessionID]
+	if !ok || !now.Before(entry.expires) {
+		return e2b.RequestPolicy{}, false
+	}
+	return entry.policy, true
+}
+
+// storePolicy caches a policy and drops expired entries once the cache is full.
+func (s *Server) storePolicy(sessionID string, policy e2b.RequestPolicy, now time.Time) {
+	s.policyMu.Lock()
+	defer s.policyMu.Unlock()
+	if s.policies == nil {
+		s.policies = map[string]cachedPolicy{}
+	}
+	if len(s.policies) >= grantPolicyCacheLimit {
+		for id, entry := range s.policies {
+			if !now.Before(entry.expires) {
+				delete(s.policies, id)
+			}
+		}
+	}
+	if len(s.policies) >= grantPolicyCacheLimit {
+		return
+	}
+	s.policies[sessionID] = cachedPolicy{policy: policy, expires: now.Add(grantPolicyTTL)}
 }

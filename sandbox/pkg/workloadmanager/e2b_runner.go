@@ -131,6 +131,55 @@ func (s *Server) Observe(ctx context.Context, sandboxID string) (e2b.CreateResul
 	return s.workloads.Observe(ctx, sandboxID)
 }
 
+// Adopt finishes a running sandbox whose create call no longer runs, such as
+// after a control-plane restart. It stores the timeout on the Workload,
+// measured from now, and writes the running session record.
+func (s *Server) Adopt(ctx context.Context, sandboxID string, result e2b.CreateResult, timeout time.Duration) error {
+	if s == nil || s.workloads == nil {
+		return fmt.Errorf("safe workload client is not configured")
+	}
+	name := result.SandboxName
+	if name == "" {
+		name = sandboxID
+	}
+	now := time.Now()
+	if timeout > 0 {
+		if err := s.workloads.AlignTimeout(ctx, name, timeout, now); err != nil {
+			return err
+		}
+	}
+	ttl := timeout
+	if ttl <= 0 {
+		ttl = s.cfg.DefaultTTL
+	}
+	if ttl <= 0 {
+		ttl = 15 * time.Minute
+	}
+	info, err := s.store.GetSandboxBySessionID(ctx, sandboxID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	if info == nil {
+		info = &store.SandboxInfo{SessionID: sandboxID, CreatedAt: now}
+	}
+	port := result.PodPort
+	if port == 0 {
+		port = 8080
+	}
+	info.Kind = store.WorkloadKind
+	info.SandboxName = name
+	if result.Namespace != "" {
+		info.Namespace = result.Namespace
+	}
+	info.PodIP = result.PodIP
+	info.PodPort = port
+	info.EntryPoints = map[string]string{"/": fmt.Sprintf("%s:%d", result.PodIP, port)}
+	info.LastActivity = now
+	info.ExpiresAt = now.Add(ttl)
+	info.Status = "running"
+	return s.store.StoreSandbox(ctx, info)
+}
+
 // Delete removes the sandbox session charged to a grant.
 func (s *Server) Delete(ctx context.Context, sandboxID string) error {
 	return s.ReclaimSession(ctx, sandboxID)

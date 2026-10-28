@@ -80,6 +80,10 @@ type Server struct {
 	safeClient     *safe.Client // SaFE API Key verification client (nil when auth disabled)
 	grants         *grant.Service
 
+	// policies caches the sealed allow-list of grant sandboxes by sandbox id.
+	policyMu sync.Mutex
+	policies map[string]cachedPolicy
+
 	// Readiness edge tracking, so the log records transitions rather than every
 	// probe. Guarded because readiness is served concurrently.
 	readyMu        sync.Mutex
@@ -615,6 +619,24 @@ func (s *Server) handleInvoke(c *gin.Context, kind string) {
 			})
 			return
 		}
+	}
+
+	// A sealed grant sandbox is served only by the E2B data plane, which
+	// applies the sealed allow-list. Exec, terminal, files, port proxy and
+	// tunnel on this route do not.
+	policy, err := s.sessionPolicy(c, sessionID)
+	if errors.Is(err, errGrantRecordMissing) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "sandbox grant record is missing", "code": "sandbox_grant_missing"})
+		return
+	}
+	if err != nil {
+		log.Error("invoke: failed to read sealed policy", "error", err, "session_id", sessionID)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sandbox authentication unavailable"})
+		return
+	}
+	if policy.Sealed {
+		c.JSON(http.StatusForbidden, gin.H{"error": "sealed sandbox is served only by the E2B data plane", "code": "sealed_denied"})
+		return
 	}
 
 	// Inject session-id in response header

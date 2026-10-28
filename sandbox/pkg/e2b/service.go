@@ -265,8 +265,12 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 	return createdResponse(ref, token), http.StatusCreated, nil
 }
 
-// replayPoll is how often a queued idempotency key is read again.
-var replayPoll = 200 * time.Millisecond
+// replayPoll is the first wait before a queued idempotency key is read again.
+// The wait doubles up to replayPollMax.
+var (
+	replayPoll    = 200 * time.Millisecond
+	replayPollMax = 2 * time.Second
+)
 
 // replay returns a finished attempt. A key that is still pending keeps waiting
 // until the sandbox is running or the request ends.
@@ -319,6 +323,12 @@ func (s *Service) adoptPending(ctx context.Context, grantID string, ref runtimev
 			up.Metadata[sameNodeMetadata] = "true"
 		}
 	}
+	if adopter, ok := s.runner.(Adopter); ok {
+		timeout := time.Duration(ref.TimeoutSec) * time.Second
+		if err := adopter.Adopt(context.WithoutCancel(ctx), ref.ID, result, timeout); err != nil {
+			return ref, false, err
+		}
+	}
 	if err := s.grants.MarkRunning(context.WithoutCancel(ctx), grantID, ref.ID, up); err != nil {
 		return ref, false, err
 	}
@@ -331,6 +341,7 @@ func (s *Service) adoptPending(ctx context.Context, grantID string, ref runtimev
 // waitReplay blocks while the sandbox is still queued.
 // A Workload that is already running is adopted, so a restarted control plane does not wait out the pending timeout.
 func (s *Service) waitReplay(ctx context.Context, grantID string, ref runtimev1alpha1.GrantSandboxRef) (runtimev1alpha1.GrantSandboxRef, error) {
+	wait := replayPoll
 	for ref.State == runtimev1alpha1.SandboxPending {
 		if next, done, err := s.adoptPending(ctx, grantID, ref); err != nil || done {
 			return next, err
@@ -345,8 +356,9 @@ func (s *Service) waitReplay(ctx context.Context, grantID string, ref runtimev1a
 		select {
 		case <-ctx.Done():
 			return ref, grant.Op(http.StatusServiceUnavailable, "sandbox_unavailable", "sandbox is still pending")
-		case <-time.After(replayPoll):
+		case <-time.After(wait):
 		}
+		wait = min(2*wait, replayPollMax)
 	}
 	return ref, nil
 }

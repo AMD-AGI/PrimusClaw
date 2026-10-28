@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"encoding/base64"
 	"encoding/json"
@@ -491,10 +492,19 @@ func workloadFailureText(obj *unstructured.Unstructured) string {
 		}
 	}
 	text = strings.Join(strings.Fields(text), " ")
-	if len(text) > workloadFailureLimit {
-		return text[:workloadFailureLimit]
+	return truncateUTF8(text, workloadFailureLimit)
+}
+
+// truncateUTF8 cuts text to at most limit bytes without splitting a character.
+func truncateUTF8(text string, limit int) string {
+	if len(text) <= limit {
+		return text
 	}
-	return text
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	return text[:cut]
 }
 
 func splitFailureDetails(message string) (string, string) {

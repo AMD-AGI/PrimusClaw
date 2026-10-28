@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -219,6 +220,16 @@ func TestCreateDeletesFailedWorkload(t *testing.T) {
 	}
 	if _, getErr := dc.Tracker().Get(workloadGVR, "", sandboxID); getErr == nil {
 		t.Fatal("failed workload was not deleted")
+	}
+}
+
+func TestWorkloadFailureTextKeepsWholeCharacters(t *testing.T) {
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"status": map[string]any{"message": "a" + strings.Repeat("\u00e9", workloadFailureLimit)},
+	}}
+	text := workloadFailureText(obj)
+	if !utf8.ValidString(text) || len(text) > workloadFailureLimit || len(text) < workloadFailureLimit-1 {
+		t.Fatalf("len=%d valid=%v", len(text), utf8.ValidString(text))
 	}
 }
 
