@@ -38,6 +38,7 @@ func TestWorkloadObjectUsesTemplateResources(t *testing.T) {
 		GrantID:       "gr-01jb7m9k2x",
 		Attestation:   "eyJ.test",
 		SigningKeyPEM: "test-private-key",
+		AvoidNodes:    "node-a node-b",
 		Timeout:       60 * time.Second,
 		Env:           map[string]string{"FOO": "1", platformInferenceKey: "secret"},
 	}, ci)
@@ -84,6 +85,10 @@ func TestWorkloadObjectUsesTemplateResources(t *testing.T) {
 	}
 	if _, found, _ := unstructured.NestedFieldNoCopy(obj.Object, "spec", "timeout"); found {
 		t.Fatal("timeout must wait until the workload is running")
+	}
+	labels, _, _ := unstructured.NestedMap(obj.Object, "spec", "customerLabels")
+	if labels["excluded-nodes"] != "node-a node-b" {
+		t.Fatalf("customerLabels=%v", labels)
 	}
 }
 

@@ -168,15 +168,19 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 	if err != nil {
 		return SandboxResponse{}, 0, grant.Op(http.StatusInternalServerError, "sandbox_create_failed", "token")
 	}
-	publicKey, privateKey, err := newSigningIdentity()
-	if err != nil {
-		return SandboxResponse{}, 0, grant.Op(http.StatusInternalServerError, "sandbox_create_failed", "signing key")
-	}
 	metadata := make(map[string]string, len(body.Metadata)+1)
 	for key, value := range body.Metadata {
 		metadata[key] = value
 	}
-	metadata[signingPublicKeyMetadata] = publicKey
+	var privateKey string
+	if tpl.Sealed {
+		publicKey, key, keyErr := newSigningIdentity()
+		if keyErr != nil {
+			return SandboxResponse{}, 0, grant.Op(http.StatusInternalServerError, "sandbox_create_failed", "signing key")
+		}
+		metadata[signingPublicKeyMetadata] = publicKey
+		privateKey = key
+	}
 	ref, err := s.grants.BeginSandbox(ctx, grant.BeginRequest{
 		GrantID:           grantID,
 		Role:              role,
@@ -227,6 +231,7 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		Attestation:   snap.Attestation,
 		Env:           body.EnvVars,
 		SigningKeyPEM: privateKey,
+		AvoidNodes:    excludedNodesLabel(metadata[avoidNodesMetadata]),
 	})
 	if runErr != nil {
 		_ = s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, sandboxID, "create_failed")
@@ -241,7 +246,10 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		NodeName:    result.NodeName,
 	}
 	if result.NodeName != "" {
-		running.Metadata = map[string]string{nodeNameMetadata: result.NodeName}
+		running.Metadata = map[string]string{
+			nodeNameMetadata: result.NodeName,
+			sameNodeMetadata: "true",
+		}
 	}
 	if err := s.grants.MarkRunning(ctx, grantID, sandboxID, running); err != nil {
 		_ = s.runner.Delete(context.WithoutCancel(ctx), sandboxID)

@@ -264,8 +264,8 @@ func (s *Service) ListRoleSandboxes(ctx context.Context, grantID, role string) (
 }
 
 // LookupAccess matches a sandbox id and access token.
-// An unknown id is 404. An ended sandbox is 410. A live sandbox with a
-// different token is 401.
+// An unknown id is 404. An ended sandbox is 502 so the E2B SDK can see
+// "was not found". A live sandbox with a different token is 401.
 func (s *Service) LookupAccess(ctx context.Context, sandboxID, token string) (runtimev1alpha1.GrantSandboxRef, error) {
 	if sandboxID == "" || token == "" {
 		return runtimev1alpha1.GrantSandboxRef{}, opErr(http.StatusUnauthorized, "invalid_token", "access token is required")
@@ -295,7 +295,7 @@ func (s *Service) LookupAccess(ctx context.Context, sandboxID, token string) (ru
 		}
 	}
 	if ended {
-		return runtimev1alpha1.GrantSandboxRef{}, opErr(http.StatusGone, "sandbox_not_found", sandboxID)
+		return runtimev1alpha1.GrantSandboxRef{}, opErr(http.StatusBadGateway, "sandbox_not_found", "the sandbox was not found")
 	}
 	return runtimev1alpha1.GrantSandboxRef{}, opErr(http.StatusNotFound, "sandbox_not_found", sandboxID)
 }

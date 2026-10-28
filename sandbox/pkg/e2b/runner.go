@@ -33,8 +33,10 @@ type CreateRequest struct {
 	// Attestation is the Claw JWT copied onto the Workload annotation.
 	Attestation string
 	Env         map[string]string
-	// SigningKeyPEM is the PKCS#8 Ed25519 private key written into the sandbox.
+	// SigningKeyPEM is the PKCS#8 Ed25519 private key written into a sealed sandbox.
 	SigningKeyPEM string
+	// AvoidNodes are node names the Workload must not run on, space-separated.
+	AvoidNodes string
 }
 
 // CreateResult is the running sandbox address.

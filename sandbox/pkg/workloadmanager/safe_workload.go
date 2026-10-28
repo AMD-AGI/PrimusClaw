@@ -423,6 +423,9 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 	if paths := templateHostPaths(ci.Spec.Template); len(paths) > 0 {
 		spec["hostpath"] = paths
 	}
+	if nodes := strings.TrimSpace(req.AvoidNodes); nodes != "" {
+		spec["customerLabels"] = map[string]any{"excluded-nodes": nodes}
+	}
 	labels := map[string]any{
 		safeDisplayNameLabel: req.Role,
 		ownerSessionIDLabel:  req.SessionID,
