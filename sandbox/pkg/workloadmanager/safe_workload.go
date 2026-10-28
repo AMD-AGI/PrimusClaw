@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"encoding/base64"
+	"encoding/json"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -59,9 +60,18 @@ const (
 	signingSecretKey = "signing-key.pem"
 	// signingSecretMountRoot is the SaFE path for a general Secret volume.
 	signingSecretMountRoot = "/etc/secrets"
+	// signingSecretNamespace is where SaFE stores a Secret before mirroring it.
+	signingSecretNamespace = "primus-safe"
+	// signingSecretWorkspaceAnnotation binds the Secret to the sandbox workspace.
+	signingSecretWorkspaceAnnotation = "primus-safe.workspace.ids"
+	// signingSecretTypeLabel marks a general Secret, the type SaFE mounts as a volume.
+	signingSecretTypeLabel   = "primus-safe.secret.type"
+	signingSecretTypeGeneral = "general"
+	// signingSecretFinalizer makes deletion wait until the mirrored copy is removed.
+	signingSecretFinalizer = "primus-safe/secret.finalizer"
 )
 
-// secretGVR is a namespace-scoped Secret in the sandbox workspace.
+// secretGVR is a namespace-scoped Secret. The signing key lives in primus-safe.
 var secretGVR = schema.GroupVersionResource{Version: "v1", Resource: "secrets"}
 
 // workloadGVR is the cluster-scoped SaFE Workload.
@@ -114,15 +124,15 @@ func (c *SafeWorkloadCreator) Create(ctx context.Context, req e2b.CreateRequest)
 	created, err := c.dynamic.Resource(workloadGVR).Create(ctx, obj, metav1.CreateOptions{})
 	if err != nil {
 		if secretName != "" {
-			_ = c.deleteSigningSecret(context.WithoutCancel(ctx), req.Workspace, secretName)
+			_ = c.deleteSigningSecret(context.WithoutCancel(ctx), secretName)
 		}
 		return nil, fmt.Errorf("create workload: %w", err)
 	}
 	name = created.GetName()
 	if secretName != "" {
-		if err := c.adoptSigningSecret(ctx, req.Workspace, secretName, created); err != nil {
+		if err := c.adoptSigningSecret(ctx, secretName, created); err != nil {
 			_ = c.Delete(context.WithoutCancel(ctx), name)
-			_ = c.deleteSigningSecret(context.WithoutCancel(ctx), req.Workspace, secretName)
+			_ = c.deleteSigningSecret(context.WithoutCancel(ctx), secretName)
 			return nil, fmt.Errorf("adopt signing secret: %w", err)
 		}
 	}
@@ -134,7 +144,7 @@ func (c *SafeWorkloadCreator) Create(ctx context.Context, req e2b.CreateRequest)
 		if waitErr != nil {
 			_ = c.Delete(context.WithoutCancel(ctx), name)
 			if secretName != "" {
-				_ = c.deleteSigningSecret(context.WithoutCancel(ctx), req.Workspace, secretName)
+				_ = c.deleteSigningSecret(context.WithoutCancel(ctx), secretName)
 			}
 		}
 	}()
@@ -299,7 +309,7 @@ func (c *SafeWorkloadCreator) Session(ctx context.Context, name string) (*store.
 	return info, nil
 }
 
-// signingSecretName is the Secret in the workspace, one per sandbox.
+// signingSecretName is one Secret per sandbox. SaFE copies this name into the workspace.
 func signingSecretName(sandboxID string) string {
 	return sandboxID
 }
@@ -309,27 +319,38 @@ func signingKeyFile(sandboxID string) string {
 	return signingSecretMountRoot + "/" + signingSecretName(sandboxID) + "/" + signingSecretKey
 }
 
-// createSigningSecret writes the sandbox private key into the workspace.
-func (c *SafeWorkloadCreator) createSigningSecret(ctx context.Context, namespace, name, pem string) error {
+// createSigningSecret writes the private key where SaFE mirrors workspace secrets.
+func (c *SafeWorkloadCreator) createSigningSecret(ctx context.Context, workspace, name, pem string) error {
+	bound, err := json.Marshal([]string{workspace})
+	if err != nil {
+		return err
+	}
 	obj := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "v1",
 		"kind":       "Secret",
 		"metadata": map[string]any{
 			"name":      name,
-			"namespace": namespace,
+			"namespace": signingSecretNamespace,
+			"labels": map[string]any{
+				signingSecretTypeLabel: signingSecretTypeGeneral,
+			},
+			"annotations": map[string]any{
+				signingSecretWorkspaceAnnotation: string(bound),
+			},
+			"finalizers": []any{signingSecretFinalizer},
 		},
 		"type": "Opaque",
 		"data": map[string]any{
 			signingSecretKey: base64.StdEncoding.EncodeToString([]byte(pem)),
 		},
 	}}
-	_, err := c.dynamic.Resource(secretGVR).Namespace(namespace).Create(ctx, obj, metav1.CreateOptions{})
+	_, err = c.dynamic.Resource(secretGVR).Namespace(signingSecretNamespace).Create(ctx, obj, metav1.CreateOptions{})
 	return err
 }
 
 // adoptSigningSecret makes the Workload the Secret owner so deleting the Workload deletes the key.
-func (c *SafeWorkloadCreator) adoptSigningSecret(ctx context.Context, namespace, name string, owner *unstructured.Unstructured) error {
-	secret, err := c.dynamic.Resource(secretGVR).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+func (c *SafeWorkloadCreator) adoptSigningSecret(ctx context.Context, name string, owner *unstructured.Unstructured) error {
+	secret, err := c.dynamic.Resource(secretGVR).Namespace(signingSecretNamespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
@@ -344,13 +365,13 @@ func (c *SafeWorkloadCreator) adoptSigningSecret(ctx context.Context, namespace,
 	if err := unstructured.SetNestedSlice(secret.Object, refs, "metadata", "ownerReferences"); err != nil {
 		return err
 	}
-	_, err = c.dynamic.Resource(secretGVR).Namespace(namespace).Update(ctx, secret, metav1.UpdateOptions{})
+	_, err = c.dynamic.Resource(secretGVR).Namespace(signingSecretNamespace).Update(ctx, secret, metav1.UpdateOptions{})
 	return err
 }
 
 // deleteSigningSecret removes the key. A missing Secret is already gone.
-func (c *SafeWorkloadCreator) deleteSigningSecret(ctx context.Context, namespace, name string) error {
-	err := c.dynamic.Resource(secretGVR).Namespace(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+func (c *SafeWorkloadCreator) deleteSigningSecret(ctx context.Context, name string) error {
+	err := c.dynamic.Resource(secretGVR).Namespace(signingSecretNamespace).Delete(ctx, name, metav1.DeleteOptions{})
 	if apierrors.IsNotFound(err) {
 		return nil
 	}

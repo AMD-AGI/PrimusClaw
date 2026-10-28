@@ -232,11 +232,23 @@ func TestSigningSecretFollowsTheWorkload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stored, err := dc.Tracker().Get(secretGVR, "top-models", sandboxID)
+	stored, err := dc.Tracker().Get(secretGVR, signingSecretNamespace, sandboxID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	secret := stored.(*unstructured.Unstructured)
+	bound, _, _ := unstructured.NestedString(secret.Object, "metadata", "annotations", signingSecretWorkspaceAnnotation)
+	if bound != `["top-models"]` {
+		t.Fatalf("workspace binding=%q", bound)
+	}
+	kind, _, _ := unstructured.NestedString(secret.Object, "metadata", "labels", signingSecretTypeLabel)
+	if kind != signingSecretTypeGeneral {
+		t.Fatalf("secret type=%q", kind)
+	}
+	finalizers, _, _ := unstructured.NestedStringSlice(secret.Object, "metadata", "finalizers")
+	if len(finalizers) != 1 || finalizers[0] != signingSecretFinalizer {
+		t.Fatalf("finalizers=%v", finalizers)
+	}
 	refs, _, _ := unstructured.NestedSlice(secret.Object, "metadata", "ownerReferences")
 	if len(refs) != 1 {
 		t.Fatalf("ownerReferences=%v", refs)
@@ -272,7 +284,7 @@ func TestSigningSecretIsDeletedWhenCreateFails(t *testing.T) {
 	if _, err := dc.Tracker().Get(workloadGVR, "", sandboxID); err == nil {
 		t.Fatal("failed workload was not deleted")
 	}
-	if _, err := dc.Tracker().Get(secretGVR, "top-models", sandboxID); err == nil {
+	if _, err := dc.Tracker().Get(secretGVR, signingSecretNamespace, sandboxID); err == nil {
 		t.Fatal("signing secret was not deleted")
 	}
 }
