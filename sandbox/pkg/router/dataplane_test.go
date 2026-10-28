@@ -221,6 +221,7 @@ func TestDataPlaneEnvDPathReachesEnvD(t *testing.T) {
 	crusoe.engine = gin.New()
 	crusoe.engine.Any("/files", crusoe.handleLocalEnvD)
 	crusoe.engine.Any("/process.Process/*path", crusoe.handleLocalEnvD)
+	crusoe.engine.Any("/filesystem.Filesystem/ListDir", crusoe.handleLocalEnvD)
 	if err := crusoe.ConfigureDataPlane("crusoe", "", string(mustPEM(t, globalJWT)), func(ctx context.Context, sandboxID string) (string, int, error) {
 		return envdHost(t, envd), envdPort(t, envd), nil
 	}); err != nil {
@@ -267,6 +268,15 @@ func TestDataPlaneEnvDPathReachesEnvD(t *testing.T) {
 	if gotPath != "/files" || gotSealedHeader != "" {
 		t.Fatalf("path=%s sealedHeader=%s", gotPath, gotSealedHeader)
 	}
+	gotPath = ""
+	sendBody(t, front.URL+"/filesystem.Filesystem/ListDir", sealedToken, `{"path":"/in"}`, http.StatusForbidden)
+	if gotPath != "" {
+		t.Fatalf("sealed list reached envd: %s", gotPath)
+	}
+	sendBody(t, front.URL+"/filesystem.Filesystem/ListDir", sealedToken, `{"path":"/out"}`, http.StatusNoContent)
+	if gotPath != "/filesystem.Filesystem/ListDir" {
+		t.Fatalf("path=%s", gotPath)
+	}
 	parsed, err := jwt.Parse(strings.TrimPrefix(gotAuth, "Bearer "), func(token *jwt.Token) (any, error) {
 		return crusoe.jwt.publicKey, nil
 	}, jwt.WithValidMethods([]string{"RS256"}))
@@ -276,6 +286,25 @@ func TestDataPlaneEnvDPathReachesEnvD(t *testing.T) {
 	claims, _ := parsed.Claims.(jwt.MapClaims)
 	if claims["sealed"] != true || fmtClaim(claims["inputs"]) != "/in" || fmtClaim(claims["outputs"]) != "/out" {
 		t.Fatalf("claims=%v", claims)
+	}
+}
+
+func sendBody(t *testing.T, rawURL, token, payload string, want int) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, rawURL, strings.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != want {
+		t.Fatalf("%s status=%d body=%s", rawURL, resp.StatusCode, body)
 	}
 }
 

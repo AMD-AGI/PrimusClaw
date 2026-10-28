@@ -230,11 +230,14 @@ func hopSealedAllows(c *gin.Context, path string, ref runtimev1alpha1.GrantSandb
 	if c.Request.URL.RawQuery != "" {
 		rawPath += "?" + c.Request.URL.RawQuery
 	}
-	if e2b.SealedAllows(c.Request.Method, rawPath, ref.Sealed, ref.Inputs, ref.Outputs) {
-		return true
+	if !e2b.SealedAllows(c.Request.Method, rawPath, ref.Sealed, ref.Inputs, ref.Outputs) {
+		writeGate(c, http.StatusForbidden, "sealed_denied", "path is outside the sealed allow-list")
+		return false
 	}
-	writeGate(c, http.StatusForbidden, "sealed_denied", "path is outside the sealed allow-list")
-	return false
+	if ref.Sealed && e2b.FilesystemReadRPC(path) && !sealedFilesystemRead(c, ref) {
+		return false
+	}
+	return true
 }
 
 // envdProxyPath strips a hop prefix so envd sees /files or /process.Process/Start.
