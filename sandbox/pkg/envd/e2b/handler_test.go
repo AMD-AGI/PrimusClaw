@@ -113,7 +113,7 @@ func TestConnectStartFilesAndSignal(t *testing.T) {
 	}
 	_ = sealed.Body.Close()
 
-	denied := postHeader(t, sealedSrv.URL+"/files?path=/in/a.txt", "text/plain", []byte("x"), map[string]string{
+	denied := postHeader(t, sealedSrv.URL+"/files?path=/out/a.txt", "text/plain", []byte("x"), map[string]string{
 		"X-Sandbox-Sealed": "false",
 	})
 	if denied.StatusCode != http.StatusForbidden {

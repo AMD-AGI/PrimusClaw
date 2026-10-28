@@ -10,10 +10,13 @@ import (
 	"strings"
 	"time"
 
+	"encoding/base64"
+	"encoding/json"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -47,11 +50,29 @@ const (
 	e2bSandboxPrefix           = "sbx-"
 	// platformInferenceKey is not copied onto a grant sandbox.
 	platformInferenceKey = "OPENAI_API_KEY"
+	// startupEnv is a shell snippet the Sandbox template evals before exec envd.
+	startupEnv = "SANDBOX_STARTUP"
 	// safeGeneratedNameLength is SaFE MaxGeneratedNameLength: a 63-character
 	// DNS label minus a 5-character suffix and the separating hyphen.
 	// The Workload name is copied onto the Sandbox, its Pod, its Service, and a label.
 	safeGeneratedNameLength = 63 - 5 - 1
+	// signingSecretKey is the data key mounted from the per-sandbox Secret.
+	signingSecretKey = "signing-key.pem"
+	// signingSecretMountRoot is the SaFE path for a general Secret volume.
+	signingSecretMountRoot = "/etc/secrets"
+	// signingSecretNamespace is where SaFE stores a Secret before mirroring it.
+	signingSecretNamespace = "primus-safe"
+	// signingSecretWorkspaceAnnotation binds the Secret to the sandbox workspace.
+	signingSecretWorkspaceAnnotation = "primus-safe.workspace.ids"
+	// signingSecretTypeLabel marks a general Secret, the type SaFE mounts as a volume.
+	signingSecretTypeLabel   = "primus-safe.secret.type"
+	signingSecretTypeGeneral = "general"
+	// signingSecretFinalizer makes deletion wait until the mirrored copy is removed.
+	signingSecretFinalizer = "primus-safe/secret.finalizer"
 )
+
+// secretGVR is a namespace-scoped Secret. The signing key lives in primus-safe.
+var secretGVR = schema.GroupVersionResource{Version: "v1", Resource: "secrets"}
 
 // workloadGVR is the cluster-scoped SaFE Workload.
 var workloadGVR = schema.GroupVersionResource{Group: "amd.com", Version: "v1", Resource: "workloads"}
@@ -93,11 +114,28 @@ func (c *SafeWorkloadCreator) Create(ctx context.Context, req e2b.CreateRequest)
 	if err != nil {
 		return nil, err
 	}
+	secretName := ""
+	if req.SigningKeyPEM != "" {
+		secretName = signingSecretName(name)
+		if err := c.createSigningSecret(ctx, req.Workspace, secretName, req.SigningKeyPEM); err != nil {
+			return nil, fmt.Errorf("create signing secret: %w", err)
+		}
+	}
 	created, err := c.dynamic.Resource(workloadGVR).Create(ctx, obj, metav1.CreateOptions{})
 	if err != nil {
+		if secretName != "" {
+			_ = c.deleteSigningSecret(context.WithoutCancel(ctx), secretName)
+		}
 		return nil, fmt.Errorf("create workload: %w", err)
 	}
 	name = created.GetName()
+	if secretName != "" {
+		if err := c.adoptSigningSecret(ctx, secretName, created); err != nil {
+			_ = c.Delete(context.WithoutCancel(ctx), name)
+			_ = c.deleteSigningSecret(context.WithoutCancel(ctx), secretName)
+			return nil, fmt.Errorf("adopt signing secret: %w", err)
+		}
+	}
 	var (
 		podIP, nodeName string
 		waitErr         error
@@ -105,11 +143,22 @@ func (c *SafeWorkloadCreator) Create(ctx context.Context, req e2b.CreateRequest)
 	defer func() {
 		if waitErr != nil {
 			_ = c.Delete(context.WithoutCancel(ctx), name)
+			if secretName != "" {
+				_ = c.deleteSigningSecret(context.WithoutCancel(ctx), secretName)
+			}
 		}
 	}()
 	podIP, nodeName, waitErr = c.waitRunning(ctx, name, req.Workspace)
 	if waitErr != nil {
 		return nil, waitErr
+	}
+	// The Workload timeout is measured from dispatch. Set it only after Running
+	// so the E2B lifetime starts once the sandbox is up.
+	if req.Timeout > 0 {
+		waitErr = c.AlignTimeout(ctx, name, req.Timeout, time.Now())
+		if waitErr != nil {
+			return nil, waitErr
+		}
 	}
 	result := &SandboxResult{
 		SandboxName:          name,
@@ -209,6 +258,43 @@ func (c *SafeWorkloadCreator) Present(ctx context.Context, name string) (bool, e
 	}
 }
 
+// Observe reports whether a sandbox Workload is running, still pending, finished, or gone.
+func (c *SafeWorkloadCreator) Observe(ctx context.Context, sandboxID string) (e2b.CreateResult, string, error) {
+	if c == nil || c.dynamic == nil || !strings.HasPrefix(sandboxID, e2bSandboxPrefix) {
+		return e2b.CreateResult{}, e2b.WorkloadMissing, nil
+	}
+	obj, err := c.dynamic.Resource(workloadGVR).Get(ctx, sandboxID, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return e2b.CreateResult{}, e2b.WorkloadMissing, nil
+	}
+	if err != nil {
+		return e2b.CreateResult{}, "", err
+	}
+	if obj.GetDeletionTimestamp() != nil {
+		return e2b.CreateResult{}, e2b.WorkloadFinished, nil
+	}
+	phase, _, _ := unstructured.NestedString(obj.Object, "status", "phase")
+	switch phase {
+	case "Failed", "Succeeded", "Stopped":
+		return e2b.CreateResult{}, e2b.WorkloadFinished, nil
+	case "Running":
+		workspace, _, _ := unstructured.NestedString(obj.Object, "spec", "workspace")
+		ip, node, ok := c.address(ctx, obj, workspace, sandboxID)
+		if !ok {
+			return e2b.CreateResult{}, e2b.WorkloadPending, nil
+		}
+		return e2b.CreateResult{
+			SandboxName: sandboxID,
+			Namespace:   workspace,
+			PodIP:       ip,
+			PodPort:     envdPort,
+			NodeName:    node,
+		}, e2b.WorkloadRunning, nil
+	default:
+		return e2b.CreateResult{}, e2b.WorkloadPending, nil
+	}
+}
+
 // Session rebuilds the session record of an E2B Workload named by the sandbox id.
 // A missing Workload, a finished phase, or a Workload not created for E2B is store.ErrNotFound.
 func (c *SafeWorkloadCreator) Session(ctx context.Context, name string) (*store.SandboxInfo, error) {
@@ -258,6 +344,78 @@ func (c *SafeWorkloadCreator) Session(ctx context.Context, name string) (*store.
 		}
 	}
 	return info, nil
+}
+
+// signingSecretName is one Secret per sandbox. SaFE copies this name into the workspace.
+func signingSecretName(sandboxID string) string {
+	return sandboxID
+}
+
+// signingKeyFile is the private key after the init container copies it onto a writable emptyDir.
+// The Secret mount itself stays on the init container.
+const signingKeyFilePath = "/run/signing-key/" + signingSecretKey
+
+func signingKeyFile(string) string {
+	return signingKeyFilePath
+}
+
+// createSigningSecret writes the private key where SaFE mirrors workspace secrets.
+func (c *SafeWorkloadCreator) createSigningSecret(ctx context.Context, workspace, name, pem string) error {
+	bound, err := json.Marshal([]string{workspace})
+	if err != nil {
+		return err
+	}
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Secret",
+		"metadata": map[string]any{
+			"name":      name,
+			"namespace": signingSecretNamespace,
+			"labels": map[string]any{
+				signingSecretTypeLabel: signingSecretTypeGeneral,
+			},
+			"annotations": map[string]any{
+				signingSecretWorkspaceAnnotation: string(bound),
+			},
+			"finalizers": []any{signingSecretFinalizer},
+		},
+		"type": "Opaque",
+		"data": map[string]any{
+			signingSecretKey: base64.StdEncoding.EncodeToString([]byte(pem)),
+		},
+	}}
+	_, err = c.dynamic.Resource(secretGVR).Namespace(signingSecretNamespace).Create(ctx, obj, metav1.CreateOptions{})
+	return err
+}
+
+// adoptSigningSecret makes the Workload the Secret owner so deleting the Workload deletes the key.
+func (c *SafeWorkloadCreator) adoptSigningSecret(ctx context.Context, name string, owner *unstructured.Unstructured) error {
+	secret, err := c.dynamic.Resource(secretGVR).Namespace(signingSecretNamespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	refs := []any{map[string]any{
+		"apiVersion":         workloadAPIVersion,
+		"kind":               workloadKind,
+		"name":               owner.GetName(),
+		"uid":                string(owner.GetUID()),
+		"controller":         true,
+		"blockOwnerDeletion": true,
+	}}
+	if err := unstructured.SetNestedSlice(secret.Object, refs, "metadata", "ownerReferences"); err != nil {
+		return err
+	}
+	_, err = c.dynamic.Resource(secretGVR).Namespace(signingSecretNamespace).Update(ctx, secret, metav1.UpdateOptions{})
+	return err
+}
+
+// deleteSigningSecret removes the key. A missing Secret is already gone.
+func (c *SafeWorkloadCreator) deleteSigningSecret(ctx context.Context, name string) error {
+	err := c.dynamic.Resource(secretGVR).Namespace(signingSecretNamespace).Delete(ctx, name, metav1.DeleteOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
 }
 
 // Delete removes the Workload. A missing object is already gone.
@@ -402,11 +560,22 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 		},
 		"resources": []any{resource},
 	}
-	if req.Timeout > 0 {
-		spec["timeout"] = int64(req.Timeout / time.Second)
+	env := sandboxEnv(ci.Spec.Template.Environment, req.Env)
+	applyTemplateRuntime(ci.Spec.Template, env)
+	for key, value := range platformSandboxEnv(req, gpuCount(ci)) {
+		env[key] = value
 	}
-	if env := sandboxEnv(ci.Spec.Template.Environment, req.Env); len(env) > 0 {
+	if len(env) > 0 {
 		spec["env"] = env
+	}
+	if paths := templateHostPaths(ci.Spec.Template); len(paths) > 0 {
+		spec["hostpath"] = paths
+	}
+	if nodes := strings.TrimSpace(req.AvoidNodes); nodes != "" {
+		spec["customerLabels"] = map[string]any{"excluded-nodes": nodes}
+	}
+	if req.SigningKeyPEM != "" {
+		spec["secrets"] = []any{map[string]any{"id": signingSecretName(req.SandboxID), "type": "general"}}
 	}
 	labels := map[string]any{
 		safeDisplayNameLabel: req.Role,
@@ -470,21 +639,108 @@ func quantityString(list corev1.ResourceList, name corev1.ResourceName) string {
 	return q.String()
 }
 
+// gpuCount is the number of GPUs the template requests.
+func gpuCount(ci *runtimev1alpha1.CodeInterpreter) int {
+	if ci == nil || ci.Spec.GPU == nil || ci.Spec.GPU.Count < 1 {
+		return 0
+	}
+	return ci.Spec.GPU.Count
+}
+
+// rocrVisibleDevices lists GPU indexes from zero. One GPU is "0".
+func rocrVisibleDevices(count int) string {
+	if count < 1 {
+		return ""
+	}
+	parts := make([]string, count)
+	for i := range parts {
+		parts[i] = strconv.Itoa(i)
+	}
+	return strings.Join(parts, ",")
+}
+
+// platformSandboxEnv sets the sandbox id, the signing key, and visible GPUs.
+// These win over template and caller env.
+func platformSandboxEnv(req e2b.CreateRequest, gpus int) map[string]string {
+	env := map[string]string{}
+	if req.SandboxID != "" {
+		env["E2B_SANDBOX_ID"] = req.SandboxID
+	}
+	if req.SigningKeyPEM != "" {
+		env["HYPERLOOM_SIGNING_KEY_FILE"] = signingKeyFile(req.SandboxID)
+	}
+	if devices := rocrVisibleDevices(gpus); devices != "" {
+		env["ROCR_VISIBLE_DEVICES"] = devices
+	}
+	return env
+}
+
 func sandboxEnv(template []corev1.EnvVar, extra map[string]string) map[string]any {
 	env := map[string]any{}
 	for _, item := range template {
-		if item.Name == "" || item.Name == platformInferenceKey || item.Value == "" {
+		if item.Name == "" || item.Name == platformInferenceKey || item.Name == startupEnv || item.Value == "" {
 			continue
 		}
 		env[item.Name] = item.Value
 	}
 	for key, value := range extra {
-		if key == "" || key == platformInferenceKey {
+		if key == "" || key == platformInferenceKey || key == startupEnv {
 			continue
 		}
 		env[key] = value
 	}
 	return env
+}
+
+// applyTemplateRuntime copies env and workdir/run steps onto the Workload.
+// SaFE has no steps field. Env steps become spec.env. Run and workdir steps
+// become SANDBOX_STARTUP, which the Sandbox template evals before exec envd.
+func applyTemplateRuntime(tmpl *runtimev1alpha1.CodeInterpreterSandboxTemplate, env map[string]any) {
+	if tmpl == nil {
+		return
+	}
+	var steps []string
+	for _, step := range tmpl.Steps {
+		if len(step.Args) == 0 || step.Args[0] == "" {
+			continue
+		}
+		switch step.Type {
+		case "env":
+			key, value, ok := strings.Cut(step.Args[0], "=")
+			if ok && key != "" && key != platformInferenceKey && key != startupEnv {
+				env[key] = value
+			}
+		case "workdir":
+			steps = append(steps, "cd "+shellSingleQuote(step.Args[0]))
+		case "run":
+			steps = append(steps, step.Args[0])
+		}
+	}
+	if script := strings.Join(steps, " && "); script != "" {
+		env[startupEnv] = script
+	}
+}
+
+// templateHostPaths returns host paths SaFE mounts at the same path.
+// A Sandbox host path is read-only. Volumes that are not hostPath have no
+// Workload field.
+func templateHostPaths(tmpl *runtimev1alpha1.CodeInterpreterSandboxTemplate) []any {
+	if tmpl == nil {
+		return nil
+	}
+	var out []any
+	seen := map[string]struct{}{}
+	for _, vol := range tmpl.Volumes {
+		if vol.HostPath == nil || vol.HostPath.Path == "" {
+			continue
+		}
+		if _, ok := seen[vol.HostPath.Path]; ok {
+			continue
+		}
+		seen[vol.HostPath.Path] = struct{}{}
+		out = append(out, vol.HostPath.Path)
+	}
+	return out
 }
 
 func dnsLabel(value string, max int) bool {

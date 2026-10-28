@@ -64,6 +64,8 @@ type RunningUpdate struct {
 	SandboxName string
 	Namespace   string
 	NodeName    string
+	// Metadata is merged into the sandbox record. Empty values are skipped.
+	Metadata map[string]string
 }
 
 // Snapshot returns the grant fields needed to authorize a create.
@@ -128,6 +130,15 @@ func (s *Service) MarkRunning(ctx context.Context, grantID, sandboxID string, up
 		}
 		if up.NodeName != "" {
 			ref.NodeName = up.NodeName
+		}
+		for key, value := range up.Metadata {
+			if key == "" || value == "" {
+				continue
+			}
+			if ref.Metadata == nil {
+				ref.Metadata = map[string]string{}
+			}
+			ref.Metadata[key] = value
 		}
 		g.Status.Sandboxes[idx] = ref
 		return nil
@@ -272,8 +283,9 @@ func (s *Service) ListRoleSandboxes(ctx context.Context, grantID, role string) (
 	return out, nil
 }
 
-// LookupAccess matches a sandbox id and access token. A mismatch is invalid_token
-// whether the id is unknown or the token is wrong.
+// LookupAccess matches a sandbox id and access token.
+// An unknown id is 404. An ended sandbox is 502 so the E2B SDK can see
+// "was not found". A live sandbox with a different token is 401.
 func (s *Service) LookupAccess(ctx context.Context, sandboxID, token string) (runtimev1alpha1.GrantSandboxRef, error) {
 	if sandboxID == "" || token == "" {
 		return runtimev1alpha1.GrantSandboxRef{}, opErr(http.StatusUnauthorized, "invalid_token", "access token is required")
@@ -283,21 +295,29 @@ func (s *Service) LookupAccess(ctx context.Context, sandboxID, token string) (ru
 	if err != nil {
 		return runtimev1alpha1.GrantSandboxRef{}, err
 	}
+	ended := false
 	for i := range list {
 		for _, ref := range list[i].Status.Sandboxes {
-			if ref.ID != sandboxID || (ref.AccessTokenHash == "" && len(ref.AccessTokenHashes) == 0) {
+			if ref.ID != sandboxID {
 				continue
 			}
-			if tokenHashMatches(ref, want) {
-				if err := usable(&list[i], s.now()); err != nil {
-					return runtimev1alpha1.GrantSandboxRef{}, err
-				}
-				return ref, nil
+			if ref.State == runtimev1alpha1.SandboxEnded || (ref.AccessTokenHash == "" && len(ref.AccessTokenHashes) == 0) {
+				ended = true
+				continue
 			}
-			return runtimev1alpha1.GrantSandboxRef{}, opErr(http.StatusUnauthorized, "invalid_token", "access token does not match")
+			if !tokenHashMatches(ref, want) {
+				return runtimev1alpha1.GrantSandboxRef{}, opErr(http.StatusUnauthorized, "invalid_token", "access token does not match")
+			}
+			if err := usable(&list[i], s.now()); err != nil {
+				return runtimev1alpha1.GrantSandboxRef{}, err
+			}
+			return ref, nil
 		}
 	}
-	return runtimev1alpha1.GrantSandboxRef{}, opErr(http.StatusUnauthorized, "invalid_token", "access token does not match")
+	if ended {
+		return runtimev1alpha1.GrantSandboxRef{}, opErr(http.StatusBadGateway, "sandbox_not_found", "the sandbox was not found")
+	}
+	return runtimev1alpha1.GrantSandboxRef{}, opErr(http.StatusNotFound, "sandbox_not_found", sandboxID)
 }
 
 func tokenHashes(ref runtimev1alpha1.GrantSandboxRef) []string {

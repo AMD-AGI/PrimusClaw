@@ -417,11 +417,13 @@ func main() {
 	}
 	if grants != nil {
 		routerServer.WithGrants(grants)
-		apiServer.WithE2B(e2b.New(e2b.Options{
+		plane := e2b.New(e2b.Options{
 			Grants:    grants,
 			Runner:    apiServer,
 			Namespace: grant.Namespace(wmCfg.Namespace),
-		}))
+		})
+		grants.SetPromoter(plane)
+		apiServer.WithE2B(plane)
 	}
 
 	// Sandbox health watcher — exposes pod health as Prometheus metrics

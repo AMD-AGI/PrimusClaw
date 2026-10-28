@@ -28,17 +28,19 @@ func TestWorkloadObjectUsesTemplateResources(t *testing.T) {
 	ci := testCodeInterpreter()
 	const sandboxID = "sbx-7a9b9b693452f613877992145c818d29"
 	obj, err := workloadObject(sandboxID, e2b.CreateRequest{
-		SandboxID:   sandboxID,
-		TemplateID:  "ar-run-dev-g2",
-		Role:        "dev",
-		SessionID:   "s-8f2a",
-		Workspace:   "top-models",
-		UserID:      "u-123",
-		UserName:    "alice",
-		GrantID:     "gr-01jb7m9k2x",
-		Attestation: "eyJ.test",
-		Timeout:     60 * time.Second,
-		Env:         map[string]string{"FOO": "1", platformInferenceKey: "secret"},
+		SandboxID:     sandboxID,
+		TemplateID:    "ar-run-dev-g2",
+		Role:          "dev",
+		SessionID:     "s-8f2a",
+		Workspace:     "top-models",
+		UserID:        "u-123",
+		UserName:      "alice",
+		GrantID:       "gr-01jb7m9k2x",
+		Attestation:   "eyJ.test",
+		SigningKeyPEM: "test-private-key",
+		AvoidNodes:    "node-a node-b",
+		Timeout:       60 * time.Second,
+		Env:           map[string]string{"FOO": "1", platformInferenceKey: "secret"},
 	}, ci)
 	if err != nil {
 		t.Fatal(err)
@@ -71,8 +73,19 @@ func TestWorkloadObjectUsesTemplateResources(t *testing.T) {
 		t.Fatalf("resources=%v", res)
 	}
 	env, _, _ := unstructured.NestedMap(obj.Object, "spec", "env")
-	if env["FOO"] != "1" || env["HYPERLOOM_ACTIVE_IMAGE_DIGEST"] != "sha256:aa" {
+	if env["FOO"] != "1" || env["HYPERLOOM_ACTIVE_IMAGE_DIGEST"] != "sha256:aa" || env["E2B_SANDBOX_ID"] != sandboxID || env["HYPERLOOM_SIGNING_KEY_FILE"] != "/run/signing-key/signing-key.pem" || env["ROCR_VISIBLE_DEVICES"] != "0,1" {
 		t.Fatalf("env=%v", env)
+	}
+	if _, ok := env["HYPERLOOM_SIGNING_KEY_PEM"]; ok {
+		t.Fatal("signing private key was copied into the workload env")
+	}
+	secrets, _, _ := unstructured.NestedSlice(obj.Object, "spec", "secrets")
+	if len(secrets) != 1 {
+		t.Fatalf("secrets=%v", secrets)
+	}
+	secretRef, _ := secrets[0].(map[string]any)
+	if secretRef["id"] != sandboxID || secretRef["type"] != "general" {
+		t.Fatalf("secret=%v", secretRef)
 	}
 	if _, ok := env[platformInferenceKey]; ok {
 		t.Fatal("platform inference key was copied")
@@ -80,6 +93,13 @@ func TestWorkloadObjectUsesTemplateResources(t *testing.T) {
 	images, _, _ := unstructured.NestedStringSlice(obj.Object, "spec", "images")
 	if len(images) != 1 || images[0] != "example@sha256:aa" {
 		t.Fatalf("images=%v", images)
+	}
+	if _, found, _ := unstructured.NestedFieldNoCopy(obj.Object, "spec", "timeout"); found {
+		t.Fatal("timeout must wait until the workload is running")
+	}
+	labels, _, _ := unstructured.NestedMap(obj.Object, "spec", "customerLabels")
+	if labels["excluded-nodes"] != "node-a node-b" {
+		t.Fatalf("customerLabels=%v", labels)
 	}
 }
 
@@ -141,6 +161,14 @@ func TestCreateWorkloadWaitsForPod(t *testing.T) {
 		result.PodPort != envdPort || result.NodeName != "node-b" || result.Kind != store.WorkloadKind {
 		t.Fatalf("result=%+v", result)
 	}
+	stored, err := dc.Tracker().Get(workloadGVR, "", sandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	timeout, _, _ := unstructured.NestedInt64(stored.(*unstructured.Unstructured).Object, "spec", "timeout")
+	if timeout != 60 {
+		t.Fatalf("timeout=%d", timeout)
+	}
 	if err := creator.Delete(context.Background(), result.SandboxName); err != nil {
 		t.Fatal(err)
 	}
@@ -191,6 +219,118 @@ func TestCreateDeletesFailedWorkload(t *testing.T) {
 	if _, getErr := dc.Tracker().Get(workloadGVR, "", sandboxID); getErr == nil {
 		t.Fatal("failed workload was not deleted")
 	}
+}
+
+func TestSigningSecretFollowsTheWorkload(t *testing.T) {
+	const sandboxID = "sbx-7a9b9b693452f613877992145c818d29"
+	prev := workloadPollInterval
+	workloadPollInterval = time.Millisecond
+	t.Cleanup(func() { workloadPollInterval = prev })
+
+	creator, dc := signingWorkloadCreator(t, sandboxID, "Running")
+	_, err := creator.Create(context.Background(), signingCreateRequest(sandboxID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := dc.Tracker().Get(secretGVR, signingSecretNamespace, sandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := stored.(*unstructured.Unstructured)
+	bound, _, _ := unstructured.NestedString(secret.Object, "metadata", "annotations", signingSecretWorkspaceAnnotation)
+	if bound != `["top-models"]` {
+		t.Fatalf("workspace binding=%q", bound)
+	}
+	kind, _, _ := unstructured.NestedString(secret.Object, "metadata", "labels", signingSecretTypeLabel)
+	if kind != signingSecretTypeGeneral {
+		t.Fatalf("secret type=%q", kind)
+	}
+	finalizers, _, _ := unstructured.NestedStringSlice(secret.Object, "metadata", "finalizers")
+	if len(finalizers) != 1 || finalizers[0] != signingSecretFinalizer {
+		t.Fatalf("finalizers=%v", finalizers)
+	}
+	refs, _, _ := unstructured.NestedSlice(secret.Object, "metadata", "ownerReferences")
+	if len(refs) != 1 {
+		t.Fatalf("ownerReferences=%v", refs)
+	}
+	ref, _ := refs[0].(map[string]any)
+	if ref["kind"] != "Workload" || ref["name"] != sandboxID || ref["apiVersion"] != workloadAPIVersion {
+		t.Fatalf("owner=%v", ref)
+	}
+	data, _, _ := unstructured.NestedString(secret.Object, "data", signingSecretKey)
+	if data == "" {
+		t.Fatal("signing key data is empty")
+	}
+	wl, err := dc.Tracker().Get(workloadGVR, "", sandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, _, _ := unstructured.NestedMap(wl.(*unstructured.Unstructured).Object, "spec", "env")
+	if _, ok := env["HYPERLOOM_SIGNING_KEY_PEM"]; ok {
+		t.Fatal("signing private key was copied into the workload env")
+	}
+}
+
+func TestSigningSecretIsDeletedWhenCreateFails(t *testing.T) {
+	const sandboxID = "sbx-7a9b9b693452f613877992145c818d29"
+	prev := workloadPollInterval
+	workloadPollInterval = time.Millisecond
+	t.Cleanup(func() { workloadPollInterval = prev })
+
+	creator, dc := signingWorkloadCreator(t, sandboxID, "Failed")
+	if _, err := creator.Create(context.Background(), signingCreateRequest(sandboxID)); err == nil {
+		t.Fatal("expected failure")
+	}
+	if _, err := dc.Tracker().Get(workloadGVR, "", sandboxID); err == nil {
+		t.Fatal("failed workload was not deleted")
+	}
+	if _, err := dc.Tracker().Get(secretGVR, signingSecretNamespace, sandboxID); err == nil {
+		t.Fatal("signing secret was not deleted")
+	}
+}
+
+func signingCreateRequest(sandboxID string) e2b.CreateRequest {
+	return e2b.CreateRequest{
+		SandboxID: sandboxID, TemplateID: "ar-run-dev-g2", Namespace: "agent-sandbox-system",
+		Role: "dev", SessionID: "s-8f2a", Workspace: "top-models",
+		UserID: "u-123", GrantID: "gr-01jb7m9k2x", Attestation: "eyJ.test",
+		SigningKeyPEM: "test-private-key", Timeout: time.Minute,
+	}
+}
+
+func signingWorkloadCreator(t *testing.T, sandboxID, phase string) (*SafeWorkloadCreator, *dynfake.FakeDynamicClient) {
+	t.Helper()
+	scheme := k8sruntime.NewScheme()
+	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "sandbox-pod", Namespace: "top-models",
+			Labels: map[string]string{safeWorkloadIDLabel: sandboxID},
+		},
+		Spec:   corev1.PodSpec{NodeName: "node-b"},
+		Status: corev1.PodStatus{PodIP: "10.2.0.4", Phase: corev1.PodRunning},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(testCodeInterpreter(), pod).Build()
+	dc := dynfake.NewSimpleDynamicClientWithCustomListKinds(k8sruntime.NewScheme(), map[schema.GroupVersionResource]string{
+		workloadGVR: "WorkloadList",
+		secretGVR:   "SecretList",
+	})
+	dc.PrependReactor("get", "workloads", func(action k8stesting.Action) (bool, k8sruntime.Object, error) {
+		get := action.(k8stesting.GetAction)
+		stored, err := dc.Tracker().Get(workloadGVR, get.GetNamespace(), get.GetName())
+		if err != nil {
+			return true, nil, err
+		}
+		obj := stored.(*unstructured.Unstructured).DeepCopy()
+		_ = unstructured.SetNestedField(obj.Object, phase, "status", "phase")
+		return true, obj, nil
+	})
+	return NewSafeWorkloadCreator(dc, cl), dc
 }
 
 func TestWorkloadNameMatchesSandboxID(t *testing.T) {
@@ -269,6 +409,41 @@ func TestWorkloadTimeoutSeconds(t *testing.T) {
 	}
 	if got := workloadTimeoutSeconds(now.Add(-1500*time.Millisecond), now, 2*time.Second); got != 4 {
 		t.Fatalf("rounded=%d", got)
+	}
+}
+
+func TestWorkloadObjectCarriesStepsAndHostPaths(t *testing.T) {
+	ci := testCodeInterpreter()
+	ci.Spec.Template.Steps = []runtimev1alpha1.SandboxBuildStep{
+		{Type: "env", Args: []string{"RUNNER_CACHE=1"}},
+		{Type: "workdir", Args: []string{"/opt/runner"}},
+		{Type: "run", Args: []string{"install-runner"}},
+	}
+	ci.Spec.Template.Volumes = []corev1.Volume{{
+		Name:         "cache",
+		VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/data/runner-cache"}},
+	}}
+	const sandboxID = "sbx-7a9b9b693452f613877992145c818d29"
+	obj, err := workloadObject(sandboxID, e2b.CreateRequest{
+		SandboxID: sandboxID, TemplateID: ci.Name, Role: "dev", SessionID: "s-8f2a",
+		Workspace: "top-models", GrantID: "gr-01jb7m9k2x", Attestation: "eyJ.test",
+	}, ci)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, _, _ := unstructured.NestedMap(obj.Object, "spec", "env")
+	if env["RUNNER_CACHE"] != "1" || env[startupEnv] != "cd '/opt/runner' && install-runner" {
+		t.Fatalf("env=%v", env)
+	}
+	paths, _, _ := unstructured.NestedStringSlice(obj.Object, "spec", "hostpath")
+	if len(paths) != 1 || paths[0] != "/data/runner-cache" {
+		t.Fatalf("hostpath=%v", paths)
+	}
+}
+
+func TestROCRVisibleDevices(t *testing.T) {
+	if rocrVisibleDevices(0) != "" || rocrVisibleDevices(1) != "0" || rocrVisibleDevices(2) != "0,1" {
+		t.Fatalf("0=%q 1=%q 2=%q", rocrVisibleDevices(0), rocrVisibleDevices(1), rocrVisibleDevices(2))
 	}
 }
 

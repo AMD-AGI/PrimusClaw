@@ -33,6 +33,10 @@ type CreateRequest struct {
 	// Attestation is the Claw JWT copied onto the Workload annotation.
 	Attestation string
 	Env         map[string]string
+	// SigningKeyPEM is the PKCS#8 Ed25519 private key written into a sealed sandbox.
+	SigningKeyPEM string
+	// AvoidNodes are node names the Workload must not run on, space-separated.
+	AvoidNodes string
 }
 
 // CreateResult is the running sandbox address.
@@ -48,6 +52,19 @@ type CreateResult struct {
 type Runner interface {
 	Create(ctx context.Context, req CreateRequest) (CreateResult, error)
 	Delete(ctx context.Context, sandboxID string) error
+}
+
+// Workload phases returned by WorkloadObserver.
+const (
+	WorkloadRunning  = "running"
+	WorkloadPending  = "pending"
+	WorkloadFinished = "finished"
+	WorkloadMissing  = "missing"
+)
+
+// WorkloadObserver reads a sandbox Workload left behind by a restarted control plane.
+type WorkloadObserver interface {
+	Observe(ctx context.Context, sandboxID string) (CreateResult, string, error)
 }
 
 // TimeoutRunner updates the stored lifetime of a sandbox.
