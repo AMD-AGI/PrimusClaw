@@ -38,6 +38,7 @@ import pino from "pino";
 import { randomUUID } from "node:crypto";
 import { getProvider } from "../llm/index.js";
 import type { LlmSession } from "../llm/provider.js";
+import { looksLikeToolArgumentsRejection, sanitizeToolUseInputs } from "../llm/tool-input.js";
 
 const logger = pino({ name: "agent-loop" });
 
@@ -1733,6 +1734,13 @@ class AgentLoopRunner {
     // Backoff (ms) per attempt index. Jittered ±50% to spread reconnect storms
     // across concurrent agent loops in the same brain pod / cluster.
     const STREAM_BACKOFF_MS = [5_000, 15_000, 30_000];
+    // The model endpoint refuses a request whose replayed history holds a tool
+    // call with non-object arguments, and the history is replayed every turn,
+    // so the refusal repeats forever. The providers already coerce on the way
+    // out; this is the second line, for a shape they did not catch. Once per
+    // call: a second refusal after repairing is not something more repairing
+    // can fix.
+    let sanitizedRetryUsed = false;
     for (let attempt = 0; ; attempt++) {
       try {
         // Filter accumulated [system-notice]: messages before each
@@ -1744,6 +1752,27 @@ class AgentLoopRunner {
       } catch (err: any) {
         let code = err?.code as string | undefined;
         const errMsg = err?.message || String(err);
+        if (!sanitizedRetryUsed && !this.signal?.aborted && looksLikeToolArgumentsRejection(err)) {
+          sanitizedRetryUsed = true;
+          const repaired = sanitizeToolUseInputs(this.workingMessages);
+          // Repairing nothing means the request that comes next is byte-for-byte
+          // the one that was just refused; say so and fail as before.
+          metrics.onToolArgsRejected(repaired.repaired > 0 ? "retried" : "nothing_to_repair");
+          logger.error(
+            { err: errMsg.slice(0, 300), code, turn, sessionId: this.sessionId, repaired: repaired.repaired },
+            "agent-loop.tool_args_rejected",
+          );
+          if (repaired.repaired > 0) {
+            metrics.onToolInputRepaired("retry", repaired.repaired);
+            // In place, so the checkpoint written at the end of the turn carries
+            // the repaired history instead of the poisoned one.
+            this.workingMessages.length = 0;
+            this.workingMessages.push(...repaired.messages);
+            // The refusal was ours to fix, not a transient: it spends no retry.
+            attempt--;
+            continue;
+          }
+        }
         const isTruncated = code === "STREAM_TRUNCATED"
           || code === "TOOL_INPUT_EMPTY"
           || code === "TOOL_INPUT_PARSE_FAILED";

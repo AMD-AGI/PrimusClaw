@@ -155,6 +155,18 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- A session no longer becomes unusable after a turn that called a tool whose name
+  reads as a credential field (for example `mcp__*__apikey_*`). Brain's redactor
+  replaced such a tool's whole `argumentsDetail` entry with the string
+  `"<redacted>"`; that string was stored with the turn and replayed to the model as
+  the call's input, the model endpoint answered 400 ("function.arguments must be a
+  JSON object") to the whole request, and every later turn of the session failed
+  the same way within two seconds. The entry now stays an object with every value
+  still masked; `reconstructHistory` turns any stored non-object input (including
+  rows already written) into one; both model providers send object inputs on the
+  wire and store streamed calls whose arguments decode to `[]` or `null` as
+  objects; and a 400 of that kind repairs the history and retries once
+  (`claw_brain_llm_tool_args_rejected_total`, `claw_brain_llm_tool_input_repaired_total`).
 - `deploy/upgrade.sh` no longer drops `PG_SSL_NO_VERIFY`. Only `deploy.sh`
   read it, so the first upgrade of a deployment installed with it re-rendered
   the API at verify-full, and against a PGO-managed database every new API pod

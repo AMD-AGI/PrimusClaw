@@ -3,6 +3,7 @@
 
 import { db } from "../infra/db.js";
 import type { Message } from "@claw/protocol";
+import { coerceToolInput } from "@claw/utils";
 
 import { getMemoryEntries, getProfileEntry, getMemoryPreference } from "../memory/service.js";
 import { CLAW_MEMORY_ENABLED } from "../config.js";
@@ -68,7 +69,15 @@ export function reconstructHistory(
         // Reconstruct as {type:"tool_use", id, name, input}.
         const id = (tc as any).actionId ?? (tc as any).id;
         const name = (tc as any).tool ?? (tc as any).name;
-        const input = (tc as any).argumentsDetail?.[name] ?? (tc as any).input ?? {};
+        // The stored value is whatever the event carried, which is not always an
+        // object: Brain's redactor used to replace the whole input with the string
+        // "<redacted>" for a tool whose NAME looks like a credential field
+        // (`mcp__*__apikey_*`). Replayed as-is, that string reaches the model
+        // endpoint as a tool call whose arguments are not a JSON object, the
+        // endpoint answers 400 to the whole request, and every later turn of the
+        // session fails the same way. Rows written before that was fixed are
+        // still in the table, so the guarantee has to be made here, on read.
+        const input = coerceToolInput((tc as any).argumentsDetail?.[name] ?? (tc as any).input);
         if (id && name) assistantContent.push({ type: "tool_use", id, name, input });
       }
 

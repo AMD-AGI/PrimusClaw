@@ -313,8 +313,57 @@ function redactValue(
   seen.add(value);
   const out: Record<string, unknown> = {};
   for (const [childKey, childValue] of Object.entries(value as Record<string, unknown>)) {
-    out[childKey] = redactValue(childValue, seen, runtimeSecrets, childKey);
+    out[childKey] = key === TOOL_ARGS_KEY && isToolInputObject(childValue)
+      ? redactToolArguments(childKey, childValue, seen, runtimeSecrets)
+      : redactValue(childValue, seen, runtimeSecrets, childKey);
   }
+  seen.delete(value);
+  return out;
+}
+
+/** Event field that maps a tool NAME to that call's input object. */
+const TOOL_ARGS_KEY = "argumentsDetail";
+
+function isToolInputObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/**
+ * Redact one `argumentsDetail[toolName]` entry without changing its type.
+ *
+ * The key here is a tool name, not a data field, but it went through the same
+ * key-name gate as everything else. A name such as `mcp__safe__apikey_list`
+ * contains the credential word `apikey`, so the whole input OBJECT was replaced
+ * by the string "<redacted>". That string is persisted with the turn and
+ * replayed to the model as the tool call's input; the model endpoint refuses a
+ * tool call whose arguments are not a JSON object, rejects the entire request,
+ * and the session fails every later turn.
+ *
+ * A name that looks like a credential is still a reason to withhold the
+ * values, so a sensitive tool name masks every leaf instead of collapsing the
+ * subtree. Keys and nesting stay, so the entry is still an object, and no value
+ * under it survives.
+ */
+function redactToolArguments(
+  toolName: string,
+  input: Record<string, unknown>,
+  seen: WeakSet<object>,
+  runtimeSecrets: RuntimeSecrets,
+): unknown {
+  if (!isSensitiveKey(toolName)) return redactValue(input, seen, runtimeSecrets, toolName);
+  return maskLeaves(input, seen);
+}
+
+function maskLeaves(value: unknown, seen: WeakSet<object>): unknown {
+  if (value === null || value === undefined || value === "") return value;
+  if (typeof value !== "object") return "<redacted>";
+  if (seen.has(value)) return "<redacted:cyclic>";
+  seen.add(value);
+  const out: unknown = Array.isArray(value)
+    ? value.map((item) => maskLeaves(item, seen))
+    : Object.fromEntries(
+        Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, maskLeaves(v, seen)]),
+      );
   seen.delete(value);
   return out;
 }
