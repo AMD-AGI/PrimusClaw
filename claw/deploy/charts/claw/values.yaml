@@ -485,8 +485,8 @@ secret:
 
 # Signing key for Agent Sandbox grants. The private key lives in
 # agent-sandbox-system/agent-sandbox-grant, key signing-key.pem. Copy that key
-# into this namespace as `secretName` before setting enabled: the API and Brain
-# pods cannot read a Secret in another namespace.
+# into this namespace as `secretName` before setting enabled. Only the API
+# mounts it. Brain asks the API to extend and reissue.
 grantSigningKey:
   enabled: false
   secretName: primus-claw-grant-signing-key
