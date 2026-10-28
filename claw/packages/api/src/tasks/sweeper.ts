@@ -900,6 +900,62 @@ export async function reapExpiredDoorbellRuns(): Promise<number> {
   return r.rowCount;
 }
 
+/** How many times one run's finishing may be handed to a new worker before it is left for an operator. */
+const APP_FINISH_REQUEUE_MAX = 5;
+
+/**
+ * Give a run left in `finishing` by a holder that lost its lease back to a live Brain.
+ *
+ * An app run has two rows: the task (who holds the lease, and whether the run
+ * is over as far as the queue is concerned) and `claw_app_runs` (how far the
+ * finishing steps got). A cancel, `reapLostLeases` and `reapStaleTasks` close
+ * the TASK, and a worker that lost its lease mid-finish is refused every write
+ * (`not_holder`) -- so the task is terminal while the run row sits in
+ * `finishing`, its sandbox up and its grant live, with no row any Brain can
+ * claim. An orphaned `running` run is taken over because its task is still
+ * non-terminal and gets redelivered; this is the same takeover for a run whose
+ * task was closed first. The task goes back to `queued` with the lease cleared,
+ * the scheduler dispatches it like any queued task, and the AppRunner reads the
+ * row and carries on from the step the last holder stopped at (every finishing
+ * step is recorded in `last_exit.finish_done`, so none is repeated).
+ *
+ * Only a lease that is dead for the grace, and only `finishing`: a `running`
+ * run with a closed task is not a finish to resume. Bounded, so a run whose
+ * finish cannot complete is not handed round for ever.
+ */
+export async function requeueUnfinishedAppRuns(): Promise<number> {
+  const rows = await applyTaskStatusTransition("queued", {
+    extra: {
+      lease_owner: null,
+      lease_expires_at: null,
+      heartbeat_at: null,
+      internal_token_hash: null,
+      attempt_id: null,
+      started_at: null,
+    },
+    setSql: [
+      "completed_at = NULL",
+      `metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{app_finish_requeues}',
+                           to_jsonb(COALESCE((metadata->>'app_finish_requeues')::int, 0) + 1))`,
+    ],
+    where: `mode = 'app'
+        AND executor = 'brain'
+        AND status IN ('cancelling','cancelled','failed')
+        AND (lease_expires_at IS NULL OR lease_expires_at < NOW() - ($1::int * INTERVAL '1 second'))
+        AND (completed_at IS NULL OR completed_at < NOW() - ($1::int * INTERVAL '1 second'))
+        AND COALESCE((metadata->>'app_finish_requeues')::int, 0) < $2::int
+        AND EXISTS (SELECT 1 FROM claw_app_runs r
+                     WHERE r.task_id = claw_tasks.task_id AND r.state = 'finishing')`,
+    params: [LEASE_LOST_GRACE_SEC, APP_FINISH_REQUEUE_MAX],
+  });
+  if (!rows.length) return 0;
+  logger.warn(
+    { requeued: rows.length, ids: rows.map((row: ClawTaskRow) => row.task_id) },
+    "sweeper.requeued_unfinished_app_runs",
+  );
+  return rows.length;
+}
+
 export async function reapLostLeases(): Promise<number> {
   const reaped = await applyTaskStatusTransition(
     { sql: "CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'failed' END", terminal: true },
@@ -2689,6 +2745,8 @@ export async function sweeperTick(): Promise<void> {
   // with the reason that explains it rather than the one that noticed second.
   await runContained("sweeper.requeued_doorbell_leases_failed", requeueLostDoorbellLeases);
   await runContained("sweeper.lost_leases_failed", reapLostLeases);
+  // After the reapers that close a task: a run they closed mid-finish is handed back here.
+  await runContained("sweeper.unfinished_app_runs_failed", requeueUnfinishedAppRuns);
   // After reapLostLeases, so an accepted row whose worker died is closed as
   // worker_lost by its own reaper rather than reclassified as one that never
   // executed. Each contained independently: a throw from one must not cost the
