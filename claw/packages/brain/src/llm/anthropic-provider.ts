@@ -455,12 +455,13 @@ export function buildAnthropicSession(
         capture,
         cacheState,
       ),
-      async complete(systemPrompt, userText, maxTokens, signal) {
+      async complete(systemPrompt, userText, maxTokens, signal, options) {
         const resp = await client.messages.create({
           model,
           max_tokens: maxTokens,
           system: systemPrompt,
           messages: [{ role: "user", content: userText }],
+          ...(options?.effort ? { output_config: { effort: options.effort } } : {}),
         }, signal ? { signal } : undefined);
         const text = resp.content
           .filter((b) => b.type === "text")

@@ -13,7 +13,7 @@ import {
   TODO_WRITE_ENABLED, EXIT_PLAN_MODE_ENABLED,
   COMPACTION_TRIGGER_INPUT_TOKENS,
   CHECKPOINT_TURN_INTERVAL, CHECKPOINT_MAX_WALL_GAP_MS,
-  LLM_CACHE_TTL,
+  LLM_CACHE_TTL, HITL_SUMMARY_MODEL,
 } from "../config.js";
 import {
   HandsRebuildFailed,
@@ -31,7 +31,8 @@ import { HandsClient, isHandsNetworkError, isHandsToolTimeout, explainHandsError
 import { isSandboxTool } from "../tools/hands.js";
 import type { HookRunner } from "./hooks.js";
 import { refusalMessage, type HitlController } from "./hitl.js";
-import { latestUserText } from "./approval-explain.js";
+import { latestUserText, type Completer } from "./approval-explain.js";
+import { summaryCompleter, summarySessionId } from "./summary-completer.js";
 import { metrics } from "../infra/metrics.js";
 import { isTrackedRun, whileRecovering, whileWaiting, type WaitMode } from "../tasks/run-phase.js";
 import pino from "pino";
@@ -325,6 +326,8 @@ export interface LoopOptions {
    *  else the loop needs already arrives through this interface, and that one
    *  module-level call was what made the file untestable. */
   llmSession?: LlmSession;
+  /** Test seam: HITL_SUMMARY_MODEL for this loop, where the deployment's setting is read at import. */
+  hitlSummaryModel?: string;
 }
 
 // ── P1: todo_write in-loop state ──
@@ -633,6 +636,8 @@ class AgentLoopRunner {
   private readonly signal?: AbortSignal;
   private readonly userId?: string;
   private readonly sessionId?: string;
+  /** Built on the first approval and kept, so a refused summary model is refused once per run. */
+  private summaryComplete?: Completer;
   private readonly depth: number;
   /** A sub-agent runs inside the slot its parent holds, so its waits must not
    *  park: that would hand back a slot this loop never acquired. */
@@ -869,6 +874,27 @@ class AgentLoopRunner {
     // seam is opts.llmSession (tests only), which does not change the
     // configured protocol and therefore cannot mislabel a real deployment.
     this.wireProtocol = getProvider().name;
+  }
+
+  /**
+   * The completer for an approval card's summary. With HITL_SUMMARY_MODEL set it is a session on that
+   * model on THIS run's gateway with THIS run's key (`this.apiKey`, already resolved by
+   * resolveRequestLlmKey: the user's own key, or the platform key in proxy mode); no other key is in
+   * scope here. The id the gateway pins a backend by is NOT the run's: see summarySessionId. Unset, it is
+   * the run's own session, as it always was, with the run's own id.
+   */
+  private summaryCompleter(): Completer {
+    this.summaryComplete ??= summaryCompleter({
+      model: this.opts.hitlSummaryModel ?? HITL_SUMMARY_MODEL,
+      runSession: this.session,
+      open: (model) => getProvider().createSession({
+        model, apiUrl: this.apiUrl, apiKey: this.apiKey, userId: this.userId,
+        // Not the run's own id: this is a different model, and the gateway's session affinity keys on it.
+        sessionId: summarySessionId(this.sessionId),
+      }),
+      onRefused: (_model, status) => metrics.onApprovalSummaryModelRefused(status),
+    });
+    return this.summaryComplete;
   }
 
   async run(): Promise<LoopResult> {
@@ -1838,7 +1864,7 @@ class AgentLoopRunner {
           toolDescription: this.tools.find((t) => t.name === toolName)?.description,
           intent: this.turnText,
           userText: latestUserText(this.workingMessages),
-          complete: (system, user, maxTokens, signal) => this.session.complete(system, user, maxTokens, signal),
+          complete: this.summaryCompleter(),
         },
       });
       // Waiting on a person, which is the longest wait a run has and the one
