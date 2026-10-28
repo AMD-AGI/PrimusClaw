@@ -32,7 +32,7 @@ const signingPublicKeyMetadata = metadataPrefix + "signing-public-key"
 // nodeNameMetadata is the node the sandbox pod was scheduled onto.
 const nodeNameMetadata = metadataPrefix + "node-name"
 
-// sameNodeMetadata records that the sandbox runs as one pod on one node.
+// sameNodeMetadata is set only when the pod landed on a node the caller asked to avoid.
 const sameNodeMetadata = metadataPrefix + "same-node"
 
 // avoidNodesMetadata lists nodes the workload must not run on.
@@ -233,6 +233,20 @@ func excludedNodesLabel(raw string) string {
 		out = append(out, part)
 	}
 	return strings.Join(out, " ")
+}
+
+// landedOnAvoidedNode reports whether node is one of the names in avoid-nodes.
+func landedOnAvoidedNode(node, avoidRaw string) bool {
+	node = strings.TrimSpace(node)
+	if node == "" {
+		return false
+	}
+	for _, name := range strings.Fields(excludedNodesLabel(avoidRaw)) {
+		if name == node {
+			return true
+		}
+	}
+	return false
 }
 
 // parseMetadataQuery reads a metadata query string.

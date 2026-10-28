@@ -251,7 +251,9 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 	if result.NodeName != "" {
 		running.Metadata = map[string]string{
 			nodeNameMetadata: result.NodeName,
-			sameNodeMetadata: "true",
+		}
+		if landedOnAvoidedNode(result.NodeName, metadata[avoidNodesMetadata]) {
+			running.Metadata[sameNodeMetadata] = "true"
 		}
 	}
 	if err := s.grants.MarkRunning(context.WithoutCancel(ctx), grantID, sandboxID, running); err != nil {

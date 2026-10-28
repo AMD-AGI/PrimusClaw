@@ -239,6 +239,40 @@ func TestCallerCancelKeepsThePendingSandbox(t *testing.T) {
 	}
 }
 
+func TestSameNodeMarksOnlyAnAvoidedNode(t *testing.T) {
+	cases := []struct {
+		avoid string
+		want  string
+	}{
+		{},
+		{avoid: "elsewhere"},
+		{avoid: "elsewhere,node-a", want: "true"},
+		{avoid: "node-b; node-a", want: "true"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.avoid, func(t *testing.T) {
+			svc, _, keys := testPlane(t, 600, []int32{1}, 1)
+			md := map[string]string{}
+			if tc.avoid != "" {
+				md[avoidNodesMetadata] = tc.avoid
+			}
+			got, status, err := svc.Create(context.Background(), keys["measurement"], CreateBody{
+				TemplateID: "runner", Timeout: 60, Metadata: md,
+			})
+			if err != nil || status != http.StatusCreated {
+				t.Fatalf("status=%d err=%v", status, err)
+			}
+			ref, err := svc.grants.Sandbox(context.Background(), "gr-01jb7m9k2x", "measurement", got.SandboxID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ref.Metadata[nodeNameMetadata] != "node-a" || ref.Metadata[sameNodeMetadata] != tc.want {
+				t.Fatalf("metadata=%v", ref.Metadata)
+			}
+		})
+	}
+}
+
 func TestCreateReplayKillAndQuota(t *testing.T) {
 	svc, runner, keys := testPlane(t, 600, []int32{1}, 1)
 	key := keys["measurement"]
@@ -266,7 +300,7 @@ func TestCreateReplayKillAndQuota(t *testing.T) {
 	if err != nil || ref.PendingTimeoutSec != int64(defaultPendingWait/time.Second) {
 		t.Fatalf("ref=%+v err=%v", ref, err)
 	}
-	if ref.Metadata["agent-sandbox.io/signing-public-key"] != "" || ref.Metadata["agent-sandbox.io/same-node"] != "true" || ref.Metadata["agent-sandbox.io/node-name"] != "node-a" {
+	if ref.Metadata["agent-sandbox.io/signing-public-key"] != "" || ref.Metadata["agent-sandbox.io/same-node"] != "" || ref.Metadata["agent-sandbox.io/node-name"] != "node-a" {
 		t.Fatalf("unsealed metadata=%v", ref.Metadata)
 	}
 	second, status, err := svc.Create(context.Background(), key, CreateBody{
@@ -294,7 +328,7 @@ func TestCreateReplayKillAndQuota(t *testing.T) {
 	if listed.Sandboxes[0].StartedAt == "" || listed.Sandboxes[0].EndAt == "" || listed.Sandboxes[0].CPUCount < 1 || listed.Sandboxes[0].MemoryMB < 128 || listed.Sandboxes[0].Metadata["agent-sandbox.io/team"] != "a" {
 		t.Fatalf("listed=%+v", listed.Sandboxes[0])
 	}
-	if listed.Sandboxes[0].Metadata["agent-sandbox.io/signing-public-key"] != "" || listed.Sandboxes[0].Metadata["agent-sandbox.io/same-node"] != "true" || listed.Sandboxes[0].Metadata["agent-sandbox.io/node-name"] != "node-a" {
+	if listed.Sandboxes[0].Metadata["agent-sandbox.io/signing-public-key"] != "" || listed.Sandboxes[0].Metadata["agent-sandbox.io/same-node"] != "" || listed.Sandboxes[0].Metadata["agent-sandbox.io/node-name"] != "node-a" {
 		t.Fatalf("metadata=%v", listed.Sandboxes[0].Metadata)
 	}
 	if created.SigningKeyPEM != "" {
