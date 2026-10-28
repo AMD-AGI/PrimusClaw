@@ -24,10 +24,10 @@ import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync,
+  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 process.env.S3_API_ENDPOINT = "http://127.0.0.1:1";
@@ -69,6 +69,8 @@ class Sandbox {
   inFlight = 0;
   maxInFlight = 0;
   private clock = 1_700_000_000;
+  /** What names this sandbox across clients, as `HandsClient.generation` (its MCP url) does. */
+  readonly generation = `http://sandbox.test/${basename(this.root)}/mcp`;
 
   constructor() { created.push(this.root, this.state); }
 
@@ -110,6 +112,7 @@ class Sandbox {
   }
 
   readonly client = {
+    generation: this.generation,
     callTool: async (tool: string, args: Record<string, unknown>): Promise<string> => {
       if (tool === "bash") {
         const command = String(args.command);
@@ -148,8 +151,13 @@ class Sandbox {
     },
   } as unknown as HandsClient;
 
-  sync(prefixOverride?: string) {
-    return syncWorkspaceToS3(this.client, "sess-1", "user-1",
+  /** What the next run builds: another client object around the same sandbox, which this one never saw. */
+  newRunClient(): HandsClient {
+    return { generation: this.generation, callTool: (t: string, a: Record<string, unknown>) => this.client.callTool(t, a) } as unknown as HandsClient;
+  }
+
+  sync(prefixOverride?: string, client: HandsClient = this.client) {
+    return syncWorkspaceToS3(client, "sess-1", "user-1",
       prefixOverride ? { s3PrefixOverride: prefixOverride } : undefined);
   }
 }
@@ -208,7 +216,94 @@ test("D3 a file rewritten with the content it already had is not uploaded (the p
   // have to read the files again to learn the same thing.
   const digestsBefore = sb.digestCalls();
   await sb.sync();
-  assert.equal(sb.digestCalls(), digestsBefore, "unchanged by size and mtime: no digest needed");
+  assert.equal(sb.digestCalls(), digestsBefore, "unchanged by size, mtime and ctime: no digest needed");
+});
+
+// The ways userland puts an old mtime on a file it has just rewritten. The content is
+// the same size, so only the digest can tell it from the version in S3; ctime is the
+// field these cannot set, and it is what sends the file there.
+const sh = (command: string): void => {
+  const r = spawnSync("bash", ["-c", command], { encoding: "utf-8" });
+  assert.equal(r.status, 0, `${command}: ${r.stderr}`);
+};
+const T_FIXED = 1_600_000_000;
+interface MtimeRestore {
+  name: string;
+  /** Rewrites `pkg/VERSION` to `1.2.4` (same size as `1.2.3`) so that it carries mtime T_FIXED again. */
+  rewrite: (sb: Sandbox) => void;
+}
+const MTIME_RESTORES: MtimeRestore[] = [
+  {
+    name: "utimes after the write",
+    rewrite: (sb) => { sb.put("pkg/VERSION", "1.2.4", T_FIXED); },
+  },
+  {
+    name: "tar x of an archive built with that mtime",
+    rewrite: (sb) => {
+      const stage = `${sb.root}-stage`;
+      created.push(stage);
+      sh(`mkdir -p ${stage}/pkg && printf 1.2.4 > ${stage}/pkg/VERSION && touch -d @${T_FIXED} ${stage}/pkg/VERSION`
+        + ` && tar -C ${stage} -cf ${stage}.tar pkg && tar -C ${sb.root} -xf ${stage}.tar`);
+    },
+  },
+  {
+    name: "cp -p from a source with that mtime",
+    rewrite: (sb) => {
+      const stage = `${sb.root}-stage`;
+      created.push(stage);
+      sh(`mkdir -p ${stage} && printf 1.2.4 > ${stage}/VERSION && touch -d @${T_FIXED} ${stage}/VERSION`
+        + ` && cp -p ${stage}/VERSION ${sb.root}/pkg/VERSION`);
+    },
+  },
+  {
+    name: "touch -r a file with that mtime",
+    rewrite: (sb) => {
+      const stage = `${sb.root}-stage`;
+      created.push(stage);
+      sh(`mkdir -p ${stage} && touch -d @${T_FIXED} ${stage}/ref && printf 1.2.4 > ${sb.root}/pkg/VERSION`
+        + ` && touch -r ${stage}/ref ${sb.root}/pkg/VERSION`);
+    },
+  },
+];
+for (const c of MTIME_RESTORES) {
+  test(`D3b a same-size rewrite that puts the recorded mtime back is uploaded: ${c.name}`, async () => {
+    // Release 1.2.3 is synced and recorded. The next release has the same six bytes
+    // and the same archive mtime, so size and mtime alone call it unchanged and S3
+    // keeps 1.2.3 for the next cold restore.
+    const sb = new Sandbox();
+    sb.put("pkg/VERSION", "1.2.3", T_FIXED);
+    sb.put("other.txt", "unrelated");
+    await sb.sync();
+    const before = statSync(join(sb.root, "pkg/VERSION"));
+
+    c.rewrite(sb);
+    const after = statSync(join(sb.root, "pkg/VERSION"));
+    assert.equal(readFileSync(join(sb.root, "pkg/VERSION"), "utf-8"), "1.2.4");
+    assert.equal(after.size, before.size, "the same size");
+    assert.equal(after.mtimeMs, before.mtimeMs, "the same mtime: the premise of the case");
+    assert.ok(after.ctimeMs > before.ctimeMs, "and the one field it could not put back");
+
+    sb.resetUploads();
+    const r = await sb.sync();
+    assert.deepEqual(sb.uploaded, ["/workspace/pkg/VERSION"], "sent, though size and mtime did not move");
+    assert.equal(r.unchanged, 1, "and the file that was not touched is still recognised");
+  });
+}
+
+test("D3c a change to ctime alone (chmod) is digested, found unchanged and not uploaded", async () => {
+  const sb = threeFiles();
+  await sb.sync();
+  sb.resetUploads();
+
+  chmodSync(join(sb.root, "dir/b.txt"), 0o755);
+  const digestsBefore = sb.digestCalls();
+  const r = await sb.sync();
+  assert.deepEqual(sb.uploaded, [], "the bytes are the ones in S3");
+  assert.equal(r.unchanged, 3);
+  assert.equal(sb.digestCalls(), digestsBefore + 1, "but the sandbox was asked to hash it, once");
+
+  await sb.sync();
+  assert.equal(sb.digestCalls(), digestsBefore + 1, "and the refreshed record does not ask again");
 });
 
 test("D4 a deleted file is forgotten, so bringing it back uploads it again", async () => {
@@ -352,6 +447,17 @@ test("D11 a record that is not whole is not believed", async () => {
   writeFileSync(join(sb.state, shards[1]), lost.replace(/"gen":"[0-9a-f]+"/, '"gen":"0000000000000000"'));
   const mixed = await planUploadDelta(sb.client, prefix, files, exclude, { shardFiles: 2 });
   assert.equal(mixed?.pending.length, 5, "shards from two writes are not one record");
+
+  // A record written before ctime was kept (version 1, entries of three) cannot say
+  // whether a restored mtime is the old file; its entries are not read.
+  await (await planUploadDelta(sb.client, prefix, files, exclude, { shardFiles: 2 }))?.commit();
+  const whole = await planUploadDelta(sb.client, prefix, files, exclude, { shardFiles: 2 });
+  assert.equal(whole?.unchanged, 5, "written afresh, it is believed");
+  for (const shard of sb.manifestFiles()) {
+    writeFileSync(join(sb.state, shard), readFileSync(join(sb.state, shard), "utf-8").replace('"v":2', '"v":1'));
+  }
+  const old = await planUploadDelta(sb.client, prefix, files, exclude, { shardFiles: 2 });
+  assert.equal(old?.pending.length, 5, "a version 1 record vouches for nothing");
 
   // A record that is not JSON at all.
   for (const s of sb.manifestFiles()) writeFileSync(join(sb.state, s), "not json\n");
@@ -551,6 +657,91 @@ test("F6 a record that cannot be neutralised is not believed by the syncs after 
   assert.equal(settled.unchanged, 3);
 });
 
+test("F7 a record that could not be neutralised is still not believed by the next run's client", async () => {
+  // A run builds its own client around a sandbox that served earlier runs, and the
+  // runner replaces it mid-run too, so a note kept on the client object is gone by
+  // the next turn. The note is about the sandbox.
+  const sb = threeFiles();
+  await sb.sync();
+
+  sb.remove("dir/c.txt");
+  sb.prelude = RM_EACCES;
+  sb.writeRefused = true;
+  await sb.sync(undefined, sb.newRunClient());
+
+  sb.put("dir/c.txt", "charlie"); // the content and size the record remembers; S3 pruned it
+  sb.resetUploads();
+  const back = await sb.sync(undefined, sb.newRunClient());
+  assert.ok(sb.uploaded.includes("/workspace/dir/c.txt"), "a third client does not trust the record either");
+  assert.equal(back.unchanged, undefined);
+
+  // The sandbox is fixed; whichever client asks next takes the record away, and deltas resume.
+  sb.prelude = "";
+  sb.writeRefused = false;
+  sb.resetUploads();
+  await sb.sync(undefined, sb.newRunClient());
+  assert.equal(sb.uploaded.length, 3);
+  sb.resetUploads();
+  const settled = await sb.sync(undefined, sb.newRunClient());
+  assert.deepEqual(sb.uploaded, []);
+  assert.equal(settled.unchanged, 3);
+});
+
+test("F8 an invalidate call that never comes back does not leave the record trusted by the next run", async () => {
+  // Sync 0 records config.py = A. Turn 1 makes it B; the sandbox does not answer the
+  // call that drops the record (and, as a whole, the overwrite is not tried), and the
+  // upload of B does not land. Turn 2 is a new run with a new client: config.py is
+  // A again under a new mtime. S3 holds B.
+  const sb = new Sandbox();
+  sb.put("config.py", "A");
+  sb.put("other.py", "o");
+  await sb.sync();
+
+  sb.put("config.py", "B");
+  sb.reply = (c) => { if (c.startsWith("rm -f")) throw new Error("fetch failed"); return undefined; };
+  sb.failPaths.add("/workspace/config.py");
+  sb.writes = [];
+  const one = await sb.sync(undefined, sb.newRunClient());
+  assert.equal(one.exhausted, true);
+  assert.deepEqual(sb.writes, [], "nobody answered, so no overwrite was attempted");
+
+  sb.reply = undefined;
+  sb.failPaths.clear();
+  sb.put("config.py", "A");
+  sb.resetUploads();
+  await sb.sync(undefined, sb.newRunClient());
+  assert.ok(sb.uploaded.includes("/workspace/config.py"), "S3 holds B, so A has to be sent again");
+});
+
+test("F9 what is remembered about sandboxes is bounded, and drops the one touched longest ago", async () => {
+  const calls = new Map<string, string[]>();
+  const stub = (id: string, rmThrows: boolean): HandsClient => ({
+    generation: id,
+    callTool: async (_tool: string, args: Record<string, unknown>): Promise<string> => {
+      const command = String(args.command ?? "");
+      (calls.get(id) ?? calls.set(id, []).get(id)!).push(command);
+      if (rmThrows && command.startsWith("rm -f")) throw new Error("fetch failed");
+      return "";
+    },
+  } as unknown as HandsClient);
+  const exclude = findExcludeArgs(s3Excludes());
+  const prefix = "users/u/sessions/bounded/";
+  const firstCall = async (id: string): Promise<string | undefined> => {
+    calls.delete(id);
+    await planUploadDelta(stub(id, true), prefix, ["/workspace/a"], exclude);
+    return calls.get(id)?.[0];
+  };
+
+  const ids = Array.from({ length: 1100 }, (_, i) => `http://bounded.test/${i}/mcp`);
+  for (const id of ids) await invalidateSyncManifest(stub(id, true), prefix);
+
+  // Probe newest first: each probe is itself a failed removal, which makes that
+  // sandbox the most recently touched, so the probes must not disturb the rest.
+  assert.match((await firstCall(ids[1099])) ?? "", /^rm -f /, "the newest is remembered: its removal is retried first");
+  assert.match((await firstCall(ids[1000])) ?? "", /^rm -f /, "so is one 99 back");
+  assert.doesNotMatch((await firstCall(ids[0])) ?? "", /^rm -f /, "the oldest fell out: it goes straight to listing");
+});
+
 /** A command's real output, with and without the line it ends on. */
 function realOutput(sb: Sandbox, command: string): { whole: string; cut: string } {
   const whole = sb.run(command).stdout;
@@ -677,16 +868,19 @@ test("D14 a batch that throws fails only its own files, which the next round sen
 
 test("P1 the stat listing is read by its shape, and a truncated one is not read at all", () => {
   const ok = parseStatListing(
-    "5 2026-10-27 14:12:07.123456789 +0000 /workspace/a.txt\n"
-    + "12 2026-10-27 14:12:08.000000000 +0000 /workspace/with space/it's.txt\n"
-    + "not a stat line\n",
+    "5|2026-10-27 14:12:07.123456789 +0000|2026-10-27 14:13:00.000000001 +0000|/workspace/a.txt\n"
+    + "12|2026-10-27 14:12:08.000000000 +0000|2026-10-27 14:12:08.000000000 +0000|/workspace/with space/it's|odd.txt\n"
+    + "not a stat line\n"
+    + "7 2026-10-27 14:12:07 +0000 /workspace/old-format-without-ctime\n",
   );
   assert.deepEqual([...(ok ?? [])], [
-    ["/workspace/a.txt", { size: "5", mtime: "2026-10-27 14:12:07.123456789 +0000" }],
-    ["/workspace/with space/it's.txt", { size: "12", mtime: "2026-10-27 14:12:08.000000000 +0000" }],
+    ["/workspace/a.txt", { size: "5", mtime: "2026-10-27 14:12:07.123456789 +0000", ctime: "2026-10-27 14:13:00.000000001 +0000" }],
+    ["/workspace/with space/it's|odd.txt", {
+      size: "12", mtime: "2026-10-27 14:12:08.000000000 +0000", ctime: "2026-10-27 14:12:08.000000000 +0000",
+    }],
   ]);
   assert.equal(
-    parseStatListing("5 2026-10-27 14:12:07 +0000 /workspace/a\n[stdout truncated; 4096 bytes dropped]\n"),
+    parseStatListing("5|2026-10-27 14:12:07 +0000|2026-10-27 14:12:07 +0000|/workspace/a\n[stdout truncated; 4096 bytes dropped]\n"),
     null,
     "Hands says it dropped output: what is left is not the whole tree",
   );

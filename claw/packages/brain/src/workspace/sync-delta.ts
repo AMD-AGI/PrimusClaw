@@ -13,17 +13,30 @@
  *
  * This module answers the narrower question "what has changed since the last
  * sync that landed", from a manifest the sandbox keeps of what it uploaded:
- * for each file its size, its mtime and a content digest. It is part of the one
+ * for each file its size, its mtime, its ctime and a content digest. It is part of the one
  * sync, not a second one -- the listing, the upload batches, the retry rounds
  * and the prune are all still `syncWorkspaceToS3`'s; this only shortens the list
  * the upload step is handed.
  *
- * The comparison is rsync's, plus one step rsync does not need. A file whose size
- * and mtime match the manifest is unchanged. A file whose mtime differs is only
- * *possibly* changed, and the step on top is a digest: the engine rewrites the
- * session's skill files on every turn with the content they already had, which
- * bumps every mtime and would defeat a size-and-mtime check on exactly the files
- * the median turn is made of.
+ * The comparison is rsync's, plus two steps rsync does not need. A file whose
+ * size, mtime and ctime all match the manifest is unchanged. A file where any of
+ * them differs is only *possibly* changed, and the step on top is a digest: the
+ * engine rewrites the session's skill files on every turn with the content they
+ * already had, which bumps every mtime and would defeat a size-and-mtime check on
+ * exactly the files the median turn is made of.
+ *
+ * Why ctime, and not size and mtime alone: mtime is something userland sets.
+ * `tar x`, `unzip`, `cp -p`, `rsync -a` and `touch -r` all put an archive's or a
+ * source's mtime on what they write, so a same-size rewrite carrying the recorded
+ * mtime (the next release of a reproducibly built archive: `VERSION` 1.2.3 ->
+ * 1.2.4, same six bytes, same mtime) looks untouched and would never be digested
+ * or uploaded. ctime is the kernel's: no syscall sets it, a write bumps it, and
+ * so does `utimensat` itself, so every one of those rewrites moves it and falls
+ * through to the digest. That is the cheapest test that is also correct -- one
+ * more field on the `stat` that is already run, no hashing of files that did not
+ * move -- where the alternatives hash every file each turn, or trust a clock
+ * userland can write. (It still trusts a filesystem to keep a ctime of its own;
+ * a mount that reports ctime == mtime for everything gets the old guarantee.)
  *
  * Where the manifest lives, and why:
  *
@@ -58,10 +71,11 @@ const logger = pino({ name: "s3-sync-delta" });
 /** Where sandboxes keep their manifests. Outside /workspace on purpose. */
 export const SYNC_STATE_DIR = "/tmp/.claw-s3-sync";
 const WORKSPACE_ROOT = "/workspace/";
-const MANIFEST_VERSION = 1;
+/** 2: entries carry the ctime too; a version 1 record, which does not, is not read. */
+const MANIFEST_VERSION = 2;
 /** Files per manifest shard: ~130 B each, so a shard stays far under Hands' ~1MB body. */
 const SHARD_FILES = 2000;
-/** A file larger than this is never digested; if its mtime moves it is re-uploaded. */
+/** A file larger than this is never digested; if its mtime or ctime moves it is re-uploaded. */
 const DIGEST_MAX_BYTES = 16 * 1024 * 1024;
 /** Bytes of file names per `sha256sum` command line. */
 const DIGEST_CHUNK_BYTES = 48 * 1024;
@@ -101,12 +115,14 @@ export function finishedOutput(raw: string): string | null {
   return lines.slice(0, end - 1).join("\n");
 }
 
-/** [size, mtime, digest]; the digest is "" for a file that was not digested. */
-type Entry = [string, string, string];
+/** [size, mtime, ctime, digest]; the digest is "" for a file that was not digested. */
+type Entry = [string, string, string, string];
 
 interface FileStat {
   size: string;
   mtime: string;
+  /** Inode change time: what the kernel sets, and userland cannot. */
+  ctime: string;
 }
 
 /**
@@ -136,20 +152,22 @@ function statePrefix(s3Prefix: string): string {
 }
 
 /**
- * `size mtime name` for every file the listing's `find` would visit, or null when
- * the sandbox could not say.
+ * `size|mtime|ctime|name` for every file the listing's `find` would visit, or null
+ * when the sandbox could not say.
  *
- * `%y` rather than `%Y`: where the filesystem keeps nanoseconds it prints them,
- * which makes "same size, same mtime, different content" need a write within one
- * nanosecond of the previous one. It is only ever compared for equality, so a
- * sandbox whose `stat` prints seconds works the same way, coarser.
+ * `%y` and `%z` rather than `%Y` and `%Z`: where the filesystem keeps nanoseconds
+ * they print them, which makes "same size, same times, different content" need a
+ * write within one nanosecond of the previous one. They are only ever compared for
+ * equality, so a sandbox whose `stat` prints seconds works the same way, coarser.
+ * The fields are `|`-separated because a timestamp has spaces in it; the name is
+ * last, so it may hold anything.
  */
 export function parseStatListing(raw: string): Map<string, FileStat> | null {
   if (TRUNCATED_FOOTER.test(raw)) return null;
   const out = new Map<string, FileStat>();
   for (const line of raw.split("\n")) {
-    const m = /^(\d+) (.+?) (\/workspace\/.+)$/.exec(line.endsWith("\r") ? line.slice(0, -1) : line);
-    if (m) out.set(m[3], { size: m[1], mtime: m[2] });
+    const m = /^(\d+)\|([^|]+)\|([^|]+)\|(\/workspace\/.+)$/.exec(line.endsWith("\r") ? line.slice(0, -1) : line);
+    if (m) out.set(m[4], { size: m[1], mtime: m[2], ctime: m[3] });
   }
   return out;
 }
@@ -161,7 +179,7 @@ async function statFiles(hands: HandsClient, excludeArgs: string): Promise<Map<s
     // is not whole, and half a listing is not "the files that changed".
     const raw = finishedOutput(await bash(
       hands,
-      `find /workspace -type f ${excludeArgs} -exec stat -c '%s %y %n' {} + 2>/dev/null; echo ${DONE}`,
+      `find /workspace -type f ${excludeArgs} -exec stat -c '%s|%y|%z|%n' {} + 2>/dev/null; echo ${DONE}`,
       STAT_TIMEOUT_SEC,
     ));
     if (raw === null) {
@@ -205,7 +223,7 @@ async function digestFiles(hands: HandsClient, paths: string[]): Promise<Map<str
       }
       for (const [p, d] of parseDigestListing(raw)) out.set(p, d);
     } catch (e) {
-      // Not fatal: a file without a digest is uploaded when its mtime moved.
+      // Not fatal: a file without a digest is uploaded when its mtime or ctime moved.
       logger.warn({ err: (e as Error)?.message ?? String(e) }, "s3.sync_delta.digest_failed");
     }
   };
@@ -245,7 +263,7 @@ async function readManifest(hands: HandsClient, s3Prefix: string): Promise<Map<s
       if (shard.gen !== gen || shard.n !== shards || seen.has(shard.i)) return null;
       seen.add(shard.i);
       for (const [path, e] of Object.entries(shard.files ?? {})) {
-        if (!Array.isArray(e) || e.length !== 3 || e.some((x) => typeof x !== "string")) return null;
+        if (!Array.isArray(e) || e.length !== 4 || e.some((x) => typeof x !== "string")) return null;
         files.set(path, e as Entry);
       }
     }
@@ -258,22 +276,45 @@ async function readManifest(hands: HandsClient, s3Prefix: string): Promise<Map<s
 }
 
 /**
- * Prefixes whose record this process could not neutralise, per sandbox client.
+ * Prefixes whose record this Brain process could not neutralise, per sandbox.
  *
  * A record that can neither be removed nor overwritten stays on disk, and the
  * next sync that finds every file matching it believes it -- after S3 has moved
  * on (a pruned object whose file comes back, an upload that did not finish). The
  * sandbox cannot be asked to remember that, since whatever stopped it taking the
- * record away stops it holding a note too, so this process does, for as long as
- * it talks to that sandbox: a poisoned prefix is not planned from until the
- * record has been confirmed gone.
+ * record away stops it holding a note too, so Brain does: a poisoned prefix is
+ * not planned from, and its removal is tried again first, until the record has
+ * been confirmed gone. A call that never came back counts the same as one that
+ * was refused: nobody confirmed anything.
+ *
+ * The key is the sandbox (`HandsClient.generation`, its MCP url), not the client
+ * object. A run builds its own client around a sandbox that already served
+ * earlier runs, and replaces it mid-run, so a note kept on the object would last
+ * one client and the next turn would trust the record again. The note lives as
+ * long as this process does, which is as far as Brain can remember anything: a
+ * restarted Brain, or another one talking to the same sandbox, starts without it.
+ * Sandboxes that are never heard from again leave their note behind, so the table
+ * is bounded and drops the one touched longest ago first; a sandbox that falls out
+ * is trusted again, which costs what a sandbox with no note costs.
  */
-const unneutralised = new WeakMap<HandsClient, Set<string>>();
+const UNNEUTRALISED_MAX_SANDBOXES = 1024;
+const unneutralised = new Map<string, Set<string>>();
+
+function isUnneutralised(hands: HandsClient, s3Prefix: string): boolean {
+  return unneutralised.get(hands.generation)?.has(s3Prefix) === true;
+}
 
 function markUnneutralised(hands: HandsClient, s3Prefix: string, yes: boolean): void {
-  let set = unneutralised.get(hands);
-  if (!set) unneutralised.set(hands, (set = new Set()));
+  const sandbox = hands.generation;
+  const set = unneutralised.get(sandbox) ?? new Set<string>();
   if (yes) set.add(s3Prefix); else set.delete(s3Prefix);
+  // Re-inserted so the map's order is "touched longest ago first"; an empty set is not kept.
+  unneutralised.delete(sandbox);
+  if (set.size === 0) return;
+  unneutralised.set(sandbox, set);
+  while (unneutralised.size > UNNEUTRALISED_MAX_SANDBOXES) {
+    unneutralised.delete(unneutralised.keys().next().value as string);
+  }
 }
 
 /**
@@ -297,8 +338,11 @@ function markUnneutralised(hands: HandsClient, s3Prefix: string, yes: boolean): 
  * that wrote it overwrites the first shard with one `readManifest` refuses, which
  * is as unusable as a missing one (every shard has to be present and of one write).
  * Only when both fail is the answer false: the caller does not use the record,
- * and this process stops planning from that prefix until a later call confirms it
- * gone (`unneutralised`).
+ * and this Brain process stops planning from that prefix, whichever run asks,
+ * until a later call confirms it gone (`unneutralised`). A `bash` call that never
+ * comes back is the same answer without the overwrite: a sandbox that does not
+ * answer one RPC will not answer a second inside the same grace window, so the
+ * retry is left to the next sync, which is made when it can.
  */
 export async function invalidateSyncManifest(
   hands: HandsClient, s3Prefix: string, timeoutSec: number = STATE_TIMEOUT_SEC,
@@ -394,7 +438,7 @@ export async function planUploadDelta(
   const shardFiles = opts.shardFiles ?? SHARD_FILES;
   // A record this process could not take away is not planned from, and is taken
   // away again first: the sandbox may have been fixed since.
-  if (unneutralised.get(hands)?.has(s3Prefix) && !(await invalidateSyncManifest(hands, s3Prefix))) return null;
+  if (isUnneutralised(hands, s3Prefix) && !(await invalidateSyncManifest(hands, s3Prefix))) return null;
   const stats = await statFiles(hands, excludeArgs);
   // A sandbox that cannot stat gets no optimisation and no manifest, not a guess.
   if (!stats || stats.size === 0) return null;
@@ -409,7 +453,8 @@ export async function planUploadDelta(
     const st = stats.get(path);
     if (!st) { pending.add(path); continue; }
     const old = prev?.get(rel(path));
-    if (old && old[0] === st.size && old[1] === st.mtime) {
+    // ctime too: mtime can be put back by `tar x`, `cp -p`, `touch -r`, and ctime cannot.
+    if (old && old[0] === st.size && old[1] === st.mtime && old[2] === st.ctime) {
       entries.set(path, old);
       unchanged++;
     } else {
@@ -422,13 +467,13 @@ export async function planUploadDelta(
   );
   for (const { path, st, old } of candidates) {
     const digest = digests.get(path) ?? "";
-    if (digest && old && old[0] === st.size && old[2] === digest) {
-      entries.set(path, [st.size, st.mtime, digest]);
+    if (digest && old && old[0] === st.size && old[3] === digest) {
+      entries.set(path, [st.size, st.mtime, st.ctime, digest]);
       unchanged++;
       refreshed++;
     } else {
       pending.add(path);
-      entries.set(path, [st.size, st.mtime, digest]);
+      entries.set(path, [st.size, st.mtime, st.ctime, digest]);
     }
   }
 
