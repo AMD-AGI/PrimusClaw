@@ -473,7 +473,7 @@ func (c *SafeWorkloadCreator) waitRunning(ctx context.Context, name, workspace s
 		phase, _, _ := unstructured.NestedString(obj.Object, "status", "phase")
 		switch phase {
 		case "Failed", "Succeeded", "Stopped":
-			return false, fmt.Errorf("workload %s phase %s", name, phase)
+			return false, terminalWorkloadError(name, phase, obj)
 		case "Running":
 			if _, remote := c.remoteClusters[cluster]; remote && cluster != "" {
 				podIP = ""
@@ -510,6 +510,155 @@ func nodeFromUsage(obj *unstructured.Unstructured) string {
 		node, _, _ := unstructured.NestedString(raw, "node")
 		if node != "" {
 			return node
+		}
+	}
+	return ""
+}
+
+const workloadFailureLimit = 480
+
+// terminalWorkloadError names the finished phase and the failure text SaFE stored.
+func terminalWorkloadError(name, phase string, obj *unstructured.Unstructured) error {
+	text := workloadFailureText(obj)
+	if text == "" {
+		return fmt.Errorf("workload %s phase %s", name, phase)
+	}
+	return fmt.Errorf("workload %s phase %s: %s", name, phase, text)
+}
+
+// workloadFailureText is status.message, else the failed condition, plus the first pod detail.
+func workloadFailureText(obj *unstructured.Unstructured) string {
+	if obj == nil {
+		return ""
+	}
+	message, _, _ := unstructured.NestedString(obj.Object, "status", "message")
+	head, detail := splitFailureDetails(strings.TrimSpace(message))
+	if head == "" && detail == "" {
+		head, detail = splitFailureDetails(conditionFailureMessage(obj))
+	}
+	if detail == "" {
+		detail = firstPodFailure(obj)
+	}
+	text := head
+	if detail != "" {
+		if text != "" {
+			text += "; " + detail
+		} else {
+			text = detail
+		}
+	}
+	text = strings.Join(strings.Fields(text), " ")
+	if len(text) > workloadFailureLimit {
+		return text[:workloadFailureLimit]
+	}
+	return text
+}
+
+func splitFailureDetails(message string) (string, string) {
+	const marker = ", details: "
+	head, raw, ok := strings.Cut(message, marker)
+	if !ok {
+		return strings.TrimSpace(message), ""
+	}
+	var items []map[string]any
+	if err := json.Unmarshal([]byte(raw), &items); err != nil || len(items) == 0 {
+		return strings.TrimSpace(message), ""
+	}
+	return strings.TrimSpace(head), formatFailureDetail(items[0])
+}
+
+func formatFailureDetail(item map[string]any) string {
+	var parts []string
+	if pod, _ := item["pod"].(string); pod != "" {
+		parts = append(parts, "pod "+pod)
+	}
+	if node, _ := item["node"].(string); node != "" {
+		parts = append(parts, "node "+node)
+	}
+	if message, _ := item["message"].(string); message != "" {
+		parts = append(parts, message)
+	}
+	if container, ok := item["container"].(map[string]any); ok {
+		if name, _ := container["name"].(string); name != "" {
+			parts = append(parts, "container "+name)
+		}
+		if reason, _ := container["reason"].(string); reason != "" {
+			parts = append(parts, "reason "+reason)
+		}
+		if exit, ok := jsonNumber(container["exitCode"]); ok {
+			parts = append(parts, fmt.Sprintf("exit %d", exit))
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func jsonNumber(value any) (int64, bool) {
+	switch n := value.(type) {
+	case float64:
+		return int64(n), true
+	case int64:
+		return n, true
+	case json.Number:
+		v, err := n.Int64()
+		return v, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func conditionFailureMessage(obj *unstructured.Unstructured) string {
+	conditions, _, _ := unstructured.NestedSlice(obj.Object, "status", "conditions")
+	var found string
+	for _, item := range conditions {
+		condition, ok := item.(map[string]any)
+		if !ok || condition["status"] != "True" {
+			continue
+		}
+		kind, _ := condition["type"].(string)
+		if kind != "K8sFailed" && kind != "AdminFailed" {
+			continue
+		}
+		message, _ := condition["message"].(string)
+		if strings.TrimSpace(message) != "" {
+			found = strings.TrimSpace(message)
+		}
+	}
+	return found
+}
+
+func firstPodFailure(obj *unstructured.Unstructured) string {
+	pods, _, _ := unstructured.NestedSlice(obj.Object, "status", "pods")
+	for _, item := range pods {
+		pod, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		phase, _ := pod["phase"].(string)
+		if phase != "" && phase != "Failed" {
+			continue
+		}
+		detail := map[string]any{
+			"pod":     pod["podId"],
+			"node":    pod["adminNodeName"],
+			"message": pod["failedMessage"],
+		}
+		if containers, ok := pod["containers"].([]any); ok {
+			for _, raw := range containers {
+				container, ok := raw.(map[string]any)
+				if !ok {
+					continue
+				}
+				exit, hasExit := jsonNumber(container["exitCode"])
+				reason, _ := container["reason"].(string)
+				if reason == "" && (!hasExit || exit == 0) {
+					continue
+				}
+				detail["container"] = container
+				break
+			}
+		}
+		if text := formatFailureDetail(detail); text != "" {
+			return text
 		}
 	}
 	return ""

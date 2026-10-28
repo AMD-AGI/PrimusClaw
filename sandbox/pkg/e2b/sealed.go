@@ -4,6 +4,7 @@
 package e2b
 
 import (
+	"context"
 	"net/http"
 	"net/url"
 	"path"
@@ -11,16 +12,36 @@ import (
 )
 
 const (
-	// HeaderSealed is set by the Router on the EnvD request.
-	// EnvD trusts it because the Router overwrites any client value.
+	// HeaderSealed is a legacy request header. EnvD does not trust it.
 	HeaderSealed = "X-Sandbox-Sealed"
-	// HeaderInputs lists sealed write roots, comma-separated. Callers may write
-	// children of these paths and may not read them.
+	// HeaderInputs is a legacy request header. EnvD does not trust it.
+	// The token claim lists write roots: a caller may write a child of these paths and may not read them.
 	HeaderInputs = "X-Sandbox-Inputs"
-	// HeaderOutputs lists sealed read roots, comma-separated. Callers may read
-	// these paths and may not write them.
+	// HeaderOutputs is a legacy request header. EnvD does not trust it.
+	// The token claim lists read roots: a caller may read these paths and may not write them.
 	HeaderOutputs = "X-Sandbox-Outputs"
 )
+
+// RequestPolicy is the sealed allow-list carried in a Router-signed token.
+type RequestPolicy struct {
+	Sealed  bool
+	Inputs  []string
+	Outputs []string
+}
+
+type requestPolicyKey struct{}
+
+// WithRequestPolicy stores a verified sealed policy on the request context.
+func WithRequestPolicy(ctx context.Context, policy RequestPolicy) context.Context {
+	return context.WithValue(ctx, requestPolicyKey{}, policy)
+}
+
+// PolicyFrom returns the verified sealed policy. The bool is false when the
+// request has no verified token.
+func PolicyFrom(ctx context.Context) (RequestPolicy, bool) {
+	policy, ok := ctx.Value(requestPolicyKey{}).(RequestPolicy)
+	return policy, ok
+}
 
 // SealedAllows reports whether a sealed sandbox may serve this request.
 // Only file APIs are reachable. Reads must sit under outputs. Writes must sit

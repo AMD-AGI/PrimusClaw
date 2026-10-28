@@ -18,9 +18,11 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	corev1 "k8s.io/api/core/v1"
+
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/agent-sandbox/pkg/e2b"
 
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
@@ -111,8 +113,14 @@ func NewJWTManager(clientset kubernetes.Interface) (*JWTManager, error) {
 	}, nil
 }
 
-// GenerateToken signs a JWT with session_id claim (5min TTL).
+// GenerateToken signs a JWT with session_id and an unsealed policy (5min TTL).
 func (jm *JWTManager) GenerateToken(sessionID string) (string, error) {
+	return jm.GenerateScopedToken(sessionID, e2b.RequestPolicy{})
+}
+
+// GenerateScopedToken signs a JWT whose sealed allow-list EnvD enforces.
+// The lists are omitted when the sandbox is not sealed.
+func (jm *JWTManager) GenerateScopedToken(sessionID string, policy e2b.RequestPolicy) (string, error) {
 	if jm == nil || jm.privateKey == nil {
 		return "", fmt.Errorf("JWT private key is unavailable")
 	}
@@ -125,6 +133,11 @@ func (jm *JWTManager) GenerateToken(sessionID string) (string, error) {
 		"iat":        time.Now().Unix(),
 		"exp":        time.Now().Add(jwtExpiration).Unix(),
 		"session_id": sessionID,
+		"sealed":     policy.Sealed,
+	}
+	if policy.Sealed {
+		claims["inputs"] = policy.Inputs
+		claims["outputs"] = policy.Outputs
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 	return token.SignedString(jm.privateKey)

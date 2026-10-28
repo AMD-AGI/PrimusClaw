@@ -10,7 +10,6 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strconv"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -101,7 +100,11 @@ func (s *Server) proxyEnvD(c *gin.Context, info *store.SandboxInfo, ref runtimev
 	sandboxID := c.GetHeader("E2b-Sandbox-Id")
 	bearer := ""
 	if s.jwt != nil {
-		token, err := s.jwt.GenerateToken(sandboxID)
+		token, err := s.jwt.GenerateScopedToken(sandboxID, e2b.RequestPolicy{
+			Sealed:  ref.Sealed,
+			Inputs:  ref.Inputs,
+			Outputs: ref.Outputs,
+		})
 		if err != nil {
 			log.Error("JWT: failed to sign token; refusing to proxy", "error", err, "session_id", sandboxID)
 			writeGate(c, http.StatusServiceUnavailable, "sandbox_unavailable", "sandbox authentication unavailable")
@@ -123,16 +126,10 @@ func (s *Server) proxyEnvD(c *gin.Context, info *store.SandboxInfo, ref runtimev
 			if sandboxID != "" {
 				req.Header.Set("x-session-id", sandboxID)
 			}
-			// The client can send these. The grant, not the caller, decides them.
-			if ref.Sealed {
-				req.Header.Set(e2b.HeaderSealed, "true")
-				req.Header.Set(e2b.HeaderInputs, strings.Join(ref.Inputs, ","))
-				req.Header.Set(e2b.HeaderOutputs, strings.Join(ref.Outputs, ","))
-			} else {
-				req.Header.Set(e2b.HeaderSealed, "false")
-				req.Header.Del(e2b.HeaderInputs)
-				req.Header.Del(e2b.HeaderOutputs)
-			}
+			// Sealed policy travels in the signed token. Drop any client headers.
+			req.Header.Del(e2b.HeaderSealed)
+			req.Header.Del(e2b.HeaderInputs)
+			req.Header.Del(e2b.HeaderOutputs)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Error("envd proxy: upstream error", "podIP", info.PodIP, "port", port, "error", err)

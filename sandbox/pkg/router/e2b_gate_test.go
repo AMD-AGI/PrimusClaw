@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -90,11 +91,18 @@ func TestE2BGateChecksTokenAndSealedPath(t *testing.T) {
 	if file.code != http.StatusOK || file.body != "from-envd" {
 		t.Fatalf("file=%d %s", file.code, file.body)
 	}
-	if got.Get("X-Sandbox-Sealed") != "true" || got.Get("X-Sandbox-Inputs") != "/in" || got.Get("X-Sandbox-Outputs") != "/out" {
-		t.Fatalf("sealed headers: %#v", got)
+	if got.Get("X-Sandbox-Sealed") != "" || got.Get("X-Sandbox-Inputs") != "" || got.Get("X-Sandbox-Outputs") != "" {
+		t.Fatalf("sealed headers forwarded: %#v", got)
 	}
-	if !strings.HasPrefix(got.Get("Authorization"), "Bearer ") {
-		t.Fatalf("auth %q", got.Get("Authorization"))
+	parsed, err := jwt.Parse(strings.TrimPrefix(got.Get("Authorization"), "Bearer "), func(token *jwt.Token) (any, error) {
+		return mgr.publicKey, nil
+	})
+	if err != nil || !parsed.Valid {
+		t.Fatalf("token: %v", err)
+	}
+	claims := parsed.Claims.(jwt.MapClaims)
+	if claims["sealed"] != true || claimList(claims["inputs"]) != "/in" || claimList(claims["outputs"]) != "/out" {
+		t.Fatalf("claims %#v", claims)
 	}
 	if got.Get("x-session-id") != "sbx-1" {
 		t.Fatalf("session %q", got.Get("x-session-id"))
@@ -133,4 +141,13 @@ func gateRequest(t *testing.T, rawURL, token string) gateResult {
 		t.Fatal(err)
 	}
 	return gateResult{code: resp.StatusCode, body: string(body)}
+}
+
+func claimList(value any) string {
+	items, ok := value.([]any)
+	if !ok || len(items) != 1 {
+		return ""
+	}
+	text, _ := items[0].(string)
+	return text
 }

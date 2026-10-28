@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"sigs.k8s.io/agent-sandbox/pkg/e2b"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
@@ -169,12 +170,21 @@ func (s *Server) proxyRequest(c *gin.Context, targetURL string, sessionID string
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sandbox authentication unavailable"})
 		return
 	}
-	token, err := s.jwt.GenerateToken(sessionID)
+	policy, err := s.sessionPolicy(c, sessionID)
+	if err != nil {
+		log.Error("proxy: failed to read sealed policy", "error", err, "session_id", sessionID)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sandbox authentication unavailable"})
+		return
+	}
+	token, err := s.jwt.GenerateScopedToken(sessionID, policy)
 	if err != nil {
 		log.Error("JWT: failed to sign token; refusing to proxy", "error", err, "session_id", sessionID)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sandbox authentication unavailable"})
 		return
 	}
+	outReq.Header.Del(e2b.HeaderSealed)
+	outReq.Header.Del(e2b.HeaderInputs)
+	outReq.Header.Del(e2b.HeaderOutputs)
 	outReq.Header.Set("Authorization", "Bearer "+token)
 
 	// Execute upstream request
@@ -236,4 +246,20 @@ func (s *Server) proxyRequest(c *gin.Context, targetURL string, sessionID string
 	} else {
 		_, _ = io.Copy(w, resp.Body)
 	}
+}
+
+// sessionPolicy returns the sealed allow-list recorded for a grant sandbox.
+// Other sessions stay unsealed. A grant lookup failure refuses the proxy.
+func (s *Server) sessionPolicy(c *gin.Context, sessionID string) (e2b.RequestPolicy, error) {
+	if s.grants == nil || !strings.HasPrefix(sessionID, "sbx-") {
+		return e2b.RequestPolicy{}, nil
+	}
+	ref, ok, err := s.grants.SandboxByID(c.Request.Context(), sessionID)
+	if err != nil {
+		return e2b.RequestPolicy{}, err
+	}
+	if !ok {
+		return e2b.RequestPolicy{}, nil
+	}
+	return e2b.RequestPolicy{Sealed: ref.Sealed, Inputs: ref.Inputs, Outputs: ref.Outputs}, nil
 }
