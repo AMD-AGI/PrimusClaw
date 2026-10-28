@@ -300,6 +300,16 @@ func (c *SafeWorkloadCreator) Observe(ctx context.Context, sandboxID string) (e2
 		return e2b.CreateResult{}, e2b.WorkloadFinished, nil
 	case "Running":
 		workspace, _, _ := unstructured.NestedString(obj.Object, "spec", "workspace")
+		cluster := obj.GetLabels()[safeClusterIDLabel]
+		if _, remote := c.remoteClusters[cluster]; remote && cluster != "" {
+			return e2b.CreateResult{
+				SandboxName: sandboxID,
+				Namespace:   workspace,
+				PodPort:     envdPort,
+				NodeName:    nodeFromUsage(obj),
+				Cluster:     cluster,
+			}, e2b.WorkloadRunning, nil
+		}
 		ip, node, ok := c.address(ctx, obj, workspace, sandboxID)
 		if !ok {
 			return e2b.CreateResult{}, e2b.WorkloadPending, nil
@@ -310,6 +320,7 @@ func (c *SafeWorkloadCreator) Observe(ctx context.Context, sandboxID string) (e2
 			PodIP:       ip,
 			PodPort:     envdPort,
 			NodeName:    node,
+			Cluster:     cluster,
 		}, e2b.WorkloadRunning, nil
 	default:
 		return e2b.CreateResult{}, e2b.WorkloadPending, nil
