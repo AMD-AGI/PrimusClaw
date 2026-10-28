@@ -33,6 +33,7 @@
  * connection, a marketplace, an LLM and a skill store before it gets this far.
  */
 
+import { applyAppMcpToTask } from "../sessions/app-mcp.js";
 import { doorbellDedupId, taskSubject, type ExecuteRequest } from "@claw/protocol";
 import pino from "pino";
 
@@ -605,6 +606,9 @@ export async function dispatchPendingMessage(
     }
   }
 
+  // The fat branch publishes this task itself; a doorbell turn gets the application's
+  // servers at claim time (tasks/run-claim.ts) and seals none of them.
+  await applyAppMcpToTask(task, sessionId);
   if (!task.user_env || typeof task.user_env !== "object" || !Object.keys(task.user_env).length) {
     await injectLiveUserEnv(task as unknown as ExecuteRequest);
   }

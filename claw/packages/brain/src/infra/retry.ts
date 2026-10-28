@@ -28,7 +28,7 @@ const logger = pino({ name: "retry" });
  * which tripped repeatedly on large-tool-count Opus requests (40 tools, long
  * message history). Per-chunk idle progress is the right abstraction.
  */
-async function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+export async function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
   const ctrl = new AbortController();
   const onCallerAbort = () => ctrl.abort((init.signal as any)?.reason);
   if (init.signal) {

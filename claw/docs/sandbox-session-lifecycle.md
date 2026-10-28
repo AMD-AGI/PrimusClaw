@@ -180,8 +180,9 @@ Claw has a separate queue cap, unrelated to the idle window:
 
 | Config | Default | Role |
 |--------|---------|------|
-| `SANDBOX_IDLE_REUSE_SECONDS` | **15 minutes** (`900`) | Running sandbox, empty `GET /api/jobs`, no in-flight message. Clock starts at `quiescedAt`. Then CAS `ready`→`closing` and `destroyHands`. |
+| `SANDBOX_IDLE_REUSE_SECONDS` | **15 minutes** (`900`) | Running sandbox, empty `GET /api/jobs`, no in-flight message. Clock starts at `quiescedAt`. Then CAS `ready`→`closing` and `destroyHands`. The API's orphan sweep reads the same setting and does not stop a parked sandbox inside the window (a finished turn's DAG row being terminal is the normal state of a sandbox waiting for the next message); after the window either side may reclaim it. Each parked sandbox holds its workload for up to this long after the session's last turn, so this is also the capacity knob: lower it to return workloads sooner at the cost of more cold starts. |
 | `SANDBOX_PENDING_TIMEOUT_SECONDS` | **3 hours** | Sandbox Workload **phase=Pending** queued longer than this → terminal failure `sandbox_pending_timeout` to the frontend. The clock stops after leaving Pending (scheduled). Image pull is not Pending. `0` waits on the queue indefinitely. |
+| `SANDBOX_START_TIMEOUT_SECONDS` | **15 minutes** (`900`) | Workload has left Pending (scheduled) but is still not ready for longer than this → terminal failure `sandbox_start_timeout`, workload stopped. Catches a container that can never start (for example an image that cannot be pulled), which SaFE does not report as a distinct state. The clock restarts if the workload falls back to Pending. `0` disables it. |
 | `SANDBOX_POLL_TIMEOUT_MS` | 1 hour | Ends only when SaFE **status is unreadable** (sustained 5xx, network failure, no phase), reason `sandbox_status_unreadable`. Readable Pending does not trigger it. |
 | SaFE Workload `timeout` | value on the task request (e.g. 46800s) | Hard cap from **StartTime / Running**, excluding queue time. |
 | `RUN_QUEUE_MAX_SEC` (API) | 2 hours | Task row never claimed by a worker; not sandbox Workload Pending. |
@@ -236,3 +237,14 @@ OOM and crash reasons belong on the Workload so brain can distinguish `sandbox_c
 | Pod replaced under the same name | — | Running or terminal | failure `sandbox_instance_replaced` |
 | EnvD exit 0 without Brain stop | — | Succeeded | failure `sandbox_envd_exited` |
 | reclaim vs new message | empty | Running | CAS `closing`; loser does not reuse |
+
+## Interactive terminal claim
+
+A shell opened in a browser terminal is not on the EnvD jobs roster, and the sandbox a plain chat turn used is stopped when that turn's run ends. Left alone, a terminal opened after a turn finds no sandbox, and one started for it is reclaimed within moments.
+
+Two owner-only routes cover this:
+
+- `POST /v1/sessions/:id/sandbox` brings up or reuses the session's sandbox without a model turn. It takes the session gate the way a message does and dispatches a sandbox-only run (`mode: "script"` with an empty script, which Brain provisions a sandbox for up front), so provisioning, reuse, credentials and admission are a turn's own. A turn or earlier call that already holds the gate means nothing is dispatched and the answer is `busy` (a turn that never calls a tool never opens a sandbox); the caller asks again, which is idempotent. Body `{"refresh": true}` distrusts a binding on record. Disable with `SESSION_SANDBOX_START_ENABLED=false` (the route then answers 404).
+- `POST /v1/sessions/:id/sandbox/keepalive` renews the claim; at most one write per session every 10 s.
+
+Both write `termhold.<session>` in the registry bucket: an absolute `until` a short time ahead (`SESSION_SANDBOX_HOLD_SECONDS`, default 300, capped by `BRAIN_REGISTRY_TTL_MS` because the bucket drops keys that are not rewritten). While it is in force, Brain's idle reclaim, the API's last-user stop and the orphan-handle sweep decline to stop the sandbox; session delete and cancel do not consult it. Nobody deletes the claim: a client that goes away stops renewing and it lapses, after which ordinary idle reclaim and the orphan sweep apply. A claim that cannot be read holds, like the other unknowns on those paths.

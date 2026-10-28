@@ -1503,7 +1503,7 @@ const SETTLED_REASON_SQL =
  * this call is core NATS, so if the worker has not subscribed yet it is simply
  * lost, and the run carries on with nothing recording it.
  */
-export async function interruptUnstartedChatRuns(sessionId: string): Promise<number> {
+export async function interruptUnstartedChatRuns(sessionId: string, onlyMessageId?: string): Promise<number> {
   let rows: Array<{
     task_id: string; message_id: string | null; user_id: string | null; prompt: string | null;
     prior_status: string; queued_since: string | null;
@@ -1529,8 +1529,8 @@ export async function interruptUnstartedChatRuns(sessionId: string): Promise<num
           AND (
             status = 'queued'
             OR (status = 'preparing' AND lease_owner IS NULL)
-          )`,
-      params: [sessionId],
+          )${onlyMessageId === undefined ? "" : "\n          AND metadata->>'message_id' = $2"}`,
+      params: onlyMessageId === undefined ? [sessionId] : [sessionId, onlyMessageId],
     });
     rows = cancelled.map((row) => ({
       task_id: row.task_id,
@@ -1676,6 +1676,38 @@ export async function stopSessionRuns(sessionId: string): Promise<number> {
     logger.warn({ err, sessionId }, "chat_run.interrupt_publish_failed");
   }
   return await interruptSessionRuns(sessionId);
+}
+
+/**
+ * Stop the runs of ONE turn on a session, not the session's runs.
+ *
+ * For a caller that decided to stop a particular turn (the trigger time limit)
+ * and must not take out a turn that started after it decided. The decision is
+ * made against the turn's own rows: only rows carrying `messageId` are
+ * cancelled, and the wire interrupt -- which can only be addressed to the whole
+ * session -- is sent only when one of those rows was still live. A turn that has
+ * already ended leaves nothing to match, so a user's next turn in the same
+ * session is never touched.
+ */
+export async function stopTurnRuns(sessionId: string, messageId: string): Promise<number> {
+  const queued = await interruptUnstartedChatRuns(sessionId, messageId);
+  const live = (await db.query(
+    `SELECT task_id FROM claw_tasks
+      WHERE session_id = $1 AND origin = 'chat'
+        AND metadata->>'message_id' = $2
+        AND status IN ('preparing','running')`,
+    [sessionId, messageId],
+  )).rows as Array<{ task_id: string }>;
+  let moved = 0;
+  for (const row of live) if (await cancelUnheldRun(row.task_id)) moved += 1;
+  if (moved > 0) {
+    try {
+      chatRunPorts.publishInterrupt(interruptSubject(sessionId));
+    } catch (err) {
+      logger.warn({ err, sessionId }, "chat_run.interrupt_publish_failed");
+    }
+  }
+  return queued + moved;
 }
 
 /**
@@ -1964,7 +1996,7 @@ export async function applySessionGateTransition(input: {
   const alsoCols = Object.keys(input.also ?? {});
   for (const c of alsoCols) {
     if (!/^[a-z_][a-z0-9_]*$/.test(c)
-        || c === "agent_status" || c === "agent_gate_message_id" || c === "updated_at") {
+        || c === "status" || c === "agent_status" || c === "agent_gate_message_id" || c === "updated_at") {
       throw new Error(`applySessionGateTransition: unsafe extra column ${c}`);
     }
   }
@@ -1979,7 +2011,10 @@ export async function applySessionGateTransition(input: {
     if (input.expectReleaser === false) return false;
     const r = await q.query(
       `UPDATE claw_sessions
-          SET agent_status = $3, agent_gate_message_id = $2, updated_at = NOW()${extra(4)}
+          SET agent_status = $3, agent_gate_message_id = $2, updated_at = NOW(),
+              -- A run starting on an archived session makes it active again, whichever
+              -- entry point started it (native message, compat event, A2A, app run).
+              status = CASE WHEN status = 'archived' THEN 'active' ELSE status END${extra(4)}
         WHERE session_id = $1 AND deleted_at IS NULL
           AND ($4::boolean
                OR agent_gate_message_id IS NULL

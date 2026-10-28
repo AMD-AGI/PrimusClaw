@@ -18,6 +18,7 @@
  *   - Finish session deletions whose cleanup did not complete in the request
  *     that asked for them (see sessions/cleanup-sweep.ts).
  */
+import { interruptKeyOf } from "./lifecycle.js";
 import { commitSessionDeletion } from "../sessions/teardown.js";
 import { withCompletionLock } from "../events/completion-lock.js";
 import { db } from "../infra/db.js";
@@ -259,7 +260,7 @@ async function resolveLiveWorkHoldings(sessionId: string): Promise<SessionHoldin
  */
 function bindingNamesOneOf(bg: SessionBackgroundWork): boolean | "unknown" {
   if (bg.state === "unreadable") return "unknown";
-  if (bg.state === "running" || bg.state === "awaiting") return true;
+  if (bg.state === "running" || bg.state === "awaiting" || bg.state === "reusable") return true;
   return bg.reason !== "no_binding" && bg.reason !== "other_sandbox"
     && bg.reason !== "no_workload";
 }
@@ -398,6 +399,7 @@ export async function reapStaleTasks(): Promise<number> {
     task_id: string;
     session_id: string;
     dag_root_task_id: string | null;
+    mode?: string | null;
     deadline_at: string | null;
     sandbox_workload_id: string | null;
   }>;
@@ -436,11 +438,9 @@ export async function reapStaleTasks(): Promise<number> {
  * terminal either way, and this only closes the gap where it is not.
  */
 async function interruptReapedRuns(
-  rows: Array<{ session_id: string; dag_root_task_id: string | null }>,
+  rows: Array<{ task_id: string; session_id: string; dag_root_task_id: string | null; mode?: string | null }>,
 ): Promise<void> {
-  const keys = new Set(
-    rows.map((row) => row.dag_root_task_id ?? row.session_id).filter(Boolean),
-  );
+  const keys = new Set(rows.map((row) => interruptKeyOf(row)).filter((k): k is string => !!k));
   if (!interruptPublisher.available()) {
     // The sweeper's own tick can outlive a NATS reconnect, and a missing
     // connection must not undo the row updates already committed above.
@@ -2483,6 +2483,20 @@ export async function reapOrphanHandles(lease?: LeaderLease): Promise<number> {
       // reports idle. It would not be coherent on the cancel path, where there
       // is no next time and deferring means never stopping, which is why the
       // guard is here and not inside `stopAllHandlesForDag`.
+      // A terminal the owner has open holds the sandbox, and so does one that is
+      // unreadable. The claim lapses on its own, so this defers rather than
+      // keeps: the next tick after the expiry reaps it like any other orphan.
+      if (sessionId) {
+        const termHold = await handleRegistry.terminalHold(sessionId);
+        if (termHold.state !== "none") {
+          logger.info(
+            { dagRoot, sessionId, hold: termHold.state },
+            "sweeper.orphan_handles_terminal_hold",
+          );
+          deferred++;
+          continue;
+        }
+      }
       const bg = sessionId
         ? await handleRegistry.backgroundWork(sessionId, [...workloads])
         : { state: "clear" as const, reason: "no_workload" as const };
@@ -2515,6 +2529,23 @@ export async function reapOrphanHandles(lease?: LeaderLease): Promise<number> {
         logger.info(
           { dagRoot, sessionId, workloadId: bg.workloadId, running: bg.running, measuredAt: bg.at },
           "sweeper.orphan_handles_background_work",
+        );
+        deferred++;
+        continue;
+      }
+      // A finished turn leaves its sandbox parked for the session's next message
+      // (Brain's SANDBOX_IDLE_REUSE_SECONDS). The DAG row being terminal and
+      // nothing running inside is the normal state of such a sandbox, not
+      // evidence that it is an orphan: reaping on it threw the sandbox away
+      // 56-90 s after each turn and cold-started the next one. Deferred until
+      // the window closes, and then reaped by the rules below like any other.
+      if (bg.state === "reusable") {
+        logger.info(
+          {
+            dagRoot, sessionId, workloadId: bg.workloadId,
+            idleForMs: bg.idleForMs, remainingMs: bg.remainingMs,
+          },
+          "sweeper.orphan_handles_reuse_window",
         );
         deferred++;
         continue;

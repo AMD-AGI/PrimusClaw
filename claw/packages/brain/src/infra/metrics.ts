@@ -50,6 +50,47 @@ const sandboxStartDuration = new Histogram({
   buckets: [1, 5, 10, 30, 60, 120, 300, 600],
   registers: [registry],
 });
+const platformDefaultTotal = new Counter({
+  name: "claw_platform_default_total",
+  help: "Platform-default skill/MCP/config mounts by kind, outcome and reason.",
+  labelNames: ["kind", "outcome", "reason"] as const,
+  registers: [registry],
+});
+const skillStageTotal = new Counter({
+  name: "claw_skill_stage_total",
+  help: "Skills staged on Brain for a turn, by source and where the files came from (cache hit, a download shared with a concurrent turn, or a fresh download).",
+  labelNames: ["source", "outcome"] as const,
+  registers: [registry],
+});
+const platformDefaultChatsTotal = new Counter({
+  name: "claw_platform_default_chats_total",
+  help: "Chats that were offered at least one platform-default skill.",
+  registers: [registry],
+});
+const platformSkillListChars = new Histogram({
+  name: "claw_platform_skill_list_chars",
+  help: "Characters of the progressive platform-skill list placed in the prompt.",
+  buckets: [100, 500, 1000, 2000, 4000, 8000],
+  registers: [registry],
+});
+const platformSkillReadTotal = new Counter({
+  name: "claw_platform_skill_read_total",
+  help: "Platform-default skills whose SKILL.md the agent actually read.",
+  labelNames: ["skill"] as const,
+  registers: [registry],
+});
+const platformSkillLazyWriteTotal = new Counter({
+  name: "claw_platform_skill_lazy_write_total",
+  help: "Lazy writes of platform-default skills into a sandbox, by outcome and whether the sandbox was started for it.",
+  labelNames: ["outcome", "cold_sandbox"] as const,
+  registers: [registry],
+});
+const platformSkillLazyWriteDuration = new Histogram({
+  name: "claw_platform_skill_lazy_write_duration_seconds",
+  help: "Wall-clock time of one lazy platform-skill write.",
+  buckets: [0.05, 0.25, 1, 2, 5, 15, 60],
+  registers: [registry],
+});
 const sandboxStopTotal = new Counter({
   name: "claw_sandbox_stop_total",
   help: "Hands sandbox teardown attempts by outcome.",
@@ -625,6 +666,28 @@ const keepaliveReclaimHeldTotal = new Counter({
 });
 
 export const metrics = {
+  /** One platform-default item resolved, skipped or failed. */
+  onPlatformDefault(kind: "skill" | "mcp" | "config", outcome: "ok" | "failed" | "skipped", reason: string): void {
+    platformDefaultTotal.inc({ kind, outcome, reason });
+  },
+  /** One skill staged for a turn: `outcome` says whether its files were downloaded. */
+  onSkillStage(source: "plugin" | "tool", outcome: "hit" | "joined" | "downloaded"): void {
+    skillStageTotal.inc({ source, outcome });
+  },
+  /** A chat whose prompt carries a progressive platform-skill list. */
+  onPlatformDefaultChat(listChars: number): void {
+    platformDefaultChatsTotal.inc();
+    platformSkillListChars.observe(listChars);
+  },
+  /** The agent read a platform-default skill's SKILL.md. */
+  onPlatformSkillRead(skill: string): void {
+    platformSkillReadTotal.inc({ skill });
+  },
+  /** One lazy write of platform-default skills into a sandbox. */
+  onPlatformSkillLazyWrite(outcome: "ok" | "failed", elapsedSec: number, coldSandbox: boolean): void {
+    platformSkillLazyWriteTotal.inc({ outcome, cold_sandbox: coldSandbox ? "true" : "false" });
+    platformSkillLazyWriteDuration.observe(elapsedSec);
+  },
   /** One sandbox destroyed by keepalive idle reclaim. */
   onKeepaliveReclaim(reason: "idle_empty" | "instance_replaced" | "terminal" | "absent"): void {
     keepaliveReclaimTotal.inc({ reason });

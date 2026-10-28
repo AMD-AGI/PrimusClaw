@@ -39,12 +39,14 @@ import type { AppManifestV1 } from "@claw/protocol";
 test("the fixture manifest is valid, or every case below is vacuous", () => {
   assert.deepEqual(validateAppManifest(MANIFEST), []);
 });
+const PLATFORM_KEY = "ak-platform-key-0123456789";
+
 
 function harness(opts: {
   manifest?: AppManifestV1; grant?: AppGrantRunHooks; seams?: AppRunnerSeams; over?: object;
 } = {}) {
   const world = new World(opts.manifest ?? MANIFEST, opts.over);
-  const runner = () => new AppRunner(RUN_ID, "pk", {
+  const runner = () => new AppRunner(RUN_ID, PLATFORM_KEY, {
     store: world.store, sandbox: world.sandbox, grant: opts.grant, seams: opts.seams,
     now: world.now, sleep: world.sleep, tickMs: 5000,
   });
@@ -768,4 +770,115 @@ test("P7 markEnded closes the row without a sandbox, and reports a refusal inste
   const again = harness();
   again.world.failStore = () => new AppRunWriteRefused("not_holder");
   assert.equal(await again.runner.markEnded("no key"), false);
+});
+
+test("P6 the session owner's platform key, which the sandbox carries as the model credential, is scrubbed too", async () => {
+  const h = harness();
+  const wl = await toRunning(h);
+  const takeover = h.newRunner();
+  h.world.appExits(wl, { final: false, returncode: 2, error: `401 from gateway for key ${PLATFORM_KEY}` });
+  await takeover.reconcile();
+  assert.ok(!JSON.stringify(h.world.rec.last_exit).includes(PLATFORM_KEY), "the platform key is not stored");
+  assert.match(String(h.world.rec.last_exit?.error), /\[redacted\]/);
+});
+
+test("P6 the platform key is scrubbed even when the store's secrets cannot be read, and no text goes out half-scrubbed", async () => {
+  const h = harness();
+  const wl = await toRunning(h);
+  const takeover = h.newRunner();
+  h.world.store.secrets = async () => { throw new Error("API unavailable"); };
+  h.world.appExits(wl, { final: false, returncode: 2, error: `401 for key ${PLATFORM_KEY} and token ${TOKEN}` });
+  await takeover.reconcile().catch(() => undefined);
+  const stored = JSON.stringify(h.world.rec.last_exit ?? {});
+  assert.ok(!stored.includes(PLATFORM_KEY), "the platform key is not stored");
+  assert.ok(!stored.includes(TOKEN), "nor is anything else the unread set would have caught");
+});
+
+// ---------------------------------------------------------------------------
+// C2-09 review follow-ups: the status announcement, the drain, the scrub gate
+// ---------------------------------------------------------------------------
+
+const settle = () => new Promise<void>((r) => setImmediate(r));
+
+test("S1 every state change is announced through one path, including finishNow's and markEnded's", async () => {
+  const states: string[] = [];
+  const seams: AppRunnerSeams = { stateChanged: async (rec) => { states.push(rec.state); } };
+  const h = harness({ seams });
+  await toRunning(h);
+  await settle();
+  assert.deepEqual(states, ["starting", "running"]);
+  await h.runner.finishNow("cancelled");
+  await settle();
+  assert.deepEqual(states, ["starting", "running", "finishing", "ended"], "finishNow's own write to finishing is announced");
+
+  const closed: string[] = [];
+  const bare = harness({ seams: { stateChanged: async (rec) => { closed.push(rec.state); } } });
+  assert.equal(await bare.runner.markEnded("no key"), true);
+  await settle();
+  assert.deepEqual(closed, ["ended"], "markEnded is announced");
+});
+
+test("S1b a stateChanged that fails or hangs does not stop or slow the machine", async () => {
+  const hang = harness({ seams: { stateChanged: () => new Promise<void>(() => undefined) } });
+  await toRunning(hang);
+  const boom = harness({ seams: { stateChanged: async () => { throw new Error("nats down"); } } });
+  await toRunning(boom);
+});
+
+test("S2 a sandbox that is gone is not drained (and says so); a live one is", async () => {
+  let drains = 0;
+  const seams: AppRunnerSeams = { drainEvents: async () => { drains++; } };
+  const live = harness({ seams });
+  await toRunning(live);
+  await live.runner.finishNow("cancelled");
+  assert.equal(drains, 1);
+
+  drains = 0;
+  const gone = harness({ seams });
+  const wl = await toRunning(gone);
+  gone.world.killWorkload(wl, "terminal");
+  await gone.runner.finishNow("cancelled");
+  assert.equal(drains, 0, "no drain against a workload SaFE says is terminal");
+  assert.equal(gone.world.rec.state, "ended");
+});
+
+test("S3 the seams get a scrub only once the run's secrets are loaded", async () => {
+  const seen: Array<((t: string) => string) | undefined> = [];
+  const seams: AppRunnerSeams = { tailEvents: async (ctx) => { seen.push(ctx.scrub); } };
+  const h = harness({ seams });
+  await toRunning(h);
+  await h.runner.reconcile();
+  const armed = seen.at(-1);
+  assert.ok(armed, "armed once the secrets are known");
+  assert.doesNotMatch(armed(`x ${TOKEN} y`), new RegExp(TOKEN));
+  assert.doesNotMatch(armed(`x ${PLATFORM_KEY} y`), new RegExp(PLATFORM_KEY), "the event tailer's scrub covers the platform key");
+
+  // Another Brain takes the run over while the API cannot open the secrets.
+  h.world.store.secrets = async () => { throw new Error("secrets unavailable"); };
+  const taken = h.newRunner();
+  seen.length = 0;
+  await taken.reconcile();
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0], undefined, "no scrub, so a seam that needs one must not read");
+});
+
+test("S4 the ended announcement is out before finishNow returns; a hung one is given up on after the bound", async () => {
+  const order: string[] = [];
+  const slow: AppRunnerSeams = {
+    stateChanged: async (rec) => { if (rec.state === "ended") { await new Promise((r) => setTimeout(r, 30)); order.push("appStatus ended"); } },
+  };
+  const h = harness({ seams: slow });
+  await toRunning(h);
+  await h.runner.finishNow("cancelled");
+  order.push("finishNow returned");
+  assert.deepEqual(order, ["appStatus ended", "finishNow returned"]);
+
+  const hung = new World(MANIFEST);
+  const runner = new AppRunner(RUN_ID, "pk", {
+    store: hung.store, sandbox: hung.sandbox, seams: { stateChanged: (rec) => (rec.state === "ended" ? new Promise<void>(() => undefined) : Promise.resolve()) },
+    now: hung.now, sleep: hung.sleep, tickMs: 5000, statusTimeoutMs: 20,
+  });
+  const started = Date.now();
+  assert.equal(await runner.markEnded("no key"), true);
+  assert.ok(Date.now() - started < 2000, "gave up on the hung announcement");
 });

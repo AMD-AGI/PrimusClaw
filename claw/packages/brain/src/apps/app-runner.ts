@@ -61,6 +61,8 @@ import {
 const logger = pino({ name: "app-runner" });
 
 export const RECONCILE_INTERVAL_MS = 5_000;
+/** How long the `ended` announcement is waited for before the run goes on without it. */
+export const STATUS_PUBLISH_TIMEOUT_MS = 5_000;
 const EXEC_TIMEOUT = "30s";
 /** Consecutive failed launches in one sandbox before it counts as the application failing. */
 const START_FAILURES_BEFORE_RESTART = 3;
@@ -125,6 +127,15 @@ export const noopAppGrant: AppGrantRunHooks = {
 export interface AppRunContext {
   record: AppRunRecord;
   instance: SandboxInstance | null;
+  /** The run's store, at the epoch this worker holds the run at. */
+  store: AppRunStore;
+  /** The submitter's platform key: what the sandbox Router authenticates, when it does. */
+  platformKey: string;
+  /**
+   * `text` with the run's secret values replaced; for anything that reads what the application wrote.
+   * Absent until the secrets have loaded: a seam that needs it waits for it.
+   */
+  scrub?(text: string): string;
 }
 
 /**
@@ -140,6 +151,8 @@ export interface AppRunnerSeams {
   drainEvents?(ctx: AppRunContext): Promise<void>;
   /** Finishing step 4: unregister the session-level MCP (C2-10). */
   unregisterMcp?(ctx: AppRunContext): Promise<void>;
+  /** The run's state moved (5.7: published as `appStatus`). Best effort: a failure is logged and the machine goes on. */
+  stateChanged?(record: AppRunRecord): Promise<void>;
 }
 
 /** The sandbox, as the runner uses it. The real one is {@link realAppSandbox}. */
@@ -163,6 +176,7 @@ export interface AppRunnerDeps {
   now?: () => number;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   tickMs?: number;
+  statusTimeoutMs?: number;
 }
 
 export interface AppRunOutcome {
@@ -253,7 +267,11 @@ export class AppRunner {
   private readonly finishDone = new Set<string>();
   /** Set when the signal given to `run` fires; cleared by `finishNow`, which ends the run on purpose. */
   private halted = false;
-  private secrets: string[] = [];
+  /**
+   * Seeded with the platform key, which is a constructor argument and needs no
+   * read: it is in the set from the first moment, whatever the store does.
+   */
+  private secrets: string[];
   private secretsLoaded = false;
   private readonly grant: AppGrantRunHooks;
   private readonly seams: AppRunnerSeams;
@@ -266,6 +284,7 @@ export class AppRunner {
     private readonly platformKey: string,
     private readonly deps: AppRunnerDeps,
   ) {
+    this.secrets = secretValuesOf({ mcpToken: "", grantKeys: {}, platformKey });
     this.grant = deps.grant ?? noopAppGrant;
     this.seams = deps.seams ?? {};
     this.now = deps.now ?? Date.now;
@@ -380,9 +399,7 @@ export class AppRunner {
     this.halted = false;
     this.rec = await this.deps.store.load(this.runId);
     if (this.rec.state !== "finishing" && this.rec.state !== "ended") {
-      this.rec = await this.deps.store.patch(
-        this.runId, { state: "finishing", last_exit: { at: this.iso(), cause, final: false } },
-      );
+      await this.commit({ state: "finishing", last_exit: { at: this.iso(), cause, final: false } });
     }
     for (let failures = 0; ; ) {
       try {
@@ -408,9 +425,7 @@ export class AppRunner {
    */
   async markEnded(error: string): Promise<boolean> {
     try {
-      this.rec = await this.deps.store.patch(
-        this.runId, { state: "ended", last_exit: { at: this.iso(), cause: "start_failed", final: false, error: clip(error) } },
-      );
+      await this.commit({ state: "ended", last_exit: { at: this.iso(), cause: "start_failed", final: false, error: clip(error) } });
       return true;
     } catch (err) {
       if (err instanceof AppRunWriteRefused) return false;
@@ -459,10 +474,10 @@ export class AppRunner {
     if (this.secretsLoaded) return;
     try {
       const stored = await this.deps.store.secrets(this.runId);
-      this.secrets = secretValuesOf({ mcpToken: stored.mcp_token, grantKeys: stored.grant_keys ?? {} });
+      this.secrets = secretValuesOf({ mcpToken: stored.mcp_token, grantKeys: stored.grant_keys ?? {}, platformKey: this.platformKey });
       this.secretsLoaded = true;
     } catch (err) {
-      logger.warn({ runId: this.runId, err: this.safeText(err) }, "app_run.secrets_unavailable_for_scrub");
+      logger.warn({ runId: this.runId, err: clip(scrub(err instanceof Error ? err.message : String(err), this.secrets)) }, "app_run.secrets_unavailable_for_scrub");
     }
   }
 
@@ -524,7 +539,7 @@ export class AppRunner {
       await this.move({ state: "starting" }, "running");
       return { done: false };
     }
-    if (verdict === "alive") await this.runningSeams({ record: this.rec, instance: inst });
+    if (verdict === "alive") await this.runningSeams(this.seamContext(inst));
     return { done: false };
   }
 
@@ -642,7 +657,7 @@ export class AppRunner {
       grantLimits: granted.limits ?? rec.grant_limits,
       nodeName,
     };
-    this.secrets = secretValuesOf(sources);
+    this.secrets = secretValuesOf({ ...sources, platformKey: this.platformKey });
     this.secretsLoaded = true;
     if (!nodeName) logger.warn({ runId: this.runId }, "app_run.node_name_unavailable");
     return buildAppEnv(sources);
@@ -753,6 +768,12 @@ export class AppRunner {
     return this.countedRestart("sandbox_lost");
   }
 
+  /** False only when SaFE says the workload is terminal or absent; a status that cannot be read throws, and the step retries. */
+  private async sandboxPresent(inst: SandboxInstance): Promise<boolean> {
+    const status = await this.deps.sandbox.status(inst);
+    return status.state !== "terminal" && status.state !== "absent";
+  }
+
   private instance(): SandboxInstance | null {
     const id = this.rec.sandbox_workload_id;
     return id ? this.deps.sandbox.instance(this.sandboxRun(), id) : null;
@@ -772,6 +793,15 @@ export class AppRunner {
 
   // ---- running ------------------------------------------------------------
 
+  private seamContext(instance: SandboxInstance | null): AppRunContext {
+    // `scrub` exists only once the run's secret values are known: a seam that reads
+    // what the application wrote must not forward it while it cannot clean it.
+    return {
+      record: this.rec, instance, store: this.deps.store, platformKey: this.platformKey,
+      ...(this.secretsLoaded ? { scrub: (text: string) => this.scrubbed(text) } : {}),
+    };
+  }
+
   private async runningSeams(ctx: AppRunContext): Promise<void> {
     for (const [name, seam] of [["tail_events", this.seams.tailEvents], ["register_mcp", this.seams.registerMcp]] as const) {
       if (!seam) continue;
@@ -789,13 +819,21 @@ export class AppRunner {
   private async inFinishing(): Promise<TickResult> {
     const rec = this.rec;
     const inst = this.instance();
-    const ctx: AppRunContext = { record: rec, instance: inst };
+    const ctx = this.seamContext(inst);
     const run: AppGrantRun = { runId: this.runId, sessionId: rec.session_id, grantId: rec.grant_id, manifest: rec.manifest };
     const cause = rec.last_exit?.cause ?? "exit";
     const cancelled = cause === "cancelled" || cause === "deadline" || cause === "row_terminal";
 
     if (cancelled && !(await this.step("stop_application", () => this.stopApplication(inst)))) return { done: false };
-    await this.step("drain_events", () => this.seams.drainEvents?.(ctx));
+    await this.step("drain_events", async () => {
+      if (!this.seams.drainEvents) return;
+      // A sandbox that is gone cannot be read: say what was left, do not spend the step's attempts on it.
+      if (inst && !(await this.sandboxPresent(inst))) {
+        logger.warn({ runId: this.runId, workloadId: inst.id, cursor: rec.events_cursor }, "app_run.events_not_drained_sandbox_gone");
+        return;
+      }
+      await this.seams.drainEvents(ctx);
+    });
     await this.step("revoke_grant", async () => {
       await this.grant.revoke(run);
       // Recorded on the row as well, so extendGrant refuses it from here on (and
@@ -957,11 +995,37 @@ export class AppRunner {
   /** Persist a transition, compare-and-set on `from` when given. */
   private async move(patch: AppRunPatch, from?: AppRunState): Promise<void> {
     this.assertActive();
-    this.rec = await this.deps.store.patch(this.runId, patch, from);
+    await this.commit(patch, from);
     logger.info(
       { runId: this.runId, state: this.rec.state, restarts: this.rec.restarts, cause: patch.last_exit?.cause },
       "app_run.transition",
     );
+  }
+
+  /**
+   * The one place a write to the row becomes `this.rec`: every state change,
+   * from `move` and from `finishNow` and `markEnded`, goes through here, and
+   * a changed state is announced to the `stateChanged` seam from here. The
+   * announcement is not awaited (a slow event stream must not slow the machine)
+   * and its failure is only logged.
+   */
+  private async commit(patch: AppRunPatch, from?: AppRunState): Promise<void> {
+    const before = this.rec?.state;
+    this.rec = await this.deps.store.patch(this.runId, patch, from);
+    const seam = this.seams.stateChanged;
+    if (!seam || this.rec.state === before) return;
+    const record = this.rec;
+    const announce = Promise.resolve().then(() => seam(record)).catch((err) => {
+      logger.warn({ runId: this.runId, seam: "state_changed", err: this.safeText(err) }, "app_run.seam_failed");
+    });
+    // The last state is waited for (bounded): the caller goes on to finish the task,
+    // and a client that follows `appStatus` must see `ended` before that completion,
+    // not instead of it. Every other change is announced without waiting.
+    if (record.state === "ended") {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([announce, new Promise<void>((resolve) => { timer = setTimeout(resolve, this.deps.statusTimeoutMs ?? STATUS_PUBLISH_TIMEOUT_MS); })]);
+      clearTimeout(timer);
+    }
   }
 
   private exitRecord(exit: Extract<ExitRead, { kind: "exit" }>, cause: AppLastExit["cause"]): AppLastExit {
@@ -982,7 +1046,14 @@ export class AppRunner {
 
   private iso(): string { return new Date(this.now()).toISOString(); }
 
-  private scrubbed(text: string): string { return scrub(text, this.secrets); }
+  /**
+   * Until the run's own secrets (MCP token, grant keys) have been read the set is
+   * incomplete, and text from the application is not forwarded at all rather than
+   * forwarded partly scrubbed.
+   */
+  private scrubbed(text: string): string {
+    return this.secretsLoaded ? scrub(text, this.secrets) : "[withheld: scrub set incomplete]";
+  }
 
   private safeText(err: unknown): string {
     return clip(this.scrubbed(err instanceof Error ? err.message : String(err)));

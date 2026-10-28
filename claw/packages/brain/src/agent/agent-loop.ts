@@ -30,7 +30,8 @@ import { safePreview } from "@claw/utils";
 import { HandsClient, isHandsNetworkError, isHandsToolTimeout, explainHandsError, handsNetworkErrorReason } from "../clients/hands.js";
 import { isSandboxTool } from "../tools/hands.js";
 import type { HookRunner } from "./hooks.js";
-import type { HitlController } from "./hitl.js";
+import { refusalMessage, type HitlController } from "./hitl.js";
+import { latestUserText } from "./approval-explain.js";
 import { metrics } from "../infra/metrics.js";
 import { isTrackedRun, whileRecovering, whileWaiting, type WaitMode } from "../tasks/run-phase.js";
 import pino from "pino";
@@ -645,6 +646,9 @@ class AgentLoopRunner {
   // --- Resume: pre-populated from checkpoint in the constructor ---
   private workingMessages: Message[];
   private textParts: string[];
+  /** The visible text of the latest model response: what the agent said it was about to do, which an
+   *  approval card shows next to the call that response issued. Never hidden reasoning. */
+  private turnText = "";
   /** Whether the previous turn was empty and was answered with EMPTY_TURN_NUDGE. */
   private emptyTurnNudged = false;
   private usage: TokenUsage;
@@ -1431,6 +1435,7 @@ class AgentLoopRunner {
       avg_output_tps: Math.round(avgOutputTps * 10) / 10,
       ...(routedModel ? { routed_model: routedModel } : {}),
     };
+    this.turnText = content.filter((b: any) => b.type === "text").map((b: any) => String(b.text ?? "")).join(" ");
     for (const b of content) {
       if ((b as any).type === "text") {
         const text = (b as any).text as string;
@@ -1829,6 +1834,12 @@ class AgentLoopRunner {
       const decide = () => this.opts.hitl!.beforeToolUse({
         sessionId: this.sessionId ?? "", userId: this.userId, actionId: toolId,
         tool: toolName, input: finalInput, signal: this.signal,
+        explain: {
+          toolDescription: this.tools.find((t) => t.name === toolName)?.description,
+          intent: this.turnText,
+          userText: latestUserText(this.workingMessages),
+          complete: (system, user, maxTokens, signal) => this.session.complete(system, user, maxTokens, signal),
+        },
       });
       // Waiting on a person, which is the longest wait a run has and the one
       // least related to how much work it is doing -- but only when there is
@@ -1837,11 +1848,13 @@ class AgentLoopRunner {
       // awaiting anything: parking around it would hand the slot back and take
       // it again on every tool call, admitting a run each time until the
       // resident ceiling stopped it.
-      const hitlResult = this.opts.hitl.willAsk(toolName)
+      const hitlResult = this.opts.hitl.willAsk(toolName, finalInput)
         ? await whileWaiting(this.runIdentityKeyFor("approval"), "approval", this.waitMode, decide)
         : await decide();
         if (hitlResult.action === "deny" || hitlResult.action === "skip") {
-          const reason = `Error: ${hitlResult.reason}`;
+          // One shared wording for MCP and bash: the model must be told the
+          // action was refused and not run, never left to read it as a failure.
+          const reason = refusalMessage(hitlResult);
         await this.onEvent({ type: "toolUsed", tool: toolName, actionId: toolId, status: "error", description: reason });
           resultByToolId.set(toolId, reason);
           return;
@@ -2213,6 +2226,7 @@ class AgentLoopRunner {
         userId: this.userId, sessionId: this.sessionId,
         depth: this.depth + 1,
         hooks: this.opts.hooks,
+        hitl: this.opts.hitl,
         runIdentity: this.opts.runIdentity,
         webToolServices: this.router.getWebToolServices?.(),
         });

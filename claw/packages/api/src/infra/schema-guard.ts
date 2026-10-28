@@ -146,6 +146,11 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     ],
   },
   {
+    table: "claw_session_app_mcp",
+    onlyWhenAppRuns: true,
+    columns: ["session_id", "name", "app_task_id", "url", "sandbox_session_id", "updated_at"],
+  },
+  {
     table: "claw_workspaces",
     // Every write against these is best-effort, so a missing table costs no
     // request -- which is exactly why it belongs here. The damage shows up
@@ -160,6 +165,12 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
   {
     table: "claw_workspace_refs",
     columns: ["workspace_id", "ref_kind", "ref_id", "created_at", "released_at"],
+  },
+  {
+    table: "claw_user_memory_prefs",
+    // Read on every prompt build and every memory write; an absent table makes
+    // both fail closed, i.e. memory silently off for everyone.
+    columns: ["user_id", "enabled"],
   },
   {
     table: "claw_memory_entries",

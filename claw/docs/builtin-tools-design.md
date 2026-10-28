@@ -1739,6 +1739,8 @@ All new behavior is gated by env vars so deployments can opt in:
 | `HITL_AUTO_ALLOW` | `"read,glob,grep,ls,todo_write,web_search,save_memory"` | CSV (note: `notebook_read` removed since merged into `read`) |
 | `HITL_DECISION_TIMEOUT_MS` | `300000` | |
 | `HITL_DECISION_DEFAULT` | `"allow"` | `"allow"` or `"deny"` on timeout |
+| `HITL_SUMMARY_ENABLED` | `true` | Adds a one-sentence, model-written plain-language summary to each `permissionRequest` (with `tool_description` and `intent`); set `false` to send none |
+| `HITL_SUMMARY_TIMEOUT_MS` | `2000` | Budget of that one model call; on a timeout or an error the request goes out without the summary |
 | `ASK_USER_QUESTION_ENABLED` | `false` | Master switch; keep off until P5 backend + frontend are both deployed |
 | `ASK_USER_QUESTION_TIMEOUT_MS` | `600000` | 10 min wait before timeout |
 

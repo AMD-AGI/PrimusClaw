@@ -27,6 +27,37 @@ record it.
 
 ## [Unreleased]
 
+### Added
+- A `permissionRequest` now says in words what the call is, so an approval card
+  can show something a person can judge instead of a raw request body:
+  `tool_description` (the tool's own first sentence), `intent` (what the agent
+  said just before the call) and `summary` (one plain sentence in the user's
+  language, written by one small call on the run's own model, within
+  `HITL_SUMMARY_TIMEOUT_MS`; `summary_by: "model"` marks it as machine-written).
+  Credential-named arguments never reach that call. A timeout, an error or
+  `HITL_SUMMARY_ENABLED=false` just omit the fields; approval semantics are
+  unchanged and `input` is still sent as before.
+- Deployment-level platform defaults: `PLATFORM_DEFAULTS_FILE` lists default skills
+  (by marketplace tool id) and MCP servers mounted into every chat, behind
+  `PROGRESSIVE_SKILLS_ENABLED` for skills. Default skills are listed by name and
+  description only and written into the sandbox on first read. Off by default;
+  see `claw/docs/platform-defaults.md`.
+
+### Changed
+- Brain no longer fetches every plugin skill again on every turn. Downloaded skill
+  files are held in memory (bounded by `SKILL_CACHE_MAX_BYTES`, 64 MiB by default,
+  `0` turns it off) and reused while the skill is unchanged: a plugin skill is
+  validated with one object-store listing per turn (per-object ETag and size, so
+  an in-place upsert of the same version is picked up), a marketplace `tool_ids`
+  skill by its record's `version` and `updated_at`. A turn that finds a plugin
+  skill unchanged reads no object and reports no `download_skill` event for it.
+- A turn of a session with plugin tools no longer starts a sandbox before its
+  first model call unless the plugin has a hooks-type tool: plugin skill files
+  are written into the sandbox on the first sandbox call that names `.skills`,
+  so a turn that only calls MCP tools opens none. With
+  `PROGRESSIVE_SKILLS_ENABLED`, plugin skills are listed by name and description
+  like the platform defaults instead of being inlined.
+
 ### Security
 - Credential redaction no longer treats every `user_env` / `session_env` value
   as a secret to cut out of transcripts, and no longer misses short or
@@ -205,6 +236,18 @@ record it.
   numbers — they were wrong.
 
 ### Added
+
+- Outbound run notifications, off by default (`CLAW_NOTIFICATIONS_ENABLED`).
+  A user subscribes an https URL through `/v1/notification-subscriptions` and
+  receives `run.completed` / `run.failed` events for runs started by a trigger
+  and for runs that took at least `NOTIFY_MIN_RUN_SECONDS` (default 60) in a
+  session created with `config.notify_on_finish: true` (sessions without it
+  are never announced as long runs). Events
+  go through a database outbox with retry, a stable `event_id` for receiver-side
+  dedup, and an HMAC-SHA256 signature over `<timestamp>.<body>`
+  (`X-Claw-Timestamp`, `X-Claw-Signature`, `X-Claw-Event-Id`). Subscription URLs
+  must be https and must not resolve to a private address unless the host is in
+  `NOTIFY_WEBHOOK_ALLOWED_HOSTS`.
 - `terminal.failure_reason` on `GET /v1/runs`: Claw's own code for how the run
   failed. `class` and `kill_reason` report a run whose sandbox never became usable
   as `failed` / `""`, exactly like an agent that ran and broke; the provisioning

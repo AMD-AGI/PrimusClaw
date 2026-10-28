@@ -145,8 +145,8 @@ export interface LlmSession {
   streamTurn(messages: Message[], tools: ToolSchema[], signal?: AbortSignal): Promise<LlmTurnResult>;
   /** Non-streaming single-shot completion used for conversation compaction.
    *  Returns the plain summary text; throws on failure so the caller can
-   *  fall back to the uncompacted messages. */
-  complete(systemPrompt: string, userText: string, maxTokens: number): Promise<string>;
+   *  fall back to the uncompacted messages. `signal` cancels the request. */
+  complete(systemPrompt: string, userText: string, maxTokens: number, signal?: AbortSignal): Promise<string>;
 }
 
 export interface LlmSessionOptions {

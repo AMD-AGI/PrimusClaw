@@ -47,6 +47,18 @@ export type BackgroundWork = "running" | "idle" | "gone" | "unknown";
 export const BG_VERDICT_TTL_MS = 30 * 60_000;
 
 /**
+ * How long an idle, parked sandbox stays reusable for the session's next
+ * message, in seconds.
+ *
+ * The one default behind `SANDBOX_IDLE_REUSE_SECONDS`, read by Brain (whose
+ * keepalive sweep reclaims a handle once it has been quiet this long) and by the
+ * API (whose orphan sweep must not reap a parked sandbox inside it). Both
+ * deployments take the same secret, so one operator setting reaches both; the
+ * default is shared here so the two cannot quietly disagree about it.
+ */
+export const DEFAULT_SANDBOX_IDLE_REUSE_SECONDS = 15 * 60;
+
+/**
  * The fields one published verdict is made of, as a set.
  *
  * Every writer that invalidates a verdict has to remove all of them together: a
