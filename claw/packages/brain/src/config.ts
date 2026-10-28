@@ -1748,6 +1748,13 @@ export const HITL_AUTO_ALLOW = env("HITL_AUTO_ALLOW", "read,glob,grep,ls,todo_wr
 export const HITL_DECISION_TIMEOUT_MS = envInt("HITL_DECISION_TIMEOUT_MS", 300_000);
 export const HITL_DECISION_DEFAULT = env("HITL_DECISION_DEFAULT", "allow");
 /**
+ * The plain-language summary added to a permissionRequest (agent/approval-explain.ts):
+ * one short model call on the run's own model, never longer than this budget. On a
+ * timeout or an error the request goes out without it; approval itself is unaffected.
+ */
+export const HITL_SUMMARY_ENABLED = envBool("HITL_SUMMARY_ENABLED", true);
+export const HITL_SUMMARY_TIMEOUT_MS = envInt("HITL_SUMMARY_TIMEOUT_MS", 2_000, { min: 200, max: 10_000 });
+/**
  * Deployment-wide bash approval rules, a JSON list (see agent/bash-approval.ts).
  * Unset means none; set but unparsable holds every bash command.
  */
