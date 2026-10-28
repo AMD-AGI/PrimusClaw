@@ -353,6 +353,21 @@ async function transitionCancellation(
 }
 
 /**
+ * The address an interrupt for this run is published to. A DAG node answers to
+ * its root and a chat turn to its session. An app run answers to its own id:
+ * the session's address is what a foreground Stop is published to, and Stop must
+ * not end the application running beside the conversation (Brain registers an app
+ * run under its task id for interrupts, `tasks/abort-registry.ts`).
+ */
+export function interruptKeyOf(
+  row: { task_id: string; session_id: string | null; dag_root_task_id: string | null; mode?: string | null },
+): string | undefined {
+  if (row.dag_root_task_id) return row.dag_root_task_id;
+  if (row.mode === "app") return row.task_id;
+  return row.session_id ?? undefined;
+}
+
+/**
  * Cancel a task (or virtual DAG root). For execution tasks we set
  * `cancelling` and trust Brain's NATS interrupt channel to react. For
  * the virtual root we directly cascade to every peer.
@@ -490,7 +505,7 @@ export async function cancelTask(
   return {
     ok: !!updated,
     cancelled: updated ? 1 : 0,
-    interrupt_key: updated ? (task.dag_root_task_id ?? task.session_id) : undefined,
+    interrupt_key: updated ? interruptKeyOf(task) : undefined,
   };
 }
 
