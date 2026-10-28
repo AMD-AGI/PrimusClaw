@@ -79,6 +79,53 @@ test("cleanSummary: plain one line, no markdown or wrapping quotes, bounded", ()
   assert.ok(Array.from(cleanSummary("词".repeat(1000))!).length <= 280);
 });
 
+// The approver reads the object's name off the card, so only paired markdown goes; a lone `*`, `_`, `` ` `` or `#`
+// belongs to an identifier, a path, a glob or a number and stays exactly as the model copied it.
+test("cleanSummary: never changes a character inside an identifier, a path, a glob or a number", () => {
+  const same = [
+    "Stop workload train_70b_v2 in workspace prod_a",           // snake_case ids (reviewer's examples)
+    "Read /workspace/my_data.csv and write /workspace/out_dir/part_1.parquet",
+    "Approve #12 and #13 for plan_85",                           // `#12` is a number, not a heading
+    "Open issue #12",
+    "Call __init__ on _private_var then __main__",
+    "Delete **/*.tmp and **/*.log from /workspace",              // `**` in a glob
+    "Delete *.log,*.tmp and *log* under /data",                  // single `*` in globs
+    "Compute 2**10 and 3**4",                                    // exponent, not bold
+    "Set a ** b to 4",                                           // spaced stars hug nothing
+    "Rewrite the C# and F# files",                               // `#` after a word
+    "Stop `w1 in prod",                                          // a lone backtick pairs with nothing
+    "Stop workload 'prod_a'",                                    // quotes inside the text stay
+    "Stop \"w1\" and \"w2\"",                                    // two quoted words are not one wrapped sentence
+    "Don't stop the job",
+  ];
+  for (const text of same) assert.equal(cleanSummary(text), text, text);
+});
+
+test("cleanSummary: paired markdown goes, the text inside it stays", () => {
+  const rows: Array<[string, string]> = [
+    ["**Stop** `train_70b_v2` in **prod_a**", "Stop train_70b_v2 in prod_a"],
+    ["`/workspace/my_data.csv`", "/workspace/my_data.csv"],
+    ["**`train_70b_v2`**", "train_70b_v2"],
+    ["Set `env=test` on `plan_85`", "Set env=test on plan_85"],
+    ["**停止** `train_70b_v2`", "停止 train_70b_v2"],
+    ["# Stop workload w1", "Stop workload w1"],
+    ["### Stop workload train_70b_v2", "Stop workload train_70b_v2"],
+    ["## Plan\nStop #12", "Plan Stop #12"],
+    ["Plan\n# Stop w1", "Plan Stop w1"],
+    ["'prod_a'", "prod_a"],
+    ["\"'train_70b_v2'\"", "train_70b_v2"],
+    ["“Stop workload prod_a”", "Stop workload prod_a"],
+    ["「停止 prod_a」", "停止 prod_a"],
+  ];
+  for (const [raw, want] of rows) assert.equal(cleanSummary(raw), want, raw);
+});
+
+test("cleanSummary: a credential value that holds marker characters is still hidden", () => {
+  // Stripping `_` and `*` first would turn the value into one the scrub no longer recognises.
+  assert.equal(cleanSummary("use pa_ss*w0rd_1 now", ["pa_ss*w0rd_1"]), "use [hidden] now");
+  assert.equal(cleanSummary("use `my_secret_key_9`", ["my_secret_key_9"]), "use [hidden]");
+});
+
 test("latestUserText: the newest real user text; tool results and notices are skipped", () => {
   const msgs: Message[] = [
     { role: "user", content: "给计划 85 加个标签" },

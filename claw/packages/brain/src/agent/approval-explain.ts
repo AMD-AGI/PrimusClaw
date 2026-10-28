@@ -179,9 +179,37 @@ export function summaryPrompt(tool: string, input: Record<string, unknown>, ctx:
   ].join("\n");
 }
 
-/** One line of plain text: no markdown emphasis, no wrapping quotes, bounded. */
+// The only markdown cleanSummary removes. A lone `*`, `_`, `` ` `` or `#` is NOT a marker: it is a character of
+// an identifier (`train_70b_v2`), a path (`/workspace/my_data.csv`), a glob (`**/*.tmp`) or a number (`#12`),
+// and the approver must read each of them exactly as the call has it.
+/** A heading marker (`# `..`###### `) at the start of a line; `#12` has no space after it and stays. */
+const HEADING_MARK = /^[ \t]{0,3}#{1,6}[ \t]+/gm;
+/** `**bold**`: paired, hugging non-space text, and not touching a word character or another `*` on the outside
+ *  (so `2**10`, `a ** b` and the leading `**` of a glob are not bold). */
+const BOLD = /(?<![\p{L}\p{N}_*])\*\*(?=[^\s*])([^*\n]*[^\s*])\*\*(?![\p{L}\p{N}_*])/gu;
+/** `` `code` ``: a pair; a lone backtick stays. */
+const CODE_SPAN = /`([^`\n]+)`/g;
+/** Quote characters that count as one kind of wrapping quote. */
+const QUOTE_FAMILIES = ['"“”', "'‘’", "「」"];
+
+/** Remove one pair of quotes around the whole text, only when they are a pair: no quote of that kind inside, so
+ *  `"a" and "b"` and `Stop 'prod_a'` keep every character they were given. */
+function unwrapQuotes(text: string): string {
+  const chars = Array.from(text);
+  if (chars.length < 2) return text;
+  for (const family of QUOTE_FAMILIES) {
+    if (family.includes(chars[0]!) && family.includes(chars[chars.length - 1]!)
+      && !chars.slice(1, -1).some((c) => family.includes(c))) return unwrapQuotes(chars.slice(1, -1).join("").trim());
+  }
+  return text;
+}
+
+/** One line of plain text: no markdown emphasis, code or heading marker, no wrapping quotes, bounded. Only
+ *  paired markers go; nothing inside an identifier, path, glob or number is touched. */
 export function cleanSummary(raw: string, secrets: readonly string[] = []): string | undefined {
-  let s = flat(raw).replace(/[*_`#]+/g, "").replace(/^["'“”‘’「」]+|["'“”‘’「」]+$/gu, "").trim();
+  // Headings are per line, so they go before the lines are joined.
+  let s = flat(String(raw ?? "").replace(HEADING_MARK, "")).replace(BOLD, "$1").replace(CODE_SPAN, "$1");
+  s = unwrapQuotes(s).trim();
   s = redactSecrets(scrub(s, secrets)).text;
   return s ? clip(s, SUMMARY_MAX_CHARS) : undefined;
 }
