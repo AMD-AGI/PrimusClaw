@@ -55,3 +55,4 @@ export type { HandleInfo } from "./sandbox/handle-map.js";
 export { getHandleEntry, setHandleEntry } from "./sandbox/handle-map.js";
 export * from "./app-manifest.js";
 export * from "./app-resources.js";
+export * from "./sandbox-grant.js";

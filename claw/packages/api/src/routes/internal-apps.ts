@@ -10,6 +10,8 @@
  *                                                 the event-forwarding cursor (5.7)
  *   PUT   /v1/internal/app-runs/:taskId/mcp       record where the app's session MCP answers (fenced)
  *   DELETE /v1/internal/app-runs/:taskId/mcp      remove that record (fenced; brain_id, claim_count in the query)
+ *   POST  /v1/internal/app-runs/:taskId/grant/extend   sign a later expiry (the API holds the key)
+ *   POST  /v1/internal/app-runs/:taskId/grant/reissue  sign the same id again after the execution copy is gone
  *
  * Authentication is the cluster internal token, like the claim surface: there
  * is no per-run token because a Brain taking a run over does not yet hold one,
@@ -20,10 +22,12 @@
  * asks for them once, at the point it builds the application's environment, and
  * the ordinary state read that runs every few seconds never carries them.
  */
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply } from "fastify";
 import pino from "pino";
 import { APP_EVENT_ID, APP_EVENT_SEGMENT_NAME } from "@claw/protocol";
 import { internalTokenAuth } from "../auth/middleware.js";
+import { extendStoredGrant, reissueStoredGrant, type StoredGrantSign } from "../grants/app-grant.js";
+import { appRunHeldBy } from "../tasks/app-run-state.js";
 import { MCP_URL_MAX, SANDBOX_SESSION_ID_MAX, recordSessionAppMcp, removeSessionAppMcp } from "../tasks/session-app-mcp.js";
 import {
   APP_RUN_STATES, LAST_EXIT_MAX_BYTES, patchAppRun, readAppRun, readAppRunSecrets,
@@ -41,7 +45,7 @@ const WORKLOAD_ID_MAX = 200;
 const RESTARTS_MAX = 1_000_000;
 const OFFSET_MAX = 2 ** 53 - 1;
 const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
-const PATCH_KEYS = new Set(["brain_id", "claim_count", "expect_state", "state", "restarts", "last_exit", "events_cursor", "state_dir", "sandbox_workload_id", "grant_expires_at", "grant_revoked"]);
+const PATCH_KEYS = new Set(["brain_id", "claim_count", "expect_state", "state", "restarts", "last_exit", "events_cursor", "state_dir", "sandbox_workload_id", "grant_expires_at", "grant_revoked", "grant_keys"]);
 
 /** The patch in `body`, or the reason it was refused. */
 export function parseAppRunPatch(
@@ -94,6 +98,11 @@ export function parseAppRunPatch(
     if (body.grant_revoked !== true) return { ok: false, error: "grant_revoked_invalid" };
     patch.grant_revoked = true;
   }
+  if (body.grant_keys !== undefined) {
+    const keys = parseGrantKeys(body.grant_keys);
+    if (!keys) return { ok: false, error: "grant_keys_invalid" };
+    patch.grant_keys = keys;
+  }
   if (body.events_cursor !== undefined) {
     const c = body.events_cursor;
     if (!isObj(c)) return { ok: false, error: "events_cursor_invalid" };
@@ -116,6 +125,22 @@ export function parseAppRunPatch(
     patch.last_exit = e as Record<string, unknown> | null;
   }
   return { ok: true, brainId, claimCount, expect, patch };
+}
+
+const GRANT_KEY_ROLES = new Set(["measurement", "subrun", "dev"]);
+
+/** Role keys only. Values are not echoed when this refuses. */
+function parseGrantKeys(value: unknown): Record<string, string> | null {
+  if (!isObj(value)) return null;
+  const names = Object.keys(value);
+  if (names.length === 0 || names.length > GRANT_KEY_ROLES.size) return null;
+  const out: Record<string, string> = {};
+  for (const name of names) {
+    const key = value[name];
+    if (!GRANT_KEY_ROLES.has(name) || typeof key !== "string" || !key || key.length > 200) return null;
+    out[name] = key;
+  }
+  return out;
 }
 
 const REFUSALS = {
@@ -220,4 +245,56 @@ export async function registerInternalAppRoutes(app: FastifyInstance): Promise<v
       return reply.status(MCP_REFUSALS[out.reason].status).send({ ok: false, error: MCP_REFUSALS[out.reason].error });
     },
   );
+
+  app.post<{ Params: { taskId: string }; Body: unknown }>(
+    "/v1/internal/app-runs/:taskId/grant/extend",
+    { preHandler: internalTokenAuth },
+    async (req, reply) => {
+      const held = await heldGrantCall(req.params.taskId, req.body);
+      if (!held.ok) return reply.status(held.status).send({ ok: false, error: held.error });
+      const expiresAt = new Date(held.expiresAt);
+      if (Number.isNaN(expiresAt.getTime())) return reply.status(400).send({ ok: false, error: "expires_at_invalid" });
+      const signed = await extendStoredGrant(req.params.taskId, expiresAt, AbortSignal.timeout(10_000));
+      return grantSignReply(reply, signed);
+    },
+  );
+
+  app.post<{ Params: { taskId: string }; Body: unknown }>(
+    "/v1/internal/app-runs/:taskId/grant/reissue",
+    { preHandler: internalTokenAuth },
+    async (req, reply) => {
+      const held = await heldGrantCall(req.params.taskId, req.body);
+      if (!held.ok) return reply.status(held.status).send({ ok: false, error: held.error });
+      const signed = await reissueStoredGrant(req.params.taskId, AbortSignal.timeout(10_000));
+      return grantSignReply(reply, signed);
+    },
+  );
+}
+
+const GRANT_SIGN_STATUS: Record<Exclude<StoredGrantSign, { ok: true }>["reason"], number> = {
+  not_configured: 501,
+  not_found: 404,
+  no_grant: 409,
+  revoked: 409,
+  no_platform_key: 409,
+  refused: 502,
+};
+
+function grantSignReply(reply: FastifyReply, signed: StoredGrantSign): unknown {
+  if (!signed.ok) return reply.status(GRANT_SIGN_STATUS[signed.reason]).send({ ok: false, error: signed.reason });
+  return reply.send({ ok: true, expiresAt: signed.expiresAt, ...(signed.keys ? { keys: signed.keys } : {}) });
+}
+
+/** The lease fence, plus an optional expiry for extend. */
+async function heldGrantCall(taskId: string, body: unknown): Promise<{ ok: true; expiresAt: string } | { ok: false; status: number; error: string }> {
+  if (!isObj(body)) return { ok: false, status: 400, error: "body_must_be_object" };
+  const fence = parseFence(body.brain_id, body.claim_count);
+  if (!fence) return { ok: false, status: 400, error: "fence_invalid" };
+  const held = await appRunHeldBy(taskId, fence);
+  if (held !== "ok") {
+    const status = held === "not_found" ? 404 : 409;
+    return { ok: false, status, error: held };
+  }
+  const expiresAt = typeof body.expires_at === "string" ? body.expires_at : "";
+  return { ok: true, expiresAt };
 }

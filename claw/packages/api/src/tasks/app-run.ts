@@ -91,6 +91,10 @@ export interface AppGrantRequest {
   resources: ResolvedAppResources;
   /** The manifest's templates, with the run's image and workspace filled in where a template sets none. */
   templates: Array<Record<string, unknown>>;
+  /** The caller's SaFE platform key. The grant service seals it. */
+  platformKey?: string;
+  /** Display name stored on the grant. The user id is used when this is empty. */
+  userName?: string;
 }
 
 /**
@@ -230,15 +234,21 @@ export function planAppRun(manifest: AppManifestV1, r: ResolvedAppResources): Ap
   if (r.cpu !== undefined) resources.cpu = String(r.cpu);
   if (r.memoryGi !== undefined) resources.memory = `${r.memoryGi}Gi`;
   const sandboxSpec: Record<string, unknown> = { handle: "app", image: r.image, namespace: r.workspace };
+  // Kept for a later reissue. Omitted when it is the app workspace, which is
+  // already `namespace`, so an older spec still means "the same workspace".
+  if (r.sandboxWorkspace !== r.workspace) sandboxSpec.sandbox_workspace = r.sandboxWorkspace;
   if (Object.keys(resources).length > 0) sandboxSpec.resources = resources;
   const workspaceIds = [r.workspace];
   if (!workspaceIds.includes(r.sandboxWorkspace)) workspaceIds.push(r.sandboxWorkspace);
   return { sandboxSpec, workspaceId: r.workspace, workspaceIds };
 }
 
-/** A grant id for one attempt. Never reused, never derived from the Idempotency-Key. */
+/**
+ * A grant id for one attempt. Never reused, never derived from the Idempotency-Key.
+ * A DNS-1123 label (`gr-` plus a ulid): Agent Sandbox stores it as the grant's name.
+ */
 export function newGrantId(): string {
-  return `grt_${ulid().toLowerCase()}`;
+  return `gr-${ulid().toLowerCase()}`;
 }
 
 /** Run `fn` with an AbortSignal that fires after `ms`; a call that has not returned by then fails. */
@@ -436,7 +446,15 @@ export async function admitAppRun(
   let issued: AppGrantIssued | void;
   try {
     issued = await withTimeout(APP_GRANT_ISSUE_TIMEOUT_MS, "grant issue", (signal) => ports.grant.issue(
-      grantRun, manifest, { resources: resolved, templates: appGrantTemplates(manifest, resolved) }, signal,
+      grantRun,
+      manifest,
+      {
+        resources: resolved,
+        templates: appGrantTemplates(manifest, resolved),
+        platformKey: req.user.platformKey,
+        userName: req.user.userName,
+      },
+      signal,
     ));
   } catch (err) {
     logger.error(
