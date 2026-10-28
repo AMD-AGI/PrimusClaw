@@ -18,6 +18,7 @@
  *   - Finish session deletions whose cleanup did not complete in the request
  *     that asked for them (see sessions/cleanup-sweep.ts).
  */
+import { interruptKeyOf } from "./lifecycle.js";
 import { commitSessionDeletion } from "../sessions/teardown.js";
 import { withCompletionLock } from "../events/completion-lock.js";
 import { db } from "../infra/db.js";
@@ -398,6 +399,7 @@ export async function reapStaleTasks(): Promise<number> {
     task_id: string;
     session_id: string;
     dag_root_task_id: string | null;
+    mode?: string | null;
     deadline_at: string | null;
     sandbox_workload_id: string | null;
   }>;
@@ -436,11 +438,9 @@ export async function reapStaleTasks(): Promise<number> {
  * terminal either way, and this only closes the gap where it is not.
  */
 async function interruptReapedRuns(
-  rows: Array<{ session_id: string; dag_root_task_id: string | null }>,
+  rows: Array<{ task_id: string; session_id: string; dag_root_task_id: string | null; mode?: string | null }>,
 ): Promise<void> {
-  const keys = new Set(
-    rows.map((row) => row.dag_root_task_id ?? row.session_id).filter(Boolean),
-  );
+  const keys = new Set(rows.map((row) => interruptKeyOf(row)).filter((k): k is string => !!k));
   if (!interruptPublisher.available()) {
     // The sweeper's own tick can outlive a NATS reconnect, and a missing
     // connection must not undo the row updates already committed above.
