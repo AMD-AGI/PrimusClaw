@@ -489,6 +489,20 @@ export async function consumeEventDelivery(msg: {
 }
 
 /**
+ * Whether a lifecycle event is an app run's. Brain stamps `message_id` with the
+ * run's task id for anything that is not a chat turn, so the id names the row.
+ */
+async function isAppRunEvent(sessionId: string, event: Record<string, unknown>): Promise<boolean> {
+  const taskId = event.message_id;
+  if (typeof taskId !== "string" || !taskId) return false;
+  const r = await db.query(
+    "SELECT 1 FROM claw_tasks WHERE task_id = $1 AND session_id = $2 AND mode = 'app'",
+    [taskId, sessionId],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
+/**
  * Apply a brain-emitted lifecycle event to claw_sessions.agent_status,
  * gated by the monotonic status_event_at column added in migration 0042.
  *
@@ -505,6 +519,16 @@ async function handleStatusEvent(
   const wall = Number(event.wallclock_ms);
   if (!Number.isFinite(wall) || wall <= 0) {
     logger.warn({ sessionId, type: event.type }, "status_event.bad_wallclock_skip");
+    return;
+  }
+  // An app run is not the session's foreground turn. `agent_status` is the gate on
+  // the conversation (`running` parks every message in `claw_pending_messages`), and
+  // a hosted application runs for hours beside it: a `taskResumed` from a redelivered
+  // app run used to set `running` with no turn to complete and no marker, so nothing
+  // released it and the application's own events kept the stuck-session reaper off.
+  // The run's lifecycle is on its row and in `appStatus`; the gate is not its to move.
+  if (await isAppRunEvent(sessionId, event)) {
+    logger.info({ sessionId, type: event.type, taskId: event.message_id }, "status_event.app_run_ignored");
     return;
   }
   const nextStatus = event.type === "taskInterrupted" ? "interrupted" : "running";
