@@ -10,7 +10,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createHmac, generateKeyPairSync } from "node:crypto";
+import { createHmac, createPublicKey, generateKeyPairSync } from "node:crypto";
 import { IdentityUnavailableError, JwtVerificationError } from "../src/index.js";
 import { harness, signJwt, testKey, type Harness, type TestKey } from "./identity-fake.js";
 
@@ -260,12 +260,19 @@ test("an unknown kid right after an ordinary refresh does not fetch the key set 
   });
 });
 
+// The public half of a real 1024-bit RSA key, kept as data: the private key was
+// discarded, and no key under 2048 bits is generated anywhere in this suite. A
+// token that claims this key is signed with the 2048-bit test key instead; the
+// property under test is only that the published key is not one the client will
+// verify with.
+const WEAK_RSA_1024_N =
+  "uPybX-dDg0qCidIQGTi0GnQ2mrj22tRE5vRUr_nJ5n4uemWqJ-ZqmhrcQQTnliIrnwfZxJaWmdO2riHO9WfuaLAg7qDIUC4UStW9mLQWgn37yZt2xh37w5MKB1erHzk_Mc6Gkz6YT7ay7u5lBAKSV0S2xzjL_HcX8uS3RL7ZgYU";
+
 test("an RSA key under 2048 bits is not used, so a token signed with it proves nothing", async () => {
-  const weak = generateKeyPairSync("rsa", { modulusLength: 1024 });
-  const weakKey: TestKey = {
-    kid: "weak", alg: "RS256", privateKey: weak.privateKey,
-    jwk: { ...weak.publicKey.export({ format: "jwk" }), kid: "weak", use: "sig", alg: "RS256" },
-  };
+  const weakJwk = { kty: "RSA", n: WEAK_RSA_1024_N, e: "AQAB", kid: "weak", use: "sig", alg: "RS256" };
+  // The fixture is what it says: without this the test could go vacuous quietly.
+  assert.equal(createPublicKey({ key: weakJwk, format: "jwk" }).asymmetricKeyDetails?.modulusLength, 1024);
+  const weakKey: TestKey = { kid: "weak", alg: "RS256", privateKey: rs.privateKey, jwk: weakJwk };
   // Published beside a good key: the set is usable, the weak key is not in it.
   await withHarness({}, [weakKey, es], async ({ client }, claims) => {
     await assert.rejects(client.verifyJwt(signJwt({ key: weakKey, claims: claims() }), { audience: AUD }), rejected("unknown_key"));
