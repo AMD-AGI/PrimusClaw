@@ -215,7 +215,9 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		_ = s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, sandboxID, "create_failed")
 		return SandboxResponse{}, 0, grant.Op(http.StatusServiceUnavailable, "sandbox_unavailable", "runner is not configured")
 	}
-	runCtx, cancel := context.WithTimeout(ctx, tpl.Pending)
+	// Placement outlives the HTTP request. A gateway close at 180s must not
+	// delete the Workload or spend the idempotency key while the pod is still pending.
+	runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tpl.Pending)
 	defer cancel()
 	result, runErr := s.runner.Create(runCtx, CreateRequest{
 		SandboxID:     sandboxID,
@@ -252,7 +254,7 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 			sameNodeMetadata: "true",
 		}
 	}
-	if err := s.grants.MarkRunning(ctx, grantID, sandboxID, running); err != nil {
+	if err := s.grants.MarkRunning(context.WithoutCancel(ctx), grantID, sandboxID, running); err != nil {
 		_ = s.runner.Delete(context.WithoutCancel(ctx), sandboxID)
 		_ = s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, sandboxID, "create_failed")
 		return SandboxResponse{}, 0, err

@@ -197,6 +197,48 @@ func TestReplayWaitsWhilePending(t *testing.T) {
 	}
 }
 
+func TestCallerCancelKeepsThePendingSandbox(t *testing.T) {
+	svc, runner, keys := testPlane(t, 600, []int32{1}, 1)
+	runner.started = make(chan struct{})
+	runner.hold = make(chan struct{})
+	body := CreateBody{TemplateID: "runner", Timeout: 60, Metadata: map[string]string{"agent-sandbox.io/idempotency-key": "once"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := svc.Create(ctx, keys["measurement"], body)
+		done <- err
+	}()
+	select {
+	case <-runner.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("create did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		t.Fatalf("caller cancel ended the create: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	replayed := make(chan error, 1)
+	go func() {
+		got, status, err := svc.Create(context.Background(), keys["measurement"], body)
+		if err == nil && (status != http.StatusCreated || got.SandboxID == "") {
+			err = errors.New("replay did not return the pending sandbox")
+		}
+		replayed <- err
+	}()
+	close(runner.hold)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-replayed; err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.deleted) != 0 || len(runner.created) != 1 {
+		t.Fatalf("created=%d deleted=%v", len(runner.created), runner.deleted)
+	}
+}
+
 func TestCreateReplayKillAndQuota(t *testing.T) {
 	svc, runner, keys := testPlane(t, 600, []int32{1}, 1)
 	key := keys["measurement"]
