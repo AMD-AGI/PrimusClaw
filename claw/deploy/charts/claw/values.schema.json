@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "claw chart values",
-  "description": "Constrains the background-shell keys, the Doorbell dispatch switches and the eight admission ceilings. Scoped deliberately and additionalProperties left open throughout: helm applies a schema to the whole merged values document, so a whitelist would reject every other value key and break the first upgrade after this schema shipped.",
+  "description": "Constrains the background-shell keys, the Doorbell dispatch switches, the eight admission ceilings and the identity client settings. Scoped deliberately and additionalProperties left open throughout: helm applies a schema to the whole merged values document, so a whitelist would reject every other value key and break the first upgrade after this schema shipped.",
   "type": "object",
   "additionalProperties": true,
   "definitions": {
@@ -11,6 +11,20 @@
         {
           "type": "string",
           "pattern": "^(0|[1-9][0-9]{0,8})$"
+        },
+        {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 999999999
+        }
+      ]
+    },
+    "optionalWholeNumber": {
+      "description": "A whole number of seconds or milliseconds, or blank for the code default. Zero is a value, not blank: for the cache and stale windows it switches them off.",
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^$|^(0|[1-9][0-9]{0,8})$"
         },
         {
           "type": "integer",
@@ -140,6 +154,41 @@
         },
         "admitTreeMaxDepth": {
           "$ref": "#/definitions/admitCeiling"
+        }
+      }
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": {
+          "description": "Build the shared identity client in API and Brain. Off by default; nothing authenticates through it yet.",
+          "default": false,
+          "type": "boolean"
+        },
+        "cache": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "positiveSeconds": {
+              "$ref": "#/definitions/optionalWholeNumber"
+            },
+            "negativeSeconds": {
+              "$ref": "#/definitions/optionalWholeNumber"
+            },
+            "staleIfErrorSeconds": {
+              "$ref": "#/definitions/optionalWholeNumber"
+            }
+          }
+        },
+        "requestTimeoutMs": {
+          "$ref": "#/definitions/optionalWholeNumber"
+        },
+        "keysRefreshSeconds": {
+          "$ref": "#/definitions/optionalWholeNumber"
+        },
+        "exchangeRefreshSkewSeconds": {
+          "$ref": "#/definitions/optionalWholeNumber"
         }
       }
     }
