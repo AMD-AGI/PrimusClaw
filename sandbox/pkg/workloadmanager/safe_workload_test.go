@@ -199,6 +199,7 @@ func TestCreateDeletesFailedWorkload(t *testing.T) {
 		}
 		obj := stored.(*unstructured.Unstructured).DeepCopy()
 		_ = unstructured.SetNestedField(obj.Object, "Failed", "status", "phase")
+		_ = unstructured.SetNestedField(obj.Object, "Container codeinterpreter terminated: reason=Error exitCode=1, details: [{\"pod\":\"sbx-1\",\"node\":\"node-a\",\"message\":\"task ended Failed\",\"container\":{\"name\":\"codeinterpreter\",\"reason\":\"Error\",\"exitCode\":1}}]", "status", "message")
 		return true, obj, nil
 	})
 	_, err := NewSafeWorkloadCreator(dc, cl).Create(context.Background(), e2b.CreateRequest{
@@ -213,11 +214,41 @@ func TestCreateDeletesFailedWorkload(t *testing.T) {
 		Attestation: "eyJ.test",
 		Timeout:     time.Minute,
 	})
-	if err == nil {
-		t.Fatal("expected failure")
+	if err == nil || !strings.Contains(err.Error(), "phase Failed") || !strings.Contains(err.Error(), "node node-a") || !strings.Contains(err.Error(), "exit 1") {
+		t.Fatalf("err=%v", err)
 	}
 	if _, getErr := dc.Tracker().Get(workloadGVR, "", sandboxID); getErr == nil {
 		t.Fatal("failed workload was not deleted")
+	}
+}
+
+func TestWorkloadFailureTextUsesTheConditionAndTheFirstPod(t *testing.T) {
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"status": map[string]any{
+			"conditions": []any{
+				map[string]any{"type": "K8sFailed", "status": "True", "message": "allocation generation is Lost, not Ready"},
+			},
+			"pods": []any{
+				map[string]any{
+					"podId": "sbx-1", "adminNodeName": "node-a", "phase": "Failed",
+					"failedMessage": "capacity gone",
+					"containers":    []any{map[string]any{"name": "codeinterpreter", "reason": "Error", "exitCode": float64(1)}},
+				},
+			},
+		},
+	}}
+	text := workloadFailureText(obj)
+	for _, want := range []string{"allocation generation is Lost", "pod sbx-1", "node node-a", "container codeinterpreter", "exit 1"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("text=%q missing %q", text, want)
+		}
+	}
+	long := strings.Repeat("x", workloadFailureLimit+40)
+	capped := workloadFailureText(&unstructured.Unstructured{Object: map[string]any{
+		"status": map[string]any{"message": long},
+	}})
+	if len(capped) != workloadFailureLimit {
+		t.Fatalf("len=%d", len(capped))
 	}
 }
 
