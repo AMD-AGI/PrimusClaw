@@ -358,6 +358,8 @@ func main() {
 		}
 		st = crStore
 	}
+	workloads := workloadmanager.NewSafeWorkloadCreator(dynamicClient, mgr.GetClient())
+	st = workloadmanager.NewWorkloadSessionStore(st, workloads)
 	defer st.Close()
 
 	wmSandboxReconciler := &workloadmanager.SandboxReconciler{
@@ -400,7 +402,6 @@ func main() {
 	if k8s != nil {
 		apiServer.WithK8s(k8s)
 	}
-	workloads := workloadmanager.NewSafeWorkloadCreator(dynamicClient, mgr.GetClient())
 	apiServer.WithSafeWorkloads(workloads)
 
 	grants, err := startGrants(ctx, mgr.GetClient(), mgr.GetAPIReader(), clientset, dynamicClient, apiServer, st, workloads, wmCfg.Namespace)

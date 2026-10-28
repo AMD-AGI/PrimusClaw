@@ -26,15 +26,21 @@ import (
 
 func TestWorkloadObjectUsesTemplateResources(t *testing.T) {
 	ci := testCodeInterpreter()
-	obj, err := workloadObject("dev-fixed", e2b.CreateRequest{
-		TemplateID: "ar-run-dev-g2",
-		Role:       "dev",
-		SessionID:  "s-8f2a",
-		Workspace:  "top-models",
-		UserID:     "u-123",
-		UserName:   "alice",
-		Timeout:    60 * time.Second,
-		Env:        map[string]string{"FOO": "1", platformInferenceKey: "secret"},
+	const sandboxID = "sbx-7a9b9b693452f613877992145c818d29"
+	obj, err := workloadObject(sandboxID, e2b.CreateRequest{
+		SandboxID:     sandboxID,
+		TemplateID:    "ar-run-dev-g2",
+		Role:          "dev",
+		SessionID:     "s-8f2a",
+		Workspace:     "top-models",
+		UserID:        "u-123",
+		UserName:      "alice",
+		GrantID:       "gr-01jb7m9k2x",
+		Attestation:   "eyJ.test",
+		SigningKeyPEM: "test-private-key",
+		AvoidNodes:    "node-a node-b",
+		Timeout:       60 * time.Second,
+		Env:           map[string]string{"FOO": "1", platformInferenceKey: "secret"},
 	}, ci)
 	if err != nil {
 		t.Fatal(err)
@@ -42,10 +48,10 @@ func TestWorkloadObjectUsesTemplateResources(t *testing.T) {
 	if _, found, _ := unstructured.NestedFieldNoCopy(obj.Object, "spec", "entryPoints"); found {
 		t.Fatal("entryPoints must stay unset")
 	}
-	if obj.GetLabels()[safeDisplayNameLabel] != "dev" || obj.GetLabels()[sessionIDLabel] != "s-8f2a" || obj.GetLabels()[safeUserIDLabel] != "u-123" {
+	if obj.GetLabels()[safeDisplayNameLabel] != "dev" || obj.GetLabels()[ownerSessionIDLabel] != "s-8f2a" || obj.GetLabels()["primus-claw/session-id"] != "" || obj.GetLabels()[safeUserIDLabel] != "u-123" || obj.GetLabels()[grantIDLabel] != "gr-01jb7m9k2x" || obj.GetLabels()[sandboxIDLabel] != sandboxID {
 		t.Fatalf("labels=%v", obj.GetLabels())
 	}
-	if obj.GetAnnotations()[safeUserNameAnnotation] != "alice" {
+	if obj.GetAnnotations()[safeUserNameAnnotation] != "alice" || obj.GetAnnotations()[grantAttestationAnnotation] != "eyJ.test" {
 		t.Fatalf("annotations=%v", obj.GetAnnotations())
 	}
 	if _, ok := obj.GetAnnotations()["primus-safe.workload.use.workspace.storage"]; ok {
@@ -57,8 +63,9 @@ func TestWorkloadObjectUsesTemplateResources(t *testing.T) {
 	}
 	priority, _, _ := unstructured.NestedInt64(obj.Object, "spec", "priority")
 	ttl, _, _ := unstructured.NestedInt64(obj.Object, "spec", "ttlSecondsAfterFinished")
-	if priority != workloadPriority || ttl != workloadTTLSeconds {
-		t.Fatalf("priority=%d ttl=%d", priority, ttl)
+	retry, _, _ := unstructured.NestedInt64(obj.Object, "spec", "maxRetry")
+	if priority != workloadPriority || ttl != workloadTTLSeconds || retry != 0 {
+		t.Fatalf("priority=%d ttl=%d retry=%d", priority, ttl, retry)
 	}
 	resources, _, _ := unstructured.NestedSlice(obj.Object, "spec", "resources")
 	res, _ := resources[0].(map[string]any)
@@ -66,7 +73,7 @@ func TestWorkloadObjectUsesTemplateResources(t *testing.T) {
 		t.Fatalf("resources=%v", res)
 	}
 	env, _, _ := unstructured.NestedMap(obj.Object, "spec", "env")
-	if env["FOO"] != "1" || env["HYPERLOOM_ACTIVE_IMAGE_DIGEST"] != "sha256:aa" {
+	if env["FOO"] != "1" || env["HYPERLOOM_ACTIVE_IMAGE_DIGEST"] != "sha256:aa" || env["E2B_SANDBOX_ID"] != sandboxID || env["HYPERLOOM_SIGNING_KEY_FILE"] != "/app/signing-key.pem" || env["HYPERLOOM_SIGNING_KEY_PEM"] != "test-private-key" || env["ROCR_VISIBLE_DEVICES"] != "0,1" {
 		t.Fatalf("env=%v", env)
 	}
 	if _, ok := env[platformInferenceKey]; ok {
@@ -75,6 +82,13 @@ func TestWorkloadObjectUsesTemplateResources(t *testing.T) {
 	images, _, _ := unstructured.NestedStringSlice(obj.Object, "spec", "images")
 	if len(images) != 1 || images[0] != "example@sha256:aa" {
 		t.Fatalf("images=%v", images)
+	}
+	if _, found, _ := unstructured.NestedFieldNoCopy(obj.Object, "spec", "timeout"); found {
+		t.Fatal("timeout must wait until the workload is running")
+	}
+	labels, _, _ := unstructured.NestedMap(obj.Object, "spec", "customerLabels")
+	if labels["excluded-nodes"] != "node-a node-b" {
+		t.Fatalf("customerLabels=%v", labels)
 	}
 }
 
@@ -117,15 +131,17 @@ func TestCreateWorkloadWaitsForPod(t *testing.T) {
 	})
 	creator := NewSafeWorkloadCreator(dc, cl)
 	result, err := creator.Create(context.Background(), e2b.CreateRequest{
-		SandboxID:  sandboxID,
-		TemplateID: ci.Name,
-		Namespace:  ci.Namespace,
-		Role:       "dev",
-		SessionID:  "s-8f2a",
-		Workspace:  "top-models",
-		UserID:     "u-123",
-		UserName:   "alice",
-		Timeout:    time.Minute,
+		SandboxID:   sandboxID,
+		TemplateID:  ci.Name,
+		Namespace:   ci.Namespace,
+		Role:        "dev",
+		SessionID:   "s-8f2a",
+		Workspace:   "top-models",
+		UserID:      "u-123",
+		UserName:    "alice",
+		GrantID:     "gr-01jb7m9k2x",
+		Attestation: "eyJ.test",
+		Timeout:     time.Minute,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -133,6 +149,14 @@ func TestCreateWorkloadWaitsForPod(t *testing.T) {
 	if result.SandboxName != sandboxID || result.Namespace != "top-models" || result.PodIP != "10.2.0.4" ||
 		result.PodPort != envdPort || result.NodeName != "node-b" || result.Kind != store.WorkloadKind {
 		t.Fatalf("result=%+v", result)
+	}
+	stored, err := dc.Tracker().Get(workloadGVR, "", sandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	timeout, _, _ := unstructured.NestedInt64(stored.(*unstructured.Unstructured).Object, "spec", "timeout")
+	if timeout != 60 {
+		t.Fatalf("timeout=%d", timeout)
 	}
 	if err := creator.Delete(context.Background(), result.SandboxName); err != nil {
 		t.Fatal(err)
@@ -167,14 +191,16 @@ func TestCreateDeletesFailedWorkload(t *testing.T) {
 		return true, obj, nil
 	})
 	_, err := NewSafeWorkloadCreator(dc, cl).Create(context.Background(), e2b.CreateRequest{
-		SandboxID:  sandboxID,
-		TemplateID: "ar-run-dev-g2",
-		Namespace:  "agent-sandbox-system",
-		Role:       "dev",
-		SessionID:  "s-8f2a",
-		Workspace:  "top-models",
-		UserID:     "u-123",
-		Timeout:    time.Minute,
+		SandboxID:   sandboxID,
+		TemplateID:  "ar-run-dev-g2",
+		Namespace:   "agent-sandbox-system",
+		Role:        "dev",
+		SessionID:   "s-8f2a",
+		Workspace:   "top-models",
+		UserID:      "u-123",
+		GrantID:     "gr-01jb7m9k2x",
+		Attestation: "eyJ.test",
+		Timeout:     time.Minute,
 	})
 	if err == nil {
 		t.Fatal("expected failure")
@@ -192,6 +218,7 @@ func TestWorkloadNameMatchesSandboxID(t *testing.T) {
 	req := e2b.CreateRequest{
 		SandboxID: sandboxID, TemplateID: "tpl", Namespace: "ns",
 		Role: "dev", SessionID: "s-8f2a", Workspace: "top-models",
+		GrantID: "gr-01jb7m9k2x", Attestation: "eyJ.test",
 	}
 	if err := validateWorkloadRequest(req); err != nil {
 		t.Fatal(err)
@@ -217,9 +244,18 @@ func TestAlignTimeoutAddsElapsed(t *testing.T) {
 	obj := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "amd.com/v1",
 		"kind":       "Workload",
-		"metadata":   map[string]any{"name": "measurement-1"},
-		"spec":       map[string]any{"timeout": int64(120)},
-		"status":     map[string]any{"startTime": started.Format(time.RFC3339)},
+		"metadata": map[string]any{
+			"name": "measurement-1",
+			"labels": map[string]any{
+				safeUserIDLabel: "u-123",
+				grantIDLabel:    "gr-01jb7m9k2x",
+			},
+			"annotations": map[string]any{
+				grantAttestationAnnotation: "eyJ.test",
+			},
+		},
+		"spec":   map[string]any{"timeout": int64(120)},
+		"status": map[string]any{"startTime": started.Format(time.RFC3339)},
 	}}
 	if _, err := dc.Resource(workloadGVR).Create(context.Background(), obj, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
@@ -235,6 +271,9 @@ func TestAlignTimeoutAddsElapsed(t *testing.T) {
 	if timeout != 390 {
 		t.Fatalf("timeout=%d", timeout)
 	}
+	if got.GetLabels()[safeUserIDLabel] != "u-123" || got.GetLabels()[grantIDLabel] != "gr-01jb7m9k2x" || got.GetAnnotations()[grantAttestationAnnotation] != "eyJ.test" {
+		t.Fatalf("metadata=%v %v", got.GetLabels(), got.GetAnnotations())
+	}
 }
 
 func TestWorkloadTimeoutSeconds(t *testing.T) {
@@ -247,6 +286,41 @@ func TestWorkloadTimeoutSeconds(t *testing.T) {
 	}
 	if got := workloadTimeoutSeconds(now.Add(-1500*time.Millisecond), now, 2*time.Second); got != 4 {
 		t.Fatalf("rounded=%d", got)
+	}
+}
+
+func TestWorkloadObjectCarriesStepsAndHostPaths(t *testing.T) {
+	ci := testCodeInterpreter()
+	ci.Spec.Template.Steps = []runtimev1alpha1.SandboxBuildStep{
+		{Type: "env", Args: []string{"RUNNER_CACHE=1"}},
+		{Type: "workdir", Args: []string{"/opt/runner"}},
+		{Type: "run", Args: []string{"install-runner"}},
+	}
+	ci.Spec.Template.Volumes = []corev1.Volume{{
+		Name:         "cache",
+		VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/data/runner-cache"}},
+	}}
+	const sandboxID = "sbx-7a9b9b693452f613877992145c818d29"
+	obj, err := workloadObject(sandboxID, e2b.CreateRequest{
+		SandboxID: sandboxID, TemplateID: ci.Name, Role: "dev", SessionID: "s-8f2a",
+		Workspace: "top-models", GrantID: "gr-01jb7m9k2x", Attestation: "eyJ.test",
+	}, ci)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, _, _ := unstructured.NestedMap(obj.Object, "spec", "env")
+	if env["RUNNER_CACHE"] != "1" || env[startupEnv] != "cd '/opt/runner' && install-runner" {
+		t.Fatalf("env=%v", env)
+	}
+	paths, _, _ := unstructured.NestedStringSlice(obj.Object, "spec", "hostpath")
+	if len(paths) != 1 || paths[0] != "/data/runner-cache" {
+		t.Fatalf("hostpath=%v", paths)
+	}
+}
+
+func TestROCRVisibleDevices(t *testing.T) {
+	if rocrVisibleDevices(0) != "" || rocrVisibleDevices(1) != "0" || rocrVisibleDevices(2) != "0,1" {
+		t.Fatalf("0=%q 1=%q 2=%q", rocrVisibleDevices(0), rocrVisibleDevices(1), rocrVisibleDevices(2))
 	}
 }
 

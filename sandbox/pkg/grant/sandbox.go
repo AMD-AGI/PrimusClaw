@@ -18,20 +18,21 @@ import (
 
 // BeginRequest charges one sandbox and records its E2B control-plane fields.
 type BeginRequest struct {
-	GrantID         string
-	Role            string
-	SandboxID       string
-	Alias           string
-	TemplateID      string
-	Namespace       string
-	GPUs            int32
-	TimeoutSec      int64
-	IdempotencyKey  string
-	AccessTokenHash string
-	Metadata        map[string]string
-	Sealed          bool
-	Inputs          []string
-	Outputs         []string
+	GrantID           string
+	Role              string
+	SandboxID         string
+	Alias             string
+	TemplateID        string
+	Namespace         string
+	GPUs              int32
+	TimeoutSec        int64
+	PendingTimeoutSec int64
+	IdempotencyKey    string
+	AccessTokenHash   string
+	Metadata          map[string]string
+	Sealed            bool
+	Inputs            []string
+	Outputs           []string
 }
 
 // Replay is returned when the idempotency key already names a sandbox.
@@ -44,8 +45,9 @@ type Replay struct {
 func (r *Replay) Error() string { return "idempotency replay" }
 
 // Snapshot is the grant spec the E2B control plane is allowed to see.
-// It has no platform key and no attestation.
+// It has no platform key. Attestation is copied onto each Workload.
 type Snapshot struct {
+	GrantID           string
 	UserID            string
 	UserName          string
 	AppRunID          string
@@ -54,6 +56,7 @@ type Snapshot struct {
 	MaxSandboxSeconds int64
 	Roles             map[string]runtimev1alpha1.GrantRole
 	Templates         []runtimev1alpha1.GrantTemplate
+	Attestation       string
 }
 
 // RunningUpdate is the data-plane address recorded once a sandbox is up.
@@ -63,6 +66,8 @@ type RunningUpdate struct {
 	NodeName    string
 	// Cluster is the SaFE cluster id from the Workload. Empty leaves the stored value unchanged.
 	Cluster string
+	// Metadata is merged into the sandbox record. Empty values are skipped.
+	Metadata map[string]string
 }
 
 // Snapshot returns the grant fields needed to authorize a create.
@@ -80,6 +85,7 @@ func (s *Service) Snapshot(ctx context.Context, grantID string) (Snapshot, error
 		g.Spec.Templates[i].DeepCopyInto(&templates[i])
 	}
 	return Snapshot{
+		GrantID:           g.Name,
 		UserID:            g.Spec.Owner.UserID,
 		UserName:          g.Spec.Owner.UserName,
 		AppRunID:          g.Spec.Issuer.AppRunID,
@@ -88,6 +94,7 @@ func (s *Service) Snapshot(ctx context.Context, grantID string) (Snapshot, error
 		MaxSandboxSeconds: g.Spec.MaxSandboxSeconds,
 		Roles:             roles,
 		Templates:         templates,
+		Attestation:       g.Spec.Attestation,
 	}, nil
 }
 
@@ -128,6 +135,15 @@ func (s *Service) MarkRunning(ctx context.Context, grantID, sandboxID string, up
 		}
 		if up.Cluster != "" {
 			ref.Cluster = up.Cluster
+		}
+		for key, value := range up.Metadata {
+			if key == "" || value == "" {
+				continue
+			}
+			if ref.Metadata == nil {
+				ref.Metadata = map[string]string{}
+			}
+			ref.Metadata[key] = value
 		}
 		g.Status.Sandboxes[idx] = ref
 		return nil
@@ -177,8 +193,9 @@ func (s *Service) EndSandbox(ctx context.Context, grantID, sandboxID, reason str
 }
 
 // SetSandboxTimeout replaces the lifetime requested for a live sandbox.
-// The new duration is measured from now, and the sandbox still cannot run
-// longer than MaxSandboxSeconds from the time it started.
+// The caller must be the role that created it. The new duration is measured
+// from now, and the sandbox still cannot run longer than MaxSandboxSeconds
+// from the time it started.
 func (s *Service) SetSandboxTimeout(ctx context.Context, grantID, role, sandboxID string, timeoutSec int64) error {
 	if timeoutSec <= 0 {
 		return opErr(http.StatusBadRequest, "invalid_sandbox", "timeout must be > 0")
@@ -251,8 +268,9 @@ func (s *Service) ListRoleSandboxes(ctx context.Context, grantID, role string) (
 	return out, nil
 }
 
-// LookupAccess matches a sandbox id and access token. A mismatch is invalid_token
-// whether the id is unknown or the token is wrong.
+// LookupAccess matches a sandbox id and access token.
+// An unknown id is 404. An ended sandbox is 502 so the E2B SDK can see
+// "was not found". A live sandbox with a different token is 401.
 func (s *Service) LookupAccess(ctx context.Context, sandboxID, token string) (runtimev1alpha1.GrantSandboxRef, error) {
 	if sandboxID == "" || token == "" {
 		return runtimev1alpha1.GrantSandboxRef{}, opErr(http.StatusUnauthorized, "invalid_token", "access token is required")
@@ -262,21 +280,29 @@ func (s *Service) LookupAccess(ctx context.Context, sandboxID, token string) (ru
 	if err != nil {
 		return runtimev1alpha1.GrantSandboxRef{}, err
 	}
+	ended := false
 	for i := range list {
 		for _, ref := range list[i].Status.Sandboxes {
-			if ref.ID != sandboxID || (ref.AccessTokenHash == "" && len(ref.AccessTokenHashes) == 0) {
+			if ref.ID != sandboxID {
 				continue
 			}
-			if tokenHashMatches(ref, want) {
-				if err := usable(&list[i], s.now()); err != nil {
-					return runtimev1alpha1.GrantSandboxRef{}, err
-				}
-				return ref, nil
+			if ref.State == runtimev1alpha1.SandboxEnded || (ref.AccessTokenHash == "" && len(ref.AccessTokenHashes) == 0) {
+				ended = true
+				continue
 			}
-			return runtimev1alpha1.GrantSandboxRef{}, opErr(http.StatusUnauthorized, "invalid_token", "access token does not match")
+			if !tokenHashMatches(ref, want) {
+				return runtimev1alpha1.GrantSandboxRef{}, opErr(http.StatusUnauthorized, "invalid_token", "access token does not match")
+			}
+			if err := usable(&list[i], s.now()); err != nil {
+				return runtimev1alpha1.GrantSandboxRef{}, err
+			}
+			return ref, nil
 		}
 	}
-	return runtimev1alpha1.GrantSandboxRef{}, opErr(http.StatusUnauthorized, "invalid_token", "access token does not match")
+	if ended {
+		return runtimev1alpha1.GrantSandboxRef{}, opErr(http.StatusBadGateway, "sandbox_not_found", "the sandbox was not found")
+	}
+	return runtimev1alpha1.GrantSandboxRef{}, opErr(http.StatusNotFound, "sandbox_not_found", sandboxID)
 }
 
 func tokenHashes(ref runtimev1alpha1.GrantSandboxRef) []string {
@@ -313,8 +339,8 @@ func beginOne(g *runtimev1alpha1.SandboxGrant, req BeginRequest, now time.Time) 
 	if req.SandboxID == "" || req.Role == "" || req.TemplateID == "" {
 		return opErr(http.StatusBadRequest, "invalid_sandbox", "sandbox id, role, and template are required")
 	}
-	if req.TimeoutSec < 0 {
-		return opErr(http.StatusBadRequest, "invalid_sandbox", "timeout must be >= 0")
+	if req.TimeoutSec < 0 || req.PendingTimeoutSec < 0 {
+		return opErr(http.StatusBadRequest, "invalid_sandbox", "timeouts must be >= 0")
 	}
 	for _, ref := range g.Status.Sandboxes {
 		if req.IdempotencyKey != "" && ref.IdempotencyKey == req.IdempotencyKey {
@@ -358,22 +384,23 @@ func beginOne(g *runtimev1alpha1.SandboxGrant, req BeginRequest, now time.Time) 
 	usage.GPUs += req.GPUs
 	g.Status.Usage[req.Role] = usage
 	g.Status.Sandboxes = append(g.Status.Sandboxes, runtimev1alpha1.GrantSandboxRef{
-		ID:              req.SandboxID,
-		Role:            req.Role,
-		GPUs:            req.GPUs,
-		SessionID:       req.SandboxID,
-		StartedAt:       metav1.NewTime(now),
-		Alias:           req.Alias,
-		TemplateID:      req.TemplateID,
-		Namespace:       req.Namespace,
-		State:           runtimev1alpha1.SandboxPending,
-		TimeoutSec:      req.TimeoutSec,
-		IdempotencyKey:  req.IdempotencyKey,
-		AccessTokenHash: req.AccessTokenHash,
-		Sealed:          req.Sealed,
-		Inputs:          append([]string(nil), req.Inputs...),
-		Outputs:         append([]string(nil), req.Outputs...),
-		Metadata:        copyMap(req.Metadata),
+		ID:                req.SandboxID,
+		Role:              req.Role,
+		GPUs:              req.GPUs,
+		SessionID:         req.SandboxID,
+		StartedAt:         metav1.NewTime(now),
+		Alias:             req.Alias,
+		TemplateID:        req.TemplateID,
+		Namespace:         req.Namespace,
+		State:             runtimev1alpha1.SandboxPending,
+		TimeoutSec:        req.TimeoutSec,
+		PendingTimeoutSec: req.PendingTimeoutSec,
+		IdempotencyKey:    req.IdempotencyKey,
+		AccessTokenHash:   req.AccessTokenHash,
+		Sealed:            req.Sealed,
+		Inputs:            append([]string(nil), req.Inputs...),
+		Outputs:           append([]string(nil), req.Outputs...),
+		Metadata:          copyMap(req.Metadata),
 	})
 	return nil
 }

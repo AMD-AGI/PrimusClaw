@@ -75,7 +75,7 @@ type SandboxGrantSpec struct {
 	MaxSandboxSeconds int64 `json:"maxSandboxSeconds,omitempty"`
 	// ExpiresAt is when the grant stops accepting creates.
 	ExpiresAt metav1.Time `json:"expiresAt"`
-	// Attestation is the Claw-signed JWT copied onto each Workload later.
+	// Attestation is the Claw-signed JWT copied onto each Workload.
 	Attestation string `json:"attestation"`
 	// PlatformKeyCiphertext is the AES-GCM ciphertext of the delegated user
 	// platform key. Empty after revoke. The plaintext is never stored.
@@ -149,6 +149,7 @@ type GrantSandboxRef struct {
 	State             string      `json:"state,omitempty"`
 	EndReason         string      `json:"endReason,omitempty"`
 	TimeoutSec        int64       `json:"timeoutSec,omitempty"`
+	PendingTimeoutSec int64       `json:"pendingTimeoutSec,omitempty"`
 	IdempotencyKey    string      `json:"idempotencyKey,omitempty"`
 	AccessTokenHash   string      `json:"accessTokenHash,omitempty"`
 	AccessTokenHashes []string    `json:"accessTokenHashes,omitempty"`

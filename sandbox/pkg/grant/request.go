@@ -97,8 +97,8 @@ type RevokeResponse struct {
 }
 
 func validateIssue(req IssueRequest, now time.Time) error {
-	if !grantName.MatchString(req.GrantID) || len(req.GrantID) > 253 {
-		return opErr(http.StatusBadRequest, "invalid_grant", "grantId is not a DNS-1123 name")
+	if !grantName.MatchString(req.GrantID) || len(req.GrantID) > 63 {
+		return opErr(http.StatusBadRequest, "invalid_grant", "grantId is not a label value")
 	}
 	if req.Owner.UserID == "" || len(req.Owner.Workspaces) == 0 {
 		return opErr(http.StatusBadRequest, "invalid_grant", "owner userId and workspaces are required")
@@ -195,40 +195,44 @@ func expandTemplates(appRunID string, roles map[string]RoleRequest, templates []
 	return out, expanded, stored, nil
 }
 
-// TemplateNames is the CodeInterpreter names one template expands to.
-func TemplateNames(appRunID, name string, perGPU []int32) []string {
-	return expandOne(appRunID, TemplateRequest{Name: name, PerGPUCount: perGPU})
-}
-
-func expandOne(appRunID string, tpl TemplateRequest) []string {
-	// A task id such as ktsk_01ABC is not a DNS-1123 label. Fold it before it
-	// becomes a CodeInterpreter name.
-	id := dnsLabel(appRunID)
-	if len(tpl.PerGPUCount) == 0 {
-		return []string{id + "-" + tpl.Name}
+// TemplateNames is the CodeInterpreter name registered for one grant template.
+// A task id such as ktsk_01ABC is folded into a DNS-1123 label.
+func TemplateNames(appRunID, templateName string, perGPU []int32) []string {
+	if len(perGPU) == 0 {
+		return []string{templateObjectName(appRunID, templateName, "")}
 	}
-	names := make([]string, 0, len(tpl.PerGPUCount))
-	for _, n := range tpl.PerGPUCount {
-		names = append(names, id+"-"+tpl.Name+"-g"+itoa(int(n)))
+	names := make([]string, 0, len(perGPU))
+	for _, n := range perGPU {
+		names = append(names, templateObjectName(appRunID, templateName, "g"+itoa(int(n))))
 	}
 	return names
 }
 
-// dnsLabel lowercases ASCII letters and turns every other character into a hyphen.
-func dnsLabel(s string) string {
+func expandOne(appRunID string, tpl TemplateRequest) []string {
+	return TemplateNames(appRunID, tpl.Name, tpl.PerGPUCount)
+}
+
+// templateObjectName builds a DNS-1123 name. Run ids may contain underscores.
+func templateObjectName(appRunID, templateName, suffix string) string {
+	raw := appRunID + "-" + templateName
+	if suffix != "" {
+		raw += "-" + suffix
+	}
+	return dnsName(raw)
+}
+
+// dnsName keeps lowercase letters, digits, and hyphens.
+func dnsName(value string) string {
 	var b strings.Builder
-	b.Grow(len(s))
-	for _, r := range s {
+	for _, r := range strings.ToLower(value) {
 		switch {
-		case r >= 'a' && r <= 'z' || r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-':
 			b.WriteRune(r)
-		case r >= 'A' && r <= 'Z':
-			b.WriteByte(byte(r - 'A' + 'a'))
 		default:
 			b.WriteByte('-')
 		}
 	}
-	return b.String()
+	return strings.Trim(b.String(), "-")
 }
 
 func itoa(n int) string {

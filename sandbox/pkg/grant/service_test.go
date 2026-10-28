@@ -156,6 +156,11 @@ func jwksFor(t *testing.T, pub *ecdsa.PublicKey) []byte {
 
 func signGrant(t *testing.T, priv *ecdsa.PrivateKey, req IssueRequest) string {
 	t.Helper()
+	return signGrantShape(t, priv, req, []string{"PyTorchJob", "Sandbox"}, 8)
+}
+
+func signGrantShape(t *testing.T, priv *ecdsa.PrivateKey, req IssueRequest, kinds []string, maxGPUs int) string {
+	t.Helper()
 	claims := grantClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    attestationIssuer,
@@ -166,8 +171,8 @@ func signGrant(t *testing.T, priv *ecdsa.PrivateKey, req IssueRequest) string {
 			IssuedAt:  jwt.NewNumericDate(req.ExpiresAt.Add(-time.Hour)),
 		},
 		Workspaces:        req.Owner.Workspaces,
-		Kinds:             []string{"PyTorchJob", "Sandbox"},
-		MaxGPUsPerSandbox: 8,
+		Kinds:             kinds,
+		MaxGPUsPerSandbox: maxGPUs,
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
 	token.Header["kid"] = "test"
@@ -191,6 +196,23 @@ func sampleRequest(expires time.Time) IssueRequest {
 		GPUHoursBudget: 1,
 		ExpiresAt:      expires,
 		Attestation:    "placeholder",
+	}
+}
+
+func TestExpandTemplatesUsesDNSName(t *testing.T) {
+	const runID = "ktsk_01m5y2heq8zekk0js2n9nw51ey"
+	roles, expanded, _, err := expandTemplates(runID, map[string]RoleRequest{
+		"measurement": {Templates: []string{"runner"}, MaxSandboxes: 1, MaxGPUs: 1},
+	}, []TemplateRequest{{Name: "runner", PerGPUCount: []int32{1}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "ktsk-01m5y2heq8zekk0js2n9nw51ey-runner-g1"
+	if got := expanded["runner"]; len(got) != 1 || got[0] != want || strings.Contains(got[0], "_") {
+		t.Fatalf("expanded=%v", got)
+	}
+	if roles["measurement"].Templates[0] != want {
+		t.Fatalf("role=%v", roles["measurement"].Templates)
 	}
 }
 
@@ -293,6 +315,55 @@ func cloneIssue(req IssueRequest) IssueRequest {
 		out.Templates[i].Spec = append(json.RawMessage(nil), req.Templates[i].Spec...)
 	}
 	return out
+}
+
+func TestIssueRejectsAttestationShape(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	svc, priv, _, _ := testService(t, now)
+	req := sampleRequest(now.Add(time.Hour))
+	req.Attestation = signGrantShape(t, priv, req, []string{"PyTorchJob"}, 8)
+	if _, _, err := svc.Issue(context.Background(), req); !IsReason(err, "attestation_invalid") {
+		t.Fatalf("kinds err=%v", err)
+	}
+	req.Attestation = signGrantShape(t, priv, req, []string{"Sandbox"}, 1)
+	if _, _, err := svc.Issue(context.Background(), req); !IsReason(err, "attestation_invalid") {
+		t.Fatalf("gpu err=%v", err)
+	}
+}
+
+func TestIssueRejectsExistingTemplateAboveGPUCap(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	svc, priv, _, _ := testService(t, now)
+	ci := &runtimev1alpha1.CodeInterpreter{
+		ObjectMeta: metav1.ObjectMeta{Name: "ar-01ja-eval-g8", Namespace: svc.namespace},
+		Spec: runtimev1alpha1.CodeInterpreterSpec{
+			GPU: &runtimev1alpha1.GPUConfig{Count: 16},
+		},
+	}
+	if err := svc.client.Create(context.Background(), ci); err != nil {
+		t.Fatal(err)
+	}
+	req := sampleRequest(now.Add(time.Hour))
+	req.GrantID = "gr-gpu-cap"
+	req.Roles = map[string]RoleRequest{
+		"measurement": {Templates: []string{"eval-g8"}, MaxSandboxes: 1, MaxGPUs: 16},
+	}
+	req.Templates = []TemplateRequest{{Name: "eval-g8"}}
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); !IsReason(err, "attestation_invalid") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestIssueRejectsLongGrantID(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	svc, priv, _, _ := testService(t, now)
+	req := sampleRequest(now.Add(time.Hour))
+	req.GrantID = "g" + strings.Repeat("r", 63)
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); !IsReason(err, "invalid_grant") {
+		t.Fatalf("err=%v", err)
+	}
 }
 
 func TestIssueRejectsBadWorkspace(t *testing.T) {
@@ -488,6 +559,43 @@ func TestReconcileDropsMissingSandbox(t *testing.T) {
 	}
 	if view.Usage["measurement"].GPUs != 0 || view.Usage["measurement"].Sandboxes != 0 {
 		t.Fatalf("usage=%+v", view.Usage)
+	}
+}
+
+func TestReconcileKeepsMissingPendingSandboxWithinTemplateWindow(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	clock := now
+	svc, priv, _, _ := testService(t, now)
+	svc.now = func() time.Time { return clock }
+	svc.exists = memExists{gone: map[string]bool{"sbx-1": true}}
+	req := sampleRequest(now.Add(time.Hour))
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.BeginSandbox(context.Background(), BeginRequest{
+		GrantID: req.GrantID, Role: "measurement", SandboxID: "sbx-1",
+		TemplateID: "ar-01ja-runner-g1", GPUs: 4, TimeoutSec: 60, PendingTimeoutSec: 90,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	svc.ReapOnce(context.Background())
+	view, err := svc.Get(context.Background(), req.GrantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Sandboxes[0].State != runtimev1alpha1.SandboxPending || view.Usage["measurement"].GPUs != 4 {
+		t.Fatalf("pending sandbox was reclaimed: %+v", view)
+	}
+	clock = now.Add(90 * time.Second)
+	svc.ReapOnce(context.Background())
+	view, err = svc.Get(context.Background(), req.GrantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Sandboxes[0].State != runtimev1alpha1.SandboxEnded || view.Sandboxes[0].EndReason != "missing" ||
+		view.Usage["measurement"].Sandboxes != 0 || view.Usage["measurement"].GPUs != 0 {
+		t.Fatalf("expired pending sandbox was not reclaimed: %+v", view)
 	}
 }
 

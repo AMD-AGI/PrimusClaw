@@ -21,7 +21,24 @@ const (
 	defaultListLimit         = 100
 )
 
-// callerMetadataKeys may be set by the SDK without a reserved prefix.
+const metadataPrefix = "agent-sandbox.io/"
+
+// idempotencyMetadataKey is the caller key that replays one create.
+const idempotencyMetadataKey = metadataPrefix + "idempotency-key"
+
+// signingPublicKeyMetadata is the Ed25519 public key of this sandbox, PKIX PEM.
+const signingPublicKeyMetadata = metadataPrefix + "signing-public-key"
+
+// nodeNameMetadata is the node the sandbox pod was scheduled onto.
+const nodeNameMetadata = metadataPrefix + "node-name"
+
+// sameNodeMetadata records that the sandbox runs as one pod on one node.
+const sameNodeMetadata = metadataPrefix + "same-node"
+
+// avoidNodesMetadata lists nodes the workload must not run on.
+const avoidNodesMetadata = metadataPrefix + "avoid-nodes"
+
+// callerMetadataKeys may be set by the SDK under agent-sandbox.io/.
 var callerMetadataKeys = map[string]struct{}{
 	"idempotency-key": {},
 	"avoid-nodes":     {},
@@ -36,16 +53,21 @@ var reservedMetadataKeys = map[string]struct{}{
 	"nodes":              {},
 }
 
-// checkMetadata accepts caller keys and the agent-sandbox.io/, claw.io/, and hyperloom. prefixes.
+// checkMetadata accepts agent-sandbox.io/ keys, including the caller keys above.
+// The same names without that prefix are rejected. Reserved names are rejected
+// with or without the prefix.
 func checkMetadata(md map[string]string) error {
 	for key := range md {
-		if _, ok := reservedMetadataKeys[key]; ok {
+		name := key
+		prefixed := false
+		if rest, ok := strings.CutPrefix(key, metadataPrefix); ok {
+			prefixed = true
+			name = rest
+		}
+		if _, ok := reservedMetadataKeys[name]; ok {
 			return grant.Op(http.StatusForbidden, "metadata_reserved", key)
 		}
-		if _, ok := callerMetadataKeys[key]; ok {
-			continue
-		}
-		if strings.HasPrefix(key, "agent-sandbox.io/") || strings.HasPrefix(key, "claw.io/") || strings.HasPrefix(key, "hyperloom.") {
+		if prefixed || strings.HasPrefix(key, "claw.io/") || strings.HasPrefix(key, "hyperloom.") {
 			continue
 		}
 		return grant.Op(http.StatusForbidden, "metadata_not_allowed", key)
@@ -74,16 +96,12 @@ func resolveTemplate(snap grant.Snapshot, role, requested string) (resolvedTempl
 		return resolvedTemplate{}, grant.Op(http.StatusForbidden, "role_not_allowed", role)
 	}
 	if contains(cap.Templates, requested) {
-		tpl, spec, gpus := templateForExpansion(snap, requested)
+		_, spec, gpus := templateForExpansion(snap, requested)
 		body, err := parseSpec(spec)
 		if err != nil {
 			return resolvedTemplate{}, err
 		}
-		alias := requested
-		if tpl.Name != "" {
-			alias = tpl.Name
-		}
-		return resolvedFrom(requested, alias, gpus, body), nil
+		return resolvedFrom(requested, requested, gpus, body), nil
 	}
 	var matches []string
 	var spec string
@@ -197,6 +215,24 @@ func contains(list []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// excludedNodesLabel is the space-separated node list stored on a Workload
+// as customerLabels excluded-nodes, the same value the Workload API writes.
+func excludedNodesLabel(raw string) string {
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r <= ' '
+	})
+	out := make([]string, 0, len(parts))
+	seen := map[string]struct{}{}
+	for _, part := range parts {
+		if _, ok := seen[part]; ok {
+			continue
+		}
+		seen[part] = struct{}{}
+		out = append(out, part)
+	}
+	return strings.Join(out, " ")
 }
 
 // parseMetadataQuery reads a metadata query string.

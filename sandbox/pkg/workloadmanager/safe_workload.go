@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -26,20 +27,29 @@ import (
 )
 
 const (
-	workloadAPIVersion       = "amd.com/v1"
-	workloadKind             = "Workload"
-	safeDisplayNameLabel     = "primus-safe.display.name"
-	safeUserIDLabel          = "primus-safe.user.id"
-	safeUserNameAnnotation   = "primus-safe.user.name"
-	safeWorkloadIDLabel      = "primus-safe.workload.id"
-	safeClusterIDLabel       = "primus-safe.cluster.id"
-	sessionIDLabel           = "primus-claw/session-id"
-	workloadEphemeralStorage = "50Gi"
-	workloadPriority         = int64(2)
-	workloadTTLSeconds       = int64(10)
-	envdPort                 = 8080
+	workloadAPIVersion     = "amd.com/v1"
+	workloadKind           = "Workload"
+	safeDisplayNameLabel   = "primus-safe.display.name"
+	safeUserIDLabel        = "primus-safe.user.id"
+	safeUserNameAnnotation = "primus-safe.user.name"
+	safeWorkloadIDLabel    = "primus-safe.workload.id"
+	safeClusterIDLabel     = "primus-safe.cluster.id"
+	// ownerSessionIDLabel records the issuing Claw session. Pulse reads
+	// primus-claw/session-id as the session's own sandbox, so a grant workload
+	// must not use that key.
+	ownerSessionIDLabel        = "primus-claw/owner-session-id"
+	grantIDLabel               = "agent-sandbox.io/grant-id"
+	sandboxIDLabel             = "agent-sandbox.io/sandbox-id"
+	grantAttestationAnnotation = "agent-sandbox.io/grant-attestation"
+	workloadEphemeralStorage   = "50Gi"
+	workloadPriority           = int64(2)
+	workloadTTLSeconds         = int64(10)
+	envdPort                   = 8080
+	e2bSandboxPrefix           = "sbx-"
 	// platformInferenceKey is not copied onto a grant sandbox.
 	platformInferenceKey = "OPENAI_API_KEY"
+	// startupEnv is a shell snippet the Sandbox template evals before exec envd.
+	startupEnv = "SANDBOX_STARTUP"
 	// safeGeneratedNameLength is SaFE MaxGeneratedNameLength: a 63-character
 	// DNS label minus a 5-character suffix and the separating hyphen.
 	// The Workload name is copied onto the Sandbox, its Pod, its Service, and a label.
@@ -122,6 +132,14 @@ func (c *SafeWorkloadCreator) Create(ctx context.Context, req e2b.CreateRequest)
 	podIP, nodeName, cluster, waitErr = c.waitRunning(ctx, name, req.Workspace)
 	if waitErr != nil {
 		return nil, waitErr
+	}
+	// The Workload timeout is measured from dispatch. Set it only after Running
+	// so the E2B lifetime starts once the sandbox is up.
+	if req.Timeout > 0 {
+		waitErr = c.AlignTimeout(ctx, name, req.Timeout, time.Now())
+		if waitErr != nil {
+			return nil, waitErr
+		}
 	}
 	result := &SandboxResult{
 		SandboxName:          name,
@@ -220,6 +238,57 @@ func (c *SafeWorkloadCreator) Present(ctx context.Context, name string) (bool, e
 	default:
 		return true, nil
 	}
+}
+
+// Session rebuilds the session record of an E2B Workload named by the sandbox id.
+// A missing Workload, a finished phase, or a Workload not created for E2B is store.ErrNotFound.
+func (c *SafeWorkloadCreator) Session(ctx context.Context, name string) (*store.SandboxInfo, error) {
+	if c == nil || c.dynamic == nil || !strings.HasPrefix(name, e2bSandboxPrefix) || !dnsLabel(name, safeGeneratedNameLength) {
+		return nil, store.ErrNotFound
+	}
+	obj, err := c.dynamic.Resource(workloadGVR).Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	labels := obj.GetLabels()
+	if _, ok := labels[ownerSessionIDLabel]; !ok || obj.GetDeletionTimestamp() != nil {
+		return nil, store.ErrNotFound
+	}
+	phase, _, _ := unstructured.NestedString(obj.Object, "status", "phase")
+	switch phase {
+	case "Failed", "Succeeded", "Stopped":
+		return nil, store.ErrNotFound
+	}
+	workspace, _, _ := unstructured.NestedString(obj.Object, "spec", "workspace")
+	info := &store.SandboxInfo{
+		Kind:        store.WorkloadKind,
+		SessionID:   name,
+		SandboxName: name,
+		Namespace:   workspace,
+		PodPort:     envdPort,
+		CreatedAt:   obj.GetCreationTimestamp().Time,
+		Status:      "creating",
+		UserID:      labels[safeUserIDLabel],
+		UserName:    obj.GetAnnotations()[safeUserNameAnnotation],
+	}
+	started := workloadStartTime(obj)
+	if seconds, _, _ := unstructured.NestedInt64(obj.Object, "spec", "timeout"); seconds > 0 && !started.IsZero() {
+		info.ExpiresAt = started.Add(time.Duration(seconds) * time.Second)
+	}
+	if phase == "Running" {
+		ip, _, ok := addressFromStatus(obj)
+		if !ok && c.client != nil {
+			ip, _, ok = c.address(ctx, obj, workspace, name)
+		}
+		if ok {
+			info.PodIP = ip
+			info.Status = "running"
+		}
+	}
+	return info, nil
 }
 
 // Delete removes the Workload. A missing object is already gone.
@@ -348,6 +417,12 @@ func validateWorkloadRequest(req e2b.CreateRequest) error {
 	if req.UserID != "" && !labelValue(req.UserID) {
 		return fmt.Errorf("user id %q is not a label value", req.UserID)
 	}
+	if !labelValue(req.GrantID) {
+		return fmt.Errorf("grant id %q is not a label value", req.GrantID)
+	}
+	if req.Attestation == "" {
+		return fmt.Errorf("grant attestation is required")
+	}
 	return nil
 }
 
@@ -376,28 +451,44 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 		"images":                  []any{ci.Spec.Template.FromImage},
 		"priority":                workloadPriority,
 		"ttlSecondsAfterFinished": workloadTTLSeconds,
+		"maxRetry":                int64(0),
 		"groupVersionKind": map[string]any{
 			"kind":    "Sandbox",
 			"version": "v1",
 		},
 		"resources": []any{resource},
 	}
-	if req.Timeout > 0 {
-		spec["timeout"] = int64(req.Timeout / time.Second)
+	env := sandboxEnv(ci.Spec.Template.Environment, req.Env)
+	applyTemplateRuntime(ci.Spec.Template, env)
+	for key, value := range platformSandboxEnv(req, gpuCount(ci)) {
+		env[key] = value
 	}
-	if env := sandboxEnv(ci.Spec.Template.Environment, req.Env); len(env) > 0 {
+	if len(env) > 0 {
 		spec["env"] = env
+	}
+	if paths := templateHostPaths(ci.Spec.Template); len(paths) > 0 {
+		spec["hostpath"] = paths
+	}
+	if nodes := strings.TrimSpace(req.AvoidNodes); nodes != "" {
+		spec["customerLabels"] = map[string]any{"excluded-nodes": nodes}
 	}
 	labels := map[string]any{
 		safeDisplayNameLabel: req.Role,
-		sessionIDLabel:       req.SessionID,
+		ownerSessionIDLabel:  req.SessionID,
+		sandboxIDLabel:       name,
 	}
 	if req.UserID != "" {
 		labels[safeUserIDLabel] = req.UserID
 	}
+	if req.GrantID != "" {
+		labels[grantIDLabel] = req.GrantID
+	}
 	annotations := map[string]any{}
 	if req.UserName != "" {
 		annotations[safeUserNameAnnotation] = req.UserName
+	}
+	if req.Attestation != "" {
+		annotations[grantAttestationAnnotation] = req.Attestation
 	}
 	obj := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": workloadAPIVersion,
@@ -443,21 +534,109 @@ func quantityString(list corev1.ResourceList, name corev1.ResourceName) string {
 	return q.String()
 }
 
+// gpuCount is the number of GPUs the template requests.
+func gpuCount(ci *runtimev1alpha1.CodeInterpreter) int {
+	if ci == nil || ci.Spec.GPU == nil || ci.Spec.GPU.Count < 1 {
+		return 0
+	}
+	return ci.Spec.GPU.Count
+}
+
+// rocrVisibleDevices lists GPU indexes from zero. One GPU is "0".
+func rocrVisibleDevices(count int) string {
+	if count < 1 {
+		return ""
+	}
+	parts := make([]string, count)
+	for i := range parts {
+		parts[i] = strconv.Itoa(i)
+	}
+	return strings.Join(parts, ",")
+}
+
+// platformSandboxEnv sets the sandbox id, the signing key, and visible GPUs.
+// These win over template and caller env.
+func platformSandboxEnv(req e2b.CreateRequest, gpus int) map[string]string {
+	env := map[string]string{}
+	if req.SandboxID != "" {
+		env["E2B_SANDBOX_ID"] = req.SandboxID
+	}
+	if req.SigningKeyPEM != "" {
+		env["HYPERLOOM_SIGNING_KEY_PEM"] = req.SigningKeyPEM
+		env["HYPERLOOM_SIGNING_KEY_FILE"] = "/app/signing-key.pem"
+	}
+	if devices := rocrVisibleDevices(gpus); devices != "" {
+		env["ROCR_VISIBLE_DEVICES"] = devices
+	}
+	return env
+}
+
 func sandboxEnv(template []corev1.EnvVar, extra map[string]string) map[string]any {
 	env := map[string]any{}
 	for _, item := range template {
-		if item.Name == "" || item.Name == platformInferenceKey || item.Value == "" {
+		if item.Name == "" || item.Name == platformInferenceKey || item.Name == startupEnv || item.Value == "" {
 			continue
 		}
 		env[item.Name] = item.Value
 	}
 	for key, value := range extra {
-		if key == "" || key == platformInferenceKey {
+		if key == "" || key == platformInferenceKey || key == startupEnv {
 			continue
 		}
 		env[key] = value
 	}
 	return env
+}
+
+// applyTemplateRuntime copies env and workdir/run steps onto the Workload.
+// SaFE has no steps field. Env steps become spec.env. Run and workdir steps
+// become SANDBOX_STARTUP, which the Sandbox template evals before exec envd.
+func applyTemplateRuntime(tmpl *runtimev1alpha1.CodeInterpreterSandboxTemplate, env map[string]any) {
+	if tmpl == nil {
+		return
+	}
+	var steps []string
+	for _, step := range tmpl.Steps {
+		if len(step.Args) == 0 || step.Args[0] == "" {
+			continue
+		}
+		switch step.Type {
+		case "env":
+			key, value, ok := strings.Cut(step.Args[0], "=")
+			if ok && key != "" && key != platformInferenceKey && key != startupEnv {
+				env[key] = value
+			}
+		case "workdir":
+			steps = append(steps, "cd "+shellSingleQuote(step.Args[0]))
+		case "run":
+			steps = append(steps, step.Args[0])
+		}
+	}
+	if script := strings.Join(steps, " && "); script != "" {
+		env[startupEnv] = script
+	}
+}
+
+// templateHostPaths returns host paths SaFE mounts at the same path.
+// A Sandbox host path is read-only. Volumes that are not hostPath have no
+// Workload field.
+func templateHostPaths(tmpl *runtimev1alpha1.CodeInterpreterSandboxTemplate) []any {
+	if tmpl == nil {
+		return nil
+	}
+	var out []any
+	seen := map[string]struct{}{}
+	for _, vol := range tmpl.Volumes {
+		if vol.HostPath == nil || vol.HostPath.Path == "" {
+			continue
+		}
+		if _, ok := seen[vol.HostPath.Path]; ok {
+			continue
+		}
+		seen[vol.HostPath.Path] = struct{}{}
+		out = append(out, vol.HostPath.Path)
+	}
+	return out
 }
 
 func dnsLabel(value string, max int) bool {

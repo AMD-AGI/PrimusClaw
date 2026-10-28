@@ -30,6 +30,8 @@ func (h *Handler) Mount(r gin.IRoutes) {
 	for _, prefix := range []string{"/sandboxes", "/v2/sandboxes"} {
 		r.POST(prefix, h.create)
 		r.GET(prefix, h.list)
+		r.GET(prefix+"/:sandboxID/metrics", h.metrics)
+		r.GET(prefix+"/:sandboxID/logs", h.logs)
 		r.GET(prefix+"/:sandboxID", h.get)
 		r.DELETE(prefix+"/:sandboxID", h.kill)
 		r.PATCH(prefix+"/:sandboxID", h.timeout)
@@ -46,6 +48,10 @@ func (h *Handler) create(c *gin.Context) {
 	var body CreateBody
 	if err := c.ShouldBindJSON(&body); err != nil {
 		writeErr(c, grant.Op(http.StatusBadRequest, "invalid_sandbox", "request body is not valid JSON"))
+		return
+	}
+	if err := applyIdempotencyHeader(&body, c.GetHeader("Idempotency-Key")); err != nil {
+		writeErr(c, err)
 		return
 	}
 	resp, status, err := h.svc.Create(c.Request.Context(), key, body)
@@ -88,7 +94,11 @@ func (h *Handler) list(c *gin.Context) {
 		writeErr(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, resp)
+	if resp.NextToken != "" {
+		c.Header("X-Next-Token", resp.NextToken)
+	}
+	// The E2B SDK decodes the list body as a JSON array.
+	c.JSON(http.StatusOK, resp.Sandboxes)
 }
 
 func (h *Handler) kill(c *gin.Context) {
@@ -135,6 +145,33 @@ func (h *Handler) timeout(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
+func (h *Handler) metrics(c *gin.Context) {
+	if _, ok := h.ready(c); !ok {
+		return
+	}
+	c.JSON(http.StatusOK, []any{})
+}
+
+func (h *Handler) logs(c *gin.Context) {
+	if _, ok := h.ready(c); !ok {
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"logs": []any{}, "logEntries": []any{}})
+}
+
+// ready authenticates the caller and requires a running sandbox.
+func (h *Handler) ready(c *gin.Context) (string, bool) {
+	key, ok := apiKey(c)
+	if !ok {
+		return "", false
+	}
+	if _, err := h.svc.Get(c.Request.Context(), key, c.Param("sandboxID")); err != nil {
+		writeErr(c, err)
+		return "", false
+	}
+	return key, true
+}
+
 func apiKey(c *gin.Context) (string, bool) {
 	key := c.GetHeader("X-API-KEY")
 	if key == "" {
@@ -147,7 +184,7 @@ func apiKey(c *gin.Context) (string, bool) {
 func writeErr(c *gin.Context, err error) {
 	var oe *grant.OpError
 	if errors.As(err, &oe) {
-		c.JSON(oe.Status, gin.H{"code": oe.Status, "reason": oe.Reason, "message": oe.Message()})
+		c.JSON(oe.Status, gin.H{"code": oe.Status, "reason": oe.Reason, "error_code": oe.Reason, "message": oe.Message()})
 		return
 	}
 	c.JSON(http.StatusInternalServerError, gin.H{
