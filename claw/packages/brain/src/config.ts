@@ -1761,4 +1761,9 @@ export const RULES_DIR = env("RULES_DIR", "/app/rules");
 export const PLATFORM_DEFAULTS_FILE = env("PLATFORM_DEFAULTS_FILE");
 // Whether the file's `skills` apply. Off: only its MCP servers are mounted.
 export const PROGRESSIVE_SKILLS_ENABLED = envBool("PROGRESSIVE_SKILLS_ENABLED", false);
+// Budget for the downloaded skill files (plugin skills and marketplace tool_ids
+// skills) Brain keeps in memory between turns, so a skill version is fetched once
+// per process instead of once per turn (see tools/skill-cache.ts). Counted as
+// content bytes plus a fixed price per file and per skill. 0 turns it off.
+export const SKILL_CACHE_MAX_BYTES = envInt("SKILL_CACHE_MAX_BYTES", 64 * 1024 * 1024, { min: 0 });
 export const SAFETY_PREAMBLE_ENABLED = envBool("SAFETY_PREAMBLE_ENABLED", true);

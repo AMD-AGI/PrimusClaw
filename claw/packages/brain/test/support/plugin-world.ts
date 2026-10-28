@@ -7,14 +7,24 @@
  * MCP server (Streamable HTTP) whose tool Brain calls in-process. Env is set
  * before the test imports the engine, because config.ts reads it once.
  */
+import { createHash } from "node:crypto";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
 export interface PluginWorld {
-  /** Put an object into the plugins bucket. */
+  /** Put an object into the plugins bucket (replaces it: a changed body gets a new ETag, as a real store does). */
   put(key: string, body: string): void;
+  /** What the object store was asked for since the last `resetCounts()`: listings, and object reads by key. */
+  counts: { lists: number; gets: string[] };
+  resetCounts(): void;
+  /** Delete an object from the plugins bucket. */
+  remove(key: string): void;
+  /** While true, listings answer 500 (object reads still work). */
+  failListings: boolean;
+  /** While true, listings carry no ETag, as a store that does not report one. */
+  omitEtags: boolean;
   /** Every MCP tool call the server answered, by tool name. */
   mcpCalls: string[];
   mcpUrl: string;
@@ -23,23 +33,34 @@ export interface PluginWorld {
 
 export async function startPluginWorld(): Promise<PluginWorld> {
   const objects = new Map<string, string>();
+  const counts = { lists: 0, gets: [] as string[] };
+  const state = { failListings: false, omitEtags: false };
+  const etag = (body: string) => `"${createHash("md5").update(body).digest("hex")}"`;
   const s3 = http.createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://x");
     const rest = decodeURIComponent(url.pathname).replace(/^\/plugins\/?/, "");
     if (url.searchParams.get("list-type") === "2") {
+      counts.lists++;
+      if (state.failListings) { res.statusCode = 500; res.end(); return; }
       const prefix = url.searchParams.get("prefix") ?? "";
       const keys = [...objects.keys()].filter((k) => k.startsWith(prefix));
       res.setHeader("content-type", "application/xml");
       res.end(
         `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`
         + `<Name>plugins</Name><KeyCount>${keys.length}</KeyCount><MaxKeys>1000</MaxKeys>`
-        + `<IsTruncated>false</IsTruncated>${keys.map((k) => `<Contents><Key>${k}</Key></Contents>`).join("")}</ListBucketResult>`,
+        + `<IsTruncated>false</IsTruncated>${keys.map((k) => {
+          const body = objects.get(k)!;
+          const tag = state.omitEtags ? "" : `<ETag>${etag(body).replaceAll('"', "&quot;")}</ETag>`;
+          return `<Contents><Key>${k}</Key>${tag}<Size>${Buffer.byteLength(body)}</Size></Contents>`;
+        }).join("")}</ListBucketResult>`,
       );
       return;
     }
     const body = objects.get(rest);
     if (body === undefined) { res.statusCode = 404; res.end(); return; }
+    counts.gets.push(rest);
     res.setHeader("content-type", "application/octet-stream");
+    res.setHeader("etag", etag(body));
     res.end(body);
   });
 
@@ -72,6 +93,13 @@ export async function startPluginWorld(): Promise<PluginWorld> {
 
   return {
     put: (key, body) => { objects.set(key, body); },
+    remove: (key) => { objects.delete(key); },
+    counts,
+    resetCounts: () => { counts.lists = 0; counts.gets.length = 0; },
+    get failListings() { return state.failListings; },
+    set failListings(v: boolean) { state.failListings = v; },
+    get omitEtags() { return state.omitEtags; },
+    set omitEtags(v: boolean) { state.omitEtags = v; },
     mcpCalls,
     mcpUrl: `http://127.0.0.1:${(mcp.address() as AddressInfo).port}/mcp`,
     close: async () => {

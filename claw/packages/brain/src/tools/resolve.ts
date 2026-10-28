@@ -10,6 +10,8 @@ import { TOOLS_API_URL } from "../config.js";
 import { UNAVAILABLE_RULES, bashApprovalFromToolConfig } from "../agent/bash-approval.js";
 import { fetchWithTimeout } from "../infra/retry.js";
 import { lookupTool, platformToolsBase } from "./lookup.js";
+import { skillCache } from "./skill-cache.js";
+import { metrics } from "../infra/metrics.js";
 import type { EventCallback } from "@claw/protocol";
 import type { HandsClient } from "../clients/hands.js";
 import { isSafeRelativePath, uploadDirToSandbox } from "../sandbox/write.js";
@@ -119,7 +121,7 @@ export async function resolveToolIds(
         await onEvent({ type: "toolUsed", tool: "download_skill", actionId: `skill_download_${tid}`, status: "running", brief: `Downloading skill: ${toolName}` });
       }
       try {
-        const content = await downloadSkill(tid, toolName, apiKey, sessionDir, hands);
+        const content = await downloadSkill(tid, toolName, apiKey, sessionDir, hands, undefined, undefined, toolFingerprint(tool));
         if (content) {
           skillContents[toolName] = content;
           logger.info({ tid, toolName, length: content.length }, "resolve_tools.skill_downloaded");
@@ -145,11 +147,29 @@ export async function resolveToolIds(
 }
 
 /**
+ * What the marketplace says a tool is right now: its version and last-updated
+ * stamp. Every in-place update of a tool row (an upsert of the same version
+ * included) bumps `updated_at`, so the pair changes whenever the skill's content
+ * can have. Null when the record carries no stamp: the skill is then downloaded
+ * every time rather than trusted.
+ */
+function toolFingerprint(tool: Record<string, unknown>): string | null {
+  const stamp = tool.updated_at ?? tool.updatedAt;
+  if (stamp === undefined || stamp === null || stamp === "") return null;
+  return `${tool.version ?? ""}|${stamp}`;
+}
+
+/**
  * Download skill from SaFE Tools API, extract ZIP if needed.
  * When `hands` is provided, files are written into the Hands sandbox under
  * `<sessionDir>/.skills/<skillName>/` so the LLM can `cat` them via bash.
  * Otherwise, files are written to a Brain-local temp directory (legacy path).
  * Returns SKILL.md contents.
+ *
+ * With a `fingerprint` (see `toolFingerprint`) the extracted files are held in
+ * memory and the next call that passes the same one skips the download and the
+ * extraction (tools/skill-cache.ts); a skill whose record changed is fetched
+ * again. Without one, nothing is cached.
  */
 export async function downloadSkill(
   toolId: number,
@@ -161,16 +181,78 @@ export async function downloadSkill(
   stageDir?: string,
   /** Tools API base; defaults to the in-cluster API (`platformToolsBase()`). */
   toolsBase: string = platformToolsBase(),
+  /** What the marketplace says this tool is now; lets a held copy be reused. */
+  fingerprint?: string | null,
 ): Promise<string> {
+  // Always stage to a Brain-local temp dir so we can read SKILL.md locally.
+  const localDir = stageDir ?? fs.mkdtempSync(path.join(os.tmpdir(), `claw-skill-${toolId}-`));
+  try {
+    const outcome = await skillCache.stage(`tool:${toolsBase}/${toolId}`, fingerprint ?? null, localDir, async (dir) => {
+      await fetchSkillArchive(toolId, skillName, apiKey, dir, toolsBase);
+      return findSkillMd(dir) !== null;
+    });
+    // Only a caller that asked for the cache is counted: the platform-default
+    // stager downloads through here too, under a disk cache of its own.
+    if (fingerprint !== undefined) metrics.onSkillStage("tool", outcome);
+  } catch (err) {
+    // A fetch that failed leaves nothing worth keeping in a directory we made.
+    if (!stageDir) fs.rmSync(localDir, { recursive: true, force: true });
+    throw err;
+  }
+
+  // Mirror files into the target (sandbox via Hands, or Brain-local fallback).
+  if (hands && sessionDir) {
+    // Sandbox path-guard resolves paths relative to /workspace. Compute a
+    // relative path: "/workspace" → "", "/workspace/foo" → "foo".
+    let rel: string;
+    if (sessionDir === SANDBOX_WORKSPACE) rel = "";
+    else if (sessionDir.startsWith(SANDBOX_WORKSPACE + "/")) rel = sessionDir.slice(SANDBOX_WORKSPACE.length + 1);
+    else rel = sessionDir.replace(/^\/+/, "");
+    const skillRel = rel ? path.posix.join(rel, ".skills", skillName) : path.posix.join(".skills", skillName);
+    const upload = await uploadDirToSandbox(hands, localDir, skillRel);
+    for (const item of upload.skips) {
+      logger.warn({ toolId, skillName, file: item.file, reason: item.reason }, "skill.upload.skipped");
+    }
+    for (const item of upload.failures) {
+      logger.warn({ toolId, skillName, file: item.file, err: item.error }, "skill.upload.failed");
+    }
+    const shippable = upload.total - upload.skipped;
+    if (upload.failed > 0 || (shippable > 0 && upload.uploaded === 0)) {
+      logger.error({ toolId, skillName, ...upload, sandboxRel: skillRel }, "skill.upload.failed_required");
+      throw new Error(`Failed to upload skill '${skillName}' to sandbox`);
+    }
+    logger.info({ toolId, skillName, ...upload, sandboxRel: skillRel }, "skill.upload.done");
+  } else if (sessionDir) {
+    // Legacy path: copy Brain-local (works only when Brain and sandbox share fs).
+    const outDir = path.join(sessionDir, ".skills", skillName);
+    fs.mkdirSync(outDir, { recursive: true });
+    copyDirSync(localDir, outDir);
+  }
+
+  const skillMd = findSkillMd(localDir);
+  if (!skillMd) throw new Error(`SKILL.md not found after extraction`);
+  return fs.readFileSync(skillMd, "utf-8");
+}
+
+/**
+ * Fetch one skill from the Tools API and unpack it into `localDir` (the
+ * download `downloadSkill` runs only when no held copy applies): an archive is
+ * extracted entry by entry under the zip-slip guards below, anything else is
+ * written as SKILL.md.
+ */
+async function fetchSkillArchive(
+  toolId: number,
+  skillName: string,
+  apiKey: string,
+  localDir: string,
+  toolsBase: string,
+): Promise<void> {
   const downloadUrl = `${toolsBase}/${toolId}/download`;
   const resp = await fetch(downloadUrl, { headers: { Authorization: `Bearer ${apiKey}` } });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
 
   const buf = Buffer.from(await resp.arrayBuffer());
   const contentType = resp.headers.get("content-type") ?? "";
-
-  // Always stage to a Brain-local temp dir so we can read SKILL.md locally.
-  const localDir = stageDir ?? fs.mkdtempSync(path.join(os.tmpdir(), `claw-skill-${toolId}-`));
 
   // ZIP file (PK header or application/zip content-type)
   const isZip = (buf[0] === 0x50 && buf[1] === 0x4b) || contentType.includes("zip") || contentType.includes("octet-stream");
@@ -214,39 +296,6 @@ export async function downloadSkill(
   } else {
     fs.writeFileSync(path.join(localDir, "SKILL.md"), buf);
   }
-
-  // Mirror files into the target (sandbox via Hands, or Brain-local fallback).
-  if (hands && sessionDir) {
-    // Sandbox path-guard resolves paths relative to /workspace. Compute a
-    // relative path: "/workspace" → "", "/workspace/foo" → "foo".
-    let rel: string;
-    if (sessionDir === SANDBOX_WORKSPACE) rel = "";
-    else if (sessionDir.startsWith(SANDBOX_WORKSPACE + "/")) rel = sessionDir.slice(SANDBOX_WORKSPACE.length + 1);
-    else rel = sessionDir.replace(/^\/+/, "");
-    const skillRel = rel ? path.posix.join(rel, ".skills", skillName) : path.posix.join(".skills", skillName);
-    const upload = await uploadDirToSandbox(hands, localDir, skillRel);
-    for (const item of upload.skips) {
-      logger.warn({ toolId, skillName, file: item.file, reason: item.reason }, "skill.upload.skipped");
-    }
-    for (const item of upload.failures) {
-      logger.warn({ toolId, skillName, file: item.file, err: item.error }, "skill.upload.failed");
-    }
-    const shippable = upload.total - upload.skipped;
-    if (upload.failed > 0 || (shippable > 0 && upload.uploaded === 0)) {
-      logger.error({ toolId, skillName, ...upload, sandboxRel: skillRel }, "skill.upload.failed_required");
-      throw new Error(`Failed to upload skill '${skillName}' to sandbox`);
-    }
-    logger.info({ toolId, skillName, ...upload, sandboxRel: skillRel }, "skill.upload.done");
-  } else if (sessionDir) {
-    // Legacy path: copy Brain-local (works only when Brain and sandbox share fs).
-    const outDir = path.join(sessionDir, ".skills", skillName);
-    fs.mkdirSync(outDir, { recursive: true });
-    copyDirSync(localDir, outDir);
-  }
-
-  const skillMd = findSkillMd(localDir);
-  if (!skillMd) throw new Error(`SKILL.md not found after extraction`);
-  return fs.readFileSync(skillMd, "utf-8");
 }
 
 /** Copy an entire directory tree. Used for the legacy non-Hands path. */
