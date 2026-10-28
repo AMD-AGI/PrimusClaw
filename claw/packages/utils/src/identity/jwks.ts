@@ -28,6 +28,8 @@ export interface JwksSettings {
   http: HttpSettings;
 }
 
+const MIN_RSA_MODULUS_BITS = 2048;
+
 /** The key the JWK describes, or null for one this client does not verify with. */
 function importKey(jwk: Record<string, unknown>): VerificationKey | null {
   const kid = typeof jwk.kid === "string" ? jwk.kid : "";
@@ -39,6 +41,9 @@ function importKey(jwk: Record<string, unknown>): VerificationKey | null {
   else return null;
   try {
     const key = createPublicKey({ key: jwk as JsonWebKeyInput["key"], format: "jwk" });
+    // RFC 7518 section 3.3: an RSA key for RS256 must be at least 2048 bits. A
+    // smaller one can be factored, so a token "signed" by it proves nothing.
+    if (kind === "rsa" && (key.asymmetricKeyDetails?.modulusLength ?? 0) < MIN_RSA_MODULUS_BITS) return null;
     // A private JWK would import as a public key too; whatever the document
     // carried, only the public half is kept.
     return { kid, kind, key };

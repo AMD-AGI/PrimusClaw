@@ -259,3 +259,23 @@ test("an unknown kid right after an ordinary refresh does not fetch the key set 
     assert.equal(fake.count("/.well-known/jwks.json"), 2, "the refresh already had its say about that kid");
   });
 });
+
+test("an RSA key under 2048 bits is not used, so a token signed with it proves nothing", async () => {
+  const weak = generateKeyPairSync("rsa", { modulusLength: 1024 });
+  const weakKey: TestKey = {
+    kid: "weak", alg: "RS256", privateKey: weak.privateKey,
+    jwk: { ...weak.publicKey.export({ format: "jwk" }), kid: "weak", use: "sig", alg: "RS256" },
+  };
+  // Published beside a good key: the set is usable, the weak key is not in it.
+  await withHarness({}, [weakKey, es], async ({ client }, claims) => {
+    await assert.rejects(client.verifyJwt(signJwt({ key: weakKey, claims: claims() }), { audience: AUD }), rejected("unknown_key"));
+    await client.verifyJwt(signJwt({ key: es, claims: claims() }), { audience: AUD });
+  });
+  // Published alone: there is no usable key at all.
+  await withHarness({}, [weakKey], async ({ client }, claims) => {
+    await assert.rejects(
+      client.verifyJwt(signJwt({ key: weakKey, claims: claims() }), { audience: AUD }),
+      (err: unknown) => err instanceof IdentityUnavailableError && err.reason === "bad_response",
+    );
+  });
+});
