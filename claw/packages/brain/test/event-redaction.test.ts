@@ -197,3 +197,44 @@ test("a non-object value under a credential-named tool is still withheld", () =>
   });
   assert.equal((event.argumentsDetail as any).mcp__safe__apikey_list, "<redacted>");
 });
+
+// The whole input of a credential-named tool used to be masked, so a credential
+// carried as an object KEY (a dynamic map keyed by token) was hidden too. Keeping
+// keys must not make that visible.
+const hostileKeys: Array<{ name: string; key: string }> = [
+  { name: "hyphenated live-key shape", key: "sk-live-abcdefghijklmnopqrstuvwxyz0123" },
+  { name: "vendor-shaped token", key: "ghp_abcdefghijklmnopqrstuvwxyz0123456789" },
+  { name: "AWS access key id", key: "AKIAIOSFODNN7EXAMPLE" },
+  { name: "long hex run", key: "0123456789abcdef0123456789abcdef" },
+  { name: "exact runtime secret", key: "tenant-runtime-key-123" },
+  { name: "very long key", key: "a".repeat(80) },
+  { name: "key with a space", key: "has space" },
+  { name: "prototype-shaped key", key: "__proto__" },
+];
+
+for (const c of hostileKeys) {
+  test(`credential-named tool does not show a credential used as a key: ${c.name}`, () => {
+    const input = JSON.parse(`{${JSON.stringify(c.key)}: "v", "name": "kept"}`) as Record<string, unknown>;
+    const event = redactPersistedEvent({
+      type: "toolUsed",
+      argumentsDetail: { mcp__svc__apikey_create: input },
+    }, ["tenant-runtime-key-123"]);
+    const got = (event.argumentsDetail as Record<string, Record<string, unknown>>).mcp__svc__apikey_create;
+    assert.equal(JSON.stringify(event).includes(c.key), false, "the key must not be serialized");
+    assert.equal(Object.keys(got).length, 2, "two entries in, two entries out");
+    assert.equal(got.name, "<redacted>");
+    assert.ok(Object.keys(got).some((k) => k.startsWith("<redacted-key-")));
+    for (const v of Object.values(got)) assert.equal(v, "<redacted>");
+  });
+}
+
+test("ordinary argument names survive on a credential-named tool", () => {
+  const event = redactPersistedEvent({
+    type: "toolUsed",
+    argumentsDetail: { mcp__svc__apikey_create: { name: "n", ttl_days: 3, expectedUpdatedAt: "t", apikey_id: 5 } },
+  });
+  assert.deepEqual(
+    (event.argumentsDetail as Record<string, unknown>).mcp__svc__apikey_create,
+    { name: "<redacted>", ttl_days: "<redacted>", expectedUpdatedAt: "<redacted>", apikey_id: "<redacted>" },
+  );
+});

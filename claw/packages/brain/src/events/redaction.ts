@@ -5,7 +5,7 @@
 // duplicated: both passes mask the same agent-loop events (here on the way into
 // NATS, there on the way out over SSE), and a sensitive name added to one copy
 // would have left the other leaking.
-import { isSensitiveKey, looksLikeVersionString, redactSecrets } from "@claw/utils";
+import { isSensitiveKey, looksLikeCredentialValue, looksLikeVersionString, redactSecrets } from "@claw/utils";
 
 /**
  * Whether a credential value is distinctive enough to hunt by substring.
@@ -351,21 +351,50 @@ function redactToolArguments(
   runtimeSecrets: RuntimeSecrets,
 ): unknown {
   if (!isSensitiveKey(toolName)) return redactValue(input, seen, runtimeSecrets, toolName);
-  return maskLeaves(input, seen);
+  return maskLeaves(input, seen, runtimeSecrets);
 }
 
-function maskLeaves(value: unknown, seen: WeakSet<object>): unknown {
+function maskLeaves(value: unknown, seen: WeakSet<object>, runtimeSecrets: RuntimeSecrets): unknown {
   if (value === null || value === undefined || value === "") return value;
   if (typeof value !== "object") return "<redacted>";
   if (seen.has(value)) return "<redacted:cyclic>";
   seen.add(value);
-  const out: unknown = Array.isArray(value)
-    ? value.map((item) => maskLeaves(item, seen))
-    : Object.fromEntries(
-        Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, maskLeaves(v, seen)]),
-      );
+  let out: unknown;
+  if (Array.isArray(value)) {
+    out = value.map((item) => maskLeaves(item, seen, runtimeSecrets));
+  } else {
+    const keyed: Record<string, unknown> = {};
+    let hidden = 0;
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      const shown = maskableKey(k, runtimeSecrets);
+      // Two hidden keys must not collapse into one entry.
+      keyed[shown ?? `<redacted-key-${++hidden}>`] = maskLeaves(v, seen, runtimeSecrets);
+    }
+    out = keyed;
+  }
   seen.delete(value);
   return out;
+}
+
+/**
+ * The key to show for a masked entry, or undefined when it must be hidden too.
+ *
+ * Keys are kept because they are what makes the entry still read as the call's
+ * arguments, but the whole input used to be masked, so a key must not be able
+ * to carry what a value cannot: a credential used AS a key (a dynamic map keyed
+ * by token) would otherwise survive. A key is shown only if it reads as an
+ * argument NAME -- short, letters/digits joined by underscores, no long
+ * digit-bearing run, not credential-shaped, and unchanged by the string
+ * redactor (exact runtime secrets, vendor-shaped tokens). Anything else is
+ * hidden; losing the name of an odd argument costs nothing, showing a token
+ * costs the token.
+ */
+const ARGUMENT_NAME_RE = /^[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)*$/;
+function maskableKey(key: string, runtimeSecrets: RuntimeSecrets): string | undefined {
+  if (key.length > 40 || !ARGUMENT_NAME_RE.test(key)) return undefined;
+  if (/\d/.test(key) && /[A-Za-z0-9]{16,}/.test(key)) return undefined;
+  if (looksLikeCredentialValue(key)) return undefined;
+  return redactString(key, runtimeSecrets) === key ? key : undefined;
 }
 
 /**
