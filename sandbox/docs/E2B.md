@@ -26,7 +26,7 @@ The data plane uses the `envdAccessToken` returned at create or connect. The SDK
 | SaFE API key (`ak-...`) | SaFE console       | Owner quota of the caller; templates from the owner policy |
 | Grant key (`e2b_...`)   | Claw sandbox grant | Role quota and templates of the grant                      |
 
-A SaFE API key is checked with primus-identity introspection. The first call creates an owner record for the caller.
+A SaFE API key is checked with primus-identity introspection. The first create or timeout call creates an owner record for the caller. Before that, list returns no sandboxes and get, connect, and kill return 404.
 
 ## Workspace
 

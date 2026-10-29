@@ -49,6 +49,8 @@ controlplane:
     # primus-identity keys on the E2B API. Enabled when introspectUrl and
     # ownerPolicyConfigMap are both set. The client Secret holds client_id and
     # client_secret; the ConfigMap key policy.json holds the owner quota policy.
+    # The policy is read at startup: a ConfigMap change needs a rollout restart.
+    # The policy role must match the role of existing owner records.
     identity:
       introspectUrl: ""
       clientSecret: "agent-sandbox-identity-client"

@@ -99,7 +99,9 @@ type caller struct {
 }
 
 // lookup resolves a grant key, or introspects any other key and returns the owner quota record.
-func (s *Service) lookup(ctx context.Context, apiKey string) (caller, error) {
+// The owner record is created or updated only when write is set; otherwise a missing
+// record leaves grantID empty.
+func (s *Service) lookup(ctx context.Context, apiKey string, write bool) (caller, error) {
 	if s.identity == nil || strings.HasPrefix(apiKey, grantKeyPrefix) {
 		grantID, role, err := s.grants.LookupKey(ctx, apiKey)
 		return caller{grantID: grantID, role: role}, err
@@ -112,7 +114,12 @@ func (s *Service) lookup(ctx context.Context, apiKey string) (caller, error) {
 		return caller{}, grant.Op(http.StatusServiceUnavailable, "identity_unavailable", "identity is temporarily unavailable")
 	}
 	admin := token.HasRole(systemAdminRole) || s.grants.IsSystemAdmin(ctx, token.Subject)
-	grantID, err := s.grants.EnsureOwner(ctx, token.Subject, token.Email, admin)
+	var grantID string
+	if write {
+		grantID, err = s.grants.EnsureOwner(ctx, token.Subject, token.Email, admin)
+	} else {
+		grantID, err = s.grants.OwnerRecord(ctx, token.Subject)
+	}
 	if err != nil {
 		return caller{}, err
 	}
@@ -168,7 +175,7 @@ func firstWorkspace(names []string) (string, error) {
 // Create starts a sandbox, or replays an idempotency key.
 // The access token is returned on this call and on connect, then only as a hash.
 func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (SandboxResponse, int, error) {
-	who, err := s.lookup(ctx, apiKey)
+	who, err := s.lookup(ctx, apiKey, true)
 	if err != nil {
 		return SandboxResponse{}, 0, err
 	}
@@ -430,13 +437,16 @@ func (s *Service) target(ctx context.Context, who caller, sandboxID string) (str
 		sb, err := s.grants.FindSandbox(ctx, sandboxID)
 		return sb.GrantID, sb.Ref, err
 	}
+	if who.grantID == "" {
+		return "", runtimev1alpha1.GrantSandboxRef{}, grant.Op(http.StatusNotFound, "sandbox_not_found", sandboxID)
+	}
 	ref, err := s.grants.Sandbox(ctx, who.grantID, who.role, sandboxID)
 	return who.grantID, ref, err
 }
 
 // Get returns one sandbox for this key's role. Other roles are not found.
 func (s *Service) Get(ctx context.Context, apiKey, sandboxID string) (SandboxResponse, error) {
-	who, err := s.lookup(ctx, apiKey)
+	who, err := s.lookup(ctx, apiKey, false)
 	if err != nil {
 		return SandboxResponse{}, err
 	}
@@ -453,7 +463,7 @@ func (s *Service) Get(ctx context.Context, apiKey, sandboxID string) (SandboxRes
 // List returns running sandboxes for this key's role.
 // state is empty, running, or paused. Ended sandboxes are not listed.
 func (s *Service) List(ctx context.Context, apiKey, metadataQuery, state, nextToken string, limit int) (ListResponse, error) {
-	who, err := s.lookup(ctx, apiKey)
+	who, err := s.lookup(ctx, apiKey, false)
 	if err != nil {
 		return ListResponse{}, err
 	}
@@ -475,7 +485,7 @@ func (s *Service) List(ctx context.Context, apiKey, metadataQuery, state, nextTo
 	var refs []grant.OwnedSandbox
 	if who.owner && who.admin {
 		refs, err = s.grants.ListAllSandboxes(ctx)
-	} else {
+	} else if grantID != "" {
 		var own []runtimev1alpha1.GrantSandboxRef
 		own, err = s.grants.ListRoleSandboxes(ctx, grantID, role)
 		for _, ref := range own {
@@ -514,7 +524,7 @@ func (s *Service) List(ctx context.Context, apiKey, metadataQuery, state, nextTo
 
 // Kill deletes a sandbox. A repeated delete of an ended sandbox is success.
 func (s *Service) Kill(ctx context.Context, apiKey, sandboxID string) error {
-	who, err := s.lookup(ctx, apiKey)
+	who, err := s.lookup(ctx, apiKey, false)
 	if err != nil {
 		return err
 	}
@@ -536,7 +546,7 @@ func (s *Service) Kill(ctx context.Context, apiKey, sandboxID string) error {
 
 // Connect issues another access token without invalidating recent tokens.
 func (s *Service) Connect(ctx context.Context, apiKey, sandboxID string) (SandboxResponse, error) {
-	who, err := s.lookup(ctx, apiKey)
+	who, err := s.lookup(ctx, apiKey, false)
 	if err != nil {
 		return SandboxResponse{}, err
 	}
@@ -583,7 +593,7 @@ func pageBounds(offset, limit, n int) (int, int) {
 // can change it. A value over the grant cap is refused. A system-admin identity
 // key may change any sandbox, bounded by its own owner cap.
 func (s *Service) Timeout(ctx context.Context, apiKey, sandboxID string, timeoutSec int64) error {
-	who, err := s.lookup(ctx, apiKey)
+	who, err := s.lookup(ctx, apiKey, true)
 	if err != nil {
 		return err
 	}

@@ -106,6 +106,9 @@ func validateIssue(req IssueRequest, now time.Time) error {
 	if req.Issuer.AppRunID == "" {
 		return opErr(http.StatusBadRequest, "invalid_grant", "issuer.appRunId is required")
 	}
+	if req.Issuer.AppRunID == ownerAppRunID {
+		return opErr(http.StatusBadRequest, "invalid_grant", "issuer.appRunId "+ownerAppRunID+" is reserved for identity keys")
+	}
 	if len(req.Roles) == 0 {
 		return opErr(http.StatusBadRequest, "invalid_grant", "at least one role is required")
 	}

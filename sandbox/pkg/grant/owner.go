@@ -18,6 +18,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
@@ -122,6 +123,9 @@ func (s *Service) SetOwnerPolicy(ctx context.Context, p OwnerPolicy) error {
 	if !validQuota(quota) || !validQuota(admin) {
 		return opErr(http.StatusBadRequest, "invalid_owner_policy", "default or admin quota is invalid")
 	}
+	if err := s.checkOwnerRole(ctx, role); err != nil {
+		return err
+	}
 	names := make([]string, 0, len(p.Templates))
 	for _, tpl := range p.Templates {
 		names = append(names, tpl.Name)
@@ -141,6 +145,21 @@ func (s *Service) SetOwnerPolicy(ctx context.Context, p OwnerPolicy) error {
 		owners[id] = q
 	}
 	s.owner.Store(&ownerConfig{role: role, roleSpec: roles[role].Templates, templates: stored, quota: quota, admin: admin, owners: owners})
+	return nil
+}
+
+// checkOwnerRole rejects a role that differs from the role of existing owner records.
+// Sandbox refs keep the role they were created with.
+func (s *Service) checkOwnerRole(ctx context.Context, role string) error {
+	var list runtimev1alpha1.SandboxGrantList
+	if err := s.reader.List(ctx, &list, ctrlclient.InNamespace(s.namespace), ctrlclient.MatchingLabels{OwnerKeyLabel: "true"}); err != nil {
+		return opWrap(http.StatusInternalServerError, "grant_list_failed", "", err)
+	}
+	for _, g := range list.Items {
+		if _, ok := g.Spec.Roles[role]; !ok {
+			return opErr(http.StatusBadRequest, "invalid_owner_policy", "role "+role+" differs from existing owner record "+g.Name)
+		}
+	}
 	return nil
 }
 
@@ -191,6 +210,29 @@ func (s *Service) EnsureOwner(ctx context.Context, userID, userName string, admi
 		if err := s.updateOwner(ctx, name, want); err != nil {
 			return "", err
 		}
+	}
+	return name, nil
+}
+
+// OwnerRecord returns the owner quota record of userID without creating it.
+// It returns "" when the record does not exist.
+func (s *Service) OwnerRecord(ctx context.Context, userID string) (string, error) {
+	if s.owner.Load() == nil {
+		return "", opErr(http.StatusForbidden, "owner_keys_disabled", "identity keys are not enabled")
+	}
+	if userID == "" {
+		return "", opErr(http.StatusUnauthorized, "invalid_key", "key has no subject")
+	}
+	name := OwnerGrantName(userID)
+	g, err := s.get(ctx, name)
+	if IsReason(err, "grant_not_found") {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if g.Spec.Owner.UserID != userID {
+		return "", opErr(http.StatusConflict, "owner_conflict", name)
 	}
 	return name, nil
 }

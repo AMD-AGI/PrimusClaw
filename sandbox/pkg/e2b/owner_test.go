@@ -238,8 +238,8 @@ func TestOwnerRecordFollowsPolicy(t *testing.T) {
 	if err := plane.grants.SetOwnerPolicy(ctx, policy); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := plane.List(ctx, "ak-bob", "", "", "", 0); err != nil {
-		t.Fatal(err)
+	if _, _, err := plane.Create(ctx, "ak-bob", CreateBody{TemplateID: "runner", Timeout: 900, Metadata: body.Metadata}); opReason(err) != "timeout_not_allowed" {
+		t.Fatalf("timeout err = %v", err)
 	}
 	var g runtimev1alpha1.SandboxGrant
 	if err := cl.Get(ctx, types.NamespacedName{Name: grant.OwnerGrantName("u-2"), Namespace: "agent-sandbox-system"}, &g); err != nil {
@@ -247,9 +247,6 @@ func TestOwnerRecordFollowsPolicy(t *testing.T) {
 	}
 	if g.Spec.Roles["e2b"].MaxSandboxes != 5 || g.Spec.MaxSandboxSeconds != 600 || g.Status.Usage["e2b"].Sandboxes != 1 {
 		t.Fatalf("owner record = %+v %+v", g.Spec, g.Status.Usage)
-	}
-	if _, _, err := plane.Create(ctx, "ak-bob", CreateBody{TemplateID: "runner", Timeout: 900, Metadata: body.Metadata}); opReason(err) != "timeout_not_allowed" {
-		t.Fatalf("timeout err = %v", err)
 	}
 }
 
@@ -371,5 +368,49 @@ func TestIdentityKeyUsesSaFEAdminRole(t *testing.T) {
 		if _, _, err := plane.Create(context.Background(), "ak-admin", body); err != nil {
 			t.Fatalf("admin create %d: %v", i, err)
 		}
+	}
+}
+
+func TestIdentityKeyReadsDoNotCreateOwnerRecord(t *testing.T) {
+	ids := &fakeIntrospector{tokens: map[string]identity.Token{"ak-alice": {Subject: "u-1"}}}
+	plane, _, cl := ownerPlane(t, ids, samplePolicy())
+	ctx := context.Background()
+
+	list, err := plane.List(ctx, "ak-alice", "", "", "", 0)
+	if err != nil || len(list.Sandboxes) != 0 {
+		t.Fatalf("list = %+v %v", list, err)
+	}
+	if _, err := plane.Get(ctx, "ak-alice", "sbx-x"); opReason(err) != "sandbox_not_found" {
+		t.Fatalf("get err = %v", err)
+	}
+	if err := plane.Kill(ctx, "ak-alice", "sbx-x"); opReason(err) != "sandbox_not_found" {
+		t.Fatalf("kill err = %v", err)
+	}
+	if _, err := plane.Connect(ctx, "ak-alice", "sbx-x"); opReason(err) != "sandbox_not_found" {
+		t.Fatalf("connect err = %v", err)
+	}
+	var grants runtimev1alpha1.SandboxGrantList
+	if err := cl.List(ctx, &grants); err != nil {
+		t.Fatal(err)
+	}
+	if len(grants.Items) != 0 {
+		t.Fatalf("owner records = %d", len(grants.Items))
+	}
+}
+
+func TestOwnerPolicyRoleIsFixedOnceRecordsExist(t *testing.T) {
+	ids := &fakeIntrospector{tokens: map[string]identity.Token{"ak-alice": {Subject: "u-1"}}}
+	plane, _, _ := ownerPlane(t, ids, samplePolicy())
+	ctx := context.Background()
+	if _, _, err := plane.Create(ctx, "ak-alice", CreateBody{TemplateID: "runner"}); err != nil {
+		t.Fatal(err)
+	}
+	policy := samplePolicy()
+	policy.Role = "dev"
+	if err := plane.grants.SetOwnerPolicy(ctx, policy); opReason(err) != "invalid_owner_policy" {
+		t.Fatalf("role change err = %v", err)
+	}
+	if err := plane.grants.SetOwnerPolicy(ctx, samplePolicy()); err != nil {
+		t.Fatalf("same role: %v", err)
 	}
 }
