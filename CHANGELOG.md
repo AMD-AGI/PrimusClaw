@@ -40,8 +40,25 @@ record it.
   `git push` works with the user's own `GH_TOKEN`, which never appears in a URL, a command line or a log. A
   failed clone does not fail the run; the reason is in the block. A session without `config.repo` is unchanged.
   See `claw/docs/sandbox-session-lifecycle.md`.
+- Remote agents, off by default (`CLAW_REMOTE_AGENTS_ENABLED=true`): a program on a user's own
+  machine can dial out to Claw, advertise the agents it can run, receive commands over a
+  `text/event-stream` and post back the events they produce, while the user's own clients read the
+  session, send commands and answer permission requests through the API. Presence, resumable streams
+  (`Last-Event-ID`), keepalive, owner-only access (another user's id is a 404) and an audit trail are
+  included; Claw does not interpret what an agent says. See `claw/docs/remote-agents.md`.
+- Connector access tokens: the four connector-side routes of remote agents accept an RFC 9068 JWT
+  (`Authorization: Bearer`, audience `claw-api`, scope `claw.connector`, type `at+jwt`) issued by the
+  identity provider and verified with the shared identity client, beside the keys and sessions they
+  already accept. The token is a credential on those routes only; the user side and every other route
+  answer it as a request with no credential. The caller is the token's subject with the `default` role,
+  a token is good until it expires or, with `CLAW_CONNECTOR_TOKEN_INTROSPECT=true`, until the provider
+  says its grant is revoked, and a command stream opened with one ends (`event: token_expired`, or
+  `event: revoked`) when the token does. The audit trail records which kind of credential a
+  connector-side action used. Off unless remote agents and the identity client are both on. See
+  `claw/docs/remote-agents.md`.
 - A shared identity client in `@claw/utils`, built by API and Brain when
-  `IDENTITY_CLIENT_ENABLED=true` (off by default; nothing authenticates through it yet). It does OIDC
+  `IDENTITY_CLIENT_ENABLED=true` (off by default; the one request it authenticates is a connector's access
+  token, above). It does OIDC
   discovery and caches the issuer's JWKS, RFC 7662 token introspection (an active answer is cached for
   30 s, an inactive one for 5 s, concurrent lookups of one credential share one call), and an RFC 8693
   token exchange with a token cache. When the provider cannot be asked, a cached active answer keeps
@@ -217,7 +234,7 @@ record it.
   named a retryable status was naked back into the queue it had just given up on.
   The runner now finds the give-up anywhere in the cause chain.
 - Parking a session whose hands handle was deleted no longer fails and retries
-  every sweep. NATS KV answers `get` on a deleted key with its delete marker, an
+  every sweep. NATS KV answers `get` on a deleted key with its delete marker, a
   empty value, and `parkHandsHandle` parsed it as a handle ("Unexpected end of
   JSON input") while `parkHandsAfterRun` skipped it as unreadable. Both now read a
   delete or purge marker as `gone`.
@@ -331,7 +348,7 @@ record it.
   values, and then the built-in fallbacks (`15m` idle, `24h` lifetime), still
   apply.
 - An `IdleReclaimRequested` Kubernetes Event on the Sandbox, recording the idle
-  timeout a reclaim was measured against and the last activity it saw, so an
+  timeout a reclaim was measured against and the last activity it saw, so a
   operator can tell an idle reclaim from any other deletion after the fact.
 - A `provider` label (`anthropic` | `openai`) on `claw_brain_llm_tokens_total`,
   `claw_brain_llm_cache_turns_total` and `claw_brain_llm_cache_write_tokens_total`.

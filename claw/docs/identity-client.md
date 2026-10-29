@@ -11,7 +11,9 @@ JWT genuine* (OIDC discovery and the issuer's JWKS), and *give me a token for th
 user* (RFC 8693 token exchange). It lives in `packages/utils/src/identity/` and
 speaks only those standards, so any provider that implements them works.
 
-It is **off by default and not wired into request authentication**. With
+It is **off by default**, and the one place it takes part in request authentication
+is a connector's access token on the connector side of remote agents (see
+[remote-agents.md](remote-agents.md#connector-access-tokens)). With
 `IDENTITY_CLIENT_ENABLED=true` each process builds the client, reads discovery and
 the key set in the background (a failure is logged, not fatal) and exports the
 `claw_identity_*` metrics. Code that wants the client gets it from
