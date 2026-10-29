@@ -54,10 +54,6 @@ rules:
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
-  # Secrets (for Router JWT key)
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
   # Leader election
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
@@ -74,6 +70,32 @@ metadata:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
+  name: agent-sandbox-workload-manager
+subjects:
+  - kind: ServiceAccount
+    name: workload-manager
+    namespace: agent-sandbox-system
+---
+# The Router public key that verifies EnvD tokens.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: agent-sandbox-workload-manager
+  namespace: agent-sandbox-system
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["envd-router-identity"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agent-sandbox-workload-manager
+  namespace: agent-sandbox-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
   name: agent-sandbox-workload-manager
 subjects:
   - kind: ServiceAccount

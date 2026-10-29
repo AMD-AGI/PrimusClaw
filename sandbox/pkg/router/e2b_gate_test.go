@@ -202,6 +202,12 @@ func TestE2BGateRejectsSealedDirectoryReads(t *testing.T) {
 		{"/filesystem.Filesystem/Stat", `{"path":"/in/.."}`},
 		{"/filesystem.Filesystem/ListDir", `{"path":"/"}`},
 		{"/filesystem.Filesystem/Stat", `{"path":"/work"}`},
+		{"/filesystem.Filesystem/Move", `{"source":"/in/a","destination":"/out/result.json"}`},
+		{"/filesystem.Filesystem/Move", `{"source":"/out/a","destination":"/in/a"}`},
+		{"/filesystem.Filesystem/Remove", `{"path":"/out/result.json"}`},
+		{"/filesystem.Filesystem/Remove", `{"path":"/in"}`},
+		{"/filesystem.Filesystem/MakeDir", `{"path":"/out/x"}`},
+		{"/filesystem.Filesystem/WatchDir", `{"path":"/out"}`},
 	}
 	for _, tc := range denied {
 		before := hits.Load()
@@ -216,6 +222,18 @@ func TestE2BGateRejectsSealedDirectoryReads(t *testing.T) {
 	code, respBody := postGate(t, front.URL+"/filesystem.Filesystem/ListDir", token, "application/json", []byte(`{"path":"/out"}`))
 	if code != http.StatusNoContent || hits.Load() != 1 || !strings.Contains(gotBody, "/out") {
 		t.Fatalf("allowed status=%d hits=%d upstream=%s body=%s", code, hits.Load(), gotBody, respBody)
+	}
+	allowed := []struct{ path, body string }{
+		{"/filesystem.Filesystem/MakeDir", `{"path":"/in/sub"}`},
+		{"/filesystem.Filesystem/Remove", `{"path":"/in/a"}`},
+		{"/filesystem.Filesystem/Move", `{"source":"/in/a","destination":"/in/b"}`},
+	}
+	for _, tc := range allowed {
+		before := hits.Load()
+		code, respBody := postGate(t, front.URL+tc.path, token, "application/json", []byte(tc.body))
+		if code != http.StatusNoContent || hits.Load() != before+1 || gotBody != tc.body {
+			t.Fatalf("%s %s status=%d upstream=%s body=%s", tc.path, tc.body, code, gotBody, respBody)
+		}
 	}
 }
 

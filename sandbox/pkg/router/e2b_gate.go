@@ -63,7 +63,7 @@ func (s *Server) e2bAccessGate(c *gin.Context) {
 		c.Abort()
 		return
 	}
-	if ref.Sealed && e2b.FilesystemReadRPC(c.Request.URL.Path) && !sealedFilesystemRead(c, ref) {
+	if ref.Sealed && e2b.FilesystemRPC(c.Request.URL.Path) && !sealedFilesystemCall(c, ref) {
 		c.Abort()
 		return
 	}
@@ -141,15 +141,15 @@ func (s *Server) proxyEnvD(c *gin.Context, info *store.SandboxInfo, ref runtimev
 	proxy.ServeHTTP(c.Writer, c.Request)
 }
 
-// filesystemReadLimit bounds a Stat or ListDir body. The path is a short field.
-const filesystemReadLimit = 1 << 20
+// filesystemBodyLimit bounds a filesystem RPC body. The paths are short fields.
+const filesystemBodyLimit = 1 << 20
 
-// sealedFilesystemRead applies the output-root rule to a Stat or ListDir body.
+// sealedFilesystemCall applies the sealed allow-list to a filesystem RPC body.
 // The body is restored for an allowed call. A missing or unreadable path is refused.
-func sealedFilesystemRead(c *gin.Context, ref runtimev1alpha1.GrantSandboxRef) bool {
-	body, err := io.ReadAll(io.LimitReader(c.Request.Body, filesystemReadLimit+1))
-	if err != nil || len(body) > filesystemReadLimit ||
-		!e2b.SealedFilesystemRead(c.GetHeader("Content-Type"), body, ref.Inputs, ref.Outputs) {
+func sealedFilesystemCall(c *gin.Context, ref runtimev1alpha1.GrantSandboxRef) bool {
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, filesystemBodyLimit+1))
+	if err != nil || len(body) > filesystemBodyLimit ||
+		!e2b.SealedFilesystemCall(c.Request.URL.Path, c.GetHeader("Content-Type"), body, ref.Inputs, ref.Outputs) {
 		writeGate(c, http.StatusForbidden, "sealed_denied", "path is outside the sealed allow-list")
 		return false
 	}

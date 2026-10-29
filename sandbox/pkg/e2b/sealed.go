@@ -96,43 +96,84 @@ func filePathOf(rawPath string) string {
 	return rest
 }
 
-// FilesystemReadRPC reports whether rawPath is a Stat or ListDir call.
+// FilesystemRPC reports whether rawPath is a filesystem RPC.
 // Those calls carry the target path in the body, not the URL.
-func FilesystemReadRPC(rawPath string) bool {
+func FilesystemRPC(rawPath string) bool {
+	_, ok := filesystemMethod(rawPath)
+	return ok
+}
+
+// filesystemMethod returns the RPC name after the filesystem service prefix.
+func filesystemMethod(rawPath string) (string, bool) {
 	requestPath := rawPath
 	if i := strings.IndexByte(requestPath, '?'); i >= 0 {
 		requestPath = requestPath[:i]
 	}
-	return strings.HasSuffix(requestPath, "/filesystem.Filesystem/Stat") ||
-		strings.HasSuffix(requestPath, "/filesystem.Filesystem/ListDir")
+	const service = "/filesystem.Filesystem/"
+	i := strings.LastIndex(requestPath, service)
+	if i < 0 {
+		return "", false
+	}
+	return requestPath[i+len(service):], true
 }
 
 // SealedFilesystemRead reports whether a sealed Stat or ListDir may read the
 // path in its body. Reads follow the output roots. A body without a path is refused.
 func SealedFilesystemRead(contentType string, body []byte, inputs, outputs []string) bool {
-	filePath, ok := filesystemReadPath(contentType, body)
+	paths, ok := filesystemPaths(contentType, body, []string{"path"})
 	if !ok {
 		return false
 	}
-	return sealedFileAllowed(http.MethodGet, filePath, inputs, outputs)
+	return sealedFileAllowed(http.MethodGet, paths[0], inputs, outputs)
 }
 
-// filesystemReadPath reads the path field from a JSON or protobuf filesystem request.
-func filesystemReadPath(contentType string, body []byte) (string, bool) {
+// SealedFilesystemCall reports whether a sealed sandbox may make this filesystem RPC.
+// Stat and ListDir follow the read rule. MakeDir and Remove follow the write
+// rule, and Move applies it to both source and destination. Other RPCs are refused.
+func SealedFilesystemCall(rawPath, contentType string, body []byte, inputs, outputs []string) bool {
+	method, _ := filesystemMethod(rawPath)
+	switch method {
+	case "Stat", "ListDir":
+		return SealedFilesystemRead(contentType, body, inputs, outputs)
+	case "MakeDir", "Remove":
+		paths, ok := filesystemPaths(contentType, body, []string{"path"})
+		return ok && sealedFileAllowed(http.MethodPost, paths[0], inputs, outputs)
+	case "Move":
+		paths, ok := filesystemPaths(contentType, body, []string{"source", "destination"})
+		return ok && sealedFileAllowed(http.MethodPost, paths[0], inputs, outputs) &&
+			sealedFileAllowed(http.MethodPost, paths[1], inputs, outputs)
+	default:
+		return false
+	}
+}
+
+// filesystemPaths reads the named string fields from a JSON or protobuf request.
+// Protobuf field numbers follow the order of names, starting at 1.
+func filesystemPaths(contentType string, body []byte, names []string) ([]string, bool) {
+	out := make([]string, len(names))
 	if strings.Contains(strings.ToLower(contentType), "json") {
-		var raw struct {
-			Path string `json:"path"`
-		}
+		var raw map[string]any
 		if err := json.Unmarshal(body, &raw); err != nil {
-			return "", false
+			return nil, false
 		}
-		return raw.Path, true
+		for i, name := range names {
+			value, _ := raw[name].(string)
+			out[i] = value
+		}
+		return out, true
 	}
 	msg, ok := rpcMessage(contentType, body)
 	if !ok {
-		return "", false
+		return nil, false
 	}
-	return protoStringField(msg, 1)
+	for i := range names {
+		value, ok := protoStringField(msg, protowire.Number(i+1))
+		if !ok {
+			return nil, false
+		}
+		out[i] = value
+	}
+	return out, true
 }
 
 // rpcMessage returns the protobuf message inside a Connect envelope, or the raw body.

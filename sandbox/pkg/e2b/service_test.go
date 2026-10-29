@@ -239,6 +239,28 @@ func TestSealedFilesystemReadFollowsOutputs(t *testing.T) {
 	}
 }
 
+func TestSealedFilesystemCallChecksMoveFields(t *testing.T) {
+	inputs, outputs := []string{"/in"}, []string{"/out"}
+	move := func(src, dst string) []byte {
+		msg := append([]byte{0x0a, byte(len(src))}, src...)
+		msg = append(append(msg, 0x12, byte(len(dst))), dst...)
+		out := make([]byte, 5+len(msg))
+		binary.BigEndian.PutUint32(out[1:5], uint32(len(msg)))
+		copy(out[5:], msg)
+		return out
+	}
+	const rpc = "/filesystem.Filesystem/Move"
+	if SealedFilesystemCall(rpc, "application/connect+proto", move("/in/a", "/out/b"), inputs, outputs) {
+		t.Fatal("move into outputs allowed")
+	}
+	if !SealedFilesystemCall(rpc, "application/connect+proto", move("/in/a", "/in/b"), inputs, outputs) {
+		t.Fatal("move inside inputs denied")
+	}
+	if SealedFilesystemCall("/filesystem.Filesystem/WatchDir", "application/json", []byte(`{"path":"/out"}`), inputs, outputs) {
+		t.Fatal("unchecked rpc allowed")
+	}
+}
+
 func connectPath(filePath string) []byte {
 	msg := append([]byte{0x0a, byte(len(filePath))}, filePath...)
 	out := make([]byte, 5+len(msg))
