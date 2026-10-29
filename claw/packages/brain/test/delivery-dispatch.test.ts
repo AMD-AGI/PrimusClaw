@@ -31,6 +31,7 @@
 //   D10e a kept overflow still occupies room, so surplus stays refused
 //   D11 room is returned when a delivery is settled
 //   D12 a refusal that throws is reported, not left as an unhandled rejection
+//   D14 an app finish-only dispatch neither waits for a slot nor is refused for the lack of one
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
@@ -443,4 +444,36 @@ describe("runDelivery", () => {
     assert.equal(h.gate.queued, 0, "and is not parked on acquire()");
     assert.equal(h.residency.holding, 1, "only the running delivery holds room");
   });
+  // D14: the dispatch the API's sweeper re-sends when no Brain has written a lease for it within the
+  // grace. Parked behind a full gate it holds no lease, which looks exactly like a lost dispatch.
+  const finishOnlyCases: Array<{ name: string; finishOnly: boolean; started: boolean; nakked: boolean; queued: number }> = [
+    { name: "an app finish-only dispatch on a full gate", finishOnly: true, started: true, nakked: false, queued: 0 },
+    { name: "an ordinary delivery on the same full gate (control)", finishOnly: false, started: false, nakked: true, queued: 0 },
+  ];
+  for (const c of finishOnlyCases) {
+    it(`D14 ${c.name}: ${c.started ? "starts at once, holding no slot" : "is handed back"}`, async () => {
+      const h = harness({ max: 1, resident: 20, hold: 30 });
+      void runDelivery(fakeMsg() as never, h.deps);
+      await settle();
+      assert.equal(h.gate.inflight, 1, "the pod is full");
+
+      const started: object[] = [];
+      const naks: number[] = [];
+      const msg = { nak: (ms: number) => naks.push(ms), info: { deliveryCount: 1 } };
+      const deps: DeliveryDeps = {
+        ...h.deps,
+        isFinishOnly: (m) => m === (msg as object) && c.finishOnly,
+        handle: (m) => { started.push(m as object); return Promise.resolve(); },
+      };
+      // Not awaited: a delivery parked on the gate would otherwise hang the test instead of failing it.
+      void runDelivery(msg as never, deps);
+      await settle();
+
+      assert.equal(started.length === 1, c.started, "the handler ran only for the finish-only dispatch");
+      assert.equal(naks.length === 1, c.nakked);
+      assert.equal(h.gate.queued, c.queued, "nothing is parked on acquire()");
+      assert.equal(h.gate.inflight, 1, "the running delivery still holds its slot, and nobody released one they never took");
+      assert.equal(h.residency.holding, 1, "the delivery that was settled gave its room back");
+    });
+  }
 });
