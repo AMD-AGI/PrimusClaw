@@ -711,10 +711,35 @@ test("the same holds for an identity token, which the peer is sent per call", as
   assert.match(out, /you are \[credential removed\]/);
 });
 
-test("scrubCredentials leaves a short value alone (it would mangle ordinary words) and removes every occurrence", () => {
-  assert.equal(scrubCredentials("the token is abc and abc again", new Set(["abc"])), "the token is abc and abc again");
+test("scrubCredentials removes every occurrence; a short credential only as a whole word, so ordinary text survives", () => {
   assert.equal(scrubCredentials("x SECRET-TOKEN-1 y SECRET-TOKEN-1", new Set(["SECRET-TOKEN-1"])), "x [credential removed] y [credential removed]");
   assert.equal(scrubCredentials("nothing here", new Set(["SECRET-TOKEN-1"])), "nothing here");
+  // a short one (a weak operator secret) is still removed where it stands alone ...
+  assert.equal(scrubCredentials("Authorization: Bearer abc.", new Set(["abc"])), "Authorization: Bearer [credential removed].");
+  assert.equal(scrubCredentials('{"token":"abc"}', new Set(["abc"])), '{"token":"[credential removed]"}');
+  assert.equal(scrubCredentials("Bearer YWJj", new Set(["abc"])), "Bearer [credential removed]");
+  // ... and left alone inside a longer word
+  assert.equal(scrubCredentials("abcdef and xabc", new Set(["abc"])), "abcdef and xabc");
+  // a regex metacharacter in a short credential is not a pattern
+  assert.equal(scrubCredentials("pw a.c and abc", new Set(["a.c"])), "pw [credential removed] and abc");
+});
+
+test("a peer echoing a SHORT service credential cannot put it in front of the model either", async () => {
+  process.env.A2A_TEST_TOKEN = "abc";
+  try {
+    const p = await standardPeer({
+      rpc: (req, res) => {
+        const s = sse(res);
+        s.event({ task: { id: "t-s", status: { state: "TASK_STATE_COMPLETED" }, artifacts: [{ artifactId: "a", parts: [{ text: `Authorization: ${req.headers.authorization}` }] }] } });
+        s.end();
+      },
+    });
+    registry([entry(p, { auth_env: "A2A_TEST_TOKEN" })]);
+    const out = parse(await call({ message: "x" }));
+    assert.equal(out.text, "Authorization: Bearer [credential removed]");
+  } finally {
+    delete process.env.A2A_TEST_TOKEN;
+  }
 });
 
 // ── Per-user entries (room for them) ────────────────────────────────────────

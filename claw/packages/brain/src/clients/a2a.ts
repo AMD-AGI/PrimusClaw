@@ -893,12 +893,17 @@ async function concludeStream(
 // A peer that re-encodes it further has already held the credential it was given; this
 // keeps it out of the model's context, it does not make a peer that holds it harmless.
 // ---------------------------------------------------------------------------
-const MIN_SCRUBBED_CREDENTIAL = 8;
+/** Below this a credential is only removed as a whole word: as a substring it would also remove ordinary text. */
+const SUBSTRING_SCRUBBED_FROM = 8;
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 export function scrubCredentials(text: string, sent: ReadonlySet<string>): string {
   let out = text;
   for (const token of sent) {
-    if (token.length < MIN_SCRUBBED_CREDENTIAL) continue;
+    if (!token) continue;
     const forms = new Set<string>([
       token,
       JSON.stringify(token).slice(1, -1),
@@ -907,7 +912,12 @@ export function scrubCredentials(text: string, sent: ReadonlySet<string>): strin
       Buffer.from(token).toString("base64").replace(/=+$/, ""),
       Buffer.from(token).toString("base64url"),
     ]);
-    for (const form of forms) if (form) out = out.split(form).join("[credential removed]");
+    for (const form of forms) {
+      if (!form) continue;
+      out = token.length >= SUBSTRING_SCRUBBED_FROM
+        ? out.split(form).join("[credential removed]")
+        : out.replace(new RegExp(`(?<![A-Za-z0-9_-])${escapeRegExp(form)}(?![A-Za-z0-9_-])`, "g"), "[credential removed]");
+    }
   }
   return out;
 }
