@@ -28,6 +28,12 @@ record it.
 ## [Unreleased]
 
 ### Added
+- Remote agents, off by default (`CLAW_REMOTE_AGENTS_ENABLED=true`): a program on a user's own
+  machine can dial out to Claw, advertise the agents it can run, receive commands over a
+  `text/event-stream` and post back the events they produce, while the user's own clients read the
+  session, send commands and answer permission requests through the API. Presence, resumable streams
+  (`Last-Event-ID`), keepalive, owner-only access (another user's id is a 404) and an audit trail are
+  included; Claw does not interpret what an agent says. See `claw/docs/remote-agents.md`.
 - A shared identity client in `@claw/utils`, built by API and Brain when
   `IDENTITY_CLIENT_ENABLED=true` (off by default; nothing authenticates through it yet). It does OIDC
   discovery and caches the issuer's JWKS, RFC 7662 token introspection (an active answer is cached for
@@ -205,7 +211,7 @@ record it.
   named a retryable status was naked back into the queue it had just given up on.
   The runner now finds the give-up anywhere in the cause chain.
 - Parking a session whose hands handle was deleted no longer fails and retries
-  every sweep. NATS KV answers `get` on a deleted key with its delete marker, an
+  every sweep. NATS KV answers `get` on a deleted key with its delete marker, a
   empty value, and `parkHandsHandle` parsed it as a handle ("Unexpected end of
   JSON input") while `parkHandsAfterRun` skipped it as unreadable. Both now read a
   delete or purge marker as `gone`.
@@ -319,7 +325,7 @@ record it.
   values, and then the built-in fallbacks (`15m` idle, `24h` lifetime), still
   apply.
 - An `IdleReclaimRequested` Kubernetes Event on the Sandbox, recording the idle
-  timeout a reclaim was measured against and the last activity it saw, so an
+  timeout a reclaim was measured against and the last activity it saw, so a
   operator can tell an idle reclaim from any other deletion after the fact.
 - A `provider` label (`anthropic` | `openai`) on `claw_brain_llm_tokens_total`,
   `claw_brain_llm_cache_turns_total` and `claw_brain_llm_cache_write_tokens_total`.

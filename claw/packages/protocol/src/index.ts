@@ -12,6 +12,7 @@ export * from "./topology.js";
 export * from "./topology-handoff.js";
 export * from "./app-run.js";
 export * from "./run-doorbell.js";
+export * from "./remote-agents.js";
 export * from "./sandbox/base32.js";
 export * from "./sandbox/hands-key.js";
 export * from "./sandbox/shell-record.js";

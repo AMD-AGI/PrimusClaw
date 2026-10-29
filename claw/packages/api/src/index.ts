@@ -28,6 +28,7 @@ import { registerA2ARoutes } from "./routes/a2a.js";
 import { registerPluginRoutes } from "./routes/plugins.js";
 import { registerUserEnvVarRoutes } from "./routes/user-env-vars.js";
 import { registerNotificationSubscriptionRoutes } from "./routes/notification-subscriptions.js";
+import { registerRemoteAgentRoutes } from "./routes/remote-agents.js";
 import { startNotificationWorker } from "./notifications/outbox.js";
 import { registerSystemEnvVarRoutes, publishSystemEnvToKv } from "./routes/system-env-vars.js";
 import { registerMcpRoutes } from "./routes/mcp.js";
@@ -271,6 +272,8 @@ async function main() {
   await registerPluginRoutes(app);
   await registerUserEnvVarRoutes(app);
   await registerNotificationSubscriptionRoutes(app);
+  // Off unless CLAW_REMOTE_AGENTS_ENABLED: the module registers nothing otherwise.
+  await registerRemoteAgentRoutes(app);
   await registerSystemEnvVarRoutes(app);
   await registerMcpRoutes(app);
   await registerInternalTaskRoutes(app);

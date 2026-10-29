@@ -409,6 +409,11 @@ export const NOTIFY_MIN_RUN_SECONDS = envInt("NOTIFY_MIN_RUN_SECONDS", 60);
 // Prefix of the `link` field in a notification, relative to the web UI origin.
 export const NOTIFY_LINK_BASE = env("NOTIFY_LINK_BASE", "/primus-claw");
 
+// --- Remote agents (default OFF) ---
+// When false: no remote-agent tables, no routes, and nothing polls. A connector
+// on a user's machine dials out to these routes; see docs/remote-agents.md.
+export const CLAW_REMOTE_AGENTS_ENABLED = envBool("CLAW_REMOTE_AGENTS_ENABLED", false);
+
 /**
  * Scheduled triggers: a cron schedule that starts a run as the user who created
  * it. Off by default; when off no table is created, no route is registered and no
