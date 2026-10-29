@@ -119,6 +119,17 @@ async function sessionWasDeleted(sessionId: string): Promise<boolean> {
   return false;
 }
 
+/**
+ * An app run's finish-only dispatch: the task was already closed, and this
+ * delivery only completes the run row's finishing steps. The Brain honours the
+ * flag for `app` mode alone (a flag on any other mode would run as an ordinary
+ * turn), so the exemption from the deleted-session drop is limited to the same
+ * pair rather than to the flag.
+ */
+export function isAppFinishOnly(request: Pick<ExecuteRequest, "mode" | "app_finish_only">): boolean {
+  return request.mode === "app" && request.app_finish_only === true;
+}
+
 const inflightHandleTasks = new Set<Promise<void>>();
 
 /** In-flight handlers, for the graceful drain in main() to await. */
@@ -380,7 +391,14 @@ async function handleResolvedRequest(
   // only bites when the delete lands between the guard's delivery and the one
   // before it -- every earlier delivery reaches this check anyway -- but for a
   // contended task that window is the final backoff, minutes wide.
-  if (await sessionWasDeleted(sessionId)) {
+  //
+  // Except an app run's finish-only dispatch. It reports nothing to the session
+  // (the task is already over for the user); all it does is end the run row and
+  // revoke the run's grant, which are the whole reason the sweeper sent it. The
+  // session being gone is the usual reason for it -- a run whose session was
+  // deleted is exactly what ends up stuck in `finishing` -- so dropping it here
+  // left the row requeued and dropped again until the requeue cap.
+  if (!isAppFinishOnly(request) && await sessionWasDeleted(sessionId)) {
     logger.info(
       { sessionId, taskId: request.task_id, claimedDoorbell },
       "task.dropped_deleted_session",
