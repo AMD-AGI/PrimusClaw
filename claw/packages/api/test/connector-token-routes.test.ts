@@ -54,6 +54,8 @@ const REGISTRARS: Record<string, string> = {
   registerTaskRoutes: "routes/tasks.js",
   registerRunRoutes: "runs/routes.js",
   registerWorkbenchRoutes: "workbenches/routes.js",
+  registerModelsRoutes: "routes/models.js",
+  registerMeRoutes: "routes/me.js",
   registerTriggerRoutes: "routes/triggers.js",
 };
 
