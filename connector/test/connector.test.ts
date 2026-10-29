@@ -389,6 +389,16 @@ describe("transport: reconnect, duplicates, loss", () => {
     assert.equal(h.messages(sid).length, 0);
     assert.ok(h.audit().some((a) => a.kind === "event_rejected" && a.type === "agent_message_chunk" && a.reason === "invalid_type"));
   });
+  test("a refused event that is the newest of its session is dropped too (the server's acknowledgement does not cover it)", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    h.claw.rejectType = "turn_end";
+    h.prompt(sid, "say last");
+    await h.claw.until("the message", () => h.messages(sid).includes("last"));
+    assert.equal(await h.connector.drained(), true, "the refused turn_end is not retried forever");
+    assert.equal(h.claw.eventsOf(sid, "turn_end").length, 0);
+    assert.ok(h.audit().some((a) => a.kind === "event_rejected" && a.type === "turn_end"));
+  });
   test("a healthy stream is never dropped by the watchdog, however long it lives", async () => {
     const h = await make();
     await h.online();
