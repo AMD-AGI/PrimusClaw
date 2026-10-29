@@ -1,0 +1,74 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+/**
+ * One command in an existing sandbox, over the real MCP client against a Hands
+ * stand-in that speaks the real protocol: the token travels as a bearer, a command's
+ * output and failure come back as Hands' own text and flag, and a sandbox that does
+ * not answer is `SandboxUnreachableError` -- never a reason to start another.
+ */
+import test, { after, before } from "node:test";
+import assert from "node:assert/strict";
+import http from "node:http";
+import net from "node:net";
+import { execInSandbox, SandboxUnreachableError } from "../src/sessions/hands-exec.js";
+import { startHandsBashStub, type HandsBashStub } from "./support/hands-bash-stub.js";
+
+let stub: HandsBashStub;
+before(async () => { stub = await startHandsBashStub({ token: "tok-123", env: { PATH: process.env.PATH ?? "" } }); });
+after(async () => { await stub.close(); });
+
+test("a command's output comes back as text, with the timeout it was given and the token as a bearer", async () => {
+  stub.commands.length = 0;
+  const r = await execInSandbox({ url: stub.url, token: "tok-123" }, "echo hello; printf 'a\\0b'", 12);
+  assert.deepEqual(r, { text: "hello\na\0b", isError: false });
+  assert.deepEqual(stub.commands, [{ command: "echo hello; printf 'a\\0b'", timeout: 12 }]);
+  assert.ok(stub.headers.length >= 1);
+  assert.ok(stub.headers.every((h) => h.authorization === "Bearer tok-123"));
+});
+
+test("a command that fails is Hands' own error text and flag, not an exception", async () => {
+  const r = await execInSandbox({ url: stub.url, token: "tok-123" }, "echo out; echo err >&2; exit 3", 10);
+  assert.equal(r.isError, true);
+  assert.match(r.text, /^exit 3\nstdout: out\n\nstderr: err\n$/);
+});
+
+test("a wrong token is an unreachable sandbox (the entry describes a different one), and nothing ran", async () => {
+  stub.commands.length = 0;
+  const before = stub.refused;
+  await assert.rejects(() => execInSandbox({ url: stub.url, token: "wrong" }, "echo no", 10), SandboxUnreachableError);
+  assert.equal(stub.commands.length, 0);
+  assert.ok(stub.refused > before);
+});
+
+test("a closed port, a name that does not resolve and a server that answers nonsense are all unreachable", async () => {
+  const closed = await new Promise<number>((resolve) => {
+    const s = net.createServer().listen(0, "127.0.0.1", () => { const p = (s.address() as net.AddressInfo).port; s.close(() => resolve(p)); });
+  });
+  await assert.rejects(() => execInSandbox({ url: `http://127.0.0.1:${closed}/mcp`, token: "t" }, "echo x", 5), SandboxUnreachableError);
+  await assert.rejects(() => execInSandbox({ url: "http://sandbox-that-is-gone.invalid/mcp", token: "t" }, "echo x", 5), SandboxUnreachableError);
+  const junk = http.createServer((_req, res) => { res.writeHead(200, { "content-type": "text/plain" }); res.end("not mcp"); });
+  await new Promise<void>((r) => junk.listen(0, "127.0.0.1", r));
+  try {
+    await assert.rejects(() => execInSandbox({ url: `http://127.0.0.1:${(junk.address() as net.AddressInfo).port}/mcp`, token: "t" }, "echo x", 5), SandboxUnreachableError);
+  } finally {
+    junk.closeAllConnections?.();
+    await new Promise<void>((r) => junk.close(() => r()));
+  }
+});
+
+test("a sandbox that accepts the connection and then goes quiet is unreachable at the timeout, not a hang", async () => {
+  const silent = http.createServer((_req, _res) => { /* never answers */ });
+  await new Promise<void>((r) => silent.listen(0, "127.0.0.1", r));
+  const t0 = Date.now();
+  try {
+    await assert.rejects(
+      () => execInSandbox({ url: `http://127.0.0.1:${(silent.address() as net.AddressInfo).port}/mcp`, token: "t" }, "echo x", 1),
+      SandboxUnreachableError,
+    );
+  } finally {
+    silent.closeAllConnections?.();
+    await new Promise<void>((r) => silent.close(() => r()));
+  }
+  assert.ok(Date.now() - t0 < 20_000, `took ${Date.now() - t0} ms`);
+});

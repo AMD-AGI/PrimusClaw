@@ -68,6 +68,16 @@ record it.
   description only and written into the sandbox on first read. Off by default;
   see `claw/docs/platform-defaults.md`.
 
+- `GET /v1/sessions/:id/changes`: what the session's sandbox has changed, computed live with git through
+  Hands. It lists every git work tree under `/workspace` (two levels down, at most 20, and 200 files each, with
+  `truncated` past a limit) with branch, short head, and for each changed file its status (`M` `A` `D` `R` `?`),
+  additions and deletions (git's own numbers; untracked files counted by their lines; binary files `null`), and
+  `?repo=<path>&file=<path>` returns one file's unified diff (64 KB at most, credentials masked). Creator only;
+  another user's session is a 404 like a missing one. A sandbox that is not running (reclaimed, pending, not
+  answering) is a `409 sandbox_not_running` and nothing is started to look at it. The repository and file in
+  the patch form must be exactly what the live listing holds; git is given only those strings, quoted, after
+  `--`, with literal pathspecs and without its optional index lock. See `claw/docs/sandbox-session-lifecycle.md`.
+
 ### Changed
 - Brain no longer fetches every plugin skill again on every turn. Downloaded skill
   files are held in memory (bounded by `SKILL_CACHE_MAX_BYTES`, 64 MiB by default,
