@@ -27,6 +27,7 @@ import (
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/e2b"
+	"sigs.k8s.io/agent-sandbox/pkg/sandboxlayer"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
 
@@ -820,6 +821,15 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 	}
 	if strings.TrimSpace(req.AvoidNodes) != "" {
 		annotations[nodesAffinityAnnotation] = nodesAffinityPreferred
+	}
+	layers, err := sandboxlayer.Resolve(ci.Spec.Template.Layers, sandboxlayer.TemplateMounts(ci.Spec.Template))
+	if err != nil {
+		return nil, fmt.Errorf("template %s: %w", req.TemplateID, err)
+	}
+	if encoded, err := sandboxlayer.Encode(layers); err != nil {
+		return nil, fmt.Errorf("template %s: encode layers: %w", req.TemplateID, err)
+	} else if encoded != "" {
+		annotations[sandboxlayer.Annotation] = encoded
 	}
 	obj := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": workloadAPIVersion,

@@ -513,3 +513,28 @@ func testCodeInterpreter() *runtimev1alpha1.CodeInterpreter {
 		},
 	}
 }
+
+func TestWorkloadObjectCarriesLayersAnnotation(t *testing.T) {
+	const image = "registry.example/layer@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	ci := testCodeInterpreter()
+	ci.Spec.Template.Layers = []runtimev1alpha1.SandboxLayer{{Image: image, From: "/layer", Mount: "/opt/host"}}
+	const sandboxID = "sbx-7a9b9b693452f613877992145c818d29"
+	req := e2b.CreateRequest{SandboxID: sandboxID, TemplateID: "ar-run-dev-g2", Role: "dev", SessionID: "s-8f2a", Workspace: "top-models", GrantID: "gr-1", Attestation: "eyJ.test"}
+	obj, err := workloadObject(sandboxID, req, ci)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `[{"image":"` + image + `","from":"/layer","mount":"/opt/host","readOnly":true}]`
+	if got := obj.GetAnnotations()["agent-sandbox.io/layers"]; got != want {
+		t.Fatalf("layers annotation = %s", got)
+	}
+	images, _, _ := unstructured.NestedSlice(obj.Object, "spec", "images")
+	if len(images) != 1 {
+		t.Fatalf("images = %v", images)
+	}
+
+	ci.Spec.Template.Layers[0].Mount = "/run/signing-key"
+	if _, err := workloadObject(sandboxID, req, ci); err == nil {
+		t.Fatal("reserved layer mount must be rejected")
+	}
+}
