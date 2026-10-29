@@ -33,6 +33,7 @@ table	claw_tasks	token_usage
 table	claw_task_edges	dag_root_task_id
 table	claw_user_env_vars	key_value_enc
 table	claw_system_env_vars	key_value_enc
+table	claw_terminal_tickets	expires_at
 index	idx_events_unprocessed	-
 index	idx_claw_sessions_status_event_at	-
 index	uq_tools_name_version_active	-

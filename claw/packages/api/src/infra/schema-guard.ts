@@ -175,6 +175,13 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     columns: ["user_id", "enabled"],
   },
   {
+    table: "claw_terminal_tickets",
+    // Every terminal ticket is minted into it and redeemed out of it. Absent, the
+    // mint fails and no browser terminal can be opened -- while everything else
+    // answers, which is how a missing table goes unnoticed.
+    columns: ["ticket_hash", "user_id", "session_id", "sealed", "expires_at"],
+  },
+  {
     table: "claw_memory_entries",
     // The reason this guard exists, found the long way round. `kind` separates
     // the rows decay is allowed to forget from the KB rows it must not touch,
