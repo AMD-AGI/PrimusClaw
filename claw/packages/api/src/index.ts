@@ -174,7 +174,7 @@ async function main() {
   // otherwise start exporting neither.
   assertRolloutConfigAtStartup();
   assertAdmissionSettings(logger);
-  // Off unless IDENTITY_CLIENT_ENABLED is set; the one request it authenticates is a connector's access token.
+  // Off unless IDENTITY_CLIENT_ENABLED is set; it authenticates a connector's access token, and an identity provider's access token only with CLAW_IDENTITY_TOKEN_AUTH_ENABLED.
   startIdentityClient(logger);
   // Off unless CLAW_GITHUB_REVIEW_ENABLED. A deployment that asked for it and cannot offer its gates does not start.
   assertGithubReviewConfig();
