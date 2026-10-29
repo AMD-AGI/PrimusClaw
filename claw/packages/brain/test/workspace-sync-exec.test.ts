@@ -755,18 +755,20 @@ for (const noRsync of [false, true]) {
       assert.match(syncWithGit(ctx, 2, { mode: "drop-all", why: "disabled" }, noRsync), /OK\s*$/);
       assert.ok(!existsSync(join(ctx.base, "current", "r/.git")), "disabled means disabled");
 
-      // Back to a snapshot that has a repository, then the sandbox comes apart:
-      // nothing in the workspace. The carry would put a `.git` into the empty copy
-      // and make it look like content, which is how the guard against replacing a
-      // snapshot with nothing would be defeated -- so it runs after that guard.
-      write(ctx.workspace, "r/.git/HEAD", "ref: refs/heads/main\n");
-      write(ctx.workspace, "r/f.txt", "v1\n");
+      // Back to a snapshot that has a repository -- the workspace's own, at the
+      // root -- then the sandbox comes apart: nothing in the workspace. The carry
+      // would put that `.git` into the empty copy and make it look like content,
+      // which is how the guard against replacing a snapshot with nothing would be
+      // defeated, so the carry runs after that guard. (A repository below the root
+      // would not show it: its directory is gone with the rest, and it is not carried.)
+      write(ctx.workspace, ".git/HEAD", "ref: refs/heads/main\n");
+      write(ctx.workspace, "f.txt", "v1\n");
       assert.match(syncWithGit(ctx, 3, KEEP, noRsync), /OK\s*$/);
       rmSync(ctx.workspace, { recursive: true, force: true });
       mkdirSync(ctx.workspace, { recursive: true });
       assert.throws(() => syncWithGit(ctx, 4, UNMEASURED, noRsync), /workspace_sync_empty|Command failed/);
-      assert.equal(snapshotFile(ctx, "r/.git/HEAD"), "ref: refs/heads/main\n", "the previous snapshot stands");
-      assert.equal(snapshotFile(ctx, "r/f.txt"), "v1\n");
+      assert.equal(snapshotFile(ctx, ".git/HEAD"), "ref: refs/heads/main\n", "the previous snapshot stands");
+      assert.equal(snapshotFile(ctx, "f.txt"), "v1\n", "with the files the empty workspace would have replaced");
     } finally {
       cleanup(ctx);
     }

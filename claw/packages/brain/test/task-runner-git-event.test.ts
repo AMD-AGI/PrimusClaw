@@ -174,6 +174,50 @@ test("the same note every turn is said once; a different one, or the same one af
   );
 });
 
+test("an event the stream refused is tried again at the next sync, not taken as said", async () => {
+  let refuse = true;
+  const said: string[] = [];
+  const msg = { info: { deliveryCount: 1 }, ack() {}, nak() {}, working() {}, term() {} } as unknown as JsMsg;
+  const emitter = {
+    async emit(_s: string, evt: Record<string, unknown>) {
+      if (evt.status !== "workspace_git_skipped") return;
+      if (refuse) { refuse = false; throw new Error("stream refused"); }
+      said.push(String(evt.message));
+    },
+  } as unknown as NatsEmitter;
+  let finished = 0;
+  const engine: Engine = {
+    async execute(_req, _onEvent, _signal, _hands, extras: ExecuteExtras | undefined) {
+      await extras!.attachHands!();
+      for (let i = 0; i < 2; i++) {
+        await extras!.onCheckpoint!(state(i + 1));
+        for (let w = 0; w < 200 && finished < i + 1; w++) await new Promise((r) => setTimeout(r, 5));
+      }
+      return {
+        finalText: "done",
+        tokenUsage: { input_tokens: 1, output_tokens: 2, cache_read: 0, cache_create: 0 },
+        turns: 2, pendingMemories: [], pendingSkills: [], skillsUsed: {}, errorCount: 0,
+        toolStats: { total_calls: 0, error_calls: 0, by_tool: {} }, elapsedMs: 5,
+      } as ExecuteResult;
+    },
+  };
+  bindTaskRunnerDeps({
+    kv: memoryKv(), kvCkpt: memoryKv(), emitter, engine,
+    sideEffects: sideEffects({
+      syncWorkspace: (async () => {
+        setTimeout(() => { finished++; }, 20);
+        return { size: 1, inodes: 1, durationMs: 1, git: over };
+      }) as never,
+    }),
+  });
+  await runHandleTask(
+    msg,
+    { session_id: SESSION, prompt: "hi", user_id: USER, platform_key: "pk" } as ExecuteRequest,
+    SESSION, `lock.${SESSION}`, MESSAGE, USER, new AbortController(),
+  );
+  assert.deepEqual(said, [NOTE_BIG], "the first was refused, so the second sync says it; nothing is said twice");
+});
+
 test("the event failing to go out does not undo a snapshot that was saved", async () => {
   // The checkpoint's workspace flag is written after the sync and before the
   // announcement; a stream that refuses the event must not be able to take it back.
