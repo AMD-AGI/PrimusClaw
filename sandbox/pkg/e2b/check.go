@@ -41,6 +41,9 @@ const avoidNodesMetadata = metadataPrefix + "avoid-nodes"
 // workspaceMetadata selects the SaFE workspace of an identity-key sandbox.
 const workspaceMetadata = metadataPrefix + "workspace"
 
+// ownerUserMetadata is the owner user id shown to a system-admin listing.
+const ownerUserMetadata = metadataPrefix + "owner-user-id"
+
 // callerMetadataKeys may be set by the SDK under agent-sandbox.io/.
 var callerMetadataKeys = map[string]struct{}{
 	"idempotency-key": {},
@@ -55,6 +58,7 @@ var reservedMetadataKeys = map[string]struct{}{
 	"signing-public-key": {},
 	"same-node":          {},
 	"nodes":              {},
+	"owner-user-id":      {},
 }
 
 // checkMetadata accepts agent-sandbox.io/ keys, including the caller keys above.

@@ -252,3 +252,86 @@ func TestOwnerRecordFollowsPolicy(t *testing.T) {
 		t.Fatalf("timeout err = %v", err)
 	}
 }
+
+func TestSystemAdminReachesEverySandbox(t *testing.T) {
+	plane, _, keys := testPlane(t, 3600, []int32{1}, 2)
+	policy := samplePolicy()
+	policy.Default = nil
+	policy.Owners = nil
+	if err := plane.grants.SetOwnerPolicy(context.Background(), policy); err != nil {
+		t.Fatal(err)
+	}
+	plane.identity = &fakeIntrospector{tokens: map[string]identity.Token{
+		"ak-alice": {Subject: "u-1"},
+		"ak-bob":   {Subject: "u-2"},
+		"ak-admin": {Subject: "u-9", Roles: []string{"system-admin"}},
+	}}
+	ctx := context.Background()
+	lab := map[string]string{workspaceMetadata: "lab"}
+
+	claw, _, err := plane.Create(ctx, keys["dev"], CreateBody{TemplateID: "runner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	alice, _, err := plane.Create(ctx, "ak-alice", CreateBody{TemplateID: "runner", Timeout: 3600, Metadata: lab})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := plane.Get(ctx, "ak-bob", alice.SandboxID); opReason(err) != "sandbox_not_found" {
+		t.Fatalf("other user get err = %v", err)
+	}
+	if got, err := plane.List(ctx, "ak-bob", "", "", "", 0); err != nil || len(got.Sandboxes) != 0 {
+		t.Fatalf("other user list = %+v %v", got, err)
+	}
+
+	list, err := plane.List(ctx, "ak-admin", "", "", "", 0)
+	if err != nil || len(list.Sandboxes) != 2 {
+		t.Fatalf("admin list = %+v %v", list, err)
+	}
+	owners := map[string]string{}
+	for _, sb := range list.Sandboxes {
+		owners[sb.SandboxID] = sb.Metadata[ownerUserMetadata]
+	}
+	if owners[claw.SandboxID] != "u-123" || owners[alice.SandboxID] != "u-1" {
+		t.Fatalf("admin list owners = %v", owners)
+	}
+	for _, id := range []string{claw.SandboxID, alice.SandboxID} {
+		if _, err := plane.Get(ctx, "ak-admin", id); err != nil {
+			t.Fatalf("admin get %s: %v", id, err)
+		}
+		conn, err := plane.Connect(ctx, "ak-admin", id)
+		if err != nil || conn.EnvdAccessToken == "" {
+			t.Fatalf("admin connect %s: %v", id, err)
+		}
+		if _, err := plane.grants.LookupAccess(ctx, id, conn.EnvdAccessToken); err != nil {
+			t.Fatalf("admin token %s: %v", id, err)
+		}
+	}
+
+	if err := plane.Timeout(ctx, "ak-alice", alice.SandboxID, 13*3600); opReason(err) != "timeout_not_allowed" {
+		t.Fatalf("user 13h timeout err = %v", err)
+	}
+	if err := plane.Timeout(ctx, "ak-admin", alice.SandboxID, 2*24*3600); err != nil {
+		t.Fatalf("admin 2d timeout: %v", err)
+	}
+	if err := plane.Timeout(ctx, "ak-admin", alice.SandboxID, 3*24*3600+1); opReason(err) != "timeout_not_allowed" {
+		t.Fatalf("admin over 3d timeout err = %v", err)
+	}
+
+	if err := plane.Kill(ctx, "ak-admin", claw.SandboxID); err != nil {
+		t.Fatalf("admin kill claw: %v", err)
+	}
+	if err := plane.Kill(ctx, "ak-admin", alice.SandboxID); err != nil {
+		t.Fatalf("admin kill alice: %v", err)
+	}
+	if _, err := plane.Get(ctx, "ak-alice", alice.SandboxID); opReason(err) != "sandbox_not_found" {
+		t.Fatalf("killed sandbox get err = %v", err)
+	}
+}
+
+func TestCallerCannotSetOwnerMetadata(t *testing.T) {
+	if err := checkMetadata(map[string]string{ownerUserMetadata: "u-1"}); opReason(err) != "metadata_reserved" {
+		t.Fatalf("err = %v", err)
+	}
+}
