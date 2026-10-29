@@ -12,9 +12,11 @@
  * whose session merely lapsed to an error page instead of the login.
  *
  *   unreachable  no answer: DNS, TLS, reset, or the timeout below. 503.
- *   rejected     the service refused the credential (401/403). The route decides
- *                what that means: for the caller's own SaFE session it is a 401,
- *                for a key the API chose for the caller it is the API's problem.
+ *   rejected     the service refused the credential (401/403), and the failure keeps
+ *                which. The route decides what that means: for the caller's own SaFE
+ *                session a 401 is a lapsed session (a 401 to the caller) while a 403
+ *                is an authorization denial (not a reason to sign in again); for a
+ *                key the API chose for the caller either is the API's problem.
  *   http         any other non-2xx. 502.
  *   bad_body     a 2xx whose body is not the JSON object/array the route expects.
  *                502: the service answered, with something this API cannot use.

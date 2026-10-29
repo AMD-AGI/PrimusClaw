@@ -11,7 +11,9 @@
  *   ME3  every SaFE read is made with THE CALLER'S credential and nobody else's,
  *        including under concurrency and with two credentials on one request
  *   ME4  SaFE failing in any way is a 401/502/503 with `{error, reason}`, never a
- *        500 -- and a failed user lookup is never rendered as `admin: false`
+ *        500 -- and a failed user lookup is never rendered as `admin: false`.
+ *        Only SaFE's 401 is a 401 (sign in again); its 403 is a 502 `safe_forbidden`,
+ *        because the session is good and signing in again would change nothing
  *   ME5  the answer is uncacheable
  *   ME6  without a credential SaFE can be shown (the dev bypass) there is no
  *        SaFE call at all
@@ -250,7 +252,10 @@ test("ME4: the failure table", async (t) => {
     { name: "users/self 500 is a failure, never admin:false", path: "/api/v1/users/self", answer: (r) => sendJson(r, 500, {}), status: 502, error: "safe_error" },
     { name: "users/self 404", path: "/api/v1/users/self", answer: (r) => sendJson(r, 404, {}), status: 502, error: "safe_error" },
     { name: "users/self 401 is the session lapsing", path: "/api/v1/users/self", answer: (r) => sendJson(r, 401, {}), status: 401, error: "session_rejected" },
-    { name: "workspaces 403", path: "/api/v1/workspaces", answer: (r) => sendJson(r, 403, {}), status: 401, error: "session_rejected" },
+    { name: "workspaces 401", path: "/api/v1/workspaces", answer: (r) => sendJson(r, 401, {}), status: 401, error: "session_rejected" },
+    { name: "workspaces 403 is a denial, not a lapsed session", path: "/api/v1/workspaces", answer: (r) => sendJson(r, 403, {}), status: 502, error: "safe_forbidden" },
+    { name: "clusters 403 (a role that may not list clusters)", path: "/api/v1/clusters", answer: (r) => sendJson(r, 403, {}), status: 502, error: "safe_forbidden" },
+    { name: "users/self 403", path: "/api/v1/users/self", answer: (r) => sendJson(r, 403, {}), status: 502, error: "safe_forbidden" },
     { name: "clusters connection dropped", path: "/api/v1/clusters", answer: (r) => { r.socket?.destroy(); }, status: 503, error: "safe_unreachable" },
     { name: "workspaces connection dropped", path: "/api/v1/workspaces", answer: (r) => { r.socket?.destroy(); }, status: 503, error: "safe_unreachable" },
     { name: "workspaces items not a list", path: "/api/v1/workspaces", answer: (r) => sendJson(r, 200, { items: "x" }), status: 502, error: "safe_bad_response" },

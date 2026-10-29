@@ -46,8 +46,13 @@
  *
  * Failures, `{ error, reason }`, never a 500 for a dependency:
  *   401 authentication_required   no credential this route can forward to SaFE
- *   401 session_rejected          SaFE refused the caller's credential (a session
- *                                 that lapsed inside the auth middleware's cache window)
+ *   401 session_rejected          SaFE answered 401: it no longer accepts the caller's
+ *                                 credential (a session that lapsed inside the auth
+ *                                 middleware's cache window). Signing in again helps.
+ *   502 safe_forbidden            SaFE answered 403: the credential is good but this
+ *                                 account may not read one of the three documents.
+ *                                 Not a 401: signing in again changes nothing, and a
+ *                                 client that answers 401 with the login would loop.
  *   503 safe_not_configured       SAFE_API_URL is unset
  *   503 safe_unreachable          DNS / TLS / reset / timeout
  *   502 safe_error                any other non-2xx
@@ -208,7 +213,12 @@ export async function registerMeRoutes(app: FastifyInstance): Promise<void> {
       const f = err.failure;
       logger.warn({ kind: f.kind, status: "status" in f ? f.status : null, detail: "detail" in f ? f.detail : null }, "me.upstream_failed");
       if (f.kind === "unreachable") return refuse(reply, 503, "safe_unreachable", "SaFE did not answer");
-      if (f.kind === "rejected") return refuse(reply, 401, "session_rejected", "SaFE no longer accepts this session; sign in again");
+      if (f.kind === "rejected") {
+        // Only a 401 says the credential is no good. SaFE uses 403 for an authorization
+        // denial on a credential it accepted, so a 403 must not send the user to the login.
+        if (f.status === 401) return refuse(reply, 401, "session_rejected", "SaFE no longer accepts this session; sign in again");
+        return refuse(reply, 502, "safe_forbidden", "SaFE does not allow this account to read what this document needs");
+      }
       if (f.kind === "http") return refuse(reply, 502, "safe_error", `SaFE answered HTTP ${f.status}`);
       return refuse(reply, 502, "safe_bad_response", "SaFE answered with a document this API cannot read");
     }
