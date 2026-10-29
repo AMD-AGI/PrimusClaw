@@ -4,12 +4,12 @@ Agent Sandbox serves the [E2B](https://e2b.dev) control plane and data plane, so
 
 ## Access
 
-| Item          | Value                                                        |
-| ------------- | ------------------------------------------------------------ |
+| Item          | Value                                                               |
+| ------------- | ------------------------------------------------------------------- |
 | Control plane | `https://<safe-host>/sandboxes`, `https://<safe-host>/v2/sandboxes` |
-| Data plane    | `https://<safe-host>` (envd, routed by sandbox id)           |
-| API key       | SaFE API key (`ak-...`), sent as `X-API-Key`                 |
-| SDK           | E2B Python SDK 2.51 or later                                 |
+| Data plane    | `https://<safe-host>` (envd, routed by sandbox id)                  |
+| API key       | SaFE API key (`ak-...`), sent as `X-API-Key`                        |
+| SDK           | E2B Python SDK 2.51 or later                                        |
 
 ```bash
 export E2B_API_KEY=ak-xxxx
@@ -21,10 +21,10 @@ The data plane uses the `envdAccessToken` returned at create or connect. The SDK
 
 ## Keys
 
-| Key                         | Issued by         | Scope                                                        |
-| --------------------------- | ----------------- | ------------------------------------------------------------ |
-| SaFE API key (`ak-...`)     | SaFE console      | Owner quota of the caller; templates from the owner policy   |
-| Grant key (`e2b_...`)       | Claw sandbox grant | Role quota and templates of the grant                        |
+| Key                     | Issued by          | Scope                                                      |
+| ----------------------- | ------------------ | ---------------------------------------------------------- |
+| SaFE API key (`ak-...`) | SaFE console       | Owner quota of the caller; templates from the owner policy |
+| Grant key (`e2b_...`)   | Claw sandbox grant | Role quota and templates of the grant                      |
 
 A SaFE API key is checked with primus-identity introspection. The first call creates an owner record for the caller.
 
@@ -38,36 +38,35 @@ A sandbox runs in a SaFE workspace the caller belongs to.
 
 ## Templates
 
-Templates are defined by the operator in the owner policy (`E2B_OWNER_POLICY`). The current policy provides:
+The operator defines the templates open to SaFE API keys in the owner policy (`E2B_OWNER_POLICY`). Ask the operator for the template ids of a deployment.
 
-| Template ID          | GPUs | Mode   |
-| -------------------- | ---- | ------ |
-| `e2b-measurement-g1` | 1    | sealed |
-| `e2b-measurement-g8` | 8    | sealed |
+A template id has the form `e2b-<name>-g<gpus>`, one per GPU count listed for the template, or `e2b-<name>` when no GPU count is listed.
 
-The measurement template runs the Hyperloom measurement runner:
+A template fixes:
 
-- The image is pinned by digest and cannot be changed by the caller.
-- Accepted environment variables: `HYPERLOOM_SOURCE_SHA`, `HYPERLOOM_RUNNER_CACHE_MANIFEST_SHA256`. Other variables return `403 env_not_allowed`.
-- At start the runner verifies its cache entry with these two variables, then waits up to 30 minutes for a spec in `/in`.
-- Results and state are written to `/out`, including `/out/status.json`. Without valid runner variables, `status.json` reports `runner_start_failed`.
+- the image, pinned by digest; the caller cannot change it;
+- the startup steps and environment;
+- `acceptedEnvs`: the only environment variables a caller may pass; others return `403 env_not_allowed`;
+- `sealed`, `inputs`, `outputs`: the sealed mode and its directories.
 
 Sealed rules:
 
-| Path         | Read | Write |
-| ------------ | ---- | ----- |
-| `/in`        | no   | yes   |
-| `/out`       | yes  | no    |
-| other paths  | no   | no    |
-| commands     | not allowed |   |
+| Target                    | Read | Write |
+| ------------------------- | ---- | ----- |
+| `inputs` directories      | no   | yes   |
+| `outputs` directories     | yes  | no    |
+| other paths               | no   | no    |
+| commands                  | no   | no    |
+
+A template that is not sealed allows commands and file access in the sandbox.
 
 ## Quotas
 
-Quotas apply per person, across all templates.
+Quotas apply per person, across all templates. The built-in defaults are below; the owner policy can override the user quota, the `system-admin` quota, or the quota of one user.
 
 | Caller         | Concurrent sandboxes | Concurrent GPUs | Max lifetime per sandbox |
 | -------------- | -------------------- | --------------- | ------------------------ |
-| User (default) | 8                    | 8               | 12 hours                 |
+| User           | 8                    | 8               | 12 hours                 |
 | `system-admin` | unlimited            | unlimited       | 3 days                   |
 
 - The create timeout and every extension stay within the max lifetime.
@@ -78,22 +77,24 @@ Quotas apply per person, across all templates.
 ## Example
 
 ```python
-import time
 from e2b import Sandbox
 
 sbx = Sandbox.create(
-    "e2b-measurement-g1",
+    "<template-id>",
     timeout=1800,
-    metadata={"hyperloom.purpose": "e2b-trial"},
+    metadata={"purpose": "e2b-trial"},
     # metadata={"agent-sandbox.io/workspace": "<workspace-id>"},
-    # envs={"HYPERLOOM_SOURCE_SHA": "...", "HYPERLOOM_RUNNER_CACHE_MANIFEST_SHA256": "..."},
+    # envs={"<ACCEPTED_ENV>": "<value>"},
     request_timeout=900,
 )
 print(sbx.sandbox_id)
 
-sbx.files.write("/in/spec.json", '{"example": true}')
-time.sleep(30)
-print(sbx.files.read("/out/status.json"))
+# Template that is not sealed
+print(sbx.commands.run("echo hello").stdout)
+
+# Sealed template: write inputs, read outputs
+# sbx.files.write("<input-dir>/spec.json", "{}")
+# print(sbx.files.read("<output-dir>/result.json"))
 
 sbx.set_timeout(3600)
 print([s.sandbox_id for s in Sandbox.list().next_items()])
@@ -105,7 +106,7 @@ Control plane with curl:
 ```bash
 curl -s -H "X-API-Key: $E2B_API_KEY" $E2B_API_URL/sandboxes
 curl -s -X POST -H "X-API-Key: $E2B_API_KEY" -H "Content-Type: application/json" \
-  -d '{"templateID":"e2b-measurement-g1","timeout":1800}' $E2B_API_URL/sandboxes
+  -d '{"templateID":"<template-id>","timeout":1800}' $E2B_API_URL/sandboxes
 curl -s -X POST -H "X-API-Key: $E2B_API_KEY" -H "Content-Type: application/json" \
   -d '{"timeout":3600}' $E2B_API_URL/sandboxes/<sandboxID>/timeout
 curl -s -X DELETE -H "X-API-Key: $E2B_API_KEY" $E2B_API_URL/sandboxes/<sandboxID>
@@ -137,16 +138,16 @@ from e2b import Sandbox
 
 ## Errors
 
-| Status | Code                    | Meaning                                             |
-| ------ | ----------------------- | --------------------------------------------------- |
-| 401    | `invalid_key`           | Key is unknown, inactive, or expired                |
-| 403    | `timeout_not_allowed`   | Timeout exceeds the max lifetime                    |
-| 403    | `template_not_allowed`  | Template is not in the caller's policy              |
-| 403    | `env_not_allowed`       | Environment variable is not accepted                |
-| 403    | `metadata_reserved`     | Metadata key is reserved by the platform            |
-| 403    | `user_not_in_workspace` | Caller is not a member of the workspace             |
-| 403    | `sealed_denied`         | Path or call is outside the sealed allow-list       |
-| 404    | `sandbox_not_found`     | Sandbox does not exist or belongs to another user   |
-| 503    | `identity_unavailable`  | primus-identity cannot be reached                   |
+| Status | Code                    | Meaning                                           |
+| ------ | ----------------------- | ------------------------------------------------- |
+| 401    | `invalid_key`           | Key is unknown, inactive, or expired              |
+| 403    | `timeout_not_allowed`   | Timeout exceeds the max lifetime                  |
+| 403    | `template_not_allowed`  | Template is not in the caller's policy            |
+| 403    | `env_not_allowed`       | Environment variable is not accepted              |
+| 403    | `metadata_reserved`     | Metadata key is reserved by the platform          |
+| 403    | `user_not_in_workspace` | Caller is not a member of the workspace           |
+| 403    | `sealed_denied`         | Path or call is outside the sealed allow-list     |
+| 404    | `sandbox_not_found`     | Sandbox does not exist or belongs to another user |
+| 503    | `identity_unavailable`  | primus-identity cannot be reached                 |
 
 A create that waits for a free GPU stays pending until the Workload is scheduled; a larger `request_timeout` keeps the call open while it waits.
