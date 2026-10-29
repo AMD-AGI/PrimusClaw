@@ -115,7 +115,9 @@ func (s *processes) startOne(req startRequest) (*proc, error) {
 	if req.Process.Cmd == "" {
 		return nil, rpcErr("invalid_argument", "command is required")
 	}
-	withStdin := true
+	// An omitted stdin field means the caller will not write. Opening a pipe
+	// in that case holds the stream open after the process exits.
+	withStdin := false
 	if req.Stdin != nil {
 		withStdin = *req.Stdin
 	}
