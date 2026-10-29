@@ -9,9 +9,10 @@
  * before the model is asked anything, through the same Hands `bash` tool the
  * agent itself uses. Three states of `/workspace/<name>`, three actions:
  *
- *   absent               clone (into a hidden sibling first, moved into place only
- *                        when it is whole, so a clone that is killed leaves nothing
- *                        that looks like a repository)
+ *   absent               clone (into a directory made for this call alone, moved into
+ *                        place only when it is whole, so a clone that is killed leaves
+ *                        nothing that looks like a repository, and nothing that was
+ *                        already there is ever removed)
  *   has a .git           a restored snapshot, or a turn in a sandbox that is still
  *                        up: fetch, and nothing else. The branch is NOT changed and
  *                        nothing is merged or reset, so a commit, a branch or an
@@ -151,32 +152,53 @@ function credentialAndProbe(dir: string, boundMarker: string): string {
     // Idempotent: a second turn in the same sandbox adds nothing.
     `if git config --global --get-all credential.helper 2>/dev/null | grep -qxF ${helper} || git config --global --add credential.helper ${helper} 2>/dev/null; then echo CLAW_REPO_CRED=ok; else echo CLAW_REPO_CRED=failed; fi;`,
     `D=${shq(dir)};`,
-    `if [ -e "$D/.git" ]; then echo CLAW_REPO_STATE=git; echo "CLAW_REPO_ORIGIN=$(git -C "$D" config --get remote.origin.url 2>/dev/null)";`,
+    // A link is never followed: a checkout that is a link, or a .git that is, would have git write
+    // (and the instruction files be read) somewhere this code was not asked about.
+    `if [ -L "$D" ] || [ -L "$D/.git" ]; then echo CLAW_REPO_STATE=symlink;`,
+    `elif [ -e "$D/.git" ]; then echo CLAW_REPO_STATE=git; echo "CLAW_REPO_ORIGIN=$(git -C "$D" config --get remote.origin.url 2>/dev/null)";`,
     `elif [ -e "$D" ] && [ -n "$(ls -A "$D" 2>/dev/null)" ]; then echo CLAW_REPO_STATE=occupied;`,
     `else echo CLAW_REPO_STATE=absent; fi;`,
     `if [ -e ${shq(boundMarker)} ]; then echo CLAW_REPO_BOUND=yes; else echo CLAW_REPO_BOUND=no; fi`,
   ].join(" ");
 }
 
-function cloneCommand(dir: string, tmp: string, url: string, boundMarker: string): string {
+/** Where a clone is staged: a directory of the form `<root>/.claw-clone-XXXXXX`, made for one call. */
+const STAGING_PREFIX = ".claw-clone-";
+const STAGING_MARKER = ".claw-staging";
+
+/**
+ * Stage in a directory made for this call alone, so nothing that was there before is
+ * ever removed: `mktemp` makes a name nobody has, a marker file says it is ours, and
+ * the call removes only what it made. The leftover of a clone that was killed (it has
+ * the marker, and is an hour old) is cleared the next time round, and a directory of
+ * the same shape without the marker is somebody's and is left alone.
+ */
+function stageSetup(root: string): string {
   return [
-    GIT_ENV, `D=${shq(dir)}; T=${shq(tmp)};`,
-    // An empty directory is in the way of the move; a partial one from a clone that was killed is not wanted.
-    `rm -rf "$T"; rmdir "$D" 2>/dev/null;`,
-    `git clone --quiet -- ${shq(url)} "$T" && mv "$T" "$D" && touch ${shq(boundMarker)}`,
-    `|| { rc=$?; rm -rf "$T"; exit $rc; }`,
+    `find ${shq(root)} -maxdepth 1 -type d -name '${STAGING_PREFIX}*' -mmin +60`,
+    `-exec sh -c 'for d in "$@"; do [ -f "$d/${STAGING_MARKER}" ] && rm -rf "$d"; done' sh {} + 2>/dev/null;`,
+    `S=$(mktemp -d ${shq(`${root}/${STAGING_PREFIX}XXXXXX`)}) || exit 1; : > "$S/${STAGING_MARKER}"; T="$S/repo";`,
   ].join(" ");
 }
 
-function adoptCommand(dir: string, tmp: string, url: string, boundMarker: string): string {
+function cloneCommand(dir: string, root: string, url: string, boundMarker: string): string {
   return [
-    GIT_ENV, `D=${shq(dir)}; T=${shq(tmp)};`,
-    `rm -rf "$T";`,
+    GIT_ENV, `D=${shq(dir)};`, stageSetup(root),
+    // An empty directory is in the way of the move.
+    `rmdir "$D" 2>/dev/null;`,
+    `git clone --quiet -- ${shq(url)} "$T" && mv "$T" "$D" && rm -rf "$S" && touch ${shq(boundMarker)}`,
+    `|| { rc=$?; rm -rf "$S"; exit $rc; }`,
+  ].join(" ");
+}
+
+function adoptCommand(dir: string, root: string, url: string, boundMarker: string): string {
+  return [
+    GIT_ENV, `D=${shq(dir)};`, stageSetup(root),
     // The repository's .git beside the files that are already there; the index is
     // rebuilt from HEAD without touching the working tree, so the files are kept
     // and show up as changes against it.
-    `git clone --quiet --no-checkout -- ${shq(url)} "$T" && mv "$T/.git" "$D/.git" && rm -rf "$T" && git -C "$D" reset --quiet && touch ${shq(boundMarker)}`,
-    `|| { rc=$?; rm -rf "$T"; exit $rc; }`,
+    `git clone --quiet --no-checkout -- ${shq(url)} "$T" && mv "$T/.git" "$D/.git" && rm -rf "$S" && git -C "$D" reset --quiet && touch ${shq(boundMarker)}`,
+    `|| { rc=$?; rm -rf "$S"; exit $rc; }`,
   ].join(" ");
 }
 
@@ -294,7 +316,6 @@ export async function bindRepo(hands: RepoHands, raw: unknown, options: BindOpti
     return failed;
   }
   const dir = `${root}/${name}`;
-  const tmp = `${root}/.claw-clone-${name}`;
   const boundMarker = `${(options.stateDir ?? "/tmp").replace(/\/+$/, "")}/.claw-repo-bound-${name}`;
   const b = emptyBinding(repo.url, repo.branch ?? null, dir);
   const started = Date.now();
@@ -310,6 +331,10 @@ export async function bindRepo(hands: RepoHands, raw: unknown, options: BindOpti
     b.notes.push("git could not be set up to use the signed-in GitHub account, so `git push` and private repositories may ask for a login that cannot be given");
   }
 
+  if (state === "symlink") {
+    b.failure = `${dir} (or its .git) is a symbolic link, so it was left untouched`;
+    return finish(b, started);
+  }
   if (state === "git") {
     const origin = marker(probe.out, "ORIGIN") ?? "";
     if (!sameRepoUrl(origin, repo.url)) {
@@ -323,7 +348,7 @@ export async function bindRepo(hands: RepoHands, raw: unknown, options: BindOpti
       if (!f.ok) b.notes.push(`git fetch failed (${reasonOf(f.out)}); the checkout is as it was left`);
     }
   } else if (state === "occupied") {
-    const a = await sh(hands, adoptCommand(dir, tmp, repo.url, boundMarker), CLONE_TIMEOUT_SEC, signal);
+    const a = await sh(hands, adoptCommand(dir, root, repo.url, boundMarker), CLONE_TIMEOUT_SEC, signal);
     if (!a.ok) {
       b.failure = `${dir} already has files and is not a git repository, and attaching the repository to them failed: ${reasonOf(a.out)}`;
       return finish(b, started);
@@ -332,7 +357,7 @@ export async function bindRepo(hands: RepoHands, raw: unknown, options: BindOpti
     b.notes.push(`${dir} already had files and no .git (a snapshot from before .git was kept): the repository's .git was attached on its default branch and those files show as local changes`);
     if (b.requestedBranch) b.notes.push(`branch ${b.requestedBranch} was not checked out because the files are in the way; the checkout is on the remote's default branch`);
   } else {
-    const c = await sh(hands, cloneCommand(dir, tmp, repo.url, boundMarker), CLONE_TIMEOUT_SEC, signal);
+    const c = await sh(hands, cloneCommand(dir, root, repo.url, boundMarker), CLONE_TIMEOUT_SEC, signal);
     if (!c.ok) {
       b.failure = `git clone of ${repo.url} failed: ${reasonOf(c.out)}`;
       return finish(b, started);

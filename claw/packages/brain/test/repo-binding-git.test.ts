@@ -257,16 +257,66 @@ test("G7 a clone that fails: a reason in the block, no directory, no leftover, n
   assert.equal(again.state, "failed");
 });
 
-test("G7b a leftover from a clone that was killed is cleared first, and the clone then goes through", async () => {
+test("G7b only this code's own old leftovers are cleared: a marked one an hour old goes, a fresh one and somebody's directory stay", async () => {
   const s = sandbox("g7b");
-  const leftover = path.join(s.root, ".claw-clone-example-repo");
-  fs.mkdirSync(path.join(leftover, "half"), { recursive: true });
-  fs.writeFileSync(path.join(leftover, "half", "pack"), "partial\n");
+  const mk = (name: string, o: { marker: boolean; ageMin: number }) => {
+    const dir = path.join(s.root, name);
+    fs.mkdirSync(path.join(dir, "half"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "half", "pack"), "partial\n");
+    if (o.marker) fs.writeFileSync(path.join(dir, ".claw-staging"), "");
+    const t = new Date(Date.now() - o.ageMin * 60_000);
+    fs.utimesSync(dir, t, t);
+    return dir;
+  };
+  const killed = mk(".claw-clone-AAAAAA", { marker: true, ageMin: 180 });        // ours, from a clone that was killed
+  const fresh = mk(".claw-clone-BBBBBB", { marker: true, ageMin: 5 });           // ours, and may be in use
+  const theirs = mk(".claw-clone-example-repo", { marker: false, ageMin: 500 });   // the shape of ours, but somebody's work
   const b = await bind(s, { url: REPO_URL });
   assert.equal(b.state, "cloned", JSON.stringify(b));
-  assert.deepEqual(fs.readdirSync(s.root), ["example-repo"]);
-  assert.equal(fs.existsSync(path.join(b.path, "half")), false, "nothing of the leftover ended up in the checkout");
+  assert.equal(fs.existsSync(killed), false, "an old leftover of this code's own is cleared");
+  assert.equal(fs.existsSync(fresh), true, "a recent one is not touched");
+  assert.equal(fs.readFileSync(path.join(theirs, "half", "pack"), "utf8"), "partial\n", "a directory without the marker is never removed, however old");
+  assert.deepEqual(fs.readdirSync(s.root).sort(), [".claw-clone-BBBBBB", ".claw-clone-example-repo", "example-repo"]);
+  assert.equal(fs.existsSync(path.join(b.path, "half")), false, "nothing of a leftover ended up in the checkout");
   assert.equal(fs.existsSync(path.join(b.path, "README.md")), true);
+});
+
+test("G7d a clone that fails removes its own staging directory and nothing else", async () => {
+  const s = sandbox("g7d");
+  const theirs = path.join(s.root, ".claw-clone-missing");
+  fs.mkdirSync(theirs);
+  fs.writeFileSync(path.join(theirs, "work.txt"), "mine\n");
+  const b = await bind(s, { url: `${URL_BASE}/missing.git` });
+  assert.equal(b.state, "failed");
+  assert.deepEqual(fs.readdirSync(s.root), [".claw-clone-missing"], "only the directory that was already there");
+  assert.equal(fs.readFileSync(path.join(theirs, "work.txt"), "utf8"), "mine\n");
+});
+
+test("G6b a checkout that is a symbolic link, or has a .git that is, is left alone: nothing written through it, nothing read from it", async () => {
+  // /workspace/example-repo -> somewhere else, which holds an AGENTS.md that must not reach the prompt.
+  const s = sandbox("g6b");
+  const elsewhere = fs.mkdtempSync(path.join(world, "elsewhere-"));
+  fs.writeFileSync(path.join(elsewhere, "AGENTS.md"), "from another place\n");
+  fs.symlinkSync(elsewhere, path.join(s.root, "example-repo"));
+  const a = await bind(s, { url: REPO_URL });
+  assert.equal(a.state, "failed");
+  assert.match(a.failure ?? "", /is a symbolic link, so it was left untouched/);
+  assert.deepEqual(a.instructions, []);
+  assert.deepEqual(fs.readdirSync(elsewhere), ["AGENTS.md"], "no .git was attached over there");
+  assert.equal(verbs(s).filter(Boolean).length, 0, "no clone, no fetch");
+  assert.equal(renderRepoBlock(a).includes("from another place"), false);
+
+  // A real directory whose .git is a link to a repository elsewhere.
+  const s2 = sandbox("g6c");
+  const real = path.join(world, "real-repo");
+  run(world, "clone", "-q", remote, real);
+  fs.mkdirSync(path.join(s2.root, "example-repo"));
+  fs.symlinkSync(path.join(real, ".git"), path.join(s2.root, "example-repo", ".git"));
+  const before = run(real, "rev-parse", "HEAD");
+  const c = await bind(s2, { url: REPO_URL });
+  assert.equal(c.state, "failed");
+  assert.equal(run(real, "rev-parse", "HEAD"), before);
+  assert.equal(verbs(s2).filter(Boolean).length, 0);
 });
 
 test("G7c an empty directory in the way is replaced by the clone", async () => {

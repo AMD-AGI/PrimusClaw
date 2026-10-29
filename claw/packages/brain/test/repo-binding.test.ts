@@ -45,7 +45,7 @@ function scripted(script: Script[]) {
   };
 }
 
-const probe = (state: "absent" | "git" | "occupied", opts: { origin?: string; bound?: boolean; cred?: "ok" | "failed" } = {}): Script => ({
+const probe = (state: "absent" | "git" | "occupied" | "symlink", opts: { origin?: string; bound?: boolean; cred?: "ok" | "failed" } = {}): Script => ({
   match: /CLAW_REPO_STATE/,
   reply: { text: [
     `CLAW_REPO_CRED=${opts.cred ?? "ok"}`,
@@ -125,14 +125,27 @@ test("S1 files without a .git: the adopt step, a note, and a requested branch is
   assert.match(b.notes[1], /branch feature\/x was not checked out because the files are in the way/);
 });
 
-test("S1 the repository is the directory under the root named by the url, and the temporary clone is a sibling of it", async () => {
+test("S1 the repository is the directory under the root named by the url; the clone is staged in a directory made for the call", async () => {
   const hands = scripted([probe("absent"), status()]);
   await bindRepo(hands, { url: "https://git.example.invalid/team/tool.git" }, { root: "/srv/ws/", stateDir: "/var/state/" });
   const clone = hands.commands().find((c) => stepOf(c) === "clone")!;
   assert.ok(clone.startsWith("export GIT_TERMINAL_PROMPT=0; "), "git never waits for a login nobody can type");
-  assert.match(clone, /D='\/srv\/ws\/tool'; T='\/srv\/ws\/\.claw-clone-tool';/);
-  assert.match(clone, /git clone --quiet -- 'https:\/\/git\.example\.invalid\/team\/tool\.git' "\$T" && mv "\$T" "\$D" && touch '\/var\/state\/\.claw-repo-bound-tool'/);
+  assert.match(clone, /D='\/srv\/ws\/tool';/);
+  // Staged in a fresh directory of its own (mktemp), marked as ours, in the root so the final move stays on one filesystem.
+  assert.match(clone, /S=\$\(mktemp -d '\/srv\/ws\/\.claw-clone-XXXXXX'\) \|\| exit 1; : > "\$S\/\.claw-staging"; T="\$S\/repo";/);
+  assert.match(clone, /git clone --quiet -- 'https:\/\/git\.example\.invalid\/team\/tool\.git' "\$T" && mv "\$T" "\$D" && rm -rf "\$S" && touch '\/var\/state\/\.claw-repo-bound-tool'/);
+  // Old leftovers are removed only when they carry the marker and are an hour old.
+  assert.match(clone, /find '\/srv\/ws' -maxdepth 1 -type d -name '\.claw-clone-\*' -mmin \+60 -exec sh -c 'for d in "\$@"; do \[ -f "\$d\/\.claw-staging" \] && rm -rf "\$d"; done' sh \{\} \+/);
   assert.match(hands.commands()[0], /\[ -e '\/var\/state\/\.claw-repo-bound-tool' \]/);
+});
+
+test("S1 a checkout, or a .git, that is a symbolic link is left alone: a failure, and nothing else runs", async () => {
+  const hands = scripted([probe("symlink")]);
+  const b = await bindRepo(hands, { url: URL }, opts);
+  assert.equal(b.state, "failed");
+  assert.equal(b.failure, "/workspace/example-repo (or its .git) is a symbolic link, so it was left untouched");
+  assert.deepEqual(hands.commands().map(stepOf), ["probe"]);
+  assert.match(hands.commands()[0], /if \[ -L "\$D" \] \|\| \[ -L "\$D\/\.git" \]; then echo CLAW_REPO_STATE=symlink;/);
 });
 
 test("S2 a failed clone is a reason and a failed state, not a throw; the instructions step is skipped", async () => {
@@ -262,8 +275,9 @@ test("S5 no command carries a credential, a force or a discard; every url and br
     assert.doesNotMatch(c, /GH_TOKEN|GITHUB_TOKEN|ghp_|x-access-token|https:\/\/[^/\s'"]*@/i, c);
     assert.doesNotMatch(c, /--force|reset --hard|\bclean\b|checkout -f|stash|\bpull\b|\bmerge\b|rebase|--delete|\bpush\b/, c);
     assert.doesNotMatch(c, /\bgit\b[^;&|]*\s-f(\s|$)/, `a forced git: ${c}`);
-    // `rm -rf` only ever names the temporary clone variable.
-    for (const m of c.matchAll(/rm -rf (\S+)/g)) assert.equal(m[1].replace(/;$/, ""), '"$T"', c);
+    // `rm -rf` only ever names the staging directory this call made, or, in the cleanup of an old
+    // one, a directory that carries this code's marker.
+    for (const m of c.matchAll(/rm -rf (\S+)/g)) assert.ok(['"$S"', '"$d"'].includes(m[1].replace(/;$/, "")), `${m[1]} in ${c}`);
   }
   // The url reaches git once, single-quoted, after `--`.
   const clone = all.find((c) => stepOf(c) === "clone")!;
