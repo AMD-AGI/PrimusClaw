@@ -26,7 +26,7 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import { decryptUserEnvValue, encryptUserEnvValue } from "../crypto/user-env.js";
-import { db } from "../infra/db.js";
+import { db, inTransaction } from "../infra/db.js";
 
 /** The longest a ticket may live. The contract is 60 seconds; this is half. */
 export const TICKET_TTL_SECONDS = 30;
@@ -76,15 +76,6 @@ export async function mintTicket(
   grant: TicketGrant,
   ttlSeconds: number = TICKET_TTL_SECONDS,
 ): Promise<string> {
-  // Spent and abandoned tickets are removed here, by whoever mints next, so the
-  // table needs no sweeper of its own and cannot grow past what is outstanding.
-  await db.query("DELETE FROM claw_terminal_tickets WHERE expires_at < NOW()");
-  const live = await db.query(
-    "SELECT COUNT(*)::int AS n FROM claw_terminal_tickets WHERE user_id = $1 AND expires_at >= NOW()",
-    [grant.userId],
-  );
-  if (Number(live.rows[0]?.n ?? 0) >= MAX_OUTSTANDING_TICKETS_PER_USER) throw new TooManyTicketsError();
-
   const ticket = randomBytes(32).toString("base64url");
   const sealed = encryptUserEnvValue(JSON.stringify({
     target: grant.target,
@@ -92,11 +83,28 @@ export async function mintTicket(
     rows: grant.rows,
     platform_key: grant.platformKey,
   }));
-  await db.query(
-    `INSERT INTO claw_terminal_tickets (ticket_hash, user_id, session_id, sealed, expires_at)
-     VALUES ($1, $2, $3, $4, NOW() + ($5::int * INTERVAL '1 second'))`,
-    [hashTicket(ticket), grant.userId, grant.sessionId, sealed, ttlSeconds],
-  );
+  await inTransaction(async (q) => {
+    // One mint at a time per user. Counting the outstanding tickets and inserting
+    // one are two statements, and without this a burst of concurrent requests all
+    // count the same number and all insert: the cap would bound nothing. The lock
+    // is on the user (a hash collision only makes two users take turns) and is
+    // released with the transaction; each statement after it sees the rows the
+    // mint before it committed.
+    await q("SELECT pg_advisory_xact_lock(hashtext($1))", [`claw_terminal_tickets:${grant.userId}`]);
+    // Spent and abandoned tickets are removed here, by whoever mints next, so the
+    // table needs no sweeper of its own and cannot grow past what is outstanding.
+    await q("DELETE FROM claw_terminal_tickets WHERE expires_at < NOW()");
+    const live = await q(
+      "SELECT COUNT(*)::int AS n FROM claw_terminal_tickets WHERE user_id = $1 AND expires_at >= NOW()",
+      [grant.userId],
+    );
+    if (Number(live.rows[0]?.n ?? 0) >= MAX_OUTSTANDING_TICKETS_PER_USER) throw new TooManyTicketsError();
+    await q(
+      `INSERT INTO claw_terminal_tickets (ticket_hash, user_id, session_id, sealed, expires_at)
+       VALUES ($1, $2, $3, $4, NOW() + ($5::int * INTERVAL '1 second'))`,
+      [hashTicket(ticket), grant.userId, grant.sessionId, sealed, ttlSeconds],
+    );
+  });
   return ticket;
 }
 
