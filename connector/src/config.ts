@@ -34,6 +34,11 @@ export interface AgentConfig {
   /** Modes a user may select from the phone. Anything else needs `allow_unsafe_modes`. */
   safeModes: string[];
   autoAllow: AutoAllowRule[];
+  /**
+   * Set for an agent that takes over sessions that already exist on this machine instead of starting new ones.
+   * `cli` is the command that lists the processes holding a session open (see attach.ts).
+   */
+  attach: { cli: string } | null;
 }
 
 export interface ConnectorConfig {
@@ -59,6 +64,7 @@ interface Preset {
   args: string[];
   askMode: string;
   safeModes: string[];
+  attach?: boolean;
 }
 
 /**
@@ -77,6 +83,12 @@ export const PRESETS: Record<string, Preset> = {
   claude: {
     kind: "claude", name: "Claude Code", command: "npx",
     args: ["-y", "@agentclientprotocol/claude-agent-acp@0.99.0"], askMode: "default", safeModes: ["default", "plan"],
+  },
+  // Existing Claude Code sessions, taken over from the phone. The kind is the opaque label a chat client picks an icon
+  // from; it says what the entry is for, not which product serves it. Same adapter and same ask mode as `claude`.
+  "claude-attach": {
+    kind: "attach", name: "Claude Code (existing sessions)", command: "npx",
+    args: ["-y", "@agentclientprotocol/claude-agent-acp@0.99.0"], askMode: "default", safeModes: ["default", "plan"], attach: true,
   },
   codex: {
     kind: "codex", name: "Codex", command: "npx",
@@ -165,9 +177,17 @@ export function parseConfig(text: string, defaults: { hostname?: string } = {}):
       if (bad) problems.push(`${label}: ${bad} turns the tool's own approvals off; remove it or set allow_unsafe_modes = true`);
     }
     const own = parseAutoAllow(raw.auto_allow, `${label}.auto_allow`, problems);
+    let attach: AgentConfig["attach"] = null;
+    if (preset?.attach) {
+      const cli = raw.attach_cli === undefined ? "claude" : raw.attach_cli;
+      if (typeof cli !== "string" || !cli.trim()) problems.push(`${label}.attach_cli must be a command name or path`);
+      else attach = { cli: cli.trim() };
+    } else if (raw.attach_cli !== undefined) {
+      problems.push(`${label}: attach_cli only applies to an agent made from the claude-attach preset`);
+    }
     agents.push({
       id, kind, name: typeof raw.name === "string" && raw.name.trim() ? raw.name.trim().slice(0, 128) : (preset?.name ?? id),
-      command, args, env, roots, askMode, safeModes, autoAllow: [...globalAllow, ...own],
+      command, args, env, roots, askMode, safeModes, autoAllow: [...globalAllow, ...own], attach,
     });
   });
 
@@ -220,6 +240,12 @@ export const SAMPLE_CONFIG = `# claw-connector: the agents this machine offers, 
 id = "claude"
 preset = "claude"
 roots = ["~/work"]
+
+# Take over a Claude Code conversation that already exists on this machine (exit it in the terminal first).
+# [[agents]]
+# id = "claude-attach"
+# preset = "claude-attach"
+# roots = ["~/work"]
 
 # [[agents]]
 # id = "codex"

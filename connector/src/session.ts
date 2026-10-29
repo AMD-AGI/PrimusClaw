@@ -14,6 +14,7 @@
  *  - a permission answer must be one of the options the adapter offered.
  */
 import path from "node:path";
+import type { AttachSupport } from "./attach.js";
 import type { Audit } from "./audit.js";
 import { AdapterProcess, type AcpParams, type AdapterHooks } from "./adapter.js";
 import type { ChildRegistry } from "./children.js";
@@ -44,6 +45,8 @@ export interface SessionEnv {
   registry: ChildRegistry;
   emit: Emit;
   store: SessionStore;
+  /** The takeover support of each attach agent, by agent id. */
+  attach: ReadonlyMap<string, AttachSupport>;
   timing: SessionTiming;
   logDir: string;
   version: string;
@@ -73,6 +76,12 @@ export class Session {
   private enforcing = false;
   private modeSeen: string[] = [];
   private replaying = false;
+  /**
+   * An attached session starts in the mode its transcript last had, which is often one that never asks, and the
+   * adapter says so on stderr while it sets the session up. That warning describes the mode about to be replaced,
+   * so it is set aside until the ask mode is locked and read back; one that comes later closes the session as ever.
+   */
+  private inheritedWarningOk = false;
   private turnRunning = false;
   private queue: Array<{ text: string; cmdId: string | null; started: () => void }> = [];
   private launching: Promise<void> | null = null;
@@ -138,10 +147,50 @@ export class Session {
     this.touch();
   }
 
+  /**
+   * `session.new` that names a session which already exists: resume it in the ask mode. The twin check runs inside
+   * the launch (so it also runs again whenever a recycled adapter comes back), and a refusal closes the session.
+   */
+  async attach(requestedMode: string | null, title: string): Promise<void> {
+    if (requestedMode && !this.agent.safeModes.includes(requestedMode) && !this.env.config.allowUnsafeModes) {
+      return this.refuse(new SessionRefusal("mode_not_allowed", `mode ${requestedMode} needs allow_unsafe_modes on this machine`));
+    }
+    if (requestedMode) this.targetMode = requestedMode;
+    try {
+      await this.launch("resume");
+    } catch (e) {
+      return this.refuse(e);
+    }
+    if (this.closed) return;
+    this.env.store.put(this.id, { agent_id: this.agent.id, acp_session_id: this.acpId, cwd: this.cwd, status: "active", mode: this.currentMode, created_at: new Date().toISOString() });
+    this.audit("session_attached", { cwd: this.cwd, mode: this.currentMode, acp_session_id: this.acpId });
+    this.emit("session_started", { acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, title, attached: true, modes: this.shownModes(), currentMode: this.currentMode });
+    this.touch();
+  }
+
   /** Start (or restart) the adapter and bring the ACP session up in a verified mode. One at a time. */
   private launch(how: "new" | "resume"): Promise<void> {
-    this.launching ??= this.doLaunch(how).finally(() => { this.launching = null; });
+    this.launching ??= this.guardedLaunch(how).finally(() => { this.launching = null; });
     return this.launching;
+  }
+
+  /** For an attach agent, nothing is started until no other process holds the session open. */
+  private async guardedLaunch(how: "new" | "resume"): Promise<void> {
+    if (!this.agent.attach) return this.doLaunch(how);
+    const support = this.env.attach.get(this.agent.id);
+    if (!support) throw new SessionRefusal("attach_unavailable", "this agent has no takeover support");
+    if (!this.acpId) throw new SessionRefusal("adapter_cannot_resume", "no session to resume");
+    const verdict = await support.check(this.acpId, { transcript: true });
+    if (!verdict.ok) {
+      this.audit("attach_refused", { reason: verdict.reason, detail: verdict.detail.slice(0, 300) });
+      throw new SessionRefusal(verdict.reason, verdict.detail);
+    }
+    this.inheritedWarningOk = true;
+    try {
+      await this.doLaunch(how);
+    } finally {
+      this.inheritedWarningOk = false;
+    }
   }
 
   private async doLaunch(how: "new" | "resume"): Promise<void> {
@@ -297,6 +346,7 @@ export class Session {
   }
 
   private onUnsafeWarning(text: string): void {
+    if (this.inheritedWarningOk) return this.audit("permission_callback_warning_inherited", { text: text.slice(0, 300) });
     this.audit("permission_callback_warning", { text: text.slice(0, 300) });
     void this.refuse(new SessionRefusal("mode_not_enforced", "the adapter warned that it will not ask for permission"));
   }
@@ -456,7 +506,7 @@ export class Session {
     try {
       while (this.queue.length && !this.closed) {
         const next = this.queue.shift()!;
-        await this.runTurn(next.text, next.started);
+        await this.runTurn(next.text, next.started, next.cmdId);
       }
     } finally {
       this.turnRunning = false;
@@ -464,7 +514,7 @@ export class Session {
     }
   }
 
-  private async runTurn(text: string, started: () => void): Promise<void> {
+  private async runTurn(text: string, started: () => void, cmdId: string | null): Promise<void> {
     try {
       await this.ensureAdapter();
     } catch (e) {
@@ -473,6 +523,19 @@ export class Session {
       return this.refuse(e);
     }
     const a = this.adapter!;
+    if (this.agent.attach && this.acpId) {
+      // Someone may have opened the conversation in a terminal since the last turn. The prompt is not sent: it
+      // would be a second writer. The session stays, so it goes through once the terminal is closed.
+      const verdict = await this.env.attach.get(this.agent.id)?.check(this.acpId, { ownPgid: a.pid, transcript: false })
+        ?? { ok: false as const, reason: "twin_check_failed" as const, detail: "no takeover support" };
+      if (!verdict.ok) {
+        started();
+        this.audit("prompt_refused", { reason: verdict.reason, detail: verdict.detail.slice(0, 300) });
+        this.rejectCommand("prompt", cmdId, verdict.reason);
+        this.emit("turn_end", { stopReason: "error", error: verdict.reason });
+        return;
+      }
+    }
     this.audit("turn_started", { length: text.length });
     try {
       const reply = a.requestUnbounded("session/prompt", { sessionId: this.acpId, prompt: [{ type: "text", text }] });

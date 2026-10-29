@@ -342,7 +342,7 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     if (!connector.online) return fail(reply, 409, "connector_offline");
     const out = await store.createSession({
       owner, client: clientLabel(req), connectorId: connector.connector_id, agentId: body.value.agent_id,
-      cwd: body.value.cwd, mode: body.value.mode, maxActive: maxActiveSessions, commandsPerMinute,
+      cwd: body.value.cwd, mode: body.value.mode, resumeRef: body.value.resume_ref, maxActive: maxActiveSessions, commandsPerMinute,
     });
     if (out.status === "limit") return fail(reply, 409, "session_limit_reached");
     if (out.status === "rate_limited") return fail(reply, 429, "rate_limited");

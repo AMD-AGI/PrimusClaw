@@ -72,9 +72,9 @@ export class FakeClaw {
     return seq;
   }
 
-  newSession(agentId: string, cwd: string, mode?: string): string {
+  newSession(agentId: string, cwd: string, mode?: string, extra: Record<string, unknown> = {}): string {
     const id = randomUUID();
-    this.issue("session.new", id, { agent_id: agentId, cwd, mode: mode ?? null });
+    this.issue("session.new", id, { agent_id: agentId, cwd, mode: mode ?? null, ...extra });
     return id;
   }
 

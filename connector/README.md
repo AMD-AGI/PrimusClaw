@@ -74,6 +74,10 @@ Presets and the adapter versions they pin (override `command` and `args` to move
 | `claude` | `npx @agentclientprotocol/claude-agent-acp@0.99.0` | `default` | `default`, `plan` |
 | `codex` | `npx @agentclientprotocol/codex-acp@2.3.0` | `read-only` | `read-only` |
 | `cursor` | `agent acp` (the Cursor CLI) | `ask` | `ask`, `plan` |
+| `claude-attach` | `npx @agentclientprotocol/claude-agent-acp@0.99.0` | `default` | `default`, `plan` |
+
+`claude-attach` does not start new conversations: it takes over Claude Code conversations that already exist on this
+machine (see [Taking over an existing conversation](#taking-over-an-existing-conversation)).
 
 An agent with no `roots` is never offered. A configuration problem is reported at start-up, not skipped.
 
@@ -108,6 +112,8 @@ All of these run on your machine and fail closed.
   audit log and is shown on the phone. The default is no rules.
 - **Credentials go over HTTPS only.** The Claw URL and the identity URL must be `https://` (`http://` is accepted only for
   localhost, for a development server); `login` and `run` refuse anything else before a token is saved or sent.
+- **Existing conversations.** Taken over only when no other process holds them open, only from inside the roots, only in the
+  directory the conversation itself records, and in the ask mode (see above).
 - **No remote shell.** Only these commands are carried out: `session.new`, `prompt`, `cancel`, `set_mode`, `resume`,
   `close`, `decision`. Anything else is dropped and audited. Claw never sends a command line, an environment variable or a
   key.
@@ -115,6 +121,46 @@ All of these run on your machine and fail closed.
   your phone can show them), after credential-shaped strings (API keys, tokens, bearer headers, private keys, JWTs) are
   masked and long tool output is cut to 8 KB. Adapter stderr never leaves; it goes to `logs/` under the state directory.
   A prompt's text is not written to the local audit log, only its hash and length.
+
+## Taking over an existing conversation
+
+An agent made from the `claude-attach` preset lists the Claude Code conversations on this machine whose directory is inside
+its `roots`, and lets you continue one from your phone. It reports them to Claw as an opaque list (`capabilities.resumable`:
+reference, title, directory, last activity, and whether anything holds it open), newest first, at most a dozen, so that a
+chat client can offer a choice; `session.new` then names the chosen one (`resume_ref`). Claw and the chat client know no
+product: the agent's `kind` is the label `attach`.
+
+```toml
+[[agents]]
+id = "claude-attach"
+preset = "claude-attach"
+roots = ["~/work"]
+# attach_cli = "claude"        # the command asked which sessions are open (default: claude, from PATH)
+# [agents.env]
+# CLAUDE_CONFIG_DIR = "/home/me/.claude"   # where the conversations live, if not the default
+```
+
+What you do: **exit the conversation in the terminal first** (`/exit`), then pick it on the phone. When you are done,
+close it from the phone and continue in the terminal with `claude --resume <id>`: the turns you took on the phone are in
+its history, because both sides read and append to the same transcript.
+
+Why the terminal must be closed: Claude Code does not stop a second process from resuming a conversation that is still
+open, and two writers fork the transcript; the next resume follows only one branch, so a turn is lost without any error
+(measured). The connector therefore refuses to take over a conversation that another process holds open, and it checks again
+before it starts the agent again after a pause and before every prompt. It asks Claude Code itself
+(`claude agents --json`, which lists the live processes and ignores the files a killed one leaves behind). If that command
+is missing or fails, it reads the registry Claude Code keeps in `$CLAUDE_CONFIG_DIR/sessions/` and checks every row against
+the process it names; a row from another host or container that shares the directory cannot be checked and counts as open.
+If neither can be read, the answer is "cannot tell" and the takeover is refused. A transcript written within the last
+10 seconds is refused too (a terminal that has only just exited may still be writing). The reasons Claw is told are
+`session_live`, `recently_written` and `twin_check_failed`; the agent that this connector itself started for the conversation
+is not mistaken for a twin.
+
+The ask mode still applies: a conversation keeps the mode it was left in, often one that never asks (`bypassPermissions`),
+and the adapter says so while it sets the session up. That warning describes the mode that is about to be replaced, so it is
+set aside until the ask mode (`default`) is locked and read back from the adapter; a warning that comes after that, or a mode
+that is not confirmed, closes the session. The phone can select only the safe modes, as for every agent. Closing the
+session stops the agent process; it never deletes the conversation.
 
 ## Commands
 

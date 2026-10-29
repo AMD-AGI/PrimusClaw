@@ -117,7 +117,14 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
   log({ method, params: method === "session/prompt" ? undefined : params });
   switch (method) {
     case "initialize":
-      return reply(id, { protocolVersion: 1, agentInfo: { name: "fake" }, authMethods: [], agentCapabilities: { loadSession: true, sessionCapabilities: env.FAKE_NO_RESUME === "1" ? { close: {} } : { resume: {}, close: {} } } });
+      return reply(id, { protocolVersion: 1, agentInfo: { name: "fake" }, authMethods: [], agentCapabilities: { loadSession: true, sessionCapabilities: env.FAKE_NO_RESUME === "1" ? { close: {} } : { resume: {}, close: {}, list: {} } } });
+    case "session/list": {
+      // The shape of a real adapter's answer: {sessionId, cwd, title, updatedAt}, newest first, paged by an opaque cursor.
+      const all = JSON.parse(env.FAKE_SESSIONS || "[]");
+      const size = Number(env.FAKE_PAGE_SIZE || 100);
+      const from = params?.cursor ? Number(String(params.cursor).replace("offset:", "")) : 0;
+      return reply(id, { sessions: all.slice(from, from + size), ...(from + size < all.length ? { nextCursor: `offset:${from + size}` } : {}) });
+    }
     case "session/new": {
       if (env.FAKE_AUTH_REQUIRED) return fail(id, -32000, "Authentication required");
       const sessionId = "acp-" + nextId++;
@@ -130,6 +137,8 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
       sessions.set(params.sessionId, s);
       // The trap measured on a real adapter: resuming puts the user's own configured mode back.
       if (env.FAKE_RESUME_RESETS) s.mode = env.FAKE_RESUME_RESETS;
+      // ... and, in a mode that never asks, it says so while it sets the session up (measured on claude-agent-acp 0.99.0).
+      if (env.FAKE_RESUME_WARN === "1" && method === "session/resume") process.stderr.write("Warning: canUseTool will not be invoked: permissionMode 'bypassPermissions' auto-approves every tool call\n");
       if (method === "session/load") update(params.sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "old history" } });
       return reply(id, { modes: modesOf(s), configOptions: configOptions(s) });
     }
@@ -138,6 +147,7 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
       if (!s) return fail(id, -32602, "no such session");
       if (env.FAKE_IGNORE_SET_MODE !== "1") s.mode = params.modeId;
       reply(id, {});
+      if (env.FAKE_WARN_AFTER_LOCK === "1") setTimeout(() => process.stderr.write("Warning: canUseTool will not be invoked: late\n"), 300);
       if (env.FAKE_NOTIFY_MODE === "1") update(params.sessionId, { sessionUpdate: "current_mode_update", currentModeId: s.mode });
       return;
     }
