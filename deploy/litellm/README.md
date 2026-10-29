@@ -12,8 +12,8 @@ software under its own license**, not part of PrimusClaw.
 
 | File | What it is |
 |---|---|
-| [`Dockerfile`](Dockerfile) | Layers the auth hook and a UI base-path patch onto `ghcr.io/berriai/litellm` |
-| [`apim_key_hook.py`](apim_key_hook.py) | The hook: injects a per-virtual-key APIM subscription header, and opt-in Anthropic prompt caching |
+| [`Dockerfile`](Dockerfile) | Layers the prompt-cache hook and a UI base-path patch onto `ghcr.io/berriai/litellm` |
+| [`prompt_cache_hook.py`](prompt_cache_hook.py) | The hook: opt-in Anthropic prompt caching |
 | [`charts/litellm/`](charts/litellm) | Helm chart — deployment, service, secret, optional ingress and ServiceMonitor |
 | [`deploy.sh`](deploy.sh) | Installs the chart; also invoked by the whole-stack installer |
 | [`values.autorouting.example.yaml`](values.autorouting.example.yaml) | Example model list and complexity-based auto-routing config |
@@ -71,12 +71,11 @@ means changing both.
 
 ## Two things the image layer does
 
-**The auth hook** lets a caller present only a LiteLLM virtual key. The
-subscription key for the upstream provider is stored in that key's metadata and
-injected by the hook, so provider credentials never reach the client. Sending
-`x-auto-prompt-caching: true` additionally makes the hook attach Anthropic
-`cache_control` markers to tools and messages, so repeated prefixes report
-`cache_read_input_tokens`.
+**The prompt-cache hook** is opt-in per request. Sending
+`x-auto-prompt-caching: true` (or `1h` for the hour-long entry) makes the hook
+attach Anthropic `cache_control` markers to tools and messages on Claude
+routes, so repeated prefixes report `cache_read_input_tokens`. Requests that do
+not send the header are left untouched.
 
 **The UI patch** rewrites the pre-built static assets' base path from `/ui` to
 `/llm-gateway` with `sed`, rather than rebuilding the UI — the upstream build
@@ -94,14 +93,15 @@ The proxy only emits `litellm_deployment_*` series when `prometheus` is in
 counters into the cluster TSDB so they survive pod restarts. Enabling the
 scrape object without the callback yields empty targets, not an error.
 
-`callbacks` in Helm **replaces** the chart default list, so keep the APIM hook
-entry when you add prometheus:
+`callbacks` in Helm **replaces** the chart default list, so keep the
+prompt-cache hook entry when you add prometheus (or a hook of your own that the
+image can import):
 
 ```yaml
 litellmSettings:
   callbacks:
     - prometheus
-    - litellm.proxy.hooks.apim_key_hook.proxy_handler_instance
+    - litellm.proxy.hooks.prompt_cache_hook.proxy_handler_instance
 serviceMonitor:
   enabled: true
 ```
@@ -137,7 +137,7 @@ Before upgrading:
    database detached, and confirm `/health/readiness` returns 200. A config key
    the new version dropped shows up here rather than under traffic.
 
-**Do not mount the hook from a ConfigMap.** The image bakes `apim_key_hook.py`
+**Do not mount the hook from a ConfigMap.** The image bakes `prompt_cache_hook.py`
 into whatever path the installed LiteLLM actually imports from, which moves
 between base images -- older ones resolve to `/app/litellm`, current ones to a
 venv `site-packages` tree. A mount pinned to the old path onto a new image

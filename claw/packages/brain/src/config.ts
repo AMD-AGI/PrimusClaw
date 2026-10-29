@@ -1405,7 +1405,7 @@ export const LLM_CACHE_TTL: PromptCacheTtl = resolvePromptCacheTtl();
  *
  * An allowlist rather than a header name baked in, because the header that
  * identifies a backend is a property of the deployment, not of Claw: it is
- * `x-litellm-model-id` behind one proxy, an Azure APIM request id behind
+ * `x-litellm-model-id` behind one proxy, a gateway request id behind
  * another, a plain `request-id` when talking to the provider directly.
  *
  * An allowlist rather than capturing everything, because response headers carry

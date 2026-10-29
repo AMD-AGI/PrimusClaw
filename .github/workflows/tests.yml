@@ -132,3 +132,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - run: bash scripts/release-tests/litellm-existing-secret.sh
+
+  litellm-prompt-cache-hook:
+    name: LiteLLM prompt-cache hook
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - run: bash scripts/release-tests/litellm-prompt-cache-hook.sh

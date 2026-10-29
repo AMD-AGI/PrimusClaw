@@ -27,7 +27,7 @@ v1.96+) classifies inside the proxy. Brain keeps sending `claude-auto`.
 ```
 Brain  model=claude-auto
   → LiteLLM >= v1.96.2
-    → apim_key_hook (cache_control when the alias contains "claude")
+    → prompt_cache_hook (cache_control when the alias contains "claude")
       → complexity_router
         → SIMPLE Haiku / MEDIUM Sonnet / COMPLEX|REASONING flagship
 ```
@@ -54,7 +54,7 @@ keeps thinking blocks on one backend for the session.
 
 v1.96.2 is the floor for Auto Router v2 **and**
 `classifier_context_window_size`. The Dockerfile still locates
-`litellm.proxy.hooks` at runtime before copying `apim_key_hook.py`, and the
+`litellm.proxy.hooks` at runtime before copying `prompt_cache_hook.py`, and the
 UI `/ui` → `/llm-gateway` patch is skipped if the prebuilt `out` directory is
 missing.
 
@@ -74,7 +74,7 @@ is therefore three steps, in order:
 
 ## 4. Alias and cache hook
 
-[`apim_key_hook.py`](../../deploy/litellm/apim_key_hook.py) injects Anthropic
+[`prompt_cache_hook.py`](../../deploy/litellm/prompt_cache_hook.py) injects Anthropic
 `cache_control` only when `"claude" in model` (or the name starts with
 `anthropic/`). The router alias **must** contain `claude`. Use `claude-auto`.
 
