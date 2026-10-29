@@ -105,6 +105,13 @@ record it.
   `TERMINAL_MAX_CONNECTIONS_PER_USER` (5) bound what one replica holds. SaFE being unreachable or
   refusing the key answers 502, and a deployment without SaFE 503, each with `{error, reason}`. The
   WebSocket server is the `ws` package, a new dependency of the API.
+- `connector/`, the client of remote agents: `claw-connector` runs on a user's own machine and exposes
+  their Claude Code, Codex and Cursor agents (over the Agent Client Protocol) through outbound HTTPS only.
+  Device sign-in (RFC 8628) or a development key; a per-agent directory whitelist; every session forced into
+  the agent's ask mode and the mode read back before the first prompt (a session whose mode cannot be
+  confirmed is not opened); the adapter's own permission options passed through verbatim, including
+  allow-always; credentials masked before upload; a local audit log; a kill switch that stops only the
+  process groups it started. See `connector/README.md`.
 - A shared identity client in `@claw/utils`, built by API and Brain when
   `IDENTITY_CLIENT_ENABLED=true` (off by default; it authenticates a request only through the access-token
   credentials above, a connector's and an identity provider's). It does OIDC

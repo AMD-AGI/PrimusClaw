@@ -1,0 +1,27 @@
+{
+  "name": "@primusclaw/connector",
+  "version": "0.1.0",
+  "description": "Connects the coding agents on your own machine to Claw, over outbound HTTPS only.",
+  "license": "MIT",
+  "type": "module",
+  "bin": { "claw-connector": "dist/cli.js" },
+  "files": ["dist", "README.md"],
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^2.1.0",
+    "smol-toml": "^1.9.1",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
