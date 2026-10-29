@@ -17,6 +17,9 @@ test("the timings keep a stream alive through the gateway's 180 s idle cut and s
   assert.ok(REMOTE_AGENT_TIMING.watchdogMs > REMOTE_AGENT_TIMING.pingMs, "a client does not give up between two pings");
   assert.ok(REMOTE_AGENT_TIMING.watchdogMs < 180_000, "the client reconnects before the gateway does it for it");
   assert.equal(REMOTE_AGENT_TIMING.onlineWindowMs, REMOTE_AGENT_TIMING.heartbeatMs * 3, "three missed heartbeats");
+  // A command that needs a watcher outlives a dropped connection (watchdog, then a reconnect), but not a night.
+  assert.ok(REMOTE_AGENT_TIMING.liveCommandTtlMs > REMOTE_AGENT_TIMING.watchdogMs + REMOTE_AGENT_TIMING.onlineWindowMs);
+  assert.ok(REMOTE_AGENT_TIMING.liveCommandTtlMs <= 10 * 60_000, "minutes, not hours");
 });
 
 test("the command set is closed, and only commands that can wait may be queued offline", () => {

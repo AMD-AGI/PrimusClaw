@@ -356,6 +356,38 @@ describe("remote agents", { skip }, () => {
       assert.deepEqual((await q("SELECT type FROM claw_remote_commands WHERE connector_id = $1", [cid])).rows.map((r: any) => r.type), ["cancel"]);
     });
 
+    test("a prompt, set_mode or resume nobody collected within minutes is dropped, not replayed when the connector returns", async () => {
+      const { cid, stream } = await online1();
+      const sid = await session("u1", cid);
+      const send = (c: unknown) => as("u1").post(`/v1/remote-agents/sessions/${sid}/commands`, c);
+      // Accepted while the connector still looked online, and sent into a connection that had died:
+      // the first stream never acts on any of it, and nothing acknowledges it.
+      for (const c of [{ type: "prompt", text: "stale" }, { type: "set_mode", mode_id: "ask" }, { type: "resume" }, { type: "prompt", text: "fresh" }, { type: "cancel" }]) {
+        assert.equal((await send(c)).status, 202, JSON.stringify(c));
+      }
+      await stream.closed();
+      await q("UPDATE claw_remote_commands SET created_at = NOW() - interval '10 minutes' WHERE connector_id = $1", [cid]);
+      await q("UPDATE claw_remote_commands SET created_at = NOW() - interval '4 minutes' WHERE connector_id = $1 AND payload->>'text' = 'fresh'", [cid]);
+
+      // The machine wakes and reconnects. Only what could still be wanted comes: the session it
+      // never started, the prompt from four minutes ago, and the cancel (which keeps a whole day).
+      const back = await openCommands("u1", cid);
+      const got: string[] = [];
+      for (let i = 0; i < 3; i++) {
+        const f = (await back.nextEvent("command")).json();
+        got.push(`${f.type}${f.text ? `:${f.text}` : ""}`);
+      }
+      assert.deepEqual(got, ["session.new", "prompt:fresh", "cancel"]);
+      assert.equal(await back.quiet(150), true, "the stale prompt, set_mode and resume are not sent");
+
+      // And they do not sit in the table as a second archive of what was typed: the next beat clears
+      // them even though it acknowledges nothing.
+      const types = async () => (await q("SELECT type FROM claw_remote_commands WHERE connector_id = $1 ORDER BY cmd_seq", [cid])).rows.map((r: any) => r.type);
+      assert.equal((await types()).length, 6);
+      assert.equal((await heartbeat("u1", cid)).status, 200);
+      assert.deepEqual(await types(), ["session.new", "prompt", "cancel"]);
+    });
+
     test("concurrent commands get consecutive numbers and arrive in that order", async () => {
       const { cid, stream } = await online1();
       const sid = await session("u1", cid);

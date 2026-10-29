@@ -144,6 +144,13 @@ connector-side route answers `401 revoked`.
 connector is offline, so a prompt nobody could see being waited on cannot run later.
 `cancel`, `close` and `decision` are queued, since they are safe to deliver late.
 
+The same rule holds after a command is accepted. A connector counts as online for up to
+90 s after its connection has died unnoticed (a closed laptop), so a `prompt`, `set_mode` or
+`resume` accepted then goes into a dead socket. Such a command is delivered for 5 minutes
+(`REMOTE_AGENT_TIMING.liveCommandTtlMs`) and then dropped: a connector that comes back
+later is not sent it, and the queue row is deleted. A client that gets no events for a prompt
+sends it again. `cancel`, `close` and `decision` stay deliverable for a day.
+
 `Idempotency-Key` holds for as long as the audit trail does, not only while the command is
 queued: a retry made after the connector has acknowledged the command is answered
 `200 {duplicate: true}` and queues nothing, and the same key with another command type or
@@ -168,4 +175,5 @@ them for ever. Live sessions are never deleted, and neither is the audit trail.
 label): connector registered and revoked, session created, every command issued, every
 permission requested and resolved. A prompt is recorded as its SHA-256 and length,
 never its text. A queued command is deleted once a heartbeat acknowledges it, or after a day
-unacknowledged: an instruction nobody has collected for that long should not run.
+unacknowledged (5 minutes for `prompt`, `set_mode` and `resume`): an instruction nobody has
+collected for that long should not run.

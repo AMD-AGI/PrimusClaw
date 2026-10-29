@@ -11,6 +11,7 @@
 import { randomUUID } from "node:crypto";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import {
+  REMOTE_AGENT_TIMING, REMOTE_COMMANDS, REMOTE_COMMAND_TYPES,
   REMOTE_EVENT_PERMISSION_REQUEST, REMOTE_EVENT_PERMISSION_RESOLVED, REMOTE_EVENT_SESSION_CLOSED,
   type ParsedRemoteEvent, type RemoteAgentDescriptor, type RemoteEventRejection, type RemoteHeartbeat,
 } from "@claw/protocol";
@@ -136,24 +137,43 @@ export async function recordHeartbeat(connectorId: string, owner: string, hb: Re
         [connectorId, a.agent_id, owner, a.kind, a.name, JSON.stringify(a.capabilities)],
       );
     }
-    if (hb.cmdCursor !== null) await pruneCommands(q, connectorId, hb.cmdCursor);
+    // Every beat also clears what has expired, acknowledged or not: a connector that reconnects
+    // after a long absence may send no cursor, and must not leave its stale prompts behind.
+    await pruneCommands(q, connectorId, hb.cmdCursor ?? 0);
   });
 }
 
+/** The commands that are accepted only while the connector is online (`needsOnline`). */
+const LIVE_COMMAND_TYPES: string[] = REMOTE_COMMAND_TYPES.filter((t) => REMOTE_COMMANDS[t].needsOnline);
+const LIVE_COMMAND_TTL_SECS = REMOTE_AGENT_TIMING.liveCommandTtlMs / 1000;
+
 /**
- * Forget commands the connector has handled, plus any a day old.
+ * Whether a queued command is too old to be carried out, as a SQL condition on `claw_remote_commands`.
+ * `typesParam` and `secsParam` are the positions of the two values it reads: {@link LIVE_COMMAND_TYPES}
+ * and {@link LIVE_COMMAND_TTL_SECS}.
+ *
+ * Two bounds. Anything is dead after a day: an instruction nobody has collected for that long is not
+ * one anybody still wants carried out. A command that needs a watcher (`prompt`, `set_mode`, `resume`)
+ * is dead after minutes: it was accepted because the connector looked online, so one still uncollected
+ * was sent into a connection that had died unnoticed (a closed laptop counts as online for up to the
+ * online window), and delivering it when the machine wakes hours later would run it with nobody watching,
+ * which is the case the `connector_offline` refusal exists to prevent. `cancel`, `close` and `decision`
+ * are safe to deliver late and keep only the day.
+ */
+const expiredSql = (typesParam: number, secsParam: number): string =>
+  `(created_at < NOW() - interval '1 day'
+    OR (type = ANY($${typesParam}::text[]) AND created_at < NOW() - make_interval(secs => $${secsParam}::float8)))`;
+
+/**
+ * Forget commands the connector has handled, plus any that have expired ({@link expiredSql}).
  *
  * A prompt is stored here until it is delivered, and the audit trail keeps only
  * its hash, so this table must not become a second archive of what people typed.
- * The day is also a deliberate bound on delivery: an instruction that nobody has
- * collected for that long is not one anybody still wants carried out, and a
- * permission answer is worthless long before it (the connector gives up on the
- * request after minutes).
  */
 export async function pruneCommands(q: Querier, connectorId: string, upTo: number): Promise<void> {
   await q(
-    "DELETE FROM claw_remote_commands WHERE connector_id = $1 AND (cmd_seq <= $2 OR created_at < NOW() - interval '1 day')",
-    [connectorId, upTo],
+    `DELETE FROM claw_remote_commands WHERE connector_id = $1 AND (cmd_seq <= $2 OR ${expiredSql(3, 4)})`,
+    [connectorId, upTo, LIVE_COMMAND_TYPES, LIVE_COMMAND_TTL_SECS],
   );
 }
 
@@ -213,8 +233,9 @@ export async function markStreamClosed(connectorId: string, streamConn: string):
 export async function commandsAfter(connectorId: string, cursor: number, limit: number): Promise<Row[]> {
   return (await direct(
     `SELECT cmd_seq, cmd_id, session_id::text AS session_id, type, payload
-       FROM claw_remote_commands WHERE connector_id = $1 AND cmd_seq > $2 ORDER BY cmd_seq LIMIT $3`,
-    [connectorId, cursor, limit],
+       FROM claw_remote_commands WHERE connector_id = $1 AND cmd_seq > $2 AND NOT ${expiredSql(4, 5)}
+      ORDER BY cmd_seq LIMIT $3`,
+    [connectorId, cursor, limit, LIVE_COMMAND_TYPES, LIVE_COMMAND_TTL_SECS],
   )).rows;
 }
 

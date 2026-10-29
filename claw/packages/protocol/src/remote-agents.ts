@@ -47,6 +47,14 @@ export const REMOTE_AGENT_TIMING = {
    * heartbeat is at most this old. Three missed heartbeats.
    */
   onlineWindowMs: 90_000,
+  /**
+   * How long a `prompt`, `set_mode` or `resume` (the commands with `needsOnline`) stays
+   * deliverable once queued. They are accepted only while the connector is online, so one
+   * still uncollected after this was sent into a connection that had died unnoticed, and
+   * nobody is waiting on it: it is dropped, not replayed when the machine wakes hours later.
+   * Longer than the connector's watchdog plus a reconnect, so an ordinary blip loses nothing.
+   */
+  liveCommandTtlMs: 5 * 60_000,
   /** A connector that sees no byte for this long drops the stream and reconnects. */
   watchdogMs: 75_000,
 } as const;
