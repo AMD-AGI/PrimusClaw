@@ -335,6 +335,12 @@ export interface ExecuteRequest {
   // ── Execution mode ────────────────────────────────────────────────────
   /** Defaults to "llm" when omitted (legacy chat path). */
   mode?: TaskMode;
+  /**
+   * An app run whose task was already closed (cancelled / failed) while its run row
+   * was left in `finishing`: this dispatch only completes the finishing steps and
+   * reports with `app_finish_done`. It never reports a terminal state of its own.
+   */
+  app_finish_only?: boolean;
 
   // ── Run budget ────────────────────────────────────────────────────────
   /**

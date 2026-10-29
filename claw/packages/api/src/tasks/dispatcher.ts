@@ -437,6 +437,7 @@ function buildExecuteRequest(opts: {
       ? { url: `${updated.callback_url}/lease`, token: internalToken }
       : undefined,
     mode: (updated.mode as TaskMode) ?? "llm",
+    ...(updated.mode === "app" && updated.metadata?.app_finish_prior ? { app_finish_only: true } : {}),
     workspace_throwaway: updated.workspace_throwaway === true ? true : undefined,
     sandbox_spec: sandboxSpecForBrain,
     workspace_id: extractSandboxNamespace(sandboxSpecForBrain) || session.workspace_id || undefined,

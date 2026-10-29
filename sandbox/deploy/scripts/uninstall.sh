@@ -35,6 +35,7 @@ helm uninstall "${RELEASE}" --namespace "${NAMESPACE}" 2>/dev/null \
     || log "helm release '${RELEASE}' not found (OK if it was installed some other way)"
 
 head "Delete ancillary resources (ingress / runtimeclass)"
+kubectl delete ingress agent-sandbox agent-sandbox-public -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || true
 kubectl delete -f "${DEPLOY_DIR}/k8s/deployments/ingress.yaml"   --ignore-not-found 2>/dev/null || true
 kubectl delete -f "${DEPLOY_DIR}/k8s-kata/deployments/ingress.yaml" --ignore-not-found 2>/dev/null || true
 kubectl delete -f "${DEPLOY_DIR}/k8s/kata/runtimeclass.yaml"     --ignore-not-found 2>/dev/null || true
