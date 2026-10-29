@@ -51,7 +51,7 @@ trap cleanup EXIT
 
 kubectl -n "$NAMESPACE" create cm "$CTX" \
   --from-file=Dockerfile="$SCRIPT_DIR/Dockerfile" \
-  --from-file=apim_key_hook.py="$SCRIPT_DIR/apim_key_hook.py" \
+  --from-file=prompt_cache_hook.py="$SCRIPT_DIR/prompt_cache_hook.py" \
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
 # Registry auth is read from an existing pull/push secret rather than inlined
@@ -75,7 +75,7 @@ spec:
       initContainers:
       - name: ctx
         image: busybox:1.36
-        command: ["sh","-c","cp /cm/Dockerfile /cm/apim_key_hook.py /workspace/"]
+        command: ["sh","-c","cp /cm/Dockerfile /cm/prompt_cache_hook.py /workspace/"]
         volumeMounts:
         - {name: ws, mountPath: /workspace}
         - {name: cm, mountPath: /cm}

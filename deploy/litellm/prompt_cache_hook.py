@@ -2,11 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 """
-Custom hook: auto-inject Ocp-Apim-Subscription-Key from Virtual Key metadata.
-
-Usage:
-  1. Create key: POST /key/generate {"metadata": {"apim_key": "xxx"}}
-  2. Use key:    Authorization: Bearer sk-xxx (no extra_headers needed)
+Custom hook: opt-in Anthropic prompt caching for the LiteLLM proxy.
 
 Prompt caching (Claude / Anthropic via LiteLLM):
   Send header ``x-auto-prompt-caching: true`` (HTTP header or ``extra_headers``).
@@ -14,14 +10,13 @@ Prompt caching (Claude / Anthropic via LiteLLM):
   messages so repeat prefixes can show ``cache_read_input_tokens`` in usage.
 """
 import logging
-import os
 from typing import Any, Mapping, Optional
 
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.proxy.proxy_server import DualCache, UserAPIKeyAuth
 from litellm.types.utils import CallTypesLiteral
 
-logger = logging.getLogger("litellm.proxy.hooks.apim_key_hook")
+logger = logging.getLogger("litellm.proxy.hooks.prompt_cache_hook")
 
 CACHE_CONTROL_EPHEMERAL: dict[str, str] = {"type": "ephemeral"}
 # ``x-auto-prompt-caching: 1h`` asks for the hour-long entry instead of the
@@ -36,16 +31,6 @@ _AUTO_PROMPT_CACHE_HEADER = "x-auto-prompt-caching"
 _COMPLETION_CALL_TYPES = frozenset(
     {"completion", "acompletion", "anthropic_messages"}
 )
-# Comma-separated APIM keys that share one fixed attribution user.
-_HYPERLOOM_APIM_KEY_ENV = "AMD_HYPERLOOM_APIM_KEY"
-_HYPERLOOM_APIM_USER_ENV = "AMD_HYPERLOOM_APIM_USER"
-
-
-def _mask(key: str) -> str:
-    """Show first 4 and last 4 chars, mask the rest."""
-    if len(key) <= 8:
-        return key[:2] + "****"
-    return key[:4] + "****" + key[-4:]
 
 
 def _header_dict_truthy(headers: Optional[Mapping[Any, Any]], name: str) -> bool:
@@ -68,33 +53,6 @@ def _header_dict_get(headers: Optional[Mapping[Any, Any]], name: str) -> Optiona
     return None
 
 
-def _ensure_extra_headers(data: dict) -> dict:
-    if not isinstance(data.get("extra_headers"), dict):
-        data["extra_headers"] = {}
-    return data["extra_headers"]
-
-
-def _inject_user_header(data: dict, apim_key: Optional[str], key_alias: str) -> None:
-    headers = _ensure_extra_headers(data)
-    if _header_dict_get(headers, "user"):
-        return
-
-    user = _header_dict_get(headers, "USER-NTID")
-    if not user and data.get("user"):
-        user = str(data["user"])
-
-    configured_keys = {
-        k.strip() for k in os.getenv(_HYPERLOOM_APIM_KEY_ENV, "").split(",") if k.strip()
-    }
-    configured_user = os.getenv(_HYPERLOOM_APIM_USER_ENV, "")
-    if not user and apim_key and configured_user and apim_key in configured_keys:
-        user = configured_user
-
-    if user:
-        headers["user"] = user
-        logger.info("[%s] injected upstream user header", key_alias)
-
-
 # Where LiteLLM leaves the caller's HTTP headers, in the order worth checking.
 #
 # ``litellm_metadata`` is the one that matters and the one this hook used to
@@ -105,13 +63,13 @@ def _inject_user_header(data: dict, apim_key: Optional[str], key_alias: str) -> 
 # ``LITELLM_METADATA_ROUTES == ('batches', '/v1/messages', 'responses', 'files')``.
 #
 # So for two years this returned False on every Anthropic request and the
-# caching branch below silently never ran, while the hook's other job -- the
-# APIM key -- kept working and kept the whole thing looking healthy.
+# caching branch below silently never ran, while everything else kept working
+# and kept the whole thing looking healthy.
 #
 # ``extra_headers`` is kept for callers that pass the flag in the request body,
-# but note it is also this hook's OWN outbound header dict (see
-# ``_ensure_extra_headers``): looking for an inbound client header there was a
-# category error, not a near miss.
+# but note it is also the OUTBOUND header dict LiteLLM forwards upstream:
+# looking for an inbound client header there was a category error, not a near
+# miss.
 _HEADER_CONTAINERS = ("litellm_metadata", "metadata")
 
 
@@ -239,7 +197,7 @@ def _inject_cache_control_on_message(msg: dict, marker: dict) -> bool:
             {"type": "text", "text": content, "cache_control": dict(marker)}
         ]
         logger.debug(
-            "apim_key_hook: injected cache_control on content block (role=%r, converted str->list)",
+            "prompt_cache_hook: injected cache_control on content block (role=%r, converted str->list)",
             msg.get("role"),
         )
         return True
@@ -254,7 +212,7 @@ def _inject_cache_control_on_message(msg: dict, marker: dict) -> bool:
             if block.get("cache_control") is None:
                 block["cache_control"] = dict(marker)
                 logger.debug(
-                    "apim_key_hook: injected cache_control on last markable block (role=%r, type=%r)",
+                    "prompt_cache_hook: injected cache_control on last markable block (role=%r, type=%r)",
                     msg.get("role"), block.get("type"),
                 )
             return True
@@ -279,7 +237,7 @@ def _inject_anthropic_prompt_cache(data: dict, marker: dict) -> None:
     # a client that marks its own request must not be pushed over it by us.
     budget = _MAX_BREAKPOINTS - _count_existing_markers(data)
     if budget <= 0:
-        logger.debug("apim_key_hook: caller already at the breakpoint cap; not injecting")
+        logger.debug("prompt_cache_hook: caller already at the breakpoint cap; not injecting")
         return
 
     tools = data.get("tools")
@@ -297,7 +255,7 @@ def _inject_anthropic_prompt_cache(data: dict, marker: dict) -> None:
             tool["cache_control"] = dict(marker)
             budget -= 1
             logger.debug(
-                "apim_key_hook: injected cache_control on tool name=%r",
+                "prompt_cache_hook: injected cache_control on tool name=%r",
                 tool.get("name") or (tool.get("function") or {}).get("name"),
             )
             break
@@ -316,7 +274,7 @@ def _inject_anthropic_prompt_cache(data: dict, marker: dict) -> None:
             return
 
 
-class ApimKeyHook(CustomLogger):
+class PromptCacheHook(CustomLogger):
     async def async_pre_call_hook(
         self,
         user_api_key_dict: UserAPIKeyAuth,
@@ -324,31 +282,7 @@ class ApimKeyHook(CustomLogger):
         data: dict,
         call_type: CallTypesLiteral,
     ):
-        metadata = user_api_key_dict.metadata or {}
-        apim_key = metadata.get("apim_key")
         key_alias = getattr(user_api_key_dict, "key_alias", None) or "unknown"
-
-        if apim_key:
-            data["extra_headers"] = _ensure_extra_headers(data)
-            data["extra_headers"]["Ocp-Apim-Subscription-Key"] = apim_key
-            logger.info(
-                f"[{key_alias}] using METADATA apim_key: {_mask(apim_key)}"
-            )
-        else:
-            existing = (data.get("extra_headers") or {}).get(
-                "Ocp-Apim-Subscription-Key"
-            )
-            apim_key = existing
-            if existing:
-                logger.info(
-                    f"[{key_alias}] using MODEL CONFIG default apim_key: {_mask(existing)}"
-                )
-            else:
-                logger.debug(
-                    f"[{key_alias}] no apim_key found (metadata or config)"
-                )
-
-        _inject_user_header(data, apim_key, key_alias)
 
         if (
             call_type in _COMPLETION_CALL_TYPES
@@ -371,4 +305,4 @@ class ApimKeyHook(CustomLogger):
         return data
 
 
-proxy_handler_instance = ApimKeyHook()
+proxy_handler_instance = PromptCacheHook()

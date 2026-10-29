@@ -10,10 +10,10 @@ WORKDIR /app
 # ═══ Inject custom hook files ═══
 # In the base image, litellm is pip-installed, so the import path resolves to
 # site-packages, NOT /app. We dynamically locate the real install path and copy there.
-COPY apim_key_hook.py /tmp/hooks/apim_key_hook.py
+COPY prompt_cache_hook.py /tmp/hooks/prompt_cache_hook.py
 RUN HOOKS_DIR=$(python3 -c "import litellm.proxy.hooks; import os; print(os.path.dirname(litellm.proxy.hooks.__file__))") && \
     echo "Installing hooks to: $HOOKS_DIR" && \
-    cp /tmp/hooks/apim_key_hook.py "$HOOKS_DIR/" && \
+    cp /tmp/hooks/prompt_cache_hook.py "$HOOKS_DIR/" && \
     rm -rf /tmp/hooks && \
     echo "Hook installed successfully"
  

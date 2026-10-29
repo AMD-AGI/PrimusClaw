@@ -461,7 +461,7 @@ secret:
   #
   # Which header identifies a backend is a property of whatever sits between
   # Claw and the model, so it is named here rather than baked in:
-  # "x-litellm-model-id" behind that proxy, an Azure APIM request id behind an
+  # "x-litellm-model-id" behind that proxy, a gateway request id behind an
   # API gateway, "request-id" talking to the provider directly.
   #
   # Named rather than "capture the response headers", because these are logged
