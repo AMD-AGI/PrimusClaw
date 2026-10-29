@@ -55,7 +55,7 @@ func startupPath(t *testing.T, sh []string, env []string, rewrite func(dir, scri
 	main := pt.Spec.Containers[0]
 	script := main.Args[0]
 	// Keep the workspace out of the host's /home.
-	script = strings.Replace(script, "mkdir -p /home/sandbox ", "mkdir -p "+filepath.Join(dir, "workspace")+" ", 1)
+	script = strings.Replace(script, "mkdir -p /app/work ", "mkdir -p "+filepath.Join(dir, "workspace")+" ", 1)
 	if rewrite != nil {
 		script = rewrite(dir, script)
 	}

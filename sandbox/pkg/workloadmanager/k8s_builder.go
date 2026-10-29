@@ -53,8 +53,10 @@ type SandboxResult struct {
 	Namespace   string
 	PodIP       string
 	PodPort     int
-	// Kind is "Sandbox" or "SandboxClaim" — used by GC to choose deletion method.
+	// Kind is "Sandbox", "SandboxClaim", or "Workload". GC uses it to choose deletion.
 	Kind string
+	// NodeName is the node the sandbox pod landed on, when known.
+	NodeName string
 	// MaxSessionDuration is read from CodeInterpreter.spec.maxSessionDuration.
 	// WM uses this to set SandboxInfo.ExpiresAt (hard upper bound on session lifetime).
 	MaxSessionDuration time.Duration

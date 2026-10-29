@@ -41,6 +41,31 @@ roleRef:
   kind: Role
   name: agent-sandbox-controlplane
 ---
+# SaFE mirrors sandbox signing Secrets from primus-safe into the workspace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: agent-sandbox-controlplane-{{ .Release.Name }}
+  namespace: primus-safe
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agent-sandbox-controlplane-{{ .Release.Name }}
+  namespace: primus-safe
+subjects:
+  - kind: ServiceAccount
+    name: agent-sandbox-controlplane
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: agent-sandbox-controlplane-{{ .Release.Name }}
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -79,6 +104,22 @@ rules:
   - apiGroups: ["runtime.agent-sandbox.io"]
     resources: ["codeinterpreters/status"]
     verbs: ["get", "patch", "update"]
+  - apiGroups: ["runtime.agent-sandbox.io"]
+    resources: ["sandboxgrants"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: ["runtime.agent-sandbox.io"]
+    resources: ["sandboxgrants/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: ["amd.com"]
+    resources: ["users"]
+    verbs: ["get"]
+  - apiGroups: ["amd.com"]
+    resources: ["workloads"]
+    # update writes spec.timeout. patch is not granted.
+    verbs: ["create", "delete", "get", "list", "update", "watch"]
   - apiGroups: ["runtime.agent-sandbox.io"]
     resources: ["clustersandboxpolicies"]
     verbs: ["get", "list", "watch"]
