@@ -45,7 +45,12 @@ describe("F2 the card options", () => {
     {
       name: "the identity scheme needs the client, the token path and an issuer",
       env: { CLAW_A2A_CONTEXT_TASKS: "1", IDENTITY_CLIENT_ENABLED: "true", CLAW_IDENTITY_TOKEN_AUTH_ENABLED: "true", IDENTITY_ISSUER_URL: "https://idp.example.com/" },
-      want: { contextTasks: true, oidcUrl: "https://idp.example.com/.well-known/openid-configuration" },
+      want: { contextTasks: true, oidcUrl: "https://idp.example.com/.well-known/openid-configuration", oidcScope: "claw.api" },
+    },
+    {
+      name: "the scope the token path requires is the one the card names",
+      env: { CLAW_A2A_CONTEXT_TASKS: "1", IDENTITY_CLIENT_ENABLED: "true", CLAW_IDENTITY_TOKEN_AUTH_ENABLED: "true", IDENTITY_ISSUER_URL: "https://idp.example.com", CLAW_IDENTITY_TOKEN_SCOPE: " claw.chat " },
+      want: { contextTasks: true, oidcUrl: "https://idp.example.com/.well-known/openid-configuration", oidcScope: "claw.chat" },
     },
     {
       name: "no issuer, no scheme",
@@ -82,6 +87,12 @@ describe("F3 the card", () => {
     assert.equal(card.supportedInterfaces[0].url, "https://claw.example.com/a2a");
     // v1.0 spells a requirement { schemes: { name: { list: [...] } } }.
     assert.deepEqual(card.securityRequirements, [{ schemes: { bearer: { list: [] } } }]);
+  });
+
+  test("the card names the scope the operator configured", () => {
+    const card = genericAgentCard("", { contextTasks: true, oidcUrl: "https://idp.example.com/.well-known/openid-configuration", oidcScope: "claw.chat" });
+    assert.deepEqual(card.securityRequirements?.[0], { schemes: { identity: { list: ["claw.chat"] } } });
+    assert.match(String((card.securitySchemes?.identity as { openIdConnectSecurityScheme: { description: string } }).openIdConnectSecurityScheme.description), /scope claw\.chat/);
   });
 
   test("the identity scheme is offered beside the bearer one, with its scope", () => {

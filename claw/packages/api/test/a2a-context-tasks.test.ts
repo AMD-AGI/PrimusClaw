@@ -719,6 +719,15 @@ describe("the A2A context/task model", { skip }, () => {
       assert.equal(recorded, long.slice(0, 128));
     });
 
+    test("a padded client id is not the id the operator named", async () => {
+      method = "identity_token";
+      process.env.CLAW_A2A_IDENTITY_CLIENT_IDS = "worker";
+      who = { ...ALICE, delegation: { clientId: "worker " } };
+      assert.equal((await rpc("ListTasks", {})).status, 403);
+      who = { ...ALICE, delegation: { clientId: "worker" } };
+      assert.equal((await rpc("ListTasks", {})).status, 200);
+    });
+
     test("the gateway's /invoke is not a way round the list", async () => {
       const invoke = (url: string) => app.inject({ method: "POST", url, payload: { question: "hello" } });
       method = "identity_token";
