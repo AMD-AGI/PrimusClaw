@@ -321,6 +321,17 @@ func (s *Service) upsertOwnerTemplates(ctx context.Context, templates []runtimev
 	return nil
 }
 
+// IsSystemAdmin reports whether the SaFE User of userID has the system-admin role.
+// A missing or unreadable User is not an admin.
+func (s *Service) IsSystemAdmin(ctx context.Context, userID string) bool {
+	checker, ok := s.membership.(AdminChecker)
+	if !ok || userID == "" {
+		return false
+	}
+	admin, err := checker.IsSystemAdmin(ctx, userID)
+	return err == nil && admin
+}
+
 // WorkspaceLister returns the workspaces listed on a user.
 type WorkspaceLister interface {
 	Workspaces(ctx context.Context, userID string) ([]string, error)

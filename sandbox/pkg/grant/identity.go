@@ -53,6 +53,11 @@ type MembershipChecker interface {
 	Check(ctx context.Context, userID string, workspaces []string) error
 }
 
+// AdminChecker reports whether a user holds the SaFE system-admin role.
+type AdminChecker interface {
+	IsSystemAdmin(ctx context.Context, userID string) (bool, error)
+}
+
 // UserCRMembership reads users.amd.com and compares the workspace list.
 type UserCRMembership struct {
 	client dynamic.Interface
@@ -113,6 +118,18 @@ func (m *UserCRMembership) Check(ctx context.Context, userID string, workspaces 
 		}
 	}
 	return nil
+}
+
+// IsSystemAdmin reports whether the User lists the system-admin role.
+func (m *UserCRMembership) IsSystemAdmin(ctx context.Context, userID string) (bool, error) {
+	if m == nil || m.client == nil {
+		return false, opErr(http.StatusServiceUnavailable, "membership_unavailable", "User client is not configured")
+	}
+	obj, err := m.client.Resource(userGVR).Get(ctx, userID, metav1.GetOptions{})
+	if err != nil {
+		return false, err
+	}
+	return isSystemAdmin(obj), nil
 }
 
 // Workspaces returns the workspaces listed on the User.

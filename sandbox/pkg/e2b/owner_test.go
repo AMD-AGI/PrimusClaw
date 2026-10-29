@@ -335,3 +335,41 @@ func TestCallerCannotSetOwnerMetadata(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+// adminMembership marks listed users as SaFE system admins.
+type adminMembership struct {
+	listMembership
+	admins map[string]bool
+}
+
+func (m adminMembership) IsSystemAdmin(_ context.Context, userID string) (bool, error) {
+	return m.admins[userID], nil
+}
+
+func TestIdentityKeyUsesSaFEAdminRole(t *testing.T) {
+	ids := &fakeIntrospector{tokens: map[string]identity.Token{
+		"ak-admin": {Subject: "u-9", Roles: []string{"default"}},
+	}}
+	scheme := runtime.NewScheme()
+	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&runtimev1alpha1.SandboxGrant{}).Build()
+	gs := grant.New(grant.Options{
+		Client: cl, Namespace: "agent-sandbox-system",
+		Membership: adminMembership{listMembership: listMembership{}, admins: map[string]bool{"u-9": true}},
+	})
+	policy := samplePolicy()
+	policy.Default = nil
+	policy.Owners = nil
+	if err := gs.SetOwnerPolicy(context.Background(), policy); err != nil {
+		t.Fatal(err)
+	}
+	plane := New(Options{Grants: gs, Runner: &fakeRunner{}, Namespace: "agent-sandbox-system", Identity: ids})
+	body := CreateBody{TemplateID: "runner", Timeout: 3 * 24 * 3600, Metadata: map[string]string{workspaceMetadata: "any-ws"}}
+	for i := 0; i < 10; i++ {
+		if _, _, err := plane.Create(context.Background(), "ak-admin", body); err != nil {
+			t.Fatalf("admin create %d: %v", i, err)
+		}
+	}
+}

@@ -111,7 +111,7 @@ func (s *Service) lookup(ctx context.Context, apiKey string) (caller, error) {
 	if err != nil {
 		return caller{}, grant.Op(http.StatusServiceUnavailable, "identity_unavailable", "identity is temporarily unavailable")
 	}
-	admin := token.HasRole(systemAdminRole)
+	admin := token.HasRole(systemAdminRole) || s.grants.IsSystemAdmin(ctx, token.Subject)
 	grantID, err := s.grants.EnsureOwner(ctx, token.Subject, token.Email, admin)
 	if err != nil {
 		return caller{}, err
