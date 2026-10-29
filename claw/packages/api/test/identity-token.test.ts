@@ -38,6 +38,7 @@ const ENV_KEYS = [
   "IDENTITY_CLIENT_ENABLED", "IDENTITY_ISSUER_URL", "IDENTITY_CLIENT_ID", "IDENTITY_CLIENT_SECRET",
   "IDENTITY_INTROSPECTION_CACHE_SECONDS", "IDENTITY_INTROSPECTION_NEGATIVE_CACHE_SECONDS", "IDENTITY_STALE_IF_ERROR_SECONDS",
   "CLAW_IDENTITY_TOKEN_AUTH_ENABLED", "CLAW_IDENTITY_TOKEN_AUDIENCE", "CLAW_IDENTITY_TOKEN_SCOPE", "CLAW_IDENTITY_TOKEN_INTROSPECT",
+  "CLAW_IDENTITY_TOKEN_TRUSTED_ROLES",
 ];
 
 /** A fresh client against the stand-in provider (so no key or answer is carried over), or none. */
@@ -174,12 +175,12 @@ describe("a valid token", () => {
     process.env.CLAW_IDENTITY_TOKEN_SCOPE = "other.scope";
     assert.equal(refused(await verify(mint())).status, 401, "the default audience no longer fits");
     verified(await verify(mint({ aud: "other-api", scope: "other.scope" })));
-    assert.deepEqual(identityTokenSettings(), { enabled: true, audience: "other-api", scope: "other.scope", introspect: false });
+    assert.deepEqual(identityTokenSettings(), { enabled: true, audience: "other-api", scope: "other.scope", introspect: false, trustedRoles: [] });
   });
 
-  test("the defaults are claw-api and claw.api, with introspection off", () => {
-    for (const k of ["CLAW_IDENTITY_TOKEN_AUTH_ENABLED", "CLAW_IDENTITY_TOKEN_AUDIENCE", "CLAW_IDENTITY_TOKEN_SCOPE", "CLAW_IDENTITY_TOKEN_INTROSPECT"]) delete process.env[k];
-    assert.deepEqual(identityTokenSettings(), { enabled: false, audience: "claw-api", scope: "claw.api", introspect: false });
+  test("the defaults are claw-api and claw.api, with introspection off and no role adopted", () => {
+    for (const k of ["CLAW_IDENTITY_TOKEN_AUTH_ENABLED", "CLAW_IDENTITY_TOKEN_AUDIENCE", "CLAW_IDENTITY_TOKEN_SCOPE", "CLAW_IDENTITY_TOKEN_INTROSPECT", "CLAW_IDENTITY_TOKEN_TRUSTED_ROLES"]) delete process.env[k];
+    assert.deepEqual(identityTokenSettings(), { enabled: false, audience: "claw-api", scope: "claw.api", introspect: false, trustedRoles: [] });
   });
 
   test("the answer carries no part of the token", async () => {
