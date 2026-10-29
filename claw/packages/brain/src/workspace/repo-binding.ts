@@ -95,6 +95,9 @@ export interface BindOptions {
 const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 
 /** Scrub what a git failure may echo: a url with userinfo, and anything shaped like a token. */
+/** An origin worth quoting back: one word of url-safe characters. */
+const PLAIN_ORIGIN = /^[A-Za-z0-9._~:@%+/-]{1,200}$/;
+
 export function scrubReason(text: string): string {
   const noUserinfo = text.replace(/(https?:\/\/)[^/\s@]+@/gi, "$1<redacted>@");
   return redactSecrets(noUserinfo).text;
@@ -215,7 +218,9 @@ function adoptCommand(dir: string, root: string, record: string, url: string, bo
     // `mv "$T/.git" "$D/"` renames onto "$D/.git" and fails if that exists and is not empty. Naming the
     // destination `$D/.git` would instead move the clone INSIDE a .git directory somebody created since
     // the probe, and the rollback would then remove theirs.
-    `MOVED=; git clone --quiet --no-checkout -- ${shq(url)} "$T" && mv "$T/.git" "$D/" && MOVED=1 && rm -rf "$S" && rm -f "$REC" && git -C "$D" reset --quiet && touch ${shq(boundMarker)}`,
+    // The same check, as late as it can be made, keeps an empty .git that appeared since the probe (a rename
+    // onto an empty directory succeeds) from being replaced and then taken for ours by the rollback.
+    `MOVED=; git clone --quiet --no-checkout -- ${shq(url)} "$T" && [ ! -e "$D/.git" ] && [ ! -L "$D/.git" ] && mv "$T/.git" "$D/" && MOVED=1 && rm -rf "$S" && rm -f "$REC" && git -C "$D" reset --quiet && touch ${shq(boundMarker)}`,
     `|| { rc=$?; [ "$MOVED" = 1 ] && rm -rf "$D/.git"; rm -rf "$S"; rm -f "$REC"; exit $rc; }`,
   ].join(" ");
 }
@@ -362,7 +367,10 @@ export async function bindRepo(hands: RepoHands, raw: unknown, options: BindOpti
     const origin = /^(?:[0-9a-fA-F]{2})*$/.test(originHex) ? Buffer.from(originHex, "hex").toString("utf8") : "";
     if (!sameRepoUrl(origin, repo.url)) {
       // Somebody else's checkout of a repository that happens to share a name. Left exactly as it is.
-      b.failure = `${dir} already holds a different repository (its origin is ${scrubReason(origin.replace(/\s+/g, " ").trim().slice(0, 200)) || "unknown"}), so it was left untouched`;
+      // The origin is the checkout's own text and this line goes to the model: shown only when it is one
+      // url-shaped word (no space, quote or line break), never as free text.
+      const shown = PLAIN_ORIGIN.test(origin) ? scrubReason(origin) : "not a plain URL";
+      b.failure = `${dir} already holds a different repository (its origin is ${shown}), so it was left untouched`;
       return finish(b, started);
     }
     b.state = "present";
