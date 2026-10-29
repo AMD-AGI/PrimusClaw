@@ -37,11 +37,11 @@ const (
 )
 
 // OwnerQuota is the per-owner cap for sandboxes created with an identity key.
+// Owner records carry no GPU-hour budget.
 type OwnerQuota struct {
-	MaxSandboxes      int32   `json:"maxSandboxes"`
-	MaxGPUs           int32   `json:"maxGpus"`
-	GPUHoursBudget    float64 `json:"gpuHoursBudget"`
-	MaxSandboxSeconds int64   `json:"maxSandboxSeconds"`
+	MaxSandboxes      int32 `json:"maxSandboxes"`
+	MaxGPUs           int32 `json:"maxGpus"`
+	MaxSandboxSeconds int64 `json:"maxSandboxSeconds"`
 }
 
 // OwnerPolicy is the quota and template set for identity keys.
@@ -128,7 +128,7 @@ func (s *Service) SetOwnerPolicy(ctx context.Context, p OwnerPolicy) error {
 }
 
 func validQuota(q OwnerQuota) bool {
-	return q.MaxSandboxes >= 0 && q.MaxGPUs >= 0 && q.GPUHoursBudget >= 0 && q.MaxSandboxSeconds >= 0
+	return q.MaxSandboxes >= 0 && q.MaxGPUs >= 0 && q.MaxSandboxSeconds >= 0
 }
 
 // OwnerRole returns the role used by identity keys, or "" when they are disabled.
@@ -200,7 +200,6 @@ func (c *ownerConfig) spec(userID, userName string, now time.Time) runtimev1alph
 			MaxGPUs:      q.MaxGPUs,
 		}},
 		Templates:         templates,
-		GPUHoursBudget:    q.GPUHoursBudget,
 		MaxSandboxSeconds: q.MaxSandboxSeconds,
 		ExpiresAt:         expiresAtTime(now.Add(ownerRecordLifetime)),
 	}
@@ -244,7 +243,6 @@ func (s *Service) updateOwner(ctx context.Context, name string, want runtimev1al
 		current.Spec.Owner.UserName = want.Owner.UserName
 		current.Spec.Roles = want.Roles
 		current.Spec.Templates = want.Templates
-		current.Spec.GPUHoursBudget = want.GPUHoursBudget
 		current.Spec.MaxSandboxSeconds = want.MaxSandboxSeconds
 		return s.client.Update(ctx, current)
 	})
@@ -260,7 +258,6 @@ func (s *Service) updateOwner(ctx context.Context, name string, want runtimev1al
 // ownerSpecMatches compares the fields the policy controls.
 func ownerSpecMatches(got, want runtimev1alpha1.SandboxGrantSpec) bool {
 	return got.Owner.UserName == want.Owner.UserName &&
-		got.GPUHoursBudget == want.GPUHoursBudget &&
 		got.MaxSandboxSeconds == want.MaxSandboxSeconds &&
 		sameRoles(got.Roles, want.Roles) &&
 		sameTemplates(got.Templates, want.Templates)

@@ -201,7 +201,7 @@ func TestOwnerRecordFollowsPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	policy := samplePolicy()
-	policy.Owners["u-2"] = grant.OwnerQuota{MaxSandboxes: 5, MaxGPUs: 16, GPUHoursBudget: 10, MaxSandboxSeconds: 600}
+	policy.Owners["u-2"] = grant.OwnerQuota{MaxSandboxes: 5, MaxGPUs: 16, MaxSandboxSeconds: 600}
 	if err := plane.grants.SetOwnerPolicy(ctx, policy); err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +212,7 @@ func TestOwnerRecordFollowsPolicy(t *testing.T) {
 	if err := cl.Get(ctx, types.NamespacedName{Name: grant.OwnerGrantName("u-2"), Namespace: "agent-sandbox-system"}, &g); err != nil {
 		t.Fatal(err)
 	}
-	if g.Spec.Roles["e2b"].MaxSandboxes != 5 || g.Spec.MaxSandboxSeconds != 600 || g.Spec.GPUHoursBudget != 10 || g.Status.Usage["e2b"].Sandboxes != 1 {
+	if g.Spec.Roles["e2b"].MaxSandboxes != 5 || g.Spec.MaxSandboxSeconds != 600 || g.Status.Usage["e2b"].Sandboxes != 1 {
 		t.Fatalf("owner record = %+v %+v", g.Spec, g.Status.Usage)
 	}
 	if _, _, err := plane.Create(ctx, "ak-bob", CreateBody{TemplateID: "runner", Timeout: 900, Metadata: body.Metadata}); opReason(err) != "timeout_not_allowed" {
