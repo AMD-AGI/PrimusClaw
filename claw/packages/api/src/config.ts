@@ -114,6 +114,16 @@ export function resolveCorsOrigin(raw: string | undefined): string[] | false {
   return origins.length > 0 ? origins : false;
 }
 export const SAFE_API_URL = env("SAFE_API_URL");
+/**
+ * Management API of the Agent Sandbox control plane that `GET /v1/admin/sandbox/*`
+ * lists for the console. Not SANDBOX_ROUTER_URL: that names the Router Brain
+ * creates sandboxes through, which may sit in another cluster and expose only the
+ * data plane. The default is the in-cluster Service the sandbox chart creates.
+ */
+export const SANDBOX_ADMIN_URL = env(
+  "SANDBOX_ADMIN_URL",
+  "http://agent-sandbox-router.agent-sandbox-system.svc.cluster.local:8080",
+);
 
 // --- Deploy mode ---
 // "safe": existing SaFE deployment (SaFE auth). "kubernetes": standalone BYOK (no SaFE auth).

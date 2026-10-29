@@ -411,7 +411,8 @@ secret:
   # Set "true" when the sandbox Router runs with --enable-auth (SANDBOX_ROUTER_AUTH_ENABLED).
   # A hosted application's session-level MCP then carries the <SAFE_API_KEY> placeholder as
   # its token, which Brain expands to the session owner's platform key; otherwise it carries
-  # the run's MCP token.
+  # the run's MCP token. The console's admin sandbox lists (GET /v1/admin/sandbox/*) then
+  # present the admin caller's platform key to the Router as a Bearer credential.
   sandboxRouterAuthEnabled: "false"
   clawDeployRoot: ""
   workspacePersistBase: ""
