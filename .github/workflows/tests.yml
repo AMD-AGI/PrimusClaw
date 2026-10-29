@@ -90,6 +90,38 @@ jobs:
       - name: Minimal demo (Hands over MCP)
         run: ./examples/hands-mcp/run.sh
 
+  connector:
+    name: Connector (TypeScript)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: claw/.nvmrc
+          cache: npm
+          cache-dependency-path: connector/package-lock.json
+
+      # The connector compiles the wire contract from claw/packages/protocol
+      # (a single dependency-free file), so it needs only its own install.
+      - run: npm ci
+        working-directory: connector
+
+      - run: npm run typecheck
+        working-directory: connector
+
+      # Real child processes and sockets: a stand-in Claw and a stand-in ACP
+      # adapter, no database and no network beyond the loopback.
+      - run: npm test
+        working-directory: connector
+
+      - name: The bundle builds and runs
+        working-directory: connector
+        run: |
+          npm run build
+          node dist/cli.js --version
+
   sandbox:
     name: Sandbox (Go)
     runs-on: ubuntu-latest

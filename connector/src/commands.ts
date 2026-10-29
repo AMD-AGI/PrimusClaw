@@ -1,0 +1,253 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+/** The subcommands. Each takes its inputs explicitly (directories, environment, output, fetch) so a test can run it against a temporary home. */
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { parseArgs } from "node:util";
+import { fileAudit } from "./audit.js";
+import { ChildRegistry, isAlive, processStart } from "./children.js";
+import { ClawClient, HttpError, RevokedError, TransportError } from "./claw-client.js";
+import { ConfigError, SAMPLE_CONFIG, loadConfig, type ConnectorConfig } from "./config.js";
+import {
+  CredentialsError, DEFAULT_CLIENT_ID, GrantRevokedError, loadCredentials, providerFor, saveCredentials, type Credentials,
+} from "./credentials.js";
+import { DeviceFlowError, deviceLogin } from "./deviceflow.js";
+import { Connector, type ConnectorTiming } from "./connector.js";
+import {
+  auditFile, childrenFile, configFile, credentialsFile, identityFile, pauseFile, pidFile, type Dirs,
+} from "./paths.js";
+import { errMessage, isObject, sleep, stderrLogger } from "./util.js";
+import { VERSION } from "./version.js";
+
+export interface Ctx {
+  dirs: Dirs;
+  env: NodeJS.ProcessEnv;
+  out: (line: string) => void;
+  err: (line: string) => void;
+  fetch?: typeof fetch;
+  hostname?: string;
+  timing?: Partial<ConnectorTiming>;
+  /** Called with the connector once it exists, so a signal handler can stop it. */
+  onConnector?: (c: Connector) => void;
+}
+
+export const EXIT = { ok: 0, failure: 1, usage: 2, revoked: 3 } as const;
+
+const HELP = `claw-connector ${VERSION}: connect the coding agents on this machine to Claw (outbound HTTPS only).
+
+Usage: claw-connector <command> [options]
+
+  init                     write a sample agents.toml
+  login                    sign in (device flow); --server URL --identity-url URL [--name HOST]
+                           development only: --key <api key>  (or CLAW_CONNECTOR_KEY)
+  run                      connect and serve (Ctrl-C or SIGTERM stops it and every agent it started)
+  status [--json]          what is running, signed in, paused
+  pause                    stop every agent now and stay offline until "resume"
+  resume                   undo "pause"
+  stop                     stop the running connector and every agent it started
+  logout                   stop, revoke the sign-in and delete it
+  --version, --help
+
+Files: ${"$"}XDG_CONFIG_HOME/claw-connector (agents.toml, credentials.json) and ${"$"}XDG_STATE_HOME/claw-connector
+(audit.jsonl, logs, outbox); set CLAW_CONNECTOR_HOME to keep everything under one directory.
+`;
+
+function loadCfg(ctx: Ctx): ConnectorConfig {
+  return loadConfig(configFile(ctx.dirs), { hostname: ctx.hostname ?? os.hostname() });
+}
+
+function serverUrl(ctx: Ctx, flag: string | undefined, cfg: ConnectorConfig | null, creds: Credentials | null): string | null {
+  const v = flag ?? ctx.env.CLAW_URL ?? cfg?.server ?? creds?.server ?? null;
+  return v ? v.trim().replace(/\/+$/, "") : null;
+}
+
+export async function main(argv: string[], ctx: Ctx): Promise<number> {
+  const [cmd, ...rest] = argv;
+  try {
+    switch (cmd) {
+      case undefined: case "help": case "--help": case "-h": ctx.out(HELP); return cmd ? EXIT.ok : EXIT.usage;
+      case "--version": case "-v": case "version": ctx.out(VERSION); return EXIT.ok;
+      case "init": return await cmdInit(ctx);
+      case "login": return await cmdLogin(rest, ctx);
+      case "run": return await cmdRun(rest, ctx);
+      case "status": return cmdStatus(rest, ctx);
+      case "pause": return await cmdPause(ctx);
+      case "resume": return cmdResume(ctx);
+      case "stop": return await cmdStop(ctx);
+      case "logout": return await cmdLogout(ctx);
+      default: ctx.err(`unknown command ${JSON.stringify(cmd)}\n\n${HELP}`); return EXIT.usage;
+    }
+  } catch (e) {
+    if (e instanceof ConfigError || e instanceof CredentialsError || e instanceof DeviceFlowError) { ctx.err(e.message); return EXIT.failure; }
+    ctx.err(`error: ${errMessage(e)}`);
+    return EXIT.failure;
+  }
+}
+
+// --- init ------------------------------------------------------------------------------
+
+async function cmdInit(ctx: Ctx): Promise<number> {
+  const file = configFile(ctx.dirs);
+  if (fs.existsSync(file)) { ctx.out(`${file} already exists; left alone`); return EXIT.ok; }
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(file, SAMPLE_CONFIG, { mode: 0o600 });
+  ctx.out(`wrote ${file}: edit the roots (the directories an agent may work in), then run: claw-connector login`);
+  return EXIT.ok;
+}
+
+// --- login -----------------------------------------------------------------------------
+
+async function cmdLogin(args: string[], ctx: Ctx): Promise<number> {
+  const { values } = parseArgs({
+    args, strict: true,
+    options: { server: { type: "string" }, "identity-url": { type: "string" }, key: { type: "string" }, name: { type: "string" } },
+  });
+  let cfg: ConnectorConfig | null = null;
+  try { cfg = loadCfg(ctx); } catch (e) { if (!(e instanceof ConfigError)) throw e; }
+  const server = serverUrl(ctx, values.server, cfg, null);
+  if (!server) { ctx.err("login needs --server <Claw API URL> (or CLAW_URL, or server = in agents.toml)"); return EXIT.usage; }
+  const file = credentialsFile(ctx.dirs);
+  const key = values.key ?? ctx.env.CLAW_CONNECTOR_KEY;
+  if (key) {
+    saveCredentials(file, { v: 1, server, kind: "key", key, saved_at: new Date().toISOString() });
+    ctx.out("saved a development key. This is for trying things out: a device sign-in is the normal way (omit --key).");
+    return EXIT.ok;
+  }
+  const identityUrl = (values["identity-url"] ?? ctx.env.CLAW_IDENTITY_URL ?? cfg?.identityUrl ?? "").replace(/\/+$/, "");
+  if (!identityUrl) { ctx.err("login needs --identity-url <identity service URL> (or CLAW_IDENTITY_URL, or identity_url = in agents.toml)"); return EXIT.usage; }
+  const deviceName = values.name ?? cfg?.name ?? ctx.hostname ?? os.hostname();
+  const tok = await deviceLogin({ identityUrl, deviceName, fetch: ctx.fetch, print: ctx.out });
+  saveCredentials(file, {
+    v: 1, server, kind: "device", identity_url: identityUrl, client_id: DEFAULT_CLIENT_ID,
+    refresh_token: tok.refresh_token, device_name: deviceName, saved_at: new Date().toISOString(),
+  });
+  ctx.out(`signed in as ${deviceName}. Next: claw-connector run`);
+  return EXIT.ok;
+}
+
+// --- run -------------------------------------------------------------------------------
+
+function runningPid(ctx: Ctx): number | null {
+  try {
+    const raw: unknown = JSON.parse(fs.readFileSync(pidFile(ctx.dirs), "utf8"));
+    if (isObject(raw) && typeof raw.pid === "number" && typeof raw.start === "string" && raw.start !== "" && processStart(raw.pid) === raw.start) return raw.pid;
+  } catch { /* no pid file */ }
+  return null;
+}
+
+async function cmdRun(_args: string[], ctx: Ctx): Promise<number> {
+  const cfg = loadCfg(ctx);
+  if (cfg.agents.length === 0) { ctx.err("agents.toml defines no agents; add an [[agents]] table"); return EXIT.failure; }
+  const creds = loadCredentials(credentialsFile(ctx.dirs));
+  if (!creds) { ctx.err("not signed in: run  claw-connector login"); return EXIT.failure; }
+  const running = runningPid(ctx);
+  if (running !== null) { ctx.err(`already running (pid ${running}); use "claw-connector stop" first`); return EXIT.failure; }
+  const server = serverUrl(ctx, undefined, cfg, creds)!;
+  const tokens = providerFor(creds, (c) => saveCredentials(credentialsFile(ctx.dirs), c), { fetch: ctx.fetch });
+  const client = new ClawClient({ server, tokens, fetch: ctx.fetch });
+  const log = stderrLogger();
+  const audit = fileAudit(auditFile(ctx.dirs));
+  const connector = new Connector({ config: cfg, dirs: ctx.dirs, client, server, audit, log, version: VERSION, timing: ctx.timing });
+  ctx.onConnector?.(connector);
+  ctx.out(`connecting ${cfg.agents.map((a) => a.id).join(", ")} to ${server} as "${cfg.name}"`);
+  try {
+    const result = await connector.run();
+    if (result === "revoked") { ctx.err("this connector was revoked: every agent was stopped. Run login again to connect it anew."); return EXIT.revoked; }
+    return EXIT.ok;
+  } catch (e) {
+    if (e instanceof HttpError || e instanceof TransportError || e instanceof RevokedError || e instanceof GrantRevokedError) { ctx.err(`error: ${e.message}`); return EXIT.failure; }
+    throw e;
+  }
+}
+
+// --- status / pause / resume / stop / logout -------------------------------------------
+
+function cmdStatus(args: string[], ctx: Ctx): number {
+  const { values } = parseArgs({ args, strict: true, options: { json: { type: "boolean" } } });
+  let creds: Credentials | null = null;
+  let credsProblem: string | null = null;
+  try { creds = loadCredentials(credentialsFile(ctx.dirs)); } catch (e) { credsProblem = errMessage(e); }
+  let agents: string[] = [];
+  let configProblem: string | null = null;
+  try { agents = loadCfg(ctx).agents.map((a) => a.id); } catch (e) { configProblem = errMessage(e); }
+  let connectorId: string | null = null;
+  try { const raw: unknown = JSON.parse(fs.readFileSync(identityFile(ctx.dirs), "utf8")); if (isObject(raw) && typeof raw.connector_id === "string") connectorId = raw.connector_id; } catch { /* not registered yet */ }
+  const reg = new ChildRegistry(childrenFile(ctx.dirs));
+  const status = {
+    version: VERSION,
+    running: runningPid(ctx),
+    paused: fs.existsSync(pauseFile(ctx.dirs)),
+    signed_in: creds ? { kind: creds.kind, server: creds.server, device_name: creds.device_name ?? null } : null,
+    connector_id: connectorId,
+    agents,
+    adapters: reg.list().filter((r) => reg.isOurs(r)).map((r) => ({ pid: r.pid, agent: r.agent_id, session: r.session_id })),
+    problems: [credsProblem, configProblem].filter((x): x is string => !!x),
+  };
+  if (values.json) { ctx.out(JSON.stringify(status, null, 2)); return EXIT.ok; }
+  ctx.out(`connector:  ${status.running ? `running (pid ${status.running})` : "not running"}${status.paused ? ", PAUSED" : ""}`);
+  ctx.out(`signed in:  ${creds ? `${creds.kind} to ${creds.server}` : "no"}`);
+  ctx.out(`agents:     ${agents.join(", ") || "none configured"}`);
+  ctx.out(`adapters:   ${status.adapters.length ? status.adapters.map((a) => `${a.agent} pid ${a.pid}`).join(", ") : "none running"}`);
+  for (const p of status.problems) ctx.out(`problem:    ${p}`);
+  return EXIT.ok;
+}
+
+async function cmdPause(ctx: Ctx): Promise<number> {
+  fs.mkdirSync(ctx.dirs.state, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(pauseFile(ctx.dirs), new Date().toISOString() + "\n", { mode: 0o600 });
+  if (runningPid(ctx) === null) {
+    // Nothing is watching the marker: stop whatever a dead run left behind.
+    const left = await new ChildRegistry(childrenFile(ctx.dirs)).killAll();
+    ctx.out(`paused (the connector is not running${left.killed.length ? `; stopped ${left.killed.length} leftover agent process group(s)` : ""})`);
+  } else {
+    ctx.out("paused: the running connector stops every agent within a second and stays offline until: claw-connector resume");
+  }
+  return EXIT.ok;
+}
+
+function cmdResume(ctx: Ctx): number {
+  fs.rmSync(pauseFile(ctx.dirs), { force: true });
+  ctx.out(runningPid(ctx) === null ? "resumed; start it with: claw-connector run" : "resumed: the running connector reconnects now");
+  return EXIT.ok;
+}
+
+/** SIGTERM the connector this directory's pid file names (verified by start time), wait, then stop any recorded adapter that is left. */
+async function cmdStop(ctx: Ctx, quiet = false): Promise<number> {
+  const pid = runningPid(ctx);
+  if (pid !== null) {
+    process.kill(pid, "SIGTERM");
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline && isAlive(pid) && processStart(pid) !== null) await sleep(100);
+    if (isAlive(pid) && runningPid(ctx) === pid) {
+      process.kill(pid, "SIGKILL");
+      if (!quiet) ctx.out(`the connector (pid ${pid}) did not stop in 15 s and was killed`);
+    }
+  }
+  const left = await new ChildRegistry(childrenFile(ctx.dirs)).killAll();
+  if (!quiet) ctx.out(pid === null ? `no connector running${left.killed.length ? `; stopped ${left.killed.length} leftover agent process group(s)` : ""}` : `stopped the connector${left.killed.length ? ` and ${left.killed.length} leftover agent process group(s)` : ""}`);
+  return EXIT.ok;
+}
+
+async function cmdLogout(ctx: Ctx): Promise<number> {
+  await cmdStop(ctx, true);
+  const file = credentialsFile(ctx.dirs);
+  let creds: Credentials | null = null;
+  try { creds = loadCredentials(file); } catch { /* an unreadable file is removed anyway */ }
+  if (creds?.kind === "device" && creds.identity_url && creds.refresh_token) {
+    try {
+      const f = ctx.fetch ?? fetch;
+      await f(`${creds.identity_url}/oauth/revoke`, {
+        method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ token: creds.refresh_token, token_type_hint: "refresh_token", client_id: creds.client_id ?? DEFAULT_CLIENT_ID }),
+        signal: AbortSignal.timeout(10_000),
+      });
+    } catch (e) {
+      ctx.err(`could not revoke the sign-in at the identity service (${errMessage(e)}); it was removed from this machine`);
+    }
+  }
+  fs.rmSync(file, { force: true });
+  ctx.out("signed out");
+  return EXIT.ok;
+}
