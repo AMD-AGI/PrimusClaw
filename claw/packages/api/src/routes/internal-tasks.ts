@@ -28,6 +28,7 @@ import { handleBackendMcpRequest, type JsonRpcRequest } from "../backend-mcp/ind
 import type { BackendMcpCtx } from "../backend-mcp/index.js";
 import { applyAgentDone, type AgentDonePayload } from "../tasks/lifecycle.js";
 import { getTask, transitionStatus } from "../tasks/db.js";
+import { settleFinishedAppRun } from "../tasks/sweeper.js";
 import { parseSandboxHandle, type SandboxHandle } from "../tasks/sandbox-handle.js";
 import { effectiveRunLeaseTtlMs, MAX_RUN_LEASE_TTL_MS } from "@claw/protocol";
 import { RUN_LEASE_TTL_MS } from "../config.js";
@@ -1254,6 +1255,7 @@ export async function registerInternalTaskRoutes(app: FastifyInstance): Promise<
   registerAgentDoneRoute(app);
   registerEventRoute(app);
   registerLeaseRoute(app);
+  registerAppFinishDoneRoute(app);
   registerBackendMcpRoute(app);
 }
 
@@ -1277,6 +1279,20 @@ function registerAgentDoneRoute(app: FastifyInstance): void {
       );
       await applyAgentDone(taskId, body);
       return { ok: true };
+    },
+  );
+}
+
+/** Brain → Backend: a finish-only app dispatch ended the run row; the task returns to its prior terminal state. */
+function registerAppFinishDoneRoute(app: FastifyInstance): void {
+  app.post<{ Params: { taskId: string }; Body: { brain_id?: string } }>(
+    "/v1/internal/tasks/:taskId/app_finish_done",
+    { preHandler: internalTaskAuth("dispatched") },
+    async (req, reply) => {
+      const brainId = req.body?.brain_id;
+      if (!brainId) return reply.status(400).send({ ok: false, error: "brain_id required" });
+      const settled = await settleFinishedAppRun(req.params.taskId, brainId);
+      return settled ? { ok: true } : reply.status(409).send({ ok: false, error: "not_settled" });
     },
   );
 }

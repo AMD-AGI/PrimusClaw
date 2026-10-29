@@ -132,6 +132,27 @@ export async function postTaskRunning(
 }
 
 /**
+ * A finish-only app run is done: its row is `ended`. Asks Backend to put the task back to
+ * the terminal state it had, without a terminal event. True when it was settled.
+ */
+export async function postAppFinishDone(request: ExecuteRequest, brainId: string): Promise<boolean> {
+  if (!request.task_id || !request.callback_url) return false;
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (request.backend_internal_token) headers["Authorization"] = `Bearer ${request.backend_internal_token}`;
+  try {
+    const resp = await fetch(`${request.callback_url}/app_finish_done`, {
+      method: "POST", headers, body: JSON.stringify({ brain_id: brainId }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!resp.ok) logger.warn({ taskId: request.task_id, status: resp.status }, "task.app_finish_done_rejected");
+    return resp.ok;
+  } catch (error) {
+    logger.warn({ taskId: request.task_id, err: error instanceof Error ? error.message : String(error) }, "task.app_finish_done_failed");
+    return false;
+  }
+}
+
+/**
  * Which attempt of a run is speaking. Neither half is monotone alone: a claim
  * advances `claimCount`, a fat redelivery advances the delivery pair.
  */

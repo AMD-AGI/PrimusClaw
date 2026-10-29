@@ -67,7 +67,7 @@ import { runScript, type ScriptProgress } from "./script-runner.js";
 import { createAppRunner } from "../apps/app-runner-wiring.js";
 import { AppRunFailedError, type AppRunOutcome } from "../apps/app-runner.js";
 import {
-  AgentDoneDeliveryError, postAgentDone, postRunLease, postTaskRunning, sandboxForLease,
+  AgentDoneDeliveryError, postAgentDone, postAppFinishDone, postRunLease, postTaskRunning, sandboxForLease,
   type LeaseRenewal, type RunAttemptToken,
 } from "./callback.js";
 import { taskSubject, type RunTimeReport } from "@claw/protocol";
@@ -463,6 +463,7 @@ export interface TaskRunnerSideEffects {
   restoreWorkspace: typeof restoreWorkspace;
   postAgentDone: typeof postAgentDone;
   postTaskRunning: typeof postTaskRunning;
+  postAppFinishDone: typeof postAppFinishDone;
   postRunLease: typeof postRunLease;
   settleRunAttempt: typeof settleClaimedRun;
   runScript: typeof runScript;
@@ -497,6 +498,7 @@ const REAL_SIDE_EFFECTS: TaskRunnerSideEffects = {
   restoreWorkspace,
   postAgentDone,
   postTaskRunning,
+  postAppFinishDone,
   postRunLease,
   settleRunAttempt: settleClaimedRun,
   runScript,
@@ -4405,10 +4407,19 @@ class TaskRunner {
       throw new AppRunFailedError("an app run needs the session owner's platform key");
     }
     const runner = fx().createAppRunner(runId, this.platformKey, epoch);
-    await this.onEvent({ type: "statusUpdate", agentStatus: "running" });
-    await fx().postTaskRunning(this.request, { brainId: BRAIN_ID, attempt: this.attempt });
+    // A finish-only dispatch is not a run starting: the task is already over as far as the
+    // user is concerned, so nothing says "running" and nothing reports a terminal state.
+    const finishOnly = this.request.app_finish_only === true;
+    if (!finishOnly) {
+      await this.onEvent({ type: "statusUpdate", agentStatus: "running" });
+      await fx().postTaskRunning(this.request, { brainId: BRAIN_ID, attempt: this.attempt });
+    }
 
     const result = await runner.run(this.abortCtrl.signal);
+    if (result.kind === "ended" && finishOnly) {
+      await this.settleFinishOnly();
+      return;
+    }
     if (result.kind === "ended") {
       if (!result.outcome.success) throw new AppRunFailedError(result.outcome.reason, result.outcome.captures);
       await this.finalizeAppSuccess(result.outcome);
@@ -4434,12 +4445,27 @@ class TaskRunner {
       // An application that wrote a successful `final` within its grace keeps its
       // own result: reported as the success it is, with its captures, not as the
       // cancel that asked it to stop.
+      if (outcome && finishOnly) {
+        await this.settleFinishOnly();
+        return;
+      }
       if (outcome?.success) {
         await this.finalizeAppSuccess(outcome);
         return;
       }
     }
     throw reason ?? new Error("cancelled by user");
+  }
+
+  /**
+   * A finish-only dispatch is over: the run row is `ended`. The task goes back to the
+   * terminal state it had, with no event, and the delivery is settled. If Backend would not
+   * settle it (the lease went) the delivery is given back instead of dropped.
+   */
+  private async settleFinishOnly(): Promise<void> {
+    const settled = await fx().postAppFinishDone(this.request, BRAIN_ID);
+    await this.releaseAfterTerminal();
+    if (settled) this.msg.ack(); else this.msg.nak(5_000);
   }
 
   /** Report an app run that ended as a success. */

@@ -900,6 +900,33 @@ export async function reapExpiredDoorbellRuns(): Promise<number> {
   return r.rowCount;
 }
 
+/**
+ * `app_finish_done`: the finish-only dispatch has ended the run row, so the task goes back to the
+ * terminal state `requeueUnfinishedAppRuns` took it from. No event is published: the user was
+ * told how this run ended when it ended. Only the lease holder, and only once the row is `ended`.
+ */
+export async function settleFinishedAppRun(taskId: string, brainId: string): Promise<boolean> {
+  const rows = await applyTaskStatusTransition(
+    { sql: "CASE WHEN metadata->'app_finish_prior'->>'status' = 'failed' THEN 'failed' ELSE 'cancelled' END", terminal: true },
+    {
+      extra: { lease_owner: null, lease_expires_at: null, heartbeat_at: null, internal_token_hash: null, attempt_id: null },
+      setSql: [
+        "failure_reason = metadata->'app_finish_prior'->>'failure_reason'",
+        "error_message = metadata->'app_finish_prior'->>'error_message'",
+        "metadata = metadata - 'app_finish_prior'",
+      ],
+      where: `task_id = $1 AND mode = 'app'
+        AND status IN ('preparing','running')
+        AND lease_owner = $2 AND lease_expires_at > NOW()
+        AND metadata->'app_finish_prior' IS NOT NULL
+        AND EXISTS (SELECT 1 FROM claw_app_runs r WHERE r.task_id = claw_tasks.task_id AND r.state = 'ended')`,
+      params: [taskId, brainId],
+    },
+  );
+  if (rows.length) logger.info({ taskId }, "sweeper.app_finish_settled");
+  return rows.length > 0;
+}
+
 /** How many times one run's finishing may be handed to a new worker before it is left for an operator. */
 const APP_FINISH_REQUEUE_MAX = 5;
 
@@ -914,10 +941,13 @@ const APP_FINISH_REQUEUE_MAX = 5;
  * `finishing`, its sandbox up and its grant live, with no row any Brain can
  * claim. An orphaned `running` run is taken over because its task is still
  * non-terminal and gets redelivered; this is the same takeover for a run whose
- * task was closed first. The task goes back to `queued` with the lease cleared,
- * the scheduler dispatches it like any queued task, and the AppRunner reads the
- * row and carries on from the step the last holder stopped at (every finishing
- * step is recorded in `last_exit.finish_done`, so none is repeated).
+ * task was closed first. The task is reopened ONLY to be dispatched: it goes
+ * back to `queued` with the lease cleared and its prior terminal state kept in
+ * `metadata.app_finish_prior`; the dispatch carries `app_finish_only`, and the
+ * Brain finishes the row from the step the last holder stopped at (every step is
+ * recorded in `last_exit.finish_done`, so none is repeated). It says "running" to
+ * nobody and reports no terminal state; `settleFinishedAppRun` then puts the task
+ * back to what it was, so a user's cancel stays a cancel.
  *
  * Only a lease that is dead for the grace, and only `finishing`: a `running`
  * run with a closed task is not a finish to resume. Bounded, so a run whose
@@ -935,8 +965,18 @@ export async function requeueUnfinishedAppRuns(): Promise<number> {
     },
     setSql: [
       "completed_at = NULL",
-      `metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{app_finish_requeues}',
-                           to_jsonb(COALESCE((metadata->>'app_finish_requeues')::int, 0) + 1))`,
+      // A fresh budget for the finish: the old deadline is long past, and the deadline
+      // backstop would close the run again the moment it is dispatched.
+      "deadline_at = NOW() + INTERVAL '1 hour'",
+      // The task is reopened only to be dispatched; what it was is kept (the first time only, so a
+      // second close by a reaper does not overwrite the user's cancel) and put back by `app_finish_done`.
+      `failure_reason = NULL, error_message = NULL`,
+      `metadata = jsonb_set(
+         COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('app_finish_prior', COALESCE(
+           metadata->'app_finish_prior',
+           jsonb_build_object('status', status, 'failure_reason', failure_reason, 'error_message', error_message))),
+         '{app_finish_requeues}',
+         to_jsonb(COALESCE((metadata->>'app_finish_requeues')::int, 0) + 1))`,
     ],
     where: `mode = 'app'
         AND executor = 'brain'
