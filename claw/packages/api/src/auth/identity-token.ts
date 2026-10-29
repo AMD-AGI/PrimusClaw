@@ -214,8 +214,12 @@ export async function verifyIdentityAccessToken(
       ...(actorSub || clientId
         ? {
           delegation: {
+            // The actor is only ever recorded, so it is clipped. The client id is also
+            // compared (CLAW_A2A_IDENTITY_CLIENT_IDS), and a clipped value would let a
+            // client whose id begins with an allowed one pass for it: it is the claim
+            // as signed, and whoever records it clips its own copy.
             ...(actorSub ? { actorSub: actorSub.slice(0, MAX_SUBJECT_CHARS) } : {}),
-            ...(clientId ? { clientId: clientId.slice(0, MAX_SUBJECT_CHARS) } : {}),
+            ...(clientId ? { clientId } : {}),
           },
         }
         : {}),

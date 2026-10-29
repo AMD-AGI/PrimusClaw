@@ -13,6 +13,7 @@ export interface UserInfo {
    * Who acted for this user, when an upstream service presented the user's
    * identity-provider access token (RFC 8693 `act` and `client_id` claims).
    * Recorded, never an authority: the user is `userId`, whatever this says.
+   * `clientId` is the whole claim (an allowlist compares it); `actorSub` is clipped.
    */
   delegation?: { actorSub?: string; clientId?: string };
 }
