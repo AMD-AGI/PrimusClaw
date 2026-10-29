@@ -150,9 +150,9 @@ answers. Every per-user call is built on those two, so none of them changes.
 
 | SaFE answers | The caller |
 |---|---|
-| the person's id (the token's `sub`) and keys | has those keys, cached for 5 minutes per token |
-| an id that is not the token's `sub` | no keys: they would be somebody else's |
-| 401 (it does not accept this issuer or audience), another 4xx, or a person with no keys | authenticated, no keys; remembered for 30 seconds so SaFE is not asked on every request. The log says why (`auth.identity_token.no_safe_keys`) |
+| the person's id (the token's `sub`) and keys | has those keys; SaFE's answer is reused for 5 minutes per token |
+| an id that is not the token's `sub` (those keys would be somebody else's), or a person SaFE holds no keys for | no keys; SaFE's answer is reused for 5 minutes, the decision is made on every request |
+| 401 (it does not accept this issuer or audience) or another 4xx | authenticated, no keys; remembered for 30 seconds so SaFE is not asked on every request. The log says why (`auth.identity_token.no_safe_keys`) |
 | 5xx or no answer | 503 `authentication_service_unavailable`, not remembered: the next request asks again |
 | (no `AUTH_INTERNAL_TOKEN` to ask with) | 500 `authentication_misconfigured`, as for a cookie or a key |
 

@@ -276,6 +276,13 @@ describe("K5 caching", () => {
     assert.equal(verifyCalls().length, 1);
   });
 
+  test("concurrent requests with one token share one question", async () => {
+    const token = mint();
+    const users = await Promise.all(Array.from({ length: 6 }, () => run(token)));
+    for (const o of users) assert.equal(user(o).platformKey, "ak-alice-platform");
+    assert.equal(verifyCalls().length, 1);
+  });
+
   test("a refusal is remembered briefly, so a SaFE that does not know the issuer is not asked on every request", async () => {
     verifyAnswer = (_r, res) => sendJson(res, 401, { code: 401, message: "invalid token" });
     const token = mint();
