@@ -30,6 +30,56 @@ import { World, MANIFEST, RUN_ID, TOKEN } from "./support/app-runner-world.js";
 const workdirs: string[] = [];
 const pids: number[] = [];
 
+type ShellResult = { exitCode: number; stdout: string; stderr: string };
+
+/**
+ * `sh -c command`, in `cwd`.
+ *
+ * A spawn that fails with EAGAIN is the machine out of processes or threads for
+ * the moment -- twelve of these start at once in one test, beside every other
+ * test file the runner is executing -- and it says nothing about the command,
+ * which never ran. Reporting it as the command's exit status turns a full
+ * process table into "nothing was started", so it is attempted again until the
+ * deadline instead. Only that: a command that ran and failed is answered as it is.
+ */
+async function runShell(command: string, cwd: string, env: Record<string, string>): Promise<ShellResult> {
+  const signal = AbortSignal.timeout(30_000);
+  for (;;) {
+    const outcome = await new Promise<ShellResult & { spawnFailed: boolean }>((resolve) => {
+      execFile("sh", ["-c", command], {
+        cwd, env: { PATH: process.env.PATH ?? "", USER_DATA_PATH: cwd, ...env }, timeout: 20_000,
+      }, (err, stdout, stderr) => {
+        const code = err ? (typeof (err as { code?: unknown }).code === "number" ? (err as { code: number }).code : 1) : 0;
+        resolve({ exitCode: code, stdout, stderr, spawnFailed: (err as { code?: unknown } | null)?.code === "EAGAIN" });
+      });
+    });
+    if (!outcome.spawnFailed || signal.aborted) return outcome;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
+/**
+ * Stop an application and anything it started.
+ *
+ * It is detached with setsid, so it leads its own group, and `sh -c "...; sleep
+ * 30"` runs the sleep as a child: signalling the leader alone left that `sleep`
+ * running for the rest of its thirty seconds, once per test.
+ */
+function stopApp(pid: number): void {
+  try { process.kill(-pid, "SIGTERM"); } catch { /* already gone */ }
+}
+
+/** The lines of `file`, once it has at least `atLeast` of them: the application's own word that it ran. */
+async function linesOnceWritten(file: string, atLeast = 1, ms = 20_000): Promise<string[]> {
+  const signal = AbortSignal.timeout(ms);
+  for (;;) {
+    const lines = existsSync(file) ? readFileSync(file, "utf8").trim().split("\n").filter(Boolean) : [];
+    if (lines.length >= atLeast) return lines;
+    if (signal.aborted) throw new Error(`${file} had ${lines.length} of ${atLeast} lines after ${ms} ms`);
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
 function realWorld(script: string, extra: Partial<AppManifestV1> = {}) {
   const dir = mkdtempSync(join(tmpdir(), "c2-03b-"));
   workdirs.push(dir);
@@ -41,14 +91,7 @@ function realWorld(script: string, extra: Partial<AppManifestV1> = {}) {
   };
   const world = new World(manifest);
   const stateDir = `${dir}/.claw-apps/${RUN_ID}`;
-  const exec = (command: string, env: Record<string, string> = {}) => new Promise<{ exitCode: number; stdout: string; stderr: string }>((resolve) => {
-    execFile("sh", ["-c", command], {
-      cwd: dir, env: { PATH: process.env.PATH ?? "", USER_DATA_PATH: dir, ...env }, timeout: 20_000,
-    }, (err, stdout, stderr) => {
-      const code = err ? (typeof (err as { code?: unknown }).code === "number" ? (err as { code: number }).code : 1) : 0;
-      resolve({ exitCode: code, stdout, stderr });
-    });
-  });
+  const exec = (command: string, env: Record<string, string> = {}) => runShell(command, dir, env);
   world.sandbox = {
     ...world.sandbox,
     exec: async (_inst, command, _t, opts) => exec(command, opts?.env),
@@ -62,7 +105,7 @@ function realWorld(script: string, extra: Partial<AppManifestV1> = {}) {
 }
 
 test.after(() => {
-  for (const pid of pids) { try { process.kill(pid); } catch { /* already gone */ } }
+  for (const pid of pids) stopApp(pid);
   for (const d of workdirs) rmSync(d, { recursive: true, force: true });
 });
 
@@ -102,7 +145,7 @@ test("the application is detached: it outlives the shell that started it", async
   assert.equal(Number(sid.stdout.trim()), pid, "the app leads its own session");
   await w.runner.reconcile();
   assert.equal(w.world.rec.state, "running");
-  process.kill(pid);
+  stopApp(pid);
 });
 
 test("a final exit with a failing return code is not run again, for real", async () => {
@@ -133,9 +176,11 @@ test("the start command refuses a second process while its generation is alive",
   assert.equal(again.stdout.trim(), "already");
   const another = await w.exec(startCommand(w.world.rec.manifest, w.stateDir, generationTag("wl-1", 0)));
   assert.equal(another.stdout.trim(), "already");
-  await new Promise((r) => setTimeout(r, 300));
-  assert.equal(readFileSync(`${w.stateDir}/starts.txt`, "utf8").trim().split("\n").length, 1);
-  process.kill(w.readPid());
+  // The answers above are what say nothing else was started. This is the
+  // application's own record that the one run happened, read once it has written
+  // it -- not after a guess at how long a process takes to get going.
+  assert.equal((await linesOnceWritten(`${w.stateDir}/starts.txt`)).length, 1);
+  stopApp(w.readPid());
 });
 
 test("many starts at once launch the application once: the start command serialises itself", async () => {
@@ -143,7 +188,7 @@ test("many starts at once launch the application once: the start command seriali
   await w.runner.reconcile();
   await w.runner.reconcile(); // state dir known, files written, one start done; remove it and race fresh starts
   pids.push(w.readPid());
-  process.kill(w.readPid());
+  stopApp(w.readPid());
   await w.exec(`rm -f ${w.stateDir}/app.sandbox ${w.stateDir}/app.pid ${w.stateDir}/starts.txt`);
   const tag = generationTag("wl-1", 5);
   const cmd = startCommand(w.world.rec.manifest, w.stateDir, tag);
@@ -153,9 +198,8 @@ test("many starts at once launch the application once: the start command seriali
   assert.equal(words.filter((x) => x === "started").length, 1, words.join(","));
   assert.ok(words.every((x) => ["started", "busy", "already"].includes(x)), words.join(","));
   pids.push(w.readPid());
-  await new Promise((r) => setTimeout(r, 400));
-  assert.equal(readFileSync(`${w.stateDir}/starts.txt`, "utf8").trim().split("\n").length, 1, "one process, not several");
-  process.kill(w.readPid());
+  assert.equal((await linesOnceWritten(`${w.stateDir}/starts.txt`)).length, 1, "one process, not several");
+  stopApp(w.readPid());
 });
 
 test("a live process of this sandbox under an older generation is 'already', and the marker follows", async () => {
@@ -171,7 +215,7 @@ test("a live process of this sandbox under an older generation is 'already', and
   const other = await w.exec(startCommand(w.world.rec.manifest, w.stateDir, generationTag("wl-2", 1)), { APP_STATE_DIR: w.stateDir });
   assert.equal(other.stdout.trim(), "started");
   pids.push(w.readPid());
-  process.kill(w.readPid());
+  stopApp(w.readPid());
 });
 
 test("a start lock left by a holder that died does not block starting for ever", async () => {
@@ -180,7 +224,7 @@ test("a start lock left by a holder that died does not block starting for ever",
   const r = await w.exec(startCommand(w.world.rec.manifest, w.stateDir, generationTag("wl-1", 0)), { APP_STATE_DIR: w.stateDir });
   assert.equal(r.stdout.trim(), "started");
   pids.push(w.readPid());
-  process.kill(w.readPid());
+  stopApp(w.readPid());
   assert.equal(existsSync(`${w.stateDir}/.start.lock`), false, "and the lock is released");
 });
 
