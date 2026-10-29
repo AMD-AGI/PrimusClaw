@@ -20,7 +20,9 @@
 #         kubectl exec -n <ns> deploy/<litellm-deploy> -- \
 #           python3 -c "import importlib.metadata as m; print(m.version('litellm'))"
 #   - The router alias must contain "claude" (claude-auto) so prompt_cache_hook.py
-#     still injects Anthropic cache_control.
+#     injects Anthropic cache_control. The litellmSettings block below loads that
+#     hook; it exists only in an image built from litellm/, so it is not part of
+#     the chart defaults and must be dropped if you stay on the legacy image.
 #   - Backend model_name values must already exist in this same modelList.
 #   - Probe each tier with Anthropic Messages against the same api_base Claw
 #     uses. A Vertex-only or undeployed Sonnet id 400s the whole claude-auto
@@ -32,6 +34,10 @@
 # Pin MEMORY_LLM_MODEL in the same change: it defaults to DEFAULT_MODEL, so
 # leaving it unset routes memory/skill extraction through the router too.
 # A task can still pin a backend with request.model=claude-opus-4-7.
+
+litellmSettings:
+  callbacks:
+    - litellm.proxy.hooks.prompt_cache_hook.proxy_handler_instance
 
 modelList:
   - model_name: claude-haiku-4-5

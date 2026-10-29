@@ -77,6 +77,22 @@ attach Anthropic `cache_control` markers to tools and messages on Claude
 routes, so repeated prefixes report `cache_read_input_tokens`. Requests that do
 not send the header are left untouched.
 
+The chart does not load the hook by default. Its default `callbacks` list is
+empty, because the image the chart pins (`docker.io/primussafe/litellm:20260331111348`)
+predates this directory and does not contain `prompt_cache_hook.py`; naming the
+hook there would start a proxy that cannot import it. Build an image from this
+directory ([Building the image](#building-the-image)), deploy it, and then opt in:
+
+```yaml
+litellmSettings:
+  callbacks:
+    - litellm.proxy.hooks.prompt_cache_hook.proxy_handler_instance
+```
+
+`scripts/release-tests/litellm-prompt-cache-hook.sh` keeps this honest: it fails
+if the chart's default `callbacks` ever name a hook while the image pins are
+still not a `build.sh` tag (or disagree with each other).
+
 **The UI patch** rewrites the pre-built static assets' base path from `/ui` to
 `/llm-gateway` with `sed`, rather than rebuilding the UI — the upstream build
 needs Google Fonts access, which is blocked in the build environment. If you
@@ -93,9 +109,9 @@ The proxy only emits `litellm_deployment_*` series when `prometheus` is in
 counters into the cluster TSDB so they survive pod restarts. Enabling the
 scrape object without the callback yields empty targets, not an error.
 
-`callbacks` in Helm **replaces** the chart default list, so keep the
-prompt-cache hook entry when you add prometheus (or a hook of your own that the
-image can import):
+`callbacks` in Helm **replaces** the chart default list, so list every entry you
+want. On an image built from this directory that includes the prompt-cache hook
+(or a hook of your own that the image can import):
 
 ```yaml
 litellmSettings:
@@ -105,6 +121,8 @@ litellmSettings:
 serviceMonitor:
   enabled: true
 ```
+
+On the pinned legacy image, drop the second entry: it does not carry the hook.
 
 Leave `serviceMonitor.namespace` empty so the ServiceMonitor is created in the
 release namespace and can read `secrets.existingSecret` (key `master_key`).
@@ -118,6 +136,13 @@ Secret in that namespace and set `serviceMonitor.bearerTokenSecret.name`.
 kaniko when there is no docker daemon). The tag it writes names the LiteLLM
 version taken from the Dockerfile, and `deploy.sh` refuses an image whose
 version-named tag disagrees with that pin.
+
+The chart's image pins (`charts/litellm/values.yaml` `image.tag`,
+`charts/litellm/Chart.yaml` `appVersion`, and the `LITELLM_IMAGE` default in
+`deploy.sh`) still name the legacy `20260331111348`. Publishing an image is a
+release step, not part of the tree: when one is published, bump all three to
+its tag and put the hook back into the chart's default `callbacks` in the same
+change. The release test fails if only the second half happens.
 
 ## Upgrading LiteLLM
 

@@ -80,6 +80,11 @@ is therefore three steps, in order:
 
 A name like `smart-router` would silently skip prompt-cache injection.
 
+The chart does not load the hook by default (its `callbacks` list is empty,
+because the default image pin predates the hook). The router values example
+turns it on with `litellmSettings.callbacks`, which is only valid on the image
+rebuilt in section 3.
+
 ## 5. v1 routing policy (quality first)
 
 | Tier | Backend (example ids) |
