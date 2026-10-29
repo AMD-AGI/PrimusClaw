@@ -42,6 +42,9 @@ export interface OutboxOptions {
 
 interface Meta { lastSeq: number; acked: number }
 
+/** How long the number of a closed session is remembered. */
+export const TOMBSTONE_MS = 30 * 24 * 3600 * 1000;
+
 const safeName = (sid: string) => sid.replace(/[^A-Za-z0-9._-]/g, "_");
 
 /** An event whose data would exceed the server's per-event limit keeps its type and says what happened. */
@@ -103,6 +106,13 @@ export class Outbox {
       if (sid === null) {
         // Nothing pending: the session id is only known from the file name, which is a safe form of it.
         sid = base;
+        // A tombstone (a closed session, nothing queued) is forgotten after a long while.
+        try {
+          if (this.now() - fs.statSync(path.join(this.dir, `${base}.meta.json`)).mtimeMs > TOMBSTONE_MS) {
+            for (const f of [`${base}.meta.json`, `${base}.jsonl`]) fs.rmSync(path.join(this.dir, f), { force: true });
+            continue;
+          }
+        } catch { /* keep it */ }
       }
       this.meta.set(sid, meta);
     }
@@ -214,9 +224,15 @@ export class Outbox {
     if (!this.queue.some((e) => e.session_id === sessionId)) this.forget(sessionId);
   }
 
+  /**
+   * A closed session needs no events once they are acknowledged, but its high-water mark must outlive them: a later
+   * event for the same session id (the answer to a stale command, `session_closed {unknown_session}`) must go on
+   * from the last number, because the server keeps the first event it saw for each `(session, seq)` and drops a
+   * repeat. What stays is the small meta file, a tombstone, removed after {@link TOMBSTONE_MS}.
+   */
   private forget(sid: string): void {
-    for (const f of [this.eventsFile(sid), this.metaFile(sid)]) fs.rmSync(f, { force: true });
-    this.meta.delete(sid);
+    fs.rmSync(this.eventsFile(sid), { force: true });
+    if (this.meta.has(sid)) this.writeMeta(sid);
     this.bytes.delete(sid);
     this.closed.delete(sid);
   }

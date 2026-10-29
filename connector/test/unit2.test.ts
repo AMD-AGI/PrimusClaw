@@ -13,7 +13,7 @@ import {
 } from "../src/credentials.js";
 import { DeviceFlowError, deviceLogin } from "../src/deviceflow.js";
 import { fileAudit } from "../src/audit.js";
-import { DROPPABLE_TYPES, Outbox } from "../src/outbox.js";
+import { DROPPABLE_TYPES, Outbox, TOMBSTONE_MS } from "../src/outbox.js";
 import { PermissionBook, boundedInput, matchAutoAllow, normalizeOptions } from "../src/permissions.js";
 import { CommandLedger } from "../src/connector.js";
 import { SessionStore } from "../src/session-store.js";
@@ -109,15 +109,28 @@ describe("outbox", () => {
     const ev = o.append(SID, "tool_call_update", { text: "z".repeat(70_000) });
     assert.deepEqual(ev.data, { truncated: true, original_bytes: 70_000 + '{"text":""}'.length });
   });
-  test("a closed session's files go once everything is acknowledged", () => {
+  test("a closed session's events go once acknowledged, but its number is remembered: a later event for it continues the sequence", () => {
     const dir = tmp();
     const o = new Outbox({ dir });
+    o.append(SID, "turn_end", {});
     o.append(SID, "session_closed", {});
     o.markClosed(SID);
-    assert.ok(fs.readdirSync(dir).length > 0);
-    o.ack({ [SID]: 1 });
-    assert.deepEqual(fs.readdirSync(dir), []);
+    o.ack({ [SID]: 2 });
+    assert.deepEqual(fs.readdirSync(dir), [`${SID}.meta.json`], "only the small tombstone is left");
+    assert.equal(o.append(SID, "session_closed", { reason: "unknown_session" }).seq, 3, "not 1: the server would drop it as a duplicate");
+    assert.equal(new Outbox({ dir }).append(SID, "x", {}).seq, 4, "and the same after a restart");
   });
+  test("a tombstone is forgotten after thirty days, not before", () => {
+    const dir = tmp();
+    const o = new Outbox({ dir });
+    for (const id of [SID, SID2]) { o.append(id, "session_closed", {}); o.markClosed(id); o.ack({ [id]: 1 }); }
+    const old = (Date.now() - TOMBSTONE_MS - 60_000) / 1000;
+    fs.utimesSync(path.join(dir, `${SID}.meta.json`), old, old);
+    const again = new Outbox({ dir });
+    assert.equal(again.append(SID, "x", {}).seq, 1, "the old tombstone is gone");
+    assert.equal(again.append(SID2, "x", {}).seq, 2, "the recent one is kept");
+  });
+
 });
 
 describe("permission book", () => {

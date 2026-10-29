@@ -566,6 +566,21 @@ describe("a connector that runs for days", () => {
   });
 });
 
+describe("answers to commands for sessions nobody knows", () => {
+  test("two stale commands for the same unknown session are both answered: the second event continues the sequence, it does not restart at 1", async () => {
+    const h = await make();
+    await h.online();
+    const ghost = "88888888-8888-4888-8888-888888888888";
+    h.claw.issue("prompt", ghost, { text: "say never" });
+    await h.claw.until("the first answer", () => h.claw.eventsOf(ghost, "session_closed").length === 1);
+    await h.connector.drained(); // acknowledged: the session's files are forgotten now
+    h.claw.issue("prompt", ghost, { text: "say again" });
+    await h.claw.until("the second answer", () => h.claw.eventsOf(ghost, "session_closed").length === 2);
+    assert.deepEqual(h.claw.eventsOf(ghost).map((e) => e.seq), [1, 2]);
+    assert.equal(h.claw.duplicatesSeen, 0, "nothing was sent twice under one number");
+  });
+});
+
 describe("kill switch", () => {
   test("a revoked connector stops every adapter, exits as revoked and does not retry", async () => {
     const h = await make();
