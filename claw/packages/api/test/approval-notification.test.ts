@@ -317,6 +317,15 @@ test("O4 no credential reaches any part of the payload: not the title (the sessi
   assert.equal((await rows())[0].payload.summary, "API_KEY=<redacted>");
 });
 
+test("O4 a tool name is text too: a credential in it is masked in approval.tool and in the title", async () => {
+  await session("s1", { config: { notify_on_finish: true } });
+  await subscribe("u1", { types: APPROVALS });
+  await deliver("s1", request({ tool: "deploy --token toolsecret1", input: {} }));
+  const p = (await rows())[0].payload;
+  assert.equal(JSON.stringify(p).includes("toolsecret1"), false, JSON.stringify(p));
+  assert.equal(p.approval.tool, "deploy --token <redacted>");
+});
+
 test("O5 the run notifications are unchanged, and the short-run rule does not apply to an approval", async () => {
   await session("s1", { config: { notify_on_finish: true } });
   await h.sql(
