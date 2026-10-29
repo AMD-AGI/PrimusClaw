@@ -409,6 +409,11 @@ describe("attach end to end", () => {
     h.prompt(sid, "say third");
     await h.turnEnd(sid, 3);
     assert.deepEqual(h.adapterLog().filter((l) => l.prompt).map((l) => l.prompt), ["say first", "say third"]);
+    // The adapter that was running while the terminal had the conversation is not reused: what the terminal wrote
+    // is not in its memory. The prompt went to a fresh one, started from the transcript, with the mode locked again.
+    assert.equal(adapterMethods(h).filter((m) => m === "session/resume").length, 2);
+    assert.equal(adapterMethods(h).filter((m) => m === "session/set_mode").length, 2);
+    assert.equal(h.connector.registry.list().length, 1, "and only one adapter is left running");
   });
 
   test("the agent's own process is listed by the command too and is not mistaken for a twin", async () => {
@@ -424,15 +429,53 @@ describe("attach end to end", () => {
     assert.equal(h.claw.eventsOf(sid, "command_rejected").length, 0);
   });
 
-  test("an adapter that was recycled is brought back only if no terminal took the session meanwhile", async () => {
+  test("an adapter that was recycled is brought back only if no terminal took the session meanwhile; the session is kept", async () => {
     const h = await attachHarness({ timing: { idleMs: 80 } });
     const sid = await h.attach(REF);
     await h.claw.until("the adapter to be recycled", () => h.audit().some((a) => a.kind === "adapter_recycled"));
     h.setLive([{ pid: process.pid, sessionId: REF, status: "idle" }]);
     h.prompt(sid, "say hi");
-    await h.claw.until("the session to close", () => closedReason(h, sid) !== undefined);
-    assert.equal(closedReason(h, sid), "session_live");
+    const rejected = await h.claw.until("the prompt to be rejected", () => h.claw.eventsOf(sid, "command_rejected")[0]);
+    assert.equal(rejected.data.reason, "session_live");
+    assert.equal(h.claw.eventsOf(sid, "session_closed").length, 0, "the conversation is not closed because a terminal has it");
     assert.deepEqual(h.adapterLog().filter((l) => l.prompt), []);
+    h.setLive([]);
+    h.prompt(sid, "say hi");
+    await h.turnEnd(sid, 2);
+    assert.deepEqual(h.messages(sid), ["hi"]);
+  });
+
+  test("a terminal that came and went between two prompts is noticed from the transcript: the next prompt starts a fresh adapter", async () => {
+    const h = await attachHarness({ timing: { recentWriteMs: 300 } });
+    const sid = await h.attach(REF);
+    const file = path.join(h.attachDir, "projects", fs.realpathSync(h.work).replace(/[^A-Za-z0-9]/g, "-"), `${REF}.jsonl`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '{"type":"user"}\n');
+    const old = (Date.now() - 3_600_000) / 1000;
+    fs.utimesSync(file, old, old);
+    // The connector marks the transcript when a turn ends; this one ends after the file exists.
+    h.prompt(sid, "say one");
+    await h.turnEnd(sid, 1);
+    const resumes = () => adapterMethods(h).filter((m) => m === "session/resume").length;
+    // Nothing wrote to it: the same adapter goes on.
+    h.prompt(sid, "say two");
+    await h.turnEnd(sid, 2);
+    assert.equal(resumes(), 1, "an untouched transcript does not cost a restart");
+    // A terminal opened the conversation, said something and closed: nothing holds it open now.
+    fs.appendFileSync(file, '{"type":"user","from":"the terminal"}\n');
+    h.prompt(sid, "say three");
+    const rejected = await h.claw.until("the prompt to be held back while the terminal's last write is fresh", () => h.claw.eventsOf(sid, "command_rejected")[0]);
+    assert.equal(rejected.data.reason, "recently_written");
+    assert.equal(h.claw.eventsOf(sid, "session_closed").length, 0);
+    assert.ok(h.audit().some((a) => a.kind === "transcript_changed"));
+    assert.deepEqual(h.adapterLog().filter((l) => l.prompt).map((l) => l.prompt), ["say one", "say two"], "not sent on to the stale adapter");
+    // Once it has settled, the prompt goes to an adapter that reads the transcript afresh.
+    fs.utimesSync(file, old, old);
+    h.prompt(sid, "say four");
+    await h.turnEnd(sid, 4);
+    assert.equal(resumes(), 2);
+    assert.deepEqual(h.adapterLog().filter((l) => l.prompt).map((l) => l.prompt), ["say one", "say two", "say four"]);
+    assert.equal(h.connector.registry.list().length, 1);
   });
 
   test("an agent that is not an attach agent never turns a resume request into a new conversation", async () => {

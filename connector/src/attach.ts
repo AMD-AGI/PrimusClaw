@@ -112,6 +112,8 @@ export class AttachSupport {
   private listError: string | null = null;
   private refreshing: Promise<void> | null = null;
   private waitedOnce = false;
+  /** Where each conversation's transcript was found, so that it is not searched for again on every prompt. */
+  private readonly transcripts = new Map<string, string>();
   private readonly localDomain = localPidDomain();
 
   constructor(readonly agent: AgentConfig, private readonly d: AttachDeps) {
@@ -258,20 +260,30 @@ export class AttachSupport {
     return out;
   }
 
+  /** The size of the conversation's transcript now, or null when there is none to look at. */
+  transcriptSize(ref: string): number | null {
+    const file = SESSION_REF_RE.test(ref) ? this.transcriptFile(ref.toLowerCase()) : null;
+    try { return file ? fs.statSync(file).size : null; } catch { return null; }
+  }
+
   /** `<config dir>/projects/<working directory with every non-alphanumeric turned into "-">/<id>.jsonl`, found by name when that guess misses. */
   private transcriptFile(ref: string): string | null {
+    const cached = this.transcripts.get(ref);
+    if (cached && fs.existsSync(cached)) return cached;
+    this.transcripts.delete(ref);
     const projects = path.join(this.configDir, "projects");
+    const remember = (f: string) => { this.transcripts.set(ref, f); return f; };
     const known = this.listed.find((l) => l.ref === ref);
     if (known) {
       const guess = path.join(projects, known.cwd.replace(/[^A-Za-z0-9]/g, "-"), `${ref}.jsonl`);
-      if (fs.existsSync(guess)) return guess;
+      if (fs.existsSync(guess)) return remember(guess);
     }
     try {
       let n = 0;
       for (const dir of fs.readdirSync(projects)) {
         if (++n > MAX_SCANNED_PROJECT_DIRS) break;
         const f = path.join(projects, dir, `${ref}.jsonl`);
-        if (fs.existsSync(f)) return f;
+        if (fs.existsSync(f)) return remember(f);
       }
     } catch { /* no projects directory */ }
     return null;

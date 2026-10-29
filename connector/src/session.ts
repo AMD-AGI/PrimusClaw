@@ -82,6 +82,8 @@ export class Session {
    * so it is set aside until the ask mode is locked and read back; one that comes later closes the session as ever.
    */
   private inheritedWarningOk = false;
+  /** The transcript's size when this connector last left it (see {@link preflight}). */
+  private transcriptMark: number | null = null;
   private turnRunning = false;
   private queue: Array<{ text: string; cmdId: string | null; started: () => void }> = [];
   private launching: Promise<void> | null = null;
@@ -188,6 +190,7 @@ export class Session {
     this.inheritedWarningOk = true;
     try {
       await this.doLaunch(how);
+      this.markTranscript();
     } finally {
       this.inheritedWarningOk = false;
     }
@@ -515,6 +518,16 @@ export class Session {
   }
 
   private async runTurn(text: string, started: () => void, cmdId: string | null): Promise<void> {
+    if (this.agent.attach) {
+      const refused = await this.preflight();
+      if (refused) {
+        started();
+        this.audit("prompt_refused", { reason: refused.reason, detail: refused.detail.slice(0, 300) });
+        this.rejectCommand("prompt", cmdId, refused.reason);
+        this.emit("turn_end", { stopReason: "error", error: refused.reason });
+        return;
+      }
+    }
     try {
       await this.ensureAdapter();
     } catch (e) {
@@ -523,19 +536,6 @@ export class Session {
       return this.refuse(e);
     }
     const a = this.adapter!;
-    if (this.agent.attach && this.acpId) {
-      // Someone may have opened the conversation in a terminal since the last turn. The prompt is not sent: it
-      // would be a second writer. The session stays, so it goes through once the terminal is closed.
-      const verdict = await this.env.attach.get(this.agent.id)?.check(this.acpId, { ownPgid: a.pid, transcript: false })
-        ?? { ok: false as const, reason: "twin_check_failed" as const, detail: "no takeover support" };
-      if (!verdict.ok) {
-        started();
-        this.audit("prompt_refused", { reason: verdict.reason, detail: verdict.detail.slice(0, 300) });
-        this.rejectCommand("prompt", cmdId, verdict.reason);
-        this.emit("turn_end", { stopReason: "error", error: verdict.reason });
-        return;
-      }
-    }
     this.audit("turn_started", { length: text.length });
     try {
       const reply = a.requestUnbounded("session/prompt", { sessionId: this.acpId, prompt: [{ type: "text", text }] });
@@ -546,7 +546,46 @@ export class Session {
     } catch (e) {
       this.audit("turn_failed", { error: errMessage(e) });
       this.emit("turn_end", { stopReason: "error", error: errMessage(e).slice(0, 300) });
+    } finally {
+      this.markTranscript();
     }
+  }
+
+  /**
+   * For an attach agent: may this prompt go to the agent now? Null when it may, else why not (the prompt is
+   * rejected and the session stays, so it goes through once the cause is gone).
+   *
+   * Someone may have opened the conversation in a terminal since the last turn. Sending the prompt would make a
+   * second writer, and even after that terminal has gone the adapter's memory of the conversation predates what
+   * the terminal wrote: continuing from it forks the transcript. So an adapter is dropped when another process
+   * holds the conversation open, and when the transcript is no longer the size this adapter left it (a terminal
+   * that came and went between two prompts); the next start reads the transcript afresh, after the full check.
+   */
+  private async preflight(): Promise<{ reason: string; detail: string } | null> {
+    const support = this.env.attach.get(this.agent.id);
+    const ref = this.acpId;
+    if (!support || !ref) return { reason: "twin_check_failed", detail: "no takeover support" };
+    const live = this.adapter && !this.adapter.exited ? this.adapter : null;
+    // Without an adapter of its own the session is about to be started: that is the full check, transcript included.
+    const verdict = await support.check(ref, { ownPgid: live?.pid ?? null, transcript: live === null });
+    if (!verdict.ok) {
+      if (live) await this.dropAdapter();
+      return verdict;
+    }
+    if (live && this.transcriptMark !== null) {
+      const now = support.transcriptSize(ref);
+      if (now !== null && now !== this.transcriptMark) {
+        this.audit("transcript_changed", { was: this.transcriptMark, now });
+        await this.dropAdapter();
+        return this.preflight();
+      }
+    }
+    return null;
+  }
+
+  /** What size the transcript is as this connector leaves it: after it starts the session and after every turn. */
+  private markTranscript(): void {
+    if (this.agent.attach && this.acpId) this.transcriptMark = this.env.attach.get(this.agent.id)?.transcriptSize(this.acpId) ?? null;
   }
 
   /** A recycled (or crashed) adapter comes back on demand. */

@@ -147,7 +147,11 @@ its history, because both sides read and append to the same transcript.
 Why the terminal must be closed: Claude Code does not stop a second process from resuming a conversation that is still
 open, and two writers fork the transcript; the next resume follows only one branch, so a turn is lost without any error
 (measured). The connector therefore refuses to take over a conversation that another process holds open, and it checks again
-before it starts the agent again after a pause and before every prompt. It asks Claude Code itself
+before it starts the agent again after a pause and before every prompt. A prompt that meets a terminal is rejected, not sent
+(the session stays, and the prompt can be sent again once the terminal is closed), and the connector's agent for the
+conversation is discarded: what the terminal wrote is not in its memory, so the next prompt starts a fresh one that reads
+the transcript. The same happens when the transcript is no longer the size the connector left it, which is how a terminal
+that came and went between two prompts is noticed. It asks Claude Code itself
 (`claude agents --json`, which lists the live processes and ignores the files a killed one leaves behind). If that command
 is missing or fails, it reads the registry Claude Code keeps in `$CLAUDE_CONFIG_DIR/sessions/` and checks every row against
 the process it names; a row from another host or container that shares the directory cannot be checked and counts as open.
