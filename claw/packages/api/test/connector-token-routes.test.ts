@@ -43,6 +43,7 @@ const REGISTRARS: Record<string, string> = {
   registerRemoteAgentRoutes: "routes/remote-agents.js",
   registerSystemEnvVarRoutes: "routes/system-env-vars.js",
   registerSandboxAdminRoutes: "routes/sandbox-admin.js",
+  registerTerminalRoutes: "routes/terminal.js",
   registerMcpRoutes: "routes/mcp.js",
   registerInternalTaskRoutes: "routes/internal-tasks.js",
   registerInternalRunRoutes: "routes/internal-runs.js",
