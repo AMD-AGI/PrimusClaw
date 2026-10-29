@@ -142,6 +142,20 @@ describe("B a tool call", () => {
     await c.close();
   });
 
+  test("B6 gh_review_submit takes the same risk_flags as gh_pr_merge, and a flagged APPROVE is refused through MCP too", async () => {
+    e.identity.answer = async () => credential({ delegation: true });
+    const c = await connect(token());
+    const tool = (await c.listTools()).tools.find((t) => t.name === "gh_review_submit");
+    assert.ok(tool && "risk_flags" in ((tool.inputSchema as { properties?: Record<string, unknown> }).properties ?? {}));
+    const flagged = await call(c, "gh_review_submit", { pr: PR, head_sha: HEAD, event: "APPROVE", body: "Fine.", risk_flags: ["security_finding"] });
+    assert.equal(flagged.isError, true);
+    assert.equal(flagged.body.reason, "high_risk_approval");
+    const unknown = await c.callTool({ name: "gh_review_submit", arguments: { pr: PR, head_sha: HEAD, event: "APPROVE", body: "Fine.", risk_flags: ["whatever"] } }) as { isError?: boolean };
+    assert.equal(unknown.isError, true);
+    assert.equal(e.gh.writes.length, 0);
+    await c.close();
+  });
+
   test("B5 gh_pr_merge through MCP holds a high-risk change for the acting user", async () => {
     e.identity.answer = async () => credential({ delegation: true });
     e.gh.files = [{ filename: ".github/workflows/ci.yml", status: "modified", additions: 1, deletions: 0, patch: "@@ -1 +1,2 @@\n a\n+b" }];

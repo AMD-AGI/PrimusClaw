@@ -443,6 +443,21 @@ describe("M2 what the change was, and what an approval may do", () => {
   });
 });
 
+describe("M3 the model's flags", () => {
+  test("M11 the reviewer's risk flags hold an APPROVE as they hold a merge, so auto-merge cannot get past the confirmation", async () => {
+    for (const risk_flags of [["security_finding"], ["review_skipped"], ["security_finding", "review_skipped"]]) {
+      const o = await submit({ event: "APPROVE", risk_flags });
+      assert.equal(reason(o), "high_risk_approval", risk_flags.join());
+      assert.match(String((o.body.reasons as string[]).join()), /security issue|skipped a step/);
+    }
+    assert.equal(e.gh.writes.length, 0);
+    // The same call without flags is a clean approval; a flag does not hold a comment.
+    assert.equal((await submit({ event: "COMMENT", risk_flags: ["security_finding"] })).isError, false);
+    assert.equal((await submit({ event: "APPROVE" })).body.status, "submitted");
+    assert.equal((await merge({ risk_flags: ["security_finding"] })).body.status, "confirmation_required");
+  });
+});
+
 describe("C high risk waits for the acting user", () => {
   beforeEach(() => {
     allowed();
@@ -560,17 +575,32 @@ describe("C high risk waits for the acting user", () => {
     assert.equal(r.body.reason, "identity_unavailable");
     assert.equal((await pending())[0]?.status, "pending");
     e.identity.answer = up;
-    e.gh.mergeStatus = 502;
+    e.gh.fail["/repos/AMD-AGI/demo/pulls/7/files"] = { status: 502, message: "Bad Gateway" };
     const again = await e.service.decide("u-bob", id, "allow");
     assert.equal(again.body.status, "retry", JSON.stringify(again.body));
     assert.equal(again.body.reason, "github_error");
     assert.equal((await pending())[0]?.status, "pending");
-    e.gh.mergeStatus = 200;
+    assert.equal(e.gh.writes.length, 0);
+    e.gh.fail = {};
     const done = await e.service.decide("u-bob", id, "allow");
     assert.equal(done.body.status, "merged", JSON.stringify(done.body));
     assert.equal((await pending())[0]?.status, "merged");
-    // The approval was posted once, not once per try.
-    assert.equal(e.gh.writes.filter((w) => w.method === "POST").length, 1);
+  });
+
+  test("C16 once an approval or a merge has been sent the try is not given back: a failure after it closes the confirmation, so a later deny or expiry cannot leave that approval standing unseen", async () => {
+    const id = String((await merge()).body.confirmation_id);
+    e.gh.mergeStatus = 502;
+    const r = await e.service.decide("u-bob", id, "allow");
+    assert.equal(r.body.status, "refused", JSON.stringify(r.body));
+    assert.equal(r.body.wrote, true);
+    assert.match(String(r.body.message), /already sent to GitHub/);
+    assert.deepEqual(e.gh.writes.map((w) => w.method), ["POST", "PUT"]);
+    const [row] = await pending();
+    assert.equal(row?.status, "refused");
+    assert.equal(row?.result.wrote, true);
+    // Nothing is left to deny, allow again or expire.
+    assert.equal((await e.service.decide("u-bob", id, "allow")).body.status, "refused");
+    assert.equal(e.gh.writes.length, 2);
   });
 
   test("C12 a confirmation is given back only while it can still be answered: not after it ran out, not when a newer one for the commit stands", async () => {
@@ -683,6 +713,21 @@ describe("W dry run, limits and the budget", () => {
     await e.sql("UPDATE claw_github_audit SET result = 'started'");
     assert.equal((await recentWrites(e.db, null, 3_600_000)).count, 1);
     assert.equal((await recentWrites(e.db, "u-bob", 3_600_000)).count, 1);
+  });
+
+  test("W8 an approval counts against the hourly limits though the merge that posted it was then refused", async () => {
+    e = await reviewEnv({ CLAW_GITHUB_REVIEWS_PER_HOUR: "1" });
+    e.gh.graphql.mergeStateStatus = "BLOCKED";
+    const m = await merge();
+    assert.equal(reason(m), "merge_state_not_clean");
+    assert.deepEqual(e.gh.writes.map((w) => w.body.event), ["APPROVE"]);
+    const [row] = await e.sql("SELECT write, result FROM claw_github_audit");
+    assert.deepEqual(row, { write: true, result: "refused" });
+    const { recentWrites } = await import("../src/github-review/store.js");
+    assert.equal((await recentWrites(e.db, null, 3_600_000)).count, 1);
+    const other = await e.service.submitReview({ ...e.actor, sessionId: "s-9" }, { pr: PR, head_sha: HEAD, event: "COMMENT", body: "Another review." });
+    assert.equal(reason(other), "rate_limited");
+    assert.equal(e.gh.writes.length, 1);
   });
 
   test("W3 a session has a budget of GitHub requests; past it every tool is refused", async () => {

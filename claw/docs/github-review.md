@@ -35,7 +35,7 @@ tool offered to a session, and `config.acting_as` is refused.
 |---|---|
 | `gh_pr_get` | The pull request, its files and diff, CI, review threads, existing comments, the risk verdict, what the acting user may do, the review path (below) and the review instructions. Text that came from the pull request is under `untrusted`. Call it first. |
 | `gh_pr_risk` | The deterministic risk verdict alone. The model may pass `risk_flags` (`security_finding`, `review_skipped`); they can only raise the verdict. |
-| `gh_review_submit` | One review on the pinned head commit, with inline comments that must sit on lines the diff shows. `COMMENT`, `REQUEST_CHANGES` or `APPROVE`. A body footer says `Reviewed by Clawy on behalf of <login> (requested by <name>), run <id>` and a hidden marker keeps a retry from posting twice. |
+| `gh_review_submit` | One review on the pinned head commit (the model may pass the same `risk_flags` as to `gh_pr_risk`, and they count for an `APPROVE`), with inline comments that must sit on lines the diff shows. `COMMENT`, `REQUEST_CHANGES` or `APPROVE`. A body footer says `Reviewed by Clawy on behalf of <login> (requested by <name>), run <id>` and a hidden marker keeps a retry from posting twice. |
 | `gh_pr_merge` | Approves when needed and merges, if every gate is open. |
 
 ## Gates (all enforced inside the tools)
@@ -62,8 +62,9 @@ tool offered to a session, and `config.acting_as` is refused.
 - **An approval.** An approval can merge a pull request by itself (GitHub's auto-merge), so
   `gh_review_submit` with `APPROVE` is posted only where `gh_pr_merge` would not stop: CI is
   green on the head commit (`ci_not_green`), no review thread is open (`threads_unresolved`)
-  and the change is not high risk (`high_risk_approval`: post a comment and call
-  `gh_pr_merge`, which asks the acting user). `COMMENT` and `REQUEST_CHANGES` are not held to that.
+  and the change is not high risk, the model's `risk_flags` included (`high_risk_approval`: post
+  a comment and call `gh_pr_merge`, which asks the acting user). `COMMENT` and `REQUEST_CHANGES`
+  are not held to that.
 - **The merge.** Everything is read again at merge time: CI is green on the **head commit**
   (every check completed and passing; a required check that never reported is missing; a pull
   request with no check at all is not green however clean GitHub calls it; an infrastructure
@@ -87,7 +88,7 @@ tool offered to a session, and `config.acting_as` is refused.
 | Route | Purpose |
 |---|---|
 | `GET /v1/github-review/confirmations?session_id=<id>&status=pending` | The confirmations of the caller's own sessions and those that ask the caller. `{items:[{id, repo, pr, title, author, head_sha, reasons, checks, actor_user_id, requester_user_id, session_id, expires_at, status}]}` |
-| `POST /v1/github-review/confirmations/:id/decision` `{decision: "allow" \| "deny"}` | The acting user's answer. Anyone else gets `403`. On `allow` every gate is read again and the merge is made with the acting user's account; the answer is `{status: "merged" \| "denied" \| "stale" \| "expired" \| "refused" \| "retry", reason, merge_sha}`. `retry` means the merge could not be tried just now (the identity service or GitHub failed, a limit was hit) and the confirmation is still open: allow it again. The merge is recorded as asked for by the requester, not by the acting user |
+| `POST /v1/github-review/confirmations/:id/decision` `{decision: "allow" \| "deny"}` | The acting user's answer. Anyone else gets `403`. On `allow` every gate is read again and the merge is made with the acting user's account; the answer is `{status: "merged" \| "denied" \| "stale" \| "expired" \| "refused" \| "retry", reason, merge_sha}`. `retry` means the merge could not be tried just now (the identity service or GitHub failed, a limit was hit) before anything was sent to GitHub, and the confirmation is still open: allow it again. Once an approval or a merge has been sent the try is not given back: the confirmation is closed as `refused` with `wrote: true`. The merge is recorded as asked for by the requester, not by the acting user |
 
 A confirmation lives 24 hours (`CLAW_GITHUB_CONFIRMATION_TTL_SECONDS`), is bound to the head
 commit (a head that moved makes it `stale`) and is used once.

@@ -52,6 +52,8 @@ export interface ToolOutcome {
   body: Record<string, unknown>;
   /** `body` as JSON with the token and anything shaped like a secret masked. */
   text: string;
+  /** A review or a merge was sent to GitHub in this call, or was about to be when it stopped: set by the core, not by the tools. */
+  wrote?: boolean;
 }
 
 /** A refusal: the tool did not do what was asked, and says why. */
@@ -276,7 +278,7 @@ export class GithubReview {
       const change = needsChange ? await this.collectChange(ctx, ref, pr) : null;
       const comments = this.checkComments(args.comments, change);
       await this.requireEvent(ctx, repo, pr, event as "COMMENT" | "REQUEST_CHANGES" | "APPROVE");
-      if (event === "APPROVE") await this.requireApprovable(ctx, ref, repo, pr, change);
+      if (event === "APPROVE") await this.requireApprovable(ctx, ref, repo, pr, change, this.flags(args));
       const result = await this.writeReview(ctx, ref, pr, event, text, comments);
       return ok({ status: result.status, head_sha: headSha, ...result.detail }, (t) => ctx.client.redact(t));
     });
@@ -339,15 +341,20 @@ export class GithubReview {
       await finishConfirmation(this.deps.db, id, "refused", deciderUserId, { reason: "writes_disabled" });
       return { http: 200, body: { ok: true, status: "refused", reason: "writes_disabled" } };
     }
-    if (TRANSIENT_REFUSALS.has(reason) || (reason === "github_error" && Number(outcome.body.github_status) >= 500)) {
-      // Nothing was decided about the merge: the person's "allow" is not used up, and they can give it again.
+    // Once an approval or a merge has been sent, the try has had an effect on the pull request and is not
+    // given back: a later deny or expiry would leave that approval standing, and a 5xx on the merge may
+    // mean it went through.
+    const wrote = outcome.wrote === true;
+    if (!wrote && (TRANSIENT_REFUSALS.has(reason) || (reason === "github_error" && Number(outcome.body.github_status) >= 500))) {
+      // Nothing was decided about the merge and nothing was written: the person's "allow" is not used up, and they can give it again.
       if (await reopenConfirmation(this.deps.db, id)) {
         return { http: 200, body: { ok: true, status: "retry", reason, message: "the merge could not be tried just now; the confirmation is still open, so allow it again in a moment" } };
       }
     }
     const final = reason === "head_moved" ? "stale" : "refused";
-    await finishConfirmation(this.deps.db, id, final, deciderUserId, { reason });
-    return { http: 200, body: { ok: true, status: final, reason, message: outcome.body.message ?? null } };
+    await finishConfirmation(this.deps.db, id, final, deciderUserId, { reason, ...(wrote ? { wrote: true } : {}) });
+    const message = [outcome.body.message, wrote ? "An approval or a merge was already sent to GitHub in this try, so this confirmation is closed; look at the pull request before asking again." : null].filter(Boolean).join(" ");
+    return { http: 200, body: { ok: true, status: final, reason, message: message || null, ...(wrote ? { wrote: true } : {}) } };
   }
 
   /** How the session names its owner in a review's footer; none when the session cannot be read. */
@@ -424,6 +431,7 @@ export class GithubReview {
         if (n <= 0) this.inflight.delete(held); else this.inflight.set(held, n);
       }
     }
+    outcome.wrote = acc.write;
     try {
       await auditFinish(this.deps.db, auditId, {
         repo: acc.repo, pr: acc.pr, headSha: acc.headSha,
@@ -675,9 +683,10 @@ export class GithubReview {
    * open thread, and a change that does not need the acting user's confirmation.
    * A high-risk approval goes through `gh_pr_merge`, which asks them first.
    */
-  private async requireApprovable(ctx: Ctx, ref: PrRef, repo: RepoInfo, pr: PrInfo, change: Change | null): Promise<void> {
+  private async requireApprovable(ctx: Ctx, ref: PrRef, repo: RepoInfo, pr: PrInfo, change: Change | null, flags: string[]): Promise<void> {
     const read = change ?? await this.collectChange(ctx, ref, pr);
-    const risk = assessRisk(this.riskInput(pr, repo, read));
+    // The reviewer's own flags count here as they do at the merge: they can only raise the verdict.
+    const risk = assessRisk(this.riskInput(pr, repo, read, flags));
     ctx.acc.riskReasons = risk.reasons;
     this.requireGreen(await this.readState(ctx, ref, pr, repo), pr.headSha);
     if (risk.level === "high") {

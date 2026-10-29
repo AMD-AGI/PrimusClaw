@@ -152,7 +152,9 @@ export async function reserveWrite(db: Queryable, id: number, headSha: string): 
  * Reviews written in the last window, by one acting user's token (`actorUserId`) or
  * by all of them (null). A review is a (session, head commit) pair that wrote, so a
  * review and the merge that follows it count once. A call in flight counts (see
- * {@link reserveWrite}), the asking call's own row included.
+ * {@link reserveWrite}), the asking call's own row included, and so does a call that
+ * sent a write and was then refused (a merge that approved and found the merge state
+ * not clean): the `write` flag is what says something was sent, not how the call ended.
  * `pairPresent` says whether the pair being asked about is already among them in a
  * row other than `pair.selfId`, so that the second half of a review is never refused
  * for the first half.
@@ -164,7 +166,7 @@ export async function recentWrites(
     `SELECT COUNT(DISTINCT session_id || ':' || head_sha)::int AS n,
             COALESCE(BOOL_OR(session_id = $3 AND head_sha = $4 AND ($5::bigint IS NULL OR id <> $5)), FALSE) AS present
        FROM claw_github_audit
-      WHERE write AND NOT dry_run AND result IN ('ok', 'started')
+      WHERE write AND NOT dry_run
         AND at > NOW() - ($2::bigint * INTERVAL '1 millisecond')
         AND ($1::text IS NULL OR actor_user_id = $1)`,
     [actorUserId, sinceMs, pair?.sessionId ?? null, pair?.headSha ?? null, pair?.selfId ?? null],

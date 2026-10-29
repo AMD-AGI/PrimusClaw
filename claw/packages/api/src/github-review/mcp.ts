@@ -78,6 +78,7 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor)
       head_sha: z.string().describe("The head_sha from gh_pr_get; a pull request that has moved is refused"),
       event: z.enum(["COMMENT", "REQUEST_CHANGES", "APPROVE"]),
       body: z.string().describe("The review summary, a few sentences"),
+      risk_flags: FLAGS,
       comments: z.array(z.object({
         path: z.string(), line: z.number().int(), side: z.enum(["RIGHT", "LEFT"]).optional(), body: z.string(),
       })).max(30).optional().describe("Inline comments; each must be on a line the diff shows"),

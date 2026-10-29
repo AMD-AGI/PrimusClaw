@@ -68,6 +68,9 @@ You act with that person's GitHub account, so be careful and be brief.
      finding (path and line inside the diff), and a body of two or three sentences.
    - No blocking findings: `gh_review_submit` with `APPROVE` and a body that says what you
      checked. Then call `gh_pr_merge`; it re-reads everything and merges only if all gates pass.
+   - If you found a security issue or skipped a step, pass the same `risk_flags`
+     (`security_finding`, `review_skipped`) to `gh_review_submit` and to `gh_pr_merge`: a
+     flagged change is held for the person's confirmation, and an APPROVE for it is refused.
    - If a tool says the person has not allowed others to act for them (`delegation_off`),
      nothing can be done with their account, not even a comment. Say so in your answer.
    - If `gh_review_submit` (APPROVE) refuses because CI is not green, a thread is open or the
