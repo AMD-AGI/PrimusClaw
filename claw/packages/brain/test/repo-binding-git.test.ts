@@ -257,7 +257,7 @@ test("G7 a clone that fails: a reason in the block, no directory, no leftover, n
   assert.equal(again.state, "failed");
 });
 
-test("G7b only this code's own old leftovers are cleared: a marked one an hour old goes, a fresh one and somebody's directory stay", async () => {
+test("G7b only a leftover this code recorded, outside the workspace, is cleared: nothing in the workspace is proof of anything", async () => {
   const s = sandbox("g7b");
   const mk = (name: string, o: { marker: boolean; ageMin: number }) => {
     const dir = path.join(s.root, name);
@@ -268,17 +268,43 @@ test("G7b only this code's own old leftovers are cleared: a marked one an hour o
     fs.utimesSync(dir, t, t);
     return dir;
   };
-  const killed = mk(".claw-clone-AAAAAA", { marker: true, ageMin: 180 });        // ours, from a clone that was killed
-  const fresh = mk(".claw-clone-BBBBBB", { marker: true, ageMin: 5 });           // ours, and may be in use
-  const theirs = mk(".claw-clone-example-repo", { marker: false, ageMin: 500 });   // the shape of ours, but somebody's work
+  const recorded = mk(".claw-clone-AAAAAA", { marker: false, ageMin: 1 });          // left by a killed clone, and written down
+  const lookalike = mk(".claw-clone-BBBBBB", { marker: true, ageMin: 500 });          // the shape and a marker, but nobody recorded it: a restored workspace's own
+  const theirs = mk(".claw-clone-example-repo", { marker: true, ageMin: 500 });
+  fs.writeFileSync(path.join(s.state, ".claw-repo-staging-example-repo"), recorded);
   const b = await bind(s, { url: REPO_URL });
   assert.equal(b.state, "cloned", JSON.stringify(b));
-  assert.equal(fs.existsSync(killed), false, "an old leftover of this code's own is cleared");
-  assert.equal(fs.existsSync(fresh), true, "a recent one is not touched");
-  assert.equal(fs.readFileSync(path.join(theirs, "half", "pack"), "utf8"), "partial\n", "a directory without the marker is never removed, however old");
+  assert.equal(fs.existsSync(recorded), false, "the leftover the record names is cleared");
+  assert.equal(fs.readFileSync(path.join(lookalike, "half", "pack"), "utf8"), "partial\n", "a directory nobody recorded is not removed, marker or no marker, however old");
+  assert.equal(fs.readFileSync(path.join(theirs, "half", "pack"), "utf8"), "partial\n");
   assert.deepEqual(fs.readdirSync(s.root).sort(), [".claw-clone-BBBBBB", ".claw-clone-example-repo", "example-repo"]);
   assert.equal(fs.existsSync(path.join(b.path, "half")), false, "nothing of a leftover ended up in the checkout");
-  assert.equal(fs.existsSync(path.join(b.path, "README.md")), true);
+  assert.equal(fs.readdirSync(s.state).includes(".claw-repo-staging-example-repo"), false, "the record is gone with the staging directory");
+});
+
+test("G7e a record that names anything but a staging directory is not followed: a path of another shape, a link, a missing path", async () => {
+  const victims = [
+    (s: Sandbox) => { const d = path.join(s.root, "example-repo-work"); fs.mkdirSync(d); fs.writeFileSync(path.join(d, "mine.txt"), "x\n"); return d; },
+    (s: Sandbox) => { const d = path.join(world, "outside-dir"); fs.mkdirSync(d, { recursive: true }); fs.writeFileSync(path.join(d, "mine.txt"), "x\n"); return d; },
+    (s: Sandbox) => { const d = path.join(s.root, ".claw-clone-ZZZZ"); fs.mkdirSync(d); fs.writeFileSync(path.join(d, "mine.txt"), "x\n"); return d; },   // five characters: not the shape
+    (s: Sandbox) => {
+      const real = path.join(world, "linked-target"); fs.mkdirSync(real, { recursive: true }); fs.writeFileSync(path.join(real, "mine.txt"), "x\n");
+      const link = path.join(s.root, ".claw-clone-LINKED"); fs.symlinkSync(real, link); return real;
+    },
+  ];
+  for (const [i, victim] of victims.entries()) {
+    const s = sandbox(`g7e${i}`);
+    const target = victim(s);
+    const named = i === 3 ? path.join(s.root, ".claw-clone-LINKED") : target;
+    fs.writeFileSync(path.join(s.state, ".claw-repo-staging-example-repo"), named);
+    const b = await bind(s, { url: REPO_URL });
+    assert.equal(b.state, "cloned", `${i}: ${JSON.stringify(b)}`);
+    assert.equal(fs.readFileSync(path.join(target, "mine.txt"), "utf8"), "x\n", `${i}: ${target} was left alone`);
+  }
+  // A record naming a path that is not there is simply dropped.
+  const s = sandbox("g7e-missing");
+  fs.writeFileSync(path.join(s.state, ".claw-repo-staging-example-repo"), path.join(s.root, ".claw-clone-GONE00"));
+  assert.equal((await bind(s, { url: REPO_URL })).state, "cloned");
 });
 
 test("G7d a clone that fails removes its own staging directory and nothing else", async () => {
@@ -300,11 +326,26 @@ test("G6b a checkout that is a symbolic link, or has a .git that is, is left alo
   fs.symlinkSync(elsewhere, path.join(s.root, "example-repo"));
   const a = await bind(s, { url: REPO_URL });
   assert.equal(a.state, "failed");
-  assert.match(a.failure ?? "", /is a symbolic link, so it was left untouched/);
+  assert.match(a.failure ?? "", /is a symbolic link, or its \.git is a pointer file and not a directory, so it was left untouched/);
   assert.deepEqual(a.instructions, []);
   assert.deepEqual(fs.readdirSync(elsewhere), ["AGENTS.md"], "no .git was attached over there");
   assert.equal(verbs(s).filter(Boolean).length, 0, "no clone, no fetch");
   assert.equal(renderRepoBlock(a).includes("from another place"), false);
+
+  // A work tree whose .git is a pointer file (a linked worktree or a submodule) naming a git directory elsewhere.
+  const s3 = sandbox("g6d");
+  const gitdir = path.join(world, "pointed-at.git");
+  run(world, "init", "-q", "--bare", gitdir);
+  run(gitdir, "remote", "add", "origin", REPO_URL);        // the origin matches the requested one: the case that would fetch
+  fs.mkdirSync(path.join(s3.root, "example-repo"));
+  fs.writeFileSync(path.join(s3.root, "example-repo", ".git"), `gitdir: ${gitdir}\n`);
+  const objectsBefore = fs.readdirSync(path.join(gitdir, "objects")).join();
+  const d = await bind(s3, { url: REPO_URL });
+  assert.equal(d.state, "failed");
+  assert.match(d.failure ?? "", /its \.git is a pointer file and not a directory, so it was left untouched/);
+  assert.equal(verbs(s3).filter(Boolean).length, 0, "no fetch through the pointer");
+  assert.equal(fs.readdirSync(path.join(gitdir, "objects")).join(), objectsBefore);
+  assert.equal(fs.existsSync(path.join(gitdir, "refs", "remotes")), false, "a fetch would have written its remote-tracking refs over there");
 
   // A real directory whose .git is a link to a repository elsewhere.
   const s2 = sandbox("g6c");
