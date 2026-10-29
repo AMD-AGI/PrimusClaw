@@ -6,7 +6,9 @@
  * Disabled by default (HITL_ENABLED=false); when off, all calls auto-allow,
  * except tools a per-server policy (approval-policy.ts) marks as requiring
  * approval: those are always held for a person, and fail closed (denied) when
- * no one answers or there is no channel to ask on.
+ * no one answers or there is no channel to ask on. The one thing that lifts such
+ * a hold is the same policy's explicit `auto_approve` allowlist: a call it lists
+ * runs without a decision and is recorded as `by: "policy"`.
  */
 
 import {
@@ -19,6 +21,7 @@ import type { DecisionDispatcher, NatsDecisionMessage } from "../delivery/decisi
 import type { EventCallback } from "@claw/protocol";
 import pino from "pino";
 import { explainApproval, type ApprovalExplainContext } from "./approval-explain.js";
+import { metrics } from "../infra/metrics.js";
 
 const logger = pino({ name: "hitl" });
 
@@ -26,7 +29,7 @@ const logger = pino({ name: "hitl" });
 export type HitlRefusal = "denied" | "skipped" | "timeout" | "no_channel" | "aborted";
 
 export type HitlResult =
-  | { action: "allow"; input: Record<string, unknown>; by: "auto_allow" | "user" | "timeout" }
+  | { action: "allow"; input: Record<string, unknown>; by: "auto_allow" | "user" | "timeout" | "policy" }
   | { action: "deny" | "skip"; reason: string; by: "user" | "timeout"; cause?: HitlRefusal };
 
 /**
@@ -80,6 +83,15 @@ export interface HitlOptions {
    * `requireApproval`: always asked, never remembered, denied on no answer.
    */
   requireApprovalFor?: (tool: string, input: Record<string, unknown>) => string | null;
+  /**
+   * Of the calls `requireApproval` holds, the allowlist entry (an explicit
+   * `auto_approve`) that lets one run without a decision, or null. Consulted only
+   * for a call `requireApproval` holds and `requireApprovalFor` does not; it
+   * cannot release anything else, and anything but a non-empty string releases
+   * nothing. The entry may come from the request, so it goes in the log line and
+   * never labels a metric.
+   */
+  autoApprovalRule?: (tool: string, input: Record<string, unknown>) => string | null;
 }
 
 export class HitlController {
@@ -108,35 +120,62 @@ export class HitlController {
    * The same question `beforeToolUse` asks itself, so the two cannot drift.
    */
   willAsk(tool: string, input?: Record<string, unknown>): boolean {
-    if (!this.dispatcher) return false;
-    // A policy-held tool is asked about every time: no session-wide allow.
-    if (this.mustAsk(tool, input)) return true;
-    if (!HITL_ENABLED) return false;
-    return !this.autoAllowSet.has(tool) && !this.alwaysAllow.has(tool);
-  }
-
-  private mustAsk(tool: string, input?: Record<string, unknown>): boolean {
-    return this.opts.requireApproval?.(tool) === true || this.holdLabel(tool, input) !== null;
+    return this.assess(tool, input).ask;
   }
 
   private holdLabel(tool: string, input?: Record<string, unknown>): string | null {
     return this.opts.requireApprovalFor?.(tool, input ?? {}) ?? null;
   }
 
+  /**
+   * Everything the controller decides about one call, read from the policy
+   * once: `willAsk` and `beforeToolUse` both answer from this, so they cannot
+   * drift.
+   *
+   * - `label`: the per-call hold (a bash rule), if any.
+   * - `must`: a policy holds the call, so it is always asked and never remembered.
+   * - `rule`: the allowlist entry that releases a server-level hold, else null.
+   *   Only the server-level `requires_approval` hold can be released: a per-call
+   *   hold is never lifted here, and a tool nothing holds is not "approved" by
+   *   this, it simply follows the ordinary HITL settings.
+   * - `ask`: a person has to be waited for. A released call waits for nobody,
+   *   whether or not there is anyone to ask; without a dispatcher there is
+   *   nobody to wait for.
+   */
+  private assess(tool: string, input?: Record<string, unknown>) {
+    const label = this.holdLabel(tool, input);
+    const held = this.opts.requireApproval?.(tool) === true;
+    const must = label !== null || held;
+    const entry = held && label === null ? this.opts.autoApprovalRule?.(tool, input ?? {}) : null;
+    const rule = typeof entry === "string" && entry !== "" ? entry : null;
+    const ask = rule === null && this.dispatcher !== null
+      && (must || (HITL_ENABLED && !this.autoAllowSet.has(tool) && !this.alwaysAllow.has(tool)));
+    return { label, must, rule, ask };
+  }
+
   async beforeToolUse(req: HitlRequest): Promise<HitlResult> {
-    // Decided once: a rule that read the input twice could answer differently.
-    const label = this.holdLabel(req.tool, req.input);
-    const must = label !== null || this.opts.requireApproval?.(req.tool) === true;
+    const { label, must, rule, ask } = this.assess(req.tool, req.input);
+    if (rule !== null) {
+      // The operator's explicit allowlist, not a person's decision: no card, no
+      // wait, and the record says so. The entry is free text a request may have
+      // supplied, so it is logged and never made a metric label (a label per
+      // entry would be a series per request).
+      const result: HitlResult = { action: "allow", input: req.input, by: "policy" };
+      metrics.onHitlPolicyAllow();
+      logger.info({ tool: req.tool, rule, sessionId: req.sessionId }, "hitl.policy_allow");
+      await this.emitDecisionResult(req.actionId, result);
+      return result;
+    }
     if (!this.dispatcher && must) {
       // Nobody could answer, and the policy says a person must. Not an allow.
       return { action: "deny", reason: "approval required but no approval channel is available", by: "timeout", cause: "no_channel" };
     }
-    if (!(must || this.willAsk(req.tool, req.input))) {
+    if (!ask) {
       return { action: "allow", input: req.input, by: "auto_allow" };
     }
 
-    // Non-null by the guard above: willAsk() is false when there is no
-    // dispatcher, because there is then nobody who could answer.
+    // Non-null by the guard above: `ask` is false when there is no dispatcher,
+    // because there is then nobody who could answer.
     const dispatcher = this.dispatcher!;
     // Words for the person who has to decide, within a fixed budget. It runs BEFORE the
     // decision window opens: nobody can answer a request that has not been shown, so
