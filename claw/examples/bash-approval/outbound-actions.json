@@ -54,6 +54,6 @@
   {
     "label": "recursive rm of a path not explicitly under /workspace/ (the working directory is not known)",
     "program": "rm",
-    "args_regex": "^(?=(?:.*\\s)?(?:-[A-Za-z]*[rR][A-Za-z]*|--recursive)(?:\\s|$))(?=(?:.*\\s)?(?!-)(?!(?!\\S*/\\.\\.(?:/|\\s|$))/workspace/(?!\\*)\\S+(?:\\s|$))\\S)"
+    "args_regex": "^(?=(?:[\\s\\S]*\\s)?(?:-[A-Za-z]*[rR][A-Za-z]*|--recursive)(?:\\s|$))(?=(?:[\\s\\S]*\\s)?(?!-)(?!(?!\\S*/\\.\\.(?:/|\\s|$))/workspace/(?!\\*)\\S+(?:\\s|$))\\S|(?:(?!--(?:\\s|$))\\S+\\s+)*--\\s+(?:[\\s\\S]*\\s)?(?!(?!\\S*/\\.\\.(?:/|\\s|$))/workspace/(?!\\*)\\S+(?:\\s|$))\\S)"
   }
 ]

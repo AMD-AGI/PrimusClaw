@@ -96,7 +96,7 @@ is not an `apply`, and `gh -R owner/repo pr create` is a `pr create`.
 Things this pack does not do, beyond the limits above:
 
 - A rule cannot see the working directory, so a recursive `rm` is judged by its text alone: it runs only when
-  every target starts with `/workspace/`. A relative target is held even inside `/workspace`
+  every target starts with `/workspace/` (every word after `--` is a target, whatever it looks like). A relative target is held even inside `/workspace`
   (`rm -rf node_modules`; write `rm -rf /workspace/app/node_modules` to run without asking), because the
   same words after a `cd /` delete something else. A variable inside the path (`/workspace/$X`) is not expanded.
 - A value with a space after git's global `-C` / `-c` (`git -C "my dir" push`) is not seen as a push: the

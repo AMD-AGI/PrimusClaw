@@ -673,6 +673,16 @@ const approvalSummaryModelRefusedTotal = new Counter({
   registers: [registry],
 });
 
+// A call that `requires_approval` held and the same server's `auto_approve` released, so it ran
+// without a decision. No labels, on purpose: neither the tool name (a model can invent any) nor the
+// allowlist entry or server name (a request can carry its own spec) is bounded, and either would
+// mint a series per turn. The entry that released the call is in the `hitl.policy_allow` log line.
+const hitlPolicyAllowTotal = new Counter({
+  name: "claw_hitl_policy_allow_total",
+  help: "Held tool calls released by an auto_approve allowlist.",
+  registers: [registry],
+});
+
 // ─── Keepalive idle reclaim: destroys and the holds that refused them ─
 // A destroy from the jobs probe used to need one reading; now it needs several
 // agreeing ones and a quiet window after any failure. The pair says how often
@@ -942,6 +952,11 @@ export const metrics = {
 
   onApprovalSummaryModelRefused(status: number): void {
     approvalSummaryModelRefusedTotal.inc({ status: String(status) });
+  },
+
+  /** A held call released by `auto_approve`. Unlabelled: see the counter. */
+  onHitlPolicyAllow(): void {
+    hitlPolicyAllowTotal.inc();
   },
 
   // ─── Plan Y v2 checkpoint helpers ────────────────────────────────
