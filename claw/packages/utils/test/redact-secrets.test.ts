@@ -396,3 +396,43 @@ test("the URL-credential pass still finds a scheme wherever a run of scheme char
     ["no scheme user:pass@host", "no scheme user:pass@host"],
   ] as Array<[string, string]>) assert.equal(redactSecrets(input).text, want, input);
 });
+
+// A diff marks each line with a one-character `+`, `-` or space, and `+` and `-` are scheme characters. A lookbehind
+// that only asked "is the previous character a scheme character" read the marker as part of the scheme, so a patch line
+// that BEGINS with a URL was never matched and its password came back in the clear from the changes endpoint.
+test("the URL-credential pass masks a URL at the start of a diff line, after its +/- marker", () => {
+  for (const [input, want] of [
+    ["+postgres://app:S3cr3tPw@db/x", "+postgres://<redacted>@db/x"],
+    ["-postgres://app:S3cr3tPw@db/x", "-postgres://<redacted>@db/x"],
+    ["+git+https://deploy:pw@host/r.git", "+git+https://<redacted>@host/r.git"],
+    ["-git+ssh://deploy:pw@host/r.git", "-git+ssh://<redacted>@host/r.git"],
+    ["+redis://:s3cr3t@cache:6379", "+redis://<redacted>@cache:6379"],
+    // Past the first line, and with other lines of the patch around it.
+    ["@@ -1,2 +1,2 @@\n ctx\n+postgres://app:S3cr3tPw@db/x\n-amqp://u:p@b/y\n+tail", "@@ -1,2 +1,2 @@\n ctx\n+postgres://<redacted>@db/x\n-amqp://<redacted>@b/y\n+tail"],
+    ["+a\r\n+postgres://app:S3cr3tPw@db/x\r\n", "+a\r\n+postgres://<redacted>@db/x\r\n"],
+    // A scheme glued to a word is that whole word's scheme, as before.
+    ["x+postgres://app:S3cr3tPw@db/x", "x+postgres://<redacted>@db/x"],
+    // Nothing to mask is nothing masked.
+    ["+postgres://db/x", "+postgres://db/x"],
+    ["+ordinary line", "+ordinary line"],
+  ] as Array<[string, string]>) assert.equal(redactSecrets(input).text, want, JSON.stringify(input));
+  for (const line of ["+postgres://app:S3cr3tPw@db/x", "-git+https://deploy:pw@host/r.git"]) {
+    assert.equal(scanForSecretLeak(line)?.category, "url_credentials", line);
+  }
+});
+
+test("the marker allowance keeps the URL-credential pass linear on a diff of long lines", () => {
+  const N = 65536;
+  for (const [label, line] of Object.entries({
+    "a long word": "+" + "a".repeat(N),
+    "a long dashed word": "-" + "ab-".repeat(N / 3),
+    "a long scheme-ish run": "+" + "a.".repeat(N / 2),
+    "markers only": "+".repeat(N),
+  })) {
+    const text = `${line}\n`.repeat(4);
+    const t0 = Date.now();
+    redactSecrets(text);
+    const ms = Date.now() - t0;
+    assert.ok(ms < 1000, `${label}: ${ms} ms`);
+  }
+});

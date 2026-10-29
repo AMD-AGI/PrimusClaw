@@ -409,6 +409,11 @@ const MASK_CASES: Array<[string, string, string]> = [
   ["a cookie header value", "+Cookie: sessionid=abc123def456", "abc123def456"],
   ["a vendor token the shape pass knows", "+x = ghp_0123456789abcdefghijklmnopqrstuvwxyzAB", "ghp_0123456789"],
   ["url userinfo", "+url = https://user:pw456789@h.example.invalid/x", "pw456789"],
+  // The line's own marker is not part of the scheme: a URL that begins the line is masked too.
+  ["url userinfo at the start of an added line", "+postgres://app:S3cr3tPw@db.example.invalid/x", "S3cr3tPw"],
+  ["url userinfo at the start of a removed line", "-postgres://app:S3cr3tPw@db.example.invalid/x", "S3cr3tPw"],
+  ["a git+https url at the start of a line", "+git+https://deploy:pw456789@host.example.invalid/r.git", "pw456789"],
+  ["a password-only url at the start of a line", "+redis://:s3cr3t456@cache.example.invalid:6379", "s3cr3t456"],
 ];
 for (const [label, line, secret] of MASK_CASES) {
   test(`patch text: ${label} is masked`, () => {
