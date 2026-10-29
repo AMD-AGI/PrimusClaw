@@ -76,6 +76,27 @@ with `returnImmediately: true` and poll with `GetTask`, or stream.
 task reads `CANCELED` at once and the context takes a new task when the worker
 has wound down.
 
+## The agent card
+
+With the switch on the card describes the one way in (a `chat` skill; a plugin
+agent lists the plugin's own skills), declares its security with the v1.0 shape
+(`securityRequirements: [{"schemes": {"bearer": {"list": []}}}]`) and carries
+`ETag` and `Cache-Control` (the generic card is public for five minutes; a
+plugin card is private and revalidated, and a refusal is never cached). When the
+identity client and `CLAW_IDENTITY_TOKEN_AUTH_ENABLED` are on and an issuer is
+configured, the card also offers `openIdConnectSecurityScheme` with the
+provider's discovery URL.
+
+## Callers authenticated by an identity provider
+
+An access token's `act.sub` (who acted for the user) and `client_id` are
+recorded in the run's `metadata.a2a` beside the caller. They grant nothing: the
+caller is the token's `sub`. Such a caller has no virtual key, so its runs are
+paid for by the deployment's shared LLM key; with the switch on, only the
+clients named in `CLAW_A2A_IDENTITY_CLIENT_IDS` (comma separated) may use A2A,
+and an empty list refuses them all with 403. API keys, cookies and the other
+credentials are not asked.
+
 ## Not supported
 
 Extended agent cards, the REST and gRPC bindings, files as artifacts, and

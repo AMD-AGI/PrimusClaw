@@ -72,9 +72,10 @@ describe("the actor and the client are recorded, and the user is still the user"
     });
   }
 
-  test("what is recorded is bounded", async () => {
+  test("the actor is clipped, the client id is the whole claim", async () => {
     const u = await user(mint({ act: { sub: "a".repeat(500) }, client_id: "c".repeat(500) }));
     assert.equal(u.delegation?.actorSub?.length, 128);
-    assert.equal(u.delegation?.clientId?.length, 128);
+    // An allowlist compares it: two clients whose ids share a prefix are two clients.
+    assert.equal(u.delegation?.clientId, "c".repeat(500));
   });
 });

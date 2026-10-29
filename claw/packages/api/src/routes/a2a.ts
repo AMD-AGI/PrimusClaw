@@ -762,7 +762,7 @@ async function admitAndOpenA2AContextSend(
           context_id: contextId,
           auth_method: auth.authMethod ?? null,
           ...(auth.delegation?.actorSub ? { act_sub: auth.delegation.actorSub } : {}),
-          ...(auth.delegation?.clientId ? { client_id: auth.delegation.clientId } : {}),
+          ...(auth.delegation?.clientId ? { client_id: auth.delegation.clientId.slice(0, 128) } : {}),
         },
       })],
     );
@@ -1650,6 +1650,16 @@ const PUSH_NOTIFICATION_METHODS: Set<string> = new Set([
   A2A_METHODS.DeleteTaskPushNotificationConfig,
 ]);
 
+/**
+ * Whether an identity-provider token's caller is refused A2A under the
+ * context/task model (see identityCallerMayUseA2a). Asked on every path that
+ * runs something, the JSON-RPC endpoint and the gateway's `/invoke` alike.
+ */
+function identityCallerRefused(req: FastifyRequest): boolean {
+  if (!a2aContextTasksEnabled()) return false;
+  return !identityCallerMayUseA2a(getAuthMethod(req), getUser(req)?.delegation?.clientId);
+}
+
 /** The methods of the context/task model; what it does not change is answered as before. */
 async function dispatchContextTasks(
   method: string,
@@ -1720,7 +1730,7 @@ async function dispatch(
     delegation: user?.delegation,
   };
 
-  if (contextTasks && !identityCallerMayUseA2a(auth.authMethod ?? null, auth.delegation?.clientId)) {
+  if (contextTasks && identityCallerRefused(req)) {
     reply.status(403);
     return makeJsonRpcError(id, JSON_RPC_INVALID_REQUEST, "this credential may not use the A2A interface");
   }
@@ -1932,11 +1942,18 @@ export async function registerA2ARoutes(app: FastifyInstance): Promise<void> {
 
   // === SaFE Gateway backward-compatible endpoints ===
   app.post<{ Params: { skill?: string } }>("/invoke/:skill", async (req, reply) => {
+    if (identityCallerRefused(req)) return refuseLegacyInvoke(reply);
     return handleLegacyInvoke(req.body as Record<string, unknown>, req.params.skill, reply);
   });
   app.post("/invoke", async (req, reply) => {
+    if (identityCallerRefused(req)) return refuseLegacyInvoke(reply);
     return handleLegacyInvoke(req.body as Record<string, unknown>, undefined, reply);
   });
+}
+
+function refuseLegacyInvoke(reply: FastifyReply): { success: false; error: string } {
+  reply.status(403);
+  return { success: false, error: "this credential may not use the A2A interface" };
 }
 
 const LEGACY_INVOKE_AUTH: A2AAuthContext = {

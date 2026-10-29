@@ -706,6 +706,42 @@ describe("the A2A context/task model", { skip }, () => {
       assert.equal((await rpc("ListTasks", {})).status, 403, "a token with no client id is nobody's");
     });
 
+    test("the allowlist compares the whole client id, and the record of it is clipped", async () => {
+      method = "identity_token";
+      const long = `svc-${"x".repeat(200)}`;
+      process.env.CLAW_A2A_IDENTITY_CLIENT_IDS = long;
+      who = { ...ALICE, delegation: { clientId: `${long.slice(0, 128)}-another-client` } };
+      assert.equal((await rpc("ListTasks", {})).status, 403, "a client whose id begins with an allowed one is not it");
+      who = { ...ALICE, delegation: { clientId: long } };
+      const r = await send("long id");
+      assert.ok(r.task, r.body);
+      const recorded = (await query("SELECT metadata->'a2a'->>'client_id' AS c FROM claw_tasks WHERE task_id = $1", [r.task.id])).rows[0].c;
+      assert.equal(recorded, long.slice(0, 128));
+    });
+
+    test("the gateway's /invoke is not a way round the list", async () => {
+      const invoke = (url: string) => app.inject({ method: "POST", url, payload: { question: "hello" } });
+      method = "identity_token";
+      who = { ...ALICE, delegation: { clientId: "claw-web" } };
+      for (const configured of [undefined, "dispatron"]) {
+        if (configured === undefined) delete process.env.CLAW_A2A_IDENTITY_CLIENT_IDS; else process.env.CLAW_A2A_IDENTITY_CLIENT_IDS = configured;
+        for (const url of ["/invoke", "/invoke/general"]) {
+          const res = await invoke(url);
+          assert.equal(res.statusCode, 403, `${url} with ${configured}`);
+          assert.equal(JSON.parse(res.body).success, false);
+        }
+      }
+      assert.equal(executes.length, 0, "nothing was run");
+      who = { ...ALICE, delegation: { clientId: "dispatron" } };
+      const ok = await invoke("/invoke");
+      assert.equal(ok.statusCode, 200, ok.body);
+      assert.equal(JSON.parse(ok.body).success, true);
+      // And with the model off nobody is asked.
+      process.env.CLAW_A2A_CONTEXT_TASKS = "0";
+      who = { ...ALICE, delegation: { clientId: "claw-web" } };
+      assert.equal((await invoke("/invoke")).statusCode, 200);
+    });
+
     test("every other credential is judged as it always was", async () => {
       for (const m of ["api_key", "cookie", null]) {
         method = m;
