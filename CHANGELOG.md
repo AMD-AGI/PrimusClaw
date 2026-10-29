@@ -301,6 +301,14 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- A caller authenticated by an identity provider's access token (`CLAW_IDENTITY_TOKEN_AUTH_ENABLED`) now has
+  the platform key and the virtual key SaFE holds for the token's subject, in the SaFE deployment mode. The API asks
+  SaFE's `POST /api/v1/auth/verify`, as it does for a cookie or an `ak-` key, with the token as the credential, only
+  for a token it has already accepted and that carries no actor, and only keys for the token's own `sub` are used.
+  Before, such a caller had no model key (a turn failed with "Could not resolve authentication method"), no key to
+  create a sandbox with, and `GET /v1/me` answered 401. A SaFE that does not accept the token leaves the caller
+  without keys; one that cannot be reached is a 503. A SaFE 5xx is no longer remembered as a failed
+  verification of a cookie or key for 30 seconds. See `claw/docs/identity-client.md`.
 - A sandbox rebuilt from the workspace snapshot is still a git repository. `.git` was on the
   snapshot's exclude list, so after the idle window the files came back and the history did not,
   and every commit that had not been pushed was lost while the conversation still remembered

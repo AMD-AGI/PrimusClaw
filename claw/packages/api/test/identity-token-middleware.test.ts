@@ -22,14 +22,27 @@ const nowSec = () => Math.floor(Date.now() / 1000);
 const es = testKey("ES256", "k-es");
 const log = { info() {}, warn() {}, error() {} };
 
-/** SaFE as far as authentication uses it: `ak-<id>` and `Token=ck-<id>` verify to user `<id>`; the calls are counted. */
-async function startSafe(): Promise<{ url: string; calls: string[]; close(): Promise<void> }> {
+/**
+ * SaFE as far as authentication uses it: `ak-<id>` and `Token=ck-<id>` verify to user `<id>`; the calls are counted.
+ * An access token (`authorization`) is accepted when it names `web-user`, as SaFE's external mode would, and answered
+ * with that user's keys; those questions are counted apart, in `tokenCalls`.
+ */
+async function startSafe(): Promise<{ url: string; calls: string[]; tokenCalls: string[]; close(): Promise<void> }> {
   const calls: string[] = [];
+  const tokenCalls: string[] = [];
   const server = http.createServer((req, res) => {
     let body = "";
     req.on("data", (c) => { body += c; });
     req.on("end", () => {
-      const q = JSON.parse(body || "{}") as { apiKey?: string; cookie?: string };
+      const q = JSON.parse(body || "{}") as { apiKey?: string; cookie?: string; authorization?: string };
+      if (q.authorization !== undefined) {
+        tokenCalls.push(q.authorization);
+        const sub = JSON.parse(Buffer.from((q.authorization.split(".")[1] ?? ""), "base64url").toString("utf8") || "{}").sub;
+        if (sub !== "web-user") { res.writeHead(401).end("{}"); return; }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ data: { id: sub, name: "SaFE's name", roles: ["default", "system-admin"], platformKey: "pk-web-user", virtualKey: "vk-web-user" } }));
+        return;
+      }
       calls.push(q.apiKey ?? q.cookie ?? "?");
       const id = q.apiKey?.startsWith("ak-") ? q.apiKey.slice(3) : /Token=ck-([^;]+)/.exec(q.cookie ?? "")?.[1];
       if (!id || !["u1", "u2"].includes(id)) { res.writeHead(401).end("{}"); return; }
@@ -41,6 +54,7 @@ async function startSafe(): Promise<{ url: string; calls: string[]; close(): Pro
   return {
     url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
     calls,
+    tokenCalls,
     close: async () => { server.closeAllConnections(); await new Promise<void>((r) => server.close(() => r())); },
   };
 }
@@ -100,6 +114,7 @@ describe("an identity access token through the authentication hook", () => {
   beforeEach(() => {
     providerDown = false;
     safe.calls.length = 0;
+    safe.tokenCalls.length = 0;
     identity(true);
     process.env.CLAW_IDENTITY_TOKEN_AUTH_ENABLED = "true";
     delete process.env.CLAW_IDENTITY_TOKEN_INTROSPECT;
@@ -111,11 +126,19 @@ describe("an identity access token through the authentication hook", () => {
   }
   const bearer = (t: string) => ({ authorization: `Bearer ${t}` });
 
-  test("authenticates the request as the token's subject, without asking SaFE", async () => {
-    const r = await whoami(bearer(mint()));
+  test("authenticates the request as the token's subject, with that subject's keys from SaFE and no role from SaFE", async () => {
+    const token = mint();
+    const r = await whoami(bearer(token));
     assert.equal(r.status, 200, JSON.stringify(r.body));
-    assert.deepEqual(r.body.user, { userId: "web-user", userName: "Web User", roles: ["default"], platformKey: "", virtualKey: "" });
-    assert.deepEqual(safe.calls, []);
+    assert.deepEqual(r.body.user, { userId: "web-user", userName: "Web User", roles: ["default"], platformKey: "pk-web-user", virtualKey: "vk-web-user" });
+    assert.deepEqual(safe.calls, [], "SaFE was not asked about a cookie or a key");
+    assert.deepEqual(safe.tokenCalls, [`Bearer ${token}`], "it was asked once, about the token");
+  });
+
+  test("a subject SaFE does not know is the token's user all the same, without keys", async () => {
+    const r = await whoami(bearer(mint({ sub: "stranger" })));
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.deepEqual(r.body.user, { userId: "stranger", userName: "Web User", roles: ["default"], platformKey: "", virtualKey: "" });
   });
 
   test("a token that carries `system-admin` in its roles claim does not make the caller an administrator (mint() carries it)", async () => {
@@ -131,6 +154,7 @@ describe("an identity access token through the authentication hook", () => {
     assert.equal(r.status, 401);
     assert.equal(r.body.error, "authentication_required");
     assert.deepEqual(safe.calls, []);
+    assert.deepEqual(safe.tokenCalls, []);
   });
 
   test("without an identity client the flag alone does nothing", async () => {
@@ -146,6 +170,7 @@ describe("an identity access token through the authentication hook", () => {
     assert.equal(r.status, 401);
     assert.equal(r.body.error, "invalid_token");
     assert.deepEqual(safe.calls, [], "the x-api-key was never tried");
+    assert.deepEqual(safe.tokenCalls, [], "SaFE is not shown a token that did not verify");
   });
 
   test("a token without the API scope is a 403 and nothing else is tried", async () => {
@@ -153,6 +178,7 @@ describe("an identity access token through the authentication hook", () => {
     assert.equal(r.status, 403);
     assert.equal(r.body.error, "insufficient_scope");
     assert.deepEqual(safe.calls, []);
+    assert.deepEqual(safe.tokenCalls, []);
   });
 
   test("a provider that cannot be asked is a 503", async () => {

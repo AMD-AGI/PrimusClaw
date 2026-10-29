@@ -26,12 +26,16 @@ import type { FastifyRequest } from "fastify";
 import Fastify, { type FastifyInstance } from "fastify";
 
 import { FakeIdentity, activeAnswer, signJwt, testKey, type Reply, type TestKey } from "../../utils/test/identity-fake.js";
+import { sendJson, startFakeUpstream } from "./support/fake-upstream.js";
 import type { CredentialOutcome } from "../src/auth/middleware.js";
 import { canAccessSessionAsOperator, getUserRole, isAdmin, isSystemAdmin } from "../src/auth/models.js";
 
 // config.ts reads SAFE_API_URL and AUTH_INTERNAL_TOKEN when it is first imported, and the modules below import it, so the
 // environment the authentication hook needs is set first and they are imported after (a static import would run before this).
-Object.assign(process.env, { SAFE_API_URL: "http://127.0.0.1:9", AUTH_INTERNAL_TOKEN: "t" });
+// SaFE is asked what keys the token's subject has (auth/identity-token.ts); this one is a SaFE that does not know the
+// issuer, which is the deployment the roles below are for, so every caller here is a plain user without keys.
+const safe = await startFakeUpstream((_req, res) => sendJson(res, 401, { code: 401, message: "invalid token" }));
+Object.assign(process.env, { SAFE_API_URL: safe.url, AUTH_INTERNAL_TOKEN: "t" });
 delete process.env.CLAW_DEPLOY_MODE;
 const { ADOPTABLE_ROLES, identityTokenSettings, verifyIdentityAccessToken } = await import("../src/auth/identity-token.js");
 const { startIdentityClient } = await import("../src/auth/identity.js");
@@ -100,7 +104,7 @@ function refused(o: CredentialOutcome) {
 }
 
 before(async () => { fake = await FakeIdentity.start(); });
-after(async () => { await fake.close(); });
+after(async () => { await fake.close(); await safe.close(); });
 beforeEach(() => {
   providerDown = false;
   answer = confirmsWhatItClaims;

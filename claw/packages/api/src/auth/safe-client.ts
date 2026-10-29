@@ -1,6 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import { createHash } from "node:crypto";
 import type { UserInfo } from "./models.js";
 import { safePreview } from "@claw/utils";
 import pino from "pino";
@@ -169,7 +170,7 @@ export class SafeClient {
     return { includePlatformKey: true, includeVirtualKey: true };
   }
 
-  // Cache-lookup + singleflight wrapper shared by the API-key and cookie paths.
+  // Cache-lookup + singleflight wrapper shared by the API-key, cookie and access-token paths.
   // Warm cache hits (positive or negative) return before touching the in-flight
   // map; concurrent misses for the same credential await one shared upstream call.
   private async verify(
@@ -193,7 +194,7 @@ export class SafeClient {
 
   // Single upstream verify call. Timeouts / network faults surface as
   // AuthUpstreamUnreachableError (mapped to 503, NOT negatively cached) so a slow
-  // SaFE never blacklists a valid credential for NEGATIVE_TTL.
+  // SaFE never blacklists a valid credential for NEGATIVE_TTL; a 5xx is not cached either.
   private async doVerify(
     cacheKey: string,
     payload: Record<string, unknown>,
@@ -211,7 +212,7 @@ export class SafeClient {
         const bodySnippet = await readBodySnippet(resp);
         const requestId = pickRequestId(resp);
         log.warn({
-          method: cacheKey.startsWith("cookie:") ? "cookie" : "apiKey",
+          method: cacheKey.startsWith("cookie:") ? "cookie" : cacheKey.startsWith("token:") ? "accessToken" : "apiKey",
           url: `${this.baseUrl}${VERIFY_PATH}`,
           status: resp.status,
           upstreamRequestId: requestId ?? null,
@@ -232,7 +233,12 @@ export class SafeClient {
           err,
         );
       }
-      this.setCache(cacheKey, null, err.message, NEGATIVE_TTL);
+      // A SaFE that answers 5xx has not judged the credential, any more than one that does not
+      // answer: remembering it as a failed verification would turn one error response into half
+      // a minute of "invalid" for a credential that is fine.
+      if (!(err instanceof SafeUpstreamHttpError && err.status >= 500)) {
+        this.setCache(cacheKey, null, err.message, NEGATIVE_TTL);
+      }
       throw err;
     }
   }
@@ -240,6 +246,24 @@ export class SafeClient {
   async verifyApiKey(apiKey: string): Promise<UserInfo> {
     if (!isApiKey(apiKey)) throw new Error("invalid API key format");
     return this.verify(apiKey, { ...this.body(), apiKey }, "invalid or expired API key");
+  }
+
+  /**
+   * An identity provider's access token (a JWT), presented to SaFE the way a cookie or
+   * an `ak-` key is: as the credential of the person it names. SaFE answers with that
+   * person's id and, because both are asked for, their platform key and their LiteLLM
+   * virtual key, which is what every per-user call this API makes for them is built on.
+   *
+   * Only a token SaFE's own authentication accepts gets an answer: the chain in
+   * `auth.authenticators` with an entry for this token's issuer and audience. A SaFE
+   * that does not know the issuer, or a token that carries an actor (RFC 8693 `act`,
+   * which SaFE never hands a key to), is a 401 or 403 here, and the caller has no key.
+   * The cache key is a digest, so the map never holds a token.
+   */
+  async verifyAccessToken(token: string): Promise<UserInfo> {
+    if (!token) throw new Error("empty access token");
+    const digest = createHash("sha256").update(token).digest("hex");
+    return this.verify(`token:${digest}`, { ...this.body(), authorization: `Bearer ${token}` }, "SaFE does not accept this access token");
   }
 
   async verifyCookie(token: string, userType = ""): Promise<UserInfo> {

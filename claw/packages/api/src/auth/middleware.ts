@@ -200,7 +200,7 @@ export function authLogPath(url: string): string {
 }
 
 /** The SaFE calls the credential paths need. Narrowed so tests can pass a stub. */
-export type CredentialVerifier = Pick<SafeClient, "verifyCookie" | "verifyApiKey">;
+export type CredentialVerifier = Pick<SafeClient, "verifyCookie" | "verifyApiKey"> & Partial<Pick<SafeClient, "verifyAccessToken">>;
 
 /** An error response a credential path asks {@link authMiddleware} to send. */
 type AuthErrorSpec = {

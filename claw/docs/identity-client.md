@@ -135,7 +135,46 @@ this use.
 | `sub` | `userId`, exactly as the issuer wrote it. A subject that is missing, blank, padded with whitespace, longer than 128 characters, containing a control character, or equal to an owner the API uses for a caller it did not authenticate (`default`, `anonymous`, `dev-user`) is refused, not repaired |
 | `name`, else `preferred_username`, else `email`, else `sub` | `userName` (at most 128 characters) |
 | (none) | `roles` is `["default"]`, plus a platform administrator role only under the three conditions in "Administrators" below. The token's `roles` and `groups` claims are never copied as they stand, so enabling this credential never makes anyone an administrator by itself |
-| | `platformKey` and `virtualKey` are empty: no session key stands behind a token |
+| | `platformKey` and `virtualKey` are the person's own keys from SaFE in the SaFE deployment mode (see "Keys for a token's user"), and empty otherwise: no session key stands behind a token |
+
+**Keys for a token's user (SaFE deployment mode).** The things a caller does that are
+not reads of this API's own tables run on two keys SaFE holds for them: the platform
+key (an `ak-` key: a sandbox is created with it, and `GET /v1/me`, the image search, the
+sandbox admin page and the other reads of SaFE present it) and the LiteLLM virtual key
+(what a turn's model calls run with). A cookie or an `ak-` key gets both from SaFE's
+verification, `POST /api/v1/auth/verify`, which the API already calls with
+`AUTH_INTERNAL_TOKEN`, and a token gets them the same way: once it has verified here
+(signature, audience, scope, and the provider's answer when that is asked for), the API
+presents it to that endpoint, asking for both keys, and the caller carries what SaFE
+answers. Every per-user call is built on those two, so none of them changes.
+
+| SaFE answers | The caller |
+|---|---|
+| the person's id (the token's `sub`) and keys | has those keys, cached for 5 minutes per token |
+| an id that is not the token's `sub` | no keys: they would be somebody else's |
+| 401 (it does not accept this issuer or audience), another 4xx, or a person with no keys | authenticated, no keys; remembered for 30 seconds so SaFE is not asked on every request. The log says why (`auth.identity_token.no_safe_keys`) |
+| 5xx or no answer | 503 `authentication_service_unavailable`, not remembered: the next request asks again |
+| (no `AUTH_INTERNAL_TOKEN` to ask with) | 500 `authentication_misconfigured`, as for a cookie or a key |
+
+A caller without keys is not refused. They can read and write their own sessions, but a
+turn has no model key (unless Brain has a deployment-wide one, `ANTHROPIC_AUTH_TOKEN`,
+as it always could), a sandbox has no platform key, and `GET /v1/me` is a 401
+`authentication_required`, because there is nothing to present to SaFE.
+
+What SaFE must be told for this to work, and what it does not do:
+
+- SaFE has to accept the token: `auth.mode: external` with an `oidc` authenticator for
+  the issuer whose `audience` is the token's audience (keep a `builtin` entry so cookies
+  and `ak-` keys go on working). A SaFE in its default `builtin` mode does not know the
+  issuer and answers 401 to every token, which leaves every token caller keyless.
+  Give the token and the authenticator one audience that both services accept
+  (`CLAW_IDENTITY_TOKEN_AUDIENCE` here, `audience` there); SaFE needs no name of this API.
+- A delegated token (RFC 8693, with an `act` claim: a service acting for the person) is not
+  shown to SaFE, whose verification refuses to give a key to an actor. Such a caller has
+  no keys.
+- The roles in SaFE's answer are ignored, as the token's are: only
+  `CLAW_IDENTITY_TOKEN_TRUSTED_ROLES` makes a token's caller an administrator.
+- The Kubernetes deployment mode has no SaFE to ask; a token's caller has no keys there.
 
 **Administrators.** A person who signs in through the provider and is an administrator
 there reaches the admin pages (the sandbox admin page, for one) only if the operator
@@ -218,9 +257,8 @@ names differently, and then the setting should stay empty.
   only the two platform administrator roles can be adopted, only when the provider
   confirms them for that token as described under "Administrators", and in the
   Kubernetes deployment mode too. No other provider role is mapped onto anything.
-- Nothing here issues per-user LLM keys: a user authenticated by a token has none,
-  so a deployment that needs a per-user key for model calls has to provide it some
-  other way.
+- Nothing here issues keys. A token's user has the keys SaFE already holds for that
+  person (see "Keys for a token's user"), and none where SaFE does not accept the token.
 - Only the Bearer header is read. A browser download by `?token=` is still an `ak-`
   key only, and a WebSocket upgrade is not covered.
 - Unverified: this was exercised against a stand-in provider on a socket with real
