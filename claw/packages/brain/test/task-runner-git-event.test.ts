@@ -49,6 +49,13 @@ const state = (turn: number): CheckpointState => ({
   rebuilds_used: 0,
 } as CheckpointState);
 
+const finalResult = (turns: number): ExecuteResult => ({
+  finalText: "done",
+  tokenUsage: { input_tokens: 1, output_tokens: 2, cache_read: 0, cache_create: 0 },
+  turns, pendingMemories: [], pendingSkills: [], skillsUsed: {}, errorCount: 0,
+  toolStats: { total_calls: 0, error_calls: 0, by_tool: {} }, elapsedMs: 5,
+} as unknown as ExecuteResult);
+
 function memoryKv(): KV {
   const store = new Map<string, Uint8Array>();
   return {
@@ -120,12 +127,7 @@ async function turnsWith(syncs: Array<GitReport | undefined>, extra: Partial<Sid
         for (let w = 0; w < 200 && finished < i + 1; w++) await new Promise((r) => setTimeout(r, 5));
         assert.equal(finished, i + 1, `sync ${i + 1} never finished`);
       }
-      return {
-        finalText: "done",
-        tokenUsage: { input_tokens: 1, output_tokens: 2, cache_read: 0, cache_create: 0 },
-        turns: syncs.length, pendingMemories: [], pendingSkills: [], skillsUsed: {}, errorCount: 0,
-        toolStats: { total_calls: 0, error_calls: 0, by_tool: {} }, elapsedMs: 5,
-      } as ExecuteResult;
+      return finalResult(syncs.length);
     },
   };
   bindTaskRunnerDeps({
@@ -193,12 +195,7 @@ test("an event the stream refused is tried again at the next sync, not taken as 
         await extras!.onCheckpoint!(state(i + 1));
         for (let w = 0; w < 200 && finished < i + 1; w++) await new Promise((r) => setTimeout(r, 5));
       }
-      return {
-        finalText: "done",
-        tokenUsage: { input_tokens: 1, output_tokens: 2, cache_read: 0, cache_create: 0 },
-        turns: 2, pendingMemories: [], pendingSkills: [], skillsUsed: {}, errorCount: 0,
-        toolStats: { total_calls: 0, error_calls: 0, by_tool: {} }, elapsedMs: 5,
-      } as ExecuteResult;
+      return finalResult(2);
     },
   };
   bindTaskRunnerDeps({
@@ -236,12 +233,7 @@ test("the event failing to go out does not undo a snapshot that was saved", asyn
       await extras!.onCheckpoint!(state(1));
       for (let w = 0; w < 200 && !synced; w++) await new Promise((r) => setTimeout(r, 5));
       await new Promise((r) => setTimeout(r, 50));
-      return {
-        finalText: "done",
-        tokenUsage: { input_tokens: 1, output_tokens: 2, cache_read: 0, cache_create: 0 },
-        turns: 1, pendingMemories: [], pendingSkills: [], skillsUsed: {}, errorCount: 0,
-        toolStats: { total_calls: 0, error_calls: 0, by_tool: {} }, elapsedMs: 5,
-      } as ExecuteResult;
+      return finalResult(1);
     },
   };
   const kv = memoryKv();

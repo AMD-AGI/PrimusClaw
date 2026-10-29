@@ -71,7 +71,7 @@ const { SYNC_STATE_DIR } = await import("../src/workspace/sync-delta.js");
 const { syncWorkspace, classifySyncFailure } = await import("../src/workspace/sync.js");
 const {
   SIGTERM_PROBE_TIMEOUT_SEC, buildGitProbeCommand, buildGitSkeletonCommand, decideGit, ensureGitSkeleton,
-  gitPruneExempt, gitReport, gitSkipNote, parseGitProbe, planGit, restoredGitDirs, unmeasuredGit,
+  gitPruneExempt, gitSkipNote, parseGitProbe, planGit, restoredGitDirs, unmeasuredGit,
 } = await import("../src/workspace/git-dirs.js");
 const { s3Excludes } = await import("../src/workspace/excludes.js");
 import type { HandsClient } from "../src/clients/hands.js";
