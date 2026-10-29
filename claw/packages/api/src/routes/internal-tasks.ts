@@ -28,7 +28,7 @@ import { handleBackendMcpRequest, type JsonRpcRequest } from "../backend-mcp/ind
 import type { BackendMcpCtx } from "../backend-mcp/index.js";
 import { applyAgentDone, type AgentDonePayload } from "../tasks/lifecycle.js";
 import { getTask, transitionStatus } from "../tasks/db.js";
-import { settleFinishedAppRun } from "../tasks/sweeper.js";
+import { markFinishOnlyHandedOver, settleFinishedAppRun } from "../tasks/sweeper.js";
 import { parseSandboxHandle, type SandboxHandle } from "../tasks/sandbox-handle.js";
 import { effectiveRunLeaseTtlMs, MAX_RUN_LEASE_TTL_MS } from "@claw/protocol";
 import { RUN_LEASE_TTL_MS } from "../config.js";
@@ -1256,6 +1256,7 @@ export async function registerInternalTaskRoutes(app: FastifyInstance): Promise<
   registerEventRoute(app);
   registerLeaseRoute(app);
   registerAppFinishDoneRoute(app);
+  registerAppFinishHandOverRoute(app);
   registerBackendMcpRoute(app);
 }
 
@@ -1293,6 +1294,20 @@ function registerAppFinishDoneRoute(app: FastifyInstance): void {
       if (!brainId) return reply.status(400).send({ ok: false, error: "brain_id required" });
       const settled = await settleFinishedAppRun(req.params.taskId, brainId);
       return settled ? { ok: true } : reply.status(409).send({ ok: false, error: "not_settled" });
+    },
+  );
+}
+
+/** Brain → Backend: a finish-only dispatch could not finish and is about to give the lease back. */
+function registerAppFinishHandOverRoute(app: FastifyInstance): void {
+  app.post<{ Params: { taskId: string }; Body: { brain_id?: string } }>(
+    "/v1/internal/tasks/:taskId/app_finish_handover",
+    { preHandler: internalTaskAuth("dispatched") },
+    async (req, reply) => {
+      const brainId = req.body?.brain_id;
+      if (!brainId) return reply.status(400).send({ ok: false, error: "brain_id required" });
+      return (await markFinishOnlyHandedOver(req.params.taskId, brainId))
+        ? { ok: true } : reply.status(409).send({ ok: false, error: "not_holder" });
     },
   );
 }

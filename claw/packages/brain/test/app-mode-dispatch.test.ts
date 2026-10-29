@@ -55,6 +55,7 @@ function harness(runner?: FakeRunner) {
   let runningSignals = 0;
   let finishDone = 0;
   const settles: unknown[][] = [];
+  let handOvers = 0;
   const events: Array<{ type?: string }> = [];
   const kv = { async get() { return null; }, async put() { return 1; }, async delete() {} } as unknown as KV;
   const engine: Engine = {
@@ -64,6 +65,7 @@ function harness(runner?: FakeRunner) {
     postAgentDone: (async (_r: unknown, result: ExecuteResult) => { done.push(result); }) as never,
     postTaskRunning: (async () => { runningSignals++; }) as never,
     postAppFinishDone: (async () => { finishDone++; return true; }) as never,
+    postAppFinishHandOver: (async () => { handOvers++; return true; }) as never,
     settleRunAttempt: (async (...args: unknown[]) => { settles.push(args); }) as never,
     ensureHands: (async () => { sandboxCalls++; throw new Error("no Hands for an app run"); }) as never,
     reapPendingHands: (async () => { reaps++; }) as never,
@@ -86,7 +88,7 @@ function harness(runner?: FakeRunner) {
   return {
     msg, done, acked: () => acked, released: () => released, engineCalls: () => engineCalls,
     sandboxCalls: () => sandboxCalls, reaps: () => reaps, created: () => created,
-    runningSignals: () => runningSignals, finishDone: () => finishDone, events, settles,
+    runningSignals: () => runningSignals, finishDone: () => finishDone, events, settles, handOvers: () => handOvers,
   };
 }
 
@@ -268,6 +270,7 @@ test("A1h finish-only: a finish that keeps failing, or the deadline, reports no 
     assert.equal(h.acked(), 1, "the delivery is settled; the sweeper hands the finish over");
     assert.equal(h.released(), 1);
     const release = h.settles.filter((a) => a[0] === "t-app" && a[3] === true);
+    assert.equal(h.handOvers(), 1, "the hand-over is marked before the lease is given back");
     assert.equal(release.length, 1, "the lease on the task row is given back (release_lease), not left to lapse");
   }
 });

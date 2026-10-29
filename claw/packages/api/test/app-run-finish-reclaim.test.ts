@@ -212,12 +212,22 @@ describe("app run finishing is re-claimed", { skip }, () => {
     assert.equal(after.metadata.app_finish_prior, undefined);
   });
 
-  test("a holder that gave the lease back is handed over at once, not after a lost-lease grace", async () => {
+  test("a hand-over is taken at once; a lease given back by an ordinary nak still waits its grace", async () => {
     await seedFinishOnly({ prior: "cancelled", runState: "finishing", status: "preparing" });
-    // The Brain's release: owner cleared, expiry stamped now.
+    // An ordinary nak: owner cleared, expiry stamped now, no hand-over mark. Its redelivery is coming.
     await sql("UPDATE claw_tasks SET lease_owner = NULL, lease_expires_at = NOW(), completed_at = NULL");
-    assert.equal(await sweeper.requeueUnfinishedAppRuns(), 1);
-    assert.equal((await task()).status, "queued");
+    assert.equal(await sweeper.requeueUnfinishedAppRuns(), 0, "not reopened under its own redelivery");
+    assert.equal((await task()).status, "preparing");
+
+    // The Brain says it cannot finish (the real route, only from the holder), then gives the lease back.
+    await sql("UPDATE claw_tasks SET lease_owner = 'brain-B', lease_expires_at = NOW() + interval '1 minute'");
+    assert.equal(await sweeper.markFinishOnlyHandedOver("app-1", "brain-X"), false, "only the holder");
+    assert.equal(await sweeper.markFinishOnlyHandedOver("app-1", "brain-B"), true);
+    await sql("UPDATE claw_tasks SET lease_owner = NULL, lease_expires_at = NOW()");
+    assert.equal(await sweeper.requeueUnfinishedAppRuns(), 1, "taken at once, no grace");
+    const row = (await sql("SELECT status, metadata FROM claw_tasks"))[0];
+    assert.equal(row.status, "queued");
+    assert.equal(row.metadata.app_finish_handed_over, undefined, "the mark is spent");
     // Control: a dispatched row nobody has taken yet is not touched.
     await sql("UPDATE claw_tasks SET status='preparing', lease_owner = NULL, lease_expires_at = NULL");
     assert.equal(await sweeper.requeueUnfinishedAppRuns(), 0);

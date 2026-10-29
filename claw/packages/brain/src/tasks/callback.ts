@@ -152,6 +152,22 @@ export async function postAppFinishDone(request: ExecuteRequest, brainId: string
   }
 }
 
+/** A finish-only run is giving the lease back because it could not finish: lets the sweeper take it at once. */
+export async function postAppFinishHandOver(request: ExecuteRequest, brainId: string): Promise<boolean> {
+  if (!request.task_id || !request.callback_url) return false;
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (request.backend_internal_token) headers["Authorization"] = `Bearer ${request.backend_internal_token}`;
+  try {
+    const resp = await fetch(`${request.callback_url}/app_finish_handover`, {
+      method: "POST", headers, body: JSON.stringify({ brain_id: brainId }), signal: AbortSignal.timeout(10_000),
+    });
+    return resp.ok;
+  } catch (error) {
+    logger.warn({ taskId: request.task_id, err: error instanceof Error ? error.message : String(error) }, "task.app_finish_handover_failed");
+    return false;
+  }
+}
+
 /**
  * Which attempt of a run is speaking. Neither half is monotone alone: a claim
  * advances `claimCount`, a fat redelivery advances the delivery pair.

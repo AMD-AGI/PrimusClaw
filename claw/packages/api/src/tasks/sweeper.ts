@@ -901,11 +901,13 @@ export async function reapExpiredDoorbellRuns(): Promise<number> {
 }
 
 /**
- * No holder: the lease lapsed more than the grace ago, or its holder gave it back (`lease_owner`
- * cleared, expiry stamped). A row nobody has taken yet has no expiry and is neither.
+ * No holder: the lease lapsed more than the grace ago, or its finish-only holder handed the finish
+ * over (`app_finish_handed_over`, then lease given back). A lease given back by an ordinary nak is
+ * NOT gone: its redelivery is coming and waits the grace like any other. A row nobody has taken yet has no expiry and is neither.
  */
 const LEASE_GONE_SQL = `(lease_expires_at < NOW() - ($1::int * INTERVAL '1 second')
-        OR (lease_owner IS NULL AND lease_expires_at IS NOT NULL)
+        OR (lease_owner IS NULL AND lease_expires_at IS NOT NULL
+            AND metadata->>'app_finish_handed_over' = 'true')
         OR lease_expires_at IS NULL AND lease_owner IS NULL AND status IN ('cancelling','cancelled','failed'))`;
 
 /**
@@ -950,13 +952,29 @@ async function restoreFinishOnlyTasks(extraWhere: string, params: unknown[]): Pr
             SET started_at   = COALESCE((metadata->'app_finish_prior'->>'started_at')::timestamptz, started_at),
                 completed_at = COALESCE((metadata->'app_finish_prior'->>'completed_at')::timestamptz, completed_at),
                 deadline_at  = COALESCE((metadata->'app_finish_prior'->>'deadline_at')::timestamptz, deadline_at),
-                metadata     = metadata - 'app_finish_prior'
+                metadata     = metadata - 'app_finish_prior' - 'app_finish_handed_over'
           WHERE task_id = ANY($1::text[])`,
         [rows.map((r) => r.task_id)],
       );
     }
     return rows;
   });
+}
+
+/**
+ * A finish-only Brain that cannot finish says so before it gives the lease back, which is what
+ * lets the sweeper take the row at once. Only the holder; the mark is cleared by the restore and
+ * by the next reopen.
+ */
+export async function markFinishOnlyHandedOver(taskId: string, brainId: string): Promise<boolean> {
+  const r = await db.query(
+    `UPDATE claw_tasks
+        SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{app_finish_handed_over}', 'true'::jsonb)
+      WHERE task_id = $1 AND mode = 'app' AND lease_owner = $2
+        AND status IN ('preparing','running') AND metadata->'app_finish_prior' IS NOT NULL`,
+    [taskId, brainId],
+  );
+  return (r.rowCount ?? 0) > 0;
 }
 
 /** `app_finish_done`: the finish-only Brain that holds the lease says the run row is `ended`. */
@@ -1052,7 +1070,7 @@ export async function requeueUnfinishedAppRuns(): Promise<number> {
       // second close by a reaper does not overwrite the user's cancel) and put back by `app_finish_done`.
       `failure_reason = NULL, error_message = NULL`,
       `metadata = jsonb_set(
-         COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('app_finish_prior', COALESCE(
+         (COALESCE(metadata, '{}'::jsonb) - 'app_finish_handed_over') || jsonb_build_object('app_finish_prior', COALESCE(
            metadata->'app_finish_prior',
            jsonb_build_object('status', status, 'failure_reason', failure_reason, 'error_message', error_message,
                               'started_at', started_at, 'completed_at', completed_at, 'deadline_at', deadline_at))),

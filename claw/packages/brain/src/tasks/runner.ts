@@ -72,7 +72,7 @@ class FinishOnlyHandOver extends Error {
   constructor(why: string) { super(why); this.name = "FinishOnlyHandOver"; }
 }
 import {
-  AgentDoneDeliveryError, postAgentDone, postAppFinishDone, postRunLease, postTaskRunning, sandboxForLease,
+  AgentDoneDeliveryError, postAgentDone, postAppFinishDone, postAppFinishHandOver, postRunLease, postTaskRunning, sandboxForLease,
   type LeaseRenewal, type RunAttemptToken,
 } from "./callback.js";
 import { taskSubject, type RunTimeReport } from "@claw/protocol";
@@ -469,6 +469,7 @@ export interface TaskRunnerSideEffects {
   postAgentDone: typeof postAgentDone;
   postTaskRunning: typeof postTaskRunning;
   postAppFinishDone: typeof postAppFinishDone;
+  postAppFinishHandOver: typeof postAppFinishHandOver;
   postRunLease: typeof postRunLease;
   settleRunAttempt: typeof settleClaimedRun;
   runScript: typeof runScript;
@@ -504,6 +505,7 @@ const REAL_SIDE_EFFECTS: TaskRunnerSideEffects = {
   postAgentDone,
   postTaskRunning,
   postAppFinishDone,
+  postAppFinishHandOver,
   postRunLease,
   settleRunAttempt: settleClaimedRun,
   runScript,
@@ -4523,6 +4525,7 @@ class TaskRunner {
       await this.releaseAfterTerminal();
       // Give the lease on the task row back, as every other ending does, so the sweeper hands
       // the finish over at once rather than after the lost-lease grace as a lost worker.
+      await fx().postAppFinishHandOver(this.request, BRAIN_ID);
       await this.releaseAttempt().catch((e) => logger.warn({ err: String(e?.message ?? e) }, "task.app_finish_only_release_failed"));
       this.msg.ack();
       return;
