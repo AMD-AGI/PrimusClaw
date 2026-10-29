@@ -295,6 +295,28 @@ test("O4 the title and summary: the tool, the session's name, the rule's label; 
   assert.equal(r.approval.tool.length, 200);
 });
 
+test("O4 no credential reaches any part of the payload: not the title (the session's name), not the summary, not the tool", async () => {
+  await session("s1", { config: { notify_on_finish: true }, name: "GH_TOKEN=abc123xyz deploy" });
+  await subscribe("u1", { types: APPROVALS });
+  const GH = "ghp_0123456789abcdefghijklmnopqrstuvwxyzAB";
+  const secrets = ["abc123xyz", "zzz987", "hunter2", "s3cr3tvalue", GH, "pw4567890"];
+  await deliver("s1", request({
+    tool: "mcp__x__call",
+    input: { note: `see ${GH}`, url: "https://u:pw4567890@h.example.invalid/x" },
+    summary: "Runs deploy with GH_TOKEN=zzz987 and --password hunter2 and Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123",
+    approval_label: "API_KEY=s3cr3tvalue",
+  }));
+  const p = (await rows())[0].payload;
+  const whole = JSON.stringify(p);
+  for (const secret of secrets) assert.equal(whole.includes(secret), false, `${secret} is in ${whole}`);
+  assert.match(p.title, /^Approval needed: mcp__x__call \(GH_TOKEN=<redacted> deploy\)$/);
+  assert.match(p.summary, /^Runs deploy with GH_TOKEN=<redacted> and --password <redacted> and /);
+  // And when the summary is absent the label is used, masked the same way.
+  await h.sql("DELETE FROM claw_notification_outbox");
+  await deliver("s1", request({ tool_use_id: "tu-2", summary: undefined, approval_label: "API_KEY=s3cr3tvalue" }));
+  assert.equal((await rows())[0].payload.summary, "API_KEY=<redacted>");
+});
+
 test("O5 the run notifications are unchanged, and the short-run rule does not apply to an approval", async () => {
   await session("s1", { config: { notify_on_finish: true } });
   await h.sql(

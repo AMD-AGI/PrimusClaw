@@ -128,6 +128,9 @@ const MATRIX: Row[] = [
       "gh pr reopen 12",
       "gh pr update-branch 12",
       "GH_REPO=example-org/example-repo gh pr create --fill",
+      "gh -R example-org/example-repo pr create --fill",
+      "gh --repo example-org/example-repo pr merge 12 --squash",
+      "gh -R example-org/example-repo pr -R example-org/example-repo close 12",
     ],
     allowed: [
       "gh pr view 12",
@@ -138,6 +141,8 @@ const MATRIX: Row[] = [
       "gh pr diff 12",
       "gh pr status",
       "gh pr checkout 12",
+      "gh -R example-org/example-repo pr view 12",
+      "gh --repo example-org/example-repo pr list",
     ] },
   { label: L.release,
     held: [
@@ -161,6 +166,7 @@ const MATRIX: Row[] = [
       "gh api repos/example-org/example-repo/git/refs/heads/x -X DELETE",
       "gh api -XDELETE repos/example-org/example-repo/git/refs/heads/x",
       "gh api --method=post repos/example-org/example-repo/issues",
+      "gh -R example-org/example-repo api -X POST repos/example-org/example-repo/issues",
       "gh api -H 'Accept: application/vnd.github+json' --method DELETE repos/example-org/example-repo/hooks/1",
     ],
     allowed: [
@@ -180,6 +186,7 @@ const MATRIX: Row[] = [
       "gh api --field title=x repos/example-org/example-repo/issues",
       "gh api --raw-field a=b repos/example-org/example-repo/issues",
       "gh api -f title=x repos/example-org/example-repo/issues",
+      "gh -R example-org/example-repo api -f title=x repos/example-org/example-repo/issues",
       "gh api -F n=1 repos/example-org/example-repo/issues",
       "gh api --input - repos/example-org/example-repo/issues",
     ],
@@ -283,6 +290,12 @@ const MATRIX: Row[] = [
       "rm -rf /workspace",
       "rm -rf /workspace/",
       "rm -rf /workspace/*",
+      "rm -rf ../../etc",
+      "rm -rf ../sibling",
+      "rm -rf ..",
+      "rm -r a/../../b",
+      "rm -rf ./build ../x",
+      "cd /workspace/app && rm -rf ../../..",
     ],
     allowed: [
       "rm file.txt",
@@ -293,6 +306,9 @@ const MATRIX: Row[] = [
       "rm -rf /workspace/app/build",
       "rm -rf /workspace/a /workspace/b",
       "rm /etc/hosts.bak",
+      "rm -rf ./build",
+      "rm -rf build/..cache ..hidden",
+      "rm -rf node_modules/.bin",
     ] },
 ];
 
@@ -378,6 +394,8 @@ test("a long adversarial command is matched in linear time, not backtracked fore
     `gh pr ${"-R x ".repeat(15000)}view 1`,
     `gh api ${"-f a=b ".repeat(12000)}-X GET x`,
     `rm -rf ${"a ".repeat(40000)}`,
+    `rm -rf ${"a/".repeat(40000)}`,
+    `gh ${"-R x ".repeat(15000)}pr view 1`,
   ];
   for (const c of cases) {
     const t0 = Date.now();
@@ -385,5 +403,19 @@ test("a long adversarial command is matched in linear time, not backtracked fore
     const ms = Date.now() - t0;
     assert.ok(ms < 1500, `${c.slice(0, 30)}... took ${ms} ms`);
     assert.equal(r, null, c.slice(0, 30));
+  }
+});
+
+test("a long command that IS held is held in linear time too", () => {
+  const p = policy();
+  for (const [c, label] of [
+    [`rm -rf ${"../".repeat(30000)}x`, L.rm],
+    [`rm -rf ${"a ".repeat(20000)}/tmp/x`, L.rm],
+    [`git ${"-C x ".repeat(12000)}push origin main`, L.push],
+    [`gh ${"-R x ".repeat(12000)}pr create`, L.pr],
+  ] as Array<[string, string]>) {
+    const t0 = Date.now();
+    assert.equal(p.check(c), label, c.slice(0, 30));
+    assert.ok(Date.now() - t0 < 1500, `${c.slice(0, 30)}... took ${Date.now() - t0} ms`);
   }
 });

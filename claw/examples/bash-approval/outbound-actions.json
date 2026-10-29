@@ -12,34 +12,34 @@
   {
     "label": "gh pr write (creates, changes or merges a pull request)",
     "program": "gh",
-    "args_regex": "^pr\\s+(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*(?:create|merge|close|review|ready|edit|reopen|comment|update-branch)(?:\\s|$)"
+    "args_regex": "^(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*pr\\s+(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*(?:create|merge|close|review|ready|edit|reopen|comment|update-branch)(?:\\s|$)"
   },
   {
     "label": "gh release write (publishes or changes a release)",
     "program": "gh",
-    "args_regex": "^release\\s+(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*(?:create|edit|delete|upload|delete-asset)(?:\\s|$)"
+    "args_regex": "^(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*release\\s+(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*(?:create|edit|delete|upload|delete-asset)(?:\\s|$)"
   },
   {
     "label": "gh api write (POST / PUT / PATCH / DELETE)",
     "program": "gh",
     "flags": "i",
-    "args_regex": "^api\\s(?:.*\\s)?(?:-X\\s*|--method(?:\\s+|=))(?:POST|PUT|PATCH|DELETE)(?:\\s|$)"
+    "args_regex": "^(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*api\\s(?:.*\\s)?(?:-X\\s*|--method(?:\\s+|=))(?:POST|PUT|PATCH|DELETE)(?:\\s|$)"
   },
   {
     "label": "gh api with fields or a body (an implied POST)",
     "program": "gh",
     "flags": "i",
-    "args_regex": "^api(?!(?:.*\\s)?(?:-X\\s*|--method(?:\\s+|=))GET(?:\\s|$)).*\\s(?:-[fF]|--field|--raw-field|--input)"
+    "args_regex": "^(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*api(?!(?:.*\\s)?(?:-X\\s*|--method(?:\\s+|=))GET(?:\\s|$)).*\\s(?:-[fF]|--field|--raw-field|--input)"
   },
   {
     "label": "gh repo write (creates, changes or deletes a repository)",
     "program": "gh",
-    "args_regex": "^repo\\s+(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*(?:create|delete|edit|rename|archive|unarchive|fork|sync)(?:\\s|$)"
+    "args_regex": "^(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*repo\\s+(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*(?:create|delete|edit|rename|archive|unarchive|fork|sync)(?:\\s|$)"
   },
   {
     "label": "gh workflow write (runs, enables or disables a workflow)",
     "program": "gh",
-    "args_regex": "^workflow\\s+(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*(?:run|enable|disable)(?:\\s|$)"
+    "args_regex": "^(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*workflow\\s+(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*(?:run|enable|disable)(?:\\s|$)"
   },
   {
     "label": "kubectl write (changes cluster state or runs a command in a pod)",
@@ -54,6 +54,6 @@
   {
     "label": "recursive rm outside /workspace (or of /workspace itself)",
     "program": "rm",
-    "args_regex": "^(?=(?:.*\\s)?(?:-[A-Za-z]*[rR][A-Za-z]*|--recursive)(?:\\s|$))(?=(?:.*\\s)?(?:/(?!workspace/(?!(?:\\S*/)?\\.\\.(?:/|\\s|$)|\\s|$|\\*(?:\\s|$)))|~|\\$\\{?HOME))"
+    "args_regex": "^(?=(?:.*\\s)?(?:-[A-Za-z]*[rR][A-Za-z]*|--recursive)(?:\\s|$))(?=(?:.*\\s)?(?:/(?!workspace/(?!(?:\\S*/)?\\.\\.(?:/|\\s|$)|\\s|$|\\*(?:\\s|$)))|~|\\$\\{?HOME|(?:\\S*/)?\\.\\.(?:/\\S*)?(?=\\s|$)))"
   }
 ]

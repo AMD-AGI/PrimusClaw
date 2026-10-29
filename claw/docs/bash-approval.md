@@ -87,11 +87,11 @@ approval request.
 | `gh workflow` | `run`, `enable`, `disable` | `list`, `view` |
 | `kubectl` | `apply`, `delete`, `patch`, `scale`, `exec`, `create`, `replace`, `edit`, `label`, `annotate`, `cordon`, `uncordon`, `drain`, `taint`, `set`, `run`, `cp`, `debug`, `expose`, `autoscale`, `rollout restart/undo/pause/resume` | `get`, `describe`, `logs`, `top`, `config`, `rollout status`, `rollout history` |
 | `helm` | `install`, `upgrade`, `uninstall`, `delete`, `rollback`, `push` | `list`, `template`, `status`, `get`, `lint`, `show`, `repo` |
-| `rm` | a recursive `rm` (`-r`, `-R`, `-rf`, `--recursive`) of an absolute path outside `/workspace`, of `~` or `$HOME`, of `/workspace` itself or `/workspace/*`, or of a path that leaves `/workspace` through `..` | `rm file`, `rm -f /tmp/x.log` (not recursive), `rm -rf node_modules` (relative), `rm -rf /workspace/app/build` |
+| `rm` | a recursive `rm` (`-r`, `-R`, `-rf`, `--recursive`) of an absolute path outside `/workspace`, of `~` or `$HOME`, of `/workspace` itself or `/workspace/*`, or of anything with a `..` segment (the working directory is not known, so a relative path that climbs is held too) | `rm file`, `rm -f /tmp/x.log` (not recursive), `rm -rf node_modules` (relative), `rm -rf /workspace/app/build` |
 
 The program is found through `sudo`, `env X=1`, `timeout`, `nohup`, `bash -c "..."`, `ssh host ...` and
 `kubectl exec -- ...`, and option values are skipped, so a namespace called `apply` in `kubectl -n apply get pods`
-is not an `apply`.
+is not an `apply`, and `gh -R owner/repo pr create` is a `pr create`.
 
 Things this pack does not do, beyond the limits above:
 

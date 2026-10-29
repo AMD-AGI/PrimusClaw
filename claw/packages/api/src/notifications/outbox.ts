@@ -21,7 +21,7 @@ import { NOTIFY_LINK_BASE, NOTIFY_MIN_RUN_SECONDS, NOTIFY_WEBHOOK_ALLOWED_HOSTS 
 import { decryptUserEnvValue } from "../crypto/user-env.js";
 import { db } from "../infra/db.js";
 import { redactPublicJson } from "../events/redaction.js";
-import { approvalTarget } from "./approval-target.js";
+import { approvalTarget, redactCommandSecrets } from "./approval-target.js";
 import { EVENT_ID_HEADER, SIGNATURE_HEADER, TIMESTAMP_HEADER, signPayload } from "./signing.js";
 import { httpTransport, type Transport } from "./transport.js";
 import { guardWebhookUrl, parseAllowedHosts, type Resolver } from "./url-guard.js";
@@ -245,12 +245,14 @@ export async function recordApprovalRequested(
     session_id: sessionId,
     task_id: taskId,
     trigger_id: session.trigger_id ?? null,
-    title: `Approval needed: ${tool}${name ? ` (${name})` : ""}`.slice(0, TITLE_MAX),
-    summary: clipSummary(text(event.summary) || text(event.approval_label)),
+    // Everything a person reads is masked the way the target is: the session's name and the
+    // model-written summary are text somebody else wrote, and either can carry a credential.
+    title: redactCommandSecrets(`Approval needed: ${tool}${name ? ` (${name})` : ""}`).slice(0, TITLE_MAX),
+    summary: clipSummary(redactCommandSecrets(text(event.summary) || text(event.approval_label))),
     link: `${NOTIFY_LINK_BASE}/sessions/${sessionId}`,
     approval: {
       tool_use_id: toolUseId.slice(0, 200),
-      tool: tool.slice(0, 200),
+      tool: redactCommandSecrets(tool).slice(0, 200),
       target: approvalTarget(tool, event.input),
       expires_at: new Date(startedAt + waitWindowMs).toISOString(),
     },
