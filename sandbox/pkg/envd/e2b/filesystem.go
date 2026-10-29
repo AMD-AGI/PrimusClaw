@@ -95,10 +95,11 @@ func SandboxPath(root, rel string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if abs != rootAbs && !strings.HasPrefix(abs, rootAbs+string(filepath.Separator)) {
+	inside, err := filepath.Rel(rootAbs, abs)
+	if err != nil || !filepath.IsLocal(inside) {
 		return "", os.ErrPermission
 	}
-	return abs, nil
+	return filepath.Join(rootAbs, inside), nil
 }
 
 func cleanUserPath(p string) string {
