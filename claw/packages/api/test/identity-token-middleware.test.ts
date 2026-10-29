@@ -114,7 +114,11 @@ describe("an identity access token through the authentication hook", () => {
   test("authenticates the request as the token's subject, without asking SaFE", async () => {
     const r = await whoami(bearer(mint()));
     assert.equal(r.status, 200, JSON.stringify(r.body));
-    assert.deepEqual(r.body.user, { userId: "web-user", userName: "Web User", roles: ["default"], platformKey: "", virtualKey: "" });
+    // The client the token was issued to is recorded beside the user (auth/identity-token.ts); it grants nothing.
+    assert.deepEqual(r.body.user, {
+      userId: "web-user", userName: "Web User", roles: ["default"], platformKey: "", virtualKey: "",
+      delegation: { clientId: "claw-web" },
+    });
     assert.deepEqual(safe.calls, []);
   });
 
