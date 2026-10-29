@@ -4,6 +4,7 @@
 import type { RunTimeReport } from "./run-time.js";
 
 import type { EnvironmentTopology } from "./topology.js";
+import type { SessionRepo } from "./session-repo.js";
 
 /** Conversation message for LLM API. */
 export interface Message {
@@ -334,6 +335,12 @@ export interface ExecuteRequest {
   // ── Execution mode ────────────────────────────────────────────────────
   /** Defaults to "llm" when omitted (legacy chat path). */
   mode?: TaskMode;
+  /**
+   * An app run whose task was already closed (cancelled / failed) while its run row
+   * was left in `finishing`: this dispatch only completes the finishing steps and
+   * reports with `app_finish_done`. It never reports a terminal state of its own.
+   */
+  app_finish_only?: boolean;
 
   // ── Run budget ────────────────────────────────────────────────────────
   /**
@@ -385,6 +392,13 @@ export interface ExecuteRequest {
   llm_api_key?: string;
   /** Per-user environment variables snapshot at message creation time; Brain merges this into the sandbox podSpec.env after CLAW / SaFE / system env layers, validated against `isUserEnvKeyAllowed` on both ends (API write + Brain merge). */
   user_env?: Record<string, string>;
+  /**
+   * The repository this session is bound to (`config.repo` at create time).
+   * Brain makes `/workspace/<name>` a working tree of it when it opens the
+   * sandbox, before the conversation starts. Absent means no binding, and the run
+   * is exactly what it was before the field existed.
+   */
+  repo?: SessionRepo;
   /** Per-session (request-level) environment variables from the POST body; highest precedence in the sandbox env merge chain, validated against `isUserEnvKeyAllowed`. */
   session_env?: Record<string, string>;
   /** Local + marketplace skills available to this task; `files` holds optional sub-files (relative path -> content) under references/, templates/, scripts/, assets/, materialized onto the sandbox fs alongside SKILL.md. */

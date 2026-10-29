@@ -1,0 +1,196 @@
+# SPDX-FileCopyrightText: Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: sandboxgrants.runtime.agent-sandbox.io
+spec:
+  group: runtime.agent-sandbox.io
+  names:
+    kind: SandboxGrant
+    listKind: SandboxGrantList
+    plural: sandboxgrants
+    singular: sandboxgrant
+    shortNames: ["sbg"]
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: State
+          type: string
+          jsonPath: .status.state
+        - name: User
+          type: string
+          jsonPath: .spec.owner.userId
+        - name: Expires
+          type: date
+          jsonPath: .spec.expiresAt
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: ["spec"]
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              required: ["owner", "roles", "expiresAt", "attestation"]
+              properties:
+                owner:
+                  type: object
+                  required: ["userId", "workspaces"]
+                  properties:
+                    userId:
+                      type: string
+                    userName:
+                      type: string
+                    workspaces:
+                      type: array
+                      items:
+                        type: string
+                issuer:
+                  type: object
+                  properties:
+                    sessionId:
+                      type: string
+                    appRunId:
+                      type: string
+                roles:
+                  type: object
+                  additionalProperties:
+                    type: object
+                    required: ["maxSandboxes", "maxGpus"]
+                    properties:
+                      templates:
+                        type: array
+                        items:
+                          type: string
+                      maxSandboxes:
+                        type: integer
+                      maxGpus:
+                        type: integer
+                templates:
+                  type: array
+                  items:
+                    type: object
+                    required: ["name"]
+                    properties:
+                      name:
+                        type: string
+                      perGpuCount:
+                        type: array
+                        items:
+                          type: integer
+                      gpuCounts:
+                        type: array
+                        items:
+                          type: integer
+                      spec:
+                        type: string
+                gpuHoursBudget:
+                  type: number
+                maxSandboxSeconds:
+                  type: integer
+                expiresAt:
+                  type: string
+                  format: date-time
+                attestation:
+                  type: string
+                platformKeyCiphertext:
+                  type: string
+            status:
+              type: object
+              properties:
+                state:
+                  type: string
+                  enum: ["active", "revoked", "expired"]
+                keyHashes:
+                  type: object
+                  additionalProperties:
+                    type: string
+                usage:
+                  type: object
+                  additionalProperties:
+                    type: object
+                    properties:
+                      sandboxes:
+                        type: integer
+                      gpus:
+                        type: integer
+                gpuSeconds:
+                  type: integer
+                sandboxes:
+                  type: array
+                  items:
+                    type: object
+                    required: ["id", "role", "gpus"]
+                    properties:
+                      id:
+                        type: string
+                      role:
+                        type: string
+                      gpus:
+                        type: integer
+                      sessionId:
+                        type: string
+                      startedAt:
+                        type: string
+                        format: date-time
+                      endedAt:
+                        type: string
+                        format: date-time
+                      alias:
+                        type: string
+                      templateID:
+                        type: string
+                      namespace:
+                        type: string
+                      sandboxName:
+                        type: string
+                      state:
+                        type: string
+                      endReason:
+                        type: string
+                      timeoutSec:
+                        type: integer
+                      pendingTimeoutSec:
+                        type: integer
+                      idempotencyKey:
+                        type: string
+                      accessTokenHash:
+                        type: string
+                      accessTokenHashes:
+                        type: array
+                        items:
+                          type: string
+                      nodeName:
+                        type: string
+                      cluster:
+                        type: string
+                      sealed:
+                        type: boolean
+                      inputs:
+                        type: array
+                        items:
+                          type: string
+                      outputs:
+                        type: array
+                        items:
+                          type: string
+                      metadata:
+                        type: object
+                        additionalProperties:
+                          type: string

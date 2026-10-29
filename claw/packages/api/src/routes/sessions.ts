@@ -48,7 +48,7 @@ import { Upload } from "@aws-sdk/lib-storage";
 import { ZipArchive } from "archiver";
 import { Readable, PassThrough } from "node:stream";
 import pino from "pino"
-import { handsSessionKey, putTerminalHold } from "@claw/protocol";
+import { handsSessionKey, parseSessionRepo, putTerminalHold } from "@claw/protocol";
 
 const logger = pino({ name: "sessions" });
 
@@ -1101,6 +1101,15 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         ok: false,
         error: `config.${suppliedReservedKey} is server-managed`,
       });
+    }
+
+    // The repository this session is bound to. Checked here, before any row or
+    // run exists, so a malformed url or branch leaves nothing behind. The value
+    // stays in `config` as the client sent it; every turn reads it from there and
+    // Brain checks it once more before it builds a command out of it.
+    const parsedRepo = parseSessionRepo(sessionConfig.repo);
+    if (!parsedRepo.ok) {
+      return reply.status(400).send({ ok: false, error: parsedRepo.error });
     }
 
     // The model this session's turns ask for. Checked here, before any row or

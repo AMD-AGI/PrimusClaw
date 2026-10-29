@@ -15,6 +15,8 @@ import { cacheUserLlmKey } from "../llm/client.js";
 import { resolveUserLlmKey, usePlatformKeyForLlm } from "../llm/key-source.js";
 import { ByokInvalidKeyError, ByokRateLimitError, ByokUpstreamUnavailableError, verifyByokKey } from "./byok.js";
 import { constantTimeEquals } from "@claw/utils";
+import { verifyConnectorToken } from "./connector-token.js";
+import { recordRequestCredential } from "./request-credential.js";
 import pino from "pino";
 
 const logger = pino({ name: "auth" });
@@ -216,7 +218,7 @@ type AuthErrorSpec = {
  * authenticated by a different header, and would report the wrong failure.
  */
 export type CredentialOutcome =
-  | { status: "verified"; user: UserInfo; method: string }
+  | { status: "verified"; user: UserInfo; method: string; expiresAt?: number }
   | { status: "rejected"; error: AuthErrorSpec }
   | { status: "absent" };
 
@@ -426,7 +428,7 @@ export async function verifyXApiKeyHeader(
  * extraction, profile update, skill evolution, summarization) can call the LLM
  * on this user's behalf. See llm/client.ts for the rationale.
  */
-function grantVerifiedUser(req: FastifyRequest, user: UserInfo, method: string): void {
+function grantVerifiedUser(req: FastifyRequest, user: UserInfo, method: string, expiresAt?: number): void {
   logger.info({
     userId: user.userId, userName: user.userName,
     hasPlatformKey: !!user.platformKey,
@@ -434,6 +436,7 @@ function grantVerifiedUser(req: FastifyRequest, user: UserInfo, method: string):
     method,
   }, "auth.verified");
   (req as any).user = user;
+  recordRequestCredential(req, method, expiresAt);
   const llmKey = resolveUserLlmKey(user);
   if (llmKey) cacheUserLlmKey(user.userId, llmKey, MEMORY_LLM_BASE_URL);
 }
@@ -503,6 +506,19 @@ export async function authMiddleware(req: FastifyRequest, reply: FastifyReply): 
     authorizationScheme: authHeaderRaw.split(" ")[0] || null,
     devAuthBypass: devAuthBypassEnabled(),
   }, "auth.incoming");
+
+  // A connector's access token, on the connector-side routes of remote agents
+  // only (auth/connector-token.ts). First, so that a request which carries one
+  // is judged by it in every mode; it abstains for everything else.
+  const connectorToken = await verifyConnectorToken(req, pathname);
+  if (connectorToken.status === "verified") {
+    grantVerifiedUser(req, connectorToken.user, connectorToken.method, connectorToken.expiresAt);
+    return;
+  }
+  if (connectorToken.status === "rejected") {
+    const { status, legacyError, anthropicType, message } = connectorToken.error;
+    return sendAuthError(req, reply, status, legacyError, anthropicType, message) as any;
+  }
 
   // Dev bypass, gated behind CLAW_INSECURE_DEV_AUTH=1. The dev-user is granted
   // `system-admin` so local harness work (task-dag platform trust, seed

@@ -28,11 +28,21 @@ rules:
     verbs: ["get", "update", "patch"]
   # Runtime CRDs (CodeInterpreter / AgentRuntime)
   - apiGroups: ["runtime.agent-sandbox.io"]
-    resources: ["codeinterpreters", "agentruntimes"]
+    resources: ["codeinterpreters", "agentruntimes", "sandboxgrants"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["runtime.agent-sandbox.io"]
-    resources: ["codeinterpreters/status", "agentruntimes/status"]
+    resources: ["codeinterpreters/status", "agentruntimes/status", "sandboxgrants/status"]
     verbs: ["get", "update", "patch"]
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: ["amd.com"]
+    resources: ["users"]
+    verbs: ["get"]
+  - apiGroups: ["amd.com"]
+    resources: ["workloads"]
+    # update writes spec.timeout. patch is not granted.
+    verbs: ["create", "delete", "get", "list", "update", "watch"]
   - apiGroups: ["runtime.agent-sandbox.io"]
     resources: ["codeinterpreters/finalizers", "agentruntimes/finalizers"]
     verbs: ["update"]
@@ -44,10 +54,6 @@ rules:
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
-  # Secrets (for Router JWT key)
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
   # Leader election
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
@@ -64,6 +70,57 @@ metadata:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
+  name: agent-sandbox-workload-manager
+subjects:
+  - kind: ServiceAccount
+    name: workload-manager
+    namespace: agent-sandbox-system
+---
+# The Router public key that verifies EnvD tokens.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: agent-sandbox-workload-manager
+  namespace: agent-sandbox-system
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["envd-router-identity"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agent-sandbox-workload-manager
+  namespace: agent-sandbox-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: agent-sandbox-workload-manager
+subjects:
+  - kind: ServiceAccount
+    name: workload-manager
+    namespace: agent-sandbox-system
+---
+# SaFE mirrors sandbox signing Secrets from primus-safe into the workspace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: agent-sandbox-workload-manager
+  namespace: primus-safe
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agent-sandbox-workload-manager
+  namespace: primus-safe
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
   name: agent-sandbox-workload-manager
 subjects:
   - kind: ServiceAccount

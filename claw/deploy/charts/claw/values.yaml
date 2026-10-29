@@ -49,6 +49,14 @@ api:
   extraVolumes: []
   extraVolumeMounts: []
   port: 8200
+  # Where a client outside the cluster reaches the API, as CLAW_PUBLIC_URL --
+  # "https://claw.example.com/claw-api". A2A agent cards advertise it, and the
+  # ingress strips its path prefix before the API sees the request, so without
+  # it a card would point clients at a path that 404s. Empty derives
+  # https://<ingress.host><ingress.path> when the ingress is enabled; set it
+  # when the public scheme or host is not what the ingress says (plain http, a
+  # CDN or another gateway in front).
+  publicUrl: ""
   # Browser origins allowed to call the API with credentials, comma-separated
   # and including the scheme -- "https://claw.example.com,https://admin.example.com".
   #
@@ -403,7 +411,8 @@ secret:
   # Set "true" when the sandbox Router runs with --enable-auth (SANDBOX_ROUTER_AUTH_ENABLED).
   # A hosted application's session-level MCP then carries the <SAFE_API_KEY> placeholder as
   # its token, which Brain expands to the session owner's platform key; otherwise it carries
-  # the run's MCP token.
+  # the run's MCP token. The console's admin sandbox lists (GET /v1/admin/sandbox/*) then
+  # present the admin caller's platform key to the Router as a Bearer credential.
   sandboxRouterAuthEnabled: "false"
   clawDeployRoot: ""
   workspacePersistBase: ""
@@ -497,9 +506,10 @@ grantSigningKey:
 # Shared identity client for API and Brain: OIDC discovery and the issuer's JWKS,
 # RFC 7662 token introspection (positive answers cached, inactive ones cached
 # briefly, concurrent lookups of one credential coalesced), and an RFC 8693 token
-# exchange client with a token cache. Off by default, and nothing authenticates
-# through it yet: enabling it builds the client, reads discovery and the key set
-# in the background, and starts exporting the claw_identity_* metrics.
+# exchange client with a token cache. Off by default, and the one request it
+# authenticates is a connector's access token on the remote-agents connector
+# routes: enabling it builds the client, reads discovery and the key set in the
+# background, and starts exporting the claw_identity_* metrics.
 #
 # The client secret is never rendered from values. Create the Secret out of band
 # and name it here; both Deployments read the one key.
