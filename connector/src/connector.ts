@@ -54,6 +54,8 @@ interface IdentityState {
   /** Highest command number fully handled, and the ids of the last few, so a replay after a restart is skipped. */
   cursor: number;
   handled: string[];
+  /** Claw said this row was revoked (401 `revoked`). It stays revoked for good, so the next sign-in registers a new one. */
+  revoked?: boolean;
 }
 
 /**
@@ -128,6 +130,8 @@ export class Connector {
   private ledger: CommandLedger = new CommandLedger();
   private cid = "";
   private revoked = false;
+  /** The connector row itself was revoked (not just the sign-in): recorded in connector.json for `login`. */
+  private rowRevoked = false;
   private paused = false;
   private wakeSender: (() => void) | null = null;
   private wakeHeartbeat: (() => void) | null = null;
@@ -183,7 +187,7 @@ export class Connector {
   }
 
   private writeIdentity(): void {
-    const st: IdentityState = { server: this.d.server, connector_id: this.cid, cursor: this.ledger.cursor, handled: this.ledger.recentIds };
+    const st: IdentityState = { server: this.d.server, connector_id: this.cid, cursor: this.ledger.cursor, handled: this.ledger.recentIds, ...(this.rowRevoked ? { revoked: true } : {}) };
     const file = identityFile(this.d.dirs);
     fs.mkdirSync(this.d.dirs.state, { recursive: true, mode: 0o700 });
     fs.writeFileSync(`${file}.tmp`, JSON.stringify(st), { mode: 0o600 });
@@ -237,7 +241,7 @@ export class Connector {
         await this.firstHeartbeat();
         return "ok";
       } catch (e) {
-        if (this.isRevocation(e)) { await this.onRevoked(errMessage(e)); return "revoked"; }
+        if (this.isRevocation(e)) { await this.onRevoked(e); return "revoked"; }
         if (!isTransient(e)) throw e;
         this.d.log.warn("cannot reach Claw yet; will retry", { error: errMessage(e), attempt });
         await sleep(backoffMs(attempt, this.timing.backoffMinMs, this.timing.backoffMaxMs), this.ctl.signal);
@@ -248,12 +252,23 @@ export class Connector {
 
   // --- revocation and pause ----------------------------------------------------------
 
-  /** The owner disconnected this connector: nothing may keep running. No retry, no reconnect. */
-  private async onRevoked(why: string): Promise<void> {
+  /**
+   * The owner disconnected this connector (or the identity service ended the sign-in): nothing may keep running.
+   * No retry, no reconnect. A revoked connector row is also marked in connector.json, which is how `login` tells a
+   * stored id that is dead from one a new sign-in should keep using; a revoked sign-in leaves the row alive, so it
+   * is not marked. The id itself stays, so a restart cannot register a new connector with the same sign-in and
+   * undo the owner's kill switch.
+   */
+  private async onRevoked(e: unknown): Promise<void> {
     if (this.revoked) return;
     this.revoked = true;
+    const why = errMessage(e);
     this.d.log.error("revoked: stopping every agent", { why });
     this.d.audit.record("revoked", { why });
+    if (e instanceof RevokedError && this.cid) {
+      this.rowRevoked = true;
+      try { this.writeIdentity(); } catch (we) { this.d.log.warn("could not record the revocation in connector.json", { error: errMessage(we) }); }
+    }
     this.ctl.abort();
     this.streamCtl?.abort();
     await this.manager.killAll("revoked");
@@ -312,7 +327,7 @@ export class Connector {
         }
         failures = 0;
       } catch (e) {
-        if (this.isRevocation(e)) return void (await this.onRevoked(errMessage(e)));
+        if (this.isRevocation(e)) return void (await this.onRevoked(e));
         failures++;
         this.d.log.warn("posting events failed; will retry", { error: errMessage(e), pending: this.outbox.size });
         await sleep(backoffMs(failures - 1, this.timing.backoffMinMs, this.timing.backoffMaxMs), this.ctl.signal);
@@ -334,7 +349,7 @@ export class Connector {
         await this.heartbeat();
         this.writeIdentity();
       } catch (e) {
-        if (this.isRevocation(e)) return void (await this.onRevoked(errMessage(e)));
+        if (this.isRevocation(e)) return void (await this.onRevoked(e));
         this.d.log.warn("heartbeat failed", { error: errMessage(e) });
       }
     }
@@ -391,12 +406,12 @@ export class Connector {
           if (f.event === "ready") reconnect = true;
         }
       } catch (e) {
-        if (this.isRevocation(e)) return void (await this.onRevoked(errMessage(e)));
+        if (this.isRevocation(e)) return void (await this.onRevoked(e));
         if (this.ctl.signal.aborted) break;
         if (e instanceof HttpError && e.status === 404) {
           // The stored id is not this account's (or was removed): register again.
           try { await this.identify(true); await this.firstHeartbeat(); } catch (again) {
-            if (this.isRevocation(again)) return void (await this.onRevoked(errMessage(again)));
+            if (this.isRevocation(again)) return void (await this.onRevoked(again));
             this.d.log.warn("could not register again", { error: errMessage(again) });
           }
         }

@@ -126,7 +126,7 @@ All of these run on your machine and fail closed.
 | `status [--json]` | Running or not, paused, signed in, agents, adapter processes. |
 | `pause` / `resume` | Stop every agent within a second and stay offline, or undo that. |
 | `stop` | Stop the running connector and every agent it started. |
-| `logout` | Stop, revoke the sign-in at the identity service, delete it and the stored connector id. |
+| `logout` | Stop, revoke the sign-in at the identity service, delete it. The stored connector id stays, so the next sign-in reuses the same connector. |
 
 **Kill switch.** Every adapter is started in its own process group and recorded (pid and start time) in
 `children.json`. `stop`, `pause`, a revocation and Ctrl-C signal exactly those groups: a process that is not recorded, or

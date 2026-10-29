@@ -105,14 +105,20 @@ async function cmdInit(ctx: Ctx): Promise<number> {
 // --- login -----------------------------------------------------------------------------
 
 /**
- * Forget the connector id this machine registered. An id belongs to the sign-in that registered it, and a revoked
- * one stays revoked for good, so keeping it after a new sign-in (or a sign-out) would send every later `run` back
- * to exit 3. Only `login` and `logout` call this, never a revocation itself: if `run` forgot its id when it was
- * revoked, the next `run` would register a fresh connector with the same still-valid sign-in and the owner's
- * kill switch would be undone.
+ * Forget the stored connector id, but only when `run` recorded that Claw revoked that row. A revoked row stays
+ * revoked for good, so keeping its id would send every later `run` back to exit 3 after a new sign-in. A row that
+ * is alive is kept: every registration takes one of the few connector rows a user may have (and `logout` cannot
+ * delete a row), so a sign-in that registered a new row each time would use them up and then `run` would fail with
+ * `connector_limit_reached`. A re-login as another account is not a problem either way: Claw answers 404 for a
+ * row that is not the caller's and `run` registers anew, and an id stored for another server is never used.
+ * Never called for a revocation itself: if `run` forgot its id when it was revoked, the next `run` would register
+ * a fresh connector with the same still-valid sign-in and the owner's kill switch would be undone.
  */
-function forgetIdentity(ctx: Ctx): void {
-  fs.rmSync(identityFile(ctx.dirs), { force: true });
+function forgetRevokedIdentity(ctx: Ctx): void {
+  const file = identityFile(ctx.dirs);
+  let revoked = false;
+  try { const raw: unknown = JSON.parse(fs.readFileSync(file, "utf8")); revoked = isObject(raw) && raw.revoked === true; } catch { /* none, or unreadable: run starts over from it */ }
+  if (revoked) fs.rmSync(file, { force: true });
 }
 
 async function cmdLogin(args: string[], ctx: Ctx): Promise<number> {
@@ -128,7 +134,7 @@ async function cmdLogin(args: string[], ctx: Ctx): Promise<number> {
   const key = values.key ?? ctx.env.CLAW_CONNECTOR_KEY;
   if (key) {
     saveCredentials(file, { v: 1, server, kind: "key", key, saved_at: new Date().toISOString() });
-    forgetIdentity(ctx);
+    forgetRevokedIdentity(ctx);
     ctx.out("saved a development key. This is for trying things out: a device sign-in is the normal way (omit --key).");
     return EXIT.ok;
   }
@@ -141,7 +147,7 @@ async function cmdLogin(args: string[], ctx: Ctx): Promise<number> {
     v: 1, server, kind: "device", identity_url: identityUrl, client_id: DEFAULT_CLIENT_ID,
     refresh_token: tok.refresh_token, device_name: deviceName, saved_at: new Date().toISOString(),
   });
-  forgetIdentity(ctx);
+  forgetRevokedIdentity(ctx);
   ctx.out(`signed in as ${deviceName}. Next: claw-connector run`);
   return EXIT.ok;
 }
@@ -267,7 +273,7 @@ async function cmdLogout(ctx: Ctx): Promise<number> {
     }
   }
   fs.rmSync(file, { force: true });
-  forgetIdentity(ctx);
+  forgetRevokedIdentity(ctx);
   ctx.out("signed out");
   return EXIT.ok;
 }
