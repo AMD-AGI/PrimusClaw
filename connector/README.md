@@ -39,13 +39,13 @@ If npm answers `EACCES`, point its global prefix at a directory you own (`npm co
 **2. Choose what an agent may touch**
 
 ```sh
-claw-connector init                            # writes ~/.config/claw-connector/agents.toml
-$EDITOR ~/.config/claw-connector/agents.toml   # set roots: the directories an agent may work in
-claw-connector status                          # prints a "problem:" line if the file is wrong
+claw-connector init      # writes agents.toml and prints where: ~/.config/claw-connector/agents.toml unless XDG_CONFIG_HOME or CLAW_CONNECTOR_HOME is set
+claw-connector status    # after you edit it: prints a "problem:" line if the file is wrong
 ```
 
-The sample enables `claude`, working in `~/work`; remove the `#` in front of the `codex` or `cursor` block to offer those too.
-A root that does not exist is reported as a problem, so create it or change it. See [agents.toml](#agentstoml).
+Open the file `init` printed and set `roots`, the directories an agent may work in. The sample enables `claude`, working in `~/work`;
+remove the `#` in front of the `codex` or `cursor` block to offer those too. A root that does not exist is reported as a problem, so
+create it or change it. See [agents.toml](#agentstoml).
 
 **3. Sign in**
 
