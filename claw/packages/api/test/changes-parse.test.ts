@@ -11,7 +11,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  CHANGES_MAX_FILES, CHANGES_MAX_REPOS, LINE_COUNT_CAP, PATCH_MAX_BYTES,
+  CHANGES_MAX_FILES, CHANGES_MAX_REPOS, LINE_COUNT_CAP, PATCH_MAX_BYTES, PATCH_READ_BYTES,
   assembleRepo, isPathUnder, parseNumstatZ, parsePatch, parseStatusZ, parseSummary, pathParam,
   resolvePatchTarget, statusLetter, summaryScript, patchScript, checkPatchParams, maskCredentialText, type KnownFile,
 } from "../src/sessions/changes.js";
@@ -156,9 +156,10 @@ test("summary: a repository with a modified file, a rename, a binary, an additio
 });
 
 test("summary: an untracked file's lines are counted as added, capped", () => {
-  const out = block({ path: "/workspace/r", untracked: [["big.txt", String(LINE_COUNT_CAP * 5)], ["empty.txt", "0"]] });
+  const out = block({ path: "/workspace/r", untracked: [["big.txt", "5000000"], ["empty.txt", "0"]] });
   const files = assembleRepo(parseSummary(out, ROOT).repos[0]).repo.files;
-  assert.deepEqual(files.map((f) => [f.path, f.additions]), [["big.txt", LINE_COUNT_CAP], ["empty.txt", 0]]);
+  assert.deepEqual(files.map((f) => [f.path, f.additions]), [["big.txt", 1_000_000], ["empty.txt", 0]]);
+  assert.equal(LINE_COUNT_CAP, 1_000_000);
 });
 
 test("summary: HEAD and branch edge cases: no commit yet, a detached HEAD, odd text", () => {
@@ -320,6 +321,21 @@ test("pathParam and isPathUnder", () => {
 
 // --- the patch ---------------------------------------------------------------------------
 
+test("patch: truncated also says so when the script stopped reading, even if masking shrank what it read below the limit", () => {
+  // 200 KB of Bearer headers: the script reads PATCH_READ_BYTES of them, masking turns each 38 characters into 18,
+  // so what is left is well under 64 KB, and the diff was still longer than what was read.
+  const raw = "Bearer abcdefghijklmnopqrstuvwxyz0123 ".repeat(5000);
+  const read = raw.slice(0, PATCH_MAX_BYTES + 4096);
+  const cut = parsePatch(`@@PATCH ${b64(read)}\n@@END`)!;
+  assert.ok(Buffer.byteLength(cut.patch) < PATCH_MAX_BYTES, `${Buffer.byteLength(cut.patch)}`);
+  assert.equal(cut.truncated, true);
+  // A diff that fit in what was read, and shrank under masking, is whole.
+  const whole = parsePatch(`@@PATCH ${b64("Bearer abcdefghijklmnopqrstuvwxyz0123 ".repeat(1700))}\n@@END`)!;
+  assert.equal(Buffer.byteLength("Bearer abcdefghijklmnopqrstuvwxyz0123 ".repeat(1700)) < PATCH_MAX_BYTES + 4096, true);
+  assert.equal(whole.truncated, false);
+  assert.equal(PATCH_READ_BYTES, PATCH_MAX_BYTES + 4096);
+});
+
 test("patch: decoded, secrets masked, cut at 64 KB on a character boundary, truncated says so", () => {
   const small = parsePatch(`@@PATCH ${b64("diff --git a/x b/x\n+hello\n")}\n@@END`);
   assert.deepEqual(small, { patch: "diff --git a/x b/x\n+hello\n", truncated: false });
@@ -349,7 +365,7 @@ test("patch: decoded, secrets masked, cut at 64 KB on a character boundary, trun
 test("the summary script takes no input but the root, and is free of what would let git act on the repository's config", () => {
   const s = summaryScript("/workspace");
   assert.ok(s.includes("R='/workspace'"));
-  assert.ok(s.includes("-gt 6000000"), "the default output budget");
+  assert.ok(s.includes("-gt 6000000 ]"), "the default output budget");
   assert.ok(summaryScript("/workspace", 123).includes("-gt 123"));
   assert.ok(s.includes("GIT_OPTIONAL_LOCKS=0"));
   assert.ok(s.includes("GIT_LITERAL_PATHSPECS=1"));

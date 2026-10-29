@@ -32,6 +32,8 @@ export const UNTRACKED_COUNT_MAX_BYTES = 5 * 1024 * 1024;
 export const LINE_COUNT_CAP = 1_000_000;
 /** The largest patch returned, in bytes. */
 export const PATCH_MAX_BYTES = 64 * 1024;
+/** What the patch script reads of a diff before it stops: a little over the limit, so that "more than the limit" is known. */
+export const PATCH_READ_BYTES = PATCH_MAX_BYTES + 4096;
 /** Longest path accepted from a caller. */
 export const PATH_PARAM_MAX = 1024;
 /** What the script reads of git's status / numstat output, per repository and per stream, before it stops. */
@@ -127,7 +129,7 @@ export function patchScript(repoPath: string, filePath: string, untracked: boole
   return [
     ENV,
     untracked ? "" : base,
-    `printf '@@PATCH %s\\n' "$(${diff} 2>/dev/null | head -c ${PATCH_MAX_BYTES + 4096} | base64 -w0)";`,
+    `printf '@@PATCH %s\\n' "$(${diff} 2>/dev/null | head -c ${PATCH_READ_BYTES} | base64 -w0)";`,
     `printf '@@END\\n'`,
   ].filter(Boolean).join(" ");
 }
@@ -468,9 +470,10 @@ export function maskCredentialText(text: string): string {
 export function parsePatch(output: string): { patch: string; truncated: boolean } | null {
   const m = /^@@PATCH (\S*)$/m.exec(output);
   if (!m) return null;
-  const raw = fromB64(m[1]).toString("utf8");
-  const redacted = maskCredentialText(raw);
+  const buf = fromB64(m[1]);
+  const redacted = maskCredentialText(buf.toString("utf8"));
   const clipped = clipBytes(redacted, PATCH_MAX_BYTES);
-  // The script reads a little more than the limit, so "more than the limit" is known.
-  return { patch: clipped.text, truncated: clipped.cut || Buffer.byteLength(raw, "utf8") > PATCH_MAX_BYTES };
+  // Cut here, at the limit; or cut by the script, which reads a little more than the limit and stops:
+  // masking can shrink what was read below the limit, and the diff was still longer than what it read.
+  return { patch: clipped.text, truncated: clipped.cut || buf.length >= PATCH_READ_BYTES };
 }

@@ -72,3 +72,16 @@ test("a sandbox that accepts the connection and then goes quiet is unreachable a
   }
   assert.ok(Date.now() - t0 < 20_000, `took ${Date.now() - t0} ms`);
 });
+
+test("a sandbox that answers the handshake and then dies mid-command is unreachable, and the reason says it was the call", async () => {
+  const dying = await startHandsBashStub({ token: "tok-d", env: { PATH: process.env.PATH ?? "" }, dropToolCalls: true });
+  try {
+    await assert.rejects(
+      () => execInSandbox({ url: dying.url, token: "tok-d" }, "echo x", 5),
+      (err: unknown) => err instanceof SandboxUnreachableError && /^sandbox unreachable: call: /.test((err as Error).message),
+    );
+    assert.equal(dying.commands.length, 0, "the command never ran");
+  } finally {
+    await dying.close();
+  }
+});

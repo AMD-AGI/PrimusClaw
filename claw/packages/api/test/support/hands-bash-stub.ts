@@ -24,11 +24,13 @@ export interface HandsBashStub {
   headers: http.IncomingHttpHeaders[];
   /** How many requests were refused for a missing or wrong token. */
   refused: number;
+  /** While true, a `tools/call` request is answered by dropping the connection (a sandbox that dies mid-command). */
+  dropToolCalls: boolean;
   close(): Promise<void>;
 }
 
-export async function startHandsBashStub(opts: { token: string; env: Record<string, string> }): Promise<HandsBashStub> {
-  const stub: HandsBashStub = { url: "", token: opts.token, commands: [], headers: [], refused: 0, close: async () => {} };
+export async function startHandsBashStub(opts: { token: string; env: Record<string, string>; dropToolCalls?: boolean }): Promise<HandsBashStub> {
+  const stub: HandsBashStub = { url: "", token: opts.token, commands: [], headers: [], refused: 0, dropToolCalls: opts.dropToolCalls === true, close: async () => {} };
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (c) => chunks.push(c));
@@ -41,6 +43,7 @@ export async function startHandsBashStub(opts: { token: string; env: Record<stri
         return;
       }
       if (req.method !== "POST") { res.writeHead(405).end(); return; }
+      if (stub.dropToolCalls && /"method"\s*:\s*"tools\/call"/.test(Buffer.concat(chunks).toString("utf8"))) { req.socket.destroy(); return; }
       const mcp = new McpServer({ name: "hands", version: "1.0.0" });
       mcp.tool("bash", "run a command", { command: z.string(), timeout: z.number().optional() }, async (args: { command: string; timeout?: number }) => {
         stub.commands.push({ command: args.command, timeout: args.timeout });

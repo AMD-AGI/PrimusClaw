@@ -304,8 +304,10 @@ test("C5 a sandbox that is not running is a 409, and nothing is started to look 
     ["no registry entry (reclaimed)", () => { target = null; }],
     ["an address that nobody answers", () => { target = { url: "http://127.0.0.1:9/mcp", token: "t" }; }],
     ["an entry whose token is not the sandbox's (a replaced sandbox)", () => { target = { url: stub.url, token: "stale" }; }],
+    ["a sandbox that answers the handshake and dies mid-command", () => { target = { url: stub.url, token: stub.token }; stub.dropToolCalls = true; }],
   ];
   for (const [label, arrange] of cases) {
+    stub.dropToolCalls = false;
     arrange();
     for (const q of ["", `?repo=${encodeURIComponent(path.join(root, "app"))}&file=README.md`]) {
       const r = await changes(q);
@@ -313,6 +315,7 @@ test("C5 a sandbox that is not running is a 409, and nothing is started to look 
       assert.deepEqual(r.body, { ok: false, error: "sandbox_not_running" }, label);
     }
   }
+  stub.dropToolCalls = false;
   assert.equal(published, 0, "no turn was published");
   assert.equal(dispatched, 0, "no run was opened, no doorbell rung");
   assert.equal(stub.commands.length, 0, "and nothing was run in a sandbox that was not the one named");
