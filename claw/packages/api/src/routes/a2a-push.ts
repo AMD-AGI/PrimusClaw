@@ -36,7 +36,7 @@ import { sanitizeSessionEvent } from "../events/store.js";
 import { httpTransport, type Transport } from "../notifications/transport.js";
 import { guardWebhookUrl, type Resolver } from "../notifications/url-guard.js";
 import { a2aPushAllowedHosts, a2aPushEnabled } from "./a2a-flags.js";
-import { loadLatestRunOfSession, loadRun, loadRunEvents } from "./a2a-store.js";
+import { loadLatestRunOfSession, loadRun, loadRunEvents, loadRunOfSessionMessage } from "./a2a-store.js";
 import {
   mapLiveEvent, newStreamState, statusUpdateEvent, taskOf, textArtifactId,
   type RunRecord,
@@ -234,7 +234,11 @@ export async function recordSessionEvent(
     "SELECT config_id, task_id FROM claw_a2a_push_configs WHERE session_id = $1", [sessionId],
   )).rows as Array<{ config_id: string; task_id: string }>;
   if (!configs.length) return 0;
-  const run = await loadLatestRunOfSession(sessionId);
+  // An event that names its turn belongs to that turn's task, even if the caller
+  // has started the context's next task since the run was closed; one that does not
+  // belongs to the context's newest.
+  const named = typeof event.message_id === "string" ? event.message_id : "";
+  const run = named ? await loadRunOfSessionMessage(sessionId, named) : await loadLatestRunOfSession(sessionId);
   if (!run) return 0;
   const ids = configs.filter((c) => c.task_id === run.taskId).map((c) => c.config_id);
   if (!ids.length) return 0;
@@ -367,7 +371,8 @@ async function sendOne(row: Claimed, deps: DeliveryDeps): Promise<boolean> {
   } catch (err) {
     status = `error:${err instanceof Error ? err.message.slice(0, 80) : "unknown"}`;
   }
-  if (row.expired || status.startsWith("refused:")) {
+  // A name that does not resolve may resolve in a minute; a refused address stays refused.
+  if (row.expired || (status.startsWith("refused:") && status !== "refused:unresolvable_host")) {
     // A refused URL stays refused (the host now resolves somewhere private, or
     // the operator took it off the list), so it is not retried.
     await db.query(

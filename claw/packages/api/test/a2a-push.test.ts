@@ -295,6 +295,19 @@ describe("A2A push notifications", { skip }, () => {
       assert.equal(await push.recordSessionEvent(first.sessionId, { type: "statusUpdate", agentStatus: "running" }, 31), 0);
     });
 
+    test("the final notification of a task is still owed when the context's next task has started", async () => {
+      const first = await liveTask("ctx-quick");
+      await rpc("CreateTaskPushNotificationConfig", { taskId: first.taskId, url: HOOK });
+      await query("UPDATE claw_tasks SET status = 'completed', completed_at = NOW() WHERE task_id = $1", [first.taskId]);
+      await query("UPDATE claw_sessions SET agent_status = 'idle', agent_gate_message_id = NULL WHERE session_id = $1", [first.sessionId]);
+      // The caller saw the end and started the next task before the consumer got to this hook.
+      assert.ok((await send("next", undefined, { contextId: "ctx-quick" })).result);
+      assert.equal(await push.recordSessionEvent(first.sessionId, { type: "exec_complete", message_id: first.messageId }, 91), 1);
+      const [row] = await outbox();
+      assert.equal(row.payload.statusUpdate.taskId, first.taskId);
+      assert.equal(row.payload.statusUpdate.status.state, "TASK_STATE_COMPLETED");
+    });
+
     test("an event of another turn, or of no interest, or with push off, owes nothing", async () => {
       const t = await liveTask();
       await rpc("CreateTaskPushNotificationConfig", { taskId: t.taskId, url: HOOK });
@@ -384,6 +397,21 @@ describe("A2A push notifications", { skip }, () => {
       rows = await outbox();
       assert.equal(rows[0].delivered_at !== null, true);
       assert.equal(rows[1].delivered_at, null);
+    });
+
+    test("a name that does not resolve right now is retried, not dropped", async () => {
+      const t = await liveTask();
+      await storeConfig(t, "https://flaky.example.com/hook");
+      await push.recordSessionEvent(t.sessionId, { type: "statusUpdate", agentStatus: "running" }, 64);
+      const s = sender();
+      const r = await push.deliverDue({ transport: s.transport as never, resolve: async () => { throw new Error("EAI_AGAIN"); } });
+      assert.deepEqual(r, { delivered: 0, failed: 1 });
+      assert.equal(s.requests.length, 0);
+      const [row] = await outbox();
+      assert.equal(row.last_status, "refused:unresolvable_host");
+      assert.equal(row.dropped_at, null, "DNS failing for a moment does not end the notification");
+      await query("UPDATE claw_a2a_push_outbox SET next_attempt_at = NOW()");
+      assert.deepEqual(await push.deliverDue({ transport: s.transport as never, resolve: hostResolver() }), { delivered: 1, failed: 0 });
     });
 
     test("a transport error is a failure like any other", async () => {
