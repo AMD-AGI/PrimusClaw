@@ -75,6 +75,74 @@ describe("agents.toml", () => {
     assert.equal(cfg.agents[0]!.kind, "mine");
   });
 
+  // approval = "never": what each preset turns into, measured on the pinned adapters (see the comment on PRESETS).
+  const approvals: Array<[string, string, string, string[] | null, string[], boolean]> = [
+    // [preset, setting, ask mode, args (null: the preset's own), safe modes, unattended]
+    ["claude", `approval = "never"\n`, "bypassPermissions", null, ["default", "plan"], true],
+    ["codex", `approval = "never"\n`, "agent-full-access", null, ["read-only"], true],
+    ["cursor", `approval = "never"\n`, "agent", ["--force", "acp"], ["ask", "plan"], true],
+    ["claude", `approval = "ask"\n`, "default", null, ["default", "plan"], false],
+    ["codex", `approval = "ask"\n`, "read-only", null, ["read-only"], false],
+    ["cursor", `approval = "ask"\n`, "ask", null, ["ask", "plan"], false],
+    ["cursor", ``, "ask", null, ["ask", "plan"], false],
+  ];
+  for (const [preset, setting, ask, args, safe, unattended] of approvals) {
+    test(`${preset} ${setting.trim() || "with no approval setting"}: starts in ${ask}, ${unattended ? "does not ask" : "asks"}`, () => {
+      const cfg = parseConfig(`[[agents]]\nid = "a"\npreset = "${preset}"\nroots = [${JSON.stringify(root)}]\n${setting}`);
+      const a = cfg.agents[0]!;
+      assert.deepEqual([a.askMode, a.safeModes, a.unattended, a.allowUnsafeModes], [ask, safe, unattended, unattended]);
+      assert.deepEqual(a.args, args ?? PRESETS[preset]!.args);
+      assert.equal(cfg.allowUnsafeModes, false, "the file-level switch is not touched by a per-agent setting");
+    });
+  }
+
+  test("approval is per agent: one agent can run unattended while the next still asks, and the file-level switch is only a default", () => {
+    const two = (top: string, a: string, b: string) => parseConfig(
+      `${top}[[agents]]\nid = "a"\npreset = "claude"\nroots = [${JSON.stringify(root)}]\n${a}\n[[agents]]\nid = "b"\npreset = "cursor"\nroots = [${JSON.stringify(root)}]\n${b}\n`);
+    const row = (c: ReturnType<typeof parseConfig>) => c.agents.map((x) => [x.id, x.allowUnsafeModes, x.unattended]);
+    assert.deepEqual(row(two("", `approval = "never"`, "")), [["a", true, true], ["b", false, false]]);
+    assert.deepEqual(row(two("allow_unsafe_modes = true\n", "", "")), [["a", true, false], ["b", true, false]], "allowed, still starting in the asking mode");
+    assert.deepEqual(row(two("allow_unsafe_modes = true\n", "", `approval = "ask"`)), [["a", true, false], ["b", false, false]], "an agent's own setting beats the default");
+    assert.deepEqual(row(two("", `approval = "never"`, `approval = "never"`)), [["a", true, true], ["b", true, true]]);
+  });
+
+  test("an explicit ask_mode and args win over what approval = never would pick", () => {
+    const cfg = parseConfig(`[[agents]]\nid = "a"\npreset = "cursor"\napproval = "never"\nargs = ["acp"]\nask_mode = "plan2"\nroots = [${JSON.stringify(root)}]\n`);
+    assert.deepEqual([cfg.agents[0]!.askMode, cfg.agents[0]!.args, cfg.agents[0]!.unattended], ["plan2", ["acp"], true]);
+  });
+
+  test("a custom agent can opt out of approval, by naming the mode in which it does not ask", () => {
+    const cfg = parseConfig(`[[agents]]\nid = "x"\ncommand = "my-agent"\napproval = "never"\nask_mode = "yolo"\nsafe_modes = ["careful"]\nroots = [${JSON.stringify(root)}]\n`);
+    assert.deepEqual([cfg.agents[0]!.askMode, cfg.agents[0]!.safeModes, cfg.agents[0]!.unattended], ["yolo", ["careful"], true]);
+  });
+
+  const badApproval: Array<[string, string, RegExp]> = [
+    ["not ask or never", base(`approval = "sometimes"\n`), /approval must be "ask" or "never"/],
+    ["a boolean", base(`approval = true\n`), /approval must be "ask" or "never"/],
+    ["a custom agent with no mode to name", `[[agents]]\nid = "x"\ncommand = "my-agent"\napproval = "never"\nroots = ["${root}"]\n`, /approval = "never" needs ask_mode/],
+    ["never next to a mode that asks", base(`approval = "never"\nask_mode = "default"\n`), /but ask_mode default is a mode that asks/],
+    ["ask next to a mode that does not", base(`approval = "ask"\nask_mode = "bypassPermissions"\n`), /not a mode that asks before every step/],
+    ["a no-approval flag with approval = ask", base(`approval = "ask"\nargs = ["--force", "acp"]\n`), /turns the tool's own approvals off/],
+  ];
+  for (const [name, text, re] of badApproval) {
+    test(`refused: ${name}`, () => {
+      assert.throws(() => parseConfig(text), (e) => e instanceof ConfigError && re.test(e.message), name);
+    });
+  }
+
+  test("an ask_mode the preset does not list as asking needs the owner's opt-in (it used to pass silently), and then is unattended", () => {
+    const text = base(`ask_mode = "bypassPermissions"\n`);
+    assert.throws(() => parseConfig(text), (e) => e instanceof ConfigError && /approval = "never" \(or allow_unsafe_modes = true\)/.test(e.message));
+    const cfg = parseConfig(`allow_unsafe_modes = true\n` + text);
+    assert.deepEqual([cfg.agents[0]!.askMode, cfg.agents[0]!.safeModes, cfg.agents[0]!.unattended], ["bypassPermissions", ["default", "plan"], true]);
+  });
+
+  test("a no-approval flag is accepted for an agent with approval = never, and for none other", () => {
+    const cfg = parseConfig(base(`approval = "never"\nargs = ["acp", "--force"]\n`));
+    assert.deepEqual(cfg.agents[0]!.args, ["acp", "--force"]);
+    assert.throws(() => parseConfig(base(`args = ["acp", "--force"]\n`)), (e) => e instanceof ConfigError);
+  });
+
   test("auto_allow rules of the file and of the agent are both kept; env is carried", () => {
     const cfg = parseConfig(`auto_allow = [{ kind = "edit", path_glob = "docs/**" }]\n` + base(`auto_allow = [{ kind = "read", path_glob = "**" }]\n[agents.env]\nANTHROPIC_MODEL = "opus"\n`));
     assert.deepEqual(cfg.agents[0]!.autoAllow, [{ kind: "edit", pathGlob: "docs/**" }, { kind: "read", pathGlob: "**" }]);

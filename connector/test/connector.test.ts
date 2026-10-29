@@ -201,6 +201,137 @@ describe("the forced ask mode, read back", () => {
   });
 });
 
+describe("no per-step approval, by the owner's opt-in", () => {
+  type Opts = Parameters<typeof Harness.create>[0];
+  /** What the Claude SDK prints when the user's own settings start it in a mode that does not ask. */
+  const WARN = { FAKE_STDERR_WARN: "(node:1) [CLAUDE_SDK_CAN_USE_TOOL_SHADOWED] Warning: canUseTool will not be invoked: permissionMode 'bypassPermissions' auto-approves every tool call" };
+  const NEVER: Opts = { approval: "never", askMode: "bypassPermissions" };
+
+  // Reverse proof: the same adapter warning closes the session unless the owner opted this agent in.
+  const warned: Array<[string, Opts, "closed" | "opened"]> = [
+    ["nothing set", {}, "closed"],
+    ["approval = ask", { approval: "ask" }, "closed"],
+    ["approval = ask, although the file allows unsafe modes", { approval: "ask", topToml: "allow_unsafe_modes = true\n" }, "closed"],
+    ["approval = never on the agent", NEVER, "opened"],
+    ["allow_unsafe_modes = true for the whole file", { topToml: "allow_unsafe_modes = true\n" }, "opened"],
+  ];
+  for (const [who, opts, outcome] of warned) {
+    test(`an adapter that says it will not ask, ${who}: the session is ${outcome}`, async () => {
+      const h = await make({ ...opts, env: WARN });
+      const sid = await h.newSession();
+      const w = await h.claw.until("the warning audited", () => h.audit().find((a) => a.kind === "permission_callback_warning"));
+      assert.equal(w.accepted, outcome === "opened");
+      if (outcome === "closed") {
+        assert.equal(h.claw.eventsOf(sid, "session_closed")[0]!.data.reason, "mode_not_enforced");
+        assert.equal(h.claw.eventsOf(sid, "session_started").length, 0);
+        await h.claw.until("adapter process stopped", () => h.connector.registry.list().length === 0);
+        return;
+      }
+      const started = h.claw.eventsOf(sid, "session_started")[0]!;
+      assert.equal(h.claw.eventsOf(sid, "session_closed").length, 0);
+      assert.equal(started.data.unattended, true, "the warning means this session may not ask: the phone is told");
+      assert.ok(h.audit().some((a) => a.kind === "session_started" && a.unattended === true));
+      h.prompt(sid, "say still working");
+      assert.equal((await h.turnEnd(sid)).data.stopReason, "end_turn");
+    });
+  }
+
+  test("a warning in the middle of a turn is accepted too, the phone is told at once, and the message is not uploaded", async () => {
+    const h = await make({ topToml: "allow_unsafe_modes = true\n" });
+    const sid = await h.newSession();
+    assert.equal(h.claw.eventsOf(sid, "session_started")[0]!.data.unattended, false, "it asks until something says otherwise");
+    h.prompt(sid, "warn");
+    await h.turnEnd(sid);
+    const update = await h.claw.until("mode_update", () => h.claw.eventsOf(sid, "mode_update")[0]);
+    assert.deepEqual([update.data.currentMode, update.data.unattended], ["default", true]);
+    assert.deepEqual(h.messages(sid).filter((m) => /canUseTool/.test(m)), []);
+    assert.equal(h.claw.eventsOf(sid, "session_closed").length, 0);
+    const closed = await make({});
+    const s2 = await closed.newSession();
+    closed.prompt(s2, "warn");
+    assert.equal((await closed.claw.until("closed", () => closed.claw.eventsOf(s2, "session_closed")[0])).data.reason, "mode_not_enforced");
+  });
+
+  test("approval = never: sessions start in the mode that does not ask, say so, and write without a permission request", async () => {
+    const h = await make(NEVER);
+    const sid = await h.newSession();
+    const started = h.claw.eventsOf(sid, "session_started")[0]!;
+    assert.deepEqual([started.data.currentMode, started.data.unattended], ["bypassPermissions", true]);
+    assert.deepEqual(started.data.modes.map((m: any) => [m.id, m.unattended]), [["default", false], ["plan", false], ["acceptEdits", true], ["bypassPermissions", true]], "with the opt-in the phone is offered every mode, and each says whether it asks");
+    h.prompt(sid, "write free.txt no asking");
+    const end = await h.turnEnd(sid);
+    assert.equal(end.data.stopReason, "end_turn");
+    assert.equal(fs.readFileSync(path.join(h.work, "free.txt"), "utf8"), "no asking");
+    assert.equal(h.claw.eventsOf(sid, "permissionRequest").length, 0);
+    assert.equal(h.adapterLog().filter((l) => l.permissionAnswer).length, 0);
+    h.claw.issue("resume", sid);
+    assert.equal((await h.claw.until("resumed", () => h.claw.eventsOf(sid, "session_resumed")[0])).data.unattended, true);
+    assert.ok(h.audit().some((a) => a.kind === "session_started" && a.unattended === true && a.mode === "bypassPermissions"));
+  });
+
+  test("an agent that asks says so: unattended is false everywhere the mode is named", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    assert.equal(h.claw.eventsOf(sid, "session_started")[0]!.data.unattended, false);
+    h.claw.issue("set_mode", sid, { mode_id: "plan" });
+    const upd = await h.claw.until("plan", () => h.claw.eventsOf(sid, "mode_update").find((e) => e.data.currentMode === "plan"));
+    assert.equal(upd.data.unattended, false);
+    h.claw.issue("resume", sid);
+    assert.equal((await h.claw.until("resumed", () => h.claw.eventsOf(sid, "session_resumed")[0])).data.unattended, false);
+  });
+
+  test("the phone switches between asking and not asking only where the owner allowed it, per agent", async () => {
+    const h = await make({ ...NEVER, secondToml: "" });
+    const open = await h.newSession(h.work, undefined, "fake");
+    const shut = await h.newSession(h.work, undefined, "fake2");
+    assert.deepEqual([h.claw.eventsOf(open, "session_started")[0]!.data.unattended, h.claw.eventsOf(shut, "session_started")[0]!.data.unattended], [true, false]);
+    // The opted-in agent: back to asking, then to not asking again; each is read back and says what it is.
+    h.claw.issue("set_mode", open, { mode_id: "default" });
+    h.claw.issue("set_mode", open, { mode_id: "bypassPermissions" });
+    await h.claw.until("both applied", () => h.claw.eventsOf(open, "mode_update").length >= 2);
+    assert.deepEqual(h.claw.eventsOf(open, "mode_update").map((e) => [e.data.currentMode, e.data.unattended]), [["default", false], ["bypassPermissions", true]]);
+    // The other agent: refused, and the adapter was never sent the unsafe mode.
+    h.claw.issue("set_mode", shut, { mode_id: "bypassPermissions" });
+    h.claw.issue("set_mode", shut, { mode_id: "acceptEdits" });
+    await h.claw.until("both refused", () => h.claw.eventsOf(shut, "command_rejected").length >= 2);
+    assert.deepEqual(h.claw.eventsOf(shut, "command_rejected").map((e) => e.data.reason), ["mode_not_allowed", "mode_not_allowed"]);
+    // A new session on it that asks for the unsafe mode is closed, with the reason.
+    const asked = await h.newSession(h.work, "bypassPermissions", "fake2");
+    assert.equal(h.claw.eventsOf(asked, "session_closed")[0]!.data.reason, "mode_not_allowed");
+    h.prompt(shut, "write blocked.txt");
+    await h.permission(shut);
+    assert.equal(fileExists(path.join(h.work, "blocked.txt")), false, "still asking");
+  });
+
+  test("the heartbeat says per agent whether sessions start without asking and whether a phone may switch to that", async () => {
+    const h = await make({ ...NEVER, secondToml: "" });
+    await h.online();
+    const caps = Object.fromEntries(h.claw.heartbeats.at(-1).agents.map((a: any) => [a.agent_id, a.capabilities]));
+    assert.deepEqual([caps.fake.unattended, caps.fake.unattended_allowed, caps.fake.ask_mode], [true, true, "bypassPermissions"]);
+    assert.deepEqual([caps.fake2.unattended, caps.fake2.unattended_allowed, caps.fake2.ask_mode], [false, false, "default"]);
+    const allowed = await make({ topToml: "allow_unsafe_modes = true\n" });
+    await allowed.online();
+    const c = allowed.claw.heartbeats.at(-1).agents[0].capabilities;
+    assert.deepEqual([c.unattended, c.unattended_allowed], [false, true], "allowed, but it still starts asking");
+  });
+
+  test("a mode the owner no longer allows is not brought back by a restart", async () => {
+    const h = await make(NEVER);
+    const sid = await h.newSession();
+    assert.equal(h.claw.eventsOf(sid, "session_started")[0]!.data.currentMode, "bypassPermissions");
+    await h.stop();
+    // The owner goes back to asking: the same home, the same session, the file now says approval = ask.
+    const h2 = await make({ home: path.dirname(h.dirs.state), work: h.work, claw: h.claw, approval: "ask" });
+    await h2.online();
+    h2.prompt(sid, "write back.txt");
+    const perm = await h2.permission(sid);
+    assert.equal(fileExists(path.join(h.work, "back.txt")), false, "asked first");
+    h2.decide(sid, perm.data.actionId, "allow-once");
+    await h2.turnEnd(sid);
+    assert.ok(h2.audit().some((a) => a.kind === "mode_reverted" && a.reason === "no_longer_allowed" && a.from === "bypassPermissions" && a.to === "default"));
+  });
+});
+
 describe("permissions", () => {
   const ids = (e: { data: any }) => e.data.options.map((o: any) => o.optionId);
   test("the card carries the adapter's own option ids and kinds, allow_always included; allow-once writes the file", async () => {

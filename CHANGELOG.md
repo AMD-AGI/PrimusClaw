@@ -118,6 +118,14 @@ record it.
   confirmed is not opened); the adapter's own permission options passed through verbatim, including
   allow-always; credentials masked before upload; a local audit log; a kill switch that stops only the
   process groups it started. See `connector/README.md`.
+- `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
+  `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
+  starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
+  Cursor `agent` with `--force`), lets the phone select such modes for that agent only, and accepts the adapter's
+  "will not ask" warning (audited) instead of refusing the session, which is still refused without the opt-in. Agents
+  report `unattended` and `unattended_allowed` in their capabilities, and `session_started`, `session_resumed` and
+  `mode_update` carry `unattended`, so a client always shows how a session runs; the API relays them unchanged. See
+  `connector/README.md` and `claw/docs/remote-agents.md`.
 - A shared identity client in `@claw/utils`, built by API and Brain when
   `IDENTITY_CLIENT_ENABLED=true` (off by default; it authenticates a request only through the access-token
   credentials above, a connector's and an identity provider's). It does OIDC
