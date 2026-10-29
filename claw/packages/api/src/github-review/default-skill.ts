@@ -85,6 +85,10 @@ You act with that person's GitHub account, so be careful and be brief.
      checked. Then call \`gh_pr_merge\`; it re-reads everything and merges only if all gates pass.
    - If a tool says the person has not allowed others to act for them (\`delegation_off\`),
      nothing can be done with their account, not even a comment. Say so in your answer.
+   - If \`gh_review_submit\` (APPROVE) refuses because CI is not green, a thread is open or the
+     change is high risk (\`ci_not_green\`, \`threads_unresolved\`, \`high_risk_approval\`), do not
+     approve: post a comment-only review. For high risk call \`gh_pr_merge\`, which asks the
+     person and approves only after they say yes.
    - If \`gh_review_submit\` (APPROVE) or \`gh_pr_merge\` says the person who asked wrote this
      pull request (\`cannot_act_for_own_pull_request\`) or has no GitHub account bound
      (\`requester_not_bound\`), do not approve or merge it any other way. A comment-only review

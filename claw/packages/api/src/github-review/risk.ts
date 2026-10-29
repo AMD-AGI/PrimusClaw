@@ -16,10 +16,12 @@
  */
 import { addedLines, removedLines } from "./diff.js";
 
-export const RISK_RULE_PACK_VERSION = "2026-10-29.1";
+export const RISK_RULE_PACK_VERSION = "2026-10-29.2";
 
 export interface RiskFile {
   path: string;
+  /** Where a renamed or copied file came from; the path rules read it as well as `path`. */
+  previousPath?: string;
   status: string;
   additions: number;
   deletions: number;
@@ -209,11 +211,15 @@ function assess(input: RiskInput): string[] {
   const removedInTests = new Map<string, number>();
   for (const f of input.files) {
     const p = f.path;
-    if (GOVERNANCE_PATHS.some((re) => re.test(p))) add(`CI, workflow or governance file changed: ${p}`);
-    if (AUTH_PATH.test(p)) add(`authentication or security code changed: ${p}`);
-    if (SECRET_PATHS.some((re) => re.test(p))) add(`secret-handling file changed: ${p}`);
-    if (RELEASE_PATHS.some((re) => re.test(p))) add(`release or deployment file changed: ${p}`);
-    if (extraGlobs.some((re) => re.test(p))) add(`path the repository marks high risk: ${p}`);
+    // A file moved out of a protected path is a change to that path, as much as one moved in or edited in place.
+    for (const q of f.previousPath && f.previousPath !== p ? [p, f.previousPath] : [p]) {
+      const where = q === p ? p : `${q} (moved to ${p})`;
+      if (GOVERNANCE_PATHS.some((re) => re.test(q))) add(`CI, workflow or governance file changed: ${where}`);
+      if (AUTH_PATH.test(q)) add(`authentication or security code changed: ${where}`);
+      if (SECRET_PATHS.some((re) => re.test(q))) add(`secret-handling file changed: ${where}`);
+      if (RELEASE_PATHS.some((re) => re.test(q))) add(`release or deployment file changed: ${where}`);
+      if (extraGlobs.some((re) => re.test(q))) add(`path the repository marks high risk: ${where}`);
+    }
     if (LOCKS.test(p) && !input.files.some((o) => MANIFESTS.test(o.path))) add(`a lock file changed without its manifest: ${p}`);
     if (f.status === "removed") {
       removedFiles += 1;

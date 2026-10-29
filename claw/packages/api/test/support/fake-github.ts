@@ -26,6 +26,8 @@ export interface FakeFile {
   additions: number;
   deletions: number;
   patch?: string;
+  /** Where a renamed or copied file came from. */
+  previous_filename?: string;
 }
 
 export class FakeGithub {

@@ -70,7 +70,8 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor)
   );
   mcp.tool(
     "gh_review_submit",
-    "Post one review on the pinned head commit, with inline comments. APPROVE is refused when the user who asked wrote the pull request. "
+    "Post one review on the pinned head commit, with inline comments. APPROVE is refused when the user who asked wrote the pull request, "
+    + "and unless CI is green, no thread is open and the change is not high risk (then use gh_pr_merge, which asks the acting user). "
     + "The review is signed with the acting user's account and a footer that names who asked.",
     {
       pr: z.string().describe(PR_HELP),

@@ -20,6 +20,7 @@
  */
 import assert from "node:assert/strict";
 import test, { after, afterEach, beforeEach, describe } from "node:test";
+import { IdentityCredentialRefusedError } from "@claw/utils";
 import { HEAD } from "./support/fake-github.js";
 import { PR, REQUESTER_TOKEN, TOKEN, closeShared, credential, directory, down, expired, reviewEnv, unbound, type ReviewEnv } from "./support/review-env.js";
 
@@ -405,6 +406,43 @@ describe("M the merge gates", () => {
   });
 });
 
+describe("M2 what the change was, and what an approval may do", () => {
+  test("M9 a file moved out of .github/workflows is read as a change to it: the merge is held, not made", async () => {
+    e.gh.files = [{ filename: "docs/old/security-scan.yml", previous_filename: ".github/workflows/security-scan.yml", status: "renamed", additions: 0, deletions: 0 }];
+    e.gh.pr.changed_files = 1;
+    const risk = (await e.service.assessPr(e.actor, { pr: PR })).body.risk as any;
+    assert.equal(risk.level, "high");
+    assert.match(risk.reasons.join(), /workflow/);
+    const o = await merge();
+    assert.equal(o.body.status, "confirmation_required");
+    assert.equal(e.gh.writes.length, 0);
+  });
+
+  test("M10 an APPROVE is posted only where gh_pr_merge would not stop (CI green, no open thread, not high risk); comments are not held to that", async () => {
+    e.gh.checkRuns = [{ name: "test", status: "completed", conclusion: "failure" }];
+    assert.equal(reason(await submit({ event: "APPROVE" })), "ci_not_green");
+    e.gh.checkRuns = [{ name: "test", status: "completed", conclusion: "success" }];
+    e.gh.graphql.reviewThreads = { totalCount: 1, nodes: [{ isResolved: false }] };
+    assert.equal(reason(await submit({ event: "APPROVE" })), "threads_unresolved");
+    e.gh.graphql.reviewThreads = { totalCount: 0, nodes: [] };
+    e.gh.files = [{ filename: ".github/workflows/ci.yml", status: "modified", additions: 2, deletions: 0, patch: "@@ -1,2 +1,4 @@\n a\n+b\n+c\n d" }];
+    e.gh.pr.changed_files = 1;
+    const high = await submit({ event: "APPROVE" });
+    assert.equal(reason(high), "high_risk_approval");
+    assert.match(String((high.body.reasons as string[]).join()), /workflow/);
+    assert.equal(e.gh.writes.length, 0);
+    // None of that holds back a comment or a request for changes, and a clean pull request is approved.
+    e.gh.checkRuns = [{ name: "test", status: "completed", conclusion: "failure" }];
+    assert.equal((await submit({ event: "COMMENT" })).isError, false);
+    assert.equal((await submit({ event: "REQUEST_CHANGES", body: "Please fix." })).isError, false);
+    e.gh.checkRuns = [{ name: "test", status: "completed", conclusion: "success" }];
+    e.gh.files = [{ filename: "src/app.ts", status: "modified", additions: 3, deletions: 1, patch: "@@ -1,4 +1,6 @@\n a\n-b\n+b2\n+c\n+d\n e\n f" }];
+    const ok = await submit({ event: "APPROVE" });
+    assert.equal(ok.body.status, "submitted", ok.text);
+    assert.deepEqual(e.gh.writes.map((w) => w.body.event), ["COMMENT", "REQUEST_CHANGES", "APPROVE"]);
+  });
+});
+
 describe("C high risk waits for the acting user", () => {
   beforeEach(() => {
     allowed();
@@ -513,6 +551,72 @@ describe("C high risk waits for the acting user", () => {
     assert.equal(e.gh.writes.length, 0);
   });
 
+  test("C11 a refusal that will pass (the identity service down, GitHub failing) keeps the acting user's allow: it can be given again; one about the merge itself is final", async () => {
+    const id = String((await merge()).body.confirmation_id);
+    const up = e.identity.answer;
+    e.identity.answer = down;
+    const r = await e.service.decide("u-bob", id, "allow");
+    assert.equal(r.body.status, "retry");
+    assert.equal(r.body.reason, "identity_unavailable");
+    assert.equal((await pending())[0]?.status, "pending");
+    e.identity.answer = up;
+    e.gh.mergeStatus = 502;
+    const again = await e.service.decide("u-bob", id, "allow");
+    assert.equal(again.body.status, "retry", JSON.stringify(again.body));
+    assert.equal(again.body.reason, "github_error");
+    assert.equal((await pending())[0]?.status, "pending");
+    e.gh.mergeStatus = 200;
+    const done = await e.service.decide("u-bob", id, "allow");
+    assert.equal(done.body.status, "merged", JSON.stringify(done.body));
+    assert.equal((await pending())[0]?.status, "merged");
+    // The approval was posted once, not once per try.
+    assert.equal(e.gh.writes.filter((w) => w.method === "POST").length, 1);
+  });
+
+  test("C12 a confirmation is given back only while it can still be answered: not after it ran out, not when a newer one for the commit stands", async () => {
+    const { claimConfirmation, reopenConfirmation } = await import("../src/github-review/store.js");
+    const first = String((await merge()).body.confirmation_id);
+    assert.equal((await claimConfirmation(e.db, first, "u-bob")).ok, true);
+    const second = String((await merge()).body.confirmation_id);
+    assert.notEqual(second, first);
+    assert.equal(await reopenConfirmation(e.db, first), false);
+    assert.equal((await e.sql("SELECT status FROM claw_github_confirmations WHERE confirmation_id = $1", [first]))[0]?.status, "merging");
+    await e.sql("UPDATE claw_github_confirmations SET status = 'pending' WHERE confirmation_id = $1", [second]);
+    await e.sql("UPDATE claw_github_confirmations SET status = 'refused' WHERE confirmation_id = $1", [second]);
+    await e.sql("UPDATE claw_github_confirmations SET expires_at = NOW() - INTERVAL '1 minute' WHERE confirmation_id = $1", [first]);
+    assert.equal(await reopenConfirmation(e.db, first), false);
+  });
+
+  test("C13 the confirmed merge is still the requester's: the audit row and the approval's footer name who asked", async () => {
+    await e.sql("INSERT INTO claw_sessions (session_id, user_id, config) VALUES ('s-1', 'u-alice', $1::jsonb)", [JSON.stringify({ acting_as: "u-bob", acting_as_requester: "Alice A" })]);
+    const id = String((await merge()).body.confirmation_id);
+    assert.equal((await e.service.decide("u-bob", id, "allow")).body.status, "merged");
+    const rows = await e.sql("SELECT requester_user_id, actor_user_id, tool FROM claw_github_audit ORDER BY id");
+    assert.deepEqual(rows.at(-1), { requester_user_id: "u-alice", actor_user_id: "u-bob", tool: "gh_pr_merge" });
+    assert.equal(rows.some((r) => r.requester_user_id === "u-bob"), false);
+    assert.match(String(e.gh.writes[0]?.body.body), /requested by Alice A\)/);
+    // The requester's lookup for the rule on their own pull request was theirs, not the acting user's.
+    assert.equal(e.resolved.some((r) => r.userId === "u-alice" && r.purpose === "gh_pr_merge:requester_login"), true);
+  });
+
+  test("C14 at the moment of the merge the rule on the requester's own pull request still applies to the requester, not to the acting user", async () => {
+    const id = String((await merge()).body.confirmation_id);
+    e.identity.answer = directory({ delegation: true }, { providerLogin: "alice" });
+    const r = await e.service.decide("u-bob", id, "allow");
+    assert.equal(r.body.status, "refused");
+    assert.equal(r.body.reason, "cannot_act_for_own_pull_request");
+    assert.equal(e.gh.writes.length, 0);
+  });
+
+  test("C15 the acting user's own allow to one held merge stands even if they have since switched delegation off", async () => {
+    const id = String((await merge()).body.confirmation_id);
+    denied();
+    const r = await e.service.decide("u-bob", id, "allow");
+    assert.equal(r.body.status, "merged", JSON.stringify(r.body));
+    // But the switch still holds for a new request.
+    assert.equal(reason(await merge()), "delegation_off");
+  });
+
   test("C8 the confirmations a caller can list are their own: the actor's and the requester's, not anyone else's", async () => {
     const { listConfirmations } = await import("../src/github-review/store.js");
     await merge();
@@ -560,6 +664,27 @@ describe("W dry run, limits and the budget", () => {
     assert.equal(reason(await submit({ head_sha: headFor(5) })), "rate_limited");
   });
 
+  test("W6 reviews that start together are counted together: with one left in the hour, ten at once do not all pass", async () => {
+    e = await reviewEnv({ CLAW_GITHUB_REVIEWS_PER_HOUR: "1", CLAW_GITHUB_CONCURRENT_PER_REPO: "10" });
+    const run = (n: number) => e.service.submitReview({ ...e.actor, sessionId: `s-${n}` }, { pr: PR, head_sha: HEAD, event: "COMMENT", body: `Review ${n}.` });
+    const outcomes = await Promise.all([1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(run));
+    assert.equal(e.gh.writes.length <= 1, true, `${e.gh.writes.length} writes`);
+    assert.equal(outcomes.filter((o) => o.body.status === "submitted").length, e.gh.writes.length);
+    assert.equal(outcomes.every((o) => o.body.status === "submitted" || reason(o) === "rate_limited"), true);
+  });
+
+  test("W7 a write is on the audit row, with its head commit, while it is being made, and a call that never finishes its row still counts", async () => {
+    let during: Promise<Record<string, any>[]> | null = null;
+    e.gh.onReview = () => { during = e.sql("SELECT write, head_sha, result FROM claw_github_audit"); };
+    assert.equal((await submit()).body.status, "submitted");
+    assert.deepEqual(await during, [{ write: true, head_sha: HEAD, result: "started" }]);
+    const { recentWrites } = await import("../src/github-review/store.js");
+    // The finish never happens: put the row back as the call left it.
+    await e.sql("UPDATE claw_github_audit SET result = 'started'");
+    assert.equal((await recentWrites(e.db, null, 3_600_000)).count, 1);
+    assert.equal((await recentWrites(e.db, "u-bob", 3_600_000)).count, 1);
+  });
+
   test("W3 a session has a budget of GitHub requests; past it every tool is refused", async () => {
     e = await reviewEnv({ CLAW_GITHUB_REQUESTS_PER_SESSION: "5" });
     assert.equal((await get()).isError, false);
@@ -605,6 +730,20 @@ describe("I the identity provider and the audit trail", () => {
     assert.equal(reason(await get()), "credential_expired");
     assert.equal(seen.size, 3);
     assert.equal(e.gh.calls.length, 0);
+  });
+
+  test("I6 only the provider's own not_bound is 'not bound': any other refusal is an outage, and says so, for the acting user and for the requester", async () => {
+    const acting = directory({ delegation: true });
+    for (const [code, status] of [["not_found", 404], ["invalid_request", 400], ["unauthorized_client", 401]] as const) {
+      const fail = (): Promise<never> => Promise.reject(new IdentityCredentialRefusedError(code, status));
+      e.identity.answer = fail;
+      assert.equal(reason(await get()), "identity_unavailable", code);
+      e.identity.answer = (req) => (req.userId === "u-alice" ? fail() : acting(req));
+      assert.equal(reason(await submit({ event: "APPROVE" })), "identity_unavailable", code);
+    }
+    e.identity.answer = unbound;
+    assert.equal(reason(await get()), "actor_not_bound");
+    assert.equal(e.gh.writes.length, 0);
   });
 
   test("I2 the identity provider is told who the credential is for, who asked, and which tool wants it", async () => {

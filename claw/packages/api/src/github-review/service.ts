@@ -32,7 +32,7 @@ import { SANDBOX_RECIPE_USAGE, buildSandboxRecipe } from "./sandbox-recipe.js";
 import { GITHUB_PROVIDER, type GithubReviewSettings } from "./settings.js";
 import {
   auditFinish, auditStart, claimConfirmation, finishConfirmation, getConfirmation, openConfirmation,
-  countPendingConfirmations, recentWrites, sessionRequestCount, type Confirmation, type Queryable,
+  countPendingConfirmations, recentWrites, reopenConfirmation, reserveWrite, sessionRequestCount, type Confirmation, type Queryable,
 } from "./store.js";
 
 const logger = pino({ name: "github-review" });
@@ -79,9 +79,13 @@ interface Ctx {
   client: GithubClient;
   /** The tool being run, as the identity provider's audit trail names the purpose of a lookup. */
   tool: string;
+  /** This call's row in the audit log. */
+  auditId: number;
   acc: {
     repo?: string; pr?: number; headSha?: string; riskReasons?: string[]; confirmationId?: string;
     write: boolean; dryRun: boolean; reviewPath?: string; reviewPathReason?: string;
+    /** The audit row has been marked as a write, so it already counts against the limits. */
+    reserved?: boolean;
   };
 }
 
@@ -135,6 +139,8 @@ const MAX_BODY_CHARS = 20_000;
 const DEFAULT_DIFF_CHARS = 80_000;
 const MAX_DIFF_CHARS = 200_000;
 const HOUR_MS = 3_600_000;
+/** Refusals that say nothing about the merge itself and will pass: the acting user's "allow" is kept for another try. */
+const TRANSIENT_REFUSALS = new Set(["too_many_concurrent", "rate_limited", "github_rate_limited", "identity_unavailable", "audit_unavailable"]);
 /** Merges waiting for one acting user's decision; past it nothing new is asked of them. */
 const MAX_PENDING_CONFIRMATIONS = 10;
 
@@ -270,6 +276,7 @@ export class GithubReview {
       const change = needsChange ? await this.collectChange(ctx, ref, pr) : null;
       const comments = this.checkComments(args.comments, change);
       await this.requireEvent(ctx, repo, pr, event as "COMMENT" | "REQUEST_CHANGES" | "APPROVE");
+      if (event === "APPROVE") await this.requireApprovable(ctx, ref, repo, pr, change);
       const result = await this.writeReview(ctx, ref, pr, event, text, comments);
       return ok({ status: result.status, head_sha: headSha, ...result.detail }, (t) => ctx.client.redact(t));
     });
@@ -309,7 +316,11 @@ export class GithubReview {
       return { http: 200, body: { ok: true, status: claimed.reason === "expired" ? "expired" : "refused", reason: claimed.reason } };
     }
     const confirmation = claimed.confirmation;
-    const actor: ReviewActor = { sessionId: confirmation.sessionId, requesterUserId: deciderUserId, actorUserId: deciderUserId };
+    // Who asked stays who asked: the audit row and the approval's footer name them, and the rule on a requester's own pull request is applied to them.
+    const actor: ReviewActor = {
+      sessionId: confirmation.sessionId, requesterUserId: confirmation.requesterUserId, actorUserId: deciderUserId,
+      requesterLabel: await this.requesterLabel(confirmation.sessionId),
+    };
     const ref = parsePrRef(`${confirmation.repo}#${confirmation.pr}`);
     if (!ref) {
       await finishConfirmation(this.deps.db, id, "refused", deciderUserId, { reason: "bad_reference" });
@@ -317,7 +328,7 @@ export class GithubReview {
     }
     const outcome = await this.run(actor, "gh_pr_merge", { pr: `${confirmation.repo}#${confirmation.pr}`, head_sha: confirmation.headSha, confirmation_id: id }, async (ctx) => {
       return ok(await this.merge(ctx, ref, confirmation.headSha, { flags: [], confirmation }), (t) => ctx.client.redact(t));
-    }, { skipBudget: true, ref });
+    }, { skipBudget: true, ref, consented: true });
     const status = String(outcome.body.status ?? "");
     const reason = String(outcome.body.reason ?? "");
     if (status === "merged") {
@@ -328,9 +339,26 @@ export class GithubReview {
       await finishConfirmation(this.deps.db, id, "refused", deciderUserId, { reason: "writes_disabled" });
       return { http: 200, body: { ok: true, status: "refused", reason: "writes_disabled" } };
     }
+    if (TRANSIENT_REFUSALS.has(reason) || (reason === "github_error" && Number(outcome.body.github_status) >= 500)) {
+      // Nothing was decided about the merge: the person's "allow" is not used up, and they can give it again.
+      if (await reopenConfirmation(this.deps.db, id)) {
+        return { http: 200, body: { ok: true, status: "retry", reason, message: "the merge could not be tried just now; the confirmation is still open, so allow it again in a moment" } };
+      }
+    }
     const final = reason === "head_moved" ? "stale" : "refused";
     await finishConfirmation(this.deps.db, id, final, deciderUserId, { reason });
     return { http: 200, body: { ok: true, status: final, reason, message: outcome.body.message ?? null } };
+  }
+
+  /** How the session names its owner in a review's footer; none when the session cannot be read. */
+  private async requesterLabel(sessionId: string): Promise<string | undefined> {
+    try {
+      const r = await this.deps.db.query("SELECT config->>'acting_as_requester' AS label FROM claw_sessions WHERE session_id = $1", [sessionId]);
+      const label = (r.rows[0] as { label?: unknown } | undefined)?.label;
+      return typeof label === "string" && label ? label : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   // --------------------------------------------------------------- core
@@ -341,7 +369,7 @@ export class GithubReview {
     tool: string,
     args: Record<string, unknown>,
     body: (ctx: Ctx, ref: PrRef) => Promise<ToolOutcome>,
-    opts: { skipBudget?: boolean; ref?: PrRef } = {},
+    opts: { skipBudget?: boolean; ref?: PrRef; consented?: boolean } = {},
   ): Promise<ToolOutcome> {
     const settings = this.deps.settings();
     const plain = (t: string): string => t;
@@ -377,13 +405,14 @@ export class GithubReview {
       const cred = await this.credential(actor.actorUserId, actor, tool, "acting");
       // Every tool acts with the acting user's account, reads included, so every tool needs their say: the
       // person who asked for their own account needs no one's permission, anyone else needs the owner's switch.
-      // Nothing is sent to GitHub for a refusal here, and the token is dropped unused.
-      if (actor.requesterUserId !== actor.actorUserId && !cred.delegation) {
+      // The owner's own "allow" to one held merge is that say for that merge. Nothing is sent to GitHub for a
+      // refusal here, and the token is dropped unused.
+      if (!opts.consented && actor.requesterUserId !== actor.actorUserId && !cred.delegation) {
         throw new Refusal("delegation_off", "the acting user has not allowed others to act for them, so nothing is done with their GitHub account");
       }
       client = new GithubClient({ token: cred.token, apiUrl: settings.apiUrl, fetchImpl: this.deps.fetchImpl });
       const ctx: Ctx = {
-        actor, settings, client, tool, acc,
+        actor, settings, client, tool, auditId, acc,
         cred: { login: cred.providerLogin, scopes: cred.scopes, delegation: cred.delegation },
       };
       outcome = await body(ctx, ref);
@@ -433,7 +462,10 @@ export class GithubReview {
       if (err instanceof Refusal) throw err;
       if (err instanceof IdentityCredentialRefusedError) {
         if (err.code === "expired") throw expiredRefusal();
-        throw new Refusal(whose === "acting" ? "actor_not_bound" : "requester_not_bound", `${who} has not bound a GitHub account`);
+        if (err.code === "not_bound") throw new Refusal(whose === "acting" ? "actor_not_bound" : "requester_not_bound", `${who} has not bound a GitHub account`);
+        // Any other answer is not about this user (a resolve URL that is wrong, a request the provider did not understand): it is an outage, and says so.
+        logger.error({ code: err.code, status: err.status, purpose }, "github_review.identity_refused_unexpected");
+        throw new Refusal("identity_unavailable", "the identity service could not be asked; nothing was done");
       }
       if (err instanceof IdentityUnavailableError) throw new Refusal("identity_unavailable", "the identity service could not be asked; nothing was done");
       throw new Refusal("identity_unavailable", `${who}'s credential could not be fetched; nothing was done`);
@@ -531,6 +563,7 @@ export class GithubReview {
         files.push({
           path: String(f.filename ?? ""), status: String(f.status ?? ""), additions: Number(f.additions ?? 0), deletions: Number(f.deletions ?? 0),
           patch: typeof f.patch === "string" ? f.patch : undefined,
+          previousPath: typeof f.previous_filename === "string" && f.previous_filename ? f.previous_filename : undefined,
         });
       }
       if (batch.length < FILE_PAGE) break;
@@ -636,6 +669,22 @@ export class GithubReview {
     await this.requireNotRequestersOwn(ctx, pr);
   }
 
+  /**
+   * An approval can merge a pull request by itself (GitHub's auto-merge), so it is
+   * posted only where `gh_pr_merge` would not stop: CI green on the head commit, no
+   * open thread, and a change that does not need the acting user's confirmation.
+   * A high-risk approval goes through `gh_pr_merge`, which asks them first.
+   */
+  private async requireApprovable(ctx: Ctx, ref: PrRef, repo: RepoInfo, pr: PrInfo, change: Change | null): Promise<void> {
+    const read = change ?? await this.collectChange(ctx, ref, pr);
+    const risk = assessRisk(this.riskInput(pr, repo, read));
+    ctx.acc.riskReasons = risk.reasons;
+    this.requireGreen(await this.readState(ctx, ref, pr, repo), pr.headSha);
+    if (risk.level === "high") {
+      throw new Refusal("high_risk_approval", "this change is high risk, so an approval waits for the acting user's confirmation: post a comment-only review and call gh_pr_merge, which asks them", { reasons: risk.reasons });
+    }
+  }
+
   private checkComments(raw: unknown, change: Change | null): Array<{ path: string; line: number; side: "RIGHT" | "LEFT"; body: string }> {
     if (raw === undefined || raw === null) return [];
     if (!Array.isArray(raw)) throw new Refusal("invalid_comments", "comments must be a list");
@@ -671,13 +720,19 @@ export class GithubReview {
   }
 
   private async limits(ctx: Ctx, headSha: string): Promise<void> {
-    const pair = { sessionId: ctx.actor.sessionId, headSha };
+    if (ctx.acc.reserved) return;
+    // Reserve first and count after, so a call in flight is counted by every other call: ten merges that
+    // each read "19 of 20" before any of them wrote are not all let through. This call's own row is in the
+    // count, which is why the limit is passed with `>`.
+    await reserveWrite(this.deps.db, ctx.auditId, headSha);
+    ctx.acc.reserved = true;
+    const pair = { sessionId: ctx.actor.sessionId, headSha, selfId: ctx.auditId };
     const own = await recentWrites(this.deps.db, ctx.actor.actorUserId, HOUR_MS, pair);
-    if (!own.pairPresent && own.count >= ctx.settings.reviewsPerTokenPerHour) {
+    if (!own.pairPresent && own.count > ctx.settings.reviewsPerTokenPerHour) {
       throw new Refusal("rate_limited", `${ctx.settings.reviewsPerTokenPerHour} reviews an hour is the limit for one GitHub account; try again later`);
     }
     const all = await recentWrites(this.deps.db, null, HOUR_MS, pair);
-    if (!all.pairPresent && all.count >= ctx.settings.reviewsPerHour) {
+    if (!all.pairPresent && all.count > ctx.settings.reviewsPerHour) {
       throw new Refusal("rate_limited", `${ctx.settings.reviewsPerHour} reviews an hour is the limit for this deployment; try again later`);
     }
   }

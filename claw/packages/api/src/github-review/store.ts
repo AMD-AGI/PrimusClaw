@@ -139,23 +139,35 @@ export async function sessionRequestCount(db: Queryable, sessionId: string): Pro
 }
 
 /**
+ * Mark a call's audit row as a write on this head commit, before the write is
+ * counted against the limits and before it is made. The row then counts for as long
+ * as the call is in flight, and stays counted if the call dies before it can finish
+ * the row; a call that ends without writing says so when it finishes the row.
+ */
+export async function reserveWrite(db: Queryable, id: number, headSha: string): Promise<void> {
+  await db.query("UPDATE claw_github_audit SET write = TRUE, head_sha = $2 WHERE id = $1", [id, headSha]);
+}
+
+/**
  * Reviews written in the last window, by one acting user's token (`actorUserId`) or
  * by all of them (null). A review is a (session, head commit) pair that wrote, so a
- * review and the merge that follows it count once. An attempt still in flight counts.
- * `pairPresent` says whether the pair being asked about is already among them, so
- * that the second half of a review is never refused for the first half.
+ * review and the merge that follows it count once. A call in flight counts (see
+ * {@link reserveWrite}), the asking call's own row included.
+ * `pairPresent` says whether the pair being asked about is already among them in a
+ * row other than `pair.selfId`, so that the second half of a review is never refused
+ * for the first half.
  */
 export async function recentWrites(
-  db: Queryable, actorUserId: string | null, sinceMs: number, pair?: { sessionId: string; headSha: string },
+  db: Queryable, actorUserId: string | null, sinceMs: number, pair?: { sessionId: string; headSha: string; selfId?: number },
 ): Promise<{ count: number; pairPresent: boolean }> {
   const r = await db.query(
     `SELECT COUNT(DISTINCT session_id || ':' || head_sha)::int AS n,
-            COALESCE(BOOL_OR(session_id = $3 AND head_sha = $4), FALSE) AS present
+            COALESCE(BOOL_OR(session_id = $3 AND head_sha = $4 AND ($5::bigint IS NULL OR id <> $5)), FALSE) AS present
        FROM claw_github_audit
       WHERE write AND NOT dry_run AND result IN ('ok', 'started')
         AND at > NOW() - ($2::bigint * INTERVAL '1 millisecond')
         AND ($1::text IS NULL OR actor_user_id = $1)`,
-    [actorUserId, sinceMs, pair?.sessionId ?? null, pair?.headSha ?? null],
+    [actorUserId, sinceMs, pair?.sessionId ?? null, pair?.headSha ?? null, pair?.selfId ?? null],
   );
   const row = r.rows[0] as { n: number; present: boolean };
   return { count: Number(row.n), pairPresent: row.present === true };
@@ -311,6 +323,28 @@ export async function claimConfirmation(db: Queryable, id: string, deciderUserId
     return { ok: false, reason: "expired" };
   }
   return { ok: false, reason: row.status === "expired" ? "expired" : "not_pending" };
+}
+
+/**
+ * Give a claimed confirmation back to the acting user, still pending, because the
+ * decision could not be carried out for a reason that will pass (a limit, a rate
+ * limit, the identity service being down). False when it can no longer be answered:
+ * it ran out, or another pending one for the same commit was asked in the meantime.
+ */
+export async function reopenConfirmation(db: Queryable, id: string): Promise<boolean> {
+  try {
+    const r = await db.query(
+      `UPDATE claw_github_confirmations
+          SET status = 'pending', decided_at = NULL, decided_by = NULL
+        WHERE confirmation_id = $1 AND status = 'merging' AND expires_at > NOW() RETURNING confirmation_id`,
+      [id],
+    );
+    return r.rows.length > 0;
+  } catch (err) {
+    // The unique index on pending rows: a newer confirmation for this commit stands. Anything else is not for this function to hide.
+    if ((err as { code?: string })?.code === "23505") return false;
+    throw err;
+  }
 }
 
 export async function finishConfirmation(

@@ -41,3 +41,10 @@ test("added and removed lines are read without the file headers or the marks", (
   assert.deepEqual(addedLines("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b"), ["b"]);
   assert.deepEqual(removedLines("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b"), ["a"]);
 });
+
+test("a content line that itself starts with ++ or -- is still an added or removed line; only what comes before the first hunk is a header", () => {
+  const patch = "@@ -1,2 +1,2 @@\n-- drop table x\n+++ chmod 777 /data\n+++x; rejectUnauthorized: false\n ctx";
+  assert.deepEqual(addedLines(patch), ["++ chmod 777 /data", "++x; rejectUnauthorized: false"]);
+  assert.deepEqual(removedLines(patch), ["- drop table x"]);
+  assert.deepEqual(addedLines("diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n+real"), ["real"]);
+});

@@ -135,3 +135,30 @@ test("globs: * stays inside a segment, ** crosses them, and regex characters are
   assert.equal(globToRegExp("a+b.txt").test("aab.txt"), false);
   assert.equal(globToRegExp("a+b.txt").test("a+b.txt"), true);
 });
+
+test("a file moved out of a protected path is judged by where it was, not only where it is", () => {
+  const moved = (from: string, to: string): RiskFile => file(to, undefined, { status: "renamed", previousPath: from, patch: undefined, additions: 0, deletions: 0 });
+  for (const [from, to, why] of [
+    [".github/workflows/security-scan.yml", "docs/old/security-scan.yml", /workflow/],
+    ["CODEOWNERS", "docs/CODEOWNERS.bak", /governance/],
+    [".github/CODEOWNERS", "notes/owners.txt", /governance/],
+    ["deploy/tls.pem", "docs/tls.txt", /secret-handling/],
+    ["Dockerfile", "docs/Dockerfile.old", /release or deployment/],
+    ["src/auth/login.ts", "src/login.ts", /authentication/],
+    ["docs/legal/terms.md", "docs/terms.md", /marks high risk/],
+  ] as const) {
+    const r = assessRisk(input([moved(from, to)], { repoConfig: { confirmMerge: "risk", highRiskPaths: ["docs/legal/**"] } }));
+    assert.equal(r.level, "high", `${from} -> ${to}`);
+    assert.match(r.reasons.join("\n"), why, `${from} -> ${to}`);
+    assert.equal(r.reasons.some((x) => x.includes(`${from} (moved to ${to})`)), true, `${from} -> ${to}`);
+  }
+  // A removed governance file is held too, and an ordinary rename is not.
+  assert.equal(assessRisk(input([file(".github/workflows/ci.yml", undefined, { status: "removed", additions: 0, deletions: 4 })])).level, "high");
+  assert.deepEqual(assessRisk(input([moved("src/a.ts", "src/b.ts")])).reasons, []);
+});
+
+test("a changed line that begins with ++ is read by the line rules like any other", () => {
+  for (const line of ["+  chmod 777 /data", "+x; rejectUnauthorized: false", "+-----BEGIN RSA PRIVATE KEY-----"]) {
+    assert.equal(assessRisk(input([file("src/x.sh", patchWith(line))])).level, "high", line);
+  }
+});

@@ -50,21 +50,28 @@ export function commentableLines(patch: string | undefined | null): CommentableL
   return out;
 }
 
-/** The added lines of a patch, without their `+`, for the rules that read what a change introduces. */
-export function addedLines(patch: string | undefined | null): string[] {
+/**
+ * The lines of a patch's hunks that start with `mark`, without it. Only what follows
+ * the first hunk header is read: GitHub's per-file patch has no `---`/`+++` header
+ * lines, so inside a hunk every line is content, and an added line that itself
+ * begins with `+` (`++x`) or a removed one that begins with `-` is still seen.
+ */
+function hunkLines(patch: string | undefined | null, mark: "+" | "-"): string[] {
   if (!patch) return [];
   const out: string[] = [];
+  let inHunk = false;
   for (const line of patch.split("\n")) {
-    if (line.startsWith("+") && !line.startsWith("+++")) out.push(line.slice(1));
+    if (HUNK_RE.test(line)) { inHunk = true; continue; }
+    if (inHunk && line.startsWith(mark)) out.push(line.slice(1));
   }
   return out;
 }
 
+/** The added lines of a patch, without their `+`, for the rules that read what a change introduces. */
+export function addedLines(patch: string | undefined | null): string[] {
+  return hunkLines(patch, "+");
+}
+
 export function removedLines(patch: string | undefined | null): string[] {
-  if (!patch) return [];
-  const out: string[] = [];
-  for (const line of patch.split("\n")) {
-    if (line.startsWith("-") && !line.startsWith("---")) out.push(line.slice(1));
-  }
-  return out;
+  return hunkLines(patch, "-");
 }

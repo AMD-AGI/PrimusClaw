@@ -57,7 +57,13 @@ tool offered to a session, and `config.acting_as` is refused.
   or a merge is also refused if the requester wrote the pull request
   (`cannot_act_for_own_pull_request`), judged by their own GitHub login (read from the
   identity provider; their token is not used), or has no GitHub account bound
-  (`requester_not_bound`).
+  (`requester_not_bound`). The identity provider's answer is read strictly: only its
+  `not_bound` is "not bound"; any other refusal is reported as `identity_unavailable` and logged.
+- **An approval.** An approval can merge a pull request by itself (GitHub's auto-merge), so
+  `gh_review_submit` with `APPROVE` is posted only where `gh_pr_merge` would not stop: CI is
+  green on the head commit (`ci_not_green`), no review thread is open (`threads_unresolved`)
+  and the change is not high risk (`high_risk_approval`: post a comment and call
+  `gh_pr_merge`, which asks the acting user). `COMMENT` and `REQUEST_CHANGES` are not held to that.
 - **The merge.** Everything is read again at merge time: CI is green on the **head commit**
   (every check completed and passing; a required check that never reported is missing; a pull
   request with no check at all is not green however clean GitHub calls it; an infrastructure
@@ -70,7 +76,8 @@ tool offered to a session, and `config.acting_as` is refused.
   workflows or governance files, authentication or security code, secret handling, release
   or deployment files, dependencies, is large or mostly deletions, is a fork or from a
   non-member, targets a branch other than the default, or when anything cannot be read (the
-  rules fail closed). A repository's `.github/clawy.yml` on the base branch can add paths
+  rules fail closed). A file that was moved is judged by the path it left as well as the one it
+  went to, and a line that starts with `++` or `--` is read like any other. A repository's `.github/clawy.yml` on the base branch can add paths
   (`high_risk_paths`) or ask for confirmation on every merge (`confirm_merge: always`).
   A merge that needs confirmation creates one pending row for the head commit and merges
   nothing.
@@ -80,7 +87,7 @@ tool offered to a session, and `config.acting_as` is refused.
 | Route | Purpose |
 |---|---|
 | `GET /v1/github-review/confirmations?session_id=<id>&status=pending` | The confirmations of the caller's own sessions and those that ask the caller. `{items:[{id, repo, pr, title, author, head_sha, reasons, checks, actor_user_id, requester_user_id, session_id, expires_at, status}]}` |
-| `POST /v1/github-review/confirmations/:id/decision` `{decision: "allow" \| "deny"}` | The acting user's answer. Anyone else gets `403`. On `allow` every gate is read again and the merge is made with the acting user's account; the answer is `{status: "merged" \| "denied" \| "stale" \| "expired" \| "refused", reason, merge_sha}` |
+| `POST /v1/github-review/confirmations/:id/decision` `{decision: "allow" \| "deny"}` | The acting user's answer. Anyone else gets `403`. On `allow` every gate is read again and the merge is made with the acting user's account; the answer is `{status: "merged" \| "denied" \| "stale" \| "expired" \| "refused" \| "retry", reason, merge_sha}`. `retry` means the merge could not be tried just now (the identity service or GitHub failed, a limit was hit) and the confirmation is still open: allow it again. The merge is recorded as asked for by the requester, not by the acting user |
 
 A confirmation lives 24 hours (`CLAW_GITHUB_CONFIRMATION_TTL_SECONDS`), is bound to the head
 commit (a head that moved makes it `stale`) and is used once.
