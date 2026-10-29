@@ -13,15 +13,18 @@
  * Three things are the proxy's own:
  *   - It ends together. Either side closing closes the other, with the same code
  *     where one can be sent, and a side that does not answer the close is cut off.
- *   - It is bounded. A terminal with no traffic for `idleMs` is closed; the
- *     number open is capped in total and per user (see {@link TerminalRegistry}).
+ *   - It is bounded. A terminal the browser has sent nothing to for `idleMs` is
+ *     closed, and none outlives `maxLifetimeMs` however busy it is; the number
+ *     open is capped in total and per user (see {@link TerminalRegistry}).
  *   - It does not buffer without limit. Output faster than the browser reads
  *     pauses the upstream until the browser has caught up.
  */
 import { WebSocket } from "ws";
 
-/** Closed because nothing was said in either direction for the idle timeout. */
+/** Closed because the browser sent nothing for the idle timeout. */
 export const CLOSE_IDLE = 4408;
+/** Closed because it had been open for the longest a terminal may be. */
+export const CLOSE_MAX_LIFETIME = 4409;
 /** Closed because this process is shutting down. */
 export const CLOSE_SHUTDOWN = 1001;
 /** Closed because the other side's connection failed. */
@@ -130,7 +133,10 @@ export function connectUpstream(url: string, opts: ConnectOptions): Promise<WebS
 }
 
 export interface BridgeOptions {
+  /** Close after this long with no frame from the browser. The shell's output does not count. */
   idleMs: number;
+  /** Close this long after opening, whatever has been going on. */
+  maxLifetimeMs: number;
   pingMs: number;
   highWaterBytes?: number;
   lowWaterBytes?: number;
@@ -174,11 +180,22 @@ export function bridge(client: WebSocket, upstream: WebSocket, opts: BridgeOptio
   let clientAlive = true;
   const closeGraceMs = opts.closeGraceMs ?? DEFAULT_CLOSE_GRACE_MS;
 
+  // Only what the browser sends is a sign that someone is there. The shell's own
+  // output is not: a forgotten tab on `tail -f`, `top` or `watch` produces it
+  // forever, and would keep the idle timer from ever running out.
   const idle = setTimeout(
     () => end(CLOSE_IDLE, "idle timeout", "idle"),
     opts.idleMs,
   );
   const touch = () => { idle.refresh(); };
+
+  // And a bound that does not depend on anyone being idle: the shell holds the
+  // user's SaFE key for as long as it is open, and the key may be revoked, or the
+  // session deleted, in the meantime. Nothing here is told of either.
+  const lifetime = setTimeout(
+    () => end(CLOSE_MAX_LIFETIME, "maximum lifetime reached", "max_lifetime"),
+    opts.maxLifetimeMs,
+  );
 
   // The browser's liveness: a ping each interval, and a socket that has not
   // answered the last one is gone and is cut rather than waited for. The
@@ -211,6 +228,7 @@ export function bridge(client: WebSocket, upstream: WebSocket, opts: BridgeOptio
     if (ended) return;
     ended = true;
     clearTimeout(idle);
+    clearTimeout(lifetime);
     clearInterval(heartbeat);
     const safeReason = relayReason(reason);
     closeSide(client, code, safeReason);
@@ -221,7 +239,7 @@ export function bridge(client: WebSocket, upstream: WebSocket, opts: BridgeOptio
   const high = opts.highWaterBytes ?? DEFAULT_HIGH_WATER_BYTES;
   const low = opts.lowWaterBytes ?? DEFAULT_LOW_WATER_BYTES;
   client.on("message", (data: RawData, isBinary: boolean) => { touch(); forward(client, upstream, data, isBinary, high, low); });
-  upstream.on("message", (data: RawData, isBinary: boolean) => { touch(); forward(upstream, client, data, isBinary, high, low); });
+  upstream.on("message", (data: RawData, isBinary: boolean) => { forward(upstream, client, data, isBinary, high, low); });
 
   client.on("close", (code: number, reason: Buffer) => end(relayCode(code), relayReason(reason), "client_closed"));
   upstream.on("close", (code: number, reason: Buffer) => {

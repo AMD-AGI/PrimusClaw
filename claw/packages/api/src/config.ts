@@ -238,10 +238,15 @@ export const SESSION_SANDBOX_HOLD_MS = Math.min(
 // for one user. Past either, the upgrade is refused with 429.
 export const TERMINAL_MAX_CONNECTIONS = envInt("TERMINAL_MAX_CONNECTIONS", 200, { min: 1, max: 100_000 });
 export const TERMINAL_MAX_CONNECTIONS_PER_USER = envInt("TERMINAL_MAX_CONNECTIONS_PER_USER", 5, { min: 1, max: 1000 });
-// A terminal with no input and no output in either direction for this long is
-// closed. Pings do not count: they only prove the sockets are alive, and a shell
-// left open in a forgotten tab is exactly the thing this is for.
+// A terminal the browser has sent nothing to for this long is closed. Only the
+// browser's frames count: pings only prove the sockets are alive, and the shell's
+// output never stops on a `tail -f` or a `top`, so counting it would let a shell
+// left open in a forgotten tab -- exactly what this is for -- stay open forever.
 export const TERMINAL_IDLE_TIMEOUT_SECONDS = envInt("TERMINAL_IDLE_TIMEOUT_SECONDS", 900, { min: 10, max: 86_400 });
+// No terminal stays open longer than this, however much is typed into it: the
+// shell holds the user's SaFE key, and nothing tells it that the key was revoked
+// or the session deleted. The browser reconnects with a new ticket.
+export const TERMINAL_MAX_LIFETIME_SECONDS = envInt("TERMINAL_MAX_LIFETIME_SECONDS", 28_800, { min: 60, max: 604_800 });
 
 // --- How long an idle sandbox stays reusable ---
 // Brain's setting, read here under the same name and default because the orphan

@@ -66,8 +66,10 @@ record it.
   one user and one session, kept (as a hash, with the key it carries sealed) in the new table
   `claw_terminal_tickets` so any replica can redeem it. The proxy passes SaFE's webshell frames
   through as they are (input as text or binary frames, `RESIZE <cols> <rows>` as a text frame, output
-  as binary frames) and ends both sockets together; a terminal idle for `TERMINAL_IDLE_TIMEOUT_SECONDS`
-  (default 900) is closed with code 4408, and `TERMINAL_MAX_CONNECTIONS` (200) and
+  as binary frames) and ends both sockets together; a terminal the browser has sent nothing to for
+  `TERMINAL_IDLE_TIMEOUT_SECONDS` (default 900; the shell's own output does not count) is closed with code
+  4408, one open for `TERMINAL_MAX_LIFETIME_SECONDS` (default 28800) is closed with code 4409 whatever is
+  going on in it, and `TERMINAL_MAX_CONNECTIONS` (200) and
   `TERMINAL_MAX_CONNECTIONS_PER_USER` (5) bound what one replica holds. SaFE being unreachable or
   refusing the key answers 502, and a deployment without SaFE 503, each with `{error, reason}`. The
   WebSocket server is the `ws` package, a new dependency of the API.

@@ -17,7 +17,7 @@ import type { AddressInfo } from "node:net";
 import { WebSocket, WebSocketServer } from "ws";
 
 import {
-  bridge, connectUpstream, relayCode, relayReason, TerminalRegistry, UpstreamConnectError,
+  bridge, CLOSE_IDLE, CLOSE_MAX_LIFETIME, connectUpstream, relayCode, relayReason, TerminalRegistry, UpstreamConnectError,
   type BridgeOptions,
 } from "../src/terminal/proxy.js";
 import { nextClose, until } from "./terminal-fixtures.js";
@@ -59,7 +59,7 @@ async function pair(opts: Partial<BridgeOptions> = {}, browserOpts: { autoPong?:
   cleanups.push(() => { browser.terminate(); upstream.terminate(); });
   let resolveEnd!: (why: string) => void;
   const end = new Promise<string>((r) => { resolveEnd = r; });
-  bridge(clientSide, upstream, { idleMs: 60_000, pingMs: 60_000, ...opts, onEnd: resolveEnd });
+  bridge(clientSide, upstream, { idleMs: 60_000, maxLifetimeMs: 60_000, pingMs: 60_000, ...opts, onEnd: resolveEnd });
   return { browser, clientSide, upstream, shell, end };
 }
 
@@ -123,6 +123,75 @@ test("a browser that answers pings is not let go", async () => {
   assert.equal(p.shell.readyState, WebSocket.OPEN);
 });
 
+test("a shell that never stops talking does not keep a terminal the browser has left from going idle", async () => {
+  const p = await pair({ idleMs: 300 });
+  let seen = 0;
+  p.browser.on("message", () => { seen += 1; });
+  // What `tail -f` or `top` does: output every 25 ms, for four times the idle timeout.
+  const chatter = setInterval(() => {
+    if (p.shell.readyState === WebSocket.OPEN) p.shell.send(Buffer.from("line\n"), { binary: true });
+  }, 25);
+  cleanups.push(() => clearInterval(chatter));
+  const closed = nextClose(p.browser);
+  const started = Date.now();
+  const c = await closed;
+  clearInterval(chatter);
+  assert.equal(c.code, CLOSE_IDLE);
+  assert.ok(Date.now() - started < 1200, `closed after ${Date.now() - started} ms`);
+  assert.ok(seen > 3, "the output was still delivered while the terminal was open");
+  assert.equal(await p.end, "idle");
+});
+
+test("a browser that keeps sending is not idle, and the shell's silence does not make it so", async () => {
+  const p = await pair({ idleMs: 300 });
+  let closedEarly = false;
+  p.browser.once("close", () => { closedEarly = true; });
+  for (let i = 0; i < 12; i++) {
+    p.browser.send("x");
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  assert.equal(closedEarly, false, "twice the idle timeout of keystrokes, and not a byte back");
+  assert.equal(p.browser.readyState, WebSocket.OPEN);
+});
+
+test("a terminal ends at its maximum lifetime however busy it is, and says so", async () => {
+  const p = await pair({ idleMs: 60_000, maxLifetimeMs: 300 });
+  const typing = setInterval(() => {
+    if (p.browser.readyState === WebSocket.OPEN) p.browser.send("x");
+    if (p.shell.readyState === WebSocket.OPEN) p.shell.send(Buffer.from("y"), { binary: true });
+  }, 20);
+  cleanups.push(() => clearInterval(typing));
+  const closed = nextClose(p.browser);
+  const started = Date.now();
+  const c = await closed;
+  clearInterval(typing);
+  assert.equal(c.code, CLOSE_MAX_LIFETIME);
+  assert.match(c.reason, /lifetime/);
+  assert.ok(Date.now() - started >= 250, "not before its lifetime was up");
+  await until(() => p.shell.readyState === WebSocket.CLOSED, "the shell's socket to close");
+  assert.equal(await p.end, "max_lifetime");
+});
+
+test("a terminal that has ended leaves neither its idle timer nor its lifetime timer running", async () => {
+  const a = await listen();
+  const b = await listen();
+  const browser = new WebSocket(a.url);
+  const upstream = new WebSocket(b.url);
+  const [clientSide] = await Promise.all([a.connections[0], b.connections[0]]);
+  await Promise.all([new Promise((r) => browser.once("open", r)), new Promise((r) => upstream.once("open", r))]);
+  cleanups.push(() => { browser.terminate(); upstream.terminate(); });
+  // A live timer is a resource the process waits for: eight hours of it per closed terminal.
+  const timers = () => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
+  const before = timers();
+  const ends: string[] = [];
+  bridge(clientSide, upstream, { idleMs: 600_000, maxLifetimeMs: 600_000, pingMs: 600_000, onEnd: (why) => ends.push(why) });
+  assert.equal(timers(), before + 3, "idle, lifetime and heartbeat");
+  browser.close(1000, "done");
+  await until(() => ends.length === 1, "the end");
+  await until(() => timers() <= before, "every timer the pair held to be cleared");
+  assert.deepEqual(ends, ["client_closed"]);
+});
+
 test("however it ends, it ends once", async () => {
   const ends: string[] = [];
   const a = await listen();
@@ -131,7 +200,7 @@ test("however it ends, it ends once", async () => {
   const upstream = new WebSocket(b.url);
   const [clientSide, shell] = await Promise.all([a.connections[0], b.connections[0]]);
   await Promise.all([new Promise((r) => browser.once("open", r)), new Promise((r) => upstream.once("open", r))]);
-  const handle = bridge(clientSide, upstream, { idleMs: 60_000, pingMs: 60_000, onEnd: (why) => ends.push(why) });
+  const handle = bridge(clientSide, upstream, { idleMs: 60_000, maxLifetimeMs: 60_000, pingMs: 60_000, onEnd: (why) => ends.push(why) });
   handle.close(1000, "first", "first");
   handle.close(1000, "second", "second");
   shell.close();

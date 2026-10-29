@@ -30,8 +30,9 @@
  *   browser -> shell   text or binary frames of input, and the text frame
  *                      `RESIZE <cols> <rows>` to change the window
  *   shell -> browser   binary frames of output; the close frame carries a reason
- * Beyond that the proxy adds one close code, 4408, for a terminal closed after
- * sitting idle. No subprotocol is negotiated.
+ * Beyond that the proxy adds two close codes: 4408, for a terminal the browser
+ * sent nothing to for too long, and 4409, for one that reached its maximum
+ * lifetime. No subprotocol is negotiated.
  */
 import type { IncomingMessage, Server } from "node:http";
 import type { Duplex } from "node:stream";
@@ -42,6 +43,7 @@ import { getUser } from "../auth/middleware.js";
 import { canAccessSession } from "../auth/models.js";
 import {
   SAFE_API_URL, TERMINAL_IDLE_TIMEOUT_SECONDS, TERMINAL_MAX_CONNECTIONS, TERMINAL_MAX_CONNECTIONS_PER_USER,
+  TERMINAL_MAX_LIFETIME_SECONDS,
 } from "../config.js";
 import { db } from "../infra/db.js";
 import { kv } from "../infra/nats.js";
@@ -64,6 +66,7 @@ export const terminalSettings = {
   maxConnections: TERMINAL_MAX_CONNECTIONS,
   maxConnectionsPerUser: TERMINAL_MAX_CONNECTIONS_PER_USER,
   idleMs: TERMINAL_IDLE_TIMEOUT_SECONDS * 1000,
+  maxLifetimeMs: TERMINAL_MAX_LIFETIME_SECONDS * 1000,
   pingMs: 30_000,
   upstreamConnectTimeoutMs: 10_000,
   /** Largest frame the browser may send (typed or pasted input) and the shell may send (output). */
@@ -309,6 +312,7 @@ async function handleUpgrade(
     bridged = true;
     const pair = bridge(client, upstream, {
       idleMs: terminalSettings.idleMs,
+      maxLifetimeMs: terminalSettings.maxLifetimeMs,
       pingMs: terminalSettings.pingMs,
       onEnd: (why) => {
         slot.release();
