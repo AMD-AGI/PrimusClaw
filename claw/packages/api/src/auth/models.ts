@@ -4,6 +4,8 @@
 export interface UserInfo {
   userId: string;
   userName: string;
+  /** As SaFE verification reports it; absent when the account has none (and always in BYOK / dev modes). */
+  email?: string;
   roles: string[];
   platformKey: string;
   virtualKey: string;
