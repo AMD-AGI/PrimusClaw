@@ -30,6 +30,7 @@ import { registerUserEnvVarRoutes } from "./routes/user-env-vars.js";
 import { registerNotificationSubscriptionRoutes } from "./routes/notification-subscriptions.js";
 import { startNotificationWorker } from "./notifications/outbox.js";
 import { registerSystemEnvVarRoutes, publishSystemEnvToKv } from "./routes/system-env-vars.js";
+import { registerSandboxAdminRoutes } from "./routes/sandbox-admin.js";
 import { registerMcpRoutes } from "./routes/mcp.js";
 import { registerInternalTaskRoutes } from "./routes/internal-tasks.js";
 import { registerInternalRunRoutes } from "./routes/internal-runs.js";
@@ -272,6 +273,7 @@ async function main() {
   await registerUserEnvVarRoutes(app);
   await registerNotificationSubscriptionRoutes(app);
   await registerSystemEnvVarRoutes(app);
+  await registerSandboxAdminRoutes(app);
   await registerMcpRoutes(app);
   await registerInternalTaskRoutes(app);
   await registerInternalRunRoutes(app);
