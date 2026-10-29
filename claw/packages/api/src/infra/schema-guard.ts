@@ -175,6 +175,12 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     columns: ["user_id", "enabled"],
   },
   {
+    table: "claw_answer_feedback",
+    // The vote routes write and delete by this key. Absent, a vote answers 500
+    // for every user, on a deployment where nothing else is wrong.
+    columns: ["session_id", "message_id", "user_id", "vote", "reason", "created_at", "updated_at"],
+  },
+  {
     table: "claw_memory_entries",
     // The reason this guard exists, found the long way round. `kind` separates
     // the rows decay is allowed to forget from the KB rows it must not touch,

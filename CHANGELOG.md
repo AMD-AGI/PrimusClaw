@@ -28,6 +28,21 @@ record it.
 ## [Unreleased]
 
 ### Added
+- A user can vote on an answer of their own session. `PUT /v1/sessions/:sessionId/feedback`
+  (`{ "message_id", "vote": "up" | "down", "reason"? }`) records it and
+  `DELETE /v1/sessions/:sessionId/feedback/:messageId` takes it back; both answer `{ "ok": true }`.
+  There is one vote per user per message, a repeat replaces it, and only the session's creator may
+  vote: another user's session, a deleted one and a missing one are the same 404. `message_id` is
+  text (1-100 characters from `A-Za-z0-9._:@-`) and `reason` is at most 8192 characters. A session
+  holds at most 1000 votes per user (409 past that). The votes live in the new table
+  `claw_answer_feedback`, created by the same idempotent start-up migration and required by the
+  schema check.
+- `GET /v1/images?search=<text>&limit=<n>` lists the container images the caller may pick from, as
+  `{ "items": [{ "name", "tag"?, "createdAt"? }], "total" }` (`name` is the full reference; `limit` is
+  50 by default and at most 200). It asks SaFE with the caller's own credential and passes on only
+  those fields. When SaFE cannot answer, the reply is a 503 (unreachable, not configured, or kubernetes
+  mode) or 502 (an answer that is not an image list), with `{ "error", "reason" }`, and a 401 or 403
+  when SaFE refuses the caller.
 - A shared identity client in `@claw/utils`, built by API and Brain when
   `IDENTITY_CLIENT_ENABLED=true` (off by default; nothing authenticates through it yet). It does OIDC
   discovery and caches the issuer's JWKS, RFC 7662 token introspection (an active answer is cached for
