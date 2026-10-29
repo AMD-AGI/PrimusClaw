@@ -1997,18 +1997,28 @@ class AgentLoopRunner {
           resultByToolId.set(toolId, errMsg);
           return;
         }
-      await this.onEvent({
+      // Registered before the question is announced: a caller that answers the
+      // moment it sees the question would otherwise find nothing waiting, and
+      // the answer would be dropped (the approval gate does the same, hitl.ts).
+      const waiting = this.opts.questionDispatcher.register({
+          actionId: toolId, type: "answer",
+          timeoutMs: ASK_USER_QUESTION_TIMEOUT_MS,
+          signal: this.signal,
+        });
+      waiting.catch(() => { /* consumed below; this only keeps an early failure from being unhandled */ });
+      try {
+        await this.onEvent({
           type: "userQuestion",
           actionId: toolId,
           questions: finalInput.questions,
           ts: Date.now(),
         });
+      } catch (err) {
+        this.opts.questionDispatcher.deregister(toolId, "answer");
+        throw err;
+      }
         try {
-        const answer = await this.opts.questionDispatcher.register({
-            actionId: toolId, type: "answer",
-            timeoutMs: ASK_USER_QUESTION_TIMEOUT_MS,
-          signal: this.signal,
-          });
+        const answer = await waiting;
           const resultMsg = answer ? JSON.stringify(answer.answers ?? {}) : "No answer received";
         await this.onEvent({ type: "toolUsed", tool: toolName, actionId: toolId, status: "success", description: resultMsg.slice(0, 200) });
         logger.info({ turn, sessionId: this.sessionId, toolName, resultLen: resultMsg.length, resultPreview: safePreview(resultMsg, 200) }, "tool.result");

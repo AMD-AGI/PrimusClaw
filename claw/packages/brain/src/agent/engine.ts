@@ -33,7 +33,7 @@ import {
   ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY, OPENAI_BASE_URL, OPENAI_API_KEY, LLM_API_STYLE,
   DEFAULT_MODEL, MAX_TURNS,
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED,
-  BASH_APPROVAL_RULES,
+  BASH_APPROVAL_RULES, ASK_USER_QUESTION_ENABLED,
   PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED,
 } from "../config.js";
 import { WebSearchService, WebFetchService, SimpleSessionCostTracker } from "../tools/web/index.js";
@@ -276,7 +276,12 @@ export class AgentEngine {
       { source: "BASH_APPROVAL_RULES", value: bashApprovalFromEnvValue(BASH_APPROVAL_RULES) },
     ]);
     const anyApproval = approval.active || bashPolicy.active;
-    const decisions = anyApproval && extras?.natsConnection
+    // The channel decisions arrive on. Approvals need it, and so does the
+    // question tool, which waits for its answer on the same subject: a
+    // deployment that turns questions on without any approval policy gets the
+    // channel for the question alone (`hitl` below is still built only for an
+    // approval policy).
+    const decisions = (anyApproval || ASK_USER_QUESTION_ENABLED) && extras?.natsConnection
       ? new DecisionDispatcher(extras.natsConnection, sessionId)
       : null;
     const hitl = anyApproval
@@ -484,8 +489,7 @@ export class AgentEngine {
           // The question tool waits for its answer on the same channel as an
           // approval. It was never handed over, so the tool answered "not
           // available" whenever it was called and a question could not be asked
-          // of anyone, a web client or an A2A caller. Present only where an
-          // approval policy builds the channel, as for approvals.
+          // of anyone, a web client or an A2A caller.
           questionDispatcher: decisions ?? undefined,
           onCheckpoint: extras?.onCheckpoint,
           onCacheUse: extras?.onCacheUse,

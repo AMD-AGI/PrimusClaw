@@ -321,6 +321,12 @@ export function createA2aV2<Auth extends { userId: string }>(deps: A2aV2Deps<Aut
     state: StreamState;
   }): Promise<void> {
     const { reply, rpcId, run, sub, initial, state } = args;
+    // The client may be gone already (it hung up while the task was being read):
+    // no `close` event will come for a connection that closed before the listener.
+    if (reply.raw.destroyed || reply.raw.writableEnded) {
+      sub.unsubscribe();
+      return;
+    }
     sseHeaders(reply);
     sseWrite(reply.raw, rpcId, { task: initial });
     let closed = false;
@@ -540,16 +546,18 @@ export function createA2aV2<Auth extends { userId: string }>(deps: A2aV2Deps<Aut
     if (!run) return makeTaskNotFoundError(rpcId, params.id);
     const state = stateOfRun(run, await loadRunEvents(run));
     if (TERMINAL_STATES.has(state)) return makeTaskNotCancelableError(rpcId, params.id, state);
-    // The same two halves as a Stop in the web client: the interrupt Brain
-    // listens for, and the durable cancellation. Held, the row parks at
-    // `cancelling` and reads as CANCELED at once; the worker's own completion
-    // then closes it as `cancelled`.
-    deps.nats.publish(interruptSubject(run.sessionId));
-    await applyTaskStatusTransition("cancelling", {
+    // The same two halves as a Stop in the web client: the durable cancellation
+    // and the interrupt Brain listens for. The row parks at `cancelling` and
+    // reads as CANCELED at once; the worker's own completion then closes it as
+    // `cancelled`. The interrupt is addressed to the whole session, so it is sent
+    // only if this statement is what moved the row: a task that finished since
+    // the state was read must not take a task that has started after it down.
+    const moved = await applyTaskStatusTransition("cancelling", {
       where: "task_id = $1 AND origin = 'a2a' AND status IN ('queued','preparing','running')",
       params: [run.taskId],
     });
-    logger.info({ taskId: run.taskId }, "a2a.CancelTask");
+    if (moved.length) deps.nats.publish(interruptSubject(run.sessionId));
+    logger.info({ taskId: run.taskId, interrupted: moved.length > 0 }, "a2a.CancelTask");
     const current = await loadRun(run.taskId) ?? run;
     return makeJsonRpcSuccess(rpcId, await viewOf(current));
   }
