@@ -674,12 +674,13 @@ const approvalSummaryModelRefusedTotal = new Counter({
 });
 
 // A call that `requires_approval` held and the same server's `auto_approve` released, so it ran
-// without a decision. The tool label is a name the operator listed (or a name an operator-listed
-// prefix matched), so it is bounded by the server's own tool list.
+// without a decision. The label is the operator's own allowlist entry (`mcp__<server>__<entry>`,
+// `get_*` for a prefix), never the name the model sent: HITL runs before any known-tool check, so a
+// model inventing `get_<suffix>` names would otherwise mint a series per name.
 const hitlPolicyAllowTotal = new Counter({
   name: "claw_hitl_policy_allow_total",
-  help: "Held tool calls released by an auto_approve allowlist, by tool.",
-  labelNames: ["tool"] as const,
+  help: "Held tool calls released by an auto_approve allowlist, by the allowlist entry.",
+  labelNames: ["rule"] as const,
   registers: [registry],
 });
 
@@ -954,9 +955,9 @@ export const metrics = {
     approvalSummaryModelRefusedTotal.inc({ status: String(status) });
   },
 
-  /** A held call released by `auto_approve`. */
-  onHitlPolicyAllow(tool: string): void {
-    hitlPolicyAllowTotal.inc({ tool });
+  /** A held call released by `auto_approve`; `rule` is the allowlist entry, not the model's tool name. */
+  onHitlPolicyAllow(rule: string): void {
+    hitlPolicyAllowTotal.inc({ rule });
   },
 
   // ─── Plan Y v2 checkpoint helpers ────────────────────────────────

@@ -90,6 +90,11 @@ export interface HitlOptions {
    * anything else, and an answer that is not exactly `true` releases nothing.
    */
   autoApprove?: (tool: string, input: Record<string, unknown>) => boolean;
+  /**
+   * The allowlist entry behind an `autoApprove` release, for the metric label.
+   * A model can send any tool name, so the raw name must not label a series.
+   */
+  autoApproveRule?: (tool: string, input: Record<string, unknown>) => string | null;
 }
 
 export class HitlController {
@@ -156,7 +161,9 @@ export class HitlController {
       // The operator's explicit allowlist, not a person's decision: no card, no
       // wait, and the record says so.
       const result: HitlResult = { action: "allow", input: req.input, by: "policy" };
-      metrics.onHitlPolicyAllow(req.tool);
+      // Labelled by the operator's entry, not by the name the model sent: HITL runs before any
+      // known-tool check, so a prefix entry would otherwise mint a series per invented name.
+      metrics.onHitlPolicyAllow(this.opts.autoApproveRule?.(req.tool, req.input) ?? "unspecified");
       logger.info({ tool: req.tool, sessionId: req.sessionId }, "hitl.policy_allow");
       await this.emitDecisionResult(req.actionId, result);
       return result;

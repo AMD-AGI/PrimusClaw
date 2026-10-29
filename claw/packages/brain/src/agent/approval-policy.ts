@@ -54,10 +54,18 @@ export interface ApprovalPolicy {
    * the tool also lists it.
    */
   autoApproves(toolName: string, input: Record<string, unknown>): boolean;
+  /**
+   * The allowlist entry that releases this call, spelled `mcp__<server>__<entry>`
+   * (the entry is the operator's own text, `get_*` for a prefix), or null when
+   * the call is not released. Bounded by the operator's configuration, never by
+   * what a model sends, which is what makes it safe as a metric label.
+   */
+  autoApprovalRule(toolName: string, input: Record<string, unknown>): string | null;
 }
 
 type Matcher = (bare: string) => boolean;
-type AutoMatcher = (bare: string, input: Record<string, unknown>) => boolean;
+/** The matching entry as the operator wrote it (`get_*`), or null for no match. */
+type AutoMatcher = (bare: string, input: Record<string, unknown>) => string | null;
 
 /** A `when` value: what a top-level argument must strictly equal. */
 type Scalar = string | number | boolean | null;
@@ -96,7 +104,7 @@ function compile(value: unknown): { match: Matcher | null; invalid: boolean } {
  */
 function compileAuto(value: unknown): AutoMatcher | null {
   if (!Array.isArray(value) || value.length === 0) return null;
-  const rules: Array<{ exact: string | null; prefix: string | null; when: Array<[string, Scalar]> }> = [];
+  const rules: Array<{ spelled: string; exact: string | null; prefix: string | null; when: Array<[string, Scalar]> }> = [];
   for (const raw of value) {
     const entry = typeof raw === "string" ? { tool: raw } : raw;
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
@@ -119,12 +127,12 @@ function compileAuto(value: unknown): AutoMatcher | null {
         conditions.push([key, want as Scalar]);
       }
     }
-    if (name.endsWith("*")) rules.push({ exact: null, prefix: name.slice(0, -1), when: conditions });
-    else rules.push({ exact: name, prefix: null, when: conditions });
+    if (name.endsWith("*")) rules.push({ spelled: name, exact: null, prefix: name.slice(0, -1), when: conditions });
+    else rules.push({ spelled: name, exact: name, prefix: null, when: conditions });
   }
-  return (bare, input) => rules.some((r) =>
+  return (bare, input) => rules.find((r) =>
     (r.exact !== null ? bare === r.exact : bare.startsWith(r.prefix!))
-    && r.when.every(([key, want]) => Object.hasOwn(input, key) && input[key] === want));
+    && r.when.every(([key, want]) => Object.hasOwn(input, key) && input[key] === want))?.spelled ?? null;
 }
 
 interface ServerRule {
@@ -178,18 +186,32 @@ export function approvalPolicyFromMcp(
   }
   const held = (r: ServerRule, toolName: string): boolean =>
     toolName.startsWith(r.prefix) && r.holds!(toolName.slice(r.prefix.length));
+  // Server names may contain "__", so two servers can claim one tool name.
+  // Each that holds it has to release it; the answer names the first one's entry.
+  const releasedBy = (toolName: string, input: Record<string, unknown>): string | null => {
+    const holding = rules.filter((r) => held(r, toolName));
+    if (holding.length === 0) return null;
+    let first: string | null = null;
+    for (const r of holding) {
+      if (r.autos.length === 0) return null;
+      for (const a of r.autos) {
+        const entry = a === null ? null : a(toolName.slice(r.prefix.length), input ?? {});
+        if (entry === null) return null;
+        first ??= `${r.prefix}${entry}`;
+      }
+    }
+    return first;
+  };
   return {
     active: rules.length > 0,
     requiresApproval(toolName: string): boolean {
       return rules.some((r) => held(r, toolName));
     },
     autoApproves(toolName: string, input: Record<string, unknown>): boolean {
-      // Server names may contain "__", so two servers can claim one tool name.
-      // Each that holds it has to release it.
-      const holding = rules.filter((r) => held(r, toolName));
-      if (holding.length === 0) return false;
-      return holding.every((r) => r.autos.length > 0
-        && r.autos.every((a) => a !== null && a(toolName.slice(r.prefix.length), input ?? {})));
+      return releasedBy(toolName, input) !== null;
+    },
+    autoApprovalRule(toolName: string, input: Record<string, unknown>): string | null {
+      return releasedBy(toolName, input);
     },
   };
 }

@@ -270,6 +270,7 @@ export class AgentEngine {
       ? new HitlController(decisions, onEvent, {
           requireApproval: (t) => approval.requiresApproval(t),
           autoApprove: (t, input) => approval.autoApproves(t, input),
+          autoApproveRule: (t, input) => approval.autoApprovalRule(t, input),
           requireApprovalFor: (t, input) => (t.toLowerCase() === "bash" ? bashPolicy.check(input.command) : null),
         })
       : undefined;

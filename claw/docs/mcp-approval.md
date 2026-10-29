@@ -37,7 +37,7 @@ an object with a `tool` and an optional `when`:
   person, and is denied when nobody answers or no approval channel exists.
 - A listed call runs at once, with no approval card, even in a session nobody is
   watching. It is recorded as a `decisionResult` with `by: "policy"` and counted
-  in `claw_hitl_policy_allow_total{tool}`.
+  in `claw_hitl_policy_allow_total{rule}`.
 - `when` compares the call's top-level arguments with strict equality: each value
   must be a string, number, boolean or `null`, and every listed key must be present
   and equal. A nested argument cannot be matched, so a tool whose risk sits inside

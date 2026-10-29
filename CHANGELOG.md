@@ -33,7 +33,7 @@ record it.
   arguments) of the held tools that may run without a decision, so a session nobody is watching can run
   low-risk tools. A held tool that is not listed still waits for a person; an absent field changes
   nothing, and a malformed one releases nothing. A release is recorded as `decisionResult` with
-  `by: "policy"` and counted in `claw_hitl_policy_allow_total{tool}`. See `claw/docs/mcp-approval.md`.
+  `by: "policy"` and counted in `claw_hitl_policy_allow_total{rule}`. See `claw/docs/mcp-approval.md`.
 - A shared identity client in `@claw/utils`, built by API and Brain when
   `IDENTITY_CLIENT_ENABLED=true` (off by default; nothing authenticates through it yet). It does OIDC
   discovery and caches the issuer's JWKS, RFC 7662 token introspection (an active answer is cached for

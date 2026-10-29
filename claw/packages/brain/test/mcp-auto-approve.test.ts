@@ -240,6 +240,7 @@ function controllerFor(servers: Record<string, Record<string, unknown>>, d: Retu
   return new HitlController(d as never, onEvent as never, {
     requireApproval: (t) => approval.requiresApproval(t),
     autoApprove: (t, input) => approval.autoApproves(t, input),
+    autoApproveRule: (t, input) => approval.autoApprovalRule(t, input),
   });
 }
 
@@ -379,17 +380,53 @@ test("autoApprove alone creates no hold and no approval", async () => {
   assert.equal(events.length, 0);
 });
 
-test("a policy release is counted, by tool, and a refusal is not", async () => {
-  const count = async (tool: string) => {
-    const m = registry.getSingleMetric("claw_hitl_policy_allow_total");
-    assert.ok(m, "metric is registered");
-    const { values } = await (m as unknown as { get(): Promise<{ values: Array<{ labels: Record<string, string>; value: number }> }> }).get();
-    return values.find((v) => v.labels.tool === tool)?.value ?? 0;
-  };
+/** Every series of the release counter, by its `rule` label. */
+async function releaseSeries(): Promise<Map<string, number>> {
+  const m = registry.getSingleMetric("claw_hitl_policy_allow_total");
+  assert.ok(m, "metric is registered");
+  const { values } = await (m as unknown as { get(): Promise<{ values: Array<{ labels: Record<string, string>; value: number }> }> }).get();
+  return new Map(values.map((v) => [v.labels.rule, v.value]));
+}
+
+test("a policy release is counted, by the allowlist entry, and a refusal is not", async () => {
+  const count = async (rule: string) => (await releaseSeries()).get(rule) ?? 0;
   const before = await count(T("job_requeue"));
   const beforeHeld = await count(T("job_cancel"));
   await run(T("job_requeue"), { job: "j1" }, null);
   await run(T("job_cancel"), { job: "j1" }, null);
   assert.equal(await count(T("job_requeue")), before + 1);
   assert.equal(await count(T("job_cancel")), beforeHeld);
+});
+
+test("a prefix entry is one series however many tool names a model invents", async () => {
+  const servers = spec({ requires_approval: true, auto_approve: ["get_*"] });
+  const before = await releaseSeries();
+  const invented = Array.from({ length: 25 }, (_, i) => T(`get_invented_${i}`));
+  for (const name of invented) {
+    const c = controllerFor(servers, null, async () => {});
+    const r = await c.beforeToolUse({ sessionId: "s", actionId: "a", tool: name, input: {} });
+    assert.equal((r as { by: string }).by, "policy", name);
+  }
+  const after = await releaseSeries();
+  // The label is the operator's entry, so 25 invented names add 25 to ONE series, not 25 series.
+  const added = [...after.keys()].filter((k) => !before.has(k));
+  assert.deepEqual(added, [T("get_*")]);
+  assert.equal((after.get(T("get_*")) ?? 0) - (before.get(T("get_*")) ?? 0), invented.length);
+  for (const name of invented) assert.equal(after.has(name), false, name);
+});
+
+test("autoApprovalRule names the entry that releases a call, and nothing for a call that is held", () => {
+  const p = approvalPolicyFromMcp(spec({
+    requires_approval: true,
+    auto_approve: ["job_requeue", "get_*", { tool: "plan_set_status", when: { status: "paused" } }],
+  }));
+  assert.equal(p.autoApprovalRule(T("job_requeue"), {}), T("job_requeue"));
+  assert.equal(p.autoApprovalRule(T("get_whatever"), {}), T("get_*"));
+  assert.equal(p.autoApprovalRule(T("plan_set_status"), { status: "paused" }), T("plan_set_status"));
+  assert.equal(p.autoApprovalRule(T("plan_set_status"), { status: "running" }), null);
+  assert.equal(p.autoApprovalRule(T("job_cancel"), {}), null);
+  // It agrees with autoApproves on every one of them.
+  for (const [bare, input] of [["job_requeue", {}], ["get_x", {}], ["job_cancel", {}], ["plan_set_status", { status: "running" }]] as const) {
+    assert.equal(p.autoApproves(T(bare), input), p.autoApprovalRule(T(bare), input) !== null, bare);
+  }
 });
