@@ -429,11 +429,7 @@ func main() {
 
 	if grants != nil {
 		routerServer.WithGrants(grants)
-		idClient, err := ownerKeys(ctx, grants)
-		if err != nil {
-			log.Error("identity key init failed", "error", err)
-			os.Exit(1)
-		}
+		idClient := ownerKeys(ctx, grants)
 		opts := e2b.Options{
 			Grants:    grants,
 			Runner:    apiServer,
@@ -478,25 +474,32 @@ func main() {
 }
 
 // ownerKeys enables primus-identity keys when both the introspection client and
-// the owner policy are configured. It returns nil when either is absent.
-func ownerKeys(ctx context.Context, grants *grant.Service) (*identity.Client, error) {
+// the owner policy are configured. It returns nil when either is absent or
+// invalid, so grant keys keep working.
+func ownerKeys(ctx context.Context, grants *grant.Service) *identity.Client {
 	client, err := identity.FromEnv()
-	if err != nil || client == nil {
-		return nil, err
+	if err != nil {
+		log.Error("identity keys disabled: identity client config is invalid", "error", err)
+		return nil
+	}
+	if client == nil {
+		return nil
 	}
 	policy, err := grant.OwnerPolicyFromEnv()
 	if err != nil {
-		return nil, err
+		log.Error("identity keys disabled: owner policy is invalid", "error", err)
+		return nil
 	}
 	if policy == nil {
 		log.Warn("identity keys disabled: owner policy is not configured")
-		return nil, nil
+		return nil
 	}
 	if err := grants.SetOwnerPolicy(ctx, *policy); err != nil {
-		return nil, err
+		log.Error("identity keys disabled: owner policy was not applied", "error", err)
+		return nil
 	}
 	log.Info("identity keys enabled", "role", grants.OwnerRole())
-	return client, nil
+	return client
 }
 
 // startGrants serves the grant admin API from SandboxGrant CRs and reaps
