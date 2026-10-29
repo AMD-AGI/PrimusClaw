@@ -17,15 +17,16 @@ import Fastify, { type FastifyInstance } from "fastify";
 
 import type { UserInfo } from "../src/auth/models.js";
 import { SANDBOX_ADMIN_URL } from "../src/config.js";
-import { buildUpstreamQuery, registerSandboxAdminRoutes } from "../src/routes/sandbox-admin.js";
+import { buildUpstreamQuery, registerSandboxAdminRoutes, sandboxAdminSettings } from "../src/routes/sandbox-admin.js";
 
-function user(userId: string, roles: string[]): UserInfo {
-  return { userId, userName: userId, roles, platformKey: "", virtualKey: `vk-${userId}` };
+function user(userId: string, roles: string[], platformKey = ""): UserInfo {
+  return { userId, userName: userId, roles, platformKey, virtualKey: `vk-${userId}` };
 }
 
 const MEMBER = user("u-member", ["default"]);
 const READONLY_ADMIN = user("u-ops", ["system-admin-readonly"]);
 const FULL_ADMIN = user("u-admin", ["system-admin"]);
+const KEYED_ADMIN = user("u-keyed", ["system-admin"], "ak-keyed-admin");
 
 interface RouterCall { url: string; init: RequestInit | undefined }
 
@@ -36,6 +37,7 @@ let calls: RouterCall[] = [];
 let answer: () => Promise<Response> = async () => Response.json({ totalCount: 0, items: [] });
 
 beforeEach(() => {
+  sandboxAdminSettings.routerAuth = false;
   calls = [];
   answer = async () => Response.json({ totalCount: 0, items: [] });
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
@@ -133,6 +135,81 @@ test("a Router that is down, unhealthy or not speaking JSON is a 502, not an emp
     const res = await app.inject({ method: "GET", url: "/v1/admin/sandbox/sessions" });
     assert.equal(res.statusCode, 502, label);
     assert.equal(res.json().ok, false, label);
+  }
+  await app.close();
+});
+
+test("with Router auth off no credential is sent, even when the admin has a key", async () => {
+  const app = await appAs(KEYED_ADMIN);
+  for (const route of ["templates", "sessions"]) {
+    const res = await app.inject({ method: "GET", url: `/v1/admin/sandbox/${route}` });
+    assert.equal(res.statusCode, 200);
+  }
+  assert.equal(calls.length, 2);
+  for (const c of calls) assert.equal(c.init?.headers, undefined);
+  await app.close();
+});
+
+test("with Router auth on the admin's own SaFE key is the one header sent, to both endpoints", async () => {
+  sandboxAdminSettings.routerAuth = true;
+  const app = await appAs(KEYED_ADMIN);
+  for (const route of ["templates", "sessions"]) {
+    const res = await app.inject({
+      method: "GET",
+      url: `/v1/admin/sandbox/${route}`,
+      headers: { cookie: "Token=browser-secret", authorization: "Bearer ak-someone-else", userid: "u-evil" },
+    });
+    assert.equal(res.statusCode, 200, route);
+  }
+  assert.equal(calls.length, 2);
+  for (const c of calls) assert.deepEqual(c.init?.headers, { Authorization: "Bearer ak-keyed-admin" });
+  await app.close();
+});
+
+test("with Router auth on, a Router that answers 401 without a credential lists for the admin's key", async () => {
+  sandboxAdminSettings.routerAuth = true;
+  globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+    calls.push({ url: String(input), init });
+    const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
+    return auth === "Bearer ak-keyed-admin"
+      ? Response.json({ totalCount: 0, items: [] })
+      : Response.json({ error: "authentication required" }, { status: 401 });
+  }) as typeof fetch;
+  const keyed = await appAs(KEYED_ADMIN);
+  const ok = await keyed.inject({ method: "GET", url: "/v1/admin/sandbox/sessions" });
+  assert.equal(ok.statusCode, 200);
+  await keyed.close();
+});
+
+test("with Router auth on, an admin session that has no SaFE key is refused clearly and the Router is not asked", async () => {
+  sandboxAdminSettings.routerAuth = true;
+  const app = await appAs(FULL_ADMIN);
+  for (const route of ["templates", "sessions"]) {
+    const res = await app.inject({ method: "GET", url: `/v1/admin/sandbox/${route}` });
+    assert.equal(res.statusCode, 503, route);
+    assert.equal(res.json().error, "router_credentials_unavailable");
+    assert.match(res.json().message, /no SaFE API key/);
+  }
+  assert.equal(calls.length, 0);
+  await app.close();
+});
+
+test("a Router refusal of the caller's filters is a 400; a refusal of our credential or a missing path stays a 502", async () => {
+  const app = await appAs(FULL_ADMIN);
+  answer = async () => Response.json({ error: "invalid public value: yes" }, { status: 400 });
+  const bad = await app.inject({ method: "GET", url: "/v1/admin/sandbox/templates?public=yes" });
+  assert.equal(bad.statusCode, 400);
+  assert.equal(bad.json().ok, false);
+  assert.match(bad.json().message, /invalid public value: yes/);
+
+  answer = async () => new Response("not json", { status: 422 });
+  const unprocessable = await app.inject({ method: "GET", url: "/v1/admin/sandbox/templates?public=yes" });
+  assert.equal(unprocessable.statusCode, 400);
+
+  for (const status of [401, 403, 404, 429]) {
+    answer = async () => Response.json({ error: "nope" }, { status });
+    const res = await app.inject({ method: "GET", url: "/v1/admin/sandbox/templates" });
+    assert.equal(res.statusCode, 502, String(status));
   }
   await app.close();
 });
