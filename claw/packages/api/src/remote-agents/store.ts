@@ -390,18 +390,19 @@ export async function listAudit(owner: string, filter: { sessionId: string | nul
 
 
 /**
- * The decision already issued under `cmdId`, read from the audit trail, shaped like the queue row
- * it replaces for the one field a caller compares (`payload.option_id`). Null when there is none.
+ * The command already issued to this connector under `cmdId`, read from the audit trail, shaped like
+ * the queue row it replaces for the fields a caller compares (`type`, `session_id`, and a decision's
+ * `payload.option_id`). Null when there is none.
  */
-async function decisionIssued(q: Querier, owner: string, sessionId: string, cmdId: string): Promise<Row | null> {
+async function commandIssued(q: Querier, owner: string, connectorId: string, cmdId: string): Promise<Row | null> {
   const a = (await q(
-    `SELECT detail FROM claw_remote_audit
-      WHERE owner_user_id = $1 AND session_id = $2 AND action = 'command.issued' AND detail->>'cmd_id' = $3
+    `SELECT session_id::text AS session_id, detail FROM claw_remote_audit
+      WHERE owner_user_id = $1 AND connector_id = $2 AND action = 'command.issued' AND detail->>'cmd_id' = $3
       ORDER BY id LIMIT 1`,
-    [owner, sessionId, cmdId],
+    [owner, connectorId, cmdId],
   )).rows[0];
   if (!a) return null;
-  return { cmd_seq: null, cmd_id: cmdId, session_id: sessionId, type: a.detail?.type, payload: { option_id: a.detail?.option_id } };
+  return { cmd_seq: null, cmd_id: cmdId, session_id: a.session_id, type: a.detail?.type, payload: { option_id: a.detail?.option_id } };
 }
 
 export type IssueOutcome =
@@ -439,13 +440,12 @@ export async function issueCommand(r: IssueRequest): Promise<IssueOutcome> {
       [r.connectorId, r.cmdId],
     )).rows[0];
     if (dup) return { status: "duplicate", row: dup } as IssueOutcome;
-    // A heartbeat deletes the queue row once the connector has handled the command, but the
-    // connector's own `permission_resolved` may not have arrived yet. In that window the queue
-    // no longer remembers the decision, so the audit trail, which is never pruned, does.
-    if (r.type === "decision") {
-      const prior = await decisionIssued(q, r.owner, r.sessionId, r.cmdId);
-      if (prior) return { status: "duplicate", row: prior } as IssueOutcome;
-    }
+    // A heartbeat deletes the queue row once the connector has handled the command, and a retry
+    // may arrive after that (the response was lost, the connector ran it, the next heartbeat
+    // acknowledged it). The queue no longer remembers the command, so the audit trail, which is
+    // never pruned, does: for every command, not only a decision, or the retry would run it twice.
+    const prior = await commandIssued(q, r.owner, r.connectorId, r.cmdId);
+    if (prior) return { status: "duplicate", row: prior } as IssueOutcome;
     if (await recentCommandCount(q, r.owner) >= r.commandsPerMinute) return { status: "rate_limited" } as IssueOutcome;
     const queued = await enqueueCommand(q, { connectorId: r.connectorId, cmdId: r.cmdId, sessionId: r.sessionId, type: r.type, payload: r.payload });
     await writeAudit(q, {

@@ -112,8 +112,9 @@ export async function ensureRemoteAgentSchema(client: pg.PoolClient): Promise<vo
   await client.query(
     "CREATE INDEX IF NOT EXISTS idx_remote_audit_rate ON claw_remote_audit(owner_user_id, action, ts)",
   );
-  // A decision is remembered through its audit row, so finding it must not read the owner's whole trail.
+  // A command is remembered through its audit row once the queue has forgotten it (an Idempotency-Key
+  // retry, a second decision), so finding it must not read the owner's whole trail.
   await client.query(
-    "CREATE INDEX IF NOT EXISTS idx_remote_audit_session ON claw_remote_audit(session_id, action)",
+    "CREATE INDEX IF NOT EXISTS idx_remote_audit_cmd ON claw_remote_audit((detail->>'cmd_id')) WHERE action = 'command.issued'",
   );
 }

@@ -421,6 +421,38 @@ describe("remote agents", { skip }, () => {
       assert.deepEqual([reused.status, reused.body.error], [409, "idempotency_key_reused"]);
     });
 
+    test("an Idempotency-Key still protects a retry after the connector has acknowledged the command", async () => {
+      const { cid } = await online1();
+      const sid = await session("u1", cid);
+      const elsewhere = await session("u1", cid, "/work/other");
+      const send = (on: string, type: string, key: string, extra: object = {}) =>
+        as("u1").post(`/v1/remote-agents/sessions/${on}/commands`, { type, ...extra }, { "idempotency-key": key });
+      const queued = async (type: string) => (await q("SELECT COUNT(*) AS n FROM claw_remote_commands WHERE type = $1", [type])).rows[0].n;
+      const first = await send(sid, "prompt", "lost-reply", { text: "once" });
+      assert.equal(first.status, 202);
+      // The response never reached the client. The connector ran the prompt, and its next heartbeat
+      // acknowledged it, which deletes the queued row.
+      assert.equal((await heartbeat("u1", cid, { cmd_cursor: first.body.data.cmd_seq })).status, 200);
+      assert.equal(await queued("prompt"), "0", "the queue no longer remembers the command");
+
+      const retry = await send(sid, "prompt", "lost-reply", { text: "once" });
+      assert.deepEqual([retry.status, retry.body.data], [200, { cmd_id: "k:lost-reply", duplicate: true }]);
+      assert.equal(await queued("prompt"), "0", "the retry queued nothing, so the agent does not run the prompt twice");
+      const audited = (await as("u1").get(`/v1/remote-agents/audit?session_id=${sid}`)).body.data
+        .filter((r: any) => r.action === "command.issued" && r.detail.type === "prompt");
+      assert.equal(audited.length, 1, "issued once, audited once");
+
+      // The key still names one command: another type, or another session, is a different request.
+      const type = await send(sid, "cancel", "lost-reply");
+      assert.deepEqual([type.status, type.body.error], [409, "idempotency_key_reused"]);
+      const session2 = await send(elsewhere, "prompt", "lost-reply", { text: "once" });
+      assert.deepEqual([session2.status, session2.body.error], [409, "idempotency_key_reused"]);
+      assert.equal(await queued("prompt"), "0");
+      // A different key is a different command.
+      const mine = await send(sid, "prompt", "fresh-key", { text: "next" });
+      assert.equal(mine.status, 202);
+    });
+
     test("closing a session closes it for further commands", async () => {
       const { cid } = await online1();
       const sid = await session("u1", cid);

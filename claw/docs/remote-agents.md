@@ -144,6 +144,11 @@ connector-side route answers `401 revoked`.
 connector is offline, so a prompt nobody could see being waited on cannot run later.
 `cancel`, `close` and `decision` are queued, since they are safe to deliver late.
 
+`Idempotency-Key` holds for as long as the audit trail does, not only while the command is
+queued: a retry made after the connector has acknowledged the command is answered
+`200 {duplicate: true}` and queues nothing, and the same key with another command type or
+another session is `409 idempotency_key_reused`.
+
 Limits per user: 5 connectors, 10 active sessions, 60 commands a minute, 20 open
 event streams per API replica.
 
