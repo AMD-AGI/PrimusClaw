@@ -11,11 +11,12 @@ JWT genuine* (OIDC discovery and the issuer's JWKS), and *give me a token for th
 user* (RFC 8693 token exchange). It lives in `packages/utils/src/identity/` and
 speaks only those standards, so any provider that implements them works.
 
-It is **off by default and not wired into request authentication**. With
-`IDENTITY_CLIENT_ENABLED=true` each process builds the client, reads discovery and
-the key set in the background (a failure is logged, not fatal) and exports the
-`claw_identity_*` metrics. Code that wants the client gets it from
-`identityClient()` (`api/src/auth/identity.ts`, `brain/src/clients/identity.ts`).
+It is **off by default, and authenticates no request unless the access-token
+credential below is also switched on**. With `IDENTITY_CLIENT_ENABLED=true` each
+process builds the client, reads discovery and the key set in the background (a
+failure is logged, not fatal) and exports the `claw_identity_*` metrics. Code that
+wants the client gets it from `identityClient()` (`api/src/auth/identity.ts`,
+`brain/src/clients/identity.ts`).
 
 ## Settings
 
@@ -91,3 +92,74 @@ unencrypted, so use `https://` anywhere that is not true.
 | `claw_identity_upstream_total` | `op`, `outcome` | `ok`, `inactive`, `refused`, or the failure: `timeout`, `network`, `rate_limited`, `http_5xx`, `http_4xx`, `bad_response`, `client_rejected` |
 | `claw_identity_upstream_duration_seconds` | `op` | Histogram of provider calls |
 | `claw_identity_client_enabled` | | 1 when the client is on in this process |
+
+## Access tokens as an API credential
+
+A browser application that signs a user in with an OpenID Connect authorization
+code flow holds an RFC 9068 access token for this API. With
+`CLAW_IDENTITY_TOKEN_AUTH_ENABLED=true` (and the identity client on) the API
+accepts it as `Authorization: Bearer <JWT>`, beside the credentials it already
+accepts. The code is `packages/api/src/auth/identity-token.ts`; it verifies with
+`verifyJwt` and reads no signature or key itself.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CLAW_IDENTITY_TOKEN_AUTH_ENABLED` | off | `true`, `1` or `yes` turns the credential on. It also needs `IDENTITY_CLIENT_ENABLED`; without the client the path does nothing |
+| `CLAW_IDENTITY_TOKEN_AUDIENCE` | `claw-api` | The `aud` the token must name |
+| `CLAW_IDENTITY_TOKEN_SCOPE` | `claw.api` | The scope the token must carry |
+| `CLAW_IDENTITY_TOKEN_INTROSPECT` | off | Also ask the provider (RFC 7662) whether the token is still active, so a revoked grant stops at once rather than when the token expires |
+
+These are read on each request. In the chart they are `identity.tokenAuth.enabled`,
+`.audience`, `.scope` and `.introspect`, rendered into the API Deployment only;
+`identity.tokenAuth.enabled` without `identity.enabled` is refused at render time.
+
+**What a token must be.** Typed `at+jwt` in its JOSE header, signed RS256 or ES256
+by a key in the issuer's key set, issued by the configured issuer, naming
+`CLAW_IDENTITY_TOKEN_AUDIENCE` in `aud`, carrying `CLAW_IDENTITY_TOKEN_SCOPE` in
+`scope` (a space-delimited string, or an array), and inside its `nbf` and `exp`.
+The typing refuses an ID token (typed `JWT`, issued to the application). The scope
+refuses a token that was issued for the same audience for another purpose, such as
+a connector's: holding a token for this API is not enough, it has to say it is for
+this use.
+
+**Who the caller is.** The user model is the one the other credentials produce:
+
+| Token | `UserInfo` |
+|---|---|
+| `sub` | `userId`, exactly as the issuer wrote it. A subject that is missing, blank, padded with whitespace, longer than 128 characters or containing a control character is refused, not repaired |
+| `name`, else `preferred_username`, else `email`, else `sub` | `userName` (at most 128 characters) |
+| `roles` | `roles`: the strings in the claim, once each, at most 32 of 64 characters or fewer, and `default` is always present. A claim that is not an array says nothing. `groups` is not read |
+| | `platformKey` and `virtualKey` are empty: no session key stands behind a token |
+
+**How it combines with the other credentials.**
+
+- Once a Bearer value is shaped like a JWT (three base64url segments) and is not an
+  `ak-` key, the token path's answer is final. A token that does not verify is a
+  401 `invalid_token` (a missing scope is a 403 `insufficient_scope`), and no other
+  credential on the request is tried instead; a provider that cannot be asked is a
+  503 `authentication_service_unavailable`, never an "invalid token".
+- A `Token` cookie is still judged first, and an `ak-` key is still judged by SaFE
+  (`ak-` is settled before the token path runs). Behind the switch nothing about
+  them changes; with it off nothing about the request changes at all.
+- It applies in the Kubernetes deployment mode too, where it is judged before the
+  gateway-key check. In that mode a Bearer value that looks like a JWT is a token,
+  not a key, once the switch is on.
+
+**Limits, stated.**
+
+- Local verification cannot see a revocation: a token is good until it expires (the
+  provider decides how long it lives).
+  `CLAW_IDENTITY_TOKEN_INTROSPECT` closes that gap at the cost of one cached
+  provider call per token, and then an outage of the provider fails requests with a
+  503 rather than letting a possibly revoked token through (the introspection cache
+  and its stale window apply as above).
+- The roles in the token are taken as the provider's statement. Whether a role
+  means administrator is decided by the same rules as for any other credential.
+- Nothing here issues per-user LLM keys: a user authenticated by a token has none,
+  so a deployment that needs a per-user key for model calls has to provide it some
+  other way.
+- Only the Bearer header is read. A browser download by `?token=` is still an `ak-`
+  key only, and a WebSocket upgrade is not covered.
+- Unverified: this was exercised against a stand-in provider on a socket with real
+  RS256 and ES256 keys, not against a deployed provider's authorization code flow.
+

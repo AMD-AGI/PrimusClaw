@@ -162,7 +162,7 @@
       "additionalProperties": true,
       "properties": {
         "enabled": {
-          "description": "Build the shared identity client in API and Brain. Off by default; nothing authenticates through it yet.",
+          "description": "Build the shared identity client in API and Brain. Off by default; nothing authenticates through it unless identity.tokenAuth is on.",
           "default": false,
           "type": "boolean"
         },
@@ -189,6 +189,26 @@
         },
         "exchangeRefreshSkewSeconds": {
           "$ref": "#/definitions/optionalWholeNumber"
+        },
+        "tokenAuth": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "enabled": {
+              "description": "Accept an access token the identity provider issued as an API credential. Off by default; needs identity.enabled.",
+              "default": false,
+              "type": "boolean"
+            },
+            "audience": {
+              "type": "string"
+            },
+            "scope": {
+              "type": "string"
+            },
+            "introspect": {
+              "type": "boolean"
+            }
+          }
         }
       }
     }

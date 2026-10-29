@@ -15,6 +15,7 @@ import { cacheUserLlmKey } from "../llm/client.js";
 import { resolveUserLlmKey, usePlatformKeyForLlm } from "../llm/key-source.js";
 import { ByokInvalidKeyError, ByokRateLimitError, ByokUpstreamUnavailableError, verifyByokKey } from "./byok.js";
 import { constantTimeEquals } from "@claw/utils";
+import { verifyIdentityAccessToken } from "./identity-token.js";
 import pino from "pino";
 
 const logger = pino({ name: "auth" });
@@ -452,11 +453,16 @@ type CredentialPath = (
  * Exported so the order is pinned by a test: moving the cookie path after a
  * header path would let a request with a stale cookie and a valid header
  * authenticate, which is the opposite of the fail-closed behaviour above.
+ *
+ * The identity-token path sits after the `ak-` key path, which settles every
+ * Bearer value that starts with `ak-` before it can be taken for a JWT, and
+ * abstains unless it is switched on.
  */
 export const CREDENTIAL_PATHS: readonly CredentialPath[] = [
   verifySessionCookie,
   verifyDownloadQueryToken,
   verifyBearerApiKey,
+  verifyIdentityAccessToken,
   verifyXApiKeyHeader,
 ];
 
@@ -523,6 +529,18 @@ export async function authMiddleware(req: FastifyRequest, reply: FastifyReply): 
   // The same key flows on as the selected LLM source (virtualKey by default,
   // platformKey in proxy mode) and is injected into the sandbox.
   if (isKubernetesMode()) {
+    // An identity provider's access token (auth/identity-token.ts) is judged first
+    // here too, and abstains unless CLAW_IDENTITY_TOKEN_AUTH_ENABLED is on; in the
+    // SaFE mode below it is one of CREDENTIAL_PATHS.
+    const identityToken = await verifyIdentityAccessToken(req, null, pathname);
+    if (identityToken.status === "verified") {
+      grantVerifiedUser(req, identityToken.user, identityToken.method);
+      return;
+    }
+    if (identityToken.status === "rejected") {
+      const { status, legacyError, anthropicType, message } = identityToken.error;
+      return sendAuthError(req, reply, status, legacyError, anthropicType, message) as any;
+    }
     const key = extractApiKey(req);
     if (!key) {
       return sendAuthError(req, reply, 401, "authentication_required", "authentication_error",

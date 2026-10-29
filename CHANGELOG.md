@@ -28,8 +28,15 @@ record it.
 ## [Unreleased]
 
 ### Added
+- The API accepts an access token from an OpenID Connect identity provider (`Authorization: Bearer <JWT>`,
+  verified by the shared identity client against the issuer's key set) as a credential beside the existing
+  ones, behind `CLAW_IDENTITY_TOKEN_AUTH_ENABLED` (off by default; also needs `IDENTITY_CLIENT_ENABLED`).
+  The token must be typed `at+jwt`, name `CLAW_IDENTITY_TOKEN_AUDIENCE` (default `claw-api`) and carry
+  `CLAW_IDENTITY_TOKEN_SCOPE` (default `claw.api`); `sub` becomes the user id and `roles` the roles.
+  `CLAW_IDENTITY_TOKEN_INTROSPECT` also asks the provider whether the token is still active. The chart takes
+  `identity.tokenAuth`. See `claw/docs/identity-client.md`.
 - A shared identity client in `@claw/utils`, built by API and Brain when
-  `IDENTITY_CLIENT_ENABLED=true` (off by default; nothing authenticates through it yet). It does OIDC
+  `IDENTITY_CLIENT_ENABLED=true` (off by default; it authenticates a request only through the access-token credential above). It does OIDC
   discovery and caches the issuer's JWKS, RFC 7662 token introspection (an active answer is cached for
   30 s, an inactive one for 5 s, concurrent lookups of one credential share one call), and an RFC 8693
   token exchange with a token cache. When the provider cannot be asked, a cached active answer keeps

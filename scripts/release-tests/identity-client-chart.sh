@@ -168,6 +168,45 @@ if rg -q 'IDENTITY_INTROSPECTION_CACHE_SECONDS|IDENTITY_STALE_IF_ERROR_SECONDS' 
 fi
 ok "a blank numeric value renders nothing"
 
+echo "==> access token as an API credential"
+
+# Off unless asked, and with identity.enabled off nothing renders however much is staged.
+if rg -q 'CLAW_IDENTITY_TOKEN_' "$tmp/default.yaml" "$tmp/on.yaml"; then
+  bad "a render without identity.tokenAuth.enabled carries a CLAW_IDENTITY_TOKEN_ entry"
+fi
+render "$tmp/token-staged.yaml" "${base[@]}" \
+  --set-string identity.tokenAuth.audience=other-api --set-string identity.tokenAuth.scope=other.scope --set identity.tokenAuth.introspect=true
+cmp -s "$tmp/default.yaml" "$tmp/token-staged.yaml" || bad "staged identity.tokenAuth values changed the render while it is off"
+render "$tmp/token-staged-on.yaml" "${base[@]}" "${enabled[@]}" \
+  --set-string identity.tokenAuth.audience=other-api --set identity.tokenAuth.introspect=true
+cmp -s "$tmp/on.yaml" "$tmp/token-staged-on.yaml" || bad "staged identity.tokenAuth values changed the render while identity.tokenAuth.enabled is false"
+rg -q '^    enabled: false$' <(sed -n '/^  tokenAuth:/,/^    audience/p' "$chart_dir/values.yaml") \
+  || bad "values.yaml does not ship identity.tokenAuth.enabled: false"
+ok "off by default, and staged values change nothing"
+
+render "$tmp/token.yaml" "${base[@]}" "${enabled[@]}" --set identity.tokenAuth.enabled=true
+document_of "$tmp/token.yaml" "primus-claw/templates/api-deployment.yaml" >"$tmp/api.token"
+document_of "$tmp/token.yaml" "primus-claw/templates/brain-deployment.yaml" >"$tmp/brain.token"
+[ "$(env_value "$tmp/api.token" CLAW_IDENTITY_TOKEN_AUTH_ENABLED)" = "true" ] || bad "the API Deployment does not get CLAW_IDENTITY_TOKEN_AUTH_ENABLED=true"
+if rg -q 'CLAW_IDENTITY_TOKEN_' "$tmp/brain.token"; then bad "Brain was given a CLAW_IDENTITY_TOKEN_ entry"; fi
+[ "$(rg -c 'name: CLAW_IDENTITY_TOKEN_AUTH_ENABLED$' "$tmp/token.yaml")" = 1 ] \
+  || bad "CLAW_IDENTITY_TOKEN_AUTH_ENABLED should render in exactly one Deployment"
+for optional in CLAW_IDENTITY_TOKEN_AUDIENCE CLAW_IDENTITY_TOKEN_SCOPE CLAW_IDENTITY_TOKEN_INTROSPECT; do
+  if rg -q "name: $optional\$" "$tmp/api.token"; then bad "$optional rendered although unset"; fi
+done
+# It rides on the identity client's own entries, which are still there.
+[ "$(env_value "$tmp/api.token" IDENTITY_CLIENT_ENABLED)" = "true" ] || bad "the identity client's own switch went missing"
+ok "only the API gets the switch, and no optional member renders until it is set"
+
+render "$tmp/token-opt.yaml" "${base[@]}" "${enabled[@]}" --set identity.tokenAuth.enabled=true \
+  --set-string identity.tokenAuth.audience=other-api --set-string identity.tokenAuth.scope=other.scope --set identity.tokenAuth.introspect=true
+document_of "$tmp/token-opt.yaml" "primus-claw/templates/api-deployment.yaml" >"$tmp/api.token-opt"
+want_token() { [ "$(env_value "$tmp/api.token-opt" "$1")" = "$2" ] || bad "$1 did not render as \"$2\", got \"$(env_value "$tmp/api.token-opt" "$1")\""; }
+want_token CLAW_IDENTITY_TOKEN_AUDIENCE other-api
+want_token CLAW_IDENTITY_TOKEN_SCOPE other.scope
+want_token CLAW_IDENTITY_TOKEN_INTROSPECT true
+ok "audience, scope and introspection render when set"
+
 echo "==> refusals"
 
 refuses "enabled with no issuer" "identity.issuerUrl is required" \
@@ -178,6 +217,10 @@ refuses "enabled with no secret reference" "identity.clientSecret.existingSecret
   "${base[@]}" --set identity.enabled=true --set-string identity.issuerUrl=https://i.example.com --set-string identity.clientId=c
 refuses "enabled as a string that is not a boolean" "identity.enabled: Invalid type" \
   "${base[@]}" --set-string identity.enabled=yes
+refuses "identity.tokenAuth.enabled without identity.enabled" "identity.tokenAuth.enabled requires identity.enabled" \
+  "${base[@]}" --set identity.tokenAuth.enabled=true
+refuses "identity.tokenAuth.enabled as a string that is not a boolean" "tokenAuth.enabled: Invalid type" \
+  "${base[@]}" "${enabled[@]}" --set-string identity.tokenAuth.enabled=yes
 for bad_number in -1 abc 1.5 9999999999; do
   refuses "identity.cache.positiveSeconds=$bad_number" "positiveSeconds" \
     "${base[@]}" --set-string "identity.cache.positiveSeconds=$bad_number"
