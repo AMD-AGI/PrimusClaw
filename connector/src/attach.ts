@@ -379,14 +379,16 @@ export function cleanTitle(raw: string): string {
 
 /**
  * The capabilities an attach agent reports, with as many of the newest sessions as fit under the limit Claw puts on
- * them. `base` is the rest of the capabilities; the list is cut from the oldest end.
+ * them. `base` is the rest of the capabilities; the list is cut from the oldest end, and when not even an empty list
+ * fits the key is left out, so that this never makes a heartbeat invalid that would have been valid without it.
  */
 export function fitResumable(base: Record<string, unknown>, items: Resumable[], limit = REMOTE_AGENT_LIMITS.maxCapabilitiesBytes): Record<string, unknown> {
   let n = Math.min(items.length, MAX_REPORTED);
   const size = (c: Record<string, unknown>) => new TextEncoder().encode(JSON.stringify(c)).length;
   for (;;) {
     const caps = { ...base, resumable: items.slice(0, n) };
-    if (n === 0 || size(caps) <= limit) return caps;
+    if (size(caps) <= limit) return caps;
+    if (n === 0) return base;
     n--;
   }
 }

@@ -20,6 +20,8 @@ const MAX_ACTIVE_SESSIONS = 10;
 
 export class SessionManager {
   readonly sessions = new Map<string, Session>();
+  /** Takeovers that have passed the "already attached" check and have not yet registered their session (`agent:ref`). */
+  private readonly attaching = new Set<string>();
   private readonly chains = new Map<string, Promise<void>>();
 
   constructor(private readonly env: SessionEnv) {}
@@ -152,16 +154,27 @@ export class SessionManager {
     const support = this.env.attach.get(agent.id);
     if (!support) return refuse("attach_unavailable");
     const want = ref.toLowerCase();
-    if ([...this.sessions.values()].some((s) => !s.closed && s.agent.id === agent.id && s.acpId?.toLowerCase() === want)) return refuse("already_attached");
-    if ([...this.sessions.values()].filter((s) => !s.closed).length >= MAX_ACTIVE_SESSIONS) return refuse("too_many_sessions");
-    const found = await support.resolve(want);
-    if (!found.ok) return refuse(found.reason);
-    const asked = checkCwd(typeof cmd.cwd === "string" ? cmd.cwd : "", agent.roots);
-    if (!asked.ok) return refuse(asked.reason, { cwd: String(cmd.cwd).slice(0, 300) });
-    if (asked.real !== found.item.cwd) return refuse("cwd_mismatch", { cwd: String(cmd.cwd).slice(0, 300) });
-    const s = new Session(sid, agent, found.item.cwd, this.env, found.item.ref);
-    this.sessions.set(sid, s);
-    await s.attach(typeof cmd.mode === "string" ? cmd.mode : null, found.item.title);
+    // Commands of different Claw sessions run side by side, so the check and the claim on the conversation are one
+    // synchronous step: two requests for the same conversation must not both get past it while one is still being
+    // looked up, or two adapters would be writing to one transcript.
+    const claim = `${agent.id}:${want}`;
+    if (this.attaching.has(claim) || [...this.sessions.values()].some((s) => !s.closed && s.agent.id === agent.id && s.acpId?.toLowerCase() === want)) return refuse("already_attached");
+    if ([...this.sessions.values()].filter((s) => !s.closed).length + this.attaching.size >= MAX_ACTIVE_SESSIONS) return refuse("too_many_sessions");
+    this.attaching.add(claim);
+    try {
+      const found = await support.resolve(want);
+      if (!found.ok) return refuse(found.reason);
+      const asked = checkCwd(typeof cmd.cwd === "string" ? cmd.cwd : "", agent.roots);
+      if (!asked.ok) return refuse(asked.reason, { cwd: String(cmd.cwd).slice(0, 300) });
+      if (asked.real !== found.item.cwd) return refuse("cwd_mismatch", { cwd: String(cmd.cwd).slice(0, 300) });
+      // Registered before anything is awaited, so from here the session itself is the claim.
+      const s = new Session(sid, agent, found.item.cwd, this.env, found.item.ref);
+      this.sessions.set(sid, s);
+      this.attaching.delete(claim);
+      await s.attach(typeof cmd.mode === "string" ? cmd.mode : null, found.item.title);
+    } finally {
+      this.attaching.delete(claim);
+    }
   }
 
   /** The ids of the existing sessions this connector holds open, by agent. */

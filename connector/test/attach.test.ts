@@ -225,7 +225,11 @@ describe("what is reported to Claw", () => {
     assert.ok(new TextEncoder().encode(JSON.stringify(caps)).length <= 4096);
     assert.ok(caps.resumable.length > 0 && caps.resumable.length <= MAX_REPORTED);
     assert.deepEqual(caps.resumable, items.slice(0, caps.resumable.length), "the newest are kept, in order");
-    assert.deepEqual((fitResumable({ ...base, roots: ["/x".repeat(3000)] }, items) as any).resumable, [], "no room: none, rather than an invalid heartbeat");
+    // No room at all: the key is left out. An empty list would be the bytes that make a heartbeat invalid.
+    const edge = { ...base, roots: ["/".concat("x".repeat(4010))] };
+    assert.ok(new TextEncoder().encode(JSON.stringify(edge)).length <= 4096 && new TextEncoder().encode(JSON.stringify({ ...edge, resumable: [] })).length > 4096, "the case is the one that matters");
+    assert.deepEqual(fitResumable(edge, items), edge);
+    assert.deepEqual(fitResumable(base, []), { ...base, resumable: [] }, "nothing to offer, room to say so");
   });
 
   test("the preset: an opaque kind, the ask mode, a default command to list with, and nothing that applies to other agents", () => {
@@ -368,6 +372,24 @@ describe("attach end to end", () => {
     assert.equal(adapterMethods(h).filter((m) => m === "session/resume").length, 1);
     const hb = await h.claw.until("a heartbeat that says so", () => [...h.claw.heartbeats].reverse().find((b) => b.agents[0].capabilities.resumable?.find((r: any) => r.ref === REF)?.state === "attached"));
     assert.ok(hb);
+  });
+
+  test("two requests for the same conversation, made at once, are not both taken: one session, one resume", async () => {
+    // catalogMs 0: each takeover looks the conversation up afresh (a process start), so the two overlap for certain.
+    const h = await attachHarness({ timing: { catalogMs: 0 } });
+    await h.online();
+    const a = h.claw.newSession("fake", h.work, undefined, { resume_ref: REF });
+    const b = h.claw.newSession("fake", h.work, undefined, { resume_ref: REF });
+    await h.claw.until("both to be answered", () => [a, b].every((s) => h.claw.eventsOf(s).some((e) => e.type === "session_started" || e.type === "session_closed")));
+    const outcomes = [a, b].map((s) => (h.claw.eventsOf(s, "session_started").length ? "started" : closedReason(h, s))).sort();
+    assert.deepEqual(outcomes, ["already_attached", "started"]);
+    assert.equal(adapterMethods(h).filter((m) => m === "session/resume").length, 1, "one writer");
+    // The claim does not outlive a refusal: once the first session is closed the conversation can be taken again.
+    const first = [a, b].find((s) => h.claw.eventsOf(s, "session_started").length)!;
+    h.claw.issue("close", first, {});
+    await h.claw.until("the first to close", () => closedReason(h, first) !== undefined);
+    const again = await h.attach(REF);
+    assert.equal(h.claw.eventsOf(again, "session_started").length, 1);
   });
 
   test("a twin that appears while it is attached stops the next prompt, and that prompt never reaches the agent", async () => {
