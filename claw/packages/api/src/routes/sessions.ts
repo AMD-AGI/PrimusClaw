@@ -8,7 +8,8 @@ import { singleflightCreate, type FlightResult } from "../shared/singleflight.js
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions/dispatch.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
-import { RUN_DOORBELL_DISPATCH, SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
+import { CLAW_GITHUB_REVIEW_ENABLED, RUN_DOORBELL_DISPATCH, SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
+import { parseActingAs } from "../github-review/acting-as.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
 import {
   forceIdleAfterInterrupt, releaseSessionGateForTurn, stopSessionRuns, takeSessionGate,
@@ -1092,6 +1093,8 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       "llm_api_key",
       "virtual_key",
       "_server_managed_credentials",
+      // Set below from the verified caller, never taken from the request.
+      "acting_as_requester",
     ];
     const suppliedReservedKey = reservedConfigKeys.find((key) =>
       Object.prototype.hasOwnProperty.call(sessionConfig, key)
@@ -1110,6 +1113,24 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     const parsedRepo = parseSessionRepo(sessionConfig.repo);
     if (!parsedRepo.ok) {
       return reply.status(400).send({ ok: false, error: parsedRepo.error });
+    }
+
+    // The user whose GitHub account this session's review tools act as. A reference
+    // only; checked here, before any row exists, and refused while the feature is
+    // off so that a session never silently goes without the tools it asked for.
+    const parsedActingAs = parseActingAs(sessionConfig.acting_as);
+    if (!parsedActingAs.ok) {
+      return reply.status(400).send({ ok: false, error: parsedActingAs.error });
+    }
+    if (parsedActingAs.actingAs !== null) {
+      if (!CLAW_GITHUB_REVIEW_ENABLED) {
+        return reply.status(400).send({ ok: false, error: "config.acting_as is not enabled on this deployment" });
+      }
+      if (!user) {
+        return reply.status(401).send({ ok: false, error: "authentication required" });
+      }
+      // The requester's name for the review footer, from the verified caller.
+      sessionConfig.acting_as_requester = (user.userName || user.userId).slice(0, 100);
     }
 
     // The model this session's turns ask for. Checked here, before any row or

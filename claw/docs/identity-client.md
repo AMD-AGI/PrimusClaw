@@ -30,6 +30,7 @@ the key set in the background (a failure is logged, not fatal) and exports the
 | `IDENTITY_INTROSPECTION_URL`, `IDENTITY_TOKEN_URL`, `IDENTITY_JWKS_URL` | from discovery | Pin an address the pod can reach when the advertised one is not; a pinned address is never discovered |
 | `IDENTITY_INTROSPECTION_CACHE_SECONDS` | 30 | How long an active answer is reused (0 turns it off) |
 | `IDENTITY_INTROSPECTION_NEGATIVE_CACHE_SECONDS` | 5 | How long an inactive answer is reused (0 turns it off) |
+| `IDENTITY_CREDENTIAL_RESOLVE_URL` | derived from the token endpoint | Where an external credential is resolved (`<origin>/oauth/external-credentials/resolve`); pin it when the pod reaches the provider on another address |
 | `IDENTITY_STALE_IF_ERROR_SECONDS` | 1800 | How long past its freshness a cached active answer may be served while the provider cannot be asked (0 turns it off) |
 | `IDENTITY_REQUEST_TIMEOUT_MS` | 5000 | Per request, including reading the body |
 | `IDENTITY_KEYS_REFRESH_SECONDS` | 300 | How often discovery and the JWKS are re-read |
@@ -84,11 +85,23 @@ followed and response bodies are capped at 1 MiB. An `http://` issuer is accepte
 for traffic inside a trusted cluster network; the client secret then crosses it
 unencrypted, so use `https://` anywhere that is not true.
 
+**External credentials** (`resolveExternalCredential`). Asks the provider for a user's
+third-party credential (a GitHub token) for one use: `POST` with HTTP Basic client
+authentication and a JSON body `{user_id, provider, requester_user_id?, purpose?}`; the answer
+is `{token, provider_login, kind, scopes, delegation, expires_at}`. Nothing is cached: the
+owner can unbind at any moment and every resolve is a line in the provider's audit trail. A
+refusal the provider decided (`not_bound`, `expired`) is an `IdentityCredentialRefusedError`;
+anything that stops an answer is an `IdentityUnavailableError`, which a caller must treat as
+"unknown", never as "not bound". The service client needs the `identity.credential.resolve`
+scope. `delegation` is the owner's switch for others acting with the credential; the caller
+has to honour it (`requesterUserId === userId || delegation`). Used by
+[GitHub pull request review](github-review.md).
+
 ## Metrics
 
 | Metric | Labels | |
 |---|---|---|
-| `claw_identity_cache_total` | `op`, `result` | `op` is `discovery`, `jwks`, `introspection` or `exchange` |
+| `claw_identity_cache_total` | `op`, `result` | `op` is `discovery`, `jwks`, `introspection`, `exchange` or `credential` |
 | `claw_identity_stale_served_total` | `op` | An answer served after the provider could not be asked. Steady state is 0 |
 | `claw_identity_upstream_total` | `op`, `outcome` | `ok`, `inactive`, `refused`, or the failure: `timeout`, `network`, `rate_limited`, `http_5xx`, `http_4xx`, `bad_response`, `client_rejected` |
 | `claw_identity_upstream_duration_seconds` | `op` | Histogram of provider calls |

@@ -427,6 +427,11 @@ export const CLAW_REMOTE_AGENTS_ENABLED = envBool("CLAW_REMOTE_AGENTS_ENABLED", 
 // less keeps them for ever. The audit trail is not touched by this.
 export const CLAW_REMOTE_AGENTS_RETENTION_DAYS = envInt("CLAW_REMOTE_AGENTS_RETENTION_DAYS", 30);
 
+// --- GitHub pull request review (default OFF) ---
+// When false: no tables, no routes, no MCP server offered to a session, and a session
+// that asks for `config.acting_as` is refused. See docs/github-review.md.
+export const CLAW_GITHUB_REVIEW_ENABLED = envBool("CLAW_GITHUB_REVIEW_ENABLED", false);
+
 /**
  * How a connector's access token is checked (see auth/connector-token.ts). Read
  * on each use rather than once, so what a request is judged by is what the

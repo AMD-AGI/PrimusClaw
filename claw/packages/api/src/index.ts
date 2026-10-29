@@ -33,6 +33,9 @@ import { startNotificationWorker } from "./notifications/outbox.js";
 import { registerSystemEnvVarRoutes, publishSystemEnvToKv } from "./routes/system-env-vars.js";
 import { registerSandboxAdminRoutes } from "./routes/sandbox-admin.js";
 import { registerMcpRoutes } from "./routes/mcp.js";
+import { registerGithubReviewRoutes } from "./github-review/mcp.js";
+import { githubReviewConfigErrors, readGithubReviewSettings } from "./github-review/settings.js";
+import { identityClient } from "./auth/identity.js";
 import { registerInternalTaskRoutes } from "./routes/internal-tasks.js";
 import { registerInternalRunRoutes } from "./routes/internal-runs.js";
 import { registerInternalAppRoutes } from "./routes/internal-apps.js";
@@ -144,6 +147,20 @@ function assertRunLeaseTiming(): void {
   );
 }
 
+/**
+ * Refuse to serve GitHub review without what its gates are made of: the secret that
+ * signs the tool token and the identity client that fetches the acting user's credential.
+ */
+function assertGithubReviewConfig(): void {
+  const settings = readGithubReviewSettings();
+  if (!settings.enabled) return;
+  if (settings.problems.length) logger.error({ refused: settings.problems }, "startup.config_refused");
+  const errors = githubReviewConfigErrors(settings, identityClient() !== null);
+  if (errors.length === 0) return;
+  logger.error({ errors }, "startup.github_review_refused");
+  throw new Error(`CLAW_GITHUB_REVIEW_ENABLED is true but GitHub review cannot be offered: ${errors.join("; ")}`);
+}
+
 async function main() {
   validateStartupConfig();
   assertNoSharedIdentityBypass();
@@ -155,6 +172,8 @@ async function main() {
   assertAdmissionSettings(logger);
   // Off unless IDENTITY_CLIENT_ENABLED is set; the one request it authenticates is a connector's access token.
   startIdentityClient(logger);
+  // Off unless CLAW_GITHUB_REVIEW_ENABLED. A deployment that asked for it and cannot offer its gates does not start.
+  assertGithubReviewConfig();
   // Validate USER_ENV_ENCRYPTION_KEY before doing anything else; we want a
   // fast-fail if the K8s Secret is misconfigured (missing or wrong length),
   // not a runtime surprise on the first PUT /v1/users/me/env-vars/* call.
@@ -275,6 +294,8 @@ async function main() {
   await registerNotificationSubscriptionRoutes(app);
   // Off unless CLAW_REMOTE_AGENTS_ENABLED: the module registers nothing otherwise.
   await registerRemoteAgentRoutes(app);
+  // Off unless CLAW_GITHUB_REVIEW_ENABLED: nothing is registered otherwise.
+  await registerGithubReviewRoutes(app);
   await registerSystemEnvVarRoutes(app);
   await registerSandboxAdminRoutes(app);
   await registerMcpRoutes(app);

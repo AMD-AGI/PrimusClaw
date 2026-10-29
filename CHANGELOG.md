@@ -36,6 +36,23 @@ record it.
   `by: "policy"` and counted in `claw_hitl_policy_allow_total` (no labels: a request can carry its own
   server spec, so the entry that released the call is in the `hitl.policy_allow` log line instead). See
   `claw/docs/mcp-approval.md`.
+- GitHub pull request review, off by default (`CLAW_GITHUB_REVIEW_ENABLED=true`). A session created with
+  `config.acting_as = <user id>` is offered four tools (`gh_pr_get`, `gh_pr_risk`, `gh_review_submit`,
+  `gh_pr_merge`) that review, and when everything is green merge, a public pull request with that user's GitHub
+  account. The token is fetched from the identity provider for one call and never reaches a sandbox, a tool result,
+  a log line or an event. Every gate is in the tool: owner allow-list and public repositories only, the head
+  commit pinned, the acting user's own permission and their setting for others acting for them (without it,
+  comments only), CI green on the head commit, no unresolved thread, GitHub's merge state `CLEAN`, a versioned
+  high-risk rule pack that holds a merge for the acting user's confirmation
+  (`GET /v1/github-review/confirmations`, `POST .../:id/decision`), rate limits, a request budget per session, a
+  dry-run switch and an audit row per call (`claw_github_audit`). A small change is reviewed from the diff
+  without starting a sandbox; the path taken is logged and audited, and the thresholds are
+  `CLAW_GITHUB_REVIEW_FAST_MAX_FILES` / `_MAX_CHANGED_LINES`. A repository's own review skill is read from the
+  tip of the base branch; the default `pr-review` skill is in `claw/examples/skills/pr-review/`.
+  On the sandbox path the model gets a credential-free bash recipe that fetches the pull request anonymously, shallow and
+  pinned to the reviewed head, reusing an existing checkout. The shared
+  identity client gains `resolveExternalCredential` (`IDENTITY_CREDENTIAL_RESOLVE_URL`). See
+  `claw/docs/github-review.md`.
 - A session can be bound to a repository. `POST /v1/sessions` accepts `config.repo = {url, branch?}`
   (`url` is `https://<host>/<owner>/<name>[.git]` with no credentials, query or fragment; `branch` is a
   plain ref name, empty meaning the remote's default; anything else is a `400` starting
