@@ -30,9 +30,9 @@
  *   browser -> shell   text or binary frames of input, and the text frame
  *                      `RESIZE <cols> <rows>` to change the window
  *   shell -> browser   binary frames of output; the close frame carries a reason
- * Beyond that the proxy adds two close codes: 4408, for a terminal the browser
- * sent nothing to for too long, and 4409, for one that reached its maximum
- * lifetime. No subprotocol is negotiated.
+ * Beyond that the proxy adds two close codes: 4408, for a terminal with no
+ * traffic in either direction for too long, and 4409, for one that reached its
+ * maximum lifetime however busy it was. No subprotocol is negotiated.
  */
 import type { IncomingMessage, Server } from "node:http";
 import type { Duplex } from "node:stream";

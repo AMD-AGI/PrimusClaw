@@ -19,7 +19,7 @@ import { WebSocket } from "ws";
 import type { UserInfo } from "../src/auth/models.js";
 import { terminalPorts, terminalRegistry, terminalSettings, registerTerminalRoutes } from "../src/routes/terminal.js";
 import { terminalTicketsSchemaSql } from "../src/terminal/schema.js";
-import { CLOSE_IDLE, CLOSE_MAX_LIFETIME } from "../src/terminal/proxy.js";
+import { CLOSE_IDLE } from "../src/terminal/proxy.js";
 import { mintTicket, type TicketGrant } from "../src/terminal/tickets.js";
 import { seedSession, startHarness, type Harness } from "./scenario-harness.js";
 import {
@@ -295,65 +295,90 @@ test("the server as a whole holds only so many terminals", async () => {
   assert.equal(res.body.error, "terminal_capacity");
 });
 
-test("a terminal the browser sends nothing to is closed after the idle timeout, on both sides", async () => {
+test("a terminal with no traffic is closed after the idle timeout, on both sides", async () => {
   terminalSettings.idleMs = 200;
   const browser = await connect(await mintTicket(GRANT));
   const shell = await shellOf();
   const closed = nextClose(browser);
   const c = await closed;
   assert.equal(c.code, CLOSE_IDLE);
+  assert.equal(c.code, 4408);
   assert.match(c.reason, /idle/);
   await until(() => shell.closed !== null, "the shell's socket to close");
-  assert.equal(shell.closed?.code, CLOSE_IDLE);
+  assert.equal(shell.closed?.code, 4408);
   await until(() => terminalRegistry.size === 0, "the slot to be released");
 });
 
-test("input from the browser keeps a terminal from going idle", async () => {
+test("traffic in either direction keeps a terminal from going idle", async () => {
   terminalSettings.idleMs = 300;
   const browser = await connect(await mintTicket(GRANT));
-  await shellOf();
+  const shell = await shellOf();
   let closedEarly = false;
   browser.once("close", () => { closedEarly = true; });
-  // 600 ms of keystrokes, one every 100 ms: twice the idle timeout.
+  // 600 ms of a conversation, alternating directions every 100 ms: twice the idle timeout.
   for (let i = 0; i < 6; i++) {
-    browser.send("x");
+    if (i % 2 === 0) browser.send("x"); else shell.socket.send(Buffer.from("y"), { binary: true });
     await new Promise((r) => setTimeout(r, 100));
   }
   assert.equal(closedEarly, false, "a terminal in use must not be closed as idle");
   assert.equal(browser.readyState, WebSocket.OPEN);
 });
 
-test("output from the shell does not keep a forgotten terminal open", async () => {
+test("input from the browser alone keeps a terminal from going idle, and so does output alone", async () => {
   terminalSettings.idleMs = 300;
   const browser = await connect(await mintTicket(GRANT));
   const shell = await shellOf();
+  let closedEarly = false;
+  browser.once("close", () => { closedEarly = true; });
+  // 600 ms of keystrokes and not a byte back, then 600 ms of output and no keystroke: each twice the idle timeout.
+  for (let i = 0; i < 6; i++) { browser.send("x"); await new Promise((r) => setTimeout(r, 100)); }
+  for (let i = 0; i < 6; i++) { shell.socket.send(Buffer.from("y"), { binary: true }); await new Promise((r) => setTimeout(r, 100)); }
+  assert.equal(closedEarly, false);
+  assert.equal(browser.readyState, WebSocket.OPEN);
+});
+
+test("output that never stops does not keep a terminal open for ever: it ends at the lifetime, on both sides, and frees its place", async () => {
+  terminalSettings.idleMs = 300;
+  terminalSettings.maxLifetimeMs = 800;
+  const browser = await connect(await mintTicket(GRANT));
+  const shell = await shellOf();
+  const started = Date.now();
   // A `tail -f` in a tab nobody is looking at: output every 25 ms, and no input.
   const chatter = setInterval(() => {
     if (shell.socket.readyState === WebSocket.OPEN) shell.socket.send(Buffer.from("line\n"), { binary: true });
   }, 25);
   try {
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal(browser.readyState, WebSocket.OPEN, "past the idle timeout but within the lifetime, output keeps it open");
+    assert.equal(terminalRegistry.size, 1);
     const c = await nextClose(browser);
-    assert.equal(c.code, CLOSE_IDLE);
+    assert.equal(c.code, 4409);
+    assert.equal(c.reason, "maximum lifetime reached");
+    assert.ok(Date.now() - started >= 750, `closed after ${Date.now() - started} ms, before its lifetime was up`);
     await until(() => shell.closed !== null, "the shell's socket to close");
-    assert.equal(shell.closed?.code, CLOSE_IDLE);
+    assert.equal(shell.closed?.code, 4409);
+    assert.equal(shell.closed?.reason, "maximum lifetime reached");
   } finally {
     clearInterval(chatter);
   }
   await until(() => terminalRegistry.size === 0, "the slot to be released");
 });
 
-test("a terminal is closed when it reaches its maximum lifetime, however busy it is", async () => {
+test("a terminal in use is closed at its lifetime as well, and not before", async () => {
   terminalSettings.idleMs = 60_000;
-  terminalSettings.maxLifetimeMs = 400;
+  terminalSettings.maxLifetimeMs = 500;
   const browser = await connect(await mintTicket(GRANT));
   const shell = await shellOf();
+  const started = Date.now();
   const typing = setInterval(() => { if (browser.readyState === WebSocket.OPEN) browser.send("x"); }, 20);
   try {
+    await new Promise((r) => setTimeout(r, 250));
+    assert.equal(browser.readyState, WebSocket.OPEN);
     const c = await nextClose(browser);
-    assert.equal(c.code, CLOSE_MAX_LIFETIME);
-    assert.match(c.reason, /lifetime/);
+    assert.equal(c.code, 4409);
+    assert.ok(Date.now() - started >= 450, `closed after ${Date.now() - started} ms`);
     await until(() => shell.closed !== null, "the shell's socket to close");
-    assert.equal(shell.closed?.code, CLOSE_MAX_LIFETIME);
+    assert.equal(shell.closed?.code, 4409);
   } finally {
     clearInterval(typing);
   }
