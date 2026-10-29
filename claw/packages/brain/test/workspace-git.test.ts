@@ -24,14 +24,42 @@
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import {
   existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, truncateSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 
-process.env.S3_API_ENDPOINT = "http://127.0.0.1:1";
-process.env.S3_SANDBOX_ENDPOINT = "http://127.0.0.1:1";
+// A bucket that lists what a test put in it and deletes what the prune asks it to,
+// so what the prune spares can be read off the bucket. Uploads do not go through
+// it (the sandbox stand-in below keeps its own store); it holds only what an
+// earlier sync is taken to have left.
+const PREFIX = "users/user-1/sessions/sess-git/";
+const bucket = new Set<string>();
+const s3 = createServer((req, res) => {
+  const url = new URL(req.url ?? "/", "http://s3.test");
+  req.resume();
+  if (req.method === "DELETE") {
+    bucket.delete(decodeURIComponent(url.pathname).replace(/^\/claw\//, ""));
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+  const entries = [...bucket].map((key) => (
+    `<Contents><Key>${key}</Key><Size>1</Size><LastModified>2026-01-01T00:00:00.000Z</LastModified></Contents>`
+  )).join("");
+  res.writeHead(200, { "Content-Type": "application/xml" });
+  res.end(`<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`
+    + `<Name>claw</Name><Prefix>${PREFIX}</Prefix><KeyCount>${bucket.size}</KeyCount><MaxKeys>1000</MaxKeys>`
+    + `<IsTruncated>false</IsTruncated>${entries}</ListBucketResult>`);
+});
+await new Promise<void>((resolve) => { s3.listen(0, "127.0.0.1", resolve); });
+s3.unref();
+const S3_URL = `http://127.0.0.1:${(s3.address() as AddressInfo).port}`;
+process.env.S3_API_ENDPOINT = S3_URL;
+process.env.S3_SANDBOX_ENDPOINT = S3_URL;
 process.env.S3_ACCESS_KEY = "AK";
 process.env.S3_SECRET_KEY = "SK";
 process.env.S3_BUCKET = "claw";
@@ -42,8 +70,8 @@ const { syncWorkspaceToS3 } = await import("../src/workspace/s3-uploader.js");
 const { SYNC_STATE_DIR } = await import("../src/workspace/sync-delta.js");
 const { syncWorkspace, classifySyncFailure } = await import("../src/workspace/sync.js");
 const {
-  buildGitProbeCommand, buildGitSkeletonCommand, decideGit, ensureGitSkeleton, gitSkipNote, parseGitProbe,
-  planGit, restoredGitDirs,
+  SIGTERM_PROBE_TIMEOUT_SEC, buildGitProbeCommand, buildGitSkeletonCommand, decideGit, ensureGitSkeleton,
+  gitPruneExempt, gitReport, gitSkipNote, parseGitProbe, planGit, restoredGitDirs, unmeasuredGit,
 } = await import("../src/workspace/git-dirs.js");
 const { s3Excludes } = await import("../src/workspace/excludes.js");
 import type { HandsClient } from "../src/clients/hands.js";
@@ -59,7 +87,10 @@ const probeOutput = (lines: string[], rc = 0): string => [BEGIN, ...lines, `${EN
 // Apparent bytes include a directory's own size (4 KiB on most filesystems), so
 // the byte bound is well above what a handful of directories adds and the "big"
 // repositories below are well above it.
-const LIMITS: GitLimits = { maxBytes: 100_000, maxFiles: 10 };
+// The totals are out of the way unless a test is about them.
+const FAR = Number.MAX_SAFE_INTEGER;
+const LIMITS: GitLimits = { maxBytes: 100_000, maxFiles: 10, totalBytes: FAR, totalFiles: FAR };
+const DEFAULT_LIMITS: GitLimits = { maxBytes: 300 * 1024 * 1024, maxFiles: 2000, totalBytes: FAR, totalFiles: FAR };
 const BIG = 200_000;
 
 // ── Deciding ────────────────────────────────────────────────────────────
@@ -86,6 +117,96 @@ test("decideGit: a repository is carried unless it is over a bound, and the boun
 test("decideGit: a measurement that cannot be believed is not 'all small enough'", () => {
   const d = decideGit({ ok: false, reason: "find_exit_1" }, LIMITS);
   assert.deepEqual(d, { mode: "drop-all", why: "unmeasured", detail: "find_exit_1" });
+});
+
+// Dozens of small clones are each within the per-repository bounds and together
+// are tens of thousands of PUTs, which is what the file bound exists to prevent.
+const repo = (name: string, bytes: number, files: number) => ({ path: `/workspace/${name}/.git`, bytes, files });
+const skippedOf = (d: ReturnType<typeof decideGit>): Array<[string, string]> =>
+  (d.mode === "keep" ? d.skipped : []).map((s) => [s.path.replace("/workspace/", "").replace("/.git", ""), s.reason]);
+
+test("decideGit: repositories are also bounded together, and the largest go first", () => {
+  const dirs = [repo("a", 10, 5), repo("b", 10, 4), repo("c", 10, 3), repo("d", 10, 2), repo("e", 10, 1)];
+  // 15 files; the limit is 10, so the one with 5 goes and 10 remain -- not b as well.
+  assert.deepEqual(
+    skippedOf(decideGit({ ok: true, dirs }, { ...LIMITS, totalFiles: 10 })),
+    [["a", "over_total_files"]],
+  );
+  // One file less of room and it takes two.
+  assert.deepEqual(
+    skippedOf(decideGit({ ok: true, dirs }, { ...LIMITS, totalFiles: 9 })),
+    [["a", "over_total_files"], ["b", "over_total_files"]],
+  );
+  // Exactly at the bound is carried, as it is for one repository.
+  assert.deepEqual(skippedOf(decideGit({ ok: true, dirs }, { ...LIMITS, totalFiles: 15 })), []);
+
+  // Bytes the same way, independently of files.
+  const heavy = [repo("x", 60_000, 1), repo("y", 50_000, 1), repo("z", 10_000, 1)];
+  assert.deepEqual(
+    skippedOf(decideGit({ ok: true, dirs: heavy }, { ...LIMITS, totalBytes: 100_000 })),
+    [["x", "over_total_bytes"]],
+  );
+});
+
+test("decideGit: a repository already left out for its own size does not count toward the total", () => {
+  const dirs = [repo("huge", 500_000, 50), repo("a", 10, 4), repo("b", 10, 4)];
+  assert.deepEqual(
+    skippedOf(decideGit({ ok: true, dirs }, { ...LIMITS, totalFiles: 8 })),
+    [["huge", "too_large"]],
+    "8 files carried against a limit of 8: the 50 files of the one already out are not in the sum",
+  );
+});
+
+test("decideGit: which of equals goes is fixed by the path, not by the order the sandbox listed them", () => {
+  const forward = [repo("m", 1, 3), repo("k", 1, 3), repo("l", 1, 3)];
+  const a = skippedOf(decideGit({ ok: true, dirs: forward }, { ...LIMITS, totalFiles: 6 }));
+  const b = skippedOf(decideGit({ ok: true, dirs: [...forward].reverse() }, { ...LIMITS, totalFiles: 6 }));
+  assert.deepEqual(a, [["k", "over_total_files"]]);
+  assert.deepEqual(b, a);
+});
+
+test("decideGit: files are settled before bytes, so one repository is not dropped twice over", () => {
+  // Dropping the file-heaviest repository also brings the bytes under their bound.
+  const dirs = [repo("many", 60_000, 9), repo("big", 70_000, 1)];
+  assert.deepEqual(
+    skippedOf(decideGit({ ok: true, dirs }, { ...LIMITS, totalFiles: 5, totalBytes: 100_000 })),
+    [["many", "over_total_files"]],
+  );
+});
+
+test("unmeasuredGit: a repository nobody could measure is the same situation as a probe that failed", () => {
+  const unreadable = decideGit({ ok: true, dirs: [repo("a", -1, 3), repo("b", 10, 3)] }, LIMITS);
+  const rows: Array<[label: string, d: Parameters<typeof unmeasuredGit>[0], expected: boolean]> = [
+    ["the whole probe failed", { mode: "drop-all", why: "unmeasured", detail: "x" }, true],
+    ["one directory's size was unreadable", unreadable, true],
+    ["an operator switched it off", { mode: "drop-all", why: "disabled" }, false],
+    ["everything was measured", { mode: "keep", skipped: [] }, false],
+    [
+      "something was measured and found too big",
+      { mode: "keep", skipped: [{ ...repo("a", 1e9, 1), reason: "too_large" }] },
+      false,
+    ],
+  ];
+  for (const [label, d, expected] of rows) assert.equal(unmeasuredGit(d), expected, label);
+});
+
+test("gitPruneExempt: spares what was not measured and nothing else", () => {
+  const probeFailed = gitPruneExempt({ mode: "drop-all", why: "unmeasured" }, "/workspace");
+  assert.equal(probeFailed("proj/.git/HEAD"), true);
+  assert.equal(probeFailed(".git/objects/ab/cd"), true, "the workspace's own repository");
+  assert.equal(probeFailed("a/b/.git"), true, "a submodule's pointer file");
+  assert.equal(probeFailed("proj/src/a.ts"), false, "an ordinary file is pruned as ever");
+  assert.equal(probeFailed("proj/.gitignore"), false, "named like one, is not one");
+
+  const one = gitPruneExempt(
+    decideGit({ ok: true, dirs: [repo("it's", -1, 3), repo("other", 10, 3), repo("big", 1e9, 3)] }, LIMITS),
+    "/workspace",
+  );
+  assert.equal(one("it's/.git/HEAD"), true);
+  assert.equal(one("other/.git/HEAD"), false, "a repository that was measured is pruned like any other");
+  assert.equal(one("big/.git/HEAD"), false, "one known to be too big is left out on purpose, and its old copy goes");
+  assert.equal(one("it's2/.git/HEAD"), false, "the exemption is a directory, not a prefix of a name");
+  assert.equal(gitPruneExempt({ mode: "drop-all", why: "disabled" }, "/workspace")("proj/.git/HEAD"), false);
 });
 
 // ── Reading the measurement ─────────────────────────────────────────────
@@ -128,7 +249,7 @@ test("a forged closing fence in a path cannot end the measurement early", () => 
 test("gitSkipNote: says which repository, why, and what it costs", () => {
   const big = { path: "/workspace/big/.git", bytes: 412 * 1024 * 1024, files: 40, reason: "too_large" as const };
   const many = { path: "/workspace/many/.git", bytes: 1, files: 3412, reason: "too_many_files" as const };
-  const lim = { maxBytes: 300 * 1024 * 1024, maxFiles: 2000 };
+  const lim: GitLimits = { ...DEFAULT_LIMITS, totalBytes: 1024 * 1024 * 1024, totalFiles: 10_000 };
 
   assert.equal(gitSkipNote([], false, lim), null, "nothing left out and nothing unmeasured: nothing to say");
 
@@ -138,6 +259,14 @@ test("gitSkipNote: says which repository, why, and what it costs", () => {
   assert.match(note, /commits that were not pushed are lost: push them first/);
 
   assert.match(gitSkipNote([], true, lim)!, /Could not measure the git repositories/);
+  assert.match(gitSkipNote([], true, lim)!, /what was saved before was kept/, "it says what happens to the saved copy");
+
+  const together = { path: "/workspace/clone/.git", bytes: 2 * 1024 * 1024, files: 400, reason: "over_total_files" as const };
+  assert.match(gitSkipNote([together], false, lim)!, /clone\/\.git \(400 files; together the repositories are over 10000 files\)/);
+  const heavy = { ...together, reason: "over_total_bytes" as const };
+  assert.match(gitSkipNote([heavy], false, lim)!, /clone\/\.git \(2 MB; together the repositories are over 1024 MB\)/);
+  const unknown = { ...together, bytes: -1, reason: "unmeasured" as const };
+  assert.match(gitSkipNote([unknown], false, lim)!, /clone\/\.git \(size unknown; the copy saved before was kept\)/);
 
   const lots = Array.from({ length: 5 }, (_, i) => ({ ...big, path: `/workspace/r${i}/.git` }));
   assert.match(gitSkipNote(lots, false, lim)!, /r0\/\.git.*r2\/\.git \(412 MB, limit 300 MB\); and 2 more\./);
@@ -216,7 +345,7 @@ class Sandbox {
     },
   } as unknown as HandsClient;
 
-  sync(gitLimits: GitLimits = { maxBytes: 300 * 1024 * 1024, maxFiles: 2000 }) {
+  sync(gitLimits: GitLimits = DEFAULT_LIMITS) {
     this.uploaded = [];
     return syncWorkspaceToS3(this.client, "sess-git", "user-1", { gitLimits });
   }
@@ -281,7 +410,7 @@ test("planGit: a path the command line cannot carry is 'could not measure', not 
 test("planGit: switched off means no measurement at all", async () => {
   const sb = new Sandbox();
   sb.put("r/.git/HEAD", "x\n");
-  const d = await planGit(sb.client, "/workspace", s3Excludes(), { maxBytes: 0, maxFiles: 10 });
+  const d = await planGit(sb.client, "/workspace", s3Excludes(), { ...LIMITS, maxBytes: 0 });
   assert.deepEqual(d, { mode: "drop-all", why: "disabled" });
   assert.equal(sb.commands.length, 0, "a switched-off deployment pays for no extra call");
 });
@@ -368,10 +497,15 @@ for (const [label, skipped, decoy] of SKIPPED_NAMES) {
   });
 }
 
-test("when the sandbox cannot measure, the repositories wait and the listing decides nothing", async () => {
+/** What an earlier sync left in the bucket, as keys under the session prefix. */
+const saved = (...rels: string[]): void => { bucket.clear(); for (const r of rels) bucket.add(`${PREFIX}${r}`); };
+const inBucket = (): string[] => [...bucket].map((k) => k.slice(PREFIX.length)).sort();
+
+test("when the sandbox cannot measure, the rest of the workspace is synced as usual", async () => {
   const sb = new Sandbox();
   sb.put("proj/.git/HEAD", "ref: refs/heads/main\n");
   sb.put("proj/src/a.ts", "a\n");
+  saved("proj/.git/HEAD", "proj/src/a.ts");
 
   // Once, measured: the next sync has a manifest to compare against.
   const healthy = await sb.sync();
@@ -379,17 +513,112 @@ test("when the sandbox cannot measure, the repositories wait and the listing dec
   const again = await sb.sync();
   assert.ok((again.unchanged ?? 0) > 0, "the delta works on a trusted listing");
 
-  // Then `du` breaks. Nothing is said about the repository except that it could
-  // not be measured: it is not uploaded this time, and a listing that is missing
-  // files the user still has is not allowed to delete anything (the prune) or to
-  // be believed about what is already up (the delta, which is skipped).
+  // Then the measurement times out. The repository is not uploaded this time, but
+  // that must not turn every later sync into a full re-upload of the workspace for
+  // as long as it stays slow: the listing is complete for everything else, so the
+  // delta holds and only what changed goes up.
   sb.probeReply = `${BEGIN}\n${END}:2`;
+  sb.put("proj/src/b.ts", "b\n");
   const r = await sb.sync();
   assert.equal(r.git?.unmeasured, true);
   assert.match(r.git!.note, /Could not measure/);
   assert.deepEqual([...sb.uploadedSet].filter((p) => p.includes(".git/")), [], "unknown is not 'small enough'");
-  assert.equal(r.unchanged, undefined, "an untrusted listing is uploaded whole, with no delta");
+  assert.deepEqual([...sb.uploadedSet], ["proj/src/b.ts"], "only the file that changed is uploaded");
+  assert.ok((r.unchanged ?? 0) > 0, "the delta was not thrown away with the measurement");
   assert.equal(healthy.git, undefined);
+});
+
+test("when the sandbox cannot measure, what was saved of every repository stays, and only that", async () => {
+  const sb = new Sandbox();
+  sb.put("proj/.git/HEAD", "ref: refs/heads/main\n");
+  sb.put("proj/src/a.ts", "a\n");
+  // A repository whose `.git` is in the bucket from a sync that could measure, a
+  // file the user has since deleted, and a deleted repository's last file.
+  saved(
+    "proj/.git/HEAD", "proj/.git/objects/pack/p.pack", "proj/src/a.ts", "proj/src/deleted.ts",
+    "gone/.git/HEAD", "gone/readme.md",
+  );
+  sb.probeReply = `${BEGIN}\n${END}:2`;
+
+  await sb.sync();
+
+  assert.deepEqual(
+    inBucket(),
+    ["gone/.git/HEAD", "proj/.git/HEAD", "proj/.git/objects/pack/p.pack", "proj/src/a.ts"],
+    "no saved .git object is deleted, whichever repository it is; a file that is not git's still is",
+  );
+});
+
+test("a measurement that works prunes a repository the user deleted", async () => {
+  // The other side of the case above, so that it cannot be satisfied by never
+  // pruning a `.git` at all.
+  const sb = new Sandbox();
+  sb.put("proj/src/a.ts", "a\n");
+  saved("proj/src/a.ts", "gone/.git/HEAD", "gone/.git/objects/pack/p.pack");
+
+  await sb.sync();
+
+  assert.deepEqual(inBucket(), ["proj/src/a.ts"]);
+});
+
+test("one repository whose size cannot be read keeps its saved copy; the others are pruned as ever", async () => {
+  const sb = new Sandbox();
+  sb.put("odd/.git/HEAD", "ref: refs/heads/main\n");
+  sb.put("fine/.git/HEAD", "ref: refs/heads/main\n");
+  sb.put("fine/src.txt", "s\n");
+  sb.put("huge/.git/HEAD", "ref: refs/heads/main\n");
+  saved(
+    "odd/.git/HEAD", "odd/.git/refs/heads/main", // the repository `du` could not read
+    "fine/.git/HEAD", "fine/.git/refs/heads/topic", // measured, and the branch is gone from it
+    "huge/.git/HEAD", // measured, and over the bound: left out on purpose
+  );
+  sb.probeReply = probeOutput([
+    `-1 -1 ${hex("/workspace/odd/.git")}`,
+    `10 3 ${hex("/workspace/fine/.git")}`,
+    `${BIG} 3 ${hex("/workspace/huge/.git")}`,
+  ]);
+
+  const r = await sb.sync(LIMITS);
+
+  assert.deepEqual(
+    inBucket(),
+    ["fine/.git/HEAD", "odd/.git/HEAD", "odd/.git/refs/heads/main"],
+    "the unreadable one is kept whole; the measured ones are judged by what the listing has",
+  );
+  assert.equal(r.git?.unmeasured, true, "the user is told, and the event says it was a measurement problem");
+  assert.deepEqual(r.git?.skipped.map((x) => [x.path, x.reason]).sort(), [
+    ["/workspace/huge/.git", "too_large"], ["/workspace/odd/.git", "unmeasured"],
+  ]);
+  assert.ok(sb.uploadedSet.has("fine/src.txt"));
+  assert.deepEqual([...sb.uploadedSet].filter((p) => p.startsWith("odd/.git")), []);
+});
+
+test("many small repositories are held to a limit of their own, largest first", async () => {
+  const sb = new Sandbox();
+  // Twelve clones of three files: each is far under the per-repository bound of ten.
+  for (let i = 0; i < 12; i++) {
+    const n = String(i).padStart(2, "0");
+    sb.put(`vendor/r${n}/.git/HEAD`, "ref: refs/heads/main\n");
+    sb.put(`vendor/r${n}/.git/config`, "[core]\n");
+    sb.put(`vendor/r${n}/.git/packed-refs`, "\n");
+  }
+  sb.put("vendor/r11/.git/objects/extra", "o\n"); // the largest, so the first to go
+  sb.put("src.txt", "s\n");
+
+  const r = await sb.sync({ ...LIMITS, totalFiles: 30 });
+
+  const gitFiles = [...sb.uploadedSet].filter((p) => p.includes(".git/"));
+  assert.ok(gitFiles.length <= 30, `${gitFiles.length} files of repositories went up; the total bound is 30`);
+  assert.ok(!gitFiles.some((p) => p.startsWith("vendor/r11/")), "the largest was dropped first, whole");
+  assert.ok(sb.uploadedSet.has("src.txt"));
+  const dropped = r.git!.skipped.filter((s) => s.reason === "over_total_files");
+  assert.ok(dropped.length > 0);
+  assert.deepEqual(r.git!.skipped.filter((s) => s.reason !== "over_total_files"), []);
+  assert.equal(r.git!.unmeasured, false);
+  assert.match(r.git!.note, /together the repositories are over 30 files/);
+  for (const d of dropped) {
+    assert.deepEqual(gitFiles.filter((p) => p.startsWith(d.path.replace("/workspace/", "").replace(".git", ".git/"))), []);
+  }
 });
 
 test("switched off, no repository is uploaded and no measurement is made", async () => {
@@ -397,7 +626,7 @@ test("switched off, no repository is uploaded and no measurement is made", async
   sb.put("proj/.git/HEAD", "ref: refs/heads/main\n");
   sb.put("proj/src/a.ts", "a\n");
 
-  const r = await sb.sync({ maxBytes: 0, maxFiles: 10 });
+  const r = await sb.sync({ ...LIMITS, maxBytes: 0 });
 
   assert.deepEqual([...sb.uploadedSet].filter((p) => p.includes(".git")), []);
   assert.ok(sb.uploadedSet.has("proj/src/a.ts"));
@@ -480,24 +709,46 @@ test("the skeleton is put back only where a repository came back, and is idempot
 const UID = "0123456789abcdef0123456789abcdef";
 const SID = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
 
-test("the shared-disk sync does not replace its snapshot when it cannot measure", async () => {
-  // It would write the new snapshot without a .git the sandbox still has, and the
-  // swap would take the saved one with it. So it stops, and the previous snapshot
-  // stands until a sync that can tell.
+test("the shared-disk sync goes on when it cannot measure, and the script keeps the saved repositories", async () => {
+  // It used to stop, which left the snapshot where it was for as long as the
+  // workspace was slow to walk -- and a snapshot that never advances loses
+  // everything since it when the sandbox is reclaimed, which is worse than the
+  // thing it was protecting. What stops a snapshot written without a measurement
+  // from losing a `.git` is the script's carry step, so that is what has to be in it.
   const commands: string[] = [];
   const hands = {
-    callTool: async (_tool: string, args: { command?: string }) => { commands.push(String(args.command)); return "garbage"; },
+    callTool: async (tool: string, args: { command?: string }) => {
+      if (tool === "read") return JSON.stringify({ size_bytes: 5, inode_count: 1 });
+      commands.push(String(args.command));
+      return commands.length === 1 ? "garbage" : "OK";
+    },
   } as unknown as HandsClient;
 
-  await assert.rejects(
-    () => syncWorkspace(hands, SID, UID, 1),
-    (err: Error) => {
-      assert.match(err.message, /workspace_sync_git_unmeasured/);
-      assert.equal(classifySyncFailure(err), "git_probe", "its own reason on the failure metric");
-      return true;
+  const r = await syncWorkspace(hands, SID, UID, 1);
+
+  assert.equal(commands.length, 2, "the measurement ran, and so did the script that writes the snapshot");
+  assert.ok(commands[1].includes("carry_git"), "which keeps what the previous snapshot holds");
+  assert.ok(commands[1].includes(`--exclude '.git'`), "and does not copy a repository it never measured");
+  assert.equal(r.git?.unmeasured, true, "the caller can tell the user");
+  assert.match(r.git!.note, /Could not measure/);
+  assert.equal(classifySyncFailure(new Error("workspace_sync_git_unmeasured")), "rsync_error", "no longer a failure of its own");
+});
+
+test("the measurement is given as long as the listing beside it, and a SIGTERM sync is given less", async () => {
+  const budgets: Array<{ timeout?: number }> = [];
+  const hands = {
+    callTool: async (tool: string, args: { command?: string; timeout?: number }) => {
+      if (tool === "read") return JSON.stringify({ size_bytes: 5, inode_count: 1 });
+      if (String(args.command).includes(BEGIN)) budgets.push({ timeout: args.timeout });
+      return String(args.command).includes(BEGIN) ? probeOutput([]) : "OK";
     },
-  );
-  assert.equal(commands.length, 1, "only the measurement ran; the script that replaces the snapshot did not");
+  } as unknown as HandsClient;
+
+  await syncWorkspace(hands, SID, UID, 1);
+  await syncWorkspace(hands, SID, UID, 2, { kind: "sigterm" });
+
+  assert.deepEqual(budgets.map((b) => b.timeout), [60, SIGTERM_PROBE_TIMEOUT_SEC]);
+  assert.ok(SIGTERM_PROBE_TIMEOUT_SEC <= 10, "the SIGTERM budget has no room for a long measurement");
 });
 
 test("the shared-disk sync tells the script which repositories to leave out, and reports them", async () => {
@@ -515,7 +766,9 @@ test("the shared-disk sync tells the script which repositories to leave out, and
 
   const r = await syncWorkspace(hands, SID, UID, 1);
 
-  assert.deepEqual(r.gitSkipped.map((s) => [s.path, s.reason]), [["/workspace/it's big/.git", "too_large"]]);
+  assert.deepEqual(r.git?.skipped.map((s) => [s.path, s.reason]), [["/workspace/it's big/.git", "too_large"]]);
+  assert.equal(r.git?.unmeasured, false);
+  assert.match(r.git!.note, /big\/\.git/, "the note the user is shown comes with the result");
   const script = commands[1];
   assert.ok(script.includes(`--exclude '/it'\\''s big/.git'`), "the repository over the bound, quoted for the shell");
   assert.ok(!script.includes("small/.git"), "and only that one");

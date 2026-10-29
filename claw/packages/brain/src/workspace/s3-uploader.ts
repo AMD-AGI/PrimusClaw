@@ -22,10 +22,11 @@ import {
   configuredGitLimits,
   ensureGitSkeleton,
   gitFindArgs,
-  gitSkipNote,
+  gitPruneExempt,
+  gitReport,
   planGit,
   type GitLimits,
-  type GitSkip,
+  type GitReport,
 } from "./git-dirs.js";
 import pino from "pino";
 
@@ -174,7 +175,7 @@ export interface SyncWorkspaceResult {
    * or could not measure them; absent when every `.git` went up. `note` is the
    * sentence the user is shown.
    */
-  git?: { skipped: GitSkip[]; unmeasured: boolean; note: string };
+  git?: GitReport;
 }
 
 /**
@@ -367,12 +368,19 @@ const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, m
  * that the listing is complete cannot be left behind at a call site: an
  * unfenced listing reaches here and stops here.
  *
+ * `exempt` is for a part of the workspace this sync did not look at, as opposed
+ * to one it looked at and found empty: the objects of a repository whose size
+ * could not be measured are not listed, and that is not the user deleting them.
+ * It spares those objects and nothing else, so one repository nobody can measure
+ * does not freeze the prune of every other file.
+ *
  * @returns how many objects were removed.
  */
 async function pruneRemovedObjects(
   sessionId: string,
   s3Prefix: string,
   listing: WorkspaceListing,
+  exempt: (rel: string) => boolean = () => false,
 ): Promise<number> {
   if (!listing.trusted) {
     logger.warn(
@@ -398,6 +406,7 @@ async function pruneRemovedObjects(
       total++;
       if (expectedKeys.has(key)) continue;
       if (isPruneExempt(key.slice(s3Prefix.length))) continue;
+      if (exempt(key.slice(s3Prefix.length))) continue;
       stale.push(key);
     }
     token = page.IsTruncated ? page.NextContinuationToken : undefined;
@@ -692,12 +701,8 @@ export async function syncWorkspaceToS3(
   // prune are all derived from, so all of them have to see the same files.
   const gitLimits = options?.gitLimits ?? configuredGitLimits();
   const git = await planGit(hands, "/workspace", s3Excludes(), gitLimits);
-  const gitSkipped = git.mode === "keep" ? git.skipped : [];
-  const gitUnmeasured = git.mode === "drop-all" && git.why === "unmeasured";
-  const gitNote = gitSkipNote(gitSkipped, gitUnmeasured, gitLimits);
-  const gitResult: Pick<SyncWorkspaceResult, "git"> = gitNote
-    ? { git: { skipped: gitSkipped, unmeasured: gitUnmeasured, note: gitNote } }
-    : {};
+  const report = gitReport(git, gitLimits);
+  const gitResult: Pick<SyncWorkspaceResult, "git"> = report ? { git: report } : {};
   const excludeArgs = `${findExcludeArgs(s3Excludes())} ${gitFindArgs(git)}`;
 
   // List files in workspace via Hands. The skips come from the one list in
@@ -719,12 +724,14 @@ export async function syncWorkspaceToS3(
       + ` 2>/dev/null; echo "${LS_END}:$?"`,
     timeout: FIND_TIMEOUT_SEC,
   });
-  let listing = parseWorkspaceListing(fileList);
-  // A listing that left the repositories out because it could not measure them is
-  // missing files the user still has. It uploads what it found, and decides
-  // nothing about what is already in S3: the prune would delete every object of a
-  // repository for the crime of a failed `du`.
-  if (gitUnmeasured && listing.trusted) listing = { ...listing, trusted: false, reason: "git_unmeasured" };
+  const listing = parseWorkspaceListing(fileList);
+  // A listing that left a repository out because it could not measure it is still
+  // a complete listing of everything else: the `find` ran to its fence. So the
+  // delta below is as good as ever (the upload is not a full re-upload of the
+  // workspace on every turn for as long as `du` is slow), and the prune is as good
+  // as ever for everything but that repository's objects, which it must not take
+  // as deleted -- it would remove a repository's saved history for a failed `du`.
+  const pruneExempt = gitPruneExempt(git, "/workspace");
   const files = listing.files;
   if (!listing.trusted) {
     logger.warn(
@@ -768,7 +775,7 @@ export async function syncWorkspaceToS3(
   const finishSynced = async (round: number): Promise<SyncWorkspaceResult> => {
     // Only once every file is up. A prune after a partial upload would be
     // deleting the old copy of something whose new copy did not arrive.
-    const pruned = await pruneRemovedObjects(sessionId, s3Prefix, listing)
+    const pruned = await pruneRemovedObjects(sessionId, s3Prefix, listing, pruneExempt)
       .catch((e: unknown) => {
       logger.warn(
         { sessionId, err: (e as { message?: string })?.message ?? String(e) },

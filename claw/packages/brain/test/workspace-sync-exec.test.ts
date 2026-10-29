@@ -32,6 +32,7 @@
 //   X11 a repository over a bound is left out whole, whatever its directory is called
 //   X12 git's transient files stay behind and the user's own *.lock does not
 //   X13 with .git switched off nothing of any repository is carried
+//   X14 a repository the sync could not measure keeps the copy the snapshot already had
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -654,6 +655,118 @@ for (const noRsync of [false, true]) {
       const snap = (rel: string): boolean => existsSync(join(ctx.base, "current", rel));
       assert.ok(!snap(".git") && !snap("a/b/.git") && !snap("sub/.git"));
       assert.ok(snap("a/b/src.txt"));
+    } finally {
+      cleanup(ctx);
+    }
+  });
+}
+
+// ── A repository the sync could not measure ─────────────────────────────
+
+// The decision a sync reaches when it cannot say how big its repositories are. The
+// snapshot is built into an empty directory and swapped in, so a repository the copy
+// leaves out is gone from the next one: for "too big" that is the point, and for
+// "could not tell" it is the unpushed history deleted by a slow `du`. So the script
+// carries the previous snapshot's copy forward, and these run it to see that it does.
+const UNMEASURED: GitDecision = { mode: "drop-all", why: "unmeasured", detail: "probe timed out" };
+
+for (const noRsync of [false, true]) {
+  const how = noRsync ? "tar fallback" : "rsync";
+
+  test(`X14a (${how}) a probe that failed carries every saved repository forward, and the rest syncs as usual`, () => {
+    const ctx = setup();
+    try {
+      // Names that tests of the carry have to survive: a space, a quote, glob
+      // characters, a newline (the listing of the saved copy is NUL-separated for it).
+      const names = ["proj", "my project", "it's", "x[1]*?", "odd\nname", "deep/er/repo", ""];
+      for (const n of names) {
+        write(ctx.workspace, `${n}/.git/HEAD`.replace(/^\//, ""), "ref: refs/heads/old\n");
+        write(ctx.workspace, `${n}/.git/refs/heads/old`, "1\n".repeat(3));
+        write(ctx.workspace, `${n}/tree.txt`.replace(/^\//, ""), "v1\n");
+      }
+      assert.match(syncWithGit(ctx, 1, KEEP, noRsync), /OK\s*$/);
+
+      // The workspace moves on -- new work in every repository, which a sync that
+      // could not measure has not seen -- and one working tree is deleted outright.
+      for (const n of names) {
+        write(ctx.workspace, `${n}/.git/HEAD`.replace(/^\//, ""), "ref: refs/heads/new\n");
+        write(ctx.workspace, `${n}/tree.txt`.replace(/^\//, ""), "v2\n");
+      }
+      rmSync(join(ctx.workspace, "my project"), { recursive: true, force: true });
+      write(ctx.workspace, "fresh.txt", "new file\n");
+
+      assert.match(syncWithGit(ctx, 2, UNMEASURED, noRsync), /OK\s*$/);
+
+      const snap = (rel: string): string => snapshotFile(ctx, rel);
+      for (const n of names.filter((x) => x !== "my project")) {
+        const p = (rel: string): string => (n ? `${n}/${rel}` : rel);
+        assert.equal(snap(p(".git/HEAD")), "ref: refs/heads/old\n", `${n || "(root)"}: the copy saved before, not none and not the new one`);
+        assert.equal(snap(p(".git/refs/heads/old")), "1\n1\n1\n");
+        assert.equal(snap(p("tree.txt")), "v2\n", `${n || "(root)"}: its working tree is synced as ever`);
+      }
+      assert.equal(snap("fresh.txt"), "new file\n");
+      assert.ok(
+        !existsSync(join(ctx.base, "current", "my project")),
+        "a repository whose directory the user deleted does not come back as a lone .git",
+      );
+      assert.ok(!existsSync(join(ctx.base, "pending")), "and nothing is left half-built");
+    } finally {
+      cleanup(ctx);
+    }
+  });
+
+  test(`X14b (${how}) one repository that could not be measured is carried; its neighbours are what the workspace has`, () => {
+    const ctx = setup();
+    try {
+      for (const n of ["odd", "fine", "huge"]) {
+        write(ctx.workspace, `${n}/.git/HEAD`, "ref: refs/heads/old\n");
+        write(ctx.workspace, `${n}/f.txt`, "v1\n");
+      }
+      assert.match(syncWithGit(ctx, 1, KEEP, noRsync), /OK\s*$/);
+      for (const n of ["odd", "fine", "huge"]) write(ctx.workspace, `${n}/.git/HEAD`, "ref: refs/heads/new\n");
+
+      const decision: GitDecision = {
+        mode: "keep",
+        skipped: [
+          { path: join(ctx.workspace, "odd/.git"), bytes: -1, files: -1, reason: "unmeasured" },
+          { path: join(ctx.workspace, "huge/.git"), bytes: 9e9, files: 1, reason: "too_large" },
+        ],
+      };
+      assert.match(syncWithGit(ctx, 2, decision, noRsync), /OK\s*$/);
+
+      const exists = (rel: string): boolean => existsSync(join(ctx.base, "current", rel));
+      assert.equal(snapshotFile(ctx, "odd/.git/HEAD"), "ref: refs/heads/old\n", "kept as it was saved");
+      assert.equal(snapshotFile(ctx, "fine/.git/HEAD"), "ref: refs/heads/new\n", "measured, so copied as it is now");
+      assert.ok(!exists("huge/.git"), "known to be too big: left out on purpose, and its old copy goes with it");
+      assert.ok(exists("huge/f.txt"));
+    } finally {
+      cleanup(ctx);
+    }
+  });
+
+  test(`X14c (${how}) switched off carries nothing, and a workspace that came back empty still keeps the snapshot`, () => {
+    const ctx = setup();
+    try {
+      write(ctx.workspace, "r/.git/HEAD", "ref: refs/heads/main\n");
+      write(ctx.workspace, "r/f.txt", "v1\n");
+      assert.match(syncWithGit(ctx, 1, KEEP, noRsync), /OK\s*$/);
+
+      // An operator's choice is not an unknown: the repository is not carried.
+      assert.match(syncWithGit(ctx, 2, { mode: "drop-all", why: "disabled" }, noRsync), /OK\s*$/);
+      assert.ok(!existsSync(join(ctx.base, "current", "r/.git")), "disabled means disabled");
+
+      // Back to a snapshot that has a repository, then the sandbox comes apart:
+      // nothing in the workspace. The carry would put a `.git` into the empty copy
+      // and make it look like content, which is how the guard against replacing a
+      // snapshot with nothing would be defeated -- so it runs after that guard.
+      write(ctx.workspace, "r/.git/HEAD", "ref: refs/heads/main\n");
+      write(ctx.workspace, "r/f.txt", "v1\n");
+      assert.match(syncWithGit(ctx, 3, KEEP, noRsync), /OK\s*$/);
+      rmSync(ctx.workspace, { recursive: true, force: true });
+      mkdirSync(ctx.workspace, { recursive: true });
+      assert.throws(() => syncWithGit(ctx, 4, UNMEASURED, noRsync), /workspace_sync_empty|Command failed/);
+      assert.equal(snapshotFile(ctx, "r/.git/HEAD"), "ref: refs/heads/main\n", "the previous snapshot stands");
+      assert.equal(snapshotFile(ctx, "r/f.txt"), "v1\n");
     } finally {
       cleanup(ctx);
     }

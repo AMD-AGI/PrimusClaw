@@ -301,7 +301,6 @@ const workspaceSyncFailuresTotal = new Counter({
   labelNames: ["kind", "reason"] as const,
   // kind: "normal" | "sigterm"
   // reason: "timeout" | "rsync_error" | "meta_write_error" | "hands_unreachable"
-  //   | "config_error" | "empty_workspace" | "git_probe"
   registers: [registry],
 });
 
@@ -1001,7 +1000,7 @@ export const metrics = {
   onWorkspaceSyncFailure(
     kind: "normal" | "sigterm",
     reason: "timeout" | "rsync_error" | "meta_write_error" | "hands_unreachable"
-      | "config_error" | "empty_workspace" | "git_probe",
+      | "config_error" | "empty_workspace",
   ): void {
     workspaceSyncFailuresTotal.inc({ kind, reason });
   },

@@ -1166,6 +1166,8 @@ class TaskRunner {
   private lastSyncAt = 0;
   private pendingSync: Promise<unknown> | null = null;
   private lastSyncedTurn = 0; // updated post-sync; gates has_workspace_sync KV bit
+  /** The repository note the user was last shown in this run; see announceGitSkipped. */
+  private lastGitNote: string | undefined;
   /** Monotonic write counter; see CheckpointEnvelope.seq. */
   private checkpointSeq = 0;
   private lastWrittenSeq = 0;
@@ -1324,6 +1326,30 @@ class TaskRunner {
     this.transcriptLog.push({ ts: Date.now(), ...safeEvent });
     await this.emitter.emit(this.sessionId, safeEvent);
   };
+
+  /**
+   * Tell the user a snapshot left a repository out, or could not measure one.
+   *
+   * The event is the only place they can learn that commits in it will not survive
+   * the sandbox. Both ways the workspace is saved report it -- the S3 sync that ends
+   * a run, and the shared-disk sync after a checkpoint -- and the second runs every
+   * turn, so a note is said when it changes and not again while it stays the
+   * same. Once a sync leaves nothing out the next one that does is news again.
+   * A sync that left nothing out says nothing.
+   */
+  private async announceGitSkipped(git: { unmeasured: boolean; note: string } | undefined): Promise<void> {
+    if (!git) { this.lastGitNote = undefined; return; }
+    if (git.note === this.lastGitNote) return;
+    await this.onEvent({
+      type: "sandboxStatus",
+      status: "workspace_git_skipped",
+      reason: git.unmeasured ? "git_unmeasured" : "git_over_limit",
+      message: git.note,
+      message_id: this.messageId,
+    });
+    // Only once it went out: an event the stream refused is tried again next turn.
+    this.lastGitNote = git.note;
+  }
 
   /**
    * Freshest proof the run's prefix cache entry existed, ahead of the
@@ -1504,6 +1530,11 @@ class TaskRunner {
             { sessionId: this.sessionId, turn: turnSnapshot, sizeBytes: info.size, durationMs: info.durationMs },
             "checkpoint.workspace_sync_done",
           );
+          // Last, and on its own: the snapshot is saved and the flag is set whether
+          // or not the user can be told what it left out.
+          await this.announceGitSkipped(info.git).catch((e: unknown) => {
+            logger.warn({ err: e, sessionId: this.sessionId }, "checkpoint.git_skipped_event_failed");
+          });
           return info;
         })
         .catch((e: unknown) => {
@@ -3098,17 +3129,8 @@ class TaskRunner {
           });
         }
         // Independent of the above: a sync can land and still have left a
-        // repository behind. The event is the only place the user can learn
-        // that their commits in it will not survive the sandbox.
-        if (r.git) {
-          await this.onEvent({
-            type: "sandboxStatus",
-            status: "workspace_git_skipped",
-            reason: r.git.unmeasured ? "git_unmeasured" : "git_over_limit",
-            message: r.git.note,
-            message_id: this.messageId,
-          });
-        }
+        // repository behind.
+        await this.announceGitSkipped(r.git);
       } catch (e: unknown) {
         const errMsg = (e as { message?: string })?.message
           ? String((e as { message: string }).message).slice(0, 500)

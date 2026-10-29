@@ -247,10 +247,15 @@ A repository's `.git` is **not** regenerable -- it holds commits that exist nowh
 else until they are pushed -- so it is carried with the rest of the workspace and a
 sandbox rebuilt from the snapshot is still a repository. It is carried whole or not
 at all: a `.git` over `WORKSPACE_GIT_MAX_BYTES` (default 300 MiB) or
-`WORKSPACE_GIT_MAX_FILES` (default 2000) is left out, and the run reports it in a
-`workspace_git_skipped` sandbox event; push before leaving such a repository.
-Git's own lock and temporary files are not carried. `WORKSPACE_GIT_MAX_BYTES=0`
-turns `.git` snapshots off.
+`WORKSPACE_GIT_MAX_FILES` (default 2000) is left out, and so are the largest of a
+workspace's repositories once they add up to more than
+`WORKSPACE_GIT_TOTAL_MAX_BYTES` (1 GiB) or `WORKSPACE_GIT_TOTAL_MAX_FILES` (10000).
+Either snapshot destination reports it in a `workspace_git_skipped` sandbox event; push
+before leaving such a repository. A sandbox that cannot measure its repositories in
+`WORKSPACE_GIT_PROBE_TIMEOUT_SEC` (default 60) does not stop the sync: the rest of the
+workspace is saved and each repository keeps the copy the last snapshot held. Git's own
+lock and temporary files are not carried. `WORKSPACE_GIT_MAX_BYTES=0` turns `.git`
+snapshots off.
 
 ## Key Environment Variables
 
