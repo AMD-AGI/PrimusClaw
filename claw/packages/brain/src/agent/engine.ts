@@ -269,6 +269,7 @@ export class AgentEngine {
     const hitl = anyApproval
       ? new HitlController(decisions, onEvent, {
           requireApproval: (t) => approval.requiresApproval(t),
+          autoApprove: (t, input) => approval.autoApproves(t, input),
           requireApprovalFor: (t, input) => (t.toLowerCase() === "bash" ? bashPolicy.check(input.command) : null),
         })
       : undefined;

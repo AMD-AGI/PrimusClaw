@@ -6,7 +6,9 @@
  * Disabled by default (HITL_ENABLED=false); when off, all calls auto-allow,
  * except tools a per-server policy (approval-policy.ts) marks as requiring
  * approval: those are always held for a person, and fail closed (denied) when
- * no one answers or there is no channel to ask on.
+ * no one answers or there is no channel to ask on. The one thing that lifts such
+ * a hold is the same policy's explicit `auto_approve` allowlist: a call it lists
+ * runs without a decision and is recorded as `by: "policy"`.
  */
 
 import {
@@ -19,6 +21,7 @@ import type { DecisionDispatcher, NatsDecisionMessage } from "../delivery/decisi
 import type { EventCallback } from "@claw/protocol";
 import pino from "pino";
 import { explainApproval, type ApprovalExplainContext } from "./approval-explain.js";
+import { metrics } from "../infra/metrics.js";
 
 const logger = pino({ name: "hitl" });
 
@@ -26,7 +29,7 @@ const logger = pino({ name: "hitl" });
 export type HitlRefusal = "denied" | "skipped" | "timeout" | "no_channel" | "aborted";
 
 export type HitlResult =
-  | { action: "allow"; input: Record<string, unknown>; by: "auto_allow" | "user" | "timeout" }
+  | { action: "allow"; input: Record<string, unknown>; by: "auto_allow" | "user" | "timeout" | "policy" }
   | { action: "deny" | "skip"; reason: string; by: "user" | "timeout"; cause?: HitlRefusal };
 
 /**
@@ -80,6 +83,13 @@ export interface HitlOptions {
    * `requireApproval`: always asked, never remembered, denied on no answer.
    */
   requireApprovalFor?: (tool: string, input: Record<string, unknown>) => string | null;
+  /**
+   * Of the calls `requireApproval` holds, those that may run without a
+   * decision (an explicit `auto_approve` allowlist). Consulted only for a call
+   * `requireApproval` holds and `requireApprovalFor` does not; it cannot release
+   * anything else, and an answer that is not exactly `true` releases nothing.
+   */
+  autoApprove?: (tool: string, input: Record<string, unknown>) => boolean;
 }
 
 export class HitlController {
@@ -108,6 +118,9 @@ export class HitlController {
    * The same question `beforeToolUse` asks itself, so the two cannot drift.
    */
   willAsk(tool: string, input?: Record<string, unknown>): boolean {
+    // A call the policy lists for auto-approval waits for nobody, whether or
+    // not there is anyone to ask.
+    if (this.autoApproved(tool, input)) return false;
     if (!this.dispatcher) return false;
     // A policy-held tool is asked about every time: no session-wide allow.
     if (this.mustAsk(tool, input)) return true;
@@ -123,10 +136,31 @@ export class HitlController {
     return this.opts.requireApprovalFor?.(tool, input ?? {}) ?? null;
   }
 
+  /**
+   * A held call the server's own allowlist releases. Only the server-level
+   * `requires_approval` hold can be released: a per-call hold (a bash rule) is
+   * never lifted here, and a tool nothing holds is not "approved" by this, it
+   * simply follows the ordinary HITL settings.
+   */
+  private autoApproved(tool: string, input?: Record<string, unknown>): boolean {
+    if (this.opts.requireApproval?.(tool) !== true) return false;
+    if (this.holdLabel(tool, input) !== null) return false;
+    return this.opts.autoApprove?.(tool, input ?? {}) === true;
+  }
+
   async beforeToolUse(req: HitlRequest): Promise<HitlResult> {
     // Decided once: a rule that read the input twice could answer differently.
     const label = this.holdLabel(req.tool, req.input);
     const must = label !== null || this.opts.requireApproval?.(req.tool) === true;
+    if (this.autoApproved(req.tool, req.input)) {
+      // The operator's explicit allowlist, not a person's decision: no card, no
+      // wait, and the record says so.
+      const result: HitlResult = { action: "allow", input: req.input, by: "policy" };
+      metrics.onHitlPolicyAllow(req.tool);
+      logger.info({ tool: req.tool, sessionId: req.sessionId }, "hitl.policy_allow");
+      await this.emitDecisionResult(req.actionId, result);
+      return result;
+    }
     if (!this.dispatcher && must) {
       // Nobody could answer, and the policy says a person must. Not an allow.
       return { action: "deny", reason: "approval required but no approval channel is available", by: "timeout", cause: "no_channel" };
