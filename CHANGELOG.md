@@ -201,6 +201,17 @@ record it.
   like the platform defaults instead of being inlined.
 
 ### Security
+- `a2a_call` no longer accepts a URL, and no longer sends the user's LLM key or the platform key to a peer.
+  The model used to be able to name any `http(s)://` address, and the call went out with the user's key (or,
+  in safe mode, the platform key) as its `Authorization` bearer, so a prompt-injected model could send that key
+  to any host or aim the call at an address inside the cluster. The tool now resolves only the peers an operator
+  configured in `A2A_AGENTS` (a URL is refused with the configured names), a peer is sent only its own token
+  (the variable its entry's `auth_env` names; none when it names none), a peer on a loopback or link-local
+  address is refused unless its entry sets `allow_local`, and redirects are not followed. `A2A_AGENTS` also
+  accepts a JSON array carrying those fields; the `name=url` list still works and sends no credential.
+  A call that relied on passing a URL (for example to the API's own A2A endpoint, authenticated with the
+  user's key) must now go through a configured peer with its own credential. See
+  `claw/docs/agent-server-design.md`, "Outbound `a2a_call`".
 - `redactSecrets` no longer takes quadratic time on a long line. The URL-credential pass rescanned a run of
   letters from every position in it when no `://` followed, so one line of 64 KB of letters held the event loop
   for about sixteen seconds in every caller (event redaction, previews, the new changes route). The scheme is now

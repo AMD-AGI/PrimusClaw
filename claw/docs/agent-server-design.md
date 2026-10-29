@@ -428,6 +428,34 @@ metadata.sandbox_image / metadata.resources       (highest)
 
 The pre-v1.0 `resource_cpu` / `resource_gpu` split was removed; downstream Brain reads `sandbox_image` + `resources`.
 
+#### Outbound `a2a_call`: peers and credentials
+
+Brain's built-in `a2a_call` tool is the client side of the above. It reaches only the peers an operator
+configured in the Brain env `A2A_AGENTS`; the model passes a peer **name**, and a URL is refused. It is
+never handed a credential and never chooses one: the `Authorization` bearer on a request to a peer is that
+peer's own token, read from the variable the entry's `auth_env` names, and a peer with no `auth_env` is sent
+no `Authorization` at all. The user's LLM key and the platform key are not sent to a peer (they used to be,
+as the bearer of every call).
+
+`A2A_AGENTS` takes either form:
+
+| Form | Example | Credential |
+|---|---|---|
+| Name list | `ci=https://ci.example.com,dev=http://dev.svc:8080` | none |
+| JSON array | `[{"name":"ci","url":"https://ci.example.com","auth_env":"A2A_PEER_TOKEN_CI","allow_local":false}]` | `A2A_PEER_TOKEN_CI` |
+
+An entry that does not parse (a name that is not `[A-Za-z0-9][A-Za-z0-9._-]*`, a non-http(s) URL, a URL with
+embedded credentials, an `auth_env` that is not a variable name, a non-boolean `allow_local`) is dropped and
+logged as `a2a.registry.entry_refused`; its neighbours still load. A named `auth_env` that is empty makes the
+peer uncallable (the call fails, it is never sent unauthenticated).
+
+A peer is refused when its address is loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, which
+includes the cloud metadata address, and `fe80::/10`) or unspecified (`0.0.0.0/8`, `::`), including those
+carried as IPv4-mapped or NAT64 IPv6, unless the entry sets `allow_local: true`. The check runs on the
+address the connection is actually made to, so a name cannot resolve one way for the check and another for
+the request. Private ranges are allowed: an in-cluster peer lives there and the operator named it.
+Redirects from a peer are not followed.
+
 #### Legacy `POST /invoke` / `POST /invoke/:skill`
 
 Kept verbatim for SaFE A2A Gateway clients that have not migrated. Bypasses the JSON-RPC dispatcher; does **not** carry caller scope (legacy sessions are inserted with `a2a_caller_id=''` and are invisible to v1.0 reads). Migrate to JSON-RPC `SendMessage` ASAP.
@@ -746,6 +774,7 @@ A2A errors carry `data: [google.rpc.ErrorInfo]` with a stable `reason` (`TASK_NO
 4. **No Secrets in Logs**: Task payloads are logged at `info` level with sensitive fields (API keys, tokens) redacted.
 5. **CORS**: Configurable via `CORS_ORIGINS` env. Default: deny all cross-origin requests in standalone mode.
 6. **TLS**: Agent Server listens on plain HTTP. TLS termination should be handled by a reverse proxy (nginx, Envoy, Higress).
+7. **Outbound A2A**: `a2a_call` only reaches operator-configured peers and sends each only its own credential; the model cannot name a URL, so a prompt-injected model can neither send a key to a host of its choosing nor aim a call at an internal address. See "Outbound `a2a_call`" in §3.2.
 
 ---
 

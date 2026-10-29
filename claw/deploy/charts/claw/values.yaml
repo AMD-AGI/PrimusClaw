@@ -133,6 +133,18 @@ brain:
   # EXTRA_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* in values.<ns>.env (see
   # values.example.env); a bare `helm upgrade --set` is dropped by the next
   # upgrade.sh. Empty by default, which changes nothing.
+  #
+  # The peers a2a_call may reach are set here too (there is no dedicated key): A2A_AGENTS names
+  # them and each peer's own token comes from the variable its auth_env names. Only a configured
+  # peer can be called, never a URL, and a peer receives only its own token -- not the user's LLM
+  # key or the platform key. With A2A_AGENTS unset, a2a_call has no peers. For example:
+  #   extraEnv:
+  #     - name: A2A_AGENTS
+  #       value: '[{"name":"ci","url":"https://ci.example.com","auth_env":"A2A_PEER_TOKEN_CI"}]'
+  #     - name: A2A_PEER_TOKEN_CI
+  #       valueFrom: {secretKeyRef: {name: a2a-peer-ci, key: token}}
+  # A peer on a loopback or link-local address needs "allow_local": true in its entry; see
+  # claw/docs/agent-server-design.md ("Outbound a2a_call").
   extraEnv: []
   extraVolumes: []
   extraVolumeMounts: []
