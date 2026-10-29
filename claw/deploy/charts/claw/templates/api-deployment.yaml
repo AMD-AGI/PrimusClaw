@@ -143,6 +143,13 @@ spec:
           value: {{ .Values.api.brainTaskTimeoutSec | quote }}
         - name: INTERNAL_BACKEND_URL
           value: {{ printf "http://primus-claw-api.%s.svc.cluster.local:80" .Release.Namespace | quote }}
+        {{- $publicUrl := include "primus-claw.publicUrl" . }}
+        {{- if $publicUrl }}
+        # Where a client outside the cluster reaches the API, ingress path
+        # prefix included. A2A agent cards advertise it; see primus-claw.publicUrl.
+        - name: CLAW_PUBLIC_URL
+          value: {{ $publicUrl | quote }}
+        {{- end }}
         - name: POSTGRES_HOST
           valueFrom:
             secretKeyRef: { name: {{ include "primus-claw.postgresUserSecretName" . | quote }}, key: host }
