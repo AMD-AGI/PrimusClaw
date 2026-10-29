@@ -310,6 +310,16 @@ const MATRIX: Row[] = [
       "rm -rf build dist",
       "rm -r ./tmp",
       "rm -rf $TARGET",
+      // After `--` every word is a target, whatever it looks like.
+      "rm -rf -- -rf",
+      "rm -rf -- -x /workspace/a",
+      "rm -r -- ../x",
+      "rm -rf /workspace/a -- /etc",
+      "rm -r -- /workspace/a /etc",
+      // A newline inside an earlier argument does not hide the words after it.
+      "rm \"a\n\" -rf /etc",
+      "rm -rf \"x\n\" /etc",
+      "rm \"a\n/b\" /workspace/c -r /workspace/d",
       "cd /workspace/app && rm -rf ../../..",
     ],
     allowed: [
@@ -322,6 +332,8 @@ const MATRIX: Row[] = [
       "rm -r -f /workspace/x/y",
       "rm --recursive /workspace/x/build",
       "rm -rf -- /workspace/x/build",
+      "rm -r -- /workspace/a /workspace/b",
+      "rm -- -x",
       "rm -rf /workspace/node_modules/.bin",
       "rm -rf /workspace/build/..cache",
       "rm /etc/hosts.bak",
@@ -415,6 +427,8 @@ test("a long adversarial command is matched in linear time, not backtracked fore
     `rm -rf ${"/workspace/a ".repeat(7000)}`,
     `rm -rf /workspace/${"a/".repeat(40000)}`,
     `rm -rf /workspace/${"/.x".repeat(30000)}`,
+    `rm -rf ${"/workspace/a ".repeat(7000)}-- /workspace/b`,
+    `rm -rf ${"/workspace/a\n".repeat(7000)}`,
     `gh ${"-R x ".repeat(15000)}pr view 1`,
   ];
   for (const c of cases) {
@@ -433,6 +447,8 @@ test("a long command that IS held is held in linear time too", () => {
     [`rm -rf ${"/workspace/a ".repeat(7000)}/tmp/x`, L.rm],
     [`rm -rf ${"/workspace/a ".repeat(7000)}tmp`, L.rm],
     [`rm -rf /workspace/${"a/".repeat(30000)}../x`, L.rm],
+    [`rm -rf ${"-- ".repeat(30000)}x`, L.rm],
+    [`rm -rf ${"/workspace/a ".repeat(7000)}-- tmp`, L.rm],
     [`git ${"-C x ".repeat(12000)}push origin main`, L.push],
     [`gh ${"-R x ".repeat(12000)}pr create`, L.pr],
   ] as Array<[string, string]>) {
