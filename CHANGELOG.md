@@ -28,8 +28,75 @@ record it.
 ## [Unreleased]
 
 ### Added
+- The API accepts an access token from an OpenID Connect identity provider (`Authorization: Bearer <JWT>`,
+  verified by the shared identity client against the issuer's key set) as a credential beside the existing
+  ones, behind `CLAW_IDENTITY_TOKEN_AUTH_ENABLED` (off by default; also needs `IDENTITY_CLIENT_ENABLED`).
+  The token must be typed `at+jwt`, name `CLAW_IDENTITY_TOKEN_AUDIENCE` (default `claw-api`) and carry
+  `CLAW_IDENTITY_TOKEN_SCOPE` (default `claw.api`); `sub` becomes the user id and the caller has the `default`
+  role only (the token's `roles` are not copied, so enabling this never grants admin).
+  `CLAW_IDENTITY_TOKEN_INTROSPECT` also asks the provider whether the token is still active. The chart takes
+  `identity.tokenAuth`. See `claw/docs/identity-client.md`.
+- A user can vote on an answer of their own session. `PUT /v1/sessions/:sessionId/feedback`
+  (`{ "message_id", "vote": "up" | "down", "reason"? }`) records it and
+  `DELETE /v1/sessions/:sessionId/feedback/:messageId` takes it back; both answer `{ "ok": true }`.
+  There is one vote per user per message, a repeat replaces it, and only the session's creator may
+  vote: another user's session, a deleted one and a missing one are the same 404. `message_id` is
+  text (1-100 characters from `A-Za-z0-9._:@-`) and `reason` is at most 8192 characters. A session
+  holds at most 1000 votes per user (409 past that). The votes live in the new table
+  `claw_answer_feedback`, created by the same idempotent start-up migration and required by the
+  schema check.
+- `GET /v1/images?search=<text>&limit=<n>` lists the container images the caller may pick from, as
+  `{ "items": [{ "name", "tag"?, "createdAt"? }], "total" }` (`name` is the full reference; `limit` is
+  50 by default and at most 200). It asks SaFE with the caller's own credential and passes on only
+  those fields. When SaFE cannot answer, the reply is a 503 (unreachable, not configured, or kubernetes
+  mode) or 502 (an answer that is not an image list), with `{ "error", "reason" }`, and a 401 or 403
+  when SaFE refuses the caller.
+- `auto_approve` on an MCP server spec, the sibling of `requires_approval`: an explicit allowlist (tool
+  names, a trailing `*` for a prefix, and an optional `when` that must equal the call's top-level scalar
+  arguments) of the held tools that may run without a decision, so a session nobody is watching can run
+  low-risk tools. A held tool that is not listed still waits for a person; an absent field changes
+  nothing, and a malformed one releases nothing. A release is recorded as `decisionResult` with
+  `by: "policy"` and counted in `claw_hitl_policy_allow_total` (no labels: a request can carry its own
+  server spec, so the entry that released the call is in the `hitl.policy_allow` log line instead). See
+  `claw/docs/mcp-approval.md`.
+- A session can be bound to a repository. `POST /v1/sessions` accepts `config.repo = {url, branch?}`
+  (`url` is `https://<host>/<owner>/<name>[.git]` with no credentials, query or fragment; `branch` is a
+  plain ref name, empty meaning the remote's default; anything else is a `400` starting
+  `config.repo`). Whenever Brain opens the sandbox for such a session it makes `/workspace/<name>` a git
+  working tree before the model is asked anything: a clone when absent, only a `git fetch` when a `.git` is
+  already there (a restored snapshot: local commits, the current branch and uncommitted edits are left
+  alone), and the repository's `.git` attached beside the files when a snapshot has files but no `.git`. The
+  turn's prompt gains a `[Repository]` block and the repository's `AGENTS.md` / `CLAUDE.md` (32 KB at most,
+  cut with a marker). The sandbox's global git config gets `credential.helper = !gh auth git-credential`, so
+  `git push` works with the user's own `GH_TOKEN`, which never appears in a URL, a command line or a log. A
+  failed clone does not fail the run; the reason is in the block. A session without `config.repo` is unchanged.
+  See `claw/docs/sandbox-session-lifecycle.md`.
+- Remote agents, off by default (`CLAW_REMOTE_AGENTS_ENABLED=true`): a program on a user's own
+  machine can dial out to Claw, advertise the agents it can run, receive commands over a
+  `text/event-stream` and post back the events they produce, while the user's own clients read the
+  session, send commands and answer permission requests through the API. Presence, resumable streams
+  (`Last-Event-ID`), keepalive, owner-only access (another user's id is a 404) and an audit trail are
+  included; Claw does not interpret what an agent says. See `claw/docs/remote-agents.md`.
+- Connector access tokens: the four connector-side routes of remote agents accept an RFC 9068 JWT
+  (`Authorization: Bearer`, audience `claw-api`, scope `claw.connector`, type `at+jwt`) issued by the
+  identity provider and verified with the shared identity client, beside the keys and sessions they
+  already accept. The token is a credential on those routes only; the user side and every other route
+  answer it as a request with no credential. The caller is the token's subject with the `default` role,
+  a token is good until it expires or, with `CLAW_CONNECTOR_TOKEN_INTROSPECT=true`, until the provider
+  says its grant is revoked, and a command stream opened with one ends (`event: token_expired`, or
+  `event: revoked`) when the token does. The audit trail records which kind of credential a
+  connector-side action used. Off unless remote agents and the identity client are both on. See
+  `claw/docs/remote-agents.md`.
+- `connector/`, the client of remote agents: `claw-connector` runs on a user's own machine and exposes
+  their Claude Code, Codex and Cursor agents (over the Agent Client Protocol) through outbound HTTPS only.
+  Device sign-in (RFC 8628) or a development key; a per-agent directory whitelist; every session forced into
+  the agent's ask mode and the mode read back before the first prompt (a session whose mode cannot be
+  confirmed is not opened); the adapter's own permission options passed through verbatim, including
+  allow-always; credentials masked before upload; a local audit log; a kill switch that stops only the
+  process groups it started. See `connector/README.md`.
 - A shared identity client in `@claw/utils`, built by API and Brain when
-  `IDENTITY_CLIENT_ENABLED=true` (off by default; nothing authenticates through it yet). It does OIDC
+  `IDENTITY_CLIENT_ENABLED=true` (off by default; it authenticates a request only through the access-token
+  credentials above, a connector's and an identity provider's). It does OIDC
   discovery and caches the issuer's JWKS, RFC 7662 token introspection (an active answer is cached for
   30 s, an inactive one for 5 s, concurrent lookups of one credential share one call), and an RFC 8693
   token exchange with a token cache. When the provider cannot be asked, a cached active answer keeps
@@ -62,11 +129,37 @@ record it.
   Credential-named arguments never reach that call. A timeout, an error or
   `HITL_SUMMARY_ENABLED=false` just omit the fields; approval semantics are
   unchanged and `input` is still sent as before.
+- `approval.requested` notifications. When Brain holds a tool call for a person's decision (an MCP tool
+  with `requires_approval`, a bash command a `bash_approval` rule matches, or `HITL_ENABLED`), the owner's
+  subscriptions that list `approval.requested` in their `event_types` are sent a signed webhook: the usual
+  fields plus `approval: {tool_use_id, tool, target, expires_at}`. `target` is the command (bash) or the
+  tool's name and salient inputs, with credentials masked and cut to 300 characters; `expires_at` is when
+  Brain stops waiting and refuses the call; a request that has already timed out when the event is
+  consumed is not announced. The `event_id` is derived from (type, session, `tool_use_id`),
+  so a repeated request is one row per subscription. The opt-in is the run notifications' (the session was
+  created with `config.notify_on_finish: true`, or was started by a trigger); `NOTIFY_MIN_RUN_SECONDS` does
+  not apply. A subscription that was created with the default `event_types` (the two run events) is not sent
+  approvals: add the type with `PATCH /v1/notification-subscriptions/:id`, or pass it on create.
+- `claw/examples/bash-approval/outbound-actions.json`, a `bash_approval` rule pack for actions that leave
+  the sandbox: `git push` (force and delete forms labelled apart), `gh pr` / `release` / `repo` / `workflow`
+  writes, `gh api` writes and implied POSTs, `kubectl` and `helm` writes, and a recursive `rm` unless
+  every target is spelled out under `/workspace/`. See `claw/docs/bash-approval.md`.
 - Deployment-level platform defaults: `PLATFORM_DEFAULTS_FILE` lists default skills
   (by marketplace tool id) and MCP servers mounted into every chat, behind
   `PROGRESSIVE_SKILLS_ENABLED` for skills. Default skills are listed by name and
   description only and written into the sandbox on first read. Off by default;
   see `claw/docs/platform-defaults.md`.
+
+- `GET /v1/sessions/:id/changes`: what the session's sandbox has changed, computed live with git through
+  Hands. It lists every git work tree under `/workspace` (two levels down, at most 20, and 200 files each, with
+  `truncated` past a limit) with branch, short head, and for each changed file its status (`M` `A` `D` `R` `?`),
+  additions and deletions (git's own numbers; untracked files counted by their lines; binary files `null`), and
+  `?repo=<path>&file=<path>` returns one file's unified diff (64 KB at most; vendor tokens, Bearer headers, URL
+  userinfo and the value after a credential-named variable, flag or field such as `DB_PASSWORD=` are masked). Creator only;
+  another user's session is a 404 like a missing one. A sandbox that is not running (reclaimed, pending, not
+  answering) is a `409 sandbox_not_running` and nothing is started to look at it. The repository and file in
+  the patch form must be exactly what the live listing holds; git is given only those strings, quoted, after
+  `--`, with literal pathspecs and without its optional index lock. See `claw/docs/sandbox-session-lifecycle.md`.
 
 ### Changed
 - Brain no longer fetches every plugin skill again on every turn. Downloaded skill
@@ -84,6 +177,10 @@ record it.
   like the platform defaults instead of being inlined.
 
 ### Security
+- `redactSecrets` no longer takes quadratic time on a long line. The URL-credential pass rescanned a run of
+  letters from every position in it when no `://` followed, so one line of 64 KB of letters held the event loop
+  for about sixteen seconds in every caller (event redaction, previews, the new changes route). The scheme is now
+  matched only where a run of scheme characters begins; the result for every input is unchanged.
 - Credential redaction no longer treats every `user_env` / `session_env` value
   as a secret to cut out of transcripts, and no longer misses short or
   oddly-named ones. Values are selected by whether the variable **name** reads
@@ -180,6 +277,25 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- A sandbox rebuilt from the workspace snapshot is still a git repository. `.git` was on the
+  snapshot's exclude list, so after the idle window the files came back and the history did not,
+  and every commit that had not been pushed was lost while the conversation still remembered
+  making it. `.git` is now snapshotted (S3 and the shared disk alike) except git's own transient
+  files (`*.lock`, `tmp_*` under `.git/objects`); `node_modules` and the rest of the list stay
+  excluded. A repository is carried whole or not at all: one over `WORKSPACE_GIT_MAX_BYTES`
+  (default 300 MiB) or `WORKSPACE_GIT_MAX_FILES` (default 2000, since the upload is one request
+  per file) is left out, and the run emits a `workspace_git_skipped` sandbox event that names it.
+  A workspace's repositories are also bounded together (`WORKSPACE_GIT_TOTAL_MAX_BYTES`, 1 GiB, and
+  `WORKSPACE_GIT_TOTAL_MAX_FILES`, 10000; the largest go first), and both snapshot destinations
+  emit the event, once per change of which repositories were left out and why. A repository left
+  out of a sync (over a bound, or one the sandbox cannot measure within
+  `WORKSPACE_GIT_PROBE_TIMEOUT_SEC`, default 60; 8 on a SIGTERM sync) keeps the copy the last
+  snapshot held: S3 does not prune its objects, and the shared-disk sync carries it forward. The
+  rest of the workspace is still saved and S3 keeps its upload delta. A `find` that only met an
+  unreadable directory no longer counts as an unfinished measurement. `WORKSPACE_GIT_MAX_BYTES=0` restores the old behaviour. A restore recreates the
+  empty `refs/` and `objects/` directories an object store cannot hold, the file list and zip
+  download hide `.git`, per-message archives do not copy it, and the resume hint no longer tells
+  the model its commits are gone.
 - A session no longer becomes unusable after a turn that called a tool whose name
   reads as a credential field (for example `mcp__*__apikey_*`). Brain's redactor
   replaced such a tool's whole `argumentsDetail` entry with the string
@@ -205,7 +321,7 @@ record it.
   named a retryable status was naked back into the queue it had just given up on.
   The runner now finds the give-up anywhere in the cause chain.
 - Parking a session whose hands handle was deleted no longer fails and retries
-  every sweep. NATS KV answers `get` on a deleted key with its delete marker, an
+  every sweep. NATS KV answers `get` on a deleted key with its delete marker, a
   empty value, and `parkHandsHandle` parsed it as a handle ("Unexpected end of
   JSON input") while `parkHandsAfterRun` skipped it as unreadable. Both now read a
   delete or purge marker as `gone`.
@@ -319,7 +435,7 @@ record it.
   values, and then the built-in fallbacks (`15m` idle, `24h` lifetime), still
   apply.
 - An `IdleReclaimRequested` Kubernetes Event on the Sandbox, recording the idle
-  timeout a reclaim was measured against and the last activity it saw, so an
+  timeout a reclaim was measured against and the last activity it saw, so a
   operator can tell an idle reclaim from any other deletion after the fact.
 - A `provider` label (`anthropic` | `openai`) on `claw_brain_llm_tokens_total`,
   `claw_brain_llm_cache_turns_total` and `claw_brain_llm_cache_write_tokens_total`.

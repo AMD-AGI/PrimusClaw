@@ -15,6 +15,9 @@ import { cacheUserLlmKey } from "../llm/client.js";
 import { resolveUserLlmKey, usePlatformKeyForLlm } from "../llm/key-source.js";
 import { ByokInvalidKeyError, ByokRateLimitError, ByokUpstreamUnavailableError, verifyByokKey } from "./byok.js";
 import { constantTimeEquals } from "@claw/utils";
+import { verifyConnectorToken } from "./connector-token.js";
+import { verifyIdentityAccessToken } from "./identity-token.js";
+import { recordRequestCredential } from "./request-credential.js";
 import pino from "pino";
 
 const logger = pino({ name: "auth" });
@@ -216,7 +219,7 @@ type AuthErrorSpec = {
  * authenticated by a different header, and would report the wrong failure.
  */
 export type CredentialOutcome =
-  | { status: "verified"; user: UserInfo; method: string }
+  | { status: "verified"; user: UserInfo; method: string; expiresAt?: number }
   | { status: "rejected"; error: AuthErrorSpec }
   | { status: "absent" };
 
@@ -426,7 +429,7 @@ export async function verifyXApiKeyHeader(
  * extraction, profile update, skill evolution, summarization) can call the LLM
  * on this user's behalf. See llm/client.ts for the rationale.
  */
-function grantVerifiedUser(req: FastifyRequest, user: UserInfo, method: string): void {
+function grantVerifiedUser(req: FastifyRequest, user: UserInfo, method: string, expiresAt?: number): void {
   logger.info({
     userId: user.userId, userName: user.userName,
     hasPlatformKey: !!user.platformKey,
@@ -434,6 +437,7 @@ function grantVerifiedUser(req: FastifyRequest, user: UserInfo, method: string):
     method,
   }, "auth.verified");
   (req as any).user = user;
+  recordRequestCredential(req, method, expiresAt);
   const llmKey = resolveUserLlmKey(user);
   if (llmKey) cacheUserLlmKey(user.userId, llmKey, MEMORY_LLM_BASE_URL);
 }
@@ -452,11 +456,16 @@ type CredentialPath = (
  * Exported so the order is pinned by a test: moving the cookie path after a
  * header path would let a request with a stale cookie and a valid header
  * authenticate, which is the opposite of the fail-closed behaviour above.
+ *
+ * The identity-token path sits after the `ak-` key path, which settles every
+ * Bearer value that starts with `ak-` before it can be taken for a JWT, and
+ * abstains unless it is switched on.
  */
 export const CREDENTIAL_PATHS: readonly CredentialPath[] = [
   verifySessionCookie,
   verifyDownloadQueryToken,
   verifyBearerApiKey,
+  verifyIdentityAccessToken,
   verifyXApiKeyHeader,
 ];
 
@@ -504,6 +513,19 @@ export async function authMiddleware(req: FastifyRequest, reply: FastifyReply): 
     devAuthBypass: devAuthBypassEnabled(),
   }, "auth.incoming");
 
+  // A connector's access token, on the connector-side routes of remote agents
+  // only (auth/connector-token.ts). First, so that a request which carries one
+  // is judged by it in every mode; it abstains for everything else.
+  const connectorToken = await verifyConnectorToken(req, pathname);
+  if (connectorToken.status === "verified") {
+    grantVerifiedUser(req, connectorToken.user, connectorToken.method, connectorToken.expiresAt);
+    return;
+  }
+  if (connectorToken.status === "rejected") {
+    const { status, legacyError, anthropicType, message } = connectorToken.error;
+    return sendAuthError(req, reply, status, legacyError, anthropicType, message) as any;
+  }
+
   // Dev bypass, gated behind CLAW_INSECURE_DEV_AUTH=1. The dev-user is granted
   // `system-admin` so local harness work (task-dag platform trust, seed
   // scripts, etc.) does not need a real SaFE login.
@@ -523,6 +545,18 @@ export async function authMiddleware(req: FastifyRequest, reply: FastifyReply): 
   // The same key flows on as the selected LLM source (virtualKey by default,
   // platformKey in proxy mode) and is injected into the sandbox.
   if (isKubernetesMode()) {
+    // An identity provider's access token (auth/identity-token.ts) is judged first
+    // here too, and abstains unless CLAW_IDENTITY_TOKEN_AUTH_ENABLED is on; in the
+    // SaFE mode below it is one of CREDENTIAL_PATHS.
+    const identityToken = await verifyIdentityAccessToken(req, null, pathname);
+    if (identityToken.status === "verified") {
+      grantVerifiedUser(req, identityToken.user, identityToken.method);
+      return;
+    }
+    if (identityToken.status === "rejected") {
+      const { status, legacyError, anthropicType, message } = identityToken.error;
+      return sendAuthError(req, reply, status, legacyError, anthropicType, message) as any;
+    }
     const key = extractApiKey(req);
     if (!key) {
       return sendAuthError(req, reply, 401, "authentication_required", "authentication_error",

@@ -45,12 +45,17 @@ test("skip_no_ckpt + deliveryCount>1 → checkpoint_lost toast, no hint", () => 
   assert.equal(r.toastReason, "checkpoint_lost");
 });
 
-test("workspace_restore → hint about .git/index + node_modules + resume_workspace_restored toast", () => {
+test("workspace_restore → hint says .git is restored and node_modules is not + resume_workspace_restored toast", () => {
   const r = classifyResumeOutcome("workspace_restore", { has_workspace_sync: true }, false, 2);
   expectHintShape(r.hint as any);
   const text = (r.hint!.content as string);
-  assert.match(text, /\.git index/);
-  assert.match(text, /node_modules/);
+  // The hint used to tell the model its commits were gone and to redo them; the
+  // snapshot now carries .git, so that advice would have it redo work that is
+  // there. What stays true is node_modules, and a .git over the size limit.
+  assert.match(text, /including each repository's \.git/);
+  assert.doesNotMatch(text, /\.git index/);
+  assert.match(text, /node_modules and other regenerable directories are not preserved/);
+  assert.match(text, /over the size limit is not saved/);
   assert.equal(r.toastReason, "resume_workspace_restored");
 });
 

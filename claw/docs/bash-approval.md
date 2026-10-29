@@ -68,6 +68,52 @@ As plugin config: `{"config": {"s3_key": "...", "bash_approval": [ ... ]}}`.
 Approval needs a decision channel, the same one `requires_approval` uses; with
 none, a held call is denied.
 
+## A ready-made pack for outbound actions
+
+[`claw/examples/bash-approval/outbound-actions.json`](../examples/bash-approval/outbound-actions.json) is a
+rule list for the actions that leave the sandbox and change something somewhere else: publishing commits,
+opening or merging pull requests, writing through the GitHub API, changing a cluster, and deleting files
+outside the workspace. Use it as it is (`BASH_APPROVAL_RULES="$(cat outbound-actions.json)"`, or as a
+tool's `config.bash_approval`) or copy the rules you want. Each held call carries the rule's label in its
+approval request.
+
+| Rule | Held | Runs without asking |
+|---|---|---|
+| `git push` | `git push` in any form, `git -C dir push`, `git --git-dir=... push`; the **force / delete** forms (`--force`, `-f`, `--force-with-lease`, `--delete`, `-d`, `--mirror`, `--prune`, `+ref`, `:ref`) are labelled separately | `status`, `log`, `diff`, `fetch`, `pull`, `clone`, `checkout`, `branch`, `commit`, `stash` (also `stash push`), `remote`, `config` |
+| `gh pr` | `create`, `merge`, `close`, `review`, `ready`, `edit`, `reopen`, `comment`, `update-branch` | `view`, `list`, `checks`, `diff`, `status`, `checkout` |
+| `gh release` | `create`, `edit`, `delete`, `upload`, `delete-asset` | `list`, `view`, `download` |
+| `gh api` | `-X` / `--method` `POST`, `PUT`, `PATCH`, `DELETE`; and any call with `-f`, `-F`, `--field`, `--raw-field` or `--input` and no explicit `GET` (`gh` sends those as a POST) | `GET` calls, including `-X GET ... -f q=...` |
+| `gh repo` | `create`, `delete`, `edit`, `rename`, `archive`, `unarchive`, `fork`, `sync` | `view`, `clone`, `list` |
+| `gh workflow` | `run`, `enable`, `disable` | `list`, `view` |
+| `kubectl` | `apply`, `delete`, `patch`, `scale`, `exec`, `create`, `replace`, `edit`, `label`, `annotate`, `cordon`, `uncordon`, `drain`, `taint`, `set`, `run`, `cp`, `debug`, `expose`, `autoscale`, `rollout restart/undo/pause/resume` | `get`, `describe`, `logs`, `top`, `config`, `rollout status`, `rollout history` |
+| `helm` | `install`, `upgrade`, `uninstall`, `delete`, `rollback`, `push` | `list`, `template`, `status`, `get`, `lint`, `show`, `repo` |
+| `rm` | a recursive `rm` (`-r`, `-R`, `-rf`, `-fr`, `--recursive`, in any spelling) unless **every** target is spelled out as `/workspace/<something>`: an absolute path elsewhere, `~`, `$HOME`, `/workspace` itself, `/workspace/*`, any path with a `..` segment, and any **relative** path (`rm -rf node_modules`, `cd / && rm -rf usr`) are held | `rm file`, `rm -f /tmp/x.log` (not recursive), `rm -rf /workspace/app/build`, `rm -r /workspace/a /workspace/b` |
+
+The program is found through `sudo`, `env X=1`, `timeout`, `nohup`, `bash -c "..."`, `ssh host ...` and
+`kubectl exec -- ...`, and option values are skipped, so a namespace called `apply` in `kubectl -n apply get pods`
+is not an `apply`, and `gh -R owner/repo pr create` is a `pr create`.
+
+Things this pack does not do, beyond the limits above:
+
+- A rule cannot see the working directory, so a recursive `rm` is judged by its text alone: it runs only when
+  every target starts with `/workspace/` (every word after `--` is a target, whatever it looks like). A relative target is held even inside `/workspace`
+  (`rm -rf node_modules`; write `rm -rf /workspace/app/node_modules` to run without asking), because the
+  same words after a `cd /` delete something else. A variable inside the path (`/workspace/$X`) is not expanded.
+- A value with a space after git's global `-C` / `-c` (`git -C "my dir" push`) is not seen as a push: the
+  words are matched after the shell's quotes are removed.
+- A recursive delete of a `/tmp` path is held, because it is outside `/workspace`. Delete the `rm` rule, or
+  narrow it, if scratch cleanup should not ask.
+- A GraphQL read through `gh api graphql -f query=...` is a POST to GitHub and is held.
+- It does not cover `gh issue`, `gh gist`, `gh secret`, `gh run`, `git` aliases, other HTTP clients (add an
+  `http` rule), `docker push`, or a script that does any of this.
+
+The held call's request goes to whoever can answer it. With `CLAW_NOTIFICATIONS_ENABLED`, a subscription that
+lists `approval.requested` in its `event_types` is also sent a signed `approval.requested` webhook for each
+held call of a session that opted in (`config.notify_on_finish: true`, or started by a trigger), carrying the
+tool, a redacted summary of the command and the time at which Brain stops waiting, so the answer does not
+depend on someone watching the run. A request whose waiting time has already passed by the time the event is
+processed (a consumer that fell behind) is not announced: nobody can still answer it.
+
 ## What the model sees on a refusal
 
 For MCP tools and bash alike: `The user denied this action; it was not

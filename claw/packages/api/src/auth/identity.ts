@@ -19,7 +19,10 @@ let instance: IdentityClient | null = null;
 
 /**
  * The process's identity client, or null while IDENTITY_CLIENT_ENABLED is off,
- * which is the default. Nothing in request authentication reads this yet.
+ * which is the default. Request authentication reads it for two things: a
+ * connector's access token (connector-token.ts) and, only with
+ * CLAW_IDENTITY_TOKEN_AUTH_ENABLED on, an identity provider's access token
+ * (identity-token.ts).
  */
 export function identityClient(): IdentityClient | null {
   return instance;

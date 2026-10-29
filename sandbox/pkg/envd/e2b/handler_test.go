@@ -34,10 +34,11 @@ func TestConnectStartFilesAndSignal(t *testing.T) {
 	}
 
 	wrote := postRaw(t, srv.URL+"/files?path=/out/a.txt", "text/plain", []byte("hi"))
-	if wrote.StatusCode != http.StatusOK {
-		t.Fatalf("upload %d", wrote.StatusCode)
-	}
+	wroteBody, _ := io.ReadAll(wrote.Body)
 	_ = wrote.Body.Close()
+	if wrote.StatusCode != http.StatusOK || !strings.Contains(string(wroteBody), `"name":"a.txt"`) || !strings.HasPrefix(strings.TrimSpace(string(wroteBody)), "[") {
+		t.Fatalf("upload %d %s", wrote.StatusCode, wroteBody)
+	}
 	got := getRaw(t, srv.URL+"/files?path=/out/a.txt")
 	if got != "hi" {
 		t.Fatalf("download %q", got)
@@ -182,6 +183,45 @@ func TestEnvelopedStart(t *testing.T) {
 	}
 	if code != 0 || out.String() != "hello" {
 		t.Fatalf("stdout=%q code=%d", out.String(), code)
+	}
+}
+
+func TestStartOmitsStdinEnds(t *testing.T) {
+	ws := t.TempDir()
+	mux := http.NewServeMux()
+	Mount(mux, ws, execStarter(ws))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	body := protoStartStdin("sh", nil, "-c", "printf hello")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/process.Process/Start", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/proto")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	events, err := readEvents(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	ended := false
+	for _, ev := range events {
+		if len(ev.data) > 0 && !ev.err {
+			out.Write(ev.data)
+		}
+		if ev.end {
+			ended = true
+		}
+	}
+	if !ended || out.String() != "hello" {
+		t.Fatalf("stdout=%q ended=%v", out.String(), ended)
 	}
 }
 

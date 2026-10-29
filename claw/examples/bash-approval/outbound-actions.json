@@ -1,0 +1,59 @@
+[
+  {
+    "label": "git push --force / --delete (rewrites or deletes remote history)",
+    "program": "git",
+    "args_regex": "^(?:(?:-[cC]|--(?:git-dir|work-tree|namespace|super-prefix|config-env|attr-source))\\s+\\S+\\s+|(?!(?:-[cC]|--(?:git-dir|work-tree|namespace|super-prefix|config-env|attr-source))\\s)-\\S*\\s+)*push\\s(?:.*\\s)?(?:--force(?:-with-lease|-if-includes)?(?:=\\S*)?|--delete|--mirror|--prune|-[A-Za-z]*[fd][A-Za-z]*|\\+\\S*|:\\S+)(?:\\s|$)"
+  },
+  {
+    "label": "git push (publishes commits to a remote)",
+    "program": "git",
+    "args_regex": "^(?:(?:-[cC]|--(?:git-dir|work-tree|namespace|super-prefix|config-env|attr-source))\\s+\\S+\\s+|(?!(?:-[cC]|--(?:git-dir|work-tree|namespace|super-prefix|config-env|attr-source))\\s)-\\S*\\s+)*push(?:\\s|$)"
+  },
+  {
+    "label": "gh pr write (creates, changes or merges a pull request)",
+    "program": "gh",
+    "args_regex": "^(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*pr\\s+(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*(?:create|merge|close|review|ready|edit|reopen|comment|update-branch)(?:\\s|$)"
+  },
+  {
+    "label": "gh release write (publishes or changes a release)",
+    "program": "gh",
+    "args_regex": "^(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*release\\s+(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*(?:create|edit|delete|upload|delete-asset)(?:\\s|$)"
+  },
+  {
+    "label": "gh api write (POST / PUT / PATCH / DELETE)",
+    "program": "gh",
+    "flags": "i",
+    "args_regex": "^(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*api\\s(?:.*\\s)?(?:-X\\s*|--method(?:\\s+|=))(?:POST|PUT|PATCH|DELETE)(?:\\s|$)"
+  },
+  {
+    "label": "gh api with fields or a body (an implied POST)",
+    "program": "gh",
+    "flags": "i",
+    "args_regex": "^(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*api(?!(?:.*\\s)?(?:-X\\s*|--method(?:\\s+|=))GET(?:\\s|$)).*\\s(?:-[fF]|--field|--raw-field|--input)"
+  },
+  {
+    "label": "gh repo write (creates, changes or deletes a repository)",
+    "program": "gh",
+    "args_regex": "^(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*repo\\s+(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*(?:create|delete|edit|rename|archive|unarchive|fork|sync)(?:\\s|$)"
+  },
+  {
+    "label": "gh workflow write (runs, enables or disables a workflow)",
+    "program": "gh",
+    "args_regex": "^(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*workflow\\s+(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*(?:run|enable|disable)(?:\\s|$)"
+  },
+  {
+    "label": "kubectl write (changes cluster state or runs a command in a pod)",
+    "program": "kubectl",
+    "args_regex": "^(?:(?:-n|-s|-v|--namespace|--context|--kubeconfig|--cluster|--user|--server|--token|--as|--as-group|--as-uid|--certificate-authority|--client-certificate|--client-key|--cache-dir|--request-timeout|--tls-server-name|--password|--username|--profile|--profile-output|--log-flush-frequency|--v|--vmodule)\\s+\\S+\\s+|(?!(?:-n|-s|-v|--namespace|--context|--kubeconfig|--cluster|--user|--server|--token|--as|--as-group|--as-uid|--certificate-authority|--client-certificate|--client-key|--cache-dir|--request-timeout|--tls-server-name|--password|--username|--profile|--profile-output|--log-flush-frequency|--v|--vmodule)\\s)-\\S*\\s+)*(?:apply|delete|patch|scale|exec|create|replace|edit|label|annotate|cordon|uncordon|drain|taint|set|run|cp|debug|expose|autoscale|rollout(?!\\s+(?:status|history)(?:\\s|$)))(?:\\s|$)"
+  },
+  {
+    "label": "helm write (installs, upgrades or removes a release)",
+    "program": "helm",
+    "args_regex": "^(?:(?:-n|--namespace|--kube-context|--kubeconfig|--kube-apiserver|--kube-token|--kube-as-user|--kube-as-group|--kube-ca-file|--kube-tls-server-name|--registry-config|--repository-cache|--repository-config|--burst-limit|--qps)\\s+\\S+\\s+|(?!(?:-n|--namespace|--kube-context|--kubeconfig|--kube-apiserver|--kube-token|--kube-as-user|--kube-as-group|--kube-ca-file|--kube-tls-server-name|--registry-config|--repository-cache|--repository-config|--burst-limit|--qps)\\s)-\\S*\\s+)*(?:install|upgrade|uninstall|delete|rollback|push)(?:\\s|$)"
+  },
+  {
+    "label": "recursive rm of a path not explicitly under /workspace/ (the working directory is not known)",
+    "program": "rm",
+    "args_regex": "^(?=(?:[\\s\\S]*\\s)?(?:-[A-Za-z]*[rR][A-Za-z]*|--recursive)(?:\\s|$))(?=(?:[\\s\\S]*\\s)?(?!-)(?!(?!\\S*/\\.\\.(?:/|\\s|$))/workspace/(?!\\*)\\S+(?:\\s|$))\\S|(?:(?!--(?:\\s|$))\\S+\\s+)*--\\s+(?:[\\s\\S]*\\s)?(?!(?!\\S*/\\.\\.(?:/|\\s|$))/workspace/(?!\\*)\\S+(?:\\s|$))\\S)"
+  }
+]
