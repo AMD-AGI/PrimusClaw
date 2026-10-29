@@ -26,6 +26,7 @@ import {
 import { getContextUsageSnapshot } from "../sessions/context-builder.js";
 import { publicSessionRow } from "../events/redaction.js";
 import { archiveSession, unarchiveSession } from "../sessions/archive.js";
+import { getChangesPatch, getChangesSummary, type ChangesFailure } from "../sessions/changes-service.js";
 import { parseSessionModel } from "../sessions/session-model.js";
 import {
   isUserEnvKeyAllowed,
@@ -49,7 +50,6 @@ import { ZipArchive } from "archiver";
 import { Readable, PassThrough } from "node:stream";
 import pino from "pino"
 import { handsSessionKey, putTerminalHold } from "@claw/protocol";
-import { getChangesPatch, getChangesSummary, type ChangesFailure } from "../sessions/changes-service.js";
 
 const logger = pino({ name: "sessions" });
 
