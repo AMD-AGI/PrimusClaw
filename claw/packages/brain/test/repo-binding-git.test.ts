@@ -198,7 +198,25 @@ test("G4 the next turn in the same sandbox: no fetch and no clone", async () => 
   const again = await bind(s, { url: REPO_URL });
   assert.equal(again.state, "present");
   assert.deepEqual(verbs(s).filter(Boolean), [], "neither git clone nor git fetch ran");
+  assert.equal(s.calls.length, 1, "one call for the whole turn: the probe brought the state and the instructions with it");
   assert.notEqual(run(again.path, "rev-parse", "origin/main"), remoteHead(), "so the remote's newer commit is not here yet");
+});
+
+test("G4b the one call is a fresh read, not a cache: edits to the tree and to the instruction file show up on the next turn", async () => {
+  const s = sandbox("g4b");
+  const first = await bind(s, { url: REPO_URL });
+  assert.equal(first.changed, 0);
+  assert.deepEqual(first.instructions, []);
+  s.calls.length = 0;
+  fs.writeFileSync(path.join(first.path, "AGENTS.md"), "new house rules\n");
+  fs.writeFileSync(path.join(first.path, "README.md"), "# edited\n");
+  const second = await bind(s, { url: REPO_URL });
+  assert.equal(s.calls.length, 1);
+  assert.equal(second.changed, 2);
+  assert.deepEqual(second.instructions, [{ file: "AGENTS.md", text: "new house rules", truncated: false }]);
+  run(second.path, "checkout", "-q", "-b", "claw/other");
+  const third = await bind(s, { url: REPO_URL });
+  assert.equal(third.branch, "claw/other");
 });
 
 test("G5 files but no .git: the repository is attached and the files stay, as local changes", async () => {
@@ -223,6 +241,38 @@ test("G5 files but no .git: the repository is attached and the files stay, as lo
   assert.equal(b.notes.length, 2);
   assert.match(b.notes.join("|"), /branch feature\/x was not checked out because the files are in the way/);
   assert.deepEqual(fs.readdirSync(s.root), ["example-repo"], "no temporary clone left");
+});
+
+test("G5b an adoption whose reset fails takes the .git back out: the tree is as it was, and the next turn agrees", async () => {
+  const s = sandbox("g5b");
+  const dir = path.join(s.root, "example-repo");
+  const seedCopy = path.join(world, "g5b-copy");
+  run(world, "clone", "-q", remote, seedCopy);
+  fs.rmSync(path.join(seedCopy, ".git"), { recursive: true });
+  fs.renameSync(seedCopy, dir);
+  fs.writeFileSync(path.join(dir, "README.md"), "# mine\n");
+  // A git that refuses `reset` (a lock, a permission error) and runs everything else.
+  const shimDir = path.join(world, "git-shim");
+  fs.mkdirSync(shimDir, { recursive: true });
+  const realGit = execFileSync("bash", ["-c", "command -v git"], { encoding: "utf8", env: gitEnv() }).trim();
+  fs.writeFileSync(path.join(shimDir, "git"), `#!/bin/bash\nfor a in "$@"; do [ "$a" = reset ] && { echo "fatal: Unable to create index.lock: File exists" >&2; exit 128; }; done\nexec ${realGit} "$@"\n`, { mode: 0o755 });
+  const broken = {
+    callToolFull: async (_n: string, a: Record<string, unknown>) => {
+      const r = spawnSync("bash", ["-c", String(a.command)], { encoding: "utf8", env: { ...gitEnv(), PATH: `${shimDir}:${gitEnv().PATH}` } });
+      return { isError: r.status !== 0, text: r.status === 0 ? r.stdout : `exit ${r.status}\nstdout: ${r.stdout}\nstderr: ${r.stderr}` };
+    },
+  };
+  const failed = await bindRepo(broken, { url: REPO_URL }, { root: s.root, stateDir: s.state });
+  assert.equal(failed.state, "failed");
+  assert.match(failed.failure ?? "", /attaching the repository to them failed: fatal: Unable to create index\.lock/);
+  assert.equal(fs.existsSync(path.join(dir, ".git")), false, "the .git that was moved in is moved out again");
+  assert.equal(fs.readFileSync(path.join(dir, "README.md"), "utf8"), "# mine\n", "the files are untouched");
+  assert.deepEqual(fs.readdirSync(s.root), ["example-repo"], "no staging directory is left");
+  assert.equal(fs.existsSync(path.join(s.state, ".claw-repo-bound-example-repo")), false, "and the sandbox is not marked as bound");
+  // The next turn, with a git that works, sees the same state the failed one did and adopts it.
+  const next = await bind(s, { url: REPO_URL });
+  assert.equal(next.state, "adopted", JSON.stringify(next));
+  assert.equal(fs.readFileSync(path.join(dir, "README.md"), "utf8"), "# mine\n");
 });
 
 test("G6 somebody else's repository under the same name is left exactly as it is", async () => {

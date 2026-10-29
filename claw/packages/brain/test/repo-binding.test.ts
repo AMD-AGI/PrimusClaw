@@ -45,13 +45,19 @@ function scripted(script: Script[]) {
   };
 }
 
-const probe = (state: "absent" | "git" | "occupied" | "linked", opts: { origin?: string; bound?: boolean; cred?: "ok" | "failed" } = {}): Script => ({
+/** What the probe's single call prints on a turn after the first: the tree's state, and the instruction files. */
+interface Inline { branch?: string; head?: string; changed?: number; files?: string }
+const probe = (state: "absent" | "git" | "occupied" | "linked", opts: { origin?: string; bound?: boolean; cred?: "ok" | "failed"; inline?: Inline } = {}): Script => ({
   match: /CLAW_REPO_STATE/,
   reply: { text: [
     `CLAW_REPO_CRED=${opts.cred ?? "ok"}`,
     `CLAW_REPO_STATE=${state}`,
     ...(state === "git" ? [`CLAW_REPO_ORIGIN=${opts.origin ?? URL}`] : []),
     `CLAW_REPO_BOUND=${opts.bound ? "yes" : "no"}`,
+    ...(state === "git" && opts.bound ? [
+      `CLAW_REPO_BRANCH=${opts.inline?.branch ?? "main"}`, `CLAW_REPO_HEAD=${opts.inline?.head ?? "abc1234"}`, `CLAW_REPO_CHANGED=${opts.inline?.changed ?? 0}`,
+      ...(opts.inline?.files ? [opts.inline.files] : []),
+    ] : []),
   ].join("\n") },
 });
 const status = (branch = "main", head = "abc1234", changed = 0): Script => ({
@@ -99,12 +105,34 @@ test("S1 has a .git in a new sandbox: probe, fetch, status, instructions - and n
   assert.match(b.notes[0], /session was started on branch main; this checkout is on claw\/work, where the earlier work was left, and it was not switched/);
 });
 
-test("S1 has a .git in the sandbox that already bound it: no fetch either", async () => {
-  const hands = scripted([probe("git", { bound: true }), status()]);
+test("S1 has a .git in the sandbox that already bound it: no fetch, and ONE call - the state and the instructions come with the probe", async () => {
+  const files = "@@CLAW-REPO-FILE AGENTS.md@@\nbe kind\n@@CLAW-REPO-END@@";
+  const hands = scripted([probe("git", { bound: true, inline: { branch: "claw/work", head: "def5678", changed: 2, files } })]);
   const b = await bindRepo(hands, { url: URL }, opts);
-  assert.deepEqual(hands.commands().map(stepOf), ["probe", "status", "instructions"]);
+  assert.deepEqual(hands.commands().map(stepOf), ["probe"]);
   assert.equal(b.state, "present");
+  assert.deepEqual([b.branch, b.head, b.changed], ["claw/work", "def5678", 2]);
+  assert.deepEqual(b.instructions, [{ file: "AGENTS.md", text: "be kind", truncated: false }]);
   assert.deepEqual(b.notes, []);
+  // The probe command itself carries the status and the instruction reads, only for a bound git checkout.
+  const cmd = hands.commands()[0];
+  assert.match(cmd, /if \[ "\$ST" = git \] && \[ "\$BD" = yes \]; then echo "CLAW_REPO_BRANCH=/);
+  assert.ok(cmd.includes("@@CLAW-REPO-FILE AGENTS.md@@") && cmd.includes("@@CLAW-REPO-FILE CLAUDE.md@@"));
+});
+
+test("S1 a probe that brought no state (the first turn in a sandbox) is followed by the fetch, the status and the instructions", async () => {
+  const hands = scripted([probe("git", { bound: false }), status()]);
+  await bindRepo(hands, { url: URL }, opts);
+  assert.deepEqual(hands.commands().map(stepOf), ["probe", "fetch", "status", "instructions"]);
+});
+
+test("S1 an origin that is not the repository drops what the probe brought with it", async () => {
+  const files = "@@CLAW-REPO-FILE AGENTS.md@@\nsomeone else's rules\n@@CLAW-REPO-END@@";
+  const hands = scripted([probe("git", { bound: true, origin: "https://github.com/other-org/example-repo.git", inline: { files } })]);
+  const b = await bindRepo(hands, { url: URL }, opts);
+  assert.equal(b.state, "failed");
+  assert.deepEqual(b.instructions, []);
+  assert.equal(renderRepoBlock(b).includes("someone else's rules"), false);
 });
 
 test("S1 on the requested branch, a present checkout has no branch note; detached HEAD is named as such", async () => {
@@ -148,7 +176,7 @@ test("S1 a checkout that is a link, or has a .git that is a link or not a direct
   assert.equal(b.state, "failed");
   assert.equal(b.failure, "/workspace/example-repo (or its .git) is a symbolic link, or its .git is a pointer file and not a directory, so it was left untouched");
   assert.deepEqual(hands.commands().map(stepOf), ["probe"]);
-  assert.match(hands.commands()[0], /if \[ -L "\$D" \] \|\| \[ -L "\$D\/\.git" \] \|\| \{ \[ -e "\$D\/\.git" \] && \[ ! -d "\$D\/\.git" \]; \}; then echo CLAW_REPO_STATE=linked;/);
+  assert.match(hands.commands()[0], /if \[ -L "\$D" \] \|\| \[ -L "\$D\/\.git" \] \|\| \{ \[ -e "\$D\/\.git" \] && \[ ! -d "\$D\/\.git" \]; \}; then ST=linked;/);
 });
 
 test("S2 a failed clone is a reason and a failed state, not a throw; the instructions step is skipped", async () => {
@@ -280,7 +308,7 @@ test("S5 no command carries a credential, a force or a discard; every url and br
     assert.doesNotMatch(c, /\bgit\b[^;&|]*\s-f(\s|$)/, `a forced git: ${c}`);
     // `rm -rf` only ever names the staging directory this call made, or the leftover the record outside
     // the workspace names (and only when it still has the shape of one).
-    for (const m of c.matchAll(/rm -rf (\S+)/g)) assert.ok(['"$S"', '"$old"'].includes(m[1].replace(/;+$/, "")), `${m[1]} in ${c}`);
+    for (const m of c.matchAll(/rm -rf (\S+)/g)) assert.ok(['"$S"', '"$old"', '"$D/.git";'].includes(m[1]) || ['"$S"', '"$old"', '"$D/.git"'].includes(m[1].replace(/;+$/, "")), `${m[1]} in ${c}`);
   }
   // The url reaches git once, single-quoted, after `--`.
   const clone = all.find((c) => stepOf(c) === "clone")!;

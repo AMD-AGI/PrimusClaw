@@ -155,11 +155,18 @@ function credentialAndProbe(dir: string, boundMarker: string): string {
     // A link is never followed, and a .git that is not a directory (a pointer file of a linked
     // worktree or a submodule names a git directory somewhere else) is not accepted either: either
     // would have git write, and the instruction files be read, somewhere this code was not asked about.
-    `if [ -L "$D" ] || [ -L "$D/.git" ] || { [ -e "$D/.git" ] && [ ! -d "$D/.git" ]; }; then echo CLAW_REPO_STATE=linked;`,
-    `elif [ -e "$D/.git" ]; then echo CLAW_REPO_STATE=git; echo "CLAW_REPO_ORIGIN=$(git -C "$D" config --get remote.origin.url 2>/dev/null)";`,
-    `elif [ -e "$D" ] && [ -n "$(ls -A "$D" 2>/dev/null)" ]; then echo CLAW_REPO_STATE=occupied;`,
-    `else echo CLAW_REPO_STATE=absent; fi;`,
-    `if [ -e ${shq(boundMarker)} ]; then echo CLAW_REPO_BOUND=yes; else echo CLAW_REPO_BOUND=no; fi`,
+    `if [ -L "$D" ] || [ -L "$D/.git" ] || { [ -e "$D/.git" ] && [ ! -d "$D/.git" ]; }; then ST=linked;`,
+    `elif [ -e "$D/.git" ]; then ST=git;`,
+    `elif [ -e "$D" ] && [ -n "$(ls -A "$D" 2>/dev/null)" ]; then ST=occupied;`,
+    `else ST=absent; fi;`,
+    `echo "CLAW_REPO_STATE=$ST";`,
+    `if [ "$ST" = git ]; then echo "CLAW_REPO_ORIGIN=$(git -C "$D" config --get remote.origin.url 2>/dev/null)"; fi;`,
+    `if [ -e ${shq(boundMarker)} ]; then BD=yes; else BD=no; fi; echo "CLAW_REPO_BOUND=$BD";`,
+    // A turn after the first in a sandbox has nothing to clone or fetch, so what it needs to know (the
+    // state of the tree, the repository's instructions) comes back in this same call: one round trip,
+    // not three. It is read here whether or not the origin turns out to be the right repository; the
+    // caller drops it if it is not.
+    `if [ "$ST" = git ] && [ "$BD" = yes ]; then ${statusCommand(dir)}; ${instructionsCommand(dir)} fi`,
   ].join(" ");
 }
 
@@ -201,8 +208,10 @@ function adoptCommand(dir: string, root: string, record: string, url: string, bo
     // The repository's .git beside the files that are already there; the index is
     // rebuilt from HEAD without touching the working tree, so the files are kept
     // and show up as changes against it.
-    `git clone --quiet --no-checkout -- ${shq(url)} "$T" && mv "$T/.git" "$D/.git" && rm -rf "$S" && rm -f "$REC" && git -C "$D" reset --quiet && touch ${shq(boundMarker)}`,
-    `|| { rc=$?; rm -rf "$S"; rm -f "$REC"; exit $rc; }`,
+    // If anything after the move fails (the reset on a lock, a permission), the .git is taken out again:
+    // a half-adopted tree would be read as a repository by the next turn, over an index never rebuilt.
+    `MOVED=; git clone --quiet --no-checkout -- ${shq(url)} "$T" && mv "$T/.git" "$D/.git" && MOVED=1 && rm -rf "$S" && rm -f "$REC" && git -C "$D" reset --quiet && touch ${shq(boundMarker)}`,
+    `|| { rc=$?; [ "$MOVED" = 1 ] && rm -rf "$D/.git"; rm -rf "$S"; rm -f "$REC"; exit $rc; }`,
   ].join(" ");
 }
 
@@ -337,6 +346,8 @@ export async function bindRepo(hands: RepoHands, raw: unknown, options: BindOpti
     b.notes.push("git could not be set up to use the signed-in GitHub account, so `git push` and private repositories may ask for a login that cannot be given");
   }
 
+  /** The probe's own output, when it already holds the tree's state and the instruction files. */
+  let inline: string | null = null;
   if (state === "linked") {
     b.failure = `${dir} (or its .git) is a symbolic link, or its .git is a pointer file and not a directory, so it was left untouched`;
     return finish(b, started);
@@ -349,7 +360,11 @@ export async function bindRepo(hands: RepoHands, raw: unknown, options: BindOpti
       return finish(b, started);
     }
     b.state = "present";
-    if (marker(probe.out, "BOUND") !== "yes") {
+    if (marker(probe.out, "BOUND") === "yes" && marker(probe.out, "CHANGED") !== null) {
+      // This sandbox has bound the repository already: the probe brought the tree's state and the
+      // instruction files back with it, so this turn made one call.
+      inline = probe.out;
+    } else {
       const f = await sh(hands, fetchCommand(dir, boundMarker), CLONE_TIMEOUT_SEC, signal);
       if (!f.ok) b.notes.push(`git fetch failed (${reasonOf(f.out)}); the checkout is as it was left`);
     }
@@ -377,17 +392,21 @@ export async function bindRepo(hands: RepoHands, raw: unknown, options: BindOpti
     }
   }
 
-  const s = await sh(hands, statusCommand(dir), GIT_TIMEOUT_SEC, signal);
-  b.branch = marker(s.out, "BRANCH") || null;
-  b.head = marker(s.out, "HEAD") || null;
-  const changed = Number(marker(s.out, "CHANGED"));
+  const statusOut = inline ?? (await sh(hands, statusCommand(dir), GIT_TIMEOUT_SEC, signal)).out;
+  b.branch = marker(statusOut, "BRANCH") || null;
+  b.head = marker(statusOut, "HEAD") || null;
+  const changed = Number(marker(statusOut, "CHANGED"));
   b.changed = Number.isFinite(changed) ? changed : null;
   if (b.state === "present" && b.requestedBranch && b.branch !== b.requestedBranch) {
     b.notes.push(`the session was started on branch ${b.requestedBranch}; this checkout is on ${b.branch ?? "a detached HEAD"}, where the earlier work was left, and it was not switched`);
   }
 
-  const i = await sh(hands, instructionsCommand(dir), GIT_TIMEOUT_SEC, signal);
-  if (i.ok) b.instructions = parseInstructions(i.out);
+  if (inline !== null) {
+    b.instructions = parseInstructions(inline);
+  } else {
+    const i = await sh(hands, instructionsCommand(dir), GIT_TIMEOUT_SEC, signal);
+    if (i.ok) b.instructions = parseInstructions(i.out);
+  }
   return finish(b, started);
 }
 

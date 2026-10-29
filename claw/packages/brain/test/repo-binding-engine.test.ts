@@ -141,7 +141,8 @@ test("E3 a clone that fails does not fail the run: the model is told what failed
   const text = userText(r.body);
   assert.ok(text.includes(`- This session is bound to ${URL}, but setting up the working tree failed: git clone of ${URL} failed: remote: Repository not found. | fatal: repository 'https://github.com/example-org/example-repo/' not found.`), text);
   assert.ok(text.includes("- /workspace/example-repo is not ready. Tell the user what failed"));
-  assert.equal(r.hands.commands.some((c) => /CLAW-REPO-FILE/.test(c)), false, "no instructions are read from a tree that is not there");
+  // (The probe, the first call, only reads them for a checkout this sandbox has already bound.)
+  assert.equal(r.hands.commands.slice(1).some((c) => /CLAW-REPO-FILE/.test(c)), false, "no instructions are read from a tree that is not there");
 });
 
 test("E4 a sandbox that cannot be opened fails the run, as it does for any turn that needs one", async () => {

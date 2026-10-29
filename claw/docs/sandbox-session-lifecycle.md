@@ -267,8 +267,8 @@ unchanged.
 | `/workspace/<name>` | What happens |
 |---|---|
 | absent | `git clone` into a hidden sibling, moved into place only when it is whole; with a `branch`, switched to it if the remote has it (otherwise the default branch stays and the block says so) |
-| has a `.git` (a restored snapshot, or a sandbox that is still up) | `git fetch` once per sandbox, nothing else: the branch is not switched and nothing is merged or reset, so a commit, a branch or an edit made earlier is as it was left. A `.git` whose `origin` is a different repository is left alone and reported |
-| files but no `.git` | the repository's `.git` is placed beside the files and the index rebuilt from it; the files stay and show as local changes |
+| has a `.git` (a restored snapshot, or a sandbox that is still up) | `git fetch` once per sandbox, nothing else (a turn after the first in a sandbox makes a single Hands call: the tree's state and the instruction files come back with the probe): the branch is not switched and nothing is merged or reset, so a commit, a branch or an edit made earlier is as it was left. A `.git` whose `origin` is a different repository is left alone and reported |
+| files but no `.git` | the repository's `.git` is placed beside the files and the index rebuilt from it; the files stay and show as local changes. If the rebuild fails, the `.git` is taken out again, so the next turn sees the tree as it was |
 
 No token is ever put in a URL, a command line or a log. The sandbox's global git config is given
 `credential.helper = !gh auth git-credential`, which asks the `gh` the sandbox already has for the user's own
