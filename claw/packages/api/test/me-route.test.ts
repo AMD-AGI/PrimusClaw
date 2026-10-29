@@ -253,6 +253,7 @@ test("ME4: the failure table", async (t) => {
     { name: "users/self 404", path: "/api/v1/users/self", answer: (r) => sendJson(r, 404, {}), status: 502, error: "safe_error" },
     { name: "users/self 401 is the session lapsing", path: "/api/v1/users/self", answer: (r) => sendJson(r, 401, {}), status: 401, error: "session_rejected" },
     { name: "workspaces 401", path: "/api/v1/workspaces", answer: (r) => sendJson(r, 401, {}), status: 401, error: "session_rejected" },
+    { name: "clusters 401", path: "/api/v1/clusters", answer: (r) => sendJson(r, 401, {}), status: 401, error: "session_rejected" },
     { name: "workspaces 403 is a denial, not a lapsed session", path: "/api/v1/workspaces", answer: (r) => sendJson(r, 403, {}), status: 502, error: "safe_forbidden" },
     { name: "clusters 403 (a role that may not list clusters)", path: "/api/v1/clusters", answer: (r) => sendJson(r, 403, {}), status: 502, error: "safe_forbidden" },
     { name: "users/self 403", path: "/api/v1/users/self", answer: (r) => sendJson(r, 403, {}), status: 502, error: "safe_forbidden" },
