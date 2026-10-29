@@ -289,8 +289,10 @@ export class Connector {
     while (!this.ctl.signal.aborted) {
       if (this.outbox.size === 0) {
         await new Promise<void>((resolve) => {
-          this.wakeSender = () => { this.wakeSender = null; resolve(); };
-          this.ctl.signal.addEventListener("abort", () => resolve(), { once: true });
+          // Whichever ends the wait removes the other: a listener left on the run-long signal for every wait would pile up for days.
+          const done = () => { this.wakeSender = null; this.ctl.signal.removeEventListener("abort", done); resolve(); };
+          this.wakeSender = done;
+          this.ctl.signal.addEventListener("abort", done, { once: true });
         });
         continue;
       }
@@ -321,11 +323,11 @@ export class Connector {
   private async heartbeater(): Promise<void> {
     while (!this.ctl.signal.aborted) {
       await new Promise<void>((resolve) => {
-        const t = setTimeout(resolve, this.timing.heartbeatMs);
-        this.wakeHeartbeat = () => { clearTimeout(t); resolve(); };
-        this.ctl.signal.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
+        const done = () => { clearTimeout(t); this.wakeHeartbeat = null; this.ctl.signal.removeEventListener("abort", done); resolve(); };
+        const t = setTimeout(done, this.timing.heartbeatMs);
+        this.wakeHeartbeat = done;
+        this.ctl.signal.addEventListener("abort", done, { once: true });
       });
-      this.wakeHeartbeat = null;
       if (this.ctl.signal.aborted) break;
       if (this.paused) continue;
       try {

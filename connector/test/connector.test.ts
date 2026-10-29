@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import test, { after, describe } from "node:test";
+import { getEventListeners } from "node:events";
 import { processStart } from "../src/children.js";
 import { sleep } from "../src/util.js";
 import { FakeClaw } from "./support/fake-claw.js";
@@ -546,6 +547,22 @@ describe("crash safety", () => {
     assert.equal(h.claw.cursor, 2, "the server keeps the queued prompt: if the connector died now it would be delivered again");
     h.claw.issue("cancel", sid); // seq 4: drops the queue
     await h.claw.until("the cursor to pass everything", () => h.claw.cursor >= 4);
+  });
+});
+
+describe("a connector that runs for days", () => {
+  test("waiting on the run-long signal leaves nothing behind: listeners do not grow with heartbeats and events", async () => {
+    const h = await make({ timing: { heartbeatMs: 15 } });
+    const sid = await h.newSession();
+    const signal = (h.connector as unknown as { ctl: AbortController }).ctl.signal;
+    const count = () => getEventListeners(signal, "abort").length;
+    await sleep(300);
+    const before = count();
+    const beats = h.claw.heartbeats.length;
+    for (let i = 0; i < 6; i++) { h.prompt(sid, "say x"); await h.turnEnd(sid, i + 1); }
+    await sleep(500);
+    assert.ok(h.claw.heartbeats.length - beats >= 20, "many heartbeats and drain waits happened");
+    assert.ok(count() <= before + 2, `abort listeners grew from ${before} to ${count()}`);
   });
 });
 
