@@ -86,6 +86,7 @@ import { keepDeliveryAlive } from "./delivery/heartbeat.js";
 import {
   runDelivery, createFatPreGate, DeliveryResidency, SURPLUS_REFUSALS, type DeliveryDeps,
 } from "./delivery/dispatch.js";
+import { startIdentityClient } from "./clients/identity.js";
 import pino from "pino";
 import {
   metrics,
@@ -836,6 +837,8 @@ async function main(): Promise<void> {
   // refuses its own configuration must refuse it while it is still holding
   // nothing.
   const capacity = proveKeepaliveCapacity();
+  // Off unless IDENTITY_CLIENT_ENABLED is set; nothing in Brain uses it yet.
+  startIdentityClient(logger);
   const jsm = await initializeInfrastructure();
   const deliveryResidency = await startTaskDelivery(jsm);
   installSignalHandlers();

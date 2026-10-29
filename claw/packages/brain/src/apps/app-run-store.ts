@@ -75,6 +75,8 @@ export interface AppRunRecord {
   manifest: AppManifestV1;
   grant_id: string | null;
   grant_limits: Record<string, unknown> | null;
+  /** The template names the grant made available, `{ role: { cards: name } }`; null when no grant was issued. */
+  grant_templates: Record<string, Record<string, string>> | null;
   /** ISO time the grant lapses; null when it has no expiry or none was issued. */
   grant_expires_at: string | null;
   /** ISO time the grant was revoked; set means it is never extended. */
@@ -137,7 +139,8 @@ export class AppRunWriteRefused extends Error {
 export interface HttpStoreOptions {
   fetch?: typeof globalThis.fetch;
   baseUrl?: () => string;
-  headers?: () => Record<string, string>;
+  /** `hasBody` is false for a GET or DELETE: such a request must not claim a JSON content type. */
+  headers?: (hasBody: boolean) => Record<string, string>;
   brainId?: string;
   /**
    * The epoch this worker holds the run at (`claw_tasks.claim_count`, the
@@ -161,7 +164,7 @@ export function httpAppRunStore(opts: HttpStoreOptions): AppRunStore {
     return `${b}/v1/internal/app-runs/${encodeURIComponent(runId)}${suffix}`;
   };
   const call = async (u: string, init: RequestInit): Promise<{ status: number; body: any }> => {
-    const resp = await doFetch(u, { ...init, headers: headers(), signal: AbortSignal.timeout(TIMEOUT_MS) });
+    const resp = await doFetch(u, { ...init, headers: headers(init.body != null), signal: AbortSignal.timeout(TIMEOUT_MS) });
     const body = await resp.json().catch(() => null);
     return { status: resp.status, body };
   };

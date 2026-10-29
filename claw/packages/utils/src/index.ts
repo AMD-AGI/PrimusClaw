@@ -31,3 +31,4 @@ export {
   InMemoryKVStore,
   natsKvStore,
 } from "./kv/store.js";
+export * from "./identity/index.js";

@@ -186,6 +186,8 @@ export interface AppEnvSources {
   mcpToken: string;
   grantKeys: Partial<Record<AppSandboxRole, string>>;
   grantLimits: Record<string, unknown> | null;
+  /** The grant's template names (`{ role: { cards: name } }`); absent when no grant was issued. */
+  sandboxTemplates?: Record<string, Record<string, string>> | null;
   nodeName: string | null;
   /** Set under the fixed names `E2B_API_URL` and `E2B_SANDBOX_URL`. */
   e2bApiUrl?: string;
@@ -222,7 +224,8 @@ export function buildAppEnv(s: AppEnvSources): Record<string, string> {
   }
   for (const role of APP_SANDBOX_ROLES) set(map.sandbox_keys?.[role], s.grantKeys[role]);
   set(map.grant_limits, s.grantLimits ? JSON.stringify(s.grantLimits) : undefined);
-  set(map.sandbox_templates, manifest.sandbox_templates ? JSON.stringify(manifest.sandbox_templates) : undefined);
+  // The names the grant service returned, stored on the run; never the manifest's own array.
+  set(map.sandbox_templates, s.sandboxTemplates && Object.keys(s.sandboxTemplates).length > 0 ? JSON.stringify(s.sandboxTemplates) : undefined);
   if (s.e2bApiUrl) env.E2B_API_URL = s.e2bApiUrl;
   if (s.e2bSandboxUrl) env.E2B_SANDBOX_URL = s.e2bSandboxUrl;
   env.CLAW_SESSION_ID = s.sessionId;

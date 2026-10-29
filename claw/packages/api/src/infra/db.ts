@@ -1152,6 +1152,10 @@ export async function initDb(): Promise<void> {
     // open it under a later one. NULL is the correct value for a session gated
     // before this column existed, and every reader treats it as fail-closed.
     await addCol("agent_gate_message_id", "TEXT");
+    // The model this session's turns ask the gateway for. NULL is the correct
+    // value for every session created before the column existed and for one that
+    // never chose: such a turn carries no model and Brain uses its DEFAULT_MODEL.
+    await addCol("model", "TEXT");
     await client.query("CREATE INDEX IF NOT EXISTS idx_sessions_user ON claw_sessions(user_id, created_at DESC)").catch(() => {});
     await client.query("CREATE INDEX IF NOT EXISTS idx_sessions_context ON claw_sessions(context_id) WHERE context_id != ''").catch(() => {});
     await client.query("CREATE INDEX IF NOT EXISTS idx_sessions_a2a_caller ON claw_sessions(a2a_caller_id) WHERE a2a_caller_id != ''").catch(() => {});
@@ -1950,6 +1954,11 @@ export async function initDb(): Promise<void> {
     // can refuse another user and a different request body.
     // (Errors are logged, not swallowed: a lock timeout here shows up later only as
     // a missing column in the schema guard, with no cause.)
+    // The template names the run's grant made available (no secret): a Brain taking the run
+    // over injects the same ones.
+    await client.query("ALTER TABLE claw_app_runs ADD COLUMN IF NOT EXISTS grant_templates JSONB").catch((err: unknown) => {
+      logger.warn({ column: "grant_templates", err: err instanceof Error ? err.message : String(err) }, "db.app_runs_alter_failed");
+    });
     for (const col of ["created_by", "request_hash"]) {
       await client.query(`ALTER TABLE claw_app_runs ADD COLUMN IF NOT EXISTS ${col} TEXT`).catch((err: unknown) => {
         logger.warn({ column: col, err: err instanceof Error ? err.message : String(err) }, "db.app_runs_alter_failed");

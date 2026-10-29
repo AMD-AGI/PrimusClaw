@@ -68,6 +68,9 @@ CREATE TABLE claw_sessions (
   config         JSONB NOT NULL DEFAULT '{}'::jsonb,
   parent_session_id TEXT,
   team_role      TEXT DEFAULT '',
+  -- Which model the session's turns ask for; NULL is the deployment default.
+  -- Read by every dispatch and written by the create route's INSERT.
+  model          TEXT,
   created_at     TIMESTAMPTZ DEFAULT NOW(),
   updated_at     TIMESTAMPTZ DEFAULT NOW(),
   deleted_at     TIMESTAMPTZ,

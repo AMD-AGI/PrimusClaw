@@ -31,6 +31,7 @@ import type { PoolClient } from "pg";
 import { decideAdmission, withOwnedAdmissionLock } from "../tasks/admission.js";
 import { admissionAskFor } from "../tasks/run-dispatch.js";
 import { stripRunSecrets } from "../tasks/run-spec.js";
+import { sessionModelFromRow } from "./session-model.js";
 import { applyAppMcpToTask } from "./app-mcp.js";
 import { ensureSessionWorkspace, requireWorkspaceBinding } from "../workspace/store.js";
 import pino from "pino";
@@ -331,13 +332,21 @@ export async function dispatchTaskToBrain(
       task.sandbox_only = true;
     }
     const sessionMeta = (await db.query(
-      "SELECT parent_session_id, team_role FROM claw_sessions WHERE session_id = $1",
+      "SELECT parent_session_id, team_role, model FROM claw_sessions WHERE session_id = $1",
       [sessionId],
     )).rows[0];
     if (sessionMeta?.parent_session_id) {
       task.parent_session_id = sessionMeta.parent_session_id;
       task.team_role = sessionMeta.team_role || "";
     }
+    // The model the session's owner chose, read now rather than carried from when
+    // the session was created, so a change made between two turns is the next
+    // turn's model. Left off for a session with no choice: Brain then uses its
+    // DEFAULT_MODEL, and the run's persisted spec is what it always was. Every
+    // LLM call of the turn -- the loop, its sub-agents, compaction -- follows
+    // Brain's `request.model`, so this one field is the whole of the selection.
+    const sessionModel = sessionModelFromRow(sessionMeta);
+    if (sessionModel) task.model = sessionModel;
     // Names collide unhelpfully here: `workspace_id` above is the sandbox
     // namespace, this is the files. Brain gates concurrency on it, which is
     // what makes two runs over one directory queue instead of overwriting

@@ -59,6 +59,8 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
       "cleanup_state", "cleanup_attempts", "cleanup_next_at", "cleanup_error",
       // Absent, every gate acquisition fails and no turn can start at all.
       "agent_gate_message_id",
+      // Absent, the read that gives a turn its model fails, and so does every turn.
+      "model",
     ],
   },
   {
@@ -141,7 +143,7 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     onlyWhenAppRuns: true,
     columns: [
       "task_id", "session_id", "plugin_id", "manifest", "idempotency_key", "state",
-      "mcp_token_enc", "grant_id", "grant_keys_enc", "grant_limits",
+      "mcp_token_enc", "grant_id", "grant_keys_enc", "grant_limits", "grant_templates",
       "grant_expires_at", "grant_revoked_at", "created_by", "request_hash",
     ],
   },

@@ -53,6 +53,7 @@ export interface AppRunView {
   manifest: Record<string, unknown>;
   grant_id: string | null;
   grant_limits: Record<string, unknown> | null;
+  grant_templates: Record<string, Record<string, string>> | null;
   /** ISO time the grant lapses, when one was issued with an expiry. */
   grant_expires_at: string | null;
   /** ISO time the grant was revoked; set means it must not be extended. */
@@ -78,6 +79,7 @@ interface RunRow {
   manifest: Record<string, unknown>;
   grant_id: string | null;
   grant_limits: Record<string, unknown> | null;
+  grant_templates: Record<string, Record<string, string>> | null;
   grant_expires_at: Date | null;
   grant_revoked_at: Date | null;
   created_at: Date;
@@ -89,7 +91,7 @@ interface RunRow {
 
 const VIEW_SQL = `
   SELECT r.task_id, r.session_id, r.state, r.restarts, r.last_exit, r.events_cursor, r.state_dir,
-         r.sandbox_workload_id, r.manifest, r.grant_id, r.grant_limits, r.grant_expires_at, r.grant_revoked_at, r.created_at,
+         r.sandbox_workload_id, r.manifest, r.grant_id, r.grant_limits, r.grant_templates, r.grant_expires_at, r.grant_revoked_at, r.created_at,
          r.created_by, t.input, t.sandbox_spec, t.workspace_id
     FROM claw_app_runs r JOIN claw_tasks t ON t.task_id = r.task_id`;
 
@@ -106,6 +108,7 @@ function toView(row: RunRow): AppRunView {
     manifest: row.manifest,
     grant_id: row.grant_id,
     grant_limits: row.grant_limits,
+    grant_templates: row.grant_templates ?? null,
     grant_expires_at: row.grant_expires_at ? row.grant_expires_at.toISOString() : null,
     grant_revoked_at: row.grant_revoked_at ? row.grant_revoked_at.toISOString() : null,
     created_at: row.created_at.toISOString(),
@@ -287,7 +290,7 @@ export async function patchAppRun(
         AND (${patch.grant_revoked === true ? "r.grant_id IS NOT NULL" : "TRUE"})
         AND (${patch.grant_keys !== undefined ? "r.grant_id IS NOT NULL" : "TRUE"})
       RETURNING r.task_id, r.session_id, r.state, r.restarts, r.last_exit, r.events_cursor, r.state_dir,
-                r.sandbox_workload_id, r.manifest, r.grant_id, r.grant_limits, r.grant_expires_at, r.grant_revoked_at, r.created_at,
+                r.sandbox_workload_id, r.manifest, r.grant_id, r.grant_limits, r.grant_templates, r.grant_expires_at, r.grant_revoked_at, r.created_at,
                 r.created_by, t.input, t.sandbox_spec, t.workspace_id`,
     params,
   );

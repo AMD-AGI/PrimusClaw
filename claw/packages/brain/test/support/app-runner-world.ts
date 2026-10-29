@@ -109,6 +109,7 @@ export class World {
       manifest,
       grant_id: null,
       grant_limits: null,
+      grant_templates: null,
       grant_expires_at: null,
       grant_revoked_at: null,
       created_at: new Date(T0).toISOString(),
