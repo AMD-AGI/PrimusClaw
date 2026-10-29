@@ -105,3 +105,22 @@ same client, so they cannot be configured to disagree.
 {{- include "primus-claw.identityOptionalEnv" (dict "name" "IDENTITY_EXCHANGE_REFRESH_SKEW_SECONDS" "value" $i.exchangeRefreshSkewSeconds) }}
 {{- end }}
 {{- end -}}
+
+{{- /*
+The externally reachable base URL of the API (CLAW_PUBLIC_URL), or the empty
+string when nothing says what it is.
+
+api.publicUrl wins when set. Otherwise, with the ingress enabled, it is
+https://<ingress.host><ingress.path>: the ingress serves the API under that
+path and rewrites it away, so the API cannot see the prefix a client has to use
+and A2A agent cards would advertise <host>/a2a instead of <host><path>/a2a.
+Without an ingress host there is nothing to derive from, and the API falls back
+to the proxy's forwarded headers, then to a relative URL.
+*/ -}}
+{{- define "primus-claw.publicUrl" -}}
+{{- if .Values.api.publicUrl -}}
+{{- .Values.api.publicUrl | trimSuffix "/" -}}
+{{- else if and .Values.ingress.enabled .Values.ingress.host -}}
+{{- printf "https://%s%s" .Values.ingress.host (.Values.ingress.path | default "" | trimSuffix "/") -}}
+{{- end -}}
+{{- end -}}

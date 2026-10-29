@@ -270,7 +270,7 @@ Every JSON-RPC request **must** carry `A2A-Version: 1.0` (or `?A2A-Version=1.0` 
 
 The card's `supportedInterfaces[].url` is absolute, because behind an ingress that strips a path prefix the path the API sees (`/a2a`) is not the path a client must call (`<prefix>/a2a`). The base is taken, in order, from:
 
-1. `CLAW_PUBLIC_URL`, when set (for example `https://claw.example.com/claw-api`);
+1. `CLAW_PUBLIC_URL`, when set (for example `https://claw.example.com/claw-api`). The Helm chart sets it on the API Deployment to `https://<ingress.host><ingress.path>` by default, so the shipped ingress prefix is always in the card; `api.publicUrl` overrides it (for example for plain http or a gateway in front of the ingress);
 2. the proxy's `X-Forwarded-Host` (else `Host`), `X-Forwarded-Proto` (default `https`) and `X-Forwarded-Prefix`, when the request carries any `X-Forwarded-*` header. Each is validated (a plain host with an optional port, `http`/`https`, plain path segments) and ignored when it is not, since a client can send them when the API is reachable without a proxy. The card is served with `Vary` on these headers;
 3. nothing, in which case the URL stays relative (`/a2a`), as before.
 
