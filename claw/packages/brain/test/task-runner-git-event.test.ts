@@ -276,7 +276,9 @@ test("the terminal S3 sync that succeeded is not turned into a failed one by the
   assert.equal(uploads, 1, "the S3 sync ran");
   const statuses = events.filter((e) => e.type === "sandboxStatus").map((e) => e.status);
   assert.ok(!statuses.includes("workspace_sync_failed"), `a sync that landed is not reported as failed (${statuses})`);
-  assert.ok(events.some((e) => e.type === "exec_complete"), "and the run still completes");
+  const done = events.find((e) => e.type === "exec_complete");
+  assert.ok(done, "the run completes");
+  assert.equal(done.failed, false, "and as a success: the event is news, not an error of the run");
 });
 
 test("a SIGTERM sync to S3 gives the git measurement the short budget", async () => {
