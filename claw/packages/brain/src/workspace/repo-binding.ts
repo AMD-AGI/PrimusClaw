@@ -160,7 +160,9 @@ function credentialAndProbe(dir: string, boundMarker: string): string {
     `elif [ -e "$D" ] && [ -n "$(ls -A "$D" 2>/dev/null)" ]; then ST=occupied;`,
     `else ST=absent; fi;`,
     `echo "CLAW_REPO_STATE=$ST";`,
-    `if [ "$ST" = git ]; then echo "CLAW_REPO_ORIGIN=$(git -C "$D" config --get remote.origin.url 2>/dev/null)"; fi;`,
+    // The origin is somebody else's text (a config value can hold a newline), so it is sent as hex: nothing
+    // in it can pass for one of the marker lines below.
+    `if [ "$ST" = git ]; then echo "CLAW_REPO_ORIGIN_HEX=$(printf %s "$(git -C "$D" config --get remote.origin.url 2>/dev/null)" | od -An -v -tx1 | tr -d ' \\n')"; fi;`,
     `if [ -e ${shq(boundMarker)} ]; then BD=yes; else BD=no; fi; echo "CLAW_REPO_BOUND=$BD";`,
     // A turn after the first in a sandbox has nothing to clone or fetch, so what it needs to know (the
     // state of the tree, the repository's instructions) comes back in this same call: one round trip,
@@ -210,7 +212,10 @@ function adoptCommand(dir: string, root: string, record: string, url: string, bo
     // and show up as changes against it.
     // If anything after the move fails (the reset on a lock, a permission), the .git is taken out again:
     // a half-adopted tree would be read as a repository by the next turn, over an index never rebuilt.
-    `MOVED=; git clone --quiet --no-checkout -- ${shq(url)} "$T" && mv "$T/.git" "$D/.git" && MOVED=1 && rm -rf "$S" && rm -f "$REC" && git -C "$D" reset --quiet && touch ${shq(boundMarker)}`,
+    // `mv "$T/.git" "$D/"` renames onto "$D/.git" and fails if that exists and is not empty. Naming the
+    // destination `$D/.git` would instead move the clone INSIDE a .git directory somebody created since
+    // the probe, and the rollback would then remove theirs.
+    `MOVED=; git clone --quiet --no-checkout -- ${shq(url)} "$T" && mv "$T/.git" "$D/" && MOVED=1 && rm -rf "$S" && rm -f "$REC" && git -C "$D" reset --quiet && touch ${shq(boundMarker)}`,
     `|| { rc=$?; [ "$MOVED" = 1 ] && rm -rf "$D/.git"; rm -rf "$S"; rm -f "$REC"; exit $rc; }`,
   ].join(" ");
 }
@@ -353,10 +358,11 @@ export async function bindRepo(hands: RepoHands, raw: unknown, options: BindOpti
     return finish(b, started);
   }
   if (state === "git") {
-    const origin = marker(probe.out, "ORIGIN") ?? "";
+    const originHex = marker(probe.out, "ORIGIN_HEX") ?? "";
+    const origin = /^(?:[0-9a-fA-F]{2})*$/.test(originHex) ? Buffer.from(originHex, "hex").toString("utf8") : "";
     if (!sameRepoUrl(origin, repo.url)) {
       // Somebody else's checkout of a repository that happens to share a name. Left exactly as it is.
-      b.failure = `${dir} already holds a different repository (its origin is ${scrubReason(origin) || "unknown"}), so it was left untouched`;
+      b.failure = `${dir} already holds a different repository (its origin is ${scrubReason(origin.replace(/\s+/g, " ").trim().slice(0, 200)) || "unknown"}), so it was left untouched`;
       return finish(b, started);
     }
     b.state = "present";
