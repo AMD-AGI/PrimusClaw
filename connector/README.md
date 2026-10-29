@@ -130,7 +130,8 @@ All of these run on your machine and fail closed.
 
 **Kill switch.** Every adapter is started in its own process group and recorded (pid and start time) in
 `children.json`. `stop`, `pause`, a revocation and Ctrl-C signal exactly those groups: a process that is not recorded, or
-whose pid has been reused, is never signalled, and nothing here uses a pattern kill. If you disconnect the connector in Claw,
+whose pid has been reused, is never signalled, and nothing here uses a pattern kill. If an adapter's group leader (an `npx` wrapper) died but the
+agent it started is still in that group, the group is still stopped. If you disconnect the connector in Claw,
 the connector sees it within a heartbeat, stops every agent and exits without retrying.
 
 ## Files

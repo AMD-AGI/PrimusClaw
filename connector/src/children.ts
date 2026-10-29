@@ -72,9 +72,21 @@ export class ChildRegistry {
     return [...this.recs.values()];
   }
 
-  /** True when the recorded process is still the one we started. */
+  /**
+   * True when the recorded process group is ours to signal.
+   *
+   * Either its leader is still the process we started (same pid and start time), or the leader is gone and members
+   * remain: a process group id is a pid that cannot be handed to another process while any member lives, so a
+   * group that is still alive under a recorded id with a dead leader can only be the one we started (an `npx`
+   * wrapper exits and the agent below it stays). A leader pid that now belongs to a different process is a
+   * recycled id and is left alone.
+   */
   isOurs(rec: ChildRecord): boolean {
-    return rec.start !== "" && processStart(rec.pid) === rec.start;
+    if (rec.start === "") return false;
+    const now = processStart(rec.pid);
+    if (now === rec.start) return true;
+    if (now === null) return groupAlive(rec.pgid);
+    return false;
   }
 
   /**
@@ -114,7 +126,7 @@ export class ChildRegistry {
 
   /**
    * Stop every recorded process group: SIGTERM, a short grace, then SIGKILL.
-   * Records whose pid no longer belongs to the process we started are dropped
+   * Records that are not ours (see {@link isOurs}: a recycled pid, or a group with nobody left in it) are dropped
    * without signalling anything.
    */
   async killAll(graceMs = 2000): Promise<{ killed: number[]; skipped: number[] }> {

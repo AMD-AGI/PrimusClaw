@@ -412,6 +412,48 @@ describe("recorded child processes", () => {
       for (const p of [mine, bystander, stale]) { try { process.kill(-p.pid!, "SIGKILL"); } catch { /* gone */ } }
     }
   });
+  const orphaned = async (reg: ChildRegistry) => {
+    // A leader (think: an npx wrapper) that starts the real agent in its group and then dies, as when the connector was killed hard.
+    const script = "const {spawn}=require('child_process');const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});console.log(c.pid);setInterval(()=>{},1000)";
+    const leader = spawn(process.execPath, ["-e", script], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+    const agent = Number(await new Promise<string>((r) => leader.stdout!.once("data", (d) => r(String(d).trim()))));
+    reg.add({ pid: leader.pid!, pgid: leader.pid!, agent_id: "a", session_id: "s" }); // records the leader's start time while it lives
+    const gone = new Promise<void>((r) => leader.once("exit", () => r()));
+    process.kill(leader.pid!, "SIGKILL");
+    await gone;
+    assert.equal(processStart(leader.pid!), null, "the leader is gone");
+    assert.notEqual(processStart(agent), null, "the agent it started is still running, in the leader's group");
+    return { leader, agent };
+  };
+  test("an agent left behind by a dead group leader is still stopped (killAll), by the group it was recorded in", async () => {
+    const reg = new ChildRegistry(path.join(tmp(), "children.json"));
+    const { leader, agent } = await orphaned(reg);
+    try {
+      assert.equal(reg.isOurs(reg.list()[0]!), true);
+      const res = await reg.killAll(500);
+      assert.deepEqual(res.killed, [leader.pid]);
+      await sleep(100);
+      assert.equal(processStart(agent), null);
+    } finally { try { process.kill(-leader.pid!, "SIGKILL"); } catch { /* gone */ } }
+  });
+  test("the same through kill() of one record, which is what an adapter's own stop uses", async () => {
+    const reg = new ChildRegistry(path.join(tmp(), "children.json"));
+    const { leader, agent } = await orphaned(reg);
+    try {
+      assert.equal(await reg.kill(leader.pid!, 500), true);
+      await sleep(100);
+      assert.equal(processStart(agent), null);
+      assert.deepEqual(reg.list(), []);
+    } finally { try { process.kill(-leader.pid!, "SIGKILL"); } catch { /* gone */ } }
+  });
+  test("a record whose leader is gone and whose group is empty is just dropped", async () => {
+    const reg = new ChildRegistry(path.join(tmp(), "children.json"));
+    const p = spawn(process.execPath, ["-e", "0"], { detached: true, stdio: "ignore" });
+    reg.add({ pid: p.pid!, pgid: p.pid!, agent_id: "a", session_id: "s" });
+    await new Promise<void>((r) => p.once("exit", () => r()));
+    const res = await reg.killAll(200);
+    assert.deepEqual([res.killed, res.skipped], [[], [p.pid]]);
+  });
   test("a recorded group is stopped as a whole, grandchildren included", async () => {
     const dir = tmp();
     const reg = new ChildRegistry(path.join(dir, "children.json"));
