@@ -16,6 +16,7 @@ import type { AddressInfo } from "node:net";
 import Fastify, { type FastifyInstance } from "fastify";
 
 import { FakeIdentity, activeAnswer, signJwt, testKey } from "../../utils/test/identity-fake.js";
+import { isAdmin } from "../src/auth/models.js";
 
 const nowSec = () => Math.floor(Date.now() / 1000);
 const es = testKey("ES256", "k-es");
@@ -113,8 +114,15 @@ describe("an identity access token through the authentication hook", () => {
   test("authenticates the request as the token's subject, without asking SaFE", async () => {
     const r = await whoami(bearer(mint()));
     assert.equal(r.status, 200, JSON.stringify(r.body));
-    assert.deepEqual(r.body.user, { userId: "web-user", userName: "Web User", roles: ["default", "system-admin"], platformKey: "", virtualKey: "" });
+    assert.deepEqual(r.body.user, { userId: "web-user", userName: "Web User", roles: ["default"], platformKey: "", virtualKey: "" });
     assert.deepEqual(safe.calls, []);
+  });
+
+  test("a token that carries `system-admin` in its roles claim does not make the caller an administrator (mint() carries it)", async () => {
+    const r = await whoami(bearer(mint({ roles: ["system-admin", "system-admin-readonly"] })));
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.deepEqual(r.body.user.roles, ["default"]);
+    assert.equal(isAdmin(r.body.user), false);
   });
 
   test("with the flag off the same token is not a credential: the request is refused as one with none, and SaFE is not asked", async () => {

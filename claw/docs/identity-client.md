@@ -131,7 +131,7 @@ this use.
 |---|---|
 | `sub` | `userId`, exactly as the issuer wrote it. A subject that is missing, blank, padded with whitespace, longer than 128 characters, containing a control character, or equal to an owner the API uses for a caller it did not authenticate (`default`, `anonymous`, `dev-user`) is refused, not repaired |
 | `name`, else `preferred_username`, else `email`, else `sub` | `userName` (at most 128 characters) |
-| `roles` | `roles`: the strings in the claim, once each, at most 32 of them and 64 characters or fewer each, then `default` if it was not among them. A claim that is not an array says nothing. `groups` is not read |
+| (none) | `roles` is `["default"]` always. The token's `roles` and `groups` claims are not read, so enabling this credential never makes anyone an administrator |
 | | `platformKey` and `virtualKey` are empty: no session key stands behind a token |
 
 **How it combines with the other credentials.**
@@ -169,8 +169,12 @@ this use.
   Set that variable to `0` to refuse every request during an outage instead. Either
   way an outage is never wider than with introspection off, where an unexpired token
   is honoured for its whole life.
-- The roles in the token are taken as the provider's statement. Whether a role
-  means administrator is decided by the same rules as for any other credential.
+- The roles in the token are not copied. A provider can be shared with other
+  applications that define a role named `system-admin` for their own purposes, and
+  copying it would make that caller a platform operator of every tenant's sessions
+  (and, in the Kubernetes deployment mode, give it a route to admin that mode never
+  had). A user authenticated by a token is a plain user, as with a connector token and
+  with BYOK; there is no setting that maps a provider role onto an administrator role.
 - Nothing here issues per-user LLM keys: a user authenticated by a token has none,
   so a deployment that needs a per-user key for model calls has to provide it some
   other way.

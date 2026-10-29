@@ -95,12 +95,12 @@ describe("a user's access token and a connector's, both switched on", () => {
     assert.match(r.body.message, /claw\.connector/);
   });
 
-  test("a user's token on any other route is the token path's: its subject and roles, and the method it is recorded under", async () => {
+  test("a user's token on any other route is the token path's: its subject, the default role only, and the method it is recorded under", async () => {
     for (const path of ["/v1/whoami", "/v1/remote-agents/connectors"]) {
       const r = await call("GET", path, userToken());
       assert.equal(r.status, 200, `${path}: ${JSON.stringify(r.body)}`);
       assert.equal(r.body.method, "identity_token");
-      assert.deepEqual(r.body.user, { userId: "web-user", userName: "Web User", roles: ["default", "system-admin"], platformKey: "", virtualKey: "" });
+      assert.deepEqual(r.body.user, { userId: "web-user", userName: "Web User", roles: ["default"], platformKey: "", virtualKey: "" });
     }
   });
 

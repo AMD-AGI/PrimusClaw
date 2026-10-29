@@ -20,9 +20,13 @@
  *     owners the API itself uses for a caller it did not authenticate is refused,
  *     not repaired: it becomes the owner of every row, so two distinct subjects
  *     must never name one owner.
- *   - The user model is the one the other credentials produce: `sub` is the user
- *     id and the `roles` claim is the role list (`default` is always in it). There
- *     is no session key behind a token, so `platformKey` and `virtualKey` are empty.
+ *   - The user model is the one the connector token and Kubernetes mode produce:
+ *     `sub` is the user id and the roles are `default` only. Whatever the token says
+ *     in `roles` or `groups` is not copied: a provider shared with other applications
+ *     can define a role named `system-admin` (or `system-admin-readonly`) that means
+ *     something else there, and copying it would make that caller a platform
+ *     operator of every tenant's sessions. Enabling this path never grants admin.
+ *     There is no session key behind a token, so `platformKey` and `virtualKey` are empty.
  *   - A token cannot be revoked by checking it locally, so it is good until it
  *     expires (minutes). With `CLAW_IDENTITY_TOKEN_INTROSPECT` on, the provider is
  *     also asked whether it is still active, and a revoked grant stops at once.
@@ -50,8 +54,6 @@ const ABSENT: CredentialOutcome = { status: "absent" };
 // An `ak-` key, a cookie or any other opaque credential does not look like this.
 const JWT_SHAPE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/;
 const MAX_SUBJECT_CHARS = 128;
-const MAX_ROLES = 32;
-const MAX_ROLE_CHARS = 64;
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
 // Owners the API itself uses for a caller it did not authenticate (the fallback owner of a row, an anonymous
 // workbench, the development bypass). A token whose subject is one of them would be that owner, so it is refused.
@@ -105,26 +107,6 @@ function text(v: unknown): string {
 }
 
 /**
- * The role list a token carries, in the shape of the user model: strings only,
- * without repeats, bounded, and with `default` in it (every active identity has
- * it, and the user model's other sources always list it). A claim that is not an
- * array says nothing. Order is kept, and the cap cuts from the end: a user is
- * never given a role the token did not carry.
- */
-export function rolesOf(claim: unknown): string[] {
-  const out: string[] = [];
-  if (Array.isArray(claim)) {
-    for (const r of claim) {
-      if (typeof r !== "string" || !r || r.length > MAX_ROLE_CHARS || out.includes(r)) continue;
-      if (out.length >= MAX_ROLES) break;
-      out.push(r);
-    }
-  }
-  if (!out.includes("default")) out.push("default");
-  return out;
-}
-
-/**
  * Path: an identity provider's access token in `Authorization: Bearer`.
  *
  * `absent` unless the feature is on, the identity client is built, and the
@@ -172,7 +154,8 @@ export async function verifyIdentityAccessToken(
     const user: UserInfo = {
       userId: sub,
       userName: (text(claims.name) || text(claims.preferred_username) || text(claims.email) || sub).slice(0, MAX_SUBJECT_CHARS),
-      roles: rolesOf(claims.roles),
+      // Never the token's `roles` claim: see the header. The connector-token path and Kubernetes mode do the same.
+      roles: ["default"],
       platformKey: "",
       virtualKey: "",
     };

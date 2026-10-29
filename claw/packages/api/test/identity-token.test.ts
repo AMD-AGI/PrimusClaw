@@ -17,9 +17,10 @@ import { randomUUID } from "node:crypto";
 import type { FastifyRequest } from "fastify";
 
 import { FakeIdentity, activeAnswer, signJwt, testKey, type TestKey } from "../../utils/test/identity-fake.js";
-import { IDENTITY_TOKEN_METHOD, identityTokenSettings, rolesOf, verifyIdentityAccessToken } from "../src/auth/identity-token.js";
+import { IDENTITY_TOKEN_METHOD, identityTokenSettings, verifyIdentityAccessToken } from "../src/auth/identity-token.js";
 import { startIdentityClient } from "../src/auth/identity.js";
 import type { CredentialOutcome } from "../src/auth/middleware.js";
+import { canAccessSessionAsOperator, getUserRole, isAdmin, isSystemAdmin } from "../src/auth/models.js";
 
 const nowSec = () => Math.floor(Date.now() / 1000);
 const payloadOf = (token: string) => JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8") || "{}");
@@ -124,15 +125,16 @@ describe("the path abstains unless it is switched on and the token is JWT-shaped
 
 describe("a valid token", () => {
   const cases: Array<[string, Record<string, unknown>, { key?: TestKey }, Partial<{ userId: string; userName: string; roles: string[] }>]> = [
-    ["maps sub, name and roles", {}, {}, { userId: "u-web-1", userName: "Ada Lovelace", roles: ["default"] }],
+    ["maps sub and name, and the user is a plain user", {}, {}, { userId: "u-web-1", userName: "Ada Lovelace", roles: ["default"] }],
     ["verifies with RS256 as well", {}, { key: rs }, { userId: "u-web-1" }],
-    ["keeps system-admin", { roles: ["default", "system-admin"] }, {}, { roles: ["default", "system-admin"] }],
-    ["keeps system-admin-readonly and adds default when it is missing", { roles: ["system-admin-readonly"] }, {}, { roles: ["system-admin-readonly", "default"] }],
-    ["has default when the roles claim is missing", { roles: undefined }, {}, { roles: ["default"] }],
-    ["has default when the roles claim is empty", { roles: [] }, {}, { roles: ["default"] }],
+    ["does not copy system-admin from the roles claim", { roles: ["default", "system-admin"] }, {}, { roles: ["default"] }],
+    ["does not copy system-admin when it is the only role", { roles: ["system-admin"] }, {}, { roles: ["default"] }],
+    ["does not copy system-admin-readonly", { roles: ["system-admin-readonly"] }, {}, { roles: ["default"] }],
+    ["has only default when the roles claim is missing", { roles: undefined }, {}, { roles: ["default"] }],
+    ["has only default when the roles claim is empty", { roles: [] }, {}, { roles: ["default"] }],
     ["takes no role from a claim that is not an array", { roles: "system-admin" }, {}, { roles: ["default"] }],
     ["takes no role from `groups`", { roles: undefined, groups: ["system-admin"] }, {}, { roles: ["default"] }],
-    ["keeps only strings, once each, and none that is empty or oversized", { roles: [1, "", "x".repeat(65), "a", "a", null, "b"] }, {}, { roles: ["a", "b", "default"] }],
+    ["copies no other role either", { roles: ["a", "b", "default"] }, {}, { roles: ["default"] }],
     ["names the user by preferred_username when there is no name", { name: undefined, preferred_username: "ada" }, {}, { userName: "ada" }],
     ["names the user by email when there is neither", { name: undefined, email: "ada@example.com" }, {}, { userName: "ada@example.com" }],
     ["names the user by sub when there is nothing else", { name: undefined, email: undefined }, {}, { userName: "u-web-1" }],
@@ -154,13 +156,17 @@ describe("a valid token", () => {
     });
   }
 
-  test("a role list longer than the cap loses its tail, never gains a role", async () => {
-    const roles = [...Array.from({ length: 40 }, (_, i) => `r${i}`), "system-admin"];
-    const v = verified(await verify(mint({ roles })));
-    assert.ok(!v.user.roles.includes("system-admin"));
-    assert.ok(v.user.roles.length <= 33);
-    assert.deepEqual(v.user.roles.slice(0, 3), ["r0", "r1", "r2"]);
-    assert.equal(v.user.roles.at(-1), "default");
+  test("a token that carries an administrator role by name does not make its subject an administrator", async () => {
+    // A provider shared with other applications can define a role with this name for its own purposes.
+    for (const roles of [["system-admin"], ["default", "system-admin"], ["system-admin-readonly"], ["system-admin", "system-admin-readonly"], [...Array.from({ length: 40 }, (_, i) => `r${i}`), "system-admin"]]) {
+      const v = verified(await verify(mint({ roles, groups: roles })));
+      assert.deepEqual(v.user.roles, ["default"], JSON.stringify(roles));
+      assert.equal(getUserRole(v.user), "default");
+      assert.equal(isAdmin(v.user), false);
+      assert.equal(isSystemAdmin(v.user), false);
+      assert.equal(canAccessSessionAsOperator("some-other-tenant", v.user), false, "no operator access to another tenant's session");
+      assert.equal(canAccessSessionAsOperator(v.user.userId, v.user), true, "its own session is still its own");
+    }
   });
 
   test("the audience and the scope are the settings', not fixed", async () => {
@@ -337,18 +343,4 @@ describe("with introspection on", () => {
     verified(await verify(mint({ jti })));
     assert.equal(fake.count("/oauth/introspect"), 0);
   });
-});
-
-describe("rolesOf", () => {
-  const table: Array<[string, unknown, string[]]> = [
-    ["undefined", undefined, ["default"]],
-    ["null", null, ["default"]],
-    ["a string", "system-admin", ["default"]],
-    ["an object", { "system-admin": true }, ["default"]],
-    ["an empty array", [], ["default"]],
-    ["default alone", ["default"], ["default"]],
-    ["default is not duplicated or moved", ["system-admin", "default"], ["system-admin", "default"]],
-    ["default is added last", ["system-admin"], ["system-admin", "default"]],
-  ];
-  for (const [name, claim, want] of table) test(name, () => assert.deepEqual(rolesOf(claim), want));
 });

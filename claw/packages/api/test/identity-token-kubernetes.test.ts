@@ -14,6 +14,7 @@ import type { AddressInfo } from "node:net";
 import Fastify, { type FastifyInstance } from "fastify";
 
 import { FakeIdentity, signJwt, testKey } from "../../utils/test/identity-fake.js";
+import { isAdmin } from "../src/auth/models.js";
 
 const nowSec = () => Math.floor(Date.now() / 1000);
 const es = testKey("ES256", "k-es");
@@ -38,7 +39,7 @@ describe("an identity access token in the Kubernetes deployment mode", () => {
     key: es,
     claims: {
       iss: fake.issuer, aud: "claw-api", sub: "web-user", client_id: "claw-web", scope: "openid claw.api", name: "Web User",
-      roles: ["default"], jti: randomUUID(), iat: nowSec(), nbf: nowSec() - 1, exp: nowSec() + 300, ...over,
+      roles: ["default", "system-admin"], jti: randomUUID(), iat: nowSec(), nbf: nowSec() - 1, exp: nowSec() + 300, ...over,
     },
   });
 
@@ -74,10 +75,11 @@ describe("an identity access token in the Kubernetes deployment mode", () => {
     return { status: r.status, body: await r.json().catch(() => null) };
   }
 
-  test("a valid token authenticates the request, with no gateway key", async () => {
+  test("a valid token authenticates the request, with no gateway key, and a `system-admin` role in it (mint() carries one) is not copied: this mode has no route to admin", async () => {
     const r = await whoami({ authorization: `Bearer ${mint()}` });
     assert.equal(r.status, 200, JSON.stringify(r.body));
     assert.deepEqual(r.body.user, { userId: "web-user", userName: "Web User", roles: ["default"], platformKey: "", virtualKey: "" });
+    assert.equal(isAdmin(r.body.user), false);
   });
 
   test("a token that does not verify is refused and never offered to the gateway key check", async () => {

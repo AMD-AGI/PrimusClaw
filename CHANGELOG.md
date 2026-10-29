@@ -32,7 +32,8 @@ record it.
   verified by the shared identity client against the issuer's key set) as a credential beside the existing
   ones, behind `CLAW_IDENTITY_TOKEN_AUTH_ENABLED` (off by default; also needs `IDENTITY_CLIENT_ENABLED`).
   The token must be typed `at+jwt`, name `CLAW_IDENTITY_TOKEN_AUDIENCE` (default `claw-api`) and carry
-  `CLAW_IDENTITY_TOKEN_SCOPE` (default `claw.api`); `sub` becomes the user id and `roles` the roles.
+  `CLAW_IDENTITY_TOKEN_SCOPE` (default `claw.api`); `sub` becomes the user id and the caller has the `default`
+  role only (the token's `roles` are not copied, so enabling this never grants admin).
   `CLAW_IDENTITY_TOKEN_INTROSPECT` also asks the provider whether the token is still active. The chart takes
   `identity.tokenAuth`. See `claw/docs/identity-client.md`.
 - `auto_approve` on an MCP server spec, the sibling of `requires_approval`: an explicit allowlist (tool
