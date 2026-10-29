@@ -93,6 +93,16 @@ litellmSettings:
 if the chart's default `callbacks` ever name a hook while the image pins are
 still not a `build.sh` tag (or disagree with each other).
 
+**Upgrading from a release that used the previous default.** The chart's default
+`callbacks` used to be one combined hook that the pinned image contains. With the
+default now empty, a `helm upgrade` or `deploy.sh` run with default values drops
+that callback without an error: prompt caching stops (`cache_read_input_tokens`
+falls to 0) and the per-key header injection the old hook also did stops with it,
+and `deploy.sh`'s post-deploy check only verifies callbacks that are named. A
+release that relies on the previous default must set `litellmSettings.callbacks`
+explicitly in its private values, naming the hook or hooks its image contains,
+**before** upgrading.
+
 **The UI patch** rewrites the pre-built static assets' base path from `/ui` to
 `/llm-gateway` with `sed`, rather than rebuilding the UI — the upstream build
 needs Google Fonts access, which is blocked in the build environment. If you
