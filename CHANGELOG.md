@@ -28,6 +28,14 @@ record it.
 ## [Unreleased]
 
 ### Added
+- `auto_approve` on an MCP server spec, the sibling of `requires_approval`: an explicit allowlist (tool
+  names, a trailing `*` for a prefix, and an optional `when` that must equal the call's top-level scalar
+  arguments) of the held tools that may run without a decision, so a session nobody is watching can run
+  low-risk tools. A held tool that is not listed still waits for a person; an absent field changes
+  nothing, and a malformed one releases nothing. A release is recorded as `decisionResult` with
+  `by: "policy"` and counted in `claw_hitl_policy_allow_total` (no labels: a request can carry its own
+  server spec, so the entry that released the call is in the `hitl.policy_allow` log line instead). See
+  `claw/docs/mcp-approval.md`.
 - A session can be bound to a repository. `POST /v1/sessions` accepts `config.repo = {url, branch?}`
   (`url` is `https://<host>/<owner>/<name>[.git]` with no credentials, query or fragment; `branch` is a
   plain ref name, empty meaning the remote's default; anything else is a `400` starting
