@@ -339,7 +339,9 @@ export class Connector {
     if (this.ledger.seen(seq, cmd.cmd_id)) return; // delivered again after a reconnect; already done
     this.ledger.begin(seq, cmd.cmd_id);
     // Not awaited: the stream must keep being read while a slow command (starting an adapter) runs.
-    void this.manager.handle(cmd).finally(() => {
+    // The command counts as handled when the manager says so (a prompt: when it reaches the adapter), and
+    // only then can the cursor sent to the server pass it.
+    void this.manager.handle(cmd, () => {
       this.ledger.end(seq, cmd.cmd_id);
       try { this.writeIdentity(); } catch { /* best effort; the next heartbeat writes it again */ }
     });
@@ -382,6 +384,11 @@ export class Connector {
     fs.mkdirSync(this.d.dirs.state, { recursive: true, mode: 0o700 });
     // Adapters a crashed earlier run left recorded are stopped first (only if they are still the processes we started).
     await this.registry.killAll();
+    // A card whose adapter died with the previous run can never be answered: close it, so a phone does not keep a dead button.
+    for (const p of this.store.takePending()) {
+      this.d.audit.record("permission_orphaned", { session_id: p.session_id, action_id: p.action_id });
+      this.emit(p.session_id, "permission_resolved", { actionId: p.action_id, optionId: null, outcome: "cancelled", by: "connector_restart" });
+    }
     const pidf = pidFile(this.d.dirs);
     fs.writeFileSync(pidf, JSON.stringify({ pid: process.pid, start: processStart(process.pid) ?? "" }), { mode: 0o600 });
     this.paused = fs.existsSync(pauseFile(this.d.dirs));

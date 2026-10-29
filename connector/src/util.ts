@@ -51,3 +51,20 @@ export const stderrLogger = (quiet = false): Logger => {
 };
 
 export const silentLogger: Logger = { info() {}, warn() {}, error() {} };
+
+/**
+ * A URL that credentials may be sent to: https, or http only to this machine (a
+ * local development server). Anything else would put a bearer token or a refresh
+ * token on the wire in the clear. Returns the URL without a trailing slash.
+ */
+export class UrlError extends Error {}
+
+export function secureUrl(raw: string, what: string): string {
+  let u: URL;
+  try { u = new URL(raw); } catch { throw new UrlError(`${what} is not a valid URL: ${JSON.stringify(raw.slice(0, 80))}`); }
+  const loopback = u.hostname === "localhost" || u.hostname === "[::1]" || /^127(\.\d{1,3}){3}$/.test(u.hostname);
+  if (u.protocol !== "https:" && !(u.protocol === "http:" && loopback)) {
+    throw new UrlError(`${what} must be an https:// URL (http:// is accepted only for localhost), got ${u.protocol}//${u.host}`);
+  }
+  return raw.replace(/\/+$/, "");
+}

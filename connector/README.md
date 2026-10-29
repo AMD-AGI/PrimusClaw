@@ -106,6 +106,8 @@ All of these run on your machine and fail closed.
   a call through without asking when its kind matches and every path it touches is inside the session directory and
   matches the glob. It uses the one-time option, never an "always" one, is decided on your machine, is written to the
   audit log and is shown on the phone. The default is no rules.
+- **Credentials go over HTTPS only.** The Claw URL and the identity URL must be `https://` (`http://` is accepted only for
+  localhost, for a development server); `login` and `run` refuse anything else before a token is saved or sent.
 - **No remote shell.** Only these commands are carried out: `session.new`, `prompt`, `cancel`, `set_mode`, `resume`,
   `close`, `decision`. Anything else is dropped and audited. Claw never sends a command line, an environment variable or a
   key.
@@ -138,6 +140,19 @@ refused). `~/.local/state/claw-connector/` (or `$XDG_STATE_HOME`): `connector.js
 commands handled), `sessions.json`, `outbox/` (events not yet acknowledged by Claw), `audit.jsonl` (spawn, directory
 decisions, every command received, every permission request and answer, every automatic approval, mode changes),
 `logs/`, `children.json`, `connector.pid`. `CLAW_CONNECTOR_HOME=/some/dir` keeps all of it under one directory.
+
+## Restarts and crashes
+
+A prompt counts as handled only when it reaches the agent (or is dropped by a cancel, a close or a stop), so a connector that
+dies with a prompt still queued is sent that prompt again by Claw instead of losing it. A permission request waiting
+for an answer lives in the adapter, which dies with the connector: the next run closes such a card (`cancelled`, by
+`connector_restart`), so a phone is not left with a button that does nothing. Session state, unacknowledged events and
+their sequence numbers are on disk; a session resumes in a fresh adapter on its next prompt.
+
+Known limit: the working-directory check resolves the path and starts the adapter in the resolved path, but another process of
+the same user that can rewrite a directory in that path could swap a symlink between the check and the start. The
+whitelist protects against what Claw (or a phone) asks for, not against another local process of the same user, which could already
+run the agent itself.
 
 ## Connection behaviour
 

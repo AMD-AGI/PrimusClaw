@@ -3,7 +3,7 @@
 
 /** RFC 8628 device authorization grant, the client side. */
 import { DEFAULT_CLIENT_ID, parseTokenResponse, type TokenResponse } from "./credentials.js";
-import { errMessage, isObject, sleep } from "./util.js";
+import { errMessage, isObject, secureUrl, sleep } from "./util.js";
 
 export class DeviceFlowError extends Error {
   constructor(readonly code: "access_denied" | "expired_token" | "unreachable" | "protocol", message: string) { super(message); }
@@ -33,6 +33,7 @@ export interface DeviceFlowOptions {
 const form = (o: Record<string, string>) => new URLSearchParams(o);
 
 export async function startDeviceAuthorization(o: DeviceFlowOptions): Promise<DeviceAuthorization> {
+  secureUrl(o.identityUrl, "the identity service URL");
   const f = o.fetch ?? fetch;
   let res: Response;
   try {

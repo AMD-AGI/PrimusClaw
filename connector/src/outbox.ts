@@ -151,6 +151,8 @@ export class Outbox {
   }
 
   private rewrite(sessionId: string): void {
+    // The log may be about to lose lines the high-water mark was read from (a shed chunk, a refused event): write it down first.
+    this.writeMeta(sessionId);
     const mine = this.queue.filter((e) => e.session_id === sessionId);
     const tmp = this.eventsFile(sessionId) + ".tmp";
     fs.writeFileSync(tmp, mine.map((e) => JSON.stringify(e) + "\n").join(""), { mode: 0o600 });

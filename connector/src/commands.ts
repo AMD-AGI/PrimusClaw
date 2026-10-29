@@ -18,7 +18,7 @@ import { Connector, type ConnectorTiming } from "./connector.js";
 import {
   auditFile, childrenFile, configFile, credentialsFile, identityFile, pauseFile, pidFile, type Dirs,
 } from "./paths.js";
-import { errMessage, isObject, sleep, stderrLogger } from "./util.js";
+import { UrlError, errMessage, isObject, secureUrl, sleep, stderrLogger } from "./util.js";
 import { VERSION } from "./version.js";
 
 export interface Ctx {
@@ -60,7 +60,7 @@ function loadCfg(ctx: Ctx): ConnectorConfig {
 
 function serverUrl(ctx: Ctx, flag: string | undefined, cfg: ConnectorConfig | null, creds: Credentials | null): string | null {
   const v = flag ?? ctx.env.CLAW_URL ?? cfg?.server ?? creds?.server ?? null;
-  return v ? v.trim().replace(/\/+$/, "") : null;
+  return v ? secureUrl(v.trim(), "the Claw server URL") : null;
 }
 
 export async function main(argv: string[], ctx: Ctx): Promise<number> {
@@ -80,7 +80,7 @@ export async function main(argv: string[], ctx: Ctx): Promise<number> {
       default: ctx.err(`unknown command ${JSON.stringify(cmd)}\n\n${HELP}`); return EXIT.usage;
     }
   } catch (e) {
-    if (e instanceof ConfigError || e instanceof CredentialsError || e instanceof DeviceFlowError) { ctx.err(e.message); return EXIT.failure; }
+    if (e instanceof ConfigError || e instanceof CredentialsError || e instanceof DeviceFlowError || e instanceof UrlError) { ctx.err(e.message); return EXIT.failure; }
     ctx.err(`error: ${errMessage(e)}`);
     return EXIT.failure;
   }
@@ -115,7 +115,8 @@ async function cmdLogin(args: string[], ctx: Ctx): Promise<number> {
     ctx.out("saved a development key. This is for trying things out: a device sign-in is the normal way (omit --key).");
     return EXIT.ok;
   }
-  const identityUrl = (values["identity-url"] ?? ctx.env.CLAW_IDENTITY_URL ?? cfg?.identityUrl ?? "").replace(/\/+$/, "");
+  const identityRaw = (values["identity-url"] ?? ctx.env.CLAW_IDENTITY_URL ?? cfg?.identityUrl ?? "").trim();
+  const identityUrl = identityRaw ? secureUrl(identityRaw, "the identity service URL") : "";
   if (!identityUrl) { ctx.err("login needs --identity-url <identity service URL> (or CLAW_IDENTITY_URL, or identity_url = in agents.toml)"); return EXIT.usage; }
   const deviceName = values.name ?? cfg?.name ?? ctx.hostname ?? os.hostname();
   const tok = await deviceLogin({ identityUrl, deviceName, fetch: ctx.fetch, print: ctx.out });

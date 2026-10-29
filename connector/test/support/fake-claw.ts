@@ -26,6 +26,8 @@ export class FakeClaw {
   muted = false;
   /** Answer the next N event posts with 503. */
   failPosts = 0;
+  /** Refuse (name in `rejected`, as the real server does) every event of this type. */
+  rejectType: string | null = null;
   /** Store the next N event posts but close the socket before answering (a lost acknowledgement). */
   loseAcks = 0;
   readonly commands: Array<{ seq: number; payload: Record<string, unknown> }> = [];
@@ -150,7 +152,9 @@ export class FakeClaw {
         const batch = parseEventBatch(body);
         if (!batch.ok) return this.json(res, 400, { ok: false, error: batch.error });
         const acked: Record<string, number> = {};
+        const refused: Array<{ index: number; session_id: string | null; seq: number | null; reason: string }> = [...batch.value.rejected];
         for (const e of batch.value.events) {
+          if (this.rejectType && e.type === this.rejectType) { refused.push({ index: e.index, session_id: e.session_id, seq: e.seq, reason: "invalid_type" }); continue; }
           const per = this.stored.get(e.session_id) ?? new Map<number, StoredEvent>();
           this.stored.set(e.session_id, per);
           this.arrivals.push({ session_id: e.session_id, seq: e.seq, type: e.type, ts: e.ts, data: e.data });
@@ -159,7 +163,7 @@ export class FakeClaw {
         }
         this.wake();
         if (this.loseAcks > 0) { this.loseAcks--; req.socket.destroy(); return; }
-        return this.json(res, 200, { ok: true, data: { batch_id: batch.value.batchId, acked, rejected: batch.value.rejected } });
+        return this.json(res, 200, { ok: true, data: { batch_id: batch.value.batchId, acked, rejected: refused } });
       }
       case "commands": {
         this.streamHeaders.push(req.headers);

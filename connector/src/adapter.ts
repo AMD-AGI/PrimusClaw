@@ -61,24 +61,27 @@ export class AdapterProcess {
     o.registry.add({ pid, pgid: pid, agent_id: o.cfg.id, session_id: o.sessionId });
     const a = new AdapterProcess(child, pid, o.registry);
 
+    // Redaction needs a whole line: a credential split across two chunks must not slip through, so nothing is written until a newline (or the end).
     let tail = "";
+    const flushLine = (line: string) => {
+      const text = redactText(line).text;
+      try { fs.writeSync(log, text + "\n"); } catch { /* the log is best effort */ }
+      try { o.hooks.onStderr(text); } catch { /* a hook must not break the stream */ }
+    };
     child.stderr!.on("data", (d: Buffer) => {
-      const text = redactText(d.toString("utf8")).text;
-      try { fs.writeSync(log, text); } catch { /* the log is best effort */ }
-      tail += text;
+      tail += d.toString("utf8");
       let nl: number;
       while ((nl = tail.indexOf("\n")) >= 0) {
-        const line = tail.slice(0, nl);
+        flushLine(tail.slice(0, nl));
         tail = tail.slice(nl + 1);
-        try { o.hooks.onStderr(line); } catch { /* a hook must not break the stream */ }
       }
-      if (tail.length > 64 * 1024) tail = "";
+      if (tail.length > 64 * 1024) { flushLine(tail); tail = ""; }
     });
+    child.stderr!.once("close", () => { if (tail) { flushLine(tail); tail = ""; } try { fs.closeSync(log); } catch { /* already closed */ } });
     child.stdin!.on("error", () => { /* the adapter went away; the exit handler reports it */ });
     child.once("exit", (code, signal) => {
       a.exited = true;
       void o.registry.reap(pid).catch(() => undefined);
-      try { fs.closeSync(log); } catch { /* already closed */ }
       o.hooks.onExit({ code, signal });
     });
 

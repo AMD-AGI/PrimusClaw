@@ -11,7 +11,7 @@ import { checkCwd, relativeInside } from "../src/roots.js";
 import { globMatches } from "../src/glob.js";
 import { redactDeep, redactText } from "../src/redact.js";
 import { SseParser } from "../src/sse.js";
-import { backoffMs, truncateBytes } from "../src/util.js";
+import { backoffMs, secureUrl, truncateBytes, UrlError } from "../src/util.js";
 
 const PEM = (what: string) => "-----" + what + " PRIVATE" + " KEY-----";
 const tmp = (prefix = "cc-") => fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -182,6 +182,16 @@ describe("server-sent events parser", () => {
     }
   });
   test("an incomplete frame waits", () => assert.deepEqual(new SseParser().push("event: x\ndata: 1"), []));
+});
+
+describe("URLs credentials may be sent to", () => {
+  const ok: Array<[string, string]> = [
+    ["https://claw.example.com/claw-api/", "https://claw.example.com/claw-api"], ["https://claw.example.com", "https://claw.example.com"],
+    ["http://localhost:8080/api", "http://localhost:8080/api"], ["http://127.0.0.1:3000", "http://127.0.0.1:3000"], ["http://[::1]:3000/x", "http://[::1]:3000/x"], ["http://127.1.2.3", "http://127.1.2.3"],
+  ];
+  for (const [input, want] of ok) test(`accepts ${input}`, () => assert.equal(secureUrl(input, "u"), want));
+  const bad = ["http://claw.example.com", "http://10.0.0.5:8080", "http://127.0.0.1.evil.example", "http://localhost.evil.example", "ftp://claw.example.com", "claw.example.com", "", "javascript:alert(1)"];
+  for (const input of bad) test(`refuses ${JSON.stringify(input)}`, () => assert.throws(() => secureUrl(input, "the url"), UrlError));
 });
 
 describe("small helpers", () => {

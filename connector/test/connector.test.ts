@@ -307,6 +307,13 @@ describe("what leaves the machine", () => {
     assert.ok(shown.length < 8300, `cut (${shown.length})`);
     assert.match(shown, /truncated, 30000 bytes in all/);
   });
+  test("everything is masked at the door, including fields no session code looks at (here a mode name the adapter chose)", async () => {
+    const h = await make({ env: { FAKE_MODE_NAME: "Manual ak-0123456789abcdefABCDEF" } });
+    const sid = await h.newSession();
+    const started = h.claw.eventsOf(sid, "session_started")[0]!;
+    assert.equal(started.data.modes[0].name, "Manual [hidden]");
+    assert.doesNotMatch(JSON.stringify(h.claw.arrivals), /ak-0123456789/);
+  });
   test("the prompt text is not in the audit trail, only its hash and length", async () => {
     const h = await make();
     const sid = await h.newSession();
@@ -315,6 +322,15 @@ describe("what leaves the machine", () => {
     const rec = h.audit().find((a) => a.kind === "command" && a.type === "prompt")!;
     assert.deepEqual([rec.length, typeof rec.sha256], [17, "string"]);
     assert.doesNotMatch(JSON.stringify(h.audit()), /secret plan/);
+  });
+  test("adapter stderr is masked before it is written, even when a credential arrives split across two writes", async () => {
+    const h = await make({ env: { FAKE_STDERR_SPLIT: "1" } });
+    const sid = await h.newSession();
+    await sleep(300);
+    const log = fs.readFileSync(path.join(h.dirs.state, "logs", "adapter-fake.log"), "utf8");
+    assert.match(log, /\[hidden\]/);
+    assert.doesNotMatch(log, /abcdefghijklmnopqrstuvwxyz0123/);
+    assert.equal(h.claw.eventsOf(sid, "session_started").length, 1);
   });
   test("a configured warning is not uploaded; adapter stderr is never uploaded", async () => {
     const h = await make({ topToml: `drop_message_patterns = ["model_max_output_tokens is ignored"]\n`, env: { FAKE_STDERR_WARN: "some adapter chatter" } });
@@ -332,12 +348,13 @@ describe("transport: reconnect, duplicates, loss", () => {
   test("four dropped connections and failed or lost-acknowledgement posts during a stream of 300 events: none lost, none repeated, in order", async () => {
     const h = await make();
     const sid = await h.newSession();
+    // Armed before the turn, so they happen however fast the machine is: the first two posts fail, the next two are stored but never acknowledged.
+    h.claw.failPosts = 2;
+    h.claw.loseAcks = 2;
     h.prompt(sid, "chunks 300");
     for (let round = 1; round <= 4; round++) {
       await sleep(40);
       h.claw.dropStreams();
-      if (round === 2) h.claw.failPosts = 2;
-      if (round === 3) h.claw.loseAcks = 2;
     }
     await h.turnEnd(sid);
     await h.connector.drained();
@@ -348,6 +365,37 @@ describe("transport: reconnect, duplicates, loss", () => {
     assert.equal(h.claw.eventsOf(sid, "session_started").length, 1, "the session.new delivered again after a reconnect was not run again");
     assert.equal(h.adapterLog().filter((l) => l.method === "session/new").length, 1);
     assert.ok(h.claw.duplicatesSeen > 0, "the lost acknowledgements really caused repeats, which the server ignored");
+  });
+  test("a card still waiting when the connection drops is shown again after the reconnect, and can still be answered", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    h.prompt(sid, "write again.txt");
+    const perm = await h.permission(sid);
+    h.claw.dropStreams();
+    const again = await h.claw.until("the card to be sent again", () => h.claw.eventsOf(sid, "permissionRequest").find((e) => e.data.resent === true));
+    assert.equal(again.data.actionId, perm.data.actionId, "the same action id: a client treats it as the same card");
+    assert.deepEqual(again.data.options, perm.data.options);
+    h.decide(sid, perm.data.actionId, "allow-once");
+    await h.turnEnd(sid);
+    assert.equal(fileExists(path.join(h.work, "again.txt")), true);
+  });
+  test("an event the server refuses for good is dropped, named in the audit, and does not block the ones behind it", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    h.claw.rejectType = "agent_message_chunk";
+    h.prompt(sid, "say refused");
+    await h.turnEnd(sid);
+    assert.equal(await h.connector.drained(), true, "nothing is left queued, so nothing is retried forever");
+    assert.equal(h.messages(sid).length, 0);
+    assert.ok(h.audit().some((a) => a.kind === "event_rejected" && a.type === "agent_message_chunk" && a.reason === "invalid_type"));
+  });
+  test("a healthy stream is never dropped by the watchdog, however long it lives", async () => {
+    const h = await make();
+    await h.online();
+    const connects = h.claw.streamHeaders.length;
+    await sleep(2000); // nearly three watchdog periods (700 ms), with a ping every 100 ms
+    assert.equal(h.claw.streamHeaders.length, connects);
+    assert.equal(h.claw.online, true);
   });
   test("events survive a restart of the connector and are posted after it", async () => {
     const h = await make();
@@ -408,6 +456,44 @@ describe("transport: reconnect, duplicates, loss", () => {
     await h.claw.until("unknown session reported", () => h.claw.eventsOf("99999999-9999-4999-8999-999999999999", "session_closed")[0]);
     assert.equal(h.claw.eventsOf("99999999-9999-4999-8999-999999999999", "session_closed")[0]!.data.reason, "unknown_session");
     assert.ok(!h.adapterLog().some((l) => l.prompt === "say ghost"));
+  });
+});
+
+describe("crash safety", () => {
+  test("a card whose adapter died with a crashed run is closed by the next run (cancelled, by connector_restart), not left as a dead button", async () => {
+    const h = await make({ start: false });
+    const sid = "33333333-3333-4333-8333-333333333333";
+    h.claw.issue("session.new", sid, { agent_id: "fake", cwd: h.work, mode: null }); // so the server knows the session
+    h.connector.store.addPending(sid, "orphan-action");
+    h.connect();
+    h.start();
+    const ev = await h.claw.until("the orphaned card to be closed", () => h.claw.eventsOf(sid, "permission_resolved").find((e) => e.data.actionId === "orphan-action"));
+    assert.deepEqual([ev.data.optionId, ev.data.outcome, ev.data.by], [null, "cancelled", "connector_restart"]);
+    assert.ok(h.audit().some((a) => a.kind === "permission_orphaned" && a.action_id === "orphan-action"));
+  });
+  test("a pending card is forgotten as soon as it is answered, so a later crash does not close it twice", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    h.prompt(sid, "write p.txt");
+    const perm = await h.permission(sid);
+    assert.deepEqual(h.connector.store.takePending().map((p) => p.action_id), [perm.data.actionId]);
+    h.connector.store.addPending(sid, perm.data.actionId); // put it back: answering must remove it
+    h.decide(sid, perm.data.actionId, "allow-once");
+    await h.turnEnd(sid);
+    assert.deepEqual(h.connector.store.takePending(), []);
+  });
+  test("a prompt is not counted as handled until it reaches the adapter: the cursor stays behind a queued one, and a cancel that drops it releases it", async () => {
+    const h = await make();
+    const sid = await h.newSession(); // seq 1 = session.new
+    h.prompt(sid, "hang"); // seq 2: running
+    await h.claw.until("the turn to be running", () => h.adapterLog().some((l) => l.prompt === "hang"));
+    h.prompt(sid, "say queued"); // seq 3: waits behind the running turn
+    await h.claw.until("the cursor to reach the running prompt", () => h.claw.cursor >= 2);
+    const before = h.claw.heartbeats.length;
+    await h.claw.until("two more heartbeats", () => h.claw.heartbeats.length >= before + 2);
+    assert.equal(h.claw.cursor, 2, "the server keeps the queued prompt: if the connector died now it would be delivered again");
+    h.claw.issue("cancel", sid); // seq 4: drops the queue
+    await h.claw.until("the cursor to pass everything", () => h.claw.cursor >= 4);
   });
 });
 

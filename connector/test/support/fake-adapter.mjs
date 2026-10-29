@@ -11,7 +11,7 @@ import readline from "node:readline";
 
 const env = process.env;
 const START_MODE = env.FAKE_START_MODE || "default";
-const MODES = ["default", "plan", "acceptEdits", "bypassPermissions"].map((id) => ({ id, name: id }));
+const MODES = ["default", "plan", "acceptEdits", "bypassPermissions"].map((id) => ({ id, name: id === "default" && env.FAKE_MODE_NAME ? env.FAKE_MODE_NAME : id }));
 const OPTION_IDS = (env.FAKE_OPTIONS || "allow-once,allow-with-updates,reject").split(",");
 const OPTION_KINDS = ["allow_once", "allow_always", "reject_once"];
 const log = env.FAKE_LOG ? (o) => fs.appendFileSync(env.FAKE_LOG, JSON.stringify(o) + "\n") : () => {};
@@ -29,6 +29,10 @@ const configOptions = (s) => [{ id: "mode", category: "mode", currentValue: s.mo
 const modesOf = (s) => ({ currentModeId: s.mode, availableModes: MODES });
 
 if (env.FAKE_STDERR_WARN) process.stderr.write(env.FAKE_STDERR_WARN + "\n");
+// A credential written to stderr in two pieces, with a pause between them.
+if (env.FAKE_STDERR_SPLIT === "1") { process.stderr.write("auth: Bearer abcdefghijkl"); setTimeout(() => process.stderr.write("mnopqrstuvwxyz0123456789 done\n"), 80); }
+// Some real adapters do not leave when their stdin closes; this one can be told not to either.
+if (env.FAKE_SURVIVE_EOF === "1") setInterval(() => {}, 1000);
 
 async function prompt(id, params) {
   const s = sessions.get(params.sessionId);

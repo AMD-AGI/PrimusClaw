@@ -8,7 +8,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { errMessage, isObject } from "./util.js";
+import { errMessage, isObject, secureUrl } from "./util.js";
 
 export const DEFAULT_CLIENT_ID = "claw-connector";
 
@@ -139,9 +139,10 @@ export class DeviceTokenProvider implements TokenProvider {
   private async doRefresh(): Promise<string> {
     const c = this.creds;
     if (!c.identity_url || !c.refresh_token) throw new CredentialsError("the sign-in file has no refresh token; run login again");
+    const identity = secureUrl(c.identity_url, "the identity service URL");
     let res: Response;
     try {
-      res = await this.f(`${c.identity_url}/oauth/token`, {
+      res = await this.f(`${identity}/oauth/token`, {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
         body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: c.refresh_token, client_id: c.client_id ?? DEFAULT_CLIENT_ID }),

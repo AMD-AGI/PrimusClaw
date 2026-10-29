@@ -6,7 +6,7 @@ import type { TokenProvider } from "./credentials.js";
 import type { OutEvent } from "./outbox.js";
 import { readSse, type SseFrame } from "./sse.js";
 import type { RemoteAgentDescriptor } from "./protocol.js";
-import { errMessage, isObject } from "./util.js";
+import { errMessage, isObject, secureUrl } from "./util.js";
 
 /** 401 `revoked`: the owner disconnected this connector. Not an error to retry. */
 export class RevokedError extends Error {
@@ -39,6 +39,8 @@ export interface EventsAck {
 export class ClawClient {
   private readonly f: typeof fetch;
   constructor(private readonly o: ClawClientOptions) {
+    // A bearer token is never sent over plain http to anything but this machine.
+    this.o = { ...o, server: secureUrl(o.server, "the Claw server URL") };
     this.f = o.fetch ?? fetch;
   }
 

@@ -74,7 +74,7 @@ export class Session {
   private modeSeen: string[] = [];
   private replaying = false;
   private turnRunning = false;
-  private queue: Array<{ text: string; cmdId: string | null }> = [];
+  private queue: Array<{ text: string; cmdId: string | null; started: () => void }> = [];
   private launching: Promise<void> | null = null;
   private idle: NodeJS.Timeout | undefined;
   private readonly book: PermissionBook;
@@ -366,7 +366,11 @@ export class Session {
   /** Put a question on the phone and wait for the answer, a cancel or the timeout. `shape` turns the answer into what the adapter expects. */
   private askPerson(options: OfferedOption[], info: Record<string, unknown>, shape: (optionId: string | null) => AcpParams): Promise<AcpParams> {
     return new Promise<AcpParams>((resolve) => {
-      const p = this.book.open(options, (actionId) => redactDeep({ actionId, ...info, options, timeout_ms: this.book.ttl }) as Record<string, unknown>, (optionId) => resolve(shape(optionId)));
+      const p = this.book.open(options, (actionId) => redactDeep({ actionId, ...info, options, timeout_ms: this.book.ttl }) as Record<string, unknown>, (optionId) => {
+        this.env.store.removePending(this.id, p.actionId);
+        resolve(shape(optionId));
+      });
+      this.env.store.addPending(this.id, p.actionId);
       this.audit("permission_requested", { action_id: p.actionId, tool: info.tool, tool_kind: info.kind, options: options.map((o) => o.optionId) });
       this.emit("permissionRequest", p.payload);
     });
@@ -426,12 +430,24 @@ export class Session {
 
   // --- turns ----------------------------------------------------------------------------
 
-  /** `prompt`: queued behind a running turn, run in order. Returns once accepted, not when the turn ends. */
-  enqueuePrompt(text: string, cmdId: string | null): void {
-    if (this.closed) return this.rejectCommand("prompt", cmdId, "session_closed");
-    if (this.queue.length >= MAX_QUEUED_PROMPTS) return this.rejectCommand("prompt", cmdId, "too_many_queued_prompts");
-    this.queue.push({ text, cmdId });
+  /**
+   * `prompt`: queued behind a running turn, run in order. Returns once accepted, not when the turn ends.
+   * `started` is called exactly once, when the prompt reaches the adapter or is dropped (refused, cancelled,
+   * the session closed): only then does the connector count the command as handled, so a restart before that
+   * delivers it again instead of losing it.
+   */
+  enqueuePrompt(text: string, cmdId: string | null, started: () => void = () => {}): void {
+    if (this.closed) { this.rejectCommand("prompt", cmdId, "session_closed"); return started(); }
+    if (this.queue.length >= MAX_QUEUED_PROMPTS) { this.rejectCommand("prompt", cmdId, "too_many_queued_prompts"); return started(); }
+    this.queue.push({ text, cmdId, started });
     if (!this.turnRunning) void this.pump();
+  }
+
+  /** Prompts that will now never run (the process is being stopped): they count as handled. */
+  dropQueued(): void {
+    const q = this.queue;
+    this.queue = [];
+    for (const item of q) item.started();
   }
 
   private async pump(): Promise<void> {
@@ -440,7 +456,7 @@ export class Session {
     try {
       while (this.queue.length && !this.closed) {
         const next = this.queue.shift()!;
-        await this.runTurn(next.text);
+        await this.runTurn(next.text, next.started);
       }
     } finally {
       this.turnRunning = false;
@@ -448,17 +464,20 @@ export class Session {
     }
   }
 
-  private async runTurn(text: string): Promise<void> {
+  private async runTurn(text: string, started: () => void): Promise<void> {
     try {
       await this.ensureAdapter();
     } catch (e) {
+      started();
       this.emit("turn_end", { stopReason: "error", error: e instanceof SessionRefusal ? e.reason : "adapter_unavailable" });
       return this.refuse(e);
     }
     const a = this.adapter!;
     this.audit("turn_started", { length: text.length });
     try {
-      const res = await a.requestUnbounded("session/prompt", { sessionId: this.acpId, prompt: [{ type: "text", text }] });
+      const reply = a.requestUnbounded("session/prompt", { sessionId: this.acpId, prompt: [{ type: "text", text }] });
+      started();
+      const res = await reply;
       const usage = isObject(res.usage) ? res.usage : undefined;
       this.emit("turn_end", { stopReason: typeof res.stopReason === "string" ? res.stopReason : "end_turn", ...(usage ? { usage } : {}) });
     } catch (e) {
@@ -492,7 +511,7 @@ export class Session {
   /** `cancel`: stop the turn, drop what was queued, answer every waiting permission request `cancelled`. */
   async cancel(): Promise<void> {
     const queued = this.queue.length;
-    this.queue = [];
+    this.dropQueued();
     const wasRunning = this.turnRunning;
     if (wasRunning && this.adapter && this.acpId) await this.adapter.notify("session/cancel", { sessionId: this.acpId }).catch(() => undefined);
     for (const actionId of this.book.cancelAll()) this.emit("permission_resolved", { actionId, optionId: null, outcome: "cancelled", by: "cancel" });
@@ -521,7 +540,7 @@ export class Session {
     if (this.closed) return;
     this.closed = true;
     clearTimeout(this.idle);
-    this.queue = [];
+    this.dropQueued();
     for (const actionId of this.book.cancelAll()) this.emit("permission_resolved", { actionId, optionId: null, outcome: "cancelled", by: reason });
     const a = this.adapter;
     if (a && this.acpId && (a.caps.sessionCapabilities as AcpParams | undefined)?.close) await a.request("session/close", { sessionId: this.acpId }, 5_000).catch(() => undefined);

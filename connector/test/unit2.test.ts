@@ -12,9 +12,12 @@ import {
   CredentialsError, DeviceTokenProvider, GrantRevokedError, TransientAuthError, loadCredentials, saveCredentials, type Credentials,
 } from "../src/credentials.js";
 import { DeviceFlowError, deviceLogin } from "../src/deviceflow.js";
+import { fileAudit } from "../src/audit.js";
 import { DROPPABLE_TYPES, Outbox } from "../src/outbox.js";
 import { PermissionBook, boundedInput, matchAutoAllow, normalizeOptions } from "../src/permissions.js";
-import { sleep } from "../src/util.js";
+import { CommandLedger } from "../src/connector.js";
+import { SessionStore } from "../src/session-store.js";
+import { UrlError, sleep } from "../src/util.js";
 import { FakeIdentity } from "./support/fake-identity.js";
 
 const tmp = (p = "cc-") => fs.mkdtempSync(path.join(os.tmpdir(), p));
@@ -30,6 +33,14 @@ describe("outbox", () => {
     const b = new Outbox({ dir });
     assert.deepEqual(b.pending(10).map((e) => e.seq), [3]);
     assert.equal(b.append(SID, "turn_end", {}).seq, 4, "the next number is never one that was already used");
+  });
+  test("a restart with nothing acknowledged yet (a crash) does not reuse a number either", () => {
+    const dir = tmp();
+    const a = new Outbox({ dir });
+    for (let i = 0; i < 3; i++) a.append(SID, "x", {});
+    const b = new Outbox({ dir });
+    assert.deepEqual(b.pending(10).map((e) => e.seq), [1, 2, 3]);
+    assert.equal(b.append(SID, "x", {}).seq, 4);
   });
   test("a restart after everything was acknowledged still does not reuse a number", () => {
     const dir = tmp();
@@ -76,6 +87,22 @@ describe("outbox", () => {
     const p = new Outbox({ dir: tmp(), maxBytesPerSession: 1000 });
     for (let i = 0; i < 10; i++) p.append(SID, "permissionRequest", { actionId: String(i), pad: "p".repeat(300) });
     assert.equal(p.size, 10);
+  });
+  test("shedding does not lose the high-water mark: an event shed right after it was written does not let its number come back after a restart", () => {
+    const dir = tmp();
+    const o = new Outbox({ dir, maxBytesPerSession: 600 });
+    assert.equal(o.append(SID, "permissionRequest", { actionId: "a" }).seq, 1);
+    assert.equal(o.append(SID, "agent_message_chunk", { text: "t".repeat(1000) }).seq, 2); // over the cap by itself: shed at once
+    assert.deepEqual(o.pending(10).map((e) => e.seq), [1]);
+    // The log no longer holds a line numbered 2; only the saved high-water mark remembers it.
+    assert.equal(new Outbox({ dir }).append(SID, "x", {}).seq, 3);
+  });
+  test("a refused event that was the newest does not let its number come back", () => {
+    const dir = tmp();
+    const o = new Outbox({ dir });
+    o.append(SID, "x", {}); o.append(SID, "x", {});
+    o.drop(SID, 2);
+    assert.equal(new Outbox({ dir }).append(SID, "x", {}).seq, 3);
   });
   test("an event over the size limit keeps its type and says what happened", () => {
     const o = new Outbox({ dir: tmp() });
@@ -159,6 +186,92 @@ describe("permission book", () => {
     ];
     for (const [name, toolCall, want] of cases) test(name, () => assert.equal(matchAutoAllow(rules, toolCall, cwd) !== null, want));
     test("no rules never matches", () => assert.equal(matchAutoAllow([], call("edit", "docs/a.md"), cwd), null));
+    test("a rule that matches every path still cannot reach outside the directory", () => {
+      const everything = [{ kind: "edit", pathGlob: "**" }];
+      const outside = fs.realpathSync(tmp("cc-outside-"));
+      assert.equal(matchAutoAllow(everything, call("edit", path.join(outside, "x.txt")), cwd), null);
+      assert.equal(matchAutoAllow(everything, call("edit", "../../x"), cwd), null);
+      assert.notEqual(matchAutoAllow(everything, call("edit", "docs/a.md"), cwd), null);
+    });
+  });
+});
+
+describe("credentials are never sent over plain http", () => {
+  test("the client, the token refresh and the device sign-in all refuse an http URL that is not this machine, without making a request", async () => {
+    const { ClawClient } = await import("../src/claw-client.js");
+    const mustNotBeCalled = (async () => { throw new Error("a request was made"); }) as unknown as typeof fetch;
+    assert.throws(() => new ClawClient({ server: "http://claw.example/api", tokens: { async bearer() { return "t"; }, invalidate() {} }, fetch: mustNotBeCalled }), UrlError);
+    const p = new DeviceTokenProvider({ creds: { v: 1, server: "s", kind: "device", identity_url: "http://identity.example", refresh_token: "r", saved_at: "" }, save: () => {}, fetch: mustNotBeCalled });
+    await assert.rejects(p.bearer(), UrlError);
+    await assert.rejects(deviceLogin({ identityUrl: "http://identity.example", deviceName: "h", fetch: mustNotBeCalled }), UrlError);
+  });
+});
+
+describe("Claw client credentials", () => {
+  test("a 401 that is not a revocation gets one retry with a fresh credential; a second 401 is an error", async () => {
+    const { FakeClaw } = await import("./support/fake-claw.js");
+    const { ClawClient, HttpError } = await import("../src/claw-client.js");
+    const claw = await FakeClaw.start();
+    try {
+      let issued = 0;
+      const tokens = { async bearer() { return issued === 0 ? "stale" : "good-token"; }, invalidate() { issued++; } };
+      const client = new ClawClient({ server: claw.url, tokens });
+      assert.equal(await client.register("n", "v"), claw.connectorId, "the retry carried the new credential");
+      assert.equal(issued, 1);
+      const never = new ClawClient({ server: claw.url, tokens: { async bearer() { return "stale"; }, invalidate() {} } });
+      await assert.rejects(never.register("n", "v"), (e) => e instanceof HttpError && e.status === 401);
+    } finally { await claw.close(); }
+  });
+});
+
+describe("session store: permission requests nobody answered", () => {
+  test("kept until answered, handed back once after a crash", () => {
+    const file = path.join(tmp(), "sessions.json");
+    const a = new SessionStore(file);
+    a.addPending("s1", "a1"); a.addPending("s1", "a2"); a.addPending("s2", "b1");
+    a.removePending("s1", "a1");
+    const b = new SessionStore(file);
+    assert.deepEqual(b.takePending(), [{ session_id: "s1", action_id: "a2" }, { session_id: "s2", action_id: "b1" }]);
+    assert.deepEqual(new SessionStore(file).takePending(), [], "forgotten once handed back");
+  });
+});
+
+describe("command ledger", () => {
+  test("the cursor sent to the server never passes a command still in flight", () => {
+    const l = new CommandLedger();
+    l.begin(1, "a"); l.begin(2, "b"); l.begin(3, "c");
+    l.end(2, "b");
+    assert.equal(l.cursor, 0, "1 is still running: the server must keep it");
+    l.end(1, "a");
+    assert.equal(l.cursor, 2, "3 is still running");
+    l.end(3, "c");
+    assert.equal(l.cursor, 3);
+  });
+  test("seen: by number at or below the cursor, by id, and while in flight", () => {
+    const l = new CommandLedger(5, ["old"]);
+    assert.deepEqual([l.seen(5, "x"), l.seen(6, "old"), l.seen(6, "new")], [true, true, false]);
+    l.begin(6, "new");
+    assert.deepEqual([l.seen(6, "other"), l.seen(7, "new"), l.seen(7, "fresh")], [true, true, false]);
+  });
+  test("the id list is bounded", () => {
+    const l = new CommandLedger();
+    for (let i = 1; i <= 600; i++) { l.begin(i, `c${i}`); l.end(i, `c${i}`); }
+    assert.equal(l.recentIds.length, 500);
+    assert.equal(l.recentIds.at(-1), "c600");
+  });
+});
+
+describe("audit log", () => {
+  test("one JSON object per line, appended 0600; a detail field can never overwrite what the record is; secrets in details are masked", () => {
+    const file = path.join(tmp(), "state", "audit.jsonl");
+    const a = fileAudit(file, () => 1_700_000_000_000);
+    a.record("auto_allow", { kind: "edit", note: "Bearer abcdefghijklmnopqrstuvwxyz0123" });
+    a.record("second");
+    const lines = fs.readFileSync(file, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.deepEqual(lines.map((l) => l.kind), ["auto_allow", "second"]);
+    assert.equal(lines[0].ts, "2023-11-14T22:13:20.000Z");
+    assert.equal(lines[0].note, "[hidden]");
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
   });
 });
 
@@ -299,7 +412,9 @@ describe("recorded child processes", () => {
     try {
       reg.add({ pid: leader.pid!, pgid: leader.pid!, agent_id: "a", session_id: "s" });
       assert.notEqual(processStart(grandchild), null);
-      await reg.killAll(500);
+      const t0 = Date.now();
+      await reg.killAll(5000);
+      assert.ok(Date.now() - t0 < 2500, "the whole group got SIGTERM at once; nothing waited for the SIGKILL after the grace period");
       await sleep(100);
       assert.equal(processStart(grandchild), null, "the leader's child died with its group");
     } finally { try { process.kill(-leader.pid!, "SIGKILL"); } catch { /* gone */ } }

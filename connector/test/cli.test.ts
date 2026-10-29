@@ -22,7 +22,7 @@ function ctx(home: string, extra: Partial<Ctx> = {}) {
   return { c, out, err, text: () => out.join("\n"), errText: () => err.join("\n") };
 }
 
-const writeConfig = (home: string, work: string, extra = "") => {
+const writeConfig = (home: string, work: string, extra = "", agentEnv = "") => {
   const dir = path.join(home, "config");
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, "agents.toml"), `${extra}
@@ -32,7 +32,7 @@ command = ${JSON.stringify(process.execPath)}
 args = [${JSON.stringify(ADAPTER)}]
 ask_mode = "default"
 roots = [${JSON.stringify(work)}]
-`);
+${agentEnv ? `[agents.env]\n${agentEnv}\n` : ""}`);
 };
 
 describe("claw-connector commands", () => {
@@ -65,12 +65,27 @@ describe("claw-connector commands", () => {
   test("login with a key (development) saves a 0600 file and says it is not the normal way", async () => {
     const home = tmpdir();
     const a = ctx(home);
-    assert.equal(await main(["login", "--server", "http://claw.example/api/", "--key", "ak-test"], a.c), EXIT.ok);
+    assert.equal(await main(["login", "--server", "https://claw.example/api/", "--key", "ak-test"], a.c), EXIT.ok);
     const file = credentialsFile(a.c.dirs);
     assert.equal(fs.statSync(file).mode & 0o777, 0o600);
-    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")).server, "http://claw.example/api");
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")).server, "https://claw.example/api");
     assert.match(a.text(), /development key/);
     assert.doesNotMatch(a.text() + a.errText(), /ak-test/, "the key is never echoed");
+  });
+
+  test("plain http is refused for the server and for the identity service (except localhost), before anything is saved or sent", async () => {
+    const home = tmpdir();
+    for (const args of [
+      ["login", "--server", "http://claw.example/api", "--key", "k"],
+      ["login", "--server", "https://claw.example/api", "--identity-url", "http://identity.example"],
+    ]) {
+      const a = ctx(home);
+      assert.equal(await main(args, a.c), EXIT.failure, args.join(" "));
+      assert.match(a.errText(), /must be an https:\/\/ URL/);
+      assert.equal(fs.existsSync(credentialsFile(a.c.dirs)), false);
+    }
+    const ok = ctx(home);
+    assert.equal(await main(["login", "--server", "http://127.0.0.1:9/api", "--key", "k"], ok.c), EXIT.ok, "a local development server is fine");
   });
 
   test("login without a server or without an identity URL says what is missing", async () => {
@@ -79,7 +94,7 @@ describe("claw-connector commands", () => {
     assert.equal(await main(["login"], a.c), EXIT.usage);
     assert.match(a.errText(), /--server/);
     const b = ctx(home);
-    assert.equal(await main(["login", "--server", "http://x"], b.c), EXIT.usage);
+    assert.equal(await main(["login", "--server", "https://x.example"], b.c), EXIT.usage);
     assert.match(b.errText(), /--identity-url/);
   });
 
@@ -90,7 +105,7 @@ describe("claw-connector commands", () => {
       const a = ctx(home, { fetch: ((u: any, i: any) => fetch(u, i)) as typeof fetch });
       id.interval = 0.01;
       id.pollScript = ["authorization_pending", "ok"];
-      assert.equal(await main(["login", "--server", "http://claw.example/api", "--identity-url", id.url, "--name", "dev-pod"], a.c), EXIT.ok);
+      assert.equal(await main(["login", "--server", "https://claw.example/api", "--identity-url", id.url, "--name", "dev-pod"], a.c), EXIT.ok);
       assert.match(a.text(), /ABCD-EFGH/);
       assert.match(a.text(), /device\?user_code=ABCD-EFGH/);
       const saved = JSON.parse(fs.readFileSync(credentialsFile(a.c.dirs), "utf8"));
@@ -108,7 +123,7 @@ describe("claw-connector commands", () => {
       const a = ctx(home);
       id.interval = 0.01;
       id.pollScript = ["access_denied"];
-      assert.equal(await main(["login", "--server", "http://x", "--identity-url", id.url], a.c), EXIT.failure);
+      assert.equal(await main(["login", "--server", "https://x.example", "--identity-url", id.url], a.c), EXIT.failure);
       assert.match(a.errText(), /denied/);
       assert.equal(fs.existsSync(credentialsFile(a.c.dirs)), false);
     } finally { await id.close(); }
@@ -250,6 +265,34 @@ describe("claw-connector commands", () => {
     }
   });
 
+  test("stop after the connector itself was killed hard still stops the agents it had recorded", async () => {
+    const claw = await FakeClaw.start();
+    const home = tmpdir();
+    const work = tmpdir("w-");
+    writeConfig(home, work, "", 'FAKE_SURVIVE_EOF = "1"');
+    await main(["login", "--server", claw.url, "--key", "good-token"], ctx(home).c);
+    const cli = path.join(path.dirname(new URL(import.meta.url).pathname), "..", "src", "cli.ts");
+    const tsx = path.join(path.dirname(new URL(import.meta.url).pathname), "..", "node_modules", ".bin", "tsx");
+    const child = spawn(tsx, [cli, "run"], { env: { ...process.env, CLAW_CONNECTOR_HOME: home }, stdio: "ignore", detached: true });
+    try {
+      await claw.until("online", () => claw.online && claw.heartbeats.length > 0, 20_000);
+      const sid = claw.newSession("fake", work);
+      await claw.until("started", () => claw.eventsOf(sid, "session_started")[0]);
+      const run = JSON.parse(fs.readFileSync(path.join(home, "state", "connector.pid"), "utf8"));
+      const adapters: number[] = JSON.parse(fs.readFileSync(path.join(home, "state", "children.json"), "utf8")).map((r: any) => r.pid);
+      process.kill(run.pid, "SIGKILL"); // no cleanup runs: the adapter is left behind
+      await sleep(300);
+      assert.notEqual(processStart(adapters[0]!), null, "the adapter outlived its connector");
+      const s = ctx(home);
+      assert.equal(await main(["stop"], s.c), EXIT.ok);
+      await sleep(200);
+      assert.equal(processStart(adapters[0]!), null, "stop removed it");
+    } finally {
+      try { process.kill(-child.pid!, "SIGKILL"); } catch { /* gone */ }
+      await claw.close();
+    }
+  });
+
   test("logout revokes the refresh token at the identity service and deletes the file", async () => {
     const id = await FakeIdentity.start();
     try {
@@ -257,7 +300,7 @@ describe("claw-connector commands", () => {
       const a = ctx(home);
       fs.mkdirSync(path.join(home, "config"), { recursive: true });
       id.refreshTokens.add("r9");
-      fs.writeFileSync(credentialsFile(a.c.dirs), JSON.stringify({ v: 1, server: "http://x", kind: "device", identity_url: id.url, client_id: "claw-connector", refresh_token: "r9", saved_at: "" }), { mode: 0o600 });
+      fs.writeFileSync(credentialsFile(a.c.dirs), JSON.stringify({ v: 1, server: "https://x.example", kind: "device", identity_url: id.url, client_id: "claw-connector", refresh_token: "r9", saved_at: "" }), { mode: 0o600 });
       assert.equal(await main(["logout"], a.c), EXIT.ok);
       assert.deepEqual(id.revokedTokens, ["r9"]);
       assert.equal(id.refreshTokens.has("r9"), false);
