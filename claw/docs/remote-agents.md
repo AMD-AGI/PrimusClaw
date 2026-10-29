@@ -82,6 +82,18 @@ that does not (`401 invalid_token`, naming the reason, or `403 insufficient_scop
 The caller is the token's `sub` with the `default` role only, whatever roles or
 groups the token carries.
 
+**`sub` must be the same user id the user's own clients resolve to.** Every
+remote-agents row is owned by the caller's id. A person's own clients (a session cookie,
+an `ak-` key, a BYOK key) are owned by the id Claw's own authentication produces for
+them, so an identity provider has to issue the connector's token with that id as `sub`.
+If it issues some other subject (an opaque UUID where Claw has a user name, say), the
+connector registers and shows online, but that person's `GET /v1/remote-agents/connectors`
+is empty and `POST /v1/remote-agents/sessions` with its id is `404 not_found`, with no
+error naming the cause. Claw has no second source for the user's id, so it cannot detect
+the mismatch itself; it logs the id every connector is filed under at registration
+(`remote_agents.connector_registered`, with `owner` and `credential`), for an operator to
+compare with the id of the person's own session.
+
 **It authenticates on those four routes and nowhere else.** On the user-side
 routes, and on every other route of the API, a token is not a credential: the
 request is answered as one with no credential. The user side of this module also

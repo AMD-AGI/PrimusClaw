@@ -224,6 +224,10 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       owner, body.value.name, body.value.version, clientLabel(req), maxConnectors, getAuthMethod(req),
     );
     if (!row) return fail(reply, 409, "connector_limit_reached");
+    // The id every row of this connector is filed under. A connector whose token `sub` is not the id the
+    // user's own clients resolve to is registered and online yet invisible to them, with no error; this
+    // line is where an operator reads which id it was filed under (docs/remote-agents.md, "Connector access tokens").
+    logger.info({ owner, connectorId: row.connector_id, credential: getAuthMethod(req) }, "remote_agents.connector_registered");
     return reply.status(201).send({ ok: true, data: { connector_id: row.connector_id, name: row.name, created_at: row.created_at } });
   });
 

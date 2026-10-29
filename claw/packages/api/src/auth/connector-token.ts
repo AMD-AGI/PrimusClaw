@@ -16,7 +16,11 @@
  *     key, and the request is refused like any request with no credential.
  *   - The caller is the token's `sub`. Its roles are `default`: whatever
  *     the token says about groups or roles is not copied, so a connector never
- *     acts as an administrator.
+ *     acts as an administrator. Every remote-agents row is owned by the caller's
+ *     id, and the user's own clients are owned by the id their credential
+ *     resolves to, so `sub` must be that same id; nothing here can check it,
+ *     because this process has no second source for the user's id (see
+ *     docs/remote-agents.md).
  *   - The token must name this API as its audience, be typed `at+jwt`, and carry
  *     the connector scope. A token for another audience or purpose is refused.
  *   - A token cannot be revoked by checking it locally, so it is good until it
