@@ -5,6 +5,7 @@ package workloadmanager
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	dynfake "k8s.io/client-go/dynamic/fake"
 
 	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/agent-sandbox/pkg/store"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -45,6 +47,34 @@ func TestWaitRunningRemoteClusterSkipsPodIP(t *testing.T) {
 	ip, node, cluster, err := creator.waitRunning(ctx, name, "crusoe-spur-vk")
 	if err != nil || ip != "" || node != "node-a" || cluster != "crusoe" {
 		t.Fatalf("ip=%q node=%q cluster=%q err=%v", ip, node, cluster, err)
+	}
+}
+
+func TestSessionSkipsRemoteWorkload(t *testing.T) {
+	const name = "sbx-remote"
+	dc := dynfake.NewSimpleDynamicClientWithCustomListKinds(k8sruntime.NewScheme(), map[schema.GroupVersionResource]string{
+		workloadGVR: "WorkloadList",
+	})
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "amd.com/v1",
+		"kind":       "Workload",
+		"metadata": map[string]any{
+			"name":   name,
+			"labels": map[string]any{safeClusterIDLabel: "crusoe", ownerSessionIDLabel: name},
+		},
+		"spec":   map[string]any{"workspace": "crusoe-spur-vk"},
+		"status": map[string]any{"phase": "Running"},
+	}}
+	if _, err := dc.Resource(workloadGVR).Create(context.Background(), obj, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	creator := NewSafeWorkloadCreator(dc, nil)
+	if _, err := creator.Session(context.Background(), name); err != nil {
+		t.Fatalf("local session: %v", err)
+	}
+	creator.SetRemoteClusters([]string{"crusoe"})
+	if info, err := creator.Session(context.Background(), name); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("remote session info=%+v err=%v", info, err)
 	}
 }
 

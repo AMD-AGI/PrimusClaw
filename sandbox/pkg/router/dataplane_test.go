@@ -150,6 +150,40 @@ func TestDataPlaneHopUsesPodFinderWhenStoreMisses(t *testing.T) {
 	}
 }
 
+func TestDataPlaneHopRejectsStoreSandboxInOtherNamespace(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	globalJWT := mustJWT(t)
+	hits := 0
+	envd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer envd.Close()
+	crusoeStore := store.NewMemoryStore()
+	if err := crusoeStore.StoreSandbox(context.Background(), &store.SandboxInfo{
+		SessionID: "sbx-1", Namespace: "other", PodIP: envdHost(t, envd), PodPort: envdPort(t, envd),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	crusoe := &Server{store: crusoeStore, jwt: mustJWT(t)}
+	crusoe.engine = gin.New()
+	crusoe.engine.Any("/internal/v1/dataplane/:sandboxID/*proxyPath", crusoe.handleDataPlaneHop)
+	if err := crusoe.ConfigureDataPlane("crusoe", "", string(mustPEM(t, globalJWT)), nil); err != nil {
+		t.Fatal(err)
+	}
+	token, err := globalJWT.generateHopToken("sbx-1", "crusoe", "top-models", false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/internal/v1/dataplane/sbx-1/health", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	crusoe.engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway || hits != 0 {
+		t.Fatalf("status=%d hits=%d", rec.Code, hits)
+	}
+}
+
 func TestDataPlaneHopRejectsOtherCluster(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	globalJWT := mustJWT(t)

@@ -176,16 +176,16 @@ func (s *Server) handleDataPlaneHop(c *gin.Context) {
 		writeGate(c, http.StatusUnauthorized, "invalid_token", "hop token is not valid for this cluster")
 		return
 	}
-	info, err := s.localSandbox(c.Request.Context(), ref.Namespace, sandboxID)
-	if err != nil || info == nil || info.PodIP == "" {
-		writeGate(c, http.StatusBadGateway, "sandbox_unavailable", sandboxID)
-		return
-	}
 	suffix := c.Param("proxyPath")
 	if suffix == "" {
 		suffix = "/"
 	}
 	if !hopSealedAllows(c, suffix, ref) {
+		return
+	}
+	info, err := s.localSandbox(c.Request.Context(), ref.Namespace, sandboxID)
+	if err != nil || info == nil || info.PodIP == "" {
+		writeGate(c, http.StatusBadGateway, "sandbox_unavailable", sandboxID)
 		return
 	}
 	c.Request.URL.Path = suffix
@@ -245,7 +245,7 @@ func hopSealedAllows(c *gin.Context, path string, ref runtimev1alpha1.GrantSandb
 func (s *Server) localSandbox(ctx context.Context, namespace, sandboxID string) (*store.SandboxInfo, error) {
 	if s.store != nil {
 		info, err := s.store.GetSandboxBySessionID(ctx, sandboxID)
-		if err == nil && info != nil && info.PodIP != "" {
+		if err == nil && info != nil && info.PodIP != "" && (namespace == "" || info.Namespace == namespace) {
 			return info, nil
 		}
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
@@ -285,7 +285,7 @@ func verifyHopToken(pub *rsa.PublicKey, raw, sandboxID, cluster string) (runtime
 		jwt.WithAudience(hopAudience),
 		jwt.WithExpirationRequired(),
 		jwt.WithIssuedAt(),
-		jwt.WithLeeway(5*time.Second),
+		jwt.WithLeeway(time.Minute),
 	)
 	if err != nil || !token.Valid {
 		return runtimev1alpha1.GrantSandboxRef{}, errors.New("invalid hop token")

@@ -332,7 +332,8 @@ func (c *SafeWorkloadCreator) Observe(ctx context.Context, sandboxID string) (e2
 }
 
 // Session rebuilds the session record of an E2B Workload named by the sandbox id.
-// A missing Workload, a finished phase, or a Workload not created for E2B is store.ErrNotFound.
+// A missing Workload, a finished phase, a Workload not created for E2B, or a
+// Workload in a remote cluster is store.ErrNotFound.
 func (c *SafeWorkloadCreator) Session(ctx context.Context, name string) (*store.SandboxInfo, error) {
 	if c == nil || c.dynamic == nil || !strings.HasPrefix(name, e2bSandboxPrefix) || !dnsLabel(name, safeGeneratedNameLength) {
 		return nil, store.ErrNotFound
@@ -346,6 +347,9 @@ func (c *SafeWorkloadCreator) Session(ctx context.Context, name string) (*store.
 	}
 	labels := obj.GetLabels()
 	if _, ok := labels[ownerSessionIDLabel]; !ok || obj.GetDeletionTimestamp() != nil {
+		return nil, store.ErrNotFound
+	}
+	if _, remote := c.remoteClusters[labels[safeClusterIDLabel]]; remote {
 		return nil, store.ErrNotFound
 	}
 	phase, _, _ := unstructured.NestedString(obj.Object, "status", "phase")
