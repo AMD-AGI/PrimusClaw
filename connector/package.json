@@ -3,10 +3,18 @@
   "version": "0.1.0",
   "description": "Connects the coding agents on your own machine to Claw, over outbound HTTPS only.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AMD-AGI/PrimusClaw.git",
+    "directory": "connector"
+  },
+  "homepage": "https://github.com/AMD-AGI/PrimusClaw/tree/main/connector#readme",
+  "bugs": { "url": "https://github.com/AMD-AGI/PrimusClaw/issues" },
   "type": "module",
   "bin": { "claw-connector": "dist/cli.js" },
-  "files": ["dist", "README.md"],
+  "files": ["dist", "README.md", "LICENSE"],
   "engines": { "node": ">=22" },
+  "publishConfig": { "access": "public" },
   "scripts": {
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",

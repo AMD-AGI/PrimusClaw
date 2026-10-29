@@ -16,27 +16,74 @@ stay on your machine.
 phone / chat client --> Claw (remote agents) <-- connector on your machine --> agent adapter (stdio) --> your agent
 ```
 
-Claw's side is documented in [claw/docs/remote-agents.md](../claw/docs/remote-agents.md); the wire contract is
-`claw/packages/protocol/src/remote-agents.ts`, compiled into this package.
+Claw's side is documented in [claw/docs/remote-agents.md](https://github.com/AMD-AGI/PrimusClaw/blob/main/claw/docs/remote-agents.md); the wire
+contract is `claw/packages/protocol/src/remote-agents.ts`, compiled into this package.
 
-## Quick start
+## Quick start (about 5 minutes)
 
-Requirements: Node.js 22 or newer, and the agent you want to expose already working on this machine (an adapter is fetched
-by `npx` on first use).
+You need Node.js 22 or newer, a coding agent that already works on this machine (Claude Code, Codex or the Cursor CLI), and the
+two addresses the people who run your Claw give you: the Claw API URL and the identity service URL. The addresses below are
+placeholders. The Claude and Codex adapters are fetched by `npx` the first time a session starts, so the machine needs
+access to the npm registry.
+
+**1. Install**
 
 ```sh
-npx @primusclaw/connector init          # writes a sample agents.toml
-$EDITOR ~/.config/claw-connector/agents.toml   # set roots: the directories an agent may work in
-npx @primusclaw/connector login --server https://claw.example.com/claw-api --identity-url https://identity.example.com
-npx @primusclaw/connector run
+npm install -g @primusclaw/connector
+claw-connector --version
 ```
 
-(The npm scope above is a placeholder until the package is published; `npm run build` in this directory produces the
-same `claw-connector` binary in `dist/cli.js`.)
+If npm answers `EACCES`, point its global prefix at a directory you own (`npm config set prefix ~/.npm-global`, then put
+`~/.npm-global/bin` on your `PATH`) instead of using `sudo`. To update later, run the same `npm install -g` again.
 
-`login` prints a short code and a link. Open the link on any device that is signed in to Claw, check the machine name,
-and confirm. The connector then holds a rotating sign-in token (file mode 0600) and refreshes its short-lived access
-token by itself. `run` keeps the connection up and stops every agent it started when you press Ctrl-C.
+**2. Choose what an agent may touch**
+
+```sh
+claw-connector init                            # writes ~/.config/claw-connector/agents.toml
+$EDITOR ~/.config/claw-connector/agents.toml   # set roots: the directories an agent may work in
+claw-connector status                          # prints a "problem:" line if the file is wrong
+```
+
+The sample enables `claude`, working in `~/work`; remove the `#` in front of the `codex` or `cursor` block to offer those too.
+A root that does not exist is reported as a problem, so create it or change it. See [agents.toml](#agentstoml).
+
+**3. Sign in**
+
+```sh
+claw-connector login --server https://claw.example.com/claw-api --identity-url https://identity.example.com
+```
+
+`login` prints a link and a short code. Open the link in a browser where you are signed in to Claw, check the machine name shown
+there, and confirm; the command then prints `signed in as <machine name>`. The connector holds a rotating sign-in token (file mode
+0600) and refreshes its short-lived access token by itself. Put `server` and `identity_url` in `agents.toml` and the two
+options can be left out.
+
+If there is no browser sign-in to use (a development server), use a Claw API key instead. Give it through the environment so it
+stays out of your shell history:
+
+```sh
+CLAW_CONNECTOR_KEY=<your Claw API key> claw-connector login --server https://claw.example.com/claw-api
+```
+
+The key is stored as it is in `credentials.json` (mode 0600) and is for trying things out; the device sign-in is the normal way.
+
+**4. Run**
+
+```sh
+claw-connector run
+```
+
+It prints `connecting claude to https://claw.example.com/claw-api as "<machine name>"` and stays in the foreground: keep it in a
+terminal tab, `tmux` or `screen`. Ctrl-C stops it and every agent it started. From another terminal, `claw-connector status` shows
+whether it is running and signed in.
+
+**5. See it in Clawy**
+
+In Clawy (or any chat client built on Claw), send `/agents`. The agents of this machine are listed, online while `run` is up.
+A session started there runs on this machine, inside one of your `roots`, and each permission request comes back as a card in the chat.
+
+To disconnect: `claw-connector pause` (stay offline until `resume`), `claw-connector stop`, or `claw-connector logout` (also
+revokes the device sign-in at the identity service; a saved key is deleted from this machine, not revoked at Claw).
 
 ## agents.toml
 
@@ -171,4 +218,9 @@ cd connector
 npm ci
 npm run typecheck && npm test      # node:test against a stand-in Claw and a stand-in ACP adapter (real processes, real sockets)
 npm run build                      # dist/cli.js: one file; the wire contract from claw/packages/protocol is compiled in
+node scripts/check-pack.mjs        # the package ships only dist/cli.js, README.md, LICENSE and package.json
+npm pack && npm install -g ./primusclaw-connector-*.tgz   # the package as the registry serves it, from a checkout
 ```
+
+A release is a tag `connector-vX.Y.Z` on a commit of `main` whose `connector/package.json` has that version: see
+[.github/workflows/connector-release.yml](https://github.com/AMD-AGI/PrimusClaw/blob/main/.github/workflows/connector-release.yml).

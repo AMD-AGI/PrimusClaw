@@ -118,6 +118,13 @@ record it.
   confirmed is not opened); the adapter's own permission options passed through verbatim, including
   allow-always; credentials masked before upload; a local audit log; a kill switch that stops only the
   process groups it started. See `connector/README.md`.
+- `@primusclaw/connector` on npm: pushing a tag `connector-vX.Y.Z` to a commit of `main` runs
+  `.github/workflows/connector-release.yml`, which tests the connector and publishes it with npm Trusted
+  Publishing (a short-lived OIDC credential and a provenance statement; no stored npm token). The tag
+  must equal the version in `connector/package.json`. Once a tag has been published,
+  `npm install -g @primusclaw/connector` installs the `claw-connector` command (Node.js 22 or newer).
+  The package holds only the bundle, README and LICENSE, and CI checks that on every change
+  (`connector/scripts/check-pack.mjs`).
 - A shared identity client in `@claw/utils`, built by API and Brain when
   `IDENTITY_CLIENT_ENABLED=true` (off by default; it authenticates a request only through the access-token
   credentials above, a connector's and an identity provider's). It does OIDC

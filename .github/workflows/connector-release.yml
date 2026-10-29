@@ -1,0 +1,148 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: Connector release
+
+# Publishes connector/ to npm as @primusclaw/connector.
+#
+# To release: set the version in connector/package.json and connector/src/version.ts, merge
+# that to main, then push a tag `connector-vX.Y.Z` on the merged commit. Only plain
+# MAJOR.MINOR.PATCH versions are accepted: a prerelease needs a dist-tag, and setting one
+# through OIDC needs a newer npm and a separate permission on the Trusted Publisher entry.
+#
+# No long-lived npm token exists anywhere. npm Trusted Publishing hands the job a
+# short-lived credential in exchange for this run's OIDC identity (`id-token: write`), and
+# only if the package's Trusted Publisher entry names this repository, this file name and the
+# environment below. The Trusted Publisher entry lives on the package's npmjs.com settings
+# page, so the package must exist first: its first version is published by hand, and this
+# workflow publishes every later one.
+#
+# Nothing but a tag push starts this: no manual dispatch, no branch push, no pull request,
+# so a change to this file can only be exercised by a maintainer who tags it. Every guard
+# below exits non-zero, and the publish step is the last one: a run that fails anywhere
+# publishes nothing.
+on:
+  push:
+    tags:
+      - "connector-v*"
+
+# Least privilege for the default GITHUB_TOKEN. The job adds `id-token: write` for the
+# publish and nothing else.
+permissions:
+  contents: read
+
+# One release at a time, and never cancel one that is part-way through publishing.
+concurrency:
+  group: connector-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Test and publish to npm
+    # Only this repository holds the Trusted Publisher entry; elsewhere (a fork, a mirror)
+    # a tag would only produce a confusing failure at the publish step.
+    if: github.repository == 'AMD-AGI/PrimusClaw' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # The name npm's Trusted Publisher entry is told. Protection rules on the environment
+    # (required reviewers, a `connector-v*` tag rule) are an extra gate maintainers can add
+    # without changing this file.
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The tag's commit has to be compared with main's history.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The tag name is attacker-shaped text (a git ref may hold `$`, backticks and `;`), so
+      # it reaches the shell through the environment, never through ${{ }} in a script.
+      - name: The tag is connector-vX.Y.Z on a commit of main
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^connector-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::the tag is not connector-vMAJOR.MINOR.PATCH; refusing to publish"
+            exit 1
+          fi
+          # A tag can be pushed to any commit, including one on a side branch that never
+          # went through review. Publish only what main contains.
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "::error::the tagged commit $GITHUB_SHA is not in main's history; refusing to publish"
+            exit 1
+          fi
+
+      # No cache: a release job should install exactly what the lockfile names and nothing
+      # a previous run left behind.
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: claw/.nvmrc
+          registry-url: https://registry.npmjs.org
+
+      # Trusted Publishing needs Node 22.14.0 and npm 11.5.1 or newer. The npm is the one the
+      # Node toolchain above ships, not one fetched here: this job refuses to run on a pair
+      # that is too old, because an older npm would not fail on the missing capability, it
+      # would look for a token that does not exist.
+      - name: The toolchain supports Trusted Publishing
+        run: |
+          set -euo pipefail
+          node -e '
+            const atLeast = (have, want) => {
+              const h = have.split(".").map(Number), w = want.split(".").map(Number);
+              for (let i = 0; i < 3; i++) if (h[i] !== w[i]) return h[i] > w[i];
+              return true;
+            };
+            const [nodeV, npmV] = [process.versions.node, process.argv[1]];
+            if (!atLeast(nodeV, "22.14.0") || !atLeast(npmV, "11.5.1")) {
+              console.error("::error::node " + nodeV + " and npm " + npmV + " are older than the 22.14.0 and 11.5.1 Trusted Publishing needs");
+              process.exit(1);
+            }
+          ' "$(npm --version)"
+
+      - name: Install
+        working-directory: connector
+        # The lockfile is the whole dependency set; a package's install script never runs
+        # in a job that holds a publish identity.
+        run: npm ci --ignore-scripts
+
+      - name: Typecheck
+        working-directory: connector
+        run: npm run typecheck
+
+      # Real child processes and sockets: a stand-in Claw and a stand-in ACP adapter, no
+      # database and no network beyond the loopback.
+      - name: Test
+        working-directory: connector
+        run: npm test
+
+      - name: Build
+        working-directory: connector
+        run: npm run build
+
+      # The package is checked as npm builds it: exactly dist/cli.js, README.md, LICENSE and
+      # package.json; the bin and engines fields; package.json's version equal to the tag and
+      # to what the built CLI prints; repository.url equal to this repository (npm refuses
+      # provenance otherwise).
+      - name: The package is what the tag says
+        working-directory: connector
+        env:
+          TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          npm pack --dry-run
+          node scripts/check-pack.mjs --version "${TAG#connector-v}" --repository "$REPOSITORY"
+
+      # `npm publish` runs `prepack` (the same build) and uploads the directory the guards
+      # above just checked. The OIDC credential is exchanged here, nowhere earlier; the
+      # version goes out under the default `latest` dist-tag.
+      - name: Publish
+        working-directory: connector
+        run: npm publish --provenance --access public
