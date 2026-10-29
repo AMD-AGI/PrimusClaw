@@ -28,7 +28,6 @@ import Fastify, { type FastifyInstance } from "fastify";
 
 process.env.CLAW_DEPLOY_MODE = "kubernetes";
 
-const { db } = await import("../src/infra/db.js");
 const { registerSessionRoutes } = await import("../src/routes/sessions.js");
 const { changesPorts } = await import("../src/sessions/changes-service.js");
 const { sessionDispatchPorts } = await import("../src/sessions/dispatch.js");
@@ -471,6 +470,23 @@ test("C7 a patch over 64 KB is cut at 64 KB and says so; secrets in it are maske
   assert.equal(cfg.status, 200);
   for (const secret of ["ghp_0123456789", "abcdefghijklmnopqrstuvwxyz0123", "user:pw456789"]) assert.equal(cfg.body.patch.includes(secret), false, secret);
   assert.match(cfg.body.patch, /\+A=1|A=1/);
+});
+
+test("C7 a credential held under a NAME in a changed file is masked in the patch, and a 64 KB single-line change comes back at once", async () => {
+  await seed();
+  const app = repo("app", { ".env": "A=1\n", "min.js": "x\n" });
+  write(path.join(app, ".env"), "A=1\nDB_PASSWORD=hunter2\napi_key = \"s3cr3tvalue\"\n  password: correcthorse\nrun --kube-token kubesecret1 up\n");
+  const env = await patch(app, ".env");
+  assert.equal(env.status, 200, env.raw);
+  for (const secret of ["hunter2", "s3cr3tvalue", "correcthorse", "kubesecret1"]) assert.equal(env.body.patch.includes(secret), false, secret);
+  assert.match(env.body.patch, /\+A=1|A=1/);
+  // One line of 64 KB (a minified bundle): redaction must not stall the process.
+  write(path.join(app, "min.js"), "a".repeat(64 * 1024) + "\n");
+  const t0 = Date.now();
+  const big = await patch(app, "min.js");
+  assert.equal(big.status, 200);
+  assert.ok(Date.now() - t0 < 5000, `${Date.now() - t0} ms`);
+  assert.equal(big.body.truncated, true);
 });
 
 test("C7 the patch form needs both parameters, once each", async () => {

@@ -96,7 +96,12 @@ const VENDOR_TOKEN_RE = new RegExp([
 // a username meant that one was not redacted at all. The username is `*` now
 // rather than `+`; the colon and the password still have to be there, so a
 // bare `scheme://host` is untouched.
-const URL_CREDENTIALS_RE = /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/:@]*:[^\s/@]+@/g;
+//
+// The scheme begins where a run of scheme characters begins (the lookbehind), not at
+// every letter inside it. Without that, a long run of letters with no `://` after it
+// is rescanned from each of its starting positions, which is quadratic: a single line
+// of 64 KB of letters took 16 seconds and blocked the event loop for all of them.
+const URL_CREDENTIALS_RE = /(?<![a-zA-Z0-9+.-])([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/:@]*:[^\s/@]+@/g;
 
 /**
  * Whether a discrete configuration VALUE looks like a credential on its own.

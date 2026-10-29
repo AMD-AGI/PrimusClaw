@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import {
   CHANGES_MAX_FILES, CHANGES_MAX_REPOS, LINE_COUNT_CAP, PATCH_MAX_BYTES,
   assembleRepo, isPathUnder, parseNumstatZ, parsePatch, parseStatusZ, parseSummary, pathParam,
-  resolvePatchTarget, statusLetter, summaryScript, patchScript, checkPatchParams, type KnownFile,
+  resolvePatchTarget, statusLetter, summaryScript, patchScript, checkPatchParams, maskCredentialText, type KnownFile,
 } from "../src/sessions/changes.js";
 
 const b64 = (s: string) => Buffer.from(s, "utf8").toString("base64");
@@ -368,4 +368,52 @@ test("the patch script quotes the repository and the file, puts them after --, a
   const u = patchScript("/workspace/app", "new.txt", true);
   assert.ok(u.includes("diff --no-index --no-color --no-ext-diff --no-textconv -- /dev/null 'new.txt'"));
   assert.equal(u.includes('"$base"'), false, "an untracked file has no base");
+});
+
+// --- credentials in a patch ----------------------------------------------------------------
+
+const MASK_CASES: Array<[string, string, string]> = [
+  ["an env assignment", "+DB_PASSWORD=hunter2", "hunter2"],
+  ["an assignment with spaces and quotes", "+  api_key = \"s3cr3tvalue\"", "s3cr3tvalue"],
+  ["a yaml field", "+  password: correcthorse", "correcthorse"],
+  ["a json field", "+  \"client_secret\": \"abc987xyz\",", "abc987xyz"],
+  ["a single-quoted value", "-TOKEN='tok123value'", "tok123value"],
+  ["a qualified name", "+MY_SERVICE_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE1", "AKIAIOSFODNN7EXAMPLE1"],
+  ["a flag with a separate value", "+  run --kube-token hunter2 upgrade", "hunter2"],
+  ["a flag with =", "+  tool --my-api-key=abcdef123456", "abcdef123456"],
+  ["a cookie header value", "+Cookie: sessionid=abc123def456", "abc123def456"],
+  ["a vendor token the shape pass knows", "+x = ghp_0123456789abcdefghijklmnopqrstuvwxyzAB", "ghp_0123456789"],
+  ["url userinfo", "+url = https://user:pw456789@h.example.invalid/x", "pw456789"],
+];
+for (const [label, line, secret] of MASK_CASES) {
+  test(`patch text: ${label} is masked`, () => {
+    const out = maskCredentialText(`diff --git a/f b/f\n@@ -1 +1 @@\n${line}\n+unrelated line\n`);
+    assert.equal(out.includes(secret), false, out);
+    assert.ok(out.includes("unrelated line"), "the rest of the patch is intact");
+    assert.match(out, /redacted/i);
+  });
+}
+
+test("patch text: ordinary code and prose are left as they were", () => {
+  const text = [
+    "diff --git a/src/a.ts b/src/a.ts", "@@ -1,3 +1,4 @@", " const author = getAuthor();", "+const authors = [];", "+// the password is checked elsewhere",
+    "+const tokenCount = tokens.length;", "+password = getPassword();", "+const { token } = config;", "+config.secret = process.env.SECRET;", "+git commit --author \"Ada <ada@example.invalid>\"", "+if (secretKeyboardLayout) {}", "",
+  ].join("\n");
+  assert.equal(maskCredentialText(text), text);
+});
+
+test("patch text: masking is linear on a long single line of any shape, and loses nothing it should not", () => {
+  const N = 65536;
+  const shapes: Record<string, string> = {
+    letters: "a".repeat(N), "dots": "a.".repeat(N / 2), "dashes": "ab-".repeat(N / 3), underscores: "a_".repeat(N / 2),
+    "name-like": "password".repeat(N / 8), "assignments": "k=v ".repeat(N / 4), "colons": "a:".repeat(N / 2), "flags": " --x".repeat(N / 4),
+    "flag-words": " --token".repeat(N / 8), "quotes": "\"a".repeat(N / 2), "equals": "=".repeat(N), "spaces then name": " ".repeat(N / 2) + "token" + " ".repeat(N / 2),
+    "name chars then no separator": "tokenaaaa".repeat(N / 9),
+  };
+  for (const [label, text] of Object.entries(shapes)) {
+    const t0 = Date.now();
+    maskCredentialText(text);
+    const ms = Date.now() - t0;
+    assert.ok(ms < 1000, `${label}: ${ms} ms`);
+  }
 });

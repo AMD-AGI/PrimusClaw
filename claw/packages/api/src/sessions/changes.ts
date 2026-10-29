@@ -370,12 +370,68 @@ function clipBytes(text: string, max: number): { text: string; cut: boolean } {
   return { text: out, cut: true };
 }
 
+// A credential's name, as a word that may sit inside a longer one (`DB_PASSWORD`, `--kube-token`, `api-key`).
+// `author` is not one.
+const CREDENTIAL_NAME_RE = /token|password|passwd|passphrase|secret|credentials?|api[-_]?key|access[-_]?key|private[-_]?key|auth(?!or)|bearer|cookie/i;
+/** `NAME=` / `NAME:` / `"name":` with what follows it up to the value; the name is checked in code, not in the pattern. */
+const ASSIGNMENT_NAME_RE = /\b([A-Za-z0-9_]+)["']?[^\S\n]*[:=][^\S\n]*/g;
+/** `--flag` and the characters of its name; the value, if any, is read from where the name ends. */
+const FLAG_NAME_RE = /[^\S\n](--?[A-Za-z0-9_-]+)/g;
+const ASSIGNED_VALUE_RE = /"[^"\n]*"|'[^'\n]*'|[^\s"',;]+/y;
+const FLAG_VALUE_RE = /(?:=|[^\S\n]+)("[^"\n]*"|'[^'\n]*'|[^\s"']+)/y;
+/** A bare value that is plainly code (a call, a member chain) and not a literal: `getPassword()`, `config.token`. */
+const CODE_LIKE_RE = /\(|^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/;
+
+/**
+ * Mask the credentials a changed file may hold, in patch text. `redactPublicJson` knows token shapes
+ * (vendor prefixes, Bearer, URL userinfo) and nothing about NAMES, so `DB_PASSWORD=hunter2` or a
+ * `"password": "x"` in a config file went through it untouched.
+ *
+ * A name that holds a credential word masks the literal that follows it: a quoted string always, a bare
+ * word unless it is plainly code. A flag whose name holds one masks its value. The names are found by
+ * patterns with no nested repetition and judged in code, so the cost is linear in the text however
+ * it is shaped (a 64 KB line of letters, of dots, of one repeated word).
+ */
+export function maskCredentialText(text: string): string {
+  const shapes = String(redactPublicJson(text) ?? "");
+  const spans: Array<[number, number]> = [];
+  for (const m of shapes.matchAll(ASSIGNMENT_NAME_RE)) {
+    if (!CREDENTIAL_NAME_RE.test(m[1])) continue;
+    const from = m.index + m[0].length;
+    ASSIGNED_VALUE_RE.lastIndex = from;
+    const v = ASSIGNED_VALUE_RE.exec(shapes);
+    if (!v) continue;
+    const quoted = v[0][0] === '"' || v[0][0] === "'";
+    if (!quoted && CODE_LIKE_RE.test(v[0])) continue;
+    spans.push([from, from + v[0].length]);
+  }
+  for (const m of shapes.matchAll(FLAG_NAME_RE)) {
+    if (!CREDENTIAL_NAME_RE.test(m[1])) continue;
+    const nameEnd = m.index + m[0].length;
+    FLAG_VALUE_RE.lastIndex = nameEnd;
+    const v = FLAG_VALUE_RE.exec(shapes);
+    if (!v) continue;
+    const valueStart = nameEnd + v[0].length - v[1].length;
+    spans.push([valueStart, valueStart + v[1].length]);
+  }
+  if (!spans.length) return shapes;
+  spans.sort((a, b) => a[0] - b[0]);
+  let out = "";
+  let last = 0;
+  for (const [a, b] of spans) {
+    if (a < last) continue;
+    out += `${shapes.slice(last, a)}<redacted>`;
+    last = b;
+  }
+  return out + shapes.slice(last);
+}
+
 /** The patch out of the patch script's output: decoded, secrets masked, cut at 64 KB. */
 export function parsePatch(output: string): { patch: string; truncated: boolean } | null {
   const m = /^@@PATCH (\S*)$/m.exec(output);
   if (!m) return null;
   const raw = fromB64(m[1]).toString("utf8");
-  const redacted = String(redactPublicJson(raw) ?? "");
+  const redacted = maskCredentialText(raw);
   const clipped = clipBytes(redacted, PATCH_MAX_BYTES);
   // The script reads a little more than the limit, so "more than the limit" is known.
   return { patch: clipped.text, truncated: clipped.cut || Buffer.byteLength(raw, "utf8") > PATCH_MAX_BYTES };

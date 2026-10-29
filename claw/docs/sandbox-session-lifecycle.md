@@ -253,7 +253,7 @@ GET /v1/sessions/:id/changes
                     files: [ { path, status: "M"|"A"|"D"|"R"|"?", additions, deletions, binary } ] } ] }
 
 GET /v1/sessions/:id/changes?repo=<path>&file=<path>
--> 200 { ok, patch, truncated }       one file's unified diff, at most 64 KB, credentials masked
+-> 200 { ok, patch, truncated }       one file's unified diff, at most 64 KB, credentials masked (token shapes, and the value after a credential-named variable, flag or field)
 ```
 
 - **Every git work tree under `/workspace`, up to two levels down** (`node_modules`, `.skills` and `.cache` are
