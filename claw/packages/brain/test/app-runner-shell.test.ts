@@ -195,8 +195,9 @@ test("many starts at once launch the application once: the start command seriali
   const env = { APP_STATE_DIR: w.stateDir };
   const results = await Promise.all(Array.from({ length: 12 }, () => w.exec(cmd, env)));
   const words = results.map((r) => r.stdout.trim());
-  assert.equal(words.filter((x) => x === "started").length, 1, words.join(","));
-  assert.ok(words.every((x) => ["started", "busy", "already"].includes(x)), words.join(","));
+  const said = [words.join(","), ...results.map((r) => r.stderr.trim()).filter(Boolean)].join(" | ");
+  assert.equal(words.filter((x) => x === "started").length, 1, said);
+  assert.ok(words.every((x) => ["started", "busy", "already"].includes(x)), said);
   pids.push(w.readPid());
   assert.equal((await linesOnceWritten(`${w.stateDir}/starts.txt`)).length, 1, "one process, not several");
   stopApp(w.readPid());
@@ -281,6 +282,41 @@ test("a live lock of this sandbox still says busy", async () => {
   const out = await w.exec(startCommand(MANIFEST, w.stateDir, generationTag("wl-1", 0)));
   assert.equal(out.stdout.trim(), "busy");
   assert.equal(existsSync(`${w.stateDir}/app.pid`), false, "nothing was started");
+});
+
+test("a lock released between the failed create and the read is asked for again, never 'broken'", async () => {
+  // Twelve starts at once reach this on a busy machine: a contender fails to create the lock, and the holder
+  // finishes before the contender has read whose it was. It reads nothing, and "nothing judged stale" must
+  // not later license `rm -rf` of the lock, which by then can be another contender's fresh one -- two
+  // processes inside the critical section, two applications started. The two commands below stand in for
+  // the timing: `readlink` finds the lock already released, and `rm` finds the lock re-taken the moment
+  // before it removes it. Neither is reached on the path that asks again.
+  const w = realWorld("sleep 30");
+  const { mkdirSync, mkdtempSync: mkShim, writeFileSync, symlinkSync, chmodSync, readFileSync: read } = await import("node:fs");
+  mkdirSync(w.stateDir, { recursive: true });
+  symlinkSync(`${process.pid}|wl-1`, `${w.stateDir}/.start.lock`);
+  const shims = mkShim(join(tmpdir(), "c2-03b-shims-"));
+  workdirs.push(shims);
+  const shim = (name: string, body: string) => {
+    writeFileSync(`${shims}/${name}`, `#!/bin/sh\nPATH="$ORIG_PATH"\n${body}\nexec ${name} "$@"\n`);
+    chmodSync(`${shims}/${name}`, 0o755);
+  };
+  shim("readlink", `if [ "$1" = .start.lock ] && [ ! -e "$SHIM_DIR/released" ]; then : > "$SHIM_DIR/released"; rm -f .start.lock; fi`);
+  shim("rm", [
+    'for a in "$@"; do',
+    '  if [ "$a" = .start.lock ] && [ ! -e .start.lock ] && [ ! -L .start.lock ]; then',
+    '    echo "removed an absent lock" >> "$SHIM_DIR/log"; ln -s "$HOLDER|wl-1" .start.lock',
+    "  fi",
+    "done",
+  ].join("\n"));
+  const origPath = process.env.PATH ?? "";
+  const out = await w.exec(startCommand(MANIFEST, w.stateDir, generationTag("wl-1", 0)), {
+    PATH: `${shims}:${origPath}`, ORIG_PATH: origPath, SHIM_DIR: shims, HOLDER: String(process.pid),
+  });
+  const log = existsSync(`${shims}/log`) ? read(`${shims}/log`, "utf8") : "";
+  assert.equal(log, "", "nothing was removed on the strength of a read that found no lock");
+  assert.equal(out.stdout.trim(), "started", out.stderr);
+  pids.push(Number(readFileSync(`${w.stateDir}/app.pid`, "utf8")));
 });
 
 test("starting a new generation removes the previous generation's exit.json; an already-running one keeps it", async () => {
