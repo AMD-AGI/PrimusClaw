@@ -23,6 +23,7 @@ import {
 } from "../workspace/s3-uploader.js";
 import { invalidateSyncManifest } from "../workspace/sync-delta.js";
 import { syncWorkspace, restoreWorkspace } from "../workspace/sync.js";
+import { SIGTERM_PROBE_TIMEOUT_SEC, gitReportKey, type GitReport } from "../workspace/git-dirs.js";
 import {
   workspaceSyncSemaphore,
   workspaceSigtermSyncSemaphore,
@@ -1166,8 +1167,8 @@ class TaskRunner {
   private lastSyncAt = 0;
   private pendingSync: Promise<unknown> | null = null;
   private lastSyncedTurn = 0; // updated post-sync; gates has_workspace_sync KV bit
-  /** The repository note the user was last shown in this run; see announceGitSkipped. */
-  private lastGitNote: string | undefined;
+  /** What the user was last told about repositories in this run (gitReportKey); see announceGitSkipped. */
+  private lastGitKey: string | undefined;
   /** Monotonic write counter; see CheckpointEnvelope.seq. */
   private checkpointSeq = 0;
   private lastWrittenSeq = 0;
@@ -1333,13 +1334,15 @@ class TaskRunner {
    * The event is the only place they can learn that commits in it will not survive
    * the sandbox. Both ways the workspace is saved report it -- the S3 sync that ends
    * a run, and the shared-disk sync after a checkpoint -- and the second runs every
-   * turn, so a note is said when it changes and not again while it stays the
-   * same. Once a sync leaves nothing out the next one that does is news again.
+   * turn, so what is said is which repositories were left out and why, once: not
+   * again while that stays the same, though the sizes in the sentence move with
+   * every turn. Once a sync leaves nothing out the next one that does is news again.
    * A sync that left nothing out says nothing.
    */
-  private async announceGitSkipped(git: { unmeasured: boolean; note: string } | undefined): Promise<void> {
-    if (!git) { this.lastGitNote = undefined; return; }
-    if (git.note === this.lastGitNote) return;
+  private async announceGitSkipped(git: GitReport | undefined): Promise<void> {
+    if (!git) { this.lastGitKey = undefined; return; }
+    const key = gitReportKey(git);
+    if (key === this.lastGitKey) return;
     await this.onEvent({
       type: "sandboxStatus",
       status: "workspace_git_skipped",
@@ -1348,7 +1351,7 @@ class TaskRunner {
       message_id: this.messageId,
     });
     // Only once it went out: an event the stream refused is tried again next turn.
-    this.lastGitNote = git.note;
+    this.lastGitKey = key;
   }
 
   /**
@@ -3106,9 +3109,11 @@ class TaskRunner {
       );
     } else {
       logger.info({ sessionId: this.sessionId, messageId: this.messageId }, "s3.sync_start");
+      let syncedGit: GitReport | undefined;
       try {
         const r = await fx().syncWorkspaceToS3(hands, this.sessionId, this.request.user_id || "default");
         syncOk = !r.exhausted && !r.empty;
+        syncedGit = r.git;
         if (r.empty) {
           await this.onEvent({
             type: "sandboxStatus",
@@ -3128,9 +3133,6 @@ class TaskRunner {
             message_id: this.messageId,
           });
         }
-        // Independent of the above: a sync can land and still have left a
-        // repository behind.
-        await this.announceGitSkipped(r.git);
       } catch (e: unknown) {
         const errMsg = (e as { message?: string })?.message
           ? String((e as { message: string }).message).slice(0, 500)
@@ -3155,6 +3157,13 @@ class TaskRunner {
         // surface the artifacts captured at the last checkpoint window.
         await this.recoverInflightCheckpoint("from_inflight_checkpoint");
       }
+      // Independent of the above: a sync can land and still have left a repository
+      // behind. Outside the try on purpose: the upload succeeded, and an event the
+      // stream refused must not turn it into the failure above, whose recovery
+      // copies an older in-flight checkpoint over the files just uploaded.
+      await this.announceGitSkipped(syncedGit).catch((e: unknown) => {
+        logger.warn({ err: e, sessionId: this.sessionId }, "s3.git_skipped_event_failed");
+      });
       if (BRAIN_WORKSPACE_SNAPSHOT_ENABLED && this.messageId && syncOk) {
         try { await fx().archiveRunToS3(this.sessionId, this.request.user_id || "default", this.messageId); } catch (e) {
           logger.warn({ err: e, sessionId: this.sessionId, messageId: this.messageId }, "s3.archive_failed");
@@ -3421,8 +3430,12 @@ class TaskRunner {
       if (!syncedFlag && this.hands) {
         const hands = this.hands;
         try {
+          // The measurement of the repositories is capped like the shared-disk SIGTERM
+          // sync's: with the shared disk unset, which is the default, this is the
+          // only sync a SIGTERM runs, and its budget cannot hold a long one.
           const r = await fx().syncWorkspaceToS3(
             hands, this.sessionId, this.userIdForSync,
+            { gitProbeTimeoutSec: SIGTERM_PROBE_TIMEOUT_SEC },
           );
           if (!r.empty) {
             sigtermSyncResult = r.exhausted ? "timeout" : "success";

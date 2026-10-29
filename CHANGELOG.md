@@ -190,10 +190,12 @@ record it.
   per file) is left out, and the run emits a `workspace_git_skipped` sandbox event that names it.
   A workspace's repositories are also bounded together (`WORKSPACE_GIT_TOTAL_MAX_BYTES`, 1 GiB, and
   `WORKSPACE_GIT_TOTAL_MAX_FILES`, 10000; the largest go first), and both snapshot destinations
-  emit the event. If the sandbox cannot measure a repository (`WORKSPACE_GIT_PROBE_TIMEOUT_SEC`,
-  default 60; 8 on a SIGTERM sync) the rest of the workspace is still saved: S3 does not prune that
-  repository's objects and keeps its upload delta, and the shared-disk sync carries the previous
-  snapshot's copy of it forward instead of dropping it. `WORKSPACE_GIT_MAX_BYTES=0` restores the old behaviour. A restore recreates the
+  emit the event, once per change of which repositories were left out and why. A repository left
+  out of a sync (over a bound, or one the sandbox cannot measure within
+  `WORKSPACE_GIT_PROBE_TIMEOUT_SEC`, default 60; 8 on a SIGTERM sync) keeps the copy the last
+  snapshot held: S3 does not prune its objects, and the shared-disk sync carries it forward. The
+  rest of the workspace is still saved and S3 keeps its upload delta. A `find` that only met an
+  unreadable directory no longer counts as an unfinished measurement. `WORKSPACE_GIT_MAX_BYTES=0` restores the old behaviour. A restore recreates the
   empty `refs/` and `objects/` directories an object store cannot hold, the file list and zip
   download hide `.git`, per-message archives do not copy it, and the resume hint no longer tells
   the model its commits are gone.

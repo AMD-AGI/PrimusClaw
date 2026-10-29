@@ -27,7 +27,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, truncateSync, writeFileSync,
+  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, truncateSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
@@ -71,7 +71,8 @@ const { SYNC_STATE_DIR } = await import("../src/workspace/sync-delta.js");
 const { syncWorkspace, classifySyncFailure } = await import("../src/workspace/sync.js");
 const {
   SIGTERM_PROBE_TIMEOUT_SEC, buildGitProbeCommand, buildGitSkeletonCommand, decideGit, ensureGitSkeleton,
-  gitPruneExempt, gitSkipNote, parseGitProbe, planGit, restoredGitDirs, unmeasuredGit,
+  enforceListedGit, gitPruneExempt, gitReport, gitReportKey, gitSkipNote, parseGitProbe, planGit,
+  restoredGitDirs, unmeasuredGit,
 } = await import("../src/workspace/git-dirs.js");
 const { s3Excludes } = await import("../src/workspace/excludes.js");
 import type { HandsClient } from "../src/clients/hands.js";
@@ -190,7 +191,31 @@ test("unmeasuredGit: a repository nobody could measure is the same situation as 
   for (const [label, d, expected] of rows) assert.equal(unmeasuredGit(d), expected, label);
 });
 
-test("gitPruneExempt: spares what was not measured and nothing else", () => {
+test("gitReportKey: the same repositories left out for the same reasons are the same news, whatever their sizes", () => {
+  const lim: GitLimits = { ...DEFAULT_LIMITS, totalBytes: FAR, totalFiles: FAR };
+  const at = (mb: number, over = "/workspace/big/.git") => gitReport(
+    { mode: "keep", skipped: [{ path: over, bytes: mb * 1024 * 1024, files: 5, reason: "too_large" }] }, lim, "/workspace",
+  )!;
+  assert.notEqual(at(351).note, at(353).note, "the sentence moves with the size");
+  assert.equal(gitReportKey(at(351)), gitReportKey(at(353)));
+  assert.notEqual(gitReportKey(at(351)), gitReportKey(at(351, "/workspace/other/.git")), "another repository is news");
+
+  const twoWays = (order: boolean) => gitReport({
+    mode: "keep",
+    skipped: [
+      { path: "/workspace/a/.git", bytes: 1e9, files: 1, reason: "too_large" as const },
+      { path: "/workspace/b/.git", bytes: 1, files: 9e3, reason: "too_many_files" as const },
+    ][order ? "slice" : "reverse"](),
+  }, lim, "/workspace")!;
+  assert.equal(gitReportKey(twoWays(true)), gitReportKey(twoWays(false)), "not the order the sandbox listed them in");
+
+  const reason = gitReport({ mode: "keep", skipped: [{ path: "/workspace/big/.git", bytes: 1, files: 9e3, reason: "too_many_files" }] }, lim, "/workspace")!;
+  assert.notEqual(gitReportKey(at(351)), gitReportKey(reason), "the same repository for another reason is news");
+  const probe = gitReport({ mode: "drop-all", why: "unmeasured" }, lim, "/workspace")!;
+  assert.notEqual(gitReportKey(probe), gitReportKey(at(351)));
+});
+
+test("gitPruneExempt: spares what this sync left out, whatever the reason, and nothing else", () => {
   const probeFailed = gitPruneExempt({ mode: "drop-all", why: "unmeasured" }, "/workspace");
   assert.equal(probeFailed("proj/.git/HEAD"), true);
   assert.equal(probeFailed(".git/objects/ab/cd"), true, "the workspace's own repository");
@@ -198,14 +223,22 @@ test("gitPruneExempt: spares what was not measured and nothing else", () => {
   assert.equal(probeFailed("proj/src/a.ts"), false, "an ordinary file is pruned as ever");
   assert.equal(probeFailed("proj/.gitignore"), false, "named like one, is not one");
 
-  const one = gitPruneExempt(
-    decideGit({ ok: true, dirs: [repo("it's", -1, 3), repo("other", 10, 3), repo("big", 1e9, 3)] }, LIMITS),
-    "/workspace",
-  );
-  assert.equal(one("it's/.git/HEAD"), true);
-  assert.equal(one("other/.git/HEAD"), false, "a repository that was measured is pruned like any other");
-  assert.equal(one("big/.git/HEAD"), false, "one known to be too big is left out on purpose, and its old copy goes");
-  assert.equal(one("it's2/.git/HEAD"), false, "the exemption is a directory, not a prefix of a name");
+  const d = decideGit({
+    ok: true,
+    dirs: [
+      repo("it's", -1, 3), repo("other", 10, 3), repo("big", 1e9, 3), repo("many", 10, 50),
+      repo("t1", 10, 8), repo("t2", 10, 7),
+    ],
+  }, { ...LIMITS, totalFiles: 15 });
+  const out = gitPruneExempt(d, "/workspace");
+  assert.equal(out("it's/.git/HEAD"), true, "could not be read");
+  assert.equal(out("big/.git/HEAD"), true, "over the byte bound: its last good copy is what a reclaimed sandbox needs");
+  assert.equal(out("many/.git/HEAD"), true, "over the file bound: the project that was just `git add`ed");
+  assert.equal(out("t1/.git/HEAD"), true, "the largest, dropped for the total");
+  assert.equal(out("t2/.git/HEAD"), false, "carried, so its listing decides");
+  assert.equal(out("other/.git/HEAD"), false, "a repository that was measured and carried is pruned like any other");
+  assert.equal(out("it's2/.git/HEAD"), false, "the exemption is a directory, not a prefix of a name");
+  assert.equal(out("big/src/a.ts"), false, "and only its .git, not the working tree beside it");
   assert.equal(gitPruneExempt({ mode: "drop-all", why: "disabled" }, "/workspace")("proj/.git/HEAD"), false);
 });
 
@@ -220,7 +253,11 @@ test("parseGitProbe: what it accepts and what it refuses to believe", () => {
     ["a value find could not read", probeOutput(["-1 -1 " + hex("/workspace/a/.git")]), "ok"],
     ["no opening fence", `${ok("/workspace/a/.git")}\n${END}:0`, "no_begin_fence"],
     ["no closing fence", `${BEGIN}\n${ok("/workspace/a/.git")}`, "no_end_fence"],
-    ["find exited non-zero", probeOutput([ok("/workspace/a/.git")], 1), "find_exit_1"],
+    // 1 is `find` reporting a directory it could not read or a file that went away
+    // while it walked: not about git, and not a walk that stopped.
+    ["find met something unreadable", probeOutput([ok("/workspace/a/.git")], 1), "ok"],
+    ["find was killed", probeOutput([ok("/workspace/a/.git")], 137), "find_exit_137"],
+    ["find failed outright", probeOutput([ok("/workspace/a/.git")], 2), "find_exit_2"],
     ["Hands says it dropped output", `${probeOutput([])}\n[stdout truncated; 4096 bytes dropped]`, "output_truncated"],
     ["a stray line", probeOutput(["hello", ok("/workspace/a/.git")]), "unexpected_line"],
     ["a path outside the workspace", probeOutput([ok("/etc/.git")]), "path_outside_workspace"],
@@ -251,25 +288,28 @@ test("gitSkipNote: says which repository, why, and what it costs", () => {
   const many = { path: "/workspace/many/.git", bytes: 1, files: 3412, reason: "too_many_files" as const };
   const lim: GitLimits = { ...DEFAULT_LIMITS, totalBytes: 1024 * 1024 * 1024, totalFiles: 10_000 };
 
-  assert.equal(gitSkipNote([], false, lim), null, "nothing left out and nothing unmeasured: nothing to say");
+  assert.equal(gitSkipNote([], false, lim, "/workspace"), null, "nothing left out and nothing unmeasured: nothing to say");
 
-  const note = gitSkipNote([big, many], false, lim)!;
+  const note = gitSkipNote([big, many], false, lim, "/workspace")!;
   assert.match(note, /big\/\.git \(412 MB, limit 300 MB\)/);
   assert.match(note, /many\/\.git \(3412 files, limit 2000; git gc packs them\)/);
-  assert.match(note, /commits that were not pushed are lost: push them first/);
+  assert.match(note, /^Not saved this time: /);
+  assert.match(note, /What was saved of them before is kept, but commits made since are not: if the sandbox restarts they are lost, so push them first\.$/);
 
-  assert.match(gitSkipNote([], true, lim)!, /Could not measure the git repositories/);
-  assert.match(gitSkipNote([], true, lim)!, /what was saved before was kept/, "it says what happens to the saved copy");
+  assert.match(gitSkipNote([], true, lim, "/workspace")!, /Could not measure the git repositories in \/workspace, so none were saved this time/);
+  // Names a repository relative to whatever the workspace root is, not to "/workspace".
+  assert.match(gitSkipNote([{ ...big, path: "/srv/ws/a/b/.git" }], true, lim, "/srv/ws")!, /Not saved this time: a\/b\/\.git \(412 MB/);
+  assert.match(gitSkipNote([], true, lim, "/srv/ws")!, /repositories in \/srv\/ws,/);
 
   const together = { path: "/workspace/clone/.git", bytes: 2 * 1024 * 1024, files: 400, reason: "over_total_files" as const };
-  assert.match(gitSkipNote([together], false, lim)!, /clone\/\.git \(400 files; together the repositories are over 10000 files\)/);
+  assert.match(gitSkipNote([together], false, lim, "/workspace")!, /clone\/\.git \(400 files; together the repositories are over 10000 files\)/);
   const heavy = { ...together, reason: "over_total_bytes" as const };
-  assert.match(gitSkipNote([heavy], false, lim)!, /clone\/\.git \(2 MB; together the repositories are over 1024 MB\)/);
+  assert.match(gitSkipNote([heavy], false, lim, "/workspace")!, /clone\/\.git \(2 MB; together the repositories are over 1024 MB\)/);
   const unknown = { ...together, bytes: -1, reason: "unmeasured" as const };
-  assert.match(gitSkipNote([unknown], false, lim)!, /clone\/\.git \(size unknown; the copy saved before was kept\)/);
+  assert.match(gitSkipNote([unknown], false, lim, "/workspace")!, /clone\/\.git \(size unknown\)/);
 
   const lots = Array.from({ length: 5 }, (_, i) => ({ ...big, path: `/workspace/r${i}/.git` }));
-  assert.match(gitSkipNote(lots, false, lim)!, /r0\/\.git.*r2\/\.git \(412 MB, limit 300 MB\); and 2 more\./);
+  assert.match(gitSkipNote(lots, false, lim, "/workspace")!, /r0\/\.git.*r2\/\.git \(412 MB, limit 300 MB\); and 2 more\./);
 });
 
 // ── A sandbox stand-in ──────────────────────────────────────────────────
@@ -398,6 +438,51 @@ test("planGit counts files, not lines: a name with newlines in it is one file", 
 
   const d = await planGit(sb.client, "/workspace", s3Excludes(), LIMITS);
   assert.deepEqual(d, { mode: "keep", skipped: [] });
+});
+
+test("the measurement is one walk of each repository: its bytes are those of its files, and its files are counted", async () => {
+  const sb = new Sandbox();
+  sb.put("r/.git/HEAD", "x".repeat(10));
+  sb.put("r/.git/objects/pack/p.pack", "y".repeat(20));
+  sb.put("r/.git/objects/ab/ee\nodd", "z".repeat(5)); // a name with a newline is one file
+  const p = parseGitProbe(await sb.client.callTool("bash", { command: buildGitProbeCommand("/workspace", s3Excludes()) }), "/workspace");
+  assert.deepEqual(p.ok && p.dirs, [{ path: "/workspace/r/.git", bytes: 35, files: 3 }]);
+
+  const empty = new Sandbox();
+  mkdirSync(join(empty.root, "e/.git"), { recursive: true });
+  const e = parseGitProbe(await empty.client.callTool("bash", { command: buildGitProbeCommand("/workspace", s3Excludes()) }), "/workspace");
+  assert.deepEqual(e.ok && e.dirs, [{ path: "/workspace/e/.git", bytes: 0, files: 0 }], "a repository with nothing in it is measured as empty");
+});
+
+// A directory nobody can read is a fact about the tree, not about git; root reads
+// everything, so these only mean something as another user.
+const NOT_ROOT = { skip: process.getuid?.() === 0 ? "root can read every directory" : false };
+
+test("an unreadable directory elsewhere in the workspace does not make the repositories unmeasured", NOT_ROOT, async () => {
+  const sb = new Sandbox();
+  sb.put("proj/.git/HEAD", "ref: refs/heads/main\n");
+  sb.put("locked/inside.txt", "x\n");
+  chmodSync(join(sb.root, "locked"), 0o000);
+  try {
+    const d = await planGit(sb.client, "/workspace", s3Excludes(), LIMITS);
+    assert.deepEqual(d, { mode: "keep", skipped: [] }, "find exited 1 over `locked`, and the repository is measured all the same");
+  } finally {
+    chmodSync(join(sb.root, "locked"), 0o755);
+  }
+});
+
+test("a repository with an unreadable corner of its own is unmeasured, and only that one", NOT_ROOT, async () => {
+  const sb = new Sandbox();
+  sb.put("bad/.git/HEAD", "ref: refs/heads/main\n");
+  sb.put("bad/.git/secret/x", "x\n");
+  sb.put("good/.git/HEAD", "ref: refs/heads/main\n");
+  chmodSync(join(sb.root, "bad/.git/secret"), 0o000);
+  try {
+    const d = await planGit(sb.client, "/workspace", s3Excludes(), LIMITS);
+    assert.deepEqual(d.mode === "keep" && d.skipped.map((x) => [x.path, x.reason]), [["/workspace/bad/.git", "unmeasured"]]);
+  } finally {
+    chmodSync(join(sb.root, "bad/.git/secret"), 0o755);
+  }
 });
 
 test("planGit: a path the command line cannot carry is 'could not measure', not a guess", async () => {
@@ -561,7 +646,7 @@ test("a measurement that works prunes a repository the user deleted", async () =
   assert.deepEqual(inBucket(), ["proj/src/a.ts"]);
 });
 
-test("one repository whose size cannot be read keeps its saved copy; the others are pruned as ever", async () => {
+test("a repository that is left out keeps its saved copy, whatever the reason; the others are pruned as ever", async () => {
   const sb = new Sandbox();
   sb.put("odd/.git/HEAD", "ref: refs/heads/main\n");
   sb.put("fine/.git/HEAD", "ref: refs/heads/main\n");
@@ -570,7 +655,7 @@ test("one repository whose size cannot be read keeps its saved copy; the others 
   saved(
     "odd/.git/HEAD", "odd/.git/refs/heads/main", // the repository `du` could not read
     "fine/.git/HEAD", "fine/.git/refs/heads/topic", // measured, and the branch is gone from it
-    "huge/.git/HEAD", // measured, and over the bound: left out on purpose
+    "huge/.git/HEAD", "huge/.git/objects/pack/old.pack", // measured, and over the bound this time
   );
   sb.probeReply = probeOutput([
     `-1 -1 ${hex("/workspace/odd/.git")}`,
@@ -582,15 +667,155 @@ test("one repository whose size cannot be read keeps its saved copy; the others 
 
   assert.deepEqual(
     inBucket(),
-    ["fine/.git/HEAD", "odd/.git/HEAD", "odd/.git/refs/heads/main"],
-    "the unreadable one is kept whole; the measured ones are judged by what the listing has",
+    [
+      "fine/.git/HEAD", "huge/.git/HEAD", "huge/.git/objects/pack/old.pack", "odd/.git/HEAD", "odd/.git/refs/heads/main",
+    ],
+    "what is left out of this sync is kept as it was saved; the measured ones are judged by what the listing has",
   );
-  assert.equal(r.git?.unmeasured, true, "the user is told, and the event says it was a measurement problem");
+  assert.equal(r.git?.unmeasured, true, "the user is told, and the event says part of it was a measurement problem");
   assert.deepEqual(r.git?.skipped.map((x) => [x.path, x.reason]).sort(), [
     ["/workspace/huge/.git", "too_large"], ["/workspace/odd/.git", "unmeasured"],
   ]);
   assert.ok(sb.uploadedSet.has("fine/src.txt"));
-  assert.deepEqual([...sb.uploadedSet].filter((p) => p.startsWith("odd/.git")), []);
+  assert.deepEqual([...sb.uploadedSet].filter((p) => p.startsWith("odd/.git") || p.startsWith("huge/.git")), []);
+});
+
+test("a project that outgrows the file bound keeps the history it had when it was small", async () => {
+  // The scenario: the agent `git add`s a big project, the loose objects take the
+  // repository past the bound, and the next sync leaves it out. Deleting what was
+  // saved of it would leave a reclaimed sandbox with files and no history at all,
+  // when the last good copy was right there.
+  const sb = new Sandbox();
+  for (let i = 0; i < 12; i++) sb.put(`proj/.git/objects/o${i}`, "o\n");
+  sb.put("proj/.git/HEAD", "ref: refs/heads/main\n");
+  sb.put("proj/src.txt", "s\n");
+  saved("proj/.git/HEAD", "proj/.git/refs/heads/main", "proj/old-file.txt");
+
+  const r = await sb.sync(LIMITS);
+
+  assert.deepEqual(r.git?.skipped.map((x) => [x.path, x.reason]), [["/workspace/proj/.git", "too_many_files"]]);
+  assert.deepEqual(inBucket(), ["proj/.git/HEAD", "proj/.git/refs/heads/main"], "the saved history stays, a file the user deleted does not");
+  assert.deepEqual([...sb.uploadedSet].filter((p) => p.includes(".git/")), []);
+});
+
+test("a repository that grew after it was measured is held to the file bound by the listing", async () => {
+  // The measurement and the listing are two calls with the agent working between
+  // them. Here the measurement says three files and the listing finds twelve, which
+  // is a thousand PUTs when it is a clone: the upload is built from the listing, so
+  // that is where the bound is applied again.
+  const sb = new Sandbox();
+  for (let i = 0; i < 12; i++) sb.put(`grown/.git/objects/o${i}`, "o\n");
+  sb.put("small/.git/HEAD", "ref: refs/heads/main\n");
+  sb.put("src.txt", "s\n");
+  saved("grown/.git/HEAD");
+  sb.probeReply = probeOutput([
+    `10 3 ${hex("/workspace/grown/.git")}`,
+    `10 1 ${hex("/workspace/small/.git")}`,
+  ]);
+
+  const r = await sb.sync(LIMITS);
+
+  assert.deepEqual([...sb.uploadedSet].filter((p) => p.startsWith("grown/")), [], "none of it goes up");
+  assert.ok(sb.uploadedSet.has("small/.git/HEAD") && sb.uploadedSet.has("src.txt"));
+  assert.deepEqual(r.git?.skipped.map((x) => [x.path, x.reason]), [["/workspace/grown/.git", "too_many_files"]]);
+  assert.match(r.git!.note, /grown\/\.git \(12 files, limit 10/);
+  assert.deepEqual(inBucket(), ["grown/.git/HEAD"], "and the copy saved before is kept, like any repository left out");
+});
+
+test("enforceListedGit: counts what the listing holds, drops whole repositories, and says nothing when all is well", () => {
+  const files = (root: string, n: number): string[] =>
+    Array.from({ length: n }, (_, i) => `/workspace/${root}/.git/objects/o${i}`);
+  const keep = { mode: "keep" as const, skipped: [] };
+
+  const fine = enforceListedGit([...files("a", 3), "/workspace/a/x.txt"], keep, LIMITS);
+  assert.equal(fine.decision, keep, "the same decision object: nothing was dropped, nothing changed");
+  assert.equal(fine.files.length, 4);
+
+  const grown = enforceListedGit([...files("a", 3), ...files("g", 11), "/workspace/g/x.txt"], keep, LIMITS);
+  assert.deepEqual(grown.files, [...files("a", 3), "/workspace/g/x.txt"], "the working tree beside it stays");
+  assert.deepEqual(
+    grown.decision.mode === "keep" && grown.decision.skipped.map((s) => [s.path, s.reason, s.files]),
+    [["/workspace/g/.git", "too_many_files", 11]],
+  );
+
+  // The total, across repositories that are each within the bound.
+  const total = enforceListedGit([...files("a", 8), ...files("b", 6), ...files("c", 4)], keep, { ...LIMITS, totalFiles: 12 });
+  assert.deepEqual(
+    total.decision.mode === "keep" && total.decision.skipped.map((s) => [s.path, s.reason]),
+    [["/workspace/a/.git", "over_total_files"]],
+  );
+
+  // What was already left out keeps its reason, and what is not carried is not counted.
+  const prior = { mode: "keep" as const, skipped: [{ path: "/workspace/z/.git", bytes: 1e9, files: 1, reason: "too_large" as const }] };
+  const both = enforceListedGit(files("g", 11), prior, LIMITS);
+  assert.deepEqual(
+    both.decision.mode === "keep" && both.decision.skipped.map((s) => s.reason),
+    ["too_large", "too_many_files"],
+  );
+
+  // A decision that carries no repository has nothing to hold the listing to.
+  const off = { mode: "drop-all" as const, why: "disabled" as const };
+  assert.equal(enforceListedGit(files("g", 99), off, LIMITS).decision, off);
+});
+
+test("a workspace that holds nothing but a repository left out still tells the user about it", async () => {
+  // The listing never saw the repository, so what it found is nothing, and the
+  // result says empty; the one thing that explains it is the report.
+  const sb = new Sandbox();
+  for (let i = 0; i < 12; i++) sb.put(`proj/.git/objects/o${i}`, "o\n");
+
+  const r = await sb.sync(LIMITS);
+
+  assert.equal(r.empty, true);
+  assert.deepEqual(r.git?.skipped.map((x) => x.reason), ["too_many_files"]);
+});
+
+test("a repository the listing itself drops is not an empty workspace", async () => {
+  // Measured small, listed large (it grew in between): the listing is not empty, the
+  // upload is, and that is a sync that landed with nothing to put.
+  const sb = new Sandbox();
+  for (let i = 0; i < 12; i++) sb.put(`proj/.git/objects/o${i}`, "o\n");
+  sb.probeReply = probeOutput([`10 3 ${hex("/workspace/proj/.git")}`]);
+  saved("proj/.git/HEAD");
+
+  const r = await sb.sync(LIMITS);
+
+  assert.equal(r.empty, false);
+  assert.equal(r.uploaded, 0);
+  assert.deepEqual(r.git?.skipped.map((x) => x.reason), ["too_many_files"]);
+  assert.deepEqual(inBucket(), ["proj/.git/HEAD"]);
+});
+
+test("a measurement whose find only met something unreadable still measures", async () => {
+  const sb = new Sandbox();
+  sb.put("proj/.git/HEAD", "ref: refs/heads/main\n");
+  sb.put("proj/src.txt", "s\n");
+  // Exit status 1: `find` could not read some directory unrelated to git, as a
+  // directory made by a root-owned container is. That used to make every
+  // repository "unmeasured" and stop any `.git` being saved again for the session.
+  sb.probeReply = probeOutput([`10 1 ${hex("/workspace/proj/.git")}`], 1);
+
+  const r = await sb.sync();
+
+  assert.equal(r.git, undefined, "measured, small, and carried: nothing to tell");
+  assert.ok(sb.uploadedSet.has("proj/.git/HEAD"));
+});
+
+test("the git measurement is given the budget the caller has", async () => {
+  const sb = new Sandbox();
+  sb.put("proj/src.txt", "s\n");
+  const timeouts: unknown[] = [];
+  const inner = sb.client.callTool.bind(sb.client);
+  (sb.client as unknown as { callTool: unknown }).callTool = async (tool: string, args: Record<string, unknown>) => {
+    if (String(args.command).includes(BEGIN)) timeouts.push(args.timeout);
+    return inner(tool, args);
+  };
+
+  await syncWorkspaceToS3(sb.client, "sess-git", "user-1", { gitLimits: LIMITS });
+  await syncWorkspaceToS3(sb.client, "sess-git", "user-1", { gitLimits: LIMITS, gitProbeTimeoutSec: SIGTERM_PROBE_TIMEOUT_SEC });
+
+  assert.deepEqual(timeouts, [60, SIGTERM_PROBE_TIMEOUT_SEC],
+    "a SIGTERM sync with the shared disk unset is an S3 sync, and its budget has no room for a minute");
 });
 
 test("many small repositories are held to a limit of their own, largest first", async () => {

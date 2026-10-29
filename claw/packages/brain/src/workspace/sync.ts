@@ -443,7 +443,7 @@ export async function syncWorkspace(
     const size = Number(meta.size_bytes ?? 0);
     const inodes = Number(meta.inode_count ?? 0);
     const durationMs = Date.now() - t0;
-    const report = gitReport(git, limits);
+    const report = gitReport(git, limits, SANDBOX_WORKSPACE);
     metrics.onWorkspaceSync(kind, size, durationMs / 1000);
     logger.info(
       {

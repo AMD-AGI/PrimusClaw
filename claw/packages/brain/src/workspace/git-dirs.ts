@@ -33,6 +33,7 @@
  */
 import pino from "pino";
 import { withHandsTimeout, type HandsClient } from "../clients/hands.js";
+import { TRUNCATED_FOOTER, shq } from "./sync-delta.js";
 import {
   WORKSPACE_GIT_MAX_BYTES,
   WORKSPACE_GIT_MAX_FILES,
@@ -89,9 +90,12 @@ export interface GitSkip extends GitDirMeasure {
  *     rest of the workspace is synced as usual -- a repository nobody can measure
  *     is not a reason for every other file to stop being saved.
  *
- * One repository whose own size could not be read (`skipped` with reason
- * `unmeasured`) is the same situation for that repository alone, and is treated
- * the same way: see `unmeasuredGit`.
+ * A repository in `skipped` -- over a bound, or one whose own size could not be
+ * read -- is left out of this sync and nothing more. It is not a repository the
+ * user deleted, so whatever the last sync that carried it saved is kept, the same
+ * way: see `gitPruneExempt` and `gitCarryCommand`. Otherwise one `git add` that
+ * pushes a project over a bound would delete the whole saved history of it, and
+ * the last good snapshot is exactly what a reclaimed sandbox needs.
  */
 export type GitDecision =
   | { mode: "keep"; skipped: GitSkip[] }
@@ -111,9 +115,6 @@ export function configuredGitLimits(): GitLimits {
 
 // ── Quoting ─────────────────────────────────────────────────────────────
 
-/** POSIX single-quoting, which carries every byte but NUL. */
-export const shq = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
-
 /** A literal path as a `find -path` pattern, which reads `* ? [ \` as syntax. */
 const globEscape = (s: string): string => s.replace(/[\\*?[]/g, "\\$&");
 
@@ -132,7 +133,6 @@ const PROBE_BEGIN = "__claw_git_begin__";
 const PROBE_END = "__claw_git_end__";
 const PROBE_END_LINE = new RegExp(`^${PROBE_END}:(\\d+)$`);
 const PROBE_LINE = /^(-?\d+) (-?\d+) ([0-9a-f]+)$/;
-const TRUNCATED_FOOTER = /^\[stdout truncated; \d+ bytes dropped\]$/;
 /** What the measurement gets when the sync is a SIGTERM's: its budget has no room for more. */
 export const SIGTERM_PROBE_TIMEOUT_SEC = 8;
 /** Beyond the sandbox's own deadline, for the call to come back; if it does not, the answer is the same. */
@@ -144,14 +144,23 @@ const PROBE_CALL_SLACK_SEC = 2;
  *
  * The path is hex because it is a name the agent chose and may hold anything,
  * newlines included, and the line has to stay a line. For the same reason files
- * are counted as the NULs of a `-print0`, not as lines: a name with newlines in it
- * is one file, and counting lines would let a few of them make a small repository
- * look like thousands of files and be left out. The search does not enter
- * the directories the snapshot drops anyway (a `node_modules` full of vendored
- * `.git` directories is not this step's business), and does not enter a `.git`
- * it has found. The exit status is the search's own, via pipefail: a `find` that
- * walked only part of the tree has not seen every repository, and the unseen one
- * would be uploaded without ever having been measured.
+ * are counted by `-printf '%s\n'`, one line per file whatever its name is made of:
+ * a name with newlines in it is one file, and counting a listing of names by lines
+ * would let a few of them make a small repository look like thousands of files
+ * and be left out. One `find` per repository gives both numbers, the bytes of the
+ * regular files in it (what an upload reads) and how many there are (what an
+ * upload pays for). The outer search does not enter the directories the snapshot
+ * drops anyway (a `node_modules` full of vendored `.git` directories is not this
+ * step's business), and does not enter a `.git` it has found.
+ *
+ * What the exit status of the outer search says: 0 and 1 are a walk that ran to
+ * its end -- 1 is `find` reporting something it could not read or a file that
+ * vanished under it (a build running beside the sync), which is a fact about
+ * unrelated corners of the tree and not about git. A repository inside a
+ * directory nobody can read is not one the snapshot could have copied either.
+ * Anything else, or no end fence at all, is a walk that did not finish, and the
+ * repository it never reached would be uploaded without ever having been measured.
+ * A repository whose own `find` fails is reported as `-1 -1`: unmeasured.
  *
  * Run through `bash <<EOF` for the same reason the sync script is: the sandbox's
  * shell is dash, which has neither `pipefail` nor `read -d`.
@@ -163,10 +172,9 @@ set -o pipefail
 echo ${PROBE_BEGIN}
 find ${shq(workspace)} \\( ${prune} \\) -prune -o -type d -name ${shq(GIT_DIR)} -prune -print0 2>/dev/null \\
   | while IFS= read -r -d '' g; do
-      b=$(du -sb -- "$g" 2>/dev/null | awk '{print $1; exit}')
-      n=$(find "$g" -type f -print0 2>/dev/null | tr -cd '\\0' | wc -c | tr -d ' ')
+      if m=$(find "$g" -type f -printf '%s\\n' 2>/dev/null | awk '{ s += $1; n++ } END { printf "%.0f %d\\n", s, n }'); then :; else m="-1 -1"; fi
       h=$(printf '%s' "$g" | od -An -v -tx1 | tr -d ' \\n')
-      echo "\${b:--1} \${n:--1} $h"
+      echo "$m $h"
     done
 rc=$?
 echo ${PROBE_END}:$rc
@@ -199,7 +207,7 @@ export function parseGitProbe(raw: string, workspace: string): GitProbe {
     if (m) { end = i; rc = Number(m[1]); break; }
   }
   if (end < 0) return { ok: false, reason: "no_end_fence" };
-  if (rc !== 0) return { ok: false, reason: `find_exit_${rc}` };
+  if (rc !== 0 && rc !== 1) return { ok: false, reason: `find_exit_${rc}` };
 
   const dirs: GitDirMeasure[] = [];
   for (const line of lines.slice(begin + 1, end)) {
@@ -258,13 +266,54 @@ export function decideGit(probe: GitProbe, limits: GitLimits): GitDecision {
 }
 
 /**
- * Whether this sync could not see some repository it should have, as opposed to
- * having seen it and found it too big.
+ * Hold the listing an upload is about to be built from to the file bounds again.
  *
- * Absence from this sync's listing means "the user deleted it" only for a
- * repository that was measured. For one that was not, the saved copy has to
- * outlive the sync, so every consumer asks this one question rather than each
- * keeping its own reading of `drop-all` and `skipped`.
+ * The measurement and the listing are two calls, and the agent keeps working
+ * between them: a `.git` that was created or grown after it was measured is in the
+ * listing and not in the decision. For the upload the cost of that is one request
+ * per file, and the listing is the one thing that says exactly how many there are,
+ * so the per-repository and the total file bounds are applied to what it holds. A
+ * repository that is over after all is dropped whole, as if it had been measured
+ * over: it joins `skipped`, and so its saved copy is kept like any other's.
+ *
+ * Bytes are not in a listing, so the byte bounds stay with the measurement; a
+ * repository that grew past one since is caught by the next sync's.
+ */
+export function enforceListedGit(
+  files: readonly string[],
+  d: GitDecision,
+  limits: GitLimits,
+): { files: string[]; decision: GitDecision } {
+  const unchanged = { files: [...files], decision: d };
+  if (d.mode !== "keep") return unchanged;
+  const rootOf = (f: string): string | null => {
+    const at = f.indexOf(`/${GIT_DIR}/`);
+    return at < 0 ? null : f.slice(0, at + 1 + GIT_DIR.length);
+  };
+  const counts = new Map<string, number>();
+  for (const f of files) {
+    const root = rootOf(f);
+    if (root) counts.set(root, (counts.get(root) ?? 0) + 1);
+  }
+  const dirs = [...counts].map(([path, n]) => ({ path, bytes: 0, files: n }));
+  const over = decideGit(
+    { ok: true, dirs },
+    { ...limits, maxBytes: Infinity, totalBytes: Infinity },
+  );
+  const extra = over.mode === "keep" ? over.skipped : [];
+  if (!extra.length) return unchanged;
+  const dropped = new Set(extra.map((s) => s.path));
+  return {
+    files: files.filter((f) => !dropped.has(rootOf(f) ?? "")),
+    decision: { mode: "keep", skipped: [...d.skipped, ...extra] },
+  };
+}
+
+/**
+ * Whether this sync could not see some repository it should have, as opposed to
+ * having seen it and found it too big. This is what the user is told ("could not
+ * measure"); what is done about it is `gitPruneExempt` and `gitCarryCommand`, which
+ * also cover the repositories that were seen and left out.
  */
 export function unmeasuredGit(d: GitDecision): boolean {
   if (d.mode === "drop-all") return d.why === "unmeasured";
@@ -276,12 +325,18 @@ export const hasGitComponent = (rel: string): boolean => rel.split("/").includes
 
 /**
  * Which paths (relative to the workspace) the prune of a saved snapshot must leave
- * alone: those of a repository this sync could not measure. Everything else is
- * pruned as before, so one unmeasurable repository does not freeze the rest.
+ * alone: those of a repository this sync left out. Absence from the listing means
+ * "the user deleted it" only for a repository that was in the listing's view; one
+ * that was too big this time, or could not be measured, is absent because of the
+ * sync, and its saved copy is the last good one. Everything else is pruned as
+ * before, so one repository that is left out does not freeze the rest.
+ *
+ * Not for `disabled`: an operator who turned `.git` snapshots off asked for what
+ * the old behaviour did, which is not to keep them.
  */
 export function gitPruneExempt(d: GitDecision, workspace: string): (rel: string) => boolean {
   if (d.mode === "drop-all") return d.why === "unmeasured" ? hasGitComponent : () => false;
-  const roots = d.skipped.filter((s) => s.reason === "unmeasured").map((s) => `${relTo(workspace, s.path)}/`);
+  const roots = d.skipped.map((s) => `${relTo(workspace, s.path)}/`);
   return (rel) => roots.some((r) => rel.startsWith(r));
 }
 
@@ -369,13 +424,13 @@ export function gitTarArgs(d: GitDecision, workspace: string): string {
 }
 
 /**
- * The shared-disk script's step for a repository it could not measure: keep what
- * the previous snapshot holds.
+ * The shared-disk script's step for a repository this sync left out: keep what the
+ * previous snapshot holds.
  *
  * A snapshot is built into an empty `pending/` and swapped in, so a repository the
- * copy leaves out is gone from the next `current/` -- for "too big" that is the
- * point, for "could not tell" it is the user's unpushed history deleted by a slow
- * `du`. So the copy of each such repository in `current/` is hard-linked into
+ * copy leaves out is gone from the next `current/` -- which is the user's unpushed
+ * history deleted by a slow `du`, or by one `git add` that took a project past a
+ * bound. So the copy of each such repository in `current/` is hard-linked into
  * `pending/` (a repository is one whole directory or nothing, so a failed link
  * falls back to a copy and a failed copy to nothing, never half of one).
  *
@@ -403,11 +458,10 @@ if [ -d "$BASE/current" ]; then
     | while IFS= read -r -d '' g; do carry_git "$g"; done || true
 fi`;
   }
-  const unmeasured = d.skipped.filter((s) => s.reason === "unmeasured");
-  if (!unmeasured.length) return "";
+  if (!d.skipped.length) return "";
   return `${fn}
 if [ -d "$BASE/current" ]; then
-${unmeasured.map((s) => `  carry_git ${shq(relTo(workspace, s.path))}`).join("\n")}
+${d.skipped.map((s) => `  carry_git ${shq(relTo(workspace, s.path))}`).join("\n")}
 fi`;
 }
 
@@ -422,14 +476,16 @@ const NOTE_LISTED = 3;
  *
  * Plain words and the consequence, because the sync event is the only place the
  * user can find out: a repository that is not saved comes back after a sandbox
- * restart as a folder of files without history, and unpushed commits are gone.
+ * restart as it was last saved, if it ever was, and unpushed commits made since
+ * are gone.
  */
 export function gitSkipNote(
   skipped: readonly GitSkip[],
   unmeasured: boolean,
   limits: GitLimits,
+  workspace: string,
 ): string | null {
-  const rel = (p: string): string => p.replace(/^\/workspace\//, "");
+  const rel = (p: string): string => relTo(workspace, p);
   const what = (s: GitSkip): string => {
     if (s.reason === "too_large") return `${rel(s.path)} (${mb(s.bytes)}, limit ${mb(limits.maxBytes)})`;
     if (s.reason === "too_many_files") {
@@ -441,24 +497,21 @@ export function gitSkipNote(
     if (s.reason === "over_total_bytes") {
       return `${rel(s.path)} (${mb(s.bytes)}; together the repositories are over ${mb(limits.totalBytes)})`;
     }
-    return `${rel(s.path)} (size unknown; the copy saved before was kept)`;
+    return `${rel(s.path)} (size unknown)`;
   };
   const sentences: string[] = [];
   if (skipped.length) {
     const shown = skipped.slice(0, NOTE_LISTED).map(what).join("; ");
     const more = skipped.length > NOTE_LISTED ? `; and ${skipped.length - NOTE_LISTED} more` : "";
-    sentences.push(`Not saved: ${shown}${more}.`);
+    sentences.push(`Not saved this time: ${shown}${more}.`);
   }
   if (unmeasured) {
-    sentences.push(
-      "Could not measure the git repositories in /workspace, so what was saved before was kept "
-      + "and anything committed since was not saved this time.",
-    );
+    sentences.push(`Could not measure the git repositories in ${workspace}, so none were saved this time.`);
   }
   if (!sentences.length) return null;
   sentences.push(
-    "A repository that is not saved comes back as plain files after the sandbox restarts, "
-    + "and commits that were not pushed are lost: push them first.",
+    "What was saved of them before is kept, but commits made since are not: "
+    + "if the sandbox restarts they are lost, so push them first.",
   );
   return sentences.join(" ");
 }
@@ -473,11 +526,21 @@ export interface GitReport {
 }
 
 /** The report for a decision, or undefined when there is nothing to tell. */
-export function gitReport(d: GitDecision, limits: GitLimits): GitReport | undefined {
+export function gitReport(d: GitDecision, limits: GitLimits, workspace: string): GitReport | undefined {
   const skipped = d.mode === "keep" ? d.skipped : [];
   const probeFailed = d.mode === "drop-all" && d.why === "unmeasured";
-  const note = gitSkipNote(skipped, probeFailed, limits);
+  const note = gitSkipNote(skipped, probeFailed, limits, workspace);
   return note ? { skipped, unmeasured: unmeasuredGit(d), note } : undefined;
+}
+
+/**
+ * What a report is about, apart from the figures in its sentence: which
+ * repositories were left out and why. A repository 350 MB over a 300 MB bound that
+ * grows a few MB a turn has a different sentence every turn and the same news, so
+ * "have I already said this" compares this and not the text.
+ */
+export function gitReportKey(r: GitReport): string {
+  return `${r.unmeasured ? "unmeasured" : "measured"}|${r.skipped.map((s) => `${s.path}:${s.reason}`).sort().join("|")}`;
 }
 
 // ── Restoring ───────────────────────────────────────────────────────────

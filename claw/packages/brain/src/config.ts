@@ -979,8 +979,8 @@ export const WORKSPACE_RESTORE_TIMEOUT_MS = envInt("WORKSPACE_RESTORE_TIMEOUT_MS
 
 // A workspace snapshot carries each repository's `.git` (so unpushed commits
 // survive a sandbox that is reclaimed and rebuilt from it), unless that one
-// directory is over either bound: then it is left out whole and the user is told
-// (workspace/git-dirs.ts). Bytes bound what Hands has to hold in memory to upload
+// directory is over either bound: then it is left out whole, the user is told, and
+// the copy saved of it before is kept (workspace/git-dirs.ts). Bytes bound what Hands has to hold in memory to upload
 // a pack; files bound what each sync pays, since the upload is one PUT per file.
 // WORKSPACE_GIT_MAX_BYTES=0 stops carrying `.git` at all, the old behaviour.
 //

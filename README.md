@@ -251,11 +251,11 @@ at all: a `.git` over `WORKSPACE_GIT_MAX_BYTES` (default 300 MiB) or
 workspace's repositories once they add up to more than
 `WORKSPACE_GIT_TOTAL_MAX_BYTES` (1 GiB) or `WORKSPACE_GIT_TOTAL_MAX_FILES` (10000).
 Either snapshot destination reports it in a `workspace_git_skipped` sandbox event; push
-before leaving such a repository. A sandbox that cannot measure its repositories in
-`WORKSPACE_GIT_PROBE_TIMEOUT_SEC` (default 60) does not stop the sync: the rest of the
-workspace is saved and each repository keeps the copy the last snapshot held. Git's own
-lock and temporary files are not carried. `WORKSPACE_GIT_MAX_BYTES=0` turns `.git`
-snapshots off.
+before leaving such a repository. A repository left out of a sync, or one the sandbox
+cannot measure in `WORKSPACE_GIT_PROBE_TIMEOUT_SEC` (default 60; 8 on a SIGTERM sync),
+does not stop the sync and does not lose its history: the rest of the workspace is saved
+and that repository keeps the copy the last snapshot held. Git's own lock and temporary
+files are not carried. `WORKSPACE_GIT_MAX_BYTES=0` turns `.git` snapshots off.
 
 ## Key Environment Variables
 

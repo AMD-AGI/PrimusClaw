@@ -715,7 +715,7 @@ for (const noRsync of [false, true]) {
     }
   });
 
-  test(`X14b (${how}) one repository that could not be measured is carried; its neighbours are what the workspace has`, () => {
+  test(`X14b (${how}) a repository left out of the sync keeps its saved copy; its neighbours are what the workspace has`, () => {
     const ctx = setup();
     try {
       for (const n of ["odd", "fine", "huge"]) {
@@ -737,8 +737,12 @@ for (const noRsync of [false, true]) {
       const exists = (rel: string): boolean => existsSync(join(ctx.base, "current", rel));
       assert.equal(snapshotFile(ctx, "odd/.git/HEAD"), "ref: refs/heads/old\n", "kept as it was saved");
       assert.equal(snapshotFile(ctx, "fine/.git/HEAD"), "ref: refs/heads/new\n", "measured, so copied as it is now");
-      assert.ok(!exists("huge/.git"), "known to be too big: left out on purpose, and its old copy goes with it");
+      assert.equal(
+        snapshotFile(ctx, "huge/.git/HEAD"), "ref: refs/heads/old\n",
+        "over the bound this time: not copied, and the last good copy is not thrown away for it",
+      );
       assert.ok(exists("huge/f.txt"));
+      assert.equal(snapshotFile(ctx, "huge/f.txt"), "v1\n");
     } finally {
       cleanup(ctx);
     }
