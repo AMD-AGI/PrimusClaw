@@ -22,12 +22,13 @@
  * with a clear error instead of being sent to a Router that would answer 401.
  */
 
-/** Read per request, so a test can flip it; the environment sets it at boot. */
-export const sandboxAdminSettings = { routerAuth: SANDBOX_ROUTER_AUTH_ENABLED };
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { authErrorPayload, getUser } from "../auth/middleware.js";
 import { isAdmin, type UserInfo } from "../auth/models.js";
 import { SANDBOX_ADMIN_URL, SANDBOX_ROUTER_AUTH_ENABLED } from "../config.js";
+
+/** Read per request, so a test can flip it; the environment sets it at boot. */
+export const sandboxAdminSettings = { routerAuth: SANDBOX_ROUTER_AUTH_ENABLED };
 
 const UPSTREAM_TIMEOUT_MS = 10_000;
 const MAX_LIMIT = 1000;
