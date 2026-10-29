@@ -102,6 +102,9 @@ func TestWorkloadObjectUsesTemplateResources(t *testing.T) {
 	if labels["excluded-nodes"] != "node-a node-b" {
 		t.Fatalf("customerLabels=%v", labels)
 	}
+	if obj.GetAnnotations()[nodesAffinityAnnotation] != nodesAffinityPreferred {
+		t.Fatalf("annotations=%v", obj.GetAnnotations())
+	}
 }
 
 func TestCreateWorkloadWaitsForPod(t *testing.T) {

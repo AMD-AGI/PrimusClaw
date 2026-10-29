@@ -44,11 +44,14 @@ const (
 	grantIDLabel               = "agent-sandbox.io/grant-id"
 	sandboxIDLabel             = "agent-sandbox.io/sandbox-id"
 	grantAttestationAnnotation = "agent-sandbox.io/grant-attestation"
-	workloadEphemeralStorage   = "50Gi"
-	workloadPriority           = int64(2)
-	workloadTTLSeconds         = int64(10)
-	envdPort                   = 8080
-	e2bSandboxPrefix           = "sbx-"
+	// nodesAffinityAnnotation asks SaFE to treat excluded-nodes as a preference.
+	nodesAffinityAnnotation  = "primus-safe.nodes.affinity"
+	nodesAffinityPreferred   = "preferred"
+	workloadEphemeralStorage = "50Gi"
+	workloadPriority         = int64(2)
+	workloadTTLSeconds       = int64(10)
+	envdPort                 = 8080
+	e2bSandboxPrefix         = "sbx-"
 	// platformInferenceKey is not copied onto a grant sandbox.
 	platformInferenceKey = "OPENAI_API_KEY"
 	// startupEnv is a shell snippet the Sandbox template evals before exec envd.
@@ -753,6 +756,9 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 	}
 	if req.Attestation != "" {
 		annotations[grantAttestationAnnotation] = req.Attestation
+	}
+	if strings.TrimSpace(req.AvoidNodes) != "" {
+		annotations[nodesAffinityAnnotation] = nodesAffinityPreferred
 	}
 	obj := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": workloadAPIVersion,

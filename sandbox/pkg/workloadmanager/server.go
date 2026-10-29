@@ -186,17 +186,28 @@ func (s *Server) Record(ctx context.Context, event *audit.AuditEvent) {
 }
 
 // ReclaimSession deletes the sandbox for a session because its grant ended.
-// A missing session is already reclaimed.
+// An E2B Workload is deleted by its sandbox id first, including one that is
+// still pending and has no session record. A missing session is already reclaimed.
 func (s *Server) ReclaimSession(ctx context.Context, sessionID string) error {
 	if sessionID == "" {
 		return nil
 	}
+	deletedWorkload := false
+	if s.workloads != nil && strings.HasPrefix(sessionID, e2bSandboxPrefix) {
+		if err := s.workloads.Delete(ctx, sessionID); err != nil {
+			return err
+		}
+		deletedWorkload = true
+	}
 	info, err := s.store.GetSandboxBySessionID(ctx, sessionID)
-	if errors.Is(err, store.ErrNotFound) {
+	if errors.Is(err, store.ErrNotFound) || (err != nil && deletedWorkload) {
 		return nil
 	}
 	if err != nil {
 		return err
+	}
+	if deletedWorkload && info.Kind == store.WorkloadKind {
+		return s.store.DeleteSandboxBySessionID(ctx, sessionID)
 	}
 	return s.deleteSandboxAndSession(ctx, info, audit.ReasonGrantReclaim)
 }

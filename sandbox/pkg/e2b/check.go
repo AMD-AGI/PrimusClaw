@@ -35,7 +35,7 @@ const nodeNameMetadata = metadataPrefix + "node-name"
 // sameNodeMetadata is set only when the pod landed on a node the caller asked to avoid.
 const sameNodeMetadata = metadataPrefix + "same-node"
 
-// avoidNodesMetadata lists nodes the workload must not run on.
+// avoidNodesMetadata lists nodes the workload prefers not to run on.
 const avoidNodesMetadata = metadataPrefix + "avoid-nodes"
 
 // callerMetadataKeys may be set by the SDK under agent-sandbox.io/.
@@ -218,7 +218,8 @@ func contains(list []string, want string) bool {
 }
 
 // excludedNodesLabel is the space-separated node list stored on a Workload
-// as customerLabels excluded-nodes, the same value the Workload API writes.
+// as customerLabels excluded-nodes. With nodes.affinity=preferred, SaFE treats
+// that list as a scheduling preference.
 func excludedNodesLabel(raw string) string {
 	parts := strings.FieldsFunc(raw, func(r rune) bool {
 		return r == ',' || r == ';' || r <= ' '

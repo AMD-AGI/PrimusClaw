@@ -169,6 +169,27 @@ func TestAdoptStoresTimeoutAndRunningSession(t *testing.T) {
 	}
 }
 
+func TestReclaimSessionDeletesPendingWorkload(t *testing.T) {
+	st := store.NewMemoryStore()
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "amd.com/v1",
+		"kind":       "Workload",
+		"metadata":   map[string]any{"name": "sbx-1"},
+		"status":     map[string]any{"phase": "Pending"},
+	}}
+	dc := dynfake.NewSimpleDynamicClientWithCustomListKinds(k8sruntime.NewScheme(), map[schema.GroupVersionResource]string{
+		workloadGVR: "WorkloadList",
+	}, obj)
+	srv := New(Config{Namespace: "ns"}, st).WithSafeWorkloads(NewSafeWorkloadCreator(dc, nil))
+	if err := srv.ReclaimSession(context.Background(), "sbx-1"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := dc.Resource(workloadGVR).Get(context.Background(), "sbx-1", metav1.GetOptions{})
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("workload remains: %v", err)
+	}
+}
+
 func TestCreateDropsPlaceholderWhenContextIsCanceled(t *testing.T) {
 	base := store.NewMemoryStore()
 	ctx, cancel := context.WithCancel(context.Background())
