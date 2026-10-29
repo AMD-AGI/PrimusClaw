@@ -38,6 +38,17 @@ func TestParseClusterRoutes(t *testing.T) {
 	}
 }
 
+func TestRemoteClusterIDsSkipsOwnCluster(t *testing.T) {
+	s := &Server{}
+	if err := s.ConfigureDataPlane(" global ", "global=https://g.example,crusoe=https://c.example", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	ids := s.RemoteClusterIDs()
+	if len(ids) != 1 || ids[0] != "crusoe" {
+		t.Fatalf("ids=%v", ids)
+	}
+}
+
 func TestDataPlaneHopForwardsToClusterRouter(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	token := "sat-hop"

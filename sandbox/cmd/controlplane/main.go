@@ -403,36 +403,11 @@ func main() {
 		apiServer.WithK8s(k8s)
 	}
 	apiServer.WithSafeWorkloads(workloads)
-	if routes, err := router.ParseClusterRoutes(os.Getenv(router.EnvClusterRoutes)); err == nil {
-		ids := make([]string, 0, len(routes))
-		for id := range routes {
-			if id != os.Getenv(router.EnvClusterID) {
-				ids = append(ids, id)
-			}
-		}
-		workloads.SetRemoteClusters(ids)
-	}
-
-	grants, err := startGrants(ctx, mgr.GetClient(), mgr.GetAPIReader(), clientset, dynamicClient, apiServer, st, workloads, wmCfg.Namespace)
-	if err != nil {
-		log.Error("grant service init failed", "error", err)
-		os.Exit(1)
-	}
 
 	routerServer, err := router.New(ctx, routerCfg, st, clientset)
 	if err != nil {
 		log.Error("router init failed", "error", err)
 		os.Exit(1)
-	}
-	if grants != nil {
-		routerServer.WithGrants(grants)
-		plane := e2b.New(e2b.Options{
-			Grants:    grants,
-			Runner:    apiServer,
-			Namespace: grant.Namespace(wmCfg.Namespace),
-		})
-		grants.SetPromoter(plane)
-		apiServer.WithE2B(plane)
 	}
 	if err := routerServer.ConfigureDataPlane(
 		os.Getenv(router.EnvClusterID),
@@ -442,6 +417,24 @@ func main() {
 	); err != nil {
 		log.Error("dataplane route config failed", "error", err)
 		os.Exit(1)
+	}
+	workloads.SetRemoteClusters(routerServer.RemoteClusterIDs())
+
+	grants, err := startGrants(ctx, mgr.GetClient(), mgr.GetAPIReader(), clientset, dynamicClient, apiServer, st, workloads, wmCfg.Namespace)
+	if err != nil {
+		log.Error("grant service init failed", "error", err)
+		os.Exit(1)
+	}
+
+	if grants != nil {
+		routerServer.WithGrants(grants)
+		plane := e2b.New(e2b.Options{
+			Grants:    grants,
+			Runner:    apiServer,
+			Namespace: grant.Namespace(wmCfg.Namespace),
+		})
+		grants.SetPromoter(plane)
+		apiServer.WithE2B(plane)
 	}
 
 	// Sandbox health watcher — exposes pod health as Prometheus metrics

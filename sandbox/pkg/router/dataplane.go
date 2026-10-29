@@ -70,6 +70,17 @@ func (s *Server) ConfigureDataPlane(clusterID, routesRaw, upstreamPEM string, po
 	return nil
 }
 
+// RemoteClusterIDs returns the configured route ids other than this cluster.
+func (s *Server) RemoteClusterIDs() []string {
+	ids := make([]string, 0, len(s.dp.routes))
+	for id := range s.dp.routes {
+		if id != s.dp.clusterID {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
 // ParseClusterRoutes parses "id=url" pairs. An empty string is an empty table.
 func ParseClusterRoutes(raw string) (map[string]string, error) {
 	out := map[string]string{}
