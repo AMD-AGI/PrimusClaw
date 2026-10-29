@@ -252,6 +252,22 @@ describe("the A2A context/task model", { skip }, () => {
       assert.equal(executes.length, 0);
     });
 
+    test("a retry of a message that named no context is that message's task, even in the middle of its run", async () => {
+      const m = msg("lost answer");
+      const call = () => rpc("SendMessage", { message: m, configuration: { returnImmediately: true } });
+      const a = (await call()).json.result.task;
+      executes.length = 0;
+      const [b, c] = (await Promise.all([call(), call()])).map((r) => r.json.result.task);
+      assert.equal(b.id, a.id);
+      assert.equal(c.id, a.id);
+      assert.equal(b.contextId, a.contextId, "in the context it was started in");
+      assert.equal(executes.length, 0, "nothing runs twice");
+      assert.equal((await query("SELECT COUNT(*)::int AS n FROM claw_tasks WHERE metadata->>'message_id' = $1", [m.messageId])).rows[0].n, 1);
+      who = BOB;
+      const theirs = (await rpc("SendMessage", { message: m, configuration: { returnImmediately: true } })).json.result.task;
+      assert.notEqual(theirs.id, a.id, "another caller's message with the same id is theirs");
+    });
+
     test("the same contextId from another caller is another context", async () => {
       const mine = await send("a", { contextId: "ctx-shared-name" });
       who = BOB;

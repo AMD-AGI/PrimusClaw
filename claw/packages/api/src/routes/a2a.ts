@@ -700,6 +700,30 @@ async function admitAndOpenA2AContextSend(
 ): Promise<ContextAdmission> {
   const settled = await withOwnedAdmissionLock(async (client): Promise<ContextAdmission> => {
     if (spec.parentSessionId) await assertParentWritable(spec.parentSessionId, auth, client);
+    // A message that names no context mints one, so the pair check inside the
+    // context cannot see a retry of it. The retry of a send whose answer was lost
+    // is the same message: it is that run, wherever it ran. Serialised on the
+    // message, so two copies sent at once start one run.
+    if (!message.contextId) {
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        [JSON.stringify(["a2a-message", callerId, message.messageId])],
+      );
+      const sent = (await client.query(
+        `SELECT t.task_id, t.session_id, s.context_id
+           FROM claw_tasks t JOIN claw_sessions s ON s.session_id = t.session_id
+          WHERE t.origin = 'a2a' AND s.a2a_caller_id = $1 AND s.deleted_at IS NULL
+            AND t.metadata->>'message_id' = $2
+          ORDER BY t.created_at DESC LIMIT 1`,
+        [callerId, message.messageId],
+      )).rows?.[0] as { task_id: string; session_id: string; context_id: string } | undefined;
+      if (sent) {
+        return {
+          kind: "duplicate", taskId: sent.task_id,
+          target: { taskId: sent.session_id, contextId: sent.context_id, created: false },
+        };
+      }
+    }
     const existing = (await client.query(
       "SELECT session_id FROM claw_sessions WHERE a2a_caller_id = $1 AND context_id = $2 AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1",
       [callerId, contextId],
@@ -767,7 +791,9 @@ async function openContextRun(input: OpenRunInput<A2AAuthContext>): Promise<Cont
       };
     }
     case "duplicate":
-      return { kind: "duplicate", sessionId: admitted.target.taskId, contextId, taskId: admitted.taskId };
+      return {
+        kind: "duplicate", sessionId: admitted.target.taskId, contextId: admitted.target.contextId, taskId: admitted.taskId,
+      };
     default:
       return admitted;
   }
