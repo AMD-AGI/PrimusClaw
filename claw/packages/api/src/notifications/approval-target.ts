@@ -23,8 +23,11 @@ const SCAN_MAX = 20_000;
 const MAX_FIELDS = 6;
 const VALUE_MAX = 80;
 
-const NAME_WITH_SECRET = /\b([A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|APIKEY|API_KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIALS?)[A-Za-z0-9_]*)(\s*=\s*)("[^"]*"|'[^']*'|\S+)/gi;
-const SECRET_FLAG = /(\s--?(?:token|password|passwd|secret|api[-_]?key|access[-_]?key|auth(?:orization)?|bearer)(?:=|\s+))("[^"]*"|'[^']*'|\S+)/gi;
+// A credential's name, as a word that may sit inside a longer one (`--kube-token`, `MY_API_KEY`).
+// `author` is not one, though it begins with the letters.
+const SECRET_WORDS = "(?:token|password|passwd|passphrase|secret|credentials?|api[-_]?key|access[-_]?key|private[-_]?key|auth(?!or)|bearer|cookie)";
+const NAME_WITH_SECRET = new RegExp(`\\b([A-Za-z0-9_]*${SECRET_WORDS}[A-Za-z0-9_]*)(\\s*=\\s*)("[^"]*"|'[^']*'|\\S+)`, "gi");
+const SECRET_FLAG = new RegExp(`(\\s--?[A-Za-z0-9_-]*${SECRET_WORDS}[A-Za-z0-9_-]*(?:=|\\s+))("[^"]*"|'[^']*'|\\S+)`, "gi");
 const BASIC_AUTH_FLAG = /(\s(?:-u|--user|--proxy-user)(?:=|\s+))("[^":]*:[^"]*"|'[^':]*:[^']*'|[^\s:]+:\S+)/g;
 const PASSWORD_FIELD = /(["']?(?:password|passwd|secret|token|api_?key)["']?\s*:\s*)("[^"]*"|'[^']*')/gi;
 

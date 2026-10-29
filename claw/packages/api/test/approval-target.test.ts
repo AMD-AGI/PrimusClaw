@@ -22,6 +22,15 @@ const SECRET_COMMANDS: Array<[string, string, string]> = [
   ["a --token flag", "tool --token abc123def456 run", "abc123def456"],
   ["a --token=value flag", "kubectl --token=abcdef123456 get pods", "abcdef123456"],
   ["a --password flag", "mysql --password hunter2 -e 'select 1'", "hunter2"],
+  ["a qualified token flag with a separate value", "helm --kube-token hunter2 upgrade prod ./chart", "hunter2"],
+  ["a qualified token flag with =", "kubectl --kube-token=abcdef123456 get pods", "abcdef123456"],
+  ["an api-key flag with a prefix", "tool --my-api-key abcdef123456 run", "abcdef123456"],
+  ["a secret-access-key flag", "aws --secret-access-key wJalrXUtnFEMI s3 ls", "wJalrXUtnFEMI"],
+  ["an oauth bearer flag", "curl --oauth2-bearer abc123def https://x.example.invalid", "abc123def"],
+  ["a short qualified flag", "tool -x-token=abc987 run", "abc987"],
+  ["a quoted flag value with spaces", "tool --client-secret 'a b c' run", "a b c"],
+  ["a cookie variable", "COOKIE=sessionid123 curl https://x.example.invalid", "sessionid123"],
+  ["an auth variable", "MY_AUTH=zzz555 ./run", "zzz555"],
   ["a bearer header", "curl -H 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123' https://x.example.invalid", "abcdefghijklmnopqrstuvwxyz0123"],
   ["basic auth", "curl -u admin:hunter2 https://x.example.invalid", "hunter2"],
   ["basic auth, long form", "curl --user admin:hunter2 https://x.example.invalid", "hunter2"],
@@ -40,6 +49,18 @@ for (const [label, command, secret] of SECRET_COMMANDS) {
     assert.match(target, /redacted/i, "and says that something was masked");
   });
 }
+
+test("words that merely resemble credential names are left alone", () => {
+  for (const c of [
+    "git commit --author \"Ada L <ada@example.invalid>\" -m x",
+    "git log --authors-file x",
+    "export AUTHOR=ada",
+    "grep -rn --include '*.token' needle .",
+    "ls --all --author",
+    "tar --exclude secrets.txt -czf a.tgz .",
+    "echo the password is rotated monthly",
+  ]) assert.equal(approvalTarget("bash", { command: c }), c, c);
+});
 
 test("a command with nothing secret in it comes through as it was written, on one line", () => {
   assert.equal(approvalTarget("bash", { command: "git push origin feat/x" }), "git push origin feat/x");
@@ -108,12 +129,13 @@ test("an MCP tool: credential-looking keys keep their name and lose their value;
 });
 
 test("an MCP tool: a value under a credential-like key is masked by the key's name alone", () => {
-  // None of these values has a shape the general patterns know, and none of the
-  // names is one the command-line patterns (TOKEN, SECRET, PASSWORD, ...) match.
-  const t = approvalTarget("mcp__x__call", { cookie: "sid=abc123def", passphrase: "correct horse", authorization: "Basic YWxpY2U6cHc=", auth: "xyz987", credential: "plainvalue1" });
-  for (const secret of ["abc123def", "correct horse", "YWxpY2U6cHc=", "xyz987", "plainvalue1"]) assert.equal(t.includes(secret), false, t);
-  assert.match(t, /cookie=\[REDACTED\]/);
-  assert.match(t, /auth=\[REDACTED\]/);
+  // None of these values has a shape the general patterns know, and none of the names carries a
+  // word the command-line patterns look for (token, secret, password, ...): the key list is what masks them.
+  const t = approvalTarget("mcp__x__call", { dsn: "plain-dsn-value1", pat: "plain-pat-value2", platform_key: "plain-key-value3", connection_string: "plain-cs-value4" });
+  for (const secret of ["plain-dsn-value1", "plain-pat-value2", "plain-key-value3", "plain-cs-value4"]) assert.equal(t.includes(secret), false, t);
+  assert.match(t, /dsn=\[REDACTED\]/);
+  assert.match(t, /pat=\[REDACTED\]/);
+  assert.match(t, /platform_key=\[REDACTED\]/);
 });
 
 test("a tool that is not a string, and input that is not an object, never throw", () => {
