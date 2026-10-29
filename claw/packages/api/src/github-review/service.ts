@@ -77,8 +77,8 @@ interface Ctx {
   settings: GithubReviewSettings;
   cred: { login: string; scopes: string[]; delegation: boolean };
   client: GithubClient;
-  /** The acting user's own account may act for this requester: they are the same person, or the owner allows it. */
-  allowed: boolean;
+  /** The tool being run, as the identity provider's audit trail names the purpose of a lookup. */
+  tool: string;
   acc: {
     repo?: string; pr?: number; headSha?: string; riskReasons?: string[]; confirmationId?: string;
     write: boolean; dryRun: boolean; reviewPath?: string; reviewPathReason?: string;
@@ -269,7 +269,7 @@ export class GithubReview {
       const needsChange = Array.isArray(args.comments) && args.comments.length > 0;
       const change = needsChange ? await this.collectChange(ctx, ref, pr) : null;
       const comments = this.checkComments(args.comments, change);
-      this.requireEvent(ctx, repo, pr, event as "COMMENT" | "REQUEST_CHANGES" | "APPROVE");
+      await this.requireEvent(ctx, repo, pr, event as "COMMENT" | "REQUEST_CHANGES" | "APPROVE");
       const result = await this.writeReview(ctx, ref, pr, event, text, comments);
       return ok({ status: result.status, head_sha: headSha, ...result.detail }, (t) => ctx.client.redact(t));
     });
@@ -374,13 +374,17 @@ export class GithubReview {
         throw new Refusal("too_many_concurrent", "too many reviews of this repository are running; try again in a minute");
       }
       this.inflight.set(held, (this.inflight.get(held) ?? 0) + 1);
-      const cred = await this.credential(actor, tool);
+      const cred = await this.credential(actor.actorUserId, actor, tool, "acting");
+      // Every tool acts with the acting user's account, reads included, so every tool needs their say: the
+      // person who asked for their own account needs no one's permission, anyone else needs the owner's switch.
+      // Nothing is sent to GitHub for a refusal here, and the token is dropped unused.
+      if (actor.requesterUserId !== actor.actorUserId && !cred.delegation) {
+        throw new Refusal("delegation_off", "the acting user has not allowed others to act for them, so nothing is done with their GitHub account");
+      }
       client = new GithubClient({ token: cred.token, apiUrl: settings.apiUrl, fetchImpl: this.deps.fetchImpl });
       const ctx: Ctx = {
-        actor, settings, client, acc,
+        actor, settings, client, tool, acc,
         cred: { login: cred.providerLogin, scopes: cred.scopes, delegation: cred.delegation },
-        // The acting user deciding a confirmation for themselves needs no one's permission.
-        allowed: actor.requesterUserId === actor.actorUserId || cred.delegation,
       };
       outcome = await body(ctx, ref);
     } catch (err) {
@@ -416,21 +420,42 @@ export class GithubReview {
     return failure("internal_error", "the tool failed; nothing further was done", {}, redact);
   }
 
-  private async credential(actor: ReviewActor, tool: string): Promise<ResolvedCredential> {
+  /** One lookup at the identity provider: the acting user's credential for the call, or the requester's own when only their login is wanted. */
+  private async credential(userId: string, actor: ReviewActor, purpose: string, whose: "acting" | "requesting"): Promise<ResolvedCredential> {
+    const who = whose === "acting" ? "the acting user" : "the user who asked";
+    const prefix = whose === "acting" ? "" : "requester_";
+    const expiredRefusal = (): Refusal => new Refusal(`${prefix}credential_expired`, `${who}'s GitHub authorization has expired; they have to bind GitHub again`);
     try {
-      const cred = await this.deps.resolveCredential({
-        userId: actor.actorUserId, provider: GITHUB_PROVIDER, requesterUserId: actor.requesterUserId, purpose: tool,
-      });
-      if (cred.expiresAt !== null && cred.expiresAt <= this.now()) throw new Refusal("credential_expired", "the acting user's GitHub authorization has expired; they have to bind GitHub again");
+      const cred = await this.deps.resolveCredential({ userId, provider: GITHUB_PROVIDER, requesterUserId: actor.requesterUserId, purpose });
+      if (cred.expiresAt !== null && cred.expiresAt <= this.now()) throw expiredRefusal();
       return cred;
     } catch (err) {
       if (err instanceof Refusal) throw err;
       if (err instanceof IdentityCredentialRefusedError) {
-        if (err.code === "expired") throw new Refusal("credential_expired", "the acting user's GitHub authorization has expired; they have to bind GitHub again");
-        throw new Refusal("actor_not_bound", "the acting user has not bound a GitHub account");
+        if (err.code === "expired") throw expiredRefusal();
+        throw new Refusal(whose === "acting" ? "actor_not_bound" : "requester_not_bound", `${who} has not bound a GitHub account`);
       }
       if (err instanceof IdentityUnavailableError) throw new Refusal("identity_unavailable", "the identity service could not be asked; nothing was done");
-      throw new Refusal("identity_unavailable", "the acting user's credential could not be fetched; nothing was done");
+      throw new Refusal("identity_unavailable", `${who}'s credential could not be fetched; nothing was done`);
+    }
+  }
+
+  /**
+   * An approval, and a merge, made with someone else's account are not made for the
+   * person who wrote the pull request: that would get their own change through with
+   * no second person's review. The requester's GitHub login is looked up (only the
+   * login is kept; their token is dropped unused) and compared with the author's.
+   * A requester who has no GitHub account bound cannot be shown not to be the
+   * author, so that refuses too. The person who is the acting user is covered by the
+   * rule on their own login.
+   */
+  private async requireNotRequestersOwn(ctx: Ctx, pr: PrInfo): Promise<void> {
+    if (ctx.actor.requesterUserId === ctx.actor.actorUserId) return;
+    const cred = await this.credential(ctx.actor.requesterUserId, ctx.actor, `${ctx.tool}:requester_login`, "requesting");
+    const login = cred.providerLogin.trim().toLowerCase();
+    if (!login) throw new Refusal("requester_not_bound", "the user who asked has no GitHub login on record, so it cannot be checked that they did not write this pull request");
+    if (login === pr.authorLogin.toLowerCase()) {
+      throw new Refusal("cannot_act_for_own_pull_request", "the user who asked wrote this pull request; an approval or a merge made with another person's account would get it through without a second reviewer");
     }
   }
 
@@ -584,11 +609,11 @@ export class GithubReview {
       github_login: ctx.cred.login,
       requested_by_acting_user: own,
       acting_user_allows_others: ctx.cred.delegation,
-      may_approve_and_merge: ctx.allowed && repo.push,
+      may_approve_and_merge: repo.push,
       has_write_permission: repo.push,
-      note: ctx.allowed
-        ? (repo.push ? "approve and merge are open, subject to the gates" : "the acting user has no write permission here: comment only, and say that nothing was merged for that reason")
-        : "the acting user has not allowed others to act for them: post a comment-only review (event COMMENT) and say that nothing was approved or merged for that reason",
+      note: repo.push
+        ? "approve and merge are open, subject to the gates"
+        : "the acting user has no write permission here: comment only, and say that nothing was merged for that reason",
     };
   }
 
@@ -602,17 +627,13 @@ export class GithubReview {
 
   // ----------------------------------------------------------- reviews
 
-  private requireEvent(ctx: Ctx, repo: RepoInfo, pr: PrInfo, event: "COMMENT" | "REQUEST_CHANGES" | "APPROVE"): void {
-    if (event === "COMMENT") return;
-    if (!ctx.allowed) {
-      throw new Refusal("delegation_off", "the acting user has not allowed others to act for them, so only a comment-only review (event COMMENT) can be posted; nothing is approved or rejected for them");
+  private async requireEvent(ctx: Ctx, repo: RepoInfo, pr: PrInfo, event: "COMMENT" | "REQUEST_CHANGES" | "APPROVE"): Promise<void> {
+    if (event !== "APPROVE") return;
+    if (!repo.push) throw new Refusal("no_write_permission", `${ctx.cred.login} has no write permission on ${repo.fullName}, and an approval without it does not count; post a comment instead`);
+    if (pr.authorLogin.toLowerCase() === ctx.cred.login.toLowerCase()) {
+      throw new Refusal("cannot_approve_own_pull_request", "the acting user wrote this pull request and cannot approve it; another approver is needed");
     }
-    if (event === "APPROVE") {
-      if (!repo.push) throw new Refusal("no_write_permission", `${ctx.cred.login} has no write permission on ${repo.fullName}, and an approval without it does not count; post a comment instead`);
-      if (pr.authorLogin.toLowerCase() === ctx.cred.login.toLowerCase()) {
-        throw new Refusal("cannot_approve_own_pull_request", "the acting user wrote this pull request and cannot approve it; another approver is needed");
-      }
-    }
+    await this.requireNotRequestersOwn(ctx, pr);
   }
 
   private checkComments(raw: unknown, change: Change | null): Array<{ path: string; line: number; side: "RIGHT" | "LEFT"; body: string }> {
@@ -698,12 +719,11 @@ export class GithubReview {
       throw new Refusal("head_moved", "the confirmation was for another commit");
     }
     ctx.acc.confirmationId = opts.confirmation?.id;
-    if (!ctx.allowed) {
-      throw new Refusal("delegation_off", "the acting user has not allowed others to act for them: nothing is approved or merged");
-    }
     if (!repo.push) {
       throw new Refusal("no_merge_permission", `${ctx.cred.login} has no write permission on ${repo.fullName}: the review stands as comments and nothing was merged`);
     }
+    // Before anyone is asked to confirm, and before anything is read for the merge.
+    await this.requireNotRequestersOwn(ctx, pr);
     const method = opts.method ?? (["squash", "merge", "rebase"] as const).find((m) => repo.methods.includes(m));
     if (!method || !repo.methods.includes(method)) throw new Refusal("merge_method_not_allowed", `the repository does not allow that merge method (allowed: ${repo.methods.join(", ") || "none"})`);
 

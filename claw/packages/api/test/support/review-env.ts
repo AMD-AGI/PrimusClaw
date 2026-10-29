@@ -15,6 +15,7 @@ import { GITHUB_REVIEW_SCHEMA_SQL, type Queryable } from "../../src/github-revie
 import { FakeGithub } from "./fake-github.js";
 
 export const TOKEN = "gho_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+export const REQUESTER_TOKEN = "gho_Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i2";
 export const SECRET = "s".repeat(40);
 export const PR = "AMD-AGI/demo#7";
 
@@ -26,8 +27,8 @@ export interface ReviewEnv {
   settings: GithubReviewSettings;
   /** Every resolve the service made. */
   resolved: ResolveCredentialRequest[];
-  /** Replace what the identity provider answers. */
-  identity: { answer: () => Promise<ResolvedCredential> };
+  /** Replace what the identity provider answers; it is told who is asked about (`userId`) and for whom (`requesterUserId`). */
+  identity: { answer: (req: ResolveCredentialRequest) => Promise<ResolvedCredential> };
   actor: ReviewActor;
   sql(text: string, params?: unknown[]): Promise<Record<string, any>[]>;
   /** A copy of the settings with some environment changed, applied to the same service. */
@@ -35,8 +36,17 @@ export interface ReviewEnv {
   close(): Promise<void>;
 }
 
+/** The acting user (`bob`) has bound GitHub and lets others act for them, which most tests need; a test for the switch being off says `delegation: false`. */
 export function credential(over: Partial<ResolvedCredential> = {}): ResolvedCredential {
-  return { token: TOKEN, providerLogin: "bob", kind: "oauth", scopes: ["public_repo"], delegation: false, expiresAt: null, ...over };
+  return { token: TOKEN, providerLogin: "bob", kind: "oauth", scopes: ["public_repo"], delegation: true, expiresAt: null, ...over };
+}
+
+/**
+ * What the identity provider answers: `bob`'s credential for the acting user's id, and for anyone else
+ * (the requester, when only their login is wanted) `carol`, a different person from the pull request's author `alice`.
+ */
+export function directory(over: Partial<ResolvedCredential> = {}, requester: Partial<ResolvedCredential> = {}): (req: ResolveCredentialRequest) => Promise<ResolvedCredential> {
+  return async (req) => (req.userId === "u-bob" ? credential(over) : credential({ token: REQUESTER_TOKEN, providerLogin: "carol", ...requester }));
 }
 
 /** One engine per test file: starting one costs more than the tests that use it, so the tables are made again for each test instead. */
@@ -61,11 +71,11 @@ export async function reviewEnv(env: Record<string, string> = {}, over: { actor?
   };
   const gh = new FakeGithub();
   const resolved: ResolveCredentialRequest[] = [];
-  const identity = { answer: async (): Promise<ResolvedCredential> => credential(over.cred) };
+  const identity = { answer: directory(over.cred) };
   let current = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_MCP_SECRET: SECRET, CLAW_GITHUB_WRITES_ENABLED: "true", ...env }, true);
   const service = new GithubReview({
     settings: () => current, db, fetchImpl: gh.fetch,
-    resolveCredential: async (req) => { resolved.push(req); return identity.answer(); },
+    resolveCredential: async (req) => { resolved.push(req); return identity.answer(req); },
   });
   const actor: ReviewActor = { sessionId: "s-1", requesterUserId: "u-alice", actorUserId: "u-bob", requesterLabel: "Alice A", ...over.actor };
   return {

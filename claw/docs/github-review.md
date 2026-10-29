@@ -49,11 +49,15 @@ tool offered to a session, and `config.acting_as` is refused.
   `sha=<head>`, so GitHub refuses it too if the head moves in between.
 - **The acting user's say.** The credential is the acting user's own (`requester_user_id ==
   user_id`) or the user has allowed others to act for them (the identity provider's
-  `delegation` flag). Without that only a comment-only review (`COMMENT`) can be posted: no
-  approval, no request for changes, no merge (`delegation_off`). An approval also needs the
-  user to have write permission on the repository, and they cannot approve their own pull
-  request. Without write permission the review stands as comments and nothing is merged
-  (`no_merge_permission`).
+  `delegation` flag). Without that every tool is refused (`delegation_off`), reads and
+  comments included: the account is not used, and nothing is sent to GitHub with it. An
+  approval also needs the user to have write permission on the repository, and they cannot
+  approve their own pull request. Without write permission the review stands as comments and
+  nothing is merged (`no_merge_permission`). When the requester is someone else, an approval
+  or a merge is also refused if the requester wrote the pull request
+  (`cannot_act_for_own_pull_request`), judged by their own GitHub login (read from the
+  identity provider; their token is not used), or has no GitHub account bound
+  (`requester_not_bound`).
 - **The merge.** Everything is read again at merge time: CI is green on the **head commit**
   (every check completed and passing; a required check that never reported is missing; a pull
   request with no check at all is not green however clean GitHub calls it; an infrastructure
