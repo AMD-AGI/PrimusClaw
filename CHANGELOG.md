@@ -28,6 +28,18 @@ record it.
 ## [Unreleased]
 
 ### Added
+- A session can be bound to a repository. `POST /v1/sessions` accepts `config.repo = {url, branch?}`
+  (`url` is `https://<host>/<owner>/<name>[.git]` with no credentials, query or fragment; `branch` is a
+  plain ref name, empty meaning the remote's default; anything else is a `400` starting
+  `config.repo`). Whenever Brain opens the sandbox for such a session it makes `/workspace/<name>` a git
+  working tree before the model is asked anything: a clone when absent, only a `git fetch` when a `.git` is
+  already there (a restored snapshot: local commits, the current branch and uncommitted edits are left
+  alone), and the repository's `.git` attached beside the files when a snapshot has files but no `.git`. The
+  turn's prompt gains a `[Repository]` block and the repository's `AGENTS.md` / `CLAUDE.md` (32 KB at most,
+  cut with a marker). The sandbox's global git config gets `credential.helper = !gh auth git-credential`, so
+  `git push` works with the user's own `GH_TOKEN`, which never appears in a URL, a command line or a log. A
+  failed clone does not fail the run; the reason is in the block. A session without `config.repo` is unchanged.
+  See `claw/docs/sandbox-session-lifecycle.md`.
 - A shared identity client in `@claw/utils`, built by API and Brain when
   `IDENTITY_CLIENT_ENABLED=true` (off by default; nothing authenticates through it yet). It does OIDC
   discovery and caches the issuer's JWKS, RFC 7662 token introspection (an active answer is cached for

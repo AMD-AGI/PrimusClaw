@@ -248,3 +248,30 @@ Two owner-only routes cover this:
 - `POST /v1/sessions/:id/sandbox/keepalive` renews the claim; at most one write per session every 10 s.
 
 Both write `termhold.<session>` in the registry bucket: an absolute `until` a short time ahead (`SESSION_SANDBOX_HOLD_SECONDS`, default 300, capped by `BRAIN_REGISTRY_TTL_MS` because the bucket drops keys that are not rewritten). While it is in force, Brain's idle reclaim, the API's last-user stop and the orphan-handle sweep decline to stop the sandbox; session delete and cancel do not consult it. Nobody deletes the claim: a client that goes away stops renewing and it lapses, after which ordinary idle reclaim and the orphan sweep apply. A claim that cannot be read holds, like the other unknowns on those paths.
+
+## A session bound to a repository
+
+`POST /v1/sessions` accepts `config.repo = { "url": "https://<host>/<owner>/<name>[.git]", "branch": "<name>" }`
+(`branch` optional; empty or absent means the remote's default). Anything else under `config.repo`, a url
+with credentials, a query, a fragment, whitespace, or any path but `/<owner>/<name>`, a branch that is not a
+plain ref name, or an unknown key, is a `400` whose `error` starts with `config.repo`. The value is stored in
+`config` as sent, and every turn of the session is handed it (`ExecuteRequest.repo`), because the sandbox a
+turn runs in may be a new one.
+
+Whenever Brain opens the sandbox of a bound session it makes `/workspace/<name>` a working tree of the
+repository **before the model is asked anything**, and puts a short `[Repository]` block (path, branch, state,
+what failed) and the repository's own `AGENTS.md` / `CLAUDE.md` (at most 32 KB together, cut with a marker) at
+the end of the turn's prompt. A session with no `config.repo` opens no sandbox for this and its prompt is
+unchanged.
+
+| `/workspace/<name>` | What happens |
+|---|---|
+| absent | `git clone` into a hidden sibling, moved into place only when it is whole; with a `branch`, switched to it if the remote has it (otherwise the default branch stays and the block says so) |
+| has a `.git` (a restored snapshot, or a sandbox that is still up) | `git fetch` once per sandbox, nothing else: the branch is not switched and nothing is merged or reset, so a commit, a branch or an edit made earlier is as it was left. A `.git` whose `origin` is a different repository is left alone and reported |
+| files but no `.git` | the repository's `.git` is placed beside the files and the index rebuilt from it; the files stay and show as local changes |
+
+No token is ever put in a URL, a command line or a log. The sandbox's global git config is given
+`credential.helper = !gh auth git-credential`, which asks the `gh` the sandbox already has for the user's own
+`GH_TOKEN` at the moment git needs it, so a plain `git push` works afterwards. A clone or fetch that fails does
+not fail the run: the reason (secrets scrubbed) is written into the `[Repository]` block for the agent to
+relay. A clone has Hands' 100-second foreground limit; a repository that needs longer fails with that reason.

@@ -32,6 +32,7 @@ import { decideAdmission, withOwnedAdmissionLock } from "../tasks/admission.js";
 import { admissionAskFor } from "../tasks/run-dispatch.js";
 import { stripRunSecrets } from "../tasks/run-spec.js";
 import { sessionModelFromRow } from "./session-model.js";
+import { sessionRepoFromRow } from "./session-repo.js";
 import { applyAppMcpToTask } from "./app-mcp.js";
 import { ensureSessionWorkspace, requireWorkspaceBinding } from "../workspace/store.js";
 import pino from "pino";
@@ -332,7 +333,7 @@ export async function dispatchTaskToBrain(
       task.sandbox_only = true;
     }
     const sessionMeta = (await db.query(
-      "SELECT parent_session_id, team_role, model FROM claw_sessions WHERE session_id = $1",
+      "SELECT parent_session_id, team_role, model, config->'repo' AS repo FROM claw_sessions WHERE session_id = $1",
       [sessionId],
     )).rows[0];
     if (sessionMeta?.parent_session_id) {
@@ -347,6 +348,11 @@ export async function dispatchTaskToBrain(
     // Brain's `request.model`, so this one field is the whole of the selection.
     const sessionModel = sessionModelFromRow(sessionMeta);
     if (sessionModel) task.model = sessionModel;
+    // The repository the session is bound to, read now for the same reason: Brain
+    // sets the working tree up in whatever sandbox this turn opens, which after an
+    // idle reclaim is a new one. No field at all for a session with no binding.
+    const sessionRepo = sessionRepoFromRow(sessionMeta, sessionId);
+    if (sessionRepo) task.repo = sessionRepo;
     // Names collide unhelpfully here: `workspace_id` above is the sandbox
     // namespace, this is the files. Brain gates concurrency on it, which is
     // what makes two runs over one directory queue instead of overwriting

@@ -57,3 +57,4 @@ export * from "./app-manifest.js";
 export * from "./app-resources.js";
 export * from "./sandbox-grant.js";
 export * from "./app-sandbox-templates.js";
+export * from "./session-repo.js";
