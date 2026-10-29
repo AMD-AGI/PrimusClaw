@@ -315,6 +315,17 @@ describe("no per-step approval, by the owner's opt-in", () => {
     assert.deepEqual([c.unattended, c.unattended_allowed], [false, true], "allowed, but it still starts asking");
   });
 
+  test("a mode the owner listed as selectable but the preset does not know to ask still says unattended", async () => {
+    // Listing a mode lets a phone select it (here the file allows unsafe modes, so a preset's list may be extended); it does not make it asking.
+    const h = await make({ preset: "claude", topToml: "allow_unsafe_modes = true\n", safeModes: ["default", "plan", "acceptEdits"] });
+    const sid = await h.newSession();
+    const started = h.claw.eventsOf(sid, "session_started")[0]!;
+    assert.deepEqual(started.data.modes.map((m: any) => [m.id, m.unattended]), [["default", false], ["plan", false], ["acceptEdits", true], ["bypassPermissions", true]]);
+    h.claw.issue("set_mode", sid, { mode_id: "acceptEdits" });
+    const upd = await h.claw.until("acceptEdits", () => h.claw.eventsOf(sid, "mode_update").find((e) => e.data.currentMode === "acceptEdits"));
+    assert.equal(upd.data.unattended, true);
+  });
+
   test("a mode the owner no longer allows is not brought back by a restart", async () => {
     const h = await make(NEVER);
     const sid = await h.newSession();

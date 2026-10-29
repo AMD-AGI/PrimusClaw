@@ -31,15 +31,20 @@ export interface AgentConfig {
   roots: string[];
   /** The mode every session is forced into, and read back, before its first prompt. */
   askMode: string;
-  /** Modes in which every write and every command is asked about. A user may select these from the phone. */
+  /** Modes a user may select from the phone without the owner's opt-in: the owner's (or the preset's) list, plus the ask mode. */
   safeModes: string[];
+  /**
+   * Modes known to ask before every write and command: what the preset measured, or for a custom agent what the owner
+   * declared. A session whose mode is not in this list is unattended, whoever listed the mode as selectable.
+   */
+  askingModes: string[];
   /**
    * Whether a phone may select a mode outside `safeModes` for this agent, and whether the machine accepts an
    * adapter's warning that it will not ask. The owner's opt-in: `approval = "never"` on the agent, else the
    * file-level `allow_unsafe_modes` (and `approval = "ask"` turns it off for this agent).
    */
   allowUnsafeModes: boolean;
-  /** Sessions start in a mode outside `safeModes`: no per-step approval. Never true without `allowUnsafeModes`. */
+  /** Sessions start in a mode outside `askingModes`: no per-step approval. Never true without `allowUnsafeModes`. */
   unattended: boolean;
   autoAllow: AutoAllowRule[];
 }
@@ -168,20 +173,26 @@ export function parseConfig(text: string, defaults: { hostname?: string } = {}):
     const explicitAsk = typeof raw.ask_mode === "string" && raw.ask_mode ? raw.ask_mode : null;
     const askMode = explicitAsk ?? (never ? preset?.unattended.askMode : preset?.askMode);
     if (!askMode) return void problems.push(never ? `${label}: approval = "never" needs ask_mode, the mode in which this agent does not ask, for a custom agent` : `${label}: ask_mode is required for a custom agent`);
-    const declaredSafe = raw.safe_modes !== undefined || preset !== undefined;
-    let safeModes = [...(raw.safe_modes !== undefined ? strList(raw.safe_modes, `${label}.safe_modes`, problems) : (preset?.safeModes ?? [askMode]))];
-    if (never) {
-      // The mode every session starts in is the one that does not ask: it is not a safe mode.
-      if (declaredSafe && explicitAsk && safeModes.includes(explicitAsk)) problems.push(`${label}: approval = "never" but ask_mode ${explicitAsk} is a mode that asks before every step; remove ask_mode, or approval`);
-      safeModes = safeModes.filter((m) => m !== askMode);
-    } else if (!safeModes.includes(askMode)) {
-      if (preset && explicitAsk) {
-        // A preset knows which of its modes ask. A mode it does not list is one that may not: it needs the owner's opt-in.
-        if (!allowUnsafe) problems.push(`${label}: ask_mode ${askMode} is not a mode that asks before every step; set approval = "never" (or allow_unsafe_modes = true) to use it`);
-      } else {
-        safeModes.push(askMode);
-      }
+    // `listed`: what a phone may select without the opt-in. `asking`: what is known to ask before every step: what the
+    // preset measured, or for a custom agent the owner's own declaration. They differ only for a preset the owner edited.
+    const listed = [...(raw.safe_modes !== undefined ? strList(raw.safe_modes, `${label}.safe_modes`, problems) : (preset?.safeModes ?? [askMode]))];
+    const asking = new Set(preset ? preset.safeModes : (raw.safe_modes !== undefined ? listed : []));
+    let safeModes = listed;
+    if (preset && !allowUnsafe) {
+      const extra = listed.filter((m) => !asking.has(m));
+      if (extra.length) problems.push(`${label}: safe_modes lists ${extra.join(", ")}, which preset ${presetName} does not know to ask before every step; remove it, set approval = "never" (or allow_unsafe_modes = true), or define the agent without a preset`);
     }
+    if (never) {
+      // The mode every session starts in is the one that does not ask: it is neither asking nor a safe mode.
+      if (explicitAsk && asking.has(explicitAsk)) problems.push(`${label}: approval = "never" but ask_mode ${explicitAsk} is a mode that asks before every step; remove ask_mode, or approval`);
+      asking.delete(askMode);
+      safeModes = safeModes.filter((m) => m !== askMode);
+    } else if (!asking.has(askMode)) {
+      // A preset knows which of its modes ask; one it does not list may not, and needs the owner's opt-in. A custom agent's ask mode asks by definition.
+      if (preset && explicitAsk) { if (!allowUnsafe) problems.push(`${label}: ask_mode ${askMode} is not a mode that asks before every step; set approval = "never" (or allow_unsafe_modes = true) to use it`); }
+      else asking.add(askMode);
+    }
+    if (asking.has(askMode) && !safeModes.includes(askMode)) safeModes.push(askMode);
     const roots = strList(raw.roots, `${label}.roots`, problems).map((r) => path.resolve(expandHome(r)));
     if (roots.length === 0) problems.push(`${label}: roots is required (an agent with no allowed directory is never offered)`);
     for (const r of roots) {
@@ -203,7 +214,7 @@ export function parseConfig(text: string, defaults: { hostname?: string } = {}):
     const own = parseAutoAllow(raw.auto_allow, `${label}.auto_allow`, problems);
     agents.push({
       id, kind, name: typeof raw.name === "string" && raw.name.trim() ? raw.name.trim().slice(0, 128) : (preset?.name ?? id),
-      command, args, env, roots, askMode, safeModes, allowUnsafeModes: allowUnsafe, unattended: !safeModes.includes(askMode),
+      command, args, env, roots, askMode, safeModes, askingModes: [...asking], allowUnsafeModes: allowUnsafe, unattended: !asking.has(askMode),
       autoAllow: [...globalAllow, ...own],
     });
   });

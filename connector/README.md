@@ -128,7 +128,9 @@ All of these run on your machine and fail closed.
   modes, Cursor `agent`) cannot be selected from a phone. `approval = "never"` on an agent, or `allow_unsafe_modes = true`
   for the whole file, in `agents.toml` is the only way, and it is yours alone. Flags that turn a tool's own approvals off
   (`--force`, `--yolo`, ...) in an agent's `args` are refused unless one of those is set too. A session recorded in a mode
-  you no longer allow comes back in the ask mode.
+  you no longer allow comes back in the ask mode. On a preset agent `safe_modes` can only narrow what the preset
+  knows to ask (naming another mode is a configuration error unless the agent has `approval = "never"` or the file has
+  `allow_unsafe_modes`), and a session in a mode the preset does not know to ask is reported `unattended`.
 - **Cursor.** Measured on `agent acp` 2026.10.22: in `agent` mode a shell command asks (options `allow-once`, `allow-always`,
   `reject-once`) but a file edit is applied without asking, whatever the approval setting. So the preset starts in `ask`,
   which cannot write. `approval = "never"` selects `agent` and starts `agent --force acp` (`--force` is a root flag of the

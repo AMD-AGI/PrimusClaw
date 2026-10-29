@@ -123,6 +123,8 @@ describe("agents.toml", () => {
     ["never next to a mode that asks", base(`approval = "never"\nask_mode = "default"\n`), /but ask_mode default is a mode that asks/],
     ["ask next to a mode that does not", base(`approval = "ask"\nask_mode = "bypassPermissions"\n`), /not a mode that asks before every step/],
     ["a no-approval flag with approval = ask", base(`approval = "ask"\nargs = ["--force", "acp"]\n`), /turns the tool's own approvals off/],
+    ["a preset's safe_modes naming a mode it does not know to ask, with approval = ask", base(`approval = "ask"\nsafe_modes = ["default", "plan", "acceptEdits"]\n`), /safe_modes lists acceptEdits, which preset claude does not know to ask/],
+    ["the same with no approval setting", base(`safe_modes = ["default", "bypassPermissions"]\n`), /safe_modes lists bypassPermissions/],
   ];
   for (const [name, text, re] of badApproval) {
     test(`refused: ${name}`, () => {
@@ -135,6 +137,20 @@ describe("agents.toml", () => {
     assert.throws(() => parseConfig(text), (e) => e instanceof ConfigError && /approval = "never" \(or allow_unsafe_modes = true\)/.test(e.message));
     const cfg = parseConfig(`allow_unsafe_modes = true\n` + text);
     assert.deepEqual([cfg.agents[0]!.askMode, cfg.agents[0]!.safeModes, cfg.agents[0]!.unattended], ["bypassPermissions", ["default", "plan"], true]);
+  });
+
+  test("the modes a phone may select and the modes known to ask are kept apart: an owner's narrower list does not make the ask mode unsafe", () => {
+    const cfg = parseConfig(base(`ask_mode = "plan"\nsafe_modes = ["default"]\n`));
+    assert.deepEqual([cfg.agents[0]!.askMode, cfg.agents[0]!.safeModes, cfg.agents[0]!.askingModes, cfg.agents[0]!.unattended], ["plan", ["default", "plan"], ["default", "plan"], false]);
+  });
+
+  test("with the opt-in a preset's list may name a mode it does not know to ask, and that mode counts as not asking", () => {
+    for (const top of [`allow_unsafe_modes = true\n`, ``]) {
+      const cfg = parseConfig(top + base(`${top ? "" : `approval = "never"\n`}safe_modes = ["default", "plan", "acceptEdits"]\n`));
+      const a = cfg.agents[0]!;
+      assert.ok(a.safeModes.includes("acceptEdits") && !a.askingModes.includes("acceptEdits"), "selectable, but not known to ask: a session in it says unattended");
+      assert.deepEqual([...a.askingModes].sort(), ["default", "plan"]);
+    }
   });
 
   test("a no-approval flag is accepted for an agent with approval = never, and for none other", () => {

@@ -32,6 +32,9 @@ export interface HarnessOptions {
   /** The agent's `approval` setting, and the mode its sessions start in (default: "default", which asks). */
   approval?: "ask" | "never";
   askMode?: string;
+  /** Make the first agent a preset's (the stand-in adapter still runs), and give the modes the phone may select. */
+  preset?: string;
+  safeModes?: string[];
   /** A second agent, "fake2", on the same stand-in adapter; this is the rest of its table (for example `approval = "never"`). */
   secondToml?: string;
   timing?: Partial<ConnectorTiming>;
@@ -66,10 +69,10 @@ export class Harness {
 id = ${JSON.stringify(id)}
 kind = "example"
 name = "Fake agent"
-command = ${JSON.stringify(process.execPath)}
+${id === "fake" && o.preset ? `preset = ${JSON.stringify(o.preset)}\n` : ""}command = ${JSON.stringify(process.execPath)}
 args = [${JSON.stringify(ADAPTER)}]
 ask_mode = ${JSON.stringify(askMode)}
-safe_modes = ["default", "plan"]
+safe_modes = ${JSON.stringify(id === "fake" && o.safeModes ? o.safeModes : ["default", "plan"])}
 roots = [${JSON.stringify(h.work)}]
 ${extra}
 [agents.env]

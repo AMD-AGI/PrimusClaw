@@ -131,11 +131,11 @@ export class Session {
 
   /** Whether this session runs without asking before every write and command: its mode is not a safe one, or its adapter said it will not ask. */
   get unattended(): boolean {
-    return this.noAskWarning || (this.currentMode !== null && !this.agent.safeModes.includes(this.currentMode));
+    return this.noAskWarning || (this.currentMode !== null && !this.agent.askingModes.includes(this.currentMode));
   }
 
   private shownModes(): Array<ModeInfo & { unattended: boolean }> {
-    return this.modes.filter((m) => this.modeAllowed(m.id)).map((m) => ({ ...m, unattended: !this.agent.safeModes.includes(m.id) }));
+    return this.modes.filter((m) => this.modeAllowed(m.id)).map((m) => ({ ...m, unattended: !this.agent.askingModes.includes(m.id) }));
   }
 
   // --- starting ----------------------------------------------------------------
