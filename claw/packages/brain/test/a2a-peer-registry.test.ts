@@ -246,7 +246,11 @@ test("isLocalAddress: loopback, link-local and unspecified only; private ranges 
     ["127.0.0.1", true], ["127.255.255.254", true], ["169.254.169.254", true], ["169.254.0.1", true],
     ["0.0.0.0", true], ["::1", true], ["::", true], ["fe80::1", true], ["febf::1", true],
     ["::ffff:127.0.0.1", true], ["::ffff:7f00:1", true], ["::ffff:a9fe:a9fe", true],
-    ["64:ff9b::7f00:1", true], ["64:ff9b::a9fe:a9fe", true],
+    ["64:ff9b::7f00:1", true], ["64:ff9b::a9fe:a9fe", true], ["64:ff9b::1", true],
+    // the local-use NAT64 prefix (RFC 8215) lays the IPv4 address out around the u-octet:
+    // 127.0.0.1, 169.254.169.254 and 0.0.0.1 below
+    ["64:ff9b:1:7f00:0:100::", true], ["64:ff9b:1:a9fe:a9:fe00::", true], ["64:ff9b:1::100:0:0", true],
+    ["64:ff9b:1:808:8:800::", false], ["64:ff9b::808:808", false],
     // an in-cluster peer lives in a private range, and the operator named it
     ["10.0.0.5", false], ["172.16.4.4", false], ["192.168.1.1", false], ["100.64.0.1", false],
     ["8.8.8.8", false], ["169.253.1.1", false], ["128.0.0.1", false],

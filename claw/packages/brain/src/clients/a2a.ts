@@ -172,8 +172,12 @@ for (const [net, prefix] of [["0.0.0.0", 8], ["127.0.0.0", 8], ["169.254.0.0", 1
 }
 for (const [net, prefix] of [
   ["::", 128], ["::1", 128], ["fe80::", 10],
-  // NAT64 embeds an IPv4 address in the low 32 bits.
+  // NAT64 embeds an IPv4 address in the address (RFC 6052). Both registered prefixes are decoded:
+  // the well-known 64:ff9b::/96 carries it in the low 32 bits, the local-use 64:ff9b:1::/48
+  // (RFC 8215) in bits 48-63 and 72-87. An operator's own network-specific prefix cannot be
+  // told from any other IPv6 address, so it is judged as the IPv6 address it is.
   ["64:ff9b::", 104], ["64:ff9b::7f00:0", 104], ["64:ff9b::a9fe:0", 112],
+  ["64:ff9b:1::", 56], ["64:ff9b:1:7f00::", 56], ["64:ff9b:1:a9fe::", 64],
 ] as const) LOCAL_ADDRESSES.addSubnet(net, prefix, "ipv6");
 
 export function isLocalAddress(address: string): boolean {

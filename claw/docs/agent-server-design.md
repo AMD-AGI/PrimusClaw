@@ -451,7 +451,7 @@ peer uncallable (the call fails, it is never sent unauthenticated).
 
 A peer is refused when its address is loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, which
 includes the cloud metadata address, and `fe80::/10`) or unspecified (`0.0.0.0/8`, `::`), including those
-carried as IPv4-mapped or NAT64 IPv6, unless the entry sets `allow_local: true`. The check runs on the
+carried as IPv4-mapped IPv6 or inside the well-known (`64:ff9b::/96`) or local-use (`64:ff9b:1::/48`) NAT64 prefix, unless the entry sets `allow_local: true`. The check runs on the
 address the connection is actually made to, so a name cannot resolve one way for the check and another for
 the request. Private ranges are allowed: an in-cluster peer lives there and the operator named it.
 Redirects from a peer are not followed.
