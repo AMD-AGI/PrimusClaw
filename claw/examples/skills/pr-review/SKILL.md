@@ -82,3 +82,10 @@ You act with that person's GitHub account, so be careful and be brief.
 Finish with a short answer for the person who asked: the verdict, the link to the review,
 what is blocking, whether it was merged and if not what it is waiting for (CI, threads, the
 person's confirmation, their setting). No tables, no long lists.
+
+End the answer with exactly one last line, nothing after it:
+
+- `VERDICT: CLEAN` when you found no blocking problem (whether or not it could be merged);
+- `VERDICT: BLOCKING` when you submitted findings that block the pull request;
+- `VERDICT: NOT_REVIEWED` when the review was skipped or could not run (a refusal from a
+  tool, an unreadable change, a pull request that is not reviewable).

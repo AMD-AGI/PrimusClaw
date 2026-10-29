@@ -123,7 +123,8 @@ of it. Without one the default `pr-review` skill applies
 importable as an ordinary skill): parallel passes over the whole change, only what the change
 introduces, only findings that are actionable and verified with a path and line, a rebuttal
 round per finding, CI read for the head commit, at most five findings, one review, no code
-changes, no request for reviewers.
+changes, no request for reviewers. The answer ends with exactly one last line, `VERDICT: CLEAN`,
+`VERDICT: BLOCKING` or `VERDICT: NOT_REVIEWED`, which a calling program can read.
 
 ## Settings
 

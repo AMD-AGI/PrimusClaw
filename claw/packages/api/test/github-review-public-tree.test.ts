@@ -36,6 +36,13 @@ test("the default skill is the same text as the skill file anyone can import", (
   assert.match(PR_REVIEW_SKILL, /^---\nname: pr-review\n/);
 });
 
+test("the skill ends its answer with one verdict line a caller can read, and nothing in a tool contradicts it", () => {
+  assert.match(PR_REVIEW_SKILL, /exactly one last line, nothing after it/);
+  for (const v of ["VERDICT: CLEAN", "VERDICT: BLOCKING", "VERDICT: NOT_REVIEWED"]) assert.ok(PR_REVIEW_SKILL.includes(`\`${v}\``), v);
+  const mcp = readFileSync(join(root, "packages/api/src/github-review/mcp.ts"), "utf8");
+  assert.doesNotMatch(mcp, /VERDICT:|last line|final answer|end (the|your) answer/i);
+});
+
 test("the fixed rules are the skill's rules without its steps, and they say what never changes", () => {
   assert.match(FIXED_REVIEW_RULES, /^# Pull request review/);
   assert.match(FIXED_REVIEW_RULES, /You only read and comment/);
