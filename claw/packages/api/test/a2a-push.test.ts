@@ -267,6 +267,23 @@ describe("A2A push notifications", { skip }, () => {
       assert.deepEqual([artifact.artifact.parts[0].text, artifact.lastChunk], ["all done", true]);
     });
 
+    test("the last notification of a cancelled task says CANCELED, though the worker's answer closed the row as completed", async () => {
+      const t = await liveTask();
+      await rpc("CreateTaskPushNotificationConfig", { taskId: t.taskId, url: HOOK });
+      assert.equal((await rpc("CancelTask", { id: t.taskId })).result.status.state, "TASK_STATE_CANCELED");
+      // The completion the consumer stored and processed: not interrupted, so the row closes as completed.
+      await query(
+        "INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ('e-late', $1, 'exec_complete', $2)",
+        [t.sessionId, { type: "exec_complete", message_id: t.messageId, final_text: "the late answer" }],
+      );
+      await query("UPDATE claw_tasks SET status = 'completed', completed_at = NOW() WHERE task_id = $1", [t.taskId]);
+      assert.equal(await push.recordSessionEvent(t.sessionId, { type: "exec_complete", message_id: t.messageId }, 99), 1);
+      const rows = await outbox();
+      assert.equal(rows.length, 2, "the result, and the final status");
+      assert.equal(rows[rows.length - 1].payload.statusUpdate.status.state, "TASK_STATE_CANCELED");
+      assert.equal(rows[rows.length - 1].final, true);
+    });
+
     test("an event delivered twice owes nothing the second time", async () => {
       const t = await liveTask();
       await rpc("CreateTaskPushNotificationConfig", { taskId: t.taskId, url: HOOK });
