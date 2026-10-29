@@ -238,10 +238,24 @@ directory from the frontend:
 | `.skills/` | Per-session skill state; excluded from the shared-filesystem snapshot only, because the sandbox image provides it |
 
 Regenerable content is also left out of the snapshot for size rather than
-ownership, and will simply be rebuilt: `.git`, `node_modules`, `.task-venv`,
+ownership, and will simply be rebuilt: `node_modules`, `.task-venv`,
 `.cache`, `.runtime`, `__pycache__`, `torchinductor_*`, `hsa`, `worktree`, and
 object files (`*.o`, `*.co`). The full list is `WORKSPACE_EXCLUDES` in
 [`claw/packages/brain/src/workspace/excludes.ts`](claw/packages/brain/src/workspace/excludes.ts).
+
+A repository's `.git` is **not** regenerable -- it holds commits that exist nowhere
+else until they are pushed -- so it is carried with the rest of the workspace and a
+sandbox rebuilt from the snapshot is still a repository. It is carried whole or not
+at all: a `.git` over `WORKSPACE_GIT_MAX_BYTES` (default 300 MiB) or
+`WORKSPACE_GIT_MAX_FILES` (default 2000) is left out, and so are the largest of a
+workspace's repositories once they add up to more than
+`WORKSPACE_GIT_TOTAL_MAX_BYTES` (1 GiB) or `WORKSPACE_GIT_TOTAL_MAX_FILES` (10000).
+Either snapshot destination reports it in a `workspace_git_skipped` sandbox event; push
+before leaving such a repository. A repository left out of a sync, or one the sandbox
+cannot measure in `WORKSPACE_GIT_PROBE_TIMEOUT_SEC` (default 60; 8 on a SIGTERM sync),
+does not stop the sync and does not lose its history: the rest of the workspace is saved
+and that repository keeps the copy the last snapshot held. Git's own lock and temporary
+files are not carried. `WORKSPACE_GIT_MAX_BYTES=0` turns `.git` snapshots off.
 
 ## Key Environment Variables
 
