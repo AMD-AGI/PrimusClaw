@@ -284,8 +284,8 @@ test("S5 no command carries a credential, a force or a discard; every url and br
   }
   // The url reaches git once, single-quoted, after `--`.
   const clone = all.find((c) => stepOf(c) === "clone")!;
-  assert.equal([...clone.matchAll(/https:\/\/github\.com/g)].length, 1);
-  assert.match(clone, /git clone --quiet -- 'https:\/\/github\.com\/example-org\/example-repo' "\$T"/);
+  assert.equal(clone.split("https://github.com").length - 1, 1, "the url is written once");
+  assert.ok(clone.includes(`git clone --quiet -- 'https://github.com/example-org/example-repo' "$T"`));
   // The credential helper is the one fixed string, added only when it is not there.
   const first = all[0];
   assert.ok(first.includes(`'${GIT_CREDENTIAL_HELPER}'`));
