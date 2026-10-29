@@ -72,14 +72,14 @@ async function subscribe(owner = "u1", o: { types?: string[]; sources?: string[]
 const APPROVALS = ["approval.requested"];
 const rows = async () => (await h.sql("SELECT * FROM claw_notification_outbox ORDER BY id")) as any[];
 
-/** The event Brain emits when it starts waiting (hitl.ts): tool_use_id, tool, input, timeout_ms, ts, message_id. */
+/** The event Brain emits when it starts waiting (hitl.ts): tool_use_id, tool, input, timeout_ms, ts, message_id. `ts` is now, as the real consumer reads the real clock. */
 function request(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     type: "permissionRequest", actionId: "tu-1", tool_use_id: "tu-1", tool: "bash",
     input: { command: "git push origin feat/x" },
     description: "[git push (publishes commits to a remote)] bash: {...}",
     approval_label: "git push (publishes commits to a remote)",
-    timeout_ms: 300_000, ts: NOW, message_id: "m-1", ...over,
+    timeout_ms: 300_000, ts: Date.now(), message_id: "m-1", ...over,
   };
 }
 
@@ -141,7 +141,7 @@ test("O2 the same request again is still one row: a redelivery, a resumed run, a
   await subscribe("u1", { types: APPROVALS });
   await deliver("s1", request());
   await deliver("s1", request());                                   // another stream sequence, same request
-  await deliver("s1", request({ ts: NOW + 60_000 }));                  // re-emitted a minute later
+  await deliver("s1", request({ ts: Date.now() + 60_000 }));            // re-emitted a minute later
   await deliver("s1", request({ actionId: undefined, input: { command: "something else" } }));   // same tool_use_id, different body
   assert.equal((await rows()).length, 1);
   const first = (await rows())[0].payload;
@@ -157,8 +157,8 @@ test("O2 the same request again is still one row: a redelivery, a resumed run, a
 test("O2 recording the same request again directly writes nothing and does not throw", async () => {
   await session("s1", { config: { notify_on_finish: true } });
   await subscribe("u1", { types: APPROVALS });
-  assert.equal(await outbox.recordApprovalRequested({ sessionId: "s1", event: request() }, () => NOW), 1);
-  assert.equal(await outbox.recordApprovalRequested({ sessionId: "s1", event: request() }, () => NOW), 0);
+  assert.equal(await outbox.recordApprovalRequested({ sessionId: "s1", event: request({ ts: NOW }) }, () => NOW), 1);
+  assert.equal(await outbox.recordApprovalRequested({ sessionId: "s1", event: request({ ts: NOW }) }, () => NOW), 0);
   assert.equal((await rows()).length, 1);
 });
 
@@ -248,7 +248,7 @@ test("O4 what is said: the command is the target, redacted and clipped; expiry i
   for (const c of cases) {
     await h.sql("DELETE FROM claw_notification_outbox");
     // The clock the API reads is pinned to the event's own timestamp.
-    assert.equal(await outbox.recordApprovalRequested({ sessionId: "s1", event: c.event }, () => NOW), 1, c.name);
+    assert.equal(await outbox.recordApprovalRequested({ sessionId: "s1", event: { ...c.event, ts: NOW } }, () => NOW), 1, c.name);
     const a = (await rows())[0].payload.approval;
     if (typeof c.target === "string") assert.equal(a.target, c.target, c.name);
     else assert.match(a.target, c.target, c.name);
@@ -258,20 +258,40 @@ test("O4 what is said: the command is the target, redacted and clipped; expiry i
   }
 });
 
-test("O4 Brain's timestamp is used when it is believable, this clock when it is not", async () => {
+test("O4 which clock starts the wait: Brain's when it is in the past, this one's when Brain's is ahead", async () => {
   await session("s1", { config: { notify_on_finish: true } });
   await subscribe("u1", { types: APPROVALS });
-  const at = async (ts: unknown, now: number) => {
+  const at = async (ts: unknown, now: number, over: Record<string, unknown> = {}) => {
     await h.sql("DELETE FROM claw_notification_outbox");
-    await outbox.recordApprovalRequested({ sessionId: "s1", event: request({ ts }) }, () => now);
-    const p = (await rows())[0].payload;
-    return [p.occurred_at, p.approval.expires_at];
+    const n = await outbox.recordApprovalRequested({ sessionId: "s1", event: request({ ts, ...over }) }, () => now);
+    return n === 0 ? null : [(await rows())[0].payload.occurred_at, (await rows())[0].payload.approval.expires_at];
   };
   assert.deepEqual(await at(NOW, NOW + 2_000), ["2026-10-29T08:00:00.000Z", "2026-10-29T08:05:00.000Z"], "emitted 2 s ago: the wait began then");
-  assert.deepEqual(await at(NOW - 3_600_000, NOW), ["2026-10-29T08:00:00.000Z", "2026-10-29T08:05:00.000Z"], "an hour in the past is a bad clock");
-  assert.deepEqual(await at(NOW + 3_600_000, NOW), ["2026-10-29T08:00:00.000Z", "2026-10-29T08:05:00.000Z"], "an hour in the future too");
-  assert.deepEqual(await at(undefined, NOW), ["2026-10-29T08:00:00.000Z", "2026-10-29T08:05:00.000Z"]);
-  assert.deepEqual(await at("soon", NOW), ["2026-10-29T08:00:00.000Z", "2026-10-29T08:05:00.000Z"]);
+  assert.deepEqual(await at(NOW, NOW + 299_000), ["2026-10-29T08:00:00.000Z", "2026-10-29T08:05:00.000Z"], "late by 4m59s: still open, and the expiry is Brain's");
+  assert.deepEqual(await at(NOW + 5_000, NOW), ["2026-10-29T08:00:00.000Z", "2026-10-29T08:05:00.000Z"], "ahead by seconds: skew, the wait began now");
+  assert.deepEqual(await at(NOW + 3_600_000, NOW), ["2026-10-29T08:00:00.000Z", "2026-10-29T08:05:00.000Z"], "an hour ahead: skew too");
+  assert.deepEqual(await at(undefined, NOW), ["2026-10-29T08:00:00.000Z", "2026-10-29T08:05:00.000Z"], "no timestamp: now");
+  assert.deepEqual(await at("soon", NOW), ["2026-10-29T08:00:00.000Z", "2026-10-29T08:05:00.000Z"], "nonsense: now");
+  assert.deepEqual(await at(0, NOW), ["2026-10-29T08:00:00.000Z", "2026-10-29T08:05:00.000Z"], "zero is not a timestamp: now");
+  // A late event: Brain gave up waiting before this consumer saw the request.
+  assert.equal(await at(NOW, NOW + 300_000), null, "the window ended exactly now: nothing to answer");
+  assert.equal(await at(NOW, NOW + 15 * 60_000), null, "15 minutes late with the default 5 minute wait");
+  assert.deepEqual(await at(NOW, NOW + 15 * 60_000, { timeout_ms: 3_600_000 }), ["2026-10-29T08:00:00.000Z", "2026-10-29T09:00:00.000Z"], "a 1 hour wait, 15 minutes in: open until 09:00");
+});
+
+test("O4 a request that expired before it was consumed is not announced, and writes no row", async () => {
+  await session("s1", { config: { notify_on_finish: true } });
+  await subscribe("u1", { types: APPROVALS });
+  const stale = Date.now() - 15 * 60_000;
+  assert.deepEqual(await deliver("s1", request({ ts: stale })), ["ack"], "the event is still consumed");
+  assert.equal((await rows()).length, 0);
+  // The same request, 4 minutes into a 5 minute wait, is still worth a push, and says when it ends.
+  const recent = Date.now() - 4 * 60_000;
+  await deliver("s1", request({ tool_use_id: "tu-2", ts: recent }));
+  const out = await rows();
+  assert.equal(out.length, 1);
+  assert.equal(out[0].payload.occurred_at, new Date(recent).toISOString());
+  assert.equal(out[0].payload.approval.expires_at, new Date(recent + 300_000).toISOString());
 });
 
 test("O4 the title and summary: the tool, the session's name, the rule's label; the task falls back to the message id", async () => {
@@ -334,7 +354,7 @@ test("O5 the run notifications are unchanged, and the short-run rule does not ap
   );
   await subscribe("u1", { types: ["run.completed", "run.failed", "approval.requested"] });
   assert.equal(await outbox.recordRunFinished({ sessionId: "s1", taskIds: ["t-short"], outcome: "completed" }), 0, "a 3 s run is not announced");
-  assert.equal(await outbox.recordApprovalRequested({ sessionId: "s1", event: request() }, () => NOW), 1, "an approval in a 3 s old session is");
+  assert.equal(await outbox.recordApprovalRequested({ sessionId: "s1", event: request({ ts: NOW }) }, () => NOW), 1, "an approval in a 3 s old session is");
   await h.sql(
     `UPDATE claw_tasks SET started_at = NOW() - interval '300 seconds' WHERE task_id = 't-short'`,
   );

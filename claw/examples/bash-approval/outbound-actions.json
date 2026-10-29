@@ -52,8 +52,8 @@
     "args_regex": "^(?:(?:-n|--namespace|--kube-context|--kubeconfig|--kube-apiserver|--kube-token|--kube-as-user|--kube-as-group|--kube-ca-file|--kube-tls-server-name|--registry-config|--repository-cache|--repository-config|--burst-limit|--qps)\\s+\\S+\\s+|(?!(?:-n|--namespace|--kube-context|--kubeconfig|--kube-apiserver|--kube-token|--kube-as-user|--kube-as-group|--kube-ca-file|--kube-tls-server-name|--registry-config|--repository-cache|--repository-config|--burst-limit|--qps)\\s)-\\S*\\s+)*(?:install|upgrade|uninstall|delete|rollback|push)(?:\\s|$)"
   },
   {
-    "label": "recursive rm outside /workspace (or of /workspace itself)",
+    "label": "recursive rm of a path not explicitly under /workspace/ (the working directory is not known)",
     "program": "rm",
-    "args_regex": "^(?=(?:.*\\s)?(?:-[A-Za-z]*[rR][A-Za-z]*|--recursive)(?:\\s|$))(?=(?:.*\\s)?(?:/(?!workspace/(?!(?:\\S*/)?\\.\\.(?:/|\\s|$)|\\s|$|\\*(?:\\s|$)))|~|\\$\\{?HOME|(?:\\S*/)?\\.\\.(?:/\\S*)?(?=\\s|$)))"
+    "args_regex": "^(?=(?:.*\\s)?(?:-[A-Za-z]*[rR][A-Za-z]*|--recursive)(?:\\s|$))(?=(?:.*\\s)?(?!-)(?!(?!\\S*/\\.\\.(?:/|\\s|$))/workspace/(?!\\*)\\S+(?:\\s|$))\\S)"
   }
 ]

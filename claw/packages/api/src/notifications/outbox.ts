@@ -167,8 +167,6 @@ async function enqueue(
 const APPROVAL_DEFAULT_WAIT_MS = 300_000;
 /** A decision window longer than this is not believed. */
 const APPROVAL_MAX_WAIT_MS = 24 * 3_600_000;
-/** Brain's clock may differ from this one's; further apart than this, its timestamp is not used. */
-const APPROVAL_MAX_CLOCK_SKEW_MS = 10 * 60_000;
 const TITLE_MAX = 200;
 
 const text = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
@@ -184,6 +182,9 @@ const text = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
  * is not sent a type it never asked for). `NOTIFY_MIN_RUN_SECONDS` does not apply:
  * a person who is not looking at the run is the very case an approval push is for,
  * and a short run can be the one that is waiting.
+ *
+ * A request whose wait window has already passed when the event is consumed is not
+ * announced (see below); this holds back nothing a person could still act on.
  *
  * Idempotent: the event id is derived from (type, session, tool_use_id), so the
  * same request seen twice -- a redelivered event, a run resumed after a restart,
@@ -222,9 +223,17 @@ export async function recordApprovalRequested(
 
   const clock = now();
   const emittedAt = Number(event.ts);
-  const startedAt = Number.isFinite(emittedAt) && Math.abs(emittedAt - clock) <= APPROVAL_MAX_CLOCK_SKEW_MS ? emittedAt : clock;
+  // The wait began when Brain emitted the event. A timestamp in the future can only be clock skew:
+  // the wait began now. A timestamp in the past is a late delivery (a consumer that fell behind, a
+  // redelivery) and is kept, so the expiry is the one Brain is working to.
+  const startedAt = Number.isFinite(emittedAt) && emittedAt > 0 ? Math.min(emittedAt, clock) : clock;
   const waitMs = Number(event.timeout_ms);
   const waitWindowMs = Number.isFinite(waitMs) && waitMs > 0 && waitMs <= APPROVAL_MAX_WAIT_MS ? waitMs : APPROVAL_DEFAULT_WAIT_MS;
+  // Brain has already stopped waiting: a push now would announce a request nobody can still answer.
+  if (startedAt + waitWindowMs <= clock) {
+    logger.info({ sessionId, lateByMs: clock - startedAt - waitWindowMs }, "notification.approval_expired_skipped");
+    return 0;
+  }
 
   // The run this request belongs to: Brain stamps every event with the message id of the turn.
   const messageId = text(event.message_id);

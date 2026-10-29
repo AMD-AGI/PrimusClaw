@@ -87,7 +87,7 @@ approval request.
 | `gh workflow` | `run`, `enable`, `disable` | `list`, `view` |
 | `kubectl` | `apply`, `delete`, `patch`, `scale`, `exec`, `create`, `replace`, `edit`, `label`, `annotate`, `cordon`, `uncordon`, `drain`, `taint`, `set`, `run`, `cp`, `debug`, `expose`, `autoscale`, `rollout restart/undo/pause/resume` | `get`, `describe`, `logs`, `top`, `config`, `rollout status`, `rollout history` |
 | `helm` | `install`, `upgrade`, `uninstall`, `delete`, `rollback`, `push` | `list`, `template`, `status`, `get`, `lint`, `show`, `repo` |
-| `rm` | a recursive `rm` (`-r`, `-R`, `-rf`, `--recursive`) of an absolute path outside `/workspace`, of `~` or `$HOME`, of `/workspace` itself or `/workspace/*`, or of anything with a `..` segment (the working directory is not known, so a relative path that climbs is held too) | `rm file`, `rm -f /tmp/x.log` (not recursive), `rm -rf node_modules` (relative), `rm -rf /workspace/app/build` |
+| `rm` | a recursive `rm` (`-r`, `-R`, `-rf`, `-fr`, `--recursive`, in any spelling) unless **every** target is spelled out as `/workspace/<something>`: an absolute path elsewhere, `~`, `$HOME`, `/workspace` itself, `/workspace/*`, any path with a `..` segment, and any **relative** path (`rm -rf node_modules`, `cd / && rm -rf usr`) are held | `rm file`, `rm -f /tmp/x.log` (not recursive), `rm -rf /workspace/app/build`, `rm -r /workspace/a /workspace/b` |
 
 The program is found through `sudo`, `env X=1`, `timeout`, `nohup`, `bash -c "..."`, `ssh host ...` and
 `kubectl exec -- ...`, and option values are skipped, so a namespace called `apply` in `kubectl -n apply get pods`
@@ -95,9 +95,13 @@ is not an `apply`, and `gh -R owner/repo pr create` is a `pr create`.
 
 Things this pack does not do, beyond the limits above:
 
+- A rule cannot see the working directory, so a recursive `rm` is judged by its text alone: it runs only when
+  every target starts with `/workspace/`. A relative target is held even inside `/workspace`
+  (`rm -rf node_modules`; write `rm -rf /workspace/app/node_modules` to run without asking), because the
+  same words after a `cd /` delete something else. A variable inside the path (`/workspace/$X`) is not expanded.
 - A value with a space after git's global `-C` / `-c` (`git -C "my dir" push`) is not seen as a push: the
   words are matched after the shell's quotes are removed.
-- A recursive delete of a `/tmp` path is held, because it is outside `/workspace`. Delete that rule, or
+- A recursive delete of a `/tmp` path is held, because it is outside `/workspace`. Delete the `rm` rule, or
   narrow it, if scratch cleanup should not ask.
 - A GraphQL read through `gh api graphql -f query=...` is a POST to GitHub and is held.
 - It does not cover `gh issue`, `gh gist`, `gh secret`, `gh run`, `git` aliases, other HTTP clients (add an
@@ -107,7 +111,8 @@ The held call's request goes to whoever can answer it. With `CLAW_NOTIFICATIONS_
 lists `approval.requested` in its `event_types` is also sent a signed `approval.requested` webhook for each
 held call of a session that opted in (`config.notify_on_finish: true`, or started by a trigger), carrying the
 tool, a redacted summary of the command and the time at which Brain stops waiting, so the answer does not
-depend on someone watching the run.
+depend on someone watching the run. A request whose waiting time has already passed by the time the event is
+processed (a consumer that fell behind) is not announced: nobody can still answer it.
 
 ## What the model sees on a refusal
 

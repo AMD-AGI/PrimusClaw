@@ -67,15 +67,16 @@ record it.
   subscriptions that list `approval.requested` in their `event_types` are sent a signed webhook: the usual
   fields plus `approval: {tool_use_id, tool, target, expires_at}`. `target` is the command (bash) or the
   tool's name and salient inputs, with credentials masked and cut to 300 characters; `expires_at` is when
-  Brain stops waiting and refuses the call. The `event_id` is derived from (type, session, `tool_use_id`),
+  Brain stops waiting and refuses the call; a request that has already timed out when the event is
+  consumed is not announced. The `event_id` is derived from (type, session, `tool_use_id`),
   so a repeated request is one row per subscription. The opt-in is the run notifications' (the session was
   created with `config.notify_on_finish: true`, or was started by a trigger); `NOTIFY_MIN_RUN_SECONDS` does
   not apply. A subscription that was created with the default `event_types` (the two run events) is not sent
   approvals: add the type with `PATCH /v1/notification-subscriptions/:id`, or pass it on create.
 - `claw/examples/bash-approval/outbound-actions.json`, a `bash_approval` rule pack for actions that leave
   the sandbox: `git push` (force and delete forms labelled apart), `gh pr` / `release` / `repo` / `workflow`
-  writes, `gh api` writes and implied POSTs, `kubectl` and `helm` writes, and a recursive `rm` outside
-  `/workspace`. See `claw/docs/bash-approval.md`.
+  writes, `gh api` writes and implied POSTs, `kubectl` and `helm` writes, and a recursive `rm` unless
+  every target is spelled out under `/workspace/`. See `claw/docs/bash-approval.md`.
 - Deployment-level platform defaults: `PLATFORM_DEFAULTS_FILE` lists default skills
   (by marketplace tool id) and MCP servers mounted into every chat, behind
   `PROGRESSIVE_SKILLS_ENABLED` for skills. Default skills are listed by name and

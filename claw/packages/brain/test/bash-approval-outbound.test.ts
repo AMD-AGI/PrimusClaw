@@ -29,7 +29,7 @@ const L = {
   workflow: "gh workflow write (runs, enables or disables a workflow)",
   kubectl: "kubectl write (changes cluster state or runs a command in a pod)",
   helm: "helm write (installs, upgrades or removes a release)",
-  rm: "recursive rm outside /workspace (or of /workspace itself)",
+  rm: "recursive rm of a path not explicitly under /workspace/ (the working directory is not known)",
 } as const;
 
 interface Row {
@@ -279,6 +279,7 @@ const MATRIX: Row[] = [
       "rm -r /etc/foo",
       "rm -Rf /home/user/x",
       "rm --recursive --force /opt/x",
+      "rm -f -r /opt/x",
       "rm -rf ~/work",
       "rm -rf $HOME/x",
       "rm -rf \"${HOME}/x\"",
@@ -286,31 +287,49 @@ const MATRIX: Row[] = [
       "rm -rf /workspace/a/../../etc",
       "rm -rf /workspace2/x",
       "rm -rf /workspace/ok /tmp/bad",
+      "rm -r /workspace/ok relative-dir",
       "rm /tmp/x -rf",
       "rm -rf /workspace",
       "rm -rf /workspace/",
       "rm -rf /workspace/*",
+      "rm -rf \"/etc\"",
+      "rm -rf '/etc/ssh'",
+      "rm -rf -- \"/work space/x\"",
+      "rm -rf \"$HOME\"",
+      "rm -rf ~/'x y'",
       "rm -rf ../../etc",
       "rm -rf ../sibling",
       "rm -rf ..",
       "rm -r a/../../b",
       "rm -rf ./build ../x",
+      // The cwd is not visible: a relative target is held, wherever the shell has been moved to.
+      "cd / && rm -rf usr",
+      "cd /etc && rm -r ssh",
+      "cd ~ && rm -rf cache",
+      "rm -rf node_modules",
+      "rm -rf build dist",
+      "rm -r ./tmp",
+      "rm -rf $TARGET",
       "cd /workspace/app && rm -rf ../../..",
     ],
     allowed: [
       "rm file.txt",
       "rm -f /tmp/x.log",
-      "rm -rf node_modules",
-      "rm -rf build dist",
-      "rm -r ./tmp",
       "rm -rf /workspace/app/build",
+      "rm -rf '/workspace/app/dist'",
+      "rm -rf \"/workspace/app/dist\"",
       "rm -rf /workspace/a /workspace/b",
+      "rm -r -f /workspace/x/y",
+      "rm --recursive /workspace/x/build",
+      "rm -rf -- /workspace/x/build",
+      "rm -rf /workspace/node_modules/.bin",
+      "rm -rf /workspace/build/..cache",
       "rm /etc/hosts.bak",
-      "rm -rf ./build",
-      "rm -rf build/..cache ..hidden",
-      "rm -rf node_modules/.bin",
+      "rm -f build.log",
+      "cd / && rm file.txt",
     ] },
 ];
+
 
 const shq = (c: string) => `'${c.replace(/'/g, `'\\''`)}'`;
 /** The same command behind each wrapper the matcher must look through. */
@@ -393,8 +412,9 @@ test("a long adversarial command is matched in linear time, not backtracked fore
     `helm ${"--namespace x ".repeat(5000)}list`,
     `gh pr ${"-R x ".repeat(15000)}view 1`,
     `gh api ${"-f a=b ".repeat(12000)}-X GET x`,
-    `rm -rf ${"a ".repeat(40000)}`,
-    `rm -rf ${"a/".repeat(40000)}`,
+    `rm -rf ${"/workspace/a ".repeat(7000)}`,
+    `rm -rf /workspace/${"a/".repeat(40000)}`,
+    `rm -rf /workspace/${"/.x".repeat(30000)}`,
     `gh ${"-R x ".repeat(15000)}pr view 1`,
   ];
   for (const c of cases) {
@@ -410,7 +430,9 @@ test("a long command that IS held is held in linear time too", () => {
   const p = policy();
   for (const [c, label] of [
     [`rm -rf ${"../".repeat(30000)}x`, L.rm],
-    [`rm -rf ${"a ".repeat(20000)}/tmp/x`, L.rm],
+    [`rm -rf ${"/workspace/a ".repeat(7000)}/tmp/x`, L.rm],
+    [`rm -rf ${"/workspace/a ".repeat(7000)}tmp`, L.rm],
+    [`rm -rf /workspace/${"a/".repeat(30000)}../x`, L.rm],
     [`git ${"-C x ".repeat(12000)}push origin main`, L.push],
     [`gh ${"-R x ".repeat(12000)}pr create`, L.pr],
   ] as Array<[string, string]>) {
