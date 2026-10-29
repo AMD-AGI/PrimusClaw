@@ -37,6 +37,7 @@ const (
 )
 
 // OwnerQuota is the per-owner cap for sandboxes created with an identity key.
+// MaxSandboxes and MaxGPUs of -1 are unlimited. MaxSandboxSeconds of 0 is unlimited.
 // Owner records carry no GPU-hour budget.
 type OwnerQuota struct {
 	MaxSandboxes      int32 `json:"maxSandboxes"`
@@ -44,12 +45,20 @@ type OwnerQuota struct {
 	MaxSandboxSeconds int64 `json:"maxSandboxSeconds"`
 }
 
+// Built-in quotas used when the policy omits default or admin.
+var (
+	defaultUserQuota  = OwnerQuota{MaxSandboxes: 8, MaxGPUs: 8, MaxSandboxSeconds: 12 * 3600}
+	defaultAdminQuota = OwnerQuota{MaxSandboxes: -1, MaxGPUs: -1, MaxSandboxSeconds: 3 * 24 * 3600}
+)
+
 // OwnerPolicy is the quota and template set for identity keys.
-// Owners maps a user id to a quota that replaces Default.
+// Default applies to users and Admin to system-admin. Owners maps a user id to a
+// quota that replaces both.
 type OwnerPolicy struct {
 	Role      string                `json:"role"`
 	Templates []TemplateRequest     `json:"templates"`
-	Default   OwnerQuota            `json:"default"`
+	Default   *OwnerQuota           `json:"default,omitempty"`
+	Admin     *OwnerQuota           `json:"admin,omitempty"`
 	Owners    map[string]OwnerQuota `json:"owners"`
 }
 
@@ -59,6 +68,7 @@ type ownerConfig struct {
 	roleSpec  []string
 	templates []runtimev1alpha1.GrantTemplate
 	quota     OwnerQuota
+	admin     OwnerQuota
 	owners    map[string]OwnerQuota
 }
 
@@ -102,8 +112,15 @@ func (s *Service) SetOwnerPolicy(ctx context.Context, p OwnerPolicy) error {
 			return opErr(http.StatusBadRequest, "invalid_owner_policy", "owner "+id+" quota is invalid")
 		}
 	}
-	if !validQuota(p.Default) {
-		return opErr(http.StatusBadRequest, "invalid_owner_policy", "default quota is invalid")
+	quota, admin := defaultUserQuota, defaultAdminQuota
+	if p.Default != nil {
+		quota = *p.Default
+	}
+	if p.Admin != nil {
+		admin = *p.Admin
+	}
+	if !validQuota(quota) || !validQuota(admin) {
+		return opErr(http.StatusBadRequest, "invalid_owner_policy", "default or admin quota is invalid")
 	}
 	names := make([]string, 0, len(p.Templates))
 	for _, tpl := range p.Templates {
@@ -123,12 +140,12 @@ func (s *Service) SetOwnerPolicy(ctx context.Context, p OwnerPolicy) error {
 	for id, q := range p.Owners {
 		owners[id] = q
 	}
-	s.owner.Store(&ownerConfig{role: role, roleSpec: roles[role].Templates, templates: stored, quota: p.Default, owners: owners})
+	s.owner.Store(&ownerConfig{role: role, roleSpec: roles[role].Templates, templates: stored, quota: quota, admin: admin, owners: owners})
 	return nil
 }
 
 func validQuota(q OwnerQuota) bool {
-	return q.MaxSandboxes >= 0 && q.MaxGPUs >= 0 && q.MaxSandboxSeconds >= 0
+	return q.MaxSandboxes >= -1 && q.MaxGPUs >= -1 && q.MaxSandboxSeconds >= 0
 }
 
 // OwnerRole returns the role used by identity keys, or "" when they are disabled.
@@ -146,8 +163,8 @@ func OwnerGrantName(userID string) string {
 }
 
 // EnsureOwner returns the owner quota record of userID, creating it on first use
-// and updating its caps when the policy changed.
-func (s *Service) EnsureOwner(ctx context.Context, userID, userName string) (string, error) {
+// and updating its caps when the policy or the admin role changed.
+func (s *Service) EnsureOwner(ctx context.Context, userID, userName string, admin bool) (string, error) {
 	cfg := s.owner.Load()
 	if cfg == nil {
 		return "", opErr(http.StatusForbidden, "owner_keys_disabled", "identity keys are not enabled")
@@ -156,7 +173,7 @@ func (s *Service) EnsureOwner(ctx context.Context, userID, userName string) (str
 		return "", opErr(http.StatusUnauthorized, "invalid_key", "key has no subject")
 	}
 	name := OwnerGrantName(userID)
-	want := cfg.spec(userID, userName, s.now())
+	want := cfg.spec(userID, userName, admin, s.now())
 	g, err := s.get(ctx, name)
 	if IsReason(err, "grant_not_found") {
 		g, err = s.createOwner(ctx, name, want)
@@ -179,8 +196,12 @@ func (s *Service) EnsureOwner(ctx context.Context, userID, userName string) (str
 }
 
 // spec builds the owner record spec for userID from the policy.
-func (c *ownerConfig) spec(userID, userName string, now time.Time) runtimev1alpha1.SandboxGrantSpec {
+// A per-owner quota wins over the admin quota, which wins over the default.
+func (c *ownerConfig) spec(userID, userName string, admin bool, now time.Time) runtimev1alpha1.SandboxGrantSpec {
 	q := c.quota
+	if admin {
+		q = c.admin
+	}
 	if o, ok := c.owners[userID]; ok {
 		q = o
 	}

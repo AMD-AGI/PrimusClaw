@@ -78,7 +78,7 @@ func samplePolicy() grant.OwnerPolicy {
 			Name: "runner", PerGPUCount: []int32{1},
 			Spec: json.RawMessage(`{"fromImage":"harbor.example/runner@sha256:0123456789abcdef","resources":{"requests":{"cpu":"1","memory":"1Gi"}}}`),
 		}},
-		Default: grant.OwnerQuota{MaxSandboxes: 1, MaxGPUs: 8, MaxSandboxSeconds: 3600},
+		Default: &grant.OwnerQuota{MaxSandboxes: 1, MaxGPUs: 8, MaxSandboxSeconds: 3600},
 		Owners:  map[string]grant.OwnerQuota{"u-2": {MaxSandboxes: 2, MaxGPUs: 8, MaxSandboxSeconds: 3600}},
 	}
 }
@@ -157,11 +157,44 @@ func TestIdentityKeyWorkspaceSelection(t *testing.T) {
 	if _, _, err := plane.Create(ctx, "ak-admin", ws("any-ws")); err != nil {
 		t.Fatalf("admin create: %v", err)
 	}
-	if _, _, err := plane.Create(ctx, "ak-admin", ws("other-ws")); opReason(err) != "grant_quota_exceeded" {
-		t.Fatalf("admin quota err = %v", err)
-	}
 	if got := runner.created[len(runner.created)-1].Workspace; got != "any-ws" {
 		t.Fatalf("admin workspace = %q", got)
+	}
+}
+
+func TestBuiltInQuotas(t *testing.T) {
+	ids := &fakeIntrospector{tokens: map[string]identity.Token{
+		"ak-alice": {Subject: "u-1"},
+		"ak-admin": {Subject: "u-9", Roles: []string{"system-admin"}},
+	}}
+	policy := samplePolicy()
+	policy.Default = nil
+	policy.Owners = nil
+	plane, _, _ := ownerPlane(t, ids, policy)
+	ctx := context.Background()
+	admin := CreateBody{TemplateID: "runner", Metadata: map[string]string{workspaceMetadata: "any-ws"}}
+
+	if _, _, err := plane.Create(ctx, "ak-alice", CreateBody{TemplateID: "runner", Timeout: 13 * 3600}); opReason(err) != "timeout_not_allowed" {
+		t.Fatalf("user 13h err = %v", err)
+	}
+	for i := 0; i < 8; i++ {
+		if _, _, err := plane.Create(ctx, "ak-alice", CreateBody{TemplateID: "runner", Timeout: 12 * 3600}); err != nil {
+			t.Fatalf("user create %d: %v", i, err)
+		}
+	}
+	if _, _, err := plane.Create(ctx, "ak-alice", CreateBody{TemplateID: "runner"}); opReason(err) != "grant_quota_exceeded" {
+		t.Fatalf("user ninth create err = %v", err)
+	}
+
+	admin.Timeout = 3*24*3600 + 1
+	if _, _, err := plane.Create(ctx, "ak-admin", admin); opReason(err) != "timeout_not_allowed" {
+		t.Fatalf("admin over 3d err = %v", err)
+	}
+	admin.Timeout = 3 * 24 * 3600
+	for i := 0; i < 10; i++ {
+		if _, _, err := plane.Create(ctx, "ak-admin", admin); err != nil {
+			t.Fatalf("admin create %d: %v", i, err)
+		}
 	}
 }
 
