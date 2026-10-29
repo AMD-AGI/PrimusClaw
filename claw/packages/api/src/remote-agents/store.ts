@@ -11,6 +11,7 @@
 import { randomUUID } from "node:crypto";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import {
+  REMOTE_AGENT_TIMING, REMOTE_COMMANDS, REMOTE_COMMAND_TYPES,
   REMOTE_EVENT_PERMISSION_REQUEST, REMOTE_EVENT_PERMISSION_RESOLVED, REMOTE_EVENT_SESSION_CLOSED,
   type ParsedRemoteEvent, type RemoteAgentDescriptor, type RemoteEventRejection, type RemoteHeartbeat,
 } from "@claw/protocol";
@@ -57,8 +58,13 @@ export async function findConnector(owner: string, connectorId: string, onlineWi
   return r.rows[0] ?? null;
 }
 
+/** Audit detail naming how the caller was authenticated, when that is known. */
+const withCredential = (detail: Record<string, unknown>, credential: string | null): Record<string, unknown> =>
+  credential ? { ...detail, credential } : detail;
+
 export async function registerConnector(
   owner: string, name: string, version: string | null, client: string | null, maxPerUser: number,
+  credential: string | null = null,
 ): Promise<Row | null> {
   return inTransaction(async (q) => {
     await lock(q, `connectors:${owner}`);
@@ -71,7 +77,7 @@ export async function registerConnector(
        RETURNING connector_id, name, created_at`,
       [randomUUID(), owner, name, version],
     )).rows[0];
-    await writeAudit(q, { owner, actor: owner, client, connectorId: row.connector_id, action: "connector.registered", detail: { name } });
+    await writeAudit(q, { owner, actor: owner, client, connectorId: row.connector_id, action: "connector.registered", detail: withCredential({ name }, credential) });
     return row;
   });
 }
@@ -131,25 +137,67 @@ export async function recordHeartbeat(connectorId: string, owner: string, hb: Re
         [connectorId, a.agent_id, owner, a.kind, a.name, JSON.stringify(a.capabilities)],
       );
     }
-    if (hb.cmdCursor !== null) await pruneCommands(q, connectorId, hb.cmdCursor);
+    // Every beat also clears what has expired, acknowledged or not: a connector that reconnects
+    // after a long absence may send no cursor, and must not leave its stale prompts behind.
+    await pruneCommands(q, connectorId, hb.cmdCursor ?? 0);
   });
 }
 
+/** The commands that are accepted only while the connector is online (`needsOnline`). */
+const LIVE_COMMAND_TYPES: string[] = REMOTE_COMMAND_TYPES.filter((t) => REMOTE_COMMANDS[t].needsOnline);
+const LIVE_COMMAND_TTL_SECS = REMOTE_AGENT_TIMING.liveCommandTtlMs / 1000;
+
 /**
- * Forget commands the connector has handled, plus any a day old.
+ * Whether a queued command is too old to be carried out, as a SQL condition on `claw_remote_commands`.
+ * `typesParam` and `secsParam` are the positions of the two values it reads: {@link LIVE_COMMAND_TYPES}
+ * and {@link LIVE_COMMAND_TTL_SECS}.
+ *
+ * Two bounds. Anything is dead after a day: an instruction nobody has collected for that long is not
+ * one anybody still wants carried out. A command that needs a watcher (`prompt`, `set_mode`, `resume`)
+ * is dead after minutes: it was accepted because the connector looked online, so one still uncollected
+ * was sent into a connection that had died unnoticed (a closed laptop counts as online for up to the
+ * online window), and delivering it when the machine wakes hours later would run it with nobody watching,
+ * which is the case the `connector_offline` refusal exists to prevent. `cancel`, `close` and `decision`
+ * are safe to deliver late and keep only the day.
+ */
+const expiredSql = (typesParam: number, secsParam: number): string =>
+  `(created_at < NOW() - interval '1 day'
+    OR (type = ANY($${typesParam}::text[]) AND created_at < NOW() - make_interval(secs => $${secsParam}::float8)))`;
+
+/**
+ * Forget commands the connector has handled, plus any that have expired ({@link expiredSql}).
  *
  * A prompt is stored here until it is delivered, and the audit trail keeps only
  * its hash, so this table must not become a second archive of what people typed.
- * The day is also a deliberate bound on delivery: an instruction that nobody has
- * collected for that long is not one anybody still wants carried out, and a
- * permission answer is worthless long before it (the connector gives up on the
- * request after minutes).
  */
 export async function pruneCommands(q: Querier, connectorId: string, upTo: number): Promise<void> {
   await q(
-    "DELETE FROM claw_remote_commands WHERE connector_id = $1 AND (cmd_seq <= $2 OR created_at < NOW() - interval '1 day')",
-    [connectorId, upTo],
+    `DELETE FROM claw_remote_commands WHERE connector_id = $1 AND (cmd_seq <= $2 OR ${expiredSql(3, 4)})`,
+    [connectorId, upTo, LIVE_COMMAND_TYPES, LIVE_COMMAND_TTL_SECS],
   );
+}
+
+/**
+ * Delete sessions that were closed more than `days` ago, and with them their stored events
+ * (the foreign key cascades). Live sessions are never touched, and the audit trail has no
+ * foreign key on purpose, so it keeps describing what was deleted. Deletes a bounded batch of
+ * sessions at a time so one statement never holds a lock over an unbounded number of events;
+ * returns how many sessions went.
+ */
+export async function pruneClosedSessions(days: number, batch = 100): Promise<number> {
+  let total = 0;
+  for (;;) {
+    const r = await direct(
+      `DELETE FROM claw_remote_sessions WHERE session_id IN (
+         SELECT session_id FROM claw_remote_sessions
+          WHERE status = 'closed' AND updated_at < NOW() - make_interval(secs => $1::float8)
+          ORDER BY updated_at LIMIT $2)`,
+      [days * 86_400, batch],
+    );
+    const n = r.rowCount ?? 0;
+    total += n;
+    if (n < batch) return total;
+  }
 }
 
 export async function markStreamOpen(connectorId: string, streamConn: string): Promise<void> {
@@ -185,8 +233,9 @@ export async function markStreamClosed(connectorId: string, streamConn: string):
 export async function commandsAfter(connectorId: string, cursor: number, limit: number): Promise<Row[]> {
   return (await direct(
     `SELECT cmd_seq, cmd_id, session_id::text AS session_id, type, payload
-       FROM claw_remote_commands WHERE connector_id = $1 AND cmd_seq > $2 ORDER BY cmd_seq LIMIT $3`,
-    [connectorId, cursor, limit],
+       FROM claw_remote_commands WHERE connector_id = $1 AND cmd_seq > $2 AND NOT ${expiredSql(4, 5)}
+      ORDER BY cmd_seq LIMIT $3`,
+    [connectorId, cursor, limit, LIVE_COMMAND_TYPES, LIVE_COMMAND_TTL_SECS],
   )).rows;
 }
 
@@ -281,7 +330,7 @@ export interface IngestResult {
  * session exists.
  */
 export async function ingestEvents(
-  connector: { connector_id: string; owner_user_id: string }, events: ParsedRemoteEvent[],
+  connector: { connector_id: string; owner_user_id: string }, events: ParsedRemoteEvent[], credential: string | null = null,
 ): Promise<IngestResult> {
   const owner = connector.owner_user_id;
   return inTransaction(async (q) => {
@@ -321,9 +370,9 @@ export async function ingestEvents(
         const d = (row.data ?? {}) as Record<string, any>;
         const base = { owner, actor: connector.connector_id, connectorId: connector.connector_id, agentId: owned.get(row.session_id), sessionId: row.session_id };
         if (row.type === REMOTE_EVENT_PERMISSION_REQUEST) {
-          await writeAudit(q, { ...base, action: "permission.requested", detail: { action_id: str(d.actionId), kind: str(d.kind), tool: str(d.tool, 200) } });
+          await writeAudit(q, { ...base, action: "permission.requested", detail: withCredential({ action_id: str(d.actionId), kind: str(d.kind), tool: str(d.tool, 200) }, credential) });
         } else if (row.type === REMOTE_EVENT_PERMISSION_RESOLVED) {
-          await writeAudit(q, { ...base, action: "permission.resolved", detail: { action_id: str(d.actionId), option_id: str(d.optionId), by: str(d.by) } });
+          await writeAudit(q, { ...base, action: "permission.resolved", detail: withCredential({ action_id: str(d.actionId), option_id: str(d.optionId), by: str(d.by) }, credential) });
         } else if (row.type === REMOTE_EVENT_SESSION_CLOSED) {
           closed.add(row.session_id);
         }
@@ -361,6 +410,22 @@ export async function listAudit(owner: string, filter: { sessionId: string | nul
 }
 
 
+/**
+ * The command already issued to this connector under `cmdId`, read from the audit trail, shaped like
+ * the queue row it replaces for the fields a caller compares (`type`, `session_id`, and a decision's
+ * `payload.option_id`). Null when there is none.
+ */
+async function commandIssued(q: Querier, owner: string, connectorId: string, cmdId: string): Promise<Row | null> {
+  const a = (await q(
+    `SELECT session_id::text AS session_id, detail FROM claw_remote_audit
+      WHERE owner_user_id = $1 AND connector_id = $2 AND action = 'command.issued' AND detail->>'cmd_id' = $3
+      ORDER BY id LIMIT 1`,
+    [owner, connectorId, cmdId],
+  )).rows[0];
+  if (!a) return null;
+  return { cmd_seq: null, cmd_id: cmdId, session_id: a.session_id, type: a.detail?.type, payload: { option_id: a.detail?.option_id } };
+}
+
 export type IssueOutcome =
   | { status: "rate_limited" }
   | { status: "queued" | "duplicate"; row: Row };
@@ -396,6 +461,12 @@ export async function issueCommand(r: IssueRequest): Promise<IssueOutcome> {
       [r.connectorId, r.cmdId],
     )).rows[0];
     if (dup) return { status: "duplicate", row: dup } as IssueOutcome;
+    // A heartbeat deletes the queue row once the connector has handled the command, and a retry
+    // may arrive after that (the response was lost, the connector ran it, the next heartbeat
+    // acknowledged it). The queue no longer remembers the command, so the audit trail, which is
+    // never pruned, does: for every command, not only a decision, or the retry would run it twice.
+    const prior = await commandIssued(q, r.owner, r.connectorId, r.cmdId);
+    if (prior) return { status: "duplicate", row: prior } as IssueOutcome;
     if (await recentCommandCount(q, r.owner) >= r.commandsPerMinute) return { status: "rate_limited" } as IssueOutcome;
     const queued = await enqueueCommand(q, { connectorId: r.connectorId, cmdId: r.cmdId, sessionId: r.sessionId, type: r.type, payload: r.payload });
     await writeAudit(q, {

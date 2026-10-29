@@ -27,8 +27,10 @@ The wire contract, limits and parsers are in `packages/protocol/src/remote-agent
 Every row belongs to one user, taken from the verified caller. Every read and
 write is filtered by it, so another user's id answers `404 not_found`, exactly as
 a missing id does. Administrators are ordinary callers here; they cannot read a
-user's sessions. A connector authenticates with the same credential as any other
-API call, and acts for the user that owns it.
+user's sessions. A connector acts for the user that owns it, and authenticates with
+either of two kinds of credential: the ones the whole API accepts (a key or a
+session), or an access token from the identity provider (see
+[Connector access tokens](#connector-access-tokens)).
 
 ## Connector side
 
@@ -55,6 +57,74 @@ Special event types: `permissionRequest` (`data.actionId`, `data.options[].optio
 `session_closed`. They are audited, and `permissionRequest` is what a decision is
 checked against.
 
+## Connector access tokens
+
+Beside a key or a session, the four connector-side routes (the table above)
+accept `Authorization: Bearer <access token>`: an RFC 9068 JWT that the identity
+provider issued to this API for a connector. It is verified with the shared
+[identity client](identity-client.md), which must be on (`IDENTITY_CLIENT_ENABLED`),
+and it is on only while `CLAW_REMOTE_AGENTS_ENABLED` is. With either off, a token is
+just an unknown credential and nothing changes.
+
+A token is accepted only if all of these hold, and is refused for exactly the one
+that does not (`401 invalid_token`, naming the reason, or `403 insufficient_scope`):
+
+| Check | |
+|---|---|
+| Signature | RS256 or ES256, by a key the issuer currently publishes |
+| `iss` | the configured issuer |
+| `aud` | `claw-api` (`CLAW_CONNECTOR_TOKEN_AUDIENCE`) |
+| `typ` | `at+jwt` |
+| `exp`, `nbf` | the token is current |
+| `scope` | contains `claw.connector` |
+| `sub` | a non-empty subject, which becomes the owner |
+
+The caller is the token's `sub` with the `default` role only, whatever roles or
+groups the token carries.
+
+**`sub` must be the same user id the user's own clients resolve to.** Every
+remote-agents row is owned by the caller's id. A person's own clients (a session cookie,
+an `ak-` key, a BYOK key) are owned by the id Claw's own authentication produces for
+them, so an identity provider has to issue the connector's token with that id as `sub`.
+If it issues some other subject (an opaque UUID where Claw has a user name, say), the
+connector registers and shows online, but that person's `GET /v1/remote-agents/connectors`
+is empty and `POST /v1/remote-agents/sessions` with its id is `404 not_found`, with no
+error naming the cause. Claw has no second source for the user's id, so it cannot detect
+the mismatch itself; it logs the id every connector is filed under at registration
+(`remote_agents.connector_registered`, with `owner` and `credential`), for an operator to
+compare with the id of the person's own session.
+
+**It authenticates on those four routes and nowhere else.** On the user-side
+routes, and on every other route of the API, a token is not a credential: the
+request is answered as one with no credential. The user side of this module also
+refuses a connector token itself (`403 connector_token_not_accepted`), so a change
+to what the global hook accepts cannot let a connector read a session or issue a
+command.
+
+**Revocation.** A token is checked locally, so a revoked grant is honoured until its
+token expires (minutes). Set `CLAW_CONNECTOR_TOKEN_INTROSPECT=true` to also ask the
+provider, on each request, whether the token is still active (the identity client
+caches an answer for a few seconds, `IDENTITY_INTROSPECTION_CACHE_SECONDS`); a revoked
+grant is then refused at once. A provider that cannot be asked is `503`, never a yes.
+
+**An open command stream** is authenticated once, when it opens, so it also ends with
+its token: at the token's `exp` the server sends `event: token_expired` (no `id`) and
+closes, and the connector reconnects with a fresh token. With introspection on, the
+stream is re-checked about as often as a ping, and a grant revoked in the meantime
+ends it with `event: revoked`, as a revoked connector does. A provider that cannot be
+asked does not cut a stream that was already authenticated; the token's expiry still
+bounds it. A stream opened with a key or a session has no such end.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CLAW_CONNECTOR_TOKEN_AUDIENCE` | `claw-api` | The `aud` a token must name |
+| `CLAW_CONNECTOR_TOKEN_INTROSPECT` | off | Ask the provider on each request whether the token is still active |
+
+The audit trail records, in `detail.credential`, how the caller was authenticated
+for the connector-side actions it keeps (`connector.registered`,
+`permission.requested`, `permission.resolved`): `connector_token`, `api_key`,
+`cookie` or `x_api_key`.
+
 ## Keepalive and presence
 
 The server sends `event: ping` every 25 s on the command stream (it carries no `id`,
@@ -78,16 +148,38 @@ connector-side route answers `401 revoked`.
 | `POST /v1/remote-agents/sessions` | `{connector_id, agent_id, cwd, mode?}`. `409 connector_offline` unless online. |
 | `GET .../sessions`, `GET .../sessions/:id` | List, and read one with `connector_online`. |
 | `POST .../sessions/:id/commands` | `{type: prompt\|cancel\|set_mode\|resume\|close, ...}`. `Idempotency-Key` makes a retry queue one command. |
-| `POST .../sessions/:id/decisions` | `{action_id, option_id}`, an option the agent offered. Answered twice, counted once. |
-| `GET .../sessions/:id/events` | History, a `historyComplete` marker, then live events, in the frame format of `/v1/chat/sessions/:id/messages`; resume with `?after=` or `Last-Event-ID`. `?mode=replay` returns JSON pages. |
+| `POST .../sessions/:id/decisions` | `{action_id, option_id}`, an option the agent offered. Answered twice, counted once: a different second choice is `409 already_decided`, even after the connector has acknowledged the first, because the audit trail remembers it. |
+| `GET .../sessions/:id/events` | History, a `historyComplete` marker, then live events, in the frame format of `/v1/chat/sessions/:id/messages`; resume with `Last-Event-ID` or `?after=`; when both are sent `Last-Event-ID` wins, because a browser reconnecting to the same URL changes only that header. `?mode=replay` returns JSON pages. |
 | `GET /v1/remote-agents/audit` | The caller's audit trail, filterable by `session_id` and `connector_id`. |
 
 `prompt`, `set_mode` and `resume` are refused with `409 connector_offline` while the
 connector is offline, so a prompt nobody could see being waited on cannot run later.
 `cancel`, `close` and `decision` are queued, since they are safe to deliver late.
 
+The same rule holds after a command is accepted. A connector counts as online for up to
+90 s after its connection has died unnoticed (a closed laptop), so a `prompt`, `set_mode` or
+`resume` accepted then goes into a dead socket. Such a command is delivered for 5 minutes
+(`REMOTE_AGENT_TIMING.liveCommandTtlMs`) and then dropped: a connector that comes back
+later is not sent it, and the queue row is deleted. A client that gets no events for a prompt
+sends it again. `cancel`, `close` and `decision` stay deliverable for a day.
+
+`Idempotency-Key` holds for as long as the audit trail does, not only while the command is
+queued: a retry made after the connector has acknowledged the command is answered
+`200 {duplicate: true}` and queues nothing, and the same key with another command type or
+another session is `409 idempotency_key_reused`.
+
 Limits per user: 5 connectors, 10 active sessions, 60 commands a minute, 20 open
 event streams per API replica.
+
+A write made through the same API replica reaches an open stream at once. A write
+made through another replica is found by the stream's own read of the database,
+which an idle stream does every 5 s, so it can arrive up to that much later.
+
+## Retention
+
+A closed session is deleted with all of its events `CLAW_REMOTE_AGENTS_RETENTION_DAYS`
+days (default 30) after it closed; each API replica checks hourly. Zero or less keeps
+them for ever. Live sessions are never deleted, and neither is the audit trail.
 
 ## Audit
 
@@ -95,4 +187,5 @@ event streams per API replica.
 label): connector registered and revoked, session created, every command issued, every
 permission requested and resolved. A prompt is recorded as its SHA-256 and length,
 never its text. A queued command is deleted once a heartbeat acknowledges it, or after a day
-unacknowledged: an instruction nobody has collected for that long should not run.
+unacknowledged (5 minutes for `prompt`, `set_mode` and `resume`): an instruction nobody has
+collected for that long should not run.

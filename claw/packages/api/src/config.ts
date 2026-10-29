@@ -114,6 +114,16 @@ export function resolveCorsOrigin(raw: string | undefined): string[] | false {
   return origins.length > 0 ? origins : false;
 }
 export const SAFE_API_URL = env("SAFE_API_URL");
+/**
+ * Management API of the Agent Sandbox control plane that `GET /v1/admin/sandbox/*`
+ * lists for the console. Not SANDBOX_ROUTER_URL: that names the Router Brain
+ * creates sandboxes through, which may sit in another cluster and expose only the
+ * data plane. The default is the in-cluster Service the sandbox chart creates.
+ */
+export const SANDBOX_ADMIN_URL = env(
+  "SANDBOX_ADMIN_URL",
+  "http://agent-sandbox-router.agent-sandbox-system.svc.cluster.local:8080",
+);
 
 // --- Deploy mode ---
 // "safe": existing SaFE deployment (SaFE auth). "kubernetes": standalone BYOK (no SaFE auth).
@@ -413,6 +423,27 @@ export const NOTIFY_LINK_BASE = env("NOTIFY_LINK_BASE", "/primus-claw");
 // When false: no remote-agent tables, no routes, and nothing polls. A connector
 // on a user's machine dials out to these routes; see docs/remote-agents.md.
 export const CLAW_REMOTE_AGENTS_ENABLED = envBool("CLAW_REMOTE_AGENTS_ENABLED", false);
+// Days a closed remote-agent session, with its stored events, is kept. Zero or
+// less keeps them for ever. The audit trail is not touched by this.
+export const CLAW_REMOTE_AGENTS_RETENTION_DAYS = envInt("CLAW_REMOTE_AGENTS_RETENTION_DAYS", 30);
+
+/**
+ * How a connector's access token is checked (see auth/connector-token.ts). Read
+ * on each use rather than once, so what a request is judged by is what the
+ * environment says now; both only matter while remote agents and the identity
+ * client are on.
+ *
+ *   CLAW_CONNECTOR_TOKEN_AUDIENCE    the `aud` the token must name, default claw-api
+ *   CLAW_CONNECTOR_TOKEN_INTROSPECT  also ask the identity provider whether the
+ *                                    token is still active, so a revoked grant
+ *                                    stops at once instead of when the token expires
+ */
+export function connectorTokenSettings(): { audience: string; introspect: boolean } {
+  return {
+    audience: env("CLAW_CONNECTOR_TOKEN_AUDIENCE", "claw-api"),
+    introspect: envBool("CLAW_CONNECTOR_TOKEN_INTROSPECT", false),
+  };
+}
 
 /**
  * Scheduled triggers: a cron schedule that starts a run as the user who created

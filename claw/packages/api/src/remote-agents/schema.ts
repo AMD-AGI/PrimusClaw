@@ -62,6 +62,10 @@ export async function ensureRemoteAgentSchema(client: pg.PoolClient): Promise<vo
   await client.query(
     "CREATE INDEX IF NOT EXISTS idx_remote_sessions_owner ON claw_remote_sessions(owner_user_id, created_at DESC)",
   );
+  // The retention sweep finds the sessions it may delete without reading the live ones.
+  await client.query(
+    "CREATE INDEX IF NOT EXISTS idx_remote_sessions_closed ON claw_remote_sessions(updated_at) WHERE status = 'closed'",
+  );
   await client.query(`
     CREATE TABLE IF NOT EXISTS claw_remote_events (
       id          BIGSERIAL PRIMARY KEY,
@@ -107,5 +111,10 @@ export async function ensureRemoteAgentSchema(client: pg.PoolClient): Promise<vo
   );
   await client.query(
     "CREATE INDEX IF NOT EXISTS idx_remote_audit_rate ON claw_remote_audit(owner_user_id, action, ts)",
+  );
+  // A command is remembered through its audit row once the queue has forgotten it (an Idempotency-Key
+  // retry, a second decision), so finding it must not read the owner's whole trail.
+  await client.query(
+    "CREATE INDEX IF NOT EXISTS idx_remote_audit_cmd ON claw_remote_audit((detail->>'cmd_id')) WHERE action = 'command.issued'",
   );
 }

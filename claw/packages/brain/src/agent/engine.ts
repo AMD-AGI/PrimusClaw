@@ -12,6 +12,7 @@ import { agentLoop } from "./agent-loop.js";
 import { resolveToolIds } from "../tools/resolve.js";
 import { marketplaceToolIds, pluginToolsHaveHooks, resolvePluginToolsFromMessage } from "../tasks/plugin-from-message.js";
 import { loadRules } from "./rules.js";
+import { bindRepo, renderRepoBlock } from "../workspace/repo-binding.js";
 import { normalizeMcpConfigs } from "../clients/mcp-config.js";
 import { approvalPolicyFromMcp } from "./approval-policy.js";
 import { HitlController } from "./hitl.js";
@@ -222,6 +223,17 @@ export class AgentEngine {
       metrics.onPlatformDefaultChat(buildProgressiveSkillHint(defaultProgressive, sessionDir).length);
     }
 
+    // A session bound to a repository has it set up now: the sandbox is opened
+    // here, not left to the first tool call, because the working tree has to be
+    // there before the conversation starts and the model has to be told what it
+    // is standing in. A failure of the setup itself is not this run's failure; it
+    // comes back as a reason and goes into the prompt. A sandbox that cannot be
+    // opened at all fails the run, as it does for any other turn that needs one.
+    // No `repo` on the request, no sandbox here and no block: the turn is what it was.
+    const repoBlock = request.repo
+      ? renderRepoBlock(await bindRepo(await sandbox(), request.repo, { signal }))
+      : "";
+
     const rules = loadRules();
     const fullPrompt = buildPrompt(
       request.prompt ?? "",
@@ -237,6 +249,7 @@ export class AgentEngine {
         teamRole: request.team_role,
       },
       progressiveSkills,
+      repoBlock,
     );
 
     logger.info({

@@ -24,6 +24,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/agent-sandbox/pkg/cmdlog"
+	"sigs.k8s.io/agent-sandbox/pkg/grant"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/nsadmission"
 	"sigs.k8s.io/agent-sandbox/pkg/safe"
@@ -77,6 +78,13 @@ type Server struct {
 	engine         *gin.Engine
 	jwt            *JWTManager
 	safeClient     *safe.Client // SaFE API Key verification client (nil when auth disabled)
+	grants         *grant.Service
+	// dp is the cross-cluster data-plane hop. Empty routes keep every sandbox local.
+	dp dataPlane
+
+	// policies caches the sealed allow-list of grant sandboxes by sandbox id.
+	policyMu sync.Mutex
+	policies map[string]cachedPolicy
 
 	// Readiness edge tracking, so the log records transitions rather than every
 	// probe. Guarded because readiness is served concurrently.
@@ -153,6 +161,8 @@ func (s *Server) setupRoutes() {
 	// The default recovery dumps request headers and masks only Authorization.
 	s.engine.Use(gin.RecoveryWithWriter(cmdlog.RedactingWriter(gin.DefaultErrorWriter)))
 	s.engine.Use(metricsMiddleware())
+	// E2B data plane. Runs before other routes and only when both headers are set.
+	s.engine.Use(s.e2bAccessGate)
 
 	// Health check endpoints (no concurrency limit)
 	s.engine.GET("/health/live", s.handleHealthLive)
@@ -225,6 +235,44 @@ func (s *Server) setupRoutes() {
 
 	// WM health (proxied for unified /v1/health)
 	v1.GET("/health", s.proxyToWM)
+
+	// Grant admin API. Outside /v1 so --enable-auth does not replace the
+	// caller service-account token. Workload Manager checks that token.
+	grants := s.engine.Group("/internal/v1/grants")
+	grants.POST("", s.proxyToWM)
+	grants.GET("/:grantId", s.proxyToWM)
+	grants.DELETE("/:grantId", s.proxyToWM)
+	grants.PATCH("/:grantId", s.proxyToWM)
+
+	// Data-plane hop from the managing cluster. The caller is another Router,
+	// authenticated by a hop token, not by an E2B access token.
+	s.engine.Any("/internal/v1/dataplane/:sandboxID/*proxyPath", s.handleDataPlaneHop)
+	// The same hop, when the path that arrives is already the envd path.
+	// A prefix strip in front of this Router otherwise ends in gin's 404 page.
+	for _, path := range []string{
+		"/files", "/files/*path",
+		"/process.Process/*path",
+		"/filesystem.Filesystem/*path",
+		"/api/files", "/api/files/*path",
+		"/api/execute", "/api/execute/*path",
+	} {
+		s.engine.Any(path, s.handleLocalEnvD)
+	}
+
+	// E2B control plane. Outside /v1 so SaFE auth does not replace X-API-KEY.
+	// Workload Manager resolves the key. A missing key is rejected here.
+	// /sandboxes and /v2/sandboxes are the same control plane. SDK 2.51+
+	// uses POST /v2/sandboxes and POST /v2/sandboxes/{id}/connect.
+	// PATCH sets the timeout.
+	for _, prefix := range []string{"/sandboxes", "/v2/sandboxes"} {
+		s.engine.POST(prefix, s.proxyE2B)
+		s.engine.GET(prefix, s.proxyE2B)
+		s.engine.GET(prefix+"/:sandboxID", s.proxyE2B)
+		s.engine.DELETE(prefix+"/:sandboxID", s.proxyE2B)
+		s.engine.PATCH(prefix+"/:sandboxID", s.proxyE2B)
+		s.engine.POST(prefix+"/:sandboxID/connect", s.proxyE2B)
+		s.engine.POST(prefix+"/:sandboxID/timeout", s.proxyE2B)
+	}
 }
 
 // namespaceAdmissionMiddleware rejects a request without a session ID whose
@@ -588,6 +636,24 @@ func (s *Server) handleInvoke(c *gin.Context, kind string) {
 			})
 			return
 		}
+	}
+
+	// A sealed grant sandbox is served only by the E2B data plane, which
+	// applies the sealed allow-list. Exec, terminal, files, port proxy and
+	// tunnel on this route do not.
+	policy, err := s.sessionPolicy(c, sessionID)
+	if errors.Is(err, errGrantRecordMissing) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "sandbox grant record is missing", "code": "sandbox_grant_missing"})
+		return
+	}
+	if err != nil {
+		log.Error("invoke: failed to read sealed policy", "error", err, "session_id", sessionID)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sandbox authentication unavailable"})
+		return
+	}
+	if policy.Sealed {
+		c.JSON(http.StatusForbidden, gin.H{"error": "sealed sandbox is served only by the E2B data plane", "code": "sealed_denied"})
+		return
 	}
 
 	// Inject session-id in response header
