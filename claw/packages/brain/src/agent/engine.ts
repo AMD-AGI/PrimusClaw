@@ -33,9 +33,10 @@ import {
   ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY, OPENAI_BASE_URL, OPENAI_API_KEY, LLM_API_STYLE,
   DEFAULT_MODEL, MAX_TURNS,
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED,
-  BASH_APPROVAL_RULES,
+  BASH_APPROVAL_RULES, A2A_CLIENT_ENABLED,
   PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED,
 } from "../config.js";
+import { a2aApprovalHold } from "../clients/a2a.js";
 import { WebSearchService, WebFetchService, SimpleSessionCostTracker } from "../tools/web/index.js";
 import type { ExecuteRequest, ExecuteResult, EventCallback } from "@claw/protocol";
 import type { ExecuteExtras } from "./index.js";
@@ -275,7 +276,9 @@ export class AgentEngine {
       ...[...pluginLayer.bashApproval, ...resolved.bashApproval].map((value) => ({ source: "tool_config", value })),
       { source: "BASH_APPROVAL_RULES", value: bashApprovalFromEnvValue(BASH_APPROVAL_RULES) },
     ]);
-    const anyApproval = approval.active || bashPolicy.active;
+    // With a2a_call on, an allow that answers a peer's approval request is held for the user
+    // (a2aApprovalHold). Nothing else changes: calls the policies do not name stay as they were.
+    const anyApproval = approval.active || bashPolicy.active || A2A_CLIENT_ENABLED;
     const decisions = anyApproval && extras?.natsConnection
       ? new DecisionDispatcher(extras.natsConnection, sessionId)
       : null;
@@ -283,7 +286,8 @@ export class AgentEngine {
       ? new HitlController(decisions, onEvent, {
           requireApproval: (t) => approval.requiresApproval(t),
           autoApprovalRule: (t, input) => approval.autoApprovalRule(t, input),
-          requireApprovalFor: (t, input) => (t.toLowerCase() === "bash" ? bashPolicy.check(input.command) : null),
+          requireApprovalFor: (t, input) =>
+            t.toLowerCase() === "bash" ? bashPolicy.check(input.command) : a2aApprovalHold(t, input),
         })
       : undefined;
 
@@ -327,6 +331,13 @@ export class AgentEngine {
       }, sandbox);
       router.lazySkillWriter = lazySkills;
       router.memoryEnabled = request.memory_enabled !== false;
+      // Whom an identity-authenticated a2a_call peer is called as, and when the run's budget ends.
+      const deadlineMs = request.deadline_at ? Date.parse(request.deadline_at) : NaN;
+      router.a2aContext = {
+        userId: request.user_id || undefined,
+        sessionId: request.session_id,
+        ...(Number.isFinite(deadlineMs) ? { deadlineAtMs: deadlineMs } : {}),
+      };
       const allToolSchemas = [...router.getToolSchemas(), ...mcpResult.schemas];
 
       const messages = [...(request.history || [])];

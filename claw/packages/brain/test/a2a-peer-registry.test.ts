@@ -11,6 +11,7 @@
  * The peers here are real HTTP servers, and every assertion about what left the
  * process reads what the server received, not what the code meant to send.
  */
+import "./a2a-client-env.js";
 import test, { afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -184,16 +185,23 @@ test("a registry peer works with its own credential: path, method and result", a
   const p = await peer();
   registry([{ name: "ci", url: `http://127.0.0.1:${p.port}/`, auth_env: "A2A_PEER_TOKEN_TEST", allow_local: true }]);
 
-  assert.equal(await handleA2ACall({ agent: "ci", message: "lint it" }), "hello from peer");
-  assert.equal(await handleA2ACall({ agent: "ci", message: "lint it", mode: "fire_and_forget" }), "Task created: t-1 (state: TASK_STATE_SUBMITTED)");
+  const streamed = JSON.parse(await handleA2ACall({ agent: "ci", message: "lint it" }));
+  assert.equal(streamed.state, "completed");
+  assert.equal(streamed.text, "hello from peer");
+  const ff = JSON.parse(await handleA2ACall({ agent: "ci", message: "lint it", mode: "fire_and_forget" }));
+  assert.equal(ff.state, "submitted");
+  assert.equal(ff.task_id, "t-1");
   assert.match(await handleA2ACall({ agent: "ci", message: "x", mode: "discover" }), /"name": "fake-peer"/);
 
-  const [stream, ff, card] = p.seen;
-  assert.equal(stream.url, "/a2a");
-  assert.equal(JSON.parse(stream.body).method, "SendStreamingMessage");
-  assert.equal(JSON.parse(stream.body).params.message.parts[0].text, "lint it");
-  assert.equal(JSON.parse(ff.body).method, "SendMessage");
+  // The card is read once and served from the cache after; the peer is then called where a bare-URL entry
+  // always was (its card names no interface, so `<base>/a2a`).
+  const [card, streamReq, ffReq] = p.seen;
   assert.equal(card.url, "/.well-known/agent-card.json");
+  assert.equal(streamReq.url, "/a2a");
+  assert.equal(JSON.parse(streamReq.body).method, "SendStreamingMessage");
+  assert.equal(JSON.parse(streamReq.body).params.message.parts[0].text, "lint it");
+  assert.equal(JSON.parse(ffReq.body).method, "SendMessage");
+  assert.equal(p.seen.length, 3);
   for (const r of p.seen) assert.equal(r.headers.authorization, `Bearer ${PEER_TOKEN}`);
 });
 
@@ -231,14 +239,15 @@ test("a peer on a loopback or link-local address is refused unless its entry all
   }
   assert.equal(p.seen.length, 0, "no refused peer was ever connected to");
 
+  const textOf = async () => JSON.parse(await handleA2ACall({ agent: "p", message: "hi" })).text;
   registry([{ name: "p", url: `http://127.0.0.1:${port}`, allow_local: true }]);
-  assert.equal(await handleA2ACall({ agent: "p", message: "hi" }), "hello from peer", "allow_local is the explicit exception");
-  assert.equal(p.seen.length, 1);
+  assert.equal(await textOf(), "hello from peer", "allow_local is the explicit exception");
+  assert.equal(p.seen.length, 2, "the card, then the call");
 
   // The exception covers a name that resolves to loopback too, not only a literal.
   registry([{ name: "p", url: `http://localhost:${port}`, allow_local: true }]);
-  assert.equal(await handleA2ACall({ agent: "p", message: "hi" }), "hello from peer");
-  assert.equal(p.seen.length, 2);
+  assert.equal(await textOf(), "hello from peer");
+  assert.equal(p.seen.length, 4);
 });
 
 test("isLocalAddress: loopback, link-local and unspecified only; private ranges stay reachable", () => {
@@ -282,22 +291,31 @@ test("a peer that redirects does not move the request somewhere the registry nev
 // ── A2A_AGENTS parsing ──────────────────────────────────────────────────────
 
 test("A2A_AGENTS parsing: both forms, and a bad entry is dropped and reported, never half-applied", () => {
+  // What an entry becomes, written out: the keys a later reader may rely on.
+  const peer = (over: Record<string, unknown>) => ({
+    name: "", url: undefined, cardUrl: "", authEnv: undefined, audience: undefined, scope: undefined, allowLocal: false, ...over,
+  });
   const legacy = parseA2AAgents("a=https://a.example/, b = http://b.svc:8080 ,c=https://c.example/x?y=1");
   assert.deepEqual(legacy.errors, []);
   assert.deepEqual(legacy.peers, [
-    { name: "a", url: "https://a.example", authEnv: undefined, allowLocal: false },
-    { name: "b", url: "http://b.svc:8080", authEnv: undefined, allowLocal: false },
-    { name: "c", url: "https://c.example/x?y=1", authEnv: undefined, allowLocal: false },
+    peer({ name: "a", url: "https://a.example", cardUrl: "https://a.example/.well-known/agent-card.json" }),
+    peer({ name: "b", url: "http://b.svc:8080", cardUrl: "http://b.svc:8080/.well-known/agent-card.json" }),
+    peer({ name: "c", url: "https://c.example/x?y=1", cardUrl: "https://c.example/x/.well-known/agent-card.json" }),
   ]);
 
   const json = parseA2AAgents(JSON.stringify([
     { name: "ci", url: "https://ci.example/", auth_env: "A2A_PEER_TOKEN_CI" },
     { name: "dev", url: "http://127.0.0.1:3000", allow_local: true },
+    { name: "claw2", card_url: "https://claw.example/claw-api/a2a/plugins/7/.well-known/agent-card.json", audience: "claw-api", scope: "claw.api" },
   ]));
   assert.deepEqual(json.errors, []);
   assert.deepEqual(json.peers, [
-    { name: "ci", url: "https://ci.example", authEnv: "A2A_PEER_TOKEN_CI", allowLocal: false },
-    { name: "dev", url: "http://127.0.0.1:3000", authEnv: undefined, allowLocal: true },
+    peer({ name: "ci", url: "https://ci.example", cardUrl: "https://ci.example/.well-known/agent-card.json", authEnv: "A2A_PEER_TOKEN_CI" }),
+    peer({ name: "dev", url: "http://127.0.0.1:3000", cardUrl: "http://127.0.0.1:3000/.well-known/agent-card.json", allowLocal: true }),
+    peer({
+      name: "claw2", cardUrl: "https://claw.example/claw-api/a2a/plugins/7/.well-known/agent-card.json",
+      audience: "claw-api", scope: "claw.api",
+    }),
   ]);
 
   const bad: Array<[string, string]> = [

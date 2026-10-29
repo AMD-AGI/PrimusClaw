@@ -35,8 +35,8 @@ test("flag off: byte-identical prompt, no marketplace traffic, no skill write", 
     + "Supporting files for each skill are at /workspace/.skills/{name}/. "
     + "Use bash/read to load them (e.g. `cat /workspace/.skills/{name}/actions/<step>.md`). "
     + "Follow the SKILL.md orchestrator above precisely.\n\n\n"
-    + "[Session Context]\n- Session ID: s1\n- User ID: u1\n"
-    + "- A2A Auth: the a2a_call tool handles authentication automatically. Do NOT use bash/curl for A2A calls — always use the a2a_call tool.",
+    // No "A2A Auth" line: a2a_call is off by default, and a tool that is not offered is not described.
+    + "[Session Context]\n- Session ID: s1\n- User ID: u1",
   );
   assert.equal(world.listCalls, 0, "no marketplace call");
   assert.equal(hands.calls.filter((c) => c.name === "write").length, 0, "nothing written");

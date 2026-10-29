@@ -28,6 +28,24 @@ record it.
 ## [Unreleased]
 
 ### Added
+- The `a2a_call` tool is now a complete A2A client, off by default behind `A2A_CLIENT_ENABLED` (chart `extraEnv`;
+  while it is off the tool is not offered to the model and a call that arrives anyway is refused). With it on:
+  a peer is called where its Agent Card says (the JSONRPC 1.0 `supportedInterfaces` entry, cached by `ETag` /
+  `Cache-Control`) instead of at a guessed `<base>/a2a`, and only on the origin the operator wrote down; the
+  result is JSON `{state, task_id, context_id, text, artifacts, input_required?}` instead of text; `mode` gains
+  `get` and `cancel`, and `context_id` continues a conversation; a peer that asks for input or approval comes
+  back as `state=input_required` with the question (and a structured approval request when the peer sends one),
+  and the model answers by calling again with the `task_id` (`approval` for an approval request, whose `allow`
+  is held for the user's own approval before it is sent); a streamed call stops waiting after
+  `A2A_STREAM_IDLE_TIMEOUT_MS` (default 120 s) without an event, or `A2A_STREAM_MAX_MS` (default 600 s) in
+  total or when the run's budget is nearly spent, and then returns `state=working` with the `task_id` rather than
+  failing; and the user's Stop sends `CancelTask` to the peer. A peer entry in `A2A_AGENTS` may now set
+  `card_url`, and either `audience` (and optionally `scope`) -- Brain exchanges a short-lived token for the
+  session's user at primus-identity (`user_id:<owner>`, RFC 8693) and calls the peer as them; the token stays in
+  the Brain process -- or `auth_env` as before (a service credential, the peer sees Claw rather than the user).
+  An entry with a key it does not know, or with both `auth_env` and `audience`, is refused. The tool's `skill`
+  parameter, which nothing read, is gone. With the switch off the prompt also loses its "A2A Auth" line.
+  See `claw/docs/agent-server-design.md`, "Outbound `a2a_call`".
 - The API accepts an access token from an OpenID Connect identity provider (`Authorization: Bearer <JWT>`,
   verified by the shared identity client against the issuer's key set) as a credential beside the existing
   ones, behind `CLAW_IDENTITY_TOKEN_AUTH_ENABLED` (off by default; also needs `IDENTITY_CLIENT_ENABLED`).
