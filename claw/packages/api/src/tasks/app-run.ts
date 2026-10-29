@@ -82,6 +82,8 @@ export interface AppGrantIssued {
   keys?: Partial<Record<AppSandboxRole, string>>;
   /** The limits actually granted (no keys). */
   limits?: Record<string, unknown>;
+  /** The template names the grant made available, `{ role: { cards: name } }`. No secret; stored as is. */
+  templates?: Record<string, Record<string, string>>;
   expiresAt?: Date | string | null;
 }
 
@@ -91,6 +93,10 @@ export interface AppGrantRequest {
   resources: ResolvedAppResources;
   /** The manifest's templates, with the run's image and workspace filled in where a template sets none. */
   templates: Array<Record<string, unknown>>;
+  /** The caller's SaFE platform key. The grant service seals it. */
+  platformKey?: string;
+  /** Display name stored on the grant. The user id is used when this is empty. */
+  userName?: string;
 }
 
 /**
@@ -230,15 +236,21 @@ export function planAppRun(manifest: AppManifestV1, r: ResolvedAppResources): Ap
   if (r.cpu !== undefined) resources.cpu = String(r.cpu);
   if (r.memoryGi !== undefined) resources.memory = `${r.memoryGi}Gi`;
   const sandboxSpec: Record<string, unknown> = { handle: "app", image: r.image, namespace: r.workspace };
+  // Kept for a later reissue. Omitted when it is the app workspace, which is
+  // already `namespace`, so an older spec still means "the same workspace".
+  if (r.sandboxWorkspace !== r.workspace) sandboxSpec.sandbox_workspace = r.sandboxWorkspace;
   if (Object.keys(resources).length > 0) sandboxSpec.resources = resources;
   const workspaceIds = [r.workspace];
   if (!workspaceIds.includes(r.sandboxWorkspace)) workspaceIds.push(r.sandboxWorkspace);
   return { sandboxSpec, workspaceId: r.workspace, workspaceIds };
 }
 
-/** A grant id for one attempt. Never reused, never derived from the Idempotency-Key. */
+/**
+ * A grant id for one attempt. Never reused, never derived from the Idempotency-Key.
+ * A DNS-1123 label (`gr-` plus a ulid): Agent Sandbox stores it as the grant's name.
+ */
 export function newGrantId(): string {
-  return `grt_${ulid().toLowerCase()}`;
+  return `gr-${ulid().toLowerCase()}`;
 }
 
 /** Run `fn` with an AbortSignal that fires after `ms`; a call that has not returned by then fails. */
@@ -436,7 +448,15 @@ export async function admitAppRun(
   let issued: AppGrantIssued | void;
   try {
     issued = await withTimeout(APP_GRANT_ISSUE_TIMEOUT_MS, "grant issue", (signal) => ports.grant.issue(
-      grantRun, manifest, { resources: resolved, templates: appGrantTemplates(manifest, resolved) }, signal,
+      grantRun,
+      manifest,
+      {
+        resources: resolved,
+        templates: appGrantTemplates(manifest, resolved),
+        platformKey: req.user.platformKey,
+        userName: req.user.userName,
+      },
+      signal,
     ));
   } catch (err) {
     logger.error(
@@ -486,8 +506,8 @@ export async function admitAppRun(
       await client.query(
         `INSERT INTO claw_app_runs (
            task_id, session_id, plugin_id, manifest, idempotency_key, state, mcp_token_enc,
-           grant_id, grant_keys_enc, grant_limits, grant_expires_at, created_by, request_hash
-         ) VALUES ($1, $2, $3, $4::jsonb, $5, 'provisioning', $6, $7, $8, $9::jsonb, $10, $11, $12)`,
+           grant_id, grant_keys_enc, grant_limits, grant_expires_at, created_by, request_hash, grant_templates
+         ) VALUES ($1, $2, $3, $4::jsonb, $5, 'provisioning', $6, $7, $8, $9::jsonb, $10, $11, $12, $13::jsonb)`,
         [
           taskId, req.sessionId, pluginId, JSON.stringify(manifest), req.idemKey,
           sealAppRunSecret(newMcpToken(), taskId, "mcp_token"),
@@ -497,6 +517,7 @@ export async function admitAppRun(
           issued?.expiresAt ?? null,
           req.user.userId,
           req.requestHash,
+          issued?.templates ? JSON.stringify(issued.templates) : null,
         ],
       );
       logger.info({ sessionId: req.sessionId, taskId, pluginId }, "app_run.created");

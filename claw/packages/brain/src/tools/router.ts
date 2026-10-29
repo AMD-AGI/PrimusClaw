@@ -44,6 +44,9 @@ function validateSubFilePath(filePath: string): string | null {
   return null;
 }
 
+/** A sandbox tool input that touches the skills directory. */
+const SKILLS_PATH_RE = /\.skills\b/;
+
 const BRAIN_NETWORK_TOOLS = new Set(["web_search", "web_fetch"]);
 
 const BG_SHELL_TOOLS = new Set(["bash_output", "kill_shell", "wait"]);
@@ -128,12 +131,12 @@ function scanContent(content: string, maxLength: number): string | null {
  * - Platform MCP tools (mcp__server__tool) → remote MCP servers (Brain-side)
  * - save_memory / save_skill → local pending buffers (flushed via exec_complete)
  *
- * Feature-flag contract (intentional design): save_memory / save_skill /
- * *_skill_file schemas stay exposed here regardless of API-side flag state
- * (CLAW_MEMORY_ENABLED / CLAW_SKILL_EVOLUTION_ENABLED) — the API silently
- * discards the exec_complete payload when a flag is OFF, so brain stays
- * stateless w.r.t. flags at the cost of an optimistic "saved" reply that
- * never reaches the DB.
+ * Feature-flag contract: save_skill / *_skill_file schemas stay exposed
+ * regardless of CLAW_SKILL_EVOLUTION_ENABLED (the API discards the payload
+ * when it is off). save_memory is different: the API tells Brain per request
+ * whether memory is active (`memory_enabled`), and when it is not the tool is
+ * not offered and a call is refused, so the agent is never told "saved" for a
+ * write the API will drop.
  */
 export class ToolRouter {
   readonly pendingMemories: PendingMemory[] = [];
@@ -149,6 +152,9 @@ export class ToolRouter {
    *  Hands sandbox is rebuilt mid-task, every child router is updated too so
    *  in-flight sub-agents transparently switch over to the new sandbox. */
   private readonly children: Set<ToolRouter> = new Set();
+
+  /** False when the API said memory is off for this user; save_memory is then withheld. */
+  memoryEnabled = true;
 
   private webServices: WebToolServices;
 
@@ -169,6 +175,14 @@ export class ToolRouter {
    * client, since a sub-agent only exists once the parent has run a tool.
    */
   private attachHands?: () => Promise<HandsClient>;
+
+  /**
+   * Platform-default skills are written into the sandbox on first need, not at
+   * run start. Set by the engine only when defaults are mounted; absent, the
+   * sandbox branch of route() is exactly what it was. Inherited by children so
+   * a sub-agent reading a default skill triggers the same write.
+   */
+  lazySkillWriter?: { ensure(hands: HandsClient, text: string, coldSandbox: boolean): Promise<void> };
 
   constructor(
     private hands: HandsClient | null,
@@ -245,6 +259,7 @@ export class ToolRouter {
 
   /** Register a child router so subsequent setHands() cascades to it. */
   registerChild(child: ToolRouter): void {
+    child.lazySkillWriter = this.lazySkillWriter;
     this.children.add(child);
   }
 
@@ -325,6 +340,9 @@ export class ToolRouter {
     // save_memory / save_skill → validate immediately, buffer, flush via exec_complete.
     // Synchronous scan ensures Agent gets accurate feedback (not optimistic "saved").
     if (name === "save_memory") {
+      if (!this.memoryEnabled) {
+        return refuse(outcome, "Error: memory is turned off for this user; nothing was saved.");
+      }
       const content = input.content as string || "";
       const blocked = scanContent(content, 2000);
       if (blocked) {
@@ -399,7 +417,15 @@ export class ToolRouter {
       // and the file was missing (e.g. Pi/Codex don't materialize skills to disk),
       // the skill name still landed in skillsRead and polluted feedback / probation /
       // evolution stats with attribution to a skill that never actually loaded.
-      const answered = await (await this.requireHands()).callToolFull(name, input, signal, ctx);
+      const coldSandbox = !this.hands;
+      const sandboxHands = await this.requireHands();
+      // First touch of a platform-default skill: write it before the call that
+      // would read it. Tied to the call naming `.skills`, so a chat that never
+      // goes there never pays for the upload.
+      if (this.lazySkillWriter && SKILLS_PATH_RE.test(JSON.stringify(input))) {
+        await this.lazySkillWriter.ensure(sandboxHands, JSON.stringify(input), coldSandbox);
+      }
+      const answered = await sandboxHands.callToolFull(name, input, signal, ctx);
       if (outcome) {
         outcome.isError = answered.isError;
         // The durable state of a shell is a field, not a sentence. Dropping it
@@ -435,6 +461,11 @@ export class ToolRouter {
    * Field names MUST match what Hands tools expect.
    */
   getToolSchemas(): ToolSchema[] {
+    const all = this.allToolSchemas();
+    return this.memoryEnabled ? all : all.filter((t) => t.name !== "save_memory");
+  }
+
+  private allToolSchemas(): ToolSchema[] {
     return [
       { name: "save_memory", description: "Save a durable fact to long-term memory for future sessions. Use when: (1) user explicitly asks to remember something, (2) you discover an important environment/project fact, (3) user corrects you and the correction is generally applicable. Do NOT save task progress or session-specific details. Write content in the same language the user uses.", input_schema: {
         type: "object", properties: {

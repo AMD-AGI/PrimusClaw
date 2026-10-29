@@ -8,14 +8,16 @@ import multipart from "@fastify/multipart";
 import {
   API_PORT, APP_ENV, SAFE_API_URL, DATABASE_URL, resolveCorsOrigin,
   AUTH_INTERNAL_TOKEN, NATS_URL,
-  CLAW_MEMORY_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED,
+  CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
   runLeaseTiming, envSettingProblems, assertAdmissionSettings,
 } from "./config.js";
 import { runLeaseTimingProblems } from "@claw/protocol";
 import { initDb } from "./infra/db.js";
+import { bindApiAppGrant } from "./grants/app-grant.js";
 import { initNats } from "./infra/nats.js";
 import { initUserEnvCrypto } from "./crypto/user-env.js";
 import { authLogPath, authMiddleware } from "./auth/middleware.js";
+import { startIdentityClient } from "./auth/identity.js";
 import { registerSessionRoutes } from "./routes/sessions.js";
 import { registerEventRoutes } from "./routes/events.js";
 import { registerAnthropicManagedAgentsRoutes } from "./routes/anthropic-managed-agents.js";
@@ -25,7 +27,10 @@ import { registerSkillRoutes } from "./routes/skills.js";
 import { registerA2ARoutes } from "./routes/a2a.js";
 import { registerPluginRoutes } from "./routes/plugins.js";
 import { registerUserEnvVarRoutes } from "./routes/user-env-vars.js";
+import { registerNotificationSubscriptionRoutes } from "./routes/notification-subscriptions.js";
+import { startNotificationWorker } from "./notifications/outbox.js";
 import { registerSystemEnvVarRoutes, publishSystemEnvToKv } from "./routes/system-env-vars.js";
+import { registerSandboxAdminRoutes } from "./routes/sandbox-admin.js";
 import { registerMcpRoutes } from "./routes/mcp.js";
 import { registerInternalTaskRoutes } from "./routes/internal-tasks.js";
 import { registerInternalRunRoutes } from "./routes/internal-runs.js";
@@ -35,12 +40,15 @@ import { registerTaskDagRoutes } from "./routes/task-dags.js";
 import { registerTaskRoutes } from "./routes/tasks.js";
 import { registerRunRoutes } from "./runs/routes.js";
 import { registerWorkbenchRoutes } from "./workbenches/routes.js";
+import { registerTriggerRoutes } from "./routes/triggers.js";
+import { startTriggerScheduler } from "./triggers/scheduler.js";
 import { startScheduler } from "./tasks/scheduler.js";
 import { startSweeper } from "./tasks/sweeper.js";
 import { startExternalResolver } from "./tasks/external-resolver.js";
 import { startEventConsumer } from "./events/consumer.js";
 import { startEvolveWorker } from "./marketplace/evolve-worker.js";
 import { startUploadSweeper } from "./sessions/upload-sweeper.js";
+import { archiveIdleSessions } from "./sessions/archive.js";
 import { decayMemory } from "./memory/service.js";
 import { cleanupOrphanSkillFiles, cleanupOldPatterns } from "./marketplace/skill-service.js";
 import { registry as metricsRegistry } from "./infra/metrics.js";
@@ -144,10 +152,13 @@ async function main() {
   // otherwise start exporting neither.
   assertRolloutConfigAtStartup();
   assertAdmissionSettings(logger);
+  // Off unless IDENTITY_CLIENT_ENABLED is set; nothing authenticates through it yet.
+  startIdentityClient(logger);
   // Validate USER_ENV_ENCRYPTION_KEY before doing anything else; we want a
   // fast-fail if the K8s Secret is misconfigured (missing or wrong length),
   // not a runtime surprise on the first PUT /v1/users/me/env-vars/* call.
   initUserEnvCrypto();
+  bindApiAppGrant();
   await initDb();
   await initNats();
 
@@ -260,7 +271,9 @@ async function main() {
   await registerA2ARoutes(app);
   await registerPluginRoutes(app);
   await registerUserEnvVarRoutes(app);
+  await registerNotificationSubscriptionRoutes(app);
   await registerSystemEnvVarRoutes(app);
+  await registerSandboxAdminRoutes(app);
   await registerMcpRoutes(app);
   await registerInternalTaskRoutes(app);
   await registerInternalRunRoutes(app);
@@ -270,6 +283,8 @@ async function main() {
   await registerTaskRoutes(app);
   await registerRunRoutes(app);
   await registerWorkbenchRoutes(app);
+  // Scheduled triggers: nothing is registered unless the deployment turns them on.
+  if (CLAW_TRIGGERS_ENABLED) await registerTriggerRoutes(app);
 
   // Reconcile SYSTEM_ENV KV with DB at boot so brain sees current global env
   // even if no admin write happens during this process lifetime.
@@ -297,6 +312,11 @@ async function main() {
   // Background upload TTL sweeper (deletes user uploads > UPLOAD_TTL_DAYS old)
   startUploadSweeper();
 
+  if (CLAW_TRIGGERS_ENABLED) startTriggerScheduler();
+  // Outbound notification delivery (HMAC-signed webhooks from the outbox).
+  // Gated: with the flag off no table exists and nothing polls.
+  if (CLAW_NOTIFICATIONS_ENABLED) startNotificationWorker();
+
   // Daily maintenance crons (every 24h, first run 1 min after startup).
   // Memory decay gated by CLAW_MEMORY_ENABLED, skill cleanups gated by
   // CLAW_SKILL_EVOLUTION_ENABLED — when OFF, old data is fully frozen so
@@ -305,12 +325,13 @@ async function main() {
     if (CLAW_MEMORY_ENABLED) {
       decayMemory().catch(err => logger.error({ err }, "memory.decay_failed"));
     }
+    archiveIdleSessions(SESSION_AUTO_ARCHIVE_DAYS).catch(err => logger.error({ err }, "session_archive.failed"));
     if (CLAW_SKILL_EVOLUTION_ENABLED) {
       cleanupOrphanSkillFiles().catch(err => logger.error({ err }, "skill_files.cleanup_failed"));
       cleanupOldPatterns().catch(err => logger.error({ err }, "skill_patterns.cleanup_failed"));
     }
   };
-  if (CLAW_MEMORY_ENABLED || CLAW_SKILL_EVOLUTION_ENABLED) {
+  if (CLAW_MEMORY_ENABLED || CLAW_SKILL_EVOLUTION_ENABLED || SESSION_AUTO_ARCHIVE_DAYS > 0) {
     setTimeout(() => {
       runMaintenance();
       setInterval(runMaintenance, 24 * 60 * 60 * 1000);

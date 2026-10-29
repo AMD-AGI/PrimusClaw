@@ -17,12 +17,14 @@ export * from "./sandbox/hands-key.js";
 export * from "./sandbox/shell-record.js";
 export * from "./sandbox/shell-classify.js";
 export * from "./sandbox/hands-route.js";
+export * from "./sandbox/terminal-hold.js";
 // The one definition of what a published background-work verdict is and when
 // it may still be believed. Exported from the package because the writer lives
 // in Brain and one of the readers lives in the API, and a second copy of these
 // rules is a defect waiting for the two to drift.
 export {
   BG_VERDICT_TTL_MS,
+  DEFAULT_SANDBOX_IDLE_REUSE_SECONDS,
   SHARED_VERDICT_FIELDS,
   measuredUnderThisIdlePeriod,
   reuseWindowStart,
@@ -53,3 +55,5 @@ export type { HandleInfo } from "./sandbox/handle-map.js";
 export { getHandleEntry, setHandleEntry } from "./sandbox/handle-map.js";
 export * from "./app-manifest.js";
 export * from "./app-resources.js";
+export * from "./sandbox-grant.js";
+export * from "./app-sandbox-templates.js";

@@ -23,6 +23,8 @@ import {
   readTrustedSessionCredentials,
 } from "../auth/session-credentials.js";
 import { CLAW_DEPLOY_MODE } from "../config.js";
+import { isMemoryActive } from "../memory/service.js";
+import { resolveTaskPlugin } from "../marketplace/plugins.js";
 import { db } from "../infra/db.js";
 import { js, sc, publishCertainlyFailed } from "../infra/nats.js";
 import pino from "pino";
@@ -351,6 +353,42 @@ async function bindRunFiles(
 }
 
 /**
+ * The plugin tool list for an agent run, from the same reader the chat paths use.
+ *
+ * Brain builds a run's MCP servers, skills, rules and bash approval rules from
+ * this list, so a row that names `plugin_id` and ships without it runs with none
+ * of them and with every bash command held. Only the agent loop reads it: a
+ * script run is told each step's scope by `renderTaskForDispatch`, and an app
+ * run is dispatched exactly as admitted, so neither carries it.
+ *
+ * Seen as the session's owner sees the plugin, without an admin override -- the
+ * owner's roles are not on the row, and not asking can only show less. A plugin
+ * that cannot be read gives null rather than failing the dispatch: a DAG node
+ * has no retry, and Brain fails closed on null.
+ *
+ * @returns undefined when the run names no plugin or is not an agent run.
+ */
+async function pluginToolsForRun(
+  row: ClawTaskRow,
+  ownerUserId: string,
+): Promise<unknown[] | null | undefined> {
+  if (row.plugin_id === null || row.plugin_id === undefined) return undefined;
+  if (((row.mode as TaskMode) ?? "llm") !== "llm") return undefined;
+  try {
+    const plugin = await withTimeout(
+      "resolveTaskPlugin", resolveTaskPlugin(row.plugin_id, ownerUserId, false),
+    );
+    return plugin.tools;
+  } catch (err) {
+    logger.warn(
+      { taskId: row.task_id, pluginId: row.plugin_id, err: (err as Error)?.message },
+      "task.plugin_resolve_failed",
+    );
+    return null;
+  }
+}
+
+/**
  * Assemble the message Brain executes.
  *
  * On the legacy NATS subject, so Brain's existing consumer picks it up without
@@ -362,8 +400,11 @@ function buildExecuteRequest(opts: {
   session: Awaited<ReturnType<typeof loadSessionCredentials>>;
   internalToken: string;
   filesWorkspaceId: string;
+  memoryEnabled: boolean;
+  /** From `pluginToolsForRun`; undefined leaves the field off the message. */
+  pluginTools: unknown[] | null | undefined;
 }): ExecuteRequest {
-  const { updated, rendered, session, internalToken, filesWorkspaceId } = opts;
+  const { updated, rendered, session, internalToken, filesWorkspaceId, memoryEnabled, pluginTools } = opts;
   const sandboxSpecForBrain = (rendered.sandbox_spec ?? "none") as ExecuteRequest["sandbox_spec"];
   // Lift per-user env snapshot from task.input back to the top-level
   // ExecuteRequest field Brain expects. expandDag embedded it under
@@ -404,9 +445,10 @@ function buildExecuteRequest(opts: {
     user_id: session.user_id || "",
     user_env: userEnvForReq,
     plugin_id: updated.plugin_id ?? undefined,
-    plugin_tools: null,
+    ...(pluginTools !== undefined ? { plugin_tools: pluginTools } : {}),
     prompt: rendered.prompt ?? undefined,
     history: [],
+    memory_enabled: memoryEnabled,
     script: rendered.script as ExecuteRequest["script"] | undefined,
     tools_allowlist: (updated.tools_allowlist as string[]) ?? undefined,
     model: updated.model ?? undefined,
@@ -579,6 +621,8 @@ export async function dispatchPreparedRow(locked: ClawTaskRow): Promise<Dispatch
     );
     const req = buildExecuteRequest({
       updated, rendered, session, internalToken, filesWorkspaceId,
+      memoryEnabled: await isMemoryActive(session.user_id || ""),
+      pluginTools: await pluginToolsForRun(updated, session.user_id || ""),
     });
 
     // 5. Publish. Serialised first, and the flag set only once there is

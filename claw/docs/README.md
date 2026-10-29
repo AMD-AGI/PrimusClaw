@@ -21,6 +21,8 @@ wins.
 | [`brain-graceful-upgrade.md`](brain-graceful-upgrade.md) | Draining and restarting Brain without losing in-flight runs |
 | [`litellm-auto-routing-design.md`](litellm-auto-routing-design.md) | Complexity-based model routing through the LiteLLM gateway |
 | [`plugins.md`](plugins.md) | The plugin format and the marketplace import path |
+| [`platform-defaults.md`](platform-defaults.md) | Deployment-level default skills and MCP servers mounted into every chat, with progressive skill loading |
+| [`identity-client.md`](identity-client.md) | The shared OIDC / introspection / token-exchange client: settings, cache windows, behaviour when the provider is down, metrics |
 | [`run-api.md`](run-api.md) | Platform run status, terminal classification, batch reads, and cursor pagination |
 | `architecture.drawio` | Editable source for the architecture diagram |
 

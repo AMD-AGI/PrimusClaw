@@ -331,6 +331,73 @@ export async function formatPluginRow(r: JsonObject, enrichRefs = false): Promis
   };
 }
 
+/**
+ * The plugin as `GET /v1/plugins/:id` shows it to this user, or null when it is
+ * missing or the user may not see it. The two are not told apart on purpose:
+ * callers that expose the answer (an A2A agent card or endpoint) must not
+ * become an existence oracle for private plugins.
+ */
+export async function getViewablePlugin(
+  pluginId: number,
+  userId: string | undefined,
+  admin: boolean,
+): Promise<JsonObject | null> {
+  const row = await MarketplaceDb.pluginGetById(pluginId, false);
+  if (!row || !canViewPlugin(row, userId, admin)) return null;
+  return formatPluginRow(row, true);
+}
+
+/**
+ * What a dispatch takes from the plugin it was asked to run under.
+ *
+ * `tools` is the list Brain expands into MCP servers, skills, rules and bash
+ * approval rules, so it is the one thing a turn cannot be dispatched without.
+ */
+export interface TaskPlugin {
+  /**
+   * The plugin's tools as `GET /v1/plugins/:id` shows them to this user, or
+   * null when the plugin is missing or the user may not see it. Null is not an
+   * empty list: Brain reads it as "the plugin's rules are unknown" and holds
+   * every bash command, where an empty list declares that the plugin has none.
+   */
+  tools: unknown[] | null;
+  image: string | undefined;
+  resource: JsonObject | undefined;
+}
+
+/**
+ * Resolve a plugin for one dispatch.
+ *
+ * The single reader every path that publishes a turn for a plugin goes through
+ * (immediate dispatch, the queued-message drain, the task dispatcher), so they
+ * cannot disagree about what `plugin_tools` is. A path that names `plugin_id`
+ * on a message and skips this hands Brain a plugin it knows nothing about.
+ *
+ * Visibility is the caller's: `userId` is the session owner, and `admin` is
+ * true only for a path that holds that owner's authenticated roles. A path that
+ * does not has to pass false, which can only narrow what is returned.
+ */
+export async function resolveTaskPlugin(
+  pluginId: number,
+  userId: string | undefined,
+  admin: boolean,
+): Promise<TaskPlugin> {
+  const formatted = await getViewablePlugin(pluginId, userId, admin);
+  if (!formatted) return { tools: null, image: undefined, resource: undefined };
+  const resource = formatted.resource;
+  return {
+    tools: (formatted.tools as unknown[]) ?? [],
+    image: pluginSandboxImage(formatted.images) || undefined,
+    // A plugin created without an explicit `resource` formats to `{}`, which is
+    // truthy and would permanently mask the deployment default in a
+    // `request || plugin || default` chain. Only a non-empty object is an answer.
+    resource: resource && typeof resource === "object" && !Array.isArray(resource)
+      && Object.keys(resource).length > 0
+      ? (resource as JsonObject)
+      : undefined,
+  };
+}
+
 export function formatResourceRow(r: JsonObject): JsonObject {
   // Resources are now globally readable; visibility is no longer per-row.
   // ``type`` is surfaced so callers can identify the default resource entry.

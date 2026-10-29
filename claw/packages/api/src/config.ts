@@ -6,6 +6,7 @@ import {
   DEFAULT_BRAIN_REGISTRY_TTL_MS,
   DEFAULT_RUN_LEASE_HEARTBEAT_MS,
   DEFAULT_RUN_LEASE_TTL_MS,
+  DEFAULT_SANDBOX_IDLE_REUSE_SECONDS,
   DEFAULT_TASK_MAX_ACK_PENDING,
   DEFAULT_TASK_MAX_DELIVER,
   MIN_RENEWAL_INTERVAL_MS,
@@ -113,6 +114,16 @@ export function resolveCorsOrigin(raw: string | undefined): string[] | false {
   return origins.length > 0 ? origins : false;
 }
 export const SAFE_API_URL = env("SAFE_API_URL");
+/**
+ * Management API of the Agent Sandbox control plane that `GET /v1/admin/sandbox/*`
+ * lists for the console. Not SANDBOX_ROUTER_URL: that names the Router Brain
+ * creates sandboxes through, which may sit in another cluster and expose only the
+ * data plane. The default is the in-cluster Service the sandbox chart creates.
+ */
+export const SANDBOX_ADMIN_URL = env(
+  "SANDBOX_ADMIN_URL",
+  "http://agent-sandbox-router.agent-sandbox-system.svc.cluster.local:8080",
+);
 
 // --- Deploy mode ---
 // "safe": existing SaFE deployment (SaFE auth). "kubernetes": standalone BYOK (no SaFE auth).
@@ -199,6 +210,37 @@ export const BRAIN_REGISTRY_TTL_MS = envInt(
   "BRAIN_REGISTRY_TTL_MS",
   DEFAULT_BRAIN_REGISTRY_TTL_MS,
 );
+
+// --- Starting a session's sandbox without a turn ---
+// `POST /v1/sessions/:id/sandbox` brings up (or reuses) the sandbox through the
+// same run path a turn uses, so it asks for nothing a turn would not and is on
+// by default; setting this false answers 404 as if the route did not exist,
+// which clients treat as "not available" and fall back from.
+export const SESSION_SANDBOX_START_ENABLED = envBool("SESSION_SANDBOX_START_ENABLED", true);
+// How long one start or keepalive claims the sandbox for an interactive
+// terminal. The claim lives in the registry bucket, whose entries are dropped
+// after BRAIN_REGISTRY_TTL_MS without a write, so a longer claim would be
+// forgotten early: the value is capped there, and renewing it is the client's
+// job while the terminal stays open. A client that goes away stops renewing and
+// the claim lapses on its own, after which ordinary idle reclaim applies.
+export const SESSION_SANDBOX_HOLD_MS = Math.min(
+  envInt("SESSION_SANDBOX_HOLD_SECONDS", 300, { min: 30 }) * 1000,
+  BRAIN_REGISTRY_TTL_MS,
+);
+
+// --- How long an idle sandbox stays reusable ---
+// Brain's setting, read here under the same name and default because the orphan
+// sweep has to agree with Brain about when an idle sandbox stops being worth
+// keeping: a sweep that reaps earlier than Brain would reclaim defeats the reuse
+// window, one that reaps later only delays a reclaim Brain already owns. Both
+// deployments take primus-claw-secrets, so one operator value reaches both.
+//
+// This is the capacity knob for parked sandboxes. Each one holds a workload slot
+// for up to this long after the session's last turn; lowering it returns the slot
+// sooner and makes more turns cold-start (10-15 s), raising it does the reverse.
+export const SANDBOX_IDLE_REUSE_MS = envInt(
+  "SANDBOX_IDLE_REUSE_SECONDS", DEFAULT_SANDBOX_IDLE_REUSE_SECONDS, { min: 1 },
+) * 1000;
 
 // Replica counts for the KV buckets this process creates, read from the same
 // variables brain reads for the two it shares -- same reasoning as the TTL
@@ -336,6 +378,13 @@ export const UPLOAD_TTL_DAYS = envInt("UPLOAD_TTL_DAYS", 7);
 // Sweep cadence in minutes.
 export const UPLOAD_SWEEP_INTERVAL_MIN = envInt("UPLOAD_SWEEP_INTERVAL_MIN", 60);
 
+// --- Session auto-archive ---
+// A session with no activity for this many days, and no run in flight, is
+// archived by the daily maintenance pass. 0 disables it. Archiving only changes
+// `claw_sessions.status`; the session stays readable and a new message to it
+// makes it active again.
+export const SESSION_AUTO_ARCHIVE_DAYS = envInt("SESSION_AUTO_ARCHIVE_DAYS", 7, { min: 0 });
+
 // --- Memory / Skill LLM ---
 export const MEMORY_LLM_MODEL = env("MEMORY_LLM_MODEL", env("DEFAULT_MODEL", "claude-opus-4-6"));
 export const MEMORY_LLM_API_KEY = env("MEMORY_LLM_API_KEY", env("ANTHROPIC_AUTH_TOKEN", env("ANTHROPIC_API_KEY")));
@@ -359,12 +408,51 @@ export const CLAW_MEMORY_ENABLED = envBool("CLAW_MEMORY_ENABLED", false);
 // recording, evolve worker, and skill-files cleanup are all short-circuited.
 export const CLAW_SKILL_EVOLUTION_ENABLED = envBool("CLAW_SKILL_EVOLUTION_ENABLED", false);
 
+// --- Outbound notifications (default OFF) ---
+// When false: no notification tables, routes, outbox writes or delivery loop.
+export const CLAW_NOTIFICATIONS_ENABLED = envBool("CLAW_NOTIFICATIONS_ENABLED", false);
+// Comma-separated hosts a subscription may name even though they resolve to a
+// private address (an in-cluster receiver). The only hosts where http is accepted.
+export const NOTIFY_WEBHOOK_ALLOWED_HOSTS = env("NOTIFY_WEBHOOK_ALLOWED_HOSTS");
+// A run that is not trigger-started is announced only once it ran this long.
+export const NOTIFY_MIN_RUN_SECONDS = envInt("NOTIFY_MIN_RUN_SECONDS", 60);
+// Prefix of the `link` field in a notification, relative to the web UI origin.
+export const NOTIFY_LINK_BASE = env("NOTIFY_LINK_BASE", "/primus-claw");
+
+/**
+ * Scheduled triggers: a cron schedule that starts a run as the user who created
+ * it. Off by default; when off no table is created, no route is registered and no
+ * loop is started.
+ */
+export const CLAW_TRIGGERS_ENABLED = envBool("CLAW_TRIGGERS_ENABLED", false);
+/** Smallest allowed gap between two firings of one schedule. */
+export const TRIGGER_MIN_INTERVAL_MINUTES = envInt("TRIGGER_MIN_INTERVAL_MINUTES", 15, { min: 1 });
+/** Triggers one user may own. */
+export const TRIGGER_MAX_PER_USER = envInt("TRIGGER_MAX_PER_USER", 20, { min: 1 });
+/** Runs one user's triggers may start in a rolling 24 hours. */
+export const TRIGGER_DAILY_LIMIT_PER_USER = envInt("TRIGGER_DAILY_LIMIT_PER_USER", 100, { min: 1 });
+/** How long a trigger-started run may take before the scheduler stops it. */
+export const TRIGGER_RUN_TIME_LIMIT_SECONDS = envInt("TRIGGER_RUN_TIME_LIMIT_SECONDS", 1800, { min: 1 });
+/** A planned firing older than this when the scheduler reaches it is skipped, not run late. */
+export const TRIGGER_STALE_AFTER_SECONDS = envInt("TRIGGER_STALE_AFTER_SECONDS", 900, { min: 1 });
+/** Consecutive failed starts before a trigger pauses itself. */
+export const TRIGGER_MAX_CONSECUTIVE_FAILURES = envInt("TRIGGER_MAX_CONSECUTIVE_FAILURES", 3, { min: 1 });
+
 /**
  * Accept `mode: "app"` on `POST /v1/sessions/:sessionId/tasks`. Off by default:
  * until the Brain side runs apps, an admitted app run is refused there as not
  * implemented, so nothing is gained by taking one in.
  */
 export const APP_RUNS_ENABLED = envBool("APP_RUNS_ENABLED", false);
+
+/**
+ * Whether the sandbox Router runs with `--enable-auth`. It decides what an
+ * application's session-level MCP carries as `token` when a turn is dispatched:
+ * with auth on, the `<SAFE_API_KEY>` placeholder, which Brain expands to the
+ * session owner's platform key; with auth off, the run's MCP token. Must match
+ * Brain's setting of the same name.
+ */
+export const SANDBOX_ROUTER_AUTH_ENABLED = envBool("SANDBOX_ROUTER_AUTH_ENABLED", false);
 
 /**
  * Platform caps on what an app run's grant may carry, as JSON of the grant

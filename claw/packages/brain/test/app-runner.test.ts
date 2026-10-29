@@ -39,12 +39,14 @@ import type { AppManifestV1 } from "@claw/protocol";
 test("the fixture manifest is valid, or every case below is vacuous", () => {
   assert.deepEqual(validateAppManifest(MANIFEST), []);
 });
+const PLATFORM_KEY = "ak-platform-key-0123456789";
+
 
 function harness(opts: {
   manifest?: AppManifestV1; grant?: AppGrantRunHooks; seams?: AppRunnerSeams; over?: object;
 } = {}) {
   const world = new World(opts.manifest ?? MANIFEST, opts.over);
-  const runner = () => new AppRunner(RUN_ID, "pk", {
+  const runner = () => new AppRunner(RUN_ID, PLATFORM_KEY, {
     store: world.store, sandbox: world.sandbox, grant: opts.grant, seams: opts.seams,
     now: world.now, sleep: world.sleep, tickMs: 5000,
   });
@@ -528,7 +530,11 @@ test("E3 the grant hook adds keys and limits through env_map; its keys beat the 
   assert.equal(env.APP_KEY_SUBRUN, KEY_S);
   assert.equal(env.APP_KEY_MEASUREMENT, "e2b_overridden-by-the-hook-0123456");
   assert.equal(env.APP_GRANT_LIMITS, JSON.stringify({ max_sandboxes: 4, max_gpus: 8 }));
-  assert.deepEqual(seen, [{ runId: RUN_ID, sessionId: "sess-1", grantId: null, manifest: MANIFEST }]);
+  assert.deepEqual(seen, [{
+    runId: RUN_ID, sessionId: "sess-1", grantId: null, manifest: MANIFEST,
+    platformKey: PLATFORM_KEY, workspaceId: "ws-1",
+    sandboxSpec: { handle: "app", image: "img:1" },
+  }]);
 });
 
 test("E4 the default grant hooks do nothing", async () => {
@@ -768,4 +774,245 @@ test("P7 markEnded closes the row without a sandbox, and reports a refusal inste
   const again = harness();
   again.world.failStore = () => new AppRunWriteRefused("not_holder");
   assert.equal(await again.runner.markEnded("no key"), false);
+});
+
+test("fixed E2B urls and the template list are injected when supplied", () => {
+  const env = buildAppEnv({
+    runId: "r", sessionId: "s", createdAt: "t", stateDir: "/d", mcpToken: TOKEN,
+    grantKeys: {}, grantLimits: { max_sandboxes: 2 }, nodeName: null,
+    sandboxTemplates: { measurement: { "1": "r1-runner-g1" } },
+    e2bApiUrl: "http://e2b.local", e2bSandboxUrl: "http://e2b.local/sandboxes",
+    manifest: { ...MANIFEST, env: undefined, env_map: { sandbox_templates: "APP_TEMPLATES", grant_limits: "APP_GRANT_LIMITS" } },
+  });
+  assert.equal(env.E2B_API_URL, "http://e2b.local");
+  assert.equal(env.E2B_SANDBOX_URL, "http://e2b.local/sandboxes");
+  assert.equal(env.APP_TEMPLATES, JSON.stringify({ measurement: { "1": "r1-runner-g1" } }), "the grant's names, not the manifest's array");
+  assert.equal(env.APP_GRANT_LIMITS, JSON.stringify({ max_sandboxes: 2 }));
+  assert.equal(env.CLAW_SESSION_ID, "s");
+});
+
+test("a missing grant is signed again and the application restarts with the new key", async () => {
+  const world = new World(MANIFEST, {
+    grant_id: "gr-01arz3ndektsv4rrffq69g5fav",
+    user_id: "user-1",
+    grant_limits: { max_sandboxes: 2, max_gpus: 4, gpu_hours: 1, max_runtime_sec: 3600 },
+    grant_expires_at: "2026-01-02T00:00:00.000Z",
+  });
+  let armed = true;
+  let reissues = 0;
+  const fresh = "e2b_newkey0123456789abcdef0123456789abcd";
+  const grant: AppGrantRunHooks = {
+    env: async () => ({}),
+    revoke: async () => undefined,
+    extend: noopAppGrant.extend,
+    inspect: async () => (world.rec.state === "running" && armed ? (armed = false, "missing") : "active"),
+    reissue: async (run) => {
+      reissues += 1;
+      assert.equal(run.userId, "user-1");
+      assert.equal(run.platformKey, "pk");
+      assert.equal(run.grantId, "gr-01arz3ndektsv4rrffq69g5fav");
+      return { keys: { measurement: fresh }, expiresAt: "2026-01-02T00:00:00.000Z" };
+    },
+  };
+  const runner = new AppRunner(RUN_ID, "pk", {
+    store: world.store, sandbox: world.sandbox, grant, now: world.now, sleep: world.sleep, tickMs: 5000,
+  });
+  for (let i = 0; i < 12 && world.rec.state !== "running"; i++) await runner.reconcile();
+  assert.equal(world.rec.state, "running");
+  assert.equal(reissues, 0, "a live copy is not signed again on the way up");
+  await runner.reconcile();
+  assert.equal(reissues, 1);
+  assert.equal(world.terms.length, 1);
+  assert.equal(world.rec.state, "running");
+  assert.equal(world.rec.restarts, 0, "a grant restart is not an application crash");
+  assert.equal(world.rec.last_exit?.grant_restart, undefined);
+  const signed = world.patches.filter((p) => p.patch.grant_keys);
+  assert.equal(signed.length, 1);
+  assert.equal(signed[0]!.patch.last_exit?.grant_restart, true, "the new keys and the restart mark are one write");
+  assert.equal(world.starts.length, 2);
+  assert.equal(world.starts[1]!.env.APP_KEY_MEASUREMENT, fresh);
+  assert.equal(reissues, 1, "an active copy is not signed again");
+});
+
+test("a grant restart with max_restarts 0 starts again, and a final exit does not end the run", async () => {
+  const manifest = { ...MANIFEST, restart: { max_restarts: 0, backoff_sec: [] } };
+  const world = new World(manifest, {
+    grant_id: "gr-01arz3ndektsv4rrffq69g5fav",
+    user_id: "user-1",
+    grant_limits: { max_sandboxes: 2, max_gpus: 4, gpu_hours: 1, max_runtime_sec: 3600 },
+    grant_expires_at: "2026-01-02T00:00:00.000Z",
+  });
+  let armed = true;
+  world.onTerm = (wl) => world.appExits(wl, { final: true, returncode: 0 });
+  const grant: AppGrantRunHooks = {
+    env: async () => ({}),
+    revoke: async () => undefined,
+    extend: noopAppGrant.extend,
+    inspect: async () => (world.rec.state === "running" && armed ? (armed = false, "missing") : "active"),
+    reissue: async () => ({ keys: { measurement: "e2b_newkey0123456789abcdef0123456789abcd" }, expiresAt: "2026-01-02T00:00:00.000Z" }),
+  };
+  const runner = new AppRunner(RUN_ID, "pk", {
+    store: world.store, sandbox: world.sandbox, grant, now: world.now, sleep: world.sleep, tickMs: 5000,
+  });
+  for (let i = 0; i < 12 && world.rec.state !== "running"; i++) await runner.reconcile();
+  await runner.reconcile();
+  assert.equal(world.rec.state, "running");
+  assert.equal(world.rec.restarts, 0);
+  assert.notEqual(world.rec.last_exit?.cause, "restarts_exhausted");
+  assert.equal(world.starts.length, 2);
+});
+
+test("a grant restart whose sandbox is already gone takes the lost-sandbox road", async () => {
+  const world = new World(MANIFEST, {
+    grant_id: "gr-01arz3ndektsv4rrffq69g5fav",
+    grant_limits: { max_sandboxes: 1, max_gpus: 1, gpu_hours: 1, max_runtime_sec: 3600 },
+  });
+  const grant: AppGrantRunHooks = {
+    env: async () => ({}),
+    revoke: async () => undefined,
+    extend: noopAppGrant.extend,
+    inspect: async () => "active",
+    reissue: async () => { throw new Error("the sandbox is gone; the grant is not signed again"); },
+  };
+  const runner = new AppRunner(RUN_ID, "pk", {
+    store: world.store, sandbox: world.sandbox, grant, now: world.now, sleep: world.sleep, tickMs: 5000,
+  });
+  for (let i = 0; i < 12 && world.rec.state !== "running"; i++) await runner.reconcile();
+  world.rec = {
+    ...world.rec,
+    last_exit: { at: "2026-01-01T00:00:00.000Z", cause: "exit", final: false, grant_restart: true },
+  };
+  world.killWorkload(world.liveWorkload(), "absent");
+  await runner.reconcile();
+  assert.equal(world.rec.last_exit?.grant_restart, undefined);
+  assert.equal(world.rec.state, "provisioning");
+  assert.equal(world.rec.restarts, 1);
+});
+
+test("a revoked grant is not signed again", async () => {
+  const h = harness({
+    over: { grant_id: "gr-01arz3ndektsv4rrffq69g5fav", grant_revoked_at: "2026-01-01T00:00:00.000Z" },
+    grant: {
+      env: async () => ({}),
+      revoke: async () => undefined,
+      extend: noopAppGrant.extend,
+      inspect: async () => "missing",
+      reissue: async () => { throw new Error("revoked grants are not re-signed"); },
+    },
+  });
+  await toRunning(h);
+  await h.runner.reconcile();
+  assert.equal(h.world.rec.state, "running");
+  assert.equal(h.world.starts.length, 1);
+});
+
+test("P6 the session owner's platform key, which the sandbox carries as the model credential, is scrubbed too", async () => {
+  const h = harness();
+  const wl = await toRunning(h);
+  const takeover = h.newRunner();
+  h.world.appExits(wl, { final: false, returncode: 2, error: `401 from gateway for key ${PLATFORM_KEY}` });
+  await takeover.reconcile();
+  assert.ok(!JSON.stringify(h.world.rec.last_exit).includes(PLATFORM_KEY), "the platform key is not stored");
+  assert.match(String(h.world.rec.last_exit?.error), /\[redacted\]/);
+});
+
+test("P6 the platform key is scrubbed even when the store's secrets cannot be read, and no text goes out half-scrubbed", async () => {
+  const h = harness();
+  const wl = await toRunning(h);
+  const takeover = h.newRunner();
+  h.world.store.secrets = async () => { throw new Error("API unavailable"); };
+  h.world.appExits(wl, { final: false, returncode: 2, error: `401 for key ${PLATFORM_KEY} and token ${TOKEN}` });
+  await takeover.reconcile().catch(() => undefined);
+  const stored = JSON.stringify(h.world.rec.last_exit ?? {});
+  assert.ok(!stored.includes(PLATFORM_KEY), "the platform key is not stored");
+  assert.ok(!stored.includes(TOKEN), "nor is anything else the unread set would have caught");
+});
+
+// ---------------------------------------------------------------------------
+// C2-09 review follow-ups: the status announcement, the drain, the scrub gate
+// ---------------------------------------------------------------------------
+
+const settle = () => new Promise<void>((r) => setImmediate(r));
+
+test("S1 every state change is announced through one path, including finishNow's and markEnded's", async () => {
+  const states: string[] = [];
+  const seams: AppRunnerSeams = { stateChanged: async (rec) => { states.push(rec.state); } };
+  const h = harness({ seams });
+  await toRunning(h);
+  await settle();
+  assert.deepEqual(states, ["starting", "running"]);
+  await h.runner.finishNow("cancelled");
+  await settle();
+  assert.deepEqual(states, ["starting", "running", "finishing", "ended"], "finishNow's own write to finishing is announced");
+
+  const closed: string[] = [];
+  const bare = harness({ seams: { stateChanged: async (rec) => { closed.push(rec.state); } } });
+  assert.equal(await bare.runner.markEnded("no key"), true);
+  await settle();
+  assert.deepEqual(closed, ["ended"], "markEnded is announced");
+});
+
+test("S1b a stateChanged that fails or hangs does not stop or slow the machine", async () => {
+  const hang = harness({ seams: { stateChanged: () => new Promise<void>(() => undefined) } });
+  await toRunning(hang);
+  const boom = harness({ seams: { stateChanged: async () => { throw new Error("nats down"); } } });
+  await toRunning(boom);
+});
+
+test("S2 a sandbox that is gone is not drained (and says so); a live one is", async () => {
+  let drains = 0;
+  const seams: AppRunnerSeams = { drainEvents: async () => { drains++; } };
+  const live = harness({ seams });
+  await toRunning(live);
+  await live.runner.finishNow("cancelled");
+  assert.equal(drains, 1);
+
+  drains = 0;
+  const gone = harness({ seams });
+  const wl = await toRunning(gone);
+  gone.world.killWorkload(wl, "terminal");
+  await gone.runner.finishNow("cancelled");
+  assert.equal(drains, 0, "no drain against a workload SaFE says is terminal");
+  assert.equal(gone.world.rec.state, "ended");
+});
+
+test("S3 the seams get a scrub only once the run's secrets are loaded", async () => {
+  const seen: Array<((t: string) => string) | undefined> = [];
+  const seams: AppRunnerSeams = { tailEvents: async (ctx) => { seen.push(ctx.scrub); } };
+  const h = harness({ seams });
+  await toRunning(h);
+  await h.runner.reconcile();
+  const armed = seen.at(-1);
+  assert.ok(armed, "armed once the secrets are known");
+  assert.doesNotMatch(armed(`x ${TOKEN} y`), new RegExp(TOKEN));
+  assert.doesNotMatch(armed(`x ${PLATFORM_KEY} y`), new RegExp(PLATFORM_KEY), "the event tailer's scrub covers the platform key");
+
+  // Another Brain takes the run over while the API cannot open the secrets.
+  h.world.store.secrets = async () => { throw new Error("secrets unavailable"); };
+  const taken = h.newRunner();
+  seen.length = 0;
+  await taken.reconcile();
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0], undefined, "no scrub, so a seam that needs one must not read");
+});
+
+test("S4 the ended announcement is out before finishNow returns; a hung one is given up on after the bound", async () => {
+  const order: string[] = [];
+  const slow: AppRunnerSeams = {
+    stateChanged: async (rec) => { if (rec.state === "ended") { await new Promise((r) => setTimeout(r, 30)); order.push("appStatus ended"); } },
+  };
+  const h = harness({ seams: slow });
+  await toRunning(h);
+  await h.runner.finishNow("cancelled");
+  order.push("finishNow returned");
+  assert.deepEqual(order, ["appStatus ended", "finishNow returned"]);
+
+  const hung = new World(MANIFEST);
+  const runner = new AppRunner(RUN_ID, "pk", {
+    store: hung.store, sandbox: hung.sandbox, seams: { stateChanged: (rec) => (rec.state === "ended" ? new Promise<void>(() => undefined) : Promise.resolve()) },
+    now: hung.now, sleep: hung.sleep, tickMs: 5000, statusTimeoutMs: 20,
+  });
+  const started = Date.now();
+  assert.equal(await runner.markEnded("no key"), true);
+  assert.ok(Date.now() - started < 2000, "gave up on the hung announcement");
 });

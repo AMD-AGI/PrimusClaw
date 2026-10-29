@@ -283,6 +283,13 @@ export function pickShellRun(request: ExecuteRequest): string {
  * rather have the overlap than the queue.
  */
 export function pickLockKey(request: ExecuteRequest): string {
+  // An app run does not write the session's files. It runs in an app sandbox of its
+  // own, so the question this key answers ("do two runs write the same files") has
+  // the answer no for it, and it must not queue the session's conversation behind
+  // an application that lives for hours (a foreground turn naked on `ws.<id>` until
+  // its delivery budget ran out). Its own key still keeps a second handler of the
+  // same run from starting on another pod.
+  if (request.mode === "app" && request.task_id) return `app.${request.task_id}`;
   const fallback = pickRunScope(request);
   if (RUN_GATE_KEY !== "workspace") return fallback;
   if (request.files_workspace_id) return `ws.${request.files_workspace_id}`;

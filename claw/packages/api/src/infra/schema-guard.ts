@@ -59,6 +59,8 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
       "cleanup_state", "cleanup_attempts", "cleanup_next_at", "cleanup_error",
       // Absent, every gate acquisition fails and no turn can start at all.
       "agent_gate_message_id",
+      // Absent, the read that gives a turn its model fails, and so does every turn.
+      "model",
     ],
   },
   {
@@ -141,9 +143,14 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     onlyWhenAppRuns: true,
     columns: [
       "task_id", "session_id", "plugin_id", "manifest", "idempotency_key", "state",
-      "mcp_token_enc", "grant_id", "grant_keys_enc", "grant_limits",
+      "mcp_token_enc", "grant_id", "grant_keys_enc", "grant_limits", "grant_templates",
       "grant_expires_at", "grant_revoked_at", "created_by", "request_hash",
     ],
+  },
+  {
+    table: "claw_session_app_mcp",
+    onlyWhenAppRuns: true,
+    columns: ["session_id", "name", "app_task_id", "url", "sandbox_session_id", "updated_at"],
   },
   {
     table: "claw_workspaces",
@@ -160,6 +167,12 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
   {
     table: "claw_workspace_refs",
     columns: ["workspace_id", "ref_kind", "ref_id", "created_at", "released_at"],
+  },
+  {
+    table: "claw_user_memory_prefs",
+    // Read on every prompt build and every memory write; an absent table makes
+    // both fail closed, i.e. memory silently off for everyone.
+    columns: ["user_id", "enabled"],
   },
   {
     table: "claw_memory_entries",

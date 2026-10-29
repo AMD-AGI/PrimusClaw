@@ -223,6 +223,13 @@ SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC="${SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC:-}"
 # CA. Empty means the chart default, verify-full. Recorded here because
 # upgrade.sh re-renders the API from this file alone.
 PG_SSL_NO_VERIFY="${PG_SSL_NO_VERIFY:-}"
+
+# Name of an existing ConfigMap in the namespace holding PEM certificates for a
+# private CA, and the key in it (empty key means the chart default, ca.crt).
+# Empty ConfigMap means no extra CA. Recorded here because upgrade.sh
+# re-renders api and brain from this file alone.
+EXTRA_CA_CERTS_CONFIGMAP="${EXTRA_CA_CERTS_CONFIGMAP:-}"
+EXTRA_CA_CERTS_KEY="${EXTRA_CA_CERTS_KEY:-}"
 EOF
   chmod 600 "$_VALUES_FILE"
   unset _BOOT_USER_ENV_KEY _BOOT_AUTH_TOKEN
@@ -253,7 +260,8 @@ BG_SHELL_ENABLED BASH_MAX_TIMEOUT_SEC
 SANDBOX_KEEPALIVE_TARGET_CEILING SANDBOX_KEEPALIVE_RECONCILE_RESERVE
 SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC
 HANDS_CHILD_UID_MIN HANDS_CHILD_UID_MAX HANDS_CHILD_ISOLATION
-PG_SSL_NO_VERIFY"
+PG_SSL_NO_VERIFY
+EXTRA_CA_CERTS_CONFIGMAP EXTRA_CA_CERTS_KEY"
 for _recorded_key in $CLAW_RECORDED_KEYS; do
   eval "_SHELL_${_recorded_key}=\${${_recorded_key}:-}"
 done
@@ -869,8 +877,17 @@ render_chart() {
   # on an empty here-string still yields a single empty element, which reaches
   # helm as an empty positional argument and fails the render.
   [ -n "$preserved_out" ] && mapfile -t preserved <<<"$preserved_out"
+  # EXTRA_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* from the values file, as a Helm values
+  # file: arbitrary values survive --set quoting only through a file.
+  local extra_values
+  extra_values="$(mktemp)"
+  if ! python3 "$(dirname "${BASH_SOURCE[0]}")/extra-values.py" > "$extra_values"; then
+    rm -f "$extra_values"
+    fail "EXTRA_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* in $_VALUES_FILE are malformed (see above)."
+  fi
   helm template primus-claw "$CLAW_CHART_DIR" \
     -n "$NAMESPACE" \
+    -f "$extra_values" \
     --set secret.create=false \
     --set ingress.enabled=false \
     --set postgres.enabled=false \
@@ -899,9 +916,12 @@ render_chart() {
     ${HANDS_CHILD_UID_MAX:+--set-string features.childUidMax="$HANDS_CHILD_UID_MAX"} \
     ${HANDS_CHILD_ISOLATION:+--set-string features.childIsolation="$HANDS_CHILD_ISOLATION"} \
     ${PG_SSL_NO_VERIFY:+--set postgres.sslNoVerify="$PG_SSL_NO_VERIFY"} \
+    ${EXTRA_CA_CERTS_CONFIGMAP:+--set-string tls.extraCACertsConfigMap="$EXTRA_CA_CERTS_CONFIGMAP"} \
+    ${EXTRA_CA_CERTS_KEY:+--set-string tls.extraCACertsKey="$EXTRA_CA_CERTS_KEY"} \
     ${preserved[@]+"${preserved[@]}"} \
     "$@" \
-    --show-only "templates/$template" > "$dst"
+    --show-only "templates/$template" > "$dst" || { rm -f "$extra_values"; return 1; }
+  rm -f "$extra_values"
 }
 
 # ── kubectl apply wrapper ────────────────────────────────────────────────
