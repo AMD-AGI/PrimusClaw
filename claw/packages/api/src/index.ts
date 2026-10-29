@@ -28,6 +28,7 @@ import { registerA2ARoutes } from "./routes/a2a.js";
 import { registerPluginRoutes } from "./routes/plugins.js";
 import { registerUserEnvVarRoutes } from "./routes/user-env-vars.js";
 import { registerNotificationSubscriptionRoutes } from "./routes/notification-subscriptions.js";
+import { registerRemoteAgentRoutes } from "./routes/remote-agents.js";
 import { startNotificationWorker } from "./notifications/outbox.js";
 import { registerSystemEnvVarRoutes, publishSystemEnvToKv } from "./routes/system-env-vars.js";
 import { registerSandboxAdminRoutes } from "./routes/sandbox-admin.js";
@@ -152,7 +153,7 @@ async function main() {
   // otherwise start exporting neither.
   assertRolloutConfigAtStartup();
   assertAdmissionSettings(logger);
-  // Off unless IDENTITY_CLIENT_ENABLED is set; it authenticates a request only with CLAW_IDENTITY_TOKEN_AUTH_ENABLED.
+  // Off unless IDENTITY_CLIENT_ENABLED is set; it authenticates a connector's access token, and an identity provider's access token only with CLAW_IDENTITY_TOKEN_AUTH_ENABLED.
   startIdentityClient(logger);
   // Validate USER_ENV_ENCRYPTION_KEY before doing anything else; we want a
   // fast-fail if the K8s Secret is misconfigured (missing or wrong length),
@@ -272,6 +273,8 @@ async function main() {
   await registerPluginRoutes(app);
   await registerUserEnvVarRoutes(app);
   await registerNotificationSubscriptionRoutes(app);
+  // Off unless CLAW_REMOTE_AGENTS_ENABLED: the module registers nothing otherwise.
+  await registerRemoteAgentRoutes(app);
   await registerSystemEnvVarRoutes(app);
   await registerSandboxAdminRoutes(app);
   await registerMcpRoutes(app);

@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	e2bapi "sigs.k8s.io/agent-sandbox/pkg/e2b"
+	"sigs.k8s.io/agent-sandbox/pkg/envd/e2b"
 	"sigs.k8s.io/agent-sandbox/pkg/envd/egress"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/policy"
@@ -197,6 +199,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/files", s.handleFiles)
 	mux.HandleFunc("/api/files/", s.handleFiles)
 
+	// E2B Connect RPC (process and filesystem) and HTTP /files.
+	e2b.Mount(mux, s.workspace, s.startE2BCommand)
+
 	// GPU
 	mux.HandleFunc("/api/gpu/status", s.handleGPUStatus)
 
@@ -205,8 +210,21 @@ func (s *Server) Handler() http.Handler {
 	// never verified, and must not become the token envd sends to WM.
 	root := http.NewServeMux()
 	root.HandleFunc("/health", s.handleHealth)
-	root.Handle("/", s.jwtMiddleware(s.sessionCaptureMiddleware(mux)))
+	root.Handle("/", s.jwtMiddleware(s.sealedLegacyMiddleware(s.sessionCaptureMiddleware(mux))))
 	return root
+}
+
+// sealedLegacyMiddleware rejects EnvD's legacy API for a sealed token.
+// Sealed callers must use the E2B handlers, which enforce the file policy.
+func (s *Server) sealedLegacyMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		policy, verified := e2bapi.PolicyFrom(r.Context())
+		if verified && policy.Sealed && strings.HasPrefix(r.URL.Path, "/api/") {
+			httpError(w, "sealed_denied: legacy API is not available", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // sessionCaptureMiddleware captures the sandbox id and Router JWT from the

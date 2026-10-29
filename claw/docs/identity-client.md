@@ -11,12 +11,15 @@ JWT genuine* (OIDC discovery and the issuer's JWKS), and *give me a token for th
 user* (RFC 8693 token exchange). It lives in `packages/utils/src/identity/` and
 speaks only those standards, so any provider that implements them works.
 
-It is **off by default, and authenticates no request unless the access-token
-credential below is also switched on**. With `IDENTITY_CLIENT_ENABLED=true` each
-process builds the client, reads discovery and the key set in the background (a
-failure is logged, not fatal) and exports the `claw_identity_*` metrics. Code that
-wants the client gets it from `identityClient()` (`api/src/auth/identity.ts`,
-`brain/src/clients/identity.ts`).
+It is **off by default**, and takes part in request authentication in two places,
+each behind its own switch: a connector's access token on the connector side of
+remote agents (see [remote-agents.md](remote-agents.md#connector-access-tokens)),
+and an identity provider's access token as a credential for the rest of the API
+(see the access-token credential below). Nothing else is authenticated through
+it. With `IDENTITY_CLIENT_ENABLED=true` each process builds the client, reads
+discovery and the key set in the background (a failure is logged, not fatal) and
+exports the `claw_identity_*` metrics. Code that wants the client gets it from
+`identityClient()` (`api/src/auth/identity.ts`, `brain/src/clients/identity.ts`).
 
 ## Settings
 
@@ -143,6 +146,13 @@ this use.
   existing `?token=` key path is still tried before any header, so a valid key there
   authenticates its owner whatever Bearer value rides along. Behind the switch nothing about
   them changes; with it off nothing about the request changes at all.
+- The connector side of remote agents (see
+  [remote-agents.md](remote-agents.md#connector-access-tokens)) judges a JWT-shaped
+  Bearer value first, by its own audience and scope, and that answer is final, so
+  this credential does not run on those four routes. On every other route, with
+  this switch on, a connector's access token (scope `claw.connector`) is judged
+  here and refused for its scope (403 `insufficient_scope`) instead of being
+  answered as a request with no credential; with the switch off nothing changes.
 - It applies in the Kubernetes deployment mode too, where it is judged before the
   gateway-key check. In that mode a Bearer value that looks like a JWT is a token,
   not a key, once the switch is on.

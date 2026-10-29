@@ -506,10 +506,11 @@ grantSigningKey:
 # Shared identity client for API and Brain: OIDC discovery and the issuer's JWKS,
 # RFC 7662 token introspection (positive answers cached, inactive ones cached
 # briefly, concurrent lookups of one credential coalesced), and an RFC 8693 token
-# exchange client with a token cache. Off by default, and nothing authenticates
-# through it unless identity.tokenAuth is on: enabling the client builds it, reads
-# discovery and the key set in the background, and starts exporting the
-# claw_identity_* metrics.
+# exchange client with a token cache. Off by default; it authenticates a
+# connector's access token on the remote-agents connector routes and, only when
+# identity.tokenAuth is on, an identity provider's access token on the API:
+# enabling the client builds it, reads discovery and the key set in the
+# background, and starts exporting the claw_identity_* metrics.
 #
 # The client secret is never rendered from values. Create the Secret out of band
 # and name it here; both Deployments read the one key.

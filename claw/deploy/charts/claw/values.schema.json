@@ -162,7 +162,7 @@
       "additionalProperties": true,
       "properties": {
         "enabled": {
-          "description": "Build the shared identity client in API and Brain. Off by default; nothing authenticates through it unless identity.tokenAuth is on.",
+          "description": "Build the shared identity client in API and Brain. Off by default; it authenticates a connector access token on the remote-agents connector routes, and an identity provider's access token on the rest of the API only when identity.tokenAuth is on.",
           "default": false,
           "type": "boolean"
         },
