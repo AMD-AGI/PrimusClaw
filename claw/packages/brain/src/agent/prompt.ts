@@ -96,6 +96,8 @@ export function buildPrompt(
   pluginRulesFromMessage = "",
   sessionContext?: { sessionId: string; userId: string; parentSessionId?: string; teamRole?: string },
   progressiveSkills: ProgressiveSkill[] = [],
+  /** The bound repository's block (see workspace/repo-binding.ts); "" for a session with none. */
+  repoBlock = "",
 ): string {
   let skillHint = "";
   const skillNames = Object.keys(skillContents);
@@ -130,7 +132,10 @@ export function buildPrompt(
   // entire skill system whenever the user pasted a long log/diff/code block.
   if (userPrompt.length > 20000) {
     const hints = [skillHint, mcpHint].filter(Boolean).join("\n");
-    return hints ? `${userPrompt}\n${hints}` : userPrompt;
+    // The repository is not a hint to drop with the policy: without it the agent
+    // would not know it is standing in one.
+    const long = hints ? `${userPrompt}\n${hints}` : userPrompt;
+    return repoBlock ? `${long}\n\n${repoBlock}` : long;
   }
 
   const rulesFromPlugin = (pluginRulesFromMessage || "").trim();
@@ -155,5 +160,5 @@ export function buildPrompt(
     sessionCtx = `\n[Session Context]\n${parts.join("\n")}`;
   }
 
-  return [preamble, userBlock, policy, extraHints, sessionCtx].filter(Boolean).join("\n\n");
+  return [preamble, userBlock, policy, extraHints, repoBlock, sessionCtx].filter(Boolean).join("\n\n");
 }

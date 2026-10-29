@@ -11,6 +11,7 @@ import { resolveTaskPlugin } from "../marketplace/plugins.js";
 
 import { buildMessages } from "../sessions/context-builder.js";
 import { sessionModelFromRow } from "../sessions/session-model.js";
+import { sessionRepoFromRow } from "../sessions/session-repo.js";
 import { maybeExtractMemory, insertMemoryEntry, isMemoryActive, scanMemoryContent, maybeUpdateUserProfile } from "../memory/service.js";
 import {
   saveSkill, recordSkillFeedback,
@@ -1276,7 +1277,7 @@ export async function drainOldestPendingMessage(
   // session has when the message is sent on, which is what a change "from the next
   // turn" means for a turn that was already parked.
   const pending = (await db.query(
-  "SELECT id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology, (SELECT model FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_model FROM claw_pending_messages WHERE session_id = $1 ORDER BY created_at LIMIT 1",
+  "SELECT id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology, (SELECT model FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_model, (SELECT config->'repo' FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_repo FROM claw_pending_messages WHERE session_id = $1 ORDER BY created_at LIMIT 1",
   [sessionId],
 )).rows[0];
 
@@ -1365,6 +1366,9 @@ if (pending) {
   // a session with no choice, so Brain falls back on its own default.
   const pendingModel = sessionModelFromRow({ model: pending.session_model });
   if (pendingModel) task.model = pendingModel;
+  // The session's bound repository, as the immediate path attaches it.
+  const pendingRepo = sessionRepoFromRow({ repo: pending.session_repo }, sessionId);
+  if (pendingRepo) task.repo = pendingRepo;
   const credentialsReadable = await applyPendingCredentials(task, pending, {
     sessionId, userId: pendingUserId, messageId: pendingMessageId,
   });
