@@ -28,6 +28,10 @@
 //   X6  a crash between the two renames still leaves a usable snapshot
 //   X7  restore overwrites the snapshot's files and keeps the image's own
 //   X8  meta.json describes current/, and is written whole or not at all
+//   X10 a repository's .git is snapshotted, and a restore gives back its commit
+//   X11 a repository over a bound is left out whole, whatever its directory is called
+//   X12 git's transient files stay behind and the user's own *.lock does not
+//   X13 with .git switched off nothing of any repository is carried
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -35,6 +39,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, statSync, existsSync, symlinkSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { __test__ } from "../src/workspace/sync.js";
+import type { GitDecision } from "../src/workspace/git-dirs.js";
 
 const { buildSyncCommand, buildRestoreCommand, buildRestoreProbeCommand } = __test__;
 
@@ -167,7 +172,6 @@ test("X1 a first sync copies the workspace and leaves the excluded trees behind"
     write(ctx.workspace, "src/main.py", "print(1)\n");
     write(ctx.workspace, "notes.md", "hello\n");
     write(ctx.workspace, "node_modules/left/index.js", "junk\n");
-    write(ctx.workspace, ".git/HEAD", "ref: refs/heads/main\n");
     write(ctx.workspace, ".skills/provided-by-image.md", "image\n");
     write(ctx.workspace, "build/kernel.o", "binary\n");
     // Brain's own log, which bootstrap writes into the directory being
@@ -180,7 +184,7 @@ test("X1 a first sync copies the workspace and leaves the excluded trees behind"
 
     assert.equal(snapshotFile(ctx, "src/main.py"), "print(1)\n");
     assert.equal(snapshotFile(ctx, "notes.md"), "hello\n");
-    for (const gone of ["node_modules", ".git", ".skills", "build/kernel.o", "hands.log"]) {
+    for (const gone of ["node_modules", ".skills", "build/kernel.o", "hands.log"]) {
       assert.ok(
         !existsSync(join(ctx.base, "current", gone)),
         `${gone} is on the exclude list and should not be in the snapshot`,
@@ -500,3 +504,158 @@ test("X9 meta.json describes what is actually in current/", () => {
     cleanup(ctx);
   }
 });
+
+// ── .git ────────────────────────────────────────────────────────────────
+
+const GIT_ENV = {
+  PATH: TOOL_PATH,
+  // A throwaway identity and no system or user config, so what git does here is
+  // what git does, not what the machine running the test has configured.
+  GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.com",
+  GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.com",
+  GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null",
+};
+
+function git(cwd: string, ...args: string[]): string {
+  return execFileSync("git", args, { cwd, encoding: "utf8", env: GIT_ENV }).trim();
+}
+
+function syncWithGit(ctx: Ctx, turn: number, decision: GitDecision, noRsync: boolean): string {
+  const cmd = buildSyncCommand(ctx.base, turn, ctx.workspace, ctx.root, decision);
+  return run(cmd, { path: noRsync ? ctx.noRsyncPath : undefined });
+}
+
+const KEEP: GitDecision = { mode: "keep", skipped: [] };
+
+for (const noRsync of [false, true]) {
+  const how = noRsync ? "tar fallback" : "rsync";
+
+  test(`X10 (${how}) a sandbox rebuilt from the snapshot is still a repository, with its unpushed commit`, () => {
+    const ctx = setup();
+    try {
+      const repo = join(ctx.workspace, "proj");
+      mkdirSync(repo, { recursive: true });
+      git(repo, "init", "-q", "-b", "main");
+      write(repo, "a.txt", "one\n");
+      git(repo, "add", "a.txt");
+      git(repo, "commit", "-q", "-m", "first");
+      // The thing the user would lose: work that exists nowhere but here.
+      git(repo, "checkout", "-q", "-b", "feature");
+      write(repo, "b.txt", "two\n");
+      git(repo, "add", "b.txt");
+      git(repo, "commit", "-q", "-m", "unpushed work");
+      write(repo, "c.txt", "uncommitted\n");
+      git(repo, "add", "c.txt"); // staged, so the index has to come back too
+      const headBefore = git(repo, "rev-parse", "HEAD");
+
+      assert.match(syncWithGit(ctx, 1, KEEP, noRsync), /OK\s*$/);
+
+      // A fresh sandbox: the image's own files and nothing the session made.
+      rmSync(ctx.workspace, { recursive: true, force: true });
+      mkdirSync(ctx.workspace, { recursive: true });
+      write(ctx.workspace, ".skills/from-image.md", "image\n");
+      run(buildRestoreCommand(ctx.base, ctx.workspace), { path: noRsync ? ctx.noRsyncPath : undefined });
+
+      const restored = join(ctx.workspace, "proj");
+      assert.equal(git(restored, "rev-parse", "HEAD"), headBefore, "the commit that was never pushed");
+      assert.equal(git(restored, "log", "-1", "--format=%s"), "unpushed work");
+      assert.equal(git(restored, "branch", "--show-current"), "feature");
+      assert.equal(git(restored, "status", "--porcelain"), "A  c.txt", "staged work survives too");
+      assert.equal(git(restored, "fsck", "--no-progress").includes("error"), false);
+    } finally {
+      cleanup(ctx);
+    }
+  });
+}
+
+// What a directory can be called. Every row is a repository the sync has been told
+// to leave out, next to one whose name is what the first row's would match if it
+// were read as a pattern: the decoy has to survive, or "left out whole" was a glob.
+const SKIPPED_NAMES: Array<[label: string, skipped: string, decoy: string | null]> = [
+  ["plain", "big", null],
+  ["space", "my project", null],
+  ["glob characters", "x[1]*?", "x1ab"],
+  ["single quote", "it's", null],
+  ["backslash", "back\\slash", null],
+  ["non-ascii", "dir-\u00e9", null],
+  ["nested", "deep/er/repo", null],
+];
+
+for (const noRsync of [false, true]) {
+  const how = noRsync ? "tar fallback" : "rsync";
+  for (const [label, skipped, decoy] of SKIPPED_NAMES) {
+    test(`X11 (${how}) a repository over a bound is left out whole: ${label}`, () => {
+      const ctx = setup();
+      try {
+        write(ctx.workspace, `${skipped}/.git/objects/pack/pack-1.pack`, "huge\n");
+        write(ctx.workspace, `${skipped}/.git/HEAD`, "ref: refs/heads/main\n");
+        // The working tree beside it is not the repository's business.
+        write(ctx.workspace, `${skipped}/src.txt`, "kept\n");
+        write(ctx.workspace, "small/.git/HEAD", "ref: refs/heads/main\n");
+        if (decoy) write(ctx.workspace, `${decoy}/.git/HEAD`, "ref: refs/heads/main\n");
+
+        const decision: GitDecision = {
+          mode: "keep",
+          skipped: [{ path: join(ctx.workspace, skipped, ".git"), bytes: 9e9, files: 1, reason: "too_large" }],
+        };
+        assert.match(syncWithGit(ctx, 1, decision, noRsync), /OK\s*$/);
+
+        const snap = (rel: string): boolean => existsSync(join(ctx.base, "current", rel));
+        assert.ok(!snap(`${skipped}/.git`), "the repository over the bound is not in the snapshot, not even in part");
+        assert.ok(snap(`${skipped}/src.txt`), "its working tree is");
+        assert.ok(snap("small/.git/HEAD"), "a repository within the bounds is");
+        if (decoy) assert.ok(snap(`${decoy}/.git/HEAD`), "and so is one whose name the skipped one would match as a pattern");
+      } finally {
+        cleanup(ctx);
+      }
+    });
+  }
+
+  test(`X12 (${how}) git's transient files stay behind, and a user's own lock file does not`, () => {
+    const ctx = setup();
+    try {
+      write(ctx.workspace, "r/.git/HEAD", "ref: refs/heads/main\n");
+      // A lock a killed git left, and the temporaries of an object being written.
+      // Restored into a sandbox where nothing runs, the first is held for ever.
+      write(ctx.workspace, "r/.git/index.lock", "");
+      write(ctx.workspace, "r/.git/refs/heads/topic.lock", "");
+      write(ctx.workspace, "r/.git/objects/pack/tmp_pack_abc", "half a pack\n");
+      write(ctx.workspace, "r/.git/objects/ab/tmp_obj_xyz", "half an object\n");
+      write(ctx.workspace, "r/.git/objects/pack/pack-1.pack", "real\n");
+      // The reason the rule is scoped under .git and is not a bare `*.lock`.
+      write(ctx.workspace, "r/yarn.lock", "yarn\n");
+      write(ctx.workspace, "Cargo.lock", "cargo\n");
+
+      syncWithGit(ctx, 1, KEEP, noRsync);
+
+      const snap = (rel: string): boolean => existsSync(join(ctx.base, "current", rel));
+      for (const gone of [
+        "r/.git/index.lock", "r/.git/refs/heads/topic.lock",
+        "r/.git/objects/pack/tmp_pack_abc", "r/.git/objects/ab/tmp_obj_xyz",
+      ]) assert.ok(!snap(gone), `${gone} is transient`);
+      for (const kept of ["r/.git/HEAD", "r/.git/objects/pack/pack-1.pack", "r/yarn.lock", "Cargo.lock"]) {
+        assert.ok(snap(kept), `${kept} is content`);
+      }
+    } finally {
+      cleanup(ctx);
+    }
+  });
+
+  test(`X13 (${how}) with .git switched off no repository is carried, at any depth`, () => {
+    const ctx = setup();
+    try {
+      write(ctx.workspace, ".git/HEAD", "ref: refs/heads/main\n");
+      write(ctx.workspace, "a/b/.git/HEAD", "ref: refs/heads/main\n");
+      write(ctx.workspace, "a/b/src.txt", "kept\n");
+      write(ctx.workspace, "sub/.git", "gitdir: ../.git/modules/sub\n"); // a submodule's pointer file
+
+      syncWithGit(ctx, 1, { mode: "drop-all", why: "disabled" }, noRsync);
+
+      const snap = (rel: string): boolean => existsSync(join(ctx.base, "current", rel));
+      assert.ok(!snap(".git") && !snap("a/b/.git") && !snap("sub/.git"));
+      assert.ok(snap("a/b/src.txt"));
+    } finally {
+      cleanup(ctx);
+    }
+  });
+}

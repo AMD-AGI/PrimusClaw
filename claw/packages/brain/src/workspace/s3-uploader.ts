@@ -18,6 +18,15 @@ import { HandsClient } from "../clients/hands.js";
 import { isSessionDeletedLocally } from "../infra/deleted-sessions.js";
 import { s3Excludes, findExcludeArgs } from "./excludes.js";
 import { planUploadDelta } from "./sync-delta.js";
+import {
+  configuredGitLimits,
+  ensureGitSkeleton,
+  gitFindArgs,
+  gitSkipNote,
+  planGit,
+  type GitLimits,
+  type GitSkip,
+} from "./git-dirs.js";
 import pino from "pino";
 
 const logger = pino({ name: "s3-uploader" });
@@ -160,6 +169,12 @@ export interface SyncWorkspaceResult {
    *  them in S3 as they are now. `uploaded + unchanged + failedCount` is
    *  `totalFiles`; absent when every file was a candidate. */
   unchanged?: number;
+  /**
+   * What the sync did about the workspace's git repositories, when it left any out
+   * or could not measure them; absent when every `.git` went up. `note` is the
+   * sentence the user is shown.
+   */
+  git?: { skipped: GitSkip[]; unmeasured: boolean; note: string };
 }
 
 /**
@@ -646,7 +661,7 @@ export async function syncWorkspaceToS3(
   hands: HandsClient,
   sessionId: string,
   userId: string,
-  options?: { s3PrefixOverride?: string },
+  options?: { s3PrefixOverride?: string; gitLimits?: GitLimits },
 ): Promise<SyncWorkspaceResult> {
   // A run being torn down still has a final flush on its way, and the delete
   // that stopped it has already listed the prefix. Landing now would re-create
@@ -672,6 +687,19 @@ export async function syncWorkspaceToS3(
     timeout: SANDBOX_PROBE_TIMEOUT_SEC,
   });
 
+  // Which git repositories are carried (workspace/git-dirs.ts). Decided before the
+  // listing because the listing is what the upload, the delta's `stat` and the
+  // prune are all derived from, so all of them have to see the same files.
+  const gitLimits = options?.gitLimits ?? configuredGitLimits();
+  const git = await planGit(hands, "/workspace", s3Excludes(), gitLimits);
+  const gitSkipped = git.mode === "keep" ? git.skipped : [];
+  const gitUnmeasured = git.mode === "drop-all" && git.why === "unmeasured";
+  const gitNote = gitSkipNote(gitSkipped, gitUnmeasured, gitLimits);
+  const gitResult: Pick<SyncWorkspaceResult, "git"> = gitNote
+    ? { git: { skipped: gitSkipped, unmeasured: gitUnmeasured, note: gitNote } }
+    : {};
+  const excludeArgs = `${findExcludeArgs(s3Excludes())} ${gitFindArgs(git)}`;
+
   // List files in workspace via Hands. The skips come from the one list in
   // workspace/excludes.ts, shared with the shared-filesystem sync -- the two
   // used to disagree about most of their contents, so restoring from S3 and
@@ -687,11 +715,16 @@ export async function syncWorkspaceToS3(
   // list of paths.
   const fileList = await hands.callTool("bash", {
     command:
-      `echo ${LS_BEGIN}; find /workspace -type f ${findExcludeArgs(s3Excludes())}`
+      `echo ${LS_BEGIN}; find /workspace -type f ${excludeArgs}`
       + ` 2>/dev/null; echo "${LS_END}:$?"`,
     timeout: FIND_TIMEOUT_SEC,
   });
-  const listing = parseWorkspaceListing(fileList);
+  let listing = parseWorkspaceListing(fileList);
+  // A listing that left the repositories out because it could not measure them is
+  // missing files the user still has. It uploads what it found, and decides
+  // nothing about what is already in S3: the prune would delete every object of a
+  // repository for the crime of a failed `du`.
+  if (gitUnmeasured && listing.trusted) listing = { ...listing, trusted: false, reason: "git_unmeasured" };
   const files = listing.files;
   if (!listing.trusted) {
     logger.warn(
@@ -723,7 +756,7 @@ export async function syncWorkspaceToS3(
   // doubtful one is uploaded whole, as before, and decides nothing about what is
   // already in S3.
   const delta = listing.trusted
-    ? await planUploadDelta(hands, s3Prefix, files, findExcludeArgs(s3Excludes()))
+    ? await planUploadDelta(hands, s3Prefix, files, excludeArgs)
     : null;
   let pending = delta ? delta.pending : files;
   const unchanged = delta?.unchanged ?? 0;
@@ -753,6 +786,7 @@ export async function syncWorkspaceToS3(
     return {
       uploaded, totalFiles: files.length, failedCount: 0, exhausted: false, empty: false,
       ...(delta ? { unchanged } : {}),
+      ...gitResult,
     };
   };
 
@@ -800,6 +834,7 @@ export async function syncWorkspaceToS3(
     exhausted: true,
     empty: false,
     ...(delta ? { unchanged } : {}),
+    ...gitResult,
   };
 }
 
@@ -854,6 +889,11 @@ function isInternalRelPath(rel: string): boolean {
  */
 export function isRestoreSkipped(rel: string): boolean {
   return isArchiveRelPath(rel) || isInternalRelPath(rel);
+}
+
+/** Whether a path under the session prefix is inside a `.git` directory. */
+function isGitRel(rel: string): boolean {
+  return rel.split("/").slice(0, -1).includes(".git");
 }
 
 /** List all object keys under prefix, paginated, minus everything that belongs
@@ -928,12 +968,18 @@ export async function syncWorkspaceFromS3(
   let pending = keys;
   let downloaded = 0;
   let lastFailures: DownloadBatchResult["failed"] = [];
+  // Objects are files, so the directories a repository keeps empty did not come
+  // back; see ensureGitSkeleton. Whatever was restored is a repository the user
+  // expects to work, so this runs whether or not every file made it.
+  const putBackGitDirs = (): Promise<void> =>
+    ensureGitSkeleton(hands, "/workspace", keys.map((k) => k.slice(s3Prefix.length)));
 
   for (let round = 1; round <= MAX_UPLOAD_ROUNDS && pending.length > 0; round++) {
     const result = await downloadRound(hands, pending, s3Prefix);
     downloaded += result.ok.length;
     lastFailures = result.failed;
     if (result.failed.length === 0) {
+      await putBackGitDirs();
       logger.info({ sessionId, round, totalDownloaded: downloaded, total: keys.length, s3Prefix }, "s3.restored");
       return downloaded;
     }
@@ -949,6 +995,7 @@ export async function syncWorkspaceFromS3(
     { sessionId, downloaded, totalFailed: lastFailures.length, sample: lastFailures.slice(0, 5), s3Prefix },
     "s3.restore.exhausted",
   );
+  await putBackGitDirs();
   return downloaded;
 }
 
@@ -1054,6 +1101,10 @@ export async function archiveRunToS3(
       // the upload-sweeper; duplicating them into per-message archives would
       // leave copies that outlive the user's expiration intent.
       if (rel.startsWith(".uploads/")) continue;
+      // Nor a repository's object store, which would be copied whole for every
+      // message. The live prefix is what a restore reads, and the archive is a
+      // record of what the run produced.
+      if (isGitRel(rel)) continue;
       const dstKey = `${archivePrefix}${rel}`;
       try {
         // CopySource encoding: AWS expects each path segment percent-encoded,

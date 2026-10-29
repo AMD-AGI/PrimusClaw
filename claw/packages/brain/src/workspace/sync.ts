@@ -28,6 +28,15 @@ import {
   rsyncExcludeArgs,
   tarExcludeArgs,
 } from "./excludes.js";
+import {
+  KEEP_ALL_GIT,
+  configuredGitLimits,
+  gitRsyncArgs,
+  gitTarArgs,
+  planGit,
+  type GitDecision,
+  type GitSkip,
+} from "./git-dirs.js";
 import pino from "pino";
 
 // Map a thrown error to the workspace_sync_failures_total{reason} enum
@@ -43,10 +52,11 @@ import pino from "pino";
 // Exported for unit tests (brain/test/workspace-sync.test.ts).
 export function classifySyncFailure(err: unknown):
   "timeout" | "rsync_error" | "meta_write_error" | "hands_unreachable"
-  | "config_error" | "empty_workspace" {
+  | "config_error" | "empty_workspace" | "git_probe" {
   const msg = String((err as { message?: string })?.message ?? err);
   if (/hands_call_timeout|workspace_restore_timeout/.test(msg)) return "timeout";
   if (isHandsNetworkError(err)) return "hands_unreachable";
+  if (/workspace_sync_git_unmeasured/.test(msg)) return "git_probe";
   if (/meta_parse_failed/.test(msg)) return "meta_write_error";
   if (/workspace_persist_base_missing/.test(msg)) return "config_error";
   if (/workspace_sync_empty/.test(msg)) return "empty_workspace";
@@ -127,6 +137,7 @@ export interface SyncResult {
   size: number;       // bytes in BASE/current/ after the swap
   inodes: number;     // file count under BASE/current/
   durationMs: number; // brain-side wall clock for the whole RPC
+  gitSkipped: GitSkip[]; // repositories over a bound, left out of this snapshot
 }
 
 // ── Sandbox-side bash script ────────────────────────────────────────────
@@ -203,6 +214,7 @@ function buildSyncCommand(
   turn: number,
   workspace = SANDBOX_WORKSPACE,
   persistRoot = WORKSPACE_PERSIST_BASE,
+  git: GitDecision = KEEP_ALL_GIT,
 ): string {
   if (!PERSIST_ROOT_RE.test(persistRoot)) throw unsafePersistRoot(persistRoot);
   return wrapWithBash(`set -euo pipefail
@@ -286,12 +298,13 @@ if command -v rsync >/dev/null 2>&1; then
   fi
   rsync -a --delete $PRECISE_MTIME $LINK_DEST \\
     ${RSYNC_EXCLUDES} \\
+    ${gitRsyncArgs(git, workspace)} \\
     ${workspace}/ "$BASE/pending/"
 else
   # rsync unavailable (offline / non-root sandbox). Repopulate the same empty
   # pending/ via tar, so no stale file survives here either. tar/cp are in every
   # base image; this path is the safety net for ENSURE_RSYNC failing silently.
-  tar -C ${workspace} ${TAR_EXCLUDES} -cf - . | tar -C "$BASE/pending" -xf -
+  tar -C ${workspace} ${TAR_EXCLUDES} ${gitTarArgs(git, workspace)} -cf - . | tar -C "$BASE/pending" -xf -
 fi
 
 # Nothing copied, over a snapshot that has something in it, is a sandbox coming
@@ -378,10 +391,19 @@ export async function syncWorkspace(
   const base = sessionBase(userIdHex, sessionId);
   const t0 = Date.now();
   try {
+    // Which repositories are small enough to carry. When that cannot be told the
+    // sync stops here instead of going on without them: this one replaces the
+    // snapshot, and a snapshot written without a `.git` the sandbox still has
+    // would take the saved one with it. The previous snapshot stands, and the
+    // next sync measures again.
+    const git = await planGit(hands, SANDBOX_WORKSPACE, sharedDiskExcludes(), configuredGitLimits(), opts.signal);
+    if (git.mode === "drop-all" && git.why === "unmeasured") {
+      throw new Error(`workspace_sync_git_unmeasured: ${git.detail ?? "unknown"}`);
+    }
     const out = await withHandsTimeout<string>(
       hands,
       "bash",
-      { command: buildSyncCommand(base, turn) },
+      { command: buildSyncCommand(base, turn, SANDBOX_WORKSPACE, WORKSPACE_PERSIST_BASE, git) },
       HANDS_CALL_RSYNC_TIMEOUT_MS,
       opts.signal,
     );
@@ -411,12 +433,13 @@ export async function syncWorkspace(
     const size = Number(meta.size_bytes ?? 0);
     const inodes = Number(meta.inode_count ?? 0);
     const durationMs = Date.now() - t0;
+    const gitSkipped = git.mode === "keep" ? git.skipped : [];
     metrics.onWorkspaceSync(kind, size, durationMs / 1000);
     logger.info(
-      { sessionId, turn, kind, size, inodes, durationMs },
+      { sessionId, turn, kind, size, inodes, durationMs, gitSkipped: gitSkipped.map((s) => `${s.path}:${s.reason}`) },
       "workspace_sync.done",
     );
-    return { size, inodes, durationMs };
+    return { size, inodes, durationMs, gitSkipped };
   } catch (err) {
     const reason = classifySyncFailure(err);
     const durationMs = Date.now() - t0;

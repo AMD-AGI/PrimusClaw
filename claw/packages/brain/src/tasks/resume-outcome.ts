@@ -110,9 +110,11 @@ export function classifyResumeOutcome(
   if (resumeMode === "workspace_restore") {
     return {
       hint: buildResumeHint(
-        "/workspace files are restored from checkpoint but .git index and "
-        + "node_modules are not preserved (ignore list). Re-stage / re-commit "
-        + "local changes or run npm install if needed.",
+        "/workspace files are restored from checkpoint, including each "
+        + "repository's .git (history, branches, committed work). node_modules and "
+        + "other regenerable directories are not preserved: run npm install if "
+        + "needed. A .git over the size limit is not saved; if a repository came "
+        + "back without one, clone it again.",
       ),
       toastReason: "resume_workspace_restored",
     };

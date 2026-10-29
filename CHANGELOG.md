@@ -180,6 +180,20 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- A sandbox rebuilt from the workspace snapshot is still a git repository. `.git` was on the
+  snapshot's exclude list, so after the idle window the files came back and the history did not,
+  and every commit that had not been pushed was lost while the conversation still remembered
+  making it. `.git` is now snapshotted (S3 and the shared disk alike) except git's own transient
+  files (`*.lock`, `tmp_*` under `.git/objects`); `node_modules` and the rest of the list stay
+  excluded. A repository is carried whole or not at all: one over `WORKSPACE_GIT_MAX_BYTES`
+  (default 300 MiB) or `WORKSPACE_GIT_MAX_FILES` (default 2000, since the upload is one request
+  per file) is left out, and the run emits a `workspace_git_skipped` sandbox event that names it.
+  If the sandbox cannot measure its repositories none are saved that time, the listing is treated
+  as doubtful (nothing is pruned from S3 on its strength) and the shared-disk sync keeps its
+  previous snapshot. `WORKSPACE_GIT_MAX_BYTES=0` restores the old behaviour. A restore recreates the
+  empty `refs/` and `objects/` directories an object store cannot hold, the file list and zip
+  download hide `.git`, per-message archives do not copy it, and the resume hint no longer tells
+  the model its commits are gone.
 - A session no longer becomes unusable after a turn that called a tool whose name
   reads as a credential field (for example `mcp__*__apikey_*`). Brain's redactor
   replaced such a tool's whole `argumentsDetail` entry with the string

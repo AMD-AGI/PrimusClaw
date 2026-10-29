@@ -3097,6 +3097,18 @@ class TaskRunner {
             message_id: this.messageId,
           });
         }
+        // Independent of the above: a sync can land and still have left a
+        // repository behind. The event is the only place the user can learn
+        // that their commits in it will not survive the sandbox.
+        if (r.git) {
+          await this.onEvent({
+            type: "sandboxStatus",
+            status: "workspace_git_skipped",
+            reason: r.git.unmeasured ? "git_unmeasured" : "git_over_limit",
+            message: r.git.note,
+            message_id: this.messageId,
+          });
+        }
       } catch (e: unknown) {
         const errMsg = (e as { message?: string })?.message
           ? String((e as { message: string }).message).slice(0, 500)

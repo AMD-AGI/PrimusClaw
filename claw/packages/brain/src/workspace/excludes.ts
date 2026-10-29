@@ -49,10 +49,15 @@
  * Written as bare component names: both rsync's trailing-slash patterns and
  * tar's default unanchored matching drop a name at any depth, and the `find`
  * predicates below are built to match.
+ *
+ * `.git` is not on this list, and was until it cost someone their commits: a
+ * repository is the one dependency-shaped tree that holds work no manifest can
+ * regenerate. It is carried, within a size bound, by `./git-dirs.ts`, which is
+ * also where the rule for git's own transient files lives -- a bare `*.lock`
+ * here would drop the user's `yarn.lock`.
  */
 export const WORKSPACE_EXCLUDES = [
-  // Version control and dependency trees.
-  ".git",
+  // Dependency trees.
   "node_modules",
   ".task-venv",
   // Caches and other regenerable state.

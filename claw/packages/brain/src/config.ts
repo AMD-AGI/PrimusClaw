@@ -977,6 +977,15 @@ export const WORKSPACE_SYNC_NORMAL_SLOTS = envInt("WORKSPACE_SYNC_NORMAL_SLOTS",
 export const WORKSPACE_SIGTERM_PRIORITY_SLOTS = envInt("WORKSPACE_SIGTERM_PRIORITY_SLOTS", 4);
 export const WORKSPACE_RESTORE_TIMEOUT_MS = envInt("WORKSPACE_RESTORE_TIMEOUT_MS", 120_000);
 
+// A workspace snapshot carries each repository's `.git` (so unpushed commits
+// survive a sandbox that is reclaimed and rebuilt from it), unless that one
+// directory is over either bound: then it is left out whole and the user is told
+// (workspace/git-dirs.ts). Bytes bound what Hands has to hold in memory to upload
+// a pack; files bound what each sync pays, since the upload is one PUT per file.
+// WORKSPACE_GIT_MAX_BYTES=0 stops carrying `.git` at all, the old behaviour.
+export const WORKSPACE_GIT_MAX_BYTES = envInt("WORKSPACE_GIT_MAX_BYTES", 300 * 1024 * 1024, { min: 0 });
+export const WORKSPACE_GIT_MAX_FILES = envInt("WORKSPACE_GIT_MAX_FILES", 2000, { min: 1 });
+
 // SIGTERM-time wait budget for an in-flight workspace_sync to drain
 // before the SIGTERM catch block issues its own final writeKvCheckpoint.
 // Sized so the full SIGTERM budget breakdown (15s pending-sync drain +
