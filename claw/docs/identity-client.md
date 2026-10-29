@@ -148,11 +148,15 @@ this use.
 **Limits, stated.**
 
 - Local verification cannot see a revocation: a token is good until it expires (the
-  provider decides how long it lives).
-  `CLAW_IDENTITY_TOKEN_INTROSPECT` closes that gap at the cost of one cached
-  provider call per token, and then an outage of the provider fails requests with a
-  503 rather than letting a possibly revoked token through (the introspection cache
-  and its stale window apply as above).
+  provider decides how long it lives). `CLAW_IDENTITY_TOKEN_INTROSPECT` closes that
+  gap at the cost of one cached provider call per token. The identity client's own
+  rules for introspection then apply: an answer is cached, and while the provider
+  cannot be asked a token whose *active* answer is cached is still honoured for up to
+  `IDENTITY_STALE_IF_ERROR_SECONDS` (30 minutes by default) and never past the
+  token's own expiry, which is checked locally first; any other token gets a 503.
+  Set that variable to `0` to refuse every request during an outage instead. Either
+  way an outage is never wider than with introspection off, where an unexpired token
+  is honoured for its whole life.
 - The roles in the token are taken as the provider's statement. Whether a role
   means administrator is decided by the same rules as for any other credential.
 - Nothing here issues per-user LLM keys: a user authenticated by a token has none,

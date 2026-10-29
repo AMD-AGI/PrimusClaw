@@ -40,13 +40,13 @@ const ENV_KEYS = [
 ];
 
 /** A fresh client against the stand-in provider (so no key or answer is carried over), or none. */
-function identity(on: boolean): void {
+function identity(on: boolean, extra: Record<string, string> = {}): void {
   for (const k of ENV_KEYS) delete process.env[k];
   if (on) {
     Object.assign(process.env, {
       IDENTITY_CLIENT_ENABLED: "true", IDENTITY_ISSUER_URL: fake.issuer, IDENTITY_CLIENT_ID: "svc-claw",
       IDENTITY_CLIENT_SECRET: "s3cret", IDENTITY_INTROSPECTION_CACHE_SECONDS: "0",
-      IDENTITY_INTROSPECTION_NEGATIVE_CACHE_SECONDS: "0", IDENTITY_STALE_IF_ERROR_SECONDS: "0",
+      IDENTITY_INTROSPECTION_NEGATIVE_CACHE_SECONDS: "0", IDENTITY_STALE_IF_ERROR_SECONDS: "0", ...extra,
     });
   }
   startIdentityClient(log);
@@ -282,9 +282,44 @@ describe("with introspection on", () => {
     assert.equal(e.legacyError, "authentication_service_unavailable");
   });
 
+  // The identity client's own stale-if-error window (IDENTITY_STALE_IF_ERROR_SECONDS, default 30 minutes) applies to
+  // the provider's answers, so it applies here: a token whose active answer is cached is honoured through an outage,
+  // and only for as long as the token itself is valid (local checks run first, so an expired token is never asked
+  // about). That is no wider than with introspection off, where an unexpired token is honoured for its whole life.
+  const withCache = (extra: Record<string, string>) => {
+    identity(true, { IDENTITY_INTROSPECTION_CACHE_SECONDS: "1", ...extra });
+    process.env.CLAW_IDENTITY_TOKEN_AUTH_ENABLED = "true";
+    process.env.CLAW_IDENTITY_TOKEN_INTROSPECT = "true";
+  };
+  const pastFreshness = () => new Promise((r) => setTimeout(r, 1100));
+
+  test("through an outage a token whose active answer is cached is still honoured, and one never seen is a 503", async () => {
+    withCache({ IDENTITY_STALE_IF_ERROR_SECONDS: "1800" });
+    const seen = mint();
+    verified(await verify(seen));
+    await pastFreshness();
+    providerDown = true;
+    verified(await verify(seen));
+    assert.equal(refused(await verify(mint())).status, 503);
+  });
+
+  test("with the stale window at zero an outage is a 503 for a token seen a moment ago too", async () => {
+    withCache({ IDENTITY_STALE_IF_ERROR_SECONDS: "0" });
+    const seen = mint();
+    verified(await verify(seen));
+    await pastFreshness();
+    providerDown = true;
+    const e = refused(await verify(seen));
+    assert.equal(e.status, 503);
+    assert.equal(e.legacyError, "authentication_service_unavailable");
+  });
+
   test("a token that fails local checks is never sent to the provider", async () => {
     refused(await verify(mint({ aud: "someone-else" })));
     refused(await verify(mint({ scope: "claw.connector" })));
+    refused(await verify(mint({ exp: nowSec() - 3600 })));
+    refused(await verify(mint({ sub: " padded" })));
+    refused(await verify(mint({}, { header: { typ: "JWT" } })));
     assert.equal(fake.count("/oauth/introspect"), 0);
   });
 
