@@ -35,6 +35,20 @@ export async function startHandsBashStub(opts: { token: string; env: Record<stri
     const chunks: Buffer[] = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", async () => {
+      // One request per connection, because this server and its client share a
+      // process and `bash` below blocks that process's event loop for as long as
+      // the command runs.
+      //
+      // The server closes a connection that has sat idle for six seconds (the
+      // five of `keepAliveTimeout` and a second of buffer), on the real clock.
+      // undici counts a pooled connection's idle time in timer ticks, so a loop
+      // that was blocked for those six seconds has barely aged it, and the next
+      // request is dispatched on a socket the server has already shut: "fetch
+      // failed", which the API turns into "sandbox not running". Hands is a
+      // separate process in production and nothing blocks the client's loop, so
+      // this is a property of the stand-in. Without a connection to reuse there
+      // is nothing to go stale, and a loopback handshake per request is cheap.
+      res.setHeader("connection", "close");
       stub.headers.push({ ...req.headers });
       if ((req.headers.authorization ?? "") !== `Bearer ${opts.token}`) {
         stub.refused++;
