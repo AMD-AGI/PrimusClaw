@@ -494,6 +494,45 @@ grantSigningKey:
   e2bApiUrl: ""
   e2bSandboxUrl: ""
 
+# Shared identity client for API and Brain: OIDC discovery and the issuer's JWKS,
+# RFC 7662 token introspection (positive answers cached, inactive ones cached
+# briefly, concurrent lookups of one credential coalesced), and an RFC 8693 token
+# exchange client with a token cache. Off by default, and nothing authenticates
+# through it yet: enabling it builds the client, reads discovery and the key set
+# in the background, and starts exporting the claw_identity_* metrics.
+#
+# The client secret is never rendered from values. Create the Secret out of band
+# and name it here; both Deployments read the one key.
+#
+# Blank numeric values leave the variable unset, so the code default applies;
+# the defaults are in the comments. A value outside its range is logged at start
+# and the default used.
+identity:
+  enabled: false
+  # The issuer identifier, exactly as it appears in the `iss` claim of its tokens.
+  issuerUrl: ""
+  clientId: ""
+  clientSecret:
+    existingSecret: ""
+    key: client-secret
+  # Where to fetch the discovery document, when that differs from the standard
+  # well-known path under issuerUrl.
+  discoveryUrl: ""
+  # Pin an address instead of taking it from discovery, for a deployment where
+  # the advertised address is not reachable from the pod. A pinned address is
+  # never discovered; with all three pinned discovery is not fetched at all.
+  endpoints:
+    introspection: ""
+    token: ""
+    jwks: ""
+  cache:
+    positiveSeconds: ""      # active answers, default 30; 0 = not cached
+    negativeSeconds: ""      # inactive answers, default 5; 0 = not cached
+    staleIfErrorSeconds: ""  # stale active answers while the provider is down, default 1800; 0 = never
+  requestTimeoutMs: ""       # default 5000
+  keysRefreshSeconds: ""     # discovery and JWKS refresh, default 300
+  exchangeRefreshSkewSeconds: ""  # an exchanged token with less left is replaced, default 30
+
 sandboxTemplate:
   enabled: true
   name: primus-claw-sandbox-template

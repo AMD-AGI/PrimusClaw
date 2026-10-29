@@ -17,6 +17,7 @@ import { bindApiAppGrant } from "./grants/app-grant.js";
 import { initNats } from "./infra/nats.js";
 import { initUserEnvCrypto } from "./crypto/user-env.js";
 import { authLogPath, authMiddleware } from "./auth/middleware.js";
+import { startIdentityClient } from "./auth/identity.js";
 import { registerSessionRoutes } from "./routes/sessions.js";
 import { registerEventRoutes } from "./routes/events.js";
 import { registerAnthropicManagedAgentsRoutes } from "./routes/anthropic-managed-agents.js";
@@ -150,6 +151,8 @@ async function main() {
   // otherwise start exporting neither.
   assertRolloutConfigAtStartup();
   assertAdmissionSettings(logger);
+  // Off unless IDENTITY_CLIENT_ENABLED is set; nothing authenticates through it yet.
+  startIdentityClient(logger);
   // Validate USER_ENV_ENCRYPTION_KEY before doing anything else; we want a
   // fast-fail if the K8s Secret is misconfigured (missing or wrong length),
   // not a runtime surprise on the first PUT /v1/users/me/env-vars/* call.

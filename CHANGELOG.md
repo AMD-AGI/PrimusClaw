@@ -28,6 +28,15 @@ record it.
 ## [Unreleased]
 
 ### Added
+- A shared identity client in `@claw/utils`, built by API and Brain when
+  `IDENTITY_CLIENT_ENABLED=true` (off by default; nothing authenticates through it yet). It does OIDC
+  discovery and caches the issuer's JWKS, RFC 7662 token introspection (an active answer is cached for
+  30 s, an inactive one for 5 s, concurrent lookups of one credential share one call), and an RFC 8693
+  token exchange with a token cache. When the provider cannot be asked, a cached active answer keeps
+  being served for up to 30 minutes (`IDENTITY_STALE_IF_ERROR_SECONDS`, counted in
+  `claw_identity_stale_served_total`); anything else is a typed `IdentityUnavailableError` and is never
+  read as "inactive". The chart takes an `identity:` block (client secret by `existingSecret`
+  reference) and exports `claw_identity_*` metrics. See `claw/docs/identity-client.md`.
 - A session can choose its own model. `POST /v1/sessions` accepts an optional `model`,
   `PATCH /v1/sessions/:id` accepts `model` (a string, or `null` to go back to the default) alone or
   beside `name`, and `GET /v1/sessions/:id` and the session list report it (`null` is the

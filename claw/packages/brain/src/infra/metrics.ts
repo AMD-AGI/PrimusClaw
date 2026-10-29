@@ -17,6 +17,7 @@ import type { SessionDestroyResult } from "../sandbox/multi-node/types.js";
 // Type-only, so this stays a leaf module: container-probe imports it at runtime.
 import type { ContainerProbeReason, ContainerProbeVerdict } from "../sandbox/container-probe.js";
 import type { HandsRecoveryAction } from "../agent/index.js";
+import type { IdentityMetrics } from "@claw/utils";
 
 /**
  * Label domain of claw_brain_sandbox_recovery_decision_total: what the recovery
@@ -693,7 +694,61 @@ const keepaliveReclaimHeldTotal = new Counter({
   registers: [registry],
 });
 
+// ─── Identity client ───────────────────────────────────────────────────
+// What the shared identity client reports about itself (@claw/utils, identity/).
+// `op` and `result` are closed unions in the client, so none of these can grow a
+// series per credential or per user. Absent while the client is off: the
+// counters only move once something asks it a question.
+const identityCacheTotal = new Counter({
+  name: "claw_identity_cache_total",
+  help: "Identity client lookups by operation and how the cache answered them: hit, hit_negative, miss, coalesced.",
+  labelNames: ["op", "result"] as const,
+  registers: [registry],
+});
+// The one to alert on: an answer served from an expired entry because the
+// identity provider could not be asked. A sustained rate is an outage.
+const identityStaleServedTotal = new Counter({
+  name: "claw_identity_stale_served_total",
+  help: "Identity answers served stale because the provider could not be asked (stale_if_error).",
+  labelNames: ["op"] as const,
+  registers: [registry],
+});
+const identityUpstreamTotal = new Counter({
+  name: "claw_identity_upstream_total",
+  help: "Calls made to the identity provider, by operation and outcome.",
+  labelNames: ["op", "outcome"] as const,
+  registers: [registry],
+});
+const identityUpstreamSeconds = new Histogram({
+  name: "claw_identity_upstream_duration_seconds",
+  help: "Wall-clock time of calls to the identity provider, by operation.",
+  labelNames: ["op"] as const,
+  buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+  registers: [registry],
+});
+const identityClientEnabled = new Gauge({
+  name: "claw_identity_client_enabled",
+  help: "1 when the identity client is configured on in this process, set once at startup.",
+  registers: [registry],
+});
+
 export const metrics = {
+  /** Handed to the identity client at construction; see @claw/utils identity/. */
+  identity: {
+    onCache(op, result): void {
+      identityCacheTotal.inc({ op, result });
+    },
+    onStaleServed(op): void {
+      identityStaleServedTotal.inc({ op });
+    },
+    onUpstream(op, outcome, seconds): void {
+      identityUpstreamTotal.inc({ op, outcome });
+      identityUpstreamSeconds.observe({ op }, seconds);
+    },
+  } satisfies IdentityMetrics,
+  setIdentityClientEnabled(enabled: boolean): void {
+    identityClientEnabled.set(enabled ? 1 : 0);
+  },
   /** One platform-default item resolved, skipped or failed. */
   onPlatformDefault(kind: "skill" | "mcp" | "config", outcome: "ok" | "failed" | "skipped", reason: string): void {
     platformDefaultTotal.inc({ kind, outcome, reason });

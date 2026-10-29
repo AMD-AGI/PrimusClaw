@@ -176,6 +176,9 @@ spec:
         - name: NODE_EXTRA_CA_CERTS
           value: /etc/claw-ca/ca.crt
         {{- end }}
+        {{- with (include "primus-claw.identityEnv" .) }}
+        {{- . | nindent 8 }}
+        {{- end }}
         {{- with .Values.api.extraEnv }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
