@@ -481,6 +481,12 @@ export class AgentEngine {
           recreateHands: extras?.recreateHands,
           hooks: hookRunner,
           hitl,
+          // The question tool waits for its answer on the same channel as an
+          // approval. It was never handed over, so the tool answered "not
+          // available" whenever it was called and a question could not be asked
+          // of anyone, a web client or an A2A caller. Present only where an
+          // approval policy builds the channel, as for approvals.
+          questionDispatcher: decisions ?? undefined,
           onCheckpoint: extras?.onCheckpoint,
           onCacheUse: extras?.onCacheUse,
           resumeFrom: extras?.resumeCheckpoint,
