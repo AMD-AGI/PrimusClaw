@@ -48,6 +48,7 @@ const ABSENT: CredentialOutcome = { status: "absent" };
 // Three base64url segments. An `ak-` key, a cookie or any other opaque credential does not look like this.
 const JWT_SHAPE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/;
 const MAX_SUBJECT_CHARS = 128;
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
 
 function refuse(status: number, legacyError: string, message: string): CredentialOutcome {
   return { status: "rejected", error: { status, legacyError, anthropicType: "authentication_error", message } };
@@ -93,8 +94,11 @@ export async function verifyConnectorToken(req: FastifyRequest, pathname: string
     if (!scopesOf(claims.scope).includes(CONNECTOR_TOKEN_SCOPE)) {
       return reject("scope", refuse(403, "insufficient_scope", `the access token needs the ${CONNECTOR_TOKEN_SCOPE} scope`));
     }
-    const sub = text(claims.sub);
-    if (!sub || sub.length > MAX_SUBJECT_CHARS) {
+    // Exactly as the issuer wrote it: it becomes the owner of every row, so a subject that
+    // is not canonical (blank, padded, with a control character) is refused, not repaired,
+    // or two distinct subjects could name one owner.
+    const sub = typeof claims.sub === "string" ? claims.sub : "";
+    if (!sub || sub.length > MAX_SUBJECT_CHARS || sub !== sub.trim() || CONTROL_CHARS.test(sub)) {
       return reject("subject", refuse(401, "invalid_token", "the access token names no usable subject"));
     }
     if (settings.introspect) {

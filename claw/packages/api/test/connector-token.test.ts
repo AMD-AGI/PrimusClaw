@@ -274,6 +274,9 @@ describe("connector access tokens", { skip }, () => {
       ["an empty subject", () => mint({ sub: "  " }), 401, "invalid_token", "subject"],
       ["a subject that is not a string", () => mint({ sub: 7 }), 401, "invalid_token", "subject"],
       ["an enormous subject", () => mint({ sub: "u".repeat(129) }), 401, "invalid_token", "subject"],
+      ["a subject padded with a space", () => mint({ sub: " u1 " }), 401, "invalid_token", "subject"],
+      ["a subject with a trailing newline", () => mint({ sub: "u1\n" }), 401, "invalid_token", "subject"],
+      ["a subject with a control character inside", () => mint({ sub: "u\u00071" }), 401, "invalid_token", "subject"],
     ];
     for (const [name, token, status, error, why] of cases) {
       test(name, async () => {
@@ -335,6 +338,15 @@ describe("connector access tokens", { skip }, () => {
   // ------------------------------------------------------------------ ownership
 
   describe("ownership", () => {
+    test("a subject that differs from the owner's only by padding is refused, not read as the owner", async () => {
+      const cid = await register(mint({ sub: "u1" }));
+      const padded = asToken(mint({ sub: " u1 " }));
+      const r = await padded.post(`/v1/remote-agents/connectors/${cid}/heartbeat`, { agents: [AGENT] });
+      assert.deepEqual([r.status, r.body.error], [401, "invalid_token"]);
+      const row = (await q("SELECT heartbeat_at FROM claw_remote_connectors WHERE connector_id = $1", [cid])).rows[0];
+      assert.equal(row.heartbeat_at, null);
+    });
+
     test("another user's token reaches nothing of a connector it does not own, exactly as a missing id", async () => {
       const cid = await register(mint({ sub: "u1" }));
       const intruder = asToken(mint({ sub: "u2" }));
