@@ -31,10 +31,15 @@ export class NatsEmitter {
     logger.info({ natsUrl, account: NATS_USER || "(default)" }, "nats-emitter.connected");
   }
 
-  async emit(sessionId: string, event: Record<string, unknown>): Promise<void> {
+  /**
+   * `msgID` is JetStream's de-duplication key: the stream drops a second publish
+   * with the same id inside its duplicate window, for the API consumer and for
+   * every live subscriber alike.
+   */
+  async emit(sessionId: string, event: Record<string, unknown>, opts: { msgID?: string } = {}): Promise<void> {
     const subject = eventSubject(sessionId);
     const payload = sc.encode(sanitizeJson(JSON.stringify(event)));
-    await this.js.publish(subject, payload);
+    await this.js.publish(subject, payload, opts.msgID ? { msgID: opts.msgID } : undefined);
     logger.info({ sessionId, subject, type: event.type }, "emit.published");
   }
 }

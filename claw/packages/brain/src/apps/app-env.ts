@@ -86,6 +86,14 @@ export function stopCommand(stateDir: string, tag: string): string {
     + `kill -TERM "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null; echo sent; else echo none; fi`;
 }
 
+/** SIGKILL the application of this generation after the TERM grace has passed. */
+export function killCommand(stateDir: string, tag: string): string {
+  const d = shq(stateDir);
+  return `if [ "$(cat ${d}/${MARKER_FILE} 2>/dev/null)" = ${shq(tag)} ]; then `
+    + `p="$(cat ${d}/${PID_FILE} 2>/dev/null)"; `
+    + `kill -KILL "-$p" 2>/dev/null || kill -KILL "$p" 2>/dev/null; echo sent; else echo none; fi`;
+}
+
 export function parseProbe(stdout: string): ProbeVerdict | null {
   const word = stdout.trim();
   return word === "alive" || word === "dead" || word === "none" ? word : null;
@@ -101,6 +109,8 @@ export function readExitCommand(stateDir: string): string {
 
 /** Seconds are not needed: a holder that is alive is told by its pid, not by the clock. */
 const START_LOCK = ".start.lock";
+/** Held only while a stale {@link START_LOCK} is being removed. */
+const BREAK_LOCK = ".start.lock.break";
 
 /**
  * Start the application detached, unless it is already running here.
@@ -112,9 +122,9 @@ const START_LOCK = ".start.lock";
  *
  *  - A symlink is the lock (creating one is atomic and writes its holder). A contender prints `busy` and leaves the
  *    decision to the next tick's probe. A lock whose holder is no longer alive is
- *    taken over. Known limit: two contenders taking over the same dead lock at
- *    the same instant can both proceed; closing that needs `flock`, which the
- *    sandbox images are not guaranteed to have.
+ *    taken over, through a second symlink that only one contender can hold, so
+ *    two contenders taking over the same dead lock cannot both proceed and a
+ *    fresh lock is never removed as stale (no `flock`: the images need not have it).
  *  - Under the lock, a live process of this sandbox, whatever its restart
  *    generation, means `already`: the marker is moved to this generation, so the
  *    probe agrees with reality, and nothing is launched.
@@ -139,7 +149,19 @@ export function startCommand(manifest: AppManifestV1, stateDir: string, tag: str
     `if ! ln -s "$$|"${shq(workload)} ${START_LOCK} 2>/dev/null; then`,
     `  held=$(readlink ${START_LOCK} 2>/dev/null); holder=\${held%%|*}; lockwl=\${held#*|}`,
     `  if [ -n "$held" ] && [ "$lockwl" = ${shq(workload)} ] && kill -0 "$holder" 2>/dev/null; then echo busy; exit 0; fi`,
-    `  rm -rf ${START_LOCK}; ln -s "$$|"${shq(workload)} ${START_LOCK} 2>/dev/null || { echo busy; exit 0; }`,
+    // Breaking a stale lock is itself serialised: `rm -rf` of a lock judged stale a moment ago can
+    // delete a fresh lock another contender created in between, and then both proceed. Only the
+    // holder of the break link may remove the lock, and only while it is still the very one judged stale.
+    `  if ! ln -s "$$|"${shq(workload)} ${BREAK_LOCK} 2>/dev/null; then`,
+    `    bheld=$(readlink ${BREAK_LOCK} 2>/dev/null); bholder=\${bheld%%|*}; bwl=\${bheld#*|}`,
+    `    if [ -n "$bheld" ] && [ "$bwl" = ${shq(workload)} ] && kill -0 "$bholder" 2>/dev/null; then echo busy; exit 0; fi`,
+    `    rm -f ${BREAK_LOCK}; ln -s "$$|"${shq(workload)} ${BREAK_LOCK} 2>/dev/null || { echo busy; exit 0; }`,
+    `  fi`,
+    `  now=$(readlink ${START_LOCK} 2>/dev/null)`,
+    `  if [ "$now" = "$held" ]; then rm -rf ${START_LOCK}; fi`,
+    `  ln -s "$$|"${shq(workload)} ${START_LOCK} 2>/dev/null; got=$?`,
+    `  rm -f ${BREAK_LOCK}`,
+    `  if [ "$got" -ne 0 ]; then echo busy; exit 0; fi`,
     `fi`,
     `trap 'rm -rf ${START_LOCK}' EXIT`,
     `marker=$(cat ${MARKER_FILE} 2>/dev/null)`,
@@ -164,7 +186,12 @@ export interface AppEnvSources {
   mcpToken: string;
   grantKeys: Partial<Record<AppSandboxRole, string>>;
   grantLimits: Record<string, unknown> | null;
+  /** The grant's template names (`{ role: { cards: name } }`); absent when no grant was issued. */
+  sandboxTemplates?: Record<string, Record<string, string>> | null;
   nodeName: string | null;
+  /** Set under the fixed names `E2B_API_URL` and `E2B_SANDBOX_URL`. */
+  e2bApiUrl?: string;
+  e2bSandboxUrl?: string;
 }
 
 /**
@@ -174,8 +201,8 @@ export interface AppEnvSources {
  * manifest cannot set at all (validateAppManifest reserves them).
  *
  * Only facilities the manifest maps are injected, and the MCP ones only when
- * `mcp` is declared. `mcp_public_url`, `sandbox_templates` and `result_archive`
- * are not provided by this change and stay unset.
+ * `mcp` is declared. `E2B_API_URL` and `E2B_SANDBOX_URL` are fixed names.
+ * `mcp_public_url` and `result_archive` stay unset.
  */
 export function buildAppEnv(s: AppEnvSources): Record<string, string> {
   const { manifest } = s;
@@ -197,14 +224,19 @@ export function buildAppEnv(s: AppEnvSources): Record<string, string> {
   }
   for (const role of APP_SANDBOX_ROLES) set(map.sandbox_keys?.[role], s.grantKeys[role]);
   set(map.grant_limits, s.grantLimits ? JSON.stringify(s.grantLimits) : undefined);
+  // The names the grant service returned, stored on the run; never the manifest's own array.
+  set(map.sandbox_templates, s.sandboxTemplates && Object.keys(s.sandboxTemplates).length > 0 ? JSON.stringify(s.sandboxTemplates) : undefined);
+  if (s.e2bApiUrl) env.E2B_API_URL = s.e2bApiUrl;
+  if (s.e2bSandboxUrl) env.E2B_SANDBOX_URL = s.e2bSandboxUrl;
   env.CLAW_SESSION_ID = s.sessionId;
   if (s.nodeName) env.NODE_NAME = s.nodeName;
   return env;
 }
 
 /** Every secret value an environment built from these sources carries. */
-export function secretValuesOf(s: Pick<AppEnvSources, "mcpToken" | "grantKeys">): string[] {
-  return [s.mcpToken, ...Object.values(s.grantKeys)].filter((v): v is string => typeof v === "string" && v.length > 0);
+export function secretValuesOf(s: Pick<AppEnvSources, "mcpToken" | "grantKeys"> & { platformKey?: string }): string[] {
+  // platformKey: the session owner's key the sandbox carries as the model credential.
+  return [s.mcpToken, s.platformKey, ...Object.values(s.grantKeys)].filter((v): v is string => typeof v === "string" && v.length > 0);
 }
 
 /** `text` with every secret value replaced (the shared rule; see protocol `scrubText`). */

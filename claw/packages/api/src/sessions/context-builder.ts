@@ -3,8 +3,9 @@
 
 import { db } from "../infra/db.js";
 import type { Message } from "@claw/protocol";
+import { coerceToolInput } from "@claw/utils";
 
-import { getMemoryEntries, getProfileEntry } from "../memory/service.js";
+import { getMemoryEntries, getProfileEntry, getMemoryPreference } from "../memory/service.js";
 import { CLAW_MEMORY_ENABLED } from "../config.js";
 import pino from "pino";
 import { estimateTokens } from "../shared/tokens.js";
@@ -68,7 +69,15 @@ export function reconstructHistory(
         // Reconstruct as {type:"tool_use", id, name, input}.
         const id = (tc as any).actionId ?? (tc as any).id;
         const name = (tc as any).tool ?? (tc as any).name;
-        const input = (tc as any).argumentsDetail?.[name] ?? (tc as any).input ?? {};
+        // The stored value is whatever the event carried, which is not always an
+        // object: Brain's redactor used to replace the whole input with the string
+        // "<redacted>" for a tool whose NAME looks like a credential field
+        // (`mcp__*__apikey_*`). Replayed as-is, that string reaches the model
+        // endpoint as a tool call whose arguments are not a JSON object, the
+        // endpoint answers 400 to the whole request, and every later turn of the
+        // session fails the same way. Rows written before that was fixed are
+        // still in the table, so the guarantee has to be made here, on read.
+        const input = coerceToolInput((tc as any).argumentsDetail?.[name] ?? (tc as any).input);
         if (id && name) assistantContent.push({ type: "tool_use", id, name, input });
       }
 
@@ -138,7 +147,12 @@ function parseJsonbArray(v: unknown): any[] {
 
 const MEMORY_BUDGET = 3_000;
 
-async function buildSystemContextParts(
+/** Tells the agent that save_memory will not persist, so it does not claim otherwise. */
+export const MEMORY_OFF_NOTICE =
+  "## Long-term Memory\nLong-term memory is turned off for this user, so save_memory does not store anything. " +
+  "If the user asks you to remember something, say that memory is off and that they can turn it on in the chat settings.";
+
+export async function buildSystemContextParts(
   sessionId: string,
   userId: string,
   rulesText = "",
@@ -159,7 +173,21 @@ async function buildSystemContextParts(
 
   // Long-term memory injection (profile + entries) is gated by CLAW_MEMORY_ENABLED.
   // When OFF: skip both DB queries and emit nothing — system prompt drops these sections.
+  // A second gate, per user: memory is opt-in, so a user who has not turned it on
+  // gets neither injection nor a way to write (see insertMemoryEntry). If the
+  // preference cannot be read, treat it as off.
+  let memoryOptIn = false;
   if (CLAW_MEMORY_ENABLED) {
+    try {
+      memoryOptIn = await getMemoryPreference(userId);
+    } catch (err: any) {
+      logger.error({ err, userId }, "memory.preference_read_failed");
+    }
+    if (!memoryOptIn) {
+      parts.push(MEMORY_OFF_NOTICE);
+    }
+  }
+  if (CLAW_MEMORY_ENABLED && memoryOptIn) {
     // 1. User profile
     try {
       const profileContent = await getProfileEntry(userId);

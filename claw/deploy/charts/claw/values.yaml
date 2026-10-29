@@ -18,9 +18,45 @@ tls:
   # into the image trust store, which the runtime stage of the Dockerfile
   # already does with NODE_EXTRA_CA_CERTS.
   insecureSkipVerify: false
+  # Name of an existing ConfigMap in the release namespace holding PEM
+  # certificates (root and any intermediates) for a private CA. It is mounted
+  # read-only into api and brain and NODE_EXTRA_CA_CERTS is pointed at the key
+  # below, so outbound HTTPS to an endpoint behind that CA verifies without
+  # rebuilding the image and without disabling verification. Node adds these to
+  # its built-in roots. Empty (the default) changes nothing. Note it replaces,
+  # for these two containers, the image's own NODE_EXTRA_CA_CERTS value, so put
+  # in the ConfigMap every anchor the image would otherwise have supplied.
+  # Node reads the file once at start-up: after changing the ConfigMap's
+  # contents, restart api and brain (kubectl rollout restart) to pick it up.
+  # upgrade.sh renders from values.<ns>.env, not from this file: set
+  # EXTRA_CA_CERTS_CONFIGMAP / EXTRA_CA_CERTS_KEY there (see values.example.env).
+  # The key is projected to /etc/claw-ca/ca.crt, so a key missing from the
+  # ConfigMap fails the pod mount instead of being silently ignored.
+  extraCACertsConfigMap: ""
+  extraCACertsKey: ca.crt
 api:
   replicas: 4
+  # Generic pass-through for settings this chart has no dedicated key for.
+  # extraEnv entries render after every other env entry of the api container, so
+  # a name set here also replaces the same name arriving through envFrom. Each
+  # entry is a Kubernetes EnvVar ({name, value} or {name, valueFrom}).
+  # extraVolumes / extraVolumeMounts are Kubernetes Volume / VolumeMount lists
+  # appended to the pod and the api container. upgrade.sh builds these from
+  # EXTRA_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* in values.<ns>.env (see
+  # values.example.env); a bare `helm upgrade --set` is dropped by the next
+  # upgrade.sh. Empty by default, which changes nothing.
+  extraEnv: []
+  extraVolumes: []
+  extraVolumeMounts: []
   port: 8200
+  # Where a client outside the cluster reaches the API, as CLAW_PUBLIC_URL --
+  # "https://claw.example.com/claw-api". A2A agent cards advertise it, and the
+  # ingress strips its path prefix before the API sees the request, so without
+  # it a card would point clients at a path that 404s. Empty derives
+  # https://<ingress.host><ingress.path> when the ingress is enabled; set it
+  # when the public scheme or host is not what the ingress says (plain http, a
+  # CDN or another gateway in front).
+  publicUrl: ""
   # Browser origins allowed to call the API with credentials, comma-separated
   # and including the scheme -- "https://claw.example.com,https://admin.example.com".
   #
@@ -88,6 +124,18 @@ api:
 
 brain:
   replicas: 3
+  # Generic pass-through for settings this chart has no dedicated key for.
+  # extraEnv entries render after every other env entry of the brain container, so
+  # a name set here also replaces the same name arriving through envFrom. Each
+  # entry is a Kubernetes EnvVar ({name, value} or {name, valueFrom}).
+  # extraVolumes / extraVolumeMounts are Kubernetes Volume / VolumeMount lists
+  # appended to the pod and the brain container. upgrade.sh builds these from
+  # EXTRA_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* in values.<ns>.env (see
+  # values.example.env); a bare `helm upgrade --set` is dropped by the next
+  # upgrade.sh. Empty by default, which changes nothing.
+  extraEnv: []
+  extraVolumes: []
+  extraVolumeMounts: []
   port: 8100
   # Which checkpoint format to WRITE; readers always accept 3 and 4.
   #
@@ -360,6 +408,12 @@ secret:
   # SaFE API key, so a Router with auth on answers 401 and Hands provisioning fails its
   # health check.
   sandboxHandsViaRouter: "false"
+  # Set "true" when the sandbox Router runs with --enable-auth (SANDBOX_ROUTER_AUTH_ENABLED).
+  # A hosted application's session-level MCP then carries the <SAFE_API_KEY> placeholder as
+  # its token, which Brain expands to the session owner's platform key; otherwise it carries
+  # the run's MCP token. The console's admin sandbox lists (GET /v1/admin/sandbox/*) then
+  # present the admin caller's platform key to the Router as a Bearer credential.
+  sandboxRouterAuthEnabled: "false"
   clawDeployRoot: ""
   workspacePersistBase: ""
   litellmApiBase: ""
@@ -369,6 +423,12 @@ secret:
   # Max time a sandbox may stay Pending/Creating before the message fails with
   # reason sandbox_pending_timeout. 0 = wait forever. Default 3h.
   sandboxPendingTimeoutSeconds: "10800"
+  # Max time a scheduled sandbox may stay not-ready (image pull, container start)
+  # before the message fails with reason sandbox_start_timeout. 0 = wait forever. Default 15m.
+  sandboxStartTimeoutSeconds: "900"
+  # The same ceiling for multi-node GPU clusters (giving up deletes the cluster).
+  # 0 = off, the default: large images and Infera role pods routinely take longer.
+  multiNodeStartTimeoutSeconds: "0"
   # How long a Running sandbox with an empty GET /api/jobs roster stays up
   # before Brain idle-reclaims it. Default 15 minutes.
   sandboxIdleReuseSeconds: "900"
@@ -431,6 +491,56 @@ secret:
   # control-plane fault can affect every sandbox at once, so the safe default is
   # to log and let the platform's own idle/TTL GC reclaim confirmed orphans.
   sandboxKeepaliveFailLimit: "0"
+
+# Signing key for Agent Sandbox grants. The private key lives in
+# agent-sandbox-system/agent-sandbox-grant, key signing-key.pem. Copy that key
+# into this namespace as `secretName` before setting enabled. Only the API
+# mounts it. Brain asks the API to extend and reissue.
+grantSigningKey:
+  enabled: false
+  secretName: primus-claw-grant-signing-key
+  url: http://agent-sandbox-router.agent-sandbox-system.svc.cluster.local:8080/internal/v1/grants
+  e2bApiUrl: ""
+  e2bSandboxUrl: ""
+
+# Shared identity client for API and Brain: OIDC discovery and the issuer's JWKS,
+# RFC 7662 token introspection (positive answers cached, inactive ones cached
+# briefly, concurrent lookups of one credential coalesced), and an RFC 8693 token
+# exchange client with a token cache. Off by default, and nothing authenticates
+# through it yet: enabling it builds the client, reads discovery and the key set
+# in the background, and starts exporting the claw_identity_* metrics.
+#
+# The client secret is never rendered from values. Create the Secret out of band
+# and name it here; both Deployments read the one key.
+#
+# Blank numeric values leave the variable unset, so the code default applies;
+# the defaults are in the comments. A value outside its range is logged at start
+# and the default used.
+identity:
+  enabled: false
+  # The issuer identifier, exactly as it appears in the `iss` claim of its tokens.
+  issuerUrl: ""
+  clientId: ""
+  clientSecret:
+    existingSecret: ""
+    key: client-secret
+  # Where to fetch the discovery document, when that differs from the standard
+  # well-known path under issuerUrl.
+  discoveryUrl: ""
+  # Pin an address instead of taking it from discovery, for a deployment where
+  # the advertised address is not reachable from the pod. A pinned address is
+  # never discovered; with all three pinned discovery is not fetched at all.
+  endpoints:
+    introspection: ""
+    token: ""
+    jwks: ""
+  cache:
+    positiveSeconds: ""      # active answers, default 30; 0 = not cached
+    negativeSeconds: ""      # inactive answers, default 5; 0 = not cached
+    staleIfErrorSeconds: ""  # stale active answers while the provider is down, default 1800; 0 = never
+  requestTimeoutMs: ""       # default 5000
+  keysRefreshSeconds: ""     # discovery and JWKS refresh, default 300
+  exchangeRefreshSkewSeconds: ""  # an exchanged token with less left is replaced, default 30
 
 sandboxTemplate:
   enabled: true

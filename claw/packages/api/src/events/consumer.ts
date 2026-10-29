@@ -7,14 +7,11 @@ import {
   rememberSessionDeleted,
 } from "../sessions/deleted-cache.js";
 import { db, MarketplaceDb } from "../infra/db.js";
-import {
-  canViewPlugin,
-  formatPluginRow,
-  pluginSandboxImage,
-} from "../marketplace/plugins.js";
+import { resolveTaskPlugin } from "../marketplace/plugins.js";
 
 import { buildMessages } from "../sessions/context-builder.js";
-import { maybeExtractMemory, insertMemoryEntry, scanMemoryContent, maybeUpdateUserProfile } from "../memory/service.js";
+import { sessionModelFromRow } from "../sessions/session-model.js";
+import { maybeExtractMemory, insertMemoryEntry, isMemoryActive, scanMemoryContent, maybeUpdateUserProfile } from "../memory/service.js";
 import {
   saveSkill, recordSkillFeedback,
   selectSkillsForTask,
@@ -22,9 +19,11 @@ import {
   maybeRecordTaskPattern,
   checkProbationGraduation,
 } from "../marketplace/skill-service.js";
+import { appEventIdentity } from "./app-events.js";
 import { enqueueEvolutionJob } from "../marketplace/evolve-worker.js";
 import { callMemoryLLM } from "../llm/client.js";
-import { CLAW_MEMORY_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
+import { CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
+import { recordRunFinished } from "../notifications/outbox.js";
 import {
   markChatRunRunning, closeChatRun, gateOwnershipEnforced, queuedMessageId,
   retireDispatchReconcileForReport,
@@ -37,7 +36,7 @@ import { metrics } from "../infra/metrics.js";
 import { publishSummaryIfCurrent } from "./summary.js";
 import { completionAlreadyProcessed } from "./store.js";
 import { withCompletionLock } from "./completion-lock.js";
-import { recordCompletionTurns } from "./completion-turns.js";
+import { isSandboxOnlyRun, recordCompletionTurns } from "./completion-turns.js";
 
 export { recordCompletionTurns } from "./completion-turns.js";
 // Re-exported: this predicate lived here until it gained a second caller, and
@@ -394,11 +393,26 @@ export async function consumeEventDelivery(msg: {
     const seq = (msg as any).seq ?? (msg as any).info?.streamSequence;
     const eventId = makeEventId(seq);
     let rowId: number | null = null;
+    // An application's progress event is published at least once (hosting design
+    // 5.7), so the same one can arrive under a new stream sequence. It is stored
+    // once per (session, app run, event id) by the unique index
+    // `uq_session_events_app_event`. Every `appEvent` takes the bare ON CONFLICT,
+    // not only one with a well-formed identity: the index's own predicate is
+    // wider than the identity check (a numeric id, an empty app_task_id still have
+    // index keys), and a targeted `ON CONFLICT (event_id, session_id)` does not
+    // absorb that index's 23505, which would nak the message for ever.
+    const isAppEvent = event.type === "appEvent";
+    const appEvent = appEventIdentity(event);
     try {
       const insertResult = await db.query(
-        "INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, $3, $4) ON CONFLICT (event_id, session_id) DO NOTHING RETURNING id",
+        `INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, $3, $4) ON CONFLICT ${isAppEvent ? "" : "(event_id, session_id) "}DO NOTHING RETURNING id`,
         [eventId, sessionId, (event.type as string) || "message", event],
       );
+      if (isAppEvent && !insertResult.rowCount) {
+        logger.info({ sessionId, appTaskId: appEvent?.appTaskId, appEventId: appEvent?.eventId }, "event-consumer.app_event_duplicate_dropped");
+        msg.ack();
+        return;
+      }
       if (insertResult.rowCount && insertResult.rows[0]) {
         metrics.onEventPersisted("ok");
         rowId = insertResult.rows[0].id;
@@ -476,6 +490,20 @@ export async function consumeEventDelivery(msg: {
 }
 
 /**
+ * Whether a lifecycle event is an app run's. Brain stamps `message_id` with the
+ * run's task id for anything that is not a chat turn, so the id names the row.
+ */
+async function isAppRunEvent(sessionId: string, event: Record<string, unknown>): Promise<boolean> {
+  const taskId = event.message_id;
+  if (typeof taskId !== "string" || !taskId) return false;
+  const r = await db.query(
+    "SELECT 1 FROM claw_tasks WHERE task_id = $1 AND session_id = $2 AND mode = 'app'",
+    [taskId, sessionId],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
+/**
  * Apply a brain-emitted lifecycle event to claw_sessions.agent_status,
  * gated by the monotonic status_event_at column added in migration 0042.
  *
@@ -492,6 +520,16 @@ async function handleStatusEvent(
   const wall = Number(event.wallclock_ms);
   if (!Number.isFinite(wall) || wall <= 0) {
     logger.warn({ sessionId, type: event.type }, "status_event.bad_wallclock_skip");
+    return;
+  }
+  // An app run is not the session's foreground turn. `agent_status` is the gate on
+  // the conversation (`running` parks every message in `claw_pending_messages`), and
+  // a hosted application runs for hours beside it: a `taskResumed` from a redelivered
+  // app run used to set `running` with no turn to complete and no marker, so nothing
+  // released it and the application's own events kept the stuck-session reaper off.
+  // The run's lifecycle is on its row and in `appStatus`; the gate is not its to move.
+  if (await isAppRunEvent(sessionId, event)) {
+    logger.info({ sessionId, type: event.type, taskId: event.message_id }, "status_event.app_run_ignored");
     return;
   }
   const nextStatus = event.type === "taskInterrupted" ? "interrupted" : "running";
@@ -729,6 +767,23 @@ function runClaimOf(event: Record<string, unknown>): number | undefined {
   return typeof raw === "number" && Number.isInteger(raw) ? raw : undefined;
 }
 
+/**
+ * The completion's side effects, behind a seam so a test can see which of them
+ * a given run triggers (the functions are imported bindings, which cannot be
+ * substituted). Production reads every one from here.
+ */
+export const completionPorts = {
+  insertMemoryEntry,
+  saveSkill,
+  recordSkillFeedback,
+  checkProbationGraduation,
+  maybeSummarize: (sessionId: string, userId: string) => maybeSummarize(sessionId, userId),
+  maybeExtractMemory,
+  maybeRecordTaskPattern,
+  enqueueEvolutionJob,
+  recordRunFinished,
+};
+
 async function handleComplete(
   sessionId: string,
   event: Record<string, unknown>,
@@ -762,6 +817,8 @@ async function handleComplete(
   // that question. `closeChatRun` is safe to run first: with no message id it
   // only closes a row that is the single open one, so it cannot take a
   // concurrent run's row with it.
+  // Runs this completion ended, for the notification outbox below.
+  let endedRunIds: string[] = [];
   if (provenance !== "foreign") {
     const closed = await closeChatRun(
       sessionId,
@@ -770,6 +827,7 @@ async function handleComplete(
       failed ? String(failure_reason ?? "agent_error") : undefined,
       { taskId: provenance ?? undefined, runClaim: runClaimOf(event) },
     );
+    endedRunIds = closed.length ? closed : (provenance ? [provenance] : []);
     // A zero match classifies the event; it is not a yes/no gate. This
     // delivery may be its own redelivery, in which case every step below is
     // still owed and each is idempotent -- but it may equally be a report the
@@ -835,6 +893,13 @@ async function handleComplete(
   // unnamed completion would otherwise only ever match an unnamed gate.
   const gateTurn = messageId
     ?? (provenance && provenance !== "foreign" ? await turnOfChatRow(sessionId, provenance) : null);
+  // Classified once, here. A sandbox-only run (the terminal's start) is not a
+  // conversation turn, so after the gate is released and the run row closed --
+  // the lifecycle -- none of the completion's side effects apply to it: no
+  // transcript turns, summaries, memory, skill feedback or evolution, and no
+  // run.completed / run.failed notification. Everything below that is such a
+  // side effect is gated on this one answer, or follows the early return.
+  const sandboxOnly = messageId !== null && await isSandboxOnlyRun(sessionId, messageId);
   const gateOpened = await releaseSessionGateIfLastRun(
     sessionId, gateTurn, Boolean(failed),
     provenance !== "foreign" ? provenance : null,
@@ -848,7 +913,7 @@ async function handleComplete(
   // Brain's save_memory tool stays in the schema, so the LLM may still call it;
   // this is the silent-discard contract documented in the feature flag.
   let explicitMemorySaved = false;
-  const memoriesToSave = (event as any).memories_to_save || [];
+  const memoriesToSave = sandboxOnly ? [] : (event as any).memories_to_save || [];
   if (!CLAW_MEMORY_ENABLED) {
     if (memoriesToSave.length) {
       logger.warn({ sessionId, count: memoriesToSave.length }, "memory.write_skipped_flag_off");
@@ -858,8 +923,11 @@ async function handleComplete(
       const blocked = scanMemoryContent(mem.content);
       if (blocked) { logger.warn({ reason: blocked }, "memory.blocked"); continue; }
       try {
-        await insertMemoryEntry(userId, { ...mem, sourceSession: sessionId, sourceType: "explicit" });
-        explicitMemorySaved = true;
+        if (await completionPorts.insertMemoryEntry(userId, { ...mem, sourceSession: sessionId, sourceType: "explicit" })) {
+          explicitMemorySaved = true;
+        } else {
+          logger.warn({ sessionId }, "memory.write_skipped_user_opted_out");
+        }
       } catch (err) {
         logger.error({ err, sessionId }, "memory.save_failed");
       }
@@ -872,8 +940,8 @@ async function handleComplete(
 
   // 4 + 4.5. Skill writes (save_skill tool, skill_file mutations).
   // Gated by CLAW_SKILL_EVOLUTION_ENABLED. When OFF: drop, warn for audit.
-  const skillsToSave = (event as any).skills_to_save || [];
-  const skillFileMutations = (event as any).skill_file_mutations || [];
+  const skillsToSave = sandboxOnly ? [] : (event as any).skills_to_save || [];
+  const skillFileMutations = sandboxOnly ? [] : (event as any).skill_file_mutations || [];
   if (!CLAW_SKILL_EVOLUTION_ENABLED) {
     if (skillsToSave.length || skillFileMutations.length) {
       logger.warn({
@@ -889,7 +957,7 @@ async function handleComplete(
       const blocked = scanMemoryContent(skill.content, 5000);
       if (blocked) { logger.warn({ reason: blocked }, "skill.blocked"); continue; }
       try {
-        await saveSkill(skill.skill_name, userId, skill.content, "manual", sessionId, skill.description || "");
+        await completionPorts.saveSkill(skill.skill_name, userId, skill.content, "manual", sessionId, skill.description || "");
         logger.info({ skillName: skill.skill_name, sessionId }, "skill.saved");
 
         // Sub-files passed in the same save_skill call (rare path; usually they come via mutations)
@@ -953,6 +1021,11 @@ async function handleComplete(
     logger.info({ sessionId, messageId }, "chat.pending_drain_deferred_session_busy");
   }
   if (gateOpened) await drainOldestPendingMessage(sessionId, userId);
+
+  if (sandboxOnly) {
+    logger.info({ sessionId, messageId, failed }, "exec_complete.handled_sandbox_only");
+    return;
+  }
 
   // 6. Record skill effectiveness feedback (synchronous DB update, no LLM).
   //    Score: failed = -1, mixed quality = 0, clean success = +1.
@@ -1036,8 +1109,8 @@ async function handleComplete(
       else score = 1;
       try {
         for (const name of primarySkills) {
-          await recordSkillFeedback(userId, [name], score);
-          await checkProbationGraduation(userId, name);
+          await completionPorts.recordSkillFeedback(userId, [name], score);
+          await completionPorts.checkProbationGraduation(userId, name);
         }
       } catch (err) {
         logger.error({ err, sessionId }, "skill.feedback_failed");
@@ -1052,14 +1125,14 @@ async function handleComplete(
   //     Memory extraction gated by CLAW_MEMORY_ENABLED; pattern recording
   //     gated by CLAW_SKILL_EVOLUTION_ENABLED. Summary stays unconditional.
   setImmediate(() => {
-    maybeSummarize(sessionId, userId).catch(err =>
+    completionPorts.maybeSummarize(sessionId, userId).catch(err =>
       logger.error({ err, sessionId }, "summarize_failed"));
     if (CLAW_MEMORY_ENABLED && !explicitMemorySaved) {
-      maybeExtractMemory(sessionId, userId).catch(err =>
+      completionPorts.maybeExtractMemory(sessionId, userId).catch(err =>
         logger.error({ err, sessionId }, "memory.extraction_failed"));
     }
     if (CLAW_SKILL_EVOLUTION_ENABLED) {
-      maybeRecordTaskPattern(sessionId, userId, event).catch(err =>
+      completionPorts.maybeRecordTaskPattern(sessionId, userId, event).catch(err =>
         logger.error({ err, sessionId }, "skill.pattern_record_failed"));
     }
   });
@@ -1071,9 +1144,25 @@ async function handleComplete(
   //     with retries and crash recovery. Gated by CLAW_SKILL_EVOLUTION_ENABLED.
   if (CLAW_SKILL_EVOLUTION_ENABLED) {
     try {
-      await enqueueEvolutionJob(sessionId, userId, event as Record<string, unknown>);
+      await completionPorts.enqueueEvolutionJob(sessionId, userId, event as Record<string, unknown>);
     } catch (err) {
       logger.error({ err, sessionId }, "evolve.enqueue_failed");
+    }
+  }
+
+  // 8. Notify subscribers that a run ended. Opt-in (flag and a subscription),
+  //    best-effort, and idempotent: the outbox row key is derived from the run,
+  //    so a redelivered completion records nothing new.
+  if (CLAW_NOTIFICATIONS_ENABLED && !interrupted && endedRunIds.length) {
+    try {
+      await completionPorts.recordRunFinished({
+        sessionId,
+        taskIds: endedRunIds,
+        outcome: failed ? "failed" : "completed",
+        failureReason: failed ? String(failure_reason ?? "agent_error") : undefined,
+      });
+    } catch (err) {
+      logger.error({ err, sessionId }, "notification.record_failed");
     }
   }
 
@@ -1164,8 +1253,12 @@ export async function drainOldestPendingMessage(
   sessionId: string,
   userId: string,
 ): Promise<void> {
+  // `session_model` is read with the row rather than stored on it: the message
+  // may have waited behind a long turn, and the model that applies is the one the
+  // session has when the message is sent on, which is what a change "from the next
+  // turn" means for a turn that was already parked.
   const pending = (await db.query(
-  "SELECT id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology FROM claw_pending_messages WHERE session_id = $1 ORDER BY created_at LIMIT 1",
+  "SELECT id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology, (SELECT model FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_model FROM claw_pending_messages WHERE session_id = $1 ORDER BY created_at LIMIT 1",
   [sessionId],
 )).rows[0];
 
@@ -1191,17 +1284,25 @@ if (pending) {
   const defaultImage = String(defaultResourceRow?.image ?? "").trim() || undefined;
   let pluginImage: string | undefined;
   let pluginResource: Record<string, unknown> | undefined;
+  // What the immediate path attaches (`undefined` = the message names no plugin).
+  // A message that names a plugin and leaves this out reaches Brain with
+  // `plugin_id` set and no tool list, so Brain loads nothing from the plugin
+  // and holds every bash command.
+  let pluginTools: unknown[] | null | undefined;
   if (pluginId !== undefined && Number.isFinite(pluginId)) {
     try {
-      const pluginRow = await MarketplaceDb.pluginGetById(pluginId, false);
-      if (pluginRow && canViewPlugin(pluginRow, pendingUserId, false)) {
-        const formatted = await formatPluginRow(pluginRow, true);
-        const imageFromPlugin = pluginSandboxImage(formatted.images);
-        if (imageFromPlugin) pluginImage = imageFromPlugin;
-        const resourceFromPlugin = asJsonObject(formatted.resource);
-        if (resourceFromPlugin) pluginResource = resourceFromPlugin;
-      }
+      // The session owner's own view. The roles of whoever sent this message
+      // are not stored on the queue row and are not guessed at here, so the
+      // admin override the immediate path applies is not applied: this can
+      // only ever show the owner less than the immediate path would.
+      const plugin = await resolveTaskPlugin(pluginId, pendingUserId, false);
+      pluginTools = plugin.tools;
+      pluginImage = plugin.image;
+      pluginResource = plugin.resource;
     } catch (err) {
+      // Not undefined: that would say the message named no plugin. Null says
+      // the tool list could not be had, and Brain fails closed on it.
+      pluginTools = null;
       logger.warn({ err, sessionId, pluginId }, "pending.plugin_resource_resolve_failed");
     }
   }
@@ -1226,12 +1327,14 @@ if (pending) {
     message_id: pendingMessageId,
     prompt: pending.content,
     history,
+    memory_enabled: await isMemoryActive(pendingUserId),
     user_id: pendingUserId,
     llm_api_key: typeof pending.llm_api_key === "string" ? pending.llm_api_key : "",
     platform_key: typeof pending.platform_key === "string" ? pending.platform_key : "",
     skills: pendingSkills,
     tool_ids: toolIds.length ? toolIds : undefined,
     plugin_id: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
+    ...(pluginTools !== undefined ? { plugin_tools: pluginTools } : {}),
     workspace_id: workspaceId,
     sandbox_image: finalSandboxImage,
     resources: finalResources,
@@ -1240,6 +1343,10 @@ if (pending) {
     session_env: pendingSessionEnv && Object.keys(pendingSessionEnv).length ? pendingSessionEnv : undefined,
     topology: asJsonObject(pending.topology),
   };
+  // Same rule as the immediate path in sessions/dispatch.ts: no field at all for
+  // a session with no choice, so Brain falls back on its own default.
+  const pendingModel = sessionModelFromRow({ model: pending.session_model });
+  if (pendingModel) task.model = pendingModel;
   const credentialsReadable = await applyPendingCredentials(task, pending, {
     sessionId, userId: pendingUserId, messageId: pendingMessageId,
   });

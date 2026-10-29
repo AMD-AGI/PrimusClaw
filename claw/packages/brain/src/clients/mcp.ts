@@ -103,8 +103,30 @@ async function connectMcpServer(name: string, spec: Record<string, unknown>): Pr
 }
 
 /**
+ * Put tool schemas in a fixed order: by name, code unit by code unit.
+ *
+ * The tool list is the first thing in the rendered prompt (tools, then system,
+ * then messages), so a prompt-cache entry only survives while it is byte for
+ * byte the same. A server may answer `tools/list` in a different order every
+ * time -- one registered from a hash map does -- and the list is built once
+ * per run, so the order is stable inside a turn and different on the next one:
+ * the entry written by the last call of one turn can never be read by the
+ * first call of the next, and the whole prefix is written again.
+ *
+ * Plain `<`, not `localeCompare`: the result must not depend on the ICU data
+ * or the locale of the pod that happens to run the turn.
+ */
+export function sortToolSchemasByName<T extends { name: string }>(tools: readonly T[]): T[] {
+  return [...tools].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
+/**
  * Connect to all MCP servers from resolved configs.
  * Returns a Map for ToolRouter and combined tool schemas for LLM.
+ *
+ * `schemas` is sorted by name (see sortToolSchemasByName), across servers, so
+ * neither a server's own listing order nor the order the servers were
+ * configured in reaches the request.
  */
 export async function connectPlatformMcp(
   servers: Record<string, Record<string, unknown>>,
@@ -134,7 +156,7 @@ export async function connectPlatformMcp(
 
   return {
     clients,
-    schemas,
+    schemas: sortToolSchemasByName(schemas),
     async closeAll() {
       for (const w of wrappers) await w.close();
     },

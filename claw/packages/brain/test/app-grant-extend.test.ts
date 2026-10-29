@@ -45,7 +45,11 @@ test("X1 a later time is passed to the hook and the time it returns is what is s
   assert.deepEqual(r, { extended: true, expiresAt: "2026-01-01T05:00:00.000Z" });
   assert.equal(h.calls.length, 1);
   assert.equal(h.calls[0]!.expiresAt, T_NEW);
-  assert.deepEqual(h.calls[0]!.run, { runId: RUN_ID, sessionId: "sess-1", grantId: "grt-1", manifest: MANIFEST });
+  assert.deepEqual(h.calls[0]!.run, {
+    runId: RUN_ID, sessionId: "sess-1", grantId: "grt-1", manifest: MANIFEST,
+    platformKey: "pk", workspaceId: "ws-1", expiresAt: T_OLD,
+    sandboxSpec: { handle: "app", image: "img:1" },
+  });
   assert.equal(h.world.rec.grant_expires_at, "2026-01-01T05:00:00.000Z", "the hook's answer, not the asked time");
 });
 

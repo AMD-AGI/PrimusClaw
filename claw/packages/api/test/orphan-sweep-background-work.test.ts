@@ -47,6 +47,10 @@ const { db } = await import("../src/infra/db.js");
 const {
   handleRegistry, readSessionBackgroundWork, unreleasedRecord,
 } = await import("../src/tasks/sandbox-stopper.js");
+
+// The terminal claim is read from the registry bucket, which these suites do not
+// stand up; no claim is in force unless a case says so.
+handleRegistry.terminalHold = async () => ({ state: "none" });
 const { reapOrphanHandles } = await import("../src/tasks/sweeper.js");
 
 const originalQuery = db.query;
@@ -98,7 +102,10 @@ function bucketHolding(entries: Record<string, unknown>): { reads: string[] } {
     },
   };
   handleRegistry.backgroundWork = (sessionId, workloadIds) =>
-    readSessionBackgroundWork(kv, sessionId, workloadIds);
+    // A reuse window of 0: this suite is about the verdict rules, and a parked
+    // entry a minute old would otherwise sit inside the real window. The window
+    // has its own suite, orphan-sweep-reuse-window.test.ts.
+    readSessionBackgroundWork(kv, sessionId, workloadIds, Date.now(), 0);
   return { reads };
 }
 

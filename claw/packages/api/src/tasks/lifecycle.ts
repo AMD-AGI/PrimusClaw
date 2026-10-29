@@ -21,7 +21,7 @@ import {
 import { cancelUnheldRun } from "./chat-run.js";
 import { applyTaskStatusTransition, getTask, transitionStatus } from "./db.js";
 import { topologyErrors } from "./run-spec.js";
-import { type ReleaseOutcome, stopAllHandlesForDag, stopSandboxByHandle } from "./sandbox-stopper.js";
+import { type ReleaseOutcome, handleRegistry, stopAllHandlesForDag, stopSandboxByHandle } from "./sandbox-stopper.js";
 import { newTaskId } from "./ids.js";
 import { decodeRunTimeReport } from "@claw/protocol";
 import { settleRunTime } from "./run-time-ledger.js";
@@ -258,6 +258,18 @@ async function maybeStopHandlesForLastUser(
     return;
   }
 
+  // A terminal the owner has open is a use of this sandbox the run's own end
+  // does not account for. Declining leaves the mapping in place, so the orphan
+  // sweep (which asks the same question) reaps it once the claim has lapsed.
+  const termHold = await handleRegistry.terminalHold(sessionId);
+  if (termHold.state !== "none") {
+    logger.info(
+      { dagRootTaskId, dagNodeId, sessionId, hold: termHold.state, handles: owned.map(([h]) => h) },
+      "sandbox.last_user_stop_deferred_terminal_hold",
+    );
+    return;
+  }
+
   for (const [handle] of owned) {
     await stopSandboxByHandle(dagRootTaskId, handle, sessionId).catch((e) => {
       logger.warn({ dagRootTaskId, handle, err: (e as Error).message }, "stop_handle_failed");
@@ -338,6 +350,21 @@ async function transitionCancellation(
     const row = rows[0];
     return row ? { ...row, ...prior } as CancellationTransition : null;
   });
+}
+
+/**
+ * The address an interrupt for this run is published to. A DAG node answers to
+ * its root and a chat turn to its session. An app run answers to its own id:
+ * the session's address is what a foreground Stop is published to, and Stop must
+ * not end the application running beside the conversation (Brain registers an app
+ * run under its task id for interrupts, `tasks/abort-registry.ts`).
+ */
+export function interruptKeyOf(
+  row: { task_id: string; session_id: string | null; dag_root_task_id: string | null; mode?: string | null },
+): string | undefined {
+  if (row.dag_root_task_id) return row.dag_root_task_id;
+  if (row.mode === "app") return row.task_id;
+  return row.session_id ?? undefined;
 }
 
 /**
@@ -478,7 +505,7 @@ export async function cancelTask(
   return {
     ok: !!updated,
     cancelled: updated ? 1 : 0,
-    interrupt_key: updated ? (task.dag_root_task_id ?? task.session_id) : undefined,
+    interrupt_key: updated ? interruptKeyOf(task) : undefined,
   };
 }
 

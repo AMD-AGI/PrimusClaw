@@ -18,9 +18,10 @@
  *   - Finish session deletions whose cleanup did not complete in the request
  *     that asked for them (see sessions/cleanup-sweep.ts).
  */
+import { interruptKeyOf } from "./lifecycle.js";
 import { commitSessionDeletion } from "../sessions/teardown.js";
 import { withCompletionLock } from "../events/completion-lock.js";
-import { db } from "../infra/db.js";
+import { db, inTransaction } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
 import { parkHandsOfSettledSessions } from "./park-settled-hands.js";
 import { backfillPlatformFacts, drainPendingPlatformFacts } from "./platform-backfill.js";
@@ -259,7 +260,7 @@ async function resolveLiveWorkHoldings(sessionId: string): Promise<SessionHoldin
  */
 function bindingNamesOneOf(bg: SessionBackgroundWork): boolean | "unknown" {
   if (bg.state === "unreadable") return "unknown";
-  if (bg.state === "running" || bg.state === "awaiting") return true;
+  if (bg.state === "running" || bg.state === "awaiting" || bg.state === "reusable") return true;
   return bg.reason !== "no_binding" && bg.reason !== "other_sandbox"
     && bg.reason !== "no_workload";
 }
@@ -398,6 +399,7 @@ export async function reapStaleTasks(): Promise<number> {
     task_id: string;
     session_id: string;
     dag_root_task_id: string | null;
+    mode?: string | null;
     deadline_at: string | null;
     sandbox_workload_id: string | null;
   }>;
@@ -436,11 +438,9 @@ export async function reapStaleTasks(): Promise<number> {
  * terminal either way, and this only closes the gap where it is not.
  */
 async function interruptReapedRuns(
-  rows: Array<{ session_id: string; dag_root_task_id: string | null }>,
+  rows: Array<{ task_id: string; session_id: string; dag_root_task_id: string | null; mode?: string | null }>,
 ): Promise<void> {
-  const keys = new Set(
-    rows.map((row) => row.dag_root_task_id ?? row.session_id).filter(Boolean),
-  );
+  const keys = new Set(rows.map((row) => interruptKeyOf(row)).filter((k): k is string => !!k));
   if (!interruptPublisher.available()) {
     // The sweeper's own tick can outlive a NATS reconnect, and a missing
     // connection must not undo the row updates already committed above.
@@ -898,6 +898,202 @@ export async function reapExpiredDoorbellRuns(): Promise<number> {
   );
   metrics.onQueueExited("budget_exhausted", queuedExits(r.rows));
   return r.rowCount;
+}
+
+/**
+ * No holder: the lease lapsed more than the grace ago, or its finish-only holder handed the finish
+ * over (`app_finish_handed_over`, then lease given back). A lease given back by an ordinary nak is
+ * NOT gone: its redelivery is coming and waits the grace like any other. A row nobody has taken yet has no expiry and is neither.
+ */
+const LEASE_GONE_SQL = `(lease_expires_at < NOW() - ($1::int * INTERVAL '1 second')
+        OR (lease_owner IS NULL AND lease_expires_at IS NOT NULL
+            AND metadata->>'app_finish_handed_over' = 'true')
+        OR lease_expires_at IS NULL AND lease_owner IS NULL AND status IN ('cancelling','cancelled','failed'))`;
+
+/**
+ * Put a task that was reopened for a finish-only dispatch back to the terminal state it had
+ * (`metadata.app_finish_prior`), once its run row is `ended`. No event is published: the user
+ * was told how this run ended when it ended.
+ *
+ * The state restored is the prior one, except that an application that wrote a successful
+ * `final` (return code 0) keeps its own result, as on the normal path: a `failed` task becomes
+ * `completed`. A user's cancel stays a cancel. The success is read off the run row, which is
+ * where both the Brain and this sweeper can see it.
+ */
+async function restoreFinishOnlyTasks(extraWhere: string, params: unknown[]): Promise<ClawTaskRow[]> {
+  const succeeded = `(SELECT (r.last_exit->>'final') = 'true' AND (r.last_exit->>'returncode') = '0'
+                        FROM claw_app_runs r WHERE r.task_id = claw_tasks.task_id)`;
+  return inTransaction(async (query) => {
+    const rows = await applyTaskStatusTransition(
+      {
+        sql: `CASE WHEN metadata->'app_finish_prior'->>'status' = 'failed'
+                    THEN (CASE WHEN COALESCE(${succeeded}, false) THEN 'completed' ELSE 'failed' END)
+                    ELSE 'cancelled' END`,
+        terminal: true,
+      },
+      {
+        extra: { lease_owner: null, lease_expires_at: null, heartbeat_at: null, internal_token_hash: null, attempt_id: null },
+        setSql: [
+          `failure_reason = CASE WHEN COALESCE(${succeeded}, false) AND metadata->'app_finish_prior'->>'status' = 'failed'
+                                THEN NULL ELSE metadata->'app_finish_prior'->>'failure_reason' END`,
+          `error_message = CASE WHEN COALESCE(${succeeded}, false) AND metadata->'app_finish_prior'->>'status' = 'failed'
+                               THEN NULL ELSE metadata->'app_finish_prior'->>'error_message' END`,
+        ],
+        where: `mode = 'app' AND metadata->'app_finish_prior' IS NOT NULL AND ${extraWhere}`,
+        params,
+        query,
+      },
+    );
+    if (rows.length) {
+      // The timeline the reopen overwrote. A second statement because the status writer owns
+      // `completed_at`; the prior is dropped here, so a failure between the two is retried.
+      await query(
+        `UPDATE claw_tasks
+            SET started_at   = COALESCE((metadata->'app_finish_prior'->>'started_at')::timestamptz, started_at),
+                completed_at = COALESCE((metadata->'app_finish_prior'->>'completed_at')::timestamptz, completed_at),
+                deadline_at  = COALESCE((metadata->'app_finish_prior'->>'deadline_at')::timestamptz, deadline_at),
+                metadata     = metadata - 'app_finish_prior' - 'app_finish_handed_over'
+          WHERE task_id = ANY($1::text[])`,
+        [rows.map((r) => r.task_id)],
+      );
+    }
+    return rows;
+  });
+}
+
+/**
+ * A finish-only Brain that cannot finish says so before it gives the lease back, which is what
+ * lets the sweeper take the row at once. Only the holder; the mark is cleared by the restore and
+ * by the next reopen.
+ */
+export async function markFinishOnlyHandedOver(taskId: string, brainId: string): Promise<boolean> {
+  const r = await db.query(
+    `UPDATE claw_tasks
+        SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{app_finish_handed_over}', 'true'::jsonb)
+      WHERE task_id = $1 AND mode = 'app' AND lease_owner = $2
+        AND status IN ('preparing','running') AND metadata->'app_finish_prior' IS NOT NULL`,
+    [taskId, brainId],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
+/** `app_finish_done`: the finish-only Brain that holds the lease says the run row is `ended`. */
+export async function settleFinishedAppRun(taskId: string, brainId: string): Promise<boolean> {
+  const rows = await restoreFinishOnlyTasks(
+    `task_id = $1 AND status IN ('preparing','running') AND lease_owner = $2 AND lease_expires_at > NOW()
+        AND EXISTS (SELECT 1 FROM claw_app_runs r WHERE r.task_id = claw_tasks.task_id AND r.state = 'ended')`,
+    [taskId, brainId],
+  );
+  if (rows.length) logger.info({ taskId, status: rows[0]!.status }, "sweeper.app_finish_settled");
+  return rows.length > 0;
+}
+
+/**
+ * The same restore when `app_finish_done` never landed (the Brain died after the last finishing
+ * step, or the call failed): the run row is `ended`, the task still carries `app_finish_prior`,
+ * and the lease is dead. Runs BEFORE the reapers, which would otherwise close it as `worker_lost`.
+ */
+export async function settleEndedFinishOnlyRuns(): Promise<number> {
+  const rows = await restoreFinishOnlyTasks(
+    `status IN ('queued','preparing','running','cancelling','cancelled','failed')
+        AND (lease_expires_at IS NULL OR ${LEASE_GONE_SQL})
+        AND EXISTS (SELECT 1 FROM claw_app_runs r WHERE r.task_id = claw_tasks.task_id AND r.state = 'ended')`,
+    [LEASE_LOST_GRACE_SEC],
+  );
+  if (rows.length) {
+    logger.warn({ settled: rows.length, ids: rows.map((r) => r.task_id) }, "sweeper.app_finish_settled_by_sweeper");
+  }
+  return rows.length;
+}
+
+/**
+ * A run whose finish was handed over `APP_FINISH_REQUEUE_MAX` times and is still `finishing`
+ * is not handed round again. Said once, and the task gets its prior state back; the run row
+ * is left as it is (its sandbox and grant need an operator).
+ */
+export async function giveUpExhaustedAppFinishes(): Promise<number> {
+  const rows = await restoreFinishOnlyTasks(
+    `status IN ('cancelling','cancelled','failed')
+        AND ${LEASE_GONE_SQL}
+        AND COALESCE((metadata->>'app_finish_requeues')::int, 0) >= $2::int
+        AND EXISTS (SELECT 1 FROM claw_app_runs r WHERE r.task_id = claw_tasks.task_id AND r.state = 'finishing')`,
+    [LEASE_LOST_GRACE_SEC, APP_FINISH_REQUEUE_MAX],
+  );
+  if (rows.length) {
+    logger.error({ ids: rows.map((r) => r.task_id), max: APP_FINISH_REQUEUE_MAX }, "sweeper.app_finish_requeue_exhausted");
+  }
+  return rows.length;
+}
+
+/** How many times one run's finishing may be handed to a new worker before it is left for an operator. */
+const APP_FINISH_REQUEUE_MAX = 5;
+
+/**
+ * Give a run left in `finishing` by a holder that lost its lease back to a live Brain.
+ *
+ * An app run has two rows: the task (who holds the lease, and whether the run
+ * is over as far as the queue is concerned) and `claw_app_runs` (how far the
+ * finishing steps got). A cancel, `reapLostLeases` and `reapStaleTasks` close
+ * the TASK, and a worker that lost its lease mid-finish is refused every write
+ * (`not_holder`) -- so the task is terminal while the run row sits in
+ * `finishing`, its sandbox up and its grant live, with no row any Brain can
+ * claim. An orphaned `running` run is taken over because its task is still
+ * non-terminal and gets redelivered; this is the same takeover for a run whose
+ * task was closed first. The task is reopened ONLY to be dispatched: it goes
+ * back to `queued` with the lease cleared and its prior terminal state kept in
+ * `metadata.app_finish_prior`; the dispatch carries `app_finish_only`, and the
+ * Brain finishes the row from the step the last holder stopped at (every step is
+ * recorded in `last_exit.finish_done`, so none is repeated). It says "running" to
+ * nobody and reports no terminal state; `settleFinishedAppRun` then puts the task
+ * back to what it was, so a user's cancel stays a cancel.
+ *
+ * Only a lease that is dead for the grace, and only `finishing`: a `running`
+ * run with a closed task is not a finish to resume. Bounded, so a run whose
+ * finish cannot complete is not handed round for ever.
+ */
+export async function requeueUnfinishedAppRuns(): Promise<number> {
+  const rows = await applyTaskStatusTransition("queued", {
+    extra: {
+      lease_owner: null,
+      lease_expires_at: null,
+      heartbeat_at: null,
+      internal_token_hash: null,
+      attempt_id: null,
+      started_at: null,
+    },
+    setSql: [
+      "completed_at = NULL",
+      // A fresh budget for the finish: the old deadline is long past, and the deadline
+      // backstop would close the run again the moment it is dispatched.
+      "deadline_at = NOW() + INTERVAL '1 hour'",
+      // The task is reopened only to be dispatched; what it was is kept (the first time only, so a
+      // second close by a reaper does not overwrite the user's cancel) and put back by `app_finish_done`.
+      `failure_reason = NULL, error_message = NULL`,
+      `metadata = jsonb_set(
+         (COALESCE(metadata, '{}'::jsonb) - 'app_finish_handed_over') || jsonb_build_object('app_finish_prior', COALESCE(
+           metadata->'app_finish_prior',
+           jsonb_build_object('status', status, 'failure_reason', failure_reason, 'error_message', error_message,
+                              'started_at', started_at, 'completed_at', completed_at, 'deadline_at', deadline_at))),
+         '{app_finish_requeues}',
+         to_jsonb(COALESCE((metadata->>'app_finish_requeues')::int, 0) + 1))`,
+    ],
+    where: `mode = 'app'
+        AND executor = 'brain'
+        AND (status IN ('cancelling','cancelled','failed')
+             OR (status IN ('preparing','running') AND metadata->'app_finish_prior' IS NOT NULL))
+        AND ${LEASE_GONE_SQL}
+        AND (completed_at IS NULL OR completed_at < NOW() - ($1::int * INTERVAL '1 second'))
+        AND COALESCE((metadata->>'app_finish_requeues')::int, 0) < $2::int
+        AND EXISTS (SELECT 1 FROM claw_app_runs r
+                     WHERE r.task_id = claw_tasks.task_id AND r.state = 'finishing')`,
+    params: [LEASE_LOST_GRACE_SEC, APP_FINISH_REQUEUE_MAX],
+  });
+  if (!rows.length) return 0;
+  logger.warn(
+    { requeued: rows.length, ids: rows.map((row: ClawTaskRow) => row.task_id) },
+    "sweeper.requeued_unfinished_app_runs",
+  );
+  return rows.length;
 }
 
 export async function reapLostLeases(): Promise<number> {
@@ -2483,6 +2679,20 @@ export async function reapOrphanHandles(lease?: LeaderLease): Promise<number> {
       // reports idle. It would not be coherent on the cancel path, where there
       // is no next time and deferring means never stopping, which is why the
       // guard is here and not inside `stopAllHandlesForDag`.
+      // A terminal the owner has open holds the sandbox, and so does one that is
+      // unreadable. The claim lapses on its own, so this defers rather than
+      // keeps: the next tick after the expiry reaps it like any other orphan.
+      if (sessionId) {
+        const termHold = await handleRegistry.terminalHold(sessionId);
+        if (termHold.state !== "none") {
+          logger.info(
+            { dagRoot, sessionId, hold: termHold.state },
+            "sweeper.orphan_handles_terminal_hold",
+          );
+          deferred++;
+          continue;
+        }
+      }
       const bg = sessionId
         ? await handleRegistry.backgroundWork(sessionId, [...workloads])
         : { state: "clear" as const, reason: "no_workload" as const };
@@ -2515,6 +2725,23 @@ export async function reapOrphanHandles(lease?: LeaderLease): Promise<number> {
         logger.info(
           { dagRoot, sessionId, workloadId: bg.workloadId, running: bg.running, measuredAt: bg.at },
           "sweeper.orphan_handles_background_work",
+        );
+        deferred++;
+        continue;
+      }
+      // A finished turn leaves its sandbox parked for the session's next message
+      // (Brain's SANDBOX_IDLE_REUSE_SECONDS). The DAG row being terminal and
+      // nothing running inside is the normal state of such a sandbox, not
+      // evidence that it is an orphan: reaping on it threw the sandbox away
+      // 56-90 s after each turn and cold-started the next one. Deferred until
+      // the window closes, and then reaped by the rules below like any other.
+      if (bg.state === "reusable") {
+        logger.info(
+          {
+            dagRoot, sessionId, workloadId: bg.workloadId,
+            idleForMs: bg.idleForMs, remainingMs: bg.remainingMs,
+          },
+          "sweeper.orphan_handles_reuse_window",
         );
         deferred++;
         continue;
@@ -2649,6 +2876,8 @@ async function runContained(event: string, work: () => Promise<unknown>): Promis
 }
 
 export async function sweeperTick(): Promise<void> {
+  // Before every reaper: a finish-only run whose row already ended must get its task back, not be closed as worker_lost.
+  await runContained("sweeper.app_finish_settle_failed", settleEndedFinishOnlyRuns);
   await runContained("sweeper.stale_tasks_failed", reapStaleTasks);
   // Run AFTER reapStaleTasks so children freshly marked as
   // `brain_timeout` show up to reapStuckDagRoots in the same tick.
@@ -2658,6 +2887,9 @@ export async function sweeperTick(): Promise<void> {
   // with the reason that explains it rather than the one that noticed second.
   await runContained("sweeper.requeued_doorbell_leases_failed", requeueLostDoorbellLeases);
   await runContained("sweeper.lost_leases_failed", reapLostLeases);
+  // After the reapers that close a task: a run they closed mid-finish is handed back here.
+  await runContained("sweeper.app_finish_exhausted_failed", giveUpExhaustedAppFinishes);
+  await runContained("sweeper.unfinished_app_runs_failed", requeueUnfinishedAppRuns);
   // After reapLostLeases, so an accepted row whose worker died is closed as
   // worker_lost by its own reaper rather than reclassified as one that never
   // executed. Each contained independently: a throw from one must not cost the

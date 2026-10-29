@@ -9,6 +9,7 @@ export {
   type RedactResult, type ScanHit,
 } from "./security/redact-secrets.js";
 export { isSensitiveKey } from "./security/sensitive-keys.js";
+export { coerceToolInput, isPlainObject } from "./tool-input.js";
 export {
   ABSENT_RUN_SCOPE, encodeScopePart, decodeScopePart, scopeBytes,
   mintScopeCredential, verifyScopeCredential,
@@ -30,3 +31,4 @@ export {
   InMemoryKVStore,
   natsKvStore,
 } from "./kv/store.js";
+export * from "./identity/index.js";

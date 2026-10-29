@@ -42,6 +42,51 @@ function getExecutionPolicy(): string {
 /** Per-skill inline SKILL.md cap — prevents token blowups for large skills. */
 const SKILL_INLINE_MAX = 20_000;
 
+/** A platform-default skill listed by name and description only. */
+export interface ProgressiveSkill { name: string; description: string }
+
+const PROGRESSIVE_MAX_ENTRIES = 50;
+const PROGRESSIVE_MAX_CHARS = 8000;
+
+/**
+ * The skills the on-demand list has room for, in order, and how many it leaves
+ * out. The list stops at the first skill that does not fit, so `listed` is
+ * always a prefix of `skills`. Exported so a caller that must not lose a skill
+ * to the cap (the engine, for plugin skills) can ask which ones fit before it
+ * decides what to inline instead.
+ */
+export function listProgressiveSkills(
+  skills: ProgressiveSkill[],
+  sessionDir = "",
+): { listed: ProgressiveSkill[]; omitted: number; lines: string } {
+  const skillBase = sessionDir ? `${sessionDir}/.skills` : ".skills";
+  let lines = "";
+  const listed: ProgressiveSkill[] = [];
+  for (const s of skills) {
+    const line = `\n  - ${s.name}: ${s.description}   [read ${skillBase}/${s.name}/SKILL.md]`;
+    if (listed.length >= PROGRESSIVE_MAX_ENTRIES || lines.length + line.length > PROGRESSIVE_MAX_CHARS) break;
+    lines += line;
+    listed.push(s);
+  }
+  return { listed, omitted: skills.length - listed.length, lines };
+}
+
+/**
+ * The on-demand skill list: one line per skill, no body. The agent reads
+ * SKILL.md itself when a description matches; the file is written into the
+ * sandbox on that first read. Descriptions are untrusted marketplace text and
+ * are only concatenated here.
+ */
+export function buildProgressiveSkillHint(skills: ProgressiveSkill[], sessionDir = ""): string {
+  if (!skills.length) return "";
+  const { omitted, lines } = listProgressiveSkills(skills, sessionDir);
+  let hint = `\n- Platform Skills (load on demand):${lines}`;
+  if (omitted > 0) hint += `\n  - (${omitted} more skills not listed)`;
+  hint += `\nBefore starting a task, if a skill's description matches, read its SKILL.md with the read tool and follow it. `;
+  hint += `Supporting files live next to SKILL.md in the same directory; read them only when SKILL.md points to them.`;
+  return hint;
+}
+
 export function buildPrompt(
   userPrompt: string,
   skillContents: Record<string, string>,
@@ -50,6 +95,7 @@ export function buildPrompt(
   sessionDir = "",
   pluginRulesFromMessage = "",
   sessionContext?: { sessionId: string; userId: string; parentSessionId?: string; teamRole?: string },
+  progressiveSkills: ProgressiveSkill[] = [],
 ): string {
   let skillHint = "";
   const skillNames = Object.keys(skillContents);
@@ -71,6 +117,8 @@ export function buildPrompt(
     skillHint += `Use bash/read to load them (e.g. \`cat ${skillBase}/{name}/actions/<step>.md\`). `;
     skillHint += `Follow the SKILL.md orchestrator above precisely.`;
   }
+
+  if (progressiveSkills.length) skillHint += (skillHint ? "\n\n" : "") + buildProgressiveSkillHint(progressiveSkills, sessionDir).replace(/^\n/, "");
 
   let mcpHint = "";
   if (mcpServerNames.length) {

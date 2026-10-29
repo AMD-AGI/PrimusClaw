@@ -40,6 +40,27 @@ export interface AppLastExit {
    * takes a finishing run over does not repeat one (the grant is revoked once).
    */
   finish_done?: string[];
+  /**
+   * The execution copy was signed again. The application is stopped so the next
+   * start injects the new keys. Cleared once the process is gone.
+   */
+  grant_restart?: true;
+}
+
+/**
+ * Where event forwarding stopped (hosting design 5.7): the segment file, the
+ * byte offset after the last line handled, and the last forwarded event id.
+ * `{}` before anything was read. Opaque to Claw beyond these three fields.
+ */
+export interface AppEventsCursor {
+  segment?: string;
+  offset?: number;
+  /** Decimal string, as the CloudEvents `id` is. */
+  last_id?: string;
+  /** Producer epoch (see the tailer): bumped when the events' ids start again. Absent means 0. */
+  epoch?: number;
+  /** Segment numbering went back and whether the ids restarted is not decided yet. */
+  reset_pending?: boolean;
 }
 
 export interface AppRunRecord {
@@ -48,11 +69,14 @@ export interface AppRunRecord {
   state: AppRunState;
   restarts: number;
   last_exit: AppLastExit | null;
+  events_cursor: AppEventsCursor;
   state_dir: string | null;
   sandbox_workload_id: string | null;
   manifest: AppManifestV1;
   grant_id: string | null;
   grant_limits: Record<string, unknown> | null;
+  /** The template names the grant made available, `{ role: { cards: name } }`; null when no grant was issued. */
+  grant_templates: Record<string, Record<string, string>> | null;
   /** ISO time the grant lapses; null when it has no expiry or none was issued. */
   grant_expires_at: string | null;
   /** ISO time the grant was revoked; set means it is never extended. */
@@ -61,6 +85,8 @@ export interface AppRunRecord {
   input: Record<string, unknown>;
   sandbox_spec: SandboxSpecCreate | null;
   workspace_id: string | null;
+  /** The user the grant is signed for. */
+  user_id?: string | null;
 }
 
 export interface AppRunSecrets {
@@ -72,11 +98,14 @@ export interface AppRunPatch {
   state?: AppRunState;
   restarts?: number;
   last_exit?: AppLastExit | null;
+  events_cursor?: AppEventsCursor;
   state_dir?: string;
   sandbox_workload_id?: string | null;
   grant_expires_at?: string;
   /** Record that the grant was revoked, so it is never extended. */
   grant_revoked?: true;
+  /** Keys from signing the same grant id again. */
+  grant_keys?: Partial<Record<AppSandboxRole, string>>;
 }
 
 export interface AppRunStore {
@@ -84,6 +113,17 @@ export interface AppRunStore {
   /** `expectState` makes the write a compare-and-set on the row's state. */
   patch(runId: string, patch: AppRunPatch, expectState?: AppRunState): Promise<AppRunRecord>;
   secrets(runId: string): Promise<AppRunSecrets>;
+  /** Record where the run's MCP answers, for the session it belongs to. No token goes with it. */
+  putMcp(runId: string, mcp: AppMcpRegistration): Promise<void>;
+  /** Remove that record. Removing one that is not there is not an error. */
+  deleteMcp(runId: string): Promise<void>;
+}
+
+export interface AppMcpRegistration {
+  /** The Router port-proxy URL of the application's MCP port. */
+  url: string;
+  /** The `x-session-id` the Router needs to route to the sandbox. */
+  sandbox_session_id: string;
 }
 
 /** The API refused a write: another worker holds the run, the state moved, or the run ended. */
@@ -99,7 +139,8 @@ export class AppRunWriteRefused extends Error {
 export interface HttpStoreOptions {
   fetch?: typeof globalThis.fetch;
   baseUrl?: () => string;
-  headers?: () => Record<string, string>;
+  /** `hasBody` is false for a GET or DELETE: such a request must not claim a JSON content type. */
+  headers?: (hasBody: boolean) => Record<string, string>;
   brainId?: string;
   /**
    * The epoch this worker holds the run at (`claw_tasks.claim_count`, the
@@ -123,7 +164,7 @@ export function httpAppRunStore(opts: HttpStoreOptions): AppRunStore {
     return `${b}/v1/internal/app-runs/${encodeURIComponent(runId)}${suffix}`;
   };
   const call = async (u: string, init: RequestInit): Promise<{ status: number; body: any }> => {
-    const resp = await doFetch(u, { ...init, headers: headers(), signal: AbortSignal.timeout(TIMEOUT_MS) });
+    const resp = await doFetch(u, { ...init, headers: headers(init.body != null), signal: AbortSignal.timeout(TIMEOUT_MS) });
     const body = await resp.json().catch(() => null);
     return { status: resp.status, body };
   };
@@ -151,6 +192,22 @@ export function httpAppRunStore(opts: HttpStoreOptions): AppRunStore {
       const r = await call(url(runId, "/secrets"), { method: "GET" });
       if (r.status !== 200 || typeof r.body?.mcp_token !== "string") return fail("secrets read", r);
       return { mcp_token: r.body.mcp_token, grant_keys: r.body.grant_keys ?? null };
+    },
+    async putMcp(runId, mcp) {
+      const r = await call(url(runId, "/mcp"), {
+        method: "PUT",
+        body: JSON.stringify({ brain_id: brainId, claim_count: opts.claimCount, ...mcp }),
+      });
+      if (r.status === 200) return;
+      if (r.status === 409) throw new AppRunWriteRefused(String(r.body?.error ?? "conflict"), r.body?.current_state);
+      fail("mcp register", r);
+    },
+    async deleteMcp(runId) {
+      const q = new URLSearchParams({ brain_id: brainId, claim_count: String(opts.claimCount) });
+      const r = await call(url(runId, `/mcp?${q}`), { method: "DELETE" });
+      if (r.status === 200) return;
+      if (r.status === 409) throw new AppRunWriteRefused(String(r.body?.error ?? "conflict"), r.body?.current_state);
+      fail("mcp unregister", r);
     },
   };
 }

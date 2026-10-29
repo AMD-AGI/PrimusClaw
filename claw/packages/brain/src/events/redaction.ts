@@ -313,7 +313,67 @@ function redactValue(
   seen.add(value);
   const out: Record<string, unknown> = {};
   for (const [childKey, childValue] of Object.entries(value as Record<string, unknown>)) {
-    out[childKey] = redactValue(childValue, seen, runtimeSecrets, childKey);
+    out[childKey] = key === TOOL_ARGS_KEY && isToolInputObject(childValue)
+      ? redactToolArguments(childKey, childValue, seen, runtimeSecrets)
+      : redactValue(childValue, seen, runtimeSecrets, childKey);
+  }
+  seen.delete(value);
+  return out;
+}
+
+/** Event field that maps a tool NAME to that call's input object. */
+const TOOL_ARGS_KEY = "argumentsDetail";
+
+function isToolInputObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/**
+ * Redact one `argumentsDetail[toolName]` entry without changing its type.
+ *
+ * The key here is a tool name, not a data field, but it went through the same
+ * key-name gate as everything else. A name such as `mcp__safe__apikey_list`
+ * contains the credential word `apikey`, so the whole input OBJECT was replaced
+ * by the string "<redacted>". That string is persisted with the turn and
+ * replayed to the model as the tool call's input; the model endpoint refuses a
+ * tool call whose arguments are not a JSON object, rejects the entire request,
+ * and the session fails every later turn.
+ *
+ * A name that looks like a credential is still a reason to withhold what was
+ * passed, so a sensitive tool name masks every leaf AND every key instead of
+ * collapsing the subtree. Nesting and entry count stay, so the entry is still an
+ * object, and nothing the caller put in it survives.
+ */
+function redactToolArguments(
+  toolName: string,
+  input: Record<string, unknown>,
+  seen: WeakSet<object>,
+  runtimeSecrets: RuntimeSecrets,
+): unknown {
+  if (!isSensitiveKey(toolName)) return redactValue(input, seen, runtimeSecrets, toolName);
+  return maskLeaves(input, seen);
+}
+
+function maskLeaves(value: unknown, seen: WeakSet<object>): unknown {
+  if (value === null || value === undefined || value === "") return value;
+  if (typeof value !== "object") return "<redacted>";
+  if (seen.has(value)) return "<redacted:cyclic>";
+  seen.add(value);
+  let out: unknown;
+  if (Array.isArray(value)) {
+    out = value.map((item) => maskLeaves(item, seen));
+  } else {
+    // Keys are hidden as well as values. The whole input used to be masked, and
+    // a key can carry exactly what a value can (a map keyed by token, a
+    // `hunter2`); no test of a key's shape can tell a name from a secret, so
+    // none is attempted. What stays is the shape: an object, one entry per
+    // argument, which is all a replay needs.
+    const keyed: Record<string, unknown> = {};
+    let n = 0;
+    for (const v of Object.values(value as Record<string, unknown>)) {
+      keyed[`<redacted-key-${++n}>`] = maskLeaves(v, seen);
+    }
+    out = keyed;
   }
   seen.delete(value);
   return out;

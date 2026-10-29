@@ -27,6 +27,62 @@ record it.
 
 ## [Unreleased]
 
+### Added
+- A shared identity client in `@claw/utils`, built by API and Brain when
+  `IDENTITY_CLIENT_ENABLED=true` (off by default; nothing authenticates through it yet). It does OIDC
+  discovery and caches the issuer's JWKS, RFC 7662 token introspection (an active answer is cached for
+  30 s, an inactive one for 5 s, concurrent lookups of one credential share one call), and an RFC 8693
+  token exchange with a token cache. When the provider cannot be asked, a cached active answer keeps
+  being served for up to 30 minutes (`IDENTITY_STALE_IF_ERROR_SECONDS`, counted in
+  `claw_identity_stale_served_total`); anything else is a typed `IdentityUnavailableError` and is never
+  read as "inactive". The chart takes an `identity:` block (client secret by `existingSecret`
+  reference) and exports `claw_identity_*` metrics. See `claw/docs/identity-client.md`.
+- A session can choose its own model. `POST /v1/sessions` accepts an optional `model`,
+  `PATCH /v1/sessions/:id` accepts `model` (a string, or `null` to go back to the default) alone or
+  beside `name`, and `GET /v1/sessions/:id` and the session list report it (`null` is the
+  deployment's `DEFAULT_MODEL`). Every LLM call of the session's turns -- the loop, its sub-agents and
+  compaction -- uses it, a change applies from the next turn (a message already parked behind a running
+  turn is sent on the model the session has when it is sent on), and the key that pays is still the
+  asking user's. The name is checked for shape only (non-empty, at most 128 characters,
+  `[A-Za-z0-9._:/-]`): the gateway decides which models exist, and a name it refuses comes back as the
+  gateway's error on the turn. `HITL_SUMMARY_MODEL` and the memory model are not affected. The column
+  (`claw_sessions.model`) is added by the same idempotent start-up migration as the others.
+- `HITL_SUMMARY_MODEL` names the model that writes an approval card's one-sentence summary, so a
+  small, fast model can do it instead of the run's own reasoning model, which could not answer inside
+  `HITL_SUMMARY_TIMEOUT_MS`. Unset keeps the run's own model. The call authenticates with the key the run
+  itself uses (the asking user's, or the platform key in proxy mode), so the tokens are billed as the
+  run's are. A model that key may not call (401/403/404) leaves the card without a summary and counts
+  `claw_brain_approval_summary_model_refused_total`; it never falls back to another key.
+- A `permissionRequest` now says in words what the call is, so an approval card
+  can show something a person can judge instead of a raw request body:
+  `tool_description` (the tool's own first sentence), `intent` (what the agent
+  said just before the call) and `summary` (one plain sentence in the user's
+  language, written by one small call on the run's own model, within
+  `HITL_SUMMARY_TIMEOUT_MS`; `summary_by: "model"` marks it as machine-written).
+  Credential-named arguments never reach that call. A timeout, an error or
+  `HITL_SUMMARY_ENABLED=false` just omit the fields; approval semantics are
+  unchanged and `input` is still sent as before.
+- Deployment-level platform defaults: `PLATFORM_DEFAULTS_FILE` lists default skills
+  (by marketplace tool id) and MCP servers mounted into every chat, behind
+  `PROGRESSIVE_SKILLS_ENABLED` for skills. Default skills are listed by name and
+  description only and written into the sandbox on first read. Off by default;
+  see `claw/docs/platform-defaults.md`.
+
+### Changed
+- Brain no longer fetches every plugin skill again on every turn. Downloaded skill
+  files are held in memory (bounded by `SKILL_CACHE_MAX_BYTES`, 64 MiB by default,
+  `0` turns it off) and reused while the skill is unchanged: a plugin skill is
+  validated with one object-store listing per turn (per-object ETag and size, so
+  an in-place upsert of the same version is picked up), a marketplace `tool_ids`
+  skill by its record's `version` and `updated_at`. A turn that finds a plugin
+  skill unchanged reads no object and reports no `download_skill` event for it.
+- A turn of a session with plugin tools no longer starts a sandbox before its
+  first model call unless the plugin has a hooks-type tool: plugin skill files
+  are written into the sandbox on the first sandbox call that names `.skills`,
+  so a turn that only calls MCP tools opens none. With
+  `PROGRESSIVE_SKILLS_ENABLED`, plugin skills are listed by name and description
+  like the platform defaults instead of being inlined.
+
 ### Security
 - Credential redaction no longer treats every `user_env` / `session_env` value
   as a secret to cut out of transcripts, and no longer misses short or
@@ -124,6 +180,18 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- A session no longer becomes unusable after a turn that called a tool whose name
+  reads as a credential field (for example `mcp__*__apikey_*`). Brain's redactor
+  replaced such a tool's whole `argumentsDetail` entry with the string
+  `"<redacted>"`; that string was stored with the turn and replayed to the model as
+  the call's input, the model endpoint answered 400 ("function.arguments must be a
+  JSON object") to the whole request, and every later turn of the session failed
+  the same way within two seconds. The entry now stays an object with every value
+  still masked; `reconstructHistory` turns any stored non-object input (including
+  rows already written) into one; both model providers send object inputs on the
+  wire and store streamed calls whose arguments decode to `[]` or `null` as
+  objects; and a 400 of that kind repairs the history and retries once
+  (`claw_brain_llm_tool_args_rejected_total`, `claw_brain_llm_tool_input_repaired_total`).
 - `deploy/upgrade.sh` no longer drops `PG_SSL_NO_VERIFY`. Only `deploy.sh`
   read it, so the first upgrade of a deployment installed with it re-rendered
   the API at verify-full, and against a PGO-managed database every new API pod
@@ -205,6 +273,18 @@ record it.
   numbers — they were wrong.
 
 ### Added
+
+- Outbound run notifications, off by default (`CLAW_NOTIFICATIONS_ENABLED`).
+  A user subscribes an https URL through `/v1/notification-subscriptions` and
+  receives `run.completed` / `run.failed` events for runs started by a trigger
+  and for runs that took at least `NOTIFY_MIN_RUN_SECONDS` (default 60) in a
+  session created with `config.notify_on_finish: true` (sessions without it
+  are never announced as long runs). Events
+  go through a database outbox with retry, a stable `event_id` for receiver-side
+  dedup, and an HMAC-SHA256 signature over `<timestamp>.<body>`
+  (`X-Claw-Timestamp`, `X-Claw-Signature`, `X-Claw-Event-Id`). Subscription URLs
+  must be https and must not resolve to a private address unless the host is in
+  `NOTIFY_WEBHOOK_ALLOWED_HOSTS`.
 - `terminal.failure_reason` on `GET /v1/runs`: Claw's own code for how the run
   failed. `class` and `kill_reason` report a run whose sandbox never became usable
   as `failed` / `""`, exactly like an agent that ran and broke; the provisioning

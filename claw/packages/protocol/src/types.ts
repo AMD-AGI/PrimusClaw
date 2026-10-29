@@ -334,6 +334,12 @@ export interface ExecuteRequest {
   // ── Execution mode ────────────────────────────────────────────────────
   /** Defaults to "llm" when omitted (legacy chat path). */
   mode?: TaskMode;
+  /**
+   * An app run whose task was already closed (cancelled / failed) while its run row
+   * was left in `finishing`: this dispatch only completes the finishing steps and
+   * reports with `app_finish_done`. It never reports a terminal state of its own.
+   */
+  app_finish_only?: boolean;
 
   // ── Run budget ────────────────────────────────────────────────────────
   /**
@@ -372,6 +378,12 @@ export interface ExecuteRequest {
   // ── mode=llm payload ──────────────────────────────────────────────────
   prompt?: string;
   history?: Message[];
+  /**
+   * Whether long-term memory is active for this user (deployment flag AND the
+   * user's own preference). `false` means Brain must not offer save_memory.
+   * Absent means an API that predates the field: the tool stays offered.
+   */
+  memory_enabled?: boolean;
   system_append?: string;
   rules_text?: string;
   model?: string;

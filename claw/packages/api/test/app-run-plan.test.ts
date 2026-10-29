@@ -54,4 +54,6 @@ test("whatever GPU key a manifest carries is dropped: the spec has one GPU key, 
 test("the sandbox workspace is checked as well when it differs", () => {
   const p = plan(manifest({ image: "i" }), { gpus: 0, workspace: "w", sandbox_workspace: "s" });
   assert.deepEqual(p.workspaceIds, ["w", "s"]);
+  assert.equal(p.sandboxSpec.sandbox_workspace, "s");
+  assert.equal(plan(manifest({ image: "i" }), { gpus: 0, workspace: "w" }).sandboxSpec.sandbox_workspace, undefined);
 });

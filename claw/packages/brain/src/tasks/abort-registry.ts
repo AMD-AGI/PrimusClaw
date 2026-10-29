@@ -67,10 +67,24 @@ export function gracefulStopRemainingMs(ctrl: AbortController, now: number = Dat
 }
 
 const lockKeysByAddress = new Map<string, Set<string>>();
-const addressesByLockKey = new Map<string, string[]>();
+const lockKeysBySessionEnd = new Map<string, Set<string>>();
+const addressesByLockKey = new Map<string, { named: string[]; sessionEnd: string[] }>();
+
+function addTo(index: Map<string, Set<string>>, address: string, lockKey: string): void {
+  const keys = index.get(address) ?? new Set<string>();
+  keys.add(lockKey);
+  index.set(address, keys);
+}
 
 /**
  * Record the names an in-flight run can be reached by, alongside its gate key.
+ *
+ * `addresses` are the names an interrupt is published to. `sessionEnd` are names
+ * that stop the run only when the whole session goes away (a deletion): they are
+ * resolved by {@link resolveSessionEndTargets} and never by an interrupt. An
+ * application running beside a conversation needs the difference: a Stop of the
+ * conversation is `interrupt.<sessionId>` and must not end it, while deleting the
+ * session must.
  *
  * Undefined and duplicate names are dropped, as is the gate key itself: it is
  * already an address by virtue of being the map key, and storing it twice would
@@ -79,27 +93,43 @@ const addressesByLockKey = new Map<string, string[]>();
 export function registerRunAddresses(
   lockKey: string,
   addresses: Array<string | undefined>,
+  sessionEnd: Array<string | undefined> = [],
 ): void {
-  const named = [...new Set(addresses.filter((a): a is string => !!a && a !== lockKey))];
-  if (!named.length) return;
-  addressesByLockKey.set(lockKey, named);
-  for (const address of named) {
-    const keys = lockKeysByAddress.get(address) ?? new Set<string>();
-    keys.add(lockKey);
-    lockKeysByAddress.set(address, keys);
-  }
+  const clean = (list: Array<string | undefined>) => [...new Set(list.filter((a): a is string => !!a && a !== lockKey))];
+  const named = clean(addresses);
+  const ending = clean(sessionEnd);
+  if (!named.length && !ending.length) return;
+  addressesByLockKey.set(lockKey, { named, sessionEnd: ending });
+  for (const address of named) addTo(lockKeysByAddress, address, lockKey);
+  for (const address of ending) addTo(lockKeysBySessionEnd, address, lockKey);
+}
+
+/**
+ * What dispatch registers for a run it starts. A chat turn or a DAG node answers
+ * to its session and DAG root. An app run is addressed by its own task id (the
+ * API's cancel publishes that) and ends with its session, but a Stop of the
+ * session's conversation is not addressed to it.
+ */
+export function registerRunAddressesFor(
+  lockKey: string,
+  request: { mode?: string; task_id?: string; session_id: string; dag_root_task_id?: string },
+): void {
+  if (request.mode === "app") registerRunAddresses(lockKey, [request.task_id], [request.session_id]);
+  else registerRunAddresses(lockKey, [request.session_id, request.dag_root_task_id]);
 }
 
 /** Forget a finished run's addresses. Safe to call for a run that had none. */
 export function forgetRunAddresses(lockKey: string): void {
-  const named = addressesByLockKey.get(lockKey);
-  if (!named) return;
+  const entry = addressesByLockKey.get(lockKey);
+  if (!entry) return;
   addressesByLockKey.delete(lockKey);
-  for (const address of named) {
-    const keys = lockKeysByAddress.get(address);
-    if (!keys) continue;
-    keys.delete(lockKey);
-    if (!keys.size) lockKeysByAddress.delete(address);
+  for (const [index, list] of [[lockKeysByAddress, entry.named], [lockKeysBySessionEnd, entry.sessionEnd]] as const) {
+    for (const address of list) {
+      const keys = index.get(address);
+      if (!keys) continue;
+      keys.delete(lockKey);
+      if (!keys.size) index.delete(address);
+    }
   }
 }
 
@@ -171,6 +201,21 @@ export const RUN_ROW_TERMINAL_ABORT_REASON = Symbol("run_row_terminal");
 export const DEADLINE_EXCEEDED_ABORT_REASON = Symbol("deadline_exceeded");
 
 /**
+ * Whether an abort reason is a user's cancel, as against a reason the run settles
+ * on its own: a handover (graceful restart, a successor taking over -- the next
+ * run adopts what this one was provisioning) or the run's own ending (deadline,
+ * terminal row -- the failure path reads the platform's account of the sandbox
+ * before it reaps it). Only a cancel may have a sandbox wait reclaim what it was
+ * waiting on.
+ */
+export function isUserCancelReason(reason: unknown): boolean {
+  return reason !== SIGTERM_ABORT_REASON
+    && reason !== LEASE_LOST_ABORT_REASON
+    && reason !== RUN_ROW_TERMINAL_ABORT_REASON
+    && reason !== DEADLINE_EXCEEDED_ABORT_REASON;
+}
+
+/**
  * Externally abort the in-flight task for a session, if any. Used by
  * sandbox-keepalive when consecutive ping failures indicate the Hands
  * sandbox is gone — without this the agent loop happily blocks for up to
@@ -191,4 +236,13 @@ export function abortSession(sessionId: string, reason?: unknown): boolean {
     aborted = true;
   }
   return aborted;
+}
+
+/**
+ * The gate keys of every run a deleted session takes down: the runs an interrupt
+ * to the session would reach, and the ones that answer to it only when it ends.
+ */
+export function resolveSessionEndTargets(sid: string): string[] {
+  const ending = [...(lockKeysBySessionEnd.get(sid) ?? [])].filter((key) => activeAbort.has(key));
+  return [...new Set([...resolveAbortTargets(sid), ...ending])];
 }

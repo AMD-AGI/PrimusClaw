@@ -8,12 +8,13 @@ import { singleflightCreate, type FlightResult } from "../shared/singleflight.js
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions/dispatch.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
-import { RUN_DOORBELL_DISPATCH } from "../config.js";
+import { RUN_DOORBELL_DISPATCH, SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
 import {
   forceIdleAfterInterrupt, releaseSessionGateForTurn, stopSessionRuns, takeSessionGate,
 } from "../tasks/chat-run.js";
-import { kv } from "../infra/nats.js";
+import { kv, nc, sc } from "../infra/nats.js";
+import { buildDecisionMessage } from "../sessions/decision-message.js";
 import { getUser } from "../auth/middleware.js";
 import {
   canAccessSession,
@@ -24,6 +25,8 @@ import {
 } from "../auth/models.js";
 import { getContextUsageSnapshot } from "../sessions/context-builder.js";
 import { publicSessionRow } from "../events/redaction.js";
+import { archiveSession, unarchiveSession } from "../sessions/archive.js";
+import { parseSessionModel } from "../sessions/session-model.js";
 import {
   isUserEnvKeyAllowed,
   validateTopology, type EnvironmentTopology,
@@ -45,7 +48,7 @@ import { Upload } from "@aws-sdk/lib-storage";
 import { ZipArchive } from "archiver";
 import { Readable, PassThrough } from "node:stream";
 import pino from "pino"
-import { handsSessionKey } from "@claw/protocol";
+import { handsSessionKey, putTerminalHold } from "@claw/protocol";
 
 const logger = pino({ name: "sessions" });
 
@@ -71,6 +74,12 @@ export interface NewSessionRow {
    * once ownership is enforced, and it waits out `reapStuckSessions` instead.
    */
   gateMessageId?: string | null;
+  /**
+   * The model this session's turns ask for, or null/absent for the deployment's
+   * default. Already validated by `parseSessionModel`: this is the write, not
+   * the check.
+   */
+  model?: string | null;
 }
 
 // A value rather than a boolean, carrying the parent it was issued for, so a
@@ -97,12 +106,12 @@ export async function insertSessionRow(
   }
   await q.query(
     `INSERT INTO claw_sessions
-     (session_id, name, user_id, mode, agent_status, agent_gate_message_id, agent_id, system_prompt, status, config, parent_session_id, team_role, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $10, 'agent_default', $6, 'active', $7::jsonb, $8, $9, NOW(), NOW())`,
+     (session_id, name, user_id, mode, agent_status, agent_gate_message_id, agent_id, system_prompt, status, config, parent_session_id, team_role, model, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $10, 'agent_default', $6, 'active', $7::jsonb, $8, $9, $11, NOW(), NOW())`,
     [
       row.sessionId, row.name, row.userId, row.mode, row.agentStatus,
       row.systemPrompt, JSON.stringify(row.config), row.parentSid, row.role,
-      row.gateMessageId ?? null,
+      row.gateMessageId ?? null, row.model ?? null,
     ],
   );
 }
@@ -1008,6 +1017,42 @@ function parseSessionEnv(
 // now lives in ../session-dispatch.js — shared with
 // routes/anthropic-managed-agents.ts. See that module for the implementation.
 
+/** Min gap between two accepted terminal keepalives of one session. */
+const SANDBOX_KEEPALIVE_MIN_GAP_MS = 10_000;
+const sandboxKeepaliveLastAt = new Map<string, number>();
+
+/**
+ * The two registry reads/writes the sandbox routes make, behind a seam: `kv` is
+ * a live binding the tests cannot substitute, and the routes' own behaviour
+ * (owner check, gate, dispatch, throttle) is what they exercise.
+ */
+export const sandboxStartPorts = {
+  /** Claim the session's sandbox for an open terminal. False when it could not be recorded. */
+  async claim(sessionId: string): Promise<boolean> {
+    try {
+      await putTerminalHold(kv, sessionId, SESSION_SANDBOX_HOLD_MS);
+      return true;
+    } catch (err) {
+      logger.warn({ sessionId, err: (err as Error)?.message }, "sandbox.terminal_claim_failed");
+      return false;
+    }
+  },
+  /** What the registry says about the session's sandbox; unreadable reads as not ready. */
+  async readBinding(sessionId: string): Promise<{ ready: boolean; workloadId: string | null }> {
+    try {
+      const entry = await kv.get(handsSessionKey(sessionId));
+      if (!entry || entry.operation === "DEL" || entry.operation === "PURGE" || entry.value.length === 0) {
+        return { ready: false, workloadId: null };
+      }
+      const info = JSON.parse(new TextDecoder().decode(entry.value)) as { status?: string; workloadId?: string };
+      const workloadId = typeof info.workloadId === "string" && info.workloadId ? info.workloadId : null;
+      return { ready: info.status === "ready" && workloadId !== null, workloadId };
+    } catch {
+      return { ready: false, workloadId: null };
+    }
+  },
+};
+
 export async function registerSessionRoutes(app: FastifyInstance): Promise<void> {
 
   // --- Create Session ---
@@ -1053,6 +1098,19 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         ok: false,
         error: `config.${suppliedReservedKey} is server-managed`,
       });
+    }
+
+    // The model this session's turns ask for. Checked here, before any row or
+    // run exists, so a malformed name leaves nothing behind. Absent and null both
+    // mean no choice; whether the gateway serves the name is its answer to give,
+    // on the first turn that uses it.
+    let sessionModel: string | null = null;
+    if (body.model !== undefined) {
+      const parsedModel = parseSessionModel(body.model);
+      if (!parsedModel.ok) {
+        return reply.status(400).send({ ok: false, error: parsedModel.error });
+      }
+      sessionModel = parsedModel.model;
     }
 
     if (parentSid && !user) {
@@ -1251,6 +1309,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
           config: sessionConfig,
           parentSid, role,
           gateMessageId: firstMessageId,
+          model: sessionModel,
         };
         // A create with no parent grows no existing tree; every create that
         // names one adds a node to it, so it is decided against the ceiling
@@ -1272,6 +1331,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
             data: {
               session_id: sessionId, name, user_id: userId, mode: dispMode,
               agent_status: "idle", parent_session_id: parentSid, team_role: role,
+              model: sessionModel,
             },
           };
           if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock, userId, route, idemKey, 200, response);
@@ -1362,6 +1422,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
           data: {
             session_id: sessionId, name, user_id: userId, mode: dispMode,
             agent_status: "running", parent_session_id: parentSid, team_role: role,
+            model: sessionModel,
             message: {
               message_id: dispatch.messageId,
               dispatched: true,
@@ -1405,11 +1466,18 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
   // --- List Sessions (with A2A children inlined) ---
   // scope=all is restricted to admin (system-admin / system-admin-readonly);
   // any other user passing scope=all silently falls back to their own sessions.
-  app.get("/v1/sessions", async (req) => {
+  app.get("/v1/sessions", async (req, reply) => {
     const user = getUser(req);
     const userId = user?.userId ?? "default";
-    const q = req.query as { scope?: string; limit?: string; offset?: string } | undefined;
+    const q = req.query as { scope?: string; limit?: string; offset?: string; status?: string } | undefined;
     const scope = q?.scope;
+    // `status` filters by archive state: active (not archived), archived, or
+    // all. Omitted means all, which is what this endpoint returned before the
+    // filter existed, so existing callers see no change.
+    const statusFilter = q?.status ?? "all";
+    if (!["active", "archived", "all"].includes(statusFilter)) {
+      return reply.status(400).send({ ok: false, error: "status must be active, archived or all" });
+    }
     const wantAll = scope === "all" && !!user && isAdmin(user);
 
     // Pagination (project convention: limit/offset, mirrors /v1/resources).
@@ -1418,9 +1486,11 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     const limit = Math.min(200, Math.max(1, Number(q?.limit) || 50));
     const offset = Math.max(0, Number(q?.offset) || 0);
 
-    const whereSql = wantAll
+    const statusSql = statusFilter === "active" ? " AND COALESCE(status, 'active') <> 'archived'"
+      : statusFilter === "archived" ? " AND status = 'archived'" : "";
+    const whereSql = (wantAll
       ? "deleted_at IS NULL"
-      : "user_id = $1 AND deleted_at IS NULL";
+      : "user_id = $1 AND deleted_at IS NULL") + statusSql;
     const whereParams: unknown[] = wantAll ? [] : [userId];
 
     const total = Number(
@@ -1498,14 +1568,33 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     return { ok: true, data: rows.map(mapSessionForDisplay) };
   });
 
-  // --- Update Session (rename) ---
+  // --- Update Session (rename, choose the model) ---
+  //
+  // Either field alone, or both. `name` is the old contract unchanged. `model`
+  // is the model this session's turns ask the gateway for: a string sets it, null
+  // clears it back to the deployment's default, and a turn reads it when it is
+  // dispatched, so a change made while a turn runs takes effect from the next one.
   app.patch<{ Params: { id: string } }>("/v1/sessions/:id", async (req, reply) => {
     const sessionId = req.params.id;
     const user = getUser(req);
     const userId = user?.userId ?? "default";
-    const body = req.body as Record<string, unknown>;
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const wantsName = body.name !== undefined;
+    const wantsModel = body.model !== undefined;
     const newName = ((body.name as string) || "").trim();
-    if (!newName) return reply.status(400).send({ ok: false, error: "name is required" });
+    // With no `model` in the body this is exactly the rename it always was,
+    // including its refusal of a blank name.
+    if ((wantsName || !wantsModel) && !newName) {
+      return reply.status(400).send({ ok: false, error: "name is required" });
+    }
+    let newModel: string | null = null;
+    if (wantsModel) {
+      const parsedModel = parseSessionModel(body.model);
+      if (!parsedModel.ok) {
+        return reply.status(400).send({ ok: false, error: parsedModel.error });
+      }
+      newModel = parsedModel.model;
+    }
 
     const row = (await db.query(
       "SELECT session_id, user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
@@ -1513,17 +1602,65 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     )).rows[0];
     if (!row) return reply.status(404).send({ ok: false, error: "session not found" });
     // Creator-only, like send-message and delete: the same rule those two express
-    // through canAccessSession, rather than a second inline copy of it.
+    // through canAccessSession, rather than a second inline copy of it. Choosing
+    // the model is held to it as well -- it decides what the owner's key is spent
+    // on, and the owner is the only one who can send a turn.
     if (!canAccessSession(row.user_id, userId) && !(!row.user_id && user && isSystemAdmin(user))) {
-      return reply.status(403).send({ ok: false, error: "only the session owner can rename" });
+      return reply.status(403).send({
+        ok: false,
+        error: wantsModel ? "only the session owner can update it" : "only the session owner can rename",
+      });
     }
 
-    await db.query(
-      "UPDATE claw_sessions SET name = $1, updated_at = NOW() WHERE session_id = $2 AND deleted_at IS NULL",
-      [newName.slice(0, 255), sessionId],
-    );
-    return { ok: true, data: { session_id: sessionId, name: newName.slice(0, 255) } };
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    if (wantsName) {
+      params.push(newName.slice(0, 255));
+      sets.push(`name = $${params.length}`);
+    }
+    if (wantsModel) {
+      params.push(newModel);
+      sets.push(`model = $${params.length}`);
+    }
+    params.push(sessionId);
+    const updated = (await db.query(
+      `UPDATE claw_sessions SET ${sets.join(", ")}, updated_at = NOW() `
+        + `WHERE session_id = $${params.length} AND deleted_at IS NULL RETURNING name, model`,
+      params,
+    )).rows[0];
+    // Deleted between the read above and the write: there is nothing to report.
+    if (!updated) return reply.status(404).send({ ok: false, error: "session not found" });
+    return {
+      ok: true,
+      data: { session_id: sessionId, name: updated.name, model: updated.model ?? null },
+    };
   });
+
+  // --- Archive / unarchive (owner only; reversible, only flips `status`) ---
+  for (const action of ["archive", "unarchive"] as const) {
+    app.post<{ Params: { id: string } }>(`/v1/sessions/:id/${action}`, async (req, reply) => {
+      const sessionId = req.params.id;
+      const user = getUser(req);
+      const row = (await db.query(
+        "SELECT session_id, user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
+        [sessionId],
+      )).rows[0];
+      if (!row) return reply.status(404).send({ ok: false, error: "session not found" });
+      if (!canAccessSession(row.user_id, user?.userId ?? "default") && !(!row.user_id && user && isSystemAdmin(user))) {
+        return reply.status(403).send({ ok: false, error: `only the session owner can ${action}` });
+      }
+      if (action === "archive") {
+        const res = await archiveSession(sessionId);
+        if (res === "running") {
+          return reply.status(409).send({ ok: false, error: "session_running" });
+        }
+        if (res === "not_found") return reply.status(404).send({ ok: false, error: "session not found" });
+      } else if (!await unarchiveSession(sessionId)) {
+        return reply.status(404).send({ ok: false, error: "session not found" });
+      }
+      return { ok: true, data: { session_id: sessionId, status: action === "archive" ? "archived" : "active" } };
+    });
+  }
 
   // --- Send Message (V1/V2 split) ---
   app.post<{ Params: { id: string } }>("/v1/sessions/:id/messages", async (req, reply) => {
@@ -1637,8 +1774,20 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     }
 
     if (messageType === "decision") {
-      // V2 agent-loop has no interactive tool-permission gate yet.
-      return reply.status(501).send({ ok: false, error: "decision messages not supported on v2 sessions" });
+      // The answer to a pending tool-approval request (Brain's approval gate,
+      // agent/hitl.ts). Only a person who may write to the session can give it.
+      const row = (await db.query(
+        "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
+        [sessionId],
+      )).rows[0];
+      if (!row) return reply.status(404).send({ ok: false, error: "session not found" });
+      if (!canWriteSessionAsOperator(row.user_id, user)) {
+        return reply.status(403).send({ ok: false, error: "access denied" });
+      }
+      const built = buildDecisionMessage(sessionId, userId, body);
+      if (!built.ok) return reply.status(400).send({ ok: false, error: built.error });
+      nc.publish(`decision.${sessionId}`, sc.encode(JSON.stringify(built.message)));
+      return { ok: true, session_id: sessionId, action_id: built.message.action_id, decision: built.message.decision };
     }
 
     // messageType: "text" | "inject" | default → require content.
@@ -1780,6 +1929,152 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       // above returns before this and carries no id on purpose: that message is
       // in `claw_pending_messages` and no run exists to name yet.
       run_id: dispatch.runId,
+    };
+  });
+
+  // --- Start the session's sandbox without a turn (creator-only) ---
+  //
+  // The terminal and file panels need a sandbox, and a sandbox is otherwise
+  // created lazily by the first tool call of a turn. Asking a person to prompt
+  // the agent just to open a shell is the thing this removes. It does not
+  // reimplement provisioning: it takes the session gate the way a message does
+  // and dispatches a sandbox-only run (see `DispatchInput.sandboxOnly`), so the
+  // sandbox is created or reused by the same code, with the same credentials
+  // and the same admission, as a turn's.
+  //
+  // Concurrency is the gate's. A turn, or an earlier call of this route, that
+  // is still holding the gate means a sandbox is already on its way: this call
+  // dispatches nothing, which is what keeps two callers from making two.
+  //
+  // It also claims the sandbox for the terminal (see `terminal-hold.ts`), up
+  // front, because the sandbox it starts is otherwise stopped when this very
+  // run ends.
+  app.post<{ Params: { id: string } }>("/v1/sessions/:id/sandbox", async (req, reply) => {
+    if (!SESSION_SANDBOX_START_ENABLED) {
+      return reply.status(404).send({ ok: false, error: "not found" });
+    }
+    const sessionId = req.params.id;
+    const user = getUser(req);
+    const userId = user?.userId ?? "default";
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    // The caller's own lookup found nothing, so a binding on record is stale.
+    const refresh = body.refresh === true;
+
+    const client = await db.pool.connect();
+    let dispatchUserEnv: Record<string, string> = {};
+    let turnMessageId: string | null = null;
+    try {
+      await client.query("BEGIN");
+      const lock = await client.query(
+        "SELECT agent_status, user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL FOR UPDATE",
+        [sessionId],
+      );
+      if (!lock.rows.length) {
+        await client.query("ROLLBACK");
+        return reply.status(404).send({ ok: false, error: "session not found" });
+      }
+      const row = lock.rows[0];
+      // Creator only, no operator override: this spends the creator's quota and
+      // credentials, which the admin read-access to sessions does not extend to.
+      if (!canAccessSession(row.user_id, userId)) {
+        await client.query("ROLLBACK");
+        return reply.status(403).send({ ok: false, error: "only the session creator can start its sandbox" });
+      }
+      const binding = await sandboxStartPorts.readBinding(sessionId);
+      const claimed = await sandboxStartPorts.claim(sessionId);
+      if (!claimed) {
+        await client.query("ROLLBACK");
+        return reply.status(503).send({ ok: false, error: "sandbox claim not recorded" });
+      }
+      if (row.agent_status === "running") {
+        // A turn (or an earlier start) holds the gate. Dispatching again is what
+        // would make two sandboxes, so nothing is dispatched; and "busy" is not
+        // "starting", because a turn that never calls a tool never opens one.
+        // The caller asks again once the gate is free, which is idempotent.
+        await client.query("ROLLBACK");
+        return { ok: true, session_id: sessionId, state: binding.ready ? "running" : "busy", workload_id: binding.workloadId };
+      }
+      if (binding.ready && !refresh) {
+        await client.query("ROLLBACK");
+        return { ok: true, session_id: sessionId, state: "running", workload_id: binding.workloadId };
+      }
+      dispatchUserEnv = await loadUserEnvSnapshot(client, userId, logger);
+      turnMessageId = newChatMessageId();
+      await takeSessionGate(sessionId, turnMessageId, client);
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
+
+    const messageId = turnMessageId as string;
+    const dispatch = await dispatchTaskToBrain(
+      {
+        sessionId, userId, user,
+        content: "[sandbox start]", messageType: "text", toolIds: [], pluginId: undefined,
+        requestImage: undefined, requestResource: undefined, requestTimeout: undefined, topology: undefined,
+        workspaceId: undefined, mcpServers: undefined,
+        capturedUserEnvSnapshot: dispatchUserEnv,
+        capturedSessionEnv: {},
+        messageId,
+        sandboxOnly: true,
+      },
+      async () => { await releaseSessionGateForTurn(sessionId, messageId); },
+    );
+    if (dispatch.kind === "publish_failed" || dispatch.kind === "publish_unknown") {
+      return reply.status(503).send({ ok: false, error: "task dispatch failed", detail: dispatch.error?.message });
+    }
+    if (dispatch.kind === "rejected") {
+      return reply.status(429).send({ ok: false, error: "admission_rejected", reason: dispatch.reason });
+    }
+    const binding = await sandboxStartPorts.readBinding(sessionId);
+    return reply.status(202).send({
+      ok: true, session_id: sessionId, state: "starting", workload_id: binding.workloadId,
+      message_id: dispatch.messageId, run_id: dispatch.runId,
+    });
+  });
+
+  // --- Keep the sandbox for an open terminal (creator-only) ---
+  //
+  // A shell in the browser is not on the jobs roster that idle reclaim reads, so
+  // without this the sandbox is reclaimed under an open terminal. The panel
+  // calls it on a timer while it is open; a panel that goes away stops calling
+  // and the claim lapses by itself.
+  app.post<{ Params: { id: string } }>("/v1/sessions/:id/sandbox/keepalive", async (req, reply) => {
+    if (!SESSION_SANDBOX_START_ENABLED) {
+      return reply.status(404).send({ ok: false, error: "not found" });
+    }
+    const sessionId = req.params.id;
+    const userId = getUser(req)?.userId ?? "default";
+    const row = (await db.query(
+      "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
+      [sessionId],
+    )).rows[0];
+    if (!row) return reply.status(404).send({ ok: false, error: "session not found" });
+    if (!canAccessSession(row.user_id, userId)) {
+      return reply.status(403).send({ ok: false, error: "only the session creator can keep its sandbox" });
+    }
+    // Rate-limited per session, in this replica's memory: a limit that is
+    // slightly loose across replicas still bounds the write rate, and the
+    // claim itself is idempotent.
+    const nowMs = Date.now();
+    const last = sandboxKeepaliveLastAt.get(sessionId) ?? 0;
+    if (nowMs - last < SANDBOX_KEEPALIVE_MIN_GAP_MS) {
+      const binding = await sandboxStartPorts.readBinding(sessionId);
+      return { ok: true, session_id: sessionId, throttled: true, workload_id: binding.workloadId };
+    }
+    if (sandboxKeepaliveLastAt.size > 10_000) sandboxKeepaliveLastAt.clear();
+    sandboxKeepaliveLastAt.set(sessionId, nowMs);
+    if (!await sandboxStartPorts.claim(sessionId)) {
+      sandboxKeepaliveLastAt.delete(sessionId);
+      return reply.status(503).send({ ok: false, error: "sandbox claim not recorded" });
+    }
+    const binding = await sandboxStartPorts.readBinding(sessionId);
+    return {
+      ok: true, session_id: sessionId, throttled: false, workload_id: binding.workloadId,
+      hold_ms: SESSION_SANDBOX_HOLD_MS,
     };
   });
 

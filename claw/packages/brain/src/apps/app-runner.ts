@@ -42,7 +42,7 @@
  * {@link AppRunnerSeams}: event tailing and MCP registration.
  */
 import pino from "pino";
-import { APP_MANIFEST_DEFAULTS, type AppManifestV1, type AppSandboxRole } from "@claw/protocol";
+import { APP_MANIFEST_DEFAULTS, type AppManifestV1, type AppSandboxRole, type SandboxSpecCreate } from "@claw/protocol";
 import type {
   SandboxExecOptions, SandboxExecResult, SandboxInstance, SandboxStatus,
 } from "../sandbox/provider.js";
@@ -54,13 +54,17 @@ import {
 } from "./app-run-store.js";
 import {
   EXIT_ABSENT, INPUT_FILE, buildAppEnv, expandStateDirCommand, generationTag, isUsableStateDir,
-  parseProbe, probeCommand, readExitCommand, scrub, secretValuesOf, startCommand, stopCommand, writeFileCommand,
+  killCommand, parseProbe, probeCommand, readExitCommand, scrub, secretValuesOf, startCommand, stopCommand, writeFileCommand,
   type ProbeVerdict,
 } from "./app-env.js";
 
 const logger = pino({ name: "app-runner" });
 
 export const RECONCILE_INTERVAL_MS = 5_000;
+/** How often a running app's grant is looked up again. Takeover still checks on its first tick. */
+export const GRANT_INSPECT_INTERVAL_MS = 60_000;
+/** How long the `ended` announcement is waited for before the run goes on without it. */
+export const STATUS_PUBLISH_TIMEOUT_MS = 5_000;
 const EXEC_TIMEOUT = "30s";
 /** Consecutive failed launches in one sandbox before it counts as the application failing. */
 const START_FAILURES_BEFORE_RESTART = 3;
@@ -88,19 +92,34 @@ export interface AppGrantRun {
   sessionId: string;
   grantId: string | null;
   manifest: AppManifestV1;
+  userId?: string;
+  platformKey?: string;
+  workspaceId?: string | null;
+  limits?: Record<string, unknown> | null;
+  expiresAt?: string | null;
+  /** The sandbox spec admission stored, including the resolved image. */
+  sandboxSpec?: SandboxSpecCreate | null;
+  /** The lease epoch this worker holds, quoted when the API signs. */
+  claimCount?: number;
 }
 
 /** What a grant adds to the application's environment. */
 export interface AppGrantEnv {
   keys?: Partial<Record<AppSandboxRole, string>>;
   limits?: Record<string, unknown>;
+  /** Injected under the fixed name `E2B_API_URL`. */
+  e2bApiUrl?: string;
+  /** Injected under the fixed name `E2B_SANDBOX_URL`. */
+  e2bSandboxUrl?: string;
 }
 
 /**
  * Grant hook points (sandbox-layering #4). `env` runs at `starting`, `revoke`
  * at `finishing` step 3; both default to doing nothing. `issue` is the API's, at
- * run creation: the runner never issues a grant, so a run taken over with its
- * `grantId` already on the row cannot be given a second one. `revoke` is called
+ * run creation. The runner does not mint a grant id. When `inspect` says the
+ * execution copy is gone and the grant was not revoked, `reissue` signs the
+ * same id and the application is started again so the new keys are injected.
+ * `revoke` is called
  * once per run end, and once more only if a Brain dies between the call and the
  * write that records it, so an implementation must tolerate a repeat.
  *
@@ -113,6 +132,10 @@ export interface AppGrantRunHooks {
   env(run: AppGrantRun): Promise<AppGrantEnv>;
   revoke(run: AppGrantRun): Promise<void>;
   extend(run: AppGrantRun, expiresAt: string): Promise<{ expiresAt: string }>;
+  /** Whether the execution copy is still there. Absent means the runner does not check. */
+  inspect?(run: AppGrantRun): Promise<"active" | "missing" | "revoked">;
+  /** Sign the same grant id again after the execution copy is gone. Returns the new keys. */
+  reissue?(run: AppGrantRun): Promise<{ keys: Partial<Record<AppSandboxRole, string>>; expiresAt: string }>;
 }
 
 export const noopAppGrant: AppGrantRunHooks = {
@@ -125,6 +148,15 @@ export const noopAppGrant: AppGrantRunHooks = {
 export interface AppRunContext {
   record: AppRunRecord;
   instance: SandboxInstance | null;
+  /** The run's store, at the epoch this worker holds the run at. */
+  store: AppRunStore;
+  /** The submitter's platform key: what the sandbox Router authenticates, when it does. */
+  platformKey: string;
+  /**
+   * `text` with the run's secret values replaced; for anything that reads what the application wrote.
+   * Absent until the secrets have loaded: a seam that needs it waits for it.
+   */
+  scrub?(text: string): string;
 }
 
 /**
@@ -140,6 +172,8 @@ export interface AppRunnerSeams {
   drainEvents?(ctx: AppRunContext): Promise<void>;
   /** Finishing step 4: unregister the session-level MCP (C2-10). */
   unregisterMcp?(ctx: AppRunContext): Promise<void>;
+  /** The run's state moved (5.7: published as `appStatus`). Best effort: a failure is logged and the machine goes on. */
+  stateChanged?(record: AppRunRecord): Promise<void>;
 }
 
 /** The sandbox, as the runner uses it. The real one is {@link realAppSandbox}. */
@@ -163,6 +197,9 @@ export interface AppRunnerDeps {
   now?: () => number;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   tickMs?: number;
+  statusTimeoutMs?: number;
+  /** Epoch quoted to the API when it signs an extend or a reissue. */
+  claimCount?: number;
 }
 
 export interface AppRunOutcome {
@@ -253,24 +290,33 @@ export class AppRunner {
   private readonly finishDone = new Set<string>();
   /** Set when the signal given to `run` fires; cleared by `finishNow`, which ends the run on purpose. */
   private halted = false;
-  private secrets: string[] = [];
+  /**
+   * Seeded with the platform key, which is a constructor argument and needs no
+   * read: it is in the set from the first moment, whatever the store does.
+   */
+  private secrets: string[];
   private secretsLoaded = false;
   private readonly grant: AppGrantRunHooks;
   private readonly seams: AppRunnerSeams;
   private readonly now: () => number;
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly tickMs: number;
+  private readonly claimCount: number;
+  /** Fake-clock time before which a grant that was already seen is not looked up again. */
+  private grantInspectAfter = 0;
 
   constructor(
     private readonly runId: string,
     private readonly platformKey: string,
     private readonly deps: AppRunnerDeps,
   ) {
+    this.secrets = secretValuesOf({ mcpToken: "", grantKeys: {}, platformKey });
     this.grant = deps.grant ?? noopAppGrant;
     this.seams = deps.seams ?? {};
     this.now = deps.now ?? Date.now;
     this.sleep = deps.sleep ?? defaultSleep;
     this.tickMs = deps.tickMs ?? RECONCILE_INTERVAL_MS;
+    this.claimCount = deps.claimCount ?? 0;
   }
 
   // ---- driving ------------------------------------------------------------
@@ -348,7 +394,7 @@ export class AppRunner {
     if (!rec.grant_expires_at) return kept("no_expiry");
     const current = Date.parse(rec.grant_expires_at);
     if (!Number.isFinite(asked) || !(asked > current)) return kept("not_later");
-    const run: AppGrantRun = { runId: this.runId, sessionId: rec.session_id, grantId: rec.grant_id, manifest: rec.manifest };
+    const run: AppGrantRun = this.grantRun(rec);
     try {
       const granted = await this.grant.extend(run, expiresAt);
       const at = Date.parse(granted?.expiresAt);
@@ -380,9 +426,7 @@ export class AppRunner {
     this.halted = false;
     this.rec = await this.deps.store.load(this.runId);
     if (this.rec.state !== "finishing" && this.rec.state !== "ended") {
-      this.rec = await this.deps.store.patch(
-        this.runId, { state: "finishing", last_exit: { at: this.iso(), cause, final: false } },
-      );
+      await this.commit({ state: "finishing", last_exit: { at: this.iso(), cause, final: false } });
     }
     for (let failures = 0; ; ) {
       try {
@@ -408,9 +452,7 @@ export class AppRunner {
    */
   async markEnded(error: string): Promise<boolean> {
     try {
-      this.rec = await this.deps.store.patch(
-        this.runId, { state: "ended", last_exit: { at: this.iso(), cause: "start_failed", final: false, error: clip(error) } },
-      );
+      await this.commit({ state: "ended", last_exit: { at: this.iso(), cause: "start_failed", final: false, error: clip(error) } });
       return true;
     } catch (err) {
       if (err instanceof AppRunWriteRefused) return false;
@@ -430,6 +472,8 @@ export class AppRunner {
       await this.move({ state: "finishing", last_exit: { at: this.iso(), cause: "deadline", final: false } }, this.rec.state);
       return { done: false };
     }
+    const held = await this.ensureGrantCopy();
+    if (held) return held;
     switch (this.rec.state) {
       case "provisioning": return this.inProvisioning();
       case "starting": return this.inStarting();
@@ -438,6 +482,119 @@ export class AppRunner {
       case "finishing": return this.inFinishing();
       case "ended": return { done: true, outcome: outcomeOf(this.rec.last_exit, this.rec.state_dir) };
     }
+  }
+
+  /**
+   * Keep the execution copy of the grant. A live copy is left alone, and looked
+   * up again only every {@link GRANT_INSPECT_INTERVAL_MS} once the app is running.
+   * A missing one is signed again under the same id, and the new keys and the
+   * restart mark are written together. The application is then started again
+   * without spending a restart and without treating its exit as final.
+   * A revoked grant is not signed.
+   */
+  private async ensureGrantCopy(): Promise<TickResult | null> {
+    if (this.rec.state === "finishing" || this.rec.state === "ended") return null;
+    if (this.rec.last_exit?.grant_restart === true) return this.driveGrantRestart();
+    if (!this.grant.inspect || !this.grant.reissue || !this.rec.grant_id || this.rec.grant_revoked_at) return null;
+    if (this.grantInspectAfter > this.now()) return null;
+    let presence: "active" | "missing" | "revoked";
+    try {
+      presence = await this.grant.inspect(this.grantRun());
+    } catch (err) {
+      this.grantInspectAfter = this.now() + GRANT_INSPECT_INTERVAL_MS;
+      logger.warn({ runId: this.runId, grantId: this.rec.grant_id, err: this.safeText(err) }, "app_run.grant_inspect_failed");
+      return null;
+    }
+    if (presence !== "missing") {
+      if (presence === "active" && (this.rec.state === "running" || this.rec.state === "restarting")) {
+        this.grantInspectAfter = this.now() + GRANT_INSPECT_INTERVAL_MS;
+      }
+      return null;
+    }
+    try {
+      const issued = await this.grant.reissue(this.grantRun());
+      const last = this.rec.last_exit ?? { at: this.iso(), cause: "exit" as const, final: false };
+      await this.move({ grant_keys: issued.keys, last_exit: { ...last, grant_restart: true } });
+      this.secretsLoaded = false;
+    } catch (err) {
+      this.grantInspectAfter = this.now() + GRANT_INSPECT_INTERVAL_MS;
+      logger.warn({ runId: this.runId, grantId: this.rec.grant_id, err: this.safeText(err) }, "app_run.grant_reissue_failed");
+      return null;
+    }
+    return this.driveGrantRestart();
+  }
+
+  /**
+   * Stop the application after a re-issue, then start it again on the same
+   * generation budget. The stop is not an application failure: `final` in the
+   * exit record is the application's answer to SIGTERM, not a completed run.
+   * A sandbox that is already gone is handled by the ordinary lost-sandbox road.
+   */
+  private async driveGrantRestart(): Promise<TickResult | null> {
+    const inst = this.instance();
+    const stateDir = this.rec.state_dir;
+    if (!inst || !stateDir || this.rec.state === "provisioning") {
+      await this.clearGrantRestart();
+      return null;
+    }
+    if (await this.sandboxGone(inst)) {
+      await this.clearGrantRestart();
+      return null;
+    }
+    let verdict = await this.probe(inst, stateDir);
+    if (verdict === "alive") {
+      const sentAt = Date.parse(this.rec.last_exit?.stop_at ?? "");
+      if (!Number.isFinite(sentAt)) {
+        await this.sendTerm(inst, stateDir);
+        await this.move({ last_exit: { ...this.rec.last_exit!, stop_at: this.iso(), grant_restart: true } });
+      } else if (this.now() >= sentAt + this.stopGraceMs()) {
+        await this.deps.sandbox.exec(inst, killCommand(stateDir, this.tag()), EXEC_TIMEOUT, { untracked: true });
+      }
+      verdict = await this.probe(inst, stateDir);
+    }
+    if (verdict !== "dead" && verdict !== "none") return { done: false };
+    return this.launch(inst, stateDir, { replace: true });
+  }
+
+  /** True when SaFE says the workload is terminal or absent. An unreadable status is not gone. */
+  private async sandboxGone(inst: SandboxInstance): Promise<boolean> {
+    try {
+      const status = await this.deps.sandbox.status(inst);
+      return status.state === "terminal" || status.state === "absent";
+    } catch {
+      return false;
+    }
+  }
+
+  private stopGraceMs(): number {
+    return Math.min(this.rec.manifest.stop_grace_sec ?? APP_MANIFEST_DEFAULTS.stop_grace_sec, MAX_STOP_GRACE_SEC) * 1000;
+  }
+
+  /** Drop the re-issue mark so the ordinary restart path can move the run. */
+  private async clearGrantRestart(): Promise<void> {
+    if (this.rec.last_exit?.grant_restart !== true) return;
+    const last: AppLastExit = { ...this.rec.last_exit };
+    delete last.grant_restart;
+    delete last.stop_at;
+    await this.move({ last_exit: last });
+  }
+
+  /** The grant hooks' view of the current row, including what a re-issue needs. */
+  private grantRun(rec: AppRunRecord = this.rec): AppGrantRun {
+    const run: AppGrantRun = {
+      runId: this.runId,
+      sessionId: rec.session_id,
+      grantId: rec.grant_id,
+      manifest: rec.manifest,
+    };
+    if (rec.user_id) run.userId = rec.user_id;
+    if (this.platformKey) run.platformKey = this.platformKey;
+    if (rec.workspace_id) run.workspaceId = rec.workspace_id;
+    if (rec.grant_limits) run.limits = rec.grant_limits;
+    if (rec.grant_expires_at) run.expiresAt = rec.grant_expires_at;
+    if (rec.sandbox_spec) run.sandboxSpec = rec.sandbox_spec;
+    if (this.claimCount > 0) run.claimCount = this.claimCount;
+    return run;
   }
 
   /** `limits.max_runtime_sec` counts from the run's creation, so a takeover keeps the same deadline. */
@@ -459,10 +616,10 @@ export class AppRunner {
     if (this.secretsLoaded) return;
     try {
       const stored = await this.deps.store.secrets(this.runId);
-      this.secrets = secretValuesOf({ mcpToken: stored.mcp_token, grantKeys: stored.grant_keys ?? {} });
+      this.secrets = secretValuesOf({ mcpToken: stored.mcp_token, grantKeys: stored.grant_keys ?? {}, platformKey: this.platformKey });
       this.secretsLoaded = true;
     } catch (err) {
-      logger.warn({ runId: this.runId, err: this.safeText(err) }, "app_run.secrets_unavailable_for_scrub");
+      logger.warn({ runId: this.runId, err: clip(scrub(err instanceof Error ? err.message : String(err), this.secrets)) }, "app_run.secrets_unavailable_for_scrub");
     }
   }
 
@@ -524,7 +681,7 @@ export class AppRunner {
       await this.move({ state: "starting" }, "running");
       return { done: false };
     }
-    if (verdict === "alive") await this.runningSeams({ record: this.rec, instance: inst });
+    if (verdict === "alive") await this.runningSeams(this.seamContext(inst));
     return { done: false };
   }
 
@@ -566,18 +723,22 @@ export class AppRunner {
     }
   }
 
-  private async launch(inst: SandboxInstance, stateDir: string): Promise<TickResult> {
+  private async launch(inst: SandboxInstance, stateDir: string, opts?: { replace?: boolean }): Promise<TickResult> {
     // A run whose application already finished must not be started again. This
     // is how a sandbox lost right after `final` ends the run instead of
     // repeating it: the state directory outlives the sandbox.
-    const prior = await this.readExit(inst, stateDir);
-    if (prior.kind === "unreadable") return { done: false };
-    if (prior.kind === "exit" && prior.final) return this.finishFromExit(prior);
-    if (this.rec.last_exit?.recovery === true) {
-      // The budget was spent when the sandbox went, and nothing final is there:
-      // the run ends as the failure it was already going to be.
-      await this.move({ state: "finishing", last_exit: { at: this.iso(), cause: "restarts_exhausted", final: false } });
-      return { done: false };
+    // A grant re-issue is the exception: the exit record is the application's
+    // answer to the SIGTERM that was sent so the new keys could be injected.
+    if (!opts?.replace) {
+      const prior = await this.readExit(inst, stateDir);
+      if (prior.kind === "unreadable") return { done: false };
+      if (prior.kind === "exit" && prior.final) return this.finishFromExit(prior);
+      if (this.rec.last_exit?.recovery === true) {
+        // The budget was spent when the sandbox went, and nothing final is there:
+        // the run ends as the failure it was already going to be.
+        await this.move({ state: "finishing", last_exit: { at: this.iso(), cause: "restarts_exhausted", final: false } });
+        return { done: false };
+      }
     }
 
     // The environment comes from the platform (the API's secrets, the grant
@@ -592,9 +753,14 @@ export class AppRunner {
       await this.startApplication(inst, stateDir, env);
     } catch (err) {
       if (err instanceof RunnerHalted) throw err;
+      if (opts?.replace) {
+        logger.warn({ runId: this.runId, err: this.safeText(err) }, "app_run.grant_restart_failed");
+        return { done: false };
+      }
       return this.onStartFailure(err);
     }
     this.startFailures = 0;
+    if (opts?.replace) await this.clearGrantRestart();
     logger.info({ runId: this.runId, workloadId: this.rec.sandbox_workload_id, restarts: this.rec.restarts }, "app_run.started");
     return { done: false };
   }
@@ -625,7 +791,7 @@ export class AppRunner {
 
   private async applicationEnv(stateDir: string): Promise<Record<string, string>> {
     const rec = this.rec;
-    const run: AppGrantRun = { runId: this.runId, sessionId: rec.session_id, grantId: rec.grant_id, manifest: rec.manifest };
+    const run: AppGrantRun = this.grantRun(rec);
     const [stored, granted, nodeName] = await Promise.all([
       this.deps.store.secrets(this.runId),
       this.grant.env(run),
@@ -640,9 +806,12 @@ export class AppRunner {
       mcpToken: stored.mcp_token,
       grantKeys: { ...(stored.grant_keys ?? {}), ...(granted.keys ?? {}) },
       grantLimits: granted.limits ?? rec.grant_limits,
+      sandboxTemplates: rec.grant_templates,
       nodeName,
+      e2bApiUrl: granted.e2bApiUrl,
+      e2bSandboxUrl: granted.e2bSandboxUrl,
     };
-    this.secrets = secretValuesOf(sources);
+    this.secrets = secretValuesOf({ ...sources, platformKey: this.platformKey });
     this.secretsLoaded = true;
     if (!nodeName) logger.warn({ runId: this.runId }, "app_run.node_name_unavailable");
     return buildAppEnv(sources);
@@ -753,6 +922,12 @@ export class AppRunner {
     return this.countedRestart("sandbox_lost");
   }
 
+  /** False only when SaFE says the workload is terminal or absent; a status that cannot be read throws, and the step retries. */
+  private async sandboxPresent(inst: SandboxInstance): Promise<boolean> {
+    const status = await this.deps.sandbox.status(inst);
+    return status.state !== "terminal" && status.state !== "absent";
+  }
+
   private instance(): SandboxInstance | null {
     const id = this.rec.sandbox_workload_id;
     return id ? this.deps.sandbox.instance(this.sandboxRun(), id) : null;
@@ -772,6 +947,15 @@ export class AppRunner {
 
   // ---- running ------------------------------------------------------------
 
+  private seamContext(instance: SandboxInstance | null): AppRunContext {
+    // `scrub` exists only once the run's secret values are known: a seam that reads
+    // what the application wrote must not forward it while it cannot clean it.
+    return {
+      record: this.rec, instance, store: this.deps.store, platformKey: this.platformKey,
+      ...(this.secretsLoaded ? { scrub: (text: string) => this.scrubbed(text) } : {}),
+    };
+  }
+
   private async runningSeams(ctx: AppRunContext): Promise<void> {
     for (const [name, seam] of [["tail_events", this.seams.tailEvents], ["register_mcp", this.seams.registerMcp]] as const) {
       if (!seam) continue;
@@ -789,13 +973,21 @@ export class AppRunner {
   private async inFinishing(): Promise<TickResult> {
     const rec = this.rec;
     const inst = this.instance();
-    const ctx: AppRunContext = { record: rec, instance: inst };
-    const run: AppGrantRun = { runId: this.runId, sessionId: rec.session_id, grantId: rec.grant_id, manifest: rec.manifest };
+    const ctx = this.seamContext(inst);
+    const run: AppGrantRun = this.grantRun(rec);
     const cause = rec.last_exit?.cause ?? "exit";
     const cancelled = cause === "cancelled" || cause === "deadline" || cause === "row_terminal";
 
     if (cancelled && !(await this.step("stop_application", () => this.stopApplication(inst)))) return { done: false };
-    await this.step("drain_events", () => this.seams.drainEvents?.(ctx));
+    await this.step("drain_events", async () => {
+      if (!this.seams.drainEvents) return;
+      // A sandbox that is gone cannot be read: say what was left, do not spend the step's attempts on it.
+      if (inst && !(await this.sandboxPresent(inst))) {
+        logger.warn({ runId: this.runId, workloadId: inst.id, cursor: rec.events_cursor }, "app_run.events_not_drained_sandbox_gone");
+        return;
+      }
+      await this.seams.drainEvents(ctx);
+    });
     await this.step("revoke_grant", async () => {
       await this.grant.revoke(run);
       // Recorded on the row as well, so extendGrant refuses it from here on (and
@@ -957,11 +1149,37 @@ export class AppRunner {
   /** Persist a transition, compare-and-set on `from` when given. */
   private async move(patch: AppRunPatch, from?: AppRunState): Promise<void> {
     this.assertActive();
-    this.rec = await this.deps.store.patch(this.runId, patch, from);
+    await this.commit(patch, from);
     logger.info(
       { runId: this.runId, state: this.rec.state, restarts: this.rec.restarts, cause: patch.last_exit?.cause },
       "app_run.transition",
     );
+  }
+
+  /**
+   * The one place a write to the row becomes `this.rec`: every state change,
+   * from `move` and from `finishNow` and `markEnded`, goes through here, and
+   * a changed state is announced to the `stateChanged` seam from here. The
+   * announcement is not awaited (a slow event stream must not slow the machine)
+   * and its failure is only logged.
+   */
+  private async commit(patch: AppRunPatch, from?: AppRunState): Promise<void> {
+    const before = this.rec?.state;
+    this.rec = await this.deps.store.patch(this.runId, patch, from);
+    const seam = this.seams.stateChanged;
+    if (!seam || this.rec.state === before) return;
+    const record = this.rec;
+    const announce = Promise.resolve().then(() => seam(record)).catch((err) => {
+      logger.warn({ runId: this.runId, seam: "state_changed", err: this.safeText(err) }, "app_run.seam_failed");
+    });
+    // The last state is waited for (bounded): the caller goes on to finish the task,
+    // and a client that follows `appStatus` must see `ended` before that completion,
+    // not instead of it. Every other change is announced without waiting.
+    if (record.state === "ended") {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([announce, new Promise<void>((resolve) => { timer = setTimeout(resolve, this.deps.statusTimeoutMs ?? STATUS_PUBLISH_TIMEOUT_MS); })]);
+      clearTimeout(timer);
+    }
   }
 
   private exitRecord(exit: Extract<ExitRead, { kind: "exit" }>, cause: AppLastExit["cause"]): AppLastExit {
@@ -982,7 +1200,14 @@ export class AppRunner {
 
   private iso(): string { return new Date(this.now()).toISOString(); }
 
-  private scrubbed(text: string): string { return scrub(text, this.secrets); }
+  /**
+   * Until the run's own secrets (MCP token, grant keys) have been read the set is
+   * incomplete, and text from the application is not forwarded at all rather than
+   * forwarded partly scrubbed.
+   */
+  private scrubbed(text: string): string {
+    return this.secretsLoaded ? scrub(text, this.secrets) : "[withheld: scrub set incomplete]";
+  }
 
   private safeText(err: unknown): string {
     return clip(this.scrubbed(err instanceof Error ? err.message : String(err)));
