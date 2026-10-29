@@ -58,11 +58,11 @@ there, and confirm; the command then prints `signed in as <machine name>`. The c
 0600) and refreshes its short-lived access token by itself. Put `server` and `identity_url` in `agents.toml` and the two
 options can be left out.
 
-If there is no browser sign-in to use (a development server), use a Claw API key instead. Give it through the environment so it
-stays out of your shell history:
+If there is no browser sign-in to use (a development server), use a Claw API key instead. Pass it in `CLAW_CONNECTOR_KEY`
+(replace the placeholder value) rather than with `--key`, which would show it in the process list:
 
 ```sh
-CLAW_CONNECTOR_KEY=<your Claw API key> claw-connector login --server https://claw.example.com/claw-api
+CLAW_CONNECTOR_KEY='replace-with-your-claw-api-key' claw-connector login --server https://claw.example.com/claw-api
 ```
 
 The key is stored as it is in `credentials.json` (mode 0600) and is for trying things out; the device sign-in is the normal way.
@@ -83,7 +83,7 @@ In Clawy (or any chat client built on Claw), send `/agents`. The agents of this 
 A session started there runs on this machine, inside one of your `roots`, and each permission request comes back as a card in the chat.
 
 To disconnect: `claw-connector pause` (stay offline until `resume`), `claw-connector stop`, or `claw-connector logout` (also
-revokes the device sign-in at the identity service; a saved key is deleted from this machine, not revoked at Claw).
+asks the identity service to revoke the device sign-in; a saved key is deleted from this machine, not revoked at Claw).
 
 ## agents.toml
 
@@ -173,7 +173,7 @@ All of these run on your machine and fail closed.
 | `status [--json]` | Running or not, paused, signed in, agents, adapter processes. |
 | `pause` / `resume` | Stop every agent within a second and stay offline, or undo that. |
 | `stop` | Stop the running connector and every agent it started. |
-| `logout` | Stop, revoke the sign-in at the identity service, delete it. The stored connector id stays, so the next sign-in reuses the same connector. |
+| `logout` | Stop, ask the identity service to revoke the sign-in, delete it from this machine. The stored connector id stays, so the next sign-in reuses the same connector. |
 
 **Kill switch.** Every adapter is started in its own process group and recorded (pid and start time) in
 `children.json`. `stop`, `pause`, a revocation and Ctrl-C signal exactly those groups: a process that is not recorded, or
@@ -183,8 +183,8 @@ the connector sees it within a heartbeat, stops every agent and exits without re
 
 ## Files
 
-`~/.config/claw-connector/` (or `$XDG_CONFIG_HOME`): `agents.toml`, `credentials.json` (0600; a file other users can read is
-refused). `~/.local/state/claw-connector/` (or `$XDG_STATE_HOME`): `connector.json` (the connector's identity and the
+`~/.config/claw-connector/` (or `$XDG_CONFIG_HOME/claw-connector/`): `agents.toml`, `credentials.json` (0600; a file other users can read is
+refused). `~/.local/state/claw-connector/` (or `$XDG_STATE_HOME/claw-connector/`): `connector.json` (the connector's identity and the
 commands handled), `sessions.json`, `outbox/` (events not yet acknowledged by Claw), `audit.jsonl` (spawn, directory
 decisions, every command received, every permission request and answer, every automatic approval, mode changes),
 `logs/`, `children.json`, `connector.pid`. `CLAW_CONNECTOR_HOME=/some/dir` keeps all of it under one directory.
