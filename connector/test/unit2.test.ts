@@ -374,6 +374,13 @@ describe("device authorization flow (RFC 8628)", () => {
       assert.ok(id.polls.length >= 2 && id.polls.length <= 31);
     } finally { await id.close(); }
   });
+  test("a service that keeps answering 5xx ends the flow after five answers, but one that recovers is waited for", async () => {
+    const dead = await run(["server_error"]);
+    assert.ok(dead.error instanceof DeviceFlowError && dead.error.code === "unreachable");
+    assert.equal(dead.id.polls.length, 5);
+    const flaky = await run(["server_error", "server_error", "authorization_pending", "server_error", "server_error", "ok"]);
+    assert.equal(flaky.tok?.refresh_token, "refresh-1", "a real answer in between starts the count again");
+  });
   test("an unreachable identity service ends the flow after a few tries", async () => {
     const err = await deviceLogin({ identityUrl: "http://127.0.0.1:1", deviceName: "h", sleep: async () => {} }).catch((e) => e);
     assert.ok(err instanceof DeviceFlowError && err.code === "unreachable");

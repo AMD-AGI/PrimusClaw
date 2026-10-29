@@ -83,6 +83,11 @@ export async function pollDeviceToken(o: DeviceFlowOptions, auth: DeviceAuthoriz
       if (++unreachable >= 5) throw new DeviceFlowError("unreachable", `could not reach the identity service: ${errMessage(e)}`);
       continue;
     }
+    // A server that keeps failing is given up on after five answers; only a real answer starts the count again.
+    if (res.status >= 500) {
+      if (++unreachable >= 5) throw new DeviceFlowError("unreachable", `the identity service keeps answering ${res.status}`);
+      continue;
+    }
     unreachable = 0;
     const body: unknown = await res.json().catch(() => null);
     if (res.ok) {
@@ -95,7 +100,6 @@ export async function pollDeviceToken(o: DeviceFlowOptions, auth: DeviceAuthoriz
     if (err === "slow_down") { interval += 5; continue; }
     if (err === "access_denied") throw new DeviceFlowError("access_denied", "the sign-in was denied in the browser");
     if (err === "expired_token") throw new DeviceFlowError("expired_token", "the code expired before it was confirmed; run login again");
-    if (res.status >= 500) { if (++unreachable >= 5) throw new DeviceFlowError("unreachable", `the identity service keeps answering ${res.status}`); continue; }
     throw new DeviceFlowError("protocol", `the identity service refused the sign-in (${err || `HTTP ${res.status}`})`);
   }
 }

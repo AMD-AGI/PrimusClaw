@@ -67,8 +67,11 @@ describe("claw-connector commands", () => {
     const a = ctx(home);
     assert.equal(await main(["login", "--server", "https://claw.example/api/", "--key", "ak-test"], a.c), EXIT.ok);
     const file = credentialsFile(a.c.dirs);
-    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
-    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")).server, "https://claw.example/api");
+    const fd = fs.openSync(file, "r");
+    try {
+      assert.equal(fs.fstatSync(fd).mode & 0o777, 0o600);
+      assert.deepEqual(JSON.parse(fs.readFileSync(fd, "utf8")).server, "https://claw.example/api");
+    } finally { fs.closeSync(fd); }
     assert.match(a.text(), /development key/);
     assert.doesNotMatch(a.text() + a.errText(), /ak-test/, "the key is never echoed");
   });

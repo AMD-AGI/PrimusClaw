@@ -8,7 +8,7 @@ import type { AddressInfo } from "node:net";
 export class FakeIdentity {
   url = "";
   /** What each poll of the device grant answers, in order; the last repeats. */
-  pollScript: Array<"authorization_pending" | "slow_down" | "access_denied" | "expired_token" | "ok"> = ["ok"];
+  pollScript: Array<"authorization_pending" | "slow_down" | "access_denied" | "expired_token" | "server_error" | "ok"> = ["ok"];
   interval = 1;
   expiresIn = 600;
   polls: number[] = [];
@@ -47,6 +47,7 @@ export class FakeIdentity {
       this.polls.push(Date.now());
       const step = this.pollScript[Math.min(this.polls.length - 1, this.pollScript.length - 1)]!;
       if (step === "ok") { const rt = `refresh-${++this.accessCounter}`; this.refreshTokens.add(rt); return send(200, { access_token: `access-${this.accessCounter}`, token_type: "Bearer", expires_in: 300, refresh_token: rt, scope: "claw.connector" }); }
+      if (step === "server_error") return send(503, { error: "temporarily_unavailable" });
       return send(400, { error: step });
     }
     if (path === "/oauth/token" && form.grant_type === "refresh_token") {

@@ -35,19 +35,27 @@ export class GrantRevokedError extends Error {
 export class TransientAuthError extends Error {}
 
 export function loadCredentials(file: string): Credentials | null {
-  let st: fs.Stats;
+  let fd: number;
   try {
-    st = fs.statSync(file);
+    fd = fs.openSync(file, "r");
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw e;
   }
-  if (process.platform !== "win32" && (st.mode & 0o077) !== 0) {
-    throw new CredentialsError(`${file} is readable by other users (mode ${(st.mode & 0o777).toString(8)}); run: chmod 600 ${file}`);
+  let text: string;
+  try {
+    // The mode is read from the very file that is then read (one descriptor), not from a path that could be swapped in between.
+    const st = fs.fstatSync(fd);
+    if (process.platform !== "win32" && (st.mode & 0o077) !== 0) {
+      throw new CredentialsError(`${file} is readable by other users (mode ${(st.mode & 0o777).toString(8)}); run: chmod 600 ${file}`);
+    }
+    text = fs.readFileSync(fd, "utf8");
+  } finally {
+    fs.closeSync(fd);
   }
   let raw: unknown;
   try {
-    raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    raw = JSON.parse(text);
   } catch (e) {
     throw new CredentialsError(`${file} is not valid JSON (${errMessage(e)})`);
   }

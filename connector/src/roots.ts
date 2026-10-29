@@ -48,7 +48,7 @@ export function checkCwd(cwd: string, roots: string[]): CwdVerdict {
 /** Whether `p` (absolute or relative to `cwd`) is a path inside `cwd`, for auto-allow rules. */
 export function relativeInside(p: string, cwd: string): string | null {
   const abs = path.resolve(cwd, p);
-  let real = abs;
+  let real: string;
   try {
     real = fs.realpathSync.native(abs);
   } catch {

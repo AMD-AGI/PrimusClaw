@@ -90,9 +90,14 @@ export async function main(argv: string[], ctx: Ctx): Promise<number> {
 
 async function cmdInit(ctx: Ctx): Promise<number> {
   const file = configFile(ctx.dirs);
-  if (fs.existsSync(file)) { ctx.out(`${file} already exists; left alone`); return EXIT.ok; }
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(file, SAMPLE_CONFIG, { mode: 0o600 });
+  try {
+    // "wx": create it only if it is not there, in one step: no check that could be raced.
+    fs.writeFileSync(file, SAMPLE_CONFIG, { mode: 0o600, flag: "wx" });
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "EEXIST") { ctx.out(`${file} already exists; left alone`); return EXIT.ok; }
+    throw e;
+  }
   ctx.out(`wrote ${file}: edit the roots (the directories an agent may work in), then run: claw-connector login`);
   return EXIT.ok;
 }
