@@ -146,12 +146,12 @@ func (jm *JWTManager) GenerateScopedToken(sessionID string, policy e2b.RequestPo
 // GenerateHopToken signs a short-lived token for one sandbox on one cluster.
 // The receiving Router checks the cluster claim and then signs its own EnvD token.
 func (jm *JWTManager) GenerateHopToken(sandboxID, cluster string) (string, error) {
-	return jm.generateHopToken(sandboxID, cluster, false, nil, nil)
+	return jm.generateHopToken(sandboxID, cluster, "", false, nil, nil)
 }
 
-// generateHopToken signs a hop token. Sealed inputs and outputs travel in the
-// token so the cluster Router can set them. A client header cannot.
-func (jm *JWTManager) generateHopToken(sandboxID, cluster string, sealed bool, inputs, outputs []string) (string, error) {
+// generateHopToken signs a hop token. The namespace and sealed file roots travel
+// in the token so the cluster Router can use them. A client header cannot.
+func (jm *JWTManager) generateHopToken(sandboxID, cluster, namespace string, sealed bool, inputs, outputs []string) (string, error) {
 	if jm == nil || jm.privateKey == nil {
 		return "", fmt.Errorf("JWT private key is unavailable")
 	}
@@ -168,6 +168,7 @@ func (jm *JWTManager) generateHopToken(sandboxID, cluster string, sealed bool, i
 		"exp":        time.Now().Add(hopExpiration).Unix(),
 		"sandbox_id": sandboxID,
 		"cluster":    cluster,
+		"namespace":  namespace,
 	}
 	if sealed {
 		claims["sealed"] = true

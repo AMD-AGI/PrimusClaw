@@ -23,13 +23,17 @@ func NewPodAddressFinder(client ctrlclient.Client) *PodAddressFinder {
 }
 
 // PodAddress returns the envd address of the Workload named sandboxID.
-// Several pods use the master pod. A single pod uses that pod.
-func (f *PodAddressFinder) PodAddress(ctx context.Context, sandboxID string) (string, int, error) {
-	if f == nil || f.client == nil || sandboxID == "" {
+// The lookup stays in namespace. Several pods use the master pod. A single pod uses that pod.
+func (f *PodAddressFinder) PodAddress(ctx context.Context, namespace, sandboxID string) (string, int, error) {
+	if f == nil || f.client == nil || namespace == "" || sandboxID == "" {
 		return "", 0, fmt.Errorf("pod address client is not configured")
 	}
 	var pods corev1.PodList
-	if err := f.client.List(ctx, &pods, ctrlclient.MatchingLabels{safeWorkloadIDLabel: sandboxID}); err != nil {
+	err := f.client.List(ctx, &pods,
+		ctrlclient.InNamespace(namespace),
+		ctrlclient.MatchingLabels{safeWorkloadIDLabel: sandboxID},
+	)
+	if err != nil {
 		return "", 0, err
 	}
 	pod := pickEnvDPod(pods.Items)

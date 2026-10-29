@@ -60,8 +60,30 @@ func TestPodAddressPrefersMaster(t *testing.T) {
 		Name: "job-master-0", Namespace: "ws", Labels: map[string]string{safeWorkloadIDLabel: "sbx-1"},
 	}, Status: corev1.PodStatus{PodIP: "10.0.0.1"}}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(worker, master).Build()
-	ip, port, err := NewPodAddressFinder(cl).PodAddress(context.Background(), "sbx-1")
+	ip, port, err := NewPodAddressFinder(cl).PodAddress(context.Background(), "ws", "sbx-1")
 	if err != nil || ip != "10.0.0.1" || port != envdPort {
 		t.Fatalf("ip=%s port=%d err=%v", ip, port, err)
+	}
+}
+
+func TestPodAddressStaysInNamespace(t *testing.T) {
+	scheme := k8sruntime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	decoy := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "x-master-0", Namespace: "other", Labels: map[string]string{safeWorkloadIDLabel: "sbx-1"},
+	}, Status: corev1.PodStatus{PodIP: "10.9.9.9"}}
+	real := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "job-worker-0", Namespace: "top-models", Labels: map[string]string{safeWorkloadIDLabel: "sbx-1"},
+	}, Status: corev1.PodStatus{PodIP: "10.0.0.4"}}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(decoy, real).Build()
+	finder := NewPodAddressFinder(cl)
+	ip, _, err := finder.PodAddress(context.Background(), "top-models", "sbx-1")
+	if err != nil || ip != "10.0.0.4" {
+		t.Fatalf("ip=%s err=%v", ip, err)
+	}
+	if _, _, err := finder.PodAddress(context.Background(), "", "sbx-1"); err == nil {
+		t.Fatal("empty namespace searched the cluster")
 	}
 }

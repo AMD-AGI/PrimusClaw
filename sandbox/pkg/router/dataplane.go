@@ -37,7 +37,7 @@ const (
 // PodAddressFunc resolves a sandbox id to an envd address in this cluster.
 // The session store is tried first. This runs when that store has no pod IP,
 // which is the case for a SaFE Workload that is not a Sandbox CR.
-type PodAddressFunc func(ctx context.Context, sandboxID string) (ip string, port int, err error)
+type PodAddressFunc func(ctx context.Context, namespace, sandboxID string) (ip string, port int, err error)
 
 // dataPlane is the optional hop between the managing Router and a cluster Router.
 type dataPlane struct {
@@ -114,7 +114,7 @@ func (s *Server) forwardDataPlane(c *gin.Context, sandboxID, base string, ref ru
 		return
 	}
 	cluster := ref.Cluster
-	token, err := s.jwt.generateHopToken(sandboxID, cluster, ref.Sealed, ref.Inputs, ref.Outputs)
+	token, err := s.jwt.generateHopToken(sandboxID, cluster, ref.Namespace, ref.Sealed, ref.Inputs, ref.Outputs)
 	if err != nil {
 		log.Error("dataplane: failed to sign hop token", "error", err, "sandbox", sandboxID, "cluster", cluster)
 		writeGate(c, http.StatusServiceUnavailable, "sandbox_unavailable", "sandbox authentication unavailable")
@@ -176,7 +176,7 @@ func (s *Server) handleDataPlaneHop(c *gin.Context) {
 		writeGate(c, http.StatusUnauthorized, "invalid_token", "hop token is not valid for this cluster")
 		return
 	}
-	info, err := s.localSandbox(c.Request.Context(), sandboxID)
+	info, err := s.localSandbox(c.Request.Context(), ref.Namespace, sandboxID)
 	if err != nil || info == nil || info.PodIP == "" {
 		writeGate(c, http.StatusBadGateway, "sandbox_unavailable", sandboxID)
 		return
@@ -214,7 +214,7 @@ func (s *Server) handleLocalEnvD(c *gin.Context) {
 	if !hopSealedAllows(c, c.Request.URL.Path, ref) {
 		return
 	}
-	info, err := s.localSandbox(c.Request.Context(), ref.ID)
+	info, err := s.localSandbox(c.Request.Context(), ref.Namespace, ref.ID)
 	if err != nil || info == nil || info.PodIP == "" {
 		writeGate(c, http.StatusBadGateway, "sandbox_unavailable", ref.ID)
 		return
@@ -242,7 +242,7 @@ func hopSealedAllows(c *gin.Context, path string, ref runtimev1alpha1.GrantSandb
 
 // localSandbox finds the envd address in this cluster.
 // The session store wins. A SaFE Workload that has no Sandbox record falls through to pods.
-func (s *Server) localSandbox(ctx context.Context, sandboxID string) (*store.SandboxInfo, error) {
+func (s *Server) localSandbox(ctx context.Context, namespace, sandboxID string) (*store.SandboxInfo, error) {
 	if s.store != nil {
 		info, err := s.store.GetSandboxBySessionID(ctx, sandboxID)
 		if err == nil && info != nil && info.PodIP != "" {
@@ -255,7 +255,7 @@ func (s *Server) localSandbox(ctx context.Context, sandboxID string) (*store.San
 	if s.dp.pods == nil {
 		return nil, store.ErrNotFound
 	}
-	ip, port, err := s.dp.pods(ctx, sandboxID)
+	ip, port, err := s.dp.pods(ctx, namespace, sandboxID)
 	if err != nil {
 		return nil, err
 	}
@@ -296,10 +296,11 @@ func verifyHopToken(pub *rsa.PublicKey, raw, sandboxID, cluster string) (runtime
 	}
 	gotSandbox, _ := claims["sandbox_id"].(string)
 	gotCluster, _ := claims["cluster"].(string)
+	gotNamespace, _ := claims["namespace"].(string)
 	if gotSandbox == "" || gotCluster != cluster || (sandboxID != "" && gotSandbox != sandboxID) {
 		return runtimev1alpha1.GrantSandboxRef{}, errors.New("hop token does not match this sandbox")
 	}
-	ref := runtimev1alpha1.GrantSandboxRef{ID: gotSandbox}
+	ref := runtimev1alpha1.GrantSandboxRef{ID: gotSandbox, Namespace: gotNamespace}
 	if sealed, _ := claims["sealed"].(bool); sealed {
 		ref.Sealed = true
 		ref.Inputs = splitClaim(claims["inputs"])

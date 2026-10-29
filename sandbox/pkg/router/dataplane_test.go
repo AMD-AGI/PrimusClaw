@@ -121,7 +121,7 @@ func TestDataPlaneHopUsesPodFinderWhenStoreMisses(t *testing.T) {
 	crusoe := &Server{store: store.NewMemoryStore(), jwt: crusoeJWT}
 	crusoe.engine = gin.New()
 	crusoe.engine.Any("/internal/v1/dataplane/:sandboxID/*proxyPath", crusoe.handleDataPlaneHop)
-	if err := crusoe.ConfigureDataPlane("crusoe", "", string(mustPEM(t, globalJWT)), func(ctx context.Context, sandboxID string) (string, int, error) {
+	if err := crusoe.ConfigureDataPlane("crusoe", "", string(mustPEM(t, globalJWT)), func(ctx context.Context, namespace, sandboxID string) (string, int, error) {
 		if sandboxID != "sbx-1" {
 			t.Fatalf("sandbox=%s", sandboxID)
 		}
@@ -222,16 +222,16 @@ func TestDataPlaneEnvDPathReachesEnvD(t *testing.T) {
 	crusoe.engine.Any("/files", crusoe.handleLocalEnvD)
 	crusoe.engine.Any("/process.Process/*path", crusoe.handleLocalEnvD)
 	crusoe.engine.Any("/filesystem.Filesystem/ListDir", crusoe.handleLocalEnvD)
-	if err := crusoe.ConfigureDataPlane("crusoe", "", string(mustPEM(t, globalJWT)), func(ctx context.Context, sandboxID string) (string, int, error) {
+	if err := crusoe.ConfigureDataPlane("crusoe", "", string(mustPEM(t, globalJWT)), func(ctx context.Context, namespace, sandboxID string) (string, int, error) {
 		return envdHost(t, envd), envdPort(t, envd), nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	sealedToken, err := globalJWT.generateHopToken("sbx-1", "crusoe", true, []string{"/in"}, []string{"/out"})
+	sealedToken, err := globalJWT.generateHopToken("sbx-1", "crusoe", "top-models", true, []string{"/in"}, []string{"/out"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	openToken, err := globalJWT.generateHopToken("sbx-1", "crusoe", false, nil, nil)
+	openToken, err := globalJWT.generateHopToken("sbx-1", "crusoe", "top-models", false, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
