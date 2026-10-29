@@ -224,6 +224,8 @@ Type definitions live in `claw/packages/api/src/routes/a2a-types.ts` (canonical,
 | Agent Card (v1.0) | `GET /.well-known/agent-card.json` | Canonical discovery (spec §8.2) |
 | Agent Card (legacy) | `GET /.well-known/agent.json` | Pre-v1.0 fallback (kept for older SaFE scanners) |
 | JSON-RPC | `POST /a2a` | Single endpoint for all RPC methods |
+| Agent Card (one plugin) | `GET /a2a/plugins/:pluginId/.well-known/agent-card.json` | Authenticated; see "One agent per plugin" below |
+| JSON-RPC (one plugin) | `POST /a2a/plugins/:pluginId` | Same methods as `POST /a2a`, every send runs with that plugin |
 | Health | `GET /a2a/health` | K8s probe |
 | Legacy invoke | `POST /invoke[/:skill]` | SaFE Gateway backward-compat |
 
@@ -266,7 +268,22 @@ Every JSON-RPC request **must** carry `A2A-Version: 1.0` (or `?A2A-Version=1.0` 
 }
 ```
 
-The Agent Card public `url` is built from the `CLAW_PUBLIC_URL` env var.
+The card's `supportedInterfaces[].url` is absolute, because behind an ingress that strips a path prefix the path the API sees (`/a2a`) is not the path a client must call (`<prefix>/a2a`). The base is taken, in order, from:
+
+1. `CLAW_PUBLIC_URL`, when set (for example `https://claw.example.com/claw-api`);
+2. the proxy's `X-Forwarded-Host` (else `Host`), `X-Forwarded-Proto` (default `https`) and `X-Forwarded-Prefix`, when the request carries any `X-Forwarded-*` header. Each is validated (a plain host with an optional port, `http`/`https`, plain path segments) and ignored when it is not, since a client can send them when the API is reachable without a proxy. The card is served with `Vary` on these headers;
+3. nothing, in which case the URL stays relative (`/a2a`), as before.
+
+#### One agent per plugin
+
+Every plugin the caller may view is also an A2A agent of its own, with the plugin's name, description, version and skills (its skill and MCP tools) on its card:
+
+- `GET /a2a/plugins/:pluginId/.well-known/agent-card.json` returns that card. Unlike the generic card it is **authenticated** and served `Cache-Control: private, no-store`, because a private plugin's name, description and tools belong to its owner.
+- `POST /a2a/plugins/:pluginId` is the same JSON-RPC surface as `POST /a2a`. A `SendMessage` or `SendStreamingMessage` runs with that plugin, exactly as if `metadata.plugin_id` had been set; a request that sets a different `metadata.plugin_id` is refused (`-32602`) rather than silently overridden.
+- Visibility is the plugin REST API's: the owner, anyone for a public plugin, admins for all. A plugin the caller cannot view, one that does not exist and a malformed id all answer `404 plugin agent not found` on every method, so the endpoint is not an existence oracle for private plugins.
+- Tasks are still scoped to the caller (`a2a_caller_id`), not to the plugin: the generic and per-plugin endpoints see the same caller's tasks and nobody else's.
+
+`POST /a2a` is unchanged, including `metadata.plugin_id`.
 
 #### JSON-RPC method catalogue
 
@@ -505,7 +522,7 @@ SANDBOX_NAMESPACE=default
 | `AUTH_BEARER_TOKENS` | `` | Comma-separated valid tokens |
 | `EXECUTION_MODE` | `local` | `local` / `local-mcp` / `sandbox` |
 | `WORKSPACE_PATH` | `/workspace` | Root workspace for local execution |
-| `CLAW_PUBLIC_URL` | `` | Public URL for A2A agent card |
+| `CLAW_PUBLIC_URL` | `` | Externally reachable API base (scheme, host and any ingress path prefix) used for the A2A agent cards' interface URLs; empty derives it from the proxy's forwarded headers, else the card URL stays relative |
 | `MAX_CONCURRENT_TASKS` | `3` | Max parallel task executions |
 
 ### 6.2 LLM Engine

@@ -6,10 +6,10 @@ import { db, MarketplaceDb, type Querier, type StatementRunner } from "../infra/
 import { metrics } from "../infra/metrics.js";
 import { js, sc, nc } from "../infra/nats.js";
 import { sanitizeSessionEvent } from "../events/store.js";
-import { getUser } from "../auth/middleware.js";
+import { authErrorPayload, getUser } from "../auth/middleware.js";
 import { canWriteSessionAsOperator, isAdmin, type UserInfo } from "../auth/models.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
-import { resolveTaskPlugin } from "../marketplace/plugins.js";
+import { getViewablePlugin, resolveTaskPlugin } from "../marketplace/plugins.js";
 import {
   decideAdmission, envAdmitLimits, sessionTreeShape, withOwnedAdmissionLock,
   type AdmissionAsk,
@@ -24,7 +24,7 @@ import { ErrorCode, NatsError } from "nats";
 import pino from "pino";
 import { randomUUID } from "node:crypto";
 import {
-  type AgentCard, type AgentSkill, type Task, type Message,
+  type Task, type Message,
   type Part, type StreamResponse,
   type TaskStatusUpdateEvent, type TaskArtifactUpdateEvent,
   type SendMessageRequest, type GetTaskRequest, type ListTasksRequest,
@@ -39,6 +39,9 @@ import {
   makeUnsupportedOperationError, makePushNotificationNotSupportedError,
   makeTaskNotCancelableError, makeVersionNotSupportedError,
 } from "./a2a-types.js";
+import {
+  bindPluginToSend, genericAgentCard, pluginAgentCard, publicBaseUrl,
+} from "./a2a-agents.js";
 
 const logger = pino({ name: "a2a-server" });
 const SUPPORTED_A2A_VERSION = "1.0";
@@ -84,46 +87,6 @@ function validateA2AVersion(req: FastifyRequest, rpcId: string | number | null):
   }
   return null;
 }
-
-// ---------------------------------------------------------------------------
-// Agent Card — full Google A2A v1.0 spec
-// ---------------------------------------------------------------------------
-function buildAgentCard(): AgentCard {
-  const baseUrl = process.env.CLAW_PUBLIC_URL || "";
-  return {
-    name: "PrimusClaw",
-    description: "AI Agent operating system for code generation, debugging, and deployment on AMD infrastructure",
-    version: "2.0.0",
-    provider: { url: "https://www.amd.com", organization: "AMD" },
-    supportedInterfaces: [
-      {
-        url: `${baseUrl}/a2a`,
-        protocolBinding: "JSONRPC",
-        protocolVersion: "1.0",
-      },
-    ],
-    capabilities: {
-      streaming: true,
-      pushNotifications: false,
-      extendedAgentCard: false,
-    },
-    securitySchemes: {
-      bearer: { httpAuthSecurityScheme: { scheme: "bearer", description: "Bearer token authentication" } },
-    },
-    securityRequirements: [{ bearer: [] }],
-    defaultInputModes: ["text/plain", "application/json"],
-    defaultOutputModes: ["text/plain", "application/json"],
-    skills: [
-      { id: "code-generation", name: "Code Generation", description: "Generate, edit, and refactor code in any language", tags: ["code", "generation", "refactor"] },
-      { id: "debugging", name: "Debugging", description: "Debug code issues with automated root cause analysis", tags: ["debug", "error", "fix"] },
-      { id: "code-review", name: "Code Review", description: "Review code for quality, security, and best practices", tags: ["review", "security", "quality"] },
-      { id: "optimization", name: "Performance Optimization", description: "Optimize code and model inference performance on AMD GPUs", tags: ["performance", "gpu", "amd"] },
-    ] satisfies AgentSkill[],
-    iconUrl: undefined,
-  };
-}
-
-const AGENT_CARD = buildAgentCard();
 
 // ---------------------------------------------------------------------------
 // DB ↔ A2A mapping helpers
@@ -1427,13 +1390,19 @@ const PUSH_NOTIFICATION_METHODS: Set<string> = new Set([
   A2A_METHODS.DeleteTaskPushNotificationConfig,
 ]);
 
+/**
+ * @param pluginId set when the request came in on a per-plugin agent endpoint,
+ *   whose sends run with that plugin. Everything else (tasks, ownership, auth)
+ *   is exactly what the generic endpoint does.
+ */
 async function dispatch(
   rpc: JsonRpcRequest,
   req: FastifyRequest,
   reply: FastifyReply,
+  pluginId?: number,
 ): Promise<JsonRpcResponse | null> {
-  const { method, params, id } = rpc;
-  const p = (params ?? {}) as Record<string, unknown>;
+  const { method, id } = rpc;
+  let p = (rpc.params ?? {}) as Record<string, unknown>;
   const callerId = extractCallerId(req);
   if (!callerId) {
     return makeJsonRpcError(id, JSON_RPC_INVALID_REQUEST, "authentication required");
@@ -1450,6 +1419,13 @@ async function dispatch(
     platformKey: user?.platformKey || "",
     virtualKey: resolveUserLlmKey(user),
   };
+
+  if (pluginId !== undefined
+    && (method === A2A_METHODS.SendMessage || method === A2A_METHODS.SendStreamingMessage)) {
+    const bound = bindPluginToSend(p, pluginId);
+    if ("error" in bound) return makeJsonRpcError(id, JSON_RPC_INVALID_PARAMS, bound.error);
+    p = bound.params;
+  }
 
   switch (method) {
     case A2A_METHODS.SendMessage:
@@ -1481,6 +1457,85 @@ async function dispatch(
 }
 
 // ---------------------------------------------------------------------------
+// Per-plugin agents
+// ---------------------------------------------------------------------------
+
+// What a card's URL is derived from. A shared cache has to key on all of it.
+const CARD_VARY = "Host, X-Forwarded-Host, X-Forwarded-Proto, X-Forwarded-Prefix";
+
+type PluginGate =
+  | { ok: true; pluginId: number; plugin: Record<string, unknown> & { id: number } }
+  | { ok: false; status: 401 | 404; message: string };
+
+/**
+ * Whether the caller may reach the agent for the plugin `:pluginId` names.
+ *
+ * The one place the rule lives, run by every request to a per-plugin path --
+ * the card and every JSON-RPC method alike -- so no method is reachable that
+ * the card is not. Visibility is the plugin REST API's own: the owner, any
+ * caller for a public plugin, an admin for all. A malformed id, a missing
+ * plugin and a plugin the caller cannot view are one answer, because a
+ * different one for the last would tell any caller which ids are private
+ * plugins.
+ */
+async function gatePluginAgent(req: FastifyRequest, rawPluginId: string): Promise<PluginGate> {
+  const user = getUser(req);
+  if (!user?.userId) return { ok: false, status: 401, message: "authentication required" };
+  const notFound: PluginGate = { ok: false, status: 404, message: "plugin agent not found" };
+  if (!/^[1-9][0-9]{0,14}$/.test(rawPluginId)) return notFound;
+  const pluginId = Number(rawPluginId);
+  if (!Number.isSafeInteger(pluginId)) return notFound;
+  const plugin = await getViewablePlugin(pluginId, user.userId, isAdmin(user));
+  if (!plugin) return notFound;
+  return { ok: true, pluginId, plugin: { ...plugin, id: pluginId } };
+}
+
+// The JSON-RPC entry both `POST /a2a` and `POST /a2a/plugins/:pluginId` serve.
+// Registered inside the scope whose error handler maps a body parse failure to
+// -32700.
+async function serveRpc(
+  req: FastifyRequest,
+  reply: FastifyReply,
+  rawPluginId?: string,
+): Promise<JsonRpcResponse | undefined> {
+  const rpc = req.body as JsonRpcRequest | undefined;
+  if (
+    !rpc
+    || rpc.jsonrpc !== "2.0"
+    || !rpc.method
+    || rpc.id === undefined
+    || (typeof rpc.id !== "string" && typeof rpc.id !== "number" && rpc.id !== null)
+  ) {
+    return makeJsonRpcError(
+      (rpc?.id ?? null) as string | number | null,
+      JSON_RPC_INVALID_REQUEST,
+      "Request payload validation error: must include jsonrpc='2.0', method, and id",
+    );
+  }
+
+  const versionError = validateA2AVersion(req, rpc.id);
+  if (versionError) return versionError;
+
+  try {
+    let pluginId: number | undefined;
+    if (rawPluginId !== undefined) {
+      const gate = await gatePluginAgent(req, rawPluginId);
+      if (!gate.ok) {
+        reply.status(gate.status);
+        return makeJsonRpcError(rpc.id, JSON_RPC_INVALID_REQUEST, gate.message);
+      }
+      pluginId = gate.pluginId;
+    }
+    const result = await dispatch(rpc, req, reply, pluginId);
+    if (result === null) return; // SSE streaming handled inline
+    return result;
+  } catch (err: unknown) {
+    logger.error({ err, method: rpc.method }, "a2a.dispatch.unhandled");
+    return makeJsonRpcError(rpc.id, JSON_RPC_INTERNAL_ERROR, "Internal error");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Route registration
 // ---------------------------------------------------------------------------
 
@@ -1490,14 +1545,34 @@ export async function registerA2ARoutes(app: FastifyInstance): Promise<void> {
   // Spec §8.2: the canonical well-known URI in v1.0 is
   // `/.well-known/agent-card.json`. The plain `agent.json` paths are kept
   // for v0.x clients (e.g. older SaFE Gateway scanners) during transition.
-  const serveAgentCard = async (_req: FastifyRequest, reply: FastifyReply) => {
+  const serveAgentCard = async (req: FastifyRequest, reply: FastifyReply) => {
     reply.header("Access-Control-Allow-Origin", "*");
-    return AGENT_CARD;
+    reply.header("Vary", CARD_VARY);
+    return genericAgentCard(publicBaseUrl(req.headers));
   };
   app.get("/.well-known/agent-card.json", serveAgentCard);
   app.get("/a2a/.well-known/agent-card.json", serveAgentCard);
   app.get("/.well-known/agent.json", serveAgentCard); // legacy v0.x
   app.get("/a2a/.well-known/agent.json", serveAgentCard); // legacy v0.x
+
+  // === Per-plugin Agent Card (authenticated) ===
+  // Not anonymous, unlike the generic card: whether a plugin may be described
+  // at all depends on who is asking, and a private plugin's name, description
+  // and tools are its owner's. A plugin the caller cannot view answers exactly
+  // as one that does not exist.
+  app.get<{ Params: { pluginId: string } }>(
+    "/a2a/plugins/:pluginId/.well-known/agent-card.json",
+    async (req, reply) => {
+      reply.header("Vary", CARD_VARY);
+      reply.header("Cache-Control", "private, no-store");
+      const gate = await gatePluginAgent(req, req.params.pluginId);
+      if (!gate.ok) {
+        reply.status(gate.status);
+        return authErrorPayload(gate.status === 401 ? "unauthorized" : "not_found", gate.message);
+      }
+      return pluginAgentCard(publicBaseUrl(req.headers), gate.plugin);
+    },
+  );
 
   // === Health (for SaFE K8s scanner) ===
   app.get("/a2a/health", async () => ({ status: "ok", service: "claw-a2a" }));
@@ -1522,34 +1597,14 @@ export async function registerA2ARoutes(app: FastifyInstance): Promise<void> {
       reply.send(err);
     });
 
-    rpcScope.post("/a2a", async (req: FastifyRequest, reply: FastifyReply) => {
-      const rpc = req.body as JsonRpcRequest | undefined;
-      if (
-        !rpc
-        || rpc.jsonrpc !== "2.0"
-        || !rpc.method
-        || rpc.id === undefined
-        || (typeof rpc.id !== "string" && typeof rpc.id !== "number" && rpc.id !== null)
-      ) {
-        return makeJsonRpcError(
-          (rpc?.id ?? null) as string | number | null,
-          JSON_RPC_INVALID_REQUEST,
-          "Request payload validation error: must include jsonrpc='2.0', method, and id",
-        );
-      }
+    rpcScope.post("/a2a", (req: FastifyRequest, reply: FastifyReply) => serveRpc(req, reply));
 
-      const versionError = validateA2AVersion(req, rpc.id);
-      if (versionError) return versionError;
-
-      try {
-        const result = await dispatch(rpc, req, reply);
-        if (result === null) return; // SSE streaming handled inline
-        return result;
-      } catch (err: unknown) {
-        logger.error({ err, method: rpc.method }, "a2a.dispatch.unhandled");
-        return makeJsonRpcError(rpc.id, JSON_RPC_INTERNAL_ERROR, "Internal error");
-      }
-    });
+    // One agent per plugin: the same JSON-RPC surface and the same caller-scoped
+    // tasks, with every send running under the plugin named in the path.
+    rpcScope.post<{ Params: { pluginId: string } }>(
+      "/a2a/plugins/:pluginId",
+      (req, reply) => serveRpc(req, reply, req.params.pluginId),
+    );
   });
 
   // === SaFE Gateway backward-compatible endpoints ===
