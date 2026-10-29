@@ -415,6 +415,24 @@ export const NOTIFY_LINK_BASE = env("NOTIFY_LINK_BASE", "/primus-claw");
 export const CLAW_REMOTE_AGENTS_ENABLED = envBool("CLAW_REMOTE_AGENTS_ENABLED", false);
 
 /**
+ * How a connector's access token is checked (see auth/connector-token.ts). Read
+ * on each use rather than once, so what a request is judged by is what the
+ * environment says now; both only matter while remote agents and the identity
+ * client are on.
+ *
+ *   CLAW_CONNECTOR_TOKEN_AUDIENCE    the `aud` the token must name, default claw-api
+ *   CLAW_CONNECTOR_TOKEN_INTROSPECT  also ask the identity provider whether the
+ *                                    token is still active, so a revoked grant
+ *                                    stops at once instead of when the token expires
+ */
+export function connectorTokenSettings(): { audience: string; introspect: boolean } {
+  return {
+    audience: env("CLAW_CONNECTOR_TOKEN_AUDIENCE", "claw-api"),
+    introspect: envBool("CLAW_CONNECTOR_TOKEN_INTROSPECT", false),
+  };
+}
+
+/**
  * Scheduled triggers: a cron schedule that starts a run as the user who created
  * it. Off by default; when off no table is created, no route is registered and no
  * loop is started.

@@ -57,8 +57,13 @@ export async function findConnector(owner: string, connectorId: string, onlineWi
   return r.rows[0] ?? null;
 }
 
+/** Audit detail naming how the caller was authenticated, when that is known. */
+const withCredential = (detail: Record<string, unknown>, credential: string | null): Record<string, unknown> =>
+  credential ? { ...detail, credential } : detail;
+
 export async function registerConnector(
   owner: string, name: string, version: string | null, client: string | null, maxPerUser: number,
+  credential: string | null = null,
 ): Promise<Row | null> {
   return inTransaction(async (q) => {
     await lock(q, `connectors:${owner}`);
@@ -71,7 +76,7 @@ export async function registerConnector(
        RETURNING connector_id, name, created_at`,
       [randomUUID(), owner, name, version],
     )).rows[0];
-    await writeAudit(q, { owner, actor: owner, client, connectorId: row.connector_id, action: "connector.registered", detail: { name } });
+    await writeAudit(q, { owner, actor: owner, client, connectorId: row.connector_id, action: "connector.registered", detail: withCredential({ name }, credential) });
     return row;
   });
 }
@@ -281,7 +286,7 @@ export interface IngestResult {
  * session exists.
  */
 export async function ingestEvents(
-  connector: { connector_id: string; owner_user_id: string }, events: ParsedRemoteEvent[],
+  connector: { connector_id: string; owner_user_id: string }, events: ParsedRemoteEvent[], credential: string | null = null,
 ): Promise<IngestResult> {
   const owner = connector.owner_user_id;
   return inTransaction(async (q) => {
@@ -321,9 +326,9 @@ export async function ingestEvents(
         const d = (row.data ?? {}) as Record<string, any>;
         const base = { owner, actor: connector.connector_id, connectorId: connector.connector_id, agentId: owned.get(row.session_id), sessionId: row.session_id };
         if (row.type === REMOTE_EVENT_PERMISSION_REQUEST) {
-          await writeAudit(q, { ...base, action: "permission.requested", detail: { action_id: str(d.actionId), kind: str(d.kind), tool: str(d.tool, 200) } });
+          await writeAudit(q, { ...base, action: "permission.requested", detail: withCredential({ action_id: str(d.actionId), kind: str(d.kind), tool: str(d.tool, 200) }, credential) });
         } else if (row.type === REMOTE_EVENT_PERMISSION_RESOLVED) {
-          await writeAudit(q, { ...base, action: "permission.resolved", detail: { action_id: str(d.actionId), option_id: str(d.optionId), by: str(d.by) } });
+          await writeAudit(q, { ...base, action: "permission.resolved", detail: withCredential({ action_id: str(d.actionId), option_id: str(d.optionId), by: str(d.by) }, credential) });
         } else if (row.type === REMOTE_EVENT_SESSION_CLOSED) {
           closed.add(row.session_id);
         }
