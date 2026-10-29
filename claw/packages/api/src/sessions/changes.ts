@@ -373,27 +373,59 @@ function clipBytes(text: string, max: number): { text: string; cut: boolean } {
 // A credential's name, as a word that may sit inside a longer one (`DB_PASSWORD`, `--kube-token`, `api-key`).
 // `author` is not one.
 const CREDENTIAL_NAME_RE = /token|password|passwd|passphrase|secret|credentials?|api[-_]?key|access[-_]?key|private[-_]?key|auth(?!or)|bearer|cookie/i;
-/** `NAME=` / `NAME:` / `"name":` with what follows it up to the value; the name is checked in code, not in the pattern. */
-const ASSIGNMENT_NAME_RE = /\b([A-Za-z0-9_]+)["']?[^\S\n]*[:=][^\S\n]*/g;
-/** `--flag` and the characters of its name; the value, if any, is read from where the name ends. */
+// The name is a whole run of name characters, hyphens and dots included (`api-key`, `config.password`), and a run is
+// only ever started where it begins (the lookbehind): from every position inside it, a long `a.a.a.a...` would be
+// rescanned to its end each time, which is quadratic.
+// (A hyphen directly before it is a diff marker (`-TOKEN=x`) unless a name character is before that hyphen.)
+const ASSIGNMENT_NAME_RE = /(?<![A-Za-z0-9_.])(?<![A-Za-z0-9_.]-)([A-Za-z0-9_][A-Za-z0-9_.-]*)["']?[^\S\n]*[:=][^\S\n]*/g;
 const FLAG_NAME_RE = /[^\S\n](--?[A-Za-z0-9_-]+)/g;
-const ASSIGNED_VALUE_RE = /"[^"\n]*"|'[^'\n]*'|[^\s"',;]+/y;
-const FLAG_VALUE_RE = /(?:=|[^\S\n]+)("[^"\n]*"|'[^'\n]*'|[^\s"']+)/y;
+// A quoted value, with its escapes: `"a\"b"`, `'it''s'`.
+const ASSIGNED_VALUE_RE = /"(?:[^"\\\n]|\\.)*"|'(?:[^'\n]|'')*'|[^\s"',;]+/y;
+const FLAG_VALUE_RE = /(?:=|[^\S\n]+)("(?:[^"\\\n]|\\.)*"|'(?:[^'\n]|'')*'|[^\s"']+)/y;
 /** A bare value that is plainly code (a call, a member chain) and not a literal: `getPassword()`, `config.token`. */
 const CODE_LIKE_RE = /\(|^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/;
+/** A YAML block scalar header: `|`, `>-`, `|+2`. What follows it, indented, is the value. */
+const BLOCK_SCALAR_RE = /^[|>][+-]?\d*[+-]?$/;
+/** A private key in PEM form, wherever it sits and under whatever name; one that is cut off runs to the end. */
+const PEM_RE = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|(?![\s\S]))/g;
+
+/**
+ * The lines of an indented block that follow `lineEnd` in patch text, as spans to mask: a diff line is a
+ * one-character marker and then the file's line, and the block is every following line indented deeper than the
+ * line that opened it (blank lines belong to it), up to the first line that is not.
+ */
+function blockLines(text: string, keyStart: number, lineEnd: number): Array<[number, number]> {
+  const lineStart = text.lastIndexOf("\n", keyStart - 1) + 1;
+  const indent = /^[^\S\n]*/.exec(text.slice(lineStart + 1, lineEnd))?.[0].length ?? 0;
+  const spans: Array<[number, number]> = [];
+  let at = lineEnd + 1;
+  while (at <= text.length && at > 0) {
+    let end = text.indexOf("\n", at);
+    if (end < 0) end = text.length;
+    const line = text.slice(at + 1, end);
+    const lead = /^[^\S\n]*/.exec(line)![0].length;
+    const blank = lead === line.length;
+    if (!blank && (lead <= indent || text.startsWith("@@", at) || text.startsWith("diff ", at))) break;
+    if (!blank) spans.push([at + 1 + lead, end]);
+    if (end >= text.length) break;
+    at = end + 1;
+  }
+  return spans;
+}
 
 /**
  * Mask the credentials a changed file may hold, in patch text. `redactPublicJson` knows token shapes
  * (vendor prefixes, Bearer, URL userinfo) and nothing about NAMES, so `DB_PASSWORD=hunter2` or a
  * `"password": "x"` in a config file went through it untouched.
  *
- * A name that holds a credential word masks the literal that follows it: a quoted string always, a bare
- * word unless it is plainly code. A flag whose name holds one masks its value. The names are found by
- * patterns with no nested repetition and judged in code, so the cost is linear in the text however
- * it is shaped (a 64 KB line of letters, of dots, of one repeated word).
+ * A name that holds a credential word masks the literal that follows it: a quoted string always (escapes
+ * included), a bare word unless it is plainly code, and a YAML block scalar with the block under it. A flag
+ * whose name holds one masks its value. A PEM private key is masked wherever it is. The names are found by
+ * patterns with no nested repetition and judged in code, so the cost is linear in the text however it is
+ * shaped (a 64 KB line of letters, of dots, of one repeated word).
  */
 export function maskCredentialText(text: string): string {
-  const shapes = String(redactPublicJson(text) ?? "");
+  const shapes = String(redactPublicJson(text) ?? "").replace(PEM_RE, "<redacted private key>");
   const spans: Array<[number, number]> = [];
   for (const m of shapes.matchAll(ASSIGNMENT_NAME_RE)) {
     if (!CREDENTIAL_NAME_RE.test(m[1])) continue;
@@ -402,6 +434,12 @@ export function maskCredentialText(text: string): string {
     const v = ASSIGNED_VALUE_RE.exec(shapes);
     if (!v) continue;
     const quoted = v[0][0] === '"' || v[0][0] === "'";
+    if (!quoted && BLOCK_SCALAR_RE.test(v[0])) {
+      let lineEnd = shapes.indexOf("\n", from);
+      if (lineEnd < 0) lineEnd = shapes.length;
+      spans.push([from, from + v[0].length], ...blockLines(shapes, m.index, lineEnd));
+      continue;
+    }
     if (!quoted && CODE_LIKE_RE.test(v[0])) continue;
     spans.push([from, from + v[0].length]);
   }

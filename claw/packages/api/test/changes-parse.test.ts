@@ -372,6 +372,11 @@ test("the patch script quotes the repository and the file, puts them after --, a
 
 // --- credentials in a patch ----------------------------------------------------------------
 
+// The PEM markers are assembled here so that no file of this repository holds one whole: a push with a private key
+// header in it is refused by secret scanning, test fixture or not.
+const PEM_BEGIN = (kind: string) => ["-----BEGIN", kind, "KEY-----"].join(" ");
+const PEM_END = (kind: string) => ["-----END", kind, "KEY-----"].join(" ");
+
 const MASK_CASES: Array<[string, string, string]> = [
   ["an env assignment", "+DB_PASSWORD=hunter2", "hunter2"],
   ["an assignment with spaces and quotes", "+  api_key = \"s3cr3tvalue\"", "s3cr3tvalue"],
@@ -394,6 +399,30 @@ for (const [label, line, secret] of MASK_CASES) {
   });
 }
 
+test("patch text: hyphenated and dotted names, escaped quotes, block scalars and PEM blocks", () => {
+  const cases: Array<[string, string, string[], string[]]> = [
+    ["a hyphenated json key", '+{"api-key":"hunter2","x":1}', ["hunter2"], ['"x":1']],
+    ["a hyphenated yaml key", "+  'access-key': 'abc987xyz'", ["abc987xyz"], []],
+    ["a dotted property", "+my.service.password = s3cr3tvalue", ["s3cr3tvalue"], []],
+    ["an escaped double quote", '+  "password": "ab\\"cd_secret_tail"', ["cd_secret_tail"], []],
+    ["a doubled single quote", "+  secret: 'it''s_the_tail'", ["the_tail"], []],
+    ["a block scalar", "+  private_key: |\n+    line one of the key\n+    line two of the key\n+  next: kept", ["line one", "line two"], ["next: kept"]],
+    ["a folded block scalar with a chomping mark", "+secret: >-\n+  folded secret text\n+other: fine", ["folded secret"], ["other: fine"]],
+    ["a block scalar's blank line inside", "+token: |\n+  first part\n+\n+  second part\n+after: 1", ["first part", "second part"], ["after: 1"]],
+    ["a pem block under any name", `+cert = ${PEM_BEGIN("RSA PRIVATE")}\n+MIIEowIBAAKCAQEA\n+abcdef\n+${PEM_END("RSA PRIVATE")}\n+kept: yes`, ["MIIEowIBAAKCAQEA", "abcdef"], ["kept: yes"]],
+    ["a pem block that is cut off", `+${PEM_BEGIN("PRIVATE")}\n+MIIEvQIBADANBg`, ["MIIEvQIBADANBg"], []],
+  ];
+  for (const [label, line, gone, kept] of cases) {
+    const out = maskCredentialText(`diff --git a/f b/f\n@@ -1 +1 @@\n${line}\n`);
+    for (const g of gone) assert.equal(out.includes(g), false, `${label}: ${g} in ${out}`);
+    for (const k of kept) assert.ok(out.includes(k), `${label}: ${k} missing from ${out}`);
+  }
+  // A block ends at the first line that is not indented deeper; a hunk header ends it too.
+  const out = maskCredentialText("+key:\n+  password: |\n+    hidden\n+  visible: yes\n@@ -9 +9 @@\n+    not hidden\n");
+  assert.ok(out.includes("visible: yes") && out.includes("not hidden"), out);
+  assert.equal(out.includes("hidden\n+  visible"), false);
+});
+
 test("patch text: ordinary code and prose are left as they were", () => {
   const text = [
     "diff --git a/src/a.ts b/src/a.ts", "@@ -1,3 +1,4 @@", " const author = getAuthor();", "+const authors = [];", "+// the password is checked elsewhere",
@@ -408,7 +437,9 @@ test("patch text: masking is linear on a long single line of any shape, and lose
     letters: "a".repeat(N), "dots": "a.".repeat(N / 2), "dashes": "ab-".repeat(N / 3), underscores: "a_".repeat(N / 2),
     "name-like": "password".repeat(N / 8), "assignments": "k=v ".repeat(N / 4), "colons": "a:".repeat(N / 2), "flags": " --x".repeat(N / 4),
     "flag-words": " --token".repeat(N / 8), "quotes": "\"a".repeat(N / 2), "equals": "=".repeat(N), "spaces then name": " ".repeat(N / 2) + "token" + " ".repeat(N / 2),
-    "name chars then no separator": "tokenaaaa".repeat(N / 9),
+    "name chars then no separator": "tokenaaaa".repeat(N / 9), "dotted names": "password.".repeat(N / 9), "hyphenated names": "api-key-".repeat(N / 8),
+    "block scalar headers": "token: |\n  x\n".repeat(N / 14), "pem starts": PEM_BEGIN("PRIVATE").repeat(N / 27), "escapes": '"\\a'.repeat(N / 3),
+    "quote then escapes": 'password: "' + "\\a".repeat(N / 2),
   };
   for (const [label, text] of Object.entries(shapes)) {
     const t0 = Date.now();

@@ -475,10 +475,13 @@ test("C7 a patch over 64 KB is cut at 64 KB and says so; secrets in it are maske
 test("C7 a credential held under a NAME in a changed file is masked in the patch, and a 64 KB single-line change comes back at once", async () => {
   await seed();
   const app = repo("app", { ".env": "A=1\n", "min.js": "x\n" });
-  write(path.join(app, ".env"), "A=1\nDB_PASSWORD=hunter2\napi_key = \"s3cr3tvalue\"\n  password: correcthorse\nrun --kube-token kubesecret1 up\n");
+  write(path.join(app, ".env"), [
+    "A=1", "DB_PASSWORD=hunter2", 'api_key = "s3cr3tvalue"', "  password: correcthorse", "run --kube-token kubesecret1 up",
+    '{"api-key":"hyphenvalue1"}', "private_key: |", `  ${["-----BEGIN", "PRIVATE", "KEY-----"].join(" ")}`, "  MIIEvQIBADANBgkq", `  ${["-----END", "PRIVATE", "KEY-----"].join(" ")}`, 'quoted: "x"', "",
+  ].join("\n"));
   const env = await patch(app, ".env");
   assert.equal(env.status, 200, env.raw);
-  for (const secret of ["hunter2", "s3cr3tvalue", "correcthorse", "kubesecret1"]) assert.equal(env.body.patch.includes(secret), false, secret);
+  for (const secret of ["hunter2", "s3cr3tvalue", "correcthorse", "kubesecret1", "hyphenvalue1", "MIIEvQIBADANBgkq"]) assert.equal(env.body.patch.includes(secret), false, secret);
   assert.match(env.body.patch, /\+A=1|A=1/);
   // One line of 64 KB (a minified bundle): redaction must not stall the process.
   write(path.join(app, "min.js"), "a".repeat(64 * 1024) + "\n");
