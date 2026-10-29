@@ -11,6 +11,7 @@ import { resolveTaskPlugin } from "../marketplace/plugins.js";
 
 import { buildMessages } from "../sessions/context-builder.js";
 import { sessionModelFromRow } from "../sessions/session-model.js";
+import { sessionRepoFromRow } from "../sessions/session-repo.js";
 import { maybeExtractMemory, insertMemoryEntry, isMemoryActive, scanMemoryContent, maybeUpdateUserProfile } from "../memory/service.js";
 import {
   saveSkill, recordSkillFeedback,
@@ -23,7 +24,7 @@ import { appEventIdentity } from "./app-events.js";
 import { enqueueEvolutionJob } from "../marketplace/evolve-worker.js";
 import { callMemoryLLM } from "../llm/client.js";
 import { CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
-import { recordRunFinished } from "../notifications/outbox.js";
+import { recordApprovalRequested, recordRunFinished } from "../notifications/outbox.js";
 import {
   markChatRunRunning, closeChatRun, gateOwnershipEnforced, queuedMessageId,
   retireDispatchReconcileForReport,
@@ -484,6 +485,16 @@ export async function consumeEventDelivery(msg: {
       // up. Best-effort: a row left describing itself as preparing is a
       // reporting inaccuracy, and this event is not worth redelivering over.
       await markChatRunRunning(sessionId);
+    } else if (event.type === "permissionRequest" && CLAW_NOTIFICATIONS_ENABLED) {
+      // Brain is now waiting for a person to decide on a held tool call. Tell the
+      // owner's subscriptions, so the wait does not depend on someone watching the
+      // run. Best-effort like the run notifications, and idempotent: the row's
+      // key is derived from the request, so a redelivered event records nothing new.
+      try {
+        await eventNotificationPorts.recordApprovalRequested({ sessionId, event });
+      } catch (err) {
+        logger.error({ err, sessionId }, "notification.approval_record_failed");
+      }
     }
 
     msg.ack();
@@ -766,6 +777,14 @@ function runClaimOf(event: Record<string, unknown>): number | undefined {
   const raw = event.run_claim;
   return typeof raw === "number" && Number.isInteger(raw) ? raw : undefined;
 }
+
+/**
+ * What the event consumer does besides storing an event, behind a seam for the
+ * same reason as `completionPorts`: an imported binding cannot be substituted.
+ */
+export const eventNotificationPorts = {
+  recordApprovalRequested,
+};
 
 /**
  * The completion's side effects, behind a seam so a test can see which of them
@@ -1258,7 +1277,7 @@ export async function drainOldestPendingMessage(
   // session has when the message is sent on, which is what a change "from the next
   // turn" means for a turn that was already parked.
   const pending = (await db.query(
-  "SELECT id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology, (SELECT model FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_model FROM claw_pending_messages WHERE session_id = $1 ORDER BY created_at LIMIT 1",
+  "SELECT id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology, (SELECT model FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_model, (SELECT config->'repo' FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_repo FROM claw_pending_messages WHERE session_id = $1 ORDER BY created_at LIMIT 1",
   [sessionId],
 )).rows[0];
 
@@ -1347,6 +1366,9 @@ if (pending) {
   // a session with no choice, so Brain falls back on its own default.
   const pendingModel = sessionModelFromRow({ model: pending.session_model });
   if (pendingModel) task.model = pendingModel;
+  // The session's bound repository, as the immediate path attaches it.
+  const pendingRepo = sessionRepoFromRow({ repo: pending.session_repo }, sessionId);
+  if (pendingRepo) task.repo = pendingRepo;
   const credentialsReadable = await applyPendingCredentials(task, pending, {
     sessionId, userId: pendingUserId, messageId: pendingMessageId,
   });
