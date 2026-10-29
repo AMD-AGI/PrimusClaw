@@ -51,13 +51,13 @@ test("the fixed rules are the skill's rules without its steps, and they say what
 });
 
 test("nothing this feature adds names an internal product, repository or host", () => {
-  // Built from pieces so that this file does not contain what it looks for.
+  // Built from pieces so that this file does not contain what it looks for; compared as plain lower-case text, not as patterns.
   const forbidden = [
-    ["Te", "ams"], ["AMD-BRAIN", "-Internal"], ["primus-safe", ".amd.com"], ["cru", "soe"], ["dis", "patron"], ["wst", "unnel"],
-  ].map((parts) => new RegExp(parts.join(""), "i"));
+    ["te", "ams"], ["amd-brain", "-internal"], ["primus-safe", ".amd.com"], ["cru", "soe"], ["dis", "patron"], ["wst", "unnel"],
+  ].map((parts) => parts.join(""));
   for (const f of OWN_FILES) {
-    const text = readFileSync(f, "utf8");
-    for (const re of forbidden) assert.doesNotMatch(text, re, `${f} mentions ${re}`);
+    const text = readFileSync(f, "utf8").toLowerCase();
+    for (const word of forbidden) assert.equal(text.includes(word), false, `${f} mentions ${word}`);
   }
 });
 

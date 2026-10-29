@@ -11,7 +11,7 @@
  *   D  with the feature off, nothing exists
  */
 import assert from "node:assert/strict";
-import test, { after, afterEach, before, beforeEach, describe } from "node:test";
+import test, { after, afterEach, beforeEach, describe } from "node:test";
 import Fastify, { type FastifyInstance } from "fastify";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";

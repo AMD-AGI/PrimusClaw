@@ -90,9 +90,8 @@ export class FakeGithub {
     }
     const p = call.path;
     if (p === "/graphql") return json(200, { data: { repository: { pullRequest: this.graphql } } });
-    let m: RegExpExecArray | null;
-    if ((m = /^\/repos\/[^/]+\/[^/]+$/.exec(p))) return json(200, this.repo);
-    if ((m = /^\/repos\/[^/]+\/[^/]+\/pulls\/\d+$/.exec(p))) return json(200, this.pr);
+    if (/^\/repos\/[^/]+\/[^/]+$/.test(p)) return json(200, this.repo);
+    if (/^\/repos\/[^/]+\/[^/]+\/pulls\/\d+$/.test(p)) return json(200, this.pr);
     if (/\/pulls\/\d+\/files$/.test(p)) {
       const per = Number(call.query.per_page ?? 30);
       const page = Number(call.query.page ?? 1);
@@ -114,9 +113,10 @@ export class FakeGithub {
       if (this.mergeStatus !== 200) return json(this.mergeStatus, { message: this.mergeStatus === 409 ? "Head branch was modified" : "Not mergeable" });
       return json(200, { sha: "m".repeat(40), merged: true, message: "Pull Request successfully merged" });
     }
-    if ((m = /\/git\/ref\/heads\/(.+)$/.exec(p))) return json(200, { object: { sha: BASE_TIP } });
-    if ((m = /\/contents\/(.+)$/.exec(p))) {
-      const path = decodeURIComponent(m[1] as string);
+    if (/\/git\/ref\/heads\/(.+)$/.test(p)) return json(200, { object: { sha: BASE_TIP } });
+    const contents = /\/contents\/(.+)$/.exec(p);
+    if (contents) {
+      const path = decodeURIComponent(contents[1] as string);
       // Contents are read at the base tip or the base branch, never at the head.
       this.contentRefs.push(call.query.ref ?? "");
       if (this.dirs[path]) return json(200, this.dirs[path]);
