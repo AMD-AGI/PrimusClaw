@@ -404,17 +404,28 @@ func main() {
 	}
 	apiServer.WithSafeWorkloads(workloads)
 
+	routerServer, err := router.New(ctx, routerCfg, st, clientset)
+	if err != nil {
+		log.Error("router init failed", "error", err)
+		os.Exit(1)
+	}
+	if err := routerServer.ConfigureDataPlane(
+		os.Getenv(router.EnvClusterID),
+		os.Getenv(router.EnvClusterRoutes),
+		os.Getenv(router.EnvUpstreamPublicKey),
+		workloadmanager.NewPodAddressFinder(mgr.GetClient()).PodAddress,
+	); err != nil {
+		log.Error("dataplane route config failed", "error", err)
+		os.Exit(1)
+	}
+	workloads.SetRemoteClusters(routerServer.RemoteClusterIDs())
+
 	grants, err := startGrants(ctx, mgr.GetClient(), mgr.GetAPIReader(), clientset, dynamicClient, apiServer, st, workloads, wmCfg.Namespace)
 	if err != nil {
 		log.Error("grant service init failed", "error", err)
 		os.Exit(1)
 	}
 
-	routerServer, err := router.New(ctx, routerCfg, st, clientset)
-	if err != nil {
-		log.Error("router init failed", "error", err)
-		os.Exit(1)
-	}
 	if grants != nil {
 		routerServer.WithGrants(grants)
 		plane := e2b.New(e2b.Options{
