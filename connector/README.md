@@ -121,12 +121,12 @@ All of these run on your machine and fail closed.
 | Command | |
 |---|---|
 | `init` | Write a sample `agents.toml`. |
-| `login` | Device sign-in. `--key <api key>` (or `CLAW_CONNECTOR_KEY`) is for development only. |
+| `login` | Device sign-in. `--key <api key>` (or `CLAW_CONNECTOR_KEY`) is for development only. After a revocation, run it again: it connects this machine as a new connector. |
 | `run` | Connect and serve. Exit code 3 means the connector was revoked. |
 | `status [--json]` | Running or not, paused, signed in, agents, adapter processes. |
 | `pause` / `resume` | Stop every agent within a second and stay offline, or undo that. |
 | `stop` | Stop the running connector and every agent it started. |
-| `logout` | Stop, revoke the sign-in at the identity service, delete it. |
+| `logout` | Stop, revoke the sign-in at the identity service, delete it and the stored connector id. |
 
 **Kill switch.** Every adapter is started in its own process group and recorded (pid and start time) in
 `children.json`. `stop`, `pause`, a revocation and Ctrl-C signal exactly those groups: a process that is not recorded, or

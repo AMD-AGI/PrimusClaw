@@ -104,6 +104,17 @@ async function cmdInit(ctx: Ctx): Promise<number> {
 
 // --- login -----------------------------------------------------------------------------
 
+/**
+ * Forget the connector id this machine registered. An id belongs to the sign-in that registered it, and a revoked
+ * one stays revoked for good, so keeping it after a new sign-in (or a sign-out) would send every later `run` back
+ * to exit 3. Only `login` and `logout` call this, never a revocation itself: if `run` forgot its id when it was
+ * revoked, the next `run` would register a fresh connector with the same still-valid sign-in and the owner's
+ * kill switch would be undone.
+ */
+function forgetIdentity(ctx: Ctx): void {
+  fs.rmSync(identityFile(ctx.dirs), { force: true });
+}
+
 async function cmdLogin(args: string[], ctx: Ctx): Promise<number> {
   const { values } = parseArgs({
     args, strict: true,
@@ -117,6 +128,7 @@ async function cmdLogin(args: string[], ctx: Ctx): Promise<number> {
   const key = values.key ?? ctx.env.CLAW_CONNECTOR_KEY;
   if (key) {
     saveCredentials(file, { v: 1, server, kind: "key", key, saved_at: new Date().toISOString() });
+    forgetIdentity(ctx);
     ctx.out("saved a development key. This is for trying things out: a device sign-in is the normal way (omit --key).");
     return EXIT.ok;
   }
@@ -129,6 +141,7 @@ async function cmdLogin(args: string[], ctx: Ctx): Promise<number> {
     v: 1, server, kind: "device", identity_url: identityUrl, client_id: DEFAULT_CLIENT_ID,
     refresh_token: tok.refresh_token, device_name: deviceName, saved_at: new Date().toISOString(),
   });
+  forgetIdentity(ctx);
   ctx.out(`signed in as ${deviceName}. Next: claw-connector run`);
   return EXIT.ok;
 }
@@ -254,6 +267,7 @@ async function cmdLogout(ctx: Ctx): Promise<number> {
     }
   }
   fs.rmSync(file, { force: true });
+  forgetIdentity(ctx);
   ctx.out("signed out");
   return EXIT.ok;
 }

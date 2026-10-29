@@ -21,7 +21,8 @@ export class FakeClaw {
   tokens = new Set<string>(["good-token"]);
   connectorId = randomUUID();
   registered = 0;
-  revoked = false;
+  /** Rows the owner revoked. As on the real server a revoked row stays revoked for good; registering makes a new row. */
+  readonly revokedIds = new Set<string>();
   pingMs = 100;
   muted = false;
   /** Answer the next N event posts with 503. */
@@ -85,6 +86,10 @@ export class FakeClaw {
 
   get online(): boolean { return this.streams.size > 0; }
 
+  /** Whether the connector row a client registered last is revoked. */
+  get revoked(): boolean { return this.revokedIds.has(this.connectorId); }
+  set revoked(v: boolean) { if (v) this.revokedIds.add(this.connectorId); else this.revokedIds.delete(this.connectorId); }
+
   revoke(): void {
     this.revoked = true;
     for (const r of this.streams) { try { r.write(`event: revoked\ndata: {}\n\n`); r.end(); } catch { /* gone */ } }
@@ -135,11 +140,11 @@ export class FakeClaw {
     if (!m[1]) {
       if (req.method === "GET") return this.json(res, 200, { ok: true, data: [] });
       this.registered++;
-      this.revoked = false;
+      if (this.revoked) this.connectorId = randomUUID(); // a revoked row is never reused
       return this.json(res, 201, { ok: true, data: { connector_id: this.connectorId } });
     }
+    if (this.revokedIds.has(m[1])) return this.json(res, 401, { ok: false, error: "revoked" });
     if (m[1] !== this.connectorId) return this.json(res, 404, { ok: false, error: "not_found" });
-    if (this.revoked) return this.json(res, 401, { ok: false, error: "revoked" });
     const body = req.method === "POST" ? await this.readBody(req) : null;
     switch (m[2]) {
       case "heartbeat": {

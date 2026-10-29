@@ -9,7 +9,7 @@ import path from "node:path";
 import test, { describe } from "node:test";
 import { main, EXIT, type Ctx } from "../src/commands.js";
 import { processStart } from "../src/children.js";
-import { credentialsFile, pauseFile, resolveDirs } from "../src/paths.js";
+import { credentialsFile, identityFile, pauseFile, resolveDirs, type Dirs } from "../src/paths.js";
 import { sleep } from "../src/util.js";
 import { FakeClaw } from "./support/fake-claw.js";
 import { FakeIdentity } from "./support/fake-identity.js";
@@ -33,6 +33,12 @@ args = [${JSON.stringify(ADAPTER)}]
 ask_mode = "default"
 roots = [${JSON.stringify(work)}]
 ${agentEnv ? `[agents.env]\n${agentEnv}\n` : ""}`);
+};
+
+/** The connector id a previous run stored, as `run` writes it. */
+const seedIdentity = (dirs: Dirs, server: string, id = "stored-connector") => {
+  fs.mkdirSync(dirs.state, { recursive: true });
+  fs.writeFileSync(identityFile(dirs), JSON.stringify({ server, connector_id: id, cursor: 0, handled: [] }), { mode: 0o600 });
 };
 
 describe("claw-connector commands", () => {
@@ -108,7 +114,9 @@ describe("claw-connector commands", () => {
       const a = ctx(home, { fetch: ((u: any, i: any) => fetch(u, i)) as typeof fetch });
       id.interval = 0.01;
       id.pollScript = ["authorization_pending", "ok"];
+      seedIdentity(a.c.dirs, "https://claw.example/api");
       assert.equal(await main(["login", "--server", "https://claw.example/api", "--identity-url", id.url, "--name", "dev-pod"], a.c), EXIT.ok);
+      assert.equal(fs.existsSync(identityFile(a.c.dirs)), false, "a new sign-in does not inherit the connector id the last one registered");
       assert.match(a.text(), /ABCD-EFGH/);
       assert.match(a.text(), /device\?user_code=ABCD-EFGH/);
       const saved = JSON.parse(fs.readFileSync(credentialsFile(a.c.dirs), "utf8"));
@@ -126,8 +134,10 @@ describe("claw-connector commands", () => {
       const a = ctx(home);
       id.interval = 0.01;
       id.pollScript = ["access_denied"];
+      seedIdentity(a.c.dirs, "https://x.example");
       assert.equal(await main(["login", "--server", "https://x.example", "--identity-url", id.url], a.c), EXIT.failure);
       assert.match(a.errText(), /denied/);
+      assert.equal(fs.existsSync(identityFile(a.c.dirs)), true, "a login that saved nothing leaves the stored connector id alone");
       assert.equal(fs.existsSync(credentialsFile(a.c.dirs)), false);
     } finally { await id.close(); }
   });
@@ -222,6 +232,43 @@ describe("claw-connector commands", () => {
     } finally { await claw.close(); }
   });
 
+  test("revoke, then login, then run: the revocation keeps the stored id; login drops it so run registers a new connector", async () => {
+    const claw = await FakeClaw.start();
+    let connector: any;
+    let running: Promise<number> | undefined;
+    try {
+      const home = tmpdir();
+      writeConfig(home, tmpdir("w-"));
+      const timing = { heartbeatMs: 100, pausePollMs: 40 };
+      await main(["login", "--server", claw.url, "--key", "good-token"], ctx(home).c);
+      const first = ctx(home, { timing });
+      const firstRun = main(["run"], first.c);
+      await claw.until("online", () => claw.online && claw.heartbeats.length > 0);
+      const revokedId = claw.connectorId;
+      claw.revoke();
+      assert.equal(await firstRun, EXIT.revoked);
+      const idFile = identityFile(first.c.dirs);
+      assert.equal(JSON.parse(fs.readFileSync(idFile, "utf8")).connector_id, revokedId, "a revocation must not make run register a new connector on its own");
+      // Run again without logging in: the row is revoked for good, so it ends the same way, and nothing new was registered.
+      assert.equal(await main(["run"], ctx(home, { timing }).c), EXIT.revoked);
+      assert.equal(claw.registered, 1);
+      // Logging in again is the owner's decision to connect anew: it forgets the revoked id.
+      assert.equal(await main(["login", "--server", claw.url, "--key", "good-token"], ctx(home).c), EXIT.ok);
+      assert.equal(fs.existsSync(idFile), false);
+      const second = ctx(home, { timing, onConnector: (cn) => { connector = cn; } });
+      running = main(["run"], second.c);
+      await claw.until("online again under a new id", () => claw.registered === 2 && claw.online);
+      assert.notEqual(claw.connectorId, revokedId);
+      assert.equal(JSON.parse(fs.readFileSync(idFile, "utf8")).connector_id, claw.connectorId);
+      connector.stop();
+      assert.equal(await running, EXIT.ok);
+    } finally {
+      connector?.stop();
+      await running;
+      await claw.close();
+    }
+  });
+
   test("pause writes the marker and resume removes it; with nothing running, pause also stops recorded leftovers", async () => {
     const home = tmpdir();
     const a = ctx(home);
@@ -296,7 +343,7 @@ describe("claw-connector commands", () => {
     }
   });
 
-  test("logout revokes the refresh token at the identity service and deletes the file", async () => {
+  test("logout revokes the refresh token at the identity service and deletes the sign-in and the stored connector id", async () => {
     const id = await FakeIdentity.start();
     try {
       const home = tmpdir();
@@ -304,7 +351,9 @@ describe("claw-connector commands", () => {
       fs.mkdirSync(path.join(home, "config"), { recursive: true });
       id.refreshTokens.add("r9");
       fs.writeFileSync(credentialsFile(a.c.dirs), JSON.stringify({ v: 1, server: "https://x.example", kind: "device", identity_url: id.url, client_id: "claw-connector", refresh_token: "r9", saved_at: "" }), { mode: 0o600 });
+      seedIdentity(a.c.dirs, "https://x.example");
       assert.equal(await main(["logout"], a.c), EXIT.ok);
+      assert.equal(fs.existsSync(identityFile(a.c.dirs)), false, "signing out also forgets the connector id");
       assert.deepEqual(id.revokedTokens, ["r9"]);
       assert.equal(id.refreshTokens.has("r9"), false);
       assert.equal(fs.existsSync(credentialsFile(a.c.dirs)), false);
