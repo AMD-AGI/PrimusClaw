@@ -14,7 +14,7 @@ import type { AddressInfo } from "node:net";
 import { IdentityExchangeRefusedError, IdentityUnavailableError, type ExchangeRequest } from "@claw/utils";
 
 import {
-  a2aApprovalHold, addPeer, handleA2ACall, initA2ARegistry, parseA2AAgents, resolvePeer, streamBudgetMs, type A2ACallOptions,
+  a2aApprovalHold, addPeer, handleA2ACall, initA2ARegistry, parseA2AAgents, resolvePeer, scrubCredentials, streamBudgetMs, type A2ACallOptions,
 } from "../src/clients/a2a.js";
 import { HitlController } from "../src/agent/hitl.js";
 import type { NatsDecisionMessage } from "../src/delivery/decision-dispatcher.js";
@@ -651,6 +651,70 @@ test("an entry cannot ask for both ways to authenticate, and a misspelt key is r
     assert.equal(r.errors.length, 1, what);
     assert.match(r.errors[0], want, what);
   }
+});
+
+// ── A peer's words never carry the peer's own credential into the model's context ──
+
+test("a peer that echoes the credential it was sent cannot put it in front of the model", async () => {
+  const echoes: Array<[string, (token: string) => string]> = [
+    ["as it arrived", (t) => `Authorization: Bearer ${t}`],
+    ["base64", (t) => Buffer.from(t).toString("base64")],
+    ["base64url", (t) => Buffer.from(t).toString("base64url")],
+    ["URL-encoded", (t) => encodeURIComponent(t)],
+  ];
+  const TOKEN = "svc/token+sentinel==with.odd:chars-9f3a";
+  process.env.A2A_TEST_TOKEN = TOKEN;
+  try {
+    for (const [how, echo] of echoes) {
+      const p = await standardPeer({
+        card: ({ origin }) => card(origin, [jsonrpc(`${origin}/rpc`)], { description: `card says ${echo(TOKEN)}` }),
+        rpc: (req, res, seen) => {
+          const auth = String(req.headers.authorization ?? "").replace(/^Bearer /, "");
+          const said = echo(auth);
+          const m = seen.rpc?.method;
+          if (m === "GetTask") return rpcError(res, -32001, `no such task, and your token was ${said}`);
+          const s = sse(res);
+          s.event({ task: { id: "t-e", contextId: "c-e", status: { state: "TASK_STATE_WORKING", message: { parts: [{ text: `status ${said}` }] } } } });
+          s.event({ artifactUpdate: { taskId: "t-e", artifact: { artifactId: "a", parts: [{ text: `artifact ${said}` }] } } });
+          s.event({ statusUpdate: { taskId: "t-e", status: { state: "TASK_STATE_FAILED", message: { parts: [{ text: `failure ${said}` }] } } } });
+          s.end();
+        },
+      });
+      registry([entry(p, { auth_env: "A2A_TEST_TOKEN" })]);
+      const outs = [
+        await call({ message: "x" }),
+        await call({ mode: "get", task_id: "t" }),
+        await call({ mode: "discover" }),
+      ];
+      for (const out of outs) assert.ok(!out.includes(echo(TOKEN)) && !out.includes(TOKEN), `${how}: the credential reached the result: ${out.slice(0, 200)}`);
+      assert.match(outs[0], /artifact .*\[credential removed\]/, `${how}: the rest of what the peer said is still there`);
+      assert.match(outs[1], /your token was .*\[credential removed\]/, how);
+      assert.match(outs[2], /card says .*\[credential removed\]/, how);
+    }
+  } finally {
+    delete process.env.A2A_TEST_TOKEN;
+  }
+});
+
+test("the same holds for an identity token, which the peer is sent per call", async () => {
+  const p = await standardPeer({
+    rpc: (req, res) => {
+      const auth = String(req.headers.authorization ?? "").replace(/^Bearer /, "");
+      const s = sse(res);
+      s.event({ task: { id: "t-i", status: { state: "TASK_STATE_COMPLETED" }, artifacts: [{ artifactId: "a", parts: [{ text: `you are ${auth}` }] }] } });
+      s.end();
+    },
+  });
+  registry([entry(p, AUDIENCE_ENTRY)]);
+  const out = await call({ message: "x" }, { identity: fakeIdentity(() => "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1In0.signature-sentinel"), userId: "u" });
+  assert.ok(!out.includes("signature-sentinel"));
+  assert.match(out, /you are \[credential removed\]/);
+});
+
+test("scrubCredentials leaves a short value alone (it would mangle ordinary words) and removes every occurrence", () => {
+  assert.equal(scrubCredentials("the token is abc and abc again", new Set(["abc"])), "the token is abc and abc again");
+  assert.equal(scrubCredentials("x SECRET-TOKEN-1 y SECRET-TOKEN-1", new Set(["SECRET-TOKEN-1"])), "x [credential removed] y [credential removed]");
+  assert.equal(scrubCredentials("nothing here", new Set(["SECRET-TOKEN-1"])), "nothing here");
 });
 
 // ── Per-user entries (room for them) ────────────────────────────────────────

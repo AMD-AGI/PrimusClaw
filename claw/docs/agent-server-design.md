@@ -478,6 +478,11 @@ another's.
   A named variable that is empty makes the peer uncallable (the call fails, it is never sent unauthenticated).
 - Neither: no `Authorization` at all.
 
+Whatever a peer writes back (its artifacts, status messages, errors and card) is read by the model, so what
+`a2a_call` returns has the credentials that call sent removed (`[credential removed]`), as sent, JSON-escaped,
+URL-encoded or base64. A peer that re-encodes a credential further has still only echoed what it was given; this
+keeps it out of the model's context, it does not make a peer that holds it harmless.
+
 **What the model gets.** JSON, `{state, task_id, context_id, text, artifacts, input_required?, note?}`. `state`
 is the task's state without the proto prefix (`submitted`, `working`, `input_required`, `auth_required`,
 `completed`, `failed`, `canceled`, `rejected`). `text` is the peer's answer (the text of its artifacts; for a

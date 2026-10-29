@@ -278,7 +278,8 @@ export class AgentEngine {
     ]);
     // With a2a_call on, an allow that answers a peer's approval request is held for the user
     // (a2aApprovalHold). Nothing else changes: calls the policies do not name stay as they were.
-    const anyApproval = approval.active || bashPolicy.active || A2A_CLIENT_ENABLED;
+    const policyActive = approval.active || bashPolicy.active;
+    const anyApproval = policyActive || A2A_CLIENT_ENABLED;
     const decisions = anyApproval && extras?.natsConnection
       ? new DecisionDispatcher(extras.natsConnection, sessionId)
       : null;
@@ -288,6 +289,8 @@ export class AgentEngine {
           autoApprovalRule: (t, input) => approval.autoApprovalRule(t, input),
           requireApprovalFor: (t, input) =>
             t.toLowerCase() === "bash" ? bashPolicy.check(input.command) : a2aApprovalHold(t, input),
+          // Without a policy of the operator's the controller exists only for that hold.
+          onlyHeld: !policyActive,
         })
       : undefined;
 

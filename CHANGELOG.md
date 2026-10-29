@@ -43,6 +43,7 @@ record it.
   `card_url`, and either `audience` (and optionally `scope`) -- Brain exchanges a short-lived token for the
   session's user at primus-identity (`user_id:<owner>`, RFC 8693) and calls the peer as them; the token stays in
   the Brain process -- or `auth_env` as before (a service credential, the peer sees Claw rather than the user).
+  What a peer writes back is scrubbed of the credentials the call sent before the model reads it.
   An entry with a key it does not know, or with both `auth_env` and `audience`, is refused. The tool's `skill`
   parameter, which nothing read, is gone. With the switch off the prompt also loses its "A2A Auth" line.
   See `claw/docs/agent-server-design.md`, "Outbound `a2a_call`".

@@ -341,6 +341,11 @@ export interface A2ACallOptions {
   cancelOnAbort?: (reason: unknown) => boolean;
   /** Filled with whether the call did the work asked of it; see ToolRouter.route's `outcome`. */
   outcome?: { isError: boolean };
+  /**
+   * Every credential this call sent a peer, filled in as they are used. Whatever the peer writes back
+   * is peer-authored text that reaches the model, so what leaves handleA2ACall is scrubbed of these.
+   */
+  sentCredentials?: Set<string>;
   /** Overrides, for tests: the identity client, and the stream's timing. */
   identity?: A2AIdentitySource | null;
   idleTimeoutMs?: number;
@@ -420,6 +425,7 @@ async function authorizedFetch(
 ): Promise<PeerResponse> {
   for (let attempt = 0; ; attempt++) {
     const bearer = await peerBearer(peer, opts, attempt > 0);
+    if (bearer) opts.sentCredentials?.add(bearer);
     const headers = bearer ? { ...init.headers, Authorization: `Bearer ${bearer}` } : init.headers;
     const res = await peerFetch(peer, url, { ...init, headers });
     if (res.status === 401 && peer.audience && attempt === 0) {
@@ -439,7 +445,13 @@ async function authorizedFetch(
 // held. A card behind identity is per user, so those entries are keyed by user: one
 // user's view of a private agent is never served to another.
 // ---------------------------------------------------------------------------
-interface CardEntry { card: AgentCard; etag?: string; freshUntilMs: number }
+interface CardEntry {
+  card: AgentCard;
+  etag?: string;
+  freshUntilMs: number;
+  /** What the peer was sent when it gave us this card: it may have echoed it into the card, and a cached card outlives the call. */
+  credentials: Set<string>;
+}
 
 const cardCache = new Map<string, CardEntry>();
 const CARD_CACHE_MAX = 500;
@@ -474,7 +486,13 @@ function joinSignals(...signals: Array<AbortSignal | undefined>): AbortSignal {
 export async function discoverAgent(peer: A2APeer, opts: A2ACallOptions = {}, timeoutMs = DISCOVER_TIMEOUT_MS): Promise<AgentCard> {
   const key = cardKey(peer, opts);
   const held = cardCache.get(key);
-  if (held && Date.now() < held.freshUntilMs) return held.card;
+  const remember = (creds: Iterable<string>): void => { for (const c of creds) opts.sentCredentials?.add(c); };
+  if (held && Date.now() < held.freshUntilMs) {
+    remember(held.credentials);
+    return held.card;
+  }
+  const used = new Set<string>(held?.credentials);
+  const fetching: A2ACallOptions = { ...opts, sentCredentials: used };
 
   // A peer given only as a base URL also answers to the pre-v1.0 card path.
   const candidates = isBareUrlPeer(peer)
@@ -484,12 +502,13 @@ export async function discoverAgent(peer: A2APeer, opts: A2ACallOptions = {}, ti
   for (const url of candidates) {
     let res: PeerResponse;
     try {
-      res = await authorizedFetch(peer, opts, url, {
+      res = await authorizedFetch(peer, fetching, url, {
         method: "GET",
         headers: { Accept: "application/json", ...(held?.etag ? { "If-None-Match": held.etag } : {}) },
         signal: joinSignals(AbortSignal.timeout(timeoutMs), opts.signal),
       });
     } catch (err) {
+      remember(used);
       if (opts.signal?.aborted) throw err;
       if (held) {
         // The card changes rarely and only decides where to call; the call itself is judged on its own.
@@ -498,9 +517,11 @@ export async function discoverAgent(peer: A2APeer, opts: A2ACallOptions = {}, ti
       }
       throw err;
     }
+    remember(used);
     if (res.status === 304 && held) {
       await res.body?.cancel().catch(() => {});
       held.freshUntilMs = Date.now() + (cardTtlMs(res) ?? 0);
+      held.credentials = used;
       return held.card;
     }
     if (res.ok) {
@@ -513,7 +534,7 @@ export async function discoverAgent(peer: A2APeer, opts: A2ACallOptions = {}, ti
           const oldest = cardCache.keys().next().value;
           if (oldest !== undefined) cardCache.delete(oldest);
         }
-        cardCache.set(key, { card, etag: res.headers.get("etag") ?? undefined, freshUntilMs: Date.now() + ttl });
+        cardCache.set(key, { card, etag: res.headers.get("etag") ?? undefined, freshUntilMs: Date.now() + ttl, credentials: used });
       }
       return card;
     }
@@ -864,6 +885,34 @@ async function concludeStream(
 }
 
 // ---------------------------------------------------------------------------
+// A peer's words are not trusted with the peer's own credential. A peer can write the
+// Authorization header it was sent into an artifact, a status message, an error or its
+// card, and all of that is read by the model, which could then hand it to another tool.
+// What leaves the handler has the credentials this call sent removed, in the spellings
+// a peer can cheaply give them (as is, JSON-escaped, URL-encoded, base64 and base64url).
+// A peer that re-encodes it further has already held the credential it was given; this
+// keeps it out of the model's context, it does not make a peer that holds it harmless.
+// ---------------------------------------------------------------------------
+const MIN_SCRUBBED_CREDENTIAL = 8;
+
+export function scrubCredentials(text: string, sent: ReadonlySet<string>): string {
+  let out = text;
+  for (const token of sent) {
+    if (token.length < MIN_SCRUBBED_CREDENTIAL) continue;
+    const forms = new Set<string>([
+      token,
+      JSON.stringify(token).slice(1, -1),
+      encodeURIComponent(token),
+      Buffer.from(token).toString("base64"),
+      Buffer.from(token).toString("base64").replace(/=+$/, ""),
+      Buffer.from(token).toString("base64url"),
+    ]);
+    for (const form of forms) if (form) out = out.split(form).join("[credential removed]");
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // a2a_call tool handler — used by ToolRouter
 // ---------------------------------------------------------------------------
 const MODES = ["stream", "fire_and_forget", "discover", "get", "cancel"] as const;
@@ -896,6 +945,12 @@ export function a2aApprovalHold(tool: string, input: Record<string, unknown>): s
 }
 
 export async function handleA2ACall(input: Record<string, unknown>, opts: A2ACallOptions = {}): Promise<string> {
+  const sent = new Set<string>();
+  const out = await runA2ACall(input, { ...opts, sentCredentials: sent });
+  return sent.size > 0 ? scrubCredentials(out, sent) : out;
+}
+
+async function runA2ACall(input: Record<string, unknown>, opts: A2ACallOptions): Promise<string> {
   const agent = text(input, "agent");
   const mode = (text(input, "mode") ?? "stream") as Mode;
   const message = text(input, "message");
@@ -948,7 +1003,7 @@ export async function handleA2ACall(input: Record<string, unknown>, opts: A2ACal
     if (opts.signal?.aborted) {
       return renderResult({ state: "canceled", text: "", artifacts: [], note: "The run was stopped during the call." });
     }
-    const msg = describeError(err);
+    const msg = scrubCredentials(describeError(err), opts.sentCredentials ?? new Set());
     logger.error({ agent, mode, err: msg, sessionId: opts.sessionId }, "a2a_call failed");
     return fail(`A2A call to "${agent}" failed: ${msg}`);
   }
