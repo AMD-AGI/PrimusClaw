@@ -26,11 +26,13 @@ export interface HandsBashStub {
   refused: number;
   /** While true, a `tools/call` request is answered by dropping the connection (a sandbox that dies mid-command). */
   dropToolCalls: boolean;
+  /** Close every connection the server holds idle, the way its own idle timeout would, and return how many were. */
+  dropIdleConnections(): number;
   close(): Promise<void>;
 }
 
 export async function startHandsBashStub(opts: { token: string; env: Record<string, string>; dropToolCalls?: boolean }): Promise<HandsBashStub> {
-  const stub: HandsBashStub = { url: "", token: opts.token, commands: [], headers: [], refused: 0, dropToolCalls: opts.dropToolCalls === true, close: async () => {} };
+  const stub: HandsBashStub = { url: "", token: opts.token, commands: [], headers: [], refused: 0, dropToolCalls: opts.dropToolCalls === true, dropIdleConnections: () => 0, close: async () => {} };
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (c) => chunks.push(c));
@@ -74,6 +76,9 @@ export async function startHandsBashStub(opts: { token: string; env: Record<stri
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   stub.url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/mcp`;
+  const sockets = new Set<import("node:net").Socket>();
+  server.on("connection", (s) => { sockets.add(s); s.on("close", () => sockets.delete(s)); });
+  stub.dropIdleConnections = () => { const n = sockets.size; server.closeIdleConnections(); return n; };
   stub.close = () => new Promise<void>((resolve) => { server.closeAllConnections?.(); server.close(() => resolve()); });
   return stub;
 }
