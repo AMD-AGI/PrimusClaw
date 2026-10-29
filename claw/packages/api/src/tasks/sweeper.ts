@@ -21,7 +21,7 @@
 import { interruptKeyOf } from "./lifecycle.js";
 import { commitSessionDeletion } from "../sessions/teardown.js";
 import { withCompletionLock } from "../events/completion-lock.js";
-import { db } from "../infra/db.js";
+import { db, inTransaction } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
 import { parkHandsOfSettledSessions } from "./park-settled-hands.js";
 import { backfillPlatformFacts, drainPendingPlatformFacts } from "./platform-backfill.js";
@@ -901,6 +901,14 @@ export async function reapExpiredDoorbellRuns(): Promise<number> {
 }
 
 /**
+ * No holder: the lease lapsed more than the grace ago, or its holder gave it back (`lease_owner`
+ * cleared, expiry stamped). A row nobody has taken yet has no expiry and is neither.
+ */
+const LEASE_GONE_SQL = `(lease_expires_at < NOW() - ($1::int * INTERVAL '1 second')
+        OR (lease_owner IS NULL AND lease_expires_at IS NOT NULL)
+        OR lease_expires_at IS NULL AND lease_owner IS NULL AND status IN ('cancelling','cancelled','failed'))`;
+
+/**
  * Put a task that was reopened for a finish-only dispatch back to the terminal state it had
  * (`metadata.app_finish_prior`), once its run row is `ended`. No event is published: the user
  * was told how this run ended when it ended.
@@ -913,26 +921,42 @@ export async function reapExpiredDoorbellRuns(): Promise<number> {
 async function restoreFinishOnlyTasks(extraWhere: string, params: unknown[]): Promise<ClawTaskRow[]> {
   const succeeded = `(SELECT (r.last_exit->>'final') = 'true' AND (r.last_exit->>'returncode') = '0'
                         FROM claw_app_runs r WHERE r.task_id = claw_tasks.task_id)`;
-  return applyTaskStatusTransition(
-    {
-      sql: `CASE WHEN metadata->'app_finish_prior'->>'status' = 'failed'
-                  THEN (CASE WHEN COALESCE(${succeeded}, false) THEN 'completed' ELSE 'failed' END)
-                  ELSE 'cancelled' END`,
-      terminal: true,
-    },
-    {
-      extra: { lease_owner: null, lease_expires_at: null, heartbeat_at: null, internal_token_hash: null, attempt_id: null },
-      setSql: [
-        `failure_reason = CASE WHEN COALESCE(${succeeded}, false) AND metadata->'app_finish_prior'->>'status' = 'failed'
-                              THEN NULL ELSE metadata->'app_finish_prior'->>'failure_reason' END`,
-        `error_message = CASE WHEN COALESCE(${succeeded}, false) AND metadata->'app_finish_prior'->>'status' = 'failed'
-                             THEN NULL ELSE metadata->'app_finish_prior'->>'error_message' END`,
-        "metadata = metadata - 'app_finish_prior'",
-      ],
-      where: `mode = 'app' AND metadata->'app_finish_prior' IS NOT NULL AND ${extraWhere}`,
-      params,
-    },
-  );
+  return inTransaction(async (query) => {
+    const rows = await applyTaskStatusTransition(
+      {
+        sql: `CASE WHEN metadata->'app_finish_prior'->>'status' = 'failed'
+                    THEN (CASE WHEN COALESCE(${succeeded}, false) THEN 'completed' ELSE 'failed' END)
+                    ELSE 'cancelled' END`,
+        terminal: true,
+      },
+      {
+        extra: { lease_owner: null, lease_expires_at: null, heartbeat_at: null, internal_token_hash: null, attempt_id: null },
+        setSql: [
+          `failure_reason = CASE WHEN COALESCE(${succeeded}, false) AND metadata->'app_finish_prior'->>'status' = 'failed'
+                                THEN NULL ELSE metadata->'app_finish_prior'->>'failure_reason' END`,
+          `error_message = CASE WHEN COALESCE(${succeeded}, false) AND metadata->'app_finish_prior'->>'status' = 'failed'
+                               THEN NULL ELSE metadata->'app_finish_prior'->>'error_message' END`,
+        ],
+        where: `mode = 'app' AND metadata->'app_finish_prior' IS NOT NULL AND ${extraWhere}`,
+        params,
+        query,
+      },
+    );
+    if (rows.length) {
+      // The timeline the reopen overwrote. A second statement because the status writer owns
+      // `completed_at`; the prior is dropped here, so a failure between the two is retried.
+      await query(
+        `UPDATE claw_tasks
+            SET started_at   = COALESCE((metadata->'app_finish_prior'->>'started_at')::timestamptz, started_at),
+                completed_at = COALESCE((metadata->'app_finish_prior'->>'completed_at')::timestamptz, completed_at),
+                deadline_at  = COALESCE((metadata->'app_finish_prior'->>'deadline_at')::timestamptz, deadline_at),
+                metadata     = metadata - 'app_finish_prior'
+          WHERE task_id = ANY($1::text[])`,
+        [rows.map((r) => r.task_id)],
+      );
+    }
+    return rows;
+  });
 }
 
 /** `app_finish_done`: the finish-only Brain that holds the lease says the run row is `ended`. */
@@ -954,7 +978,7 @@ export async function settleFinishedAppRun(taskId: string, brainId: string): Pro
 export async function settleEndedFinishOnlyRuns(): Promise<number> {
   const rows = await restoreFinishOnlyTasks(
     `status IN ('queued','preparing','running','cancelling','cancelled','failed')
-        AND (lease_expires_at IS NULL OR lease_expires_at < NOW() - ($1::int * INTERVAL '1 second'))
+        AND (lease_expires_at IS NULL OR ${LEASE_GONE_SQL})
         AND EXISTS (SELECT 1 FROM claw_app_runs r WHERE r.task_id = claw_tasks.task_id AND r.state = 'ended')`,
     [LEASE_LOST_GRACE_SEC],
   );
@@ -970,22 +994,12 @@ export async function settleEndedFinishOnlyRuns(): Promise<number> {
  * is left as it is (its sandbox and grant need an operator).
  */
 export async function giveUpExhaustedAppFinishes(): Promise<number> {
-  const rows = await applyTaskStatusTransition(
-    { sql: "CASE WHEN metadata->'app_finish_prior'->>'status' = 'failed' THEN 'failed' ELSE 'cancelled' END", terminal: true },
-    {
-      extra: { lease_owner: null, lease_expires_at: null, heartbeat_at: null, internal_token_hash: null, attempt_id: null },
-      setSql: [
-        "failure_reason = metadata->'app_finish_prior'->>'failure_reason'",
-        "error_message = metadata->'app_finish_prior'->>'error_message'",
-        "metadata = metadata - 'app_finish_prior'",
-      ],
-      where: `mode = 'app' AND metadata->'app_finish_prior' IS NOT NULL
-        AND status IN ('cancelling','cancelled','failed')
-        AND (lease_expires_at IS NULL OR lease_expires_at < NOW() - ($1::int * INTERVAL '1 second'))
+  const rows = await restoreFinishOnlyTasks(
+    `status IN ('cancelling','cancelled','failed')
+        AND ${LEASE_GONE_SQL}
         AND COALESCE((metadata->>'app_finish_requeues')::int, 0) >= $2::int
         AND EXISTS (SELECT 1 FROM claw_app_runs r WHERE r.task_id = claw_tasks.task_id AND r.state = 'finishing')`,
-      params: [LEASE_LOST_GRACE_SEC, APP_FINISH_REQUEUE_MAX],
-    },
+    [LEASE_LOST_GRACE_SEC, APP_FINISH_REQUEUE_MAX],
   );
   if (rows.length) {
     logger.error({ ids: rows.map((r) => r.task_id), max: APP_FINISH_REQUEUE_MAX }, "sweeper.app_finish_requeue_exhausted");
@@ -1040,14 +1054,16 @@ export async function requeueUnfinishedAppRuns(): Promise<number> {
       `metadata = jsonb_set(
          COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('app_finish_prior', COALESCE(
            metadata->'app_finish_prior',
-           jsonb_build_object('status', status, 'failure_reason', failure_reason, 'error_message', error_message))),
+           jsonb_build_object('status', status, 'failure_reason', failure_reason, 'error_message', error_message,
+                              'started_at', started_at, 'completed_at', completed_at, 'deadline_at', deadline_at))),
          '{app_finish_requeues}',
          to_jsonb(COALESCE((metadata->>'app_finish_requeues')::int, 0) + 1))`,
     ],
     where: `mode = 'app'
         AND executor = 'brain'
-        AND status IN ('cancelling','cancelled','failed')
-        AND (lease_expires_at IS NULL OR lease_expires_at < NOW() - ($1::int * INTERVAL '1 second'))
+        AND (status IN ('cancelling','cancelled','failed')
+             OR (status IN ('preparing','running') AND metadata->'app_finish_prior' IS NOT NULL))
+        AND ${LEASE_GONE_SQL}
         AND (completed_at IS NULL OR completed_at < NOW() - ($1::int * INTERVAL '1 second'))
         AND COALESCE((metadata->>'app_finish_requeues')::int, 0) < $2::int
         AND EXISTS (SELECT 1 FROM claw_app_runs r

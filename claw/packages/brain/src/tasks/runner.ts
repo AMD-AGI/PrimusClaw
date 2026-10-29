@@ -4521,6 +4521,9 @@ class TaskRunner {
       // No agent_done and no status update: the task keeps the terminal state it had.
       logger.warn({ taskId: this.request.task_id, why: err.message }, "task.app_finish_only_handed_over");
       await this.releaseAfterTerminal();
+      // Give the lease on the task row back, as every other ending does, so the sweeper hands
+      // the finish over at once rather than after the lost-lease grace as a lost worker.
+      await this.releaseAttempt().catch((e) => logger.warn({ err: String(e?.message ?? e) }, "task.app_finish_only_release_failed"));
       this.msg.ack();
       return;
     }

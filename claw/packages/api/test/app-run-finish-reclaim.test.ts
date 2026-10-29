@@ -193,4 +193,40 @@ describe("app run finishing is re-claimed", { skip }, () => {
     assert.equal(row.metadata.app_finish_prior, undefined);
     assert.equal(await sweeper.giveUpExhaustedAppFinishes(), 0, "said once");
   });
+
+  test("the reopen and the restore keep the task's own timeline (started_at, completed_at, deadline_at)", async () => {
+    await seed("finishing", { status: "cancelled" });
+    await sql(`UPDATE claw_tasks SET started_at = '2026-10-28T15:00:00Z', completed_at = NOW() - interval '1 hour',
+                      deadline_at = '2026-10-28T16:00:00Z' WHERE task_id='app-1'`);
+    const before = (await sql("SELECT started_at, completed_at, deadline_at FROM claw_tasks"))[0];
+    assert.equal(await sweeper.requeueUnfinishedAppRuns(), 1);
+    const mid = (await sql("SELECT deadline_at FROM claw_tasks"))[0];
+    assert.notEqual(new Date(mid.deadline_at).getTime(), new Date(before.deadline_at).getTime(), "reopened with a fresh deadline");
+    await sql("UPDATE claw_app_runs SET state='ended'");
+    assert.equal(await sweeper.settleEndedFinishOnlyRuns(), 1);
+    const after = (await sql("SELECT status, started_at, completed_at, deadline_at, metadata FROM claw_tasks"))[0];
+    assert.equal(after.status, "cancelled");
+    for (const k of ["started_at", "completed_at", "deadline_at"] as const) {
+      assert.equal(new Date(after[k]).getTime(), new Date(before[k]).getTime(), `${k} is the original`);
+    }
+    assert.equal(after.metadata.app_finish_prior, undefined);
+  });
+
+  test("a holder that gave the lease back is handed over at once, not after a lost-lease grace", async () => {
+    await seedFinishOnly({ prior: "cancelled", runState: "finishing", status: "preparing" });
+    // The Brain's release: owner cleared, expiry stamped now.
+    await sql("UPDATE claw_tasks SET lease_owner = NULL, lease_expires_at = NOW(), completed_at = NULL");
+    assert.equal(await sweeper.requeueUnfinishedAppRuns(), 1);
+    assert.equal((await task()).status, "queued");
+    // Control: a dispatched row nobody has taken yet is not touched.
+    await sql("UPDATE claw_tasks SET status='preparing', lease_owner = NULL, lease_expires_at = NULL");
+    assert.equal(await sweeper.requeueUnfinishedAppRuns(), 0);
+  });
+
+  test("giving up at the cap reaches the same verdict as the other restore: a successful final is completed", async () => {
+    await seedFinishOnly({ status: "failed", prior: "failed", runState: "finishing", requeues: 5,
+      lastExit: { cause: "exit", final: true, returncode: 0 } });
+    assert.equal(await sweeper.giveUpExhaustedAppFinishes(), 1);
+    assert.equal((await sql("SELECT status FROM claw_tasks"))[0].status, "completed");
+  });
 });
