@@ -35,6 +35,8 @@ interface FakeRunner {
   finishes: string[];
   /** What finishNow answers; default: a failure carrying the cause. */
   finishOutcome?: AppRunOutcome;
+  /** finishNow fails (the runner gave up after FINISH_NOW_MAX_FAILURES). */
+  finishThrows?: boolean;
   /** The platform key and epoch each createAppRunner call got, and how often the row was closed without a runner. */
   made: Array<{ platformKey: string; epoch: number }>;
   closed: string[];
@@ -50,13 +52,21 @@ function harness(runner?: FakeRunner) {
   let sandboxCalls = 0;
   let reaps = 0;
   let created = 0;
+  let runningSignals = 0;
+  let finishDone = 0;
+  const settles: unknown[][] = [];
+  let handOvers = 0;
+  const events: Array<{ type?: string }> = [];
   const kv = { async get() { return null; }, async put() { return 1; }, async delete() {} } as unknown as KV;
   const engine: Engine = {
     async execute(): Promise<ExecuteResult> { engineCalls++; throw new Error("engine must not run"); },
   };
   const sideEffects = {
     postAgentDone: (async (_r: unknown, result: ExecuteResult) => { done.push(result); }) as never,
-    postTaskRunning: (async () => undefined) as never,
+    postTaskRunning: (async () => { runningSignals++; }) as never,
+    postAppFinishDone: (async () => { finishDone++; return true; }) as never,
+    postAppFinishHandOver: (async () => { handOvers++; return true; }) as never,
+    settleRunAttempt: (async (...args: unknown[]) => { settles.push(args); }) as never,
     ensureHands: (async () => { sandboxCalls++; throw new Error("no Hands for an app run"); }) as never,
     reapPendingHands: (async () => { reaps++; }) as never,
     releaseTaskLock: (async () => { released++; }) as never,
@@ -69,15 +79,16 @@ function harness(runner?: FakeRunner) {
       return {
         markEnded: async (why: string) => { runner?.closed.push(why); return true; },
         run: async (signal: AbortSignal) => { runner!.runs++; return runner!.script(signal); },
-        finishNow: async (cause: string): Promise<AppRunOutcome> => { runner!.finishes.push(cause); return runner!.finishOutcome ?? { success: false, reason: cause }; },
+        finishNow: async (cause: string): Promise<AppRunOutcome> => { runner!.finishes.push(cause); if (runner!.finishThrows) throw new Error("finish kept failing"); return runner!.finishOutcome ?? { success: false, reason: cause }; },
       } as unknown as AppRunner;
     }) as never,
   } as unknown as Partial<TaskRunnerSideEffects>;
-  bindTaskRunnerDeps({ kv, kvCkpt: kv, emitter: { async emit() {} } as unknown as NatsEmitter, engine, sideEffects });
+  bindTaskRunnerDeps({ kv, kvCkpt: kv, emitter: { async emit(e: { type?: string }) { events.push(e); } } as unknown as NatsEmitter, engine, sideEffects });
   const msg = { info: { deliveryCount: 1 }, ack() { acked++; }, nak() {}, working() {}, term() {} } as unknown as JsMsg;
   return {
     msg, done, acked: () => acked, released: () => released, engineCalls: () => engineCalls,
     sandboxCalls: () => sandboxCalls, reaps: () => reaps, created: () => created,
+    runningSignals: () => runningSignals, finishDone: () => finishDone, events, settles, handOvers: () => handOvers,
   };
 }
 
@@ -222,4 +233,56 @@ test("A3 an unknown mode is refused, failed with its name, and never reaches the
   assert.equal(h.acked(), 1);
   assert.equal(h.released(), 1);
   assert.equal(activeAbort.has("lock.s-app"), false);
+});
+
+test("A1g a finish-only dispatch (the task already closed) ends the run row and reports no terminal state of its own", async () => {
+  const runner = fakeRunner(async () => ({ kind: "ended", outcome: { success: false, reason: "app run ended: cancelled" } }));
+  const h = harness(runner);
+  const abortCtrl = new AbortController();
+  activeAbort.set("lock.s-app", abortCtrl);
+  await runHandleTask(h.msg, { ...request("app"), app_finish_only: true } as ExecuteRequest, "s-app", "lock.s-app", "m1", "u1", abortCtrl);
+  assert.equal(runner.runs, 1);
+  assert.equal(h.done.length, 0, "no agent_done: the user was told how this run ended when it ended");
+  assert.equal(h.runningSignals(), 0, "nothing says the run is running again");
+  assert.equal(h.events.filter((e) => e.type === "statusUpdate").length, 0);
+  assert.equal(h.finishDone(), 1, "the task is handed back to its terminal state once");
+  assert.equal(h.acked(), 1);
+});
+
+async function finishOnly(runner: FakeRunner, reason: unknown, req: Partial<ExecuteRequest> = {}) {
+  const h = harness(runner);
+  const c = new AbortController();
+  activeAbort.set("lock.s-app", c);
+  runner.script = async () => { if (reason === "cancel") c.abort(); else c.abort(reason as never); return { kind: "aborted" }; };
+  await runHandleTask(h.msg, { ...request("app"), app_finish_only: true, ...req } as ExecuteRequest, "s-app", "lock.s-app", "m1", "u1", c);
+  return h;
+}
+
+test("A1h finish-only: a finish that keeps failing, or the deadline, reports no terminal state and leaves the task to the sweeper", async () => {
+  for (const reason of ["cancel", DEADLINE_EXCEEDED_ABORT_REASON]) {
+    const runner = fakeRunner(async () => ({ kind: "aborted" }));
+    runner.finishThrows = true;
+    const h = await finishOnly(runner, reason);
+    assert.equal(runner.finishes.length, 1, "the finish was attempted");
+    assert.equal(h.done.length, 0, "no agent_done for a task the user already cancelled");
+    assert.equal(h.events.filter((e) => e.type === "statusUpdate").length, 0, "no status update either");
+    assert.equal(h.finishDone(), 0, "not reported as finished");
+    assert.equal(h.acked(), 1, "the delivery is settled; the sweeper hands the finish over");
+    assert.equal(h.released(), 1);
+    const release = h.settles.filter((a) => a[0] === "t-app" && a[3] === true);
+    assert.equal(h.handOvers(), 1, "the hand-over is marked before the lease is given back");
+    assert.equal(release.length, 1, "the lease on the task row is given back (release_lease), not left to lapse");
+  }
+});
+
+test("A1i finish-only without a platform key: nothing is reported and the run row is not closed", async () => {
+  const runner = fakeRunner(async () => { throw new Error("must not run"); });
+  const h = harness(runner);
+  const c = new AbortController();
+  activeAbort.set("lock.s-app", c);
+  await runHandleTask(h.msg, { ...request("app"), app_finish_only: true, platform_key: undefined } as ExecuteRequest, "s-app", "lock.s-app", "m1", "u1", c);
+  assert.equal(runner.closed.length, 0, "the row is left for a Brain that has a key");
+  assert.equal(h.done.length, 0);
+  assert.equal(h.events.filter((e) => e.type === "statusUpdate").length, 0);
+  assert.equal(h.acked(), 1);
 });
