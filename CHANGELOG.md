@@ -87,6 +87,13 @@ record it.
   `event: revoked`) when the token does. The audit trail records which kind of credential a
   connector-side action used. Off unless remote agents and the identity client are both on. See
   `claw/docs/remote-agents.md`.
+- `connector/`, the client of remote agents: `claw-connector` runs on a user's own machine and exposes
+  their Claude Code, Codex and Cursor agents (over the Agent Client Protocol) through outbound HTTPS only.
+  Device sign-in (RFC 8628) or a development key; a per-agent directory whitelist; every session forced into
+  the agent's ask mode and the mode read back before the first prompt (a session whose mode cannot be
+  confirmed is not opened); the adapter's own permission options passed through verbatim, including
+  allow-always; credentials masked before upload; a local audit log; a kill switch that stops only the
+  process groups it started. See `connector/README.md`.
 - A shared identity client in `@claw/utils`, built by API and Brain when
   `IDENTITY_CLIENT_ENABLED=true` (off by default; it authenticates a request only through the access-token
   credentials above, a connector's and an identity provider's). It does OIDC
