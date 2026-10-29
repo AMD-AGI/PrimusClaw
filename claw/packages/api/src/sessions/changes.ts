@@ -407,7 +407,8 @@ function blockLines(text: string, keyStart: number, lineEnd: number): Array<[num
     const line = text.slice(at + 1, end);
     const lead = /^[^\S\n]*/.exec(line)![0].length;
     const blank = lead === line.length;
-    if (!blank && (lead <= indent || text.startsWith("@@", at) || text.startsWith("diff ", at))) break;
+    // A hunk header or a `diff` line has no indentation, so it ends the block like any line at the key's depth.
+    if (!blank && lead <= indent) break;
     if (!blank) spans.push([at + 1 + lead, end]);
     if (end >= text.length) break;
     at = end + 1;
