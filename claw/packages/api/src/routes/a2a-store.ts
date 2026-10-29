@@ -13,7 +13,7 @@
 
 import { db } from "../infra/db.js";
 import { sanitizeSessionEvent } from "../events/store.js";
-import type { RunEvent, RunRecord } from "./a2a-task-view.js";
+import { isTerminalRun, type RunEvent, type RunRecord } from "./a2a-task-view.js";
 
 // The event types the task view reads. A session also holds every tool output
 // and thinking block, none of which a task needs.
@@ -25,6 +25,7 @@ const VIEW_EVENTS = [
 const RUN_COLUMNS = `
   t.task_id, t.session_id, t.status, t.prompt, t.failure_reason, t.error_message,
   t.created_at, t.completed_at, t.metadata->>'message_id' AS message_id,
+  t.metadata->>'a2a_cancel_requested_at' AS cancel_requested_at,
   s.context_id`;
 
 function runOf(row: Record<string, unknown>): RunRecord {
@@ -39,6 +40,7 @@ function runOf(row: Record<string, unknown>): RunRecord {
     errorMessage: (row.error_message as string | null) ?? null,
     createdAt: row.created_at as Date,
     completedAt: (row.completed_at as Date | null) ?? null,
+    cancelRequestedAt: (row.cancel_requested_at as string | null) ?? null,
   };
 }
 
@@ -129,6 +131,11 @@ export interface ListRunsFilter {
   contextId?: string;
   /** Row statuses a state maps to; undefined for no restriction. */
   statuses?: string[];
+  /**
+   * A task the caller cancelled is CANCELED whatever its row says (see
+   * stateOfRun): `include` adds such rows to the statuses, `exclude` takes them out.
+   */
+  cancelled?: "include" | "exclude";
   after?: Date;
   cursor?: { at: Date; taskId: string };
   limit: number;
@@ -144,7 +151,11 @@ export async function listRunsForCaller(
   const params: unknown[] = [f.callerId];
   const add = (sql: string, value: unknown) => { params.push(value); where.push(sql.replace("?", `$${params.length}`)); };
   if (f.contextId) add("s.context_id = ?", f.contextId);
-  if (f.statuses) add("t.status = ANY(?::text[])", f.statuses);
+  const CANCEL_REQUESTED = "t.metadata->>'a2a_cancel_requested_at' IS NOT NULL";
+  if (f.statuses) {
+    add(f.cancelled === "include" ? `(t.status = ANY(?::text[]) OR ${CANCEL_REQUESTED})` : "t.status = ANY(?::text[])", f.statuses);
+    if (f.cancelled === "exclude") where.push(`NOT (${CANCEL_REQUESTED})`);
+  }
   if (f.after) add(`${STATUS_AT} >= ?`, f.after);
   const filter = where.join(" AND ");
   const total = Number((await db.query(
@@ -189,8 +200,7 @@ export async function settleRun(
   for (;;) {
     const run = await loadRun(taskId);
     if (!run) return null;
-    if (run.status === "completed" || run.status === "failed"
-      || run.status === "cancelled" || run.status === "cancelling") return run;
+    if (isTerminalRun(run.status, run.cancelRequestedAt)) return run;
     if (Date.now() >= deadline) return run;
     await new Promise((resolve) => setTimeout(resolve, pollMs));
   }

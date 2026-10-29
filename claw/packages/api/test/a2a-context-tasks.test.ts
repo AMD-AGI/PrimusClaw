@@ -503,6 +503,35 @@ describe("the A2A context/task model", { skip }, () => {
       assert.equal((await rpc("CancelTask", { id: r.task!.id })).json.error.code, -32002);
     });
 
+    test("a worker that finishes its answer after the stop does not un-cancel the task", async () => {
+      const r = await send("finishing anyway", { contextId: "ctx-cancel-late" });
+      const sessionId = await sessionOf(r.task!.id);
+      assert.equal((await rpc("CancelTask", { id: r.task!.id })).json.result.status.state, "TASK_STATE_CANCELED");
+      // What the consumer does with a completion that is not flagged as interrupted:
+      // the answer was already on its way, so the row is closed as completed.
+      await said(sessionId, "the late answer");
+      await finish(r.task!.id, "completed");
+      const t = (await get(r.task!.id)).result;
+      assert.equal(t.status.state, "TASK_STATE_CANCELED", "CANCELED is not overwritten");
+      assert.equal(t.artifacts[0].parts[0].text, "the late answer", "what arrived is kept");
+      const list = async (status: string) => (await rpc("ListTasks", { status })).json.result.tasks.map((x: { id: string }) => x.id);
+      assert.ok((await list("TASK_STATE_CANCELED")).includes(r.task!.id), "listed as canceled");
+      assert.equal((await list("TASK_STATE_COMPLETED")).includes(r.task!.id), false, "and not as completed");
+      assert.equal((await rpc("CancelTask", { id: r.task!.id })).json.error.code, -32002);
+      assert.equal((await rpc("SubscribeToTask", { id: r.task!.id })).json.error.code, -32004);
+      // The context is free for the next task.
+      await query("UPDATE claw_sessions SET agent_status = 'idle', agent_gate_message_id = NULL WHERE session_id = $1", [sessionId]);
+      assert.ok((await send("after", { contextId: "ctx-cancel-late" })).task);
+    });
+
+    test("a cancel on a task that finished is refused and does not mark it", async () => {
+      const r = await send("done already");
+      await finish(r.task!.id);
+      assert.equal((await rpc("CancelTask", { id: r.task!.id })).json.error.code, -32002);
+      assert.equal((await query("SELECT metadata->>'a2a_cancel_requested_at' AS c FROM claw_tasks WHERE task_id = $1", [r.task!.id])).rows[0].c, null);
+      assert.equal((await get(r.task!.id)).result.status.state, "TASK_STATE_COMPLETED");
+    });
+
     test("a finished task cannot be cancelled and nothing is sent", async () => {
       const r = await send("short");
       await finish(r.task!.id);
@@ -572,6 +601,18 @@ describe("the A2A context/task model", { skip }, () => {
       const last = events[events.length - 1].statusUpdate.status;
       assert.equal(last.state, "TASK_STATE_FAILED");
       assert.equal(last.message.parts[0].text, "worker lost");
+    });
+
+    test("a cancelled task's stream ends CANCELED even when the row was closed as completed", async () => {
+      const events = await stream(async (feed, sid) => {
+        const sessionId = await sid();
+        const taskId = String((await query("SELECT task_id FROM claw_tasks WHERE session_id = $1", [sessionId])).rows[0].task_id);
+        assert.equal((await rpc("CancelTask", { id: taskId })).json.result.status.state, "TASK_STATE_CANCELED");
+        setTimeout(() => { void finish(taskId, "completed"); }, 100);
+        feed.push({ type: "AssistantMessage", data: { content: [{ text: "late" }] } });
+        feed.push({ type: "exec_complete", final_text: "late" });
+      });
+      assert.equal(events[events.length - 1].statusUpdate.status.state, "TASK_STATE_CANCELED");
     });
 
     test("a stopped run closes as CANCELED, not COMPLETED", async () => {

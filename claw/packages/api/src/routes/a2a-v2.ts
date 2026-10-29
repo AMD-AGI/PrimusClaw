@@ -353,7 +353,7 @@ export function createA2aV2<Auth extends { userId: string }>(deps: A2aV2Deps<Aut
           // The state a caller is told is the closed row's: one who sees
           // COMPLETED and asks GetTask must not read WORKING.
           let settled = await settleRun(run.taskId, settleMs) ?? run;
-          if (!isTerminalRun(settled.status)) {
+          if (!isTerminalRun(settled.status, settled.cancelRequestedAt)) {
             settled = { ...settled, status: event.failed ? "failed" : event.interrupted ? "cancelled" : "completed" };
           }
           const view = taskOf(settled, await loadRunEvents(settled));
@@ -501,7 +501,11 @@ export function createA2aV2<Auth extends { userId: string }>(deps: A2aV2Deps<Aut
     }
 
     const statuses = params.status !== undefined ? statusesOf(params.status) : undefined;
-    const base = { callerId, contextId: params.contextId, statuses, after };
+    const base = {
+      callerId, contextId: params.contextId, statuses, after,
+      cancelled: params.status === undefined ? undefined
+        : params.status === TaskState.CANCELED ? "include" as const : "exclude" as const,
+    };
     // SUBMITTED, WORKING and INPUT_REQUIRED are one set of rows; the events tell them apart.
     const derived = params.status === TaskState.SUBMITTED || params.status === TaskState.WORKING
       || params.status === TaskState.INPUT_REQUIRED;
@@ -551,9 +555,14 @@ export function createA2aV2<Auth extends { userId: string }>(deps: A2aV2Deps<Aut
     // `cancelled`. The interrupt is addressed to the whole session, so it is sent
     // only if this statement is what moved the row: a task that finished since
     // the state was read must not take a task that has started after it down.
+    //
+    // The cancellation is written on the row too: a worker that was already
+    // finishing its answer closes the row as `completed` from its own completion,
+    // and the task the caller was told is CANCELED must stay CANCELED.
     const moved = await applyTaskStatusTransition("cancelling", {
       where: "task_id = $1 AND origin = 'a2a' AND status IN ('queued','preparing','running')",
       params: [run.taskId],
+      extra: { metadata: JSON.stringify({ a2a_cancel_requested_at: new Date().toISOString() }) },
     });
     if (moved.length) deps.nats.publish(interruptSubject(run.sessionId));
     logger.info({ taskId: run.taskId, interrupted: moved.length > 0 }, "a2a.CancelTask");

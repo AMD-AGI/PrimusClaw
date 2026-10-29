@@ -38,6 +38,13 @@ export interface RunRecord {
   errorMessage: string | null;
   createdAt: Date | string;
   completedAt: Date | string | null;
+  /**
+   * When CancelTask was accepted for the run, if it was. The cancellation is
+   * what the caller was told, and it outlives the worker: a run that was
+   * already finishing its answer when it was stopped is closed by its own
+   * completion as `completed`, and the task must not go from CANCELED to that.
+   */
+  cancelRequestedAt?: Date | string | null;
 }
 
 export type PendingInput =
@@ -173,11 +180,15 @@ export function runStarted(events: RunEvent[]): boolean {
 /**
  * The A2A state of a run.
  *
- * The row decides every terminal answer. `cancelling` already reads as
- * CANCELED: the caller asked for the stop, and a state that goes back to
- * WORKING while the worker winds down would be a task that un-cancels itself.
+ * The row decides every terminal answer, except one the caller asked for: a
+ * task the caller cancelled is CANCELED, from the moment CancelTask is accepted
+ * and for good. A state that goes back to WORKING while the worker winds down,
+ * or to COMPLETED when the in-flight answer lands after all, would be a task
+ * that un-cancels itself.
  */
-export function stateOfRun(run: Pick<RunRecord, "status">, events: RunEvent[]): TaskState {
+export function stateOfRun(run: Pick<RunRecord, "status" | "cancelRequestedAt">, events: RunEvent[]): TaskState {
+  // Before the row: a cancelled task stays cancelled whatever the worker reports after.
+  if (run.cancelRequestedAt) return TaskState.CANCELED;
   switch (run.status) {
     case "completed": return TaskState.COMPLETED;
     case "failed": return TaskState.FAILED;
@@ -193,8 +204,9 @@ export function stateOfRun(run: Pick<RunRecord, "status">, events: RunEvent[]): 
   }
 }
 
-export function isTerminalRun(status: string): boolean {
-  return status === "completed" || status === "failed" || status === "cancelled" || status === "cancelling";
+export function isTerminalRun(status: string, cancelRequestedAt?: unknown): boolean {
+  return Boolean(cancelRequestedAt)
+    || status === "completed" || status === "failed" || status === "cancelled" || status === "cancelling";
 }
 
 // ---------------------------------------------------------------------------
@@ -264,7 +276,12 @@ function failureMessage(run: RunRecord, events: RunEvent[]): Message | undefined
 
 export function artifactsOf(taskId: string, events: RunEvent[]): Artifact[] {
   const artifacts: Artifact[] = [];
-  const text = accumulatedText(events);
+  // The text the run said, or, when no message event was kept, the final text its
+  // completion carries (not a failure's, which is the status message, and not a
+  // stopped run's partial one).
+  const completion = [...events].reverse().find((e) => e.event === "exec_complete");
+  const text = accumulatedText(events)
+    || (completion && !completion.data.failed && !completion.data.interrupted ? str(completion.data.final_text) : "");
   if (text) {
     artifacts.push({
       artifactId: textArtifactId(taskId),
@@ -296,7 +313,7 @@ export function taskOf(run: RunRecord, events: RunEvent[], opts: TaskViewOptions
   const lastEventAt = iso(events.length ? events[events.length - 1].createdAt : undefined);
   const status: Task["status"] = {
     state,
-    timestamp: (isTerminalRun(run.status) ? iso(run.completedAt) : undefined)
+    timestamp: (isTerminalRun(run.status, run.cancelRequestedAt) ? iso(run.completedAt) : undefined)
       ?? lastEventAt ?? iso(run.createdAt),
   };
   if (pending) status.message = inputRequiredMessage(run, pending);

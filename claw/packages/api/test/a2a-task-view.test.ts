@@ -64,6 +64,36 @@ describe("V1 the state of a run", () => {
   for (const c of cases) {
     test(c.name, () => assert.equal(stateOfRun({ status: c.status }, c.events), c.want));
   }
+
+  // A task the caller cancelled is CANCELED for good: a worker that was already
+  // finishing its answer closes the row from its own completion, and the task
+  // must not go from CANCELED to what the worker reports.
+  const cancelled = "2026-10-29T10:00:05.000Z";
+  const stays: Array<{ name: string; status: string; events: RunEvent[] }> = [
+    { name: "cancel accepted, the row still running", status: "running", events: [started()] },
+    { name: "cancel accepted, the row cancelling", status: "cancelling", events: [] },
+    { name: "cancel accepted, the in-flight answer then lands: the row says completed", status: "completed", events: [said("late answer")] },
+    { name: "cancel accepted, the worker then fails: the row says failed", status: "failed", events: [] },
+    { name: "cancel accepted, a request is still open", status: "running", events: [approval("a1")] },
+    { name: "cancel accepted, the row cancelled", status: "cancelled", events: [] },
+  ];
+  for (const c of stays) {
+    test(c.name, () => {
+      assert.equal(stateOfRun({ status: c.status, cancelRequestedAt: cancelled }, c.events), TaskState.CANCELED);
+      assert.equal(taskOf(run({ status: c.status, cancelRequestedAt: cancelled }), c.events).status.state, TaskState.CANCELED);
+    });
+  }
+  test("no cancel on the row, a completed run is COMPLETED", () => {
+    for (const none of [undefined, null]) {
+      assert.equal(stateOfRun({ status: "completed", cancelRequestedAt: none }, []), TaskState.COMPLETED);
+    }
+  });
+  test("a cancelled task keeps what the worker said after the stop, as artifacts", () => {
+    const task = taskOf(run({ status: "completed", cancelRequestedAt: cancelled }), [said("late answer")]);
+    assert.equal(task.status.state, TaskState.CANCELED);
+    assert.equal(task.artifacts?.[0].parts[0].text, "late answer");
+    assert.equal(task.status.message, undefined, "and says nothing of a failure");
+  });
 });
 
 describe("V2 the request a run is waiting on", () => {
@@ -115,6 +145,15 @@ describe("V3 the task a caller reads", () => {
     assert.deepEqual(artifacts.map((a) => a.artifactId), ["ktsk_1-text", "ktsk_1-tools"]);
     assert.equal(artifacts[0].parts[0].text, "first\nsecond");
     assert.equal(artifacts[1].parts[0].text, "[Tool: bash] ran ls");
+  });
+
+  test("with no message event kept, a finished run's text is its completion's", () => {
+    const done = taskOf(run({ status: "completed" }), [ev("exec_complete", { final_text: "the answer" })]);
+    assert.equal(done.artifacts?.[0].parts[0].text, "the answer");
+    // Not a failure's text (that is the status message), not a stopped run's partial one, and never over what was said.
+    assert.equal(taskOf(run({ status: "failed" }), [ev("exec_complete", { final_text: "[Task failed: x]", failed: true })]).artifacts, undefined);
+    assert.equal(taskOf(run({ status: "cancelled" }), [ev("exec_complete", { final_text: "partial", interrupted: true })]).artifacts, undefined);
+    assert.equal(taskOf(run({ status: "completed" }), [said("said"), ev("exec_complete", { final_text: "other" })]).artifacts?.[0].parts[0].text, "said");
   });
 
   test("an INPUT_REQUIRED task carries the request as a text part and a data part", () => {
