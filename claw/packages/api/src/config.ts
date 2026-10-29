@@ -228,6 +228,32 @@ export const SESSION_SANDBOX_HOLD_MS = Math.min(
   BRAIN_REGISTRY_TTL_MS,
 );
 
+// --- The browser terminal ---
+// `GET /v1/sessions/:id/terminal/ws` is a WebSocket proxy to the sandbox's shell,
+// so every open terminal holds two sockets and a pod's pty for as long as it
+// lives. These bound that per replica. A limit that is slightly loose across
+// replicas still bounds the cost, which is all they are for.
+//
+// Connections: at most this many terminals open on one replica, in total and
+// for one user. Past either, the upgrade is refused with 429.
+export const TERMINAL_MAX_CONNECTIONS = envInt("TERMINAL_MAX_CONNECTIONS", 200, { min: 1, max: 100_000 });
+export const TERMINAL_MAX_CONNECTIONS_PER_USER = envInt("TERMINAL_MAX_CONNECTIONS_PER_USER", 5, { min: 1, max: 1000 });
+// A terminal with no input and no output in either direction for this long is
+// closed. Pings do not count: they only prove the sockets are alive. Output does,
+// so someone watching `top` is not cut off; a forgotten tab on `tail -f` is the
+// lifetime's to end, below.
+export const TERMINAL_IDLE_TIMEOUT_SECONDS = envInt("TERMINAL_IDLE_TIMEOUT_SECONDS", 900, { min: 10, max: 86_400 });
+// No terminal stays open longer than this, whatever is going on in it: traffic
+// does not extend it, which is what makes it a bound where the idle timeout
+// above is not (output that never stops keeps a terminal from ever being idle).
+// The shell holds the user's SaFE key, and nothing tells it that the key was
+// revoked or the session deleted; the browser reconnects with a new ticket.
+// There is no way to turn this off: 0, or anything outside 60 seconds to 7 days
+// (604800), is refused -- the default applies, and start-up reports the setting
+// as refused like any other -- because a switch that makes the shell open for as
+// long as the browser likes is the thing this exists to prevent.
+export const TERMINAL_MAX_LIFETIME_SECONDS = envInt("TERMINAL_MAX_LIFETIME_SECONDS", 28_800, { min: 60, max: 604_800 });
+
 // --- How long an idle sandbox stays reusable ---
 // Brain's setting, read here under the same name and default because the orphan
 // sweep has to agree with Brain about when an idle sandbox stops being worth

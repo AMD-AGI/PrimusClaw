@@ -5,6 +5,7 @@ import pg from "pg";
 import { APP_RUNS_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_REMOTE_AGENTS_ENABLED, CLAW_TRIGGERS_ENABLED, DATABASE_URL, envInt } from "../config.js";
 import { ensureNotificationSchema } from "../notifications/schema.js";
 import { ensureRemoteAgentSchema } from "../remote-agents/schema.js";
+import { terminalTicketsSchemaSql } from "../terminal/schema.js";
 import pino from "pino";
 import {
   REQUIRED_SCHEMA,
@@ -2242,6 +2243,10 @@ export async function initDb(): Promise<void> {
         updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
+
+    // One-time tickets for the browser terminal's WebSocket (terminal/tickets.ts).
+    // Short-lived rows, deleted by their redemption or by the next mint.
+    for (const sql of terminalTicketsSchemaSql()) await client.query(sql);
 
     // Off by default: a deployment that has not opted in gets no new tables.
     if (CLAW_NOTIFICATIONS_ENABLED) await ensureNotificationSchema(client);

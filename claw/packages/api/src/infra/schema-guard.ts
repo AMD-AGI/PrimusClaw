@@ -175,6 +175,13 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     columns: ["user_id", "enabled"],
   },
   {
+    table: "claw_terminal_tickets",
+    // Every terminal ticket is minted into it and redeemed out of it. Absent, the
+    // mint fails and no browser terminal can be opened -- while everything else
+    // answers, which is how a missing table goes unnoticed.
+    columns: ["ticket_hash", "user_id", "session_id", "sealed", "expires_at"],
+  },
+  {
     table: "claw_answer_feedback",
     // The vote routes write and delete by this key. Absent, a vote answers 500
     // for every user, on a deployment where nothing else is wrong.
