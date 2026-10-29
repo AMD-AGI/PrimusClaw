@@ -170,9 +170,15 @@ export interface APIKeySecurityScheme {
   description?: string;
 }
 
+export interface OpenIdConnectSecurityScheme {
+  openIdConnectUrl: string;
+  description?: string;
+}
+
 export type SecurityScheme =
   | { httpAuthSecurityScheme: HTTPAuthSecurityScheme }
-  | { apiKeySecurityScheme: APIKeySecurityScheme };
+  | { apiKeySecurityScheme: APIKeySecurityScheme }
+  | { openIdConnectSecurityScheme: OpenIdConnectSecurityScheme };
 
 export type SecurityRequirement = Record<string, string[]>;
 

@@ -200,6 +200,8 @@ export async function verifyIdentityAccessToken(
         if (answer.sub === sub) adopted = claimed.filter((r) => answer.roles.includes(r));
       }
     }
+    const actorSub = text((claims.act as { sub?: unknown } | undefined)?.sub);
+    const clientId = text(claims.client_id);
     const user: UserInfo = {
       userId: sub,
       userName: (text(claims.name) || text(claims.preferred_username) || text(claims.email) || sub).slice(0, MAX_SUBJECT_CHARS),
@@ -209,6 +211,14 @@ export async function verifyIdentityAccessToken(
       roles: ["default", ...adopted],
       platformKey: "",
       virtualKey: "",
+      ...(actorSub || clientId
+        ? {
+          delegation: {
+            ...(actorSub ? { actorSub: actorSub.slice(0, MAX_SUBJECT_CHARS) } : {}),
+            ...(clientId ? { clientId: clientId.slice(0, MAX_SUBJECT_CHARS) } : {}),
+          },
+        }
+        : {}),
     };
     return { status: "verified", user, method: IDENTITY_TOKEN_METHOD };
   } catch (err) {
