@@ -201,7 +201,9 @@ export async function verifyIdentityAccessToken(
       }
     }
     const actorSub = text((claims.act as { sub?: unknown } | undefined)?.sub);
-    const clientId = text(claims.client_id);
+    // Exactly as signed, not trimmed: an allowlist compares it, and `worker` and
+    // `worker ` are two clients (only a blank id is no id).
+    const clientId = typeof claims.client_id === "string" && claims.client_id.trim() !== "" ? claims.client_id : "";
     const user: UserInfo = {
       userId: sub,
       userName: (text(claims.name) || text(claims.preferred_username) || text(claims.email) || sub).slice(0, MAX_SUBJECT_CHARS),

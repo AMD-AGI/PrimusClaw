@@ -121,6 +121,8 @@ export interface CardOptions {
   contextTasks?: boolean;
   /** The identity provider's discovery document, when its tokens are accepted. */
   oidcUrl?: string;
+  /** The scope those tokens must carry (CLAW_IDENTITY_TOKEN_SCOPE); `claw.api` when unset. */
+  oidcScope?: string;
 }
 
 /** The card options this process's environment implies. */
@@ -131,7 +133,12 @@ export function cardOptionsFromEnv(env: Record<string, string | undefined> = pro
   const tokens = on("IDENTITY_CLIENT_ENABLED") && on("CLAW_IDENTITY_TOKEN_AUTH_ENABLED") && issuer !== "";
   return {
     contextTasks,
-    ...(contextTasks && tokens ? { oidcUrl: `${issuer}/.well-known/openid-configuration` } : {}),
+    ...(contextTasks && tokens
+      ? {
+        oidcUrl: `${issuer}/.well-known/openid-configuration`,
+        oidcScope: (env.CLAW_IDENTITY_TOKEN_SCOPE ?? "").trim() || "claw.api",
+      }
+      : {}),
   };
 }
 
@@ -148,14 +155,15 @@ function cardEnvelope(url: string, opts: CardOptions): Pick<
   if (opts.contextTasks) {
     securityRequirements = [{ schemes: { bearer: { list: [] } } } as unknown as Record<string, string[]>];
     if (opts.oidcUrl) {
+      const scope = opts.oidcScope || "claw.api";
       securitySchemes.identity = {
         openIdConnectSecurityScheme: {
           openIdConnectUrl: opts.oidcUrl,
-          description: "Access token from the deployment's identity provider (scope claw.api)",
+          description: `Access token from the deployment's identity provider (scope ${scope})`,
         },
       };
       securityRequirements = [
-        { schemes: { identity: { list: ["claw.api"] } } },
+        { schemes: { identity: { list: [scope] } } },
         { schemes: { bearer: { list: [] } } },
       ] as unknown as Record<string, string[]>[];
     }

@@ -58,6 +58,9 @@ describe("the actor and the client are recorded, and the user is still the user"
     ["an exchanged token names both", { act: { sub: "svc-dispatch" } }, { actorSub: "svc-dispatch", clientId: "dispatron" }],
     ["a token with no actor names its client", {}, { clientId: "dispatron" }],
     ["a token with neither says nothing", { client_id: undefined }, undefined],
+    ["a blank client id is no client id", { client_id: "   " }, undefined],
+    // Compared as signed: a padded id is another client, not the trimmed one.
+    ["a client id is kept exactly, padding included", { client_id: " dispatron " }, { clientId: " dispatron " }],
     ["a blank actor is no actor", { act: { sub: "  " } }, { clientId: "dispatron" }],
     ["an actor that is not an object is ignored", { act: "svc-dispatch" }, { clientId: "dispatron" }],
     ["an actor with a non-string sub is ignored", { act: { sub: 7 } }, { clientId: "dispatron" }],
