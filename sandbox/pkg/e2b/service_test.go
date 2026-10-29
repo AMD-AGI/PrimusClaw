@@ -710,7 +710,7 @@ func TestSealedAllowsFilesOnly(t *testing.T) {
 	if !SealedAllows(http.MethodGet, "/files?path=/out/b", true, []string{"/in"}, []string{"/out"}) {
 		t.Fatal("output read denied")
 	}
-	if SealedAllows(http.MethodGet, "/api/files?path=/out/../in/a", true, []string{"/in"}, []string{"/out"}) {
+	if SealedAllows(http.MethodGet, "/files?path=/out/../in/a", true, []string{"/in"}, []string{"/out"}) {
 		t.Fatal("traversal read allowed")
 	}
 	if SealedAllows(http.MethodPost, "/process.Process/Start", true, nil, nil) {
