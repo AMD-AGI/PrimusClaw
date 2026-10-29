@@ -200,16 +200,39 @@ func (s *Server) ReclaimSession(ctx context.Context, sessionID string) error {
 		deletedWorkload = true
 	}
 	info, err := s.store.GetSandboxBySessionID(ctx, sessionID)
-	if errors.Is(err, store.ErrNotFound) || (err != nil && deletedWorkload) {
-		return nil
-	}
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) && deletedWorkload {
+			s.recordReclaimedWorkload(ctx, &store.SandboxInfo{
+				SessionID: sessionID, SandboxName: sessionID,
+			})
+			return nil
+		}
 		return err
 	}
 	if deletedWorkload && info.Kind == store.WorkloadKind {
-		return s.store.DeleteSandboxBySessionID(ctx, sessionID)
+		if err := s.store.DeleteSandboxBySessionID(ctx, sessionID); err != nil {
+			return err
+		}
+		s.recordReclaimedWorkload(ctx, info)
+		return nil
 	}
 	return s.deleteSandboxAndSession(ctx, info, audit.ReasonGrantReclaim)
+}
+
+// recordReclaimedWorkload records a Workload deleted by its stable sandbox id.
+func (s *Server) recordReclaimedWorkload(ctx context.Context, info *store.SandboxInfo) {
+	duration := int64(0)
+	if !info.CreatedAt.IsZero() {
+		duration = time.Since(info.CreatedAt).Milliseconds()
+	}
+	s.emitAudit(ctx, &audit.AuditEvent{
+		ID: audit.NewEventID(), EventType: audit.EventDeleted,
+		SessionID: info.SessionID, SandboxName: info.SandboxName, Namespace: info.Namespace,
+		UserID: info.UserID, UserName: info.UserName,
+		Timestamp: time.Now(), DeleteReason: audit.ReasonGrantReclaim,
+		DurationMs: duration,
+	})
+	sandboxDeleteTotal.WithLabelValues(audit.ReasonGrantReclaim).Inc()
 }
 
 // emitAudit records an audit event (fire-and-forget, never blocks the caller).

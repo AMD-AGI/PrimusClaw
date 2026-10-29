@@ -5,9 +5,11 @@ package workloadmanager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,12 +21,35 @@ import (
 	dynfake "k8s.io/client-go/dynamic/fake"
 	k8stesting "k8s.io/client-go/testing"
 
+	"sigs.k8s.io/agent-sandbox/pkg/audit"
 	"sigs.k8s.io/agent-sandbox/pkg/e2b"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
 
 type cancelDeleteStore struct {
 	store.Store
+}
+
+type reclaimStore struct {
+	store.Store
+	getErr error
+}
+
+func (s reclaimStore) GetSandboxBySessionID(context.Context, string) (*store.SandboxInfo, error) {
+	return nil, s.getErr
+}
+
+type deletedAuditStore struct {
+	audit.AuditStore
+	mu     sync.Mutex
+	events []*audit.AuditEvent
+}
+
+func (s *deletedAuditStore) Store(_ context.Context, event *audit.AuditEvent) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.events = append(s.events, event)
+	return nil
 }
 
 func (s cancelDeleteStore) DeleteSandboxBySessionID(ctx context.Context, sessionID string) error {
@@ -171,6 +196,7 @@ func TestAdoptStoresTimeoutAndRunningSession(t *testing.T) {
 
 func TestReclaimSessionDeletesPendingWorkload(t *testing.T) {
 	st := store.NewMemoryStore()
+	audits := &deletedAuditStore{}
 	obj := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "amd.com/v1",
 		"kind":       "Workload",
@@ -180,9 +206,35 @@ func TestReclaimSessionDeletesPendingWorkload(t *testing.T) {
 	dc := dynfake.NewSimpleDynamicClientWithCustomListKinds(k8sruntime.NewScheme(), map[schema.GroupVersionResource]string{
 		workloadGVR: "WorkloadList",
 	}, obj)
-	srv := New(Config{Namespace: "ns"}, st).WithSafeWorkloads(NewSafeWorkloadCreator(dc, nil))
+	srv := New(Config{Namespace: "ns"}, st).WithSafeWorkloads(NewSafeWorkloadCreator(dc, nil)).WithAuditStore(audits)
 	if err := srv.ReclaimSession(context.Background(), "sbx-1"); err != nil {
 		t.Fatal(err)
+	}
+	_, err := dc.Resource(workloadGVR).Get(context.Background(), "sbx-1", metav1.GetOptions{})
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("workload remains: %v", err)
+	}
+	audits.mu.Lock()
+	defer audits.mu.Unlock()
+	if len(audits.events) != 1 || audits.events[0].EventType != audit.EventDeleted {
+		t.Fatalf("events=%+v", audits.events)
+	}
+}
+
+func TestReclaimSessionReturnsStoreFailureAfterDeletingWorkload(t *testing.T) {
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "amd.com/v1",
+		"kind":       "Workload",
+		"metadata":   map[string]any{"name": "sbx-1"},
+	}}
+	dc := dynfake.NewSimpleDynamicClientWithCustomListKinds(k8sruntime.NewScheme(), map[schema.GroupVersionResource]string{
+		workloadGVR: "WorkloadList",
+	}, obj)
+	want := errors.New("redis unavailable")
+	srv := New(Config{Namespace: "ns"}, reclaimStore{Store: store.NewMemoryStore(), getErr: want}).
+		WithSafeWorkloads(NewSafeWorkloadCreator(dc, nil))
+	if err := srv.ReclaimSession(context.Background(), "sbx-1"); !errors.Is(err, want) {
+		t.Fatalf("err=%v want=%v", err, want)
 	}
 	_, err := dc.Resource(workloadGVR).Get(context.Background(), "sbx-1", metav1.GetOptions{})
 	if !apierrors.IsNotFound(err) {
