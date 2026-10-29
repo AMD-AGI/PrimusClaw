@@ -173,11 +173,10 @@ export function createA2aV2<Auth extends { userId: string }>(deps: A2aV2Deps<Aut
    */
   async function waitForTask(run: RunRecord, historyLength: number | undefined, answered?: string): Promise<Task> {
     const deadline = Date.now() + blockingWaitMs;
-    let task = await viewOf(run, historyLength);
     for (;;) {
       const current = await loadRun(run.taskId) ?? run;
       const events = await loadRunEvents(current);
-      task = taskOf(current, events, { historyLength });
+      const task = taskOf(current, events, { historyLength });
       const state = task.status.state;
       if (TERMINAL_STATES.has(state)) return task;
       if (state === TaskState.INPUT_REQUIRED && pendingInputOf(events)?.actionId !== answered) return task;
