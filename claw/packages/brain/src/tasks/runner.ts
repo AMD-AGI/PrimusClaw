@@ -66,6 +66,11 @@ import { provisionTerminalOf } from "../sandbox/errors.js";
 import { runScript, type ScriptProgress } from "./script-runner.js";
 import { createAppRunner } from "../apps/app-runner-wiring.js";
 import { AppRunFailedError, type AppRunOutcome } from "../apps/app-runner.js";
+
+/** A finish-only run that could not finish: nothing is reported, the sweeper hands it over again. */
+class FinishOnlyHandOver extends Error {
+  constructor(why: string) { super(why); this.name = "FinishOnlyHandOver"; }
+}
 import {
   AgentDoneDeliveryError, postAgentDone, postAppFinishDone, postRunLease, postTaskRunning, sandboxForLease,
   type LeaseRenewal, type RunAttemptToken,
@@ -4387,11 +4392,17 @@ class TaskRunner {
    */
   private async executeAppRun(): Promise<void> {
     const runId = this.request.task_id;
+    const finishOnly = this.request.app_finish_only === true;
     // Not an AppRunFailedError: that means the app run is already `ended` on its row
     // (see handleRunFailure), and these two are refusals made before anything ran.
     if (!runId) throw new Error("an app run needs a task id");
     const epoch = this.heldGeneration();
     // Without it SaFE cannot be asked for anything, and every tick would fail the same way.
+    if (!this.platformKey && finishOnly) {
+      // The task is already over for the user: no terminal report. The sweeper hands the finish over again.
+      logger.error({ taskId: runId }, "task.app_finish_only_without_platform_key");
+      throw new FinishOnlyHandOver("no platform key");
+    }
     if (!this.platformKey) {
       const closed = await fx().createAppRunner(runId, "", epoch)
         .markEnded("the session owner's platform key is not available to this worker")
@@ -4409,7 +4420,6 @@ class TaskRunner {
     const runner = fx().createAppRunner(runId, this.platformKey, epoch);
     // A finish-only dispatch is not a run starting: the task is already over as far as the
     // user is concerned, so nothing says "running" and nothing reports a terminal state.
-    const finishOnly = this.request.app_finish_only === true;
     if (!finishOnly) {
       await this.onEvent({ type: "statusUpdate", agentStatus: "running" });
       await fx().postTaskRunning(this.request, { brainId: BRAIN_ID, attempt: this.attempt });
@@ -4454,6 +4464,9 @@ class TaskRunner {
         return;
       }
     }
+    // Finish-only never reports a terminal state, whatever stopped it (a finish that kept failing,
+    // the deadline): the lease lapses and the sweeper hands the finish over again.
+    if (finishOnly && !handedOver) throw new FinishOnlyHandOver(String(reason ?? "finish not completed"));
     throw reason ?? new Error("cancelled by user");
   }
 
@@ -4485,6 +4498,7 @@ class TaskRunner {
   }
 
   private failureOutcome(err: unknown): TaskOutcome {
+    if (err instanceof FinishOnlyHandOver) return "retryable";
     if (err instanceof AppRunFailedError && this.stillOwnsLock()) return "failed";
     if (this.abortCtrl.signal.reason === SIGTERM_ABORT_REASON) return "retryable";
     // `stillOwnsLock()` rather than the abort reason alone: the reason belongs
@@ -4503,6 +4517,13 @@ class TaskRunner {
   }
 
   private async handleRunFailure(err: any): Promise<void> {
+    if (err instanceof FinishOnlyHandOver) {
+      // No agent_done and no status update: the task keeps the terminal state it had.
+      logger.warn({ taskId: this.request.task_id, why: err.message }, "task.app_finish_only_handed_over");
+      await this.releaseAfterTerminal();
+      this.msg.ack();
+      return;
+    }
     if (this.abortCtrl.signal.reason === SIGTERM_ABORT_REASON) {
       await this.handleSigtermAbort();
       return;

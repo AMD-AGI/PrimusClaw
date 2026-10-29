@@ -132,4 +132,65 @@ describe("app run finishing is re-claimed", { skip }, () => {
     await sql("UPDATE claw_tasks SET metadata = jsonb_build_object('app_finish_requeues', 5)");
     assert.equal(await sweeper.requeueUnfinishedAppRuns(), 0);
   });
+
+  async function seedFinishOnly(opts: { status?: string; prior: string; runState: string; lastExit?: object; requeues?: number; leaseAgo?: number }) {
+    await seed(opts.runState, { status: opts.status ?? "preparing", leaseAgo: opts.leaseAgo ?? 3600 });
+    await sql(
+      `UPDATE claw_tasks SET completed_at = NOW() - interval '1 hour',
+              metadata = jsonb_build_object('app_finish_requeues', $2::int,
+                'app_finish_prior', jsonb_build_object('status', $1::text, 'failure_reason', 'cancelled', 'error_message', 'cancelled by user'))
+        WHERE task_id='app-1'`,
+      [opts.prior, opts.requeues ?? 1],
+    );
+    if (opts.lastExit) await sql("UPDATE claw_app_runs SET last_exit = $1::jsonb", [JSON.stringify(opts.lastExit)]);
+  }
+
+  test("the run row ended but app_finish_done never landed: the sweeper restores the cancel, before the reapers can fail it", async () => {
+    await seedFinishOnly({ prior: "cancelled", runState: "ended" });
+    // The tick's order: the settle pass is first. Run the reapers after it, as the tick does.
+    assert.equal(await sweeper.settleEndedFinishOnlyRuns(), 1);
+    await sweeper.reapLostLeases();
+    const row = (await sql("SELECT status, failure_reason, lease_owner, metadata FROM claw_tasks"))[0];
+    assert.equal(row.status, "cancelled", "not failed / worker_lost");
+    assert.equal(row.failure_reason, "cancelled");
+    assert.equal(row.metadata.app_finish_prior, undefined);
+  });
+
+  test("an application's own successful final survives: a failed task becomes completed, a cancel stays a cancel", async () => {
+    const ok = { cause: "exit", final: true, returncode: 0 };
+    await seedFinishOnly({ prior: "failed", runState: "ended", lastExit: ok });
+    assert.equal(await sweeper.settleEndedFinishOnlyRuns(), 1);
+    let row = (await sql("SELECT status, failure_reason FROM claw_tasks"))[0];
+    assert.equal(row.status, "completed");
+    assert.equal(row.failure_reason, null);
+
+    await sql("DELETE FROM claw_app_runs"); await sql("DELETE FROM claw_tasks");
+    await seedFinishOnly({ prior: "cancelled", runState: "ended", lastExit: ok });
+    await sweeper.settleEndedFinishOnlyRuns();
+    row = (await sql("SELECT status FROM claw_tasks"))[0];
+    assert.equal(row.status, "cancelled");
+
+    await sql("DELETE FROM claw_app_runs"); await sql("DELETE FROM claw_tasks");
+    await seedFinishOnly({ prior: "failed", runState: "ended", lastExit: { cause: "cancelled", final: false } });
+    await sweeper.settleEndedFinishOnlyRuns();
+    row = (await sql("SELECT status FROM claw_tasks"))[0];
+    assert.equal(row.status, "failed", "no success on the row: the prior failure stands");
+  });
+
+  test("the holder's app_finish_done also keeps a successful final", async () => {
+    await seedFinishOnly({ prior: "failed", runState: "ended", lastExit: { cause: "exit", final: true, returncode: 0 } });
+    await sql("UPDATE claw_tasks SET lease_owner='brain-B', lease_expires_at = NOW() + interval '1 minute'");
+    assert.equal(await sweeper.settleFinishedAppRun("app-1", "brain-B"), true);
+    assert.equal((await sql("SELECT status FROM claw_tasks"))[0].status, "completed");
+  });
+
+  test("at the requeue cap the task gets its prior state back and the exhaustion is not silent", async () => {
+    await seedFinishOnly({ status: "failed", prior: "cancelled", runState: "finishing", requeues: 5 });
+    assert.equal(await sweeper.requeueUnfinishedAppRuns(), 0, "not handed round again");
+    assert.equal(await sweeper.giveUpExhaustedAppFinishes(), 1);
+    const row = (await sql("SELECT status, failure_reason, metadata FROM claw_tasks"))[0];
+    assert.equal(row.status, "cancelled", "the user's cancel, not the last reaper's worker_lost");
+    assert.equal(row.metadata.app_finish_prior, undefined);
+    assert.equal(await sweeper.giveUpExhaustedAppFinishes(), 0, "said once");
+  });
 });

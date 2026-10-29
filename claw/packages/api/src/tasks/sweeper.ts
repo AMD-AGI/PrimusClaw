@@ -901,11 +901,75 @@ export async function reapExpiredDoorbellRuns(): Promise<number> {
 }
 
 /**
- * `app_finish_done`: the finish-only dispatch has ended the run row, so the task goes back to the
- * terminal state `requeueUnfinishedAppRuns` took it from. No event is published: the user was
- * told how this run ended when it ended. Only the lease holder, and only once the row is `ended`.
+ * Put a task that was reopened for a finish-only dispatch back to the terminal state it had
+ * (`metadata.app_finish_prior`), once its run row is `ended`. No event is published: the user
+ * was told how this run ended when it ended.
+ *
+ * The state restored is the prior one, except that an application that wrote a successful
+ * `final` (return code 0) keeps its own result, as on the normal path: a `failed` task becomes
+ * `completed`. A user's cancel stays a cancel. The success is read off the run row, which is
+ * where both the Brain and this sweeper can see it.
  */
+async function restoreFinishOnlyTasks(extraWhere: string, params: unknown[]): Promise<ClawTaskRow[]> {
+  const succeeded = `(SELECT (r.last_exit->>'final') = 'true' AND (r.last_exit->>'returncode') = '0'
+                        FROM claw_app_runs r WHERE r.task_id = claw_tasks.task_id)`;
+  return applyTaskStatusTransition(
+    {
+      sql: `CASE WHEN metadata->'app_finish_prior'->>'status' = 'failed'
+                  THEN (CASE WHEN COALESCE(${succeeded}, false) THEN 'completed' ELSE 'failed' END)
+                  ELSE 'cancelled' END`,
+      terminal: true,
+    },
+    {
+      extra: { lease_owner: null, lease_expires_at: null, heartbeat_at: null, internal_token_hash: null, attempt_id: null },
+      setSql: [
+        `failure_reason = CASE WHEN COALESCE(${succeeded}, false) AND metadata->'app_finish_prior'->>'status' = 'failed'
+                              THEN NULL ELSE metadata->'app_finish_prior'->>'failure_reason' END`,
+        `error_message = CASE WHEN COALESCE(${succeeded}, false) AND metadata->'app_finish_prior'->>'status' = 'failed'
+                             THEN NULL ELSE metadata->'app_finish_prior'->>'error_message' END`,
+        "metadata = metadata - 'app_finish_prior'",
+      ],
+      where: `mode = 'app' AND metadata->'app_finish_prior' IS NOT NULL AND ${extraWhere}`,
+      params,
+    },
+  );
+}
+
+/** `app_finish_done`: the finish-only Brain that holds the lease says the run row is `ended`. */
 export async function settleFinishedAppRun(taskId: string, brainId: string): Promise<boolean> {
+  const rows = await restoreFinishOnlyTasks(
+    `task_id = $1 AND status IN ('preparing','running') AND lease_owner = $2 AND lease_expires_at > NOW()
+        AND EXISTS (SELECT 1 FROM claw_app_runs r WHERE r.task_id = claw_tasks.task_id AND r.state = 'ended')`,
+    [taskId, brainId],
+  );
+  if (rows.length) logger.info({ taskId, status: rows[0]!.status }, "sweeper.app_finish_settled");
+  return rows.length > 0;
+}
+
+/**
+ * The same restore when `app_finish_done` never landed (the Brain died after the last finishing
+ * step, or the call failed): the run row is `ended`, the task still carries `app_finish_prior`,
+ * and the lease is dead. Runs BEFORE the reapers, which would otherwise close it as `worker_lost`.
+ */
+export async function settleEndedFinishOnlyRuns(): Promise<number> {
+  const rows = await restoreFinishOnlyTasks(
+    `status IN ('queued','preparing','running','cancelling','cancelled','failed')
+        AND (lease_expires_at IS NULL OR lease_expires_at < NOW() - ($1::int * INTERVAL '1 second'))
+        AND EXISTS (SELECT 1 FROM claw_app_runs r WHERE r.task_id = claw_tasks.task_id AND r.state = 'ended')`,
+    [LEASE_LOST_GRACE_SEC],
+  );
+  if (rows.length) {
+    logger.warn({ settled: rows.length, ids: rows.map((r) => r.task_id) }, "sweeper.app_finish_settled_by_sweeper");
+  }
+  return rows.length;
+}
+
+/**
+ * A run whose finish was handed over `APP_FINISH_REQUEUE_MAX` times and is still `finishing`
+ * is not handed round again. Said once, and the task gets its prior state back; the run row
+ * is left as it is (its sandbox and grant need an operator).
+ */
+export async function giveUpExhaustedAppFinishes(): Promise<number> {
   const rows = await applyTaskStatusTransition(
     { sql: "CASE WHEN metadata->'app_finish_prior'->>'status' = 'failed' THEN 'failed' ELSE 'cancelled' END", terminal: true },
     {
@@ -915,16 +979,18 @@ export async function settleFinishedAppRun(taskId: string, brainId: string): Pro
         "error_message = metadata->'app_finish_prior'->>'error_message'",
         "metadata = metadata - 'app_finish_prior'",
       ],
-      where: `task_id = $1 AND mode = 'app'
-        AND status IN ('preparing','running')
-        AND lease_owner = $2 AND lease_expires_at > NOW()
-        AND metadata->'app_finish_prior' IS NOT NULL
-        AND EXISTS (SELECT 1 FROM claw_app_runs r WHERE r.task_id = claw_tasks.task_id AND r.state = 'ended')`,
-      params: [taskId, brainId],
+      where: `mode = 'app' AND metadata->'app_finish_prior' IS NOT NULL
+        AND status IN ('cancelling','cancelled','failed')
+        AND (lease_expires_at IS NULL OR lease_expires_at < NOW() - ($1::int * INTERVAL '1 second'))
+        AND COALESCE((metadata->>'app_finish_requeues')::int, 0) >= $2::int
+        AND EXISTS (SELECT 1 FROM claw_app_runs r WHERE r.task_id = claw_tasks.task_id AND r.state = 'finishing')`,
+      params: [LEASE_LOST_GRACE_SEC, APP_FINISH_REQUEUE_MAX],
     },
   );
-  if (rows.length) logger.info({ taskId }, "sweeper.app_finish_settled");
-  return rows.length > 0;
+  if (rows.length) {
+    logger.error({ ids: rows.map((r) => r.task_id), max: APP_FINISH_REQUEUE_MAX }, "sweeper.app_finish_requeue_exhausted");
+  }
+  return rows.length;
 }
 
 /** How many times one run's finishing may be handed to a new worker before it is left for an operator. */
@@ -2776,6 +2842,8 @@ async function runContained(event: string, work: () => Promise<unknown>): Promis
 }
 
 export async function sweeperTick(): Promise<void> {
+  // Before every reaper: a finish-only run whose row already ended must get its task back, not be closed as worker_lost.
+  await runContained("sweeper.app_finish_settle_failed", settleEndedFinishOnlyRuns);
   await runContained("sweeper.stale_tasks_failed", reapStaleTasks);
   // Run AFTER reapStaleTasks so children freshly marked as
   // `brain_timeout` show up to reapStuckDagRoots in the same tick.
@@ -2786,6 +2854,7 @@ export async function sweeperTick(): Promise<void> {
   await runContained("sweeper.requeued_doorbell_leases_failed", requeueLostDoorbellLeases);
   await runContained("sweeper.lost_leases_failed", reapLostLeases);
   // After the reapers that close a task: a run they closed mid-finish is handed back here.
+  await runContained("sweeper.app_finish_exhausted_failed", giveUpExhaustedAppFinishes);
   await runContained("sweeper.unfinished_app_runs_failed", requeueUnfinishedAppRuns);
   // After reapLostLeases, so an accepted row whose worker died is closed as
   // worker_lost by its own reaper rather than reclassified as one that never
