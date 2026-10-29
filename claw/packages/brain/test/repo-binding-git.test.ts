@@ -337,6 +337,17 @@ test("G6b an origin that holds newlines cannot pass for the probe's own lines: i
   }
 });
 
+test("G6c an origin with non-ASCII text is shown as it is stored (the hex framing is decoded as UTF-8)", async () => {
+  const s = sandbox("g6c");
+  const dir = path.join(s.root, "example-repo");
+  fs.mkdirSync(dir);
+  run(dir, "init", "-q", "-b", "main");
+  run(dir, "config", "remote.origin.url", "https://git.example.invalid/\u00f8rg/\u00fcn\u00efcode.git");
+  const b = await bind(s, { url: REPO_URL });
+  assert.equal(b.state, "failed");
+  assert.ok((b.failure ?? "").includes("(its origin is https://git.example.invalid/\u00f8rg/\u00fcn\u00efcode.git)"), b.failure ?? "");
+});
+
 test("G7 a clone that fails: a reason in the block, no directory, no leftover, nothing thrown", async () => {
   const s = sandbox("g7");
   const b = await bind(s, { url: `${URL_BASE}/missing.git` });
