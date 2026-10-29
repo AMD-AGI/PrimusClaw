@@ -19,6 +19,8 @@ import { initUserEnvCrypto } from "./crypto/user-env.js";
 import { authLogPath, authMiddleware } from "./auth/middleware.js";
 import { startIdentityClient } from "./auth/identity.js";
 import { registerSessionRoutes } from "./routes/sessions.js";
+import { registerAnswerFeedbackRoutes } from "./routes/answer-feedback.js";
+import { registerImageRoutes } from "./routes/images.js";
 import { registerEventRoutes } from "./routes/events.js";
 import { registerAnthropicManagedAgentsRoutes } from "./routes/anthropic-managed-agents.js";
 import { registerAdminRoutes } from "./routes/admin.js";
@@ -36,6 +38,8 @@ import { registerMcpRoutes } from "./routes/mcp.js";
 import { registerGithubReviewRoutes } from "./github-review/mcp.js";
 import { githubReviewConfigErrors, readGithubReviewSettings } from "./github-review/settings.js";
 import { identityClient } from "./auth/identity.js";
+import { registerMeRoutes } from "./routes/me.js";
+import { registerModelsRoutes } from "./routes/models.js";
 import { registerInternalTaskRoutes } from "./routes/internal-tasks.js";
 import { registerInternalRunRoutes } from "./routes/internal-runs.js";
 import { registerInternalAppRoutes } from "./routes/internal-apps.js";
@@ -283,6 +287,8 @@ async function main() {
   app.addHook("preHandler", authMiddleware);
 
   await registerSessionRoutes(app);
+  await registerAnswerFeedbackRoutes(app);
+  await registerImageRoutes(app);
   await registerEventRoutes(app);
   await registerAnthropicManagedAgentsRoutes(app);
   await registerAdminRoutes(app);
@@ -307,6 +313,8 @@ async function main() {
   await registerTaskRoutes(app);
   await registerRunRoutes(app);
   await registerWorkbenchRoutes(app);
+  await registerModelsRoutes(app);
+  await registerMeRoutes(app);
   // Scheduled triggers: nothing is registered unless the deployment turns them on.
   if (CLAW_TRIGGERS_ENABLED) await registerTriggerRoutes(app);
 

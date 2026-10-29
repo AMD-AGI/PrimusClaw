@@ -52,7 +52,7 @@ const probe = (state: "absent" | "git" | "occupied" | "linked", opts: { origin?:
   reply: { text: [
     `CLAW_REPO_CRED=${opts.cred ?? "ok"}`,
     `CLAW_REPO_STATE=${state}`,
-    ...(state === "git" ? [`CLAW_REPO_ORIGIN=${opts.origin ?? URL}`] : []),
+    ...(state === "git" ? [`CLAW_REPO_ORIGIN_HEX=${Buffer.from(opts.origin ?? URL).toString("hex")}`] : []),
     `CLAW_REPO_BOUND=${opts.bound ? "yes" : "no"}`,
     ...(state === "git" && opts.bound ? [
       `CLAW_REPO_BRANCH=${opts.inline?.branch ?? "main"}`, `CLAW_REPO_HEAD=${opts.inline?.head ?? "abc1234"}`, `CLAW_REPO_CHANGED=${opts.inline?.changed ?? 0}`,
