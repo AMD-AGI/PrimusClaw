@@ -41,6 +41,8 @@ const REGISTRARS: Record<string, string> = {
   registerUserEnvVarRoutes: "routes/user-env-vars.js",
   registerNotificationSubscriptionRoutes: "routes/notification-subscriptions.js",
   registerRemoteAgentRoutes: "routes/remote-agents.js",
+  registerAnswerFeedbackRoutes: "routes/answer-feedback.js",
+  registerImageRoutes: "routes/images.js",
   registerSystemEnvVarRoutes: "routes/system-env-vars.js",
   registerSandboxAdminRoutes: "routes/sandbox-admin.js",
   registerMcpRoutes: "routes/mcp.js",
@@ -52,6 +54,8 @@ const REGISTRARS: Record<string, string> = {
   registerTaskRoutes: "routes/tasks.js",
   registerRunRoutes: "runs/routes.js",
   registerWorkbenchRoutes: "workbenches/routes.js",
+  registerModelsRoutes: "routes/models.js",
+  registerMeRoutes: "routes/me.js",
   registerTriggerRoutes: "routes/triggers.js",
 };
 

@@ -36,6 +36,21 @@ record it.
   role only (the token's `roles` are not copied, so enabling this never grants admin).
   `CLAW_IDENTITY_TOKEN_INTROSPECT` also asks the provider whether the token is still active. The chart takes
   `identity.tokenAuth`. See `claw/docs/identity-client.md`.
+- A user can vote on an answer of their own session. `PUT /v1/sessions/:sessionId/feedback`
+  (`{ "message_id", "vote": "up" | "down", "reason"? }`) records it and
+  `DELETE /v1/sessions/:sessionId/feedback/:messageId` takes it back; both answer `{ "ok": true }`.
+  There is one vote per user per message, a repeat replaces it, and only the session's creator may
+  vote: another user's session, a deleted one and a missing one are the same 404. `message_id` is
+  text (1-100 characters from `A-Za-z0-9._:@-`) and `reason` is at most 8192 characters. A session
+  holds at most 1000 votes per user (409 past that). The votes live in the new table
+  `claw_answer_feedback`, created by the same idempotent start-up migration and required by the
+  schema check.
+- `GET /v1/images?search=<text>&limit=<n>` lists the container images the caller may pick from, as
+  `{ "items": [{ "name", "tag"?, "createdAt"? }], "total" }` (`name` is the full reference; `limit` is
+  50 by default and at most 200). It asks SaFE with the caller's own credential and passes on only
+  those fields. When SaFE cannot answer, the reply is a 503 (unreachable, not configured, or kubernetes
+  mode) or 502 (an answer that is not an image list), with `{ "error", "reason" }`, and a 401 or 403
+  when SaFE refuses the caller.
 - `auto_approve` on an MCP server spec, the sibling of `requires_approval`: an explicit allowlist (tool
   names, a trailing `*` for a prefix, and an optional `when` that must equal the call's top-level scalar
   arguments) of the held tools that may run without a decision, so a session nobody is watching can run
@@ -128,6 +143,17 @@ record it.
   description only and written into the sandbox on first read. Off by default;
   see `claw/docs/platform-defaults.md`.
 
+- `GET /v1/sessions/:id/changes`: what the session's sandbox has changed, computed live with git through
+  Hands. It lists every git work tree under `/workspace` (two levels down, at most 20, and 200 files each, with
+  `truncated` past a limit) with branch, short head, and for each changed file its status (`M` `A` `D` `R` `?`),
+  additions and deletions (git's own numbers; untracked files counted by their lines; binary files `null`), and
+  `?repo=<path>&file=<path>` returns one file's unified diff (64 KB at most; vendor tokens, Bearer headers, URL
+  userinfo and the value after a credential-named variable, flag or field such as `DB_PASSWORD=` are masked). Creator only;
+  another user's session is a 404 like a missing one. A sandbox that is not running (reclaimed, pending, not
+  answering) is a `409 sandbox_not_running` and nothing is started to look at it. The repository and file in
+  the patch form must be exactly what the live listing holds; git is given only those strings, quoted, after
+  `--`, with literal pathspecs and without its optional index lock. See `claw/docs/sandbox-session-lifecycle.md`.
+
 ### Changed
 - Brain no longer fetches every plugin skill again on every turn. Downloaded skill
   files are held in memory (bounded by `SKILL_CACHE_MAX_BYTES`, 64 MiB by default,
@@ -144,6 +170,10 @@ record it.
   like the platform defaults instead of being inlined.
 
 ### Security
+- `redactSecrets` no longer takes quadratic time on a long line. The URL-credential pass rescanned a run of
+  letters from every position in it when no `://` followed, so one line of 64 KB of letters held the event loop
+  for about sixteen seconds in every caller (event redaction, previews, the new changes route). The scheme is now
+  matched only where a run of scheme characters begins; the result for every input is unchanged.
 - Credential redaction no longer treats every `user_env` / `session_env` value
   as a secret to cut out of transcripts, and no longer misses short or
   oddly-named ones. Values are selected by whether the variable **name** reads

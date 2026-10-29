@@ -238,6 +238,48 @@ OOM and crash reasons belong on the Workload so brain can distinguish `sandbox_c
 | EnvD exit 0 without Brain stop | — | Succeeded | failure `sandbox_envd_exited` |
 | reclaim vs new message | empty | Running | CAS `closing`; loser does not reuse |
 
+## What a session's sandbox has changed
+
+`GET /v1/sessions/:id/changes` answers "what did the agent change?" from the sandbox that is running, with
+`git`, through Hands. Creator only (an administrator is not the creator, since this runs commands in the
+creator's sandbox); another user's session and a missing one are the same `404 {"ok": false, "error": "session not
+found"}`.
+
+```
+GET /v1/sessions/:id/changes
+-> 200 { ok, session_id, generated_at, truncated,
+         repos: [ { path, branch, head, truncated,
+                    totals: { files, additions, deletions },
+                    files: [ { path, status: "M"|"A"|"D"|"R"|"?", additions, deletions, binary } ] } ] }
+
+GET /v1/sessions/:id/changes?repo=<path>&file=<path>
+-> 200 { ok, patch, truncated }       one file's unified diff, at most 64 KB, credentials masked (token shapes, and the value after a credential-named variable, flag or field)
+```
+
+- **Every git work tree under `/workspace`, up to two levels down** (`node_modules`, `.skills` and `.cache` are
+  not entered), at most 20 of them and 200 files each; past a limit `truncated` is true and the totals are lower
+  bounds. `status` is git's, folded to one letter (`R` a staged rename, `?` untracked). `additions` /
+  `deletions` come from `git diff --numstat HEAD` (a repository with no commit yet is diffed against the empty
+  tree); an untracked file counts as added by its lines (`deletions` 0), a binary file has `null` and
+  `binary: true`, and an untracked file over 5 MB has `additions: null`. `branch` is `null` on a detached HEAD
+  and `head` is empty before the first commit.
+- **A sandbox that is not running is `409 {"ok": false, "error": "sandbox_not_running"}`**, and nothing is started
+  to find out. The route reads the registry entry Brain wrote when the sandbox became ready (it must be `ready`
+  and name an address and a token) and talks to that sandbox only. No entry, a pending one, an address nobody
+  answers or a token that is no longer the sandbox's all read as "not running"; it never dispatches a turn,
+  opens a run or touches the session. `502 changes_unavailable` means the sandbox answered and the command
+  failed; `429` means too many patch requests for the session are already in flight.
+- **Read-only, and quiet beside the agent.** Git is run with `GIT_OPTIONAL_LOCKS=0` (it does not take the index lock,
+  so it cannot collide with the agent's own git), without an fsmonitor hook, an external diff or a text
+  conversion from the repository's config, and with literal pathspecs. Concurrent summary requests for one
+  session share one run.
+- **Nothing the caller sends reaches git unless the listing produced it.** The scripts take no input. For the
+  patch form, `repo` must be a canonical path under `/workspace` and `file` a canonical path (relative, or
+  absolute under the repository) with no `..` or `.` segment, no control characters and no more than 1024
+  characters, else `400`; and both must then be exactly a repository and a changed file of the live listing, else
+  `404 repo_not_found` / `file_not_found`. What is passed to git is the listing's own string, single-quoted, after
+  `--`. A file named like an option, a glob or shell text is diffed as a name.
+
 ## Interactive terminal claim
 
 A shell opened in a browser terminal is not on the EnvD jobs roster, and the sandbox a plain chat turn used is stopped when that turn's run ends. Left alone, a terminal opened after a turn finds no sandbox, and one started for it is reclaimed within moments.

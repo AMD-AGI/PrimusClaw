@@ -26,6 +26,7 @@ import {
 import { getContextUsageSnapshot } from "../sessions/context-builder.js";
 import { publicSessionRow } from "../events/redaction.js";
 import { archiveSession, unarchiveSession } from "../sessions/archive.js";
+import { getChangesPatch, getChangesSummary, type ChangesFailure } from "../sessions/changes-service.js";
 import { parseSessionModel } from "../sessions/session-model.js";
 import {
   isUserEnvKeyAllowed,
@@ -2088,6 +2089,48 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       ok: true, session_id: sessionId, throttled: false, workload_id: binding.workloadId,
       hold_ms: SESSION_SANDBOX_HOLD_MS,
     };
+  });
+
+  // --- What the session's sandbox has changed (creator-only, live) ---
+  //
+  // Asked of the sandbox that is running, through Hands, and of no other: a session
+  // whose sandbox was reclaimed is a 409, never a reason to start one. Another user's
+  // session and a missing one are the same 404, and an administrator is not the
+  // creator: this runs commands in the creator's sandbox.
+  //
+  //   GET /v1/sessions/:id/changes                      the work trees under /workspace, files and +/-
+  //   GET /v1/sessions/:id/changes?repo=<path>&file=<path>   one file's unified diff
+  app.get<{ Params: { id: string } }>("/v1/sessions/:id/changes", async (req, reply) => {
+    const sessionId = req.params.id;
+    const userId = getUser(req)?.userId ?? "default";
+    const row = (await db.query(
+      "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
+      [sessionId],
+    )).rows[0];
+    if (!row || !canAccessSession(row.user_id, userId)) {
+      return reply.status(404).send({ ok: false, error: "session not found" });
+    }
+    const failure = (f: ChangesFailure) => {
+      switch (f.kind) {
+        case "not_running": return reply.status(409).send({ ok: false, error: "sandbox_not_running" });
+        case "unavailable": return reply.status(502).send({ ok: false, error: "changes_unavailable" });
+        case "bad_request": return reply.status(400).send({ ok: false, error: f.error });
+        case "not_found": return reply.status(404).send({ ok: false, error: f.error });
+        case "busy": return reply.status(429).send({ ok: false, error: "too_many_requests" });
+      }
+    };
+    const q = (req.query ?? {}) as Record<string, unknown>;
+    if (q.repo === undefined && q.file === undefined) {
+      const summary = await getChangesSummary(sessionId);
+      if (summary.kind !== "ok") return failure(summary);
+      return { ok: true, ...summary.value };
+    }
+    if (q.repo === undefined || q.file === undefined) {
+      return reply.status(400).send({ ok: false, error: "repo and file must be given together" });
+    }
+    const patch = await getChangesPatch(sessionId, q.repo, q.file);
+    if (patch.kind !== "ok") return failure(patch);
+    return { ok: true, ...patch.value };
   });
 
   // --- List Files (V1/V2 split) ---

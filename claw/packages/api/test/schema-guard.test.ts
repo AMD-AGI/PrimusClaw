@@ -141,6 +141,22 @@ for (const column of [
   });
 }
 
+test("names the answer-feedback table before a vote tries to write it", () => {
+  // The vote routes insert and delete on it for every user, so a database that
+  // lost it must stop the start-up rather than answer 500 to each vote.
+  const present = fullSchema().filter((c) => c.table_name !== "claw_answer_feedback");
+  assert.deepEqual(missingSchemaObjects(REQUIRED_SCHEMA, present), ["table claw_answer_feedback is missing"]);
+});
+
+for (const column of ["session_id", "message_id", "user_id", "vote", "reason", "updated_at"]) {
+  test(`keeps ${column} required on the answer-feedback table`, () => {
+    assert.deepEqual(
+      missingSchemaObjects(REQUIRED_SCHEMA, without([["claw_answer_feedback", column]])),
+      [`claw_answer_feedback is missing column(s): ${column}`],
+    );
+  });
+}
+
 test("keeps the run-time epoch required, since requeues overwrite queued_at", () => {
   const tasks = REQUIRED_SCHEMA.find((r) => r.table === "claw_tasks");
   assert.ok(tasks?.columns.includes("run_time_epoch_at"));
