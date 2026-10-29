@@ -46,6 +46,7 @@ const REGISTRARS: Record<string, string> = {
   registerImageRoutes: "routes/images.js",
   registerSystemEnvVarRoutes: "routes/system-env-vars.js",
   registerSandboxAdminRoutes: "routes/sandbox-admin.js",
+  registerTerminalRoutes: "routes/terminal.js",
   registerMcpRoutes: "routes/mcp.js",
   registerInternalTaskRoutes: "routes/internal-tasks.js",
   registerInternalRunRoutes: "routes/internal-runs.js",

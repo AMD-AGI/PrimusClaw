@@ -104,6 +104,24 @@ record it.
   `event: revoked`) when the token does. The audit trail records which kind of credential a
   connector-side action used. Off unless remote agents and the identity client are both on. See
   `claw/docs/remote-agents.md`.
+- A shell in a session's sandbox, for a browser, through the API alone (no direct call to SaFE). The
+  session's creator -- no one else, admins included; anything else answers 404 -- gets
+  `GET /v1/sessions/:id/terminal` (`{state: "ready"|"none"|"starting"|"ended", message?, target?}`),
+  `POST /v1/sessions/:id/terminal/ticket` (body `{cols, rows}`, answers `{ticket, expiresInSeconds,
+  wsPath}`) and `GET /v1/sessions/:id/terminal/ws?ticket=...` (WebSocket). Everything is looked up and
+  opened with the caller's own SaFE key. A browser WebSocket cannot send an `Authorization` header, so
+  the socket is authenticated by the ticket: random, good for one connection for 30 seconds, bound to
+  one user and one session, kept (as a hash, with the key it carries sealed) in the new table
+  `claw_terminal_tickets` so any replica can redeem it. The proxy passes SaFE's webshell frames
+  through as they are (input as text or binary frames, `RESIZE <cols> <rows>` as a text frame, output
+  as binary frames) and ends both sockets together; a terminal with no traffic in either direction for
+  `TERMINAL_IDLE_TIMEOUT_SECONDS` (default 900) is closed with code 4408, and one open for
+  `TERMINAL_MAX_LIFETIME_SECONDS` (default 28800, 8 hours; traffic does not extend it, so a tab left on
+  `tail -f` is ended too; 0 and anything outside 60 to 604800 is refused and the default applies) is
+  closed with code 4409, and `TERMINAL_MAX_CONNECTIONS` (200) and
+  `TERMINAL_MAX_CONNECTIONS_PER_USER` (5) bound what one replica holds. SaFE being unreachable or
+  refusing the key answers 502, and a deployment without SaFE 503, each with `{error, reason}`. The
+  WebSocket server is the `ws` package, a new dependency of the API.
 - `connector/`, the client of remote agents: `claw-connector` runs on a user's own machine and exposes
   their Claude Code, Codex and Cursor agents (over the Agent Client Protocol) through outbound HTTPS only.
   Device sign-in (RFC 8628) or a development key; a per-agent directory whitelist; every session forced into
