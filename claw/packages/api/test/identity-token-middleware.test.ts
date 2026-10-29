@@ -86,6 +86,8 @@ describe("an identity access token through the authentication hook", () => {
     await app.register((await import("@fastify/cookie")).default);
     app.addHook("preHandler", authMiddleware);
     app.get("/v1/whoami", async (req) => ({ user: getUser(req) }));
+    // A browser-download route: the one place the existing `?token=` key path is tried, and before any header path.
+    app.get("/v1/sessions/abc/files/main.py", async (req) => ({ user: getUser(req) }));
     await app.listen({ port: 0, host: "127.0.0.1" });
     base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
   });
@@ -165,6 +167,22 @@ describe("an identity access token through the authentication hook", () => {
     assert.equal(r.status, 401);
     assert.equal(r.body.error, "invalid_api_key");
     assert.deepEqual(safe.calls, ["ak-aaa.bbb.ccc"]);
+  });
+
+  test("on a browser-download route the `?token=` key is still tried first, as before, and a token does not displace it", async () => {
+    const get = async (query: string, headers: Record<string, string>) => {
+      const r = await fetch(`${base}/v1/sessions/abc/files/main.py${query}`, { headers });
+      return { status: r.status, body: (await r.json().catch(() => null)) as any };
+    };
+    // A valid key in the query authenticates its owner, whatever else is presented: the key is the credential that was verified.
+    const withKey = await get("?token=ak-u1", bearer(mint({ aud: "someone-else" })));
+    assert.equal(withKey.status, 200);
+    assert.equal(withKey.body.user.userId, "u1");
+    // Without a key the token is judged there like anywhere: valid, it authenticates; bad, it is final.
+    assert.equal((await get("", bearer(mint()))).body.user.userId, "web-user");
+    const bad = await get("", bearer(mint({ aud: "someone-else" })));
+    assert.equal(bad.status, 401);
+    assert.equal(bad.body.error, "invalid_token");
   });
 
   test("the cookie still comes first: a valid cookie wins over a valid token", async () => {

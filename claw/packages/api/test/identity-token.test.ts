@@ -213,6 +213,9 @@ describe("a token that is wrong is refused, and never passed on", () => {
     ["a sub with a control character inside", () => mint({ sub: "u\u00011" }), 401, "invalid_token"],
     ["a sub with DEL", () => mint({ sub: "u\u007f1" }), 401, "invalid_token"],
     ["a sub longer than 128 characters", () => mint({ sub: "s".repeat(129) }), 401, "invalid_token"],
+    ["a sub that is the fallback owner `default`", () => mint({ sub: "default" }), 401, "invalid_token"],
+    ["a sub that is the anonymous owner", () => mint({ sub: "anonymous" }), 401, "invalid_token"],
+    ["a sub that is the development bypass user", () => mint({ sub: "dev-user" }), 401, "invalid_token"],
   ];
   for (const [name, token, status, legacyError] of refusals) {
     test(name, async () => {
@@ -221,6 +224,10 @@ describe("a token that is wrong is refused, and never passed on", () => {
       assert.equal(e.legacyError, legacyError);
     });
   }
+
+  test("a reserved owner is refused only whole: a subject that merely contains it is a user like any other", async () => {
+    for (const sub of ["default-user", "Default", "user-default", "anonymous1"]) assert.equal(verified(await verify(mint({ sub }))).user.userId, sub);
+  });
 
   test("a sub of exactly 128 characters is the longest accepted", async () => {
     assert.equal(verified(await verify(mint({ sub: "s".repeat(128) }))).user.userId.length, 128);

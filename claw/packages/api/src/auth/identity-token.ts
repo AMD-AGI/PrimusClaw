@@ -16,9 +16,10 @@
  *     application); the scope refuses a token issued for some other purpose to the
  *     same audience (a connector's, which carries its own scope).
  *   - The caller is the token's `sub`, named as the issuer wrote it. A subject
- *     that is blank, padded, too long or has a control character is refused, not
- *     repaired: it becomes the owner of every row, so two distinct subjects must
- *     never name one owner.
+ *     that is blank, padded, too long, has a control character or is one of the
+ *     owners the API itself uses for a caller it did not authenticate is refused,
+ *     not repaired: it becomes the owner of every row, so two distinct subjects
+ *     must never name one owner.
  *   - The user model is the one the other credentials produce: `sub` is the user
  *     id and the `roles` claim is the role list (`default` is always in it). There
  *     is no session key behind a token, so `platformKey` and `virtualKey` are empty.
@@ -52,6 +53,9 @@ const MAX_SUBJECT_CHARS = 128;
 const MAX_ROLES = 32;
 const MAX_ROLE_CHARS = 64;
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+// Owners the API itself uses for a caller it did not authenticate (the fallback owner of a row, an anonymous
+// workbench, the development bypass). A token whose subject is one of them would be that owner, so it is refused.
+const RESERVED_SUBJECTS: ReadonlySet<string> = new Set(["default", "anonymous", "dev-user"]);
 
 export interface IdentityTokenSettings {
   enabled: boolean;
@@ -156,7 +160,7 @@ export async function verifyIdentityAccessToken(
       return reject("scope", refuse(403, "insufficient_scope", `the access token needs the ${settings.scope} scope`));
     }
     const sub = typeof claims.sub === "string" ? claims.sub : "";
-    if (!sub || sub.length > MAX_SUBJECT_CHARS || sub !== sub.trim() || CONTROL_CHARS.test(sub)) {
+    if (!sub || sub.length > MAX_SUBJECT_CHARS || sub !== sub.trim() || CONTROL_CHARS.test(sub) || RESERVED_SUBJECTS.has(sub)) {
       return reject("subject", refuse(401, "invalid_token", "the access token names no usable subject"));
     }
     if (settings.introspect) {

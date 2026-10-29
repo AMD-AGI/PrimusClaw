@@ -126,9 +126,9 @@ this use.
 
 | Token | `UserInfo` |
 |---|---|
-| `sub` | `userId`, exactly as the issuer wrote it. A subject that is missing, blank, padded with whitespace, longer than 128 characters or containing a control character is refused, not repaired |
+| `sub` | `userId`, exactly as the issuer wrote it. A subject that is missing, blank, padded with whitespace, longer than 128 characters, containing a control character, or equal to an owner the API uses for a caller it did not authenticate (`default`, `anonymous`, `dev-user`) is refused, not repaired |
 | `name`, else `preferred_username`, else `email`, else `sub` | `userName` (at most 128 characters) |
-| `roles` | `roles`: the strings in the claim, once each, at most 32 of 64 characters or fewer, and `default` is always present. A claim that is not an array says nothing. `groups` is not read |
+| `roles` | `roles`: the strings in the claim, once each, at most 32 of them and 64 characters or fewer each, then `default` if it was not among them. A claim that is not an array says nothing. `groups` is not read |
 | | `platformKey` and `virtualKey` are empty: no session key stands behind a token |
 
 **How it combines with the other credentials.**
@@ -139,7 +139,9 @@ this use.
   credential on the request is tried instead; a provider that cannot be asked is a
   503 `authentication_service_unavailable`, never an "invalid token".
 - A `Token` cookie is still judged first, and an `ak-` key is still judged by SaFE
-  (`ak-` is settled before the token path runs). Behind the switch nothing about
+  (`ak-` is settled before the token path runs). On the browser-download routes the
+  existing `?token=` key path is still tried before any header, so a valid key there
+  authenticates its owner whatever Bearer value rides along. Behind the switch nothing about
   them changes; with it off nothing about the request changes at all.
 - It applies in the Kubernetes deployment mode too, where it is judged before the
   gateway-key check. In that mode a Bearer value that looks like a JWT is a token,
