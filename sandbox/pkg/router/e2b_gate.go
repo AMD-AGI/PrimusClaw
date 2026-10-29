@@ -121,8 +121,6 @@ func (s *Server) proxyEnvD(c *gin.Context, info *store.SandboxInfo, ref runtimev
 	proxy := &httputil.ReverseProxy{
 		FlushInterval: -1,
 		Director: func(req *http.Request) {
-			req.URL.Path = envdProxyPath(req.URL.Path)
-			req.URL.RawPath = ""
 			req.URL.Scheme = target.Scheme
 			req.URL.Host = target.Host
 			req.Host = target.Host

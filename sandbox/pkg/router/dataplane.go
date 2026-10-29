@@ -240,24 +240,6 @@ func hopSealedAllows(c *gin.Context, path string, ref runtimev1alpha1.GrantSandb
 	return true
 }
 
-// envdProxyPath strips a hop prefix so envd sees /files or /process.Process/Start.
-func envdProxyPath(path string) string {
-	const marker = "/internal/v1/dataplane/"
-	i := strings.Index(path, marker)
-	if i < 0 {
-		if path == "" {
-			return "/"
-		}
-		return path
-	}
-	rest := path[i+len(marker):]
-	slash := strings.Index(rest, "/")
-	if slash < 0 {
-		return "/"
-	}
-	return rest[slash:]
-}
-
 // localSandbox finds the envd address in this cluster.
 // The session store wins. A SaFE Workload that has no Sandbox record falls through to pods.
 func (s *Server) localSandbox(ctx context.Context, sandboxID string) (*store.SandboxInfo, error) {
