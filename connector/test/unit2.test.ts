@@ -318,6 +318,7 @@ describe("token provider (rotating refresh)", () => {
       assert.deepEqual(saved, ["refresh-1", "refresh-2"]);
       p.invalidate();
       assert.equal(await p.bearer(), "access-3");
+      assert.ok(id.requests.filter((r) => r.form.grant_type === "refresh_token").every((r) => r.form.scope === "claw.connector"), "every refresh asks for it again");
     } finally { await id.close(); }
   });
   test("an invalid_grant means the sign-in was revoked; a network failure is only transient", async () => {
@@ -352,6 +353,7 @@ describe("device authorization flow (RFC 8628)", () => {
     assert.match(r.lines.join("\n"), /ABCD-EFGH/);
     const auth = r.id.requests[0]!;
     assert.deepEqual([auth.path, auth.form.client_id, auth.form.device_name], ["/oauth/device_authorization", "claw-connector", "dev-box"]);
+    assert.equal(auth.form.scope, "claw.connector", "the scope Claw's connector routes require is asked for, not left to the provider's defaults");
     const poll = r.id.requests[1]!;
     assert.deepEqual([poll.form.grant_type, poll.form.device_code], ["urn:ietf:params:oauth:grant-type:device_code", "dev-code-1"]);
   });

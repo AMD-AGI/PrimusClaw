@@ -11,6 +11,12 @@ import path from "node:path";
 import { errMessage, isObject, secureUrl } from "./util.js";
 
 export const DEFAULT_CLIENT_ID = "claw-connector";
+/**
+ * The scope Claw's connector routes require of an access token. Asked for explicitly, on the device authorization
+ * and on every refresh, so an identity service that issues only what was requested still issues this one. The
+ * audience (`claw-api`) is bound to the public client by the identity service's own configuration.
+ */
+export const CONNECTOR_SCOPE = "claw.connector";
 
 export interface Credentials {
   v: 1;
@@ -153,7 +159,7 @@ export class DeviceTokenProvider implements TokenProvider {
       res = await this.f(`${identity}/oauth/token`, {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
-        body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: c.refresh_token, client_id: c.client_id ?? DEFAULT_CLIENT_ID }),
+        body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: c.refresh_token, client_id: c.client_id ?? DEFAULT_CLIENT_ID, scope: CONNECTOR_SCOPE }),
         signal: AbortSignal.timeout(15_000),
       });
     } catch (e) {

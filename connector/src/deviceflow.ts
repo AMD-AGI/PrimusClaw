@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /** RFC 8628 device authorization grant, the client side. */
-import { DEFAULT_CLIENT_ID, parseTokenResponse, type TokenResponse } from "./credentials.js";
+import { CONNECTOR_SCOPE, DEFAULT_CLIENT_ID, parseTokenResponse, type TokenResponse } from "./credentials.js";
 import { errMessage, isObject, secureUrl, sleep } from "./util.js";
 
 export class DeviceFlowError extends Error {
@@ -40,7 +40,7 @@ export async function startDeviceAuthorization(o: DeviceFlowOptions): Promise<De
     res = await f(`${o.identityUrl}/oauth/device_authorization`, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
-      body: form({ client_id: o.clientId ?? DEFAULT_CLIENT_ID, ...(o.scope ? { scope: o.scope } : {}), device_name: o.deviceName }),
+      body: form({ client_id: o.clientId ?? DEFAULT_CLIENT_ID, scope: o.scope ?? CONNECTOR_SCOPE, device_name: o.deviceName }),
       signal: AbortSignal.timeout(15_000),
     });
   } catch (e) {
