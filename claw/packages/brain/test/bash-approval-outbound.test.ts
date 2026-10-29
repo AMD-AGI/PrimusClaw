@@ -316,6 +316,8 @@ const MATRIX: Row[] = [
       "rm -r -- ../x",
       "rm -rf /workspace/a -- /etc",
       "rm -r -- /workspace/a /etc",
+      "rm -r -- /workspace/a -x",
+      "rm -rf -- /workspace/a /workspace/b -rf",
       // A newline inside an earlier argument does not hide the words after it.
       "rm \"a\n\" -rf /etc",
       "rm -rf \"x\n\" /etc",
