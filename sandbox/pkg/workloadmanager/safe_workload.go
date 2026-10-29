@@ -745,7 +745,7 @@ func validateWorkloadRequest(req e2b.CreateRequest) error {
 	if !labelValue(req.GrantID) {
 		return fmt.Errorf("grant id %q is not a label value", req.GrantID)
 	}
-	if req.Attestation == "" {
+	if req.Attestation == "" && !req.OwnerKey {
 		return fmt.Errorf("grant attestation is required")
 	}
 	return nil

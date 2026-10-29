@@ -38,11 +38,15 @@ const sameNodeMetadata = metadataPrefix + "same-node"
 // avoidNodesMetadata lists nodes the workload prefers not to run on.
 const avoidNodesMetadata = metadataPrefix + "avoid-nodes"
 
+// workspaceMetadata selects the SaFE workspace of an identity-key sandbox.
+const workspaceMetadata = metadataPrefix + "workspace"
+
 // callerMetadataKeys may be set by the SDK under agent-sandbox.io/.
 var callerMetadataKeys = map[string]struct{}{
 	"idempotency-key": {},
 	"avoid-nodes":     {},
 	"priority":        {},
+	"workspace":       {},
 }
 
 // reservedMetadataKeys are assigned by the platform and rejected from callers.

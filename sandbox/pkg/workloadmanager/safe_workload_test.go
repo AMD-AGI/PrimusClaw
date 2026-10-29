@@ -403,6 +403,21 @@ func TestWorkloadNameMatchesSandboxID(t *testing.T) {
 	}
 }
 
+func TestWorkloadAttestationRequiredUnlessOwnerKey(t *testing.T) {
+	req := e2b.CreateRequest{
+		SandboxID: "sbx-7a9b9b693452f613877992145c818d29", TemplateID: "tpl", Namespace: "ns",
+		Role: "e2b", SessionID: "owner-0123456789abcdef01234567", Workspace: "lab",
+		GrantID: "owner-0123456789abcdef01234567",
+	}
+	if err := validateWorkloadRequest(req); err == nil {
+		t.Fatal("accepted a grant sandbox without attestation")
+	}
+	req.OwnerKey = true
+	if err := validateWorkloadRequest(req); err != nil {
+		t.Fatalf("owner-key sandbox rejected: %v", err)
+	}
+}
+
 func TestAlignTimeoutAddsElapsed(t *testing.T) {
 	dc := dynfake.NewSimpleDynamicClientWithCustomListKinds(k8sruntime.NewScheme(), map[schema.GroupVersionResource]string{
 		workloadGVR: "WorkloadList",

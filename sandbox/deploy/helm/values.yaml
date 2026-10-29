@@ -46,6 +46,13 @@ controlplane:
     # image (built with EXTRA_CA_CERT_URLS) and fails the same way if it is empty.
     sandboxExtraCAConfigMap: ""
     sandboxExtraCARequired: false
+    # primus-identity keys on the E2B API. Enabled when introspectUrl and
+    # ownerPolicyConfigMap are both set. The client Secret holds client_id and
+    # client_secret; the ConfigMap key policy.json holds the owner quota policy.
+    identity:
+      introspectUrl: ""
+      clientSecret: "agent-sandbox-identity-client"
+      ownerPolicyConfigMap: ""
   # Graceful drain on rollout or eviction, in Kubernetes order:
   #  1. preStop sleeps preStopSleepSeconds while the Pod, already terminating,
   #     is removed from the Service endpoints and the gateway stops routing to

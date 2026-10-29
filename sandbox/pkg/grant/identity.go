@@ -114,3 +114,19 @@ func (m *UserCRMembership) Check(ctx context.Context, userID string, workspaces 
 	}
 	return nil
 }
+
+// Workspaces returns the workspaces listed on the User.
+func (m *UserCRMembership) Workspaces(ctx context.Context, userID string) ([]string, error) {
+	if m == nil || m.client == nil {
+		return nil, opErr(http.StatusServiceUnavailable, "membership_unavailable", "User client is not configured")
+	}
+	obj, err := m.client.Resource(userGVR).Get(ctx, userID, metav1.GetOptions{})
+	if err != nil {
+		return nil, opErr(http.StatusForbidden, "user_not_in_workspace", "user was not found")
+	}
+	got, err := listedWorkspaces(obj)
+	if err != nil {
+		return nil, opWrap(http.StatusForbidden, "user_not_in_workspace", "workspace list is unreadable", err)
+	}
+	return got, nil
+}
