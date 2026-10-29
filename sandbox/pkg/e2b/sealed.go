@@ -63,9 +63,7 @@ func SealedAllows(method, rawPath string, sealed bool, inputs, outputs []string)
 	case strings.HasPrefix(requestPath, "/filesystem.Filesystem/"):
 		return true
 	case requestPath != "/files" &&
-		!strings.HasPrefix(requestPath, "/files/") &&
-		requestPath != "/api/files" &&
-		!strings.HasPrefix(requestPath, "/api/files/"):
+		!strings.HasPrefix(requestPath, "/files/"):
 		return false
 	}
 	filePath := filePathOf(rawPath)

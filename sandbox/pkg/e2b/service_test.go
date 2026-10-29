@@ -695,19 +695,19 @@ func TestSealedAllowsFilesOnly(t *testing.T) {
 	if SealedAllows(http.MethodPost, "/api/execute", true, []string{"/in"}, []string{"/out"}) {
 		t.Fatal("execute allowed")
 	}
-	if SealedAllows(http.MethodGet, "/api/files?path=/in/a", true, []string{"/in"}, []string{"/out"}) {
+	if SealedAllows(http.MethodGet, "/files?path=/in/a", true, []string{"/in"}, []string{"/out"}) {
 		t.Fatal("input read allowed")
 	}
-	if !SealedAllows(http.MethodPut, "/api/files?path=/in/a", true, []string{"/in"}, []string{"/out"}) {
+	if !SealedAllows(http.MethodPut, "/files?path=/in/a", true, []string{"/in"}, []string{"/out"}) {
 		t.Fatal("input write denied")
 	}
-	if SealedAllows(http.MethodPut, "/api/files?path=/in", true, []string{"/in"}, []string{"/out"}) {
+	if SealedAllows(http.MethodPut, "/files?path=/in", true, []string{"/in"}, []string{"/out"}) {
 		t.Fatal("input root write allowed")
 	}
-	if SealedAllows(http.MethodPut, "/api/files/out/b", true, []string{"/in"}, []string{"/out"}) {
+	if SealedAllows(http.MethodPut, "/files/out/b", true, []string{"/in"}, []string{"/out"}) {
 		t.Fatal("output write allowed")
 	}
-	if !SealedAllows(http.MethodGet, "/api/files?path=/out/b", true, []string{"/in"}, []string{"/out"}) {
+	if !SealedAllows(http.MethodGet, "/files?path=/out/b", true, []string{"/in"}, []string{"/out"}) {
 		t.Fatal("output read denied")
 	}
 	if SealedAllows(http.MethodGet, "/api/files?path=/out/../in/a", true, []string{"/in"}, []string{"/out"}) {
@@ -743,7 +743,7 @@ func TestSealedAllowsFilesOnly(t *testing.T) {
 		if SealedFileAllows(http.MethodGet, filePath, []string{"/in"}, []string{"/out"}) {
 			t.Fatalf("traversal allowed: %s", filePath)
 		}
-		if SealedAllows(http.MethodGet, "/api/files?path="+url.QueryEscape(filePath), true, []string{"/in"}, []string{"/out"}) {
+		if SealedAllows(http.MethodGet, "/files?path="+url.QueryEscape(filePath), true, []string{"/in"}, []string{"/out"}) {
 			t.Fatalf("HTTP traversal allowed: %s", filePath)
 		}
 	}

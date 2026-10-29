@@ -89,6 +89,10 @@ func TestE2BGateChecksTokenAndSealedPath(t *testing.T) {
 		t.Fatalf("execute=%d %s", execute.code, execute.body)
 	}
 	file := gateRequest(t, front.URL+"/api/files?path=/out/a", token)
+	if file.code != http.StatusForbidden {
+		t.Fatalf("file=%d %s", file.code, file.body)
+	}
+	file = gateRequest(t, front.URL+"/files?path=/out/a", token)
 	if file.code != http.StatusOK || file.body != "from-envd" {
 		t.Fatalf("file=%d %s", file.code, file.body)
 	}
