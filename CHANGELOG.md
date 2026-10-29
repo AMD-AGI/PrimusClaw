@@ -36,8 +36,37 @@ record it.
   `by: "policy"` and counted in `claw_hitl_policy_allow_total` (no labels: a request can carry its own
   server spec, so the entry that released the call is in the `hitl.policy_allow` log line instead). See
   `claw/docs/mcp-approval.md`.
+- A session can be bound to a repository. `POST /v1/sessions` accepts `config.repo = {url, branch?}`
+  (`url` is `https://<host>/<owner>/<name>[.git]` with no credentials, query or fragment; `branch` is a
+  plain ref name, empty meaning the remote's default; anything else is a `400` starting
+  `config.repo`). Whenever Brain opens the sandbox for such a session it makes `/workspace/<name>` a git
+  working tree before the model is asked anything: a clone when absent, only a `git fetch` when a `.git` is
+  already there (a restored snapshot: local commits, the current branch and uncommitted edits are left
+  alone), and the repository's `.git` attached beside the files when a snapshot has files but no `.git`. The
+  turn's prompt gains a `[Repository]` block and the repository's `AGENTS.md` / `CLAUDE.md` (32 KB at most,
+  cut with a marker). The sandbox's global git config gets `credential.helper = !gh auth git-credential`, so
+  `git push` works with the user's own `GH_TOKEN`, which never appears in a URL, a command line or a log. A
+  failed clone does not fail the run; the reason is in the block. A session without `config.repo` is unchanged.
+  See `claw/docs/sandbox-session-lifecycle.md`.
+- Remote agents, off by default (`CLAW_REMOTE_AGENTS_ENABLED=true`): a program on a user's own
+  machine can dial out to Claw, advertise the agents it can run, receive commands over a
+  `text/event-stream` and post back the events they produce, while the user's own clients read the
+  session, send commands and answer permission requests through the API. Presence, resumable streams
+  (`Last-Event-ID`), keepalive, owner-only access (another user's id is a 404) and an audit trail are
+  included; Claw does not interpret what an agent says. See `claw/docs/remote-agents.md`.
+- Connector access tokens: the four connector-side routes of remote agents accept an RFC 9068 JWT
+  (`Authorization: Bearer`, audience `claw-api`, scope `claw.connector`, type `at+jwt`) issued by the
+  identity provider and verified with the shared identity client, beside the keys and sessions they
+  already accept. The token is a credential on those routes only; the user side and every other route
+  answer it as a request with no credential. The caller is the token's subject with the `default` role,
+  a token is good until it expires or, with `CLAW_CONNECTOR_TOKEN_INTROSPECT=true`, until the provider
+  says its grant is revoked, and a command stream opened with one ends (`event: token_expired`, or
+  `event: revoked`) when the token does. The audit trail records which kind of credential a
+  connector-side action used. Off unless remote agents and the identity client are both on. See
+  `claw/docs/remote-agents.md`.
 - A shared identity client in `@claw/utils`, built by API and Brain when
-  `IDENTITY_CLIENT_ENABLED=true` (off by default; nothing authenticates through it yet). It does OIDC
+  `IDENTITY_CLIENT_ENABLED=true` (off by default; the one request it authenticates is a connector's access
+  token, above). It does OIDC
   discovery and caches the issuer's JWKS, RFC 7662 token introspection (an active answer is cached for
   30 s, an inactive one for 5 s, concurrent lookups of one credential share one call), and an RFC 8693
   token exchange with a token cache. When the provider cannot be asked, a cached active answer keeps
@@ -70,6 +99,21 @@ record it.
   Credential-named arguments never reach that call. A timeout, an error or
   `HITL_SUMMARY_ENABLED=false` just omit the fields; approval semantics are
   unchanged and `input` is still sent as before.
+- `approval.requested` notifications. When Brain holds a tool call for a person's decision (an MCP tool
+  with `requires_approval`, a bash command a `bash_approval` rule matches, or `HITL_ENABLED`), the owner's
+  subscriptions that list `approval.requested` in their `event_types` are sent a signed webhook: the usual
+  fields plus `approval: {tool_use_id, tool, target, expires_at}`. `target` is the command (bash) or the
+  tool's name and salient inputs, with credentials masked and cut to 300 characters; `expires_at` is when
+  Brain stops waiting and refuses the call; a request that has already timed out when the event is
+  consumed is not announced. The `event_id` is derived from (type, session, `tool_use_id`),
+  so a repeated request is one row per subscription. The opt-in is the run notifications' (the session was
+  created with `config.notify_on_finish: true`, or was started by a trigger); `NOTIFY_MIN_RUN_SECONDS` does
+  not apply. A subscription that was created with the default `event_types` (the two run events) is not sent
+  approvals: add the type with `PATCH /v1/notification-subscriptions/:id`, or pass it on create.
+- `claw/examples/bash-approval/outbound-actions.json`, a `bash_approval` rule pack for actions that leave
+  the sandbox: `git push` (force and delete forms labelled apart), `gh pr` / `release` / `repo` / `workflow`
+  writes, `gh api` writes and implied POSTs, `kubectl` and `helm` writes, and a recursive `rm` unless
+  every target is spelled out under `/workspace/`. See `claw/docs/bash-approval.md`.
 - Deployment-level platform defaults: `PLATFORM_DEFAULTS_FILE` lists default skills
   (by marketplace tool id) and MCP servers mounted into every chat, behind
   `PROGRESSIVE_SKILLS_ENABLED` for skills. Default skills are listed by name and
@@ -213,7 +257,7 @@ record it.
   named a retryable status was naked back into the queue it had just given up on.
   The runner now finds the give-up anywhere in the cause chain.
 - Parking a session whose hands handle was deleted no longer fails and retries
-  every sweep. NATS KV answers `get` on a deleted key with its delete marker, an
+  every sweep. NATS KV answers `get` on a deleted key with its delete marker, a
   empty value, and `parkHandsHandle` parsed it as a handle ("Unexpected end of
   JSON input") while `parkHandsAfterRun` skipped it as unreadable. Both now read a
   delete or purge marker as `gone`.
@@ -327,7 +371,7 @@ record it.
   values, and then the built-in fallbacks (`15m` idle, `24h` lifetime), still
   apply.
 - An `IdleReclaimRequested` Kubernetes Event on the Sandbox, recording the idle
-  timeout a reclaim was measured against and the last activity it saw, so an
+  timeout a reclaim was measured against and the last activity it saw, so a
   operator can tell an idle reclaim from any other deletion after the fact.
 - A `provider` label (`anthropic` | `openai`) on `claw_brain_llm_tokens_total`,
   `claw_brain_llm_cache_turns_total` and `claw_brain_llm_cache_write_tokens_total`.

@@ -23,9 +23,8 @@
 #   ENVD_KEY_SRC_KUBECONFIG=                  # required when ENVD_KEY_SOURCE=copy
 #   ENVD_KEY_SRC_NAMESPACE=agent-sandbox-system
 #   INSTALL_RUNTIMECLASS=false                # apply Kata RuntimeClass (kata-qemu)
-#   INSTALL_INGRESS=false                     # apply Higress Ingress
-#   INGRESS_VARIANT=k8s                       # k8s (example) | k8s-kata (example)
-#   INGRESS_HOST=                             # if set, sed-replaces the default host in ingress.yaml
+#   INGRESS_HOST=                             # existing public host, e.g. sandbox.example.com; unset skips the Ingress
+#   INGRESS_CLASS=higress                     # Ingress class for that host
 #   INSTALL_DEFAULT_TEMPLATES=false           # apply CodeInterpreter examples
 #   TEMPLATES_VARIANT=default                 # default | kata (both use default-templates.yaml)
 #   SAFE_API_URL=                             # set to enable SaFE authentication (recommended)
@@ -56,9 +55,8 @@ ENVD_KEY_SOURCE="${ENVD_KEY_SOURCE:-regen}"
 ENVD_KEY_SRC_KUBECONFIG="${ENVD_KEY_SRC_KUBECONFIG:-}"
 ENVD_KEY_SRC_NAMESPACE="${ENVD_KEY_SRC_NAMESPACE:-agent-sandbox-system}"
 INSTALL_RUNTIMECLASS="${INSTALL_RUNTIMECLASS:-false}"
-INSTALL_INGRESS="${INSTALL_INGRESS:-false}"
-INGRESS_VARIANT="${INGRESS_VARIANT:-k8s}"
 INGRESS_HOST="${INGRESS_HOST:-}"
+INGRESS_CLASS="${INGRESS_CLASS:-higress}"
 INSTALL_DEFAULT_TEMPLATES="${INSTALL_DEFAULT_TEMPLATES:-false}"
 TEMPLATES_VARIANT="${TEMPLATES_VARIANT:-default}"
 AUTO_INSTALL_HELM="${AUTO_INSTALL_HELM:-true}"
@@ -157,11 +155,99 @@ ensure_crds() {
     ok "7 CRDs Established"
 }
 
+# dns_name_ok reports whether value is a lowercase DNS name.
+dns_name_ok() {
+    local value="$1" mode="$2"
+    case "${mode}" in
+        label) [[ "${value}" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] ;;
+        domain) [[ "${value}" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+# prompt_ingress_host asks for the public host on an interactive terminal.
+# Enter leaves the Ingress uncreated. A host already set in the environment is kept.
+prompt_ingress_host() {
+    [[ -t 0 ]] || return 0
+    [[ -z "${INGRESS_HOST}" ]] || return 0
+    read -r -p "Public host (for example sandbox.example.com, Enter to skip): " INGRESS_HOST || INGRESS_HOST=""
+}
+
+# apply_router_ingress mounts the router on an existing public host.
+# The host is whatever already resolves for that cluster, for example
+# sandbox.example.com. E2B uses absolute paths, so the routes are
+# /sandboxes and the data-plane prefixes, not a path prefix in front of them.
+# An unset host skips creation and installation continues.
+apply_router_ingress() {
+    prompt_ingress_host
+    if [[ -z "${INGRESS_HOST}" ]]; then
+        log "skipped router Ingress (INGRESS_HOST unset)"
+        return 0
+    fi
+    dns_name_ok "${INGRESS_HOST}" domain \
+        || err "INGRESS_HOST must be a lowercase DNS name, got ${INGRESS_HOST}"
+    dns_name_ok "${INGRESS_CLASS}" domain \
+        || dns_name_ok "${INGRESS_CLASS}" label \
+        || err "INGRESS_CLASS must be a DNS label or name, got ${INGRESS_CLASS}"
+
+    local manifest path
+    manifest="$(mktemp /tmp/sandbox-ingress.XXXXXX.yaml)"
+    cat >"${manifest}" <<EOF
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: agent-sandbox-public
+  namespace: ${NAMESPACE}
+  labels:
+    app: agent-sandbox
+    higress.io/resource-definer: higress
+  annotations:
+    higress.io/route-priority: "100"
+    higress.io/ignore-path-case: "false"
+    higress.io/proxy-body-size: "0"
+    higress.io/proxy-buffering: "off"
+    higress.io/proxy-read-timeout: "3600"
+    higress.io/proxy-send-timeout: "3600"
+    higress.io/timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: ${INGRESS_CLASS}
+  rules:
+  - host: ${INGRESS_HOST}
+    http:
+      paths:
+EOF
+    for path in /sandboxes /v2/sandboxes /files /api/files /process.Process /filesystem.Filesystem; do
+        cat >>"${manifest}" <<EOF
+      - path: ${path}
+        pathType: Prefix
+        backend:
+          service:
+            name: agent-sandbox-router
+            port:
+              number: 8080
+EOF
+    done
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        echo "  [dry-run] kubectl apply -f ${manifest}"
+        cat "${manifest}"
+    else
+        kubectl apply -f "${manifest}"
+    fi
+    rm -f "${manifest}"
+    ok "router Ingress https://${INGRESS_HOST}/sandboxes"
+}
+
 # ── Idempotency guard: skip when Sandbox is already installed ─────────────────
 # Treat Sandbox as installed only when its controlplane Deployment is Ready, so
 # a half-broken install is still repaired. FORCE_SANDBOX=1 overrides.
 # CRDs are still applied: they are outside the Helm release, and a new CRD
 # (SandboxPolicy) has to land on an already-Ready cluster.
+# The router Ingress is applied too, so a re-run with INGRESS_HOST
+# publishes the paths without reinstalling the release.
 FORCE_SANDBOX="${FORCE_SANDBOX:-false}"
 if command -v kubectl >/dev/null 2>&1 \
    && [[ "${FORCE_SANDBOX}" != "1" && "${FORCE_SANDBOX}" != "true" && "${DRY_RUN}" != "true" ]]; then
@@ -173,9 +259,11 @@ if command -v kubectl >/dev/null 2>&1 \
        && "${INSTANCE}" == "${RELEASE}" \
        && "${DESIRED}" =~ ^[1-9][0-9]*$ \
        && "${READY_REPLICAS}" == "${DESIRED}" ]]; then
-        ok "Sandbox Helm release ${RELEASE} is fully ready in ${NAMESPACE} — applying CRDs, then skipping the rest (set FORCE_SANDBOX=1 to reinstall)"
+        ok "Sandbox Helm release ${RELEASE} is fully ready in ${NAMESPACE} — applying CRDs and router Ingress, then skipping the rest (set FORCE_SANDBOX=1 to reinstall)"
         section "CRDs"
         ensure_crds
+        section "Router Ingress"
+        apply_router_ingress
         exit 0
     fi
 fi
@@ -493,28 +581,9 @@ else
     log "skipped (INSTALL_RUNTIMECLASS=false)"
 fi
 
-# ── Step 8: Higress Ingress (optional) ────────────────────────────────────────
-section "Step 8: Higress Ingress (optional)"
-case "${INGRESS_VARIANT}" in
-    k8s)    INGRESS_YAML="${DEPLOY_DIR}/k8s/deployments/ingress.yaml" ;;
-    k8s-kata) INGRESS_YAML="${DEPLOY_DIR}/k8s-kata/deployments/ingress.yaml" ;;
-    *)      err "unknown INGRESS_VARIANT=${INGRESS_VARIANT} (use k8s|k8s-kata)" ;;
-esac
-if [[ "${INSTALL_INGRESS}" == "true" ]]; then
-    [[ -f "${INGRESS_YAML}" ]] || err "missing ${INGRESS_YAML}"
-    TMP_ING="$(mktemp /tmp/sandbox-ingress.XXXXXX.yaml)"
-    cp "${INGRESS_YAML}" "${TMP_ING}"
-    if [[ -n "${INGRESS_HOST}" ]]; then
-        # Rewrite the only host field in the manifest to the user-provided one
-        sed -i "s|host: .*|host: ${INGRESS_HOST}|g" "${TMP_ING}"
-        log "rewrote ingress host -> ${INGRESS_HOST}"
-    fi
-    run "kubectl apply -f \"${TMP_ING}\""
-    rm -f "${TMP_ING}"
-    ok "Ingress applied (variant=${INGRESS_VARIANT})"
-else
-    log "skipped (INSTALL_INGRESS=false)"
-fi
+# ── Step 8: Router Ingress (optional) ─────────────────────────────────────────
+section "Step 8: Router Ingress (optional)"
+apply_router_ingress
 
 # ── Step 9: Default CodeInterpreter templates (optional) ──────────────────────
 section "Step 9: Default CodeInterpreter templates (optional)"
@@ -533,6 +602,11 @@ fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 section "Install complete"
+if [[ -n "${INGRESS_HOST}" ]]; then
+    INGRESS_SUMMARY="router Ingress https://${INGRESS_HOST}/sandboxes"
+else
+    INGRESS_SUMMARY="router Ingress not created (INGRESS_HOST unset)"
+fi
 cat <<EOF
 
   Resources installed:
@@ -544,12 +618,12 @@ cat <<EOF
         Service      workloadmanager:8080
         Service      agent-sandbox-router:8080
     - RuntimeClass kata-qemu     (INSTALL_RUNTIMECLASS=${INSTALL_RUNTIMECLASS})
-    - Higress Ingress            (INSTALL_INGRESS=${INSTALL_INGRESS}, variant=${INGRESS_VARIANT})
+    - ${INGRESS_SUMMARY}
     - Default templates          (INSTALL_DEFAULT_TEMPLATES=${INSTALL_DEFAULT_TEMPLATES}, variant=${TEMPLATES_VARIANT})
 
   Notes:
     - Kata RuntimeClass alone is harmless; runtime binaries still require: sudo bash ${SCRIPT_DIR}/install-kata.sh (per worker node)
-    - Ingress requires Higress controller in the cluster; override host via INGRESS_HOST=<fqdn>
+    - Router Ingress is mounted on INGRESS_HOST at /sandboxes and the E2B data-plane paths. Leave INGRESS_HOST unset to skip it.
 
   Uninstall:
     DELETE_CRDS=true bash ${SCRIPT_DIR}/uninstall.sh

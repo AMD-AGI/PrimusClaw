@@ -101,6 +101,12 @@ log "Go:       ${GO_BIN} ($(${GO_BIN} version | awk '{print $3}'))"
 
 cd "${REPO_ROOT}"
 
+# Both Dockerfiles install these into the image trust store. A missing file
+# must stop the build here, not produce an image that cannot verify AMD TLS.
+for cert in docker/certs/amd-root-ca.crt docker/certs/amd-issuing-ca.crt; do
+  [[ -s "${cert}" ]] || err "AMD CA certificate is missing: ${cert}"
+done
+
 # ── Step 1: build Go binaries ─────────────────────────────────────────────────
 head "Step 1: Build Go binaries"
 mkdir -p bin
