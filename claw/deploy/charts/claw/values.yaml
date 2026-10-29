@@ -49,6 +49,14 @@ api:
   extraVolumes: []
   extraVolumeMounts: []
   port: 8200
+  # Where a client outside the cluster reaches the API, as CLAW_PUBLIC_URL --
+  # "https://claw.example.com/claw-api". A2A agent cards advertise it, and the
+  # ingress strips its path prefix before the API sees the request, so without
+  # it a card would point clients at a path that 404s. Empty derives
+  # https://<ingress.host><ingress.path> when the ingress is enabled; set it
+  # when the public scheme or host is not what the ingress says (plain http, a
+  # CDN or another gateway in front).
+  publicUrl: ""
   # Browser origins allowed to call the API with credentials, comma-separated
   # and including the scheme -- "https://claw.example.com,https://admin.example.com".
   #
