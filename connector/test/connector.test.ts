@@ -51,6 +51,48 @@ describe("identity, heartbeat and presence", () => {
   });
 });
 
+describe("start-up when the network or a provider is not ready", () => {
+  test("Claw answering 503 at first is waited out: the connector registers and comes online by itself", async () => {
+    const claw = await FakeClaw.start();
+    claw.unavailable = 3; // the register call and the first heartbeats
+    const h = await make({ claw });
+    await h.online();
+    assert.equal(claw.unavailable, 0);
+    assert.equal(claw.registered, 1);
+  });
+  test("an identity service that cannot be reached yet (a transient refresh failure) is waited out too", async () => {
+    const { TransientAuthError } = await import("../src/credentials.js");
+    let calls = 0;
+    const tokens = { async bearer() { if (++calls <= 2) throw new TransientAuthError("identity service not up yet"); return "good-token"; }, invalidate() {} };
+    const h = await make({ tokens });
+    await h.online();
+    assert.ok(calls > 2);
+  });
+  test("nothing listening at all (no network) keeps the connector retrying instead of exiting; it ends cleanly on stop", async () => {
+    const claw = await FakeClaw.start();
+    await claw.close(); // the address is now dead
+    const h = await make({ claw, start: false });
+    let settled = false;
+    void h.start().then(() => { settled = true; }, () => { settled = true; });
+    await sleep(500);
+    assert.equal(settled, false, "still trying");
+    assert.equal(await h.stop(), "stopped");
+  });
+  test("stop() during the retries ends the run cleanly", async () => {
+    const claw = await FakeClaw.start();
+    claw.unavailable = 1_000_000;
+    const h = await make({ claw });
+    await claw.until("a few attempts", () => claw.requests.length >= 3);
+    assert.equal(await h.stop(), "stopped");
+  });
+  test("a refused credential or a missing scope is not retried: the run ends with the error", async () => {
+    const h = await make({ token: "wrong", start: false });
+    h.start();
+    await assert.rejects(h.running!, (e: any) => e.status === 401);
+    assert.ok(h.claw.requests.length <= 2, "no retry loop");
+  });
+});
+
 describe("working directory whitelist", () => {
   test("a directory outside the roots is refused: no process is started, the session is closed with the reason", async () => {
     const h = await make();

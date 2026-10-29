@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { ClawClient } from "../../src/claw-client.js";
 import { parseConfig, type ConnectorConfig } from "../../src/config.js";
 import { Connector, type ConnectorTiming, type RunResult } from "../../src/connector.js";
-import { KeyTokenProvider } from "../../src/credentials.js";
+import { KeyTokenProvider, type TokenProvider } from "../../src/credentials.js";
 import { fileAudit } from "../../src/audit.js";
 import { auditFile, resolveDirs, type Dirs } from "../../src/paths.js";
 import { silentLogger } from "../../src/util.js";
@@ -34,6 +34,7 @@ export interface HarnessOptions {
   home?: string;
   work?: string;
   token?: string;
+  tokens?: TokenProvider;
   start?: boolean;
 }
 
@@ -76,7 +77,7 @@ ${envToml}
 
   /** (Re)build the connector object on the same home, as after a restart. */
   connect(o: HarnessOptions = {}): void {
-    const client = new ClawClient({ server: this.claw.url, tokens: new KeyTokenProvider(o.token ?? "good-token"), requestTimeoutMs: 3000 });
+    const client = new ClawClient({ server: this.claw.url, tokens: o.tokens ?? new KeyTokenProvider(o.token ?? "good-token"), requestTimeoutMs: 3000 });
     this.connector = new Connector({
       config: this.config, dirs: this.dirs, client, server: this.claw.url, audit: fileAudit(auditFile(this.dirs)), log: silentLogger,
       version: "test", timing: { ...FAST, ...(o.timing ?? {}) },

@@ -26,6 +26,8 @@ export class FakeClaw {
   muted = false;
   /** Answer the next N event posts with 503. */
   failPosts = 0;
+  /** Answer the next N requests, whatever they are, with 503. */
+  unavailable = 0;
   /** Refuse (name in `rejected`, as the real server does) every event of this type. */
   rejectType: string | null = null;
   /** Store the next N event posts but close the socket before answering (a lost acknowledgement). */
@@ -125,6 +127,7 @@ export class FakeClaw {
     const url = new URL(req.url ?? "/", "http://x");
     const path = url.pathname.replace(/^\/claw-api/, "");
     this.requests.push({ method: req.method ?? "", path, auth: req.headers.authorization, client: req.headers["x-claw-client"] as string | undefined });
+    if (this.unavailable > 0) { this.unavailable--; return this.json(res, 503, { ok: false, error: "unavailable" }); }
     const token = (req.headers.authorization ?? "").replace(/^Bearer /, "");
     if (!this.tokens.has(token)) return this.json(res, 401, { ok: false, error: "unauthorized" });
     const m = /^\/v1\/remote-agents\/connectors(?:\/([^/]+)\/(heartbeat|events|commands))?$/.exec(path);

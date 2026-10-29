@@ -10,9 +10,9 @@ import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { Audit } from "./audit.js";
 import { ChildRegistry, processStart } from "./children.js";
-import { ClawClient, HttpError, RevokedError } from "./claw-client.js";
+import { ClawClient, HttpError, RevokedError, TransportError } from "./claw-client.js";
 import type { ConnectorConfig } from "./config.js";
-import { GrantRevokedError } from "./credentials.js";
+import { GrantRevokedError, TransientAuthError } from "./credentials.js";
 import { SessionManager, type Command } from "./manager.js";
 import { Outbox } from "./outbox.js";
 import {
@@ -113,6 +113,11 @@ export interface ConnectorDeps {
 }
 
 export type RunResult = "stopped" | "revoked";
+
+/** Failures that pass by themselves: no connection, a provider that is down or busy. */
+export function isTransient(e: unknown): boolean {
+  return e instanceof TransientAuthError || e instanceof TransportError || (e instanceof HttpError && (e.status >= 500 || e.status === 429));
+}
 
 export class Connector {
   readonly timing: ConnectorTiming;
@@ -217,6 +222,28 @@ export class Connector {
       }
       throw e;
     }
+  }
+
+  /**
+   * Identify to Claw and send the first heartbeat, trying again (with the usual backoff) while the failure is
+   * the kind that passes: no network yet (a laptop that woke before Wi-Fi), the identity service or Claw
+   * answering 5xx or 429. Anything else (a refused credential, a missing scope) is a problem a retry will not
+   * fix and ends the run with its message.
+   */
+  private async startup(): Promise<"ok" | "stopped" | "revoked"> {
+    for (let attempt = 0; !this.ctl.signal.aborted; attempt++) {
+      try {
+        await this.identify();
+        await this.firstHeartbeat();
+        return "ok";
+      } catch (e) {
+        if (this.isRevocation(e)) { await this.onRevoked(errMessage(e)); return "revoked"; }
+        if (!isTransient(e)) throw e;
+        this.d.log.warn("cannot reach Claw yet; will retry", { error: errMessage(e), attempt });
+        await sleep(backoffMs(attempt, this.timing.backoffMinMs, this.timing.backoffMaxMs), this.ctl.signal);
+      }
+    }
+    return "stopped";
   }
 
   // --- revocation and pause ----------------------------------------------------------
@@ -393,13 +420,8 @@ export class Connector {
     fs.writeFileSync(pidf, JSON.stringify({ pid: process.pid, start: processStart(process.pid) ?? "" }), { mode: 0o600 });
     this.paused = fs.existsSync(pauseFile(this.d.dirs));
     try {
-      try {
-        await this.identify();
-        await this.firstHeartbeat();
-      } catch (e) {
-        if (this.isRevocation(e)) { await this.onRevoked(errMessage(e)); return "revoked"; }
-        throw e;
-      }
+      const up = await this.startup();
+      if (up !== "ok") return up;
       this.d.audit.record("connector_online", { connector_id: this.cid, agents: this.d.config.agents.map((a) => a.id), paused: this.paused });
       await Promise.all([this.sender(), this.heartbeater(), this.streamLoop(), this.pauseWatcher()]);
     } finally {
