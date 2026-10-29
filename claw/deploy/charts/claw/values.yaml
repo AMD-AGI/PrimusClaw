@@ -506,9 +506,10 @@ grantSigningKey:
 # Shared identity client for API and Brain: OIDC discovery and the issuer's JWKS,
 # RFC 7662 token introspection (positive answers cached, inactive ones cached
 # briefly, concurrent lookups of one credential coalesced), and an RFC 8693 token
-# exchange client with a token cache. Off by default, and the one request it
-# authenticates is a connector's access token on the remote-agents connector
-# routes: enabling it builds the client, reads discovery and the key set in the
+# exchange client with a token cache. Off by default; it authenticates a
+# connector's access token on the remote-agents connector routes and, only when
+# identity.tokenAuth is on, an identity provider's access token on the API:
+# enabling the client builds it, reads discovery and the key set in the
 # background, and starts exporting the claw_identity_* metrics.
 #
 # The client secret is never rendered from values. Create the Secret out of band
@@ -542,6 +543,15 @@ identity:
   requestTimeoutMs: ""       # default 5000
   keysRefreshSeconds: ""     # discovery and JWKS refresh, default 300
   exchangeRefreshSkewSeconds: ""  # an exchanged token with less left is replaced, default 30
+  # Accept an access token the identity provider issued (an RFC 9068 JWT, sent as
+  # `Authorization: Bearer`) as a credential for the API, beside the credentials it
+  # already accepts. Off by default; needs identity.enabled, which verifies the
+  # token. Rendered into the API Deployment only.
+  tokenAuth:
+    enabled: false
+    audience: ""    # the `aud` the token must name, default claw-api
+    scope: ""       # the scope the token must carry, default claw.api
+    introspect: false  # also ask the provider whether the token is still active, so a revoked grant stops at once
 
 sandboxTemplate:
   enabled: true

@@ -28,6 +28,14 @@ record it.
 ## [Unreleased]
 
 ### Added
+- The API accepts an access token from an OpenID Connect identity provider (`Authorization: Bearer <JWT>`,
+  verified by the shared identity client against the issuer's key set) as a credential beside the existing
+  ones, behind `CLAW_IDENTITY_TOKEN_AUTH_ENABLED` (off by default; also needs `IDENTITY_CLIENT_ENABLED`).
+  The token must be typed `at+jwt`, name `CLAW_IDENTITY_TOKEN_AUDIENCE` (default `claw-api`) and carry
+  `CLAW_IDENTITY_TOKEN_SCOPE` (default `claw.api`); `sub` becomes the user id and the caller has the `default`
+  role only (the token's `roles` are not copied, so enabling this never grants admin).
+  `CLAW_IDENTITY_TOKEN_INTROSPECT` also asks the provider whether the token is still active. The chart takes
+  `identity.tokenAuth`. See `claw/docs/identity-client.md`.
 - A user can vote on an answer of their own session. `PUT /v1/sessions/:sessionId/feedback`
   (`{ "message_id", "vote": "up" | "down", "reason"? }`) records it and
   `DELETE /v1/sessions/:sessionId/feedback/:messageId` takes it back; both answer `{ "ok": true }`.
@@ -80,8 +88,8 @@ record it.
   connector-side action used. Off unless remote agents and the identity client are both on. See
   `claw/docs/remote-agents.md`.
 - A shared identity client in `@claw/utils`, built by API and Brain when
-  `IDENTITY_CLIENT_ENABLED=true` (off by default; the one request it authenticates is a connector's access
-  token, above). It does OIDC
+  `IDENTITY_CLIENT_ENABLED=true` (off by default; it authenticates a request only through the access-token
+  credentials above, a connector's and an identity provider's). It does OIDC
   discovery and caches the issuer's JWKS, RFC 7662 token introspection (an active answer is cached for
   30 s, an inactive one for 5 s, concurrent lookups of one credential share one call), and an RFC 8693
   token exchange with a token cache. When the provider cannot be asked, a cached active answer keeps

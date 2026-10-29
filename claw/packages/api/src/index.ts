@@ -157,7 +157,7 @@ async function main() {
   // otherwise start exporting neither.
   assertRolloutConfigAtStartup();
   assertAdmissionSettings(logger);
-  // Off unless IDENTITY_CLIENT_ENABLED is set; the one request it authenticates is a connector's access token.
+  // Off unless IDENTITY_CLIENT_ENABLED is set; it authenticates a connector's access token, and an identity provider's access token only with CLAW_IDENTITY_TOKEN_AUTH_ENABLED.
   startIdentityClient(logger);
   // Validate USER_ENV_ENCRYPTION_KEY before doing anything else; we want a
   // fast-fail if the K8s Secret is misconfigured (missing or wrong length),
