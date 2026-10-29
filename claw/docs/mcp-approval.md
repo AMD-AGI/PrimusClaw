@@ -37,11 +37,18 @@ an object with a `tool` and an optional `when`:
   person, and is denied when nobody answers or no approval channel exists.
 - A listed call runs at once, with no approval card, even in a session nobody is
   watching. It is recorded as a `decisionResult` with `by: "policy"` and counted
-  in `claw_hitl_policy_allow_total{rule}`.
+  in `claw_hitl_policy_allow_total`. The counter has no labels, because a request
+  can carry its own server spec and a label per server or entry would be a series
+  per request; the entry that released the call is the `rule` field of the
+  `hitl.policy_allow` log line.
 - `when` compares the call's top-level arguments with strict equality: each value
   must be a string, number, boolean or `null`, and every listed key must be present
   and equal. A nested argument cannot be matched, so a tool whose risk sits inside
   a nested argument should not rely on `when`; check it on the server.
+- `when` constrains only the keys it names. Any other argument the call carries is
+  not checked: with `{ "tool": "plan_set_status", "when": { "status": "paused" } }`
+  the call `{ "status": "paused", "plan_id": "*", "cascade": true }` is released
+  too. Name every argument that matters in `when`, or do not list the tool.
 - A `null`, a bare `*`, a bare `true`, an empty list, an unknown key in an entry, or
   an empty or non-scalar `when` is malformed (only an absent field means no rule). A malformed `auto_approve` fails closed: the
   whole field is ignored, so nothing of that server is released, and

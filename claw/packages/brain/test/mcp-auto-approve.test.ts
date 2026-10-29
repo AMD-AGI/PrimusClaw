@@ -29,10 +29,10 @@ const T = (bare: string) => `mcp__safe__${bare}`;
 test("no auto_approve means today's behaviour: held tools are held, none is released", () => {
   const p = approvalPolicyFromMcp(spec({ requires_approval: ["job_*"] }));
   assert.equal(p.requiresApproval(T("job_requeue")), true);
-  assert.equal(p.autoApproves(T("job_requeue"), {}), false);
+  assert.equal(p.autoApprovalRule(T("job_requeue"), {}) !== null, false);
   for (const none of [undefined, null]) {
     const q = approvalPolicyFromMcp(spec({ requires_approval: true, auto_approve: none }));
-    assert.equal(q.autoApproves(T("anything"), {}), false);
+    assert.equal(q.autoApprovalRule(T("anything"), {}) !== null, false);
   }
 });
 
@@ -41,28 +41,28 @@ test("a listed tool is released, an unlisted held tool is not", () => {
     requires_approval: true,
     auto_approve: ["job_requeue", "get_*"],
   }));
-  assert.equal(p.autoApproves(T("job_requeue"), { id: "j1" }), true);
-  assert.equal(p.autoApproves(T("get_job"), {}), true);
-  assert.equal(p.autoApproves(T("get_"), {}), true);
+  assert.equal(p.autoApprovalRule(T("job_requeue"), { id: "j1" }) !== null, true);
+  assert.equal(p.autoApprovalRule(T("get_job"), {}) !== null, true);
+  assert.equal(p.autoApprovalRule(T("get_"), {}) !== null, true);
   // Still held, and not released: the rest of the server waits for a person.
   for (const bare of ["job_requeue_all", "job_cancel", "plan_recycle", "xget_job", "job_requeu"]) {
     assert.equal(p.requiresApproval(T(bare)), true, bare);
-    assert.equal(p.autoApproves(T(bare), {}), false, bare);
+    assert.equal(p.autoApprovalRule(T(bare), {}) !== null, false, bare);
   }
   // Another server's tool of the same name, and the bare name, are no match.
-  assert.equal(p.autoApproves("mcp__other__job_requeue", {}), false);
-  assert.equal(p.autoApproves("job_requeue", {}), false);
+  assert.equal(p.autoApprovalRule("mcp__other__job_requeue", {}) !== null, false);
+  assert.equal(p.autoApprovalRule("job_requeue", {}) !== null, false);
 });
 
 test("auto_approve narrows a hold; it never creates one", () => {
   const p = approvalPolicyFromMcp(spec({ requires_approval: ["job_cancel"], auto_approve: ["job_requeue"] }));
   // Not held at all: nothing to release, and nothing is reported as approved.
   assert.equal(p.requiresApproval(T("job_requeue")), false);
-  assert.equal(p.autoApproves(T("job_requeue"), {}), false);
+  assert.equal(p.autoApprovalRule(T("job_requeue"), {}) !== null, false);
   const alone = approvalPolicyFromMcp(spec({ auto_approve: ["job_requeue"] }));
   assert.equal(alone.active, false);
   assert.equal(alone.requiresApproval(T("job_requeue")), false);
-  assert.equal(alone.autoApproves(T("job_requeue"), {}), false);
+  assert.equal(alone.autoApprovalRule(T("job_requeue"), {}) !== null, false);
   // requires_approval: false is an explicit no rule, whatever auto_approve says.
   assert.equal(approvalPolicyFromMcp(spec({ requires_approval: false, auto_approve: ["x"] })).active, false);
 });
@@ -89,15 +89,17 @@ test("when: top-level scalars compared with strict equality", () => {
     ["a nested value never equals a scalar", { status: "paused" }, { status: { v: "paused" } }, false],
     ["an array never equals a scalar", { status: "paused" }, { status: ["paused"] }, false],
     ["an inherited key is not an argument", { toString: "x" }, {}, false],
+    // Documented: a `when` constrains the keys it names and nothing else.
+    ["an argument the when does not name is not checked", { status: "paused" }, { status: "paused", plan_id: "*", cascade: true }, true],
   ];
   // An argument that is only inherited (never from JSON, but nothing may rely on that).
   const inherited = Object.create({ status: "paused" }) as Record<string, unknown>;
-  assert.equal(rule({ status: "paused" }).autoApproves(T("plan_set_status"), inherited), false, "inherited value");
+  assert.equal(rule({ status: "paused" }).autoApprovalRule(T("plan_set_status"), inherited) !== null, false, "inherited value");
   for (const [name, when, input, want] of cases) {
-    assert.equal(rule(when).autoApproves(T("plan_set_status"), input), want, name);
+    assert.equal(rule(when).autoApprovalRule(T("plan_set_status"), input) !== null, want, name);
   }
   // The tool still has to be the listed one.
-  assert.equal(rule({ status: "paused" }).autoApproves(T("plan_delete"), { status: "paused" }), false);
+  assert.equal(rule({ status: "paused" }).autoApprovalRule(T("plan_delete"), { status: "paused" }) !== null, false);
 });
 
 test("a prefix entry carries its when; one unconditional entry releases the tool", () => {
@@ -105,10 +107,10 @@ test("a prefix entry carries its when; one unconditional entry releases the tool
     requires_approval: true,
     auto_approve: [{ tool: "plan_*", when: { dry_run: true } }, "plan_get"],
   }));
-  assert.equal(p.autoApproves(T("plan_pause"), { dry_run: true }), true);
-  assert.equal(p.autoApproves(T("plan_pause"), { dry_run: false }), false);
-  assert.equal(p.autoApproves(T("plan_pause"), {}), false);
-  assert.equal(p.autoApproves(T("plan_get"), {}), true);
+  assert.equal(p.autoApprovalRule(T("plan_pause"), { dry_run: true }) !== null, true);
+  assert.equal(p.autoApprovalRule(T("plan_pause"), { dry_run: false }) !== null, false);
+  assert.equal(p.autoApprovalRule(T("plan_pause"), {}) !== null, false);
+  assert.equal(p.autoApprovalRule(T("plan_get"), {}) !== null, true);
 });
 
 test("a malformed auto_approve releases nothing of that server, and the holds stay", () => {
@@ -128,14 +130,14 @@ test("a malformed auto_approve releases nothing of that server, and the holds st
     });
     const label = JSON.stringify(value) ?? String(value);
     assert.equal(p.requiresApproval(T("a")), true, label);
-    assert.equal(p.autoApproves(T("a"), { x: 1 }), false, label);
-    assert.equal(p.autoApproves(T("b"), {}), false, label);
+    assert.equal(p.autoApprovalRule(T("a"), { x: 1 }) !== null, false, label);
+    assert.equal(p.autoApprovalRule(T("b"), {}) !== null, false, label);
     // The malformed server does not take another server's list down with it.
-    assert.equal(p.autoApproves("mcp__other__a", {}), true, label);
+    assert.equal(p.autoApprovalRule("mcp__other__a", {}) !== null, true, label);
     // A good entry beside the bad one is not released either: the list is void as a whole.
     if (Array.isArray(value) && value.length > 0) {
       const mixed = approvalPolicyFromMcp(spec({ requires_approval: true, auto_approve: ["good", ...value] }));
-      assert.equal(mixed.autoApproves(T("good"), { x: 1 }), false, `good + ${label}`);
+      assert.equal(mixed.autoApprovalRule(T("good"), { x: 1 }) !== null, false, `good + ${label}`);
     }
   }
 });
@@ -146,21 +148,21 @@ test("both spellings must release a call; one cannot widen the other", () => {
     auto_approve: ["a", "b"],
     autoApprove: ["b", "c"],
   }));
-  assert.equal(p.autoApproves(T("a"), {}), false);
-  assert.equal(p.autoApproves(T("b"), {}), true);
-  assert.equal(p.autoApproves(T("c"), {}), false);
+  assert.equal(p.autoApprovalRule(T("a"), {}) !== null, false);
+  assert.equal(p.autoApprovalRule(T("b"), {}) !== null, true);
+  assert.equal(p.autoApprovalRule(T("c"), {}) !== null, false);
   // A readable spelling cannot rescue an unreadable one, and an explicit null is unreadable, not absent.
   for (const bad of ["a", null, []]) {
     const q = approvalPolicyFromMcp(spec({ requires_approval: true, auto_approve: ["a"], autoApprove: bad }));
-    assert.equal(q.autoApproves(T("a"), {}), false, JSON.stringify(bad));
+    assert.equal(q.autoApprovalRule(T("a"), {}) !== null, false, JSON.stringify(bad));
     const r = approvalPolicyFromMcp(spec({ requires_approval: true, auto_approve: bad, autoApprove: ["a"] }));
-    assert.equal(r.autoApproves(T("a"), {}), false, JSON.stringify(bad));
+    assert.equal(r.autoApprovalRule(T("a"), {}) !== null, false, JSON.stringify(bad));
     assert.equal(r.requiresApproval(T("a")), true, JSON.stringify(bad));
   }
   // Absent is absent: the one spelling present decides.
-  assert.equal(approvalPolicyFromMcp(spec({ requires_approval: true, auto_approve: ["a"], autoApprove: undefined })).autoApproves(T("a"), {}), true);
+  assert.equal(approvalPolicyFromMcp(spec({ requires_approval: true, auto_approve: ["a"], autoApprove: undefined })).autoApprovalRule(T("a"), {}) !== null, true);
   // The camelCase spelling works on its own.
-  assert.equal(approvalPolicyFromMcp(spec({ requiresApproval: ["a"], autoApprove: ["a"] })).autoApproves(T("a"), {}), true);
+  assert.equal(approvalPolicyFromMcp(spec({ requiresApproval: ["a"], autoApprove: ["a"] })).autoApprovalRule(T("a"), {}) !== null, true);
 });
 
 test("a tool two servers claim is released only when both release it", () => {
@@ -170,12 +172,12 @@ test("a tool two servers claim is released only when both release it", () => {
     a__b: { ...base, requires_approval: ["c"] },
   });
   assert.equal(only.requiresApproval("mcp__a__b__c"), true);
-  assert.equal(only.autoApproves("mcp__a__b__c", {}), false);
+  assert.equal(only.autoApprovalRule("mcp__a__b__c", {}) !== null, false);
   const both = approvalPolicyFromMcp({
     a: { ...base, requires_approval: ["b__c"], auto_approve: ["b__c"] },
     a__b: { ...base, requires_approval: ["c"], auto_approve: ["c"] },
   });
-  assert.equal(both.autoApproves("mcp__a__b__c", {}), true);
+  assert.equal(both.autoApprovalRule("mcp__a__b__c", {}) !== null, true);
 });
 
 test("the field survives normalizeMcpConfigs", () => {
@@ -239,8 +241,7 @@ function controllerFor(servers: Record<string, Record<string, unknown>>, d: Retu
   const approval = approvalPolicyFromMcp(servers);
   return new HitlController(d as never, onEvent as never, {
     requireApproval: (t) => approval.requiresApproval(t),
-    autoApprove: (t, input) => approval.autoApproves(t, input),
-    autoApproveRule: (t, input) => approval.autoApprovalRule(t, input),
+    autoApprovalRule: (t, input) => approval.autoApprovalRule(t, input),
   });
 }
 
@@ -338,7 +339,7 @@ test("a per-call hold (the bash rules' form) is never lifted by auto_approve", a
   const c = new HitlController(d as never, async (e) => { events.push(e as never); }, {
     requireApproval: (t) => t === "x",
     requireApprovalFor: () => "a rule",
-    autoApprove: () => true,
+    autoApprovalRule: () => "x",
   });
   assert.equal(c.willAsk("x", {}), true);
   assert.equal((await c.beforeToolUse({ sessionId: "s", actionId: "a1", tool: "x", input: {} })).action, "deny");
@@ -349,7 +350,7 @@ test("a released call is not a wait: willAsk says so, a held one still says yes"
   const approval = approvalPolicyFromMcp(SERVER);
   const mk = (d: unknown) => new HitlController(d as never, async () => {}, {
     requireApproval: (t) => approval.requiresApproval(t),
-    autoApprove: (t, input) => approval.autoApproves(t, input),
+    autoApprovalRule: (t, input) => approval.autoApprovalRule(t, input),
   });
   for (const d of [fakeDispatcher({ decision: "allow" }), null]) {
     const c = mk(d);
@@ -361,58 +362,86 @@ test("a released call is not a wait: willAsk says so, a held one still says yes"
   }
 });
 
-test("only an exact true releases a hold", async () => {
-  for (const answer of [1, "yes", {}, [], undefined, null, "true"]) {
+test("only a non-empty rule string releases a hold", async () => {
+  for (const answer of [true, 1, {}, [], undefined, null, ""]) {
     const d = fakeDispatcher({ decision: "deny" });
     const c = new HitlController(d as never, async () => {}, {
       requireApproval: () => true,
-      autoApprove: () => answer as never,
+      autoApprovalRule: () => answer as never,
     });
     assert.equal((await c.beforeToolUse({ sessionId: "s", actionId: "a1", tool: "x", input: {} })).action, "deny", String(answer));
   }
 });
 
-test("autoApprove alone creates no hold and no approval", async () => {
+test("autoApprovalRule alone creates no hold and no approval", async () => {
   const events: Array<Record<string, unknown>> = [];
-  const c = new HitlController(null, async (e) => { events.push(e as never); }, { autoApprove: () => true });
+  const c = new HitlController(null, async (e) => { events.push(e as never); }, { autoApprovalRule: () => "x" });
   const r = await c.beforeToolUse({ sessionId: "s", actionId: "a1", tool: "x", input: {} });
   assert.deepEqual([r.action, (r as { by: string }).by], ["allow", "auto_allow"]);
   assert.equal(events.length, 0);
 });
 
-/** Every series of the release counter, by its `rule` label. */
-async function releaseSeries(): Promise<Map<string, number>> {
+/** Every series of the release counter: its label set and value. */
+async function releaseSeries(): Promise<Array<{ labels: Record<string, string>; value: number }>> {
   const m = registry.getSingleMetric("claw_hitl_policy_allow_total");
   assert.ok(m, "metric is registered");
   const { values } = await (m as unknown as { get(): Promise<{ values: Array<{ labels: Record<string, string>; value: number }> }> }).get();
-  return new Map(values.map((v) => [v.labels.rule, v.value]));
+  return values;
 }
+const released = async () => (await releaseSeries()).reduce((n, v) => n + v.value, 0);
 
-test("a policy release is counted, by the allowlist entry, and a refusal is not", async () => {
-  const count = async (rule: string) => (await releaseSeries()).get(rule) ?? 0;
-  const before = await count(T("job_requeue"));
-  const beforeHeld = await count(T("job_cancel"));
+test("a policy release is counted, and a refusal is not", async () => {
+  const before = await released();
   await run(T("job_requeue"), { job: "j1" }, null);
+  assert.equal(await released(), before + 1);
   await run(T("job_cancel"), { job: "j1" }, null);
-  assert.equal(await count(T("job_requeue")), before + 1);
-  assert.equal(await count(T("job_cancel")), beforeHeld);
+  assert.equal(await released(), before + 1);
 });
 
-test("a prefix entry is one series however many tool names a model invents", async () => {
-  const servers = spec({ requires_approval: true, auto_approve: ["get_*"] });
-  const before = await releaseSeries();
-  const invented = Array.from({ length: 25 }, (_, i) => T(`get_invented_${i}`));
-  for (const name of invented) {
-    const c = controllerFor(servers, null, async () => {});
-    const r = await c.beforeToolUse({ sessionId: "s", actionId: "a", tool: name, input: {} });
-    assert.equal((r as { by: string }).by, "policy", name);
+test("the counter stays one series however many tool names, servers or entries a model or a request invents", async () => {
+  const before = await released();
+  // A model inventing names under a prefix entry the operator wrote.
+  const prefixed = spec({ requires_approval: true, auto_approve: ["get_*"] });
+  for (let i = 0; i < 25; i++) {
+    const r = await controllerFor(prefixed, null, async () => {})
+      .beforeToolUse({ sessionId: "s", actionId: "a", tool: T(`get_invented_${i}`), input: {} });
+    assert.equal((r as { by: string }).by, "policy");
+  }
+  // A request carrying its own servers, each with its own random entry: engine.ts merges
+  // request.mcp_servers into the policy, so server name and entry are not the operator's.
+  for (let i = 0; i < 25; i++) {
+    const servers = { [`s${i}`]: { ...base, requires_approval: true, auto_approve: [`x${i}`] } };
+    const r = await controllerFor(servers, null, async () => {})
+      .beforeToolUse({ sessionId: "s", actionId: "a", tool: `mcp__s${i}__x${i}`, input: {} });
+    assert.equal((r as { by: string }).by, "policy");
   }
   const after = await releaseSeries();
-  // The label is the operator's entry, so 25 invented names add 25 to ONE series, not 25 series.
-  const added = [...after.keys()].filter((k) => !before.has(k));
-  assert.deepEqual(added, [T("get_*")]);
-  assert.equal((after.get(T("get_*")) ?? 0) - (before.get(T("get_*")) ?? 0), invented.length);
-  for (const name of invented) assert.equal(after.has(name), false, name);
+  assert.deepEqual(after.map((v) => v.labels), [{}], "one series and no label that carries what a caller sent");
+  assert.equal(after[0].value, before + 50);
+});
+
+test("the policy is read once per call, however the controller is asked", async () => {
+  const approval = approvalPolicyFromMcp(SERVER);
+  for (const [tool, input, dispatcher] of [
+    [T("job_requeue"), {}, null],                          // released
+    [T("job_requeue"), {}, fakeDispatcher({ decision: "allow" })],
+    [T("job_cancel"), {}, fakeDispatcher({ decision: "allow" })],   // held, asked
+    [T("job_cancel"), {}, null],                           // held, nobody to ask
+    [T("get_job"), {}, fakeDispatcher({ decision: "allow" })],      // held by `true`, asked
+  ] as const) {
+    const calls = { hold: 0, label: 0, rule: 0 };
+    const c = new HitlController(dispatcher as never, async () => {}, {
+      requireApproval: (t) => { calls.hold++; return approval.requiresApproval(t); },
+      requireApprovalFor: () => { calls.label++; return null; },
+      autoApprovalRule: (t, i) => { calls.rule++; return approval.autoApprovalRule(t, i); },
+    });
+    const name = `${tool} ${dispatcher ? "with" : "without"} a channel`;
+    c.willAsk(tool, input);
+    assert.deepEqual(calls, { hold: 1, label: 1, rule: 1 }, `willAsk: ${name}`);
+    Object.assign(calls, { hold: 0, label: 0, rule: 0 });
+    await c.beforeToolUse({ sessionId: "s", actionId: "a1", tool, input });
+    assert.deepEqual(calls, { hold: 1, label: 1, rule: 1 }, `beforeToolUse: ${name}`);
+  }
 });
 
 test("autoApprovalRule names the entry that releases a call, and nothing for a call that is held", () => {
@@ -425,8 +454,4 @@ test("autoApprovalRule names the entry that releases a call, and nothing for a c
   assert.equal(p.autoApprovalRule(T("plan_set_status"), { status: "paused" }), T("plan_set_status"));
   assert.equal(p.autoApprovalRule(T("plan_set_status"), { status: "running" }), null);
   assert.equal(p.autoApprovalRule(T("job_cancel"), {}), null);
-  // It agrees with autoApproves on every one of them.
-  for (const [bare, input] of [["job_requeue", {}], ["get_x", {}], ["job_cancel", {}], ["plan_set_status", { status: "running" }]] as const) {
-    assert.equal(p.autoApproves(T(bare), input), p.autoApprovalRule(T(bare), input) !== null, bare);
-  }
 });

@@ -36,7 +36,10 @@
  * logged. `when` compares top-level scalars only (string, number, boolean,
  * null) with strict equality; a nested argument cannot be matched, so a tool
  * whose danger sits in a nested argument must not be listed with a `when`
- * alone.
+ * alone. A `when` is a condition on the keys it names, not a whitelist of the
+ * call: any other argument the call carries is not checked, so a `when` on
+ * `status` releases `{ status: "paused", cascade: true }` as well. Name every
+ * argument that matters, or leave the tool unlisted.
  */
 import pino from "pino";
 
@@ -48,17 +51,13 @@ export interface ApprovalPolicy {
   /** `toolName` is the model-visible name, `mcp__<server>__<tool>`. */
   requiresApproval(toolName: string): boolean;
   /**
-   * True when `requires_approval` holds this call and the server's
-   * `auto_approve` lists it, so it may run without a decision. Never true for a
-   * call that is not held, and never true unless every server whose rule holds
-   * the tool also lists it.
-   */
-  autoApproves(toolName: string, input: Record<string, unknown>): boolean;
-  /**
    * The allowlist entry that releases this call, spelled `mcp__<server>__<entry>`
-   * (the entry is the operator's own text, `get_*` for a prefix), or null when
-   * the call is not released. Bounded by the operator's configuration, never by
-   * what a model sends, which is what makes it safe as a metric label.
+   * (the entry is the configured text, `get_*` for a prefix), or null when the
+   * call is not released: a non-null answer IS the release, so there is one
+   * question and one answer. It is null for a call that is not held, and unless
+   * every server whose rule holds the tool also lists it. A request can carry
+   * its own server spec, so the entry is free text from outside: fit for a log
+   * line, never for a metric label.
    */
   autoApprovalRule(toolName: string, input: Record<string, unknown>): string | null;
 }
@@ -206,9 +205,6 @@ export function approvalPolicyFromMcp(
     active: rules.length > 0,
     requiresApproval(toolName: string): boolean {
       return rules.some((r) => held(r, toolName));
-    },
-    autoApproves(toolName: string, input: Record<string, unknown>): boolean {
-      return releasedBy(toolName, input) !== null;
     },
     autoApprovalRule(toolName: string, input: Record<string, unknown>): string | null {
       return releasedBy(toolName, input);

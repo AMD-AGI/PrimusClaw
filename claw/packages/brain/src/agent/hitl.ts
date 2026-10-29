@@ -84,17 +84,14 @@ export interface HitlOptions {
    */
   requireApprovalFor?: (tool: string, input: Record<string, unknown>) => string | null;
   /**
-   * Of the calls `requireApproval` holds, those that may run without a
-   * decision (an explicit `auto_approve` allowlist). Consulted only for a call
-   * `requireApproval` holds and `requireApprovalFor` does not; it cannot release
-   * anything else, and an answer that is not exactly `true` releases nothing.
+   * Of the calls `requireApproval` holds, the allowlist entry (an explicit
+   * `auto_approve`) that lets one run without a decision, or null. Consulted only
+   * for a call `requireApproval` holds and `requireApprovalFor` does not; it
+   * cannot release anything else, and anything but a non-empty string releases
+   * nothing. The entry may come from the request, so it goes in the log line and
+   * never labels a metric.
    */
-  autoApprove?: (tool: string, input: Record<string, unknown>) => boolean;
-  /**
-   * The allowlist entry behind an `autoApprove` release, for the metric label.
-   * A model can send any tool name, so the raw name must not label a series.
-   */
-  autoApproveRule?: (tool: string, input: Record<string, unknown>) => string | null;
+  autoApprovalRule?: (tool: string, input: Record<string, unknown>) => string | null;
 }
 
 export class HitlController {
@@ -123,18 +120,7 @@ export class HitlController {
    * The same question `beforeToolUse` asks itself, so the two cannot drift.
    */
   willAsk(tool: string, input?: Record<string, unknown>): boolean {
-    // A call the policy lists for auto-approval waits for nobody, whether or
-    // not there is anyone to ask.
-    if (this.autoApproved(tool, input)) return false;
-    if (!this.dispatcher) return false;
-    // A policy-held tool is asked about every time: no session-wide allow.
-    if (this.mustAsk(tool, input)) return true;
-    if (!HITL_ENABLED) return false;
-    return !this.autoAllowSet.has(tool) && !this.alwaysAllow.has(tool);
-  }
-
-  private mustAsk(tool: string, input?: Record<string, unknown>): boolean {
-    return this.opts.requireApproval?.(tool) === true || this.holdLabel(tool, input) !== null;
+    return this.assess(tool, input).ask;
   }
 
   private holdLabel(tool: string, input?: Record<string, unknown>): string | null {
@@ -142,29 +128,41 @@ export class HitlController {
   }
 
   /**
-   * A held call the server's own allowlist releases. Only the server-level
-   * `requires_approval` hold can be released: a per-call hold (a bash rule) is
-   * never lifted here, and a tool nothing holds is not "approved" by this, it
-   * simply follows the ordinary HITL settings.
+   * Everything the controller decides about one call, read from the policy
+   * once: `willAsk` and `beforeToolUse` both answer from this, so they cannot
+   * drift.
+   *
+   * - `label`: the per-call hold (a bash rule), if any.
+   * - `must`: a policy holds the call, so it is always asked and never remembered.
+   * - `rule`: the allowlist entry that releases a server-level hold, else null.
+   *   Only the server-level `requires_approval` hold can be released: a per-call
+   *   hold is never lifted here, and a tool nothing holds is not "approved" by
+   *   this, it simply follows the ordinary HITL settings.
+   * - `ask`: a person has to be waited for. A released call waits for nobody,
+   *   whether or not there is anyone to ask; without a dispatcher there is
+   *   nobody to wait for.
    */
-  private autoApproved(tool: string, input?: Record<string, unknown>): boolean {
-    if (this.opts.requireApproval?.(tool) !== true) return false;
-    if (this.holdLabel(tool, input) !== null) return false;
-    return this.opts.autoApprove?.(tool, input ?? {}) === true;
+  private assess(tool: string, input?: Record<string, unknown>) {
+    const label = this.holdLabel(tool, input);
+    const held = this.opts.requireApproval?.(tool) === true;
+    const must = label !== null || held;
+    const entry = held && label === null ? this.opts.autoApprovalRule?.(tool, input ?? {}) : null;
+    const rule = typeof entry === "string" && entry !== "" ? entry : null;
+    const ask = rule === null && this.dispatcher !== null
+      && (must || (HITL_ENABLED && !this.autoAllowSet.has(tool) && !this.alwaysAllow.has(tool)));
+    return { label, must, rule, ask };
   }
 
   async beforeToolUse(req: HitlRequest): Promise<HitlResult> {
-    // Decided once: a rule that read the input twice could answer differently.
-    const label = this.holdLabel(req.tool, req.input);
-    const must = label !== null || this.opts.requireApproval?.(req.tool) === true;
-    if (this.autoApproved(req.tool, req.input)) {
+    const { label, must, rule, ask } = this.assess(req.tool, req.input);
+    if (rule !== null) {
       // The operator's explicit allowlist, not a person's decision: no card, no
-      // wait, and the record says so.
+      // wait, and the record says so. The entry is free text a request may have
+      // supplied, so it is logged and never made a metric label (a label per
+      // entry would be a series per request).
       const result: HitlResult = { action: "allow", input: req.input, by: "policy" };
-      // Labelled by the operator's entry, not by the name the model sent: HITL runs before any
-      // known-tool check, so a prefix entry would otherwise mint a series per invented name.
-      metrics.onHitlPolicyAllow(this.opts.autoApproveRule?.(req.tool, req.input) ?? "unspecified");
-      logger.info({ tool: req.tool, sessionId: req.sessionId }, "hitl.policy_allow");
+      metrics.onHitlPolicyAllow();
+      logger.info({ tool: req.tool, rule, sessionId: req.sessionId }, "hitl.policy_allow");
       await this.emitDecisionResult(req.actionId, result);
       return result;
     }
@@ -172,12 +170,12 @@ export class HitlController {
       // Nobody could answer, and the policy says a person must. Not an allow.
       return { action: "deny", reason: "approval required but no approval channel is available", by: "timeout", cause: "no_channel" };
     }
-    if (!(must || this.willAsk(req.tool, req.input))) {
+    if (!ask) {
       return { action: "allow", input: req.input, by: "auto_allow" };
     }
 
-    // Non-null by the guard above: willAsk() is false when there is no
-    // dispatcher, because there is then nobody who could answer.
+    // Non-null by the guard above: `ask` is false when there is no dispatcher,
+    // because there is then nobody who could answer.
     const dispatcher = this.dispatcher!;
     // Words for the person who has to decide, within a fixed budget. It runs BEFORE the
     // decision window opens: nobody can answer a request that has not been shown, so
