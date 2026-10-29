@@ -27,7 +27,7 @@ import {
   isRemoteCommandType, parseConnectorRegistration, parseCursor, parseEventBatch, parseHeartbeat,
   parseRemoteId, parseSessionNew, sseFrame, type RemoteCommandType,
 } from "@claw/protocol";
-import { CLAW_REMOTE_AGENTS_ENABLED } from "../config.js";
+import { CLAW_REMOTE_AGENTS_ENABLED, CLAW_REMOTE_AGENTS_RETENTION_DAYS } from "../config.js";
 import { getUser } from "../auth/middleware.js";
 import { db } from "../infra/db.js";
 import { redactPublicJson } from "../events/redaction.js";
@@ -41,6 +41,10 @@ export interface RemoteAgentOptions {
   pingMs?: number;
   /** How often a stream re-reads the database when nothing wakes it. */
   pollMs?: number;
+  /** Days a closed session and its events are kept; zero or less keeps them for ever. */
+  retentionDays?: number;
+  /** How often this replica looks for sessions past the retention. */
+  retentionSweepMs?: number;
   onlineWindowMs?: number;
   commandsPerMinute?: number;
   maxConnectorsPerUser?: number;
@@ -50,6 +54,18 @@ export interface RemoteAgentOptions {
   /** Shared with the process, so a test can see a stream leave. */
   waker?: Waker;
 }
+
+/**
+ * How long an idle stream waits before it reads the database anyway. A write made
+ * through this process wakes its streams at once, so this only bounds how late a
+ * write made through another replica is seen. Short enough for that, and long
+ * enough that a stream with nothing to say costs a query every few seconds, not
+ * every second: a ping every 25 s still keeps the connection itself alive.
+ */
+const IDLE_POLL_MS = 5_000;
+
+/** How often each replica deletes sessions that are past the retention. */
+const RETENTION_SWEEP_MS = 60 * 60 * 1000;
 
 const notFound = (reply: FastifyReply) => reply.status(404).send({ ok: false, error: "not_found" });
 const fail = (reply: FastifyReply, status: number, error: string) => reply.status(status).send({ ok: false, error });
@@ -134,13 +150,38 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
   if (!CLAW_REMOTE_AGENTS_ENABLED) return;
   const waker = opts.waker ?? new Waker();
   const pingMs = opts.pingMs ?? REMOTE_AGENT_TIMING.pingMs;
-  const pollMs = opts.pollMs ?? 1000;
+  const pollMs = opts.pollMs ?? IDLE_POLL_MS;
   const onlineWindowMs = opts.onlineWindowMs ?? REMOTE_AGENT_TIMING.onlineWindowMs;
   const commandsPerMinute = opts.commandsPerMinute ?? REMOTE_AGENT_LIMITS.commandsPerMinute;
   const maxConnectors = opts.maxConnectorsPerUser ?? REMOTE_AGENT_LIMITS.maxConnectorsPerUser;
   const maxActiveSessions = opts.maxActiveSessionsPerUser ?? REMOTE_AGENT_LIMITS.maxActiveSessionsPerUser;
   const maxStreams = opts.maxStreamsPerUser ?? 20;
   const timing = { pingMs, pollMs };
+
+  // Closed sessions and their events would otherwise be kept for ever. Every replica sweeps; the
+  // delete is idempotent, so two sweeping at once only share the work. The timer neither keeps
+  // the process alive nor outlives the server.
+  const retentionDays = opts.retentionDays ?? CLAW_REMOTE_AGENTS_RETENTION_DAYS;
+  const sweepMs = opts.retentionSweepMs ?? RETENTION_SWEEP_MS;
+  if (retentionDays > 0) {
+    let timer: NodeJS.Timeout | undefined;
+    let stopped = false;
+    const schedule = (ms: number) => {
+      if (stopped) return;
+      timer = setTimeout(async () => {
+        try {
+          const n = await store.pruneClosedSessions(retentionDays);
+          if (n > 0) logger.info({ sessions: n, retentionDays }, "remote_agents.retention_swept");
+        } catch (err) {
+          logger.warn({ err: (err as Error)?.message }, "remote_agents.retention_sweep_failed");
+        }
+        schedule(sweepMs);
+      }, ms);
+      timer.unref();
+    };
+    schedule(Math.min(sweepMs, 60_000));
+    app.addHook("onClose", async () => { stopped = true; clearTimeout(timer); });
+  }
   // A reader's stream polls the database, so one user cannot hold an unbounded number open.
   const openReaders = new Map<string, number>();
 
@@ -369,7 +410,9 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       const sessionId = parseRemoteId(req.params.id);
       const session = sessionId ? await store.findSession(owner, sessionId) : null;
       if (!sessionId || !session) return notFound(reply);
-      const resume = parseCursor(req.query.after, req.headers["last-event-id"]);
+      // `Last-Event-ID` first: a browser reconnects to the same URL and only updates that header,
+      // so `?after=` is where the stream began and goes stale as soon as one frame is delivered.
+      const resume = parseCursor(req.headers["last-event-id"], req.query.after);
       if (!resume.ok) return fail(reply, 400, resume.error);
       let cursor = resume.value;
 

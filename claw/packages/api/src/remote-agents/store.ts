@@ -152,6 +152,29 @@ export async function pruneCommands(q: Querier, connectorId: string, upTo: numbe
   );
 }
 
+/**
+ * Delete sessions that were closed more than `days` ago, and with them their stored events
+ * (the foreign key cascades). Live sessions are never touched, and the audit trail has no
+ * foreign key on purpose, so it keeps describing what was deleted. Deletes a bounded batch of
+ * sessions at a time so one statement never holds a lock over an unbounded number of events;
+ * returns how many sessions went.
+ */
+export async function pruneClosedSessions(days: number, batch = 100): Promise<number> {
+  let total = 0;
+  for (;;) {
+    const r = await direct(
+      `DELETE FROM claw_remote_sessions WHERE session_id IN (
+         SELECT session_id FROM claw_remote_sessions
+          WHERE status = 'closed' AND updated_at < NOW() - make_interval(secs => $1::float8)
+          ORDER BY updated_at LIMIT $2)`,
+      [days * 86_400, batch],
+    );
+    const n = r.rowCount ?? 0;
+    total += n;
+    if (n < batch) return total;
+  }
+}
+
 export async function markStreamOpen(connectorId: string, streamConn: string): Promise<void> {
   await direct(
     "UPDATE claw_remote_connectors SET stream_conn = $2, stream_seen_at = NOW() WHERE connector_id = $1",
@@ -361,6 +384,21 @@ export async function listAudit(owner: string, filter: { sessionId: string | nul
 }
 
 
+/**
+ * The decision already issued under `cmdId`, read from the audit trail, shaped like the queue row
+ * it replaces for the one field a caller compares (`payload.option_id`). Null when there is none.
+ */
+async function decisionIssued(q: Querier, owner: string, sessionId: string, cmdId: string): Promise<Row | null> {
+  const a = (await q(
+    `SELECT detail FROM claw_remote_audit
+      WHERE owner_user_id = $1 AND session_id = $2 AND action = 'command.issued' AND detail->>'cmd_id' = $3
+      ORDER BY id LIMIT 1`,
+    [owner, sessionId, cmdId],
+  )).rows[0];
+  if (!a) return null;
+  return { cmd_seq: null, cmd_id: cmdId, session_id: sessionId, type: a.detail?.type, payload: { option_id: a.detail?.option_id } };
+}
+
 export type IssueOutcome =
   | { status: "rate_limited" }
   | { status: "queued" | "duplicate"; row: Row };
@@ -396,6 +434,13 @@ export async function issueCommand(r: IssueRequest): Promise<IssueOutcome> {
       [r.connectorId, r.cmdId],
     )).rows[0];
     if (dup) return { status: "duplicate", row: dup } as IssueOutcome;
+    // A heartbeat deletes the queue row once the connector has handled the command, but the
+    // connector's own `permission_resolved` may not have arrived yet. In that window the queue
+    // no longer remembers the decision, so the audit trail, which is never pruned, does.
+    if (r.type === "decision") {
+      const prior = await decisionIssued(q, r.owner, r.sessionId, r.cmdId);
+      if (prior) return { status: "duplicate", row: prior } as IssueOutcome;
+    }
     if (await recentCommandCount(q, r.owner) >= r.commandsPerMinute) return { status: "rate_limited" } as IssueOutcome;
     const queued = await enqueueCommand(q, { connectorId: r.connectorId, cmdId: r.cmdId, sessionId: r.sessionId, type: r.type, payload: r.payload });
     await writeAudit(q, {

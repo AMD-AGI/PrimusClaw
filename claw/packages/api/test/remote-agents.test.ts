@@ -44,7 +44,7 @@ describe("remote agents", { skip }, () => {
         };
       }
     });
-    await register(app, { pingMs: 150, pollMs: 40, waker, ...opts });
+    await register(app, { pingMs: 150, pollMs: 40, waker, retentionDays: 0, ...opts });
     await app.listen({ port: 0, host: "127.0.0.1" });
     apps.push(app);
     return `http://127.0.0.1:${(app.server.address() as { port: number }).port}`;
@@ -560,6 +560,25 @@ describe("remote agents", { skip }, () => {
       assert.equal((await as("u1").get(`/v1/remote-agents/sessions/${sid}/events?after=x`)).status, 400);
     });
 
+    test("a reconnect resumes from Last-Event-ID, not from the ?after= the stream was first opened with", async () => {
+      const { cid } = await online1();
+      const sid = await session("u1", cid);
+      await post("u1", cid, [1, 2, 3, 4].map((n) => ev(sid, "agent_message_chunk", { n })));
+      const path = `/v1/remote-agents/sessions/${sid}/events`;
+      const ids: string[] = (await as("u1").get(`${path}?mode=replay`)).body.data.map((r: any) => r.id);
+      assert.equal(ids.length, 4);
+      // An EventSource opened with ?after=<first> and has delivered up to the third event reconnects
+      // to the same URL and changes only the header. Starting over from the first would send 2 and 3 again.
+      const s = await SseClient.open(`${base}${path}?after=${ids[0]}`, { "x-test-user": "u1", "last-event-id": ids[2]! });
+      streams.push(s);
+      assert.equal((await s.next()).id, ids[3]);
+      assert.equal((await s.nextEvent("historyComplete")).json().count, 1, "only the event after the header's id was replayed");
+      const replay = await call("u1", "GET", `${path}?mode=replay&after=${ids[0]}`, undefined, { "last-event-id": ids[2]! });
+      assert.deepEqual(replay.body.data.map((r: any) => r.id), [ids[3]], "replay pages by the same position");
+      // Without a header the query is still what it says.
+      assert.equal((await as("u1").get(`${path}?mode=replay&after=${ids[1]}`)).body.data.length, 2);
+    });
+
     test("overlapping posts of the same batch cannot reorder or duplicate a session's events", async () => {
       const { cid } = await online1();
       const sid = await session("u1", cid);
@@ -639,6 +658,30 @@ describe("remote agents", { skip }, () => {
       await post("u1", cid, [ev(sid, "permission_resolved", { actionId: "act-1", optionId: "allow-once", by: "u1" })], "b2");
       const late = await decide(sid, body);
       assert.deepEqual([late.status, late.body.error], [409, "already_resolved"]);
+    });
+
+    test("a different second choice is refused after a heartbeat forgot the first and before the connector reported it resolved", async () => {
+      const { cid } = await online1();
+      const sid = await session("u1", cid);
+      await post("u1", cid, [request(sid)]);
+      const first = await decide(sid, { action_id: "act-1", option_id: "allow-once" });
+      assert.equal(first.status, 202);
+      // The connector handled it and said so in a heartbeat, which deletes the queued row; the
+      // permission_resolved event that would close the request has not been posted yet.
+      assert.equal((await heartbeat("u1", cid, { cmd_cursor: first.body.data.cmd_seq })).status, 200);
+      const queued = async () => (await q("SELECT COUNT(*) AS n FROM claw_remote_commands WHERE type = 'decision'")).rows[0].n;
+      assert.equal(await queued(), "0", "the queue no longer remembers the decision");
+      const other = await decide(sid, { action_id: "act-1", option_id: "reject" });
+      assert.deepEqual([other.status, other.body.error], [409, "already_decided"]);
+      const again = await decide(sid, { action_id: "act-1", option_id: "allow-once" });
+      assert.deepEqual([again.status, again.body.data], [200, { cmd_id: `dec:${sid}:act-1`, duplicate: true }]);
+      assert.equal(await queued(), "0", "neither was queued");
+      const audited = (await as("u1").get(`/v1/remote-agents/audit?session_id=${sid}`)).body.data
+        .filter((r: any) => r.action === "command.issued" && r.detail.type === "decision");
+      assert.deepEqual(audited.map((r: any) => r.detail.option_id), ["allow-once"], "answered twice, audited once");
+      // Another action in the same session is its own question.
+      await post("u1", cid, [request(sid, "act-2")], "b2");
+      assert.equal((await decide(sid, { action_id: "act-2", option_id: "reject" })).status, 202);
     });
 
     test("a decision may be given while the connector is offline, since the request outlives the connection", async () => {
@@ -810,6 +853,91 @@ describe("remote agents", { skip }, () => {
       // The intruder is told nothing different from a missing id.
       assert.deepEqual((await heartbeat("u2", cid)).body, { ok: false, error: "not_found" });
     });
+
+    test("an idle stream reads the database only every few seconds, and a write through this process still reaches it at once", async () => {
+      // The default poll interval, and a ping slower than the window, so only polling touches the database.
+      const root = await serve({ pingMs: 60_000, pollMs: undefined });
+      const u = as("u1");
+      const cid = (await u.post("/v1/remote-agents/connectors", { name: "m" }, undefined, root)).body.data.connector_id;
+      const commands = await SseClient.open(`${root}/v1/remote-agents/connectors/${cid}/commands`, { "x-test-user": "u1" });
+      streams.push(commands);
+      await commands.nextEvent("ready");
+      await u.post(`/v1/remote-agents/connectors/${cid}/heartbeat`, { agents: [AGENT] }, undefined, root);
+      const sid = (await u.post("/v1/remote-agents/sessions", { connector_id: cid, agent_id: "a1", cwd: "/w" }, undefined, root)).body.data.session_id;
+      await commands.nextEvent("command");
+      const reader = await SseClient.open(`${root}/v1/remote-agents/sessions/${sid}/events`, { "x-test-user": "u1" });
+      streams.push(reader);
+      await reader.nextEvent("historyComplete");
+
+      const pool = h.app.db.db;
+      const real = pool.query;
+      let queries = 0;
+      pool.query = ((text: string, params?: unknown[]) => { queries++; return real(text, params); }) as typeof pool.query;
+      try {
+        await new Promise((r) => setTimeout(r, 2500));
+      } finally {
+        pool.query = real;
+      }
+      assert.equal(queries, 0, `an idle command stream and an idle reader read the database ${queries} times in 2.5 s`);
+
+      // The doorbell keeps them prompt: neither waits for its next poll. The shared waker stands for one process.
+      assert.equal((await u.post(`/v1/remote-agents/sessions/${sid}/commands`, { type: "cancel" }, undefined, root)).status, 202);
+      assert.equal((await commands.next((f) => f.event === "command", 1500)).json().type, "cancel");
+      assert.equal((await post("u1", cid, [ev(sid, "turn_end", {})])).status, 200);
+      assert.equal((await reader.nextEvent("turn_end", 1500)).json().type, "turn_end");
+    });
+  });
+
+  // ------------------------------------------------------------- retention
+
+  describe("retention", () => {
+    const store = () => import("../src/remote-agents/store.js");
+    const rows = async (table: string, sid: string) =>
+      Number((await q(`SELECT COUNT(*) AS n FROM ${table} WHERE session_id = $1`, [sid])).rows[0].n);
+    /** A session holding one event, `status` since `age`. */
+    async function aged(cid: string, status: "active" | "closed", age: string): Promise<string> {
+      const sid = await session("u1", cid);
+      await post("u1", cid, [ev(sid, "agent_message_chunk", { text: "kept?" })], `b-${sid}`);
+      await q("UPDATE claw_remote_sessions SET status = $2, updated_at = NOW() - $3::interval WHERE session_id = $1", [sid, status, age]);
+      return sid;
+    }
+
+    test("a closed session past the window goes with its events, a live or recent one stays, and the audit trail stays", async () => {
+      const { cid } = await online1();
+      const old = await aged(cid, "closed", "31 days");
+      const recent = await aged(cid, "closed", "29 days");
+      const abandoned = await aged(cid, "active", "90 days");
+      assert.equal(await (await store()).pruneClosedSessions(30), 1);
+      assert.deepEqual([await rows("claw_remote_sessions", old), await rows("claw_remote_events", old)], [0, 0]);
+      for (const kept of [recent, abandoned]) {
+        assert.deepEqual([await rows("claw_remote_sessions", kept), await rows("claw_remote_events", kept)], [1, 1], kept);
+      }
+      assert.ok(await rows("claw_remote_audit", old) > 0, "the audit trail outlives the session it describes");
+      assert.equal(await (await store()).pruneClosedSessions(30), 0, "nothing more to delete");
+    });
+
+    test("a backlog larger than one batch is cleared in one pass", async () => {
+      const { cid } = await online1();
+      const old: string[] = [];
+      for (let i = 0; i < 5; i++) old.push(await aged(cid, "closed", "40 days"));
+      assert.equal(await (await store()).pruneClosedSessions(30, 2), 5);
+      for (const sid of old) assert.equal(await rows("claw_remote_sessions", sid), 0);
+    });
+
+    test("the sweep runs on its own where retention is on, and not where it is off", async () => {
+      const { cid } = await online1();
+      const old = await aged(cid, "closed", "31 days");
+      await serve({ retentionDays: 0, retentionSweepMs: 30 });
+      await new Promise((r) => setTimeout(r, 300));
+      assert.equal(await rows("claw_remote_sessions", old), 1, "retention 0 keeps everything");
+      await apps.pop()!.close();
+      await serve({ retentionDays: 30, retentionSweepMs: 30 });
+      try {
+        for (let i = 0; i < 100 && await rows("claw_remote_sessions", old) > 0; i++) await new Promise((r) => setTimeout(r, 30));
+        assert.equal(await rows("claw_remote_sessions", old), 0, "swept without anyone calling it");
+      } finally {
+        await apps.pop()!.close();
+      }
+    });
   });
 });
-

@@ -423,6 +423,9 @@ export const NOTIFY_LINK_BASE = env("NOTIFY_LINK_BASE", "/primus-claw");
 // When false: no remote-agent tables, no routes, and nothing polls. A connector
 // on a user's machine dials out to these routes; see docs/remote-agents.md.
 export const CLAW_REMOTE_AGENTS_ENABLED = envBool("CLAW_REMOTE_AGENTS_ENABLED", false);
+// Days a closed remote-agent session, with its stored events, is kept. Zero or
+// less keeps them for ever. The audit trail is not touched by this.
+export const CLAW_REMOTE_AGENTS_RETENTION_DAYS = envInt("CLAW_REMOTE_AGENTS_RETENTION_DAYS", 30);
 
 /**
  * Scheduled triggers: a cron schedule that starts a run as the user who created

@@ -78,8 +78,8 @@ connector-side route answers `401 revoked`.
 | `POST /v1/remote-agents/sessions` | `{connector_id, agent_id, cwd, mode?}`. `409 connector_offline` unless online. |
 | `GET .../sessions`, `GET .../sessions/:id` | List, and read one with `connector_online`. |
 | `POST .../sessions/:id/commands` | `{type: prompt\|cancel\|set_mode\|resume\|close, ...}`. `Idempotency-Key` makes a retry queue one command. |
-| `POST .../sessions/:id/decisions` | `{action_id, option_id}`, an option the agent offered. Answered twice, counted once. |
-| `GET .../sessions/:id/events` | History, a `historyComplete` marker, then live events, in the frame format of `/v1/chat/sessions/:id/messages`; resume with `?after=` or `Last-Event-ID`. `?mode=replay` returns JSON pages. |
+| `POST .../sessions/:id/decisions` | `{action_id, option_id}`, an option the agent offered. Answered twice, counted once: a different second choice is `409 already_decided`, even after the connector has acknowledged the first, because the audit trail remembers it. |
+| `GET .../sessions/:id/events` | History, a `historyComplete` marker, then live events, in the frame format of `/v1/chat/sessions/:id/messages`; resume with `Last-Event-ID` or `?after=`; when both are sent `Last-Event-ID` wins, because a browser reconnecting to the same URL changes only that header. `?mode=replay` returns JSON pages. |
 | `GET /v1/remote-agents/audit` | The caller's audit trail, filterable by `session_id` and `connector_id`. |
 
 `prompt`, `set_mode` and `resume` are refused with `409 connector_offline` while the
@@ -88,6 +88,16 @@ connector is offline, so a prompt nobody could see being waited on cannot run la
 
 Limits per user: 5 connectors, 10 active sessions, 60 commands a minute, 20 open
 event streams per API replica.
+
+A write made through the same API replica reaches an open stream at once. A write
+made through another replica is found by the stream's own read of the database,
+which an idle stream does every 5 s, so it can arrive up to that much later.
+
+## Retention
+
+A closed session is deleted with all of its events `CLAW_REMOTE_AGENTS_RETENTION_DAYS`
+days (default 30) after it closed; each API replica checks hourly. Zero or less keeps
+them for ever. Live sessions are never deleted, and neither is the audit trail.
 
 ## Audit
 
