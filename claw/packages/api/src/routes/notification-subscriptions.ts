@@ -27,7 +27,9 @@ import { newSubscriptionId } from "../notifications/outbox.js";
 import { guardWebhookUrl, parseAllowedHosts } from "../notifications/url-guard.js";
 
 const MAX_SUBSCRIPTIONS_PER_USER = 5;
-const EVENT_TYPES = ["run.completed", "run.failed"];
+// `approval.requested` is accepted here but is not in the default set a new
+// subscription gets (the INSERT below): a receiver has to ask for it.
+const EVENT_TYPES = ["run.completed", "run.failed", "approval.requested"];
 const SOURCES = ["trigger", "long_run"];
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 

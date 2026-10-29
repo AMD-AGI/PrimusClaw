@@ -23,7 +23,7 @@ import { appEventIdentity } from "./app-events.js";
 import { enqueueEvolutionJob } from "../marketplace/evolve-worker.js";
 import { callMemoryLLM } from "../llm/client.js";
 import { CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
-import { recordRunFinished } from "../notifications/outbox.js";
+import { recordApprovalRequested, recordRunFinished } from "../notifications/outbox.js";
 import {
   markChatRunRunning, closeChatRun, gateOwnershipEnforced, queuedMessageId,
   retireDispatchReconcileForReport,
@@ -484,6 +484,16 @@ export async function consumeEventDelivery(msg: {
       // up. Best-effort: a row left describing itself as preparing is a
       // reporting inaccuracy, and this event is not worth redelivering over.
       await markChatRunRunning(sessionId);
+    } else if (event.type === "permissionRequest" && CLAW_NOTIFICATIONS_ENABLED) {
+      // Brain is now waiting for a person to decide on a held tool call. Tell the
+      // owner's subscriptions, so the wait does not depend on someone watching the
+      // run. Best-effort like the run notifications, and idempotent: the row's
+      // key is derived from the request, so a redelivered event records nothing new.
+      try {
+        await eventNotificationPorts.recordApprovalRequested({ sessionId, event });
+      } catch (err) {
+        logger.error({ err, sessionId }, "notification.approval_record_failed");
+      }
     }
 
     msg.ack();
@@ -766,6 +776,14 @@ function runClaimOf(event: Record<string, unknown>): number | undefined {
   const raw = event.run_claim;
   return typeof raw === "number" && Number.isInteger(raw) ? raw : undefined;
 }
+
+/**
+ * What the event consumer does besides storing an event, behind a seam for the
+ * same reason as `completionPorts`: an imported binding cannot be substituted.
+ */
+export const eventNotificationPorts = {
+  recordApprovalRequested,
+};
 
 /**
  * The completion's side effects, behind a seam so a test can see which of them
