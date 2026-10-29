@@ -37,6 +37,7 @@ const (
 	safeUserIDLabel        = "primus-safe.user.id"
 	safeUserNameAnnotation = "primus-safe.user.name"
 	safeWorkloadIDLabel    = "primus-safe.workload.id"
+	safeClusterIDLabel     = "primus-safe.cluster.id"
 	// ownerSessionIDLabel records the issuing Claw session. Pulse reads
 	// primus-claw/session-id as the session's own sandbox, so a grant workload
 	// must not use that key.
@@ -88,6 +89,24 @@ var workloadPollInterval = time.Second
 type SafeWorkloadCreator struct {
 	dynamic dynamic.Interface
 	client  ctrlclient.Client
+	// remoteClusters are SaFE cluster ids whose pods this control plane cannot address.
+	// A Running Workload in one of them is ready without a pod IP.
+	remoteClusters map[string]struct{}
+}
+
+// SetRemoteClusters records SaFE cluster ids that are reached through another Router.
+// Create treats a Running Workload in one of those clusters as ready.
+func (c *SafeWorkloadCreator) SetRemoteClusters(ids []string) {
+	if c == nil {
+		return
+	}
+	remote := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id != "" {
+			remote[id] = struct{}{}
+		}
+	}
+	c.remoteClusters = remote
 }
 
 // NewSafeWorkloadCreator uses the dynamic client for Workloads and the controller client for templates and pods.
@@ -95,8 +114,9 @@ func NewSafeWorkloadCreator(dyn dynamic.Interface, client ctrlclient.Client) *Sa
 	return &SafeWorkloadCreator{dynamic: dyn, client: client}
 }
 
-// Create writes one Sandbox Workload from the CodeInterpreter and waits until it is Running
-// and a pod address is visible. It does not set entryPoints; the Sandbox template starts envd.
+// Create writes one Sandbox Workload from the CodeInterpreter and waits until it is Running.
+// A Workload in a remote cluster is ready at Running; this cluster also waits for a pod address.
+// It does not set entryPoints; the Sandbox template starts envd.
 func (c *SafeWorkloadCreator) Create(ctx context.Context, req e2b.CreateRequest) (*SandboxResult, error) {
 	if c == nil || c.dynamic == nil || c.client == nil {
 		return nil, fmt.Errorf("safe workload client is not configured")
@@ -141,8 +161,8 @@ func (c *SafeWorkloadCreator) Create(ctx context.Context, req e2b.CreateRequest)
 		}
 	}
 	var (
-		podIP, nodeName string
-		waitErr         error
+		podIP, nodeName, cluster string
+		waitErr                  error
 	)
 	defer func() {
 		if waitErr != nil {
@@ -152,7 +172,7 @@ func (c *SafeWorkloadCreator) Create(ctx context.Context, req e2b.CreateRequest)
 			}
 		}
 	}()
-	podIP, nodeName, waitErr = c.waitRunning(ctx, name, req.Workspace)
+	podIP, nodeName, cluster, waitErr = c.waitRunning(ctx, name, req.Workspace)
 	if waitErr != nil {
 		return nil, waitErr
 	}
@@ -170,6 +190,7 @@ func (c *SafeWorkloadCreator) Create(ctx context.Context, req e2b.CreateRequest)
 		PodIP:                podIP,
 		PodPort:              envdPort,
 		NodeName:             nodeName,
+		Cluster:              cluster,
 		Kind:                 store.WorkloadKind,
 		MaxSessionDuration:   req.Timeout,
 		RuntimePolicy:        ci.Spec.RuntimePolicy,
@@ -283,6 +304,16 @@ func (c *SafeWorkloadCreator) Observe(ctx context.Context, sandboxID string) (e2
 		return e2b.CreateResult{}, e2b.WorkloadFinished, nil
 	case "Running":
 		workspace, _, _ := unstructured.NestedString(obj.Object, "spec", "workspace")
+		cluster := obj.GetLabels()[safeClusterIDLabel]
+		if _, remote := c.remoteClusters[cluster]; remote && cluster != "" {
+			return e2b.CreateResult{
+				SandboxName: sandboxID,
+				Namespace:   workspace,
+				PodPort:     envdPort,
+				NodeName:    nodeFromUsage(obj),
+				Cluster:     cluster,
+			}, e2b.WorkloadRunning, nil
+		}
 		ip, node, ok := c.address(ctx, obj, workspace, sandboxID)
 		if !ok {
 			return e2b.CreateResult{}, e2b.WorkloadPending, nil
@@ -293,6 +324,7 @@ func (c *SafeWorkloadCreator) Observe(ctx context.Context, sandboxID string) (e2
 			PodIP:       ip,
 			PodPort:     envdPort,
 			NodeName:    node,
+			Cluster:     cluster,
 		}, e2b.WorkloadRunning, nil
 	default:
 		return e2b.CreateResult{}, e2b.WorkloadPending, nil
@@ -300,7 +332,8 @@ func (c *SafeWorkloadCreator) Observe(ctx context.Context, sandboxID string) (e2
 }
 
 // Session rebuilds the session record of an E2B Workload named by the sandbox id.
-// A missing Workload, a finished phase, or a Workload not created for E2B is store.ErrNotFound.
+// A missing Workload, a finished phase, a Workload not created for E2B, or a
+// Workload in a remote cluster is store.ErrNotFound.
 func (c *SafeWorkloadCreator) Session(ctx context.Context, name string) (*store.SandboxInfo, error) {
 	if c == nil || c.dynamic == nil || !strings.HasPrefix(name, e2bSandboxPrefix) || !dnsLabel(name, safeGeneratedNameLength) {
 		return nil, store.ErrNotFound
@@ -314,6 +347,9 @@ func (c *SafeWorkloadCreator) Session(ctx context.Context, name string) (*store.
 	}
 	labels := obj.GetLabels()
 	if _, ok := labels[ownerSessionIDLabel]; !ok || obj.GetDeletionTimestamp() != nil {
+		return nil, store.ErrNotFound
+	}
+	if _, remote := c.remoteClusters[labels[safeClusterIDLabel]]; remote {
 		return nil, store.ErrNotFound
 	}
 	phase, _, _ := unstructured.NestedString(obj.Object, "status", "phase")
@@ -434,18 +470,24 @@ func (c *SafeWorkloadCreator) Delete(ctx context.Context, name string) error {
 	return err
 }
 
-func (c *SafeWorkloadCreator) waitRunning(ctx context.Context, name, workspace string) (string, string, error) {
-	var podIP, nodeName string
+func (c *SafeWorkloadCreator) waitRunning(ctx context.Context, name, workspace string) (string, string, string, error) {
+	var podIP, nodeName, cluster string
 	err := wait.PollUntilContextCancel(ctx, workloadPollInterval, true, func(ctx context.Context) (bool, error) {
 		obj, err := c.dynamic.Resource(workloadGVR).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
+		cluster = obj.GetLabels()[safeClusterIDLabel]
 		phase, _, _ := unstructured.NestedString(obj.Object, "status", "phase")
 		switch phase {
 		case "Failed", "Succeeded", "Stopped":
 			return false, terminalWorkloadError(name, phase, obj)
 		case "Running":
+			if _, remote := c.remoteClusters[cluster]; remote && cluster != "" {
+				podIP = ""
+				nodeName = nodeFromUsage(obj)
+				return true, nil
+			}
 			ip, node, ok := c.address(ctx, obj, workspace, name)
 			if !ok {
 				return false, nil
@@ -457,9 +499,28 @@ func (c *SafeWorkloadCreator) waitRunning(ctx context.Context, name, workspace s
 		}
 	})
 	if err != nil {
-		return "", "", err
+		return "", "", cluster, err
 	}
-	return podIP, nodeName, nil
+	return podIP, nodeName, cluster, nil
+}
+
+// nodeFromUsage reads the first admin node recorded on an offloaded Workload.
+func nodeFromUsage(obj *unstructured.Unstructured) string {
+	usage, found, err := unstructured.NestedSlice(obj.Object, "status", "nodeUsage")
+	if err != nil || !found {
+		return ""
+	}
+	for _, item := range usage {
+		raw, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		node, _, _ := unstructured.NestedString(raw, "node")
+		if node != "" {
+			return node
+		}
+	}
+	return ""
 }
 
 const workloadFailureLimit = 480

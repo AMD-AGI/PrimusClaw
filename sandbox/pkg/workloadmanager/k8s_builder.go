@@ -57,6 +57,8 @@ type SandboxResult struct {
 	Kind string
 	// NodeName is the node the sandbox pod landed on, when known.
 	NodeName string
+	// Cluster is the SaFE cluster id from the Workload label, when known.
+	Cluster string
 	// MaxSessionDuration is read from CodeInterpreter.spec.maxSessionDuration.
 	// WM uses this to set SandboxInfo.ExpiresAt (hard upper bound on session lifetime).
 	MaxSessionDuration time.Duration

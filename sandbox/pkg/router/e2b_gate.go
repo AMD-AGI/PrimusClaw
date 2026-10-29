@@ -63,7 +63,12 @@ func (s *Server) e2bAccessGate(c *gin.Context) {
 		c.Abort()
 		return
 	}
-	if ref.Sealed && e2b.FilesystemRPC(c.Request.URL.Path) && !sealedFilesystemCall(c, ref) {
+	if ref.Sealed && e2b.FilesystemRPC(c.Request.URL.Path) && !sealedFilesystemCall(c, c.Request.URL.Path, ref) {
+		c.Abort()
+		return
+	}
+	if base, ok := s.forwardTarget(ref.Cluster); ok {
+		s.forwardDataPlane(c, sandboxID, base, ref)
 		c.Abort()
 		return
 	}
@@ -146,10 +151,10 @@ const filesystemBodyLimit = 1 << 20
 
 // sealedFilesystemCall applies the sealed allow-list to a filesystem RPC body.
 // The body is restored for an allowed call. A missing or unreadable path is refused.
-func sealedFilesystemCall(c *gin.Context, ref runtimev1alpha1.GrantSandboxRef) bool {
+func sealedFilesystemCall(c *gin.Context, rpcPath string, ref runtimev1alpha1.GrantSandboxRef) bool {
 	body, err := io.ReadAll(io.LimitReader(c.Request.Body, filesystemBodyLimit+1))
 	if err != nil || len(body) > filesystemBodyLimit ||
-		!e2b.SealedFilesystemCall(c.Request.URL.Path, c.GetHeader("Content-Type"), body, ref.Inputs, ref.Outputs) {
+		!e2b.SealedFilesystemCall(rpcPath, c.GetHeader("Content-Type"), body, ref.Inputs, ref.Outputs) {
 		writeGate(c, http.StatusForbidden, "sealed_denied", "path is outside the sealed allow-list")
 		return false
 	}

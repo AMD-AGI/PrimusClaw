@@ -246,6 +246,7 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		SandboxName: result.SandboxName,
 		Namespace:   result.Namespace,
 		NodeName:    result.NodeName,
+		Cluster:     result.Cluster,
 	}
 	if result.NodeName != "" {
 		running.Metadata = map[string]string{
@@ -316,7 +317,7 @@ func (s *Service) adoptPending(ctx context.Context, grantID string, ref runtimev
 	if phase != WorkloadRunning {
 		return ref, false, nil
 	}
-	up := grant.RunningUpdate{SandboxName: result.SandboxName, Namespace: result.Namespace, NodeName: result.NodeName}
+	up := grant.RunningUpdate{SandboxName: result.SandboxName, Namespace: result.Namespace, NodeName: result.NodeName, Cluster: result.Cluster}
 	if result.NodeName != "" {
 		up.Metadata = map[string]string{nodeNameMetadata: result.NodeName}
 		if landedOnAvoidedNode(result.NodeName, ref.Metadata[avoidNodesMetadata]) {
