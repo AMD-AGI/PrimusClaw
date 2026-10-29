@@ -267,6 +267,8 @@ func TestDataPlaneEnvDPathReachesEnvD(t *testing.T) {
 	crusoe.engine.Any("/files", crusoe.handleLocalEnvD)
 	crusoe.engine.Any("/process.Process/*path", crusoe.handleLocalEnvD)
 	crusoe.engine.Any("/filesystem.Filesystem/ListDir", crusoe.handleLocalEnvD)
+	crusoe.engine.Any("/filesystem.Filesystem/Move", crusoe.handleLocalEnvD)
+	crusoe.engine.Any("/internal/v1/dataplane/:sandboxID/*proxyPath", crusoe.handleDataPlaneHop)
 	if err := crusoe.ConfigureDataPlane("crusoe", "", string(mustPEM(t, globalJWT)), func(ctx context.Context, namespace, sandboxID string) (string, int, error) {
 		return envdHost(t, envd), envdPort(t, envd), nil
 	}); err != nil {
@@ -320,6 +322,17 @@ func TestDataPlaneEnvDPathReachesEnvD(t *testing.T) {
 	}
 	sendBody(t, front.URL+"/filesystem.Filesystem/ListDir", sealedToken, `{"path":"/out"}`, http.StatusNoContent)
 	if gotPath != "/filesystem.Filesystem/ListDir" {
+		t.Fatalf("path=%s", gotPath)
+	}
+	gotPath = ""
+	forged := `{"source":"/in/a","destination":"/out/result.json"}`
+	sendBody(t, front.URL+"/filesystem.Filesystem/Move", sealedToken, forged, http.StatusForbidden)
+	sendBody(t, front.URL+"/internal/v1/dataplane/sbx-1/filesystem.Filesystem/Move", sealedToken, forged, http.StatusForbidden)
+	if gotPath != "" {
+		t.Fatalf("sealed move reached envd: %s", gotPath)
+	}
+	sendBody(t, front.URL+"/internal/v1/dataplane/sbx-1/filesystem.Filesystem/Move", sealedToken, `{"source":"/in/a","destination":"/in/b"}`, http.StatusNoContent)
+	if gotPath != "/filesystem.Filesystem/Move" {
 		t.Fatalf("path=%s", gotPath)
 	}
 	parsed, err := jwt.Parse(strings.TrimPrefix(gotAuth, "Bearer "), func(token *jwt.Token) (any, error) {

@@ -245,7 +245,7 @@ func hopSealedAllows(c *gin.Context, path string, ref runtimev1alpha1.GrantSandb
 		writeGate(c, http.StatusForbidden, "sealed_denied", "path is outside the sealed allow-list")
 		return false
 	}
-	if ref.Sealed && e2b.FilesystemReadRPC(path) && !sealedFilesystemRead(c, ref) {
+	if ref.Sealed && e2b.FilesystemRPC(path) && !sealedFilesystemCall(c, path, ref) {
 		return false
 	}
 	return true

@@ -114,8 +114,9 @@ func TestE2BGateChecksTokenAndSealedPath(t *testing.T) {
 	if got.Get("x-session-id") != "sbx-1" {
 		t.Fatalf("session %q", got.Get("x-session-id"))
 	}
+	gotPath = ""
 	rewrite := gateRequest(t, front.URL+"/filesystem.Filesystem/internal/v1/dataplane/x/api/execute", token)
-	if rewrite.code != http.StatusOK || gotPath != "/filesystem.Filesystem/internal/v1/dataplane/x/api/execute" {
+	if rewrite.code != http.StatusForbidden || gotPath != "" {
 		t.Fatalf("rewrite status=%d path=%q", rewrite.code, gotPath)
 	}
 	plain := gateRequest(t, front.URL+"/api/execute", "")
