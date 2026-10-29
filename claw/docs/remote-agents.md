@@ -27,8 +27,10 @@ The wire contract, limits and parsers are in `packages/protocol/src/remote-agent
 Every row belongs to one user, taken from the verified caller. Every read and
 write is filtered by it, so another user's id answers `404 not_found`, exactly as
 a missing id does. Administrators are ordinary callers here; they cannot read a
-user's sessions. A connector authenticates with the same credential as any other
-API call, and acts for the user that owns it.
+user's sessions. A connector acts for the user that owns it, and authenticates with
+either of two kinds of credential: the ones the whole API accepts (a key or a
+session), or an access token from the identity provider (see
+[Connector access tokens](#connector-access-tokens)).
 
 ## Connector side
 
@@ -54,6 +56,62 @@ Special event types: `permissionRequest` (`data.actionId`, `data.options[].optio
 `permission_resolved` (`data.actionId`, `data.optionId`, `data.by`), and
 `session_closed`. They are audited, and `permissionRequest` is what a decision is
 checked against.
+
+## Connector access tokens
+
+Beside a key or a session, the four connector-side routes (the table above)
+accept `Authorization: Bearer <access token>`: an RFC 9068 JWT that the identity
+provider issued to this API for a connector. It is verified with the shared
+[identity client](identity-client.md), which must be on (`IDENTITY_CLIENT_ENABLED`),
+and it is on only while `CLAW_REMOTE_AGENTS_ENABLED` is. With either off, a token is
+just an unknown credential and nothing changes.
+
+A token is accepted only if all of these hold, and is refused for exactly the one
+that does not (`401 invalid_token`, naming the reason, or `403 insufficient_scope`):
+
+| Check | |
+|---|---|
+| Signature | RS256 or ES256, by a key the issuer currently publishes |
+| `iss` | the configured issuer |
+| `aud` | `claw-api` (`CLAW_CONNECTOR_TOKEN_AUDIENCE`) |
+| `typ` | `at+jwt` |
+| `exp`, `nbf` | the token is current |
+| `scope` | contains `claw.connector` |
+| `sub` | a non-empty subject, which becomes the owner |
+
+The caller is the token's `sub` with the `default` role only, whatever roles or
+groups the token carries.
+
+**It authenticates on those four routes and nowhere else.** On the user-side
+routes, and on every other route of the API, a token is not a credential: the
+request is answered as one with no credential. The user side of this module also
+refuses a connector token itself (`403 connector_token_not_accepted`), so a change
+to what the global hook accepts cannot let a connector read a session or issue a
+command.
+
+**Revocation.** A token is checked locally, so a revoked grant is honoured until its
+token expires (minutes). Set `CLAW_CONNECTOR_TOKEN_INTROSPECT=true` to also ask the
+provider, on each request, whether the token is still active (the identity client
+caches an answer for a few seconds, `IDENTITY_INTROSPECTION_CACHE_SECONDS`); a revoked
+grant is then refused at once. A provider that cannot be asked is `503`, never a yes.
+
+**An open command stream** is authenticated once, when it opens, so it also ends with
+its token: at the token's `exp` the server sends `event: token_expired` (no `id`) and
+closes, and the connector reconnects with a fresh token. With introspection on, the
+stream is re-checked about as often as a ping, and a grant revoked in the meantime
+ends it with `event: revoked`, as a revoked connector does. A provider that cannot be
+asked does not cut a stream that was already authenticated; the token's expiry still
+bounds it. A stream opened with a key or a session has no such end.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CLAW_CONNECTOR_TOKEN_AUDIENCE` | `claw-api` | The `aud` a token must name |
+| `CLAW_CONNECTOR_TOKEN_INTROSPECT` | off | Ask the provider on each request whether the token is still active |
+
+The audit trail records, in `detail.credential`, how the caller was authenticated
+for the connector-side actions it keeps (`connector.registered`,
+`permission.requested`, `permission.resolved`): `connector_token`, `api_key`,
+`cookie` or `x_api_key`.
 
 ## Keepalive and presence
 

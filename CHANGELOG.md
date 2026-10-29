@@ -34,8 +34,19 @@ record it.
   session, send commands and answer permission requests through the API. Presence, resumable streams
   (`Last-Event-ID`), keepalive, owner-only access (another user's id is a 404) and an audit trail are
   included; Claw does not interpret what an agent says. See `claw/docs/remote-agents.md`.
+- Connector access tokens: the four connector-side routes of remote agents accept an RFC 9068 JWT
+  (`Authorization: Bearer`, audience `claw-api`, scope `claw.connector`, type `at+jwt`) issued by the
+  identity provider and verified with the shared identity client, beside the keys and sessions they
+  already accept. The token is a credential on those routes only; the user side and every other route
+  answer it as a request with no credential. The caller is the token's subject with the `default` role,
+  a token is good until it expires or, with `CLAW_CONNECTOR_TOKEN_INTROSPECT=true`, until the provider
+  says its grant is revoked, and a command stream opened with one ends (`event: token_expired`, or
+  `event: revoked`) when the token does. The audit trail records which kind of credential a
+  connector-side action used. Off unless remote agents and the identity client are both on. See
+  `claw/docs/remote-agents.md`.
 - A shared identity client in `@claw/utils`, built by API and Brain when
-  `IDENTITY_CLIENT_ENABLED=true` (off by default; nothing authenticates through it yet). It does OIDC
+  `IDENTITY_CLIENT_ENABLED=true` (off by default; the one request it authenticates is a connector's access
+  token, above). It does OIDC
   discovery and caches the issuer's JWKS, RFC 7662 token introspection (an active answer is cached for
   30 s, an inactive one for 5 s, concurrent lookups of one credential share one call), and an RFC 8693
   token exchange with a token cache. When the provider cannot be asked, a cached active answer keeps

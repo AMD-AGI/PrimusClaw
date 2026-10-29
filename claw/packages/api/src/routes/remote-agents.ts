@@ -29,6 +29,9 @@ import {
 } from "@claw/protocol";
 import { CLAW_REMOTE_AGENTS_ENABLED, CLAW_REMOTE_AGENTS_RETENTION_DAYS } from "../config.js";
 import { getUser } from "../auth/middleware.js";
+import { getAuthMethod } from "../auth/request-credential.js";
+import { CONNECTOR_TOKEN_METHOD, tokenExpired, tokenRevoked } from "../auth/connector-token.js";
+import { CONNECTOR_SIDE_ROUTES } from "../remote-agents/connector-routes.js";
 import { db } from "../infra/db.js";
 import { redactPublicJson } from "../events/redaction.js";
 import { Waker } from "../remote-agents/waker.js";
@@ -70,11 +73,23 @@ const RETENTION_SWEEP_MS = 60 * 60 * 1000;
 const notFound = (reply: FastifyReply) => reply.status(404).send({ ok: false, error: "not_found" });
 const fail = (reply: FastifyReply, status: number, error: string) => reply.status(status).send({ ok: false, error });
 
-/** The verified caller, or a refusal. Administrators are ordinary callers here. */
-function requireOwner(req: FastifyRequest, reply: FastifyReply): string | null {
+/**
+ * The verified caller, or a refusal. Administrators are ordinary callers here.
+ *
+ * `side` is which half of the API the route belongs to. A connector's access
+ * token authenticates only on the connector side (`CONNECTOR_SIDE_ROUTES`, and
+ * the global hook only offers it there), but the user side refuses it again
+ * here, so no change to what the hook accepts can let a connector read a
+ * session or issue a command.
+ */
+function requireOwner(req: FastifyRequest, reply: FastifyReply, side: "user" | "connector" = "user"): string | null {
   const userId = getUser(req)?.userId;
   if (!userId || userId === "default") {
     fail(reply, 403, "remote_agents_require_authenticated_user");
+    return null;
+  }
+  if (side === "user" && getAuthMethod(req) === CONNECTOR_TOKEN_METHOD) {
+    fail(reply, 403, "connector_token_not_accepted");
     return null;
   }
   return userId;
@@ -200,12 +215,14 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
 
   // --- connectors (user side) ------------------------------------------------
 
-  app.post("/v1/remote-agents/connectors", async (req, reply) => {
-    const owner = requireOwner(req, reply);
+  app.post(CONNECTOR_SIDE_ROUTES.register.url, async (req, reply) => {
+    const owner = requireOwner(req, reply, "connector");
     if (!owner) return;
     const body = parseConnectorRegistration(req.body ?? {});
     if (!body.ok) return fail(reply, 400, body.error);
-    const row = await store.registerConnector(owner, body.value.name, body.value.version, clientLabel(req), maxConnectors);
+    const row = await store.registerConnector(
+      owner, body.value.name, body.value.version, clientLabel(req), maxConnectors, getAuthMethod(req),
+    );
     if (!row) return fail(reply, 409, "connector_limit_reached");
     return reply.status(201).send({ ok: true, data: { connector_id: row.connector_id, name: row.name, created_at: row.created_at } });
   });
@@ -227,8 +244,8 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
 
   // --- connector side --------------------------------------------------------
 
-  app.post("/v1/remote-agents/connectors/:cid/heartbeat", async (req, reply) => {
-    const owner = requireOwner(req, reply);
+  app.post(CONNECTOR_SIDE_ROUTES.heartbeat.url, async (req, reply) => {
+    const owner = requireOwner(req, reply, "connector");
     if (!owner) return;
     const connector = await ownConnector(req, reply, owner);
     if (!connector) return;
@@ -238,8 +255,8 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     return reply.send({ ok: true, data: { server_time: new Date().toISOString(), online_window_ms: onlineWindowMs } });
   });
 
-  app.post("/v1/remote-agents/connectors/:cid/events", async (req, reply) => {
-    const owner = requireOwner(req, reply);
+  app.post(CONNECTOR_SIDE_ROUTES.events.url, async (req, reply) => {
+    const owner = requireOwner(req, reply, "connector");
     if (!owner) return;
     const connector = await ownConnector(req, reply, owner);
     if (!connector) return;
@@ -247,16 +264,16 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     if (!batch.ok) return fail(reply, 400, batch.error);
     // Second line of defence behind the connector's own scrub of what leaves the machine.
     const events = batch.value.events.map((e) => ({ ...e, data: redactPublicJson(e.data) as Record<string, unknown> }));
-    const result = await store.ingestEvents(connector as { connector_id: string; owner_user_id: string }, events);
+    const result = await store.ingestEvents(connector as { connector_id: string; owner_user_id: string }, events, getAuthMethod(req));
     for (const sid of result.touched) waker.wake(`s:${sid}`);
     const rejected = [...batch.value.rejected, ...result.rejected].sort((a, b) => a.index - b.index);
     return reply.send({ ok: true, data: { batch_id: batch.value.batchId, acked: result.acked, rejected } });
   });
 
   app.get<{ Params: { cid: string }; Querystring: { after?: string } }>(
-    "/v1/remote-agents/connectors/:cid/commands",
+    CONNECTOR_SIDE_ROUTES.commands.url,
     async (req, reply) => {
-      const owner = requireOwner(req, reply);
+      const owner = requireOwner(req, reply, "connector");
       if (!owner) return;
       const connector = await ownConnector(req, reply, owner);
       if (!connector) return;
@@ -272,12 +289,21 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       const cid = connector.connector_id as string;
       const streamConn = randomUUID();
       let cursor = 0;
+      let nextTokenCheck = Date.now() + pingMs;
       await store.markStreamOpen(cid, streamConn);
       return serveSse(req, reply, waker, timing, {
         key: `c:${cid}`,
         first: [sseFrame("ready", { v: REMOTE_AGENT_PROTOCOL_VERSION, connector_id: cid, server_time: new Date().toISOString() })],
         pingFrame: () => sseFrame("ping", { t: Date.now() }),
         async poll() {
+          // A stream opened with an access token ends when the token does (the
+          // connector reconnects with a fresh one), and when the provider says
+          // its grant was revoked (checked as often as a ping, when introspection is on).
+          if (tokenExpired(req)) return { frames: [], stop: sseFrame("token_expired", { connector_id: cid }) };
+          if (Date.now() >= nextTokenCheck) {
+            nextTokenCheck = Date.now() + pingMs;
+            if (await tokenRevoked(req)) return { frames: [], stop: sseFrame("revoked", { connector_id: cid }) };
+          }
           const verdict = await store.streamVerdict(cid, streamConn);
           if (verdict) return { frames: [], stop: sseFrame(verdict, { connector_id: cid }) };
           const rows = await store.commandsAfter(cid, cursor, 100);
