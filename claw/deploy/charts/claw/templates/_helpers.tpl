@@ -107,6 +107,32 @@ same client, so they cannot be configured to disagree.
 {{- end -}}
 
 {{- /*
+Accepting an identity provider's access token as an API credential, for the API
+Deployment only (Brain authenticates nobody with it). Renders nothing while
+identity.tokenAuth.enabled is false, so the default chart is byte-for-byte what it
+was. The token is verified by the identity client, so it also needs identity.enabled:
+asking for one without the other is refused here rather than rendered as a switch
+that quietly does nothing.
+*/ -}}
+{{- define "primus-claw.identityTokenEnv" -}}
+{{- $i := .Values.identity | default dict -}}
+{{- $t := $i.tokenAuth | default dict -}}
+{{- if $t.enabled -}}
+{{- if not $i.enabled -}}
+{{- fail "identity.tokenAuth.enabled requires identity.enabled: the access token is verified by the identity client" -}}
+{{- end -}}
+- name: CLAW_IDENTITY_TOKEN_AUTH_ENABLED
+  value: "true"
+{{- include "primus-claw.identityOptionalEnv" (dict "name" "CLAW_IDENTITY_TOKEN_AUDIENCE" "value" $t.audience) }}
+{{- include "primus-claw.identityOptionalEnv" (dict "name" "CLAW_IDENTITY_TOKEN_SCOPE" "value" $t.scope) }}
+{{- if $t.introspect }}
+- name: CLAW_IDENTITY_TOKEN_INTROSPECT
+  value: "true"
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{- /*
 The externally reachable base URL of the API (CLAW_PUBLIC_URL), or the empty
 string when nothing says what it is.
 

@@ -96,7 +96,10 @@ compare with the id of the person's own session.
 
 **It authenticates on those four routes and nowhere else.** On the user-side
 routes, and on every other route of the API, a token is not a credential: the
-request is answered as one with no credential. The user side of this module also
+request is answered as one with no credential (with the identity provider's
+access-token credential switched on, `CLAW_IDENTITY_TOKEN_AUTH_ENABLED`, it is
+judged by that path instead and refused for its scope, `403 insufficient_scope`;
+see [identity-client.md](identity-client.md#access-tokens-as-an-api-credential)). The user side of this module also
 refuses a connector token itself (`403 connector_token_not_accepted`), so a change
 to what the global hook accepts cannot let a connector read a session or issue a
 command.

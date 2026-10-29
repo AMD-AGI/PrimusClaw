@@ -36,6 +36,8 @@ import { registerSystemEnvVarRoutes, publishSystemEnvToKv } from "./routes/syste
 import { registerSandboxAdminRoutes } from "./routes/sandbox-admin.js";
 import { registerTerminalRoutes } from "./routes/terminal.js";
 import { registerMcpRoutes } from "./routes/mcp.js";
+import { registerMeRoutes } from "./routes/me.js";
+import { registerModelsRoutes } from "./routes/models.js";
 import { registerInternalTaskRoutes } from "./routes/internal-tasks.js";
 import { registerInternalRunRoutes } from "./routes/internal-runs.js";
 import { registerInternalAppRoutes } from "./routes/internal-apps.js";
@@ -156,7 +158,7 @@ async function main() {
   // otherwise start exporting neither.
   assertRolloutConfigAtStartup();
   assertAdmissionSettings(logger);
-  // Off unless IDENTITY_CLIENT_ENABLED is set; the one request it authenticates is a connector's access token.
+  // Off unless IDENTITY_CLIENT_ENABLED is set; it authenticates a connector's access token, and an identity provider's access token only with CLAW_IDENTITY_TOKEN_AUTH_ENABLED.
   startIdentityClient(logger);
   // Validate USER_ENV_ENCRYPTION_KEY before doing anything else; we want a
   // fast-fail if the K8s Secret is misconfigured (missing or wrong length),
@@ -292,6 +294,8 @@ async function main() {
   await registerTaskRoutes(app);
   await registerRunRoutes(app);
   await registerWorkbenchRoutes(app);
+  await registerModelsRoutes(app);
+  await registerMeRoutes(app);
   // Scheduled triggers: nothing is registered unless the deployment turns them on.
   if (CLAW_TRIGGERS_ENABLED) await registerTriggerRoutes(app);
 

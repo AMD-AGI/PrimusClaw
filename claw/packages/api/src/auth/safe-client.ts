@@ -137,9 +137,13 @@ export class SafeClient {
     const d = (data.data ?? data) as Record<string, unknown>;
     const userId = (d.id as string) || "";
     if (!userId) throw new Error("SaFE returned empty user ID");
+    // Only a present, non-empty string: the field is optional on SaFE's side and
+    // an `email: undefined` key would change what a UserInfo compares equal to.
+    const email = typeof d.email === "string" && d.email !== "" ? d.email : undefined;
     return {
       userId,
       userName: (d.name as string) || "",
+      ...(email !== undefined ? { email } : {}),
       roles: (d.roles as string[]) || [],
       platformKey: (d.platformKey as string) || (d.platform_key as string) || "",
       virtualKey: (d.virtualKey as string) || (d.virtual_key as string) || "",
