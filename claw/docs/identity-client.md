@@ -111,10 +111,13 @@ accepts. The code is `packages/api/src/auth/identity-token.ts`; it verifies with
 | `CLAW_IDENTITY_TOKEN_AUDIENCE` | `claw-api` | The `aud` the token must name |
 | `CLAW_IDENTITY_TOKEN_SCOPE` | `claw.api` | The scope the token must carry |
 | `CLAW_IDENTITY_TOKEN_INTROSPECT` | off | Also ask the provider (RFC 7662) whether the token is still active, so a revoked grant stops at once rather than when the token expires |
+| `CLAW_IDENTITY_TOKEN_TRUSTED_ROLES` | none | The platform roles a token the provider confirms may confer: `system-admin` and/or `system-admin-readonly`, separated by commas or spaces. Any other name is ignored. See "Administrators" below |
 
 These are read on each request. In the chart they are `identity.tokenAuth.enabled`,
-`.audience`, `.scope` and `.introspect`, rendered into the API Deployment only;
-`identity.tokenAuth.enabled` without `identity.enabled` is refused at render time.
+`.audience`, `.scope`, `.introspect` and `.trustedRoles` (a list), rendered into the
+API Deployment only; `identity.tokenAuth.enabled` without `identity.enabled` is
+refused at render time, and so is a `trustedRoles` entry that is not one of the two
+adoptable roles.
 
 **What a token must be.** Typed `at+jwt` in its JOSE header, signed RS256 or ES256
 by a key in the issuer's key set, issued by the configured issuer, naming
@@ -131,8 +134,45 @@ this use.
 |---|---|
 | `sub` | `userId`, exactly as the issuer wrote it. A subject that is missing, blank, padded with whitespace, longer than 128 characters, containing a control character, or equal to an owner the API uses for a caller it did not authenticate (`default`, `anonymous`, `dev-user`) is refused, not repaired |
 | `name`, else `preferred_username`, else `email`, else `sub` | `userName` (at most 128 characters) |
-| (none) | `roles` is `["default"]` always. The token's `roles` and `groups` claims are not read, so enabling this credential never makes anyone an administrator |
+| (none) | `roles` is `["default"]`, plus a platform administrator role only under the three conditions in "Administrators" below. The token's `roles` and `groups` claims are never copied as they stand, so enabling this credential never makes anyone an administrator by itself |
 | | `platformKey` and `virtualKey` are empty: no session key stands behind a token |
+
+**Administrators.** A person who signs in through the provider and is an administrator
+there reaches the admin pages (the sandbox admin page, for one) only if the operator
+sets `CLAW_IDENTITY_TOKEN_TRUSTED_ROLES`. It is empty by default, and while it is empty
+every token's caller is a plain user, which is what the credential did before the
+setting existed. With it set, a role is adopted for a request only when all of these hold:
+
+1. the operator named the role (only `system-admin` and `system-admin-readonly` can be named);
+2. the token claims it in `roles` (a list of strings; `groups` is not read). The token has
+   already been verified as the configured issuer's, for this API's audience and scope, so
+   a self-signed token, another issuer's token or an ID token never gets this far;
+3. the provider's RFC 7662 answer for that token, asked now through the identity client
+   and cached by its rules, is `active`, names the same `sub` as the token and lists the
+   role in its own `roles`. Nothing about the token's own claim stands in for this: the
+   provider's answer is the confirmation.
+
+The provider is asked only about a token that claims a role the operator named, so an
+ordinary user costs no extra call (with `CLAW_IDENTITY_TOKEN_INTROSPECT` on, the one
+question serves both). The outcomes:
+
+| The provider says | The caller |
+|---|---|
+| active, same subject, lists the role | `["default", <the role>]` |
+| active, same subject, does not list the role (it was taken away) | `["default"]` |
+| active, names no subject | `["default"]`: nothing is confirmed |
+| inactive, or an answer for another subject | refused, 401 `invalid_token` |
+| cannot be asked (network, timeout, 5xx, 429, an unreadable answer, a refusal of this client's own credentials, or no introspection endpoint) | `["default"]` for that request, never the token's claim and not a 503; the request is otherwise that token's own. With `CLAW_IDENTITY_TOKEN_INTROSPECT` on, an outage stays a 503 as described below |
+
+So an outage costs an administrator the admin pages until the provider is back, and
+nothing else. While the provider is down the identity client may still serve a stale
+*active* answer for a token it had already confirmed, for up to
+`IDENTITY_STALE_IF_ERROR_SECONDS`; set that to `0` to drop the role at once.
+
+Name a role only when the provider's role of that name means the same thing here. In
+`primus-identity` the `roles` claim holds platform roles only, and these two are the
+platform administrator roles; a provider shared with other applications may use the
+names differently, and then the setting should stay empty.
 
 **How it combines with the other credentials.**
 
@@ -174,7 +214,10 @@ this use.
   copying it would make that caller a platform operator of every tenant's sessions
   (and, in the Kubernetes deployment mode, give it a route to admin that mode never
   had). A user authenticated by a token is a plain user, as with a connector token and
-  with BYOK; there is no setting that maps a provider role onto an administrator role.
+  with BYOK, unless the operator opts in with `CLAW_IDENTITY_TOKEN_TRUSTED_ROLES`; then
+  only the two platform administrator roles can be adopted, only when the provider
+  confirms them for that token as described under "Administrators", and in the
+  Kubernetes deployment mode too. No other provider role is mapped onto anything.
 - Nothing here issues per-user LLM keys: a user authenticated by a token has none,
   so a deployment that needs a per-user key for model calls has to provide it some
   other way.

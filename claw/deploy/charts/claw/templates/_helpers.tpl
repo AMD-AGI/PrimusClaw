@@ -112,7 +112,8 @@ Deployment only (Brain authenticates nobody with it). Renders nothing while
 identity.tokenAuth.enabled is false, so the default chart is byte-for-byte what it
 was. The token is verified by the identity client, so it also needs identity.enabled:
 asking for one without the other is refused here rather than rendered as a switch
-that quietly does nothing.
+that quietly does nothing. identity.tokenAuth.trustedRoles (empty by default) names the
+platform roles a token the provider confirms may confer; it renders only when it is not empty.
 */ -}}
 {{- define "primus-claw.identityTokenEnv" -}}
 {{- $i := .Values.identity | default dict -}}
@@ -128,6 +129,10 @@ that quietly does nothing.
 {{- if $t.introspect }}
 - name: CLAW_IDENTITY_TOKEN_INTROSPECT
   value: "true"
+{{- end }}
+{{- with $t.trustedRoles }}
+- name: CLAW_IDENTITY_TOKEN_TRUSTED_ROLES
+  value: {{ join "," . | quote }}
 {{- end }}
 {{- end }}
 {{- end -}}

@@ -36,6 +36,12 @@ record it.
   role only (the token's `roles` are not copied, so enabling this never grants admin).
   `CLAW_IDENTITY_TOKEN_INTROSPECT` also asks the provider whether the token is still active. The chart takes
   `identity.tokenAuth`. See `claw/docs/identity-client.md`.
+- `CLAW_IDENTITY_TOKEN_TRUSTED_ROLES` (chart: `identity.tokenAuth.trustedRoles`; empty by default, which changes
+  nothing) lets an administrator who signs in through the identity provider reach the admin pages. It names
+  `system-admin` and/or `system-admin-readonly`; such a role is adopted only for a token that claims it and whose
+  RFC 7662 answer, asked now, is active, names the same subject and lists it. A token that does not verify as the
+  configured issuer's never gets that far, an inactive token is refused, and a provider that cannot be asked
+  leaves the caller a plain user (never the token's claim, and not a 503).
 - A user can vote on an answer of their own session. `PUT /v1/sessions/:sessionId/feedback`
   (`{ "message_id", "vote": "up" | "down", "reason"? }`) records it and
   `DELETE /v1/sessions/:sessionId/feedback/:messageId` takes it back; both answer `{ "ok": true }`.

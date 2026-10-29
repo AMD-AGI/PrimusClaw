@@ -207,6 +207,15 @@
             },
             "introspect": {
               "type": "boolean"
+            },
+            "trustedRoles": {
+              "description": "Platform roles a token the identity provider confirms (RFC 7662) may confer on its caller. Empty by default: every token's caller is a plain user.",
+              "default": [],
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "enum": ["system-admin", "system-admin-readonly"]
+              }
             }
           }
         }
