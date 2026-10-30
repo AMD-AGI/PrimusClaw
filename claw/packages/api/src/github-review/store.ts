@@ -40,8 +40,11 @@ export const GITHUB_REVIEW_SCHEMA_SQL = [
       expires_at        TIMESTAMPTZ NOT NULL,
       decided_at        TIMESTAMPTZ,
       decided_by        TEXT,
+      decided_via       JSONB,
       result            JSONB
     )`,
+  // Who stood behind the decision when it was not the person themselves: the service client and its actor (RFC 8693 `act`).
+  `ALTER TABLE claw_github_confirmations ADD COLUMN IF NOT EXISTS decided_via JSONB`,
   // One pending row per head commit, so asking twice shows the person one card.
   `CREATE UNIQUE INDEX IF NOT EXISTS uq_github_confirmations_pending
       ON claw_github_confirmations(session_id, repo, pr, head_sha) WHERE status = 'pending'`,
@@ -194,6 +197,10 @@ export interface Confirmation {
   status: ConfirmationStatus;
   createdAt: string;
   expiresAt: string;
+  /** Whose decision it was (the acting user), once it was made. */
+  decidedBy: string | null;
+  /** Set when a service client answered for `decidedBy`: `{kind: "service", client_id, act_sub}`. Null when the person did. */
+  decidedVia: Record<string, unknown> | null;
 }
 
 function toConfirmation(row: Record<string, unknown>): Confirmation {
@@ -213,6 +220,8 @@ function toConfirmation(row: Record<string, unknown>): Confirmation {
     status: row.status as ConfirmationStatus,
     createdAt: iso(row.created_at),
     expiresAt: iso(row.expires_at),
+    decidedBy: typeof row.decided_by === "string" ? row.decided_by : null,
+    decidedVia: row.decided_via && typeof row.decided_via === "object" ? (row.decided_via as Record<string, unknown>) : null,
   };
 }
 
@@ -302,6 +311,12 @@ export async function listConfirmations(
   return r.rows.map((row) => toConfirmation(row as Record<string, unknown>));
 }
 
+/** The service that answered for the acting user: its identity-provider client id and the actor the token names. */
+export interface DecidedVia {
+  clientId: string;
+  actorSub: string;
+}
+
 export type ClaimResult =
   | { ok: true; confirmation: Confirmation }
   | { ok: false; reason: "not_found" | "not_pending" | "expired" };
@@ -310,12 +325,12 @@ export type ClaimResult =
  * Take a pending confirmation for deciding, once. The conditional update is the
  * single-use guarantee: of two clicks, one gets the row.
  */
-export async function claimConfirmation(db: Queryable, id: string, deciderUserId: string): Promise<ClaimResult> {
+export async function claimConfirmation(db: Queryable, id: string, deciderUserId: string, via: DecidedVia | null = null): Promise<ClaimResult> {
   const claimed = await db.query(
     `UPDATE claw_github_confirmations
-        SET status = 'merging', decided_at = NOW(), decided_by = $2
+        SET status = 'merging', decided_at = NOW(), decided_by = $2, decided_via = $3::jsonb
       WHERE confirmation_id = $1 AND status = 'pending' AND expires_at > NOW() RETURNING *`,
-    [id, deciderUserId],
+    [id, deciderUserId, via ? JSON.stringify({ kind: "service", client_id: via.clientId, act_sub: via.actorSub }) : null],
   );
   if (claimed.rows[0]) return { ok: true, confirmation: toConfirmation(claimed.rows[0] as Record<string, unknown>) };
   const row = await getConfirmation(db, id);
@@ -337,7 +352,7 @@ export async function reopenConfirmation(db: Queryable, id: string): Promise<boo
   try {
     const r = await db.query(
       `UPDATE claw_github_confirmations
-          SET status = 'pending', decided_at = NULL, decided_by = NULL
+          SET status = 'pending', decided_at = NULL, decided_by = NULL, decided_via = NULL
         WHERE confirmation_id = $1 AND status = 'merging' AND expires_at > NOW() RETURNING confirmation_id`,
       [id],
     );

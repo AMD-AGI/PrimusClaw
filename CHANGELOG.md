@@ -74,8 +74,12 @@ record it.
   comments only), CI green on the head commit, no unresolved thread, GitHub's merge state `CLEAN`, a versioned
   high-risk rule pack that holds a merge for the acting user's confirmation
   (`GET /v1/github-review/confirmations`, `POST .../:id/decision`, which takes a signed-in person's session or
-  identity token and refuses the `ak-` or BYOK key a sandbox holds; a file that came without its diff and a
-  lock file are high risk), rate limits, a request budget per session, a
+  identity token and refuses the `ak-` or BYOK key a sandbox holds, and also a service an operator named in
+  `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS` acting for the user its identity token names, recording both). The
+  rules judge what the change does (architecture, interface, security-sensitive code, CI and release,
+  dependencies, size and breadth) from its net diff, so a pure refactor stays low; a file that came without its
+  diff and a lock file stay high as a floor, and the reviewing model can raise a verdict with a reason shown on
+  the confirmation (`risk_judgement`) and never lower it. Rate limits, a request budget per session, a
   dry-run switch and an audit row per call (`claw_github_audit`). A small change is reviewed from the diff
   without starting a sandbox; the path taken is logged and audited, and the thresholds are
   `CLAW_GITHUB_REVIEW_FAST_MAX_FILES` / `_MAX_CHANGED_LINES`. A repository's own review skill is read from the

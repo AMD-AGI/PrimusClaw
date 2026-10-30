@@ -162,6 +162,26 @@ describe("B a tool call", () => {
     await c.close();
   });
 
+  test("B7 the three tools that judge risk take the reviewer's judgement, only low and high are words it knows, and a high through MCP holds a merge the rules would let through", async () => {
+    e.identity.answer = async () => credential({ delegation: true });
+    const c = await connect(token());
+    const tools = (await c.listTools()).tools;
+    for (const name of ["gh_pr_risk", "gh_review_submit", "gh_pr_merge"]) {
+      const tool = tools.find((t) => t.name === name);
+      assert.ok(tool && "risk_judgement" in ((tool.inputSchema as { properties?: Record<string, unknown> }).properties ?? {}), name);
+    }
+    assert.ok(!("risk_judgement" in ((tools.find((t) => t.name === "gh_pr_get")?.inputSchema as { properties?: Record<string, unknown> }).properties ?? {})), "gh_pr_get has nothing to add to");
+    const bad = await c.callTool({ name: "gh_pr_merge", arguments: { pr: PR, head_sha: HEAD, risk_judgement: { level: "medium", reason: "x" } } }) as { isError?: boolean };
+    assert.equal(bad.isError, true);
+    assert.equal(e.gh.calls.length, 0, "the schema stopped it before anything was asked of GitHub");
+    const held = await call(c, "gh_pr_merge", { pr: PR, head_sha: HEAD, risk_judgement: { level: "high", reason: "changes the shape of every run's result" } });
+    assert.equal(held.isError, false, held.text);
+    assert.equal(held.body.status, "confirmation_required");
+    assert.equal(held.body.reasons[0], "the reviewer's judgement: changes the shape of every run's result");
+    assert.equal(e.gh.calls.filter((x) => x.method === "PUT").length, 0);
+    await c.close();
+  });
+
   test("B5 gh_pr_merge through MCP holds a high-risk change for the acting user", async () => {
     e.identity.answer = async () => credential({ delegation: true });
     e.gh.files = [{ filename: ".github/workflows/ci.yml", status: "modified", additions: 1, deletions: 0, patch: "@@ -1 +1,2 @@\n a\n+b" }];
@@ -195,7 +215,9 @@ describe("C confirmations over HTTP", () => {
       assert.equal(r.status, 200, who);
       assert.equal(r.body.items.length, 1, who);
       const item = r.body.items[0];
-      assert.deepEqual(Object.keys(item).sort(), ["actor_user_id", "author", "checks", "expires_at", "head_sha", "id", "pr", "reasons", "repo", "requester_user_id", "session_id", "status", "title"]);
+      assert.deepEqual(Object.keys(item).sort(), ["actor_user_id", "author", "checks", "decided_by", "decided_via", "expires_at", "head_sha", "id", "pr", "reasons", "repo", "requester_user_id", "session_id", "status", "title"]);
+      assert.equal(item.decided_by, null, "nobody has answered it yet");
+      assert.equal(item.decided_via, null);
       assert.equal(item.repo, "AMD-AGI/demo");
       assert.equal(item.pr, 7);
       assert.equal(item.head_sha, HEAD);

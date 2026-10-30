@@ -5,18 +5,47 @@
  * The high-risk rule pack: a deterministic, versioned decision that a pull request
  * must not be merged without its acting user's own confirmation.
  *
- * It runs in the API, on GitHub's own description of the change, and nothing the
- * model says can lower its answer; the model may only add to it (`flags`). It fails
- * closed: a file list that cannot be read in full, a patch GitHub did not send, a
- * repository configuration that does not parse and a rule that throws are all
- * `high`. The rules are examples of what to hold for a human, not a security scan.
+ * What makes a change high risk is what it DOES, not which kind of file it touches
+ * (see risk-signals.ts): an architecture change (a package or deployable unit added or
+ * removed, a directory moved, the layering or the dependency graph changed), an interface
+ * change (an exported signature, an HTTP route, a schema, a command-line flag, a
+ * configuration or environment contract, a database schema, a wire or event format),
+ * code that decides who may do what (authentication, cryptography, permissions,
+ * secrets), CI and release workflows, dependency manifests, and size and breadth. A pure
+ * refactor, a move of code, a reformat, documentation and tests stay low.
+ *
+ * Under that sits a floor that does not read content and is kept as a backstop: a file
+ * that came without its diff (a binary, a diff GitHub found too large, a rename), a lock
+ * file, a submodule pointer, a file mode change, a file list that was cut, a fork, a
+ * non-member, a base branch that is not the default.
+ *
+ * It runs in the API, on GitHub's own description of the change, and nothing the model
+ * says can lower its answer. The reviewing model may only RAISE it: with `flags`
+ * (`security_finding`, `review_skipped`) and with a content judgement, a short reason
+ * that is shown to the acting user on the confirmation. It fails closed: a file list that
+ * cannot be read in full, a patch GitHub did not send, a repository configuration that
+ * does not parse and a rule that throws are all `high`. The rules are examples of what to
+ * hold for a human, not a security scan.
  *
  * What the repository itself says comes from the BASE branch only (see
  * {@link parseClawyConfig}); a pull request that edits that file is high risk.
  */
 import { addedLines, removedLines } from "./diff.js";
+import { contentFindings, isDoc, isSource, isTest, type Finding, type RiskCategory } from "./risk-signals.js";
 
-export const RISK_RULE_PACK_VERSION = "2026-10-30.1";
+export type { Finding, RiskCategory } from "./risk-signals.js";
+
+export const RISK_RULE_PACK_VERSION = "2026-10-30.2";
+
+/** What the reviewing model says about the change after reading it. It can only raise the verdict. */
+export interface ReviewerJudgement {
+  level: "low" | "high";
+  /** One short sentence, shown to the acting user on the confirmation. */
+  reason: string;
+}
+
+/** Longest reason kept: it is printed on a card. */
+export const MAX_JUDGEMENT_REASON_CHARS = 200;
 
 export interface RiskFile {
   path: string;
@@ -61,12 +90,37 @@ export interface RiskInput {
   repoConfig: RepoConfig | null | "invalid";
   /** Escalations only: `security_finding`, `review_skipped`. */
   flags?: string[];
+  /** The reviewing model's own reading of the change; a `high` adds a reason, a `low` changes nothing. */
+  judgement?: ReviewerJudgement | null;
 }
 
 export interface RiskResult {
+  /** The verdict: `high` when there is any reason, from the rules or from the reviewer. */
   level: "low" | "high";
   reasons: string[];
+  /** The kinds of change the reasons are about, in the order they first appear. */
+  categories: RiskCategory[];
+  /** What the rules alone say. The reviewer's judgement is never in it, and it never goes down because of it. */
+  ruleLevel: "low" | "high";
+  /** The reviewer's judgement is what made a change the rules call low into a high one. */
+  raisedByReviewer: boolean;
   rulePack: string;
+}
+
+/**
+ * The reviewer's judgement as it is kept: only a `high` with a reason counts, the reason is one clipped line without
+ * control characters or markup that could dress it up on a card, and `mask` (the token and secret masking of the tool
+ * answers) is applied to it. Anything else, a `low` included, is nothing: the model cannot lower a verdict.
+ */
+export function normaliseJudgement(raw: unknown, mask: (text: string) => string = (t) => t): ReviewerJudgement | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const { level, reason } = raw as { level?: unknown; reason?: unknown };
+  if (level !== "high") return null;
+  const text = mask(typeof reason === "string" ? reason : "")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, " ").replace(/[`<>]/g, "'").replace(/\s+/g, " ").trim();
+  const clipped = text.length > MAX_JUDGEMENT_REASON_CHARS ? `${text.slice(0, MAX_JUDGEMENT_REASON_CHARS - 1)}…` : text;
+  return { level: "high", reason: clipped || "the reviewer judged this change high risk and gave no reason" };
 }
 
 /** Most files the reader fetches; a pull request with more is high risk by size alone. */
@@ -100,7 +154,6 @@ const RELEASE_PATHS: RegExp[] = [
 ];
 const MANIFESTS = /(^|\/)(package\.json|go\.mod|requirements[^/]*\.txt|pyproject\.toml|Cargo\.toml|Gemfile|pom\.xml|build\.gradle(\.kts)?|setup\.py|setup\.cfg|composer\.json|Pipfile|Package\.swift|mix\.exs|pubspec\.ya?ml|Podfile)$/i;
 const LOCKS = /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lock|deno\.lock|go\.sum|poetry\.lock|pdm\.lock|uv\.lock|Pipfile\.lock|Cargo\.lock|Gemfile\.lock|composer\.lock|packages\.lock\.json|gradle\.lockfile|Podfile\.lock|Package\.resolved|mix\.lock|pubspec\.lock|flake\.lock)$/i;
-const TEST_DIR = /(^|\/)(tests?|__tests__|spec|specs)\//i;
 
 const INSECURE_LINES: Array<[RegExp, string]> = [
   [/verify\s*=\s*False/, "TLS verification switched off (verify=False)"],
@@ -192,30 +245,43 @@ export function parseClawyConfig(text: string): RepoConfig | "invalid" {
   return config;
 }
 
-function assess(input: RiskInput): string[] {
-  const reasons: string[] = [];
-  const add = (r: string): void => { if (!reasons.includes(r)) reasons.push(r); };
+function assess(input: RiskInput): Finding[] {
+  const findings: Finding[] = [];
+  const seen = new Set<string>();
+  const add = (category: RiskCategory, reason: string): void => {
+    if (seen.has(reason)) return;
+    seen.add(reason);
+    findings.push({ category, reason });
+  };
 
+  // ---- the floor: nothing here reads what the change says, and all of it stays as a backstop.
   // Size and completeness first: nothing below can be trusted if the list is cut.
   if (!input.filesComplete || input.changedFiles > input.files.length) {
-    add(`the change list is incomplete (${input.files.length} of ${input.changedFiles} files read)`);
+    add("integrity", `the change list is incomplete (${input.files.length} of ${input.changedFiles} files read)`);
   }
-  if (input.changedFiles > 3000) add("more than 3000 files changed: GitHub's file list limit");
-  if (input.changedFiles > 40) add(`large change: ${input.changedFiles} files`);
-  if (input.additions + input.deletions > 1000) add(`large change: ${input.additions + input.deletions} lines`);
-  if (input.deletions > 300) add(`${input.deletions} lines deleted`);
-  if (input.deletions >= 100 && input.deletions > (input.additions + input.deletions) / 2) add("mostly deletions");
+  if (input.changedFiles > 3000) add("integrity", "more than 3000 files changed: GitHub's file list limit");
+  if (input.changedFiles > 40) add("size_breadth", `large change: ${input.changedFiles} files`);
+  if (input.additions + input.deletions > 1000) add("size_breadth", `large change: ${input.additions + input.deletions} lines`);
+  if (input.deletions > 300) add("size_breadth", `${input.deletions} lines deleted`);
+  if (input.deletions >= 100 && input.deletions > (input.additions + input.deletions) / 2) add("size_breadth", "mostly deletions");
 
-  if (input.fork) add("the pull request comes from a fork");
+  if (input.fork) add("provenance", "the pull request comes from a fork");
   if (!["MEMBER", "OWNER", "COLLABORATOR"].includes(input.authorAssociation)) {
-    add(`the author is not a member of the organisation (${input.authorAssociation || "unknown"})`);
+    add("provenance", `the author is not a member of the organisation (${input.authorAssociation || "unknown"})`);
   }
-  if (input.baseRef !== input.defaultBranch) add(`the base branch is ${input.baseRef}, not the default branch ${input.defaultBranch}`);
+  if (input.baseRef !== input.defaultBranch) add("provenance", `the base branch is ${input.baseRef}, not the default branch ${input.defaultBranch}`);
 
-  if (input.repoConfig === "invalid") add("the repository's .github/clawy.yml could not be read");
+  if (input.repoConfig === "invalid") add("provenance", "the repository's .github/clawy.yml could not be read");
   const extra = input.repoConfig && input.repoConfig !== "invalid" ? input.repoConfig : null;
-  if (extra?.confirmMerge === "always") add("the repository asks for confirmation on every merge");
+  if (extra?.confirmMerge === "always") add("provenance", "the repository asks for confirmation on every merge");
   const extraGlobs = (extra?.highRiskPaths ?? []).map(globToRegExp);
+
+  // ---- what the change does: architecture, interfaces, security-sensitive code (risk-signals.ts).
+  const content = contentFindings(input.files);
+  for (const f of content.findings) add(f.category, f.reason);
+  // A file counts as changed for the path rules below when something of it really changed: a comment or a line that only
+  // moved elsewhere is not a change to a Dockerfile, an authentication module or a deployment chart.
+  const changed = (f: RiskFile): boolean => ["added", "removed", "renamed", "copied"].includes(f.status) || content.touched.has(f.path);
 
   let removedFiles = 0;
   const removedInTests = new Map<string, number>();
@@ -224,60 +290,71 @@ function assess(input: RiskInput): string[] {
     // A file moved out of a protected path is a change to that path, as much as one moved in or edited in place.
     for (const q of f.previousPath && f.previousPath !== p ? [p, f.previousPath] : [p]) {
       const where = q === p ? p : `${q} (moved to ${p})`;
-      if (GOVERNANCE_PATHS.some((re) => re.test(q))) add(`CI, workflow or governance file changed: ${where}`);
-      if (AUTH_PATH.test(q)) add(`authentication or security code changed: ${where}`);
-      if (SECRET_PATHS.some((re) => re.test(q))) add(`secret-handling file changed: ${where}`);
-      if (RELEASE_PATHS.some((re) => re.test(q))) add(`release or deployment file changed: ${where}`);
-      if (extraGlobs.some((re) => re.test(q))) add(`path the repository marks high risk: ${where}`);
+      if (GOVERNANCE_PATHS.some((re) => re.test(q))) add("ci_release", `CI, workflow or governance file changed: ${where}`);
+      if (AUTH_PATH.test(q) && isSource(q) && changed(f)) add("security", `authentication or security code changed: ${where}`);
+      if (SECRET_PATHS.some((re) => re.test(q))) add("security", `secret-handling file changed: ${where}`);
+      if (RELEASE_PATHS.some((re) => re.test(q)) && !isDoc(q) && changed(f)) add("ci_release", `release or deployment file changed: ${where}`);
+      if (extraGlobs.some((re) => re.test(q))) add("provenance", `path the repository marks high risk: ${where}`);
     }
     // A lock file decides which tarball or checksum an install fetches, and nothing here reads its lines. A manifest
     // edited somewhere else in the same change says nothing about it, so a lock file is held whatever else changed:
     // a real dependency change is held by the manifest rule below in any case.
-    if (LOCKS.test(p) || (f.previousPath !== undefined && LOCKS.test(f.previousPath))) add(`lock file changed (it decides what an install downloads): ${p}`);
+    if (LOCKS.test(p) || (f.previousPath !== undefined && LOCKS.test(f.previousPath))) add("integrity", `lock file changed (it decides what an install downloads): ${p}`);
     if (f.status === "removed") {
       removedFiles += 1;
       const dir = p.replace(/\/[^/]*$/, "");
-      if (TEST_DIR.test(p)) removedInTests.set(dir, (removedInTests.get(dir) ?? 0) + 1);
+      if (isTest(p)) removedInTests.set(dir, (removedInTests.get(dir) ?? 0) + 1);
     }
-    if (f.status === "changed") add(`file mode or type changed: ${p}`);
+    if (f.status === "changed") add("integrity", `file mode or type changed: ${p}`);
     // Whatever the status and the line counts say, a change that came without its diff was not read (see diffNotSent).
-    if (diffNotSent(f)) add(`diff not readable (binary, renamed without a diff, or too large): ${p}`);
+    if (diffNotSent(f)) add("integrity", `diff not readable (binary, renamed without a diff, or too large): ${p}`);
 
     const added = addedLines(f.patch);
     const removed = removedLines(f.patch);
-    if (/^Subproject commit /m.test((f.patch ?? "")) || added.some((l) => /^Subproject commit /.test(l))) add(`submodule pointer changed: ${p}`);
+    if (/^Subproject commit /m.test((f.patch ?? "")) || added.some((l) => /^Subproject commit /.test(l))) add("integrity", `submodule pointer changed: ${p}`);
     for (const line of added) {
-      for (const [re, what] of INSECURE_LINES) if (re.test(line)) add(`added line with ${what}: ${p}`);
-      for (const [re, what] of SECRET_LINES) if (re.test(line)) add(`added line with ${what}: ${p}`);
+      // A sentence in the documentation that names `--insecure`, or a test that switches verification off on purpose, is not
+      // product code switching it off. A secret on any line, wherever it is, still is.
+      if (isSource(p)) for (const [re, what] of INSECURE_LINES) if (re.test(line)) add("security", `added line with ${what}: ${p}`);
+      for (const [re, what] of SECRET_LINES) if (re.test(line)) add("security", `added line with ${what}: ${p}`);
     }
     if (MANIFESTS.test(p)) {
       if (/(^|\/)package\.json$/i.test(p) && [...added, ...removed].some((l) => MANIFEST_RELEASE_FIELDS.test(l))) {
-        add(`package metadata (version, scripts, publish fields) changed: ${p}`);
+        add("dependency", `package metadata (version, scripts, publish fields) changed: ${p}`);
       }
-      if (added.some((l) => DEPENDENCY_LINES.some((re) => re.test(l)))) add(`dependency added or changed: ${p}`);
-      if (added.some((l) => SOURCE_LINE.test(l))) add(`dependency or setting from a git or URL source: ${p}`);
+      if (added.some((l) => DEPENDENCY_LINES.some((re) => re.test(l)))) add("dependency", `dependency added or changed: ${p}`);
+      if (added.some((l) => SOURCE_LINE.test(l))) add("dependency", `dependency or setting from a git or URL source: ${p}`);
     }
   }
-  if (removedFiles > 5) add(`${removedFiles} files deleted`);
-  for (const [dir, n] of removedInTests) if (n >= 3) add(`${n} test files deleted under ${dir}`);
+  if (removedFiles > 5) add("size_breadth", `${removedFiles} files deleted`);
+  for (const [dir, n] of removedInTests) if (n >= 3) add("size_breadth", `${n} test files deleted under ${dir}`);
 
   for (const flag of input.flags ?? []) {
-    if (flag === "security_finding") add("the review found a security issue (even if it was fixed)");
-    else if (flag === "review_skipped") add("the review skipped a step");
-    else add(`the reviewer raised the flag ${flag.slice(0, 40)}`);
+    if (flag === "security_finding") add("reviewer", "the review found a security issue (even if it was fixed)");
+    else if (flag === "review_skipped") add("reviewer", "the review skipped a step");
+    else add("reviewer", `the reviewer raised the flag ${flag.slice(0, 40)}`);
   }
-  return reasons;
+  return findings;
 }
 
 /** Never throws: a rule that fails makes the answer `high`. */
 export function assessRisk(input: RiskInput): RiskResult {
-  let reasons: string[];
+  let findings: Finding[];
   try {
-    reasons = assess(input);
+    findings = assess(input);
   } catch {
-    reasons = ["the risk rules could not be evaluated"];
+    findings = [{ category: "integrity", reason: "the risk rules could not be evaluated" }];
   }
-  const shown = reasons.slice(0, MAX_REASONS);
-  if (reasons.length > MAX_REASONS) shown.push(`and ${reasons.length - MAX_REASONS} more`);
-  return { level: reasons.length > 0 ? "high" : "low", reasons: shown, rulePack: RISK_RULE_PACK_VERSION };
+  const ruleLevel: "low" | "high" = findings.length > 0 ? "high" : "low";
+  // The reviewer's reading can add to the verdict and never take from it. It goes first: it is the one reason written for
+  // this change, and a card shows only the first few.
+  const judged = input.judgement?.level === "high" ? input.judgement : null;
+  if (judged) findings.unshift({ category: "reviewer", reason: `the reviewer's judgement: ${judged.reason}` });
+  const shown = findings.slice(0, MAX_REASONS).map((f) => f.reason);
+  if (findings.length > MAX_REASONS) shown.push(`and ${findings.length - MAX_REASONS} more`);
+  const categories = [...new Set(findings.map((f) => f.category))];
+  return {
+    level: findings.length > 0 ? "high" : "low", reasons: shown, categories, ruleLevel,
+    raisedByReviewer: judged !== null && ruleLevel === "low", rulePack: RISK_RULE_PACK_VERSION,
+  };
 }

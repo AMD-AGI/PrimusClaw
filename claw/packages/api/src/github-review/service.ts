@@ -25,14 +25,14 @@ import { IdentityCredentialRefusedError, IdentityUnavailableError, type ResolveC
 import { evaluateChecks, requiredContextsFromRules, type ChecksVerdict } from "./checks.js";
 import { commentableLines } from "./diff.js";
 import { GithubClient, GithubError, parsePrRef, repoPath, type PrRef } from "./github.js";
-import { MAX_FILES_READ, assessRisk, diffNotSent, parseClawyConfig, type RepoConfig, type RiskFile, type RiskResult } from "./risk.js";
+import { MAX_FILES_READ, assessRisk, diffNotSent, normaliseJudgement, parseClawyConfig, type RepoConfig, type ReviewerJudgement, type RiskFile, type RiskResult } from "./risk.js";
 import { selectReviewInstructions } from "./repo-skill.js";
 import { chooseReviewPath, reviewPathAdvice } from "./review-path.js";
 import { SANDBOX_RECIPE_USAGE, buildSandboxRecipe } from "./sandbox-recipe.js";
 import { GITHUB_PROVIDER, type GithubReviewSettings } from "./settings.js";
 import {
   auditFinish, auditStart, claimConfirmation, finishConfirmation, getConfirmation, openConfirmation,
-  countPendingConfirmations, recentWrites, reopenConfirmation, reserveWrite, sessionRequestCount, type Confirmation, type Queryable,
+  countPendingConfirmations, recentWrites, reopenConfirmation, reserveWrite, sessionRequestCount, type Confirmation, type DecidedVia, type Queryable,
 } from "./store.js";
 
 const logger = pino({ name: "github-review" });
@@ -220,7 +220,7 @@ export class GithubReview {
           status: state.mergeStateStatus, mergeable: state.mergeable, review_decision: state.reviewDecision,
           unresolved_threads: state.unresolvedThreads, threads_complete: state.threadsComplete,
         },
-        risk: { level: risk.level, reasons: risk.reasons, rule_pack: risk.rulePack },
+        risk: this.riskBlock(risk),
         files: change.files.map((f) => ({ path: f.path, status: f.status, additions: f.additions, deletions: f.deletions, has_diff: f.patch !== undefined })),
         files_complete: change.complete,
         diff_cut: diffCut,
@@ -253,10 +253,10 @@ export class GithubReview {
     return this.run(actor, "gh_pr_risk", args, async (ctx, ref) => {
       const { repo, pr } = await this.load(ctx, ref);
       const change = await this.collectChange(ctx, ref, pr);
-      const risk = assessRisk(this.riskInput(pr, repo, change, this.flags(args)));
+      const risk = assessRisk(this.riskInput(pr, repo, change, this.flags(args), this.judgement(ctx, args)));
       ctx.acc.riskReasons = risk.reasons;
       ctx.acc.headSha = pr.headSha;
-      return ok({ status: "ok", head_sha: pr.headSha, risk: { level: risk.level, reasons: risk.reasons, rule_pack: risk.rulePack } }, (t) => ctx.client.redact(t));
+      return ok({ status: "ok", head_sha: pr.headSha, risk: this.riskBlock(risk) }, (t) => ctx.client.redact(t));
     });
   }
 
@@ -278,7 +278,7 @@ export class GithubReview {
       const change = needsChange ? await this.collectChange(ctx, ref, pr) : null;
       const comments = this.checkComments(args.comments, change);
       await this.requireEvent(ctx, repo, pr, event as "COMMENT" | "REQUEST_CHANGES" | "APPROVE");
-      if (event === "APPROVE") await this.requireApprovable(ctx, ref, repo, pr, change, this.flags(args));
+      if (event === "APPROVE") await this.requireApprovable(ctx, ref, repo, pr, change, this.flags(args), this.judgement(ctx, args));
       const result = await this.writeReview(ctx, ref, pr, event, text, comments);
       return ok({ status: result.status, head_sha: headSha, ...result.detail }, (t) => ctx.client.redact(t));
     });
@@ -292,7 +292,7 @@ export class GithubReview {
       if (method !== undefined && !["squash", "merge", "rebase"].includes(method)) {
         throw new Refusal("invalid_method", "method must be squash, merge or rebase");
       }
-      return ok(await this.merge(ctx, ref, headSha, { method: method as "squash" | "merge" | "rebase" | undefined, flags: this.flags(args), confirmation: null }), (t) => ctx.client.redact(t));
+      return ok(await this.merge(ctx, ref, headSha, { method: method as "squash" | "merge" | "rebase" | undefined, flags: this.flags(args), judgement: this.judgement(ctx, args), confirmation: null }), (t) => ctx.client.redact(t));
     });
   }
 
@@ -302,18 +302,30 @@ export class GithubReview {
    * The acting user's answer to a held merge. Only the actor can give it (the
    * caller checks that and passes `deciderUserId`); on allow, every merge gate is
    * read again and the merge is made with the actor's own account.
+   *
+   * `via` is set when a service client answered for the actor (an operator-allowed
+   * service holding a token the identity provider exchanged for that user, which
+   * the route has already checked): the subject is still the actor, and who stood
+   * behind the answer is recorded with it, on the confirmation and on the audit row
+   * of the merge. A service has no say of its own: the person it names is the only
+   * one whose answer it can give.
    */
-  async decide(deciderUserId: string, id: string, decision: "allow" | "deny"): Promise<{ http: number; body: Record<string, unknown> }> {
+  async decide(deciderUserId: string, id: string, decision: "allow" | "deny", via: DecidedVia | null = null): Promise<{ http: number; body: Record<string, unknown> }> {
     const row = await getConfirmation(this.deps.db, id);
     if (!row) return { http: 404, body: { ok: false, error: "not_found" } };
     if (row.actorUserId !== deciderUserId) return { http: 403, body: { ok: false, error: "only_the_acting_user_can_decide" } };
+    // What the closing record says about who answered; as before, only a deny (and now a service's answer) says so at all.
+    const by: Record<string, unknown> = via ? { by: "service", client_id: via.clientId, act_sub: via.actorSub } : {};
+    if (via) {
+      (this.deps.logger ?? logger).info({ confirmation_id: id, subject: deciderUserId, client_id: via.clientId, act_sub: via.actorSub, decision }, "github_review.decision_by_service");
+    }
     if (decision === "deny") {
-      const claimed = await claimConfirmation(this.deps.db, id, deciderUserId);
+      const claimed = await claimConfirmation(this.deps.db, id, deciderUserId, via);
       if (!claimed.ok) return { http: 200, body: { ok: true, status: claimed.reason === "expired" ? "expired" : "refused", reason: claimed.reason } };
-      await finishConfirmation(this.deps.db, id, "denied", deciderUserId, { by: "actor" });
+      await finishConfirmation(this.deps.db, id, "denied", deciderUserId, via ? by : { by: "actor" });
       return { http: 200, body: { ok: true, status: "denied" } };
     }
-    const claimed = await claimConfirmation(this.deps.db, id, deciderUserId);
+    const claimed = await claimConfirmation(this.deps.db, id, deciderUserId, via);
     if (!claimed.ok) {
       return { http: 200, body: { ok: true, status: claimed.reason === "expired" ? "expired" : "refused", reason: claimed.reason } };
     }
@@ -325,20 +337,20 @@ export class GithubReview {
     };
     const ref = parsePrRef(`${confirmation.repo}#${confirmation.pr}`);
     if (!ref) {
-      await finishConfirmation(this.deps.db, id, "refused", deciderUserId, { reason: "bad_reference" });
+      await finishConfirmation(this.deps.db, id, "refused", deciderUserId, { ...by, reason: "bad_reference" });
       return { http: 200, body: { ok: true, status: "refused", reason: "bad_reference" } };
     }
-    const outcome = await this.run(actor, "gh_pr_merge", { pr: `${confirmation.repo}#${confirmation.pr}`, head_sha: confirmation.headSha, confirmation_id: id }, async (ctx) => {
-      return ok(await this.merge(ctx, ref, confirmation.headSha, { flags: [], confirmation }), (t) => ctx.client.redact(t));
+    const outcome = await this.run(actor, "gh_pr_merge", { pr: `${confirmation.repo}#${confirmation.pr}`, head_sha: confirmation.headSha, confirmation_id: id, ...(via ? { decided_by_service: via.clientId, decided_by_service_act: via.actorSub } : {}) }, async (ctx) => {
+      return ok(await this.merge(ctx, ref, confirmation.headSha, { flags: [], judgement: null, confirmation }), (t) => ctx.client.redact(t));
     }, { skipBudget: true, ref, consented: true });
     const status = String(outcome.body.status ?? "");
     const reason = String(outcome.body.reason ?? "");
     if (status === "merged") {
-      await finishConfirmation(this.deps.db, id, "merged", deciderUserId, { merge_sha: outcome.body.merge_sha ?? null });
+      await finishConfirmation(this.deps.db, id, "merged", deciderUserId, { ...by, merge_sha: outcome.body.merge_sha ?? null });
       return { http: 200, body: { ok: true, status: "merged", merge_sha: outcome.body.merge_sha ?? null, url: outcome.body.url ?? null } };
     }
     if (status === "dry_run") {
-      await finishConfirmation(this.deps.db, id, "refused", deciderUserId, { reason: "writes_disabled" });
+      await finishConfirmation(this.deps.db, id, "refused", deciderUserId, { ...by, reason: "writes_disabled" });
       return { http: 200, body: { ok: true, status: "refused", reason: "writes_disabled" } };
     }
     // Once an approval or a merge has been sent, the try has had an effect on the pull request and is not
@@ -352,7 +364,7 @@ export class GithubReview {
       }
     }
     const final = reason === "head_moved" ? "stale" : "refused";
-    await finishConfirmation(this.deps.db, id, final, deciderUserId, { reason, ...(wrote ? { wrote: true } : {}) });
+    await finishConfirmation(this.deps.db, id, final, deciderUserId, { ...by, reason, ...(wrote ? { wrote: true } : {}) });
     const message = [outcome.body.message, wrote ? "An approval or a merge was already sent to GitHub in this try, so this confirmation is closed; look at the pull request before asking again." : null].filter(Boolean).join(" ");
     return { http: 200, body: { ok: true, status: final, reason, message: message || null, ...(wrote ? { wrote: true } : {}) } };
   }
@@ -594,12 +606,21 @@ export class GithubReview {
     return { files, complete: files.length >= pr.changedFiles && pr.changedFiles <= MAX_FILES_READ, repoConfig };
   }
 
-  private riskInput(pr: PrInfo, repo: RepoInfo, change: Change, flags: string[] = []): Parameters<typeof assessRisk>[0] {
+  private riskInput(pr: PrInfo, repo: RepoInfo, change: Change, flags: string[] = [], judgement: ReviewerJudgement | null = null): Parameters<typeof assessRisk>[0] {
     return {
       files: change.files, changedFiles: pr.changedFiles, filesComplete: change.complete, additions: pr.additions, deletions: pr.deletions,
       fork: pr.fork, authorAssociation: pr.authorAssociation, baseRef: pr.baseRef, defaultBranch: repo.defaultBranch,
-      repoConfig: change.repoConfig, flags,
+      repoConfig: change.repoConfig, flags, judgement,
     };
+  }
+
+  /** The reviewing model's content judgement of the change, as it is kept: it can only raise the verdict (see normaliseJudgement). */
+  private judgement(ctx: Ctx, args: Record<string, unknown>): ReviewerJudgement | null {
+    return normaliseJudgement(args.risk_judgement, (t) => ctx.client.redact(t));
+  }
+
+  private riskBlock(risk: RiskResult): Record<string, unknown> {
+    return { level: risk.level, rule_level: risk.ruleLevel, raised_by_reviewer: risk.raisedByReviewer, reasons: risk.reasons, categories: risk.categories, rule_pack: risk.rulePack };
   }
 
   private async readState(ctx: Ctx, ref: PrRef, pr: PrInfo, _repo: RepoInfo): Promise<PullState> {
@@ -683,10 +704,10 @@ export class GithubReview {
    * open thread, and a change that does not need the acting user's confirmation.
    * A high-risk approval goes through `gh_pr_merge`, which asks them first.
    */
-  private async requireApprovable(ctx: Ctx, ref: PrRef, repo: RepoInfo, pr: PrInfo, change: Change | null, flags: string[]): Promise<void> {
+  private async requireApprovable(ctx: Ctx, ref: PrRef, repo: RepoInfo, pr: PrInfo, change: Change | null, flags: string[], judgement: ReviewerJudgement | null): Promise<void> {
     const read = change ?? await this.collectChange(ctx, ref, pr);
-    // The reviewer's own flags count here as they do at the merge: they can only raise the verdict.
-    const risk = assessRisk(this.riskInput(pr, repo, read, flags));
+    // The reviewer's own flags and judgement count here as they do at the merge: they can only raise the verdict.
+    const risk = assessRisk(this.riskInput(pr, repo, read, flags, judgement));
     ctx.acc.riskReasons = risk.reasons;
     this.requireGreen(await this.readState(ctx, ref, pr, repo), pr.headSha);
     if (risk.level === "high") {
@@ -774,7 +795,7 @@ export class GithubReview {
 
   private async merge(
     ctx: Ctx, ref: PrRef, headSha: string,
-    opts: { method?: "squash" | "merge" | "rebase"; flags: string[]; confirmation: Confirmation | null },
+    opts: { method?: "squash" | "merge" | "rebase"; flags: string[]; judgement: ReviewerJudgement | null; confirmation: Confirmation | null },
   ): Promise<Record<string, unknown>> {
     const { repo, pr } = await this.load(ctx, ref);
     this.requireOpen(pr);
@@ -792,7 +813,7 @@ export class GithubReview {
     if (!method || !repo.methods.includes(method)) throw new Refusal("merge_method_not_allowed", `the repository does not allow that merge method (allowed: ${repo.methods.join(", ") || "none"})`);
 
     const change = await this.collectChange(ctx, ref, pr);
-    const risk: RiskResult = assessRisk(this.riskInput(pr, repo, change, opts.flags));
+    const risk: RiskResult = assessRisk(this.riskInput(pr, repo, change, opts.flags, opts.judgement));
     ctx.acc.riskReasons = risk.reasons;
     let state = await this.readState(ctx, ref, pr, repo);
     // Before anyone is asked: a person is not woken to confirm a merge that CI or an open thread would refuse anyway.

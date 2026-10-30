@@ -34,7 +34,7 @@ tool offered to a session, and `config.acting_as` is refused.
 | Tool | What it does |
 |---|---|
 | `gh_pr_get` | The pull request, its files and diff, CI, review threads, existing comments, the risk verdict, what the acting user may do, the review path (below) and the review instructions. Text that came from the pull request is under `untrusted`. Call it first. |
-| `gh_pr_risk` | The deterministic risk verdict alone. The model may pass `risk_flags` (`security_finding`, `review_skipped`); they can only raise the verdict. |
+| `gh_pr_risk` | The risk verdict alone, with its categories. The model may pass `risk_flags` (`security_finding`, `review_skipped`) and a `risk_judgement` (see High risk); both can only raise the verdict. |
 | `gh_review_submit` | One review on the pinned head commit (the model may pass the same `risk_flags` as to `gh_pr_risk`, and they count for an `APPROVE`), with inline comments that must sit on lines the diff shows. `COMMENT`, `REQUEST_CHANGES` or `APPROVE`. A body footer says `Reviewed by Clawy on behalf of <login> (requested by <name>), run <id>` and a hidden marker keeps a retry from posting twice. |
 | `gh_pr_merge` | Approves when needed and merges, if every gate is open. |
 
@@ -72,17 +72,53 @@ tool offered to a session, and `config.acting_as` is refused.
   state is `CLEAN` after the approval, and the repository's own protections are met because
   they are GitHub's. No admin merge, no auto-merge, no branch update, no change to a rule.
   The method is the repository's first allowed one, squash first.
-- **High risk.** A versioned rule pack (`packages/api/src/github-review/risk.ts`) decides.
-  It holds a merge for the acting user's own confirmation when a change touches CI,
-  workflows or governance files, authentication or security code, secret handling, release
-  or deployment files, dependencies (a lock file is held whatever else the change edits, since it decides
-  what an install downloads), is large or mostly deletions, is a fork or from a
-  non-member, targets a branch other than the default, or when anything cannot be read (the
-  rules fail closed: a file that came without its diff is held whatever its status and line counts
-  say, since GitHub sends none for a binary, a rename or a diff it finds too large, and counts a modified
-  or renamed binary as 0 lines). A file that was moved is judged by the path it left as well as the one it
-  went to, and a line that starts with `++` or `--` is read like any other. A repository's `.github/clawy.yml` on the base branch can add paths
-  (`high_risk_paths`) or ask for confirmation on every merge (`confirm_merge: always`).
+- **High risk.** A versioned rule pack (`packages/api/src/github-review/risk.ts` and
+  `risk-signals.ts`, version `2026-10-30.2`) decides from what the change **does**, read from
+  its diff, not from which kind of file it touches. A merge is held for the acting user's own
+  confirmation when the change is
+  - an **architecture** change: a package or module added or removed (a manifest, a `go.mod`, a
+    `__init__.py`), a deployable unit added or removed (a Dockerfile, a compose file, a
+    Kubernetes Deployment, Service, Ingress or role, a Terraform resource), a directory moved
+    (three or more files) or code moved between packages, a relative import that reaches into
+    another package, the workspace, project-reference or layering rules changed;
+  - an **interface** change: an exported symbol with a different signature or removed (TypeScript,
+    Go, Python, Rust and Java/Kotlin/C# are read; a new export counts in a package's entry point),
+    an HTTP route added, removed or changed, an OpenAPI, protobuf, GraphQL, Avro or JSON schema, a
+    command-line flag, an environment variable read or the documented configuration example, a
+    database migration or a schema statement in code, a wire or event format under `protocol/`,
+    `contracts/` and the like;
+  - **security-sensitive code**: authentication, authorisation and permission logic, token
+    handling, cryptography, privilege and isolation settings, secret and credential handling, web
+    security settings, code-execution surfaces, and the lines that switch verification off or
+    carry a secret (a secret is a finding in documentation too, an insecure flag in prose is not);
+  - a **CI or release** change (workflows, governance files such as CODEOWNERS, a Dockerfile, a
+    chart, a release script) whose content changed, a **dependency** manifest change, or a change
+    that is large (files, lines, deletions) or broad (five packages or more).
+
+  It reads the **net** change: a line that one file loses and another gains cancels out, and blank
+  and comment lines are not content, so a pure refactor, a move of code, a reformat, a comment-only
+  edit, documentation and tests are low. A rename inside one package is low. What it cannot see (a
+  field added to an exported type, a parameter on a wrapped signature line, a behaviour that changed
+  under an unchanged name) is for the reviewer's own judgement (below).
+
+  Under the content rules sits a **floor** that reads no content and stays as a backstop: a file
+  that came without its diff (GitHub sends none for a binary, a rename or a diff it finds too large,
+  and counts a modified or renamed binary as 0 lines, so the missing patch is the signal), a lock
+  file (it decides what an install downloads), a submodule pointer, a file mode change, a file list
+  that was cut, a fork, a non-member author, a base branch other than the default, and any rule
+  that throws: the rules fail closed. A file that was moved is judged by the path it left as well
+  as the one it went to, and a line that starts with `++` or `--` is read like any other. A
+  repository's `.github/clawy.yml` on the base branch can add paths (`high_risk_paths`) or ask for
+  confirmation on every merge (`confirm_merge: always`).
+
+  **The reviewer's judgement.** `gh_pr_risk`, `gh_review_submit` and `gh_pr_merge` take
+  `risk_judgement: {level: "low" | "high", reason}`. A `high` with its reason adds a reason that
+  comes first on the confirmation the acting user is shown (one clipped line, markup stripped, the
+  token masked) and holds the merge, and an APPROVE with it. A `low` changes nothing: the
+  reviewer can raise the verdict, never lower it, and what the rules said alone is reported apart
+  (`risk.rule_level`, `risk.raised_by_reviewer`, `risk.categories`: `architecture`, `interface`,
+  `security`, `ci_release`, `dependency`, `size_breadth`, `integrity`, `provenance`, `reviewer`).
+
   A merge that needs confirmation creates one pending row for the head commit and merges
   nothing.
 
@@ -91,10 +127,33 @@ tool offered to a session, and `config.acting_as` is refused.
 | Route | Purpose |
 |---|---|
 | `GET /v1/github-review/confirmations?session_id=<id>&status=pending` | The confirmations of the caller's own sessions and those that ask the caller. `{items:[{id, repo, pr, title, author, head_sha, reasons, checks, actor_user_id, requester_user_id, session_id, expires_at, status}]}` |
-| `POST /v1/github-review/confirmations/:id/decision` `{decision: "allow" \| "deny"}` | The acting user's answer, given signed in: a browser session (the `Token` cookie) or an identity provider's access token. Anyone else gets `403`, and so does the acting user with an `ak-` key (`Authorization: Bearer` or `x-api-key`) or a BYOK key, whatever the id: the sandbox of a session holds its owner's key, and in a session that acts as its owner a model could otherwise answer its own confirmation (`403 interactive_sign_in_required`; the check is on how the request was authenticated, before the confirmation is looked up). On `allow` every gate is read again and the merge is made with the acting user's account; the answer is `{status: "merged" \| "denied" \| "stale" \| "expired" \| "refused" \| "retry", reason, merge_sha}`. `retry` means the merge could not be tried just now (the identity service or GitHub failed, a limit was hit) before anything was sent to GitHub, and the confirmation is still open: allow it again. Once an approval or a merge has been sent the try is not given back: the confirmation is closed as `refused` with `wrote: true`. The merge is recorded as asked for by the requester, not by the acting user |
+| `POST /v1/github-review/confirmations/:id/decision` `{decision: "allow" \| "deny"}` | The acting user's answer, given signed in: a browser session (the `Token` cookie) or an identity provider's access token. Anyone else gets `403`, and so does the acting user with an `ak-` key (`Authorization: Bearer` or `x-api-key`) or a BYOK key, whatever the id: the sandbox of a session holds its owner's key, and in a session that acts as its owner a model could otherwise answer its own confirmation (`403 interactive_sign_in_required`; the check is on how the request was authenticated, before the confirmation is looked up). On `allow` every gate is read again and the merge is made with the acting user's account; the answer is `{status: "merged" \| "denied" \| "stale" \| "expired" \| "refused" \| "retry", reason, merge_sha}`. `retry` means the merge could not be tried just now (the identity service or GitHub failed, a limit was hit) before anything was sent to GitHub, and the confirmation is still open: allow it again. Once an approval or a merge has been sent the try is not given back: the confirmation is closed as `refused` with `wrote: true`. The merge is recorded as asked for by the requester, not by the acting user. A service an operator named may answer for the acting user too (next section) |
 
 A confirmation lives 24 hours (`CLAW_GITHUB_CONFIRMATION_TTL_SECONDS`), is bound to the head
 commit (a head that moved makes it `stale`) and is used once.
+
+### A service answering for the acting user
+
+A chat integration or another service cannot hold a person's browser session, and the key a
+sandbox holds is refused on purpose. A **service client** of the identity provider answers
+instead, the way a service acts for a user everywhere else in Claw: it exchanges its own client
+credentials for an access token that acts as that user (RFC 8693: `sub` is the user, `act.sub` and
+`client_id` name the service) and calls the decision route with it as `Authorization: Bearer`.
+
+- Only a client an operator named is taken: `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS`
+  (comma or space separated, compared exactly as the identity provider signed it, empty by
+  default, which refuses every service). Any other client, and a token that names an actor but
+  no client, is `403 service_client_not_allowed`.
+- The subject is the token's `sub`, which the service cannot choose: the answer counts only when
+  it is the acting user's own (`403 only_the_acting_user_can_decide` otherwise), so a service
+  holding a token for someone else, or its own token, cannot answer.
+- A person's own access token (a browser sign-in, which names no actor) is still the person's
+  answer, and an `ak-` key, an `x-api-key`, a BYOK key or a connector token is still refused
+  (`403 interactive_sign_in_required`), whatever the allow-list says.
+- Who stood behind the answer is recorded: `decided_by` is the acting user, `decided_via` is
+  `{kind: "service", client_id, act_sub}` (also in the confirmation list), the closing `result`
+  says `by: "service"`, the audit row of the merge carries `decided_by_service`, and a
+  `github_review.decision_by_service` log line names the confirmation, the user and the client.
 
 ## Review path: the diff or a sandbox
 
@@ -153,6 +212,7 @@ changes, no request for reviewers. The answer ends with exactly one last line, `
 | `CLAW_GITHUB_WRITES_ENABLED` | off | Off is a dry run: every gate is checked and nothing is written to GitHub; the tools answer what they would do |
 | `CLAW_GITHUB_API_URL` | `https://api.github.com` | The API address |
 | `CLAW_GITHUB_CONFIRMATION_TTL_SECONDS` | 86400 | Life of a pending confirmation |
+| `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS` | none | Identity-provider client ids of the services that may answer a held merge for the user their token names (see "A service answering for the acting user"). Empty refuses every service |
 | `CLAW_GITHUB_REVIEWS_PER_TOKEN_PER_HOUR` | 6 | Reviews one GitHub account may have in an hour (a review and its merge count once) |
 | `CLAW_GITHUB_REVIEWS_PER_HOUR` | 20 | The same, all accounts together |
 | `CLAW_GITHUB_CONCURRENT_PER_REPO` | 3 | Tool calls on one repository at once, per API replica |

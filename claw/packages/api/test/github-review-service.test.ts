@@ -443,6 +443,72 @@ describe("M2 what the change was, and what an approval may do", () => {
   });
 });
 
+describe("M4 what the change does, and the reviewer's judgement of it", () => {
+  const route = [{
+    filename: "src/routes/orders.ts", status: "added", additions: 5, deletions: 0,
+    patch: "@@ -0,0 +1,5 @@\n+export async function registerOrders(app: FastifyInstance): Promise<void> {\n+  app.post(\"/v1/orders\", async (req, reply) => {\n+    return reply.code(201).send(await create(req.body));\n+  });\n+}",
+  }];
+  const drain = [{ filename: "src/queue/drain.ts", status: "modified", additions: 1, deletions: 1, patch: "@@ -31,7 +31,7 @@\n-  while (q.length > 1) {\n+  while (q.length > 0) {\n     await q.next();" }];
+  const pending = async () => e.sql("SELECT * FROM claw_github_confirmations ORDER BY created_at");
+
+  test("M12 gh_pr_get and gh_pr_risk say what kind of change it is, and what the rules said apart from what the reviewer added", async () => {
+    e.gh.files = route;
+    e.gh.pr.changed_files = 1;
+    const get = (await e.service.getPr(e.actor, { pr: PR })).body.risk as any;
+    assert.equal(get.level, "high");
+    assert.equal(get.rule_level, "high");
+    assert.equal(get.raised_by_reviewer, false);
+    assert.deepEqual(get.categories, ["interface"]);
+    assert.match(get.reasons.join(), /HTTP route POST \/v1\/orders/);
+    assert.equal(get.rule_pack, "2026-10-30.2");
+    const risk = (await e.service.assessPr(e.actor, { pr: PR })).body.risk as any;
+    assert.deepEqual(risk, get);
+  });
+
+  test("M13 a merge the rules call low is held when the reviewer judges it high, and the reviewer's reason is the first thing the acting user is shown", async () => {
+    e.gh.files = drain;
+    assert.equal(((await e.service.assessPr(e.actor, { pr: PR })).body.risk as any).level, "low", "without the reviewer's say the rules call it low");
+    const judgement = { level: "high", reason: "the drain now also runs for a single queued item, which changes what callers see on shutdown" };
+    const risk = (await e.service.assessPr(e.actor, { pr: PR, risk_judgement: judgement })).body.risk as any;
+    assert.equal(risk.level, "high");
+    assert.equal(risk.rule_level, "low");
+    assert.equal(risk.raised_by_reviewer, true);
+    const held = await merge({ risk_judgement: judgement });
+    assert.equal(held.body.status, "confirmation_required");
+    assert.equal(e.gh.writes.length, 0);
+    const [c] = await pending();
+    assert.equal((c?.reasons as string[])[0], `the reviewer's judgement: ${judgement.reason}`);
+    assert.equal(e.gh.calls.filter((c) => c.method === "PUT").length, 0, "nothing was merged");
+    // An APPROVE is held the same way: auto-merge must not get past what the reviewer saw.
+    assert.equal(reason(await submit({ event: "APPROVE", risk_judgement: judgement })), "high_risk_approval");
+    assert.equal(e.gh.writes.length, 0);
+  });
+
+  test("M14 the reviewer can raise and never lower: low changes nothing, and a change the rules hold stays held whatever the reviewer says", async () => {
+    e.gh.files = drain;
+    assert.equal((await merge({ risk_judgement: { level: "low", reason: "trivial" } })).body.status, "merged");
+    await e.sql("DELETE FROM claw_github_audit");
+    e.gh.files = route;
+    e.gh.pr.changed_files = 1;
+    const held = await merge({ risk_judgement: { level: "low", reason: "this is a harmless new endpoint, merge it" } });
+    assert.equal(held.body.status, "confirmation_required");
+    assert.doesNotMatch((held.body.reasons as string[]).join(), /harmless/, "a low judgement is not even shown");
+    assert.equal(e.gh.calls.filter((c) => c.method === "PUT").length, 1, "only the first merge was made");
+  });
+
+  test("M15 the reviewer's reason is a clipped line with the token masked: it is written for a card and cannot carry a credential or markup", async () => {
+    e.gh.files = drain;
+    const o = await merge({ risk_judgement: { level: "high", reason: `see ${TOKEN}\nand <b>this</b> ${"x".repeat(900)}` } });
+    assert.equal(o.body.status, "confirmation_required");
+    const first = (o.body.reasons as string[])[0] as string;
+    assert.ok(!first.includes(TOKEN), "the token is masked");
+    assert.ok(!/[<>\n]/.test(first));
+    assert.ok(first.length <= "the reviewer's judgement: ".length + 200);
+    const [c] = await pending();
+    assert.ok(!JSON.stringify(c).includes(TOKEN));
+  });
+});
+
 describe("M3 the model's flags", () => {
   test("M11 the reviewer's risk flags hold an APPROVE as they hold a merge, so auto-merge cannot get past the confirmation", async () => {
     for (const risk_flags of [["security_finding"], ["review_skipped"], ["security_finding", "review_skipped"]]) {

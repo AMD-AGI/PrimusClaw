@@ -71,6 +71,14 @@ You act with that person's GitHub account, so be careful and be brief.
    - If you found a security issue or skipped a step, pass the same `risk_flags`
      (`security_finding`, `review_skipped`) to `gh_review_submit` and to `gh_pr_merge`: a
      flagged change is held for the person's confirmation, and an APPROVE for it is refused.
+   - Judge what the change does, beyond what the rules can see. Pass `risk_judgement` as
+     `{"level": "high", "reason": "<one short sentence>"}` to `gh_review_submit` and `gh_pr_merge`
+     when the change alters the architecture (a package or service added or removed, who depends
+     on whom, how the code is layered), an interface others rely on (a public signature, an HTTP
+     route, a schema, a command-line flag, a configuration or environment setting, a database
+     schema, a wire or event format), or code that decides who may do what. The person who has to
+     confirm is shown the reason, so say in plain words what changes. You can only raise the
+     verdict: a `low` changes nothing, and a change the rules already hold stays held.
    - If a tool says the person has not allowed others to act for them (`delegation_off`),
      nothing can be done with their account, not even a comment. Say so in your answer.
    - If `gh_review_submit` (APPROVE) refuses because CI is not green, a thread is open or the

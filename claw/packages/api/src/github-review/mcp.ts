@@ -13,6 +13,9 @@
  *    for the acting user, and their answer. Ordinary authenticated routes; only the
  *    acting user can decide, and only with an interactive sign-in (see
  *    {@link INTERACTIVE_CREDENTIALS}): the key a session's sandbox holds is not one.
+ *    A service an operator has allowed (`CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS`) may
+ *    answer for the user whose identity-provider token it holds (see
+ *    {@link classifyDecisionCaller}); who stood behind the answer is recorded.
  *
  * Nothing is registered unless `CLAW_GITHUB_REVIEW_ENABLED` is on.
  */
@@ -24,6 +27,7 @@ import pino from "pino";
 import { z } from "zod";
 import { identityClient } from "../auth/identity.js";
 import { IDENTITY_TOKEN_METHOD } from "../auth/identity-token.js";
+import type { UserInfo } from "../auth/models.js";
 import { getUser } from "../auth/middleware.js";
 import { getAuthMethod } from "../auth/request-credential.js";
 import { CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
@@ -31,7 +35,7 @@ import { db } from "../infra/db.js";
 import { parseActingAs } from "./acting-as.js";
 import { GithubReview, type ReviewActor, type ToolOutcome } from "./service.js";
 import { readGithubReviewSettings, type GithubReviewSettings } from "./settings.js";
-import { listConfirmations, type ConfirmationStatus, type Queryable } from "./store.js";
+import { listConfirmations, type ConfirmationStatus, type DecidedVia, type Queryable } from "./store.js";
 import { verifySessionToolToken } from "./token.js";
 
 const logger = pino({ name: "github-review-mcp" });
@@ -46,6 +50,14 @@ export interface GithubReviewRouteOptions {
 const PR_HELP = "The pull request: a https://github.com/<owner>/<repo>/pull/<number> URL or owner/repo#number";
 const FLAGS = z.array(z.enum(["security_finding", "review_skipped"])).max(5).optional()
   .describe("Raise these when the review found a security issue or skipped a step: they can only make a merge need confirmation");
+const JUDGEMENT = z.object({
+  level: z.enum(["low", "high"]),
+  reason: z.string().max(1000).describe("One short sentence the acting user reads on the confirmation: what the change does that needs a person, in plain words"),
+}).optional().describe(
+  "Your own reading of what the change DOES, beyond the rules: high when it changes the architecture (a package, a service, the layering, "
+  + "who depends on whom), an interface others rely on (a public signature, an HTTP route, a schema, a CLI flag, a configuration or environment "
+  + "setting, a database schema, a wire or event format), or code that decides who may do what. A `high` makes the merge wait for the acting user "
+  + "and its reason is shown to them; a `low` changes nothing: you can raise the verdict, never lower it");
 
 function toResult(outcome: ToolOutcome): { content: Array<{ type: "text"; text: string }>; isError?: boolean } {
   return { content: [{ type: "text" as const, text: outcome.text }], ...(outcome.isError ? { isError: true } : {}) };
@@ -67,8 +79,9 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor)
   );
   mcp.tool(
     "gh_pr_risk",
-    "The deterministic risk verdict for a pull request (high means a merge needs the acting user's own confirmation).",
-    { pr: z.string().describe(PR_HELP), risk_flags: FLAGS },
+    "The risk verdict for a pull request, from rules that read what the change does (architecture, interfaces, security-sensitive code, CI and release, "
+    + "dependencies, size) with the floor under them (high means a merge needs the acting user's own confirmation). Pass your own `risk_judgement` to add to it.",
+    { pr: z.string().describe(PR_HELP), risk_flags: FLAGS, risk_judgement: JUDGEMENT },
     async (a) => toResult(await service.assessPr(actor, a)),
   );
   mcp.tool(
@@ -82,6 +95,7 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor)
       event: z.enum(["COMMENT", "REQUEST_CHANGES", "APPROVE"]),
       body: z.string().describe("The review summary, a few sentences"),
       risk_flags: FLAGS,
+      risk_judgement: JUDGEMENT,
       comments: z.array(z.object({
         path: z.string(), line: z.number().int(), side: z.enum(["RIGHT", "LEFT"]).optional(), body: z.string(),
       })).max(30).optional().describe("Inline comments; each must be on a line the diff shows"),
@@ -97,6 +111,7 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor)
       head_sha: z.string().describe("The head_sha from gh_pr_get"),
       method: z.enum(["squash", "merge", "rebase"]).optional().describe("Default: the repository's first allowed method, squash first"),
       risk_flags: FLAGS,
+      risk_judgement: JUDGEMENT,
     },
     async (a) => toResult(await service.mergePr(actor, a)),
   );
@@ -120,6 +135,34 @@ function refuse(reply: FastifyReply, status: number, error: string): FastifyRepl
  * request was authenticated, which a process in the sandbox cannot change.
  */
 export const INTERACTIVE_CREDENTIALS: ReadonlySet<string> = new Set(["cookie", IDENTITY_TOKEN_METHOD]);
+
+export type DecisionCaller =
+  | { ok: true; via: DecidedVia | null }
+  | { ok: false; error: "interactive_sign_in_required" | "service_client_not_allowed" };
+
+/**
+ * Who is answering a held merge: a person, a service acting for the person, or neither.
+ *
+ *  - A credential that is not interactive (an `ak-` key, a BYOK key, a connector token, no recorded method) is refused, as it
+ *    always was: `interactive_sign_in_required`.
+ *  - A browser session, and an identity-provider access token with no actor in it (the grant a person's own sign-in holds), is
+ *    the person.
+ *  - An identity-provider access token that names an actor (`act`, RFC 8693: what a service gets when it exchanges its own
+ *    client credentials for a token that acts as a user it holds a binding for) is a service answering for that user. It is
+ *    taken only from a client the operator named in `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS`, compared exactly as signed;
+ *    any other service, and every service while the list is empty, is refused: `service_client_not_allowed`. The subject is
+ *    still the token's `sub`, which the service cannot choose: the confirmation checks it is the acting user's.
+ *
+ * Nothing about this lets a service decide for someone it holds no token for, and nothing lets a key a sandbox holds decide.
+ */
+export function classifyDecisionCaller(method: string | null, user: Pick<UserInfo, "delegation">, allowedClients: readonly string[]): DecisionCaller {
+  if (method === null || !INTERACTIVE_CREDENTIALS.has(method)) return { ok: false, error: "interactive_sign_in_required" };
+  const actorSub = method === IDENTITY_TOKEN_METHOD ? user.delegation?.actorSub : undefined;
+  if (!actorSub) return { ok: true, via: null };
+  const clientId = user.delegation?.clientId ?? "";
+  if (!clientId || !allowedClients.includes(clientId)) return { ok: false, error: "service_client_not_allowed" };
+  return { ok: true, via: { clientId, actorSub } };
+}
 
 const CONFIRMATION_STATUSES = new Set<string>(["pending", "merging", "merged", "denied", "stale", "expired", "refused"]);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -186,6 +229,7 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
     })).map((c) => ({
       id: c.id, repo: c.repo, pr: c.pr, title: c.title, author: c.author, head_sha: c.headSha, reasons: c.reasons, checks: c.checks,
       actor_user_id: c.actorUserId, requester_user_id: c.requesterUserId, session_id: c.sessionId, expires_at: c.expiresAt, status: c.status,
+      decided_by: c.decidedBy, decided_via: c.decidedVia,
     }));
     return { ok: true, items, data: { items } };
   });
@@ -194,14 +238,15 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
     const user = getUser(req);
     if (!user) return refuse(reply, 401, "authentication required");
     const method = getAuthMethod(req);
-    if (method === null || !INTERACTIVE_CREDENTIALS.has(method)) {
-      logger.warn({ userId: user.userId, method: method ?? "none" }, "github_review.decision_refused_credential");
-      return refuse(reply, 403, "interactive_sign_in_required");
+    const caller = classifyDecisionCaller(method, user, settings().decisionClientIds);
+    if (!caller.ok) {
+      logger.warn({ userId: user.userId, method: method ?? "none", clientId: user.delegation?.clientId?.slice(0, 128) }, `github_review.decision_refused_${caller.error}`);
+      return refuse(reply, 403, caller.error);
     }
     const decision = ((req.body ?? {}) as { decision?: unknown }).decision;
     if (decision !== "allow" && decision !== "deny") return refuse(reply, 400, "decision must be allow or deny");
     if (!UUID_RE.test(req.params.id)) return refuse(reply, 404, "not_found");
-    const answer = await service.decide(user.userId, req.params.id, decision);
+    const answer = await service.decide(user.userId, req.params.id, decision, caller.via);
     return reply.status(answer.http).send(answer.body);
   });
 

@@ -20,7 +20,7 @@ const patchWith = (...added: string[]): string => `@@ -1,1 +1,${added.length + 1
 
 test("an ordinary change is low risk, and the verdict names the rule pack", () => {
   const r = assessRisk(input([file("src/render.ts"), file("test/render.test.ts")]));
-  assert.deepEqual(r, { level: "low", reasons: [], rulePack: RISK_RULE_PACK_VERSION });
+  assert.deepEqual(r, { level: "low", reasons: [], categories: [], ruleLevel: "low", raisedByReviewer: false, rulePack: RISK_RULE_PACK_VERSION });
 });
 
 const HIGH: Array<[string, RiskInput, RegExp]> = [
@@ -50,6 +50,7 @@ const HIGH: Array<[string, RiskInput, RegExp]> = [
   ["a GitHub token", input([file("src/k.ts", patchWith("const t = 'ghp_" + "a".repeat(36) + "'"))]), /GitHub token/],
   ["an AWS key", input([file("src/k.ts", patchWith("AKIAABCDEFGHIJKLMNOP"))]), /AWS/],
   ["a Kubernetes Secret", input([file("src/s.yaml", patchWith("kind: Secret"))]), /Kubernetes Secret/],
+  ["a token pasted into documentation", input([file("docs/setup.md", patchWith("export GH=ghp_" + "a".repeat(36)))]), /GitHub token/],
   ["a Dockerfile", input([file("Dockerfile")]), /release or deployment/],
   ["a chart", input([file("charts/app/values.yaml")]), /release or deployment/],
   ["terraform", input([file("infra/main.tf")]), /release or deployment/],
@@ -107,6 +108,10 @@ const LOW: Array<[string, RiskInput]> = [
   ["source and tests", input([file("src/render.ts"), file("test/render.test.ts")])],
   ["documentation", input([file("docs/guide.md"), file("README.md")])],
   ["a manifest edit that adds no dependency", input([file("package.json", patchWith('"description": "A tool"'))])],
+  ["documentation that names a verification-skipping flag", input([file("docs/dev.md", patchWith("Run with --insecure only on your laptop."))])],
+  ["a test that switches TLS verification off on purpose", input([file("test/tls.test.ts", patchWith("const agent = { rejectUnauthorized: false };"))])],
+  ["a sentence about authentication in documentation", input([file("docs/auth/login.md")])],
+  ["a test of authentication code", input([file("test/auth/login.test.ts")])],
   ["a small deletion", input([file("src/a.ts", undefined, { additions: 1, deletions: 40 })], { additions: 1, deletions: 40 })],
   ["a file named like a secret word inside source code", input([file("src/author.ts")])],
   ["a word that only contains 'session' as a substring", input([file("src/obsessional.ts")])],
