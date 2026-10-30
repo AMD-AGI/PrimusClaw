@@ -98,8 +98,8 @@ const RELEASE_PATHS: RegExp[] = [
   /(^|\/)(install|setup|release|publish|deploy)[^/]*\.(sh|ps1)$/i,
   /(^|\/)Makefile$/i,
 ];
-const MANIFESTS = /(^|\/)(package\.json|go\.mod|requirements[^/]*\.txt|pyproject\.toml|Cargo\.toml|Gemfile|pom\.xml|build\.gradle(\.kts)?|setup\.py|setup\.cfg)$/i;
-const LOCKS = /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|go\.sum|poetry\.lock|uv\.lock|Cargo\.lock|Gemfile\.lock)$/i;
+const MANIFESTS = /(^|\/)(package\.json|go\.mod|requirements[^/]*\.txt|pyproject\.toml|Cargo\.toml|Gemfile|pom\.xml|build\.gradle(\.kts)?|setup\.py|setup\.cfg|composer\.json|Pipfile|Package\.swift|mix\.exs|pubspec\.ya?ml|Podfile)$/i;
+const LOCKS = /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lock|deno\.lock|go\.sum|poetry\.lock|pdm\.lock|uv\.lock|Pipfile\.lock|Cargo\.lock|Gemfile\.lock|composer\.lock|packages\.lock\.json|gradle\.lockfile|Podfile\.lock|Package\.resolved|mix\.lock|pubspec\.lock|flake\.lock)$/i;
 const TEST_DIR = /(^|\/)(tests?|__tests__|spec|specs)\//i;
 
 const INSECURE_LINES: Array<[RegExp, string]> = [

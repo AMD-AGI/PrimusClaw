@@ -57,6 +57,8 @@ const HIGH: Array<[string, RiskInput, RegExp]> = [
   ["package scripts", input([file("package.json", patchWith('"postinstall": "node x.js"'))]), /package metadata/],
   ["a new dependency", input([file("package.json", patchWith('"left-pad": "^1.3.0"'))]), /dependency added/],
   ["a requirements line", input([file("requirements.txt", patchWith("requests>=2.31"))]), /dependency added/],
+  ["a new PHP dependency", input([file("composer.json", patchWith('"monolog/monolog": "^3.0"'))]), /dependency added/],
+  ["a new Pipfile dependency", input([file("Pipfile", patchWith('requests = ">=2.31"'))]), /dependency added/],
   ["a dependency from a git url", input([file("package.json", patchWith('"x": "git+https://example.invalid/x.git"'))]), /git or URL source/],
   ["a lock file alone", input([file("package-lock.json")]), /lock file/],
   // A manifest edited anywhere in the change must not switch the lock-file rule off: the lock decides what is downloaded.
@@ -183,7 +185,11 @@ test("a file that came without its diff is held whatever its status and counts s
 });
 
 test("a lock file is held, in every ecosystem's spelling, whatever else the change contains", () => {
-  for (const name of ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "go.sum", "poetry.lock", "uv.lock", "Cargo.lock", "Gemfile.lock", "tools/cli/package-lock.json"]) {
+  for (const name of [
+    "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "deno.lock", "go.sum", "poetry.lock", "pdm.lock", "uv.lock",
+    "Pipfile.lock", "Cargo.lock", "Gemfile.lock", "composer.lock", "packages.lock.json", "gradle.lockfile", "Podfile.lock", "Package.resolved",
+    "mix.lock", "pubspec.lock", "flake.lock", "tools/cli/package-lock.json", "app/composer.lock",
+  ]) {
     const alone = assessRisk(input([file(name)]));
     assert.equal(alone.level, "high", name);
     assert.match(alone.reasons.join("\n"), /lock file changed/, name);
