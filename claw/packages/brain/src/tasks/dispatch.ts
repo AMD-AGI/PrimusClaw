@@ -130,6 +130,21 @@ export function isAppFinishOnly(request: Pick<ExecuteRequest, "mode" | "app_fini
   return request.mode === "app" && request.app_finish_only === true;
 }
 
+/**
+ * Whether a JetStream delivery is an app run's finish-only dispatch, read from the wire.
+ *
+ * What `runDelivery` asks before it decides to wait for an execution slot: a finish
+ * provisions nothing, and parked behind long runs it would hold no lease, which the API
+ * cannot tell from a dispatch that never arrived. A payload that does not parse is not one.
+ */
+export function isFinishOnlyDelivery(msg: Pick<JsMsg, "data">): boolean {
+  try {
+    return isAppFinishOnly(JSON.parse(sc.decode(msg.data)) as Parameters<typeof isAppFinishOnly>[0]);
+  } catch {
+    return false;
+  }
+}
+
 const inflightHandleTasks = new Set<Promise<void>>();
 
 /** In-flight handlers, for the graceful drain in main() to await. */
