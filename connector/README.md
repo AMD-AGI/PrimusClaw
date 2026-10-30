@@ -151,12 +151,22 @@ before it starts the agent again after a pause and before every prompt. A prompt
 (the session stays, and the prompt can be sent again once the terminal is closed), and the connector's agent for the
 conversation is discarded: what the terminal wrote is not in its memory, so the next prompt starts a fresh one that reads
 the transcript. The same happens when the transcript is no longer the size the connector left it, which is how a terminal
-that came and went between two prompts is noticed. It asks Claude Code itself
-(`claude agents --json`, which lists the live processes and ignores the files a killed one leaves behind). If that command
-is missing or fails, it reads the registry Claude Code keeps in `$CLAUDE_CONFIG_DIR/sessions/` and checks every row against
-the process it names; a row from another host or container that shares the directory cannot be checked and counts as open.
-If neither can be read, the answer is "cannot tell" and the takeover is refused. A transcript written within the last
-10 seconds is refused too (a terminal that has only just exited may still be writing). The reasons Claw is told are
+that came and went between two prompts is noticed.
+
+While the connector's own agent is working on the conversation (starting, or running a turn) the size cannot say whether
+someone else wrote, because the agent's own writes grow it too. So during that time the registry is read every second and
+once more, in full, when the work ends. A terminal that held the conversation open for about a second or more during a turn
+is noticed even if it has exited by the next prompt: that prompt goes to a fresh agent, after the full check above. One seen
+while the agent is starting refuses the takeover (`session_live`) and stops the agent. A terminal that opens and closes the
+conversation between two reads, which is shorter than anything that can take a turn, is not seen.
+
+Who holds the conversation open is asked of Claude Code itself
+(`claude agents --json`, which lists the live processes of this machine and ignores the files a killed one leaves behind)
+and of the registry Claude Code keeps in `$CLAUDE_CONFIG_DIR/sessions/`, whose rows are each checked against the process they
+name. The command does not report a row from another host or container that shares the directory (it asks whether the pid is
+alive here), and such a row cannot be checked: it counts as open whatever the command says. If the command is missing or
+fails, the registry alone is the answer; if neither can be read, the answer is "cannot tell" and the takeover is refused.
+A transcript written within the last 10 seconds is refused too (a terminal that has only just exited may still be writing). The reasons Claw is told are
 `session_live`, `recently_written` and `twin_check_failed`; the agent that this connector itself started for the conversation
 is not mistaken for a twin.
 

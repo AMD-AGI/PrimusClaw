@@ -11,9 +11,12 @@
  * This file is that guard, and it fails closed: an answer that cannot be had is a refusal, never a yes.
  *
  * Who holds a session open is read from Claude Code's own `claude agents --json` (it lists the live processes with
- * their session ids and ignores the stale files a killed process leaves). If that command is not there or does
- * not answer, the registry it reads, `$CLAUDE_CONFIG_DIR/sessions/<pid>.json`, is read directly and each entry is
- * checked against the process it names (same start time), so a file left behind by a crash is not a twin.
+ * their session ids and ignores the stale files a killed process leaves) and from the registry it reads,
+ * `$CLAUDE_CONFIG_DIR/sessions/<pid>.json`, directly. Each local registry row is checked against the process it
+ * names (same start time), so a file left behind by a crash is not a twin. A row from another host or container
+ * that shares the directory cannot be checked, and the command does not report it either (it asks whether the pid
+ * is alive in this pid namespace): such a row counts as open whatever the command says. If the command is not
+ * there or does not answer, the registry alone is the answer.
  */
 import { execFile, execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -217,7 +220,7 @@ export class AttachSupport {
     } catch (e) {
       return { ok: false, reason: "twin_check_failed", detail: errMessage(e) };
     }
-    const twin = live.find((e) => e.sessionId.toLowerCase() === want && !(o.ownPgid != null && processGroup(e.pid) === o.ownPgid));
+    const twin = live.find((e) => isTwin(e, want, o.ownPgid));
     if (twin) {
       return { ok: false, reason: "session_live", detail: twin.foreign ? `registered by a process this machine cannot see (pid ${twin.pid})` : `process ${twin.pid} has it open (${twin.status ?? "running"})` };
     }
@@ -249,15 +252,34 @@ export class AttachSupport {
     }
     let out: LiveEntry[];
     if (viaCli) {
-      // The command's answer is the whole answer; a local registry row it did not list can only add to it.
+      // The command knows the processes of this pid namespace and nothing else, so the registry adds to its answer: a
+      // local row it did not list (a duplicate by pid is dropped), and every foreign row. A foreign row's pid is a
+      // number in a namespace this one does not share; it is neither matched against the command's pids nor dropped
+      // because the command did not list it.
       const seen = new Set(viaCli.map((e) => e.pid));
-      out = [...viaCli, ...registry.filter((e) => !e.foreign && !seen.has(e.pid))];
+      out = [...viaCli, ...registry.filter((e) => e.foreign || !seen.has(e.pid))];
     } else if (!registryError) {
       out = registry;
     } else {
       throw new TwinCheckError(`cannot tell which sessions are open: "${this.agent.attach?.cli ?? "claude"} agents --json" failed (${cliError}) and the session registry could not be read (${registryError})`);
     }
     return out;
+  }
+
+  /**
+   * A look at the registry alone, with nothing started: is another process listed as holding `ref` open? It is cheap
+   * enough to repeat every second while this connector's own agent is writing to the transcript, which is when a
+   * terminal that opens the conversation and closes it again must not go unseen (see `Session.watchTwins`). Null when
+   * the registry cannot be read; the full {@link check} made when the work ends is the one that has to answer.
+   */
+  peek(ref: string, ownPgid: number | null): { twin: LiveEntry | null } | null {
+    if (!SESSION_REF_RE.test(ref)) return null;
+    const want = ref.toLowerCase();
+    try {
+      return { twin: readRegistry(this.configDir, this.localDomain, this.now()).find((e) => isTwin(e, want, ownPgid)) ?? null };
+    } catch {
+      return null;
+    }
   }
 
   /** The size of the conversation's transcript now, or null when there is none to look at. */
@@ -288,6 +310,16 @@ export class AttachSupport {
     } catch { /* no projects directory */ }
     return null;
   }
+}
+
+/**
+ * Whether `e` is another process holding `want` open. This connector's own agent (a process of the group `ownPgid`) is
+ * not. A foreign row is never excluded that way: its pid is a number in a namespace this machine does not share, and
+ * the local process that happens to have the same number says nothing about it.
+ */
+function isTwin(e: LiveEntry, want: string, ownPgid: number | null | undefined): boolean {
+  if (e.sessionId.toLowerCase() !== want) return false;
+  return e.foreign || !(ownPgid != null && processGroup(e.pid) === ownPgid);
 }
 
 /** `p`'s answer, or `late` if it takes longer than `ms`; the timer never keeps the process alive. */

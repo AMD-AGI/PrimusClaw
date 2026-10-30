@@ -35,9 +35,11 @@ export interface SessionTiming {
   permissionTtlMs: number;
   /** How long to wait for an adapter to confirm a mode change by notification when it has no other way to be asked. */
   modeConfirmMs: number;
+  /** An attach session reads the registry this often while its own agent is starting or running a turn, to see a terminal that opens the conversation meanwhile. */
+  twinWatchMs: number;
 }
 
-export const DEFAULT_SESSION_TIMING: SessionTiming = { idleMs: 30 * 60_000, permissionTtlMs: 10 * 60_000, modeConfirmMs: 3_000 };
+export const DEFAULT_SESSION_TIMING: SessionTiming = { idleMs: 30 * 60_000, permissionTtlMs: 10 * 60_000, modeConfirmMs: 3_000, twinWatchMs: 1_000 };
 
 export interface SessionEnv {
   config: ConnectorConfig;
@@ -84,6 +86,12 @@ export class Session {
   private inheritedWarningOk = false;
   /** The transcript's size when this connector last left it (see {@link preflight}). */
   private transcriptMark: number | null = null;
+  /**
+   * Another process was seen holding the conversation open while this connector's own agent was running a turn on
+   * it. That agent's memory then lacks whatever the process wrote, and the transcript's size cannot say so (see
+   * {@link watchTwins}): the agent is discarded before the next prompt. Cleared when an agent is started afresh.
+   */
+  private twinSeen = false;
   private turnRunning = false;
   private queue: Array<{ text: string; cmdId: string | null; started: () => void }> = [];
   private launching: Promise<void> | null = null;
@@ -188,12 +196,59 @@ export class Session {
       throw new SessionRefusal(verdict.reason, verdict.detail);
     }
     this.inheritedWarningOk = true;
+    const watch = this.watchTwins(support, this.acpId);
     try {
       await this.doLaunch(how);
+      // The mark is taken first: whatever is written after it, by a terminal that arrives while the look below is made, changes the size.
       this.markTranscript();
+      // The check above is one moment, and the agent reads the transcript some seconds after it. A process that opened
+      // the conversation since, even one that has already left, wrote what this agent has not read: not a session to keep.
+      if (await watch.finish()) {
+        await this.dropAdapter();
+        const detail = "another process opened the conversation while it was being resumed";
+        this.audit("attach_refused", { reason: "session_live", detail });
+        throw new SessionRefusal("session_live", detail);
+      }
+      this.twinSeen = false;
     } finally {
+      watch.stop();
       this.inheritedWarningOk = false;
     }
+  }
+
+  /**
+   * Watch for a second writer while this connector's own agent is working on the conversation (starting, or running a
+   * turn). The check before a prompt is a look at one moment, and the transcript's size cannot stand in for it during
+   * the work: the agent's own writes and a terminal's are the same kind of bytes, so a terminal that opens the
+   * conversation, takes a turn and exits meanwhile would be gone by the next look and its bytes already counted as
+   * the agent's. So the registry is read every `twinWatchMs` for as long as the work lasts (a process that has held the
+   * conversation open for longer than that is seen), and once more, in full (the command too), when it ends.
+   * `finish()` answers whether another process was seen holding the conversation open at any of those moments, or the
+   * last look could not be made.
+   */
+  private watchTwins(support: AttachSupport, ref: string): { finish(): Promise<boolean>; stop(): void } {
+    let seen = false;
+    const own = () => (this.adapter && !this.adapter.exited ? this.adapter.pid : null);
+    const look = () => {
+      if (seen) return;
+      const r = support.peek(ref, own());
+      if (r?.twin) { seen = true; this.audit("twin_seen", { pid: r.twin.pid, foreign: r.twin.foreign }); }
+    };
+    const timer = setInterval(look, this.env.timing.twinWatchMs);
+    timer.unref?.();
+    const stop = () => clearInterval(timer);
+    return {
+      stop,
+      finish: async () => {
+        stop();
+        look();
+        if (!seen) {
+          const v = await support.check(ref, { ownPgid: own(), transcript: false });
+          if (!v.ok) { seen = true; this.audit("twin_seen", { reason: v.reason, detail: v.detail.slice(0, 300) }); }
+        }
+        return seen;
+      },
+    };
   }
 
   private async doLaunch(how: "new" | "resume"): Promise<void> {
@@ -537,6 +592,8 @@ export class Session {
     }
     const a = this.adapter!;
     this.audit("turn_started", { length: text.length });
+    const support = this.agent.attach && this.acpId ? this.env.attach.get(this.agent.id) : undefined;
+    const watch = support ? this.watchTwins(support, this.acpId!) : null;
     try {
       const reply = a.requestUnbounded("session/prompt", { sessionId: this.acpId, prompt: [{ type: "text", text }] });
       started();
@@ -547,7 +604,13 @@ export class Session {
       this.audit("turn_failed", { error: errMessage(e) });
       this.emit("turn_end", { stopReason: "error", error: errMessage(e).slice(0, 300) });
     } finally {
+      // At once, before the look at who holds the conversation open: the test below it for a terminal that writes
+      // next is the size, and it must start from the turn's end, not from a moment later.
       this.markTranscript();
+      if (watch) {
+        if (this.closed) watch.stop();
+        else if (await watch.finish()) this.twinSeen = true;
+      }
     }
   }
 
@@ -558,14 +621,22 @@ export class Session {
    * Someone may have opened the conversation in a terminal since the last turn. Sending the prompt would make a
    * second writer, and even after that terminal has gone the adapter's memory of the conversation predates what
    * the terminal wrote: continuing from it forks the transcript. So an adapter is dropped when another process
-   * holds the conversation open, and when the transcript is no longer the size this adapter left it (a terminal
-   * that came and went between two prompts); the next start reads the transcript afresh, after the full check.
+   * holds the conversation open, when one was seen holding it open during the last turn (see {@link watchTwins}), and
+   * when the transcript is no longer the size this adapter left it (a terminal that came and went between two
+   * prompts); the next start reads the transcript afresh, after the full check.
    */
   private async preflight(): Promise<{ reason: string; detail: string } | null> {
     const support = this.env.attach.get(this.agent.id);
     const ref = this.acpId;
     if (!support || !ref) return { reason: "twin_check_failed", detail: "no takeover support" };
-    const live = this.adapter && !this.adapter.exited ? this.adapter : null;
+    let live = this.adapter && !this.adapter.exited ? this.adapter : null;
+    if (live && this.twinSeen) {
+      // A terminal opened the conversation while the turn ran and may be gone now: what it wrote is in the transcript
+      // (the mark below took it for the agent's own) and not in this agent's memory.
+      this.audit("adapter_discarded", { why: "another process held the conversation open during the last turn" });
+      await this.dropAdapter();
+      live = null;
+    }
     // Without an adapter of its own the session is about to be started: that is the full check, transcript included.
     const verdict = await support.check(ref, { ownPgid: live?.pid ?? null, transcript: live === null });
     if (!verdict.ok) {

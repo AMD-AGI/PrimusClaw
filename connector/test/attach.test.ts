@@ -62,6 +62,15 @@ ${Object.entries(o.cliEnv ?? {}).map(([k, v]) => `${k} = ${JSON.stringify(v)}`).
   });
 }
 
+/** A terminal that has the conversation open: a real process and the registry row Claude Code writes for it. `leave()` is `/exit`. */
+function openTerminal(dir: string, ref = REF): { pid: number; leave(): Promise<void> } {
+  const proc = sleeper();
+  fs.mkdirSync(path.join(dir, "sessions"), { recursive: true });
+  const row = path.join(dir, "sessions", `${proc.pid}.json`);
+  fs.writeFileSync(row, JSON.stringify({ pid: proc.pid, sessionId: ref, status: "busy", kind: "interactive", procStart: processStart(proc.pid!), pidDomain: localPidDomain() }));
+  return { pid: proc.pid!, leave: async () => { await stop(proc); fs.rmSync(row, { force: true }); } };
+}
+
 /** A shell wrapper that runs the stand-in `claude` with the given behaviour, so `attach_cli` can name it. */
 function fakeCli(mode: string, live: unknown[]): { cli: string; env: Record<string, string> } {
   const dir = tmpdir("cc-fakecli-");
@@ -172,6 +181,29 @@ describe("the twin check", () => {
       assert.equal(v.ok ? "ok" : v.reason, c.expect, v.ok ? "" : v.detail);
     });
   }
+
+  test("a row from another host or container counts as open when the command answers too: the command cannot see it", async () => {
+    if (localPidDomain() === null) return; // only Linux names a pid namespace
+    const own = sleeper({ detached: true });
+    const cases: Array<{ name: string; live: unknown[]; pid: number; ownPgid: number | null }> = [
+      { name: "the command lists nothing", live: [], pid: 999999, ownPgid: null },
+      { name: "its pid is a number the command lists for another session", live: [{ pid: 4242, sessionId: REF2 }], pid: 4242, ownPgid: null },
+      { name: "its pid is that of this connector's own agent: a number from another namespace is not our agent", live: [{ pid: own.pid, sessionId: REF }], pid: own.pid!, ownPgid: own.pid! },
+    ];
+    for (const c of cases) {
+      const dir = configDir();
+      registryRow(dir, c.pid, { pidDomain: "linux:other-host:pid:[7]" });
+      const fake = fakeCli("ok", c.live);
+      const v = await support(dir, { cli: fake.cli, cliEnv: fake.env }).check(REF, { ownPgid: c.ownPgid, transcript: false });
+      assert.equal(v.ok ? "ok" : v.reason, "session_live", c.name);
+      assert.match(v.ok ? "" : v.detail, /cannot see/, c.name);
+    }
+    // The same row written by a process of this machine, and that process is our own agent: not a twin.
+    const dir = configDir();
+    registryRow(dir, own.pid!, { procStart: processStart(own.pid!), pidDomain: localPidDomain() });
+    const fake = fakeCli("ok", [{ pid: own.pid, sessionId: REF }]);
+    assert.equal((await support(dir, { cli: fake.cli, cliEnv: fake.env }).check(REF, { ownPgid: own.pid!, transcript: false })).ok, true);
+  });
 
   test("asked without its own pgid, the same listing is a twin: the exclusion is by process group, not by session id", async () => {
     const own = sleeper({ detached: true });
@@ -476,6 +508,91 @@ describe("attach end to end", () => {
     assert.equal(resumes(), 2);
     assert.deepEqual(h.adapterLog().filter((l) => l.prompt).map((l) => l.prompt), ["say one", "say two", "say four"]);
     assert.equal(h.connector.registry.list().length, 1);
+  });
+
+  test("a terminal that opens the conversation during a turn, takes a turn of its own and exits is noticed: the next prompt does not go to the agent that was running", async () => {
+    const h = await attachHarness({ timing: { twinWatchMs: 20 } });
+    const sid = await h.attach(REF);
+    const file = path.join(h.attachDir, "projects", fs.realpathSync(h.work).replace(/[^A-Za-z0-9]/g, "-"), `${REF}.jsonl`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '{"type":"user"}\n');
+    const old = (Date.now() - 3_600_000) / 1000;
+    fs.utimesSync(file, old, old);
+    h.prompt(sid, "say one");
+    await h.turnEnd(sid, 1);
+    const resumes = () => adapterMethods(h).filter((m) => m === "session/resume").length;
+    // A long turn. While it runs, a terminal resumes the conversation, takes its turn (the transcript grows) and exits.
+    const release = path.join(h.attachDir, "release");
+    h.prompt(sid, `wait ${release}`);
+    await h.claw.until("the turn to be running", () => h.adapterLog().some((l) => String(l.prompt).startsWith("wait ")));
+    const terminal = openTerminal(h.attachDir);
+    await h.claw.until("the connector to see the terminal", () => h.audit().some((a) => a.kind === "twin_seen" && a.pid === terminal.pid));
+    fs.appendFileSync(file, '{"type":"user","from":"the terminal"}\n');
+    await terminal.leave();
+    fs.utimesSync(file, old, old); // it left a while ago: the transcript is no longer being written
+    fs.writeFileSync(release, "");
+    await h.turnEnd(sid, 2);
+    // Nothing holds the conversation open now, and the transcript's size is what it was when the turn ended. The agent
+    // that ran the turn has not read what the terminal wrote, so it must not be the one to take the next prompt.
+    h.prompt(sid, "say three");
+    await h.turnEnd(sid, 3);
+    assert.equal(h.claw.eventsOf(sid, "command_rejected").length, 0);
+    assert.equal(resumes(), 2, "the next prompt went to an agent that was started afresh, from the transcript");
+    assert.equal(adapterMethods(h).filter((m) => m === "session/set_mode").length, 2, "and its mode was locked again");
+    assert.ok(h.audit().some((a) => a.kind === "adapter_discarded"));
+    assert.equal(h.connector.registry.list().length, 1, "only one agent is left running");
+    // That fresh agent has seen it all: the next prompt goes on to it without another restart.
+    h.prompt(sid, "say four");
+    await h.turnEnd(sid, 4);
+    assert.equal(resumes(), 2);
+  });
+
+  test("a terminal still open when a turn ends is noticed by the check made then, even if it is gone by the next prompt", async () => {
+    const h = await attachHarness();
+    const sid = await h.attach(REF);
+    const resumes = () => adapterMethods(h).filter((m) => m === "session/resume").length;
+    const release = path.join(h.attachDir, "release");
+    h.prompt(sid, `wait ${release}`);
+    await h.claw.until("the turn to be running", () => h.adapterLog().some((l) => String(l.prompt).startsWith("wait ")));
+    // Only the command shows it (the registry has no row), and only at the end of the turn.
+    h.setLive([{ pid: process.pid, sessionId: REF, status: "busy" }]);
+    fs.writeFileSync(release, "");
+    await h.turnEnd(sid, 1);
+    await h.claw.until("the check at the end of the turn", () => h.audit().some((a) => a.kind === "twin_seen" && a.reason === "session_live"));
+    h.setLive([]);
+    h.prompt(sid, "say two");
+    await h.turnEnd(sid, 2);
+    assert.equal(resumes(), 2, "the agent that ran that turn is not reused");
+    assert.equal(h.claw.eventsOf(sid, "command_rejected").length, 0);
+  });
+
+  test("a terminal that opens the conversation while the agent is being started is not missed: still there, or already gone", async () => {
+    const variants: Array<{ name: string; during: (h: Harness) => Promise<void>; refused: boolean }> = [
+      { name: "nobody", during: async () => {}, refused: false },
+      { name: "the command lists it when the start ends", during: async (h) => h.setLive([{ pid: process.pid, sessionId: REF, status: "idle" }]), refused: true },
+      {
+        name: "the registry showed it for a moment, and it is gone when the start ends",
+        during: async (h) => {
+          const terminal = openTerminal(h.attachDir);
+          await h.claw.until("the connector to see the terminal", () => h.audit().some((a) => a.kind === "twin_seen" && a.pid === terminal.pid));
+          assert.ok(!adapterMethods(h).includes("session/set_mode"), "it was seen while the agent was still starting, not when the start was over");
+          await terminal.leave();
+        },
+        refused: true,
+      },
+    ];
+    for (const v of variants) {
+      // The agent takes a while to read the transcript: the terminal appears after the check that let the takeover begin.
+      const h = await attachHarness({ env: { FAKE_RESUME_DELAY_MS: "800" }, timing: { twinWatchMs: 20 } });
+      await h.online();
+      const sid = h.claw.newSession("fake", h.work, undefined, { resume_ref: REF });
+      await h.claw.until("the agent to be resuming", () => adapterMethods(h).includes("session/resume"));
+      await v.during(h);
+      await h.claw.until("an answer", () => h.claw.eventsOf(sid).some((e) => e.type === "session_started" || e.type === "session_closed"), 15_000);
+      assert.equal(closedReason(h, sid), v.refused ? "session_live" : undefined, v.name);
+      assert.equal(h.claw.eventsOf(sid, "session_started").length, v.refused ? 0 : 1, v.name);
+      assert.equal(h.connector.registry.list().length, v.refused ? 0 : 1, `${v.name}: the agent that was started is not left running`);
+    }
   });
 
   test("an agent that is not an attach agent never turns a resume request into a new conversation", async () => {

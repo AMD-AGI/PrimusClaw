@@ -81,6 +81,12 @@ async function prompt(id, params) {
     update(params.sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: text.slice(4) } });
     return done("end_turn");
   }
+  // A turn that lasts until the test lets it end: `wait <file>` returns once <file> exists.
+  if ((n = /^wait (\S+)$/.exec(text))) {
+    for (let i = 0; i < 1200 && !s.cancelled && !fs.existsSync(n[1]); i++) await new Promise((r) => setTimeout(r, 25));
+    update(params.sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "waited" } });
+    return done(s.cancelled ? "cancelled" : "end_turn");
+  }
   if (text === "hang") {
     for (let i = 0; i < 600 && !s.cancelled; i++) await new Promise((r) => setTimeout(r, 25));
     return done(s.cancelled ? "cancelled" : "end_turn");
@@ -139,6 +145,8 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
       if (env.FAKE_RESUME_RESETS) s.mode = env.FAKE_RESUME_RESETS;
       // ... and, in a mode that never asks, it says so while it sets the session up (measured on claude-agent-acp 0.99.0).
       if (env.FAKE_RESUME_WARN === "1" && method === "session/resume") process.stderr.write("Warning: canUseTool will not be invoked: permissionMode 'bypassPermissions' auto-approves every tool call\n");
+      // A resume that takes its time (reading a long transcript), so that a test can act while it runs.
+      if (env.FAKE_RESUME_DELAY_MS) await new Promise((r) => setTimeout(r, Number(env.FAKE_RESUME_DELAY_MS)));
       if (method === "session/load") update(params.sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "old history" } });
       return reply(id, { modes: modesOf(s), configOptions: configOptions(s) });
     }
