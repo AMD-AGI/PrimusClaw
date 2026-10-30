@@ -10,9 +10,11 @@
  * history fork and the next resume follows only one of them, so a turn typed on the phone silently disappears.
  * This file is that guard, and it fails closed: an answer that cannot be had is a refusal, never a yes.
  *
- * Who holds a session open is read from Claude Code's own `claude agents --json` (it lists the live processes with
- * their session ids and ignores the stale files a killed process leaves) and from the registry it reads,
- * `$CLAUDE_CONFIG_DIR/sessions/<pid>.json`, directly. Each local registry row is checked against the process it
+ * Who holds a session open is read, first, from the rows the installed `SessionStart`/`SessionEnd` hooks keep for
+ * terminal sessions (terminals.ts; a session that was opened before the hooks were installed is not in them), then from
+ * Claude Code's own `claude agents --json` (it lists the live processes with their session ids and ignores the stale
+ * files a killed process leaves) and from the registry it keeps, `$CLAUDE_CONFIG_DIR/sessions/<pid>.json`, directly.
+ * The hook rows can only add a refusal: what they do not know is still decided by the rest. Each local registry row is checked against the process it
  * names (same start time), so a file left behind by a crash is not a twin. A row from another host or container
  * that shares the directory cannot be checked, and the command does not report it either (it asks whether the pid
  * is alive in this pid namespace): such a row counts as open whatever the command says. If the command is not
@@ -26,9 +28,11 @@ import { AdapterProcess, type AdapterHooks } from "./adapter.js";
 import type { Audit } from "./audit.js";
 import { isAlive, processStart, type ChildRegistry } from "./children.js";
 import type { AgentConfig } from "./config.js";
+import { hooksStatus } from "./hooks.js";
 import { REMOTE_AGENT_LIMITS } from "./protocol.js";
 import { redactText } from "./redact.js";
 import { checkCwd } from "./roots.js";
+import { SESSION_ID_RE, localPidDomain, readTerminals } from "./terminals.js";
 import { errMessage, isObject, type Logger } from "./util.js";
 
 /** idle: nothing holds it open. live: a process (a terminal) does. attached: this connector holds it. unknown: the check could not be made. */
@@ -59,6 +63,8 @@ export interface LiveEntry {
   status: string | null;
   /** Registered by a process this machine cannot see (another host or container sharing the directory): not provably gone. */
   foreign: boolean;
+  /** Read from the rows the terminal hooks keep, not from Claude Code's own registry. */
+  via?: "hook";
 }
 
 export type Verdict =
@@ -71,7 +77,8 @@ export type Resolved = { ok: true; item: Listed } | { ok: false; reason: "unknow
 export class TwinCheckError extends Error {}
 
 /** Claude Code names a session by a UUID; anything else is never used to build a path. */
-export const SESSION_REF_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export const SESSION_REF_RE = SESSION_ID_RE;
+export { localPidDomain };
 
 /** Most entries of the list that goes into the heartbeat. */
 export const MAX_REPORTED = 12;
@@ -125,6 +132,34 @@ export class AttachSupport {
 
   private now(): number { return this.d.now ? this.d.now() : Date.now(); }
 
+  private hookNote = false;
+  private lastHookError = "";
+
+  /** Once: say whether the terminal hooks are in this agent's Claude config, so a missing one is not a mystery. */
+  private noteHooks(): void {
+    if (this.hookNote) return;
+    this.hookNote = true;
+    const st = hooksStatus(this.configDir);
+    if (!st.installed) this.d.log.info("the terminal hooks are not installed in this Claude config directory; sessions open in a terminal are found by listing processes only (claw-connector hooks install)", { agent: this.agent.id, dir: this.configDir });
+    else if (!st.healthy) this.d.log.warn("an installed terminal hook points at a file that is gone", { agent: this.agent.id, problem: st.problem });
+  }
+
+  /**
+   * The sessions the terminal hooks say are open. This source only ever adds: when it cannot be read it answers
+   * nothing (and says so once), because the sources behind it decide everything it does not know.
+   */
+  private terminalRows(): LiveEntry[] {
+    try {
+      this.lastHookError = "";
+      return readTerminals(this.configDir, this.localDomain, this.now());
+    } catch (e) {
+      const msg = errMessage(e);
+      if (msg !== this.lastHookError) this.d.log.warn("the terminal hook rows could not be read; the other checks decide", { agent: this.agent.id, error: msg });
+      this.lastHookError = msg;
+      return [];
+    }
+  }
+
   // --- what exists -------------------------------------------------------------------
 
   /** Ask the adapter for the sessions on this machine and keep those whose directory is inside the roots. One adapter process, started and stopped here. */
@@ -135,6 +170,7 @@ export class AttachSupport {
 
   private async doRefresh(): Promise<void> {
     let adapter: AdapterProcess | null = null;
+    this.noteHooks();
     try {
       adapter = await AdapterProcess.start({
         cfg: this.agent, registry: this.d.registry, sessionId: `list-${this.agent.id}`, cwd: this.agent.roots[0] ?? os.homedir(),
@@ -214,6 +250,9 @@ export class AttachSupport {
   async check(ref: string, o: { ownPgid?: number | null; transcript: boolean }): Promise<Verdict> {
     if (!SESSION_REF_RE.test(ref)) return { ok: false, reason: "twin_check_failed", detail: "not a session id" };
     const want = ref.toLowerCase();
+    // The terminals' own rows first: they answer without starting anything, and a yes from them is final.
+    const inTerminal = this.terminalRows().find((e) => isTwin(e, want, o.ownPgid));
+    if (inTerminal) return { ok: false, reason: "session_live", detail: describeTwin(inTerminal) };
     let live: LiveEntry[];
     try {
       live = await this.liveEntries();
@@ -222,7 +261,7 @@ export class AttachSupport {
     }
     const twin = live.find((e) => isTwin(e, want, o.ownPgid));
     if (twin) {
-      return { ok: false, reason: "session_live", detail: twin.foreign ? `registered by a process this machine cannot see (pid ${twin.pid})` : `process ${twin.pid} has it open (${twin.status ?? "running"})` };
+      return { ok: false, reason: "session_live", detail: describeTwin(twin) };
     }
     if (o.transcript) {
       const file = this.transcriptFile(want);
@@ -263,7 +302,8 @@ export class AttachSupport {
     } else {
       throw new TwinCheckError(`cannot tell which sessions are open: "${this.agent.attach?.cli ?? "claude"} agents --json" failed (${cliError}) and the session registry could not be read (${registryError})`);
     }
-    return out;
+    // The hook rows add to whatever the other two say (the same process may be in both, which changes nothing).
+    return [...this.terminalRows(), ...out];
   }
 
   /**
@@ -275,10 +315,11 @@ export class AttachSupport {
   peek(ref: string, ownPgid: number | null): { twin: LiveEntry | null } | null {
     if (!SESSION_REF_RE.test(ref)) return null;
     const want = ref.toLowerCase();
+    const hook = this.terminalRows().find((e) => isTwin(e, want, ownPgid));
     try {
-      return { twin: readRegistry(this.configDir, this.localDomain, this.now()).find((e) => isTwin(e, want, ownPgid)) ?? null };
+      return { twin: hook ?? readRegistry(this.configDir, this.localDomain, this.now()).find((e) => isTwin(e, want, ownPgid)) ?? null };
     } catch {
-      return null;
+      return hook ? { twin: hook } : null;
     }
   }
 
@@ -310,6 +351,11 @@ export class AttachSupport {
     } catch { /* no projects directory */ }
     return null;
   }
+}
+
+function describeTwin(e: LiveEntry): string {
+  if (e.via === "hook") return e.foreign ? `open in a terminal, registered by a process this machine cannot see (pid ${e.pid})` : `open in a terminal (pid ${e.pid}, registered by its session hook)`;
+  return e.foreign ? `registered by a process this machine cannot see (pid ${e.pid})` : `process ${e.pid} has it open (${e.status ?? "running"})`;
 }
 
 /**
@@ -390,16 +436,6 @@ export function readRegistry(configDir: string, localDomain: string | null, now 
     out.push({ pid: doc.pid, sessionId: doc.sessionId, status: typeof doc.status === "string" ? doc.status : null, foreign });
   }
   return out;
-}
-
-/** What Claude Code writes as `pidDomain`: the machine, and the pid namespace the pid belongs to. */
-export function localPidDomain(): string | null {
-  if (process.platform !== "linux") return null;
-  try {
-    return `linux:${fs.readFileSync("/etc/machine-id", "utf8").trim()}:${fs.readlinkSync("/proc/self/ns/pid")}`;
-  } catch {
-    return null;
-  }
 }
 
 /** The process group of a process, or null when it cannot be read. */

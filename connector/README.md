@@ -160,7 +160,24 @@ is noticed even if it has exited by the next prompt: that prompt goes to a fresh
 while the agent is starting refuses the takeover (`session_live`) and stops the agent. A terminal that opens and closes the
 conversation between two reads, which is shorter than anything that can take a turn, is not seen.
 
-Who holds the conversation open is asked of Claude Code itself
+The first thing asked is the terminal itself. `claw-connector init` (or `claw-connector hooks install`) adds two Claude Code
+hooks, `SessionStart` and `SessionEnd`, to the user-level `settings.json` of the Claude config directory. Each runs a tiny
+program that keeps one row per terminal session, `<config dir>/claw-connector-terminals/<pid>.json`: the session id and the
+process that holds it, with that process's start time. Claude Code runs the same hooks for sessions started by an ACP adapter
+(this connector's own included) and by `claude -p`; they are told apart by `CLAUDE_CODE_ENTRYPOINT` in the hook's environment
+(`cli` in a terminal, `sdk-cli` otherwise), so only terminal sessions are recorded. `SessionEnd` runs on `/exit`, Ctrl-C and
+Ctrl-D twice, a closed terminal (SIGHUP) and a plain `kill`; it does not run after `kill -9` or a power cut, so a row counts
+only while the process it names is still the same process (same start time), and the next hook sweeps dead rows away. The
+hooks are merged into `settings.json` without touching anything else in it (a file that is not valid JSON is left alone), take
+under two seconds at most (`SessionStart` holds up the first turn, so they have timeouts of 2 s and 1 s), print nothing and
+always exit 0, so they cannot get in the way of a session. `claw-connector hooks uninstall` takes exactly those entries out
+again. The entries name this installation's node and program by absolute path, so install from a durable one (`npm i -g
+@primusclaw/connector`) rather than a throwaway `npx` cache; `hooks status` and `run` say when a path is gone, and installing
+again repairs it. A conversation that was opened before the hooks were installed is not in the rows, and neither is one under a
+different config directory or when Claude Code is configured not to run user hooks: the rows can only add a refusal, and
+everything below stays in force as the fallback (`claw-connector hooks status` says where they stand).
+
+Who holds the conversation open is then asked of Claude Code itself
 (`claude agents --json`, which lists the live processes of this machine and ignores the files a killed one leaves behind)
 and of the registry Claude Code keeps in `$CLAUDE_CONFIG_DIR/sessions/`, whose rows are each checked against the process they
 name. The command does not report a row from another host or container that shares the directory (it asks whether the pid is
@@ -180,7 +197,8 @@ session stops the agent process; it never deletes the conversation.
 
 | Command | |
 |---|---|
-| `init` | Write a sample `agents.toml`. |
+| `init` | Write a sample `agents.toml` and install the Claude Code session hooks (`--no-hooks` skips that). |
+| `hooks install\|uninstall\|status` | The `SessionStart`/`SessionEnd` hooks alone; `--config-dir DIR` names the Claude config directory (default: those of the `claude-attach` agents, else `$CLAUDE_CONFIG_DIR` or `~/.claude`). |
 | `login` | Device sign-in. `--key <api key>` (or `CLAW_CONNECTOR_KEY`) is for development only. After a revocation, run it again: it connects this machine as a new connector. |
 | `run` | Connect and serve. Exit code 3 means the connector was revoked. |
 | `status [--json]` | Running or not, paused, signed in, agents, adapter processes. |

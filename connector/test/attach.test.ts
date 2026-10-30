@@ -18,6 +18,7 @@ import {
 import { ChildRegistry, processStart } from "../src/children.js";
 import { memoryAudit } from "../src/audit.js";
 import { ConfigError, parseConfig } from "../src/config.js";
+import { terminalsDir, runHook } from "../src/terminals.js";
 import { silentLogger } from "../src/util.js";
 import { Harness, tmpdir, FAKE_CLAUDE, type AttachOptions } from "./support/harness.js";
 
@@ -234,6 +235,102 @@ describe("the twin check", () => {
     const v = await support(configDir()).check("../../etc/passwd", { transcript: true });
     assert.equal(v.ok, false);
     assert.ok(!SESSION_REF_RE.test("../../etc/passwd") && SESSION_REF_RE.test(REF));
+  });
+});
+
+/** The row a terminal session's hook keeps (terminals.ts): `procStart` and `pidDomain` default to the real process's. */
+function hookRow(dir: string, pid: number, extra: Record<string, unknown> = {}, name = `${pid}.json`): void {
+  fs.mkdirSync(terminalsDir(dir), { recursive: true });
+  fs.writeFileSync(path.join(terminalsDir(dir), name), JSON.stringify({ v: 1, pid, procStart: processStart(pid), sessionId: REF, cwd: "/w", at: Date.now(), pidDomain: localPidDomain(), ...extra }));
+}
+
+describe("the terminal hooks' rows in the twin check", () => {
+  type Case = {
+    name: string;
+    hook: "live" | "other-session" | "killed" | "recycled" | "foreign" | "own-group" | "broken-young" | "none";
+    cli?: { mode: string; live: unknown[] };
+    claudeRegistry?: "none" | "empty" | "live-twin";
+    ref?: string;
+    expect: "ok" | "session_live" | "twin_check_failed";
+    detail?: RegExp;
+    /** Answered without waiting for the command (which here would run into its timeout). */
+    fast?: boolean;
+  };
+  const cases: Case[] = [
+    { name: "a terminal's row names the session: refused, and the detail says it is in a terminal", hook: "live", cli: { mode: "ok", live: [] }, claudeRegistry: "empty", expect: "session_live", detail: /open in a terminal \(pid \d+/ },
+    { name: "the rows are asked first: a command that hangs is never waited for", hook: "live", cli: { mode: "hang", live: [] }, claudeRegistry: "empty", expect: "session_live", fast: true },
+    { name: "the rows alone answer when nothing else can (no command, no registry would be unanswerable)", hook: "live", claudeRegistry: "none", expect: "session_live", detail: /terminal/ },
+    { name: "the id is compared whatever its case", hook: "live", ref: REF.toUpperCase(), cli: { mode: "ok", live: [] }, claudeRegistry: "empty", expect: "session_live" },
+    { name: "a row for another session is not this one", hook: "other-session", cli: { mode: "ok", live: [] }, claudeRegistry: "empty", expect: "ok" },
+    { name: "a row whose process was killed (kill -9 ran no SessionEnd) is not open", hook: "killed", cli: { mode: "ok", live: [] }, claudeRegistry: "empty", expect: "ok" },
+    { name: "a row whose pid now belongs to another process is not open", hook: "recycled", cli: { mode: "ok", live: [] }, claudeRegistry: "empty", expect: "ok" },
+    { name: "a row from another host or container cannot be checked and counts", hook: "foreign", cli: { mode: "ok", live: [] }, claudeRegistry: "empty", expect: "session_live", detail: /cannot see/ },
+    { name: "this connector's own agent is not a twin, whoever registered it", hook: "own-group", cli: { mode: "ok", live: [] }, claudeRegistry: "empty", expect: "ok" },
+    { name: "no rows at all: Claude Code's own registry still refuses (the fallback)", hook: "none", cli: { mode: "ok", live: [] }, claudeRegistry: "live-twin", expect: "session_live", detail: /process \d+ has it open/ },
+    { name: "no rows and the command lists it: still refused", hook: "none", cli: { mode: "ok", live: [{ pid: 4242, sessionId: REF, status: "idle" }] }, claudeRegistry: "empty", expect: "session_live", detail: /process 4242/ },
+    { name: "rows that cannot be read add nothing: the registry still refuses", hook: "broken-young", cli: { mode: "ok", live: [] }, claudeRegistry: "live-twin", expect: "session_live", detail: /process \d+ has it open/ },
+    { name: "rows that cannot be read never turn a yes into a no: nothing else is open", hook: "broken-young", cli: { mode: "ok", live: [] }, claudeRegistry: "empty", expect: "ok" },
+    { name: "rows that say nothing do not make an unanswerable check answerable", hook: "none", cli: { mode: "fail", live: [] }, claudeRegistry: "none", expect: "twin_check_failed" },
+    { name: "a row for another session does not make an unanswerable check answerable either", hook: "other-session", cli: { mode: "fail", live: [] }, claudeRegistry: "none", expect: "twin_check_failed" },
+  ];
+  for (const c of cases) {
+    test(c.name, async () => {
+      const dir = configDir();
+      if (c.claudeRegistry === "none") fs.rmSync(path.join(dir, "sessions"), { recursive: true });
+      const term = sleeper();
+      const own = sleeper({ detached: true });
+      const gone = sleeper();
+      if (c.hook === "live") hookRow(dir, term.pid!);
+      if (c.hook === "other-session") hookRow(dir, term.pid!, { sessionId: REF2 });
+      if (c.hook === "killed") { hookRow(dir, gone.pid!); await stop(gone); }
+      if (c.hook === "recycled") hookRow(dir, term.pid!, { procStart: "1" });
+      if (c.hook === "foreign") hookRow(dir, 999999, { procStart: null, pidDomain: "linux:other-host:pid:[7]" });
+      if (c.hook === "own-group") hookRow(dir, own.pid!);
+      if (c.hook === "broken-young") { fs.mkdirSync(terminalsDir(dir), { recursive: true }); fs.writeFileSync(path.join(terminalsDir(dir), "1.json"), "{ half a fi"); }
+      if (c.claudeRegistry === "live-twin") registryRow(dir, term.pid!, { procStart: processStart(term.pid!), pidDomain: localPidDomain() });
+      const fake = c.cli ? fakeCli(c.cli.mode, c.cli.live) : null;
+      if (c.hook === "foreign" && localPidDomain() === null) return; // only Linux names a pid namespace
+      const t0 = Date.now();
+      const v = await support(dir, { cli: fake?.cli, cliEnv: fake?.env }).check(c.ref ?? REF, { ownPgid: c.hook === "own-group" ? own.pid! : null, transcript: false });
+      assert.equal(v.ok ? "ok" : v.reason, c.expect, v.ok ? "" : v.detail);
+      if (c.detail) assert.match(v.ok ? "" : v.detail, c.detail);
+      if (c.fast) assert.ok(Date.now() - t0 < 1000, `answered in ${Date.now() - t0} ms: the command (timeout 1500 ms) was waited for`);
+    });
+  }
+
+  test("a terminal opens the session, then exits: refused, then allowed; with kill -9 it is allowed too, because the process is gone", async () => {
+    const dir = configDir();
+    const s = support(dir);
+    const env = (pid: number) => ({ CLAUDE_CODE_ENTRYPOINT: "cli", CLAUDE_CODE_SESSION_ATTENDED: "1", CLAUDE_PID: String(pid) });
+    const hook = (event: "start" | "end", pid: number) =>
+      runHook({ event, configDir: dir, stdin: JSON.stringify({ session_id: REF, cwd: "/w" }), env: env(pid), ppid: 1 }, { ancestors: () => [pid] });
+    assert.equal((await s.check(REF, { transcript: false })).ok, true, "before: nothing open");
+    const a = sleeper();
+    assert.equal(hook("start", a.pid!).done, "registered");
+    assert.equal((await s.check(REF, { transcript: false })).ok, false, "open in a terminal: refused");
+    assert.equal(hook("end", a.pid!).done, "unregistered");
+    assert.equal((await s.check(REF, { transcript: false })).ok, true, "/exit: allowed");
+    const b = sleeper();
+    hook("start", b.pid!);
+    assert.equal((await s.check(REF, { transcript: false })).ok, false);
+    await stop(b);
+    assert.equal((await s.check(REF, { transcript: false })).ok, true, "kill -9: no SessionEnd, but the process is gone");
+  });
+
+  test("the rows add to the live list and to the look the connector takes while its own agent works", async () => {
+    const dir = configDir();
+    const term = sleeper();
+    const own = sleeper({ detached: true });
+    hookRow(dir, term.pid!);
+    hookRow(dir, own.pid!, { sessionId: REF2 });
+    const fake = fakeCli("ok", []);
+    const s = support(dir, { cli: fake.cli, cliEnv: fake.env });
+    const live = await s.liveEntries();
+    assert.deepEqual(live.filter((e) => e.via === "hook").map((e) => [e.pid, e.sessionId]).sort(), [[term.pid, REF], [own.pid, REF2]].sort());
+    assert.equal(s.peek(REF, null)?.twin?.pid, term.pid, "peek sees the terminal");
+    assert.equal(s.peek(REF, own.pid!)?.twin?.pid, term.pid, "another process group is not this connector's own");
+    assert.equal(s.peek(REF2, own.pid!)?.twin, null, "the process group that is its own is not a twin");
+    assert.equal(s.peek(REF3, null)?.twin, null);
   });
 });
 
