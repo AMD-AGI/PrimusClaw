@@ -17,6 +17,7 @@
  *   C5 a held call or a question is INPUT_REQUIRED, and a message with the taskId answers it
  *   C6 CancelTask stops the run and the task stays CANCELED
  *   C7 the stream: running, text, the request, the end
+ *   C8 who asked is recorded; an identity token's caller must be on the operator's list
  *   C9 with the switch off the server is the one it was
  */
 
@@ -86,7 +87,10 @@ export const nc = {
 
 const skip = postgresSkipReason();
 
-type Caller = { userId: string; userName: string; roles: string[]; platformKey: string; virtualKey: string };
+type Caller = {
+  userId: string; userName: string; roles: string[]; platformKey: string; virtualKey: string;
+  delegation?: { actorSub?: string; clientId?: string };
+};
 const ALICE: Caller = { userId: "u-alice", userName: "alice", roles: ["default"], platformKey: "pk-a", virtualKey: "vk-a" };
 const BOB: Caller = { userId: "u-bob", userName: "bob", roles: ["default"], platformKey: "pk-b", virtualKey: "vk-b" };
 
@@ -94,6 +98,7 @@ describe("the A2A context/task model", { skip }, () => {
   let harness: AdmissionCluster;
   let app: FastifyInstance;
   let who: Caller = ALICE;
+  let method: string | null = "api_key";
   let seq = 0;
 
   before(async () => {
@@ -102,6 +107,7 @@ describe("the A2A context/task model", { skip }, () => {
     app = Fastify();
     app.addHook("onRequest", async (req) => {
       (req as unknown as { user: unknown }).user = who;
+      (req as unknown as { authMethod: unknown }).authMethod = method;
     });
     await a2a.registerA2ARoutes(app);
     await app.ready();
@@ -115,7 +121,9 @@ describe("the A2A context/task model", { skip }, () => {
     core.length = 0;
     feeds.length = 0;
     who = ALICE;
+    method = "api_key";
     process.env.CLAW_A2A_CONTEXT_TASKS = "1";
+    delete process.env.CLAW_A2A_IDENTITY_CLIENT_IDS;
   });
 
   const query = (sql: string, params: unknown[] = []) => harness.app.db.db.query(sql, params);
@@ -666,6 +674,89 @@ describe("the A2A context/task model", { skip }, () => {
       assert.equal(events[1].artifactUpdate.artifact.parts[0].text, "\nand more", "and the stream carries on from it");
       assert.equal(events[events.length - 1].statusUpdate.status.state, "TASK_STATE_COMPLETED");
       assert.equal((await rpc("SubscribeToTask", { id: r.task!.id })).json.error.code, -32004);
+    });
+  });
+
+  describe("C8 who asked", () => {
+    test("an upstream service's id and the actor are on the run, and in the log of record", async () => {
+      who = { ...ALICE, delegation: { actorSub: "svc-dispatch", clientId: "dispatron" } };
+      method = "identity_token";
+      process.env.CLAW_A2A_IDENTITY_CLIENT_IDS = "dispatron";
+      const r = await send("on behalf");
+      assert.ok(r.task, r.body);
+      const meta = (await query("SELECT metadata->'a2a' AS a FROM claw_tasks WHERE task_id = $1", [r.task.id])).rows[0].a;
+      assert.deepEqual(meta, {
+        caller_id: "user:u-alice", context_id: r.task.contextId, auth_method: "identity_token",
+        act_sub: "svc-dispatch", client_id: "dispatron",
+      });
+    });
+
+    test("an identity token's caller must be an upstream service the operator named", async () => {
+      method = "identity_token";
+      who = { ...ALICE, delegation: { clientId: "claw-web" } };
+      for (const configured of [undefined, "", "dispatron", "dispatron,other"]) {
+        if (configured === undefined) delete process.env.CLAW_A2A_IDENTITY_CLIENT_IDS; else process.env.CLAW_A2A_IDENTITY_CLIENT_IDS = configured;
+        const r = await rpc("SendMessage", { message: msg("hi"), configuration: { returnImmediately: true } });
+        assert.equal(r.status, 403, `list: ${configured}`);
+        assert.equal(r.json.error.code, -32600);
+      }
+      assert.equal((await rpc("GetTask", { id: "x" })).status, 403, "every method, not only a send");
+      who = { ...ALICE, delegation: undefined };
+      process.env.CLAW_A2A_IDENTITY_CLIENT_IDS = "dispatron";
+      assert.equal((await rpc("ListTasks", {})).status, 403, "a token with no client id is nobody's");
+    });
+
+    test("the allowlist compares the whole client id, and the record of it is clipped", async () => {
+      method = "identity_token";
+      const long = `svc-${"x".repeat(200)}`;
+      process.env.CLAW_A2A_IDENTITY_CLIENT_IDS = long;
+      who = { ...ALICE, delegation: { clientId: `${long.slice(0, 128)}-another-client` } };
+      assert.equal((await rpc("ListTasks", {})).status, 403, "a client whose id begins with an allowed one is not it");
+      who = { ...ALICE, delegation: { clientId: long } };
+      const r = await send("long id");
+      assert.ok(r.task, r.body);
+      const recorded = (await query("SELECT metadata->'a2a'->>'client_id' AS c FROM claw_tasks WHERE task_id = $1", [r.task.id])).rows[0].c;
+      assert.equal(recorded, long.slice(0, 128));
+    });
+
+    test("a padded client id is not the id the operator named", async () => {
+      method = "identity_token";
+      process.env.CLAW_A2A_IDENTITY_CLIENT_IDS = "worker";
+      who = { ...ALICE, delegation: { clientId: "worker " } };
+      assert.equal((await rpc("ListTasks", {})).status, 403);
+      who = { ...ALICE, delegation: { clientId: "worker" } };
+      assert.equal((await rpc("ListTasks", {})).status, 200);
+    });
+
+    test("the gateway's /invoke is not a way round the list", async () => {
+      const invoke = (url: string) => app.inject({ method: "POST", url, payload: { question: "hello" } });
+      method = "identity_token";
+      who = { ...ALICE, delegation: { clientId: "claw-web" } };
+      for (const configured of [undefined, "dispatron"]) {
+        if (configured === undefined) delete process.env.CLAW_A2A_IDENTITY_CLIENT_IDS; else process.env.CLAW_A2A_IDENTITY_CLIENT_IDS = configured;
+        for (const url of ["/invoke", "/invoke/general"]) {
+          const res = await invoke(url);
+          assert.equal(res.statusCode, 403, `${url} with ${configured}`);
+          assert.equal(JSON.parse(res.body).success, false);
+        }
+      }
+      assert.equal(executes.length, 0, "nothing was run");
+      who = { ...ALICE, delegation: { clientId: "dispatron" } };
+      const ok = await invoke("/invoke");
+      assert.equal(ok.statusCode, 200, ok.body);
+      assert.equal(JSON.parse(ok.body).success, true);
+      // And with the model off nobody is asked.
+      process.env.CLAW_A2A_CONTEXT_TASKS = "0";
+      who = { ...ALICE, delegation: { clientId: "claw-web" } };
+      assert.equal((await invoke("/invoke")).statusCode, 200);
+    });
+
+    test("every other credential is judged as it always was", async () => {
+      for (const m of ["api_key", "cookie", null]) {
+        method = m;
+        delete process.env.CLAW_A2A_IDENTITY_CLIENT_IDS;
+        assert.equal((await rpc("ListTasks", {})).status, 200, String(m));
+      }
     });
   });
 

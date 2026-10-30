@@ -7,6 +7,7 @@ import { metrics } from "../infra/metrics.js";
 import { js, sc, nc } from "../infra/nats.js";
 import { sanitizeSessionEvent } from "../events/store.js";
 import { authErrorPayload, getUser } from "../auth/middleware.js";
+import { getAuthMethod } from "../auth/request-credential.js";
 import { canWriteSessionAsOperator, isAdmin, type UserInfo } from "../auth/models.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { getViewablePlugin, resolveTaskPlugin } from "../marketplace/plugins.js";
@@ -16,7 +17,7 @@ import {
 } from "../tasks/admission.js";
 import { applySessionGateTransition, openChatRun } from "../tasks/chat-run.js";
 import { createA2aV2, type A2aV2, type ContextEntry, type OpenRunInput } from "./a2a-v2.js";
-import { a2aContextTasksEnabled } from "./a2a-flags.js";
+import { a2aContextTasksEnabled, identityCallerMayUseA2a } from "./a2a-flags.js";
 import { applyTaskStatusTransition } from "../tasks/db.js";
 import { gpuNodesFromSpec, topologyErrors } from "../tasks/run-spec.js";
 import type { EnvironmentTopology } from "@claw/protocol";
@@ -42,7 +43,8 @@ import {
   makeTaskNotCancelableError, makeVersionNotSupportedError,
 } from "./a2a-types.js";
 import {
-  bindPluginToSend, genericAgentCard, pluginAgentCard, publicBaseUrl,
+  bindPluginToSend, cardEtag, cardOptionsFromEnv, etagMatches, genericAgentCard, pluginAgentCard,
+  publicBaseUrl,
 } from "./a2a-agents.js";
 
 const logger = pino({ name: "a2a-server" });
@@ -347,6 +349,10 @@ interface A2AAuthContext {
   roles: string[];
   platformKey: string;
   virtualKey: string;
+  /** How the caller authenticated (`api_key`, `identity_token`, ...). */
+  authMethod?: string | null;
+  /** Who acted for the user, when an upstream service presented the token. */
+  delegation?: { actorSub?: string; clientId?: string };
 }
 
 
@@ -746,13 +752,17 @@ async function admitAndOpenA2AContextSend(
     // A repeated pair was answered above, so the open cannot find one. Thrown
     // rather than returned: the lock rolls the session and its gate back.
     if (!taskId) throw new Error("a2a.context_run_not_opened");
-    // Which A2A caller and context the run belongs to, for the audit trail.
+    // Who asked, for the audit trail: the run belongs to the caller, and an
+    // upstream service may have asked on their behalf.
     await client.query(
       "UPDATE claw_tasks SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb WHERE task_id = $1",
       [taskId, JSON.stringify({
         a2a: {
           caller_id: callerId,
           context_id: contextId,
+          auth_method: auth.authMethod ?? null,
+          ...(auth.delegation?.actorSub ? { act_sub: auth.delegation.actorSub } : {}),
+          ...(auth.delegation?.clientId ? { client_id: auth.delegation.clientId.slice(0, 128) } : {}),
         },
       })],
     );
@@ -1640,6 +1650,16 @@ const PUSH_NOTIFICATION_METHODS: Set<string> = new Set([
   A2A_METHODS.DeleteTaskPushNotificationConfig,
 ]);
 
+/**
+ * Whether an identity-provider token's caller is refused A2A under the
+ * context/task model (see identityCallerMayUseA2a). Asked on every path that
+ * runs something, the JSON-RPC endpoint and the gateway's `/invoke` alike.
+ */
+function identityCallerRefused(req: FastifyRequest): boolean {
+  if (!a2aContextTasksEnabled()) return false;
+  return !identityCallerMayUseA2a(getAuthMethod(req), getUser(req)?.delegation?.clientId);
+}
+
 /** The methods of the context/task model; what it does not change is answered as before. */
 async function dispatchContextTasks(
   method: string,
@@ -1706,7 +1726,14 @@ async function dispatch(
     roles: user?.roles ?? [],
     platformKey: user?.platformKey || "",
     virtualKey: resolveUserLlmKey(user),
+    authMethod: getAuthMethod(req),
+    delegation: user?.delegation,
   };
+
+  if (contextTasks && identityCallerRefused(req)) {
+    reply.status(403);
+    return makeJsonRpcError(id, JSON_RPC_INVALID_REQUEST, "this credential may not use the A2A interface");
+  }
 
   if (pluginId !== undefined
     && (method === A2A_METHODS.SendMessage || method === A2A_METHODS.SendStreamingMessage)) {
@@ -1838,7 +1865,15 @@ export async function registerA2ARoutes(app: FastifyInstance): Promise<void> {
   const serveAgentCard = async (req: FastifyRequest, reply: FastifyReply) => {
     reply.header("Access-Control-Allow-Origin", "*");
     reply.header("Vary", CARD_VARY);
-    return genericAgentCard(publicBaseUrl(req.headers));
+    const opts = cardOptionsFromEnv();
+    const card = genericAgentCard(publicBaseUrl(req.headers), opts);
+    if (!opts.contextTasks) return card;
+    // Spec 8.6: a validator and a lifetime, so a client revalidates cheaply.
+    const etag = cardEtag(card);
+    reply.header("ETag", etag);
+    reply.header("Cache-Control", "public, max-age=300");
+    if (etagMatches(req.headers["if-none-match"], etag)) return reply.status(304).send();
+    return card;
   };
   app.get("/.well-known/agent-card.json", serveAgentCard);
   app.get("/a2a/.well-known/agent-card.json", serveAgentCard);
@@ -1853,14 +1888,22 @@ export async function registerA2ARoutes(app: FastifyInstance): Promise<void> {
   app.get<{ Params: { pluginId: string } }>(
     "/a2a/plugins/:pluginId/.well-known/agent-card.json",
     async (req, reply) => {
-      reply.header("Vary", CARD_VARY);
-      reply.header("Cache-Control", "private, no-store");
+      const opts = cardOptionsFromEnv();
+      // The card depends on who asks (a private plugin answers its owner only).
+      reply.header("Vary", opts.contextTasks ? `${CARD_VARY}, Authorization` : CARD_VARY);
+      reply.header("Cache-Control", opts.contextTasks ? "private, max-age=0, must-revalidate" : "private, no-store");
       const gate = await gatePluginAgent(req, req.params.pluginId);
       if (!gate.ok) {
+        reply.header("Cache-Control", "private, no-store");
         reply.status(gate.status);
         return authErrorPayload(gate.status === 401 ? "unauthorized" : "not_found", gate.message);
       }
-      return pluginAgentCard(publicBaseUrl(req.headers), gate.plugin);
+      const card = pluginAgentCard(publicBaseUrl(req.headers), gate.plugin, opts);
+      if (!opts.contextTasks) return card;
+      const etag = cardEtag(card);
+      reply.header("ETag", etag);
+      if (etagMatches(req.headers["if-none-match"], etag)) return reply.status(304).send();
+      return card;
     },
   );
 
@@ -1899,11 +1942,18 @@ export async function registerA2ARoutes(app: FastifyInstance): Promise<void> {
 
   // === SaFE Gateway backward-compatible endpoints ===
   app.post<{ Params: { skill?: string } }>("/invoke/:skill", async (req, reply) => {
+    if (identityCallerRefused(req)) return refuseLegacyInvoke(reply);
     return handleLegacyInvoke(req.body as Record<string, unknown>, req.params.skill, reply);
   });
   app.post("/invoke", async (req, reply) => {
+    if (identityCallerRefused(req)) return refuseLegacyInvoke(reply);
     return handleLegacyInvoke(req.body as Record<string, unknown>, undefined, reply);
   });
+}
+
+function refuseLegacyInvoke(reply: FastifyReply): { success: false; error: string } {
+  reply.status(403);
+  return { success: false, error: "this credential may not use the A2A interface" };
 }
 
 const LEGACY_INVOKE_AUTH: A2AAuthContext = {
