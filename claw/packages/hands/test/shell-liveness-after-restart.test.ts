@@ -15,10 +15,10 @@
  * actually presents: the durable records stay, a new epoch marker is minted,
  * and the registry starts empty.
  */
-import test, { after, beforeEach } from "node:test";
+import test, { after, afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { mintScopeCredential } from "@claw/utils";
 import { join } from "node:path";
@@ -41,8 +41,28 @@ const OWNER = "sess-restart";
 const RUN = "ktsk_1";
 const survivors: ChildProcess[] = [];
 
+/**
+ * Kill everything a child started, not only the child.
+ *
+ * Each of these is spawned detached, so it leads its own group, and `sh -c
+ * "sleep 60"` forks rather than execs: signalling the leader alone left the
+ * `sleep` running for the rest of its minute. Across the spawns in this file,
+ * and every other file the runner executes beside it, those are the processes
+ * that run a small CI machine into `spawn EAGAIN`.
+ */
+function killGroup(child: ChildProcess): void {
+  try { process.kill(-child.pid!, "SIGKILL"); } catch { /* already gone */ }
+}
+
+/** Nothing a test spawned outlives the test, so at most one test's processes are ever live. */
+function reapSurvivors(): void {
+  for (const child of survivors.splice(0)) killGroup(child);
+}
+
+afterEach(reapSurvivors);
+
 after(async () => {
-  for (const child of survivors) child.kill("SIGKILL");
+  reapSurvivors();
   await app.close();
   rmSync(process.env.HANDS_STATE_DIR!, { recursive: true, force: true });
 });
@@ -74,13 +94,36 @@ function spawnRecorded(shellId: string): ChildProcess {
   return child;
 }
 
-/** Block until nothing is left in `pid`'s process group. */
-async function waitForGroupToDrain(pid: number): Promise<void> {
-  for (let i = 0; i < 100; i += 1) {
-    if (!liveness.groupHasMember(pid)) return;
-    await new Promise((r) => setTimeout(r, 20));
+/**
+ * Poll `ready` until it holds or the deadline passes.
+ *
+ * The condition is a fact about the process table, which catches up with a
+ * signal or an exit on the kernel's schedule, not the test's. The deadline is
+ * generous because meeting it costs nothing: the loop returns the moment the
+ * fact is true, where a fixed sleep or an iteration count is what a descheduled
+ * runner outlasts.
+ */
+async function waitUntil(what: string, ready: () => boolean, ms = 15_000): Promise<void> {
+  const signal = AbortSignal.timeout(ms);
+  while (!ready()) {
+    if (signal.aborted) throw new Error(`${what} did not happen within ${ms} ms`);
+    await new Promise((r) => setTimeout(r, 10));
   }
-  throw new Error(`group ${pid} never drained`);
+}
+
+/** Block until nothing is left in `pid`'s process group. */
+function waitForGroupToDrain(pid: number): Promise<void> {
+  return waitUntil(`group ${pid} draining`, () => !liveness.groupHasMember(pid));
+}
+
+/** Whether `pid` is a zombie: exited, its status waiting for a parent that never collects it. */
+function isZombie(pid: number): boolean {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z");
+  } catch {
+    return false;
+  }
 }
 
 /** What a restart is, as the sandbox sees it: new epoch, empty registry. */
@@ -104,8 +147,6 @@ test("a shell that outlived the process that spawned it is still counted", async
   assert.equal(after.classes.lost, 1,
     "honestly reported: nobody can collect its exit status any more, which is a "
       + "reason to say so rather than a reason to stop protecting it");
-
-  child.kill("SIGKILL");
 });
 
 test("a shell that ended before the restart does not hold the sandbox open", async () => {
@@ -137,9 +178,15 @@ test("a zombie is not work, so it does not hold the sandbox open", async () => {
   // of these holds a sandbox open for as long as its parent lives.
   // A shell parent is no good here: it reaps its own background children, and
   // Node's child_process does too. This parent provably never waits.
+  //
+  // It holds on to the Popen object, which is the whole point of the `p =`. A
+  // bare `Popen(...).pid` drops the object the moment `.pid` is read, and the
+  // object's finaliser collects a child that has already exited -- which a
+  // starved machine makes the usual case, since `/bin/true` is gone in a
+  // millisecond -- leaving no zombie for the assertions below to be about.
   const parent = spawn(
     "python3",
-    ["-c", "import subprocess,time; print(subprocess.Popen(['/bin/true']).pid, flush=True); time.sleep(60)"],
+    ["-c", "import subprocess,time; p = subprocess.Popen(['/bin/true']); print(p.pid, flush=True); time.sleep(60)"],
     { detached: true, stdio: ["ignore", "pipe", "ignore"] },
   );
   survivors.push(parent);
@@ -147,8 +194,10 @@ test("a zombie is not work, so it does not hold the sandbox open", async () => {
     parent.stdout!.once("data", (b: Buffer) => resolve(Number(b.toString().trim())));
     parent.once("error", (e) => reject(new Error(`cannot build a zombie: ${e.message}`)));
   });
-  // The parent has to reach `sleep` before the child is reaped-by-nobody.
-  await new Promise((r) => setTimeout(r, 200));
+  // The pid is printed when the child is spawned, not when it has exited. Wait
+  // for the state the test is about, rather than for a guess at how long
+  // `/bin/true` takes.
+  await waitUntil(`process ${zombiePid} becoming a zombie`, () => isZombie(zombiePid));
 
   records.claimRecord({
     owner_scope: OWNER, run_identity: RUN, shell_id: "zombie",
@@ -166,8 +215,6 @@ test("a zombie is not work, so it does not hold the sandbox open", async () => {
   assert.equal(live.determinate, true);
   assert.equal(live.active, 0, "a zombie was counted as live work");
   assert.equal(live.classes.ended_unreaped, 1);
-
-  parent.kill("SIGKILL");
 });
 
 test("a claim with no process yet still blocks reclamation after a restart", () => {
@@ -203,8 +250,6 @@ test("the count Brain actually reads keeps a restarted sandbox's work", async ()
   });
   assert.equal(res.statusCode, 200);
   assert.deepEqual(res.json(), { running: 1 });
-
-  child.kill("SIGKILL");
 });
 
 test("an unreadable subtree answers unknown, never zero", async () => {
@@ -228,8 +273,6 @@ test("an unreadable subtree answers unknown, never zero", async () => {
   assert.equal(res.statusCode, 503,
     "a status the caller turns into its own unanswered-probe case, which keeps "
       + "the sandbox rather than filing it idle");
-
-  child.kill("SIGKILL");
 });
 
 test("one unreadable record makes the whole answer indeterminate, not smaller", async () => {
@@ -249,8 +292,6 @@ test("one unreadable record makes the whole answer indeterminate, not smaller", 
   assert.equal(ownerLiveness(OWNER, emptyRegistry).determinate, false);
   assert.equal(runningShellCount(OWNER), null,
     "not a determinate count of the records that happened to parse");
-
-  child.kill("SIGKILL");
 });
 
 test("another owner's surviving work does not hold this owner's sandbox", () => {

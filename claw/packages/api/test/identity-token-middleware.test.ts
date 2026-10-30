@@ -134,7 +134,11 @@ describe("an identity access token through the authentication hook", () => {
     const token = mint();
     const r = await whoami(bearer(token));
     assert.equal(r.status, 200, JSON.stringify(r.body));
-    assert.deepEqual(r.body.user, { userId: "web-user", userName: "Web User", roles: ["default"], platformKey: "pk-web-user", virtualKey: "vk-web-user" });
+    // The client the token was issued to is recorded beside the user (auth/identity-token.ts); it grants nothing.
+    assert.deepEqual(r.body.user, {
+      userId: "web-user", userName: "Web User", roles: ["default"], platformKey: "pk-web-user", virtualKey: "vk-web-user",
+      delegation: { clientId: "claw-web" },
+    });
     assert.deepEqual(safe.calls, [], "SaFE was not asked about a cookie or a key");
     // It was asked once, and not about the user's token: about the one the provider issued the API for SaFE's audience,
     // naming the API as the party acting for the user.
@@ -148,7 +152,10 @@ describe("an identity access token through the authentication hook", () => {
   test("a subject SaFE does not know is the token's user all the same, without keys", async () => {
     const r = await whoami(bearer(mint({ sub: "stranger" })));
     assert.equal(r.status, 200, JSON.stringify(r.body));
-    assert.deepEqual(r.body.user, { userId: "stranger", userName: "Web User", roles: ["default"], platformKey: "", virtualKey: "" });
+    assert.deepEqual(r.body.user, {
+      userId: "stranger", userName: "Web User", roles: ["default"], platformKey: "", virtualKey: "",
+      delegation: { clientId: "claw-web" },
+    });
   });
 
   test("a token that carries `system-admin` in its roles claim does not make the caller an administrator (mint() carries it)", async () => {

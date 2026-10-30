@@ -280,6 +280,10 @@ export async function verifyIdentityAccessToken(
       // Not an error of the request, but this user has no key for model calls or sandboxes: the log is where that is visible.
       logger.warn({ path: pathname, userId: sub, reason: keys.reason }, "auth.identity_token.no_safe_keys");
     }
+    const actorSub = text((claims.act as { sub?: unknown } | undefined)?.sub);
+    // Exactly as signed, not trimmed: an allowlist compares it, and `worker` and
+    // `worker ` are two clients (only a blank id is no id).
+    const clientId = typeof claims.client_id === "string" && claims.client_id.trim() !== "" ? claims.client_id : "";
     const user: UserInfo = {
       userId: sub,
       userName: (text(claims.name) || text(claims.preferred_username) || text(claims.email) || sub).slice(0, MAX_SUBJECT_CHARS),
@@ -289,6 +293,18 @@ export async function verifyIdentityAccessToken(
       roles: ["default", ...adopted],
       platformKey: keys.status === "keys" ? keys.platformKey : "",
       virtualKey: keys.status === "keys" ? keys.virtualKey : "",
+      ...(actorSub || clientId
+        ? {
+          delegation: {
+            // The actor is only ever recorded, so it is clipped. The client id is also
+            // compared (CLAW_A2A_IDENTITY_CLIENT_IDS), and a clipped value would let a
+            // client whose id begins with an allowed one pass for it: it is the claim
+            // as signed, and whoever records it clips its own copy.
+            ...(actorSub ? { actorSub: actorSub.slice(0, MAX_SUBJECT_CHARS) } : {}),
+            ...(clientId ? { clientId } : {}),
+          },
+        }
+        : {}),
     };
     return { status: "verified", user, method: IDENTITY_TOKEN_METHOD };
   } catch (err) {
