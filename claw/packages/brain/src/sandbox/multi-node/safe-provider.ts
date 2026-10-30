@@ -3,7 +3,7 @@
 
 /**
  * Multi-node provider for `CLAW_DEPLOY_MODE=safe`: the cluster is a SaFE
- * workload (RayJob or InferaDeployment) created with the requesting user's
+ * workload (RayJob, InferaDeployment, Atom, or SGLangRouter) created with the requesting user's
  * platform key, exactly as Hyperloom's own `multi_node` CLI would create it.
  *
  * Everything goes through the SaFE API; Brain never talks to Kubernetes. The
@@ -24,7 +24,7 @@ import {
 } from "../../config.js";
 import { normalizeWorkloadTimeout, resolveSandboxImageFromRequest } from "../ensure-hands.js";
 import {
-  assertMultiNodeInferaModel,
+  assertMultiNodeModel,
   ephemeralGiPerNode,
   resolveTopology,
   type MultiNodePromptSpec,
@@ -34,7 +34,10 @@ import { SandboxProvisionTerminalError } from "../errors.js";
 import { ACTIVE_PHASES, TERMINAL_PHASES, waitForWorkloadReady, type WorkloadWaitDeps } from "../workload-wait.js";
 import { parseWorkloadListPage, type WorkloadRef } from "./workload-parse.js";
 import {
+  ATOM_ROUTER_PORT,
+  buildAtomWorkloadBody,
   buildInferaWorkloadBody,
+  buildSGLangRouterWorkloadBody,
   buildRayJobWorkloadBody,
   inferaFrontendPort,
   inferaSshPortBase,
@@ -74,7 +77,7 @@ const SESSION_MAX_PAGES = 20;
  * SaFE kinds that are GPU clusters. Used to spare the session's own sandbox,
  * which carries the same `CLAW_SESSION_ID` env and would otherwise be swept.
  */
-const CLUSTER_KINDS = new Set(["RayJob", "InferaDeployment"]);
+const CLUSTER_KINDS = new Set(["RayJob", "InferaDeployment", "Atom", "SGLangRouter"]);
 
 /** Where the Infera private key is materialised inside the sandbox. */
 const SANDBOX_SSH_KEY_PATH = "/tmp/primus-claw-mn-ssh-key";
@@ -312,7 +315,7 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
   ): Promise<MultiNodeContext> {
     const spec = resolveTopology(request);
     if (!spec) throw new Error("SafeMultiNodeProvider.ensure called for a single-node request");
-    assertMultiNodeInferaModel(spec);
+    assertMultiNodeModel(spec);
 
     const messageId = request.message_id?.trim();
     if (!messageId) throw new Error("multi-node request requires message_id");
@@ -592,6 +595,23 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
         pdPrefillTp: spec.pdPrefillTp,
         pdDecodeTp: spec.pdDecodeTp,
       });
+    } else if (spec.backend === "atom" || spec.backend === "sglangrouter") {
+      const pd = {
+        ...common,
+        model: spec.model,
+        framework: spec.framework,
+        kvTransferBackend: spec.kvTransferBackend,
+        pdMode: spec.pdMode,
+        pdPrefillNodes: spec.pdPrefillNodes,
+        pdDecodeNodes: spec.pdDecodeNodes,
+        pdPrefillTp: spec.pdPrefillTp,
+        pdDecodeTp: spec.pdDecodeTp,
+        serverArgs: spec.serverArgs,
+        pdPrefillExtraArgs: spec.pdPrefillExtraArgs,
+        pdDecodeExtraArgs: spec.pdDecodeExtraArgs,
+        pdIbDevice: spec.pdIbDevice,
+      };
+      body = spec.backend === "atom" ? buildAtomWorkloadBody(pd) : buildSGLangRouterWorkloadBody(pd);
     } else {
       body = buildRayJobWorkloadBody(common);
     }
@@ -686,6 +706,9 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
       logPrefix: "mn.safe",
       isReady: (detail) => {
         if (String(detail.phase ?? "").toLowerCase() !== "running") return false;
+        // Atom and SGLangRouter report Running only after router, prefill and
+        // decode are all up, so the phase is the readiness signal. Infera still
+        // needs live pod IPs.
         if (spec.backend !== "infera") return true;
         return gpuPodsReady(
           discoverRolePods(detail, spec.pdMode, inferaSshPortBase(displayName)),
@@ -769,6 +792,13 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
         ...base,
         serviceUrl: `http://${host}:${RAYJOB_SERVER_PORT}`,
         headHost: this.resolveRayHeadHost(workloadId, namespace, detail),
+      };
+    }
+
+    if (spec.backend === "atom" || spec.backend === "sglangrouter") {
+      return {
+        ...base,
+        serviceUrl: `http://${host}:${ATOM_ROUTER_PORT}`,
       };
     }
 
