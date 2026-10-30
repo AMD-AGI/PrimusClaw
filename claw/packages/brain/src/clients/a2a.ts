@@ -512,7 +512,7 @@ export async function discoverAgent(peer: A2APeer, opts: A2ACallOptions = {}, ti
       if (opts.signal?.aborted) throw err;
       if (held) {
         // The card changes rarely and only decides where to call; the call itself is judged on its own.
-        logger.warn({ agent: peer.name, err: describeError(err) }, "a2a.card.stale_served");
+        logger.warn({ agent: peer.name, err: scrubCredentials(describeError(err), used) }, "a2a.card.stale_served");
         return held.card;
       }
       throw err;
@@ -638,12 +638,16 @@ async function rpcCall(
   peer: A2APeer, opts: A2ACallOptions, method: string, params: Record<string, unknown>,
   timeoutMs = RPC_TIMEOUT_MS, withoutRunSignal = false,
 ): Promise<unknown> {
-  const { endpoint } = await resolveEndpoint(peer, opts);
-  const res = await authorizedFetch(peer, opts, endpoint, {
+  // `withoutRunSignal` is for a request sent because the run's signal fired (CancelTask on Stop), so
+  // it covers the card fetch that finds the endpoint as much as the POST: a card that is not fresh is
+  // fetched again, and with that signal already aborted the fetch would fail before anything was sent.
+  const callOpts: A2ACallOptions = withoutRunSignal ? { ...opts, signal: undefined } : opts;
+  const { endpoint } = await resolveEndpoint(peer, callOpts);
+  const res = await authorizedFetch(peer, callOpts, endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json", "A2A-Version": A2A_VERSION },
     body: rpcBody(method, params).body,
-    signal: joinSignals(AbortSignal.timeout(timeoutMs), withoutRunSignal ? undefined : opts.signal),
+    signal: joinSignals(AbortSignal.timeout(timeoutMs), callOpts.signal),
   });
   let json: JsonRpcResponse;
   try {
@@ -862,7 +866,12 @@ async function concludeStream(
       const cancelled = await cancelTask(peer, opts, view.taskId, true);
       return { ...cancelled, note: "The run was stopped; CancelTask was sent to the peer." };
     } catch (err) {
-      logger.warn({ agent: peer.name, taskId: view.taskId, err: describeError(err) }, "a2a.cancel_on_stop.failed");
+      // The error carries the peer's own words (a JSON-RPC error message), which may echo what it was sent.
+      const sent = opts.sentCredentials ?? new Set<string>();
+      logger.warn(
+        { agent: peer.name, taskId: scrubCredentials(view.taskId, sent), err: scrubCredentials(describeError(err), sent) },
+        "a2a.cancel_on_stop.failed",
+      );
       return view.toResult(`The run was stopped; CancelTask to the peer failed (${describeError(err)}). Its task may still be running.`);
     }
   }
@@ -1005,7 +1014,11 @@ async function runA2ACall(input: Record<string, unknown>, opts: A2ACallOptions):
     }
     if (opts.outcome && resultIsFailure(result)) opts.outcome.isError = true;
     logger.info(
-      { agent, mode, state: result.state, taskId: result.task_id, sessionId: opts.sessionId, elapsedMs: Date.now() - started },
+      {
+        agent, mode, state: result.state, sessionId: opts.sessionId, elapsedMs: Date.now() - started,
+        // The peer names the task, so it is scrubbed like everything else of the peer's that is written down.
+        taskId: result.task_id === undefined ? undefined : scrubCredentials(result.task_id, opts.sentCredentials ?? new Set()),
+      },
       "a2a.call",
     );
     return renderResult(result);

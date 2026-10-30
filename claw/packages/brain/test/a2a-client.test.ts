@@ -9,6 +9,7 @@
 import "./a2a-client-env.js";
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { IdentityExchangeRefusedError, IdentityUnavailableError, type ExchangeRequest } from "@claw/utils";
@@ -85,10 +86,14 @@ const done = (text: string) => ({
 });
 
 /** A well-behaved peer: its card names `/rpc`, SendStreamingMessage streams a completed task. */
-async function standardPeer(over: { card?: (peer: { origin: string }) => unknown; rpc?: Handler } = {}): Promise<Peer> {
+async function standardPeer(
+  over: { card?: (peer: { origin: string }) => unknown; cardHeaders?: Record<string, string>; rpc?: Handler } = {},
+): Promise<Peer> {
   const self: { origin: string } = { origin: "" };
   const p = await startPeer((req, res, seen) => {
-    if (req.method === "GET" && req.url === CARD_PATH) return json(res, over.card ? over.card(self) : card(self.origin, [jsonrpc(`${self.origin}/rpc`)]));
+    if (req.method === "GET" && req.url === CARD_PATH) {
+      return json(res, over.card ? over.card(self) : card(self.origin, [jsonrpc(`${self.origin}/rpc`)]), 200, over.cardHeaders);
+    }
     if (over.rpc) return over.rpc(req, res, seen);
     if (seen.rpc?.method === "SendStreamingMessage") {
       const s = sse(res);
@@ -109,6 +114,40 @@ const registry = (entries: unknown[]) => initA2ARegistry(JSON.stringify(entries)
 const entry = (p: Peer, extra: Record<string, unknown> = {}) => ({ name: "p", card_url: `${p.origin}${CARD_PATH}`, allow_local: true, ...extra });
 const call = async (input: Record<string, unknown>, opts: A2ACallOptions = {}) => handleA2ACall({ agent: "p", ...input }, opts);
 const parse = (out: string) => JSON.parse(out);
+
+/**
+ * The lines the client logs while `run` goes. The logger is a module-private pino writing to fd 1,
+ * so there is no object to swap; taking `fs.write` keeps the real serializers on the path and reads
+ * the bytes the process was about to emit.
+ */
+async function captureLogLines(run: () => Promise<unknown>, waitFor: string): Promise<string[]> {
+  const lines: string[] = [];
+  const realWrite = fs.write as unknown as (...args: unknown[]) => unknown;
+  const realWriteSync = fs.writeSync as unknown as (...args: unknown[]) => unknown;
+  const take = (chunk: unknown) => { for (const line of String(chunk).split("\n")) if (line) lines.push(line); };
+  fs.write = ((fd: number, chunk: unknown, ...rest: unknown[]) => {
+    if (fd !== 1) return realWrite(fd, chunk, ...rest);
+    take(chunk);
+    const done = rest[rest.length - 1];
+    if (typeof done === "function") done(null, Buffer.byteLength(String(chunk)), chunk);
+    return undefined;
+  }) as unknown as typeof fs.write;
+  fs.writeSync = ((fd: number, chunk: unknown, ...rest: unknown[]) => {
+    if (fd !== 1) return realWriteSync(fd, chunk, ...rest);
+    take(chunk);
+    return Buffer.byteLength(String(chunk));
+  }) as unknown as typeof fs.writeSync;
+  try {
+    await run();
+    // pino hands the line to the sink asynchronously: wait for the line by name, not for a fixed time.
+    const wanted = `"msg":${JSON.stringify(waitFor)}`;
+    for (let i = 0; i < 500 && !lines.some((l) => l.includes(wanted)); i++) await new Promise((r) => setTimeout(r, 1));
+  } finally {
+    fs.write = realWrite as unknown as typeof fs.write;
+    fs.writeSync = realWriteSync as unknown as typeof fs.writeSync;
+  }
+  return lines;
+}
 
 // ── Where the call goes: the card ───────────────────────────────────────────
 
@@ -513,6 +552,89 @@ test("Stop before the peer has named a task has nothing to cancel; Stop before t
   already.abort();
   assert.equal(parse(await call({ message: "x" }, { signal: already.signal })).state, "canceled");
   assert.equal(silent.seen.length, before, "no request at all");
+});
+
+test("Stop still cancels the peer's task when its card is no longer fresh", async () => {
+  // A stream can outlive the card's freshness (5 minutes by default, a call may run 10), and a card
+  // served no-store is never held. The card is then fetched again to find the endpoint, and by then
+  // the run's signal has fired: the fetch must not be tied to it, or CancelTask is never sent.
+  const stale: Array<[string, Record<string, string>]> = [
+    ["no-cache", { "cache-control": "no-cache" }],
+    ["no-store", { "cache-control": "no-store" }],
+    ["max-age=0", { "cache-control": "max-age=0" }],
+  ];
+  for (const [how, cardHeaders] of stale) {
+    const p = await standardPeer({
+      cardHeaders,
+      rpc: (_q, res, seen) => {
+        if (seen.rpc?.method === "CancelTask") return rpcResult(res, seen, { id: "t-s", contextId: "c-s", status: { state: "TASK_STATE_CANCELED" } });
+        sse(res).event({ task: { id: "t-s", contextId: "c-s", status: { state: "TASK_STATE_WORKING" } } });
+      },
+    });
+    registry([entry(p)]);
+    const stop = new AbortController();
+    setTimeout(() => stop.abort(), 150);
+    const r = parse(await call({ message: "slow" }, { signal: stop.signal }));
+    const cardFetches = p.seen.filter((s) => s.method === "GET" && s.url === CARD_PATH).length;
+    assert.ok(cardFetches >= 2, `${how}: the card was asked for again at Stop (otherwise this proves nothing), got ${cardFetches}`);
+    assert.deepEqual(p.rpcs(), ["SendStreamingMessage", "CancelTask"], `${how}: CancelTask was sent`);
+    assert.equal(r.state, "canceled", how);
+    assert.match(r.note, /CancelTask was sent to the peer/, how);
+  }
+});
+
+// ── What the peer says never reaches the Brain log with the credential it was sent ──
+
+test("a failed CancelTask does not put the peer's echo of its credential in the log", async () => {
+  const TOKEN = "svc-log-token-sentinel-7c1e9d";
+  process.env.A2A_TEST_TOKEN = TOKEN;
+  try {
+    const p = await standardPeer({
+      rpc: (req, res, seen) => {
+        const auth = String(req.headers.authorization ?? "").replace(/^Bearer /, "");
+        if (seen.rpc?.method === "CancelTask") return rpcError(res, -32002, `cannot cancel; you sent ${auth}`);
+        sse(res).event({ task: { id: `t-${auth}`, contextId: "c-s", status: { state: "TASK_STATE_WORKING" } } });
+      },
+    });
+    registry([entry(p, { auth_env: "A2A_TEST_TOKEN" })]);
+    const stop = new AbortController();
+    setTimeout(() => stop.abort(), 150);
+    let out = "";
+    const lines = await captureLogLines(async () => { out = await call({ message: "slow" }, { signal: stop.signal }); }, "a2a.cancel_on_stop.failed");
+    const failed = lines.filter((l) => l.includes('"msg":"a2a.cancel_on_stop.failed"'));
+    assert.equal(failed.length, 1, `the failure is logged once, got ${lines.length} lines`);
+    assert.match(failed[0], /cannot cancel; you sent \[credential removed\]/, "the rest of the peer's words is still there");
+    assert.match(failed[0], /t-\[credential removed\]/, "the peer-named task id is scrubbed too");
+    for (const l of lines) assert.ok(!l.includes(TOKEN), `the credential reached the log: ${l.slice(0, 300)}`);
+    assert.ok(!out.includes(TOKEN), "nor the result");
+  } finally {
+    delete process.env.A2A_TEST_TOKEN;
+  }
+});
+
+test("a task id the peer made out of its credential is not logged as it is", async () => {
+  const TOKEN = "svc-log-token-sentinel-4b8f2a";
+  process.env.A2A_TEST_TOKEN = TOKEN;
+  try {
+    const p = await standardPeer({
+      rpc: (req, res) => {
+        const auth = String(req.headers.authorization ?? "").replace(/^Bearer /, "");
+        const s = sse(res);
+        s.event({ task: { id: `task-${auth}`, status: { state: "TASK_STATE_COMPLETED" }, artifacts: [{ artifactId: "a", parts: [{ text: "done" }] }] } });
+        s.end();
+      },
+    });
+    registry([entry(p, { auth_env: "A2A_TEST_TOKEN" })]);
+    let out = "";
+    const lines = await captureLogLines(async () => { out = await call({ message: "x" }); }, "a2a.call");
+    const info = lines.filter((l) => l.includes('"msg":"a2a.call"'));
+    assert.equal(info.length, 1);
+    assert.match(info[0], /task-\[credential removed\]/);
+    for (const l of lines) assert.ok(!l.includes(TOKEN), `the credential reached the log: ${l.slice(0, 300)}`);
+    assert.ok(!out.includes(TOKEN));
+  } finally {
+    delete process.env.A2A_TEST_TOKEN;
+  }
 });
 
 // ── Whose identity the peer is called with ──────────────────────────────────
