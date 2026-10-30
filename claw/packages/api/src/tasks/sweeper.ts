@@ -903,12 +903,35 @@ export async function reapExpiredDoorbellRuns(): Promise<number> {
 /**
  * No holder: the lease lapsed more than the grace ago, or its finish-only holder handed the finish
  * over (`app_finish_handed_over`, then lease given back). A lease given back by an ordinary nak is
- * NOT gone: its redelivery is coming and waits the grace like any other. A row nobody has taken yet has no expiry and is neither.
+ * NOT gone: its redelivery is coming and waits the grace like any other. A row nobody has taken yet has
+ * no expiry and is neither; for a finish-only dispatch that is `FINISH_DISPATCH_UNACCEPTED_SQL`.
  */
 const LEASE_GONE_SQL = `(lease_expires_at < NOW() - ($1::int * INTERVAL '1 second')
         OR (lease_owner IS NULL AND lease_expires_at IS NOT NULL
             AND metadata->>'app_finish_handed_over' = 'true')
         OR lease_expires_at IS NULL AND lease_owner IS NULL AND status IN ('cancelling','cancelled','failed'))`;
+
+/**
+ * A finish-only dispatch that no Brain accepted within the grace: the row was reopened and
+ * published (`preparing`, a fresh `started_at`), and nobody ever wrote a lease on it.
+ *
+ * A Brain does not park a finish-only delivery behind its execution gate (`runDelivery`,
+ * `isFinishOnly`), so the handler starts at once and its first lease renewal is the first thing the
+ * run does: a healthy fleet writes the lease within seconds, a redelivery within `ack_wait`, and a
+ * lock held by a dead worker for the lease-lost grace at most. Ten minutes without one means the
+ * message was settled without being accepted (a Brain that dropped it, the stream gave up on it) or
+ * never reached anyone, and it is not coming back.
+ * `LEASE_GONE_SQL` cannot see this row -- it has no expiry to lapse -- and the generic backstop in
+ * `reapStaleTasks` only notices it once the finish's fresh budget (the reopen sets `deadline_at` an
+ * hour ahead) plus `RUN_BUDGET_BACKSTOP_GRACE_SEC` has gone, or `BRAIN_TASK_TIMEOUT_SEC` after the
+ * dispatch if that is sooner, and the requeue that follows is then another grace later. Re-sending a
+ * duplicate is safe: the new dispatch replaces the row's token hash, so the lease POST of a message
+ * from the earlier one is refused.
+ * `$1` is the grace, as in `LEASE_GONE_SQL`. Both callers already restrict to a task carrying
+ * `app_finish_prior`, which is what makes a `preparing` row a finish-only dispatch.
+ */
+const FINISH_DISPATCH_UNACCEPTED_SQL = `(status = 'preparing' AND lease_owner IS NULL AND lease_expires_at IS NULL
+        AND started_at < NOW() - ($1::int * INTERVAL '1 second'))`;
 
 /**
  * Put a task that was reopened for a finish-only dispatch back to the terminal state it had
@@ -1013,8 +1036,7 @@ export async function settleEndedFinishOnlyRuns(): Promise<number> {
  */
 export async function giveUpExhaustedAppFinishes(): Promise<number> {
   const rows = await restoreFinishOnlyTasks(
-    `status IN ('cancelling','cancelled','failed')
-        AND ${LEASE_GONE_SQL}
+    `((status IN ('cancelling','cancelled','failed') AND ${LEASE_GONE_SQL}) OR ${FINISH_DISPATCH_UNACCEPTED_SQL})
         AND COALESCE((metadata->>'app_finish_requeues')::int, 0) >= $2::int
         AND EXISTS (SELECT 1 FROM claw_app_runs r WHERE r.task_id = claw_tasks.task_id AND r.state = 'finishing')`,
     [LEASE_LOST_GRACE_SEC, APP_FINISH_REQUEUE_MAX],
@@ -1047,7 +1069,8 @@ const APP_FINISH_REQUEUE_MAX = 5;
  * nobody and reports no terminal state; `settleFinishedAppRun` then puts the task
  * back to what it was, so a user's cancel stays a cancel.
  *
- * Only a lease that is dead for the grace, and only `finishing`: a `running`
+ * Only a lease that is dead for the grace -- or a finish-only dispatch that nobody accepted for
+ * as long (`FINISH_DISPATCH_UNACCEPTED_SQL`) -- and only `finishing`: a `running`
  * run with a closed task is not a finish to resume. Bounded, so a run whose
  * finish cannot complete is not handed round for ever.
  */
@@ -1081,7 +1104,7 @@ export async function requeueUnfinishedAppRuns(): Promise<number> {
         AND executor = 'brain'
         AND (status IN ('cancelling','cancelled','failed')
              OR (status IN ('preparing','running') AND metadata->'app_finish_prior' IS NOT NULL))
-        AND ${LEASE_GONE_SQL}
+        AND (${LEASE_GONE_SQL} OR ${FINISH_DISPATCH_UNACCEPTED_SQL})
         AND (completed_at IS NULL OR completed_at < NOW() - ($1::int * INTERVAL '1 second'))
         AND COALESCE((metadata->>'app_finish_requeues')::int, 0) < $2::int
         AND EXISTS (SELECT 1 FROM claw_app_runs r
