@@ -218,9 +218,58 @@ cd connector
 npm ci
 npm run typecheck && npm test      # node:test against a stand-in Claw and a stand-in ACP adapter (real processes, real sockets)
 npm run build                      # dist/cli.js: one file; the wire contract from claw/packages/protocol is compiled in
-node scripts/check-pack.mjs        # the package ships only dist/cli.js, README.md, LICENSE and package.json
+node scripts/check-pack.mjs        # packs the tarball: it must hold only dist/cli.js, README.md, LICENSE and package.json
 npm pack && npm install -g ./primusclaw-connector-*.tgz   # the package as the registry serves it, from a checkout
 ```
 
-A release is a tag `connector-vX.Y.Z` on a commit of `main` whose `connector/package.json` has that version: see
-[.github/workflows/connector-release.yml](https://github.com/AMD-AGI/PrimusClaw/blob/main/.github/workflows/connector-release.yml).
+## Releasing (maintainers)
+
+A release is a GitHub Release whose tag is `connector-vX.Y.Z`, cut the way Hyperloom's are. Publishing it starts
+[connector-release.yml](https://github.com/AMD-AGI/PrimusClaw/blob/main/.github/workflows/connector-release.yml): it builds, tests and
+checks the tarball, signs a build-provenance attestation for it, attaches it to the release and publishes it to npm with Trusted Publishing
+(an OIDC credential; no npm token is stored anywhere). Only stable `MAJOR.MINOR.PATCH` versions are released: a prerelease needs a dist-tag,
+which OIDC publishing sets only with a newer npm and a separate permission on the Trusted Publisher entry.
+
+**What stops an unreviewed publish.** A release runs the workflow file as it exists at its tag, and a tag can point at any commit, so the
+checks inside that file (tag shape, the commit being in `main`, the environment below having reviewers) catch honest mistakes and are not the
+control. The control is the GitHub environment `npm-publish`: its required reviewers must approve the `publish` job, and the Trusted Publisher
+entry on npmjs.com names that environment, so npm hands the publish credential to no other job. Only the `publish` job, which checks out and
+installs nothing, runs behind it. `scripts/release-tests/connector-release-workflow.sh`, run on every change by the Connector packaging
+workflow, fails if the workflow file stops having that shape.
+
+**One-time setup** (a repository admin, and a member of the `primusclaw` npm organisation). The order matters.
+
+1. Create the environment `npm-publish` (repository Settings > Environments) with **Required reviewers** (the people who may publish),
+   **Prevent self-review** on and **Allow administrators to bypass** off. The release run refuses to build until all three hold. To narrow who can
+   start a run at all, add a tag ruleset restricting who may create `refs/tags/connector-v*`; a deployment tag rule on the environment alone does not
+   help, since the tag of an unreviewed commit matches it too.
+2. Publish 0.1.0 once by hand from a clean checkout of the merged `main` (the package must exist before it can be given a Trusted Publisher):
+   `cd connector && npm ci && npm publish --access public`, logged in to npm with 2FA.
+3. On npmjs.com, Packages > `@primusclaw/connector` > Settings > Trusted publishing > GitHub Actions: Organization `AMD-AGI`, Repository
+   `PrimusClaw`, Workflow filename `connector-release.yml`, Environment `npm-publish` (all case-sensitive; create the entry only after step 1).
+   Allowed actions: `npm publish`, which is what the workflow runs; leave dist-tag management off. The entry must see its first successful
+   publish within 2 days or it expires.
+4. Settings > Publishing access: require two-factor authentication and disallow tokens.
+
+**Cutting a release.**
+
+1. Set the new version in `package.json` and `src/version.ts` (`scripts/check-pack.mjs` fails if they disagree) and merge that to `main`.
+2. Write the release notes from the PR descriptions, not from commit subjects: every change states in its PR what a user will now observe.
+   For the PRs that touched `connector/` since the previous release (`prev` is its tag, or for the first workflow release the commit 0.1.0 was
+   published from):
+   ```sh
+   prev=connector-v0.1.0
+   git fetch origin main --tags
+   for n in $(git log --first-parent --format=%s "$prev"..origin/main -- connector/ | grep -o '(#[0-9]*)$' | tr -d '(#)'); do
+     gh pr view "$n" --repo AMD-AGI/PrimusClaw --json number,title,body --jq '"## #\(.number) \(.title)\n\n\(.body)\n"'
+   done > notes.md
+   ```
+   Edit `notes.md` into the notes a user of the package wants to read.
+3. Publish the release on the merged commit (not as a pre-release):
+   `gh release create connector-v0.1.1 --target <sha-on-main> --title "claw-connector 0.1.1" --notes-file notes.md`
+4. The `package` job runs and writes a summary: the commit, whether the release workflow at that commit equals the one on `main`, and the
+   tarball's name, sha256 and files. A reviewer opens the run, checks that the tagged commit is the reviewed one on `main` and that the
+   workflow file is `main`'s (if the summary says it is different, read the diff first), and approves `publish`. The job then attests the
+   tarball, attaches it to the release and publishes it.
+5. Check it: `npm view @primusclaw/connector version`, and `gh attestation verify primusclaw-connector-0.1.1.tgz --repo AMD-AGI/PrimusClaw`
+   on the tarball attached to the release.

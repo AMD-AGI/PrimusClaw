@@ -122,13 +122,6 @@ jobs:
           npm run build
           node dist/cli.js --version
 
-      # What `npm publish` would upload (connector-release.yml does it on a tag): only the
-      # bundle, README and LICENSE, the bin and engines fields, and a version the built CLI
-      # reports. Checked here on every change so a release is never the first time anyone looks.
-      - name: The package ships only what it should
-        working-directory: connector
-        run: node scripts/check-pack.mjs
-
   sandbox:
     name: Sandbox (Go)
     runs-on: ubuntu-latest

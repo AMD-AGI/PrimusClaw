@@ -118,13 +118,15 @@ record it.
   confirmed is not opened); the adapter's own permission options passed through verbatim, including
   allow-always; credentials masked before upload; a local audit log; a kill switch that stops only the
   process groups it started. See `connector/README.md`.
-- `@primusclaw/connector` on npm: pushing a tag `connector-vX.Y.Z` to a commit of `main` runs
-  `.github/workflows/connector-release.yml`, which tests the connector and publishes it with npm Trusted
-  Publishing (a short-lived OIDC credential and a provenance statement; no stored npm token). The tag
-  must equal the version in `connector/package.json`. Once a tag has been published,
+- `@primusclaw/connector` on npm: publishing a GitHub Release tagged `connector-vX.Y.Z` runs
+  `.github/workflows/connector-release.yml`, which tests the connector, signs a build-provenance attestation
+  for the tarball, attaches it to the release and publishes it with npm Trusted Publishing (a short-lived OIDC
+  credential and a provenance statement; no stored npm token). The publish waits for the required reviewers
+  of the `npm-publish` environment, which is what keeps an unreviewed commit from being published. The tag
+  must equal the version in `connector/package.json`. Once a release has been published,
   `npm install -g @primusclaw/connector` installs the `claw-connector` command (Node.js 22 or newer).
-  The package holds only the bundle, README and LICENSE, and CI checks that on every change
-  (`connector/scripts/check-pack.mjs`).
+  The package holds only the bundle, README and LICENSE, and the Connector packaging workflow checks a real
+  tarball on every change (`connector/scripts/check-pack.mjs`), together with the shape of the release workflow.
 - A shared identity client in `@claw/utils`, built by API and Brain when
   `IDENTITY_CLIENT_ENABLED=true` (off by default; it authenticates a request only through the access-token
   credentials above, a connector's and an identity provider's). It does OIDC
