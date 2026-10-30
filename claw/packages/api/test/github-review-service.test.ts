@@ -458,6 +458,51 @@ describe("M3 the model's flags", () => {
   });
 });
 
+describe("M4 a change the diff does not show, and a lock file", () => {
+  // GitHub counts a modified or renamed binary as 0 lines and sends no patch for it.
+  const binaries: Array<[string, Record<string, unknown>]> = [
+    ["a modified shared library", { filename: "vendor/lib/libfoo.so", status: "modified", additions: 0, deletions: 0 }],
+    ["a modified wrapper jar", { filename: "gradle/wrapper/gradle-wrapper.jar", status: "modified", additions: 0, deletions: 0 }],
+    ["a renamed binary", { filename: "vendor/lib/libbar.so", previous_filename: "vendor/lib/libfoo.so", status: "renamed", additions: 0, deletions: 0 }],
+  ];
+
+  test("M12 a binary that GitHub counts as 0 lines is high risk, sends the review to a sandbox, holds an APPROVE and holds the merge for the acting user", async () => {
+    for (const [what, file] of binaries) {
+      e = await reviewEnv(); // a request budget of its own for each case: the three calls below make about thirty requests
+      e.gh.files = [file as never];
+      e.gh.pr.changed_files = 1;
+      e.gh.pr.additions = 0;
+      e.gh.pr.deletions = 0;
+      const b = (await get()).body as any;
+      assert.equal(b.risk.level, "high", what);
+      assert.match(b.risk.reasons.join(), /diff not readable/, what);
+      assert.equal(b.review_path.path, "sandbox", what);
+      assert.equal(b.review_path.reason, "diff_not_available", what);
+      assert.equal(b.files[0].has_diff, false, what);
+      assert.equal(reason(await submit({ event: "APPROVE" })), "high_risk_approval", what);
+      const m = await merge();
+      assert.equal(m.body.status, "confirmation_required", what);
+      assert.match(String((m.body.reasons as string[]).join()), /diff not readable/, what);
+      assert.equal(e.gh.writes.length, 0, what);
+      assert.equal(puts().length, 0, what);
+    }
+  });
+
+  test("M13 a lock file is held whatever manifest the same change edits", async () => {
+    e.gh.files = [
+      { filename: "package.json", status: "modified", additions: 1, deletions: 0, patch: "@@ -1,2 +1,3 @@\n {\n+  \"description\": \"x\",\n }" },
+      { filename: "package-lock.json", status: "modified", additions: 2, deletions: 2, patch: "@@ -10,4 +10,4 @@\n \"left-pad\": {\n-  \"resolved\": \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\",\n+  \"resolved\": \"https://example.invalid/left-pad.tgz\",\n }" },
+    ];
+    e.gh.pr.changed_files = 2;
+    const risk = (await e.service.assessPr(e.actor, { pr: PR })).body.risk as any;
+    assert.equal(risk.level, "high");
+    assert.match(risk.reasons.join(), /lock file changed/);
+    assert.equal((await merge()).body.status, "confirmation_required");
+    assert.equal(reason(await submit({ event: "APPROVE" })), "high_risk_approval");
+    assert.equal(e.gh.writes.length, 0);
+  });
+});
+
 describe("C high risk waits for the acting user", () => {
   beforeEach(() => {
     allowed();

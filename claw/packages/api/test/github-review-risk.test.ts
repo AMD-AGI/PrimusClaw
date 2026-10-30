@@ -8,7 +8,7 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { assessRisk, globToRegExp, parseClawyConfig, RISK_RULE_PACK_VERSION, type RiskFile, type RiskInput } from "../src/github-review/risk.js";
+import { assessRisk, diffNotSent, globToRegExp, parseClawyConfig, RISK_RULE_PACK_VERSION, type RiskFile, type RiskInput } from "../src/github-review/risk.js";
 
 const file = (path: string, patch = "@@ -1,1 +1,2 @@\n a\n+b", over: Partial<RiskFile> = {}): RiskFile => ({ path, status: "modified", additions: 1, deletions: 0, patch, ...over });
 const input = (files: RiskFile[], over: Partial<RiskInput> = {}): RiskInput => ({
@@ -59,6 +59,11 @@ const HIGH: Array<[string, RiskInput, RegExp]> = [
   ["a requirements line", input([file("requirements.txt", patchWith("requests>=2.31"))]), /dependency added/],
   ["a dependency from a git url", input([file("package.json", patchWith('"x": "git+https://example.invalid/x.git"'))]), /git or URL source/],
   ["a lock file alone", input([file("package-lock.json")]), /lock file/],
+  // A manifest edited anywhere in the change must not switch the lock-file rule off: the lock decides what is downloaded.
+  ["a lock file beside a manifest edit that adds no dependency", input([file("package.json", patchWith('"description": "x"')), file("package-lock.json", patchWith('"resolved": "https://example.invalid/evil.tgz"', '"integrity": "sha512-AAAA"'))]), /lock file/],
+  ["a lock file with the only manifest edit in another directory", input([file("tools/cli/package.json", patchWith('"description": "x"')), file("package-lock.json", patchWith('"integrity": "sha512-AAAA"'))]), /lock file/],
+  ["a lock file with a manifest that only lost a dependency", input([file("package.json", "@@ -1,2 +1 @@\n a\n-\"left-pad\": \"^1.3.0\"", { additions: 0, deletions: 1 }), file("package-lock.json", patchWith('"integrity": "sha512-AAAA"'))]), /lock file/],
+  ["a renamed lock file", input([file("docs/lock.txt", undefined, { status: "renamed", previousPath: "package-lock.json", patch: "@@ -1 +1,2 @@\n a\n+b" })]), /lock file/],
   ["more than 300 deleted lines", input([file("src/a.ts", undefined, { additions: 0, deletions: 301 })], { deletions: 301 }), /lines deleted/],
   ["mostly deletions", input([file("src/a.ts", undefined, { additions: 20, deletions: 120 })], { additions: 20, deletions: 120 }), /mostly deletions/],
   ["more than 1000 changed lines", input([file("src/a.ts")], { additions: 1001 }), /large change/],
@@ -66,6 +71,14 @@ const HIGH: Array<[string, RiskInput, RegExp]> = [
   ["more than 5 files deleted", input(Array.from({ length: 6 }, (_, i) => file(`src/f${i}.ts`, undefined, { status: "removed", additions: 0, deletions: 1 }))), /files deleted/],
   ["a test directory emptied", input(Array.from({ length: 3 }, (_, i) => file(`test/unit/t${i}.ts`, undefined, { status: "removed", additions: 0, deletions: 1 }))), /test files deleted/],
   ["a binary or too-large diff", input([file("data/model.bin", undefined, { patch: undefined, additions: 5000 })]), /not readable/],
+  // GitHub counts a modified or renamed binary as 0 lines and sends no patch for it: the missing patch is the signal, not the counts.
+  ["a modified binary at an ordinary path", input([file("vendor/lib/libfoo.so", undefined, { patch: undefined, additions: 0, deletions: 0 })]), /not readable/],
+  ["a modified wrapper jar", input([file("gradle/wrapper/gradle-wrapper.jar", undefined, { patch: undefined, additions: 0, deletions: 0 })]), /not readable/],
+  ["a modified file of model weights", input([file("models/tiny.safetensors", undefined, { patch: undefined, additions: 0, deletions: 0 })]), /not readable/],
+  ["a renamed binary", input([file("vendor/lib/libbar.so", undefined, { status: "renamed", previousPath: "vendor/lib/libfoo.so", patch: undefined, additions: 0, deletions: 0 })]), /not readable/],
+  ["a copied binary", input([file("vendor/lib/libbaz.so", undefined, { status: "copied", previousPath: "vendor/lib/libfoo.so", patch: undefined, additions: 0, deletions: 0 })]), /not readable/],
+  ["a removed file that came without a diff", input([file("vendor/lib/libfoo.so", undefined, { status: "removed", patch: undefined, additions: 0, deletions: 0 })]), /not readable/],
+  ["an added file with no readable content", input([file("vendor/empty.bin", undefined, { status: "added", patch: undefined, additions: 0, deletions: 0 })]), /not readable/],
   ["a submodule pointer", input([file("vendor/lib", "@@ -1 +1 @@\n-Subproject commit aaa\n+Subproject commit bbb")]), /submodule/],
   ["a file mode change", input([file("run.sh", undefined, { status: "changed" })]), /mode or type/],
   ["a fork", input([file("src/a.ts")], { fork: true }), /fork/],
@@ -92,7 +105,6 @@ const LOW: Array<[string, RiskInput]> = [
   ["source and tests", input([file("src/render.ts"), file("test/render.test.ts")])],
   ["documentation", input([file("docs/guide.md"), file("README.md")])],
   ["a manifest edit that adds no dependency", input([file("package.json", patchWith('"description": "A tool"'))])],
-  ["a manifest and its lock together", input([file("package.json", patchWith('"description": "A tool"')), file("package-lock.json")])],
   ["a small deletion", input([file("src/a.ts", undefined, { additions: 1, deletions: 40 })], { additions: 1, deletions: 40 })],
   ["a file named like a secret word inside source code", input([file("src/author.ts")])],
   ["a word that only contains 'session' as a substring", input([file("src/obsessional.ts")])],
@@ -152,9 +164,34 @@ test("a file moved out of a protected path is judged by where it was, not only w
     assert.match(r.reasons.join("\n"), why, `${from} -> ${to}`);
     assert.equal(r.reasons.some((x) => x.includes(`${from} (moved to ${to})`)), true, `${from} -> ${to}`);
   }
-  // A removed governance file is held too, and an ordinary rename is not.
+  // A removed governance file is held too, and a rename that comes with its diff is not.
   assert.equal(assessRisk(input([file(".github/workflows/ci.yml", undefined, { status: "removed", additions: 0, deletions: 4 })])).level, "high");
-  assert.deepEqual(assessRisk(input([moved("src/a.ts", "src/b.ts")])).reasons, []);
+  assert.deepEqual(assessRisk(input([file("src/b.ts", undefined, { status: "renamed", previousPath: "src/a.ts" })])).reasons, []);
+});
+
+test("a file that came without its diff is held whatever its status and counts say, and the rule that holds it is the one the review path reads", () => {
+  for (const status of ["modified", "renamed", "copied", "removed", "added", "changed"]) {
+    for (const [additions, deletions] of [[0, 0], [0, 7], [7, 0], [7, 7]]) {
+      const r = assessRisk(input([file("vendor/lib/libfoo.so", undefined, { status, patch: undefined, additions, deletions })]));
+      assert.equal(r.level, "high", `${status} +${additions} -${deletions}`);
+      assert.match(r.reasons.join("\n"), /diff not readable/, `${status} +${additions} -${deletions}`);
+    }
+  }
+  assert.equal(diffNotSent({ patch: undefined }), true);
+  assert.equal(diffNotSent({ patch: "" }), false, "an empty patch is a patch GitHub sent");
+  assert.equal(diffNotSent({ patch: "@@ -1 +1 @@\n-a\n+b" }), false);
+});
+
+test("a lock file is held, in every ecosystem's spelling, whatever else the change contains", () => {
+  for (const name of ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "go.sum", "poetry.lock", "uv.lock", "Cargo.lock", "Gemfile.lock", "tools/cli/package-lock.json"]) {
+    const alone = assessRisk(input([file(name)]));
+    assert.equal(alone.level, "high", name);
+    assert.match(alone.reasons.join("\n"), /lock file changed/, name);
+    // The manifest beside it changes metadata only, which is what an attacker's change would look like.
+    const beside = assessRisk(input([file("package.json", patchWith('"description": "x"')), file("go.mod", patchWith("// x")), file(name)]));
+    assert.equal(beside.level, "high", `${name} beside manifests`);
+    assert.match(beside.reasons.join("\n"), /lock file changed/, `${name} beside manifests`);
+  }
 });
 
 test("a changed line that begins with ++ is read by the line rules like any other", () => {

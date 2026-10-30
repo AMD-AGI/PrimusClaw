@@ -75,9 +75,12 @@ tool offered to a session, and `config.acting_as` is refused.
 - **High risk.** A versioned rule pack (`packages/api/src/github-review/risk.ts`) decides.
   It holds a merge for the acting user's own confirmation when a change touches CI,
   workflows or governance files, authentication or security code, secret handling, release
-  or deployment files, dependencies, is large or mostly deletions, is a fork or from a
+  or deployment files, dependencies (a lock file is held whatever else the change edits, since it decides
+  what an install downloads), is large or mostly deletions, is a fork or from a
   non-member, targets a branch other than the default, or when anything cannot be read (the
-  rules fail closed). A file that was moved is judged by the path it left as well as the one it
+  rules fail closed: a file that came without its diff is held whatever its status and line counts
+  say, since GitHub sends none for a binary, a rename or a diff it finds too large, and counts a modified
+  or renamed binary as 0 lines). A file that was moved is judged by the path it left as well as the one it
   went to, and a line that starts with `++` or `--` is read like any other. A repository's `.github/clawy.yml` on the base branch can add paths
   (`high_risk_paths`) or ask for confirmation on every merge (`confirm_merge: always`).
   A merge that needs confirmation creates one pending row for the head commit and merges
@@ -88,7 +91,7 @@ tool offered to a session, and `config.acting_as` is refused.
 | Route | Purpose |
 |---|---|
 | `GET /v1/github-review/confirmations?session_id=<id>&status=pending` | The confirmations of the caller's own sessions and those that ask the caller. `{items:[{id, repo, pr, title, author, head_sha, reasons, checks, actor_user_id, requester_user_id, session_id, expires_at, status}]}` |
-| `POST /v1/github-review/confirmations/:id/decision` `{decision: "allow" \| "deny"}` | The acting user's answer. Anyone else gets `403`. On `allow` every gate is read again and the merge is made with the acting user's account; the answer is `{status: "merged" \| "denied" \| "stale" \| "expired" \| "refused" \| "retry", reason, merge_sha}`. `retry` means the merge could not be tried just now (the identity service or GitHub failed, a limit was hit) before anything was sent to GitHub, and the confirmation is still open: allow it again. Once an approval or a merge has been sent the try is not given back: the confirmation is closed as `refused` with `wrote: true`. The merge is recorded as asked for by the requester, not by the acting user |
+| `POST /v1/github-review/confirmations/:id/decision` `{decision: "allow" \| "deny"}` | The acting user's answer, given signed in: a browser session (the `Token` cookie) or an identity provider's access token. Anyone else gets `403`, and so does the acting user with an `ak-` key (`Authorization: Bearer` or `x-api-key`) or a BYOK key, whatever the id: the sandbox of a session holds its owner's key, and in a session that acts as its owner a model could otherwise answer its own confirmation (`403 interactive_sign_in_required`; the check is on how the request was authenticated, before the confirmation is looked up). On `allow` every gate is read again and the merge is made with the acting user's account; the answer is `{status: "merged" \| "denied" \| "stale" \| "expired" \| "refused" \| "retry", reason, merge_sha}`. `retry` means the merge could not be tried just now (the identity service or GitHub failed, a limit was hit) before anything was sent to GitHub, and the confirmation is still open: allow it again. Once an approval or a merge has been sent the try is not given back: the confirmation is closed as `refused` with `wrote: true`. The merge is recorded as asked for by the requester, not by the acting user |
 
 A confirmation lives 24 hours (`CLAW_GITHUB_CONFIRMATION_TTL_SECONDS`), is bound to the head
 commit (a head that moved makes it `stale`) and is used once.
@@ -98,7 +101,7 @@ commit (a head that moved makes it `stale`) and is used once.
 A sandbox costs a cold start of about 16 seconds. A small change needs none: `gh_pr_get`
 returns the diff, the file list and the metadata, and says `review_path.path = "api_diff"`.
 A sandbox is allowed (`"sandbox"`) when the change is large, GitHub did not send the diff of
-some file, the file list is incomplete, or the repository has a review skill of its own, which
+some file (a binary, a rename or a diff too large, whatever the line counts say), the file list is incomplete, or the repository has a review skill of its own, which
 may use scripts. Brain opens a sandbox only when a turn uses a sandbox tool, so the decision is
 advice plus a record: a structured log line (`github_review.path_chosen` with `review_path`,
 `review_path_reason`, `session_id`, `repo`, `pr`, `changed_files`, `changed_lines`) and the

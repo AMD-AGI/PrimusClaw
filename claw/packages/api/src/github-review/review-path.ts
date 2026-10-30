@@ -22,7 +22,7 @@ export interface ReviewPathInput {
   changedLines: number;
   /** Every changed file was listed. */
   filesComplete: boolean;
-  /** Some changed file came without a diff (binary, or too large for GitHub to send). */
+  /** Some changed file came without a diff: a binary, a rename, or one too large for GitHub to send (risk.ts `diffNotSent`). */
   diffMissing: boolean;
   /** The repository has a review skill of its own, which may use scripts. */
   repoSkill: boolean;

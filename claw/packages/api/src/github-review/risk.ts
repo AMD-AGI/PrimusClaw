@@ -16,7 +16,7 @@
  */
 import { addedLines, removedLines } from "./diff.js";
 
-export const RISK_RULE_PACK_VERSION = "2026-10-29.2";
+export const RISK_RULE_PACK_VERSION = "2026-10-30.1";
 
 export interface RiskFile {
   path: string;
@@ -34,6 +34,16 @@ export interface RepoConfig {
   confirmMerge: "always" | "risk";
   /** Extra globs (`*` within a segment, `**` across segments) that make a change high risk. */
   highRiskPaths: string[];
+}
+
+/**
+ * Whether this file's change was not sent as a diff. GitHub omits `patch` for a binary, for a diff it considers too
+ * large, and for a rename or a modified binary it counts as 0 lines, so the status and the counts cannot be used to
+ * tell "nothing to read" from "nothing was shown": the absence is the only signal, and it is read the same way by the
+ * risk rules and by the choice of review path.
+ */
+export function diffNotSent(f: Pick<RiskFile, "patch">): boolean {
+  return f.patch === undefined;
 }
 
 export interface RiskInput {
@@ -220,15 +230,18 @@ function assess(input: RiskInput): string[] {
       if (RELEASE_PATHS.some((re) => re.test(q))) add(`release or deployment file changed: ${where}`);
       if (extraGlobs.some((re) => re.test(q))) add(`path the repository marks high risk: ${where}`);
     }
-    if (LOCKS.test(p) && !input.files.some((o) => MANIFESTS.test(o.path))) add(`a lock file changed without its manifest: ${p}`);
+    // A lock file decides which tarball or checksum an install fetches, and nothing here reads its lines. A manifest
+    // edited somewhere else in the same change says nothing about it, so a lock file is held whatever else changed:
+    // a real dependency change is held by the manifest rule below in any case.
+    if (LOCKS.test(p) || (f.previousPath !== undefined && LOCKS.test(f.previousPath))) add(`lock file changed (it decides what an install downloads): ${p}`);
     if (f.status === "removed") {
       removedFiles += 1;
       const dir = p.replace(/\/[^/]*$/, "");
       if (TEST_DIR.test(p)) removedInTests.set(dir, (removedInTests.get(dir) ?? 0) + 1);
     }
     if (f.status === "changed") add(`file mode or type changed: ${p}`);
-    if (f.patch === undefined && f.additions + f.deletions > 0) add(`diff not readable (binary or too large): ${p}`);
-    if (f.patch === undefined && f.status === "added" && f.additions + f.deletions === 0) add(`added file with no readable content: ${p}`);
+    // Whatever the status and the line counts say, a change that came without its diff was not read (see diffNotSent).
+    if (diffNotSent(f)) add(`diff not readable (binary, renamed without a diff, or too large): ${p}`);
 
     const added = addedLines(f.patch);
     const removed = removedLines(f.patch);

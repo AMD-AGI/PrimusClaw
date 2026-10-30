@@ -25,7 +25,7 @@ import { IdentityCredentialRefusedError, IdentityUnavailableError, type ResolveC
 import { evaluateChecks, requiredContextsFromRules, type ChecksVerdict } from "./checks.js";
 import { commentableLines } from "./diff.js";
 import { GithubClient, GithubError, parsePrRef, repoPath, type PrRef } from "./github.js";
-import { MAX_FILES_READ, assessRisk, parseClawyConfig, type RepoConfig, type RiskFile, type RiskResult } from "./risk.js";
+import { MAX_FILES_READ, assessRisk, diffNotSent, parseClawyConfig, type RepoConfig, type RiskFile, type RiskResult } from "./risk.js";
 import { selectReviewInstructions } from "./repo-skill.js";
 import { chooseReviewPath, reviewPathAdvice } from "./review-path.js";
 import { SANDBOX_RECIPE_USAGE, buildSandboxRecipe } from "./sandbox-recipe.js";
@@ -186,7 +186,7 @@ export class GithubReview {
       const instructions = await selectReviewInstructions(ctx.client, ref, pr.baseRef);
       const choice = chooseReviewPath({
         changedFiles: pr.changedFiles, changedLines: pr.additions + pr.deletions, filesComplete: change.complete,
-        diffMissing: change.files.some((f) => f.patch === undefined && f.additions + f.deletions > 0),
+        diffMissing: change.files.some(diffNotSent),
         repoSkill: instructions.source === "repository",
       }, ctx.settings);
       const recipe = choice.path === "sandbox" ? buildSandboxRecipe({ ref, baseRef: pr.baseRef, headSha: pr.headSha }) : null;
@@ -809,7 +809,7 @@ export class GithubReview {
       ctx.acc.confirmationId = c.id;
       return {
         status: "confirmation_required", confirmation_id: c.id, expires_at: c.expiresAt, reasons: risk.reasons,
-        message: `This change is high risk, so ${ctx.cred.login} is asked to confirm the merge. Nothing was merged. Say that the merge waits for their decision and give the reasons.`,
+        message: `This change is high risk, so ${ctx.cred.login} is asked to confirm the merge. Nothing was merged. Say that the merge waits for their decision and give the reasons. They answer it signed in, in their own session: no tool or key of yours can, so do not try.`,
       };
     }
 

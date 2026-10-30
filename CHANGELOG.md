@@ -73,7 +73,9 @@ record it.
   commit pinned, the acting user's own permission and their setting for others acting for them (without it,
   comments only), CI green on the head commit, no unresolved thread, GitHub's merge state `CLEAN`, a versioned
   high-risk rule pack that holds a merge for the acting user's confirmation
-  (`GET /v1/github-review/confirmations`, `POST .../:id/decision`), rate limits, a request budget per session, a
+  (`GET /v1/github-review/confirmations`, `POST .../:id/decision`, which takes a signed-in person's session or
+  identity token and refuses the `ak-` or BYOK key a sandbox holds; a file that came without its diff and a
+  lock file are high risk), rate limits, a request budget per session, a
   dry-run switch and an audit row per call (`claw_github_audit`). A small change is reviewed from the diff
   without starting a sandbox; the path taken is logged and audited, and the thresholds are
   `CLAW_GITHUB_REVIEW_FAST_MAX_FILES` / `_MAX_CHANGED_LINES`. A repository's own review skill is read from the

@@ -7,7 +7,7 @@
  *
  *   A  who may call: the token, the session row and its owner
  *   B  what a tool call is: four tools, errors as errors, nothing secret in an answer
- *   C  the confirmation routes: only the acting user decides
+ *   C  the confirmation routes: only the acting user decides, and only by signing in (C3: not with the key a sandbox holds)
  *   D  with the feature off, nothing exists
  */
 import assert from "node:assert/strict";
@@ -32,7 +32,13 @@ async function boot(opts: { enabled?: boolean } = {}): Promise<void> {
   app.addHook("preHandler", async (req) => {
     // Stands in for the global authentication hook, as the other route tests do.
     const who = req.headers["x-test-user"];
-    if (typeof who === "string") (req as unknown as { user: unknown }).user = { userId: who, userName: who, roles: ["default"], platformKey: "", virtualKey: "" };
+    if (typeof who === "string") {
+      (req as unknown as { user: unknown }).user = { userId: who, userName: who, roles: ["default"], platformKey: "", virtualKey: "" };
+      // How the caller signed in is what the hook records beside the user (auth/request-credential.ts): a browser session unless a test
+      // says otherwise, and `none` for a credential the hook records no method for (a BYOK key, the development bypass).
+      const method = req.headers["x-test-method"];
+      if (method !== "none") (req as unknown as { authMethod: string }).authMethod = typeof method === "string" ? method : "cookie";
+    }
   });
   await registerGithubReviewRoutes(app, { enabled: opts.enabled ?? true, settings: () => e.settings, db: e.db, service: e.service });
   await app.listen({ port: 0, host: "127.0.0.1" });
@@ -178,8 +184,8 @@ describe("C confirmations over HTTP", () => {
     await call(c, "gh_pr_merge", { pr: PR, head_sha: HEAD });
     await c.close();
   });
-  const http = async (user: string | null, method: string, path: string, body?: unknown) => {
-    const r = await fetch(base + path, { method, headers: { ...(user ? { "x-test-user": user } : {}), ...(body === undefined ? {} : { "content-type": "application/json" }) }, body: body === undefined ? undefined : JSON.stringify(body) });
+  const http = async (user: string | null, method: string, path: string, body?: unknown, signedInWith?: string) => {
+    const r = await fetch(base + path, { method, headers: { ...(user ? { "x-test-user": user } : {}), ...(signedInWith ? { "x-test-method": signedInWith } : {}), ...(body === undefined ? {} : { "content-type": "application/json" }) }, body: body === undefined ? undefined : JSON.stringify(body) });
     return { status: r.status, body: (await r.json().catch(() => null)) as any };
   };
 
@@ -218,6 +224,76 @@ describe("C confirmations over HTTP", () => {
     const again = await http("u-bob", "POST", path, { decision: "allow" });
     assert.equal(again.body.status, "refused");
     assert.equal(e.gh.calls.filter((x) => x.method === "PUT").length, 1);
+  });
+});
+
+describe("C3 who may answer for the acting user", () => {
+  beforeEach(async () => {
+    await boot();
+    e.identity.answer = async () => credential({ delegation: true });
+    e.gh.files = [{ filename: ".github/workflows/ci.yml", status: "modified", additions: 1, deletions: 0, patch: "@@ -1 +1,2 @@\n a\n+b" }];
+    e.gh.graphql.mergeStateStatus = "BLOCKED";
+    e.gh.onReview = (r) => { if (r.event === "APPROVE") e.gh.graphql.mergeStateStatus = "CLEAN"; };
+  });
+  const decide = async (id: string, decision: unknown, signedInWith?: string, user = "u-bob") => {
+    const r = await fetch(`${base}/v1/github-review/confirmations/${id}/decision`, {
+      method: "POST",
+      headers: { "x-test-user": user, "content-type": "application/json", ...(signedInWith ? { "x-test-method": signedInWith } : {}) },
+      body: JSON.stringify({ decision }),
+    });
+    return { status: r.status, body: (await r.json().catch(() => null)) as any };
+  };
+  const hold = async (): Promise<string> => {
+    const c = await connect(token());
+    const held = await call(c, "gh_pr_merge", { pr: PR, head_sha: HEAD });
+    await c.close();
+    assert.equal(held.body.status, "confirmation_required");
+    return held.body.confirmation_id as string;
+  };
+  const status = async (id: string) => (await e.sql("SELECT status FROM claw_github_confirmations WHERE confirmation_id = $1", [id]))[0]?.status;
+
+  test("C3 the model cannot answer its own confirmation with the key its sandbox holds: an ak- key, an x-api-key, a query token, a BYOK key (no method) and a connector token are all 403", async () => {
+    // The session's owner is also the acting user (the self case): the key in the sandbox is that user's own.
+    await e.sql("UPDATE claw_sessions SET user_id = 'u-bob', config = $1::jsonb WHERE session_id = 's-1'", [JSON.stringify({ acting_as: "u-bob", acting_as_requester: "Bob B" })]);
+    const c = await connect(token({ requesterUserId: "u-bob" }));
+    const held = await call(c, "gh_pr_merge", { pr: PR, head_sha: HEAD });
+    await c.close();
+    assert.equal(held.body.status, "confirmation_required");
+    const id = held.body.confirmation_id as string;
+    for (const how of ["api_key", "x_api_key", "query_token", "connector_token", "none", "something_new"]) {
+      for (const decision of ["allow", "deny", "nonsense"]) {
+        const r = await decide(id, decision, how);
+        assert.equal(r.status, 403, `${how} ${decision}`);
+        assert.equal(r.body.error, "interactive_sign_in_required", `${how} ${decision}`);
+      }
+    }
+    assert.equal(await status(id), "pending", "the confirmation is untouched");
+    assert.equal(e.gh.writes.length, 0, "nothing was approved");
+    assert.equal(e.gh.calls.filter((x) => x.method === "PUT").length, 0, "nothing was merged");
+    // The same person, signed in the way a person signs in, can.
+    const ok = await decide(id, "allow", "cookie");
+    assert.equal(ok.status, 200);
+    assert.equal(ok.body.status, "merged");
+    assert.equal(e.gh.calls.filter((x) => x.method === "PUT").length, 1);
+  });
+
+  test("C4 an identity provider's access token and a browser session both decide; a deny made with either is final", async () => {
+    for (const how of ["cookie", "identity_token"]) {
+      await e.sql("DELETE FROM claw_github_confirmations");
+      const id = await hold();
+      const r = await decide(id, "deny", how);
+      assert.equal(r.status, 200, how);
+      assert.equal(r.body.status, "denied", how);
+      assert.equal(await status(id), "denied", how);
+    }
+  });
+
+  test("C5 the credential is judged before the confirmation is looked up, so a refused caller learns nothing about which ids exist", async () => {
+    const missing = "00000000-0000-4000-8000-000000000000";
+    assert.deepEqual((await decide(missing, "allow", "api_key")).body, { ok: false, error: "interactive_sign_in_required" });
+    const id = await hold();
+    assert.deepEqual((await decide(id, "allow", "api_key")).body, { ok: false, error: "interactive_sign_in_required" });
+    assert.equal((await decide(missing, "allow", "cookie")).status, 404);
   });
 });
 

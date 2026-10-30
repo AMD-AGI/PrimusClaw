@@ -11,7 +11,8 @@
  *    `/v1/internal/`, which the global authentication hook leaves to the route.
  *  - `GET /v1/github-review/confirmations` and `POST .../:id/decision`: a merge held
  *    for the acting user, and their answer. Ordinary authenticated routes; only the
- *    acting user can decide.
+ *    acting user can decide, and only with an interactive sign-in (see
+ *    {@link INTERACTIVE_CREDENTIALS}): the key a session's sandbox holds is not one.
  *
  * Nothing is registered unless `CLAW_GITHUB_REVIEW_ENABLED` is on.
  */
@@ -22,7 +23,9 @@ import { IdentityUnavailableError } from "@claw/utils";
 import pino from "pino";
 import { z } from "zod";
 import { identityClient } from "../auth/identity.js";
+import { IDENTITY_TOKEN_METHOD } from "../auth/identity-token.js";
 import { getUser } from "../auth/middleware.js";
+import { getAuthMethod } from "../auth/request-credential.js";
 import { CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
 import { db } from "../infra/db.js";
 import { parseActingAs } from "./acting-as.js";
@@ -104,6 +107,20 @@ function refuse(reply: FastifyReply, status: number, error: string): FastifyRepl
   return reply.status(status).send({ ok: false, error });
 }
 
+/**
+ * How a caller may have been authenticated to decide a held merge: a browser session
+ * (`cookie`) or an identity provider's access token (`identity_token`), which a person
+ * signs in for.
+ *
+ * Not an `ak-` key (`api_key`, `x_api_key`, `query_token`) and not a BYOK key (no method is
+ * recorded for it, so it is refused as well): the session owner's own key is placed in
+ * the session's sandbox as `SAFE_API_KEY` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, so a
+ * model that has just been handed a `confirmation_id` could otherwise answer it itself,
+ * as the acting user when they are also the session's owner. The gate is on how the
+ * request was authenticated, which a process in the sandbox cannot change.
+ */
+export const INTERACTIVE_CREDENTIALS: ReadonlySet<string> = new Set(["cookie", IDENTITY_TOKEN_METHOD]);
+
 const CONFIRMATION_STATUSES = new Set<string>(["pending", "merging", "merged", "denied", "stale", "expired", "refused"]);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -176,6 +193,11 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
   app.post<{ Params: { id: string } }>("/v1/github-review/confirmations/:id/decision", async (req, reply) => {
     const user = getUser(req);
     if (!user) return refuse(reply, 401, "authentication required");
+    const method = getAuthMethod(req);
+    if (method === null || !INTERACTIVE_CREDENTIALS.has(method)) {
+      logger.warn({ userId: user.userId, method: method ?? "none" }, "github_review.decision_refused_credential");
+      return refuse(reply, 403, "interactive_sign_in_required");
+    }
     const decision = ((req.body ?? {}) as { decision?: unknown }).decision;
     if (decision !== "allow" && decision !== "deny") return refuse(reply, 400, "decision must be allow or deny");
     if (!UUID_RE.test(req.params.id)) return refuse(reply, 404, "not_found");
