@@ -205,6 +205,16 @@ test("a lock file is held, in every ecosystem's spelling, whatever else the chan
   }
 });
 
+test("a manifest line that is very long costs a bounded amount to read, and is held for being too long", () => {
+  // `name.name/path v1` overlaps its own character classes: unbounded, it is quadratic in the length of the line.
+  const long = `${"a.".repeat(50_000)}/x v`;
+  const started = Date.now();
+  const r = assessRisk(input([file("go.mod", `@@ -1,1 +1,2 @@\n a\n+\t${long}`)]));
+  assert.ok(Date.now() - started < 1000, `took ${Date.now() - started} ms`);
+  assert.equal(r.level, "high");
+  assert.match(r.reasons.join("\n"), /too long to read/);
+});
+
 test("a changed line that begins with ++ is read by the line rules like any other", () => {
   for (const line of ["+  chmod 777 /data", "+x; rejectUnauthorized: false", "+-----BEGIN RSA PRIVATE KEY-----"]) {
     assert.equal(assessRisk(input([file("src/x.sh", patchWith(line))])).level, "high", line);

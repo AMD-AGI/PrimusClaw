@@ -31,7 +31,7 @@
  * {@link parseClawyConfig}); a pull request that edits that file is high risk.
  */
 import { addedLines, removedLines } from "./diff.js";
-import { contentFindings, isDoc, isSource, isTest, type Finding, type RiskCategory } from "./risk-signals.js";
+import { clipLine, contentFindings, isDoc, isSource, isTest, type Finding, type RiskCategory } from "./risk-signals.js";
 
 export type { Finding, RiskCategory } from "./risk-signals.js";
 
@@ -309,8 +309,9 @@ function assess(input: RiskInput): Finding[] {
     // Whatever the status and the line counts say, a change that came without its diff was not read (see diffNotSent).
     if (diffNotSent(f)) add("integrity", `diff not readable (binary, renamed without a diff, or too large): ${p}`);
 
-    const added = addedLines(f.patch);
-    const removed = removedLines(f.patch);
+    // Clipped: a pattern can cost no more than a bounded line, and a line too long to read is a reason of its own (risk-signals.ts).
+    const added = addedLines(f.patch).map(clipLine);
+    const removed = removedLines(f.patch).map(clipLine);
     if (/^Subproject commit /m.test((f.patch ?? "")) || added.some((l) => /^Subproject commit /.test(l))) add("integrity", `submodule pointer changed: ${p}`);
     for (const line of added) {
       // A sentence in the documentation that names `--insecure`, or a test that switches verification off on purpose, is not

@@ -523,6 +523,32 @@ for (const row of HIGH) {
   });
 }
 
+test("a removed security check cannot hide behind an identical line added somewhere else: nothing that touches security-sensitive code is cancelled", () => {
+  const guard = "if (!isAdmin(req.user)) return reply.code(403).send({ error: \"forbidden\" });";
+  const cases: Array<[string, RiskFile[], RegExp]> = [
+    ["removed from one route, the same line added to another", [
+      mod("src/routes/tenants.ts", `@@ -44,6 +44,5 @@ async function dropTenant(req: FastifyRequest, reply: FastifyReply) {\n-  ${guard}\n   await store.drop(req.params.id);`),
+      mod("src/routes/reports.ts", `@@ -9,3 +9,4 @@ async function listReports(req: FastifyRequest, reply: FastifyReply) {\n+  ${guard}\n   return store.reports();`),
+    ], /authorization or permission logic changed \(src\/routes\/tenants\.ts\)/],
+    ["removed from a handler and added to another in the same file", [
+      mod("src/routes/tenants.ts", `@@ -44,6 +44,5 @@\n-  ${guard}\n   await store.drop(req.params.id);\n@@ -90,3 +89,4 @@\n   return store.reports();\n+  ${guard}`),
+    ], /authorization or permission logic changed \(src\/routes\/tenants\.ts\)/],
+    ["removed from an authentication module and added to a file elsewhere", [
+      mod("src/auth/gate.ts", `@@ -3,4 +3,3 @@\n-  ${guard}\n   next();`),
+      mod("src/util/misc.ts", `@@ -1,2 +1,3 @@\n a\n+  ${guard}`),
+    ], /authentication or security code changed: src\/auth\/gate\.ts/],
+    ["a Dockerfile line removed, the same line added to another file", [
+      mod("Dockerfile", "@@ -5,3 +5,2 @@\n-RUN curl -s https://example.invalid/x.sh | sh\n USER app"),
+      mod("scripts/helper.sh", "@@ -1,1 +1,2 @@\n a\n+RUN curl -s https://example.invalid/x.sh | sh"),
+    ], /release or deployment file changed: Dockerfile/],
+  ];
+  for (const [name, files, why] of cases) {
+    const r = assessRisk(input(files));
+    assert.equal(r.level, "high", name);
+    assert.match(r.reasons.join("\n"), why, name);
+  }
+});
+
 test("a very long changed line is held rather than scanned: it is minified or generated, the patterns do not read it, and reading it costs nothing", () => {
   const long = "a".repeat(200_000);
   const started = Date.now();

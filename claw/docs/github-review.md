@@ -95,9 +95,15 @@ tool offered to a session, and `config.acting_as` is refused.
     chart, a release script) whose content changed, a **dependency** manifest change, or a change
     that is large (files, lines, deletions) or broad (five packages or more).
 
-  It reads the **net** change: a line that one file loses and another gains cancels out, and blank
-  and comment lines are not content, so a pure refactor, a move of code, a reformat, a comment-only
-  edit, documentation and tests are low. A rename inside one package is low. What it cannot see (a
+  For interfaces and architecture it reads the **net** change: a line that one file loses and
+  another gains cancels out, and blank and comment lines are not content, so a pure refactor, a
+  move of code, a reformat, a comment-only edit, documentation and tests are low. A rename inside
+  one package is low. Security-sensitive code, schemas, migrations, layering rules and the files
+  the path rules watch (workflows, a Dockerfile, an authentication module) are read **raw**, with
+  nothing cancelled: a check that is removed in one place and an identical line added in another
+  is indistinguishable from a move, and must not be able to hide behind a copy of itself, so
+  moving code that carries such a line is held. A changed line longer than 4000 characters
+  (minified or generated code) is held rather than scanned. What it cannot see (a
   field added to an exported type, a parameter on a wrapped signature line, a behaviour that changed
   under an unchanged name) is for the reviewer's own judgement (below).
 

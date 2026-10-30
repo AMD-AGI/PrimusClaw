@@ -14,10 +14,15 @@
  *
  * Two properties keep it from crying wolf:
  *
- *  - It reads the NET change. A line that one file loses and another file (or the same file,
- *    reindented) gains cancels out, so a pure refactor, a move of code between files and a
- *    reformat contribute nothing, while a changed or removed signature still shows. Blank
- *    lines and comment lines are not content.
+ *  - For interfaces and architecture it reads the NET change. A line that one file loses and
+ *    another file (or the same file, reindented) gains cancels out, so a pure refactor, a move of
+ *    code between files and a reformat contribute nothing, while a changed or removed signature
+ *    still shows. Blank lines and comment lines are not content.
+ *  - For security-sensitive code, schemas, migrations, layering rules and the files the path rules
+ *    watch it reads the RAW change, with nothing cancelled: a guard that is removed in one place
+ *    and an identical line added in another is indistinguishable from a move, and a removed check
+ *    must not be able to hide behind a copy of itself. Moving code that carries such a line is a
+ *    change to security-sensitive code, and is held.
  *  - Documentation and tests are not product code: a sentence about authentication or a test
  *    that exercises a route changes no interface.
  *
@@ -66,12 +71,17 @@ export interface NetLine { path: string; text: string }
 export interface Net {
   added: NetLine[];
   removed: NetLine[];
+  /** Every meaningful changed line, nothing cancelled: what the rules that must not be argued out of a change read. */
+  raw: { added: NetLine[]; removed: NetLine[] };
   /** Files with a changed line longer than {@link MAX_LINE_CHARS}: minified or generated code the patterns below do not read. */
   unreadable: Set<string>;
 }
 
 /** The longest line the patterns read. A longer one is cut for them, and said so, so a very long line is a reason of its own. */
 export const MAX_LINE_CHARS = 4000;
+
+/** A changed line as the patterns read it: cut at {@link MAX_LINE_CHARS}, which bounds what any pattern can cost. */
+export const clipLine = (text: string): string => (text.length <= MAX_LINE_CHARS ? text : text.slice(0, MAX_LINE_CHARS));
 
 const norm = (l: string): string => l.trim().replace(/\s+/g, " ");
 // `#` opens a comment in shell, Python and YAML but not a Rust attribute (`#[`) or a shebang (`#!`).
@@ -117,12 +127,12 @@ export function netChange(files: RiskFile[]): Net {
     const n = lost.get(key) ?? 0;
     if (n > 0) { lost.set(key, n - 1); removed.push(l); }
   }
-  return { added, removed, unreadable };
+  return { added, removed, raw: { added: addedAll, removed: removedAll }, unreadable };
 }
 
-/** The paths that have at least one line of net change. */
+/** The paths that have at least one meaningful changed line, whether or not it appears elsewhere: a comment is not a change, a moved line is. */
 export function touchedPaths(net: Net): Set<string> {
-  return new Set([...net.added, ...net.removed].map((l) => l.path));
+  return new Set([...net.raw.added, ...net.raw.removed].map((l) => l.path));
 }
 
 const sourceLines = (lines: NetLine[]): NetLine[] => lines.filter((l) => isSource(l.path));
@@ -387,7 +397,7 @@ function architectureFindings(files: RiskFile[], net: Net): Finding[] {
 
   const layering = new Set<string>();
   const byPath = new Map(files.map((f) => [f.path, f]));
-  for (const l of [...net.added, ...net.removed]) {
+  for (const l of [...net.raw.added, ...net.raw.removed]) {
     if (isTest(l.path)) continue;
     if (LAYERING_ANY.test(l.path)
       || (TSCONFIG.test(l.path) && TSCONFIG_GRAPH.test(l.text))
@@ -418,7 +428,8 @@ const SECURITY_CODE: Array<[RegExp, string]> = [
 function securityFindings(net: Net): Finding[] {
   const seen = new Set<string>();
   const out: Finding[] = [];
-  for (const l of sourceLines([...net.added, ...net.removed])) {
+  // Raw, not net: see the header. Nothing a change adds elsewhere cancels a security-sensitive line it removes.
+  for (const l of sourceLines([...net.raw.added, ...net.raw.removed])) {
     for (const [re, what] of SECURITY_CODE) {
       if (!re.test(l.text)) continue;
       const key = `${what}:${l.path}`;
