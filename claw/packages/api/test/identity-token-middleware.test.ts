@@ -15,7 +15,7 @@ import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import Fastify, { type FastifyInstance } from "fastify";
 
-import { FakeIdentity, activeAnswer, signJwt, testKey } from "../../utils/test/identity-fake.js";
+import { FakeIdentity, activeAnswer, answerDelegation, signJwt, testKey } from "../../utils/test/identity-fake.js";
 import { isAdmin } from "../src/auth/models.js";
 
 const nowSec = () => Math.floor(Date.now() / 1000);
@@ -65,6 +65,7 @@ describe("an identity access token through the authentication hook", () => {
   let app: FastifyInstance;
   let base = "";
   let providerDown = false;
+  let delegations: ReturnType<typeof answerDelegation>;
   let startIdentityClient: typeof import("../src/auth/identity.js").startIdentityClient;
 
   const payloadOf = (token: string) => JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8") || "{}");
@@ -93,6 +94,8 @@ describe("an identity access token through the authentication hook", () => {
     fake = await FakeIdentity.start();
     fake.jwks = () => ({ body: { keys: [es.jwk] } });
     fake.introspect = (r) => (providerDown ? { status: 503, body: "down" } : { body: activeAnswer({ sub: payloadOf(r.form.get("token") ?? "").sub }) });
+    // SaFE is asked about the delegated token the provider issues for the user's own, never about the user's token.
+    delegations = answerDelegation(fake, es, { clientId: "svc-claw" });
     Object.assign(process.env, { SAFE_API_URL: safe.url, AUTH_INTERNAL_TOKEN: "t" });
     delete process.env.CLAW_DEPLOY_MODE;
     ({ startIdentityClient } = await import("../src/auth/identity.js"));
@@ -115,6 +118,7 @@ describe("an identity access token through the authentication hook", () => {
     providerDown = false;
     safe.calls.length = 0;
     safe.tokenCalls.length = 0;
+    delegations.length = 0;
     identity(true);
     process.env.CLAW_IDENTITY_TOKEN_AUTH_ENABLED = "true";
     delete process.env.CLAW_IDENTITY_TOKEN_INTROSPECT;
@@ -132,7 +136,13 @@ describe("an identity access token through the authentication hook", () => {
     assert.equal(r.status, 200, JSON.stringify(r.body));
     assert.deepEqual(r.body.user, { userId: "web-user", userName: "Web User", roles: ["default"], platformKey: "pk-web-user", virtualKey: "vk-web-user" });
     assert.deepEqual(safe.calls, [], "SaFE was not asked about a cookie or a key");
-    assert.deepEqual(safe.tokenCalls, [`Bearer ${token}`], "it was asked once, about the token");
+    // It was asked once, and not about the user's token: about the one the provider issued the API for SaFE's audience,
+    // naming the API as the party acting for the user.
+    assert.equal(safe.tokenCalls.length, 1);
+    assert.notEqual(safe.tokenCalls[0], `Bearer ${token}`, "SaFE was shown the user's own token");
+    const asked = payloadOf((safe.tokenCalls[0] ?? "").replace("Bearer ", ""));
+    assert.deepEqual([asked.sub, asked.aud, asked.scope, asked.act], ["web-user", "primus-safe", "safe.api", { sub: "svc-claw" }]);
+    assert.deepEqual(delegations.map((d) => [d.subjectToken === token, d.audience, d.scope]), [[true, "primus-safe", "safe.api"]]);
   });
 
   test("a subject SaFE does not know is the token's user all the same, without keys", async () => {

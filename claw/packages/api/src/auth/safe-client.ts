@@ -199,6 +199,7 @@ export class SafeClient {
     cacheKey: string,
     payload: Record<string, unknown>,
     invalidMsg: string,
+    cacheable = true,
   ): Promise<UserInfo> {
     try {
       const resp = await fetch(`${this.baseUrl}${VERIFY_PATH}`, {
@@ -222,7 +223,7 @@ export class SafeClient {
         throw new SafeUpstreamHttpError({ status: resp.status, bodySnippet, requestId });
       }
       const user = this.parseResponse(await resp.json() as Record<string, unknown>);
-      this.setCache(cacheKey, user, null, CACHE_TTL);
+      if (cacheable) this.setCache(cacheKey, user, null, CACHE_TTL);
       return user;
     } catch (e: unknown) {
       if (e instanceof AuthServiceMisconfiguredError) throw e;
@@ -236,7 +237,7 @@ export class SafeClient {
       // A SaFE that answers 5xx has not judged the credential, any more than one that does not
       // answer: remembering it as a failed verification would turn one error response into half
       // a minute of "invalid" for a credential that is fine.
-      if (!(err instanceof SafeUpstreamHttpError && err.status >= 500)) {
+      if (cacheable && !(err instanceof SafeUpstreamHttpError && err.status >= 500)) {
         this.setCache(cacheKey, null, err.message, NEGATIVE_TTL);
       }
       throw err;
@@ -249,21 +250,27 @@ export class SafeClient {
   }
 
   /**
-   * An identity provider's access token (a JWT), presented to SaFE the way a cookie or
-   * an `ak-` key is: as the credential of the person it names. SaFE answers with that
-   * person's id and, because both are asked for, their platform key and their LiteLLM
-   * virtual key, which is what every per-user call this API makes for them is built on.
+   * An access token SaFE's own authentication accepts, presented to SaFE the way a cookie or an `ak-` key is: as
+   * the credential of the person it names. SaFE answers with that person's id and, because both are asked for,
+   * their platform key and their LiteLLM virtual key, which is what every per-user call this API makes for them
+   * is built on.
    *
-   * Only a token SaFE's own authentication accepts gets an answer: the chain in
-   * `auth.authenticators` with an entry for this token's issuer and audience. A SaFE
-   * that does not know the issuer, or a token that carries an actor (RFC 8693 `act`,
-   * which SaFE never hands a key to), is a 401 or 403 here, and the caller has no key.
-   * The cache key is a digest, so the map never holds a token.
+   * What this API presents is a delegated token (RFC 8693) that the identity provider issued to this API's own
+   * service client for SaFE's audience, with the API as its actor (`act`); see `delegated-keys.ts`. SaFE gives a
+   * key only to a token whose actor it has been told to accept, and only the keys of the token's subject. A SaFE
+   * that does not know the issuer or the audience, or an actor it was not told about, is a 401 or 403 here.
+   *
+   * The cache key is a digest, so the map never holds a token. `cache: false` neither reads nor writes it, for a
+   * caller that keeps the answer itself (a delegated token is minted per person, and its caller bounds the answer
+   * by the token's own remaining life).
    */
-  async verifyAccessToken(token: string): Promise<UserInfo> {
+  async verifyAccessToken(token: string, opts: { cache?: boolean } = {}): Promise<UserInfo> {
     if (!token) throw new Error("empty access token");
+    const payload = { ...this.body(), authorization: `Bearer ${token}` };
+    const invalidMsg = "SaFE does not accept this access token";
+    if (opts.cache === false) return this.doVerify("token:uncached", payload, invalidMsg, false);
     const digest = createHash("sha256").update(token).digest("hex");
-    return this.verify(`token:${digest}`, { ...this.body(), authorization: `Bearer ${token}` }, "SaFE does not accept this access token");
+    return this.verify(`token:${digest}`, payload, invalidMsg);
   }
 
   async verifyCookie(token: string, userType = ""): Promise<UserInfo> {

@@ -23,7 +23,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import Fastify, { type FastifyInstance } from "fastify";
 import cookie from "@fastify/cookie";
-import { FakeIdentity, activeAnswer, signJwt, testKey } from "../../utils/test/identity-fake.js";
+import { FakeIdentity, activeAnswer, answerDelegation, signJwt, testKey } from "../../utils/test/identity-fake.js";
 import type { FakeUpstream } from "./support/fake-upstream.js";
 import { AUTH_INTERNAL_TOKEN, startFakePlatform, type Account, type TokenVerdict } from "./support/fake-platform.js";
 
@@ -51,10 +51,14 @@ let fake: FakeIdentity;
 let platform: FakeUpstream;
 let app: FastifyInstance;
 
+// SaFE's rule for the token it is shown (apiserver `verifyExternal` with `auth.key_actors`): a token for its own audience,
+// with the scope its verification needs, whose actor it was told to accept; the keys are those of the token's subject.
+// An actor it was not told about is a 403, a token that is not for it a 401. The token it is shown here is never the
+// person's own (aud claw-api): the API asks the provider for one.
 const tokenVerdict = (bearer: string): TokenVerdict => {
   const claims = JSON.parse(Buffer.from(bearer.split(".")[1] ?? "", "base64url").toString("utf8") || "{}");
-  if (claims.aud !== "claw-api") return null;
-  if (claims.act !== undefined) return "delegated";
+  if (claims.aud !== "primus-safe" || !String(claims.scope ?? "").split(" ").includes("safe.api")) return null;
+  if (claims.act?.sub !== "svc-claw") return "delegated";
   return ({ "u-alice": ALICE, "u-bob": BOB } as Record<string, Account>)[claims.sub] ?? null;
 };
 
@@ -70,6 +74,7 @@ before(async () => {
   fake = await FakeIdentity.start();
   fake.jwks = () => ({ body: { keys: [es.jwk] } });
   fake.introspect = () => ({ body: activeAnswer() });
+  answerDelegation(fake, es, { clientId: "svc-claw" });
   platform = await startFakePlatform({ alice: ALICE, bob: BOB }, () => false, tokenVerdict);
 
   process.env.APP_ENV = "dev";

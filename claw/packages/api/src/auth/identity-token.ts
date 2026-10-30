@@ -27,16 +27,18 @@
  *     something else there, and copying it would make that caller a platform
  *     operator of every tenant's sessions. Enabling this path alone never grants admin.
  *     There is no session key behind a token, so the keys come from SaFE (next item).
- *   - In the SaFE deployment mode the caller's keys come from SaFE, asked what it asks for a
- *     cookie or an `ak-` key: `POST /api/v1/auth/verify` with the token as the credential and
- *     the platform key and virtual key requested. Every per-user call the API makes (the
- *     LLM key a turn runs with, the key a sandbox is created with, what `GET /v1/me` reads)
- *     is built on those two, so one answer here serves all of them. It needs SaFE to accept
- *     the token (see docs/identity-client.md) and is not done for a delegated token
- *     (RFC 8693 `act`), which SaFE never gives a key to. The answer must name the token's own
- *     `sub`, or its keys are somebody else's and are not used. A SaFE that cannot be reached
- *     is a 503; a SaFE that does not accept the token leaves the caller without keys, and
- *     says so in the log. The token's roles are still not copied, and neither are SaFE's.
+ *   - In the SaFE deployment mode the caller's keys come from SaFE: `POST /api/v1/auth/verify`, asked
+ *     for the platform key and the virtual key. Every per-user call the API makes (the LLM key a turn runs
+ *     with, the key a sandbox is created with, what `GET /v1/me` reads) is built on those two, so one answer
+ *     here serves all of them. SaFE is not shown the person's token: the API exchanges it at the identity
+ *     provider (RFC 8693 service delegation, `delegated-keys.ts`) for a token for SaFE's audience that names
+ *     this API as the acting party, and presents that. It needs the provider to have registered this API's
+ *     service client for the exchange, and SaFE to accept that actor (see docs/identity-client.md). The
+ *     answer must name the token's own `sub`, or its keys are somebody else's and are not used, and it is
+ *     kept per person for at most the life the delegated token has left. A token that is itself delegated
+ *     (RFC 8693 `act`) is not exchanged again. A SaFE or a provider that cannot be reached is a 503; a SaFE
+ *     that does not accept the delegated token, or a provider that refuses the exchange, leaves the caller
+ *     without keys and says so in the log. The token's roles are still not copied, and neither are SaFE's.
  *   - The one way a token's role becomes the caller's role is an operator naming it in
  *     `CLAW_IDENTITY_TOKEN_TRUSTED_ROLES` (default: none; only `system-admin` and
  *     `system-admin-readonly` can be named). Even then a role is adopted only when all
@@ -60,11 +62,10 @@ import pino from "pino";
 import { IdentityUnavailableError, JwtVerificationError } from "@claw/utils";
 import type { UserInfo } from "./models.js";
 import { envBool } from "../config.js";
+import { DelegatedKeys, type SaFeKeys } from "./delegated-keys.js";
 import { identityClient } from "./identity.js";
 import type { CredentialOutcome } from "./middleware.js";
-import {
-  AuthServiceMisconfiguredError, AuthUpstreamUnreachableError, SafeUpstreamHttpError, isApiKey, type SafeClient,
-} from "./safe-client.js";
+import { isApiKey, type SafeClient } from "./safe-client.js";
 
 const logger = pino({ name: "auth" });
 
@@ -94,6 +95,10 @@ export interface IdentityTokenSettings {
   introspect: boolean;
   /** The platform roles the operator lets a provider-confirmed token confer. Always a subset of {@link ADOPTABLE_ROLES}. */
   trustedRoles: string[];
+  /** The `aud` of the token the API asks the provider for, to present to SaFE in the person's name. */
+  delegationAudience: string;
+  /** The scope of that token. */
+  delegationScope: string;
 }
 
 function setting(key: string, fallback: string): string {
@@ -110,6 +115,8 @@ function setting(key: string, fallback: string): string {
  *   CLAW_IDENTITY_TOKEN_INTROSPECT    also ask the provider whether the token is still active
  *   CLAW_IDENTITY_TOKEN_TRUSTED_ROLES comma- or space-separated platform roles a confirmed token may
  *                                     confer (system-admin, system-admin-readonly); default none
+ *   CLAW_IDENTITY_TOKEN_DELEGATION_AUDIENCE  the `aud` of the delegated token presented to SaFE, default primus-safe
+ *   CLAW_IDENTITY_TOKEN_DELEGATION_SCOPE     its scope, default safe.api
  */
 export function identityTokenSettings(): IdentityTokenSettings {
   return {
@@ -118,6 +125,8 @@ export function identityTokenSettings(): IdentityTokenSettings {
     scope: setting("CLAW_IDENTITY_TOKEN_SCOPE", "claw.api"),
     introspect: envBool("CLAW_IDENTITY_TOKEN_INTROSPECT", false),
     trustedRoles: trustedRoles(process.env.CLAW_IDENTITY_TOKEN_TRUSTED_ROLES),
+    delegationAudience: setting("CLAW_IDENTITY_TOKEN_DELEGATION_AUDIENCE", "primus-safe"),
+    delegationScope: setting("CLAW_IDENTITY_TOKEN_DELEGATION_SCOPE", "safe.api"),
   };
 }
 
@@ -155,43 +164,35 @@ function claimedTrustedRoles(trusted: readonly string[], claim: unknown): string
 /** What the token path asks of SaFE: only the access-token verification. `null` where there is no SaFE (Kubernetes mode). */
 export type TokenKeyVerifier = Partial<Pick<SafeClient, "verifyAccessToken">> | null;
 
-/** The keys SaFE holds for a token's subject, or why the caller has none. */
-type SaFeKeys =
-  | { status: "keys"; platformKey: string; virtualKey: string }
-  | { status: "none"; reason: string }
-  | { status: "unavailable" }
-  | { status: "misconfigured"; message: string };
+// One cache of keys per SaFE client, which is one per process; a test that builds a new client starts with none.
+const keyCaches = new WeakMap<object, DelegatedKeys>();
 
 /**
- * Ask SaFE for the keys of the person a verified token names.
+ * Ask SaFE for the keys of the person a verified token names, in the API's own name and theirs.
  *
  * The token has already been verified here (signature, audience, scope, the provider's
- * answer when that is asked for), so SaFE is never shown a token that is not the
- * provider's. A delegated token is not shown to it either: SaFE refuses to hand a key to
- * an actor, so the question has a known answer and asking only costs a refusal.
+ * answer when that is asked for). It is not shown to SaFE: it is the proof the provider needs to
+ * issue this API a token for SaFE's audience that acts for the person, and that token is what SaFE is
+ * shown (`delegated-keys.ts`). A token that is itself delegated is not exchanged again: the question
+ * has no useful answer for a party that was not sent the person's own token.
  *
- * `unavailable` is SaFE not being able to answer (unreachable, 5xx) and `misconfigured` is this
+ * `unavailable` is SaFE or the provider not being able to answer (unreachable, 5xx) and `misconfigured` is this
  * API not being able to ask (no `AUTH_INTERNAL_TOKEN`), as for a cookie or a key: neither is "no
  * keys", so the caller is told so rather than served as a keyless user. Everything
- * else SaFE says about the token (401: it does not accept this issuer or audience, 403: a
- * refusal, an id that is not the subject) is `none`, with the reason for the log.
+ * else (the provider refusing the exchange, SaFE's 401 or 403, an id that is not the subject) is `none`, with the reason for the log.
  */
-async function safeKeysOf(verifier: TokenKeyVerifier, token: string, sub: string, claims: Record<string, unknown>): Promise<SaFeKeys> {
-  if (!verifier?.verifyAccessToken) return { status: "none", reason: "no_safe" };
+async function safeKeysOf(
+  verifier: TokenKeyVerifier, identity: NonNullable<ReturnType<typeof identityClient>>, token: string, sub: string,
+  claims: Record<string, unknown>, settings: IdentityTokenSettings,
+): Promise<SaFeKeys> {
+  const verifyAccessToken = verifier?.verifyAccessToken?.bind(verifier);
+  if (!verifier || !verifyAccessToken) return { status: "none", reason: "no_safe" };
   if (claims.act !== undefined) return { status: "none", reason: "delegated_token" };
-  try {
-    const user = await verifier.verifyAccessToken(token);
-    if (user.userId !== sub) return { status: "none", reason: "subject_mismatch" };
-    if (!user.platformKey && !user.virtualKey) return { status: "none", reason: "safe_holds_no_keys" };
-    return { status: "keys", platformKey: user.platformKey, virtualKey: user.virtualKey };
-  } catch (err) {
-    if (err instanceof AuthServiceMisconfiguredError) return { status: "misconfigured", message: err.message };
-    if (err instanceof AuthUpstreamUnreachableError) return { status: "unavailable" };
-    if (err instanceof SafeUpstreamHttpError) {
-      return err.status >= 500 ? { status: "unavailable" } : { status: "none", reason: `safe_http_${err.status}` };
-    }
-    return { status: "none", reason: "safe_does_not_accept_token" };
-  }
+  let cache = keyCaches.get(verifier);
+  if (!cache) keyCaches.set(verifier, (cache = new DelegatedKeys()));
+  return cache.keysOf(sub, token, { audience: settings.delegationAudience, scope: settings.delegationScope }, {
+    identity, safe: { verifyAccessToken },
+  });
 }
 
 /**
@@ -255,14 +256,16 @@ export async function verifyIdentityAccessToken(
         if (answer.sub === sub) adopted = claimed.filter((r) => answer.roles.includes(r));
       }
     }
-    const keys = await safeKeysOf(verifier, token, sub, claims);
+    const keys = await safeKeysOf(verifier, identity, token, sub, claims, settings);
     if (keys.status === "unavailable") {
-      logger.warn({ path: pathname }, "auth.identity_token.safe_unavailable");
+      logger.warn({ path: pathname, source: keys.source }, "auth.identity_token.keys_unavailable");
       return {
         status: "rejected",
         error: {
           status: 503, legacyError: "authentication_service_unavailable", anthropicType: "api_error",
-          message: "cannot reach SaFE to look up the keys of the access token's user",
+          message: keys.source === "safe"
+            ? "cannot reach SaFE to look up the keys of the access token's user"
+            : "cannot reach the identity provider to act for the access token's user",
         },
       };
     }

@@ -552,6 +552,12 @@ identity:
     audience: ""    # the `aud` the token must name, default claw-api
     scope: ""       # the scope the token must carry, default claw.api
     introspect: false  # also ask the provider whether the token is still active, so a revoked grant stops at once
+    # In the SaFE deployment mode the API gets a signed-in person's keys from SaFE without showing SaFE the person's
+    # token: it exchanges the token at the provider (RFC 8693) for one for SaFE's audience that names the API as the
+    # party acting for the person. This is that token's audience and scope. The provider must have registered the
+    # API's own client (identity.clientId) for the exchange, and SaFE must be told to accept it as an actor.
+    delegationAudience: ""  # default primus-safe
+    delegationScope: ""     # default safe.api
     # Platform roles a token may confer, from system-admin and system-admin-readonly. Empty (the default): every token's
     # caller is a plain user, whatever the token's roles claim says. A named role is adopted only for a token that claims
     # it AND whose provider answer (RFC 7662, asked per the identity cache rules) is active, names the same subject and
