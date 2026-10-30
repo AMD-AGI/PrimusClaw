@@ -445,9 +445,12 @@ as the bearer of every call).
 | JSON array | `[{"name":"ci","url":"https://ci.example.com","auth_env":"A2A_PEER_TOKEN_CI","allow_local":false}]` | `A2A_PEER_TOKEN_CI` |
 
 An entry that does not parse (a name that is not `[A-Za-z0-9][A-Za-z0-9._-]*`, a non-http(s) URL, a URL with
-embedded credentials, an `auth_env` that is not a variable name, a non-boolean `allow_local`) is dropped and
-logged as `a2a.registry.entry_refused`; its neighbours still load. A named `auth_env` that is empty makes the
-peer uncallable (the call fails, it is never sent unauthenticated).
+embedded credentials, an `auth_env` that is not a variable name or does not start with `A2A_PEER_TOKEN_`, a
+non-boolean `allow_local`) is refused when Brain starts: it is logged as `a2a.registry.entry_refused` with the
+reason and not registered, and its neighbours still load. The `A2A_PEER_TOKEN_` prefix keeps a peer entry from
+being pointed at a deployment-wide secret such as `ANTHROPIC_API_KEY`: the only variables a peer can be sent
+are ones set aside for peers. A named `auth_env` that is empty makes the peer uncallable (the call fails, it
+is never sent unauthenticated).
 
 A peer is refused when its address is loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, which
 includes the cloud metadata address, and `fe80::/10`) or unspecified (`0.0.0.0/8`, `::`), including those

@@ -73,6 +73,11 @@ function isErrorResponse(r: JsonRpcResponse): r is JsonRpcErrorResponse {
 //   name=url,name=url                                  (no credential)
 //   [{"name":"ci","url":"https://ci.example.com",
 //     "auth_env":"A2A_PEER_TOKEN_CI","allow_local":false}]
+//
+// `auth_env` must name a variable that starts with A2A_PEER_TOKEN_. The model cannot
+// choose it, but an operator's entry could otherwise point at a deployment-wide secret
+// (ANTHROPIC_API_KEY, the platform key) and send it to a peer. An entry that names any
+// other variable is refused when the registry loads, with a message saying why.
 // ---------------------------------------------------------------------------
 export interface A2APeer {
   name: string;
@@ -88,6 +93,8 @@ const agentRegistry = new Map<string, A2APeer>();
 
 const PEER_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** The only variables a peer entry may read its token from: ones set aside for peers. */
+export const A2A_PEER_TOKEN_PREFIX = "A2A_PEER_TOKEN_";
 
 function toPeer(name: unknown, url: unknown, authEnv: unknown, allowLocal: unknown): A2APeer {
   if (typeof name !== "string" || !PEER_NAME.test(name)) throw new Error(`invalid peer name ${JSON.stringify(name)}`);
@@ -97,6 +104,13 @@ function toPeer(name: unknown, url: unknown, authEnv: unknown, allowLocal: unkno
   if (parsed.username || parsed.password) throw new Error(`peer "${name}": url must not embed credentials (use auth_env)`);
   if (authEnv !== undefined && (typeof authEnv !== "string" || !ENV_NAME.test(authEnv))) {
     throw new Error(`peer "${name}": auth_env must be an environment variable name`);
+  }
+  if (typeof authEnv === "string" && !authEnv.startsWith(A2A_PEER_TOKEN_PREFIX)) {
+    throw new Error(
+      `peer "${name}": auth_env ${authEnv} is refused; it must name a variable that starts with `
+      + `${A2A_PEER_TOKEN_PREFIX} (for example ${A2A_PEER_TOKEN_PREFIX}${name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}), `
+      + "so a peer can only ever be sent a token set aside for peers, never a deployment-wide secret",
+    );
   }
   if (allowLocal !== undefined && typeof allowLocal !== "boolean") throw new Error(`peer "${name}": allow_local must be a boolean`);
   return { name, url: String(url).replace(/\/$/, ""), authEnv: authEnv as string | undefined, allowLocal: allowLocal === true };
