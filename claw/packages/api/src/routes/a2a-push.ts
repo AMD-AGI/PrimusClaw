@@ -24,6 +24,12 @@
 //   - Delivery is at least once, durable (an outbox row per notification) and
 //     retried with backoff; a config is dropped with its task's final
 //     notification ("MUST persist until task completion or explicit deletion").
+//     The final notification is owed to every run that ends, whoever closed
+//     it: the completion event writes it when it arrives, and
+//     `enqueueFinalForClosedRuns` writes it for a run that was closed without
+//     one (the sweeper's budget and unconfirmed-stop closes, a lost event).
+//   - A config is the task's: its id is unique within the task, never across
+//     callers, so the id a client picks cannot collide with, or reveal, another's.
 //
 // Credentials are stored encrypted and never returned by Get/List.
 // ---------------------------------------------------------------------------
@@ -49,6 +55,9 @@ export const MAX_CONFIGS_PER_TASK = 5;
 const MAX_TOKEN_CHARS = 512;
 const MAX_SCHEME_CHARS = 32;
 const MAX_CREDENTIAL_CHARS = 4096;
+/** How long a closed run is left to its own completion event before the worker writes its final notification. */
+export const FINAL_RECONCILE_GRACE_SECONDS = 15;
+const RECONCILE_EVERY_MS = 10_000;
 /** Seconds to wait after the Nth failed attempt; the last step repeats. */
 export const RETRY_BACKOFF_SECONDS = [1, 5, 30, 300];
 /** A notification still undelivered this long after it was written is dropped. */
@@ -151,7 +160,7 @@ export async function insertPushConfig(
     `INSERT INTO claw_a2a_push_configs
        (config_id, task_id, session_id, owner, url, token_enc, auth_scheme, auth_credentials_enc)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-     ON CONFLICT (config_id) DO NOTHING
+     ON CONFLICT (task_id, config_id) DO NOTHING
      RETURNING config_id, task_id, url, auth_scheme`,
     [
       configId, run.taskId, run.sessionId, ownerId, value.url,
@@ -160,7 +169,8 @@ export async function insertPushConfig(
       value.credentials ? encryptUserEnvValue(value.credentials) : null,
     ],
   );
-  if (!inserted.rows[0]) return { ok: false, kind: "duplicate_id", error: "a push notification config with this id already exists" };
+  // The key is (task, id) and the task is the caller's own, so this names a config of this task only.
+  if (!inserted.rows[0]) return { ok: false, kind: "duplicate_id", error: "a push notification config with this id already exists on this task" };
   return { ok: true, config: wire(inserted.rows[0] as Record<string, unknown>) };
 }
 
@@ -200,18 +210,94 @@ const TRIGGERS = new Set([
   "statusUpdate", "permissionRequest", "userQuestion", "decisionResult", "toolUsed", "exec_complete",
 ]);
 
-async function enqueue(
-  configIds: string[], key: string, payload: StreamResponse, final = false,
-): Promise<void> {
-  for (const configId of configIds) {
-    await db.query(
-      `INSERT INTO claw_a2a_push_outbox (config_id, dedupe_key, payload, final)
-       VALUES ($1, $2, $3::jsonb, $4)
-       ON CONFLICT (config_id, dedupe_key) DO NOTHING`,
-      [configId, key, JSON.stringify(payload), final],
-    );
+interface Notification { key: string; payload: StreamResponse; final?: boolean }
+
+/**
+ * One statement per task, so the rows of a pass get consecutive ids in the
+ * order given (delivery is by id) and two writers racing on the same final pass
+ * cannot interleave them. A config deleted since the caller read it is simply
+ * not matched.
+ */
+async function enqueue(taskId: string, configIds: string[], items: Notification[]): Promise<void> {
+  if (!configIds.length || !items.length) return;
+  await db.query(
+    `INSERT INTO claw_a2a_push_outbox (task_id, config_id, dedupe_key, payload, final)
+     SELECT c.task_id, c.config_id, i.key, i.payload::jsonb, i.final
+       FROM claw_a2a_push_configs c
+      CROSS JOIN unnest($3::text[], $4::text[], $5::boolean[]) WITH ORDINALITY AS i(key, payload, final, ord)
+      WHERE c.task_id = $1 AND c.config_id = ANY($2::text[])
+      ORDER BY c.config_id, i.ord
+     ON CONFLICT (task_id, config_id, dedupe_key) DO NOTHING`,
+    [taskId, configIds, items.map((i) => i.key), items.map((i) => JSON.stringify(i.payload)), items.map((i) => i.final ?? false)],
+  );
+  kickWorker();
+}
+
+/**
+ * The closing notifications of a run, read from its row as it stands: the whole
+ * text as one artifact, then the final status. The keys are fixed, so every way
+ * of reaching this (the completion event, its redelivery, the worker finding a
+ * closed run) records the same two rows once.
+ */
+async function enqueueFinal(run: RunRecord, configIds: string[]): Promise<void> {
+  const settled = await loadRun(run.taskId) ?? run;
+  const view = taskOf(settled, await loadRunEvents(settled));
+  const text = view.artifacts?.find((a) => a.artifactId === textArtifactId(run.taskId))?.parts[0]?.text;
+  const items: Notification[] = [];
+  if (text) {
+    items.push({
+      key: "final:artifact",
+      payload: {
+        artifactUpdate: {
+          taskId: run.taskId,
+          contextId: run.contextId,
+          artifact: { artifactId: textArtifactId(run.taskId), name: "response", parts: [{ text, mediaType: "text/plain" }] },
+          append: false,
+          lastChunk: true,
+        },
+      },
+    });
   }
-  if (configIds.length) kickWorker();
+  items.push({ key: "final:status", payload: statusUpdateEvent(settled, view.status.state, view.status.message), final: true });
+  await enqueue(run.taskId, configIds, items);
+}
+
+/**
+ * Write the final notification of every run that has ended without one.
+ *
+ * The completion event is not the only way a run ends: the sweeper closes one
+ * that outlived its budget as `failed`, and one whose stop was never confirmed
+ * as `cancelled`, and sends an interrupt, not a completion. A webhook told
+ * `WORKING` for a task that is `FAILED` would wait for ever, and its config (with
+ * the client's credentials) would never be retired. So this reads the rows, which
+ * every close writes, rather than depending on each closer to say so. A run only
+ * counts as missed after a grace period, so the event that normally writes the
+ * notification is left to; and if both do, the fixed keys make it one.
+ */
+export async function enqueueFinalForClosedRuns(
+  graceSeconds = FINAL_RECONCILE_GRACE_SECONDS,
+): Promise<number> {
+  const due = (await db.query(
+    `SELECT c.task_id, array_agg(c.config_id) AS config_ids
+       FROM claw_a2a_push_configs c
+       JOIN claw_tasks t ON t.task_id = c.task_id
+      WHERE t.status IN ('completed', 'failed', 'cancelled')
+        AND (t.completed_at IS NULL OR t.completed_at < NOW() - make_interval(secs => $1))
+        AND NOT EXISTS (
+          SELECT 1 FROM claw_a2a_push_outbox o
+           WHERE o.task_id = c.task_id AND o.config_id = c.config_id AND o.final)
+      GROUP BY c.task_id
+      LIMIT 50`,
+    [graceSeconds],
+  )).rows as Array<{ task_id: string; config_ids: string[] }>;
+  let n = 0;
+  for (const d of due) {
+    const run = await loadRun(d.task_id);
+    if (!run) continue;
+    await enqueueFinal(run, d.config_ids);
+    n += d.config_ids.length;
+  }
+  return n;
 }
 
 /**
@@ -250,22 +336,7 @@ export async function recordSessionEvent(
     if (messageId && run.messageId && messageId !== run.messageId) return 0;
     // The state is the settled row's, not a reading of the event: the consumer
     // has closed the run before this is called.
-    const settled = await loadRun(run.taskId) ?? run;
-    const view = taskOf(settled, await loadRunEvents(settled));
-    const text = view.artifacts?.find((a) => a.artifactId === textArtifactId(run.taskId))?.parts[0]?.text;
-    // One closing artifact with the whole text, ahead of the final status.
-    if (text) {
-      await enqueue(ids, `${origin}:artifact`, {
-        artifactUpdate: {
-          taskId: run.taskId,
-          contextId: run.contextId,
-          artifact: { artifactId: textArtifactId(run.taskId), name: "response", parts: [{ text, mediaType: "text/plain" }] },
-          append: false,
-          lastChunk: true,
-        },
-      });
-    }
-    await enqueue(ids, `${origin}:status`, statusUpdateEvent(settled, view.status.state, view.status.message), true);
+    await enqueueFinal(run, ids);
     return ids.length;
   }
 
@@ -273,15 +344,13 @@ export async function recordSessionEvent(
   // A run already past `running` must not announce WORKING again for the same event type.
   const mapped = mapLiveEvent(run, safe, state);
   if (!mapped) return 0;
-  let n = 0;
-  for (const response of mapped.responses) {
-    // Chunks of text and the tool log are not pushed: a webhook gets state
-    // changes and the finished result, not a request per token.
-    if (!("statusUpdate" in response)) continue;
-    await enqueue(ids, `${origin}:${n}`, response);
-    n += 1;
-  }
-  return n * ids.length;
+  // Chunks of text and the tool log are not pushed: a webhook gets state
+  // changes and the finished result, not a request per token.
+  const items = mapped.responses
+    .filter((response) => "statusUpdate" in response)
+    .map((payload, n) => ({ key: `${origin}:${n}`, payload }));
+  await enqueue(run.taskId, ids, items);
+  return items.length * ids.length;
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +365,7 @@ export interface DeliveryDeps {
 
 interface Claimed {
   id: string;
+  task_id: string;
   config_id: string;
   payload: StreamResponse;
   attempts: number;
@@ -309,10 +379,10 @@ async function claimDue(): Promise<Claimed[]> {
   // that is backing off, or leased to another replica, holds its successors.
   return (await db.query(
     `WITH heads AS (
-       SELECT DISTINCT ON (config_id) id
+       SELECT DISTINCT ON (task_id, config_id) id
          FROM claw_a2a_push_outbox
         WHERE delivered_at IS NULL AND dropped_at IS NULL
-        ORDER BY config_id, id
+        ORDER BY task_id, config_id, id
      )
      UPDATE claw_a2a_push_outbox o
         SET attempts = o.attempts + 1,
@@ -323,7 +393,7 @@ async function claimDue(): Promise<Claimed[]> {
          ORDER BY next_attempt_at
          LIMIT $1
          FOR UPDATE SKIP LOCKED)
-      RETURNING o.id, o.config_id, o.payload, o.attempts, o.final,
+      RETURNING o.id, o.task_id, o.config_id, o.payload, o.attempts, o.final,
                 o.created_at < NOW() - make_interval(secs => $3) AS expired`,
     [CLAIM_BATCH, CLAIM_LEASE_SECONDS, GIVE_UP_AFTER_SECONDS],
   )).rows as Claimed[];
@@ -331,13 +401,16 @@ async function claimDue(): Promise<Claimed[]> {
 
 /** A finished task's configuration goes with its last notification. */
 async function retireIfFinal(row: Claimed): Promise<void> {
-  if (row.final) await db.query("DELETE FROM claw_a2a_push_configs WHERE config_id = $1", [row.config_id]);
+  if (row.final) {
+    await db.query("DELETE FROM claw_a2a_push_configs WHERE task_id = $1 AND config_id = $2", [row.task_id, row.config_id]);
+  }
 }
 
 async function sendOne(row: Claimed, deps: DeliveryDeps): Promise<boolean> {
   const config = (await db.query(
-    `SELECT url, token_enc, auth_scheme, auth_credentials_enc FROM claw_a2a_push_configs WHERE config_id = $1`,
-    [row.config_id],
+    `SELECT url, token_enc, auth_scheme, auth_credentials_enc FROM claw_a2a_push_configs
+      WHERE task_id = $1 AND config_id = $2`,
+    [row.task_id, row.config_id],
   )).rows[0] as Record<string, string | null> | undefined;
   if (!config) {
     await db.query(
@@ -405,11 +478,19 @@ const POLL_MS = 2000;
 let timer: NodeJS.Timeout | null = null;
 let inFlight = false;
 let pending = false;
+let lastReconcileAt = 0;
 
 function tick(): void {
   if (inFlight) { pending = true; return; }
   inFlight = true;
-  deliverDue()
+  (async () => {
+    // Ahead of delivery, so a final notification found here goes out in this pass.
+    if (Date.now() - lastReconcileAt >= RECONCILE_EVERY_MS) {
+      lastReconcileAt = Date.now();
+      await enqueueFinalForClosedRuns().catch((err) => logger.error({ err }, "a2a_push.reconcile_failed"));
+    }
+    return deliverDue();
+  })()
     .then(async (r) => {
       // More rows may be waiting behind the ones just sent (one per receiver per pass).
       if (r.delivered > 0 || pending) { pending = false; setImmediate(tick); }

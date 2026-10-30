@@ -104,8 +104,11 @@ With `CLAW_A2A_PUSH_ENABLED=true` a client registers a webhook for a task
 on the send; `Get`, `List` and `Delete` too) and is sent a `StreamResponse` when
 the task changes state: running, `INPUT_REQUIRED` with the request, working
 again, and at the end the whole result as one artifact followed by the final
-status. A task takes five configs; a config goes with its task's last
-notification.
+status. A task takes five configs, and a config's id is the task's own: two
+callers, or two tasks of one caller, can each use the same id. A config goes with
+its task's last notification, however the run ended: the completion event writes
+it, and a run that was closed without one (the sweeper's budget close, a stop
+that was never confirmed) gets it from the push worker within about 30 seconds.
 
 The receiver is authenticated with what the client supplied: the config's
 `authentication` is sent as `Authorization: <scheme> <credentials>` and its

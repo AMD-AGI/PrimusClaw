@@ -15,6 +15,7 @@
  *   P4 which events owe which notifications, once, in order
  *   P5 delivery: the spec's headers, the address that was checked, retries, order, the last one
  *   P6 the callback guard, at creation and again at delivery
+ *   P7 a run that ends without a completion event (the sweeper's closes) still gets its final notification
  */
 
 import assert from "node:assert/strict";
@@ -65,6 +66,7 @@ describe("A2A push notifications", { skip }, () => {
   let who = ALICE;
   let seq = 0;
   let push: typeof import("../src/routes/a2a-push.js");
+  let sweeper: typeof import("../src/tasks/sweeper.js");
 
   before(async () => {
     harness = await startAdmissionCluster({
@@ -73,6 +75,7 @@ describe("A2A push notifications", { skip }, () => {
     });
     (await import("../src/crypto/user-env.js")).initUserEnvCrypto();
     push = await import("../src/routes/a2a-push.js");
+    sweeper = await import("../src/tasks/sweeper.js");
     const a2a = await import("../src/routes/a2a.js");
     app = Fastify();
     app.addHook("onRequest", async (req) => {
@@ -158,6 +161,37 @@ describe("A2A push notifications", { skip }, () => {
       const t = await liveTask();
       assert.equal((await rpc("CreateTaskPushNotificationConfig", { taskId: t.taskId, url: HOOK, id: "mine" })).result.id, "mine");
       assert.equal((await rpc("CreateTaskPushNotificationConfig", { taskId: t.taskId, url: HOOK, id: "mine" })).error.code, -32602);
+    });
+
+    test("a config id is the task's: two callers, and two tasks of one caller, can each use the same one", async () => {
+      const a1 = await liveTask();
+      const a2 = await liveTask();
+      const create = (taskId: string, url: string, id = "webhook") => rpc("CreateTaskPushNotificationConfig", { taskId, url, id });
+      assert.equal((await create(a1.taskId, `${HOOK}/a1`)).result?.id, "webhook");
+      // One caller that uses one fixed id on every task, as the spec's per-task keying allows.
+      assert.equal((await create(a2.taskId, `${HOOK}/a2`)).result?.id, "webhook");
+      who = BOB;
+      const b = await liveTask();
+      const bobs = await create(b.taskId, `${HOOK}/b`);
+      assert.equal(bobs.result?.id, "webhook", `another caller's id must not block this one: ${JSON.stringify(bobs)}`);
+      const sent = await send("with a config that has the same id", { id: "webhook", url: `${HOOK}/b-send` });
+      assert.ok(sent.result?.task?.id, `a send carrying it must still open its task: ${JSON.stringify(sent)}`);
+      assert.equal(await configCount(), 4);
+
+      // Each reads, and deletes, only its own.
+      const urlOf = async (taskId: string) => (await rpc("GetTaskPushNotificationConfig", { taskId, id: "webhook" })).result?.url;
+      assert.equal(await urlOf(b.taskId), `${HOOK}/b`);
+      who = ALICE;
+      assert.equal(await urlOf(a1.taskId), `${HOOK}/a1`);
+      assert.equal(await urlOf(a2.taskId), `${HOOK}/a2`);
+      assert.deepEqual((await rpc("DeleteTaskPushNotificationConfig", { taskId: a1.taskId, id: "webhook" })).result, {});
+      assert.equal(await configCount(), 3, "deleting one task's config deletes no other's");
+      assert.equal(await urlOf(a2.taskId), `${HOOK}/a2`);
+
+      // Within one task a name is still taken once; that is the caller's own business and names no one else.
+      const again = await create(a2.taskId, HOOK);
+      assert.equal(again.error?.code, -32602);
+      assert.match(again.error.message, /already exists on this task/);
     });
 
     test("a task takes five", async () => {
@@ -460,6 +494,22 @@ describe("A2A push notifications", { skip }, () => {
       assert.equal((await outbox()).length, 0, "and its rows");
     });
 
+    test("two tasks that share a config id are told only their own, and one ending retires only its own", async () => {
+      const a = await liveTask();
+      const b = await liveTask();
+      await rpc("CreateTaskPushNotificationConfig", { taskId: a.taskId, url: `${HOOK}/a`, id: "webhook" });
+      await rpc("CreateTaskPushNotificationConfig", { taskId: b.taskId, url: `${HOOK}/b`, id: "webhook" });
+      await push.recordSessionEvent(a.sessionId, { type: "statusUpdate", agentStatus: "running" }, 121);
+      assert.deepEqual((await query("SELECT task_id FROM claw_a2a_push_outbox")).rows.map((r) => r.task_id), [a.taskId]);
+      await query("UPDATE claw_tasks SET status = 'completed', completed_at = NOW() WHERE task_id = $1", [a.taskId]);
+      await push.recordSessionEvent(a.sessionId, { type: "exec_complete", message_id: a.messageId }, 122);
+      const s = sender();
+      for (let i = 0; i < 3; i += 1) await push.deliverDue({ transport: s.transport as never, resolve: hostResolver() });
+      assert.deepEqual(s.requests.map((r) => r.target.url.pathname), ["/hooks/a2a/a", "/hooks/a2a/a"], "only a's receiver was called");
+      const left = (await query("SELECT task_id, url FROM claw_a2a_push_configs")).rows;
+      assert.deepEqual(left, [{ task_id: b.taskId, url: `${HOOK}/b` }], "a's config went with its last notification, b's did not");
+    });
+
     test("a config deleted while a notification waits is not sent to", async () => {
       const t = await configured();
       await push.recordSessionEvent(t.sessionId, { type: "statusUpdate", agentStatus: "running" }, 76);
@@ -542,6 +592,107 @@ describe("A2A push notifications", { skip }, () => {
       });
       assert.deepEqual(r, { delivered: 0, failed: 1 });
       assert.equal(s.n, 0, "taken off the list, it is refused at delivery");
+    });
+  });
+
+  describe("P7 a run that ends without a completion event", () => {
+    type Req = { target: { address: string; family: number; url: URL }; headers: Record<string, string>; body: string };
+    const states = (requests: Req[]) => requests.map((r) => {
+      const b = JSON.parse(r.body);
+      return (b.statusUpdate?.status.state ?? "artifact").replace("TASK_STATE_", "");
+    });
+
+    async function configured() {
+      const t = await liveTask();
+      await rpc("CreateTaskPushNotificationConfig", { taskId: t.taskId, url: HOOK, token: "tok" });
+      return t;
+    }
+    /** The sweeper's own close: a run past its budget and grace, which sends an interrupt and no completion. */
+    async function sweeperCloses(taskId: string, status: "running" | "cancelling") {
+      const bus = sweeper.interruptPublisher;
+      const original = { ...bus };
+      Object.assign(bus, { available: () => true, publish: () => {}, flush: async () => {} });
+      try {
+        await query("UPDATE claw_tasks SET status = $2, deadline_at = NOW() - INTERVAL '1 hour' WHERE task_id = $1", [taskId, status]);
+        assert.equal(await sweeper.reapStaleTasks(), 1, "the sweeper closed it");
+      } finally {
+        Object.assign(bus, original);
+      }
+    }
+    async function drain() {
+      const requests: Req[] = [];
+      const transport = async (req: Req) => { requests.push(req); return 200; };
+      // One notification per receiver per pass.
+      for (let i = 0; i < 4; i += 1) {
+        await push.deliverDue({ transport: transport as never, resolve: async () => [{ address: "203.0.113.7", family: 4 }] });
+      }
+      return requests;
+    }
+    const age = (taskId: string) => query("UPDATE claw_tasks SET completed_at = NOW() - INTERVAL '1 minute' WHERE task_id = $1", [taskId]);
+
+    test("a run the sweeper closes as failed still ends its webhook with FAILED, and the config is retired", async () => {
+      const t = await configured();
+      await push.recordSessionEvent(t.sessionId, { type: "statusUpdate", agentStatus: "running" }, 201);
+      await sweeperCloses(t.taskId, "running");
+      assert.equal((await query("SELECT status FROM claw_tasks WHERE task_id = $1", [t.taskId])).rows[0].status, "failed");
+      assert.equal(await configCount(), 1, "nothing has said so yet");
+
+      // The completion event gets a moment to arrive and write it; a worker that came sooner would race it.
+      assert.equal(await push.enqueueFinalForClosedRuns(), 0);
+      await age(t.taskId);
+      assert.equal(await push.enqueueFinalForClosedRuns(), 1);
+
+      assert.deepEqual(states(await drain()), ["WORKING", "FAILED"]);
+      assert.equal(await configCount(), 0, "the credentials do not outlive the task");
+      assert.equal((await outbox()).length, 0);
+    });
+
+    test("a stop that was never confirmed, closed by the sweeper as cancelled, ends its webhook with CANCELED", async () => {
+      const t = await configured();
+      await sweeperCloses(t.taskId, "cancelling");
+      assert.equal((await query("SELECT status FROM claw_tasks WHERE task_id = $1", [t.taskId])).rows[0].status, "cancelled");
+      await age(t.taskId);
+      assert.equal(await push.enqueueFinalForClosedRuns(), 1);
+      assert.deepEqual(states(await drain()), ["CANCELED"]);
+      assert.equal(await configCount(), 0);
+    });
+
+    test("the completion event and the worker finding the closed run record the final notification once, in either order", async () => {
+      for (const eventFirst of [true, false]) {
+        const t = await configured();
+        await query("UPDATE claw_tasks SET status = 'failed', error_message = 'boom', completed_at = NOW() - INTERVAL '1 minute' WHERE task_id = $1", [t.taskId]);
+        const event = () => push.recordSessionEvent(t.sessionId, { type: "exec_complete", message_id: t.messageId, failed: true }, 211);
+        if (eventFirst) await event();
+        await push.enqueueFinalForClosedRuns();
+        if (!eventFirst) await event();
+        const rows = (await outbox()).filter((r) => r.payload.statusUpdate?.taskId === t.taskId);
+        assert.deepEqual(rows.map((r) => [r.dedupe_key, r.final]), [["final:status", true]], `event first: ${eventFirst}`);
+        assert.equal(await push.enqueueFinalForClosedRuns(), 0, "and it is not found a second time");
+        await query("DELETE FROM claw_a2a_push_configs WHERE task_id = $1", [t.taskId]);
+      }
+    });
+
+    test("the closing text is sent ahead of the final status, whichever wrote them", async () => {
+      const t = await configured();
+      await query(
+        "INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ('e-text', $1, 'AssistantMessage', $2)",
+        [t.sessionId, { type: "AssistantMessage", data: { content: [{ type: "text", text: "partial answer" }] } }],
+      );
+      await query("UPDATE claw_tasks SET status = 'failed', error_message = 'boom', completed_at = NOW() - INTERVAL '1 minute' WHERE task_id = $1", [t.taskId]);
+      assert.equal(await push.enqueueFinalForClosedRuns(), 1);
+      assert.deepEqual(states(await drain()), ["artifact", "FAILED"]);
+    });
+
+    test("a run that is still going, and a task of a config that is already finished, are left alone", async () => {
+      const live = await configured();
+      assert.equal(await push.enqueueFinalForClosedRuns(0), 0);
+      assert.equal((await outbox()).length, 0);
+      await query("UPDATE claw_tasks SET status = 'completed', completed_at = NOW() - INTERVAL '1 minute' WHERE task_id = $1", [live.taskId]);
+      assert.equal(await push.enqueueFinalForClosedRuns(), 1);
+      await drain();
+      assert.equal(await configCount(), 0);
+      assert.equal(await push.enqueueFinalForClosedRuns(), 0, "its config went with its last notification");
+      assert.equal((await outbox()).length, 0);
     });
   });
 });
