@@ -180,7 +180,9 @@ const DEPENDENCY_LINES: RegExp[] = [
   /^\s*["']?[@\w./-]+["']?\s*[:=]\s*["'][~^<>=!v]*\d/,
   /^\s*["']?[@\w./-]+["']?\s*[:=]\s*["'](\*|latest|workspace:|npm:|link:)/,
   /^\s*[A-Za-z0-9][\w.-]*(\[[^\]]*\])?\s*(==|>=|<=|~=|!=|<|>)\s*\d/,
-  /^\s*[\w.-]+\.[\w.-]+\/[\w./-]+\s+v\d/,
+  // `host.tld/path v1.2.3`. The dotted host is written so that its pieces cannot overlap (a dot only ever separates them): the
+  // obvious `[\w.-]+\.[\w.-]+` backtracks quadratically on a long line of dots and letters.
+  /^\s*[\w-]+(?:\.[\w-]+)+\/[\w./-]+\s+v\d/,
   /^\s*(require|replace)\b/,
   /^\s*[\w-]+\s*=\s*\{[^}]*(version|git|path)\s*=/,
 ];

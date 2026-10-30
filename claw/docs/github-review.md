@@ -102,8 +102,12 @@ tool offered to a session, and `config.acting_as` is refused.
   the path rules watch (workflows, a Dockerfile, an authentication module) are read **raw**, with
   nothing cancelled: a check that is removed in one place and an identical line added in another
   is indistinguishable from a move, and must not be able to hide behind a copy of itself, so
-  moving code that carries such a line is held. A changed line longer than 4000 characters
-  (minified or generated code) is held rather than scanned. What it cannot see (a
+  moving code that carries such a line is held. A comment that a tool reads is not a comment: a
+  Dockerfile parser directive (`# syntax=` names the build frontend), a migration tool's
+  `-- +goose` and `-- migrate:` lines, `//go:generate`, `//go:build`, a `+kubebuilder` marker, the
+  C preprocessor, and a marker that switches a security scanner off for a line (`#nosec`,
+  `checkov:skip`, `nolint:gosec` and the like) all count as changed content. A changed line longer
+  than 4000 characters (minified or generated code) is held rather than scanned. What it cannot see (a
   field added to an exported type, a parameter on a wrapped signature line, a behaviour that changed
   under an unchanged name) is for the reviewer's own judgement (below).
 

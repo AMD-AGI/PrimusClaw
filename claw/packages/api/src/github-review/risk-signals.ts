@@ -86,8 +86,23 @@ export const clipLine = (text: string): string => (text.length <= MAX_LINE_CHARS
 const norm = (l: string): string => l.trim().replace(/\s+/g, " ");
 // `#` opens a comment in shell, Python and YAML but not a Rust attribute (`#[`) or a shebang (`#!`).
 const COMMENT = /^(\/\/|\/\*|\*( |\/|$)|#(?![[!])|--( |$)|<!--|"""|''')/;
-/** A line that says something: not blank and not only a comment. */
-const meaningfulLine = (l: string): boolean => { const n = norm(l); return n !== "" && !COMMENT.test(n); };
+/**
+ * A line that is shaped like a comment and is read by a tool: it changes what happens, so it is not a comment. A Dockerfile parser
+ * directive can name the frontend that runs the build, a migration tool reads its own `-- +goose` and `-- migrate:` lines, the Go
+ * toolchain runs `//go:generate` and obeys `//go:build` and `//go:embed`, a code generator turns `// +kubebuilder:rbac` into
+ * permissions, and a comment can switch a security scanner off for the line it sits on.
+ */
+const DIRECTIVE = /^(?:#\s*(?:syntax|escape|check)\s*=|(?:--|#|\/\/)\s*\+?(?:goose|migrate)\b|--\s*(?:migrate:|liquibase|changeset|atlas:|flyway)|\/\/\s*(?:go:|\+build|\+kubebuilder|\+k8s|\+genclient|nolint)|\/[/*]\s*(?:@ts-|eslint-|istanbul|webpack)|.*(?:#nosec|\bnosec\b|checkov:skip|trivy:ignore|NOSONAR|pragma:\s*allowlist|\bnoqa\b|lgtm\[|codeql\[))/i;
+/** The C family keeps its preprocessor on lines that start with `#`; they are code. */
+const C_FAMILY = /\.(?:c|h|cc|cpp|cxx|hpp|hh|cu|cuh|m|mm)$/i;
+const PREPROCESSOR = /^#\s*(?:include|define|undef|if|ifdef|ifndef|else|elif|endif|pragma|import|error|warning|line)\b/;
+/** A line that says something: not blank and not only a comment (a comment a tool reads is not only a comment). */
+const meaningfulLine = (l: string, path = ""): boolean => {
+  const n = norm(l);
+  if (n === "") return false;
+  if (!COMMENT.test(n)) return true;
+  return DIRECTIVE.test(n) || (C_FAMILY.test(path) && PREPROCESSOR.test(n));
+};
 
 /**
  * The lines the change really adds and really removes: a line that is removed in one place and added in
@@ -106,13 +121,13 @@ export function netChange(files: RiskFile[]): Net {
   for (const f of files) {
     for (const raw of removedLines(f.patch)) {
       const text = clip(f.path, raw);
-      if (!meaningfulLine(text)) continue;
+      if (!meaningfulLine(text, f.path)) continue;
       removedAll.push({ path: f.path, text });
       lost.set(norm(text), (lost.get(norm(text)) ?? 0) + 1);
     }
     for (const raw of addedLines(f.patch)) {
       const text = clip(f.path, raw);
-      if (meaningfulLine(text)) addedAll.push({ path: f.path, text });
+      if (meaningfulLine(text, f.path)) addedAll.push({ path: f.path, text });
     }
   }
   const added: NetLine[] = [];
@@ -422,7 +437,8 @@ const SECURITY_CODE: Array<[RegExp, string]> = [
   [/\b(?:chmod|chown|setuid|setgid|sudo|CAP_[A-Z_]+|seccomp|apparmor|privileged|allowPrivilegeEscalation|runAsRoot|runAsUser|hostPID|hostNetwork|hostPath|securityContext|NET_ADMIN|SYS_ADMIN)\b/, "privilege or isolation settings"],
   [/\b(?:secretKeyRef|secretRef|SecretStore|ExternalSecret|getSecret|readSecret|decrypt\w*|encrypt\w*|passw(?:or)?d|passphrase|api[_-]?key|private[_-]?key|client[_-]?secret|access[_-]?key|credentials?)\b/i, "secret or credential handling"],
   [/\b(?:cors|csrf|xsrf|helmet|trustProxy)\b|Access-Control-Allow-\w+|Content-Security-Policy|\bSameSite\b|\bHttpOnly\b|X-Forwarded-For/i, "web security settings"],
-  [/(?<![.\w])(?:exec|execSync|execFile|spawn|spawnSync)\(|child_process|\bos\.system\(|\bsubprocess\.|shell\s*:\s*true|(?<![.\w])eval\(|new Function\(|innerHTML|dangerouslySetInnerHTML|pickle\.loads|\bvm\.run\w+/, "code execution or injection surface"],
+  [/(?<![.\w])(?:exec|execSync|execFile|spawn|spawnSync)\(|child_process|\bos\.system\(|\bsubprocess\.|shell\s*:\s*true|(?<![.\w])eval\(|new Function\(|innerHTML|dangerouslySetInnerHTML|pickle\.loads|\bvm\.run\w+|\/\/\s*go:generate\b/, "code execution or injection surface"],
+  [/#nosec|\bnosec\b|checkov:skip|trivy:ignore|NOSONAR|pragma:\s*allowlist|nolint:[^\n]*gosec|noqa:\s*S\d|lgtm\[|codeql\[|eslint-disable[^\n]*security/i, "a security check suppressed"],
 ];
 
 function securityFindings(net: Net): Finding[] {

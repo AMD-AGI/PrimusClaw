@@ -215,6 +215,17 @@ test("a manifest line that is very long costs a bounded amount to read, and is h
   assert.match(r.reasons.join("\n"), /too long to read/);
 });
 
+test("a go.mod full of adversarial lines is read in a bounded time: the module-path pattern cannot overlap itself", () => {
+  const line = `+\t${"a.".repeat(1_999)}/x v`;
+  const started = Date.now();
+  const r = assessRisk(input([file("go.mod", `@@ -1,1 +1,301 @@\n a\n${Array.from({ length: 300 }, () => line).join("\n")}`)]));
+  assert.ok(Date.now() - started < 700, `took ${Date.now() - started} ms`);
+  assert.equal(r.level, "high");
+  // A real module line is still a dependency.
+  assert.match(assessRisk(input([file("go.mod", patchWith("\tgithub.com/foo/bar v1.2.3"))])).reasons.join(), /dependency added or changed/);
+  assert.match(assessRisk(input([file("go.mod", patchWith("\texample.org/a-b.c/d/e v0.1.0"))])).reasons.join(), /dependency added or changed/);
+});
+
 test("a changed line that begins with ++ is read by the line rules like any other", () => {
   for (const line of ["+  chmod 777 /data", "+x; rejectUnauthorized: false", "+-----BEGIN RSA PRIVATE KEY-----"]) {
     assert.equal(assessRisk(input([file("src/x.sh", patchWith(line))])).level, "high", line);
