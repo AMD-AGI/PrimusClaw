@@ -41,7 +41,17 @@ ALLOWED_PUBLISH_ACTIONS = {
     "actions/setup-node",
     "actions/attest-build-provenance",
 }
-REPO_CODE = re.compile(r"\b(npm\s+(ci|install|i|run|test|exec|start)|npx|pnpm|yarn|node\s+scripts/|bash\s+scripts/|make)\b")
+# Anything that could run code from the repository or from the tarball: installs, package scripts,
+# a node script file (the toolchain guard's `node -e` is inline code written in the workflow itself),
+# unpacking and running what was unpacked.
+_cmd = r"(?:^|[;&|(]|&&)\s*"  # a command position: line start or after ; & | (
+REPO_CODE = re.compile(
+    r"\b(?:npm\s+(?:ci|install|i|run|test|exec|start)|npx|pnpm|yarn|make|tar|unzip|python3?|chmod)\b"
+    + r"|" + _cmd + r"node\s+(?!-e\b)\S"
+    + r"|" + _cmd + r"(?:ba)?sh\s+\S"
+    + r"|(?:^|\s)\./",
+    re.M,
+)
 
 
 def triggers(wf):
@@ -186,6 +196,7 @@ mutations = [
     ("no-code", "publish installs dependencies", add_publish_step({"name": "install", "run": "npm ci"})),
     ("no-code", "publish runs a repository script", add_publish_step({"name": "script", "run": "node scripts/anything.mjs"})),
     ("no-code", "publish uses another action", add_publish_step({"uses": "some/action@" + "0" * 40})),
+    ("no-code", "publish unpacks the tarball and runs the bundle", add_publish_step({"name": "run", "run": "tar -xzf x.tgz && node package/dist/cli.js --version"})),
     ("publish-last", "npm publish also runs in package", add_package_step({"name": "early", "run": "npm publish"})),
     ("publish-last", "npm publish is not last", move_publish_up),
     ("guard", "package stops checking the environment", drop_guard),

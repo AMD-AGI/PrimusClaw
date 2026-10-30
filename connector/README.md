@@ -242,7 +242,8 @@ workflow, fails if the workflow file stops having that shape.
 1. Create the environment `npm-publish` (repository Settings > Environments) with **Required reviewers** (the people who may publish),
    **Prevent self-review** on and **Allow administrators to bypass** off. The release run refuses to build until all three hold. To narrow who can
    start a run at all, add a tag ruleset restricting who may create `refs/tags/connector-v*`; a deployment tag rule on the environment alone does not
-   help, since the tag of an unreviewed commit matches it too.
+   help, since the tag of an unreviewed commit matches it too. Do not restrict the environment to "Protected branches only": a release's
+   ref is a tag, so it would be refused.
 2. Publish 0.1.0 once by hand from a clean checkout of the merged `main` (the package must exist before it can be given a Trusted Publisher):
    `cd connector && npm ci && npm publish --access public`, logged in to npm with 2FA.
 3. On npmjs.com, Packages > `@primusclaw/connector` > Settings > Trusted publishing > GitHub Actions: Organization `AMD-AGI`, Repository
