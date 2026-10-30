@@ -209,6 +209,8 @@ describe("K2 every other way SaFE or the provider can answer", () => {
     ["a 200 whose body is a proxy's page, not JSON", (_r, res) => { res.writeHead(200, { "content-type": "text/html" }); res.end("<html>bad gateway</html>"); }, "503"],
     ["a 200 whose body is cut off", (_r, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end('{"code":0,"data":{"id":"u-al'); }, "503"],
     ["a 200 whose body is JSON but not an object", (_r, res) => sendJson(res, 200, "ok"), "503"],
+    ["a 200 whose user id is a number", (_r, res) => sendJson(res, 200, { code: 0, data: { id: 42, platformKey: "ak-x" } }), "503"],
+    ["a 200 whose user id is an object", (_r, res) => sendJson(res, 200, { code: 0, data: { id: { x: 1 }, platformKey: "ak-x" } }), "503"],
     ["500", (_r, res) => sendJson(res, 500, { code: 500, message: "boom" }), "503"],
     ["503", (_r, res) => sendJson(res, 503, { code: 503, message: "the authentication service is unavailable" }), "503"],
     ["a connection that is dropped", (r, res) => { res.destroy(); void r; }, "503"],
@@ -493,9 +495,16 @@ describe("K6 what the rest of the API presents to SaFE for such a caller", () =>
     assert.equal(safeAuthorizationOf(withMethod(IDENTITY_TOKEN_METHOD, { ...alice, platformKey: "" }, { authorization: `Bearer ${token}` })), "", "keyless: nothing, not the token");
   });
 
-  test("and every other caller's header is forwarded as it always was", () => {
+  test("what is sent is the credential that won authentication, not whatever Authorization header the request carries", () => {
     assert.equal(safeAuthorizationOf(withMethod("api_key", alice, { authorization: "Bearer ak-presented" })), "Bearer ak-presented");
+    assert.equal(safeAuthorizationOf(withMethod("api_key", alice, { "x-api-key": "ak-in-the-other-header" })), "Bearer ak-in-the-other-header");
     assert.equal(safeAuthorizationOf(withMethod(null, alice, {})), "");
+    // A cookie that won, with an identity token beside it: the token is not sent.
+    const both = { headers: { cookie: "Token=ck", authorization: "Bearer eyJ.a.b" }, cookies: { Token: "ck" }, user: alice } as any;
+    recordRequestCredential(both, "cookie");
+    assert.equal(safeAuthorizationOf(both), "");
+    // An identity provider's token next to an ak- key that did not win is not what is sent either.
+    assert.equal(safeAuthorizationOf(withMethod(IDENTITY_TOKEN_METHOD, alice, { authorization: "Bearer eyJ.a.b", "x-api-key": "ak-someone-else" })), "Bearer ak-alice-platform");
   });
 
   test("a caller authenticated another way is unchanged: the credential it presented", () => {

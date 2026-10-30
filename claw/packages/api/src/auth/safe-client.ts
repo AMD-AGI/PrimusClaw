@@ -150,7 +150,9 @@ export class SafeClient {
 
   private parseResponse(data: Record<string, unknown>): UserInfo {
     const d = (data.data ?? data) as Record<string, unknown>;
-    const userId = (d.id as string) || "";
+    // A string and not empty: an id of any other kind is not an answer, and must not become somebody's subject.
+    if (d.id !== undefined && d.id !== null && typeof d.id !== "string") throw new SafeUpstreamProtocolError("SaFE returned a user ID that is not a string");
+    const userId = (d.id as string | undefined) || "";
     if (!userId) throw new SafeUpstreamProtocolError("SaFE returned empty user ID");
     // Only a present, non-empty string: the field is optional on SaFE's side and
     // an `email: undefined` key would change what a UserInfo compares equal to.

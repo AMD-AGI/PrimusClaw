@@ -10,6 +10,8 @@
  *   MM1  an identity-token caller: SaFE's models endpoint gets the platform key, and nothing SaFE sees carries the token
  *   MM2  an identity-token caller SaFE has no keys for: SaFE's models endpoint gets no Authorization at all
  *   MM3  an `ak-` key caller: the header it sent is the one SaFE gets, as before
+ *   MM4  a SaFE cookie that wins authentication with an identity token beside it: the token is not sent to SaFE either
+ *   MM5  an `ak-` key in `x-api-key`: sent as the Authorization SaFE accepts (the key won authentication)
  */
 import test, { after, before, beforeEach, describe } from "node:test";
 import assert from "node:assert/strict";
@@ -76,7 +78,8 @@ describe("the models tool and an identity token", () => {
     safe = await startFakeUpstream((req, res) => {
       const path = req.url.split("?")[0];
       if (req.method === "POST" && path === "/api/v1/auth/verify") {
-        const q = JSON.parse(req.body) as { apiKey?: string; authorization?: string };
+        const q = JSON.parse(req.body) as { apiKey?: string; authorization?: string; cookie?: string };
+        if (q.cookie === "Token=ck-cookie-user") return sendJson(res, 200, { data: { id: "cookie-user", name: "Cookie", roles: ["default"], platformKey: "ak-cookie", virtualKey: "sk-cookie" } });
         if (q.apiKey === "ak-direct") return sendJson(res, 200, { data: { id: "direct-user", name: "Direct", roles: ["default"], platformKey: "ak-direct", virtualKey: "sk-direct" } });
         const claims = payloadOf((q.authorization ?? "").replace("Bearer ", ""));
         if (!hasKeys || claims.aud !== "primus-safe" || claims.act?.sub !== CLAW) return sendJson(res, 401, { message: "invalid token" });
@@ -130,6 +133,22 @@ describe("the models tool and an identity token", () => {
     assert.equal(calls.length, 1);
     assert.equal(calls[0]!.headers.authorization, undefined);
     for (const r of safe.seen) assert.ok(!JSON.stringify(r.headers).includes(token) && !r.body.includes(token));
+  });
+
+  test("MM4 a cookie that wins authentication, with an identity token in Authorization beside it: SaFE is not sent the token", async () => {
+    const token = mint();
+    const { status } = await listModels({ cookie: "Token=ck-cookie-user", authorization: `Bearer ${token}` });
+    assert.equal(status, 200);
+    const calls = modelsCalls();
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.headers.authorization, undefined, "a cookie caller has no Authorization to forward, and the token is not one");
+    for (const r of safe.seen) assert.ok(!JSON.stringify(r.headers).includes(token) && !r.body.includes(token), `SaFE was shown the token in ${r.method} ${r.url}`);
+  });
+
+  test("MM5 an ak- key in x-api-key is sent as the Authorization SaFE accepts", async () => {
+    const { status } = await listModels({ "x-api-key": "ak-direct" });
+    assert.equal(status, 200);
+    assert.equal(modelsCalls()[0]!.headers.authorization, "Bearer ak-direct");
   });
 
   test("MM3 an ak- key caller's own header is what SaFE gets, as before", async () => {

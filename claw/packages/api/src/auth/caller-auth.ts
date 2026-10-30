@@ -46,12 +46,12 @@ export function callerAuthOf(req: FastifyRequest): CallerAuth {
 }
 
 /**
- * The `Authorization` value to send SaFE for a route that forwards the caller's own header (the MCP tool that lists
- * models). A caller authenticated by an identity provider's access token must not have it forwarded: it is good for
- * this API, and SaFE is only ever shown the person's platform key (see {@link callerAuthOf}); without one, nothing.
- * Every other caller's header goes as it always did.
+ * The `Authorization` value to send SaFE for a route that forwards the caller's credential to it as a header (the MCP tool
+ * that lists models). It is derived from the credential the middleware actually accepted ({@link callerAuthOf}), never from
+ * whatever `Authorization` header the request happens to carry: a request can carry a SaFE cookie that won authentication
+ * and an identity provider's access token beside it, and that token is good for this API's audience, so SaFE is never
+ * shown it. A caller authenticated by such a token is sent the person's platform key, and nothing without one.
  */
 export function safeAuthorizationOf(req: FastifyRequest): string {
-  if (getAuthMethod(req) === IDENTITY_TOKEN_METHOD) return callerAuthOf(req).authorization ?? "";
-  return (req.headers.authorization as string | undefined) || "";
+  return callerAuthOf(req).authorization ?? "";
 }
