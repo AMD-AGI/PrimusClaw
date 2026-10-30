@@ -24,7 +24,7 @@ import type { Engine } from "../src/agent/index.js";
 import type { NatsEmitter } from "../src/events/emitter.js";
 import type { AppRunner } from "../src/apps/app-runner.js";
 import type { TaskRunnerSideEffects } from "../src/tasks/runner.js";
-import { handleTask, bindTaskDispatchKv, isAppFinishOnly } from "../src/tasks/dispatch.js";
+import { handleTask, bindTaskDispatchKv, isAppFinishOnly, isFinishOnlyDelivery } from "../src/tasks/dispatch.js";
 import { bindTaskLockKv } from "../src/tasks/lock.js";
 import { bindTaskRunnerDeps } from "../src/tasks/runner.js";
 import { activeAbort } from "../src/tasks/abort-registry.js";
@@ -158,3 +158,16 @@ test("isAppFinishOnly is the app + flag pair, nothing looser", () => {
   assert.equal(isAppFinishOnly({ mode: "script", app_finish_only: true }), false);
   assert.equal(isAppFinishOnly({ app_finish_only: true }), false);
 });
+
+// What the delivery layer asks before it parks a message behind the execution gate.
+for (const c of [
+  { name: "an app finish-only dispatch", data: JSON.stringify({ mode: "app", app_finish_only: true, task_id: TASK }), finishOnly: true },
+  { name: "an app run's first dispatch", data: JSON.stringify({ mode: "app", task_id: TASK }), finishOnly: false },
+  { name: "the flag on a mode that ignores it", data: JSON.stringify({ mode: "llm", app_finish_only: true }), finishOnly: false },
+  { name: "a doorbell", data: JSON.stringify({ task_id: TASK, session_id: SESSION, semantics: 1 }), finishOnly: false },
+  { name: "a payload that is not JSON", data: "{not json", finishOnly: false },
+]) {
+  test(`isFinishOnlyDelivery: ${c.name} -> ${c.finishOnly}`, () => {
+    assert.equal(isFinishOnlyDelivery({ data: sc.encode(c.data) }), c.finishOnly);
+  });
+}
