@@ -528,3 +528,25 @@ func testCodeInterpreter() *runtimev1alpha1.CodeInterpreter {
 		},
 	}
 }
+
+func TestWorkloadObjectMarksOwnerKeyWorkload(t *testing.T) {
+	ci := testCodeInterpreter()
+	const sandboxID = "sbx-7a9b9b693452f613877992145c818d29"
+	req := e2b.CreateRequest{SandboxID: sandboxID, TemplateID: "e2b-runner-g1", Role: "e2b", SessionID: "owner-c6c289e49e9c05b214586038",
+		Workspace: "lab", UserID: "user-1", GrantID: "owner-c6c289e49e9c05b214586038", OwnerKey: true}
+	obj, err := workloadObject(sandboxID, req, ci)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obj.GetLabels()["agent-sandbox.io/owner-key"] != "true" || obj.GetLabels()[grantIDLabel] != req.GrantID {
+		t.Fatalf("labels = %v", obj.GetLabels())
+	}
+	req.OwnerKey, req.Attestation = false, "eyJ.test"
+	obj, err = workloadObject(sandboxID, req, ci)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := obj.GetLabels()["agent-sandbox.io/owner-key"]; ok {
+		t.Fatal("grant workload must not carry the owner-key label")
+	}
+}
