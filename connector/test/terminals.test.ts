@@ -168,6 +168,8 @@ describe("reading the rows", () => {
     write(dir, `${live.pid}.json`, { ...base, pid: live.pid, procStart: processStart(live.pid!) });
     write(dir, "recycled.json", { ...base, sessionId: REF2, pid: live.pid, procStart: "1" });
     write(dir, "dead.json", { ...base, pid: gone.pid, procStart: goneStart });
+    // a row with no start time to compare (another platform, a hand-made one) is open only while its pid is alive
+    write(dir, "dead-no-start.json", { ...base, sessionId: REF2, pid: gone.pid, procStart: null });
     write(dir, "foreign.json", { ...base, sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", pid: 999999, procStart: "7", pidDomain: "linux:other-host:pid:[7]" });
     write(dir, "version.json", { ...base, v: 2, pid: live.pid, procStart: processStart(live.pid!) });
     write(dir, "badid.json", { ...base, sessionId: "../x", pid: live.pid, procStart: processStart(live.pid!) });
@@ -278,7 +280,7 @@ describe("merging the hooks into settings.json", () => {
     doc.hooks.SessionStart.push({ matcher: "resume", hooks: [ours("start", dir, "/elsewhere/terminal-hook.js")] });
     fs.writeFileSync(settingsFile(dir), JSON.stringify(doc));
     assert.equal(installHooks(dir, NODE, SCRIPT).changed, true);
-    assert.deepEqual(readSettings(dir).hooks.SessionStart, [{ hooks: [ours("start", dir)] }, { matcher: "resume", hooks: [] }], "one of ours; the group with its own matcher stays, empty");
+    assert.deepEqual(readSettings(dir).hooks.SessionStart, [{ hooks: [ours("start", dir)] }], "one of ours; the groups that held only copies are gone");
   });
 
   test("the file's own indentation is kept", () => {
@@ -335,6 +337,17 @@ describe("merging the hooks into settings.json", () => {
     const none = settingsDir(undefined);
     assert.equal(uninstallHooks(none).changed, false);
     assert.equal(fs.existsSync(settingsFile(none)), false, "uninstall never creates the file");
+  });
+
+  test("uninstall drops a group that held only ours (a matcher too), and keeps the user's entries in a group they share", () => {
+    const dir = settingsDir(undefined);
+    installHooks(dir, NODE, SCRIPT);
+    const doc = readSettings(dir);
+    doc.hooks.SessionStart = [{ matcher: "startup|resume", hooks: doc.hooks.SessionStart[0].hooks }, userStart];
+    doc.hooks.SessionEnd = [{ matcher: "other", hooks: [userEnd.hooks[0], ...doc.hooks.SessionEnd[0].hooks] }];
+    fs.writeFileSync(settingsFile(dir), JSON.stringify(doc));
+    assert.equal(uninstallHooks(dir).changed, true);
+    assert.deepEqual(readSettings(dir), { hooks: { SessionStart: [userStart], SessionEnd: [{ matcher: "other", hooks: [userEnd.hooks[0]] }] } });
   });
 
   test("uninstall also removes the rows", () => {

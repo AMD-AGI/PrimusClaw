@@ -110,8 +110,8 @@ export function installHooks(configDir: string, node: string, script: string): I
         kept.push({ ...(x as Json), ...entry });
       }
       g.hooks = kept;
-      // A group that held only a duplicate of ours is empty now; it is ours to drop, and nothing else is.
-      if (dropped && kept.length === 0 && Object.keys(g).length === 1) { groups.splice(i, 1); i--; }
+      // A group that held only a duplicate of ours is empty now (whatever matcher it has): it is ours to drop, and nothing else is.
+      if (dropped && kept.length === 0) { groups.splice(i, 1); i--; }
     }
     if (!seen) groups.push({ hooks: [entry] });
   }
@@ -139,7 +139,7 @@ export function uninstallHooks(configDir: string): InstallResult {
         if (rest.length === g.hooks.length) continue;
         touched = true;
         g.hooks = rest;
-        if (rest.length === 0 && Object.keys(g).length === 1) groups.splice(i, 1);
+        if (rest.length === 0) groups.splice(i, 1);
       }
       if (touched && groups.length === 0) delete hooks[h.event];
       touchedAny ||= touched;
