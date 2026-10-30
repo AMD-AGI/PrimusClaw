@@ -70,7 +70,12 @@ describe("claw-connector commands", () => {
     assert.equal(fs.statSync(file).mode & 0o777, 0o600);
   });
 
-  /** The sample `init` wrote, with every agent block switched on and its root made real, as the config the connector would load. */
+  /** The file `init` wrote, as `run` would load it (the root made real, nothing else touched): which agents are on, and which of them do not ask. */
+  const loadWritten = (home: string) => {
+    const text = fs.readFileSync(path.join(home, "config", "agents.toml"), "utf8").replaceAll("~/work", tmpdir("w-"));
+    return parseConfig(text, { hostname: "box" }).agents;
+  };
+  /** The same file with every agent block switched on, as it would be once the owner enables the others: what each block's lines are worth. */
   const loadSample = (home: string) => {
     const root = tmpdir("w-");
     const text = fs.readFileSync(path.join(home, "config", "agents.toml"), "utf8")
@@ -79,22 +84,43 @@ describe("claw-connector commands", () => {
   };
   const ASK = [["claude", "default", false, PRESETS.claude!.args.join(" ")], ["codex", "read-only", false, PRESETS.codex!.args.join(" ")], ["cursor", "ask", false, "acp"]];
   const NEVER = [["claude", "bypassPermissions", true, PRESETS.claude!.args.join(" ")], ["codex", "agent-full-access", true, PRESETS.codex!.args.join(" ")], ["cursor", "agent", true, "--force acp"]];
-  const initRows: Array<[string, string[], unknown[][], RegExp]> = [
-    ["by default every agent asks, and the output says how to turn that off", [], ASK, /every agent asks[^]*--approval never/],
-    ["--approval ask is the same as nothing", ["--approval", "ask"], ASK, /every agent asks/],
-    ["--approval never: every agent runs without per-step approval, with its own mode and flags", ["--approval", "never"], NEVER, /no per-step approval for: claude, codex, cursor[^]*unattended[^]*delete the approval = "never" line/],
-    ["--approval claude=never: only that agent", ["--approval", "claude=never"], [NEVER[0]!, ASK[1]!, ASK[2]!], /no per-step approval for: claude\./],
-    ["a later setting wins: never for all, but cursor asks", ["--approval", "never", "--approval", "cursor=ask"], [NEVER[0]!, NEVER[1]!, ASK[2]!], /for: claude, codex\./],
+  // [name, args, what each agent block is worth once enabled, the agents that are on in the written file and run unattended,
+  //  the agents the command says are not on in it (null: it says nothing about any), what it says]
+  const initRows: Array<[string, string[], unknown[][], string[], string | null, RegExp]> = [
+    ["by default every agent asks, and the output says how to turn that off", [], ASK, [], null, /every agent in this file asks[^]*--approval never/],
+    ["--approval ask is the same as nothing", ["--approval", "ask"], ASK, [], null, /every agent in this file asks/],
+    ["--approval never: the agents that are on run without per-step approval, with their own mode and flags; the others carry it for when they are enabled", ["--approval", "never"], NEVER, ["claude"], "codex, cursor", /no per-step approval for: claude\.[^]*unattended[^]*set approval = "ask"/],
+    ["--approval claude=never: only that agent", ["--approval", "claude=never"], [NEVER[0]!, ASK[1]!, ASK[2]!], ["claude"], null, /no per-step approval for: claude\./],
+    ["a later setting wins: never for all, but cursor asks", ["--approval", "never", "--approval", "cursor=ask"], [NEVER[0]!, NEVER[1]!, ASK[2]!], ["claude"], "codex", /for: claude\./],
+    ["--approval codex=never: codex is not on in the file, so nothing runs unattended and the command says so", ["--approval", "codex=never"], [ASK[0]!, NEVER[1]!, ASK[2]!], [], "codex", /every agent in this file asks/],
   ];
-  for (const [name, args, expected, say] of initRows) {
+  for (const [name, args, expected, unattended, parked, say] of initRows) {
     test(`init ${name}`, async () => {
       const home = tmpdir();
       const a = ctx(home);
       assert.equal(await main(["init", ...args], a.c), EXIT.ok);
       assert.deepEqual(loadSample(home), expected);
       assert.match(a.text(), say);
+      if (parked) assert.match(a.text(), new RegExp(`${parked}: not enabled in this file \\(the block is commented out\\), so approval = "never" does nothing there`));
+      else assert.doesNotMatch(a.text(), /not enabled/);
+      // The file as written, not as the owner might edit it: the agents the command says run without asking are exactly the ones
+      // that are on and unattended in it (the message once listed agents the file leaves commented out).
+      const written = loadWritten(home);
+      assert.deepEqual(written.map((x) => x.id), ["claude"], "only Claude is on in the sample");
+      assert.deepEqual(written.filter((x) => x.unattended).map((x) => x.id), unattended);
+      assert.deepEqual(/no per-step approval for: ([a-z, ]+)\./.exec(a.text())?.[1]?.split(", ") ?? [], unattended);
     });
   }
+
+  test("the way back init writes next to approval = never is setting it to ask, which works whatever else the file says", async () => {
+    const home = tmpdir();
+    const a = ctx(home);
+    await main(["init", "--approval", "claude=never"], a.c);
+    const text = fs.readFileSync(path.join(home, "config", "agents.toml"), "utf8");
+    assert.match(text, /To go back to asking, set it to "ask"/);
+    assert.match(a.text(), /To go back, set approval = "ask"/);
+    assert.doesNotMatch(text + a.text(), /delete (this|the approval)/i, "deleting the line is not enough when allow_unsafe_modes = true is set");
+  });
 
   for (const args of [["--approval", "sometimes"], ["--approval", "claude=maybe"], ["--approval", "vim=never"], ["--approval"], ["--no-approval"], ["--approval", "=never"]]) {
     test(`init ${args.join(" ")} is refused and writes nothing`, async () => {

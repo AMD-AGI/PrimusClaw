@@ -258,18 +258,31 @@ export type Approval = "ask" | "never";
 /** The presets `init` can write, in the order they appear in the sample. */
 export const SAMPLE_AGENTS = ["claude", "codex", "cursor"] as const;
 
+/** The ones the sample switches on. The others are written commented out, and an owner enables one by uncommenting it. */
+export const SAMPLE_ACTIVE: readonly string[] = ["claude"];
+
+/**
+ * What the file `init` writes does with a requested `never`: `unattended` are agents that are on in it and run without
+ * per-step approval; `parked` are agents that asked for it but whose block is commented out, so it has no effect until
+ * the owner uncomments the block. The one place that says which agents are on, so the text and the message cannot differ.
+ */
+export function sampleApprovals(approval: Partial<Record<string, Approval>>): { unattended: string[]; parked: string[] } {
+  const never = SAMPLE_AGENTS.filter((id) => approval[id] === "never");
+  return { unattended: never.filter((id) => SAMPLE_ACTIVE.includes(id)), parked: never.filter((id) => !SAMPLE_ACTIVE.includes(id)) };
+}
+
 const NEVER_NOTE = `# No per-step approval: this agent runs like it does in your terminal. A phone session writes files and runs
-# commands without asking, and the phone shows it as unattended. Delete this line (or set "ask") to go back to asking.`;
+# commands without asking, and the phone shows it as unattended. To go back to asking, set it to "ask".`;
 
 /**
  * The text `claw-connector init` writes. `approval` picks, per preset, whether the agent asks before every write
  * and command (the default) or never asks; a preset it does not name asks.
  */
 export function sampleConfig(approval: Partial<Record<string, Approval>> = {}): string {
-  const agent = (id: string, active: boolean): string => {
+  const agent = (id: string): string => {
     const lines = [`[[agents]]`, `id = "${id}"`, `preset = "${id}"`, `roots = ["~/work"]`];
     if (approval[id] === "never") lines.push(...NEVER_NOTE.split("\n"), `approval = "never"`);
-    return lines.map((l) => (active || l.startsWith("#") ? l : `# ${l}`)).join("\n");
+    return lines.map((l) => (SAMPLE_ACTIVE.includes(id) || l.startsWith("#") ? l : `# ${l}`)).join("\n");
   };
   return `# claw-connector: the agents this machine offers, and what they may touch.
 # Policy lives here, on your machine; nothing Claw sends can widen it.
@@ -284,11 +297,7 @@ export function sampleConfig(approval: Partial<Record<string, Approval>> = {}): 
 # are refused for an agent without approval = "never" unless you set this for every agent at once:
 # allow_unsafe_modes = false
 
-${agent("claude", true)}
-
-${agent("codex", false)}
-
-${agent("cursor", false)}
+${SAMPLE_AGENTS.map(agent).join("\n\n")}
 
 # Let one kind of change through without asking, inside the session's directory.
 # Every automatic approval is written to audit.jsonl and shown on the phone.

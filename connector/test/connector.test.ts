@@ -326,21 +326,45 @@ describe("no per-step approval, by the owner's opt-in", () => {
     assert.equal(upd.data.unattended, true);
   });
 
-  test("a mode the owner no longer allows is not brought back by a restart", async () => {
-    const h = await make(NEVER);
-    const sid = await h.newSession();
-    assert.equal(h.claw.eventsOf(sid, "session_started")[0]!.data.currentMode, "bypassPermissions");
-    await h.stop();
-    // The owner goes back to asking: the same home, the same session, the file now says approval = ask.
-    const h2 = await make({ home: path.dirname(h.dirs.state), work: h.work, claw: h.claw, approval: "ask" });
-    await h2.online();
-    h2.prompt(sid, "write back.txt");
-    const perm = await h2.permission(sid);
-    assert.equal(fileExists(path.join(h.work, "back.txt")), false, "asked first");
-    h2.decide(sid, perm.data.actionId, "allow-once");
-    await h2.turnEnd(sid);
-    assert.ok(h2.audit().some((a) => a.kind === "mode_reverted" && a.reason === "no_longer_allowed" && a.from === "bypassPermissions" && a.to === "default"));
-  });
+  // What the README's "to go back" promises: a session recorded in bypassPermissions after the owner changed the file and restarted.
+  // `approval = "ask"` always brings it back asking; deleting the line does only while the file does not set allow_unsafe_modes
+  // (that flag still allows the mode for an agent with no setting of its own, and the phone is told the session is unattended).
+  const ALLOW = "allow_unsafe_modes = true\n";
+  const goBack: Array<[string, Opts, "asks" | "stays unattended"]> = [
+    ["approval = ask", { approval: "ask" }, "asks"],
+    ["the approval line deleted", {}, "asks"],
+    ["approval = ask, with allow_unsafe_modes = true in the file", { approval: "ask", topToml: ALLOW }, "asks"],
+    ["the approval line deleted, with allow_unsafe_modes = true in the file", { topToml: ALLOW }, "stays unattended"],
+  ];
+  for (const [change, opts, outcome] of goBack) {
+    test(`a session recorded in a mode that does not ask, after the owner changed the file to ${change}: it ${outcome}`, async () => {
+      const h = await make(NEVER);
+      const sid = await h.newSession();
+      assert.equal(h.claw.eventsOf(sid, "session_started")[0]!.data.currentMode, "bypassPermissions");
+      await h.stop();
+      // The same home, the same session, the file now says something else.
+      const h2 = await make({ home: path.dirname(h.dirs.state), work: h.work, claw: h.claw, ...opts });
+      await h2.online();
+      const reverted = () => h2.audit().some((a) => a.kind === "mode_reverted" && a.reason === "no_longer_allowed" && a.from === "bypassPermissions" && a.to === "default");
+      if (outcome === "asks") {
+        h2.prompt(sid, "write back.txt");
+        const perm = await h2.permission(sid);
+        assert.equal(fileExists(path.join(h.work, "back.txt")), false, "asked first");
+        h2.decide(sid, perm.data.actionId, "allow-once");
+        await h2.turnEnd(sid);
+        assert.ok(reverted());
+      } else {
+        h2.claw.issue("resume", sid);
+        const resumed = await h2.claw.until("resumed", () => h2.claw.eventsOf(sid, "session_resumed").at(-1));
+        assert.deepEqual([resumed.data.currentMode, resumed.data.unattended], ["bypassPermissions", true], "the phone is told");
+        h2.prompt(sid, "write back.txt unattended");
+        await h2.turnEnd(sid);
+        assert.equal(fs.readFileSync(path.join(h.work, "back.txt"), "utf8"), "unattended");
+        assert.equal(reverted(), false);
+        assert.equal(h2.claw.eventsOf(sid, "permissionRequest").length, 0);
+      }
+    });
+  }
 });
 
 describe("permissions", () => {

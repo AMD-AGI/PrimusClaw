@@ -9,7 +9,7 @@ import { parseArgs } from "node:util";
 import { fileAudit } from "./audit.js";
 import { ChildRegistry, isAlive, processStart } from "./children.js";
 import { ClawClient, HttpError, RevokedError, TransportError } from "./claw-client.js";
-import { ConfigError, SAMPLE_AGENTS, loadConfig, sampleConfig, type Approval, type ConnectorConfig } from "./config.js";
+import { ConfigError, SAMPLE_AGENTS, loadConfig, sampleApprovals, sampleConfig, type Approval, type ConnectorConfig } from "./config.js";
 import {
   CredentialsError, DEFAULT_CLIENT_ID, GrantRevokedError, loadCredentials, providerFor, saveCredentials, type Credentials,
 } from "./credentials.js";
@@ -125,10 +125,12 @@ async function cmdInit(args: string[], ctx: Ctx): Promise<number> {
     throw e;
   }
   ctx.out(`wrote ${file}: edit the roots (the directories an agent may work in), then run: claw-connector login`);
-  const never = Object.entries(approval).filter(([, v]) => v === "never").map(([k]) => k);
-  ctx.out(never.length
-    ? `no per-step approval for: ${never.join(", ")}. Those agents write files and run commands without asking; the phone shows such a session as unattended. To go back, delete the approval = "never" line.`
-    : `every agent asks before it writes a file or runs a command. To let phone sessions run like your terminal instead: claw-connector init --approval never (on a new file), or set approval = "never" on an agent.`);
+  // Say what the file just written does, not what was asked: an agent whose block is commented out is not on.
+  const { unattended, parked } = sampleApprovals(approval);
+  ctx.out(unattended.length
+    ? `no per-step approval for: ${unattended.join(", ")}. Those agents write files and run commands without asking; the phone shows such a session as unattended. To go back, set approval = "ask" on the agent.`
+    : `every agent in this file asks before it writes a file or runs a command. To let phone sessions run like your terminal instead: claw-connector init --approval never (on a new file), or set approval = "never" on an agent.`);
+  if (parked.length) ctx.out(`${parked.join(", ")}: not enabled in this file (the block is commented out), so approval = "never" does nothing there until you uncomment the block.`);
   return EXIT.ok;
 }
 

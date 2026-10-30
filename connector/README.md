@@ -96,7 +96,8 @@ unattended while Cursor keeps asking. For that agent the connector then:
 - lets a phone select any mode the adapter offers (without the setting a phone can only select the safe modes);
 - accepts an adapter's warning that it will not ask for permission, which happens when your own Claude settings default to
   `bypassPermissions`, instead of refusing the session (`mode_not_enforced`). The warning is written to `audit.jsonl`
-  with `accepted: true`. Without the setting that refusal stays;
+  with `accepted: true`. Without the setting that refusal stays, except that `allow_unsafe_modes = true` in the file
+  accepts it too, for every agent that has no `approval` of its own (below);
 - tells the phone: every agent reports `unattended` in its capabilities, and `session_started`, `session_resumed` and
   `mode_update` carry `unattended`, so a client can always show whether a session asks. `status` and the line `run` prints
   at start-up name the agents without per-step approval.
@@ -105,11 +106,21 @@ unattended while Cursor keeps asking. For that agent the connector then:
 a file or a web page, with everything your account can do inside its roots (and `--force` or full access reach outside the
 sandbox the adapter would otherwise keep), and nobody is asked first.
 
-**To go back:** delete the `approval = "never"` line (or set `approval = "ask"`) and restart the connector
-(`claw-connector stop`, then `run`). The policy is read again on start, so a session that was unattended resumes asking.
-`allow_unsafe_modes = true` at the top of the file is the older, coarser form: it lets a phone select unsafe modes for
-every agent and accepts the warning for all of them, but starts sessions in the asking mode; `approval = "ask"` on an
-agent overrides it for that agent.
+**To go back:** set `approval = "ask"` on the agent and restart the connector (`claw-connector stop`, then `run`). The
+policy is read again on start, so a session that was unattended resumes asking. Setting `"ask"` is the way back that
+always works. Deleting the `approval = "never"` line is enough only when the file does not set `allow_unsafe_modes = true`:
+that is the older, coarser form, which lets a phone select unsafe modes for every agent and accepts the warning for all
+of them (but starts sessions in the asking mode), so an agent without an `approval` line of its own still resumes an
+unattended session unattended (the phone shows it). `approval = "ask"` on an agent overrides it for that agent.
+
+**Upgrading.** Two things change for an `agents.toml` that already exists, with no setting needed:
+
+- A file with `allow_unsafe_modes = true` now also accepts an adapter's "will not ask for permission" warning for every
+  agent without its own `approval`. Such a session used to be closed with `mode_not_enforced`; now it opens and is
+  reported `unattended`. Set `approval = "ask"` on an agent to keep refusing it.
+- A preset agent whose `safe_modes` or `ask_mode` names a mode the preset does not know to ask (for example `claude`
+  with `safe_modes = ["default", "plan", "acceptEdits"]`) is now a configuration error, and `claw-connector run` does not
+  start. Remove the mode, or set `approval = "never"` on that agent (or `allow_unsafe_modes = true` in the file).
 
 ## What the connector enforces
 
@@ -121,7 +132,8 @@ All of these run on your machine and fail closed.
 - **Ask mode, read back.** After the adapter creates a session, the connector sets the agent's ask mode and reads the
   mode back from the adapter. Your own agent settings may start an adapter in a mode that never asks (bypass, full
   access); an adapter that does not confirm the ask mode, or that warns it will not invoke its permission callback, is
-  not opened, unless you set `approval = "never"` for that agent (above), which accepts the warning and records it. A mode
+  not opened, unless you set `approval = "never"` for that agent (above) or `allow_unsafe_modes = true` for the file,
+  either of which accepts the warning and records it. A mode
   change the agent makes on its own to a mode outside the allowed list is undone at once. The adapter's
   `session/resume` can reset the mode, so it is locked again after every resume.
 - **Unsafe modes.** Modes in which the agent does not ask before writing (`acceptEdits`, `bypassPermissions`, Codex write and full-access
