@@ -84,8 +84,11 @@ describe("the hook: what it registers", () => {
         assert.equal(rows[0]!.pid, claude.pid, "the row names the claude process");
         assert.equal(rows[0]!.via, "hook");
         const file = path.join(terminalsDir(dir), `${claude.pid}.json`);
-        assert.equal(fs.statSync(file).mode & 0o777, 0o600);
-        assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).procStart, processStart(claude.pid!), "with the start time that tells it from a recycled pid");
+        const fd = fs.openSync(file, "r"); // one handle for the mode and the content: the file cannot change between the two
+        try {
+          assert.equal(fs.fstatSync(fd).mode & 0o777, 0o600);
+          assert.equal(JSON.parse(fs.readFileSync(fd, "utf8")).procStart, processStart(claude.pid!), "with the start time that tells it from a recycled pid");
+        } finally { fs.closeSync(fd); }
       } else {
         assert.deepEqual(rows, [], "nothing written");
         assert.equal(fs.existsSync(terminalsDir(dir)), false);
