@@ -1,0 +1,25 @@
+name: zz envprobe tmp
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/zz-envprobe-tmp.yml"
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Read environments with the default-scoped token
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for e in copilot npm-publish; do
+            echo "== $e"
+            if out="$(gh api "repos/$GITHUB_REPOSITORY/environments/$e" 2>&1)"; then
+              jq -c '{name, can_admins_bypass, rules: [.protection_rules[]? | {type, prevent_self_review, reviewers: ((.reviewers // []) | length)}]}' <<<"$out"
+            else
+              echo "ERR: $out" | head -c 300
+            fi
+          done
+          jq --version
