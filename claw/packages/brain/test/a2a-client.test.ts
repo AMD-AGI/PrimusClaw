@@ -173,8 +173,8 @@ test("a card that names an endpoint elsewhere is refused before anything is sent
   ];
   for (const [what, urlFor] of table) {
     const p = await standardPeer({ card: ({ origin }) => card(origin, [jsonrpc(urlFor(origin))]) });
-    registry([entry(p, { auth_env: "A2A_TEST_TOKEN" })]);
-    process.env.A2A_TEST_TOKEN = "tok-sentinel";
+    registry([entry(p, { auth_env: "A2A_PEER_TOKEN_TEST" })]);
+    process.env.A2A_PEER_TOKEN_TEST = "tok-sentinel";
     const out = await call({ message: "hi" });
     assert.match(out, /not the origin of its card_url or url/, what);
     assert.equal(p.rpcs().length, 0, `${what}: nothing was sent to the peer`);
@@ -187,7 +187,7 @@ test("a card that names an endpoint elsewhere is refused before anything is sent
   registry([entry(p, { url: victim.origin })]);
   await call({ message: "hi" });
   assert.equal(victim.seen.length, 1, "an origin the operator wrote down is allowed");
-  delete process.env.A2A_TEST_TOKEN;
+  delete process.env.A2A_PEER_TOKEN_TEST;
 });
 
 test("a card without a usable JSONRPC 1.0 interface is an error that says what it found", async () => {
@@ -587,7 +587,7 @@ test("Stop still cancels the peer's task when its card is no longer fresh", asyn
 
 test("a failed CancelTask does not put the peer's echo of its credential in the log", async () => {
   const TOKEN = "svc-log-token-sentinel-7c1e9d";
-  process.env.A2A_TEST_TOKEN = TOKEN;
+  process.env.A2A_PEER_TOKEN_TEST = TOKEN;
   try {
     const p = await standardPeer({
       rpc: (req, res, seen) => {
@@ -596,7 +596,7 @@ test("a failed CancelTask does not put the peer's echo of its credential in the 
         sse(res).event({ task: { id: `t-${auth}`, contextId: "c-s", status: { state: "TASK_STATE_WORKING" } } });
       },
     });
-    registry([entry(p, { auth_env: "A2A_TEST_TOKEN" })]);
+    registry([entry(p, { auth_env: "A2A_PEER_TOKEN_TEST" })]);
     const stop = new AbortController();
     setTimeout(() => stop.abort(), 150);
     let out = "";
@@ -608,13 +608,13 @@ test("a failed CancelTask does not put the peer's echo of its credential in the 
     for (const l of lines) assert.ok(!l.includes(TOKEN), `the credential reached the log: ${l.slice(0, 300)}`);
     assert.ok(!out.includes(TOKEN), "nor the result");
   } finally {
-    delete process.env.A2A_TEST_TOKEN;
+    delete process.env.A2A_PEER_TOKEN_TEST;
   }
 });
 
 test("a task id the peer made out of its credential is not logged as it is", async () => {
   const TOKEN = "svc-log-token-sentinel-4b8f2a";
-  process.env.A2A_TEST_TOKEN = TOKEN;
+  process.env.A2A_PEER_TOKEN_TEST = TOKEN;
   try {
     const p = await standardPeer({
       rpc: (req, res) => {
@@ -624,7 +624,7 @@ test("a task id the peer made out of its credential is not logged as it is", asy
         s.end();
       },
     });
-    registry([entry(p, { auth_env: "A2A_TEST_TOKEN" })]);
+    registry([entry(p, { auth_env: "A2A_PEER_TOKEN_TEST" })]);
     let out = "";
     const lines = await captureLogLines(async () => { out = await call({ message: "x" }); }, "a2a.call");
     const info = lines.filter((l) => l.includes('"msg":"a2a.call"'));
@@ -633,7 +633,7 @@ test("a task id the peer made out of its credential is not logged as it is", asy
     for (const l of lines) assert.ok(!l.includes(TOKEN), `the credential reached the log: ${l.slice(0, 300)}`);
     assert.ok(!out.includes(TOKEN));
   } finally {
-    delete process.env.A2A_TEST_TOKEN;
+    delete process.env.A2A_PEER_TOKEN_TEST;
   }
 });
 
@@ -747,18 +747,18 @@ test("an identity peer's card is per user; a service-credential peer's is shared
   await call({ mode: "discover" }, { identity: id, userId: "bob" });
   assert.equal(gets(), 2, "bob never reads the card alice's identity fetched");
 
-  process.env.A2A_TEST_TOKEN = "svc";
-  registry([entry(p, { auth_env: "A2A_TEST_TOKEN" })]);
+  process.env.A2A_PEER_TOKEN_TEST = "svc";
+  registry([entry(p, { auth_env: "A2A_PEER_TOKEN_TEST" })]);
   const before = gets();
   await call({ mode: "discover" }, { userId: "alice" });
   await call({ mode: "discover" }, { userId: "bob" });
   assert.equal(gets() - before, 1);
-  delete process.env.A2A_TEST_TOKEN;
+  delete process.env.A2A_PEER_TOKEN_TEST;
 });
 
 test("an entry cannot ask for both ways to authenticate, and a misspelt key is refused rather than ignored", () => {
   const bad: Array<[string, Record<string, unknown>, RegExp]> = [
-    ["both", { name: "p", url: "https://x.example", auth_env: "T", audience: "a" }, /set one/],
+    ["both", { name: "p", url: "https://x.example", auth_env: "A2A_PEER_TOKEN_T", audience: "a" }, /set one/],
     ["scope without audience", { name: "p", url: "https://x.example", scope: "claw.api" }, /scope only applies with audience/],
     ["a misspelt audience", { name: "p", url: "https://x.example", audiance: "a" }, /unknown key "audiance"/],
     ["a camel-cased card url", { name: "p", cardUrl: "https://x.example/c" }, /unknown key "cardUrl"/],
@@ -785,7 +785,7 @@ test("a peer that echoes the credential it was sent cannot put it in front of th
     ["URL-encoded", (t) => encodeURIComponent(t)],
   ];
   const TOKEN = "svc/token+sentinel==with.odd:chars-9f3a";
-  process.env.A2A_TEST_TOKEN = TOKEN;
+  process.env.A2A_PEER_TOKEN_TEST = TOKEN;
   try {
     for (const [how, echo] of echoes) {
       const p = await standardPeer({
@@ -802,7 +802,7 @@ test("a peer that echoes the credential it was sent cannot put it in front of th
           s.end();
         },
       });
-      registry([entry(p, { auth_env: "A2A_TEST_TOKEN" })]);
+      registry([entry(p, { auth_env: "A2A_PEER_TOKEN_TEST" })]);
       const outs = [
         await call({ message: "x" }),
         await call({ mode: "get", task_id: "t" }),
@@ -814,7 +814,7 @@ test("a peer that echoes the credential it was sent cannot put it in front of th
       assert.match(outs[2], /card says .*\[credential removed\]/, how);
     }
   } finally {
-    delete process.env.A2A_TEST_TOKEN;
+    delete process.env.A2A_PEER_TOKEN_TEST;
   }
 });
 
@@ -847,7 +847,7 @@ test("scrubCredentials removes every occurrence; a short credential only as a wh
 });
 
 test("a peer echoing a SHORT service credential cannot put it in front of the model either", async () => {
-  process.env.A2A_TEST_TOKEN = "abc";
+  process.env.A2A_PEER_TOKEN_TEST = "abc";
   try {
     const p = await standardPeer({
       rpc: (req, res) => {
@@ -856,11 +856,11 @@ test("a peer echoing a SHORT service credential cannot put it in front of the mo
         s.end();
       },
     });
-    registry([entry(p, { auth_env: "A2A_TEST_TOKEN" })]);
+    registry([entry(p, { auth_env: "A2A_PEER_TOKEN_TEST" })]);
     const out = parse(await call({ message: "x" }));
     assert.equal(out.text, "Authorization: Bearer [credential removed]");
   } finally {
-    delete process.env.A2A_TEST_TOKEN;
+    delete process.env.A2A_PEER_TOKEN_TEST;
   }
 });
 

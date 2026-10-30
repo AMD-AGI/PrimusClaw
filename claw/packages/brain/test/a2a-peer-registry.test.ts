@@ -18,7 +18,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 
 import {
-  handleA2ACall, initA2ARegistry, isLocalAddress, parseA2AAgents,
+  A2A_PEER_TOKEN_PREFIX, handleA2ACall, initA2ARegistry, isLocalAddress, parseA2AAgents,
 } from "../src/clients/a2a.js";
 import { ToolRouter } from "../src/tools/router.js";
 
@@ -338,4 +338,59 @@ test("A2A_AGENTS parsing: both forms, and a bad entry is dropped and reported, n
   const mixed = parseA2AAgents(JSON.stringify([{ name: "ok", url: "https://ok.example" }, { name: "bad name", url: "https://x.example" }]));
   assert.deepEqual(mixed.peers.map((p) => p.name), ["ok"], "one bad entry does not drop its neighbours");
   assert.equal(mixed.errors.length, 1);
+});
+
+// ── auth_env must name a variable set aside for peers ───────────────────────
+
+test("auth_env must start with A2A_PEER_TOKEN_: any other variable is refused, with a message that says why", () => {
+  const table: Array<[string, boolean]> = [
+    // the deployment-wide secrets an entry could otherwise be pointed at
+    ["ANTHROPIC_API_KEY", false], ["ANTHROPIC_AUTH_TOKEN", false], ["OPENAI_API_KEY", false],
+    ["LLM_API_KEY", false], ["PLATFORM_KEY", false], ["DATABASE_URL", false], ["NATS_TOKEN", false],
+    // near misses: the prefix must be the start of the name, whole, and in upper case
+    ["A2A_PEER_TOKEN", false], ["A2A_PEER_TOKENS_CI", false], ["A2A_PEER_TOKE_CI", false],
+    ["XA2A_PEER_TOKEN_CI", false], ["MY_A2A_PEER_TOKEN_CI", false], ["_A2A_PEER_TOKEN_CI", false],
+    ["a2a_peer_token_ci", false], ["A2a_Peer_Token_CI", false],
+    // not even a variable name stays refused for its own reason
+    ["A2A_PEER_TOKEN_CI; rm -rf /", false], ["A2A_PEER_TOKEN_C-I", false],
+    // the names an operator is told to use
+    ["A2A_PEER_TOKEN_CI", true], ["A2A_PEER_TOKEN_DEV_1", true], ["A2A_PEER_TOKEN_x", true],
+  ];
+  for (const [authEnv, accepted] of table) {
+    const r = parseA2AAgents(JSON.stringify([{ name: "ci", url: "https://ci.example", auth_env: authEnv }]));
+    if (accepted) {
+      assert.deepEqual(r.errors, [], authEnv);
+      assert.deepEqual(r.peers.map((p) => p.authEnv), [authEnv], authEnv);
+    } else {
+      assert.equal(r.peers.length, 0, `${authEnv}: the peer is not registered`);
+      assert.equal(r.errors.length, 1, `${authEnv}: one error is reported`);
+      assert.match(r.errors[0], /peer "ci"/, `${authEnv}: the message names the peer`);
+      assert.ok(r.errors[0].includes(authEnv) || /environment variable name/.test(r.errors[0]), `${authEnv}: the message names the variable`);
+    }
+  }
+  // The refusals that are about the prefix say so, and say what to use instead.
+  const r = parseA2AAgents(JSON.stringify([{ name: "ci", url: "https://ci.example", auth_env: "ANTHROPIC_API_KEY" }]));
+  assert.match(r.errors[0], new RegExp(`must name a variable that starts with ${A2A_PEER_TOKEN_PREFIX}`));
+  assert.match(r.errors[0], /A2A_PEER_TOKEN_CI/);
+  assert.equal(A2A_PEER_TOKEN_PREFIX, "A2A_PEER_TOKEN_");
+});
+
+test("an entry whose auth_env names the user's or the platform key is never registered, so nothing reaches the peer", async () => {
+  const p = await peer();
+  // Both are set in the process (beforeEach) to the sentinels, exactly as a real deployment has them.
+  for (const authEnv of ["ANTHROPIC_AUTH_TOKEN", "LLM_API_KEY", "PLATFORM_KEY"]) {
+    registry([
+      { name: "bad", url: `http://127.0.0.1:${p.port}`, allow_local: true, auth_env: authEnv },
+      { name: "good", url: `http://127.0.0.1:${p.port}`, allow_local: true, auth_env: "A2A_PEER_TOKEN_TEST" },
+    ]);
+    for (const mode of ["stream", "fire_and_forget", "discover"]) {
+      const out = await handleA2ACall({ agent: "bad", message: "hi", mode });
+      assert.match(out, /Unknown agent "bad"/, `${authEnv} / ${mode}: ${out}`);
+      assert.match(out, /Available: good/, `${authEnv} / ${mode}: its neighbour still loads`);
+    }
+    assert.equal(p.seen.length, 0, `${authEnv}: the peer received nothing`);
+    // the neighbour with a conforming auth_env is called with its own token, and only that
+    assert.equal(JSON.parse(await handleA2ACall({ agent: "good", message: "hi" })).text, "hello from peer");
+    assertNoForeignCredential(p.seen.splice(0), `Bearer ${PEER_TOKEN}`, authEnv);
+  }
 });

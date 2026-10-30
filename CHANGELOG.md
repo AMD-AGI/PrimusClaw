@@ -228,9 +228,12 @@ record it.
   (the variable its entry's `auth_env` names; none when it names none), a peer on a loopback or link-local
   address is refused unless its entry sets `allow_local`, and redirects are not followed. `A2A_AGENTS` also
   accepts a JSON array carrying those fields; the `name=url` list still works and sends no credential.
-  A call that relied on passing a URL (for example to the API's own A2A endpoint, authenticated with the
-  user's key) must now go through a configured peer with its own credential. See
-  `claw/docs/agent-server-design.md`, "Outbound `a2a_call`".
+  `auth_env` must name a variable that starts with `A2A_PEER_TOKEN_`; an entry naming any other variable
+  (for example `ANTHROPIC_API_KEY`) is refused at start-up and not registered, so a peer entry cannot be
+  pointed at a deployment-wide secret.
+  **Breaking:** a call that relied on passing a URL (for example to the API's own A2A endpoint,
+  authenticated with the user's key) must now go through a configured peer with its own credential.
+  See `claw/docs/agent-server-design.md`, "Outbound `a2a_call`".
 - `redactSecrets` no longer takes quadratic time on a long line. The URL-credential pass rescanned a run of
   letters from every position in it when no `://` followed, so one line of 64 KB of letters held the event loop
   for about sixteen seconds in every caller (event redaction, previews, the new changes route). The scheme is now

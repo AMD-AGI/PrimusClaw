@@ -90,6 +90,11 @@ function isErrorResponse(r: JsonRpcResponse): r is JsonRpcErrorResponse {
 // the origin the operator wrote down (`card_url`'s, or `url`'s): a peer that could
 // redirect the call, and the credential with it, to another host would defeat the
 // allowlist.
+//
+// `auth_env` must name a variable that starts with A2A_PEER_TOKEN_. The model cannot
+// choose it, but an operator's entry could otherwise point at a deployment-wide secret
+// (ANTHROPIC_API_KEY, the platform key) and send it to a peer. An entry that names any
+// other variable is refused when the registry loads, with a message saying why.
 // ---------------------------------------------------------------------------
 export interface A2APeer {
   name: string;
@@ -120,6 +125,8 @@ const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const AUDIENCE = /^[\x21-\x7e]{1,256}$/;
 const SCOPE = /^[A-Za-z0-9._:/-]+( [A-Za-z0-9._:/-]+)*$/;
 const ENTRY_KEYS = new Set(["name", "url", "card_url", "auth_env", "allow_local", "audience", "scope"]);
+/** The only variables a peer entry may read its token from: ones set aside for peers. */
+export const A2A_PEER_TOKEN_PREFIX = "A2A_PEER_TOKEN_";
 
 function httpUrl(name: string, what: string, value: unknown): URL {
   let parsed: URL;
@@ -161,6 +168,13 @@ function toPeer(e: Record<string, unknown>): A2APeer {
   const card = cardUrl === undefined ? undefined : httpUrl(name, "card_url", cardUrl);
   if (authEnv !== undefined && (typeof authEnv !== "string" || !ENV_NAME.test(authEnv))) {
     throw new Error(`peer "${name}": auth_env must be an environment variable name`);
+  }
+  if (typeof authEnv === "string" && !authEnv.startsWith(A2A_PEER_TOKEN_PREFIX)) {
+    throw new Error(
+      `peer "${name}": auth_env ${authEnv} is refused; it must name a variable that starts with `
+      + `${A2A_PEER_TOKEN_PREFIX} (for example ${A2A_PEER_TOKEN_PREFIX}${name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}), `
+      + "so a peer can only ever be sent a token set aside for peers, never a deployment-wide secret",
+    );
   }
   if (allowLocal !== undefined && typeof allowLocal !== "boolean") throw new Error(`peer "${name}": allow_local must be a boolean`);
   if (audience !== undefined && (typeof audience !== "string" || !AUDIENCE.test(audience))) {

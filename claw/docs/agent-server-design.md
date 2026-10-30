@@ -448,9 +448,10 @@ are not sent to a peer (they used to be, as the bearer of every call).
 An entry needs `url` (a base URL) or `card_url` (the Agent Card's address; with only `url` it is
 `<url>/.well-known/agent-card.json`). Its other keys are `auth_env`, `audience`, `scope` (only with `audience`)
 and `allow_local`. An entry that does not parse (a name that is not `[A-Za-z0-9][A-Za-z0-9._-]*`, a non-http(s)
-URL, a URL with embedded credentials, an `auth_env` that is not a variable name, a non-boolean `allow_local`, a key
-that is not one of those listed -- a misspelt `audience` must not leave a peer called without it -- or both
-`auth_env` and `audience`) is dropped and logged as `a2a.registry.entry_refused`; its neighbours still load.
+URL, a URL with embedded credentials, an `auth_env` that is not a variable name or does not start with
+`A2A_PEER_TOKEN_`, a non-boolean `allow_local`, a key that is not one of those listed -- a misspelt `audience`
+must not leave a peer called without it -- or both `auth_env` and `audience`) is refused when Brain starts: it
+is logged as `a2a.registry.entry_refused` with the reason and not registered, and its neighbours still load.
 Entries carry an optional owner in the registry, so a later step can add a user's own peers without changing the
 callers; today every entry is the operator's and every session's.
 
@@ -475,6 +476,8 @@ another's.
   owner needs a binding at identity (`backfill-bindings`), and the service client needs the audience in its
   allowed audiences and the scope among the exchange scopes (`PRIMUS_IDENTITY_EXCHANGE_SCOPES`).
 - `auth_env`: the peer's own token, read from the variable the entry names; the peer sees Claw, not the user.
+  The name must start with `A2A_PEER_TOKEN_`, so a peer entry cannot be pointed at a deployment-wide secret
+  such as `ANTHROPIC_API_KEY`: the only variables a peer can be sent are ones set aside for peers.
   A named variable that is empty makes the peer uncallable (the call fails, it is never sent unauthenticated).
 - Neither: no `Authorization` at all.
 
