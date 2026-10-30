@@ -434,6 +434,27 @@ describe("K5 how long an answer is kept", () => {
   });
 });
 
+describe("K5b SaFE's client keeps only what it is told it may", () => {
+  test("a verification asked for without its cache neither reads nor writes it: not an answer, not a refusal", async () => {
+    const delegated = signJwt({
+      key: es, claims: { iss: fake.issuer, aud: "primus-safe", sub: "u-alice", scope: "safe.api", act: { sub: CLAW }, jti: "d1", iat: nowSec(), exp: nowSec() + 300 },
+    });
+    for (let i = 0; i < 2; i++) assert.equal((await client.verifyAccessToken(delegated, { cache: false })).userId, "u-alice");
+    assert.equal(verifyCalls().length, 2);
+    verifyAnswer = (_r, res) => sendJson(res, 401, { code: 401, message: "invalid token" });
+    for (let i = 0; i < 2; i++) await assert.rejects(client.verifyAccessToken(delegated, { cache: false }));
+    assert.equal(verifyCalls().length, 4, "a refusal is not kept either");
+  });
+
+  test("by default it still keeps both, as it does for a cookie and a key", async () => {
+    const delegated = signJwt({
+      key: es, claims: { iss: fake.issuer, aud: "primus-safe", sub: "u-alice", scope: "safe.api", act: { sub: CLAW }, jti: "d2", iat: nowSec(), exp: nowSec() + 300 },
+    });
+    for (let i = 0; i < 2; i++) assert.equal((await client.verifyAccessToken(delegated)).userId, "u-alice");
+    assert.equal(verifyCalls().length, 1);
+  });
+});
+
 describe("K6 what the rest of the API presents to SaFE for such a caller", () => {
   const withMethod = (method: string | null, userRecord: unknown, headers: Record<string, unknown> = {}) => {
     const req = { headers, cookies: {}, user: userRecord } as any;
