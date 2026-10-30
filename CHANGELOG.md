@@ -311,7 +311,7 @@ record it.
   left, not per token and not for a fixed time. Before, such a caller had no model key (a turn failed with "Could not
   resolve authentication method"), no key to create a sandbox with, and `GET /v1/me` answered 401. A SaFE that does
   not accept the delegated token, or a provider that refuses the exchange, leaves the caller without keys; one that
-  cannot be reached is a 503. A SaFE 5xx is no longer remembered as a failed verification of a cookie or key for 30
+  cannot be reached, or answers 200 with something that is not an answer, is a 503. The MCP models tool no longer forwards such a caller's token to SaFE (it sends the platform key). A SaFE 5xx is no longer remembered as a failed verification of a cookie or key for 30
   seconds. See `claw/docs/identity-client.md`.
 - A sandbox rebuilt from the workspace snapshot is still a git repository. `.git` was on the
   snapshot's exclude list, so after the idle window the files came back and the history did not,

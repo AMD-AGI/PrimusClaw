@@ -173,7 +173,7 @@ question.
 | an id that is not the token's `sub` (those keys would be somebody else's), or a person SaFE holds no keys for | no keys; kept 30 seconds, the decision is made on every request |
 | SaFE answers 401 or another 4xx (it does not accept this issuer or audience, or was not told about this actor) | authenticated, no keys; kept 30 seconds so SaFE is not asked on every request. The log says why (`auth.identity_token.no_safe_keys`) |
 | the provider refuses the exchange (`unauthorized_client`: its client is not registered to exchange access tokens; `invalid_grant`: the person's grant is gone, `invalid_target`: no such audience for this client) | authenticated, no keys; kept 30 seconds. The log says which refusal (`delegation_refused_<code>`) |
-| SaFE 5xx or no answer, the provider 5xx, a timeout, or the provider refusing this client's own credentials | 503 `authentication_service_unavailable`, not remembered: the next request asks again |
+| SaFE 5xx or no answer, a 200 from SaFE that is not an answer (a proxy's page, a cut-off body, no user id), the provider 5xx, a timeout, or the provider refusing this client's own credentials | 503 `authentication_service_unavailable`, not remembered: the next request asks again |
 | (no `AUTH_INTERNAL_TOKEN` to ask with) | 500 `authentication_misconfigured`, as for a cookie or a key |
 
 A caller without keys is not refused. They can read and write their own sessions, but a
@@ -197,6 +197,8 @@ What has to be set up, and what is not done:
   SaFE needs no name of this API beyond that client id.
 - A token that is itself delegated (RFC 8693, with an `act` claim: a service acting for the person) is
   not exchanged again. Such a caller has no keys.
+- The person's token is not forwarded to SaFE by any route. The MCP tool that lists models, which sends the
+  caller's own `Authorization` header to SaFE, sends such a caller's platform key instead (nothing if they have none).
 - The roles in SaFE's answer are ignored, as the token's are: only
   `CLAW_IDENTITY_TOKEN_TRUSTED_ROLES` makes a token's caller an administrator.
 - The Kubernetes deployment mode has no SaFE to ask; a token's caller has no keys there.
