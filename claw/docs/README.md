@@ -22,6 +22,7 @@ wins.
 | [`litellm-auto-routing-design.md`](litellm-auto-routing-design.md) | Complexity-based model routing through the LiteLLM gateway |
 | [`plugins.md`](plugins.md) | The plugin format and the marketplace import path |
 | [`platform-defaults.md`](platform-defaults.md) | Deployment-level default skills and MCP servers mounted into every chat, with progressive skill loading |
+| [`a2a.md`](a2a.md) | The A2A server: contexts and tasks, approvals through `INPUT_REQUIRED`, cancel, streams, the agent card, push notifications, the switches |
 | [`identity-client.md`](identity-client.md) | The shared OIDC / introspection / token-exchange client: settings, cache windows, behaviour when the provider is down, metrics |
 | [`github-review.md`](github-review.md) | Reviewing and merging a public GitHub pull request with a named user's account: the tools, every gate, the high-risk hold and the acting user's confirmation, the diff-only fast path, audit and limits |
 | [`run-api.md`](run-api.md) | Platform run status, terminal classification, batch reads, and cursor pagination |

@@ -191,7 +191,7 @@ document_of "$tmp/token.yaml" "primus-claw/templates/brain-deployment.yaml" >"$t
 if rg -q 'CLAW_IDENTITY_TOKEN_' "$tmp/brain.token"; then bad "Brain was given a CLAW_IDENTITY_TOKEN_ entry"; fi
 [ "$(rg -c 'name: CLAW_IDENTITY_TOKEN_AUTH_ENABLED$' "$tmp/token.yaml")" = 1 ] \
   || bad "CLAW_IDENTITY_TOKEN_AUTH_ENABLED should render in exactly one Deployment"
-for optional in CLAW_IDENTITY_TOKEN_AUDIENCE CLAW_IDENTITY_TOKEN_SCOPE CLAW_IDENTITY_TOKEN_INTROSPECT; do
+for optional in CLAW_IDENTITY_TOKEN_AUDIENCE CLAW_IDENTITY_TOKEN_SCOPE CLAW_IDENTITY_TOKEN_INTROSPECT CLAW_IDENTITY_TOKEN_TRUSTED_ROLES; do
   if rg -q "name: $optional\$" "$tmp/api.token"; then bad "$optional rendered although unset"; fi
 done
 # It rides on the identity client's own entries, which are still there.
@@ -207,6 +207,21 @@ want_token CLAW_IDENTITY_TOKEN_SCOPE other.scope
 want_token CLAW_IDENTITY_TOKEN_INTROSPECT true
 ok "audience, scope and introspection render when set"
 
+# Roles a token may confer: none unless named, and only the two platform administrator roles can be.
+render "$tmp/token-roles.yaml" "${base[@]}" "${enabled[@]}" --set identity.tokenAuth.enabled=true \
+  --set 'identity.tokenAuth.trustedRoles={system-admin,system-admin-readonly}'
+document_of "$tmp/token-roles.yaml" "primus-claw/templates/api-deployment.yaml" >"$tmp/api.token-roles"
+[ "$(env_value "$tmp/api.token-roles" CLAW_IDENTITY_TOKEN_TRUSTED_ROLES)" = "system-admin,system-admin-readonly" ] \
+  || bad "identity.tokenAuth.trustedRoles did not render as CLAW_IDENTITY_TOKEN_TRUSTED_ROLES=system-admin,system-admin-readonly, got \"$(env_value "$tmp/api.token-roles" CLAW_IDENTITY_TOKEN_TRUSTED_ROLES)\""
+render "$tmp/token-roles-empty.yaml" "${base[@]}" "${enabled[@]}" --set identity.tokenAuth.enabled=true --set-json 'identity.tokenAuth.trustedRoles=[]'
+cmp -s "$tmp/token.yaml" "$tmp/token-roles-empty.yaml" || bad "an empty identity.tokenAuth.trustedRoles changed the render"
+render "$tmp/token-roles-staged.yaml" "${base[@]}" "${enabled[@]}" --set 'identity.tokenAuth.trustedRoles={system-admin}'
+cmp -s "$tmp/on.yaml" "$tmp/token-roles-staged.yaml" || bad "identity.tokenAuth.trustedRoles changed the render while identity.tokenAuth.enabled is false"
+if rg -q 'CLAW_IDENTITY_TOKEN_TRUSTED_ROLES' "$tmp/token.yaml" "$tmp/token-opt.yaml"; then
+  bad "CLAW_IDENTITY_TOKEN_TRUSTED_ROLES rendered although identity.tokenAuth.trustedRoles is unset"
+fi
+ok "trusted roles render only when named, and only for the API"
+
 echo "==> refusals"
 
 refuses "enabled with no issuer" "identity.issuerUrl is required" \
@@ -221,6 +236,10 @@ refuses "identity.tokenAuth.enabled without identity.enabled" "identity.tokenAut
   "${base[@]}" --set identity.tokenAuth.enabled=true
 refuses "identity.tokenAuth.enabled as a string that is not a boolean" "tokenAuth.enabled: Invalid type" \
   "${base[@]}" "${enabled[@]}" --set-string identity.tokenAuth.enabled=yes
+refuses "identity.tokenAuth.trustedRoles naming a role that cannot be adopted" "trustedRoles" \
+  "${base[@]}" "${enabled[@]}" --set identity.tokenAuth.enabled=true --set 'identity.tokenAuth.trustedRoles={default}'
+refuses "identity.tokenAuth.trustedRoles as a string" "trustedRoles" \
+  "${base[@]}" "${enabled[@]}" --set identity.tokenAuth.enabled=true --set-string identity.tokenAuth.trustedRoles=system-admin
 for bad_number in -1 abc 1.5 9999999999; do
   refuses "identity.cache.positiveSeconds=$bad_number" "positiveSeconds" \
     "${base[@]}" --set-string "identity.cache.positiveSeconds=$bad_number"

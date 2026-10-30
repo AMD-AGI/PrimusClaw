@@ -374,6 +374,15 @@ export interface DeliveryDeps {
    */
   isWakeup?(msg: JsMsg): boolean;
   /**
+   * An app run's finish-only dispatch. It provisions nothing -- it ends a run row
+   * and revokes its grant -- so it neither waits for an execution slot nor is
+   * refused for the lack of one. Parked behind runs that live for hours it holds
+   * no lease, and the API cannot tell that from a dispatch that never arrived:
+   * its sweeper re-sends a finish-only dispatch that no Brain has written a
+   * lease for within the grace (`FINISH_DISPATCH_UNACCEPTED_SQL`).
+   */
+  isFinishOnly?(msg: JsMsg): boolean;
+  /**
    * The durable holder protocol for fat deliveries. Optional: a pod wired
    * without one runs every delivery the way it always did.
    */
@@ -432,7 +441,8 @@ export async function runDelivery(msg: JsMsg, deps: DeliveryDeps): Promise<void>
     // busy replica held work for hours while others sat idle.
     const deliveries = msg.info?.deliveryCount ?? 1;
     const wakeup = deps.isWakeup?.(msg) === true;
-    if (!deps.gate.admissible() && (wakeup || deps.canRefuse(deliveries))) {
+    const finishOnly = deps.isFinishOnly?.(msg) === true;
+    if (!finishOnly && !deps.gate.admissible() && (wakeup || deps.canRefuse(deliveries))) {
       deps.onRefuse?.("surplus");
       if (wakeup) {
         msg.ack();
@@ -462,8 +472,12 @@ export async function runDelivery(msg: JsMsg, deps: DeliveryDeps): Promise<void>
     stopHeartbeat = deps.keepAlive(msg);
 
     if (!target || !acceptance || !arm) {
-      await deps.gate.acquire();
-      slotHeld = true;
+      // No slot for a finish-only dispatch (see `isFinishOnly`): the handler starts at once, and
+      // its first lease renewal is what tells the API that a Brain has the message.
+      if (!finishOnly) {
+        await deps.gate.acquire();
+        slotHeld = true;
+      }
       if (deps.isDraining()) {
         deps.onRefuse?.("drain");
         msg.nak(DRAIN_NAK_MS);

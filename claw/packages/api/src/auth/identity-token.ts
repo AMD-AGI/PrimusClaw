@@ -21,12 +21,22 @@
  *     not repaired: it becomes the owner of every row, so two distinct subjects
  *     must never name one owner.
  *   - The user model is the one the connector token and Kubernetes mode produce:
- *     `sub` is the user id and the roles are `default` only. Whatever the token says
+ *     `sub` is the user id and the roles are `default` only (but for the opt-in below). Whatever the token says
  *     in `roles` or `groups` is not copied: a provider shared with other applications
  *     can define a role named `system-admin` (or `system-admin-readonly`) that means
  *     something else there, and copying it would make that caller a platform
- *     operator of every tenant's sessions. Enabling this path never grants admin.
+ *     operator of every tenant's sessions. Enabling this path alone never grants admin.
  *     There is no session key behind a token, so `platformKey` and `virtualKey` are empty.
+ *   - The one way a token's role becomes the caller's role is an operator naming it in
+ *     `CLAW_IDENTITY_TOKEN_TRUSTED_ROLES` (default: none; only `system-admin` and
+ *     `system-admin-readonly` can be named). Even then a role is adopted only when all
+ *     three hold: the operator named it, the token (already verified as the configured
+ *     issuer's, for this audience) claims it, and the provider's RFC 7662 answer for
+ *     that token, now, is active, names the same subject and lists it. The provider
+ *     is not asked at all for a token that claims none of the named roles. When the
+ *     provider cannot be asked the caller is a plain user for that request: never the
+ *     token's claim, and not a 503 either, so an outage costs an administrator the
+ *     admin pages and nothing else. A token the provider says is inactive is refused.
  *   - A token cannot be revoked by checking it locally, so it is good until it
  *     expires (minutes). With `CLAW_IDENTITY_TOKEN_INTROSPECT` on, the provider is
  *     also asked whether it is still active, and a revoked grant stops at once.
@@ -59,6 +69,9 @@ const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
 // workbench, the development bypass). A token whose subject is one of them would be that owner, so it is refused.
 const RESERVED_SUBJECTS: ReadonlySet<string> = new Set(["default", "anonymous", "dev-user"]);
 
+/** The only roles a token can bring with it, in the order a caller's roles list them. Nothing else is ever adopted. */
+export const ADOPTABLE_ROLES: readonly string[] = ["system-admin", "system-admin-readonly"];
+
 export interface IdentityTokenSettings {
   enabled: boolean;
   /** The `aud` the token must name. */
@@ -67,6 +80,8 @@ export interface IdentityTokenSettings {
   scope: string;
   /** Also ask the provider whether the token is still active. */
   introspect: boolean;
+  /** The platform roles the operator lets a provider-confirmed token confer. Always a subset of {@link ADOPTABLE_ROLES}. */
+  trustedRoles: string[];
 }
 
 function setting(key: string, fallback: string): string {
@@ -81,6 +96,8 @@ function setting(key: string, fallback: string): string {
  *   CLAW_IDENTITY_TOKEN_AUDIENCE      the `aud` the token must name, default claw-api
  *   CLAW_IDENTITY_TOKEN_SCOPE         the scope the token must carry, default claw.api
  *   CLAW_IDENTITY_TOKEN_INTROSPECT    also ask the provider whether the token is still active
+ *   CLAW_IDENTITY_TOKEN_TRUSTED_ROLES comma- or space-separated platform roles a confirmed token may
+ *                                     confer (system-admin, system-admin-readonly); default none
  */
 export function identityTokenSettings(): IdentityTokenSettings {
   return {
@@ -88,7 +105,18 @@ export function identityTokenSettings(): IdentityTokenSettings {
     audience: setting("CLAW_IDENTITY_TOKEN_AUDIENCE", "claw-api"),
     scope: setting("CLAW_IDENTITY_TOKEN_SCOPE", "claw.api"),
     introspect: envBool("CLAW_IDENTITY_TOKEN_INTROSPECT", false),
+    trustedRoles: trustedRoles(process.env.CLAW_IDENTITY_TOKEN_TRUSTED_ROLES),
   };
+}
+
+/**
+ * The adoptable roles an operator named. A name that is not one of
+ * {@link ADOPTABLE_ROLES} is ignored, not an error and not adopted: the setting can
+ * make a provider's administrators this API's administrators and nothing else.
+ */
+function trustedRoles(raw: string | undefined): string[] {
+  const named = new Set((raw ?? "").split(/[\s,]+/).filter(Boolean));
+  return ADOPTABLE_ROLES.filter((r) => named.has(r));
 }
 
 function refuse(status: number, legacyError: string, message: string): CredentialOutcome {
@@ -104,6 +132,12 @@ function scopesOf(claim: unknown): string[] {
 
 function text(v: unknown): string {
   return typeof v === "string" ? v.trim() : "";
+}
+
+/** The operator-named roles that a claim lists, in {@link ADOPTABLE_ROLES} order. Only a string array counts. */
+function claimedTrustedRoles(trusted: readonly string[], claim: unknown): string[] {
+  if (!Array.isArray(claim)) return [];
+  return trusted.filter((r) => claim.includes(r));
 }
 
 /**
@@ -145,19 +179,52 @@ export async function verifyIdentityAccessToken(
     if (!sub || sub.length > MAX_SUBJECT_CHARS || sub !== sub.trim() || CONTROL_CHARS.test(sub) || RESERVED_SUBJECTS.has(sub)) {
       return reject("subject", refuse(401, "invalid_token", "the access token names no usable subject"));
     }
-    if (settings.introspect) {
-      const answer = await identity.introspect(token, { tokenTypeHint: "access_token" });
-      if (!answer.active || (answer.sub !== undefined && answer.sub !== sub)) {
-        return reject("inactive", refuse(401, "invalid_token", "the access token is no longer active"));
+    // The roles the operator named that this token claims. Only these need the provider's word.
+    const claimed = claimedTrustedRoles(settings.trustedRoles, claims.roles);
+    let adopted: string[] = [];
+    if (settings.introspect || claimed.length > 0) {
+      let answer: Awaited<ReturnType<typeof identity.introspect>> | undefined;
+      try {
+        answer = await identity.introspect(token, { tokenTypeHint: "access_token" });
+      } catch (err) {
+        // With introspection required the provider being down is a 503 (below). With it asked only to confirm a
+        // role, the request is still a valid token's: a plain user, never the claim.
+        if (settings.introspect || !(err instanceof IdentityUnavailableError)) throw err;
+        logger.warn({ path: pathname, reason: err.reason }, "auth.identity_token.roles_unconfirmed");
+      }
+      if (answer) {
+        if (!answer.active || (answer.sub !== undefined && answer.sub !== sub)) {
+          return reject("inactive", refuse(401, "invalid_token", "the access token is no longer active"));
+        }
+        // The provider's own list, for this subject: an answer that does not name the subject confirms nothing.
+        if (answer.sub === sub) adopted = claimed.filter((r) => answer.roles.includes(r));
       }
     }
+    const actorSub = text((claims.act as { sub?: unknown } | undefined)?.sub);
+    // Exactly as signed, not trimmed: an allowlist compares it, and `worker` and
+    // `worker ` are two clients (only a blank id is no id).
+    const clientId = typeof claims.client_id === "string" && claims.client_id.trim() !== "" ? claims.client_id : "";
     const user: UserInfo = {
       userId: sub,
       userName: (text(claims.name) || text(claims.preferred_username) || text(claims.email) || sub).slice(0, MAX_SUBJECT_CHARS),
-      // Never the token's `roles` claim: see the header. The connector-token path and Kubernetes mode do the same.
-      roles: ["default"],
+      // The token's `roles` claim is not copied: see the header. What is added is `adopted`, which the operator
+      // named, the token claimed and the provider confirmed just now. Otherwise `default` only, as the
+      // connector-token path and Kubernetes mode.
+      roles: ["default", ...adopted],
       platformKey: "",
       virtualKey: "",
+      ...(actorSub || clientId
+        ? {
+          delegation: {
+            // The actor is only ever recorded, so it is clipped. The client id is also
+            // compared (CLAW_A2A_IDENTITY_CLIENT_IDS), and a clipped value would let a
+            // client whose id begins with an allowed one pass for it: it is the claim
+            // as signed, and whoever records it clips its own copy.
+            ...(actorSub ? { actorSub: actorSub.slice(0, MAX_SUBJECT_CHARS) } : {}),
+            ...(clientId ? { clientId } : {}),
+          },
+        }
+        : {}),
     };
     return { status: "verified", user, method: IDENTITY_TOKEN_METHOD };
   } catch (err) {
