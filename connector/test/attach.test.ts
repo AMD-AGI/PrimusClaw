@@ -575,7 +575,9 @@ describe("attach end to end", () => {
   });
 
   test("a terminal that came and went between two prompts is noticed from the transcript: the next prompt starts a fresh adapter", async () => {
-    const h = await attachHarness({ timing: { recentWriteMs: 300 } });
+    // The window must outlast the time the check itself takes on a loaded machine (it starts a process): a 300 ms one was
+    // only a test that depended on a fast runner. The write is made old again by hand below instead of waiting for it.
+    const h = await attachHarness({ timing: { recentWriteMs: 5_000 } });
     const sid = await h.attach(REF);
     const file = path.join(h.attachDir, "projects", fs.realpathSync(h.work).replace(/[^A-Za-z0-9]/g, "-"), `${REF}.jsonl`);
     fs.mkdirSync(path.dirname(file), { recursive: true });

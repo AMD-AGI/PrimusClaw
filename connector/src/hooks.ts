@@ -20,21 +20,26 @@ export const HOOKED = [
   { event: "SessionEnd", arg: "end", timeout: 1 },
 ] as const;
 
-/** A hook entry is ours when its command runs the hook script with one of our two arguments. */
-const OURS_RE = /terminal-hook\.(?:js|ts)["']?\s+(?:start|end)(?:\s|$)/;
+/**
+ * What marks an entry as ours: the command ends with this, and runs the hook script. Both, so that a user's own hook that
+ * happens to be called `terminal-hook.js start` is never taken for ours (overwritten by install, deleted by uninstall).
+ */
+export const MANAGED_MARK = "--managed-by claw-connector";
+const OURS_RE = /terminal-hook\.(?:js|ts)["']?\s+(?:start|end)\s/;
 
 const shellQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
 
-/** The command a hook entry runs: this node, the hook script, the event, and the config dir the rows go under. */
+/** The command a hook entry runs: this node, the hook script, the event, the config dir the rows go under, and the mark that says it is ours. */
 export function hookCommand(node: string, script: string, arg: "start" | "end", configDir: string): string {
-  return `${shellQuote(node)} ${shellQuote(script)} ${arg} --dir ${shellQuote(configDir)}`;
+  return `${shellQuote(node)} ${shellQuote(script)} ${arg} --dir ${shellQuote(configDir)} ${MANAGED_MARK}`;
 }
 
 export const settingsFile = (configDir: string): string => path.join(configDir, "settings.json");
 
 type Json = Record<string, unknown>;
 const isObject = (x: unknown): x is Json => typeof x === "object" && x !== null && !Array.isArray(x);
-const isOurs = (h: unknown): boolean => isObject(h) && h.type === "command" && typeof h.command === "string" && OURS_RE.test(h.command);
+const isOurs = (h: unknown): boolean =>
+  isObject(h) && h.type === "command" && typeof h.command === "string" && h.command.endsWith(` ${MANAGED_MARK}`) && OURS_RE.test(h.command);
 
 interface Loaded { doc: Json; text: string | null; file: string }
 

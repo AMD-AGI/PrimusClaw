@@ -171,7 +171,7 @@ only while the process it names is still the same process (same start time), and
 hooks are merged into `settings.json` without touching anything else in it (a file that is not valid JSON is left alone), take
 under two seconds at most (`SessionStart` holds up the first turn, so they have timeouts of 2 s and 1 s), print nothing and
 always exit 0, so they cannot get in the way of a session. `claw-connector hooks uninstall` takes exactly those entries out
-again. The entries name this installation's node and program by absolute path, so install from a durable one (`npm i -g
+again (they carry the mark `--managed-by claw-connector`; a hook of your own is never taken for one of them). The entries name this installation's node and program by absolute path, so install from a durable one (`npm i -g
 @primusclaw/connector`) rather than a throwaway `npx` cache; `hooks status` and `run` say when a path is gone, and installing
 again repairs it. A conversation that was opened before the hooks were installed is not in the rows, and neither is one under a
 different config directory or when Claude Code is configured not to run user hooks: the rows can only add a refusal, and

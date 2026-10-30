@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * The command the Claude Code hooks run: `terminal-hook.js start|end --dir <Claude config dir>` (see terminals.ts).
+ * The command the Claude Code hooks run: `terminal-hook.js start|end --dir <Claude config dir> --managed-by claw-connector`
+ * (see terminals.ts; the last two words are only the mark hooks.ts recognises its own entries by, and are not read here).
  *
  * It is its own entry point, with nothing imported but the registry code, because `SessionStart` holds up the first
  * turn of every Claude Code session until it returns. It prints nothing to stdout (a `SessionStart` hook's stdout is

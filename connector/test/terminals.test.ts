@@ -350,6 +350,26 @@ describe("merging the hooks into settings.json", () => {
     assert.deepEqual(readSettings(dir), { hooks: { SessionStart: [userStart], SessionEnd: [{ matcher: "other", hooks: [userEnd.hooks[0]] }] } });
   });
 
+  test("a user's own hook that looks alike is never taken for ours: install leaves it, uninstall leaves it", () => {
+    const lookalikes = [
+      { type: "command", command: "/home/me/bin/terminal-hook.js start" },
+      { type: "command", command: "node /x/terminal-hook.js end --dir /elsewhere" },
+      { type: "command", command: "'/usr/bin/node' '/opt/other/terminal-hook.js' start --dir '/c'", timeout: 9 },
+      { type: "command", command: "echo --managed-by claw-connector" },
+      { type: "prompt", command: "x terminal-hook.js start --dir y --managed-by claw-connector" },
+    ];
+    const initial = { hooks: { SessionStart: [{ hooks: lookalikes.slice(0, 3) }], SessionEnd: [{ hooks: lookalikes.slice(3) }] } };
+    const dir = settingsDir(initial);
+    installHooks(dir, NODE, SCRIPT);
+    const after = readSettings(dir);
+    assert.deepEqual(after.hooks.SessionStart[0], initial.hooks.SessionStart[0], "theirs, exactly as it was");
+    assert.deepEqual(after.hooks.SessionEnd[0], initial.hooks.SessionEnd[0]);
+    assert.deepEqual(after.hooks.SessionStart[1], { hooks: [ours("start", dir)] }, "ours is added beside, not over");
+    assert.equal(hooksStatus(settingsDir(initial)).events.length, 0, "and none of them counts as installed");
+    uninstallHooks(dir);
+    assert.deepEqual(readSettings(dir), initial, "uninstall takes only ours");
+  });
+
   test("uninstall also removes the rows", () => {
     const dir = settingsDir({});
     installHooks(dir, NODE, SCRIPT);
@@ -370,7 +390,7 @@ describe("merging the hooks into settings.json", () => {
     const script = path.join(dir, "terminal-hook.js");
     fs.writeFileSync(script, "process.stdout.write(JSON.stringify(process.argv.slice(2)));\n");
     const r = spawnSync("/bin/sh", ["-c", hookCommand(process.execPath, script, "start", dir)], { encoding: "utf8" });
-    assert.deepEqual(JSON.parse(r.stdout), ["start", "--dir", dir]);
+    assert.deepEqual(JSON.parse(r.stdout), ["start", "--dir", dir, "--managed-by", "claw-connector"]);
   });
 
   test("status: not installed, installed and healthy, half installed, broken, unreadable", () => {
