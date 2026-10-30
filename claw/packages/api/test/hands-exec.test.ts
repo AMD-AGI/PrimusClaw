@@ -85,3 +85,18 @@ test("a sandbox that answers the handshake and then dies mid-command is unreacha
     await dying.close();
   }
 });
+
+test("the stand-in leaves no pooled connection for a server-side close to strand", async () => {
+  // Its server closes a connection that has sat idle (six seconds, on the real clock), and this
+  // process's client only hears of that on its next turn of the loop. A command sent in the same turn goes
+  // out on a socket that is already shut -- "connect: fetch failed" -- and the changes route reports a
+  // sandbox that is not running. In CI that was the command after one that had blocked the loop for six
+  // seconds (git over 230 files), which no test could depend on. The close is made here directly, in the
+  // turn the next command is sent, so it is the same on every run: with one connection per request there
+  // is nothing idle to close, and the command goes out on a new one.
+  const first = await execInSandbox({ url: stub.url, token: "tok-123" }, "echo one", 10);
+  assert.equal(first.text.trim(), "one");
+  stub.dropIdleConnections();
+  const second = await execInSandbox({ url: stub.url, token: "tok-123" }, "echo two", 10);
+  assert.equal(second.text.trim(), "two");
+});
