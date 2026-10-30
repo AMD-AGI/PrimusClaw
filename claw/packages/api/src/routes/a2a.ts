@@ -15,6 +15,8 @@ import {
   type AdmissionAsk,
 } from "../tasks/admission.js";
 import { applySessionGateTransition, openChatRun } from "../tasks/chat-run.js";
+import { createA2aV2, type A2aV2, type ContextEntry, type OpenRunInput } from "./a2a-v2.js";
+import { a2aContextTasksEnabled } from "./a2a-flags.js";
 import { applyTaskStatusTransition } from "../tasks/db.js";
 import { gpuNodesFromSpec, topologyErrors } from "../tasks/run-spec.js";
 import type { EnvironmentTopology } from "@claw/protocol";
@@ -592,6 +594,253 @@ async function admitAndOpenA2ASend(
   }));
 }
 
+// ---------------------------------------------------------------------------
+// Context/task model (CLAW_A2A_CONTEXT_TASKS): the admission half.
+//
+// A context is a session; a send finds it by caller and context id (or creates
+// it), takes its gate, and opens one run, which is the task. The handlers that
+// answer the caller live in a2a-v2.ts and are handed these functions.
+// ---------------------------------------------------------------------------
+
+interface ContextOpened {
+  target: SendTarget;
+  spec: A2ARunSpec;
+  auth: A2AAuthContext;
+  messageId: string;
+}
+
+type ContextAdmission =
+  | { kind: "opened"; target: SendTarget; taskId: string }
+  | { kind: "duplicate"; target: SendTarget; taskId: string }
+  | { kind: "busy"; taskId: string }
+  | { kind: "rejected"; reason: string }
+  | { kind: "deferred" }
+  | { kind: "error"; error: JsonRpcResponse };
+
+/**
+ * The session a context names for this caller, taken for a new run.
+ *
+ * One transaction-scoped advisory lock per (caller, context) serialises two
+ * sends to the same context, so the second reads the first's run row and is
+ * told the context is busy instead of both starting.
+ */
+async function resolveContextTarget(
+  message: Message,
+  contextId: string,
+  callerId: string,
+  auth: A2AAuthContext,
+  text: string,
+  q: StatementRunner,
+): Promise<{ target: SendTarget } | { dupe: string } | { busy: string }> {
+  await q.query(
+    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+    [JSON.stringify(["a2a-context", callerId, contextId])],
+  );
+  const found = await q.query(
+    `SELECT session_id, user_id, ${TOUCHED_TARGET_COLUMNS.join(", ")}
+       FROM claw_sessions
+      WHERE a2a_caller_id = $1 AND context_id = $2 AND deleted_at IS NULL
+      ORDER BY created_at DESC LIMIT 1
+      FOR UPDATE`,
+    [callerId, contextId],
+  );
+  const row = found.rows?.[0] as Record<string, unknown> | undefined;
+  if (!row) {
+    const sessionId = `a2a-${randomUUID()}`;
+    await q.query(
+      `INSERT INTO claw_sessions
+         (session_id, name, user_id, mode, agent_status, context_id, a2a_caller_id, agent_gate_message_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [sessionId, text.slice(0, 80), auth.userId, "claw", "pending", contextId, callerId, message.messageId],
+    );
+    return { target: { taskId: sessionId, contextId, created: true } };
+  }
+  const sessionId = String(row.session_id);
+  // A resend of a message this context already ran is that run, whether or not
+  // it is still going.
+  const same = await q.query(
+    `SELECT task_id FROM claw_tasks
+      WHERE session_id = $1 AND origin = 'a2a' AND metadata->>'message_id' = $2 LIMIT 1`,
+    [sessionId, message.messageId],
+  );
+  if (same.rows?.[0]) return { dupe: String((same.rows[0] as { task_id: string }).task_id) };
+  const live = await q.query(
+    `SELECT task_id FROM claw_tasks
+      WHERE session_id = $1 AND origin IN ('a2a','chat')
+        AND status IN ('queued','preparing','running','cancelling')
+      ORDER BY created_at DESC LIMIT 1`,
+    [sessionId],
+  );
+  if (live.rows?.[0]) return { busy: String((live.rows[0] as { task_id: string }).task_id) };
+  const preImage = Object.fromEntries(TOUCHED_TARGET_COLUMNS.map((c) => [c, row[c]]));
+  // A session an earlier version minted under the shared owner becomes the caller's.
+  if (!row.user_id || row.user_id === "a2a") {
+    await q.query("UPDATE claw_sessions SET user_id = $2 WHERE session_id = $1", [sessionId, auth.userId]);
+  }
+  await applySessionGateTransition({
+    sessionId,
+    actor: message.messageId,
+    intent: "take",
+    status: "pending",
+    force: true,
+    expectReleaser: true,
+    also: { context_id: contextId },
+    q: { query: (t: string, p?: unknown[]) => q.query(t, p) },
+  });
+  return { target: { taskId: sessionId, contextId, created: false, preImage, markerWritten: message.messageId } };
+}
+
+async function admitAndOpenA2AContextSend(
+  message: Message,
+  text: string,
+  contextId: string,
+  callerId: string,
+  auth: A2AAuthContext,
+  spec: A2ARunSpec,
+): Promise<ContextAdmission> {
+  const settled = await withOwnedAdmissionLock(async (client): Promise<ContextAdmission> => {
+    if (spec.parentSessionId) await assertParentWritable(spec.parentSessionId, auth, client);
+    // A message that names no context mints one, so the pair check inside the
+    // context cannot see a retry of it. The retry of a send whose answer was lost
+    // is the same message: it is that run, wherever it ran. Serialised on the
+    // message, so two copies sent at once start one run.
+    if (!message.contextId) {
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        [JSON.stringify(["a2a-message", callerId, message.messageId])],
+      );
+      const sent = (await client.query(
+        `SELECT t.task_id, t.session_id, s.context_id
+           FROM claw_tasks t JOIN claw_sessions s ON s.session_id = t.session_id
+          WHERE t.origin = 'a2a' AND s.a2a_caller_id = $1 AND s.deleted_at IS NULL
+            AND t.metadata->>'message_id' = $2
+          ORDER BY t.created_at DESC LIMIT 1`,
+        [callerId, message.messageId],
+      )).rows?.[0] as { task_id: string; session_id: string; context_id: string } | undefined;
+      if (sent) {
+        return {
+          kind: "duplicate", taskId: sent.task_id,
+          target: { taskId: sent.session_id, contextId: sent.context_id, created: false },
+        };
+      }
+    }
+    const existing = (await client.query(
+      "SELECT session_id FROM claw_sessions WHERE a2a_caller_id = $1 AND context_id = $2 AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1",
+      [callerId, contextId],
+    )).rows?.[0] as { session_id?: string } | undefined;
+    const decision = await decideAdmission(await a2aAdmissionAsk(existing?.session_id ?? null, spec, client), client);
+    if (decision.kind === "reject") return { kind: "rejected", reason: decision.reason };
+    if (decision.kind === "queue") return { kind: "deferred" };
+
+    const resolved = await resolveContextTarget(message, contextId, callerId, auth, text, client);
+    if ("busy" in resolved) return { kind: "busy", taskId: resolved.busy };
+    if ("dupe" in resolved) {
+      return {
+        kind: "duplicate", taskId: resolved.dupe,
+        target: { taskId: existing?.session_id ?? "", contextId, created: false },
+      };
+    }
+    const { target } = resolved;
+    await attachA2AParent(target, auth, spec, client);
+    const taskId = await openA2ARun(target, text, auth, spec, client);
+    // A repeated pair was answered above, so the open cannot find one. Thrown
+    // rather than returned: the lock rolls the session and its gate back.
+    if (!taskId) throw new Error("a2a.context_run_not_opened");
+    // Which A2A caller and context the run belongs to, for the audit trail.
+    await client.query(
+      "UPDATE claw_tasks SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb WHERE task_id = $1",
+      [taskId, JSON.stringify({
+        a2a: {
+          caller_id: callerId,
+          context_id: contextId,
+        },
+      })],
+    );
+    // The turn in the transcript, and the point in the event log this task's
+    // events are counted from (routes/a2a-store.ts).
+    await client.query(
+      `INSERT INTO claw_session_events (event_id, session_id, event, data)
+       VALUES ($1, $2, 'UserMessage', $3::jsonb)
+       ON CONFLICT (event_id, session_id) DO NOTHING`,
+      [spec.messageId, target.taskId, JSON.stringify({
+        type: "UserMessage", message_id: spec.messageId, role: "user",
+        data: { content: [{ type: "text", text }] },
+      })],
+    );
+    return { kind: "opened", target, taskId };
+  });
+  if (settled.kind === "opened" && settled.target.created) metrics.onSessionCreated("ok");
+  return settled;
+}
+
+async function openContextRun(input: OpenRunInput<A2AAuthContext>): Promise<ContextEntry> {
+  const { text, callerId, rpcId, auth, metadata } = input;
+  const message: Message = { ...input.message, messageId: input.message.messageId || randomUUID() };
+  const resolved = await resolveA2ARunSpec(message.messageId, metadata, auth);
+  if ("invalidTopology" in resolved) {
+    return { kind: "error", error: makeInvalidParams(rpcId, resolved.invalidTopology.join("; ")).error };
+  }
+  const contextId = message.contextId || `ctx-${randomUUID()}`;
+  const admitted = await admitAndOpenA2AContextSend(message, text, contextId, callerId, auth, resolved.spec);
+  switch (admitted.kind) {
+    case "opened": {
+      const internal: ContextOpened = { target: admitted.target, spec: resolved.spec, auth, messageId: message.messageId };
+      return {
+        kind: "opened", sessionId: admitted.target.taskId, contextId, taskId: admitted.taskId,
+        messageId: message.messageId, internal,
+      };
+    }
+    case "duplicate":
+      return {
+        kind: "duplicate", sessionId: admitted.target.taskId, contextId: admitted.target.contextId, taskId: admitted.taskId,
+      };
+    default:
+      return admitted;
+  }
+}
+
+async function publishContextRun(
+  entry: Extract<ContextEntry, { kind: "opened" }>,
+  text: string,
+  auth: A2AAuthContext,
+): Promise<void> {
+  const { target, spec } = entry.internal as ContextOpened;
+  try {
+    // The turns the context already has, so a follow-up in it is a conversation
+    // and not a fresh start. Memory and the user's profile come with it, as for
+    // a turn sent from the web client. The last message is this prompt, which
+    // Brain adds itself.
+    const { buildMessages } = await import("../sessions/context-builder.js");
+    const history = (await buildMessages(target.taskId, text, auth.userId)).slice(0, -1);
+    await publishA2AExecuteTask(target.taskId, text, auth, spec, history);
+  } catch (err) {
+    await rollbackA2AAdmission(target, entry.taskId, err);
+    await db.query(
+      "DELETE FROM claw_session_events WHERE event_id = $1 AND session_id = $2 AND event = 'UserMessage'",
+      [spec.messageId, target.taskId],
+    ).catch(() => { /* the session row is the one that matters */ });
+    throw err;
+  }
+}
+
+let contextV2: A2aV2<A2AAuthContext> | null = null;
+
+/** Built on first use, from this module's own NATS binding (which a suite points elsewhere). */
+function a2aV2(): A2aV2<A2AAuthContext> {
+  contextV2 ??= createA2aV2<A2AAuthContext>({
+    nats: {
+      subscribe: (subject) => nc.subscribe(subject) as never,
+      publish: (subject, payload) => { nc.publish(subject, payload === undefined ? undefined : sc.encode(payload)); },
+      decode: (data) => sc.decode(data),
+    },
+    openRun: openContextRun,
+    publishRun: publishContextRun,
+    admissionRejected: makeAdmissionRejectedError,
+    admissionDeferred: makeAdmissionDeferredError,
+  });
+  return contextV2;
+}
+
 // Counted after the commit: inside the lock the insert is still provisional.
 async function countingCreatedSession(entry: Promise<A2AEntry>): Promise<A2AEntry> {
   const settled = await entry;
@@ -648,12 +897,13 @@ async function publishA2AExecuteTask(
   text: string,
   auth: A2AAuthContext,
   spec: A2ARunSpec,
+  history: unknown[] = [],
 ): Promise<void> {
   const payload: Record<string, unknown> = {
     session_id: taskId,
     message_id: spec.messageId,
     prompt: text,
-    history: [],
+    history,
     memory_enabled: await isMemoryActive(auth.userId || "a2a"),
     user_id: auth.userId || "a2a",
     platform_key: auth.platformKey,
@@ -1390,6 +1640,43 @@ const PUSH_NOTIFICATION_METHODS: Set<string> = new Set([
   A2A_METHODS.DeleteTaskPushNotificationConfig,
 ]);
 
+/** The methods of the context/task model; what it does not change is answered as before. */
+async function dispatchContextTasks(
+  method: string,
+  p: Record<string, unknown>,
+  id: string | number,
+  reply: FastifyReply,
+  callerId: string,
+  auth: A2AAuthContext,
+): Promise<JsonRpcResponse | null> {
+  const v2 = a2aV2();
+  switch (method) {
+    case A2A_METHODS.SendMessage:
+      return v2.sendMessage(p as unknown as SendMessageRequest, id, callerId, auth);
+    case A2A_METHODS.SendStreamingMessage:
+      await v2.sendStreamingMessage(p as unknown as SendMessageRequest, id, reply, callerId, auth);
+      return null;
+    case A2A_METHODS.GetTask:
+      return v2.getTask(p as unknown as GetTaskRequest, id, callerId);
+    case A2A_METHODS.ListTasks:
+      return v2.listTasks(p as unknown as ListTasksRequest, id, callerId);
+    case A2A_METHODS.CancelTask:
+      return v2.cancelTask(p as unknown as CancelTaskRequest, id, callerId);
+    case A2A_METHODS.SubscribeToTask:
+      await v2.subscribeToTask(p as unknown as SubscribeToTaskRequest, id, reply, callerId);
+      return null;
+    case A2A_METHODS.CreateTaskPushNotificationConfig:
+    case A2A_METHODS.GetTaskPushNotificationConfig:
+    case A2A_METHODS.ListTaskPushNotificationConfigs:
+    case A2A_METHODS.DeleteTaskPushNotificationConfig:
+      return makePushNotificationNotSupportedError(id);
+    case A2A_METHODS.GetExtendedAgentCard:
+      return makeUnsupportedOperationError(id, "Extended agent card is not supported");
+    default:
+      return makeJsonRpcError(id, JSON_RPC_METHOD_NOT_FOUND, `Method not found: ${method}`);
+  }
+}
+
 /**
  * @param pluginId set when the request came in on a per-plugin agent endpoint,
  *   whose sends run with that plugin. Everything else (tasks, ownership, auth)
@@ -1408,7 +1695,8 @@ async function dispatch(
     return makeJsonRpcError(id, JSON_RPC_INVALID_REQUEST, "authentication required");
   }
 
-  if (PUSH_NOTIFICATION_METHODS.has(method)) {
+  const contextTasks = a2aContextTasksEnabled();
+  if (!contextTasks && PUSH_NOTIFICATION_METHODS.has(method)) {
     return makePushNotificationNotSupportedError(id);
   }
 
@@ -1426,6 +1714,8 @@ async function dispatch(
     if ("error" in bound) return makeJsonRpcError(id, JSON_RPC_INVALID_PARAMS, bound.error);
     p = bound.params;
   }
+
+  if (contextTasks) return dispatchContextTasks(method, p, id, reply, callerId, auth);
 
   switch (method) {
     case A2A_METHODS.SendMessage:
