@@ -14,7 +14,11 @@
 #   [no-code]      that job checks out nothing, installs nothing, runs no repository script and
 #                  uses only the three actions it needs
 #   [publish-last] `npm publish` is that job's last step and appears nowhere else
-#   [guard]        the package job checks that the environment has reviewers before it builds
+#   [guard]        the package job checks, before it builds, that the environment has at least one
+#                  required reviewer and administrator bypass off. Self-review is allowed (the
+#                  maintainer who cuts a release approves it), so the check must not demand it: the
+#                  job's own jq program is run against environment responses, so a guard that would
+#                  refuse the environment as it is set up, or accept one without reviewers, fails here
 #   [injection]    no run script interpolates ${{ }}; every expression reaches the shell as env
 #   [pinned]       every action is pinned to a commit
 # Then it mutates a copy of the file once per rule and requires that rule, and not just any rule,
@@ -26,10 +30,11 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 workflow="${1:-$repo_root/.github/workflows/connector-release.yml}"
 
 command -v python3 >/dev/null 2>&1 || { echo "error: python3 is required for this check" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "error: jq is required for this check" >&2; exit 1; }
 python3 -c 'import yaml' 2>/dev/null || { echo "error: python3 PyYAML is required for this check" >&2; exit 1; }
 
 exec python3 - "$workflow" <<'PY'
-import copy, re, sys
+import copy, json, re, subprocess, sys
 import yaml
 
 path = sys.argv[1]
@@ -52,6 +57,50 @@ REPO_CODE = re.compile(
     + r"|(?:^|\s)\./",
     re.M,
 )
+
+
+# The package job decides whether the environment is acceptable with a `jq -e` program over the
+# response of GET /repos/{repo}/environments/npm-publish. It is run here, against responses shaped
+# like the API's, so that what it accepts and refuses is observed and not read off its text.
+GUARD_PROGRAM = re.compile(r"jq -e '(.*?)'\s*<<<\"\$environment\"", re.S)
+
+
+def environment(bypass=False, rules=None):
+    doc = {"name": "npm-publish", "protection_rules": rules if rules is not None else []}
+    if bypass is not None:
+        doc["can_admins_bypass"] = bypass
+    return doc
+
+
+def reviewers(prevent_self_review, people=1):
+    return {
+        "id": 1, "type": "required_reviewers", "prevent_self_review": prevent_self_review,
+        "reviewers": [{"type": "User", "reviewer": {"login": f"maintainer{i}"}} for i in range(people)],
+    }
+
+
+GUARD_ACCEPTS = [
+    ("a reviewer, self-review allowed, administrator bypass off (how the environment is set up)",
+     environment(rules=[reviewers(False)])),
+    ("a reviewer, self-review prevented, administrator bypass off (stricter is fine)",
+     environment(rules=[reviewers(True)])),
+    ("two reviewers beside a wait timer", environment(rules=[{"type": "wait_timer", "wait_timer": 5}, reviewers(False, people=2)])),
+]
+GUARD_REFUSES = [
+    ("no protection rules at all", environment(rules=[])),
+    ("a wait timer and no reviewer rule", environment(rules=[{"type": "wait_timer", "wait_timer": 5}])),
+    ("a reviewer rule with nobody in it", environment(rules=[reviewers(False, people=0)])),
+    ("a reviewer rule that has no reviewers key", environment(rules=[{"type": "required_reviewers", "prevent_self_review": False}])),
+    ("a reviewer, but administrators may bypass", environment(bypass=True, rules=[reviewers(False)])),
+    ("a reviewer, but the response does not say whether administrators may bypass", environment(bypass=None, rules=[reviewers(False)])),
+    ("a response without protection_rules", {"name": "npm-publish", "can_admins_bypass": False}),
+]
+
+
+def jq_decides(program, doc):
+    """True: accepted; False: refused; None: jq itself failed on the program."""
+    r = subprocess.run(["jq", "-e", program], input=json.dumps(doc), capture_output=True, text=True)
+    return {0: True, 1: False}.get(r.returncode)
 
 
 def triggers(wf):
@@ -113,8 +162,20 @@ def check(wf):
     if len(publishing) != 1 or publishing[0][0] != "publish" or publishing[0][1] != publishing[0][2] - 1:
         bad("publish-last", f"npm publish must appear once, as the last step of publish; found {publishing!r}")
 
-    if not any("environments/npm-publish" in str(s.get("run", "")) for s in steps(pkg)):
+    guards = [s for s in steps(pkg) if "environments/npm-publish" in str(s.get("run", ""))]
+    if not guards:
         bad("guard", "package must check the npm-publish environment through the API")
+    for s in guards:
+        found = GUARD_PROGRAM.search(str(s.get("run", "")))
+        if not found:
+            bad("guard", f"step {s.get('name')!r} must decide with a jq -e program over the environment response")
+            continue
+        for what, doc in GUARD_ACCEPTS:
+            if jq_decides(found.group(1), doc) is not True:
+                bad("guard", f"the environment check must accept {what}")
+        for what, doc in GUARD_REFUSES:
+            if jq_decides(found.group(1), doc) is not False:
+                bad("guard", f"the environment check must refuse {what}")
 
     for name, job in jobs.items():
         for s in steps(job):
@@ -200,6 +261,11 @@ mutations = [
     ("publish-last", "npm publish also runs in package", add_package_step({"name": "early", "run": "npm publish"})),
     ("publish-last", "npm publish is not last", move_publish_up),
     ("guard", "package stops checking the environment", drop_guard),
+    ("guard", "the check demands self-review prevented again",
+     rewrite_runs("select(((.reviewers", "select(.prevent_self_review == true and ((.reviewers")),
+    ("guard", "the check stops requiring administrator bypass off", rewrite_runs(".can_admins_bypass == false", ".can_admins_bypass != null")),
+    ("guard", "the check stops requiring a reviewer", rewrite_runs("select(((.reviewers // []) | length) > 0)", "select(true)")),
+    ("guard", "the check no longer reads the environment's response", rewrite_runs("<<<\"$environment\"", "<<<'{}'")),
     ("injection", "the tag is interpolated into a script", add_package_step({"name": "echo", "run": "echo ${{ github.event.release.tag_name }}"})),
     ("pinned", "an action is not pinned to a commit", unpin),
 ]

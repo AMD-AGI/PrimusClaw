@@ -121,9 +121,11 @@ record it.
 - `@primusclaw/connector` on npm: publishing a GitHub Release tagged `connector-vX.Y.Z` runs
   `.github/workflows/connector-release.yml`, which tests the connector, signs a build-provenance attestation
   for the tarball, attaches it to the release and publishes it with npm Trusted Publishing (a short-lived OIDC
-  credential and a provenance statement; no stored npm token). The publish waits for the required reviewers
-  of the `npm-publish` environment, which is what keeps an unreviewed commit from being published. The tag
-  must equal the version in `connector/package.json`. Once a release has been published,
+  credential and a provenance statement; no stored npm token). The publish waits for a required reviewer
+  of the `npm-publish` environment (who may be the maintainer who cut the release; administrators cannot
+  bypass it), which is what keeps an unreviewed commit from being published, and creating a `connector-v*`
+  tag is limited to repository admins by a tag ruleset. The tag must equal the version in
+  `connector/package.json`. Once a release has been published,
   `npm install -g @primusclaw/connector` installs the `claw-connector` command (Node.js 22 or newer).
   The package holds only the bundle, README and LICENSE, and the Connector packaging workflow checks a real
   tarball on every change (`connector/scripts/check-pack.mjs`), together with the shape of the release workflow.

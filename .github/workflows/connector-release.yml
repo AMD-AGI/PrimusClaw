@@ -78,10 +78,14 @@ jobs:
             exit 1
           fi
 
-      # Fails the run before anything is built if the environment that gates the publish is missing
-      # or has no reviewers (naming a missing environment in a job creates it, unprotected, on
-      # first use). It reads the environment with the default token. It cannot be the boundary: a
-      # writer's copy of this file could drop it. It stops a maintainer who forgot the setup.
+      # Fails the run before anything is built if the environment that gates the publish is missing,
+      # has no required reviewer, or lets administrators bypass its protection (naming a missing
+      # environment in a job creates it, unprotected, on first use). Self-review is allowed: the
+      # maintainer who cuts the release may approve its publish, so the approval is a decision by a
+      # listed reviewer and not a second pair of eyes; the tag ruleset on connector-v* (admins only)
+      # is what limits who can start a run. It reads the environment with the default token. It cannot
+      # be the boundary: a writer's copy of this file could drop it. It stops a maintainer who forgot
+      # the setup.
       - name: The npm-publish environment requires reviewers
         env:
           GH_TOKEN: ${{ github.token }}
@@ -93,9 +97,9 @@ jobs:
           fi
           if ! jq -e '
             .can_admins_bypass == false
-            and ([.protection_rules[]? | select(((.reviewers // []) | length) > 0 and .prevent_self_review == true)] | length) > 0
+            and ([.protection_rules[]? | select(((.reviewers // []) | length) > 0)] | length) > 0
           ' <<<"$environment" >/dev/null; then
-            echo "::error::npm-publish must have required reviewers with self-review prevented and administrator bypass off (connector/README.md, Releasing)"
+            echo "::error::npm-publish must have at least one required reviewer and administrator bypass off (connector/README.md, Releasing)"
             exit 1
           fi
 

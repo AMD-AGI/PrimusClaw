@@ -231,18 +231,23 @@ checks the tarball, signs a build-provenance attestation for it, attaches it to 
 which OIDC publishing sets only with a newer npm and a separate permission on the Trusted Publisher entry.
 
 **What stops an unreviewed publish.** A release runs the workflow file as it exists at its tag, and a tag can point at any commit, so the
-checks inside that file (tag shape, the commit being in `main`, the environment below having reviewers) catch honest mistakes and are not the
-control. The control is the GitHub environment `npm-publish`: its required reviewers must approve the `publish` job, and the Trusted Publisher
-entry on npmjs.com names that environment, so npm hands the publish credential to no other job. Only the `publish` job, which checks out and
-installs nothing, runs behind it. `scripts/release-tests/connector-release-workflow.sh`, run on every change by the Connector packaging
-workflow, fails if the workflow file stops having that shape.
+checks inside that file (tag shape, the commit being in `main`, the environment below having a reviewer) catch honest mistakes and are not the
+control. The control is the GitHub environment `npm-publish`: one of its required reviewers must approve the `publish` job, and the Trusted
+Publisher entry on npmjs.com names that environment, so npm hands the publish credential to no other job. Only the `publish` job, which checks out
+and installs nothing, runs behind it. Two more rules narrow who can get that far. The environment does not let administrators bypass its
+protection, and a tag ruleset limits creating `refs/tags/connector-v*` to repository admins, so only an admin can start a release run at all.
+Self-review is allowed: the maintainer who cuts a release may approve its publish, so the approval is an explicit decision by a listed reviewer
+and not a second person's check. `scripts/release-tests/connector-release-workflow.sh`, run on every change by the Connector packaging
+workflow, fails if the workflow file stops having that shape, or if its environment check would refuse the environment as set up below.
 
 **One-time setup** (a repository admin, and a member of the `primusclaw` npm organisation). The order matters.
 
-1. Create the environment `npm-publish` (repository Settings > Environments) with **Required reviewers** (the people who may publish),
-   **Prevent self-review** on and **Allow administrators to bypass** off. The release run refuses to build until all three hold. To narrow who can
-   start a run at all, add a tag ruleset restricting who may create `refs/tags/connector-v*`; a deployment tag rule on the environment alone does not
-   help, since the tag of an unreviewed commit matches it too. Do not restrict the environment to "Protected branches only": a release's
+1. Create the environment `npm-publish` (repository Settings > Environments) with **Required reviewers** (the people who may publish) and
+   **Allow administrators to bypass** off. **Prevent self-review** is left off, so a reviewer who cuts a release may approve it (turning it on is
+   accepted too). The release run refuses to build unless the environment has at least one required reviewer and administrator bypass is off.
+   Then add a tag ruleset (Settings > Rules > Rulesets, target: tags) matching `refs/tags/connector-v*` that restricts creation to repository
+   admins: with self-review allowed this is what limits who can start a release run, and a deployment tag rule on the environment alone does
+   not help, since the tag of an unreviewed commit matches it too. Do not restrict the environment to "Protected branches only": a release's
    ref is a tag, so it would be refused.
 2. Publish 0.1.0 once by hand from a clean checkout of the merged `main` (the package must exist before it can be given a Trusted Publisher):
    `cd connector && npm ci && npm publish --access public`, logged in to npm with 2FA.
