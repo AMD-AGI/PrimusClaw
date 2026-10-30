@@ -36,7 +36,7 @@ import { startFakeUpstream, sendJson, type FakeUpstream, type SeenRequest } from
 import { IDENTITY_TOKEN_METHOD, verifyIdentityAccessToken } from "../src/auth/identity-token.js";
 import { startIdentityClient } from "../src/auth/identity.js";
 import { SafeClient } from "../src/auth/safe-client.js";
-import { callerAuthOf } from "../src/auth/caller-auth.js";
+import { callerAuthOf, safeAuthorizationOf } from "../src/auth/caller-auth.js";
 import { recordRequestCredential } from "../src/auth/request-credential.js";
 import type { CredentialOutcome } from "../src/auth/middleware.js";
 
@@ -202,8 +202,13 @@ describe("K2 every other way SaFE or the provider can answer", () => {
     ["400", (_r, res) => sendJson(res, 400, { code: 400, message: "bad request" }), "keyless"],
     ["an id that is not the token's subject: those keys are somebody else's", (_r, res) =>
       sendJson(res, 200, { code: 0, data: { id: "u-bob", platformKey: "ak-bob-platform", virtualKey: "sk-bob-virtual" } }), "keyless"],
-    ["an answer with no id at all", (_r, res) => sendJson(res, 200, { code: 0, data: { platformKey: "ak-x" } }), "keyless"],
+    ["a user SaFE holds nothing for, answered with the id only", (_r, res) => sendJson(res, 200, { code: 0, data: { id: "u-alice" } }), "keyless"],
     ["a user SaFE holds no keys for", (_r, res) => sendJson(res, 200, { code: 0, data: { id: "u-nokeys" } }), "keyless"],
+    // A 2xx that is not an answer is SaFE (or what is in front of it) failing, not a decision about the token.
+    ["an answer with no id at all", (_r, res) => sendJson(res, 200, { code: 0, data: { platformKey: "ak-x" } }), "503"],
+    ["a 200 whose body is a proxy's page, not JSON", (_r, res) => { res.writeHead(200, { "content-type": "text/html" }); res.end("<html>bad gateway</html>"); }, "503"],
+    ["a 200 whose body is cut off", (_r, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end('{"code":0,"data":{"id":"u-al'); }, "503"],
+    ["a 200 whose body is JSON but not an object", (_r, res) => sendJson(res, 200, "ok"), "503"],
     ["500", (_r, res) => sendJson(res, 500, { code: 500, message: "boom" }), "503"],
     ["503", (_r, res) => sendJson(res, 503, { code: 503, message: "the authentication service is unavailable" }), "503"],
     ["a connection that is dropped", (r, res) => { res.destroy(); void r; }, "503"],
@@ -423,6 +428,16 @@ describe("K5 how long an answer is kept", () => {
     assert.equal(verifyCalls().length, 2);
   });
 
+  test("a 200 that is not an answer is not remembered: the next request asks again, and gets the keys", async () => {
+    let up = false;
+    verifyAnswer = (r, res) => { if (up) return defaultVerify(r, res); res.writeHead(200, { "content-type": "text/html" }); res.end("<html>"); };
+    const token = mint();
+    assert.equal(refused(await run(token)).status, 503);
+    up = true;
+    assert.equal(user(await run(token)).platformKey, "ak-alice-platform");
+    assert.equal(verifyCalls().length, 2);
+  });
+
   test("the provider not answering is not remembered either", async () => {
     let up = false;
     const real = fake.token;
@@ -470,6 +485,17 @@ describe("K6 what the rest of the API presents to SaFE for such a caller", () =>
   test("without a platform key there is nothing to present, and no other header stands in for it", () => {
     const keyless = { ...alice, platformKey: "" };
     assert.deepEqual(callerAuthOf(withMethod(IDENTITY_TOKEN_METHOD, keyless, { authorization: "Bearer eyJ.a.b", "x-api-key": "ak-someone-else" })), {});
+  });
+
+  test("a route that forwards the caller's own Authorization header to SaFE sends an identity-token caller's platform key, never the token", () => {
+    const token = "eyJ.a.b";
+    assert.equal(safeAuthorizationOf(withMethod(IDENTITY_TOKEN_METHOD, alice, { authorization: `Bearer ${token}` })), "Bearer ak-alice-platform");
+    assert.equal(safeAuthorizationOf(withMethod(IDENTITY_TOKEN_METHOD, { ...alice, platformKey: "" }, { authorization: `Bearer ${token}` })), "", "keyless: nothing, not the token");
+  });
+
+  test("and every other caller's header is forwarded as it always was", () => {
+    assert.equal(safeAuthorizationOf(withMethod("api_key", alice, { authorization: "Bearer ak-presented" })), "Bearer ak-presented");
+    assert.equal(safeAuthorizationOf(withMethod(null, alice, {})), "");
   });
 
   test("a caller authenticated another way is unchanged: the credential it presented", () => {

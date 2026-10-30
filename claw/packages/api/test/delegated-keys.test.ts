@@ -17,7 +17,7 @@ import assert from "node:assert/strict";
 
 import { IdentityExchangeRefusedError, IdentityUnavailableError, type ExchangedToken, type ExchangeRequest } from "@claw/utils";
 import { DelegatedKeys, type DelegationDeps } from "../src/auth/delegated-keys.js";
-import { AuthUpstreamUnreachableError, SafeUpstreamHttpError } from "../src/auth/safe-client.js";
+import { AuthUpstreamUnreachableError, SafeUpstreamHttpError, SafeUpstreamProtocolError } from "../src/auth/safe-client.js";
 import type { UserInfo } from "../src/auth/models.js";
 
 const SETTINGS = { audience: "primus-safe", scope: "safe.api" };
@@ -155,6 +155,8 @@ describe("D2 what is kept of a refusal and of a failure to answer", () => {
     assert.deepEqual(await ask(w, "alice"), { status: "unavailable", source: "safe" });
     w.verify = async () => { throw new SafeUpstreamHttpError({ status: 502, bodySnippet: "" }); };
     assert.deepEqual(await ask(w, "alice"), { status: "unavailable", source: "safe" });
+    w.verify = async () => { throw new SafeUpstreamProtocolError("SaFE answered 200 with a body that is not JSON"); };
+    assert.deepEqual(await ask(w, "alice"), { status: "unavailable", source: "safe" }, "a 2xx that is not an answer is a failure to answer");
     w.verify = undefined;
     w.exchange = async () => { throw new IdentityUnavailableError("exchange", "timeout"); };
     assert.deepEqual(await ask(w, "alice"), { status: "unavailable", source: "identity" });

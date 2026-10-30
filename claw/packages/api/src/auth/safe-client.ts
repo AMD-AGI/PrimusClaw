@@ -85,6 +85,20 @@ export class SafeUpstreamHttpError extends Error {
   }
 }
 
+/**
+ * SaFE answered 2xx with something that is not an answer: a body that is not JSON (a proxy's page, a truncated
+ * response) or an answer with no user id. It is not a decision about the credential. A caller that keeps what SaFE
+ * said must not keep this, and one that tells a person "no keys" must tell them SaFE did not answer instead.
+ */
+export class SafeUpstreamProtocolError extends Error {
+  constructor(message: string, cause?: unknown) {
+    super(message);
+    this.name = "SafeUpstreamProtocolError";
+    Object.setPrototypeOf(this, new.target.prototype);
+    if (cause !== undefined) (this as Error & { cause?: unknown }).cause = cause;
+  }
+}
+
 function isUpstreamNetworkError(err: Error): boolean {
   const msg = (err.message || "").toLowerCase();
   const cause = (err as Error & { cause?: { code?: string; message?: string } }).cause;
@@ -137,7 +151,7 @@ export class SafeClient {
   private parseResponse(data: Record<string, unknown>): UserInfo {
     const d = (data.data ?? data) as Record<string, unknown>;
     const userId = (d.id as string) || "";
-    if (!userId) throw new Error("SaFE returned empty user ID");
+    if (!userId) throw new SafeUpstreamProtocolError("SaFE returned empty user ID");
     // Only a present, non-empty string: the field is optional on SaFE's side and
     // an `email: undefined` key would change what a UserInfo compares equal to.
     const email = typeof d.email === "string" && d.email !== "" ? d.email : undefined;
@@ -222,7 +236,14 @@ export class SafeClient {
         }, "auth.safe.upstream_error");
         throw new SafeUpstreamHttpError({ status: resp.status, bodySnippet, requestId });
       }
-      const user = this.parseResponse(await resp.json() as Record<string, unknown>);
+      let answer: unknown;
+      try {
+        answer = await resp.json();
+      } catch (parseErr) {
+        throw new SafeUpstreamProtocolError("SaFE answered 200 with a body that is not JSON", parseErr);
+      }
+      if (answer === null || typeof answer !== "object") throw new SafeUpstreamProtocolError("SaFE answered 200 with a body that is not an object");
+      const user = this.parseResponse(answer as Record<string, unknown>);
       if (cacheable) this.setCache(cacheKey, user, null, CACHE_TTL);
       return user;
     } catch (e: unknown) {

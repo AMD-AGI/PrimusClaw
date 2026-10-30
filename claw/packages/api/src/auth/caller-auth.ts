@@ -44,3 +44,14 @@ export function callerAuthOf(req: FastifyRequest): CallerAuth {
   if (typeof apiKey === "string" && isApiKey(apiKey)) return { authorization: `Bearer ${apiKey}` };
   return {};
 }
+
+/**
+ * The `Authorization` value to send SaFE for a route that forwards the caller's own header (the MCP tool that lists
+ * models). A caller authenticated by an identity provider's access token must not have it forwarded: it is good for
+ * this API, and SaFE is only ever shown the person's platform key (see {@link callerAuthOf}); without one, nothing.
+ * Every other caller's header goes as it always did.
+ */
+export function safeAuthorizationOf(req: FastifyRequest): string {
+  if (getAuthMethod(req) === IDENTITY_TOKEN_METHOD) return callerAuthOf(req).authorization ?? "";
+  return (req.headers.authorization as string | undefined) || "";
+}

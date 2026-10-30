@@ -18,7 +18,7 @@
  */
 import { ACCESS_TOKEN_TYPE, IdentityExchangeRefusedError, IdentityUnavailableError, type ExchangedToken, type ExchangeRequest } from "@claw/utils";
 import {
-  AuthServiceMisconfiguredError, AuthUpstreamUnreachableError, SafeUpstreamHttpError, type SafeClient,
+  AuthServiceMisconfiguredError, AuthUpstreamUnreachableError, SafeUpstreamHttpError, SafeUpstreamProtocolError, type SafeClient,
 } from "./safe-client.js";
 
 /** The keys SaFE holds for a token's subject, or why the caller has none. */
@@ -123,7 +123,8 @@ export class DelegatedKeys {
       return { status: "keys", platformKey: user.platformKey, virtualKey: user.virtualKey };
     } catch (err) {
       if (err instanceof AuthServiceMisconfiguredError) return { status: "misconfigured", message: err.message };
-      if (err instanceof AuthUpstreamUnreachableError) return { status: "unavailable", source: "safe" };
+      // A 2xx that is not an answer (not JSON, no id) is SaFE, or something in front of it, failing: not a refusal.
+      if (err instanceof AuthUpstreamUnreachableError || err instanceof SafeUpstreamProtocolError) return { status: "unavailable", source: "safe" };
       if (err instanceof SafeUpstreamHttpError) {
         return err.status >= 500 ? { status: "unavailable", source: "safe" } : { status: "none", reason: `safe_http_${err.status}` };
       }
