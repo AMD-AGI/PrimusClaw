@@ -201,7 +201,8 @@ record it.
   `unattended`; set `approval = "ask"` on an agent to keep refusing it. And a preset agent whose `safe_modes` or
   `ask_mode` names a mode the preset does not know to ask (for example `claude` with
   `safe_modes = ["default", "plan", "acceptEdits"]`) is now a configuration error, so `claw-connector run` does not
-  start; remove the mode, or set `approval = "never"` on the agent (or `allow_unsafe_modes = true` in the file).
+  start; remove the mode, or set `approval = "never"` on the agent (or `allow_unsafe_modes = true` in the file, for an
+  agent that does not say `approval = "ask"`).
 - Brain no longer fetches every plugin skill again on every turn. Downloaded skill
   files are held in memory (bounded by `SKILL_CACHE_MAX_BYTES`, 64 MiB by default,
   `0` turns it off) and reused while the skill is unchanged: a plugin skill is

@@ -120,7 +120,8 @@ unattended session unattended (the phone shows it). `approval = "ask"` on an age
   reported `unattended`. Set `approval = "ask"` on an agent to keep refusing it.
 - A preset agent whose `safe_modes` or `ask_mode` names a mode the preset does not know to ask (for example `claude`
   with `safe_modes = ["default", "plan", "acceptEdits"]`) is now a configuration error, and `claw-connector run` does not
-  start. Remove the mode, or set `approval = "never"` on that agent (or `allow_unsafe_modes = true` in the file).
+  start. Remove the mode, or set `approval = "never"` on that agent (or `allow_unsafe_modes = true` in the file, for an
+  agent that does not say `approval = "ask"`).
 
 ## What the connector enforces
 
