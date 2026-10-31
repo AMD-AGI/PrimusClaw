@@ -221,6 +221,55 @@ export function activeAnswer(over: Record<string, unknown> = {}): Record<string,
   };
 }
 
+// --- the provider's side of service delegation -----------------------------------
+
+/** What {@link answerDelegation} was asked, for a test to look at. */
+export interface DelegationRequest {
+  /** The subject token as sent (the user's own access token). */
+  subjectToken: string;
+  audience: string;
+  scope: string;
+}
+
+/**
+ * Make the provider answer an RFC 8693 exchange whose `subject_token_type` is an access token the way
+ * primus-identity does: the new token's `sub` is the subject token's, its `aud` and `scope` are what was asked for, and
+ * `act` names the client the request was authenticated as. The subject token is not verified here (the real provider
+ * does: signature, audience, revocation); a test that needs a refusal replaces `fake.token` itself. Every request that
+ * reaches it is in `requests` as well as in `fake.requests`.
+ */
+export function answerDelegation(
+  fake: FakeIdentity, key: TestKey,
+  opts: { lifetimeSeconds?: number; clientId?: string; now?: () => number } = {},
+): DelegationRequest[] {
+  const requests: DelegationRequest[] = [];
+  const clientId = opts.clientId ?? CLIENT_ID;
+  const now = opts.now ?? (() => Math.floor(Date.now() / 1000));
+  let counter = 0;
+  fake.token = (r) => {
+    if (r.form.get("subject_token_type") !== "urn:ietf:params:oauth:token-type:access_token") {
+      return { status: 400, body: { error: "invalid_request" } };
+    }
+    const subjectToken = r.form.get("subject_token") ?? "";
+    const subject = JSON.parse(Buffer.from(subjectToken.split(".")[1] ?? "", "base64url").toString("utf8") || "{}") as Record<string, unknown>;
+    const audience = r.form.get("audience") ?? "";
+    const scope = r.form.get("scope") ?? "";
+    requests.push({ subjectToken, audience, scope });
+    const iat = now();
+    const lifetime = opts.lifetimeSeconds ?? 300;
+    const token = signJwt({
+      key,
+      claims: {
+        iss: fake.issuer, aud: audience, sub: subject.sub, client_id: clientId, act: { sub: clientId },
+        ...(subject.gid !== undefined ? { gid: subject.gid } : {}),
+        scope, jti: `delegated-${++counter}`, iat, nbf: iat - 1, exp: iat + lifetime,
+      },
+    });
+    return { body: { access_token: token, issued_token_type: "urn:ietf:params:oauth:token-type:access_token", token_type: "Bearer", expires_in: lifetime, scope } };
+  };
+  return requests;
+}
+
 // --- the pieces on their own, for what the facade fixes (cache capacity) ---------
 
 function pieces(fake: FakeIdentity, clock: Clock) {

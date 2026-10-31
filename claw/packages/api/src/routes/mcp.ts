@@ -22,6 +22,7 @@ import {
   LITELLM_API_BASE,
   SAFE_DEFAULT_WORKSPACE,
 } from "../config.js";
+import { safeAuthorizationOf } from "../auth/caller-auth.js";
 import { buildHyperloomPrompt, buildGeakPrompt } from "../workbenches/prompt-builders.js";
 import pino from "pino";
 
@@ -64,7 +65,7 @@ function promptApiBaseParam(defaultApiBase: string) {
   );
 }
 
-function createMcpServer(app: FastifyInstance, authHeader: string): McpServer {
+function createMcpServer(app: FastifyInstance, authHeader: string, safeAuthorization: string): McpServer {
   const mcp = new McpServer({ name: "PrimusClaw", version: "2.0.0" });
 
   // No content-type here: it is added per call, and only with a body (Fastify
@@ -349,7 +350,7 @@ function createMcpServer(app: FastifyInstance, authHeader: string): McpServer {
 
       const qs = params.workspace ? `?workspace=${encodeURIComponent(params.workspace)}` : "";
       const resp = await fetch(`${SAFE_API_URL}/playground/models${qs}`, {
-        headers: authHeader ? { Authorization: authHeader } : {},
+        headers: safeAuthorization ? { Authorization: safeAuthorization } : {},
         signal: AbortSignal.timeout(30_000),
       });
       if (!resp.ok) throw new Error(`SaFE API error: HTTP ${resp.status}`);
@@ -465,7 +466,9 @@ export async function registerMcpRoutes(app: FastifyInstance): Promise<void> {
 
   app.all("/mcp", async (req, reply) => {
     const authHeader = (req.headers.authorization as string) || "";
-    const mcp = createMcpServer(app, authHeader);
+    // The tools call this API's own routes with the caller's header (it stays here); what SaFE is sent is not that for a
+    // caller authenticated by an identity provider's access token.
+    const mcp = createMcpServer(app, authHeader, safeAuthorizationOf(req));
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined as any,
     });

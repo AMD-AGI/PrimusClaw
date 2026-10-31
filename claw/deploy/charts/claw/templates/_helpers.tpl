@@ -126,6 +126,8 @@ platform roles a token the provider confirms may confer; it renders only when it
   value: "true"
 {{- include "primus-claw.identityOptionalEnv" (dict "name" "CLAW_IDENTITY_TOKEN_AUDIENCE" "value" $t.audience) }}
 {{- include "primus-claw.identityOptionalEnv" (dict "name" "CLAW_IDENTITY_TOKEN_SCOPE" "value" $t.scope) }}
+{{- include "primus-claw.identityOptionalEnv" (dict "name" "CLAW_IDENTITY_TOKEN_DELEGATION_AUDIENCE" "value" $t.delegationAudience) }}
+{{- include "primus-claw.identityOptionalEnv" (dict "name" "CLAW_IDENTITY_TOKEN_DELEGATION_SCOPE" "value" $t.delegationScope) }}
 {{- if $t.introspect }}
 - name: CLAW_IDENTITY_TOKEN_INTROSPECT
   value: "true"
