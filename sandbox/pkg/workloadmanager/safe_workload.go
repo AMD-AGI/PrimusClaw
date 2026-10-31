@@ -41,8 +41,10 @@ const (
 	// ownerSessionIDLabel records the issuing Claw session. Pulse reads
 	// primus-claw/session-id as the session's own sandbox, so a grant workload
 	// must not use that key.
-	ownerSessionIDLabel        = "primus-claw/owner-session-id"
-	grantIDLabel               = "agent-sandbox.io/grant-id"
+	ownerSessionIDLabel = "primus-claw/owner-session-id"
+	grantIDLabel        = "agent-sandbox.io/grant-id"
+	// ownerKeyLabel marks a Workload charged to an identity-key owner record.
+	ownerKeyLabel              = "agent-sandbox.io/owner-key"
 	sandboxIDLabel             = "agent-sandbox.io/sandbox-id"
 	grantAttestationAnnotation = "agent-sandbox.io/grant-attestation"
 	// nodesAffinityAnnotation asks SaFE to treat excluded-nodes as a preference.
@@ -745,7 +747,7 @@ func validateWorkloadRequest(req e2b.CreateRequest) error {
 	if !labelValue(req.GrantID) {
 		return fmt.Errorf("grant id %q is not a label value", req.GrantID)
 	}
-	if req.Attestation == "" {
+	if req.Attestation == "" && !req.OwnerKey {
 		return fmt.Errorf("grant attestation is required")
 	}
 	return nil
@@ -810,6 +812,9 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 	}
 	if req.GrantID != "" {
 		labels[grantIDLabel] = req.GrantID
+	}
+	if req.OwnerKey {
+		labels[ownerKeyLabel] = "true"
 	}
 	annotations := map[string]any{}
 	if req.UserName != "" {

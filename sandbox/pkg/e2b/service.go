@@ -25,6 +25,7 @@ import (
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/grant"
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
 )
 
 // sandboxDiskDefaultMB is the workload's 50Gi ephemeral storage, in MiB.
@@ -54,11 +55,18 @@ func applyIdempotencyHeader(body *CreateBody, header string) error {
 	return nil
 }
 
-// Service is the E2B control plane. Authorization is the caller's grant key.
+// Introspector validates a primus-identity key.
+type Introspector interface {
+	Introspect(ctx context.Context, key string) (identity.Token, error)
+}
+
+// Service is the E2B control plane. Authorization is the caller's grant key
+// or a primus-identity key charged to the owner quota record.
 type Service struct {
 	grants    *grant.Service
 	runner    Runner
 	namespace string
+	identity  Introspector
 }
 
 // Options configures a Service.
@@ -66,11 +74,62 @@ type Options struct {
 	Grants    *grant.Service
 	Runner    Runner
 	Namespace string
+	// Identity enables primus-identity keys. Nil accepts grant keys only.
+	Identity Introspector
 }
 
 // New returns an E2B control plane.
 func New(opt Options) *Service {
-	return &Service{grants: opt.Grants, runner: opt.Runner, namespace: opt.Namespace}
+	return &Service{grants: opt.Grants, runner: opt.Runner, namespace: opt.Namespace, identity: opt.Identity}
+}
+
+// grantKeyPrefix marks a key issued by the grant API.
+const grantKeyPrefix = "e2b_"
+
+// systemAdminRole is the identity role that may use any workspace.
+const systemAdminRole = "system-admin"
+
+// caller is the grant and role an API key resolves to.
+type caller struct {
+	grantID string
+	role    string
+	owner   bool
+	userID  string
+	admin   bool
+}
+
+// lookup resolves a grant key, or introspects any other key and returns the owner quota record.
+// The owner record is created or updated only when write is set; otherwise a missing
+// record leaves grantID empty.
+func (s *Service) lookup(ctx context.Context, apiKey string, write bool) (caller, error) {
+	if s.identity == nil || strings.HasPrefix(apiKey, grantKeyPrefix) {
+		grantID, role, err := s.grants.LookupKey(ctx, apiKey)
+		return caller{grantID: grantID, role: role}, err
+	}
+	token, err := s.identity.Introspect(ctx, apiKey)
+	if errors.Is(err, identity.ErrInactive) {
+		return caller{}, grant.Op(http.StatusUnauthorized, "invalid_key", "key is not active")
+	}
+	if err != nil {
+		return caller{}, grant.Op(http.StatusServiceUnavailable, "identity_unavailable", "identity is temporarily unavailable")
+	}
+	admin := token.HasRole(systemAdminRole) || s.grants.IsSystemAdmin(ctx, token.Subject)
+	var grantID string
+	if write {
+		grantID, err = s.grants.EnsureOwner(ctx, token.Subject, token.Email, admin)
+	} else {
+		grantID, err = s.grants.OwnerRecord(ctx, token.Subject)
+	}
+	if err != nil {
+		return caller{}, err
+	}
+	return caller{
+		grantID: grantID,
+		role:    s.grants.OwnerRole(),
+		owner:   true,
+		userID:  token.Subject,
+		admin:   admin,
+	}, nil
 }
 
 // CreateBody is POST /sandboxes.
@@ -116,10 +175,11 @@ func firstWorkspace(names []string) (string, error) {
 // Create starts a sandbox, or replays an idempotency key.
 // The access token is returned on this call and on connect, then only as a hash.
 func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (SandboxResponse, int, error) {
-	grantID, role, err := s.grants.LookupKey(ctx, apiKey)
+	who, err := s.lookup(ctx, apiKey, true)
 	if err != nil {
 		return SandboxResponse{}, 0, err
 	}
+	grantID, role := who.grantID, who.role
 	snap, err := s.grants.Snapshot(ctx, grantID)
 	if err != nil {
 		return SandboxResponse{}, 0, err
@@ -137,7 +197,12 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		s.grants.AuditDenied(ctx, grantID, "")
 		return SandboxResponse{}, 0, err
 	}
-	workspace, err := firstWorkspace(snap.Workspaces)
+	var workspace string
+	if who.owner {
+		workspace, err = s.grants.OwnerWorkspace(ctx, who.userID, body.Metadata[workspaceMetadata], who.admin)
+	} else {
+		workspace, err = firstWorkspace(snap.Workspaces)
+	}
 	if err != nil {
 		s.grants.AuditDenied(ctx, grantID, "")
 		return SandboxResponse{}, 0, err
@@ -231,6 +296,7 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		Workspace:     workspace,
 		GrantID:       snap.GrantID,
 		Attestation:   snap.Attestation,
+		OwnerKey:      who.owner,
 		Env:           body.EnvVars,
 		SigningKeyPEM: privateKey,
 		AvoidNodes:    excludedNodesLabel(metadata[avoidNodesMetadata]),
@@ -364,13 +430,27 @@ func (s *Service) waitReplay(ctx context.Context, grantID string, ref runtimev1a
 	return ref, nil
 }
 
+// target returns the sandbox the caller may operate on and the grant it is charged to.
+// A system-admin identity key reaches a sandbox on any grant; other keys only their own role.
+func (s *Service) target(ctx context.Context, who caller, sandboxID string) (string, runtimev1alpha1.GrantSandboxRef, error) {
+	if who.owner && who.admin {
+		sb, err := s.grants.FindSandbox(ctx, sandboxID)
+		return sb.GrantID, sb.Ref, err
+	}
+	if who.grantID == "" {
+		return "", runtimev1alpha1.GrantSandboxRef{}, grant.Op(http.StatusNotFound, "sandbox_not_found", sandboxID)
+	}
+	ref, err := s.grants.Sandbox(ctx, who.grantID, who.role, sandboxID)
+	return who.grantID, ref, err
+}
+
 // Get returns one sandbox for this key's role. Other roles are not found.
 func (s *Service) Get(ctx context.Context, apiKey, sandboxID string) (SandboxResponse, error) {
-	grantID, role, err := s.grants.LookupKey(ctx, apiKey)
+	who, err := s.lookup(ctx, apiKey, false)
 	if err != nil {
 		return SandboxResponse{}, err
 	}
-	ref, err := s.grants.Sandbox(ctx, grantID, role, sandboxID)
+	grantID, ref, err := s.target(ctx, who, sandboxID)
 	if err != nil {
 		return SandboxResponse{}, err
 	}
@@ -383,10 +463,11 @@ func (s *Service) Get(ctx context.Context, apiKey, sandboxID string) (SandboxRes
 // List returns running sandboxes for this key's role.
 // state is empty, running, or paused. Ended sandboxes are not listed.
 func (s *Service) List(ctx context.Context, apiKey, metadataQuery, state, nextToken string, limit int) (ListResponse, error) {
-	grantID, role, err := s.grants.LookupKey(ctx, apiKey)
+	who, err := s.lookup(ctx, apiKey, false)
 	if err != nil {
 		return ListResponse{}, err
 	}
+	grantID, role := who.grantID, who.role
 	want, err := parseMetadataQuery(metadataQuery)
 	if err != nil {
 		return ListResponse{}, err
@@ -401,26 +482,39 @@ func (s *Service) List(ctx context.Context, apiKey, metadataQuery, state, nextTo
 	if state != "" && state != runtimev1alpha1.SandboxRunning && state != "paused" {
 		return ListResponse{}, grant.Op(http.StatusBadRequest, "invalid_sandbox", "state must be running or paused")
 	}
-	refs, err := s.grants.ListRoleSandboxes(ctx, grantID, role)
+	var refs []grant.OwnedSandbox
+	if who.owner && who.admin {
+		refs, err = s.grants.ListAllSandboxes(ctx)
+	} else if grantID != "" {
+		var own []runtimev1alpha1.GrantSandboxRef
+		own, err = s.grants.ListRoleSandboxes(ctx, grantID, role)
+		for _, ref := range own {
+			refs = append(refs, grant.OwnedSandbox{GrantID: grantID, Ref: ref})
+		}
+	}
 	if err != nil {
 		return ListResponse{}, err
 	}
-	var filtered []runtimev1alpha1.GrantSandboxRef
-	for _, ref := range refs {
-		if ref.State != runtimev1alpha1.SandboxRunning || state == "paused" {
+	var filtered []grant.OwnedSandbox
+	for _, sb := range refs {
+		if sb.Ref.State != runtimev1alpha1.SandboxRunning || state == "paused" {
 			continue
 		}
-		if !metadataMatch(ref.Metadata, want) {
+		if !metadataMatch(sb.Ref.Metadata, want) {
 			continue
 		}
-		filtered = append(filtered, ref)
+		filtered = append(filtered, sb)
 	}
-	sort.Slice(filtered, func(i, j int) bool { return filtered[i].ID < filtered[j].ID })
+	sort.Slice(filtered, func(i, j int) bool { return filtered[i].Ref.ID < filtered[j].Ref.ID })
 	offset, end := pageBounds(offset, limit, len(filtered))
 	page := filtered[offset:end]
 	out := ListResponse{Sandboxes: make([]SandboxResponse, 0, len(page))}
-	for _, ref := range page {
-		out.Sandboxes = append(out.Sandboxes, s.detail(ctx, grantID, ref))
+	for _, sb := range page {
+		resp := s.detail(ctx, sb.GrantID, sb.Ref)
+		if who.owner && who.admin {
+			resp.Metadata = withOwner(resp.Metadata, sb.UserID)
+		}
+		out.Sandboxes = append(out.Sandboxes, resp)
 	}
 	if end < len(filtered) {
 		out.NextToken = encodeOffset(end)
@@ -430,11 +524,11 @@ func (s *Service) List(ctx context.Context, apiKey, metadataQuery, state, nextTo
 
 // Kill deletes a sandbox. A repeated delete of an ended sandbox is success.
 func (s *Service) Kill(ctx context.Context, apiKey, sandboxID string) error {
-	grantID, role, err := s.grants.LookupKey(ctx, apiKey)
+	who, err := s.lookup(ctx, apiKey, false)
 	if err != nil {
 		return err
 	}
-	ref, err := s.grants.Sandbox(ctx, grantID, role, sandboxID)
+	grantID, ref, err := s.target(ctx, who, sandboxID)
 	if err != nil {
 		return err
 	}
@@ -452,11 +546,11 @@ func (s *Service) Kill(ctx context.Context, apiKey, sandboxID string) error {
 
 // Connect issues another access token without invalidating recent tokens.
 func (s *Service) Connect(ctx context.Context, apiKey, sandboxID string) (SandboxResponse, error) {
-	grantID, role, err := s.grants.LookupKey(ctx, apiKey)
+	who, err := s.lookup(ctx, apiKey, false)
 	if err != nil {
 		return SandboxResponse{}, err
 	}
-	ref, err := s.grants.Sandbox(ctx, grantID, role, sandboxID)
+	grantID, ref, err := s.target(ctx, who, sandboxID)
 	if err != nil {
 		return SandboxResponse{}, err
 	}
@@ -496,13 +590,19 @@ func pageBounds(offset, limit, n int) (int, int) {
 }
 
 // Timeout sets a new lifetime from now. Only the role that created the sandbox
-// can change it. A value over the grant cap is refused.
+// can change it. A value over the grant cap is refused. A system-admin identity
+// key may change any sandbox, bounded by its own owner cap.
 func (s *Service) Timeout(ctx context.Context, apiKey, sandboxID string, timeoutSec int64) error {
-	grantID, role, err := s.grants.LookupKey(ctx, apiKey)
+	who, err := s.lookup(ctx, apiKey, true)
 	if err != nil {
 		return err
 	}
-	if err := s.grants.SetSandboxTimeout(ctx, grantID, role, sandboxID, timeoutSec); err != nil {
+	if who.owner && who.admin {
+		err = s.adminTimeout(ctx, who, sandboxID, timeoutSec)
+	} else {
+		err = s.grants.SetSandboxTimeout(ctx, who.grantID, who.role, sandboxID, timeoutSec)
+	}
+	if err != nil {
 		return err
 	}
 	if setter, ok := s.runner.(TimeoutRunner); ok {
@@ -511,6 +611,29 @@ func (s *Service) Timeout(ctx context.Context, apiKey, sandboxID string, timeout
 		}
 	}
 	return nil
+}
+
+// adminTimeout sets the lifetime of a sandbox on any grant, capped by the admin's owner record.
+func (s *Service) adminTimeout(ctx context.Context, who caller, sandboxID string, timeoutSec int64) error {
+	own, err := s.grants.Snapshot(ctx, who.grantID)
+	if err != nil {
+		return err
+	}
+	sb, err := s.grants.FindSandbox(ctx, sandboxID)
+	if err != nil {
+		return err
+	}
+	return s.grants.SetSandboxTimeoutAs(ctx, sb.GrantID, sandboxID, timeoutSec, own.MaxSandboxSeconds)
+}
+
+// withOwner returns a copy of md with the owner user id.
+func withOwner(md map[string]string, userID string) map[string]string {
+	out := make(map[string]string, len(md)+1)
+	for k, v := range md {
+		out[k] = v
+	}
+	out[ownerUserMetadata] = userID
+	return out
 }
 
 func createdResponse(ref runtimev1alpha1.GrantSandboxRef, token string) SandboxResponse {

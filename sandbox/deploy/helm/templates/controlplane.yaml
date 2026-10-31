@@ -297,6 +297,27 @@ spec:
             - name: REGISTRY_SECRET
               value: {{ .Values.controlplane.config.registrySecret | quote }}
             {{- end }}
+            {{- with .Values.controlplane.config.identity }}
+            {{- if and .introspectUrl .ownerPolicyConfigMap }}
+            - name: IDENTITY_INTROSPECT_URL
+              value: {{ .introspectUrl | quote }}
+            - name: IDENTITY_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .clientSecret | quote }}
+                  key: client_id
+            - name: IDENTITY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .clientSecret | quote }}
+                  key: client_secret
+            - name: E2B_OWNER_POLICY
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ .ownerPolicyConfigMap | quote }}
+                  key: policy.json
+            {{- end }}
+            {{- end }}
             {{- with .Values.router.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

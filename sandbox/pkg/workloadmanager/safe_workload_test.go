@@ -403,6 +403,21 @@ func TestWorkloadNameMatchesSandboxID(t *testing.T) {
 	}
 }
 
+func TestWorkloadAttestationRequiredUnlessOwnerKey(t *testing.T) {
+	req := e2b.CreateRequest{
+		SandboxID: "sbx-7a9b9b693452f613877992145c818d29", TemplateID: "tpl", Namespace: "ns",
+		Role: "e2b", SessionID: "owner-0123456789abcdef01234567", Workspace: "lab",
+		GrantID: "owner-0123456789abcdef01234567",
+	}
+	if err := validateWorkloadRequest(req); err == nil {
+		t.Fatal("accepted a grant sandbox without attestation")
+	}
+	req.OwnerKey = true
+	if err := validateWorkloadRequest(req); err != nil {
+		t.Fatalf("owner-key sandbox rejected: %v", err)
+	}
+}
+
 func TestAlignTimeoutAddsElapsed(t *testing.T) {
 	dc := dynfake.NewSimpleDynamicClientWithCustomListKinds(k8sruntime.NewScheme(), map[schema.GroupVersionResource]string{
 		workloadGVR: "WorkloadList",
@@ -511,5 +526,27 @@ func testCodeInterpreter() *runtimev1alpha1.CodeInterpreter {
 			},
 			GPU: &runtimev1alpha1.GPUConfig{Count: 2, SharedMemory: "250Gi", ResourceName: "amd.com/gpu"},
 		},
+	}
+}
+
+func TestWorkloadObjectMarksOwnerKeyWorkload(t *testing.T) {
+	ci := testCodeInterpreter()
+	const sandboxID = "sbx-7a9b9b693452f613877992145c818d29"
+	req := e2b.CreateRequest{SandboxID: sandboxID, TemplateID: "e2b-runner-g1", Role: "e2b", SessionID: "owner-c6c289e49e9c05b214586038",
+		Workspace: "lab", UserID: "user-1", GrantID: "owner-c6c289e49e9c05b214586038", OwnerKey: true}
+	obj, err := workloadObject(sandboxID, req, ci)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obj.GetLabels()["agent-sandbox.io/owner-key"] != "true" || obj.GetLabels()[grantIDLabel] != req.GrantID {
+		t.Fatalf("labels = %v", obj.GetLabels())
+	}
+	req.OwnerKey, req.Attestation = false, "eyJ.test"
+	obj, err = workloadObject(sandboxID, req, ci)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := obj.GetLabels()["agent-sandbox.io/owner-key"]; ok {
+		t.Fatal("grant workload must not carry the owner-key label")
 	}
 }

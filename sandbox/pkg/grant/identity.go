@@ -53,6 +53,11 @@ type MembershipChecker interface {
 	Check(ctx context.Context, userID string, workspaces []string) error
 }
 
+// AdminChecker reports whether a user holds the SaFE system-admin role.
+type AdminChecker interface {
+	IsSystemAdmin(ctx context.Context, userID string) (bool, error)
+}
+
 // UserCRMembership reads users.amd.com and compares the workspace list.
 type UserCRMembership struct {
 	client dynamic.Interface
@@ -113,4 +118,32 @@ func (m *UserCRMembership) Check(ctx context.Context, userID string, workspaces 
 		}
 	}
 	return nil
+}
+
+// IsSystemAdmin reports whether the User lists the system-admin role.
+func (m *UserCRMembership) IsSystemAdmin(ctx context.Context, userID string) (bool, error) {
+	if m == nil || m.client == nil {
+		return false, opErr(http.StatusServiceUnavailable, "membership_unavailable", "User client is not configured")
+	}
+	obj, err := m.client.Resource(userGVR).Get(ctx, userID, metav1.GetOptions{})
+	if err != nil {
+		return false, err
+	}
+	return isSystemAdmin(obj), nil
+}
+
+// Workspaces returns the workspaces listed on the User.
+func (m *UserCRMembership) Workspaces(ctx context.Context, userID string) ([]string, error) {
+	if m == nil || m.client == nil {
+		return nil, opErr(http.StatusServiceUnavailable, "membership_unavailable", "User client is not configured")
+	}
+	obj, err := m.client.Resource(userGVR).Get(ctx, userID, metav1.GetOptions{})
+	if err != nil {
+		return nil, opErr(http.StatusForbidden, "user_not_in_workspace", "user was not found")
+	}
+	got, err := listedWorkspaces(obj)
+	if err != nil {
+		return nil, opWrap(http.StatusForbidden, "user_not_in_workspace", "workspace list is unreadable", err)
+	}
+	return got, nil
 }

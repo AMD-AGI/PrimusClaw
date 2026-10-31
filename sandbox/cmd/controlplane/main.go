@@ -37,6 +37,7 @@ import (
 	"sigs.k8s.io/agent-sandbox/pkg/builder"
 	"sigs.k8s.io/agent-sandbox/pkg/e2b"
 	"sigs.k8s.io/agent-sandbox/pkg/grant"
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/nsadmission"
 	"sigs.k8s.io/agent-sandbox/pkg/router"
@@ -428,11 +429,16 @@ func main() {
 
 	if grants != nil {
 		routerServer.WithGrants(grants)
-		plane := e2b.New(e2b.Options{
+		idClient := ownerKeys(ctx, grants)
+		opts := e2b.Options{
 			Grants:    grants,
 			Runner:    apiServer,
 			Namespace: grant.Namespace(wmCfg.Namespace),
-		})
+		}
+		if idClient != nil {
+			opts.Identity = idClient
+		}
+		plane := e2b.New(opts)
 		grants.SetPromoter(plane)
 		apiServer.WithE2B(plane)
 	}
@@ -465,6 +471,35 @@ func main() {
 		os.Exit(1)
 	}
 	log.Info("controlplane shutdown complete")
+}
+
+// ownerKeys enables primus-identity keys when both the introspection client and
+// the owner policy are configured. It returns nil when either is absent or
+// invalid, so grant keys keep working.
+func ownerKeys(ctx context.Context, grants *grant.Service) *identity.Client {
+	client, err := identity.FromEnv()
+	if err != nil {
+		log.Error("identity keys disabled: identity client config is invalid", "error", err)
+		return nil
+	}
+	if client == nil {
+		return nil
+	}
+	policy, err := grant.OwnerPolicyFromEnv()
+	if err != nil {
+		log.Error("identity keys disabled: owner policy is invalid", "error", err)
+		return nil
+	}
+	if policy == nil {
+		log.Warn("identity keys disabled: owner policy is not configured")
+		return nil
+	}
+	if err := grants.SetOwnerPolicy(ctx, *policy); err != nil {
+		log.Error("identity keys disabled: owner policy was not applied", "error", err)
+		return nil
+	}
+	log.Info("identity keys enabled", "role", grants.OwnerRole())
+	return client
 }
 
 // startGrants serves the grant admin API from SandboxGrant CRs and reaps
