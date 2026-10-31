@@ -3,6 +3,7 @@
 
 import pg from "pg";
 import { APP_RUNS_ENABLED, CLAW_GITHUB_REVIEW_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_REMOTE_AGENTS_ENABLED, CLAW_TRIGGERS_ENABLED, DATABASE_URL, envBool, envInt } from "../config.js";
+import { ensureA2aPushSchema } from "../notifications/a2a-push-schema.js";
 import { ensureNotificationSchema } from "../notifications/schema.js";
 import { ensureRemoteAgentSchema } from "../remote-agents/schema.js";
 import { ensureGithubReviewSchema } from "../github-review/store.js";
@@ -2260,6 +2261,7 @@ export async function initDb(): Promise<void> {
         `CREATE INDEX IF NOT EXISTS idx_sessions_a2a_context ON claw_sessions(a2a_caller_id, context_id)
           WHERE a2a_caller_id != '' AND context_id != ''`,
       );
+      if (envBool("CLAW_A2A_PUSH_ENABLED", false)) await ensureA2aPushSchema(client);
     }
 
     await assertSchema(client);

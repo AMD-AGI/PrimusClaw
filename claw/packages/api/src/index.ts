@@ -32,6 +32,8 @@ import { registerUserEnvVarRoutes } from "./routes/user-env-vars.js";
 import { registerNotificationSubscriptionRoutes } from "./routes/notification-subscriptions.js";
 import { registerRemoteAgentRoutes } from "./routes/remote-agents.js";
 import { startNotificationWorker } from "./notifications/outbox.js";
+import { a2aPushEnabled } from "./routes/a2a-flags.js";
+import { startA2aPushWorker } from "./routes/a2a-push.js";
 import { registerSystemEnvVarRoutes, publishSystemEnvToKv } from "./routes/system-env-vars.js";
 import { registerSandboxAdminRoutes } from "./routes/sandbox-admin.js";
 import { registerTerminalRoutes } from "./routes/terminal.js";
@@ -350,6 +352,7 @@ async function main() {
   // Outbound notification delivery (HMAC-signed webhooks from the outbox).
   // Gated: with the flag off no table exists and nothing polls.
   if (CLAW_NOTIFICATIONS_ENABLED) startNotificationWorker();
+  if (a2aPushEnabled()) startA2aPushWorker();
 
   // Daily maintenance crons (every 24h, first run 1 min after startup).
   // Memory decay gated by CLAW_MEMORY_ENABLED, skill cleanups gated by

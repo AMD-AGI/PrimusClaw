@@ -22,7 +22,7 @@ import assert from "node:assert/strict";
 import type { Message, ToolSchema } from "@claw/protocol";
 import type { LlmSession, LlmTurnResult, LlmContentBlock } from "../src/llm/provider.js";
 import { ToolRouter } from "../src/tools/router.js";
-import { HandsClient } from "../src/clients/hands.js";
+import type { HandsClient } from "../src/clients/hands.js";
 import { BG_SHELL_ENABLED } from "../src/config.js";
 import { agentLoop, type LoopOptions } from "../src/agent/agent-loop.js";
 import { beginRun, endRun, setParkHooks } from "../src/tasks/run-phase.js";
@@ -63,11 +63,20 @@ const textBlock = (text: string): LlmContentBlock =>
  */
 function lazyRouter(): { router: ToolRouter; attaches: number } {
   const state = { attaches: 0 };
+  const hands = {
+    async callToolFull() { return { text: "ok", isError: false }; },
+    async classifyShell() { return { shellClass: "running", collectorLive: true }; },
+  } as unknown as HandsClient;
+  // The attach callback is the router's fourth parameter. `tsc` covers `src`
+  // only, so a constructor change that shifts it is invisible here: the
+  // callback would land past the end, `attachHands` would stay undefined, and
+  // every `attaches === 0` below would hold for the wrong reason. The control
+  // test after this fixture is what notices.
   const router = new ToolRouter(
-    null, undefined, undefined, undefined,
+    null, undefined, undefined,
     async () => {
       state.attaches += 1;
-      return new HandsClient("http://sandbox:9100/mcp", "tok", "sess-1", "ktsk_1");
+      return hands;
     },
   );
   return { router, get attaches() { return state.attaches; } };
@@ -77,6 +86,17 @@ test("the flag this file tests is off", () => {
   assert.equal(BG_SHELL_ENABLED, false,
     "every assertion below is about the disabled deployment and would pass "
       + "vacuously against the other one");
+});
+
+test("the fixture's attach callback is wired: a sandbox call opens exactly one", async () => {
+  // Control for the two `attaches === 0` assertions below. A callback that
+  // never reaches the router makes them pass whatever the router does, so
+  // prove here that a call which really needs a sandbox does provision one.
+  const lazy = lazyRouter();
+  await lazy.router.route("bash", { command: "echo hi" });
+  assert.equal(lazy.attaches, 1,
+    "the lazy-attach callback never reached the router, so the zero-attach "
+      + "assertions in this file prove nothing");
 });
 
 test("classifying a shell opens no sandbox when the wait would be refused", async () => {
