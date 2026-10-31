@@ -274,6 +274,17 @@ describe("D5 a refusal is kept for whom it is about", () => {
     assert.equal(w.exchanges.length, 2, "after 30 seconds it is asked again, and the provider may have changed its mind");
   });
 
+  test("a live refusal of a token stands even after another token of the person has earned keys, and ends with its 30 seconds", async () => {
+    const clock = { t: 1_000_000 };
+    const w = twoDevices(clock);
+    assert.equal((await asAlice(w, STALE)).status, "none");
+    assert.equal((await asAlice(w, GOOD)).status, "keys");
+    assert.deepEqual(await asAlice(w, STALE), { status: "none", reason: "delegation_refused_invalid_grant" }, "the provider's word on that token is not undone by the person's keys");
+    assert.equal(w.exchanges.length, 2, "and it was not asked again");
+    clock.t += 30_000;
+    assert.equal((await asAlice(w, STALE)).status, "keys", "once its refusal has lapsed, the person's held keys answer as for any token of theirs");
+  });
+
   test("a refusal of one person's token is nobody else's: another person's lookup with the same token text is its own", async () => {
     const clock = { t: 1_000_000 };
     const w = twoDevices(clock);

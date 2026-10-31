@@ -86,14 +86,16 @@ export class DelegatedKeys {
    * own token: that is not an answer for a caller who brought another.
    */
   async keysOf(sub: string, userToken: string, settings: DelegationSettings, deps: DelegationDeps): Promise<SaFeKeys> {
-    const held = this.entries.get(sub);
-    if (held && held.until > this.now()) return held.outcome;
-    if (held) this.entries.delete(sub);
-
+    // A refusal of this very token comes first: the provider's word on it stands for its 30 seconds even if another
+    // token of the person has since earned keys.
     const tokenKey = `${sub}\u0000${createHash("sha256").update(userToken).digest("hex")}`;
     const refused = this.tokenRefusals.get(tokenKey);
     if (refused && refused.until > this.now()) return refused.outcome;
     if (refused) this.tokenRefusals.delete(tokenKey);
+
+    const held = this.entries.get(sub);
+    if (held && held.until > this.now()) return held.outcome;
+    if (held) this.entries.delete(sub);
 
     const running = this.flights.get(sub);
     if (running) {
