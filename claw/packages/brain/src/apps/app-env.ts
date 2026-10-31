@@ -149,19 +149,28 @@ export function startCommand(manifest: AppManifestV1, stateDir: string, tag: str
     `if ! ln -s "$$|"${shq(workload)} ${START_LOCK} 2>/dev/null; then`,
     `  held=$(readlink ${START_LOCK} 2>/dev/null); holder=\${held%%|*}; lockwl=\${held#*|}`,
     `  if [ -n "$held" ] && [ "$lockwl" = ${shq(workload)} ] && kill -0 "$holder" 2>/dev/null; then echo busy; exit 0; fi`,
+    // A lock that is gone by the time it is read was released by a holder that had just finished: there is
+    // nothing stale to break, and "nothing" is not a value to compare against later, because by then a
+    // contender may have taken the lock and the comparison would still match. Ask for the lock again.
+    `  if [ -z "$held" ] && [ ! -e ${START_LOCK} ] && [ ! -L ${START_LOCK} ]; then`,
+    `    ln -s "$$|"${shq(workload)} ${START_LOCK} 2>/dev/null || { echo busy; exit 0; }`,
+    `  else`,
     // Breaking a stale lock is itself serialised: `rm -rf` of a lock judged stale a moment ago can
     // delete a fresh lock another contender created in between, and then both proceed. Only the
     // holder of the break link may remove the lock, and only while it is still the very one judged stale.
-    `  if ! ln -s "$$|"${shq(workload)} ${BREAK_LOCK} 2>/dev/null; then`,
-    `    bheld=$(readlink ${BREAK_LOCK} 2>/dev/null); bholder=\${bheld%%|*}; bwl=\${bheld#*|}`,
-    `    if [ -n "$bheld" ] && [ "$bwl" = ${shq(workload)} ] && kill -0 "$bholder" 2>/dev/null; then echo busy; exit 0; fi`,
-    `    rm -f ${BREAK_LOCK}; ln -s "$$|"${shq(workload)} ${BREAK_LOCK} 2>/dev/null || { echo busy; exit 0; }`,
+    `    if ! ln -s "$$|"${shq(workload)} ${BREAK_LOCK} 2>/dev/null; then`,
+    `      bheld=$(readlink ${BREAK_LOCK} 2>/dev/null); bholder=\${bheld%%|*}; bwl=\${bheld#*|}`,
+    // A break link that cannot be read is one that was just released: leave it to the next tick.
+    `      if [ -z "$bheld" ] || { [ "$bwl" = ${shq(workload)} ] && kill -0 "$bholder" 2>/dev/null; }; then echo busy; exit 0; fi`,
+    `      rm -f ${BREAK_LOCK}; ln -s "$$|"${shq(workload)} ${BREAK_LOCK} 2>/dev/null || { echo busy; exit 0; }`,
+    `    fi`,
+    `    now=$(readlink ${START_LOCK} 2>/dev/null)`,
+    // An owner-less lock is a directory left by an older version, and only that may be removed on an empty read.
+    `    if [ "$now" = "$held" ] && { [ -n "$held" ] || { [ -d ${START_LOCK} ] && [ ! -L ${START_LOCK} ]; }; }; then rm -rf ${START_LOCK}; fi`,
+    `    ln -s "$$|"${shq(workload)} ${START_LOCK} 2>/dev/null; got=$?`,
+    `    rm -f ${BREAK_LOCK}`,
+    `    if [ "$got" -ne 0 ]; then echo busy; exit 0; fi`,
     `  fi`,
-    `  now=$(readlink ${START_LOCK} 2>/dev/null)`,
-    `  if [ "$now" = "$held" ]; then rm -rf ${START_LOCK}; fi`,
-    `  ln -s "$$|"${shq(workload)} ${START_LOCK} 2>/dev/null; got=$?`,
-    `  rm -f ${BREAK_LOCK}`,
-    `  if [ "$got" -ne 0 ]; then echo busy; exit 0; fi`,
     `fi`,
     `trap 'rm -rf ${START_LOCK}' EXIT`,
     `marker=$(cat ${MARKER_FILE} 2>/dev/null)`,

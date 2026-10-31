@@ -137,6 +137,15 @@ record it.
   confirmed is not opened); the adapter's own permission options passed through verbatim, including
   allow-always; credentials masked before upload; a local audit log; a kill switch that stops only the
   process groups it started. See `connector/README.md`.
+- `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
+  `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
+  starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
+  Cursor `agent` with `--force`), lets the phone select such modes for that agent only, and accepts the adapter's
+  "will not ask" warning (audited) instead of refusing the session; a file-level `allow_unsafe_modes = true` accepts it
+  too, for every agent without its own `approval`, and without either the session is still refused. Agents
+  report `unattended` and `unattended_allowed` in their capabilities, and `session_started`, `session_resumed` and
+  `mode_update` carry `unattended`, so a client always shows how a session runs; the API relays them unchanged. See
+  `connector/README.md` and `claw/docs/remote-agents.md`.
 - A shared identity client in `@claw/utils`, built by API and Brain when
   `IDENTITY_CLIENT_ENABLED=true` (off by default; it authenticates a request only through the access-token
   credentials above, a connector's and an identity provider's). It does OIDC
@@ -205,6 +214,14 @@ record it.
   `--`, with literal pathspecs and without its optional index lock. See `claw/docs/sandbox-session-lifecycle.md`.
 
 ### Changed
+- `claw-connector`: two changes for an existing `agents.toml` that need no setting to take effect. A file with
+  `allow_unsafe_modes = true` now also accepts an adapter's "will not ask for permission" warning for every agent without
+  its own `approval`, so a session that used to be closed with `mode_not_enforced` now opens and is reported
+  `unattended`; set `approval = "ask"` on an agent to keep refusing it. And a preset agent whose `safe_modes` or
+  `ask_mode` names a mode the preset does not know to ask (for example `claude` with
+  `safe_modes = ["default", "plan", "acceptEdits"]`) is now a configuration error, so `claw-connector run` does not
+  start; remove the mode, or set `approval = "never"` on the agent (or `allow_unsafe_modes = true` in the file, for an
+  agent that does not say `approval = "ask"`).
 - Brain no longer fetches every plugin skill again on every turn. Downloaded skill
   files are held in memory (bounded by `SKILL_CACHE_MAX_BYTES`, 64 MiB by default,
   `0` turns it off) and reused while the skill is unchanged: a plugin skill is

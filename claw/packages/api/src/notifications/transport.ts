@@ -36,9 +36,10 @@ export const httpTransport: Transport = ({ target, headers, body, timeoutMs }) =
       method: "POST",
       servername: secure ? url.hostname : undefined,
       headers: {
+        // A caller that speaks another JSON media type (A2A's) names it.
+        "content-type": "application/json",
         ...headers,
         host: url.host,
-        "content-type": "application/json",
         "content-length": String(Buffer.byteLength(body)),
       },
     }, (res) => {

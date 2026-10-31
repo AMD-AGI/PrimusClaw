@@ -33,7 +33,7 @@ import {
   ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY, OPENAI_BASE_URL, OPENAI_API_KEY, LLM_API_STYLE,
   DEFAULT_MODEL, MAX_TURNS,
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED,
-  BASH_APPROVAL_RULES, A2A_CLIENT_ENABLED,
+  BASH_APPROVAL_RULES, ASK_USER_QUESTION_ENABLED, A2A_CLIENT_ENABLED,
   PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED,
 } from "../config.js";
 import { a2aApprovalHold } from "../clients/a2a.js";
@@ -280,7 +280,12 @@ export class AgentEngine {
     // (a2aApprovalHold). Nothing else changes: calls the policies do not name stay as they were.
     const policyActive = approval.active || bashPolicy.active;
     const anyApproval = policyActive || A2A_CLIENT_ENABLED;
-    const decisions = anyApproval && extras?.natsConnection
+    // The channel decisions arrive on. Approvals need it, and so does the
+    // question tool, which waits for its answer on the same subject: a
+    // deployment that turns questions on without any approval policy gets the
+    // channel for the question alone (`hitl` below is still built only for an
+    // approval policy).
+    const decisions = (anyApproval || ASK_USER_QUESTION_ENABLED) && extras?.natsConnection
       ? new DecisionDispatcher(extras.natsConnection, sessionId)
       : null;
     const hitl = anyApproval
@@ -493,6 +498,11 @@ export class AgentEngine {
           recreateHands: extras?.recreateHands,
           hooks: hookRunner,
           hitl,
+          // The question tool waits for its answer on the same channel as an
+          // approval. It was never handed over, so the tool answered "not
+          // available" whenever it was called and a question could not be asked
+          // of anyone, a web client or an A2A caller.
+          questionDispatcher: decisions ?? undefined,
           onCheckpoint: extras?.onCheckpoint,
           onCacheUse: extras?.onCacheUse,
           resumeFrom: extras?.resumeCheckpoint,
