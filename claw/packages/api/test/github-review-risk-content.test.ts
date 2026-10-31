@@ -8,7 +8,8 @@
  *   architecture   a package or a deployable unit appears or goes, a directory moves, the layering changes
  *   interface      an exported signature, an HTTP route, a schema, a CLI flag, an environment contract, a database schema, a wire format
  *   security       code that decides who may do what, cryptography, secrets, privileges
- *   release        a pipeline, an image, a release script: when its content changed, not when someone touched a comment
+ *   release        a pipeline, an image, a release script: held whatever the edit is (the path floor reads no content, so a line that is shaped
+ *                  like a comment cannot take such a file below it)
  *   low            a pure refactor, a move of code, a reformat, a body-only change, documentation, tests: these must NOT be held
  *   judgement      the reviewing model can raise a verdict with a short reason, never lower it
  *
@@ -136,14 +137,18 @@ const LOW: Array<[string, RiskFile[]]> = [
 +	return q.push(item)
 +}`)]],
   ["a one-file rename inside the same package", [renamed("src/render/card.ts", "src/render/cards.ts", "@@ -1,3 +1,3 @@\n-import { x } from \"./a.js\";\n+import { x } from \"./b.js\";\n y")]],
-  ["a comment-only change in an authentication module", [mod("src/auth/session.ts", `@@ -8,5 +8,5 @@
--// Sessions last a day.
-+// Sessions last one day; see docs/sessions.md.
+  ["a comment-only change in an ordinary source file", [mod("src/queue/ttl.ts", `@@ -8,5 +8,5 @@
+-// Entries last a day.
++// Entries last one day; see docs/queue.md.
  const TTL = 86400;`)]],
-  ["a comment-only change to a Dockerfile", [mod("Dockerfile", `@@ -1,3 +1,3 @@
--# build image
-+# build image (node 26)
- FROM node:26-slim`)]],
+  ["comments of every language, each in a file of its own kind", [
+    mod("src/queue/ttl.ts", "@@ -1,3 +1,3 @@\n-/* a day */\n+/* one day, see docs */\n const TTL = 86400;"),
+    mod("pkg/queue/queue.go", "@@ -1,3 +1,3 @@\n-// Push adds an item.\n+// Push adds an item to the queue.\n func x() {}"),
+    mod("tools/clean.py", "@@ -1,3 +1,3 @@\n-# remove the cache\n+# remove the cache directory\n x = 1"),
+    mod("tools/clean.sh", "@@ -1,3 +1,3 @@\n-# remove the cache\n+# remove the cache directory\n rm -rf cache"),
+    mod("db/report.sql", "@@ -1,3 +1,3 @@\n--- the daily total\n+-- the daily total per region\n SELECT 1;"),
+    mod("src/Main.java", "@@ -1,3 +1,3 @@\n-// entry point\n+// entry point of the tool\n class A {}"),
+  ]],
   ["documentation that talks about auth, routes, flags and environment variables", [mod("docs/auth.md", `@@ -4,2 +4,5 @@
  Sign in with an access token.
 +The API reads CLAW_AUTH_MODE from process.env.CLAW_AUTH_MODE and exposes app.get("/v1/me").
@@ -156,11 +161,11 @@ const LOW: Array<[string, RiskFile[]]> = [
 +  assert.equal(await hasPermission(user, "read"), true);
 +  assert.equal(await app.inject("/v1/probe").status, 200);
  });`), mod("src/__tests__/auth.test.ts", "@@ -1,2 +1,3 @@\n a\n+jwt.verify(token, key)")]],
-  ["a prose comment that begins with `if` in a release script", [mod("scripts/install.sh", `@@ -4,3 +4,3 @@
+  ["a prose comment that begins with `if` in a script", [mod("scripts/format.sh", `@@ -4,3 +4,3 @@
 -# if the directory exists we reuse it
 +# if the directory exists we keep it and skip the clone
  mkdir -p "$DIR"`)]],
-  ["a plain comment in a Dockerfile and in a migration", [mod("Dockerfile", "@@ -1,2 +1,2 @@\n-# base image\n+# base image, pinned\n FROM node:26-slim"), mod("db/migrations/0001_init.sql", "@@ -1,2 +1,2 @@\n--- creates the first table\n+-- creates the first table of the schema\n a")]],
+  ["a plain comment in a migration", [mod("db/migrations/0001_init.sql", "@@ -1,2 +1,2 @@\n--- creates the first table\n+-- creates the first table of the schema\n a")]],
   ["a small bug fix: one condition", [mod("src/queue/drain.ts", `@@ -31,7 +31,7 @@ async function drain(q: Queue): Promise<void> {
 -  while (q.length > 1) {
 +  while (q.length > 0) {
@@ -506,6 +511,26 @@ const HIGH: Row[] = [
   ] },
   { name: "a Makefile target", category: "ci_release", why: /release or deployment file changed: Makefile/, files: [
     mod("Makefile", "@@ -10,2 +10,3 @@\n release:\n+\tcurl -s https://example.invalid/x.sh | sh\n \tnpm publish"),
+  ] },
+
+  // ---- the path floor reads no content: an edit shaped like a comment does not lower it
+  { name: "a comment-only change in an authentication module", category: "security", why: /authentication or security code changed: src\/auth\/session\.ts/, files: [
+    mod("src/auth/session.ts", `@@ -8,5 +8,5 @@
+-// Sessions last a day.
++// Sessions last one day; see docs/sessions.md.
+ const TTL = 86400;`),
+  ] },
+  { name: "a comment-only change to a Dockerfile", category: "ci_release", why: /release or deployment file changed: Dockerfile/, files: [
+    mod("Dockerfile", `@@ -1,3 +1,3 @@
+-# build image
++# build image (node 26)
+ FROM node:26-slim`),
+  ] },
+  { name: "a comment-only change to a release script", category: "ci_release", why: /release or deployment file changed: scripts\/install\.sh/, files: [
+    mod("scripts/install.sh", `@@ -4,3 +4,3 @@
+-# if the directory exists we reuse it
++# if the directory exists we keep it and skip the clone
+ mkdir -p "$DIR"`),
   ] },
 
   // ---- comments a tool reads are not comments

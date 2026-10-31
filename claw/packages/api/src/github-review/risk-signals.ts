@@ -80,12 +80,113 @@ export interface Net {
 /** The longest line the patterns read. A longer one is cut for them, and said so, so a very long line is a reason of its own. */
 export const MAX_LINE_CHARS = 4000;
 
+/**
+ * The most the content half reads of one change: this many changed lines and this many characters of them. A pull request that adds
+ * more is not read past the point the budget runs out, and that is a reason of its own (it is also large, which holds it): what a
+ * person outside the organisation writes must cost the shared API a bounded amount, however many lines it sends.
+ */
+export const MAX_READ_LINES = 20_000;
+export const MAX_READ_CHARS = 2_000_000;
+
 /** A changed line as the patterns read it: cut at {@link MAX_LINE_CHARS}, which bounds what any pattern can cost. */
 export const clipLine = (text: string): string => (text.length <= MAX_LINE_CHARS ? text : text.slice(0, MAX_LINE_CHARS));
 
+/** The changed lines of every file as the patterns read them, read once: cut at {@link MAX_LINE_CHARS} and within the budget above. */
+export interface ChangeText {
+  lines: Map<RiskFile, { added: string[]; removed: string[] }>;
+  /** Files with a changed line longer than {@link MAX_LINE_CHARS}: minified or generated code the patterns do not read in full. */
+  unreadable: Set<string>;
+  /** The budget ran out: the lines after that point were not read. */
+  truncated: boolean;
+}
+
+export function readChange(files: RiskFile[]): ChangeText {
+  const lines = new Map<RiskFile, { added: string[]; removed: string[] }>();
+  const unreadable = new Set<string>();
+  let count = 0;
+  let chars = 0;
+  let truncated = false;
+  const take = (path: string, raw: string[]): string[] => {
+    const out: string[] = [];
+    for (const line of raw) {
+      if (count >= MAX_READ_LINES || chars >= MAX_READ_CHARS) { truncated = true; break; }
+      if (line.length > MAX_LINE_CHARS) unreadable.add(path);
+      const text = clipLine(line);
+      count += 1;
+      chars += text.length;
+      out.push(text);
+    }
+    return out;
+  };
+  for (const f of files) lines.set(f, { added: take(f.path, addedLines(f.patch)), removed: take(f.path, removedLines(f.patch)) });
+  return { lines, unreadable, truncated };
+}
+
 const norm = (l: string): string => l.trim().replace(/\s+/g, " ");
-// `#` opens a comment in shell, Python and YAML but not a Rust attribute (`#[`) or a shebang (`#!`).
-const COMMENT = /^(\/\/|\/\*|\*( |\/|$)|#(?![[!])|--( |$)|<!--|"""|''')/;
+
+/**
+ * What a comment looks like in a file, by the file's name: only the markers its language has. A line that starts like a comment
+ * in some other language is code here (`#allowed() {` is a JavaScript private member, an empty block comment followed by a call is a
+ * call, `* b;` ends a multiplication), and a file of a kind that is not listed has no comments at all, so nothing in it is dropped. A line is a
+ * comment only when all of it is: after a block comment that closes on the line, a statement is still a statement. The inside
+ * of a block comment is not tracked (a lone `/*` inside a string would hide the code after it), so a line in the middle of a
+ * comment block is read like any other line.
+ */
+interface CommentSyntax { line: readonly string[]; block: boolean; html: boolean }
+const NO_COMMENTS: CommentSyntax = { line: [], block: false, html: false };
+const SLASH: CommentSyntax = { line: ["//"], block: true, html: false };
+const HASH: CommentSyntax = { line: ["#"], block: false, html: false };
+const SYNTAX_BY_EXTENSION = new Map<string, CommentSyntax>();
+const syntaxFor = (syntax: CommentSyntax, ...extensions: string[]): void => { for (const e of extensions) SYNTAX_BY_EXTENSION.set(e, syntax); };
+syntaxFor(SLASH, "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "go", "java", "kt", "kts", "scala", "c", "h", "cc", "cpp", "cxx", "hpp", "hh",
+  "cu", "cuh", "cs", "rs", "swift", "dart", "groovy", "gradle", "proto", "thrift", "jsonc", "json5", "m", "mm", "sol");
+syntaxFor({ line: ["//", "#"], block: true, html: false }, "php");
+syntaxFor(HASH, "py", "pyi", "sh", "bash", "zsh", "ksh", "rb", "pl", "pm", "r", "yaml", "yml", "toml", "tf", "tfvars", "hcl", "conf", "cfg", "ini",
+  "properties", "ps1", "nix", "ex", "exs", "mk", "cmake", "bzl", "bazel", "dockerfile", "gitignore", "dockerignore", "graphql", "graphqls", "gql");
+syntaxFor({ line: ["--"], block: true, html: false }, "sql", "psql");
+syntaxFor({ line: ["--"], block: false, html: false }, "lua", "hs");
+syntaxFor({ line: [], block: false, html: true }, "html", "htm", "xhtml", "xml", "svg", "vue");
+const HASH_FILES = /^(?:Dockerfile.*|(?:GNU)?[Mm]akefile|\.env(?:\..*)?|BUILD|WORKSPACE|Procfile|\.gitattributes|\.npmrc)$/;
+const SLASH_FILES = /^(?:Jenkinsfile.*|go\.work)$/;
+function commentSyntax(path: string): CommentSyntax {
+  const name = path.slice(path.lastIndexOf("/") + 1);
+  if (HASH_FILES.test(name)) return HASH;
+  if (SLASH_FILES.test(name)) return SLASH;
+  const dot = name.lastIndexOf(".");
+  return (dot > 0 ? SYNTAX_BY_EXTENSION.get(name.slice(dot + 1).toLowerCase()) : undefined) ?? NO_COMMENTS;
+}
+
+/** A line marker that opens a comment at `i`: `#` is not a Rust attribute (`#[`) or a shebang (`#!`), and `--` needs a space or the end after it. */
+function lineMarkerAt(marker: string, n: string, i: number): boolean {
+  if (!n.startsWith(marker, i)) return false;
+  const next = n[i + marker.length];
+  if (marker === "#") return next !== "[" && next !== "!";
+  if (marker === "--") return next === undefined || next === " ";
+  return true;
+}
+
+/** Whether every character of the (normalised, non-blank) line is comment. Linear: it only moves forward over comments it recognises. */
+function commentOnly(n: string, syntax: CommentSyntax): boolean {
+  let i = 0;
+  while (i < n.length) {
+    if (n.charCodeAt(i) === 32) { i += 1; continue; }
+    if (syntax.block && n.startsWith("/*", i)) {
+      const end = n.indexOf("*/", i + 2);
+      if (end < 0) return true; // an opening line: comment to its end, and the lines inside it are read as lines
+      i = end + 2;
+      continue;
+    }
+    if (syntax.html && n.startsWith("<!--", i)) {
+      const end = n.indexOf("-->", i + 4);
+      if (end < 0) return false;
+      i = end + 3;
+      continue;
+    }
+    return syntax.line.some((m) => lineMarkerAt(m, n, i));
+  }
+  return true;
+}
+
 /**
  * A line that is shaped like a comment and is read by a tool: it changes what happens, so it is not a comment. A Dockerfile parser
  * directive can name the frontend that runs the build, a migration tool reads its own `-- +goose` and `-- migrate:` lines, the Go
@@ -93,40 +194,29 @@ const COMMENT = /^(\/\/|\/\*|\*( |\/|$)|#(?![[!])|--( |$)|<!--|"""|''')/;
  * permissions, and a comment can switch a security scanner off for the line it sits on.
  */
 const DIRECTIVE = /^(?:#\s*(?:syntax|escape|check)\s*=|(?:--|#|\/\/)\s*\+?(?:goose|migrate)\b|--\s*(?:migrate:|liquibase|changeset|atlas:|flyway)|\/\/\s*(?:go:|\+build|\+kubebuilder|\+k8s|\+genclient|nolint)|\/[/*]\s*(?:@ts-|eslint-|istanbul|webpack)|.*(?:#nosec|\bnosec\b|checkov:skip|trivy:ignore|NOSONAR|pragma:\s*allowlist|\bnoqa\b|lgtm\[|codeql\[))/i;
-/** The C family keeps its preprocessor on lines that start with `#`; they are code. */
-const C_FAMILY = /\.(?:c|h|cc|cpp|cxx|hpp|hh|cu|cuh|m|mm)$/i;
-const PREPROCESSOR = /^#\s*(?:include|define|undef|if|ifdef|ifndef|else|elif|endif|pragma|import|error|warning|line)\b/;
-/** A line that says something: not blank and not only a comment (a comment a tool reads is not only a comment). */
+/** A line that says something: not blank and not only a comment of its file's language (a comment a tool reads is not only a comment). */
 const meaningfulLine = (l: string, path = ""): boolean => {
   const n = norm(l);
   if (n === "") return false;
-  if (!COMMENT.test(n)) return true;
-  return DIRECTIVE.test(n) || (C_FAMILY.test(path) && PREPROCESSOR.test(n));
+  return !commentOnly(n, commentSyntax(path)) || DIRECTIVE.test(n);
 };
 
 /**
  * The lines the change really adds and really removes: a line that is removed in one place and added in
  * another (a move, a reindent) is in neither list.
  */
-export function netChange(files: RiskFile[]): Net {
+export function netChange(files: RiskFile[], read: ChangeText): Net {
   const lost = new Map<string, number>();
   const removedAll: NetLine[] = [];
   const addedAll: NetLine[] = [];
-  const unreadable = new Set<string>();
-  const clip = (path: string, text: string): string => {
-    if (text.length <= MAX_LINE_CHARS) return text;
-    unreadable.add(path);
-    return text.slice(0, MAX_LINE_CHARS);
-  };
   for (const f of files) {
-    for (const raw of removedLines(f.patch)) {
-      const text = clip(f.path, raw);
+    const lines = read.lines.get(f);
+    for (const text of lines?.removed ?? []) {
       if (!meaningfulLine(text, f.path)) continue;
       removedAll.push({ path: f.path, text });
       lost.set(norm(text), (lost.get(norm(text)) ?? 0) + 1);
     }
-    for (const raw of addedLines(f.patch)) {
-      const text = clip(f.path, raw);
+    for (const text of lines?.added ?? []) {
       if (meaningfulLine(text, f.path)) addedAll.push({ path: f.path, text });
     }
   }
@@ -142,7 +232,7 @@ export function netChange(files: RiskFile[]): Net {
     const n = lost.get(key) ?? 0;
     if (n > 0) { lost.set(key, n - 1); removed.push(l); }
   }
-  return { added, removed, raw: { added: addedAll, removed: removedAll }, unreadable };
+  return { added, removed, raw: { added: addedAll, removed: removedAll }, unreadable: read.unreadable };
 }
 
 /** The paths that have at least one meaningful changed line, whether or not it appears elsewhere: a comment is not a change, a moved line is. */
@@ -211,50 +301,84 @@ const PUBLIC_ENTRY = /(^|\/)(index\.[cm]?[jt]sx?|mod\.rs|lib\.rs|__init__\.pyi?)
 
 interface ExportedSymbol { key: string; name: string; sig: string }
 
-/** What the signature is, without the body that follows it and, for a constant, without the value that initialises it. */
-function jsSignature(text: string): string {
-  const t = text.trim().replace(/\s*\{\s*$/, "").replace(/;$/, "");
-  const decl = /^(export\s+(?:declare\s+)?(?:default\s+)?(?:const|let|var)\s+[^=]+?)\s*=\s*(.*)$/.exec(t);
+/*
+ * The patterns below read a line that a stranger wrote, in the API's own process, so none of them may cost more than the line is long.
+ * Two things keep them to that. The line is normalised first (runs of whitespace are one space, see `norm`), so a pattern never has two
+ * optional runs of whitespace next to each other to divide a long run between; and a part of a pattern that can match what the part
+ * next to it matches (a word followed by an optional word, a lazy run followed by a space) is split with plain string code instead.
+ * A pattern that backtracks super-linearly on a 4000-character line is a defect: test/github-review-redos.test.ts times every
+ * language on adversarial lines.
+ */
+
+/** What the signature is, without the body that follows it and, for a constant, without the value that initialises it. `n` is normalised. */
+function jsSignature(n: string): string {
+  const t = n.replace(/ ?\{$/, "").replace(/;$/, "");
+  const decl = /^(export (?:declare )?(?:default )?(?:const|let|var) [^=]+?) ?= ?(.*)$/.exec(t);
   if (!decl) return t;
   // A function-valued constant is its parameters: keep them, drop the body.
-  const fn = /^((?:async\s*)?(?:<[^>]*>\s*)?(?:\([^)]*\)|[\w$]+)\s*(?::\s*[^=]+?)?\s*=>)/.exec(decl[2] as string);
+  const fn = /^((?:async ?)?(?:<[^>]*> ?)?(?:\([^)]*\)|[\w$]+) ?(?:: ?[^=]+?)? ?=>)/.exec(decl[2] as string);
   return fn ? `${decl[1]} = ${fn[1]}` : (decl[1] as string);
 }
 
+/** `func (r *T[K]) Name(` or `func Name(`: the receiver's type, if there is one, and the name. Split in two so that no pattern has to divide the receiver's words. */
+function goFunction(n: string): { recv: string | null; name: string } | null {
+  const fn = /^func (?:\(([^)]*)\) ?)?([A-Z]\w*) ?[[(]/.exec(n);
+  if (!fn) return null;
+  if (fn[1] === undefined) return { recv: null, name: fn[2] as string };
+  const recv = /^(?:\w+(?: |(?=\*)))?\*? ?(\w+)(?:\[[^\]]*\])? ?$/.exec(fn[1]);
+  return recv ? { recv: recv[1] as string, name: fn[2] as string } : null;
+}
+
+/** `public [modifiers] ReturnType name(`: the method's name. `n` is normalised; the first `(` ends the declaration part, which holds no `(` of its own. */
+function jvmMethodName(n: string): string | null {
+  if (!n.startsWith("public ")) return null;
+  const open = n.indexOf("(");
+  if (open < 0) return null;
+  const left = n.slice(7, open).trimEnd();
+  const space = left.lastIndexOf(" ");
+  if (space < 0) return null; // a return type and a name are both needed
+  const name = left.slice(space + 1);
+  // What stands before the name: modifiers and the return type, in the characters a type is written with.
+  return /^\w+$/.test(name) && /^[\w<>[\],.? ]+$/.test(left.slice(0, space)) ? name : null;
+}
+
 function exportedSymbol(lang: Lang, path: string, raw: string): ExportedSymbol | null {
-  const t = raw.trim();
+  const t = norm(raw);
+  // Go and Python declare at column 0 only: an indented line is a nested one.
+  const top = !/^\s/.test(raw);
   if (lang === "js") {
-    const m = /^export\s+(?:declare\s+)?(?:default\s+)?(?:abstract\s+)?(?:async\s+)?(function\s*\*?|class|interface|type|enum|const|let|var|namespace)\s*([A-Za-z_$][\w$]*)?/.exec(t);
+    const m = /^export (?:declare )?(?:default )?(?:abstract )?(?:async )?(function ?\*?|class|interface|type|enum|const|let|var|namespace) ?([A-Za-z_$][\w$]*)?/.exec(t);
     if (m) { const name = m[2] ?? "default"; return { key: name === "default" ? `${path}:default` : `js:${name}`, name, sig: jsSignature(t) }; }
-    const names = /^export\s*(?:type\s*)?\{([^}]*)\}/.exec(t);
+    const names = /^export ?(?:type ?)?\{([^}]*)\}/.exec(t);
     if (names) return { key: `${path}:{}`, name: norm(names[1] as string), sig: t };
-    const star = /^export\s*\*(?:\s*as\s+\w+)?\s*from\s*['"]([^'"]+)['"]/.exec(t);
+    const star = /^export ?\*(?: ?as \w+)? ?from ?['"]([^'"]+)['"]/.exec(t);
     if (star) return { key: `${path}:*${star[1]}`, name: `* from ${star[1]}`, sig: t };
-    if (/^export\s+default\b/.test(t)) return { key: `${path}:default`, name: "default", sig: jsSignature(t) };
+    if (/^export default\b/.test(t)) return { key: `${path}:default`, name: "default", sig: jsSignature(t) };
     return null;
   }
   if (lang === "go") {
-    const fn = /^func\s+(?:\(\s*\w*\s*\*?\s*(\w+)(?:\[[^\]]*\])?\s*\)\s*)?([A-Z]\w*)\s*[[(]/.exec(raw);
-    if (fn) { const name = fn[1] ? `${fn[1]}.${fn[2]}` : (fn[2] as string); return { key: `go:${name}`, name, sig: t.replace(/\s*\{\s*$/, "") }; }
-    const ty = /^(?:type|var|const)\s+([A-Z]\w*)\b/.exec(raw);
-    if (ty) return { key: `go:${ty[1]}`, name: ty[1] as string, sig: t.replace(/\s*\{\s*$/, "") };
+    if (!top) return null;
+    const fn = goFunction(t);
+    if (fn) { const name = fn.recv ? `${fn.recv}.${fn.name}` : fn.name; return { key: `go:${name}`, name, sig: t.replace(/ ?\{$/, "") }; }
+    const ty = /^(?:type|var|const) ([A-Z]\w*)\b/.exec(t);
+    if (ty) return { key: `go:${ty[1]}`, name: ty[1] as string, sig: t.replace(/ ?\{$/, "") };
     return null;
   }
   if (lang === "py") {
     // Top level only (column 0) and not private.
-    const def = /^(?:async\s+)?(?:def|class)\s+([A-Za-z]\w*)/.exec(raw);
-    if (def) return { key: `py:${def[1]}`, name: def[1] as string, sig: t.replace(/:\s*$/, "") };
+    const def = top ? /^(?:async )?(?:def|class) ([A-Za-z]\w*)/.exec(t) : null;
+    if (def) return { key: `py:${def[1]}`, name: def[1] as string, sig: t.replace(/:$/, "") };
     return null;
   }
   if (lang === "jvm") {
-    const type = /^public\s+(?:(?:static|final|abstract|sealed|partial|open|data)\s+)*(?:class|interface|enum|record|struct|object)\s+(\w+)/.exec(t);
-    if (type) return { key: `jvm:${type[1]}`, name: type[1] as string, sig: t.replace(/\s*\{\s*$/, "") };
-    const method = /^public\s+(?:(?:static|final|abstract|synchronized|override|async|virtual)\s+)*[\w<>[\],.? ]+?\s+(\w+)\s*\(/.exec(t);
-    if (method) return { key: `jvm:${method[1]}`, name: method[1] as string, sig: t.replace(/\s*\{\s*$/, "") };
+    const type = /^public (?:(?:static|final|abstract|sealed|partial|open|data) )*(?:class|interface|enum|record|struct|object) (\w+)/.exec(t);
+    if (type) return { key: `jvm:${type[1]}`, name: type[1] as string, sig: t.replace(/ ?\{$/, "") };
+    const method = jvmMethodName(t);
+    if (method) return { key: `jvm:${method}`, name: method, sig: t.replace(/ ?\{$/, "") };
     return null;
   }
-  const rs = /^pub(?:\([^)]*\))?\s+(?:(?:async|unsafe|const|extern)\s+)*(fn|struct|enum|trait|type|const|static|mod)\s+(\w+)/.exec(t);
-  return rs ? { key: `rs:${rs[2]}`, name: rs[2] as string, sig: t.replace(/\s*\{\s*$/, "") } : null;
+  const rs = /^pub(?:\([^)]*\))? (?:(?:async|unsafe|const|extern) )*(fn|struct|enum|trait|type|const|static|mod) (\w+)/.exec(t);
+  return rs ? { key: `rs:${rs[2]}`, name: rs[2] as string, sig: t.replace(/ ?\{$/, "") } : null;
 }
 
 function exportFindings(net: Net, byPath: Map<string, RiskFile>): Finding[] {
@@ -458,8 +582,8 @@ function securityFindings(net: Net): Finding[] {
 }
 
 /** Everything the content of the change says, over the files GitHub described. */
-export function contentFindings(files: RiskFile[]): { findings: Finding[]; touched: Set<string>; net: Net } {
-  const net = netChange(files);
+export function contentFindings(files: RiskFile[], read: ChangeText = readChange(files)): { findings: Finding[]; touched: Set<string>; net: Net } {
+  const net = netChange(files, read);
   const touched = touchedPaths(net);
   // Fails closed: what cannot be read in a reasonable length is not known to be harmless.
   const unreadable: Finding[] = [...net.unreadable].map((path) => ({ category: "integrity", reason: `a changed line is too long to read (minified or generated code): ${path}` }));

@@ -30,12 +30,11 @@
  * What the repository itself says comes from the BASE branch only (see
  * {@link parseClawyConfig}); a pull request that edits that file is high risk.
  */
-import { addedLines, removedLines } from "./diff.js";
-import { clipLine, contentFindings, isDoc, isSource, isTest, type Finding, type RiskCategory } from "./risk-signals.js";
+import { MAX_READ_CHARS, MAX_READ_LINES, contentFindings, isDoc, isSource, isTest, readChange, type Finding, type RiskCategory } from "./risk-signals.js";
 
 export type { Finding, RiskCategory } from "./risk-signals.js";
 
-export const RISK_RULE_PACK_VERSION = "2026-10-30.2";
+export const RISK_RULE_PACK_VERSION = "2026-10-31.1";
 
 /** What the reviewing model says about the change after reading it. It can only raise the verdict. */
 export interface ReviewerJudgement {
@@ -72,7 +71,17 @@ export interface RepoConfig {
  * risk rules and by the choice of review path.
  */
 export function diffNotSent(f: Pick<RiskFile, "patch">): boolean {
-  return f.patch === undefined;
+  return f.patch === undefined || isLfsPointerPatch(f.patch);
+}
+
+/**
+ * A file tracked by Git LFS is a small text pointer in the repository (`version https://git-lfs.github.com/spec/v1`, `oid sha256:<hash>`,
+ * `size <bytes>`), and that pointer is what GitHub sends as the patch: a swapped executable or a set of model weights shows as two changed
+ * lines of hex, which no rule can read as the change it is. It is the same as a binary whose diff was not sent: what changed was not shown.
+ */
+const LFS_POINTER_LINE = /^[ +-](?:version https:\/\/(?:git-lfs|hawser)\.github\.com\/spec\/v\d+|oid sha256:[0-9a-f]{64})\r?$/m;
+export function isLfsPointerPatch(patch: string): boolean {
+  return LFS_POINTER_LINE.test(patch);
 }
 
 export interface RiskInput {
@@ -279,11 +288,10 @@ function assess(input: RiskInput): Finding[] {
   const extraGlobs = (extra?.highRiskPaths ?? []).map(globToRegExp);
 
   // ---- what the change does: architecture, interfaces, security-sensitive code (risk-signals.ts).
-  const content = contentFindings(input.files);
+  const read = readChange(input.files);
+  const content = contentFindings(input.files, read);
   for (const f of content.findings) add(f.category, f.reason);
-  // A file counts as changed for the path rules below when something of it really changed: a comment or a line that only
-  // moved elsewhere is not a change to a Dockerfile, an authentication module or a deployment chart.
-  const changed = (f: RiskFile): boolean => ["added", "removed", "renamed", "copied"].includes(f.status) || content.touched.has(f.path);
+  if (read.truncated) add("integrity", `more changed text than is read line by line (over ${MAX_READ_LINES} lines or ${MAX_READ_CHARS} characters): the rest was not read`);
 
   let removedFiles = 0;
   const removedInTests = new Map<string, number>();
@@ -293,9 +301,11 @@ function assess(input: RiskInput): Finding[] {
     for (const q of f.previousPath && f.previousPath !== p ? [p, f.previousPath] : [p]) {
       const where = q === p ? p : `${q} (moved to ${p})`;
       if (GOVERNANCE_PATHS.some((re) => re.test(q))) add("ci_release", `CI, workflow or governance file changed: ${where}`);
-      if (AUTH_PATH.test(q) && isSource(q) && changed(f)) add("security", `authentication or security code changed: ${where}`);
+      // The path rules below read no content and are a floor: an edit that looks like a comment, or a line that moved, does not lower them
+      // (what a comment is depends on the language, and a line shaped like one can be code). The content half above can only add to them.
+      if (AUTH_PATH.test(q) && isSource(q)) add("security", `authentication or security code changed: ${where}`);
       if (SECRET_PATHS.some((re) => re.test(q))) add("security", `secret-handling file changed: ${where}`);
-      if (RELEASE_PATHS.some((re) => re.test(q)) && !isDoc(q) && changed(f)) add("ci_release", `release or deployment file changed: ${where}`);
+      if (RELEASE_PATHS.some((re) => re.test(q)) && !isDoc(q)) add("ci_release", `release or deployment file changed: ${where}`);
       if (extraGlobs.some((re) => re.test(q))) add("provenance", `path the repository marks high risk: ${where}`);
     }
     // A lock file decides which tarball or checksum an install fetches, and nothing here reads its lines. A manifest
@@ -309,11 +319,12 @@ function assess(input: RiskInput): Finding[] {
     }
     if (f.status === "changed") add("integrity", `file mode or type changed: ${p}`);
     // Whatever the status and the line counts say, a change that came without its diff was not read (see diffNotSent).
-    if (diffNotSent(f)) add("integrity", `diff not readable (binary, renamed without a diff, or too large): ${p}`);
+    if (f.patch === undefined) add("integrity", `diff not readable (binary, renamed without a diff, or too large): ${p}`);
+    else if (diffNotSent(f)) add("integrity", `Git LFS file changed (the pointer is shown, not the file it stands for): ${p}`);
 
-    // Clipped: a pattern can cost no more than a bounded line, and a line too long to read is a reason of its own (risk-signals.ts).
-    const added = addedLines(f.patch).map(clipLine);
-    const removed = removedLines(f.patch).map(clipLine);
+    // Read once, clipped and within a budget: a pattern can cost no more than a bounded line, a line too long to read is a reason of its
+    // own, and so is a change with more text than is read at all (risk-signals.ts).
+    const { added, removed } = read.lines.get(f) ?? { added: [], removed: [] };
     if (/^Subproject commit /m.test((f.patch ?? "")) || added.some((l) => /^Subproject commit /.test(l))) add("integrity", `submodule pointer changed: ${p}`);
     for (const line of added) {
       // A sentence in the documentation that names `--insecure`, or a test that switches verification off on purpose, is not

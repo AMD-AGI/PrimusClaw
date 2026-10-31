@@ -202,7 +202,9 @@ export class GithubReview {
       let diffCut = false;
       for (const f of change.files) {
         if (onlyFile && f.path !== onlyFile) continue;
-        const part = `### ${f.path} (${f.status}, +${f.additions} -${f.deletions})\n${f.patch ?? "[no diff available: binary or too large]"}\n`;
+        const shown = f.patch === undefined ? "[no diff available: binary or too large]"
+          : diffNotSent(f) ? `[Git LFS pointer: the file it stands for is not shown]\n${f.patch}` : f.patch;
+        const part = `### ${f.path} (${f.status}, +${f.additions} -${f.deletions})\n${shown}\n`;
         if (diff.length + part.length > maxDiff) { diff += part.slice(0, Math.max(0, maxDiff - diff.length)); diffCut = true; break; }
         diff += part;
       }
@@ -221,7 +223,7 @@ export class GithubReview {
           unresolved_threads: state.unresolvedThreads, threads_complete: state.threadsComplete,
         },
         risk: this.riskBlock(risk),
-        files: change.files.map((f) => ({ path: f.path, status: f.status, additions: f.additions, deletions: f.deletions, has_diff: f.patch !== undefined })),
+        files: change.files.map((f) => ({ path: f.path, status: f.status, additions: f.additions, deletions: f.deletions, has_diff: !diffNotSent(f) })),
         files_complete: change.complete,
         diff_cut: diffCut,
         review_path: {

@@ -17,7 +17,11 @@ tool offered to a session, and `config.acting_as` is refused.
 
 ## How a session uses it
 
-1. The requester creates a session with `config.acting_as = "<user id>"` (`POST /v1/sessions`).
+1. The requester creates a session with `config.acting_as = "<user id>"` (`POST /v1/sessions`),
+   signed in with an identity provider's access token: a person's own, or a service's that an
+   operator named (see "Who may speak for the person"). An `ak-` key, a BYOK key, a connector token
+   and a browser session cookie are refused (`403 interactive_sign_in_required`): the key a sandbox
+   holds must not be able to start a session that reviews and merges with its owner's account.
    The id is a reference, never a credential. The requester is the session's owner; the
    verified caller's name is kept as `config.acting_as_requester` for the review footer (a
    client cannot set it).
@@ -73,7 +77,7 @@ tool offered to a session, and `config.acting_as` is refused.
   they are GitHub's. No admin merge, no auto-merge, no branch update, no change to a rule.
   The method is the repository's first allowed one, squash first.
 - **High risk.** A versioned rule pack (`packages/api/src/github-review/risk.ts` and
-  `risk-signals.ts`, version `2026-10-30.2`) decides from what the change **does**, read from
+  `risk-signals.ts`, version `2026-10-31.1`) decides from what the change **does**, read from
   its diff, not from which kind of file it touches. A merge is held for the acting user's own
   confirmation when the change is
   - an **architecture** change: a package or module added or removed (a manifest, a `go.mod`, a
@@ -92,13 +96,21 @@ tool offered to a session, and `config.acting_as` is refused.
     security settings, code-execution surfaces, and the lines that switch verification off or
     carry a secret (a secret is a finding in documentation too, an insecure flag in prose is not);
   - a **CI or release** change (workflows, governance files such as CODEOWNERS, a Dockerfile, a
-    chart, a release script) whose content changed, a **dependency** manifest change, or a change
-    that is large (files, lines, deletions) or broad (five packages or more).
+    chart, a release script), however small the edit (the path floor below), a **dependency**
+    manifest change, or a change that is large (files, lines, deletions) or broad (five packages or
+    more).
 
   For interfaces and architecture it reads the **net** change: a line that one file loses and
   another gains cancels out, and blank and comment lines are not content, so a pure refactor, a
   move of code, a reformat, a comment-only edit, documentation and tests are low. A rename inside
-  one package is low. Security-sensitive code, schemas, migrations, layering rules and the files
+  one package is low. What a comment is depends on the file's language: `//` and a block comment
+  that closes on its line in the C family, Go, Java, Rust and TypeScript, `#` in shell, Python,
+  YAML and Dockerfiles (not `#!` or `#[`), `--` in SQL, a closed `<!-- -->` in markup, and nothing
+  at all in a file of a kind that is not listed, where every line is read. A line that only
+  starts like a comment is code and is read (`#allowed() {` in TypeScript is a private member, an
+  empty block comment followed by a call is a call, `* b;` ends a multiplication), a line is a
+  comment only when all of it is, and a line in the middle of a block comment is read like any
+  other. A comment-only edit is low, except in the files the path floor watches. Security-sensitive code, schemas, migrations, layering rules and the files
   the path rules watch (workflows, a Dockerfile, an authentication module) are read **raw**, with
   nothing cancelled: a check that is removed in one place and an identical line added in another
   is indistinguishable from a move, and must not be able to hide behind a copy of itself, so
@@ -107,7 +119,11 @@ tool offered to a session, and `config.acting_as` is refused.
   `-- +goose` and `-- migrate:` lines, `//go:generate`, `//go:build`, a `+kubebuilder` marker, the
   C preprocessor, and a marker that switches a security scanner off for a line (`#nosec`,
   `checkov:skip`, `nolint:gosec` and the like) all count as changed content. A changed line longer
-  than 4000 characters (minified or generated code) is held rather than scanned. What it cannot see (a
+  than 4000 characters (minified or generated code) is held rather than scanned, and so is a change
+  with more than 20 000 changed lines or two million characters, which is not read past that point.
+  Every pattern that reads a line runs in time linear in its length (the author of a pull request
+  may be outside the organisation, and the rules run in the API's own process:
+  `test/github-review-redos.test.ts` times each language on adversarial lines). What it cannot see (a
   field added to an exported type, a parameter on a wrapped signature line, a behaviour that changed
   under an unchanged name) is for the reviewer's own judgement (below).
 
@@ -115,8 +131,12 @@ tool offered to a session, and `config.acting_as` is refused.
   that came without its diff (GitHub sends none for a binary, a rename or a diff it finds too large,
   and counts a modified or renamed binary as 0 lines, so the missing patch is the signal), a lock
   file (it decides what an install downloads), a submodule pointer, a file mode change, a file list
-  that was cut, a fork, a non-member author, a base branch other than the default, and any rule
-  that throws: the rules fail closed. A file that was moved is judged by the path it left as well
+  that was cut, a fork, a non-member author, a base branch other than the default, an
+  authentication module, a workflow, a Dockerfile, a chart or a release script that is edited at
+  all (a line shaped like a comment does not take it below the floor: the content rules can only
+  add), a file tracked by Git LFS (GitHub sends its pointer, `version`, `oid sha256:` and `size`,
+  as an ordinary text patch with real line counts; that is a diff that did not show the file, and
+  is treated like a binary's), and any rule that throws: the rules fail closed. A file that was moved is judged by the path it left as well
   as the one it went to, and a line that starts with `++` or `--` is read like any other. A
   repository's `.github/clawy.yml` on the base branch can add paths (`high_risk_paths`) or ask for
   confirmation on every merge (`confirm_merge: always`).
@@ -137,16 +157,20 @@ tool offered to a session, and `config.acting_as` is refused.
 | Route | Purpose |
 |---|---|
 | `GET /v1/github-review/confirmations?session_id=<id>&status=pending` | The confirmations of the caller's own sessions and those that ask the caller. `{items:[{id, repo, pr, title, author, head_sha, reasons, checks, actor_user_id, requester_user_id, session_id, expires_at, status}]}` |
-| `POST /v1/github-review/confirmations/:id/decision` `{decision: "allow" \| "deny"}` | The acting user's answer, given signed in: a browser session (the `Token` cookie) or an identity provider's access token. Anyone else gets `403`, and so does the acting user with an `ak-` key (`Authorization: Bearer` or `x-api-key`) or a BYOK key, whatever the id: the sandbox of a session holds its owner's key, and in a session that acts as its owner a model could otherwise answer its own confirmation (`403 interactive_sign_in_required`; the check is on how the request was authenticated, before the confirmation is looked up). On `allow` every gate is read again and the merge is made with the acting user's account; the answer is `{status: "merged" \| "denied" \| "stale" \| "expired" \| "refused" \| "retry", reason, merge_sha}`. `retry` means the merge could not be tried just now (the identity service or GitHub failed, a limit was hit) before anything was sent to GitHub, and the confirmation is still open: allow it again. Once an approval or a merge has been sent the try is not given back: the confirmation is closed as `refused` with `wrote: true`. The merge is recorded as asked for by the requester, not by the acting user. A service an operator named may answer for the acting user too (next section) |
+| `POST /v1/github-review/confirmations/:id/decision` `{decision: "allow" \| "deny"}` | The acting user's answer, given with an identity provider's access token: their own sign-in at the provider, or an allowed service's (next section). Anyone else gets `403`, and so does the acting user with an `ak-` key (`Authorization: Bearer` or `x-api-key`), a BYOK key, a connector token or a browser session cookie, whatever the id (`403 interactive_sign_in_required`; the check is on how the request was authenticated, before the confirmation is looked up). The sandbox of a session holds its owner's key, and with SaFE's built-in sign-in that key sets the owner's password and logs in, which returns a session cookie the API verifies as the person's own: so neither a key nor a cookie is proof of a person, and a model in any session of that user could otherwise answer a confirmation itself. On `allow` every gate is read again and the merge is made with the acting user's account; the answer is `{status: "merged" \| "denied" \| "stale" \| "expired" \| "refused" \| "retry", reason, merge_sha}`. `retry` means the merge could not be tried just now (the identity service or GitHub failed, a limit was hit) before anything was sent to GitHub, and the confirmation is still open: allow it again. Once an approval or a merge has been sent the try is not given back: the confirmation is closed as `refused` with `wrote: true`. The merge is recorded as asked for by the requester, not by the acting user. A service an operator named may answer for the acting user too (next section) |
+
+A browser session cookie would be taken again only where the platform that issues it refuses to set a
+password with an API key; that is a change to Primus-SaFE, not something this code can check, so until
+it is made the identity provider (or an allowed service) is the only way to answer.
 
 A confirmation lives 24 hours (`CLAW_GITHUB_CONFIRMATION_TTL_SECONDS`), is bound to the head
 commit (a head that moved makes it `stale`) and is used once.
 
 ### A service answering for the acting user
 
-A chat integration or another service cannot hold a person's browser session, and the key a
-sandbox holds is refused on purpose. A **service client** of the identity provider answers
-instead, the way a service acts for a user everywhere else in Claw: it exchanges its own client
+A chat integration or another service cannot hold a person's sign-in at the identity provider,
+and the key a sandbox holds (and the cookie that key can sign in to) is refused on purpose. A
+**service client** of the identity provider answers instead, the way a service acts for a user everywhere else in Claw: it exchanges its own client
 credentials for an access token that acts as that user (RFC 8693: `sub` is the user, `act.sub` and
 `client_id` name the service) and calls the decision route with it as `Authorization: Bearer`.
 
@@ -157,9 +181,13 @@ credentials for an access token that acts as that user (RFC 8693: `sub` is the u
 - The subject is the token's `sub`, which the service cannot choose: the answer counts only when
   it is the acting user's own (`403 only_the_acting_user_can_decide` otherwise), so a service
   holding a token for someone else, or its own token, cannot answer.
-- A person's own access token (a browser sign-in, which names no actor) is still the person's
-  answer, and an `ak-` key, an `x-api-key`, a BYOK key or a connector token is still refused
-  (`403 interactive_sign_in_required`), whatever the allow-list says.
+- A person's own access token (their sign-in at the provider, which names no actor) is the person's
+  answer, and an `ak-` key, an `x-api-key`, a BYOK key, a connector token or a browser session cookie
+  is refused (`403 interactive_sign_in_required`), whatever the allow-list says.
+- The same two checks apply to creating a session with `config.acting_as` (`POST /v1/sessions`): the
+  person's own token, or an allowed service's, and nothing else. Without a credential of that kind
+  the answer is `403 interactive_sign_in_required` or `403 service_client_not_allowed`, and nothing
+  is created.
 - Who stood behind the answer is recorded: `decided_by` is the acting user, `decided_via` is
   `{kind: "service", client_id, act_sub}` (also in the confirmation list), the closing `result`
   says `by: "service"`, the audit row of the merge carries `decided_by_service`, and a
@@ -222,7 +250,7 @@ changes, no request for reviewers. The answer ends with exactly one last line, `
 | `CLAW_GITHUB_WRITES_ENABLED` | off | Off is a dry run: every gate is checked and nothing is written to GitHub; the tools answer what they would do |
 | `CLAW_GITHUB_API_URL` | `https://api.github.com` | The API address |
 | `CLAW_GITHUB_CONFIRMATION_TTL_SECONDS` | 86400 | Life of a pending confirmation |
-| `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS` | none | Identity-provider client ids of the services that may answer a held merge for the user their token names (see "A service answering for the acting user"). Empty refuses every service |
+| `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS` | none | Identity-provider client ids of the services that may answer a held merge, or create a session that acts as a user, for the user their token names (see "A service answering for the acting user"). Empty refuses every service |
 | `CLAW_GITHUB_REVIEWS_PER_TOKEN_PER_HOUR` | 6 | Reviews one GitHub account may have in an hour (a review and its merge count once) |
 | `CLAW_GITHUB_REVIEWS_PER_HOUR` | 20 | The same, all accounts together |
 | `CLAW_GITHUB_CONCURRENT_PER_REPO` | 3 | Tool calls on one repository at once, per API replica |

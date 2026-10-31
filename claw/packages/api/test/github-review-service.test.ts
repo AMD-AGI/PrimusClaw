@@ -460,7 +460,7 @@ describe("M4 what the change does, and the reviewer's judgement of it", () => {
     assert.equal(get.raised_by_reviewer, false);
     assert.deepEqual(get.categories, ["interface"]);
     assert.match(get.reasons.join(), /HTTP route POST \/v1\/orders/);
-    assert.equal(get.rule_pack, "2026-10-30.2");
+    assert.equal(get.rule_pack, "2026-10-31.1");
     const risk = (await e.service.assessPr(e.actor, { pr: PR })).body.risk as any;
     assert.deepEqual(risk, get);
   });
@@ -549,6 +549,40 @@ describe("M4 a change the diff does not show, and a lock file", () => {
       const m = await merge();
       assert.equal(m.body.status, "confirmation_required", what);
       assert.match(String((m.body.reasons as string[]).join()), /diff not readable/, what);
+      assert.equal(e.gh.writes.length, 0, what);
+      assert.equal(puts().length, 0, what);
+    }
+  });
+
+  // What GitHub sends for a file tracked by Git LFS: the pointer, as an ordinary text patch with real line counts.
+  const OID_OLD = "a".repeat(64);
+  const OID_NEW = "b".repeat(64);
+  const pointerChange = `@@ -1,3 +1,3 @@\n version https://git-lfs.github.com/spec/v1\n-oid sha256:${OID_OLD}\n-size 1048576\n+oid sha256:${OID_NEW}\n+size 1048577`;
+  const lfs: Array<[string, Record<string, unknown>]> = [
+    ["model weights swapped under LFS", { filename: "models/llama.safetensors", status: "modified", additions: 2, deletions: 2, patch: pointerChange }],
+    ["an executable under LFS replaced", { filename: "vendor/bin/tool", status: "modified", additions: 2, deletions: 2, patch: pointerChange }],
+    ["a file newly tracked by LFS", { filename: "assets/blob.bin", status: "added", additions: 3, deletions: 0, patch: `@@ -0,0 +1,3 @@\n+version https://git-lfs.github.com/spec/v1\n+oid sha256:${OID_NEW}\n+size 2048` }],
+  ];
+
+  test("M14 a binary tracked by Git LFS reaches the API as its pointer, an ordinary text patch: it is high risk all the same, goes to a sandbox and holds the merge", async () => {
+    for (const [what, file] of lfs) {
+      e = await reviewEnv();
+      e.gh.files = [file as never];
+      e.gh.pr.changed_files = 1;
+      e.gh.pr.additions = Number(file.additions);
+      e.gh.pr.deletions = Number(file.deletions);
+      const b = (await get()).body as any;
+      assert.equal(b.risk.level, "high", what);
+      assert.match(b.risk.reasons.join(), /Git LFS file changed/, what);
+      assert.ok(b.risk.categories.includes("integrity"), what);
+      assert.equal(b.review_path.path, "sandbox", what);
+      assert.equal(b.review_path.reason, "diff_not_available", what);
+      assert.equal(b.files[0].has_diff, false, what);
+      assert.match(b.untrusted.diff, /Git LFS pointer: the file it stands for is not shown/, what);
+      assert.equal(reason(await submit({ event: "APPROVE" })), "high_risk_approval", what);
+      const m = await merge();
+      assert.equal(m.body.status, "confirmation_required", what);
+      assert.match(String((m.body.reasons as string[]).join()), /Git LFS file changed/, what);
       assert.equal(e.gh.writes.length, 0, what);
       assert.equal(puts().length, 0, what);
     }
