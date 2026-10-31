@@ -88,6 +88,14 @@ export const MAX_LINE_CHARS = 4000;
 export const MAX_READ_LINES = 20_000;
 export const MAX_READ_CHARS = 2_000_000;
 
+/**
+ * The few rules that look at a patch as a whole (a submodule pointer, a Git LFS pointer, a `workspaces` key that is only context in a
+ * diff) read no more than this much of it. A pointer's patch is a few lines and the key is next to the entry it holds, so nothing is
+ * missed, and what is looked at past this is a change that is held for its size anyway.
+ */
+export const MAX_RAW_SCAN_CHARS = 262_144;
+export const rawHead = (patch: string | undefined | null): string => (patch ?? "").slice(0, MAX_RAW_SCAN_CHARS);
+
 /** A changed line as the patterns read it: cut at {@link MAX_LINE_CHARS}, which bounds what any pattern can cost. */
 export const clipLine = (text: string): string => (text.length <= MAX_LINE_CHARS ? text : text.slice(0, MAX_LINE_CHARS));
 
@@ -538,12 +546,19 @@ function architectureFindings(files: RiskFile[], net: Net): Finding[] {
 
   const layering = new Set<string>();
   const byPath = new Map(files.map((f) => [f.path, f]));
+  // Once per file: asked of every line of a manifest, a scan of its whole patch each time is quadratic in the patch.
+  const workspacesKey = new Map<string, boolean>();
+  const keyInPatch = (path: string): boolean => {
+    let found = workspacesKey.get(path);
+    if (found === undefined) { found = /"workspaces"\s*:/.test(rawHead(byPath.get(path)?.patch)); workspacesKey.set(path, found); }
+    return found;
+  };
   for (const l of [...net.raw.added, ...net.raw.removed]) {
     if (isTest(l.path)) continue;
     if (LAYERING_ANY.test(l.path)
       || (TSCONFIG.test(l.path) && TSCONFIG_GRAPH.test(l.text))
       || (ESLINT_CONFIG.test(l.path) && ESLINT_LAYERING.test(l.text))
-      || (/(^|\/)package\.json$/i.test(l.path) && (WORKSPACES_LINE.test(l.text) || (STRING_ENTRY.test(l.text) && /"workspaces"\s*:/.test(byPath.get(l.path)?.patch ?? ""))))) layering.add(l.path);
+      || (/(^|\/)package\.json$/i.test(l.path) && (WORKSPACES_LINE.test(l.text) || (STRING_ENTRY.test(l.text) && keyInPatch(l.path))))) layering.add(l.path);
   }
   for (const path of layering) add(`architecture change: workspace, layering or module-boundary rules changed (${path})`);
 

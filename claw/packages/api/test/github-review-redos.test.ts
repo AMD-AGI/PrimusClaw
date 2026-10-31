@@ -14,6 +14,7 @@
  *       and the JVM `public` method pattern, each on a 4000-character line
  *   R2  every language's exported-symbol patterns on lines of a repeated filler, and the whole rule pack on the other shapes that are
  *       cheap to write (a manifest, a route, a flag, an environment read, a secret, a dependency line)
+ *   R4  nothing else costs more than the patch is long: the rules that look at a patch as a whole run once per file, over a bounded head
  *   R3  the number of lines read is capped: a change with more is not read past the cap, says so, and is held, and the rest of a
  *       huge patch is not even split into lines
  */
@@ -139,4 +140,21 @@ test("R3c a patch of millions of lines is read up to the cap and no further: the
   assert.equal(read.lines.get(file)?.added.length, MAX_READ_LINES);
   assert.equal(read.truncated, true);
   assert.ok(ms < 250, `${Math.round(ms)} ms`);
+});
+
+test("R4 a manifest of tens of thousands of workspace-entry lines, and many such manifests, cost a bounded amount: the patch is not scanned again for every line", () => {
+  /** The key is context at the top of the diff, as it is when a workspace glob is added to the list under it; without it nothing in the diff says `workspaces`. */
+  const manifest = (path: string, lines: number, key: boolean): RiskFile => ({
+    path, status: "modified", additions: lines, deletions: 0,
+    patch: `@@ -1,3 +1,${lines + 3} @@\n   ${key ? '"workspaces": [' : '"files": ['}\n${Array.from({ length: lines }, (_, i) => `+    "pkg/p${i}",`).join("\n")}\n   ]`,
+  });
+  const bound = 800;
+  const withKey = run([manifest("package.json", 40_000, true)]);
+  assert.match(withKey.reasons.join("\n"), /workspace, layering or module-boundary rules changed \(package\.json\)/);
+  const without = run([manifest("package.json", 40_000, false)]);
+  assert.ok(without.ms < bound, `one manifest of 40000 lines without the key: ${Math.round(without.ms)} ms (bound ${bound})`);
+  const many = run(Array.from({ length: 100 }, (_, k) => manifest(`p${k}/package.json`, 10_000, false)));
+  assert.ok(many.ms < bound, `100 manifests of 10000 lines: ${Math.round(many.ms)} ms (bound ${bound})`);
+  // Whatever its size, a change of that many lines is held.
+  assert.equal(many.level, "high");
 });

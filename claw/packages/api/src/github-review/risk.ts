@@ -30,7 +30,7 @@
  * What the repository itself says comes from the BASE branch only (see
  * {@link parseClawyConfig}); a pull request that edits that file is high risk.
  */
-import { MAX_READ_CHARS, MAX_READ_LINES, contentFindings, isDoc, isSource, isTest, readChange, type Finding, type RiskCategory } from "./risk-signals.js";
+import { MAX_READ_CHARS, MAX_READ_LINES, contentFindings, isDoc, isSource, isTest, rawHead, readChange, type Finding, type RiskCategory } from "./risk-signals.js";
 
 export type { Finding, RiskCategory } from "./risk-signals.js";
 
@@ -81,7 +81,7 @@ export function diffNotSent(f: Pick<RiskFile, "patch">): boolean {
  */
 const LFS_POINTER_LINE = /^[ +-](?:version https:\/\/(?:git-lfs|hawser)\.github\.com\/spec\/v\d+|oid sha256:[0-9a-f]{64})\r?$/m;
 export function isLfsPointerPatch(patch: string): boolean {
-  return LFS_POINTER_LINE.test(patch);
+  return LFS_POINTER_LINE.test(rawHead(patch));
 }
 
 export interface RiskInput {
@@ -325,7 +325,7 @@ function assess(input: RiskInput): Finding[] {
     // Read once, clipped and within a budget: a pattern can cost no more than a bounded line, a line too long to read is a reason of its
     // own, and so is a change with more text than is read at all (risk-signals.ts).
     const { added, removed } = read.lines.get(f) ?? { added: [], removed: [] };
-    if (/^Subproject commit /m.test((f.patch ?? "")) || added.some((l) => /^Subproject commit /.test(l))) add("integrity", `submodule pointer changed: ${p}`);
+    if (/^Subproject commit /m.test(rawHead(f.patch)) || added.some((l) => /^Subproject commit /.test(l))) add("integrity", `submodule pointer changed: ${p}`);
     for (const line of added) {
       // A sentence in the documentation that names `--insecure`, or a test that switches verification off on purpose, is not
       // product code switching it off. A secret on any line, wherever it is, still is.
