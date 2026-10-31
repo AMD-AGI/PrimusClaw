@@ -608,6 +608,27 @@ describe("remote agents", { skip }, () => {
       assert.equal((await s.next((f) => !!f.comment, 1500)).comment, true, "a keepalive follows while idle");
     });
 
+    test("what a connector says about a session running without per-step approval reaches the user's client unchanged", async () => {
+      // `unattended` is not interpreted here: the API relays whatever the connector reports, in the agent's
+      // capabilities and in the session events that name a mode. Nothing in it is a product name.
+      const caps = { ask_mode: "no-approval-mode", modes: ["a", "b"], unattended: true, unattended_allowed: true, protocol: 1 };
+      const asking = { ask_mode: "default", modes: ["a", "b"], unattended: false, unattended_allowed: false, protocol: 1 };
+      const cid = await connector();
+      await heartbeat("u1", cid, {}, [{ ...AGENT, capabilities: caps }, { agent_id: "a2", kind: "other", name: "Two", capabilities: asking }]);
+      const listed = (await as("u1").get("/v1/remote-agents/connectors")).body.data[0].agents;
+      assert.deepEqual(listed.map((a: any) => [a.agent_id, a.capabilities]), [["a1", caps], ["a2", asking]]);
+
+      const { cid: online, stream: _s } = await online1();
+      const sid = await session("u1", online);
+      const started = { acp_session_id: "x", agent_id: "a1", kind: "example-kind", cwd: "/work/repo", currentMode: "no-approval-mode", unattended: true, modes: [{ id: "a", unattended: false }, { id: "no-approval-mode", unattended: true }] };
+      const changed = { currentMode: "a", unattended: false };
+      const posted = await post("u1", online, [ev(sid, "session_started", started), ev(sid, "mode_update", changed), ev(sid, "session_resumed", { ...started })]);
+      assert.deepEqual(posted.body.data.rejected, []);
+      const s = await SseClient.open(`${base}/v1/remote-agents/sessions/${sid}/events`, { "x-test-user": "u1" });
+      streams.push(s);
+      assert.deepEqual([(await s.next()).json().data, (await s.next()).json().data, (await s.next()).json().data], [started, changed, started]);
+    });
+
     test("a session with no events still gets its marker", async () => {
       const { cid } = await online1();
       const sid = await session("u1", cid);

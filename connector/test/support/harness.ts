@@ -43,6 +43,14 @@ export interface HarnessOptions {
   /** Extra TOML for the agent table, and for the top of the file. */
   agentToml?: string;
   topToml?: string;
+  /** The agent's `approval` setting, and the mode its sessions start in (default: "default", which asks). */
+  approval?: "ask" | "never";
+  askMode?: string;
+  /** Make the first agent a preset's (the stand-in adapter still runs), and give the modes the phone may select. */
+  preset?: string;
+  safeModes?: string[];
+  /** A second agent, "fake2", on the same stand-in adapter; this is the rest of its table (for example `approval = "never"`). */
+  secondToml?: string;
   timing?: Partial<ConnectorTiming>;
   claw?: FakeClaw;
   home?: string;
@@ -89,21 +97,24 @@ export class Harness {
     }
     const env = { FAKE_LOG: h.fakeLog, ...attachEnv, ...(o.env ?? {}) };
     const envToml = Object.entries(env).map(([k, v]) => `${k} = ${JSON.stringify(v)}`).join("\n");
-    h.config = parseConfig(`${o.topToml ?? ""}
+    const agent = (id: string, askMode: string, extra: string) => `
 [[agents]]
-id = "fake"
-${o.attach ? "" : 'kind = "example"'}
+id = ${JSON.stringify(id)}
+${o.attach && id === "fake" ? "" : 'kind = "example"'}
 name = "Fake agent"
-command = ${JSON.stringify(process.execPath)}
+${id === "fake" && o.preset ? `preset = ${JSON.stringify(o.preset)}\n` : ""}command = ${JSON.stringify(process.execPath)}
 args = [${JSON.stringify(ADAPTER)}]
-ask_mode = "default"
-safe_modes = ["default", "plan"]
+ask_mode = ${JSON.stringify(askMode)}
+safe_modes = ${JSON.stringify(id === "fake" && o.safeModes ? o.safeModes : ["default", "plan"])}
 roots = [${JSON.stringify(h.work)}]
-${attachToml}
-${o.agentToml ?? ""}
+${id === "fake" ? attachToml : ""}
+${extra}
 [agents.env]
 ${envToml}
-`, { hostname: "test-box" });
+`;
+    h.config = parseConfig(`${o.topToml ?? ""}
+${agent("fake", o.askMode ?? "default", `${o.approval ? `approval = "${o.approval}"\n` : ""}${o.agentToml ?? ""}`)}
+${o.secondToml === undefined ? "" : agent("fake2", "default", o.secondToml)}`, { hostname: "test-box" });
     h.connect(o);
     if (o.start !== false) h.start();
     return h;
@@ -138,9 +149,9 @@ ${envToml}
   }
 
   /** A session created and started, resolved when `session_started` or `session_closed` arrives. */
-  async newSession(cwd: string = this.work, mode?: string): Promise<string> {
+  async newSession(cwd: string = this.work, mode?: string, agent = "fake"): Promise<string> {
     await this.online();
-    const sid = this.claw.newSession("fake", cwd, mode);
+    const sid = this.claw.newSession(agent, cwd, mode);
     await this.claw.until("session_started or session_closed", () => this.claw.eventsOf(sid).some((e) => e.type === "session_started" || e.type === "session_closed"));
     return sid;
   }

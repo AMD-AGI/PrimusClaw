@@ -31,8 +31,21 @@ export interface AgentConfig {
   roots: string[];
   /** The mode every session is forced into, and read back, before its first prompt. */
   askMode: string;
-  /** Modes a user may select from the phone. Anything else needs `allow_unsafe_modes`. */
+  /** Modes a user may select from the phone without the owner's opt-in: the owner's (or the preset's) list, plus the ask mode. */
   safeModes: string[];
+  /**
+   * Modes known to ask before every write and command: what the preset measured, or for a custom agent what the owner
+   * declared. A session whose mode is not in this list is unattended, whoever listed the mode as selectable.
+   */
+  askingModes: string[];
+  /**
+   * Whether a phone may select a mode outside `safeModes` for this agent, and whether the machine accepts an
+   * adapter's warning that it will not ask. The owner's opt-in: `approval = "never"` on the agent, else the
+   * file-level `allow_unsafe_modes` (and `approval = "ask"` turns it off for this agent).
+   */
+  allowUnsafeModes: boolean;
+  /** Sessions start in a mode outside `askingModes`: no per-step approval. Never true without `allowUnsafeModes`. */
+  unattended: boolean;
   autoAllow: AutoAllowRule[];
   /**
    * Set for an agent that takes over sessions that already exist on this machine instead of starting new ones.
@@ -64,6 +77,8 @@ interface Preset {
   args: string[];
   askMode: string;
   safeModes: string[];
+  /** What `approval = "never"` turns the preset into: the adapter's mode that never asks, and the flags that go with it. */
+  unattended: { askMode: string; args?: string[] };
   attach?: boolean;
 }
 
@@ -76,26 +91,35 @@ interface Preset {
  * `agent acp`: in its `agent` mode a shell command asks (allow-once /
  * allow-always / reject-once) but a file edit is applied without asking, in
  * every approval setting; its `ask` and `plan` modes cannot write. So the Cursor
- * preset starts read-only, and `agent` needs `allow_unsafe_modes` plus
- * `ask_mode = "agent"` from the owner.
+ * preset starts read-only, and `agent` needs the owner's `approval = "never"` for that agent.
+ *
+ * `unattended` is what `approval = "never"` selects: the mode in which the agent runs like it does in the owner's
+ * terminal, without asking. Measured on the pinned adapters: claude-agent-acp offers `bypassPermissions`;
+ * codex-acp 2.3.0 offers `read-only`, `workspace-write`, `agent` (asks only for actions it judges unsafe) and
+ * `agent-full-access` (no limits); Cursor's `agent` mode applies edits without asking and asks for shell commands,
+ * so its root flag `--force` goes with it (the flag is global: `agent --force acp`).
  */
 export const PRESETS: Record<string, Preset> = {
   claude: {
     kind: "claude", name: "Claude Code", command: "npx",
     args: ["-y", "@agentclientprotocol/claude-agent-acp@0.99.0"], askMode: "default", safeModes: ["default", "plan"],
+    unattended: { askMode: "bypassPermissions" },
   },
   // Existing Claude Code sessions, taken over from the phone. The kind is the opaque label a chat client picks an icon
   // from; it says what the entry is for, not which product serves it. Same adapter and same ask mode as `claude`.
   "claude-attach": {
     kind: "attach", name: "Claude Code (existing sessions)", command: "npx",
     args: ["-y", "@agentclientprotocol/claude-agent-acp@0.99.0"], askMode: "default", safeModes: ["default", "plan"], attach: true,
+    unattended: { askMode: "bypassPermissions" },
   },
   codex: {
     kind: "codex", name: "Codex", command: "npx",
     args: ["-y", "@agentclientprotocol/codex-acp@2.3.0"], askMode: "read-only", safeModes: ["read-only"],
+    unattended: { askMode: "agent-full-access" },
   },
   cursor: {
     kind: "cursor", name: "Cursor", command: "agent", args: ["acp"], askMode: "ask", safeModes: ["ask", "plan"],
+    unattended: { askMode: "agent", args: ["--force", "acp"] },
   },
 };
 
@@ -151,13 +175,37 @@ export function parseConfig(text: string, defaults: { hostname?: string } = {}):
     if (presetName && !preset) return void problems.push(`${label}: unknown preset ${JSON.stringify(presetName)} (known: ${Object.keys(PRESETS).join(", ")})`);
     const command = typeof raw.command === "string" && raw.command ? raw.command : preset?.command;
     if (!command) return void problems.push(`${label}: needs a preset or a command`);
-    const args = raw.args !== undefined ? strList(raw.args, `${label}.args`, problems) : (preset?.args ?? []);
+    if (raw.approval !== undefined && raw.approval !== "ask" && raw.approval !== "never") return void problems.push(`${label}: approval must be "ask" or "never"`);
+    const approval = raw.approval === "ask" || raw.approval === "never" ? raw.approval : null;
+    const never = approval === "never";
+    // The owner's opt-in for this agent: its own `approval` setting wins over the file-level default.
+    const allowUnsafe = approval === null ? allowUnsafeModes : never;
+    const args = raw.args !== undefined ? strList(raw.args, `${label}.args`, problems) : [...((never ? preset?.unattended.args : undefined) ?? preset?.args ?? [])];
     const kind = typeof raw.kind === "string" ? raw.kind : (preset?.kind ?? "custom");
     if (!KIND_RE.test(kind)) problems.push(`${label}: kind must be 1-64 characters of A-Z a-z 0-9 . _ : -`);
-    const askMode = typeof raw.ask_mode === "string" && raw.ask_mode ? raw.ask_mode : preset?.askMode;
-    if (!askMode) return void problems.push(`${label}: ask_mode is required for a custom agent`);
-    const safeModes = [...(raw.safe_modes !== undefined ? strList(raw.safe_modes, `${label}.safe_modes`, problems) : (preset?.safeModes ?? [askMode]))];
-    if (!safeModes.includes(askMode)) safeModes.push(askMode);
+    const explicitAsk = typeof raw.ask_mode === "string" && raw.ask_mode ? raw.ask_mode : null;
+    const askMode = explicitAsk ?? (never ? preset?.unattended.askMode : preset?.askMode);
+    if (!askMode) return void problems.push(never ? `${label}: approval = "never" needs ask_mode, the mode in which this agent does not ask, for a custom agent` : `${label}: ask_mode is required for a custom agent`);
+    // `listed`: what a phone may select without the opt-in. `asking`: what is known to ask before every step: what the
+    // preset measured, or for a custom agent the owner's own declaration. They differ only for a preset the owner edited.
+    const listed = [...(raw.safe_modes !== undefined ? strList(raw.safe_modes, `${label}.safe_modes`, problems) : (preset?.safeModes ?? [askMode]))];
+    const asking = new Set(preset ? preset.safeModes : (raw.safe_modes !== undefined ? listed : []));
+    let safeModes = listed;
+    if (preset && !allowUnsafe) {
+      const extra = listed.filter((m) => !asking.has(m));
+      if (extra.length) problems.push(`${label}: safe_modes lists ${extra.join(", ")}, which preset ${presetName} does not know to ask before every step; remove it, set approval = "never" (or allow_unsafe_modes = true), or define the agent without a preset`);
+    }
+    if (never) {
+      // The mode every session starts in is the one that does not ask: it is neither asking nor a safe mode.
+      if (explicitAsk && asking.has(explicitAsk)) problems.push(`${label}: approval = "never" but ask_mode ${explicitAsk} is a mode that asks before every step; remove ask_mode, or approval`);
+      asking.delete(askMode);
+      safeModes = safeModes.filter((m) => m !== askMode);
+    } else if (!asking.has(askMode)) {
+      // A preset knows which of its modes ask; one it does not list may not, and needs the owner's opt-in. A custom agent's ask mode asks by definition.
+      if (preset && explicitAsk) { if (!allowUnsafe) problems.push(`${label}: ask_mode ${askMode} is not a mode that asks before every step; set approval = "never" (or allow_unsafe_modes = true) to use it`); }
+      else asking.add(askMode);
+    }
+    if (asking.has(askMode) && !safeModes.includes(askMode)) safeModes.push(askMode);
     const roots = strList(raw.roots, `${label}.roots`, problems).map((r) => path.resolve(expandHome(r)));
     if (roots.length === 0) problems.push(`${label}: roots is required (an agent with no allowed directory is never offered)`);
     for (const r of roots) {
@@ -172,9 +220,9 @@ export function parseConfig(text: string, defaults: { hostname?: string } = {}):
         else env[k] = v;
       }
     }
-    if (!allowUnsafeModes) {
+    if (!allowUnsafe) {
       const bad = args.find((a) => BYPASS_ARG_RE.test(a));
-      if (bad) problems.push(`${label}: ${bad} turns the tool's own approvals off; remove it or set allow_unsafe_modes = true`);
+      if (bad) problems.push(`${label}: ${bad} turns the tool's own approvals off; remove it or set approval = "never" (or allow_unsafe_modes = true)`);
     }
     const own = parseAutoAllow(raw.auto_allow, `${label}.auto_allow`, problems);
     let attach: AgentConfig["attach"] = null;
@@ -187,7 +235,8 @@ export function parseConfig(text: string, defaults: { hostname?: string } = {}):
     }
     agents.push({
       id, kind, name: typeof raw.name === "string" && raw.name.trim() ? raw.name.trim().slice(0, 128) : (preset?.name ?? id),
-      command, args, env, roots, askMode, safeModes, autoAllow: [...globalAllow, ...own], attach,
+      command, args, env, roots, askMode, safeModes, askingModes: [...asking], allowUnsafeModes: allowUnsafe, unattended: !asking.has(askMode),
+      autoAllow: [...globalAllow, ...own], attach,
     });
   });
 
@@ -225,39 +274,61 @@ export function loadConfig(file: string, defaults: { hostname?: string } = {}): 
   return parseConfig(text, defaults);
 }
 
-export const SAMPLE_CONFIG = `# claw-connector: the agents this machine offers, and what they may touch.
+export type Approval = "ask" | "never";
+
+/** The presets `init` can write, in the order they appear in the sample. */
+export const SAMPLE_AGENTS = ["claude", "claude-attach", "codex", "cursor"] as const;
+
+/** The ones the sample switches on. The others are written commented out, and an owner enables one by uncommenting it. */
+export const SAMPLE_ACTIVE: readonly string[] = ["claude"];
+
+/**
+ * What the file `init` writes does with a requested `never`: `unattended` are agents that are on in it and run without
+ * per-step approval; `parked` are agents that asked for it but whose block is commented out, so it has no effect until
+ * the owner uncomments the block. The one place that says which agents are on, so the text and the message cannot differ.
+ */
+export function sampleApprovals(approval: Partial<Record<string, Approval>>): { unattended: string[]; parked: string[] } {
+  const never = SAMPLE_AGENTS.filter((id) => approval[id] === "never");
+  return { unattended: never.filter((id) => SAMPLE_ACTIVE.includes(id)), parked: never.filter((id) => !SAMPLE_ACTIVE.includes(id)) };
+}
+
+/** A line of explanation written above a sample block, for a preset whose purpose is not its name. */
+const SAMPLE_NOTES: Record<string, string> = {
+  "claude-attach": "# Take over a Claude Code conversation that already exists on this machine (exit it in the terminal first).",
+};
+
+const NEVER_NOTE = `# No per-step approval: this agent runs like it does in your terminal. A phone session writes files and runs
+# commands without asking, and the phone shows it as unattended. To go back to asking, set it to "ask".`;
+
+/**
+ * The text `claw-connector init` writes. `approval` picks, per preset, whether the agent asks before every write
+ * and command (the default) or never asks; a preset it does not name asks.
+ */
+export function sampleConfig(approval: Partial<Record<string, Approval>> = {}): string {
+  const agent = (id: string): string => {
+    const lines = [...(SAMPLE_NOTES[id] ? [SAMPLE_NOTES[id]!] : []), `[[agents]]`, `id = "${id}"`, `preset = "${id}"`, `roots = ["~/work"]`];
+    if (approval[id] === "never") lines.push(...NEVER_NOTE.split("\n"), `approval = "never"`);
+    return lines.map((l) => (SAMPLE_ACTIVE.includes(id) || l.startsWith("#") ? l : `# ${l}`)).join("\n");
+  };
+  return `# claw-connector: the agents this machine offers, and what they may touch.
 # Policy lives here, on your machine; nothing Claw sends can widen it.
 
 # server = "https://claw.example.com/claw-api"
 # identity_url = "https://identity.example.com"
 # name = "my-laptop"
 
-# Modes in which the agent does not ask before it writes or runs something
-# (bypassPermissions, acceptEdits, full access...) are refused unless you set this.
+# By default every agent asks before it writes a file or runs a command, and the phone answers each question.
+# approval = "never" on an agent turns that off for it (a phone session runs like your terminal);
+# approval = "ask" keeps it on. Modes in which an agent does not ask (bypassPermissions, acceptEdits, full access...)
+# are refused for an agent without approval = "never" unless you set this for every agent at once:
 # allow_unsafe_modes = false
 
-[[agents]]
-id = "claude"
-preset = "claude"
-roots = ["~/work"]
-
-# Take over a Claude Code conversation that already exists on this machine (exit it in the terminal first).
-# [[agents]]
-# id = "claude-attach"
-# preset = "claude-attach"
-# roots = ["~/work"]
-
-# [[agents]]
-# id = "codex"
-# preset = "codex"
-# roots = ["~/work"]
-
-# [[agents]]
-# id = "cursor"
-# preset = "cursor"
-# roots = ["~/work"]
+${SAMPLE_AGENTS.map(agent).join("\n\n")}
 
 # Let one kind of change through without asking, inside the session's directory.
 # Every automatic approval is written to audit.jsonl and shown on the phone.
 # auto_allow = [{ kind = "edit", path_glob = "docs/**" }]
 `;
+}
+
+export const SAMPLE_CONFIG = sampleConfig();

@@ -24,6 +24,8 @@ import { appEventIdentity } from "./app-events.js";
 import { enqueueEvolutionJob } from "../marketplace/evolve-worker.js";
 import { callMemoryLLM } from "../llm/client.js";
 import { CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
+import { a2aPushEnabled } from "../routes/a2a-flags.js";
+import { recordSessionEvent as recordA2aPushEvent } from "../routes/a2a-push.js";
 import { recordApprovalRequested, recordRunFinished } from "../notifications/outbox.js";
 import {
   markChatRunRunning, closeChatRun, gateOwnershipEnforced, queuedMessageId,
@@ -494,6 +496,18 @@ export async function consumeEventDelivery(msg: {
         await eventNotificationPorts.recordApprovalRequested({ sessionId, event });
       } catch (err) {
         logger.error({ err, sessionId }, "notification.approval_record_failed");
+      }
+    }
+
+    // After the event is stored and, for a completion, processed: the run row a
+    // finished task's notification reports is closed by now. Best-effort, like
+    // the run notifications: a notification not recorded is not worth failing
+    // an event over, and the event is acked whatever happens here.
+    if (a2aPushEnabled()) {
+      try {
+        await recordA2aPushEvent(sessionId, event, rowId);
+      } catch (err) {
+        logger.error({ err, sessionId, type: event.type }, "a2a_push.record_failed");
       }
     }
 

@@ -9,6 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import test, { describe } from "node:test";
 import { main, EXIT, type Ctx } from "../src/commands.js";
+import { PRESETS, parseConfig } from "../src/config.js";
 import { processStart } from "../src/children.js";
 import { credentialsFile, identityFile, pauseFile, resolveDirs, type Dirs } from "../src/paths.js";
 import { sleep } from "../src/util.js";
@@ -69,6 +70,94 @@ describe("claw-connector commands", () => {
     assert.match(b.text(), /already exists/);
     assert.match(fs.readFileSync(file, "utf8"), /# mine/);
     assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  });
+
+  /** The file `init` wrote, as `run` would load it (the root made real, nothing else touched): which agents are on, and which of them do not ask. */
+  const loadWritten = (home: string) => {
+    const text = fs.readFileSync(path.join(home, "config", "agents.toml"), "utf8").replaceAll("~/work", tmpdir("w-"));
+    return parseConfig(text, { hostname: "box" }).agents;
+  };
+  /** The same file with every agent block switched on, as it would be once the owner enables the others: what each block's lines are worth. */
+  const loadSample = (home: string) => {
+    const root = tmpdir("w-");
+    const text = fs.readFileSync(path.join(home, "config", "agents.toml"), "utf8")
+      .split("\n").map((l) => l.replace(/^# (\[\[agents\]\]|id = "[a-z-]+"|preset = "[a-z-]+"|roots = \[.*\]|approval = "(?:ask|never)")$/, "$1")).join("\n").replaceAll("~/work", root);
+    return parseConfig(text, { hostname: "box" }).agents.map((a) => [a.id, a.askMode, a.unattended, a.args.join(" ")]);
+  };
+  const ASK = [["claude", "default", false, PRESETS.claude!.args.join(" ")], ["claude-attach", "default", false, PRESETS.claude!.args.join(" ")], ["codex", "read-only", false, PRESETS.codex!.args.join(" ")], ["cursor", "ask", false, "acp"]];
+  const NEVER = [["claude", "bypassPermissions", true, PRESETS.claude!.args.join(" ")], ["claude-attach", "bypassPermissions", true, PRESETS.claude!.args.join(" ")], ["codex", "agent-full-access", true, PRESETS.codex!.args.join(" ")], ["cursor", "agent", true, "--force acp"]];
+  // [name, args, what each agent block is worth once enabled, the agents that are on in the written file and run unattended,
+  //  the agents the command says are not on in it (null: it says nothing about any), what it says]
+  const initRows: Array<[string, string[], unknown[][], string[], string | null, RegExp]> = [
+    ["by default every agent asks, and the output says how to turn that off", [], ASK, [], null, /every agent in this file asks[^]*--approval never/],
+    ["--approval ask is the same as nothing", ["--approval", "ask"], ASK, [], null, /every agent in this file asks/],
+    ["--approval never: the agents that are on run without per-step approval, with their own mode and flags; the others carry it for when they are enabled", ["--approval", "never"], NEVER, ["claude"], "claude-attach, codex, cursor", /no per-step approval for: claude\.[^]*unattended[^]*set approval = "ask"/],
+    ["--approval claude=never: only that agent", ["--approval", "claude=never"], [NEVER[0]!, ASK[1]!, ASK[2]!, ASK[3]!], ["claude"], null, /no per-step approval for: claude\./],
+    ["a later setting wins: never for all, but cursor asks", ["--approval", "never", "--approval", "cursor=ask"], [NEVER[0]!, NEVER[1]!, NEVER[2]!, ASK[3]!], ["claude"], "claude-attach, codex", /for: claude\./],
+    ["--approval codex=never: codex is not on in the file, so nothing runs unattended and the command says so", ["--approval", "codex=never"], [ASK[0]!, ASK[1]!, NEVER[2]!, ASK[3]!], [], "codex", /every agent in this file asks/],
+  ];
+  for (const [name, args, expected, unattended, parked, say] of initRows) {
+    test(`init ${name}`, async () => {
+      const home = tmpdir();
+      const a = ctx(home);
+      assert.equal(await main(["init", ...args], a.c), EXIT.ok);
+      assert.deepEqual(loadSample(home), expected);
+      assert.match(a.text(), say);
+      if (parked) assert.match(a.text(), new RegExp(`${parked}: not enabled in this file \\(the block is commented out\\), so approval = "never" does nothing there`));
+      else assert.doesNotMatch(a.text(), /not enabled/);
+      // The file as written, not as the owner might edit it: the agents the command says run without asking are exactly the ones
+      // that are on and unattended in it (the message once listed agents the file leaves commented out).
+      const written = loadWritten(home);
+      assert.deepEqual(written.map((x) => x.id), ["claude"], "only Claude is on in the sample");
+      assert.deepEqual(written.filter((x) => x.unattended).map((x) => x.id), unattended);
+      assert.deepEqual(/no per-step approval for: ([a-z, ]+)\./.exec(a.text())?.[1]?.split(", ") ?? [], unattended);
+    });
+  }
+
+  test("the way back init writes next to approval = never is setting it to ask, which works whatever else the file says", async () => {
+    const home = tmpdir();
+    const a = ctx(home);
+    await main(["init", "--approval", "claude=never"], a.c);
+    const text = fs.readFileSync(path.join(home, "config", "agents.toml"), "utf8");
+    assert.match(text, /To go back to asking, set it to "ask"/);
+    assert.match(a.text(), /To go back, set approval = "ask"/);
+    assert.doesNotMatch(text + a.text(), /delete (this|the approval)/i, "deleting the line is not enough when allow_unsafe_modes = true is set");
+  });
+
+  for (const args of [["--approval", "sometimes"], ["--approval", "claude=maybe"], ["--approval", "vim=never"], ["--approval"], ["--no-approval"], ["--approval", "=never"]]) {
+    test(`init ${args.join(" ")} is refused and writes nothing`, async () => {
+      const home = tmpdir();
+      const a = ctx(home);
+      assert.notEqual(await main(["init", ...args], a.c), EXIT.ok);
+      assert.equal(fs.existsSync(path.join(home, "config", "agents.toml")), false);
+      assert.ok(a.errText().length > 0);
+    });
+  }
+
+  test("init --approval never on a file that is there leaves it alone and says how to change it", async () => {
+    const home = tmpdir();
+    await main(["init"], ctx(home).c);
+    const file = path.join(home, "config", "agents.toml");
+    const before = fs.readFileSync(file, "utf8");
+    const b = ctx(home);
+    assert.equal(await main(["init", "--approval", "never"], b.c), EXIT.ok);
+    assert.equal(fs.readFileSync(file, "utf8"), before);
+    assert.match(b.text(), /already exists; left alone[^]*approval = "ask" or "never" in its \[\[agents\]\] table/);
+  });
+
+  test("status says which agents run without per-step approval, in the text and in --json", async () => {
+    const home = tmpdir();
+    const work = tmpdir("w-");
+    const dir = path.join(home, "config");
+    fs.mkdirSync(dir, { recursive: true });
+    const agent = (id: string, extra: string) => `[[agents]]\nid = "${id}"\ncommand = "x"\nask_mode = "${extra ? "yolo" : "default"}"\n${extra}roots = [${JSON.stringify(work)}]\n`;
+    fs.writeFileSync(path.join(dir, "agents.toml"), agent("free", `approval = "never"\n`) + agent("careful", ""));
+    const t = ctx(home);
+    await main(["status"], t.c);
+    assert.match(t.text(), /agents:\s+free \(no per-step approval\), careful\n/);
+    const j = ctx(home);
+    await main(["status", "--json"], j.c);
+    assert.deepEqual([JSON.parse(j.text()).agents, JSON.parse(j.text()).unattended], [["free", "careful"], ["free"]]);
   });
 
   test("login with a key (development) saves a 0600 file and says it is not the normal way", async () => {

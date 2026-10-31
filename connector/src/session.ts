@@ -12,6 +12,11 @@
  *    in which case it would not send a single permission request. A mode the adapter does not confirm, or a
  *    warning that its permission callback will not be invoked, closes the session instead of opening it;
  *  - a permission answer must be one of the options the adapter offered.
+ *
+ * The owner can opt an agent out of per-step approval (`approval = "never"`, or `allow_unsafe_modes`). Then the
+ * unsafe modes may be used and an adapter's "will not ask" warning is accepted (audited) instead of closing the
+ * session. Without that opt-in every one of these guards stays as it was. Whichever way a session runs, every
+ * event that names its mode also says whether it is `unattended`, so a phone always shows it.
  */
 import path from "node:path";
 import type { AttachSupport } from "./attach.js";
@@ -73,6 +78,10 @@ export class Session {
   currentMode: string | null = null;
   modes: ModeInfo[] = [];
   closed = false;
+  /** The adapter warned that it will not ask for permission and the owner's opt-in accepted that. Per adapter process. */
+  private noAskWarning = false;
+  /** The phone already knows this session: a mode change is worth an event. */
+  private announced: boolean;
   private modeConfigId: string | null = null;
   private targetMode: string;
   private enforcing = false;
@@ -101,7 +110,13 @@ export class Session {
   constructor(readonly id: string, readonly agent: AgentConfig, cwd: string, private readonly env: SessionEnv, acpId: string | null = null, mode: string | null = null) {
     this.cwd = cwd;
     this.acpId = acpId;
+    this.announced = acpId !== null;
     this.targetMode = mode ?? agent.askMode;
+    // The policy is read again after a restart: a mode the owner no longer allows is not brought back.
+    if (!agent.safeModes.includes(this.targetMode) && !agent.allowUnsafeModes && this.targetMode !== agent.askMode) {
+      this.env.audit.record("mode_reverted", { session_id: id, agent_id: agent.id, from: this.targetMode, to: agent.askMode, reason: "no_longer_allowed" });
+      this.targetMode = agent.askMode;
+    }
     this.book = new PermissionBook(env.timing.permissionTtlMs, (actionId) => {
       this.env.audit.record("permission_expired", { session_id: this.id, action_id: actionId });
       this.emit("permission_resolved", { actionId, optionId: null, outcome: "cancelled", by: "timeout" });
@@ -130,19 +145,24 @@ export class Session {
 
   /** Whether `mode` may be selected from a phone. */
   modeAllowed(mode: string): boolean {
-    return this.agent.safeModes.includes(mode) || (this.env.config.allowUnsafeModes && (this.modes.length === 0 || this.modes.some((m) => m.id === mode)));
+    return this.agent.safeModes.includes(mode) || (this.agent.allowUnsafeModes && (this.modes.length === 0 || this.modes.some((m) => m.id === mode)));
   }
 
-  private shownModes(): ModeInfo[] {
-    return this.modes.filter((m) => this.modeAllowed(m.id));
+  /** Whether this session runs without asking before every write and command: its mode is not a safe one, or its adapter said it will not ask. */
+  get unattended(): boolean {
+    return this.noAskWarning || (this.currentMode !== null && !this.agent.askingModes.includes(this.currentMode));
+  }
+
+  private shownModes(): Array<ModeInfo & { unattended: boolean }> {
+    return this.modes.filter((m) => this.modeAllowed(m.id)).map((m) => ({ ...m, unattended: !this.agent.askingModes.includes(m.id) }));
   }
 
   // --- starting ----------------------------------------------------------------
 
   /** `session.new`: start the adapter, create the ACP session, lock the mode. A refusal closes the session with a reason. */
   async create(requestedMode: string | null): Promise<void> {
-    if (requestedMode && !this.agent.safeModes.includes(requestedMode) && !this.env.config.allowUnsafeModes) {
-      return this.refuse(new SessionRefusal("mode_not_allowed", `mode ${requestedMode} needs allow_unsafe_modes on this machine`));
+    if (requestedMode && !this.agent.safeModes.includes(requestedMode) && !this.agent.allowUnsafeModes) {
+      return this.refuse(new SessionRefusal("mode_not_allowed", `mode ${requestedMode} needs approval = "never" for this agent (or allow_unsafe_modes) on this machine`));
     }
     if (requestedMode) this.targetMode = requestedMode;
     try {
@@ -152,8 +172,9 @@ export class Session {
     }
     if (this.closed) return;
     this.env.store.put(this.id, { agent_id: this.agent.id, acp_session_id: this.acpId, cwd: this.cwd, status: "active", mode: this.currentMode, created_at: new Date().toISOString() });
-    this.audit("session_started", { cwd: this.cwd, mode: this.currentMode, acp_session_id: this.acpId });
-    this.emit("session_started", { acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, modes: this.shownModes(), currentMode: this.currentMode });
+    this.audit("session_started", { cwd: this.cwd, mode: this.currentMode, unattended: this.unattended, acp_session_id: this.acpId });
+    this.emit("session_started", { acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, modes: this.shownModes(), currentMode: this.currentMode, unattended: this.unattended });
+    this.announced = true;
     this.touch();
   }
 
@@ -162,8 +183,8 @@ export class Session {
    * the launch (so it also runs again whenever a recycled adapter comes back), and a refusal closes the session.
    */
   async attach(requestedMode: string | null, title: string): Promise<void> {
-    if (requestedMode && !this.agent.safeModes.includes(requestedMode) && !this.env.config.allowUnsafeModes) {
-      return this.refuse(new SessionRefusal("mode_not_allowed", `mode ${requestedMode} needs allow_unsafe_modes on this machine`));
+    if (requestedMode && !this.agent.safeModes.includes(requestedMode) && !this.agent.allowUnsafeModes) {
+      return this.refuse(new SessionRefusal("mode_not_allowed", `mode ${requestedMode} needs approval = "never" for this agent (or allow_unsafe_modes) on this machine`));
     }
     if (requestedMode) this.targetMode = requestedMode;
     try {
@@ -173,8 +194,8 @@ export class Session {
     }
     if (this.closed) return;
     this.env.store.put(this.id, { agent_id: this.agent.id, acp_session_id: this.acpId, cwd: this.cwd, status: "active", mode: this.currentMode, created_at: new Date().toISOString() });
-    this.audit("session_attached", { cwd: this.cwd, mode: this.currentMode, acp_session_id: this.acpId });
-    this.emit("session_started", { acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, title, attached: true, modes: this.shownModes(), currentMode: this.currentMode });
+    this.audit("session_attached", { cwd: this.cwd, mode: this.currentMode, unattended: this.unattended, acp_session_id: this.acpId });
+    this.emit("session_started", { acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, title, attached: true, modes: this.shownModes(), currentMode: this.currentMode, unattended: this.unattended });
     this.touch();
   }
 
@@ -252,6 +273,8 @@ export class Session {
   }
 
   private async doLaunch(how: "new" | "resume"): Promise<void> {
+    // A warning belongs to the adapter process that printed it; a new process says its own.
+    this.noAskWarning = false;
     const adapter = await AdapterProcess.start({
       cfg: this.agent, registry: this.env.registry, sessionId: this.id, cwd: this.cwd, hooks: this.hooks(),
       logFile: path.join(this.env.logDir, `adapter-${this.agent.id}.log`), version: this.env.version,
@@ -362,14 +385,14 @@ export class Session {
     this.currentMode = mode;
     if (!this.modeAllowed(mode)) {
       this.audit("mode_reverted", { from, to: mode, back_to: this.agent.askMode });
-      this.emit("mode_update", { currentMode: mode, reverted: true });
+      this.emit("mode_update", { currentMode: mode, reverted: true, unattended: this.unattended });
       void this.enforceMode(this.agent.askMode).then(
-        () => this.emit("mode_update", { currentMode: this.currentMode }),
+        () => this.emit("mode_update", { currentMode: this.currentMode, unattended: this.unattended }),
         (e) => this.refuse(e),
       );
       return;
     }
-    this.emit("mode_update", { currentMode: mode });
+    this.emit("mode_update", { currentMode: mode, unattended: this.unattended });
   }
 
   /** `set_mode`: a user-chosen mode, only from the allowed list, always read back. */
@@ -380,8 +403,8 @@ export class Session {
     const previous = this.targetMode;
     try {
       await this.enforceMode(modeId);
-      this.audit("mode_set", { mode: modeId });
-      this.emit("mode_update", { currentMode: this.currentMode });
+      this.audit("mode_set", { mode: modeId, unattended: this.unattended });
+      this.emit("mode_update", { currentMode: this.currentMode, unattended: this.unattended });
     } catch (e) {
       // The adapter did not take it: go back to a mode known to ask.
       this.audit("mode_set_failed", { mode: modeId, error: errMessage(e) });
@@ -403,10 +426,22 @@ export class Session {
     };
   }
 
+  /**
+   * The adapter says it will not ask for permission (its own settings start it in a mode that does not, or an allow
+   * rule shadows the callback). With the owner's opt-in for this agent that is accepted: audited, and the session says
+   * it is unattended. Without it the session is closed, as before.
+   */
   private onUnsafeWarning(text: string): void {
     if (this.inheritedWarningOk) return this.audit("permission_callback_warning_inherited", { text: text.slice(0, 300) });
-    this.audit("permission_callback_warning", { text: text.slice(0, 300) });
-    void this.refuse(new SessionRefusal("mode_not_enforced", "the adapter warned that it will not ask for permission"));
+    const accepted = this.agent.allowUnsafeModes;
+    this.audit("permission_callback_warning", { text: text.slice(0, 300), accepted });
+    if (!accepted) {
+      void this.refuse(new SessionRefusal("mode_not_enforced", "the adapter warned that it will not ask for permission"));
+      return;
+    }
+    if (this.noAskWarning) return;
+    this.noAskWarning = true;
+    if (this.announced && !this.closed) this.emit("mode_update", { currentMode: this.currentMode, unattended: true });
   }
 
   private onExit(info: { code: number | null; signal: NodeJS.Signals | null }): void {
@@ -676,8 +711,8 @@ export class Session {
     } catch (e) {
       return this.refuse(e);
     }
-    this.audit("session_resumed", { mode: this.currentMode });
-    this.emit("session_resumed", { acp_session_id: this.acpId, modes: this.shownModes(), currentMode: this.currentMode });
+    this.audit("session_resumed", { mode: this.currentMode, unattended: this.unattended });
+    this.emit("session_resumed", { acp_session_id: this.acpId, modes: this.shownModes(), currentMode: this.currentMode, unattended: this.unattended });
     this.touch();
   }
 

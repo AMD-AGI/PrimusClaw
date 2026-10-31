@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 import pg from "pg";
-import { APP_RUNS_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_REMOTE_AGENTS_ENABLED, CLAW_TRIGGERS_ENABLED, DATABASE_URL, envInt } from "../config.js";
+import { APP_RUNS_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_REMOTE_AGENTS_ENABLED, CLAW_TRIGGERS_ENABLED, DATABASE_URL, envBool, envInt } from "../config.js";
+import { ensureA2aPushSchema } from "../notifications/a2a-push-schema.js";
 import { ensureNotificationSchema } from "../notifications/schema.js";
 import { ensureRemoteAgentSchema } from "../remote-agents/schema.js";
 import { terminalTicketsSchemaSql } from "../terminal/schema.js";
@@ -2251,6 +2252,15 @@ export async function initDb(): Promise<void> {
     // Off by default: a deployment that has not opted in gets no new tables.
     if (CLAW_NOTIFICATIONS_ENABLED) await ensureNotificationSchema(client);
     if (CLAW_REMOTE_AGENTS_ENABLED) await ensureRemoteAgentSchema(client);
+    // A2A context/task model: a context is found by its caller and id on every
+    // send, which the single-column index above does not narrow.
+    if (envBool("CLAW_A2A_CONTEXT_TASKS", false)) {
+      await client.query(
+        `CREATE INDEX IF NOT EXISTS idx_sessions_a2a_context ON claw_sessions(a2a_caller_id, context_id)
+          WHERE a2a_caller_id != '' AND context_id != ''`,
+      );
+      if (envBool("CLAW_A2A_PUSH_ENABLED", false)) await ensureA2aPushSchema(client);
+    }
 
     await assertSchema(client);
     logger.info("db.migrated");

@@ -89,6 +89,11 @@ export interface RemoteAgentDescriptor {
   /** Opaque to the server; a client picks an icon from it. */
   kind: string;
   name: string;
+  /**
+   * Whatever the connector reports, stored and relayed unchanged (at most `maxCapabilitiesBytes`). The connector in
+   * this repository reports `unattended` and `unattended_allowed` (docs/remote-agents.md, "Whether a session asks
+   * before it acts"); the server does not read them.
+   */
   capabilities: Record<string, unknown>;
 }
 

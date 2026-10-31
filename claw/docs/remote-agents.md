@@ -72,6 +72,23 @@ The convention the connector in this repository uses for `resumable`, newest fir
 epoch, and `state` one of `idle`, `live` (something else has it open: not offered for takeover), `attached` (this
 connector already holds it) or `unknown`.
 
+## Whether a session asks before it acts
+
+Whether an agent asks the user before it writes a file or runs a command is the machine owner's choice,
+made in the connector's own configuration; nothing Claw sends can change it. Claw does not interpret what the
+connector reports about it, and relays it unchanged (an agent's `capabilities`, and an event's `data`, are opaque to
+the API). The connector in this repository reports these keys, none of which names a product:
+
+| Where | Key | Meaning |
+|---|---|---|
+| an agent's `capabilities` | `unattended` | Its sessions start in a mode that does not ask before a write or a command. |
+| an agent's `capabilities` | `unattended_allowed` | A client may switch this agent to such a mode (`set_mode`). Where it is `false` the connector refuses the switch (`command_rejected`, `mode_not_allowed`). |
+| `session_started`, `session_resumed`, `mode_update` event `data` | `unattended` | This session, as it is now, does not ask. It is also `true` when the agent has said it will not ask, whatever its mode is called. |
+| `data.modes[]` of `session_started` and `session_resumed` | `unattended` | Selecting this mode makes the session unattended. |
+
+A client should show `unattended` wherever it shows a session's mode, so nobody is surprised that nothing asks. The keys are
+absent from a connector that predates them: a client treats absent as unknown, not as "asks".
+
 ## Connector access tokens
 
 Beside a key or a session, the four connector-side routes (the table above)

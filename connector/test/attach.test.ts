@@ -388,10 +388,10 @@ roots = ["${os.tmpdir()}"]
 const hs: Harness[] = [];
 after(async () => { for (const h of hs) await h.close(); });
 
-async function attachHarness(o: { live?: Array<Record<string, unknown>>; cliMode?: string; env?: Record<string, string>; timing?: Record<string, number>; sessions?: AttachOptions["sessions"] } = {}): Promise<Harness> {
+async function attachHarness(o: { live?: Array<Record<string, unknown>>; cliMode?: string; env?: Record<string, string>; timing?: Record<string, number>; sessions?: AttachOptions["sessions"]; approval?: "ask" | "never"; askMode?: string } = {}): Promise<Harness> {
   const work = tmpdir("cc-work-");
   const h = await Harness.create({
-    work, env: o.env, timing: o.timing,
+    work, env: o.env, timing: o.timing, approval: o.approval, askMode: o.askMode,
     attach: {
       live: o.live, cliMode: o.cliMode,
       sessions: o.sessions ?? [
@@ -442,6 +442,27 @@ describe("attach end to end", () => {
     assert.ok(h.audit().some((a) => a.kind === "permission_callback_warning_inherited"), "the inherited-mode warning is recorded, not lost");
     assert.ok(h.audit().some((a) => a.kind === "session_attached" && a.acp_session_id === REF));
     assert.ok(!methods.includes("session/delete"), "the conversation is never deleted");
+  });
+
+  test("a taken-over session says whether it asks: it does by default, and with approval = never it is unattended, in the agent's own mode", async () => {
+    const asks = await attachHarness({ env: { FAKE_RESUME_RESETS: "bypassPermissions" } });
+    const sid1 = await asks.attach(REF);
+    const a = asks.claw.eventsOf(sid1, "session_started")[0]!.data;
+    assert.deepEqual([a.currentMode, a.unattended], ["default", false]);
+    assert.equal(asks.audit().find((x) => x.kind === "session_attached")?.unattended, false);
+    await asks.online();
+    const hb1 = await asks.claw.until("a heartbeat", () => asks.claw.heartbeats.at(-1));
+    assert.deepEqual([hb1.agents[0].capabilities.unattended, hb1.agents[0].capabilities.unattended_allowed], [false, false]);
+
+    const never = await attachHarness({ approval: "never", askMode: "bypassPermissions", env: { FAKE_RESUME_RESETS: "default" } });
+    const sid2 = await never.attach(REF);
+    const n = never.claw.eventsOf(sid2, "session_started")[0]!.data;
+    assert.deepEqual([n.currentMode, n.unattended, n.attached], ["bypassPermissions", true, true], "the mode the transcript was left in is replaced by the agent's own, and the phone is told it does not ask");
+    assert.equal(never.audit().find((x) => x.kind === "session_attached")?.unattended, true);
+    assert.ok(n.modes.every((m: { unattended: boolean }) => typeof m.unattended === "boolean"), "every mode offered says whether it asks");
+    await never.online();
+    const hb2 = await never.claw.until("a heartbeat", () => never.claw.heartbeats.at(-1));
+    assert.deepEqual([hb2.agents[0].capabilities.unattended, hb2.agents[0].capabilities.unattended_allowed], [true, true]);
   });
 
   test("a warning about the permission callback that comes after the mode is locked still closes the session", async () => {

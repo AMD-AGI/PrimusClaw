@@ -146,3 +146,18 @@ test("registration, heartbeat and session bodies", () => {
     else assert.deepEqual(r.ok && r.value.resume_ref, want, JSON.stringify(resume_ref)?.slice(0, 40));
   }
 });
+
+test("a heartbeat's capabilities are carried as the connector wrote them, whatever they say about approval", () => {
+  const capabilities = { ask_mode: "m", modes: ["a"], unattended: true, unattended_allowed: false, protocol: 1, nested: { x: [1, { y: null }] } };
+  const parsed = parseHeartbeat({ agents: [{ agent_id: "a1", kind: "k", name: "n", capabilities }] });
+  assert.ok(parsed.ok);
+  assert.deepEqual(parsed.value.agents[0]!.capabilities, capabilities);
+});
+
+test("a session event's data is carried whole, so a flag a connector adds to it reaches every client", () => {
+  const data = { currentMode: "m", unattended: true, modes: [{ id: "m", unattended: true }] };
+  const parsed = parseEventBatch({ batch_id: "b", events: [{ session_id: SID, seq: 1, type: "mode_update", ts: 1, data }] });
+  assert.ok(parsed.ok);
+  assert.deepEqual(parsed.value.events[0]!.data, data);
+  assert.deepEqual(parsed.value.rejected, []);
+});
