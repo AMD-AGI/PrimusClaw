@@ -41,7 +41,9 @@ The check sits in the one authentication hook, so there is no route to forget: t
 sessions and sandboxes, remote agents, A2A and the rest are all behind it. It runs
 before the caller's LLM key is cached for background work, so a refused caller leaves no key behind.
 Not judged: `/health`, `/metrics`, agent-card discovery and `/v1/internal/*` (which have their own
-credentials and no user). A request with no credential or a bad one is still a 401.
+credentials and no user), and the local-development bypass (`CLAW_INSECURE_DEV_AUTH=1`, which
+authenticates nobody and is refused outside a dev `APP_ENV`). A request with no credential or a
+bad one is still a 401.
 
 ## Where the roles come from
 
@@ -77,6 +79,7 @@ they stop being served.
 2. Set the roles an ordinary user holds (`api.requiredPlatformRoles: [default]`) while
    people holding other roles are still being served by other means, and watch
    `auth.platform_access.refused` in the API log (`userId`, `method`, `reason`:
-   `role_missing` for a caller the platform named roles for, `roles_unknown` for one it
-   did not). Every user you expect to be served should be absent from it.
+   `role_missing`: the platform verified the credential and its answer holds none of the
+   named roles, including an answer with no usable `roles` field; `roles_unknown`: the credential
+   was not one the platform verifies). Every user you expect to be served should be absent from it.
 3. To turn it off, empty the setting: the next request is judged as before.
