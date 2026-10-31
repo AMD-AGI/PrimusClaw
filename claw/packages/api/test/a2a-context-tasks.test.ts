@@ -775,20 +775,4 @@ describe("the A2A context/task model", { skip }, () => {
       assert.equal(r.json.error.code, -32003);
     });
   });
-
-  describe("C10 push notifications are not part of this model yet", () => {
-    test("the four methods, and a send that carries a config, are unsupported, as before", async () => {
-      for (const name of ["CreateTaskPushNotificationConfig", "GetTaskPushNotificationConfig", "ListTaskPushNotificationConfigs", "DeleteTaskPushNotificationConfig"]) {
-        assert.equal((await rpc(name, { taskId: "x", id: "y", url: "https://example.com/h" })).json.error.code, -32003, name);
-      }
-      const sessions = async () => Number((await query("SELECT COUNT(*)::int AS n FROM claw_sessions")).rows[0].n);
-      const before = await sessions();
-      const sent = await rpc("SendMessage", {
-        message: msg("with a config"),
-        configuration: { returnImmediately: true, taskPushNotificationConfig: { url: "https://example.com/h" } },
-      });
-      assert.equal(sent.json.error.code, -32003);
-      assert.equal(await sessions(), before, "and it opened nothing");
-    });
-  });
 });

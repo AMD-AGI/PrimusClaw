@@ -24,6 +24,11 @@ import { applyTaskStatusTransition } from "../tasks/db.js";
 import { buildDecisionMessage } from "../sessions/decision-message.js";
 import { interruptSubject } from "@claw/protocol";
 import { sanitizeSessionEvent } from "../events/store.js";
+import { a2aPushEnabled } from "./a2a-flags.js";
+import {
+  checkWebhookUrl, deletePushConfig, getPushConfig, insertPushConfig, listPushConfigs,
+  validatePushConfig,
+} from "./a2a-push.js";
 import {
   listRunsForCaller, loadRun, loadRunEvents, loadRunForCaller, settleRun,
 } from "./a2a-store.js";
@@ -35,7 +40,7 @@ import {
 import {
   type CancelTaskRequest, type GetTaskRequest, type JsonRpcResponse, type ListTasksRequest,
   type ListTasksResponse, type Message, type Part, type SendMessageRequest, type StreamResponse,
-  type SubscribeToTaskRequest, type Task,
+  type SubscribeToTaskRequest, type Task, type TaskPushNotificationConfig,
   JSON_RPC_INTERNAL_ERROR, JSON_RPC_INVALID_PARAMS,
   TaskState, TERMINAL_STATES,
   makeJsonRpcError, makeJsonRpcSuccess, makePushNotificationNotSupportedError,
@@ -77,8 +82,16 @@ export interface A2aV2Deps<Auth extends { userId: string }> {
   nats: NatsPort;
   /** Session, parent attachment, gate and run row in one admission transaction. */
   openRun(input: OpenRunInput<Auth>): Promise<ContextEntry>;
-  /** Publish the opened run for execution; a failure rolls the admission back and is rethrown. */
-  publishRun(entry: Extract<ContextEntry, { kind: "opened" }>, text: string, auth: Auth): Promise<void>;
+  /**
+   * Publish the opened run for execution. `beforePublish` runs first and may
+   * throw; any failure rolls the admission back and is rethrown.
+   */
+  publishRun(
+    entry: Extract<ContextEntry, { kind: "opened" }>,
+    text: string,
+    auth: Auth,
+    beforePublish?: () => Promise<void>,
+  ): Promise<void>;
   admissionRejected(rpcId: string | number, reason: string): JsonRpcResponse;
   admissionDeferred(rpcId: string | number): JsonRpcResponse;
   /** How long a blocking send waits for the task to finish or need input. */
@@ -186,6 +199,27 @@ export function createA2aV2<Auth extends { userId: string }>(deps: A2aV2Deps<Aut
   }
 
   // -------------------------------------------------------------------------
+  // Push configuration carried on a send
+  // -------------------------------------------------------------------------
+
+  type PushCheck =
+    | { present: false }
+    | { present: true; value: Extract<ReturnType<typeof validatePushConfig>, { ok: true }>["value"] }
+    | { present: true; error: JsonRpcResponse };
+
+  /** Validated before anything is created, so a refused webhook leaves no task behind. */
+  async function checkPushOnSend(config: SendMessageRequest["configuration"], rpcId: string | number): Promise<PushCheck> {
+    const raw = config?.taskPushNotificationConfig;
+    if (raw === undefined) return { present: false };
+    if (!a2aPushEnabled()) return { present: true, error: makePushNotificationNotSupportedError(rpcId) };
+    const v = validatePushConfig(raw);
+    if (!v.ok) return { present: true, error: invalid(rpcId, v.error) };
+    const url = await checkWebhookUrl(v.value.url);
+    if (!url.ok) return { present: true, error: invalid(rpcId, `push notification url refused: ${url.reason}`) };
+    return { present: true, value: v.value };
+  }
+
+  // -------------------------------------------------------------------------
   // SendMessage
   // -------------------------------------------------------------------------
 
@@ -213,6 +247,7 @@ export function createA2aV2<Auth extends { userId: string }>(deps: A2aV2Deps<Aut
     rpcId: string | number,
     callerId: string,
     auth: Auth,
+    push: PushCheck,
   ): Promise<{ run: RunRecord; actionId: string } | { error: JsonRpcResponse }> {
     const run = await loadRunForCaller(message.taskId as string, callerId);
     if (!run) return { error: makeTaskNotFoundError(rpcId, message.taskId as string) };
@@ -231,6 +266,10 @@ export function createA2aV2<Auth extends { userId: string }>(deps: A2aV2Deps<Aut
     }
     const parsed = parseAnswer(pending, message.parts ?? []);
     if (!parsed.ok) return { error: invalid(rpcId, parsed.error) };
+    if (push.present && "value" in push) {
+      const stored = await insertPushConfig(run, callerId, push.value);
+      if (!stored.ok) return { error: invalid(rpcId, stored.error) };
+    }
     // The message Brain's decision dispatcher already reads; `user_id` is the
     // caller, as for a decision made in the web client.
     if (parsed.kind === "approval") {
@@ -264,11 +303,12 @@ export function createA2aV2<Auth extends { userId: string }>(deps: A2aV2Deps<Aut
     params: SendMessageRequest, rpcId: string | number, callerId: string, auth: Auth,
   ): Promise<JsonRpcResponse> {
     const { message, configuration, metadata } = params;
-    if (configuration?.taskPushNotificationConfig !== undefined) return makePushNotificationNotSupportedError(rpcId);
+    const push = await checkPushOnSend(configuration, rpcId);
+    if (push.present && "error" in push) return push.error;
     if (!message?.parts?.length) return invalid(rpcId, "message.parts is required and must be non-empty");
 
     if (message.taskId) {
-      const answered = await answer(message, rpcId, callerId, auth);
+      const answered = await answer(message, rpcId, callerId, auth, push);
       if ("error" in answered) return answered.error;
       if (configuration?.returnImmediately === true) {
         return makeJsonRpcSuccess(rpcId, { task: await viewOf(answered.run, configuration.historyLength) });
@@ -287,7 +327,14 @@ export function createA2aV2<Auth extends { userId: string }>(deps: A2aV2Deps<Aut
       if (entry.kind === "error") return entry.error;
       if (entry.kind === "busy") return busyError(rpcId, entry.taskId);
       if (entry.kind === "opened") {
-        await deps.publishRun(entry, text, auth);
+        await deps.publishRun(entry, text, auth, async () => {
+          if (push.present && "value" in push) {
+            const stored = await insertPushConfig(
+              { taskId: entry.taskId, sessionId: entry.sessionId }, callerId, push.value,
+            );
+            if (!stored.ok) throw new Error(stored.error);
+          }
+        });
       }
       logger.info({ taskId: entry.taskId, contextId: entry.contextId, duplicate: entry.kind === "duplicate" }, "a2a.SendMessage");
       const run = await loadRun(entry.taskId);
@@ -378,10 +425,8 @@ export function createA2aV2<Auth extends { userId: string }>(deps: A2aV2Deps<Aut
     params: SendMessageRequest, rpcId: string | number, reply: FastifyReply, callerId: string, auth: Auth,
   ): Promise<void> {
     const { message, configuration, metadata } = params;
-    if (configuration?.taskPushNotificationConfig !== undefined) {
-      reply.send(makePushNotificationNotSupportedError(rpcId));
-      return;
-    }
+    const push = await checkPushOnSend(configuration, rpcId);
+    if (push.present && "error" in push) { reply.send(push.error); return; }
     if (!message?.parts?.length) {
       reply.status(400).send(invalid(rpcId, "message.parts is required"));
       return;
@@ -393,7 +438,7 @@ export function createA2aV2<Auth extends { userId: string }>(deps: A2aV2Deps<Aut
       // Subscribed before the answer is published: the run resumes the moment
       // it is heard.
       const sub = deps.nats.subscribe(`events.${run.sessionId}`);
-      const answered = await answer(message, rpcId, callerId, auth);
+      const answered = await answer(message, rpcId, callerId, auth, push);
       if ("error" in answered) { sub.unsubscribe(); reply.send(answered.error); return; }
       const events = await loadRunEvents(run);
       // The events that record the answer have not landed yet, so the task is
@@ -428,7 +473,12 @@ export function createA2aV2<Auth extends { userId: string }>(deps: A2aV2Deps<Aut
     }
     const sub = deps.nats.subscribe(`events.${entry.sessionId}`);
     try {
-      await deps.publishRun(entry, text, auth);
+      await deps.publishRun(entry, text, auth, async () => {
+        if (push.present && "value" in push) {
+          const stored = await insertPushConfig({ taskId: entry.taskId, sessionId: entry.sessionId }, callerId, push.value);
+          if (!stored.ok) throw new Error(stored.error);
+        }
+      });
     } catch (err: unknown) {
       sub.unsubscribe();
       logger.error({ err }, "a2a.SendStreamingMessage.failed");
@@ -570,6 +620,66 @@ export function createA2aV2<Auth extends { userId: string }>(deps: A2aV2Deps<Aut
     return makeJsonRpcSuccess(rpcId, await viewOf(current));
   }
 
+  // -------------------------------------------------------------------------
+  // Push notification configuration (spec 3.1.7 - 3.1.10)
+  // -------------------------------------------------------------------------
+
+  async function ownedRun(taskId: unknown, rpcId: string | number, callerId: string):
+    Promise<{ run: RunRecord } | { error: JsonRpcResponse }> {
+    if (typeof taskId !== "string" || !taskId) return { error: invalid(rpcId, "taskId is required") };
+    const run = await loadRunForCaller(taskId, callerId);
+    return run ? { run } : { error: makeTaskNotFoundError(rpcId, taskId) };
+  }
+
+  async function createPushConfig(
+    params: TaskPushNotificationConfig, rpcId: string | number, callerId: string,
+  ): Promise<JsonRpcResponse> {
+    if (!a2aPushEnabled()) return makePushNotificationNotSupportedError(rpcId);
+    const owned = await ownedRun(params?.taskId, rpcId, callerId);
+    if ("error" in owned) return owned.error;
+    const v = validatePushConfig(params);
+    if (!v.ok) return invalid(rpcId, v.error);
+    if (isTerminalRun(owned.run.status)) {
+      return makeUnsupportedOperationError(rpcId, "The task is finished; no notification will be sent for it");
+    }
+    const url = await checkWebhookUrl(v.value.url);
+    if (!url.ok) return invalid(rpcId, `push notification url refused: ${url.reason}`);
+    const stored = await insertPushConfig(owned.run, callerId, v.value);
+    if (!stored.ok) return invalid(rpcId, stored.error);
+    return makeJsonRpcSuccess(rpcId, stored.config);
+  }
+
+  async function getPushConfigMethod(
+    params: { taskId?: string; id?: string }, rpcId: string | number, callerId: string,
+  ): Promise<JsonRpcResponse> {
+    if (!a2aPushEnabled()) return makePushNotificationNotSupportedError(rpcId);
+    const owned = await ownedRun(params?.taskId, rpcId, callerId);
+    if ("error" in owned) return owned.error;
+    if (typeof params.id !== "string" || !params.id) return invalid(rpcId, "id is required");
+    const config = await getPushConfig(owned.run.taskId, params.id, callerId);
+    return config ? makeJsonRpcSuccess(rpcId, config) : makeTaskNotFoundError(rpcId, params.id);
+  }
+
+  async function listPushConfigsMethod(
+    params: { taskId?: string }, rpcId: string | number, callerId: string,
+  ): Promise<JsonRpcResponse> {
+    if (!a2aPushEnabled()) return makePushNotificationNotSupportedError(rpcId);
+    const owned = await ownedRun(params?.taskId, rpcId, callerId);
+    if ("error" in owned) return owned.error;
+    return makeJsonRpcSuccess(rpcId, { configs: await listPushConfigs(owned.run.taskId, callerId), nextPageToken: "" });
+  }
+
+  async function deletePushConfigMethod(
+    params: { taskId?: string; id?: string }, rpcId: string | number, callerId: string,
+  ): Promise<JsonRpcResponse> {
+    if (!a2aPushEnabled()) return makePushNotificationNotSupportedError(rpcId);
+    const owned = await ownedRun(params?.taskId, rpcId, callerId);
+    if ("error" in owned) return owned.error;
+    if (typeof params.id !== "string" || !params.id) return invalid(rpcId, "id is required");
+    await deletePushConfig(owned.run.taskId, params.id, callerId);
+    return makeJsonRpcSuccess(rpcId, {});
+  }
+
   return {
     sendMessage,
     sendStreamingMessage,
@@ -577,6 +687,10 @@ export function createA2aV2<Auth extends { userId: string }>(deps: A2aV2Deps<Aut
     getTask,
     listTasks,
     cancelTask,
+    createPushConfig,
+    getPushConfig: getPushConfigMethod,
+    listPushConfigs: listPushConfigsMethod,
+    deletePushConfig: deletePushConfigMethod,
   };
 }
 

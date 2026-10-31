@@ -119,6 +119,8 @@ export function publicBaseUrl(
 export interface CardOptions {
   /** The context/task model is on: the card describes it truthfully. */
   contextTasks?: boolean;
+  /** Push notifications are on. */
+  push?: boolean;
   /** The identity provider's discovery document, when its tokens are accepted. */
   oidcUrl?: string;
   /** The scope those tokens must carry (CLAW_IDENTITY_TOKEN_SCOPE); `claw.api` when unset. */
@@ -133,6 +135,7 @@ export function cardOptionsFromEnv(env: Record<string, string | undefined> = pro
   const tokens = on("IDENTITY_CLIENT_ENABLED") && on("CLAW_IDENTITY_TOKEN_AUTH_ENABLED") && issuer !== "";
   return {
     contextTasks,
+    push: contextTasks && on("CLAW_A2A_PUSH_ENABLED"),
     ...(contextTasks && tokens
       ? {
         oidcUrl: `${issuer}/.well-known/openid-configuration`,
@@ -173,7 +176,7 @@ function cardEnvelope(url: string, opts: CardOptions): Pick<
     provider: { url: "https://www.amd.com", organization: "AMD" },
     capabilities: {
       streaming: true,
-      pushNotifications: false,
+      pushNotifications: opts.push === true,
       extendedAgentCard: false,
     },
     securitySchemes,

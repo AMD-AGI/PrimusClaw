@@ -158,8 +158,6 @@ export class ToolRouter {
 
   private webServices: WebToolServices;
 
-  private bearerToken: string;
-
   /**
    * Backend-side MCP connection (task-design.md §7.5). When provided, tool
    * calls whose `plugin_tools[*].config.scope === "backend"` are routed to
@@ -188,11 +186,9 @@ export class ToolRouter {
     private hands: HandsClient | null,
     private platformMcp: Map<string, { callTool: (name: string, args: Record<string, unknown>) => Promise<string> }> = new Map(),
     webServices?: WebToolServices,
-    bearerToken?: string,
     attachHands?: () => Promise<HandsClient>,
   ) {
     this.webServices = webServices ?? {};
-    this.bearerToken = bearerToken || "";
     this.attachHands = attachHands;
   }
 
@@ -443,7 +439,7 @@ export class ToolRouter {
     }
 
     if (name === "a2a_call") {
-      return handleA2ACall(input, this.bearerToken);
+      return handleA2ACall(input);
     }
 
     if (name.startsWith("mcp__")) {
@@ -657,9 +653,9 @@ export class ToolRouter {
         },
       } as ToolSchema] : []),
 
-      { name: "a2a_call", description: "Call an external AI agent using the A2A protocol. Authentication is handled automatically — do NOT use bash/curl for A2A calls. Use when: (1) the task requires expertise from another agent, (2) user explicitly asks to involve another agent, (3) creating worker agents in an agent team. Use mode='discover' first to check capabilities. Pass metadata.plugin_id to load a specific plugin/skill on the remote agent.", input_schema: {
+      { name: "a2a_call", description: "Call a peer AI agent that the operator has configured, using the A2A protocol. Only configured peers can be called (never a URL), and authentication is handled for you — do NOT use bash/curl for A2A calls. Use when: (1) the task requires expertise from another agent, (2) user explicitly asks to involve another agent, (3) creating worker agents in an agent team. Use mode='discover' first to check capabilities. Pass metadata.plugin_id to load a specific plugin/skill on the remote agent.", input_schema: {
         type: "object", properties: {
-          agent: { type: "string", description: "Agent name (from registry) or full URL" },
+          agent: { type: "string", description: "Name of a configured peer agent (not a URL); an unknown name is refused with the list of configured peers" },
           message: { type: "string", description: "The task/question to send to the remote agent" },
           skill: { type: "string", description: "Optional: target a specific skill on the remote agent" },
           mode: { type: "string", enum: ["stream", "fire_and_forget", "discover"], description: "stream (default): wait for full response. fire_and_forget: submit and return immediately. discover: fetch agent card only." },

@@ -67,6 +67,18 @@ export async function loadRun(taskId: string): Promise<RunRecord | null> {
   return r.rows[0] ? runOf(r.rows[0] as Record<string, unknown>) : null;
 }
 
+/** The A2A run of a session that was sent under `messageId`: the one an event that names its turn belongs to. */
+export async function loadRunOfSessionMessage(sessionId: string, messageId: string): Promise<RunRecord | null> {
+  const r = await db.query(
+    `SELECT ${RUN_COLUMNS}
+       FROM claw_tasks t JOIN claw_sessions s ON s.session_id = t.session_id
+      WHERE t.session_id = $1 AND t.origin = 'a2a' AND t.metadata->>'message_id' = $2
+      LIMIT 1`,
+    [sessionId, messageId],
+  );
+  return r.rows[0] ? runOf(r.rows[0] as Record<string, unknown>) : null;
+}
+
 /** The newest A2A run of a session, the one its live events belong to. */
 export async function loadLatestRunOfSession(sessionId: string): Promise<RunRecord | null> {
   const r = await db.query(
