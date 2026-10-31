@@ -1,6 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import { CredentialClient, type ResolveCredentialRequest, type ResolvedCredential } from "./credentials.js";
 import { Endpoints } from "./discovery.js";
 import { ExchangeClient, type ExchangedToken, type ExchangeRequest } from "./exchange.js";
 import { Introspector, type IntrospectionResult, type IntrospectOptions } from "./introspection.js";
@@ -19,6 +20,8 @@ export interface IdentityClientSettings {
   introspectionUrl?: string;
   tokenUrl?: string;
   jwksUrl?: string;
+  /** Where an external credential is resolved; derived from the token endpoint when unset. */
+  credentialResolveUrl?: string;
 
   positiveTtlMs: number;
   negativeTtlMs: number;
@@ -65,6 +68,7 @@ export class IdentityClient {
   private readonly keys: JwksCache;
   private readonly introspector: Introspector;
   private readonly exchanger: ExchangeClient;
+  private readonly credentials: CredentialClient;
 
   constructor(private readonly settings: IdentityClientSettings, deps: Partial<IdentityDeps> = {}) {
     this.deps = {
@@ -81,6 +85,7 @@ export class IdentityClient {
         introspectionUrl: settings.introspectionUrl,
         tokenUrl: settings.tokenUrl,
         jwksUrl: settings.jwksUrl,
+        credentialResolveUrl: settings.credentialResolveUrl,
       },
       refreshMs: settings.keysRefreshMs,
       staleIfErrorMs: settings.keysStaleIfErrorMs,
@@ -111,6 +116,11 @@ export class IdentityClient {
       maxEntries: MAX_EXCHANGE_ENTRIES,
       http,
     }, this.endpoints, this.deps);
+    this.credentials = new CredentialClient({
+      clientId: settings.clientId,
+      clientSecret: settings.clientSecret,
+      http,
+    }, this.endpoints, this.deps);
   }
 
   /**
@@ -124,6 +134,15 @@ export class IdentityClient {
   /** A token for the subject, from the cache while it has life left. */
   exchange(req: ExchangeRequest): Promise<ExchangedToken> {
     return this.exchanger.exchange(req);
+  }
+
+  /**
+   * A user's third-party credential (a GitHub token), for one use and not kept.
+   * Throws {@link IdentityCredentialRefusedError} when there is none or it has
+   * expired, {@link IdentityUnavailableError} when the provider could not be asked.
+   */
+  resolveExternalCredential(req: ResolveCredentialRequest): Promise<ResolvedCredential> {
+    return this.credentials.resolve(req);
   }
 
   /** Verify a JWT locally against the issuer's keys; `issuer` defaults to the configured one. */

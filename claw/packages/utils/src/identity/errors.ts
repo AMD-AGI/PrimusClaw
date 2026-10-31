@@ -69,3 +69,21 @@ export class JwtVerificationError extends Error {
     this.reason = reason;
   }
 }
+
+/**
+ * The identity provider answered a credential lookup and said no: the user has
+ * nothing of that kind on record (`not_bound`) or it has run out (`expired`).
+ * A decision, not an outage: a retry will not change it.
+ */
+export class IdentityCredentialRefusedError extends Error {
+  readonly code: string;
+  readonly status: number;
+
+  constructor(code: string, status: number) {
+    super(`credential lookup refused: ${code}`);
+    this.name = "IdentityCredentialRefusedError";
+    Object.setPrototypeOf(this, new.target.prototype);
+    this.code = code;
+    this.status = status;
+  }
+}
