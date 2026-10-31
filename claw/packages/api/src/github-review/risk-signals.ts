@@ -32,7 +32,7 @@
  * exported type, a parameter on a wrapped signature line, a behaviour that changed under an
  * unchanged name) is what the reviewing model's own judgement is for.
  */
-import { addedLines, removedLines } from "./diff.js";
+import { eachChangedLine } from "./diff.js";
 import type { RiskFile } from "./risk.js";
 
 export type RiskCategory =
@@ -106,19 +106,21 @@ export function readChange(files: RiskFile[]): ChangeText {
   let count = 0;
   let chars = 0;
   let truncated = false;
-  const take = (path: string, raw: string[]): string[] => {
-    const out: string[] = [];
-    for (const line of raw) {
-      if (count >= MAX_READ_LINES || chars >= MAX_READ_CHARS) { truncated = true; break; }
-      if (line.length > MAX_LINE_CHARS) unreadable.add(path);
+  for (const f of files) {
+    const read = { added: [] as string[], removed: [] as string[] };
+    lines.set(f, read);
+    if (truncated) continue;
+    // One pass that stops at the budget: the rest of a large patch is neither split nor collected.
+    eachChangedLine(f.patch, (mark, line) => {
+      if (count >= MAX_READ_LINES || chars >= MAX_READ_CHARS) { truncated = true; return false; }
+      if (line.length > MAX_LINE_CHARS) unreadable.add(f.path);
       const text = clipLine(line);
       count += 1;
       chars += text.length;
-      out.push(text);
-    }
-    return out;
-  };
-  for (const f of files) lines.set(f, { added: take(f.path, addedLines(f.patch)), removed: take(f.path, removedLines(f.patch)) });
+      (mark === "+" ? read.added : read.removed).push(text);
+      return true;
+    });
+  }
   return { lines, unreadable, truncated };
 }
 
@@ -178,7 +180,7 @@ function commentOnly(n: string, syntax: CommentSyntax): boolean {
     }
     if (syntax.html && n.startsWith("<!--", i)) {
       const end = n.indexOf("-->", i + 4);
-      if (end < 0) return false;
+      if (end < 0) return true; // an opening line, like a block comment's
       i = end + 3;
       continue;
     }

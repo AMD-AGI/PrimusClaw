@@ -67,6 +67,28 @@ function hunkLines(patch: string | undefined | null, mark: "+" | "-"): string[] 
   return out;
 }
 
+/**
+ * The added and removed lines of a patch in order, one pass, each handed to `visit` (the mark, and the line without it) until it
+ * returns false. Nothing is collected: a caller that has read enough stops the scan, so what a very large patch costs is bounded by the
+ * caller's budget and not by the patch. The same lines {@link addedLines} and {@link removedLines} return.
+ */
+export function eachChangedLine(patch: string | undefined | null, visit: (mark: "+" | "-", text: string) => boolean): void {
+  if (!patch) return;
+  let inHunk = false;
+  let pos = 0;
+  while (pos <= patch.length) {
+    let end = patch.indexOf("\n", pos);
+    if (end < 0) end = patch.length;
+    const first = patch[pos];
+    if (first === "@") {
+      if (HUNK_RE.test(patch.slice(pos, Math.min(end, pos + 80)))) inHunk = true;
+    } else if (inHunk && (first === "+" || first === "-")) {
+      if (!visit(first, patch.slice(pos + 1, end))) return;
+    }
+    pos = end + 1;
+  }
+}
+
 /** The added lines of a patch, without their `+`, for the rules that read what a change introduces. */
 export function addedLines(patch: string | undefined | null): string[] {
   return hunkLines(patch, "+");

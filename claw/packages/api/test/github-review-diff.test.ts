@@ -4,7 +4,7 @@
 /** Which lines of a patch an inline comment may sit on. */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { addedLines, commentableLines, removedLines } from "../src/github-review/diff.js";
+import { addedLines, commentableLines, eachChangedLine, removedLines } from "../src/github-review/diff.js";
 
 const PATCH = [
   "@@ -3,4 +3,5 @@ func x()",
@@ -47,4 +47,18 @@ test("a content line that itself starts with ++ or -- is still an added or remov
   assert.deepEqual(addedLines(patch), ["++ chmod 777 /data", "++x; rejectUnauthorized: false"]);
   assert.deepEqual(removedLines(patch), ["- drop table x"]);
   assert.deepEqual(addedLines("diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n+real"), ["real"]);
+});
+
+test("eachChangedLine hands over the same lines as addedLines and removedLines, in order, and stops when asked", () => {
+  const patch = "--- a/x\n+++ b/x\n@@ -1,4 +1,4 @@\n ctx\n-gone\n+here\n++plus\n--minus\n ctx\n@@ -20,1 +20,2 @@\n+last";
+  const seen: Array<[string, string]> = [];
+  eachChangedLine(patch, (mark, text) => { seen.push([mark, text]); return true; });
+  assert.deepEqual(seen, [["-", "gone"], ["+", "here"], ["+", "+plus"], ["-", "-minus"], ["+", "last"]]);
+  assert.deepEqual(seen.filter(([m]) => m === "+").map(([, t]) => t), addedLines(patch));
+  assert.deepEqual(seen.filter(([m]) => m === "-").map(([, t]) => t), removedLines(patch));
+  const first: string[] = [];
+  eachChangedLine(patch, (_m, text) => { first.push(text); return first.length < 2; });
+  assert.deepEqual(first, ["gone", "here"]);
+  eachChangedLine(undefined, () => assert.fail("no patch, no line"));
+  eachChangedLine("+not in a hunk\n-nor this", () => assert.fail("nothing before the first hunk header is content"));
 });

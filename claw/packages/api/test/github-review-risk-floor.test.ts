@@ -84,6 +84,7 @@ test("F2 a line that only starts like a comment is code, and the content rules r
     ["a comment in SQL", "db/report.sql", "-- DROP TABLE reports; was here"],
     ["a comment in a PHP file, with either marker", "web/index.php", "# eval($x) was here"],
     ["a comment in markup", "web/page.html", "<!-- <script>eval(input)</script> -->"],
+    ["a markup comment that opens and closes on later lines", "web/page.html", "<!-- eval(input)"],
   ];
   for (const [what, path, line] of comments) {
     const r = assess([{ path, status: "modified", additions: 1, deletions: 0, patch: `@@ -1,1 +1,2 @@\n ctx\n+${line}` }]);

@@ -14,12 +14,13 @@
  *       and the JVM `public` method pattern, each on a 4000-character line
  *   R2  every language's exported-symbol patterns on lines of a repeated filler, and the whole rule pack on the other shapes that are
  *       cheap to write (a manifest, a route, a flag, an environment read, a secret, a dependency line)
- *   R3  the number of lines read is capped: a change with more is not read past the cap, says so, and is held
+ *   R3  the number of lines read is capped: a change with more is not read past the cap, says so, and is held, and the rest of a
+ *       huge patch is not even split into lines
  */
 import assert from "node:assert/strict";
 import test from "node:test";
 import { assessRisk, type RiskFile } from "../src/github-review/risk.js";
-import { MAX_LINE_CHARS, MAX_READ_CHARS, MAX_READ_LINES } from "../src/github-review/risk-signals.js";
+import { MAX_LINE_CHARS, MAX_READ_CHARS, MAX_READ_LINES, readChange } from "../src/github-review/risk-signals.js";
 
 /** Healthy cost is about a millisecond; the slow patterns took 5 to 35 seconds. The bound leaves a slow machine room and a quadratic pattern none to hide in. */
 const BOUND_MS = 400;
@@ -126,4 +127,16 @@ test("R3b the cap is over the files together, not per file: many files of a few 
   const r = run(files);
   assert.match(r.reasons.join("\n"), /more changed text than is read line by line/);
   assert.ok(r.ms < 3000, `${Math.round(r.ms)} ms`);
+});
+
+test("R3c a patch of millions of lines is read up to the cap and no further: the rest of it is not split or collected", () => {
+  const n = 4_000_000;
+  const patch = `@@ -1,1 +1,2 @@\n${"+x = 1;\n".repeat(n)}`; // about 32 MB, which splitting into lines costs more than a second to collect
+  const file: RiskFile = { path: "src/huge.ts", status: "modified", additions: n, deletions: 0, patch };
+  const started = performance.now();
+  const read = readChange([file]);
+  const ms = performance.now() - started;
+  assert.equal(read.lines.get(file)?.added.length, MAX_READ_LINES);
+  assert.equal(read.truncated, true);
+  assert.ok(ms < 250, `${Math.round(ms)} ms`);
 });
