@@ -329,9 +329,7 @@ export class AgentEngine {
           ? new WebSearchService(webToolCtx) : undefined,
         webFetch: webToolCtx && WEB_FETCH_ENABLED
           ? new WebFetchService(webToolCtx) : undefined,
-        // a2a bearer: keep the platform_key fallback so safe-mode dispatch
-        // (empty llm_api_key) still authenticates sub-agent calls.
-      }, resolveRequestLlmKey(request) || request.platform_key || "", sandbox);
+      }, sandbox);
       router.lazySkillWriter = lazySkills;
       router.memoryEnabled = request.memory_enabled !== false;
       const allToolSchemas = [...router.getToolSchemas(), ...mcpResult.schemas];
