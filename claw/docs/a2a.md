@@ -97,6 +97,32 @@ clients named in `CLAW_A2A_IDENTITY_CLIENT_IDS` (comma separated) may use A2A,
 and an empty list refuses them all with 403. API keys, cookies and the other
 credentials are not asked.
 
+## Push notifications
+
+With `CLAW_A2A_PUSH_ENABLED=true` a client registers a webhook for a task
+(`CreateTaskPushNotificationConfig`, or `configuration.taskPushNotificationConfig`
+on the send; `Get`, `List` and `Delete` too) and is sent a `StreamResponse` when
+the task changes state: running, `INPUT_REQUIRED` with the request, working
+again, and at the end the whole result as one artifact followed by the final
+status. A task takes five configs, and a config's id is the task's own: two
+callers, or two tasks of one caller, can each use the same id. A config goes with
+its task's last notification, however the run ended: the completion event writes
+it, and a run that was closed without one (the sweeper's budget close, a stop
+that was never confirmed) gets it from the push worker within about 30 seconds.
+
+The receiver is authenticated with what the client supplied: the config's
+`authentication` is sent as `Authorization: <scheme> <credentials>` and its
+`token` as `X-A2A-Notification-Token`. v1.0.1 has no server-held signing key for
+notifications, so none is published. Credentials are stored encrypted and never
+returned.
+
+A webhook must be https and must resolve to a public address. A host named in
+`CLAW_A2A_PUSH_ALLOWED_HOSTS` (comma separated) is the operator's exception, the
+only place plain http is accepted, for an in-cluster receiver. The check runs
+when the config is created and again at every delivery, which connects to the
+address that was checked. Delivery is at least once and in order per config,
+retried with backoff and abandoned after an hour.
+
 ## Not supported
 
 Extended agent cards, the REST and gRPC bindings, files as artifacts, and

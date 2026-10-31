@@ -30,7 +30,7 @@ import {
   type Task, type Message,
   type Part, type StreamResponse,
   type TaskStatusUpdateEvent, type TaskArtifactUpdateEvent,
-  type SendMessageRequest, type GetTaskRequest, type ListTasksRequest,
+  type SendMessageRequest, type GetTaskRequest, type ListTasksRequest, type TaskPushNotificationConfig,
   type ListTasksResponse, type CancelTaskRequest, type SubscribeToTaskRequest,
   type JsonRpcRequest, type JsonRpcResponse,
   TaskState, Role, TERMINAL_STATES,
@@ -813,9 +813,11 @@ async function publishContextRun(
   entry: Extract<ContextEntry, { kind: "opened" }>,
   text: string,
   auth: A2AAuthContext,
+  beforePublish?: () => Promise<void>,
 ): Promise<void> {
   const { target, spec } = entry.internal as ContextOpened;
   try {
+    if (beforePublish) await beforePublish();
     // The turns the context already has, so a follow-up in it is a conversation
     // and not a fresh start. Memory and the user's profile come with it, as for
     // a turn sent from the web client. The last message is this prompt, which
@@ -829,6 +831,9 @@ async function publishContextRun(
       "DELETE FROM claw_session_events WHERE event_id = $1 AND session_id = $2 AND event = 'UserMessage'",
       [spec.messageId, target.taskId],
     ).catch(() => { /* the session row is the one that matters */ });
+    // Push configurations written for the task that never ran (the table exists only with push on).
+    await db.query("DELETE FROM claw_a2a_push_configs WHERE task_id = $1", [entry.taskId])
+      .catch(() => { /* no table, nothing to remove */ });
     throw err;
   }
 }
@@ -1686,10 +1691,13 @@ async function dispatchContextTasks(
       await v2.subscribeToTask(p as unknown as SubscribeToTaskRequest, id, reply, callerId);
       return null;
     case A2A_METHODS.CreateTaskPushNotificationConfig:
+      return v2.createPushConfig(p as unknown as TaskPushNotificationConfig, id, callerId);
     case A2A_METHODS.GetTaskPushNotificationConfig:
+      return v2.getPushConfig(p, id, callerId);
     case A2A_METHODS.ListTaskPushNotificationConfigs:
+      return v2.listPushConfigs(p, id, callerId);
     case A2A_METHODS.DeleteTaskPushNotificationConfig:
-      return makePushNotificationNotSupportedError(id);
+      return v2.deletePushConfig(p, id, callerId);
     case A2A_METHODS.GetExtendedAgentCard:
       return makeUnsupportedOperationError(id, "Extended agent card is not supported");
     default:
