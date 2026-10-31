@@ -9,7 +9,7 @@ import { parseArgs } from "node:util";
 import { fileAudit } from "./audit.js";
 import { ChildRegistry, isAlive, processStart } from "./children.js";
 import { ClawClient, HttpError, RevokedError, TransportError } from "./claw-client.js";
-import { ConfigError, SAMPLE_CONFIG, loadConfig, type ConnectorConfig } from "./config.js";
+import { ConfigError, SAMPLE_AGENTS, loadConfig, sampleApprovals, sampleConfig, type Approval, type ConnectorConfig } from "./config.js";
 import {
   CredentialsError, DEFAULT_CLIENT_ID, GrantRevokedError, loadCredentials, providerFor, saveCredentials, type Credentials,
 } from "./credentials.js";
@@ -39,7 +39,10 @@ const HELP = `claw-connector ${VERSION}: connect the coding agents on this machi
 
 Usage: claw-connector <command> [options]
 
-  init                     write a sample agents.toml
+  init [--approval ask|never | --approval AGENT=ask|never ...]
+                           write a sample agents.toml. Agents ask before every write and command by default;
+                           "--approval never" (or "--approval claude=never") lets phone sessions run like your
+                           terminal, with no per-step approval. Agents are: ${SAMPLE_AGENTS.join(", ")}.
   login                    sign in (device flow); --server URL --identity-url URL [--name HOST]
                            development only: --key <api key>  (or CLAW_CONNECTOR_KEY)
   run                      connect and serve (Ctrl-C or SIGTERM stops it and every agent it started)
@@ -69,7 +72,7 @@ export async function main(argv: string[], ctx: Ctx): Promise<number> {
     switch (cmd) {
       case undefined: case "help": case "--help": case "-h": ctx.out(HELP); return cmd ? EXIT.ok : EXIT.usage;
       case "--version": case "-v": case "version": ctx.out(VERSION); return EXIT.ok;
-      case "init": return await cmdInit(ctx);
+      case "init": return await cmdInit(rest, ctx);
       case "login": return await cmdLogin(rest, ctx);
       case "run": return await cmdRun(rest, ctx);
       case "status": return cmdStatus(rest, ctx);
@@ -88,17 +91,46 @@ export async function main(argv: string[], ctx: Ctx): Promise<number> {
 
 // --- init ------------------------------------------------------------------------------
 
-async function cmdInit(ctx: Ctx): Promise<number> {
+/** `--approval never`, `--approval ask`, or `--approval claude=never`, any number of them; a later one wins. */
+function parseApproval(values: string[]): Partial<Record<string, Approval>> | string {
+  const out: Partial<Record<string, Approval>> = {};
+  for (const v of values) {
+    const eq = v.indexOf("=");
+    const who = eq < 0 ? null : v.slice(0, eq);
+    const how = eq < 0 ? v : v.slice(eq + 1);
+    if (how !== "ask" && how !== "never") return `--approval takes ask or never (or AGENT=ask|never), not ${JSON.stringify(v)}`;
+    const targets = who === null ? [...SAMPLE_AGENTS] : [who];
+    for (const t of targets) {
+      if (!(SAMPLE_AGENTS as readonly string[]).includes(t)) return `--approval: no sample agent ${JSON.stringify(t)} (agents are: ${SAMPLE_AGENTS.join(", ")})`;
+      out[t] = how;
+    }
+  }
+  return out;
+}
+
+async function cmdInit(args: string[], ctx: Ctx): Promise<number> {
+  const { values } = parseArgs({ args, strict: true, options: { approval: { type: "string", multiple: true } } });
+  const approval = parseApproval(values.approval ?? []);
+  if (typeof approval === "string") { ctx.err(approval); return EXIT.usage; }
   const file = configFile(ctx.dirs);
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   try {
     // "wx": create it only if it is not there, in one step: no check that could be raced.
-    fs.writeFileSync(file, SAMPLE_CONFIG, { mode: 0o600, flag: "wx" });
+    fs.writeFileSync(file, sampleConfig(approval), { mode: 0o600, flag: "wx" });
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === "EEXIST") { ctx.out(`${file} already exists; left alone`); return EXIT.ok; }
+    if ((e as NodeJS.ErrnoException).code === "EEXIST") {
+      ctx.out(`${file} already exists; left alone${values.approval?.length ? ` (to change an agent's approval, set approval = "ask" or "never" in its [[agents]] table)` : ""}`);
+      return EXIT.ok;
+    }
     throw e;
   }
   ctx.out(`wrote ${file}: edit the roots (the directories an agent may work in), then run: claw-connector login`);
+  // Say what the file just written does, not what was asked: an agent whose block is commented out is not on.
+  const { unattended, parked } = sampleApprovals(approval);
+  ctx.out(unattended.length
+    ? `no per-step approval for: ${unattended.join(", ")}. Those agents write files and run commands without asking; the phone shows such a session as unattended. To go back, set approval = "ask" on the agent.`
+    : `every agent in this file asks before it writes a file or runs a command. To let phone sessions run like your terminal instead: claw-connector init --approval never (on a new file), or set approval = "never" on an agent.`);
+  if (parked.length) ctx.out(`${parked.join(", ")}: not enabled in this file (the block is commented out), so approval = "never" does nothing there until you uncomment the block.`);
   return EXIT.ok;
 }
 
@@ -176,7 +208,7 @@ async function cmdRun(_args: string[], ctx: Ctx): Promise<number> {
   const audit = fileAudit(auditFile(ctx.dirs));
   const connector = new Connector({ config: cfg, dirs: ctx.dirs, client, server, audit, log, version: VERSION, timing: ctx.timing });
   ctx.onConnector?.(connector);
-  ctx.out(`connecting ${cfg.agents.map((a) => a.id).join(", ")} to ${server} as "${cfg.name}"`);
+  ctx.out(`connecting ${cfg.agents.map((a) => (a.unattended ? `${a.id} (no per-step approval)` : a.id)).join(", ")} to ${server} as "${cfg.name}"`);
   try {
     const result = await connector.run();
     if (result === "revoked") { ctx.err("this connector was revoked: every agent was stopped. Run login again to connect it anew."); return EXIT.revoked; }
@@ -195,8 +227,9 @@ function cmdStatus(args: string[], ctx: Ctx): number {
   let credsProblem: string | null = null;
   try { creds = loadCredentials(credentialsFile(ctx.dirs)); } catch (e) { credsProblem = errMessage(e); }
   let agents: string[] = [];
+  let unattended: string[] = [];
   let configProblem: string | null = null;
-  try { agents = loadCfg(ctx).agents.map((a) => a.id); } catch (e) { configProblem = errMessage(e); }
+  try { const cfg = loadCfg(ctx); agents = cfg.agents.map((a) => a.id); unattended = cfg.agents.filter((a) => a.unattended).map((a) => a.id); } catch (e) { configProblem = errMessage(e); }
   let connectorId: string | null = null;
   try { const raw: unknown = JSON.parse(fs.readFileSync(identityFile(ctx.dirs), "utf8")); if (isObject(raw) && typeof raw.connector_id === "string") connectorId = raw.connector_id; } catch { /* not registered yet */ }
   const reg = new ChildRegistry(childrenFile(ctx.dirs));
@@ -207,13 +240,15 @@ function cmdStatus(args: string[], ctx: Ctx): number {
     signed_in: creds ? { kind: creds.kind, server: creds.server, device_name: creds.device_name ?? null } : null,
     connector_id: connectorId,
     agents,
+    /** Agents whose sessions start without asking before a write or a command. */
+    unattended,
     adapters: reg.list().filter((r) => reg.isOurs(r)).map((r) => ({ pid: r.pid, agent: r.agent_id, session: r.session_id })),
     problems: [credsProblem, configProblem].filter((x): x is string => !!x),
   };
   if (values.json) { ctx.out(JSON.stringify(status, null, 2)); return EXIT.ok; }
   ctx.out(`connector:  ${status.running ? `running (pid ${status.running})` : "not running"}${status.paused ? ", PAUSED" : ""}`);
   ctx.out(`signed in:  ${creds ? `${creds.kind} to ${creds.server}` : "no"}`);
-  ctx.out(`agents:     ${agents.join(", ") || "none configured"}`);
+  ctx.out(`agents:     ${agents.map((a) => (unattended.includes(a) ? `${a} (no per-step approval)` : a)).join(", ") || "none configured"}`);
   ctx.out(`adapters:   ${status.adapters.length ? status.adapters.map((a) => `${a.agent} pid ${a.pid}`).join(", ") : "none running"}`);
   for (const p of status.problems) ctx.out(`problem:    ${p}`);
   return EXIT.ok;

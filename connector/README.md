@@ -25,7 +25,7 @@ Requirements: Node.js 22 or newer, and the agent you want to expose already work
 by `npx` on first use).
 
 ```sh
-npx @primusclaw/connector init          # writes a sample agents.toml
+npx @primusclaw/connector init          # writes a sample agents.toml (add --approval never to run without per-step approval, see below)
 $EDITOR ~/.config/claw-connector/agents.toml   # set roots: the directories an agent may work in
 npx @primusclaw/connector login --server https://claw.example.com/claw-api --identity-url https://identity.example.com
 npx @primusclaw/connector run
@@ -50,6 +50,7 @@ name = "my-laptop"                                # shown to you in Claw; defaul
 id = "claude"
 preset = "claude"                  # claude | codex | cursor, or a custom command (below)
 roots = ["~/work"]                 # required: a session's directory must be inside one of these
+approval = "never"                 # optional, "ask" (the default) or "never": see "Running without per-step approval"
 
 [[agents]]
 id = "codex"
@@ -69,13 +70,58 @@ roots = ["~/work"]
 
 Presets and the adapter versions they pin (override `command` and `args` to move):
 
-| Preset | Command | Mode every session is forced into | Modes a phone may select |
-|---|---|---|---|
-| `claude` | `npx @agentclientprotocol/claude-agent-acp@0.99.0` | `default` | `default`, `plan` |
-| `codex` | `npx @agentclientprotocol/codex-acp@2.3.0` | `read-only` | `read-only` |
-| `cursor` | `agent acp` (the Cursor CLI) | `ask` | `ask`, `plan` |
+| Preset | Command | Mode every session is forced into | Modes a phone may select | With `approval = "never"` |
+|---|---|---|---|---|
+| `claude` | `npx @agentclientprotocol/claude-agent-acp@0.99.0` | `default` | `default`, `plan` | `bypassPermissions` |
+| `codex` | `npx @agentclientprotocol/codex-acp@2.3.0` | `read-only` | `read-only` | `agent-full-access` |
+| `cursor` | `agent acp` (the Cursor CLI) | `ask` | `ask`, `plan` | `agent`, started as `agent --force acp` |
 
 An agent with no `roots` is never offered. A configuration problem is reported at start-up, not skipped.
+
+## Running without per-step approval
+
+By default every agent asks before it writes a file or runs a command, and the phone answers each question. To let a
+phone session run like your own terminal session (Claude `bypassPermissions`, Codex full access, Cursor `agent` with
+`--force`), turn the questions off for that agent:
+
+```sh
+claw-connector init --approval never                  # every sample agent
+claw-connector init --approval claude=never           # only Claude (repeatable: --approval never --approval cursor=ask)
+```
+
+or set `approval = "never"` in an `[[agents]]` table of an existing `agents.toml`. It is per agent, so Claude can run
+unattended while Cursor keeps asking. For that agent the connector then:
+
+- starts every session in the preset's no-approval mode (the table above; for a custom agent, `ask_mode` names it);
+- lets a phone select any mode the adapter offers (without the setting a phone can only select the safe modes);
+- accepts an adapter's warning that it will not ask for permission, which happens when your own Claude settings default to
+  `bypassPermissions`, instead of refusing the session (`mode_not_enforced`). The warning is written to `audit.jsonl`
+  with `accepted: true`. Without the setting that refusal stays, except that `allow_unsafe_modes = true` in the file
+  accepts it too, for every agent that has no `approval` of its own (below);
+- tells the phone: every agent reports `unattended` in its capabilities, and `session_started`, `session_resumed` and
+  `mode_update` carry `unattended`, so a client can always show whether a session asks. `status` and the line `run` prints
+  at start-up name the agents without per-step approval.
+
+**The risk, in one sentence:** an agent without per-step approval acts on whatever it is told, including text it read in
+a file or a web page, with everything your account can do inside its roots (and `--force` or full access reach outside the
+sandbox the adapter would otherwise keep), and nobody is asked first.
+
+**To go back:** set `approval = "ask"` on the agent and restart the connector (`claw-connector stop`, then `run`). The
+policy is read again on start, so a session that was unattended resumes asking. Setting `"ask"` is the way back that
+always works. Deleting the `approval = "never"` line is enough only when the file does not set `allow_unsafe_modes = true`:
+that is the older, coarser form, which lets a phone select unsafe modes for every agent and accepts the warning for all
+of them (but starts sessions in the asking mode), so an agent without an `approval` line of its own still resumes an
+unattended session unattended (the phone shows it). `approval = "ask"` on an agent overrides it for that agent.
+
+**Upgrading.** Two things change for an `agents.toml` that already exists, with no setting needed:
+
+- A file with `allow_unsafe_modes = true` now also accepts an adapter's "will not ask for permission" warning for every
+  agent without its own `approval`. Such a session used to be closed with `mode_not_enforced`; now it opens and is
+  reported `unattended`. Set `approval = "ask"` on an agent to keep refusing it.
+- A preset agent whose `safe_modes` or `ask_mode` names a mode the preset does not know to ask (for example `claude`
+  with `safe_modes = ["default", "plan", "acceptEdits"]`) is now a configuration error, and `claw-connector run` does not
+  start. Remove the mode, or set `approval = "never"` on that agent (or `allow_unsafe_modes = true` in the file, for an
+  agent that does not say `approval = "ask"`).
 
 ## What the connector enforces
 
@@ -87,15 +133,21 @@ All of these run on your machine and fail closed.
 - **Ask mode, read back.** After the adapter creates a session, the connector sets the agent's ask mode and reads the
   mode back from the adapter. Your own agent settings may start an adapter in a mode that never asks (bypass, full
   access); an adapter that does not confirm the ask mode, or that warns it will not invoke its permission callback, is
-  not opened. A mode change the agent makes on its own to a mode outside the safe list is undone at once. The adapter's
+  not opened, unless you set `approval = "never"` for that agent (above) or `allow_unsafe_modes = true` for the file,
+  either of which accepts the warning and records it. A mode
+  change the agent makes on its own to a mode outside the allowed list is undone at once. The adapter's
   `session/resume` can reset the mode, so it is locked again after every resume.
 - **Unsafe modes.** Modes in which the agent does not ask before writing (`acceptEdits`, `bypassPermissions`, Codex write and full-access
-  modes, Cursor `agent`) cannot be selected from a phone. `allow_unsafe_modes = true` in `agents.toml` is the only way, and
-  it is yours alone. Flags that turn a tool's own approvals off (`--force`, `--yolo`, ...) in an agent's `args` are refused
-  unless that is set too.
+  modes, Cursor `agent`) cannot be selected from a phone. `approval = "never"` on an agent, or `allow_unsafe_modes = true`
+  for the whole file, in `agents.toml` is the only way, and it is yours alone. Flags that turn a tool's own approvals off
+  (`--force`, `--yolo`, ...) in an agent's `args` are refused unless one of those is set too. A session recorded in a mode
+  you no longer allow comes back in the ask mode. On a preset agent `safe_modes` can only narrow what the preset
+  knows to ask (naming another mode is a configuration error unless the agent has `approval = "never"` or the file has
+  `allow_unsafe_modes`), and a session in a mode the preset does not know to ask is reported `unattended`.
 - **Cursor.** Measured on `agent acp` 2026.10.22: in `agent` mode a shell command asks (options `allow-once`, `allow-always`,
   `reject-once`) but a file edit is applied without asking, whatever the approval setting. So the preset starts in `ask`,
-  which cannot write. To use `agent` mode set `allow_unsafe_modes = true` and `ask_mode = "agent"` for that agent. Cursor
+  which cannot write. `approval = "never"` selects `agent` and starts `agent --force acp` (`--force` is a root flag of the
+  Cursor CLI, "force allow commands unless explicitly denied"; it is accepted before or after `acp`). Cursor
   has no `session/resume`; the connector uses `session/load` and marks the replayed history `replay: true`.
 - **Permissions.** Each permission request becomes a card with the options **the adapter offered**, passed through with
   their own ids and kinds (`allow_once`, `allow_always`, `reject_once`). An answer must be one of those ids; any other is refused
@@ -120,7 +172,7 @@ All of these run on your machine and fail closed.
 
 | Command | |
 |---|---|
-| `init` | Write a sample `agents.toml`. |
+| `init [--approval ask\|never \| AGENT=ask\|never]` | Write a sample `agents.toml`; an existing file is never touched. `--approval never` turns per-step approval off (see above). |
 | `login` | Device sign-in. `--key <api key>` (or `CLAW_CONNECTOR_KEY`) is for development only. After a revocation, run it again: it connects this machine as a new connector. |
 | `run` | Connect and serve. Exit code 3 means the connector was revoked. |
 | `status [--json]` | Running or not, paused, signed in, agents, adapter processes. |
