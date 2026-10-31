@@ -92,6 +92,13 @@ export interface HitlOptions {
    * never labels a metric.
    */
   autoApprovalRule?: (tool: string, input: Record<string, unknown>) => string | null;
+  /**
+   * Hold only what the two hooks above name; leave every other call to run as it did before there was
+   * a controller at all, whatever HITL_ENABLED says. For a deployment whose only reason to have a
+   * controller is one held call (an a2a_call approval): HITL_ENABLED=true used to do nothing there, and
+   * a controller that appeared for another reason must not start asking about every tool.
+   */
+  onlyHeld?: boolean;
 }
 
 export class HitlController {
@@ -149,7 +156,7 @@ export class HitlController {
     const entry = held && label === null ? this.opts.autoApprovalRule?.(tool, input ?? {}) : null;
     const rule = typeof entry === "string" && entry !== "" ? entry : null;
     const ask = rule === null && this.dispatcher !== null
-      && (must || (HITL_ENABLED && !this.autoAllowSet.has(tool) && !this.alwaysAllow.has(tool)));
+      && (must || (!this.opts.onlyHeld && HITL_ENABLED && !this.autoAllowSet.has(tool) && !this.alwaysAllow.has(tool)));
     return { label, must, rule, ask };
   }
 
