@@ -76,7 +76,7 @@ export class DelegatedKeys {
   private readonly entries = new Map<string, Entry>();
   /** Per subject token (digested, never stored): a refusal that is that token's alone. */
   private readonly tokenRefusals = new Map<string, Entry>();
-  private readonly flights = new Map<string, { token: string; answer: Promise<Answer> }>();
+  private readonly flights = new Map<string, { tokenKey: string; answer: Promise<Answer> }>();
 
   constructor(private readonly now: () => number = Date.now) {}
 
@@ -100,14 +100,14 @@ export class DelegatedKeys {
     const running = this.flights.get(sub);
     if (running) {
       const { outcome, tokenOnly } = await running.answer;
-      if (!tokenOnly || running.token === userToken) return outcome;
+      if (!tokenOnly || running.tokenKey === tokenKey) return outcome;
       // The flight we joined was refused for another token of this person: ours has not been asked about.
       return this.keysOf(sub, userToken, settings, deps);
     }
     const answer = this.ask(sub, tokenKey, userToken, settings, deps).finally(() => {
       if (this.flights.get(sub)?.answer === answer) this.flights.delete(sub);
     });
-    this.flights.set(sub, { token: userToken, answer });
+    this.flights.set(sub, { tokenKey, answer });
     return (await answer).outcome;
   }
 
