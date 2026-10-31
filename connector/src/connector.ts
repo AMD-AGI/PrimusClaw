@@ -170,7 +170,9 @@ export class Connector {
   private descriptors(): RemoteAgentDescriptor[] {
     return this.d.config.agents.map((a) => ({
       agent_id: a.id, kind: a.kind, name: a.name,
-      capabilities: { ask_mode: a.askMode, modes: a.safeModes, roots: a.roots.slice(0, 8), protocol: 1 },
+      // `unattended`: sessions start in a mode that does not ask before a write or a command. `unattended_allowed`:
+      // a phone may switch this agent to such a mode. A client shows the first so nobody is surprised by it.
+      capabilities: { ask_mode: a.askMode, modes: a.safeModes, roots: a.roots.slice(0, 8), protocol: 1, unattended: a.unattended, unattended_allowed: a.allowUnsafeModes },
     }));
   }
 
@@ -439,7 +441,10 @@ export class Connector {
     try {
       const up = await this.startup();
       if (up !== "ok") return up;
-      this.d.audit.record("connector_online", { connector_id: this.cid, agents: this.d.config.agents.map((a) => a.id), paused: this.paused });
+      this.d.audit.record("connector_online", {
+        connector_id: this.cid, agents: this.d.config.agents.map((a) => a.id), paused: this.paused,
+        unattended_agents: this.d.config.agents.filter((a) => a.unattended).map((a) => a.id),
+      });
       await Promise.all([this.sender(), this.heartbeater(), this.streamLoop(), this.pauseWatcher()]);
     } finally {
       await this.manager.killAll(this.revoked ? "revoked" : "stopped").catch(() => undefined);

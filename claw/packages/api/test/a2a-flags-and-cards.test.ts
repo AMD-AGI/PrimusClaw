@@ -8,7 +8,7 @@
  * Coverage:
  *   F1 an identity-provider token's caller must be named by the operator; no other credential is asked
  *   F2 the card options follow the environment, and nothing set is the card it always was
- *   F3 the card under the new model: truthful skill, the identity scheme, v1.0 requirement shape
+ *   F3 the card under the new model: truthful skill, push, the identity scheme, v1.0 requirement shape
  *   F4 the card's validator
  */
 
@@ -40,32 +40,34 @@ describe("F1 who may call with an identity-provider token", () => {
 
 describe("F2 the card options", () => {
   const cases: Array<{ name: string; env: Record<string, string>; want: Record<string, unknown> }> = [
-    { name: "nothing set", env: {}, want: { contextTasks: false } },
-    { name: "the model alone", env: { CLAW_A2A_CONTEXT_TASKS: "1" }, want: { contextTasks: true } },
+    { name: "nothing set", env: {}, want: { contextTasks: false, push: false } },
+    { name: "push alone is not enough", env: { CLAW_A2A_PUSH_ENABLED: "true" }, want: { contextTasks: false, push: false } },
+    { name: "the model alone", env: { CLAW_A2A_CONTEXT_TASKS: "1" }, want: { contextTasks: true, push: false } },
+    { name: "the model and push", env: { CLAW_A2A_CONTEXT_TASKS: "true", CLAW_A2A_PUSH_ENABLED: "yes" }, want: { contextTasks: true, push: true } },
     {
       name: "the identity scheme needs the client, the token path and an issuer",
       env: { CLAW_A2A_CONTEXT_TASKS: "1", IDENTITY_CLIENT_ENABLED: "true", CLAW_IDENTITY_TOKEN_AUTH_ENABLED: "true", IDENTITY_ISSUER_URL: "https://idp.example.com/" },
-      want: { contextTasks: true, oidcUrl: "https://idp.example.com/.well-known/openid-configuration", oidcScope: "claw.api" },
+      want: { contextTasks: true, push: false, oidcUrl: "https://idp.example.com/.well-known/openid-configuration", oidcScope: "claw.api" },
     },
     {
       name: "the scope the token path requires is the one the card names",
       env: { CLAW_A2A_CONTEXT_TASKS: "1", IDENTITY_CLIENT_ENABLED: "true", CLAW_IDENTITY_TOKEN_AUTH_ENABLED: "true", IDENTITY_ISSUER_URL: "https://idp.example.com", CLAW_IDENTITY_TOKEN_SCOPE: " claw.chat " },
-      want: { contextTasks: true, oidcUrl: "https://idp.example.com/.well-known/openid-configuration", oidcScope: "claw.chat" },
+      want: { contextTasks: true, push: false, oidcUrl: "https://idp.example.com/.well-known/openid-configuration", oidcScope: "claw.chat" },
     },
     {
       name: "no issuer, no scheme",
       env: { CLAW_A2A_CONTEXT_TASKS: "1", IDENTITY_CLIENT_ENABLED: "true", CLAW_IDENTITY_TOKEN_AUTH_ENABLED: "true" },
-      want: { contextTasks: true },
+      want: { contextTasks: true, push: false },
     },
     {
       name: "tokens off, no scheme",
       env: { CLAW_A2A_CONTEXT_TASKS: "1", IDENTITY_CLIENT_ENABLED: "true", IDENTITY_ISSUER_URL: "https://idp.example.com" },
-      want: { contextTasks: true },
+      want: { contextTasks: true, push: false },
     },
     {
       name: "the old model never advertises the identity scheme",
       env: { IDENTITY_CLIENT_ENABLED: "true", CLAW_IDENTITY_TOKEN_AUTH_ENABLED: "true", IDENTITY_ISSUER_URL: "https://idp.example.com" },
-      want: { contextTasks: false },
+      want: { contextTasks: false, push: false },
     },
   ];
   for (const c of cases) test(c.name, () => assert.deepEqual(cardOptionsFromEnv(c.env), c.want));
@@ -93,6 +95,11 @@ describe("F3 the card", () => {
     const card = genericAgentCard("", { contextTasks: true, oidcUrl: "https://idp.example.com/.well-known/openid-configuration", oidcScope: "claw.chat" });
     assert.deepEqual(card.securityRequirements?.[0], { schemes: { identity: { list: ["claw.chat"] } } });
     assert.match(String((card.securitySchemes?.identity as { openIdConnectSecurityScheme: { description: string } }).openIdConnectSecurityScheme.description), /scope claw\.chat/);
+  });
+
+  test("push is advertised only when it is on", () => {
+    assert.equal(genericAgentCard("", { contextTasks: true, push: true }).capabilities.pushNotifications, true);
+    assert.equal(pluginAgentCard("", { id: 3, name: "p" }, { contextTasks: true, push: true }).capabilities.pushNotifications, true);
   });
 
   test("the identity scheme is offered beside the bearer one, with its scope", () => {
@@ -123,6 +130,7 @@ describe("F4 the card's validator", () => {
     const a = cardEtag(genericAgentCard("https://a.example.com", { contextTasks: true }));
     assert.equal(a, cardEtag(genericAgentCard("https://a.example.com", { contextTasks: true })));
     assert.notEqual(a, cardEtag(genericAgentCard("https://b.example.com", { contextTasks: true })));
+    assert.notEqual(a, cardEtag(genericAgentCard("https://a.example.com", { contextTasks: true, push: true })));
     assert.match(a, /^"[0-9a-f]{32}"$/);
   });
 

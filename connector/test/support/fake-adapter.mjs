@@ -45,7 +45,7 @@ async function prompt(id, params) {
     const file = path.join(s.cwd, m[1]);
     const toolCallId = "tc-" + nextOut;
     update(params.sessionId, { sessionUpdate: "tool_call", toolCallId, title: `Write ${m[1]}`, kind: "edit", status: "pending", rawInput: { file_path: file, content: m[2] ?? "hello\n" }, locations: [{ path: file }] });
-    // A bypass mode never asks: that is what the connector's mode lock exists to prevent.
+    // A bypass mode never asks: that is what the connector's mode lock exists to prevent (and what an owner opts into).
     let allowed = s.mode === "bypassPermissions";
     if (!allowed) {
       const res = await ask("session/request_permission", {
@@ -100,6 +100,11 @@ async function prompt(id, params) {
   }
   if (text === "todos") {
     send({ method: "cursor/update_todos", params: { toolCallId: "t", todos: [{ id: "1", content: "x", status: "pending" }], merge: false } });
+    return done("end_turn");
+  }
+  // What the Claude SDK says, as a message, when something will keep it from asking.
+  if (text === "warn") {
+    update(params.sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "canUseTool will not be invoked: permissionMode 'bypassPermissions' auto-approves every tool call" } });
     return done("end_turn");
   }
   if (text === "whoami") {

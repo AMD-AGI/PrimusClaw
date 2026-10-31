@@ -189,15 +189,38 @@ export interface AuthenticationInfo {
   credentials?: string;
 }
 
-export interface PushNotificationConfig {
+// v1.0 (a2a.proto): one flat message. The 0.3 nesting, a `pushNotificationConfig`
+// object inside a task-keyed wrapper, is gone.
+export interface TaskPushNotificationConfig {
+  tenant?: string;
+  /** Assigned by the server when the client leaves it out. */
+  id?: string;
+  /** Empty when the configuration rides on a `SendMessage` request. */
+  taskId?: string;
   url: string;
+  /** Echoed to the receiver as `X-A2A-Notification-Token`. */
   token?: string;
   authentication?: AuthenticationInfo;
 }
 
-export interface TaskPushNotificationConfig {
-  taskId?: string;
-  pushNotificationConfig: PushNotificationConfig;
+export interface GetTaskPushNotificationConfigRequest {
+  tenant?: string;
+  taskId: string;
+  id: string;
+}
+
+export type DeleteTaskPushNotificationConfigRequest = GetTaskPushNotificationConfigRequest;
+
+export interface ListTaskPushNotificationConfigsRequest {
+  tenant?: string;
+  taskId: string;
+  pageSize?: number;
+  pageToken?: string;
+}
+
+export interface ListTaskPushNotificationConfigsResponse {
+  configs: TaskPushNotificationConfig[];
+  nextPageToken: string;
 }
 
 export interface SendMessageConfiguration {

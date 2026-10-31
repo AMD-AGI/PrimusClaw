@@ -871,6 +871,8 @@ A2A spec: Aligned with **Google A2A Protocol v0.x subset**, implementing only Ag
 
 Loaded into memory at startup + hot-reloaded (SIGHUP or ConfigMap watch).
 
+> Implemented today: Brain's env `A2A_AGENTS` (a name list or a JSON array with `auth_env` and `allow_local`), loaded at startup only. See `agent-server-design.md`, "Outbound `a2a_call`".
+
 ### 16.7 Team Template Field Extension (A2A Scenario)
 
 After A2A introduction, the only new field **team templates** (`deploy/team-templates/*.yaml`) need is the top-level `a2a_entry` (determines the default Inbound mapping target). Other A2A-related fields (`type`/`peer`/`skill_id`/`auth_env`/`allow_a2a_out`) all belong to **execution templates** (see [execution-template-design.md §4](./execution-template-design.md)); team templates **only reference** execution templates.
