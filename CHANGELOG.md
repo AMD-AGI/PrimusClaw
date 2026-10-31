@@ -118,6 +118,17 @@ record it.
   confirmed is not opened); the adapter's own permission options passed through verbatim, including
   allow-always; credentials masked before upload; a local audit log; a kill switch that stops only the
   process groups it started. See `connector/README.md`.
+- `@primusclaw/connector` on npm: publishing a GitHub Release tagged `connector-vX.Y.Z` runs
+  `.github/workflows/connector-release.yml`, which tests the connector, signs a build-provenance attestation
+  for the tarball, attaches it to the release and publishes it with npm Trusted Publishing (a short-lived OIDC
+  credential and a provenance statement; no stored npm token). The publish waits for a required reviewer
+  of the `npm-publish` environment (who may be the maintainer who cut the release; administrators cannot
+  bypass it), which is what keeps an unreviewed commit from being published, and creating a `connector-v*`
+  tag is limited to repository admins by a tag ruleset. The tag must equal the version in
+  `connector/package.json`. Once a release has been published,
+  `npm install -g @primusclaw/connector` installs the `claw-connector` command (Node.js 22 or newer).
+  The package holds only the bundle, README and LICENSE, and the Connector packaging workflow checks a real
+  tarball on every change (`connector/scripts/check-pack.mjs`), together with the shape of the release workflow.
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
