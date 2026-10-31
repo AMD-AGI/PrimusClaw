@@ -244,11 +244,12 @@ describe("a service an operator allowed answers a held merge for the user its to
   });
 
   test("S8 the classifier: who is a person, who is a service, who is neither", async () => {
-    const { classifyDecisionCaller } = await import("../src/github-review/mcp.js");
+    const { classifyAttendedCaller: classifyDecisionCaller } = await import("../src/github-review/attended.js");
     const service = { delegation: { actorSub: CLAWY, clientId: CLAWY } };
     const rows: Array<[string, string | null, Parameters<typeof classifyDecisionCaller>[1], readonly string[], unknown]> = [
-      ["a browser session", "cookie", {}, [], { ok: true, via: null }],
-      ["a browser session never reads the list, even when its user object carries a delegation", "cookie", service, [], { ok: true, via: null }],
+      // A session cookie is what SaFE's own sign-in hands out, and a key can complete that sign-in (see test/github-review-decision-credential.test.ts).
+      ["a browser session", "cookie", {}, [], { ok: false, error: "interactive_sign_in_required" }],
+      ["a browser session, whatever its user object carries and whatever the list says", "cookie", service, [CLAWY], { ok: false, error: "interactive_sign_in_required" }],
       ["a person's token", "identity_token", { delegation: { clientId: "claw-web" } }, [], { ok: true, via: null }],
       ["a token with no delegation at all", "identity_token", {}, [], { ok: true, via: null }],
       ["an allowed service", "identity_token", service, [CLAWY], { ok: true, via: { clientId: CLAWY, actorSub: CLAWY } }],

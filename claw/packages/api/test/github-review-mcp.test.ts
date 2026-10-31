@@ -34,10 +34,10 @@ async function boot(opts: { enabled?: boolean } = {}): Promise<void> {
     const who = req.headers["x-test-user"];
     if (typeof who === "string") {
       (req as unknown as { user: unknown }).user = { userId: who, userName: who, roles: ["default"], platformKey: "", virtualKey: "" };
-      // How the caller signed in is what the hook records beside the user (auth/request-credential.ts): a browser session unless a test
+      // How the caller signed in is what the hook records beside the user (auth/request-credential.ts): a person's identity-provider token unless a test
       // says otherwise, and `none` for a credential the hook records no method for (a BYOK key, the development bypass).
       const method = req.headers["x-test-method"];
-      if (method !== "none") (req as unknown as { authMethod: string }).authMethod = typeof method === "string" ? method : "cookie";
+      if (method !== "none") (req as unknown as { authMethod: string }).authMethod = typeof method === "string" ? method : "identity_token";
     }
   });
   await registerGithubReviewRoutes(app, { enabled: opts.enabled ?? true, settings: () => e.settings, db: e.db, service: e.service });
@@ -274,7 +274,7 @@ describe("C3 who may answer for the acting user", () => {
   };
   const status = async (id: string) => (await e.sql("SELECT status FROM claw_github_confirmations WHERE confirmation_id = $1", [id]))[0]?.status;
 
-  test("C3 the model cannot answer its own confirmation with the key its sandbox holds: an ak- key, an x-api-key, a query token, a BYOK key (no method) and a connector token are all 403", async () => {
+  test("C3 the model cannot answer its own confirmation with the key its sandbox holds, or with the session cookie that key can sign in to: an ak- key, an x-api-key, a query token, a BYOK key (no method), a connector token and a cookie are all 403", async () => {
     // The session's owner is also the acting user (the self case): the key in the sandbox is that user's own.
     await e.sql("UPDATE claw_sessions SET user_id = 'u-bob', config = $1::jsonb WHERE session_id = 's-1'", [JSON.stringify({ acting_as: "u-bob", acting_as_requester: "Bob B" })]);
     const c = await connect(token({ requesterUserId: "u-bob" }));
@@ -282,7 +282,7 @@ describe("C3 who may answer for the acting user", () => {
     await c.close();
     assert.equal(held.body.status, "confirmation_required");
     const id = held.body.confirmation_id as string;
-    for (const how of ["api_key", "x_api_key", "query_token", "connector_token", "none", "something_new"]) {
+    for (const how of ["api_key", "x_api_key", "query_token", "connector_token", "cookie", "none", "something_new"]) {
       for (const decision of ["allow", "deny", "nonsense"]) {
         const r = await decide(id, decision, how);
         assert.equal(r.status, 403, `${how} ${decision}`);
@@ -292,15 +292,15 @@ describe("C3 who may answer for the acting user", () => {
     assert.equal(await status(id), "pending", "the confirmation is untouched");
     assert.equal(e.gh.writes.length, 0, "nothing was approved");
     assert.equal(e.gh.calls.filter((x) => x.method === "PUT").length, 0, "nothing was merged");
-    // The same person, signed in the way a person signs in, can.
-    const ok = await decide(id, "allow", "cookie");
+    // The same person, signed in at the identity provider, can.
+    const ok = await decide(id, "allow", "identity_token");
     assert.equal(ok.status, 200);
     assert.equal(ok.body.status, "merged");
     assert.equal(e.gh.calls.filter((x) => x.method === "PUT").length, 1);
   });
 
-  test("C4 an identity provider's access token and a browser session both decide; a deny made with either is final", async () => {
-    for (const how of ["cookie", "identity_token"]) {
+  test("C4 an identity provider's access token decides, and a deny made with it is final", async () => {
+    for (const how of ["identity_token"]) {
       await e.sql("DELETE FROM claw_github_confirmations");
       const id = await hold();
       const r = await decide(id, "deny", how);
@@ -315,7 +315,7 @@ describe("C3 who may answer for the acting user", () => {
     assert.deepEqual((await decide(missing, "allow", "api_key")).body, { ok: false, error: "interactive_sign_in_required" });
     const id = await hold();
     assert.deepEqual((await decide(id, "allow", "api_key")).body, { ok: false, error: "interactive_sign_in_required" });
-    assert.equal((await decide(missing, "allow", "cookie")).status, 404);
+    assert.equal((await decide(missing, "allow", "identity_token")).status, 404);
   });
 });
 

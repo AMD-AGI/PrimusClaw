@@ -11,11 +11,11 @@
  *    `/v1/internal/`, which the global authentication hook leaves to the route.
  *  - `GET /v1/github-review/confirmations` and `POST .../:id/decision`: a merge held
  *    for the acting user, and their answer. Ordinary authenticated routes; only the
- *    acting user can decide, and only with an interactive sign-in (see
- *    {@link INTERACTIVE_CREDENTIALS}): the key a session's sandbox holds is not one.
- *    A service an operator has allowed (`CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS`) may
- *    answer for the user whose identity-provider token it holds (see
- *    {@link classifyDecisionCaller}); who stood behind the answer is recorded.
+ *    acting user can decide, and only with a credential a sandbox cannot obtain (see
+ *    attended.ts): neither the key a session's sandbox holds nor a browser session that
+ *    key can sign in to. A service an operator has allowed
+ *    (`CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS`) may answer for the user whose
+ *    identity-provider token it holds; who stood behind the answer is recorded.
  *
  * Nothing is registered unless `CLAW_GITHUB_REVIEW_ENABLED` is on.
  */
@@ -26,16 +26,15 @@ import { IdentityUnavailableError } from "@claw/utils";
 import pino from "pino";
 import { z } from "zod";
 import { identityClient } from "../auth/identity.js";
-import { IDENTITY_TOKEN_METHOD } from "../auth/identity-token.js";
-import type { UserInfo } from "../auth/models.js";
 import { getUser } from "../auth/middleware.js";
 import { getAuthMethod } from "../auth/request-credential.js";
 import { CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
 import { db } from "../infra/db.js";
 import { parseActingAs } from "./acting-as.js";
+import { classifyAttendedCaller } from "./attended.js";
 import { GithubReview, type ReviewActor, type ToolOutcome } from "./service.js";
 import { readGithubReviewSettings, type GithubReviewSettings } from "./settings.js";
-import { listConfirmations, type ConfirmationStatus, type DecidedVia, type Queryable } from "./store.js";
+import { listConfirmations, type ConfirmationStatus, type Queryable } from "./store.js";
 import { verifySessionToolToken } from "./token.js";
 
 const logger = pino({ name: "github-review-mcp" });
@@ -122,48 +121,6 @@ function refuse(reply: FastifyReply, status: number, error: string): FastifyRepl
   return reply.status(status).send({ ok: false, error });
 }
 
-/**
- * How a caller may have been authenticated to decide a held merge: a browser session
- * (`cookie`) or an identity provider's access token (`identity_token`), which a person
- * signs in for.
- *
- * Not an `ak-` key (`api_key`, `x_api_key`, `query_token`) and not a BYOK key (no method is
- * recorded for it, so it is refused as well): the session owner's own key is placed in
- * the session's sandbox as `SAFE_API_KEY` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, so a
- * model that has just been handed a `confirmation_id` could otherwise answer it itself,
- * as the acting user when they are also the session's owner. The gate is on how the
- * request was authenticated, which a process in the sandbox cannot change.
- */
-export const INTERACTIVE_CREDENTIALS: ReadonlySet<string> = new Set(["cookie", IDENTITY_TOKEN_METHOD]);
-
-export type DecisionCaller =
-  | { ok: true; via: DecidedVia | null }
-  | { ok: false; error: "interactive_sign_in_required" | "service_client_not_allowed" };
-
-/**
- * Who is answering a held merge: a person, a service acting for the person, or neither.
- *
- *  - A credential that is not interactive (an `ak-` key, a BYOK key, a connector token, no recorded method) is refused, as it
- *    always was: `interactive_sign_in_required`.
- *  - A browser session, and an identity-provider access token with no actor in it (the grant a person's own sign-in holds), is
- *    the person.
- *  - An identity-provider access token that names an actor (`act`, RFC 8693: what a service gets when it exchanges its own
- *    client credentials for a token that acts as a user it holds a binding for) is a service answering for that user. It is
- *    taken only from a client the operator named in `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS`, compared exactly as signed;
- *    any other service, and every service while the list is empty, is refused: `service_client_not_allowed`. The subject is
- *    still the token's `sub`, which the service cannot choose: the confirmation checks it is the acting user's.
- *
- * Nothing about this lets a service decide for someone it holds no token for, and nothing lets a key a sandbox holds decide.
- */
-export function classifyDecisionCaller(method: string | null, user: Pick<UserInfo, "delegation">, allowedClients: readonly string[]): DecisionCaller {
-  if (method === null || !INTERACTIVE_CREDENTIALS.has(method)) return { ok: false, error: "interactive_sign_in_required" };
-  const actorSub = method === IDENTITY_TOKEN_METHOD ? user.delegation?.actorSub : undefined;
-  if (!actorSub) return { ok: true, via: null };
-  const clientId = user.delegation?.clientId ?? "";
-  if (!clientId || !allowedClients.includes(clientId)) return { ok: false, error: "service_client_not_allowed" };
-  return { ok: true, via: { clientId, actorSub } };
-}
-
 const CONFIRMATION_STATUSES = new Set<string>(["pending", "merging", "merged", "denied", "stale", "expired", "refused"]);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -238,7 +195,7 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
     const user = getUser(req);
     if (!user) return refuse(reply, 401, "authentication required");
     const method = getAuthMethod(req);
-    const caller = classifyDecisionCaller(method, user, settings().decisionClientIds);
+    const caller = classifyAttendedCaller(method, user, settings().decisionClientIds);
     if (!caller.ok) {
       logger.warn({ userId: user.userId, method: method ?? "none", clientId: user.delegation?.clientId?.slice(0, 128) }, `github_review.decision_refused_${caller.error}`);
       return refuse(reply, 403, caller.error);

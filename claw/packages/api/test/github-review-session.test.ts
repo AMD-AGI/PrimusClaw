@@ -6,7 +6,8 @@
  * `POST /v1/sessions` with `config.acting_as`, and the tools that the session's turn
  * is then offered, against the real routes and a real PostgreSQL engine (PGlite).
  *
- *   V  what the create route accepts and refuses, and what it records
+ *   V  what the create route accepts and refuses, and what it records, and who may ask for it: a session that acts as a user is
+ *      the person's say, so the key a sandbox holds (or the cookie that key signs in to) cannot start one
  *   T  the `mcp_servers` entry a turn carries: only for such a session, signed, reserved
  */
 import assert from "node:assert/strict";
@@ -24,7 +25,8 @@ let db: typeof import("../src/infra/db.js").db;
 let published: Record<string, unknown>[] = [];
 let originalConnect: unknown;
 let pristinePorts: Record<string, unknown> = {};
-let appAs: (user: { userId: string; userName: string }) => Promise<FastifyInstance>;
+type Caller = { userId: string; userName: string; delegation?: { actorSub?: string; clientId?: string } };
+let appAs: (user: Caller, method?: string | null) => Promise<FastifyInstance>;
 let verify: typeof import("../src/github-review/token.js").verifySessionToolToken;
 let tools: typeof import("../src/github-review/session-tools.js");
 let applyAppMcpToTask: typeof import("../src/sessions/app-mcp.js").applyAppMcpToTask;
@@ -42,10 +44,13 @@ before(async () => {
   const { closedDoorbellBarrier } = await import("./doorbell-barrier-stub.js");
   const Fastify = (await import("fastify")).default;
   const { registerSessionRoutes } = await import("../src/routes/sessions.js");
-  appAs = async (user) => {
+  // `method` is what the global authentication hook records beside the user (auth/request-credential.ts): an identity-provider token
+  // unless a test says otherwise, and null for a credential the hook records no method for (a BYOK key, the development bypass).
+  appAs = async (user, method = "identity_token") => {
     const app = Fastify();
     app.addHook("preHandler", async (req) => {
       (req as unknown as { user: unknown }).user = { ...user, roles: ["default"], platformKey: "pk", virtualKey: "vk" };
+      if (method !== null) (req as unknown as { authMethod: string }).authMethod = method;
     });
     await registerSessionRoutes(app);
     await app.ready();
@@ -77,8 +82,8 @@ after(async () => {
   await h?.close();
 });
 
-const create = async (user: { userId: string; userName: string }, config: Record<string, unknown>, extra: Record<string, unknown> = {}) => {
-  const app = await appAs(user);
+const create = async (user: Caller, config: Record<string, unknown>, extra: Record<string, unknown> = {}, method: string | null = "identity_token") => {
+  const app = await appAs(user, method);
   try {
     const res = await app.inject({ method: "POST", url: "/v1/sessions", payload: { name: "review", config, ...extra } });
     return { status: res.statusCode, body: res.json() as any };
@@ -120,6 +125,46 @@ test("V4 a session without acting_as is exactly what it was: no extra key is sto
   assert.deepEqual((await stored(r.body.data.session_id)).config, { notify_on_finish: true });
   const n = await create(ALICE, { acting_as: null });
   assert.deepEqual((await stored(n.body.data.session_id)).config, { acting_as: null });
+});
+
+const count = async (): Promise<number> => Number((await h.sql("SELECT count(*)::int AS n FROM claw_sessions"))[0]?.n);
+
+test("V5 the key a sandbox holds, the cookie that key signs in to and every other credential that is not an identity-provider token cannot create a session that acts as a user: 403, no row, no turn", async () => {
+  // A model injected in any ordinary session of Alice holds her key and could otherwise start a session that acts as her (or as a colleague who
+  // allowed her) and review and merge with the account on its own.
+  for (const method of ["api_key", "x_api_key", "query_token", "connector_token", "cookie", "something_new", null]) {
+    for (const actingAs of ["u-alice", "u-bob"]) {
+      const r = await create(ALICE, { acting_as: actingAs }, { message: { content: "review it" } }, method);
+      assert.equal(r.status, 403, `${method} acting as ${actingAs}`);
+      assert.equal(r.body.error, "interactive_sign_in_required", `${method} acting as ${actingAs}`);
+    }
+  }
+  assert.equal(await count(), 0);
+  assert.equal(published.length, 0);
+});
+
+test("V6 an identity-provider token creates one: a person's own, and a service's only from a client the operator named", async () => {
+  const saved = process.env.CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS;
+  try {
+    process.env.CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS = "clawy-worker";
+    assert.equal((await create(ALICE, { acting_as: "u-alice" })).status, 200, "a person's own token, acting as themselves");
+    assert.equal((await create({ ...ALICE, delegation: { clientId: "claw-web" } }, { acting_as: "u-bob" })).status, 200, "a token that names a client and no actor is the person's");
+    const service = { ...ALICE, delegation: { actorSub: "clawy-worker", clientId: "clawy-worker" } };
+    assert.equal((await create(service, { acting_as: "u-bob" })).status, 200, "an allowed service acting for Alice");
+    const other = await create({ ...ALICE, delegation: { actorSub: "other-service", clientId: "other-service" } }, { acting_as: "u-bob" });
+    assert.equal(other.status, 403);
+    assert.equal(other.body.error, "service_client_not_allowed");
+    process.env.CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS = "";
+    assert.equal((await create(service, { acting_as: "u-bob" })).body.error, "service_client_not_allowed", "every service is refused while the list is empty");
+    assert.equal(await count(), 3);
+  } finally {
+    if (saved === undefined) delete process.env.CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS; else process.env.CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS = saved;
+  }
+});
+
+test("V7 a key is still the ordinary way to use the API: a session without acting_as is created with it, and with no method at all", async () => {
+  for (const method of ["api_key", "x_api_key", "cookie", null]) assert.equal((await create(ALICE, { notify_on_finish: true }, {}, method)).status, 200, String(method));
+  assert.equal(await count(), 4);
 });
 
 test("T1 the first turn of such a session carries the review tools: a signed token for this session, its owner and the acting user, and no GitHub credential", async () => {
