@@ -3,6 +3,7 @@
 
 /** Turns the commands Claw sends into session operations. The command set is closed: anything else is dropped and audited. */
 import type { AgentConfig } from "./config.js";
+import { SESSION_REF_RE } from "./attach.js";
 import { Session, type SessionEnv } from "./session.js";
 import { checkCwd } from "./roots.js";
 import { REMOTE_COMMAND_TYPES, isRemoteCommandType } from "./protocol.js";
@@ -19,6 +20,8 @@ const MAX_ACTIVE_SESSIONS = 10;
 
 export class SessionManager {
   readonly sessions = new Map<string, Session>();
+  /** Takeovers that have passed the "already attached" check and have not yet registered their session (`agent:ref`). */
+  private readonly attaching = new Set<string>();
   private readonly chains = new Map<string, Promise<void>>();
 
   constructor(private readonly env: SessionEnv) {}
@@ -108,6 +111,14 @@ export class SessionManager {
       this.env.emit(sid, "session_closed", { reason: "unknown_agent" });
       return;
     }
+    const ref = cmd.resume_ref;
+    if (agent.attach) return this.attachNew(cmd, agent);
+    if (ref !== undefined && ref !== null) {
+      // Starting a new session would answer a request to continue an old one with a different conversation.
+      this.env.audit.record("session_refused", { session_id: sid, agent_id: agent.id, reason: "resume_not_supported" });
+      this.env.emit(sid, "session_closed", { reason: "resume_not_supported" });
+      return;
+    }
     const verdict = checkCwd(typeof cmd.cwd === "string" ? cmd.cwd : "", agent.roots);
     if (!verdict.ok) {
       // The directory is outside everything this agent may touch: no process is started.
@@ -124,6 +135,53 @@ export class SessionManager {
     const s = new Session(sid, agent, verdict.real, this.env);
     this.sessions.set(sid, s);
     await s.create(typeof cmd.mode === "string" ? cmd.mode : null);
+  }
+
+  /**
+   * `session.new` for an agent that takes over an existing session: `resume_ref` names it, and it must be one the
+   * adapter lists under this agent's roots. The directory it is resumed in is the one the session itself records;
+   * the one Claw sent has to be the same. Whether another process has it open is checked when it is launched.
+   */
+  private async attachNew(cmd: Command, agent: AgentConfig): Promise<void> {
+    const sid = cmd.session_id;
+    const refuse = (reason: string, extra: Record<string, unknown> = {}) => {
+      this.env.audit.record("session_refused", { session_id: sid, agent_id: agent.id, reason, ...extra });
+      this.env.emit(sid, "session_closed", { reason });
+    };
+    const ref = typeof cmd.resume_ref === "string" ? cmd.resume_ref : "";
+    if (!ref) return refuse("resume_ref_required");
+    if (!SESSION_REF_RE.test(ref)) return refuse("invalid_resume_ref");
+    const support = this.env.attach.get(agent.id);
+    if (!support) return refuse("attach_unavailable");
+    const want = ref.toLowerCase();
+    // Commands of different Claw sessions run side by side, so the check and the claim on the conversation are one
+    // synchronous step: two requests for the same conversation must not both get past it while one is still being
+    // looked up, or two adapters would be writing to one transcript.
+    const claim = `${agent.id}:${want}`;
+    if (this.attaching.has(claim) || [...this.sessions.values()].some((s) => !s.closed && s.agent.id === agent.id && s.acpId?.toLowerCase() === want)) return refuse("already_attached");
+    if ([...this.sessions.values()].filter((s) => !s.closed).length + this.attaching.size >= MAX_ACTIVE_SESSIONS) return refuse("too_many_sessions");
+    this.attaching.add(claim);
+    try {
+      const found = await support.resolve(want);
+      if (!found.ok) return refuse(found.reason);
+      const asked = checkCwd(typeof cmd.cwd === "string" ? cmd.cwd : "", agent.roots);
+      if (!asked.ok) return refuse(asked.reason, { cwd: String(cmd.cwd).slice(0, 300) });
+      if (asked.real !== found.item.cwd) return refuse("cwd_mismatch", { cwd: String(cmd.cwd).slice(0, 300) });
+      // Registered before anything is awaited, so from here the session itself is the claim.
+      const s = new Session(sid, agent, found.item.cwd, this.env, found.item.ref);
+      this.sessions.set(sid, s);
+      this.attaching.delete(claim);
+      await s.attach(typeof cmd.mode === "string" ? cmd.mode : null, found.item.title);
+    } finally {
+      this.attaching.delete(claim);
+    }
+  }
+
+  /** The ids of the existing sessions this connector holds open, by agent. */
+  attachedRefs(agentId: string): Set<string> {
+    const out = new Set<string>();
+    for (const s of this.sessions.values()) if (!s.closed && s.agent.id === agentId && s.acpId) out.add(s.acpId.toLowerCase());
+    return out;
   }
 
   /** A session this process knows, or one it made earlier (before a restart) and can bring back. */

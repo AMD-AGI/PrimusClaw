@@ -5,6 +5,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test, { describe } from "node:test";
 import { main, EXIT, type Ctx } from "../src/commands.js";
@@ -19,7 +20,8 @@ import { ADAPTER, tmpdir } from "./support/harness.js";
 function ctx(home: string, extra: Partial<Ctx> = {}) {
   const out: string[] = [];
   const err: string[] = [];
-  const c: Ctx = { dirs: resolveDirs({ CLAW_CONNECTOR_HOME: home } as NodeJS.ProcessEnv), env: {}, out: (l) => out.push(l), err: (l) => err.push(l), hostname: "box", ...extra };
+  // `init` and `hooks` write into a Claude config directory: the test's own, never the real home's.
+  const c: Ctx = { dirs: resolveDirs({ CLAW_CONNECTOR_HOME: home } as NodeJS.ProcessEnv), env: { CLAUDE_CONFIG_DIR: path.join(home, "claude-config") }, out: (l) => out.push(l), err: (l) => err.push(l), hostname: "box", ...extra };
   return { c, out, err, text: () => out.join("\n"), errText: () => err.join("\n") };
 }
 
@@ -79,20 +81,20 @@ describe("claw-connector commands", () => {
   const loadSample = (home: string) => {
     const root = tmpdir("w-");
     const text = fs.readFileSync(path.join(home, "config", "agents.toml"), "utf8")
-      .split("\n").map((l) => l.replace(/^# (\[\[agents\]\]|id = "[a-z]+"|preset = "[a-z]+"|roots = \[.*\]|approval = "(?:ask|never)")$/, "$1")).join("\n").replaceAll("~/work", root);
+      .split("\n").map((l) => l.replace(/^# (\[\[agents\]\]|id = "[a-z-]+"|preset = "[a-z-]+"|roots = \[.*\]|approval = "(?:ask|never)")$/, "$1")).join("\n").replaceAll("~/work", root);
     return parseConfig(text, { hostname: "box" }).agents.map((a) => [a.id, a.askMode, a.unattended, a.args.join(" ")]);
   };
-  const ASK = [["claude", "default", false, PRESETS.claude!.args.join(" ")], ["codex", "read-only", false, PRESETS.codex!.args.join(" ")], ["cursor", "ask", false, "acp"]];
-  const NEVER = [["claude", "bypassPermissions", true, PRESETS.claude!.args.join(" ")], ["codex", "agent-full-access", true, PRESETS.codex!.args.join(" ")], ["cursor", "agent", true, "--force acp"]];
+  const ASK = [["claude", "default", false, PRESETS.claude!.args.join(" ")], ["claude-attach", "default", false, PRESETS.claude!.args.join(" ")], ["codex", "read-only", false, PRESETS.codex!.args.join(" ")], ["cursor", "ask", false, "acp"]];
+  const NEVER = [["claude", "bypassPermissions", true, PRESETS.claude!.args.join(" ")], ["claude-attach", "bypassPermissions", true, PRESETS.claude!.args.join(" ")], ["codex", "agent-full-access", true, PRESETS.codex!.args.join(" ")], ["cursor", "agent", true, "--force acp"]];
   // [name, args, what each agent block is worth once enabled, the agents that are on in the written file and run unattended,
   //  the agents the command says are not on in it (null: it says nothing about any), what it says]
   const initRows: Array<[string, string[], unknown[][], string[], string | null, RegExp]> = [
     ["by default every agent asks, and the output says how to turn that off", [], ASK, [], null, /every agent in this file asks[^]*--approval never/],
     ["--approval ask is the same as nothing", ["--approval", "ask"], ASK, [], null, /every agent in this file asks/],
-    ["--approval never: the agents that are on run without per-step approval, with their own mode and flags; the others carry it for when they are enabled", ["--approval", "never"], NEVER, ["claude"], "codex, cursor", /no per-step approval for: claude\.[^]*unattended[^]*set approval = "ask"/],
-    ["--approval claude=never: only that agent", ["--approval", "claude=never"], [NEVER[0]!, ASK[1]!, ASK[2]!], ["claude"], null, /no per-step approval for: claude\./],
-    ["a later setting wins: never for all, but cursor asks", ["--approval", "never", "--approval", "cursor=ask"], [NEVER[0]!, NEVER[1]!, ASK[2]!], ["claude"], "codex", /for: claude\./],
-    ["--approval codex=never: codex is not on in the file, so nothing runs unattended and the command says so", ["--approval", "codex=never"], [ASK[0]!, NEVER[1]!, ASK[2]!], [], "codex", /every agent in this file asks/],
+    ["--approval never: the agents that are on run without per-step approval, with their own mode and flags; the others carry it for when they are enabled", ["--approval", "never"], NEVER, ["claude"], "claude-attach, codex, cursor", /no per-step approval for: claude\.[^]*unattended[^]*set approval = "ask"/],
+    ["--approval claude=never: only that agent", ["--approval", "claude=never"], [NEVER[0]!, ASK[1]!, ASK[2]!, ASK[3]!], ["claude"], null, /no per-step approval for: claude\./],
+    ["a later setting wins: never for all, but cursor asks", ["--approval", "never", "--approval", "cursor=ask"], [NEVER[0]!, NEVER[1]!, NEVER[2]!, ASK[3]!], ["claude"], "claude-attach, codex", /for: claude\./],
+    ["--approval codex=never: codex is not on in the file, so nothing runs unattended and the command says so", ["--approval", "codex=never"], [ASK[0]!, ASK[1]!, NEVER[2]!, ASK[3]!], [], "codex", /every agent in this file asks/],
   ];
   for (const [name, args, expected, unattended, parked, say] of initRows) {
     test(`init ${name}`, async () => {
@@ -538,5 +540,139 @@ describe("claw-connector commands", () => {
       assert.equal(id.refreshTokens.has("r9"), false);
       assert.equal(fs.existsSync(credentialsFile(a.c.dirs)), false);
     } finally { await id.close(); }
+  });
+});
+
+// --- the Claude Code session hooks -------------------------------------------------------------------
+
+describe("init and hooks: the Claude Code session hooks", () => {
+  const stand = (): string => { const f = path.join(tmpdir("cc-hookbin-"), "terminal-hook.js"); fs.writeFileSync(f, "// stand-in\n"); return f; };
+  const claudeDir = (home: string) => { const d = path.join(home, "claude-config"); fs.mkdirSync(d, { recursive: true }); return d; };
+  const settings = (dir: string) => path.join(dir, "settings.json");
+  const hookCommands = (dir: string): string[] => {
+    const doc = JSON.parse(fs.readFileSync(settings(dir), "utf8"));
+    return Object.values<any>(doc.hooks ?? {}).flatMap((groups) => groups.flatMap((g: any) => g.hooks.map((h: any) => h.command as string)));
+  };
+
+  test("init installs the hooks into the Claude config directory, once, and says so; run again it changes nothing", async () => {
+    const home = tmpdir();
+    const dir = claudeDir(home);
+    fs.writeFileSync(settings(dir), JSON.stringify({ model: "opus", hooks: { Stop: [{ hooks: [{ type: "command", command: "mine.sh" }] }] } }, null, 2));
+    const script = stand();
+    const a = ctx(home, { hookScript: script });
+    assert.equal(await main(["init"], a.c), EXIT.ok);
+    assert.match(a.text(), /installed the Claude Code session hooks in .*settings\.json/);
+    const cmds = hookCommands(dir);
+    assert.equal(cmds.filter((c) => c.includes("terminal-hook.js") && c.includes(`--dir '${dir}'`)).length, 2);
+    assert.ok(cmds.includes("mine.sh"), "the user's own hook is still there");
+    assert.equal(JSON.parse(fs.readFileSync(settings(dir), "utf8")).model, "opus");
+    const bytes = fs.readFileSync(settings(dir), "utf8");
+    const b = ctx(home, { hookScript: script });
+    assert.equal(await main(["init"], b.c), EXIT.ok);
+    assert.match(b.text(), /already exists/);
+    assert.match(b.text(), /session hooks are already in/);
+    assert.equal(fs.readFileSync(settings(dir), "utf8"), bytes);
+  });
+
+  test("init --no-hooks leaves Claude Code alone; with no Claude directory it says how to do it later and creates nothing", async () => {
+    const home = tmpdir();
+    const dir = claudeDir(home);
+    const a = ctx(home, { hookScript: stand() });
+    assert.equal(await main(["init", "--no-hooks"], a.c), EXIT.ok);
+    assert.equal(fs.existsSync(settings(dir)), false);
+    const other = tmpdir();
+    const b = ctx(other, { hookScript: stand() });
+    assert.equal(await main(["init"], b.c), EXIT.ok);
+    assert.match(b.text(), /no Claude Code directory at .*claude hooks install|no Claude Code directory at .*hooks install/s);
+    assert.equal(fs.existsSync(path.join(other, "claude-config")), false);
+  });
+
+  test("a settings file that cannot be merged into does not fail init: the sample is written, the problem is reported, the file is untouched", async () => {
+    const home = tmpdir();
+    const dir = claudeDir(home);
+    fs.writeFileSync(settings(dir), "{ not json");
+    const a = ctx(home, { hookScript: stand() });
+    assert.equal(await main(["init"], a.c), EXIT.ok);
+    assert.ok(fs.existsSync(path.join(home, "config", "agents.toml")));
+    assert.match(a.errText(), /hooks: .*not valid JSON/);
+    assert.equal(fs.readFileSync(settings(dir), "utf8"), "{ not json");
+  });
+
+  test("a source checkout that was not built has no hook script: init says so and still succeeds", async () => {
+    const home = tmpdir();
+    claudeDir(home);
+    const a = ctx(home);
+    assert.equal(await main(["init"], a.c), EXIT.ok);
+    assert.match(a.errText(), /terminal-hook\.js does not exist/);
+  });
+
+  test("hooks install, status and uninstall, for the directory named", async () => {
+    const home = tmpdir();
+    const dir = path.join(home, "elsewhere");
+    const script = stand();
+    const i = ctx(home, { hookScript: script });
+    assert.equal(await main(["hooks", "install", "--config-dir", dir], i.c), EXIT.ok);
+    assert.ok(fs.existsSync(settings(dir)), "an explicit directory is created if it is not there");
+    const st = ctx(home);
+    assert.equal(await main(["hooks", "status", "--config-dir", dir, "--json"], st.c), EXIT.ok);
+    const [row] = JSON.parse(st.text());
+    assert.deepEqual([row.dir, row.installed, row.healthy, row.events], [dir, true, true, ["SessionStart", "SessionEnd"]]);
+    const plain = ctx(home);
+    await main(["hooks", "status", "--config-dir", dir], plain.c);
+    assert.match(plain.text(), /installed$/);
+    const u = ctx(home);
+    assert.equal(await main(["hooks", "uninstall", "--config-dir", dir], u.c), EXIT.ok);
+    assert.match(u.text(), /removed the Claude Code session hooks/);
+    assert.deepEqual(hookCommands(dir), []);
+    const again = ctx(home);
+    await main(["hooks", "uninstall", "--config-dir", dir], again.c);
+    assert.match(again.text(), /no session hooks of ours/);
+    assert.equal(await main(["hooks", "install", "--config-dir", dir], ctx(home, { hookScript: script }).c), EXIT.ok);
+    fs.rmSync(script);
+    const broken = ctx(home);
+    await main(["hooks", "status", "--config-dir", dir], broken.c);
+    assert.match(broken.text(), /installed, but broken; .*does not exist/);
+  });
+
+  test("a hooks command with no or an unknown subcommand is a usage error; a settings file it cannot read is a failure and stays untouched", async () => {
+    const home = tmpdir();
+    for (const args of [["hooks"], ["hooks", "frobnicate"]]) {
+      const u = ctx(home);
+      assert.equal(await main(args, u.c), EXIT.usage, args.join(" "));
+      assert.match(u.errText(), /usage: claw-connector hooks/);
+    }
+    const dir = claudeDir(home);
+    fs.writeFileSync(settings(dir), "[]");
+    const f = ctx(home, { hookScript: stand() });
+    assert.equal(await main(["hooks", "install", "--config-dir", dir], f.c), EXIT.failure);
+    assert.match(f.errText(), /not a JSON object/);
+    assert.equal(fs.readFileSync(settings(dir), "utf8"), "[]");
+  });
+
+  test("without --config-dir the directories are those of the claude-attach agents; failing that, the default one", async () => {
+    const home = tmpdir();
+    const a = path.join(home, "cfg-a");
+    const b = path.join(home, "cfg-b");
+    fs.mkdirSync(a);
+    fs.mkdirSync(b);
+    const dflt = claudeDir(home);
+    const agent = (id: string, dir: string | null) => `[[agents]]\nid = "${id}"\npreset = "claude-attach"\nroots = [${JSON.stringify(os.tmpdir())}]\n${dir ? `[agents.env]\nCLAUDE_CONFIG_DIR = ${JSON.stringify(dir)}\n` : ""}`;
+    fs.mkdirSync(path.join(home, "config"), { recursive: true });
+    fs.writeFileSync(path.join(home, "config", "agents.toml"), [agent("one", a), agent("two", b), agent("three", a)].join("\n"));
+    const i = ctx(home, { hookScript: stand() });
+    assert.equal(await main(["hooks", "install"], i.c), EXIT.ok);
+    assert.equal(i.out.length, 2, "two different directories, each once");
+    assert.equal(hookCommands(a).length, 2);
+    assert.equal(hookCommands(b).length, 2);
+    assert.equal(fs.existsSync(settings(dflt)), false, "the default directory is not touched when the agents name theirs");
+    // an attach agent that names no directory uses CLAUDE_CONFIG_DIR of the environment, else the home's .claude
+    fs.writeFileSync(path.join(home, "config", "agents.toml"), agent("solo", null));
+    const j = ctx(home, { hookScript: stand() });
+    assert.equal(await main(["hooks", "install"], j.c), EXIT.ok);
+    assert.equal(hookCommands(dflt).length, 2);
+    // a directory that does not exist, not named explicitly, is not invented
+    const k = ctx(tmpdir(), { hookScript: stand() });
+    assert.equal(await main(["hooks", "install"], k.c), EXIT.failure);
+    assert.match(k.errText(), /no Claude Code directory .*--config-dir/);
   });
 });

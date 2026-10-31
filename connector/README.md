@@ -73,8 +73,12 @@ Presets and the adapter versions they pin (override `command` and `args` to move
 | Preset | Command | Mode every session is forced into | Modes a phone may select | With `approval = "never"` |
 |---|---|---|---|---|
 | `claude` | `npx @agentclientprotocol/claude-agent-acp@0.99.0` | `default` | `default`, `plan` | `bypassPermissions` |
+| `claude-attach` | `npx @agentclientprotocol/claude-agent-acp@0.99.0` | `default` | `default`, `plan` | `bypassPermissions` |
 | `codex` | `npx @agentclientprotocol/codex-acp@2.3.0` | `read-only` | `read-only` | `agent-full-access` |
 | `cursor` | `agent acp` (the Cursor CLI) | `ask` | `ask`, `plan` | `agent`, started as `agent --force acp` |
+
+`claude-attach` does not start new conversations: it takes over Claude Code conversations that already exist on this
+machine (see [Taking over an existing conversation](#taking-over-an-existing-conversation)).
 
 An agent with no `roots` is never offered. A configuration problem is reported at start-up, not skipped.
 
@@ -160,6 +164,8 @@ All of these run on your machine and fail closed.
   audit log and is shown on the phone. The default is no rules.
 - **Credentials go over HTTPS only.** The Claw URL and the identity URL must be `https://` (`http://` is accepted only for
   localhost, for a development server); `login` and `run` refuse anything else before a token is saved or sent.
+- **Existing conversations.** Taken over only when no other process holds them open, only from inside the roots, only in the
+  directory the conversation itself records, and in the ask mode (see above).
 - **No remote shell.** Only these commands are carried out: `session.new`, `prompt`, `cancel`, `set_mode`, `resume`,
   `close`, `decision`. Anything else is dropped and audited. Claw never sends a command line, an environment variable or a
   key.
@@ -168,11 +174,87 @@ All of these run on your machine and fail closed.
   masked and long tool output is cut to 8 KB. Adapter stderr never leaves; it goes to `logs/` under the state directory.
   A prompt's text is not written to the local audit log, only its hash and length.
 
+## Taking over an existing conversation
+
+An agent made from the `claude-attach` preset lists the Claude Code conversations on this machine whose directory is inside
+its `roots`, and lets you continue one from your phone. It reports them to Claw as an opaque list (`capabilities.resumable`:
+reference, title, directory, last activity, and whether anything holds it open), newest first, at most a dozen, so that a
+chat client can offer a choice; `session.new` then names the chosen one (`resume_ref`). Claw and the chat client know no
+product: the agent's `kind` is the label `attach`.
+
+```toml
+[[agents]]
+id = "claude-attach"
+preset = "claude-attach"
+roots = ["~/work"]
+# attach_cli = "claude"        # the command asked which sessions are open (default: claude, from PATH)
+# [agents.env]
+# CLAUDE_CONFIG_DIR = "/home/me/.claude"   # where the conversations live, if not the default
+```
+
+A taken-over conversation asks before every write and command like any other session. `approval = "never"` in this table
+works as it does for `claude`: the conversation is resumed in `bypassPermissions` and the phone shows it as unattended
+(see [Running without per-step approval](#running-without-per-step-approval)).
+
+What you do: **exit the conversation in the terminal first** (`/exit`), then pick it on the phone. When you are done,
+close it from the phone and continue in the terminal with `claude --resume <id>`: the turns you took on the phone are in
+its history, because both sides read and append to the same transcript.
+
+Why the terminal must be closed: Claude Code does not stop a second process from resuming a conversation that is still
+open, and two writers fork the transcript; the next resume follows only one branch, so a turn is lost without any error
+(measured). The connector therefore refuses to take over a conversation that another process holds open, and it checks again
+before it starts the agent again after a pause and before every prompt. A prompt that meets a terminal is rejected, not sent
+(the session stays, and the prompt can be sent again once the terminal is closed), and the connector's agent for the
+conversation is discarded: what the terminal wrote is not in its memory, so the next prompt starts a fresh one that reads
+the transcript. The same happens when the transcript is no longer the size the connector left it, which is how a terminal
+that came and went between two prompts is noticed.
+
+While the connector's own agent is working on the conversation (starting, or running a turn) the size cannot say whether
+someone else wrote, because the agent's own writes grow it too. So during that time the registry is read every second and
+once more, in full, when the work ends. A terminal that held the conversation open for about a second or more during a turn
+is noticed even if it has exited by the next prompt: that prompt goes to a fresh agent, after the full check above. One seen
+while the agent is starting refuses the takeover (`session_live`) and stops the agent. A terminal that opens and closes the
+conversation between two reads, which is shorter than anything that can take a turn, is not seen.
+
+The first thing asked is the terminal itself. `claw-connector init` (or `claw-connector hooks install`) adds two Claude Code
+hooks, `SessionStart` and `SessionEnd`, to the user-level `settings.json` of the Claude config directory. Each runs a tiny
+program that keeps one row per terminal session, `<config dir>/claw-connector-terminals/<pid>.json`: the session id and the
+process that holds it, with that process's start time. Claude Code runs the same hooks for sessions started by an ACP adapter
+(this connector's own included) and by `claude -p`; they are told apart by `CLAUDE_CODE_ENTRYPOINT` in the hook's environment
+(`cli` in a terminal, `sdk-cli` otherwise), so only terminal sessions are recorded. `SessionEnd` runs on `/exit`, Ctrl-C and
+Ctrl-D twice, a closed terminal (SIGHUP) and a plain `kill`; it does not run after `kill -9` or a power cut, so a row counts
+only while the process it names is still the same process (same start time), and the next hook sweeps dead rows away. The
+hooks are merged into `settings.json` without touching anything else in it (a file that is not valid JSON is left alone), take
+under two seconds at most (`SessionStart` holds up the first turn, so they have timeouts of 2 s and 1 s), print nothing and
+always exit 0, so they cannot get in the way of a session. `claw-connector hooks uninstall` takes exactly those entries out
+again (they carry the mark `--managed-by claw-connector`; a hook of your own is never taken for one of them). The entries name this installation's node and program by absolute path, so install from a durable one (`npm i -g
+@primusclaw/connector`) rather than a throwaway `npx` cache; `hooks status` and `run` say when a path is gone, and installing
+again repairs it. A conversation that was opened before the hooks were installed is not in the rows, and neither is one under a
+different config directory or when Claude Code is configured not to run user hooks: the rows can only add a refusal, and
+everything below stays in force as the fallback (`claw-connector hooks status` says where they stand).
+
+Who holds the conversation open is then asked of Claude Code itself
+(`claude agents --json`, which lists the live processes of this machine and ignores the files a killed one leaves behind)
+and of the registry Claude Code keeps in `$CLAUDE_CONFIG_DIR/sessions/`, whose rows are each checked against the process they
+name. The command does not report a row from another host or container that shares the directory (it asks whether the pid is
+alive here), and such a row cannot be checked: it counts as open whatever the command says. If the command is missing or
+fails, the registry alone is the answer; if neither can be read, the answer is "cannot tell" and the takeover is refused.
+A transcript written within the last 10 seconds is refused too (a terminal that has only just exited may still be writing). The reasons Claw is told are
+`session_live`, `recently_written` and `twin_check_failed`; the agent that this connector itself started for the conversation
+is not mistaken for a twin.
+
+The ask mode still applies: a conversation keeps the mode it was left in, often one that never asks (`bypassPermissions`),
+and the adapter says so while it sets the session up. That warning describes the mode that is about to be replaced, so it is
+set aside until the ask mode (`default`) is locked and read back from the adapter; a warning that comes after that, or a mode
+that is not confirmed, closes the session. The phone can select only the safe modes, as for every agent. Closing the
+session stops the agent process; it never deletes the conversation.
+
 ## Commands
 
 | Command | |
 |---|---|
-| `init [--approval ask\|never \| AGENT=ask\|never]` | Write a sample `agents.toml`; an existing file is never touched. `--approval never` turns per-step approval off (see above). |
+| `init [--approval ask\|never \| AGENT=ask\|never] [--no-hooks]` | Write a sample `agents.toml`; an existing file is never touched. `--approval never` turns per-step approval off (see above). Also installs the Claude Code session hooks (`--no-hooks` skips that). |
+| `hooks install\|uninstall\|status` | The `SessionStart`/`SessionEnd` hooks alone; `--config-dir DIR` names the Claude config directory (default: those of the `claude-attach` agents, else `$CLAUDE_CONFIG_DIR` or `~/.claude`). |
 | `login` | Device sign-in. `--key <api key>` (or `CLAW_CONNECTOR_KEY`) is for development only. After a revocation, run it again: it connects this machine as a new connector. |
 | `run` | Connect and serve. Exit code 3 means the connector was revoked. |
 | `status [--json]` | Running or not, paused, signed in, agents, adapter processes. |

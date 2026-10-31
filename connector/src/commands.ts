@@ -5,6 +5,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { fileAudit } from "./audit.js";
 import { ChildRegistry, isAlive, processStart } from "./children.js";
@@ -14,6 +15,7 @@ import {
   CredentialsError, DEFAULT_CLIENT_ID, GrantRevokedError, loadCredentials, providerFor, saveCredentials, type Credentials,
 } from "./credentials.js";
 import { DeviceFlowError, deviceLogin } from "./deviceflow.js";
+import { HooksError, hooksStatus, installHooks, settingsFile, uninstallHooks } from "./hooks.js";
 import { Connector, type ConnectorTiming } from "./connector.js";
 import {
   auditFile, childrenFile, configFile, credentialsFile, identityFile, pauseFile, pidFile, type Dirs,
@@ -31,6 +33,9 @@ export interface Ctx {
   timing?: Partial<ConnectorTiming>;
   /** Called with the connector once it exists, so a signal handler can stop it. */
   onConnector?: (c: Connector) => void;
+  /** The file the terminal hooks run (default: `terminal-hook.js` next to this program) and the node that runs it. */
+  hookScript?: string;
+  node?: string;
 }
 
 export const EXIT = { ok: 0, failure: 1, usage: 2, revoked: 3 } as const;
@@ -39,10 +44,15 @@ const HELP = `claw-connector ${VERSION}: connect the coding agents on this machi
 
 Usage: claw-connector <command> [options]
 
-  init [--approval ask|never | --approval AGENT=ask|never ...]
-                           write a sample agents.toml. Agents ask before every write and command by default;
+  init [--approval ask|never | --approval AGENT=ask|never ...] [--no-hooks]
+                           write a sample agents.toml, and install the Claude Code session hooks (see "hooks"; --no-hooks
+                           skips that). Agents ask before every write and command by default;
                            "--approval never" (or "--approval claude=never") lets phone sessions run like your
                            terminal, with no per-step approval. Agents are: ${SAMPLE_AGENTS.join(", ")}.
+  hooks install|uninstall|status [--config-dir DIR]
+                           the SessionStart/SessionEnd hooks that tell this connector which Claude Code sessions are open
+                           in a terminal; merged into DIR/settings.json (default: the claude-attach agents' config
+                           directories, else $CLAUDE_CONFIG_DIR or ~/.claude); only its own entries are ever changed
   login                    sign in (device flow); --server URL --identity-url URL [--name HOST]
                            development only: --key <api key>  (or CLAW_CONNECTOR_KEY)
   run                      connect and serve (Ctrl-C or SIGTERM stops it and every agent it started)
@@ -73,6 +83,7 @@ export async function main(argv: string[], ctx: Ctx): Promise<number> {
       case undefined: case "help": case "--help": case "-h": ctx.out(HELP); return cmd ? EXIT.ok : EXIT.usage;
       case "--version": case "-v": case "version": ctx.out(VERSION); return EXIT.ok;
       case "init": return await cmdInit(rest, ctx);
+      case "hooks": return cmdHooks(rest, ctx);
       case "login": return await cmdLogin(rest, ctx);
       case "run": return await cmdRun(rest, ctx);
       case "status": return cmdStatus(rest, ctx);
@@ -109,7 +120,7 @@ function parseApproval(values: string[]): Partial<Record<string, Approval>> | st
 }
 
 async function cmdInit(args: string[], ctx: Ctx): Promise<number> {
-  const { values } = parseArgs({ args, strict: true, options: { approval: { type: "string", multiple: true } } });
+  const { values } = parseArgs({ args, strict: true, options: { approval: { type: "string", multiple: true }, "no-hooks": { type: "boolean" } } });
   const approval = parseApproval(values.approval ?? []);
   if (typeof approval === "string") { ctx.err(approval); return EXIT.usage; }
   const file = configFile(ctx.dirs);
@@ -117,21 +128,83 @@ async function cmdInit(args: string[], ctx: Ctx): Promise<number> {
   try {
     // "wx": create it only if it is not there, in one step: no check that could be raced.
     fs.writeFileSync(file, sampleConfig(approval), { mode: 0o600, flag: "wx" });
+    ctx.out(`wrote ${file}: edit the roots (the directories an agent may work in), then run: claw-connector login`);
+    // Say what the file just written does, not what was asked: an agent whose block is commented out is not on.
+    const { unattended, parked } = sampleApprovals(approval);
+    ctx.out(unattended.length
+      ? `no per-step approval for: ${unattended.join(", ")}. Those agents write files and run commands without asking; the phone shows such a session as unattended. To go back, set approval = "ask" on the agent.`
+      : `every agent in this file asks before it writes a file or runs a command. To let phone sessions run like your terminal instead: claw-connector init --approval never (on a new file), or set approval = "never" on an agent.`);
+    if (parked.length) ctx.out(`${parked.join(", ")}: not enabled in this file (the block is commented out), so approval = "never" does nothing there until you uncomment the block.`);
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === "EEXIST") {
-      ctx.out(`${file} already exists; left alone${values.approval?.length ? ` (to change an agent's approval, set approval = "ask" or "never" in its [[agents]] table)` : ""}`);
-      return EXIT.ok;
-    }
-    throw e;
+    if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+    ctx.out(`${file} already exists; left alone${values.approval?.length ? ` (to change an agent's approval, set approval = "ask" or "never" in its [[agents]] table)` : ""}`);
   }
-  ctx.out(`wrote ${file}: edit the roots (the directories an agent may work in), then run: claw-connector login`);
-  // Say what the file just written does, not what was asked: an agent whose block is commented out is not on.
-  const { unattended, parked } = sampleApprovals(approval);
-  ctx.out(unattended.length
-    ? `no per-step approval for: ${unattended.join(", ")}. Those agents write files and run commands without asking; the phone shows such a session as unattended. To go back, set approval = "ask" on the agent.`
-    : `every agent in this file asks before it writes a file or runs a command. To let phone sessions run like your terminal instead: claw-connector init --approval never (on a new file), or set approval = "never" on an agent.`);
-  if (parked.length) ctx.out(`${parked.join(", ")}: not enabled in this file (the block is commented out), so approval = "never" does nothing there until you uncomment the block.`);
+  // The hooks are a convenience: a Claude Code settings file that cannot be merged into is reported, and init still succeeded.
+  if (!values["no-hooks"]) {
+    const dir = defaultClaudeDir(ctx);
+    if (!fs.existsSync(dir)) ctx.out(`no Claude Code directory at ${dir}; once you use Claude Code, run: claw-connector hooks install`);
+    else installForInit(ctx, dir);
+  }
   return EXIT.ok;
+}
+
+function installForInit(ctx: Ctx, dir: string): void {
+  try { ctx.out(describeInstall(dir, installOne(ctx, dir).changed)); } catch (e) { ctx.err(`hooks: ${errMessage(e)} (everything else is set up; fix it and run: claw-connector hooks install)`); }
+}
+
+// --- hooks -----------------------------------------------------------------------------
+
+const defaultClaudeDir = (ctx: Ctx): string => path.resolve(ctx.env.CLAUDE_CONFIG_DIR?.trim() || path.join(os.homedir(), ".claude"));
+
+/** The Claude config directories the connector looks at: those of its claude-attach agents, else the default one. */
+function claudeDirs(ctx: Ctx, flag: string | undefined): string[] {
+  if (flag !== undefined) return [path.resolve(flag)];
+  let dirs: string[] = [];
+  try {
+    dirs = loadCfg(ctx).agents.filter((a) => a.attach).map((a) => path.resolve(a.env.CLAUDE_CONFIG_DIR ?? ctx.env.CLAUDE_CONFIG_DIR?.trim() ?? path.join(os.homedir(), ".claude")));
+  } catch { /* no usable agents.toml yet: the default directory */ }
+  return dirs.length ? [...new Set(dirs)] : [defaultClaudeDir(ctx)];
+}
+
+function hookScript(ctx: Ctx): string {
+  const script = ctx.hookScript ?? fileURLToPath(new URL("./terminal-hook.js", import.meta.url));
+  if (!fs.existsSync(script)) throw new HooksError(`${script} does not exist (a source checkout needs "npm run build" first)`);
+  return script;
+}
+
+function installOne(ctx: Ctx, dir: string) {
+  return installHooks(dir, ctx.node ?? process.execPath, hookScript(ctx));
+}
+
+const describeInstall = (dir: string, changed: boolean): string =>
+  changed ? `installed the Claude Code session hooks in ${settingsFile(dir)}` : `the Claude Code session hooks are already in ${settingsFile(dir)}`;
+
+function cmdHooks(args: string[], ctx: Ctx): number {
+  const [sub, ...rest] = args;
+  if (sub !== "install" && sub !== "uninstall" && sub !== "status") { ctx.err("usage: claw-connector hooks install|uninstall|status [--config-dir DIR]"); return EXIT.usage; }
+  const { values } = parseArgs({ args: rest, strict: true, options: { "config-dir": { type: "string" }, json: { type: "boolean" } } });
+  const dirs = claudeDirs(ctx, values["config-dir"]);
+  let code: number = EXIT.ok;
+  const report: Array<Record<string, unknown>> = [];
+  for (const dir of dirs) {
+    try {
+      if (sub === "install") {
+        if (values["config-dir"] === undefined && !fs.existsSync(dir)) { ctx.err(`no Claude Code directory at ${dir}; pass --config-dir to name one`); code = EXIT.failure; continue; }
+        ctx.out(describeInstall(dir, installOne(ctx, dir).changed));
+      } else if (sub === "uninstall") {
+        ctx.out(uninstallHooks(dir).changed ? `removed the Claude Code session hooks from ${settingsFile(dir)}` : `no session hooks of ours in ${settingsFile(dir)}`);
+      } else {
+        const st = hooksStatus(dir);
+        report.push({ dir, ...st });
+        if (!values.json) ctx.out(`${dir}: ${st.installed ? (st.healthy ? "installed" : "installed, but broken") : st.events.length ? `partly installed (${st.events.join(", ")})` : "not installed"}${st.problem ? `; ${st.problem}` : ""}`);
+      }
+    } catch (e) {
+      ctx.err(e instanceof HooksError ? e.message : `error: ${errMessage(e)}`);
+      code = EXIT.failure;
+    }
+  }
+  if (sub === "status" && values.json) ctx.out(JSON.stringify(report, null, 2));
+  return code;
 }
 
 // --- login -----------------------------------------------------------------------------

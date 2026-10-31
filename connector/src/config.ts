@@ -47,6 +47,11 @@ export interface AgentConfig {
   /** Sessions start in a mode outside `askingModes`: no per-step approval. Never true without `allowUnsafeModes`. */
   unattended: boolean;
   autoAllow: AutoAllowRule[];
+  /**
+   * Set for an agent that takes over sessions that already exist on this machine instead of starting new ones.
+   * `cli` is the command that lists the processes holding a session open (see attach.ts).
+   */
+  attach: { cli: string } | null;
 }
 
 export interface ConnectorConfig {
@@ -74,6 +79,7 @@ interface Preset {
   safeModes: string[];
   /** What `approval = "never"` turns the preset into: the adapter's mode that never asks, and the flags that go with it. */
   unattended: { askMode: string; args?: string[] };
+  attach?: boolean;
 }
 
 /**
@@ -97,6 +103,13 @@ export const PRESETS: Record<string, Preset> = {
   claude: {
     kind: "claude", name: "Claude Code", command: "npx",
     args: ["-y", "@agentclientprotocol/claude-agent-acp@0.99.0"], askMode: "default", safeModes: ["default", "plan"],
+    unattended: { askMode: "bypassPermissions" },
+  },
+  // Existing Claude Code sessions, taken over from the phone. The kind is the opaque label a chat client picks an icon
+  // from; it says what the entry is for, not which product serves it. Same adapter and same ask mode as `claude`.
+  "claude-attach": {
+    kind: "attach", name: "Claude Code (existing sessions)", command: "npx",
+    args: ["-y", "@agentclientprotocol/claude-agent-acp@0.99.0"], askMode: "default", safeModes: ["default", "plan"], attach: true,
     unattended: { askMode: "bypassPermissions" },
   },
   codex: {
@@ -212,10 +225,18 @@ export function parseConfig(text: string, defaults: { hostname?: string } = {}):
       if (bad) problems.push(`${label}: ${bad} turns the tool's own approvals off; remove it or set approval = "never" (or allow_unsafe_modes = true)`);
     }
     const own = parseAutoAllow(raw.auto_allow, `${label}.auto_allow`, problems);
+    let attach: AgentConfig["attach"] = null;
+    if (preset?.attach) {
+      const cli = raw.attach_cli === undefined ? "claude" : raw.attach_cli;
+      if (typeof cli !== "string" || !cli.trim()) problems.push(`${label}.attach_cli must be a command name or path`);
+      else attach = { cli: cli.trim() };
+    } else if (raw.attach_cli !== undefined) {
+      problems.push(`${label}: attach_cli only applies to an agent made from the claude-attach preset`);
+    }
     agents.push({
       id, kind, name: typeof raw.name === "string" && raw.name.trim() ? raw.name.trim().slice(0, 128) : (preset?.name ?? id),
       command, args, env, roots, askMode, safeModes, askingModes: [...asking], allowUnsafeModes: allowUnsafe, unattended: !asking.has(askMode),
-      autoAllow: [...globalAllow, ...own],
+      autoAllow: [...globalAllow, ...own], attach,
     });
   });
 
@@ -256,7 +277,7 @@ export function loadConfig(file: string, defaults: { hostname?: string } = {}): 
 export type Approval = "ask" | "never";
 
 /** The presets `init` can write, in the order they appear in the sample. */
-export const SAMPLE_AGENTS = ["claude", "codex", "cursor"] as const;
+export const SAMPLE_AGENTS = ["claude", "claude-attach", "codex", "cursor"] as const;
 
 /** The ones the sample switches on. The others are written commented out, and an owner enables one by uncommenting it. */
 export const SAMPLE_ACTIVE: readonly string[] = ["claude"];
@@ -271,6 +292,11 @@ export function sampleApprovals(approval: Partial<Record<string, Approval>>): { 
   return { unattended: never.filter((id) => SAMPLE_ACTIVE.includes(id)), parked: never.filter((id) => !SAMPLE_ACTIVE.includes(id)) };
 }
 
+/** A line of explanation written above a sample block, for a preset whose purpose is not its name. */
+const SAMPLE_NOTES: Record<string, string> = {
+  "claude-attach": "# Take over a Claude Code conversation that already exists on this machine (exit it in the terminal first).",
+};
+
 const NEVER_NOTE = `# No per-step approval: this agent runs like it does in your terminal. A phone session writes files and runs
 # commands without asking, and the phone shows it as unattended. To go back to asking, set it to "ask".`;
 
@@ -280,7 +306,7 @@ const NEVER_NOTE = `# No per-step approval: this agent runs like it does in your
  */
 export function sampleConfig(approval: Partial<Record<string, Approval>> = {}): string {
   const agent = (id: string): string => {
-    const lines = [`[[agents]]`, `id = "${id}"`, `preset = "${id}"`, `roots = ["~/work"]`];
+    const lines = [...(SAMPLE_NOTES[id] ? [SAMPLE_NOTES[id]!] : []), `[[agents]]`, `id = "${id}"`, `preset = "${id}"`, `roots = ["~/work"]`];
     if (approval[id] === "never") lines.push(...NEVER_NOTE.split("\n"), `approval = "never"`);
     return lines.map((l) => (SAMPLE_ACTIVE.includes(id) || l.startsWith("#") ? l : `# ${l}`)).join("\n");
   };

@@ -16,6 +16,7 @@ import { silentLogger } from "../../src/util.js";
 import { FakeClaw } from "./fake-claw.js";
 
 export const ADAPTER = path.join(path.dirname(fileURLToPath(import.meta.url)), "fake-adapter.mjs");
+export const FAKE_CLAUDE = path.join(path.dirname(fileURLToPath(import.meta.url)), "fake-claude.mjs");
 
 export const tmpdir = (p = "cc-"): string => fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), p)));
 
@@ -24,7 +25,20 @@ export const FAST: Partial<ConnectorTiming> = {
   idleMs: 60_000, permissionTtlMs: 60_000, modeConfirmMs: 250,
 };
 
+/** An agent made from the claude-attach preset, with a stand-in `claude` command and a Claude config directory of its own. */
+export interface AttachOptions {
+  /** What the adapter's `session/list` answers. */
+  sessions: Array<{ sessionId: string; cwd: string; title: string; updatedAt: string }>;
+  /** What `claude agents --json` answers; change it later with `attach.setLive`. */
+  live?: Array<Record<string, unknown>>;
+  /** ok | garbage | fail | hang | notlist (see fake-claude.mjs). */
+  cliMode?: string;
+  /** Use this command instead of the stand-in. */
+  cli?: string;
+}
+
 export interface HarnessOptions {
+  attach?: AttachOptions;
   env?: Record<string, string>;
   /** Extra TOML for the agent table, and for the top of the file. */
   agentToml?: string;
@@ -54,6 +68,10 @@ export class Harness {
   work!: string;
   running: Promise<RunResult> | null = null;
   fakeLog = "";
+  /** For an attach agent: its Claude config directory, and the files the stand-in command reads and writes. */
+  attachDir = "";
+  liveFile = "";
+  cliLog = "";
 
   static async create(o: HarnessOptions = {}): Promise<Harness> {
     const h = new Harness();
@@ -62,18 +80,34 @@ export class Harness {
     h.work = o.work ?? tmpdir("cc-work-");
     h.fakeLog = path.join(h.dirs.state, "fake-adapter.log");
     fs.mkdirSync(h.dirs.state, { recursive: true });
-    const env = { FAKE_LOG: h.fakeLog, ...(o.env ?? {}) };
+    let attachToml = "";
+    const attachEnv: Record<string, string> = {};
+    if (o.attach) {
+      h.attachDir = tmpdir("cc-claude-");
+      h.liveFile = path.join(h.attachDir, "live.json");
+      h.cliLog = path.join(h.attachDir, "cli.log");
+      fs.writeFileSync(h.liveFile, JSON.stringify(o.attach.live ?? []));
+      const wrapper = path.join(h.attachDir, "claude");
+      fs.writeFileSync(wrapper, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_CLAUDE)} "$@"\n`, { mode: 0o755 });
+      attachToml = `preset = "claude-attach"\nattach_cli = ${JSON.stringify(o.attach.cli ?? wrapper)}`;
+      Object.assign(attachEnv, {
+        CLAUDE_CONFIG_DIR: h.attachDir, FAKE_CLAUDE_LIVE: h.liveFile, FAKE_CLAUDE_LOG: h.cliLog, FAKE_CLAUDE_MODE: o.attach.cliMode ?? "ok",
+        FAKE_SESSIONS: JSON.stringify(o.attach.sessions),
+      });
+    }
+    const env = { FAKE_LOG: h.fakeLog, ...attachEnv, ...(o.env ?? {}) };
     const envToml = Object.entries(env).map(([k, v]) => `${k} = ${JSON.stringify(v)}`).join("\n");
     const agent = (id: string, askMode: string, extra: string) => `
 [[agents]]
 id = ${JSON.stringify(id)}
-kind = "example"
+${o.attach && id === "fake" ? "" : 'kind = "example"'}
 name = "Fake agent"
 ${id === "fake" && o.preset ? `preset = ${JSON.stringify(o.preset)}\n` : ""}command = ${JSON.stringify(process.execPath)}
 args = [${JSON.stringify(ADAPTER)}]
 ask_mode = ${JSON.stringify(askMode)}
 safe_modes = ${JSON.stringify(id === "fake" && o.safeModes ? o.safeModes : ["default", "plan"])}
 roots = [${JSON.stringify(h.work)}]
+${id === "fake" ? attachToml : ""}
 ${extra}
 [agents.env]
 ${envToml}
@@ -120,6 +154,18 @@ ${o.secondToml === undefined ? "" : agent("fake2", "default", o.secondToml)}`, {
     const sid = this.claw.newSession(agent, cwd, mode);
     await this.claw.until("session_started or session_closed", () => this.claw.eventsOf(sid).some((e) => e.type === "session_started" || e.type === "session_closed"));
     return sid;
+  }
+
+  /** `session.new` naming an existing session, resolved when `session_started` or `session_closed` arrives. */
+  async attach(ref: string | undefined, cwd: string = this.work, extra: Record<string, unknown> = {}): Promise<string> {
+    await this.online();
+    const sid = this.claw.newSession("fake", cwd, undefined, ref === undefined ? extra : { resume_ref: ref, ...extra });
+    await this.claw.until("session_started or session_closed", () => this.claw.eventsOf(sid).some((e) => e.type === "session_started" || e.type === "session_closed"));
+    return sid;
+  }
+
+  setLive(entries: Array<Record<string, unknown>>): void {
+    fs.writeFileSync(this.liveFile, JSON.stringify(entries));
   }
 
   prompt(sid: string, text: string, extra: Record<string, unknown> = {}): number {

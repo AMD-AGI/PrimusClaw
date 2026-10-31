@@ -133,6 +133,18 @@ test("registration, heartbeat and session bodies", () => {
   for (const bad of [{ ...base, cwd: "" }, { ...base, cwd: "x".repeat(4097) }, { ...base, agent_id: "a b" }, { ...base, connector_id: "x" }, { ...base, mode: "a b" }]) {
     assert.equal(parseSessionNew(bad).ok, false, JSON.stringify(bad).slice(0, 60));
   }
+  // `resume_ref` names an existing session; Claw keeps its shape sane and never reads it.
+  const refs: Array<[unknown, string | null | "invalid_resume_ref"]> = [
+    [undefined, null], [null, null], ["0f8fad5b-d9cb-469f-a165-70867728950e", "0f8fad5b-d9cb-469f-a165-70867728950e"],
+    ["any opaque value", "any opaque value"], ["x".repeat(128), "x".repeat(128)],
+    ["", "invalid_resume_ref"], ["x".repeat(129), "invalid_resume_ref"], ["a\nb", "invalid_resume_ref"], ["a\u0000b", "invalid_resume_ref"],
+    [5, "invalid_resume_ref"], [{}, "invalid_resume_ref"], [["a"], "invalid_resume_ref"], [true, "invalid_resume_ref"],
+  ];
+  for (const [resume_ref, want] of refs) {
+    const r = parseSessionNew({ ...base, resume_ref });
+    if (want === "invalid_resume_ref") assert.deepEqual(r, { ok: false, error: want }, JSON.stringify(resume_ref)?.slice(0, 40));
+    else assert.deepEqual(r.ok && r.value.resume_ref, want, JSON.stringify(resume_ref)?.slice(0, 40));
+  }
 });
 
 test("a heartbeat's capabilities are carried as the connector wrote them, whatever they say about approval", () => {

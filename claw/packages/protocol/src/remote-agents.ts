@@ -214,6 +214,12 @@ export interface RemoteSessionNew {
   agent_id: string;
   cwd: string;
   mode: string | null;
+  /**
+   * Names a session of that agent that already exists on the machine, to continue it instead of starting a new
+   * one. Claw does not interpret it: the connector reported the value (in an agent's `capabilities`) and is the
+   * only one that knows what it means.
+   */
+  resume_ref: string | null;
 }
 
 export function parseSessionNew(body: unknown): Parsed<RemoteSessionNew> {
@@ -231,7 +237,12 @@ export function parseSessionNew(body: unknown): Parsed<RemoteSessionNew> {
     if (typeof body.mode !== "string" || !LABEL_RE.test(body.mode)) return fail("invalid_mode");
     mode = body.mode;
   }
-  return { ok: true, value: { connector_id: connectorId, agent_id: body.agent_id, cwd: body.cwd, mode } };
+  let resumeRef: string | null = null;
+  if (body.resume_ref !== undefined && body.resume_ref !== null) {
+    if (typeof body.resume_ref !== "string" || !OPAQUE_ID_RE.test(body.resume_ref)) return fail("invalid_resume_ref");
+    resumeRef = body.resume_ref;
+  }
+  return { ok: true, value: { connector_id: connectorId, agent_id: body.agent_id, cwd: body.cwd, mode, resume_ref: resumeRef } };
 }
 
 /**
