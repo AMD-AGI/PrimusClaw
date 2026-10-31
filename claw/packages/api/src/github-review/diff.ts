@@ -76,7 +76,7 @@ export function eachChangedLine(patch: string | undefined | null, visit: (mark: 
   if (!patch) return;
   let inHunk = false;
   let pos = 0;
-  while (pos <= patch.length) {
+  while (pos < patch.length) {
     let end = patch.indexOf("\n", pos);
     if (end < 0) end = patch.length;
     const first = patch[pos];

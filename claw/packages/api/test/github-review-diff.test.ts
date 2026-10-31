@@ -60,5 +60,12 @@ test("eachChangedLine hands over the same lines as addedLines and removedLines, 
   eachChangedLine(patch, (_m, text) => { first.push(text); return first.length < 2; });
   assert.deepEqual(first, ["gone", "here"]);
   eachChangedLine(undefined, () => assert.fail("no patch, no line"));
+  // The end of the patch is the end of the last line, with or without a newline after it, and nothing is read past it.
+  for (const tail of ["", "\n", "\n\n"]) {
+    const lines: string[] = [];
+    eachChangedLine(`@@ -1 +1 @@\n-a\n+b${tail}`, (m, text) => { lines.push(m + text); return true; });
+    assert.deepEqual(lines, ["-a", "+b"], JSON.stringify(tail));
+  }
+  eachChangedLine("\n", () => assert.fail("a blank patch has no line"));
   eachChangedLine("+not in a hunk\n-nor this", () => assert.fail("nothing before the first hunk header is content"));
 });
