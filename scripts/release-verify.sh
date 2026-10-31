@@ -70,6 +70,9 @@ bash "$repo_root/scripts/release-tests/identity-client-chart.sh"
 echo "==> A2A public URL chart wiring"
 bash "$repo_root/scripts/release-tests/a2a-public-url-chart.sh"
 
+echo "==> required platform roles chart wiring"
+bash "$repo_root/scripts/release-tests/required-platform-roles-chart.sh"
+
 echo "==> PromQL rollout gates"
 bash "$repo_root/scripts/release-tests/promql-gates.sh"
 

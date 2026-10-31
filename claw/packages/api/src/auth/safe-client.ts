@@ -103,6 +103,15 @@ const NEGATIVE_TTL = 30_000;
 const MAX_CACHE = 1000;
 const VERIFY_PATH = "/api/v1/auth/verify";
 
+/**
+ * The roles SaFE reported. Only an array of strings counts: the field is SaFE's
+ * to add or drop, and anything else (absent, null, a bare string) is no roles
+ * rather than something a role check would take apart character by character.
+ */
+function rolesOf(raw: unknown): string[] {
+  return Array.isArray(raw) ? raw.filter((r): r is string => typeof r === "string") : [];
+}
+
 export function isApiKey(token: string): boolean {
   return token.startsWith(API_KEY_PREFIX);
 }
@@ -144,7 +153,7 @@ export class SafeClient {
       userId,
       userName: (d.name as string) || "",
       ...(email !== undefined ? { email } : {}),
-      roles: (d.roles as string[]) || [],
+      roles: rolesOf(d.roles),
       platformKey: (d.platformKey as string) || (d.platform_key as string) || "",
       virtualKey: (d.virtualKey as string) || (d.virtual_key as string) || "",
     };

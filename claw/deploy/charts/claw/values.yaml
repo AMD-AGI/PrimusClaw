@@ -48,6 +48,16 @@ api:
   extraEnv: []
   extraVolumes: []
   extraVolumeMounts: []
+  # Platform roles, as SaFE reports them, of which a caller must hold at least one
+  # to use Claw at all (CLAW_REQUIRED_PLATFORM_ROLES): the LLM, sandboxes, remote
+  # agents, every authenticated route. Anyone else is refused with a 403
+  # `platform_access_required` ("no access yet - ask an administrator"). The names are
+  # SaFE's, not this chart's. Empty (the default) checks nothing and changes nothing.
+  # Only a credential SaFE verifies (the session cookie, an `ak-` key) brings roles, so
+  # while this is set an identity token, a connector token and a BYOK key are refused too.
+  # SaFE's answer is cached for five minutes, so a role granted or withdrawn takes
+  # that long to apply.
+  requiredPlatformRoles: []
   port: 8200
   # Where a client outside the cluster reaches the API, as CLAW_PUBLIC_URL --
   # "https://claw.example.com/claw-api". A2A agent cards advertise it, and the
