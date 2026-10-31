@@ -11,6 +11,7 @@
  *   D2  a refusal is kept 30 seconds; a failure to answer is not kept
  *   D3  concurrent lookups of one person are one exchange and one question
  *   D4  the cache is bounded, and a person's answer is never another's
+ *   D5  a refusal is kept for whom it is about: the client's refusal for the person, a token's for that token alone
  */
 import test, { describe } from "node:test";
 import assert from "node:assert/strict";
@@ -227,6 +228,112 @@ describe("D4 bounded, and per person", () => {
     assert.notDeepEqual(a, b);
     assert.deepEqual(await ask(w, "alice"), a);
     assert.deepEqual(await ask(w, "bob"), b);
+  });
+});
+
+/** A person with two signed-in devices: one token whose grant is gone, and one that is good. */
+describe("D5 a refusal is kept for whom it is about", () => {
+  const STALE = "user-token-of-alice-signed-out-device";
+  const GOOD = "user-token-of-alice-phone";
+  const asAlice = (w: ReturnType<typeof world>, token: string) => w.keys.keysOf("alice", token, SETTINGS, w.deps);
+  /** The provider refuses the signed-out device's token and exchanges any other of Alice's; SaFE knows Alice. */
+  function twoDevices(clock: { t: number }, code = "invalid_grant") {
+    const w = world(clock);
+    w.exchange = async (req) => {
+      if (req.subjectToken === STALE) throw new IdentityExchangeRefusedError(code, 400);
+      return { accessToken: `delegated-for-${req.subjectToken}`, tokenType: "Bearer", expiresAt: clock.t + 60_000 };
+    };
+    w.verify = async () => user("alice");
+    return w;
+  }
+
+  test("a token the provider refuses (its grant is signed out) does not leave the person keyless for their other token", async () => {
+    const w = twoDevices({ t: 1_000_000 });
+    assert.deepEqual(await asAlice(w, STALE), { status: "none", reason: "delegation_refused_invalid_grant" });
+    assert.deepEqual(await asAlice(w, GOOD), { status: "keys", platformKey: "ak-alice", virtualKey: "sk-alice" });
+    assert.deepEqual(w.exchanges.map((e) => e.subjectToken), [STALE, GOOD], "the good token was asked about, not answered by the other's refusal");
+  });
+
+  test("the same holds for every code that is not about the client: invalid_token, invalid_request, and one nobody has heard of", async () => {
+    for (const code of ["invalid_grant", "invalid_token", "invalid_request", "access_denied", "something_new"]) {
+      const w = twoDevices({ t: 1_000_000 }, code);
+      assert.equal((await asAlice(w, STALE)).status, "none", code);
+      assert.equal((await asAlice(w, GOOD)).status, "keys", `${code} is not the person's verdict`);
+    }
+  });
+
+  test("the refused token itself is not asked again for 30 seconds, exactly, so a signed-out device is not a question per request", async () => {
+    const clock = { t: 1_000_000 };
+    const w = twoDevices(clock);
+    await asAlice(w, STALE);
+    clock.t += 29_999;
+    assert.deepEqual(await asAlice(w, STALE), { status: "none", reason: "delegation_refused_invalid_grant" });
+    assert.equal(w.exchanges.length, 1);
+    clock.t += 1;
+    await asAlice(w, STALE);
+    assert.equal(w.exchanges.length, 2, "after 30 seconds it is asked again, and the provider may have changed its mind");
+  });
+
+  test("a refusal of one person's token is nobody else's: another person's lookup with the same token text is its own", async () => {
+    const clock = { t: 1_000_000 };
+    const w = twoDevices(clock);
+    await asAlice(w, STALE);
+    w.exchange = undefined;
+    w.verify = async () => user("bob");
+    assert.equal((await w.keys.keysOf("bob", STALE, SETTINGS, w.deps)).status, "keys");
+  });
+
+  test("a refusal about the client (unauthorized_client, invalid_target, invalid_scope) is the same for every token, and is kept for the person", async () => {
+    for (const code of ["unauthorized_client", "invalid_target", "invalid_scope"]) {
+      const clock = { t: 1_000_000 };
+      const w = world(clock);
+      w.exchange = async () => { throw new IdentityExchangeRefusedError(code, 400); };
+      assert.deepEqual(await asAlice(w, GOOD), { status: "none", reason: `delegation_refused_${code}` });
+      assert.deepEqual(await asAlice(w, "user-token-of-alice-tablet"), { status: "none", reason: `delegation_refused_${code}` });
+      assert.equal(w.exchanges.length, 1, `${code}: the provider is not asked per token`);
+      clock.t += 30_000;
+      await asAlice(w, GOOD);
+      assert.equal(w.exchanges.length, 2, `${code}: kept 30 seconds`);
+    }
+  });
+
+  test("a lookup that joins a flight refused for another token of the person is not answered by that refusal", async () => {
+    const clock = { t: 1_000_000 };
+    const w = twoDevices(clock);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const exchange = w.exchange!;
+    w.exchange = async (req) => { if (req.subjectToken === STALE) await gate; return exchange(req); };
+    const stale = asAlice(w, STALE);
+    await new Promise((r) => setImmediate(r));
+    const good = asAlice(w, GOOD); // joins the flight of the refused token
+    await new Promise((r) => setImmediate(r));
+    release();
+    assert.equal((await stale).status, "none");
+    assert.equal((await good).status, "keys");
+    assert.deepEqual(w.exchanges.map((e) => e.subjectToken).sort(), [GOOD, STALE].sort());
+  });
+
+  test("callers with the refused token itself share its flight and its refusal: still one exchange", async () => {
+    const w = twoDevices({ t: 1_000_000 });
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const exchange = w.exchange!;
+    w.exchange = async (req) => { await gate; return exchange(req); };
+    const all = Promise.all([asAlice(w, STALE), asAlice(w, STALE), asAlice(w, STALE)]);
+    await new Promise((r) => setImmediate(r));
+    release();
+    for (const r of await all) assert.equal(r.status, "none");
+    assert.equal(w.exchanges.length, 1);
+  });
+
+  test("the refused tokens are a bounded set, and the cache does not hold a token's text", async () => {
+    const w = twoDevices({ t: 1_000_000 });
+    w.exchange = async () => { throw new IdentityExchangeRefusedError("invalid_grant", 400); };
+    for (let i = 0; i < 1001; i++) await w.keys.keysOf("alice", `tok-${i}`, SETTINGS, w.deps);
+    const held = (w.keys as unknown as { tokenRefusals: Map<string, unknown> }).tokenRefusals;
+    assert.equal(held.size, 1000);
+    for (const k of held.keys()) assert.ok(!k.includes("tok-"), "digested");
   });
 });
 

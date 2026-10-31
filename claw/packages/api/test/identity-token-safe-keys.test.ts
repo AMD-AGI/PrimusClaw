@@ -420,6 +420,19 @@ describe("K5 how long an answer is kept", () => {
     assert.equal(exchangeCalls().length, 1);
   });
 
+  test("a refusal of one device's token (its grant is signed out) is not the person's: another device's token still gets keys", async () => {
+    // Two devices of Alice. The provider refuses the exchange of the signed-out device's token (invalid_grant) and
+    // exchanges the other's. With introspection off (the default) the signed-out token passes verification until it expires.
+    const signedOut = mint({ jti: "signed-out-device" });
+    const phone = mint({ jti: "phone" });
+    const real = fake.token;
+    fake.token = (r) => (r.form.get("subject_token") === signedOut ? { status: 400, body: { error: "invalid_grant" } } : real(r));
+    assert.equal(user(await run(signedOut)).platformKey, "", "the refused token runs keyless");
+    assert.equal(user(await run(phone)).platformKey, "ak-alice-platform", "the other device is not made keyless by it");
+    assert.equal(user(await run(phone)).virtualKey, "sk-alice-virtual");
+    assert.equal(delegations.length, 1, "only the good token was exchanged for SaFE's audience");
+  });
+
   test("SaFE not answering is not remembered: the next request asks again, and gets the keys", async () => {
     let up = false;
     verifyAnswer = (r, res) => (up ? defaultVerify(r, res) : sendJson(res, 503, { code: 503, message: "down" }));
