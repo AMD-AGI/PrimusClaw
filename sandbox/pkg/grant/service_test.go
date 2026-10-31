@@ -954,3 +954,16 @@ func TestMeasurementTemplateDeniesEgress(t *testing.T) {
 		t.Fatalf("dev policy=%s", dev.Spec.RuntimePolicy)
 	}
 }
+
+func TestIssueRejectsInvalidTemplateLayers(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	svc, priv, _, _ := testService(t, now)
+	req := sampleRequest(now.Add(time.Minute))
+	req.Templates[0].Spec = json.RawMessage(`{"fromImage":"example:latest","layers":[{"image":"layer:latest","from":"/layer","mount":"/opt/host"}]}`)
+	req.Attestation = signGrant(t, priv, req)
+	_, _, err := svc.Issue(context.Background(), req)
+	var op *OpError
+	if !errors.As(err, &op) || op.Status != http.StatusBadRequest {
+		t.Fatalf("err = %v", err)
+	}
+}

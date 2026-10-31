@@ -317,6 +317,9 @@ func (c *K8sSandboxCreator) CreateSandbox(
 
 // createDirect creates a Sandbox directly from the CodeInterpreter template.
 func (c *K8sSandboxCreator) createDirect(ctx context.Context, ci *runtimev1alpha1.CodeInterpreter, sandboxName, namespace, sessionID string, user *UserIdentity, overrides *SandboxOverrides) (*SandboxResult, error) {
+	if err := validateTemplateLayers(ci.Spec); err != nil {
+		return nil, err
+	}
 	r := &CodeInterpreterReconciler{Client: c.client}
 	podTemplate := r.buildPodTemplate(ci)
 

@@ -163,6 +163,29 @@ type CodeInterpreterSandboxTemplate struct {
 	// read-only. Writable mounts must set readOnly explicitly to false.
 	// +optional
 	VolumeMounts []CodeInterpreterVolumeMount `json:"volumeMounts,omitempty"`
+
+	// Layers copy files from other images into the sandbox before it starts.
+	// Each layer image runs as an init container that copies From into an
+	// emptyDir, and the main container mounts that emptyDir at Mount.
+	// +optional
+	// +kubebuilder:validation:MaxItems=4
+	Layers []SandboxLayer `json:"layers,omitempty"`
+}
+
+// SandboxLayer is one image whose directory is copied into the sandbox.
+type SandboxLayer struct {
+	// Image is pinned by digest (name@sha256:<hex>). It must provide sh and cp.
+	// +kubebuilder:validation:Required
+	Image string `json:"image"`
+	// From is the absolute directory in Image to copy.
+	// +kubebuilder:validation:Required
+	From string `json:"from"`
+	// Mount is the absolute path of the copy in the main container.
+	// +kubebuilder:validation:Required
+	Mount string `json:"mount"`
+	// ReadOnly defaults to true when omitted.
+	// +optional
+	ReadOnly *bool `json:"readOnly,omitempty"`
 }
 
 // CodeInterpreterVolumeMount defines a volume mount on the main sandbox container.

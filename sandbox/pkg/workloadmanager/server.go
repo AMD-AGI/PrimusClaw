@@ -1236,6 +1236,10 @@ func (s *Server) handleTemplateCreate(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: " + err.Error()})
 		return
 	}
+	if err := validateTemplateLayers(req.Spec); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: " + err.Error()})
+		return
+	}
 	if req.Namespace == "" {
 		req.Namespace = "default"
 	}
@@ -1343,6 +1347,10 @@ func (s *Server) handleTemplateCreateStream(c *gin.Context) {
 	}
 	var req CreateTemplateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: " + err.Error()})
+		return
+	}
+	if err := validateTemplateLayers(req.Spec); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: " + err.Error()})
 		return
 	}
@@ -1607,6 +1615,10 @@ func (s *Server) handleTemplateUpdate(c *gin.Context) {
 	}
 	var req UpdateTemplateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: " + err.Error()})
+		return
+	}
+	if err := validateTemplateLayers(req.Spec); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: " + err.Error()})
 		return
 	}
