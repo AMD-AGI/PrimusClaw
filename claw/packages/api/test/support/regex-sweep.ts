@@ -237,8 +237,9 @@ export function worstCost(source: string, flags: string, length: number, stopAbo
   let worst = { ms: 0, line: "" };
   const time = (line: string): number => { const t0 = performance.now(); re.exec(line); return performance.now() - t0; };
   for (const s of sampleStrings(source)) {
-    for (let k = 0; k <= s.length; k++) {
-      if (k > 0 && k < s.length && kindOf(s[k - 1] as string) === kindOf(s[k] as string)) continue;
+    // The places to push a run in: both ends, and wherever the kind of character changes.
+    const cuts = Array.from({ length: s.length + 1 }, (_, k) => k).filter((k) => k === 0 || k === s.length || kindOf(s[k - 1] as string) !== kindOf(s[k] as string));
+    for (const k of cuts) {
       for (const filler of new Set([" ", "a", "\t", s[k - 1] ?? "", s[k] ?? "", s.slice(Math.max(0, k - 2), k), s.slice(k, k + 2)])) {
         if (filler === "") continue;
         const room = length - s.length;
