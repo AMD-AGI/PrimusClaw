@@ -338,6 +338,16 @@ test("A8 every place in the source that can start a turn is gated, or is on a li
   assert.deepEqual(unknown, [], "a file that can start a turn is neither gated nor on the list: decide which, and say why");
   assert.deepEqual(Object.keys(NO_GATE).filter((f) => !found.has(f)), [], "an entry of the list that no longer matches anything");
   for (const [file, places] of Object.entries(GATED)) assert.equal(found.get(file), places, `${file} asks actingTurnRefusal in ${places} place(s)`);
+  // A count of gates per file cannot tell one dispatch from another, so each place that dispatches a turn is counted too: a new one in a gated
+  // file fails here until somebody says which kind it is. In routes/sessions.ts they are the first message of a new session (the create asks
+  // `classifyAttendedCaller`), a message (gated) and the start of the sandbox, which is a script run with no model call (`sandboxOnly`).
+  const dispatches: Record<string, number> = { "routes/sessions.ts": 3, "routes/anthropic-managed-agents.ts": 1 };
+  for (const [file, n] of Object.entries(dispatches)) {
+    assert.equal((stripComments(readFileSync(join(src, file), "utf8")).match(/\bdispatchTaskToBrain\(/g) ?? []).length, n, `${file}: places that dispatch a turn`);
+  }
+  const sessions = stripComments(readFileSync(join(src, "routes/sessions.ts"), "utf8"));
+  assert.equal((sessions.match(/sandboxOnly: true/g) ?? []).length, 1, "exactly one dispatch of the sessions route is the sandbox start");
+  assert.equal((sessions.match(/classifyAttendedCaller\(/g) ?? []).length, 1, "and the create asks the classifier");
   // The three routes of routes/tasks.ts that start work say so; the ones that read or stop do not.
   const tasks = readFileSync(join(src, "routes/tasks.ts"), "utf8");
   assert.equal((tasks.match(/(?:requireSessionAccess|requireTaskAccess)\(req, reply, [\w.]+, true, true, true\)/g) ?? []).length, 3);
