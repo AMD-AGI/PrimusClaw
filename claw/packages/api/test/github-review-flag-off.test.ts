@@ -48,6 +48,22 @@ test("no tools are offered, even to a row that has acting_as", async () => {
   assert.deepEqual(await githubReviewMcpServers("s-1"), {});
 });
 
+test("no turn is gated for a session that has acting_as, and the gate asks the database nothing", async () => {
+  // Nothing is offered to such a row, so it is an ordinary session, and the statements of every route are the ones they were.
+  const { actingTurnRefusal, actingTurnRefusalFor } = await import("../src/github-review/acting-turns.js");
+  const req = { user: { userId: "u-1", userName: "u-1", roles: ["default"] }, authMethod: "api_key" } as never;
+  const query = db.query;
+  const asked: string[] = [];
+  db.query = (async (text: string) => { asked.push(text); return { rows: [{ acting_as: "u-2" }], rowCount: 1 }; }) as unknown as typeof db.query;
+  try {
+    assert.equal(await actingTurnRefusalFor(req, "s-1"), null);
+    assert.equal(actingTurnRefusal(req, "u-2"), null);
+  } finally {
+    db.query = query;
+  }
+  assert.deepEqual(asked, []);
+});
+
 test("no route exists and no table is made", async () => {
   const app = Fastify();
   await registerGithubReviewRoutes(app);

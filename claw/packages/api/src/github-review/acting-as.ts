@@ -18,3 +18,14 @@ export function parseActingAs(value: unknown): ActingAsParse {
   }
   return { ok: true, actingAs: value };
 }
+
+/**
+ * The user a session's stored config says it acts as, or null: unset, or not a well-formed id, which makes it an ordinary session. The one
+ * reading that two things share, the tools a turn is offered (`session-tools.ts`) and the gate on who may start a turn (`acting-turns.ts`),
+ * so that a session that is offered the tools is a session that is gated, whatever its `acting_as` looks like.
+ */
+export function actingUserOf(config: unknown): string | null {
+  const value = config !== null && typeof config === "object" ? (config as Record<string, unknown>).acting_as : undefined;
+  const parsed = parseActingAs(value);
+  return parsed.ok ? parsed.actingAs : null;
+}

@@ -77,7 +77,8 @@ record it.
   only: the person's own sign-in, or a service an operator named in `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS`
   acting for the user its token names, recording both. It refuses the `ak-` or BYOK key a sandbox holds and the
   session cookie that key can sign in to at SaFE; the same credentials are required to create a session with
-  `config.acting_as`). The
+  `config.acting_as` and to start any turn in one: a message, an approval or an answer, a task, a batch, a retry
+  or a workbench run). The
   rules judge what the change does (architecture, interface, security-sensitive code, CI and release,
   dependencies, size and breadth) from its net diff, so a pure refactor stays low; a file that came without its
   diff (a binary, or an LFS pointer), a lock file and an edit of an authentication module or a release file stay

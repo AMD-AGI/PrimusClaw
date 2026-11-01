@@ -13,7 +13,7 @@
 import pino from "pino";
 import { CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
 import { db } from "../infra/db.js";
-import { parseActingAs } from "./acting-as.js";
+import { actingUserOf } from "./acting-as.js";
 import { readGithubReviewSettings } from "./settings.js";
 import { mintSessionToolToken } from "./token.js";
 
@@ -33,14 +33,14 @@ export async function githubReviewMcpServers(sessionId: string): Promise<McpServ
     )).rows as Array<{ user_id: string | null; config: Record<string, unknown> | null }>;
     const row = rows[0];
     if (!row?.user_id) return {};
-    const acting = parseActingAs(row.config?.acting_as);
-    if (!acting.ok || acting.actingAs === null) return {};
+    const actingUser = actingUserOf(row.config);
+    if (actingUser === null) return {};
     if (!settings.mcpSecret) {
       logger.error({ sessionId }, "github_review.no_secret_tools_not_offered");
       return {};
     }
     const token = mintSessionToolToken(
-      { sessionId, requesterUserId: row.user_id, actorUserId: acting.actingAs }, settings.mcpSecret, settings.tokenTtlSeconds,
+      { sessionId, requesterUserId: row.user_id, actorUserId: actingUser }, settings.mcpSecret, settings.tokenTtlSeconds,
     );
     return { [GITHUB_REVIEW_SERVER_NAME]: { type: "http", url: settings.mcpUrl, token } };
   } catch (err) {

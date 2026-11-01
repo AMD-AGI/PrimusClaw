@@ -25,6 +25,16 @@ tool offered to a session, and `config.acting_as` is refused.
    The id is a reference, never a credential. The requester is the session's owner; the
    verified caller's name is kept as `config.acting_as_requester` for the review footer (a
    client cannot set it).
+   The same credentials are asked of everything that puts work in front of that session's model
+   afterwards: a message (`POST /v1/sessions/:id/messages`, queued or immediate, and the Anthropic-compatible
+   `POST /anthropic/v1/sessions/:id/events`), an approval or an answer to a question of the model
+   (`messageType: "decision"`, `POST /v1/chat/sessions/:id/decisions` and `/answers`), and a task, a batch, a
+   retry, a hosted application run or a workbench run into it. Otherwise a model in any ordinary session of
+   the same user would find the acting session with `GET /v1/sessions` and send it a message with its key.
+   Each is `403 interactive_sign_in_required` (or `service_client_not_allowed`) without one, and nothing is
+   queued or created. Stop, and starting the session's sandbox (no model call), are not asked for. Browser
+   clients of such a session therefore send the person's identity-provider access token, not the session
+   cookie.
 2. From then on every turn of that session is offered an MCP server named `github_review`
    (reserved: a request cannot replace it) with four tools, hosted by the API at
    `POST /v1/internal/github-review/mcp`. Brain calls it with a token signed by the API
@@ -184,10 +194,10 @@ credentials for an access token that acts as that user (RFC 8693: `sub` is the u
 - A person's own access token (their sign-in at the provider, which names no actor) is the person's
   answer, and an `ak-` key, an `x-api-key`, a BYOK key, a connector token or a browser session cookie
   is refused (`403 interactive_sign_in_required`), whatever the allow-list says.
-- The same two checks apply to creating a session with `config.acting_as` (`POST /v1/sessions`): the
-  person's own token, or an allowed service's, and nothing else. Without a credential of that kind
-  the answer is `403 interactive_sign_in_required` or `403 service_client_not_allowed`, and nothing
-  is created.
+- The same two checks apply to creating a session with `config.acting_as` (`POST /v1/sessions`) and to
+  every turn in it (see "How a session uses it"): the person's own token, or an allowed service's, and
+  nothing else. Without a credential of that kind the answer is `403 interactive_sign_in_required` or
+  `403 service_client_not_allowed`, and nothing is created or queued.
 - Who stood behind the answer is recorded: `decided_by` is the acting user, `decided_via` is
   `{kind: "service", client_id, act_sub}` (also in the confirmation list), the closing `result`
   says `by: "service"`, the audit row of the merge carries `decided_by_service`, and a

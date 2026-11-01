@@ -9,6 +9,7 @@ import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions/dispatch.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { CLAW_GITHUB_REVIEW_ENABLED, RUN_DOORBELL_DISPATCH, SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
+import { actingTurnRefusalFor } from "../github-review/acting-turns.js";
 import { parseActingAs } from "../github-review/acting-as.js";
 import { classifyAttendedCaller } from "../github-review/attended.js";
 import { readGithubReviewSettings } from "../github-review/settings.js";
@@ -1829,6 +1830,9 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       if (!canWriteSessionAsOperator(row.user_id, user)) {
         return reply.status(403).send({ ok: false, error: "access denied" });
       }
+      // In a session that acts as a user an approval is the person's say, not something the key a sandbox holds may give itself.
+      const unattended = await actingTurnRefusalFor(req, sessionId);
+      if (unattended) return reply.status(403).send({ ok: false, error: unattended });
       const built = buildDecisionMessage(sessionId, userId, body);
       if (!built.ok) return reply.status(400).send({ ok: false, error: built.error });
       nc.publish(`decision.${sessionId}`, sc.encode(JSON.stringify(built.message)));
@@ -1868,6 +1872,13 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       if (!canAccessSession(row.user_id, userId) && !(!row.user_id && user && isSystemAdmin(user))) {
         await client.query("ROLLBACK");
         return reply.status(403).send({ ok: false, error: "only the session creator can send messages" });
+      }
+      // A turn in a session that acts as a user is the person's say, like creating it: the key a sandbox holds is the owner's own and
+      // reaches this route, so it must not be able to put work in front of a model that holds the person's GitHub account.
+      const unattended = await actingTurnRefusalFor(req, sessionId, client);
+      if (unattended) {
+        await client.query("ROLLBACK");
+        return reply.status(403).send({ ok: false, error: unattended });
       }
 
       const status = lockResult.rows[0].agent_status;
