@@ -481,8 +481,13 @@ const TSCONFIG_GRAPH = /"(paths|references|baseUrl|rootDirs|extends)"\s*:|"path"
 const ESLINT_CONFIG = /(^|\/)(\.eslintrc[^/]*|eslint\.config\.[cm]?[jt]s)$/i;
 const ESLINT_LAYERING = /no-restricted-(imports|paths)|import\/no-|boundaries\/|no-cycle|no-internal-modules/;
 const WORKSPACES_LINE = /"workspaces"\s*:|"packages"\s*:/;
-/** An entry of a JSON string list: what a workspace glob looks like when the key above it is only context in the diff. */
-const STRING_ENTRY = /^\s*"[^"]+"\s*,?\s*$/;
+/**
+ * An entry of a JSON string list: what a workspace glob looks like when the key above it is only context in the diff. Read on the
+ * trimmed line (see `isStringEntry`): with whitespace allowed on both sides of the optional comma too, a long run of it could be divided
+ * between the two runs in as many ways as it is long, and the pattern cost the square of the line.
+ */
+const STRING_ENTRY = /^"[^"]+"\s*,?$/;
+const isStringEntry = (text: string): boolean => STRING_ENTRY.test(text.trim());
 const RELATIVE_IMPORT = /(?:\bfrom|\bimport|\brequire\s*\(|\bimport\s*\()\s*['"`](\.{1,2}\/[^'"`]+)['"`]/;
 
 function resolveRelative(fromPath: string, spec: string): string | null {
@@ -558,7 +563,7 @@ function architectureFindings(files: RiskFile[], net: Net): Finding[] {
     if (LAYERING_ANY.test(l.path)
       || (TSCONFIG.test(l.path) && TSCONFIG_GRAPH.test(l.text))
       || (ESLINT_CONFIG.test(l.path) && ESLINT_LAYERING.test(l.text))
-      || (/(^|\/)package\.json$/i.test(l.path) && (WORKSPACES_LINE.test(l.text) || (STRING_ENTRY.test(l.text) && keyInPatch(l.path))))) layering.add(l.path);
+      || (/(^|\/)package\.json$/i.test(l.path) && (WORKSPACES_LINE.test(l.text) || (keyInPatch(l.path) && isStringEntry(l.text))))) layering.add(l.path);
   }
   for (const path of layering) add(`architecture change: workspace, layering or module-boundary rules changed (${path})`);
 

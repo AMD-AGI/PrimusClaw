@@ -114,7 +114,7 @@ export class GithubClient {
   constructor(opts: GithubClientOptions) {
     if (!opts.token) throw new TypeError("a token is required");
     this.#token = opts.token;
-    this.apiUrl = opts.apiUrl.replace(/\/+$/, "");
+    this.apiUrl = opts.apiUrl.replace(/(?<!\/)\/+$/, "");
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.timeoutMs = opts.timeoutMs ?? 15_000;
     this.maxBodyBytes = opts.maxBodyBytes ?? 8 * 1024 * 1024;

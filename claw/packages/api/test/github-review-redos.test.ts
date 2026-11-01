@@ -17,6 +17,9 @@
  *   R4  nothing else costs more than the patch is long: the rules that look at a patch as a whole run once per file, over a bounded head
  *   R3  the number of lines read is capped: a change with more is not read past the cap, says so, and is held, and the rest of a
  *       huge patch is not even split into lines
+ *
+ * Which patterns to time is not decided here: `github-review-redos-sweep.test.ts` reads every regular expression literal in the module, so a
+ * pattern nobody named is timed as well (it is how a fourth, next to these, was found).
  */
 import assert from "node:assert/strict";
 import test from "node:test";

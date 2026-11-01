@@ -69,14 +69,14 @@ export function readGithubReviewSettings(env: Env = process.env, enabled: boolea
   const owners = ((env.CLAW_GITHUB_REVIEW_OWNERS ?? "").trim() || "AMD-AGI")
     .split(",").map((o) => o.trim().toLowerCase()).filter(Boolean);
   const backend = (env.INTERNAL_BACKEND_URL ?? "").trim() || `http://127.0.0.1:${(env.API_PORT ?? "").trim() || "8200"}`;
-  const apiUrl = ((env.CLAW_GITHUB_API_URL ?? "").trim() || "https://api.github.com").replace(/\/+$/, "");
+  const apiUrl = ((env.CLAW_GITHUB_API_URL ?? "").trim() || "https://api.github.com").replace(/(?<!\/)\/+$/, "");
   return {
     enabled,
     owners,
     writesEnabled: bool(env.CLAW_GITHUB_WRITES_ENABLED),
     apiUrl,
     mcpSecret: (env.CLAW_GITHUB_REVIEW_MCP_SECRET ?? "").trim(),
-    mcpUrl: (env.CLAW_GITHUB_REVIEW_MCP_URL ?? "").trim() || `${backend.replace(/\/+$/, "")}/v1/internal/github-review/mcp`,
+    mcpUrl: (env.CLAW_GITHUB_REVIEW_MCP_URL ?? "").trim() || `${backend.replace(/(?<!\/)\/+$/, "")}/v1/internal/github-review/mcp`,
     tokenTtlSeconds: num("CLAW_GITHUB_REVIEW_TOKEN_TTL_SECONDS", 43_200, { min: 60, max: 7 * 86_400 }),
     confirmationTtlSeconds: num("CLAW_GITHUB_CONFIRMATION_TTL_SECONDS", 86_400, { min: 60, max: 7 * 86_400 }),
     reviewsPerTokenPerHour: num("CLAW_GITHUB_REVIEWS_PER_TOKEN_PER_HOUR", 6, { min: 1, max: 1000 }),

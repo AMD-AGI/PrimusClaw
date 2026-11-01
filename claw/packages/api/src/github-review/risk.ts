@@ -214,6 +214,37 @@ export function globToRegExp(glob: string): RegExp {
 }
 
 /**
+ * The line without the comment at its end: from the first `#` that follows whitespace. Plain string code, because the pattern for it
+ * (a run of whitespace, a `#`, then the rest of the line) restarts at every character of a long run of whitespace that no `#` ends,
+ * and the file is read whole, in the API's own process, with no limit on a line.
+ */
+function withoutTrailingComment(line: string): string {
+  // A comment runs to the end of the line, and a line break inside what is called a line (a lone carriage return, U+2028, U+2029) ends the
+  // reach of the pattern this replaces: a `#` before the last of them is not the start of a comment, and the file stays unreadable.
+  const lastBreak = Math.max(line.lastIndexOf("\r"), line.lastIndexOf("\u2028"), line.lastIndexOf("\u2029"));
+  for (let i = Math.max(1, lastBreak + 1); i < line.length; i++) {
+    if (line.charCodeAt(i) === 35 && /\s/.test(line[i - 1] as string)) return line.slice(0, i);
+  }
+  return line;
+}
+
+/**
+ * The value of a list item (`  - "docs/legal/**"`): what stands after the dash, without one quote on either side. Plain string code for
+ * the same reason as above (a lazy run and the whitespace after it both match a long run of spaces). `null` when the line is not an item.
+ * The value stops at the first quote, and what follows that quote must be nothing but whitespace, as the quoted forms always were.
+ */
+function listItemValue(line: string): string | null {
+  const dash = /^\s+-\s+/.exec(line);
+  if (!dash) return null;
+  let rest = line.slice(dash[0].length);
+  if (rest[0] === '"' || rest[0] === "'") rest = rest.slice(1);
+  if (rest === "" || /^[\s"']/.test(rest)) return null;
+  const quote = rest.search(/["']/);
+  if (quote < 0) return rest.trimEnd();
+  return rest.slice(quote + 1).trim() === "" ? rest.slice(0, quote) : null;
+}
+
+/**
  * The optional `.github/clawy.yml` of the base branch. Only two keys exist, and
  * only the plain shape is read:
  *
@@ -229,7 +260,7 @@ export function parseClawyConfig(text: string): RepoConfig | "invalid" {
   const config: RepoConfig = { confirmMerge: "risk", highRiskPaths: [] };
   let inPaths = false;
   for (const raw of text.split(/\r?\n/)) {
-    const line = raw.replace(/\s+#.*$/, "").trimEnd();
+    const line = withoutTrailingComment(raw).trimEnd();
     if (!line.trim() || line.trim().startsWith("#")) continue;
     const key = /^([a-z_]+):\s*(.*)$/.exec(line);
     if (key) {
@@ -245,10 +276,10 @@ export function parseClawyConfig(text: string): RepoConfig | "invalid" {
       }
       continue;
     }
-    const item = /^\s+-\s+["']?([^"'\s][^"']*?)["']?\s*$/.exec(line);
-    if (inPaths && item) {
+    const item = inPaths ? listItemValue(line) : null;
+    if (item !== null) {
       if (config.highRiskPaths.length >= 100) return "invalid";
-      config.highRiskPaths.push((item[1] as string).trim());
+      config.highRiskPaths.push(item.trim());
       continue;
     }
     return "invalid";
