@@ -12,6 +12,7 @@
  *   C2d a call that waited behind another for the same title sees its item
  *   C3  numbers count per user
  *   N1  work_send takes the item back to in progress, queues the words once, and an acceptance of the old result then fails
+ *   N1d work_send fences the run that is still executing out: its ready is refused, and the run that carries the instruction is the one heard
  *   N2  work_stop closes the item, fences its worker out and drops a first message that never started
  *   N3  work_recall gives the summary, the reports or the worker's tail, and marks what a worker wrote as untrusted
  *   X1  L1-7: another user's item is unreachable from every tool, and is not changed
@@ -262,6 +263,31 @@ describe("assistant tools", { skip }, () => {
     const later = await w.routerTurn(alice);
     await t().workSend(later, { item_id: item.itemId, text: "Also fix the lint errors." });
     assert.equal((await w.pending(item.workerSid)).length, 1, "the same words in a later turn are a new instruction");
+  });
+
+  test("N1d an instruction sent while a worker run is executing fences that run out, and the run that carries it is the one heard", async () => {
+    const item = await w.createItem(alice, "Fix the build");
+    const running = await w.workerTurn(item.itemId);
+    await t().workSend(await w.routerTurn(alice), { item_id: item.itemId, text: "Use the new API instead." });
+    assert.equal((await w.item(item.itemId)).generation, running.gen! + 1, "the instruction is a new generation");
+    w.drains.length = 0;
+
+    // The run never saw the instruction: what it calls ready is not the result of the work the user now wants.
+    assert.equal(await code(t().report(running, { kind: "ready", summary: "PR 12 opened" })), "stale_run");
+    const run = { itemId: item.itemId, workerSessionId: item.workerSid, generation: running.gen!, runId: running.task_id };
+    assert.deepEqual(await w.mod.reports.ingestReport(run, { kind: "ready", summary: "done" }, "turn_end"), { status: "stale" }, "nor does its end say so");
+    const row = await w.item(item.itemId);
+    assert.deepEqual([row.board_state, row.last_report_kind, row.result_version, row.attention_seq], ["in_progress", "progress", 0, 0]);
+    assert.equal((await w.pending(alice.routerSid)).length, 0, "nobody was told it is ready");
+    assert.equal((await w.pending(item.workerSid)).length, 1, "the instruction is still queued for the next run");
+
+    // The run that carries the instruction reports under the new generation, and that result is the one to accept.
+    await w.closeRun(running.task_id, "completed", undefined, 5);
+    const next = await w.workerTurn(item.itemId);
+    assert.equal(next.gen, running.gen! + 2);
+    await t().report(next, { kind: "ready", summary: "PR 12 uses the new API" });
+    assert.equal((await w.mod.workItems.acceptWorkItem("alice", item.itemId, 1)).status, "ok");
+    assert.equal((await w.item(item.itemId)).outcome, "accepted");
   });
 
   test("N1b a closed or foreign item takes nothing", async () => {

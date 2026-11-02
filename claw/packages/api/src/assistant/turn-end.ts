@@ -17,6 +17,7 @@
  */
 import pino from "pino";
 import { db } from "../infra/db.js";
+import { SWEEPABLE_RUN_STATUSES } from "../tasks/chat-run.js";
 import { REPORT_SUMMARY_MAX } from "./report.js";
 import { ingestReport } from "./reports.js";
 import { REPORT_KINDS, reportTransition, type WorkReport } from "./work-items.js";
@@ -25,7 +26,7 @@ const logger = pino({ name: "assistant-turn-end" });
 
 /** A run closed this recently is the completion handler's to record; the sweep waits for it. */
 const SWEEP_GRACE_SECONDS = 60;
-const SWEEP_BATCH = 20;
+export const SWEEP_BATCH = 20;
 
 /**
  * The reports that already tell the assistant something it must act on, read off the state table rather than
@@ -35,6 +36,30 @@ const WAKING_KINDS = REPORT_KINDS.filter((kind) => reportTransition({ kind }).wa
 const WAKING_WITH_QUESTION = REPORT_KINDS.filter(
   (kind) => !WAKING_KINDS.includes(kind) && reportTransition({ kind, question: "?" }).wake,
 );
+
+/**
+ * What a run's end has to know, as SQL over `w` (the item) and `e` (the run's `run_started` event). Written once
+ * for `recordRunEnd` and for the sweep that looks for runs to record, so the sweep selects exactly the runs
+ * `recordRunEnd` would not skip: a run it would skip is selected again on every tick, and enough of them fill
+ * the batch and keep the runs behind them from ever being reached.
+ *
+ * `RUN_TOLD`: a report of this run already made the assistant hear about it, so the end adds nothing.
+ * `RUN_CONTINUING`: another turn is open or queued behind this one on the same session, so the item is not at
+ * rest and the next turn will report for itself.
+ *
+ * $1 the statuses of a run that is not over; $2 and $3 the kinds of report that tell the assistant something.
+ */
+const RUN_TOLD = `EXISTS (
+  SELECT 1 FROM claw_work_item_events r
+   WHERE r.item_id = w.item_id AND r.run_id = e.run_id
+     AND (r.kind = ANY($2::text[]) OR (r.kind = ANY($3::text[]) AND r.question IS NOT NULL))
+)`;
+const RUN_CONTINUING = `(EXISTS (
+  SELECT 1 FROM claw_tasks t
+   WHERE t.session_id = w.worker_session_id AND t.origin = 'chat' AND t.task_id <> e.run_id AND t.status = ANY($1::text[])
+) OR EXISTS (
+  SELECT 1 FROM claw_pending_messages p WHERE p.session_id = w.worker_session_id
+))`;
 
 export type TurnEndOutcome = "failed" | "finished" | "interrupted";
 
@@ -48,30 +73,14 @@ interface RunRecord {
 /**
  * What the item knows of this run, or null when the run never carried an assistant role (it began before the
  * assistant was on, or is another session's).
- *
- * `told`: a report of this run already made the assistant hear about it, so the end adds nothing.
- * `continuing`: another turn is open or queued behind this one on the same session, so the item is not at
- * rest and the next turn will report for itself.
  */
 async function runRecord(workerSessionId: string, runId: string): Promise<RunRecord | null> {
   const row = (await db.query(
-    `SELECT w.item_id, e.generation,
-            EXISTS (
-              SELECT 1 FROM claw_work_item_events r
-               WHERE r.item_id = w.item_id AND r.run_id = e.run_id
-                 AND (r.kind = ANY($3::text[]) OR (r.kind = ANY($4::text[]) AND r.question IS NOT NULL))
-            ) AS told,
-            (EXISTS (
-               SELECT 1 FROM claw_tasks t
-                WHERE t.session_id = w.worker_session_id AND t.origin = 'chat' AND t.task_id <> e.run_id
-                  AND t.status IN ('queued', 'preparing', 'running', 'cancelling')
-             ) OR EXISTS (
-               SELECT 1 FROM claw_pending_messages p WHERE p.session_id = w.worker_session_id
-            )) AS continuing
+    `SELECT w.item_id, e.generation, ${RUN_TOLD} AS told, ${RUN_CONTINUING} AS continuing
        FROM claw_work_items w
-       JOIN claw_work_item_events e ON e.item_id = w.item_id AND e.run_id = $2 AND e.kind = 'run_started'
-      WHERE w.worker_session_id = $1`,
-    [workerSessionId, runId, WAKING_KINDS, WAKING_WITH_QUESTION],
+       JOIN claw_work_item_events e ON e.item_id = w.item_id AND e.run_id = $5 AND e.kind = 'run_started'
+      WHERE w.worker_session_id = $4`,
+    [SWEEPABLE_RUN_STATUSES, WAKING_KINDS, WAKING_WITH_QUESTION, workerSessionId, runId],
   )).rows[0] as RunRecord | undefined;
   return row ?? null;
 }
@@ -144,14 +153,16 @@ export async function reconcileWorkerRuns(): Promise<number> {
        JOIN claw_tasks t ON t.task_id = e.run_id
       WHERE w.board_state = 'in_progress'
         AND t.status IN ('completed', 'failed', 'cancelled')
-        AND t.completed_at < NOW() - make_interval(secs => $1::int)
+        AND t.completed_at < NOW() - make_interval(secs => $4::int)
         AND NOT EXISTS (
           SELECT 1 FROM claw_work_item_events x
            WHERE x.item_id = w.item_id AND x.run_id = e.run_id AND x.source = 'turn_end'
         )
+        AND NOT ${RUN_TOLD}
+        AND NOT ${RUN_CONTINUING}
       ORDER BY t.completed_at
-      LIMIT $2`,
-    [SWEEP_GRACE_SECONDS, SWEEP_BATCH],
+      LIMIT $5`,
+    [SWEEPABLE_RUN_STATUSES, WAKING_KINDS, WAKING_WITH_QUESTION, SWEEP_GRACE_SECONDS, SWEEP_BATCH],
   )).rows as Array<{ worker_session_id: string; run_id: string; status: string; failure_reason: string | null }>;
   let recorded = 0;
   for (const run of runs) {
@@ -165,5 +176,69 @@ export async function reconcileWorkerRuns(): Promise<number> {
     }
   }
   if (recorded) logger.warn({ recorded }, "assistant.reconciled_unrecorded_runs");
+  return recorded;
+}
+
+/**
+ * An item in progress that nothing is working on: no turn open on its worker's session, none queued, and the last
+ * one over for longer than the completion handler needs. Its last instruction never started (the dispatch was
+ * refused, or failed before the run was claimed), so no run will ever report, and no run end exists for
+ * `reconcileWorkerRuns` to find. $1 the statuses of a run that is not over; $2 the grace, in seconds.
+ */
+const ORPHANED_ITEM = `
+  w.board_state = 'in_progress'
+  AND w.updated_at < NOW() - make_interval(secs => $2::int)
+  AND NOT EXISTS (
+    SELECT 1 FROM claw_tasks t
+     WHERE t.session_id = w.worker_session_id AND t.origin = 'chat'
+       AND (t.status = ANY($1::text[]) OR t.completed_at >= NOW() - make_interval(secs => $2::int))
+  )
+  AND NOT EXISTS (SELECT 1 FROM claw_pending_messages p WHERE p.session_id = w.worker_session_id)`;
+
+const ORPHANED_REPORT: WorkReport = {
+  kind: "failed",
+  summary: "Nothing is working on this item and nothing is waiting to start: the last instruction never reached a run. Send it again.",
+};
+
+/** Thrown inside the report's transaction when the item stopped being an orphan between the sweep's read and its write. */
+class NoLongerOrphaned extends Error {}
+
+/**
+ * Tell the assistant about each item in progress that nothing is working on. Returns how many were recorded.
+ *
+ * Re-asked under the item's row lock, in the transaction that writes the report: two sweepers that selected
+ * the same item meet there, and the second finds it no longer in progress, as does an instruction that arrived
+ * after the select.
+ */
+export async function reconcileOrphanedItems(): Promise<number> {
+  const items = (await db.query(
+    `SELECT w.item_id, w.worker_session_id, w.generation FROM claw_work_items w
+      WHERE ${ORPHANED_ITEM}
+      ORDER BY w.updated_at
+      LIMIT $3`,
+    [SWEEPABLE_RUN_STATUSES, SWEEP_GRACE_SECONDS, SWEEP_BATCH],
+  )).rows as Array<{ item_id: string; worker_session_id: string; generation: number }>;
+  let recorded = 0;
+  for (const item of items) {
+    try {
+      const result = await ingestReport(
+        { itemId: item.item_id, workerSessionId: item.worker_session_id, generation: Number(item.generation), runId: null },
+        ORPHANED_REPORT,
+        "sweep",
+        async (query) => {
+          const still = await query(
+            `SELECT 1 FROM claw_work_items w WHERE w.item_id = $3 AND ${ORPHANED_ITEM} FOR UPDATE OF w`,
+            [SWEEPABLE_RUN_STATUSES, SWEEP_GRACE_SECONDS, item.item_id],
+          );
+          if (!still.rowCount) throw new NoLongerOrphaned();
+        },
+      );
+      if (result.status === "applied") recorded += 1;
+    } catch (err) {
+      if (err instanceof NoLongerOrphaned) continue;
+      logger.warn({ err, itemId: item.item_id }, "assistant.reconcile_item_failed");
+    }
+  }
+  if (recorded) logger.warn({ recorded }, "assistant.reconciled_orphaned_items");
   return recorded;
 }

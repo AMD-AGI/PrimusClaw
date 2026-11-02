@@ -355,6 +355,11 @@ export async function stopWorkItem(input: {
 /**
  * The user asked for more on an item: back to in progress, with the old result no
  * longer the one to accept (the accept's WHERE clause needs `ready`).
+ *
+ * The generation goes up with it. A run that is still executing never saw this
+ * instruction, so whatever it reports next, `ready` above all, describes work the
+ * user has already asked to change: it is fenced out, and the run that carries the
+ * instruction is the next one to be heard.
  */
 export async function reopenWorkItem(
   q: StatementRunner,
@@ -364,7 +369,7 @@ export async function reopenWorkItem(
     `WITH upd AS (
        UPDATE claw_work_items
           SET board_state = 'in_progress', last_report_kind = 'progress', pending_question = NULL,
-              updated_at = NOW()
+              generation = generation + 1, updated_at = NOW()
         WHERE item_id = $1 AND user_id = $2 AND board_state <> 'done'
     RETURNING ${ITEM_COLUMNS}, generation
      ), ev AS (

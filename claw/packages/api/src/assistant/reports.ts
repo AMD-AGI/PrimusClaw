@@ -31,8 +31,8 @@ export interface ReportRun {
   workerSessionId: string;
   /** The generation the run was started under (`startWorkerRun`). */
   generation: number;
-  /** The run's task id: what a ready result is pinned to, and what a turn-end record is unique on. */
-  runId: string;
+  /** The run's task id: what a ready result is pinned to, and what a turn-end record is unique on. Null for a report no run made (the sweep's). */
+  runId: string | null;
 }
 
 export type IngestOutcome =

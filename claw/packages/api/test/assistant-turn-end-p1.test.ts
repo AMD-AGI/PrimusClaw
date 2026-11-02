@@ -12,6 +12,8 @@
  *   E5  an interrupted turn, a turn with another queued behind it and a run of no item are left alone
  *   E6  the completion handler does it: an exec_complete for a worker session ends in the record
  *   S1  the sweep records a run whose completion was lost, once, and not one that is still young or still running
+ *   S1d the sweep never selects a run the end would skip, so a full batch of them cannot keep a recordable run out of reach
+ *   S7  an item in progress with no run open or queued, whatever its history, is told to the assistant once, and only then
  *   S2  an item that needs the user with no delivered message is announced once, after the threshold and not before
  *   S3  L1-6: a say whose delivery fails does not count; the sweep sends one fallback and only one
  *   S4  a delivered message about the current need is enough; a new need is a new announcement
@@ -250,6 +252,112 @@ describe("assistant turn ends and sweeps", { skip }, () => {
     await w.mod.tools.workStop(router, { item_id: item.itemId, reason: "no" });
     assert.equal(await w.mod.turnEnd.reconcileWorkerRuns(), 0);
     assert.equal((await turnEnds()).length, 0);
+  });
+
+  async function newItem(n: number) {
+    const user = await w.user(`stuck${n}`);
+    return { user, item: await w.createItem(user, `Stuck item ${n}`) };
+  }
+
+  for (const [why, skipThe] of [
+    ["told: the run said ready, then went on and said progress", async (i: { itemId: string; workerSid: string }) => {
+      const turn = await w.workerTurn(i.itemId);
+      await w.mod.tools.report(turn, { kind: "ready", summary: "PR opened" });
+      await w.mod.tools.report(turn, { kind: "progress", summary: "one more thing" });
+      await w.closeRun(turn.task_id, "completed", undefined, 900);
+    }],
+    ["continuing: a message is queued behind the run", async (i: { itemId: string; workerSid: string }) => {
+      const turn = await w.workerTurn(i.itemId);
+      await w.closeRun(turn.task_id, "completed", undefined, 900);
+      await w.q("INSERT INTO claw_pending_messages (session_id, user_id, content) VALUES ($1, 'alice', 'one more thing')", [i.workerSid]);
+    }],
+  ] as const) {
+    test(`S1d a full batch of runs the end would skip (${why}) does not keep a recordable run out of reach`, async () => {
+      for (let n = 0; n < w.mod.turnEnd.SWEEP_BATCH; n += 1) await skipThe((await newItem(n)).item);
+      const recordable = await endedRun({ agoSeconds: 300 });
+      assert.equal(await w.mod.turnEnd.reconcileWorkerRuns(), 1, "the batch holds only runs that can be recorded");
+      assert.deepEqual((await turnEnds()).map((e) => e.run_id), [recordable.task_id]);
+      assert.equal(await w.mod.turnEnd.reconcileWorkerRuns(), 0);
+    });
+  }
+
+  /** What the item's last instruction left behind: the run that reported ready is over and the next one never started. */
+  async function instructionThatNeverStarted() {
+    const done = await w.workerTurn(item.itemId);
+    await w.mod.tools.report(done, { kind: "ready", summary: "PR 12 opened" });
+    await w.closeRun(done.task_id, "completed", undefined, 900);
+    await w.mod.tools.workSend(await w.routerTurn(alice), { item_id: item.itemId, text: "Also fix the lint errors." });
+    // The dispatch was refused (admission, a failed publish): the queue row goes, and no run was ever claimed.
+    await w.q("DELETE FROM claw_pending_messages WHERE session_id = $1", [item.workerSid]);
+    await w.q("UPDATE claw_work_items SET updated_at = NOW() - interval '10 minutes' WHERE item_id = $1", [item.itemId]);
+    w.drains.length = 0;
+    return done;
+  }
+  const sweepEvents = async () => (await w.itemEvents(item.itemId)).filter((e) => e.source === "sweep");
+
+  test("S7 ready, then an instruction whose run never starts: the item is not left in progress for ever", async () => {
+    await instructionThatNeverStarted();
+    const wakes = await routerWakes();
+    assert.equal((await w.item(item.itemId)).board_state, "in_progress");
+    assert.equal(await w.mod.turnEnd.reconcileWorkerRuns(), 0, "the run that reported ready is neither the item's current run nor one to record");
+
+    assert.equal(await w.mod.turnEnd.reconcileOrphanedItems(), 1);
+    const row = await w.item(item.itemId);
+    assert.deepEqual([row.board_state, row.last_report_kind, row.attention_seq], ["needs_you", "failed", 2]);
+    const [record] = await sweepEvents();
+    assert.deepEqual([record.kind, record.run_id], ["failed", null]);
+    assert.match(record.summary, /Nothing is working on this item/);
+    assert.equal(await routerWakes(), wakes + 1, "the assistant is woken to tell the user");
+    assert.equal(await w.mod.turnEnd.reconcileOrphanedItems(), 0, "told once");
+    assert.equal((await sweepEvents()).length, 1);
+  });
+
+  test("S7b a first message that never started is the same item", async () => {
+    await w.q("UPDATE claw_work_items SET updated_at = NOW() - interval '10 minutes' WHERE item_id = $1", [item.itemId]);
+    assert.equal(await w.mod.turnEnd.reconcileOrphanedItems(), 1);
+    assert.equal((await w.item(item.itemId)).last_report_kind, "failed");
+  });
+
+  test("S7c the sweeper's tick tells it", async () => {
+    await instructionThatNeverStarted();
+    await w.mod.sweeper.sweeperTick();
+    assert.equal((await w.item(item.itemId)).last_report_kind, "failed");
+    assert.equal((await sweepEvents()).length, 1);
+  });
+
+  for (const [why, setUp] of [
+    ["a turn is running", async () => { await w.workerTurn(item.itemId); }],
+    ["a turn is queued", async () => { await w.openRun(item.workerSid, { status: "queued" }); }],
+    ["a turn ended a moment ago, which is the completion handler's to record", async () => {
+      await w.closeRun((await w.workerTurn(item.itemId)).task_id, "completed", undefined, 5);
+    }],
+    ["a message is waiting for its turn", async () => {
+      await w.q("INSERT INTO claw_pending_messages (session_id, user_id, content) VALUES ($1, 'alice', 'one more thing')", [item.workerSid]);
+    }],
+    ["the item was touched a moment ago", async () => {
+      await w.q("UPDATE claw_work_items SET updated_at = NOW() - interval '5 seconds' WHERE item_id = $1", [item.itemId]);
+    }],
+    ["the item already needs the user", async () => {
+      await w.q("UPDATE claw_work_items SET board_state = 'needs_you' WHERE item_id = $1", [item.itemId]);
+    }],
+    ["the item is closed", async () => {
+      await w.q("UPDATE claw_work_items SET board_state = 'done', outcome = 'stopped', closed_at = NOW() WHERE item_id = $1", [item.itemId]);
+    }],
+  ] as const) {
+    test(`S7d not an orphan while ${why}`, async () => {
+      await w.q("UPDATE claw_work_items SET updated_at = NOW() - interval '10 minutes' WHERE item_id = $1", [item.itemId]);
+      await setUp();
+      assert.equal(await w.mod.turnEnd.reconcileOrphanedItems(), 0);
+      assert.equal((await sweepEvents()).length, 0);
+    });
+  }
+
+  test("S7e sweepers that read the same orphan at once record it once", async () => {
+    await instructionThatNeverStarted();
+    const recorded = await Promise.all([1, 2, 3, 4].map(() => w.mod.turnEnd.reconcileOrphanedItems()));
+    assert.equal(recorded.reduce((a, b) => a + b, 0), 1);
+    assert.equal((await sweepEvents()).length, 1);
+    assert.equal((await w.item(item.itemId)).attention_seq, 2, "the need was entered once more, not four times");
   });
 
   /** An item that needs the user, its need `agoSeconds` old. */

@@ -10,12 +10,15 @@
  * queued message on an ordinary session.
  */
 import { CLAW_ASSISTANT_ENABLED } from "../config.js";
-import { reconcileWorkerRuns } from "./turn-end.js";
+import { reconcileOrphanedItems, reconcileWorkerRuns } from "./turn-end.js";
 import { tellSilentItems } from "./silent-sweep.js";
 
 export async function sweepAssistant(): Promise<void> {
   if (!CLAW_ASSISTANT_ENABLED) return;
   // In this order: a run recorded as ready here needs the user, and is then eligible for the announcement.
+  // The runs first: an item whose last run ended unrecorded is the run's to record, and only what is left with
+  // nothing behind it at all is the orphan pass's.
   await reconcileWorkerRuns();
+  await reconcileOrphanedItems();
   await tellSilentItems();
 }
