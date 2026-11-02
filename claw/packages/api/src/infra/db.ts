@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: MIT
 
 import pg from "pg";
-import { APP_RUNS_ENABLED, CLAW_ASSISTANT_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_REMOTE_AGENTS_ENABLED, CLAW_TRIGGERS_ENABLED, DATABASE_URL, envBool, envInt } from "../config.js";
+import { APP_RUNS_ENABLED, CLAW_ASSISTANT_ENABLED, CLAW_GITHUB_REVIEW_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_REMOTE_AGENTS_ENABLED, CLAW_TRIGGERS_ENABLED, DATABASE_URL, envBool, envInt } from "../config.js";
 import { ensureAssistantSchema } from "../assistant/schema.js";
 import { ensureA2aPushSchema } from "../notifications/a2a-push-schema.js";
 import { ensureNotificationSchema } from "../notifications/schema.js";
 import { ensureRemoteAgentSchema } from "../remote-agents/schema.js";
+import { ensureGithubReviewSchema } from "../github-review/store.js";
 import { terminalTicketsSchemaSql } from "../terminal/schema.js";
 import pino from "pino";
 import {
@@ -2293,6 +2294,7 @@ export async function initDb(): Promise<void> {
     if (CLAW_NOTIFICATIONS_ENABLED) await ensureNotificationSchema(client);
     if (CLAW_REMOTE_AGENTS_ENABLED) await ensureRemoteAgentSchema(client);
     if (CLAW_ASSISTANT_ENABLED) await ensureAssistantSchema(client);
+    if (CLAW_GITHUB_REVIEW_ENABLED) await ensureGithubReviewSchema(client);
     // A2A context/task model: a context is found by its caller and id on every
     // send, which the single-column index above does not narrow.
     if (envBool("CLAW_A2A_CONTEXT_TASKS", false)) {
