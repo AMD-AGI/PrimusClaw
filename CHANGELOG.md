@@ -117,7 +117,7 @@ record it.
   `CLAW_GITHUB_REVIEW_FAST_MAX_FILES` / `_MAX_CHANGED_LINES`. A repository's own review skill is read from the
   tip of the base branch; the default `pr-review` skill is in `claw/examples/skills/pr-review/`.
   The merge waits a few seconds, one request a look, for GitHub to finish working out the merge state after the
-  approval it just posted (`UNKNOWN`, or `BLOCKED` until the review counts), and a review's hidden marker
+  approval it just posted (`UNKNOWN`, or `BLOCKED` until the review counts; CI is read again before a merge that waited), and a review's hidden marker
   carries a digest of its text and inline comments, so a second, different review of the same kind on the same commit is posted.
   On the sandbox path the model gets a credential-free bash recipe that fetches the pull request anonymously, shallow and
   pinned to the reviewed head, reusing an existing checkout. The shared

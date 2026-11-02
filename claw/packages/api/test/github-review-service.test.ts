@@ -371,6 +371,12 @@ describe("S2 one review is not another of the same kind", () => {
     e.gh.reviews = [...filler(120), { id: 7, state: "APPROVED", user: { login: "bob" }, commit_id: HEAD, body: "" }];
     assert.equal((await merge()).body.status, "merged");
     assert.equal(posts().length, 0);
+    // A pull request with exactly as many reviews as are read is read whole; with one more it is refused.
+    e = await reviewEnv();
+    assert.equal((await submit()).body.status, "submitted");
+    e.gh.reviews = [...filler(999), e.gh.reviews[0]!];
+    assert.equal((await submit()).body.status, "already_submitted");
+    assert.equal(e.gh.writes.length, 1);
     // Past what is read, nothing is posted on a guess.
     e = await reviewEnv();
     e.gh.reviews = filler(1001);
@@ -506,8 +512,32 @@ describe("M the merge gates", () => {
       // The waiting is one request a look, not a full read of CI and threads each time.
       const looks = e.gh.calls.filter((c) => c.path === "/graphql").length;
       const checkReads = e.gh.calls.filter((c) => /\/check-runs$/.test(c.path)).length;
-      assert.equal(checkReads, 2, `${name}: CI is read before and after the approval, not at every look`);
+      assert.equal(checkReads, expected === "merged" && waits.length ? 3 : 2, `${name}: CI is read before and after the approval, and once more before a merge that waited, not at every look`);
       assert.equal(looks, 2 + waits.length, `${name}: the state before the approval, after it, and one look a wait`);
+    }
+  });
+
+  test("M18 the merge is never made on a CI verdict from before the wait: a check that fails, is re-run or goes missing while GitHub works the merge state out stops it", async () => {
+    // [what happens to the checks during the wait, expected]
+    const cases: Array<[string, () => void, string]> = [
+      ["a check fails", () => { e.gh.checkRuns = [{ name: "test", status: "completed", conclusion: "failure" }]; }, "ci_not_green"],
+      ["a check is re-run and has not finished", () => { e.gh.checkRuns = [{ name: "test", status: "in_progress", conclusion: null }]; }, "ci_not_green"],
+      ["the required check disappears", () => { e.gh.checkRuns = []; }, "ci_not_green"],
+      ["nothing changes", () => {}, "merged"],
+    ];
+    for (const [name, during, expected] of cases) {
+      e = await reviewEnv(); allowed();
+      e.gh.graphql.mergeStateStatus = "BLOCKED";
+      e.gh.onReview = (r) => {
+        if (r.event !== "APPROVE") return;
+        e.gh.graphqlQueue = [{ mergeStateStatus: "UNKNOWN" }];
+        e.gh.graphql.mergeStateStatus = "CLEAN";
+      };
+      e.onSleep = during;
+      const o = await merge();
+      assert.equal(reason(o), expected, `${name}: ${o.text}`);
+      assert.deepEqual(e.sleeps, [500], name);
+      assert.equal(puts().length, expected === "merged" ? 1 : 0, name);
     }
   });
 

@@ -29,6 +29,8 @@ export interface ReviewEnv {
   resolved: ResolveCredentialRequest[];
   /** Every wait the service asked for, in ms; none of them takes any time. */
   sleeps: number[];
+  /** Runs when the service waits, so a test can change what GitHub says while it does. */
+  onSleep: (ms: number) => void;
   /** Replace what the identity provider answers; it is told who is asked about (`userId`) and for whom (`requesterUserId`). */
   identity: { answer: (req: ResolveCredentialRequest) => Promise<ResolvedCredential> };
   actor: ReviewActor;
@@ -74,16 +76,17 @@ export async function reviewEnv(env: Record<string, string> = {}, over: { actor?
   const gh = new FakeGithub();
   const resolved: ResolveCredentialRequest[] = [];
   const sleeps: number[] = [];
+  const hooks = { onSleep: (_ms: number): void => {} };
   const identity = { answer: directory(over.cred) };
   let current = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_MCP_SECRET: SECRET, CLAW_GITHUB_WRITES_ENABLED: "true", ...env }, true);
   const service = new GithubReview({
     settings: () => current, db, fetchImpl: gh.fetch,
-    sleep: async (ms) => { sleeps.push(ms); },
+    sleep: async (ms) => { sleeps.push(ms); hooks.onSleep(ms); },
     resolveCredential: async (req) => { resolved.push(req); return identity.answer(req); },
   });
   const actor: ReviewActor = { sessionId: "s-1", requesterUserId: "u-alice", actorUserId: "u-bob", requesterLabel: "Alice A", ...over.actor };
   return {
-    pg, db, gh, service, get settings() { return current; }, resolved, sleeps, identity, actor,
+    pg, db, gh, service, get settings() { return current; }, resolved, sleeps, get onSleep() { return hooks.onSleep; }, set onSleep(f: (ms: number) => void) { hooks.onSleep = f; }, identity, actor,
     sql: async (text, params) => (await pg.query(text, params as unknown[] | undefined)).rows as Record<string, any>[],
     configure(extra) { current = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_MCP_SECRET: SECRET, CLAW_GITHUB_WRITES_ENABLED: "true", ...env, ...extra }, true); },
     close: async () => {},

@@ -85,7 +85,7 @@ tool offered to a session, and `config.acting_as` is refused.
   failure is a failure; nothing is re-run), no review thread is unresolved, GitHub's own merge
   state is `CLEAN` after the approval (GitHub works the state out asynchronously, so an `UNKNOWN`,
   and a `BLOCKED` right after this call's own approval, is looked at again for about seven seconds, one
-  request a look, before the merge is refused as `merge_state_not_clean`), and the repository's own
+  request a look, with CI read once more before a merge that had to wait, before the merge is refused as `merge_state_not_clean`), and the repository's own
   protections are met because they are GitHub's. No admin merge, no auto-merge, no branch update, no change to a rule.
   The method is the repository's first allowed one, squash first.
 - **High risk.** A versioned rule pack (`packages/api/src/github-review/risk.ts` and

@@ -643,6 +643,11 @@ export class GithubReview {
   }
 
   private async readState(ctx: Ctx, ref: PrRef, pr: PrInfo, _repo: RepoInfo): Promise<PullState> {
+    return { checks: await this.readChecks(ctx, ref, pr), ...(await this.readMergeFacts(ctx, ref)) };
+  }
+
+  /** CI on the pinned head commit: its check runs and statuses against what the base branch requires. */
+  private async readChecks(ctx: Ctx, ref: PrRef, pr: PrInfo): Promise<ChecksVerdict> {
     const sha = pr.headSha;
     const runs = await ctx.client.get<{ total_count?: number; check_runs?: Array<{ name?: string; status?: string; conclusion?: string | null }> }>(
       repoPath(ref, `/commits/${sha}/check-runs`), { per_page: 100 },
@@ -660,11 +665,10 @@ export class GithubReview {
     }
     const checkRuns = (runs.json?.check_runs ?? []).map((c) => ({ name: String(c.name ?? ""), status: String(c.status ?? ""), conclusion: c.conclusion ?? null }));
     const statuses = (status.json?.statuses ?? []).map((s) => ({ context: String(s.context ?? ""), state: String(s.state ?? "") }));
-    const checks = evaluateChecks({
+    return evaluateChecks({
       checkRuns, statuses, required,
       truncated: Number(runs.json?.total_count ?? 0) > checkRuns.length || Number(status.json?.total_count ?? 0) > statuses.length,
     });
-    return { checks, ...(await this.readMergeFacts(ctx, ref)) };
   }
 
   /** What GitHub says of the pull request itself, in one request: its merge state and review decision, its head and its review threads. */
@@ -785,9 +789,14 @@ export class GithubReview {
   /** Every review of the pull request, oldest first. More than could be read is a refusal: a marker or an approval past the cut would be missed. */
   private async listReviews<T>(ctx: Ctx, ref: PrRef): Promise<T[]> {
     const all: T[] = [];
-    for (let page = 1; page <= MAX_REVIEW_PAGES; page++) {
+    // One page past the limit is asked for, to tell a pull request with exactly the limit from one with more.
+    for (let page = 1; page <= MAX_REVIEW_PAGES + 1; page++) {
       const a = await ctx.client.get<T[]>(repoPath(ref, `/pulls/${ref.number}/reviews`), { per_page: REVIEW_PAGE, page });
       const batch = Array.isArray(a.json) ? a.json : [];
+      if (page > MAX_REVIEW_PAGES) {
+        if (batch.length === 0) return all;
+        break;
+      }
       all.push(...batch);
       if (batch.length < REVIEW_PAGE) return all;
     }
@@ -898,7 +907,7 @@ export class GithubReview {
         this.requireGreen(state, headSha);
       }
     }
-    state = await this.settleMergeState(ctx, ref, headSha, state, approved);
+    state = await this.settleMergeState(ctx, ref, pr, state, approved);
     if (state.mergeStateStatus !== "CLEAN") {
       const why = ownPr && state.reviewDecision !== "APPROVED"
         ? "the acting user wrote this pull request and cannot approve it, and GitHub does not yet count it as approved: another approver is needed"
@@ -928,16 +937,23 @@ export class GithubReview {
    * and when it is first asked: UNKNOWN is "still computing", and BLOCKED right after this call's own approval is "that review
    * does not count yet". Only those are waited for; any other state (BEHIND, DIRTY, UNSTABLE) is not one an approval changes,
    * and is read as it is. Each look is one request, and the gates that depend on the pull request itself (the head, the threads)
-   * are checked again with it.
+   * are checked again with it. CI is read again once, after the last wait and before the merge, because a check can have been
+   * re-run or have failed in the meantime: the merge is never made on a verdict that is seconds old.
    */
-  private async settleMergeState(ctx: Ctx, ref: PrRef, headSha: string, first: PullState, approvedByThisCall: boolean): Promise<PullState> {
+  private async settleMergeState(ctx: Ctx, ref: PrRef, pr: PrInfo, first: PullState, approvedByThisCall: boolean): Promise<PullState> {
     let state = first;
+    let waited = false;
     const settling = (s: PullState): boolean => s.mergeStateStatus === "UNKNOWN" || (approvedByThisCall && s.mergeStateStatus === "BLOCKED");
     for (const wait of MERGE_STATE_SETTLE_MS) {
       if (!settling(state)) break;
       await this.sleep(wait);
+      waited = true;
       state = { ...state, ...(await this.readMergeFacts(ctx, ref)) };
-      this.requireGreen(state, headSha);
+      this.requireGreen(state, pr.headSha);
+    }
+    if (waited && state.mergeStateStatus === "CLEAN") {
+      state = { ...state, checks: await this.readChecks(ctx, ref, pr) };
+      this.requireGreen(state, pr.headSha);
     }
     return state;
   }
