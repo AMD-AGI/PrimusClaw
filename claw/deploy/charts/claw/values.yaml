@@ -134,17 +134,20 @@ brain:
   # values.example.env); a bare `helm upgrade --set` is dropped by the next
   # upgrade.sh. Empty by default, which changes nothing.
   #
-  # The peers a2a_call may reach are set here too (there is no dedicated key): A2A_AGENTS names
-  # them and each peer's own token comes from the variable its auth_env names. Only a configured
-  # peer can be called, never a URL, and a peer receives only its own token -- not the user's LLM
-  # key or the platform key. With A2A_AGENTS unset, a2a_call has no peers (this is a breaking
-  # change for a deployment whose agents called a peer by URL: list that peer here). The variable
-  # auth_env names must start with A2A_PEER_TOKEN_; an entry naming any other variable (for example
-  # ANTHROPIC_API_KEY) is refused at start-up, logged as a2a.registry.entry_refused, and not
-  # registered. For example:
+  # The a2a_call tool (calling other A2A agents) is off unless A2A_CLIENT_ENABLED is "true", and the peers it may
+  # reach are set here too (there is no dedicated key): A2A_AGENTS names them. Only a configured peer can be called,
+  # never a URL, and a peer receives only its own credential -- not the user's LLM key or the platform key. An
+  # internal peer carries "audience": Brain exchanges a short-lived token for the session's user at primus-identity
+  # (needs the identity client, see `identity`) and calls the peer as them. A third-party peer carries "auth_env", the
+  # variable holding the operator's token for it (the peer sees Claw, not the user); its name must start with
+  # A2A_PEER_TOKEN_, and an entry naming any other variable (for example ANTHROPIC_API_KEY) is refused at start-up,
+  # logged as a2a.registry.entry_refused, and not registered. With A2A_AGENTS unset, a2a_call has no peers (a breaking
+  # change for a deployment whose agents called a peer by URL: list that peer here). For example:
   #   extraEnv:
+  #     - name: A2A_CLIENT_ENABLED
+  #       value: "true"
   #     - name: A2A_AGENTS
-  #       value: '[{"name":"ci","url":"https://ci.example.com","auth_env":"A2A_PEER_TOKEN_CI"}]'
+  #       value: '[{"name":"ci","url":"https://ci.example.com","auth_env":"A2A_PEER_TOKEN_CI"},{"name":"claw2","card_url":"https://claw.example.com/claw-api/.well-known/agent-card.json","audience":"claw-api","scope":"claw.api"}]'
   #     - name: A2A_PEER_TOKEN_CI
   #       valueFrom: {secretKeyRef: {name: a2a-peer-ci, key: token}}
   # A peer on a loopback or link-local address needs "allow_local": true in its entry; see
