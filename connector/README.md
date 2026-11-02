@@ -355,8 +355,8 @@ and reconnects with a 1 s to 60 s backoff with jitter. Commands are delivered at
 cd connector
 npm ci
 npm run typecheck && npm test      # node:test against a stand-in Claw and a stand-in ACP adapter (real processes, real sockets)
-npm run build                      # dist/cli.js: one file; the wire contract from claw/packages/protocol is compiled in
-node scripts/check-pack.mjs        # packs the tarball: it must hold only dist/cli.js, README.md, LICENSE and package.json
+npm run build                      # dist/cli.js and dist/terminal-hook.js; the wire contract from claw/packages/protocol is compiled in
+node scripts/check-pack.mjs        # packs the tarball: it must hold only dist/cli.js, dist/terminal-hook.js, README.md, LICENSE and package.json
 npm pack && npm install -g ./primusclaw-connector-*.tgz   # the package as the registry serves it, from a checkout
 ```
 

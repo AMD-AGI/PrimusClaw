@@ -146,7 +146,7 @@ record it.
   tag is limited to repository admins by a tag ruleset. The tag must equal the version in
   `connector/package.json`. Once a release has been published,
   `npm install -g @primusclaw/connector` installs the `claw-connector` command (Node.js 22 or newer).
-  The package holds only the bundle, README and LICENSE, and the Connector packaging workflow checks a real
+  The package holds only the two bundles (the CLI and the session-hook program), README and LICENSE, and the Connector packaging workflow checks a real
   tarball on every change (`connector/scripts/check-pack.mjs`), together with the shape of the release workflow.
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
