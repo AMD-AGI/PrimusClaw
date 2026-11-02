@@ -38,8 +38,9 @@ record it.
   does not start. See `claw/docs/identity-client.md`.
 - The sandbox of a session that acts as a user (`config.acting_as`, GitHub review on) is created without its owner's
   keys: Brain is told (`ExecuteRequest.withhold_sandbox_keys`, set on every turn of such a session) to leave
-  `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `SAFE_API_KEY` out of its environment, while it still uses the keys for the
-  model and for SaFE. Nothing changes for any other session. See `claw/docs/github-review.md`.
+  `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `SAFE_API_KEY` out of its environment, whichever layer sets them, while it
+  still uses the keys for the model and for SaFE; a hosted application run is refused for such a session (409
+  `app_run_not_allowed_for_acting_session`). Nothing changes for any other session. See `claw/docs/github-review.md`.
 - Brain now enforces `ExecuteRequest.tools_allowlist`, which it used to ignore. A run whose request carries a
   non-empty list is offered only the tools it names, and a call outside the list is refused with an error
   instead of run: a tool the model was never offered, one a resumed transcript still names, a `task` or

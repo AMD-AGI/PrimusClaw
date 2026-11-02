@@ -100,7 +100,7 @@ test("settings: defaults, and a refused number falls back and is reported", () =
 
 test("the sandbox's keys are left alone, and the database is asked nothing, for a row that has acting_as", async () => {
   // Nothing is offered to such a row, so it is an ordinary session, and an ordinary session's sandbox holds its owner's keys as it always did.
-  const { applySandboxKeyPolicyToTask, withholdsSandboxKeys } = await import("../src/github-review/session-tools.js");
+  const { applySandboxKeyPolicyToTask, sessionWithholdsSandboxKeys, withholdsSandboxKeys } = await import("../src/github-review/session-tools.js");
   const { applyAppMcpToTask } = await import("../src/sessions/app-mcp.js");
   assert.equal(withholdsSandboxKeys({ acting_as: "u-2" }), false);
   const query = db.query;
@@ -110,6 +110,7 @@ test("the sandbox's keys are left alone, and the database is asked nothing, for 
     const task: Record<string, unknown> = {};
     await applySandboxKeyPolicyToTask(task, "s-1");
     assert.deepEqual(task, {});
+    assert.equal(await sessionWithholdsSandboxKeys("s-1"), false, "and a hosted application run is asked for as it always was");
     // The whole of what is added to a turn built for a session: the application servers' own statements, and none about acting_as.
     await applyAppMcpToTask(task, "s-1");
     assert.equal("withhold_sandbox_keys" in task, false);

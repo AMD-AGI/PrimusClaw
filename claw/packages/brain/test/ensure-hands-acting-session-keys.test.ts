@@ -112,3 +112,24 @@ test("the marker is a switch for a true value only: false and absent are an ordi
     assert.equal(r.created.env.SAFE_API_KEY, PLATFORM_KEY, String(marker));
   }
 });
+
+test("no layer can put a key back: the spec's env, the user's own variables and the request's env are all taken out of a marked sandbox, and reach an ordinary one", async () => {
+  const layers = {
+    sandbox_spec: {
+      handle: "main", image: "registry.test/img:1", resources: { cpu: "1", memory: "1Gi" },
+      env: { ANTHROPIC_API_KEY: "planted-in-spec", SAFE_API_KEY: "planted-in-spec", SPEC_KEPT: "1" },
+    },
+    user_env: { OPENAI_API_KEY: "the-users-own", ANTHROPIC_API_KEY: "the-users-own", USER_KEPT: "1" },
+    session_env: { OPENAI_API_KEY: "planted-in-session", ANTHROPIC_API_KEY: "planted-in-session", SESSION_KEPT: "1" },
+  } as Partial<ExecuteRequest>;
+  // Control: without the mark the layers do reach the sandbox (the request's env has the last word), so the absence below is the mark's.
+  const ordinary = await sandboxEnvOf(layers);
+  for (const env of everyEnv(ordinary)) {
+    assert.deepEqual([env.ANTHROPIC_API_KEY, env.OPENAI_API_KEY], ["planted-in-session", "planted-in-session"]);
+  }
+  const marked = await sandboxEnvOf({ ...layers, withhold_sandbox_keys: true });
+  for (const env of everyEnv(marked)) {
+    for (const name of KEY_NAMES) assert.equal(name in env, false, `${name} is not in the sandbox's environment`);
+    assert.deepEqual([env.SPEC_KEPT, env.USER_KEPT, env.SESSION_KEPT], ["1", "1", "1"], "and nothing else is taken out");
+  }
+});

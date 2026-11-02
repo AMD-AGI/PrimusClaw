@@ -232,8 +232,11 @@ with `config.acting_as` is therefore built differently: every turn Brain is hand
 turn claimed from the queue, a task of a DAG), and Brain creates its sandbox with none of the three. Brain keeps using
 the key for what it does itself, the model calls and the workload it creates and owns in SaFE. What a process in
 the sandbox cannot do is call the model or SaFE as the requester: a review reads and runs code, it does not need
-to. Environment variables the requester stored for themselves (`user_env`, `session_env`) are theirs and are applied
-as before, and a sandbox that was created before the mark existed keeps the environment it was created with.
+to. The three variables are taken out of the environment once it is composed, whichever layer set them (the
+sandbox spec's, the requester's own stored variables, the request's); every other variable is applied as before.
+A sandbox that was created before the mark existed keeps the environment it was created with. A hosted application
+run (`mode: "app"`) is refused for such a session (`409 app_run_not_allowed_for_acting_session`): an application's
+sandbox is made with the key, and an application is code the session's model can hand text to.
 The key stays where the session already keeps it (the session's stored configuration, server-managed), and is not
 shown to the model or the sandbox. Nothing changes while `CLAW_GITHUB_REVIEW_ENABLED` is off: such a session is
 an ordinary one.

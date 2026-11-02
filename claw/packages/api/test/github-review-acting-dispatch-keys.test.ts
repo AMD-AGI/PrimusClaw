@@ -12,6 +12,7 @@
  *   D1  a turn claimed from the queue (the doorbell path) is marked from the live row at the claim, and its keys are still handed to Brain
  *   D2  a task of a DAG (the scheduler's dispatch) is marked from the session's stored config, and its key is still handed to Brain
  *   D3  each place that hands Brain a turn for a stored session decides the sandbox's keys
+ *   D4  a hosted application's sandbox is made with the owner's keys, so none is made for such a session
  */
 import test, { after, before } from "node:test";
 import assert from "node:assert/strict";
@@ -31,6 +32,7 @@ const { registerInternalRunRoutes } = await import("../src/routes/internal-runs.
 const { runClaimPorts } = await import("../src/tasks/run-claim.js");
 const { sealRunCredentials } = await import("../src/tasks/run-secrets.js");
 const { dispatchTask, taskPublisher } = await import("../src/tasks/dispatcher.js");
+const { checkAppRunRequest, appRunPorts } = await import("../src/tasks/app-run.js");
 
 const TOKEN = "cluster-internal-token";
 const originalQuery = db.query;
@@ -141,4 +143,26 @@ test("D3 each place that hands Brain a turn for a stored session decides the san
   assert.deepEqual(calls(/\bapplyAppMcpToTask\((?!task: Record)/), ["sessions/dispatch.ts", "tasks/pending-dispatch.ts", "tasks/run-claim.ts"]);
   assert.deepEqual(calls(/\bwithholdsSandboxKeys\(cfg\)/), ["tasks/dispatcher.ts"]);
   assert.match(strip(readFileSync(join(src, "sessions/app-mcp.ts"), "utf8")), /await applySandboxKeyPolicyToTask\(task, sessionId\);/);
+});
+
+test("D4 a hosted application run is refused for a session that acts as a user, before anything is looked up, and is asked of any other session as it always was", async () => {
+  const asked: string[] = [];
+  const answerFor = (actingAs: unknown) => (async (text: string) => {
+    const sql = text.replace(/\s+/g, " ").trim();
+    asked.push(sql);
+    if (/SELECT config->'acting_as' AS acting_as FROM claw_sessions/.test(sql)) return { rows: [{ acting_as: actingAs === undefined ? null : actingAs }], rowCount: 1 };
+    return { rows: [], rowCount: 0 };
+  }) as typeof db.query;
+  const ports = { ...appRunPorts, enabled: () => true };
+  const user = { userId: "u-1", userName: "u-1", roles: ["default"], platformKey: "pk", virtualKey: "vk" };
+  for (const [what, actingAs, marked] of ACTING) {
+    db.query = answerFor(actingAs);
+    asked.length = 0;
+    const out = await checkAppRunRequest({ sessionId: "s-1", user, auth: {}, body: { plugin_id: 7, input: {} }, idemKey: null, requestHash: "h" }, ports);
+    if (marked) {
+      assert.deepEqual([out, asked.some((sql) => /FROM plugins/.test(sql))], [{ statusCode: 409, response: { ok: false, error: "app_run_not_allowed_for_acting_session" } }, false], what);
+    } else {
+      assert.deepEqual([out, asked.some((sql) => /FROM plugins/.test(sql))], [{ statusCode: 404, response: { ok: false, error: "plugin_not_found" } }, true], `${what}: the next check is the one it was`);
+    }
+  }
 });

@@ -343,6 +343,17 @@ export function applyPlatformKeyEnv(
   if (!kubernetesMode) env.SAFE_API_KEY = apiKey;
 }
 
+/** The variables a process in a sandbox reads a model or platform key from. */
+export const SANDBOX_KEY_ENV_NAMES: readonly string[] = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "SAFE_API_KEY"];
+
+/**
+ * Takes every key variable out of a sandbox's composed environment, whichever layer put it there (the spec's env, the system's, the
+ * user's own variables, the request's). For a request marked `withhold_sandbox_keys`: the session's model reads what strangers wrote.
+ */
+export function withholdKeyEnv(env: Record<string, string>): void {
+  for (const name of SANDBOX_KEY_ENV_NAMES) delete env[name];
+}
+
 /**
  * Only the two model variables, under the conventional Anthropic / OpenAI
  * names, without `SAFE_API_KEY`. In safe mode the value is still the caller's

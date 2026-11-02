@@ -97,3 +97,20 @@ test("a session that acts as a user gets a sandbox without the key, wherever its
     assert.equal(env.CLAW_SESSION_ID, "sess-acting-k8s", "the rest of the environment is built as it always was");
   }
 });
+
+test("no layer can put the key back: the spec's env, the user's own variables and the request's env are all taken out", async () => {
+  const layers = {
+    sandbox_spec: {
+      handle: "main", image: "registry.test/img:1", resources: { cpu: "1", memory: "1Gi" },
+      env: { ANTHROPIC_API_KEY: "planted-in-spec", SPEC_KEPT: "1" },
+    },
+    user_env: { OPENAI_API_KEY: "the-users-own", USER_KEPT: "1" },
+    session_env: { ANTHROPIC_API_KEY: "planted-in-session", SESSION_KEPT: "1" },
+  } as Partial<ExecuteRequest>;
+  const [ordinary] = await sandboxEnvOf(layers);
+  assert.deepEqual([ordinary!.ANTHROPIC_API_KEY, ordinary!.OPENAI_API_KEY], ["planted-in-session", "the-users-own"], "control: without the mark they reach the sandbox");
+  for (const env of await sandboxEnvOf({ ...layers, withhold_sandbox_keys: true })) {
+    for (const name of KEY_NAMES) assert.equal(name in env, false, `${name} is not in the sandbox's environment`);
+    assert.deepEqual([env.SPEC_KEPT, env.USER_KEPT, env.SESSION_KEPT], ["1", "1", "1"], "and nothing else is taken out");
+  }
+});

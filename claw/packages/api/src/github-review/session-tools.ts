@@ -36,12 +36,17 @@ export function withholdsSandboxKeys(config: unknown): boolean {
 }
 
 /**
- * Marks a turn that is built here for a session that acts as a user (`withhold_sandbox_keys`, protocol). Read from the live row, as the
- * tools are, and not caught: a turn whose session cannot be read is not started with its keys in the sandbox.
+ * `withholdsSandboxKeys` for a session that is read from its row now, as the tools are. Not caught: a session that cannot be read is not
+ * one whose work is started with its keys in the sandbox. Asks the database nothing while the feature is off.
  */
+export async function sessionWithholdsSandboxKeys(sessionId: string): Promise<boolean> {
+  if (!CLAW_GITHUB_REVIEW_ENABLED) return false;
+  return withholdsSandboxKeys({ acting_as: await storedActingAs(sessionId) });
+}
+
+/** Marks a turn that is built here for a session that acts as a user (`withhold_sandbox_keys`, protocol). */
 export async function applySandboxKeyPolicyToTask(task: Record<string, unknown>, sessionId: string): Promise<void> {
-  if (!CLAW_GITHUB_REVIEW_ENABLED) return;
-  if (withholdsSandboxKeys({ acting_as: await storedActingAs(sessionId) })) task.withhold_sandbox_keys = true;
+  if (await sessionWithholdsSandboxKeys(sessionId)) task.withhold_sandbox_keys = true;
 }
 
 export async function githubReviewMcpServers(sessionId: string): Promise<McpServers> {

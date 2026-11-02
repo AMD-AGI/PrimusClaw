@@ -39,6 +39,7 @@ import {
   writeTopologyHandoff,
   hasSshKeyFile,
   applyPlatformKeyEnv,
+  withholdKeyEnv,
 } from "./params.js";
 import type { SandboxAction } from "./params.js";
 import { resourcesJsonToWorkloadArray } from "./workload-resources.js";
@@ -2656,12 +2657,7 @@ async function provisionHands(
   // a shared virtualKey relay.
   // In safe mode the same key is also SAFE_API_KEY (platform-owned; the deny
   // lists keep user/system env from overriding it).
-  //
-  // Not for a session that acts as a user's GitHub account: its model reads text
-  // strangers wrote, and whatever the sandbox's environment holds the model can
-  // print. `apiKey` itself is still what the workload is created and owned with
-  // (below); only the copy a process in the sandbox could read is withheld.
-  applyPlatformKeyEnv(env, request.withhold_sandbox_keys ? undefined : apiKey, isKubernetesMode());
+  applyPlatformKeyEnv(env, apiKey, isKubernetesMode());
 
   // Multi-node: point Hyperloom's SaFE-less external mode at the cluster Brain
   // already provisioned instead of the per-user SaFE workload it would
@@ -2679,6 +2675,13 @@ async function provisionHands(
     userEnv: request.user_env ?? {},
     sessionEnv: request.session_env ?? {},
   });
+  // A session that acts as a user's GitHub account: its model reads text strangers
+  // wrote, and whatever the sandbox's environment holds the model can print. Taken
+  // out of the composed result, so that no layer can have put one there (the spec's
+  // env, the user's own variables, the request's). `apiKey` is still what the
+  // workload is created and owned with (below); only a copy a process in the
+  // sandbox could read is withheld.
+  if (request.withhold_sandbox_keys) withholdKeyEnv(env);
 
   // ── kubernetes/BYOK mode: agent-sandbox provider path (design §16.5). ──
   // safe mode falls through to the SaFE Workload path below (unchanged).
