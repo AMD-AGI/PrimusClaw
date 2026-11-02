@@ -46,6 +46,18 @@ record it.
   session's model. Another user's item is a 404. Four tables (`claw_assistants`, `claw_work_items`,
   `claw_work_item_events`, `claw_assistant_says`) exist only while the switch is on; the assistant's model
   tools and the way a worker reports are separate changes.
+- The assistant's turns, still behind `CLAW_ASSISTANT_ENABLED`. A user's messages go to their assistant session,
+  whose turns are cut to the assistant's own tools (`tools_allowlist: ["mcp__assistant__*"]`, so Brain must
+  already honour it: roll Brain out first): `say` is the only way anything reaches the user (the assistant's
+  plain output goes nowhere), `work_create` starts a work item in its own worker session, `work_send` and
+  `work_stop` steer it, `work_recall` looks closer. A worker reports with one tool, `report`, and never speaks
+  to the user; a report, its event and the message that wakes the assistant are one transaction, and a report
+  from a run that is no longer the item's current one is refused (generation fencing). A worker turn that ends
+  without reporting is recorded as ready (or failed), and the sweeper records a turn whose end was lost and
+  tells the user about an item that has needed them for `CLAW_ASSISTANT_SILENT_SWEEP_SEC` (default 300) with
+  no delivered message. The tools are served at `/v1/internal/assistant-mcp`, authenticated by a per-turn
+  bearer signed with `CLAW_ASSISTANT_TOKEN_KEY` (required, 32+ characters, when the switch is on);
+  `CLAW_ASSISTANT_WORKER_MODEL` and `CLAW_ASSISTANT_ROUTER_MAX_TURNS` (default 8) tune the turns.
 - `CLAW_REQUIRED_PLATFORM_ROLES` (chart: `api.requiredPlatformRoles`; empty by default, which changes
   nothing) names platform roles of which a caller must hold at least one to use Claw at all. Anyone else is
   refused with a 403 `platform_access_required` ("no access yet - ask an administrator") on every
