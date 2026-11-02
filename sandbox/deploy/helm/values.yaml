@@ -46,9 +46,11 @@ controlplane:
     # image (built with EXTRA_CA_CERT_URLS) and fails the same way if it is empty.
     sandboxExtraCAConfigMap: ""
     sandboxExtraCARequired: false
-    # primus-identity keys on the E2B API. Enabled when introspectUrl and
-    # ownerPolicyConfigMap are both set. The client Secret holds client_id and
-    # client_secret; the ConfigMap key policy.json holds the owner quota policy.
+    # primus-identity keys on the E2B API. Introspection is enabled when
+    # introspectUrl and ownerPolicyConfigMap are both set. The client Secret
+    # holds client_id and client_secret; primus-identity creates that Secret
+    # once in this namespace and does not rotate it. The ConfigMap key
+    # policy.json holds the owner quota policy.
     # The policy is read at startup: a ConfigMap change needs a rollout restart.
     # The policy role must match the role of existing owner records.
     # A quota field left out keeps the built-in value; one left out of an owners
@@ -57,7 +59,7 @@ controlplane:
       introspectUrl: ""
       # attestUrl is POST /api/v1/sandbox-attestations. Workload creation calls it
       # with the client Secret below and copies the token onto the Workload.
-      attestUrl: ""
+      attestUrl: "http://primus-identity.primus-identity.svc/api/v1/sandbox-attestations"
       clientSecret: "agent-sandbox-identity-client"
       ownerPolicyConfigMap: ""
   # Graceful drain on rollout or eviction, in Kubernetes order:
