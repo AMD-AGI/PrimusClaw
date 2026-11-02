@@ -28,6 +28,14 @@ record it.
 ## [Unreleased]
 
 ### Added
+- Brain now enforces `ExecuteRequest.tools_allowlist`, which it used to ignore. A run whose request carries a
+  non-empty list is offered only the tools it names, and a call outside the list is refused with an error
+  instead of run: a tool the model was never offered, one a resumed transcript still names, a `task` or
+  `todo_write` the loop handles itself, and anything a sub-agent calls (a sub-agent starts from the parent's
+  tools narrowed by the same list). An entry is an exact tool name, or a name ending in `*` that matches by
+  prefix (`mcp__<server>__*` names a whole MCP server). A request with no list, or an empty one, changes
+  nothing. DAG nodes that set no list of their own inherit one from their plugin's MCP tool rows (api
+  `dag-expander`) and are now held to it; `mode=script` tasks still ignore the field.
 - `CLAW_REQUIRED_PLATFORM_ROLES` (chart: `api.requiredPlatformRoles`; empty by default, which changes
   nothing) names platform roles of which a caller must hold at least one to use Claw at all. Anyone else is
   refused with a 403 `platform_access_required` ("no access yet - ask an administrator") on every
