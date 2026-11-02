@@ -7,6 +7,7 @@ import { handleA2ACall } from "../clients/a2a.js";
 import { LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON } from "../tasks/abort-registry.js";
 import { callBackendMcpTool } from "../clients/backend-mcp.js";
 import { getPluginToolScope } from "./scope.js";
+import { toolNotAllowedMessage, type ToolAllowlist } from "./allowlist.js";
 import type { ToolSchema, PendingMemory, PendingSkill, PendingSkillFileMutation } from "@claw/protocol";
 import {
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED, TODO_WRITE_ENABLED, BG_SHELL_ENABLED,
@@ -158,6 +159,14 @@ export class ToolRouter {
   memoryEnabled = true;
 
   /**
+   * The run's `tools_allowlist`, null when it has none. Set by the engine from
+   * the request; `route()` refuses any call outside it. A sub-agent's router is
+   * not given it: that router's own guard is built from the schemas the
+   * sub-agent was handed, which the same list has already narrowed.
+   */
+  private toolAllowlist: ToolAllowlist | null = null;
+
+  /**
    * Whom `a2a_call` acts for and how long the run has: the session's owner (an identity
    * peer is called as them), its id for logs, and the epoch ms its budget ends. Set by the
    * engine; sub-agent routers inherit it, so a sub-agent's call is the same user's.
@@ -243,6 +252,11 @@ export class ToolRouter {
     this.pluginTools = opts.pluginTools ?? undefined;
   }
 
+  /** Restrict this router to a run's `tools_allowlist`; null lifts the restriction. */
+  setToolAllowlist(allowlist: ToolAllowlist | null): void {
+    this.toolAllowlist = allowlist;
+  }
+
   /** Parse a file path for `.skills/{name}/SKILL.md` and record the skill name. */
   private trackSkillRead(path: string): void {
     const m = path.match(/\.skills\/([a-z0-9][a-z0-9-]*)\/SKILL\.md/i);
@@ -317,6 +331,12 @@ export class ToolRouter {
     /** Replay-stable identity of this call site; sealed on the reference row. */
     ctx?: { stepIdentity?: string },
   ): Promise<string> {
+    // First, before any branch below can reach a sandbox, a server or a peer:
+    // the schemas the model was given are advice, and this is the enforcement.
+    if (this.toolAllowlist && !this.toolAllowlist.allows(name)) {
+      return refuse(outcome, toolNotAllowedMessage(name));
+    }
+
     if (LOOP_INTERCEPTED_TOOLS.has(name)) {
       throw new Error(`${name} must be handled by engine loop, not router`);
     }

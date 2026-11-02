@@ -410,6 +410,43 @@ export function anthropicDefaultHeaders(opts: {
   };
 }
 
+type AnthropicClientOptions = NonNullable<ConstructorParameters<typeof Anthropic>[0]>;
+
+/**
+ * The credential headers for a gateway that still authenticates `x-api-key`.
+ *
+ * SDK 1 sends `apiKey` as `Authorization: Bearer`. This gateway bills the
+ * Anthropic wire from `x-api-key` and does not treat that Bearer as the run's
+ * key, so the key has to travel under the old header and the Bearer has to be
+ * removed. `null` is how this SDK drops a header it would otherwise set.
+ */
+export function anthropicAuthHeaders(apiKey: string): Record<string, string | null> {
+  return {
+    "x-api-key": apiKey,
+    Authorization: null,
+  };
+}
+
+/** One Anthropic client, with the gateway's auth headers on every request. */
+export function createAnthropicClient(opts: {
+  apiKey: string;
+  baseURL: string;
+  maxRetries?: number;
+  fetch?: AnthropicClientOptions["fetch"];
+  defaultHeaders?: Record<string, string | null>;
+}): Anthropic {
+  return new Anthropic({
+    apiKey: opts.apiKey,
+    baseURL: opts.baseURL,
+    maxRetries: opts.maxRetries ?? 2,
+    fetch: opts.fetch,
+    defaultHeaders: {
+      ...opts.defaultHeaders,
+      ...anthropicAuthHeaders(opts.apiKey),
+    },
+  });
+}
+
 export class AnthropicProvider implements LlmProvider {
   readonly name = "anthropic" as const;
 
@@ -427,10 +464,9 @@ export class AnthropicProvider implements LlmProvider {
     // 503), which previously surfaced as `task.failed` after dozens of
     // successful turns and forced the task to restart via NATS redelivery.
     const capture: RoutedModelSink = {};
-    const client = new Anthropic({
+    const client = createAnthropicClient({
       apiKey,
       baseURL: apiUrl,
-      maxRetries: 2,
       fetch: wrapFetchCaptureRoutedModel(capture),
       defaultHeaders: anthropicDefaultHeaders({ litellmTags, litellmMeta, userId, sessionId }),
     });

@@ -28,6 +28,18 @@ record it.
 ## [Unreleased]
 
 ### Added
+- Brain now enforces `ExecuteRequest.tools_allowlist`, which it used to ignore. A run whose request carries a
+  non-empty list is offered only the tools it names, and a call outside the list is refused with an error
+  instead of run: a tool the model was never offered, one a resumed transcript still names, a `task` or
+  `todo_write` the loop handles itself, and anything a sub-agent calls (a sub-agent starts from the parent's
+  tools narrowed by the same list). An entry is an exact tool name, or a name ending in `*` that matches by
+  prefix (`mcp__<server>__*` names a whole MCP server). A request with no list, or an empty one, changes
+  nothing. The API's DAG expander used to fill a node that set no list with the names of its plugin's MCP tool
+  rows, which are not the names Brain's tools have; such a node now sends no list (so it keeps every tool, as
+  before), and a list a node does set has an entry naming one of the plugin's MCP tool rows converted to
+  `mcp__<server>__*` for each server that row declares. A node's list that is not a list of strings is refused
+  when the template is registered (and when a stored one is expanded) instead of being read as no list.
+  `mode=script` tasks still ignore the field.
 - The assistant's board, off by default (`CLAW_ASSISTANT_ENABLED=true`; one switch for every user, no per-user
   list): `POST /v1/assistant` returns the caller's assistant session, made on first use and the same one every
   time; `GET /v1/work-items?state=in_progress|needs_you|done` and `GET /v1/work-items/:id` show the work the
