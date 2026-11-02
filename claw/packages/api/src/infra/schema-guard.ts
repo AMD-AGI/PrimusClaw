@@ -132,6 +132,9 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
       // Absent, a retried drain cannot recognise the run it already opened and
       // executes the queued message a second time.
       "dispatch_task_id",
+      // Absent, the insert that carries a dedupe key fails outright, so every
+      // submit that names one is refused -- the retry-safe path, not the plain one.
+      "dedupe_key",
     ],
   },
   {
