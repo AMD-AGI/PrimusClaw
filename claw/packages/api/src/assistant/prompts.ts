@@ -77,13 +77,20 @@ export interface ManifestItem {
   pendingQuestion: string | null;
 }
 
+/**
+ * What a worker or a page wrote, as one line. The list and the wake message are read by the router as its own
+ * instructions' neighbours: a line break in a worker's words could start a line that looks like another item
+ * or another event.
+ */
+const oneLine = (text: string): string => text.replace(/\s+/g, " ").trim();
+
 export function formatManifestLine(item: ManifestItem): string {
-  const parts = [`#${item.seq} [${item.boardState}] ${item.title}`];
-  if (item.summary) parts.push(`- ${item.summary}`);
+  const parts = [`#${item.seq} [${item.boardState}] ${oneLine(item.title)}`];
+  if (item.summary) parts.push(`- ${oneLine(item.summary)}`);
   const tail: string[] = [];
   if (item.lastReportKind) tail.push(`last report: ${item.lastReportKind}`);
   if (item.resultVersion > 0) tail.push(`result v${item.resultVersion}`);
-  if (item.pendingQuestion) tail.push(`asks: ${item.pendingQuestion}`);
+  if (item.pendingQuestion) tail.push(`asks: ${oneLine(item.pendingQuestion)}`);
   return tail.length ? `${parts.join(" ")} (${tail.join("; ")})` : parts.join(" ");
 }
 
@@ -101,5 +108,5 @@ export function formatWorkEvent(e: {
   seq: number; kind: ReportKind; version?: number; summary: string; question?: string | null;
 }): string {
   const head = `${WORK_EVENT_PREFIX} #${e.seq} ${e.kind}${e.kind === "ready" && e.version ? ` v${e.version}` : ""}`;
-  return `${head}: ${e.summary}${e.question ? `\nQuestion for the user: ${e.question}` : ""}`;
+  return `${head}: ${oneLine(e.summary)}${e.question ? `\nQuestion for the user: ${oneLine(e.question)}` : ""}`;
 }
