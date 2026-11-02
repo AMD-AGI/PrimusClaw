@@ -293,6 +293,21 @@ function declaresImageDigest(dag: TaskDagDef): boolean {
   return false;
 }
 
+/**
+ * Why a node's `tools_allowlist` cannot be sent to Brain, or null when it can.
+ *
+ * Brain offers a run only the tools the list names, and reads a value that is not
+ * a list of names as "nothing is allowed". A malformed value is refused here, at
+ * the door, rather than being turned into "no restriction" further on.
+ */
+export function toolsAllowlistProblem(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
+    return "tools_allowlist must be an array of strings";
+  }
+  return null;
+}
+
 export interface DagAdmissionResult {
   derived: DagDerived;
 }
@@ -319,6 +334,8 @@ export async function validateDag(dag: TaskDagDef): Promise<DagAdmissionResult> 
     if (n.workspace_throwaway !== undefined && typeof n.workspace_throwaway !== "boolean") {
       throw new BadRequestError(`node ${n.id}: workspace_throwaway must be a boolean`);
     }
+    const allowlistProblem = toolsAllowlistProblem(n.tools_allowlist);
+    if (allowlistProblem) throw new BadRequestError(`node ${n.id}: ${allowlistProblem}`);
   }
   for (const n of dag.nodes) {
     for (const dep of n.depends_on ?? []) {
