@@ -16,7 +16,7 @@
  *       lines that were slow, and read what they read before
  *   S5  one `assessRisk` call on the most a pull request can make it read (500 lines at the cap) costs a bounded amount, whatever the lines
  *       repeat: the bound is on the call, which is what the shared API pays, and not on one `exec`; it is a multiple of what a call on lines
- *       nothing reads costs, timed in the same moment, so that how fast or how busy the machine is cancels out
+ *       nothing reads costs, timed in the same run, so that how fast or how busy the machine is cancels out
  *   S6  the three patterns that were rewritten after S5 was written read what they read before
  */
 import assert from "node:assert/strict";
@@ -172,29 +172,26 @@ test("S5 one assessRisk call on the most a pull request can make it read costs a
   // what it costs the caller, and asks for the call, not the `exec`, to be bounded.
   //
   // The bound is not a number of milliseconds, which a busy CI runner makes any call exceed (one run measured 2959 ms for a call that takes
-  // 60 to 90 ms): it is CALL_BUDGET_RATIO times a call on lines that no pattern has anything to say about, timed right before it in the same
-  // process, so that a slow machine slows both and the ratio stays what it is. A pause that hits one of the two only is not a verdict: the
-  // pair is timed again, up to ROUNDS times, and the opening is over the bound only if no round is under it. A pattern that has gone
-  // super-linear is over it in every round, by a factor of hundreds.
-  const ROUNDS = 5;
+  // 60 to 90 ms): it is CALL_BUDGET_RATIO times a call on lines that no pattern has anything to say about, timed in the same process, so
+  // that a slow machine slows both and the ratio stays what it is. Each is timed ROUNDS times, round after round, and the least of the
+  // rounds is the one compared: a pause only ever makes a call slower, so the least is the one it touched least, on either side of the
+  // ratio, and one pause cannot decide the result. A pattern that has gone super-linear is over the bound in every round.
+  const ROUNDS = 3;
   const openings = ["#[arg(", "#[clap(", "r.get<", "app.PUT<", "r.get<x>(", "nolint:", "eslint-disable", "/*", "function ", "export ", "import("];
   const callMs = (line: string): number => assessLines(Array.from({ length: LINES_AT_CAP }, () => line)).ms;
   const fill = (unit: string): string => unit.repeat(Math.ceil(MAX_LINE_CHARS / unit.length)).slice(0, MAX_LINE_CHARS);
   const quiet = fill("lorem ipsum dolor sit amet "); // words, as a line of prose is, and none of the openings above
-  const over: string[] = [];
-  for (const opening of openings) {
-    const line = fill(opening);
-    let last = "";
-    let within = false;
-    for (let round = 0; round < ROUNDS && !within; round++) {
-      const base = callMs(quiet);
-      const ms = callMs(line);
-      within = ms <= CALL_BUDGET_RATIO * base;
-      last = `${Math.round(ms)} ms against ${Math.round(base)} ms for a call on lines nothing reads (${(ms / base).toFixed(1)} times)`;
-    }
-    if (!within) over.push(`${JSON.stringify(opening)} x ${LINES_AT_CAP} lines of ${MAX_LINE_CHARS}: ${last}`);
+  const lines = openings.map(fill);
+  let base = Infinity;
+  const least = openings.map(() => Infinity);
+  for (let round = 0; round < ROUNDS; round++) {
+    base = Math.min(base, callMs(quiet));
+    lines.forEach((line, k) => { least[k] = Math.min(least[k]!, callMs(line)); });
   }
-  assert.deepEqual(over, [], `the budget of one call is ${CALL_BUDGET_RATIO} times a call that reads nothing, in every one of ${ROUNDS} rounds`);
+  const over = openings.flatMap((opening, k) => least[k]! > CALL_BUDGET_RATIO * base
+    ? [`${JSON.stringify(opening)} x ${LINES_AT_CAP} lines of ${MAX_LINE_CHARS}: ${Math.round(least[k]!)} ms against ${Math.round(base)} ms for a call on lines nothing reads (${(least[k]! / base).toFixed(1)} times)`]
+    : []);
+  assert.deepEqual(over, [], `the budget of one call is ${CALL_BUDGET_RATIO} times a call that reads nothing, least of ${ROUNDS} rounds each`);
 });
 
 test("S6 the patterns that were rewritten to be linear read what they read before", () => {
