@@ -444,6 +444,9 @@ export const NOTIFY_WEBHOOK_ALLOWED_HOSTS = env("NOTIFY_WEBHOOK_ALLOWED_HOSTS");
 export const NOTIFY_MIN_RUN_SECONDS = envInt("NOTIFY_MIN_RUN_SECONDS", 60);
 // Prefix of the `link` field in a notification, relative to the web UI origin.
 export const NOTIFY_LINK_BASE = env("NOTIFY_LINK_BASE", "/primus-claw");
+// The most `say` messages one user's assistant may send in an hour. A guard against a
+// looping assistant, not a quota: a person is not meant to meet it.
+export const CLAW_ASSISTANT_SAY_MAX_PER_HOUR = envInt("CLAW_ASSISTANT_SAY_MAX_PER_HOUR", 120, { min: 1 });
 
 // --- Remote agents (default OFF) ---
 // When false: no remote-agent tables, no routes, and nothing polls. A connector
