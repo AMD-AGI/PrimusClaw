@@ -8,6 +8,7 @@ import path from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
 import { HandsClient } from "../clients/hands.js";
 import { ToolRouter } from "../tools/router.js";
+import { filterToolSchemas, parseToolAllowlist } from "../tools/allowlist.js";
 import { agentLoop } from "./agent-loop.js";
 import { resolveToolIds } from "../tools/resolve.js";
 import { marketplaceToolIds, pluginToolsHaveHooks, resolvePluginToolsFromMessage } from "../tasks/plugin-from-message.js";
@@ -346,7 +347,12 @@ export class AgentEngine {
         sessionId: request.session_id,
         ...(Number.isFinite(deadlineMs) ? { deadlineAtMs: deadlineMs } : {}),
       };
-      const allToolSchemas = [...router.getToolSchemas(), ...mcpResult.schemas];
+      // `tools_allowlist`: what the model is offered, and what the router will
+      // run, both read from the one parsed list. No field, or an empty one, is
+      // no restriction and leaves both exactly as they were.
+      const toolAllowlist = parseToolAllowlist(request.tools_allowlist);
+      router.setToolAllowlist(toolAllowlist);
+      const allToolSchemas = filterToolSchemas([...router.getToolSchemas(), ...mcpResult.schemas], toolAllowlist);
 
       const messages = [...(request.history || [])];
       const brainSystemParts = [rules, request.rules_text, request.system_append].filter(Boolean);
@@ -473,6 +479,7 @@ export class AgentEngine {
         sessionId,
         maxTurns,
         toolSchemaCount: allToolSchemas.length,
+        toolAllowlist: toolAllowlist?.patterns,
         messageCount: messages.length,
         mcpClients: mcpResult.clients.size,
         hasHooks: !!hookRunner,
@@ -494,6 +501,7 @@ export class AgentEngine {
           hands: attached,
           attachHands: sandbox,
           runIdentity,
+          toolAllowlist,
           platformMcpClients: mcpResult.clients,
           recreateHands: extras?.recreateHands,
           hooks: hookRunner,
