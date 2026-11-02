@@ -8,8 +8,8 @@
  * Trust enforcement is done at admission time (`tasks/dags/admission.ts`);
  * here we just materialize the already-validated template.
  *
- * Plugin defaults (image / resources / skills / rules_text / tools_allowlist)
- * are inherited at expansion time, *not* at runtime: copies the values into
+ * Plugin defaults (image / resources / skills / rules_text) are inherited at
+ * expansion time, *not* at runtime: copies the values into
  * each `claw_tasks` row so a later plugin version bump does not affect
  * in-flight DAG instances (task-design.md §6.5.3 plugin_assets_version).
  */
@@ -97,10 +97,53 @@ function topologicalSort(nodes: DagNode[]): DagNode[] {
 }
 
 /**
+ * The `tools_allowlist` a node carries to Brain, which since it started
+ * honouring the field offers a run only the tools the list names.
+ *
+ * A node that wrote no list gets `[]`, which Brain reads as "no restriction":
+ * the node keeps every tool, as it did while Brain ignored the field. It used
+ * to be filled with the plugin's MCP tool-row names (`board`), which are not
+ * names Brain's tools have (`mcp__board__ping`), so inheriting them would have
+ * taken bash and the plugin's own MCP tools away from every plugin-backed node.
+ *
+ * A node that did write a list gets it in the form Brain matches: an exact tool
+ * name, or `mcp__<server>__*`. An entry naming one of the plugin's MCP tool rows
+ * means every tool of the MCP servers that row declares (the keys of its
+ * `config.mcpServers`, which are the `<server>` in Brain's tool names), so it
+ * becomes one `mcp__<server>__*` per server. Everything else (a builtin such as
+ * `bash`, a name already in Brain's form, a name this plugin does not know) is
+ * passed through exactly as written.
+ */
+export function nodeToolsAllowlist(
+  node: Pick<DagNode, "tools_allowlist">,
+  plugin: ExpandOpts["plugin"],
+): unknown[] {
+  const explicit: unknown = node.tools_allowlist;
+  if (!Array.isArray(explicit)) return [];
+  const serversByRow = new Map<string, string[]>();
+  for (const row of plugin?.tools ?? []) {
+    const r = row as { name?: unknown; type?: unknown; config?: { mcpServers?: unknown } } | null;
+    if (!r || String(r.type ?? "").toLowerCase() !== "mcp" || typeof r.name !== "string") continue;
+    const servers = r.config?.mcpServers;
+    if (!servers || typeof servers !== "object" || Array.isArray(servers)) continue;
+    const names = Object.keys(servers);
+    if (names.length) serversByRow.set(r.name, names);
+  }
+  const out: unknown[] = [];
+  for (const entry of explicit) {
+    const servers = typeof entry === "string" ? serversByRow.get(entry.trim()) : undefined;
+    for (const converted of servers ? servers.map((server) => `mcp__${server}__*`) : [entry]) {
+      if (!out.includes(converted)) out.push(converted);
+    }
+  }
+  return out;
+}
+
+/**
  * Render plugin defaults into the node's runtime fields. The result lands
  * straight into `claw_tasks` so the live row is fully self-describing.
  */
-function applyPluginDefaults(node: DagNode, plugin: ExpandOpts["plugin"]): {
+export function applyPluginDefaults(node: DagNode, plugin: ExpandOpts["plugin"]): {
   sandbox_spec: NodeSandbox;
   tools_allowlist: unknown[];
   skills: unknown[];
@@ -122,12 +165,9 @@ function applyPluginDefaults(node: DagNode, plugin: ExpandOpts["plugin"]): {
     };
   }
 
-  // Tool / skill / rule / hook inheritance only applies to mode=llm nodes.
-  const tools: unknown[] = node.tools_allowlist
-    ? [...node.tools_allowlist]
-    : (plugin?.tools ?? [])
-      .filter((t: any) => t?.type === "mcp" && (t?.config?.scope ?? "hands") === "hands")
-      .map((t: any) => t.name);
+  // Skill / rule / hook inheritance only applies to mode=llm nodes. Tools are
+  // not inherited at all: see nodeToolsAllowlist.
+  const tools = nodeToolsAllowlist(node, plugin);
 
   const skills = node.skills
     ? [...node.skills]
