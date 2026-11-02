@@ -9,6 +9,7 @@
  *   L2  a tool is for its role: a worker cannot speak for the router, a router cannot report for a worker
  *   C1  work_create makes the item, its worker session and its first message together, or none of them
  *   C2  work_create refuses past the cap, refuses a bad repository and a session with no credentials, and takes a replay for the same item
+ *   C2d a call that waited behind another for the same title sees its item
  *   C3  numbers count per user
  *   N1  work_send takes the item back to in progress, queues the words once, and an acceptance of the old result then fails
  *   N2  work_stop closes the item, fences its worker out and drops a first message that never started
@@ -175,6 +176,27 @@ describe("assistant tools", { skip }, () => {
     assert.equal(await count("claw_work_items"), 1);
     assert.equal(await count("claw_sessions", "name = 'Fix the build'"), 1, "and one worker session");
     assert.equal(await count("claw_pending_messages"), 1);
+  });
+
+  test("C2d a call that waited for the user's lock sees the item the call before it committed", async () => {
+    const turn = await w.routerTurn(alice);
+    const holder = await w.h.connect();
+    try {
+      // The first call is in flight: it holds the user's assistant row.
+      await holder.query("BEGIN");
+      await holder.query("SELECT 1 FROM claw_assistants WHERE session_id = $1 FOR UPDATE", [alice.routerSid]);
+      const second = t().workCreate(turn, { title: "Fix the build", brief: "x" });
+      await new Promise((r) => setTimeout(r, 250));
+      // ... and commits its item while the second waits.
+      await holder.query("INSERT INTO claw_sessions (session_id, name, user_id, mode) VALUES ('w-first', 'Fix the build', 'alice', 'claw')");
+      await holder.query(
+        "INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, worker_session_id) VALUES ('kwi_first', 'alice', 1, 'Fix the build', 'in_progress', 'w-first')",
+      );
+      await holder.query("COMMIT");
+      const out = await second;
+      assert.deepEqual({ id: out.item_id, dup: out.deduplicated }, { id: "kwi_first", dup: true });
+      assert.equal(await count("claw_work_items"), 1);
+    } finally { await holder.query("ROLLBACK").catch(() => {}); await holder.end(); }
   });
 
   test("C3 numbers count per user", async () => {
