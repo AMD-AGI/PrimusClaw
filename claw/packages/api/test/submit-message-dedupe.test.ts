@@ -24,7 +24,9 @@
  *   D6  a keyed and an unkeyed insert freeze the same request
  *   D7  a session that is running parks the message and is not drained
  *   D8  an idle session is drained once, and the gate is left to the drain
- *   D9  a drain that throws leaves the message queued and says so
+ *   D9  a drain that throws before taking the message says it is still queued
+ *   D9b a drain that throws after taking it says it left the queue
+ *   D9c a drain that throws with the queue unreadable says it does not know
  *   D10 the duplicate is not drained a second time
  *   D11 a stranger, a missing and a deleted session queue nothing
  *   D12 a key where it cannot be honoured, or an unusable one, is refused
@@ -259,6 +261,47 @@ describe("queue then drain", () => {
     assert.equal(r.drain, "drain_failed");
     assert.equal(typeof r.pendingId, "number", "the message is recorded, which is what was asked");
     assert.equal((await queue()).length, 1, "and the sweeper's orphan drain can find it");
+  });
+
+  test("D9b a drain that took the message off the queue before it failed says the message left it", async () => {
+    // The real drain publishes, deletes the queue row and only then takes the
+    // gate, so it can fail with the message already on its way. "Still queued"
+    // would be false, and a caller that read it as licence to submit again would
+    // send the message twice: the key has no row left to find.
+    await seedSession(h, "s1", { agentStatus: "idle" });
+    submitMessagePorts.drainOldestPendingMessage = async () => {
+      await h.sql("DELETE FROM claw_pending_messages WHERE session_id = 's1'");
+      throw new Error("gate not taken");
+    };
+
+    const r = await enqueue("s1", "k");
+
+    assert.ok(r.kind === "queued");
+    if (r.kind !== "queued") return;
+    assert.equal(r.drain, "left_queue");
+    assert.deepEqual(await queue(), [], "the message is no longer queued");
+  });
+
+  test("D9c a drain that failed with the queue unreadable says it does not know", async () => {
+    await seedSession(h, "s1", { agentStatus: "idle" });
+    const query = db.query;
+    submitMessagePorts.drainOldestPendingMessage = async () => {
+      db.query = (async (text: string, params?: unknown[]) => {
+        if (/FROM claw_pending_messages WHERE id = \$1/.test(text)) throw new Error("database unavailable");
+        return query(text, params);
+      }) as typeof db.query;
+      throw new Error("drain refused");
+    };
+
+    try {
+      const r = await enqueue("s1", "k");
+      assert.ok(r.kind === "queued");
+      if (r.kind !== "queued") return;
+      assert.equal(r.drain, "drain_unknown",
+        "neither 'still queued' nor 'gone': a read that failed is not an answer");
+    } finally {
+      db.query = query;
+    }
   });
 
   test("D10 the duplicate is not drained a second time", async () => {
