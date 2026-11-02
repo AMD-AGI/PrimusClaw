@@ -42,6 +42,7 @@ const REGISTRARS: Record<string, string> = {
   registerNotificationSubscriptionRoutes: "routes/notification-subscriptions.js",
   registerRemoteAgentRoutes: "routes/remote-agents.js",
   registerAssistantRoutes: "routes/assistant.js",
+  registerGithubReviewRoutes: "github-review/mcp.js",
   registerAnswerFeedbackRoutes: "routes/answer-feedback.js",
   registerImageRoutes: "routes/images.js",
   registerSystemEnvVarRoutes: "routes/system-env-vars.js",
