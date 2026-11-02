@@ -16,7 +16,7 @@
  * report is the caller's job, in the same transaction, from `wake`.
  */
 import { CLAW_ASSISTANT_MAX_ACTIVE_ITEMS } from "../config.js";
-import { db, inTransaction, type StatementRunner } from "../infra/db.js";
+import { db, inTransaction, type Querier, type StatementRunner } from "../infra/db.js";
 import { stopSessionRuns } from "../tasks/chat-run.js";
 import { newWorkItemId } from "../tasks/ids.js";
 
@@ -318,8 +318,11 @@ export async function stopWorkItem(input: {
   itemId: string;
   source: "user" | "router";
   reason?: string;
+  /** Runs first inside the transaction; throwing stops nothing. The router's tool asks whether its turn is still live. */
+  guard?: (query: Querier) => Promise<void>;
 }): Promise<DecisionResult> {
   const stopped = await inTransaction(async (query) => {
+    await input.guard?.(query);
     const rows = (await query(
       `WITH upd AS (
          UPDATE claw_work_items

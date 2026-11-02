@@ -9,7 +9,8 @@
  *   F2  a report from a run that is no longer the item's current one changes nothing, wakes nobody, and is counted
  *   F3  a report of the current run applies; a report after the item is closed does not
  *   F4  a report whose turn has ended, or whose gate went to another turn, is refused
- *   W1  every kind of report moves the item as the state table says and wakes the router exactly when it must
+ *   D1  a worker's word-for-word repeat of its last report is a replay: no second version, no second wake
+  W1  every kind of report moves the item as the state table says and wakes the router exactly when it must
  *   W2  the state change, its event and the wake are one transaction: a commit that fails leaves none of them
  *   W3  the wake is one queued message per report, carries the owner's credentials, and is drained after the commit;
       a router in the middle of a turn is left to drain its own queue
@@ -143,6 +144,33 @@ describe("assistant worker reports", { skip }, () => {
 
     assert.equal(await refusal(report({ ...live, role: "router" } as never, { kind: "progress", summary: "x" })), "not_allowed");
     assert.equal(await refusal(report(live, { kind: "ready" })), "invalid_report");
+  });
+
+  test("D1 a worker that repeats its last report word for word is not counted twice", async () => {
+    const turn = await w.workerTurn(item.itemId);
+    const ready = { kind: "ready", summary: "PR 12 opened", result: { refs: [{ type: "pr", url: "https://example.com/pr/12" }] } };
+    assert.deepEqual(await report(turn, ready), { ok: true, status: "recorded", item_state: "needs_you" });
+    assert.deepEqual(await report(turn, ready), { ok: true, status: "already_recorded", item_state: "unchanged" });
+    assert.deepEqual(await report(turn, { ...ready, result: { refs: [{ url: "https://example.com/pr/12", type: "pr" }] } }), { ok: true, status: "already_recorded", item_state: "unchanged" }, "key order is not a difference");
+    const row = await w.item(item.itemId);
+    assert.deepEqual({ version: row.result_version, attention: row.attention_seq }, { version: 1, attention: 1 }, "the card the user has is still the current one");
+    assert.equal((await w.itemEvents(item.itemId)).filter((e) => e.kind === "ready").length, 1);
+    assert.equal((await w.pending(alice.routerSid)).length, 1, "and the router was woken once");
+
+    // Anything else is heard: a different report, or the same one after something in between.
+    assert.equal((await report(turn, { ...ready, summary: "PR 12 opened and rebased" })).status, "recorded");
+    assert.equal((await report(turn, { kind: "progress", summary: "touching up" })).status, "recorded");
+    assert.equal((await report(turn, { kind: "progress", summary: "touching up" })).status, "already_recorded");
+    assert.equal((await report(turn, { ...ready, summary: "PR 12 opened and rebased" })).status, "recorded");
+    assert.equal((await w.item(item.itemId)).result_version, 3);
+  });
+
+  test("D1b replays arriving together are one report", async () => {
+    const turn = await w.workerTurn(item.itemId);
+    const out = await Promise.all([1, 2, 3, 4].map(() => report(turn, { kind: "blocked", summary: "no access", question: "which org?" })));
+    assert.deepEqual(out.map((o) => o.status).sort(), ["already_recorded", "already_recorded", "already_recorded", "recorded"]);
+    assert.equal((await w.item(item.itemId)).attention_seq, 1);
+    assert.equal((await w.pending(alice.routerSid)).length, 1);
   });
 
   type Row = [string, Record<string, unknown>, { state: string; wake: boolean; attention: number; version: number; kindOnRow: string; question: string | null }];

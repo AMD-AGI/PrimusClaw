@@ -78,7 +78,7 @@ test("P3 the worker is told how to report, to end with a report, and to check be
 });
 
 test("P4 the work event begins with the marker the prompt names", () => {
-  assert.match(ROUTER_PROMPT, new RegExp(`starts with ${WORK_EVENT_PREFIX.replace(/[[\]]/g, "\\$&")}`));
+  assert.ok(ROUTER_PROMPT.includes(`starts with ${WORK_EVENT_PREFIX}`));
   assert.equal(formatWorkEvent({ seq: 2, kind: "ready", version: 1, summary: "PR opened" }), "[work_event] #2 ready v1: PR opened");
   assert.equal(formatWorkEvent({ seq: 2, kind: "failed", summary: "build broke" }), "[work_event] #2 failed: build broke");
   assert.equal(

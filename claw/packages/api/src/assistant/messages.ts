@@ -30,7 +30,7 @@ export interface ServerMessage {
   userId: string;
   content: string;
   /** Names this message for a retry: a second one with the same key into the same session is not queued. */
-  dedupeKey: string;
+  dedupeKey?: string;
 }
 
 export type QueuedServerMessage =

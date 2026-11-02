@@ -12,6 +12,7 @@
  * it said nothing (`recordWorkerTurnEnd`), and the sweep that finds a turn that ended unseen. They share the
  * generation fence, so none of them can write over a state a newer run or a stop has moved on from.
  */
+import { isDeepStrictEqual } from "node:util";
 import pino from "pino";
 import { inTransaction, type Querier } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
@@ -41,6 +42,27 @@ export type IngestOutcome =
   /** This run's turn end was already recorded. */
   | { status: "duplicate" };
 
+/**
+ * Whether this report is the one the run made last, word for word: a model that repeats a tool call, or a
+ * Brain that replays it after a restart, must not count a result twice (a second `ready` is a new version,
+ * and the card the user already has would go stale). Only the immediate repeat counts, so a worker that
+ * reports the same thing again after something else is heard; and the item is locked first, so two replays
+ * arriving together are ordered and the second sees the first.
+ */
+async function repeatsLastReport(query: Querier, run: ReportRun, report: WorkReport): Promise<boolean> {
+  await query("SELECT 1 FROM claw_work_items WHERE item_id = $1 FOR UPDATE", [run.itemId]);
+  const last = (await query(
+    `SELECT kind, summary, question, result FROM claw_work_item_events
+      WHERE item_id = $1 AND run_id = $2 AND source = 'worker' ORDER BY id DESC LIMIT 1`,
+    [run.itemId, run.runId],
+  )).rows[0] as { kind: string; summary: string | null; question: string | null; result: unknown } | undefined;
+  return last !== undefined
+    && last.kind === report.kind
+    && last.summary === report.summary
+    && (last.question ?? null) === (report.question?.trim() || null)
+    && isDeepStrictEqual(last.result ?? null, report.result ?? null);
+}
+
 export async function ingestReport(
   run: ReportRun, report: WorkReport, source: ReportSource,
   /** Runs first inside the transaction; throwing aborts the report. The worker's tool asks whether its turn is live. */
@@ -56,6 +78,7 @@ export async function ingestReport(
     written = await inTransaction(async (query): Promise<Written> => {
       const q = { query };
       await guard?.(query);
+      if (source === "worker" && await repeatsLastReport(query, run, recorded)) return { outcome: { status: "duplicate" }, wake: null };
       const applied = await applyWorkerReport(q, {
         itemId: run.itemId, generation: run.generation, workerSessionId: run.workerSessionId,
         source, runId: run.runId, report: recorded,

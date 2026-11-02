@@ -12,7 +12,7 @@
  * transaction that writes. A router turn that was interrupted, or whose gate was handed to a newer turn, is
  * refused: a late call from the past must not speak to the user or change what a newer turn has decided.
  */
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { parseSessionRepo } from "@claw/protocol";
 import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
 import { CLAW_ASSISTANT_WORKER_MODEL, CLAW_DEPLOY_MODE } from "../config.js";
@@ -115,6 +115,8 @@ export async function workCreate(
   const created = await inTransaction(async (query) => {
     const q = { query };
     const { userId } = await assertLiveRun(query, claims);
+    // The lock `insertWorkItem` takes, taken first: two calls for one title meet here, and the second sees the first's item.
+    await query("SELECT 1 FROM claw_assistants WHERE session_id = $1 FOR UPDATE", [claims.sid]);
     const same = (await query(
       `SELECT item_id, seq FROM claw_work_items
         WHERE user_id = $1 AND board_state <> 'done' AND title = $2
@@ -178,19 +180,24 @@ export async function workSend(
       [args.item_id, userId],
     )).rows[0] as { worker_session_id: string } | undefined;
     if (!item) throw new ToolRefused("item_not_found", "no such item");
+    // The same words already sent to this item in this router turn are a replayed call. Asked of the item's own log,
+    // not of the queue: the queue's key is gone once the message has been handed to a run.
+    const replayed = await query(
+      `SELECT 1 FROM claw_work_item_events e, claw_tasks t
+        WHERE e.item_id = $1 AND e.source = 'router' AND e.kind = 'progress' AND e.summary = $2
+          AND t.task_id = $3 AND e.created_at >= t.created_at
+        LIMIT 1`,
+      [args.item_id, text, claims.task_id],
+    );
+    if (replayed.rowCount) return { userId, workerSessionId: null };
     if (!await reopenWorkItem(q, { userId, itemId: args.item_id, text })) {
       throw new ToolRefused("item_closed", "that item is finished or stopped; start a new item instead");
     }
-    // Named by this turn and the words, so a replay of the same call queues once and two different
-    // instructions in one turn both go.
-    const key = createHash("sha256").update(`${args.item_id}\n${text}`).digest("hex").slice(0, 24);
-    const queued = await queueServerMessage(q, {
-      sessionId: item.worker_session_id, userId, content: text, dedupeKey: `send:${claims.mid}:${key}`,
-    });
+    const queued = await queueServerMessage(q, { sessionId: item.worker_session_id, userId, content: text });
     if (!queued.ok) throw new ToolRefused(queued.error, "the instruction could not be delivered");
     return { userId, workerSessionId: item.worker_session_id };
   });
-  await drainSessionIfIdle(sent.workerSessionId, sent.userId);
+  if (sent.workerSessionId) await drainSessionIfIdle(sent.workerSessionId, sent.userId);
   return { ok: true, item_id: args.item_id, status: "in_progress" };
 }
 
@@ -198,8 +205,14 @@ export async function workStop(
   claims: AssistantTokenClaims, args: { item_id: string; reason: string },
 ): Promise<{ ok: true; item_id: string; outcome: "stopped" }> {
   requireRole(claims, "router");
-  const { userId } = await inTransaction((query) => assertLiveRun(query, claims));
-  const stopped = await stopWorkItem({ userId, itemId: args.item_id, source: "router", reason: args.reason });
+  const userId = await assistantUser(claims.sid);
+  const stopped = await stopWorkItem({
+    userId, itemId: args.item_id, source: "router", reason: args.reason,
+    // In the stop's own transaction, so a turn that loses its gate cannot close an item between the two.
+    guard: async (query) => {
+      if ((await assertLiveRun(query, claims)).userId !== userId) throw new ToolRefused("turn_not_live", "the session changed hands");
+    },
+  });
   if (stopped.status === "not_found") throw new ToolRefused("item_not_found", "no such item");
   if (stopped.status === "conflict") throw new ToolRefused("item_closed", "that item is already finished");
   return { ok: true, item_id: args.item_id, outcome: "stopped" };

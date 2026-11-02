@@ -167,6 +167,16 @@ describe("assistant tools", { skip }, () => {
     assert.equal((await t().workCreate(await w.routerTurn(alice), { title: "Fix the build", brief: "x" })).seq, 3, "and a finished one is not an item to return");
   });
 
+  test("C2c the same title called for at once is one item", async () => {
+    const turn = await w.routerTurn(alice);
+    const made = await Promise.all([1, 2, 3].map(() => t().workCreate(turn, { title: "Fix the build", brief: "x" })));
+    assert.equal(new Set(made.map((m) => m.item_id)).size, 1);
+    assert.deepEqual(made.map((m) => m.deduplicated).sort(), [false, true, true]);
+    assert.equal(await count("claw_work_items"), 1);
+    assert.equal(await count("claw_sessions", "name = 'Fix the build'"), 1, "and one worker session");
+    assert.equal(await count("claw_pending_messages"), 1);
+  });
+
   test("C3 numbers count per user", async () => {
     assert.equal((await t().workCreate(await w.routerTurn(alice), { title: "A1", brief: "x" })).seq, 1);
     assert.equal((await t().workCreate(await w.routerTurn(bob), { title: "B1", brief: "x" })).seq, 1);
@@ -201,7 +211,7 @@ describe("assistant tools", { skip }, () => {
     const [message] = await w.pending(item.workerSid);
     assert.equal(message.content, "Also fix the lint errors.");
     assert.equal(message.platform_key, "pk-alice");
-    assert.match(message.dedupe_key, new RegExp(`^send:${turn.mid}:`));
+    assert.equal(message.dedupe_key, null, "a replay is recognised by the item's own log, not by a queue key that goes with the row");
     assert.deepEqual(w.drains, [{ sessionId: item.workerSid, userId: "alice" }]);
 
     await t().workSend(turn, { item_id: item.itemId, text: "Also fix the lint errors." });
@@ -211,6 +221,25 @@ describe("assistant tools", { skip }, () => {
 
     const accepted = await w.mod.workItems.acceptWorkItem("alice", item.itemId, 1);
     assert.equal(accepted.status, "conflict", "the result the user saw is no longer the one to accept");
+  });
+
+  test("N1c a replay of work_send after the message was handed to a run is not sent again", async () => {
+    const item = await w.createItem(alice, "Fix the build");
+    const turn = await w.routerTurn(alice);
+    await t().workSend(turn, { item_id: item.itemId, text: "Also fix the lint errors." });
+    assert.equal((await w.pending(item.workerSid)).length, 1);
+    // The drain hands the message to a run and deletes the queue row, and with it the queue's own protection.
+    await w.q("DELETE FROM claw_pending_messages WHERE session_id = $1", [item.workerSid]);
+    w.drains.length = 0;
+    assert.deepEqual(await t().workSend(turn, { item_id: item.itemId, text: "Also fix the lint errors." }), { ok: true, item_id: item.itemId, status: "in_progress" });
+    assert.equal((await w.pending(item.workerSid)).length, 0, "the same call again queued nothing");
+    assert.equal(w.drains.length, 0);
+    assert.equal((await w.itemEvents(item.itemId)).filter((e) => e.source === "router" && e.kind === "progress").length, 1);
+    await w.closeRun(turn.task_id);
+    await new Promise((r) => setTimeout(r, 5));
+    const later = await w.routerTurn(alice);
+    await t().workSend(later, { item_id: item.itemId, text: "Also fix the lint errors." });
+    assert.equal((await w.pending(item.workerSid)).length, 1, "the same words in a later turn are a new instruction");
   });
 
   test("N1b a closed or foreign item takes nothing", async () => {
@@ -233,6 +262,32 @@ describe("assistant tools", { skip }, () => {
     assert.equal((await w.itemEvents(created.item_id)).at(-1)!.kind, "stopped");
     assert.equal((await w.itemEvents(created.item_id)).at(-1)!.source, "router");
     assert.equal(await code(t().workStop(await w.routerTurn(alice), { item_id: "kwi_nope", reason: "x" })), "item_not_found");
+  });
+
+  test("N2b the turn check and the stop are one transaction: the gate cannot change hands between them", async () => {
+    const item = await w.createItem(alice, "Fix the build");
+    const turn = await w.routerTurn(alice);
+    const other = await w.h.connect();
+    let gateDone = false;
+    let blockedWhileOpen: boolean | null = null;
+    let gateMoved: Promise<unknown> = Promise.resolve();
+    try {
+      await w.mod.workItems.stopWorkItem({
+        userId: "alice", itemId: item.itemId, source: "router",
+        guard: async (query) => {
+          await t().assertLiveRun(query, turn);
+          // A newer turn takes the gate now, from another connection. It has to wait until this transaction ends.
+          gateMoved = other.query("UPDATE claw_sessions SET agent_gate_message_id = 'claw-newer-turn' WHERE session_id = $1", [alice.routerSid])
+            .then(() => { gateDone = true; });
+          await new Promise((r) => setTimeout(r, 200));
+          blockedWhileOpen = !gateDone;
+        },
+      });
+      assert.equal(blockedWhileOpen, true, "the gate change was still waiting while the check and the stop were open");
+      await gateMoved;
+      assert.equal(gateDone, true, "and it went through once the stop had committed");
+      assert.equal((await w.item(item.itemId)).outcome, "stopped");
+    } finally { await other.end(); }
   });
 
   test("N3 work_recall gives the summary, the reports, or the worker's tail, marked untrusted", async () => {
