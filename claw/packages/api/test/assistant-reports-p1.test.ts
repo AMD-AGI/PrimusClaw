@@ -11,7 +11,8 @@
  *   F4  a report whose turn has ended, or whose gate went to another turn, is refused
  *   W1  every kind of report moves the item as the state table says and wakes the router exactly when it must
  *   W2  the state change, its event and the wake are one transaction: a commit that fails leaves none of them
- *   W3  the wake is one queued message per report, carries the owner's credentials, and is drained after the commit
+ *   W3  the wake is one queued message per report, carries the owner's credentials, and is drained after the commit;
+      a router in the middle of a turn is left to drain its own queue
  *   W4  a router that cannot be woken does not lose the report
  */
 import assert from "node:assert/strict";
@@ -208,6 +209,14 @@ describe("assistant worker reports", { skip }, () => {
     });
     assert.deepEqual(again, { ok: true, pendingId: null, deduplicated: true });
     assert.equal((await w.pending(alice.routerSid)).length, 1);
+  });
+
+  test("W3b a router that is busy is not drained: its own turn drains the queue when it ends", async () => {
+    await w.openRun(alice.routerSid);
+    const turn = await w.workerTurn(item.itemId);
+    await report(turn, { kind: "ready", summary: "done" });
+    assert.equal((await w.pending(alice.routerSid)).length, 1, "the wake is queued behind the turn in front of it");
+    assert.equal(w.drains.filter((d) => d.sessionId === alice.routerSid).length, 0);
   });
 
   test("W4 a router that cannot be woken does not lose the report", async () => {

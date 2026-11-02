@@ -48,8 +48,10 @@ test("T3 another key, or any altered part, is refused", () => {
 test("T3b a token is bound to the assistant: the same key's signature over another domain proves nothing", async () => {
   const { createHmac } = await import("node:crypto");
   const body = Buffer.from(JSON.stringify(router)).toString("base64url");
-  const sig = createHmac("sha256", KEY).update(body).digest("base64url");
-  assert.deepEqual(verifyAssistantToken(`a1.${body}.${sig}`, KEY, NOW), { ok: false, reason: "bad_signature" });
+  for (const signed of ["", "a1."]) {
+    const sig = createHmac("sha256", KEY).update(signed).update(body).digest("base64url");
+    assert.deepEqual(verifyAssistantToken(`a1.${body}.${sig}`, KEY, NOW), { ok: false, reason: "bad_signature" }, JSON.stringify(signed));
+  }
 });
 
 test("T4 a signed body that is not a well-formed claim set is refused", () => {

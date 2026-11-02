@@ -57,7 +57,7 @@ describe("assistant role profile", { skip }, () => {
   };
 
   const pristineDispatch = (() => { let p: any = null; return () => (p ??= { ...dispatch.sessionDispatchPorts }); })();
-  async function send(sessionId: string, userId: string, opts: { doorbell: boolean; mcpServers?: Record<string, Record<string, unknown>> }) {
+  async function send(sessionId: string, userId: string, opts: { doorbell: boolean; mcpServers?: Record<string, Record<string, unknown>>; toolIds?: number[] }) {
     const p = dispatch.sessionDispatchPorts as any;
     Object.assign(p, pristineDispatch());
     p.doorbellDispatch = opts.doorbell ? () => ({ release() {} }) : () => null;
@@ -67,7 +67,7 @@ describe("assistant role profile", { skip }, () => {
     p.publishTask = async (_s: string, payload: string) => { published.push(payload); return published.length; };
     await w.q("DELETE FROM claw_tasks WHERE session_id = $1", [sessionId]);
     const result = await dispatch.dispatchTaskToBrain({
-      sessionId, userId, user: user(userId), content: "hello", messageType: "text", toolIds: [], pluginId: undefined,
+      sessionId, userId, user: user(userId), content: "hello", messageType: "text", toolIds: opts.toolIds ?? [], pluginId: undefined,
       requestImage: undefined, requestResource: undefined, requestTimeout: undefined, workspaceId: undefined,
       mcpServers: opts.mcpServers, capturedUserEnvSnapshot: {}, capturedSessionEnv: {},
     } as never, async () => {});
@@ -138,6 +138,13 @@ describe("assistant role profile", { skip }, () => {
     assert.ok(task.system_append.startsWith("You are the user's personal assistant."));
     assert.match(task.system_append, /Work items \(open ones[^)]*\):\n#1 \[in_progress\] Fix the build/);
     assert.equal(task.skills, undefined);
+  });
+
+  test("A1c marketplace tools a message named are not resolved for a router, and are for a worker", async () => {
+    const router = JSON.parse((await send(alice.routerSid, "alice", { doorbell: false, toolIds: [7] })).published[0]);
+    assert.equal(router.tool_ids, undefined);
+    const worker = JSON.parse((await send(item.workerSid, "alice", { doorbell: false, toolIds: [7] })).published[0]);
+    assert.deepEqual(worker.tool_ids, [7]);
   });
 
   test("A1b the item list is the user's own", async () => {

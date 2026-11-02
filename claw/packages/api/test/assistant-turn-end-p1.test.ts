@@ -16,6 +16,7 @@
  *   S3  L1-6: a say whose delivery fails does not count; the sweep sends one fallback and only one
  *   S4  a delivered message about the current need is enough; a new need is a new announcement
  *   S5  the orphan drain finds a wake nobody drained
+ *   S6  the sweeper's own tick runs both sweeps
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -318,6 +319,22 @@ describe("assistant turn ends and sweeps", { skip }, () => {
     assert.equal(fallback.length, 1);
     assert.equal(fallback[0].item_attention_seq, 2);
     assert.match(fallback[0].text, /disable rule X\?/);
+  });
+
+  test("S6 the sweeper's own tick does both: records the lost end, then announces the need", async () => {
+    await w.subscribe("alice");
+    const lost = await endedRun({ agoSeconds: 600 });
+    await w.mod.sweeper.sweeperTick();
+    assert.equal((await turnEnds())[0]?.run_id, lost.task_id, "the lost end was recorded");
+    assert.equal((await w.item(item.itemId)).board_state, "needs_you");
+    // Not announced yet: the need is new.
+    assert.equal((await says()).length, 0);
+    await w.q("UPDATE claw_work_items SET updated_at = NOW() - interval '1 hour' WHERE item_id = $1", [item.itemId]);
+    await w.mod.sweeper.sweeperTick();
+    const [fallback] = await says();
+    assert.equal(fallback?.fallback, true, "and announced once it had gone unsaid for the threshold");
+    await w.mod.sweeper.sweeperTick();
+    assert.equal((await says()).length, 1);
   });
 
   test("S5 the orphan drain finds a wake nobody drained", async () => {
