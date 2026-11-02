@@ -205,6 +205,14 @@
             "scope": {
               "type": "string"
             },
+            "delegationAudience": {
+              "description": "The audience of the token the API asks the identity provider for (RFC 8693) to present to SaFE in a signed-in person's name. Blank: primus-safe.",
+              "type": "string"
+            },
+            "delegationScope": {
+              "description": "The scope of that token. Blank: safe.api.",
+              "type": "string"
+            },
             "introspect": {
               "type": "boolean"
             },
