@@ -325,28 +325,27 @@ describe("assistant turn ends and sweeps", { skip }, () => {
     assert.equal((await sweepEvents()).length, 1);
   });
 
-  for (const [why, setUp] of [
-    ["a turn is running", async () => { await w.workerTurn(item.itemId); }],
-    ["a turn is queued", async () => { await w.openRun(item.workerSid, { status: "queued" }); }],
-    ["a turn ended a moment ago, which is the completion handler's to record", async () => {
+  // `age`: how long ago the item was last touched. Set after the case's own setup, which touches it (a run's start does).
+  for (const [why, age, setUp] of [
+    ["a turn is running", 600, async () => { await w.workerTurn(item.itemId); }],
+    ["a turn is queued", 600, async () => { await w.openRun(item.workerSid, { status: "queued" }); }],
+    ["a turn ended a moment ago, which is the completion handler's to record", 600, async () => {
       await w.closeRun((await w.workerTurn(item.itemId)).task_id, "completed", undefined, 5);
     }],
-    ["a message is waiting for its turn", async () => {
+    ["a message is waiting for its turn", 600, async () => {
       await w.q("INSERT INTO claw_pending_messages (session_id, user_id, content) VALUES ($1, 'alice', 'one more thing')", [item.workerSid]);
     }],
-    ["the item was touched a moment ago", async () => {
-      await w.q("UPDATE claw_work_items SET updated_at = NOW() - interval '5 seconds' WHERE item_id = $1", [item.itemId]);
-    }],
-    ["the item already needs the user", async () => {
+    ["the item was touched a moment ago", 5, async () => undefined],
+    ["the item already needs the user", 600, async () => {
       await w.q("UPDATE claw_work_items SET board_state = 'needs_you' WHERE item_id = $1", [item.itemId]);
     }],
-    ["the item is closed", async () => {
+    ["the item is closed", 600, async () => {
       await w.q("UPDATE claw_work_items SET board_state = 'done', outcome = 'stopped', closed_at = NOW() WHERE item_id = $1", [item.itemId]);
     }],
   ] as const) {
     test(`S7d not an orphan while ${why}`, async () => {
-      await w.q("UPDATE claw_work_items SET updated_at = NOW() - interval '10 minutes' WHERE item_id = $1", [item.itemId]);
       await setUp();
+      await w.q("UPDATE claw_work_items SET updated_at = NOW() - make_interval(secs => $2::int) WHERE item_id = $1", [item.itemId, age]);
       assert.equal(await w.mod.turnEnd.reconcileOrphanedItems(), 0);
       assert.equal((await sweepEvents()).length, 0);
     });

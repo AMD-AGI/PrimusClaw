@@ -56,8 +56,10 @@ record it.
   plain output goes nowhere), `work_create` starts a work item in its own worker session, `work_send` and
   `work_stop` steer it, `work_recall` looks closer. A worker reports with one tool, `report`, and never speaks
   to the user; a report, its event and the message that wakes the assistant are one transaction, and a report
-  from a run that is no longer the item's current one is refused (generation fencing). A worker turn that ends
-  without reporting is recorded as ready (or failed), and the sweeper records a turn whose end was lost and
+  from a run that is no longer the item's current one is refused (generation fencing; a new instruction to the
+  item fences out the run that was still executing). A worker turn that ends
+  without reporting is recorded as ready (or failed), and the sweeper records a turn whose end was lost, reports
+  as failed an item in progress that nothing is running or queued for, and
   tells the user about an item that has needed them for `CLAW_ASSISTANT_SILENT_SWEEP_SEC` (default 300) with
   no delivered message. The tools are served at `/v1/internal/assistant-mcp`, authenticated by a per-turn
   bearer signed with `CLAW_ASSISTANT_TOKEN_KEY` (required, 32+ characters, when the switch is on);
