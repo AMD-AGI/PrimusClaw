@@ -365,7 +365,8 @@ describe("the platform-role requirement through the authentication hook", () => 
         // The provider answers for another subject: the token is refused outright (401), and the roles are not lent.
         providerSays("someone-else", ["default", "system-admin"]);
         assert.equal((await call("GET", "/v1/whoami", adminToken("claimed-admin"))).status, 401);
-        // The provider cannot be asked: the caller is a plain user, never the claim, and (as with no requirement) not a 503.
+        // The provider cannot be asked and nothing is cached or served stale here (the client is built with stale serving off):
+        // the caller is a plain user, never the claim, and (as with no requirement) not a 503.
         fake.introspect = () => ({ status: 503, body: "down" });
         assert.equal((await call("GET", "/v1/whoami", adminToken("claimed-admin"))).status, 403);
         delete process.env[ENV];

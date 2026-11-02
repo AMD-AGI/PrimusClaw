@@ -30,9 +30,10 @@
  *
  * One exception, for the identity token only: a role the identity provider
  * confirmed (CLAW_IDENTITY_TOKEN_TRUSTED_ROLES: named by the operator, claimed by
- * the token and listed for the same subject by the provider's RFC 7662 answer,
- * asked now) is a role somebody vouched for, and Claw already lets it confer admin
- * rights, so it counts here too. The synthetic `default` never does.
+ * the token and listed for the same subject by the provider's RFC 7662 answer, as
+ * the identity client gives it, cache and stale-if-error window included) is a role
+ * somebody vouched for, and Claw already lets it confer admin rights, so it counts
+ * here too, exactly as fresh as those rights. The synthetic `default` never does.
  */
 import type { UserInfo } from "./models.js";
 

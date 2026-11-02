@@ -63,11 +63,16 @@ of strings is treated the same way: no roles, refused.
 
 One exception, for the identity token only. A role the identity provider confirmed through
 `CLAW_IDENTITY_TOKEN_TRUSTED_ROLES` (`system-admin` and/or `system-admin-readonly`: the
-operator named it, the token claims it, and the provider's RFC 7662 answer, asked on that
-request, is active, names the same subject and lists it) is a role someone vouched for, and
-Claw already lets it confer admin rights, so it counts here as well. Only that: the `default`
-every identity-token caller carries never does, and a role that is merely claimed, or that
-the provider could not be asked about, counts for nothing. So with
+operator named it, the token claims it, and the provider's RFC 7662 answer for the token is
+active, names the same subject and lists it) is a role someone vouched for, and Claw already
+lets it confer admin rights, so it counts here as well. Only that: the `default` every
+identity-token caller carries never does, and a role that is merely claimed, or that the
+provider has not confirmed, counts for nothing. The answer is the identity client's, with its
+rules: it is cached for `IDENTITY_INTROSPECTION_CACHE_SECONDS` (30 by default), and while the
+provider cannot be asked a confirmation is still served for up to `IDENTITY_STALE_IF_ERROR_SECONDS`
+(1800 by default; 0 turns that off). The requirement is therefore exactly as fresh as the admin
+rights the same role confers: a role withdrawn at the provider keeps counting until that
+answer expires. So with
 `CLAW_IDENTITY_TOKEN_TRUSTED_ROLES=system-admin` and `api.requiredPlatformRoles: [system-admin]`
 an administrator signing in through the provider is served, and with `[default]` they are not.
 Connector tokens and BYOK keys have no such confirmation and stay refused.
@@ -88,8 +93,8 @@ platform verifies; the peer then sees that account, not the user.
 - The platform's answer is cached for five minutes per credential, so a role granted or
   withdrawn takes up to that long to apply. The setting itself applies on the next request.
 - Work that was already accepted is not re-judged: a run in flight finishes, and **a scheduled
-  trigger keeps firing** with the key saved when it was created, on every tick, for a user who
-  later loses access or who created it before the setting was turned on. The check is on
+  trigger keeps firing** with the key saved when it was created (or last resumed), on every tick,
+  for a user who later loses access or who created it before the setting was turned on. The check is on
   requests, and a trigger's fire is not one. See Rollout for what to do about it.
 - It decides who is served; it does not change what the platform lets a user do there.
 
