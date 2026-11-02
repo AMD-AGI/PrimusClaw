@@ -15,7 +15,7 @@
     "@claw/utils": "*",
     "@modelcontextprotocol/sdk": "^1.32.1",
     "fastify": "^5.12.5",
-    "minimatch": "^10.2.6",
+    "minimatch": "^11.0.3",
     "zod": "^4.6.5"
   },
   "devDependencies": {

@@ -21,6 +21,7 @@ import pino from "pino";
 import { APP_RUNS_ENABLED, SANDBOX_ROUTER_AUTH_ENABLED } from "../config.js";
 import { db } from "../infra/db.js";
 import { openAppRunSecret } from "../crypto/app-run-secrets.js";
+import { githubReviewMcpServers } from "../github-review/session-tools.js";
 
 const logger = pino({ name: "session-app-mcp" });
 
@@ -101,6 +102,10 @@ export async function sessionAppMcpServers(
  * the wire (the fat branch). A turn that is parked and claimed later is resolved
  * when it is claimed instead (`tasks/run-claim.ts`), so that nothing sealed on the
  * row holds the MCP token and a stale record is never offered.
+ *
+ * The GitHub review tools (see `github-review/session-tools.ts`) ride the same
+ * path for the same reason, a session that has `config.acting_as` only, under a
+ * reserved server name that a request cannot replace.
  */
 export async function applyAppMcpToTask(task: Record<string, unknown>, sessionId: string): Promise<void> {
   const merged = mergeAppMcpServers(
@@ -108,4 +113,8 @@ export async function applyAppMcpToTask(task: Record<string, unknown>, sessionId
     task.mcp_servers as McpServers | undefined,
   );
   if (merged !== undefined) task.mcp_servers = merged;
+  const review = await githubReviewMcpServers(sessionId);
+  if (Object.keys(review).length > 0) {
+    task.mcp_servers = { ...((task.mcp_servers as McpServers | undefined) ?? {}), ...review };
+  }
 }

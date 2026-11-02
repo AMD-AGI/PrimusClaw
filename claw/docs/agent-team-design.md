@@ -871,7 +871,7 @@ A2A spec: Aligned with **Google A2A Protocol v0.x subset**, implementing only Ag
 
 Loaded into memory at startup + hot-reloaded (SIGHUP or ConfigMap watch).
 
-> Implemented today: Brain's env `A2A_AGENTS` (a name list or a JSON array with `auth_env` and `allow_local`), loaded at startup only. See `agent-server-design.md`, "Outbound `a2a_call`".
+> Implemented today: Brain's env `A2A_AGENTS` (a name list or a JSON array with `url` / `card_url`, `auth_env` or `audience`, `scope` and `allow_local`), loaded at startup only, behind `A2A_CLIENT_ENABLED`. See `agent-server-design.md`, "Outbound `a2a_call`".
 
 ### 16.7 Team Template Field Extension (A2A Scenario)
 
