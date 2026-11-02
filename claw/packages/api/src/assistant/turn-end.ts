@@ -39,20 +39,26 @@ const WAKING_WITH_QUESTION = REPORT_KINDS.filter(
 
 /**
  * What a run's end has to know, as SQL over `w` (the item) and `e` (the run's `run_started` event). Written once
- * for `recordRunEnd` and for the sweep that looks for runs to record, so the sweep selects exactly the runs
- * `recordRunEnd` would not skip: a run it would skip is selected again on every tick, and enough of them fill
- * the batch and keep the runs behind them from ever being reached.
+ * for `recordRunEnd` and for the sweep that looks for runs to record, so the sweep does not select a run
+ * `recordRunEnd` would skip: a run it would skip is selected again on every tick, and enough of them fill the
+ * batch and keep the runs behind them from ever being reached.
  *
- * `RUN_TOLD`: a report of this run already made the assistant hear about it, so the end adds nothing.
+ * `RUN_TOLD`: the last report of this run is one that made the assistant hear about it, so the end adds nothing.
+ * Only the last: a run that said ready and then went on (said progress) has taken the item back to work, and
+ * its end is the next thing the assistant has to hear. (The sweep needs no such test: a run whose last report
+ * woke the assistant left the item needing the user, and an item that does is not in progress.)
  * `RUN_CONTINUING`: another turn is open or queued behind this one on the same session, so the item is not at
  * rest and the next turn will report for itself.
  *
  * $1 the statuses of a run that is not over; $2 and $3 the kinds of report that tell the assistant something.
  */
 const RUN_TOLD = `EXISTS (
-  SELECT 1 FROM claw_work_item_events r
-   WHERE r.item_id = w.item_id AND r.run_id = e.run_id
-     AND (r.kind = ANY($2::text[]) OR (r.kind = ANY($3::text[]) AND r.question IS NOT NULL))
+  SELECT 1 FROM (
+    SELECT r.kind, r.question FROM claw_work_item_events r
+     WHERE r.item_id = w.item_id AND r.run_id = e.run_id AND r.kind <> 'run_started'
+     ORDER BY r.id DESC LIMIT 1
+  ) last
+   WHERE last.kind = ANY($2::text[]) OR (last.kind = ANY($3::text[]) AND last.question IS NOT NULL)
 )`;
 const RUN_CONTINUING = `(EXISTS (
   SELECT 1 FROM claw_tasks t
@@ -153,16 +159,15 @@ export async function reconcileWorkerRuns(): Promise<number> {
        JOIN claw_tasks t ON t.task_id = e.run_id
       WHERE w.board_state = 'in_progress'
         AND t.status IN ('completed', 'failed', 'cancelled')
-        AND t.completed_at < NOW() - make_interval(secs => $4::int)
+        AND t.completed_at < NOW() - make_interval(secs => $2::int)
         AND NOT EXISTS (
           SELECT 1 FROM claw_work_item_events x
            WHERE x.item_id = w.item_id AND x.run_id = e.run_id AND x.source = 'turn_end'
         )
-        AND NOT ${RUN_TOLD}
         AND NOT ${RUN_CONTINUING}
       ORDER BY t.completed_at
-      LIMIT $5`,
-    [SWEEPABLE_RUN_STATUSES, WAKING_KINDS, WAKING_WITH_QUESTION, SWEEP_GRACE_SECONDS, SWEEP_BATCH],
+      LIMIT $3`,
+    [SWEEPABLE_RUN_STATUSES, SWEEP_GRACE_SECONDS, SWEEP_BATCH],
   )).rows as Array<{ worker_session_id: string; run_id: string; status: string; failure_reason: string | null }>;
   let recorded = 0;
   for (const run of runs) {
@@ -180,14 +185,21 @@ export async function reconcileWorkerRuns(): Promise<number> {
 }
 
 /**
- * An item in progress that nothing is working on: no turn open on its worker's session, none queued, and the last
- * one over for longer than the completion handler needs. Its last instruction never started (the dispatch was
- * refused, or failed before the run was claimed), so no run will ever report, and no run end exists for
- * `reconcileWorkerRuns` to find. $1 the statuses of a run that is not over; $2 the grace, in seconds.
+ * An item in progress that nothing is working on: no run has started under its current generation, no turn is
+ * open on its worker's session or queued for it, none ended within the grace, and it has been quiet for longer
+ * than the completion handler needs. Its last instruction never started (the dispatch was refused, or failed
+ * before the run was claimed), so no run will ever report, and there is no run end for `reconcileWorkerRuns` to
+ * find. A run that did start under this generation is `reconcileWorkerRuns`'s, however many of them are waiting
+ * behind its batch: it records what that run did, where this would record that nothing ran.
+ * $1 the statuses of a run that is not over; $2 the grace, in seconds.
  */
 const ORPHANED_ITEM = `
   w.board_state = 'in_progress'
   AND w.updated_at < NOW() - make_interval(secs => $2::int)
+  AND NOT EXISTS (
+    SELECT 1 FROM claw_work_item_events e
+     WHERE e.item_id = w.item_id AND e.kind = 'run_started' AND e.generation = w.generation
+  )
   AND NOT EXISTS (
     SELECT 1 FROM claw_tasks t
      WHERE t.session_id = w.worker_session_id AND t.origin = 'chat'

@@ -13,7 +13,8 @@
  *   E6  the completion handler does it: an exec_complete for a worker session ends in the record
  *   S1  the sweep records a run whose completion was lost, once, and not one that is still young or still running
  *   S1d the sweep never selects a run the end would skip, so a full batch of them cannot keep a recordable run out of reach
- *   S7  an item in progress with no run open or queued, whatever its history, is told to the assistant once, and only then
+ *   S1e a run that said ready and then went on is recorded when it ends: only its last report counts as having told the assistant
+ *   S7  an item in progress that no run was started for, and nothing is running or queued for, is told to the assistant once, and only then
  *   S2  an item that needs the user with no delivered message is announced once, after the threshold and not before
  *   S3  L1-6: a say whose delivery fails does not count; the sweep sends one fallback and only one
  *   S4  a delivered message about the current need is enough; a new need is a new announcement
@@ -259,27 +260,32 @@ describe("assistant turn ends and sweeps", { skip }, () => {
     return { user, item: await w.createItem(user, `Stuck item ${n}`) };
   }
 
-  for (const [why, skipThe] of [
-    ["told: the run said ready, then went on and said progress", async (i: { itemId: string; workerSid: string }) => {
-      const turn = await w.workerTurn(i.itemId);
-      await w.mod.tools.report(turn, { kind: "ready", summary: "PR opened" });
-      await w.mod.tools.report(turn, { kind: "progress", summary: "one more thing" });
+  test("S1d a full batch of runs with another turn queued behind them does not keep a recordable run out of reach", async () => {
+    for (let n = 0; n < w.mod.turnEnd.SWEEP_BATCH; n += 1) {
+      const { item: stuck } = await newItem(n);
+      const turn = await w.workerTurn(stuck.itemId);
       await w.closeRun(turn.task_id, "completed", undefined, 900);
-    }],
-    ["continuing: a message is queued behind the run", async (i: { itemId: string; workerSid: string }) => {
-      const turn = await w.workerTurn(i.itemId);
-      await w.closeRun(turn.task_id, "completed", undefined, 900);
-      await w.q("INSERT INTO claw_pending_messages (session_id, user_id, content) VALUES ($1, 'alice', 'one more thing')", [i.workerSid]);
-    }],
-  ] as const) {
-    test(`S1d a full batch of runs the end would skip (${why}) does not keep a recordable run out of reach`, async () => {
-      for (let n = 0; n < w.mod.turnEnd.SWEEP_BATCH; n += 1) await skipThe((await newItem(n)).item);
-      const recordable = await endedRun({ agoSeconds: 300 });
-      assert.equal(await w.mod.turnEnd.reconcileWorkerRuns(), 1, "the batch holds only runs that can be recorded");
-      assert.deepEqual((await turnEnds()).map((e) => e.run_id), [recordable.task_id]);
-      assert.equal(await w.mod.turnEnd.reconcileWorkerRuns(), 0);
-    });
-  }
+      await w.q("INSERT INTO claw_pending_messages (session_id, user_id, content) VALUES ($1, 'alice', 'one more thing')", [stuck.workerSid]);
+    }
+    const recordable = await endedRun({ agoSeconds: 300 });
+    assert.equal(await w.mod.turnEnd.reconcileWorkerRuns(), 1, "the batch holds only runs that can be recorded");
+    assert.deepEqual((await turnEnds()).map((e) => e.run_id), [recordable.task_id]);
+    assert.equal(await w.mod.turnEnd.reconcileWorkerRuns(), 0);
+  });
+
+  test("S1e a run that said ready and then went on is recorded when it ends, not skipped for ever as one that told", async () => {
+    const turn = await w.workerTurn(item.itemId);
+    await w.mod.tools.report(turn, { kind: "ready", summary: "PR 12 opened" });
+    await w.mod.tools.report(turn, { kind: "progress", summary: "one more thing" });
+    assert.equal((await w.item(item.itemId)).board_state, "in_progress", "the progress report took the item back to work");
+    await w.closeRun(turn.task_id, "completed", undefined, 900);
+    assert.equal(await w.mod.turnEnd.reconcileOrphanedItems(), 0, "a run started under this generation: not nothing running");
+    assert.equal(await w.mod.turnEnd.reconcileWorkerRuns(), 1);
+    const [record] = await turnEnds();
+    assert.deepEqual([record.kind, record.run_id], ["ready", turn.task_id]);
+    const row = await w.item(item.itemId);
+    assert.deepEqual([row.board_state, row.result_version], ["needs_you", 2], "the second result is a new version to accept");
+  });
 
   /** What the item's last instruction left behind: the run that reported ready is over and the next one never started. */
   async function instructionThatNeverStarted() {
@@ -325,12 +331,18 @@ describe("assistant turn ends and sweeps", { skip }, () => {
     assert.equal((await sweepEvents()).length, 1);
   });
 
+  const reopen = () => w.mod.workItems.reopenWorkItem(
+    { query: (t: string, p?: unknown[]) => w.h.app.db.db.query(t, p) }, { userId: "alice", itemId: item.itemId, text: "Also fix the lint errors." },
+  );
   // `age`: how long ago the item was last touched. Set after the case's own setup, which touches it (a run's start does).
+  // A reopen moves the generation past the run that was started, so a case that wants a run on the item and no run
+  // under its current generation reopens it: what is left to hold the orphan pass back is the case's own condition.
   for (const [why, age, setUp] of [
-    ["a turn is running", 600, async () => { await w.workerTurn(item.itemId); }],
+    ["a turn is running", 600, async () => { await w.workerTurn(item.itemId); await reopen(); }],
     ["a turn is queued", 600, async () => { await w.openRun(item.workerSid, { status: "queued" }); }],
     ["a turn ended a moment ago, which is the completion handler's to record", 600, async () => {
       await w.closeRun((await w.workerTurn(item.itemId)).task_id, "completed", undefined, 5);
+      await reopen();
     }],
     ["a message is waiting for its turn", 600, async () => {
       await w.q("INSERT INTO claw_pending_messages (session_id, user_id, content) VALUES ($1, 'alice', 'one more thing')", [item.workerSid]);
@@ -350,6 +362,22 @@ describe("assistant turn ends and sweeps", { skip }, () => {
       assert.equal((await sweepEvents()).length, 0);
     });
   }
+
+  test("S7g runs that ended unrecorded are the run sweep's, however many are waiting behind its batch", async () => {
+    const waiting = w.mod.turnEnd.SWEEP_BATCH + 1;
+    const items = [item];
+    for (let n = 1; n < waiting; n += 1) items.push((await newItem(n)).item);
+    for (const i of items) {
+      await w.closeRun((await w.workerTurn(i.itemId)).task_id, "completed", undefined, 900);
+      await w.q("UPDATE claw_work_items SET updated_at = NOW() - interval '10 minutes' WHERE item_id = $1", [i.itemId]);
+    }
+    assert.equal(await w.mod.turnEnd.reconcileOrphanedItems(), 0, "each of them has a run to record, and none is told that nothing ran");
+    assert.equal(await w.mod.turnEnd.reconcileWorkerRuns(), w.mod.turnEnd.SWEEP_BATCH);
+    assert.equal(await w.mod.turnEnd.reconcileOrphanedItems(), 0, "the one past the batch is still the run sweep's");
+    assert.equal(await w.mod.turnEnd.reconcileWorkerRuns(), 1);
+    const all = await w.q("SELECT kind, source FROM claw_work_item_events WHERE kind <> 'run_started' AND kind <> 'created'");
+    assert.deepEqual(all.map((e) => `${e.source}:${e.kind}`), Array(waiting).fill("turn_end:ready"), "every run is recorded as what it did");
+  });
 
   test("S7e sweepers that read the same orphan at once record it once", async () => {
     await instructionThatNeverStarted();

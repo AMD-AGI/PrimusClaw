@@ -16,8 +16,8 @@ import { tellSilentItems } from "./silent-sweep.js";
 export async function sweepAssistant(): Promise<void> {
   if (!CLAW_ASSISTANT_ENABLED) return;
   // In this order: a run recorded as ready here needs the user, and is then eligible for the announcement.
-  // The runs first: an item whose last run ended unrecorded is the run's to record, and only what is left with
-  // nothing behind it at all is the orphan pass's.
+  // The two passes share no item: one with a run started under its current generation is the first's, one with
+  // none is the second's.
   await reconcileWorkerRuns();
   await reconcileOrphanedItems();
   await tellSilentItems();
