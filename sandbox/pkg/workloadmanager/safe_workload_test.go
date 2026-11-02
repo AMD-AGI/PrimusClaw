@@ -145,8 +145,8 @@ func TestCreateWorkloadWaitsForPod(t *testing.T) {
 		return true, obj, nil
 	})
 	creator := NewSafeWorkloadCreator(dc, cl)
-	attestedGPUs := -1
-	creator.SetIdentityAttester(staticAttester{token: "eyJ.identity", gpus: &attestedGPUs})
+	var call attestCall
+	creator.SetIdentityAttester(staticAttester{token: "eyJ.identity", call: &call})
 	result, err := creator.Create(context.Background(), e2b.CreateRequest{
 		SandboxID:   sandboxID,
 		TemplateID:  ci.Name,
@@ -176,11 +176,11 @@ func TestCreateWorkloadWaitsForPod(t *testing.T) {
 	if timeout != 60 {
 		t.Fatalf("timeout=%d", timeout)
 	}
-	if obj.GetAnnotations()[identityAttestationAnnotation] != "eyJ.identity" || obj.GetAnnotations()[grantAttestationAnnotation] != "eyJ.test" {
+	if _, ok := obj.GetAnnotations()[identityAttestationAnnotation]; ok || obj.GetAnnotations()[grantAttestationAnnotation] != "eyJ.test" {
 		t.Fatalf("annotations=%v", obj.GetAnnotations())
 	}
-	if attestedGPUs != 2 {
-		t.Fatalf("attested gpus=%d", attestedGPUs)
+	if call.called {
+		t.Fatal("a grant-key create asked the identity provider for an attestation")
 	}
 	if err := creator.Delete(context.Background(), result.SandboxName); err != nil {
 		t.Fatal(err)
@@ -394,12 +394,19 @@ func signingWorkloadCreator(t *testing.T, sandboxID, phase string) (*SafeWorkloa
 type staticAttester struct {
 	token string
 	err   error
-	gpus  *int
+	call  *attestCall
 }
 
-func (a staticAttester) Attest(_ context.Context, _, _ string, maxGPUs int) (string, error) {
-	if a.gpus != nil {
-		*a.gpus = maxGPUs
+// attestCall records the arguments of the last Attest call.
+type attestCall struct {
+	called           bool
+	key, ws, sandbox string
+	gpus             int
+}
+
+func (a staticAttester) Attest(_ context.Context, subjectKey, workspace, sandbox string, maxGPUs int) (string, error) {
+	if a.call != nil {
+		*a.call = attestCall{called: true, key: subjectKey, ws: workspace, sandbox: sandbox, gpus: maxGPUs}
 	}
 	if a.err != nil {
 		return "", a.err
@@ -407,12 +414,54 @@ func (a staticAttester) Attest(_ context.Context, _, _ string, maxGPUs int) (str
 	return a.token, nil
 }
 
+// ownerCreateRequest is an identity-key create: no Claw attestation, and the caller's key.
+func ownerCreateRequest(sandboxID string) e2b.CreateRequest {
+	req := signingCreateRequest(sandboxID)
+	req.Attestation, req.OwnerKey = "", true
+	req.GrantID = "owner-c6c289e49e9c05b214586038"
+	req.SubjectKey = "ak-caller-key"
+	return req
+}
+
 func TestCreateRefusesWithoutIdentityAttester(t *testing.T) {
 	const sandboxID = "sbx-7a9b9b693452f613877992145c818d29"
 	creator, dc := signingWorkloadCreator(t, sandboxID, "Running")
 	creator.SetIdentityAttester(nil)
-	if _, err := creator.Create(context.Background(), signingCreateRequest(sandboxID)); err == nil || !strings.Contains(err.Error(), "not configured") {
+	if _, err := creator.Create(context.Background(), ownerCreateRequest(sandboxID)); err == nil || !strings.Contains(err.Error(), "not configured") {
 		t.Fatalf("err=%v", err)
+	}
+	if _, err := dc.Tracker().Get(workloadGVR, "", sandboxID); err == nil {
+		t.Fatal("workload was created without an attestation")
+	}
+}
+
+func TestOwnerKeyCreateForwardsTheCallerKey(t *testing.T) {
+	const sandboxID = "sbx-7a9b9b693452f613877992145c818d29"
+	creator, dc := signingWorkloadCreator(t, sandboxID, "Running")
+	var call attestCall
+	creator.SetIdentityAttester(staticAttester{token: "eyJ.identity", call: &call})
+	if _, err := creator.Create(context.Background(), ownerCreateRequest(sandboxID)); err != nil {
+		t.Fatal(err)
+	}
+	if call.key != "ak-caller-key" || call.ws != "top-models" || call.sandbox != sandboxID || call.gpus != 2 {
+		t.Fatalf("attest call=%+v", call)
+	}
+	stored, err := dc.Tracker().Get(workloadGVR, "", sandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stored.(*unstructured.Unstructured).GetAnnotations()[identityAttestationAnnotation]; got != "eyJ.identity" {
+		t.Fatalf("identity annotation=%q", got)
+	}
+}
+
+func TestOwnerKeyCreateNeedsTheCallerKey(t *testing.T) {
+	const sandboxID = "sbx-7a9b9b693452f613877992145c818d29"
+	creator, dc := signingWorkloadCreator(t, sandboxID, "Running")
+	req := ownerCreateRequest(sandboxID)
+	req.SubjectKey = ""
+	if _, err := creator.Create(context.Background(), req); err == nil {
+		t.Fatal("an identity-key create without the caller's key was accepted")
 	}
 	if _, err := dc.Tracker().Get(workloadGVR, "", sandboxID); err == nil {
 		t.Fatal("workload was created without an attestation")

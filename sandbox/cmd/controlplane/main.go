@@ -447,6 +447,9 @@ func main() {
 		}
 		if idClient != nil {
 			opts.Identity = idClient
+			if attester == nil {
+				log.Warn("identity-key sandbox creates are refused: IDENTITY_ATTEST_URL is not set")
+			}
 		}
 		plane := e2b.New(opts)
 		grants.SetPromoter(plane)
@@ -486,7 +489,7 @@ func main() {
 // ownerPolicyRetry is the first delay between owner policy attempts. It doubles up to a minute.
 var ownerPolicyRetry = time.Second
 
-// ownerKeys enables primus-identity keys when both the introspection client and
+// ownerKeys enables identity provider keys when both the introspection client and
 // the owner policy are configured. It returns nil when either is absent or
 // invalid, so grant keys keep working. A policy that fails for a transient
 // reason is retried in the background; identity keys get 503 until it applies.

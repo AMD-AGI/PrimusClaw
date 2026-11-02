@@ -98,10 +98,11 @@ type SafeWorkloadCreator struct {
 	identity       IdentityAttester
 }
 
-// IdentityAttester asks primus-identity for a short sandbox attestation.
-// maxGPUs is the GPU ceiling bound into the attestation.
+// IdentityAttester asks the identity provider for a short sandbox attestation.
+// subjectKey is the caller's identity key; the attestation names its owner,
+// workspace, the Workload name sandbox, and the GPU ceiling maxGPUs.
 type IdentityAttester interface {
-	Attest(ctx context.Context, userID, workspace string, maxGPUs int) (string, error)
+	Attest(ctx context.Context, subjectKey, workspace, sandbox string, maxGPUs int) (string, error)
 }
 
 // SetIdentityAttester records the client that signs sandbox attestations.
@@ -152,11 +153,13 @@ func (c *SafeWorkloadCreator) Create(ctx context.Context, req e2b.CreateRequest)
 	// SaFE copies the Workload name into the session-id annotation. EnvD accepts
 	// a token only when that annotation equals the E2B sandbox id.
 	name := req.SandboxID
-	token, err := c.identityAttestation(ctx, req, gpuCount(ci))
-	if err != nil {
-		return nil, err
+	if req.OwnerKey {
+		token, err := c.identityAttestation(ctx, req, name, gpuCount(ci))
+		if err != nil {
+			return nil, err
+		}
+		req.IdentityAttestation = token
 	}
-	req.IdentityAttestation = token
 	obj, err := workloadObject(name, req, ci)
 	if err != nil {
 		return nil, err
@@ -746,13 +749,16 @@ func addressFromStatus(obj *unstructured.Unstructured) (string, string, bool) {
 	return "", "", false
 }
 
-// identityAttestation asks primus-identity for the token copied onto the Workload.
-// gpus is the template GPU count the Workload requests.
-func (c *SafeWorkloadCreator) identityAttestation(ctx context.Context, req e2b.CreateRequest, gpus int) (string, error) {
+// identityAttestation asks the identity provider for the token copied onto an identity-key Workload.
+// name is the Workload name and gpus the template GPU count the Workload requests.
+func (c *SafeWorkloadCreator) identityAttestation(ctx context.Context, req e2b.CreateRequest, name string, gpus int) (string, error) {
 	if c == nil || c.identity == nil {
 		return "", fmt.Errorf("identity attester is not configured")
 	}
-	token, err := c.identity.Attest(ctx, req.UserID, req.Workspace, gpus)
+	if req.SubjectKey == "" {
+		return "", fmt.Errorf("identity attestation needs the caller's identity key")
+	}
+	token, err := c.identity.Attest(ctx, req.SubjectKey, req.Workspace, name, gpus)
 	if err != nil {
 		return "", fmt.Errorf("identity attestation: %w", err)
 	}

@@ -17,7 +17,7 @@ import (
 
 const attestTimeout = 8 * time.Second
 
-// Attester asks primus-identity to sign a short sandbox attestation.
+// Attester asks the identity provider to sign a short sandbox attestation.
 type Attester struct {
 	endpoint     string
 	clientID     string
@@ -50,12 +50,13 @@ func AttesterFromEnv() (*Attester, error) {
 	return NewAttester(endpoint, id, secret), nil
 }
 
-// Attest returns the compact attestation for userID in workspace with a GPU ceiling of maxGPUs.
-func (a *Attester) Attest(ctx context.Context, userID, workspace string, maxGPUs int) (string, error) {
+// Attest returns the compact attestation for the owner of subjectKey in workspace,
+// bound to the Workload name sandbox and a GPU ceiling of maxGPUs.
+func (a *Attester) Attest(ctx context.Context, subjectKey, workspace, sandbox string, maxGPUs int) (string, error) {
 	if a == nil || a.endpoint == "" {
 		return "", fmt.Errorf("identity attester is not configured")
 	}
-	body, err := json.Marshal(map[string]any{"userId": userID, "workspace": workspace, "maxGpus": maxGPUs})
+	body, err := json.Marshal(map[string]any{"subjectToken": subjectKey, "workspace": workspace, "sandbox": sandbox, "maxGpus": maxGPUs})
 	if err != nil {
 		return "", err
 	}

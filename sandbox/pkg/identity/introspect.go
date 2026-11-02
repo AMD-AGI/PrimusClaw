@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package identity validates primus-identity API keys through RFC 7662 token introspection.
+// Package identity validates identity provider API keys through RFC 7662 token introspection.
 package identity
 
 import (

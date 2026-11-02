@@ -113,7 +113,7 @@ func TestIdentityKeyCreatesUnderOwnerQuota(t *testing.T) {
 	}
 	req := runner.created[0]
 	owner := grant.OwnerGrantName("u-1")
-	if req.Workspace != "lab" || req.GrantID != owner || req.SessionID != owner || !req.OwnerKey || req.Role != "e2b" || req.UserID != "u-1" || req.TemplateID != "e2b-runner-g1" {
+	if req.Workspace != "lab" || req.GrantID != owner || req.SessionID != owner || !req.OwnerKey || req.Role != "e2b" || req.UserID != "u-1" || req.TemplateID != "e2b-runner-g1" || req.SubjectKey != "ak-alice" {
 		t.Fatalf("create request = %+v", req)
 	}
 	var g runtimev1alpha1.SandboxGrant

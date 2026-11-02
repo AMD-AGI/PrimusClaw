@@ -298,7 +298,7 @@ spec:
               value: {{ .Values.controlplane.config.registrySecret | quote }}
             {{- end }}
             {{- with .Values.controlplane.config.identity }}
-            {{- if or (and .introspectUrl .ownerPolicyConfigMap) .attestUrl }}
+            {{- if and .introspectUrl .ownerPolicyConfigMap }}
             - name: IDENTITY_CLIENT_ID
               valueFrom:
                 secretKeyRef:
@@ -309,8 +309,6 @@ spec:
                 secretKeyRef:
                   name: {{ .clientSecret | quote }}
                   key: client_secret
-            {{- end }}
-            {{- if and .introspectUrl .ownerPolicyConfigMap }}
             - name: IDENTITY_INTROSPECT_URL
               value: {{ .introspectUrl | quote }}
             - name: E2B_OWNER_POLICY
@@ -318,10 +316,10 @@ spec:
                 configMapKeyRef:
                   name: {{ .ownerPolicyConfigMap | quote }}
                   key: policy.json
-            {{- end }}
             {{- if .attestUrl }}
             - name: IDENTITY_ATTEST_URL
               value: {{ .attestUrl | quote }}
+            {{- end }}
             {{- end }}
             {{- end }}
             {{- with .Values.router.extraEnv }}

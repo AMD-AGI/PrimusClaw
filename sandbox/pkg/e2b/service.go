@@ -55,13 +55,13 @@ func applyIdempotencyHeader(body *CreateBody, header string) error {
 	return nil
 }
 
-// Introspector validates a primus-identity key.
+// Introspector validates an identity provider key.
 type Introspector interface {
 	Introspect(ctx context.Context, key string) (identity.Token, error)
 }
 
 // Service is the E2B control plane. Authorization is the caller's grant key
-// or a primus-identity key charged to the owner quota record.
+// or an identity provider key charged to the owner quota record.
 type Service struct {
 	grants    *grant.Service
 	runner    Runner
@@ -74,7 +74,7 @@ type Options struct {
 	Grants    *grant.Service
 	Runner    Runner
 	Namespace string
-	// Identity enables primus-identity keys. Nil accepts grant keys only.
+	// Identity enables identity provider keys. Nil accepts grant keys only.
 	Identity Introspector
 }
 
@@ -305,6 +305,7 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		GrantID:       snap.GrantID,
 		Attestation:   snap.Attestation,
 		OwnerKey:      who.owner,
+		SubjectKey:    subjectKey(who, apiKey),
 		Env:           body.EnvVars,
 		SigningKeyPEM: privateKey,
 		AvoidNodes:    excludedNodesLabel(metadata[avoidNodesMetadata]),
@@ -650,6 +651,14 @@ func tighterCap(a, b int64) int64 {
 		return a
 	}
 	return b
+}
+
+// subjectKey returns the caller's identity key for an owner-record create, and empty for a grant key.
+func subjectKey(who caller, apiKey string) string {
+	if !who.owner {
+		return ""
+	}
+	return apiKey
 }
 
 // withOwner returns a copy of md with the owner user id.
