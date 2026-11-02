@@ -362,6 +362,14 @@ func main() {
 		st = crStore
 	}
 	workloads := workloadmanager.NewSafeWorkloadCreator(dynamicClient, mgr.GetClient())
+	attester, err := identity.AttesterFromEnv()
+	if err != nil {
+		log.Error("identity attestation config is invalid", "error", err)
+		os.Exit(1)
+	}
+	if attester != nil {
+		workloads.SetIdentityAttester(attester)
+	}
 	st = workloadmanager.NewWorkloadSessionStore(st, workloads)
 	defer st.Close()
 

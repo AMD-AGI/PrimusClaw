@@ -44,9 +44,10 @@ const (
 	ownerSessionIDLabel = "primus-claw/owner-session-id"
 	grantIDLabel        = "agent-sandbox.io/grant-id"
 	// ownerKeyLabel marks a Workload charged to an identity-key owner record.
-	ownerKeyLabel              = "agent-sandbox.io/owner-key"
-	sandboxIDLabel             = "agent-sandbox.io/sandbox-id"
-	grantAttestationAnnotation = "agent-sandbox.io/grant-attestation"
+	ownerKeyLabel                 = "agent-sandbox.io/owner-key"
+	sandboxIDLabel                = "agent-sandbox.io/sandbox-id"
+	grantAttestationAnnotation    = "agent-sandbox.io/grant-attestation"
+	identityAttestationAnnotation = "agent-sandbox.io/identity-attestation"
 	// nodesAffinityAnnotation asks SaFE to treat excluded-nodes as a preference.
 	nodesAffinityAnnotation  = "primus-safe.nodes.affinity"
 	nodesAffinityPreferred   = "preferred"
@@ -94,6 +95,20 @@ type SafeWorkloadCreator struct {
 	// remoteClusters are SaFE cluster ids whose pods this control plane cannot address.
 	// A Running Workload in one of them is ready without a pod IP.
 	remoteClusters map[string]struct{}
+	identity       IdentityAttester
+}
+
+// IdentityAttester asks primus-identity for a short sandbox attestation.
+type IdentityAttester interface {
+	Attest(ctx context.Context, userID, workspace string) (string, error)
+}
+
+// SetIdentityAttester records the client that signs sandbox attestations.
+func (c *SafeWorkloadCreator) SetIdentityAttester(attester IdentityAttester) {
+	if c == nil {
+		return
+	}
+	c.identity = attester
 }
 
 // SetRemoteClusters records SaFE cluster ids that are reached through another Router.
@@ -136,6 +151,11 @@ func (c *SafeWorkloadCreator) Create(ctx context.Context, req e2b.CreateRequest)
 	// SaFE copies the Workload name into the session-id annotation. EnvD accepts
 	// a token only when that annotation equals the E2B sandbox id.
 	name := req.SandboxID
+	token, err := c.identityAttestation(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	req.IdentityAttestation = token
 	obj, err := workloadObject(name, req, ci)
 	if err != nil {
 		return nil, err
@@ -725,6 +745,21 @@ func addressFromStatus(obj *unstructured.Unstructured) (string, string, bool) {
 	return "", "", false
 }
 
+// identityAttestation asks primus-identity for the token copied onto the Workload.
+func (c *SafeWorkloadCreator) identityAttestation(ctx context.Context, req e2b.CreateRequest) (string, error) {
+	if c == nil || c.identity == nil {
+		return "", fmt.Errorf("identity attester is not configured")
+	}
+	token, err := c.identity.Attest(ctx, req.UserID, req.Workspace)
+	if err != nil {
+		return "", fmt.Errorf("identity attestation: %w", err)
+	}
+	if token == "" {
+		return "", fmt.Errorf("identity attestation is empty")
+	}
+	return token, nil
+}
+
 func validateWorkloadRequest(req e2b.CreateRequest) error {
 	if req.TemplateID == "" || req.Namespace == "" {
 		return fmt.Errorf("template and namespace are required")
@@ -822,6 +857,9 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 	}
 	if req.Attestation != "" {
 		annotations[grantAttestationAnnotation] = req.Attestation
+	}
+	if req.IdentityAttestation != "" {
+		annotations[identityAttestationAnnotation] = req.IdentityAttestation
 	}
 	if strings.TrimSpace(req.AvoidNodes) != "" {
 		annotations[nodesAffinityAnnotation] = nodesAffinityPreferred

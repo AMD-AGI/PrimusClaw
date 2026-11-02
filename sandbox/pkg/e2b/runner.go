@@ -32,7 +32,9 @@ type CreateRequest struct {
 	GrantID string
 	// Attestation is the Claw JWT copied onto the Workload annotation.
 	Attestation string
-	// OwnerKey marks a sandbox charged to an identity-key owner record, which has no attestation.
+	// IdentityAttestation is the primus-identity JWT copied onto the Workload annotation.
+	IdentityAttestation string
+	// OwnerKey marks a sandbox charged to an identity-key owner record, which has no Claw attestation.
 	OwnerKey bool
 	Env      map[string]string
 	// SigningKeyPEM is the PKCS#8 Ed25519 private key written into a sealed sandbox.

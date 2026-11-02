@@ -145,6 +145,7 @@ func TestCreateWorkloadWaitsForPod(t *testing.T) {
 		return true, obj, nil
 	})
 	creator := NewSafeWorkloadCreator(dc, cl)
+	creator.SetIdentityAttester(staticAttester{token: "eyJ.identity"})
 	result, err := creator.Create(context.Background(), e2b.CreateRequest{
 		SandboxID:   sandboxID,
 		TemplateID:  ci.Name,
@@ -169,9 +170,13 @@ func TestCreateWorkloadWaitsForPod(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	timeout, _, _ := unstructured.NestedInt64(stored.(*unstructured.Unstructured).Object, "spec", "timeout")
+	obj := stored.(*unstructured.Unstructured)
+	timeout, _, _ := unstructured.NestedInt64(obj.Object, "spec", "timeout")
 	if timeout != 60 {
 		t.Fatalf("timeout=%d", timeout)
+	}
+	if obj.GetAnnotations()[identityAttestationAnnotation] != "eyJ.identity" || obj.GetAnnotations()[grantAttestationAnnotation] != "eyJ.test" {
+		t.Fatalf("annotations=%v", obj.GetAnnotations())
 	}
 	if err := creator.Delete(context.Background(), result.SandboxName); err != nil {
 		t.Fatal(err)
@@ -206,7 +211,9 @@ func TestCreateDeletesFailedWorkload(t *testing.T) {
 		_ = unstructured.SetNestedField(obj.Object, "Container codeinterpreter terminated: reason=Error exitCode=1, details: [{\"pod\":\"sbx-1\",\"node\":\"node-a\",\"message\":\"task ended Failed\",\"container\":{\"name\":\"codeinterpreter\",\"reason\":\"Error\",\"exitCode\":1}}]", "status", "message")
 		return true, obj, nil
 	})
-	_, err := NewSafeWorkloadCreator(dc, cl).Create(context.Background(), e2b.CreateRequest{
+	creator := NewSafeWorkloadCreator(dc, cl)
+	creator.SetIdentityAttester(staticAttester{token: "eyJ.identity"})
+	_, err := creator.Create(context.Background(), e2b.CreateRequest{
 		SandboxID:   sandboxID,
 		TemplateID:  "ar-run-dev-g2",
 		Namespace:   "agent-sandbox-system",
@@ -375,7 +382,33 @@ func signingWorkloadCreator(t *testing.T, sandboxID, phase string) (*SafeWorkloa
 		_ = unstructured.SetNestedField(obj.Object, phase, "status", "phase")
 		return true, obj, nil
 	})
-	return NewSafeWorkloadCreator(dc, cl), dc
+	creator := NewSafeWorkloadCreator(dc, cl)
+	creator.SetIdentityAttester(staticAttester{token: "eyJ.identity"})
+	return creator, dc
+}
+
+type staticAttester struct {
+	token string
+	err   error
+}
+
+func (a staticAttester) Attest(context.Context, string, string) (string, error) {
+	if a.err != nil {
+		return "", a.err
+	}
+	return a.token, nil
+}
+
+func TestCreateRefusesWithoutIdentityAttester(t *testing.T) {
+	const sandboxID = "sbx-7a9b9b693452f613877992145c818d29"
+	creator, dc := signingWorkloadCreator(t, sandboxID, "Running")
+	creator.SetIdentityAttester(nil)
+	if _, err := creator.Create(context.Background(), signingCreateRequest(sandboxID)); err == nil || !strings.Contains(err.Error(), "not configured") {
+		t.Fatalf("err=%v", err)
+	}
+	if _, err := dc.Tracker().Get(workloadGVR, "", sandboxID); err == nil {
+		t.Fatal("workload was created without an attestation")
+	}
 }
 
 func TestWorkloadNameMatchesSandboxID(t *testing.T) {
