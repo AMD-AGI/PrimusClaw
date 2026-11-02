@@ -131,6 +131,14 @@
       "type": "object",
       "additionalProperties": true,
       "properties": {
+        "requiredPlatformRoles": {
+          "description": "Platform roles, as SaFE reports them, of which a caller must hold at least one to use Claw (CLAW_REQUIRED_PLATFORM_ROLES). Empty, the default, checks nothing.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[^\\s,]+$"
+          }
+        },
         "admitSoftRuns": {
           "$ref": "#/definitions/admitCeiling"
         },

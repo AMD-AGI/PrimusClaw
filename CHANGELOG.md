@@ -28,6 +28,15 @@ record it.
 ## [Unreleased]
 
 ### Added
+- `CLAW_REQUIRED_PLATFORM_ROLES` (chart: `api.requiredPlatformRoles`; empty by default, which changes
+  nothing) names platform roles of which a caller must hold at least one to use Claw at all. Anyone else is
+  refused with a 403 `platform_access_required` ("no access yet - ask an administrator") on every
+  authenticated route, before any LLM key is cached for them. The roles are the ones the platform's
+  verification of the caller's credential reports; a connector token and a BYOK key bring none, so they are
+  refused while the setting is on, and so is an identity token unless it carries a role the identity provider
+  confirmed (`CLAW_IDENTITY_TOKEN_TRUSTED_ROLES`; the `default` every such caller has never counts). Claw knows
+  no role names. Scheduled triggers already created keep firing for a user who loses access. See
+  `claw/docs/platform-access.md`.
 - The `a2a_call` tool is now a complete A2A client, off by default behind `A2A_CLIENT_ENABLED` (chart `extraEnv`;
   while it is off the tool is not offered to the model and a call that arrives anyway is refused). With it on:
   a peer is called where its Agent Card says (the JSONRPC 1.0 `supportedInterfaces` entry, cached by `ETag` /
@@ -84,6 +93,36 @@ record it.
   `by: "policy"` and counted in `claw_hitl_policy_allow_total` (no labels: a request can carry its own
   server spec, so the entry that released the call is in the `hitl.policy_allow` log line instead). See
   `claw/docs/mcp-approval.md`.
+- GitHub pull request review, off by default (`CLAW_GITHUB_REVIEW_ENABLED=true`). A session created with
+  `config.acting_as = <user id>` is offered four tools (`gh_pr_get`, `gh_pr_risk`, `gh_review_submit`,
+  `gh_pr_merge`) that review, and when everything is green merge, a public pull request with that user's GitHub
+  account. The token is fetched from the identity provider for one call and never reaches a sandbox, a tool result,
+  a log line or an event. Every gate is in the tool: owner allow-list and public repositories only, the head
+  commit pinned, the acting user's own permission and their setting for others acting for them (without it,
+  comments only), CI green on the head commit, no unresolved thread, GitHub's merge state `CLEAN`, a versioned
+  high-risk rule pack that holds a merge for the acting user's confirmation
+  (`GET /v1/github-review/confirmations`, `POST .../:id/decision`, which takes an identity-provider access token
+  only: the person's own sign-in, or a service an operator named in `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS`
+  acting for the user its token names, recording both. It refuses the `ak-` or BYOK key a sandbox holds and the
+  session cookie that key can sign in to at SaFE; the same credentials are required to create a session with
+  `config.acting_as` and to start any turn in one: a message, an approval or an answer, a task, a batch, a retry
+  or a workbench run). The
+  rules judge what the change does (architecture, interface, security-sensitive code, CI and release,
+  dependencies, size and breadth) from its net diff, so a pure refactor stays low; a file that came without its
+  diff (a binary, or an LFS pointer), a lock file and an edit of an authentication module or a release file stay
+  high as a floor whatever the edit looks like, and the reviewing model can raise a verdict with a reason shown on
+  the confirmation (`risk_judgement`) and never lower it. Rate limits, a request budget per session, a
+  dry-run switch and an audit row per call (`claw_github_audit`). A small change is reviewed from the diff
+  without starting a sandbox; the path taken is logged and audited, and the thresholds are
+  `CLAW_GITHUB_REVIEW_FAST_MAX_FILES` / `_MAX_CHANGED_LINES`. A repository's own review skill is read from the
+  tip of the base branch; the default `pr-review` skill is in `claw/examples/skills/pr-review/`.
+  The merge waits a few seconds, one request a look, for GitHub to finish working out the merge state after the
+  approval it just posted (`UNKNOWN`, or `BLOCKED` until the review counts; CI is read again before a merge that waited), and a review's hidden marker
+  carries a digest of its text and inline comments, so a second, different review of the same kind on the same commit is posted.
+  On the sandbox path the model gets a credential-free bash recipe that fetches the pull request anonymously, shallow and
+  pinned to the reviewed head, reusing an existing checkout. The shared
+  identity client gains `resolveExternalCredential` (`IDENTITY_CREDENTIAL_RESOLVE_URL`). See
+  `claw/docs/github-review.md`.
 - A session can be bound to a repository. `POST /v1/sessions` accepts `config.repo = {url, branch?}`
   (`url` is `https://<host>/<owner>/<name>[.git]` with no credentials, query or fragment; `branch` is a
   plain ref name, empty meaning the remote's default; anything else is a `400` starting
@@ -146,8 +185,11 @@ record it.
   tag is limited to repository admins by a tag ruleset. The tag must equal the version in
   `connector/package.json`. Once a release has been published,
   `npm install -g @primusclaw/connector` installs the `claw-connector` command (Node.js 22 or newer).
-  The package holds only the bundle, README and LICENSE, and the Connector packaging workflow checks a real
+  The package holds only the two bundles (the CLI and the session-hook program), README and LICENSE, and the Connector packaging workflow checks a real
   tarball on every change (`connector/scripts/check-pack.mjs`), together with the shape of the release workflow.
+- `@primusclaw/connector` 0.1.1 is the first version published by the release workflow, with a build-provenance
+  attestation (`gh attestation verify` on the tarball attached to the release, and the provenance shown on npmjs.com). It has
+  the same code as 0.1.0, which was published by hand: no behaviour change.
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,

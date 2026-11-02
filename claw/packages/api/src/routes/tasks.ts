@@ -29,6 +29,7 @@ import { getTaskDag } from "../tasks/dags/db.js";
 import type { UserInfo } from "../auth/models.js";
 import { MissingPlatformKeyError, stampSessionCredentials } from "../auth/session-credentials.js";
 import { withAdmissionTransaction } from "../tasks/admission.js";
+import { actingTurnRefusalFor } from "../github-review/acting-turns.js";
 import { createAppRun } from "./app-run-create.js";
 import {
   createSingleTask, expandDag, isCreateRefusal, isTopologyRefusal,
@@ -141,6 +142,7 @@ async function requireSessionAccess(
   sessionId: string,
   write: boolean,
   ownerOnly = false,
+  startsWork = false,
 ): Promise<boolean> {
   const session = (await db.query(
     "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
@@ -160,6 +162,13 @@ async function requireSessionAccess(
     reply.status(403).send({ ok: false, error: "access_denied" });
     return false;
   }
+  // Work that is about to run in a session that acts as a user runs with the review tools in its hands (github-review/acting-turns.ts),
+  // so it is the person's say, like creating that session: the key a sandbox holds must not be able to start it.
+  const unattended = startsWork ? await actingTurnRefusalFor(req, sessionId) : null;
+  if (unattended) {
+    reply.status(403).send({ ok: false, error: unattended });
+    return false;
+  }
   return true;
 }
 
@@ -169,13 +178,14 @@ async function requireTaskAccess(
   taskId: string,
   write: boolean,
   ownerOnly = false,
+  startsWork = false,
 ): Promise<ClawTaskRow | null> {
   const task = await getTask(taskId);
   if (!task) {
     reply.status(404).send({ ok: false, error: "not_found" });
     return null;
   }
-  if (!await requireSessionAccess(req, reply, task.session_id, write, ownerOnly)) return null;
+  if (!await requireSessionAccess(req, reply, task.session_id, write, ownerOnly, startsWork)) return null;
   return task;
 }
 
@@ -275,7 +285,7 @@ export async function registerTaskCreateRoute(app: FastifyInstance): Promise<voi
       // Submission stamps the caller's credentials onto the session. Operators
       // may inspect and stop tenant work, but submitting here would replace the
       // owner's credentials while their queued tasks still read from this row.
-      if (!await requireSessionAccess(req, reply, sessionId, true, true)) return reply;
+      if (!await requireSessionAccess(req, reply, sessionId, true, true, true)) return reply;
 
       // A hosted application run has its own admission (tasks/app-run.ts) and
       // its own Idempotency-Key handling; the session check above is the
@@ -347,7 +357,7 @@ export async function registerBatchRoute(app: FastifyInstance): Promise<void> {
     if (!Array.isArray(body.inputs) || body.inputs.length === 0) {
       return reply.status(400).send({ ok: false, error: "inputs[] required" });
     }
-    if (!await requireSessionAccess(req, reply, body.session_id, true, true)) return reply;
+    if (!await requireSessionAccess(req, reply, body.session_id, true, true, true)) return reply;
 
     const dag = await getTaskDag(body.dag_id);
     if (!dag || !canExecuteTaskDag(dag, user)) {
@@ -588,7 +598,7 @@ export async function registerTaskLifecycleRoutes(app: FastifyInstance): Promise
   app.post<{ Params: { taskId: string } }>(
     "/v1/tasks/:taskId/retry",
     async (req, reply) => {
-      const task = await requireTaskAccess(req, reply, req.params.taskId, true, true);
+      const task = await requireTaskAccess(req, reply, req.params.taskId, true, true, true);
       if (!task) return reply;
       const user = getUser(req);
       if (!user) return reply.status(401).send({ ok: false, error: "unauthorized" });

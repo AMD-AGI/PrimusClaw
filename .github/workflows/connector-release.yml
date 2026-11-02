@@ -130,7 +130,7 @@ jobs:
         run: npm run build
 
       # The tarball that is uploaded below, attested and published is the one checked here: exactly
-      # dist/cli.js, README.md, LICENSE and package.json; the bin and engines fields; package.json's
+      # dist/cli.js, dist/terminal-hook.js, README.md, LICENSE and package.json; the bin and engines fields; package.json's
       # version equal to the tag and to what the built CLI prints; repository.url equal to this
       # repository (npm refuses provenance otherwise).
       - name: Pack and check the tarball
