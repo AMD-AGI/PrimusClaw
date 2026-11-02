@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 import pg from "pg";
-import { APP_RUNS_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_REMOTE_AGENTS_ENABLED, CLAW_TRIGGERS_ENABLED, DATABASE_URL, envBool, envInt } from "../config.js";
+import { APP_RUNS_ENABLED, CLAW_ASSISTANT_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_REMOTE_AGENTS_ENABLED, CLAW_TRIGGERS_ENABLED, DATABASE_URL, envBool, envInt } from "../config.js";
+import { ensureAssistantSchema } from "../assistant/schema.js";
 import { ensureA2aPushSchema } from "../notifications/a2a-push-schema.js";
 import { ensureNotificationSchema } from "../notifications/schema.js";
 import { ensureRemoteAgentSchema } from "../remote-agents/schema.js";
@@ -428,7 +429,7 @@ async function assertSchema(client: pg.PoolClient): Promise<void> {
   // APP_RUNS_ENABLED off they are a warning, so a database that has not been
   // migrated for them still serves everything else.
   const { fatal: problems, warnings } = classifySchemaProblems(
-    REQUIRED_SCHEMA, present.rows as PresentColumn[], APP_RUNS_ENABLED,
+    REQUIRED_SCHEMA, present.rows as PresentColumn[], APP_RUNS_ENABLED, CLAW_ASSISTANT_ENABLED,
   );
   if (warnings.length > 0) logger.warn({ problems: warnings }, "db.app_run_schema_incomplete (APP_RUNS_ENABLED is off: not fatal)");
   if (problems.length > 0) {
@@ -2252,6 +2253,7 @@ export async function initDb(): Promise<void> {
     // Off by default: a deployment that has not opted in gets no new tables.
     if (CLAW_NOTIFICATIONS_ENABLED) await ensureNotificationSchema(client);
     if (CLAW_REMOTE_AGENTS_ENABLED) await ensureRemoteAgentSchema(client);
+    if (CLAW_ASSISTANT_ENABLED) await ensureAssistantSchema(client);
     // A2A context/task model: a context is found by its caller and id on every
     // send, which the single-column index above does not narrow.
     if (envBool("CLAW_A2A_CONTEXT_TASKS", false)) {

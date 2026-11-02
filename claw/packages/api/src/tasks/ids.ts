@@ -44,3 +44,8 @@ export function newBatchId(): string {
 export function newWorkspaceId(): string {
   return `kws_${ulid()}`;
 }
+
+/** A work item: one thing the assistant took on for a user. */
+export function newWorkItemId(): string {
+  return `kwi_${ulid()}`;
+}
