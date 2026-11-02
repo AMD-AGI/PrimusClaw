@@ -4,12 +4,13 @@
 import { HandsClient, type ShellClassProbe } from "../clients/hands.js";
 import { isSandboxTool, toolTimeoutCeilingSec } from "./hands.js";
 import { handleA2ACall } from "../clients/a2a.js";
+import { LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON } from "../tasks/abort-registry.js";
 import { callBackendMcpTool } from "../clients/backend-mcp.js";
 import { getPluginToolScope } from "./scope.js";
 import type { ToolSchema, PendingMemory, PendingSkill, PendingSkillFileMutation } from "@claw/protocol";
 import {
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED, TODO_WRITE_ENABLED, BG_SHELL_ENABLED,
-  EXIT_PLAN_MODE_ENABLED, ASK_USER_QUESTION_ENABLED,
+  EXIT_PLAN_MODE_ENABLED, ASK_USER_QUESTION_ENABLED, A2A_CLIENT_ENABLED,
   BASH_FOREGROUND_DEFAULT_SEC, WAIT_DEFAULT_SEC,
 } from "../config.js";
 import type { WebSearchService } from "./web/search.js";
@@ -156,6 +157,13 @@ export class ToolRouter {
   /** False when the API said memory is off for this user; save_memory is then withheld. */
   memoryEnabled = true;
 
+  /**
+   * Whom `a2a_call` acts for and how long the run has: the session's owner (an identity
+   * peer is called as them), its id for logs, and the epoch ms its budget ends. Set by the
+   * engine; sub-agent routers inherit it, so a sub-agent's call is the same user's.
+   */
+  a2aContext: { userId?: string; sessionId?: string; deadlineAtMs?: number } = {};
+
   private webServices: WebToolServices;
 
   /**
@@ -256,6 +264,7 @@ export class ToolRouter {
   /** Register a child router so subsequent setHands() cascades to it. */
   registerChild(child: ToolRouter): void {
     child.lazySkillWriter = this.lazySkillWriter;
+    child.a2aContext = this.a2aContext;
     this.children.add(child);
   }
 
@@ -439,7 +448,15 @@ export class ToolRouter {
     }
 
     if (name === "a2a_call") {
-      return handleA2ACall(input);
+      // The schema is withheld while the switch is off, but a resumed transcript can still hold a call.
+      if (!A2A_CLIENT_ENABLED) return refuse(outcome, "Error: a2a_call is disabled in this deployment");
+      return handleA2ACall(input, {
+        ...this.a2aContext,
+        signal,
+        outcome,
+        // A Stop ends the peer's task too. A restart does not: the run resumes and may still want it.
+        cancelOnAbort: (reason) => reason !== SIGTERM_ABORT_REASON && reason !== LEASE_LOST_ABORT_REASON,
+      });
     }
 
     if (name.startsWith("mcp__")) {
@@ -653,21 +670,25 @@ export class ToolRouter {
         },
       } as ToolSchema] : []),
 
-      { name: "a2a_call", description: "Call a peer AI agent that the operator has configured, using the A2A protocol. Only configured peers can be called (never a URL), and authentication is handled for you — do NOT use bash/curl for A2A calls. Use when: (1) the task requires expertise from another agent, (2) user explicitly asks to involve another agent, (3) creating worker agents in an agent team. Use mode='discover' first to check capabilities. Pass metadata.plugin_id to load a specific plugin/skill on the remote agent.", input_schema: {
+      ...(A2A_CLIENT_ENABLED ? [{ name: "a2a_call", description: "Call a peer AI agent that the operator has configured, using the A2A protocol. Only configured peers can be called (never a URL), and authentication is handled for you — do NOT use bash/curl for A2A calls. Use when: (1) the task requires expertise from another agent, (2) user explicitly asks to involve another agent, (3) creating worker agents in an agent team. Use mode='discover' first to check capabilities. Pass metadata.plugin_id to load a specific plugin/skill on the remote agent. The result is JSON: {state, task_id, context_id, text, artifacts, input_required?}. state is submitted, working, input_required, auth_required, completed, failed, canceled or rejected. A call that outlasts its wait returns state=working with a task_id: read it later with mode='get'. state=input_required means the peer is asking something: input_required.text is the question; answer by calling again with the same task_id and context_id and your answer in message (or approval for an approval request). Pass context_id alone to continue the same conversation in a new task.", input_schema: {
         type: "object", properties: {
           agent: { type: "string", description: "Name of a configured peer agent (not a URL); an unknown name is refused with the list of configured peers" },
-          message: { type: "string", description: "The task/question to send to the remote agent" },
-          skill: { type: "string", description: "Optional: target a specific skill on the remote agent" },
-          mode: { type: "string", enum: ["stream", "fire_and_forget", "discover"], description: "stream (default): wait for full response. fire_and_forget: submit and return immediately. discover: fetch agent card only." },
-          task_id: { type: "string", description: "Optional: existing task ID for multi-turn follow-up on the same remote session" },
+          message: { type: "string", description: "The task/question to send to the remote agent, or your answer when task_id is set. Not needed for discover, get or cancel." },
+          mode: { type: "string", enum: ["stream", "fire_and_forget", "discover", "get", "cancel"], description: "stream (default): wait for the response, up to an idle and a total limit. fire_and_forget: submit and return immediately. discover: fetch agent card only. get: read the task task_id (state and result). cancel: ask the peer to cancel task task_id." },
+          task_id: { type: "string", description: "The peer's task: required for get and cancel; with stream or fire_and_forget it answers that task when it is input_required." },
+          context_id: { type: "string", description: "Optional: the peer's conversation (from an earlier result) to continue in a new task." },
+          approval: { type: "object", description: "Answer a peer's approval request (input_required.approval). allow is held for the user's own approval before it is sent.", properties: {
+            action_id: { type: "string", description: "input_required.approval.action_id" },
+            decision: { type: "string", enum: ["allow", "deny"] },
+          }, required: ["action_id", "decision"] },
           metadata: { type: "object", description: "Optional: A2A metadata passed to the remote agent. Key fields: plugin_id (number) to load a plugin/skill, workspace_id (string) for sandbox namespace, parent_session_id (string) for agent team, team_role (string) for team role name.", properties: {
             plugin_id: { type: "number", description: "Marketplace plugin ID — the remote Brain will download and load this plugin's skill/rules/tools" },
             workspace_id: { type: "string", description: "Target K8s namespace for the remote sandbox" },
             parent_session_id: { type: "string", description: "Parent session ID to form an agent team" },
             team_role: { type: "string", description: "Role name within the agent team" },
           }},
-        }, required: ["agent", "message"],
-      }},
+        }, required: ["agent"],
+      }} as ToolSchema] : []),
       // NOTE: `upload_to_s3` is intentionally NOT exposed to the LLM. It is an
       // internal Brain↔Hands plumbing tool (used by syncWorkspaceToS3), and
       // the LLM has no S3 credentials to produce valid presigned URLs — any

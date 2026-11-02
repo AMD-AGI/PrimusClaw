@@ -18,6 +18,7 @@ import { constantTimeEquals } from "@claw/utils";
 import { verifyConnectorToken } from "./connector-token.js";
 import { verifyIdentityAccessToken } from "./identity-token.js";
 import { recordRequestCredential } from "./request-credential.js";
+import { platformAccessRefusal } from "./platform-access.js";
 import pino from "pino";
 
 const logger = pino({ name: "auth" });
@@ -200,7 +201,7 @@ export function authLogPath(url: string): string {
 }
 
 /** The SaFE calls the credential paths need. Narrowed so tests can pass a stub. */
-export type CredentialVerifier = Pick<SafeClient, "verifyCookie" | "verifyApiKey">;
+export type CredentialVerifier = Pick<SafeClient, "verifyCookie" | "verifyApiKey"> & Partial<Pick<SafeClient, "verifyAccessToken">>;
 
 /** An error response a credential path asks {@link authMiddleware} to send. */
 type AuthErrorSpec = {
@@ -492,6 +493,17 @@ export async function authMiddleware(req: FastifyRequest, reply: FastifyReply): 
     return;
   }
 
+  // Whether this caller may use Claw at all (auth/platform-access.ts): asked of
+  // every verified caller, BEFORE grantVerifiedUser, so that a refused caller's
+  // LLM key is not cached for background work. Nothing is refused while
+  // CLAW_REQUIRED_PLATFORM_ROLES is empty, which is the default.
+  const refuseWithoutPlatformAccess = (user: UserInfo, method: string): FastifyReply | null => {
+    const refusal = platformAccessRefusal(user, method);
+    if (!refusal) return null;
+    logger.info({ userId: user.userId, method, reason: refusal.reason }, "auth.platform_access.refused");
+    return sendAuthError(req, reply, refusal.status, refusal.legacyError, refusal.anthropicType, refusal.message);
+  };
+
   // Diagnostic: log what auth material reached the server. Cookie NAMES are
   // logged verbatim (non-sensitive); only value-length is surfaced to
   // distinguish "missing" from "present but malformed".
@@ -518,6 +530,8 @@ export async function authMiddleware(req: FastifyRequest, reply: FastifyReply): 
   // is judged by it in every mode; it abstains for everything else.
   const connectorToken = await verifyConnectorToken(req, pathname);
   if (connectorToken.status === "verified") {
+    const refused = refuseWithoutPlatformAccess(connectorToken.user, connectorToken.method);
+    if (refused) return refused as any;
     grantVerifiedUser(req, connectorToken.user, connectorToken.method, connectorToken.expiresAt);
     return;
   }
@@ -550,6 +564,8 @@ export async function authMiddleware(req: FastifyRequest, reply: FastifyReply): 
     // SaFE mode below it is one of CREDENTIAL_PATHS.
     const identityToken = await verifyIdentityAccessToken(req, null, pathname);
     if (identityToken.status === "verified") {
+      const refused = refuseWithoutPlatformAccess(identityToken.user, identityToken.method);
+      if (refused) return refused as any;
       grantVerifiedUser(req, identityToken.user, identityToken.method);
       return;
     }
@@ -589,6 +605,9 @@ export async function authMiddleware(req: FastifyRequest, reply: FastifyReply): 
       platformKey: usePlatformKeyForLlm() ? key : "",
       virtualKey: key,
     } satisfies UserInfo;
+    // A BYOK key is verified by the LLM gateway, not by SaFE: no platform roles.
+    const refused = refuseWithoutPlatformAccess(user, "byok");
+    if (refused) return refused as any;
     (req as any).user = user;
     // Cache for background tasks; base url is the platform LLM gateway (DK2-A).
     cacheUserLlmKey(userId, resolveUserLlmKey(user), MEMORY_LLM_BASE_URL);
@@ -604,6 +623,8 @@ export async function authMiddleware(req: FastifyRequest, reply: FastifyReply): 
   for (const verifyCredential of CREDENTIAL_PATHS) {
     const outcome = await verifyCredential(req, client, pathname);
     if (outcome.status === "verified") {
+      const refused = refuseWithoutPlatformAccess(outcome.user, outcome.method);
+      if (refused) return refused as any;
       grantVerifiedUser(req, outcome.user, outcome.method);
       return;
     }
