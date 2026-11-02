@@ -21,6 +21,8 @@ import {
 } from "./admission.js";
 import { insertEdge, insertTask } from "./db.js";
 import { newTaskId } from "./ids.js";
+import { toolsAllowlistProblem } from "./dags/admission.js";
+import { BadRequestError } from "../shared/errors.js";
 import { appGpuNodesFromSpec, gpuNodesFromSpec, topologyErrors } from "./run-spec.js";
 import type { DagNode, NodeSandbox, TaskDagDef } from "./dags/types.js";
 
@@ -113,13 +115,20 @@ function topologicalSort(nodes: DagNode[]): DagNode[] {
  * becomes one `mcp__<server>__*` per server. Everything else (a builtin such as
  * `bash`, a name already in Brain's form, a name this plugin does not know) is
  * passed through exactly as written.
+ *
+ * A list that is not a list of strings is refused (admission refuses it when the
+ * template is registered; this is the same check for a template stored before
+ * that). It is not read as "no list": Brain would then offer such a node every
+ * tool, where the author wrote something meant to restrict it.
  */
 export function nodeToolsAllowlist(
-  node: Pick<DagNode, "tools_allowlist">,
+  node: Pick<DagNode, "id" | "tools_allowlist">,
   plugin: ExpandOpts["plugin"],
 ): unknown[] {
-  const explicit: unknown = node.tools_allowlist;
-  if (!Array.isArray(explicit)) return [];
+  const problem = toolsAllowlistProblem(node.tools_allowlist);
+  if (problem) throw new BadRequestError(`node ${node.id}: ${problem}`);
+  const explicit = node.tools_allowlist;
+  if (!explicit) return [];
   const serversByRow = new Map<string, string[]>();
   for (const row of plugin?.tools ?? []) {
     const r = row as { name?: unknown; type?: unknown; config?: { mcpServers?: unknown } } | null;

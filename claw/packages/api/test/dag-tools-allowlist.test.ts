@@ -19,7 +19,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { filterToolSchemas, parseToolAllowlist } from "../../brain/src/tools/allowlist.js";
 import { applyPluginDefaults, nodeToolsAllowlist } from "../src/tasks/dag-expander.js";
-import type { DagNode } from "../src/tasks/dags/types.js";
+import { toolsAllowlistProblem, validateDag } from "../src/tasks/dags/admission.js";
+import { BadRequestError } from "../src/shared/errors.js";
+import type { DagNode, TaskDagDef } from "../src/tasks/dags/types.js";
 
 /** A plugin with one MCP server per row, one row with two servers, and rows that are not MCP. */
 const PLUGIN = {
@@ -66,7 +68,7 @@ const rows: Row[] = [
   { name: "no list, plugin with MCP rows: no restriction, bash and the plugin's MCP tools stay", plugin: PLUGIN, sent: [], offered: OFFERED },
   { name: "no list, no plugin: no restriction", plugin: null, sent: [], offered: OFFERED },
   { name: "an empty list is no restriction", tools: [], plugin: PLUGIN, sent: [], offered: OFFERED },
-  { name: "a list that is not a list is no restriction, as it was before Brain read it", tools: "bash", plugin: PLUGIN, sent: [], offered: OFFERED },
+  { name: "null is no list", tools: null, plugin: PLUGIN, sent: [], offered: OFFERED },
 
   // An explicit list is what the node sees, and nothing else.
   { name: "a builtin name passes through", tools: ["bash"], plugin: PLUGIN, sent: ["bash"], offered: ["bash"] },
@@ -112,4 +114,36 @@ test("the rest of what a plugin supplies a node is unchanged", () => {
   const out = applyPluginDefaults(node(), PLUGIN);
   assert.deepEqual(out.skills, ["triage"]);
   assert.equal(out.rules_text, null, "rule bodies come from the object store, not this row");
+});
+
+// A value that is meant to restrict must never come out the other end as "no restriction".
+const MALFORMED: unknown[] = ["bash", { bash: true }, 5, true, ["bash", 5], [null], [["bash"]]];
+
+test("a list that is not a list of strings is refused, not read as no list", () => {
+  for (const bad of MALFORMED) {
+    assert.throws(
+      () => applyPluginDefaults(node({ tools_allowlist: bad as never }), PLUGIN),
+      (e: unknown) => e instanceof BadRequestError && /node n1: tools_allowlist must be an array of strings/.test(e.message),
+      JSON.stringify(bad),
+    );
+  }
+});
+
+test("admission refuses the same values when the template is registered", async () => {
+  const dag = (tools: unknown) => ({
+    dag_id: "d", name: "d",
+    nodes: [{ id: "n1", executor: "brain", mode: "llm", sandbox: { handle: "h", image: "img" }, tools_allowlist: tools }],
+  }) as unknown as TaskDagDef;
+  for (const bad of MALFORMED) {
+    assert.notEqual(toolsAllowlistProblem(bad), null, JSON.stringify(bad));
+    await assert.rejects(
+      validateDag(dag(bad)),
+      (e: unknown) => e instanceof BadRequestError && /node n1: tools_allowlist must be an array of strings/.test(e.message),
+      JSON.stringify(bad),
+    );
+  }
+  for (const good of [undefined, null, [], ["bash"], ["bash", "board", "mcp__board__*"]]) {
+    assert.equal(toolsAllowlistProblem(good), null, JSON.stringify(good));
+    await validateDag(dag(good));
+  }
 });
