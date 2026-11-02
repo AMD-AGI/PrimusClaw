@@ -50,12 +50,12 @@ func AttesterFromEnv() (*Attester, error) {
 	return NewAttester(endpoint, id, secret), nil
 }
 
-// Attest returns the compact attestation for userID in workspace.
-func (a *Attester) Attest(ctx context.Context, userID, workspace string) (string, error) {
+// Attest returns the compact attestation for userID in workspace with a GPU ceiling of maxGPUs.
+func (a *Attester) Attest(ctx context.Context, userID, workspace string, maxGPUs int) (string, error) {
 	if a == nil || a.endpoint == "" {
 		return "", fmt.Errorf("identity attester is not configured")
 	}
-	body, err := json.Marshal(map[string]string{"userId": userID, "workspace": workspace})
+	body, err := json.Marshal(map[string]any{"userId": userID, "workspace": workspace, "maxGpus": maxGPUs})
 	if err != nil {
 		return "", err
 	}

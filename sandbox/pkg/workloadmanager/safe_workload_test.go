@@ -145,7 +145,8 @@ func TestCreateWorkloadWaitsForPod(t *testing.T) {
 		return true, obj, nil
 	})
 	creator := NewSafeWorkloadCreator(dc, cl)
-	creator.SetIdentityAttester(staticAttester{token: "eyJ.identity"})
+	attestedGPUs := -1
+	creator.SetIdentityAttester(staticAttester{token: "eyJ.identity", gpus: &attestedGPUs})
 	result, err := creator.Create(context.Background(), e2b.CreateRequest{
 		SandboxID:   sandboxID,
 		TemplateID:  ci.Name,
@@ -177,6 +178,9 @@ func TestCreateWorkloadWaitsForPod(t *testing.T) {
 	}
 	if obj.GetAnnotations()[identityAttestationAnnotation] != "eyJ.identity" || obj.GetAnnotations()[grantAttestationAnnotation] != "eyJ.test" {
 		t.Fatalf("annotations=%v", obj.GetAnnotations())
+	}
+	if attestedGPUs != 2 {
+		t.Fatalf("attested gpus=%d", attestedGPUs)
 	}
 	if err := creator.Delete(context.Background(), result.SandboxName); err != nil {
 		t.Fatal(err)
@@ -390,9 +394,13 @@ func signingWorkloadCreator(t *testing.T, sandboxID, phase string) (*SafeWorkloa
 type staticAttester struct {
 	token string
 	err   error
+	gpus  *int
 }
 
-func (a staticAttester) Attest(context.Context, string, string) (string, error) {
+func (a staticAttester) Attest(_ context.Context, _, _ string, maxGPUs int) (string, error) {
+	if a.gpus != nil {
+		*a.gpus = maxGPUs
+	}
 	if a.err != nil {
 		return "", a.err
 	}

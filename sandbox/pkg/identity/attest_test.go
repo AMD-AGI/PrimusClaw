@@ -13,6 +13,7 @@ import (
 
 func TestAttestUsesBasicClientCredentials(t *testing.T) {
 	var gotUser, gotWorkspace, gotAuth string
+	gotGPUs := -1
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		user, pass, ok := r.BasicAuth()
 		if !ok || user != "svc-1" || pass != "secret" || r.URL.Path != "/api/v1/sandbox-attestations" {
@@ -22,20 +23,21 @@ func TestAttestUsesBasicClientCredentials(t *testing.T) {
 		var body struct {
 			UserID    string `json:"userId"`
 			Workspace string `json:"workspace"`
+			MaxGPUs   int    `json:"maxGpus"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Error(err)
 		}
-		gotUser, gotWorkspace, gotAuth = body.UserID, body.Workspace, r.Header.Get("Authorization")
+		gotUser, gotWorkspace, gotAuth, gotGPUs = body.UserID, body.Workspace, r.Header.Get("Authorization"), body.MaxGPUs
 		_ = json.NewEncoder(w).Encode(map[string]string{"attestation": "eyJ.signed"})
 	}))
 	defer srv.Close()
-	token, err := NewAttester(srv.URL+"/api/v1/sandbox-attestations", "svc-1", "secret").Attest(context.Background(), "user-1", "lab")
+	token, err := NewAttester(srv.URL+"/api/v1/sandbox-attestations", "svc-1", "secret").Attest(context.Background(), "user-1", "lab", 2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if token != "eyJ.signed" || gotUser != "user-1" || gotWorkspace != "lab" || gotAuth == "" {
-		t.Fatalf("token=%q user=%q workspace=%q auth=%q", token, gotUser, gotWorkspace, gotAuth)
+	if token != "eyJ.signed" || gotUser != "user-1" || gotWorkspace != "lab" || gotAuth == "" || gotGPUs != 2 {
+		t.Fatalf("token=%q user=%q workspace=%q auth=%q gpus=%d", token, gotUser, gotWorkspace, gotAuth, gotGPUs)
 	}
 }
 
@@ -44,7 +46,7 @@ func TestAttestRejectsNonOK(t *testing.T) {
 		http.Error(w, "no", http.StatusForbidden)
 	}))
 	defer srv.Close()
-	if _, err := NewAttester(srv.URL, "svc-1", "secret").Attest(context.Background(), "user-1", "lab"); err == nil {
+	if _, err := NewAttester(srv.URL, "svc-1", "secret").Attest(context.Background(), "user-1", "lab", 0); err == nil {
 		t.Fatal("forbidden response was accepted")
 	}
 }
