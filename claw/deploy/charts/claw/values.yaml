@@ -54,9 +54,11 @@ api:
   # `platform_access_required` ("no access yet - ask an administrator"). The names are
   # SaFE's, not this chart's. Empty (the default) checks nothing and changes nothing.
   # Only a credential SaFE verifies (the session cookie, an `ak-` key) brings roles, so
-  # while this is set an identity token, a connector token and a BYOK key are refused too.
+  # while this is set a connector token and a BYOK key are refused too, and so is an identity
+  # token unless it carries a role the identity provider confirmed (identity.tokenAuth.trustedRoles).
   # SaFE's answer is cached for five minutes, so a role granted or withdrawn takes
-  # that long to apply.
+  # that long to apply. Scheduled triggers already created keep firing: see
+  # claw/docs/platform-access.md before turning this on.
   requiredPlatformRoles: []
   port: 8200
   # Where a client outside the cluster reaches the API, as CLAW_PUBLIC_URL --

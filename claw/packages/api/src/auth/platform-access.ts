@@ -27,6 +27,12 @@
  * a credential SaFE verifies. That is the point of failing closed here: the
  * alternative is that a person who has no access yet could reach the same
  * services by presenting a different kind of credential.
+ *
+ * One exception, for the identity token only: a role the identity provider
+ * confirmed (CLAW_IDENTITY_TOKEN_TRUSTED_ROLES: named by the operator, claimed by
+ * the token and listed for the same subject by the provider's RFC 7662 answer,
+ * asked now) is a role somebody vouched for, and Claw already lets it confer admin
+ * rights, so it counts here too. The synthetic `default` never does.
  */
 import type { UserInfo } from "./models.js";
 
@@ -50,6 +56,15 @@ export const PLATFORM_ACCESS_MESSAGE = "no access yet - ask an administrator";
 const SAFE_VERIFIED_METHODS: ReadonlySet<string> = new Set(["cookie", "query_token", "api_key", "x_api_key"]);
 
 /**
+ * The credential method whose roles are Claw's synthetic `default` plus whatever the identity
+ * provider confirmed (`verifyIdentityAccessToken`). Only the confirmed part is judged.
+ */
+const IDENTITY_TOKEN_METHOD = "identity_token";
+
+/** Claw's own marker for an ordinary user, put on every caller it builds itself; no one vouched for it. */
+const SYNTHETIC_ROLE = "default";
+
+/**
  * The roles an operator requires, from a comma- or whitespace-separated list.
  * Names are compared exactly (SaFE's role names are case-sensitive); blanks and
  * repeats are dropped. Read from the environment on each use, so what a request
@@ -60,7 +75,10 @@ export function requiredPlatformRoles(env: Readonly<Record<string, string | unde
   return [...new Set(names)];
 }
 
-/** Why a caller was refused. `roles_unknown`: no credential SaFE verified. `role_missing`: SaFE named roles and none is required. */
+/**
+ * Why a caller was refused. `roles_unknown`: nobody vouched for any role (no credential SaFE verified, or an
+ * identity token whose roles the provider confirmed none of). `role_missing`: roles were vouched for and none is required.
+ */
 export type PlatformAccessRefusalReason = "roles_unknown" | "role_missing";
 
 /** The response to send, in the shape the middleware's other refusals take. */
@@ -91,6 +109,13 @@ export function platformAccessRefusal(
     message: PLATFORM_ACCESS_MESSAGE,
     reason,
   });
-  if (!SAFE_VERIFIED_METHODS.has(method)) return refuse("roles_unknown");
-  return user.roles.some((role) => required.includes(role)) ? null : refuse("role_missing");
+  if (SAFE_VERIFIED_METHODS.has(method)) {
+    return user.roles.some((role) => required.includes(role)) ? null : refuse("role_missing");
+  }
+  if (method === IDENTITY_TOKEN_METHOD) {
+    const confirmed = user.roles.filter((role) => role !== SYNTHETIC_ROLE);
+    if (confirmed.length === 0) return refuse("roles_unknown");
+    return confirmed.some((role) => required.includes(role)) ? null : refuse("role_missing");
+  }
+  return refuse("roles_unknown");
 }

@@ -8,7 +8,9 @@
  *   PA2  empty means no requirement: every caller, every method, every roles list passes
  *   PA3  with a requirement, only a SaFE-verified credential whose roles include one of
  *        the names passes; a credential SaFE did not verify has unknown roles and
- *        never does, whatever roles the caller was built with
+ *        never does, whatever roles the caller was built with. The one exception is an
+ *        identity token, whose roles the provider confirmed count and whose synthetic
+ *        `default` does not
  *   PA4  the refusal is the one a client can show, and does not name a role
  *   PA5  SaFE's `roles` field is read as an array of strings and nothing else
  */
@@ -66,10 +68,11 @@ test("PA1: the process environment is read on each use", () => {
 });
 
 const SAFE_METHODS = ["cookie", "query_token", "api_key", "x_api_key"];
-const OTHER_METHODS = ["identity_token", "connector_token", "byok", "", "something_new"];
+const OTHER_METHODS = ["connector_token", "byok", "", "something_new"];
+const IDENTITY_METHOD = "identity_token";
 
 test("PA2: with no requirement nobody is refused, whatever the method or roles", () => {
-  for (const method of [...SAFE_METHODS, ...OTHER_METHODS]) {
+  for (const method of [...SAFE_METHODS, IDENTITY_METHOD, ...OTHER_METHODS]) {
     for (const roles of [[], ["default"], ["pending"], ["system-admin"], ["x", "y"]]) {
       assert.equal(platformAccessRefusal(userWith(roles), method, []), null, `${method} ${JSON.stringify(roles)}`);
     }
@@ -78,7 +81,7 @@ test("PA2: with no requirement nobody is refused, whatever the method or roles",
 
 type Row = { required: string[]; roles: string[]; method: string; want: PlatformAccessRefusalReason | null };
 
-test("PA3: a requirement is met by a role SaFE reported, and only by that", () => {
+test("PA3: a requirement is met by a role SaFE reported (or the identity provider confirmed), and only by that", () => {
   const rows: Row[] = [];
   for (const method of SAFE_METHODS) {
     rows.push(
@@ -101,11 +104,23 @@ test("PA3: a requirement is met by a role SaFE reported, and only by that", () =
     rows.push(
       // The `default` these paths give their caller is Claw's marker, not SaFE's word.
       { required: ["default"], roles: ["default"], method, want: "roles_unknown" },
-      // Not even a role the provider confirmed (identity-token.ts adopts system-admin) is SaFE's report.
+      // These paths confirm nothing, so a role they carry is not anyone's word either.
       { required: ["system-admin"], roles: ["default", "system-admin"], method, want: "roles_unknown" },
       { required: ["default", "system-admin"], roles: ["default", "system-admin"], method, want: "roles_unknown" },
     );
   }
+  // The identity token is the exception: identity-token.ts adds to the synthetic `default` only the roles the
+  // provider confirmed (system-admin, system-admin-readonly), so those count and `default` does not.
+  rows.push(
+    { required: ["default"], roles: ["default"], method: IDENTITY_METHOD, want: "roles_unknown" },
+    { required: ["system-admin"], roles: ["default"], method: IDENTITY_METHOD, want: "roles_unknown" },
+    { required: ["system-admin"], roles: ["default", "system-admin"], method: IDENTITY_METHOD, want: null },
+    { required: ["default", "system-admin"], roles: ["default", "system-admin"], method: IDENTITY_METHOD, want: null },
+    { required: ["system-admin-readonly", "system-admin"], roles: ["default", "system-admin-readonly"], method: IDENTITY_METHOD, want: null },
+    // A confirmed role that is not the required one is a role vouched for and not the right one; `default` is not made real by it.
+    { required: ["default"], roles: ["default", "system-admin"], method: IDENTITY_METHOD, want: "role_missing" },
+    { required: ["system-admin"], roles: ["default", "system-admin-readonly"], method: IDENTITY_METHOD, want: "role_missing" },
+  );
   for (const r of rows) {
     const got = platformAccessRefusal(userWith(r.roles), r.method, r.required);
     assert.equal(got === null ? null : got.reason, r.want, JSON.stringify(r));

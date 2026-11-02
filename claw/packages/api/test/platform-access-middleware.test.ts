@@ -15,8 +15,12 @@
  *        credential are still 401; probes, discovery and internal routes are not judged
  *   PM5  under /anthropic/ the refusal has Anthropic's error shape
  *   PM6  a token the identity provider issued (identity token, connector token)
- *        brings no SaFE roles, so with the setting on it is refused too
+ *        brings no SaFE roles, so with the setting on it is refused too, except
+ *        that a role the provider confirmed (CLAW_IDENTITY_TOKEN_TRUSTED_ROLES) on an
+ *        identity token counts
  *   PM7  the setting is read on each request
+ *   PM8  the A2A JSON-RPC routes are behind it too, including for the identity token
+ *        Brain's `a2a_call` presents to a peer Claw (an `audience` peer entry)
  */
 import test, { after, before, beforeEach, describe } from "node:test";
 import assert from "node:assert/strict";
@@ -24,7 +28,7 @@ import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import Fastify, { type FastifyInstance } from "fastify";
 
-import { FakeIdentity, signJwt, testKey } from "../../utils/test/identity-fake.js";
+import { FakeIdentity, activeAnswer, signJwt, testKey } from "../../utils/test/identity-fake.js";
 import { sendJson, startFakeUpstream, type FakeUpstream } from "./support/fake-upstream.js";
 
 const nowSec = () => Math.floor(Date.now() / 1000);
@@ -111,6 +115,8 @@ describe("the platform-role requirement through the authentication hook", () => 
     app.get(DOWNLOAD, serve("download"));
     app.get("/anthropic/v1/whoami", serve("anthropic"));
     app.post("/v1/remote-agents/connectors", serve("connector"));
+    app.post("/a2a", serve("a2a"));
+    app.post("/a2a/plugins/:pluginId", serve("a2a-plugin"));
     app.get("/health", async () => ({ status: "ok" }));
     app.get("/.well-known/agent-card.json", async () => ({ name: "card" }));
     app.get("/v1/internal/ping", async () => ({ ok: true }));
@@ -244,6 +250,35 @@ describe("the platform-role requirement through the authentication hook", () => 
     assert.equal(safe.seen.filter((s) => s.url.startsWith("/api/v1/auth/verify")).length, 1);
   });
 
+  test("PM8: the A2A JSON-RPC routes are judged like the rest, for a SaFE credential and for the identity token an `audience` peer call carries", async () => {
+    const rpc = ["/a2a", "/a2a/plugins/7"];
+    // What Brain's a2a_call sends a peer Claw that has an `audience` entry: the session owner's identity token.
+    identity(true);
+    process.env.CLAW_IDENTITY_TOKEN_AUTH_ENABLED = "true";
+    const asPeerCaller = () => ({ authorization: `Bearer ${mint("openid claw.api", "peer-caller")}` });
+
+    for (const path of rpc) {
+      reached = [];
+      const served = await call("POST", path, asPeerCaller());
+      assert.equal(served.status, 200, `${path} with the setting empty: ${JSON.stringify(served.body)}`);
+      assert.equal(reached.length, 1, path);
+    }
+
+    process.env[ENV] = "default";
+    for (const path of rpc) {
+      reached = [];
+      const refused = await call("POST", path, asPeerCaller());
+      assert.equal(refused.status, 403, path);
+      assert.deepEqual(refused.body, { ok: false, error: "platform_access_required", message: "no access yet - ask an administrator" }, path);
+      assert.deepEqual(reached, [], `${path}: a refused caller reached the route`);
+      // A caller SaFE vouches for is served on the same routes.
+      const verified = await call("POST", path, { authorization: "Bearer ak-alice" });
+      assert.equal(verified.status, 200, `${path} as a SaFE-verified caller: ${JSON.stringify(verified.body)}`);
+      assert.equal((await call("POST", path, { authorization: "Bearer ak-reader" })).status, 403, `${path} as a SaFE-verified caller with no required role`);
+    }
+    assert.equal(getCachedUserLlmKey("peer-caller"), undefined);
+  });
+
   describe("PM6: a token the identity provider issued carries no SaFE roles", () => {
     const identityToken = () => ({ authorization: `Bearer ${mint("openid claw.api", "web-user")}` });
     const connectorToken = () => ({ authorization: `Bearer ${mint("claw.connector", "conn-user")}` });
@@ -262,7 +297,7 @@ describe("the platform-role requirement through the authentication hook", () => 
       assert.equal(refused.body.error, "platform_access_required");
       assert.deepEqual(reached, []);
       assert.equal(getCachedUserLlmKey("web-user"), undefined);
-      // A role the provider confirmed is not SaFE's report either.
+      // A role the token merely claims (here system-admin, which the operator has not let it confer) is nobody's word.
       process.env[ENV] = "system-admin";
       assert.equal((await call("GET", "/v1/whoami", identityToken())).status, 403);
       // SaFE was never asked: the token is not one of its credentials.
@@ -279,6 +314,70 @@ describe("the platform-role requirement through the authentication hook", () => 
       assert.equal(refused.status, 403);
       assert.equal(refused.body.error, "platform_access_required");
       assert.deepEqual(reached, []);
+    });
+
+    describe("a role the identity provider confirmed counts, the synthetic `default` does not", () => {
+      const TRUSTED = "CLAW_IDENTITY_TOKEN_TRUSTED_ROLES";
+      /** What the provider answers when asked about the token: active, this subject, these roles. */
+      const providerSays = (sub: string, roles: string[]) => { fake.introspect = () => ({ body: activeAnswer({ sub, roles }) }); };
+      const adminToken = (sub: string) => ({ authorization: `Bearer ${mint("openid claw.api", sub)}` });
+      beforeEach(() => {
+        identity(true);
+        process.env.CLAW_IDENTITY_TOKEN_AUTH_ENABLED = "true";
+        process.env[TRUSTED] = "system-admin";
+        // No answer is remembered from one test to the next.
+        process.env.IDENTITY_INTROSPECTION_CACHE_SECONDS = "0";
+        process.env.IDENTITY_INTROSPECTION_NEGATIVE_CACHE_SECONDS = "0";
+        process.env.IDENTITY_STALE_IF_ERROR_SECONDS = "0";
+        startIdentityClient(log);
+      });
+      after(() => {
+        fake.introspect = () => ({ body: { active: false } });
+        for (const k of [TRUSTED, "IDENTITY_INTROSPECTION_CACHE_SECONDS", "IDENTITY_INTROSPECTION_NEGATIVE_CACHE_SECONDS", "IDENTITY_STALE_IF_ERROR_SECONDS"]) delete process.env[k];
+      });
+
+      test("an administrator the provider confirmed is served when system-admin is what is required, and still refused when only `default` is", async () => {
+        providerSays("confirmed-admin", ["default", "system-admin"]);
+        const served = await call("GET", "/v1/whoami", adminToken("confirmed-admin"));
+        assert.equal(served.status, 200, JSON.stringify(served.body));
+        assert.deepEqual(served.body.user.roles, ["default", "system-admin"]);
+
+        for (const required of ["system-admin", "default,system-admin"]) {
+          process.env[ENV] = required;
+          const r = await call("GET", "/v1/whoami", adminToken("confirmed-admin"));
+          assert.equal(r.status, 200, `${required}: ${JSON.stringify(r.body)}`);
+        }
+        // `default` is Claw's marker, not something anyone confirmed: the admin role does not make it real.
+        process.env[ENV] = "default";
+        reached = [];
+        const refused = await call("GET", "/v1/whoami", adminToken("confirmed-admin"));
+        assert.equal(refused.status, 403);
+        assert.equal(refused.body.error, "platform_access_required");
+        assert.deepEqual(reached, []);
+        assert.equal(getCachedUserLlmKey("confirmed-admin"), undefined);
+      });
+
+      test("a role the token claims but the provider does not list, or cannot be asked about, confirms nothing", async () => {
+        process.env[ENV] = "system-admin";
+        // The provider's answer for this subject lists no role.
+        providerSays("claimed-admin", ["default"]);
+        assert.equal((await call("GET", "/v1/whoami", adminToken("claimed-admin"))).status, 403);
+        // The provider answers for another subject: the token is refused outright (401), and the roles are not lent.
+        providerSays("someone-else", ["default", "system-admin"]);
+        assert.equal((await call("GET", "/v1/whoami", adminToken("claimed-admin"))).status, 401);
+        // The provider cannot be asked: the caller is a plain user, never the claim, and (as with no requirement) not a 503.
+        fake.introspect = () => ({ status: 503, body: "down" });
+        assert.equal((await call("GET", "/v1/whoami", adminToken("claimed-admin"))).status, 403);
+        delete process.env[ENV];
+        assert.equal((await call("GET", "/v1/whoami", adminToken("claimed-admin"))).status, 200);
+      });
+
+      test("the operator must have named the role: confirmed by the provider but not in CLAW_IDENTITY_TOKEN_TRUSTED_ROLES is not adopted", async () => {
+        delete process.env[TRUSTED];
+        providerSays("unnamed-admin", ["default", "system-admin"]);
+        process.env[ENV] = "system-admin";
+        assert.equal((await call("GET", "/v1/whoami", adminToken("unnamed-admin"))).status, 403);
+      });
     });
 
     test("the same user's SaFE-verified credential still passes, so the way in is a credential SaFE vouches for", async () => {

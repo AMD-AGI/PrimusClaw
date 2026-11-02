@@ -61,16 +61,36 @@ refused**: their roles are unknown, and unknown never satisfies a requirement. I
 is on, a field missing from the platform's answer, `null`, or anything that is not a list
 of strings is treated the same way: no roles, refused.
 
+One exception, for the identity token only. A role the identity provider confirmed through
+`CLAW_IDENTITY_TOKEN_TRUSTED_ROLES` (`system-admin` and/or `system-admin-readonly`: the
+operator named it, the token claims it, and the provider's RFC 7662 answer, asked on that
+request, is active, names the same subject and lists it) is a role someone vouched for, and
+Claw already lets it confer admin rights, so it counts here as well. Only that: the `default`
+every identity-token caller carries never does, and a role that is merely claimed, or that
+the provider could not be asked about, counts for nothing. So with
+`CLAW_IDENTITY_TOKEN_TRUSTED_ROLES=system-admin` and `api.requiredPlatformRoles: [system-admin]`
+an administrator signing in through the provider is served, and with `[default]` they are not.
+Connector tokens and BYOK keys have no such confirmation and stay refused.
+
 Before turning the setting on in a deployment that uses those credentials, check that the
 people and services using them also have a credential the platform verifies, or accept that
 they stop being served.
+
+This includes Brain's `a2a_call` to a peer Claw whose `A2A_AGENTS` entry sets `audience`: it
+calls the peer with the session owner's identity token, so a peer that has the setting on
+refuses it with the 403 above (the A2A routes are behind the same hook), unless the token
+confers a required role as described above, which an ordinary user's does not. A peer entry with
+`auth_env` holding an `ak-` key of an account that has a required role is a credential the
+platform verifies; the peer then sees that account, not the user.
 
 ## What it does not cover
 
 - The platform's answer is cached for five minutes per credential, so a role granted or
   withdrawn takes up to that long to apply. The setting itself applies on the next request.
-- Work that was already accepted is not re-judged: a scheduled trigger fires with the key
-  saved when it was created, and a run in flight finishes. The check is on requests.
+- Work that was already accepted is not re-judged: a run in flight finishes, and **a scheduled
+  trigger keeps firing** with the key saved when it was created, on every tick, for a user who
+  later loses access or who created it before the setting was turned on. The check is on
+  requests, and a trigger's fire is not one. See Rollout for what to do about it.
 - It decides who is served; it does not change what the platform lets a user do there.
 
 ## Rollout
@@ -82,4 +102,10 @@ they stop being served.
    `role_missing`: the platform verified the credential and its answer holds none of the
    named roles, including an answer with no usable `roles` field; `roles_unknown`: the credential
    was not one the platform verifies). Every user you expect to be served should be absent from it.
-3. To turn it off, empty the setting: the next request is judged as before.
+3. Before turning it on, and whenever you withdraw a role, deal with the scheduled triggers of
+   the users who are about to lose access (`claw_triggers`, one row per trigger, `owner_user_id`):
+   a refused user can no longer reach `POST /v1/triggers/:id/pause` or `DELETE /v1/triggers/:id`, and the
+   scheduler does not ask who may use Claw, so their triggers go on spending the platform's LLM key
+   until someone stops them. Have the owners pause or delete them first, or set `enabled = false` on
+   those rows.
+4. To turn it off, empty the setting: the next request is judged as before.
