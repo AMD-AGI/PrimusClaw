@@ -73,7 +73,8 @@ Quotas apply per person, across all templates. The built-in defaults are below; 
 - The create timeout and every extension stay within the max lifetime.
 - An expired sandbox is reclaimed. Kill releases the quota at once.
 - A user lists and operates only their own sandboxes. Another user's sandbox returns `404`.
-- A `system-admin` lists and operates every sandbox, including Claw grant sandboxes. List results carry `agent-sandbox.io/owner-user-id`, and the list can filter on it. An extension stays within both the caller's max lifetime and that of the sandbox's owner.
+- A `system-admin` operates every sandbox, including Claw grant sandboxes. An extension stays within both the caller's max lifetime and that of the sandbox's owner.
+- A `system-admin` list returns their own sandboxes. The metadata filter `agent-sandbox.io/scope=all` lists every sandbox; those results carry `agent-sandbox.io/owner-user-id`, and the list can filter on it. Other callers ignore that filter.
 
 ## Example
 

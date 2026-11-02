@@ -471,6 +471,8 @@ func (s *Service) Get(ctx context.Context, apiKey, sandboxID string) (SandboxRes
 
 // List returns running sandboxes for this key's role.
 // state is empty, running, or paused. Ended sandboxes are not listed.
+// A system-admin identity key lists every sandbox only with metadata scope=all;
+// other keys ignore that filter.
 func (s *Service) List(ctx context.Context, apiKey, metadataQuery, state, nextToken string, limit int) (ListResponse, error) {
 	who, err := s.lookup(ctx, apiKey, false)
 	if err != nil {
@@ -481,6 +483,8 @@ func (s *Service) List(ctx context.Context, apiKey, metadataQuery, state, nextTo
 	if err != nil {
 		return ListResponse{}, err
 	}
+	all := who.owner && who.admin && want[scopeMetadata] == scopeAll
+	delete(want, scopeMetadata)
 	offset, err := decodeOffset(nextToken)
 	if err != nil {
 		return ListResponse{}, err
@@ -492,7 +496,7 @@ func (s *Service) List(ctx context.Context, apiKey, metadataQuery, state, nextTo
 		return ListResponse{}, grant.Op(http.StatusBadRequest, "invalid_sandbox", "state must be running or paused")
 	}
 	var refs []grant.OwnedSandbox
-	if who.owner && who.admin {
+	if all {
 		refs, err = s.grants.ListAllSandboxes(ctx)
 	} else if grantID != "" {
 		var own []runtimev1alpha1.GrantSandboxRef
@@ -510,7 +514,7 @@ func (s *Service) List(ctx context.Context, apiKey, metadataQuery, state, nextTo
 			continue
 		}
 		md := sb.Ref.Metadata
-		if who.owner && who.admin {
+		if all {
 			md = withOwner(md, sb.UserID)
 		}
 		if !metadataMatch(md, want) {
@@ -524,7 +528,7 @@ func (s *Service) List(ctx context.Context, apiKey, metadataQuery, state, nextTo
 	out := ListResponse{Sandboxes: make([]SandboxResponse, 0, len(page))}
 	for _, sb := range page {
 		resp := s.detail(ctx, sb.GrantID, sb.Ref)
-		if who.owner && who.admin {
+		if all {
 			resp.Metadata = withOwner(resp.Metadata, sb.UserID)
 		}
 		out.Sandboxes = append(out.Sandboxes, resp)

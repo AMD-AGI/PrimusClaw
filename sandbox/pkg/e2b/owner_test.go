@@ -291,7 +291,10 @@ func TestSystemAdminReachesEverySandbox(t *testing.T) {
 		t.Fatalf("other user list = %+v %v", got, err)
 	}
 
-	list, err := plane.List(ctx, "ak-admin", "", "", "", 0)
+	if got, err := plane.List(ctx, "ak-admin", "", "", "", 0); err != nil || len(got.Sandboxes) != 0 {
+		t.Fatalf("admin default list = %+v %v", got, err)
+	}
+	list, err := plane.List(ctx, "ak-admin", url.Values{scopeMetadata: {scopeAll}}.Encode(), "", "", 0)
 	if err != nil || len(list.Sandboxes) != 2 {
 		t.Fatalf("admin list = %+v %v", list, err)
 	}
@@ -601,7 +604,7 @@ func TestAdminListFiltersByOwner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	list, err := plane.List(ctx, "ak-admin", url.Values{ownerUserMetadata: {"u-1"}}.Encode(), "", "", 0)
+	list, err := plane.List(ctx, "ak-admin", url.Values{ownerUserMetadata: {"u-1"}, scopeMetadata: {scopeAll}}.Encode(), "", "", 0)
 	if err != nil || len(list.Sandboxes) != 1 || list.Sandboxes[0].SandboxID != alice.SandboxID {
 		t.Fatalf("filtered list = %+v %v", list, err)
 	}
