@@ -10,7 +10,7 @@
 # ──────────────────────────────────────────────────────────────────────
 
 # ========== Stage 1: build ==========
-FROM node:26-bookworm-slim@sha256:1884ec272c7c06aba7696262fb822dc602f8fa5eb978d03617d6bfe487d7ebac AS builder
+FROM node:26-bookworm-slim@sha256:bc0a2afd3b74ce12222fc8bab99271e66257f021078f5f4a5d687a77d280c1d9 AS builder
 WORKDIR /app
 
 # ============ Extra CA anchors (opt-in) ============
@@ -166,7 +166,7 @@ RUN bun build packages/hands/src/index.ts \
 
 # ========== Stage 2: runtime ==========
 # node:26-slim (Debian/glibc) — Node.js runs API and Brain processes.
-FROM node:26-bookworm-slim@sha256:1884ec272c7c06aba7696262fb822dc602f8fa5eb978d03617d6bfe487d7ebac AS runtime
+FROM node:26-bookworm-slim@sha256:bc0a2afd3b74ce12222fc8bab99271e66257f021078f5f4a5d687a77d280c1d9 AS runtime
 WORKDIR /app
 ENV NODE_ENV=production \
     WORKSPACE_PATH=/workspace
