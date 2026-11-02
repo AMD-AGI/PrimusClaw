@@ -1853,7 +1853,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       isCancelled: () => isClientGone(req),
       // A turn in a session that acts as a user is the person's say, like creating it: the key a sandbox holds is the owner's own and
       // reaches this route, so it must not be able to put work in front of a model that holds the person's GitHub account.
-      refuse: (client) => actingTurnRefusalFor(req, sessionId, client),
+      refuse: (tx) => actingTurnRefusalFor(req, sessionId, tx),
     });
     switch (submitted.kind) {
       case "session_not_found":
@@ -1861,7 +1861,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       case "not_owner":
         return reply.status(403).send({ ok: false, error: "only the session creator can send messages" });
       case "refused":
-        return reply.status(403).send({ ok: false, error: submitted.error });
+        return reply.status(403).send({ ok: false, error: submitted.reason });
       case "queued":
         // No `run_id`: what this call accepted is a queued message, and the run
         // row is opened later by the drain -- see docs/run-api.md.
