@@ -192,8 +192,13 @@ export type TokenKeyVerifier = Partial<Pick<SafeClient, "verifyAccessToken" | "v
 // One cache of keys per SaFE client, which is one per process; a test that builds a new client starts with none.
 const keyCaches = new WeakMap<object, DelegatedKeys>();
 
-/** What a request has for keys: SaFE's answer, or the refusal of the request that asked for keys it may not have. */
-type CallerKeys = SaFeKeys | { status: "refused"; reason: string; outcome: CredentialOutcome };
+/** The request asked for the person's own key to be used and may not have it: the whole request is refused, never served without it. */
+class OwnKeyRefused extends Error {
+  constructor(readonly reason: string, readonly outcome: CredentialOutcome) {
+    super(reason);
+    this.name = "OwnKeyRefused";
+  }
+}
 
 /**
  * The `x-api-key` this request brought, if it may bring one: its token is delegated and was issued to a service the operator named.
@@ -211,22 +216,22 @@ function ownKeyPresented(req: FastifyRequest, claims: Record<string, unknown>, c
  * The keys of a person whose own `ak-` key a service brought along with its delegated token. The key is SaFE's to judge, as for any
  * `ak-` key, and it counts only when SaFE says it is the token's subject's: the same rule as for the keys got by delegation.
  */
-async function ownKeysOf(verifier: TokenKeyVerifier, key: string, sub: string): Promise<CallerKeys> {
+async function ownKeysOf(verifier: TokenKeyVerifier, key: string, sub: string): Promise<SaFeKeys> {
   const verifyApiKey = verifier?.verifyApiKey?.bind(verifier);
   if (!verifyApiKey) {
     return { status: "misconfigured", message: "CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS needs SaFE to verify the key, and this deployment has none" };
   }
-  const turnedAway = (reason: string, legacyError: string, message: string): CallerKeys => ({ status: "refused", reason, outcome: refuse(401, legacyError, message) });
-  if (!isApiKey(key)) return turnedAway("not_an_api_key", "invalid_api_key", "x-api-key must be the user's own API key (ak-...)");
+  if (!isApiKey(key)) throw new OwnKeyRefused("not_an_api_key", refuse(401, "invalid_api_key", "x-api-key must be the user's own API key (ak-...)"));
   let user: UserInfo;
   try {
     user = await verifyApiKey(key);
   } catch (err) {
     const failure = safeFailureOf(err);
-    return failure.status === "none" ? turnedAway(failure.reason, "invalid_api_key", "SaFE does not accept the x-api-key") : failure;
+    if (failure.status !== "none") return failure;
+    throw new OwnKeyRefused(failure.reason, refuse(401, "invalid_api_key", "SaFE does not accept the x-api-key"));
   }
-  if (user.userId !== sub) return turnedAway("key_of_another_user", "key_subject_mismatch", "the x-api-key is not the access token's user's own key");
-  if (!user.platformKey && !user.virtualKey) return turnedAway("key_without_keys", "invalid_api_key", "SaFE holds no keys for the x-api-key");
+  if (user.userId !== sub) throw new OwnKeyRefused("key_of_another_user", refuse(401, "key_subject_mismatch", "the x-api-key is not the access token's user's own key"));
+  if (!user.platformKey && !user.virtualKey) throw new OwnKeyRefused("key_without_keys", refuse(401, "invalid_api_key", "SaFE holds no keys for the x-api-key"));
   return { status: "keys", platformKey: user.platformKey, virtualKey: user.virtualKey };
 }
 
@@ -245,12 +250,12 @@ async function ownKeysOf(verifier: TokenKeyVerifier, key: string, sub: string): 
  * else (the provider refusing the exchange, SaFE's 401 or 403, an id that is not the subject) is `none`, with the reason for the log.
  *
  * A delegated token has no keys of its own, but a service the operator named may bring the person's own key
- * (`ownKeysOf`): what that asks of SaFE is a refusal of the request, never `none`.
+ * (`ownKeysOf`): what that asks of SaFE is a refusal of the request (`OwnKeyRefused`), never `none`.
  */
 async function safeKeysOf(
   verifier: TokenKeyVerifier, identity: NonNullable<ReturnType<typeof identityClient>>, token: string, sub: string,
   claims: Record<string, unknown>, ownKey: string | undefined, settings: IdentityTokenSettings,
-): Promise<CallerKeys> {
+): Promise<SaFeKeys> {
   if (ownKey !== undefined) return ownKeysOf(verifier, ownKey, sub);
   const verifyAccessToken = verifier?.verifyAccessToken?.bind(verifier);
   if (!verifier || !verifyAccessToken) return { status: "none", reason: "no_safe" };
@@ -328,7 +333,6 @@ export async function verifyIdentityAccessToken(
     const clientId = typeof claims.client_id === "string" && claims.client_id.trim() !== "" ? claims.client_id : "";
     const ownKey = ownKeyPresented(req, claims, clientId, settings);
     const keys = await safeKeysOf(verifier, identity, token, sub, claims, ownKey, settings);
-    if (keys.status === "refused") return reject(keys.reason, keys.outcome);
     if (keys.status === "unavailable") {
       logger.warn({ path: pathname, source: keys.source }, "auth.identity_token.keys_unavailable");
       return {
@@ -381,6 +385,7 @@ export async function verifyIdentityAccessToken(
     };
     return { status: "verified", user, method: IDENTITY_TOKEN_METHOD };
   } catch (err) {
+    if (err instanceof OwnKeyRefused) return reject(err.reason, err.outcome);
     if (err instanceof JwtVerificationError) {
       return reject(err.reason, refuse(401, "invalid_token", `the access token was refused (${err.reason})`));
     }
