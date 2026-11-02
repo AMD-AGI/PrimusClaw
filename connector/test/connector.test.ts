@@ -717,17 +717,27 @@ describe("crash safety", () => {
 });
 
 describe("a connector that runs for days", () => {
+  /** How long to wait for a count to be reached; far above what an idle machine needs, so only a loop that has stopped runs into it. */
+  const COUNT_WAIT_MS = 30_000;
   test("waiting on the run-long signal leaves nothing behind: listeners do not grow with heartbeats and events", async () => {
     const h = await make({ timing: { heartbeatMs: 15 } });
     const sid = await h.newSession();
     const signal = (h.connector as unknown as { ctl: AbortController }).ctl.signal;
     const count = () => getEventListeners(signal, "abort").length;
-    await sleep(300);
+    // Everything below waits on a count of what happened, never on elapsed time: a loaded runner stretches the
+    // wait, it cannot shrink the number of heartbeats and drain waits the assertions need to have seen.
+    assert.ok(await h.connector.drained(), "the start-up events were acknowledged");
+    await h.claw.until("a few heartbeats while idle", () => h.claw.heartbeats.length >= 3, COUNT_WAIT_MS);
     const before = count();
     const beats = h.claw.heartbeats.length;
+    const posts = () => h.claw.requests.filter((r) => r.path.endsWith("/events")).length;
+    const postsBefore = posts();
     for (let i = 0; i < 6; i++) { h.prompt(sid, "say x"); await h.turnEnd(sid, i + 1); }
-    await sleep(500);
-    assert.ok(h.claw.heartbeats.length - beats >= 20, "many heartbeats and drain waits happened");
+    // Each turn's end is its own post (the next prompt is only sent after it arrived), and the sender goes back to
+    // waiting for the next event after each one: that is six drain waits on the run-long signal, at least.
+    assert.ok(posts() - postsBefore >= 6, `drain waits happened: ${posts() - postsBefore} posts`);
+    // The heartbeats must keep coming while those waits are pending, and long enough to show a leak per wait.
+    await h.claw.until("20 more heartbeats", () => h.claw.heartbeats.length - beats >= 20, COUNT_WAIT_MS);
     assert.ok(count() <= before + 2, `abort listeners grew from ${before} to ${count()}`);
   });
 });
