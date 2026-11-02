@@ -5,15 +5,16 @@
  * The two tables behind GitHub pull request review, created only while
  * `CLAW_GITHUB_REVIEW_ENABLED` is on:
  *
- *  - `claw_github_confirmations`: a merge held for the acting user. One row per
- *    (session, repository, pull request, head commit) while pending, single use,
+ *  - `claw_github_confirmations`: a write held for the acting user, a merge or a review (with its
+ *    event, text and inline comments, so that what is posted is what they were shown). One row per
+ *    (session, repository, pull request, head commit, write) while pending, single use,
  *    bound to the head commit it was asked about.
  *  - `claw_github_audit`: one row per tool call, written before the call does
  *    anything and finished after. Neither table holds a credential: not the GitHub
  *    token and not the session token. The audit table has no foreign key on
  *    purpose: it outlives the sessions it describes.
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type pg from "pg";
 
 /** Anything that can run a statement: the pool, a client, or a test's database. */
@@ -35,7 +36,7 @@ export const GITHUB_REVIEW_SCHEMA_SQL = [
       reasons           JSONB NOT NULL DEFAULT '[]'::jsonb,
       checks            JSONB NOT NULL DEFAULT '{}'::jsonb,
       status            TEXT NOT NULL DEFAULT 'pending'
-                        CHECK (status IN ('pending', 'merging', 'merged', 'denied', 'stale', 'expired', 'refused')),
+                        CHECK (status IN ('pending', 'merging', 'merged', 'submitted', 'denied', 'stale', 'expired', 'refused')),
       created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       expires_at        TIMESTAMPTZ NOT NULL,
       decided_at        TIMESTAMPTZ,
@@ -45,9 +46,24 @@ export const GITHUB_REVIEW_SCHEMA_SQL = [
     )`,
   // Who stood behind the decision when it was not the person themselves: the service client and its actor (RFC 8693 `act`).
   `ALTER TABLE claw_github_confirmations ADD COLUMN IF NOT EXISTS decided_via JSONB`,
-  // One pending row per head commit, so asking twice shows the person one card.
-  `CREATE UNIQUE INDEX IF NOT EXISTS uq_github_confirmations_pending
-      ON claw_github_confirmations(session_id, repo, pr, head_sha) WHERE status = 'pending'`,
+  // What is held: a merge (approve if needed, then merge), or a review whose event, text and inline comments are kept as they were shown.
+  `ALTER TABLE claw_github_confirmations ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'merge'`,
+  `ALTER TABLE claw_github_confirmations ADD COLUMN IF NOT EXISTS review JSONB`,
+  // Tells one held review from another on the same head commit; empty for a merge.
+  `ALTER TABLE claw_github_confirmations ADD COLUMN IF NOT EXISTS action_key TEXT NOT NULL DEFAULT ''`,
+  // 'submitted' is the end of a held review that was posted. A table made by an earlier release has a check without it, which is replaced.
+  `DO $$ BEGIN
+     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'claw_github_confirmations_status_check' AND pg_get_constraintdef(oid) LIKE '%submitted%') THEN
+       ALTER TABLE claw_github_confirmations DROP CONSTRAINT IF EXISTS claw_github_confirmations_status_check;
+       ALTER TABLE claw_github_confirmations ADD CONSTRAINT claw_github_confirmations_status_check
+         CHECK (status IN ('pending', 'merging', 'merged', 'submitted', 'denied', 'stale', 'expired', 'refused'));
+     END IF;
+   END $$`,
+  // One pending row per head commit and write, so asking twice shows the person one card. The index an earlier release made, on the commit alone,
+  // would let a held review stand in for a merge.
+  `DROP INDEX IF EXISTS uq_github_confirmations_pending`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_github_confirmations_pending_write
+      ON claw_github_confirmations(session_id, repo, pr, head_sha, kind, action_key) WHERE status = 'pending'`,
   `CREATE INDEX IF NOT EXISTS idx_github_confirmations_session ON claw_github_confirmations(session_id, status)`,
   `CREATE INDEX IF NOT EXISTS idx_github_confirmations_actor ON claw_github_confirmations(actor_user_id, status)`,
   `CREATE TABLE IF NOT EXISTS claw_github_audit (
@@ -180,7 +196,25 @@ export async function recentWrites(
 
 // ---------------------------------------------------------- confirmations
 
-export type ConfirmationStatus = "pending" | "merging" | "merged" | "denied" | "stale" | "expired" | "refused";
+export type ConfirmationStatus = "pending" | "merging" | "merged" | "submitted" | "denied" | "stale" | "expired" | "refused";
+
+export type ReviewEvent = "COMMENT" | "REQUEST_CHANGES" | "APPROVE";
+export interface ReviewComment { path: string; line: number; side: "RIGHT" | "LEFT"; body: string }
+/** A review held for the acting user, as it will be posted (its footer is added when it is). */
+export interface HeldReview { event: ReviewEvent; body: string; comments: ReviewComment[] }
+/** What a confirmation holds: a merge (approve if needed, then merge), or a review. */
+export type ConfirmationKind = "merge" | "review";
+
+/** A digest of what a review says, its text and inline comments: the marker a posted review carries, and part of the key of a held one. */
+export function reviewDigest(text: string, comments: ReviewComment[]): string {
+  return createHash("sha256").update(JSON.stringify([text, comments.map((c) => [c.path, c.line, c.side, c.body])])).digest("hex").slice(0, 12);
+}
+
+function readHeldReview(value: unknown): HeldReview | null {
+  const v = value !== null && typeof value === "object" ? value as Record<string, unknown> : null;
+  if (!v || !["COMMENT", "REQUEST_CHANGES", "APPROVE"].includes(String(v.event)) || typeof v.body !== "string" || !Array.isArray(v.comments)) return null;
+  return { event: v.event as ReviewEvent, body: v.body, comments: v.comments as ReviewComment[] };
+}
 
 export interface Confirmation {
   id: string;
@@ -194,6 +228,9 @@ export interface Confirmation {
   author: string;
   reasons: string[];
   checks: Record<string, unknown>;
+  kind: ConfirmationKind;
+  /** What a `review` confirmation holds; null for a merge, and for a row that says it holds a review and does not (the decision refuses it). */
+  review: HeldReview | null;
   status: ConfirmationStatus;
   createdAt: string;
   expiresAt: string;
@@ -217,6 +254,8 @@ function toConfirmation(row: Record<string, unknown>): Confirmation {
     author: String(row.author ?? ""),
     reasons: Array.isArray(row.reasons) ? (row.reasons as string[]) : [],
     checks: (row.checks && typeof row.checks === "object" ? row.checks : {}) as Record<string, unknown>,
+    kind: row.kind === "review" ? "review" : "merge",
+    review: readHeldReview(row.review),
     status: row.status as ConfirmationStatus,
     createdAt: iso(row.created_at),
     expiresAt: iso(row.expires_at),
@@ -234,42 +273,36 @@ export interface NewConfirmation {
   headSha: string;
   title: string;
   author: string;
+  kind: ConfirmationKind;
+  review: HeldReview | null;
   reasons: string[];
   checks: Record<string, unknown>;
   ttlSeconds: number;
 }
 
-/** The pending confirmation for this head commit, made if there is none. */
+/** The pending confirmation for this head commit and this write, made if there is none. */
 export async function openConfirmation(db: Queryable, c: NewConfirmation): Promise<Confirmation> {
-  const existing = await db.query(
-    `SELECT * FROM claw_github_confirmations
-      WHERE session_id = $1 AND repo = $2 AND pr = $3 AND head_sha = $4 AND status = 'pending' AND expires_at > NOW()`,
-    [c.sessionId, c.repo, c.pr, c.headSha],
-  );
+  const actionKey = c.review ? `${c.review.event}:${reviewDigest(c.review.body, c.review.comments)}` : "";
+  const same = `session_id = $1 AND repo = $2 AND pr = $3 AND head_sha = $4 AND kind = $5 AND action_key = $6`;
+  const key = [c.sessionId, c.repo, c.pr, c.headSha, c.kind, actionKey];
+  const existing = await db.query(`SELECT * FROM claw_github_confirmations WHERE ${same} AND status = 'pending' AND expires_at > NOW()`, key);
   if (existing.rows[0]) return toConfirmation(existing.rows[0] as Record<string, unknown>);
   // A pending row that ran out is closed first, or the unique index would refuse the new one.
-  await db.query(
-    `UPDATE claw_github_confirmations SET status = 'expired'
-      WHERE session_id = $1 AND repo = $2 AND pr = $3 AND head_sha = $4 AND status = 'pending' AND expires_at <= NOW()`,
-    [c.sessionId, c.repo, c.pr, c.headSha],
-  );
+  await db.query(`UPDATE claw_github_confirmations SET status = 'expired' WHERE ${same} AND status = 'pending' AND expires_at <= NOW()`, key);
   const inserted = await db.query(
     `INSERT INTO claw_github_confirmations
-       (confirmation_id, session_id, requester_user_id, actor_user_id, repo, pr, head_sha, title, author, reasons, checks, expires_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, NOW() + ($12::bigint * INTERVAL '1 second'))
+       (confirmation_id, session_id, requester_user_id, actor_user_id, repo, pr, head_sha, title, author, reasons, checks, kind, review, action_key, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12, $13::jsonb, $14, NOW() + ($15::bigint * INTERVAL '1 second'))
      ON CONFLICT DO NOTHING RETURNING *`,
     [
       randomUUID(), c.sessionId, c.requesterUserId, c.actorUserId, c.repo, c.pr, c.headSha,
-      c.title.slice(0, 300), c.author.slice(0, 100), JSON.stringify(c.reasons), JSON.stringify(c.checks), c.ttlSeconds,
+      c.title.slice(0, 300), c.author.slice(0, 100), JSON.stringify(c.reasons), JSON.stringify(c.checks),
+      c.kind, c.review ? JSON.stringify(c.review) : null, actionKey, c.ttlSeconds,
     ],
   );
   if (inserted.rows[0]) return toConfirmation(inserted.rows[0] as Record<string, unknown>);
   // Lost a race with a concurrent identical call: theirs is the one.
-  const raced = await db.query(
-    `SELECT * FROM claw_github_confirmations
-      WHERE session_id = $1 AND repo = $2 AND pr = $3 AND head_sha = $4 AND status = 'pending'`,
-    [c.sessionId, c.repo, c.pr, c.headSha],
-  );
+  const raced = await db.query(`SELECT * FROM claw_github_confirmations WHERE ${same} AND status = 'pending'`, key);
   return toConfirmation(raced.rows[0] as Record<string, unknown>);
 }
 

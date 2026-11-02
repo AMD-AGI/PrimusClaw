@@ -35,6 +35,16 @@ tool offered to a session, and `config.acting_as` is refused.
    queued or created. Stop, and starting the session's sandbox (no model call), are not asked for. Browser
    clients of such a session therefore send the person's identity-provider access token, not the session
    cookie.
+   The creator may also bind the session to one pull request with `config.review_target =
+   {"owner": "<owner>", "repo": "<repository>", "number": <n>}`. Every tool call that names another pull
+   request, in this repository or any other, is refused (`review_target_mismatch`) before the acting
+   user's credential is looked up, reads included; the answer names the bound pull request. It is
+   written only when the session is created (no route changes a session's config afterwards), it is
+   `400` without `config.acting_as` or when it is not a well-formed reference, and a session whose stored
+   target cannot be read is offered no tools (`403 review_target_invalid` on the tool route). Without it
+   the session may act on any pull request of an allowed owner. The binding is what stops a model that
+   was talked into naming another pull request from reading it, or writing under the acting user's name
+   on it.
 2. From then on every turn of that session is offered an MCP server named `github_review`
    (reserved: a request cannot replace it) with four tools, hosted by the API at
    `POST /v1/internal/github-review/mcp`. Brain calls it with a token signed by the API
@@ -49,8 +59,8 @@ tool offered to a session, and `config.acting_as` is refused.
 |---|---|
 | `gh_pr_get` | The pull request, its files and diff, CI, review threads, existing comments, the risk verdict, what the acting user may do, the review path (below) and the review instructions. Text that came from the pull request is under `untrusted`. Call it first. |
 | `gh_pr_risk` | The risk verdict alone, with its categories. The model may pass `risk_flags` (`security_finding`, `review_skipped`) and a `risk_judgement` (see High risk); both can only raise the verdict. |
-| `gh_review_submit` | One review on the pinned head commit (the model may pass the same `risk_flags` as to `gh_pr_risk`, and they count for an `APPROVE`), with inline comments that must sit on lines the diff shows. `COMMENT`, `REQUEST_CHANGES` or `APPROVE`. A body footer says `Reviewed by Clawy on behalf of <login> (requested by <name>), run <id>` and a hidden marker (the run, the event and a digest of the text and inline comments) keeps a retry of the same review from posting twice, while a different review of the same kind on the same commit is posted. |
-| `gh_pr_merge` | Approves when needed and merges, if every gate is open. |
+| `gh_review_submit` | One review on the pinned head commit (the model may pass the same `risk_flags` as to `gh_pr_risk`, and they count for an `APPROVE`), with inline comments that must sit on lines the diff shows. `COMMENT`, `REQUEST_CHANGES` or `APPROVE`. A body footer says `Reviewed by <agent name> on behalf of <login> (requested by <name>), run <id>` (the agent name is `CLAW_GITHUB_REVIEW_AGENT_NAME`, default `Claw`) and a hidden marker (the run, the event and a digest of the text and inline comments) keeps a retry of the same review from posting twice, while a different review of the same kind on the same commit is posted. When someone else asked, nothing is posted until the acting user confirms (below). |
+| `gh_pr_merge` | Approves when needed and merges, if every gate is open. A base branch that is merged through a merge queue is refused (below). When someone else asked, nothing is approved or merged until the acting user confirms. |
 
 ## Gates (all enforced inside the tools)
 
@@ -70,9 +80,28 @@ tool offered to a session, and `config.acting_as` is refused.
   nothing is merged (`no_merge_permission`). When the requester is someone else, an approval
   or a merge is also refused if the requester wrote the pull request
   (`cannot_act_for_own_pull_request`), judged by their own GitHub login (read from the
-  identity provider; their token is not used), or has no GitHub account bound
-  (`requester_not_bound`). The identity provider's answer is read strictly: only its
+  identity provider; their token is not used), or has no usable GitHub account bound
+  (`requester_not_bound`, `requester_credential_expired`). That is the first thing an `APPROVE` review and a
+  merge ask, after the pull request itself has been read and before CI, threads, the diff or the merge
+  rules are read and before anyone is asked to confirm, so a requester who cannot pass is refused before
+  a turn's work is spent on it. A comment and a request for changes approve nothing and are not held
+  to it. The identity provider's answer is read strictly: only its
   `not_bound` is "not bound"; any other refusal is reported as `identity_unavailable` and logged.
+- **Someone else's request.** When the requester is not the acting user, no write is made with the
+  acting user's account until the acting user has confirmed that very write, whatever its risk: a merge
+  (which approves first when it has to) and a review of any event (`COMMENT`, `REQUEST_CHANGES`,
+  `APPROVE`) each stop at `confirmation_required` and write nothing. The confirmation holds the review as
+  it will be posted (event, text, inline comments), so what the acting user reads is what goes out; the
+  gates of the write are read again when they allow it. It cannot be switched off by a setting or by a
+  repository's configuration. A requester who is the acting user needs none of this: the person who asked
+  for their own account is the one who decides.
+- **Merge queue.** A merge is refused (`merge_queue_required`) before anything is written, and before
+  anyone is asked to confirm, when the rules of the base branch (`GET /repos/{owner}/{repo}/rules/branches/{branch}`,
+  the same read that finds the required checks) include a `merge_queue` rule: this tool approves and
+  then merges directly, which such a branch refuses after the approval is already on the pull request.
+  Only rulesets are visible to that read; a merge queue set up through classic branch protection is not,
+  and GitHub's refusal there arrives after the approval (`not_mergeable`). Rules that cannot be read are
+  not a queue; they fail the CI gate (`ci_not_green`) before any write.
 - **An approval.** An approval can merge a pull request by itself (GitHub's auto-merge), so
   `gh_review_submit` with `APPROVE` is posted only where `gh_pr_merge` would not stop: CI is
   green on the head commit (`ci_not_green`), no review thread is open (`threads_unresolved`)
@@ -89,7 +118,7 @@ tool offered to a session, and `config.acting_as` is refused.
   protections are met because they are GitHub's. No admin merge, no auto-merge, no branch update, no change to a rule.
   The method is the repository's first allowed one, squash first.
 - **High risk.** A versioned rule pack (`packages/api/src/github-review/risk.ts` and
-  `risk-signals.ts`, version `2026-10-31.1`) decides from what the change **does**, read from
+  `risk-signals.ts`, version `2026-11-02.1`) decides from what the change **does**, read from
   its diff, not from which kind of file it touches. A merge is held for the acting user's own
   confirmation when the change is
   - an **architecture** change: a package or module added or removed (a manifest, a `go.mod`, a
@@ -150,7 +179,7 @@ tool offered to a session, and `config.acting_as` is refused.
   as an ordinary text patch with real line counts; that is a diff that did not show the file, and
   is treated like a binary's), and any rule that throws: the rules fail closed. A file that was moved is judged by the path it left as well
   as the one it went to, and a line that starts with `++` or `--` is read like any other. A
-  repository's `.github/clawy.yml` on the base branch can add paths (`high_risk_paths`) or ask for
+  repository's `.github/claw-review.yml` on the base branch can add paths (`high_risk_paths`) or ask for
   confirmation on every merge (`confirm_merge: always`).
 
   **The reviewer's judgement.** `gh_pr_risk`, `gh_review_submit` and `gh_pr_merge` take
@@ -162,21 +191,25 @@ tool offered to a session, and `config.acting_as` is refused.
   `security`, `ci_release`, `dependency`, `size_breadth`, `integrity`, `provenance`, `reviewer`).
 
   A merge that needs confirmation creates one pending row for the head commit and merges
-  nothing.
+  nothing. When the requester is not the acting user it needs confirmation whatever the rules said:
+  the card then says that another user asked for it.
 
 ## Confirmations
 
 | Route | Purpose |
 |---|---|
-| `GET /v1/github-review/confirmations?session_id=<id>&status=pending` | The confirmations of the caller's own sessions and those that ask the caller. `{items:[{id, repo, pr, title, author, head_sha, reasons, checks, actor_user_id, requester_user_id, session_id, expires_at, status}]}` |
-| `POST /v1/github-review/confirmations/:id/decision` `{decision: "allow" \| "deny"}` | The acting user's answer, given with an identity provider's access token: their own sign-in at the provider, or an allowed service's (next section). Anyone else gets `403`, and so does the acting user with an `ak-` key (`Authorization: Bearer` or `x-api-key`), a BYOK key, a connector token or a browser session cookie, whatever the id (`403 interactive_sign_in_required`; the check is on how the request was authenticated, before the confirmation is looked up). The sandbox of a session holds its owner's key, and with SaFE's built-in sign-in that key sets the owner's password and logs in, which returns a session cookie the API verifies as the person's own: so neither a key nor a cookie is proof of a person, and a model in any session of that user could otherwise answer a confirmation itself. On `allow` every gate is read again and the merge is made with the acting user's account; the answer is `{status: "merged" \| "denied" \| "stale" \| "expired" \| "refused" \| "retry", reason, merge_sha}`. `retry` means the merge could not be tried just now (the identity service or GitHub failed, a limit was hit) before anything was sent to GitHub, and the confirmation is still open: allow it again. Once an approval or a merge has been sent the try is not given back: the confirmation is closed as `refused` with `wrote: true`. The merge is recorded as asked for by the requester, not by the acting user. A service an operator named may answer for the acting user too (next section) |
+| `GET /v1/github-review/confirmations?session_id=<id>&status=pending` | The confirmations of the caller's own sessions and those that ask the caller. `{items:[{id, kind, review, repo, pr, title, author, head_sha, reasons, checks, actor_user_id, requester_user_id, session_id, expires_at, status}]}`. `kind` is `merge` or `review`; for a `review`, `review` is `{event, body, comments: [{path, line, side, body}]}` as it will be posted (without its footer), and `null` for a merge. `status` is `pending`, `merging`, `merged`, `submitted`, `denied`, `stale`, `expired` or `refused` |
+| `POST /v1/github-review/confirmations/:id/decision` `{decision: "allow" \| "deny"}` | The acting user's answer, given with an identity provider's access token: their own sign-in at the provider, or an allowed service's (next section). Anyone else gets `403`, and so does the acting user with an `ak-` key (`Authorization: Bearer` or `x-api-key`), a BYOK key, a connector token or a browser session cookie, whatever the id (`403 interactive_sign_in_required`; the check is on how the request was authenticated, before the confirmation is looked up). The sandbox of a session holds its owner's key, and with SaFE's built-in sign-in that key sets the owner's password and logs in, which returns a session cookie the API verifies as the person's own: so neither a key nor a cookie is proof of a person, and a model in any session of that user could otherwise answer a confirmation itself. On `allow` every gate is read again and the held write is made with the acting user's account; the answer is `{status: "merged" \| "submitted" \| "denied" \| "stale" \| "expired" \| "refused" \| "retry", reason, merge_sha, review_id, url}` (`merged` for a merge, `submitted` for a review). `retry` means the write could not be tried just now (the identity service or GitHub failed, a limit was hit) before anything was sent to GitHub, and the confirmation is still open: allow it again. Once a review, an approval or a merge has been sent the try is not given back: the confirmation is closed as `refused` with `wrote: true`. The write is recorded as asked for by the requester, not by the acting user. A service an operator named may answer for the acting user too (next section) |
 
 A browser session cookie would be taken again only where the platform that issues it refuses to set a
 password with an API key; that is a change to Primus-SaFE, not something this code can check, so until
 it is made the identity provider (or an allowed service) is the only way to answer.
 
 A confirmation lives 24 hours (`CLAW_GITHUB_CONFIRMATION_TTL_SECONDS`), is bound to the head
-commit (a head that moved makes it `stale`) and is used once.
+commit (a head that moved makes it `stale`) and is used once. There is one pending confirmation for a
+head commit and a write: asking for the same merge, or posting the same review, again shows the same one,
+while a merge and a review, or two reviews that say different things, are different confirmations. One
+acting user is asked about at most ten writes at a time (`too_many_pending_confirmations`).
 
 ### A service answering for the acting user
 
@@ -202,7 +235,7 @@ credentials for an access token that acts as that user (RFC 8693: `sub` is the u
   `403 service_client_not_allowed`, and nothing is created or queued.
 - Who stood behind the answer is recorded: `decided_by` is the acting user, `decided_via` is
   `{kind: "service", client_id, act_sub}` (also in the confirmation list), the closing `result`
-  says `by: "service"`, the audit row of the merge carries `decided_by_service`, and a
+  says `by: "service"`, the audit row of the write carries `decided_by_service`, and a
   `github_review.decision_by_service` log line names the confirmation, the user and the client.
 
 ## Review path: the diff or a sandbox
@@ -262,7 +295,8 @@ changes, no request for reviewers. The answer ends with exactly one last line, `
 | `CLAW_GITHUB_WRITES_ENABLED` | off | Off is a dry run: every gate is checked and nothing is written to GitHub; the tools answer what they would do |
 | `CLAW_GITHUB_API_URL` | `https://api.github.com` | The API address |
 | `CLAW_GITHUB_CONFIRMATION_TTL_SECONDS` | 86400 | Life of a pending confirmation |
-| `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS` | none | Identity-provider client ids of the services that may answer a held merge, or create a session that acts as a user, for the user their token names (see "A service answering for the acting user"). Empty refuses every service |
+| `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS` | none | Identity-provider client ids of the services that may answer a held write, or create a session that acts as a user, for the user their token names (see "A service answering for the acting user"). Empty refuses every service |
+| `CLAW_GITHUB_REVIEW_AGENT_NAME` | `Claw` | How the footer of a review names its author (`Reviewed by <name> on behalf of ...`): one line of plain text, at most 40 characters |
 | `CLAW_GITHUB_REVIEWS_PER_TOKEN_PER_HOUR` | 6 | Reviews one GitHub account may have in an hour (a review and its merge count once) |
 | `CLAW_GITHUB_REVIEWS_PER_HOUR` | 20 | The same, all accounts together |
 | `CLAW_GITHUB_CONCURRENT_PER_REPO` | 3 | Tool calls on one repository at once, per API replica |
@@ -287,6 +321,16 @@ secret before the model reads it. Rate limits answer `rate_limited`; GitHub's ow
 answer `github_rate_limited` with `retry_after_seconds`, and a write is never retried blindly:
 a retry first looks for its own marker on the pull request, in all of its reviews (more than a thousand
 answer `reviews_unreadable`).
+
+## Names
+
+- Earlier release names, still read and never written: the hidden marker `<!-- clawy:run:... -->` in a review's footer (a retry still finds a review an earlier release posted, and does not post it twice) and the repository configuration file `.github/clawy.yml`, which is read only where `.github/claw-review.yml` is absent. A pull request that edits either file is high risk. Everything new is written under the neutral names: the marker `<!-- claw-review:run:... -->`, the file `.github/claw-review.yml` and the footer name `CLAW_GITHUB_REVIEW_AGENT_NAME`. The platform does not name the clients that call it; `test/github-review-public-tree.test.ts` fails on the product name anywhere else in this feature.
+
+## Risks accepted in this phase
+
+- **One person, two GitHub accounts.** The rule that the requester did not write the pull request compares the GitHub login the requester has bound with the author's. A requester who has another account, the one the pull request was written under, passes it, and so does one who writes from an account nobody knows is theirs. Nothing in this code can tell. What stands is the acting user's confirmation of every merge and approval, which shows the author and the requester; it is not a control that is independent of the people involved. Which people may ask for someone else's account is for the deployment to decide; it should be people whose GitHub accounts are known.
+- **The acting user is asked more.** Every write on someone else's request is a card. A person who is asked by many can have ten waiting at once and then every further request is refused until they answer or the cards expire; there is no per-requester limit yet.
+- **A merge queue set up through classic branch protection** is not seen (see "Gates"), so a merge there can fail after the approval is posted.
 
 ## What it does not do
 

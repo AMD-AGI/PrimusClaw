@@ -97,3 +97,8 @@ export function requiredContextsFromRules(rules: unknown): string[] | null {
   }
   return out;
 }
+
+/** Whether the rules of the base branch say it is merged through a merge queue (GitHub's rule type `merge_queue`). */
+export function hasMergeQueueRule(rules: unknown): boolean {
+  return Array.isArray(rules) && rules.some((rule) => (rule as { type?: unknown } | null)?.type === "merge_queue");
+}

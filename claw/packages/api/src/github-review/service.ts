@@ -22,17 +22,20 @@
 import { createHash } from "node:crypto";
 import pino from "pino";
 import { IdentityCredentialRefusedError, IdentityUnavailableError, type ResolveCredentialRequest, type ResolvedCredential } from "@claw/utils";
-import { evaluateChecks, requiredContextsFromRules, type ChecksVerdict } from "./checks.js";
+import { evaluateChecks, hasMergeQueueRule, requiredContextsFromRules, type ChecksVerdict } from "./checks.js";
 import { commentableLines } from "./diff.js";
 import { GithubClient, GithubError, parsePrRef, repoPath, type PrRef } from "./github.js";
-import { MAX_FILES_READ, assessRisk, diffNotSent, normaliseJudgement, parseClawyConfig, type RepoConfig, type ReviewerJudgement, type RiskFile, type RiskResult } from "./risk.js";
+import { LEGACY_REPO_CONFIG_STEM, LEGACY_RUN_MARKER_PREFIX } from "./legacy-names.js";
+import { MAX_FILES_READ, REPO_CONFIG_PATH, assessRisk, diffNotSent, normaliseJudgement, parseRepoConfig, type RepoConfig, type ReviewerJudgement, type RiskFile, type RiskResult } from "./risk.js";
 import { selectReviewInstructions } from "./repo-skill.js";
 import { chooseReviewPath, reviewPathAdvice } from "./review-path.js";
+import { isReviewTarget } from "./review-target.js";
 import { SANDBOX_RECIPE_USAGE, buildSandboxRecipe } from "./sandbox-recipe.js";
 import { GITHUB_PROVIDER, type GithubReviewSettings } from "./settings.js";
 import {
   auditFinish, auditStart, claimConfirmation, finishConfirmation, getConfirmation, openConfirmation,
-  countPendingConfirmations, recentWrites, reopenConfirmation, reserveWrite, sessionRequestCount, type Confirmation, type DecidedVia, type Queryable,
+  countPendingConfirmations, recentWrites, reopenConfirmation, reserveWrite, reviewDigest, sessionRequestCount,
+  type Confirmation, type DecidedVia, type HeldReview, type Queryable, type ReviewComment, type ReviewEvent,
 } from "./store.js";
 
 const logger = pino({ name: "github-review" });
@@ -45,6 +48,8 @@ export interface ReviewActor {
   actorUserId: string;
   /** How the requester is named in the review footer. */
   requesterLabel?: string;
+  /** The one pull request the session may touch (`config.review_target`, see review-target.ts); none means any pull request of an allowed owner. */
+  reviewTarget?: PrRef | null;
 }
 
 export interface ToolOutcome {
@@ -91,6 +96,8 @@ interface Ctx {
     /** The audit row has been marked as a write, so it already counts against the limits. */
     reserved?: boolean;
   };
+  /** The base branch's rules as GitHub gave them, read once per call (see `baseRules`); null when they could not be read. */
+  rules?: unknown;
 }
 
 interface RepoInfo {
@@ -119,8 +126,6 @@ interface PrInfo {
   url: string;
 }
 
-interface ReviewComment { path: string; line: number; side: "RIGHT" | "LEFT"; body: string }
-
 interface Change {
   files: RiskFile[];
   complete: boolean;
@@ -147,8 +152,13 @@ const MAX_DIFF_CHARS = 200_000;
 const HOUR_MS = 3_600_000;
 /** Refusals that say nothing about the merge itself and will pass: the acting user's "allow" is kept for another try. */
 const TRANSIENT_REFUSALS = new Set(["too_many_concurrent", "rate_limited", "github_rate_limited", "identity_unavailable", "audit_unavailable"]);
-/** Merges waiting for one acting user's decision; past it nothing new is asked of them. */
+/** Writes (a merge, a review) waiting for one acting user's decision; past it nothing new is asked of them. */
 const MAX_PENDING_CONFIRMATIONS = 10;
+/** What the acting user is told when nothing about the change holds a write and the only reason is that someone else asked for it. */
+const onBehalfReason = (what: string): string => `another user asked for ${what}; nothing is written with your GitHub account until you confirm it`;
+/** The hidden line in a review's footer that names the run; a retry looks for it. The prefix an earlier release wrote is still looked for (legacy-names.ts). */
+const RUN_MARKER_PREFIX = "claw-review:run";
+const REVIEW_EVENTS: readonly ReviewEvent[] = ["COMMENT", "REQUEST_CHANGES", "APPROVE"];
 /**
  * GitHub works a pull request's merge state out asynchronously: it reads UNKNOWN while it computes, and BLOCKED until
  * the review this call has just posted counts. These are the waits (ms) between the reads that look for it to settle,
@@ -284,23 +294,46 @@ export class GithubReview {
     return this.run(actor, "gh_review_submit", args, async (ctx, ref) => {
       const headSha = this.pinned(args.head_sha);
       const event = String(args.event ?? "");
-      if (!["COMMENT", "REQUEST_CHANGES", "APPROVE"].includes(event)) {
+      if (!REVIEW_EVENTS.includes(event as ReviewEvent)) {
         throw new Refusal("invalid_event", "event must be COMMENT, REQUEST_CHANGES or APPROVE");
       }
       const text = typeof args.body === "string" ? args.body.trim() : "";
       if (!text) throw new Refusal("empty_review", "a review needs a body");
       if (text.length > MAX_BODY_CHARS) throw new Refusal("body_too_long", `the body is longer than ${MAX_BODY_CHARS} characters`);
-      const { repo, pr } = await this.load(ctx, ref);
-      this.requireOpen(pr);
-      this.requireHead(pr, headSha);
-      const needsChange = Array.isArray(args.comments) && args.comments.length > 0;
-      const change = needsChange ? await this.collectChange(ctx, ref, pr) : null;
-      const comments = this.checkComments(args.comments, change);
-      await this.requireEvent(ctx, repo, pr, event as "COMMENT" | "REQUEST_CHANGES" | "APPROVE");
-      if (event === "APPROVE") await this.requireApprovable(ctx, ref, repo, pr, change, this.flags(args), this.judgement(ctx, args));
-      const result = await this.writeReview(ctx, ref, pr, event, text, comments);
-      return ok({ status: result.status, head_sha: headSha, ...result.detail }, (t) => ctx.client.redact(t));
+      return ok(await this.submit(ctx, ref, headSha, {
+        event: event as ReviewEvent, text, rawComments: args.comments, flags: this.flags(args), judgement: this.judgement(ctx, args), confirmation: null,
+      }), (t) => ctx.client.redact(t));
     });
+  }
+
+  /**
+   * One review, from the gates to the write. For someone else's account (the requester is not the acting user) it stops short of the write
+   * and holds the review for the acting user, whatever its event: they read exactly what would be posted, and the gates are read again when
+   * they allow it, so `confirmation` is set on that second pass and the review is written.
+   */
+  private async submit(
+    ctx: Ctx, ref: PrRef, headSha: string,
+    o: { event: ReviewEvent; text: string; rawComments: unknown; flags: string[]; judgement: ReviewerJudgement | null; confirmation: Confirmation | null },
+  ): Promise<Record<string, unknown>> {
+    const { repo, pr } = await this.load(ctx, ref);
+    this.requireOpen(pr);
+    this.requireHead(pr, headSha);
+    ctx.acc.confirmationId = o.confirmation?.id;
+    if (o.event === "APPROVE") await this.requireNotRequestersOwn(ctx, pr);
+    const needsChange = Array.isArray(o.rawComments) && o.rawComments.length > 0;
+    const change = needsChange ? await this.collectChange(ctx, ref, pr) : null;
+    const comments = this.checkComments(o.rawComments, change);
+    await this.requireEvent(ctx, repo, pr, o.event);
+    if (o.event === "APPROVE") await this.requireApprovable(ctx, ref, repo, pr, change, o.flags, o.judgement);
+    if (!o.confirmation && this.onSomeoneElsesRequest(ctx)) {
+      const review: HeldReview = { event: o.event, body: o.text, comments };
+      return this.hold(ctx, ref, pr, headSha, {
+        kind: "review", review, reasons: [onBehalfReason("this review")], checks: {},
+        message: `A ${o.event} review would be posted with ${ctx.cred.login}'s account on another user's request, so ${ctx.cred.login} is asked to confirm it first. Nothing was posted. Say that the review waits for their decision.`,
+      });
+    }
+    const result = await this.writeReview(ctx, ref, pr, o.event, o.text, comments);
+    return { status: result.status, head_sha: headSha, ...result.detail };
   }
 
   /** `gh_pr_merge`: approve (when needed) and merge, if every gate is open. */
@@ -318,9 +351,9 @@ export class GithubReview {
   // -------------------------------------------------- confirmations
 
   /**
-   * The acting user's answer to a held merge. Only the actor can give it (the
-   * caller checks that and passes `deciderUserId`); on allow, every merge gate is
-   * read again and the merge is made with the actor's own account.
+   * The acting user's answer to a held write, a merge or a review. Only the actor can give it (the
+   * caller checks that and passes `deciderUserId`); on allow, every gate of that write is
+   * read again and it is made with the actor's own account.
    *
    * `via` is set when a service client answered for the actor (an operator-allowed
    * service holding a token the identity provider exchanged for that user, which
@@ -359,8 +392,18 @@ export class GithubReview {
       await finishConfirmation(this.deps.db, id, "refused", deciderUserId, { ...by, reason: "bad_reference" });
       return { http: 200, body: { ok: true, status: "refused", reason: "bad_reference" } };
     }
-    const outcome = await this.run(actor, "gh_pr_merge", { pr: `${confirmation.repo}#${confirmation.pr}`, head_sha: confirmation.headSha, confirmation_id: id, ...(via ? { decided_by_service: via.clientId, decided_by_service_act: via.actorSub } : {}) }, async (ctx) => {
-      return ok(await this.merge(ctx, ref, confirmation.headSha, { flags: [], judgement: null, confirmation }), (t) => ctx.client.redact(t));
+    // A row that says it holds a review and does not is never read as a merge.
+    const held = confirmation.kind === "review" ? confirmation.review : null;
+    if (confirmation.kind === "review" && !held) {
+      await finishConfirmation(this.deps.db, id, "refused", deciderUserId, { ...by, reason: "unreadable_confirmation" });
+      return { http: 200, body: { ok: true, status: "refused", reason: "unreadable_confirmation" } };
+    }
+    const tool = held ? "gh_review_submit" : "gh_pr_merge";
+    const outcome = await this.run(actor, tool, { pr: `${confirmation.repo}#${confirmation.pr}`, head_sha: confirmation.headSha, confirmation_id: id, ...(via ? { decided_by_service: via.clientId, decided_by_service_act: via.actorSub } : {}) }, async (ctx) => {
+      const body = held
+        ? await this.submit(ctx, ref, confirmation.headSha, { event: held.event, text: held.body, rawComments: held.comments, flags: [], judgement: null, confirmation })
+        : await this.merge(ctx, ref, confirmation.headSha, { flags: [], judgement: null, confirmation });
+      return ok(body, (t) => ctx.client.redact(t));
     }, { skipBudget: true, ref, consented: true });
     const status = String(outcome.body.status ?? "");
     const reason = String(outcome.body.reason ?? "");
@@ -368,23 +411,27 @@ export class GithubReview {
       await finishConfirmation(this.deps.db, id, "merged", deciderUserId, { ...by, merge_sha: outcome.body.merge_sha ?? null });
       return { http: 200, body: { ok: true, status: "merged", merge_sha: outcome.body.merge_sha ?? null, url: outcome.body.url ?? null } };
     }
+    if (held && (status === "submitted" || status === "already_submitted")) {
+      await finishConfirmation(this.deps.db, id, "submitted", deciderUserId, { ...by, review_id: outcome.body.review_id ?? null });
+      return { http: 200, body: { ok: true, status: "submitted", review_id: outcome.body.review_id ?? null, url: outcome.body.url ?? null } };
+    }
     if (status === "dry_run") {
       await finishConfirmation(this.deps.db, id, "refused", deciderUserId, { ...by, reason: "writes_disabled" });
       return { http: 200, body: { ok: true, status: "refused", reason: "writes_disabled" } };
     }
-    // Once an approval or a merge has been sent, the try has had an effect on the pull request and is not
-    // given back: a later deny or expiry would leave that approval standing, and a 5xx on the merge may
+    // Once a review, an approval or a merge has been sent, the try has had an effect on the pull request and is not
+    // given back: a later deny or expiry would leave that review standing, and a 5xx on the write may
     // mean it went through.
     const wrote = outcome.wrote === true;
     if (!wrote && (TRANSIENT_REFUSALS.has(reason) || (reason === "github_error" && Number(outcome.body.github_status) >= 500))) {
-      // Nothing was decided about the merge and nothing was written: the person's "allow" is not used up, and they can give it again.
+      // Nothing was decided about the write and nothing was written: the person's "allow" is not used up, and they can give it again.
       if (await reopenConfirmation(this.deps.db, id)) {
-        return { http: 200, body: { ok: true, status: "retry", reason, message: "the merge could not be tried just now; the confirmation is still open, so allow it again in a moment" } };
+        return { http: 200, body: { ok: true, status: "retry", reason, message: "this could not be tried just now; the confirmation is still open, so allow it again in a moment" } };
       }
     }
     const final = reason === "head_moved" ? "stale" : "refused";
     await finishConfirmation(this.deps.db, id, final, deciderUserId, { ...by, reason, ...(wrote ? { wrote: true } : {}) });
-    const message = [outcome.body.message, wrote ? "An approval or a merge was already sent to GitHub in this try, so this confirmation is closed; look at the pull request before asking again." : null].filter(Boolean).join(" ");
+    const message = [outcome.body.message, wrote ? "A review, an approval or a merge was already sent to GitHub in this try, so this confirmation is closed; look at the pull request before asking again." : null].filter(Boolean).join(" ");
     return { http: 200, body: { ok: true, status: final, reason, message: message || null, ...(wrote ? { wrote: true } : {}) } };
   }
 
@@ -426,6 +473,13 @@ export class GithubReview {
     let held: string | null = null;
     try {
       if (!ref) throw new Refusal("invalid_pull_request", "name the pull request as a github.com URL or owner/repo#number");
+      // Before the owner list, the budget and the credential: a session bound to one pull request has no business with another, and the
+      // account it acts as is not even looked up for it. Reads are held to it as well as writes.
+      const bound = actor.reviewTarget;
+      if (bound && !isReviewTarget(ref, bound)) {
+        const target = `${bound.owner}/${bound.repo}#${bound.number}`;
+        throw new Refusal("review_target_mismatch", `this session is bound to ${target} and can act on nothing else`, { review_target: target });
+      }
       if (!settings.owners.includes(ref.owner.toLowerCase())) {
         throw new Refusal("owner_not_allowed", `reviews are limited to repositories owned by ${settings.owners.join(", ")}`);
       }
@@ -512,13 +566,14 @@ export class GithubReview {
   }
 
   /**
-   * An approval, and a merge, made with someone else's account are not made for the
-   * person who wrote the pull request: that would get their own change through with
-   * no second person's review. The requester's GitHub login is looked up (only the
-   * login is kept; their token is dropped unused) and compared with the author's.
-   * A requester who has no GitHub account bound cannot be shown not to be the
-   * author, so that refuses too. The person who is the acting user is covered by the
-   * rule on their own login.
+   * An approval, and a merge, made with someone else's account are not made for the person who wrote the pull request: that would get their
+   * own change through with no second person's review. Asked first by every approving write (an `APPROVE` review, a merge), before any other
+   * gate is read and before anyone is asked to confirm, so that a requester who cannot pass is refused before a turn's work is spent on it. The
+   * requester's GitHub login is looked up (only the login is kept; their token is dropped unused) and compared with the author's. A requester
+   * who has no usable GitHub account bound cannot be shown not to be the author, so that refuses too. The person who is the acting user is
+   * covered by the rule on their own login. One person with two GitHub accounts passes it with the one that is not the author's: the acting
+   * user's confirmation, which shows the author, is what stands there (docs/github-review.md). A comment and a request for changes approve
+   * nothing and are not held to this.
    */
   private async requireNotRequestersOwn(ctx: Ctx, pr: PrInfo): Promise<void> {
     if (ctx.actor.requesterUserId === ctx.actor.actorUserId) return;
@@ -609,14 +664,15 @@ export class GithubReview {
     }
     let repoConfig: Change["repoConfig"] = null;
     try {
-      const a = await ctx.client.get<{ type?: string; content?: string; encoding?: string }>(
-        repoPath(ref, "/contents/.github/clawy.yml"), { ref: pr.baseRef }, [404],
-      );
-      if (a.status !== 404) {
+      // The earlier name is read only where the current one is absent, so a repository that has both is read by the current one.
+      for (const path of [REPO_CONFIG_PATH, `.github/${LEGACY_REPO_CONFIG_STEM}.yml`]) {
+        const a = await ctx.client.get<{ type?: string; content?: string; encoding?: string }>(repoPath(ref, `/contents/${path}`), { ref: pr.baseRef }, [404]);
+        if (a.status === 404) continue;
         const j = a.json;
         repoConfig = j && j.type === "file" && j.encoding === "base64" && typeof j.content === "string"
-          ? parseClawyConfig(Buffer.from(j.content, "base64").toString("utf8"))
+          ? parseRepoConfig(Buffer.from(j.content, "base64").toString("utf8"))
           : "invalid";
+        break;
       }
     } catch (err) {
       if (err instanceof GithubError && err.rateLimited) throw err;
@@ -655,14 +711,7 @@ export class GithubReview {
     const status = await ctx.client.get<{ total_count?: number; statuses?: Array<{ context?: string; state?: string }> }>(
       repoPath(ref, `/commits/${sha}/status`), { per_page: 100 },
     );
-    let required: string[] | null = null;
-    try {
-      const rules = await ctx.client.get<unknown>(repoPath(ref, `/rules/branches/${encodeURIComponent(pr.baseRef)}`));
-      required = requiredContextsFromRules(rules.json);
-    } catch (err) {
-      if (err instanceof GithubError && err.rateLimited) throw err;
-      required = null;
-    }
+    const required = requiredContextsFromRules(await this.baseRules(ctx, ref, pr));
     const checkRuns = (runs.json?.check_runs ?? []).map((c) => ({ name: String(c.name ?? ""), status: String(c.status ?? ""), conclusion: c.conclusion ?? null }));
     const statuses = (status.json?.statuses ?? []).map((s) => ({ context: String(s.context ?? ""), state: String(s.state ?? "") }));
     return evaluateChecks({
@@ -700,9 +749,12 @@ export class GithubReview {
       acting_user_allows_others: ctx.cred.delegation,
       may_approve_and_merge: repo.push,
       has_write_permission: repo.push,
-      note: repo.push
+      // Someone else's request: nothing is posted or merged until the acting user confirms it, which the model is told before it tries.
+      writes_need_acting_user_confirmation: !own,
+      note: (repo.push
         ? "approve and merge are open, subject to the gates"
-        : "the acting user has no write permission here: comment only, and say that nothing was merged for that reason",
+        : "the acting user has no write permission here: comment only, and say that nothing was merged for that reason")
+        + (own ? "" : "; every review and merge is held for the acting user to confirm, so none is posted or merged until they do"),
     };
   }
 
@@ -716,13 +768,12 @@ export class GithubReview {
 
   // ----------------------------------------------------------- reviews
 
-  private async requireEvent(ctx: Ctx, repo: RepoInfo, pr: PrInfo, event: "COMMENT" | "REQUEST_CHANGES" | "APPROVE"): Promise<void> {
+  private async requireEvent(ctx: Ctx, repo: RepoInfo, pr: PrInfo, event: ReviewEvent): Promise<void> {
     if (event !== "APPROVE") return;
     if (!repo.push) throw new Refusal("no_write_permission", `${ctx.cred.login} has no write permission on ${repo.fullName}, and an approval without it does not count; post a comment instead`);
     if (pr.authorLogin.toLowerCase() === ctx.cred.login.toLowerCase()) {
       throw new Refusal("cannot_approve_own_pull_request", "the acting user wrote this pull request and cannot approve it; another approver is needed");
     }
-    await this.requireNotRequestersOwn(ctx, pr);
   }
 
   /**
@@ -774,16 +825,18 @@ export class GithubReview {
   /**
    * The hidden line that says a review was posted: which run (session and head commit), which event, and a digest of what the
    * review says (its text and inline comments). A retry of the same review finds it; a different review of the same kind on the
-   * same commit does not, and is posted.
+   * same commit does not, and is posted. `write` is the one that is posted; `known` adds the one an earlier release posted, so that a
+   * review it already made is still found.
    */
-  private marker(runId: string, event: string, text: string, comments: ReviewComment[]): string {
-    const said = JSON.stringify([text, comments.map((c) => [c.path, c.line, c.side, c.body])]);
-    return `<!-- clawy:run:${runId}:${event}:${createHash("sha256").update(said).digest("hex").slice(0, 12)} -->`;
+  private markers(runId: string, event: string, text: string, comments: ReviewComment[]): { write: string; known: string[] } {
+    const rest = `:${runId}:${event}:${reviewDigest(text, comments)} -->`;
+    const write = `<!-- ${RUN_MARKER_PREFIX}${rest}`;
+    return { write, known: [write, `<!-- ${LEGACY_RUN_MARKER_PREFIX}${rest}`] };
   }
 
   private footer(ctx: Ctx, runId: string, marker: string): string {
     const who = (ctx.actor.requesterLabel ?? ctx.actor.requesterUserId).replace(/[\r\n<>`]/g, " ").trim().slice(0, 60) || "unknown";
-    return `\n\n---\nReviewed by Clawy on behalf of ${ctx.cred.login} (requested by ${who}), run ${runId}\n${marker}`;
+    return `\n\n---\nReviewed by ${ctx.settings.agentName} on behalf of ${ctx.cred.login} (requested by ${who}), run ${runId}\n${marker}`;
   }
 
   /** Every review of the pull request, oldest first. More than could be read is a refusal: a marker or an approval past the cut would be missed. */
@@ -826,12 +879,12 @@ export class GithubReview {
     ctx: Ctx, ref: PrRef, pr: PrInfo, event: string, text: string, comments: ReviewComment[],
   ): Promise<{ status: string; detail: Record<string, unknown> }> {
     const runId = this.runId(ctx, pr.headSha);
-    const marker = this.marker(runId, event, text, comments);
+    const marker = this.markers(runId, event, text, comments);
     const existing = await this.listReviews<{ id?: number; body?: string; html_url?: string }>(ctx, ref);
-    const prior = existing.find((r) => typeof r.body === "string" && r.body.includes(marker));
+    const prior = existing.find((r) => typeof r.body === "string" && marker.known.some((m) => (r.body as string).includes(m)));
     if (prior) return { status: "already_submitted", detail: { review_id: prior.id ?? null, url: prior.html_url ?? null, event } };
     const payload = {
-      commit_id: pr.headSha, event, body: `${text}${this.footer(ctx, runId, marker)}`,
+      commit_id: pr.headSha, event, body: `${text}${this.footer(ctx, runId, marker.write)}`,
       ...(comments.length ? { comments: comments.map((c) => ({ path: c.path, line: c.line, side: c.side, body: c.body })) } : {}),
     };
     if (!ctx.settings.writesEnabled) {
@@ -857,11 +910,12 @@ export class GithubReview {
       throw new Refusal("head_moved", "the confirmation was for another commit");
     }
     ctx.acc.confirmationId = opts.confirmation?.id;
+    // Before anything else is read or asked, and so before any approval is written or anyone is asked to confirm.
+    await this.requireNotRequestersOwn(ctx, pr);
     if (!repo.push) {
       throw new Refusal("no_merge_permission", `${ctx.cred.login} has no write permission on ${repo.fullName}: the review stands as comments and nothing was merged`);
     }
-    // Before anyone is asked to confirm, and before anything is read for the merge.
-    await this.requireNotRequestersOwn(ctx, pr);
+    await this.requireNoMergeQueue(ctx, ref, pr);
     const method = opts.method ?? (["squash", "merge", "rebase"] as const).find((m) => repo.methods.includes(m));
     if (!method || !repo.methods.includes(method)) throw new Refusal("merge_method_not_allowed", `the repository does not allow that merge method (allowed: ${repo.methods.join(", ") || "none"})`);
 
@@ -871,20 +925,14 @@ export class GithubReview {
     let state = await this.readState(ctx, ref, pr, repo);
     // Before anyone is asked: a person is not woken to confirm a merge that CI or an open thread would refuse anyway.
     this.requireGreen(state, headSha);
-    if (risk.level === "high" && !opts.confirmation) {
-      if ((await countPendingConfirmations(this.deps.db, ctx.actor.actorUserId)) >= MAX_PENDING_CONFIRMATIONS) {
-        throw new Refusal("too_many_pending_confirmations", `${ctx.cred.login} already has ${MAX_PENDING_CONFIRMATIONS} merges waiting for a decision; nothing was merged`);
-      }
-      const c = await openConfirmation(this.deps.db, {
-        sessionId: ctx.actor.sessionId, requesterUserId: ctx.actor.requesterUserId, actorUserId: ctx.actor.actorUserId,
-        repo: `${ref.owner}/${ref.repo}`, pr: ref.number, headSha, title: pr.title, author: pr.authorLogin,
-        reasons: risk.reasons, checks: { ...state.checks.summary, green: state.checks.green }, ttlSeconds: ctx.settings.confirmationTtlSeconds,
+    if (!opts.confirmation && (risk.level === "high" || this.onSomeoneElsesRequest(ctx))) {
+      const high = risk.level === "high";
+      return this.hold(ctx, ref, pr, headSha, {
+        kind: "merge", review: null, reasons: high ? risk.reasons : [onBehalfReason("this merge, with an approval first where one is needed")], checks: { ...state.checks.summary, green: state.checks.green },
+        message: high
+          ? `This change is high risk, so ${ctx.cred.login} is asked to confirm the merge. Nothing was merged. Say that the merge waits for their decision and give the reasons.`
+          : `This merge would be made with ${ctx.cred.login}'s account on another user's request, so ${ctx.cred.login} is asked to confirm it first. Nothing was merged. Say that the merge waits for their decision.`,
       });
-      ctx.acc.confirmationId = c.id;
-      return {
-        status: "confirmation_required", confirmation_id: c.id, expires_at: c.expiresAt, reasons: risk.reasons,
-        message: `This change is high risk, so ${ctx.cred.login} is asked to confirm the merge. Nothing was merged. Say that the merge waits for their decision and give the reasons. They answer it signed in, in their own session: no tool or key of yours can, so do not try.`,
-      };
     }
 
     const ownPr = pr.authorLogin.toLowerCase() === ctx.cred.login.toLowerCase();
@@ -930,6 +978,58 @@ export class GithubReview {
       if (err instanceof GithubError && (err.status === 405 || err.status === 422)) throw new Refusal("not_mergeable", `GitHub refused the merge: ${err.message}`, { github_request_id: err.requestId });
       throw err;
     }
+  }
+
+  /** The write is made with the acting user's account for another user: the requester is not them. */
+  private onSomeoneElsesRequest(ctx: Ctx): boolean {
+    return ctx.actor.requesterUserId !== ctx.actor.actorUserId;
+  }
+
+  /**
+   * Holds a write for the acting user instead of making it: one pending confirmation for this head commit and this exact write, and nothing
+   * sent to GitHub. They answer it signed in, in their own session (see `decide`), so no tool or key of the model's can.
+   */
+  private async hold(
+    ctx: Ctx, ref: PrRef, pr: PrInfo, headSha: string,
+    held: { kind: "merge" | "review"; review: HeldReview | null; reasons: string[]; checks: Record<string, unknown>; message: string },
+  ): Promise<Record<string, unknown>> {
+    if ((await countPendingConfirmations(this.deps.db, ctx.actor.actorUserId)) >= MAX_PENDING_CONFIRMATIONS) {
+      throw new Refusal("too_many_pending_confirmations", `${ctx.cred.login} already has ${MAX_PENDING_CONFIRMATIONS} writes waiting for a decision; nothing was written`);
+    }
+    const c = await openConfirmation(this.deps.db, {
+      sessionId: ctx.actor.sessionId, requesterUserId: ctx.actor.requesterUserId, actorUserId: ctx.actor.actorUserId,
+      repo: `${ref.owner}/${ref.repo}`, pr: ref.number, headSha, title: pr.title, author: pr.authorLogin,
+      kind: held.kind, review: held.review, reasons: held.reasons, checks: held.checks, ttlSeconds: ctx.settings.confirmationTtlSeconds,
+    });
+    ctx.acc.confirmationId = c.id;
+    return {
+      status: "confirmation_required", kind: held.kind, confirmation_id: c.id, expires_at: c.expiresAt, reasons: held.reasons,
+      message: `${held.message} They answer it signed in, in their own session: no tool or key of yours can, so do not try.`,
+    };
+  }
+
+  /**
+   * A merge goes through a merge queue where the base branch's rules say so, and this tool has no way into one: it approves and then merges
+   * directly, and the repository refuses that after the approval is already on the pull request. So it is refused here, before anything is
+   * written. Rules that could not be read say nothing either way; the CI gate (`readChecks`) refuses on them before any write.
+   */
+  private async requireNoMergeQueue(ctx: Ctx, ref: PrRef, pr: PrInfo): Promise<void> {
+    if (hasMergeQueueRule(await this.baseRules(ctx, ref, pr))) {
+      throw new Refusal("merge_queue_required", `${pr.baseRef} of ${ref.owner}/${ref.repo} is merged through a merge queue, which this tool cannot use; nothing was approved or merged. Say so, and leave the merge to a person.`);
+    }
+  }
+
+  /** The rules that apply to the base branch, read once per call; null when GitHub would not say (a rate limit is not that, it stops the call). */
+  private async baseRules(ctx: Ctx, ref: PrRef, pr: PrInfo): Promise<unknown> {
+    if (ctx.rules === undefined) {
+      try {
+        ctx.rules = (await ctx.client.get<unknown>(repoPath(ref, `/rules/branches/${encodeURIComponent(pr.baseRef)}`))).json;
+      } catch (err) {
+        if (err instanceof GithubError && err.rateLimited) throw err;
+        ctx.rules = null;
+      }
+    }
+    return ctx.rules;
   }
 
   /**

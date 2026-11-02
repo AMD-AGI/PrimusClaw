@@ -22,7 +22,11 @@ import assert from "node:assert/strict";
 import test, { after, afterEach, beforeEach, describe } from "node:test";
 import { IdentityCredentialRefusedError } from "@claw/utils";
 import { HEAD } from "./support/fake-github.js";
-import { PR, REQUESTER_TOKEN, TOKEN, closeShared, credential, directory, down, expired, reviewEnv, unbound, type ReviewEnv } from "./support/review-env.js";
+import { PR, REQUESTER_TOKEN, TOKEN, closeShared, credential, directory, down, expired, reviewEnv as makeEnv, unbound, type ReviewEnv } from "./support/review-env.js";
+
+/** An environment where the requester is the acting user, so a write goes straight to GitHub: what these tests are about unless they say `delegated()`. */
+const reviewEnv = (env: Record<string, string> = {}, over: Parameters<typeof makeEnv>[1] = {}): Promise<ReviewEnv> =>
+  makeEnv(env, { ...over, actor: { requesterUserId: "u-bob", ...over.actor } });
 
 let e: ReviewEnv;
 beforeEach(async () => { e = await reviewEnv(); });
@@ -32,6 +36,8 @@ after(closeShared);
 const get = () => e.service.getPr(e.actor, { pr: PR });
 const submit = (over: Record<string, unknown> = {}) => e.service.submitReview(e.actor, { pr: PR, head_sha: HEAD, event: "COMMENT", body: "Looks fine.", ...over });
 const merge = (over: Record<string, unknown> = {}) => e.service.mergePr(e.actor, { pr: PR, head_sha: HEAD, ...over });
+/** The requester is someone else (`u-alice`) asking for the acting user's account: nothing is written until the acting user confirms it. */
+const delegated = () => { e.actor = { ...e.actor, requesterUserId: "u-alice" }; };
 /** The acting user lets others act for them. */
 const allowed = () => { e.identity.answer = directory({ delegation: true }); };
 /** The acting user has not. */
@@ -138,6 +144,7 @@ describe("P which pull requests", () => {
 });
 
 describe("D delegation and permissions", () => {
+  beforeEach(delegated);
   test("D1 when the acting user has not allowed others, every tool is refused, a comment and a read included, and nothing is sent to GitHub with their account", async () => {
     denied();
     for (const event of ["COMMENT", "APPROVE", "REQUEST_CHANGES"]) {
@@ -206,15 +213,18 @@ describe("D delegation and permissions", () => {
     assert.equal(puts().length, 0);
   });
 
-  test("D7 a requester who is not the author can have it approved and merged through the acting user's account, and only the acting user's token reaches GitHub", async () => {
+  test("D7 a requester who is not the author can have it approved and merged through the acting user's account once the acting user confirms it, and only the acting user's token reaches GitHub", async () => {
     e.gh.onReview = (r) => { if (r.event === "APPROVE") e.gh.graphql.mergeStateStatus = "CLEAN"; };
     e.gh.graphql.mergeStateStatus = "BLOCKED";
-    const o = await merge();
-    assert.equal(o.body.status, "merged", o.text);
+    const asked = await merge();
+    assert.equal(asked.body.status, "confirmation_required", asked.text);
+    assert.equal(e.gh.writes.length, 0, "nothing is approved or merged before the acting user says so");
+    const o = await e.service.decide("u-bob", String(asked.body.confirmation_id), "allow");
+    assert.equal(o.body.status, "merged", JSON.stringify(o.body));
     assert.equal(e.gh.writes[0]?.body.event, "APPROVE");
     assert.equal(e.gh.calls.every((c) => c.authorization.includes(TOKEN)), true);
     assert.equal(e.gh.calls.some((c) => c.authorization.includes(REQUESTER_TOKEN)), false);
-    assert.equal(o.text.includes(REQUESTER_TOKEN), false);
+    assert.equal(asked.text.includes(REQUESTER_TOKEN) || JSON.stringify(o.body).includes(REQUESTER_TOKEN), false);
   });
 
   test("D8 a high-risk merge for the requester's own pull request is refused before anyone is asked to confirm it", async () => {
@@ -274,7 +284,7 @@ describe("S reviews", () => {
       { path: "src/app.ts", line: 3, side: "RIGHT", body: "This drops the error." },
       { path: "src/app.ts", line: 2, side: "LEFT", body: "Why was this removed?" },
     ]);
-    assert.match(w[0]?.body.body, /^Looks fine\.\n\n---\nReviewed by Clawy on behalf of bob \(requested by Alice A\), run [0-9a-f]{12}\n<!-- clawy:run:[0-9a-f]{12}:COMMENT:[0-9a-f]{12} -->$/);
+    assert.match(w[0]?.body.body, /^Looks fine\.\n\n---\nReviewed by Claw on behalf of bob \(requested by Alice A\), run [0-9a-f]{12}\n<!-- claw-review:run:[0-9a-f]{12}:COMMENT:[0-9a-f]{12} -->$/);
     assert.doesNotMatch(w[0]?.body.body, /[\u{1F300}-\u{1FAFF}]/u);
   });
 
@@ -302,12 +312,12 @@ describe("S reviews", () => {
   });
 
   test("S5 the requester's name in the footer cannot break out of it", async () => {
-    e = await reviewEnv({}, { actor: { requesterLabel: "Mallory\n\n<!-- clawy:run:x -->`" } });
+    e = await reviewEnv({}, { actor: { requesterLabel: "Mallory\n\n<!-- claw-review:run:x -->`" } });
     await submit();
     const body = String(e.gh.writes[0]?.body.body);
     assert.equal(body.split("\n").filter((l) => l.startsWith("Reviewed by")).length, 1);
     // Only the tool's own marker survives: the name had its brackets and backtick taken out.
-    assert.equal(body.match(/<!-- clawy:run:/g)?.length, 1);
+    assert.equal(body.match(/<!-- claw-review:run:/g)?.length, 1);
     assert.doesNotMatch(body.split("\n").find((l) => l.startsWith("Reviewed by")) ?? "", /<|>|`/);
   });
 });
@@ -341,7 +351,7 @@ describe("S2 one review is not another of the same kind", () => {
         assert.equal(posted() - before, 2, `${name} ${event}`);
         // What GitHub got for the second is what the model sent, in full.
         const last = e.gh.reviews[e.gh.reviews.length - 1] as any;
-        assert.match(String(last.body), /<!-- clawy:run:[0-9a-f]{12}:[A-Z_]+:[0-9a-f]{12} -->$/, name);
+        assert.match(String(last.body), /<!-- claw-review:run:[0-9a-f]{12}:[A-Z_]+:[0-9a-f]{12} -->$/, name);
       }
     }
   });
@@ -618,7 +628,7 @@ describe("M4 what the change does, and the reviewer's judgement of it", () => {
     assert.equal(get.raised_by_reviewer, false);
     assert.deepEqual(get.categories, ["interface"]);
     assert.match(get.reasons.join(), /HTTP route POST \/v1\/orders/);
-    assert.equal(get.rule_pack, "2026-10-31.1");
+    assert.equal(get.rule_pack, "2026-11-02.1");
     const risk = (await e.service.assessPr(e.actor, { pr: PR })).body.risk as any;
     assert.deepEqual(risk, get);
   });
@@ -763,6 +773,7 @@ describe("M4 a change the diff does not show, and a lock file", () => {
 
 describe("C high risk waits for the acting user", () => {
   beforeEach(() => {
+    delegated();
     allowed();
     e.gh.files = [{ filename: ".github/workflows/ci.yml", status: "modified", additions: 2, deletions: 0, patch: "@@ -1,2 +1,4 @@\n a\n+b\n+c\n d" }];
     e.gh.pr.changed_files = 1;
@@ -1003,7 +1014,7 @@ describe("W dry run, limits and the budget", () => {
     e.gh.pr.head = { ...e.gh.pr.head, sha: headFor(2) };
     assert.equal((await submit({ head_sha: headFor(2), event: "REQUEST_CHANGES", body: "second half" })).body.status, "submitted");
     // Another account, but the deployment's own ceiling.
-    e.actor = { ...e.actor, sessionId: "s-2", actorUserId: "u-carol" };
+    e.actor = { ...e.actor, sessionId: "s-2", requesterUserId: "u-carol", actorUserId: "u-carol" };
     e.gh.pr.head = { ...e.gh.pr.head, sha: headFor(4) };
     assert.equal((await submit({ head_sha: headFor(4) })).body.status, "submitted");
     e.actor = { ...e.actor, sessionId: "s-3" };
@@ -1080,6 +1091,7 @@ describe("W dry run, limits and the budget", () => {
 });
 
 describe("I the identity provider and the audit trail", () => {
+  beforeEach(delegated);
   test("I1 a user who has not bound GitHub, an expired authorization and an identity outage each stop the call before GitHub is asked, with different words", async () => {
     const seen = new Set<string>();
     for (const [answer, code] of [[unbound, "actor_not_bound"], [expired, "credential_expired"], [down, "identity_unavailable"]] as const) {
@@ -1117,11 +1129,20 @@ describe("I the identity provider and the audit trail", () => {
 
   test("I3 every call leaves an audit row: who, for whom, what, which commit, how many GitHub requests and their ids, the risk, the result", async () => {
     allowed();
-    await submit({ comments: [{ path: "src/app.ts", line: 3, body: "x" }] });
+    const held = await submit({ comments: [{ path: "src/app.ts", line: 3, body: "x" }] });
+    const id = String(held.body.confirmation_id);
+    assert.equal((await e.service.decide("u-bob", id, "allow")).body.status, "submitted");
     await merge().catch(() => undefined);
     const rows = await e.sql("SELECT * FROM claw_github_audit ORDER BY id");
-    assert.deepEqual(rows.map((r) => r.tool), ["gh_review_submit", "gh_pr_merge"]);
-    const r = rows[0] as Record<string, any>;
+    assert.deepEqual(rows.map((r) => r.tool), ["gh_review_submit", "gh_review_submit", "gh_pr_merge"]);
+    const [asked, posted, merging] = rows as Array<Record<string, any>>;
+    // The call that held the review wrote nothing and says which confirmation it opened.
+    assert.equal(asked?.write, false);
+    assert.equal(asked?.confirmation_id, id);
+    assert.equal(asked?.detail, "confirmation_required");
+    assert.equal(merging?.write, false);
+    // The one the acting user allowed is the write.
+    const r = posted as Record<string, any>;
     assert.equal(r.requester_user_id, "u-alice");
     assert.equal(r.actor_user_id, "u-bob");
     assert.equal(r.session_id, "s-1");
@@ -1130,10 +1151,11 @@ describe("I the identity provider and the audit trail", () => {
     assert.equal(r.head_sha, HEAD);
     assert.equal(r.write, true);
     assert.equal(r.result, "ok");
+    assert.equal(r.confirmation_id, id);
     assert.equal(r.github_requests >= 3, true);
     assert.equal(Array.isArray(r.github_request_ids) && r.github_request_ids.length > 0, true);
-    assert.deepEqual(r.arguments.comments, "[1 items]");
-    assert.equal(r.arguments.body, "[11 characters]");
+    assert.deepEqual(asked?.arguments.comments, "[1 items]");
+    assert.equal(asked?.arguments.body, "[11 characters]");
   });
 
   test("I4 refusals are audited with their reason", async () => {

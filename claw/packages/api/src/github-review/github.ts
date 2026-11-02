@@ -76,10 +76,15 @@ export function parsePrRef(input: unknown): PrRef | null {
     if (!m) return null;
     [, owner, repo, num] = m;
   }
-  if (!owner || !repo || !num || !OWNER_RE.test(owner) || !REPO_RE.test(repo) || repo === "." || repo === "..") return null;
-  const n = Number(num);
-  if (!Number.isSafeInteger(n) || n < 1) return null;
-  return { owner, repo, number: n };
+  if (!owner || !repo || !num) return null;
+  const ref: PrRef = { owner, repo, number: Number(num) };
+  return isValidPrRef(ref) ? ref : null;
+}
+
+/** Whether every part of a reference is something a request path may be built from: the one check that `parsePrRef` and a session's bound target share. */
+export function isValidPrRef(ref: PrRef): boolean {
+  return OWNER_RE.test(ref.owner) && REPO_RE.test(ref.repo) && ref.repo !== "." && ref.repo !== ".."
+    && Number.isSafeInteger(ref.number) && ref.number >= 1 && ref.number <= 999_999_999;
 }
 
 async function readCapped(resp: Response, maxBytes: number): Promise<string> {
