@@ -13,6 +13,7 @@ import {
 import { SAFE_API_URL } from "../config.js";
 import { getUser, internalTokenAuth as internalAuth } from "../auth/middleware.js";
 import { canWriteSessionAsOperator } from "../auth/models.js";
+import { actingTurnRefusalFor } from "../github-review/acting-turns.js";
 import { collectSandboxInventory } from "./sandbox-inventory.js";
 import { handsRouteHeaders, sessionIdFromHandsKey } from "@claw/protocol";
 import { listDagHandles } from "../infra/dag-handles.js";
@@ -176,6 +177,9 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     if (!canWriteSessionAsOperator(session.user_id, user)) {
       return reply.status(403).send({ ok: false, error: "forbidden" });
     }
+    // In a session that acts as a user an approval is the person's say, not something the key a sandbox holds may give itself.
+    const unattended = await actingTurnRefusalFor(req, sessionId);
+    if (unattended) return reply.status(403).send({ ok: false, error: unattended });
 
     const body = req.body as Record<string, unknown>;
     const decision = (body.decision as string) || "";
@@ -215,6 +219,9 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     if (!canWriteSessionAsOperator(session.user_id, user)) {
       return reply.status(403).send({ ok: false, error: "forbidden" });
     }
+    // The answer to a question the model asked is the person's say in a session that acts as a user, like an approval.
+    const unattended = await actingTurnRefusalFor(req, sessionId);
+    if (unattended) return reply.status(403).send({ ok: false, error: unattended });
 
     const body = req.body as Record<string, unknown>;
     const actionId = (body.actionId as string) || (body.action_id as string) || "";
