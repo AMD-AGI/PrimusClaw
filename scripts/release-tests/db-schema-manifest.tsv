@@ -14,6 +14,7 @@ table	claw_pending_messages	user_env
 table	claw_pending_messages	platform_key
 table	claw_pending_messages	llm_api_key
 table	claw_pending_messages	workspace_id
+table	claw_pending_messages	dedupe_key
 table	claw_memory_entries	content_tsv
 table	claw_skills	inject_count
 table	claw_skill_files	skill_id
@@ -47,6 +48,7 @@ index	idx_tasks_status_waiting	-
 index	idx_tasks_status_active	-
 index	idx_tasks_session	-
 index	idx_pending_session	-
+index	uq_pending_session_dedupe	-
 index	idx_sessions_user	-
 index	idx_sessions_parent	-
 index	uq_edges_from_to	-
