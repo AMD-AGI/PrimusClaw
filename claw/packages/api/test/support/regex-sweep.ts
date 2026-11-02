@@ -227,16 +227,49 @@ export function sampleStrings(source: string, count = 12): string[] {
 const kindOf = (c: string): string => (/\w/.test(c) ? "w" : /\s/.test(c) ? "s" : c);
 
 /**
+ * The lines made of one opening of a sample string said over and over (`#[arg(#[arg(#[arg(` ...), each `length` characters long: the
+ * first 1 to 40 characters of a sample, alone and with a space after, with and without a character that fails the match at the end.
+ * A pattern that scans on from its opening to the end of the line (`#\[arg\([^\]]*long`) starts again at every copy of the opening and reads
+ * the rest of the line each time, so it costs the square of the line however short the run of one character it can divide is; a run of
+ * one character pushed in (`worstCost` below) never says its opening twice and does not find that.
+ */
+function repeatedOpenings(samples: string[], length: number): string[] {
+  const units = new Set<string>();
+  for (const s of samples) {
+    for (let end = 1; end <= Math.min(s.length, 40); end++) { units.add(s.slice(0, end)); units.add(`${s.slice(0, end)} `); }
+  }
+  const lines: string[] = [];
+  for (const unit of units) {
+    const line = unit.repeat(Math.ceil(length / unit.length)).slice(0, length);
+    lines.push(line, `${line.slice(0, length - 1)}!`);
+  }
+  return lines;
+}
+
+/**
  * The most one `exec` of the pattern cost, in milliseconds, over the sample strings each with a run of `length` characters pushed in where
- * the kind of character changes, and with a character that fails the match after the run. Each slow line is timed again and the fastest of
- * the runs counts, so one pause of the process is not a slow pattern. With `stopAboveMs` it stops at the first line over that, which is how a
- * pattern that is known to be slow is shown to be without waiting for it on every line.
+ * the kind of character changes, and with a character that fails the match after the run, and over lines that say one opening of a sample
+ * over and over (`repeatedOpenings`). Each slow line is timed again and the fastest of the runs counts, so one pause of the process is not
+ * a slow pattern. With `stopAboveMs` it stops at the first line over that, which is how a pattern that is known to be slow is shown to be
+ * without waiting for it on every line.
  */
 export function worstCost(source: string, flags: string, length: number, stopAboveMs = Infinity): { ms: number; line: string } {
   const re = new RegExp(source, flags.replace(/[gy]/g, ""));
   let worst = { ms: 0, line: "" };
   const time = (line: string): number => { const t0 = performance.now(); re.exec(line); return performance.now() - t0; };
-  for (const s of sampleStrings(source)) {
+  const samples = sampleStrings(source);
+  const slowest = (line: string, what: string): boolean => {
+    let ms = time(line);
+    if (ms > worst.ms) {
+      ms = Math.min(ms, time(line), time(line));
+      if (ms > worst.ms) worst = { ms, line: what };
+    }
+    return worst.ms > stopAboveMs;
+  };
+  for (const line of repeatedOpenings(samples, length)) {
+    if (slowest(line, `${JSON.stringify(line.slice(0, 24))}... (an opening said over and over, ${length} characters)`)) return worst;
+  }
+  for (const s of samples) {
     // The places to push a run in: both ends, and wherever the kind of character changes.
     const cuts = Array.from({ length: s.length + 1 }, (_, k) => k).filter((k) => k === 0 || k === s.length || kindOf(s[k - 1] as string) !== kindOf(s[k] as string));
     for (const k of cuts) {
@@ -246,12 +279,7 @@ export function worstCost(source: string, flags: string, length: number, stopAbo
         const run = filler.repeat(Math.ceil(room / filler.length)).slice(0, room);
         const pushed = s.slice(0, k) + run + s.slice(k);
         for (const line of [pushed, `${pushed.slice(0, length - 1)}!`]) {
-          let ms = time(line);
-          if (ms > worst.ms) {
-            ms = Math.min(ms, time(line), time(line));
-            if (ms > worst.ms) worst = { ms, line: `${JSON.stringify(s)} with ${JSON.stringify(filler)} x ${run.length} at ${k}` };
-            if (worst.ms > stopAboveMs) return worst;
-          }
+          if (slowest(line, `${JSON.stringify(s)} with ${JSON.stringify(filler)} x ${run.length} at ${k}`)) return worst;
         }
       }
     }

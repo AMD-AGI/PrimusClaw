@@ -266,13 +266,45 @@ const ENV_EXAMPLE = /(^|\/)\.env\.(example|sample|template|dist)$/i;
 
 /** An HTTP route as a framework registers it. The path must be a literal that starts with `/` (or `*`), so `map.get("key")` is not one. */
 const ROUTES: Array<[RegExp, (m: RegExpExecArray) => string]> = [
-  [/(?<![\w$])(?:(?:r|e|g)|\w*(?:app|App|router|Router|fastify|server|Server|mux|Mux|routes?|Routes?|group|Group))\.(get|post|put|patch|delete|options|head|all|route|GET|POST|PUT|PATCH|DELETE|Any)\s*(?:<[^>]*>)?\(\s*[`'"]((?:\/|\*)[^`'"]*)[`'"]/, (m) => `${(m[1] as string).toUpperCase()} ${m[2]}`],
   [/@\w+\.(get|post|put|patch|delete|route|api_route|websocket)\(\s*['"]((?:\/|\*)[^'"]*)['"]/i, (m) => `${(m[1] as string).toUpperCase()} ${m[2]}`],
   [/@(Get|Post|Put|Patch|Delete|Request)Mapping\b(?:\(\s*(?:value\s*=\s*)?"([^"]*)")?/, (m) => `${(m[1] as string).toUpperCase()} ${m[2] ?? ""}`.trim()],
   [/\b(?:http|mux|router|r|e|g|app)\.(?:HandleFunc|Handle)\(\s*"([^"]+)"/, (m) => `${m[1]}`],
   [/\.(?:Methods)\(\s*"(GET|POST|PUT|PATCH|DELETE)"/, (m) => `${m[1]}`],
   [/\b(?:path|re_path|url)\(\s*r?['"]([^'"]*)['"]\s*,/, (m) => `${m[1]}`],
 ];
+
+/**
+ * The route of an object that is called like a router, with type arguments or without (`app.get("/x")`, `fastify.get<{ Params: P }>("/x")`).
+ * One pattern read this whole as one, and its `(?:<[^>]*>)?` read on to the first `>` from every `app.get<` on the line, which is the square
+ * of the line when none of them is closed. Here the head is found first (the owner, the method, and a `<` or a `(` after them), and the first
+ * `>` after a `<` is looked for once: it is the same for every head before it, and if there is none, there is none for any `<` after it.
+ */
+const ROUTE_HEAD = /(?<![\w$])(?:(?:r|e|g)|\w*(?:app|App|router|Router|fastify|server|Server|mux|Mux|routes?|Routes?|group|Group))\.(get|post|put|patch|delete|options|head|all|route|GET|POST|PUT|PATCH|DELETE|Any)\s*(?=[<(])/g;
+const ROUTE_PATH = /\(\s*[`'"]((?:\/|\*)[^`'"]*)[`'"]/y;
+function typedRoute(text: string): string | null {
+  let close = -2; // the first `>` after the last `<` that was asked about; -1 when there is none
+  ROUTE_HEAD.lastIndex = 0;
+  for (let head = ROUTE_HEAD.exec(text); head !== null; ROUTE_HEAD.lastIndex = head.index + 1, head = ROUTE_HEAD.exec(text)) {
+    let at = head.index + head[0].length;
+    if (text[at] === "<") {
+      if (close !== -1 && close < at) close = text.indexOf(">", at + 1);
+      if (close === -1) continue;
+      at = close + 1;
+    }
+    ROUTE_PATH.lastIndex = at;
+    const path = ROUTE_PATH.exec(text);
+    if (path) return `${(head[1] as string).toUpperCase()} ${path[1]}`;
+  }
+  return null;
+}
+
+/** The HTTP route a line registers, by the first pattern that reads one. */
+function routeOf(text: string): string | null {
+  const typed = typedRoute(text);
+  if (typed !== null) return typed;
+  for (const [re, name] of ROUTES) { const m = re.exec(text); if (m) return name(m); }
+  return null;
+}
 
 const CLI_FLAGS: Array<[RegExp, (m: RegExpExecArray) => string]> = [
   [/\.(?:option|requiredOption|addOption|command)\(\s*['"`](-{0,2}[\w-]+)/, (m) => `${m[1]}`],
@@ -281,8 +313,29 @@ const CLI_FLAGS: Array<[RegExp, (m: RegExpExecArray) => string]> = [
   [/\.(?:add_argument|add_option)\(\s*['"](-{1,2}[\w-]+)/, (m) => `${m[1]}`],
   [/@click\.(?:option|argument)\(\s*['"](-{0,2}[\w-]+)/, (m) => `${m[1]}`],
   [/\bArg::new\(\s*"([\w-]+)"/, (m) => `--${m[1]}`],
-  [/#\[(?:arg|clap)\([^\]]*\blong\b(?:\s*=\s*"([\w-]+)")?/, (m) => `--${m[1] ?? "(from the field name)"}`],
 ];
+
+/**
+ * A Rust attribute that names a long flag (`#[arg(short, long = "output")]`): the first attribute, from the left, that says `long` before its
+ * own `]`, and the last `long` in it gives the name. The attribute is cut at its `]` first, and the search for the next one goes on from there,
+ * because a pattern that reads `[^\]]*` on from every `#[arg(` on a line reads the rest of the line once per copy, which is the square of it,
+ * and a `long` that is not in an attribute is not in one that opens inside it either.
+ */
+const CLAP_ATTRIBUTE = /#\[(?:arg|clap)\(([^\]]*)/g;
+const CLAP_LONG = /^[^\]]*\blong\b(?:\s*=\s*"([\w-]+)")?/;
+function clapFlag(text: string): string | null {
+  for (const attribute of text.matchAll(CLAP_ATTRIBUTE)) {
+    const long = CLAP_LONG.exec(attribute[1] as string);
+    if (long) return `--${long[1] ?? "(from the field name)"}`;
+  }
+  return null;
+}
+
+/** The command-line flag a line declares, by the first pattern that reads one: the name as it is written (`-v`, `--out`). */
+function cliFlag(text: string): string | null {
+  for (const [re, name] of CLI_FLAGS) { const m = re.exec(text); if (m) return name(m); }
+  return clapFlag(text);
+}
 
 /** Where a program reads its environment. */
 const ENV_READS: RegExp[] = [
@@ -451,8 +504,10 @@ function interfaceFindings(files: RiskFile[], net: Net, touched: Set<string>): F
   const secretEnvs: Record<string, string[]> = {};
   const ddl = new Set<string>();
   for (const l of sourceLines([...net.added, ...net.removed])) {
-    for (const [re, name] of ROUTES) { const m = re.exec(l.text); if (m) { (routes[l.path] ??= []).push(name(m)); break; } }
-    for (const [re, name] of CLI_FLAGS) { const m = re.exec(l.text); if (m) { (flags[l.path] ??= []).push(name(m)); break; } }
+    const route = routeOf(l.text);
+    if (route !== null) (routes[l.path] ??= []).push(route);
+    const flag = cliFlag(l.text);
+    if (flag !== null) (flags[l.path] ??= []).push(flag);
     for (const re of ENV_READS) {
       const m = re.exec(l.text);
       if (m) { const n = m[1] as string; (envs[l.path] ??= []).push(n); if (SECRET_ENV_NAME.test(n)) (secretEnvs[l.path] ??= []).push(n); break; }
@@ -575,8 +630,24 @@ function architectureFindings(files: RiskFile[], net: Net): Finding[] {
 
 // ------------------------------------------------------------------ security-sensitive code
 
+/**
+ * A comment that switches a security check off. `nolint:` and `eslint-disable` name the checker later on the line (`nolint:errcheck,gosec`,
+ * `eslint-disable-next-line security/detect-eval`), and a pattern that reads on to the end of the line from every copy of one of them
+ * (`nolint:[^\n]*gosec`) reads the rest of the line once per copy, which is the square of it. The marker is found once, at its first place, and
+ * the rest of the line is read once: a later copy has less of the line left to name the checker in, so the first is the one to ask. (A line
+ * has no line feed in it: patches are split on them.)
+ */
+const SUPPRESSION_MARKER = /#nosec|\bnosec\b|checkov:skip|trivy:ignore|NOSONAR|pragma:\s*allowlist|noqa:\s*S\d|lgtm\[|codeql\[/i;
+const namesLater = (text: string, marker: RegExp, checker: RegExp): boolean => {
+  const at = marker.exec(text);
+  return at !== null && checker.test(text.slice(at.index + at[0].length));
+};
+const SECURITY_SUPPRESSED = {
+  test: (text: string): boolean => SUPPRESSION_MARKER.test(text) || namesLater(text, /nolint:/i, /gosec/i) || namesLater(text, /eslint-disable/i, /security/i),
+};
+
 /** Code that decides who may do what, or protects what is kept secret. A match is a reason to look, not a finding. */
-const SECURITY_CODE: Array<[RegExp, string]> = [
+const SECURITY_CODE: Array<[{ test(text: string): boolean }, string]> = [
   [/(?:^|[^a-z])(?:jwt|jws|jwk|oauth2?|oidc|saml|openid|bearer)(?:[^a-z]|$)|jsonwebtoken|verifyJwt/i, "token or sign-in handling"],
   [/\b(?:createHash|createHmac|createCipher(?:iv)?|createDecipher(?:iv)?|createSign|createVerify|randomBytes|randomFillSync|generateKeyPair(?:Sync)?|timingSafeEqual|constantTimeEquals|scrypt|pbkdf2|bcrypt|argon2|hkdf|webcrypto)\b|\bcrypto\.|\bhashlib\.|\bhmac\.|\bcrypto\/(?:aes|cipher|hmac|rand|rsa|sha256|tls|x509)\b|\b(?:AES|RSA|ECDSA|Ed25519|ChaCha20|HMAC)\b/, "cryptography"],
   [/\b(?:isAdmin|isSystemAdmin|hasRole|hasPermission|checkPermission|authori[sz]\w*|authenticat\w*|requireAuth\w*|requireRole|rbac|acl|ClusterRole(?:Binding)?|RoleBinding|allowedRoles|permissions?|privileges?|isAnonymous\w*|ANONYMOUS_\w+|skipAuth|noAuth)\b/i, "authorization or permission logic"],
@@ -584,7 +655,7 @@ const SECURITY_CODE: Array<[RegExp, string]> = [
   [/\b(?:secretKeyRef|secretRef|SecretStore|ExternalSecret|getSecret|readSecret|decrypt\w*|encrypt\w*|passw(?:or)?d|passphrase|api[_-]?key|private[_-]?key|client[_-]?secret|access[_-]?key|credentials?)\b/i, "secret or credential handling"],
   [/\b(?:cors|csrf|xsrf|helmet|trustProxy)\b|Access-Control-Allow-\w+|Content-Security-Policy|\bSameSite\b|\bHttpOnly\b|X-Forwarded-For/i, "web security settings"],
   [/(?<![.\w])(?:exec|execSync|execFile|spawn|spawnSync)\(|child_process|\bos\.system\(|\bsubprocess\.|shell\s*:\s*true|(?<![.\w])eval\(|new Function\(|innerHTML|dangerouslySetInnerHTML|pickle\.loads|\bvm\.run\w+|\/\/\s*go:generate\b/, "code execution or injection surface"],
-  [/#nosec|\bnosec\b|checkov:skip|trivy:ignore|NOSONAR|pragma:\s*allowlist|nolint:[^\n]*gosec|noqa:\s*S\d|lgtm\[|codeql\[|eslint-disable[^\n]*security/i, "a security check suppressed"],
+  [SECURITY_SUPPRESSED, "a security check suppressed"],
 ];
 
 function securityFindings(net: Net): Finding[] {
