@@ -282,7 +282,13 @@ describe("assistant outbound", { skip }, () => {
 
     test("is a hard cap under concurrent says", async () => {
       const limited = deps({ maxPerHour: 3 });
-      const results = await Promise.allSettled(Array.from({ length: 8 }, (_, i) => say(`burst ${i}`, {}, limited)));
+      // Hold every transaction open until all eight are, so each of them reaches the count before any has written.
+      const burst = 8;
+      let open = 0;
+      let release!: () => void;
+      const allOpen = new Promise<void>((r) => { release = r; });
+      const barrier = async () => { open += 1; if (open === burst) release(); await allOpen; };
+      const results = await Promise.allSettled(Array.from({ length: burst }, (_, i) => say(`burst ${i}`, { guard: barrier }, limited)));
       assert.equal(results.filter((r) => r.status === "fulfilled").length, 3);
       assert.ok(results.filter((r) => r.status === "rejected").every((r) => (r as PromiseRejectedResult).reason.code === "say_rate_limited"));
       assert.equal((await saysRows()).length, 3);
@@ -342,7 +348,7 @@ describe("assistant outbound", { skip }, () => {
       assert.equal((await saysRows())[0].delivered_at.getTime(), first.getTime());
     });
 
-    test("a kick while delivery runs goes round again for what was written after its claim, and sends never overlap", async () => {
+    test("a kick while delivery runs goes round again for what was written after its claim, and sends never overlap", { timeout: 10_000 }, async () => {
       await subscribe();
       let release!: () => void;
       const gate = new Promise<void>((r) => { release = r; });
@@ -359,11 +365,17 @@ describe("assistant outbound", { skip }, () => {
       };
       const slowDeps = () => deps({ kick: () => { const p = outbox.kickDelivery({ transport: slow, resolve: pub, allowedHosts: new Set() }); kicks.push(p); return p; } });
 
+      // A say returns while the receiver still holds the first send: a model's tool call does not wait for a webhook.
+      // The valve lets a say that does wait come back, so that fails the assertion instead of hanging the file.
+      let valved = false;
+      const valve = setTimeout(() => { valved = true; release(); }, 1500);
       await say("one", {}, slowDeps());
+      assert.equal(valved, false, "the say waited for the receiver");
       await until("the first send", () => sends === 1);
       await say("two", {}, slowDeps());
       await sleep(50);
       assert.equal(sends, 1, "the second send waits for the first");
+      clearTimeout(valve);
       release();
       await settle();
       assert.equal(sends, 2);
