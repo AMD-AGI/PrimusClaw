@@ -39,11 +39,67 @@ const (
 
 // OwnerQuota is the per-owner cap for sandboxes created with an identity key.
 // MaxSandboxes and MaxGPUs of -1 are unlimited. MaxSandboxSeconds of 0 is unlimited.
-// Owner records carry no GPU-hour budget.
+// Owner records carry no GPU-hour budget. A field left out of the policy JSON
+// takes its value from a base quota: the built-in quota for default and admin,
+// and the default or admin quota of the user for an owners entry.
 type OwnerQuota struct {
 	MaxSandboxes      int32 `json:"maxSandboxes"`
 	MaxGPUs           int32 `json:"maxGpus"`
 	MaxSandboxSeconds int64 `json:"maxSandboxSeconds"`
+	absent            quotaFields
+}
+
+// quotaFields is a set of OwnerQuota fields.
+type quotaFields uint8
+
+const (
+	quotaSandboxes quotaFields = 1 << iota
+	quotaGPUs
+	quotaSeconds
+)
+
+// UnmarshalJSON decodes a quota and records the fields that are absent.
+func (q *OwnerQuota) UnmarshalJSON(b []byte) error {
+	var raw struct {
+		MaxSandboxes      *int32 `json:"maxSandboxes"`
+		MaxGPUs           *int32 `json:"maxGpus"`
+		MaxSandboxSeconds *int64 `json:"maxSandboxSeconds"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	*q = OwnerQuota{}
+	if raw.MaxSandboxes != nil {
+		q.MaxSandboxes = *raw.MaxSandboxes
+	} else {
+		q.absent |= quotaSandboxes
+	}
+	if raw.MaxGPUs != nil {
+		q.MaxGPUs = *raw.MaxGPUs
+	} else {
+		q.absent |= quotaGPUs
+	}
+	if raw.MaxSandboxSeconds != nil {
+		q.MaxSandboxSeconds = *raw.MaxSandboxSeconds
+	} else {
+		q.absent |= quotaSeconds
+	}
+	return nil
+}
+
+// over returns q with its absent fields taken from base.
+func (q OwnerQuota) over(base OwnerQuota) OwnerQuota {
+	out := OwnerQuota{MaxSandboxes: q.MaxSandboxes, MaxGPUs: q.MaxGPUs, MaxSandboxSeconds: q.MaxSandboxSeconds}
+	if q.absent&quotaSandboxes != 0 {
+		out.MaxSandboxes = base.MaxSandboxes
+	}
+	if q.absent&quotaGPUs != 0 {
+		out.MaxGPUs = base.MaxGPUs
+	}
+	if q.absent&quotaSeconds != 0 {
+		out.MaxSandboxSeconds = base.MaxSandboxSeconds
+	}
+	return out
 }
 
 // Built-in quotas used when the policy omits default or admin.
@@ -54,7 +110,7 @@ var (
 
 // OwnerPolicy is the quota and template set for identity keys.
 // Default applies to users and Admin to system-admin. Owners maps a user id to a
-// quota that replaces both.
+// quota that replaces both; its absent fields come from the quota of the user's role.
 type OwnerPolicy struct {
 	Role      string                `json:"role"`
 	Templates []TemplateRequest     `json:"templates"`
@@ -115,10 +171,10 @@ func (s *Service) SetOwnerPolicy(ctx context.Context, p OwnerPolicy) error {
 	}
 	quota, admin := defaultUserQuota, defaultAdminQuota
 	if p.Default != nil {
-		quota = *p.Default
+		quota = p.Default.over(defaultUserQuota)
 	}
 	if p.Admin != nil {
-		admin = *p.Admin
+		admin = p.Admin.over(defaultAdminQuota)
 	}
 	if !validQuota(quota) || !validQuota(admin) {
 		return opErr(http.StatusBadRequest, "invalid_owner_policy", "default or admin quota is invalid")
@@ -186,7 +242,7 @@ func OwnerGrantName(userID string) string {
 func (s *Service) EnsureOwner(ctx context.Context, userID, userName string, admin bool) (string, error) {
 	cfg := s.owner.Load()
 	if cfg == nil {
-		return "", opErr(http.StatusForbidden, "owner_keys_disabled", "identity keys are not enabled")
+		return "", opErr(http.StatusServiceUnavailable, "identity_unavailable", "owner policy is not applied")
 	}
 	if userID == "" {
 		return "", opErr(http.StatusUnauthorized, "invalid_key", "key has no subject")
@@ -218,7 +274,7 @@ func (s *Service) EnsureOwner(ctx context.Context, userID, userName string, admi
 // It returns "" when the record does not exist.
 func (s *Service) OwnerRecord(ctx context.Context, userID string) (string, error) {
 	if s.owner.Load() == nil {
-		return "", opErr(http.StatusForbidden, "owner_keys_disabled", "identity keys are not enabled")
+		return "", opErr(http.StatusServiceUnavailable, "identity_unavailable", "owner policy is not applied")
 	}
 	if userID == "" {
 		return "", opErr(http.StatusUnauthorized, "invalid_key", "key has no subject")
@@ -239,13 +295,14 @@ func (s *Service) OwnerRecord(ctx context.Context, userID string) (string, error
 
 // spec builds the owner record spec for userID from the policy.
 // A per-owner quota wins over the admin quota, which wins over the default.
+// Fields absent from the per-owner quota come from the admin or default quota.
 func (c *ownerConfig) spec(userID, userName string, admin bool, now time.Time) runtimev1alpha1.SandboxGrantSpec {
 	q := c.quota
 	if admin {
 		q = c.admin
 	}
 	if o, ok := c.owners[userID]; ok {
-		q = o
+		q = o.over(q)
 	}
 	templates := make([]runtimev1alpha1.GrantTemplate, len(c.templates))
 	for i := range c.templates {
@@ -326,8 +383,10 @@ func ownerSpecMatches(got, want runtimev1alpha1.SandboxGrantSpec) bool {
 		sameTemplates(got.Templates, want.Templates)
 }
 
-// upsertOwnerTemplates creates or updates the CodeInterpreters of the owner policy.
+// upsertOwnerTemplates creates or updates the CodeInterpreters of the owner policy
+// and deletes the owner CodeInterpreters the policy no longer lists.
 func (s *Service) upsertOwnerTemplates(ctx context.Context, templates []runtimev1alpha1.GrantTemplate) error {
+	wanted := map[string]bool{}
 	for _, tpl := range templates {
 		base, ok, err := templateFromSpec(tpl.Spec)
 		if err != nil {
@@ -337,6 +396,7 @@ func (s *Service) upsertOwnerTemplates(ctx context.Context, templates []runtimev
 			continue
 		}
 		for i, name := range expandOne(ownerAppRunID, TemplateRequest{Name: tpl.Name, PerGPUCount: tpl.PerGPUCount}) {
+			wanted[name] = true
 			want := codeInterpreter(ownerTemplatesID, name, base, templateGPUCount(tpl, i), s.namespace)
 			existing := &runtimev1alpha1.CodeInterpreter{}
 			err := s.reader.Get(ctx, types.NamespacedName{Name: name, Namespace: s.namespace}, existing)
@@ -360,31 +420,64 @@ func (s *Service) upsertOwnerTemplates(ctx context.Context, templates []runtimev
 			}
 		}
 	}
+	return s.deleteDroppedOwnerTemplates(ctx, wanted)
+}
+
+// deleteDroppedOwnerTemplates deletes owner CodeInterpreters whose names are not in wanted.
+func (s *Service) deleteDroppedOwnerTemplates(ctx context.Context, wanted map[string]bool) error {
+	var list runtimev1alpha1.CodeInterpreterList
+	if err := s.reader.List(ctx, &list, ctrlclient.InNamespace(s.namespace), ctrlclient.MatchingLabels{grantIDKey: ownerTemplatesID}); err != nil {
+		return opWrap(http.StatusInternalServerError, "template_list_failed", "", err)
+	}
+	for i := range list.Items {
+		ci := &list.Items[i]
+		if wanted[ci.Name] || !ownedByGrant(ci, ownerTemplatesID) {
+			continue
+		}
+		if err := s.client.Delete(ctx, ci); err != nil && !apierrors.IsNotFound(err) {
+			return opWrap(http.StatusInternalServerError, "template_delete_failed", ci.Name, err)
+		}
+	}
 	return nil
 }
 
-// IsSystemAdmin reports whether the SaFE User of userID has the system-admin role.
-// A missing or unreadable User is not an admin.
-func (s *Service) IsSystemAdmin(ctx context.Context, userID string) bool {
-	checker, ok := s.membership.(AdminChecker)
+// ReadOwnerUser reads the SaFE User of userID once. It returns nil when the
+// membership checker cannot read users. A read error is returned unchanged.
+func (s *Service) ReadOwnerUser(ctx context.Context, userID string) (*OwnerUser, error) {
+	reader, ok := s.membership.(UserReader)
 	if !ok || userID == "" {
-		return false
+		return nil, nil
 	}
-	admin, err := checker.IsSystemAdmin(ctx, userID)
-	return err == nil && admin
-}
-
-// WorkspaceLister returns the workspaces listed on a user.
-type WorkspaceLister interface {
-	Workspaces(ctx context.Context, userID string) ([]string, error)
+	u, err := reader.ReadUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
 }
 
 // OwnerWorkspace picks the workspace for an identity-key sandbox. A requested
-// workspace must pass the membership check unless admin is set. Without a request,
-// the user's only listed workspace is used.
-func (s *Service) OwnerWorkspace(ctx context.Context, userID, requested string, admin bool) (string, error) {
+// workspace must be listed on the User unless admin is set. Without a request,
+// the user's only listed workspace is used. user is the User read earlier in the
+// request, or nil to read it here.
+func (s *Service) OwnerWorkspace(ctx context.Context, userID, requested string, admin bool, user *OwnerUser) (string, error) {
+	if requested != "" && admin {
+		return requested, nil
+	}
+	if user == nil {
+		u, err := s.ReadOwnerUser(ctx, userID)
+		if _, ok := err.(*OpError); ok {
+			return "", err
+		}
+		if err != nil {
+			return "", opWrap(http.StatusServiceUnavailable, "membership_unavailable", "user is temporarily unreadable", err)
+		}
+		user = u
+	}
 	if requested != "" {
-		if admin {
+		if user != nil {
+			if err := user.allows([]string{requested}); err != nil {
+				return "", err
+			}
 			return requested, nil
 		}
 		if s.membership == nil {
@@ -395,16 +488,14 @@ func (s *Service) OwnerWorkspace(ctx context.Context, userID, requested string, 
 		}
 		return requested, nil
 	}
-	lister, ok := s.membership.(WorkspaceLister)
-	if !ok {
+	if user == nil {
 		return "", opErr(http.StatusServiceUnavailable, "membership_unavailable", "User client is not configured")
 	}
-	got, err := lister.Workspaces(ctx, userID)
-	if err != nil {
-		return "", err
+	if !user.Found {
+		return "", opErr(http.StatusForbidden, "user_not_in_workspace", "user was not found")
 	}
-	if len(got) != 1 {
+	if len(user.Workspaces) != 1 {
 		return "", opErr(http.StatusBadRequest, "workspace_required", "set metadata agent-sandbox.io/workspace")
 	}
-	return got[0], nil
+	return user.Workspaces[0], nil
 }

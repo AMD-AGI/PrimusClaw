@@ -958,12 +958,21 @@ func TestMeasurementTemplateDeniesEgress(t *testing.T) {
 func TestIssueRejectsReservedAppRunID(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	svc, priv, _, _ := testService(t, now)
-	req := sampleRequest(now.Add(time.Minute))
-	req.Issuer.AppRunID = "e2b"
-	req.Attestation = signGrant(t, priv, req)
-	_, _, err := svc.Issue(context.Background(), req)
-	var op *OpError
-	if !errors.As(err, &op) || op.Status != http.StatusBadRequest {
-		t.Fatalf("err = %v", err)
+	for _, appRunID := range []string{"e2b", "E2B", "e2b_", "e2b-foo", "E2B.run"} {
+		req := sampleRequest(now.Add(time.Minute))
+		req.Issuer.AppRunID = appRunID
+		req.Attestation = signGrant(t, priv, req)
+		_, _, err := svc.Issue(context.Background(), req)
+		var op *OpError
+		if !errors.As(err, &op) || op.Status != http.StatusBadRequest {
+			t.Fatalf("%s: err = %v", appRunID, err)
+		}
+	}
+	for _, appRunID := range []string{"e2bx", "run-e2b"} {
+		req := sampleRequest(now.Add(time.Minute))
+		req.Issuer.AppRunID = appRunID
+		if err := validateIssue(req, now); err != nil {
+			t.Fatalf("%s: err = %v", appRunID, err)
+		}
 	}
 }

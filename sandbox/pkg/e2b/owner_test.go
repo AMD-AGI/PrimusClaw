@@ -6,7 +6,9 @@ package e2b
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"net/url"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -50,11 +52,18 @@ func (m listMembership) Check(_ context.Context, userID string, workspaces []str
 	return nil
 }
 
-func (m listMembership) Workspaces(_ context.Context, userID string) ([]string, error) {
-	return m[userID], nil
+func (m listMembership) ReadUser(_ context.Context, userID string) (grant.OwnerUser, error) {
+	ws, ok := m[userID]
+	return grant.OwnerUser{Found: ok, Workspaces: ws}, nil
 }
 
 func ownerPlane(t *testing.T, ids *fakeIntrospector, policy grant.OwnerPolicy) (*Service, *fakeRunner, client.Client) {
+	t.Helper()
+	return ownerPlaneWith(t, ids, policy, listMembership{"u-1": {"lab"}, "u-2": {"lab", "prod"}})
+}
+
+// ownerPlaneWith builds an identity-key plane on a fake cluster with the given membership.
+func ownerPlaneWith(t *testing.T, ids *fakeIntrospector, policy grant.OwnerPolicy, membership grant.MembershipChecker) (*Service, *fakeRunner, client.Client) {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
@@ -63,7 +72,7 @@ func ownerPlane(t *testing.T, ids *fakeIntrospector, policy grant.OwnerPolicy) (
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&runtimev1alpha1.SandboxGrant{}).Build()
 	gs := grant.New(grant.Options{
 		Client: cl, Namespace: "agent-sandbox-system",
-		Membership: listMembership{"u-1": {"lab"}, "u-2": {"lab", "prod"}},
+		Membership: membership,
 	})
 	if err := gs.SetOwnerPolicy(context.Background(), policy); err != nil {
 		t.Fatal(err)
@@ -309,11 +318,11 @@ func TestSystemAdminReachesEverySandbox(t *testing.T) {
 	if err := plane.Timeout(ctx, "ak-alice", alice.SandboxID, 13*3600); opReason(err) != "timeout_not_allowed" {
 		t.Fatalf("user 13h timeout err = %v", err)
 	}
-	if err := plane.Timeout(ctx, "ak-admin", alice.SandboxID, 2*24*3600); err != nil {
-		t.Fatalf("admin 2d timeout: %v", err)
+	if err := plane.Timeout(ctx, "ak-admin", alice.SandboxID, 6*3600); err != nil {
+		t.Fatalf("admin 6h timeout: %v", err)
 	}
-	if err := plane.Timeout(ctx, "ak-admin", alice.SandboxID, 3*24*3600+1); opReason(err) != "timeout_not_allowed" {
-		t.Fatalf("admin over 3d timeout err = %v", err)
+	if err := plane.Timeout(ctx, "ak-admin", alice.SandboxID, 13*3600); opReason(err) != "timeout_not_allowed" {
+		t.Fatalf("admin over the owner cap timeout err = %v", err)
 	}
 
 	if err := plane.Kill(ctx, "ak-admin", claw.SandboxID); err != nil {
@@ -339,8 +348,11 @@ type adminMembership struct {
 	admins map[string]bool
 }
 
-func (m adminMembership) IsSystemAdmin(_ context.Context, userID string) (bool, error) {
-	return m.admins[userID], nil
+func (m adminMembership) ReadUser(ctx context.Context, userID string) (grant.OwnerUser, error) {
+	u, _ := m.listMembership.ReadUser(ctx, userID)
+	u.Admin = m.admins[userID]
+	u.Found = u.Found || u.Admin
+	return u, nil
 }
 
 func TestIdentityKeyUsesSaFEAdminRole(t *testing.T) {
@@ -412,5 +424,212 @@ func TestOwnerPolicyRoleIsFixedOnceRecordsExist(t *testing.T) {
 	}
 	if err := plane.grants.SetOwnerPolicy(ctx, samplePolicy()); err != nil {
 		t.Fatalf("same role: %v", err)
+	}
+}
+
+// countingMembership counts User reads and can fail them.
+type countingMembership struct {
+	adminMembership
+	reads *int
+	err   *error
+}
+
+func (m countingMembership) ReadUser(ctx context.Context, userID string) (grant.OwnerUser, error) {
+	*m.reads++
+	if *m.err != nil {
+		return grant.OwnerUser{}, *m.err
+	}
+	return m.adminMembership.ReadUser(ctx, userID)
+}
+
+func newCountingMembership(workspaces listMembership, admins map[string]bool) countingMembership {
+	var reads int
+	var err error
+	return countingMembership{adminMembership: adminMembership{listMembership: workspaces, admins: admins}, reads: &reads, err: &err}
+}
+
+func ownerRecord(t *testing.T, cl client.Client, userID string) runtimev1alpha1.SandboxGrant {
+	t.Helper()
+	var g runtimev1alpha1.SandboxGrant
+	if err := cl.Get(context.Background(), types.NamespacedName{Name: grant.OwnerGrantName(userID), Namespace: "agent-sandbox-system"}, &g); err != nil {
+		t.Fatal(err)
+	}
+	return g
+}
+
+func TestUserReadErrorKeepsAdminOwnerRecord(t *testing.T) {
+	ids := &fakeIntrospector{tokens: map[string]identity.Token{"ak-admin": {Subject: "u-9", Roles: []string{"default"}}}}
+	m := newCountingMembership(listMembership{}, map[string]bool{"u-9": true})
+	policy := samplePolicy()
+	policy.Default, policy.Owners = nil, nil
+	plane, _, cl := ownerPlaneWith(t, ids, policy, m)
+	ctx := context.Background()
+	body := CreateBody{TemplateID: "runner", Metadata: map[string]string{workspaceMetadata: "any-ws"}}
+	created, _, err := plane.Create(ctx, "ak-admin", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	*m.err = errors.New("apiserver timeout")
+	if _, _, err := plane.Create(ctx, "ak-admin", body); opReason(err) != "identity_unavailable" {
+		t.Fatalf("create err = %v", err)
+	}
+	if err := plane.Timeout(ctx, "ak-admin", created.SandboxID, 600); opReason(err) != "identity_unavailable" {
+		t.Fatalf("timeout err = %v", err)
+	}
+	if g := ownerRecord(t, cl, "u-9"); g.Spec.Roles["e2b"].MaxSandboxes != -1 {
+		t.Fatalf("admin record downgraded: %+v", g.Spec.Roles)
+	}
+}
+
+func TestIdentityCreateReadsUserOnce(t *testing.T) {
+	ids := &fakeIntrospector{tokens: map[string]identity.Token{"ak-alice": {Subject: "u-1"}}}
+	m := newCountingMembership(listMembership{"u-1": {"lab"}}, nil)
+	plane, _, _ := ownerPlaneWith(t, ids, samplePolicy(), m)
+	ctx := context.Background()
+	for name, body := range map[string]CreateBody{
+		"implied":   {TemplateID: "runner"},
+		"requested": {TemplateID: "runner", Metadata: map[string]string{workspaceMetadata: "lab"}},
+	} {
+		*m.reads = 0
+		resp, _, err := plane.Create(ctx, "ak-alice", body)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if *m.reads != 1 {
+			t.Fatalf("%s: user reads = %d", name, *m.reads)
+		}
+		if err := plane.Kill(ctx, "ak-alice", resp.SandboxID); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestOwnerPolicyNotAppliedIsUnavailable(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&runtimev1alpha1.SandboxGrant{}).Build()
+	gs := grant.New(grant.Options{Client: cl, Namespace: "agent-sandbox-system", Membership: listMembership{"u-1": {"lab"}}})
+	ids := &fakeIntrospector{tokens: map[string]identity.Token{"ak-alice": {Subject: "u-1"}}}
+	plane := New(Options{Grants: gs, Runner: &fakeRunner{}, Namespace: "agent-sandbox-system", Identity: ids})
+	_, _, err := plane.Create(context.Background(), "ak-alice", CreateBody{TemplateID: "runner"})
+	if oe, ok := err.(*grant.OpError); !ok || oe.Status != http.StatusServiceUnavailable {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestPartialQuotasInheritByRole(t *testing.T) {
+	tpl, err := json.Marshal(samplePolicy().Templates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("E2B_OWNER_POLICY", `{"templates":`+string(tpl)+`,
+		"default":{"maxSandboxes":4},
+		"admin":{"maxSandboxSeconds":86400},
+		"owners":{"u-2":{"maxGpus":16},"u-8":{"maxGpus":16}}}`)
+	policy, err := grant.OwnerPolicyFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := &fakeIntrospector{tokens: map[string]identity.Token{
+		"ak-alice": {Subject: "u-1"},
+		"ak-bob":   {Subject: "u-2"},
+		"ak-admin": {Subject: "u-9", Roles: []string{"system-admin"}},
+		"ak-root":  {Subject: "u-8", Roles: []string{"system-admin"}},
+	}}
+	plane, _, cl := ownerPlane(t, ids, *policy)
+	ctx := context.Background()
+	lab := map[string]string{workspaceMetadata: "lab"}
+	for _, key := range []string{"ak-alice", "ak-bob", "ak-admin", "ak-root"} {
+		if _, _, err := plane.Create(ctx, key, CreateBody{TemplateID: "runner", Timeout: 60, Metadata: lab}); err != nil {
+			t.Fatalf("%s: %v", key, err)
+		}
+	}
+	for user, want := range map[string][3]int64{
+		"u-1": {4, 8, 12 * 3600},
+		"u-2": {4, 16, 12 * 3600},
+		"u-9": {-1, -1, 86400},
+		"u-8": {-1, 16, 86400},
+	} {
+		g := ownerRecord(t, cl, user)
+		role := g.Spec.Roles["e2b"]
+		if got := [3]int64{int64(role.MaxSandboxes), int64(role.MaxGPUs), g.Spec.MaxSandboxSeconds}; got != want {
+			t.Fatalf("%s quota = %v, want %v", user, got, want)
+		}
+	}
+}
+
+func TestAdminTimeoutCappedByTargetGrant(t *testing.T) {
+	plane, _, keys := testPlane(t, 3600, []int32{1}, 2)
+	policy := samplePolicy()
+	policy.Default, policy.Owners = nil, nil
+	if err := plane.grants.SetOwnerPolicy(context.Background(), policy); err != nil {
+		t.Fatal(err)
+	}
+	plane.identity = &fakeIntrospector{tokens: map[string]identity.Token{"ak-admin": {Subject: "u-9", Roles: []string{"system-admin"}}}}
+	ctx := context.Background()
+	claw, _, err := plane.Create(ctx, keys["dev"], CreateBody{TemplateID: "runner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := plane.Timeout(ctx, "ak-admin", claw.SandboxID, 7200); opReason(err) != "timeout_not_allowed" {
+		t.Fatalf("over grant cap err = %v", err)
+	}
+	if err := plane.Timeout(ctx, "ak-admin", claw.SandboxID, 1800); err != nil {
+		t.Fatalf("within grant cap: %v", err)
+	}
+}
+
+func TestAdminListFiltersByOwner(t *testing.T) {
+	plane, _, keys := testPlane(t, 3600, []int32{1}, 2)
+	policy := samplePolicy()
+	policy.Default, policy.Owners = nil, nil
+	if err := plane.grants.SetOwnerPolicy(context.Background(), policy); err != nil {
+		t.Fatal(err)
+	}
+	plane.identity = &fakeIntrospector{tokens: map[string]identity.Token{
+		"ak-alice": {Subject: "u-1"},
+		"ak-admin": {Subject: "u-9", Roles: []string{"system-admin"}},
+	}}
+	ctx := context.Background()
+	if _, _, err := plane.Create(ctx, keys["dev"], CreateBody{TemplateID: "runner"}); err != nil {
+		t.Fatal(err)
+	}
+	alice, _, err := plane.Create(ctx, "ak-alice", CreateBody{TemplateID: "runner", Timeout: 60, Metadata: map[string]string{workspaceMetadata: "lab"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	list, err := plane.List(ctx, "ak-admin", url.Values{ownerUserMetadata: {"u-1"}}.Encode(), "", "", 0)
+	if err != nil || len(list.Sandboxes) != 1 || list.Sandboxes[0].SandboxID != alice.SandboxID {
+		t.Fatalf("filtered list = %+v %v", list, err)
+	}
+}
+
+func TestOwnerPolicyRemovesDroppedTemplates(t *testing.T) {
+	policy := samplePolicy()
+	extra := policy.Templates[0]
+	extra.Name = "extra"
+	policy.Templates = append(policy.Templates, extra)
+	plane, _, cl := ownerPlane(t, &fakeIntrospector{}, policy)
+	ctx := context.Background()
+	foreign := &runtimev1alpha1.CodeInterpreter{}
+	foreign.Name, foreign.Namespace = "other-extra-g1", "agent-sandbox-system"
+	if err := cl.Create(ctx, foreign); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := plane.grants.SetOwnerPolicy(ctx, samplePolicy()); err != nil {
+		t.Fatal(err)
+	}
+	var ci runtimev1alpha1.CodeInterpreter
+	if err := cl.Get(ctx, types.NamespacedName{Name: "e2b-extra-g1", Namespace: "agent-sandbox-system"}, &ci); err == nil {
+		t.Fatal("dropped template e2b-extra-g1 still exists")
+	}
+	for _, name := range []string{"e2b-runner-g1", "other-extra-g1"} {
+		if err := cl.Get(ctx, types.NamespacedName{Name: name, Namespace: "agent-sandbox-system"}, &ci); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
 	}
 }

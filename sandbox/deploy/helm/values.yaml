@@ -51,6 +51,8 @@ controlplane:
     # client_secret; the ConfigMap key policy.json holds the owner quota policy.
     # The policy is read at startup: a ConfigMap change needs a rollout restart.
     # The policy role must match the role of existing owner records.
+    # A quota field left out keeps the built-in value; one left out of an owners
+    # entry comes from the default or admin quota of that user.
     identity:
       introspectUrl: ""
       clientSecret: "agent-sandbox-identity-client"

@@ -5,8 +5,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -473,9 +475,13 @@ func main() {
 	log.Info("controlplane shutdown complete")
 }
 
+// ownerPolicyRetry is the first delay between owner policy attempts. It doubles up to a minute.
+var ownerPolicyRetry = time.Second
+
 // ownerKeys enables primus-identity keys when both the introspection client and
 // the owner policy are configured. It returns nil when either is absent or
-// invalid, so grant keys keep working.
+// invalid, so grant keys keep working. A policy that fails for a transient
+// reason is retried in the background; identity keys get 503 until it applies.
 func ownerKeys(ctx context.Context, grants *grant.Service) *identity.Client {
 	client, err := identity.FromEnv()
 	if err != nil {
@@ -494,12 +500,50 @@ func ownerKeys(ctx context.Context, grants *grant.Service) *identity.Client {
 		log.Warn("identity keys disabled: owner policy is not configured")
 		return nil
 	}
-	if err := grants.SetOwnerPolicy(ctx, *policy); err != nil {
+	err = grants.SetOwnerPolicy(ctx, *policy)
+	if err == nil {
+		log.Info("identity keys enabled", "role", grants.OwnerRole())
+		return client
+	}
+	if !transientPolicyError(err) {
 		log.Error("identity keys disabled: owner policy was not applied", "error", err)
 		return nil
 	}
-	log.Info("identity keys enabled", "role", grants.OwnerRole())
+	log.Warn("owner policy was not applied, retrying", "error", err)
+	go retryOwnerPolicy(ctx, grants, *policy)
 	return client
+}
+
+// transientPolicyError reports whether an owner policy error may clear on retry.
+// A rejected policy, such as an invalid quota or a name conflict, is not retried.
+func transientPolicyError(err error) bool {
+	var op *grant.OpError
+	return !errors.As(err, &op) || op.Status >= http.StatusInternalServerError
+}
+
+// retryOwnerPolicy applies the owner policy until it succeeds, fails permanently, or ctx ends.
+func retryOwnerPolicy(ctx context.Context, grants *grant.Service, policy grant.OwnerPolicy) {
+	delay := ownerPolicyRetry
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		err := grants.SetOwnerPolicy(ctx, policy)
+		if err == nil {
+			log.Info("identity keys enabled", "role", grants.OwnerRole())
+			return
+		}
+		if !transientPolicyError(err) {
+			log.Error("identity keys disabled: owner policy was not applied", "error", err)
+			return
+		}
+		log.Warn("owner policy was not applied, retrying", "error", err, "delay", delay)
+		if delay *= 2; delay > time.Minute {
+			delay = time.Minute
+		}
+	}
 }
 
 // startGrants serves the grant admin API from SandboxGrant CRs and reaps

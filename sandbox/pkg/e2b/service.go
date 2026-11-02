@@ -86,16 +86,15 @@ func New(opt Options) *Service {
 // grantKeyPrefix marks a key issued by the grant API.
 const grantKeyPrefix = "e2b_"
 
-// systemAdminRole is the identity role that may use any workspace.
-const systemAdminRole = "system-admin"
-
-// caller is the grant and role an API key resolves to.
+// caller is the grant and role an API key resolves to. user is the SaFE User
+// read during lookup, or nil when it was not read.
 type caller struct {
 	grantID string
 	role    string
 	owner   bool
 	userID  string
 	admin   bool
+	user    *grant.OwnerUser
 }
 
 // lookup resolves a grant key, or introspects any other key and returns the owner quota record.
@@ -113,7 +112,15 @@ func (s *Service) lookup(ctx context.Context, apiKey string, write bool) (caller
 	if err != nil {
 		return caller{}, grant.Op(http.StatusServiceUnavailable, "identity_unavailable", "identity is temporarily unavailable")
 	}
-	admin := token.HasRole(systemAdminRole) || s.grants.IsSystemAdmin(ctx, token.Subject)
+	admin := token.HasRole(grant.SystemAdminRole)
+	var user *grant.OwnerUser
+	if !admin {
+		user, err = s.grants.ReadOwnerUser(ctx, token.Subject)
+		if err != nil {
+			return caller{}, grant.Op(http.StatusServiceUnavailable, "identity_unavailable", "user is temporarily unreadable")
+		}
+		admin = user != nil && user.Admin
+	}
 	var grantID string
 	if write {
 		grantID, err = s.grants.EnsureOwner(ctx, token.Subject, token.Email, admin)
@@ -129,6 +136,7 @@ func (s *Service) lookup(ctx context.Context, apiKey string, write bool) (caller
 		owner:   true,
 		userID:  token.Subject,
 		admin:   admin,
+		user:    user,
 	}, nil
 }
 
@@ -199,7 +207,7 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 	}
 	var workspace string
 	if who.owner {
-		workspace, err = s.grants.OwnerWorkspace(ctx, who.userID, body.Metadata[workspaceMetadata], who.admin)
+		workspace, err = s.grants.OwnerWorkspace(ctx, who.userID, body.Metadata[workspaceMetadata], who.admin, who.user)
 	} else {
 		workspace, err = firstWorkspace(snap.Workspaces)
 	}
@@ -500,7 +508,11 @@ func (s *Service) List(ctx context.Context, apiKey, metadataQuery, state, nextTo
 		if sb.Ref.State != runtimev1alpha1.SandboxRunning || state == "paused" {
 			continue
 		}
-		if !metadataMatch(sb.Ref.Metadata, want) {
+		md := sb.Ref.Metadata
+		if who.owner && who.admin {
+			md = withOwner(md, sb.UserID)
+		}
+		if !metadataMatch(md, want) {
 			continue
 		}
 		filtered = append(filtered, sb)
@@ -591,7 +603,8 @@ func pageBounds(offset, limit, n int) (int, int) {
 
 // Timeout sets a new lifetime from now. Only the role that created the sandbox
 // can change it. A value over the grant cap is refused. A system-admin identity
-// key may change any sandbox, bounded by its own owner cap.
+// key may change any sandbox, bounded by its own owner cap and the cap of the
+// grant that holds the sandbox.
 func (s *Service) Timeout(ctx context.Context, apiKey, sandboxID string, timeoutSec int64) error {
 	who, err := s.lookup(ctx, apiKey, true)
 	if err != nil {
@@ -613,7 +626,8 @@ func (s *Service) Timeout(ctx context.Context, apiKey, sandboxID string, timeout
 	return nil
 }
 
-// adminTimeout sets the lifetime of a sandbox on any grant, capped by the admin's owner record.
+// adminTimeout sets the lifetime of a sandbox on any grant, capped by the admin's
+// owner record and by the grant that holds the sandbox.
 func (s *Service) adminTimeout(ctx context.Context, who caller, sandboxID string, timeoutSec int64) error {
 	own, err := s.grants.Snapshot(ctx, who.grantID)
 	if err != nil {
@@ -623,7 +637,19 @@ func (s *Service) adminTimeout(ctx context.Context, who caller, sandboxID string
 	if err != nil {
 		return err
 	}
-	return s.grants.SetSandboxTimeoutAs(ctx, sb.GrantID, sandboxID, timeoutSec, own.MaxSandboxSeconds)
+	maxSec := tighterCap(own.MaxSandboxSeconds, sb.MaxSandboxSeconds)
+	return s.grants.SetSandboxTimeoutAs(ctx, sb.GrantID, sandboxID, timeoutSec, maxSec)
+}
+
+// tighterCap returns the smaller of two lifetime caps. Zero is unlimited.
+func tighterCap(a, b int64) int64 {
+	if a <= 0 {
+		return b
+	}
+	if b <= 0 || a < b {
+		return a
+	}
+	return b
 }
 
 // withOwner returns a copy of md with the owner user id.

@@ -62,7 +62,7 @@ A template that is not sealed allows commands and file access in the sandbox.
 
 ## Quotas
 
-Quotas apply per person, across all templates. The built-in defaults are below; the owner policy can override the user quota, the `system-admin` quota, or the quota of one user.
+Quotas apply per person, across all templates. The built-in defaults are below; the owner policy can override the user quota, the `system-admin` quota, or the quota of one user. A field the policy leaves out keeps the built-in value; a field left out of one user's quota comes from the user or `system-admin` quota of that user.
 
 | Caller         | Concurrent sandboxes | Concurrent GPUs | Max lifetime per sandbox |
 | -------------- | -------------------- | --------------- | ------------------------ |
@@ -72,7 +72,7 @@ Quotas apply per person, across all templates. The built-in defaults are below; 
 - The create timeout and every extension stay within the max lifetime.
 - An expired sandbox is reclaimed. Kill releases the quota at once.
 - A user lists and operates only their own sandboxes. Another user's sandbox returns `404`.
-- A `system-admin` lists and operates every sandbox, including Claw grant sandboxes. List results carry `agent-sandbox.io/owner-user-id`.
+- A `system-admin` lists and operates every sandbox, including Claw grant sandboxes. List results carry `agent-sandbox.io/owner-user-id`, and the list can filter on it. An extension stays within both the caller's max lifetime and that of the sandbox's owner.
 
 ## Example
 
@@ -148,6 +148,6 @@ from e2b import Sandbox
 | 403    | `user_not_in_workspace` | Caller is not a member of the workspace           |
 | 403    | `sealed_denied`         | Path or call is outside the sealed allow-list     |
 | 404    | `sandbox_not_found`     | Sandbox does not exist or belongs to another user |
-| 503    | `identity_unavailable`  | primus-identity cannot be reached                 |
+| 503    | `identity_unavailable`  | Identity or the user record cannot be read        |
 
 A create that waits for a free GPU stays pending until the Workload is scheduled; a larger `request_timeout` keeps the call open while it waits.

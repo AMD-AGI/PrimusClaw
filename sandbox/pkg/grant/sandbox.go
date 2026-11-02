@@ -277,10 +277,12 @@ func (s *Service) SandboxByID(ctx context.Context, sandboxID string) (runtimev1a
 }
 
 // OwnedSandbox is a sandbox ref with the grant and owner it is charged to.
+// MaxSandboxSeconds is the lifetime cap of that grant; zero is unlimited.
 type OwnedSandbox struct {
-	GrantID string
-	UserID  string
-	Ref     runtimev1alpha1.GrantSandboxRef
+	GrantID           string
+	UserID            string
+	MaxSandboxSeconds int64
+	Ref               runtimev1alpha1.GrantSandboxRef
 }
 
 // FindSandbox returns the sandbox and its grant from any grant.
@@ -306,7 +308,7 @@ func (s *Service) ListAllSandboxes(ctx context.Context) ([]OwnedSandbox, error) 
 	var out []OwnedSandbox
 	for i := range grants {
 		for _, ref := range grants[i].Status.Sandboxes {
-			out = append(out, OwnedSandbox{GrantID: grants[i].Name, UserID: grants[i].Spec.Owner.UserID, Ref: ref})
+			out = append(out, OwnedSandbox{GrantID: grants[i].Name, UserID: grants[i].Spec.Owner.UserID, MaxSandboxSeconds: grants[i].Spec.MaxSandboxSeconds, Ref: ref})
 		}
 	}
 	return out, nil
