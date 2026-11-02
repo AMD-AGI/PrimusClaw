@@ -23,13 +23,16 @@ import { CLAW_NOTIFICATIONS_ENABLED, NOTIFY_WEBHOOK_ALLOWED_HOSTS } from "../con
 import { getUser } from "../auth/middleware.js";
 import { encryptUserEnvValue } from "../crypto/user-env.js";
 import { db } from "../infra/db.js";
+import { ASSISTANT_EVENT_TYPES } from "../notifications/assistant-events.js";
 import { newSubscriptionId } from "../notifications/outbox.js";
 import { guardWebhookUrl, parseAllowedHosts } from "../notifications/url-guard.js";
 
 const MAX_SUBSCRIPTIONS_PER_USER = 5;
-// `approval.requested` is accepted here but is not in the default set a new
-// subscription gets (the INSERT below): a receiver has to ask for it.
-const EVENT_TYPES = ["run.completed", "run.failed", "approval.requested"];
+// `approval.requested` and the assistant's events are accepted here but are not in the
+// default set a new subscription gets (the INSERT below): a receiver has to ask for them.
+// `sources` says what started a run, so it narrows run events only; an assistant event
+// reaches every subscription that lists its type.
+const EVENT_TYPES: string[] = ["run.completed", "run.failed", "approval.requested", ...ASSISTANT_EVENT_TYPES];
 const SOURCES = ["trigger", "long_run"];
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 

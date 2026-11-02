@@ -33,6 +33,7 @@ import { registerAssistantRoutes } from "./routes/assistant.js";
 import { registerNotificationSubscriptionRoutes } from "./routes/notification-subscriptions.js";
 import { registerRemoteAgentRoutes } from "./routes/remote-agents.js";
 import { startNotificationWorker } from "./notifications/outbox.js";
+import { registerAssistantDeliveryHook } from "./assistant/outbound.js";
 import { a2aPushEnabled } from "./routes/a2a-flags.js";
 import { startA2aPushWorker } from "./routes/a2a-push.js";
 import { registerSystemEnvVarRoutes, publishSystemEnvToKv } from "./routes/system-env-vars.js";
@@ -334,6 +335,7 @@ async function main() {
   // Outbound notification delivery (HMAC-signed webhooks from the outbox).
   // Gated: with the flag off no table exists and nothing polls.
   if (CLAW_NOTIFICATIONS_ENABLED) startNotificationWorker();
+  if (CLAW_NOTIFICATIONS_ENABLED) registerAssistantDeliveryHook();
   if (a2aPushEnabled()) startA2aPushWorker();
 
   // Daily maintenance crons (every 24h, first run 1 min after startup).
