@@ -35,6 +35,7 @@ import { registerAdminRoutes } from "../src/routes/admin.js";
 import { registerInternalWorkspaceRoutes } from "../src/routes/internal-workspaces.js";
 import { registerInternalRunRoutes } from "../src/routes/internal-runs.js";
 import { registerInternalAppRoutes } from "../src/routes/internal-apps.js";
+import { registerAssistantMcpRoutes } from "../src/assistant/mcp.js";
 
 const REGISTRARS: Array<(app: FastifyInstance) => Promise<void>> = [
   registerInternalTaskRoutes,
@@ -42,6 +43,8 @@ const REGISTRARS: Array<(app: FastifyInstance) => Promise<void>> = [
   registerInternalWorkspaceRoutes,
   registerInternalRunRoutes,
   registerInternalAppRoutes,
+  // The assistant's MCP service is off by default; asked for here so it is held to the same rule.
+  (app) => registerAssistantMcpRoutes(app, true),
 ];
 
 interface DiscoveredRoute {
@@ -111,6 +114,7 @@ test("the /v1/internal/ modules register at least the routes we think they do", 
       "/v1/internal/workspaces/by-session/:sessionId",
       "/v1/internal/tasks/:taskId/claim",
       "/v1/internal/runs/claim-next",
+      "/v1/internal/assistant-mcp",
     ]) {
       assert.ok(urls.has(expected), `expected ${expected} to be registered`);
     }
