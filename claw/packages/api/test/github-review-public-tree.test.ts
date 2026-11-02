@@ -29,6 +29,35 @@ const OWN_FILES = [
   ...readdirSync(join(root, "packages/api/test")).filter((f) => f.startsWith("github-review-")).map((f) => join(root, "packages/api/test", f)),
   join(root, "packages/utils/src/identity/credentials.ts"),
   join(root, "packages/utils/test/identity-credentials.test.ts"),
+  // What a service that acts for a person may bring with its token: the auth code, its documentation and its tests.
+  join(root, "packages/api/src/auth/identity-token.ts"),
+  join(root, "packages/api/src/auth/delegated-keys.ts"),
+  join(root, "docs/identity-client.md"),
+  join(root, "packages/api/test/identity-token-safe-keys.test.ts"),
+  join(root, "packages/api/test/identity-token-middleware.test.ts"),
+  // What a session that acts as a user is not given: its sandbox's keys.
+  join(root, "packages/brain/test/ensure-hands-acting-session-keys.test.ts"),
+  join(root, "packages/brain/test/ensure-hands-acting-session-keys-k8s.test.ts"),
+];
+
+/**
+ * What this change adds on top of the tree above, and what it is written without: the name of the chat service that is the first
+ * user of it. The service is a client id an operator writes down; nothing in the public tree is written for it. (The review feature
+ * itself still names it in places, which is not this list's business: they are not in it.)
+ */
+const NEUTRAL_FILES = [
+  join(root, "packages/api/src/auth/identity-token.ts"),
+  join(root, "packages/api/src/auth/delegated-keys.ts"),
+  join(root, "packages/api/src/github-review/session-tools.ts"),
+  join(root, "docs/identity-client.md"),
+  join(root, "packages/api/test/identity-token-safe-keys.test.ts"),
+  join(root, "packages/api/test/identity-token-middleware.test.ts"),
+  join(root, "packages/api/test/github-review-session.test.ts"),
+  join(root, "packages/api/test/github-review-acting-turns.test.ts"),
+  join(root, "packages/api/test/github-review-own-key-chain.test.ts"),
+  join(root, "packages/api/test/github-review-acting-dispatch-keys.test.ts"),
+  join(root, "packages/brain/test/ensure-hands-acting-session-keys.test.ts"),
+  join(root, "packages/brain/test/ensure-hands-acting-session-keys-k8s.test.ts"),
 ];
 
 test("the default skill is the same text as the skill file anyone can import", () => {
@@ -61,6 +90,12 @@ test("nothing this feature adds names an internal product, repository or host", 
   }
 });
 
+test("what a service that acts for a person may bring, and the sandbox keys a session that acts as a user is not given, name no chat service", () => {
+  // Built from pieces so that this file does not contain what it looks for.
+  const word = ["cla", "wy"].join("");
+  for (const f of NEUTRAL_FILES) assert.equal(readFileSync(f, "utf8").toLowerCase().includes(word), false, `${f} mentions ${word}`);
+});
+
 test("every new source file carries the licence header", () => {
   for (const f of OWN_FILES.filter((p) => p.endsWith(".ts"))) {
     assert.match(readFileSync(f, "utf8").slice(0, 120), /Copyright Advanced Micro Devices, Inc\.\n.*SPDX-License-Identifier: MIT/s, f);
@@ -73,6 +108,7 @@ test("the schema, the routes and the session tools are wired behind the flag, an
   assert.match(read("packages/api/src/infra/db.ts"), /if \(CLAW_GITHUB_REVIEW_ENABLED\) await ensureGithubReviewSchema\(client\)/);
   assert.match(read("packages/api/src/index.ts"), /await registerGithubReviewRoutes\(app\)/);
   assert.match(read("packages/api/src/index.ts"), /assertGithubReviewConfig\(\)/);
+  assert.match(read("packages/api/src/index.ts"), /githubReviewConfigErrors\(settings, identityClient\(\) !== null, identityTokenSettings\(\)\.ownKeyClientIds\)/);
   assert.match(read("packages/api/src/github-review/mcp.ts"), /if \(!\(opts\.enabled \?\? CLAW_GITHUB_REVIEW_ENABLED\)\) return;/);
   assert.match(read("packages/api/src/github-review/session-tools.ts"), /if \(!CLAW_GITHUB_REVIEW_ENABLED\) return \{\};/);
   assert.match(read("packages/api/src/routes/sessions.ts"), /config\.acting_as is not enabled on this deployment/);

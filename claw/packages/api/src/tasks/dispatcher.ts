@@ -23,6 +23,7 @@ import {
   readTrustedSessionCredentials,
 } from "../auth/session-credentials.js";
 import { CLAW_DEPLOY_MODE } from "../config.js";
+import { withholdsSandboxKeys } from "../github-review/session-tools.js";
 import { isMemoryActive } from "../memory/service.js";
 import { resolveTaskPlugin } from "../marketplace/plugins.js";
 import { db } from "../infra/db.js";
@@ -144,6 +145,7 @@ async function loadSessionCredentials(sessionId: string): Promise<{
   platform_key: string;
   workspace_id: string;
   llm_api_key: string;
+  withhold_sandbox_keys: boolean;
 }> {
   // `claw_sessions` only ships `user_id` in the canonical schema; the legacy
   // `platform_key` / `workspace_id` columns are optional add-ons in some
@@ -183,6 +185,7 @@ async function loadSessionCredentials(sessionId: string): Promise<{
     // it runs as, and a deployment-wide default for it grants nothing.
     workspace_id: sessionWorkspaceId || process.env.SANDBOX_NAMESPACE || "",
     llm_api_key: credentials.llmApiKey,
+    withhold_sandbox_keys: withholdsSandboxKeys(cfg),
   };
 }
 
@@ -443,6 +446,7 @@ function buildExecuteRequest(opts: {
     workspace_id: extractSandboxNamespace(sandboxSpecForBrain) || session.workspace_id || undefined,
     platform_key: session.platform_key || "",
     llm_api_key: session.llm_api_key || undefined,
+    ...(session.withhold_sandbox_keys ? { withhold_sandbox_keys: true } : {}),
     user_id: session.user_id || "",
     user_env: userEnvForReq,
     plugin_id: updated.plugin_id ?? undefined,

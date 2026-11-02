@@ -28,6 +28,18 @@ record it.
 ## [Unreleased]
 
 ### Added
+- A service that acts for a person (a delegated identity token: RFC 8693 `act`) can now bring the person's own
+  `ak-` key in `x-api-key`, for the services an operator names in `CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS` (empty by
+  default, which changes nothing: such a token still has no keys and the header is still not read). SaFE verifies the
+  key, it must be the token's own subject's, and the request is still judged by the token. A key that is another
+  user's is a 401 `key_subject_mismatch`, one SaFE does not accept (or a value that is not a key) a 401
+  `invalid_api_key`, and SaFE not answering a 503; a request that asked for its key to be used is never served without
+  it. With GitHub review on, each such service must also be in `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS`, or the API
+  does not start. See `claw/docs/identity-client.md`.
+- The sandbox of a session that acts as a user (`config.acting_as`, GitHub review on) is created without its owner's
+  keys: Brain is told (`ExecuteRequest.withhold_sandbox_keys`, set on every turn of such a session) to leave
+  `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `SAFE_API_KEY` out of its environment, while it still uses the keys for the
+  model and for SaFE. Nothing changes for any other session. See `claw/docs/github-review.md`.
 - Brain now enforces `ExecuteRequest.tools_allowlist`, which it used to ignore. A run whose request carries a
   non-empty list is offered only the tools it names, and a call outside the list is refused with an error
   instead of run: a tool the model was never offered, one a resumed transcript still names, a `task` or

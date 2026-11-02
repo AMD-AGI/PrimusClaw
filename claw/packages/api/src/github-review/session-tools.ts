@@ -14,6 +14,7 @@ import pino from "pino";
 import { CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
 import { db } from "../infra/db.js";
 import { actingUserOf } from "./acting-as.js";
+import { storedActingAs } from "./acting-turns.js";
 import { readGithubReviewSettings } from "./settings.js";
 import { mintSessionToolToken } from "./token.js";
 
@@ -22,6 +23,26 @@ const logger = pino({ name: "github-review-session" });
 export const GITHUB_REVIEW_SERVER_NAME = "github_review";
 
 type McpServers = Record<string, Record<string, unknown>>;
+
+/**
+ * Whether the sandbox of a session with this stored config must hold none of its owner's keys. The session is offered the review tools, so
+ * its model reads what strangers wrote, and a sandbox's environment is whatever that model can print: the owner's key there would be
+ * the owner's account (the platform's sign-in takes a key for a password change). Brain still uses the keys itself, for the model and for
+ * SaFE. The same reading of `acting_as` as the tools and the turn gate, and nothing while the feature is off: such a session is then
+ * an ordinary one.
+ */
+export function withholdsSandboxKeys(config: unknown): boolean {
+  return CLAW_GITHUB_REVIEW_ENABLED && actingUserOf(config) !== null;
+}
+
+/**
+ * Marks a turn that is built here for a session that acts as a user (`withhold_sandbox_keys`, protocol). Read from the live row, as the
+ * tools are, and not caught: a turn whose session cannot be read is not started with its keys in the sandbox.
+ */
+export async function applySandboxKeyPolicyToTask(task: Record<string, unknown>, sessionId: string): Promise<void> {
+  if (!CLAW_GITHUB_REVIEW_ENABLED) return;
+  if (withholdsSandboxKeys({ acting_as: await storedActingAs(sessionId) })) task.withhold_sandbox_keys = true;
+}
 
 export async function githubReviewMcpServers(sessionId: string): Promise<McpServers> {
   if (!CLAW_GITHUB_REVIEW_ENABLED) return {};

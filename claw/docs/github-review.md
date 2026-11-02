@@ -10,7 +10,8 @@ A session can review a public GitHub pull request, and merge it when everything 
 reviewer of record. Four tools do the work. The GitHub token is fetched from the identity
 provider for one tool call, used on the API's side and dropped; it never enters a sandbox, a
 tool result, a log line or an event. Claude, Codex and the other agents that review in a
-sandbox have no token to leak.
+sandbox have no token to leak. Nor does the requester's own key: the sandbox of such a session
+holds none (see "The sandbox holds no key").
 
 Off by default. With `CLAW_GITHUB_REVIEW_ENABLED` unset there are no tables, no routes, no
 tool offered to a session, and `config.acting_as` is refused.
@@ -22,6 +23,9 @@ tool offered to a session, and `config.acting_as` is refused.
    operator named (see "Who may speak for the person"). An `ak-` key, a BYOK key, a connector token
    and a browser session cookie are refused (`403 interactive_sign_in_required`): the key a sandbox
    holds must not be able to start a session that reviews and merges with its owner's account.
+   A service that creates the session for the requester sends the requester's own `ak-` key in
+   `x-api-key` beside its token, so that the turns run on the requester's models and quota
+   (see "A service answering for the acting user"); a key alone is still refused.
    The id is a reference, never a credential. The requester is the session's owner; the
    verified caller's name is kept as `config.acting_as_requester` for the review footer (a
    client cannot set it).
@@ -169,7 +173,7 @@ tool offered to a session, and `config.acting_as` is refused.
 | Route | Purpose |
 |---|---|
 | `GET /v1/github-review/confirmations?session_id=<id>&status=pending` | The confirmations of the caller's own sessions and those that ask the caller. `{items:[{id, repo, pr, title, author, head_sha, reasons, checks, actor_user_id, requester_user_id, session_id, expires_at, status}]}` |
-| `POST /v1/github-review/confirmations/:id/decision` `{decision: "allow" \| "deny"}` | The acting user's answer, given with an identity provider's access token: their own sign-in at the provider, or an allowed service's (next section). Anyone else gets `403`, and so does the acting user with an `ak-` key (`Authorization: Bearer` or `x-api-key`), a BYOK key, a connector token or a browser session cookie, whatever the id (`403 interactive_sign_in_required`; the check is on how the request was authenticated, before the confirmation is looked up). The sandbox of a session holds its owner's key, and with SaFE's built-in sign-in that key sets the owner's password and logs in, which returns a session cookie the API verifies as the person's own: so neither a key nor a cookie is proof of a person, and a model in any session of that user could otherwise answer a confirmation itself. On `allow` every gate is read again and the merge is made with the acting user's account; the answer is `{status: "merged" \| "denied" \| "stale" \| "expired" \| "refused" \| "retry", reason, merge_sha}`. `retry` means the merge could not be tried just now (the identity service or GitHub failed, a limit was hit) before anything was sent to GitHub, and the confirmation is still open: allow it again. Once an approval or a merge has been sent the try is not given back: the confirmation is closed as `refused` with `wrote: true`. The merge is recorded as asked for by the requester, not by the acting user. A service an operator named may answer for the acting user too (next section) |
+| `POST /v1/github-review/confirmations/:id/decision` `{decision: "allow" \| "deny"}` | The acting user's answer, given with an identity provider's access token: their own sign-in at the provider, or an allowed service's (next section). Anyone else gets `403`, and so does the acting user with an `ak-` key (`Authorization: Bearer` or `x-api-key`), a BYOK key, a connector token or a browser session cookie, whatever the id (`403 interactive_sign_in_required`; the check is on how the request was authenticated, before the confirmation is looked up). The sandbox of an ordinary session holds its owner's key, and with SaFE's built-in sign-in that key sets the owner's password and logs in, which returns a session cookie the API verifies as the person's own: so neither a key nor a cookie is proof of a person, and a model in any session of that user could otherwise answer a confirmation itself. On `allow` every gate is read again and the merge is made with the acting user's account; the answer is `{status: "merged" \| "denied" \| "stale" \| "expired" \| "refused" \| "retry", reason, merge_sha}`. `retry` means the merge could not be tried just now (the identity service or GitHub failed, a limit was hit) before anything was sent to GitHub, and the confirmation is still open: allow it again. Once an approval or a merge has been sent the try is not given back: the confirmation is closed as `refused` with `wrote: true`. The merge is recorded as asked for by the requester, not by the acting user. A service an operator named may answer for the acting user too (next section) |
 
 A browser session cookie would be taken again only where the platform that issues it refuses to set a
 password with an API key; that is a change to Primus-SaFE, not something this code can check, so until
@@ -195,15 +199,44 @@ credentials for an access token that acts as that user (RFC 8693: `sub` is the u
   holding a token for someone else, or its own token, cannot answer.
 - A person's own access token (their sign-in at the provider, which names no actor) is the person's
   answer, and an `ak-` key, an `x-api-key`, a BYOK key, a connector token or a browser session cookie
-  is refused (`403 interactive_sign_in_required`), whatever the allow-list says.
+  is refused (`403 interactive_sign_in_required`), whatever the allow-list says. (A key sent beside an allowed
+  service's token is not a credential of its own: see "The requester's own key" below. Sent alone it is refused.)
 - The same two checks apply to creating a session with `config.acting_as` (`POST /v1/sessions`) and to
   every turn in it (see "How a session uses it"): the person's own token, or an allowed service's, and
   nothing else. Without a credential of that kind the answer is `403 interactive_sign_in_required` or
   `403 service_client_not_allowed`, and nothing is created or queued.
+- **The requester's own key.** A turn needs a model key, and a delegated token has none of its own
+  (see [identity-client.md](identity-client.md), "Keys for a token's user"). A service named in
+  `CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS` (comma or space separated, compared exactly as signed, empty by
+  default) may send the requester's own `ak-` key as `x-api-key` with the request that creates the session and
+  with every request that sends it a message or answers it. It counts only when SaFE says the key is the
+  token's own `sub`'s (`401 key_subject_mismatch` otherwise; `401 invalid_api_key` for a key SaFE does not
+  accept or a value that is not a key; `503` when SaFE cannot answer), and the turn then runs on the
+  requester's keys, never on the acting user's. The decision route is called with the acting user's token and
+  runs no turn, so it is sent no key: one sent with it would not be that token's user's and is refused. Setting the list needs
+  `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS` to name the same services: a process with the review on that
+  has a client in the first list and not in the second does not start. With the list empty, nothing here
+  changes: a delegated token has no keys and the header is not read.
 - Who stood behind the answer is recorded: `decided_by` is the acting user, `decided_via` is
   `{kind: "service", client_id, act_sub}` (also in the confirmation list), the closing `result`
   says `by: "service"`, the audit row of the merge carries `decided_by_service`, and a
   `github_review.decision_by_service` log line names the confirmation, the user and the client.
+
+## The sandbox holds no key
+
+A model that reviews a pull request reads what strangers wrote, and a sandbox's environment is whatever that
+model can print. In an ordinary session that environment holds its owner's key (`SAFE_API_KEY`,
+`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`), which with SaFE's built-in sign-in is also the owner's account. A session
+with `config.acting_as` is therefore built differently: every turn Brain is handed for it carries
+`withhold_sandbox_keys` (decided from the session's row, on every path a turn reaches Brain by: a message, a
+turn claimed from the queue, a task of a DAG), and Brain creates its sandbox with none of the three. Brain keeps using
+the key for what it does itself, the model calls and the workload it creates and owns in SaFE. What a process in
+the sandbox cannot do is call the model or SaFE as the requester: a review reads and runs code, it does not need
+to. Environment variables the requester stored for themselves (`user_env`, `session_env`) are theirs and are applied
+as before, and a sandbox that was created before the mark existed keeps the environment it was created with.
+The key stays where the session already keeps it (the session's stored configuration, server-managed), and is not
+shown to the model or the sandbox. Nothing changes while `CLAW_GITHUB_REVIEW_ENABLED` is off: such a session is
+an ordinary one.
 
 ## Review path: the diff or a sandbox
 
@@ -263,6 +296,7 @@ changes, no request for reviewers. The answer ends with exactly one last line, `
 | `CLAW_GITHUB_API_URL` | `https://api.github.com` | The API address |
 | `CLAW_GITHUB_CONFIRMATION_TTL_SECONDS` | 86400 | Life of a pending confirmation |
 | `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS` | none | Identity-provider client ids of the services that may answer a held merge, or create a session that acts as a user, for the user their token names (see "A service answering for the acting user"). Empty refuses every service |
+| `CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS` | none | The services whose delegated token may bring the requester's own `ak-` key in `x-api-key` (see "A service answering for the acting user", and [identity-client.md](identity-client.md)). Each must be in `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS` too, or the process does not start. Empty: no service may |
 | `CLAW_GITHUB_REVIEWS_PER_TOKEN_PER_HOUR` | 6 | Reviews one GitHub account may have in an hour (a review and its merge count once) |
 | `CLAW_GITHUB_REVIEWS_PER_HOUR` | 20 | The same, all accounts together |
 | `CLAW_GITHUB_CONCURRENT_PER_REPO` | 3 | Tool calls on one repository at once, per API replica |

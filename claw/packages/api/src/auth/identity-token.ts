@@ -39,6 +39,15 @@
  *     (RFC 8693 `act`) is not exchanged again. A SaFE or a provider that cannot be reached is a 503; a SaFE
  *     that does not accept the delegated token, or a provider that refuses the exchange, leaves the caller
  *     without keys and says so in the log. The token's roles are still not copied, and neither are SaFE's.
+ *   - A delegated token has no keys of its own, and one exception: a service the operator named in
+ *     `CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS` (default: none, compared exactly as the provider signed the token's
+ *     `client_id`) may send the person's own `ak-` key in `x-api-key` beside it, so that a turn it starts runs on the
+ *     person's own models and quota. SaFE verifies that key (as for any `ak-` key), and it is taken only when it is the
+ *     token's subject's own; the request is judged by the token, so it is still an identity-token caller. Whoever
+ *     asked for the key and does not get it is refused, never served keyless: a value that is not an `ak-` key, or
+ *     that SaFE does not accept, is a 401 `invalid_api_key`, a key that is somebody else's is a 401
+ *     `key_subject_mismatch`, SaFE not answering is a 503. A request from any other service, or with no
+ *     `x-api-key`, is as it always was, and so is a token that is not delegated: the header is not read for it.
  *   - The one way a token's role becomes the caller's role is an operator naming it in
  *     `CLAW_IDENTITY_TOKEN_TRUSTED_ROLES` (default: none; only `system-admin` and
  *     `system-admin-readonly` can be named). Even then a role is adopted only when all
@@ -62,7 +71,7 @@ import pino from "pino";
 import { IdentityUnavailableError, JwtVerificationError } from "@claw/utils";
 import type { UserInfo } from "./models.js";
 import { envBool } from "../config.js";
-import { DelegatedKeys, type SaFeKeys } from "./delegated-keys.js";
+import { DelegatedKeys, safeFailureOf, type SaFeKeys } from "./delegated-keys.js";
 import { identityClient } from "./identity.js";
 import type { CredentialOutcome } from "./middleware.js";
 import { isApiKey, type SafeClient } from "./safe-client.js";
@@ -99,6 +108,8 @@ export interface IdentityTokenSettings {
   delegationAudience: string;
   /** The scope of that token. */
   delegationScope: string;
+  /** The services (client ids, compared as signed) whose delegated token may bring its subject's own key in `x-api-key`. */
+  ownKeyClientIds: string[];
 }
 
 function setting(key: string, fallback: string): string {
@@ -117,6 +128,8 @@ function setting(key: string, fallback: string): string {
  *                                     confer (system-admin, system-admin-readonly); default none
  *   CLAW_IDENTITY_TOKEN_DELEGATION_AUDIENCE  the `aud` of the delegated token presented to SaFE, default primus-safe
  *   CLAW_IDENTITY_TOKEN_DELEGATION_SCOPE     its scope, default safe.api
+ *   CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS   comma- or space-separated client ids of the services whose delegated token may bring
+ *                                            the person's own `ak-` key in `x-api-key`; default none
  */
 export function identityTokenSettings(): IdentityTokenSettings {
   return {
@@ -127,7 +140,16 @@ export function identityTokenSettings(): IdentityTokenSettings {
     trustedRoles: trustedRoles(process.env.CLAW_IDENTITY_TOKEN_TRUSTED_ROLES),
     delegationAudience: setting("CLAW_IDENTITY_TOKEN_DELEGATION_AUDIENCE", "primus-safe"),
     delegationScope: setting("CLAW_IDENTITY_TOKEN_DELEGATION_SCOPE", "safe.api"),
+    ownKeyClientIds: parseClientIds(process.env.CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS),
   };
+}
+
+/**
+ * Client ids as an operator lists them, separated by commas or white space. Not lower-cased and not trimmed past the separators: a
+ * client id is compared as the identity provider signed it, and `worker` and `Worker` are two clients.
+ */
+export function parseClientIds(raw: string | undefined): string[] {
+  return [...new Set((raw ?? "").split(/[\s,]+/).filter(Boolean))];
 }
 
 /**
@@ -161,11 +183,52 @@ function claimedTrustedRoles(trusted: readonly string[], claim: unknown): string
   return trusted.filter((r) => claim.includes(r));
 }
 
-/** What the token path asks of SaFE: only the access-token verification. `null` where there is no SaFE (Kubernetes mode). */
-export type TokenKeyVerifier = Partial<Pick<SafeClient, "verifyAccessToken">> | null;
+/**
+ * What the token path asks of SaFE: the access-token verification, and the verification of an `ak-` key (only for a service that
+ * may bring its subject's own). `null` where there is no SaFE (Kubernetes mode).
+ */
+export type TokenKeyVerifier = Partial<Pick<SafeClient, "verifyAccessToken" | "verifyApiKey">> | null;
 
 // One cache of keys per SaFE client, which is one per process; a test that builds a new client starts with none.
 const keyCaches = new WeakMap<object, DelegatedKeys>();
+
+/** What a request has for keys: SaFE's answer, or the refusal of the request that asked for keys it may not have. */
+type CallerKeys = SaFeKeys | { status: "refused"; reason: string; outcome: CredentialOutcome };
+
+/**
+ * The `x-api-key` this request brought, if it may bring one: its token is delegated and was issued to a service the operator named.
+ * `undefined` for every other request, whose header is not read here at all (as it never was on this path). `""` is a header that is
+ * there and empty: that is a key asked for and not given, so a refusal, not "no key".
+ */
+function ownKeyPresented(req: FastifyRequest, claims: Record<string, unknown>, clientId: string, settings: IdentityTokenSettings): string | undefined {
+  if (claims.act === undefined || !clientId || !settings.ownKeyClientIds.includes(clientId)) return undefined;
+  const header = req.headers["x-api-key"];
+  if (header === undefined) return undefined;
+  return (Array.isArray(header) ? header[0] ?? "" : header).trim();
+}
+
+/**
+ * The keys of a person whose own `ak-` key a service brought along with its delegated token. The key is SaFE's to judge, as for any
+ * `ak-` key, and it counts only when SaFE says it is the token's subject's: the same rule as for the keys got by delegation.
+ */
+async function ownKeysOf(verifier: TokenKeyVerifier, key: string, sub: string): Promise<CallerKeys> {
+  const verifyApiKey = verifier?.verifyApiKey?.bind(verifier);
+  if (!verifyApiKey) {
+    return { status: "misconfigured", message: "CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS needs SaFE to verify the key, and this deployment has none" };
+  }
+  const refused = (reason: string, legacyError: string, message: string): CallerKeys => ({ status: "refused", reason, outcome: refuse(401, legacyError, message) });
+  if (!isApiKey(key)) return refused("not_an_api_key", "invalid_api_key", "x-api-key must be the user's own API key (ak-...)");
+  let user: UserInfo;
+  try {
+    user = await verifyApiKey(key);
+  } catch (err) {
+    const failure = safeFailureOf(err);
+    return failure.status === "none" ? refused(failure.reason, "invalid_api_key", "SaFE does not accept the x-api-key") : failure;
+  }
+  if (user.userId !== sub) return refused("key_of_another_user", "key_subject_mismatch", "the x-api-key is not the access token's user's own key");
+  if (!user.platformKey && !user.virtualKey) return refused("key_without_keys", "invalid_api_key", "SaFE holds no keys for the x-api-key");
+  return { status: "keys", platformKey: user.platformKey, virtualKey: user.virtualKey };
+}
 
 /**
  * Ask SaFE for the keys of the person a verified token names, in the API's own name and theirs.
@@ -180,11 +243,15 @@ const keyCaches = new WeakMap<object, DelegatedKeys>();
  * API not being able to ask (no `AUTH_INTERNAL_TOKEN`), as for a cookie or a key: neither is "no
  * keys", so the caller is told so rather than served as a keyless user. Everything
  * else (the provider refusing the exchange, SaFE's 401 or 403, an id that is not the subject) is `none`, with the reason for the log.
+ *
+ * A delegated token has no keys of its own, but a service the operator named may bring the person's own key
+ * (`ownKeysOf`): what that asks of SaFE is a refusal of the request, never `none`.
  */
 async function safeKeysOf(
   verifier: TokenKeyVerifier, identity: NonNullable<ReturnType<typeof identityClient>>, token: string, sub: string,
-  claims: Record<string, unknown>, settings: IdentityTokenSettings,
-): Promise<SaFeKeys> {
+  claims: Record<string, unknown>, ownKey: string | undefined, settings: IdentityTokenSettings,
+): Promise<CallerKeys> {
+  if (ownKey !== undefined) return ownKeysOf(verifier, ownKey, sub);
   const verifyAccessToken = verifier?.verifyAccessToken?.bind(verifier);
   if (!verifier || !verifyAccessToken) return { status: "none", reason: "no_safe" };
   if (claims.act !== undefined) return { status: "none", reason: "delegated_token" };
@@ -256,7 +323,12 @@ export async function verifyIdentityAccessToken(
         if (answer.sub === sub) adopted = claimed.filter((r) => answer.roles.includes(r));
       }
     }
-    const keys = await safeKeysOf(verifier, identity, token, sub, claims, settings);
+    // Exactly as signed, not trimmed: an allowlist compares it, and `worker` and
+    // `worker ` are two clients (only a blank id is no id).
+    const clientId = typeof claims.client_id === "string" && claims.client_id.trim() !== "" ? claims.client_id : "";
+    const ownKey = ownKeyPresented(req, claims, clientId, settings);
+    const keys = await safeKeysOf(verifier, identity, token, sub, claims, ownKey, settings);
+    if (keys.status === "refused") return reject(keys.reason, keys.outcome);
     if (keys.status === "unavailable") {
       logger.warn({ path: pathname, source: keys.source }, "auth.identity_token.keys_unavailable");
       return {
@@ -281,9 +353,10 @@ export async function verifyIdentityAccessToken(
       logger.warn({ path: pathname, userId: sub, reason: keys.reason }, "auth.identity_token.no_safe_keys");
     }
     const actorSub = text((claims.act as { sub?: unknown } | undefined)?.sub);
-    // Exactly as signed, not trimmed: an allowlist compares it, and `worker` and
-    // `worker ` are two clients (only a blank id is no id).
-    const clientId = typeof claims.client_id === "string" && claims.client_id.trim() !== "" ? claims.client_id : "";
+    if (ownKey !== undefined && keys.status === "keys") {
+      // A person's own key used on a service's say: the log is where that is visible.
+      logger.info({ path: pathname, userId: sub, clientId: clientId.slice(0, MAX_SUBJECT_CHARS) }, "auth.identity_token.own_key_used");
+    }
     const user: UserInfo = {
       userId: sub,
       userName: (text(claims.name) || text(claims.preferred_username) || text(claims.email) || sub).slice(0, MAX_SUBJECT_CHARS),

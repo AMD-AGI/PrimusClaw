@@ -175,13 +175,22 @@ export class DelegatedKeys {
       if (!user.platformKey && !user.virtualKey) return { status: "none", reason: "safe_holds_no_keys" };
       return { status: "keys", platformKey: user.platformKey, virtualKey: user.virtualKey };
     } catch (err) {
-      if (err instanceof AuthServiceMisconfiguredError) return { status: "misconfigured", message: err.message };
-      // A 2xx that is not an answer (not JSON, no id) is SaFE, or something in front of it, failing: not a refusal.
-      if (err instanceof AuthUpstreamUnreachableError || err instanceof SafeUpstreamProtocolError) return { status: "unavailable", source: "safe" };
-      if (err instanceof SafeUpstreamHttpError) {
-        return err.status >= 500 ? { status: "unavailable", source: "safe" } : { status: "none", reason: `safe_http_${err.status}` };
-      }
-      return { status: "none", reason: "safe_does_not_accept_token" };
+      return safeFailureOf(err);
     }
   }
+}
+
+/**
+ * What a question to SaFE that failed says about the credential it asked about. The API (or SaFE) not being able to ask or answer is
+ * `unavailable` or `misconfigured`: not a verdict on the credential, so never kept and never told to a person as "invalid". Everything
+ * else is SaFE's refusal, as `none` with the reason for the log. One reading for every credential SaFE is asked about.
+ */
+export function safeFailureOf(err: unknown): Exclude<SaFeKeys, { status: "keys" }> {
+  if (err instanceof AuthServiceMisconfiguredError) return { status: "misconfigured", message: err.message };
+  // A 2xx that is not an answer (not JSON, no id) is SaFE, or something in front of it, failing: not a refusal.
+  if (err instanceof AuthUpstreamUnreachableError || err instanceof SafeUpstreamProtocolError) return { status: "unavailable", source: "safe" };
+  if (err instanceof SafeUpstreamHttpError) {
+    return err.status >= 500 ? { status: "unavailable", source: "safe" } : { status: "none", reason: `safe_http_${err.status}` };
+  }
+  return { status: "none", reason: "safe_does_not_accept_credential" };
 }

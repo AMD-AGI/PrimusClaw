@@ -8,7 +8,8 @@
  *
  *   V  what the create route accepts and refuses, and what it records, and who may ask for it: a session that acts as a user is
  *      the person's say, so the key a sandbox holds (or the cookie that key signs in to) cannot start one
- *   T  the `mcp_servers` entry a turn carries: only for such a session, signed, reserved
+ *   T  the `mcp_servers` entry a turn carries: only for such a session, signed, reserved; and the `withhold_sandbox_keys` mark that keeps
+ *      its owner's keys out of the sandbox (T5-T7; the other ways a turn reaches Brain are github-review-acting-dispatch-keys.test.ts)
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach } from "node:test";
@@ -146,10 +147,10 @@ test("V5 the key a sandbox holds, the cookie that key signs in to and every othe
 test("V6 an identity-provider token creates one: a person's own, and a service's only from a client the operator named", async () => {
   const saved = process.env.CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS;
   try {
-    process.env.CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS = "clawy-worker";
+    process.env.CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS = "chat-service";
     assert.equal((await create(ALICE, { acting_as: "u-alice" })).status, 200, "a person's own token, acting as themselves");
     assert.equal((await create({ ...ALICE, delegation: { clientId: "claw-web" } }, { acting_as: "u-bob" })).status, 200, "a token that names a client and no actor is the person's");
-    const service = { ...ALICE, delegation: { actorSub: "clawy-worker", clientId: "clawy-worker" } };
+    const service = { ...ALICE, delegation: { actorSub: "chat-service", clientId: "chat-service" } };
     assert.equal((await create(service, { acting_as: "u-bob" })).status, 200, "an allowed service acting for Alice");
     const other = await create({ ...ALICE, delegation: { actorSub: "other-service", clientId: "other-service" } }, { acting_as: "u-bob" });
     assert.equal(other.status, 403);
@@ -208,4 +209,53 @@ test("T4 no tools for a deleted session, a missing one, or when the secret is mi
   const query = db.query;
   db.query = (async () => { throw new Error("database down"); }) as typeof db.query;
   try { assert.deepEqual(await tools.githubReviewMcpServers(id), {}); } finally { db.query = query; }
+});
+
+test("T5 the first turn of a session that acts as a user is marked so that its sandbox holds none of its owner's keys, and any other turn is not", async () => {
+  const acting = await create(ALICE, { acting_as: "u-bob" }, { message: { content: "review it" } });
+  assert.equal(acting.status, 200, JSON.stringify(acting.body));
+  assert.equal(published[0]?.withhold_sandbox_keys, true);
+  assert.equal(published[0]?.platform_key, "pk", "Brain is still given the keys: it asks the model and SaFE with them");
+  assert.equal(published[0]?.llm_api_key, "vk");
+  const plain = await create(ALICE, { notify_on_finish: true }, { message: { content: "hello" } });
+  assert.equal(plain.status, 200);
+  assert.equal("withhold_sandbox_keys" in (published[1] ?? {}), false, "an ordinary session's turn is exactly what it was");
+});
+
+test("T6 the mark is read from the live row at the time the turn is built, as the tools are, and a row that cannot be read is not a turn with keys", async () => {
+  const id = (await create(ALICE, { acting_as: "u-bob" })).body.data.session_id as string;
+  const marked = async (sessionId: string): Promise<unknown> => {
+    const task: Record<string, unknown> = {};
+    await tools.applySandboxKeyPolicyToTask(task, sessionId);
+    return task.withhold_sandbox_keys;
+  };
+  assert.equal(await marked(id), true);
+  // The same reading of `acting_as` as the tools and the turn gate: only a well-formed id counts.
+  for (const [config, expected] of [
+    [{ acting_as: "u-bob" }, true], [{ acting_as: "has space" }, undefined], [{ acting_as: 7 }, undefined], [{ acting_as: null }, undefined], [{}, undefined],
+  ] as const) {
+    await h.sql("UPDATE claw_sessions SET config = $2::jsonb WHERE session_id = $1", [id, JSON.stringify(config)]);
+    assert.equal(await marked(id), expected, JSON.stringify(config));
+    assert.equal(tools.withholdsSandboxKeys(config), expected === true, JSON.stringify(config));
+  }
+  assert.equal(await marked("no-such-session"), undefined);
+  // Unlike the tools, which a turn does not depend on, a failure to read is not swallowed: the turn is not built.
+  const query = db.query;
+  db.query = (async () => { throw new Error("database down"); }) as typeof db.query;
+  try { await assert.rejects(marked(id), /database down/); } finally { db.query = query; }
+});
+
+test("T7 the mark does not depend on the tools being offered: a session that acts as a user is marked without a secret to sign the tools with", async () => {
+  const id = (await create(ALICE, { acting_as: "u-bob" })).body.data.session_id as string;
+  const saved = process.env.CLAW_GITHUB_REVIEW_MCP_SECRET;
+  process.env.CLAW_GITHUB_REVIEW_MCP_SECRET = "";
+  try {
+    assert.deepEqual(await tools.githubReviewMcpServers(id), {}, "no tools");
+    const task: Record<string, unknown> = {};
+    await applyAppMcpToTask(task, id);
+    assert.equal(task.withhold_sandbox_keys, true, "and still no keys in the sandbox");
+    assert.equal("mcp_servers" in task, false);
+  } finally {
+    process.env.CLAW_GITHUB_REVIEW_MCP_SECRET = saved;
+  }
 });

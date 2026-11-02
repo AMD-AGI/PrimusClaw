@@ -2656,7 +2656,12 @@ async function provisionHands(
   // a shared virtualKey relay.
   // In safe mode the same key is also SAFE_API_KEY (platform-owned; the deny
   // lists keep user/system env from overriding it).
-  applyPlatformKeyEnv(env, apiKey, isKubernetesMode());
+  //
+  // Not for a session that acts as a user's GitHub account: its model reads text
+  // strangers wrote, and whatever the sandbox's environment holds the model can
+  // print. `apiKey` itself is still what the workload is created and owned with
+  // (below); only the copy a process in the sandbox could read is withheld.
+  applyPlatformKeyEnv(env, request.withhold_sandbox_keys ? undefined : apiKey, isKubernetesMode());
 
   // Multi-node: point Hyperloom's SaFE-less external mode at the cluster Brain
   // already provisioned instead of the per-user SaFE workload it would

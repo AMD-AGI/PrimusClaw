@@ -25,6 +25,7 @@
  *   K4  two users never share a key, and the roles are still nobody's but the operator's
  *   K5  the answer is kept per person for at most the delegated token's life, and a failure to answer is not
  *   K6  `callerAuthOf` presents the platform key for such a caller (`GET /v1/me` with it is me-route-identity-token.test.ts)
+ *   K7  a delegated token has no keys, except an allow-listed service's, which may bring the person's own key: which refusals, and what is never read
  */
 import test, { after, before, beforeEach, describe } from "node:test";
 import assert from "node:assert/strict";
@@ -64,9 +65,24 @@ let delegations: DelegationRequest[];
 let verifyAnswer: (req: SeenRequest, res: import("node:http").ServerResponse) => void;
 let client: SafeClient;
 
+/** The `ak-` keys SaFE knows, and whose they are. */
+const API_KEYS: Record<string, string> = { "ak-alice-platform": "u-alice", "ak-bob-platform": "u-bob", "ak-nv-platform": "u-novirtual", "ak-nokeys": "u-nokeys" };
+
 const defaultVerify: typeof verifyAnswer = (req, res) => {
   if (req.headers["x-internal-token"] !== INTERNAL) return sendJson(res, 403, { code: 403, message: "internal authentication required" });
-  const body = JSON.parse(req.body) as { authorization?: string; includePlatformKey?: boolean; includeVirtualKey?: boolean };
+  const body = JSON.parse(req.body) as { authorization?: string; apiKey?: string; includePlatformKey?: boolean; includeVirtualKey?: boolean };
+  if (body.apiKey !== undefined) {
+    const owner = ACCOUNTS[API_KEYS[body.apiKey] ?? ""];
+    if (!owner) return sendJson(res, 401, { code: 401, message: "invalid api key" });
+    return sendJson(res, 200, {
+      code: 0,
+      data: {
+        id: API_KEYS[body.apiKey], name: owner.name, roles: owner.roles,
+        ...(body.includePlatformKey ? { platformKey: owner.platformKey } : {}),
+        ...(body.includeVirtualKey ? { virtualKey: owner.virtualKey } : {}),
+      },
+    });
+  }
   const bearer = /^Bearer (\S+)$/.exec(body.authorization ?? "")?.[1] ?? "";
   const claims = payloadOf(bearer);
   const account = ACCOUNTS[claims.sub];
@@ -90,6 +106,7 @@ const ENV_KEYS = [
   "IDENTITY_EXCHANGE_REFRESH_SKEW_SECONDS",
   "CLAW_IDENTITY_TOKEN_AUTH_ENABLED", "CLAW_IDENTITY_TOKEN_AUDIENCE", "CLAW_IDENTITY_TOKEN_SCOPE", "CLAW_IDENTITY_TOKEN_INTROSPECT",
   "CLAW_IDENTITY_TOKEN_TRUSTED_ROLES", "CLAW_IDENTITY_TOKEN_DELEGATION_AUDIENCE", "CLAW_IDENTITY_TOKEN_DELEGATION_SCOPE",
+  "CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS",
 ];
 
 function identity(): void {
@@ -114,9 +131,10 @@ function mint(over: Record<string, unknown> = {}, signed = es): string {
   return signJwt({ key: signed, claims });
 }
 
-const request = (token: string): FastifyRequest => ({ headers: { authorization: `Bearer ${token}` } }) as unknown as FastifyRequest;
-const run = (token: string, verifier: Parameters<typeof verifyIdentityAccessToken>[1] = client) =>
-  verifyIdentityAccessToken(request(token), verifier, "/v1/sessions");
+const request = (token: string, headers: Record<string, string | string[]> = {}): FastifyRequest =>
+  ({ headers: { authorization: `Bearer ${token}`, ...headers } }) as unknown as FastifyRequest;
+const run = (token: string, verifier: Parameters<typeof verifyIdentityAccessToken>[1] = client, headers: Record<string, string | string[]> = {}) =>
+  verifyIdentityAccessToken(request(token, headers), verifier, "/v1/sessions");
 const verifyCalls = () => safe.seen.filter((r) => r.url === "/api/v1/auth/verify");
 const exchangeCalls = () => fake.requests.filter((r) => r.path === "/oauth/token");
 
@@ -277,8 +295,8 @@ describe("K2 every other way SaFE or the provider can answer", () => {
     }
   });
 
-  test("a delegated token (RFC 8693 act) is not exchanged again or shown to SaFE, and has no keys", async () => {
-    const u = user(await run(mint({ act: { sub: "svc-teams" } })));
+  test("a delegated token (RFC 8693 act) is not exchanged again or shown to SaFE, and has no keys (no service is named to bring its own: K7)", async () => {
+    const u = user(await run(mint({ act: { sub: "svc-chat" } })));
     assert.equal(u.platformKey, "");
     assert.equal(u.virtualKey, "");
     assert.equal(verifyCalls().length, 0);
@@ -523,5 +541,137 @@ describe("K6 what the rest of the API presents to SaFE for such a caller", () =>
   test("a caller authenticated another way is unchanged: the credential it presented", () => {
     assert.deepEqual(callerAuthOf(withMethod("api_key", alice, { authorization: "Bearer ak-presented" })), { authorization: "Bearer ak-presented" });
     assert.deepEqual(callerAuthOf(withMethod(null, alice, { authorization: "Bearer eyJ.a.b" })), {});
+  });
+});
+
+describe("K7 a delegated token has no keys, except an allow-listed service's, which may bring the person's own", () => {
+  const SERVICE = "svc-chat";
+  /** A token as the provider issues it to a service that acts for the person: `sub` the person, `act` and `client_id` the service. */
+  const delegatedBy = (service: string, over: Record<string, unknown> = {}) => mint({ act: { sub: service }, client_id: service, ...over });
+  const asService = (over: Record<string, unknown> = {}) => delegatedBy(SERVICE, over);
+  const asked = () => verifyCalls().map((c) => JSON.parse(c.body) as { apiKey?: string; authorization?: string });
+  beforeEach(() => { process.env.CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS = SERVICE; });
+
+  test("the person's own key is what SaFE is asked about and the keys SaFE answers are the caller's; the provider is not asked to exchange anything", async () => {
+    const u = user(await run(asService(), client, { "x-api-key": "ak-alice-platform" }));
+    assert.equal(u.userId, "u-alice");
+    assert.equal(u.platformKey, "ak-alice-platform");
+    assert.equal(u.virtualKey, "sk-alice-virtual");
+    assert.deepEqual(u.roles, ["default"], "SaFE's roles for the user are nobody's but the operator's, here too");
+    assert.deepEqual(u.delegation, { actorSub: SERVICE, clientId: SERVICE }, "still the caller it was: a service acting for the person");
+    const [call, ...rest] = verifyCalls();
+    assert.equal(rest.length, 0, "one question");
+    assert.equal(call!.headers["x-internal-token"], INTERNAL);
+    assert.deepEqual(asked(), [{ includePlatformKey: true, includeVirtualKey: true, apiKey: "ak-alice-platform" }]);
+    assert.equal(exchangeCalls().length, 0, "a delegated token is not exchanged again");
+  });
+
+  test("the header's value is trimmed, and a key with no virtual key is that user's all the same", async () => {
+    const u = user(await run(asService({ sub: "u-novirtual" }), client, { "x-api-key": "  ak-nv-platform  " }));
+    assert.deepEqual([u.userId, u.platformKey, u.virtualKey], ["u-novirtual", "ak-nv-platform", ""]);
+  });
+
+  // [name, the key sent, the token's subject, SaFE's answer, status, error code, whether SaFE is asked at all]
+  const refusals: Array<[string, string, string, typeof verifyAnswer | null, number, string, boolean]> = [
+    ["a key that is another person's is not served as theirs, and not as the token's user keyless either", "ak-bob-platform", "u-alice", null, 401, "key_subject_mismatch", true],
+    ["a key SaFE does not know", "ak-nobody", "u-alice", null, 401, "invalid_api_key", true],
+    ["a key SaFE has no keys for", "ak-nokeys", "u-nokeys", null, 401, "invalid_api_key", true],
+    ["SaFE's 403 (it does not accept this API's own credential) is not a verdict that is told as a person's key being fine", "ak-alice-platform", "u-alice", (_r, res) => sendJson(res, 403, { code: 403, message: "refused" }), 401, "invalid_api_key", true],
+    ["a value that is not an ak- key", "sk-alice-virtual", "u-alice", null, 401, "invalid_api_key", false],
+    ["an Authorization-style value", "Bearer ak-alice-platform", "u-alice", null, 401, "invalid_api_key", false],
+    ["a header that is there and empty is a key asked for and not given", "", "u-alice", null, 401, "invalid_api_key", false],
+    ["a header of blanks", "   ", "u-alice", null, 401, "invalid_api_key", false],
+    ["SaFE answers 500", "ak-alice-platform", "u-alice", (_r, res) => sendJson(res, 500, { code: 500, message: "boom" }), 503, "authentication_service_unavailable", true],
+    ["SaFE answers 503", "ak-alice-platform", "u-alice", (_r, res) => sendJson(res, 503, { code: 503, message: "down" }), 503, "authentication_service_unavailable", true],
+    ["a 200 that is a proxy's page", "ak-alice-platform", "u-alice", (_r, res) => { res.writeHead(200, { "content-type": "text/html" }); res.end("<html>bad gateway</html>"); }, 503, "authentication_service_unavailable", true],
+    ["a connection that is dropped", "ak-alice-platform", "u-alice", (r, res) => { res.destroy(); void r; }, 503, "authentication_service_unavailable", true],
+  ];
+  for (const [name, key, sub, answer, status, code, asksSafe] of refusals) {
+    test(`refused, never served keyless: ${name}`, async () => {
+      if (answer) verifyAnswer = answer;
+      const e = refused(await run(asService({ sub }), client, { "x-api-key": key }));
+      assert.deepEqual([e.status, e.legacyError], [status, code]);
+      assert.equal(verifyCalls().length, asksSafe ? 1 : 0);
+      assert.equal(exchangeCalls().length, 0, "the keys of the delegation path are not a fallback for a key that was asked for");
+      assert.ok(!JSON.stringify(e).includes(key.trim() || "\u0000"), "the refusal does not repeat the key");
+    });
+  }
+
+  test("no AUTH_INTERNAL_TOKEN to ask SaFE with is a 500 authentication_misconfigured, as for any key, and SaFE is not asked", async () => {
+    const saved = process.env.AUTH_INTERNAL_TOKEN;
+    delete process.env.AUTH_INTERNAL_TOKEN;
+    try {
+      const e = refused(await run(asService(), client, { "x-api-key": "ak-alice-platform" }));
+      assert.deepEqual([e.status, e.legacyError], [500, "authentication_misconfigured"]);
+      assert.equal(verifyCalls().length, 0);
+    } finally {
+      process.env.AUTH_INTERNAL_TOKEN = saved;
+    }
+  });
+
+  test("with no SaFE to verify the key (Kubernetes mode, or a verifier that cannot) it is a 500 authentication_misconfigured, never keyless", async () => {
+    for (const verifier of [null, {}, { verifyAccessToken: client.verifyAccessToken.bind(client) }] as const) {
+      const e = refused(await run(asService(), verifier, { "x-api-key": "ak-alice-platform" }));
+      assert.deepEqual([e.status, e.legacyError], [500, "authentication_misconfigured"]);
+      assert.match(e.message, /CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS/);
+    }
+    assert.equal(verifyCalls().length, 0);
+  });
+
+  // The header is read only for a delegated token of a named service. Everywhere else it is not read at all: today's behaviour.
+  // [name, the environment's list (null: unset; undefined: the service of this suite), the token, the key sent]: each is what it was
+  // before this setting, and the caller has no keys of its own.
+  const ignored: Array<[string, string | null | undefined, () => string, string | null]> = [
+    ["no service is named (the default)", null, () => asService(), "ak-alice-platform"],
+    ["an empty list", "", () => asService(), "ak-alice-platform"],
+    ["another service is named", "svc-other", () => asService(), "ak-alice-platform"],
+    ["a client id that differs by a trailing space", undefined, () => delegatedBy(`${SERVICE} `), "ak-alice-platform"],
+    ["a client id that differs by case", undefined, () => delegatedBy("SVC-CHAT"), "ak-alice-platform"],
+    ["a client id that merely begins with a named one", undefined, () => delegatedBy(`${SERVICE}-2`), "ak-alice-platform"],
+    ["a delegated token that names no client", undefined, () => asService({ client_id: undefined }), "ak-alice-platform"],
+    ["a named service that sent no key", undefined, () => asService(), null],
+  ];
+  for (const [name, list, token, key] of ignored) {
+    test(`not read, no keys of the person's own (as before): ${name}`, async () => {
+      if (list === null) delete process.env.CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS;
+      else if (list !== undefined) process.env.CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS = list;
+      const u = user(await run(token(), client, key === null ? {} : { "x-api-key": key }));
+      assert.equal(u.userId, "u-alice");
+      assert.equal(u.platformKey, "");
+      assert.equal(u.virtualKey, "");
+      assert.equal(verifyCalls().length, 0, "the key was not shown to SaFE");
+      assert.equal(exchangeCalls().length, 0);
+    });
+  }
+
+  test("a token that is not delegated has the keys SaFE holds for its subject by delegation, whatever key rides along and whoever sent it", async () => {
+    // The named service's own plain token (no act): the header is not read, so a key that is somebody else's gets nobody anything.
+    const u = user(await run(mint({ client_id: SERVICE }), client, { "x-api-key": "ak-bob-platform" }));
+    assert.deepEqual([u.userId, u.platformKey, u.virtualKey], ["u-alice", "ak-alice-platform", "sk-alice-virtual"]);
+    assert.deepEqual(asked().map((q) => Object.keys(q).includes("apiKey")), [false], "SaFE was asked about the delegated token, never about the key");
+    assert.equal(delegations.length, 1);
+  });
+
+  test("a token that does not verify is refused before the key is looked at", async () => {
+    for (const token of [mint({ aud: "someone-else", act: { sub: SERVICE }, client_id: SERVICE }), mint({ scope: "openid", act: { sub: SERVICE }, client_id: SERVICE })]) {
+      assert.equal((await run(token, client, { "x-api-key": "ak-alice-platform" })).status, "rejected");
+    }
+    assert.equal(verifyCalls().length, 0);
+  });
+
+  test("a value that is not an ak- key is refused here, whatever the verifier would have said of it", async () => {
+    // Not left to the SaFE client's own check of the shape: a verifier that says yes to everything is asked about nothing that is not a key.
+    const yes = { verifyApiKey: async () => ({ userId: "u-alice", userName: "Alice", roles: [], platformKey: "p", virtualKey: "v" }) };
+    for (const key of ["sk-alice-virtual", "", "  ", "Bearer ak-alice-platform"]) {
+      const e = refused(await run(asService(), yes, { "x-api-key": key }));
+      assert.deepEqual([e.status, e.legacyError], [401, "invalid_api_key"], JSON.stringify(key));
+    }
+    assert.equal(user(await run(asService(), yes, { "x-api-key": "ak-anything" })).platformKey, "p", "and a key is what the verifier is asked about");
+  });
+
+  test("the setting's value is a list of client ids, as signed: commas or white space, and each is compared whole", async () => {
+    process.env.CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS = ` first ,${SERVICE}\n  third,${SERVICE}`;
+    assert.equal(user(await run(asService(), client, { "x-api-key": "ak-alice-platform" })).platformKey, "ak-alice-platform");
+    assert.equal(user(await run(delegatedBy("fir"), client, { "x-api-key": "ak-alice-platform" })).platformKey, "");
   });
 });

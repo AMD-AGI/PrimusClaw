@@ -43,6 +43,7 @@ import { registerMcpRoutes } from "./routes/mcp.js";
 import { registerGithubReviewRoutes } from "./github-review/mcp.js";
 import { githubReviewConfigErrors, readGithubReviewSettings } from "./github-review/settings.js";
 import { identityClient } from "./auth/identity.js";
+import { identityTokenSettings } from "./auth/identity-token.js";
 import { registerMeRoutes } from "./routes/me.js";
 import { registerModelsRoutes } from "./routes/models.js";
 import { registerInternalTaskRoutes } from "./routes/internal-tasks.js";
@@ -164,7 +165,7 @@ function assertGithubReviewConfig(): void {
   const settings = readGithubReviewSettings();
   if (!settings.enabled) return;
   if (settings.problems.length) logger.error({ refused: settings.problems }, "startup.config_refused");
-  const errors = githubReviewConfigErrors(settings, identityClient() !== null);
+  const errors = githubReviewConfigErrors(settings, identityClient() !== null, identityTokenSettings().ownKeyClientIds);
   if (errors.length === 0) return;
   logger.error({ errors }, "startup.github_review_refused");
   throw new Error(`CLAW_GITHUB_REVIEW_ENABLED is true but GitHub review cannot be offered: ${errors.join("; ")}`);
