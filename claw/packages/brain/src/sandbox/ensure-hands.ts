@@ -176,6 +176,10 @@ export function requestSpecFingerprint(
     userEnv: request.user_env,
     sessionEnv: request.session_env,
   });
+  // As the sandbox is built (provisionHands): a session that acts as a user has none of the key variables, so a change in one of
+  // them is not a change in the sandbox, and its key is not one that was injected.
+  const withholdKeys = request.withhold_sandbox_keys === true;
+  if (withholdKeys) withholdKeyEnv(env);
   const labels = action.params.labels ?? {};
   const namespace = sandboxNamespaceFor(request);
   if (kubernetes) {
@@ -194,7 +198,8 @@ export function requestSpecFingerprint(
       // rotation only reaches the sandbox by rebuilding it. safe mode
       // authenticates with the deployment's platform key instead, which is
       // not per-request and so is not folded in there.
-      llmKey: resolveRequestLlmKey(request),
+      llmKey: withholdKeys ? undefined : resolveRequestLlmKey(request),
+      withholdKeys,
     });
   }
   const resources: Record<string, string> = {};
@@ -209,6 +214,7 @@ export function requestSpecFingerprint(
     ttlSec: action.params.ttl_sec ?? DEFAULT_SANDBOX_TTL_SEC,
     labels,
     namespace,
+    withholdKeys,
   });
 }
 

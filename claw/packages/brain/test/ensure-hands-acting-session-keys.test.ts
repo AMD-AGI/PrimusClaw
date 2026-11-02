@@ -41,6 +41,8 @@ function echoKv(): KV {
     async get(key: string) { return stored && key.startsWith("hands.") ? { key, value: stored, revision: 1 } : null; },
     async put(_key: string, value: Uint8Array) { stored = value; return 1; },
     async update(_key: string, value: Uint8Array) { stored = value; return 2; },
+    // The ledger a displaced sandbox is retained in (a turn that is not served by the sandbox the session has).
+    async create() { return 1; },
     async delete() {},
   } as unknown as KV;
 }
@@ -132,4 +134,42 @@ test("no layer can put a key back: the spec's env, the user's own variables and 
     for (const name of KEY_NAMES) assert.equal(name in env, false, `${name} is not in the sandbox's environment`);
     assert.deepEqual([env.SPEC_KEPT, env.USER_KEPT, env.SESSION_KEPT], ["1", "1", "1"], "and nothing else is taken out");
   }
+});
+
+test("a sandbox that was made with the keys is not reused for a turn that is not to have them, and one made without them is reused as any is", async () => {
+  // A session's later turn finds the sandbox of an earlier one (reuse is decided by what the sandbox was built with). One built before
+  // the mark existed holds the key in its environment, and cannot lose it: the next turn has to get a new one.
+  const kv = echoKv();
+  bindHandsKv(kv);
+  const created: SandboxCreateParams[] = [];
+  const provider = {
+    kind: "safe-workload",
+    async create(params: SandboxCreateParams) {
+      created.push(params);
+      return { provider: "safe-workload", id: `wl-${created.length}`, sandboxName: `wl-${created.length}`, namespace: "ns-test", handsBaseUrl: "", platformKey: PLATFORM_KEY };
+    },
+    async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
+    async stop() {},
+  } as unknown as SandboxProvider;
+  restores.push(bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider }));
+  restores.push(bindSandboxReuseEffects({ registerSandbox: () => {}, probeSandboxContainer: async () => ({ verdict: "gone", reason: "test" }) } as never));
+  realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response("ok", { status: 200 })) as unknown as typeof fetch;
+  let turns = 0;
+  const turn = (extra: Partial<ExecuteRequest>) => ensureHands("sess-reuse", {
+    task_id: `task-reuse-${++turns}`, session_id: "sess-reuse", llm_api_key: "sk-owner-virtual-key-0001",
+    sandbox_spec: { handle: "main", image: "registry.test/img:1", resources: { cpu: "1", memory: "1Gi" } }, ...extra,
+  } as unknown as ExecuteRequest, PLATFORM_KEY, async () => {});
+
+  await turn({});
+  assert.equal(created.length, 1);
+  assert.equal(created[0]!.env.SAFE_API_KEY, PLATFORM_KEY, "the first turn's sandbox holds the key");
+  await turn({});
+  assert.equal(created.length, 1, "control: the same request is served by the sandbox it already has");
+
+  await turn({ withhold_sandbox_keys: true });
+  assert.equal(created.length, 2, "a turn that is not to have the keys is not served by a sandbox that has them");
+  assert.equal("SAFE_API_KEY" in created[1]!.env, false);
+  await turn({ withhold_sandbox_keys: true });
+  assert.equal(created.length, 2, "and the sandbox it was given is reused for the next one");
 });

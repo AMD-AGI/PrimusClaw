@@ -142,6 +142,33 @@ test("A1f no platform key: the row is closed and the task fails", async () => {
   assert.equal(h.done[0]!.abortReason, "error");
 });
 
+test("A1j an app run of a session that acts as a user is ended, not run: it is admitted before the API refused it, and its sandbox would be made with the owner's key", async () => {
+  const runner = fakeRunner(async () => { throw new Error("must not run"); });
+  const h = harness(runner);
+  const abortCtrl = new AbortController();
+  activeAbort.set("lock.s-app", abortCtrl);
+  await runHandleTask(h.msg, { ...request("app"), withhold_sandbox_keys: true } as ExecuteRequest, "s-app", "lock.s-app", "m1", "u1", abortCtrl);
+  assert.equal(runner.runs, 0, "the application is never started");
+  assert.equal(runner.made.length, 1);
+  assert.equal(runner.made[0]!.platformKey, "", "a runner is made only to close the row, with no key");
+  assert.deepEqual(runner.closed, ["a hosted application is not run for a session that acts as a user"], "the row is ended, not left running");
+  assert.equal(h.runningSignals(), 0, "nothing says the run is running");
+  assert.equal(h.done.length, 1);
+  assert.equal(h.done[0]!.abortReason, "error");
+  assert.equal(h.engineCalls() + h.sandboxCalls(), 0);
+});
+
+test("A1k the same run's finish-only dispatch (the task already closed) is still wound up as always: that only tears down", async () => {
+  const runner = fakeRunner(async () => ({ kind: "ended", outcome: { success: false, reason: "app run ended: cancelled" } }));
+  const h = harness(runner);
+  const abortCtrl = new AbortController();
+  activeAbort.set("lock.s-app", abortCtrl);
+  await runHandleTask(h.msg, { ...request("app"), app_finish_only: true, withhold_sandbox_keys: true } as ExecuteRequest, "s-app", "lock.s-app", "m1", "u1", abortCtrl);
+  assert.equal(runner.runs, 1);
+  assert.equal(runner.closed.length, 0);
+  assert.equal(h.finishDone(), 1);
+});
+
 test("A1b a failed app run is reported as a failure with the runner's reason, and not retried", async () => {
   const runner = fakeRunner(async () => ({ kind: "ended", outcome: { success: false, reason: "app exited final with return code 3 (rate limit 429)" } }));
   const h = harness(runner);
