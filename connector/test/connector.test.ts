@@ -726,15 +726,20 @@ describe("a connector that runs for days", () => {
     const count = () => getEventListeners(signal, "abort").length;
     // Everything below waits on a count of what happened, never on elapsed time: a loaded runner stretches the
     // wait, it cannot shrink the number of heartbeats and drain waits the assertions need to have seen.
-    assert.ok(await h.connector.drained(), "the start-up events were acknowledged");
+    assert.ok(await h.connector.drained(COUNT_WAIT_MS), "the start-up events were acknowledged");
     await h.claw.until("a few heartbeats while idle", () => h.claw.heartbeats.length >= 3, COUNT_WAIT_MS);
     const before = count();
     const beats = h.claw.heartbeats.length;
     const posts = () => h.claw.requests.filter((r) => r.path.endsWith("/events")).length;
     const postsBefore = posts();
-    for (let i = 0; i < 6; i++) { h.prompt(sid, "say x"); await h.turnEnd(sid, i + 1); }
-    // Each turn's end is its own post (the next prompt is only sent after it arrived), and the sender goes back to
-    // waiting for the next event after each one: that is six drain waits on the run-long signal, at least.
+    for (let i = 0; i < 6; i++) {
+      h.prompt(sid, "say x");
+      await h.turnEnd(sid, i + 1);
+      // The fake server stores an event before it answers the post, so the turn end arriving does not yet mean the sender
+      // is back at rest. Once the outbox is empty it is: the sender is parked in its wait on the run-long signal, and the
+      // next prompt's first event wakes it. That is one drain wait per turn, six in all.
+      assert.ok(await h.connector.drained(COUNT_WAIT_MS), `the events of turn ${i + 1} were acknowledged`);
+    }
     assert.ok(posts() - postsBefore >= 6, `drain waits happened: ${posts() - postsBefore} posts`);
     // The heartbeats must keep coming while those waits are pending, and long enough to show a leak per wait.
     await h.claw.until("20 more heartbeats", () => h.claw.heartbeats.length - beats >= 20, COUNT_WAIT_MS);
