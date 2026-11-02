@@ -105,6 +105,7 @@ describe("assistant worker reports", { skip }, () => {
     assert.equal(row.result_version, 1);
     assert.equal(row.attention_seq, 1);
     const ready = (await w.itemEvents(item.itemId)).find((e) => e.kind === "ready");
+    assert.ok(ready, "the report is logged");
     assert.equal(ready.generation, 1);
     assert.equal(ready.run_id, turn.task_id);
     assert.equal(ready.result.run_id, turn.task_id, "a result is pinned to the run that made it");

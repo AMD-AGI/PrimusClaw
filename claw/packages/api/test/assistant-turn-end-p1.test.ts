@@ -7,7 +7,7 @@
  *
  *   E1  a turn that ends with no report is recorded as ready, with the worker's last words
  *   E2  a run that failed is recorded as failed, never as ready
- *   E3  the same completion delivered twice is one record and one wake
+ *   E3  the same completion delivered twice is one record and one wake, also when both passed the check together
  *   E4  a turn that already told the assistant something it must act on is not recorded again
  *   E5  an interrupted turn, a turn with another queued behind it and a run of no item are left alone
  *   E6  the completion handler does it: an exec_complete for a worker session ends in the record
@@ -97,6 +97,16 @@ describe("assistant turn ends and sweeps", { skip }, () => {
     await Promise.all([1, 2, 3].map(() => end(turn, { finalText: "done" })));
     assert.equal((await turnEnds()).length, 1);
     assert.equal(await routerWakes(), 1);
+  });
+
+  test("E3c the check and the write are not one step: two that both passed the check meet the unique key, and one is absorbed", async () => {
+    const turn = await endedRun();
+    const run = { itemId: item.itemId, workerSessionId: item.workerSid, generation: turn.gen!, runId: turn.task_id };
+    const outcomes = await Promise.all([1, 2, 3].map(() => w.mod.reports.ingestReport(run, { kind: "ready", summary: "done" }, "turn_end")));
+    assert.deepEqual(outcomes.map((o) => o.status).sort(), ["applied", "duplicate", "duplicate"]);
+    assert.equal((await turnEnds()).length, 1);
+    assert.equal(await routerWakes(), 1);
+    assert.equal((await w.item(item.itemId)).attention_seq, 1, "the need was entered once");
   });
 
   test("E4 a turn that already told the assistant something it must act on adds nothing", async () => {
@@ -277,7 +287,11 @@ describe("assistant turn ends and sweeps", { skip }, () => {
     assert.equal(await w.mod.silent.tellSilentItems(30), 1, "the threshold is the setting, not a constant");
     await w.q("TRUNCATE claw_assistant_says");
     await w.q("UPDATE claw_work_items SET board_state = 'in_progress' WHERE item_id = $1", [item.itemId]);
-    assert.equal(await w.mod.silent.tellSilentItems(30), 0);
+    const real = w.mod.silent.silentSweepPorts.recordNeedsYouFallback;
+    const asked: string[] = [];
+    w.mod.silent.silentSweepPorts.recordNeedsYouFallback = async (input) => { asked.push(input.itemId); return real(input); };
+    try { assert.equal(await w.mod.silent.tellSilentItems(30), 0); } finally { w.mod.silent.silentSweepPorts.recordNeedsYouFallback = real; }
+    assert.deepEqual(asked, [], "an item that does not need the user is not even looked at, let alone announced");
   });
 
   test("S3 a say whose delivery fails does not count; the sweep sends one fallback and only one", async () => {

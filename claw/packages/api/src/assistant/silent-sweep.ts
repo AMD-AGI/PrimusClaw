@@ -23,6 +23,9 @@ const logger = pino({ name: "assistant-silent-sweep" });
 
 const BATCH = 50;
 
+/** The announcement, behind a seam so a test can see which items the sweep chose to announce. */
+export const silentSweepPorts = { recordNeedsYouFallback };
+
 /** Returns how many announcements were made. */
 export async function tellSilentItems(thresholdSeconds: number = CLAW_ASSISTANT_SILENT_SWEEP_SEC): Promise<number> {
   const items = (await db.query(
@@ -41,7 +44,7 @@ export async function tellSilentItems(thresholdSeconds: number = CLAW_ASSISTANT_
   let told = 0;
   for (const item of items) {
     try {
-      if (await recordNeedsYouFallback({ itemId: item.item_id })) told += 1;
+      if (await silentSweepPorts.recordNeedsYouFallback({ itemId: item.item_id })) told += 1;
     } catch (err) {
       logger.warn({ err, itemId: item.item_id }, "assistant.needs_you_fallback_failed");
     }
