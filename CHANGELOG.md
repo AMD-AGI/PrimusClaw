@@ -146,6 +146,17 @@ record it.
   confirmed is not opened); the adapter's own permission options passed through verbatim, including
   allow-always; credentials masked before upload; a local audit log; a kill switch that stops only the
   process groups it started. See `connector/README.md`.
+- `@primusclaw/connector` on npm: publishing a GitHub Release tagged `connector-vX.Y.Z` runs
+  `.github/workflows/connector-release.yml`, which tests the connector, signs a build-provenance attestation
+  for the tarball, attaches it to the release and publishes it with npm Trusted Publishing (a short-lived OIDC
+  credential and a provenance statement; no stored npm token). The publish waits for a required reviewer
+  of the `npm-publish` environment (who may be the maintainer who cut the release; administrators cannot
+  bypass it), which is what keeps an unreviewed commit from being published, and creating a `connector-v*`
+  tag is limited to repository admins by a tag ruleset. The tag must equal the version in
+  `connector/package.json`. Once a release has been published,
+  `npm install -g @primusclaw/connector` installs the `claw-connector` command (Node.js 22 or newer).
+  The package holds only the two bundles (the CLI and the session-hook program), README and LICENSE, and the Connector packaging workflow checks a real
+  tarball on every change (`connector/scripts/check-pack.mjs`), together with the shape of the release workflow.
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
@@ -360,6 +371,18 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- A caller authenticated by an identity provider's access token (`CLAW_IDENTITY_TOKEN_AUTH_ENABLED`) now has
+  the platform key and the virtual key SaFE holds for the token's subject, in the SaFE deployment mode. SaFE is never
+  shown the person's token: the API exchanges it at the provider (RFC 8693 service delegation, subject token type
+  access token) for a token for SaFE's audience that names the API as the party acting for the person
+  (`CLAW_IDENTITY_TOKEN_DELEGATION_AUDIENCE` and `_SCOPE`, default `primus-safe` and `safe.api`), and asks SaFE's
+  `POST /api/v1/auth/verify` with that, only for a token it has already accepted and that carries no actor. Only keys
+  for the token's own `sub` are used, and the answer is kept per person for at most the life the delegated token has
+  left, not per token and not for a fixed time. Before, such a caller had no model key (a turn failed with "Could not
+  resolve authentication method"), no key to create a sandbox with, and `GET /v1/me` answered 401. A SaFE that does
+  not accept the delegated token, or a provider that refuses the exchange, leaves the caller without keys; one that
+  cannot be reached, or answers 200 with something that is not an answer, is a 503. The provider's refusal of one subject token (`invalid_grant`: that device's grant is signed out, or the token has expired inside the clock tolerance) is kept for that token alone for 30 seconds, so the person's other tokens still get keys; only a refusal about the API's own client (`unauthorized_client`, `invalid_target`, `invalid_scope`) is kept per person. The MCP models tool no longer forwards such a caller's token to SaFE (it sends the platform key). A SaFE 5xx is no longer remembered as a failed verification of a cookie or key for 30
+  seconds. See `claw/docs/identity-client.md`.
 - A sandbox rebuilt from the workspace snapshot is still a git repository. `.git` was on the
   snapshot's exclude list, so after the idle window the files came back and the history did not,
   and every commit that had not been pushed was lost while the conversation still remembered

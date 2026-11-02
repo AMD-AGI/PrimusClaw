@@ -9,6 +9,7 @@
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { Audit } from "./audit.js";
+import { AttachSupport, fitResumable } from "./attach.js";
 import { ChildRegistry, processStart } from "./children.js";
 import { ClawClient, HttpError, RevokedError, TransportError } from "./claw-client.js";
 import type { ConnectorConfig } from "./config.js";
@@ -35,6 +36,12 @@ export interface ConnectorTiming extends SessionTiming {
   backoffMinMs: number;
   backoffMaxMs: number;
   pausePollMs: number;
+  /** An attach agent's list of existing sessions is reused this long. */
+  catalogMs: number;
+  /** How long the command that lists the open sessions may take before the check is refused as unanswerable. */
+  attachCliMs: number;
+  /** A session whose transcript was written this recently is still in someone's hands. */
+  recentWriteMs: number;
 }
 
 export const DEFAULT_TIMING: ConnectorTiming = {
@@ -46,6 +53,9 @@ export const DEFAULT_TIMING: ConnectorTiming = {
   backoffMinMs: 1_000,
   backoffMaxMs: 60_000,
   pausePollMs: 1_000,
+  catalogMs: 120_000,
+  attachCliMs: 8_000,
+  recentWriteMs: 10_000,
 };
 
 interface IdentityState {
@@ -127,6 +137,7 @@ export class Connector {
   readonly registry: ChildRegistry;
   readonly manager: SessionManager;
   readonly store: SessionStore;
+  private readonly attach = new Map<string, AttachSupport>();
   private ledger: CommandLedger = new CommandLedger();
   private cid = "";
   private revoked = false;
@@ -143,8 +154,16 @@ export class Connector {
     this.outbox = new Outbox({ dir: outboxDir(d.dirs) });
     this.registry = new ChildRegistry(childrenFile(d.dirs));
     this.store = new SessionStore(sessionsFile(d.dirs));
+    for (const a of d.config.agents) {
+      if (!a.attach) continue;
+      this.attach.set(a.id, new AttachSupport(a, {
+        registry: this.registry, audit: d.audit, log: d.log, logDir: logDir(d.dirs), version: d.version, env: process.env,
+        catalogMs: this.timing.catalogMs, cliTimeoutMs: this.timing.attachCliMs, recentWriteMs: this.timing.recentWriteMs,
+        attachedRefs: () => this.manager.attachedRefs(a.id),
+      }));
+    }
     const env: SessionEnv = {
-      config: d.config, audit: d.audit, registry: this.registry, store: this.store, timing: this.timing,
+      config: d.config, audit: d.audit, registry: this.registry, store: this.store, attach: this.attach, timing: this.timing,
       logDir: logDir(d.dirs), version: d.version, log: d.log,
       emit: (sid, type, data) => this.emit(sid, type, data),
     };
@@ -167,12 +186,15 @@ export class Connector {
     this.streamCtl?.abort();
   }
 
-  private descriptors(): RemoteAgentDescriptor[] {
-    return this.d.config.agents.map((a) => ({
-      agent_id: a.id, kind: a.kind, name: a.name,
+  private async descriptors(): Promise<RemoteAgentDescriptor[]> {
+    return Promise.all(this.d.config.agents.map(async (a) => {
       // `unattended`: sessions start in a mode that does not ask before a write or a command. `unattended_allowed`:
       // a phone may switch this agent to such a mode. A client shows the first so nobody is surprised by it.
-      capabilities: { ask_mode: a.askMode, modes: a.safeModes, roots: a.roots.slice(0, 8), protocol: 1, unattended: a.unattended, unattended_allowed: a.allowUnsafeModes },
+      const base = { ask_mode: a.askMode, modes: a.safeModes, roots: a.roots.slice(0, 8), protocol: 1, unattended: a.unattended, unattended_allowed: a.allowUnsafeModes };
+      const support = this.attach.get(a.id);
+      // An attach agent also says which existing sessions it could take over, and whether anything holds them open now.
+      const capabilities = support ? fitResumable(base, await support.resumable()) : base;
+      return { agent_id: a.id, kind: a.kind, name: a.name, capabilities };
     }));
   }
 
@@ -212,7 +234,7 @@ export class Connector {
 
   private async heartbeat(): Promise<void> {
     await this.d.client.heartbeat(this.cid, {
-      version: this.d.version, agents: this.descriptors(), cmd_cursor: this.ledger.cursor > 0 ? this.ledger.cursor : null,
+      version: this.d.version, agents: await this.descriptors(), cmd_cursor: this.ledger.cursor > 0 ? this.ledger.cursor : null,
     });
   }
 

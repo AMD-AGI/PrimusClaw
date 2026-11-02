@@ -20,6 +20,12 @@
   "dependencies": {
     "adm-zip": "^0.6.1"
   },
+  "//overrides": "archiver@8 -> readdir-glob@3 pins minimatch ^10, whose whole line is affected by GHSA-g3hv-75wg-m249 (fixed in 11.0.1); readdir-glob has no newer release. Drop this once archiver ships a readdir-glob that accepts minimatch >=11.0.1.",
+  "overrides": {
+    "readdir-glob": {
+      "minimatch": "^11.0.3"
+    }
+  },
   "engines": {
     "node": ">=26"
   }

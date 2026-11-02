@@ -111,10 +111,12 @@ accepts. The code is `packages/api/src/auth/identity-token.ts`; it verifies with
 | `CLAW_IDENTITY_TOKEN_AUDIENCE` | `claw-api` | The `aud` the token must name |
 | `CLAW_IDENTITY_TOKEN_SCOPE` | `claw.api` | The scope the token must carry |
 | `CLAW_IDENTITY_TOKEN_INTROSPECT` | off | Also ask the provider (RFC 7662) whether the token is still active, so a revoked grant stops at once rather than when the token expires |
+| `CLAW_IDENTITY_TOKEN_DELEGATION_AUDIENCE` | `primus-safe` | SaFE deployment mode: the audience of the token the API asks the provider for, to present to SaFE in the person's name (see "Keys for a token's user") |
+| `CLAW_IDENTITY_TOKEN_DELEGATION_SCOPE` | `safe.api` | The scope of that token |
 | `CLAW_IDENTITY_TOKEN_TRUSTED_ROLES` | none | The platform roles a token the provider confirms may confer: `system-admin` and/or `system-admin-readonly`, separated by commas or spaces. Any other name is ignored. See "Administrators" below |
 
 These are read on each request. In the chart they are `identity.tokenAuth.enabled`,
-`.audience`, `.scope`, `.introspect` and `.trustedRoles` (a list), rendered into the
+`.audience`, `.scope`, `.introspect`, `.delegationAudience`, `.delegationScope` and `.trustedRoles` (a list), rendered into the
 API Deployment only; `identity.tokenAuth.enabled` without `identity.enabled` is
 refused at render time, and so is a `trustedRoles` entry that is not one of the two
 adoptable roles.
@@ -135,7 +137,72 @@ this use.
 | `sub` | `userId`, exactly as the issuer wrote it. A subject that is missing, blank, padded with whitespace, longer than 128 characters, containing a control character, or equal to an owner the API uses for a caller it did not authenticate (`default`, `anonymous`, `dev-user`) is refused, not repaired |
 | `name`, else `preferred_username`, else `email`, else `sub` | `userName` (at most 128 characters) |
 | (none) | `roles` is `["default"]`, plus a platform administrator role only under the three conditions in "Administrators" below. The token's `roles` and `groups` claims are never copied as they stand, so enabling this credential never makes anyone an administrator by itself |
-| | `platformKey` and `virtualKey` are empty: no session key stands behind a token |
+| | `platformKey` and `virtualKey` are the person's own keys from SaFE in the SaFE deployment mode (see "Keys for a token's user"), and empty otherwise: no session key stands behind a token |
+
+**Keys for a token's user (SaFE deployment mode).** The things a caller does that are
+not reads of this API's own tables run on two keys SaFE holds for them: the platform
+key (an `ak-` key: a sandbox is created with it, and `GET /v1/me`, the image search, the
+sandbox admin page and the other reads of SaFE present it) and the LiteLLM virtual key
+(what a turn's model calls run with). A cookie or an `ak-` key gets both from SaFE's
+verification, `POST /api/v1/auth/verify`, which the API already calls with
+`AUTH_INTERNAL_TOKEN`. A token gets them the same way, but **SaFE is never shown the token**,
+which is good for this API's own audience: the API is a service acting for the person, and
+asks the identity provider for the credential of one (RFC 8693 service delegation).
+
+1. The token has verified here (signature, audience, scope, and the provider's answer when
+   that is asked for).
+2. The API exchanges it at the provider, as its own client (`IDENTITY_CLIENT_ID`),
+   with `subject_token_type=urn:ietf:params:oauth:token-type:access_token`, for a token whose
+   audience and scope are `CLAW_IDENTITY_TOKEN_DELEGATION_AUDIENCE` and `_SCOPE` (default
+   `primus-safe` and `safe.api`). The provider answers with a token for that person (its `sub` is the
+   token's), with the API's client as the party acting for them (`act`), valid for the lifetime the
+   provider has set for this client (it is not fixed here: the exchange response says how long).
+3. The API presents that token to SaFE's verification, asking for both keys. SaFE answers with the
+   keys of the token's subject, if it was told to accept this API as an actor.
+4. The answer must name the token's own `sub`, or those keys are somebody else's and are not used.
+
+What the API keeps: the answer, **per person**, for at most the life the delegated token has left
+(a person's own token is replaced every few minutes; their keys do not change with it, so a new
+token of the same person does not ask again). A provider that states no lifetime has nothing to
+bound an answer by, and none is kept. Concurrent requests of one person make one exchange and one
+question.
+
+| What happens | The caller |
+|---|---|
+| SaFE answers with the person's id (the token's `sub`) and keys | has those keys, until the delegated token ends |
+| an id that is not the token's `sub` (those keys would be somebody else's), or a person SaFE holds no keys for | no keys; kept 30 seconds, the decision is made on every request |
+| SaFE answers 401 or another 4xx (it does not accept this issuer or audience, or was not told about this actor) | authenticated, no keys; kept 30 seconds so SaFE is not asked on every request. The log says why (`auth.identity_token.no_safe_keys`) |
+| the provider refuses the exchange for a reason about this client (`unauthorized_client`: its client is not registered to exchange access tokens; `invalid_target`: no such audience for this client; `invalid_scope`) | authenticated, no keys; kept 30 seconds for the person, because every token of every person gets the same answer. The log says which refusal (`delegation_refused_<code>`) |
+| the provider refuses the exchange of this one token (`invalid_grant`: the grant behind it is signed out, or the token has expired inside the clock tolerance; `invalid_token`; any other code) | this request is authenticated, no keys; kept 30 seconds for that token only. A person has one grant per signed-in device, so the person's other tokens are still exchanged and still get keys |
+| SaFE 5xx or no answer, a 200 from SaFE that is not an answer (a proxy's page, a cut-off body, no user id), the provider 5xx, a timeout, or the provider refusing this client's own credentials | 503 `authentication_service_unavailable`, not remembered: the next request asks again |
+| (no `AUTH_INTERNAL_TOKEN` to ask with) | 500 `authentication_misconfigured`, as for a cookie or a key |
+
+A caller without keys is not refused. They can read and write their own sessions, but a
+turn has no model key (unless Brain has a deployment-wide one, `ANTHROPIC_AUTH_TOKEN`,
+as it always could), a sandbox has no platform key, and `GET /v1/me` is a 401
+`authentication_required`, because there is nothing to present to SaFE.
+
+What has to be set up, and what is not done:
+
+- **The provider** has to know this API's client (`IDENTITY_CLIENT_ID`) as one that may exchange
+  an access token for this API's audience (`claw-api`) and may ask for tokens for SaFE's audience
+  with the scope above. In `primus-identity` that is a service client with `allowedAudiences`
+  `primus-safe`, `allowedScopes` `safe.api` and `subjectAudiences` `claw-api`; its `tokenTtlSeconds`
+  is how long the delegated token lives, and so how long the API keeps a person's keys.
+- **SaFE** has to accept the token the provider issues: `auth.mode: external` with an `oidc`
+  authenticator for the issuer whose `audience` is the delegation audience (keep a `builtin` entry so
+  cookies and `ak-` keys go on working), and this API's client id in `auth.key_actors`, which lets a
+  delegated token whose actor is listed call `POST /api/v1/auth/verify` and get the keys of its subject
+  and no one else's. A SaFE in its default `builtin` mode does not know the issuer and answers 401 to every
+  token, which leaves every token caller keyless; one that was not told about the actor answers 403, the same.
+  SaFE needs no name of this API beyond that client id.
+- A token that is itself delegated (RFC 8693, with an `act` claim: a service acting for the person) is
+  not exchanged again. Such a caller has no keys.
+- The person's token is not forwarded to SaFE by any route. The MCP tool that lists models, which sends the
+  caller's own `Authorization` header to SaFE, sends such a caller's platform key instead (nothing if they have none).
+- The roles in SaFE's answer are ignored, as the token's are: only
+  `CLAW_IDENTITY_TOKEN_TRUSTED_ROLES` makes a token's caller an administrator.
+- The Kubernetes deployment mode has no SaFE to ask; a token's caller has no keys there.
 
 **Administrators.** A person who signs in through the provider and is an administrator
 there reaches the admin pages (the sandbox admin page, for one) only if the operator
@@ -218,9 +285,8 @@ names differently, and then the setting should stay empty.
   only the two platform administrator roles can be adopted, only when the provider
   confirms them for that token as described under "Administrators", and in the
   Kubernetes deployment mode too. No other provider role is mapped onto anything.
-- Nothing here issues per-user LLM keys: a user authenticated by a token has none,
-  so a deployment that needs a per-user key for model calls has to provide it some
-  other way.
+- Nothing here issues keys. A token's user has the keys SaFE already holds for that
+  person (see "Keys for a token's user"), and none where SaFE does not accept the token.
 - Only the Bearer header is read. A browser download by `?token=` is still an `ak-`
   key only, and a WebSocket upgrade is not covered.
 - Unverified: this was exercised against a stand-in provider on a socket with real
