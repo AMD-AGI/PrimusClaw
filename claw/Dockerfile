@@ -136,7 +136,7 @@ RUN npm run build -w packages/utils \
 #
 # Uses AlmaLinux 8 (glibc 2.28) so the binary runs on older base images like
 # sglang/ROCm and PyTorch without relying on an end-of-life build distribution.
-FROM almalinux:10-minimal@sha256:77aeeeef6889af731a91d83f65b08ef9930bde10332ae2e3fd6e0f0c47066a7b AS bun-builder
+FROM almalinux:10-minimal@sha256:dfc4e05e3965fc933f9e256eb2e63a7a7a1eb1a53fa951c39841f2069ff38530 AS bun-builder
 WORKDIR /app
 
 # Nothing in this stage touches the network, and that is the point. This base
