@@ -20,18 +20,7 @@ describe("assistant outbound without notifications", { skip }, () => {
   let outbound: typeof import("../src/assistant/outbound.js");
   before(async () => {
     delete process.env.CLAW_NOTIFICATIONS_ENABLED;
-    h = await startAdmissionCluster({});
-    await h.app.db.db.query(`
-      CREATE TABLE claw_work_items (
-        item_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, seq INT NOT NULL, title TEXT NOT NULL,
-        board_state TEXT NOT NULL, last_report_kind TEXT, pending_question TEXT,
-        worker_session_id TEXT NOT NULL UNIQUE, result_version INT NOT NULL DEFAULT 0,
-        attention_seq INT NOT NULL DEFAULT 0, UNIQUE (user_id, seq));
-      CREATE TABLE claw_assistants (user_id TEXT PRIMARY KEY, session_id TEXT NOT NULL UNIQUE);
-      CREATE TABLE claw_assistant_says (
-        say_id UUID PRIMARY KEY, user_id TEXT NOT NULL, item_id TEXT, item_attention_seq INT, text TEXT NOT NULL,
-        fallback BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), delivered_at TIMESTAMPTZ);
-    `);
+    h = await startAdmissionCluster({ CLAW_ASSISTANT_ENABLED: "true" });
     outbound = await import("../src/assistant/outbound.js");
   });
   after(async () => { await h?.stop(); });
@@ -50,8 +39,8 @@ describe("assistant outbound without notifications", { skip }, () => {
     assert.equal((await h.app.db.db.query("SELECT to_regclass('claw_notification_outbox') AS t")).rows[0].t, null);
   });
 
-  test("the delivery hook is registered only behind the notifications flag", () => {
+  test("the delivery hook is registered only behind both the notifications and the assistant flag", () => {
     const index = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
-    assert.match(index, /if \(CLAW_NOTIFICATIONS_ENABLED\) registerAssistantDeliveryHook\(\)/);
+    assert.match(index, /if \(CLAW_NOTIFICATIONS_ENABLED && CLAW_ASSISTANT_ENABLED\) registerAssistantDeliveryHook\(\)/);
   });
 });

@@ -8,7 +8,7 @@ import multipart from "@fastify/multipart";
 import {
   API_PORT, APP_ENV, SAFE_API_URL, DATABASE_URL, resolveCorsOrigin,
   AUTH_INTERNAL_TOKEN, NATS_URL,
-  CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
+  CLAW_ASSISTANT_ENABLED, CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
   runLeaseTiming, envSettingProblems, assertAdmissionSettings,
 } from "./config.js";
 import { runLeaseTimingProblems } from "@claw/protocol";
@@ -335,7 +335,8 @@ async function main() {
   // Outbound notification delivery (HMAC-signed webhooks from the outbox).
   // Gated: with the flag off no table exists and nothing polls.
   if (CLAW_NOTIFICATIONS_ENABLED) startNotificationWorker();
-  if (CLAW_NOTIFICATIONS_ENABLED) registerAssistantDeliveryHook();
+  // The assistant's messages go out through the same outbox, so both switches have to be on.
+  if (CLAW_NOTIFICATIONS_ENABLED && CLAW_ASSISTANT_ENABLED) registerAssistantDeliveryHook();
   if (a2aPushEnabled()) startA2aPushWorker();
 
   // Daily maintenance crons (every 24h, first run 1 min after startup).

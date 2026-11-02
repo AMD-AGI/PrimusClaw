@@ -26,6 +26,7 @@ import {
   type AssistantItemSnapshot,
 } from "../notifications/assistant-events.js";
 import { deterministicEventId, enqueue, kickDelivery, onDelivered } from "../notifications/outbox.js";
+import { canAccept } from "./work-items.js";
 
 const logger = pino({ name: "assistant-outbound" });
 
@@ -83,14 +84,13 @@ interface ItemRow {
 
 const ITEM_COLUMNS = "item_id, user_id, seq, title, board_state, last_report_kind, pending_question, result_version, attention_seq";
 
-/** `can_accept` is the condition the accept statement checks, so an offer is made only where it can succeed. */
 const snapshot = (item: ItemRow): AssistantItemSnapshot => ({
   item_id: item.item_id,
   seq: item.seq,
   title: redact(item.title),
   board_state: item.board_state,
   result_version: item.result_version,
-  can_accept: item.board_state === "needs_you" && item.last_report_kind === "ready",
+  can_accept: canAccept(item),
 });
 
 /** Text leaves the system for a receiver of the user's choosing: a credential a model repeated is masked on the way. */

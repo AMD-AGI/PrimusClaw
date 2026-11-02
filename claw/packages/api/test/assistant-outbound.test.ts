@@ -3,7 +3,8 @@
 
 /**
  * What an assistant says to its user, from the stored message to the receiver's
- * 2xx, against a real Postgres with `CLAW_NOTIFICATIONS_ENABLED` on. Skipped without
+ * 2xx, against a real Postgres whose schema `initDb` built with
+ * `CLAW_NOTIFICATIONS_ENABLED` and `CLAW_ASSISTANT_ENABLED` on. Skipped without
  * DATABASE_URL, and a skip is not a pass.
  */
 import assert from "node:assert/strict";
@@ -90,19 +91,7 @@ describe("assistant outbound", { skip }, () => {
   const saysRows = async () => (await q("SELECT * FROM claw_assistant_says ORDER BY created_at")).rows as any[];
 
   before(async () => {
-    h = await startAdmissionCluster({ CLAW_NOTIFICATIONS_ENABLED: "true" });
-    // The tables the assistant's other pieces own; only the columns this one reads and writes matter.
-    await q(`
-      CREATE TABLE IF NOT EXISTS claw_assistants (user_id TEXT PRIMARY KEY, session_id TEXT NOT NULL UNIQUE);
-      CREATE TABLE IF NOT EXISTS claw_work_items (
-        item_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, seq INT NOT NULL, title TEXT NOT NULL,
-        board_state TEXT NOT NULL, last_report_kind TEXT, pending_question TEXT,
-        worker_session_id TEXT NOT NULL UNIQUE, result_version INT NOT NULL DEFAULT 0,
-        attention_seq INT NOT NULL DEFAULT 0, UNIQUE (user_id, seq));
-      CREATE TABLE IF NOT EXISTS claw_assistant_says (
-        say_id UUID PRIMARY KEY, user_id TEXT NOT NULL, item_id TEXT, item_attention_seq INT, text TEXT NOT NULL,
-        fallback BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), delivered_at TIMESTAMPTZ);
-    `);
+    h = await startAdmissionCluster({ CLAW_NOTIFICATIONS_ENABLED: "true", CLAW_ASSISTANT_ENABLED: "true" });
     crypto = await import("../src/crypto/user-env.js");
     crypto.initUserEnvCrypto();
     outbox = await import("../src/notifications/outbox.js");
