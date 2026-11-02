@@ -35,6 +35,7 @@ import { db } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { redactPublicJson } from "../events/redaction.js";
+import { actingTurnRefusalFor } from "../github-review/acting-turns.js";
 import { workbenchRegistry } from "./registry.js";
 import { canExecuteTaskDag, canReadTaskDag } from "../tasks/dags/authz.js";
 import { getTaskDag } from "../tasks/dags/db.js";
@@ -59,11 +60,17 @@ interface CreateRunBody {
  * transaction a later refusal -- or a failing `COMMIT` -- undoes, so only the
  * transaction itself knows whether a session outlived the request.
  */
+/** The run was sent into a session that acts as a user by a credential that is not the person's own (github-review/acting-turns.ts). */
+class UnattendedActingTurn extends Error {
+  constructor(readonly refusal: string) { super(refusal); }
+}
+
 async function ensureSession(
   workbench: WorkbenchDef,
   user: UserInfo,
   body: Record<string, unknown>,
   client: PoolClient,
+  req: FastifyRequest,
 ): Promise<{ sessionId: string; created: boolean }> {
   assertSessionCredentialsForDispatch(
     (body.session_id as string | undefined) ?? "new workbench session",
@@ -88,6 +95,9 @@ async function ensureSession(
       if (!canAccessSession(r.rows[0].user_id, user.userId)) {
         throw new Error("session_access_denied");
       }
+      // Nodes that run in a session that acts as a user run with the review tools in their hands: the person's say, like creating it.
+      const unattended = await actingTurnRefusalFor(req, provided, client);
+      if (unattended) throw new UnattendedActingTurn(unattended);
       await client.query(
         `UPDATE claw_sessions
             SET config = COALESCE(config, '{}'::jsonb) || $2::jsonb
@@ -289,7 +299,7 @@ export async function registerWorkbenchRunRoutes(app: FastifyInstance): Promise<
       // whose first statement is the admission lock.
       return await withAdmissionTransaction<unknown>(
         (client, afterCommit) => submitWorkbenchRun(client, {
-          workbench: d, user, body, reply, dagRow, plugin, input: inputWithEnv,
+          workbench: d, user, body, req, reply, dagRow, plugin, input: inputWithEnv,
         }, afterCommit),
       );
     },
@@ -300,6 +310,7 @@ interface WorkbenchRunSubmission {
   workbench: WorkbenchDef;
   user: UserInfo;
   body: CreateRunBody;
+  req: FastifyRequest;
   reply: FastifyReply;
   dagRow: unknown;
   plugin: { id: number; version: string; image: string; resource: Record<string, unknown>; tools: unknown[] };
@@ -314,10 +325,14 @@ async function submitWorkbenchRun(
   const { reply } = run;
   let session: { sessionId: string; created: boolean };
   try {
-    session = await ensureSession(run.workbench, run.user, run.body, client);
+    session = await ensureSession(run.workbench, run.user, run.body, client, run.req);
   } catch (e) {
     if ((e as Error)?.message === "session_access_denied") {
       await reply.status(403).send({ ok: false, error: "session_access_denied" });
+      return { commit: false, value: reply };
+    }
+    if (e instanceof UnattendedActingTurn) {
+      await reply.status(403).send({ ok: false, error: e.refusal });
       return { commit: false, value: reply };
     }
     if (e instanceof MissingPlatformKeyError) {

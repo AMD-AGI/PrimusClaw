@@ -7,7 +7,7 @@
  *
  * Shared by the two switch-state test files because the surface differs between
  * them only in `bash`'s property set and the three background names; writing the
- * other eighteen rows twice is how the two copies come to disagree.
+ * other seventeen rows twice is how the two copies come to disagree.
  *
  * Description prose is deliberately absent: a whole-description assertion turns
  * every wording improvement into a failure and pins nothing the field sets do
@@ -30,14 +30,18 @@ interface Expected {
   nested?: Record<string, string[]>;
 }
 
-/** The eighteen names published in both switch states, in publication order. */
+/**
+ * The seventeen names published in both switch states, in publication order.
+ * `a2a_call` is not among them: it is published only while A2A_CLIENT_ENABLED is on,
+ * and its own surface is pinned in a2a-client-tool.test.ts.
+ */
 export const CLOSED_STATE_NAMES = [
   "save_memory", "save_skill", "add_skill_file", "update_skill_file", "remove_skill_file",
   "bash", "read", "write", "edit", "glob", "grep", "ls", "notebook_edit", "multi_edit",
-  "todo_write", "exit_plan_mode", "a2a_call", "task",
+  "todo_write", "exit_plan_mode", "task",
 ];
 
-/** The same eighteen, with the background trio spliced in after `bash`. */
+/** The same seventeen, with the background trio spliced in after `bash`. */
 export const OPEN_STATE_NAMES = CLOSED_STATE_NAMES.flatMap((name) =>
   name === "bash" ? [name, "bash_output", "kill_shell", "wait"] : [name],
 );
@@ -89,12 +93,6 @@ const SHARED: Record<string, Expected> = {
     required: ["todos"],
   },
   exit_plan_mode: { properties: ["plan"], required: ["plan"] },
-  a2a_call: {
-    properties: ["agent", "message", "skill", "mode", "task_id", "metadata"],
-    required: ["agent", "message"],
-    enums: { mode: ["stream", "fire_and_forget", "discover"] },
-    nested: { metadata: ["plugin_id", "workspace_id", "parent_session_id", "team_role"] },
-  },
   task: {
     properties: ["description", "prompt", "subagent_type", "tools"],
     required: ["description", "prompt"],
