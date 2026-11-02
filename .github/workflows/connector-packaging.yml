@@ -1,0 +1,68 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: Connector packaging
+
+# Checks, before a release is ever cut, what the release would publish: the contents of a real
+# `npm pack` tarball of @primusclaw/connector, and the shape of the workflow that publishes it
+# (connector-release.yml).
+#
+# Deliberately runs in full on every event, with no path filter, like Hyperloom's packaging
+# workflow: a change to the README, to LICENSE or to the release workflow is exactly the change
+# that can break a release, and a skipped check is not a passed one. Both jobs take about a minute.
+on:
+  # PRs run via `pull_request`; `push` is scoped to `main` so a same-repo PR does not trigger twice.
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Cancel superseded runs for the same ref.
+concurrency:
+  group: connector-packaging-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tarball-contents:
+    name: tarball contents
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: claw/.nvmrc
+          cache: npm
+          cache-dependency-path: connector/package-lock.json
+
+      # No install script runs: the job only builds and inspects.
+      - run: npm ci --ignore-scripts
+        working-directory: connector
+
+      - run: npm run build
+        working-directory: connector
+
+      # Packs the real tarball and fails unless it holds exactly dist/cli.js, README.md, LICENSE
+      # and package.json, the bin and engines fields are right, the bundle in it is the one just
+      # built and reports the package's version, and the licence is the repository's.
+      - name: Check the tarball
+        working-directory: connector
+        run: node scripts/check-pack.mjs
+
+  release-workflow:
+    name: release workflow shape
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - run: python3 -c 'import yaml' || sudo apt-get install -y python3-yaml
+
+      # connector-release.yml publishes to a public registry with an OIDC identity, and the file a
+      # release runs is the one at the release's tag, so what keeps a publish behind the
+      # npm-publish environment is that file's shape. The script asserts it and then mutates a copy
+      # of the file once per rule to see each rule refuse.
+      - run: bash scripts/release-tests/connector-release-workflow.sh

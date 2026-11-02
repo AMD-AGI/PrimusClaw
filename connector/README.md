@@ -16,27 +16,78 @@ stay on your machine.
 phone / chat client --> Claw (remote agents) <-- connector on your machine --> agent adapter (stdio) --> your agent
 ```
 
-Claw's side is documented in [claw/docs/remote-agents.md](../claw/docs/remote-agents.md); the wire contract is
-`claw/packages/protocol/src/remote-agents.ts`, compiled into this package.
+Claw's side is documented in [claw/docs/remote-agents.md](https://github.com/AMD-AGI/PrimusClaw/blob/main/claw/docs/remote-agents.md); the wire
+contract is `claw/packages/protocol/src/remote-agents.ts`, compiled into this package.
 
-## Quick start
+## Quick start (about 5 minutes)
 
-Requirements: Node.js 22 or newer, and the agent you want to expose already working on this machine (an adapter is fetched
-by `npx` on first use).
+You need Node.js 22 or newer, a coding agent that already works on this machine (Claude Code, Codex or the Cursor CLI), and the
+two addresses the people who run your Claw give you: the Claw API URL and the identity service URL. The addresses below are
+placeholders. The Claude and Codex adapters are fetched by `npx` the first time a session starts, so the machine needs
+access to the npm registry.
+
+**1. Install**
 
 ```sh
-npx @primusclaw/connector init          # writes a sample agents.toml (add --approval never to run without per-step approval, see below)
-$EDITOR ~/.config/claw-connector/agents.toml   # set roots: the directories an agent may work in
-npx @primusclaw/connector login --server https://claw.example.com/claw-api --identity-url https://identity.example.com
-npx @primusclaw/connector run
+npm install -g @primusclaw/connector
+claw-connector --version
 ```
 
-(The npm scope above is a placeholder until the package is published; `npm run build` in this directory produces the
-same `claw-connector` binary in `dist/cli.js`.)
+If npm answers `EACCES`, point its global prefix at a directory you own (`npm config set prefix ~/.npm-global`, then put
+`~/.npm-global/bin` on your `PATH`) instead of using `sudo`. To update later, run the same `npm install -g` again.
 
-`login` prints a short code and a link. Open the link on any device that is signed in to Claw, check the machine name,
-and confirm. The connector then holds a rotating sign-in token (file mode 0600) and refreshes its short-lived access
-token by itself. `run` keeps the connection up and stops every agent it started when you press Ctrl-C.
+**2. Choose what an agent may touch**
+
+```sh
+claw-connector init      # writes agents.toml and prints where: ~/.config/claw-connector/agents.toml unless XDG_CONFIG_HOME or CLAW_CONNECTOR_HOME is set
+claw-connector status    # after you edit it: prints a "problem:" line if the file is wrong
+```
+
+By default every agent asks before it writes a file or runs a command, and your phone answers each question. To let phone sessions run
+like your terminal instead, run `claw-connector init --approval never` (or set `approval = "never"` on an agent later); see
+[Running without per-step approval](#running-without-per-step-approval).
+
+Open the file `init` printed and set `roots`, the directories an agent may work in. The sample enables `claude`, working in `~/work`;
+remove the `#` in front of the `codex` or `cursor` block to offer those too. A root that does not exist is reported as a problem, so
+create it or change it. See [agents.toml](#agentstoml).
+
+**3. Sign in**
+
+```sh
+claw-connector login --server https://claw.example.com/claw-api --identity-url https://identity.example.com
+```
+
+`login` prints a link and a short code. Open the link in a browser where you are signed in to Claw, check the machine name shown
+there, and confirm; the command then prints `signed in as <machine name>`. The connector holds a rotating sign-in token (file mode
+0600) and refreshes its short-lived access token by itself. Put `server` and `identity_url` in `agents.toml` and the two
+options can be left out.
+
+If there is no browser sign-in to use (a development server), use a Claw API key instead. Pass it in `CLAW_CONNECTOR_KEY`
+(replace the placeholder value) rather than with `--key`, which would show it in the process list:
+
+```sh
+CLAW_CONNECTOR_KEY='replace-with-your-claw-api-key' claw-connector login --server https://claw.example.com/claw-api
+```
+
+The key is stored as it is in `credentials.json` (mode 0600) and is for trying things out; the device sign-in is the normal way.
+
+**4. Run**
+
+```sh
+claw-connector run
+```
+
+It prints `connecting claude to https://claw.example.com/claw-api as "<machine name>"` and stays in the foreground: keep it in a
+terminal tab, `tmux` or `screen`. Ctrl-C stops it and every agent it started. From another terminal, `claw-connector status` shows
+whether it is running and signed in.
+
+**5. See it in Clawy**
+
+In Clawy (or any chat client built on Claw), send `/agents`. The agents of this machine are listed, online while `run` is up.
+A session started there runs on this machine, inside one of your `roots`, and each permission request comes back as a card in the chat.
+
+To disconnect: `claw-connector pause` (stay offline until `resume`), `claw-connector stop`, or `claw-connector logout` (also
+asks the identity service to revoke the device sign-in; a saved key is deleted from this machine, not revoked at Claw).
 
 ## agents.toml
 
@@ -178,7 +229,7 @@ All of these run on your machine and fail closed.
 | `status [--json]` | Running or not, paused, signed in, agents, adapter processes. |
 | `pause` / `resume` | Stop every agent within a second and stay offline, or undo that. |
 | `stop` | Stop the running connector and every agent it started. |
-| `logout` | Stop, revoke the sign-in at the identity service, delete it. The stored connector id stays, so the next sign-in reuses the same connector. |
+| `logout` | Stop, ask the identity service to revoke the sign-in, delete it from this machine. The stored connector id stays, so the next sign-in reuses the same connector. |
 
 **Kill switch.** Every adapter is started in its own process group and recorded (pid and start time) in
 `children.json`. `stop`, `pause`, a revocation and Ctrl-C signal exactly those groups: a process that is not recorded, or
@@ -188,8 +239,8 @@ the connector sees it within a heartbeat, stops every agent and exits without re
 
 ## Files
 
-`~/.config/claw-connector/` (or `$XDG_CONFIG_HOME`): `agents.toml`, `credentials.json` (0600; a file other users can read is
-refused). `~/.local/state/claw-connector/` (or `$XDG_STATE_HOME`): `connector.json` (the connector's identity and the
+`~/.config/claw-connector/` (or `$XDG_CONFIG_HOME/claw-connector/`): `agents.toml`, `credentials.json` (0600; a file other users can read is
+refused). `~/.local/state/claw-connector/` (or `$XDG_STATE_HOME/claw-connector/`): `connector.json` (the connector's identity and the
 commands handled), `sessions.json`, `outbox/` (events not yet acknowledged by Claw), `audit.jsonl` (spawn, directory
 decisions, every command received, every permission request and answer, every automatic approval, mode changes),
 `logs/`, `children.json`, `connector.pid`. `CLAW_CONNECTOR_HOME=/some/dir` keeps all of it under one directory.
@@ -223,4 +274,64 @@ cd connector
 npm ci
 npm run typecheck && npm test      # node:test against a stand-in Claw and a stand-in ACP adapter (real processes, real sockets)
 npm run build                      # dist/cli.js: one file; the wire contract from claw/packages/protocol is compiled in
+node scripts/check-pack.mjs        # packs the tarball: it must hold only dist/cli.js, README.md, LICENSE and package.json
+npm pack && npm install -g ./primusclaw-connector-*.tgz   # the package as the registry serves it, from a checkout
 ```
+
+## Releasing (maintainers)
+
+A release is a GitHub Release whose tag is `connector-vX.Y.Z`, cut the way Hyperloom's are. Publishing it starts
+[connector-release.yml](https://github.com/AMD-AGI/PrimusClaw/blob/main/.github/workflows/connector-release.yml): it builds, tests and
+checks the tarball, signs a build-provenance attestation for it, attaches it to the release and publishes it to npm with Trusted Publishing
+(an OIDC credential; no npm token is stored anywhere). Only stable `MAJOR.MINOR.PATCH` versions are released: a prerelease needs a dist-tag,
+which OIDC publishing sets only with a newer npm and a separate permission on the Trusted Publisher entry.
+
+**What stops an unreviewed publish.** A release runs the workflow file as it exists at its tag, and a tag can point at any commit, so the
+checks inside that file (tag shape, the commit being in `main`, the environment below having a reviewer) catch honest mistakes and are not the
+control. The control is the GitHub environment `npm-publish`: one of its required reviewers must approve the `publish` job, and the Trusted
+Publisher entry on npmjs.com names that environment, so npm hands the publish credential to no other job. Only the `publish` job, which checks out
+and installs nothing, runs behind it. Two more rules narrow who can get that far. The environment does not let administrators bypass its
+protection, and a tag ruleset limits creating `refs/tags/connector-v*` to repository admins, so only an admin can start a release run at all.
+Self-review is allowed: the maintainer who cuts a release may approve its publish, so the approval is an explicit decision by a listed reviewer
+and not a second person's check. `scripts/release-tests/connector-release-workflow.sh`, run on every change by the Connector packaging
+workflow, fails if the workflow file stops having that shape, or if its environment check would refuse the environment as set up below.
+
+**One-time setup** (a repository admin, and a member of the `primusclaw` npm organisation). The order matters.
+
+1. Create the environment `npm-publish` (repository Settings > Environments) with **Required reviewers** (the people who may publish) and
+   **Allow administrators to bypass** off. **Prevent self-review** is left off, so a reviewer who cuts a release may approve it (turning it on is
+   accepted too). The release run refuses to build unless the environment has at least one required reviewer and administrator bypass is off.
+   Then add a tag ruleset (Settings > Rules > Rulesets, target: tags) matching `refs/tags/connector-v*` that restricts creation to repository
+   admins: with self-review allowed this is what limits who can start a release run, and a deployment tag rule on the environment alone does
+   not help, since the tag of an unreviewed commit matches it too. Do not restrict the environment to "Protected branches only": a release's
+   ref is a tag, so it would be refused.
+2. Publish 0.1.0 once by hand from a clean checkout of the merged `main` (the package must exist before it can be given a Trusted Publisher):
+   `cd connector && npm ci && npm publish --access public`, logged in to npm with 2FA.
+3. On npmjs.com, Packages > `@primusclaw/connector` > Settings > Trusted publishing > GitHub Actions: Organization `AMD-AGI`, Repository
+   `PrimusClaw`, Workflow filename `connector-release.yml`, Environment `npm-publish` (all case-sensitive; create the entry only after step 1).
+   Allowed actions: `npm publish`, which is what the workflow runs; leave dist-tag management off. The entry must see its first successful
+   publish within 2 days or it expires.
+4. Settings > Publishing access: require two-factor authentication and disallow tokens.
+
+**Cutting a release.**
+
+1. Set the new version in `package.json` and `src/version.ts` (`scripts/check-pack.mjs` fails if they disagree) and merge that to `main`.
+2. Write the release notes from the PR descriptions, not from commit subjects: every change states in its PR what a user will now observe.
+   For the PRs that touched `connector/` since the previous release (`prev` is its tag, or for the first workflow release the commit 0.1.0 was
+   published from):
+   ```sh
+   prev=connector-v0.1.0
+   git fetch origin main --tags
+   for n in $(git log --first-parent --format=%s "$prev"..origin/main -- connector/ | grep -o '(#[0-9]*)$' | tr -d '(#)'); do
+     gh pr view "$n" --repo AMD-AGI/PrimusClaw --json number,title,body --jq '"## #\(.number) \(.title)\n\n\(.body)\n"'
+   done > notes.md
+   ```
+   Edit `notes.md` into the notes a user of the package wants to read.
+3. Publish the release on the merged commit (not as a pre-release):
+   `gh release create connector-v0.1.1 --target <sha-on-main> --title "claw-connector 0.1.1" --notes-file notes.md`
+4. The `package` job runs and writes a summary: the commit, whether the release workflow at that commit equals the one on `main`, and the
+   tarball's name, sha256 and files. A reviewer opens the run, checks that the tagged commit is the reviewed one on `main` and that the
+   workflow file is `main`'s (if the summary says it is different, read the diff first), and approves `publish`. The job then attests the
+   tarball, attaches it to the release and publishes it.
+5. Check it: `npm view @primusclaw/connector version`, and `gh attestation verify primusclaw-connector-0.1.1.tgz --repo AMD-AGI/PrimusClaw`
+   on the tarball attached to the release.

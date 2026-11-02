@@ -1,0 +1,263 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: Connector release
+
+# Publishes connector/ to npm as @primusclaw/connector, the way Hyperloom cuts a release: a
+# maintainer publishes a GitHub Release whose tag is connector-vX.Y.Z and whose notes are the
+# descriptions of the PRs it contains (connector/README.md, "Releasing"). Publishing the release
+# starts this workflow, which builds and checks the tarball, signs a provenance attestation for it,
+# attaches it to the release and publishes it to the registry.
+#
+# What stops an unreviewed publish. A release event runs the workflow file as it exists at the
+# release's tag, and a tag can point at any commit, so every check in this file is made by a file
+# whoever created the tag could have edited. Those checks (the tag shape, the tagged commit being in
+# main's history, the npm-publish environment having reviewers) catch honest mistakes. The security
+# boundary is outside this file: the GitHub environment `npm-publish`, whose required reviewers must
+# approve before the `publish` job starts, and the Trusted Publisher entry on npmjs.com, which names
+# that environment, so npm gives the publish credential to nothing else. A tag on any commit, with
+# any copy of this file, therefore still waits for a reviewer.
+#
+# Two jobs, so that nothing which runs repository code or installs a dependency holds a credential:
+#   package  builds, tests and checks the tarball. contents: read, no OIDC, no environment.
+#   publish  waits for the environment's reviewers, then handles the finished tarball and nothing
+#            else: it checks out no code and installs no dependency. It alone holds id-token: write.
+# No long-lived npm token exists anywhere: npm Trusted Publishing hands the publish job a
+# short-lived credential in exchange for this run's OIDC identity. The Trusted Publisher entry lives
+# on the package's npmjs.com settings page, so the package must exist first: its first version is
+# published by hand and this workflow publishes every later one.
+on:
+  release:
+    types: [published]
+
+# Least privilege for the default GITHUB_TOKEN; the publish job adds what it needs.
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Build and check the package
+    # Only this repository holds the Trusted Publisher entry (a fork or a mirror would only fail at
+    # the publish step), and a release of anything but the connector (the repository's v* releases)
+    # must not start this.
+    if: github.repository == 'AMD-AGI/PrimusClaw' && startsWith(github.event.release.tag_name, 'connector-v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The tagged commit has to be compared with main's history.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The tag name is attacker-shaped text (a git ref may hold `$`, backticks and `;`), so it
+      # reaches the shell through the environment, never through ${{ }} in a script.
+      - name: The release is connector-vX.Y.Z on a commit of main
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^connector-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::the tag is not connector-vMAJOR.MINOR.PATCH; refusing to publish"
+            exit 1
+          fi
+          # npm publishes under `latest`; a release marked as a pre-release says the opposite.
+          if [ "$PRERELEASE" != "false" ]; then
+            echo "::error::the release is marked as a pre-release; only stable versions go to npm"
+            exit 1
+          fi
+          # A tag can be put on any commit, including one on a side branch that never went through
+          # review. This catches the honest mistake; the environment below is the control.
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "::error::the tagged commit $GITHUB_SHA is not in main's history; refusing to publish"
+            exit 1
+          fi
+
+      # Fails the run before anything is built if the environment that gates the publish is missing,
+      # has no required reviewer, or lets administrators bypass its protection (naming a missing
+      # environment in a job creates it, unprotected, on first use). Self-review is allowed: the
+      # maintainer who cuts the release may approve its publish, so the approval is a decision by a
+      # listed reviewer and not a second pair of eyes; the tag ruleset on connector-v* (admins only)
+      # is what limits who can start a run. It reads the environment with the default token. It cannot
+      # be the boundary: a writer's copy of this file could drop it. It stops a maintainer who forgot
+      # the setup.
+      - name: The npm-publish environment requires reviewers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! environment="$(gh api "repos/$GITHUB_REPOSITORY/environments/npm-publish")"; then
+            echo "::error::cannot read the npm-publish environment; create it with required reviewers first (connector/README.md, Releasing)"
+            exit 1
+          fi
+          if ! jq -e '
+            .can_admins_bypass == false
+            and ([.protection_rules[]? | select(((.reviewers // []) | length) > 0)] | length) > 0
+          ' <<<"$environment" >/dev/null; then
+            echo "::error::npm-publish must have at least one required reviewer and administrator bypass off (connector/README.md, Releasing)"
+            exit 1
+          fi
+
+      # No cache: a release job should install exactly what the lockfile names and nothing a
+      # previous run left behind.
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: claw/.nvmrc
+
+      - name: Install
+        working-directory: connector
+        # The lockfile is the whole dependency set; a package's install script never runs here.
+        run: npm ci --ignore-scripts
+
+      - name: Typecheck
+        working-directory: connector
+        run: npm run typecheck
+
+      # Real child processes and sockets: a stand-in Claw and a stand-in ACP adapter, no database
+      # and no network beyond the loopback.
+      - name: Test
+        working-directory: connector
+        run: npm test
+
+      - name: Build
+        working-directory: connector
+        run: npm run build
+
+      # The tarball that is uploaded below, attested and published is the one checked here: exactly
+      # dist/cli.js, README.md, LICENSE and package.json; the bin and engines fields; package.json's
+      # version equal to the tag and to what the built CLI prints; repository.url equal to this
+      # repository (npm refuses provenance otherwise).
+      - name: Pack and check the tarball
+        working-directory: connector
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          REPOSITORY: ${{ github.server_url }}/${{ github.repository }}
+          TARBALL_DIR: ${{ runner.temp }}/connector-tarball
+        run: |
+          set -euo pipefail
+          mkdir "$TARBALL_DIR"
+          # The bundle was built by the step above; the tarball must hold exactly that.
+          npm pack --ignore-scripts --pack-destination "$TARBALL_DIR"
+          tarball="$TARBALL_DIR/primusclaw-connector-${TAG#connector-v}.tgz"
+          node scripts/check-pack.mjs --tarball "$tarball" --version "${TAG#connector-v}" --repository "$REPOSITORY"
+
+      # What a reviewer needs in front of them before approving the publish job. The comparison
+      # is made by this file and is no substitute for opening the run's workflow file.
+      - name: Summary for the reviewer of the publish
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          TARBALL_DIR: ${{ runner.temp }}/connector-tarball
+        run: |
+          set -euo pipefail
+          tarball="$TARBALL_DIR/primusclaw-connector-${TAG#connector-v}.tgz"
+          if git diff --quiet refs/remotes/origin/main -- .github/workflows/connector-release.yml; then
+            same="identical to the one on main"
+          else
+            same="DIFFERENT from the one on main: read the diff before approving"
+          fi
+          {
+            echo "### $TAG"
+            echo
+            echo "- commit \`$GITHUB_SHA\`, in main's history"
+            echo "- release workflow at this commit: $same"
+            echo "- tarball \`$(basename "$tarball")\`, sha256 \`$(sha256sum "$tarball" | cut -d' ' -f1)\`"
+            echo "- files: $(tar -tzf "$tarball" | grep -v '/$' | sed 's|^package/||' | sort | paste -sd' ' -)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the tarball for the publish job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: connector-tarball
+          path: ${{ runner.temp }}/connector-tarball/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Attest, attach and publish
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # One release at a time, and never cancel one that is part-way through publishing. On this job
+    # and not on the workflow: a release of something else must not queue behind (or replace) one.
+    concurrency:
+      group: connector-release
+      cancel-in-progress: false
+    # The name npm's Trusted Publisher entry is told, and the gate: the job does not start until the
+    # environment's required reviewers approve.
+    environment: npm-publish
+    permissions:
+      contents: write       # attach the tarball to the release
+      id-token: write       # sign the attestation; exchange the OIDC identity for npm's publish credential
+      attestations: write   # store the attestation
+    steps:
+      - name: Fetch the tarball
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: connector-tarball
+          path: ${{ runner.temp }}/connector-tarball
+
+      # npm's own Node-bundled version is what publishes; the release's Node (claw/.nvmrc) is not
+      # read here, because this job has no checkout. The guard below stays: an npm older than 11.5.1
+      # does not fail on the missing capability, it looks for a token that does not exist.
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+
+      - name: The toolchain supports Trusted Publishing
+        run: |
+          set -euo pipefail
+          node -e '
+            const atLeast = (have, want) => {
+              const h = have.split(".").map(Number), w = want.split(".").map(Number);
+              for (let i = 0; i < 3; i++) if (h[i] !== w[i]) return h[i] > w[i];
+              return true;
+            };
+            const [nodeV, npmV] = [process.versions.node, process.argv[1]];
+            if (!atLeast(nodeV, "22.14.0") || !atLeast(npmV, "11.5.1")) {
+              console.error("::error::node " + nodeV + " and npm " + npmV + " are older than the 22.14.0 and 11.5.1 Trusted Publishing needs");
+              process.exit(1);
+            }
+          ' "$(npm --version)"
+
+      - name: Locate the tarball
+        id: tarball
+        env:
+          TARBALL_DIR: ${{ runner.temp }}/connector-tarball
+        run: |
+          set -euo pipefail
+          files=("$TARBALL_DIR"/*.tgz)
+          if [ "${#files[@]}" -ne 1 ] || [ ! -f "${files[0]}" ]; then
+            echo "::error::expected exactly one tarball in $TARBALL_DIR"
+            exit 1
+          fi
+          echo "path=${files[0]}" >> "$GITHUB_OUTPUT"
+
+      # `gh attestation verify <tarball> --repo AMD-AGI/PrimusClaw` checks it.
+      - name: Attest the tarball's provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ steps.tarball.outputs.path }}
+
+      # Before the publish: this is repeatable (--clobber), the registry is not.
+      - name: Attach the tarball to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          TARBALL: ${{ steps.tarball.outputs.path }}
+        run: gh release upload "$TAG" "$TARBALL" --clobber --repo "$GITHUB_REPOSITORY"
+
+      # The OIDC credential is exchanged here, nowhere earlier; the version goes out under the
+      # default `latest` dist-tag. Publishing a tarball runs no lifecycle script. Nothing may follow
+      # this step: a run that fails anywhere before it publishes nothing.
+      - name: Publish
+        env:
+          TARBALL: ${{ steps.tarball.outputs.path }}
+        run: npm publish "$TARBALL" --provenance --access public
