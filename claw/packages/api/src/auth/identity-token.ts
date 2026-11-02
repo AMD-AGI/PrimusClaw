@@ -216,17 +216,17 @@ async function ownKeysOf(verifier: TokenKeyVerifier, key: string, sub: string): 
   if (!verifyApiKey) {
     return { status: "misconfigured", message: "CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS needs SaFE to verify the key, and this deployment has none" };
   }
-  const refused = (reason: string, legacyError: string, message: string): CallerKeys => ({ status: "refused", reason, outcome: refuse(401, legacyError, message) });
-  if (!isApiKey(key)) return refused("not_an_api_key", "invalid_api_key", "x-api-key must be the user's own API key (ak-...)");
+  const turnedAway = (reason: string, legacyError: string, message: string): CallerKeys => ({ status: "refused", reason, outcome: refuse(401, legacyError, message) });
+  if (!isApiKey(key)) return turnedAway("not_an_api_key", "invalid_api_key", "x-api-key must be the user's own API key (ak-...)");
   let user: UserInfo;
   try {
     user = await verifyApiKey(key);
   } catch (err) {
     const failure = safeFailureOf(err);
-    return failure.status === "none" ? refused(failure.reason, "invalid_api_key", "SaFE does not accept the x-api-key") : failure;
+    return failure.status === "none" ? turnedAway(failure.reason, "invalid_api_key", "SaFE does not accept the x-api-key") : failure;
   }
-  if (user.userId !== sub) return refused("key_of_another_user", "key_subject_mismatch", "the x-api-key is not the access token's user's own key");
-  if (!user.platformKey && !user.virtualKey) return refused("key_without_keys", "invalid_api_key", "SaFE holds no keys for the x-api-key");
+  if (user.userId !== sub) return turnedAway("key_of_another_user", "key_subject_mismatch", "the x-api-key is not the access token's user's own key");
+  if (!user.platformKey && !user.virtualKey) return turnedAway("key_without_keys", "invalid_api_key", "SaFE holds no keys for the x-api-key");
   return { status: "keys", platformKey: user.platformKey, virtualKey: user.virtualKey };
 }
 
