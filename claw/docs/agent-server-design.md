@@ -430,12 +430,12 @@ The pre-v1.0 `resource_cpu` / `resource_gpu` split was removed; downstream Brain
 
 #### Outbound `a2a_call`: peers and credentials
 
-Brain's built-in `a2a_call` tool is the client side of the above. It reaches only the peers an operator
-configured in the Brain env `A2A_AGENTS`; the model passes a peer **name**, and a URL is refused. It is
-never handed a credential and never chooses one: the `Authorization` bearer on a request to a peer is that
-peer's own token, read from the variable the entry's `auth_env` names, and a peer with no `auth_env` is sent
-no `Authorization` at all. The user's LLM key and the platform key are not sent to a peer (they used to be,
-as the bearer of every call).
+Brain's built-in `a2a_call` tool is the client side of the above. It is off unless the Brain env
+`A2A_CLIENT_ENABLED` is `true`: the tool is then not offered to the model, and a call that arrives anyway (a
+resumed transcript) is refused. With it on, it reaches only the peers an operator configured in `A2A_AGENTS`;
+the model passes a peer **name**, and a URL is refused. It is never handed a credential and never chooses one:
+what a peer receives as `Authorization` is decided by its entry, below. The user's LLM key and the platform key
+are not sent to a peer (they used to be, as the bearer of every call).
 
 `A2A_AGENTS` takes either form:
 
@@ -443,21 +443,86 @@ as the bearer of every call).
 |---|---|---|
 | Name list | `ci=https://ci.example.com,dev=http://dev.svc:8080` | none |
 | JSON array | `[{"name":"ci","url":"https://ci.example.com","auth_env":"A2A_PEER_TOKEN_CI","allow_local":false}]` | `A2A_PEER_TOKEN_CI` |
+| JSON array | `[{"name":"claw2","card_url":"https://claw.example.com/claw-api/a2a/plugins/7/.well-known/agent-card.json","audience":"claw-api","scope":"claw.api"}]` | the session user's identity |
 
-An entry that does not parse (a name that is not `[A-Za-z0-9][A-Za-z0-9._-]*`, a non-http(s) URL, a URL with
-embedded credentials, an `auth_env` that is not a variable name or does not start with `A2A_PEER_TOKEN_`, a
-non-boolean `allow_local`) is refused when Brain starts: it is logged as `a2a.registry.entry_refused` with the
-reason and not registered, and its neighbours still load. The `A2A_PEER_TOKEN_` prefix keeps a peer entry from
-being pointed at a deployment-wide secret such as `ANTHROPIC_API_KEY`: the only variables a peer can be sent
-are ones set aside for peers. A named `auth_env` that is empty makes the peer uncallable (the call fails, it
-is never sent unauthenticated).
+An entry needs `url` (a base URL) or `card_url` (the Agent Card's address; with only `url` it is
+`<url>/.well-known/agent-card.json`). Its other keys are `auth_env`, `audience`, `scope` (only with `audience`)
+and `allow_local`. An entry that does not parse (a name that is not `[A-Za-z0-9][A-Za-z0-9._-]*`, a non-http(s)
+URL, a URL with embedded credentials, an `auth_env` that is not a variable name or does not start with
+`A2A_PEER_TOKEN_`, a non-boolean `allow_local`, a key that is not one of those listed -- a misspelt `audience`
+must not leave a peer called without it -- or both `auth_env` and `audience`) is refused when Brain starts: it
+is logged as `a2a.registry.entry_refused` with the reason and not registered, and its neighbours still load.
+Entries carry an optional owner in the registry, so a later step can add a user's own peers without changing the
+callers; today every entry is the operator's and every session's.
+
+**Where the call goes.** The endpoint is the card's `supportedInterfaces` entry with binding `JSONRPC` and version
+`1.x`, not a guess. It must be on the origin of `card_url` (or of `url`): a card that named another host could
+otherwise carry the credential there, so the call is refused and nothing is sent. A peer given only as a bare
+base URL (`name=url`) that publishes no card, or a card with no interfaces at all, keeps being called at
+`<url>/a2a`. The card is cached for its `Cache-Control` `max-age` (5 minutes when absent, at most one hour),
+revalidated with `If-None-Match`, and a card that cannot be refreshed (a 5xx, an unreachable peer) is served
+from the cache; a card for an identity peer is cached per user, so one user's view of a private agent is never
+another's.
+
+**How it authenticates.** One of three, per entry:
+
+- `audience`: the peer is called as the session's user. Brain asks primus-identity (RFC 8693, as its own service
+  client, `IDENTITY_CLIENT_*`) for a token with `subject_token=user_id:<session owner>`, `subject_token_type=
+  urn:primus:params:oauth:token-type:user-ref`, `audience=<audience>` and the entry's `scope`; the client caches
+  it and refreshes it before it expires. The peer sees `sub` = the user and `act.sub` = the Brain's client. A
+  binding revoked at identity ends the calls at the next exchange (within the token's life, 5 minutes by
+  default) with a message saying so; a token the peer refuses (401) is replaced by a fresh exchange once. The
+  token stays in the Brain process: it is not in the tool result, the model's context or the sandbox. The session
+  owner needs a binding at identity (`backfill-bindings`), and the service client needs the audience in its
+  allowed audiences and the scope among the exchange scopes (`PRIMUS_IDENTITY_EXCHANGE_SCOPES`).
+- `auth_env`: the peer's own token, read from the variable the entry names; the peer sees Claw, not the user.
+  The name must start with `A2A_PEER_TOKEN_`, so a peer entry cannot be pointed at a deployment-wide secret
+  such as `ANTHROPIC_API_KEY`: the only variables a peer can be sent are ones set aside for peers.
+  A named variable that is empty makes the peer uncallable (the call fails, it is never sent unauthenticated).
+- Neither: no `Authorization` at all.
+
+Whatever a peer writes back (its artifacts, status messages, errors and card) is read by the model, so what
+`a2a_call` returns has the credentials that call sent removed (`[credential removed]`), as sent, JSON-escaped,
+URL-encoded or base64. A peer that re-encodes a credential further has still only echoed what it was given; this
+keeps it out of the model's context, it does not make a peer that holds it harmless.
+
+**What the model gets.** JSON, `{state, task_id, context_id, text, artifacts, input_required?, note?}`. `state`
+is the task's state without the proto prefix (`submitted`, `working`, `input_required`, `auth_required`,
+`completed`, `failed`, `canceled`, `rejected`). `text` is the peer's answer (the text of its artifacts; for a
+failed task, its status message first); `artifacts` lists what was produced, and a part that is not text is
+described (a URL, a size) and never inlined. `mode` is `stream` (default), `fire_and_forget`, `discover`, `get`
+or `cancel`; `context_id` continues a conversation in a new task. A peer that says it does not stream is asked
+with an ordinary `SendMessage`.
+
+**Waiting.** A streamed call ends its wait after `A2A_STREAM_IDLE_TIMEOUT_MS` (default 120 s) with no event (the
+connection's keep-alive comments do not count: they show the connection is up, not that the task moves) or after
+`A2A_STREAM_MAX_MS` (default 600 s), whichever is first, and in any case 10 s before the run's own budget
+(`deadline_at`) ends, never under 5 s. Outliving the wait is not a failure: the result is `state=working` with
+the `task_id`, and the task is left running; the model reads it later with `mode=get`, or stops it with
+`mode=cancel`. Discovery waits 10 s, other non-streaming calls 30 s.
+
+**Stop.** When the run's abort signal fires because the user pressed Stop (or the run's deadline passed), the
+call sends `CancelTask` to the peer on a request of its own and returns `state=canceled`. A graceful restart of
+Brain does not cancel the peer's task: the run resumes and may still want it. A Stop that arrives before the peer
+has named a task has nothing to cancel.
+
+**input_required.** A peer that asks for input or approval (or, forwarded, authentication) ends the wait with
+`state=input_required` and `input_required.text`, the question. If the peer attaches a data part
+`{kind:"approval", actionId, tool, input, options, timeoutMs}` it is surfaced as `input_required.approval`. The
+model either asks the user with `ask_user_question`, or answers by calling `a2a_call` again with the `task_id`
+and `context_id` and the answer in `message`; for an approval request it passes `approval: {action_id,
+decision}`, sent as a data part `{actionId, decision}`. **An `allow` is held for the user**: it goes through the
+same approval gate as any held tool (`HitlController`, a `permissionRequest` the user answers, denied when
+nobody answers), so a peer's own text cannot talk the model into approving it. This guards the structured
+approval; an answer typed into `message` is the model's own call, like any text it sends (the guard reads the
+call, not the peer, so a peer that takes a bare "allow" in text is outside it -- ask the user first).
 
 A peer is refused when its address is loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, which
 includes the cloud metadata address, and `fe80::/10`) or unspecified (`0.0.0.0/8`, `::`), including those
 carried as IPv4-mapped IPv6 or inside the well-known (`64:ff9b::/96`) or local-use (`64:ff9b:1::/48`) NAT64 prefix, unless the entry sets `allow_local: true`. The check runs on the
 address the connection is actually made to, so a name cannot resolve one way for the check and another for
 the request. Private ranges are allowed: an in-cluster peer lives there and the operator named it.
-Redirects from a peer are not followed.
+Redirects from a peer are not followed. A single response or stream is read to at most 16 MiB.
 
 #### Legacy `POST /invoke` / `POST /invoke/:skill`
 
@@ -777,7 +842,7 @@ A2A errors carry `data: [google.rpc.ErrorInfo]` with a stable `reason` (`TASK_NO
 4. **No Secrets in Logs**: Task payloads are logged at `info` level with sensitive fields (API keys, tokens) redacted.
 5. **CORS**: Configurable via `CORS_ORIGINS` env. Default: deny all cross-origin requests in standalone mode.
 6. **TLS**: Agent Server listens on plain HTTP. TLS termination should be handled by a reverse proxy (nginx, Envoy, Higress).
-7. **Outbound A2A**: `a2a_call` only reaches operator-configured peers and sends each only its own credential; the model cannot name a URL, so a prompt-injected model can neither send a key to a host of its choosing nor aim a call at an internal address. See "Outbound `a2a_call`" in §3.2.
+7. **Outbound A2A**: `a2a_call` is off by default, only reaches operator-configured peers at the endpoint their card names on the origin the operator wrote down, and sends each only its own credential (an identity token for the session's user, or the operator's service token); the model cannot name a URL, so a prompt-injected model can neither send a key to a host of its choosing nor aim a call at an internal address, and a peer's approval request is the user's to grant. See "Outbound `a2a_call`" in §3.2.
 
 ---
 
