@@ -35,12 +35,12 @@ export interface WorkReport {
   result?: unknown;
 }
 
-const TITLE_MAX = 40;
+export const TITLE_MAX = 40;
 const SUMMARY_MAX = 80;
 export const DONE_WINDOW_DAYS = 7;
 
 /** One line, at most `max` characters (not UTF-16 units: titles are mostly Chinese). */
-function clipOneLine(text: string, max: number): string {
+export function clipOneLine(text: string, max: number): string {
   return Array.from(text.replace(/\s+/g, " ").trim()).slice(0, max).join("");
 }
 

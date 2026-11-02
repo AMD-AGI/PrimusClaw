@@ -127,6 +127,8 @@ export async function startWorld(env: Record<string, string> = {}) {
     const created = await mod.tools.workCreate(turn, { title, brief });
     await closeRun(turn.task_id);
     const row = (await q("SELECT worker_session_id FROM claw_work_items WHERE item_id = $1", [created.item_id]))[0];
+    // The drain the stub stood in for would have handed the first message to a run and deleted its queue row.
+    await q("DELETE FROM claw_pending_messages WHERE session_id = $1", [row.worker_session_id]);
     drains.length = 0;
     return { itemId: created.item_id, seq: created.seq, workerSid: row.worker_session_id };
   }

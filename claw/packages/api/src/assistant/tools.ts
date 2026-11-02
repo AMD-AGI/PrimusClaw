@@ -23,7 +23,9 @@ import { recordAssistantSay, SayRefused, type SayDeps } from "./outbound.js";
 import { parseReport } from "./report.js";
 import { ingestReport } from "./reports.js";
 import type { AssistantTokenClaims } from "./token.js";
-import { getWorkItem, insertWorkItem, recentEvents, reopenWorkItem, stopWorkItem } from "./work-items.js";
+import {
+  clipOneLine, getWorkItem, insertWorkItem, recentEvents, reopenWorkItem, stopWorkItem, TITLE_MAX,
+} from "./work-items.js";
 
 /** A refusal written for the model to read and act on. Anything else thrown is a fault, not an answer. */
 export class ToolRefused extends Error {
@@ -37,7 +39,6 @@ export class ToolRefused extends Error {
 const DUPLICATE_CREATE_WINDOW = "10 minutes";
 export const WORKER_TAIL_MAX_CHARS = 4000;
 const RECALL_EVENTS = 20;
-const TITLE_MAX = 40;
 
 /**
  * The current user of a live turn, or a refusal. `FOR SHARE` holds the session row for the rest of the
@@ -98,13 +99,11 @@ export async function say(
   }
 }
 
-const oneLine = (text: string, max: number): string => Array.from(text.replace(/\s+/g, " ").trim()).slice(0, max).join("");
-
 export async function workCreate(
   claims: AssistantTokenClaims, args: { title: string; brief: string; repo?: unknown },
 ): Promise<{ ok: true; item_id: string; seq: number; deduplicated: boolean }> {
   requireRole(claims, "router");
-  const title = oneLine(args.title, TITLE_MAX);
+  const title = clipOneLine(args.title, TITLE_MAX);
   const brief = args.brief.trim();
   if (!title || !brief) throw new ToolRefused("invalid_arguments", "work_create needs a title and a brief");
   let repo: unknown;

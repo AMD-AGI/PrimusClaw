@@ -19,13 +19,22 @@ import pino from "pino";
 import { db } from "../infra/db.js";
 import { REPORT_SUMMARY_MAX } from "./report.js";
 import { ingestReport } from "./reports.js";
-import type { WorkReport } from "./work-items.js";
+import { REPORT_KINDS, reportTransition, type WorkReport } from "./work-items.js";
 
 const logger = pino({ name: "assistant-turn-end" });
 
 /** A run closed this recently is the completion handler's to record; the sweep waits for it. */
 const SWEEP_GRACE_SECONDS = 60;
 const SWEEP_BATCH = 20;
+
+/**
+ * The reports that already tell the assistant something it must act on, read off the state table rather than
+ * listed again: a kind that wakes the router whatever it carries, and a kind that wakes it only with a question.
+ */
+const WAKING_KINDS = REPORT_KINDS.filter((kind) => reportTransition({ kind }).wake);
+const WAKING_WITH_QUESTION = REPORT_KINDS.filter(
+  (kind) => !WAKING_KINDS.includes(kind) && reportTransition({ kind, question: "?" }).wake,
+);
 
 export type TurnEndOutcome = "failed" | "finished" | "interrupted";
 
@@ -50,8 +59,7 @@ async function runRecord(workerSessionId: string, runId: string): Promise<RunRec
             EXISTS (
               SELECT 1 FROM claw_work_item_events r
                WHERE r.item_id = w.item_id AND r.run_id = e.run_id
-                 AND (r.kind IN ('blocked', 'ready', 'failed', 'dropped')
-                      OR (r.kind = 'waiting' AND r.question IS NOT NULL))
+                 AND (r.kind = ANY($3::text[]) OR (r.kind = ANY($4::text[]) AND r.question IS NOT NULL))
             ) AS told,
             (EXISTS (
                SELECT 1 FROM claw_tasks t
@@ -63,7 +71,7 @@ async function runRecord(workerSessionId: string, runId: string): Promise<RunRec
        FROM claw_work_items w
        JOIN claw_work_item_events e ON e.item_id = w.item_id AND e.run_id = $2 AND e.kind = 'run_started'
       WHERE w.worker_session_id = $1`,
-    [workerSessionId, runId],
+    [workerSessionId, runId, WAKING_KINDS, WAKING_WITH_QUESTION],
   )).rows[0] as RunRecord | undefined;
   return row ?? null;
 }
