@@ -157,6 +157,9 @@ record it.
   `npm install -g @primusclaw/connector` installs the `claw-connector` command (Node.js 22 or newer).
   The package holds only the two bundles (the CLI and the session-hook program), README and LICENSE, and the Connector packaging workflow checks a real
   tarball on every change (`connector/scripts/check-pack.mjs`), together with the shape of the release workflow.
+- `@primusclaw/connector` 0.1.1 is the first version published by the release workflow, with a build-provenance
+  attestation (`gh attestation verify` on the tarball attached to the release, and the provenance shown on npmjs.com). It has
+  the same code as 0.1.0, which was published by hand: no behaviour change.
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
