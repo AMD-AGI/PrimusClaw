@@ -532,6 +532,21 @@ describe("assistant work items", { skip }, () => {
       assert.deepEqual(published, []);
     });
 
+    test("a body that names another user as the owner changes nothing: the owner is the caller", async () => {
+      const mine = await item("u1");
+      await report(mine, { kind: "ready", summary: "v1" });
+      const created = await as("u2").post("/v1/assistant", { user_id: "u1", userId: "u1" });
+      assert.deepEqual((await rows("SELECT user_id FROM claw_sessions WHERE session_id = $1", [created.body.data.session_id])).map((r) => r.user_id), ["u2"]);
+      assert.deepEqual((await rows("SELECT user_id FROM claw_assistants ORDER BY user_id")).map((r) => r.user_id), ["u1", "u2"]);
+      for (const [path, body] of [
+        [`/v1/work-items/${mine.itemId}/accept`, { version: 1, user_id: "u1" }],
+        [`/v1/work-items/${mine.itemId}/stop`, { user_id: "u1" }],
+      ] as const) {
+        assert.equal((await as("u2").post(path, body)).status, 404, path);
+      }
+      assert.equal((await row(mine.itemId)).board_state, "needs_you");
+    });
+
     test("the board of one user holds none of another's", async () => {
       await item("u1", 1);
       await item("u2", 1);
