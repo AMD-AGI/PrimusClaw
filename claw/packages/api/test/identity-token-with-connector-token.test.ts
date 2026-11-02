@@ -20,12 +20,14 @@ import test, { after, before, describe } from "node:test";
 import Fastify, { type FastifyInstance } from "fastify";
 
 import { FakeIdentity, signJwt, testKey } from "../../utils/test/identity-fake.js";
+import { sendJson, startFakeUpstream, type FakeUpstream } from "./support/fake-upstream.js";
 
 const nowSec = () => Math.floor(Date.now() / 1000);
 const es = testKey("ES256", "k-es");
 
 describe("a user's access token and a connector's, both switched on", () => {
   let fake: FakeIdentity;
+  let safe: FakeUpstream;
   let app: FastifyInstance;
   let base = "";
 
@@ -47,11 +49,12 @@ describe("a user's access token and a connector's, both switched on", () => {
 
   before(async () => {
     process.env.CLAW_REMOTE_AGENTS_ENABLED = "true";
+    safe = await startFakeUpstream((_req, res) => sendJson(res, 401, { code: 401, message: "invalid token" }));
     fake = await FakeIdentity.start();
     fake.jwks = () => ({ body: { keys: [es.jwk] } });
     Object.assign(process.env, {
-      // Never called: no request here carries a credential SaFE could judge.
-      SAFE_API_URL: "http://127.0.0.1:9", AUTH_INTERNAL_TOKEN: "t",
+      // A SaFE that does not know the issuer: the only question put to it is what keys a user token's subject has.
+      SAFE_API_URL: safe.url, AUTH_INTERNAL_TOKEN: "t",
       IDENTITY_CLIENT_ENABLED: "true", IDENTITY_ISSUER_URL: fake.issuer, IDENTITY_CLIENT_ID: "svc-claw", IDENTITY_CLIENT_SECRET: "s3cret",
       CLAW_IDENTITY_TOKEN_AUTH_ENABLED: "true",
     });
@@ -79,6 +82,7 @@ describe("a user's access token and a connector's, both switched on", () => {
   after(async () => {
     await app?.close();
     await fake?.close();
+    await safe?.close();
   });
 
   test("a connector's token on the connector side is the connector path's: the `default` role, whatever the token says", async () => {
