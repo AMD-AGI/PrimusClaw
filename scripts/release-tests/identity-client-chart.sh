@@ -191,7 +191,8 @@ document_of "$tmp/token.yaml" "primus-claw/templates/brain-deployment.yaml" >"$t
 if rg -q 'CLAW_IDENTITY_TOKEN_' "$tmp/brain.token"; then bad "Brain was given a CLAW_IDENTITY_TOKEN_ entry"; fi
 [ "$(rg -c 'name: CLAW_IDENTITY_TOKEN_AUTH_ENABLED$' "$tmp/token.yaml")" = 1 ] \
   || bad "CLAW_IDENTITY_TOKEN_AUTH_ENABLED should render in exactly one Deployment"
-for optional in CLAW_IDENTITY_TOKEN_AUDIENCE CLAW_IDENTITY_TOKEN_SCOPE CLAW_IDENTITY_TOKEN_INTROSPECT CLAW_IDENTITY_TOKEN_TRUSTED_ROLES; do
+for optional in CLAW_IDENTITY_TOKEN_AUDIENCE CLAW_IDENTITY_TOKEN_SCOPE CLAW_IDENTITY_TOKEN_INTROSPECT CLAW_IDENTITY_TOKEN_TRUSTED_ROLES \
+  CLAW_IDENTITY_TOKEN_DELEGATION_AUDIENCE CLAW_IDENTITY_TOKEN_DELEGATION_SCOPE; do
   if rg -q "name: $optional\$" "$tmp/api.token"; then bad "$optional rendered although unset"; fi
 done
 # It rides on the identity client's own entries, which are still there.
@@ -199,13 +200,16 @@ done
 ok "only the API gets the switch, and no optional member renders until it is set"
 
 render "$tmp/token-opt.yaml" "${base[@]}" "${enabled[@]}" --set identity.tokenAuth.enabled=true \
-  --set-string identity.tokenAuth.audience=other-api --set-string identity.tokenAuth.scope=other.scope --set identity.tokenAuth.introspect=true
+  --set-string identity.tokenAuth.audience=other-api --set-string identity.tokenAuth.scope=other.scope --set identity.tokenAuth.introspect=true \
+  --set-string identity.tokenAuth.delegationAudience=keys-service --set-string identity.tokenAuth.delegationScope=keys.verify
 document_of "$tmp/token-opt.yaml" "primus-claw/templates/api-deployment.yaml" >"$tmp/api.token-opt"
 want_token() { [ "$(env_value "$tmp/api.token-opt" "$1")" = "$2" ] || bad "$1 did not render as \"$2\", got \"$(env_value "$tmp/api.token-opt" "$1")\""; }
 want_token CLAW_IDENTITY_TOKEN_AUDIENCE other-api
 want_token CLAW_IDENTITY_TOKEN_SCOPE other.scope
 want_token CLAW_IDENTITY_TOKEN_INTROSPECT true
-ok "audience, scope and introspection render when set"
+want_token CLAW_IDENTITY_TOKEN_DELEGATION_AUDIENCE keys-service
+want_token CLAW_IDENTITY_TOKEN_DELEGATION_SCOPE keys.verify
+ok "audience, scope, introspection and the delegation audience and scope render when set"
 
 # Roles a token may confer: none unless named, and only the two platform administrator roles can be.
 render "$tmp/token-roles.yaml" "${base[@]}" "${enabled[@]}" --set identity.tokenAuth.enabled=true \
