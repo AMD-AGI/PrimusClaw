@@ -303,6 +303,7 @@ test("A8 every place in the source that can start a turn is gated, or is on a li
   const PRIMITIVES = [
     /\bdispatchTaskToBrain\b/, /\bdispatchPendingMessage\b/, /INSERT INTO claw_pending_messages/, /\bexpandDag\b/, /\bcreateSingleTask\b/, /\bretryTask\b/,
     /\badmitAppRun\b/, /\bopenChatRun\b/, /\bhandOffAssembledRun\b/, /publish\(`decision\./, /\bapplySessionGateTransition\b/,
+    /\bsubmitSessionMessage\b/,
   ];
   /** Files that ask `actingTurnRefusal` (or `actingTurnRefusalFor`), and in how many places. */
   const GATED: Record<string, number> = {
@@ -314,6 +315,7 @@ test("A8 every place in the source that can start a turn is gated, or is on a li
   };
   /** Files that can start a turn and need no gate of their own, with the reason. Each must still match, so that the list holds no guesses. */
   const NO_GATE: Record<string, string> = {
+    "sessions/submit-message.ts": "accepts a message once routes/sessions.ts has passed its gate in as `refuse`, asked under the session lock (see below)",
     "sessions/dispatch.ts": "the shared dispatch: the gated routes call it, and so do a new session's first message and a trigger",
     "events/consumer.ts": "drains the queue, which only the two gated routes put messages into",
     "tasks/pending-dispatch.ts": "drains queued messages, which only the two gated routes queue",
@@ -340,14 +342,17 @@ test("A8 every place in the source that can start a turn is gated, or is on a li
   for (const [file, places] of Object.entries(GATED)) assert.equal(found.get(file), places, `${file} asks actingTurnRefusal in ${places} place(s)`);
   // A count of gates per file cannot tell one dispatch from another, so each place that dispatches a turn is counted too: a new one in a gated
   // file fails here until somebody says which kind it is. In routes/sessions.ts they are the first message of a new session (the create asks
-  // `classifyAttendedCaller`), a message (gated) and the start of the sandbox, which is a script run with no model call (`sandboxOnly`).
-  const dispatches: Record<string, number> = { "routes/sessions.ts": 3, "routes/anthropic-managed-agents.ts": 1 };
+  // `classifyAttendedCaller`) and the start of the sandbox, which is a script run with no model call (`sandboxOnly`). A message is dispatched
+  // by sessions/submit-message.ts, which refuses what the route's `refuse` refuses.
+  const dispatches: Record<string, number> = { "routes/sessions.ts": 2, "sessions/submit-message.ts": 1, "routes/anthropic-managed-agents.ts": 1 };
   for (const [file, n] of Object.entries(dispatches)) {
     assert.equal((stripComments(readFileSync(join(src, file), "utf8")).match(/\bdispatchTaskToBrain\(/g) ?? []).length, n, `${file}: places that dispatch a turn`);
   }
   const sessions = stripComments(readFileSync(join(src, "routes/sessions.ts"), "utf8"));
   assert.equal((sessions.match(/sandboxOnly: true/g) ?? []).length, 1, "exactly one dispatch of the sessions route is the sandbox start");
   assert.equal((sessions.match(/classifyAttendedCaller\(/g) ?? []).length, 1, "and the create asks the classifier");
+  // The message route is the one caller that holds a request, and it passes the gate in: a message accepted without it is open to the sandbox's key.
+  assert.equal((sessions.match(/\bsubmitSessionMessage\(\{[\s\S]*?\n    \}\);/g) ?? []).filter((call) => /\brefuse: \(tx\) => actingTurnRefusalFor\(req, sessionId, tx\)/.test(call)).length, 1, "the message route passes its gate to submitSessionMessage");
   // The three routes of routes/tasks.ts that start work say so; the ones that read or stop do not.
   const tasks = readFileSync(join(src, "routes/tasks.ts"), "utf8");
   assert.equal((tasks.match(/(?:requireSessionAccess|requireTaskAccess)\(req, reply, [\w.]+, true, true, true\)/g) ?? []).length, 3);

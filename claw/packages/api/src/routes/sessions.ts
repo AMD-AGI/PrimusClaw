@@ -7,13 +7,12 @@ import { connectionLost, db, type StatementRunner } from "../infra/db.js";
 import { singleflightCreate, type FlightResult } from "../shared/singleflight.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions/dispatch.js";
-import { resolveUserLlmKey } from "../llm/key-source.js";
-import { CLAW_GITHUB_REVIEW_ENABLED, RUN_DOORBELL_DISPATCH, SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
+import { submitSessionMessage } from "../sessions/submit-message.js";
+import { CLAW_GITHUB_REVIEW_ENABLED, SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
 import { actingTurnRefusalFor } from "../github-review/acting-turns.js";
 import { parseActingAs } from "../github-review/acting-as.js";
 import { classifyAttendedCaller } from "../github-review/attended.js";
 import { readGithubReviewSettings } from "../github-review/settings.js";
-import { pendingSecretColumns } from "../tasks/run-secrets.js";
 import {
   forceIdleAfterInterrupt, releaseSessionGateForTurn, stopSessionRuns, takeSessionGate,
 } from "../tasks/chat-run.js";
@@ -1844,148 +1843,47 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     // queues into claw_pending_messages (next-turn semantics); if idle it dispatches immediately.
     if (!content) return reply.status(400).send({ ok: false, error: "content required" });
 
-    // Captured inside the transaction (idle path) so the task publish below
-    // can inject user_env without re-reading the DB. Queue path freezes it
-    // onto claw_pending_messages directly and leaves this map empty.
-    let capturedUserEnvSnapshot: Record<string, string> = {};
-
-    // Minted before the gate is taken, so marker and turn are one string.
-    const turnMessageId = newChatMessageId();
-
-    // Transaction: lock row → check status → queue or dispatch
-    const client = await db.pool.connect();
-    try {
-      await client.query("BEGIN");
-      const lockResult = await client.query(
-        "SELECT agent_status, user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL FOR UPDATE",
-        [sessionId],
-      );
-      if (!lockResult.rows.length) {
-        await client.query("ROLLBACK");
-        return reply.status(404).send({ ok: false, error: "session not found" });
-      }
-      const row = lockResult.rows[0];
-      // Owner-only: text/inject messages are conversation writes; only the
-      // session creator may extend the conversation. Other ops on this session
-      // (read, interrupt, delete-of-own-session) are governed by their own
-      // rules above / below.
-      if (!canAccessSession(row.user_id, userId) && !(!row.user_id && user && isSystemAdmin(user))) {
-        await client.query("ROLLBACK");
-        return reply.status(403).send({ ok: false, error: "only the session creator can send messages" });
-      }
+    // Lock, gate, queue or dispatch: all of it is `submitSessionMessage`, which is
+    // also what a caller that is not an HTTP request goes through.
+    const submitted = await submitSessionMessage({
+      sessionId, userId, user,
+      content, messageType, toolIds, pluginId,
+      requestImage, requestResource, requestTimeout, topology,
+      workspaceId, mcpServers, sessionEnv,
+      isCancelled: () => isClientGone(req),
       // A turn in a session that acts as a user is the person's say, like creating it: the key a sandbox holds is the owner's own and
       // reaches this route, so it must not be able to put work in front of a model that holds the person's GitHub account.
-      const unattended = await actingTurnRefusalFor(req, sessionId, client);
-      if (unattended) {
-        await client.query("ROLLBACK");
-        return reply.status(403).send({ ok: false, error: unattended });
-      }
-
-      const status = lockResult.rows[0].agent_status;
-      // Snapshot per-user env at message creation time. Decrypted once here,
-      // frozen on the pending_messages row (queue path) or NATS task body
-      // (immediate path) so Brain reads plaintext without touching the
-      // master key. Same userId source as the SELECT above (req.user).
-      // IMPORTANT: reuse the transaction connection `client` here. Using the
-      // pool (`db`) would borrow a second connection while this tx still holds
-      // the FOR UPDATE row lock; under load that exhausts the pool, leaving
-      // connections stuck "idle in transaction" holding claw_sessions locks
-      // and blocking ALTER TABLE / reads cluster-wide.
-      const userEnvSnapshot = await loadUserEnvSnapshot(client, userId, logger);
-      if (status === "running") {
-        const secrets = pendingSecretColumns({
-          llmKey: resolveUserLlmKey(user) || "",
-          platformKey: user?.platformKey || "",
-          userEnv: userEnvSnapshot,
-          doorbell: RUN_DOORBELL_DISPATCH,
-        });
-        await client.query(
-          "INSERT INTO claw_pending_messages (session_id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11::jsonb, $12, $13::jsonb, $14::jsonb, $15::jsonb)",
-          [
-            sessionId,
-            content,
-            userId,
-            pluginId ?? null,
-            JSON.stringify(toolIds.length ? toolIds : []),
-            workspaceId ?? null,
-            secrets.platform,
-            secrets.llm,
-            secrets.blob,
-            requestImage ?? null,
-            requestResource ? JSON.stringify(requestResource) : null,
-            requestTimeout ?? null,
-            JSON.stringify(secrets.userEnv),
-            JSON.stringify(sessionEnv),
-            topology ? JSON.stringify(topology) : null,
-          ],
-        );
-        await client.query("COMMIT");
-        // No `run_id` here, and none invented. What this call accepted is a
-        // queued message; the run row is opened later by the drain, once the
-        // turn in front of it finishes. An id minted now would answer 404 on
-        // `/v1/runs` until then, and would name nothing at all if the replay is
-        // later refused a workspace or its admission. The caller polls the
-        // session until a run appears -- see docs/run-api.md.
+      refuse: (tx) => actingTurnRefusalFor(req, sessionId, tx),
+    });
+    switch (submitted.kind) {
+      case "session_not_found":
+        return reply.status(404).send({ ok: false, error: "session not found" });
+      case "not_owner":
+        return reply.status(403).send({ ok: false, error: "only the session creator can send messages" });
+      case "refused":
+        return reply.status(403).send({ ok: false, error: submitted.reason });
+      case "queued":
+        // No `run_id`: what this call accepted is a queued message, and the run
+        // row is opened later by the drain -- see docs/run-api.md.
         return { ok: true, session_id: sessionId, queued: true };
-      }
-      // Stash the snapshot for the immediate-dispatch path below — building
-      // `task` happens outside the transaction so we need it accessible.
-      // Hoisted via outer-scope variable defined after the try/finally block.
-      capturedUserEnvSnapshot = userEnvSnapshot;
-
-      await takeSessionGate(sessionId, turnMessageId, client);
-      await client.query("COMMIT");
-    } catch (e) {
-      await client.query("ROLLBACK");
-      throw e;
-    } finally {
-      client.release();
+      case "client_gone":
+        return reply.status(499).send({ ok: false, error: "client_closed_request" });
+      case "dispatch_failed":
+        return reply.status(503).send({ ok: false, error: "task dispatch failed", detail: submitted.error?.message });
+      case "admission_rejected":
+        return reply.status(429).send({ ok: false, error: "admission_rejected", reason: submitted.reason });
+      case "dispatched":
+        return {
+          ok: true,
+          session_id: sessionId,
+          message_id: submitted.messageId,
+          accepted: true,
+          // Present exactly when this call opened a run row. The queued branch
+          // above returns before this and carries no id on purpose: that message
+          // is in `claw_pending_messages` and no run exists to name yet.
+          run_id: submitted.runId,
+        };
     }
-
-    // A3: client already disconnected — don't dispatch; revert to idle so no
-    // phantom 'running' spinner is left behind (mirrors the publish-failure
-    // rollback below). The transaction above already committed 'running'.
-    if (isClientGone(req)) {
-      await releaseSessionGateForTurn(sessionId, turnMessageId);
-      logger.warn({ sessionId, userId }, "message.client_gone_pre_dispatch");
-      return reply.status(499).send({ ok: false, error: "client_closed_request" });
-    }
-
-    // Outside transaction: hand off to the shared brain-dispatch helper.
-    // On JetStream publish failure we MUST flip agent_status back to 'idle'
-    // here (the transaction above committed 'running'); otherwise the
-    // frontend spinner never stops and the next /messages POST queues into
-    // claw_pending_messages waiting for an exec_complete that never arrives.
-    const dispatch = await dispatchTaskToBrain(
-      {
-        sessionId, userId, user,
-        content, messageType, toolIds, pluginId,
-        requestImage, requestResource, requestTimeout, topology,
-        workspaceId, mcpServers,
-        capturedUserEnvSnapshot,
-        capturedSessionEnv: sessionEnv,
-        messageId: turnMessageId,
-      },
-      async () => {
-        await releaseSessionGateForTurn(sessionId, turnMessageId);
-      },
-    );
-    if (dispatch.kind === "publish_failed" || dispatch.kind === "publish_unknown") {
-      return reply.status(503).send({ ok: false, error: "task dispatch failed", detail: dispatch.error?.message });
-    }
-    if (dispatch.kind === "rejected") {
-      return reply.status(429).send({ ok: false, error: "admission_rejected", reason: dispatch.reason });
-    }
-    return {
-      ok: true,
-      session_id: sessionId,
-      message_id: dispatch.messageId,
-      accepted: true,
-      // Present exactly when this call opened a run row. The queued branch
-      // above returns before this and carries no id on purpose: that message is
-      // in `claw_pending_messages` and no run exists to name yet.
-      run_id: dispatch.runId,
-    };
   });
 
   // --- Start the session's sandbox without a turn (creator-only) ---
