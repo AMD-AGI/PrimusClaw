@@ -7,11 +7,12 @@ export {
   buildIdentityClient, startIdentityClient,
   type IdentityProcessMetrics, type IdentityStartupLog,
 } from "./startup.js";
+export { type ResolveCredentialRequest, type ResolvedCredential } from "./credentials.js";
 export {
-  IdentityExchangeRefusedError, IdentityUnavailableError, JwtVerificationError,
+  IdentityCredentialRefusedError, IdentityExchangeRefusedError, IdentityUnavailableError, JwtVerificationError,
   type JwtFailure, type UnavailableReason,
 } from "./errors.js";
-export { TOKEN_EXCHANGE_GRANT, type ExchangedToken, type ExchangeRequest } from "./exchange.js";
+export { ACCESS_TOKEN_TYPE, TOKEN_EXCHANGE_GRANT, type ExchangedToken, type ExchangeRequest } from "./exchange.js";
 export {
   type ActiveIntrospection, type InactiveIntrospection, type IntrospectionResult, type IntrospectOptions,
 } from "./introspection.js";

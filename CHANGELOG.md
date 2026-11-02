@@ -28,6 +28,34 @@ record it.
 ## [Unreleased]
 
 ### Added
+- `CLAW_REQUIRED_PLATFORM_ROLES` (chart: `api.requiredPlatformRoles`; empty by default, which changes
+  nothing) names platform roles of which a caller must hold at least one to use Claw at all. Anyone else is
+  refused with a 403 `platform_access_required` ("no access yet - ask an administrator") on every
+  authenticated route, before any LLM key is cached for them. The roles are the ones the platform's
+  verification of the caller's credential reports; a connector token and a BYOK key bring none, so they are
+  refused while the setting is on, and so is an identity token unless it carries a role the identity provider
+  confirmed (`CLAW_IDENTITY_TOKEN_TRUSTED_ROLES`; the `default` every such caller has never counts). Claw knows
+  no role names. Scheduled triggers already created keep firing for a user who loses access. See
+  `claw/docs/platform-access.md`.
+- The `a2a_call` tool is now a complete A2A client, off by default behind `A2A_CLIENT_ENABLED` (chart `extraEnv`;
+  while it is off the tool is not offered to the model and a call that arrives anyway is refused). With it on:
+  a peer is called where its Agent Card says (the JSONRPC 1.0 `supportedInterfaces` entry, cached by `ETag` /
+  `Cache-Control`) instead of at a guessed `<base>/a2a`, and only on the origin the operator wrote down; the
+  result is JSON `{state, task_id, context_id, text, artifacts, input_required?}` instead of text; `mode` gains
+  `get` and `cancel`, and `context_id` continues a conversation; a peer that asks for input or approval comes
+  back as `state=input_required` with the question (and a structured approval request when the peer sends one),
+  and the model answers by calling again with the `task_id` (`approval` for an approval request, whose `allow`
+  is held for the user's own approval before it is sent); a streamed call stops waiting after
+  `A2A_STREAM_IDLE_TIMEOUT_MS` (default 120 s) without an event, or `A2A_STREAM_MAX_MS` (default 600 s) in
+  total or when the run's budget is nearly spent, and then returns `state=working` with the `task_id` rather than
+  failing; and the user's Stop sends `CancelTask` to the peer. A peer entry in `A2A_AGENTS` may now set
+  `card_url`, and either `audience` (and optionally `scope`) -- Brain exchanges a short-lived token for the
+  session's user at primus-identity (`user_id:<owner>`, RFC 8693) and calls the peer as them; the token stays in
+  the Brain process -- or `auth_env` as before (a service credential, the peer sees Claw rather than the user).
+  What a peer writes back is scrubbed of the credentials the call sent before the model reads it.
+  An entry with a key it does not know, or with both `auth_env` and `audience`, is refused. The tool's `skill`
+  parameter, which nothing read, is gone. With the switch off the prompt also loses its "A2A Auth" line.
+  See `claw/docs/agent-server-design.md`, "Outbound `a2a_call`".
 - The API accepts an access token from an OpenID Connect identity provider (`Authorization: Bearer <JWT>`,
   verified by the shared identity client against the issuer's key set) as a credential beside the existing
   ones, behind `CLAW_IDENTITY_TOKEN_AUTH_ENABLED` (off by default; also needs `IDENTITY_CLIENT_ENABLED`).
@@ -65,6 +93,36 @@ record it.
   `by: "policy"` and counted in `claw_hitl_policy_allow_total` (no labels: a request can carry its own
   server spec, so the entry that released the call is in the `hitl.policy_allow` log line instead). See
   `claw/docs/mcp-approval.md`.
+- GitHub pull request review, off by default (`CLAW_GITHUB_REVIEW_ENABLED=true`). A session created with
+  `config.acting_as = <user id>` is offered four tools (`gh_pr_get`, `gh_pr_risk`, `gh_review_submit`,
+  `gh_pr_merge`) that review, and when everything is green merge, a public pull request with that user's GitHub
+  account. The token is fetched from the identity provider for one call and never reaches a sandbox, a tool result,
+  a log line or an event. Every gate is in the tool: owner allow-list and public repositories only, the head
+  commit pinned, the acting user's own permission and their setting for others acting for them (without it,
+  comments only), CI green on the head commit, no unresolved thread, GitHub's merge state `CLEAN`, a versioned
+  high-risk rule pack that holds a merge for the acting user's confirmation
+  (`GET /v1/github-review/confirmations`, `POST .../:id/decision`, which takes an identity-provider access token
+  only: the person's own sign-in, or a service an operator named in `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS`
+  acting for the user its token names, recording both. It refuses the `ak-` or BYOK key a sandbox holds and the
+  session cookie that key can sign in to at SaFE; the same credentials are required to create a session with
+  `config.acting_as` and to start any turn in one: a message, an approval or an answer, a task, a batch, a retry
+  or a workbench run). The
+  rules judge what the change does (architecture, interface, security-sensitive code, CI and release,
+  dependencies, size and breadth) from its net diff, so a pure refactor stays low; a file that came without its
+  diff (a binary, or an LFS pointer), a lock file and an edit of an authentication module or a release file stay
+  high as a floor whatever the edit looks like, and the reviewing model can raise a verdict with a reason shown on
+  the confirmation (`risk_judgement`) and never lower it. Rate limits, a request budget per session, a
+  dry-run switch and an audit row per call (`claw_github_audit`). A small change is reviewed from the diff
+  without starting a sandbox; the path taken is logged and audited, and the thresholds are
+  `CLAW_GITHUB_REVIEW_FAST_MAX_FILES` / `_MAX_CHANGED_LINES`. A repository's own review skill is read from the
+  tip of the base branch; the default `pr-review` skill is in `claw/examples/skills/pr-review/`.
+  The merge waits a few seconds, one request a look, for GitHub to finish working out the merge state after the
+  approval it just posted (`UNKNOWN`, or `BLOCKED` until the review counts; CI is read again before a merge that waited), and a review's hidden marker
+  carries a digest of its text and inline comments, so a second, different review of the same kind on the same commit is posted.
+  On the sandbox path the model gets a credential-free bash recipe that fetches the pull request anonymously, shallow and
+  pinned to the reviewed head, reusing an existing checkout. The shared
+  identity client gains `resolveExternalCredential` (`IDENTITY_CREDENTIAL_RESOLVE_URL`). See
+  `claw/docs/github-review.md`.
 - A session can be bound to a repository. `POST /v1/sessions` accepts `config.repo = {url, branch?}`
   (`url` is `https://<host>/<owner>/<name>[.git]` with no credentials, query or fragment; `branch` is a
   plain ref name, empty meaning the remote's default; anything else is a `400` starting
@@ -118,6 +176,20 @@ record it.
   confirmed is not opened); the adapter's own permission options passed through verbatim, including
   allow-always; credentials masked before upload; a local audit log; a kill switch that stops only the
   process groups it started. See `connector/README.md`.
+- `@primusclaw/connector` on npm: publishing a GitHub Release tagged `connector-vX.Y.Z` runs
+  `.github/workflows/connector-release.yml`, which tests the connector, signs a build-provenance attestation
+  for the tarball, attaches it to the release and publishes it with npm Trusted Publishing (a short-lived OIDC
+  credential and a provenance statement; no stored npm token). The publish waits for a required reviewer
+  of the `npm-publish` environment (who may be the maintainer who cut the release; administrators cannot
+  bypass it), which is what keeps an unreviewed commit from being published, and creating a `connector-v*`
+  tag is limited to repository admins by a tag ruleset. The tag must equal the version in
+  `connector/package.json`. Once a release has been published,
+  `npm install -g @primusclaw/connector` installs the `claw-connector` command (Node.js 22 or newer).
+  The package holds only the two bundles (the CLI and the session-hook program), README and LICENSE, and the Connector packaging workflow checks a real
+  tarball on every change (`connector/scripts/check-pack.mjs`), together with the shape of the release workflow.
+- `@primusclaw/connector` 0.1.1 is the first version published by the release workflow, with a build-provenance
+  attestation (`gh attestation verify` on the tarball attached to the release, and the provenance shown on npmjs.com). It has
+  the same code as 0.1.0, which was published by hand: no behaviour change.
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
@@ -332,6 +404,18 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- A caller authenticated by an identity provider's access token (`CLAW_IDENTITY_TOKEN_AUTH_ENABLED`) now has
+  the platform key and the virtual key SaFE holds for the token's subject, in the SaFE deployment mode. SaFE is never
+  shown the person's token: the API exchanges it at the provider (RFC 8693 service delegation, subject token type
+  access token) for a token for SaFE's audience that names the API as the party acting for the person
+  (`CLAW_IDENTITY_TOKEN_DELEGATION_AUDIENCE` and `_SCOPE`, default `primus-safe` and `safe.api`), and asks SaFE's
+  `POST /api/v1/auth/verify` with that, only for a token it has already accepted and that carries no actor. Only keys
+  for the token's own `sub` are used, and the answer is kept per person for at most the life the delegated token has
+  left, not per token and not for a fixed time. Before, such a caller had no model key (a turn failed with "Could not
+  resolve authentication method"), no key to create a sandbox with, and `GET /v1/me` answered 401. A SaFE that does
+  not accept the delegated token, or a provider that refuses the exchange, leaves the caller without keys; one that
+  cannot be reached, or answers 200 with something that is not an answer, is a 503. The provider's refusal of one subject token (`invalid_grant`: that device's grant is signed out, or the token has expired inside the clock tolerance) is kept for that token alone for 30 seconds, so the person's other tokens still get keys; only a refusal about the API's own client (`unauthorized_client`, `invalid_target`, `invalid_scope`) is kept per person. The MCP models tool no longer forwards such a caller's token to SaFE (it sends the platform key). A SaFE 5xx is no longer remembered as a failed verification of a cookie or key for 30
+  seconds. See `claw/docs/identity-client.md`.
 - A sandbox rebuilt from the workspace snapshot is still a git repository. `.git` was on the
   snapshot's exclude list, so after the idle window the files came back and the history did not,
   and every commit that had not been pushed was lost while the conversation still remembered

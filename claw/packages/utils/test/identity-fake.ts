@@ -49,6 +49,7 @@ export class FakeIdentity {
   jwks: (r: Recorded) => Reply = () => ({ body: { keys: [] } });
   introspect: (r: Recorded) => Reply = () => ({ body: { active: false } });
   token: (r: Recorded) => Reply = () => ({ status: 400, body: { error: "invalid_grant" } });
+  resolveCredential: (r: Recorded) => Reply = () => ({ status: 404, body: { error: "not_bound" } });
 
   private constructor(private readonly server: http.Server) {}
 
@@ -69,6 +70,7 @@ export class FakeIdentity {
         else if (path === "/.well-known/jwks.json") reply = self.jwks(rec);
         else if (path === "/oauth/introspect") reply = self.introspect(rec);
         else if (path === "/oauth/token") reply = self.token(rec);
+        else if (path === "/oauth/external-credentials/resolve") reply = self.resolveCredential(rec);
         else reply = { status: 404, body: "not found" };
         void respond(res, reply);
       });
@@ -219,6 +221,55 @@ export function activeAnswer(over: Record<string, unknown> = {}): Record<string,
     active: true, sub: "user-1", username: "u1@example.com", email: "u1@example.com",
     roles: ["default"], groups: [], token_type: "session", ...over,
   };
+}
+
+// --- the provider's side of service delegation -----------------------------------
+
+/** What {@link answerDelegation} was asked, for a test to look at. */
+export interface DelegationRequest {
+  /** The subject token as sent (the user's own access token). */
+  subjectToken: string;
+  audience: string;
+  scope: string;
+}
+
+/**
+ * Make the provider answer an RFC 8693 exchange whose `subject_token_type` is an access token the way
+ * primus-identity does: the new token's `sub` is the subject token's, its `aud` and `scope` are what was asked for, and
+ * `act` names the client the request was authenticated as. The subject token is not verified here (the real provider
+ * does: signature, audience, revocation); a test that needs a refusal replaces `fake.token` itself. Every request that
+ * reaches it is in `requests` as well as in `fake.requests`.
+ */
+export function answerDelegation(
+  fake: FakeIdentity, key: TestKey,
+  opts: { lifetimeSeconds?: number; clientId?: string; now?: () => number } = {},
+): DelegationRequest[] {
+  const requests: DelegationRequest[] = [];
+  const clientId = opts.clientId ?? CLIENT_ID;
+  const now = opts.now ?? (() => Math.floor(Date.now() / 1000));
+  let counter = 0;
+  fake.token = (r) => {
+    if (r.form.get("subject_token_type") !== "urn:ietf:params:oauth:token-type:access_token") {
+      return { status: 400, body: { error: "invalid_request" } };
+    }
+    const subjectToken = r.form.get("subject_token") ?? "";
+    const subject = JSON.parse(Buffer.from(subjectToken.split(".")[1] ?? "", "base64url").toString("utf8") || "{}") as Record<string, unknown>;
+    const audience = r.form.get("audience") ?? "";
+    const scope = r.form.get("scope") ?? "";
+    requests.push({ subjectToken, audience, scope });
+    const iat = now();
+    const lifetime = opts.lifetimeSeconds ?? 300;
+    const token = signJwt({
+      key,
+      claims: {
+        iss: fake.issuer, aud: audience, sub: subject.sub, client_id: clientId, act: { sub: clientId },
+        ...(subject.gid !== undefined ? { gid: subject.gid } : {}),
+        scope, jti: `delegated-${++counter}`, iat, nbf: iat - 1, exp: iat + lifetime,
+      },
+    });
+    return { body: { access_token: token, issued_token_type: "urn:ietf:params:oauth:token-type:access_token", token_type: "Bearer", expires_in: lifetime, scope } };
+  };
+  return requests;
 }
 
 // --- the pieces on their own, for what the facade fixes (cache capacity) ---------
