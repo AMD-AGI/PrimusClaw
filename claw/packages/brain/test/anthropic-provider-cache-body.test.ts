@@ -13,7 +13,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { Message, ToolSchema } from "@claw/protocol";
-import { anthropicDefaultHeaders, buildAnthropicSession } from "../src/llm/anthropic-provider.js";
+import { anthropicDefaultHeaders, buildAnthropicSession, createAnthropicClient } from "../src/llm/anthropic-provider.js";
 
 type Body = Record<string, any>;
 
@@ -256,6 +256,43 @@ test("the dead x-auto-prompt-caching header is gone and stays gone", async () =>
   // The session-affinity header must stay: without it the Auto Router can
   // change backend mid-conversation, and cache entries are model-scoped.
   assert.equal(headers["x-litellm-session-id"], "s");
+});
+
+test("the run's key goes out as x-api-key, and the SDK's Bearer is not added beside it", async () => {
+  // SDK 1 puts apiKey in Authorization. The gateway bills x-api-key, and a
+  // deployment key sitting in the environment must not ride along either.
+  const previous = process.env.ANTHROPIC_API_KEY;
+  process.env.ANTHROPIC_API_KEY = "deployment-shared-key-DO-NOT-USE";
+  const seen: Headers[] = [];
+  try {
+    const client = createAnthropicClient({
+      apiKey: "user-key-alice",
+      baseURL: "http://127.0.0.1:9",
+      defaultHeaders: anthropicDefaultHeaders({
+        litellmTags: "t", litellmMeta: "{}", userId: "u", sessionId: "s",
+      }),
+      fetch: async (_input, init) => {
+        seen.push(new Headers(init?.headers));
+        return new Response(JSON.stringify({
+          id: "msg_1", type: "message", role: "assistant", model: "m",
+          stop_reason: "end_turn", stop_sequence: null,
+          content: [{ type: "text", text: "ok" }],
+          usage: { input_tokens: 1, output_tokens: 1 },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      },
+    });
+    await client.messages.create({ model: "m", max_tokens: 8, messages: [{ role: "user", content: "hi" }] });
+  } finally {
+    if (previous === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = previous;
+  }
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].get("x-api-key"), "user-key-alice");
+  assert.equal(seen[0].get("authorization"), null);
+  assert.equal(seen[0].get("anthropic-version"), "2023-06-01");
+  assert.equal(seen[0].get("x-litellm-session-id"), "s");
+  const wire = JSON.stringify(Object.fromEntries(seen[0].entries()));
+  assert.equal(wire.includes("deployment-shared-key-DO-NOT-USE"), false);
 });
 
 test("the system hoist survives caching being turned off", async () => {

@@ -5,7 +5,6 @@ import fs from "node:fs";
 import { attachOrWrap } from "./attach-error.js";
 import os from "node:os";
 import path from "node:path";
-import Anthropic from "@anthropic-ai/sdk";
 import { HandsClient } from "../clients/hands.js";
 import { ToolRouter } from "../tools/router.js";
 import { agentLoop } from "./agent-loop.js";
@@ -22,6 +21,7 @@ import { connectPlatformMcp } from "../clients/mcp.js";
 import { buildPrompt, buildProgressiveSkillHint, listProgressiveSkills } from "./prompt.js";
 import { loadPlatformDefaults, resolveDefaultSkills, skillDescription, LazyDefaultSkills, type DefaultSkill } from "./platform-defaults.js";
 import { metrics } from "../infra/metrics.js";
+import { createAnthropicClient } from "../llm/anthropic-provider.js";
 import { resolveRequestLlmKey } from "../llm/key-source.js";
 import {
   isSafeRelativePath,
@@ -314,8 +314,9 @@ export class AgentEngine {
       const webApiKey = LLM_API_STYLE === "anthropic" ? apiKey : ANTHROPIC_API_KEY;
       const webToolCtx = (WEB_SEARCH_PROVIDER !== "disabled" || WEB_FETCH_ENABLED)
         ? (() => {
-            const anthropicClient = new Anthropic({
-              apiKey: webApiKey, baseURL: ANTHROPIC_BASE_URL, maxRetries: 2,
+            const anthropicClient = createAnthropicClient({
+              apiKey: webApiKey,
+              baseURL: ANTHROPIC_BASE_URL,
               defaultHeaders: webToolClientHeaders(),
             });
             const costTracker = new SimpleSessionCostTracker();
