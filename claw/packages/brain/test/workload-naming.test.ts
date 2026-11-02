@@ -9,6 +9,8 @@ test("every SaFE workload Claw creates shares the claw-<epoch-ms>-<kind> shape",
   assert.equal(sandboxWorkloadName(1785291793209), "claw-1785291793209-sandbox");
   assert.equal(multiNodeWorkloadName("claw-1785291151001", "rayjob"), "claw-1785291151001-ray");
   assert.equal(multiNodeWorkloadName("claw-1785291151001", "infera"), "claw-1785291151001-infera");
+  assert.equal(multiNodeWorkloadName("claw-1785291151001", "atom"), "claw-1785291151001-atom");
+  assert.equal(multiNodeWorkloadName("claw-1785291151001", "sglangrouter"), "claw-1785291151001-sglangrouter");
 });
 
 test("multiNodeWorkloadName is stable for a message id, so a redelivery maps to the same name", () => {

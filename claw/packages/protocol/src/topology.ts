@@ -31,8 +31,18 @@
 import { PG_INT4_MAX } from "@claw/utils";
 
 /** The engines a multi-node run can be provisioned onto. */
-export const TOPOLOGY_BACKENDS = ["rayjob", "infera"] as const;
+export const TOPOLOGY_BACKENDS = ["rayjob", "infera", "atom", "sglangrouter"] as const;
 export type TopologyBackend = (typeof TOPOLOGY_BACKENDS)[number];
+
+/** Backends that launch from a model path/id and must refuse a missing `--model`. */
+export function backendRequiresModel(backend: TopologyBackend): boolean {
+  return backend === "infera" || backend === "atom" || backend === "sglangrouter";
+}
+
+/** Atom and SGLangRouter are always router+prefill+decode; aggregated is not offered. */
+export function backendRequiresDisaggregatedPd(backend: TopologyBackend): boolean {
+  return backend === "atom" || backend === "sglangrouter";
+}
 
 export const TOPOLOGY_FRAMEWORKS = ["sglang", "vllm"] as const;
 export const TOPOLOGY_KV_BACKENDS = ["nixl", "mori", "mooncake"] as const;
@@ -54,7 +64,7 @@ export interface EnvironmentTopology {
   mem_per_node_gib?: number;
   /** Cluster image; falls back to the sandbox image when absent. */
   image?: string;
-  /** Model path or id. Required by the infera frontend, unused by rayjob. */
+  /** Model path or id. Required by infera, atom, and sglangrouter engines, unused by rayjob. */
   model?: string;
   framework?: (typeof TOPOLOGY_FRAMEWORKS)[number];
   pd_transfer_backend?: (typeof TOPOLOGY_KV_BACKENDS)[number];
@@ -63,6 +73,14 @@ export interface EnvironmentTopology {
   pd_decode_nodes?: number;
   pd_prefill_tp?: number;
   pd_decode_tp?: number;
+  /** Engine flags from `--server-args`, appended as given. */
+  server_args?: string;
+  /** Per-role engine flags from `--pd-prefill-extra-args`. */
+  pd_prefill_extra_args?: string;
+  /** Per-role engine flags from `--pd-decode-extra-args`. */
+  pd_decode_extra_args?: string;
+  /** IB device list from `--pd-ib-device`. */
+  pd_ib_device?: string;
   /** Variables injected into the cluster containers. */
   extra_env?: Record<string, string>;
 }
@@ -90,7 +108,14 @@ const NUMERIC_FIELDS = [
   "pd_decode_tp",
 ] as const;
 
-const STRING_FIELDS = ["image", "model"] as const;
+const STRING_FIELDS = [
+  "image",
+  "model",
+  "server_args",
+  "pd_prefill_extra_args",
+  "pd_decode_extra_args",
+  "pd_ib_device",
+] as const;
 
 const ENUM_FIELDS: Record<string, readonly string[]> = {
   backend: TOPOLOGY_BACKENDS,
@@ -165,7 +190,7 @@ export function validateTopology(input: unknown): TopologyValidation {
     // No default: `--nodes` alone used to be enough to provision a cluster on
     // whichever engine happened to be first, which is a large thing to get by
     // omission.
-    errors.push("topology.backend is required: rayjob or infera");
+    errors.push("topology.backend is required: rayjob, infera, atom, or sglangrouter");
   }
   if (typeof raw.nodes === "number" && raw.nodes < 1) {
     errors.push("topology.nodes must be at least 1");
@@ -185,14 +210,141 @@ export function validateTopology(input: unknown): TopologyValidation {
     }
   }
 
-  if (raw.backend === "infera" && !String(raw.model ?? "").trim()) {
-    // The infera frontend takes it as --router-tokenizer-path; without it the
-    // cluster comes up and the frontend cannot start.
-    errors.push("topology.model is required when backend is infera");
+  const backend = typeof raw.backend === "string"
+    && (TOPOLOGY_BACKENDS as readonly string[]).includes(raw.backend)
+    ? raw.backend as TopologyBackend
+    : undefined;
+
+  if (backend && backendRequiresModel(backend) && !String(raw.model ?? "").trim()) {
+    // Infera's frontend takes it as --router-tokenizer-path. Atom and
+    // SGLangRouter prefill and decode take it as --model-path. Without it the
+    // cluster comes up and the serving process cannot start.
+    errors.push(`topology.model is required when backend is ${backend}`);
+  }
+
+  if (backend && backendRequiresDisaggregatedPd(backend)) {
+    errors.push(...pdClusterShapeErrors(raw, backend));
   }
 
   if (errors.length) return { ok: false, errors };
   return { ok: true, value: raw as unknown as EnvironmentTopology };
+}
+
+/** GPU count used when a request omits gpus_per_node. */
+export const DEFAULT_GPUS_PER_NODE = 8;
+
+export interface PdClusterShape {
+  backend: string;
+  /** Omitted means the builder default, disaggregated. */
+  pdMode?: string;
+  nodes: number;
+  gpusPerNode?: number;
+  pdPrefillNodes?: number;
+  pdDecodeNodes?: number;
+  pdPrefillTp?: number;
+  pdDecodeTp?: number;
+}
+
+export type PdClusterProblem =
+  | { kind: "pd_mode"; got: string }
+  | { kind: "partial_roles" }
+  | { kind: "min_nodes"; nodes: number }
+  | { kind: "role_sum"; nodes: number; total: number }
+  | { kind: "tp"; role: "prefill" | "decode"; tp: number; gpus: number };
+
+/**
+ * Shape rules for an Atom or SGLangRouter cluster.
+ *
+ * Explicit prefill and decode counts must both be set and sum to nodes.
+ * Otherwise nodes is split evenly, which requires at least two nodes.
+ */
+export function pdClusterProblems(shape: PdClusterShape): PdClusterProblem[] {
+  const problems: PdClusterProblem[] = [];
+  if (shape.pdMode !== undefined && shape.pdMode !== "disaggregated") {
+    problems.push({ kind: "pd_mode", got: shape.pdMode });
+  }
+  const gpus = shape.gpusPerNode && shape.gpusPerNode > 0
+    ? shape.gpusPerNode
+    : DEFAULT_GPUS_PER_NODE;
+  const prefill = shape.pdPrefillNodes ?? 0;
+  const decode = shape.pdDecodeNodes ?? 0;
+  if ((prefill > 0) !== (decode > 0)) {
+    problems.push({ kind: "partial_roles" });
+  } else if (prefill > 0) {
+    const total = prefill + decode;
+    if (shape.nodes !== total) {
+      problems.push({ kind: "role_sum", nodes: shape.nodes, total });
+    }
+  } else if (shape.nodes < 2) {
+    problems.push({ kind: "min_nodes", nodes: shape.nodes });
+  }
+  const tp: Array<["prefill" | "decode", number]> = [
+    ["prefill", shape.pdPrefillTp ?? 0],
+    ["decode", shape.pdDecodeTp ?? 0],
+  ];
+  for (const [role, value] of tp) {
+    if (value > gpus) problems.push({ kind: "tp", role, tp: value, gpus });
+  }
+  return problems;
+}
+
+/**
+ * Prefill and decode replica counts. Explicit counts win; otherwise nodes is
+ * split evenly. Returns the first count problem instead of a pair.
+ */
+export function splitPdReplicas(
+  nodes: number,
+  prefillNodes: number,
+  decodeNodes: number,
+): { ok: true; prefill: number; decode: number } | { ok: false; problem: PdClusterProblem } {
+  const problem = pdClusterProblems({
+    backend: "pd-cluster",
+    nodes,
+    pdPrefillNodes: prefillNodes,
+    pdDecodeNodes: decodeNodes,
+  }).find((item) => item.kind === "partial_roles" || item.kind === "min_nodes" || item.kind === "role_sum");
+  if (problem) return { ok: false, problem };
+  if (prefillNodes > 0 && decodeNodes > 0) {
+    return { ok: true, prefill: prefillNodes, decode: decodeNodes };
+  }
+  const prefill = Math.floor(nodes / 2);
+  return { ok: true, prefill, decode: nodes - prefill };
+}
+
+/**
+ * Admission text for the shared PD-cluster shape rules.
+ * A missing pd_mode is accepted: the builder defaults it to disaggregated.
+ */
+function pdClusterShapeErrors(
+  raw: Record<string, unknown>,
+  backend: TopologyBackend,
+): string[] {
+  const nodes = typeof raw.nodes === "number" ? raw.nodes : 0;
+  return pdClusterProblems({
+    backend,
+    pdMode: typeof raw.pd_mode === "string" ? raw.pd_mode : undefined,
+    nodes,
+    gpusPerNode: typeof raw.gpus_per_node === "number" ? raw.gpus_per_node : undefined,
+    pdPrefillNodes: typeof raw.pd_prefill_nodes === "number" ? raw.pd_prefill_nodes : undefined,
+    pdDecodeNodes: typeof raw.pd_decode_nodes === "number" ? raw.pd_decode_nodes : undefined,
+    pdPrefillTp: typeof raw.pd_prefill_tp === "number" ? raw.pd_prefill_tp : undefined,
+    pdDecodeTp: typeof raw.pd_decode_tp === "number" ? raw.pd_decode_tp : undefined,
+  }).map((problem) => pdClusterAdmissionMessage(backend, problem));
+}
+
+function pdClusterAdmissionMessage(backend: string, problem: PdClusterProblem): string {
+  switch (problem.kind) {
+    case "pd_mode":
+      return `topology.pd_mode ${problem.got} is not supported when backend is ${backend}`;
+    case "partial_roles":
+      return `topology.pd_prefill_nodes and topology.pd_decode_nodes must both be set when backend is ${backend}`;
+    case "min_nodes":
+      return `topology.nodes (${problem.nodes}) must be at least 2 when backend is ${backend}`;
+    case "role_sum":
+      return `topology.nodes (${problem.nodes}) must equal prefill+decode GPU nodes (${problem.total}) when backend is ${backend}`;
+    case "tp":
+      return `topology.pd_${problem.role}_tp (${problem.tp}) exceeds gpus_per_node (${problem.gpus}); cross-pod TP is not supported`;
+  }
 }
 
 /**
