@@ -45,7 +45,9 @@ import { releaseSessionGateForTurn, takeSessionGate } from "../tasks/chat-run.js
 import { drainOldestPendingMessage } from "../events/consumer.js";
 import { dispatchTaskToBrain, newChatMessageId } from "./dispatch.js";
 
-const logger = pino({ name: "submit-message" });
+// The name the route logged these records under before they moved, so a filter an
+// operator already has keeps matching them.
+const logger = pino({ name: "sessions" });
 
 /**
  * Seam over the drain, which reaches the whole completion path (history,
@@ -103,10 +105,26 @@ export type QueuedDrain =
   /** `enqueue` on an idle session, and the drain returned. */
   | "drained"
   /**
-   * `enqueue` on an idle session, and the drain threw. The message is queued; the
-   * sweeper's orphan drain picks up a queue row behind an idle session.
+   * `enqueue` on an idle session, the drain threw, and the row is still queued:
+   * the sweeper's orphan drain picks up a queue row behind an idle session, and
+   * a retry with the same key finds the row.
    */
   | "drain_failed"
+  /**
+   * The drain threw, but not before it took the message off the queue: it had
+   * been handed to a run (the drain publishes, deletes the row, and only then
+   * takes the gate) or refused with a run row to show for it. The message is
+   * not queued any more and must not be sent again -- the key no longer has a
+   * row to find, so a retry would be a second message.
+   */
+  | "left_queue"
+  /**
+   * The drain threw and whether the row survived could not be read. Treated as
+   * neither of the two above: a caller that retries on "still queued" would send
+   * twice if the row had gone, and one that stops on "gone" would lose the message
+   * if it had not.
+   */
+  | "drain_unknown"
   /** The key was already queued: nothing was written and nothing was drained. */
   | "duplicate";
 
@@ -186,6 +204,20 @@ export async function insertPendingMessage(
   );
   const id = (inserted.rows[0] as { id?: number } | undefined)?.id ?? null;
   return { id, deduplicated: keyed && id === null };
+}
+
+/** Whether the row a failed drain was working on is still in the queue. */
+async function queuedAfterFailedDrain(
+  pendingId: number | null,
+): Promise<"drain_failed" | "left_queue" | "drain_unknown"> {
+  if (pendingId === null) return "drain_unknown";
+  try {
+    const row = await db.query("SELECT 1 FROM claw_pending_messages WHERE id = $1", [pendingId]);
+    return row.rows.length > 0 ? "drain_failed" : "left_queue";
+  } catch (err) {
+    logger.warn({ err, pendingId }, "message.enqueue_drain_state_unreadable");
+    return "drain_unknown";
+  }
 }
 
 /**
@@ -313,14 +345,15 @@ export async function submitSessionMessage(
     // send that takes the gate between the commit above and this call puts a
     // second turn on a live session, which Brain serialises per session.
     //
-    // A drain that throws leaves the message queued, which is the state the
-    // sweeper's orphan drain exists to find; the answer says so rather than
-    // failing a submit whose message is recorded.
+    // A drain that throws is not a drain that left the message queued: it
+    // publishes, deletes the queue row and only then takes the gate, so it can
+    // fail with the message already on its way. The row is read back to say
+    // which, because the answer decides whether a caller may submit again.
     try {
       await submitMessagePorts.drainOldestPendingMessage(sessionId, userId);
     } catch (err) {
       logger.warn({ err, sessionId, pendingId }, "message.enqueue_drain_failed");
-      return { kind: "queued", pendingId, deduplicated, drain: "drain_failed" };
+      return { kind: "queued", pendingId, deduplicated, drain: await queuedAfterFailedDrain(pendingId) };
     }
     return { kind: "queued", pendingId, deduplicated, drain: "drained" };
   }
