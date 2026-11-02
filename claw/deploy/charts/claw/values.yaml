@@ -133,6 +133,25 @@ brain:
   # EXTRA_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* in values.<ns>.env (see
   # values.example.env); a bare `helm upgrade --set` is dropped by the next
   # upgrade.sh. Empty by default, which changes nothing.
+  #
+  # The a2a_call tool (calling other A2A agents) is off unless A2A_CLIENT_ENABLED is "true", and the peers it may
+  # reach are set here too (there is no dedicated key): A2A_AGENTS names them. Only a configured peer can be called,
+  # never a URL, and a peer receives only its own credential -- not the user's LLM key or the platform key. An
+  # internal peer carries "audience": Brain exchanges a short-lived token for the session's user at primus-identity
+  # (needs the identity client, see `identity`) and calls the peer as them. A third-party peer carries "auth_env", the
+  # variable holding the operator's token for it (the peer sees Claw, not the user); its name must start with
+  # A2A_PEER_TOKEN_, and an entry naming any other variable (for example ANTHROPIC_API_KEY) is refused at start-up,
+  # logged as a2a.registry.entry_refused, and not registered. With A2A_AGENTS unset, a2a_call has no peers (a breaking
+  # change for a deployment whose agents called a peer by URL: list that peer here). For example:
+  #   extraEnv:
+  #     - name: A2A_CLIENT_ENABLED
+  #       value: "true"
+  #     - name: A2A_AGENTS
+  #       value: '[{"name":"ci","url":"https://ci.example.com","auth_env":"A2A_PEER_TOKEN_CI"},{"name":"claw2","card_url":"https://claw.example.com/claw-api/.well-known/agent-card.json","audience":"claw-api","scope":"claw.api"}]'
+  #     - name: A2A_PEER_TOKEN_CI
+  #       valueFrom: {secretKeyRef: {name: a2a-peer-ci, key: token}}
+  # A peer on a loopback or link-local address needs "allow_local": true in its entry; see
+  # claw/docs/agent-server-design.md ("Outbound a2a_call").
   extraEnv: []
   extraVolumes: []
   extraVolumeMounts: []
@@ -461,7 +480,7 @@ secret:
   #
   # Which header identifies a backend is a property of whatever sits between
   # Claw and the model, so it is named here rather than baked in:
-  # "x-litellm-model-id" behind that proxy, an Azure APIM request id behind an
+  # "x-litellm-model-id" behind that proxy, a gateway request id behind an
   # API gateway, "request-id" talking to the provider directly.
   #
   # Named rather than "capture the response headers", because these are logged
@@ -506,9 +525,11 @@ grantSigningKey:
 # Shared identity client for API and Brain: OIDC discovery and the issuer's JWKS,
 # RFC 7662 token introspection (positive answers cached, inactive ones cached
 # briefly, concurrent lookups of one credential coalesced), and an RFC 8693 token
-# exchange client with a token cache. Off by default, and nothing authenticates
-# through it yet: enabling it builds the client, reads discovery and the key set
-# in the background, and starts exporting the claw_identity_* metrics.
+# exchange client with a token cache. Off by default; it authenticates a
+# connector's access token on the remote-agents connector routes and, only when
+# identity.tokenAuth is on, an identity provider's access token on the API:
+# enabling the client builds it, reads discovery and the key set in the
+# background, and starts exporting the claw_identity_* metrics.
 #
 # The client secret is never rendered from values. Create the Secret out of band
 # and name it here; both Deployments read the one key.
@@ -541,6 +562,27 @@ identity:
   requestTimeoutMs: ""       # default 5000
   keysRefreshSeconds: ""     # discovery and JWKS refresh, default 300
   exchangeRefreshSkewSeconds: ""  # an exchanged token with less left is replaced, default 30
+  # Accept an access token the identity provider issued (an RFC 9068 JWT, sent as
+  # `Authorization: Bearer`) as a credential for the API, beside the credentials it
+  # already accepts. Off by default; needs identity.enabled, which verifies the
+  # token. Rendered into the API Deployment only.
+  tokenAuth:
+    enabled: false
+    audience: ""    # the `aud` the token must name, default claw-api
+    scope: ""       # the scope the token must carry, default claw.api
+    introspect: false  # also ask the provider whether the token is still active, so a revoked grant stops at once
+    # In the SaFE deployment mode the API gets a signed-in person's keys from SaFE without showing SaFE the person's
+    # token: it exchanges the token at the provider (RFC 8693) for one for SaFE's audience that names the API as the
+    # party acting for the person. This is that token's audience and scope. The provider must have registered the
+    # API's own client (identity.clientId) for the exchange, and SaFE must be told to accept it as an actor.
+    delegationAudience: ""  # default primus-safe
+    delegationScope: ""     # default safe.api
+    # Platform roles a token may confer, from system-admin and system-admin-readonly. Empty (the default): every token's
+    # caller is a plain user, whatever the token's roles claim says. A named role is adopted only for a token that claims
+    # it AND whose provider answer (RFC 7662, asked per the identity cache rules) is active, names the same subject and
+    # lists it; when the provider cannot be asked the caller is a plain user for that request. Name a role only if the
+    # provider's role of that name means the same thing here.
+    trustedRoles: []
 
 sandboxTemplate:
   enabled: true

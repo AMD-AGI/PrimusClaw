@@ -18,6 +18,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,14 +32,18 @@ import (
 )
 
 type fakeRunner struct {
-	fail     error
-	created  []CreateRequest
-	deleted  []string
-	started  chan struct{}
-	hold     chan struct{}
-	observed string
-	node     string
-	adopted  []time.Duration
+	fail    error
+	created []CreateRequest
+	deleted []string
+	// started is closed the first time Create is entered. The tests set it
+	// before they start the create and only read it afterwards; the fake never
+	// writes it again, so a late reader still sees the closed channel.
+	started   chan struct{}
+	startOnce sync.Once
+	hold      chan struct{}
+	observed  string
+	node      string
+	adopted   []time.Duration
 }
 
 func (f *fakeRunner) Adopt(_ context.Context, _ string, _ CreateResult, timeout time.Duration) error {
@@ -49,8 +54,7 @@ func (f *fakeRunner) Adopt(_ context.Context, _ string, _ CreateResult, timeout 
 func (f *fakeRunner) Create(ctx context.Context, req CreateRequest) (CreateResult, error) {
 	f.created = append(f.created, req)
 	if f.started != nil {
-		close(f.started)
-		f.started = nil
+		f.startOnce.Do(func() { close(f.started) })
 	}
 	if f.hold != nil {
 		select {
@@ -79,6 +83,21 @@ func (f *fakeRunner) Observe(_ context.Context, sandboxID string) (CreateResult,
 func (f *fakeRunner) Delete(_ context.Context, sandboxID string) error {
 	f.deleted = append(f.deleted, sandboxID)
 	return nil
+}
+
+// awaitStarted blocks until the fake runner has been entered. It waits on the
+// runner's signal and not on the clock: how long the create takes to reach the
+// runner depends on how busy the machine is, and a fixed budget fails on a slow
+// one. The wait still ends early with the real cause if the create returns
+// before it reaches the runner, and a create that never starts is stopped by
+// the test binary's own timeout, which dumps where it is stuck.
+func awaitStarted(t *testing.T, started <-chan struct{}, done <-chan error) {
+	t.Helper()
+	select {
+	case <-started:
+	case err := <-done:
+		t.Fatalf("create returned before the runner started: %v", err)
+	}
 }
 
 type grantClaims struct {
@@ -279,11 +298,7 @@ func TestReplayWaitsWhilePending(t *testing.T) {
 		_, _, err := svc.Create(context.Background(), keys["measurement"], body)
 		done <- err
 	}()
-	select {
-	case <-runner.started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("create did not start")
-	}
+	awaitStarted(t, runner.started, done)
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	_, _, err := svc.Create(ctx, keys["measurement"], body)
@@ -307,11 +322,7 @@ func TestCallerCancelKeepsThePendingSandbox(t *testing.T) {
 		_, _, err := svc.Create(ctx, keys["measurement"], body)
 		done <- err
 	}()
-	select {
-	case <-runner.started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("create did not start")
-	}
+	awaitStarted(t, runner.started, done)
 	cancel()
 	select {
 	case err := <-done:
@@ -351,11 +362,7 @@ func TestReplayAdoptsARunningWorkload(t *testing.T) {
 		_, _, err := svc.Create(context.Background(), keys["measurement"], body)
 		done <- err
 	}()
-	select {
-	case <-runner.started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("create did not start")
-	}
+	awaitStarted(t, runner.started, done)
 	runner.observed = WorkloadRunning
 	runner.node = "node-a"
 	got, status, err := svc.Create(context.Background(), keys["measurement"], body)
@@ -385,11 +392,7 @@ func TestPromotePendingAppliesTheTimeout(t *testing.T) {
 		_, _, err := svc.Create(context.Background(), keys["measurement"], CreateBody{TemplateID: "runner", Timeout: 300})
 		done <- err
 	}()
-	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("create did not start")
-	}
+	awaitStarted(t, started, done)
 	refs, err := svc.grants.ListRoleSandboxes(context.Background(), "gr-01jb7m9k2x", "measurement")
 	if err != nil || len(refs) != 1 || refs[0].State != runtimev1alpha1.SandboxPending {
 		t.Fatalf("refs=%+v err=%v", refs, err)

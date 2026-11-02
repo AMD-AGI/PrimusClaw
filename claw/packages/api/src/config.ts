@@ -228,6 +228,32 @@ export const SESSION_SANDBOX_HOLD_MS = Math.min(
   BRAIN_REGISTRY_TTL_MS,
 );
 
+// --- The browser terminal ---
+// `GET /v1/sessions/:id/terminal/ws` is a WebSocket proxy to the sandbox's shell,
+// so every open terminal holds two sockets and a pod's pty for as long as it
+// lives. These bound that per replica. A limit that is slightly loose across
+// replicas still bounds the cost, which is all they are for.
+//
+// Connections: at most this many terminals open on one replica, in total and
+// for one user. Past either, the upgrade is refused with 429.
+export const TERMINAL_MAX_CONNECTIONS = envInt("TERMINAL_MAX_CONNECTIONS", 200, { min: 1, max: 100_000 });
+export const TERMINAL_MAX_CONNECTIONS_PER_USER = envInt("TERMINAL_MAX_CONNECTIONS_PER_USER", 5, { min: 1, max: 1000 });
+// A terminal with no input and no output in either direction for this long is
+// closed. Pings do not count: they only prove the sockets are alive. Output does,
+// so someone watching `top` is not cut off; a forgotten tab on `tail -f` is the
+// lifetime's to end, below.
+export const TERMINAL_IDLE_TIMEOUT_SECONDS = envInt("TERMINAL_IDLE_TIMEOUT_SECONDS", 900, { min: 10, max: 86_400 });
+// No terminal stays open longer than this, whatever is going on in it: traffic
+// does not extend it, which is what makes it a bound where the idle timeout
+// above is not (output that never stops keeps a terminal from ever being idle).
+// The shell holds the user's SaFE key, and nothing tells it that the key was
+// revoked or the session deleted; the browser reconnects with a new ticket.
+// There is no way to turn this off: 0, or anything outside 60 seconds to 7 days
+// (604800), is refused -- the default applies, and start-up reports the setting
+// as refused like any other -- because a switch that makes the shell open for as
+// long as the browser likes is the thing this exists to prevent.
+export const TERMINAL_MAX_LIFETIME_SECONDS = envInt("TERMINAL_MAX_LIFETIME_SECONDS", 28_800, { min: 60, max: 604_800 });
+
 // --- How long an idle sandbox stays reusable ---
 // Brain's setting, read here under the same name and default because the orphan
 // sweep has to agree with Brain about when an idle sandbox stops being worth
@@ -418,6 +444,32 @@ export const NOTIFY_WEBHOOK_ALLOWED_HOSTS = env("NOTIFY_WEBHOOK_ALLOWED_HOSTS");
 export const NOTIFY_MIN_RUN_SECONDS = envInt("NOTIFY_MIN_RUN_SECONDS", 60);
 // Prefix of the `link` field in a notification, relative to the web UI origin.
 export const NOTIFY_LINK_BASE = env("NOTIFY_LINK_BASE", "/primus-claw");
+
+// --- Remote agents (default OFF) ---
+// When false: no remote-agent tables, no routes, and nothing polls. A connector
+// on a user's machine dials out to these routes; see docs/remote-agents.md.
+export const CLAW_REMOTE_AGENTS_ENABLED = envBool("CLAW_REMOTE_AGENTS_ENABLED", false);
+// Days a closed remote-agent session, with its stored events, is kept. Zero or
+// less keeps them for ever. The audit trail is not touched by this.
+export const CLAW_REMOTE_AGENTS_RETENTION_DAYS = envInt("CLAW_REMOTE_AGENTS_RETENTION_DAYS", 30);
+
+/**
+ * How a connector's access token is checked (see auth/connector-token.ts). Read
+ * on each use rather than once, so what a request is judged by is what the
+ * environment says now; both only matter while remote agents and the identity
+ * client are on.
+ *
+ *   CLAW_CONNECTOR_TOKEN_AUDIENCE    the `aud` the token must name, default claw-api
+ *   CLAW_CONNECTOR_TOKEN_INTROSPECT  also ask the identity provider whether the
+ *                                    token is still active, so a revoked grant
+ *                                    stops at once instead of when the token expires
+ */
+export function connectorTokenSettings(): { audience: string; introspect: boolean } {
+  return {
+    audience: env("CLAW_CONNECTOR_TOKEN_AUDIENCE", "claw-api"),
+    introspect: envBool("CLAW_CONNECTOR_TOKEN_INTROSPECT", false),
+  };
+}
 
 /**
  * Scheduled triggers: a cron schedule that starts a run as the user who created

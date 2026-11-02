@@ -4,9 +4,18 @@
 export interface UserInfo {
   userId: string;
   userName: string;
+  /** As SaFE verification reports it; absent when the account has none (and always in BYOK / dev modes). */
+  email?: string;
   roles: string[];
   platformKey: string;
   virtualKey: string;
+  /**
+   * Who acted for this user, when an upstream service presented the user's
+   * identity-provider access token (RFC 8693 `act` and `client_id` claims).
+   * Recorded, never an authority: the user is `userId`, whatever this says.
+   * `clientId` is the whole claim (an allowlist compares it); `actorSub` is clipped.
+   */
+  delegation?: { actorSub?: string; clientId?: string };
 }
 
 export function getUserRole(user: UserInfo): string {

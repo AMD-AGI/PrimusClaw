@@ -3,7 +3,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { RULES_DIR, SAFETY_PREAMBLE_ENABLED } from "../config.js";
+import { A2A_CLIENT_ENABLED, RULES_DIR, SAFETY_PREAMBLE_ENABLED } from "../config.js";
 
 const SAFETY_PREAMBLE_FILE = path.join(RULES_DIR, "safety-preamble.txt");
 const EXECUTION_POLICY_FILE = path.join(RULES_DIR, "execution-policy.txt");
@@ -96,6 +96,8 @@ export function buildPrompt(
   pluginRulesFromMessage = "",
   sessionContext?: { sessionId: string; userId: string; parentSessionId?: string; teamRole?: string },
   progressiveSkills: ProgressiveSkill[] = [],
+  /** The bound repository's block (see workspace/repo-binding.ts); "" for a session with none. */
+  repoBlock = "",
 ): string {
   let skillHint = "";
   const skillNames = Object.keys(skillContents);
@@ -130,7 +132,10 @@ export function buildPrompt(
   // entire skill system whenever the user pasted a long log/diff/code block.
   if (userPrompt.length > 20000) {
     const hints = [skillHint, mcpHint].filter(Boolean).join("\n");
-    return hints ? `${userPrompt}\n${hints}` : userPrompt;
+    // The repository is not a hint to drop with the policy: without it the agent
+    // would not know it is standing in one.
+    const long = hints ? `${userPrompt}\n${hints}` : userPrompt;
+    return repoBlock ? `${long}\n\n${repoBlock}` : long;
   }
 
   const rulesFromPlugin = (pluginRulesFromMessage || "").trim();
@@ -151,9 +156,11 @@ export function buildPrompt(
     if (sessionContext.userId) parts.push(`- User ID: ${sessionContext.userId}`);
     if (sessionContext.parentSessionId) parts.push(`- Parent Session ID: ${sessionContext.parentSessionId} (you are a worker in an agent team)`);
     if (sessionContext.teamRole) parts.push(`- Team Role: ${sessionContext.teamRole}`);
-    parts.push(`- A2A Auth: the a2a_call tool handles authentication automatically. Do NOT use bash/curl for A2A calls — always use the a2a_call tool.`);
+    if (A2A_CLIENT_ENABLED) {
+      parts.push(`- A2A Auth: the a2a_call tool handles authentication automatically. Do NOT use bash/curl for A2A calls — always use the a2a_call tool.`);
+    }
     sessionCtx = `\n[Session Context]\n${parts.join("\n")}`;
   }
 
-  return [preamble, userBlock, policy, extraHints, sessionCtx].filter(Boolean).join("\n\n");
+  return [preamble, userBlock, policy, extraHints, repoBlock, sessionCtx].filter(Boolean).join("\n\n");
 }

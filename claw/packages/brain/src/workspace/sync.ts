@@ -28,6 +28,18 @@ import {
   rsyncExcludeArgs,
   tarExcludeArgs,
 } from "./excludes.js";
+import {
+  KEEP_ALL_GIT,
+  SIGTERM_PROBE_TIMEOUT_SEC,
+  configuredGitLimits,
+  gitCarryCommand,
+  gitReport,
+  gitRsyncArgs,
+  gitTarArgs,
+  planGit,
+  type GitDecision,
+  type GitReport,
+} from "./git-dirs.js";
 import pino from "pino";
 
 // Map a thrown error to the workspace_sync_failures_total{reason} enum
@@ -127,6 +139,8 @@ export interface SyncResult {
   size: number;       // bytes in BASE/current/ after the swap
   inodes: number;     // file count under BASE/current/
   durationMs: number; // brain-side wall clock for the whole RPC
+  /** What the sync did about the workspace's repositories, when it left any out or could not measure them. */
+  git?: GitReport;
 }
 
 // ── Sandbox-side bash script ────────────────────────────────────────────
@@ -203,6 +217,7 @@ function buildSyncCommand(
   turn: number,
   workspace = SANDBOX_WORKSPACE,
   persistRoot = WORKSPACE_PERSIST_BASE,
+  git: GitDecision = KEEP_ALL_GIT,
 ): string {
   if (!PERSIST_ROOT_RE.test(persistRoot)) throw unsafePersistRoot(persistRoot);
   return wrapWithBash(`set -euo pipefail
@@ -286,12 +301,13 @@ if command -v rsync >/dev/null 2>&1; then
   fi
   rsync -a --delete $PRECISE_MTIME $LINK_DEST \\
     ${RSYNC_EXCLUDES} \\
+    ${gitRsyncArgs(git, workspace)} \\
     ${workspace}/ "$BASE/pending/"
 else
   # rsync unavailable (offline / non-root sandbox). Repopulate the same empty
   # pending/ via tar, so no stale file survives here either. tar/cp are in every
   # base image; this path is the safety net for ENSURE_RSYNC failing silently.
-  tar -C ${workspace} ${TAR_EXCLUDES} -cf - . | tar -C "$BASE/pending" -xf -
+  tar -C ${workspace} ${TAR_EXCLUDES} ${gitTarArgs(git, workspace)} -cf - . | tar -C "$BASE/pending" -xf -
 fi
 
 # Nothing copied, over a snapshot that has something in it, is a sandbox coming
@@ -311,6 +327,8 @@ if [ -d "$BASE/current" ] \\
   echo "workspace_sync_empty: ${workspace} produced no files; keeping the previous snapshot" >&2
   exit 1
 fi
+
+${gitCarryCommand(git, workspace)}
 
 # Two-step atomic swap. See workspace/sync.ts header for the T0..T3
 # timeline that makes this safe under SIGKILL.
@@ -378,10 +396,24 @@ export async function syncWorkspace(
   const base = sessionBase(userIdHex, sessionId);
   const t0 = Date.now();
   try {
+    // Which repositories are small enough to carry. When that cannot be told the
+    // sync still goes on, without the measurement: stopping would leave the
+    // snapshot where it is for as long as the workspace is slow to walk, and a
+    // snapshot that never advances loses everything since it when the sandbox is
+    // reclaimed. What the script does instead is keep the previous snapshot's copy
+    // of every repository (gitCarryCommand), so the snapshot written without a
+    // measurement is not one written without the `.git` the sandbox still has.
+    // The next sync measures again. A SIGTERM sync gets a shorter measurement
+    // because its budget has no room for a long one.
+    const limits = configuredGitLimits();
+    const git = await planGit(
+      hands, SANDBOX_WORKSPACE, sharedDiskExcludes(), limits, opts.signal,
+      kind === "sigterm" ? SIGTERM_PROBE_TIMEOUT_SEC : undefined,
+    );
     const out = await withHandsTimeout<string>(
       hands,
       "bash",
-      { command: buildSyncCommand(base, turn) },
+      { command: buildSyncCommand(base, turn, SANDBOX_WORKSPACE, WORKSPACE_PERSIST_BASE, git) },
       HANDS_CALL_RSYNC_TIMEOUT_MS,
       opts.signal,
     );
@@ -411,12 +443,17 @@ export async function syncWorkspace(
     const size = Number(meta.size_bytes ?? 0);
     const inodes = Number(meta.inode_count ?? 0);
     const durationMs = Date.now() - t0;
+    const report = gitReport(git, limits, SANDBOX_WORKSPACE);
     metrics.onWorkspaceSync(kind, size, durationMs / 1000);
     logger.info(
-      { sessionId, turn, kind, size, inodes, durationMs },
+      {
+        sessionId, turn, kind, size, inodes, durationMs,
+        gitSkipped: (report?.skipped ?? []).map((s) => `${s.path}:${s.reason}`),
+        gitUnmeasured: report?.unmeasured ?? false,
+      },
       "workspace_sync.done",
     );
-    return { size, inodes, durationMs };
+    return { size, inodes, durationMs, ...(report ? { git: report } : {}) };
   } catch (err) {
     const reason = classifySyncFailure(err);
     const durationMs = Date.now() - t0;

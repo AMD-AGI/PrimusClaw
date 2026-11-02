@@ -12,6 +12,7 @@ import { agentLoop } from "./agent-loop.js";
 import { resolveToolIds } from "../tools/resolve.js";
 import { marketplaceToolIds, pluginToolsHaveHooks, resolvePluginToolsFromMessage } from "../tasks/plugin-from-message.js";
 import { loadRules } from "./rules.js";
+import { bindRepo, renderRepoBlock } from "../workspace/repo-binding.js";
 import { normalizeMcpConfigs } from "../clients/mcp-config.js";
 import { approvalPolicyFromMcp } from "./approval-policy.js";
 import { HitlController } from "./hitl.js";
@@ -32,9 +33,10 @@ import {
   ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY, OPENAI_BASE_URL, OPENAI_API_KEY, LLM_API_STYLE,
   DEFAULT_MODEL, MAX_TURNS,
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED,
-  BASH_APPROVAL_RULES,
+  BASH_APPROVAL_RULES, ASK_USER_QUESTION_ENABLED, A2A_CLIENT_ENABLED,
   PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED,
 } from "../config.js";
+import { a2aApprovalHold } from "../clients/a2a.js";
 import { WebSearchService, WebFetchService, SimpleSessionCostTracker } from "../tools/web/index.js";
 import type { ExecuteRequest, ExecuteResult, EventCallback } from "@claw/protocol";
 import type { ExecuteExtras } from "./index.js";
@@ -222,6 +224,17 @@ export class AgentEngine {
       metrics.onPlatformDefaultChat(buildProgressiveSkillHint(defaultProgressive, sessionDir).length);
     }
 
+    // A session bound to a repository has it set up now: the sandbox is opened
+    // here, not left to the first tool call, because the working tree has to be
+    // there before the conversation starts and the model has to be told what it
+    // is standing in. A failure of the setup itself is not this run's failure; it
+    // comes back as a reason and goes into the prompt. A sandbox that cannot be
+    // opened at all fails the run, as it does for any other turn that needs one.
+    // No `repo` on the request, no sandbox here and no block: the turn is what it was.
+    const repoBlock = request.repo
+      ? renderRepoBlock(await bindRepo(await sandbox(), request.repo, { signal }))
+      : "";
+
     const rules = loadRules();
     const fullPrompt = buildPrompt(
       request.prompt ?? "",
@@ -237,6 +250,7 @@ export class AgentEngine {
         teamRole: request.team_role,
       },
       progressiveSkills,
+      repoBlock,
     );
 
     logger.info({
@@ -262,14 +276,26 @@ export class AgentEngine {
       ...[...pluginLayer.bashApproval, ...resolved.bashApproval].map((value) => ({ source: "tool_config", value })),
       { source: "BASH_APPROVAL_RULES", value: bashApprovalFromEnvValue(BASH_APPROVAL_RULES) },
     ]);
-    const anyApproval = approval.active || bashPolicy.active;
-    const decisions = anyApproval && extras?.natsConnection
+    // With a2a_call on, an allow that answers a peer's approval request is held for the user
+    // (a2aApprovalHold). Nothing else changes: calls the policies do not name stay as they were.
+    const policyActive = approval.active || bashPolicy.active;
+    const anyApproval = policyActive || A2A_CLIENT_ENABLED;
+    // The channel decisions arrive on. Approvals need it, and so does the
+    // question tool, which waits for its answer on the same subject: a
+    // deployment that turns questions on without any approval policy gets the
+    // channel for the question alone (`hitl` below is still built only for an
+    // approval policy).
+    const decisions = (anyApproval || ASK_USER_QUESTION_ENABLED) && extras?.natsConnection
       ? new DecisionDispatcher(extras.natsConnection, sessionId)
       : null;
     const hitl = anyApproval
       ? new HitlController(decisions, onEvent, {
           requireApproval: (t) => approval.requiresApproval(t),
-          requireApprovalFor: (t, input) => (t.toLowerCase() === "bash" ? bashPolicy.check(input.command) : null),
+          autoApprovalRule: (t, input) => approval.autoApprovalRule(t, input),
+          requireApprovalFor: (t, input) =>
+            t.toLowerCase() === "bash" ? bashPolicy.check(input.command) : a2aApprovalHold(t, input),
+          // Without a policy of the operator's the controller exists only for that hold.
+          onlyHeld: !policyActive,
         })
       : undefined;
 
@@ -310,11 +336,16 @@ export class AgentEngine {
           ? new WebSearchService(webToolCtx) : undefined,
         webFetch: webToolCtx && WEB_FETCH_ENABLED
           ? new WebFetchService(webToolCtx) : undefined,
-        // a2a bearer: keep the platform_key fallback so safe-mode dispatch
-        // (empty llm_api_key) still authenticates sub-agent calls.
-      }, resolveRequestLlmKey(request) || request.platform_key || "", sandbox);
+      }, sandbox);
       router.lazySkillWriter = lazySkills;
       router.memoryEnabled = request.memory_enabled !== false;
+      // Whom an identity-authenticated a2a_call peer is called as, and when the run's budget ends.
+      const deadlineMs = request.deadline_at ? Date.parse(request.deadline_at) : NaN;
+      router.a2aContext = {
+        userId: request.user_id || undefined,
+        sessionId: request.session_id,
+        ...(Number.isFinite(deadlineMs) ? { deadlineAtMs: deadlineMs } : {}),
+      };
       const allToolSchemas = [...router.getToolSchemas(), ...mcpResult.schemas];
 
       const messages = [...(request.history || [])];
@@ -467,6 +498,11 @@ export class AgentEngine {
           recreateHands: extras?.recreateHands,
           hooks: hookRunner,
           hitl,
+          // The question tool waits for its answer on the same channel as an
+          // approval. It was never handed over, so the tool answered "not
+          // available" whenever it was called and a question could not be asked
+          // of anyone, a web client or an A2A caller.
+          questionDispatcher: decisions ?? undefined,
           onCheckpoint: extras?.onCheckpoint,
           onCacheUse: extras?.onCacheUse,
           resumeFrom: extras?.resumeCheckpoint,

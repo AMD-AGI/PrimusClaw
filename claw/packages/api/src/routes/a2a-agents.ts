@@ -9,6 +9,7 @@
 // can be driven directly by table tests.
 // ---------------------------------------------------------------------------
 
+import { createHash } from "node:crypto";
 import type { AgentCard, AgentSkill } from "./a2a-types.js";
 
 /** The generic agent's JSON-RPC endpoint, relative to the API's own root. */
@@ -110,41 +111,115 @@ export function publicBaseUrl(
 // Agent cards
 // ---------------------------------------------------------------------------
 
-function cardEnvelope(url: string): Pick<
+/**
+ * What a card says depends on how this deployment is configured, so it is
+ * asked for rather than assumed. With nothing set the card is the one it
+ * always was.
+ */
+export interface CardOptions {
+  /** The context/task model is on: the card describes it truthfully. */
+  contextTasks?: boolean;
+  /** Push notifications are on. */
+  push?: boolean;
+  /** The identity provider's discovery document, when its tokens are accepted. */
+  oidcUrl?: string;
+  /** The scope those tokens must carry (CLAW_IDENTITY_TOKEN_SCOPE); `claw.api` when unset. */
+  oidcScope?: string;
+}
+
+/** The card options this process's environment implies. */
+export function cardOptionsFromEnv(env: Record<string, string | undefined> = process.env): CardOptions {
+  const on = (key: string) => ["true", "1", "yes"].includes((env[key] ?? "").trim().toLowerCase());
+  const contextTasks = on("CLAW_A2A_CONTEXT_TASKS");
+  const issuer = (env.IDENTITY_ISSUER_URL ?? "").trim().replace(/\/+$/, "");
+  const tokens = on("IDENTITY_CLIENT_ENABLED") && on("CLAW_IDENTITY_TOKEN_AUTH_ENABLED") && issuer !== "";
+  return {
+    contextTasks,
+    push: contextTasks && on("CLAW_A2A_PUSH_ENABLED"),
+    ...(contextTasks && tokens
+      ? {
+        oidcUrl: `${issuer}/.well-known/openid-configuration`,
+        oidcScope: (env.CLAW_IDENTITY_TOKEN_SCOPE ?? "").trim() || "claw.api",
+      }
+      : {}),
+  };
+}
+
+function cardEnvelope(url: string, opts: CardOptions): Pick<
   AgentCard,
   | "supportedInterfaces" | "provider" | "capabilities" | "securitySchemes"
   | "securityRequirements" | "defaultInputModes" | "defaultOutputModes"
 > {
+  const securitySchemes: AgentCard["securitySchemes"] = {
+    bearer: { httpAuthSecurityScheme: { scheme: "bearer", description: "Bearer token authentication" } },
+  };
+  // v1.0 spells a requirement `{ schemes: { <name>: { list: [scopes] } } }`.
+  let securityRequirements: AgentCard["securityRequirements"] = [{ bearer: [] }];
+  if (opts.contextTasks) {
+    securityRequirements = [{ schemes: { bearer: { list: [] } } } as unknown as Record<string, string[]>];
+    if (opts.oidcUrl) {
+      const scope = opts.oidcScope || "claw.api";
+      securitySchemes.identity = {
+        openIdConnectSecurityScheme: {
+          openIdConnectUrl: opts.oidcUrl,
+          description: `Access token from the deployment's identity provider (scope ${scope})`,
+        },
+      };
+      securityRequirements = [
+        { schemes: { identity: { list: [scope] } } },
+        { schemes: { bearer: { list: [] } } },
+      ] as unknown as Record<string, string[]>[];
+    }
+  }
   return {
     supportedInterfaces: [{ url, protocolBinding: "JSONRPC", protocolVersion: "1.0" }],
     provider: { url: "https://www.amd.com", organization: "AMD" },
     capabilities: {
       streaming: true,
-      pushNotifications: false,
+      pushNotifications: opts.push === true,
       extendedAgentCard: false,
     },
-    securitySchemes: {
-      bearer: { httpAuthSecurityScheme: { scheme: "bearer", description: "Bearer token authentication" } },
-    },
-    securityRequirements: [{ bearer: [] }],
+    securitySchemes,
+    securityRequirements,
     defaultInputModes: ["text/plain", "application/json"],
     defaultOutputModes: ["text/plain", "application/json"],
   };
 }
 
+/** A validator for `If-None-Match`: the same card gives the same tag. */
+export function cardEtag(card: AgentCard): string {
+  return `"${createHash("sha256").update(JSON.stringify(card)).digest("hex").slice(0, 32)}"`;
+}
+
+/** Whether `If-None-Match` names `etag` (`*` and weak forms included). */
+export function etagMatches(header: string | string[] | undefined, etag: string): boolean {
+  const raw = Array.isArray(header) ? header.join(",") : (header ?? "");
+  return raw.split(",").map((t) => t.trim().replace(/^W\//, "")).some((t) => t === "*" || t === etag);
+}
+
 /** The generic agent: no plugin, whatever the caller's metadata names. */
-export function genericAgentCard(baseUrl: string): AgentCard {
-  return {
-    name: "PrimusClaw",
-    description: "AI Agent operating system for code generation, debugging, and deployment on AMD infrastructure",
-    version: "2.0.0",
-    ...cardEnvelope(`${baseUrl}${A2A_ENDPOINT_PATH}`),
-    skills: [
+export function genericAgentCard(baseUrl: string, opts: CardOptions = {}): AgentCard {
+  const skills: AgentSkill[] = opts.contextTasks
+    // One entry, because the agent has one way in: a conversation. The four
+    // this used to list described nothing the server routes on.
+    ? [{
+      id: "chat",
+      name: "Claw agent",
+      description: "General-purpose agent with a sandboxed workspace: reads and edits code, runs commands, answers questions. Send a message; reuse the contextId to continue the conversation.",
+      tags: ["agent", "code"],
+    }]
+    : [
       { id: "code-generation", name: "Code Generation", description: "Generate, edit, and refactor code in any language", tags: ["code", "generation", "refactor"] },
       { id: "debugging", name: "Debugging", description: "Debug code issues with automated root cause analysis", tags: ["debug", "error", "fix"] },
       { id: "code-review", name: "Code Review", description: "Review code for quality, security, and best practices", tags: ["review", "security", "quality"] },
       { id: "optimization", name: "Performance Optimization", description: "Optimize code and model inference performance on AMD GPUs", tags: ["performance", "gpu", "amd"] },
-    ] satisfies AgentSkill[],
+    ];
+  return {
+    name: "PrimusClaw",
+    description: "AI Agent operating system for code generation, debugging, and deployment on AMD infrastructure",
+    version: "2.0.0",
+    ...cardEnvelope(`${baseUrl}${A2A_ENDPOINT_PATH}`, opts),
+    skills,
   };
 }
 
@@ -190,14 +265,14 @@ function pluginSkills(plugin: PluginCardSource, name: string, description: strin
 }
 
 /** The agent that runs `plugin`: its name, description and skills are the plugin's. */
-export function pluginAgentCard(baseUrl: string, plugin: PluginCardSource): AgentCard {
+export function pluginAgentCard(baseUrl: string, plugin: PluginCardSource, opts: CardOptions = {}): AgentCard {
   const name = text(plugin.name) || `plugin-${plugin.id}`;
   const description = text(plugin.description) || `PrimusClaw agent running the "${name}" plugin`;
   return {
     name,
     description,
     version: text(plugin.version) || "1",
-    ...cardEnvelope(`${baseUrl}${pluginAgentPath(plugin.id)}`),
+    ...cardEnvelope(`${baseUrl}${pluginAgentPath(plugin.id)}`, opts),
     skills: pluginSkills(plugin, name, description),
   };
 }

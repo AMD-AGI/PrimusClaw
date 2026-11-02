@@ -233,6 +233,90 @@ describe("app run finishing is re-claimed", { skip }, () => {
     assert.equal(await sweeper.requeueUnfinishedAppRuns(), 0);
   });
 
+  // The shape the live row had: the sweeper reopened it and the scheduler published it (`preparing`, a
+  // fresh `started_at`, a token hash), and no Brain ever wrote a lease on it.
+  async function seedUnacceptedDispatch(opts: { requeues?: number; startedAgoSec: number; runState?: string }) {
+    await seedFinishOnly({ status: "preparing", prior: "cancelled", runState: opts.runState ?? "finishing", requeues: opts.requeues ?? 4 });
+    await sql(
+      `UPDATE claw_tasks SET lease_owner = NULL, lease_expires_at = NULL, completed_at = NULL,
+              internal_token_hash = 'hash-1', started_at = NOW() - ($1::int * INTERVAL '1 second'),
+              deadline_at = NOW() + interval '10 minutes'
+        WHERE task_id='app-1'`,
+      [opts.startedAgoSec],
+    );
+  }
+
+  const unacceptedCases: Array<{
+    name: string; startedAgoSec: number; mutate?: string; runState?: string; requeued: number; why: string;
+  }> = [
+    { name: "dispatched 50 minutes ago and never accepted (the stuck row)", startedAgoSec: 50 * 60, requeued: 1,
+      why: "the dispatch is lost; nothing else would look at it for another ten minutes" },
+    { name: "dispatched a minute ago", startedAgoSec: 60, requeued: 0,
+      why: "a Brain has not had the time to accept it" },
+    { name: "dispatched long ago but a Brain holds the lease", startedAgoSec: 50 * 60, requeued: 0,
+      mutate: "UPDATE claw_tasks SET lease_owner = 'brain-B', lease_expires_at = NOW() + interval '1 minute'",
+      why: "an accepted dispatch is the lease reaper's, not this pass's" },
+    { name: "dispatched long ago, no app_finish_prior: an ordinary run, not a finish", startedAgoSec: 50 * 60, requeued: 0,
+      mutate: "UPDATE claw_tasks SET metadata = metadata - 'app_finish_prior'",
+      why: "an app run's first dispatch is left to the generic backstop" },
+    { name: "dispatched long ago and the run already ended", startedAgoSec: 50 * 60, runState: "ended", requeued: 0,
+      why: "nothing left to finish: the settle pass restores the task instead" },
+  ];
+  for (const c of unacceptedCases) {
+    test(`an unaccepted finish-only dispatch: ${c.name} -> ${c.requeued ? "reopened and re-sent" : "left alone"}`, async () => {
+      await seedUnacceptedDispatch({ startedAgoSec: c.startedAgoSec, runState: c.runState });
+      if (c.mutate) await sql(c.mutate);
+      // Within the backstop's hour either way: the generic reaper has not reached this row.
+      assert.equal(await sweeper.reapStaleTasks(), 0, "the generic backstop does not own it yet");
+      assert.equal(await sweeper.requeueUnfinishedAppRuns(), c.requeued, c.why);
+      const row = (await sql("SELECT status, lease_owner, internal_token_hash, metadata FROM claw_tasks"))[0];
+      if (!c.requeued) {
+        assert.equal(row.status, "preparing");
+        return;
+      }
+      assert.equal(row.status, "queued", "reopened to be dispatched again");
+      assert.equal(row.internal_token_hash, null, "the lost dispatch's token no longer opens the row");
+      assert.equal(row.metadata.app_finish_requeues, 5, "counted against the cap");
+      assert.equal(row.metadata.app_finish_prior.status, "cancelled", "the user's cancel is still what the task goes back to");
+    });
+  }
+
+  test("an unaccepted dispatch is re-sent, and a message from the earlier dispatch cannot take the row", async () => {
+    // Two requeues in hand, so the second loss below is still inside the cap.
+    await seedUnacceptedDispatch({ requeues: 2, startedAgoSec: 50 * 60 });
+    assert.equal(await sweeper.requeueUnfinishedAppRuns(), 1);
+    assert.deepEqual(await dispatcher.dispatchTask("app-1"), { ok: true });
+    const first = published.at(-1)!.backend_internal_token as string;
+    // Lost again: the same pass takes it once the grace has passed on the new dispatch.
+    await sql("UPDATE claw_tasks SET started_at = NOW() - interval '50 minutes'");
+    assert.equal(await sweeper.requeueUnfinishedAppRuns(), 1);
+    assert.deepEqual(await dispatcher.dispatchTask("app-1"), { ok: true });
+    const second = published.at(-1)!.backend_internal_token as string;
+    assert.notEqual(first, second);
+    assert.equal(published.at(-1)!.app_finish_only, true);
+    const lease = async (token: string) => (await routes.inject({
+      method: "POST", url: "/v1/internal/tasks/app-1/lease",
+      headers: { authorization: `Bearer ${token}` }, payload: { brain_id: "brain-B", lease_seconds: 45 },
+    })).statusCode;
+    assert.notEqual(await lease(first), 200, "a late delivery of the first message is refused");
+    assert.equal(await lease(second), 200, "the re-sent dispatch is accepted");
+    assert.equal((await task()).lease_owner, "brain-B");
+  });
+
+  test("at the cap an unaccepted dispatch is given up on, not left for the hour backstop", async () => {
+    await seedUnacceptedDispatch({ requeues: 5, startedAgoSec: 60 });
+    assert.equal(await sweeper.giveUpExhaustedAppFinishes(), 0, "still inside the grace");
+    await sql("UPDATE claw_tasks SET started_at = NOW() - interval '50 minutes'");
+    assert.equal(await sweeper.requeueUnfinishedAppRuns(), 0, "not handed round again");
+    assert.equal(await sweeper.giveUpExhaustedAppFinishes(), 1);
+    const row = (await sql("SELECT status, failure_reason, lease_owner, internal_token_hash, metadata FROM claw_tasks"))[0];
+    assert.equal(row.status, "cancelled", "the user's cancel, not a brain_timeout");
+    assert.equal(row.failure_reason, "cancelled");
+    assert.equal(row.internal_token_hash, null);
+    assert.equal(row.metadata.app_finish_prior, undefined);
+    assert.equal(await sweeper.giveUpExhaustedAppFinishes(), 0, "said once");
+  });
+
   test("giving up at the cap reaches the same verdict as the other restore: a successful final is completed", async () => {
     await seedFinishOnly({ status: "failed", prior: "failed", runState: "finishing", requeues: 5,
       lastExit: { cause: "exit", final: true, returncode: 0 } });

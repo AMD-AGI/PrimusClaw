@@ -977,10 +977,33 @@ export const WORKSPACE_SYNC_NORMAL_SLOTS = envInt("WORKSPACE_SYNC_NORMAL_SLOTS",
 export const WORKSPACE_SIGTERM_PRIORITY_SLOTS = envInt("WORKSPACE_SIGTERM_PRIORITY_SLOTS", 4);
 export const WORKSPACE_RESTORE_TIMEOUT_MS = envInt("WORKSPACE_RESTORE_TIMEOUT_MS", 120_000);
 
+// A workspace snapshot carries each repository's `.git` (so unpushed commits
+// survive a sandbox that is reclaimed and rebuilt from it), unless that one
+// directory is over either bound: then it is left out whole, the user is told, and
+// the copy saved of it before is kept (workspace/git-dirs.ts). Bytes bound what Hands has to hold in memory to upload
+// a pack; files bound what each sync pays, since the upload is one PUT per file.
+// WORKSPACE_GIT_MAX_BYTES=0 stops carrying `.git` at all, the old behaviour.
+//
+// The same two bounds again across all of a workspace's repositories together
+// (WORKSPACE_GIT_TOTAL_MAX_*): a tree of dozens of small clones is within the
+// per-repository bounds one by one and still adds tens of thousands of PUTs. When
+// the sum is over, whole repositories are dropped, largest first.
+export const WORKSPACE_GIT_MAX_BYTES = envInt("WORKSPACE_GIT_MAX_BYTES", 300 * 1024 * 1024, { min: 0 });
+export const WORKSPACE_GIT_MAX_FILES = envInt("WORKSPACE_GIT_MAX_FILES", 2000, { min: 1 });
+export const WORKSPACE_GIT_TOTAL_MAX_BYTES = envInt("WORKSPACE_GIT_TOTAL_MAX_BYTES", 1024 * 1024 * 1024, { min: 1 });
+export const WORKSPACE_GIT_TOTAL_MAX_FILES = envInt("WORKSPACE_GIT_TOTAL_MAX_FILES", 10_000, { min: 1 });
+// How long the sandbox gets to measure those repositories before the sync goes on
+// without a measurement (the previous copy of each repository is then kept, not
+// dropped). Sized like the listing it sits beside, not like a liveness probe: the
+// walk is over the whole workspace. A SIGTERM sync is capped lower in git-dirs.ts,
+// because its budget (below) has no room for it.
+export const WORKSPACE_GIT_PROBE_TIMEOUT_SEC = envInt("WORKSPACE_GIT_PROBE_TIMEOUT_SEC", 60, { min: 1 });
+
 // SIGTERM-time wait budget for an in-flight workspace_sync to drain
 // before the SIGTERM catch block issues its own final writeKvCheckpoint.
 // Sized so the full SIGTERM budget breakdown (15s pending-sync drain +
-// 60s priority workspace sync + 3s event + 15s transcript ≈ 93s) fits
+// 60s priority workspace sync (its git measurement is capped at 10s of that) +
+// 3s event + 15s transcript ≈ 93s) fits
 // inside the brain-deployment.yaml terminationGracePeriodSeconds (300s).
 // See checkpoint-architecture-redesign.md §5.3.
 export const SIGTERM_PENDING_SYNC_WAIT_MS = envInt(
@@ -1405,7 +1428,7 @@ export const LLM_CACHE_TTL: PromptCacheTtl = resolvePromptCacheTtl();
  *
  * An allowlist rather than a header name baked in, because the header that
  * identifies a backend is a property of the deployment, not of Claw: it is
- * `x-litellm-model-id` behind one proxy, an Azure APIM request id behind
+ * `x-litellm-model-id` behind one proxy, a gateway request id behind
  * another, a plain `request-id` when talking to the provider directly.
  *
  * An allowlist rather than capturing everything, because response headers carry
@@ -1625,6 +1648,16 @@ export const EXIT_PLAN_MODE_ENABLED = envBool("EXIT_PLAN_MODE_ENABLED", true);
 // --- Ask User Question ---
 export const ASK_USER_QUESTION_ENABLED = envBool("ASK_USER_QUESTION_ENABLED", false);
 export const ASK_USER_QUESTION_TIMEOUT_MS = envInt("ASK_USER_QUESTION_TIMEOUT_MS", 600_000);
+
+// --- A2A client (the a2a_call tool) ---
+// Off by default: the tool is not offered to the model and a call is refused. The peers it may
+// reach are the operator's A2A_AGENTS (clients/a2a.ts); this switch is the operator's decision that
+// this deployment calls other agents at all.
+export const A2A_CLIENT_ENABLED = envBool("A2A_CLIENT_ENABLED", false);
+// A streamed call gives up waiting (without failing the peer's task) after this long with no event,
+// and after A2A_STREAM_MAX_MS in all, or when the run's own budget is nearly spent, whichever is first.
+export const A2A_STREAM_IDLE_TIMEOUT_MS = envInt("A2A_STREAM_IDLE_TIMEOUT_MS", 120_000, { min: 1_000, max: 3_600_000 });
+export const A2A_STREAM_MAX_MS = envInt("A2A_STREAM_MAX_MS", 600_000, { min: 1_000, max: 7_200_000 });
 
 // --- Background Shell ---
 export const BG_SHELL_ENABLED = envBool("BG_SHELL_ENABLED", false);

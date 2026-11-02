@@ -19,6 +19,8 @@ import { initUserEnvCrypto } from "./crypto/user-env.js";
 import { authLogPath, authMiddleware } from "./auth/middleware.js";
 import { startIdentityClient } from "./auth/identity.js";
 import { registerSessionRoutes } from "./routes/sessions.js";
+import { registerAnswerFeedbackRoutes } from "./routes/answer-feedback.js";
+import { registerImageRoutes } from "./routes/images.js";
 import { registerEventRoutes } from "./routes/events.js";
 import { registerAnthropicManagedAgentsRoutes } from "./routes/anthropic-managed-agents.js";
 import { registerAdminRoutes } from "./routes/admin.js";
@@ -28,10 +30,16 @@ import { registerA2ARoutes } from "./routes/a2a.js";
 import { registerPluginRoutes } from "./routes/plugins.js";
 import { registerUserEnvVarRoutes } from "./routes/user-env-vars.js";
 import { registerNotificationSubscriptionRoutes } from "./routes/notification-subscriptions.js";
+import { registerRemoteAgentRoutes } from "./routes/remote-agents.js";
 import { startNotificationWorker } from "./notifications/outbox.js";
+import { a2aPushEnabled } from "./routes/a2a-flags.js";
+import { startA2aPushWorker } from "./routes/a2a-push.js";
 import { registerSystemEnvVarRoutes, publishSystemEnvToKv } from "./routes/system-env-vars.js";
 import { registerSandboxAdminRoutes } from "./routes/sandbox-admin.js";
+import { registerTerminalRoutes } from "./routes/terminal.js";
 import { registerMcpRoutes } from "./routes/mcp.js";
+import { registerMeRoutes } from "./routes/me.js";
+import { registerModelsRoutes } from "./routes/models.js";
 import { registerInternalTaskRoutes } from "./routes/internal-tasks.js";
 import { registerInternalRunRoutes } from "./routes/internal-runs.js";
 import { registerInternalAppRoutes } from "./routes/internal-apps.js";
@@ -152,7 +160,7 @@ async function main() {
   // otherwise start exporting neither.
   assertRolloutConfigAtStartup();
   assertAdmissionSettings(logger);
-  // Off unless IDENTITY_CLIENT_ENABLED is set; nothing authenticates through it yet.
+  // Off unless IDENTITY_CLIENT_ENABLED is set; it authenticates a connector's access token, and an identity provider's access token only with CLAW_IDENTITY_TOKEN_AUTH_ENABLED.
   startIdentityClient(logger);
   // Validate USER_ENV_ENCRYPTION_KEY before doing anything else; we want a
   // fast-fail if the K8s Secret is misconfigured (missing or wrong length),
@@ -263,6 +271,8 @@ async function main() {
   app.addHook("preHandler", authMiddleware);
 
   await registerSessionRoutes(app);
+  await registerAnswerFeedbackRoutes(app);
+  await registerImageRoutes(app);
   await registerEventRoutes(app);
   await registerAnthropicManagedAgentsRoutes(app);
   await registerAdminRoutes(app);
@@ -272,8 +282,11 @@ async function main() {
   await registerPluginRoutes(app);
   await registerUserEnvVarRoutes(app);
   await registerNotificationSubscriptionRoutes(app);
+  // Off unless CLAW_REMOTE_AGENTS_ENABLED: the module registers nothing otherwise.
+  await registerRemoteAgentRoutes(app);
   await registerSystemEnvVarRoutes(app);
   await registerSandboxAdminRoutes(app);
+  await registerTerminalRoutes(app);
   await registerMcpRoutes(app);
   await registerInternalTaskRoutes(app);
   await registerInternalRunRoutes(app);
@@ -283,6 +296,8 @@ async function main() {
   await registerTaskRoutes(app);
   await registerRunRoutes(app);
   await registerWorkbenchRoutes(app);
+  await registerModelsRoutes(app);
+  await registerMeRoutes(app);
   // Scheduled triggers: nothing is registered unless the deployment turns them on.
   if (CLAW_TRIGGERS_ENABLED) await registerTriggerRoutes(app);
 
@@ -316,6 +331,7 @@ async function main() {
   // Outbound notification delivery (HMAC-signed webhooks from the outbox).
   // Gated: with the flag off no table exists and nothing polls.
   if (CLAW_NOTIFICATIONS_ENABLED) startNotificationWorker();
+  if (a2aPushEnabled()) startA2aPushWorker();
 
   // Daily maintenance crons (every 24h, first run 1 min after startup).
   // Memory decay gated by CLAW_MEMORY_ENABLED, skill cleanups gated by

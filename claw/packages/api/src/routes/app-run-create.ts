@@ -26,11 +26,11 @@
 import type { FastifyRequest } from "fastify";
 import pino from "pino";
 import type { UserInfo } from "../auth/models.js";
-import { isApiKey } from "../auth/safe-client.js";
+import { callerAuthOf } from "../auth/caller-auth.js";
 import { connectionLost, db } from "../infra/db.js";
 import { singleflightCreate, type FlightResult } from "../shared/singleflight.js";
 import {
-  admitAppRun, appRunPorts, appRunRequestHash, findAppRunByIdempotencyKey, type AppRunByKey, type AppRunOutcome, type CallerAuth,
+  admitAppRun, appRunPorts, appRunRequestHash, findAppRunByIdempotencyKey, type AppRunByKey, type AppRunOutcome,
 } from "../tasks/app-run.js";
 import {
   acquireIdempotencyLock, extractIdempotencyKey, IDEM_BUSY_POLL_MS, IDEM_BUSY_POLL_TRIES,
@@ -42,26 +42,8 @@ const logger = pino({ name: "app-run-create" });
 const inflightAppCreates = new Map<string, Promise<FlightResult>>();
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-/**
- * The caller's own credential, the one the auth middleware actually accepted, to
- * be asked of SaFE on the caller's behalf. The middleware tries, in order: the
- * session cookie (`Token`), `Authorization: Bearer ak-...`, then `x-api-key`
- * (first value, `ak-...`). Forwarding the first thing that is present instead
- * would, for a gateway's own Bearer token beside the user's `x-api-key`, ask SaFE
- * with a credential that was never the caller's.
- */
-export function callerAuthOf(req: FastifyRequest): CallerAuth {
-  const cookies = req.cookies as Record<string, string> | undefined;
-  if (cookies?.Token && typeof req.headers.cookie === "string") return { cookie: req.headers.cookie };
-  const authorization = req.headers.authorization;
-  if (typeof authorization === "string" && authorization.startsWith("Bearer ") && isApiKey(authorization.slice(7))) {
-    return { authorization };
-  }
-  const header = req.headers["x-api-key"];
-  const apiKey = Array.isArray(header) ? header[0] : header;
-  if (typeof apiKey === "string" && isApiKey(apiKey)) return { authorization: `Bearer ${apiKey}` };
-  return {};
-}
+// Re-exported: the function moved beside the auth middleware so other routes can use it.
+export { callerAuthOf };
 
 const isClientGone = (req: FastifyRequest): boolean => {
   const raw = req.raw as unknown as { aborted?: boolean };

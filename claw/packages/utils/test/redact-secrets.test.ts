@@ -360,3 +360,79 @@ test("a bare version number is left alone at every spelling of it", () => {
     assert.equal(r.hits, 0);
   }
 });
+
+// A line of tens of kilobytes is ordinary input here (a minified file, a log line, a patch), and every
+// pass over it has to stay linear: the URL-credential pass was quadratic in the length of a run of
+// letters, so 64 KB of them blocked the event loop for about sixteen seconds.
+test("redaction stays linear on a long single line of any shape", () => {
+  const N = 65536;
+  const shapes: Record<string, string> = {
+    letters: "a".repeat(N),
+    hex: "0123456789abcdef".repeat(N / 16),
+    "base64-ish": "QUJD".repeat(N / 4),
+    "words with dashes": "ab-".repeat(N / 3),
+    "words with dots": "a.".repeat(N / 2),
+    "after a vendor prefix": "sk-" + "a".repeat(N),
+    "jwt-like": "eyJ" + "a".repeat(N),
+    "after a scheme-ish prefix": "http" + "a".repeat(N),
+  };
+  for (const [label, text] of Object.entries(shapes)) {
+    const t0 = Date.now();
+    const out = redactSecrets(text).text;
+    const ms = Date.now() - t0;
+    assert.ok(ms < 1000, `${label}: ${ms} ms`);
+    assert.equal(out.length > 0, true);
+  }
+});
+
+test("the URL-credential pass still finds a scheme wherever a run of scheme characters begins", () => {
+  for (const [input, want] of [
+    ["https://user:pass@example.invalid/x", "https://<redacted>@example.invalid/x"],
+    ["git+ssh://u:p@h/x and more", "git+ssh://<redacted>@h/x and more"],
+    ["see xhttp://u:p@h now", "see xhttp://<redacted>@h now"],
+    ["redis://:s3cr3t@host:6379", "redis://<redacted>@host:6379"],
+    ["a b://c:d@e f g://h:i@j", "a b://<redacted>@e f g://<redacted>@j"],
+    ["https://host/path", "https://host/path"],
+    ["no scheme user:pass@host", "no scheme user:pass@host"],
+  ] as Array<[string, string]>) assert.equal(redactSecrets(input).text, want, input);
+});
+
+// A diff marks each line with a one-character `+`, `-` or space, and `+` and `-` are scheme characters. A lookbehind
+// that only asked "is the previous character a scheme character" read the marker as part of the scheme, so a patch line
+// that BEGINS with a URL was never matched and its password came back in the clear from the changes endpoint.
+test("the URL-credential pass masks a URL at the start of a diff line, after its +/- marker", () => {
+  for (const [input, want] of [
+    ["+postgres://app:S3cr3tPw@db/x", "+postgres://<redacted>@db/x"],
+    ["-postgres://app:S3cr3tPw@db/x", "-postgres://<redacted>@db/x"],
+    ["+git+https://deploy:pw@host/r.git", "+git+https://<redacted>@host/r.git"],
+    ["-git+ssh://deploy:pw@host/r.git", "-git+ssh://<redacted>@host/r.git"],
+    ["+redis://:s3cr3t@cache:6379", "+redis://<redacted>@cache:6379"],
+    // Past the first line, and with other lines of the patch around it.
+    ["@@ -1,2 +1,2 @@\n ctx\n+postgres://app:S3cr3tPw@db/x\n-amqp://u:p@b/y\n+tail", "@@ -1,2 +1,2 @@\n ctx\n+postgres://<redacted>@db/x\n-amqp://<redacted>@b/y\n+tail"],
+    ["+a\r\n+postgres://app:S3cr3tPw@db/x\r\n", "+a\r\n+postgres://<redacted>@db/x\r\n"],
+    // A scheme glued to a word is that whole word's scheme, as before.
+    ["x+postgres://app:S3cr3tPw@db/x", "x+postgres://<redacted>@db/x"],
+    // Nothing to mask is nothing masked.
+    ["+postgres://db/x", "+postgres://db/x"],
+    ["+ordinary line", "+ordinary line"],
+  ] as Array<[string, string]>) assert.equal(redactSecrets(input).text, want, JSON.stringify(input));
+  for (const line of ["+postgres://app:S3cr3tPw@db/x", "-git+https://deploy:pw@host/r.git"]) {
+    assert.equal(scanForSecretLeak(line)?.category, "url_credentials", line);
+  }
+});
+
+test("the marker allowance keeps the URL-credential pass linear on a diff of long lines", () => {
+  const N = 65536;
+  for (const [label, line] of Object.entries({
+    "a long word": "+" + "a".repeat(N),
+    "a long dashed word": "-" + "ab-".repeat(N / 3),
+    "a long scheme-ish run": "+" + "a.".repeat(N / 2),
+    "markers only": "+".repeat(N),
+  })) {
+    const text = `${line}\n`.repeat(4);
+    const t0 = Date.now();
+    redactSecrets(text);
+    const ms = Date.now() - t0;
+    assert.ok(ms < 1000, `${label}: ${ms} ms`);
+  }
+});

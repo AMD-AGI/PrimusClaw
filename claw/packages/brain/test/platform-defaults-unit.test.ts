@@ -103,7 +103,7 @@ function routerWith(writes: string[]) {
   const hands = {
     async callToolFull(name: string, args: Record<string, unknown>) { order.push(`call:${name}`); return { text: "ok", isError: false, args }; },
   };
-  const router = new ToolRouter(null, new Map(), undefined, "", async () => { attached++; return hands as never; });
+  const router = new ToolRouter(null, new Map(), undefined, async () => { attached++; return hands as never; });
   router.lazySkillWriter = {
     async ensure(_h, text) { writes.push(text); order.push("write"); },
   };

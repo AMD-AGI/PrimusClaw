@@ -303,6 +303,62 @@ test("a fat request emits its task identity on exec_complete", async () => {
   assert.equal(r.completion?.message_id, MESSAGE);
 });
 
+// What the user is told when the snapshot left a repository behind. The sync
+// result carries the sentence; this is the join that puts it on the session's
+// event stream, and the run still completes -- a repository over a bound is news,
+// not a failure.
+const GIT_NOTE = "Not saved: big/.git (412 MB, limit 300 MB). push them first.";
+// A sandbox is only opened by a run's first tool call; a run that never opens one
+// has no workspace to sync and the terminal sync is skipped.
+const withSandbox = async (_signal?: AbortSignal, extras?: ExecuteExtras): Promise<ExecuteResult> => {
+  await extras?.attachHands?.();
+  return result();
+};
+const SYNCED = { uploaded: 1, totalFiles: 1, failedCount: 0, exhausted: false, empty: false };
+for (const [label, git, reason] of [
+  ["a repository over a bound", { skipped: [], unmeasured: false, note: GIT_NOTE }, "git_over_limit"],
+  ["repositories that could not be measured", { skipped: [], unmeasured: true, note: GIT_NOTE }, "git_unmeasured"],
+] as const) {
+  test(`a sync that left out ${label} says so on its own event, and the run still completes`, async () => {
+    const r = await runScenario({
+      engineBehavior: withSandbox,
+      sideEffects: { syncWorkspaceToS3: (async () => ({ ...SYNCED, git })) as never },
+    });
+
+    const skipped = r.events.filter((e) => e.type === "sandboxStatus" && e.status === "workspace_git_skipped");
+    assert.equal(skipped.length, 1);
+    assert.equal(skipped[0].reason, reason);
+    assert.equal(skipped[0].message, GIT_NOTE, "the user reads the sentence the sync wrote");
+    assert.equal(skipped[0].message_id, MESSAGE);
+    assert.equal(r.completion?.failed, false);
+    assert.deepEqual(r.verdicts, ["ack"]);
+  });
+}
+
+test("a sync that left nothing out says nothing about repositories", async () => {
+  let syncs = 0;
+  const r = await runScenario({
+    engineBehavior: withSandbox,
+    sideEffects: { syncWorkspaceToS3: (async () => { syncs++; return SYNCED; }) as never },
+  });
+  assert.equal(syncs, 1, "the sync ran, so the absence below means something");
+  assert.deepEqual(r.events.filter((e) => e.status === "workspace_git_skipped"), []);
+});
+
+test("a repository left out is reported beside a partial upload, not instead of it", async () => {
+  const r = await runScenario({
+    engineBehavior: withSandbox,
+    sideEffects: {
+      syncWorkspaceToS3: (async () => ({
+        ...SYNCED, exhausted: true, failedCount: 2, git: { skipped: [], unmeasured: false, note: GIT_NOTE },
+      })) as never,
+    },
+  });
+  const statuses = r.events.filter((e) => e.type === "sandboxStatus").map((e) => e.status);
+  assert.ok(statuses.includes("workspace_sync_partial"));
+  assert.ok(statuses.includes("workspace_git_skipped"));
+});
+
 // ── fatal ────────────────────────────────────────────────────────────────
 
 test("a non-retryable error acks with failed=true and a presentable reason", async () => {

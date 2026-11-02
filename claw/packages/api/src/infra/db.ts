@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: MIT
 
 import pg from "pg";
-import { APP_RUNS_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, DATABASE_URL, envInt } from "../config.js";
+import { APP_RUNS_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_REMOTE_AGENTS_ENABLED, CLAW_TRIGGERS_ENABLED, DATABASE_URL, envBool, envInt } from "../config.js";
+import { ensureA2aPushSchema } from "../notifications/a2a-push-schema.js";
 import { ensureNotificationSchema } from "../notifications/schema.js";
+import { ensureRemoteAgentSchema } from "../remote-agents/schema.js";
+import { terminalTicketsSchemaSql } from "../terminal/schema.js";
 import pino from "pino";
 import {
   REQUIRED_SCHEMA,
@@ -1285,6 +1288,28 @@ export async function initDb(): Promise<void> {
       )
     `);
 
+    // A user's thumbs up/down on one answer of their own session. One row per
+    // (session, message, user): a repeated vote replaces the earlier one, and
+    // taking a vote back deletes the row.
+    //
+    // `message_id` is the key the client received with the answer (`claw-<seq>`
+    // for a run's events), kept as text because Claw never required it to be a
+    // number. There is no foreign key to `claw_sessions`: sessions are
+    // soft-deleted, and the routes check the session and its owner before they
+    // write.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS claw_answer_feedback (
+        session_id  TEXT NOT NULL,
+        message_id  TEXT NOT NULL,
+        user_id     TEXT NOT NULL,
+        vote        TEXT NOT NULL CHECK (vote IN ('up', 'down')),
+        reason      TEXT,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (session_id, message_id, user_id)
+      )
+    `);
+
     // Skill storage + version management (Phase 3)
     await client.query(`
       CREATE TABLE IF NOT EXISTS claw_skills (
@@ -2220,8 +2245,22 @@ export async function initDb(): Promise<void> {
       )
     `);
 
+    // One-time tickets for the browser terminal's WebSocket (terminal/tickets.ts).
+    // Short-lived rows, deleted by their redemption or by the next mint.
+    for (const sql of terminalTicketsSchemaSql()) await client.query(sql);
+
     // Off by default: a deployment that has not opted in gets no new tables.
     if (CLAW_NOTIFICATIONS_ENABLED) await ensureNotificationSchema(client);
+    if (CLAW_REMOTE_AGENTS_ENABLED) await ensureRemoteAgentSchema(client);
+    // A2A context/task model: a context is found by its caller and id on every
+    // send, which the single-column index above does not narrow.
+    if (envBool("CLAW_A2A_CONTEXT_TASKS", false)) {
+      await client.query(
+        `CREATE INDEX IF NOT EXISTS idx_sessions_a2a_context ON claw_sessions(a2a_caller_id, context_id)
+          WHERE a2a_caller_id != '' AND context_id != ''`,
+      );
+      if (envBool("CLAW_A2A_PUSH_ENABLED", false)) await ensureA2aPushSchema(client);
+    }
 
     await assertSchema(client);
     logger.info("db.migrated");

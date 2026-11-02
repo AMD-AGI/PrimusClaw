@@ -142,10 +142,23 @@ const rel = (path: string): string =>
   path.startsWith(WORKSPACE_ROOT) ? path.slice(WORKSPACE_ROOT.length) : path;
 
 /** POSIX single-quoting, which has no character it cannot carry but NUL. */
-const shq = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
+export const shq = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
 
-/** Hands' own statement that it dropped output; see TRUNCATED_FOOTER in s3-uploader. */
-const TRUNCATED_FOOTER = /^\[stdout truncated; \d+ bytes dropped\]$/m;
+/**
+ * Hands' footer for output its ring buffer dropped, matched as a whole line.
+ *
+ * Written by `collectOutput` in hands/src/tools/shell/process-runner.ts on exactly
+ * the condition that bytes were dropped, which makes it the one thing in this
+ * output that reports truncation rather than being evidence of it. The one
+ * definition: the listing, this module's `stat` and the git measurement all read
+ * the same footer, and a change to its format has to reach all of them.
+ *
+ * Matched as a whole line for the reason the trailing fence is: a filename can
+ * contain anything, so a listing could print this text itself. That direction
+ * is harmless -- it refuses a prune that would have been allowed, and a prune
+ * refused deletes nothing.
+ */
+export const TRUNCATED_FOOTER = /^\[stdout truncated; \d+ bytes dropped\]$/m;
 
 function statePrefix(s3Prefix: string): string {
   return `${SYNC_STATE_DIR}/${createHash("sha256").update(s3Prefix).digest("hex").slice(0, 24)}`;
