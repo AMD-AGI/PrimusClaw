@@ -34,6 +34,7 @@ A sandbox runs in a SaFE workspace the caller belongs to.
 
 - A caller in one workspace uses that workspace.
 - A caller in several workspaces sets metadata `agent-sandbox.io/workspace`.
+- A `system-admin` always sets metadata `agent-sandbox.io/workspace` and may choose any workspace.
 - A workspace the caller does not belong to returns `403 user_not_in_workspace`.
 
 ## Templates

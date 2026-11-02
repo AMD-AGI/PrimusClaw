@@ -455,12 +455,15 @@ func (s *Service) ReadOwnerUser(ctx context.Context, userID string) (*OwnerUser,
 	return &u, nil
 }
 
-// OwnerWorkspace picks the workspace for an identity-key sandbox. A requested
-// workspace must be listed on the User unless admin is set. Without a request,
-// the user's only listed workspace is used. user is the User read earlier in the
-// request, or nil to read it here.
+// OwnerWorkspace picks the workspace for an identity-key sandbox. An admin must
+// request a workspace and may use any. A requested workspace of other users must
+// be listed on the User. Without a request, the user's only listed workspace is
+// used. user is the User read earlier in the request, or nil to read it here.
 func (s *Service) OwnerWorkspace(ctx context.Context, userID, requested string, admin bool, user *OwnerUser) (string, error) {
-	if requested != "" && admin {
+	if admin {
+		if requested == "" {
+			return "", opErr(http.StatusBadRequest, "workspace_required", "system-admin must set metadata agent-sandbox.io/workspace")
+		}
 		return requested, nil
 	}
 	if user == nil {
