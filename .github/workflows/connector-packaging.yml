@@ -45,8 +45,8 @@ jobs:
       - run: npm run build
         working-directory: connector
 
-      # Packs the real tarball and fails unless it holds exactly dist/cli.js, README.md, LICENSE
-      # and package.json, the bin and engines fields are right, the bundle in it is the one just
+      # Packs the real tarball and fails unless it holds exactly dist/cli.js, dist/terminal-hook.js,
+      # README.md, LICENSE and package.json, the bin and engines fields are right, the bundle in it is the one just
       # built and reports the package's version, and the licence is the repository's.
       - name: Check the tarball
         working-directory: connector

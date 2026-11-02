@@ -43,14 +43,16 @@ try {
   }
   const fromTarball = (member, encoding) => execFileSync("tar", ["-xzOf", tarball, `package/${member}`], { encoding, maxBuffer: 256 * 1024 * 1024 });
 
-  // What ships: every file of the tarball (npm puts all of them under package/).
-  const allowed = new Set(["LICENSE", "README.md", "dist/cli.js", "package.json"]);
+  // What ships: every file of the tarball (npm puts all of them under package/). dist/terminal-hook.js is the
+  // program the Claude Code session hooks run (`claw-connector hooks install` resolves it next to dist/cli.js, see
+  // hookScript in src/commands.ts), so an installed package without it would write hooks that point at nothing.
+  const allowed = new Set(["LICENSE", "README.md", "dist/cli.js", "dist/terminal-hook.js", "package.json"]);
   const packed = execFileSync("tar", ["-tzf", tarball], { encoding: "utf8" })
     .split("\n")
     .filter((line) => line !== "" && !line.endsWith("/"))
     .map((line) => (line.startsWith("package/") ? line.slice("package/".length) : `../${line}`));
   for (const f of packed) if (!allowed.has(f)) fail(`unexpected file in the package: ${f}`);
-  for (const f of allowed) if (!packed.includes(f)) fail(`missing from the package: ${f}${f === "dist/cli.js" ? " (run npm run build first)" : ""}`);
+  for (const f of allowed) if (!packed.includes(f)) fail(`missing from the package: ${f}${f.startsWith("dist/") ? " (run npm run build first)" : ""}`);
 
   // The manifest that ships, not the one in the working directory.
   const pkg = JSON.parse(fromTarball("package.json", "utf8"));

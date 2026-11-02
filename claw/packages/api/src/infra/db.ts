@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: MIT
 
 import pg from "pg";
-import { APP_RUNS_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_REMOTE_AGENTS_ENABLED, CLAW_TRIGGERS_ENABLED, DATABASE_URL, envBool, envInt } from "../config.js";
+import { APP_RUNS_ENABLED, CLAW_GITHUB_REVIEW_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_REMOTE_AGENTS_ENABLED, CLAW_TRIGGERS_ENABLED, DATABASE_URL, envBool, envInt } from "../config.js";
 import { ensureA2aPushSchema } from "../notifications/a2a-push-schema.js";
 import { ensureNotificationSchema } from "../notifications/schema.js";
 import { ensureRemoteAgentSchema } from "../remote-agents/schema.js";
+import { ensureGithubReviewSchema } from "../github-review/store.js";
 import { terminalTicketsSchemaSql } from "../terminal/schema.js";
 import pino from "pino";
 import {
@@ -327,6 +328,34 @@ export const CHAT_TURN_CLAIM_INDEX = "idx_tasks_chat_turn_unique";
 /** One counted A2A row per `(session_id, message_id)` execution. */
 export const A2A_EXECUTION_INDEX = "idx_tasks_a2a_execution";
 
+/**
+ * One queued message per `(session_id, dedupe_key)`.
+ *
+ * What lets a caller that retries a submit -- a replayed tool call, a redelivered
+ * event, a request whose answer was lost -- name the message it already queued
+ * instead of queuing it again. NULL keys never collide, so every message that
+ * carries none (all of them today) is unaffected.
+ */
+export const PENDING_DEDUPE_INDEX = "uq_pending_session_dedupe";
+
+/**
+ * The column and index above, returned rather than executed so a test builds
+ * these very statements and not a copy of them.
+ *
+ * Plain rather than CONCURRENTLY, like `idx_pending_session` beside it: the
+ * table is a queue that holds a message only until the turn in front of it
+ * ends, so the build is over before it could be waited on. Nullable and
+ * additive, so a replica from the previous image that never writes the column
+ * keeps working against the migrated table.
+ */
+export function pendingMessageDedupeSchemaSql(): string[] {
+  return [
+    `ALTER TABLE claw_pending_messages ADD COLUMN IF NOT EXISTS dedupe_key TEXT`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS ${PENDING_DEDUPE_INDEX}
+       ON claw_pending_messages(session_id, dedupe_key)`,
+  ];
+}
+
 // Disjoint from ACTIVE_CHAT_TURN_SQL by origin, so the two unique indexes
 // never constrain the same row. No status filter: a repeated pair must answer
 // with the existing execution however that execution ended, or a client
@@ -440,6 +469,11 @@ async function assertSchema(client: pg.PoolClient): Promise<void> {
     client,
     A2A_EXECUTION_INDEX,
     "one A2A execution per (session_id, message_id) is not enforced",
+  );
+  await assertUniqueIndexValid(
+    client,
+    PENDING_DEDUPE_INDEX,
+    "a retried submit with the same dedupe key would queue the message twice",
   );
 }
 
@@ -1250,6 +1284,12 @@ export async function initDb(): Promise<void> {
     await client.query(
       `ALTER TABLE claw_pending_messages ADD COLUMN IF NOT EXISTS bind_attempts INTEGER NOT NULL DEFAULT 0`,
     ).catch(() => {});
+    // The key a retried submit is recognised by (see submitSessionMessage). Like
+    // the rest of this block the statements discard their error; what is asserted
+    // is the outcome -- `assertSchema` names the column, and refuses to serve
+    // without a valid unique index, since an index that is not there enforces
+    // nothing and a retry would then queue the message twice without a sound.
+    for (const sql of pendingMessageDedupeSchemaSql()) await client.query(sql).catch(() => {});
 
     // Long-term memory entries (Phase 1)
     await client.query(`
@@ -2252,6 +2292,7 @@ export async function initDb(): Promise<void> {
     // Off by default: a deployment that has not opted in gets no new tables.
     if (CLAW_NOTIFICATIONS_ENABLED) await ensureNotificationSchema(client);
     if (CLAW_REMOTE_AGENTS_ENABLED) await ensureRemoteAgentSchema(client);
+    if (CLAW_GITHUB_REVIEW_ENABLED) await ensureGithubReviewSchema(client);
     // A2A context/task model: a context is found by its caller and id on every
     // send, which the single-column index above does not narrow.
     if (envBool("CLAW_A2A_CONTEXT_TASKS", false)) {

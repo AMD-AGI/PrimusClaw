@@ -29,6 +29,7 @@ import type { RunIdentity } from "../tasks/run-identity.js";
 import { safePreview } from "@claw/utils";
 import { HandsClient, isHandsNetworkError, isHandsToolTimeout, explainHandsError, handsNetworkErrorReason } from "../clients/hands.js";
 import { isSandboxTool } from "../tools/hands.js";
+import { toolNotAllowedMessage, type ToolAllowlist } from "../tools/allowlist.js";
 import type { HookRunner } from "./hooks.js";
 import { refusalMessage, type HitlController } from "./hitl.js";
 import { latestUserText, type Completer } from "./approval-explain.js";
@@ -329,6 +330,15 @@ export interface LoopOptions {
   llmSession?: LlmSession;
   /** Test seam: HITL_SUMMARY_MODEL for this loop, where the deployment's setting is read at import. */
   hitlSummaryModel?: string;
+  /**
+   * The run's `tools_allowlist`; absent when it has none. The schemas handed to
+   * `agentLoop` are already narrowed by it, and `ToolRouter.route()` refuses what
+   * is outside it. This is for the calls that never reach a router: the ones this
+   * loop handles itself (`task`, `todo_write`, `ask_user_question`,
+   * `exit_plan_mode`), and the wait probe that opens a sandbox before a `wait` is
+   * routed. Forwarded to every sub-agent.
+   */
+  toolAllowlist?: ToolAllowlist | null;
 }
 
 // ── P1: todo_write in-loop state ──
@@ -1851,6 +1861,10 @@ class AgentLoopRunner {
       }
     logger.info({ turn, sessionId: this.sessionId, toolName, input: logInput }, "tool.call");
 
+      // Outside the run's tool allowlist: answered here, before a hook, an
+      // approver or a sandbox probe can be reached on its behalf.
+      if (await this.refuseUnlisted(toolName, toolId, resultByToolId)) return;
+
       // Emit `start` synchronously with full argumentsDetail. The web client's
       // event reducer only creates the tool card on
       // status="start" and does NOT read argumentsDetail on the terminal
@@ -2207,11 +2221,40 @@ class AgentLoopRunner {
     return true;
   }
 
+  /**
+   * Turn away a call to a tool outside the run's `tools_allowlist`.
+   *
+   * Reports to the model as an error result, the way every other refusal does,
+   * and counts as a call that failed. Returns whether it refused; with no
+   * allowlist it never does, and a run without one is exactly what it was.
+   */
+  private async refuseUnlisted(
+    toolName: string,
+    toolId: string,
+    resultByToolId: Map<string, string>,
+  ): Promise<boolean> {
+    const allowlist = this.opts.toolAllowlist;
+    if (!allowlist || allowlist.allows(toolName)) return false;
+    const reason = toolNotAllowedMessage(toolName);
+    this.totalToolCalls++;
+    this.errorCount++;
+    this.toolCallsByName[toolName] = (this.toolCallsByName[toolName] || 0) + 1;
+    logger.warn({ sessionId: this.sessionId, toolName }, "tool.not_in_allowlist");
+    await this.onEvent({ type: "toolUsed", tool: toolName, actionId: toolId, status: "error", description: reason });
+    resultByToolId.set(toolId, reason);
+    return true;
+  }
+
   private async runTaskTool(
     tc: any,
     turn: number,
     resultByToolId: Map<string, string>,
   ): Promise<void> {
+    // A `task` the run's tool allowlist does not name starts nothing: it would
+    // open a sandbox for the sub-agent before anything else could object. It
+    // counts as no started call, so it is turned away ahead of the increment
+    // below, which only a call that really begins may make.
+    if (await this.refuseUnlisted("task", tc.id as string, resultByToolId)) return;
     // FIRST, before any await. A sibling in the same `Promise.all` batch must
     // be visible to a check made while this one is still suspended -- see
     // `toolsStarted`.
@@ -2294,6 +2337,8 @@ class AgentLoopRunner {
         hitl: this.opts.hitl,
         runIdentity: this.opts.runIdentity,
         webToolServices: this.router.getWebToolServices?.(),
+        // Forwarded, never re-derived: a sub-agent is no way around the list.
+        toolAllowlist: this.opts.toolAllowlist,
         });
         resultText = sub.finalText || "(sub-agent produced no final text)";
       } catch (err: any) {
