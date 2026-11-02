@@ -15,7 +15,8 @@
  *   S4  the entry points that read a repository's own text (`.github/clawy.yml`, a `package.json` change) cost a bounded amount on the
  *       lines that were slow, and read what they read before
  *   S5  one `assessRisk` call on the most a pull request can make it read (500 lines at the cap) costs a bounded amount, whatever the lines
- *       repeat: the bound is on the call, which is what the shared API pays, and not on one `exec`
+ *       repeat: the bound is on the call, which is what the shared API pays, and not on one `exec`; it is a multiple of what a call on lines
+ *       nothing reads costs, timed in the same moment, so that how fast or how busy the machine is cancels out
  *   S6  the three patterns that were rewritten after S5 was written read what they read before
  */
 import assert from "node:assert/strict";
@@ -33,6 +34,8 @@ const LINES_AT_CAP = MAX_READ_CHARS / MAX_LINE_CHARS;
  * how long every tenant waits for one pull request. A call on lines that no pattern has anything to say about costs a quarter of it.
  */
 const CALL_BUDGET_MS = 400;
+/** The same budget as S5 measures it: a call may cost this many times what a call on lines that no pattern has anything to say about costs. */
+const CALL_BUDGET_RATIO = 4;
 /** So the most one pattern may cost on one line at the cap: a pattern that costs more makes a call over the budget when the change repeats what it starts on. */
 const EXEC_BOUND_MS = CALL_BUDGET_MS / LINES_AT_CAP;
 /** The length and the bound the first sweep used, which the patterns it was written for are timed at (see S2). */
@@ -167,17 +170,31 @@ test("S5 one assessRisk call on the most a pull request can make it read costs a
   // synchronous pattern that scans on to the end of the line from every copy of its opening makes the call take seconds. One line of
   // each opening that a pattern of the rule pack starts with and cannot finish; the sweep (S3) finds a pattern by what it costs, this finds
   // what it costs the caller, and asks for the call, not the `exec`, to be bounded.
+  //
+  // The bound is not a number of milliseconds, which a busy CI runner makes any call exceed (one run measured 2959 ms for a call that takes
+  // 60 to 90 ms): it is CALL_BUDGET_RATIO times a call on lines that no pattern has anything to say about, timed right before it in the same
+  // process, so that a slow machine slows both and the ratio stays what it is. A pause that hits one of the two only is not a verdict: the
+  // pair is timed again, up to ROUNDS times, and the opening is over the bound only if no round is under it. A pattern that has gone
+  // super-linear is over it in every round, by a factor of hundreds.
+  const ROUNDS = 5;
   const openings = ["#[arg(", "#[clap(", "r.get<", "app.PUT<", "r.get<x>(", "nolint:", "eslint-disable", "/*", "function ", "export ", "import("];
-  const worst: Array<[string, number]> = [];
+  const callMs = (line: string): number => assessLines(Array.from({ length: LINES_AT_CAP }, () => line)).ms;
+  const fill = (unit: string): string => unit.repeat(Math.ceil(MAX_LINE_CHARS / unit.length)).slice(0, MAX_LINE_CHARS);
+  const quiet = fill("lorem ipsum dolor sit amet "); // words, as a line of prose is, and none of the openings above
+  const over: string[] = [];
   for (const opening of openings) {
-    const line = opening.repeat(Math.ceil(MAX_LINE_CHARS / opening.length)).slice(0, MAX_LINE_CHARS);
-    const lines = Array.from({ length: LINES_AT_CAP }, () => line);
-    let ms = assessLines(lines).ms;
-    if (ms > CALL_BUDGET_MS) ms = Math.min(ms, assessLines(lines).ms); // one pause of the process is not a slow call
-    worst.push([opening, ms]);
+    const line = fill(opening);
+    let last = "";
+    let within = false;
+    for (let round = 0; round < ROUNDS && !within; round++) {
+      const base = callMs(quiet);
+      const ms = callMs(line);
+      within = ms <= CALL_BUDGET_RATIO * base;
+      last = `${Math.round(ms)} ms against ${Math.round(base)} ms for a call on lines nothing reads (${(ms / base).toFixed(1)} times)`;
+    }
+    if (!within) over.push(`${JSON.stringify(opening)} x ${LINES_AT_CAP} lines of ${MAX_LINE_CHARS}: ${last}`);
   }
-  const over = worst.filter(([, ms]) => ms > CALL_BUDGET_MS).map(([o, ms]) => `${JSON.stringify(o)} x ${LINES_AT_CAP} lines of ${MAX_LINE_CHARS}: ${Math.round(ms)} ms`);
-  assert.deepEqual(over, [], `the budget of one call is ${CALL_BUDGET_MS} ms`);
+  assert.deepEqual(over, [], `the budget of one call is ${CALL_BUDGET_RATIO} times a call that reads nothing, in every one of ${ROUNDS} rounds`);
 });
 
 test("S6 the patterns that were rewritten to be linear read what they read before", () => {
