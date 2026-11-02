@@ -1649,6 +1649,16 @@ export const EXIT_PLAN_MODE_ENABLED = envBool("EXIT_PLAN_MODE_ENABLED", true);
 export const ASK_USER_QUESTION_ENABLED = envBool("ASK_USER_QUESTION_ENABLED", false);
 export const ASK_USER_QUESTION_TIMEOUT_MS = envInt("ASK_USER_QUESTION_TIMEOUT_MS", 600_000);
 
+// --- A2A client (the a2a_call tool) ---
+// Off by default: the tool is not offered to the model and a call is refused. The peers it may
+// reach are the operator's A2A_AGENTS (clients/a2a.ts); this switch is the operator's decision that
+// this deployment calls other agents at all.
+export const A2A_CLIENT_ENABLED = envBool("A2A_CLIENT_ENABLED", false);
+// A streamed call gives up waiting (without failing the peer's task) after this long with no event,
+// and after A2A_STREAM_MAX_MS in all, or when the run's own budget is nearly spent, whichever is first.
+export const A2A_STREAM_IDLE_TIMEOUT_MS = envInt("A2A_STREAM_IDLE_TIMEOUT_MS", 120_000, { min: 1_000, max: 3_600_000 });
+export const A2A_STREAM_MAX_MS = envInt("A2A_STREAM_MAX_MS", 600_000, { min: 1_000, max: 7_200_000 });
+
 // --- Background Shell ---
 export const BG_SHELL_ENABLED = envBool("BG_SHELL_ENABLED", false);
 
