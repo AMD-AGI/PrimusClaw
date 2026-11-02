@@ -448,6 +448,15 @@ export const NOTIFY_LINK_BASE = env("NOTIFY_LINK_BASE", "/primus-claw");
 // looping assistant, not a quota: a person is not meant to meet it.
 export const CLAW_ASSISTANT_SAY_MAX_PER_HOUR = envInt("CLAW_ASSISTANT_SAY_MAX_PER_HOUR", 120, { min: 1 });
 
+// --- Assistant (default OFF) ---
+// When false: no assistant tables and no routes, as if the feature did not exist.
+// One switch for every user: Claw has no per-user allow-list for it.
+export const CLAW_ASSISTANT_ENABLED = envBool("CLAW_ASSISTANT_ENABLED", false);
+// The model a user's router session asks for. Blank is the deployment default.
+export const CLAW_ASSISTANT_ROUTER_MODEL = env("CLAW_ASSISTANT_ROUTER_MODEL");
+// Work items one user may have unfinished (not on the done board) at once.
+export const CLAW_ASSISTANT_MAX_ACTIVE_ITEMS = envInt("CLAW_ASSISTANT_MAX_ACTIVE_ITEMS", 20, { min: 1 });
+
 // --- Remote agents (default OFF) ---
 // When false: no remote-agent tables, no routes, and nothing polls. A connector
 // on a user's machine dials out to these routes; see docs/remote-agents.md.
