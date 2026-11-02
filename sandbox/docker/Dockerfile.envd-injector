@@ -24,7 +24,7 @@
 # /shared/bin/ld-musl-x86_64.so.1, bundled with musl libc to ensure it works in glibc containers
 
 # ── Stage 0: Build EnvD ──────────────────────────────────────────────────────
-FROM golang:1.27@sha256:4013ae0f9e7994f8535c58c811f8f863fbed38b72e0d51e6592156f758d66146 AS envd-builder
+FROM golang:1.27@sha256:2920bb124f1a2e12a1d39f0cab756ae0068441ee1da7655dec7f5e374944095b AS envd-builder
 
 WORKDIR /workspace
 COPY go.mod go.sum ./
