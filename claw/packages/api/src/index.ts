@@ -29,6 +29,7 @@ import { registerSkillRoutes } from "./routes/skills.js";
 import { registerA2ARoutes } from "./routes/a2a.js";
 import { registerPluginRoutes } from "./routes/plugins.js";
 import { registerUserEnvVarRoutes } from "./routes/user-env-vars.js";
+import { registerAssistantRoutes } from "./routes/assistant.js";
 import { registerNotificationSubscriptionRoutes } from "./routes/notification-subscriptions.js";
 import { registerRemoteAgentRoutes } from "./routes/remote-agents.js";
 import { startNotificationWorker } from "./notifications/outbox.js";
@@ -303,6 +304,8 @@ async function main() {
   await registerNotificationSubscriptionRoutes(app);
   // Off unless CLAW_REMOTE_AGENTS_ENABLED: the module registers nothing otherwise.
   await registerRemoteAgentRoutes(app);
+  // Off unless CLAW_ASSISTANT_ENABLED: the module registers nothing otherwise.
+  await registerAssistantRoutes(app);
   // Off unless CLAW_GITHUB_REVIEW_ENABLED: nothing is registered otherwise.
   await registerGithubReviewRoutes(app);
   await registerSystemEnvVarRoutes(app);

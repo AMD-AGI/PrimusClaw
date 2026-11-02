@@ -40,6 +40,16 @@ record it.
   `mcp__<server>__*` for each server that row declares. A node's list that is not a list of strings is refused
   when the template is registered (and when a stored one is expanded) instead of being read as no list.
   `mode=script` tasks still ignore the field.
+- The assistant's board, off by default (`CLAW_ASSISTANT_ENABLED=true`; one switch for every user, no per-user
+  list): `POST /v1/assistant` returns the caller's assistant session, made on first use and the same one every
+  time; `GET /v1/work-items?state=in_progress|needs_you|done` and `GET /v1/work-items/:id` show the work the
+  assistant took on (done items for the last seven days); `POST /v1/work-items/:id/accept` takes the result
+  version the user saw and refuses a version that is no longer current (409); `POST /v1/work-items/:id/stop`
+  closes an item and interrupts its worker. A user's unfinished items are capped by
+  `CLAW_ASSISTANT_MAX_ACTIVE_ITEMS` (default 20) and `CLAW_ASSISTANT_ROUTER_MODEL` picks the assistant
+  session's model. Another user's item is a 404. Four tables (`claw_assistants`, `claw_work_items`,
+  `claw_work_item_events`, `claw_assistant_says`) exist only while the switch is on; the assistant's model
+  tools and the way a worker reports are separate changes.
 - `CLAW_REQUIRED_PLATFORM_ROLES` (chart: `api.requiredPlatformRoles`; empty by default, which changes
   nothing) names platform roles of which a caller must hold at least one to use Claw at all. Anyone else is
   refused with a 403 `platform_access_required` ("no access yet - ask an administrator") on every
