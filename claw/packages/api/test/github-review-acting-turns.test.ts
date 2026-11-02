@@ -315,8 +315,9 @@ test("A8 every place in the source that can start a turn is gated, or is on a li
   /** Files that can start a turn and need no gate of their own, with the reason. Each must still match, so that the list holds no guesses. */
   const NO_GATE: Record<string, string> = {
     "sessions/dispatch.ts": "the shared dispatch: the gated routes call it, and so do a new session's first message and a trigger",
-    "events/consumer.ts": "drains the queue, which only the two gated routes put messages into",
-    "tasks/pending-dispatch.ts": "drains queued messages, which only the two gated routes queue",
+    "sessions/submit-message.ts": "the one place a message is accepted onto a session: routes/sessions.ts calls it with a `refuse` hook that asks actingTurnRefusalFor under the session lock (counted above), and the assistant's tools call it for the user's own assistant and worker sessions, which are made by the server and never carry config.acting_as",
+    "events/consumer.ts": "drains the queue, which only the gated routes, and the assistant for its own sessions (never acting_as), put messages into",
+    "tasks/pending-dispatch.ts": "drains queued messages, which only the gated routes, and the assistant for its own sessions (never acting_as), queue",
     "tasks/chat-run.ts": "the run row and the gate of a turn that a route above has already accepted",
     "tasks/run-dispatch.ts": "hands a turn that a route above has already admitted to a worker",
     "tasks/dag-expander.ts": "creates the nodes of a DAG for routes/tasks.ts and workbenches/routes.ts, both gated",
@@ -340,8 +341,9 @@ test("A8 every place in the source that can start a turn is gated, or is on a li
   for (const [file, places] of Object.entries(GATED)) assert.equal(found.get(file), places, `${file} asks actingTurnRefusal in ${places} place(s)`);
   // A count of gates per file cannot tell one dispatch from another, so each place that dispatches a turn is counted too: a new one in a gated
   // file fails here until somebody says which kind it is. In routes/sessions.ts they are the first message of a new session (the create asks
-  // `classifyAttendedCaller`), a message (gated) and the start of the sandbox, which is a script run with no model call (`sandboxOnly`).
-  const dispatches: Record<string, number> = { "routes/sessions.ts": 3, "routes/anthropic-managed-agents.ts": 1 };
+  // `classifyAttendedCaller`) and the start of the sandbox, which is a script run with no model call (`sandboxOnly`); a message is dispatched
+  // by sessions/submit-message.ts, which the route calls with its `refuse` hook.
+  const dispatches: Record<string, number> = { "routes/sessions.ts": 2, "sessions/submit-message.ts": 1, "routes/anthropic-managed-agents.ts": 1 };
   for (const [file, n] of Object.entries(dispatches)) {
     assert.equal((stripComments(readFileSync(join(src, file), "utf8")).match(/\bdispatchTaskToBrain\(/g) ?? []).length, n, `${file}: places that dispatch a turn`);
   }
