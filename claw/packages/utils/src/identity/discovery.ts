@@ -11,7 +11,12 @@ export interface EndpointOverrides {
   introspectionUrl?: string;
   tokenUrl?: string;
   jwksUrl?: string;
+  /** Where an external credential is resolved; derived from the token endpoint when unset. */
+  credentialResolveUrl?: string;
 }
+
+/** Path of the resolve call, relative to the identity provider's origin. */
+const CREDENTIAL_RESOLVE_PATH = "/oauth/external-credentials/resolve";
 
 export interface DiscoverySettings {
   /** The issuer identifier, exactly as it appears in `iss`. */
@@ -103,6 +108,24 @@ export class Endpoints {
 
   jwks(): Promise<string> {
     return this.resolve(this.s.overrides.jwksUrl, (d) => d.jwksUri);
+  }
+
+  /**
+   * Where an external credential is resolved. Discovery does not advertise it, so
+   * it is the token endpoint with its `/oauth/token` path replaced (the address a
+   * pod can reach the provider on is the one the token endpoint already names), or
+   * the issuer's own path when the token endpoint is somewhere else.
+   */
+  async credentialResolve(): Promise<string> {
+    const pinned = this.s.overrides.credentialResolveUrl;
+    if (pinned) return pinned;
+    const token = new URL(await this.token());
+    if (token.pathname.endsWith("/oauth/token")) {
+      token.pathname = token.pathname.slice(0, -"/oauth/token".length) + CREDENTIAL_RESOLVE_PATH;
+      token.search = "";
+      return token.toString();
+    }
+    return `${trimTrailingSlashes(this.s.issuer)}${CREDENTIAL_RESOLVE_PATH}`;
   }
 
   /**

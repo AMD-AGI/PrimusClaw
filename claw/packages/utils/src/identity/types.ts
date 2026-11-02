@@ -6,8 +6,8 @@
  * replace. This file imports nothing so every other module here can use it.
  */
 
-/** The four upstream conversations the client has. */
-export type IdentityOp = "discovery" | "jwks" | "introspection" | "exchange";
+/** The five upstream conversations the client has. */
+export type IdentityOp = "discovery" | "jwks" | "introspection" | "exchange" | "credential";
 
 /**
  * How a lookup was answered. `hit` and `hit_negative` never left the process,

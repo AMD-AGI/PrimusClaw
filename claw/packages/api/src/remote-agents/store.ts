@@ -485,6 +485,8 @@ export type CreateSessionOutcome = { status: "limit" } | { status: "rate_limited
 /** Create a session and queue the command that makes the connector start it, or refuse at the limits. */
 export async function createSession(p: {
   owner: string; client: string | null; connectorId: string; agentId: string; cwd: string; mode: string | null;
+  /** Forwarded to the connector as given; never stored on the row (the connector keeps what it needs). */
+  resumeRef?: string | null;
   maxActive: number; commandsPerMinute: number;
 }): Promise<CreateSessionOutcome> {
   return inTransaction(async (q) => {
@@ -505,10 +507,10 @@ export async function createSession(p: {
     const cmdId = randomUUID();
     await enqueueCommand(q, {
       connectorId: p.connectorId, cmdId, sessionId, type: "session.new",
-      payload: { agent_id: p.agentId, cwd: p.cwd, mode: p.mode },
+      payload: { agent_id: p.agentId, cwd: p.cwd, mode: p.mode, ...(p.resumeRef ? { resume_ref: p.resumeRef } : {}) },
     });
     const base = { owner: p.owner, actor: p.owner, client: p.client, connectorId: p.connectorId, agentId: p.agentId, sessionId };
-    await writeAudit(q, { ...base, action: "session.created", detail: { cwd: p.cwd, mode: p.mode } });
+    await writeAudit(q, { ...base, action: "session.created", detail: { cwd: p.cwd, mode: p.mode, ...(p.resumeRef ? { resume_ref: p.resumeRef } : {}) } });
     await writeAudit(q, { ...base, action: "command.issued", detail: { type: "session.new", cmd_id: cmdId } });
     return { status: "created", session } as CreateSessionOutcome;
   });

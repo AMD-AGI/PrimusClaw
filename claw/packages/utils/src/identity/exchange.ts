@@ -10,6 +10,13 @@ import type { IdentityDeps } from "./types.js";
 /** RFC 8693 section 2.1 grant type. */
 export const TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange";
 
+/**
+ * RFC 8693 section 3 token type of an access token. As a `subjectTokenType` it says the subject is the user an
+ * access token the provider issued names, and the token itself is the proof (no consent on record is needed): a
+ * service that was sent the user's token uses it to ask for one for another service that acts for that user.
+ */
+export const ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token";
+
 export interface ExchangeRequest {
   subjectToken: string;
   /**

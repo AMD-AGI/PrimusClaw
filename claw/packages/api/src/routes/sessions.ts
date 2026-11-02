@@ -8,7 +8,11 @@ import { singleflightCreate, type FlightResult } from "../shared/singleflight.js
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions/dispatch.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
-import { RUN_DOORBELL_DISPATCH, SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
+import { CLAW_GITHUB_REVIEW_ENABLED, RUN_DOORBELL_DISPATCH, SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
+import { actingTurnRefusalFor } from "../github-review/acting-turns.js";
+import { parseActingAs } from "../github-review/acting-as.js";
+import { classifyAttendedCaller } from "../github-review/attended.js";
+import { readGithubReviewSettings } from "../github-review/settings.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
 import {
   forceIdleAfterInterrupt, releaseSessionGateForTurn, stopSessionRuns, takeSessionGate,
@@ -16,6 +20,7 @@ import {
 import { kv, nc, sc } from "../infra/nats.js";
 import { buildDecisionMessage } from "../sessions/decision-message.js";
 import { getUser } from "../auth/middleware.js";
+import { getAuthMethod } from "../auth/request-credential.js";
 import {
   canAccessSession,
   canAccessSessionAsOperator,
@@ -1093,6 +1098,8 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       "llm_api_key",
       "virtual_key",
       "_server_managed_credentials",
+      // Set below from the verified caller, never taken from the request.
+      "acting_as_requester",
     ];
     const suppliedReservedKey = reservedConfigKeys.find((key) =>
       Object.prototype.hasOwnProperty.call(sessionConfig, key)
@@ -1111,6 +1118,32 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     const parsedRepo = parseSessionRepo(sessionConfig.repo);
     if (!parsedRepo.ok) {
       return reply.status(400).send({ ok: false, error: parsedRepo.error });
+    }
+
+    // The user whose GitHub account this session's review tools act as. A reference
+    // only; checked here, before any row exists, and refused while the feature is
+    // off so that a session never silently goes without the tools it asked for.
+    const parsedActingAs = parseActingAs(sessionConfig.acting_as);
+    if (!parsedActingAs.ok) {
+      return reply.status(400).send({ ok: false, error: parsedActingAs.error });
+    }
+    if (parsedActingAs.actingAs !== null) {
+      if (!CLAW_GITHUB_REVIEW_ENABLED) {
+        return reply.status(400).send({ ok: false, error: "config.acting_as is not enabled on this deployment" });
+      }
+      if (!user) {
+        return reply.status(401).send({ ok: false, error: "authentication required" });
+      }
+      // A session that acts as a user is the person's say, and the key a sandbox holds (or a sign-in that key can complete) must not be
+      // able to start one: a model injected in any ordinary session of the user would otherwise review and merge with their account
+      // on its own. The same credentials as answering a held merge (github-review/attended.ts).
+      const caller = classifyAttendedCaller(getAuthMethod(req), user, readGithubReviewSettings().decisionClientIds);
+      if (!caller.ok) {
+        logger.warn({ userId: user.userId, method: getAuthMethod(req) ?? "none", clientId: user.delegation?.clientId?.slice(0, 128) }, `github_review.acting_as_refused_${caller.error}`);
+        return reply.status(403).send({ ok: false, error: caller.error });
+      }
+      // The requester's name for the review footer, from the verified caller.
+      sessionConfig.acting_as_requester = (user.userName || user.userId).slice(0, 100);
     }
 
     // The model this session's turns ask for. Checked here, before any row or
@@ -1797,6 +1830,9 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       if (!canWriteSessionAsOperator(row.user_id, user)) {
         return reply.status(403).send({ ok: false, error: "access denied" });
       }
+      // In a session that acts as a user an approval is the person's say, not something the key a sandbox holds may give itself.
+      const unattended = await actingTurnRefusalFor(req, sessionId);
+      if (unattended) return reply.status(403).send({ ok: false, error: unattended });
       const built = buildDecisionMessage(sessionId, userId, body);
       if (!built.ok) return reply.status(400).send({ ok: false, error: built.error });
       nc.publish(`decision.${sessionId}`, sc.encode(JSON.stringify(built.message)));
@@ -1836,6 +1872,13 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       if (!canAccessSession(row.user_id, userId) && !(!row.user_id && user && isSystemAdmin(user))) {
         await client.query("ROLLBACK");
         return reply.status(403).send({ ok: false, error: "only the session creator can send messages" });
+      }
+      // A turn in a session that acts as a user is the person's say, like creating it: the key a sandbox holds is the owner's own and
+      // reaches this route, so it must not be able to put work in front of a model that holds the person's GitHub account.
+      const unattended = await actingTurnRefusalFor(req, sessionId, client);
+      if (unattended) {
+        await client.query("ROLLBACK");
+        return reply.status(403).send({ ok: false, error: unattended });
       }
 
       const status = lockResult.rows[0].agent_status;
