@@ -39,6 +39,18 @@ const VERSION = "a1";
 const DOMAIN = "claw-assistant-mcp-token";
 export const MIN_TOKEN_KEY_LENGTH = 32;
 
+/**
+ * Refuse to start an assistant that could not authenticate its own turns. Without a key every turn would be
+ * dispatched with a bearer nobody can check, and the failure would show as a model that mysteriously cannot
+ * use its tools. Fatal at boot, where somebody is reading.
+ */
+export function assertAssistantTokenKey(enabled: boolean, key: string): void {
+  if (!enabled) return;
+  if (key.length < MIN_TOKEN_KEY_LENGTH) {
+    throw new Error(`CLAW_ASSISTANT_ENABLED needs CLAW_ASSISTANT_TOKEN_KEY of at least ${MIN_TOKEN_KEY_LENGTH} characters`);
+  }
+}
+
 function sign(key: string, body: string): string {
   return createHmac("sha256", key).update(DOMAIN).update(".").update(VERSION).update(".").update(body).digest("base64url");
 }

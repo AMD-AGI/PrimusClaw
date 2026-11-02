@@ -11,7 +11,8 @@
  * a bad outcome: the Router's tool list is cut to `mcp__assistant__*` by the request's `tools_allowlist`,
  * only `say` reaches the user, and there is no accept tool at all.
  */
-import { REPORT_SUMMARY_MAX, type ReportKind } from "./report.js";
+import { REPORT_SUMMARY_MAX } from "./report.js";
+import type { ReportKind } from "./work-items.js";
 
 export const ROUTER_PROMPT_VERSION = "router-v1";
 export const WORKER_PROMPT_VERSION = "worker-v1";
