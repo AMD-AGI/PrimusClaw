@@ -674,3 +674,18 @@ export function assertAdmissionSettings(
 // Bad cases get more attention since they drive the change; good cases serve as a baseline.
 export const EVOLVE_EVIDENCE_GOOD_COUNT = Number(env("EVOLVE_EVIDENCE_GOOD_COUNT", "3"));
 export const EVOLVE_EVIDENCE_BAD_COUNT = Number(env("EVOLVE_EVIDENCE_BAD_COUNT", "4"));
+
+// --- Assistant: router and worker turns (the switch itself is CLAW_ASSISTANT_ENABLED) ---
+// HMAC key of the bearer a router or worker turn presents to the assistant MCP service.
+// Required, 32 characters at least, whenever the assistant is on: a deployment without
+// it refuses to start rather than mint turns nobody can authenticate.
+export const CLAW_ASSISTANT_TOKEN_KEY = env("CLAW_ASSISTANT_TOKEN_KEY");
+// The model a work item's worker turns ask for. Blank is the worker session's own choice.
+export const CLAW_ASSISTANT_WORKER_MODEL = env("CLAW_ASSISTANT_WORKER_MODEL");
+// LLM calls a router turn may make. A router only classifies, calls a tool and says one line.
+export const CLAW_ASSISTANT_ROUTER_MAX_TURNS = envInt("CLAW_ASSISTANT_ROUTER_MAX_TURNS", 8, { min: 1 });
+// How long an item may need the user with nobody having told them before the system tells them.
+export const CLAW_ASSISTANT_SILENT_SWEEP_SEC = envInt("CLAW_ASSISTANT_SILENT_SWEEP_SEC", 300, { min: 1 });
+// The address Brain reaches this API at; the assistant MCP service is served under it.
+export const INTERNAL_BACKEND_URL =
+  process.env.INTERNAL_BACKEND_URL || `http://127.0.0.1:${process.env.API_PORT || "8200"}`;
