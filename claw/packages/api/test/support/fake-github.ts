@@ -55,6 +55,8 @@ export class FakeGithub {
     mergeStateStatus: "CLEAN", mergeable: "MERGEABLE", reviewDecision: "APPROVED", headRefOid: HEAD,
     reviewThreads: { totalCount: 0, nodes: [] },
   };
+  /** What the next GraphQL calls answer, one entry each and in order, each laid over `graphql`; once used up, `graphql` itself. */
+  graphqlQueue: Array<Record<string, any>> = [];
   reviews: Array<Record<string, any>> = [];
   issueComments: Array<Record<string, any>> = [];
   reviewComments: Array<Record<string, any>> = [];
@@ -91,7 +93,7 @@ export class FakeGithub {
       if (call.path.startsWith(prefix) && (!f.method || f.method === method)) return json(f.status, { message: f.message });
     }
     const p = call.path;
-    if (p === "/graphql") return json(200, { data: { repository: { pullRequest: this.graphql } } });
+    if (p === "/graphql") return json(200, { data: { repository: { pullRequest: { ...this.graphql, ...(this.graphqlQueue.shift() ?? {}) } } } });
     if (/^\/repos\/[^/]+\/[^/]+$/.test(p)) return json(200, this.repo);
     if (/^\/repos\/[^/]+\/[^/]+\/pulls\/\d+$/.test(p)) return json(200, this.pr);
     if (/\/pulls\/\d+\/files$/.test(p)) {
@@ -105,7 +107,11 @@ export class FakeGithub {
     if (/\/issues\/\d+\/comments$/.test(p)) return json(200, this.issueComments);
     if (/\/pulls\/\d+\/comments$/.test(p)) return json(200, this.reviewComments);
     if (/\/pulls\/\d+\/reviews$/.test(p)) {
-      if (method === "GET") return json(200, this.reviews);
+      if (method === "GET") {
+        const per = Number(call.query.per_page ?? 30);
+        const page = Number(call.query.page ?? 1);
+        return json(200, this.reviews.slice((page - 1) * per, page * per));
+      }
       const review = { id: 900 + this.reviews.length, state: call.body.event === "APPROVE" ? "APPROVED" : "COMMENTED", user: { login: "bob" }, commit_id: call.body.commit_id, body: call.body.body, html_url: "https://github.com/AMD-AGI/demo/pull/7#pullrequestreview-1", event: call.body.event };
       this.reviews.push(review);
       this.onReview(review);

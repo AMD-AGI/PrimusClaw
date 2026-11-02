@@ -49,7 +49,7 @@ tool offered to a session, and `config.acting_as` is refused.
 |---|---|
 | `gh_pr_get` | The pull request, its files and diff, CI, review threads, existing comments, the risk verdict, what the acting user may do, the review path (below) and the review instructions. Text that came from the pull request is under `untrusted`. Call it first. |
 | `gh_pr_risk` | The risk verdict alone, with its categories. The model may pass `risk_flags` (`security_finding`, `review_skipped`) and a `risk_judgement` (see High risk); both can only raise the verdict. |
-| `gh_review_submit` | One review on the pinned head commit (the model may pass the same `risk_flags` as to `gh_pr_risk`, and they count for an `APPROVE`), with inline comments that must sit on lines the diff shows. `COMMENT`, `REQUEST_CHANGES` or `APPROVE`. A body footer says `Reviewed by Clawy on behalf of <login> (requested by <name>), run <id>` and a hidden marker keeps a retry from posting twice. |
+| `gh_review_submit` | One review on the pinned head commit (the model may pass the same `risk_flags` as to `gh_pr_risk`, and they count for an `APPROVE`), with inline comments that must sit on lines the diff shows. `COMMENT`, `REQUEST_CHANGES` or `APPROVE`. A body footer says `Reviewed by Clawy on behalf of <login> (requested by <name>), run <id>` and a hidden marker (the run, the event and a digest of the text and inline comments) keeps a retry of the same review from posting twice, while a different review of the same kind on the same commit is posted. |
 | `gh_pr_merge` | Approves when needed and merges, if every gate is open. |
 
 ## Gates (all enforced inside the tools)
@@ -83,8 +83,10 @@ tool offered to a session, and `config.acting_as` is refused.
   (every check completed and passing; a required check that never reported is missing; a pull
   request with no check at all is not green however clean GitHub calls it; an infrastructure
   failure is a failure; nothing is re-run), no review thread is unresolved, GitHub's own merge
-  state is `CLEAN` after the approval, and the repository's own protections are met because
-  they are GitHub's. No admin merge, no auto-merge, no branch update, no change to a rule.
+  state is `CLEAN` after the approval (GitHub works the state out asynchronously, so an `UNKNOWN`,
+  and a `BLOCKED` right after this call's own approval, is looked at again for about seven seconds, one
+  request a look, before the merge is refused as `merge_state_not_clean`), and the repository's own
+  protections are met because they are GitHub's. No admin merge, no auto-merge, no branch update, no change to a rule.
   The method is the repository's first allowed one, squash first.
 - **High risk.** A versioned rule pack (`packages/api/src/github-review/risk.ts` and
   `risk-signals.ts`, version `2026-10-31.1`) decides from what the change **does**, read from
@@ -283,7 +285,8 @@ a write, the result and the review path. A call that cannot be written down is n
 table holds a credential. A tool answer is masked with the token and anything shaped like a
 secret before the model reads it. Rate limits answer `rate_limited`; GitHub's own limits
 answer `github_rate_limited` with `retry_after_seconds`, and a write is never retried blindly:
-a retry first looks for its own marker on the pull request.
+a retry first looks for its own marker on the pull request, in all of its reviews (more than a thousand
+answer `reviews_unreadable`).
 
 ## What it does not do
 

@@ -274,7 +274,7 @@ describe("S reviews", () => {
       { path: "src/app.ts", line: 3, side: "RIGHT", body: "This drops the error." },
       { path: "src/app.ts", line: 2, side: "LEFT", body: "Why was this removed?" },
     ]);
-    assert.match(w[0]?.body.body, /^Looks fine\.\n\n---\nReviewed by Clawy on behalf of bob \(requested by Alice A\), run [0-9a-f]{12}\n<!-- clawy:run:[0-9a-f]{12}:COMMENT -->$/);
+    assert.match(w[0]?.body.body, /^Looks fine\.\n\n---\nReviewed by Clawy on behalf of bob \(requested by Alice A\), run [0-9a-f]{12}\n<!-- clawy:run:[0-9a-f]{12}:COMMENT:[0-9a-f]{12} -->$/);
     assert.doesNotMatch(w[0]?.body.body, /[\u{1F300}-\u{1FAFF}]/u);
   });
 
@@ -309,6 +309,74 @@ describe("S reviews", () => {
     // Only the tool's own marker survives: the name had its brackets and backtick taken out.
     assert.equal(body.match(/<!-- clawy:run:/g)?.length, 1);
     assert.doesNotMatch(body.split("\n").find((l) => l.startsWith("Reviewed by")) ?? "", /<|>|`/);
+  });
+});
+
+describe("S2 one review is not another of the same kind", () => {
+  const inline = (body: string, line = 3) => ({ path: "src/app.ts", line, body });
+  const posted = () => e.gh.reviews.length;
+
+  test("S6 a second review of the same kind on the same commit is posted when it says something else, and a retry of either is still posted once", async () => {
+    // [what the second review changes, event, first, second]; the first is always posted.
+    const cases: Array<[string, Record<string, unknown>, Record<string, unknown>]> = [
+      ["another body", { body: "Looks fine." }, { body: "On a second look the error path is not handled." }],
+      ["the same body, another inline comment", { comments: [inline("This drops the error.")] }, { comments: [inline("This drops the error and the retry.")] }],
+      ["the same body and comment, on another line", { comments: [inline("Why?", 3)] }, { comments: [inline("Why?", 4)] }],
+      ["the same body, an added inline comment", { body: "See below." }, { body: "See below.", comments: [inline("Why?")] }],
+      ["the same body, the comment on the other side", { comments: [{ path: "src/app.ts", line: 2, side: "LEFT", body: "Why?" }] }, { comments: [{ path: "src/app.ts", line: 2, side: "RIGHT", body: "Why?" }] }],
+    ];
+    for (const [name, first, second] of cases) {
+      for (const event of ["COMMENT", "REQUEST_CHANGES"]) {
+        // A session has a budget of GitHub requests: one environment for each review pair.
+        e = await reviewEnv();
+        const before = posted();
+        const a = await submit({ event, ...first });
+        const b = await submit({ event, ...first, ...second });
+        assert.equal(a.body.status, "submitted", `${name} ${event} first: ${a.text}`);
+        assert.equal(b.body.status, "submitted", `${name} ${event} second: ${b.text}`);
+        assert.notEqual(b.body.review_id, a.body.review_id, name);
+        // Neither is posted twice by a retry.
+        assert.equal((await submit({ event, ...first })).body.status, "already_submitted", `${name} retry of the first`);
+        assert.equal((await submit({ event, ...first, ...second })).body.status, "already_submitted", `${name} retry of the second`);
+        assert.equal(posted() - before, 2, `${name} ${event}`);
+        // What GitHub got for the second is what the model sent, in full.
+        const last = e.gh.reviews[e.gh.reviews.length - 1] as any;
+        assert.match(String(last.body), /<!-- clawy:run:[0-9a-f]{12}:[A-Z_]+:[0-9a-f]{12} -->$/, name);
+      }
+    }
+  });
+
+  test("S7 a review that has the same words but another event is its own review, and the marker belongs to one session and one commit", async () => {
+    assert.equal((await submit({ event: "COMMENT" })).body.status, "submitted");
+    assert.equal((await submit({ event: "REQUEST_CHANGES" })).body.status, "submitted");
+    assert.equal((await submit({ event: "COMMENT" })).body.status, "already_submitted");
+    // Another session posting the same words on the same commit has not posted it yet.
+    const other = await e.service.submitReview({ ...e.actor, sessionId: "s-2" }, { pr: PR, head_sha: HEAD, event: "COMMENT", body: "Looks fine." });
+    assert.equal(other.body.status, "submitted", other.text);
+    assert.equal(posted(), 3);
+  });
+
+  test("S8 a retry finds its marker wherever it sits among the reviews, not only in the first hundred; more than could be read is refused, not read in part", async () => {
+    const filler = (n: number) => Array.from({ length: n }, (_, i) => ({ id: i + 1, state: "COMMENTED", user: { login: "someone" }, commit_id: HEAD, body: `review ${i}` }));
+    assert.equal((await submit()).body.status, "submitted");
+    const mine = e.gh.reviews[0]!;
+    // 250 reviews by others, then this one: it is on the third page.
+    e.gh.reviews = [...filler(250), mine];
+    const again = await submit();
+    assert.equal(again.body.status, "already_submitted", again.text);
+    assert.equal(again.body.review_id, mine.id);
+    assert.equal(e.gh.writes.length, 1);
+    // An approval given long ago is found too, so it is not given twice.
+    const approvedEnv = await reviewEnv(); e = approvedEnv; allowed();
+    e.gh.reviews = [...filler(120), { id: 7, state: "APPROVED", user: { login: "bob" }, commit_id: HEAD, body: "" }];
+    assert.equal((await merge()).body.status, "merged");
+    assert.equal(posts().length, 0);
+    // Past what is read, nothing is posted on a guess.
+    e = await reviewEnv();
+    e.gh.reviews = filler(1001);
+    const refused = await submit();
+    assert.equal(reason(refused), "reviews_unreadable");
+    assert.equal(e.gh.writes.length, 0);
   });
 });
 
@@ -403,6 +471,66 @@ describe("M the merge gates", () => {
     const o = await merge();
     assert.equal(reason(o), "not_mergeable");
     assert.equal(o.isError, true);
+  });
+
+  test("M16 GitHub works the merge state out after the approval, not at once: UNKNOWN, and BLOCKED while the review does not count yet, are waited for, a few seconds at most; the merge is made when it settles, and not otherwise", async () => {
+    const st = (mergeStateStatus: string, extra: Record<string, unknown> = {}) => ({ mergeStateStatus, ...extra });
+    // [name, the states the reads after the approval answer, in order, then what every later read answers, expected reason or "merged", waits]
+    const cases: Array<[string, Array<Record<string, unknown>>, string, string, number[]]> = [
+      ["CLEAN at once: no wait", [], "CLEAN", "merged", []],
+      ["UNKNOWN once, then CLEAN", [st("UNKNOWN")], "CLEAN", "merged", [500]],
+      ["UNKNOWN, UNKNOWN, BLOCKED, then CLEAN: the waits back off", [st("UNKNOWN"), st("UNKNOWN"), st("BLOCKED")], "CLEAN", "merged", [500, 1000, 2000]],
+      ["BLOCKED, the review not counted yet", [st("BLOCKED", { reviewDecision: null })], "CLEAN", "merged", [500]],
+      ["BLOCKED with the decision already APPROVED", [st("BLOCKED", { reviewDecision: "APPROVED" })], "CLEAN", "merged", [500]],
+      ["UNKNOWN for good", [], "UNKNOWN", "merge_state_not_clean", [500, 1000, 2000, 4000]],
+      ["BLOCKED for good (another approver is required)", [], "BLOCKED", "merge_state_not_clean", [500, 1000, 2000, 4000]],
+      ["BEHIND is not a state an approval changes: no wait", [], "BEHIND", "merge_state_not_clean", []],
+      ["DIRTY is not one either", [], "DIRTY", "merge_state_not_clean", []],
+      ["UNKNOWN, then the head moved while waiting", [st("UNKNOWN"), st("UNKNOWN", { headRefOid: "2".repeat(40) })], "CLEAN", "head_moved", [500]],
+      ["UNKNOWN, then a thread was opened while waiting", [st("UNKNOWN"), st("UNKNOWN", { reviewThreads: { totalCount: 1, nodes: [{ isResolved: false }] } })], "CLEAN", "threads_unresolved", [500]],
+    ];
+    for (const [name, queue, rest, expected, waits] of cases) {
+      e = await reviewEnv(); allowed();
+      e.gh.graphql.mergeStateStatus = "BLOCKED";
+      e.gh.onReview = (r) => {
+        if (r.event !== "APPROVE") return;
+        e.gh.graphqlQueue = queue.map((q) => ({ ...q }));
+        e.gh.graphql.mergeStateStatus = rest;
+      };
+      const o = await merge();
+      assert.equal(reason(o), expected, `${name}: ${o.text}`);
+      assert.deepEqual(e.sleeps, waits, name);
+      assert.equal(puts().length, expected === "merged" ? 1 : 0, name);
+      assert.equal(posts().length, 1, `${name}: the approval is posted once whatever follows`);
+      if (expected === "merge_state_not_clean") assert.equal(o.body.approved_by_this_call, true, name);
+      // The waiting is one request a look, not a full read of CI and threads each time.
+      const looks = e.gh.calls.filter((c) => c.path === "/graphql").length;
+      const checkReads = e.gh.calls.filter((c) => /\/check-runs$/.test(c.path)).length;
+      assert.equal(checkReads, 2, `${name}: CI is read before and after the approval, not at every look`);
+      assert.equal(looks, 2 + waits.length, `${name}: the state before the approval, after it, and one look a wait`);
+    }
+  });
+
+  test("M17 a merge state still being computed is waited for when this call posted no approval too (the first look at a pull request often says UNKNOWN); BLOCKED is not, nothing of this call's could unblock it", async () => {
+    e.gh.reviews = [{ id: 1, state: "APPROVED", user: { login: "bob" }, commit_id: HEAD, body: "" }];
+    e.gh.graphql.mergeStateStatus = "UNKNOWN";
+    e.gh.graphqlQueue = [{ mergeStateStatus: "UNKNOWN" }, { mergeStateStatus: "UNKNOWN" }, { mergeStateStatus: "CLEAN" }];
+    // The first read of the merge is the third answer's turn: the read before the gates, then two looks.
+    const o = await merge();
+    assert.equal(reason(o), "merged", o.text);
+    assert.deepEqual(e.sleeps, [500, 1000]);
+    assert.equal(posts().length, 0);
+    e = await reviewEnv(); allowed();
+    e.gh.reviews = [{ id: 1, state: "APPROVED", user: { login: "bob" }, commit_id: HEAD, body: "" }];
+    e.gh.graphql.mergeStateStatus = "BLOCKED";
+    assert.equal(reason(await merge()), "merge_state_not_clean");
+    assert.deepEqual(e.sleeps, []);
+    // The author's own pull request: nothing was approved by this call, so BLOCKED is final at once.
+    e = await reviewEnv(); allowed();
+    e.gh.pr.user = { login: "bob" };
+    e.gh.graphql.mergeStateStatus = "BLOCKED";
+    assert.equal(reason(await merge()), "needs_other_approver");
+    assert.deepEqual(e.sleeps, []);
   });
 });
 
@@ -746,6 +874,20 @@ describe("C high risk waits for the acting user", () => {
     // Nothing is left to deny, allow again or expire.
     assert.equal((await e.service.decide("u-bob", id, "allow")).body.status, "refused");
     assert.equal(e.gh.writes.length, 2);
+  });
+
+  test("C17 the acting user's allow is not spent by GitHub's lag: the merge state still UNKNOWN or BLOCKED after the approval is waited for, and the confirmation ends merged", async () => {
+    const id = String((await merge()).body.confirmation_id);
+    e.gh.onReview = (r) => {
+      if (r.event !== "APPROVE") return;
+      e.gh.graphqlQueue = [{ mergeStateStatus: "UNKNOWN" }, { mergeStateStatus: "BLOCKED" }];
+      e.gh.graphql.mergeStateStatus = "CLEAN";
+    };
+    const r = await e.service.decide("u-bob", id, "allow");
+    assert.equal(r.body.status, "merged", JSON.stringify(r.body));
+    assert.deepEqual(e.sleeps, [500, 1000]);
+    assert.deepEqual(e.gh.writes.map((w) => w.method), ["POST", "PUT"]);
+    assert.equal((await pending())[0]?.status, "merged");
   });
 
   test("C12 a confirmation is given back only while it can still be answered: not after it ran out, not when a newer one for the commit stands", async () => {

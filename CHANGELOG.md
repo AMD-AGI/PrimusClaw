@@ -116,6 +116,9 @@ record it.
   without starting a sandbox; the path taken is logged and audited, and the thresholds are
   `CLAW_GITHUB_REVIEW_FAST_MAX_FILES` / `_MAX_CHANGED_LINES`. A repository's own review skill is read from the
   tip of the base branch; the default `pr-review` skill is in `claw/examples/skills/pr-review/`.
+  The merge waits a few seconds, one request a look, for GitHub to finish working out the merge state after the
+  approval it just posted (`UNKNOWN`, or `BLOCKED` until the review counts), and a review's hidden marker
+  carries a digest of its text and inline comments, so a second, different review of the same kind on the same commit is posted.
   On the sandbox path the model gets a credential-free bash recipe that fetches the pull request anonymously, shallow and
   pinned to the reviewed head, reusing an existing checkout. The shared
   identity client gains `resolveExternalCredential` (`IDENTITY_CREDENTIAL_RESOLVE_URL`). See

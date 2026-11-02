@@ -70,6 +70,8 @@ export interface ReviewDeps {
   resolveCredential: (req: ResolveCredentialRequest) => Promise<ResolvedCredential>;
   fetchImpl?: typeof fetch;
   now?: () => number;
+  /** Waits that long; real time by default. A test passes one that returns at once and records the waits. */
+  sleep?: (ms: number) => Promise<void>;
   /** Where the structured log lines go; the process's logger by default. */
   logger?: { info(fields: Record<string, unknown>, message: string): void };
 }
@@ -117,6 +119,8 @@ interface PrInfo {
   url: string;
 }
 
+interface ReviewComment { path: string; line: number; side: "RIGHT" | "LEFT"; body: string }
+
 interface Change {
   files: RiskFile[];
   complete: boolean;
@@ -145,6 +149,15 @@ const HOUR_MS = 3_600_000;
 const TRANSIENT_REFUSALS = new Set(["too_many_concurrent", "rate_limited", "github_rate_limited", "identity_unavailable", "audit_unavailable"]);
 /** Merges waiting for one acting user's decision; past it nothing new is asked of them. */
 const MAX_PENDING_CONFIRMATIONS = 10;
+/**
+ * GitHub works a pull request's merge state out asynchronously: it reads UNKNOWN while it computes, and BLOCKED until
+ * the review this call has just posted counts. These are the waits (ms) between the reads that look for it to settle,
+ * about seven seconds in all; a merge state that is still not CLEAN after them is refused as it is.
+ */
+const MERGE_STATE_SETTLE_MS = [500, 1000, 2000, 4000];
+const REVIEW_PAGE = 100;
+/** A pull request with more reviews than this (REVIEW_PAGE each) is refused, not read in part. */
+const MAX_REVIEW_PAGES = 10;
 
 const THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){
   mergeStateStatus mergeable reviewDecision headRefOid reviewThreads(first:100){totalCount nodes{isResolved}}}}}`;
@@ -172,6 +185,10 @@ export class GithubReview {
   constructor(private readonly deps: ReviewDeps) {}
 
   private now(): number { return this.deps.now ? this.deps.now() : Date.now(); }
+
+  private sleep(ms: number): Promise<void> {
+    return this.deps.sleep ? this.deps.sleep(ms) : new Promise((resolve) => setTimeout(resolve, ms));
+  }
 
   // ---------------------------------------------------------------- tools
 
@@ -647,6 +664,11 @@ export class GithubReview {
       checkRuns, statuses, required,
       truncated: Number(runs.json?.total_count ?? 0) > checkRuns.length || Number(status.json?.total_count ?? 0) > statuses.length,
     });
+    return { checks, ...(await this.readMergeFacts(ctx, ref)) };
+  }
+
+  /** What GitHub says of the pull request itself, in one request: its merge state and review decision, its head and its review threads. */
+  private async readMergeFacts(ctx: Ctx, ref: PrRef): Promise<Omit<PullState, "checks">> {
     const g = await ctx.client.graphql<{ repository?: { pullRequest?: {
       mergeStateStatus?: string; mergeable?: string; reviewDecision?: string | null; headRefOid?: string;
       reviewThreads?: { totalCount?: number; nodes?: Array<{ isResolved?: boolean }> };
@@ -655,7 +677,6 @@ export class GithubReview {
     if (!p) throw new Refusal("unreadable_pull_request", "GitHub did not return the pull request's merge state");
     const nodes = p.reviewThreads?.nodes ?? [];
     return {
-      checks,
       unresolvedThreads: nodes.filter((n) => n.isResolved !== true).length,
       threadsComplete: Number(p.reviewThreads?.totalCount ?? 0) <= nodes.length,
       mergeStateStatus: String(p.mergeStateStatus ?? "UNKNOWN"),
@@ -717,12 +738,12 @@ export class GithubReview {
     }
   }
 
-  private checkComments(raw: unknown, change: Change | null): Array<{ path: string; line: number; side: "RIGHT" | "LEFT"; body: string }> {
+  private checkComments(raw: unknown, change: Change | null): ReviewComment[] {
     if (raw === undefined || raw === null) return [];
     if (!Array.isArray(raw)) throw new Refusal("invalid_comments", "comments must be a list");
     if (raw.length > MAX_REVIEW_COMMENTS) throw new Refusal("too_many_comments", `at most ${MAX_REVIEW_COMMENTS} inline comments`);
     const problems: string[] = [];
-    const out: Array<{ path: string; line: number; side: "RIGHT" | "LEFT"; body: string }> = [];
+    const out: ReviewComment[] = [];
     const lines = new Map<string, ReturnType<typeof commentableLines>>();
     for (const f of change?.files ?? []) lines.set(f.path, commentableLines(f.patch));
     raw.forEach((c, i) => {
@@ -746,9 +767,31 @@ export class GithubReview {
     return createHash("sha256").update(`${ctx.actor.sessionId}:${headSha}`).digest("hex").slice(0, 12);
   }
 
-  private footer(ctx: Ctx, runId: string, event: string): string {
+  /**
+   * The hidden line that says a review was posted: which run (session and head commit), which event, and a digest of what the
+   * review says (its text and inline comments). A retry of the same review finds it; a different review of the same kind on the
+   * same commit does not, and is posted.
+   */
+  private marker(runId: string, event: string, text: string, comments: ReviewComment[]): string {
+    const said = JSON.stringify([text, comments.map((c) => [c.path, c.line, c.side, c.body])]);
+    return `<!-- clawy:run:${runId}:${event}:${createHash("sha256").update(said).digest("hex").slice(0, 12)} -->`;
+  }
+
+  private footer(ctx: Ctx, runId: string, marker: string): string {
     const who = (ctx.actor.requesterLabel ?? ctx.actor.requesterUserId).replace(/[\r\n<>`]/g, " ").trim().slice(0, 60) || "unknown";
-    return `\n\n---\nReviewed by Clawy on behalf of ${ctx.cred.login} (requested by ${who}), run ${runId}\n<!-- clawy:run:${runId}:${event} -->`;
+    return `\n\n---\nReviewed by Clawy on behalf of ${ctx.cred.login} (requested by ${who}), run ${runId}\n${marker}`;
+  }
+
+  /** Every review of the pull request, oldest first. More than could be read is a refusal: a marker or an approval past the cut would be missed. */
+  private async listReviews<T>(ctx: Ctx, ref: PrRef): Promise<T[]> {
+    const all: T[] = [];
+    for (let page = 1; page <= MAX_REVIEW_PAGES; page++) {
+      const a = await ctx.client.get<T[]>(repoPath(ref, `/pulls/${ref.number}/reviews`), { per_page: REVIEW_PAGE, page });
+      const batch = Array.isArray(a.json) ? a.json : [];
+      all.push(...batch);
+      if (batch.length < REVIEW_PAGE) return all;
+    }
+    throw new Refusal("reviews_unreadable", `the pull request has more than ${MAX_REVIEW_PAGES * REVIEW_PAGE} reviews, more than could be read`);
   }
 
   private async limits(ctx: Ctx, headSha: string): Promise<void> {
@@ -769,18 +812,17 @@ export class GithubReview {
     }
   }
 
-  /** Post one review. Looks for its own marker first, so a retry never posts twice. */
+  /** Post one review. Looks for its own marker first (this review, not another of the same kind), so a retry never posts twice. */
   private async writeReview(
-    ctx: Ctx, ref: PrRef, pr: PrInfo, event: string, text: string,
-    comments: Array<{ path: string; line: number; side: "RIGHT" | "LEFT"; body: string }>,
+    ctx: Ctx, ref: PrRef, pr: PrInfo, event: string, text: string, comments: ReviewComment[],
   ): Promise<{ status: string; detail: Record<string, unknown> }> {
     const runId = this.runId(ctx, pr.headSha);
-    const marker = `<!-- clawy:run:${runId}:${event} -->`;
-    const existing = await ctx.client.get<Array<{ id?: number; body?: string; html_url?: string }>>(repoPath(ref, `/pulls/${ref.number}/reviews`), { per_page: 100 });
-    const prior = (existing.json ?? []).find((r) => typeof r.body === "string" && r.body.includes(marker));
+    const marker = this.marker(runId, event, text, comments);
+    const existing = await this.listReviews<{ id?: number; body?: string; html_url?: string }>(ctx, ref);
+    const prior = existing.find((r) => typeof r.body === "string" && r.body.includes(marker));
     if (prior) return { status: "already_submitted", detail: { review_id: prior.id ?? null, url: prior.html_url ?? null, event } };
     const payload = {
-      commit_id: pr.headSha, event, body: `${text}${this.footer(ctx, runId, event)}`,
+      commit_id: pr.headSha, event, body: `${text}${this.footer(ctx, runId, marker)}`,
       ...(comments.length ? { comments: comments.map((c) => ({ path: c.path, line: c.line, side: c.side, body: c.body })) } : {}),
     };
     if (!ctx.settings.writesEnabled) {
@@ -839,8 +881,8 @@ export class GithubReview {
     const ownPr = pr.authorLogin.toLowerCase() === ctx.cred.login.toLowerCase();
     let approved = false;
     if (!ownPr) {
-      const reviews = await ctx.client.get<Array<{ user?: { login?: string }; state?: string; commit_id?: string }>>(repoPath(ref, `/pulls/${ref.number}/reviews`), { per_page: 100 });
-      const already = (reviews.json ?? []).some((r) => r.user?.login?.toLowerCase() === ctx.cred.login.toLowerCase() && r.state === "APPROVED" && String(r.commit_id ?? "").toLowerCase() === headSha);
+      const reviews = await this.listReviews<{ user?: { login?: string }; state?: string; commit_id?: string }>(ctx, ref);
+      const already = reviews.some((r) => r.user?.login?.toLowerCase() === ctx.cred.login.toLowerCase() && r.state === "APPROVED" && String(r.commit_id ?? "").toLowerCase() === headSha);
       if (!already) {
         if (!ctx.settings.writesEnabled) {
           ctx.acc.dryRun = true;
@@ -856,6 +898,7 @@ export class GithubReview {
         this.requireGreen(state, headSha);
       }
     }
+    state = await this.settleMergeState(ctx, ref, headSha, state, approved);
     if (state.mergeStateStatus !== "CLEAN") {
       const why = ownPr && state.reviewDecision !== "APPROVED"
         ? "the acting user wrote this pull request and cannot approve it, and GitHub does not yet count it as approved: another approver is needed"
@@ -878,6 +921,25 @@ export class GithubReview {
       if (err instanceof GithubError && (err.status === 405 || err.status === 422)) throw new Refusal("not_mergeable", `GitHub refused the merge: ${err.message}`, { github_request_id: err.requestId });
       throw err;
     }
+  }
+
+  /**
+   * Waits, a few seconds at most, for GitHub to finish working out the merge state, which it does asynchronously after a review
+   * and when it is first asked: UNKNOWN is "still computing", and BLOCKED right after this call's own approval is "that review
+   * does not count yet". Only those are waited for; any other state (BEHIND, DIRTY, UNSTABLE) is not one an approval changes,
+   * and is read as it is. Each look is one request, and the gates that depend on the pull request itself (the head, the threads)
+   * are checked again with it.
+   */
+  private async settleMergeState(ctx: Ctx, ref: PrRef, headSha: string, first: PullState, approvedByThisCall: boolean): Promise<PullState> {
+    let state = first;
+    const settling = (s: PullState): boolean => s.mergeStateStatus === "UNKNOWN" || (approvedByThisCall && s.mergeStateStatus === "BLOCKED");
+    for (const wait of MERGE_STATE_SETTLE_MS) {
+      if (!settling(state)) break;
+      await this.sleep(wait);
+      state = { ...state, ...(await this.readMergeFacts(ctx, ref)) };
+      this.requireGreen(state, headSha);
+    }
+    return state;
   }
 
   private requireGreen(state: PullState, headSha: string): void {
