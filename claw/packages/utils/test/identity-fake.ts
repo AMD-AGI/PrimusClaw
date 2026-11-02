@@ -49,6 +49,7 @@ export class FakeIdentity {
   jwks: (r: Recorded) => Reply = () => ({ body: { keys: [] } });
   introspect: (r: Recorded) => Reply = () => ({ body: { active: false } });
   token: (r: Recorded) => Reply = () => ({ status: 400, body: { error: "invalid_grant" } });
+  resolveCredential: (r: Recorded) => Reply = () => ({ status: 404, body: { error: "not_bound" } });
 
   private constructor(private readonly server: http.Server) {}
 
@@ -69,6 +70,7 @@ export class FakeIdentity {
         else if (path === "/.well-known/jwks.json") reply = self.jwks(rec);
         else if (path === "/oauth/introspect") reply = self.introspect(rec);
         else if (path === "/oauth/token") reply = self.token(rec);
+        else if (path === "/oauth/external-credentials/resolve") reply = self.resolveCredential(rec);
         else reply = { status: 404, body: "not found" };
         void respond(res, reply);
       });

@@ -34,6 +34,7 @@
  */
 
 import pino from "pino";
+import type { PoolClient } from "pg";
 import type { EnvironmentTopology } from "@claw/protocol";
 import { db, type StatementRunner } from "../infra/db.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
@@ -86,6 +87,15 @@ interface SubmitSessionMessageBase {
    * message is already recorded.
    */
   isCancelled?: () => boolean;
+  /**
+   * A reason this sender may not put a message on this session, or null. Asked
+   * under the session row's lock, after the owner check and before anything is
+   * written, on the transaction's own connection; an answer refuses the message
+   * and leaves nothing behind. For the caller that holds a request to judge
+   * (the route, which refuses a credential a sandbox holds into a session that
+   * acts as a user); a caller that is not a request has nothing to ask.
+   */
+  refuse?: (tx: PoolClient) => Promise<string | null>;
 }
 
 /**
@@ -132,6 +142,8 @@ export type SubmitSessionMessageResult =
   | { kind: "session_not_found" }
   /** Only the session's creator (or an operator of an ownerless one) may send. */
   | { kind: "not_owner" }
+  /** `refuse` gave a reason; nothing was written. */
+  | { kind: "refused"; reason: string }
   /**
    * Written to `claw_pending_messages`. No run exists yet and none is named: the
    * row is opened later by the drain, which may yet refuse it.
@@ -277,6 +289,11 @@ export async function submitSessionMessage(
     if (!canAccessSession(row.user_id, userId) && !(!row.user_id && user && isSystemAdmin(user))) {
       await client.query("ROLLBACK");
       return { kind: "not_owner" };
+    }
+    const refusal = await input.refuse?.(client);
+    if (refusal) {
+      await client.query("ROLLBACK");
+      return { kind: "refused", reason: refusal };
     }
 
     const status = lockResult.rows[0].agent_status;
