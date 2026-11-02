@@ -37,7 +37,9 @@ record it.
   nothing. The API's DAG expander used to fill a node that set no list with the names of its plugin's MCP tool
   rows, which are not the names Brain's tools have; such a node now sends no list (so it keeps every tool, as
   before), and a list a node does set has an entry naming one of the plugin's MCP tool rows converted to
-  `mcp__<server>__*` for each server that row declares. `mode=script` tasks still ignore the field.
+  `mcp__<server>__*` for each server that row declares. A node's list that is not a list of strings is refused
+  when the template is registered (and when a stored one is expanded) instead of being read as no list.
+  `mode=script` tasks still ignore the field.
 - `CLAW_REQUIRED_PLATFORM_ROLES` (chart: `api.requiredPlatformRoles`; empty by default, which changes
   nothing) names platform roles of which a caller must hold at least one to use Claw at all. Anyone else is
   refused with a 403 `platform_access_required` ("no access yet - ask an administrator") on every
