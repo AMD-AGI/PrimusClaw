@@ -157,11 +157,13 @@ export function resourcesMapToWorkloadArray(map: Record<string, string>): Array<
  * other sandbox callers authenticate with. Hyperloom keys the hand-off purely off
  * `HYPERLOOM_MN_EXT_SERVICE_URL`, so no credential variable selects the mode.
  *
- * The two backends drive the cluster through entirely different control planes:
- * rayjob talks to the head over Ray Dashboard REST (:8265) / GCS (:6379) and
- * needs no pod IPs, while infera SSHes into the GPU pods directly and needs
- * their IPs plus a private key. Only the variables the active backend reads are
- * set, since Hyperloom infers the mode from which ones are present.
+ * The backends drive the cluster through different control planes: rayjob talks
+ * to the head over Ray Dashboard REST (:8265) / GCS (:6379) and needs no pod
+ * IPs, infera SSHes into the GPU pods directly and needs their IPs plus a
+ * private key, and atom and sglangrouter serve on the router Service with no
+ * SSH control plane.
+ * Only the variables the active backend reads are set, since Hyperloom infers
+ * the mode from which ones are present.
  *
  * Nothing about the shared filesystem is set here. `USER_DATA_PATH` is the
  * workspace root Hyperloom resolves its session directories from, and SaFE's
@@ -195,6 +197,10 @@ export function applyMultiNodeExternalEnv(
     if (ctx.dashboardToken) env.HYPERLOOM_MN_EXT_RAY_DASHBOARD_TOKEN = ctx.dashboardToken;
     return;
   }
+
+  // atom and sglangrouter launch router, prefill and decode themselves. The
+  // sandbox only needs the router Service; there is no SSH control plane to hand over.
+  if (ctx.backend === "atom" || ctx.backend === "sglangrouter") return;
 
   // infera: the optimizer SSHes into the GPU pods to relaunch the engine, so it
   // needs the key path plus at least one role's pod IPs.
@@ -256,7 +262,7 @@ export function buildTopologyHandoff(ctx: MultiNodeContext): TopologyHandoffBuil
     const ray: NonNullable<TopologyHandoffV1["ray"]> = {};
     if (ctx.headHost) ray.head_ip = ctx.headHost;
     handoff.ray = ray;
-  } else {
+  } else if (ctx.backend === "infera") {
     const infera: NonNullable<TopologyHandoffV1["infera"]> = {
       prefill_ips: [...(ctx.prefillIps ?? [])],
       decode_ips: [...(ctx.decodeIps ?? [])],

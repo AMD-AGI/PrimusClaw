@@ -94,6 +94,30 @@ test("infera with empty role lists: file keeps empty arrays, legacy vars stay un
   assert.equal(env.HYPERLOOM_MN_EXT_WORKER_IPS, "10.0.0.9");
 });
 
+test("atom and sglangrouter hand off the router service and no control-plane block", () => {
+  for (const backend of ["atom", "sglangrouter"] as const) {
+    const ctx: MultiNodeContext = {
+      backend,
+      provider: "safe",
+      name: `msg1-${backend}`,
+      namespace: "ws",
+      nodeCount: 2,
+      gpusPerNode: 8,
+      serviceUrl: `http://msg1-${backend}.ws.svc.cluster.local:8000`,
+    };
+    const { env, handoff, files } = build(ctx);
+    assert.equal(handoff.backend, backend);
+    assert.equal(handoff.service_url, ctx.serviceUrl);
+    assert.equal(handoff.ray, undefined);
+    assert.equal(handoff.infera, undefined);
+    assert.deepEqual(validateTopologyHandoff(handoff), []);
+    assert.deepEqual(files.map((f) => f.path), [DOC]);
+    assert.equal(env.HYPERLOOM_MN_EXT_SERVICE_URL, ctx.serviceUrl);
+    assert.equal(env.HYPERLOOM_MN_EXT_SSH_KEY, undefined);
+    assert.equal(env.HYPERLOOM_MN_EXT_PREFILL_IPS, undefined);
+  }
+});
+
 test("handoff documents validate against the schema", () => {
   for (const ctx of [RAYJOB, INFERA]) {
     const { handoff, byPath } = build(ctx);

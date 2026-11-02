@@ -14,15 +14,21 @@
 // Flag names, units and defaults mirror Hyperloom
 // `inference_optimizer/cli/parser.py`:
 //   --nodes                total GPU nodes (head + workers), default 1
-//   --mn-backend           rayjob | infera; no default, required for multi-node
+//   --mn-backend           rayjob | infera | atom | sglangrouter; no default, required for multi-node
 //   --mn-image             cluster image; falls back to the sandbox image
 //   --gpus-per-node        default 8
 //   --cpus-per-node        default 96
 //   --mem-per-node         GiB, default 1024
-//   --model                model path/id (infera frontend --router-tokenizer-path)
-//   --framework            infera backend framework: sglang | vllm, default sglang
-//   --pd-transfer-backend  infera KV transfer: nixl | mori | mooncake, default mori
-//   --pd-mode              aggregated | disaggregated, default aggregated
+//   --model                model path/id (infera frontend, or atom/sglangrouter --model-path)
+//   --framework            sglang | vllm, default sglang. Atom router --backend and
+//                          Infera backendFramework take this value.
+//   --server-args          engine flags, appended as given
+//   --pd-prefill-extra-args / --pd-decode-extra-args   per-role engine flags
+//   --pd-ib-device         IB device list for the disaggregation plane
+//   --pd-transfer-backend  nixl | mori | mooncake. Default mori, except atom and
+//                          sglangrouter, which default to mooncake.
+//   --pd-mode              aggregated | disaggregated. Default aggregated, except
+//                          atom and sglangrouter, which can only be disaggregated.
 //   --pd-prefill-nodes / --pd-decode-nodes    PD group node counts
 //   --pd-prefill-tp    / --pd-decode-tp       PD group tensor-parallel sizes
 //   --extra-env K=V    repeatable; the only way to reach the GPU pods' env
@@ -30,18 +36,29 @@
 // Imports are limited to types and pure protocol helpers, so tests can load
 // this without pulling in the k8s client.
 import {
-  validateTopology, type EnvironmentTopology,
+  TOPOLOGY_BACKENDS,
+  backendRequiresDisaggregatedPd,
+  backendRequiresModel,
+  validateTopology,
+  type EnvironmentTopology,
+  type TopologyBackend,
+  DEFAULT_GPUS_PER_NODE,
+  pdClusterProblems,
+  splitPdReplicas,
+  type PdClusterProblem,
 } from "@claw/protocol";
+import { SandboxFailure } from "../errors.js";
 
 /** Ephemeral storage per node; not expressible as a Hyperloom flag. */
 const EPHEMERAL_STORAGE_PER_NODE = "200Gi";
 
 const DEFAULT_NODES = 1;
-const DEFAULT_GPUS_PER_NODE = 8;
 const DEFAULT_CPUS_PER_NODE = 96;
 const DEFAULT_MEM_PER_NODE_GIB = 1024;
 const DEFAULT_FRAMEWORK = "sglang";
 const DEFAULT_KV_TRANSFER_BACKEND = "mori";
+/** Used when atom or sglangrouter omits --pd-transfer-backend. */
+const PD_CLUSTER_KV_TRANSFER_BACKEND = "mooncake";
 
 /** Enum values mirrored from the SaFE Infera webhook. */
 const INFERA_FRAMEWORKS = new Set(["sglang", "vllm"]);
@@ -59,7 +76,7 @@ const RESERVED_EXTRA_ENV = new Set([
   "MN_SSH_PORT",
 ]);
 
-export type MultiNodeBackendFlag = "rayjob" | "infera";
+export type MultiNodeBackendFlag = TopologyBackend;
 export type PdMode = "aggregated" | "disaggregated";
 
 export interface MultiNodePromptSpec {
@@ -74,9 +91,9 @@ export interface MultiNodePromptSpec {
   image: string;
   /** `--extra-env K=V` entries (repeatable), injected into the cluster containers. */
   extraEnv: Record<string, string>;
-  /** `--model`; required by the infera frontend, unused by rayjob. */
+  /** `--model`; required by infera, atom, and sglangrouter, unused by rayjob. */
   model: string;
-  /** `--framework`, validated against the Infera enum. */
+  /** `--framework`. Atom router `--backend` and Infera `backendFramework`. */
   framework: string;
   /** `--pd-transfer-backend`, validated against the Infera KV enum. */
   kvTransferBackend: string;
@@ -85,6 +102,14 @@ export interface MultiNodePromptSpec {
   pdDecodeNodes: number;
   pdPrefillTp: number;
   pdDecodeTp: number;
+  /** `--server-args`, appended to each engine command. */
+  serverArgs: string;
+  /** `--pd-prefill-extra-args`, appended after serverArgs on prefill. */
+  pdPrefillExtraArgs: string;
+  /** `--pd-decode-extra-args`, appended after serverArgs on decode. */
+  pdDecodeExtraArgs: string;
+  /** `--pd-ib-device`. Empty when the prompt does not set one. */
+  pdIbDevice: string;
 }
 
 /**
@@ -138,6 +163,42 @@ function readEnumFlag(
   return allowed.has(raw) ? raw : fallback;
 }
 
+/**
+ * Read one argument string. A quoted value is taken whole, so the flags inside
+ * `--server-args "..."` stay part of that value.
+ */
+function readArgString(prompt: string, flag: string): string {
+  const re = new RegExp(`--${flag}(?:\\s+|=)\\s*`, "i");
+  const found = re.exec(prompt);
+  if (!found) return "";
+  let i = found.index + found[0].length;
+  // A leading backslash belongs to an escaped opener (`\"...\"`), not to the value.
+  const openerEscaped = prompt[i] === "\\";
+  if (openerEscaped) i += 1;
+  const quote = prompt[i];
+  if (quote === "\"" || quote === "'") {
+    i += 1;
+    let out = "";
+    while (i < prompt.length) {
+      const ch = prompt[i];
+      // The same escape that opened the value closes it. A plain quote still
+      // treats \" as a literal quote inside the value.
+      if (openerEscaped && ch === "\\" && prompt[i + 1] === quote) break;
+      if (ch === "\\" && (prompt[i + 1] === quote || prompt[i + 1] === "\\")) {
+        out += prompt[i + 1];
+        i += 2;
+        continue;
+      }
+      if (ch === quote) break;
+      out += ch;
+      i += 1;
+    }
+    return out.trim();
+  }
+  const bare = /\S+/.exec(prompt.slice(i))?.[0] ?? "";
+  return stripFlagDecoration(bare);
+}
+
 /** Read every occurrence of a repeatable flag (`--extra-env` is `action="append"`). */
 function readRepeatedFlag(prompt: string, flag: string): string[] {
   const re = new RegExp(`--${flag}[\\s=]+(\\S+)`, "gi");
@@ -186,10 +247,24 @@ export function requestedNodeCount(prompt: string): number {
   return readIntFlag(String(prompt ?? ""), "nodes", DEFAULT_NODES);
 }
 
+/** Default PD mode. Atom and SGLangRouter have no aggregated shape. */
+function defaultPdMode(backend: MultiNodeBackendFlag): PdMode {
+  return backendRequiresDisaggregatedPd(backend) ? "disaggregated" : "aggregated";
+}
+
+/** Default KV transfer. Atom and SGLangRouter engines are written for Mooncake. */
+function defaultKvTransferBackend(backend: MultiNodeBackendFlag): string {
+  return backendRequiresDisaggregatedPd(backend)
+    ? PD_CLUSTER_KV_TRANSFER_BACKEND
+    : DEFAULT_KV_TRANSFER_BACKEND;
+}
+
 /** `--mn-backend`, or null when the flag is absent or outside the enum. */
 function readBackendFlag(prompt: string): MultiNodeBackendFlag | null {
   const raw = (readFlag(prompt, "mn-backend") ?? "").toLowerCase();
-  return raw === "rayjob" || raw === "infera" ? raw : null;
+  return (TOPOLOGY_BACKENDS as readonly string[]).includes(raw)
+    ? (raw as MultiNodeBackendFlag)
+    : null;
 }
 
 /**
@@ -210,10 +285,10 @@ export function parseMultiNodePromptFlags(prompt: string): MultiNodePromptSpec |
   const backend = readBackendFlag(text);
   if (!backend) return null;
 
-  const pdMode: PdMode =
-    (readFlag(text, "pd-mode") ?? "").toLowerCase() === "disaggregated"
-      ? "disaggregated"
-      : "aggregated";
+  const pdModeFlag = (readFlag(text, "pd-mode") ?? "").toLowerCase();
+  const pdMode: PdMode = pdModeFlag === "disaggregated" || pdModeFlag === "aggregated"
+    ? pdModeFlag
+    : defaultPdMode(backend);
 
   return {
     nodes,
@@ -229,23 +304,97 @@ export function parseMultiNodePromptFlags(prompt: string): MultiNodePromptSpec |
       text,
       "pd-transfer-backend",
       INFERA_KV_BACKENDS,
-      DEFAULT_KV_TRANSFER_BACKEND,
+      defaultKvTransferBackend(backend),
     ),
     pdMode,
     pdPrefillNodes: readIntFlag(text, "pd-prefill-nodes", 0),
     pdDecodeNodes: readIntFlag(text, "pd-decode-nodes", 0),
     pdPrefillTp: readIntFlag(text, "pd-prefill-tp", 0),
     pdDecodeTp: readIntFlag(text, "pd-decode-tp", 0),
+    serverArgs: readArgString(text, "server-args"),
+    pdPrefillExtraArgs: readArgString(text, "pd-prefill-extra-args"),
+    pdDecodeExtraArgs: readArgString(text, "pd-decode-extra-args"),
+    pdIbDevice: readArgString(text, "pd-ib-device"),
   };
 }
 
-/** Fail fast when infera multi-node is missing the required --model flag. */
-export function assertMultiNodeInferaModel(spec: MultiNodePromptSpec): void {
-  if (spec.backend === "infera" && !spec.model.trim()) {
-    throw new Error(
-      "multi-node infera request requires --model (infera frontend --router-tokenizer-path)",
-    );
+/**
+ * Fail fast when a backend that launches from `--model` is missing it, and when
+ * Atom/SGLangRouter are asked for a topology they cannot provision.
+ *
+ * Infera's frontend takes the path as `--router-tokenizer-path`. Atom and
+ * SGLangRouter prefill and decode take it as `--model-path`. Either cluster
+ * would otherwise come up and then fail to serve.
+ */
+export function assertMultiNodeModel(spec: MultiNodePromptSpec): void {
+  if (backendRequiresModel(spec.backend)) {
+    if (!spec.model.trim()) {
+      const where = spec.backend === "infera"
+        ? "infera frontend --router-tokenizer-path"
+        : `${spec.backend} prefill/decode --model-path`;
+      const code = spec.backend === "infera" ? "infera_model_missing" : "mn_model_missing";
+      throw new SandboxFailure(code, `model is required (${where})`);
+    }
   }
+  if (backendRequiresDisaggregatedPd(spec.backend)) {
+    assertPdClusterPrompt(spec);
+  }
+}
+
+/**
+ * Atom/SGLangRouter are a router + prefill + decode cluster. Aggregated mode
+ * is refused, and `--nodes` must match the GPU roles that will be created.
+ */
+export function assertPdClusterPrompt(spec: {
+  backend: string;
+  pdMode: string;
+  framework: string;
+  nodes: number;
+  gpusPerNode: number;
+  pdPrefillNodes: number;
+  pdDecodeNodes: number;
+  pdPrefillTp: number;
+  pdDecodeTp: number;
+}): void {
+  const problem = pdClusterProblems(spec)[0];
+  if (problem) throw pdClusterFailure(spec.backend, problem);
+}
+
+function pdClusterFailure(backend: string, problem: PdClusterProblem): SandboxFailure {
+  return new SandboxFailure("mn_config_invalid", pdClusterPromptMessage(backend, problem));
+}
+
+function pdClusterPromptMessage(backend: string, problem: PdClusterProblem): string {
+  switch (problem.kind) {
+    case "pd_mode":
+      return `${backend} requires --pd-mode disaggregated (got ${problem.got})`;
+    case "partial_roles":
+      return `${backend} requires both --pd-prefill-nodes and --pd-decode-nodes when either is set`;
+    case "min_nodes":
+      return `${backend} requires --nodes >= 2`;
+    case "role_sum":
+      return `${backend}: --nodes (${problem.nodes}) must equal prefill+decode GPU nodes (${problem.total})`;
+    case "tp":
+      return `${backend}: --pd-${problem.role}-tp (${problem.tp}) exceeds --gpus-per-node (${problem.gpus}); cross-pod TP is not supported`;
+  }
+}
+
+/**
+ * Prefill/decode replica counts for an Atom/SGLangRouter cluster.
+ *
+ * Explicit `--pd-*-nodes` win when either is set (both required). Otherwise
+ * `--nodes` is split evenly across the two GPU roles so Hyperloom's
+ * INFERENCE_OPTIMIZER_NODES matches the pods that will exist.
+ */
+export function resolvePdClusterReplicas(spec: {
+  nodes: number;
+  pdPrefillNodes: number;
+  pdDecodeNodes: number;
+  backend?: string;
+}): { prefill: number; decode: number } {
+  const split = splitPdReplicas(spec.nodes, spec.pdPrefillNodes, spec.pdDecodeNodes);
+  if (!split.ok) throw pdClusterFailure(spec.backend ?? "pd-cluster", split.problem);
+  return { prefill: split.prefill, decode: split.decode };
 }
 
 /** Ephemeral storage per node in GiB, for the SaFE workload bodies. */
@@ -275,12 +424,16 @@ export function specFromTopology(topology: EnvironmentTopology): MultiNodePrompt
     extraEnv,
     model: (topology.model ?? "").trim(),
     framework: topology.framework ?? DEFAULT_FRAMEWORK,
-    kvTransferBackend: topology.pd_transfer_backend ?? DEFAULT_KV_TRANSFER_BACKEND,
-    pdMode: topology.pd_mode ?? "aggregated",
+    kvTransferBackend: topology.pd_transfer_backend ?? defaultKvTransferBackend(topology.backend),
+    pdMode: topology.pd_mode ?? defaultPdMode(topology.backend),
     pdPrefillNodes: topology.pd_prefill_nodes ?? 0,
     pdDecodeNodes: topology.pd_decode_nodes ?? 0,
     pdPrefillTp: topology.pd_prefill_tp ?? 0,
     pdDecodeTp: topology.pd_decode_tp ?? 0,
+    serverArgs: (topology.server_args ?? "").trim(),
+    pdPrefillExtraArgs: (topology.pd_prefill_extra_args ?? "").trim(),
+    pdDecodeExtraArgs: (topology.pd_decode_extra_args ?? "").trim(),
+    pdIbDevice: (topology.pd_ib_device ?? "").trim(),
   };
 }
 
@@ -295,13 +448,42 @@ export function specFromTopology(topology: EnvironmentTopology): MultiNodePrompt
  *
  * @throws when `topology` is present and does not validate.
  */
+/**
+ * Code for a declaration the validator refused, taken from the same shape
+ * rules the builder uses. Absent when the refusal is not one of those.
+ */
+function declaredFailureCode(raw: unknown): string | null {
+  if (!raw || typeof raw !== "object") return null;
+  const body = raw as Record<string, unknown>;
+  const backend = typeof body.backend === "string" ? body.backend : "";
+  if (!(TOPOLOGY_BACKENDS as readonly string[]).includes(backend)) return null;
+  const known = backend as TopologyBackend;
+  if (backendRequiresModel(known) && !String(body.model ?? "").trim()) {
+    return known === "infera" ? "infera_model_missing" : "mn_model_missing";
+  }
+  if (!backendRequiresDisaggregatedPd(known)) return null;
+  const problems = pdClusterProblems({
+    backend: known,
+    pdMode: typeof body.pd_mode === "string" ? body.pd_mode : undefined,
+    nodes: typeof body.nodes === "number" ? body.nodes : 0,
+    gpusPerNode: typeof body.gpus_per_node === "number" ? body.gpus_per_node : undefined,
+    pdPrefillNodes: typeof body.pd_prefill_nodes === "number" ? body.pd_prefill_nodes : undefined,
+    pdDecodeNodes: typeof body.pd_decode_nodes === "number" ? body.pd_decode_nodes : undefined,
+    pdPrefillTp: typeof body.pd_prefill_tp === "number" ? body.pd_prefill_tp : undefined,
+    pdDecodeTp: typeof body.pd_decode_tp === "number" ? body.pd_decode_tp : undefined,
+  });
+  return problems.length ? "mn_config_invalid" : null;
+}
+
 export function resolveTopology(
   request: { prompt?: string; topology?: unknown },
 ): MultiNodePromptSpec | null {
   if (request.topology !== undefined && request.topology !== null) {
     const checked = validateTopology(request.topology);
     if (!checked.ok) {
-      throw new Error(`invalid topology: ${checked.errors.join("; ")}`);
+      const message = `invalid topology: ${checked.errors.join("; ")}`;
+      const code = declaredFailureCode(request.topology);
+      throw code ? new SandboxFailure(code, message) : new Error(message);
     }
     return checked.value.nodes >= 2 ? specFromTopology(checked.value) : null;
   }
