@@ -41,7 +41,7 @@ record it.
   `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `SAFE_API_KEY` out of its environment, whichever layer sets them, while it
   still uses the keys for the model and for SaFE; a sandbox the session already has that holds them is replaced rather
   than reused, and a hosted application run is refused for such a session (409
-  `app_run_not_allowed_for_acting_session`; Brain ends one admitted earlier). Nothing changes for any other session,
+  `app_run_not_allowed_for_acting_session`; Brain winds up one admitted earlier). Nothing changes for any other session,
   and no sandbox fingerprint stored before this is disturbed. See `claw/docs/github-review.md`.
 - Brain now enforces `ExecuteRequest.tools_allowlist`, which it used to ignore. A run whose request carries a
   non-empty list is offered only the tools it names, and a call outside the list is refused with an error

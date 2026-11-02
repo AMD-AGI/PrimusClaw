@@ -4429,23 +4429,6 @@ class TaskRunner {
   }
 
   /**
-   * Ends an app run's row without making its sandbox, and fails the task. A runner is made only to close the row, with no key: nothing
-   * here asks SaFE for anything. Any sandbox an earlier worker made is not stopped from here; it ends with its workload time limit.
-   */
-  private async endAppRunUnrun(runId: string, epoch: number, why: { ended: string; failure: string; leftOpen: string }): Promise<never> {
-    const closed = await fx().createAppRunner(runId, "", epoch)
-      .markEnded(why.ended)
-      .catch((err) => { logger.error({ err: String(err?.message ?? err), taskId: runId }, "task.app_run_close_failed"); return false; });
-    if (!closed) {
-      // The row was not closed (another worker holds it, or it could not be written):
-      // it is not `ended`, so this is not the terminal AppRunFailedError.
-      logger.error({ taskId: runId }, why.leftOpen);
-      throw new Error(why.failure);
-    }
-    throw new AppRunFailedError(why.failure);
-  }
-
-  /**
    * A run of mode `app`: the AppRunner drives the application in its own
    * sandbox under this run's lease, which the heartbeat started in `run()`
    * keeps renewing. There is no Hands, no engine and no workspace sync here.
@@ -4469,21 +4452,26 @@ class TaskRunner {
       logger.error({ taskId: runId }, "task.app_finish_only_without_platform_key");
       throw new FinishOnlyHandOver("no platform key");
     }
-    // A session that acts as a user is not given a hosted application's sandbox, which is made with the owner's model key (the API refuses
-    // to admit one). A run admitted before it did is ended here, before anything is made. Not a finish-only dispatch: that only tears down.
-    if (this.request.withhold_sandbox_keys === true && !finishOnly) {
-      await this.endAppRunUnrun(runId, epoch, {
-        ended: "a hosted application is not run for a session that acts as a user",
-        failure: "a hosted application is not run for a session that acts as a user",
-        leftOpen: "task.app_run_row_left_open_acting_session",
-      });
-    }
     if (!this.platformKey) {
-      await this.endAppRunUnrun(runId, epoch, {
-        ended: "the session owner's platform key is not available to this worker",
-        failure: "an app run needs the session owner's platform key",
-        leftOpen: "task.app_run_row_left_open_no_platform_key",
-      });
+      const closed = await fx().createAppRunner(runId, "", epoch)
+        .markEnded("the session owner's platform key is not available to this worker")
+        .catch((err) => { logger.error({ err: String(err?.message ?? err), taskId: runId }, "task.app_run_close_failed"); return false; });
+      // Any sandbox an earlier worker made is not stopped from here (no key to
+      // stop it with); it ends with its workload time limit.
+      if (!closed) {
+        // The row was not closed (another worker holds it, or it could not be written):
+        // it is not `ended`, so this is not the terminal AppRunFailedError.
+        logger.error({ taskId: runId }, "task.app_run_row_left_open_no_platform_key");
+        throw new Error("an app run needs the session owner's platform key");
+      }
+      throw new AppRunFailedError("an app run needs the session owner's platform key");
+    }
+    // A session that acts as a user is not given a hosted application's sandbox, which is made with the owner's model key (the API refuses
+    // to admit one). A run admitted before it did is wound up here instead of started: whatever sandbox an earlier worker made is stopped and
+    // the grant revoked, as for a cancel, and the row is ended. Not a finish-only dispatch: that is this already.
+    if (this.request.withhold_sandbox_keys === true && !finishOnly) {
+      await fx().createAppRunner(runId, this.platformKey, epoch).finishNow("cancelled");
+      throw new AppRunFailedError("a hosted application is not run for a session that acts as a user");
     }
     const runner = fx().createAppRunner(runId, this.platformKey, epoch);
     // A finish-only dispatch is not a run starting: the task is already over as far as the

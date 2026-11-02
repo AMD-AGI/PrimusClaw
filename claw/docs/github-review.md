@@ -234,12 +234,14 @@ the key for what it does itself, the model calls and the workload it creates and
 the sandbox cannot do is call the model or SaFE as the requester: a review reads and runs code, it does not need
 to. The three variables are taken out of the environment once it is composed, whichever layer set them (the
 sandbox spec's, the requester's own stored variables, the request's); every other variable is applied as before.
-A sandbox that already exists for the session and holds the keys (one made before the mark existed) is not reused
-for a marked turn: the mark is part of what a sandbox is reused by, so the turn gets a new one, and the fingerprint of
-a sandbox made without the mark is unchanged. A hosted application run (`mode: "app"`) is refused for such a session
-(`409 app_run_not_allowed_for_acting_session`), and Brain ends one that was admitted before that refusal existed instead
-of starting it: an application's sandbox is made with the key, and an application is code the session's model can hand
-text to.
+The session's own sandbox, if it holds the keys (one made before the mark existed), is not reused for a marked turn:
+the mark is part of what a sandbox is reused by, so the turn gets a new one, and the fingerprint of a sandbox made
+without the mark is unchanged. A sandbox that a DAG handle names is looked up before that comparison, so a session that
+acts as a user and was already running tasks on a Brain without the mark should be created again rather than
+continued; a session created with the mark never has one. A hosted application run (`mode: "app"`) is refused for such
+a session (`409 app_run_not_allowed_for_acting_session`), and Brain winds up one that was admitted before that refusal
+existed (stops its sandbox, revokes its grant, ends the run) instead of starting it: an application's sandbox is made
+with the key, and an application is code the session's model can hand text to.
 The key stays where the session already keeps it (the session's stored configuration, server-managed), and is not
 shown to the model or the sandbox. Nothing changes while `CLAW_GITHUB_REVIEW_ENABLED` is off: such a session is
 an ordinary one.
