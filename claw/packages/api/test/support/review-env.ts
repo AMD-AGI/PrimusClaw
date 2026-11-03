@@ -42,7 +42,7 @@ export interface ReviewEnv {
 
 /** The acting user (`bob`) has bound GitHub and lets others act for them, which most tests need; a test for the switch being off says `delegation: false`. */
 export function credential(over: Partial<ResolvedCredential> = {}): ResolvedCredential {
-  return { token: TOKEN, providerLogin: "bob", kind: "oauth", scopes: ["public_repo"], delegation: true, reviewMode: "high_risk_confirm", expiresAt: null, ...over };
+  return { token: TOKEN, providerLogin: "bob", kind: "oauth", scopes: ["public_repo"], delegation: true, expiresAt: null, ...over };
 }
 
 /**
@@ -64,7 +64,7 @@ export async function closeShared(): Promise<void> {
 
 export async function reviewEnv(env: Record<string, string> = {}, over: { actor?: Partial<ReviewActor>; cred?: Partial<ResolvedCredential> } = {}): Promise<ReviewEnv> {
   const pg = (shared ??= new PGlite());
-  await pg.exec("DROP TABLE IF EXISTS claw_github_audit, claw_github_confirmations, claw_sessions");
+  await pg.exec("DROP TABLE IF EXISTS claw_github_audit, claw_github_confirmations, claw_github_review_settings, claw_sessions");
   await pg.exec("CREATE TABLE claw_sessions (session_id TEXT PRIMARY KEY, user_id TEXT, config JSONB DEFAULT '{}'::jsonb, deleted_at TIMESTAMPTZ)");
   for (const sql of GITHUB_REVIEW_SCHEMA_SQL) await pg.exec(sql);
   const db: Queryable = {

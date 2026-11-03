@@ -43,17 +43,6 @@ test("the request names the user, the provider, who asked and why, and authentic
   });
 });
 
-test("the review mode is read from the binding, and a binding without one, or with a value that is not a mode, is high_risk_confirm", async () => {
-  await withHarness(async ({ fake, client }) => {
-    for (const [sent, want] of [[undefined, "high_risk_confirm"], ["fully_auto", "fully_auto"], ["high_risk_confirm", "high_risk_confirm"], ["FULLY_AUTO", "high_risk_confirm"], [true, "high_risk_confirm"]] as const) {
-      fake.resolveCredential = () => ({ body: sent === undefined ? GRANT : { ...GRANT, review_mode: sent } });
-      const got = await client.resolveExternalCredential({ userId: "u-1", provider: "github" });
-      assert.equal(got.reviewMode, want, String(sent));
-      assert.equal(got.delegation, true, "the mode says nothing about whether others may ask");
-    }
-  });
-});
-
 test("members the caller did not give are not sent", async () => {
   await withHarness(async ({ fake, client }) => {
     fake.resolveCredential = () => ({ body: GRANT });

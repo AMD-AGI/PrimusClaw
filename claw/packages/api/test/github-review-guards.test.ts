@@ -21,6 +21,7 @@ import assert from "node:assert/strict";
 import test, { after, afterEach, beforeEach, describe } from "node:test";
 import { LEGACY_REPO_CONFIG_STEM, LEGACY_RUN_MARKER_PREFIX } from "../src/github-review/legacy-names.js";
 import type { ToolOutcome } from "../src/github-review/service.js";
+import { setReviewMode } from "../src/github-review/store.js";
 import { HEAD } from "./support/fake-github.js";
 import { PR, REQUESTER_TOKEN, TOKEN, closeShared, credential, directory, down, reviewEnv as makeEnv, unbound, type ReviewEnv } from "./support/review-env.js";
 
@@ -53,15 +54,16 @@ const inline = { path: ".github/workflows/ci.yml", line: 2, body: "This runs unt
 const EVENTS = ["COMMENT", "REQUEST_CHANGES", "APPROVE"] as const;
 const stages = (o: { gh: ReviewEnv["gh"] }): string[] => o.gh.writes.map((w) => `${w.method} ${w.path.split("/").slice(-1)[0]}`);
 
-describe("K the acting user's review mode, from their GitHub binding, whoever asked", () => {
+describe("K the acting user's review mode, their own setting in Claw, whoever asked", () => {
   const MODES = ["high_risk_confirm", "fully_auto", undefined] as const;
   const WHO = [["someone else asks", {}], ["the acting user asks for their own account", { requesterUserId: "u-bob" }]] as const;
   const JUDGED = [["low", { level: "low", reason: "an ordinary change" }], ["high", { level: "high", reason: "changes what callers see on shutdown" }]] as const;
   for (const mode of MODES) for (const [who, actor] of WHO) for (const [said, judgement] of JUDGED) for (const workflow of [false, true]) for (const always of [false, true]) {
-    // A binding without the setting is high_risk_confirm. fully_auto holds only what the repository itself requires.
+    // No setting is high_risk_confirm. fully_auto holds only what the repository itself requires.
     const held = always || ((mode ?? "high_risk_confirm") === "high_risk_confirm" && (said === "high" || workflow));
-    test(`K ${mode ?? "no mode on the binding"}, ${who}, judged ${said}${workflow ? ", a workflow change" : ""}${always ? `, the repository's ${LEGACY_REPO_CONFIG_STEM}.yml says confirm_merge: always` : ""} -> ${held ? "held" : "merged"}`, async () => {
-      e = await env({}, { actor, cred: mode ? { reviewMode: mode } : { reviewMode: undefined as never } });
+    test(`K ${mode ?? "no mode set"}, ${who}, judged ${said}${workflow ? ", a workflow change" : ""}${always ? `, the repository's ${LEGACY_REPO_CONFIG_STEM}.yml says confirm_merge: always` : ""} -> ${held ? "held" : "merged"}`, async () => {
+      e = await env({}, { actor });
+      if (mode) await setReviewMode(e.db, "u-bob", mode);
       if (workflow) highRisk();
       if (always) e.gh.contents[`.github/${LEGACY_REPO_CONFIG_STEM}.yml`] = "confirm_merge: always\n";
       const o = await merge({ risk_judgement: judgement });
@@ -82,7 +84,7 @@ describe("K the acting user's review mode, from their GitHub binding, whoever as
   }
 
   test("K gh_pr_get and gh_pr_risk say which mode applies and what it holds; delegation is a separate question", async () => {
-    e = await env({}, { cred: { reviewMode: "fully_auto" } });
+    await setReviewMode(e.db, "u-bob", "fully_auto");
     highRisk();
     const got = (await get()).body as any;
     assert.equal(got.acting.review_mode, "fully_auto");
@@ -92,8 +94,11 @@ describe("K the acting user's review mode, from their GitHub binding, whoever as
     assert.match(got.risk.hard_holds.join(), /workflow/);
     const risk = (await e.service.assessPr(e.actor, { pr: PR, risk_judgement: { level: "high", reason: "x" } })).body.risk as any;
     assert.deepEqual([risk.level, risk.reasons, risk.review_mode], ["low", [], "fully_auto"]);
-    e = await env({}, { cred: { reviewMode: "fully_auto", delegation: false } });
+    e = await env({}, { cred: { delegation: false } });
+    await setReviewMode(e.db, "u-bob", "fully_auto");
     assert.equal(reason(await merge()), "delegation_off", "fully_auto does not let others ask: that is delegation's");
+    const [audit] = await e.sql("SELECT review_mode FROM claw_github_audit");
+    assert.equal(audit?.review_mode, "fully_auto", "a refused call records the mode too");
   });
 });
 

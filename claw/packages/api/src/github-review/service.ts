@@ -22,7 +22,7 @@
  */
 import { createHash } from "node:crypto";
 import pino from "pino";
-import { IdentityCredentialRefusedError, IdentityUnavailableError, parseReviewMode, type CredentialReviewMode, type ResolveCredentialRequest, type ResolvedCredential } from "@claw/utils";
+import { IdentityCredentialRefusedError, IdentityUnavailableError, type ResolveCredentialRequest, type ResolvedCredential } from "@claw/utils";
 import { evaluateChecks, hasMergeQueueRule, requiredContextsFromRules, type ChecksVerdict } from "./checks.js";
 import { commentableLines } from "./diff.js";
 import { GithubClient, GithubError, GithubGraphqlError, parsePrRef, repoPath, type PrRef } from "./github.js";
@@ -35,8 +35,8 @@ import { SANDBOX_RECIPE_USAGE, buildSandboxRecipe } from "./sandbox-recipe.js";
 import { GITHUB_PROVIDER, type GithubReviewSettings } from "./settings.js";
 import {
   auditFinish, auditStart, claimConfirmation, finishConfirmation, getConfirmation, openConfirmation,
-  countPendingConfirmations, heldOrDeniedOn, recentWrites, reopenConfirmation, reserveWrite, reviewDigest, sessionRequestCount,
-  type Confirmation, type DecidedVia, type HeldReview, type Queryable, type ReviewComment, type ReviewEvent,
+  countPendingConfirmations, getReviewMode, heldOrDeniedOn, recentWrites, reopenConfirmation, reserveWrite, reviewDigest, sessionRequestCount,
+  type Confirmation, type DecidedVia, type HeldReview, type Queryable, type ReviewComment, type ReviewEvent, type ReviewMode,
 } from "./store.js";
 
 const logger = pino({ name: "github-review" });
@@ -85,8 +85,8 @@ export interface ReviewDeps {
 interface Ctx {
   actor: ReviewActor;
   settings: GithubReviewSettings;
-  /** `mode` is the acting user's own review mode, from their GitHub binding: it decides their holds whoever asked (see `holdFor`). */
-  cred: { login: string; scopes: string[]; delegation: boolean; mode: CredentialReviewMode };
+  /** `mode` is the acting user's own review mode (store.ts getReviewMode): it decides their holds whoever asked (see `holdFor`). */
+  cred: { login: string; scopes: string[]; delegation: boolean; mode: ReviewMode };
   client: GithubClient;
   /** The tool being run, as the identity provider's audit trail names the purpose of a lookup. */
   tool: string;
@@ -94,7 +94,7 @@ interface Ctx {
   auditId: number;
   acc: {
     repo?: string; pr?: number; headSha?: string; riskReasons?: string[]; confirmationId?: string;
-    write: boolean; dryRun: boolean; reviewPath?: string; reviewPathReason?: string; reviewMode?: CredentialReviewMode;
+    write: boolean; dryRun: boolean; reviewPath?: string; reviewPathReason?: string; reviewMode?: ReviewMode;
     /** The audit row has been marked as a write, so it already counts against the limits. */
     reserved?: boolean;
   };
@@ -546,6 +546,9 @@ export class GithubReview {
       }
       this.inflight.set(held, (this.inflight.get(held) ?? 0) + 1);
       const cred = await this.credential(actor.actorUserId, actor, tool);
+      // The acting user's own setting, read for every call and recorded on its audit row, a refused one included.
+      const { mode } = await getReviewMode(this.deps.db, actor.actorUserId);
+      acc.reviewMode = mode;
       // Every tool acts with the acting user's account, reads included, so every tool needs their say: the
       // person who asked for their own account needs no one's permission, anyone else needs the owner's switch
       // (their standing authorization). The owner's own "allow" to one held write is that say for that write.
@@ -556,9 +559,8 @@ export class GithubReview {
       client = new GithubClient({ token: cred.token, apiUrl: settings.apiUrl, fetchImpl: this.deps.fetchImpl });
       const ctx: Ctx = {
         actor, settings, client, tool, auditId, acc,
-        cred: { login: cred.providerLogin, scopes: cred.scopes, delegation: cred.delegation, mode: parseReviewMode(cred.reviewMode) },
+        cred: { login: cred.providerLogin, scopes: cred.scopes, delegation: cred.delegation, mode },
       };
-      acc.reviewMode = ctx.cred.mode;
       outcome = await body(ctx, ref);
     } catch (err) {
       outcome = this.errorOutcome(err, client);
@@ -750,7 +752,7 @@ export class GithubReview {
   }
 
   /**
-   * Whether this write waits for the acting user, under their own review mode (from their GitHub binding, whoever asked, the acting user
+   * Whether this write waits for the acting user, under their own review mode (their own setting, getReviewMode, whoever asked, the acting user
    * themselves included): `high_risk_confirm` holds what assessRisk holds, `fully_auto` only the repository's own requirement. Under
    * either, an approval or a merge of a head commit for which an earlier one already waits for the acting user, is being decided by them,
    * or was refused by them is held as well: a later call with a lower judgement, or the other of the two tools, must not get past their

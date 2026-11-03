@@ -90,14 +90,50 @@ export const GITHUB_REVIEW_SCHEMA_SQL = [
       review_path         TEXT,
       review_path_reason  TEXT
     )`,
-  // The acting user's review mode the call ran under (`high_risk_confirm` or `fully_auto`, from their GitHub binding).
+  // The acting user's review mode the call ran under (`high_risk_confirm` or `fully_auto`, their own setting in claw_github_review_settings).
   `ALTER TABLE claw_github_audit ADD COLUMN IF NOT EXISTS review_mode TEXT`,
   `CREATE INDEX IF NOT EXISTS idx_github_audit_actor ON claw_github_audit(actor_user_id, at DESC)`,
+  // A person's own review mode for writes made with their GitHub account (see {@link getReviewMode}); no row is the default.
+  `CREATE TABLE IF NOT EXISTS claw_github_review_settings (
+      user_id      TEXT PRIMARY KEY,
+      review_mode  TEXT NOT NULL CHECK (review_mode IN ('high_risk_confirm', 'fully_auto')),
+      updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`,
   `CREATE INDEX IF NOT EXISTS idx_github_audit_session ON claw_github_audit(session_id)`,
 ];
 
 export async function ensureGithubReviewSchema(client: pg.PoolClient): Promise<void> {
   for (const sql of GITHUB_REVIEW_SCHEMA_SQL) await client.query(sql);
+}
+
+// ---------------------------------------------------------------- review mode
+
+/**
+ * How a person wants a held approval or merge made with their GitHub account confirmed, whoever asked: `high_risk_confirm` asks them
+ * when the change needs a person, `fully_auto` only for what the repository itself requires. Their own setting, kept here by their
+ * Claw user id; whether others may ask at all is the identity provider's `delegation`, not this.
+ */
+export type ReviewMode = "high_risk_confirm" | "fully_auto";
+export const REVIEW_MODES: readonly ReviewMode[] = ["high_risk_confirm", "fully_auto"];
+export const DEFAULT_REVIEW_MODE: ReviewMode = "high_risk_confirm";
+
+/** The person's review mode; the default when they never set one. */
+export async function getReviewMode(db: Queryable, userId: string): Promise<{ mode: ReviewMode; updatedAt: string | null }> {
+  const r = await db.query("SELECT review_mode, updated_at FROM claw_github_review_settings WHERE user_id = $1", [userId]);
+  const row = r.rows[0] as { review_mode?: string; updated_at?: Date | string } | undefined;
+  if (!row || row.review_mode !== "fully_auto") return { mode: DEFAULT_REVIEW_MODE, updatedAt: row?.updated_at ? new Date(row.updated_at).toISOString() : null };
+  return { mode: "fully_auto", updatedAt: new Date(row.updated_at as Date | string).toISOString() };
+}
+
+export async function setReviewMode(db: Queryable, userId: string, mode: ReviewMode): Promise<{ mode: ReviewMode; updatedAt: string }> {
+  const r = await db.query(
+    `INSERT INTO claw_github_review_settings (user_id, review_mode) VALUES ($1, $2)
+     ON CONFLICT (user_id) DO UPDATE SET review_mode = EXCLUDED.review_mode, updated_at = NOW()
+     RETURNING review_mode, updated_at`,
+    [userId, mode],
+  );
+  const row = r.rows[0] as { review_mode: ReviewMode; updated_at: Date | string };
+  return { mode: row.review_mode, updatedAt: new Date(row.updated_at).toISOString() };
 }
 
 // ---------------------------------------------------------------- audit

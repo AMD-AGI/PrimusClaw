@@ -123,10 +123,9 @@ review and the merge and who is the reviewer of record, and whose own standing a
   own review mode (next item) decides what holds. A held approval is posted alone: to approve and merge in
   one confirmation, a model calls `gh_pr_merge`.
 - **The acting user's review mode.** How a held write is confirmed is the acting user's own setting, kept
-  on their GitHub binding at the identity provider and returned with the credential (`review_mode` in the
-  `/oauth/external-credentials/resolve` answer). It applies to every review and merge made with their
-  account, whoever asked, the acting user themselves included:
-  - `high_risk_confirm` (the default, and what a binding without the setting means): an `APPROVE` or a
+  in Claw by their user id (`claw_github_review_settings`, see "Review mode" below). It applies to every
+  review and merge made with their account, whoever asked, the acting user themselves included:
+  - `high_risk_confirm` (the default, and what a person who never set one has): an `APPROVE` or a
     merge is held as "High risk" says, for the reviewer's judgement, its flags or a hard hold;
   - `fully_auto`: nothing is held except what the repository itself requires (`risk.repo_holds`: its
     configuration's `confirm_merge: always` or a `high_risk_paths` match, a configuration that does not
@@ -136,12 +135,10 @@ review and the merge and who is the reviewer of record, and whose own standing a
     stand as ever.
 
   It says nothing about who may ask: that stays the `delegation` flag (others may ask only when it is on).
-  A value that is not one of the two is `high_risk_confirm`. `gh_pr_get` (`acting.review_mode`,
+  `gh_pr_get` (`acting.review_mode`,
   `risk.review_mode`, `risk.repo_holds`) and `gh_pr_risk` show the mode in force, the audit row records it
   (`review_mode`), and an approval or a merge made under `fully_auto` answers `review_mode_note` ("made
-  under <login>'s fully automatic setting: nobody was asked to confirm it") for the report to repeat. The
-  setting is written where the binding is, at the identity provider, at bind time or later by its owner,
-  as `delegation` is; this API only reads it.
+  under <login>'s fully automatic setting: nobody was asked to confirm it") for the report to repeat.
 - **Merge queue.** A base branch that is merged through a merge queue refuses a direct merge, so there
   `gh_pr_merge` does not merge: after every gate of a merge has passed and the approval is on the pull
   request (or the acting user has allowed a held merge), it puts the pull request in the queue with the
@@ -283,6 +280,17 @@ review and the merge and who is the reviewer of record, and whose own standing a
 
   A merge or an approval that needs confirmation creates one pending row for the head commit and
   writes nothing.
+
+## Review mode
+
+| Route | What it does |
+|---|---|
+| `GET /v1/github-review/settings` | The caller's own review mode: `{ok: true, data: {review_mode, updated_at, review_modes}}`. `review_mode` is `high_risk_confirm` or `fully_auto`; with nothing set it is `high_risk_confirm` and `updated_at` is `null`. `review_modes` lists the values. Any signed-in caller; `401` without one |
+| `PUT /v1/github-review/settings` `{review_mode: "high_risk_confirm" \| "fully_auto"}` | Sets the caller's own review mode and answers as `GET` does. Given as a decision is (next section): the person's own identity-provider token, or the exchange token of a service an operator named in `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS`; an `ak-` key, a BYOK key, a connector token or a cookie is `403 interactive_sign_in_required`. Another value is `400` |
+
+Neither route names a user: what is read or set is always the caller's own, so nobody can change another
+person's mode. A chat integration sets it when the person binds GitHub and whenever they change it. It is
+independent of `delegation` (whether others may ask), which stays at the identity provider.
 
 ## Confirmations
 

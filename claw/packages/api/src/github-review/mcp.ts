@@ -35,7 +35,7 @@ import { classifyAttendedCaller } from "./attended.js";
 import { reviewTargetOf } from "./review-target.js";
 import { GithubReview, type ReviewActor, type ToolOutcome } from "./service.js";
 import { readGithubReviewSettings, type GithubReviewSettings } from "./settings.js";
-import { listConfirmations, type ConfirmationStatus, type Queryable } from "./store.js";
+import { REVIEW_MODES, getReviewMode, listConfirmations, setReviewMode, type ConfirmationStatus, type Queryable, type ReviewMode } from "./store.js";
 import { verifySessionToolToken } from "./token.js";
 
 const logger = pino({ name: "github-review-mcp" });
@@ -217,6 +217,32 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
     if (!UUID_RE.test(req.params.id)) return refuse(reply, 404, "not_found");
     const answer = await service.decide(user.userId, req.params.id, decision, caller.via);
     return reply.status(answer.http).send(answer.body);
+  });
+
+  // The caller's own review mode: there is no user in the path, so nobody can read or set another person's.
+  app.get("/v1/github-review/settings", async (req, reply) => {
+    const user = getUser(req);
+    if (!user) return refuse(reply, 401, "authentication required");
+    const { mode, updatedAt } = await getReviewMode(database, user.userId);
+    return { ok: true, data: { review_mode: mode, updated_at: updatedAt, review_modes: REVIEW_MODES } };
+  });
+
+  // Set as a decision is given: by the person signed in, or by a service an operator allowed to speak for them. A key a sandbox holds
+  // must not be able to switch its owner to fully_auto.
+  app.put("/v1/github-review/settings", async (req, reply) => {
+    const user = getUser(req);
+    if (!user) return refuse(reply, 401, "authentication required");
+    const method = getAuthMethod(req);
+    const caller = classifyAttendedCaller(method, user, settings().decisionClientIds);
+    if (!caller.ok) {
+      logger.warn({ userId: user.userId, method: method ?? "none", clientId: user.delegation?.clientId?.slice(0, 128) }, `github_review.settings_refused_${caller.error}`);
+      return refuse(reply, 403, caller.error);
+    }
+    const wanted = ((req.body ?? {}) as { review_mode?: unknown }).review_mode;
+    if (!REVIEW_MODES.includes(wanted as ReviewMode)) return refuse(reply, 400, `review_mode must be one of ${REVIEW_MODES.join(", ")}`);
+    const saved = await setReviewMode(database, user.userId, wanted as ReviewMode);
+    logger.info({ userId: user.userId, reviewMode: saved.mode, ...(caller.via ? { clientId: caller.via.clientId, actSub: caller.via.actorSub } : {}) }, "github_review.review_mode_set");
+    return { ok: true, data: { review_mode: saved.mode, updated_at: saved.updatedAt, review_modes: REVIEW_MODES } };
   });
 
   logger.info("github_review.routes_registered");
