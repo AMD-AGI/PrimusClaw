@@ -82,6 +82,14 @@ const DIGEST_CHUNK_BYTES = 48 * 1024;
 const STAT_TIMEOUT_SEC = 60;
 const DIGEST_TIMEOUT_SEC = 120;
 const STATE_TIMEOUT_SEC = 20;
+/**
+ * How long a record may go on standing in for a listing of the prefix. A prune
+ * by name cannot find an object the record does not name -- a write that raced
+ * the restore's listing, a checkpoint copy whose invalidation was not confirmed
+ * -- so once this long has passed since the prefix was last listed, the prune
+ * lists it again, and such an object lives at most this long.
+ */
+export const RELIST_AFTER_MS = 30 * 60 * 1000;
 
 /**
  * What a command prints, last, when the shell ran it to the end.
@@ -249,8 +257,20 @@ async function digestFiles(hands: HandsClient, paths: string[]): Promise<Map<str
   return out;
 }
 
+/**
+ * A manifest as read back: its entries, whether the write that produced it
+ * followed a prune that left nothing under the prefix outside the record (see
+ * `UploadDelta.recorded`), and when (Brain's clock, ms) the prefix was last
+ * listed to make that so; 0 when the record does not say.
+ */
+interface Manifest {
+  files: Map<string, Entry>;
+  pruned: boolean;
+  listed: number;
+}
+
 /** The manifest for this prefix, or null when there is none or it is not whole. */
-async function readManifest(hands: HandsClient, s3Prefix: string): Promise<Map<string, Entry> | null> {
+async function readManifest(hands: HandsClient, s3Prefix: string): Promise<Manifest | null> {
   let raw: string | null;
   try {
     raw = finishedOutput(await bash(hands, `cat ${statePrefix(s3Prefix)}.*.json 2>/dev/null; echo ${DONE}`, STATE_TIMEOUT_SEC));
@@ -262,11 +282,14 @@ async function readManifest(hands: HandsClient, s3Prefix: string): Promise<Map<s
   const seen = new Set<number>();
   let gen: string | undefined;
   let shards: number | undefined;
+  let pruned = true;
+  let listed: number | undefined;
   try {
     for (const line of raw.split("\n")) {
       if (!line.trim()) continue;
       const shard = JSON.parse(line) as {
-        v?: number; prefix?: string; gen?: string; n?: number; i?: number; files?: Record<string, unknown>;
+        v?: number; prefix?: string; gen?: string; n?: number; i?: number; pruned?: unknown; listed?: unknown;
+        files?: Record<string, unknown>;
       };
       if (shard.v !== MANIFEST_VERSION || shard.prefix !== s3Prefix) return null;
       if (typeof shard.gen !== "string" || typeof shard.n !== "number" || typeof shard.i !== "number") return null;
@@ -275,6 +298,10 @@ async function readManifest(hands: HandsClient, s3Prefix: string): Promise<Map<s
       if (gen === undefined) { gen = shard.gen; shards = shard.n; }
       if (shard.gen !== gen || shard.n !== shards || seen.has(shard.i)) return null;
       seen.add(shard.i);
+      // Every shard has to say so; a record written before the flag existed does not.
+      if (shard.pruned !== true) pruned = false;
+      const at = typeof shard.listed === "number" && Number.isFinite(shard.listed) ? shard.listed : 0;
+      listed = listed === undefined ? at : Math.min(listed, at);
       for (const [path, e] of Object.entries(shard.files ?? {})) {
         if (!Array.isArray(e) || e.length !== 4 || e.some((x) => typeof x !== "string")) return null;
         files.set(path, e as Entry);
@@ -285,7 +312,7 @@ async function readManifest(hands: HandsClient, s3Prefix: string): Promise<Map<s
   }
   if (shards === undefined || seen.size !== shards) return null;
   for (let i = 0; i < shards; i++) if (!seen.has(i)) return null;
-  return files;
+  return { files, pruned, listed: listed ?? 0 };
 }
 
 /**
@@ -399,20 +426,21 @@ async function tryInvalidate(hands: HandsClient, s3Prefix: string, timeoutSec: n
 }
 
 async function writeManifest(
-  hands: HandsClient, s3Prefix: string, entries: Map<string, Entry>, shardFiles: number,
+  hands: HandsClient, s3Prefix: string, entries: Map<string, Entry>, shardFiles: number, pruned: boolean, listed: number,
 ): Promise<boolean> {
   const rows = [...entries].map(([path, e]) => [rel(path), e] as const);
   const n = Math.max(1, Math.ceil(rows.length / shardFiles));
   const gen = randomBytes(8).toString("hex");
   for (let i = 0; i < n; i++) {
-    const files: Record<string, Entry> = {};
-    for (const [path, e] of rows.slice(i * shardFiles, (i + 1) * shardFiles)) files[path] = e;
+    // Defined, not assigned: a file called `__proto__` assigned into an object
+    // literal sets its prototype and never reaches the JSON.
+    const files: Record<string, Entry> = Object.fromEntries(rows.slice(i * shardFiles, (i + 1) * shardFiles));
     const out = await withHandsTimeout<string>(
       hands,
       "write",
       {
         path: `${statePrefix(s3Prefix)}.${i}.json`,
-        contents: `${JSON.stringify({ v: MANIFEST_VERSION, prefix: s3Prefix, gen, n, i, files })}\n`,
+        contents: `${JSON.stringify({ v: MANIFEST_VERSION, prefix: s3Prefix, gen, n, i, pruned, listed, files })}\n`,
       },
       STATE_TIMEOUT_SEC * 1000,
     );
@@ -422,16 +450,56 @@ async function writeManifest(
   return true;
 }
 
+/**
+ * Record, in a sandbox just restored from `s3Prefix`, what the restore's listing
+ * found there: every object a prune could ever delete, as a path the record
+ * names. The stats are left blank, so the first sync still uploads every file
+ * (a restored file's times are the download's, which says nothing about S3);
+ * what it saves is the listing in that sync's prune, which on a large session
+ * is the longest part of it. `listedAt` is when that listing started. Never
+ * throws; a record it cannot write is a sync that lists, as before.
+ */
+export async function seedSyncManifest(
+  hands: HandsClient, s3Prefix: string, rels: readonly string[], listedAt: number,
+): Promise<void> {
+  try {
+    if (!(await invalidateSyncManifest(hands, s3Prefix))) return;
+    const blank: Entry = ["", "", "", ""];
+    const entries = new Map(rels.map((r) => [`${WORKSPACE_ROOT}${r}`, blank] as const));
+    if (!(await writeManifest(hands, s3Prefix, entries, SHARD_FILES, true, listedAt))) {
+      await invalidateSyncManifest(hands, s3Prefix);
+    }
+  } catch (e) {
+    logger.warn({ err: (e as Error)?.message ?? String(e), s3Prefix }, "s3.sync_delta.seed_failed");
+    await invalidateSyncManifest(hands, s3Prefix).catch(() => false);
+  }
+}
+
 export interface UploadDelta {
   /** The files to upload, in listing order. */
   pending: string[];
   /** Files the manifest vouches are already in S3 as they are now. */
   unchanged: number;
   /**
-   * Record that every pending file is up. Call it only after the upload step
-   * succeeded in full (and the prune ran); never throws.
+   * Every workspace path (relative to /workspace) the previous sync left in S3,
+   * when that is all there is under the prefix apart from the directories the
+   * prune never touches; null when the record cannot say so.
+   *
+   * It can when the sync that wrote it pruned completely: everything stale was
+   * deleted and nothing was spared for a repository it could not measure; and
+   * only for `RELIST_AFTER_MS` after the prefix was last listed. Then
+   * an object the prune would delete now is one of these whose file is gone, and
+   * the prune can name it instead of listing the prefix -- which is what held a
+   * finished turn's session busy: a MinIO listing of a 1,500-object prefix takes
+   * about 45 s, on every turn, whatever the turn changed.
    */
-  commit(): Promise<void>;
+  recorded: ReadonlySet<string> | null;
+  /**
+   * Record that every pending file is up. Call it only after the upload step
+   * succeeded in full (and the prune ran), saying whether that prune left the
+   * prefix holding nothing outside this record; never throws.
+   */
+  commit(pruned: boolean): Promise<void>;
 }
 
 /**
@@ -447,15 +515,31 @@ export async function planUploadDelta(
   excludeArgs: string,
   opts: { shardFiles?: number } = {},
 ): Promise<UploadDelta | null> {
-  if (files.length === 0) return null;
+  // Nothing to plan is still a sync whose prune may delete what the record vouches
+  // for (every listed file held back with its repository), so the record goes.
+  if (files.length === 0) {
+    await invalidateSyncManifest(hands, s3Prefix);
+    return null;
+  }
   const shardFiles = opts.shardFiles ?? SHARD_FILES;
   // A record this process could not take away is not planned from, and is taken
   // away again first: the sandbox may have been fixed since.
   if (isUnneutralised(hands, s3Prefix) && !(await invalidateSyncManifest(hands, s3Prefix))) return null;
   const stats = await statFiles(hands, excludeArgs);
   // A sandbox that cannot stat gets no optimisation and no manifest, not a guess.
-  if (!stats || stats.size === 0) return null;
-  const prev = await readManifest(hands, s3Prefix);
+  // Nor does it keep the one it had: the full upload that follows puts objects
+  // under the prefix that record does not name, so a later prune by it would
+  // never delete them.
+  if (!stats || stats.size === 0) {
+    await invalidateSyncManifest(hands, s3Prefix);
+    return null;
+  }
+  const planned = Date.now();
+  const record = await readManifest(hands, s3Prefix);
+  const prev = record?.files ?? null;
+  const age = record ? planned - record.listed : Number.NaN;
+  // A record that says it was listed in the future is not one to measure from.
+  const recorded = record?.pruned && age >= 0 && age < RELIST_AFTER_MS ? new Set(prev!.keys()) : null;
 
   const entries = new Map<string, Entry>();
   const pending = new Set<string>();
@@ -511,13 +595,20 @@ export async function planUploadDelta(
   return {
     pending: toUpload,
     unchanged,
-    commit: async () => {
+    recorded,
+    commit: async (pruned: boolean) => {
       try {
-        // The manifest on disk is still exact when nothing moved and nothing was
-        // deleted; rewriting it would be a round trip for no change.
-        if (prev && toUpload.length === 0 && refreshed === 0 && prev.size === entries.size) return;
+        // A prune by name keeps the record's last listing; a prune that listed is a new one.
+        const listed = recorded ? record!.listed : planned;
+        // The manifest on disk is still exact when nothing moved, nothing was
+        // deleted and the prune left the prefix as the record says; rewriting it
+        // would be a round trip for no change.
+        if (
+          record && toUpload.length === 0 && refreshed === 0 && prev!.size === entries.size
+          && record.pruned === pruned && (!pruned || record.listed === listed)
+        ) return;
         if (!dropped && !(await invalidateSyncManifest(hands, s3Prefix))) return;
-        if (!(await writeManifest(hands, s3Prefix, entries, shardFiles))) {
+        if (!(await writeManifest(hands, s3Prefix, entries, shardFiles, pruned, listed))) {
           logger.warn({ s3Prefix }, "s3.sync_delta.write_refused");
           await invalidateSyncManifest(hands, s3Prefix);
         }

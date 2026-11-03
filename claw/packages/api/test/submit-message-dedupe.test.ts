@@ -78,7 +78,8 @@ const QUEUE_COLUMNS = `ALTER TABLE claw_pending_messages
   ADD COLUMN timeout INTEGER,
   ADD COLUMN user_env JSONB,
   ADD COLUMN session_env JSONB,
-  ADD COLUMN topology JSONB`;
+  ADD COLUMN topology JSONB,
+  ADD COLUMN tools_allowlist JSONB`;
 
 let h: Harness;
 let drains: Array<[string, string]> = [];
@@ -534,7 +535,7 @@ describe("two submits on a server", { skip: postgresSkipReason() }, () => {
       user_id TEXT DEFAULT 'default', created_at TIMESTAMPTZ DEFAULT NOW(),
       plugin_id INTEGER, tool_ids JSONB DEFAULT '[]'::jsonb, workspace_id TEXT,
       platform_key TEXT, llm_api_key TEXT, credentials_blob TEXT, image TEXT,
-      resources JSONB, timeout INTEGER, user_env JSONB, session_env JSONB, topology JSONB)`);
+      resources JSONB, timeout INTEGER, user_env JSONB, session_env JSONB, topology JSONB, tools_allowlist JSONB)`);
     for (const sql of pendingMessageDedupeSchemaSql()) await client.query(sql);
   });
   after(async () => { await cluster?.end(); });

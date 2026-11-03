@@ -49,13 +49,22 @@ export const REPO_TRUNCATION_MARKER = "\n[... truncated: the repository's instru
 export const GIT_CREDENTIAL_HELPER = "!gh auth git-credential";
 /** Hands' foreground ceiling; a clone that needs longer fails with that reason and the agent is told. */
 const CLONE_TIMEOUT_SEC = 100;
+/**
+ * How long a clone, fetch or attach may take when it runs as a background shell.
+ * The foreground ceiling exists because a proxy in front of Hands gives up on a
+ * request after 120s; a background shell is waited on in slices under it, so a
+ * large repository is bounded by this instead.
+ */
+const CLONE_BACKGROUND_MAX_SEC = 900;
+/** How long stopping a background clone may take; its own budget, since the turn's signal may be the reason it is stopped. */
+const KILL_SHELL_TIMEOUT_MS = 10_000;
 const GIT_TIMEOUT_SEC = 60;
 const REASON_MAX_CHARS = 300;
 
 export interface RepoHands {
   callToolFull(
     name: string, args: Record<string, unknown>, signal?: AbortSignal,
-  ): Promise<{ text: string; isError: boolean }>;
+  ): Promise<{ text: string; isError: boolean; structured?: unknown }>;
 }
 
 export type RepoState = "cloned" | "adopted" | "present" | "failed";
@@ -93,6 +102,12 @@ export interface BindOptions {
    */
   stateDir?: string;
   signal?: AbortSignal;
+  /**
+   * Run the clone, fetch and attach as a background shell and wait for it,
+   * instead of in the foreground under its 100s ceiling. Only where the
+   * deployment has background shells (BG_SHELL_ENABLED).
+   */
+  background?: boolean;
 }
 
 const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
@@ -130,6 +145,48 @@ async function sh(
     // The sandbox is unreachable or the call was cut. Not thrown further: the
     // turn goes on, and the reason is what the agent is told.
     return { ok: false, out: `stderr: could not run the command in the sandbox: ${(err as Error)?.message ?? err}` };
+  }
+}
+
+/**
+ * A command that may outlast the foreground ceiling: started in the background
+ * and waited on, one wait at a time, until it ends or CLONE_BACKGROUND_MAX_SEC
+ * passes. Foreground, as before, when background shells are off.
+ */
+async function shLong(
+  hands: RepoHands, command: string, options: BindOptions,
+): Promise<{ ok: boolean; out: string }> {
+  const { signal } = options;
+  if (!options.background) return sh(hands, command, CLONE_TIMEOUT_SEC, signal);
+  let shellId: string | undefined;
+  let finished = false;
+  try {
+    const start = await hands.callToolFull("bash", { command, run_in_background: true }, signal);
+    const id = (start.structured as { shell_id?: unknown } | undefined)?.shell_id;
+    if (start.isError || typeof id !== "string" || !id) {
+      return { ok: false, out: `stderr: could not start the command in the background: ${start.text}` };
+    }
+    shellId = id;
+    const deadline = Date.now() + CLONE_BACKGROUND_MAX_SEC * 1000;
+    let out = "";
+    for (;;) {
+      const w = await hands.callToolFull("wait", { shell_id: shellId, timeout_sec: CLONE_TIMEOUT_SEC }, signal);
+      out += `${w.text}\n`;
+      if (w.isError) return { ok: false, out };
+      const s = w.structured as { finished?: unknown; exit_code?: unknown } | undefined;
+      if (s?.finished === true) { finished = true; return { ok: s.exit_code === 0, out }; }
+      if (Date.now() >= deadline) {
+        return { ok: false, out: `stderr: did not finish within ${CLONE_BACKGROUND_MAX_SEC}s and was stopped` };
+      }
+    }
+  } catch (err) {
+    return { ok: false, out: `stderr: could not run the command in the sandbox: ${(err as Error)?.message ?? err}` };
+  } finally {
+    // A clone left running would race the next turn's bind: its staging dir removed
+    // under it, or its move landing inside the checkout that turn put in place.
+    if (shellId && !finished) {
+      await hands.callToolFull("kill_shell", { shell_id: shellId }, AbortSignal.timeout(KILL_SHELL_TIMEOUT_MS)).catch(() => undefined);
+    }
   }
 }
 
@@ -382,11 +439,11 @@ export async function bindRepo(hands: RepoHands, raw: unknown, options: BindOpti
       // instruction files back with it, so this turn made one call.
       inline = probe.out;
     } else {
-      const f = await sh(hands, fetchCommand(dir, boundMarker), CLONE_TIMEOUT_SEC, signal);
+      const f = await shLong(hands, fetchCommand(dir, boundMarker), options);
       if (!f.ok) b.notes.push(`git fetch failed (${reasonOf(f.out)}); the checkout is as it was left`);
     }
   } else if (state === "occupied") {
-    const a = await sh(hands, adoptCommand(dir, root, stagingRecord, repo.url, boundMarker), CLONE_TIMEOUT_SEC, signal);
+    const a = await shLong(hands, adoptCommand(dir, root, stagingRecord, repo.url, boundMarker), options);
     if (!a.ok) {
       b.failure = `${dir} already has files and is not a git repository, and attaching the repository to them failed: ${reasonOf(a.out)}`;
       return finish(b, started);
@@ -395,7 +452,7 @@ export async function bindRepo(hands: RepoHands, raw: unknown, options: BindOpti
     b.notes.push(`${dir} already had files and no .git (a snapshot from before .git was kept): the repository's .git was attached on its default branch and those files show as local changes`);
     if (b.requestedBranch) b.notes.push(`branch ${b.requestedBranch} was not checked out because the files are in the way; the checkout is on the remote's default branch`);
   } else {
-    const c = await sh(hands, cloneCommand(dir, root, stagingRecord, repo.url, boundMarker), CLONE_TIMEOUT_SEC, signal);
+    const c = await shLong(hands, cloneCommand(dir, root, stagingRecord, repo.url, boundMarker), options);
     if (!c.ok) {
       b.failure = `git clone of ${repo.url} failed: ${reasonOf(c.out)}`;
       return finish(b, started);
