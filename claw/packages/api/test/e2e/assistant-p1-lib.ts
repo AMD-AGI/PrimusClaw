@@ -123,12 +123,94 @@ export function apiClient(base: string, defaultKey: string) {
   };
 }
 
-/** Poll until `probe` returns something other than undefined, or the deadline passes (then null: never "assumed fine"). */
+/**
+ * Poll until `probe` returns something other than undefined, or the deadline passes (then null: never "assumed fine").
+ * The deadline is strict: an answer that arrives after it, or a deadline already past, is null.
+ */
 export async function until<T>(probe: () => Promise<T | undefined> | T | undefined, deadlineAt: number, everyMs = 250): Promise<T | null> {
   for (;;) {
+    if (Date.now() > deadlineAt) return null;
     const value = await probe();
-    if (value !== undefined) return value;
+    if (value !== undefined) return Date.now() <= deadlineAt ? value : null;
     if (Date.now() >= deadlineAt) return null;
     await new Promise((r) => setTimeout(r, everyMs));
   }
+}
+
+/**
+ * The tag every task name of one run carries. The Router answers a task it closed in the last day from that item
+ * ("already done"), so a rerun whose task names repeat an earlier run's gets no new item; a tag per run prevents it.
+ */
+export function runTag(given: string | undefined, now = Date.now()): string {
+  const tag = (given ?? "").trim();
+  return tag || `r${now.toString(36)}`;
+}
+
+/** Items created after the board's highest number was `floorSeq`, that the run has not already counted as its own. */
+export function newItemsSince<T extends { item_id: string; seq: number }>(board: readonly T[], floorSeq: number, taken: ReadonlySet<string>): T[] {
+  return board.filter((i) => Number(i.seq) > floorSeq && !taken.has(i.item_id)).sort((a, b) => a.seq - b.seq);
+}
+
+/** The item whose title names this task (`S3a` names neither `S13a` nor `S3ab`), if any. */
+export function itemNamed<T extends { title: string }>(items: Iterable<T>, name: string): T | undefined {
+  const re = new RegExp(`(^|[^A-Za-z0-9])${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}($|[^A-Za-z0-9])`, "i");
+  for (const i of items) if (re.test(i.title)) return i;
+  return undefined;
+}
+
+export const SESSION_ID_LABEL = "primus-claw/session-id";
+const TERMINAL_PHASES = new Set(["Stopped", "Succeeded", "Failed"]);
+
+export interface WorkloadList {
+  items?: Array<{ metadata?: { name?: string; labels?: Record<string, string> }; status?: { phase?: string } }>;
+}
+
+/** Names of the sandboxes (SaFE workloads) of these sessions that are not yet in a terminal phase. */
+export function aliveSandboxes(list: WorkloadList, sessions: ReadonlySet<string>): string[] {
+  if (!Array.isArray(list?.items)) throw new Error("the workload list has no items array");
+  return list.items
+    .filter((w) => sessions.has(w.metadata?.labels?.[SESSION_ID_LABEL] ?? "") && !TERMINAL_PHASES.has(w.status?.phase ?? ""))
+    .map((w) => w.metadata?.name ?? "?");
+}
+
+/**
+ * Runs the scenario, then every registered cleanup whatever happened (latest first, each one even if another failed),
+ * and answers the exit code: 0 only if nothing failed. A scenario that throws, or ends without a recorded failure
+ * but without finishing, is a failure too.
+ */
+export async function settle(
+  scenario: () => Promise<"finished" | void>, cleanups: Array<{ what: string; run: () => Promise<void> }>, failures: string[],
+): Promise<number> {
+  try {
+    if ((await scenario()) !== "finished" && failures.length === 0) failures.push("the scenario ended before it finished");
+  } catch (err) {
+    failures.push(`the scenario could not be carried out: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  for (const c of [...cleanups].reverse()) {
+    try { await c.run(); } catch (err) { failures.push(`cleanup: ${c.what}: ${err instanceof Error ? err.message : String(err)}`); }
+  }
+  return failures.length === 0 ? 0 : 1;
+}
+
+/**
+ * How long to wait before a round so that the user's messages in the last hour, plus what the round will say, stay
+ * within the deployment's per-user cap (CLAW_ASSISTANT_SAY_MAX_PER_HOUR). Over the cap the assistant is refused and
+ * says nothing, which would read as no answer. 0 when there is room; Infinity when one round alone would not fit.
+ */
+export function sayPacingWaitMs(sayTimes: readonly number[], now: number, limit: number, reserve: number, windowMs = 3_600_000): number {
+  if (reserve > limit) return Number.POSITIVE_INFINITY;
+  const inWindow = sayTimes.filter((t) => t > now - windowMs).sort((a, b) => a - b);
+  const over = inWindow.length + reserve - limit;
+  return over <= 0 ? 0 : inWindow[over - 1] + windowMs - now + 1_000;
+}
+
+/** Calls an idempotent request again (up to `tries` times, `gapMs` apart) while it answers 5xx or cannot be sent. */
+export async function retry5xx(call: () => Promise<number>, tries = 3, gapMs = 2_000): Promise<number> {
+  let status = 0;
+  for (let i = 0; i < tries; i++) {
+    if (i) await new Promise((r) => setTimeout(r, gapMs));
+    try { status = await call(); } catch { status = 599; }
+    if (status < 500) return status;
+  }
+  return status;
 }

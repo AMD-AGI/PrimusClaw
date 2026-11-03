@@ -363,6 +363,20 @@ record it.
   like the platform defaults instead of being inlined.
 
 ### Security
+- A session that acts as a user (`config.acting_as`, GitHub review on; its turns carry `withhold_sandbox_keys`) is no longer
+  given the deployment's platform defaults (`PLATFORM_DEFAULTS_FILE`): no default MCP server and no default skill. The default
+  servers are called with the requester's own key (`<SAFE_API_KEY>`), so a pull request's text that a review turn reads could
+  drive their read tools as the requester and carry the result into the review. Such a turn now has only what its own request
+  carries (the review tools the API puts there), whichever way it reaches Brain (a message, a queued turn, a task of a DAG,
+  a sub-agent). Every other session is given the defaults as before. See `claw/docs/platform-defaults.md`.
+- The same session is no longer given its requester's long-term memory, in either direction (`CLAW_MEMORY_ENABLED`, with the
+  requester opted in): their memory entries and profile are not put in its prompt (nor the notice that memory is off),
+  `save_memory` is not offered (Brain refuses a request marked `withhold_sandbox_keys` whatever `memory_enabled` says; a
+  sub-agent starts from its parent's tools and has none), and a completion of such a session saves nothing it asked to save
+  and extracts nothing from its conversation. A pull request's text that a review turn reads could otherwise get the
+  requester's private memories quoted into a public review comment, or write a memory that steers all of their later
+  ordinary sessions. A session whose row cannot be read counts as one that withholds: memory is not used, the turn is not
+  failed. Every other session is unchanged. See `claw/docs/github-review.md`.
 - `a2a_call` no longer accepts a URL, and no longer sends the user's LLM key or the platform key to a peer.
   The model used to be able to name any `http(s)://` address, and the call went out with the user's key (or,
   in safe mode, the platform key) as its `Authorization` bearer, so a prompt-injected model could send that key
@@ -477,6 +491,15 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- The review instructions that `gh_pr_get` returns (`review_instructions`) no longer open with a skill's frontmatter
+  (`name: pr-review ...`), which sent the model looking for a skill that is not in its session and made it say so. The
+  default instructions are the rules and steps alone, a repository skill's own frontmatter is left out too, and
+  `examples/skills/pr-review/SKILL.md` is still a valid skill: it is the same text behind its frontmatter. The
+  instructions also tell the model to answer in the language the person wrote in, in natural wording, with plain words
+  ("approved", "merged", "commented", "waiting for your confirmation") instead of the names of tools or of their states
+  such as `dry_run`, and to say that nothing happened on GitHub when writes are switched off. These answer rules, with
+  the last `VERDICT:` line, are put in front of a repository's own review skill as well, not only in the default
+  instructions. Tool names stay in the logs and the audit rows.
 - Reading a skill no longer starts a sandbox. With `PROGRESSIVE_SKILLS_ENABLED`, the prompt told the model to open
   `/workspace/.skills/<name>/SKILL.md` with the `read` tool, which made Brain provision a sandbox for a file read:
   a turn that called an MCP tool and then needed the skill waited for a pod, and on a cluster that could not

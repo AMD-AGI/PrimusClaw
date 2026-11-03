@@ -42,6 +42,7 @@ type fakeRunner struct {
 	startOnce sync.Once
 	hold      chan struct{}
 	observed  string
+	failure   string
 	node      string
 	adopted   []time.Duration
 }
@@ -77,7 +78,7 @@ func (f *fakeRunner) Observe(_ context.Context, sandboxID string) (CreateResult,
 	if node == "" {
 		node = "node-a"
 	}
-	return CreateResult{SandboxName: "pod-" + sandboxID, Namespace: "ns", PodIP: "10.0.0.8", PodPort: 8080, NodeName: node}, f.observed, nil
+	return CreateResult{SandboxName: "pod-" + sandboxID, Namespace: "ns", PodIP: "10.0.0.8", PodPort: 8080, NodeName: node, Failure: f.failure}, f.observed, nil
 }
 
 func (f *fakeRunner) Delete(_ context.Context, sandboxID string) error {
@@ -211,28 +212,64 @@ func (allowMember) Check(context.Context, string, []string) error { return nil }
 
 func TestOriginalCreateReportsFailureBeforeReplay(t *testing.T) {
 	cases := []struct {
-		name string
-		fail error
-		want string
+		name   string
+		fail   error
+		hold   bool
+		status int
+		reason string
+		want   string
 	}{
-		{name: "workload failed", fail: errors.New("workload sbx-1 phase Failed: allocation generation is Lost"), want: "Lost"},
-		{name: "pending timeout", fail: context.DeadlineExceeded, want: "deadline exceeded"},
+		{name: "workload failed", fail: errors.New("workload sbx-1 phase Failed: CapacityGone: allocation generation is Lost"), status: http.StatusInternalServerError, reason: "sandbox_create_failed", want: "CapacityGone"},
+		{name: "pending timeout", hold: true, status: http.StatusServiceUnavailable, reason: "pending_timeout", want: "not running after 1s"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			svc, runner, keys := testPlane(t, 600, []int32{1}, 1)
+			svc, runner, keys := testPlaneWithSpec(t, 600, []int32{1}, 1, `{"pendingTimeoutSec":1}`)
 			runner.fail = tc.fail
+			if tc.hold {
+				runner.hold = make(chan struct{})
+			}
 			body := CreateBody{TemplateID: "runner", Timeout: 60, Metadata: map[string]string{idempotencyMetadataKey: "once"}}
 			_, _, err := svc.Create(context.Background(), keys["measurement"], body)
 			var oe *grant.OpError
-			if !errors.As(err, &oe) || oe.Status != http.StatusInternalServerError || oe.Reason != "sandbox_create_failed" || !strings.Contains(oe.Detail, tc.want) {
+			if !errors.As(err, &oe) || oe.Status != tc.status || oe.Reason != tc.reason || !strings.Contains(oe.Detail, tc.want) {
 				t.Fatalf("create=%v", err)
 			}
 			_, _, err = svc.Create(context.Background(), keys["measurement"], body)
-			if !errors.As(err, &oe) || oe.Status != http.StatusGone || oe.Reason != "idempotency_key_spent" {
+			if !errors.As(err, &oe) || oe.Status != http.StatusGone || oe.Reason != "idempotency_key_spent" || !strings.HasPrefix(oe.Detail, "sbx-") || strings.Contains(oe.Detail, " ") {
 				t.Fatalf("replay=%v", err)
 			}
 		})
+	}
+}
+
+func TestReplayThatEndsTheRefKeepsTheReason(t *testing.T) {
+	svc, runner, keys := testPlane(t, 600, []int32{1}, 1)
+	failure := "workload sbx-1 phase Failed: CapacityGone: allocation generation is Lost"
+	runner.started = make(chan struct{})
+	runner.hold = make(chan struct{})
+	runner.observed = WorkloadFinished
+	runner.failure = failure
+	runner.fail = errors.New(failure)
+	body := CreateBody{TemplateID: "runner", Timeout: 60, Metadata: map[string]string{idempotencyMetadataKey: "once"}}
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := svc.Create(context.Background(), keys["measurement"], body)
+		done <- err
+	}()
+	awaitStarted(t, runner.started, done)
+	_, _, err := svc.Create(context.Background(), keys["measurement"], body)
+	var oe *grant.OpError
+	if !errors.As(err, &oe) || oe.Status != http.StatusGone || oe.Reason != "idempotency_key_spent" {
+		t.Fatalf("replay=%v", err)
+	}
+	refs, err := svc.grants.ListRoleSandboxes(context.Background(), "gr-01jb7m9k2x", "measurement")
+	if err != nil || len(refs) != 1 || !strings.Contains(refs[0].EndReason, "CapacityGone") {
+		t.Fatalf("refs=%+v err=%v", refs, err)
+	}
+	close(runner.hold)
+	if err := <-done; !errors.As(err, &oe) || oe.Status != http.StatusInternalServerError || !strings.Contains(oe.Detail, "CapacityGone") {
+		t.Fatalf("create=%v", err)
 	}
 }
 
