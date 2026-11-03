@@ -6,10 +6,14 @@ import { z } from "zod";
 import { guardPath } from "../../runtime/path-guard.js";
 import { readImage } from "./read-image.js";
 
+/** Lines one call returns when no limit is given; the rest is paged with offset. */
+export const READ_DEFAULT_LINES = 2000;
+
 const schema = {
   path: z.string().describe("File path (relative to workspace)"),
   offset: z.number().optional().describe("Start line (1-based)"),
-  limit: z.number().optional().describe("Number of lines to read"),
+  limit: z.number().optional().describe(`Number of lines to read (default ${READ_DEFAULT_LINES})`),
+  line_numbers: z.boolean().optional().describe("Prefix each line with its number (default true); false returns the raw text"),
   notebook_cell_index: z.number().int().nonnegative().optional()
     .describe("For .ipynb files: return only this cell (0-based)"),
 };
@@ -77,9 +81,9 @@ function formatCell(cell: Record<string, unknown>, index: number): string {
 
 export const read = {
   name: "read",
-  description: "Read a file from the workspace. Supports line offset and limit. Automatically detects .ipynb and formats notebook cells. A PNG, JPEG, GIF or WebP image is returned as the image itself, so you can look at it.",
+  description: `Read a file from the workspace. Lines come numbered as N|text; at most ${READ_DEFAULT_LINES} lines per call, page with offset and limit. Automatically detects .ipynb and formats notebook cells. A PNG, JPEG, GIF or WebP image is returned as the image itself, so you can look at it.`,
   zodSchema: schema,
-  execute: async (args: { path: string; offset?: number; limit?: number; notebook_cell_index?: number }) => {
+  execute: async (args: { path: string; offset?: number; limit?: number; line_numbers?: boolean; notebook_cell_index?: number }) => {
     let safePath: string;
     try { safePath = guardPath(args.path); } catch (e: any) {
       return { content: [{ type: "text" as const, text: `Error: ${e.message}` }] };
@@ -104,13 +108,20 @@ export const read = {
     try { content = fs.readFileSync(safePath, "utf-8"); } catch (e: any) {
       return { content: [{ type: "text" as const, text: `Error reading ${args.path}: ${e.message}` }] };
     }
-    if (args.offset || args.limit) {
-      const lines = content.split("\n");
-      const start = Math.max(0, (args.offset ?? 1) - 1);
-      const end = args.limit ? start + args.limit : lines.length;
-      const sliced = lines.slice(start, end).map((l, i) => `${start + i + 1}|${l}`).join("\n");
-      return { content: [{ type: "text" as const, text: sliced }] };
+    // Raw text is for Brain's own reads of files it wrote (sync metadata), which parse the content.
+    if (args.line_numbers === false && !args.offset && !args.limit) {
+      return { content: [{ type: "text" as const, text: content }] };
     }
-    return { content: [{ type: "text" as const, text: content }] };
+    const lines = content.split("\n");
+    const start = Math.max(0, (args.offset ?? 1) - 1);
+    const end = Math.min(lines.length, start + (args.limit && args.limit > 0 ? args.limit : READ_DEFAULT_LINES));
+    const page = lines.slice(start, end);
+    const body = args.line_numbers === false
+      ? page.join("\n")
+      : page.map((l, i) => `${start + i + 1}|${l}`).join("\n");
+    const more = end < lines.length
+      ? `\n[lines ${start + 1}-${end} of ${lines.length}; call read with offset=${end + 1} for more]`
+      : "";
+    return { content: [{ type: "text" as const, text: body + more }] };
   },
 };

@@ -79,6 +79,7 @@ test("a question is asked on the decision channel and the answer is what the mod
   const asked = events.find((e) => e.type === "userQuestion");
   assert.ok(asked, "the question is announced");
   assert.deepEqual(asked.questions, QUESTION.questions);
+  assert.equal(asked.timeout_ms, 2000, "with how long the answer is waited for, so a client can stop offering it then");
   assert.ok(nats.subjects.some((s) => s.startsWith("decision.")), "on the channel decisions use");
   assert.match(modelSaw, /\{\\"q1\\":\[\\"b\\"\]\}/, "the answer reaches the model as the tool result");
   assert.equal(modelSaw.includes("not available"), false);

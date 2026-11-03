@@ -40,7 +40,7 @@ export class FakeGithub {
   pr: Record<string, any> = {
     number: 7, title: "Fix the thing", body: "Fixes the thing.", state: "open", draft: false, merged: false,
     head: { sha: HEAD, ref: "fix", repo: { full_name: "AMD-AGI/demo" } },
-    base: { ref: "main", repo: { full_name: "AMD-AGI/demo" } },
+    base: { ref: "main", sha: BASE_TIP, repo: { full_name: "AMD-AGI/demo" } },
     user: { login: "alice" }, author_association: "MEMBER", additions: 3, deletions: 1, changed_files: 1,
     html_url: "https://github.com/AMD-AGI/demo/pull/7",
   };
@@ -111,7 +111,16 @@ export class FakeGithub {
       if (this.enqueueEntry) Object.assign(this.graphql, { isInMergeQueue: true, mergeQueueEntry: this.enqueueEntry });
       return json(200, { data: { enqueuePullRequest: { mergeQueueEntry: this.enqueueEntry } } });
     }
-    if (p === "/graphql") return json(200, { data: { repository: { pullRequest: { ...this.graphql, ...(this.graphqlQueue.shift() ?? {}) } } } });
+    if (p === "/graphql") {
+      // The repository as the REST answer above describes it, in GraphQL's names, and its pull request: the head is the REST one's.
+      const r = this.repo;
+      const repository = {
+        owner: r.owner, isPrivate: r.private, visibility: typeof r.visibility === "string" ? r.visibility.toUpperCase() : undefined,
+        isArchived: r.archived, isDisabled: r.disabled,
+      };
+      const pull = /isArchived/.test(String(call.body?.query ?? "")) ? { headRefOid: this.pr.head?.sha, baseRefName: this.pr.base?.ref, baseRefOid: this.pr.base?.sha } : { ...this.graphql, ...(this.graphqlQueue.shift() ?? {}) };
+      return json(200, { data: { repository: { ...repository, pullRequest: pull } } });
+    }
     if (/^\/repos\/[^/]+\/[^/]+$/.test(p)) return json(200, this.repo);
     if (/^\/repos\/[^/]+\/[^/]+\/pulls\/\d+$/.test(p)) return json(200, this.pr);
     if (/\/pulls\/\d+\/files$/.test(p)) {
@@ -140,15 +149,22 @@ export class FakeGithub {
       return json(200, { sha: "m".repeat(40), merged: true, message: "Pull Request successfully merged" });
     }
     if (/\/git\/ref\/heads\/(.+)$/.test(p)) return json(200, { object: { sha: BASE_TIP } });
+    const tree = /\/git\/trees\/([0-9a-f]{40})$/.exec(p);
+    if (tree) {
+      this.treeReads.push({ sha: tree[1] as string, recursive: call.query.recursive ?? "" });
+      return json(200, { sha: tree[1], truncated: false, tree: [], ...this.trees[tree[1] as string] });
+    }
     const contents = /\/contents\/(.+)$/.exec(p);
     if (contents) {
       const path = decodeURIComponent(contents[1] as string);
       // Contents are read at the base tip or the base branch, never at the head.
       this.contentRefs.push(call.query.ref ?? "");
       if (this.dirs[path]) return json(200, this.dirs[path]);
-      if (path in this.contents) {
-        const text = this.contents[path] as string;
-        return json(200, { type: "file", encoding: "base64", content: Buffer.from(text).toString("base64"), size: text.length });
+      // A symlink to a file answers with the file it points at, under that file's own path, as GitHub does.
+      const target = this.symlinks[path] ?? path;
+      if (target in this.contents) {
+        const text = this.contents[target] as string;
+        return json(200, { type: "file", path: target, encoding: "base64", content: Buffer.from(text).toString("base64"), size: text.length });
       }
       return json(404, { message: "Not Found" });
     }
@@ -156,4 +172,9 @@ export class FakeGithub {
   };
 
   contentRefs: string[] = [];
+  /** commit sha -> its recursive tree, as `GET /git/trees/{sha}?recursive=1` answers it; a commit not named here has an empty tree. */
+  trees: Record<string, { truncated?: boolean; tree?: Array<{ path: string; type: string; mode?: string; sha: string }> }> = {};
+  treeReads: Array<{ sha: string; recursive: string }> = [];
+  /** path -> the path a symlink there points at. */
+  symlinks: Record<string, string> = {};
 }

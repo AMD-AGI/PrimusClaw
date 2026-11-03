@@ -999,3 +999,17 @@ test("the shared-disk sync tells the script which repositories to leave out, and
   assert.ok(!script.includes("small/.git"), "and only that one");
   assert.ok(script.includes(`--exclude '.git/**.lock'`), "git's transient files are always left behind");
 });
+
+test("the sync reads meta.json as raw text: Hands numbers read's lines unless told not to", async () => {
+  const meta = JSON.stringify({ size_bytes: 5, inode_count: 1 });
+  const hands = {
+    callTool: async (tool: string, args: { command?: string; line_numbers?: boolean }) => {
+      // Hands' read contract: lines come numbered as N|text unless line_numbers is false.
+      if (tool === "read") return args.line_numbers === false ? meta : `1|${meta}`;
+      return String(args.command).includes(BEGIN) ? probeOutput([]) : "OK";
+    },
+  } as unknown as HandsClient;
+
+  const r = await syncWorkspace(hands, SID, UID, 1);
+  assert.equal(r.size, 5, "meta.json was not parsed");
+});

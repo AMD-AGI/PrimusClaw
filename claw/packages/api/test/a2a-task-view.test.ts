@@ -40,8 +40,8 @@ const said = (text: string) => ev("AssistantMessage", { data: { content: [{ type
 const started = () => ev("statusUpdate", { agentStatus: "running" });
 const approval = (id: string, over: Record<string, unknown> = {}) =>
   ev("permissionRequest", { actionId: id, tool: "bash", input: { command: "ls" }, description: "bash: ls", timeout_ms: 300000, ...over });
-const question = (id: string) =>
-  ev("userQuestion", { actionId: id, questions: [{ id: "q1", question: "Pick", options: [{ id: "a", label: "A" }] }] });
+const question = (id: string, over: Record<string, unknown> = {}) =>
+  ev("userQuestion", { actionId: id, questions: [{ id: "q1", question: "Pick", options: [{ id: "a", label: "A" }] }], ...over });
 const decided = (id: string) => ev("decisionResult", { actionId: id, decision: "allow" });
 
 describe("V1 the state of a run", () => {
@@ -174,6 +174,12 @@ describe("V3 the task a caller reads", () => {
     const msg = task.status.message!;
     assert.match(msg.parts[0].text!, /Pick \(a: A\)/);
     assert.equal((msg.parts[1].data as { kind: string }).kind, "question");
+    assert.equal("timeoutMs" in (msg.parts[1].data as object), false, "a Brain that does not say how long it waits: no timeout");
+  });
+
+  test("a question says how long the answer is waited for, as an approval does", () => {
+    const msg = taskOf(run(), [question("q-1", { timeout_ms: 600000 })]).status.message!;
+    assert.equal((msg.parts[1].data as { timeoutMs?: number }).timeoutMs, 600000);
   });
 
   test("a failed task says why", () => {
@@ -285,7 +291,7 @@ describe("V4 live events as stream events", () => {
 describe("V5 the answer to a waiting task", () => {
   const approvalReq: PendingInput = { kind: "approval", actionId: "a1", tool: "bash", input: {}, summary: "s", timeoutMs: null };
   const questionReq = (n: number): PendingInput => ({
-    kind: "question", actionId: "q-1",
+    kind: "question", actionId: "q-1", timeoutMs: null,
     questions: Array.from({ length: n }, (_, i) => ({ id: `q${i + 1}`, question: "?" })),
   });
   const data = (d: Record<string, unknown>): Part => ({ data: d });

@@ -79,7 +79,7 @@ test("an image over the size bound is refused with what to do instead", async ()
 
 test("any other file is still read as text", async () => {
   const res = await read.execute({ path: put("notes.txt", "hello") }) as { content: Block[] };
-  assert.deepEqual(res.content, [{ type: "text", text: "hello" }]);
+  assert.deepEqual(res.content, [{ type: "text", text: "1|hello" }]);
 });
 
 async function serve(body: string): Promise<{ url: string; hits: () => number; close: () => Promise<void> }> {
