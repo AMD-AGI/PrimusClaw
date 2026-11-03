@@ -7,21 +7,27 @@ import { z } from "zod";
 import { minimatch } from "minimatch";
 import { guardPath } from "../../runtime/path-guard.js";
 import { WORKSPACE } from "../../config.js";
+import { WORKSPACE_EXCLUDES } from "@claw/protocol";
 
 /**
- * Directories a recursive search does not enter: version-control internals,
- * dependency trees and caches, which are large and never what was meant.
- * Other dot-directories (.github, .claude, .vscode) hold real project files and
- * are searched. A path given explicitly is searched whatever its name.
+ * What a recursive search does not enter: version-control internals, the
+ * Python venv convention, and everything a workspace snapshot leaves behind
+ * (dependency trees, caches, uploads, transcripts, kept tool results), which is
+ * large and never what was meant. Other dot-directories (.github, .claude,
+ * .vscode) hold real project files and are searched. A path given explicitly is
+ * searched whatever its name.
  */
-export const GREP_SKIP_DIRS = new Set([
-  ".git", "node_modules", ".cache", ".venv", ".task-venv", "__pycache__", ".tool-results",
-]);
+export const GREP_SKIP = [".git", ".venv", ...WORKSPACE_EXCLUDES] as const;
+
+/** A file bigger than this is not read: a dataset or a binary, and one read would hold Hands past every deadline. */
+export const GREP_MAX_FILE_BYTES = 8 * 1024 * 1024;
+
+const skipped = (name: string) => GREP_SKIP.some((p) => minimatch(name, p, { dot: true }));
 
 function walkFiles(dir: string): string[] {
   const results: string[] = [];
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (GREP_SKIP_DIRS.has(entry.name)) continue;
+    if (skipped(entry.name)) continue;
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) results.push(...walkFiles(full));
     else results.push(full);
@@ -49,7 +55,7 @@ const TOTAL_TIMEOUT_MS = 30_000;
 
 export const grep = {
   name: "grep",
-  description: "Search file contents with a regex (case-insensitive unless case_sensitive). Searches dot-directories such as .github; skips .git, node_modules and caches.",
+  description: "Search file contents with a regex (case-insensitive unless case_sensitive). Searches dot-directories such as .github; skips .git, node_modules, caches, uploads and files over 8 MB.",
   zodSchema: schema,
   execute: async (args: { pattern: string; path?: string; context?: number; case_sensitive?: boolean; glob?: string }) => {
     if (args.pattern.length > PATTERN_MAX_LEN) {
@@ -73,12 +79,14 @@ export const grep = {
       : walked;
     const totalDeadline = Date.now() + TOTAL_TIMEOUT_MS;
     let timedOutFiles = 0;
+    let tooLarge = 0;
     for (const file of files) {
       if (Date.now() > totalDeadline) {
         results.push(`[grep aborted: total timeout ${TOTAL_TIMEOUT_MS}ms hit, ${files.length - results.length} files unscanned]`);
         break;
       }
       try {
+        if (fs.statSync(file).size > GREP_MAX_FILE_BYTES) { tooLarge++; continue; }
         const lines = fs.readFileSync(file, "utf-8").split("\n");
         const rel = path.relative(WORKSPACE, file);
         const fileDeadline = Date.now() + PER_FILE_TIMEOUT_MS;
@@ -99,6 +107,9 @@ export const grep = {
         }
         if (aborted) { timedOutFiles++; results.push(`${rel}: [scan aborted at ${PER_FILE_TIMEOUT_MS}ms]`); }
       } catch { /* skip binary/unreadable */ }
+    }
+    if (tooLarge > 0) {
+      results.unshift(`[note] ${tooLarge} file(s) over ${GREP_MAX_FILE_BYTES / (1024 * 1024)} MB not searched.`);
     }
     if (timedOutFiles > 0) {
       results.unshift(`[note] ${timedOutFiles} file(s) hit the per-file ${PER_FILE_TIMEOUT_MS}ms scan timeout (possible ReDoS pattern).`);

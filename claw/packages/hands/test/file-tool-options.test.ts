@@ -14,7 +14,8 @@ import path from "node:path";
 
 import { read, READ_DEFAULT_LINES } from "../src/tools/fs/read.js";
 import { edit } from "../src/tools/fs/edit.js";
-import { grep } from "../src/tools/fs/grep.js";
+import { grep, GREP_SKIP, GREP_MAX_FILE_BYTES } from "../src/tools/fs/grep.js";
+import { WORKSPACE_EXCLUDES } from "@claw/protocol";
 
 let dir: string;
 
@@ -99,6 +100,28 @@ test("grep searches dot-directories such as .github, and skips .git and node_mod
   const out = textOf(await grep.execute({ pattern: "needle", path: dir }));
   assert.ok(out.includes(path.join(".github", "workflows", "ci.yaml")) || out.includes("ci.yaml"), out);
   assert.doesNotMatch(out, /\.git[/\\]config|node_modules/);
+});
+
+test("grep skips every tree a workspace snapshot leaves behind, so uploads and transcripts are not read whole", async () => {
+  for (const d of [".uploads", ".runtime", ".transcripts", ".hands-binary", "hsa", "worktree", ".tool-results", "torchinductor_root"]) {
+    put(`${d}/f.txt`, "needle\n");
+  }
+  put("src/kept.txt", "needle\n");
+  const out = textOf(await grep.execute({ pattern: "needle", path: dir }));
+  assert.match(out, /kept\.txt/);
+  assert.doesNotMatch(out, /\.uploads|\.runtime|\.transcripts|\.hands-binary|hsa|worktree|\.tool-results|torchinductor/, out);
+  for (const name of WORKSPACE_EXCLUDES) assert.ok(GREP_SKIP.includes(name as never), `grep enters ${name}`);
+});
+
+test("grep does not read a file over the size cap, and says so", async () => {
+  put("small.txt", "needle\n");
+  const big = put("big.bin", "");
+  fs.truncateSync(big, GREP_MAX_FILE_BYTES + 1);
+  fs.appendFileSync(big, "needle\n");
+  const out = textOf(await grep.execute({ pattern: "needle", path: dir }));
+  assert.match(out, /small\.txt/);
+  assert.doesNotMatch(out, /big\.bin/);
+  assert.match(out, /1 file\(s\) over 8 MB not searched/);
 });
 
 test("grep is case-insensitive by default and exact with case_sensitive", async () => {
