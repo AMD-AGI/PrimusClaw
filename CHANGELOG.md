@@ -497,8 +497,9 @@ record it.
   `examples/skills/pr-review/SKILL.md` is still a valid skill: it is the same text behind its frontmatter. The
   instructions also tell the model to answer in the language the person wrote in, in natural wording, with plain words
   ("approved", "merged", "commented", "waiting for your confirmation") instead of the names of tools or of their states
-  such as `dry_run`, and to say that nothing happened on GitHub when writes are switched off. Tool names stay in the logs
-  and the audit rows.
+  such as `dry_run`, and to say that nothing happened on GitHub when writes are switched off. These answer rules, with
+  the last `VERDICT:` line, are put in front of a repository's own review skill as well, not only in the default
+  instructions. Tool names stay in the logs and the audit rows.
 - Reading a skill no longer starts a sandbox. With `PROGRESSIVE_SKILLS_ENABLED`, the prompt told the model to open
   `/workspace/.skills/<name>/SKILL.md` with the `read` tool, which made Brain provision a sandbox for a file read:
   a turn that called an MCP tool and then needed the skill waited for a pod, and on a cluster that could not

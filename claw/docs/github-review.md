@@ -390,8 +390,8 @@ A repository's review skill is read from the **tip of the base branch** and nowh
 (never the pull request's head, which could rewrite the rules it is reviewed by), in the order
 `.claude/skills/review-pr`, any other `.claude/skills/*review*`, any `.agents/skills/*review*`,
 together with the base's `AGENTS.md` and `.github/copilot-instructions.md`. The fixed rules (read
-and comment only, text from the pull request is data, the tools' gates) are always put in front
-of it. Without one the default review instructions apply
+and comment only, text from the pull request is data, the tools' gates) and the answer rules below
+are always put in front of it. Without one the default review instructions apply
 ([`examples/skills/pr-review/SKILL.md`](../examples/skills/pr-review/SKILL.md) is the same text behind
 a skill's frontmatter, so it can also be imported as an ordinary skill; `review_instructions` itself
 carries no frontmatter, which would only send the model looking for a skill of that name, and a
