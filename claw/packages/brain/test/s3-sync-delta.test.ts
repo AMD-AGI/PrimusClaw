@@ -46,9 +46,10 @@ const s3 = createServer((req, res) => {
     const prefix = url.searchParams.get("prefix") ?? "";
     const keys = [...store.objects].filter((k) => k.startsWith(prefix)).sort();
     res.setHeader("Content-Type", "application/xml");
-    res.end(`<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>claw</Name><Prefix>${prefix}</Prefix>`
+    const xml = (v: string): string => v.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    res.end(`<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>claw</Name>`
       + `<KeyCount>${keys.length}</KeyCount><IsTruncated>false</IsTruncated>`
-      + keys.map((k) => `<Contents><Key>${k}</Key><Size>1</Size></Contents>`).join("")
+      + keys.map((k) => `<Contents><Key>${xml(k)}</Key><Size>1</Size></Contents>`).join("")
       + "</ListBucketResult>");
     return;
   }
