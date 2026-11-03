@@ -169,7 +169,7 @@ review and the merge and who is the reviewer of record, and whose own standing a
      branch asks for it (`confirm_merge: always`, or a changed path matches its `high_risk_paths`), or
      that configuration does not parse; the change touches a file that controls the repository
      (`.github/workflows/`, `.github/actions/`, `CODEOWNERS` at the root, under `.github/` or `docs/`,
-     `.github/claw-review.yml` or the earlier name `.github/clawy.yml`), including a file moved out of
+     `.github/claw-review.yml` or the same file under its earlier name), including a file moved out of
      one; the file list is cut (more files than are read), so such a change cannot be ruled out; or the
      rules themselves fail.
 

@@ -348,7 +348,7 @@ record it.
   outside the organisation (the person who asked is very often the author), a fork, another base branch, an
   interface or dependency change are for the model to weigh. Before, nearly every approval of an ordinary large
   pull request by a contributor was held. What still holds whatever the model says: the repository's own
-  `.github/claw-review.yml` (or `.github/clawy.yml`) asking for it (`confirm_merge: always`, a `high_risk_paths`
+  `.github/claw-review.yml` (or the same file under its earlier name) asking for it (`confirm_merge: always`, a `high_risk_paths`
   match) or not parsing; a change to `.github/workflows/`, `.github/actions/`, `CODEOWNERS` or that configuration
   file; a cut file list; rules that fail; and a missing or malformed judgement. The model's `risk_flags` hold as
   before. The held confirmation and the tool answer give the reasons in plain words, the model's own first.
