@@ -64,7 +64,9 @@ SKILL.md. `load_skill` is exempt from the generic 6000-character tool-result cap
 which for a skill means `read` or `bash` and so a sandbox): a part, its footer
 (at most 100 paths of at most 120 characters, the rest counted) and the notices
 fit a bound of its own, and a skill of any length is read through `load_skill`
-alone.
+alone. A skill name is at most 255 characters (the name repeats in those notices,
+and a longer one could not be a directory in the sandbox); `load_skill` refuses
+a longer one.
 
 The sandbox is for running commands. The skill directory is written into it the
 first time a sandbox tool call names `.skills`, immediately before that call

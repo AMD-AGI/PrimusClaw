@@ -21,13 +21,25 @@ const FOOTER_PATH_MAX_CHARS = 120;
  * SKILL.md of ordinary length (the longest real ones are ~12k) is one part.
  */
 export const SKILL_PAGE_CHARS = 16000;
-/** What a part may carry besides its text: the continuation line and the fixed words of the footer. */
+/**
+ * The longest skill name `load_skill` serves. The name is repeated in a part's
+ * notices and in the footer, and a name longer than a directory entry can be
+ * (255 on every filesystem Brain and the sandbox use) could not be written to
+ * `<skillBase>/<name>/` anyway; without the limit the size of a result would
+ * depend on a string nobody bounds.
+ */
+export const SKILL_NAME_MAX_CHARS = 255;
+/**
+ * What a part may carry besides its text: the continuation line and the fixed
+ * words of the footer, with a name of SKILL_NAME_MAX_CHARS in them three times
+ * (or, for a file other than SKILL.md, which has no footer, its path twice).
+ */
 const NOTICE_RESERVE_CHARS = 4000;
 /**
  * The most one `load_skill` result can be: a part, a footer that lists at most
  * FOOTER_MAX_FILES paths of at most FOOTER_PATH_MAX_CHARS each, and the notices.
  * The agent loop caps `load_skill` results at exactly this, so its own cap never
- * cuts a part or the file list.
+ * cuts a part or the file list; `load` stays under it for every name it serves.
  */
 export const LOAD_SKILL_RESULT_MAX_CHARS =
   SKILL_PAGE_CHARS + FOOTER_MAX_FILES * (FOOTER_PATH_MAX_CHARS + 3) + NOTICE_RESERVE_CHARS;
@@ -68,6 +80,9 @@ export class SkillStore {
    * guessing a path. A part ends at a line break when one is near the limit.
    */
   async load(name: string, file?: string, offset?: unknown): Promise<SkillLoad> {
+    if (name.length > SKILL_NAME_MAX_CHARS) {
+      return { ok: false, error: `Error: a skill name is at most ${SKILL_NAME_MAX_CHARS} characters; '${name.slice(0, 60)}...' has ${name.length}.` };
+    }
     const skill = this.byName.get(name);
     if (!skill) {
       const known = this.names;

@@ -12,7 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import type { ToolSchema } from "@claw/protocol";
 
-const { SkillStore, LOAD_SKILL_TOOL, SKILL_PAGE_CHARS, LOAD_SKILL_RESULT_MAX_CHARS } = await import("../src/agent/skill-store.js");
+const { SkillStore, LOAD_SKILL_TOOL, SKILL_PAGE_CHARS, SKILL_NAME_MAX_CHARS, LOAD_SKILL_RESULT_MAX_CHARS } = await import("../src/agent/skill-store.js");
 const { truncateToolResult } = await import("../src/agent/agent-loop.js");
 const { ToolRouter } = await import("../src/tools/router.js");
 const { parseToolAllowlist } = await import("../src/tools/allowlist.js");
@@ -304,6 +304,35 @@ test("the file list is bounded: 100 paths of at most 120 chars, longer ones and 
   assert.ok(last.length <= LOAD_SKILL_RESULT_MAX_CHARS, `${last.length} <= ${LOAD_SKILL_RESULT_MAX_CHARS}`);
   assert.equal(truncateToolResult(last, LOAD_SKILL_TOOL), last, "the loop's cap leaves the whole list");
   assert.ok(truncateToolResult(last).length < last.length, "where the generic cap would have cut it");
+});
+
+test("worst case: the longest name, a last part of a full page and a full file list stay under the load_skill bound; a longer name is refused, not served over it", async () => {
+  const name = "n".repeat(SKILL_NAME_MAX_CHARS);
+  const files: Record<string, string> = { "SKILL.md": "y".repeat(SKILL_PAGE_CHARS * 2) }; // no line break: two full parts
+  for (let i = 0; i < 100; i++) files[`references/${String(i).padStart(3, "0")}-${"d".repeat(100)}.md`] = "x";
+  const store = new SkillStore([skill(name, stage(files), {}), skill("n".repeat(3000), stage({ "SKILL.md": "X" }))], "/workspace/.skills");
+  const results = await readAll(store, name);
+  assert.equal(results.length, 2);
+  const last = results[1];
+  assert.ok(partText(last).length === SKILL_PAGE_CHARS, "a full page");
+  assert.equal(last.split("\n- ").length - 1, 100, "100 paths listed");
+  assert.ok(last.endsWith("under /workspace/.skills/" + name + "/ (the sandbox gets the skill's files when a command first names .skills)."), "to the end of the footer");
+  assert.ok(last.length <= LOAD_SKILL_RESULT_MAX_CHARS, `${last.length} <= ${LOAD_SKILL_RESULT_MAX_CHARS}`);
+  assert.equal(truncateToolResult(last, LOAD_SKILL_TOOL), last, "so the loop's cap leaves it whole");
+  // A name no directory could hold is refused with a short answer, however it was written in the list.
+  for (const long of ["n".repeat(SKILL_NAME_MAX_CHARS + 1), "n".repeat(3000)]) {
+    const r = await store.load(long);
+    assert.ok(!r.ok && r.error.length < 200 && r.error.includes(String(long.length)), `${long.length} chars: ${r.ok ? "served" : r.error}`);
+  }
+});
+
+test("worst case: a reference file under a deep path pages within the bound, its path in both notices", async () => {
+  const deep = ["a", "b", "c", "d"].map((c) => c.repeat(250)).join("/") + "/ref.md";
+  const store = new SkillStore([skill("s1", stage({ "SKILL.md": "X", [deep]: "r".repeat(SKILL_PAGE_CHARS * 2 + 7) }))]);
+  const results = await readAll(store, "s1", deep);
+  assert.equal(results.length, 3);
+  for (const t of results) assert.ok(t.length <= LOAD_SKILL_RESULT_MAX_CHARS && truncateToolResult(t, LOAD_SKILL_TOOL) === t);
+  assert.ok(results[0].split(deep).length - 1 >= 2, "the path is in the header and in the call to make next");
 });
 
 // --- the loop's cap -----------------------------------------------------------
