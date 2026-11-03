@@ -180,8 +180,8 @@ const DEEP_REVIEW_STEPS = `## Steps
    Read each of those whole before you judge, in pages: \`gh_pr_get\` with \`section\`, the \`head_sha\`,
    the \`read_id\` and \`offset\` 0, then each page's \`next_offset\` until it is null. A page you skip is a part of
    the change you did not review. On the \`sandbox\` path the \`diff\` section is the one exception: do not
-   page it; read the diff once from the checkout (\`.pr-review/pr.diff\`, step 4), and page it only if the
-   recipe fails. If the head moves while
+   page it; read the diff once from the checkout (\`.pr-review/pr.diff\`, step 4, all of it, with as many
+   \`read\` offsets as it takes), and page it only if the recipe fails. If the head moves while
    you work, start again from the new head. Read \`acting\` (whether approve and merge are open
    to you or only comments) and \`review_path\`:
    - \`api_diff\` (a small change): review from the diff and the file list in the result and do
@@ -253,7 +253,8 @@ const DEEP_REVIEW_STEPS = `## Steps
    - On the sandbox path, start it with the \`task\` tool: \`subagent_type\` \`explore\` and
      \`tools\` \`["bash", "read", "grep", "glob", "ls"]\` (it must not have the review tools). Its prompt
      names the checkout directory, the base (\`origin/<base>\`), the head commit, the path of
-     \`.pr-review/pr.diff\` (it reads the change there, once, and does not page or regenerate it), the
+     \`.pr-review/pr.diff\` (it reads the change there once, all of it, with as many \`read\` offsets as it
+     takes, and does not regenerate it), the
      intent of the change in two sentences, the files and functions you read, the callers and users
      you saw in a search but did not open, what you ran, and your findings, one line each. It asks
      it to open those unopened callers and users first, to read again what you read only to follow

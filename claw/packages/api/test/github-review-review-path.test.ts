@@ -255,7 +255,7 @@ test("the second pass is handed the diff file, what was read and the callers see
   assert.match(text, /of the callers and users a search showed you that you did not open \(path, line, name\)/);
   const second = text.slice(text.indexOf("Second pass, always"));
   for (const handed of [
-    /the path of `\.pr-review\/pr\.diff` \(it reads the change there, once, and does not page or regenerate it\)/,
+    /the path of `\.pr-review\/pr\.diff` \(it reads the change there once, all of it, with as many `read` offsets as it takes, and does not regenerate it\)/,
     /the files and functions you read, the callers and users you saw in a search but did not open, what you ran/,
     /to open those unopened callers and users first/,
     /writing each one down as soon as it has it: it has at most 20 turns/,
@@ -332,7 +332,7 @@ test("with the deep review set to false, the model is given exactly what main ga
 
 test("the deep review's sandbox path reads the diff once from the checkout and does not page it; its diff path still pages it", async () => {
   const step1 = DEEP_PR_REVIEW_INSTRUCTIONS.replace(/\s+/g, " ").split(" 2. ")[0]!;
-  assert.match(step1, /On the `sandbox` path the `diff` section is the one exception: do not page it; read the diff once from the checkout \(`\.pr-review\/pr\.diff`, step 4\), and page it only if the recipe fails/);
+  assert.match(step1, /On the `sandbox` path the `diff` section is the one exception: do not page it; read the diff once from the checkout \(`\.pr-review\/pr\.diff`, step 4, all of it, with as many `read` offsets as it takes\), and page it only if the recipe fails/);
   assert.doesNotMatch(step1, /What you review is the diff in the `gh_pr_get` result/);
   const { e, service } = await envWith(DEEP);
   const sandbox = (await service.getPr(e.actor, { pr: PR })).body as any;
