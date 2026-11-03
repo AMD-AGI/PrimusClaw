@@ -1,0 +1,10 @@
+{
+  "api": {
+    "extra-ca": "/etc/claw-ca",
+    "grant-signing-key": "/var/run/claw/grant"
+  },
+  "brain": {
+    "extra-ca": "/etc/claw-ca",
+    "sandbox-template": "/etc/claw"
+  }
+}
