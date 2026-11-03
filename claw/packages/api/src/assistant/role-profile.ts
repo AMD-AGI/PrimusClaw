@@ -22,15 +22,17 @@ import {
 } from "../config.js";
 import { db } from "../infra/db.js";
 import { RUN_BUDGET_DEFAULT_SEC } from "../tasks/run-budget.js";
+import { languageToAnswerIn, withReplyLanguage } from "./language.js";
 import {
-  ROUTER_PROMPT_VERSION, WORKER_PROMPT_VERSION, renderRouterSystem, renderWorkerSystem, type ManifestItem,
+  ASSISTANT_MCP_SERVER, ROUTER_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, renderRouterSystem, renderWorkerSystem,
+  type ManifestItem,
 } from "./prompts.js";
 import { startWorkerRun } from "./run-started.js";
 import { mintAssistantToken, type AssistantTokenClaims } from "./token.js";
 
 const logger = pino({ name: "assistant-role" });
 
-export const ASSISTANT_MCP_SERVER = "assistant";
+export { ASSISTANT_MCP_SERVER };
 export const ASSISTANT_MCP_PATH = "/v1/internal/assistant-mcp";
 /** Every tool of the assistant MCP service, as Brain names them. */
 export const ASSISTANT_TOOLS_PATTERN = `mcp__${ASSISTANT_MCP_SERVER}__*`;
@@ -70,7 +72,7 @@ export async function skipsSkillSelection(sessionId: string): Promise<boolean> {
 
 export async function routerManifest(userId: string): Promise<ManifestItem[]> {
   const rows = (await db.query(
-    `SELECT seq, title, summary, board_state, last_report_kind, result_version, pending_question FROM (
+    `SELECT item_id, seq, title, summary, board_state, last_report_kind, result_version, pending_question FROM (
        SELECT * FROM claw_work_items
         WHERE user_id = $1
           AND (board_state <> 'done' OR closed_at > NOW() - $2::interval)
@@ -79,6 +81,7 @@ export async function routerManifest(userId: string): Promise<ManifestItem[]> {
     [userId, MANIFEST_CLOSED_WINDOW, MANIFEST_MAX_ITEMS],
   )).rows as Array<Record<string, unknown>>;
   return rows.map((r) => ({
+    itemId: String(r.item_id),
     seq: Number(r.seq),
     title: String(r.title),
     boardState: String(r.board_state),
@@ -87,6 +90,35 @@ export async function routerManifest(userId: string): Promise<ManifestItem[]> {
     resultVersion: Number(r.result_version),
     pendingQuestion: (r.pending_question as string | null) ?? null,
   }));
+}
+
+/** How far back the user's own messages are read for a language, when the current one does not show it. */
+const LANGUAGE_LOOKBACK_MESSAGES = 5;
+
+/** What the user wrote to this assistant before, newest first. A worker's report is not theirs. */
+async function earlierUserMessages(sessionId: string): Promise<string[]> {
+  const rows = (await db.query(
+    `SELECT content FROM claw_conversation_turns
+      WHERE session_id = $1 AND role = 'user' AND deleted_at IS NULL AND NOT starts_with(content, $2)
+      ORDER BY turn_index DESC LIMIT $3`,
+    [sessionId, WORK_EVENT_PREFIX, LANGUAGE_LOOKBACK_MESSAGES],
+  )).rows as Array<{ content: string }>;
+  return rows.map((r) => r.content);
+}
+
+/**
+ * Say in which language to answer, beside the message being answered (`language.ts`). The message the turn starts
+ * with is the user's own, or a worker's report that woke the assistant; a report says nothing about the user's
+ * language, so for it the language is the one they last wrote in. Only the request changes: the turn that is stored
+ * and shown is the user's words as they sent them.
+ */
+async function addReplyLanguage(task: Record<string, unknown>, sessionId: string): Promise<void> {
+  const prompt = stringField(task, "prompt");
+  if (!prompt) return;
+  const language = await languageToAnswerIn(
+    prompt.startsWith(WORK_EVENT_PREFIX) ? null : prompt, () => earlierUserMessages(sessionId),
+  );
+  if (language) task.prompt = withReplyLanguage(prompt, language);
 }
 
 function tokenTtlSeconds(): number {
@@ -129,6 +161,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     task.mcp_servers = {};
     for (const field of ["skills", "tool_ids", "plugin_id", "plugin_tools"]) delete task[field];
     withSystemAppend(task, renderRouterSystem(await routerManifest(role.userId)));
+    await addReplyLanguage(task, sessionId);
     logger.info({ sessionId, taskId, prompt: ROUTER_PROMPT_VERSION }, "assistant.router_turn");
   } else {
     const started = await startWorkerRun(sessionId, taskId);

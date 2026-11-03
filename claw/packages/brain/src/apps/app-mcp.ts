@@ -18,7 +18,7 @@
 import pino from "pino";
 import type { AppMcp } from "@claw/protocol";
 import { SANDBOX_NAMESPACE, SANDBOX_ROUTER_AUTH_ENABLED } from "../config.js";
-import { routerBaseForPortProxy } from "../sandbox/sandbox-router.js";
+import { routerBaseForPortProxy, withRouterFailover } from "../sandbox/sandbox-router.js";
 import type { AppRunContext, AppRunnerSeams } from "./app-runner.js";
 
 const logger = pino({ name: "app-mcp" });
@@ -83,7 +83,10 @@ function rpcMessage(contentType: string, text: string): any {
 
 /** Never puts a token or a response body into the verdict. */
 export async function probeAppMcp(i: McpProbeInput): Promise<McpProbeVerdict> {
-  const doFetch = i.fetch ?? globalThis.fetch;
+  // The URL is built on one base of the sandbox's Router; with several listed, a base
+  // that cannot be reached must not leave the app's MCP unregistered while another works.
+  const doFetch = i.fetch
+    ?? (withRouterFailover((input: RequestInfo | URL, init?: RequestInit) => globalThis.fetch(input, init)) as typeof globalThis.fetch);
   let resp: Response;
   try {
     resp = await doFetch(i.url, {
@@ -107,7 +110,8 @@ export async function probeAppMcp(i: McpProbeInput): Promise<McpProbeVerdict> {
 }
 
 export interface AppMcpSeamDeps {
-  routerBase?: () => string | null;
+  /** The Router base for a sandbox in the given namespace. */
+  routerBase?: (namespace: string) => string | null;
   namespace?: string;
   routerAuth?: () => boolean;
   fetch?: typeof globalThis.fetch;
@@ -133,12 +137,13 @@ export function appMcpSeams(deps: AppMcpSeamDeps = {}): Pick<AppRunnerSeams, "re
       if (!mcp || !ctx.instance || !workloadId) return;
       const runId = ctx.record.run_id;
       if (registered.get(runId) === workloadId) return;
-      const base = routerBase();
+      const namespace = ctx.instance.namespace?.trim() || deps.namespace || SANDBOX_NAMESPACE;
+      const base = routerBase(namespace);
       if (!base) {
         logger.warn({ runId }, "app_mcp.no_router_base");
         return;
       }
-      const url = appMcpUrl(base, ctx.instance.namespace?.trim() || deps.namespace || SANDBOX_NAMESPACE, workloadId, mcp);
+      const url = appMcpUrl(base, namespace, workloadId, mcp);
       const { mcp_token: token } = await ctx.store.secrets(runId);
       const verdict = await probeAppMcp({
         url, token, tokenHeader: mcp.token_header, sandboxSessionId: workloadId,

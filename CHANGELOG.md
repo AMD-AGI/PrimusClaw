@@ -477,6 +477,60 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- Reading a skill no longer starts a sandbox. With `PROGRESSIVE_SKILLS_ENABLED`, the prompt told the model to open
+  `/workspace/.skills/<name>/SKILL.md` with the `read` tool, which made Brain provision a sandbox for a file read:
+  a turn that called an MCP tool and then needed the skill waited for a pod, and on a cluster that could not
+  schedule one (all sandbox nodes unschedulable) the user watched a progress bar for minutes before Brain gave up
+  after ~15 minutes. A skill is instructions for the model, so Brain now serves it: the listed skills are loaded
+  with a new `load_skill` tool (`name`, optional `file`) from Brain's own staged copy, with no sandbox, and the
+  prompt says so instead of giving a path to read. SKILL.md comes back with the skill's other files and the sandbox
+  path its scripts run from. The sandbox is for running things: a skill's files, scripts included, are still
+  written into it the first time a sandbox tool names `.skills`, so running a script starts a sandbox as before, and
+  a model that reads a `.skills` path with `read` or `bash` still gets the file. `load_skill` is offered only when
+  the prompt lists skills, is allowed in plan mode and for the `readonly` and `explore` sub-agents, and is subject
+  to `tools_allowlist`: a run whose list does not name it (every list written before the tool existed) is not
+  offered it, and gets the skill hint from before, which reads SKILL.md with `read` from the path on each line, as
+  its skills were read until now; a list that names `load_skill` gets the sandbox-free load. It is in the default
+  `HITL_AUTO_ALLOW`, so turning approval on does not start asking about every skill the model loads. A skill longer than the loop's 6000-character tool-result cap is not cut by it, which would
+  have sent the model back to `read` or `bash` for the rest: `load_skill` returns a file in parts of up to 16000
+  characters, each saying the `offset` of the next, and has a bound of its own that leaves a part and the skill's
+  file list whole.
+- A sandbox that cannot start is now told to the user early and ended early. While a sandbox is held up, either
+  queued in the platform or admitted with nothing yet willing to run its pod, the turn's progress event says so
+  as soon as the platform reports it, instead of one "Waiting in queue (position 0)" and then ten minutes of nothing
+  (`log`, plus additive `waiting` = `queued` | `unscheduled` and `waitReason`: one line in our words, such as how many
+  nodes cannot take the sandbox and why, never the platform's pool ids, namespaces, pod names or taint keys, which stay
+  in the Brain log; the queue's own short phrases are repeated as written). A sandbox the platform admitted whose pod no node has taken and for which no node is being added,
+  for `SANDBOX_UNSCHEDULABLE_TIMEOUT_SECONDS` (default 300, chart `secret.sandboxUnschedulableTimeoutSeconds`, `0` turns
+  it off), now ends with the new reason `sandbox_unschedulable` saying what was observed, and its workload is stopped;
+  before, it was waited on for the whole of `SANDBOX_START_TIMEOUT_SECONDS` (15 minutes) once the platform called it
+  NotReady, and for `SANDBOX_PENDING_TIMEOUT_SECONDS` (3 hours) while it called it Pending. The platform's own message
+  on such a pod ("0/7 nodes are available ...", "pod didn't trigger scale-up ...") says why it is stuck and does not
+  exempt it; a scale-up the platform reports as triggered, or a message it has not said before, restarts the clock.
+  A sandbox still in the platform's queue, one with a scale-up under way and one that is pulling an image keep their
+  existing, longer limits, and multi-node clusters and hosted applications are unchanged. When opening a
+  run's sandbox ends on `sandbox_unschedulable`, `sandbox_start_timeout` or `sandbox_pending_timeout`, the run no longer
+  provisions another for the rest of that turn (the model used to read a bare "did not become ready", call the tool
+  again, and make the user wait the whole time twice): the tool error tells the model the sandbox is unavailable and to
+  report the reason to the user, a further attempt is refused with the same error, and the workload the failed open left
+  is stopped and its binding reaped even though the run goes on.
+- The assistant's Router (behind `CLAW_ASSISTANT_ENABLED`) could not act on the items it was shown. Its list and a
+  worker's report named an item only as `#3` while the tools took only the item's id, so in an evaluation against a
+  real model a follow-up or a stop was refused as `item_not_found` three times in four. `say`, `work_send`,
+  `work_stop` and `work_recall` now take the item's `item_id` or its number (`#3`, `3`) among the caller's own items
+  (a number is per user, and another user's item is still not found), both are shown in the list and in a report's
+  header, and a reference that names nothing is refused as `item_not_found`, `invalid_item_ref` or
+  `ambiguous_item_ref`. The Router is told to call `work_create`, `work_send` and `work_stop` without a `say` in the
+  same step and to speak after their results, so it no longer announces what a refused call did not do. The message
+  it is answering is followed by a `[Reply language: X]` line (Chinese, Japanese, Korean or English, read from the
+  user's own words with what they quote left out, or from their last ones when a worker's report woke it; a message
+  in another language gets no line, and only one with no wording of its own, such as `ok`, `retry #2` or `done` (at most
+  one Latin word, and no letter of another script), looks back;
+  only the first and last 2000 characters of a long message are read, so a message of megabytes costs what a short
+  one does), so item titles in another language no longer decide the language of a reply. The line is on the request only: the
+  conversation turn written when the run completes holds the user's words from the run row, as they were sent. A
+  turn that ends with plain text and no `say`, which reached nobody, has its text delivered as a `say`. The
+  evaluation in `claw/packages/api/test/e2e/assistant-router-eval.ts` measures all of this against a real model.
 - A caller authenticated by an identity provider's access token (`CLAW_IDENTITY_TOKEN_AUTH_ENABLED`) now has
   the platform key and the virtual key SaFE holds for the token's subject, in the SaFE deployment mode. SaFE is never
   shown the person's token: the API exchanges it at the provider (RFC 8693 service delegation, subject token type

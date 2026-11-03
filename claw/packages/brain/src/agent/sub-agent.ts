@@ -26,8 +26,8 @@ export const SUBAGENT_TYPES = ["explore", "readonly", "shell", "generalPurpose"]
 export type SubagentType = typeof SUBAGENT_TYPES[number];
 
 const PROFILE_ALLOW: Record<SubagentType, string[] | "all"> = {
-  explore:         ["read", "grep", "glob", "ls", "bash"],
-  readonly:        ["read", "grep", "glob", "ls"],
+  explore:         ["read", "grep", "glob", "ls", "bash", "load_skill"],
+  readonly:        ["read", "grep", "glob", "ls", "load_skill"],
   shell:           ["bash"],
   generalPurpose:  "all",
 };

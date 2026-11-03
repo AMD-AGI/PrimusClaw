@@ -9,7 +9,7 @@
  *   O1  a turn's request is finished without a single statement, and without a change
  *   O2  the sweep does nothing, and the router skips nothing
  *   O3  the MCP route is not registered
- *   O4  a completion does not ask for a worker turn's record
+ *   O4  a completion does not ask for a worker turn's record, nor for a router turn's unsaid answer
  */
 import assert from "node:assert/strict";
 import test, { after, before, describe } from "node:test";
@@ -58,17 +58,24 @@ describe("assistant switched off", { skip }, () => {
     await app.close();
   });
 
-  test("O4 a completion does not ask for a worker turn's record", async () => {
+  test("O4 a completion does not ask for a worker turn's record, nor for a router turn's unsaid answer", async () => {
     const { consumeEventDelivery, completionPorts, tombstoneReader } = await import("../src/events/consumer.js");
     const { sc } = await import("../src/infra/nats.js");
     const { resetDeletedSessionCache } = await import("../src/sessions/deleted-cache.js");
     await h.app.db.db.query("INSERT INTO claw_sessions (session_id, name, user_id, mode) VALUES ('s1', 't', 'u1', 'claw')");
+    // A run that is open, so that the completion ends a run: without one the step that asks for a turn's record is never reached.
+    await h.app.db.db.query(
+      `INSERT INTO claw_tasks (task_id, session_id, name, status, origin, executor, input, metadata, depends_on, created_at, queued_at)
+       VALUES ('ktsk_1', 's1', 'chat', 'running', 'chat', 'brain', '{}'::jsonb, '{"message_id": "m1"}'::jsonb, '{}', NOW(), NOW())`,
+    );
     const originalTombstone = { ...tombstoneReader };
     Object.assign(tombstoneReader, { has: async () => false });
     resetDeletedSessionCache();
     const original = completionPorts.recordWorkerTurnEnd;
+    const originalUnsaid = completionPorts.deliverUnsaidAnswer;
     let asked = 0;
     completionPorts.recordWorkerTurnEnd = async (e) => { asked += 1; return original(e); };
+    completionPorts.deliverUnsaidAnswer = async (e) => { asked += 1; return originalUnsaid(e); };
     const outcome: string[] = [];
     try {
       await consumeEventDelivery({
@@ -81,10 +88,12 @@ describe("assistant switched off", { skip }, () => {
       });
     } finally {
       completionPorts.recordWorkerTurnEnd = original;
+      completionPorts.deliverUnsaidAnswer = originalUnsaid;
       Object.assign(tombstoneReader, originalTombstone);
       resetDeletedSessionCache();
     }
     assert.deepEqual(outcome, ["ack"], "the completion was handled");
+    assert.equal((await h.app.db.db.query("SELECT status FROM claw_tasks WHERE task_id = 'ktsk_1'")).rows[0].status, "completed", "and it ended the run, which is what the record is asked for");
     assert.equal(asked, 0);
   });
 });

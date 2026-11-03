@@ -64,7 +64,7 @@ func userObject(name, role, workspace string) *unstructured.Unstructured {
 }
 
 func TestSystemAdminIgnoresWorkspaceMembership(t *testing.T) {
-	user := userObject("admin-1", systemAdminRole, "global-control-plane")
+	user := userObject("admin-1", SystemAdminRole, "global-control-plane")
 	dc := dynfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
 		userGVR: "UserList",
 	}, user)

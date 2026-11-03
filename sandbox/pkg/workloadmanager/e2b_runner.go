@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+
 	"sigs.k8s.io/agent-sandbox/pkg/e2b"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
@@ -193,15 +195,26 @@ func (s *Server) Delete(ctx context.Context, sandboxID string) error {
 // SetTimeout moves the session expiry to now plus timeout.
 // The caller only reaches this after the grant accepts the new duration.
 // A SaFE Workload stores that same lifetime as a duration from its start time.
+// A Workload without a session record, such as one on a remote cluster, is
+// updated by its sandbox id.
 func (s *Server) SetTimeout(ctx context.Context, sandboxID string, timeout time.Duration) error {
-	info, err := s.store.GetSandboxBySessionID(ctx, sandboxID)
-	if err != nil {
-		return err
-	}
 	if timeout <= 0 {
 		return fmt.Errorf("timeout must be > 0")
 	}
 	now := time.Now()
+	info, err := s.store.GetSandboxBySessionID(ctx, sandboxID)
+	if errors.Is(err, store.ErrNotFound) && s.workloads != nil {
+		if err := s.workloads.AlignTimeout(ctx, sandboxID, timeout, now); err != nil {
+			if apierrors.IsNotFound(err) {
+				return store.ErrNotFound
+			}
+			return err
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
 	if info.Kind == store.WorkloadKind {
 		if s.workloads == nil {
 			return fmt.Errorf("safe workload client is not configured")

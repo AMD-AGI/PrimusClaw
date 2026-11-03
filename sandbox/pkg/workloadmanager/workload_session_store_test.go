@@ -163,3 +163,26 @@ func TestE2BSetTimeoutUpdatesWorkloadMissingFromStore(t *testing.T) {
 		t.Fatalf("timeout=%d", timeout)
 	}
 }
+
+func TestE2BSetTimeoutUpdatesRemoteClusterWorkload(t *testing.T) {
+	labels := e2bLabels()
+	labels[safeClusterIDLabel] = "crusoe"
+	dc := workloadStoreClient(e2bWorkload(e2bWorkloadID, "Running", labels))
+	workloads := NewSafeWorkloadCreator(dc, nil)
+	workloads.SetRemoteClusters([]string{"crusoe"})
+	st := NewWorkloadSessionStore(noWriteStore{store.NewMemoryStore()}, workloads)
+	srv := New(Config{Namespace: "ns", DefaultTTL: time.Hour}, st).WithSafeWorkloads(workloads)
+	if err := srv.SetTimeout(context.Background(), e2bWorkloadID, 10*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	got, err := dc.Resource(workloadGVR).Get(context.Background(), e2bWorkloadID, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if timeout, _, _ := unstructured.NestedInt64(got.Object, "spec", "timeout"); timeout <= 300 {
+		t.Fatalf("timeout=%d", timeout)
+	}
+	if err := srv.SetTimeout(context.Background(), "sbx-00000000000000000000000000000000", time.Minute); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("missing workload err = %v", err)
+	}
+}

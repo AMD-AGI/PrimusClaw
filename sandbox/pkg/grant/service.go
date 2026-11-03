@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -62,6 +63,7 @@ type Service struct {
 	promoter   PendingPromoter
 	record     Recorder
 	now        func() time.Time
+	owner      atomic.Pointer[ownerConfig]
 }
 
 // PendingPromoter finishes a pending sandbox whose Workload the create goroutine no longer owns.

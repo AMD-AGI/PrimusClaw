@@ -26,14 +26,15 @@ import {
   type AssistantItemSnapshot,
 } from "../notifications/assistant-events.js";
 import { deterministicEventId, enqueue, kickDelivery, onDelivered } from "../notifications/outbox.js";
-import { canAccept } from "./work-items.js";
+import type { ItemRefError } from "./item-ref.js";
+import { canAccept, resolveWorkItem } from "./work-items.js";
 
 const logger = pino({ name: "assistant-outbound" });
 
 /** The longest message the assistant may say: about a hundred words. */
 export const SAY_TEXT_MAX = 600;
 
-export type SayRefusal = "empty_text" | "text_too_long" | "item_not_found" | "say_rate_limited";
+export type SayRefusal = "empty_text" | "text_too_long" | "item_not_found" | ItemRefError | "say_rate_limited";
 
 /** A say that was not stored. `code` is what the caller tells the model. */
 export class SayRefused extends Error {
@@ -48,7 +49,7 @@ export interface SayInput {
   /** The user's assistant session: where a web client sees the message. */
   sessionId: string;
   text: string;
-  /** An item of this user's that the message is about; it is attached to the event as a snapshot. */
+  /** An item of this user's that the message is about, by its id or its number (`#3`); it is attached to the event as a snapshot. */
   itemId?: string;
   /**
    * Runs first, inside the transaction, before anything is read or written; throwing
@@ -175,7 +176,8 @@ async function loadItem(q: Querier, itemId: string, userId?: string): Promise<It
 
 /**
  * Record a message the assistant chose to say. Throws {@link SayRefused} for an
- * empty or over-long text, for an item that is not this user's, and for a user who
+ * empty or over-long text, for an item that is not this user's or is not named as
+ * an item is (`item-ref.ts`), and for a user who
  * has already had `CLAW_ASSISTANT_SAY_MAX_PER_HOUR` messages in the last hour.
  */
 export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): Promise<SayOutcome> {
@@ -189,8 +191,13 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
     // One say at a time per user: the cap counts stored rows, and without this a burst
     // all count the same number and all insert.
     await q("SELECT pg_advisory_xact_lock(hashtext('claw_assistant_say'), hashtext($1))", [input.userId]);
-    const item = input.itemId ? await loadItem(q, input.itemId, input.userId) : null;
-    if (input.itemId && !item) throw new SayRefused("item_not_found", "no such item");
+    let item: ItemRow | null = null;
+    if (input.itemId?.trim()) {
+      const named = await resolveWorkItem(q, input.userId, input.itemId);
+      if (!named.ok) throw new SayRefused(named.error, named.message);
+      item = await loadItem(q, named.item.item_id, input.userId);
+      if (!item) throw new SayRefused("item_not_found", "no such item");
+    }
     // The system's own messages are not counted: they are what is left when the assistant has failed to speak.
     const recent = Number((await q(
       `SELECT COUNT(*) AS n FROM claw_assistant_says

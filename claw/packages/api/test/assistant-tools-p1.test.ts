@@ -16,6 +16,9 @@
  *   N2  work_stop closes the item, fences its worker out and drops a first message that never started
  *   N3  work_recall gives the summary, the reports or the worker's tail, and marks what a worker wrote as untrusted
  *   X1  L1-7: another user's item is unreachable from every tool, and is not changed
+ *   M1  every tool that names an item takes its id or its number (#2, 2), and acts on that item and no other
+ *   M2  a number is the caller's own: another user's item with the same number is not reached, and one the caller lacks is not found
+ *   M3  a reference that names nothing says which way it failed, in every tool, and nothing is written
  *   Y1  say stores before it announces, refuses what the outbound refuses, and is refused for a turn that is over
  */
 import assert from "node:assert/strict";
@@ -227,7 +230,7 @@ describe("assistant tools", { skip }, () => {
     w.drains.length = 0;
 
     const turn = await w.routerTurn(alice);
-    assert.deepEqual(await t().workSend(turn, { item_id: item.itemId, text: "Also fix the lint errors." }), { ok: true, item_id: item.itemId, status: "in_progress" });
+    assert.deepEqual(await t().workSend(turn, { item_id: item.itemId, text: "Also fix the lint errors." }), { ok: true, item_id: item.itemId, seq: 1, status: "in_progress" });
     const row = await w.item(item.itemId);
     assert.equal(row.board_state, "in_progress");
     assert.equal(row.last_report_kind, "progress");
@@ -254,7 +257,7 @@ describe("assistant tools", { skip }, () => {
     // The drain hands the message to a run and deletes the queue row, and with it the queue's own protection.
     await w.q("DELETE FROM claw_pending_messages WHERE session_id = $1", [item.workerSid]);
     w.drains.length = 0;
-    assert.deepEqual(await t().workSend(turn, { item_id: item.itemId, text: "Also fix the lint errors." }), { ok: true, item_id: item.itemId, status: "in_progress" });
+    assert.deepEqual(await t().workSend(turn, { item_id: item.itemId, text: "Also fix the lint errors." }), { ok: true, item_id: item.itemId, seq: 1, status: "in_progress" });
     assert.equal((await w.pending(item.workerSid)).length, 0, "the same call again queued nothing");
     assert.equal(w.drains.length, 0);
     assert.equal((await w.itemEvents(item.itemId)).filter((e) => e.source === "router" && e.kind === "progress").length, 1);
@@ -303,7 +306,7 @@ describe("assistant tools", { skip }, () => {
     const created = await t().workCreate(await w.routerTurn(alice), { title: "Fix the build", brief: "x" });
     assert.equal(await count("claw_pending_messages"), 1);
     const before = await w.item(created.item_id);
-    assert.deepEqual(await t().workStop(await w.routerTurn(alice), { item_id: created.item_id, reason: "not needed" }), { ok: true, item_id: created.item_id, outcome: "stopped" });
+    assert.deepEqual(await t().workStop(await w.routerTurn(alice), { item_id: created.item_id, reason: "not needed" }), { ok: true, item_id: created.item_id, seq: 1, outcome: "stopped" });
     const row = await w.item(created.item_id);
     assert.deepEqual({ state: row.board_state, outcome: row.outcome, gen: row.generation }, { state: "done", outcome: "stopped", gen: before.generation + 1 });
     assert.equal(await count("claw_pending_messages", `session_id = '${row.worker_session_id}'`), 0, "the worker never starts");
@@ -388,6 +391,118 @@ describe("assistant tools", { skip }, () => {
     const bobsWorker = await w.workerTurn(mine.itemId);
     await t().report(bobsWorker, { kind: "ready", summary: "mine" });
     assert.equal((await w.item(item.itemId)).board_state, "in_progress");
+  });
+
+  /** The four calls that name an item, each for one reference, with what each leaves behind. */
+  const naming: Array<[string, (c: any, ref: string) => Promise<any>]> = [
+    ["say", (c, ref) => t().say(c, { text: "about it", item_id: ref }, w.sayDeps)],
+    ["work_send", (c, ref) => t().workSend(c, { item_id: ref, text: `words for ${ref}` })],
+    ["work_stop", (c, ref) => t().workStop(c, { item_id: ref, reason: "no longer needed" })],
+    ["work_recall", (c, ref) => t().workRecall(c, { item_id: ref, detail: "summary" })],
+  ];
+  /** Which items a call changed, by their numbers. */
+  const touched = async (): Promise<{ says: unknown[]; sent: number[]; stopped: number[] }> => ({
+    says: (await w.q("SELECT item_id FROM claw_assistant_says ORDER BY created_at")).map((r) => r.item_id),
+    sent: (await w.q("SELECT i.seq FROM claw_work_item_events e JOIN claw_work_items i USING (item_id) WHERE e.source = 'router' AND e.kind = 'progress' ORDER BY i.seq")).map((r) => Number(r.seq)),
+    stopped: (await w.q("SELECT seq FROM claw_work_items WHERE outcome = 'stopped' ORDER BY seq")).map((r) => Number(r.seq)),
+  });
+
+  test("M1 every tool that names an item takes its id or its number, and acts on that item and no other", async () => {
+    const first = await w.createItem(alice, "First");
+    const second = await w.createItem(alice, "Second");
+    const third = await w.createItem(alice, "Third");
+    assert.deepEqual([first.seq, second.seq, third.seq], [1, 2, 3]);
+    const refs = (item: { itemId: string; seq: number }): string[] => [item.itemId, `#${item.seq}`, String(item.seq), `item ${item.seq}`];
+
+    // work_recall's other two answers read the item's own log and its worker's session, which are asked for by id.
+    await w.q("INSERT INTO claw_conversation_turns (session_id, turn_index, role, content, message_id) VALUES ($1, 1, 'assistant', 'the second one is half done', 'm1')", [second.workerSid]);
+    for (const ref of refs(second)) {
+      const reports = await t().workRecall(await w.routerTurn(alice), { item_id: ref, detail: "reports" }) as any;
+      assert.deepEqual(reports.reports.map((e: any) => e.kind), ["created"], `reports of ${ref}`);
+      assert.equal(reports.item.item_id, second.itemId);
+      const tail = await t().workRecall(await w.routerTurn(alice), { item_id: ref, detail: "worker_tail" }) as any;
+      assert.match(tail.worker_tail, /the second one is half done/, `tail of ${ref}`);
+    }
+
+    for (const [name, call] of naming) {
+      for (const ref of refs(second)) {
+        await w.q("TRUNCATE claw_assistant_says");
+        await w.q("DELETE FROM claw_work_item_events WHERE kind IN ('progress', 'stopped')");
+        await w.q("UPDATE claw_work_items SET board_state = 'in_progress', outcome = NULL, closed_at = NULL");
+        const out = await call(await w.routerTurn(alice), ref);
+        const changed = await touched();
+        if (name === "work_recall") assert.equal(out.item.item_id, second.itemId, `${name} ${ref}`);
+        if (name === "work_send") assert.deepEqual(out, { ok: true, item_id: second.itemId, seq: 2, status: "in_progress" }, `${name} ${ref}`);
+        if (name === "work_stop") assert.deepEqual(out, { ok: true, item_id: second.itemId, seq: 2, outcome: "stopped" }, `${name} ${ref}`);
+        assert.deepEqual(changed, {
+          says: name === "say" ? [second.itemId] : [], sent: name === "work_send" ? [2] : [], stopped: name === "work_stop" ? [2] : [],
+        }, `${name} ${ref}: only #2 is touched`);
+      }
+    }
+  });
+
+  test("M1b a replay of work_send is a replay whichever way the item is named", async () => {
+    const item = await w.createItem(alice, "Fix the build");
+    const turn = await w.routerTurn(alice);
+    await t().workSend(turn, { item_id: "#1", text: "Also fix the lint errors." });
+    await t().workSend(turn, { item_id: item.itemId, text: "Also fix the lint errors." });
+    await t().workSend(turn, { item_id: "1", text: "Also fix the lint errors." });
+    assert.equal((await w.pending(item.workerSid)).length, 1, "three namings of one call are one message");
+    assert.equal((await w.itemEvents(item.itemId)).filter((e) => e.source === "router" && e.kind === "progress").length, 1);
+  });
+
+  test("M1c an item the turn has just made can be named by the number work_create answered with", async () => {
+    const turn = await w.routerTurn(alice);
+    const created = await t().workCreate(turn, { title: "Fix the build", brief: "x" });
+    assert.deepEqual((await t().workSend(turn, { item_id: `#${created.seq}`, text: "and the lint" })).item_id, created.item_id);
+  });
+
+  test("M2 a number is the caller's own: another user's item with the same number is not reached", async () => {
+    const mine = await w.createItem(alice, "Alice 1");
+    await w.createItem(alice, "Alice 2");
+    const theirs = await w.createItem(bob, "Bob 1");
+    assert.deepEqual([mine.seq, theirs.seq], [1, 1], "both users have a #1");
+
+    // Bob's #1 is Bob's item, and Alice's is left alone.
+    await t().workSend(await w.routerTurn(bob), { item_id: "#1", text: "for bob" });
+    assert.equal((await w.pending(theirs.workerSid)).length, 1);
+    assert.equal((await w.pending(mine.workerSid)).length, 0);
+    await t().workStop(await w.routerTurn(bob), { item_id: "1", reason: "bob's" });
+    assert.equal((await w.item(theirs.itemId)).outcome, "stopped");
+    assert.equal((await w.item(mine.itemId)).outcome, null);
+    assert.equal(((await t().workRecall(await w.routerTurn(bob), { item_id: "#1", detail: "summary" })) as any).item.item_id, theirs.itemId);
+
+    // Alice's #2 is not Bob's, and says nothing about whether it exists: it is simply not found.
+    for (const [name, call] of naming) {
+      const before = JSON.stringify(await touched());
+      assert.equal(await code(call(await w.routerTurn(bob), "#2")), "item_not_found", `${name}: a number only the other user has`);
+      assert.equal(await code(call(await w.routerTurn(bob), mine.itemId)), "item_not_found", `${name}: the other user's id`);
+      assert.equal(JSON.stringify(await touched()), before, `${name}: nothing changed`);
+    }
+    assert.equal((await w.item(mine.itemId)).board_state, "in_progress");
+    assert.equal((await w.pending(mine.workerSid)).length, 0);
+  });
+
+  test("M3 a reference that names nothing says how it failed, in every tool, and nothing is written", async () => {
+    const item = await w.createItem(alice, "Fix the build");
+    await w.createItem(alice, "Second");
+    const before = JSON.stringify(await touched());
+    const refusals: Array<[string, string]> = [
+      ["#99", "item_not_found"], ["99", "item_not_found"], ["kwi_nosuchitem", "item_not_found"],
+      ["the build one", "invalid_item_ref"], ["PR #1", "invalid_item_ref"], ["#", "invalid_item_ref"],
+      ["#1, #2", "ambiguous_item_ref"], [`${item.itemId} and #2`, "ambiguous_item_ref"], ["1 2", "ambiguous_item_ref"],
+    ];
+    for (const [name, call] of naming) {
+      for (const [ref, want] of refusals) assert.equal(await code(call(await w.routerTurn(alice), ref)), want, `${name} ${JSON.stringify(ref)}`);
+    }
+    assert.deepEqual(await touched(), JSON.parse(before), "no item was said about, sent to or stopped");
+    assert.equal(await count("claw_pending_messages"), 0);
+    // A refused call says what to pass, in words the Router can act on.
+    const refused = await t().workSend(await w.routerTurn(alice), { item_id: "the build one", text: "x" }).catch((e) => e);
+    assert.match(refused.message, /item_id from the list, or by its number such as #3/);
+    // And a blank item in say names none, as it always did.
+    assert.equal((await t().say(await w.routerTurn(alice), { text: "hello", item_id: "  " }, w.sayDeps)).ok, true);
+    assert.equal((await w.q("SELECT item_id FROM claw_assistant_says"))[0].item_id, null);
   });
 
   test("Y1 say stores before it announces, and the outbound's refusals reach the router as refusals", async () => {

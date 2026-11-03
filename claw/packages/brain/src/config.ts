@@ -173,12 +173,29 @@ export const TOOLS_API_URL = `${SAFE_API_URL}/claw-api/v1/tools`;
  */
 export const SANDBOX_ROUTER_URL = env("SANDBOX_ROUTER_URL", "");
 /**
+ * The workspace for a sandbox that asks for no GPU (`gpu` absent or 0), when a
+ * deployment keeps CPU-only sandboxes apart from GPU ones. Empty by default: every
+ * sandbox then goes where it always did (the request's `workspace_id`, else
+ * SANDBOX_NAMESPACE). A sandbox that asks for a GPU never goes here: it goes to
+ * SANDBOX_NAMESPACE, which is then the GPU workspace. A request that names a
+ * workspace of its own is still honoured, except that it cannot send a GPU request
+ * to this workspace. See sandbox/workspace-select.ts.
+ */
+export const SANDBOX_CPU_NAMESPACE = env("SANDBOX_CPU_NAMESPACE");
+/**
+ * The Router base(s) of the sandboxes in SANDBOX_CPU_NAMESPACE, same format as
+ * SANDBOX_ROUTER_URL. A Router answers only for the sandboxes of its own cluster, so
+ * a CPU workspace on another cluster than SANDBOX_NAMESPACE needs its own. Empty
+ * means SANDBOX_ROUTER_URL serves it too (and the CPU workspace is on the same cluster).
+ */
+export const SANDBOX_CPU_ROUTER_URL = env("SANDBOX_CPU_ROUTER_URL");
+/**
  * Reach Hands through the Router's port proxy instead of the sandbox's cluster DNS name.
  *
  * Off by default because the DNS name is the shorter path wherever it resolves, which is
  * every deployment whose sandboxes run in its own cluster. Turn it on when they run in
  * another cluster, where that name does not resolve and the Router is the only way in.
- * Has no effect without SANDBOX_ROUTER_URL.
+ * Has no effect without SANDBOX_ROUTER_URL (or, for the CPU workspace, SANDBOX_CPU_ROUTER_URL).
  *
  * Requires a Router running without `--enable-auth`. Routed Hands requests carry the
  * per-sandbox Hands token (in Authorization and X-Hands-Token), not a SaFE API key, so a
@@ -192,7 +209,8 @@ export const SANDBOX_HANDS_VIA_ROUTER = envBool("SANDBOX_HANDS_VIA_ROUTER", fals
  * defined in this file depend on it and that module imports this one.
  */
 export function handsBehindRouterProxy(): boolean {
-  return SANDBOX_HANDS_VIA_ROUTER && /[^\s,]/.test(SANDBOX_ROUTER_URL);
+  return SANDBOX_HANDS_VIA_ROUTER
+    && (/[^\s,]/.test(SANDBOX_ROUTER_URL) || /[^\s,]/.test(SANDBOX_CPU_ROUTER_URL));
 }
 /**
  * Whether the sandbox Router runs with `--enable-auth`. It decides what an
@@ -1084,6 +1102,42 @@ export const SANDBOX_PENDING_TIMEOUT_MS = envInt("SANDBOX_PENDING_TIMEOUT_SECOND
 // 0 waits indefinitely. Stored in ms; configured in seconds like the siblings.
 export const SANDBOX_START_TIMEOUT_MS = envInt("SANDBOX_START_TIMEOUT_SECONDS", 15 * 60) * 1000;
 
+// Maximum duration a sandbox the platform has ADMITTED may sit with nothing having
+// taken its pod -- no node has acknowledged it -- and no node being added for it,
+// before the message fails terminally with reason `sandbox_unschedulable`, the
+// workload is stopped, and the model is told to report it rather than open
+// another. That is what a sandbox that no node will run looks like (every node
+// cordoned, down or tainted for other workloads): waiting longer does not change
+// it, and the user is otherwise left on a progress bar for the whole of the start
+// ceiling above (15 minutes by default, 3 hours if the platform still reports it
+// Pending), twice over if the model retries.
+//
+// The platform writes a message on every pod it could not place ("0/7 nodes are
+// available ...", "pod didn't trigger scale-up ..."). That message says why the
+// pod is stuck; it is not progress, so it does not exempt the wait. Progress is a
+// scale-up the platform reports as triggered (`TriggeredScaleUp`), or a message
+// that changes: either restarts the clock. The platform keeps only its newest
+// scheduling event on the workload and the scheduler repeats its own after the
+// autoscaler's one, so a scale-up that was reported stays in force through the
+// scheduler's account that follows it, and ends only when the autoscaler says it
+// will not add a node (`NotTriggerScaleUp`), the platform withdraws its message
+// or a pod is taken.
+//
+// Counted from the first read that shows the pod untaken and cleared the moment
+// anything takes it, so it measures an absence of progress and never the time a
+// healthy start (image pull, container boot) takes; that keeps its own, longer
+// ceiling above. It does NOT cover a workload still in the platform's queue (a
+// queue moves, and for a GPU sandbox can be hours), nor an admitted one with a
+// node being added (which can take longer than this): those keep the ceilings of
+// their phase, SANDBOX_PENDING_TIMEOUT_SECONDS while Pending and
+// SANDBOX_START_TIMEOUT_SECONDS once the platform reports it NotReady, and the
+// user is told why they are waiting. A cluster whose nodes scale up without the
+// platform saying so should raise this or set 0. Applies to the sandbox a run
+// opens, not to hosted applications or multi-node clusters.
+// Stored in ms; configured in seconds like the siblings. Default 5 minutes. 0
+// disables it (the previous behaviour: only the ceilings above end the wait).
+export const SANDBOX_UNSCHEDULABLE_TIMEOUT_MS = envInt("SANDBOX_UNSCHEDULABLE_TIMEOUT_SECONDS", 5 * 60) * 1000;
+
 // The same ceiling for a multi-node GPU cluster, off by default. A cluster's
 // start is routinely longer than a single sandbox's -- large GPU images, and an
 // Infera cluster is not ready until every role pod is up while the workload
@@ -1777,7 +1831,7 @@ export const WAIT_DEFAULT_SEC = envInt("WAIT_DEFAULT_SEC", 100, { min: 1 });
 
 // --- HITL ---
 export const HITL_ENABLED = envBool("HITL_ENABLED", false);
-export const HITL_AUTO_ALLOW = env("HITL_AUTO_ALLOW", "read,glob,grep,ls,todo_write,web_search,save_memory");
+export const HITL_AUTO_ALLOW = env("HITL_AUTO_ALLOW", "read,glob,grep,ls,load_skill,todo_write,web_search,save_memory");
 export const HITL_DECISION_TIMEOUT_MS = envInt("HITL_DECISION_TIMEOUT_MS", 300_000);
 export const HITL_DECISION_DEFAULT = env("HITL_DECISION_DEFAULT", "allow");
 /**

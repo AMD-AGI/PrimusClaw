@@ -62,6 +62,24 @@ export async function isSandboxOnlyRun(sessionId: string, messageId: string): Pr
   return (r.rows?.length ?? 0) > 0;
 }
 
+/**
+ * What the user said in this turn. Brain echoes the prompt of the request it ran in the completion event, and that
+ * request can be longer than the message: the assistant adds its reply-language line to the request after the run
+ * row is opened (`assistant/role-profile.ts`). Taken from the event, that line would be stored as part of the user's
+ * turn and handed back to the model as history. The run row holds the message as the user sent it, which is also
+ * what the doorbell claim builds its history from; the event's copy is for a run with no row.
+ */
+async function userWords(sessionId: string, messageId: string | null, eventPrompt: string): Promise<string> {
+  if (!messageId) return eventPrompt;
+  const row = (await db.query(
+    `SELECT prompt FROM claw_tasks
+      WHERE session_id = $1 AND metadata->>'message_id' = $2 AND prompt IS NOT NULL
+      LIMIT 1`,
+    [sessionId, messageId],
+  )).rows[0] as { prompt: string } | undefined;
+  return row?.prompt ? row.prompt : eventPrompt;
+}
+
 export async function recordCompletionTurns(
   sessionId: string,
   event: Record<string, unknown>,
@@ -92,9 +110,10 @@ export async function recordCompletionTurns(
     [sessionId],
   )).rows[0].max;
   if (prompt) {
+    const said = await userWords(sessionId, messageId, prompt);
     await db.query(
       "INSERT INTO claw_conversation_turns (session_id, turn_index, role, content, token_count, message_id) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING",
-      [sessionId, lastIdx + 1, "user", prompt, estimateTokens(prompt), messageId],
+      [sessionId, lastIdx + 1, "user", said, estimateTokens(said), messageId],
     );
   }
 

@@ -122,6 +122,14 @@ export const SAFE_API_URL = env("SAFE_API_URL");
  */
 export const SANDBOX_NAMESPACE = env("SANDBOX_NAMESPACE");
 /**
+ * The workspace for sandboxes that ask for no GPU, when a deployment has a separate one
+ * (Brain's SANDBOX_CPU_NAMESPACE; see the Brain config for the rule). Then the workspace
+ * sandboxes start in is this one, not SANDBOX_NAMESPACE, which becomes the GPU workspace:
+ * `GET /v1/me` names this as the default, and Brain's own default is chosen per sandbox.
+ * Empty when not configured.
+ */
+export const SANDBOX_CPU_NAMESPACE = env("SANDBOX_CPU_NAMESPACE");
+/**
  * Management API of the Agent Sandbox control plane that `GET /v1/admin/sandbox/*`
  * lists for the console. Not SANDBOX_ROUTER_URL: that names the Router Brain
  * creates sandboxes through, which may sit in another cluster and expose only the
