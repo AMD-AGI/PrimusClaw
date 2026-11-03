@@ -73,6 +73,7 @@ export interface RunSubagentOptions {
   // LLM config (inherited from parent engine).
   model: string;
   effort?: ReasoningEffort;
+  rollingCacheTtl?: "5m";
   apiUrl: string;
   apiKey: string;
   maxTurns: number;
@@ -210,6 +211,7 @@ export async function runSubagent(opts: RunSubagentOptions): Promise<SubagentRes
     result = await agentLoop(messages, schemas, {
       model: opts.model,
       effort: opts.effort,
+      rollingCacheTtl: opts.rollingCacheTtl,
       apiUrl: opts.apiUrl,
       apiKey: opts.apiKey,
       maxTurns: opts.maxTurns,

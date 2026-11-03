@@ -168,6 +168,8 @@ export interface LlmSessionOptions {
   sessionId?: string;
   /** Every `streamTurn` of the session asks for this reasoning effort; absent leaves the gateway's defaults. `complete` keeps its own. */
   effort?: ReasoningEffort;
+  /** The rolling cache markers of every `streamTurn` are written for five minutes; the anchor keeps `LLM_CACHE_TTL`. */
+  rollingCacheTtl?: "5m";
 }
 
 export interface LlmProvider {

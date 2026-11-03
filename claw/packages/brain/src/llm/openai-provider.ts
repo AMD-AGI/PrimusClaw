@@ -148,6 +148,7 @@ async function streamingTurn(
   capture: RoutedModelSink,
   cacheState: OpenAiCacheState,
   effort?: ReasoningEffort,
+  rollingCacheTtl?: "5m",
 ): Promise<LlmTurnResult> {
   const ctrl = new AbortController();
   const onParentAbort = () => ctrl.abort(signal?.reason);
@@ -171,7 +172,7 @@ async function streamingTurn(
   const useMarkers = OPENAI_CACHE_MARKERS && !cacheState.markersDisabled && !markersRefusedByModel.has(model);
   const rendered = useMarkers
     ? renderOpenAiCacheMarkers(wire as unknown as Array<Record<string, unknown>>,
-        { style: LLM_CACHE_STYLE === "anthropic" ? "anthropic" : "native", ttl: LLM_CACHE_TTL })
+        { style: LLM_CACHE_STYLE === "anthropic" ? "anthropic" : "native", ttl: LLM_CACHE_TTL, rollingTtl: rollingCacheTtl })
     : { messages: wire as unknown as Array<Record<string, unknown>>, breakpointsApplied: 0 };
   const wireMessages = rendered.messages;
   let breakpointsSent = rendered.breakpointsApplied;
@@ -474,7 +475,7 @@ export class OpenAiProvider implements LlmProvider {
   readonly name = "openai" as const;
 
   createSession(opts: LlmSessionOptions): LlmSession {
-    const { model, apiUrl, apiKey, userId, sessionId, effort } = opts;
+    const { model, apiUrl, apiKey, userId, sessionId, effort, rollingCacheTtl } = opts;
 
     const litellmTags = ["product:primus-claw", "executor:brain", `engine:${model.split("-")[0]}`].join(",");
     const litellmMeta = JSON.stringify({ session_id: sessionId || "", user_id: userId || "" });
@@ -499,7 +500,7 @@ export class OpenAiProvider implements LlmProvider {
       },
     });
 
-    return buildOpenAiSession(client, model, capture, effort);
+    return buildOpenAiSession(client, model, capture, effort, rollingCacheTtl);
   }
 }
 
@@ -516,11 +517,12 @@ export function buildOpenAiSession(
   model: string,
   capture: RoutedModelSink = {},
   effort?: ReasoningEffort,
+  rollingCacheTtl?: "5m",
 ): LlmSession {
   const cacheState: OpenAiCacheState = { markersDisabled: false, decoratedFailures: 0, probedWithoutRelief: false };
   return {
     streamTurn: (messages, tools, signal) =>
-      streamingTurn(client, model, messages, tools, signal, capture, cacheState, effort),
+      streamingTurn(client, model, messages, tools, signal, capture, cacheState, effort, rollingCacheTtl),
       async complete(systemPrompt, userText, maxTokens, signal, options) {
         const resp = await client.chat.completions.create({
           model,

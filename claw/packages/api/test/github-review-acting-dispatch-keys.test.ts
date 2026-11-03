@@ -91,6 +91,8 @@ test("D1 a turn claimed from the queue is marked for a session that acts as a us
     assert.equal(request.withhold_sandbox_keys, marked ? true : undefined, what);
     assert.equal(request.effort, marked ? "high" : undefined, `${what}: a review runs at the review's effort`);
     assert.equal((await claim(actingAs, "gpt-4o")).request.effort, undefined, `${what}: not on a model the effort was not set for`);
+    assert.equal(request.rolling_cache_ttl, marked ? "5m" : undefined, `${what}: nobody waits between a review's turns`);
+    assert.equal((await claim(actingAs, "gpt-4o")).request.rolling_cache_ttl, marked ? "5m" : undefined, `${what}: on any model`);
     assert.equal(request.platform_key, "pk-live", `${what}: Brain still needs the key for the model and for SaFE`);
     assert.equal(request.llm_api_key, "sk-live", what);
   }
@@ -127,6 +129,7 @@ test("D2 a task of a DAG is marked for a session that acts as a user, and its ke
     const request = await dispatchDag({ platform_key: "pk-user-1", _server_managed_credentials: true, ...(actingAs === undefined ? {} : { acting_as: actingAs }) });
     assert.equal(request.withhold_sandbox_keys, marked ? true : undefined, what);
     assert.equal(request.effort, marked ? "high" : undefined, `${what}: a review runs at the review's effort`);
+    assert.equal(request.rolling_cache_ttl, marked ? "5m" : undefined, `${what}: nobody waits between a review's turns; any other DAG keeps Brain's TTL`);
     assert.equal(request.platform_key, "pk-user-1", `${what}: Brain still needs the key to own the workload`);
   }
 });

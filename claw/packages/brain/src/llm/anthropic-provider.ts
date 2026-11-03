@@ -67,6 +67,7 @@ async function streamingTurn(
   capture: RoutedModelSink,
   cacheState: SessionCacheState,
   effort?: ReasoningEffort,
+  rollingCacheTtl?: "5m",
 ): Promise<LlmTurnResult> {
   // One abort controller PER ATTEMPT, not per turn.
   //
@@ -97,7 +98,7 @@ async function streamingTurn(
     metrics.onToolInputRepaired("wire", sanitized.repaired);
     logger.warn({ repaired: sanitized.repaired }, "llm.tool_input.repaired_on_wire");
   }
-  const prepared = prepareAnthropicRequest(sanitized.messages, { ttl: LLM_CACHE_TTL });
+  const prepared = prepareAnthropicRequest(sanitized.messages, { ttl: LLM_CACHE_TTL, rollingTtl: rollingCacheTtl });
   const useMarkers = PROMPT_CACHE_ENABLED && !cacheState.disabled;
   const decorated = useMarkers ? prepared : stripCacheControl(prepared);
 
@@ -454,7 +455,7 @@ export class AnthropicProvider implements LlmProvider {
   readonly name = "anthropic" as const;
 
   createSession(opts: LlmSessionOptions): LlmSession {
-    const { model, apiUrl, apiKey, userId, sessionId, effort } = opts;
+    const { model, apiUrl, apiKey, userId, sessionId, effort, rollingCacheTtl } = opts;
 
     // Observability: LiteLLM headers — every messages.create call carries
     // the same tags for spend/log attribution.
@@ -474,7 +475,7 @@ export class AnthropicProvider implements LlmProvider {
       defaultHeaders: anthropicDefaultHeaders({ litellmTags, litellmMeta, userId, sessionId }),
     });
 
-    return buildAnthropicSession(client, model, capture, effort);
+    return buildAnthropicSession(client, model, capture, effort, rollingCacheTtl);
   }
 }
 
@@ -493,6 +494,7 @@ export function buildAnthropicSession(
   model: string,
   capture: RoutedModelSink = {},
   effort?: ReasoningEffort,
+  rollingCacheTtl?: "5m",
 ): LlmSession {
   const cacheState: SessionCacheState = { disabled: false, decoratedFailures: 0 };
   return {
@@ -506,6 +508,7 @@ export function buildAnthropicSession(
         capture,
         cacheState,
         effort,
+        rollingCacheTtl,
       ),
       async complete(systemPrompt, userText, maxTokens, signal, options) {
         const resp = await client.messages.create({

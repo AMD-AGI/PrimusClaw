@@ -94,15 +94,24 @@ export function actingSessionEffort(model: unknown): { effort?: ReasoningEffort 
 }
 
 /**
+ * What a turn of a session that acts as a user carries beyond the mark: the review's effort, and rolling cache markers written for five
+ * minutes. Nobody waits between a review's turns (the longest gap measured over five reviews was 102 s), so a 1h write of the tail is
+ * paid at 8/5 of the 5m price and read only seconds later; the anchor stays at Brain's TTL and still carries the prefix to the next review.
+ */
+export function actingSessionTurnFields(model: unknown): { effort?: ReasoningEffort; rolling_cache_ttl: "5m" } {
+  return { ...actingSessionEffort(model), rolling_cache_ttl: "5m" };
+}
+
+/**
  * Marks a turn that is built here for a session that acts as a user (`withhold_sandbox_keys`, protocol), and takes the owner's stored
  * variables off it: whichever way they reached the task (a queued message that was frozen with them before the mark applied), a session
- * that withholds its sandbox's keys is sent none. The same turn is run at the review's reasoning effort: it is a review.
+ * that withholds its sandbox's keys is sent none. The same turn is run as a review: `actingSessionTurnFields`.
  */
 export async function applySandboxKeyPolicyToTask(task: Record<string, unknown>, sessionId: string): Promise<void> {
   if (!(await sessionWithholdsSandboxKeys(sessionId))) return;
   task.withhold_sandbox_keys = true;
   delete task.user_env;
-  Object.assign(task, actingSessionEffort(task.model));
+  Object.assign(task, actingSessionTurnFields(task.model));
 }
 
 export async function githubReviewMcpServers(sessionId: string): Promise<McpServers> {

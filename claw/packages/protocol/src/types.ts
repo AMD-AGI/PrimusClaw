@@ -418,6 +418,12 @@ export interface ExecuteRequest {
    * for a session that reviews a pull request on someone's behalf, when an operator set `CLAW_GITHUB_REVIEW_EFFORT`.
    */
   effort?: ReasoningEffort;
+  /**
+   * "5m": the rolling prompt-cache markers of this run's turns (sub-agents included) are written for five minutes, the anchor keeps
+   * Brain's `LLM_CACHE_TTL`. For a run nobody waits on between turns; absent, every marker is written at `LLM_CACHE_TTL`. The API sets it
+   * for a session that reviews a pull request on someone's behalf.
+   */
+  rolling_cache_ttl?: "5m";
   max_turns?: number;
   llm_api_key?: string;
   /** Per-user environment variables snapshot at message creation time; Brain merges this into the sandbox podSpec.env after CLAW / SaFE / system env layers, validated against `isUserEnvKeyAllowed` on both ends (API write + Brain merge). */

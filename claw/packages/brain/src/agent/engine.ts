@@ -523,6 +523,7 @@ export class AgentEngine {
           model,
           // A value Brain does not know is no effort at all: the gateway's defaults, never a refused turn.
           ...(isReasoningEffort(request.effort) ? { effort: request.effort } : {}),
+          ...(request.rolling_cache_ttl === "5m" ? { rollingCacheTtl: "5m" as const } : {}),
           apiUrl,
           apiKey,
           maxTurns,
