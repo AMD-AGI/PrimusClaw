@@ -18,6 +18,8 @@
  * the server's default workspace on every turn, so without the exception a deployment
  * could not make its default a CPU workspace and still run a GPU sandbox from it.
  *
+ * A multi-node cluster is always the "GPU requested" case (`gpuWorkspaceFor`).
+ *
  * With SANDBOX_CPU_NAMESPACE unset nothing changes: the function returns exactly what
  * `request.workspace_id?.trim() || SANDBOX_NAMESPACE` did.
  */
@@ -81,6 +83,22 @@ export function sandboxNamespaceForResources(
   return pickSandboxNamespace({
     requested,
     needsGpu: resourcesNeedGpu(resources),
+    defaultNamespace: SANDBOX_NAMESPACE,
+    cpuNamespace: SANDBOX_CPU_NAMESPACE,
+  });
+}
+
+/**
+ * The workspace a multi-node cluster of this request goes to. A cluster is GPU nodes by
+ * definition, so it follows the "a GPU requested" branch above whatever the request's
+ * resources say: the request's own workspace unless that is the CPU workspace (which the
+ * console names on every turn once the default is the CPU one), else SANDBOX_NAMESPACE.
+ * Empty only when neither the request nor the deployment names a workspace.
+ */
+export function gpuWorkspaceFor(requested: string | null | undefined): string {
+  return pickSandboxNamespace({
+    requested,
+    needsGpu: true,
     defaultNamespace: SANDBOX_NAMESPACE,
     cpuNamespace: SANDBOX_CPU_NAMESPACE,
   });

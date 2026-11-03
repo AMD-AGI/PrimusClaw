@@ -53,6 +53,7 @@ import {
 } from "../config.js";
 import { ensureHands } from "../sandbox/ensure-hands.js";
 import { isMultiNodeRequest } from "../sandbox/multi-node/prompt-flags.js";
+import { gpuWorkspaceFor } from "../sandbox/workspace-select.js";
 import { getMultiNodeProvider, multiNodeAvailable } from "../sandbox/multi-node/factory.js";
 import type { MultiNodeContext } from "../sandbox/multi-node/types.js";
 import { destroyHands, reapPendingHands, classifySandboxFailure } from "../sandbox/reaper.js";
@@ -2958,7 +2959,9 @@ class TaskRunner {
       );
       return;
     }
-    const namespace = this.multiNodeContext?.namespace ?? this.request.workspace_id?.trim();
+    // Where ensure created the cluster; failing that, where it would have (a run that
+    // failed before the context existed still owes the release), by the same rule.
+    const namespace = this.multiNodeContext?.namespace ?? gpuWorkspaceFor(this.request.workspace_id);
     if (!namespace || !this.messageId) return;
     // A deployment without SaFE has no cluster to release. Reachable: a prompt
     // carrying multi-node flags is not rejected before it gets here, it just

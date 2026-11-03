@@ -8,8 +8,9 @@
  * decides where every sandbox of the task goes. With one workspace that is
  * SANDBOX_NAMESPACE, as before. With a separate CPU workspace (SANDBOX_CPU_NAMESPACE)
  * nothing is stamped: only Brain sees what each sandbox asks for, and stamping the GPU
- * workspace here would pin the task's CPU-only sandboxes to it. Kubernetes mode has no
- * CPU workspace (Brain ignores the setting there), so it is stamped as before.
+ * workspace here would pin the task's CPU-only sandboxes to it. A multi-node cluster
+ * is always placed in the GPU workspace by Brain, whatever is stamped here. Kubernetes
+ * mode has no CPU workspace (Brain ignores the setting there), so it is stamped as before.
  */
 export function defaultTaskWorkspaceId(
   env: Record<string, string | undefined> = process.env,
