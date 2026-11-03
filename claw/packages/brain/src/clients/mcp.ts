@@ -24,8 +24,8 @@ interface McpClientWrapper {
  * The API checks where a requester's own MCP server resolves and records the
  * answer on the spec as `pinned_address`; a name that resolved somewhere public
  * then, and somewhere inside the cluster now, would otherwise pass. The host
- * name still goes out as SNI and Host, so TLS is checked against it, and
- * redirects are refused, since they would leave the pinned address. Specs
+ * name still goes out as SNI and Host, so TLS is checked against it. (The
+ * SDK follows a redirect only within the same origin, which this pins too.) Specs
  * without the field (the operator's, and those the API adds itself) connect
  * normally.
  */
@@ -43,7 +43,7 @@ export function pinnedFetch(pin: unknown): FetchLike | undefined {
       },
     },
   });
-  return (url, init) => undiciFetch(url, { ...(init as object), dispatcher, redirect: "error" }) as unknown as Promise<Response>;
+  return (url, init) => undiciFetch(url, { ...(init as object), dispatcher }) as unknown as Promise<Response>;
 }
 
 /**
