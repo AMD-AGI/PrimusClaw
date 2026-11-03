@@ -505,7 +505,8 @@ record it.
   same step and to speak after their results, so it no longer announces what a refused call did not do. The message
   it is answering is followed by a `[Reply language: X]` line (Chinese, Japanese, Korean or English, read from the
   user's own words with what they quote left out, or from their last ones when a worker's report woke it; a message
-  in another language gets no line, and only one with too few letters to be in any language, such as `ok`, looks back;
+  in another language gets no line, and only one with no wording of its own, such as `ok`, `retry #2` or `done` (at most
+  one Latin word, and no letter of another script), looks back;
   only the first and last 2000 characters of a long message are read, so a message of megabytes costs what a short
   one does), so item titles in another language no longer decide the language of a reply. The line is on the request only: the
   conversation turn written when the run completes holds the user's words from the run row, as they were sent. A

@@ -11,10 +11,11 @@
  *
  * Deliberately small: Chinese, Japanese, Korean and English, which a script count and a short list of English function
  * words tell apart without a model or a dependency. For any other text there is no verdict and no line is added, and
- * the model reads the language from the message as it always did. A message with too few letters to be in any language
- * (`ok`, `#3`, an emoji) says nothing either, but it says nothing about the user's language rather than something
- * unknown: the caller then looks at the user's earlier messages, newest first, and the first of them that has words
- * decides, named or not (a French message after English ones is not answered in English). A wrong line would be worse
+ * the model reads the language from the message as it always did. A message without wording of its own (`ok`, `#3`,
+ * `retry #2`, `done`, an emoji: at most one Latin word, and no letter of another script) says nothing either, but it
+ * says nothing about the user's language rather than something unknown: the caller then looks at the user's earlier
+ * messages, newest first, and the first of them that has words decides, named or not (a French message after English
+ * ones is not answered in English). A wrong line would be worse
  * than none, so every rule below prefers "no verdict".
  */
 
@@ -158,20 +159,35 @@ function opensInCjk(text: string): boolean {
   return false;
 }
 
-/** Fewer letters than this are not a sentence of any language: `ok`, `#3`, `👍`. */
-const MIN_LETTERS = 3;
+/** A word in Latin script of at least this many letters is a word a language can be told from; one letter is not (`a`, `x`). */
+const MIN_WORD_LETTERS = 2;
 
-/** Whether there are enough letters in the text to be wording in some language. */
-function hasLetters(text: string): boolean {
-  let letters = 0;
-  for (const _ of text.matchAll(/\p{L}/gu)) if (++letters >= MIN_LETTERS) return true;
+/** A run of Latin letters, an apostrophe inside it (`don't`) keeping it one word. */
+const LATIN_WORD = /\p{Script=Latin}+(?:'\p{Script=Latin}+)*/gu;
+
+/** A letter of any other script: Cyrillic, Arabic, Hebrew, Greek, Devanagari, Thai, and also what is Chinese, Japanese or Korean. */
+const NON_LATIN_LETTER = /(?!\p{Script=Latin})\p{L}/u;
+
+/**
+ * Whether the text is wording in some language, as opposed to a command or an acknowledgement. Latin script is the one
+ * that cannot be judged from a single token: `stop 3`, `retry #2`, `cancel 1`, `done` and `okay` are what a user says to
+ * the Router about an item whatever language they speak, and nothing in them is a sentence of any language. So Latin
+ * script is wording only from two words of two letters or more on (`merci beaucoup`), and any letter of another script is
+ * wording on its own, because a single Cyrillic or Arabic word is a word of a language that is not the one to look back to.
+ */
+function hasWordsOfItsOwn(text: string): boolean {
+  if (NON_LATIN_LETTER.test(text)) return true;
+  let words = 0;
+  for (const [word] of text.matchAll(LATIN_WORD)) {
+    if (word.replace(/'/g, "").length >= MIN_WORD_LETTERS && ++words >= 2) return true;
+  }
   return false;
 }
 
 export interface LanguageReading {
   /** The language of the message, or null when it cannot be told. */
   language: string | null;
-  /** Whether the message has wording of its own, whatever language it is in: false for `ok`, `#3` or an emoji. */
+  /** Whether the message has wording of its own, whatever language it is in: false for `ok`, `#3`, `retry #2`, `done` or an emoji. */
   hasWords: boolean;
 }
 
@@ -195,7 +211,7 @@ function readLanguageOfAll(whole: string): LanguageReading {
   const outside = unquoted(text);
   // The user's own words first; what they quoted only when they said nothing besides it.
   const language = judge(outside) ?? (outside === text ? null : judge(text));
-  return { language, hasWords: language !== null || hasLetters(text) };
+  return { language, hasWords: language !== null || hasWordsOfItsOwn(text) };
 }
 
 function judge(text: string): string | null {
@@ -224,7 +240,7 @@ function judge(text: string): string | null {
  * The language to answer in: the one the user's message is in, and failing that the one of what they wrote before,
  * newest first. `message` is null when the turn did not start with the user's words (a worker's report woke the
  * assistant): a report says nothing about the user's language. `earlier` is asked only when the message has no words
- * (`ok`, `#3`): a message with words in a language that cannot be named gets no line, not the language of older ones,
+ * (`ok`, `#3`, `retry #2`): a message with words in a language that cannot be named gets no line, not the language of older ones,
  * and among the earlier messages the newest that has words decides in the same way.
  */
 export async function languageToAnswerIn(

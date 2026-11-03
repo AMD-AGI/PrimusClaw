@@ -10,7 +10,7 @@
  *   L2  a message that cannot be told, or is in another language, has no verdict rather than a wrong one
  *   L3  the verdict agrees with the language every evaluation message is labelled with
  *   L4  the language is the message's own, else the one the user wrote in before; a report is not the user's message
- *   L4b a message with words in a language that cannot be named gets no line, and is not answered in the language of older ones; one with too few letters to be in any language still looks back
+ *   L4b a message with words in a language that cannot be named gets no line, and is not answered in the language of older ones; one with no more than a single Latin word (`retry #2`, `done`, `ok`, `#3`, an emoji) still looks back
  *   L5  the line is the same every time and is added once
  *   L6  only the start and the end of a long message are read, and a paste between them does not decide
  *   L7  what it costs does not grow with what was sent: not by the length of the message, nor by how its characters are arranged
@@ -149,7 +149,7 @@ test("L4 the message's own language, else the user's earlier words, and a report
   assert.equal(await languageToAnswerIn("ok", async () => ["Please look"]), "English", "earlier may be asked asynchronously");
 });
 
-test("L4b a message with words in a language that cannot be named gets no line; one with too few letters to be in any language looks back", async () => {
+test("L4b a message with words in a language that cannot be named gets no line; one with no more than a single Latin word looks back", async () => {
   const french = "Bonjour, peux-tu corriger le build s'il te plaît ?";
   const german = "Hallo, kannst du bitte den Build reparieren? Er ist seit gestern rot.";
   const spanish = "Hola, ¿puedes arreglar la compilación? Lleva en rojo desde ayer.";
@@ -165,9 +165,30 @@ test("L4b a message with words in a language that cannot be named gets no line; 
       [message, [english, chinese], null, false],
       [message, [chinese], null, false],
     ]),
-    // Three letters are words, two are not.
-    ["oui", [english], null, false],
-    ["Hola", [english], null, false],
+    // Two Latin words are wording of the user's, in whatever language; any letter of another script is too.
+    ["merci beaucoup", [english], null, false],
+    ["ok gracias", [chinese], null, false],
+    ["да", [english], null, false],
+    ["ok да", [english, chinese], null, false],
+    ["نعم", [chinese], null, false],
+    // A single Latin word, with or without numbers and punctuation, is a command or an acknowledgement, not wording in an
+    // unnamed language: the older messages are read, newest first. These are what the Router is typically sent.
+    ["oui", [english], "English", true],
+    ["Hola", [english], "English", true],
+    ["retry #2", [english], "English", true],
+    ["retry #2", [chinese], "Chinese", true],
+    ["retry #2", [chinese, english], "Chinese", true],
+    ["stop 3", [english], "English", true],
+    ["stop 3", [chinese], "Chinese", true],
+    ["cancel 1", [english], "English", true],
+    ["cancel 1", [chinese], "Chinese", true],
+    ["done", [english], "English", true],
+    ["done", [chinese], "Chinese", true],
+    ["okay", [english], "English", true],
+    ["okay!", [chinese], "Chinese", true],
+    ["#2 retry.", [chinese], "Chinese", true],
+    ["x 3 y", [chinese], "Chinese", true],
+    ["retry #2", ["ok", french], null, true],
     // Too few letters to be in any language: the older messages are read, newest first.
     ["ok", [english], "English", true],
     ["#3", [chinese, english], "Chinese", true],
@@ -186,15 +207,23 @@ test("L4b a message with words in a language that cannot be named gets no line; 
     [null, ["ok", english, french], "English", true],
     [null, ["ok", "#2"], null, true],
   ];
+  const wrong: string[] = [];
   for (const [message, before, language, readEarlier] of table) {
     let asked = false;
     const answer = await languageToAnswerIn(message, () => { asked = true; return before; });
-    assert.equal(answer, language, `${JSON.stringify(message)} after ${JSON.stringify(before)}`);
-    assert.equal(asked, readEarlier, `${JSON.stringify(message)}: whether the earlier messages are read`);
+    const want = `${JSON.stringify(language)}, earlier messages ${readEarlier ? "read" : "not read"}`;
+    const got = `${JSON.stringify(answer)}, earlier messages ${asked ? "read" : "not read"}`;
+    if (want !== got) wrong.push(`${JSON.stringify(message)} after ${JSON.stringify(before)}: want ${want}, got ${got}`);
   }
+  assert.deepEqual(wrong, []);
   // The reading says which of the two a message is.
   assert.deepEqual(readLanguage(french), { language: null, hasWords: true });
   assert.deepEqual(readLanguage("ok"), { language: null, hasWords: false });
+  assert.deepEqual(readLanguage("retry #2"), { language: null, hasWords: false });
+  assert.deepEqual(readLanguage("stop 3"), { language: null, hasWords: false });
+  assert.deepEqual(readLanguage("okay"), { language: null, hasWords: false });
+  assert.deepEqual(readLanguage("merci beaucoup"), { language: null, hasWords: true });
+  assert.deepEqual(readLanguage("да"), { language: null, hasWords: true });
   assert.deepEqual(readLanguage("Please stop"), { language: "English", hasWords: true });
   assert.deepEqual(readLanguage("好"), { language: "Chinese", hasWords: true });
   assert.deepEqual(readLanguage(""), { language: null, hasWords: false });
