@@ -21,7 +21,7 @@ import pino from "pino";
 import { APP_RUNS_ENABLED, SANDBOX_ROUTER_AUTH_ENABLED } from "../config.js";
 import { db } from "../infra/db.js";
 import { openAppRunSecret } from "../crypto/app-run-secrets.js";
-import { githubReviewMcpServers } from "../github-review/session-tools.js";
+import { applySandboxKeyPolicyToTask, githubReviewMcpServers } from "../github-review/session-tools.js";
 
 const logger = pino({ name: "session-app-mcp" });
 
@@ -105,7 +105,10 @@ export async function sessionAppMcpServers(
  *
  * The GitHub review tools (see `github-review/session-tools.ts`) ride the same
  * path for the same reason, a session that has `config.acting_as` only, under a
- * reserved server name that a request cannot replace.
+ * reserved server name that a request cannot replace. So does what such a session
+ * is not given: its sandbox holds none of its owner's keys (`withhold_sandbox_keys`),
+ * and none of its owner's stored variables (any `user_env` is taken off the task),
+ * decided from the live row at the claim like the tools are.
  */
 export async function applyAppMcpToTask(task: Record<string, unknown>, sessionId: string): Promise<void> {
   const merged = mergeAppMcpServers(
@@ -117,4 +120,5 @@ export async function applyAppMcpToTask(task: Record<string, unknown>, sessionId
   if (Object.keys(review).length > 0) {
     task.mcp_servers = { ...((task.mcp_servers as McpServers | undefined) ?? {}), ...review };
   }
+  await applySandboxKeyPolicyToTask(task, sessionId);
 }

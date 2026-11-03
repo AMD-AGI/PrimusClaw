@@ -33,9 +33,9 @@ import {
 } from "../auth/session-credentials.js";
 import { db } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
-import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { redactPublicJson } from "../events/redaction.js";
 import { actingTurnRefusalFor } from "../github-review/acting-turns.js";
+import { loadUserEnvForSession } from "../github-review/session-tools.js";
 import { workbenchRegistry } from "./registry.js";
 import { canExecuteTaskDag, canReadTaskDag } from "../tasks/dags/authz.js";
 import { getTaskDag } from "../tasks/dags/db.js";
@@ -284,22 +284,13 @@ export async function registerWorkbenchRunRoutes(app: FastifyInstance): Promise<
         });
       }
 
-      // Snapshot per-user env at run-create time and embed under
-      // `input.user_env`. dag-expander writes it onto every task.input
-      // verbatim, so dispatcher (claw_tasks → ExecuteRequest) can lift it
-      // back out and inject into Brain's sandbox podSpec.env. Sweep parity
-      // with chat /messages path (routes/sessions.ts).
-      const userEnvSnapshot = await loadUserEnvSnapshot(db, user.userId, logger);
-      const inputWithEnv = Object.keys(userEnvSnapshot).length
-        ? { ...normalised, user_env: userEnvSnapshot }
-        : normalised;
-
       // `ensureSession` may create a session outright, and a refusal must not
       // leave it behind: it runs on the transaction the refusal rolls back,
-      // whose first statement is the admission lock.
+      // whose first statement is the admission lock. The per-user env snapshot
+      // is taken there too, once the session is known (see `submitWorkbenchRun`).
       return await withAdmissionTransaction<unknown>(
         (client, afterCommit) => submitWorkbenchRun(client, {
-          workbench: d, user, body, req, reply, dagRow, plugin, input: inputWithEnv,
+          workbench: d, user, body, req, reply, dagRow, plugin, input: normalised,
         }, afterCommit),
       );
     },
@@ -343,12 +334,24 @@ async function submitWorkbenchRun(
   }
   const { sessionId } = session;
 
+  // Snapshot per-user env at run-create time and embed under `input.user_env`.
+  // dag-expander writes it onto every task.input verbatim, so dispatcher
+  // (claw_tasks → ExecuteRequest) can lift it back out and inject into Brain's
+  // sandbox podSpec.env. Sweep parity with chat /messages path
+  // (routes/sessions.ts). Read here and not before the session is known, so
+  // that a run into a session that acts as a user holds none of its owner's
+  // stored variables: its nodes' sandboxes are given none of them.
+  const userEnvSnapshot = await loadUserEnvForSession(client, run.user.userId, sessionId, logger);
+  const input = Object.keys(userEnvSnapshot).length
+    ? { ...run.input, user_env: userEnvSnapshot }
+    : run.input;
+
   const result = await expandDag({
     session_id: sessionId,
     user_id: run.user.userId,
     dag: run.dagRow as TaskDagDef & { metadata: { derived: any } },
     plugin: run.plugin,
-    input: run.input,
+    input,
   }, client);
   if (isCreateRefusal(result)) {
     await sendRunRefusal(reply, result);

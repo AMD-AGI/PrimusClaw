@@ -363,6 +363,13 @@ export interface ExecuteRequest {
   workspace_id?: string;
   /** SaFE platform API key for this user; Brain calls SaFE on behalf of user. */
   platform_key?: string;
+  /**
+   * This session acts as another user's GitHub account (`config.acting_as`), so its model reads text that strangers wrote. Brain keeps
+   * using the keys of this request for its own calls (the LLM gateway, SaFE) and puts none of them in the environment of the sandbox it
+   * creates: no `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or `SAFE_API_KEY`. Whatever the model runs in the sandbox, it has no key to read
+   * out. Absent means a session like any other, as before the field existed.
+   */
+  withhold_sandbox_keys?: boolean;
 
   // ── Legacy chat fields (Phase 4 removes; do not use in new task code) ─
   /** @deprecated Use `sandbox_spec.image`. Kept for legacy chat NATS path. */

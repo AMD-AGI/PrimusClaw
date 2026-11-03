@@ -13,6 +13,7 @@ import { actingTurnRefusalFor } from "../github-review/acting-turns.js";
 import { parseActingAs } from "../github-review/acting-as.js";
 import { parseReviewTarget } from "../github-review/review-target.js";
 import { classifyAttendedCaller } from "../github-review/attended.js";
+import { loadUserEnvForSession, withholdsSandboxKeys } from "../github-review/session-tools.js";
 import { readGithubReviewSettings } from "../github-review/settings.js";
 import {
   forceIdleAfterInterrupt, releaseSessionGateForTurn, stopSessionRuns, takeSessionGate,
@@ -1338,8 +1339,10 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
 
         // Snapshot user env BEFORE inserting the session so a snapshot failure
         // can short-circuit without leaving a row behind.
+        // A session that acts as a user is sent none of its owner's stored variables (see `loadUserEnvForSession`); this one has no row to
+        // be read from yet, and the config it is about to be written with is what decides.
         let userEnvSnapshot: Record<string, string> = {};
-        if (firstMessage) {
+        if (firstMessage && !withholdsSandboxKeys(sessionConfig)) {
           userEnvSnapshot = await loadUserEnvSnapshot(db, userId, logger);
         }
 
@@ -1962,7 +1965,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         await client.query("ROLLBACK");
         return { ok: true, session_id: sessionId, state: "running", workload_id: binding.workloadId };
       }
-      dispatchUserEnv = await loadUserEnvSnapshot(client, userId, logger);
+      dispatchUserEnv = await loadUserEnvForSession(client, userId, sessionId, logger);
       turnMessageId = newChatMessageId();
       await takeSessionGate(sessionId, turnMessageId, client);
       await client.query("COMMIT");

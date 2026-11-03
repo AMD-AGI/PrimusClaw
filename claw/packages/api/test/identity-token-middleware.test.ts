@@ -45,7 +45,7 @@ async function startSafe(): Promise<{ url: string; calls: string[]; tokenCalls: 
       }
       calls.push(q.apiKey ?? q.cookie ?? "?");
       const id = q.apiKey?.startsWith("ak-") ? q.apiKey.slice(3) : /Token=ck-([^;]+)/.exec(q.cookie ?? "")?.[1];
-      if (!id || !["u1", "u2"].includes(id)) { res.writeHead(401).end("{}"); return; }
+      if (!id || !["u1", "u2", "u3", "u4"].includes(id)) { res.writeHead(401).end("{}"); return; }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ data: { id, name: `User ${id}`, roles: ["default"], platformKey: "", virtualKey: `vk-${id}` } }));
     });
@@ -100,10 +100,11 @@ describe("an identity access token through the authentication hook", () => {
     delete process.env.CLAW_DEPLOY_MODE;
     ({ startIdentityClient } = await import("../src/auth/identity.js"));
     const { authMiddleware, getUser } = await import("../src/auth/middleware.js");
+    const { getAuthMethod } = await import("../src/auth/request-credential.js");
     app = Fastify();
     await app.register((await import("@fastify/cookie")).default);
     app.addHook("preHandler", authMiddleware);
-    app.get("/v1/whoami", async (req) => ({ user: getUser(req) }));
+    app.get("/v1/whoami", async (req) => ({ user: getUser(req), method: getAuthMethod(req) }));
     // A browser-download route: the one place the existing `?token=` key path is tried, and before any header path.
     app.get("/v1/sessions/abc/files/main.py", async (req) => ({ user: getUser(req) }));
     await app.listen({ port: 0, host: "127.0.0.1" });
@@ -122,6 +123,7 @@ describe("an identity access token through the authentication hook", () => {
     identity(true);
     process.env.CLAW_IDENTITY_TOKEN_AUTH_ENABLED = "true";
     delete process.env.CLAW_IDENTITY_TOKEN_INTROSPECT;
+    delete process.env.CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS;
   });
 
   async function whoami(headers: Record<string, string>): Promise<{ status: number; body: any }> {
@@ -252,5 +254,68 @@ describe("an identity access token through the authentication hook", () => {
     const r = await whoami({ authorization: "Bearer opaque", "x-api-key": "ak-u2" });
     assert.equal(r.status, 200);
     assert.equal(r.body.user.userId, "u2");
+  });
+
+  // A service's delegated token (`sub` the person, `act` and `client_id` the service) beside the person's own key. The token path is
+  // final for a JWT-shaped Bearer, so the key never reaches the x-api-key path: only the token path reads it, and only for a named service.
+  describe("a delegated token beside an x-api-key", () => {
+    // u3 and u4 are used by these tests alone: the API's SaFE client keeps what it learned about a key for minutes, and a call count would then depend on the order of the tests.
+    const delegated = (sub: string, service = "svc-chat") => mint({ sub, act: { sub: service }, client_id: service });
+    const asKeyOf = (token: string, key: string) => ({ ...bearer(token), "x-api-key": key });
+
+    test("a service that is named brings the person's own key: that user, that key's keys, still an identity-token caller", async () => {
+      process.env.CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS = "svc-chat";
+      const r = await whoami(asKeyOf(delegated("u3"), "ak-u3"));
+      assert.equal(r.status, 200, JSON.stringify(r.body));
+      assert.deepEqual(r.body.user, {
+        userId: "u3", userName: "Web User", roles: ["default"], platformKey: "", virtualKey: "vk-u3",
+        delegation: { actorSub: "svc-chat", clientId: "svc-chat" },
+      });
+      assert.equal(r.body.method, "identity_token", "judged by the token: the attended checks of a service that speaks for the user still apply");
+      assert.deepEqual(safe.calls, ["ak-u3"], "SaFE was asked about the key once, by the token path");
+      assert.deepEqual(safe.tokenCalls, [], "and not about the token");
+      assert.deepEqual(delegations, [], "nothing was exchanged");
+    });
+
+    test("somebody else's key is a 401 key_subject_mismatch: not the key's owner, not the token's user keyless", async () => {
+      process.env.CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS = "svc-chat";
+      const r = await whoami(asKeyOf(delegated("u3"), "ak-u4"));
+      assert.equal(r.status, 401);
+      assert.equal(r.body.error, "key_subject_mismatch");
+      assert.deepEqual(safe.calls, ["ak-u4"], "asked once: the x-api-key path did not judge it again");
+    });
+
+    test("a key SaFE does not know, and a value that is not an ak- key, are a 401 invalid_api_key", async () => {
+      process.env.CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS = "svc-chat";
+      const unknown = await whoami(asKeyOf(delegated("u1"), "ak-nobody"));
+      assert.deepEqual([unknown.status, unknown.body.error], [401, "invalid_api_key"]);
+      const notAKey = await whoami(asKeyOf(delegated("u1"), "sk-not-a-key"));
+      assert.deepEqual([notAKey.status, notAKey.body.error], [401, "invalid_api_key"]);
+    });
+
+    test("with no service named (the default) the key is never read: the caller is the token's user, keyless, as before", async () => {
+      delete process.env.CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS;
+      for (const key of ["ak-u1", "ak-u2", "ak-nobody"]) {
+        const r = await whoami(asKeyOf(delegated("u1"), key));
+        assert.equal(r.status, 200, `${key}: ${JSON.stringify(r.body)}`);
+        assert.deepEqual([r.body.user.userId, r.body.user.platformKey, r.body.user.virtualKey], ["u1", "", ""]);
+      }
+      assert.deepEqual(safe.calls, [], "no key was shown to SaFE, and the x-api-key path was never reached");
+    });
+
+    test("another service's token with a key is the same: not read", async () => {
+      process.env.CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS = "svc-chat";
+      const r = await whoami(asKeyOf(delegated("u1", "svc-other"), "ak-u1"));
+      assert.equal(r.status, 200);
+      assert.deepEqual([r.body.user.userId, r.body.user.platformKey, r.body.user.virtualKey], ["u1", "", ""]);
+      assert.deepEqual(safe.calls, []);
+    });
+
+    test("a request with only the key (no token) is a plain key caller as before, and never an identity-token one", async () => {
+      process.env.CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS = "svc-chat";
+      const r = await whoami({ "x-api-key": "ak-u1" });
+      assert.equal(r.status, 200);
+      assert.equal(r.body.method, "x_api_key");
+    });
   });
 });
