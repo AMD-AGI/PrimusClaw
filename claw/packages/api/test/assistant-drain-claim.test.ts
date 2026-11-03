@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * One drain of a session's queue at a time (`src/sessions/drain-claim.ts`), against a real Postgres: the claim is an
- * advisory lock, and only a second connection can contend for it. Skipped without DATABASE_URL, and a skip is not a pass.
+ * One drain of a session's queue at a time (`src/sessions/drain-claim.ts`), against a real Postgres, where the racing
+ * drains and the message run on connections of their own. Skipped without DATABASE_URL, and a skip is not a pass.
  *
  *   Q1  soak 6, round 16: a worker's report is being dispatched into the idle assistant when a second report finds
  *       the assistant idle too, and the user asks a question. The second report does not start a turn over the first,
@@ -50,14 +50,10 @@ describe("pending drain claim", { skip }, () => {
     p.reached();
     await p.release;
   };
-  /** Until `done` says so, or another connection waits on an advisory lock: the claim is being contended. */
-  async function settledOrWaiting(done: () => boolean): Promise<void> {
-    for (let i = 0; i < 500; i++) {
-      if (done()) return;
-      if ((await w.q("SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted")).length) return;
-      await new Promise((r) => setTimeout(r, 10));
-    }
-    throw new Error("neither finished nor waited");
+  /** Settled within a few seconds: nothing in a drain's way waits for the drain in front of it. */
+  async function settledSoon(t: { done: boolean }, what: string): Promise<void> {
+    for (let i = 0; i < 500 && !t.done; i++) await new Promise((r) => setTimeout(r, 10));
+    assert.ok(t.done, `${what} waited for the drain in flight`);
   }
   const tracked = <T>(p: Promise<T>) => {
     const t = { done: false, promise: p };
@@ -154,7 +150,7 @@ describe("pending drain claim", { skip }, () => {
 
     // The user asks while the first turn is still being dispatched.
     const asked = tracked(ask("Which of them is done?"));
-    await settledOrWaiting(() => asked.done);
+    await settledSoon(asked, "the question");
     // Queued at once, not held in a transaction (and a pooled connection) until the dispatch is over.
     assert.deepEqual(
       (await w.pending(alice.routerSid)).map((p) => p.content).filter((c) => c.startsWith("Which")), ["Which of them is done?"],
@@ -196,7 +192,7 @@ describe("pending drain claim", { skip }, () => {
     await opening.reachedP;
     // The sweeper finds the same message on a session that still reads free.
     const sweep = tracked(w.mod.sweeper.drainOrphanedPendingMessages());
-    await settledOrWaiting(() => sweep.done);
+    await settledSoon(sweep, "the sweeper");
     opening.release();
     await completion.promise;
     await sweep.promise;

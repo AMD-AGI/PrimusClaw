@@ -44,7 +44,7 @@ import { loadUserEnvForSession } from "../github-review/session-tools.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
 import { releaseSessionGateForTurn, takeSessionGate } from "../tasks/chat-run.js";
 import { drainOldestPendingMessage } from "../events/consumer.js";
-import { tryPendingDrainClaim } from "./drain-claim.js";
+import { DRAIN_UNDER_WAY_SQL } from "./drain-claim.js";
 import { dispatchTaskToBrain, newChatMessageId } from "./dispatch.js";
 
 // The name the route logged these records under before they moved, so a filter an
@@ -278,11 +278,8 @@ export async function submitSessionMessage(
   const client = await db.pool.connect();
   try {
     await client.query("BEGIN");
-    // A drain under way is dispatching a turn that has not taken the gate yet: this message is queued behind it
-    // rather than taking the gate the drain is about to take over it.
-    const drainUnderWay = !await tryPendingDrainClaim(client, sessionId);
     const lockResult = await client.query(
-      "SELECT agent_status, user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL FOR UPDATE",
+      `SELECT agent_status, user_id, ${DRAIN_UNDER_WAY_SQL} AS drain_under_way FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL FOR UPDATE`,
       [sessionId],
     );
     if (!lockResult.rows.length) {
@@ -305,6 +302,9 @@ export async function submitSessionMessage(
     }
 
     const status = lockResult.rows[0].agent_status;
+    // A drain under way is dispatching a turn that has not taken the gate yet: this message is queued behind it
+    // rather than taking the gate the drain is about to take over it.
+    const drainUnderWay = lockResult.rows[0].drain_under_way === true;
     // Snapshot per-user env at message creation time. Decrypted once here,
     // frozen on the pending_messages row (queue path) or NATS task body
     // (immediate path) so Brain reads plaintext without touching the
@@ -367,9 +367,10 @@ export async function submitSessionMessage(
     if (deduplicated) return { kind: "queued", pendingId, deduplicated, drain: "duplicate" };
     if (wasRunning) return { kind: "queued", pendingId, deduplicated, drain: "awaiting_turn" };
     // `enqueue` on a session nobody holds, or a message queued behind a drain
-    // that held the session's claim: nothing may complete to drain this, so it
-    // is drained here, after the transaction and on its own connection. Behind
-    // a drain, this one waits for it and does nothing when it started a turn.
+    // under way: nothing may complete to drain this, so it is drained here,
+    // after the transaction and on its own connection. Behind a drain that
+    // still holds the session this does nothing: the turn that drain starts
+    // drains the queue when it ends.
     // This is the drain the completion handler runs: a send that takes the gate
     // between the commit above and this call leaves the row to that turn.
     //

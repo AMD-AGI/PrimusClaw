@@ -11,62 +11,57 @@
  * turn over the first, whose tools were then refused as superseded. A message the owner sent in that span did the
  * same from the other side: it took the free gate and the drain's take superseded the owner's turn.
  *
- * The claim is a Postgres advisory lock on the session, held by the drain for the whole drain on a connection of
- * the lock pool, and tried by a message's transaction, which queues the message when a drain holds it and then
- * drains behind that one. Under the claim the drain asks again whether the session is free, so a drain that waited
- * for another one finds the turn that one started and leaves the queue to that turn's completion.
+ * The claim is a lease on the session row (`pending_drain_until`), taken in the statement that asks whether the
+ * session is free, so a drain that finds another one under way, or the turn it started, leaves the queue to that one.
+ * A row, not a lock held on a connection: the completion that drains already holds the lock pool's connection for
+ * its own lock, and a drain must not need a second one to finish. A message reads the lease under the session row's
+ * lock and is queued behind a drain under way. The lease outlives a drain that died, so the sweeper drains after it.
  */
 import pino from "pino";
 import { db, type StatementRunner } from "../infra/db.js";
 
 const logger = pino({ name: "pending-drain-claim" });
 
-const CLAIM_ARGS = "hashtext('claw_pending_drain'), hashtext($1)";
+/** Longer than a drain takes, including a publish that times out; how long a dead drain's claim holds the queue. */
+const CLAIM_SECONDS = 120;
+
+/** SQL: a drain holds the claim on the session row the statement reads. */
+export const DRAIN_UNDER_WAY_SQL = "(pending_drain_until IS NOT NULL AND pending_drain_until > NOW())";
 
 /**
- * Whether no drain of this session is under way; while it is not, none starts until the caller's transaction ends.
- * Not waited for: a message that finds a drain under way is queued behind it, and holds no connection while that
- * drain needs the pool to finish.
- */
-export async function tryPendingDrainClaim(client: StatementRunner, sessionId: string): Promise<boolean> {
-  const r = await client.query(`SELECT pg_try_advisory_xact_lock(${CLAIM_ARGS}) AS ok`, [sessionId]);
-  return (r.rows[0] as { ok?: boolean } | undefined)?.ok === true;
-}
-
-/**
- * Run `drain` while holding the session's claim, if the session is free once the claim is held.
+ * Run `drain` while holding the session's claim, if the session is free and no other drain holds it.
  *
  * @returns whether `drain` ran.
  */
 export async function withPendingDrainClaim(sessionId: string, drain: () => Promise<void>): Promise<boolean> {
-  const client = await db.lockPool.connect();
-  let held = false;
+  const claim = await takeClaim(db, sessionId);
+  if (claim === null) {
+    logger.info({ sessionId }, "pending.drain_session_taken");
+    return false;
+  }
   try {
-    await client.query(`SELECT pg_advisory_lock(${CLAIM_ARGS})`, [sessionId]);
-    held = true;
-    const free = await db.query(
-      "SELECT 1 FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL AND agent_status <> 'running'",
-      [sessionId],
-    );
-    if (!free.rowCount) {
-      logger.info({ sessionId }, "pending.drain_session_taken");
-      return false;
-    }
     await drain();
     return true;
   } finally {
-    if (held) {
-      try {
-        await client.query(`SELECT pg_advisory_unlock(${CLAIM_ARGS})`, [sessionId]);
-        client.release();
-      } catch (err) {
-        // The lock may still be held on this backend: a connection returned to the pool with it would keep every
-        // later drain of the session waiting, so it is destroyed instead.
-        logger.warn({ err, sessionId }, "pending.drain_claim_release_failed");
-        client.release(err as Error);
-      }
-    } else {
-      client.release();
+    try {
+      await db.query(
+        "UPDATE claw_sessions SET pending_drain_until = NULL WHERE session_id = $1 AND pending_drain_until = $2::timestamptz",
+        [sessionId, claim],
+      );
+    } catch (err) {
+      // The lease runs out by itself; until then the next message is queued and drained by the sweeper.
+      logger.warn({ err, sessionId }, "pending.drain_claim_release_failed");
     }
   }
+}
+
+/** The claim's own value, which is what releases it; null when the session is running or another drain holds it. */
+async function takeClaim(q: StatementRunner, sessionId: string): Promise<string | null> {
+  const r = await q.query(
+    `UPDATE claw_sessions SET pending_drain_until = clock_timestamp() + make_interval(secs => $2)
+      WHERE session_id = $1 AND deleted_at IS NULL AND agent_status <> 'running' AND NOT ${DRAIN_UNDER_WAY_SQL}
+      RETURNING pending_drain_until::text AS claim`,
+    [sessionId, CLAIM_SECONDS],
+  );
+  return (r.rows[0] as { claim?: string } | undefined)?.claim ?? null;
 }
