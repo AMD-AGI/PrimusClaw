@@ -20,9 +20,9 @@
  *   CLAW_GITHUB_REVIEW_FAST_MAX_FILES       a change with at most this many files is reviewed from the diff, no sandbox, default 15
  *   CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES  ... and at most this many added plus deleted lines, default 600 (200 with the deep
  *                                           review on, where a change of a non-test source file takes the sandbox path whatever its size)
- *   CLAW_GITHUB_REVIEW_DEEP_ENABLED         the deep review (default-skill.ts, review-path.ts): a source change is checked out, its
- *                                           callers read, its closest tests run, then a second adversarial pass; off (default) gives
- *                                           the review it was before the switch
+ *   CLAW_GITHUB_REVIEW_DEEP_ENABLED         the deep review (default-skill.ts, review-path.ts), on by default: a source change is checked
+ *                                           out, its callers read, its closest tests run, then a second adversarial pass; `false`
+ *                                           gives the review it was before the switch
  *   CLAW_GITHUB_REVIEW_MODEL                the model of a session that acts as a user when its creator named none, default
  *                                           claude-opus-5.5; `default` leaves the deployment's DEFAULT_MODEL
  *   CLAW_GITHUB_REVIEW_EFFORT               the reasoning effort of every turn of such a session (low, medium, high); unset (default)
@@ -107,9 +107,10 @@ export function readGithubReviewSettings(env: Env = process.env, enabled: boolea
     problems.push(`CLAW_GITHUB_REVIEW_EFFORT=${reviewEffortRaw} is not low, medium or high; sending none`);
   }
   const deepRaw = (env.CLAW_GITHUB_REVIEW_DEEP_ENABLED ?? "").trim().toLowerCase();
-  const deepReview = bool(deepRaw);
-  if (deepRaw && !deepReview && !["false", "0", "no"].includes(deepRaw)) {
-    problems.push(`CLAW_GITHUB_REVIEW_DEEP_ENABLED=${deepRaw} is not true or false; using false`);
+  const deepOff = ["false", "0", "no"].includes(deepRaw);
+  const deepReview = !deepOff;
+  if (deepRaw && !deepOff && !bool(deepRaw)) {
+    problems.push(`CLAW_GITHUB_REVIEW_DEEP_ENABLED=${deepRaw} is not true or false; using true`);
   }
   const apiUrl = ((env.CLAW_GITHUB_API_URL ?? "").trim() || "https://api.github.com").replace(/(?<!\/)\/+$/, "");
   return {

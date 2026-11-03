@@ -23,6 +23,7 @@ after(closeShared);
 /** The deep review on: what most tests here are about. */
 const LIMITS = { fastMaxFiles: 15, fastMaxChangedLines: 600, deepReview: true };
 const DEEP = { CLAW_GITHUB_REVIEW_DEEP_ENABLED: "true" };
+const OFF = { CLAW_GITHUB_REVIEW_DEEP_ENABLED: "false" };
 const SMALL = { changedFiles: 3, changedLines: 80, filesComplete: true, diffMissing: false, repoSkill: false, paths: ["docs/guide.md", "README.md", "test/app.test.ts"] };
 /** The change most fixtures here are: documentation only, so it may be reviewed from the diff. */
 const DOCS_ONLY = [{ filename: "docs/app.md", status: "modified", additions: 3, deletions: 1, patch: "@@ -1,4 +1,6 @@\n a\n-b\n+b2\n+c\n+d\n e\n f" }];
@@ -101,8 +102,8 @@ test("the advice tells the model not to use a sandbox on the fast path, and that
 test("the thresholds are read from the environment with documented defaults, and a bad value falls back and is reported", () => {
   const d = readGithubReviewSettings({}, true);
   assert.equal(d.fastMaxFiles, 15);
-  assert.equal(d.fastMaxChangedLines, 600);
-  assert.equal(readGithubReviewSettings(DEEP, true).fastMaxChangedLines, 200);
+  assert.equal(d.fastMaxChangedLines, 200);
+  assert.equal(readGithubReviewSettings(OFF, true).fastMaxChangedLines, 600);
   const s = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_FAST_MAX_FILES: "40", CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES: "2500" }, true);
   assert.equal(s.fastMaxFiles, 40);
   assert.equal(s.fastMaxChangedLines, 2500);
@@ -162,8 +163,8 @@ test("past the file threshold the path is the sandbox, in the result, the log li
   assert.deepEqual(await auditPath(e), { review_path: "sandbox", review_path_reason: "too_many_files" });
 });
 
-test("with the deep review on, a four-line change of a source file is reviewed with a sandbox, with the recipe, in the result and the audit row", async () => {
-  const { e, rec, service } = await envWith(DEEP);
+test("by default (the deep review on), a four-line change of a source file is reviewed with a sandbox, with the recipe, in the result and the audit row", async () => {
+  const { e, rec, service } = await envWith();
   const b = (await service.getPr(e.actor, { pr: PR })).body as any;
   assert.deepEqual([b.review_path.path, b.review_path.reason], ["sandbox", "source_change"]);
   assert.match(b.review_path.sandbox_recipe, /pull\/7\/head/);
@@ -263,20 +264,24 @@ const MAIN = {
 };
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 
-test("the deep review is off by default, read like the other switches, and a bad value is reported and leaves it off", () => {
-  assert.equal(readGithubReviewSettings({}, true).deepReview, false);
-  for (const v of ["true", "1", "yes", " TRUE "]) assert.equal(readGithubReviewSettings({ CLAW_GITHUB_REVIEW_DEEP_ENABLED: v }, true).deepReview, true, v);
-  for (const v of ["false", "0", "no", ""]) {
+test("the deep review is on by default, turned off only by false/0/no, and a bad value is reported and leaves it on", () => {
+  for (const v of ["true", "1", "yes", " TRUE ", "", " "]) {
+    const s = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_DEEP_ENABLED: v }, true);
+    assert.deepEqual([s.deepReview, s.problems], [true, []], JSON.stringify(v));
+  }
+  assert.deepEqual([readGithubReviewSettings({}, true).deepReview, readGithubReviewSettings({}, true).problems], [true, []]);
+  for (const v of ["false", "0", "no", " FALSE "]) {
     const s = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_DEEP_ENABLED: v }, true);
     assert.deepEqual([s.deepReview, s.problems], [false, []], v);
   }
-  const bad = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_DEEP_ENABLED: "on" }, true);
-  assert.equal(bad.deepReview, false);
-  assert.match(bad.problems.join(), /CLAW_GITHUB_REVIEW_DEEP_ENABLED=on is not true or false; using false/);
+  const bad = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_DEEP_ENABLED: "off" }, true);
+  assert.equal(bad.deepReview, true);
+  assert.match(bad.problems.join(), /CLAW_GITHUB_REVIEW_DEEP_ENABLED=off is not true or false; using true/);
 });
 
-test("with the deep review off, the model is given exactly what main gave it: instructions, skill, fixed rules, path and advice", async () => {
-  const off = readGithubReviewSettings({}, true);
+test("with the deep review set to false, the model is given exactly what main gave it: instructions, skill, fixed rules, path and advice", async () => {
+  const off = readGithubReviewSettings(OFF, true);
+  assert.equal(off.deepReview, false);
   assert.equal(sha256(PR_REVIEW_INSTRUCTIONS), MAIN.instructions);
   assert.equal(sha256(PR_REVIEW_SKILL), MAIN.skill);
   assert.equal(sha256(readFileSync(new URL("../../../examples/skills/pr-review/SKILL.md", import.meta.url), "utf8")), MAIN.skill);
@@ -289,7 +294,7 @@ test("with the deep review off, the model is given exactly what main gave it: in
   assert.deepEqual(chooseReviewPath({ ...SMALL, changedLines: 600, paths: ["src/auth.ts"] }, off).path, "api_diff");
   assert.deepEqual(chooseReviewPath({ ...SMALL, changedLines: 601 }, off), { path: "sandbox", reason: "too_many_changed_lines" });
   // What gh_pr_get hands the model as `review_instructions`, with no repository instructions and with a repository skill.
-  const { e, service } = await envWith();
+  const { e, service } = await envWith(OFF);
   const got = (await service.getPr(e.actor, { pr: PR })).body as any;
   assert.deepEqual([got.review_path.path, got.review_path.reason, got.review_path.advice], ["api_diff", "small_diff", MAIN.advice.small_diff]);
   assert.equal(sha256((await readSection(service, e.actor, PR, "instructions")).text), MAIN.instructions);

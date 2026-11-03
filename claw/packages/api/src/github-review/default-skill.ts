@@ -146,7 +146,7 @@ const REVIEW_STEPS = `## Steps
 `;
 
 /**
- * The deep review (`CLAW_GITHUB_REVIEW_DEEP_ENABLED`, off by default): a source change is checked out, the callers of what changed
+ * The deep review (`CLAW_GITHUB_REVIEW_DEEP_ENABLED`, on by default): a source change is checked out, the callers of what changed
  * are read and the closest tests built and run, and a second, adversarial pass looks for what the first missed. Off, the
  * instructions above are given, word for word what they were before the switch existed.
  */
