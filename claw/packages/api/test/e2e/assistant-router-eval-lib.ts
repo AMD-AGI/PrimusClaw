@@ -74,7 +74,9 @@ export const EVAL_SESSION = { sessionId: "eval-assistant-session", userId: "eval
 
 /**
  * The user's turn as the model receives it: Brain's `buildPrompt` with no skills, no execution policy and one
- * MCP server (the assistant's) appends a hint naming the server and a session context block.
+ * MCP server (the assistant's) appends a hint naming the server and a session context block. Left out because a
+ * default deployment does not have them: the safety preamble (not sent to Claude models) and the rules directory
+ * (`RULES_ENABLED` is off by default), which `engine.ts` would add to the system message.
  */
 export function userTurn(text: string): string {
   return [
@@ -147,20 +149,22 @@ export function messagesLlm(o: { baseUrl: string; model: string; apiKey: () => s
     let last = "";
     for (let attempt = 0; attempt < (o.attempts ?? 4); attempt++) {
       if (attempt) await new Promise((r) => setTimeout(r, 2000 * 2 ** (attempt - 1)));
+      const key = o.apiKey();
+      // What is kept of a failure is the gateway's own words, with the key struck out in case they quote it.
+      const scrub = (t: string): string => (key ? t.split(key).join("<redacted>") : t);
       try {
         const res = await fetch(`${base}/v1/messages`, {
           method: "POST",
-          headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": o.apiKey() },
+          headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": key },
           body,
           signal: AbortSignal.timeout(o.timeoutMs ?? 120_000),
         });
         const text = await res.text();
         if (res.ok) return JSON.parse(text) as ModelResponse;
-        // Only the gateway's own error text, which does not carry the request headers.
-        last = `HTTP ${res.status}: ${text.slice(0, 300)}`;
+        last = scrub(`HTTP ${res.status}: ${text.slice(0, 300)}`);
         if (res.status !== 429 && res.status < 500) break;
       } catch (err) {
-        last = err instanceof Error ? err.message : String(err);
+        last = scrub(err instanceof Error ? err.message : String(err));
       }
     }
     throw new Error(last || "no answer");
@@ -344,6 +348,19 @@ export async function runCase(c: EvalCase, opts: RunOptions): Promise<Trace> {
     if (turn === maxTurns) trace.exhausted = true;
   }
   return trace;
+}
+
+/** A number from the environment, or `dflt` when it is unset or blank. Anything else that is not a number in range is an error: `NaN` would run nothing and still pass. */
+export function numberFromEnv(raw: string | undefined, name: string, dflt: number, min: number, max = Number.POSITIVE_INFINITY): number {
+  if (raw === undefined || raw.trim() === "") return dflt;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < min || n > max) throw new Error(`${name} must be a number from ${min} to ${max}, got "${raw}"`);
+  return n;
+}
+
+/** Every run that was asked for was made, and each reached the gate. No runs, or too few, is not a pass. */
+export function gateReached(accuracies: readonly number[], runs: number, gate: number): boolean {
+  return runs > 0 && accuracies.length === runs && accuracies.every((a) => a >= gate);
 }
 
 /** `work` over `items` with at most `n` in flight; results in the order of `items`. */

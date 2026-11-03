@@ -33,7 +33,7 @@ import { join } from "node:path";
 
 import { CASES, type EvalCase } from "./assistant-router-eval-cases.js";
 import {
-  describeEffects, messagesLlm, pool, routerTools, runCase, scoreCase, summarize, type Score, type Trace,
+  describeEffects, gateReached, messagesLlm, numberFromEnv, pool, routerTools, runCase, scoreCase, summarize, type Score, type Trace,
 } from "./assistant-router-eval-lib.js";
 
 const need = (name: string): string => {
@@ -44,9 +44,12 @@ const need = (name: string): string => {
 
 const BASE_URL = need("EVAL_BASE_URL").replace(/\/+$/, "");
 const MODEL = need("EVAL_MODEL");
-const RUNS = Math.max(1, Number(process.env.EVAL_RUNS || 1));
-const CONCURRENCY = Math.min(4, Math.max(1, Number(process.env.EVAL_CONCURRENCY || 2)));
-const GATE = Number(process.env.EVAL_GATE || 0.95);
+const configured = <T>(read: () => T): T => {
+  try { return read(); } catch (err) { console.error(err instanceof Error ? err.message : String(err)); process.exit(2); }
+};
+const RUNS = configured(() => Math.floor(numberFromEnv(process.env.EVAL_RUNS, "EVAL_RUNS", 1, 1)));
+const CONCURRENCY = configured(() => Math.floor(numberFromEnv(process.env.EVAL_CONCURRENCY, "EVAL_CONCURRENCY", 2, 1, 4)));
+const GATE = configured(() => numberFromEnv(process.env.EVAL_GATE, "EVAL_GATE", 0.95, 0, 1));
 const OUT = process.env.EVAL_OUT;
 const STRICT_IDS = process.env.EVAL_STRICT_IDS !== "0";
 const ONLY = new Set((process.env.EVAL_CASES || "").split(",").map((s) => s.trim()).filter(Boolean));
@@ -111,7 +114,7 @@ async function main(): Promise<void> {
     }
   }
 
-  const ok = accuracies.every((a) => a >= GATE);
+  const ok = gateReached(accuracies, RUNS, GATE);
   console.log(JSON.stringify({ model: MODEL, cases: cases.length, runs: RUNS, gate: GATE, accuracy: accuracies, passed: ok }));
   process.exit(ok ? 0 : 1);
 }

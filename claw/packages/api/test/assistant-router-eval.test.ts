@@ -32,7 +32,7 @@ import {
   CASES, FIXTURE, itemIdOf, NOTHING, type EvalCase,
 } from "./e2e/assistant-router-eval-cases.js";
 import {
-  effectsOf, fixtureFor, manifestOf, messagesLlm, pool, resolveItemRef, routerTools, runCase, sameEffects, scoreCase,
+  effectsOf, fixtureFor, gateReached, manifestOf, messagesLlm, numberFromEnv, pool, resolveItemRef, routerTools, runCase, sameEffects, scoreCase,
   summarize, userTurn, type Block, type Llm, type ModelResponse,
 } from "./e2e/assistant-router-eval-lib.js";
 
@@ -285,6 +285,47 @@ test("R8b the model call is the Messages request, retries only what may pass, an
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+test("R8b2 a failure the gateway words with the key in it is kept without the key", async () => {
+  const realFetch = globalThis.fetch;
+  const calls: number[] = [];
+  globalThis.fetch = (async () => {
+    calls.push(1);
+    if (calls.length === 1) return new Response("invalid x-api-key: k-secret-123", { status: 401 });
+    throw new Error("connect failed for key k-secret-123");
+  }) as typeof fetch;
+  try {
+    const llm = messagesLlm({ baseUrl: "https://gw.example", model: "m", apiKey: () => "k-secret-123", attempts: 1 });
+    await assert.rejects(llm({ system: "S", messages: [], tools: [] }), (err: Error) => {
+      assert.match(err.message, /HTTP 401: invalid x-api-key: <redacted>/);
+      assert.ok(!err.message.includes("k-secret-123"));
+      return true;
+    });
+    const second = messagesLlm({ baseUrl: "https://gw.example", model: "m", apiKey: () => "k-secret-123", attempts: 1 });
+    await assert.rejects(second({ system: "S", messages: [], tools: [] }), (err: Error) => {
+      assert.match(err.message, /connect failed for key <redacted>/);
+      return true;
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("R8d a setting that is not a number in range is refused rather than read as NaN, and no runs is not a pass", () => {
+  assert.equal(numberFromEnv(undefined, "EVAL_RUNS", 1, 1), 1);
+  assert.equal(numberFromEnv("  ", "EVAL_RUNS", 1, 1), 1);
+  assert.equal(numberFromEnv("3", "EVAL_RUNS", 1, 1), 3);
+  assert.equal(numberFromEnv("0.9", "EVAL_GATE", 0.95, 0, 1), 0.9);
+  for (const bad of ["abc", "NaN", "Infinity", "0", "-2"]) assert.throws(() => numberFromEnv(bad, "EVAL_RUNS", 1, 1), /EVAL_RUNS/, bad);
+  assert.throws(() => numberFromEnv("5", "EVAL_CONCURRENCY", 2, 1, 4), /EVAL_CONCURRENCY/);
+  assert.throws(() => numberFromEnv("1.5", "EVAL_GATE", 0.95, 0, 1), /EVAL_GATE/);
+
+  assert.equal(gateReached([1, 0.96], 2, 0.95), true);
+  assert.equal(gateReached([1, 0.94], 2, 0.95), false, "one run under the gate");
+  assert.equal(gateReached([], 0, 0.95), false, "no runs");
+  assert.equal(gateReached([], Number.NaN, 0.95), false, "a count that is not a number");
+  assert.equal(gateReached([1], 3, 0.95), false, "fewer runs than were asked for");
 });
 
 test("R8c the pool keeps the order of the results and the bound on what is in flight", async () => {
