@@ -72,7 +72,8 @@ const post = async (url: string, payload: unknown) => {
 const count = async (table: string): Promise<number> => Number((await h.sql(`SELECT count(*)::int AS n FROM ${table}`))[0]?.n);
 const server = (url: unknown) => ({ probe: { type: "http", url, token: "<SAFE_API_KEY>" } });
 
-const rows: Array<{ name: string; servers: unknown; refused: RegExp | null }> = [
+/** For an accepted row, the address Brain is told to connect to; `localhost` may resolve to either loopback. */
+const rows: Array<{ name: string; servers: unknown; refused: RegExp | null; pin?: RegExp }> = [
   { name: "loopback", servers: server("https://127.0.0.1:8080/mcp"), refused: /mcp_servers\.probe\.url refused: private_address/ },
   { name: "link-local metadata address", servers: server("https://169.254.169.254/latest"), refused: /private_address/ },
   { name: "cluster-internal private address", servers: server("https://10.96.0.1/mcp"), refused: /private_address/ },
@@ -81,10 +82,25 @@ const rows: Array<{ name: string; servers: unknown; refused: RegExp | null }> = 
   { name: "not http at all", servers: server("file:///etc/passwd"), refused: /https_required/ },
   { name: "no url", servers: { probe: { command: "sh" } }, refused: /mcp_servers\.probe\.url must be an http\(s\) URL/ },
   { name: "not an object", servers: ["https://93.184.215.14/mcp"], refused: /mcp_servers must be a JSON object/ },
-  { name: "https to a public address", servers: server("https://93.184.215.14/mcp"), refused: null },
-  { name: "a host the operator allowed, over http", servers: server("http://localhost:8080/mcp"), refused: null },
+  { name: "https to a public address", servers: server("https://93.184.215.14/mcp"), refused: null, pin: /^93\.184\.215\.14$/ },
+  { name: "a host the operator allowed, over http", servers: server("http://localhost:8080/mcp"), refused: null, pin: /^(127\.0\.0\.1|::1)$/ },
+  {
+    name: "a pin the request wrote itself is replaced",
+    servers: { probe: { url: "https://93.184.215.14/mcp", token: "t", pinned_address: { address: "10.0.0.1", family: 4 } } },
+    refused: null, pin: /^93\.184\.215\.14$/,
+  },
   { name: "none", servers: undefined, refused: null },
 ];
+
+/** The servers as sent, each carrying the address it was vetted at, which is where Brain will connect. */
+function assertDispatchedAsVetted(got: unknown, row: (typeof rows)[number]): void {
+  if (!row.servers) return assert.equal(got ?? null, null, "no servers were added");
+  const probe = (got as Record<string, Record<string, unknown>>).probe;
+  const { pinned_address: pin, ...rest } = probe;
+  const { pinned_address: _sent, ...sent } = (row.servers as Record<string, Record<string, unknown>>).probe;
+  assert.deepEqual(rest, sent, "the server as sent");
+  assert.match(String((pin as { address?: unknown })?.address), row.pin!, "pinned at the vetted address");
+}
 
 for (const row of rows) {
   test(`a message: ${row.name}`, async () => {
@@ -100,7 +116,7 @@ for (const row of rows) {
     } else {
       assert.equal(r.status, 200, JSON.stringify(r.body));
       assert.equal(published.length, 1, "the turn was dispatched");
-      assert.deepEqual(published[0]?.mcp_servers ?? null, row.servers ?? null, "with the servers as sent");
+      assertDispatchedAsVetted(published[0]?.mcp_servers, row);
     }
   });
 
@@ -115,6 +131,7 @@ for (const row of rows) {
     } else {
       assert.equal(r.status, 200, JSON.stringify(r.body));
       assert.equal(published.length, 1, "the first turn was dispatched");
+      assertDispatchedAsVetted(published[0]?.mcp_servers, row);
     }
   });
 }
