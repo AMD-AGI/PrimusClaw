@@ -80,6 +80,8 @@ export const WORKSPACE_EXCLUDES = [
   // user with a file they cannot get back and cannot delete. Excluding it here
   // is what makes "no sandbox writes here" a fact rather than an assumption.
   ".transcripts",
+  // The same, for the copies `deliver_file` makes (@claw/protocol deliveries.ts).
+  ".deliveries",
   // Historical bootstrap artefact (~100MB) from Brain releases that wrote the
   // Hands binary into /workspace. Current Brain puts it under /tmp; kept
   // because old workspaces still have one.

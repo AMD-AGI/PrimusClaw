@@ -30,6 +30,7 @@ import {
   type GitLimits,
   type GitReport,
 } from "./git-dirs.js";
+import { DELIVERY_DIR } from "@claw/protocol";
 import pino from "pino";
 
 const logger = pino({ name: "s3-uploader" });
@@ -343,12 +344,13 @@ const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, m
  * tag or by an unrelated prefix, and the upload sweeper only touches
  * `.uploads/`.
  *
- * Four things are deliberately never deleted here:
+ * Five things are deliberately never deleted here:
  *
  *   - `.uploads/`, which has its own expiry.
  *   - `.zip-cache/`, likewise.
  *   - `.transcripts/`, which Brain writes to and no sandbox ever has, so every
  *     prune sees the whole directory as stale.
+ *   - `.deliveries/`, likewise: the copies `deliver_file` gave the user.
  *   - `claw-<timestamp>/` archive directories, which are the point-in-time
  *     copies of past runs. They are supposed to outlive the current workspace.
  *
@@ -481,6 +483,7 @@ export function isPruneExempt(rel: string): boolean {
   return rel.startsWith(".uploads/")
     || rel.startsWith(".zip-cache/")
     || rel.startsWith(TRANSCRIPT_PREFIX)
+    || rel.startsWith(`${DELIVERY_DIR}/`)
     || isArchiveRelPath(rel);
 }
 
@@ -877,11 +880,12 @@ function isArchiveRelPath(rel: string): boolean {
  * run. Transcripts already sitting in the flat location are deliberately not
  * named here, and the prune no longer spares them either: shape cannot tell one
  * from a `results.jsonl` a user's own run wrote, so neither filter guesses and
- * both leave them as the workspace files they became. `.skills/` is intentionally
+ * both leave them as the workspace files they became. `.deliveries/` is the
+ * same as `.transcripts/`: written by Brain, never the sandbox's. `.skills/` is intentionally
  * NOT in this list; per-session skill state is restored from S3.
  */
 function isInternalRelPath(rel: string): boolean {
-  return rel === ".hands-binary" || rel.startsWith(TRANSCRIPT_PREFIX);
+  return rel === ".hands-binary" || rel.startsWith(TRANSCRIPT_PREFIX) || rel.startsWith(`${DELIVERY_DIR}/`);
 }
 
 /**

@@ -12,8 +12,10 @@ import type { ToolSchema, PendingMemory, PendingSkill, PendingSkillFileMutation 
 import {
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED, TODO_WRITE_ENABLED, BG_SHELL_ENABLED,
   EXIT_PLAN_MODE_ENABLED, ASK_USER_QUESTION_ENABLED, A2A_CLIENT_ENABLED,
-  BASH_FOREGROUND_DEFAULT_SEC, WAIT_DEFAULT_SEC,
+  BASH_FOREGROUND_DEFAULT_SEC, WAIT_DEFAULT_SEC, DELIVER_FILE_ENABLED, DELIVER_FILE_MAX_BYTES,
 } from "../config.js";
+import type { Delivery } from "@claw/protocol";
+import { DELIVER_FILE_TOOL, deliverFile, deliverFileSchema } from "./deliver-file.js";
 import type { WebSearchService } from "./web/search.js";
 import type { WebFetchService } from "./web/fetch.js";
 import { LOAD_SKILL_TOOL, type SkillStore } from "../agent/skill-store.js";
@@ -73,7 +75,12 @@ const BG_SHELL_DISABLED_MESSAGE =
   + "Run the command in the foreground with an appropriate bash timeout instead.";
 
 /** What `route()` fills in for its caller; see its `outcome` parameter. */
-type RouteOutcome = { isError: boolean; structured?: Record<string, unknown> };
+export type RouteOutcome = {
+  isError: boolean;
+  structured?: Record<string, unknown>;
+  /** A `deliver_file` that copied its file: what the terminal event tells the client. */
+  delivery?: Delivery;
+};
 
 /**
  * Answer with a refusal, recorded as one.
@@ -469,6 +476,22 @@ export class ToolRouter {
       return loaded.text;
     }
 
+    if (name === DELIVER_FILE_TOOL) {
+      // The schema is withheld while the switch is off, but a resumed transcript can still hold a call.
+      if (!DELIVER_FILE_ENABLED) return refuse(outcome, "Error: deliver_file is disabled in this deployment");
+      const { userId, sessionId } = this.a2aContext;
+      if (!sessionId) return refuse(outcome, "Error: deliver_file needs a session; nothing was delivered.");
+      const delivered = await deliverFile(
+        await this.requireHands(),
+        // The owner segment the workspace sync uses (tasks/runner.ts): the API serves from the same prefix.
+        { userId: userId || "default", sessionId, maxBytes: DELIVER_FILE_MAX_BYTES },
+        input, signal,
+      );
+      if (!delivered.ok) return refuse(outcome, delivered.error);
+      if (outcome) outcome.delivery = delivered.delivery;
+      return delivered.text;
+    }
+
     if (!BG_SHELL_ENABLED && isBackgroundShellCall(name, input)) {
       return refuse(outcome, BG_SHELL_DISABLED_MESSAGE);
     }
@@ -678,6 +701,8 @@ export class ToolRouter {
           }, required: ["todos"],
         },
       } as ToolSchema] : []),
+
+      ...(DELIVER_FILE_ENABLED ? [deliverFileSchema()] : []),
 
       // ── Web tools (P0, gated by feature flags) ──
       ...(WEB_SEARCH_PROVIDER !== "disabled" ? [{

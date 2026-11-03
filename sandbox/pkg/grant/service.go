@@ -162,9 +162,6 @@ func (s *Service) Issue(ctx context.Context, req IssueRequest) (IssueResponse, i
 	if err != nil {
 		return IssueResponse{}, 0, err
 	}
-	if err := validateTemplateLayers(stored); err != nil {
-		return IssueResponse{}, 0, err
-	}
 	if err := s.resolveTemplateGPUCounts(ctx, req.Issuer.AppRunID, stored); err != nil {
 		return IssueResponse{}, 0, err
 	}

@@ -31,6 +31,7 @@ const nowSec = () => Math.floor(Date.now() / 1000);
 /** Which module exports each `register*Routes` that `index.ts` calls on the app. */
 const REGISTRARS: Record<string, string> = {
   registerSessionRoutes: "routes/sessions.js",
+  registerSessionDeliveryRoutes: "routes/session-deliveries.js",
   registerEventRoutes: "routes/events.js",
   registerAnthropicManagedAgentsRoutes: "routes/anthropic-managed-agents.js",
   registerAdminRoutes: "routes/admin.js",

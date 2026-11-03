@@ -287,13 +287,15 @@ const ZIP_PRESIGN_EXPIRES_SEC = 3600;
 //   .git        - a repository's object store, which the snapshot carries so
 //                 unpushed commits survive a sandbox restart: thousands of
 //                 files, none of them the user's artifacts
+//   .deliveries - the copies `deliver_file` made, each served by its own route
+//                 (routes/session-deliveries.ts); the original is in the listing
 //
 // `.transcripts/` is deliberately absent. It is written by Brain rather than by
 // the sandbox, so the sync treats it as internal -- but it is the user's record
 // of what their run did, and it was downloadable from this listing for every
 // release before it moved into a directory. Hiding it here would take a feature
 // away as a side effect of a storage-layout change.
-const INTERNAL_PREFIXES_RE = /(?:^|\/)(\.zip-cache|\.uploads|\.skills|\.git)\//;
+const INTERNAL_PREFIXES_RE = /(?:^|\/)(\.zip-cache|\.uploads|\.skills|\.git|\.deliveries)\//;
 
 /**
  * Whether an object under the session prefix is hidden from the user's files.

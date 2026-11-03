@@ -31,6 +31,8 @@ test("the directories that belong to another lifecycle stay hidden", () => {
   assert.equal(isHiddenSessionFile(".zip-cache/ktsk_1.zip"), true);
   assert.equal(isHiddenSessionFile(".uploads/input.csv"), true);
   assert.equal(isHiddenSessionFile(".skills/pdf/SKILL.md"), true);
+  // Delivered copies are served by their own link; the original is in the listing already.
+  assert.equal(isHiddenSessionFile(".deliveries/0f8fad5b-d9cb-469f-a165-70867728950e/chart.png"), true);
   // Nested too: an archive of a past run carries the same directories inside it.
   assert.equal(isHiddenSessionFile("claw-1786000000000/.uploads/input.csv"), true);
 });

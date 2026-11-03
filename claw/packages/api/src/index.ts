@@ -19,6 +19,7 @@ import { initUserEnvCrypto } from "./crypto/user-env.js";
 import { authLogPath, authMiddleware } from "./auth/middleware.js";
 import { startIdentityClient } from "./auth/identity.js";
 import { registerSessionRoutes } from "./routes/sessions.js";
+import { registerSessionDeliveryRoutes } from "./routes/session-deliveries.js";
 import { registerAnswerFeedbackRoutes } from "./routes/answer-feedback.js";
 import { registerImageRoutes } from "./routes/images.js";
 import { registerEventRoutes } from "./routes/events.js";
@@ -296,6 +297,7 @@ async function main() {
   app.addHook("preHandler", authMiddleware);
 
   await registerSessionRoutes(app);
+  await registerSessionDeliveryRoutes(app);
   await registerAnswerFeedbackRoutes(app);
   await registerImageRoutes(app);
   await registerEventRoutes(app);

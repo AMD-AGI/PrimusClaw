@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { ToolRouter } from "../tools/router.js";
+import { ToolRouter, type RouteOutcome } from "../tools/router.js";
 import { isRetryable } from "../infra/retry.js";
 import { runSubagent, SUBAGENT_TYPES, type SubagentType } from "./sub-agent.js";
 import {
@@ -2067,14 +2067,14 @@ class AgentLoopRunner {
 
       const toolStart = Date.now();
       let resultText: string;
-      let toolOutcome = { isError: false };
+      let toolOutcome: RouteOutcome = { isError: false };
       try {
       // `wait` blocks on a background command finishing, which is the run
       // sitting still rather than working -- the case the whole waiting/
       // executing split exists to measure.
       // Filled by the router from the tool's own result, so what counts as
       // success is the tool's answer rather than the shape of its wording.
-      const outcome = { isError: false };
+      const outcome: RouteOutcome = { isError: false };
       // The model-issued tool-use identifier. Sealed onto the reference row
       // before the dispatch, so a resumed run recognises its own retry of this
       // exact call rather than one that merely produced the same command.
@@ -2182,6 +2182,8 @@ class AgentLoopRunner {
     await this.onEvent({
         type: "toolUsed", tool: toolName, actionId: toolId, status: "success",
         description: resultText.slice(0, 2000),
+        // The file a client offers for download (tools/deliver-file.ts).
+        ...(toolOutcome.delivery ? { delivery: toolOutcome.delivery } : {}),
       });
       resultByToolId.set(toolId, resultText);
   }
