@@ -88,10 +88,20 @@ const REVIEW_STEPS = `## Steps
    - find how the repository runs its tests (README, CONTRIBUTING, AGENTS.md, package.json, Makefile,
      pyproject.toml, go.mod) and run the tests closest to the change: the tests of the changed
      modules and the tests that import them, never the whole suite. Bound every command with
-     \`timeout 600\` and the whole of it to about fifteen minutes. Install dependencies only the
-     documented way and only if that fits the bound. A test that fails because of the change is a
-     finding; a test that could not run (missing services, dependencies, time) is not a pass: say
-     which and why in the review body.
+     \`timeout 600\` and the whole of it to about fifteen minutes.
+   - build what those tests need before you run them, the way the repository documents it. A fresh
+     checkout has no built output, and in a workspace (a monorepo) a test usually loads its sibling
+     packages from theirs (\`dist/\`, a compiled module): build the packages the tests import, only
+     those when the build tool allows it (\`npm run build -w <package>\` for each, in dependency
+     order; \`make <target>\`), else the documented build. Install dependencies only the documented
+     way and only when they are missing: dependencies and build output an earlier run left in the
+     checkout are kept and reused, so do not delete them and do not run a clean install (\`npm ci\`)
+     over installed ones. Build again after each recipe run, since the head may be new. A test that
+     stops on a missing module or a missing built file did not run: build what it names and run it
+     again. If the build fails or does not fit the bound, run the closest tests that need no build.
+   - a test that fails because of the change is a finding; a test that could not run (missing
+     services, dependencies, a build that failed or did not fit, time) is not a pass: say which and
+     why in the review body.
    Keep a list of what you read (files, functions) and what you ran (command and result): the
    review body reports it.
 5. Look for problems in separate passes, each over the whole change: logic and correctness

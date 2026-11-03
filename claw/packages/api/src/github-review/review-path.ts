@@ -77,6 +77,6 @@ export function reviewPathAdvice(choice: ReviewPathChoice): string {
     source_change: "the change touches source code",
   };
   return `This review must use a sandbox because ${why[choice.reason] ?? choice.reason}. `
-    + "Run the sandbox_recipe below (anonymous, pinned to the head_sha), then read the callers of what changed and run the tests closest to the change. "
+    + "Run the sandbox_recipe below (anonymous, pinned to the head_sha), then read the callers of what changed, build what the tests closest to the change need (the documented way, only what is missing) and run them. "
     + "Never give the sandbox a GitHub credential: comments, approvals and merges go through the tools.";
 }

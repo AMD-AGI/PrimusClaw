@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 import test, { after } from "node:test";
 import { GithubReview } from "../src/github-review/service.js";
 import { chooseReviewPath, isNonTestSource, reviewPathAdvice } from "../src/github-review/review-path.js";
+import { PR_REVIEW_INSTRUCTIONS } from "../src/github-review/default-skill.js";
 import { readGithubReviewSettings } from "../src/github-review/settings.js";
 import { PR, SECRET, closeShared, credential, readSection, reviewEnv } from "./support/review-env.js";
 
@@ -89,7 +90,7 @@ test("the advice tells the model not to use a sandbox on the fast path, and that
   const slow = reviewPathAdvice({ path: "sandbox", reason: "too_many_files" });
   assert.match(slow, /must use a sandbox because the change touches many files/);
   assert.match(slow, /callers/);
-  assert.match(slow, /run the tests closest to the change/);
+  assert.match(slow, /build what the tests closest to the change need \(the documented way, only what is missing\) and run them/);
   assert.match(reviewPathAdvice({ path: "sandbox", reason: "source_change" }), /because the change touches source code/);
 });
 
@@ -215,4 +216,26 @@ test("the review model and effort are read from the environment: sonnet and no e
   assert.deepEqual([bad.reviewModel, bad.reviewEffort], ["claude-sonnet-5.5", null]);
   assert.match(bad.problems.join(), /CLAW_GITHUB_REVIEW_MODEL/);
   assert.match(bad.problems.join(), /CLAW_GITHUB_REVIEW_EFFORT=max/);
+});
+
+test("the instructions build what the closest tests import before running them, reuse what an earlier run left, and fall back to tests that need no build", () => {
+  const text = PR_REVIEW_INSTRUCTIONS.replace(/\s+/g, " ");
+  // Order: find the tests, build what they need, then judge what ran.
+  const find = text.indexOf("run the tests closest to the change");
+  const build = text.indexOf("build what those tests need before you run them, the way the repository documents it");
+  const judge = text.indexOf("a test that could not run");
+  assert.ok(find > 0 && build > find && judge > build, `${find} ${build} ${judge}`);
+  // A workspace's sibling packages load from their built output, which a fresh checkout lacks.
+  assert.match(text, /sibling packages from theirs \(`dist\/`, a compiled module\)/);
+  assert.match(text, /`npm run build -w <package>` for each, in dependency order/);
+  // Cached: what an earlier run left is reused, never wiped by a clean install.
+  assert.match(text, /only when they are missing/);
+  assert.match(text, /do not run a clean install \(`npm ci`\) over installed ones/);
+  assert.match(text, /Build again after each recipe run/);
+  // A missing module is a build not done, not a result; a build that does not fit is not a pass.
+  assert.match(text, /stops on a missing module or a missing built file did not run: build what it names and run it again/);
+  assert.match(text, /If the build fails or does not fit the bound, run the closest tests that need no build/);
+  assert.match(text, /a build that failed or did not fit, time\) is not a pass/);
+  // Bounded like every other command.
+  assert.match(text, /Bound every command with `timeout 600`/);
 });

@@ -444,7 +444,10 @@ non-test source file changed (`source_change`: a code, shell, SQL or interface-s
 some file (a binary, a rename or a diff too large, whatever the line counts say), the file list is incomplete, or the repository has a review skill of its own, which
 may use scripts. On that path the model checks the pull request out, reads the callers of every
 changed function and export and the code around them, and runs the tests closest to the change
-(the repository's documented test command, scoped, each command under `timeout 600`), then has a
+(the repository's documented test command, scoped, each command under `timeout 600`, after
+building what those tests import the documented way: in a workspace a test loads its sibling
+packages from their built output, which a fresh checkout lacks; dependencies and build output left
+in the reused checkout are kept and reused, never reinstalled from clean), then has a
 second, adversarial pass look for what the first missed (a `task` sub-agent with read and bash
 tools only), and the review body lists what was read and run. A diff alone shows what changed, not
 who depends on it. Brain opens a sandbox only when a turn uses a sandbox tool, so the decision is
