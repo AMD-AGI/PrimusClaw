@@ -762,7 +762,8 @@ export class GithubReview {
     const earlier = await heldOrDeniedOn(this.deps.db, ctx.actor.actorUserId, `${ref.owner}/${ref.repo}`, ref.number, pr.headSha);
     const theirs = earlier === "denied"
       ? [`${ctx.cred.login} refused an approval or a merge of this commit before, so this one is theirs to decide as well`]
-      : earlier === "pending" ? [`an approval or a merge of this commit already waits for ${ctx.cred.login}'s decision, so this one waits as well`] : [];
+      : earlier === "pending" ? [`an approval or a merge of this commit already waits for ${ctx.cred.login}'s decision, so this one waits as well`]
+        : earlier === "expired" ? [`an earlier hold of this commit was never answered by ${ctx.cred.login}, so this one waits for them as well`] : [];
     const reasons = [...theirs, ...(ctx.cred.mode === "fully_auto" ? risk.repoHolds : risk.reasons)];
     return { ...risk, level: reasons.length > 0 ? "high" : "low", reasons };
   }

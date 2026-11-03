@@ -349,17 +349,19 @@ record it.
   interface or dependency change are for the model to weigh. Before, nearly every approval of an ordinary large
   pull request by a contributor was held. What still holds whatever the model says: the repository's own
   `.github/claw-review.yml` (or the same file under its earlier name) asking for it (`confirm_merge: always`, a `high_risk_paths`
-  match) or not parsing; a change to `.github/workflows/`, `.github/actions/`, `CODEOWNERS` or that configuration
-  file; a cut file list; rules that fail; and a missing or malformed judgement. The model's `risk_flags` hold as
+  match) or not parsing; a change to `.github/workflows/`, `.github/actions/`, `.github/scripts/`, another CI
+  definition, `CODEOWNERS` or that configuration file; a change to the instructions the reviewing model reads (a
+  review skill, the root `AGENTS.md`, `.github/copilot-instructions.md`); a cut file list; rules that fail; and a missing or malformed judgement. The model's `risk_flags` hold as
   before. The held confirmation and the tool answer give the reasons in plain words, the model's own first.
   Delegation, author != acting user, CI, merge state, branch protection, the writes switch, the head-SHA binding
   and the audit are unchanged; the audit row keeps the evidence (`evidence: ...`). `gh_pr_risk` no longer
   answers `raised_by_reviewer`. An approval or a merge of a head commit whose earlier approval or merge still
-  waits for the acting user, is being decided, or was refused is held too. See `claw/docs/github-review.md` ("High risk").
+  waits for the acting user, is being decided, was refused, or expired unanswered is held too. See `claw/docs/github-review.md` ("High risk").
 - GitHub review: the acting user's own review mode decides what holds for every review and merge made with their
   account, whoever asked: `high_risk_confirm` (the default, also for a person who never set one) holds as above,
   `fully_auto` holds only what the repository itself requires (`confirm_merge: always`, a `high_risk_paths` match, a
-  configuration that does not parse) and an earlier held or refused write of the commit. It is kept in Claw
+  configuration that does not parse), a change to the instructions the reviewing model reads, and an earlier held,
+  refused or unanswered write of the commit. It is kept in Claw
   (`claw_github_review_settings`, by user id, created on start) and read and set by the person themselves with
   `GET` / `PUT /v1/github-review/settings` (`{review_mode}`; the `PUT` needs the person's sign-in or an allowed
   service's exchange token). `delegation` still decides alone whether others may ask. The mode is in `gh_pr_get` and

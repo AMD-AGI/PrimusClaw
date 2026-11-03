@@ -356,22 +356,24 @@ export async function countPendingConfirmations(db: Queryable, actorUserId: stri
 }
 
 /**
- * Whether an approval or a merge of this head commit, with this acting user's account, is already waiting for them, is being decided, or
- * was refused by them: a later call for the same commit must not make that write without them, whatever it says of the change. GitHub's names are not
+ * Whether an approval or a merge of this head commit, with this acting user's account, is already waiting for them, is being decided, was
+ * refused by them, or was held and never answered: a later call for the same commit must not make that write without them, whatever it says of the change. GitHub's names are not
  * case sensitive, and neither is this: `amd-agi/DEMO#7` is the same pull request as `AMD-AGI/demo#7`.
  */
-export async function heldOrDeniedOn(db: Queryable, actorUserId: string, repo: string, pr: number, headSha: string): Promise<"pending" | "denied" | null> {
+export async function heldOrDeniedOn(db: Queryable, actorUserId: string, repo: string, pr: number, headSha: string): Promise<"pending" | "denied" | "expired" | null> {
   const r = await db.query(
-    `SELECT status FROM claw_github_confirmations
+    `SELECT CASE WHEN status = 'pending' AND expires_at <= NOW() THEN 'expired' ELSE status END AS state
+       FROM claw_github_confirmations
       WHERE actor_user_id = $1 AND lower(repo) = lower($2) AND pr = $3 AND head_sha = $4
-        AND ((status = 'pending' AND expires_at > NOW()) OR status IN ('merging', 'denied'))
-      ORDER BY status = 'denied' DESC LIMIT 1`,
+        AND status IN ('pending', 'merging', 'denied', 'expired')`,
     [actorUserId, repo, pr, headSha],
   );
-  const status = (r.rows[0] as { status?: string } | undefined)?.status;
-  if (status === "denied") return "denied";
+  const states = new Set((r.rows as Array<{ state?: string }>).map((row) => row.state));
+  if (states.has("denied")) return "denied";
   // `merging` is a decision being carried out, a deny as much as an allow (claimConfirmation): until it is recorded it is still theirs.
-  return status === "pending" || status === "merging" ? "pending" : null;
+  if (states.has("pending") || states.has("merging")) return "pending";
+  // Nobody answered: the judgement that held it may be asked again until it says low, so the commit stays theirs to decide.
+  return states.has("expired") ? "expired" : null;
 }
 
 export async function getConfirmation(db: Queryable, id: string): Promise<Confirmation | null> {

@@ -80,8 +80,9 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor)
   mcp.tool(
     "gh_pr_risk",
     "Whether an approval or a merge of a pull request would be held for the acting user's own confirmation (level high), given your `risk_judgement` "
-    + "and `risk_flags`: the judgement decides, except for the hard holds (the repository's own configuration, a change to its workflows, actions, "
-    + "CODEOWNERS or review configuration, a file list that was cut), and a missing judgement holds. The rules' evidence comes with it.",
+    + "and `risk_flags` and the acting user's `review_mode`. Under high_risk_confirm the judgement decides, except for the hard holds (the repository's own "
+    + "configuration, a change to its CI, CODEOWNERS, review configuration or the review instructions you read, a file list that was cut), and a missing judgement "
+    + "holds; under fully_auto only `repo_holds` hold. The rules' evidence comes with it.",
     { pr: z.string().describe(PR_HELP), risk_flags: FLAGS, risk_judgement: JUDGEMENT },
     async (a) => toResult(await service.assessPr(actor, a)),
   );

@@ -30,6 +30,25 @@ export interface ReviewInstructions {
   text: string;
 }
 
+/** Where a repository's review skill is looked for, in this order: `<dir>/<name>/SKILL.md` for a `name` that {@link reviewSkillCandidates} picks. */
+const SKILL_DIRS = [".claude/skills", ".agents/skills"] as const;
+/** Files read beside the skill as context about the repository. */
+const CONTEXT_FILES = ["AGENTS.md", ".github/copilot-instructions.md"] as const;
+
+/**
+ * Whether a change to this path changes what the reviewing model is told (by {@link selectReviewInstructions}, once it is on the base
+ * branch): a context file, or anything in a skill directory whose name could be picked, the one in use or one that would be put before it.
+ */
+export function isReviewInstructionPath(path: string): boolean {
+  if ((CONTEXT_FILES as readonly string[]).includes(path)) return true;
+  for (const dir of SKILL_DIRS) {
+    if (!path.startsWith(`${dir}/`)) continue;
+    const name = path.slice(dir.length + 1).split("/")[0] ?? "";
+    if (reviewSkillCandidates([{ name, type: "dir" }], false).length > 0) return true;
+  }
+  return false;
+}
+
 const MAX_SKILL_BYTES = 64 * 1024;
 const MAX_CONTEXT_BYTES = 16 * 1024;
 
@@ -86,7 +105,7 @@ export async function selectReviewInstructions(client: GithubClient, ref: PrRef,
   }
   try {
     let found: { path: string; text: string } | null = null;
-    for (const dir of [".claude/skills", ".agents/skills"]) {
+    for (const dir of SKILL_DIRS) {
       const candidates = reviewSkillCandidates(await listDir(client, ref, dir, baseSha), dir === ".agents/skills");
       for (const name of candidates) {
         const path = `${dir}/${name}/SKILL.md`;
@@ -95,8 +114,9 @@ export async function selectReviewInstructions(client: GithubClient, ref: PrRef,
       }
       if (found) break;
     }
-    const agents = await readFileAt(client, ref, "AGENTS.md", baseSha, MAX_CONTEXT_BYTES);
-    const copilot = await readFileAt(client, ref, ".github/copilot-instructions.md", baseSha, MAX_CONTEXT_BYTES);
+    const [agentsPath, copilotPath] = CONTEXT_FILES;
+    const agents = await readFileAt(client, ref, agentsPath, baseSha, MAX_CONTEXT_BYTES);
+    const copilot = await readFileAt(client, ref, copilotPath, baseSha, MAX_CONTEXT_BYTES);
     if (!found && !agents && !copilot) return { source: "default", baseSha, text: PR_REVIEW_INSTRUCTIONS };
     const parts: string[] = [];
     if (found) {

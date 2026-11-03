@@ -700,9 +700,18 @@ describe("M4 what the change does, and the reviewer's judgement of it", () => {
     await e.sql("UPDATE claw_github_confirmations SET status = 'merging'");
     assert.equal((await merge()).body.status, "confirmation_required", "a deny in flight is not lost to a write");
     await e.sql("DELETE FROM claw_github_confirmations WHERE kind = 'merge'");
+    // A hold nobody answered: closed as expired, or still pending past its time. Asking again until the judgement says low does not get past it.
+    for (const expire of ["UPDATE claw_github_confirmations SET status = 'expired'", "UPDATE claw_github_confirmations SET status = 'pending', expires_at = NOW() - INTERVAL '1 second'"]) {
+      await e.sql(expire);
+      const unanswered = await merge();
+      assert.equal(unanswered.body.status, "confirmation_required", expire);
+      assert.match((unanswered.body.reasons as string[])[0] ?? "", /an earlier hold of this commit was never answered by bob/);
+      await e.sql("DELETE FROM claw_github_confirmations WHERE kind = 'merge'");
+    }
+    await e.sql("DELETE FROM claw_github_audit"); // the session's request budget, which this many calls spend
     await e.sql("UPDATE claw_github_confirmations SET status = 'denied'");
     const after = await merge();
-    assert.equal(after.body.status, "confirmation_required", "a refusal stands for the commit it was about");
+    assert.equal(after.body.status, "confirmation_required", `a refusal stands for the commit it was about: ${after.text}`);
     assert.match((after.body.reasons as string[])[0] ?? "", /bob refused an approval or a merge of this commit/);
     // Another commit is another question.
     await e.sql("UPDATE claw_github_confirmations SET head_sha = $1", ["f".repeat(40)]);

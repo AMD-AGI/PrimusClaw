@@ -35,6 +35,7 @@
  * {@link parseRepoConfig}); a pull request that edits that file is held.
  */
 import { LEGACY_REPO_CONFIG_STEM } from "./legacy-names.js";
+import { isReviewInstructionPath } from "./repo-skill.js";
 import { MAX_READ_CHARS, MAX_READ_LINES, contentFindings, isDoc, isSource, isTest, rawHead, readChange, type Finding, type RiskCategory } from "./risk-signals.js";
 
 export type { Finding, RiskCategory } from "./risk-signals.js";
@@ -120,7 +121,10 @@ export interface RiskResult {
   evidence: string[];
   /** The rules' findings that hold whatever the reviewer says (also in `reasons`). */
   hardHolds: string[];
-  /** Those of `hardHolds` that are the repository's own requirement: they hold whatever the acting user's review mode says as well. */
+  /**
+   * Those of `hardHolds` that hold whatever the acting user's review mode says as well: the repository's own requirement, and a change to
+   * the instructions the reviewing model reads (repo-skill.ts).
+   */
   repoHolds: string[];
   /** The kinds of change the evidence and the reasons are about, in the order they first appear. */
   categories: RiskCategory[];
@@ -180,7 +184,9 @@ const GOVERNANCE_PATHS: RegExp[] = [
  * A change to one holds whatever the reviewer says.
  */
 const CONTROL_PATHS: RegExp[] = [
-  /^\.github\/(workflows|actions)\//i,
+  /^\.github\/(workflows|actions|scripts)\//i,
+  /(^|\/)\.gitlab-ci\.ya?ml$/i,
+  /(^|\/)(azure-pipelines|Jenkinsfile|\.circleci\/config)/i,
   /^(\.github\/|docs\/)?CODEOWNERS$/i,
   new RegExp(`^\\.github\\/(claw-review|${LEGACY_REPO_CONFIG_STEM})\\.ya?ml$`, "i"),
 ];
@@ -386,6 +392,8 @@ function assess(input: RiskInput): { findings: Finding[]; hard: Set<string>; rep
       const where = q === p ? p : `${q} (moved to ${p})`;
       const controls = CONTROL_PATHS.some((re) => re.test(q));
       if (controls || GOVERNANCE_PATHS.some((re) => re.test(q))) add("ci_release", `CI, workflow or governance file changed: ${where}`, controls && "hard");
+      // What the reviewing model is told decides this very hold: a change to it holds under every review mode, as the repository's own requirement does.
+      if (isReviewInstructionPath(q)) add("ci_release", `the instructions the reviewing model reads changed: ${where}`, "repo");
       // The path rules below read no content and are a floor: an edit that looks like a comment, or a line that moved, does not lower them
       // (what a comment is depends on the language, and a line shaped like one can be code). The content half above can only add to them.
       if (AUTH_PATH.test(q) && isSource(q)) add("security", `authentication or security code changed: ${where}`);

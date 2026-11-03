@@ -129,8 +129,9 @@ review and the merge and who is the reviewer of record, and whose own standing a
     merge is held as "High risk" says, for the reviewer's judgement, its flags or a hard hold;
   - `fully_auto`: nothing is held except what the repository itself requires (`risk.repo_holds`: its
     configuration's `confirm_merge: always` or a `high_risk_paths` match, a configuration that does not
-    parse, rules that failed, a cut file list where it marks paths), and an earlier write of the same
-    commit that still waits for the person, is being decided by them, or was refused by them. The other
+    parse, rules that failed, a cut file list where it marks paths), a change to the instructions the
+    reviewing model reads, and an earlier write of the same commit that still waits for the person, is
+    being decided by them, was refused by them, or was held and never answered. The other
     gates (CI green, no open thread, merge state `CLEAN`, not the author, delegation, the head commit)
     stand as ever.
 
@@ -178,16 +179,20 @@ review and the merge and who is the reviewer of record, and whose own standing a
   protections are met because they are GitHub's. No admin merge, no auto-merge, no branch update, no change to a rule.
   The method is the repository's first allowed one, squash first.
 - **High risk.** Whether an `APPROVE` or a merge is held for the acting user's own confirmation is
-  decided in `packages/api/src/github-review/risk.ts` (`assessRisk`), and it is held when
+  decided in `packages/api/src/github-review/risk.ts` (`assessRisk`). Under the acting user's default review
+  mode, `high_risk_confirm` (under `fully_auto` see the item above), it is held when
   1. the reviewing model's `risk_judgement` on `gh_review_submit` / `gh_pr_merge` is `high`; or it is
      missing or malformed (fail closed); or the model passed a `risk_flags` (`security_finding`,
      `review_skipped`); or
   2. a **hard hold** applies, which no judgement lowers: the repository's own configuration on the base
      branch asks for it (`confirm_merge: always`, or a changed path matches its `high_risk_paths`), or
      that configuration does not parse; the change touches a file that controls the repository
-     (`.github/workflows/`, `.github/actions/`, `CODEOWNERS` at the root, under `.github/` or `docs/`,
+     (`.github/workflows/`, `.github/actions/`, `.github/scripts/`, `.gitlab-ci.yml`, a `Jenkinsfile`,
+     `azure-pipelines`, `.circleci/config`, `CODEOWNERS` at the root, under `.github/` or `docs/`,
      `.github/claw-review.yml` or the same file under its earlier name), including a file moved out of
-     one; the file list is cut (more files than are read), so such a change cannot be ruled out; or the
+     one; the change touches the instructions the reviewing model reads (`repo-skill.ts`
+     `isReviewInstructionPath`: a review skill directory under `.claude/skills/` or `.agents/skills/`,
+     the root `AGENTS.md`, `.github/copilot-instructions.md`), which holds under `fully_auto` too; the file list is cut (more files than are read), so such a change cannot be ruled out; or the
      rules themselves fail.
 
   Nothing else holds. The rule pack below (version `2026-11-03.1`) is **evidence**: `gh_pr_get` and
@@ -274,8 +279,9 @@ review and the merge and who is the reviewer of record, and whose own standing a
   `gh_pr_get`, before any judgement, gives the evidence, the hard holds and the guidance. The audit row
   keeps the reasons and the evidence (marked `evidence:`). A `low` without a reason is no judgement.
   An approval or a merge of a head commit for which an earlier approval or merge already waits for the
-  acting user, is being decided by them, or was refused by them (the repository name compared without
-  case), is held too, and `gh_pr_risk` says so, whatever the later call says: a lower judgement on a
+  acting user, is being decided by them, was refused by them, or was held and never answered (an expired
+  confirmation: asking again until a judgement says low does not get past it; a new head commit does), with
+  the repository name compared without case, is held too, and `gh_pr_risk` says so, whatever the later call says: a lower judgement on a
   second call, or the other of the two tools, does not get past their decision.
 
   A merge or an approval that needs confirmation creates one pending row for the head commit and
