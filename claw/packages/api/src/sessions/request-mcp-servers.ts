@@ -31,13 +31,14 @@ export async function vetRequestMcpServers(
   if (servers === undefined || servers === null) return { ok: true, servers: undefined };
   if (typeof servers !== "object" || Array.isArray(servers)) return { ok: false, error: "mcp_servers must be a JSON object" };
   const allowed = parseAllowedHosts(MCP_SERVER_ALLOWED_HOSTS);
-  const vetted: McpServers = {};
+  const vetted: Array<[string, Record<string, unknown>]> = [];
   for (const [name, spec] of Object.entries(servers)) {
     const url = spec && typeof spec === "object" ? (spec as Record<string, unknown>).url : undefined;
     if (typeof url !== "string" || !url) return { ok: false, error: `mcp_servers.${name}.url must be an http(s) URL` };
     const guard = await guardWebhookUrl(url, allowed, resolve);
     if (!guard.ok) return { ok: false, error: `mcp_servers.${name}.url refused: ${guard.reason}` };
-    vetted[name] = { ...(spec as Record<string, unknown>), pinned_address: { address: guard.address, family: guard.family } };
+    vetted.push([name, { ...(spec as Record<string, unknown>), pinned_address: { address: guard.address, family: guard.family } }]);
   }
-  return { ok: true, servers: vetted };
+  // fromEntries defines own properties, so a server named `__proto__` stays a server.
+  return { ok: true, servers: Object.fromEntries(vetted) };
 }
