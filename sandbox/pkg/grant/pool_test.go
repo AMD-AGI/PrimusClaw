@@ -9,6 +9,11 @@ import (
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+
+	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
 )
 
@@ -53,6 +58,46 @@ func detailOf(err error) string {
 		return oe.Detail
 	}
 	return ""
+}
+
+func TestIssueEchoesStoredCaps(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	svc, priv, _, _ := testService(t, now)
+	req := poolRequest(now.Add(time.Hour))
+	req.Attestation = signGrant(t, priv, req)
+	for _, want := range []int{201, 200} {
+		resp, status, err := svc.Issue(context.Background(), req)
+		if err != nil || status != want {
+			t.Fatalf("status=%d err=%v", status, err)
+		}
+		if resp.MaxSandboxes == nil || *resp.MaxSandboxes != 8 || resp.MaxGPUs == nil || *resp.MaxGPUs != 8 {
+			t.Fatalf("status=%d caps=%v %v", status, resp.MaxSandboxes, resp.MaxGPUs)
+		}
+	}
+}
+
+func TestIssueRejectsDroppedCaps(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	svc, priv, _, _ := testService(t, now)
+	svc.client = interceptor.NewClient(svc.client.(client.WithWatch), interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if g, ok := obj.(*runtimev1alpha1.SandboxGrant); ok {
+				g.Spec.MaxSandboxes, g.Spec.MaxGPUs = nil, nil
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	})
+	req := poolRequest(now.Add(time.Hour))
+	req.Attestation = signGrant(t, priv, req)
+	_, _, err := svc.Issue(context.Background(), req)
+	var oe *OpError
+	if !IsReason(err, "grant_caps_unsupported") || !errors.As(err, &oe) || oe.Status != 500 {
+		t.Fatalf("err=%v", err)
+	}
+	var got runtimev1alpha1.SandboxGrant
+	if err := svc.client.Get(context.Background(), client.ObjectKey{Namespace: "agent-sandbox-system", Name: req.GrantID}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("grant kept: %v", err)
+	}
 }
 
 func TestPoolSharedAcrossRoles(t *testing.T) {

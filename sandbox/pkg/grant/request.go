@@ -71,10 +71,13 @@ type ExtendRequest struct {
 
 // IssueResponse is the body of a successful issue call.
 // Keys is omitted when the grant already existed.
+// MaxSandboxes and MaxGPUs are the grant caps as stored.
 type IssueResponse struct {
-	GrantID   string              `json:"grantId"`
-	Keys      map[string]string   `json:"keys,omitempty"`
-	Templates map[string][]string `json:"templates,omitempty"`
+	GrantID      string              `json:"grantId"`
+	Keys         map[string]string   `json:"keys,omitempty"`
+	Templates    map[string][]string `json:"templates,omitempty"`
+	MaxSandboxes *int32              `json:"maxSandboxes,omitempty"`
+	MaxGPUs      *int32              `json:"maxGpus,omitempty"`
 }
 
 // GrantView is GET /internal/v1/grants/{id}. It has no keys and no platform key.

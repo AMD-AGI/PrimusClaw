@@ -9,7 +9,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createVerify, generateKeyPairSync } from "node:crypto";
 import {
-  GRANT_AUDIENCE, GRANT_ISSUER, GRANT_KID, GRANT_KINDS, GrantHttpError, GrantKeysMissingError, GrantSigner,
+  GRANT_AUDIENCE, GRANT_ISSUER, GRANT_KID, GRANT_KINDS, GrantCapsMissingError, GrantHttpError, GrantKeysMissingError, GrantSigner,
   SandboxGrantClient, buildSandboxGrant, loadGrantSigner, type SandboxGrantMaterial,
 } from "../src/sandbox-grant.js";
 
@@ -30,6 +30,9 @@ const material = (): SandboxGrantMaterial => ({
   templates: [{ name: "runner", per_gpu_count: [1, 8], image: "img:1", data_plane: { mode: "sealed" } }],
   roles: { measurement: ["runner"], subrun: ["runner"] },
 });
+
+/** The grant caps the material sends, as the service echoes them. */
+const CAPS = { maxSandboxes: 4, maxGpus: 8 };
 
 function client(handler: (req: { method: string; url: string; body: unknown }) => { status: number; json?: unknown } | Promise<{ status: number; json?: unknown }>): SandboxGrantClient {
   const fetchImpl: typeof fetch = async (url, init) => {
@@ -85,11 +88,24 @@ test("201 returns the keys", async () => {
   const c = client(async (req) => {
     assert.equal(req.method, "POST");
     assert.equal((req.body as { attestation: string }).attestation.split(".").length, 3);
-    return { status: 201, json: { grantId: material().grantId, keys: { measurement: "e2b_a", subrun: "e2b_b" } } };
+    return { status: 201, json: { grantId: material().grantId, keys: { measurement: "e2b_a", subrun: "e2b_b" }, ...CAPS } };
   });
   const issued = await c.issue(material());
   assert.equal(issued.keys.measurement, "e2b_a");
   assert.equal(issued.keys.subrun, "e2b_b");
+});
+
+test("keys without the sent caps revoke that id and fail", async () => {
+  for (const answered of [{}, { maxSandboxes: 4 }, { maxSandboxes: 4, maxGpus: 2 }]) {
+    const calls: string[] = [];
+    const c = client(async (req) => {
+      calls.push(req.method);
+      if (req.method === "POST") return { status: 201, json: { keys: { measurement: "e2b_a" }, ...answered } };
+      return { status: 200 };
+    });
+    await assert.rejects(() => c.issue(material()), (err: unknown) => err instanceof GrantCapsMissingError);
+    assert.deepEqual(calls, ["POST", "DELETE"]);
+  }
 });
 
 test("200 without keys revokes that id and fails", async () => {
@@ -183,7 +199,7 @@ test("reissue of a 200 without keys revokes and posts once more", async () => {
     if (req.method === "POST") {
       posts += 1;
       if (posts === 1) return { status: 200, json: { grantId: material().grantId } };
-      return { status: 201, json: { keys: { measurement: "e2b_a", subrun: "e2b_b" } } };
+      return { status: 201, json: { keys: { measurement: "e2b_a", subrun: "e2b_b" }, ...CAPS } };
     }
     assert.equal(req.method, "DELETE");
     return { status: 200 };
@@ -227,8 +243,8 @@ test("the signer rejects a non-EC key", () => {
 });
 
 test("issue returns the template names the response carries, and none when it carries none", async () => {
-  const withNames = client(() => ({ status: 200, json: { keys: { measurement: "k" }, templates: { measurement: ["r-runner-g1", "r-runner-g8"] } } }));
+  const withNames = client(() => ({ status: 200, json: { keys: { measurement: "k" }, ...CAPS, templates: { measurement: ["r-runner-g1", "r-runner-g8"] } } }));
   assert.deepEqual((await withNames.issue(material())).templates, { measurement: ["r-runner-g1", "r-runner-g8"] });
-  const without = client(() => ({ status: 200, json: { keys: { measurement: "k" } } }));
+  const without = client(() => ({ status: 200, json: { keys: { measurement: "k" }, ...CAPS } }));
   assert.equal((await without.issue(material())).templates, undefined);
 });

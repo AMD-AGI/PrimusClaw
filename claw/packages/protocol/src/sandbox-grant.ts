@@ -112,6 +112,14 @@ export class GrantKeysMissingError extends Error {
   }
 }
 
+/** Issue returned keys but not the grant caps that were sent: the grant is revoked. */
+export class GrantCapsMissingError extends Error {
+  constructor(readonly grantId: string) {
+    super(`grant ${grantId} issued without its caps`);
+    this.name = "GrantCapsMissingError";
+  }
+}
+
 /** The grant service refused or failed. `code` is its reason, never a key. */
 export class GrantHttpError extends Error {
   constructor(readonly status: number, readonly code: string) {
@@ -172,6 +180,10 @@ export class SandboxGrantClient {
     if (!keys) {
       if (mode === "create") await this.revoke(material.grantId, signal).catch(() => undefined);
       throw new GrantKeysMissingError(material.grantId);
+    }
+    if (!capsStored(payload, built.body)) {
+      await this.revoke(material.grantId, signal).catch(() => undefined);
+      throw new GrantCapsMissingError(material.grantId);
     }
     const templates = grantedTemplateNamesOf(payload);
     return { keys, expiresAt: built.claims.expiresAt, ...(templates ? { templates } : {}) };
@@ -418,6 +430,13 @@ function unique(values: Array<string | null | undefined>): string[] {
 
 function truncateSeconds(d: Date): Date {
   return new Date(Math.floor(d.getTime() / 1000) * 1000);
+}
+
+/** Whether the response carries the grant caps the issue body sent. */
+function capsStored(payload: unknown, sent: Record<string, unknown>): boolean {
+  if (!payload || typeof payload !== "object") return false;
+  const got = payload as { maxSandboxes?: unknown; maxGpus?: unknown };
+  return got.maxSandboxes === sent.maxSandboxes && got.maxGpus === sent.maxGpus;
 }
 
 function keysOf(body: unknown): Record<string, string> | null {

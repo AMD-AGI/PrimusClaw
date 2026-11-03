@@ -225,7 +225,11 @@ func (s *Service) Issue(ctx context.Context, req IssueRequest) (IssueResponse, i
 		if !specMatches(existing, obj.Spec) {
 			return IssueResponse{}, 0, opErr(http.StatusConflict, "grant_conflict", "grantId already exists with a different spec")
 		}
-		return IssueResponse{GrantID: req.GrantID, Templates: expandedFrom(existing)}, http.StatusOK, nil
+		return IssueResponse{GrantID: req.GrantID, Templates: expandedFrom(existing), MaxSandboxes: existing.Spec.MaxSandboxes, MaxGPUs: existing.Spec.MaxGPUs}, http.StatusOK, nil
+	}
+	if !sameCap(obj.Spec.MaxSandboxes, req.MaxSandboxes) || !sameCap(obj.Spec.MaxGPUs, req.MaxGPUs) {
+		_ = s.client.Delete(ctx, obj)
+		return IssueResponse{}, 0, opErr(http.StatusInternalServerError, "grant_caps_unsupported", "grant caps were not stored")
 	}
 	if err := s.setStatus(ctx, req.GrantID, func(g *runtimev1alpha1.SandboxGrant) error {
 		g.Status.State = runtimev1alpha1.GrantStateActive
@@ -241,7 +245,7 @@ func (s *Service) Issue(ctx context.Context, req IssueRequest) (IssueResponse, i
 		return IssueResponse{}, 0, opWrap(http.StatusInternalServerError, "template_register_failed", "", err)
 	}
 	s.audit(ctx, audit.EventGrantCreated, req.GrantID, req.Issuer.SessionID, req.Issuer.AppRunID, req.Owner.UserID, req.Owner.UserName, "")
-	return IssueResponse{GrantID: req.GrantID, Keys: keys, Templates: expanded}, http.StatusCreated, nil
+	return IssueResponse{GrantID: req.GrantID, Keys: keys, Templates: expanded, MaxSandboxes: obj.Spec.MaxSandboxes, MaxGPUs: obj.Spec.MaxGPUs}, http.StatusCreated, nil
 }
 
 // Get returns the grant without keys or the platform key.
