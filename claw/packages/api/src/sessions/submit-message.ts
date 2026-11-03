@@ -37,10 +37,10 @@ import pino from "pino";
 import type { PoolClient } from "pg";
 import type { EnvironmentTopology } from "@claw/protocol";
 import { db, type StatementRunner } from "../infra/db.js";
-import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { RUN_DOORBELL_DISPATCH } from "../config.js";
 import { canAccessSession, isSystemAdmin, type UserInfo } from "../auth/models.js";
+import { loadUserEnvForSession } from "../github-review/session-tools.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
 import { releaseSessionGateForTurn, takeSessionGate } from "../tasks/chat-run.js";
 import { drainOldestPendingMessage } from "../events/consumer.js";
@@ -306,7 +306,8 @@ export async function submitSessionMessage(
     // the FOR UPDATE row lock; under load that exhausts the pool, leaving
     // connections stuck "idle in transaction" holding claw_sessions locks
     // and blocking ALTER TABLE / reads cluster-wide.
-    const userEnvSnapshot = await loadUserEnvSnapshot(client, userId, logger);
+    // None for a session that acts as a user: its sandbox is given none of its owner's stored variables (see `loadUserEnvForSession`).
+    const userEnvSnapshot = await loadUserEnvForSession(client, userId, sessionId, logger);
     if (status === "running" || mode === "enqueue") {
       const secrets = pendingSecretColumns({
         llmKey: resolveUserLlmKey(user) || "",

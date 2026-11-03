@@ -31,8 +31,8 @@ import { resolveUserLlmKey } from "../llm/key-source.js";
 import { RUN_DOORBELL_DISPATCH } from "../config.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
 import { applySessionGateTransition, stopSessionRuns } from "../tasks/chat-run.js";
-import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { actingTurnRefusal } from "../github-review/acting-turns.js";
+import { loadUserEnvForSession } from "../github-review/session-tools.js";
 import {
   createSessionSubscriptionReady, sanitizeSessionEvent, type SessionSubscription,
 } from "../events/store.js";
@@ -1229,7 +1229,8 @@ async function gateUserMessageTurn(
       await client.query("ROLLBACK");
       return { kind: "missing" };
     }
-    const userEnv = await loadUserEnvSnapshot(client, userId, logger);
+    // None for a session that acts as a user (see `loadUserEnvForSession`).
+    const userEnv = await loadUserEnvForSession(client, userId, sessionId, logger);
     if (locked.rows[0].agent_status === "running") {
       const secrets = pendingSecretColumns({
         llmKey: resolveUserLlmKey(user) || "",

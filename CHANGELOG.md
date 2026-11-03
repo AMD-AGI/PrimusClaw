@@ -28,6 +28,21 @@ record it.
 ## [Unreleased]
 
 ### Added
+- A service that acts for a person (a delegated identity token: RFC 8693 `act`) can now bring the person's own
+  `ak-` key in `x-api-key`, for the services an operator names in `CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS` (empty by
+  default, which changes nothing: such a token still has no keys and the header is still not read). SaFE verifies the
+  key, it must be the token's own subject's, and the request is still judged by the token. A key that is another
+  user's is a 401 `key_subject_mismatch`, one SaFE does not accept (or a value that is not a key) a 401
+  `invalid_api_key`, and SaFE not answering a 503; a request that asked for its key to be used is never served without
+  it. With GitHub review on, each such service must also be in `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS`, or the API
+  does not start. See `claw/docs/identity-client.md`.
+- The sandbox of a session that acts as a user (`config.acting_as`, GitHub review on) is created without its owner's
+  keys: Brain is told (`ExecuteRequest.withhold_sandbox_keys`, set on every turn of such a session) to leave
+  `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `SAFE_API_KEY` out of its environment, whichever layer sets them, while it
+  still uses the keys for the model and for SaFE; a sandbox the session already has that holds them is replaced rather
+  than reused, and a hosted application run is refused for such a session (409
+  `app_run_not_allowed_for_acting_session`; Brain winds up one admitted earlier). Nothing changes for any other session,
+  and no sandbox fingerprint stored before this is disturbed. See `claw/docs/github-review.md`.
 - Brain now enforces `ExecuteRequest.tools_allowlist`, which it used to ignore. A run whose request carries a
   non-empty list is offered only the tools it names, and a call outside the list is refused with an error
   instead of run: a tool the model was never offered, one a resumed transcript still names, a `task` or
@@ -462,6 +477,24 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- Reading a skill no longer starts a sandbox. With `PROGRESSIVE_SKILLS_ENABLED`, the prompt told the model to open
+  `/workspace/.skills/<name>/SKILL.md` with the `read` tool, which made Brain provision a sandbox for a file read:
+  a turn that called an MCP tool and then needed the skill waited for a pod, and on a cluster that could not
+  schedule one (all sandbox nodes unschedulable) the user watched a progress bar for minutes before Brain gave up
+  after ~15 minutes. A skill is instructions for the model, so Brain now serves it: the listed skills are loaded
+  with a new `load_skill` tool (`name`, optional `file`) from Brain's own staged copy, with no sandbox, and the
+  prompt says so instead of giving a path to read. SKILL.md comes back with the skill's other files and the sandbox
+  path its scripts run from. The sandbox is for running things: a skill's files, scripts included, are still
+  written into it the first time a sandbox tool names `.skills`, so running a script starts a sandbox as before, and
+  a model that reads a `.skills` path with `read` or `bash` still gets the file. `load_skill` is offered only when
+  the prompt lists skills, is allowed in plan mode and for the `readonly` and `explore` sub-agents, and is subject
+  to `tools_allowlist`: a run whose list does not name it (every list written before the tool existed) is not
+  offered it, and gets the skill hint from before, which reads SKILL.md with `read` from the path on each line, as
+  its skills were read until now; a list that names `load_skill` gets the sandbox-free load. It is in the default
+  `HITL_AUTO_ALLOW`, so turning approval on does not start asking about every skill the model loads. A skill longer than the loop's 6000-character tool-result cap is not cut by it, which would
+  have sent the model back to `read` or `bash` for the rest: `load_skill` returns a file in parts of up to 16000
+  characters, each saying the `offset` of the next, and has a bound of its own that leaves a part and the skill's
+  file list whole.
 - A sandbox that cannot start is now told to the user early and ended early. While a sandbox is held up, either
   queued in the platform or admitted with nothing yet willing to run its pod, the turn's progress event says so
   as soon as the platform reports it, instead of one "Waiting in queue (position 0)" and then ten minutes of nothing

@@ -8,6 +8,7 @@
  * worth nothing if the turns that run in it can be sent with the key a sandbox holds: a model in any ordinary session of the user finds the
  * acting session with `GET /v1/sessions` and writes to it with that key, and the review tools it is then offered approve and merge with the
  * user's GitHub account on their own. So the same credentials are asked of every route that puts work in front of the session's model.
+ * (The keys of the session's own sandbox are a different door and are shut differently: such a session's sandbox holds none, A2 and A7.)
  *
  *   A1  a message, queued or immediate: the key, the cookie it signs in to, a connector token, a method nobody listed and no method at all
  *       are 403, and leave nothing behind (no row, no queued message, no turn)
@@ -16,7 +17,7 @@
  *   A4  an approval or an answer to a question of the model (three routes), and Stop, which is not asked for
  *   A5  the Anthropic-compatible events route
  *   A6  a task, a batch and a retry (and a hosted application run, which is a task with a mode)
- *   A7  a session whose `acting_as` is not a well-formed id is not offered the tools and is not gated: one reading decides both
+ *   A7  a session whose `acting_as` is not a well-formed id is not offered the tools, is not gated and keeps its sandbox's keys: one reading decides all three
  *   A8  every place in the source that can start a turn is either gated or on a list with the reason it needs no gate
  */
 import assert from "node:assert/strict";
@@ -158,6 +159,8 @@ test("A2 the person's own token sends to it, queued or immediate, and an allowed
     assert.equal(own.status, 200, JSON.stringify(own.body));
     assert.equal(published.length, 1, "the turn was dispatched");
     assert.ok((published[0]?.mcp_servers as Record<string, unknown>)?.github_review, "with the review tools");
+    assert.equal(published[0]?.withhold_sandbox_keys, true, "and with the instruction that its sandbox holds none of its owner's keys, which Brain is still given");
+    assert.deepEqual([published[0]?.platform_key, published[0]?.llm_api_key], ["pk", "vk"]);
 
     await h.sql("UPDATE claw_sessions SET agent_status = 'running' WHERE session_id = $1", [id]);
     const queued = await send(ALICE, "identity_token", message);
@@ -193,6 +196,7 @@ test("A3 a session that does not act as a user takes any credential, as it alway
     const r = await send(ALICE, method, { method: "POST", url: `/v1/sessions/${id}/messages`, payload: { content: "hello" } });
     assert.equal(r.status, 200, `${method}: ${JSON.stringify(r.body)}`);
   }
+  assert.ok(published.length > 0 && published.every((task) => !("withhold_sandbox_keys" in task)), "and its sandbox is given its owner's keys, as it always was");
   // Somebody else's acting session is still not theirs: the owner check comes first, and says what it said before.
   const acting = await session();
   const bob = await send({ userId: "u-mallory", userName: "M" }, "api_key", { method: "POST", url: `/v1/sessions/${acting}/messages`, payload: { content: "hello" } });
@@ -283,8 +287,11 @@ test("A7 a session whose acting_as is not a well-formed id is neither offered th
     assert.equal(actingUserOf({ acting_as: JSON.parse(stored) }), expected, stored);
     const offered = Object.keys(await tools.githubReviewMcpServers(id)).length > 0;
     const gated = refusedAsUnattended(await send(ALICE, "api_key", { method: "POST", url: `/v1/sessions/${id}/messages`, payload: { content: "hi" } }));
+    const task: Record<string, unknown> = {};
+    await tools.applySandboxKeyPolicyToTask(task, id);
     assert.equal(offered, expected !== null, `tools offered for ${stored}`);
     assert.equal(gated, offered, `gated exactly when offered: ${stored}`);
+    assert.equal(task.withhold_sandbox_keys === true, offered, `sandbox keys withheld exactly when offered: ${stored}`);
   }
 });
 
