@@ -10,7 +10,7 @@
  * nothing that is not the user's, and opening the pull request from it is held.
  * A push to main / master is, since it lands without a review where the branch is
  * unprotected; so is one whose destination the text does not show (no refspec,
- * HEAD, --all), which is main whenever main is checked out. A GraphQL call is
+ * HEAD, --all, `:`, a `*` pattern), which can be main. A GraphQL call is
  * held only when it is a mutation, or its query is read from somewhere unseen.
  *
  * Copied verbatim from the outbound-actions pack (examples/bash-approval), which
@@ -25,7 +25,7 @@ export const DEFAULT_BASH_APPROVAL_RULES: ReadonlyArray<Record<string, unknown>>
   {
     "label": "git push to main / master, or to a branch the command does not name",
     "program": "git",
-    "args_regex": "^(?:(?:-[cC]|--(?:git-dir|work-tree|namespace|super-prefix|config-env|attr-source))\\s+\\S+\\s+|(?!(?:-[cC]|--(?:git-dir|work-tree|namespace|super-prefix|config-env|attr-source))\\s)-\\S*\\s+)*push(?:(?:\\s+(?:(?:-o|--push-option|--repo|--receive-pack|--exec)\\s+\\S+|(?!(?:-o|--push-option|--repo|--receive-pack|--exec)\\s)-\\S*|\\d*[<>]+(?![<>])(?:\\S+|\\s+\\S+|$)))*(?:\\s+(?!-|\\d*[<>])\\S+(?:\\s+(?:(?:-o|--push-option|--repo|--receive-pack|--exec)\\s+\\S+|(?!(?:-o|--push-option|--repo|--receive-pack|--exec)\\s)-\\S*|\\d*[<>]+(?![<>])(?:\\S+|\\s+\\S+|$)))*)?$|\\s(?:.*\\s)?(?:(?:\\S*:)?(?:refs/heads/)?(?:main|master)|HEAD|@|--all|--branches)(?:\\s|$))"
+    "args_regex": "^(?:(?:-[cC]|--(?:git-dir|work-tree|namespace|super-prefix|config-env|attr-source))\\s+\\S+\\s+|(?!(?:-[cC]|--(?:git-dir|work-tree|namespace|super-prefix|config-env|attr-source))\\s)-\\S*\\s+)*push(?:(?:\\s+(?:(?:-o|--push-option|--repo|--receive-pack|--exec)\\s+\\S+|(?!(?:-o|--push-option|--repo|--receive-pack|--exec)\\s)-\\S*|\\d*[<>]+(?![<>])(?:\\S+|\\s+\\S+|$)))*(?:\\s+(?!-|\\d*[<>])\\S+(?:\\s+(?:(?:-o|--push-option|--repo|--receive-pack|--exec)\\s+\\S+|(?!(?:-o|--push-option|--repo|--receive-pack|--exec)\\s)-\\S*|\\d*[<>]+(?![<>])(?:\\S+|\\s+\\S+|$)))*)?$|\\s(?:.*\\s)?(?:(?:\\S*:)?(?:refs/heads/)?(?:main|master)|HEAD|@|--all|--branches|:|[^\\s*]*\\*\\S*)(?:\\s|$))"
   },
   {
     "label": "gh pr write (creates, changes or merges a pull request)",

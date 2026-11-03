@@ -35,7 +35,7 @@ async function runBash(command: string, session: string) {
 
 const HELD = [
   "gh pr merge 12 --squash", "gh api -X DELETE repos/o/r/git/refs/heads/x", "git push --force origin main", "gh issue comment 3 --body hi",
-  "git push origin main", "git push origin HEAD:master", "git push -u origin HEAD", "git push",
+  "git push origin main", "git push origin HEAD:master", "git push -u origin HEAD", "git push", "git push origin :", "git push origin 'refs/heads/*:refs/heads/*'",
   "gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: \"x\"}) { thread { id } } }'",
   "curl -X POST https://api.github.com/repos/o/r/issues -d '{}'", "gh secret set X --body y", "gh run rerun 9",
 ];

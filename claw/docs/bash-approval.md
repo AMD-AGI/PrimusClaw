@@ -84,7 +84,7 @@ approval request.
 
 | Rule | Held | Runs without asking |
 |---|---|---|
-| `git push` | `git push` in any form, `git -C dir push`, `git --git-dir=... push`; the **force / delete** forms (`--force`, `-f`, `--force-with-lease`, `--delete`, `-d`, `--mirror`, `--prune`, `+ref`, `:ref`) and a push to **`main` / `master`** (`origin main`, `HEAD:main`, `HEAD:refs/heads/master`) or to a branch the command does not name (no refspec, `HEAD`, `--all`: whatever is checked out, which may be `main`) are labelled separately | `status`, `log`, `diff`, `fetch`, `pull`, `clone`, `checkout`, `branch`, `commit`, `stash` (also `stash push`), `remote`, `config` |
+| `git push` | `git push` in any form, `git -C dir push`, `git --git-dir=... push`; the **force / delete** forms (`--force`, `-f`, `--force-with-lease`, `--delete`, `-d`, `--mirror`, `--prune`, `+ref`, `:ref`) and a push to **`main` / `master`** (`origin main`, `HEAD:main`, `HEAD:refs/heads/master`) or to a branch the command does not name (no refspec, `HEAD`, `--all`, the matching refspec `:`, a `*` pattern: any of them can be `main`) are labelled separately | `status`, `log`, `diff`, `fetch`, `pull`, `clone`, `checkout`, `branch`, `commit`, `stash` (also `stash push`), `remote`, `config` |
 | `gh pr` | `create`, `merge`, `close`, `review`, `ready`, `edit`, `reopen`, `comment`, `update-branch` | `view`, `list`, `checks`, `diff`, `status`, `checkout` |
 | `gh issue` | `create`, `close`, `comment`, `edit`, `delete`, `reopen`, `transfer`, `lock`, `unlock`, `pin`, `unpin`, `develop` | `view`, `list`, `status` |
 | `gh release` | `create`, `edit`, `delete`, `upload`, `delete-asset` | `list`, `view`, `download` |
