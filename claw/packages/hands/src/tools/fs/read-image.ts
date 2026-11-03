@@ -46,18 +46,24 @@ function failed(text: string): ImageResult {
 export function readImage(safePath: string, shownPath: string): ImageResult | null {
   if (!IMAGE_EXTENSIONS.has(path.extname(safePath).toLowerCase())) return null;
   let bytes: Buffer;
+  let fd: number | undefined;
   try {
-    const size = fs.statSync(safePath).size;
+    // One open file for the size and the read, so the size checked is the size of what is read.
+    fd = fs.openSync(safePath, "r");
+    const size = fs.fstatSync(fd).size;
     if (size > IMAGE_MAX_BYTES) {
       return failed(
         `Error: ${shownPath} is ${size} bytes; an image is shown only up to ${IMAGE_MAX_BYTES} bytes. `
         + "Make a smaller copy (scale it down or save it as JPEG) and read that.",
       );
     }
-    bytes = fs.readFileSync(safePath);
+    bytes = fs.readFileSync(fd);
   } catch (e: any) {
     return failed(`Error reading ${shownPath}: ${e.message}`);
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
   }
+  if (bytes.length > IMAGE_MAX_BYTES) return failed(`Error: ${shownPath} grew past ${IMAGE_MAX_BYTES} bytes while it was read.`);
   const mimeType = sniff(bytes);
   if (!mimeType) return failed(`Error: ${shownPath} is not a PNG, JPEG, GIF or WebP image.`);
   return {

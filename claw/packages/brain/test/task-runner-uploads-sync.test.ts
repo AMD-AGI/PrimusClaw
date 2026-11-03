@@ -103,11 +103,7 @@ async function attachOnce(created: boolean, failSync = false) {
     async execute(_req, _onEvent, _signal, _hands, extras) {
       await extras!.attachHands!();
       calls.push("attached");
-      return {
-        finalText: "done", tokenUsage: { input_tokens: 1, output_tokens: 1, cache_read: 0, cache_create: 0 },
-        turns: 1, pendingMemories: [], pendingSkills: [], skillsUsed: {}, errorCount: 0,
-        toolStats: { total_calls: 1, error_calls: 0, by_tool: {} }, elapsedMs: 1,
-      } as unknown as ExecuteResult;
+      return result();
     },
   };
   bindTaskRunnerDeps({ kv, kvCkpt, emitter, engine, sideEffects });
