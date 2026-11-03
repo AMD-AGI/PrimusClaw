@@ -121,7 +121,7 @@ async function addReplyLanguage(task: Record<string, unknown>, sessionId: string
   if (language) task.prompt = withReplyLanguage(prompt, language);
 }
 
-function tokenTtlSeconds(): number {
+export function tokenTtlSeconds(): number {
   const budget = RUN_BUDGET_DEFAULT_SEC.chat;
   return budget > 0 ? budget + TOKEN_GRACE_SEC : TOKEN_FALLBACK_TTL_SEC;
 }

@@ -50,7 +50,9 @@ const RECALL_EVENTS = 20;
  * gate is a session from before gates carried an owner, and a gate naming a turn that has ended is one this
  * run outlived (`gateNamesEndedTurnSql`); neither is a reason to refuse.
  */
-export async function assertLiveRun(q: Querier, claims: AssistantTokenClaims): Promise<{ userId: string }> {
+export async function assertLiveRun(
+  q: Querier, claims: Pick<AssistantTokenClaims, "sid" | "mid" | "task_id">,
+): Promise<{ userId: string }> {
   const row = (await q(
     `SELECT s.user_id, s.agent_gate_message_id, t.status,
             ${gateNamesEndedTurnSql("s.session_id", "s.agent_gate_message_id")} AS gate_turn_ended

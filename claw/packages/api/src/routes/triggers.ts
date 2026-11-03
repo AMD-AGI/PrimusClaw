@@ -9,18 +9,16 @@
  * credentials on the row, since the run that fires later has no request to take
  * them from.
  */
-import crypto from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { assertSessionCredentialsForDispatch } from "../auth/session-credentials.js";
 import { getUser } from "../auth/middleware.js";
-import { TRIGGER_MAX_PER_USER, TRIGGER_MIN_INTERVAL_MINUTES } from "../config.js";
-import { encryptUserEnvValue } from "../crypto/user-env.js";
+import { TRIGGER_MIN_INTERVAL_MINUTES } from "../config.js";
 import { db } from "../infra/db.js";
 import { checkSchedule, nextFireAfter } from "../triggers/schedule.js";
-
-const PUBLIC_COLUMNS =
-  "trigger_id, name, kind, prompt, schedule, timezone, enabled, paused_reason, next_fire_at, last_fire_at, consecutive_failures, created_at, updated_at";
-const MAX_PROMPT = 8000;
+import {
+  deleteTrigger, insertTrigger, listTriggers, parseTriggerInput, sealTriggerCredentials,
+  TRIGGER_MAX_NAME, TRIGGER_MAX_PROMPT as MAX_PROMPT, TRIGGER_PUBLIC_COLUMNS as PUBLIC_COLUMNS,
+} from "../triggers/store.js";
 
 function owner(req: FastifyRequest, reply: FastifyReply) {
   const user = getUser(req);
@@ -32,49 +30,31 @@ function owner(req: FastifyRequest, reply: FastifyReply) {
 }
 
 function sealCredentials(user: NonNullable<ReturnType<typeof getUser>>): string {
-  return encryptUserEnvValue(JSON.stringify({
+  return sealTriggerCredentials({
     platformKey: user.platformKey || "", virtualKey: user.virtualKey || "", userName: user.userName || "",
-  }));
+  });
 }
 
 export async function registerTriggerRoutes(app: FastifyInstance): Promise<void> {
   app.post("/v1/triggers", async (req, reply) => {
     const user = owner(req, reply);
     if (!user) return;
-    const b = (req.body ?? {}) as Record<string, unknown>;
-    const name = typeof b.name === "string" ? b.name.trim() : "";
-    const prompt = typeof b.prompt === "string" ? b.prompt.trim() : "";
-    const schedule = typeof b.schedule === "string" ? b.schedule.trim() : "";
-    const timezone = typeof b.timezone === "string" ? b.timezone : "";
-    if (!name || name.length > 120) return reply.status(400).send({ ok: false, error: "name required (max 120 characters)" });
-    if (!prompt || prompt.length > MAX_PROMPT) return reply.status(400).send({ ok: false, error: "prompt required" });
-    const check = checkSchedule(schedule, timezone, TRIGGER_MIN_INTERVAL_MINUTES);
-    if (!check.ok) return reply.status(400).send({ ok: false, error: check.error });
+    const parsed = parseTriggerInput((req.body ?? {}) as Record<string, unknown>);
+    if (!parsed.ok) return reply.status(400).send({ ok: false, error: parsed.error });
     try {
       assertSessionCredentialsForDispatch("trigger", user);
     } catch {
       return reply.status(400).send({ ok: false, error: "no platform key on this request; a trigger needs its owner's key" });
     }
-    const triggerId = crypto.randomUUID();
-    // One statement: the cap is counted in the same INSERT so two creates cannot both pass it.
-    const r = await db.query(
-      `INSERT INTO claw_triggers (trigger_id, owner_user_id, name, prompt, schedule, timezone, next_fire_at, credential_enc)
-       SELECT $1, $2, $3, $4, $5, $6, $7, $8
-        WHERE (SELECT COUNT(*) FROM claw_triggers WHERE owner_user_id = $2) < $9
-       RETURNING ${PUBLIC_COLUMNS}`,
-      [triggerId, user.userId, name, prompt, schedule, timezone,
-        nextFireAfter(schedule, timezone, new Date()), sealCredentials(user), TRIGGER_MAX_PER_USER],
-    );
-    if (!r.rows.length) return reply.status(409).send({ ok: false, error: "trigger_limit_reached" });
-    return { ok: true, data: r.rows[0] };
+    const row = await insertTrigger(user.userId, parsed.input, sealCredentials(user));
+    if (!row) return reply.status(409).send({ ok: false, error: "trigger_limit_reached" });
+    return { ok: true, data: row };
   });
 
   app.get("/v1/triggers", async (req, reply) => {
     const user = owner(req, reply);
     if (!user) return;
-    const r = await db.query(
-      `SELECT ${PUBLIC_COLUMNS} FROM claw_triggers WHERE owner_user_id = $1 ORDER BY created_at`, [user.userId]);
-    return { ok: true, data: r.rows };
+    return { ok: true, data: await listTriggers(user.userId) };
   });
 
   app.get("/v1/triggers/:id", async (req, reply) => {
@@ -100,7 +80,7 @@ export async function registerTriggerRoutes(app: FastifyInstance): Promise<void>
     const prompt = typeof b.prompt === "string" ? b.prompt.trim() : cur.prompt;
     const schedule = typeof b.schedule === "string" ? b.schedule.trim() : cur.schedule;
     const timezone = typeof b.timezone === "string" ? b.timezone : cur.timezone;
-    if (!name || name.length > 120 || !prompt || prompt.length > MAX_PROMPT) {
+    if (!name || name.length > TRIGGER_MAX_NAME || !prompt || prompt.length > MAX_PROMPT) {
       return reply.status(400).send({ ok: false, error: "invalid name or prompt" });
     }
     const check = checkSchedule(schedule, timezone, TRIGGER_MIN_INTERVAL_MINUTES);
@@ -154,10 +134,7 @@ export async function registerTriggerRoutes(app: FastifyInstance): Promise<void>
   app.delete("/v1/triggers/:id", async (req, reply) => {
     const user = owner(req, reply);
     if (!user) return;
-    const r = await db.query(
-      "DELETE FROM claw_triggers WHERE trigger_id = $1 AND owner_user_id = $2 RETURNING trigger_id",
-      [(req.params as any).id, user.userId]);
-    if (!r.rows.length) return reply.status(404).send({ ok: false, error: "not_found" });
+    if (!await deleteTrigger(user.userId, (req.params as any).id)) return reply.status(404).send({ ok: false, error: "not_found" });
     return { ok: true };
   });
 }
