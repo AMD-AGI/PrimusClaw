@@ -81,12 +81,9 @@ const EXAMPLE = {
   },
 } satisfies AppManifestV1;
 
-const LAYER_IMAGE = "registry.example.invalid/host-layer@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
 /** Every field the type has, set, on a document that is also a valid one. */
 const FULL = {
   ...EXAMPLE,
-  container: { ...EXAMPLE.container, layers: [{ image: LAYER_IMAGE, from: "/layer", mount: "/opt/app-host", readOnly: true }] },
   env_map: { ...EXAMPLE.env_map, mcp_public_url: "APP_MCP_PUBLIC_URL" },
   mcp: { ...EXAMPLE.mcp, public: true },
 } satisfies AppManifestV1;
@@ -148,7 +145,7 @@ function checkKeys(schema: Node, docs: unknown[], at: string, seen: { objects: n
 test("JSON schema keys equal the type's keys at every object", () => {
   const seen = { objects: 0 };
   checkKeys(S as Node, [FULL], "", seen);
-  assert.equal(seen.objects, 12, "the walk must reach every fixed-key object in the schema");
+  assert.equal(seen.objects, 11, "the walk must reach every fixed-key object in the schema");
 });
 
 test("the schema's closed sets equal the exported constants", () => {
@@ -176,21 +173,6 @@ test("the smallest manifest validates", () => {
 
 test("the documented defaults are in the schema", () => {
   assert.equal(S.properties.stop_grace_sec.default, 900);
-});
-
-test("container.layers is checked for shape and count", () => {
-  const layer = (over: Record<string, unknown>) => ({ image: LAYER_IMAGE, from: "/layer", mount: "/opt/a", ...over });
-  const withLayers = (layers: unknown) => mutate((m) => { m.container.layers = layers; });
-  assert.deepEqual(paths(withLayers([layer({}), layer({ mount: "/opt/b", readOnly: false })])), []);
-  refused(withLayers([layer({ image: "registry.example.invalid/host-layer:v1" })]), "container.layers[0].image", "must match");
-  refused(withLayers([layer({ from: "layer" })]), "container.layers[0].from", "must match");
-  refused(withLayers([layer({ mount: "/opt/a;rm" })]), "container.layers[0].mount", "must match");
-  refused(withLayers([layer({ readOnly: "yes" })]), "container.layers[0].readOnly", "must be a boolean");
-  refused(withLayers([layer({ env: {} })]), "container.layers[0].env", "unknown field");
-  refused(withLayers([{ image: LAYER_IMAGE, from: "/layer" }]), "container.layers[0].mount", "required");
-  refused(withLayers([]), "container.layers", "at least 1");
-  const five = ["/opt/a", "/opt/b", "/opt/c", "/opt/d", "/opt/e"].map((mount) => layer({ mount }));
-  refused(withLayers(five), "container.layers", "at most 4");
 });
 
 test("the container image is only a default and may be absent", () => {
