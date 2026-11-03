@@ -206,7 +206,7 @@ const THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!){reposito
 
 /** What a page served from a session's read asks of GitHub: the repository as it is now (the gates of `readRepo`) and the head. */
 const PAGE_GATE_QUERY = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){
-  owner{login} isPrivate visibility isArchived isDisabled pullRequest(number:$number){headRefOid}}}`;
+  owner{login} isPrivate visibility isArchived isDisabled pullRequest(number:$number){headRefOid baseRefName}}}`;
 
 /**
  * Puts the pull request in the base branch's merge queue as the acting user. expectedHeadOid is the head commit the review read: GitHub refuses
@@ -781,10 +781,10 @@ export class GithubReview {
     if (repo.closed) throw new Refusal("repository_archived", "the repository is archived or disabled");
   }
 
-  /** For a page served from this session's read: the repository gates and the head, as they are now, in one request. */
+  /** For a page served from this session's read: the repository gates, the head and the base branch, as they are now, in one request. */
   private async requirePageStillValid(ctx: Ctx, ref: PrRef, known: PrInfo): Promise<void> {
     const g = await ctx.client.graphql<{ repository?: {
-      owner?: { login?: string }; isPrivate?: boolean; visibility?: string; isArchived?: boolean; isDisabled?: boolean; pullRequest?: { headRefOid?: string } | null;
+      owner?: { login?: string }; isPrivate?: boolean; visibility?: string; isArchived?: boolean; isDisabled?: boolean; pullRequest?: { headRefOid?: string; baseRefName?: string } | null;
     } | null }>(PAGE_GATE_QUERY, { owner: ref.owner, name: ref.repo, number: ref.number });
     const r = g.repository;
     if (!r?.pullRequest) throw new Refusal("unreadable_pull_request", "GitHub did not return the pull request");
@@ -794,6 +794,11 @@ export class GithubReview {
       closed: r.isArchived === true || r.isDisabled === true,
     });
     this.requireHead({ ...known, headSha: String(r.pullRequest.headRefOid ?? "").toLowerCase() }, known.headSha);
+    // The same head against another base branch is another diff: the pages read so far are of a change that is no longer the one asked.
+    const base = String(r.pullRequest.baseRefName ?? "");
+    if (base !== known.baseRef) {
+      throw new Refusal("base_changed", "the pull request now targets another base branch, so its diff is another one; read it again with gh_pr_get without head_sha", { current_base: base });
+    }
   }
 
   private async readRepo(ctx: Ctx, ref: PrRef): Promise<RepoInfo> {

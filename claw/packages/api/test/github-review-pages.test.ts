@@ -17,6 +17,7 @@
  *   G9  the acting user's token is masked in a section before it is cut into pages, so no two pages put it back together
  *   G10 an offset past the end of a section, or outside the named file, is refused: never an empty page that reads as the end
  *   G11 a file that is not in the change is refused, not answered with an empty diff
+ *   G13 a pull request retargeted to another base branch, same head, refuses the page: the diff read is no longer the change
  *   G12 `file` with the offset the files index gives reads that file's part whole, in the whole diff's offsets
  */
 import assert from "node:assert/strict";
@@ -318,4 +319,21 @@ test("G12 `file` with the offset the files index gives reads that file's part wh
     assert.equal(text.length, Number(m[2]));
     assert.ok(pages > 1, `pages ${pages}`);
   }
+});
+
+test("G13 a pull request retargeted to another base branch with the same head refuses the page, and the next overview reads the new diff", async () => {
+  useChange(bigChange(6, 25));
+  await e.service.getPr(e.actor, { pr: PR });
+  e.gh.pr.base = { ...e.gh.pr.base, ref: "release-1" };
+  e.gh.files = bigChange(2, 3);
+  e.gh.pr.changed_files = 2;
+  const page = await e.service.getPr(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0 });
+  assert.equal(page.isError, true);
+  assert.equal(page.body.reason, "base_changed");
+  assert.equal(page.body.current_base, "release-1");
+  assert.equal(page.body.untrusted, undefined);
+  const again = (await e.service.getPr(e.actor, { pr: PR })).body as any;
+  assert.equal(again.pull_request.base, "release-1");
+  const fresh = await e.service.getPr(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0 });
+  assert.equal((fresh.body as any).untrusted.text, diffText(asRead(e.gh.files)));
 });

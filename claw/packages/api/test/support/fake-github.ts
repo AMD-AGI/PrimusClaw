@@ -118,7 +118,7 @@ export class FakeGithub {
         owner: r.owner, isPrivate: r.private, visibility: typeof r.visibility === "string" ? r.visibility.toUpperCase() : undefined,
         isArchived: r.archived, isDisabled: r.disabled,
       };
-      const pull = /isArchived/.test(String(call.body?.query ?? "")) ? { headRefOid: this.pr.head?.sha } : { ...this.graphql, ...(this.graphqlQueue.shift() ?? {}) };
+      const pull = /isArchived/.test(String(call.body?.query ?? "")) ? { headRefOid: this.pr.head?.sha, baseRefName: this.pr.base?.ref } : { ...this.graphql, ...(this.graphqlQueue.shift() ?? {}) };
       return json(200, { data: { repository: { ...repository, pullRequest: pull } } });
     }
     if (/^\/repos\/[^/]+\/[^/]+$/.test(p)) return json(200, this.repo);
