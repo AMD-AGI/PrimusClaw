@@ -13,6 +13,7 @@
  *
  *   E1  a message to an idle session (the turn is published with its task)
  *   E2  a message to a running session (the queued message is frozen with no vault), and the drain of it
+ *   E2b a message the server queues on a session by itself (the assistant's worker and router turns)
  *   E3  a queued message that was frozen with the vault before the session was marked: drained without it
  *   E4  the first message of a new session
  *   E5  the Anthropic-compatible events route
@@ -223,6 +224,26 @@ test("E2 a message to a running session is frozen on the queue without the vault
   }
 });
 
+test("E2b a message the server queues on a session by itself is frozen without the vault when the session acts as a user", async () => {
+  const { queueServerMessage } = await import("../src/assistant/messages.js");
+  for (const [what, actingAs, marked] of KINDS) {
+    await h.reset();
+    await plantVault();
+    const id = await session(actingAs);
+    await h.sql("UPDATE claw_sessions SET config = config || $2::jsonb WHERE session_id = $1", [id, JSON.stringify({ platform_key: "pk", llm_api_key: "vk", _server_managed_credentials: true })]);
+    const queued = await queueServerMessage(db, { sessionId: id, userId: ALICE.userId, content: "a worker's first task" });
+    assert.equal(queued.ok, true, `${what}: ${JSON.stringify(queued)}`);
+    const rows = await h.sql("SELECT * FROM claw_pending_messages WHERE session_id = $1", [id]);
+    assert.equal(rows.length, 1, `${what}: queued`);
+    if (marked) {
+      assert.equal(holdsVault(rows[0]), false, `${what}: nothing of the vault is on the queued row`);
+      assert.equal(vaultReads(), 0, `${what}: the vault is not read at all`);
+    } else {
+      assert.deepEqual(rows[0]!.user_env, VAULT, `${what}: control, the row is frozen with the vault as it always was`);
+    }
+  }
+});
+
 test("E3 a message that was queued with the vault, before its session was marked, is drained without it", async () => {
   const { drainOldestPendingMessage } = await import("../src/events/consumer.js");
   for (const [what, actingAs, marked] of KINDS) {
@@ -399,6 +420,7 @@ test("E9 every place in the source that reads the vault or puts it on a request 
   const TOUCHES = [/\bloadUserEnvSnapshot\b/, /\bloadUserEnvForSession\b/, /\buser_env\b(?!\.(?:decrypt|encrypt|snapshot|audit))/];
   const DECIDES: Record<string, string> = {
     "github-review/session-tools.ts": "the one reader of a session's vault: loadUserEnvForSession reads none for a session that withholds its keys, and applySandboxKeyPolicyToTask takes it off a task",
+    "assistant/messages.ts": "a message the server queues on a session by itself: reads it through loadUserEnvForSession on the statements of the state change it belongs to (E2b)",
     "sessions/submit-message.ts": "a message: reads it through loadUserEnvForSession on the transaction that holds the session's row (E1, E2)",
     "routes/anthropic-managed-agents.ts": "an event: reads it through loadUserEnvForSession on the transaction that holds the session's row (E5)",
     "routes/sessions.ts": "the first message of a new session decides from the config it is about to be written with (E4); the start of the sandbox reads it through loadUserEnvForSession (E6)",

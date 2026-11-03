@@ -250,7 +250,8 @@ an ordinary one.
 personal tokens are kept (GitHub, Hugging Face, W&B and the like), under names no key filter would know, and an ordinary
 session's sandbox is composed with all of it. The model of a session with `config.acting_as` can print those as it can
 print the keys, so such a session is sent none of them, on every path that carries the vault: the API does not read it
-for a message, for a message queued behind a running turn, for the first message of a new session, for the start of the
+for a message, for a message queued behind a running turn (also one the server queues on a session by itself), for the
+first message of a new session, for the start of the
 session's sandbox, for an event of the Anthropic-compatible route, or for a workbench run into the session; it reads none
 when Brain claims a queued turn, and takes whatever a queued message was frozen with before the mark applied off the turn
 it sends on; and the scheduler's dispatch of a task of a DAG leaves out what the task's input holds, from the request and from the
