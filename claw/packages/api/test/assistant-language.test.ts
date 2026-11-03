@@ -71,6 +71,7 @@ test("L1c a quotation is not the user's sentence, and a message that opens in Ch
     ["翻译成中文：‘I don’t think the build is fixed, and it isn’t what we want’", "Chinese"],
     ["Hmm 翻译成中文: 'I don't think the build is fixed, and it isn't what we want'", "Chinese"],
     ["Hmm 翻译成中文: \"Please fix the build and then deploy it\"", "Chinese"],
+    ["Hmm 翻译成中文: ‘Please fix the build and then deploy it’", "Chinese"],
     // Whatever the quotation marks, when the Chinese around them has no grammar word of its own to open the message with.
     ["翻译成中文：\"Please fix the build and then deploy it\"", "Chinese"],
     ["翻译成中文：“Please fix the build and then deploy it”", "Chinese"],
