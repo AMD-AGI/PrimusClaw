@@ -28,7 +28,7 @@ export const READ_TOOLS = [
 /** What one answer may hold; the rest is cut with a line that says so. */
 export const MAX_ANSWER_CHARS = 60_000;
 const MAX_PATCH_CHARS = 4_000;
-const MAX_LOG_BYTES = 8 * 1024 * 1024;
+export const MAX_LOG_BYTES = 8 * 1024 * 1024;
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
@@ -111,6 +111,22 @@ export interface GithubToolDeps {
   fetchImpl?: typeof fetch;
 }
 
+/** The last `max` bytes of a body, read as it arrives: a long log is never held whole in this shared process. */
+async function tailBytes(body: ReadableStream<Uint8Array> | null, max: number): Promise<Buffer> {
+  const kept: Uint8Array[] = [];
+  let size = 0;
+  if (body) {
+    const reader = body.getReader();
+    for (let r = await reader.read(); !r.done; r = await reader.read()) {
+      kept.push(r.value);
+      size += r.value.length;
+      while (size - kept[0].length >= max) size -= kept.shift()!.length;
+    }
+  }
+  const all = Buffer.concat(kept, size);
+  return all.subarray(Math.max(0, all.length - max));
+}
+
 export function buildGithubToolServer({ gh, fetchImpl = fetch }: GithubToolDeps): McpServer {
   const mcp = new McpServer({ name: "github", version: "1.0.0" });
 
@@ -187,8 +203,7 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch }: GithubToolDeps)
       // A signed, short-lived address: no credential is sent with it.
       const log = await fetchImpl(location, { redirect: "follow", signal: AbortSignal.timeout(30_000) });
       if (!log.ok) throw new BadInput(`the log download answered ${log.status}`);
-      const buf = Buffer.from(await log.arrayBuffer());
-      text = buf.subarray(Math.max(0, buf.length - MAX_LOG_BYTES)).toString("utf8");
+      text = (await tailBytes(log.body, MAX_LOG_BYTES)).toString("utf8");
     }
     const lines = text.split("\n");
     const n = a.tail_lines ?? 200;

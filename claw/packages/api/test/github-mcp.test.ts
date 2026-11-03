@@ -23,7 +23,7 @@ process.env.USER_ENV_ENCRYPTION_KEY = randomBytes(32).toString("base64");
 
 const { encryptUserEnvValue, initUserEnvCrypto } = await import("../src/crypto/user-env.js");
 const { githubMcpServers, registerGithubMcpRoutes } = await import("../src/github-mcp/mcp.js");
-const { READ_TOOLS } = await import("../src/github-mcp/tools.js");
+const { READ_TOOLS, MAX_LOG_BYTES } = await import("../src/github-mcp/tools.js");
 const { mintSessionToolToken, verifySessionToolToken } = await import("../src/github-review/token.js");
 const { approvalPolicyFromMcp } = await import("../../brain/src/agent/approval-policy.js");
 initUserEnvCrypto();
@@ -180,6 +180,37 @@ describe("B what a call does", () => {
       [`${API}/repos/o/r/actions/jobs/9/logs`, `Bearer ${GH_TOKEN}`],
       ["https://logs.blob.test/job/9?sig=x", ""],
     ]);
+  });
+
+  test("B4b a log longer than the kept tail is read as a stream, never whole, and its end comes back intact", async () => {
+    const line = (i: number) => `line ${String(i).padStart(9, "0")} ${"x".repeat(48)}\n`;
+    const perChunk = 1024;
+    const chunks = Math.ceil((3 * MAX_LOG_BYTES) / (perChunk * line(0).length));
+    let pulled = 0;
+    let buffered = "";
+    const body = () => new ReadableStream<Uint8Array>({
+      pull(c) {
+        if (pulled === chunks) { c.close(); return; }
+        const first = pulled++ * perChunk;
+        c.enqueue(Buffer.from(Array.from({ length: perChunk }, (_, i) => line(first + i)).join("")));
+      },
+    });
+    respond = (url) => {
+      if (url.hostname === "github.api.test") return new Response(null, { status: 302, headers: { location: "https://logs.blob.test/job/9?sig=x" } });
+      const res = new Response(body(), { status: 200 });
+      for (const whole of ["arrayBuffer", "text", "blob", "bytes", "json", "formData"]) {
+        Object.defineProperty(res, whole, { value: () => { buffered = whole; throw new Error(`the whole log was buffered (${whole})`); } });
+      }
+      return res;
+    };
+    const r = await call(await connect(token()), "job_logs", { repo: "o/r", job_id: 9, tail_lines: 3 });
+    assert.equal(buffered, "", "the log body was read whole");
+    assert.equal(r.isError, false, r.text);
+    const last = chunks * perChunk - 1;
+    const keptLines = Math.floor(MAX_LOG_BYTES / line(0).length);
+    assert.equal(pulled, chunks, "the whole log was read");
+    // The kept tail starts on a line boundary and ends with a newline, so the last of the 3 lines is the empty one after it.
+    assert.equal(r.text, `[${keptLines - 2} earlier lines not shown]\n${line(last - 1)}${line(last)}`);
   });
 
   test("B5 a write sends exactly what was asked", async () => {
