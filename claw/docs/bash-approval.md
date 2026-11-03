@@ -116,7 +116,8 @@ Things this pack does not do, beyond the limits above:
   an ordinary `gh api` call (held when it has fields).
 - A push to `main` is recognised by its destination as written. The built-in rules let a push that names a
   feature branch run (`git push origin feat/x`, `git push -u origin HEAD:feat/x`) and hold one that does not
-  name its destination (`git push`, `git push -u origin HEAD`).
+  name its destination (`git push`, `git push -u origin HEAD`). Git configuration that changes where a push
+  goes (`remote.<name>.push`, `push.default=matching`) is not visible in the command text.
 - An `http` rule's `url_prefix` is compared after the scheme and any `user:token@` before the host are
   dropped, so `https://x-access-token:...@api.github.com/...` is a call to `api.github.com`.
 - It does not cover `git` aliases, other HTTP clients (add an `http` rule), a GitHub Enterprise API host
