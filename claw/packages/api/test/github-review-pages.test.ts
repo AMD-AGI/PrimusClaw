@@ -196,7 +196,8 @@ test("G7 a page fits whatever the text costs to escape, ends at a line end when 
     "\u0001\"\\\n".repeat(5000),
     `${"x".repeat(20_000)}\nshort\n`,
     "a line\n".repeat(3000),
-    "😀".repeat(9000),
+    `x${"😀".repeat(9000)}`,
+    "ab😀c".repeat(4000),
   ]) {
     let got = "";
     for (let offset: number | null = 0; offset !== null;) {
