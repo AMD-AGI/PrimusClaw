@@ -369,6 +369,36 @@ test("message-scoped idle reclaim deletes nothing it cannot place in this sessio
   assert.equal(calls.filter((c) => c.method === "DELETE").length, 0);
 });
 
+test("idle reclaim deletes an SGLangRouter cluster and spares the sandbox", async (t) => {
+  const calls = stubSafeApi(t, {
+    list: [
+      workload("msg-sglang", "running", "SGLangRouter"),
+      workload("sandbox-1", "running", "Sandbox"),
+    ],
+    deleteStatus: 204,
+  });
+
+  assert.equal(await reclaimIdleSessionClusters(SESSION, KEY), 1);
+  const deletes = calls.filter((c) => c.method === "DELETE");
+  assert.equal(deletes.length, 1);
+  assert.match(deletes[0]!.url, /\/workloads\/msg-sglang$/);
+});
+
+test("idle reclaim deletes an Atom cluster and spares the sandbox", async (t) => {
+  const calls = stubSafeApi(t, {
+    list: [
+      workload("msg-atom", "running", "Atom"),
+      workload("sandbox-1", "running", "Sandbox"),
+    ],
+    deleteStatus: 204,
+  });
+
+  assert.equal(await reclaimIdleSessionClusters(SESSION, KEY), 1);
+  const deletes = calls.filter((c) => c.method === "DELETE");
+  assert.equal(deletes.length, 1);
+  assert.match(deletes[0]!.url, /\/workloads\/msg-atom$/);
+});
+
 test("message-scoped idle reclaim spares a workload of this session that is not a cluster", async (t) => {
   // Same sparing the unscoped branch does: the sandbox's own workload is in
   // the session's listing, and reclaiming GPUs must not stop the sandbox.

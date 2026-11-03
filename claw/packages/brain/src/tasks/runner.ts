@@ -63,7 +63,7 @@ import type { ContainerProbeVerdict, HandsProbeEntry } from "../sandbox/containe
 import { checkHandsHealth } from "../sandbox/hands-health.js";
 import { restartHandsInSandbox } from "../sandbox/hands-restart.js";
 import { resolveSandboxAction } from "../sandbox/params.js";
-import { provisionTerminalOf } from "../sandbox/errors.js";
+import { provisionTerminalOf, sandboxFailureOf } from "../sandbox/errors.js";
 import { runScript, type ScriptProgress } from "./script-runner.js";
 import { createAppRunner } from "../apps/app-runner-wiring.js";
 import { AppRunFailedError, type AppRunOutcome } from "../apps/app-runner.js";
@@ -3852,7 +3852,9 @@ class TaskRunner {
     const rawMsg = String(err?.message || err);
     // A SandboxProvisionTerminalError carries an authoritative machine reason
     // (e.g. sandbox_workload_terminal); else fall back to the message-regex classifier.
-    const sandboxReason = provisionTerminalOf(err)?.reason ?? classifySandboxFailure(rawMsg);
+    const sandboxReason = sandboxFailureOf(err)?.code
+      ?? provisionTerminalOf(err)?.reason
+      ?? classifySandboxFailure(rawMsg);
     if (sandboxReason) {
       await this.onEvent({
         type: "sandboxStatus",
