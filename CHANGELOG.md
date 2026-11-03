@@ -529,7 +529,8 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
-- A session's queue is drained by one drain at a time. Two drains running together -- a turn's completion and the
+- A session's queue is drained by one drain at a time (a lease on the session row, the new column
+  `claw_sessions.pending_drain_until`, added on start). Two drains running together -- a turn's completion and the
   sweeper's, or two workers' reports waking an idle assistant a moment apart -- each started a turn: the second
   started the next queued message on top of the first, whose `say` was then refused as `turn_superseded`, or the same
   message again, which failed on a duplicate run id (`sweeper.orphaned_pending_drain_failed`). A message the owner
