@@ -8,7 +8,8 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { assessRisk, diffNotSent, globToRegExp, parseClawyConfig, RISK_RULE_PACK_VERSION, type RiskFile, type RiskInput } from "../src/github-review/risk.js";
+import { LEGACY_REPO_CONFIG_STEM } from "../src/github-review/legacy-names.js";
+import { assessRisk, diffNotSent, globToRegExp, parseRepoConfig, REPO_CONFIG_PATH, RISK_RULE_PACK_VERSION, type RiskFile, type RiskInput } from "../src/github-review/risk.js";
 
 const file = (path: string, patch = "@@ -1,1 +1,2 @@\n a\n+b", over: Partial<RiskFile> = {}): RiskFile => ({ path, status: "modified", additions: 1, deletions: 0, patch, ...over });
 const input = (files: RiskFile[], over: Partial<RiskInput> = {}): RiskInput => ({
@@ -31,7 +32,9 @@ const HIGH: Array<[string, RiskInput, RegExp]> = [
   ["the repository's own agent instructions", input([file("AGENTS.md")]), /governance/],
   ["a nested AGENTS.md", input([file("tools/x/AGENTS.md")]), /governance/],
   ["a skill under .claude", input([file(".claude/skills/review-pr/SKILL.md")]), /governance/],
-  ["the repository's clawy config", input([file(".github/clawy.yml")]), /governance/],
+  ["the repository's review config", input([file(REPO_CONFIG_PATH)]), /governance/],
+  ["the repository's review config, spelled .yaml", input([file(REPO_CONFIG_PATH.replace(/yml$/, "yaml"))]), /governance/],
+  ["the repository's config under the name an earlier release read", input([file(`.github/${LEGACY_REPO_CONFIG_STEM}.yml`)]), /governance/],
   ["the licence", input([file("LICENSE")]), /governance/],
   ["SECURITY.md", input([file("SECURITY.md")]), /governance/],
   ["auth code", input([file("src/auth/login.ts")]), /authentication/],
@@ -89,7 +92,7 @@ const HIGH: Array<[string, RiskInput, RegExp]> = [
   ["a base that is not the default branch", input([file("src/a.ts")], { baseRef: "releases" }), /base branch is releases/],
   ["a file list that was cut", input([file("src/a.ts")], { filesComplete: false, changedFiles: 600 }), /incomplete/],
   ["more files than GitHub lists", input([file("src/a.ts")], { changedFiles: 3500, filesComplete: false }), /3000/],
-  ["a repository config that does not parse", input([file("src/a.ts")], { repoConfig: "invalid" }), /clawy\.yml could not be read/],
+  ["a repository config that does not parse", input([file("src/a.ts")], { repoConfig: "invalid" }), /claw-review\.yml could not be read/],
   ["a repository that asks for confirmation every time", input([file("src/a.ts")], { repoConfig: { confirmMerge: "always", highRiskPaths: [] } }), /every merge/],
   ["a path the repository marks", input([file("docs/legal/terms.md")], { repoConfig: { confirmMerge: "risk", highRiskPaths: ["docs/legal/**"] } }), /marks high risk/],
   ["a security finding the reviewer reports", input([file("src/a.ts")], { flags: ["security_finding"] }), /security issue/],
@@ -139,11 +142,15 @@ test("the list of reasons is bounded and says how many more there were", () => {
   assert.match(r.reasons.at(-1) ?? "", /and \d+ more/);
 });
 
-test("clawy.yml: the two keys are read, a comment and a blank line are fine, and anything else is invalid", () => {
-  assert.deepEqual(parseClawyConfig("# note\nconfirm_merge: always\n\nhigh_risk_paths:\n  - \"docs/legal/**\"\n  - 'infra/*.yaml'\n"), { confirmMerge: "always", highRiskPaths: ["docs/legal/**", "infra/*.yaml"] });
-  assert.deepEqual(parseClawyConfig(""), { confirmMerge: "risk", highRiskPaths: [] });
+test("the stem of the config file an earlier release read is plain letters, because it is put into a pattern", () => {
+  assert.match(LEGACY_REPO_CONFIG_STEM, /^[a-z]+$/);
+});
+
+test("the repository config: the two keys are read, a comment and a blank line are fine, and anything else is invalid", () => {
+  assert.deepEqual(parseRepoConfig("# note\nconfirm_merge: always\n\nhigh_risk_paths:\n  - \"docs/legal/**\"\n  - 'infra/*.yaml'\n"), { confirmMerge: "always", highRiskPaths: ["docs/legal/**", "infra/*.yaml"] });
+  assert.deepEqual(parseRepoConfig(""), { confirmMerge: "risk", highRiskPaths: [] });
   for (const bad of ["confirm_merge: sometimes", "surprise: 1", "high_risk_paths: docs", "  - orphan", "confirm_merge: always\nbroken line"]) {
-    assert.equal(parseClawyConfig(bad), "invalid", bad);
+    assert.equal(parseRepoConfig(bad), "invalid", bad);
   }
 });
 

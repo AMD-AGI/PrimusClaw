@@ -8,7 +8,7 @@
  */
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import test from "node:test";
 import { FIXED_REVIEW_RULES, PR_REVIEW_SKILL } from "../src/github-review/default-skill.js";
 
@@ -79,15 +79,37 @@ test("the fixed rules are the skill's rules without its steps, and they say what
   assert.doesNotMatch(FIXED_REVIEW_RULES, /## Steps/);
 });
 
+/**
+ * Where the product name of the chat integration may still appear: the names an earlier release wrote and this one only reads
+ * (legacy-names.ts), and the one line of the documentation that says so. Anywhere else it is a layering break: the platform does not name the
+ * clients that call it.
+ */
+const LEGACY_NAME_LINES: Array<{ file: string; line: RegExp }> = [
+  { file: "packages/api/src/github-review/legacy-names.ts", line: /^export const LEGACY_[A-Z_]+ = "[^"]+";$/ },
+  { file: "docs/github-review.md", line: /^- Earlier release names, still read and never written: / },
+];
+
 test("nothing this feature adds names an internal product, repository or host", () => {
   // Built from pieces so that this file does not contain what it looks for; compared as plain lower-case text, not as patterns.
+  const product = ["cla", "wy"].join("");
   const forbidden = [
-    ["te", "ams"], ["amd-brain", "-internal"], ["primus-safe", ".amd.com"], ["cru", "soe"], ["dis", "patron"], ["wst", "unnel"],
+    ["te", "ams"], ["amd-brain", "-internal"], ["primus-safe", ".amd.com"], ["cru", "soe"], ["dis", "patron"], ["wst", "unnel"], [product],
   ].map((parts) => parts.join(""));
+  const used = new Set<RegExp>();
   for (const f of OWN_FILES) {
-    const text = readFileSync(f, "utf8").toLowerCase();
-    for (const word of forbidden) assert.equal(text.includes(word), false, `${f} mentions ${word}`);
+    const exempt = LEGACY_NAME_LINES.filter((x) => x.file === relative(root, f));
+    readFileSync(f, "utf8").split("\n").forEach((line, i) => {
+      const lower = line.toLowerCase();
+      for (const word of forbidden) {
+        if (!lower.includes(word)) continue;
+        const hit = word === product ? exempt.find((x) => x.line.test(line)) : undefined;
+        if (hit) used.add(hit.line);
+        assert.ok(hit, `${f}:${i + 1} mentions ${word}`);
+      }
+    });
   }
+  // An exemption nothing uses is a hole kept open for nothing.
+  for (const x of LEGACY_NAME_LINES) assert.ok(used.has(x.line), `no line uses the exemption for ${x.file}`);
 });
 
 test("what a service that acts for a person may bring, and the sandbox keys a session that acts as a user is not given, name no chat service", () => {

@@ -7,7 +7,7 @@
  * keeps the keys for its own calls and puts none in the sandbox (brain/test/ensure-hands-acting-session-keys*.test.ts); here is what
  * tells it to, on each of the ways a turn reaches Brain from a stored session.
  *
- * The first turn and the tools of the session are github-review-session.test.ts (T5-T7), and a message to it is
+ * The first turn and the tools of the session are github-review-session.test.ts (T6-T8), and a message to it is
  * github-review-acting-turns.test.ts. What is here:
  *   D1  a turn claimed from the queue (the doorbell path) is marked from the live row at the claim, and its keys are still handed to Brain
  *   D2  a task of a DAG (the scheduler's dispatch) is marked from the session's stored config, and its key is still handed to Brain

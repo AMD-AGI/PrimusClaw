@@ -73,6 +73,9 @@ bash "$repo_root/scripts/release-tests/a2a-public-url-chart.sh"
 echo "==> required platform roles chart wiring"
 bash "$repo_root/scripts/release-tests/required-platform-roles-chart.sh"
 
+echo "==> extra env and ConfigMap/Secret mounts (extra-values.py)"
+bash "$repo_root/scripts/release-tests/extra-values.sh"
+
 echo "==> PromQL rollout gates"
 bash "$repo_root/scripts/release-tests/promql-gates.sh"
 

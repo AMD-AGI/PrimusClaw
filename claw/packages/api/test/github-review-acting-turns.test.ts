@@ -151,7 +151,7 @@ test("A1 a message to a session that acts as a user is refused to every credenti
 test("A2 the person's own token sends to it, queued or immediate, and an allowed service may; a service that is not allowed may not", async () => {
   const saved = process.env.CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS;
   try {
-    process.env.CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS = "chat-service";
+    process.env.CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS = "chat-worker";
     const id = await session();
     const message = { url: `/v1/sessions/${id}/messages`, method: "POST" as const, payload: { content: "review it" } };
 
@@ -173,7 +173,7 @@ test("A2 the person's own token sends to it, queued or immediate, and an allowed
     assert.equal(named.status, 200, "a token that names a client and no actor is the person's");
 
     await h.sql("UPDATE claw_sessions SET agent_status = 'idle', agent_gate_message_id = NULL WHERE session_id = $1", [id]);
-    const service = await send({ ...ALICE, delegation: { actorSub: "chat-service", clientId: "chat-service" } }, "identity_token", message);
+    const service = await send({ ...ALICE, delegation: { actorSub: "chat-worker", clientId: "chat-worker" } }, "identity_token", message);
     assert.equal(service.status, 200, JSON.stringify(service.body));
 
     const before = published.length;
@@ -181,7 +181,7 @@ test("A2 the person's own token sends to it, queued or immediate, and an allowed
     assert.equal(other.status, 403);
     assert.deepEqual(other.body, { ok: false, error: "service_client_not_allowed" });
     process.env.CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS = "";
-    const none = await send({ ...ALICE, delegation: { actorSub: "chat-service", clientId: "chat-service" } }, "identity_token", message);
+    const none = await send({ ...ALICE, delegation: { actorSub: "chat-worker", clientId: "chat-worker" } }, "identity_token", message);
     assert.equal(none.body.error, "service_client_not_allowed", "every service is refused while the list is empty");
     assert.equal(published.length, before, "and neither sent anything");
   } finally {
