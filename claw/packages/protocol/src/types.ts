@@ -639,3 +639,10 @@ export interface UserInfo {
 }
 
 export type EventCallback = (payload: Record<string, unknown>) => void | Promise<void>;
+
+/**
+ * The MCP server the API adds to a turn for the model's trigger tools. Its `requires_approval` holds those tools
+ * for the user and nothing else: Brain does not count it as an operator's approval policy, which would let
+ * HITL_ENABLED ask about every other call of the turn, turns nobody is watching included.
+ */
+export const TRIGGER_MCP_SERVER = "schedules";

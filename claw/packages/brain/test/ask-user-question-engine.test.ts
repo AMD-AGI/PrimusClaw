@@ -20,36 +20,11 @@ process.env.ASK_USER_QUESTION_TIMEOUT_MS = "2000";
 process.env.BASH_APPROVAL_RULES = JSON.stringify([{ label: "held", program: "curl" }]);
 
 import { startWorld, fakeHands, baseRequest } from "./support/platform-defaults-world.js";
+import { fakeNats } from "./support/fake-nats.js";
 
 const world = await startWorld();
 const { AgentEngine } = await import("../src/agent/engine.js");
 test.after(async () => { await world.close(); });
-
-/** The subject a dispatcher subscribes to, fed by hand. */
-function fakeNats() {
-  const queue: Array<{ data: Uint8Array } | null> = [];
-  let wake: (() => void) | null = null;
-  const sc = new TextEncoder();
-  const nc = {
-    subscribe(subject: string) {
-      nc.subjects.push(subject);
-      return {
-        async drain() { queue.push(null); wake?.(); },
-        async *[Symbol.asyncIterator]() {
-          for (;;) {
-            while (!queue.length) await new Promise<void>((r) => { wake = r; });
-            const next = queue.shift();
-            if (next === null) return;
-            yield next as { data: Uint8Array };
-          }
-        },
-      };
-    },
-    subjects: [] as string[],
-    answer(msg: Record<string, unknown>) { queue.push({ data: sc.encode(JSON.stringify(msg)) }); wake?.(); },
-  };
-  return nc;
-}
 
 const QUESTION = { questions: [{ id: "q1", question: "Which?", options: [{ id: "a", label: "A" }, { id: "b", label: "B" }] }] };
 

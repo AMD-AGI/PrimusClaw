@@ -305,8 +305,11 @@ export class AgentEngine {
     ]);
     // With a2a_call on, an allow that answers a peer's approval request is held for the user
     // (a2aApprovalHold). Nothing else changes: calls the policies do not name stay as they were.
-    const policyActive = approval.active || bashPolicy.active;
-    const anyApproval = policyActive || A2A_CLIENT_ENABLED;
+    // The trigger tools' hold is the platform's in the same way: it holds trigger_create and
+    // trigger_cancel, and must not make HITL_ENABLED ask about every call of a worker or doorbell
+    // turn that nobody is watching.
+    const policyActive = approval.operatorActive || bashPolicy.active;
+    const anyApproval = approval.active || policyActive || A2A_CLIENT_ENABLED;
     // The channel decisions arrive on. Approvals need it, and so does the
     // question tool, which waits for its answer on the same subject: a
     // deployment that turns questions on without any approval policy gets the
