@@ -3,7 +3,7 @@
 
 import { ToolRouter } from "../tools/router.js";
 import { isRetryable } from "../infra/retry.js";
-import { runSubagent, SUBAGENT_TYPES, type SubagentType } from "./sub-agent.js";
+import { pickSubagentModel, runSubagent, SUBAGENT_TYPES, type SubagentType } from "./sub-agent.js";
 import {
   SUB_AGENT_MAX_TURNS, SUB_AGENT_MAX_CONCURRENT, SUB_AGENT_MAX_DEPTH,
   BRAIN_BLOCK_SKILL_SUBAGENTS,
@@ -50,6 +50,15 @@ const logger = pino({ name: "agent-loop" });
  * in one is time the run holds a slot without using it.
  */
 const WAITING_TOOLS = new Set(["wait"]);
+
+/**
+ * Sandbox tools that only read, so a run of them in one turn goes to the
+ * sandbox together rather than one after another: Hands serves each from the
+ * file system without changing it. Every other tool still runs alone, in the
+ * order the model emitted it (the sandbox has one writer).
+ */
+const PARALLEL_READ_TOOLS = new Set(["read", "grep", "glob", "ls"]);
+const PARALLEL_READ_LIMIT = 8;
 
 /**
  * The classes a `wait` can still block in.
@@ -1600,12 +1609,22 @@ class AgentLoopRunner {
     // whole tool-call timeout to take effect. Cancelled calls still get a
     // tool_result — the API rejects an assistant tool_use with no matching
     // result — they just get one that says so instead of running.
-    for (const tc of otherCalls) {
+    for (let i = 0; i < otherCalls.length;) {
+      // Consecutive reads go together (see PARALLEL_READ_TOOLS); anything a
+      // person may be asked to approve keeps its own turn at the card.
+      const together = (tc: any) => PARALLEL_READ_TOOLS.has(tc.name)
+        && !this.opts.hitl?.willAsk(tc.name as string, (tc.input || {}) as Record<string, unknown>);
+      let end = i + 1;
+      if (together(otherCalls[i])) {
+        while (end < otherCalls.length && end - i < PARALLEL_READ_LIMIT && together(otherCalls[end])) end++;
+      }
+      const batch = otherCalls.slice(i, end);
+      i = end;
       if (this.signal?.aborted) {
-        resultByToolId.set((tc as any).id as string, CANCELLED_TOOL_RESULT);
+        for (const tc of batch) resultByToolId.set((tc as any).id as string, CANCELLED_TOOL_RESULT);
         continue;
       }
-      await this.runRegularTool(tc, turn, resultByToolId);
+      await Promise.all(batch.map((tc) => this.runRegularTool(tc, turn, resultByToolId)));
     }
 
     // Run `task` tools concurrently, bounded.
@@ -2330,6 +2349,8 @@ class AgentLoopRunner {
       if (this.depth >= SUB_AGENT_MAX_DEPTH) {
         throw new Error(`sub-agent nesting limit reached (depth=${this.depth}, max=${SUB_AGENT_MAX_DEPTH})`);
         }
+      const picked = pickSubagentModel(toolInput.model, subagentType, this.model);
+      if ("error" in picked) throw new Error(picked.error.replace(/^Error: /, ""));
       // A sub-agent gets its own router around the same sandbox, so the run
       // has to have one by now even if this turn's parent never used a tool.
       const subHands = this.opts.hands ?? await this.opts.attachHands?.();
@@ -2351,7 +2372,7 @@ class AgentLoopRunner {
         parentRouter: this.router,
         onEvent: this.onEvent,
         signal: this.signal,
-        model: this.model, apiUrl: this.apiUrl, apiKey: this.apiKey,
+        model: picked.model, apiUrl: this.apiUrl, apiKey: this.apiKey,
         maxTurns: SUB_AGENT_MAX_TURNS > 0 ? SUB_AGENT_MAX_TURNS : this.maxTurns,
         userId: this.userId, sessionId: this.sessionId,
         depth: this.depth + 1,

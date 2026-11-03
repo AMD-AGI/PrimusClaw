@@ -1,0 +1,161 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+/**
+ * A `task` call may pick its sub-agent's model from the ones the deployment
+ * offers, and reads emitted together go to the sandbox together.
+ *
+ * The models are configured before anything is imported: they are read once,
+ * at module load, like every other setting.
+ */
+import test, { after, before } from "node:test";
+import assert from "node:assert/strict";
+import type { Message, ToolSchema } from "@claw/protocol";
+
+process.env.SUB_AGENT_MODELS = "light-model, other-model";
+process.env.SUB_AGENT_EXPLORE_MODEL = "light-model";
+process.env.SUB_AGENT_MAX_TURNS = "4";
+
+const { agentLoop } = await import("../src/agent/agent-loop.js");
+const { pickSubagentModel } = await import("../src/agent/sub-agent.js");
+const { ToolRouter } = await import("../src/tools/router.js");
+const { AnthropicProvider } = await import("../src/llm/anthropic-provider.js");
+const { OpenAiProvider } = await import("../src/llm/openai-provider.js");
+type LlmSession = import("../src/llm/provider.js").LlmSession;
+type LlmTurnResult = import("../src/llm/provider.js").LlmTurnResult;
+type LlmSessionOptions = import("../src/llm/provider.js").LlmSessionOptions;
+type HandsClient = import("../src/clients/hands.js").HandsClient;
+type LoopOptions = import("../src/agent/agent-loop.js").LoopOptions;
+type SubagentType = import("../src/agent/sub-agent.js").SubagentType;
+
+const usage = { input_tokens: 1, output_tokens: 1, cache_create: 0, cache_read: 0 };
+type Turn = { content: unknown[]; stopReason: string };
+const toolUse = (id: string, name: string, input: Record<string, unknown> = {}) => ({ type: "tool_use", id, name, input });
+const say = (text: string): Turn => ({ content: [{ type: "text", text }], stopReason: "end_turn" });
+
+function scripted(turns: Turn[]): LlmSession & { sent: Message[][] } {
+  const sent: Message[][] = [];
+  return {
+    sent,
+    async streamTurn(messages) {
+      sent.push(JSON.parse(JSON.stringify(messages)));
+      const next = turns.shift();
+      if (!next) throw new Error("the loop asked for more turns than the script has");
+      return { ...next, usage, firstByteMs: 1, promptTokens: 1 } as unknown as LlmTurnResult;
+    },
+    async complete() { return "summary"; },
+  };
+}
+
+/** Sub-agents open their session through the provider: record the model each was opened with. */
+const opened: string[] = [];
+const originalAnthropic = AnthropicProvider.prototype.createSession;
+const originalOpenAi = OpenAiProvider.prototype.createSession;
+before(() => {
+  const create = (opts: LlmSessionOptions) => { opened.push(opts.model); return scripted([say("sub done")]); };
+  AnthropicProvider.prototype.createSession = create as never;
+  OpenAiProvider.prototype.createSession = create as never;
+});
+after(() => {
+  AnthropicProvider.prototype.createSession = originalAnthropic;
+  OpenAiProvider.prototype.createSession = originalOpenAi;
+});
+
+function resultOf(session: { sent: Message[][] }, id: string): string {
+  const block = session.sent[1]
+    .flatMap((m) => (Array.isArray(m.content) ? m.content : []))
+    .find((b: unknown) => (b as { tool_use_id?: string }).tool_use_id === id) as { content?: unknown } | undefined;
+  return String(block?.content);
+}
+
+const PICK_ROWS: Array<{ name: string; requested: unknown; type: SubagentType; want: string | RegExp }> = [
+  { name: "nothing named, a reading profile: the reading default", requested: undefined, type: "explore", want: "light-model" },
+  { name: "nothing named, readonly: the reading default", requested: "", type: "readonly", want: "light-model" },
+  { name: "nothing named, a working profile: the run's own", requested: undefined, type: "generalPurpose", want: "run-model" },
+  { name: "nothing named, shell: the run's own", requested: undefined, type: "shell", want: "run-model" },
+  { name: "an offered model", requested: "other-model", type: "generalPurpose", want: "other-model" },
+  { name: "the run's own model, named", requested: "run-model", type: "explore", want: "run-model" },
+  { name: "a model not offered is refused", requested: "costly-model", type: "explore", want: /not offered.*run-model, light-model, other-model/ },
+  { name: "a non-string is refused", requested: 7, type: "explore", want: /not offered/ },
+];
+
+for (const row of PICK_ROWS) {
+  test(`pickSubagentModel: ${row.name}`, () => {
+    const got = pickSubagentModel(row.requested, row.type, "run-model");
+    if (typeof row.want === "string") assert.deepEqual(got, { model: row.want });
+    else assert.match((got as { error: string }).error, row.want);
+  });
+}
+
+test("the task schema offers exactly the configured models", () => {
+  const task = new ToolRouter(null, new Map()).allToolSchemas().find((t) => t.name === "task")!;
+  const model = (task.input_schema as { properties: Record<string, { enum?: string[] }> }).properties.model;
+  assert.deepEqual(model?.enum, ["light-model", "other-model"]);
+});
+
+function parentOptions(session: LlmSession, router: unknown): LoopOptions {
+  return {
+    model: "run-model", apiUrl: "http://localhost:0", apiKey: "k", maxTurns: 4, depth: 0,
+    router: router as never, sessionId: "s-269", userId: "u", llmSession: session,
+    hands: {} as HandsClient,
+    onEvent: async () => {},
+  };
+}
+
+const taskSchema = { name: "task", description: "task", input_schema: { type: "object", properties: {} } } as unknown as ToolSchema;
+const readSchema = (name: string) => ({ name, description: name, input_schema: { type: "object", properties: {} } }) as unknown as ToolSchema;
+
+test("a task runs its sub-agent on the model it names, and an explore task on the reading default", async () => {
+  opened.length = 0;
+  const parent = scripted([
+    { content: [
+      toolUse("t1", "task", { description: "a", prompt: "p", subagent_type: "generalPurpose", model: "other-model" }),
+      toolUse("t2", "task", { description: "b", prompt: "p", subagent_type: "explore" }),
+      toolUse("t3", "task", { description: "c", prompt: "p", subagent_type: "explore", model: "costly-model" }),
+    ], stopReason: "tool_use" },
+    say("all done"),
+  ]);
+  const router = new ToolRouter({} as HandsClient, new Map());
+  await agentLoop([{ role: "user", content: "go" } as Message], [taskSchema, readSchema("read")], parentOptions(parent, router));
+  assert.deepEqual(opened.sort(), ["light-model", "other-model"]);   // the refused one opened nothing
+  assert.equal(resultOf(parent, "t1"), "sub done");
+  assert.match(resultOf(parent, "t3"), /^Error: model "costly-model" is not offered/);
+});
+
+test("reads emitted together run together; a write waits for them and runs alone", async () => {
+  const log: string[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const router = {
+    setHands: () => {},
+    route: async (name: string, input: Record<string, unknown>) => {
+      log.push(`start ${name} ${input.path}`);
+      if (name !== "write") {
+        // Both reads must have started before either is let finish: run one after another, this never resolves.
+        if (log.filter((l) => l.startsWith("start read") || l.startsWith("start grep")).length === 2) release();
+        await gate;
+      }
+      log.push(`end ${name} ${input.path}`);
+      return `${name} ok`;
+    },
+  };
+  const parent = scripted([
+    { content: [
+      toolUse("r1", "read", { path: "a" }),
+      toolUse("r2", "grep", { path: "b" }),
+      toolUse("w1", "write", { path: "c" }),
+    ], stopReason: "tool_use" },
+    say("done"),
+  ]);
+  const timeout = setTimeout(() => release(), 2_000);
+  try {
+    await agentLoop([{ role: "user", content: "go" } as Message],
+      ["read", "grep", "write"].map(readSchema), parentOptions(parent, router));
+  } finally {
+    clearTimeout(timeout);
+  }
+  assert.deepEqual(log.slice(0, 2).sort(), ["start grep b", "start read a"], `reads did not start together: ${log.join(" | ")}`);
+  assert.deepEqual(log.slice(-2), ["start write c", "end write c"], `the write did not run alone after the reads: ${log.join(" | ")}`);
+  assert.equal(resultOf(parent, "r1"), "read ok");
+  assert.equal(resultOf(parent, "w1"), "write ok");
+});

@@ -12,7 +12,7 @@ import type { ToolSchema, PendingMemory, PendingSkill, PendingSkillFileMutation 
 import {
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED, TODO_WRITE_ENABLED, BG_SHELL_ENABLED,
   EXIT_PLAN_MODE_ENABLED, ASK_USER_QUESTION_ENABLED, A2A_CLIENT_ENABLED,
-  BASH_FOREGROUND_DEFAULT_SEC, WAIT_DEFAULT_SEC,
+  BASH_FOREGROUND_DEFAULT_SEC, WAIT_DEFAULT_SEC, SUB_AGENT_MODELS,
 } from "../config.js";
 import type { WebSearchService } from "./web/search.js";
 import type { WebFetchService } from "./web/fetch.js";
@@ -773,6 +773,13 @@ export class ToolRouter {
             items: { type: "string" },
             description: "Optional: exact tool base names allowed for this sub-agent (further narrows subagent_type). Omit to use the profile defaults.",
           },
+          // Offered only where the deployment names models to choose from: an
+          // enum of nothing would be a field the model can only get wrong.
+          ...(SUB_AGENT_MODELS.length ? { model: {
+            type: "string",
+            enum: [...SUB_AGENT_MODELS],
+            description: "Optional: the model this sub-agent runs on. Omit to use the default (a lighter model for explore/readonly where one is configured, otherwise your own). Pick a lighter one for broad reading and searching, your own for work that needs judgement.",
+          } } : {}),
         },
         required: ["description", "prompt"],
       }},

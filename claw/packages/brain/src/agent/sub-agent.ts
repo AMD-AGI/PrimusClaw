@@ -8,6 +8,7 @@ import type { HookRunner } from "./hooks.js";
 import type { Message, ToolSchema, EventCallback } from "@claw/protocol";
 import type { RunIdentity } from "../tasks/run-identity.js";
 import { filterToolSchemas, type ToolAllowlist } from "../tools/allowlist.js";
+import { SUB_AGENT_EXPLORE_MODEL, SUB_AGENT_MODELS } from "../config.js";
 import pino from "pino";
 import { randomUUID } from "node:crypto";
 
@@ -45,6 +46,32 @@ const DENY_LIST = new Set([
   "upload_to_s3",
   "download_from_s3",
 ]);
+
+/** The profiles that only read and search: the ones a lighter default model is for. */
+const READING_PROFILES = new Set<SubagentType>(["explore", "readonly"]);
+
+/**
+ * The model a `task` call's sub-agent runs on: the one the call names when the
+ * deployment offers it (SUB_AGENT_MODELS), else the reading default for a
+ * reading profile, else the run's own. A name the deployment does not offer is
+ * refused rather than replaced, so the model learns its choice did not happen.
+ */
+export function pickSubagentModel(
+  requested: unknown,
+  type: SubagentType,
+  runModel: string,
+  offered: ReadonlyArray<string> = SUB_AGENT_MODELS,
+  readingDefault: string = SUB_AGENT_EXPLORE_MODEL,
+): { model: string } | { error: string } {
+  if (requested === undefined || requested === null || requested === "") {
+    return { model: READING_PROFILES.has(type) && readingDefault ? readingDefault : runModel };
+  }
+  if (typeof requested === "string" && (requested === runModel || offered.includes(requested))) {
+    return { model: requested };
+  }
+  const choices = [...new Set([runModel, ...offered])].join(", ");
+  return { error: `Error: model ${JSON.stringify(String(requested)).slice(0, 80)} is not offered for sub-agents; choose one of: ${choices}, or omit it.` };
+}
 
 export interface RunSubagentOptions {
   /** Sub-agent identity, used for event tagging and log correlation. */
