@@ -1172,3 +1172,16 @@ test("L7 a restore that did not bring everything back leaves the next sync to li
   await sb.sync();
   assert.equal(store.lists, 1);
 });
+
+test("L8 a file called __proto__ is in the record like any other, so its removal is pruned too", async () => {
+  const sb = threeFiles();
+  sb.put("__proto__", "x");
+  await sb.sync();
+  assert.ok(store.objects.has("users/user-1/sessions/sess-1/__proto__"));
+
+  sb.remove("__proto__");
+  store.lists = 0;
+  await sb.sync();
+  assert.equal(store.lists, 0);
+  assert.equal(store.objects.has("users/user-1/sessions/sess-1/__proto__"), false);
+});

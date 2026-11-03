@@ -418,8 +418,9 @@ async function writeManifest(
   const n = Math.max(1, Math.ceil(rows.length / shardFiles));
   const gen = randomBytes(8).toString("hex");
   for (let i = 0; i < n; i++) {
-    const files: Record<string, Entry> = {};
-    for (const [path, e] of rows.slice(i * shardFiles, (i + 1) * shardFiles)) files[path] = e;
+    // Defined, not assigned: a file called `__proto__` assigned into an object
+    // literal sets its prototype and never reaches the JSON.
+    const files: Record<string, Entry> = Object.fromEntries(rows.slice(i * shardFiles, (i + 1) * shardFiles));
     const out = await withHandsTimeout<string>(
       hands,
       "write",
