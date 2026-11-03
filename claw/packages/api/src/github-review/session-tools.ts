@@ -14,6 +14,7 @@ import pino from "pino";
 import { CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
 import { db } from "../infra/db.js";
 import { actingUserOf } from "./acting-as.js";
+import { reviewTargetOf } from "./review-target.js";
 import { readGithubReviewSettings } from "./settings.js";
 import { mintSessionToolToken } from "./token.js";
 
@@ -35,6 +36,11 @@ export async function githubReviewMcpServers(sessionId: string): Promise<McpServ
     if (!row?.user_id) return {};
     const actingUser = actingUserOf(row.config);
     if (actingUser === null) return {};
+    // A bound pull request that cannot be read is not an unbound session: the tools are not offered rather than offered without the binding.
+    if (!reviewTargetOf(row.config).ok) {
+      logger.error({ sessionId }, "github_review.review_target_unreadable_tools_not_offered");
+      return {};
+    }
     if (!settings.mcpSecret) {
       logger.error({ sessionId }, "github_review.no_secret_tools_not_offered");
       return {};

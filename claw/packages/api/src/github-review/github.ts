@@ -33,6 +33,20 @@ export class GithubError extends Error {
   }
 }
 
+/**
+ * GitHub answered a GraphQL request with 200 and an `errors` list: the request was understood and refused. `detail` is the first error's
+ * message (redacted, cut), which is what a caller tells the person; the message of the error itself carries the same text.
+ */
+export class GithubGraphqlError extends GithubError {
+  readonly detail: string;
+
+  constructor(detail: string, requestId: string) {
+    super(502, `GraphQL: ${detail}`, requestId);
+    this.name = "GithubGraphqlError";
+    this.detail = detail;
+  }
+}
+
 export interface GithubClientOptions {
   token: string;
   apiUrl: string;
@@ -76,10 +90,15 @@ export function parsePrRef(input: unknown): PrRef | null {
     if (!m) return null;
     [, owner, repo, num] = m;
   }
-  if (!owner || !repo || !num || !OWNER_RE.test(owner) || !REPO_RE.test(repo) || repo === "." || repo === "..") return null;
-  const n = Number(num);
-  if (!Number.isSafeInteger(n) || n < 1) return null;
-  return { owner, repo, number: n };
+  if (!owner || !repo || !num) return null;
+  const ref: PrRef = { owner, repo, number: Number(num) };
+  return isValidPrRef(ref) ? ref : null;
+}
+
+/** Whether every part of a reference is something a request path may be built from: the one check that `parsePrRef` and a session's bound target share. */
+export function isValidPrRef(ref: PrRef): boolean {
+  return OWNER_RE.test(ref.owner) && REPO_RE.test(ref.repo) && ref.repo !== "." && ref.repo !== ".."
+    && Number.isSafeInteger(ref.number) && ref.number >= 1 && ref.number <= 999_999_999;
 }
 
 async function readCapped(resp: Response, maxBytes: number): Promise<string> {
@@ -198,7 +217,7 @@ export class GithubClient {
     const body = answer.json;
     if (!body || body.errors?.length || body.data === undefined) {
       const msg = this.redact(body?.errors?.[0]?.message ?? "no data").slice(0, 200);
-      throw new GithubError(502, `GraphQL: ${msg}`, answer.requestId);
+      throw new GithubGraphqlError(msg, answer.requestId);
     }
     return body.data;
   }

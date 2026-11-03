@@ -12,7 +12,7 @@
  *   S2  the timing sees what it is for: the patterns that were super-linear (copied as they were) are over the bound
  *   S3  every regular expression literal in `src/github-review` is under it, on lines at the longest a changed line is read, including lines
  *       that say the opening of the pattern over and over
- *   S4  the entry points that read a repository's own text (`.github/clawy.yml`, a `package.json` change) cost a bounded amount on the
+ *   S4  the entry points that read a repository's own text (`.github/claw-review.yml`, a `package.json` change) cost a bounded amount on the
  *       lines that were slow, and read what they read before
  *   S5  one `assessRisk` call on the most a pull request can make it read (500 lines at the cap) costs a bounded amount, whatever the lines
  *       repeat: the bound is on the call, which is what the shared API pays, and not on one `exec`; it is a multiple of what a call on lines
@@ -24,7 +24,7 @@
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 import test from "node:test";
-import { assessRisk, parseClawyConfig, type RiskFile } from "../src/github-review/risk.js";
+import { assessRisk, parseRepoConfig, type RiskFile } from "../src/github-review/risk.js";
 import { MAX_LINE_CHARS, MAX_READ_CHARS } from "../src/github-review/risk-signals.js";
 import { regexLiterals, sampleStrings, worstCost } from "./support/regex-sweep.js";
 
@@ -165,7 +165,7 @@ test("S4 a package.json that adds string entries of whitespace, with and without
 });
 
 test("S4b the repository's own config is read in time on a line that is very long, and reads what it read before", () => {
-  const cost = (text: string): number => { const t0 = performance.now(); parseClawyConfig(text); return performance.now() - t0; };
+  const cost = (text: string): number => { const t0 = performance.now(); parseRepoConfig(text); return performance.now() - t0; };
   const long = 200_000;
   const assertFast = (what: string, text: string): void => { const ms = cost(text); assert.ok(ms < 400, `${what}: ${Math.round(ms)} ms`); };
   assertFast("whitespace that no comment ends", `confirm_merge: risk${" \t".repeat(long / 2)}x`);
@@ -173,7 +173,7 @@ test("S4b the repository's own config is read in time on a line that is very lon
   assertFast("a list item of whitespace and a quote", `high_risk_paths:\n  - a${" ".repeat(long)}b"c`);
   assertFast("a list item of whitespace, then a character that ends nothing", `high_risk_paths:\n  - "${" ".repeat(long)}x`);
 
-  const good = (text: string) => parseClawyConfig(text);
+  const good = (text: string) => parseRepoConfig(text);
   assert.deepEqual(good('confirm_merge: always # every merge\nhigh_risk_paths:\n  - "docs/legal/**"  # legal\n  - \'infra/*\'\n  - plain/path\n  -   spaced/path  \n'),
     { confirmMerge: "always", highRiskPaths: ["docs/legal/**", "infra/*", "plain/path", "spaced/path"] });
   assert.deepEqual(good("# a comment\n\nconfirm_merge: risk\n"), { confirmMerge: "risk", highRiskPaths: [] });

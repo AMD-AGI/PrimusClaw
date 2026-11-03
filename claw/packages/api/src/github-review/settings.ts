@@ -19,14 +19,17 @@
  *   CLAW_GITHUB_REQUESTS_PER_SESSION        GitHub requests one session may make, default 60
  *   CLAW_GITHUB_REVIEW_FAST_MAX_FILES       a change with at most this many files is reviewed from the diff, no sandbox, default 15
  *   CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES  ... and at most this many added plus deleted lines, default 600
- *   CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS  identity-provider client ids of the services that may answer a held merge for the user a
+ *   CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS  identity-provider client ids of the services that may answer a held write for the user a
  *                                           token names (RFC 8693 exchange: `sub` the user, `act` the service); default none
+ *   CLAW_GITHUB_REVIEW_AGENT_NAME           how the footer of a review names its author ("Reviewed by <name> on behalf of ..."), default Claw
  */
 import { readIntSetting, type IntSettingBounds } from "@claw/utils";
 import { CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
 
 export const GITHUB_PROVIDER = "github";
 export const MIN_MCP_SECRET_LENGTH = 32;
+export const DEFAULT_AGENT_NAME = "Claw";
+const MAX_AGENT_NAME_CHARS = 40;
 
 export interface GithubReviewSettings {
   enabled: boolean;
@@ -43,8 +46,10 @@ export interface GithubReviewSettings {
   requestsPerSession: number;
   fastMaxFiles: number;
   fastMaxChangedLines: number;
-  /** The services (identity client ids, compared exactly as signed) that may decide a held merge for the user their token names. */
+  /** The services (identity client ids, compared exactly as signed) that may decide a held write for the user their token names. */
   decisionClientIds: string[];
+  /** How the footer of a review names its author: one line of plain text, nothing that could open markup or end the footer. */
+  agentName: string;
   /** Values that were refused and replaced by their default. */
   problems: string[];
 }
@@ -69,6 +74,10 @@ export function readGithubReviewSettings(env: Env = process.env, enabled: boolea
   const owners = ((env.CLAW_GITHUB_REVIEW_OWNERS ?? "").trim() || "AMD-AGI")
     .split(",").map((o) => o.trim().toLowerCase()).filter(Boolean);
   const backend = (env.INTERNAL_BACKEND_URL ?? "").trim() || `http://127.0.0.1:${(env.API_PORT ?? "").trim() || "8200"}`;
+  const agentName = (env.CLAW_GITHUB_REVIEW_AGENT_NAME ?? "").replace(/[\u0000-\u001f\u007f\u2028\u2029<>`]+/g, " ").replace(/\s+/g, " ").trim().slice(0, MAX_AGENT_NAME_CHARS).trim();
+  if ((env.CLAW_GITHUB_REVIEW_AGENT_NAME ?? "").trim() && !agentName) {
+    problems.push(`CLAW_GITHUB_REVIEW_AGENT_NAME has no printable text; using ${DEFAULT_AGENT_NAME}`);
+  }
   const apiUrl = ((env.CLAW_GITHUB_API_URL ?? "").trim() || "https://api.github.com").replace(/(?<!\/)\/+$/, "");
   return {
     enabled,
@@ -87,6 +96,7 @@ export function readGithubReviewSettings(env: Env = process.env, enabled: boolea
     fastMaxChangedLines: num("CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES", 600, { min: 0, max: 100_000 }),
     // Not lower-cased and not trimmed past the separators: a client id is compared as the identity provider signed it.
     decisionClientIds: [...new Set((env.CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS ?? "").split(/[\s,]+/).filter(Boolean))],
+    agentName: agentName || DEFAULT_AGENT_NAME,
     problems,
   };
 }
