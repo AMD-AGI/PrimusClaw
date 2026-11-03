@@ -12,7 +12,10 @@
 
 import { LRUCache } from "lru-cache";
 import pino from "pino";
-import dns from "node:dns/promises";
+import dns from "node:dns";
+import http from "node:http";
+import https from "node:https";
+import net from "node:net";
 import { URL } from "node:url";
 import {
   WEB_FETCH_MAX_BYTES,
@@ -35,45 +38,76 @@ const MAX_REDIRECTS = 10;
 
 // ── SSRF guard ──
 
-function isBlockedIPv4(ip: string): boolean {
-  const parts = ip.split(".");
-  if (parts.length !== 4) return true;
-  const [a, b] = parts.map((p) => parseInt(p, 10));
-  if (a === 0) return true;                          // 0.0.0.0/8
-  if (a === 10) return true;                          // 10.0.0.0/8
-  if (a === 127) return true;                         // 127.0.0.0/8
-  if (a === 169 && b === 254) return true;            // 169.254.0.0/16
-  if (a === 172 && b >= 16 && b <= 31) return true;   // 172.16.0.0/12
-  if (a === 192 && b === 168) return true;            // 192.168.0.0/16
-  if (a === 100 && b >= 64 && b <= 127) return true;  // 100.64.0.0/10 (CGNAT)
-  if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 (benchmark)
-  if (a >= 224) return true;                          // multicast + reserved
-  return false;
+/**
+ * Addresses web_fetch never connects to: loopback, private, link-local (cloud
+ * metadata), CGNAT -- the blocks cluster Service and Pod ranges are drawn from --
+ * documentation and reserved ranges, and the IPv6 forms that embed or route to them.
+ * BlockList also matches IPv4-mapped IPv6 (::ffff:a.b.c.d) against the IPv4 rules.
+ */
+const BLOCKED_ADDRESSES = (() => {
+  const list = new net.BlockList();
+  for (const [prefix, bits] of [
+    ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8],
+    ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.0.2.0", 24],
+    ["192.168.0.0", 16], ["198.18.0.0", 15], ["198.51.100.0", 24], ["203.0.113.0", 24],
+    ["224.0.0.0", 3],
+  ] as const) list.addSubnet(prefix, bits, "ipv4");
+  for (const [prefix, bits] of [
+    ["::", 128], ["::1", 128], ["64:ff9b::", 96], ["64:ff9b:1::", 48], ["100::", 64],
+    ["2001::", 32], ["2001:db8::", 32], ["2002::", 16], ["fc00::", 7], ["fe80::", 10],
+    ["fec0::", 10], ["ff00::", 8],
+  ] as const) list.addSubnet(prefix, bits, "ipv6");
+  return list;
+})();
+
+export function isBlockedAddress(ip: string): boolean {
+  const family = net.isIP(ip);
+  if (family === 0) return true;
+  return BLOCKED_ADDRESSES.check(ip, family === 6 ? "ipv6" : "ipv4");
 }
 
-function isBlockedIPv6(ip: string): boolean {
-  const normalized = ip.toLowerCase();
-  if (normalized === "::1") return true;
-  if (normalized.startsWith("fc") || normalized.startsWith("fd")) return true; // fc00::/7
-  if (normalized.startsWith("fe8") || normalized.startsWith("fe9") ||
-      normalized.startsWith("fea") || normalized.startsWith("feb")) return true; // fe80::/10
-  // IPv4-mapped IPv6
-  if (normalized.startsWith("::ffff:")) {
-    const v4 = normalized.slice(7);
-    if (v4.includes(".") && isBlockedIPv4(v4)) return true;
-  }
-  return false;
+/** Names that only mean something inside a cluster or a host, refused before any lookup. */
+const INTERNAL_NAME_RE = /(?:^|\.)(?:localhost|local|internal|svc|home\.arpa)$/i;
+
+type Resolve = (
+  hostname: string,
+  options: dns.LookupAllOptions,
+  callback: (err: NodeJS.ErrnoException | null, addresses: dns.LookupAddress[]) => void,
+) => void;
+
+/**
+ * The `lookup` the HTTP agents connect through.
+ *
+ * The check sits here, on the address the socket is about to dial, rather than
+ * in a lookup made before the request: a separate lookup answers a different
+ * question than the connection's own, and a name with a short TTL can answer
+ * public to the first and private to the second. The name is resolved as
+ * absolute (trailing dot) so the resolver's search domains cannot turn
+ * `service.namespace` into an in-cluster address.
+ */
+export function guardedLookup(resolve: Resolve = dns.lookup as unknown as Resolve): net.LookupFunction {
+  return (hostname, options, callback) => {
+    const name = hostname.endsWith(".") ? hostname : `${hostname}.`;
+    resolve(name, { ...options, all: true }, (err, addresses) => {
+      if (err) return callback(err, "", 0);
+      const blocked = addresses.find((a) => isBlockedAddress(a.address));
+      if (blocked) {
+        return callback(new Error(`SSRF: ${hostname} resolves to blocked address ${blocked.address}`), "", 0);
+      }
+      if (addresses.length === 0) {
+        return callback(Object.assign(new Error(`ENOTFOUND ${hostname}`), { code: "ENOTFOUND" }), "", 0);
+      }
+      if ((options as dns.LookupOptions).all) return callback(null, addresses as unknown as string);
+      callback(null, addresses[0].address, addresses[0].family);
+    });
+  };
 }
 
-async function ssrfCheck(hostname: string): Promise<void> {
-  const results = await dns.lookup(hostname, { all: true });
-  for (const { address, family } of results) {
-    if (family === 4 && isBlockedIPv4(address)) {
-      throw new Error(`SSRF: resolved IP ${address} is in a blocked range`);
-    }
-    if (family === 6 && isBlockedIPv6(address)) {
-      throw new Error(`SSRF: resolved IPv6 ${address} is in a blocked range`);
-    }
+/** An IP-literal host never reaches `lookup`, so it is checked on its own. */
+function literalAddressCheck(hostname: string): void {
+  const bare = hostname.replace(/^\[|\]$/g, "");
+  if (net.isIP(bare) && isBlockedAddress(bare)) {
+    throw new Error(`SSRF: address ${bare} is in a blocked range`);
   }
 }
 
@@ -92,6 +126,9 @@ function validateUrl(raw: string): URL {
   const parsed = new URL(urlStr);
   if (parsed.username || parsed.password) throw new Error("URL must not contain credentials");
   if (!parsed.hostname.includes(".")) throw new Error("Hostname must contain at least one dot");
+  if (INTERNAL_NAME_RE.test(parsed.hostname.replace(/\.$/, ""))) {
+    throw new Error(`SSRF: ${parsed.hostname} is an internal name`);
+  }
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
     throw new Error(`Unsupported protocol: ${parsed.protocol}`);
   }
@@ -184,73 +221,87 @@ interface FetchResult {
   redirectInfo?: string;
 }
 
-async function fetchWithRedirects(
+export async function fetchWithRedirects(
   startUrl: URL,
   maxBytes: number,
   signal?: AbortSignal,
+  resolve?: Resolve,
 ): Promise<FetchResult> {
   const { default: axios } = await import("axios");
+  const lookup = guardedLookup(resolve);
+  // Fresh agents, so no pooled socket dialled before this check is reused.
+  const httpAgent = new http.Agent({ lookup });
+  const httpsAgent = new https.Agent({ lookup });
   let current = startUrl;
 
-  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-    await ssrfCheck(current.hostname);
+  try {
+    for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+      literalAddressCheck(current.hostname);
 
-    const resp = await axios.get(current.toString(), {
-      maxRedirects: 0,
-      maxContentLength: maxBytes,
-      responseType: "arraybuffer",
-      timeout: WEB_FETCH_TIMEOUT_MS,
-      headers: { "User-Agent": USER_AGENT },
-      signal,
-      validateStatus: (s: number) => s < 400 || (s >= 300 && s < 400),
-    });
+      const resp = await axios.get(current.toString(), {
+        httpAgent,
+        httpsAgent,
+        // A proxy would resolve the name itself and the guard above would never see it.
+        proxy: false,
+        maxRedirects: 0,
+        maxContentLength: maxBytes,
+        responseType: "arraybuffer",
+        timeout: WEB_FETCH_TIMEOUT_MS,
+        headers: { "User-Agent": USER_AGENT },
+        signal,
+        validateStatus: (s: number) => s < 400 || (s >= 300 && s < 400),
+      });
 
-    if (resp.status >= 300 && resp.status < 400) {
-      const location = resp.headers.location;
-      if (!location) throw new Error(`Redirect ${resp.status} without Location header`);
+      if (resp.status >= 300 && resp.status < 400) {
+        const location = resp.headers.location;
+        if (!location) throw new Error(`Redirect ${resp.status} without Location header`);
 
-      let next: URL;
-      try { next = new URL(location, current.toString()); }
-      catch { throw new Error(`Invalid redirect URL: ${location}`); }
+        let next: URL;
+        try { next = new URL(location, current.toString()); }
+        catch { throw new Error(`Invalid redirect URL: ${location}`); }
 
-      if (next.protocol !== "https:" && next.protocol !== "http:") {
-        throw new Error(`Redirect to unsupported protocol: ${next.protocol}`);
+        if (next.protocol !== "https:" && next.protocol !== "http:") {
+          throw new Error(`Redirect to unsupported protocol: ${next.protocol}`);
+        }
+        if (next.username || next.password) {
+          throw new Error("Redirect URL must not contain credentials");
+        }
+
+        if (!isSameHost(current, next)) {
+          const statusText = { 301: "Moved Permanently", 302: "Found", 307: "Temporary Redirect", 308: "Permanent Redirect" };
+          return {
+            body: Buffer.alloc(0),
+            contentType: "",
+            statusCode: resp.status,
+            finalUrl: next.toString(),
+            redirectInfo: [
+              "REDIRECT DETECTED: The URL redirects to a different host.",
+              `Original URL: ${startUrl.toString()}`,
+              `Redirected URL: ${next.toString()}`,
+              `Status: ${resp.status} ${(statusText as any)[resp.status] ?? "Redirect"}`,
+              "",
+              "Please call web_fetch again with the redirected URL and the same prompt if you still want this content.",
+            ].join("\n"),
+          };
+        }
+
+        current = next;
+        continue;
       }
-      if (next.username || next.password) {
-        throw new Error("Redirect URL must not contain credentials");
-      }
 
-      if (!isSameHost(current, next)) {
-        const statusText = { 301: "Moved Permanently", 302: "Found", 307: "Temporary Redirect", 308: "Permanent Redirect" };
-        return {
-          body: Buffer.alloc(0),
-          contentType: "",
-          statusCode: resp.status,
-          finalUrl: next.toString(),
-          redirectInfo: [
-            "REDIRECT DETECTED: The URL redirects to a different host.",
-            `Original URL: ${startUrl.toString()}`,
-            `Redirected URL: ${next.toString()}`,
-            `Status: ${resp.status} ${(statusText as any)[resp.status] ?? "Redirect"}`,
-            "",
-            "Please call web_fetch again with the redirected URL and the same prompt if you still want this content.",
-          ].join("\n"),
-        };
-      }
-
-      current = next;
-      continue;
+      return {
+        body: Buffer.from(resp.data),
+        contentType: String(resp.headers["content-type"] ?? "").split(";")[0].trim().toLowerCase(),
+        statusCode: resp.status,
+        finalUrl: current.toString(),
+      };
     }
 
-    return {
-      body: Buffer.from(resp.data),
-      contentType: String(resp.headers["content-type"] ?? "").split(";")[0].trim().toLowerCase(),
-      statusCode: resp.status,
-      finalUrl: current.toString(),
-    };
+    throw new Error(`Too many redirects (>${MAX_REDIRECTS})`);
+  } finally {
+    httpAgent.destroy();
+    httpsAgent.destroy();
   }
-
-  throw new Error(`Too many redirects (>${MAX_REDIRECTS})`);
 }
 
 // ── WebFetchService ──
