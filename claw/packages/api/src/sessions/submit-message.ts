@@ -78,6 +78,8 @@ interface SubmitSessionMessageBase {
   workspaceId?: string;
   mcpServers?: Record<string, Record<string, unknown>>;
   topology?: EnvironmentTopology;
+  /** The request's `tools_allowlist`, already validated; absent or empty is no restriction. */
+  toolsAllowlist?: string[];
   /** The `env` map of the request, already parsed. */
   sessionEnv: Record<string, string>;
   /**
@@ -170,6 +172,7 @@ export interface PendingMessageRow {
   timeout?: number;
   sessionEnv: Record<string, string>;
   topology?: EnvironmentTopology;
+  toolsAllowlist?: string[];
   dedupeKey?: string;
 }
 
@@ -203,14 +206,15 @@ export async function insertPendingMessage(
     JSON.stringify(row.secrets.userEnv),
     JSON.stringify(row.sessionEnv),
     row.topology ? JSON.stringify(row.topology) : null,
+    row.toolsAllowlist?.length ? JSON.stringify(row.toolsAllowlist) : null,
   ];
   const keyed = row.dedupeKey !== undefined;
   if (keyed) params.push(row.dedupeKey);
   const inserted = await q.query(
-    "INSERT INTO claw_pending_messages (session_id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology"
+    "INSERT INTO claw_pending_messages (session_id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology, tools_allowlist"
     + (keyed ? ", dedupe_key" : "")
-    + ") VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11::jsonb, $12, $13::jsonb, $14::jsonb, $15::jsonb"
-    + (keyed ? ", $16) ON CONFLICT (session_id, dedupe_key) DO NOTHING" : ")")
+    + ") VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11::jsonb, $12, $13::jsonb, $14::jsonb, $15::jsonb, $16::jsonb"
+    + (keyed ? ", $17) ON CONFLICT (session_id, dedupe_key) DO NOTHING" : ")")
     + " RETURNING id",
     params,
   );
@@ -246,7 +250,7 @@ export async function submitSessionMessage(
   const {
     sessionId, userId, user, content, messageType, toolIds, pluginId,
     requestImage, requestResource, requestTimeout, workspaceId, mcpServers,
-    topology, sessionEnv, dedupeKey,
+    topology, toolsAllowlist, sessionEnv, dedupeKey,
   } = input;
   const mode = input.mode ?? "dispatch";
   // Caller bugs, not data, so they throw: an empty key would dedupe every
@@ -328,6 +332,7 @@ export async function submitSessionMessage(
         timeout: requestTimeout,
         sessionEnv,
         topology,
+        toolsAllowlist,
         dedupeKey,
       });
       await client.query("COMMIT");
@@ -394,7 +399,7 @@ export async function submitSessionMessage(
     {
       sessionId, userId, user,
       content, messageType, toolIds, pluginId,
-      requestImage, requestResource, requestTimeout, topology,
+      requestImage, requestResource, requestTimeout, topology, toolsAllowlist,
       workspaceId, mcpServers,
       capturedUserEnvSnapshot,
       capturedSessionEnv: sessionEnv,

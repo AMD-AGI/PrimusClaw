@@ -54,7 +54,7 @@ before(async () => {
   // The columns of a queued message that the harness's table leaves out (db.ts adds them with ALTERs): the queue path writes them all.
   for (const column of [
     "plugin_id INTEGER", "tool_ids JSONB DEFAULT '[]'::jsonb", "workspace_id TEXT", "platform_key TEXT", "llm_api_key TEXT", "credentials_blob TEXT",
-    "image TEXT", "resources JSONB", "timeout INTEGER", "user_env JSONB", "session_env JSONB", "topology JSONB",
+    "image TEXT", "resources JSONB", "timeout INTEGER", "user_env JSONB", "session_env JSONB", "topology JSONB", "tools_allowlist JSONB",
   ]) await h.sql(`ALTER TABLE claw_pending_messages ADD COLUMN IF NOT EXISTS ${column}`);
   const { sessionDispatchPorts } = await import("../src/sessions/dispatch.js");
   pristinePorts = { ...sessionDispatchPorts };

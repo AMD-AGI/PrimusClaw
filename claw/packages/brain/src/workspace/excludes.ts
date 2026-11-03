@@ -56,6 +56,13 @@
  * also where the rule for git's own transient files lives -- a bare `*.lock`
  * here would drop the user's `yarn.lock`.
  */
+/**
+ * Where a tool result too long for the conversation is kept whole, under
+ * /workspace (tools/router.ts spillToolResult). For the sandbox that produced
+ * it: potentially large, and re-created by running the command again.
+ */
+export const TOOL_RESULTS_DIR = ".tool-results";
+
 export const WORKSPACE_EXCLUDES = [
   // Dependency trees.
   "node_modules",
@@ -80,6 +87,7 @@ export const WORKSPACE_EXCLUDES = [
   // user with a file they cannot get back and cannot delete. Excluding it here
   // is what makes "no sandbox writes here" a fact rather than an assumption.
   ".transcripts",
+  TOOL_RESULTS_DIR,
   // Historical bootstrap artefact (~100MB) from Brain releases that wrote the
   // Hands binary into /workspace. Current Brain puts it under /tmp; kept
   // because old workspaces still have one.

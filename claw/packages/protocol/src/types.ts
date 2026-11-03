@@ -392,6 +392,12 @@ export interface ExecuteRequest {
    * Absent means an API that predates the field: the tool stays offered.
    */
   memory_enabled?: boolean;
+  /**
+   * Whether the API keeps skills the agent saves (CLAW_SKILL_EVOLUTION_ENABLED).
+   * Anything but `true` means Brain neither offers nor runs save_skill and the
+   * *_skill_file tools: the API would drop what they write.
+   */
+  skill_evolution_enabled?: boolean;
   system_append?: string;
   rules_text?: string;
   model?: string;

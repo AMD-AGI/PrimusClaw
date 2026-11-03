@@ -4,13 +4,24 @@
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
+import { minimatch } from "minimatch";
 import { guardPath } from "../../runtime/path-guard.js";
 import { WORKSPACE } from "../../config.js";
+
+/**
+ * Directories a recursive search does not enter: version-control internals,
+ * dependency trees and caches, which are large and never what was meant.
+ * Other dot-directories (.github, .claude, .vscode) hold real project files and
+ * are searched. A path given explicitly is searched whatever its name.
+ */
+export const GREP_SKIP_DIRS = new Set([
+  ".git", "node_modules", ".cache", ".venv", ".task-venv", "__pycache__", ".tool-results",
+]);
 
 function walkFiles(dir: string): string[] {
   const results: string[] = [];
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+    if (GREP_SKIP_DIRS.has(entry.name)) continue;
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) results.push(...walkFiles(full));
     else results.push(full);
@@ -22,6 +33,8 @@ const schema = {
   pattern: z.string().describe("Regex pattern to search for"),
   path: z.string().optional().describe("File or directory to search"),
   context: z.number().optional().describe("Lines of context around matches (default: 2)"),
+  case_sensitive: z.boolean().optional().describe("Match case exactly (default false: case-insensitive)"),
+  glob: z.string().optional().describe("Only search files whose path matches this glob, e.g. *.ts or src/**/*.py"),
 };
 
 // Defenses against ReDoS / runaway scans:
@@ -36,9 +49,9 @@ const TOTAL_TIMEOUT_MS = 30_000;
 
 export const grep = {
   name: "grep",
-  description: "Search file contents using regex pattern",
+  description: "Search file contents with a regex (case-insensitive unless case_sensitive). Searches dot-directories such as .github; skips .git, node_modules and caches.",
   zodSchema: schema,
-  execute: async (args: { pattern: string; path?: string; context?: number }) => {
+  execute: async (args: { pattern: string; path?: string; context?: number; case_sensitive?: boolean; glob?: string }) => {
     if (args.pattern.length > PATTERN_MAX_LEN) {
       return { content: [{ type: "text" as const, text: `Pattern too long (${args.pattern.length} > ${PATTERN_MAX_LEN})` }] };
     }
@@ -48,11 +61,16 @@ export const grep = {
     }
     const ctx = args.context ?? 2;
     let regex: RegExp;
-    try { regex = new RegExp(args.pattern, "i"); } catch (e: any) {
+    try { regex = new RegExp(args.pattern, args.case_sensitive ? "" : "i"); } catch (e: any) {
       return { content: [{ type: "text" as const, text: `Invalid regex: ${e.message}` }] };
     }
     const results: string[] = [];
-    const files = fs.statSync(target).isDirectory() ? walkFiles(target) : [target];
+    const isDir = fs.statSync(target).isDirectory();
+    const walked = isDir ? walkFiles(target) : [target];
+    // A pattern without a slash names a file, at any depth; with one it is a path under the searched directory.
+    const files = args.glob && isDir
+      ? walked.filter((f) => minimatch(path.relative(target, f), args.glob!, { matchBase: true, dot: true }))
+      : walked;
     const totalDeadline = Date.now() + TOTAL_TIMEOUT_MS;
     let timedOutFiles = 0;
     for (const file of files) {

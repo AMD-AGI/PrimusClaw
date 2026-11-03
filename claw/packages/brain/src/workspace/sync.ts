@@ -428,7 +428,7 @@ export async function syncWorkspace(
     const metaOut = await withHandsTimeout<string>(
       hands,
       "read",
-      { path: `${base}/meta.json` },
+      { path: `${base}/meta.json`, line_numbers: false },
       HANDS_CALL_DEFAULT_TIMEOUT_MS,
       opts.signal,
     );
