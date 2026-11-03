@@ -41,7 +41,9 @@ function imageSize(block: Record<string, unknown>): number {
  * message are counted alike. Changes `messages` in place; returns how many
  * images were dropped.
  */
-export function boundHistoryImages(messages: Message[], maxBase64 = HISTORY_IMAGE_MAX_BASE64): number {
+export function boundHistoryImages(
+  messages: Message[], maxBase64 = HISTORY_IMAGE_MAX_BASE64, replacement = IMAGE_DROPPED_TEXT,
+): number {
   let kept = 0;
   let dropped = 0;
   const visit = (blocks: Array<Record<string, unknown>>): void => {
@@ -54,7 +56,7 @@ export function boundHistoryImages(messages: Message[], maxBase64 = HISTORY_IMAG
         if (kept + size <= maxBase64) {
           kept += size;
         } else {
-          blocks[i] = { type: "text", text: IMAGE_DROPPED_TEXT };
+          blocks[i] = { type: "text", text: replacement };
           dropped++;
         }
       }
@@ -74,4 +76,28 @@ export function toolResultText(content: unknown, note = "[image]"): string {
   return content
     .map((b: Record<string, unknown>) => (b?.type === "text" ? String(b.text ?? "") : b?.type === "image" ? note : JSON.stringify(b)))
     .join("\n");
+}
+
+export const IMAGE_REFUSED_TEXT =
+  "[image not shown: the model could not process it; the file may be damaged or not really an image]";
+
+/**
+ * Does this error say the model refused an image in the request? An image that
+ * passed Hands' checks can still be one the API will not decode, and it stays in
+ * the history that is replayed every turn, so the refusal would repeat until the
+ * run ends. Matched on the wording the API answers with (measured through the
+ * live proxy: "Could not process image").
+ */
+export function looksLikeImageRejection(err: unknown): boolean {
+  let text: string;
+  try {
+    const e = err as Record<string, unknown> | null;
+    text = [
+      (e?.message as string) ?? "",
+      typeof e?.error === "object" ? JSON.stringify(e.error) : String(e?.error ?? ""),
+    ].join(" ");
+  } catch {
+    text = String(err);
+  }
+  return /could not process image|image (?:is )?(?:invalid|not valid|corrupt)|invalid image/i.test(text);
 }

@@ -16,7 +16,7 @@ import { agentLoop, type LoopOptions } from "../src/agent/agent-loop.js";
 import { toolImages } from "../src/clients/hands.js";
 import { toOpenAiMessages } from "../src/llm/openai-provider.js";
 import {
-  boundHistoryImages, IMAGE_DROPPED_TEXT, toolResultContent, toolResultText,
+  boundHistoryImages, IMAGE_DROPPED_TEXT, IMAGE_REFUSED_TEXT, looksLikeImageRejection, toolResultContent, toolResultText,
 } from "../src/llm/tool-images.js";
 
 const usage = { input_tokens: 10, output_tokens: 1, cache_create: 0, cache_read: 0 };
@@ -161,4 +161,50 @@ test("the loop keeps the history's images within the budget as images keep comin
   const older = blocksOf("t1")[1];
   assert.equal(older.type, "text", "the older image is no longer sent");
   assert.equal(older.text, IMAGE_DROPPED_TEXT, "it is named instead");
+});
+
+test("an image the model cannot process is dropped from the history and the turn is asked again", async () => {
+  const sent: Message[][] = [];
+  let refusals = 0;
+  const turns = [
+    { content: [{ type: "tool_use", id: "t1", name: "read", input: { path: "/workspace/bad.png" } }], stopReason: "tool_use" },
+    { content: [{ type: "text", text: "that file is not readable" }], stopReason: "end_turn" },
+  ];
+  const session: LlmSession = {
+    async streamTurn(messages) {
+      sent.push(structuredClone(messages));
+      const hasImage = JSON.stringify(messages).includes('"type":"image"');
+      if (hasImage) {
+        refusals++;
+        throw Object.assign(new Error("400 {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Could not process image\"}}"), { status: 400 });
+      }
+      return { ...turns.shift()!, usage, firstByteMs: 1, promptTokens: 10 } as unknown as LlmTurnResult;
+    },
+    async complete() { return "summary"; },
+  };
+  const router = {
+    route: async (_n: string, _i: unknown, _s: unknown, outcome?: { images?: unknown }) => {
+      if (outcome) outcome.images = [{ mediaType: "image/png", data: PNG_B64 }];
+      return "Image /workspace/bad.png";
+    },
+    setHands: () => {},
+  } as unknown as ToolRouter;
+  const result = await agentLoop([{ role: "user", content: "look" }], [] as ToolSchema[], {
+    model: "m", apiUrl: "http://localhost:0", apiKey: "k", maxTurns: 5, depth: 0, router,
+    sessionId: "s-img3", userId: "u", llmSession: session, onEvent: async () => {},
+  });
+  assert.equal(refusals, 1, "refused once, then asked without the image");
+  assert.equal(result.finalText, "that file is not readable");
+  const retried = sent[sent.length - 1];
+  const block = retried.flatMap((m) => (Array.isArray(m.content) ? m.content : []))
+    .find((b: Record<string, unknown>) => b.tool_use_id === "t1")!.content as Array<Record<string, unknown>>;
+  assert.equal(block[1].type, "text");
+  assert.equal(block[1].text, IMAGE_REFUSED_TEXT);
+});
+
+test("only an image refusal is read as one", () => {
+  assert.equal(looksLikeImageRejection(new Error("400 Could not process image")), true);
+  assert.equal(looksLikeImageRejection({ error: { error: { message: "Could not process image" } } }), true);
+  assert.equal(looksLikeImageRejection(new Error("400 prompt is too long")), false);
+  assert.equal(looksLikeImageRejection(new Error("overloaded")), false);
 });

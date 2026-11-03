@@ -19,7 +19,10 @@ import { downloadS3 } from "../src/tools/s3/download-s3.js";
 
 const PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC", "base64");
-const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]);
+// An 8x8 grey baseline JPEG, accepted by the model API through the live proxy (2026-11-03).
+const JPEG = Buffer.from("/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/wAALCAAIAAgBAREA/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/9oACAEBAAA/ACv/2Q==", "base64");
+// The first ten bytes of a JPEG: the signature is right, the file is not; the API answers "Could not process image".
+const TRUNCATED_JPEG = JPEG.subarray(0, 10);
 
 let dir: string;
 beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), "claw-hands-image-")); });
@@ -52,6 +55,17 @@ test("a file named as an image that is not one is refused, not sent as an image"
   assert.equal(res.isError, true);
   assert.equal(res.content.length, 1);
   assert.match(res.content[0].text!, /is not a PNG, JPEG, GIF or WebP image/);
+});
+
+test("a damaged image is refused, not sent as an image", async () => {
+  const brokenPng = Buffer.from(PNG);
+  brokenPng[brokenPng.length - 5] ^= 0xff;   // the IEND chunk's CRC
+  for (const [name, body] of [["cut.jpg", TRUNCATED_JPEG], ["crc.png", brokenPng], ["half.png", PNG.subarray(0, 40)]] as const) {
+    const res = await read.execute({ path: put(name, body) }) as { content: Block[]; isError?: boolean };
+    assert.equal(res.isError, true, name);
+    assert.match(res.content[0].text!, /is a damaged or incomplete (JPEG|PNG) file/, name);
+    assert.ok(!res.content.some((b) => b.type === "image"), name);
+  }
 });
 
 test("an image over the size bound is refused with what to do instead", async () => {

@@ -5,6 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { guardPath } from "../../runtime/path-guard.js";
+import { WORKSPACE } from "../../config.js";
 
 const downloadItem = z.object({
   local_path: z.string(),
@@ -24,6 +25,33 @@ function sizeOf(p: string): number | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * The first symbolic link on the way from the workspace root to `p`, if any.
+ *
+ * Hands writes as its own identity, which can differ from the one the model's
+ * commands run as, and a download into a sandbox that is already running (the
+ * uploads a reused sandbox is given) lands where links made there point. Only
+ * the part below the workspace root is checked: the root itself is the
+ * deployment's to place.
+ */
+function linkOnTheWay(p: string): string | null {
+  const root = path.resolve(WORKSPACE);
+  const rel = path.relative(root, p);
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return null;
+  let at = root;
+  for (const part of rel.split(path.sep)) {
+    at = path.join(at, part);
+    let st: fs.Stats;
+    try {
+      st = fs.lstatSync(at);
+    } catch {
+      return null;   // nothing there yet: the rest is created below, as directories
+    }
+    if (st.isSymbolicLink()) return at;
+  }
+  return null;
 }
 
 /**
@@ -51,8 +79,15 @@ export const downloadS3 = {
           continue;
         }
         const body = Buffer.from(await resp.arrayBuffer());
+        const link = linkOnTheWay(safePath);
+        if (link) {
+          failed.push({ path: file.local_path, status: 0, error: `not written: ${link} is a symbolic link` });
+          continue;
+        }
         fs.mkdirSync(path.dirname(safePath), { recursive: true });
-        fs.writeFileSync(safePath, body);
+        // O_NOFOLLOW: a link put in the file's place after the check is not followed either.
+        const fd = fs.openSync(safePath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW);
+        try { fs.writeFileSync(fd, body); } finally { fs.closeSync(fd); }
         ok.push(file.local_path);
       } catch (e: any) {
         failed.push({ path: file.local_path, status: 0, error: e?.message || String(e) });

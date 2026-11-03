@@ -30,7 +30,9 @@ import { safePreview } from "@claw/utils";
 import {
   HandsClient, isHandsNetworkError, isHandsToolTimeout, explainHandsError, handsNetworkErrorReason, type ToolImage,
 } from "../clients/hands.js";
-import { boundHistoryImages, toolResultContent, toolResultText } from "../llm/tool-images.js";
+import {
+  boundHistoryImages, IMAGE_REFUSED_TEXT, looksLikeImageRejection, toolResultContent, toolResultText,
+} from "../llm/tool-images.js";
 import { isSandboxTool } from "../tools/hands.js";
 import { LOAD_SKILL_TOOL, LOAD_SKILL_RESULT_MAX_CHARS } from "./skill-store.js";
 import { toolNotAllowedMessage, type ToolAllowlist } from "../tools/allowlist.js";
@@ -1805,6 +1807,7 @@ class AgentLoopRunner {
     // call: a second refusal after repairing is not something more repairing
     // can fix.
     let sanitizedRetryUsed = false;
+    let imagesDropped = false;
     for (let attempt = 0; ; attempt++) {
       try {
         // Filter accumulated [system-notice]: messages before each
@@ -1833,6 +1836,16 @@ class AgentLoopRunner {
             this.workingMessages.length = 0;
             this.workingMessages.push(...repaired.messages);
             // The refusal was ours to fix, not a transient: it spends no retry.
+            attempt--;
+            continue;
+          }
+        }
+        if (!imagesDropped && !this.signal?.aborted && looksLikeImageRejection(err)) {
+          imagesDropped = true;
+          // In place, like the repair above, so the checkpoint does not carry the image on.
+          const dropped = boundHistoryImages(this.workingMessages, 0, IMAGE_REFUSED_TEXT);
+          logger.warn({ err: errMsg.slice(0, 300), turn, sessionId: this.sessionId, dropped }, "agent-loop.image_rejected");
+          if (dropped > 0) {
             attempt--;
             continue;
           }
