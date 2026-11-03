@@ -224,6 +224,7 @@ next sandbox and will not be there when the session is rehydrated:
 |------|-------|
 | `.uploads/` | Files uploaded through the API; expired on their own schedule |
 | `.transcripts/` | Per-run transcripts Brain writes straight to object storage |
+| `.tool-results/` | Whole tool outputs too long for the conversation, kept for the agent to page through |
 | `.deliveries/` | Copies of the files the agent handed you with `deliver_file` |
 | `.hands-binary` | Bootstrap artefact from older releases |
 | `hands.log` | The agent runtime's own log, truncated at every launch |

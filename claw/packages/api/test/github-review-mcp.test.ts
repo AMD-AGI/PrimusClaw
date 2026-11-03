@@ -16,6 +16,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { registerGithubReviewRoutes } from "../src/github-review/mcp.js";
+import { HOLD_GUIDANCE } from "../src/github-review/risk.js";
 import { mintSessionToolToken } from "../src/github-review/token.js";
 import { HEAD } from "./support/fake-github.js";
 import { PR, SECRET, TOKEN, closeShared, credential, reviewEnv, type ReviewEnv } from "./support/review-env.js";
@@ -172,6 +173,11 @@ describe("B a tool call", () => {
       assert.ok(tool && "risk_judgement" in ((tool.inputSchema as { properties?: Record<string, unknown> }).properties ?? {}), name);
     }
     assert.ok(!("risk_judgement" in ((tools.find((t) => t.name === "gh_pr_get")?.inputSchema as { properties?: Record<string, unknown> }).properties ?? {})), "gh_pr_get has nothing to add to");
+    // The hold guidance reaches the model with the tools themselves, on every turn, wherever it judges.
+    for (const name of ["gh_pr_risk", "gh_review_submit", "gh_pr_merge"]) {
+      const judgement = ((tools.find((t) => t.name === name)?.inputSchema as { properties?: Record<string, { description?: string }> }).properties ?? {}).risk_judgement;
+      assert.ok(judgement?.description?.includes(HOLD_GUIDANCE), name);
+    }
     const bad = await c.callTool({ name: "gh_pr_merge", arguments: { pr: PR, head_sha: HEAD, risk_judgement: { level: "medium", reason: "x" } } }) as { isError?: boolean };
     assert.equal(bad.isError, true);
     assert.equal(e.gh.calls.length, 0, "the schema stopped it before anything was asked of GitHub");
@@ -411,11 +417,69 @@ describe("C3 who may answer for the acting user", () => {
   });
 });
 
+describe("S the caller's own review mode", () => {
+  const http = async (user: string | null, method: string, body?: unknown, signedInWith?: string) => {
+    const r = await fetch(`${base}/v1/github-review/settings`, { method, headers: { ...(user ? { "x-test-user": user } : {}), ...(signedInWith ? { "x-test-method": signedInWith } : {}), ...(body === undefined ? {} : { "content-type": "application/json" }) }, body: body === undefined ? undefined : JSON.stringify(body) });
+    return { status: r.status, body: (await r.json().catch(() => null)) as any };
+  };
+  beforeEach(async () => { await boot(); });
+
+  test("S1 with no row it is high_risk_confirm; the person sets their own, signed in, and reads it back; nobody else's changes", async () => {
+    const first = await http("u-bob", "GET");
+    assert.equal(first.status, 200);
+    assert.deepEqual(first.body.data, { review_mode: "high_risk_confirm", updated_at: null, review_modes: ["high_risk_confirm", "fully_auto"] });
+    const set = await http("u-bob", "PUT", { review_mode: "fully_auto" });
+    assert.equal(set.status, 200, JSON.stringify(set.body));
+    assert.equal(set.body.data.review_mode, "fully_auto");
+    assert.equal((await http("u-bob", "GET")).body.data.review_mode, "fully_auto");
+    assert.equal((await http("u-alice", "GET")).body.data.review_mode, "high_risk_confirm", "a setting is the person's own");
+    // There is no user in the request: what alice sets is alice's, and bob's stays.
+    assert.equal((await http("u-alice", "PUT", { review_mode: "high_risk_confirm", user_id: "u-bob" })).status, 200);
+    assert.equal((await http("u-bob", "GET")).body.data.review_mode, "fully_auto");
+    assert.equal((await http("u-bob", "PUT", { review_mode: "high_risk_confirm" })).body.data.review_mode, "high_risk_confirm");
+    assert.deepEqual((await e.sql("SELECT user_id, review_mode FROM claw_github_review_settings ORDER BY user_id")).map((r) => [r.user_id, r.review_mode]),
+      [["u-alice", "high_risk_confirm"], ["u-bob", "high_risk_confirm"]]);
+  });
+
+  test("S2 a key a sandbox holds, a cookie and the like cannot set it, nor can no one; a value that is not a mode is 400", async () => {
+    for (const how of ["api_key", "x_api_key", "query_token", "connector_token", "cookie", "none"]) {
+      const r = await http("u-bob", "PUT", { review_mode: "fully_auto" }, how);
+      assert.deepEqual([r.status, r.body.error], [403, "interactive_sign_in_required"], how);
+    }
+    assert.equal((await http(null, "PUT", { review_mode: "fully_auto" })).status, 401);
+    assert.equal((await http(null, "GET")).status, 401);
+    for (const bad of ["FULLY_AUTO", "off", true, null]) assert.equal((await http("u-bob", "PUT", { review_mode: bad })).status, 400, String(bad));
+    assert.deepEqual(await e.sql("SELECT * FROM claw_github_review_settings"), []);
+  });
+
+  test("S3 what the person set is what their account's writes run under, whoever asked: fully_auto merges a workflow change the default holds", async () => {
+    e.identity.answer = async () => credential({ delegation: true });
+    e.gh.files = [{ filename: ".github/workflows/ci.yml", status: "modified", additions: 1, deletions: 0, patch: "@@ -1 +1,2 @@\n a\n+b" }];
+    e.gh.onReview = (r) => { if (r.event === "APPROVE") e.gh.graphql.mergeStateStatus = "CLEAN"; };
+    const judged = { level: "low", reason: "a test step renamed" };
+    let c = await connect(token());
+    assert.equal((await call(c, "gh_pr_merge", { pr: PR, head_sha: HEAD, risk_judgement: judged })).body.status, "confirmation_required");
+    await c.close();
+    await e.sql("DELETE FROM claw_github_confirmations");
+    assert.equal((await http("u-alice", "PUT", { review_mode: "fully_auto" })).status, 200);
+    c = await connect(token());
+    assert.equal((await call(c, "gh_pr_merge", { pr: PR, head_sha: HEAD, risk_judgement: judged })).body.status, "confirmation_required", "the requester's own setting is not the acting user's");
+    await c.close();
+    await e.sql("DELETE FROM claw_github_confirmations");
+    assert.equal((await http("u-bob", "PUT", { review_mode: "fully_auto" })).status, 200);
+    c = await connect(token());
+    const merged = await call(c, "gh_pr_merge", { pr: PR, head_sha: HEAD, risk_judgement: judged });
+    await c.close();
+    assert.equal(merged.body.status, "merged", merged.text);
+    assert.equal(merged.body.review_mode_note, "made under bob's fully automatic setting: nobody was asked to confirm it");
+  });
+});
+
 describe("D with the feature off nothing exists", () => {
   test("D1 no route is registered, whatever the caller", async () => {
     e = await reviewEnv();
     await boot({ enabled: false });
-    for (const [method, path] of [["POST", "/v1/internal/github-review/mcp"], ["GET", "/v1/github-review/confirmations"], ["POST", "/v1/github-review/confirmations/00000000-0000-4000-8000-000000000000/decision"]] as const) {
+    for (const [method, path] of [["POST", "/v1/internal/github-review/mcp"], ["GET", "/v1/github-review/confirmations"], ["GET", "/v1/github-review/settings"], ["POST", "/v1/github-review/confirmations/00000000-0000-4000-8000-000000000000/decision"]] as const) {
       const r = await fetch(base + path, { method, headers: { "x-test-user": "u-bob", "content-type": "application/json" }, body: method === "POST" ? "{}" : undefined });
       assert.equal(r.status, 404, `${method} ${path}`);
     }

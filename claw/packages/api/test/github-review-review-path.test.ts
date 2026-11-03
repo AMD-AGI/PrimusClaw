@@ -12,7 +12,7 @@ import test, { after } from "node:test";
 import { GithubReview } from "../src/github-review/service.js";
 import { chooseReviewPath, reviewPathAdvice } from "../src/github-review/review-path.js";
 import { readGithubReviewSettings } from "../src/github-review/settings.js";
-import { PR, SECRET, closeShared, credential, reviewEnv } from "./support/review-env.js";
+import { PR, SECRET, closeShared, credential, readSection, reviewEnv } from "./support/review-env.js";
 
 after(closeShared);
 
@@ -89,7 +89,7 @@ test("gh_pr_get on a small change chooses the diff, says so to the model, logs i
   assert.equal(b.review_path.max_files_for_diff_only, 15);
   // The diff, the files and the metadata are all in the result: that is what makes the fast path possible.
   assert.match(b.untrusted.diff, /src\/app\.ts/);
-  assert.equal(b.files.length, 1);
+  assert.equal(b.untrusted.files.trim().split("\n").length, 1);
   assert.equal(b.pull_request.head_sha.length, 40);
   const line = rec.lines.find((l) => l.message === "github_review.path_chosen");
   assert.equal(line?.fields.review_path, "api_diff");
@@ -134,7 +134,7 @@ test("only the AGENTS.md of a repository is context, not a review skill: it does
   e.gh.contents["AGENTS.md"] = "Build with make.";
   const b = (await service.getPr(e.actor, { pr: PR })).body as any;
   assert.equal(b.review_path.path, "api_diff");
-  assert.match(b.review_instructions, /Build with make\./);
+  assert.match((await readSection(service, e.actor, PR, "instructions")).text, /Build with make\./);
 });
 
 test("a tool that does not choose a path leaves the audit columns empty", async () => {

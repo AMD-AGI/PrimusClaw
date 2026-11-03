@@ -1664,6 +1664,12 @@ export const WEB_SEARCH_MAX_USES = envInt("WEB_SEARCH_MAX_USES", 8);
 export const TAVILY_API_KEY = env("TAVILY_API_KEY");
 export const BRAVE_API_KEY = env("BRAVE_API_KEY");
 export const SERPER_API_KEY = env("SERPER_API_KEY");
+// The search key is the Brain's alone: read once and taken out of the
+// environment for the reason BRAIN_CHECKPOINT_KEY is, so no `<NAME>`
+// placeholder in an MCP config can expand it and no child process inherits it.
+delete process.env.TAVILY_API_KEY;
+delete process.env.BRAVE_API_KEY;
+delete process.env.SERPER_API_KEY;
 export const WEB_SEARCH_MODEL = env("WEB_SEARCH_MODEL", "");
 export const WEB_SEARCH_FORCE_TOOL = envBool("WEB_SEARCH_FORCE_TOOL", true);
 export const WEB_SEARCH_DOMAIN_DENYLIST = env("WEB_SEARCH_DOMAIN_DENYLIST", "");

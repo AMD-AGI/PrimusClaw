@@ -72,7 +72,8 @@ before(async () => {
     ADD COLUMN timeout INTEGER,
     ADD COLUMN user_env JSONB,
     ADD COLUMN session_env JSONB,
-    ADD COLUMN topology JSONB`);
+    ADD COLUMN topology JSONB,
+    ADD COLUMN tools_allowlist JSONB`);
   // Read by the skill-feedback step the control run reaches.
   await h.sql(`CREATE TABLE claw_skills (id SERIAL PRIMARY KEY, user_id TEXT, skill_name TEXT,
     status TEXT DEFAULT 'active', version INT DEFAULT 1, deleted_at TIMESTAMPTZ)`);

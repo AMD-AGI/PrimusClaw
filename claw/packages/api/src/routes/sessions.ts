@@ -19,7 +19,7 @@ import {
   forceIdleAfterInterrupt, releaseSessionGateForTurn, stopSessionRuns, takeSessionGate,
 } from "../tasks/chat-run.js";
 import { kv, nc, sc } from "../infra/nats.js";
-import { buildDecisionMessage } from "../sessions/decision-message.js";
+import { buildAnswerMessage, buildDecisionMessage } from "../sessions/decision-message.js";
 import { getUser } from "../auth/middleware.js";
 import { getAuthMethod } from "../auth/request-credential.js";
 import {
@@ -56,6 +56,7 @@ import { ZipArchive } from "archiver";
 import { Readable, PassThrough } from "node:stream";
 import pino from "pino"
 import { handsSessionKey, parseSessionRepo, putTerminalHold } from "@claw/protocol";
+import { toolsAllowlistProblem } from "../tasks/dags/admission.js";
 
 const logger = pino({ name: "sessions" });
 
@@ -1800,6 +1801,12 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     }
     const sessionEnv = sessionEnvResult.env;
 
+    // The tools this turn may use, enforced by Brain: exact names, or a prefix
+    // ending in `*` such as `mcp__<server>__*`. Absent or empty is no restriction.
+    const allowlistProblem = toolsAllowlistProblem(body.tools_allowlist);
+    if (allowlistProblem) return reply.status(400).send({ ok: false, error: allowlistProblem });
+    const toolsAllowlist = body.tools_allowlist as string[] | undefined;
+
     // V1-compatible control-channel messages share the /messages endpoint.
     // Handle them before the "content required" check that only applies to text.
     // Interrupt mutates another execution, so it follows the same owner/full
@@ -1845,9 +1852,10 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       return { ok: true, session_id: sessionId, accepted: true, interrupted: true };
     }
 
-    if (messageType === "decision") {
+    if (messageType === "decision" || messageType === "answer") {
       // The answer to a pending tool-approval request (Brain's approval gate,
-      // agent/hitl.ts). Only a person who may write to the session can give it.
+      // agent/hitl.ts) or to a question the model asked (ask_user_question).
+      // Only a person who may write to the session can give it.
       const row = (await db.query(
         "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
         [sessionId],
@@ -1859,6 +1867,12 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       // In a session that acts as a user an approval is the person's say, not something the key a sandbox holds may give itself.
       const unattended = await actingTurnRefusalFor(req, sessionId);
       if (unattended) return reply.status(403).send({ ok: false, error: unattended });
+      if (messageType === "answer") {
+        const built = buildAnswerMessage(sessionId, userId, body);
+        if (!built.ok) return reply.status(400).send({ ok: false, error: built.error });
+        nc.publish(`decision.${sessionId}`, sc.encode(JSON.stringify(built.message)));
+        return { ok: true, session_id: sessionId, action_id: built.message.action_id };
+      }
       const built = buildDecisionMessage(sessionId, userId, body);
       if (!built.ok) return reply.status(400).send({ ok: false, error: built.error });
       nc.publish(`decision.${sessionId}`, sc.encode(JSON.stringify(built.message)));
@@ -1875,7 +1889,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     const submitted = await submitSessionMessage({
       sessionId, userId, user,
       content, messageType, toolIds, pluginId,
-      requestImage, requestResource, requestTimeout, topology,
+      requestImage, requestResource, requestTimeout, topology, toolsAllowlist,
       workspaceId, mcpServers, sessionEnv,
       isCancelled: () => isClientGone(req),
       // A turn in a session that acts as a user is the person's say, like creating it: the key a sandbox holds is the owner's own and

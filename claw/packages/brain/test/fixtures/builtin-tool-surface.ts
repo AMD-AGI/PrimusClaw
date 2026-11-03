@@ -7,7 +7,7 @@
  *
  * Shared by the two switch-state test files because the surface differs between
  * them only in `bash`'s property set and the three background names; writing the
- * other eighteen rows twice is how the two copies come to disagree.
+ * other rows twice is how the two copies come to disagree.
  *
  * Description prose is deliberately absent: a whole-description assertion turns
  * every wording improvement into a failure and pins nothing the field sets do
@@ -31,17 +31,19 @@ interface Expected {
 }
 
 /**
- * The eighteen names published in both switch states, in publication order.
+ * The fourteen names published in both switch states, in publication order.
  * `a2a_call` is not among them: it is published only while A2A_CLIENT_ENABLED is on,
- * and its own surface is pinned in a2a-client-tool.test.ts.
+ * and its own surface is pinned in a2a-client-tool.test.ts. Nor are the four
+ * skill-writing tools: a router publishes them only when the API says skill
+ * self-evolution is on (skill-evolution-off.test.ts); their rows are pinned below.
  */
 export const CLOSED_STATE_NAMES = [
-  "save_memory", "save_skill", "add_skill_file", "update_skill_file", "remove_skill_file",
+  "save_memory",
   "bash", "read", "write", "edit", "glob", "grep", "ls", "notebook_edit", "multi_edit",
   "todo_write", "deliver_file", "exit_plan_mode", "task",
 ];
 
-/** The same eighteen, with the background trio spliced in after `bash`. */
+/** The same fourteen, with the background trio spliced in after `bash`. */
 export const OPEN_STATE_NAMES = CLOSED_STATE_NAMES.flatMap((name) =>
   name === "bash" ? [name, "bash_output", "kill_shell", "wait"] : [name],
 );
@@ -77,11 +79,11 @@ const SHARED: Record<string, Expected> = {
   },
   write: { properties: ["path", "contents"], required: ["path", "contents"] },
   edit: {
-    properties: ["path", "old_string", "new_string"],
+    properties: ["path", "old_string", "new_string", "replace_all"],
     required: ["path", "old_string", "new_string"],
   },
   glob: { properties: ["pattern", "directory"], required: ["pattern"] },
-  grep: { properties: ["pattern", "path", "context"], required: ["pattern"] },
+  grep: { properties: ["pattern", "path", "context", "case_sensitive", "glob"], required: ["pattern"] },
   ls: { properties: ["path"] },
   notebook_edit: {
     properties: ["path", "cell_index", "old_string", "new_string"],

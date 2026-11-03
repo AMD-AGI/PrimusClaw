@@ -95,8 +95,11 @@ test("the disabled refusal is a failure, not a call that did the work", async ()
  */
 
 /** A router with no sandbox and no web services: only its own branches answer. */
+/** Skill self-evolution on, so the skill tools reach the branches these tests are about. */
 function bareRouter(): ToolRouter {
-  return new ToolRouter(null);
+  const router = new ToolRouter(null);
+  router.skillEvolutionEnabled = true;
+  return router;
 }
 
 /** What `route()` filled in for one call it answered itself. */

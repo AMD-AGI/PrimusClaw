@@ -19,6 +19,7 @@ export * from "./sandbox/shell-record.js";
 export * from "./sandbox/shell-classify.js";
 export * from "./sandbox/hands-route.js";
 export * from "./sandbox/terminal-hold.js";
+export * from "./workspace-excludes.js";
 // The one definition of what a published background-work verdict is and when
 // it may still be believed. Exported from the package because the writer lives
 // in Brain and one of the readers lives in the API, and a second copy of these
