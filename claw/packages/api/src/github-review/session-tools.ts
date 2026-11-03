@@ -48,6 +48,23 @@ export async function sessionWithholdsSandboxKeys(sessionId: string, q: Paramete
 }
 
 /**
+ * Whether the requester's long-term memory stays out of this session: their entries and profile are not put in the prompt, `save_memory`
+ * is not offered (Brain, on the same mark), and nothing is saved or extracted from the session's conversation. The same sessions that
+ * withhold their sandbox's keys, for the same reason: the model of such a session reads what strangers wrote, so memory going in would be
+ * quoted into a review comment, and memory going out would be what a stranger's text makes every later session of the requester believe.
+ * A session that cannot be read counts as one that withholds: memory is simply not used for it, where `sessionWithholdsSandboxKeys`
+ * refuses the work, because a failed read here must not end a turn or a completion.
+ */
+export async function sessionWithholdsMemory(sessionId: string, q: Parameters<typeof storedActingAs>[1] = db): Promise<boolean> {
+  try {
+    return await sessionWithholdsSandboxKeys(sessionId, q);
+  } catch (err) {
+    logger.error({ sessionId, code: (err as { code?: string })?.code ?? "" }, "github_review.memory_gate_unreadable_memory_not_used");
+    return true;
+  }
+}
+
+/**
  * The owner's stored variables (the env vault: personal tokens for GitHub, Hugging Face, W&B and the like) for a turn in this session, or
  * none for a session that withholds its sandbox's keys. The vault is the other half of what a sandbox's environment holds of its owner:
  * the model of such a session reads what strangers wrote and can print whatever the environment holds, so these are not sent either. Not

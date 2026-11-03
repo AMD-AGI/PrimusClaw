@@ -8,7 +8,9 @@ import (
 	"crypto/subtle"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -177,6 +179,51 @@ func (s *Service) RotateToken(ctx context.Context, grantID, sandboxID, hash stri
 		g.Status.Sandboxes[idx] = ref
 		return nil
 	})
+}
+
+// endReasonLimit caps the end reason stored on each ref of the grant status.
+const endReasonLimit = 256
+
+// createFailedReason is the end reason of a failed create that names no cause.
+const createFailedReason = "create_failed"
+
+// FailSandbox ends a sandbox whose create failed with reason.
+// A ref already ended as a create failure takes reason, since the create call knows the cause.
+func (s *Service) FailSandbox(ctx context.Context, grantID, sandboxID, reason string) error {
+	return s.setStatus(ctx, grantID, func(g *runtimev1alpha1.SandboxGrant) error {
+		ref, idx := findSandbox(g, sandboxID)
+		if idx >= 0 && ref.State == runtimev1alpha1.SandboxEnded {
+			if isCreateFailure(ref.EndReason) {
+				g.Status.Sandboxes[idx].EndReason = capReason(reason)
+			}
+			return nil
+		}
+		now := s.now()
+		if err := endOne(g, sandboxID, reason, now); err != nil {
+			return err
+		}
+		compactEndedRefs(g, now)
+		return nil
+	})
+}
+
+// isCreateFailure reports whether an end reason records a failed create.
+func isCreateFailure(reason string) bool {
+	return reason == createFailedReason ||
+		strings.HasPrefix(reason, "sandbox_create_failed") ||
+		strings.HasPrefix(reason, "pending_timeout")
+}
+
+// capReason cuts reason to endReasonLimit bytes without splitting a character.
+func capReason(reason string) string {
+	if len(reason) <= endReasonLimit {
+		return reason
+	}
+	cut := endReasonLimit
+	for cut > 0 && !utf8.RuneStart(reason[cut]) {
+		cut--
+	}
+	return reason[:cut]
 }
 
 // EndSandbox stops charging a sandbox and keeps the ref for idempotency.
@@ -492,7 +539,7 @@ func endOne(g *runtimev1alpha1.SandboxGrant, sandboxID, reason string, now time.
 		}
 	}
 	ref.State = runtimev1alpha1.SandboxEnded
-	ref.EndReason = reason
+	ref.EndReason = capReason(reason)
 	ref.EndedAt = metav1.NewTime(now)
 	ref.AccessTokenHash = ""
 	ref.AccessTokenHashes = nil
