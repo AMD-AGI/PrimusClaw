@@ -43,6 +43,8 @@ function stubLockPool(): void {
     return {
       async query(sql: string, params: unknown[] = []) {
         const id = params[0] as number;
+        // The queue drain's claim on the session (`drain-claim.ts`), not the completion's lock.
+        if (sql.includes("claw_pending_drain")) return { rows: [{}] };
         if (sql.includes("pg_try_advisory_lock")) {
           if (held.has(id)) return { rows: [{ ok: false }] };
           held.add(id); owned.add(id);

@@ -62,9 +62,13 @@ interface LockHandout {
   lockId?: number;
   /** Whether it was handed back with the destroy flag. */
   destroyed: boolean;
+  /** A drain of the session's queue holding its claim (`drain-claim.ts`), not the completion's lock. */
+  drainClaim?: boolean;
 }
 
 let handouts: LockHandout[] = [];
+/** The handouts that held the completion's lock. */
+const completionHandouts = () => handouts.filter((h) => !h.drainClaim);
 /** Terminate the next checked-out backend the moment it has taken the lock. */
 let dropOnAcquire = false;
 /** Whether a second connection could take the lock while the body still ran. */
@@ -94,6 +98,7 @@ function realLockPool(): void {
     (client as unknown as { query: (sql: string, params?: unknown[]) => Promise<pg.QueryResult> })
       .query = async (sql: string, params: unknown[] = []) => {
         const r = await send(sql, params as never[]);
+        if (sql.includes("claw_pending_drain")) handout.drainClaim = true;
         if (sql.includes("pg_try_advisory_lock") && r.rows[0]?.ok === true) {
           handout.lockId = Number(params[0]);
           if (dropOnAcquire) {
@@ -218,8 +223,8 @@ test("a completion that lost its lock leaves processed_at NULL, so the redeliver
     + "so a second holder could have run handleComplete for the same event");
   assert.deepEqual(lost, { acks: 0, naks: [10_000] },
     "a pass that was not exclusive has to be naked, not acked");
-  assert.equal(handouts.length, 1);
-  assert.equal(handouts[0].destroyed, true, "a dropped session is not handed to the next caller");
+  assert.equal(completionHandouts().length, 1);
+  assert.equal(completionHandouts()[0].destroyed, true, "a dropped session is not handed to the next caller");
   assert.deepEqual(completionWork(), [],
     "a loss that is already recorded when the body reaches its writes stops them outright, "
     + "so the duplicate handleComplete this repair exists to redo is never run in the first "
@@ -238,7 +243,7 @@ test("a completion that lost its lock leaves processed_at NULL, so the redeliver
   const redelivered = await deliver(completion(), 1);
 
   assert.deepEqual(redelivered, { acks: 1, naks: [] });
-  assert.equal(handouts.length, 2, "the redelivery took the lock again");
+  assert.equal(completionHandouts().length, 2, "the redelivery took the lock again");
   assert.ok(
     completionWork().length > 0,
     "the redelivery acked without redoing the completion -- the only repair that exists "
@@ -254,8 +259,8 @@ test("an ordinary completion under a lock that is never lost behaves exactly as 
   const outcome = await deliver(completion(), 7);
 
   assert.deepEqual(outcome, { acks: 1, naks: [] });
-  assert.equal(handouts.length, 1);
-  assert.equal(handouts[0].destroyed, false, "a clean hold costs no connection");
+  assert.equal(completionHandouts().length, 1);
+  assert.equal(completionHandouts()[0].destroyed, false, "a clean hold costs no connection");
   assert.notEqual(await processedAt(7), null, "a completion that ran alone is marked done");
   assert.ok(completionWork().length > 0);
 
