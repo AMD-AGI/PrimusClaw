@@ -35,6 +35,7 @@
 
 import { applyAppMcpToTask } from "../sessions/app-mcp.js";
 import { applySessionRoleToTask } from "../assistant/role-profile.js";
+import { applyTriggerToolsToTask } from "../triggers/mcp.js";
 import { doorbellDedupId, taskSubject, type ExecuteRequest } from "@claw/protocol";
 import pino from "pino";
 
@@ -705,6 +706,7 @@ export async function dispatchPendingMessage(
   task.files_workspace_id = filesWorkspaceId;
   task.files_workspace_required = true;
   // Here and not beside `applyAppMcpToTask` above: the turn's token names the run, which is opened only now.
+  await applyTriggerToolsToTask(task, sessionId);
   await applySessionRoleToTask(task, sessionId);
 
   let publishAttempted = false;

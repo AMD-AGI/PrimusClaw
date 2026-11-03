@@ -17,7 +17,7 @@ import {
 import { HandsClient } from "../clients/hands.js";
 import { isSessionDeletedLocally } from "../infra/deleted-sessions.js";
 import { s3Excludes, findExcludeArgs } from "./excludes.js";
-import { TRUNCATED_FOOTER, planUploadDelta } from "./sync-delta.js";
+import { TRUNCATED_FOOTER, invalidateSyncManifest, planUploadDelta, seedSyncManifest } from "./sync-delta.js";
 import {
   configuredGitLimits,
   enforceListedGit,
@@ -362,45 +362,61 @@ const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, m
  * It spares those objects and nothing else, so one repository nobody can measure
  * does not freeze the prune of every other file.
  *
- * @returns how many objects were removed.
+ * `recorded` is the sync manifest's account of what the prefix holds, when it
+ * has one it can stand behind (`UploadDelta.recorded`). Given it, the objects to
+ * delete are named from it and the prefix is not listed: a listing costs a round
+ * trip per thousand objects and, on the MinIO this runs against, about 30 ms an
+ * object, so it was most of the time a finished turn kept its session busy.
+ *
+ * `complete` is whether the prefix is left holding nothing a later prune would
+ * have to find by listing: nothing stale deferred or failed, nothing spared for a
+ * repository that could not be measured. Only then may the next sync name its
+ * deletions from the record instead.
  */
 async function pruneRemovedObjects(
   sessionId: string,
   s3Prefix: string,
   listing: WorkspaceListing,
   exempt: (rel: string) => boolean = () => false,
-): Promise<number> {
+  recorded: ReadonlySet<string> | null = null,
+): Promise<{ deleted: number; complete: boolean }> {
   if (!listing.trusted) {
     logger.warn(
       { sessionId, s3Prefix, reason: listing.reason, listed: listing.files.length },
       "s3.prune.skipped_untrusted_listing",
     );
-    return 0;
+    return { deleted: 0, complete: false };
   }
   const expectedKeys = new Set(listing.files.map((f) => localPathToS3Key(f, s3Prefix)));
   const client = getS3Client();
   const stale: string[] = [];
+  let spared = 0;
   let total = 0;
-  let token: string | undefined;
-  do {
-    const page = await client.send(new ListObjectsV2Command({
-      Bucket: S3_BUCKET,
-      Prefix: s3Prefix,
-      ContinuationToken: token,
-    }));
-    for (const obj of page.Contents ?? []) {
-      const key = obj.Key;
-      if (!key) continue;
-      total++;
-      if (expectedKeys.has(key)) continue;
-      if (isPruneExempt(key.slice(s3Prefix.length))) continue;
-      if (exempt(key.slice(s3Prefix.length))) continue;
-      stale.push(key);
-    }
-    token = page.IsTruncated ? page.NextContinuationToken : undefined;
-  } while (token);
+  const consider = (key: string): void => {
+    total++;
+    if (expectedKeys.has(key)) return;
+    if (isPruneExempt(key.slice(s3Prefix.length))) return;
+    if (exempt(key.slice(s3Prefix.length))) { spared++; return; }
+    stale.push(key);
+  };
+  if (recorded) {
+    for (const rel of recorded) consider(`${s3Prefix}${rel}`);
+  } else {
+    let token: string | undefined;
+    do {
+      const page = await client.send(new ListObjectsV2Command({
+        Bucket: S3_BUCKET,
+        Prefix: s3Prefix,
+        ContinuationToken: token,
+      }));
+      for (const obj of page.Contents ?? []) {
+        if (obj.Key) consider(obj.Key);
+      }
+      token = page.IsTruncated ? page.NextContinuationToken : undefined;
+    } while (token);
+  }
 
-  if (stale.length === 0) return 0;
+  if (stale.length === 0) return { deleted: 0, complete: spared === 0 };
 
   const { doomed, deferred } = prunePlan(stale);
   if (deferred > 0) {
@@ -442,8 +458,8 @@ async function pruneRemovedObjects(
       }
     }
   }
-  logger.info({ sessionId, s3Prefix, deleted, total }, "s3.pruned");
-  return deleted;
+  logger.info({ sessionId, s3Prefix, deleted, total, listed: !recorded }, "s3.pruned");
+  return { deleted, complete: spared === 0 && deferred === 0 && deleted === stale.length };
 }
 
 /**
@@ -767,6 +783,11 @@ export async function syncWorkspaceToS3(
   // prune below is exactly what it was. Only for a listing that proved itself: a
   // doubtful one is uploaded whole, as before, and decides nothing about what is
   // already in S3.
+  //
+  // A doubtful listing also takes the record away before anything is uploaded:
+  // the upload puts objects under the prefix the record does not name, and a
+  // later prune by that record would never delete them.
+  if (!listing.trusted) await invalidateSyncManifest(hands, s3Prefix);
   const delta = listing.trusted
     ? await planUploadDelta(hands, s3Prefix, files, excludeArgs)
     : null;
@@ -780,17 +801,20 @@ export async function syncWorkspaceToS3(
   const finishSynced = async (round: number): Promise<SyncWorkspaceResult> => {
     // Only once every file is up. A prune after a partial upload would be
     // deleting the old copy of something whose new copy did not arrive.
-    const pruned = await pruneRemovedObjects(sessionId, s3Prefix, listing, pruneExempt)
+    const prune = await pruneRemovedObjects(sessionId, s3Prefix, listing, pruneExempt, delta?.recorded ?? null)
       .catch((e: unknown) => {
       logger.warn(
         { sessionId, err: (e as { message?: string })?.message ?? String(e) },
         "s3.prune.failed",
       );
-      return 0;
+      return { deleted: 0, complete: false };
     });
+    const pruned = prune.deleted;
     // After the prune, so a sync that dies in it leaves no manifest rather than
-    // one claiming a state S3 was not left in.
-    await delta?.commit();
+    // one claiming a state S3 was not left in. A repository left out of the
+    // upload keeps objects the record does not name, so its sync cannot vouch for
+    // the prefix either.
+    await delta?.commit(prune.complete && files.length === listing.files.length);
     logger.info(
       { sessionId, round, totalUploaded: uploaded, unchanged, total: files.length, pruned, s3Prefix },
       "s3.synced",
@@ -905,9 +929,11 @@ export function isRestoreSkipped(rel: string): boolean {
 
 /** List all object keys under prefix, paginated, minus everything that belongs
  *  to another lifecycle. */
-async function listCurrentWorkspaceKeys(s3Prefix: string): Promise<string[]> {
+/** The keys to restore, and every path under the prefix a prune could delete. */
+async function listCurrentWorkspaceKeys(s3Prefix: string): Promise<{ keys: string[]; prunable: string[] }> {
   const s3 = getS3Client();
   const keys: string[] = [];
+  const prunable: string[] = [];
   let continuationToken: string | undefined;
   do {
     const resp = await s3.send(new ListObjectsV2Command({
@@ -917,12 +943,13 @@ async function listCurrentWorkspaceKeys(s3Prefix: string): Promise<string[]> {
       const k = obj.Key;
       if (!k) continue;
       const rel = k.slice(s3Prefix.length);
+      if (!isPruneExempt(rel)) prunable.push(rel);
       if (isRestoreSkipped(rel)) continue;
       keys.push(k);
     }
     continuationToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
   } while (continuationToken);
-  return keys;
+  return { keys, prunable };
 }
 
 async function buildDownloadList(keys: string[], s3Prefix: string) {
@@ -966,9 +993,14 @@ export async function syncWorkspaceFromS3(
 ): Promise<number> {
   const s3Prefix = options?.s3PrefixOverride
     ?? `users/${userId}/sessions/${sessionId}/`;
-  const keys = await listCurrentWorkspaceKeys(s3Prefix);
+  const listedAt = Date.now();
+  const { keys, prunable } = await listCurrentWorkspaceKeys(s3Prefix);
+  // Only once the workspace holds everything the listing found: then the
+  // listing is also what the next sync's prune would have to list again.
+  const seed = (): Promise<void> => seedSyncManifest(hands, s3Prefix, prunable, listedAt);
   if (!keys.length) {
     logger.info({ sessionId, s3Prefix }, "s3.restore.empty");
+    await seed();
     return 0;
   }
 
@@ -987,6 +1019,7 @@ export async function syncWorkspaceFromS3(
     lastFailures = result.failed;
     if (result.failed.length === 0) {
       await putBackGitDirs();
+      await seed();
       logger.info({ sessionId, round, totalDownloaded: downloaded, total: keys.length, s3Prefix }, "s3.restored");
       return downloaded;
     }
@@ -1026,7 +1059,7 @@ export async function copyS3Prefix(
   dstPrefix: string,
 ): Promise<{ copied: number; failed: number }> {
   const s3 = getS3Client();
-  const keys = await listCurrentWorkspaceKeys(srcPrefix).catch((e: unknown) => {
+  const keys = await listCurrentWorkspaceKeys(srcPrefix).then((l) => l.keys).catch((e: unknown) => {
     logger.warn({ err: e, sessionId, srcPrefix }, "s3.recover.list_failed");
     return [] as string[];
   });
@@ -1085,7 +1118,7 @@ export async function archiveRunToS3(
   const s3Prefix = `users/${userId}/sessions/${sessionId}/`;
   const archivePrefix = `${s3Prefix}${messageId}/`;
   const s3 = getS3Client();
-  const keys = await listCurrentWorkspaceKeys(s3Prefix).catch((e) => {
+  const keys = await listCurrentWorkspaceKeys(s3Prefix).then((l) => l.keys).catch((e) => {
     logger.warn({ err: e, sessionId }, "s3.archive.list_failed");
     return [] as string[];
   });

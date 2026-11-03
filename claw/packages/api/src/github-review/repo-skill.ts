@@ -30,6 +30,25 @@ export interface ReviewInstructions {
   text: string;
 }
 
+/** Where a repository's review skill is looked for, in this order: `<dir>/<name>/SKILL.md` for a `name` that {@link reviewSkillCandidates} picks. */
+const SKILL_DIRS = [".claude/skills", ".agents/skills"] as const;
+/** Files read beside the skill as context about the repository. */
+const CONTEXT_FILES = ["AGENTS.md", ".github/copilot-instructions.md"] as const;
+
+/**
+ * Whether a change to this path changes what the reviewing model is told (by {@link selectReviewInstructions}, once it is on the base
+ * branch): a context file, or anything in a skill directory whose name could be picked, the one in use or one that would be put before it.
+ */
+export function isReviewInstructionPath(path: string): boolean {
+  if ((CONTEXT_FILES as readonly string[]).includes(path)) return true;
+  for (const dir of SKILL_DIRS) {
+    if (!path.startsWith(`${dir}/`)) continue;
+    const name = path.slice(dir.length + 1).split("/")[0] ?? "";
+    if (reviewSkillCandidates([{ name, type: "dir" }], false).length > 0) return true;
+  }
+  return false;
+}
+
 const MAX_SKILL_BYTES = 64 * 1024;
 const MAX_CONTEXT_BYTES = 16 * 1024;
 
@@ -39,11 +58,14 @@ function encodePath(p: string): string {
 
 async function readFileAt(client: GithubClient, ref: PrRef, path: string, sha: string, maxBytes: number): Promise<string | null> {
   try {
-    const a = await client.get<{ type?: string; content?: string; encoding?: string; size?: number }>(
+    const a = await client.get<{ type?: string; path?: string; content?: string; encoding?: string; size?: number }>(
       repoPath(ref, `/contents/${encodePath(path)}`), { ref: sha },
     );
     const j = a.json;
     if (!j || Array.isArray(j) || j.type !== "file" || j.encoding !== "base64" || typeof j.content !== "string") return null;
+    // GitHub answers a symlink to a file with that file, under its own path. Instructions read from somewhere else would change with a pull
+    // request that touches only that other file, which isReviewInstructionPath cannot see: they are not read.
+    if (j.path !== path) return null;
     const text = Buffer.from(j.content, "base64").toString("utf8");
     return text.length > maxBytes ? `${text.slice(0, maxBytes)}\n[cut: the file is longer than ${maxBytes} bytes]` : text;
   } catch (err) {
@@ -73,9 +95,14 @@ export function reviewSkillCandidates(entries: Array<{ name: string; type: strin
   return [...first, ...rest];
 }
 
-export async function selectReviewInstructions(client: GithubClient, ref: PrRef, baseRef: string): Promise<ReviewInstructions> {
+/**
+ * `pinnedSha`, when given, is the base commit to read at instead of the branch's tip: the one the caller compared the head with
+ * (service.ts instructionChanges), so that the instructions the model is given are the ones that were checked, however the branch moves.
+ */
+export async function selectReviewInstructions(client: GithubClient, ref: PrRef, baseRef: string, pinnedSha?: string): Promise<ReviewInstructions> {
   let baseSha: string;
-  try {
+  if (pinnedSha !== undefined && /^[0-9a-f]{40}$/.test(pinnedSha)) baseSha = pinnedSha;
+  else try {
     const a = await client.get<{ object?: { sha?: string } }>(repoPath(ref, `/git/ref/heads/${encodePath(baseRef)}`));
     const sha = a.json?.object?.sha;
     if (typeof sha !== "string" || !/^[0-9a-f]{40}$/.test(sha)) throw new Error("no sha");
@@ -86,7 +113,7 @@ export async function selectReviewInstructions(client: GithubClient, ref: PrRef,
   }
   try {
     let found: { path: string; text: string } | null = null;
-    for (const dir of [".claude/skills", ".agents/skills"]) {
+    for (const dir of SKILL_DIRS) {
       const candidates = reviewSkillCandidates(await listDir(client, ref, dir, baseSha), dir === ".agents/skills");
       for (const name of candidates) {
         const path = `${dir}/${name}/SKILL.md`;
@@ -95,8 +122,9 @@ export async function selectReviewInstructions(client: GithubClient, ref: PrRef,
       }
       if (found) break;
     }
-    const agents = await readFileAt(client, ref, "AGENTS.md", baseSha, MAX_CONTEXT_BYTES);
-    const copilot = await readFileAt(client, ref, ".github/copilot-instructions.md", baseSha, MAX_CONTEXT_BYTES);
+    const [agentsPath, copilotPath] = CONTEXT_FILES;
+    const agents = await readFileAt(client, ref, agentsPath, baseSha, MAX_CONTEXT_BYTES);
+    const copilot = await readFileAt(client, ref, copilotPath, baseSha, MAX_CONTEXT_BYTES);
     if (!found && !agents && !copilot) return { source: "default", baseSha, text: PR_REVIEW_INSTRUCTIONS };
     const parts: string[] = [];
     if (found) {

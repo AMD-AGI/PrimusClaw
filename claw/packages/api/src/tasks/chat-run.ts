@@ -1914,6 +1914,24 @@ export function gateOwnershipEnforced(): boolean {
   return RUN_FAT_PREPARING_RECONCILE;
 }
 
+/**
+ * SQL: the gate names a turn that has already ended.
+ *
+ * Two runs can hold one session at once: a user message takes the idle gate
+ * while a drain is still dispatching the parked one, and the drain's forced take
+ * then names its own turn over it. Whichever ends first leaves the gate to the
+ * other, so the marker can outlive its turn; the run still going is then the
+ * holder in all but name, and its completion and its tools must be treated as
+ * the holder's. A marker with no row at all is not an ended turn: the immediate
+ * path takes the gate before it writes the row. Nor is one whose replay is open
+ * beside the row that ended.
+ */
+export function gateNamesEndedTurnSql(sessionId: string, marker: string): string {
+  const named = `FROM claw_tasks h WHERE h.session_id = ${sessionId} AND h.metadata->>'message_id' = ${marker}`;
+  return `(EXISTS (SELECT 1 ${named} AND h.status IN ('completed','failed','cancelled'))
+           AND NOT EXISTS (SELECT 1 ${named} AND h.status NOT IN ('completed','failed','cancelled')))`;
+}
+
 /** Take the session gate for one turn, naming the turn that holds it. */
 /**
  * The one statement that may write `agent_gate_message_id`.
