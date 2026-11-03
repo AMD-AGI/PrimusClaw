@@ -24,7 +24,8 @@ import { parseReport } from "./report.js";
 import { ingestReport } from "./reports.js";
 import type { AssistantTokenClaims } from "./token.js";
 import {
-  clipOneLine, getWorkItem, insertWorkItem, recentEvents, reopenWorkItem, stopWorkItem, TITLE_MAX,
+  clipOneLine, getWorkItem, insertWorkItem, recentEvents, reopenWorkItem, resolveWorkItem, resolveWorkItemNow, stopWorkItem,
+  TITLE_MAX, type ItemLookup, type ResolvedItem,
 } from "./work-items.js";
 
 /** A refusal written for the model to read and act on. Anything else thrown is a fault, not an answer. */
@@ -68,6 +69,12 @@ export async function assertLiveRun(q: Querier, claims: AssistantTokenClaims): P
 
 function requireRole(claims: AssistantTokenClaims, role: "router" | "worker"): void {
   if (claims.role !== role) throw new ToolRefused("not_allowed", `this tool is for the ${role}, not the ${claims.role}`);
+}
+
+/** The item a lookup found, or the refusal that says why it found none. */
+function found(lookup: ItemLookup): ResolvedItem {
+  if (!lookup.ok) throw new ToolRefused(lookup.error, lookup.message);
+  return lookup.item;
 }
 
 /** The user a router session speaks for. */
@@ -168,18 +175,14 @@ export async function workCreate(
 
 export async function workSend(
   claims: AssistantTokenClaims, args: { item_id: string; text: string },
-): Promise<{ ok: true; item_id: string; status: "in_progress" }> {
+): Promise<{ ok: true; item_id: string; seq: number; status: "in_progress" }> {
   requireRole(claims, "router");
   const text = args.text.trim();
   if (!text) throw new ToolRefused("invalid_arguments", "work_send needs text");
   const sent = await inTransaction(async (query) => {
     const q = { query };
     const { userId } = await assertLiveRun(query, claims);
-    const item = (await query(
-      "SELECT worker_session_id FROM claw_work_items WHERE item_id = $1 AND user_id = $2 FOR UPDATE",
-      [args.item_id, userId],
-    )).rows[0] as { worker_session_id: string } | undefined;
-    if (!item) throw new ToolRefused("item_not_found", "no such item");
+    const item = found(await resolveWorkItem(query, userId, args.item_id, { forUpdate: true }));
     // The same words already sent to this item in this router turn are a replayed call. Asked of the item's own log,
     // not of the queue: the queue's key is gone once the message has been handed to a run.
     const replayed = await query(
@@ -187,27 +190,29 @@ export async function workSend(
         WHERE e.item_id = $1 AND e.source = 'router' AND e.kind = 'progress' AND e.summary = $2
           AND t.task_id = $3 AND e.created_at >= t.created_at
         LIMIT 1`,
-      [args.item_id, text, claims.task_id],
+      [item.item_id, text, claims.task_id],
     );
-    if (replayed.rowCount) return { userId, workerSessionId: null };
-    if (!await reopenWorkItem(q, { userId, itemId: args.item_id, text })) {
+    if (replayed.rowCount) return { userId, item, workerSessionId: null };
+    if (!await reopenWorkItem(q, { userId, itemId: item.item_id, text })) {
       throw new ToolRefused("item_closed", "that item is finished or stopped; start a new item instead");
     }
     const queued = await queueServerMessage(q, { sessionId: item.worker_session_id, userId, content: text });
     if (!queued.ok) throw new ToolRefused(queued.error, "the instruction could not be delivered");
-    return { userId, workerSessionId: item.worker_session_id };
+    return { userId, item, workerSessionId: item.worker_session_id };
   });
   if (sent.workerSessionId) await drainSessionIfIdle(sent.workerSessionId, sent.userId);
-  return { ok: true, item_id: args.item_id, status: "in_progress" };
+  return { ok: true, item_id: sent.item.item_id, seq: sent.item.seq, status: "in_progress" };
 }
 
 export async function workStop(
   claims: AssistantTokenClaims, args: { item_id: string; reason: string },
-): Promise<{ ok: true; item_id: string; outcome: "stopped" }> {
+): Promise<{ ok: true; item_id: string; seq: number; outcome: "stopped" }> {
   requireRole(claims, "router");
   const userId = await assistantUser(claims.sid);
+  // An item's id and number never change hands, so naming it before the stop's own transaction cannot name another.
+  const item = found(await resolveWorkItemNow(userId, args.item_id));
   const stopped = await stopWorkItem({
-    userId, itemId: args.item_id, source: "router", reason: args.reason,
+    userId, itemId: item.item_id, source: "router", reason: args.reason,
     // In the stop's own transaction, so a turn that loses its gate cannot close an item between the two.
     guard: async (query) => {
       if ((await assertLiveRun(query, claims)).userId !== userId) throw new ToolRefused("turn_not_live", "the session changed hands");
@@ -215,7 +220,7 @@ export async function workStop(
   });
   if (stopped.status === "not_found") throw new ToolRefused("item_not_found", "no such item");
   if (stopped.status === "conflict") throw new ToolRefused("item_closed", "that item is already finished");
-  return { ok: true, item_id: args.item_id, outcome: "stopped" };
+  return { ok: true, item_id: item.item_id, seq: item.seq, outcome: "stopped" };
 }
 
 export type RecallDetail = "summary" | "reports" | "worker_tail";
@@ -227,7 +232,8 @@ export async function workRecall(
 ): Promise<Record<string, unknown>> {
   requireRole(claims, "router");
   const userId = await assistantUser(claims.sid);
-  const item = await getWorkItem(userId, args.item_id);
+  const named = found(await resolveWorkItemNow(userId, args.item_id));
+  const item = await getWorkItem(userId, named.item_id);
   if (!item) throw new ToolRefused("item_not_found", "no such item");
   const summary = {
     item_id: item.item_id, seq: item.seq, title: item.title, board_state: item.board_state,
@@ -236,7 +242,7 @@ export async function workRecall(
   };
   if (args.detail === "summary") return { ok: true, item: summary, note: UNTRUSTED_NOTE };
   if (args.detail === "reports") {
-    return { ok: true, item: summary, note: UNTRUSTED_NOTE, reports: await recentEvents(args.item_id, RECALL_EVENTS) };
+    return { ok: true, item: summary, note: UNTRUSTED_NOTE, reports: await recentEvents(named.item_id, RECALL_EVENTS) };
   }
   const turns = (await db.query(
     `SELECT role, content FROM claw_conversation_turns

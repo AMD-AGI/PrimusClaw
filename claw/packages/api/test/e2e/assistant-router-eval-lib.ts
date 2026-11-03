@@ -7,7 +7,9 @@
  * tested offline (`assistant-router-eval.test.ts`) with a model that answers from a script.
  *
  * Nothing about the Router is restated here. The prompt is `renderRouterSystem`, the tool definitions are what
- * the assistant's MCP server lists for a router token, the reply limit is `SAY_MAX_CHARS`, and the turn budget is
+ * the assistant's MCP server lists for a router token, the reply limit is `SAY_MAX_CHARS`, the way an item is named
+ * is `parseItemRef`, the reply-language line is `languageToAnswerIn` and `withReplyLanguage`, what is delivered when a turn
+ * ends in plain text is `answerToDeliver`, and the turn budget is
  * `CLAW_ASSISTANT_ROUTER_MAX_TURNS`: when one of them changes, the evaluation measures the new one. The one
  * piece that is reproduced rather than imported is the wrapper Brain puts around the user's words
  * (`brain/src/agent/prompt.ts: buildPrompt`), because the api package does not depend on Brain.
@@ -17,7 +19,10 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import { CLAW_ASSISTANT_ROUTER_MAX_TURNS } from "../../src/config.js";
 import { createAssistantMcpServer } from "../../src/assistant/mcp.js";
-import { renderRouterSystem, SAY_MAX_CHARS, type ManifestItem } from "../../src/assistant/prompts.js";
+import { parseItemRef } from "../../src/assistant/item-ref.js";
+import { languageToAnswerIn, withReplyLanguage } from "../../src/assistant/language.js";
+import { renderRouterSystem, SAY_MAX_CHARS, WORK_EVENT_PREFIX, type ManifestItem } from "../../src/assistant/prompts.js";
+import { answerToDeliver } from "../../src/assistant/router-turn-end.js";
 import { ASSISTANT_MCP_SERVER } from "../../src/assistant/role-profile.js";
 import {
   FIXTURE, itemIdOf, NOTHING, type EvalCase, type Effects, type FixtureItem, type HistoryTurn,
@@ -65,7 +70,7 @@ export function fixtureFor(c: Pick<EvalCase, "patch">): FixtureItem[] {
 
 export function manifestOf(items: readonly FixtureItem[]): ManifestItem[] {
   return items.map((i) => ({
-    seq: i.seq, title: i.title, boardState: i.boardState, summary: i.summary,
+    itemId: itemIdOf(i.seq), seq: i.seq, title: i.title, boardState: i.boardState, summary: i.summary,
     lastReportKind: i.lastReportKind, resultVersion: i.resultVersion, pendingQuestion: i.pendingQuestion,
   }));
 }
@@ -84,6 +89,17 @@ export function userTurn(text: string): string {
     "\n- Available MCP servers: assistant. Use these tools when relevant.",
     `\n[Session Context]\n- Session ID: ${EVAL_SESSION.sessionId}\n- User ID: ${EVAL_SESSION.userId}`,
   ].join("\n\n");
+}
+
+/**
+ * What the API hands Brain as the user's message: the user's words, and the reply-language line the assistant's role
+ * profile puts after them (`applySessionRoleToTask`). The language is the message's own, or the one of the user's
+ * earlier messages when it shows none; a worker's report is not the user's message.
+ */
+export async function promptFor(c: Pick<EvalCase, "text" | "history">): Promise<string> {
+  const earlier = [...(c.history ?? [])].reverse().map((h) => h.user).filter((u) => !u.startsWith(WORK_EVENT_PREFIX));
+  const language = await languageToAnswerIn(c.text.startsWith(WORK_EVENT_PREFIX) ? null : c.text, () => earlier);
+  return language ? withReplyLanguage(c.text, language) : c.text;
 }
 
 // --- Messages -------------------------------------------------------------------------------------------------
@@ -176,24 +192,34 @@ export function messagesLlm(o: { baseUrl: string; model: string; apiKey: () => s
 export interface ItemRef {
   /** The fixture item it names, or null when it names none. */
   seq: number | null;
-  /** True only when it is the item's real id. Anything else would be `item_not_found` against a real database. */
+  /** True when it was named by the item's own id; false when by its number or not at all. */
   exact: boolean;
+  /** Why the real tools would refuse it, when they would. */
+  refusal?: { error: string; message: string };
 }
 
 /**
- * What an `item_id` the model wrote refers to. The real tools take only the item's own id. The Router is never
- * shown that id (see `renderRouterSystem`), so what it writes is mostly "#3" or "3"; those are read as item 3
- * so the decision can be scored, and are marked `exact: false` so the evaluation can say how often the call
- * would have been refused. With `strict` they are refused, as they would be.
+ * What an `item_id` the model wrote refers to. By default the real tools' own reading: `parseItemRef` decides what
+ * is a reference (the item's id, or its number as `#3` or `3`), and the item is then one of the fixture's. With
+ * `lenient` a few more spellings of a number (`seq 3`) are read as well; what names nothing is refused either way.
  */
-export function resolveItemRef(ref: unknown, items: readonly FixtureItem[], strict = false): ItemRef {
-  if (typeof ref !== "string") return { seq: null, exact: false };
-  const exact = items.find((i) => itemIdOf(i.seq) === ref);
-  if (exact) return { seq: exact.seq, exact: true };
-  if (strict) return { seq: null, exact: false };
-  const m = /^\s*(?:#|item\s*#?|seq\s*)?(\d{1,3})\s*$/i.exec(ref);
-  if (m && items.some((i) => i.seq === Number(m[1]))) return { seq: Number(m[1]), exact: false };
-  return { seq: null, exact: false };
+export function resolveItemRef(ref: unknown, items: readonly FixtureItem[], lenient = false): ItemRef {
+  const notFound = (): ItemRef => ({ seq: null, exact: false, refusal: { error: "item_not_found", message: "no such item" } });
+  if (typeof ref !== "string") return { seq: null, exact: false, refusal: { error: "invalid_arguments", message: "item_id must be a string" } };
+  const parsed = parseItemRef(ref);
+  if (parsed.ok) {
+    const named = parsed.ref;
+    if (named.by === "id") {
+      const item = items.find((i) => itemIdOf(i.seq) === named.itemId);
+      return item ? { seq: item.seq, exact: true } : notFound();
+    }
+    return items.some((i) => i.seq === named.seq) ? { seq: named.seq, exact: false } : notFound();
+  }
+  if (lenient) {
+    const m = /^\s*(?:#|item\s*#?|seq\s*)?(\d{1,3})\s*$/i.exec(ref);
+    if (m && items.some((i) => i.seq === Number(m[1]))) return { seq: Number(m[1]), exact: false };
+  }
+  return { seq: null, exact: false, refusal: { error: parsed.error, message: parsed.message } };
 }
 
 export interface CallRecord {
@@ -211,7 +237,7 @@ class StubBackend {
   readonly items: FixtureItem[];
   private nextSeq: number;
   private readonly created = new Map<string, number>();
-  constructor(items: FixtureItem[], private readonly strict: boolean) {
+  constructor(items: FixtureItem[], private readonly lenient: boolean) {
     this.items = items;
     this.nextSeq = Math.max(...items.map((i) => i.seq)) + 1;
   }
@@ -228,9 +254,11 @@ class StubBackend {
         const text = str("text");
         if (!text.trim()) return this.refuse("empty_text", "say needs text");
         if (text.length > SAY_MAX_CHARS) return this.refuse("text_too_long", `at most ${SAY_MAX_CHARS} characters`);
-        if (input.item_id !== undefined) {
-          const ref = resolveItemRef(input.item_id, this.items, this.strict);
-          if (ref.seq === null) return { ...this.refuse("item_not_found", "no such item"), ref };
+        // As the real tool: an item that is absent or blank names no item.
+        const names = typeof input.item_id === "string" ? input.item_id.trim() !== "" : input.item_id !== undefined;
+        if (names) {
+          const ref = resolveItemRef(input.item_id, this.items, this.lenient);
+          if (ref.refusal) return { ...this.refuse(ref.refusal.error, ref.refusal.message), ref };
           return { ...this.ok({ ok: true, say_id: `say_${this.nextSeq}`, subscribers: 1 }), ref };
         }
         return this.ok({ ok: true, say_id: `say_${this.nextSeq}`, subscribers: 1 });
@@ -250,24 +278,24 @@ class StubBackend {
         return this.ok({ ok: true, item_id: itemIdOf(seq), seq, deduplicated: false });
       }
       case "work_send": {
-        const ref = resolveItemRef(input.item_id, this.items, this.strict);
+        const ref = resolveItemRef(input.item_id, this.items, this.lenient);
         const item = this.items.find((i) => i.seq === ref.seq);
         if (!str("text").trim()) return { ...this.refuse("invalid_arguments", "work_send needs text"), ref };
-        if (!item) return { ...this.refuse("item_not_found", "no such item"), ref };
+        if (ref.refusal || !item) return { ...this.refuse(ref.refusal?.error ?? "item_not_found", ref.refusal?.message ?? "no such item"), ref };
         if (item.boardState === "done") return { ...this.refuse("item_closed", "that item is finished or stopped; start a new item instead"), ref };
-        return { ...this.ok({ ok: true, item_id: input.item_id, status: "in_progress" }), ref };
+        return { ...this.ok({ ok: true, item_id: itemIdOf(item.seq), seq: item.seq, status: "in_progress" }), ref };
       }
       case "work_stop": {
-        const ref = resolveItemRef(input.item_id, this.items, this.strict);
+        const ref = resolveItemRef(input.item_id, this.items, this.lenient);
         const item = this.items.find((i) => i.seq === ref.seq);
-        if (!item) return { ...this.refuse("item_not_found", "no such item"), ref };
+        if (ref.refusal || !item) return { ...this.refuse(ref.refusal?.error ?? "item_not_found", ref.refusal?.message ?? "no such item"), ref };
         if (item.boardState === "done") return { ...this.refuse("item_closed", "that item is already finished"), ref };
-        return { ...this.ok({ ok: true, item_id: input.item_id, outcome: "stopped" }), ref };
+        return { ...this.ok({ ok: true, item_id: itemIdOf(item.seq), seq: item.seq, outcome: "stopped" }), ref };
       }
       case "work_recall": {
-        const ref = resolveItemRef(input.item_id, this.items, this.strict);
+        const ref = resolveItemRef(input.item_id, this.items, this.lenient);
         const item = this.items.find((i) => i.seq === ref.seq);
-        if (!item) return { ...this.refuse("item_not_found", "no such item"), ref };
+        if (ref.refusal || !item) return { ...this.refuse(ref.refusal?.error ?? "item_not_found", ref.refusal?.message ?? "no such item"), ref };
         const summary = {
           item_id: itemIdOf(item.seq), seq: item.seq, title: item.title, board_state: item.boardState,
           last_report_kind: item.lastReportKind, summary: item.summary, pending_question: item.pendingQuestion,
@@ -294,8 +322,10 @@ export interface Trace {
   turns: number;
   /** The turn budget ran out with the model still calling tools. */
   exhausted: boolean;
-  /** The text the model wrote outside any tool; it reaches nobody. */
+  /** The text the model wrote outside any tool; it reaches nobody unless the turn ended without a say (`delivered`). */
   stray: string;
+  /** What the completion handler delivers when the turn ends in plain text and no say (`answerToDeliver`). */
+  delivered?: string;
   inputTokens: number;
   outputTokens: number;
   /** The model could not be reached: the case has no answer, which is not a pass. */
@@ -306,17 +336,31 @@ export interface RunOptions {
   llm: Llm;
   tools: ToolSchema[];
   maxTurns?: number;
-  /** Answer an item reference as the real tools do: only the item's own id names an item. */
+  /**
+   * Answer an item reference as the real tools do: the item's id or its number (`#3`, `3`) names an item, anything
+   * else is refused. False reads anything that looks like a number as that item.
+   */
   strictIds?: boolean;
 }
 
-/** Runs the Router on one case: the model calls tools, the stand-in answers, until the model stops or the budget is spent. */
+/**
+ * Runs the Router on one case: the model calls tools, the stand-in answers, until the model stops or the budget is spent,
+ * and then the turn ends as the system ends it: plain text and no say is delivered as a say.
+ */
 export async function runCase(c: EvalCase, opts: RunOptions): Promise<Trace> {
+  const trace = await runLoop(c, opts);
+  const spoke = trace.calls.some((x) => x.tool === "say" && !x.refused);
+  const text = trace.error || spoke ? null : answerToDeliver(trace.stray, [c.text]);
+  if (text) trace.delivered = text;
+  return trace;
+}
+
+async function runLoop(c: EvalCase, opts: RunOptions): Promise<Trace> {
   const maxTurns = opts.maxTurns ?? CLAW_ASSISTANT_ROUTER_MAX_TURNS;
   const items = fixtureFor(c);
   const system = renderRouterSystem(manifestOf(items));
-  const backend = new StubBackend(items, opts.strictIds === true);
-  const messages: Message[] = [...historyMessages(c.history), { role: "user", content: userTurn(c.text) }];
+  const backend = new StubBackend(items, opts.strictIds !== true);
+  const messages: Message[] = [...historyMessages(c.history), { role: "user", content: userTurn(await promptFor(c)) }];
   const trace: Trace = { calls: [], turns: 0, exhausted: false, stray: "", inputTokens: 0, outputTokens: 0 };
   const prefix = `mcp__${ASSISTANT_MCP_SERVER}__`;
 
@@ -361,6 +405,17 @@ export function numberFromEnv(raw: string | undefined, name: string, dflt: numbe
 /** Every run that was asked for was made, and each reached the gate. No runs, or too few, is not a pass. */
 export function gateReached(accuracies: readonly number[], runs: number, gate: number): boolean {
   return runs > 0 && accuracies.length === runs && accuracies.every((a) => a >= gate);
+}
+
+/**
+ * What the summary line says. The gate is a statement about the whole set, so a run of a subset (`EVAL_CASES`) shows its
+ * scores and never passes: `passed` is true only when every case of the set was run and every run reached the gate.
+ */
+export function verdictOf(
+  accuracies: readonly number[], runs: number, gate: number, selected: number, total: number,
+): { full_set: boolean; passed: boolean } {
+  const full = selected === total;
+  return { full_set: full, passed: full && gateReached(accuracies, runs, gate) };
 }
 
 /** `work` over `items` with at most `n` in flight; results in the order of `items`. */
@@ -418,13 +473,15 @@ export interface Score {
   sayItemOk: boolean;
   /** The reply is in the user's language. */
   langOk: boolean;
+  /** The user was told by the turn's end (plain text, no say) and not by a say. */
+  rescued: boolean;
   /** dispatch, speech, item and language all right. */
   turnOk: boolean;
   actual: Effects;
   /** Counting calls the tools refused as well: what the model first reached for. */
   attempted: Effects;
   spoke: number;
-  /** Calls that named an item with something other than its real id (see `resolveItemRef`), whether or not it was refused. */
+  /** Calls that named an item by its number rather than its id (see `resolveItemRef`), or by nothing it knows. */
   inexactRefs: number;
   /** Calls the tools refused. */
   refusals: string[];
@@ -446,14 +503,15 @@ export function scoreCase(c: EvalCase, t: Trace): Score {
   const accepted = [c.expect, ...(c.also ?? [])];
   const says = t.calls.filter((x) => x.tool === "say" && !x.refused);
   const dispatchOk = !t.error && accepted.some((e) => sameEffects(e, actual));
-  const spokeOk = !t.error && (c.says === "optional" || says.length > 0);
+  const delivered = t.delivered ? [t.delivered] : [];
+  const spokeOk = !t.error && (c.says === "optional" || says.length + delivered.length > 0);
   const sayItemOk = c.sayItem == null || says.some((x) => x.ref?.seq === c.sayItem);
-  const texts = says.map((x) => String(x.input.text ?? ""));
+  const texts = [...says.map((x) => String(x.input.text ?? "")), ...delivered];
   const langOk = !c.lang || texts.every((s) => (c.lang === "zh" ? CJK.test(s) : !CJK.test(s)));
   return {
-    id: c.id, kind: c.kind, dispatchOk, spokeOk, sayItemOk, langOk,
+    id: c.id, kind: c.kind, dispatchOk, spokeOk, sayItemOk, langOk, rescued: delivered.length > 0,
     turnOk: dispatchOk && spokeOk && sayItemOk && langOk,
-    actual, attempted, spoke: says.length,
+    actual, attempted, spoke: says.length + delivered.length,
     inexactRefs: t.calls.filter((x) => x.ref && !x.ref.exact).length,
     refusals: t.calls.filter((x) => x.refused).map((x) => `${x.tool}:${(x.result as { error?: string }).error}`),
     saidBeforeResult: says.filter((x) => beside(t, x).length > 0).length,

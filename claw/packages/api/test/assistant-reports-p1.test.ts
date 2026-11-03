@@ -202,7 +202,7 @@ describe("assistant worker reports", { skip }, () => {
       assert.ok(event, "the report is logged whether or not it wakes anyone");
       assert.equal(event.source, "worker");
       if (want.wake) {
-        assert.match(queued[0].content, new RegExp(`^\\[work_event\\] #${item.seq} ${args.kind}`));
+        assert.match(queued[0].content, new RegExp(`^\\[work_event\\] #${item.seq} \\(item_id: ${item.itemId}\\) ${args.kind}`));
         assert.equal(queued[0].dedupe_key, `wi-evt:${event.id}`);
       }
     });

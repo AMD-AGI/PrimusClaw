@@ -25,6 +25,7 @@ import { enqueueEvolutionJob } from "../marketplace/evolve-worker.js";
 import { callMemoryLLM } from "../llm/client.js";
 import { CLAW_ASSISTANT_ENABLED, CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
 import { skipsSkillSelection } from "../assistant/role-profile.js";
+import { deliverUnsaidAnswer } from "../assistant/router-turn-end.js";
 import { recordWorkerTurnEnd } from "../assistant/turn-end.js";
 import { a2aPushEnabled } from "../routes/a2a-flags.js";
 import { recordSessionEvent as recordA2aPushEvent } from "../routes/a2a-push.js";
@@ -818,6 +819,7 @@ export const completionPorts = {
   enqueueEvolutionJob,
   recordRunFinished,
   recordWorkerTurnEnd,
+  deliverUnsaidAnswer,
 };
 
 async function handleComplete(
@@ -1217,6 +1219,21 @@ async function handleComplete(
       });
     } catch (err) {
       logger.error({ err, sessionId }, "assistant.turn_end_failed");
+    }
+    // 9b. A router turn that answered the user in plain text and said nothing: the text is what it meant to say.
+    //     Best-effort: a turn whose words were lost here is a user who heard nothing, which the model could have
+    //     caused on its own, so this is a repair and not a promise.
+    try {
+      await completionPorts.deliverUnsaidAnswer({
+        sessionId,
+        runIds: endedRunIds,
+        failed: Boolean(failed),
+        interrupted: Boolean(interrupted),
+        fromSweeper: (event as any).completion_source === "sweeper",
+        finalText: typeof (event as any).final_text === "string" ? (event as any).final_text : undefined,
+      });
+    } catch (err) {
+      logger.error({ err, sessionId }, "assistant.unsaid_answer_failed");
     }
   }
 

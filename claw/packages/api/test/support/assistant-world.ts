@@ -38,6 +38,7 @@ export async function startWorld(env: Record<string, string> = {}) {
     reports: await import("../../src/assistant/reports.js"),
     messages: await import("../../src/assistant/messages.js"),
     turnEnd: await import("../../src/assistant/turn-end.js"),
+    routerTurnEnd: await import("../../src/assistant/router-turn-end.js"),
     role: await import("../../src/assistant/role-profile.js"),
     silent: await import("../../src/assistant/silent-sweep.js"),
     runStarted: await import("../../src/assistant/run-started.js"),

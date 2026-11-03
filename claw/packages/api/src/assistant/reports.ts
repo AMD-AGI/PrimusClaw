@@ -87,17 +87,17 @@ export async function ingestReport(
       let wake: Written["wake"] = null;
       if (applied.wake) {
         const target = (await query(
-          `SELECT w.seq, a.session_id AS router_session_id
+          `SELECT w.seq, w.item_id, a.session_id AS router_session_id
              FROM claw_work_items w LEFT JOIN claw_assistants a ON a.user_id = w.user_id
             WHERE w.item_id = $1`,
           [run.itemId],
-        )).rows[0] as { seq: number; router_session_id: string | null } | undefined;
+        )).rows[0] as { seq: number; item_id: string; router_session_id: string | null } | undefined;
         if (target?.router_session_id) {
           const queued = await queueServerMessage(q, {
             sessionId: target.router_session_id,
             userId: applied.userId,
             content: formatWorkEvent({
-              seq: Number(target.seq), kind: recorded.kind, version: applied.resultVersion,
+              itemId: target.item_id, seq: Number(target.seq), kind: recorded.kind, version: applied.resultVersion,
               summary: recorded.summary, question: recorded.question ?? null,
             }),
             dedupeKey: `wi-evt:${applied.eventId}`,
