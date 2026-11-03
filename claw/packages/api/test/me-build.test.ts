@@ -51,6 +51,32 @@ test("the default workspace is the first Sandbox workspace in SaFE's order", () 
   assert.deepEqual(me?.sandbox, { available: true, defaultWorkspaceId: "b-sandbox", gpuProduct: "MI300X" });
 });
 
+test("the deployment's default sandbox workspace is the default when the caller has it, wherever SaFE lists it", () => {
+  // crusoe-spur-vk sorts first and is the one the console used to be sent to; the
+  // deployment's own default is global-cpu, which carries no GPU product.
+  const workspaces = list(
+    ws("crusoe-spur-vk", { scopes: ["Train", "Sandbox"], gpuProduct: "MI355X", isDefault: true }),
+    ws("global-cpu", { scopes: ["Authoring", "Sandbox"] }),
+  );
+  const me = buildMe(USER, workspaces, READY, NONE_MANAGED, "global-cpu");
+  assert.deepEqual(me?.sandbox, { available: true, defaultWorkspaceId: "global-cpu" });
+  // The same input with no deployment default is the first-listed rule, unchanged.
+  assert.deepEqual(
+    buildMe(USER, workspaces, READY, NONE_MANAGED, "")?.sandbox,
+    { available: true, defaultWorkspaceId: "crusoe-spur-vk", gpuProduct: "MI355X" },
+  );
+});
+
+test("a deployment default the caller cannot run a sandbox in does not become their default", () => {
+  const rows: [string, unknown, string][] = [
+    ["not one of their workspaces", list(ws("a", { scopes: ["Sandbox"] }), ws("b", { scopes: ["Sandbox"] })), "a"],
+    ["one of theirs, but without the Sandbox scope", list(ws("global-cpu", { scopes: ["Train"] }), ws("b", { scopes: ["Sandbox"] })), "b"],
+  ];
+  for (const [name, workspaces, expected] of rows) {
+    assert.equal(buildMe(USER, workspaces, READY, NONE_MANAGED, "global-cpu")?.sandbox.defaultWorkspaceId, expected, name);
+  }
+});
+
 test("a default workspace is named whenever a Sandbox workspace exists, available or not", () => {
   const me = buildMe(USER, list(ws("w", { scopes: ["Sandbox"] })), list(), NONE_MANAGED);
   assert.deepEqual(me?.sandbox, { available: false, defaultWorkspaceId: "w" });
