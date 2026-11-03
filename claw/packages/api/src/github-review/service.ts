@@ -27,7 +27,7 @@ import { commentableLines } from "./diff.js";
 import { GithubClient, GithubError, GithubGraphqlError, parsePrRef, repoPath, type PrRef } from "./github.js";
 import { LEGACY_REPO_CONFIG_STEM, LEGACY_RUN_MARKER_PREFIX } from "./legacy-names.js";
 import { MAX_FILES_READ, REPO_CONFIG_PATH, assessRisk, diffNotSent, normaliseJudgement, parseRepoConfig, type RepoConfig, type ReviewerJudgement, type RiskFile, type RiskResult } from "./risk.js";
-import { PAGE_MAX_CHARS, SECTIONS, conversationText, diffText, filesText, fitPage, isSection, type Comment, type Section } from "./pages.js";
+import { PAGE_MAX_CHARS, SECTIONS, conversationText, diffRanges, diffText, filesText, fitPage, isSection, type Comment, type Section } from "./pages.js";
 import { selectReviewInstructions } from "./repo-skill.js";
 import { chooseReviewPath, reviewPathAdvice } from "./review-path.js";
 import { isReviewTarget } from "./review-target.js";
@@ -180,7 +180,8 @@ const MAX_KEPT_READS = 64;
 const PAGED_SECTIONS = SECTIONS.filter((s): s is Exclude<Section, "overview"> => s !== "overview");
 const HOW_TO_READ = "Each answer fits what you can read at once. Read every section in `sections` that is not inline, whole, before you judge: call gh_pr_get "
   + "with this pr, `section`, this `head_sha` and `offset` (0, then each page's `next_offset` until it is null). Read `instructions` first. In `files`, each file "
-  + "gives its offset and length in `diff`, to read one file's part; `file` narrows `diff` to one file. A page costs one GitHub request.";
+  + "gives its offset and length in `diff`, to read one file's part: pass `file` with that offset (or 0) to stay inside it. Offsets are always "
+  + "the whole diff's. An offset past the end is refused, never an empty page. A page costs one GitHub request.";
 const HOUR_MS = 3_600_000;
 /** Refusals that say nothing about the merge itself and will pass: the acting user's "allow" is kept for another try. */
 const TRANSIENT_REFUSALS = new Set(["too_many_concurrent", "rate_limited", "github_rate_limited", "identity_unavailable", "audit_unavailable"]);
@@ -264,6 +265,9 @@ export class GithubReview {
       ctx.acc.reviewPath = read.reviewPath;
       ctx.acc.reviewPathReason = read.reviewPathReason;
       const offset = Number.isSafeInteger(args.offset) && Number(args.offset) > 0 ? Number(args.offset) : 0;
+      if (typeof args.file === "string" && args.file && !read.files.some((f) => f.path === args.file)) {
+        throw new Refusal("unknown_file", `no changed file is named ${args.file}; the files section lists them`);
+      }
       const redact = (t: string): string => ctx.client.redact(t);
       if (section === "overview" && offset === 0) {
         const first = this.overviewAnswer(read, typeof args.file === "string" && args.file ? args.file : null, redact);
@@ -396,16 +400,26 @@ export class GithubReview {
    * escaped into JSON, so that a page holds as much of the section as fits and reads as the diff does.
    */
   private pageAnswer(read: ReviewRead, section: Section, offset: number, args: Record<string, unknown>, redact: (t: string) => string): ToolOutcome {
-    const file = typeof args.file === "string" && args.file ? args.file : null;
-    const full = this.sectionText(read, section, file, redact);
+    const file = section === "diff" && typeof args.file === "string" && args.file ? args.file : null;
+    // A diff page is always in the whole diff's offsets, the ones the `files` index gives; `file` only keeps the page inside that file's part.
+    const full = section === "diff" ? diffText(read.files, null, redact) : this.sectionText(read, section, null, redact);
+    const range = file ? diffRanges(read.files, redact).find((r) => r.path === file) : { start: 0, end: full.length };
+    if (!range) throw new Refusal("unknown_file", `no changed file is named ${file}; the files section lists them`);
+    const from = file && offset === 0 ? range.start : offset;
+    // Past the end is a mistake, never an empty last page: the model would take it for the end of what it had to read.
+    if (from < range.start || from > range.end || (from === range.end && range.end > range.start)) {
+      throw new Refusal("offset_out_of_range", `offset ${offset} is outside ${file ? `the part of ${file} (${range.start} to ${range.end})` : `the ${section} section (0 to ${full.length})`}`, {
+        section, section_chars: full.length, ...(file ? { file, file_start: range.start, file_end: range.end } : {}),
+      });
+    }
     const want = section === "diff" && Number.isSafeInteger(args.max_diff_chars) && Number(args.max_diff_chars) > 0 ? Number(args.max_diff_chars) : PAGE_MAX_CHARS;
     const untrusted = section === "files" || section === "diff" || section === "conversation";
     let body: Record<string, unknown> = {};
-    const page = fitPage(full, offset, want, (slice, next) => {
+    const page = fitPage(full.slice(0, range.end), from, want, (slice, next) => {
       const head = {
-        status: "ok", head_sha: read.pr.headSha, section, ...(file && section === "diff" ? { file } : {}), offset: Math.min(offset, full.length),
+        status: "ok", head_sha: read.pr.headSha, section, ...(file ? { file, file_start: range.start, file_end: range.end } : {}), offset: from,
         section_chars: full.length, next_offset: next,
-        ...(next === null ? {} : { next: `call gh_pr_get with section "${section}", this head_sha and offset ${next}` }),
+        ...(next === null ? {} : { next: `call gh_pr_get with section "${section}"${file ? ", the same file" : ""}, this head_sha and offset ${next}` }),
         ...(untrusted ? { notice: UNTRUSTED_PAGE_NOTICE } : {}),
         text: "the lines after this one",
       };
@@ -414,6 +428,7 @@ export class GithubReview {
     });
     return { isError: false, body, text: page.text };
   }
+
 
   /** `gh_pr_risk`: the rule pack's verdict alone. */
   assessPr(actor: ReviewActor, args: Record<string, unknown>): Promise<ToolOutcome> {

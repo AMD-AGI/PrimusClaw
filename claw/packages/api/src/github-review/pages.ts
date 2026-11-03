@@ -51,13 +51,21 @@ export function diffText(files: RiskFile[], only: string | null = null, redact: 
 }
 
 /** One line per changed file: what it is, and where its part of the `diff` section starts and how long it is, so a page can be aimed at it. */
-export function filesText(files: RiskFile[], redact: Redact = asIs): string {
+/** Where each file's part is in the whole diff ({@link diffText} with no file named), as the `files` index gives it. */
+export function diffRanges(files: RiskFile[], redact: Redact = asIs): Array<{ path: string; start: number; end: number }> {
   let offset = 0;
-  return redact(files.map((f) => {
-    const part = redact(filePart(f)).length;
-    const line = `${f.path} (${f.status}, +${f.additions} -${f.deletions}) diff offset ${offset}, ${part} chars${diffNotSent(f) ? ", no diff" : ""}\n`;
-    offset += part;
-    return line;
+  return files.map((f) => {
+    const start = offset;
+    offset += redact(filePart(f)).length;
+    return { path: f.path, start, end: offset };
+  });
+}
+
+export function filesText(files: RiskFile[], redact: Redact = asIs): string {
+  const ranges = diffRanges(files, redact);
+  return redact(files.map((f, i) => {
+    const r = ranges[i] as { start: number; end: number };
+    return `${f.path} (${f.status}, +${f.additions} -${f.deletions}) diff offset ${r.start}, ${r.end - r.start} chars${diffNotSent(f) ? ", no diff" : ""}\n`;
   }).join(""));
 }
 

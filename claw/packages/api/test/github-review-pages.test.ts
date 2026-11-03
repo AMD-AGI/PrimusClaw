@@ -15,6 +15,9 @@
  *   G7  a page fits whatever the text costs to escape, and a line longer than a page is still read whole
  *   G8  a page from the session's read is still held to the repository gates as they are now
  *   G9  the acting user's token is masked in a section before it is cut into pages, so no two pages put it back together
+ *   G10 an offset past the end of a section, or outside the named file, is refused: never an empty page that reads as the end
+ *   G11 a file that is not in the change is refused, not answered with an empty diff
+ *   G12 `file` with the offset the files index gives reads that file's part whole, in the whole diff's offsets
  */
 import assert from "node:assert/strict";
 import test, { after, afterEach, beforeEach } from "node:test";
@@ -252,5 +255,67 @@ test("G9 the acting user's token in the change is masked before the section is c
     if (section === "diff") assert.ok(pages > 5, `pages ${pages}`);
     assert.ok(!text.includes(TOKEN), `${section}: the pages put together carry the token`);
     for (let n = 12; n < TOKEN.length; n += 6) assert.ok(!text.includes(TOKEN.slice(0, n)), `${section}: a prefix of ${n}`);
+  }
+});
+
+const refusal = (o: { isError: boolean; body: Record<string, unknown> }) => (o.isError ? String(o.body.reason) : "answered");
+
+test("G10 an offset past the end of a section, or outside the named file, is refused with the section's length: never an empty page that reads as the end", async () => {
+  e = await reviewEnv({ CLAW_GITHUB_REQUESTS_PER_SESSION: "1000" }); // many whole reads; the budget is G1's subject
+  const files = bigChange(6, 25);
+  useChange(files);
+  await e.service.getPr(e.actor, { pr: PR });
+  for (const section of ["diff", "files", "instructions", "conversation"]) {
+    const { text } = await readSection(e.service, e.actor, PR, section);
+    for (const offset of [text.length, text.length + 1, text.length + 50_000]) {
+      const o = await e.service.getPr(e.actor, { pr: PR, section, head_sha: HEAD, offset });
+      assert.equal(refusal(o), "offset_out_of_range", `${section} at ${offset}`);
+      assert.equal(o.body.section_chars, text.length, section);
+    }
+    const last = await e.service.getPr(e.actor, { pr: PR, section, head_sha: HEAD, offset: text.length - 1 });
+    assert.equal(refusal(last), "answered", `${section}: the last character is still a page`);
+  }
+  // Inside the diff but outside the named file: before it and at its end.
+  const [first, fourth] = [files[0] as FakeFile, files[3] as FakeFile];
+  const ranges = (await readSection(e.service, e.actor, PR, "files")).text.trim().split("\n").map((l) => /diff offset (\d+), (\d+) chars/.exec(l) as RegExpExecArray);
+  const r4 = { start: Number(ranges[3]?.[1]), end: Number(ranges[3]?.[1]) + Number(ranges[3]?.[2]) };
+  for (const offset of [r4.start - 1, r4.end, r4.end + 10]) {
+    const o = await e.service.getPr(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset, file: fourth.filename });
+    assert.equal(refusal(o), "offset_out_of_range", `${offset}`);
+    assert.deepEqual([o.body.file_start, o.body.file_end], [r4.start, r4.end]);
+  }
+  assert.equal(refusal(await e.service.getPr(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0, file: first.filename })), "answered");
+});
+
+test("G11 a file that is not in the change is refused, in the overview and in a page, not answered with an empty diff", async () => {
+  useChange(bigChange(6, 25));
+  assert.equal(refusal(await e.service.getPr(e.actor, { pr: PR, file: "src/nope.ts" })), "unknown_file");
+  assert.equal(refusal(await e.service.getPr(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0, file: "src/nope.ts" })), "unknown_file");
+});
+
+test("G12 `file` with the offset the files index gives reads that file's part whole, and its pages go on in the whole diff's offsets", async () => {
+  e = await reviewEnv({ CLAW_GITHUB_REQUESTS_PER_SESSION: "1000" }); // many whole reads; the budget is G1's subject
+  const files = bigChange(6, 25);
+  useChange(files);
+  await e.service.getPr(e.actor, { pr: PR });
+  const index = (await readSection(e.service, e.actor, PR, "files")).text.trim().split("\n");
+  const whole = diffText(asRead(files));
+  for (const [i, f] of files.entries()) {
+    const m = /diff offset (\d+), (\d+) chars/.exec(index[i] as string) as RegExpExecArray;
+    const start = Number(m[1]);
+    let text = "";
+    let pages = 0;
+    for (let offset: number | null = start; offset !== null; pages++) {
+      const o = await e.service.getPr(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset, file: f.filename, max_diff_chars: 2000 });
+      assert.equal(o.isError, false, o.text.slice(0, 200));
+      const b = o.body as any;
+      assert.equal(b.offset, offset);
+      text += b.untrusted.text;
+      offset = b.next_offset;
+      if (offset !== null) assert.equal(whole.slice(start, offset), text, "a next offset is the whole diff's");
+    }
+    assert.equal(text, diffText(asRead([f])), f.filename);
+    assert.equal(text.length, Number(m[2]));
+    assert.ok(pages > 1, `pages ${pages}`);
   }
 });

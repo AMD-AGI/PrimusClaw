@@ -78,7 +78,7 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor)
       section: z.enum(SECTIONS).optional().describe("What to read: the overview (default), or one section in pages"),
       head_sha: z.string().optional().describe("The head_sha of the overview: a page is of that head, and is refused when the pull request has moved"),
       offset: z.number().int().min(0).optional().describe("Where the page starts in the section: 0, then the previous page's next_offset"),
-      file: z.string().optional().describe("Only this file's diff"),
+      file: z.string().optional().describe("Only this file's diff. Offsets stay the whole diff's, as the files section gives them; 0 starts at the file"),
       max_diff_chars: z.number().int().optional().describe("At most this many characters of diff in a page (a page is never longer than fits)"),
     },
     async (a) => toResult(await service.getPr(actor, a)),

@@ -758,7 +758,8 @@ describe("M4 a change the diff does not show, and a lock file", () => {
       assert.equal(b.review_path.path, "sandbox", what);
       assert.equal(b.review_path.reason, "diff_not_available", what);
       assert.match(b.untrusted.files, /, no diff\n$/, what);
-      assert.match(b.untrusted.diff, /Git LFS pointer: the file it stands for is not shown/, what);
+      const diff = (await e.service.getPr(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0 })).body as any;
+      assert.match(diff.untrusted.text, /Git LFS pointer: the file it stands for is not shown/, what);
       assert.equal((await submit({ event: "APPROVE" })).body.status, "confirmation_required", what);
       const m = await merge();
       assert.equal(m.body.status, "confirmation_required", what);
