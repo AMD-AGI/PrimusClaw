@@ -22,7 +22,8 @@ import {
   MissingPlatformKeyError,
   readTrustedSessionCredentials,
 } from "../auth/session-credentials.js";
-import { CLAW_DEPLOY_MODE } from "../config.js";
+import { CLAW_AGENT_GUIDELINE_ENABLED, CLAW_DEPLOY_MODE } from "../config.js";
+import { withAgentGuideline } from "../sessions/agent-guideline.js";
 import { withholdsSandboxKeys } from "../github-review/session-tools.js";
 import { defaultTaskWorkspaceId } from "./default-workspace.js";
 import { isMemoryActive } from "../memory/service.js";
@@ -632,6 +633,8 @@ export async function dispatchPreparedRow(locked: ClawTaskRow): Promise<Dispatch
       memoryEnabled: await isMemoryActive(session.user_id || ""),
       pluginTools: await pluginToolsForRun(updated, session.user_id || ""),
     });
+    // Scripts and apps run no model turn.
+    if (CLAW_AGENT_GUIDELINE_ENABLED && req.mode === "llm") withAgentGuideline(req as unknown as Record<string, unknown>);
 
     // 5. Publish. Serialised first, and the flag set only once there is
     // something to send: a payload that will not serialise never reaches the
