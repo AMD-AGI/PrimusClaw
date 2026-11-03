@@ -918,6 +918,7 @@ render_chart() {
     ${PG_SSL_NO_VERIFY:+--set postgres.sslNoVerify="$PG_SSL_NO_VERIFY"} \
     ${EXTRA_CA_CERTS_CONFIGMAP:+--set-string tls.extraCACertsConfigMap="$EXTRA_CA_CERTS_CONFIGMAP"} \
     ${EXTRA_CA_CERTS_KEY:+--set-string tls.extraCACertsKey="$EXTRA_CA_CERTS_KEY"} \
+    ${GRANT_SIGNING_KEY_ENABLED:+--set grantSigningKey.enabled="$GRANT_SIGNING_KEY_ENABLED"} \
     ${preserved[@]+"${preserved[@]}"} \
     "$@" \
     --show-only "templates/$template" > "$dst" || { rm -f "$extra_values"; return 1; }

@@ -20,7 +20,7 @@ import {
 } from "../config.js";
 import { db } from "../infra/db.js";
 import { stopTurnRuns } from "../tasks/chat-run.js";
-import { fireTrigger, type TriggerRow } from "./fire.js";
+import { fireIntoItem, fireTrigger, type TriggerRow } from "./fire.js";
 import { nextFireAfter } from "./schedule.js";
 
 const logger = pino({ name: "triggers-scheduler" });
@@ -41,24 +41,39 @@ async function recordFire(
   void owner;
 }
 
-/** Whether the trigger's previous run is still going. */
-async function previousRunOpen(triggerId: string): Promise<boolean> {
-  const r = await db.query(
-    `SELECT 1 FROM claw_sessions
-      WHERE config->>'trigger_id' = $1 AND agent_status = 'running' AND deleted_at IS NULL LIMIT 1`,
-    [triggerId],
-  );
+/** Whether the trigger's previous run is still going: its own session's, or the turn of the item it wakes. */
+async function previousRunOpen(t: Pick<TriggerRow, "trigger_id" | "item_id">): Promise<boolean> {
+  const r = t.item_id
+    ? await db.query(
+      `SELECT 1 FROM claw_work_items w JOIN claw_sessions s ON s.session_id = w.worker_session_id
+        WHERE w.item_id = $1 AND s.agent_status = 'running'`,
+      [t.item_id],
+    )
+    : await db.query(
+      `SELECT 1 FROM claw_sessions
+        WHERE config->>'trigger_id' = $1 AND agent_status = 'running' AND deleted_at IS NULL LIMIT 1`,
+      [t.trigger_id],
+    );
   return r.rows.length > 0;
+}
+
+/** A trigger that has had its last run stays listed, paused as `ended`, and never fires again. */
+async function endTrigger(triggerId: string, reason: "ended" | "item_closed"): Promise<void> {
+  await db.query(
+    "UPDATE claw_triggers SET paused_reason = $2, next_fire_at = NULL, updated_at = NOW() WHERE trigger_id = $1",
+    [triggerId, reason],
+  );
 }
 
 export async function tickTriggers(now: Date = new Date()): Promise<void> {
   const due = (await db.query(
-    `SELECT trigger_id, owner_user_id, name, prompt, schedule, timezone, credential_enc, next_fire_at
+    `SELECT trigger_id, owner_user_id, name, prompt, schedule, timezone, credential_enc, next_fire_at,
+            ends_at, max_runs, runs, item_id
        FROM claw_triggers
       WHERE enabled AND paused_reason IS NULL AND next_fire_at <= $1
       ORDER BY next_fire_at LIMIT $2`,
     [now, BATCH],
-  )).rows as Array<TriggerRow & { next_fire_at: Date }>;
+  )).rows as Array<TriggerRow & { next_fire_at: Date; ends_at: Date | null; max_runs: number | null; runs: number }>;
 
   for (const t of due) {
     const planned = t.next_fire_at;
@@ -68,13 +83,17 @@ export async function tickTriggers(now: Date = new Date()): Promise<void> {
     } catch (err) {
       logger.error({ err, triggerId: t.trigger_id }, "trigger.next_fire_failed");
     }
+    // The firing after `until` is never planned: this one, if it runs, is the last.
+    const pastEnd = next !== null && t.ends_at !== null && next > t.ends_at;
+    if (pastEnd) next = null;
     // Moves to the next FUTURE time, so a long outage yields one candidate firing
     // (the planned one, judged stale below), never a burst of catch-up runs.
     const won = await db.query(
-      `UPDATE claw_triggers SET next_fire_at = $3, last_fire_at = $4, updated_at = NOW()
+      `UPDATE claw_triggers SET next_fire_at = $3, last_fire_at = $4, updated_at = NOW(),
+              paused_reason = CASE WHEN $5 THEN 'ended' ELSE paused_reason END
         WHERE trigger_id = $1 AND next_fire_at = $2 AND enabled AND paused_reason IS NULL
         RETURNING trigger_id`,
-      [t.trigger_id, planned, next, now],
+      [t.trigger_id, planned, next, now, pastEnd],
     );
     if (!won.rows.length) continue;
 
@@ -86,6 +105,13 @@ export async function tickTriggers(now: Date = new Date()): Promise<void> {
     );
     if (!claimed.rows.length) continue;
 
+    // Already had every run it was given, or planned past its end: a row from before either was set, or one a
+    // resume brought back, ends here rather than running once more.
+    if ((t.max_runs !== null && t.runs >= t.max_runs) || (t.ends_at !== null && planned > t.ends_at)) {
+      await recordFire(t.trigger_id, key, t.owner_user_id, "skipped_ended", null, null);
+      await endTrigger(t.trigger_id, "ended");
+      continue;
+    }
     if (now.getTime() - planned.getTime() > TRIGGER_STALE_AFTER_SECONDS * 1000) {
       await recordFire(t.trigger_id, key, t.owner_user_id, "skipped_stale", null, null);
       continue;
@@ -104,15 +130,32 @@ export async function tickTriggers(now: Date = new Date()): Promise<void> {
       logger.warn({ triggerId: t.trigger_id }, "trigger.daily_limit_reached");
       continue;
     }
-    if (await previousRunOpen(t.trigger_id)) {
+    if (await previousRunOpen(t)) {
       await recordFire(t.trigger_id, key, t.owner_user_id, "skipped_overlap", null, null);
       continue;
     }
 
-    const outcome = await fireTrigger(t, planned);
+    const outcome = t.item_id ? await fireIntoItem(t, planned) : await fireTrigger(t, planned);
     if (outcome.status === "started") {
       await recordFire(t.trigger_id, key, t.owner_user_id, "started", outcome.sessionId, null, outcome.messageId);
-      await db.query("UPDATE claw_triggers SET consecutive_failures = 0 WHERE trigger_id = $1", [t.trigger_id]);
+      await db.query(
+        `UPDATE claw_triggers
+            SET consecutive_failures = 0, runs = runs + 1,
+                paused_reason = CASE WHEN max_runs IS NOT NULL AND runs + 1 >= max_runs THEN 'ended' ELSE paused_reason END,
+                next_fire_at = CASE WHEN max_runs IS NOT NULL AND runs + 1 >= max_runs THEN NULL ELSE next_fire_at END
+          WHERE trigger_id = $1`,
+        [t.trigger_id],
+      );
+      continue;
+    }
+    if (outcome.status === "item_closed") {
+      await recordFire(t.trigger_id, key, t.owner_user_id, "skipped_item_closed", null, null);
+      await endTrigger(t.trigger_id, "item_closed");
+      continue;
+    }
+    if (outcome.status === "item_waiting") {
+      // The item is waiting for its user; the watch resumes once they answer.
+      await recordFire(t.trigger_id, key, t.owner_user_id, "skipped_item_waiting", null, null);
       continue;
     }
     await recordFire(t.trigger_id, key, t.owner_user_id, "failed_start", null, outcome.detail);

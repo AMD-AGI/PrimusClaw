@@ -619,3 +619,106 @@ test("G9 no credential anywhere: not in a command, not in .git/config, not in th
     if (before === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = before;
   }
 });
+
+/**
+ * Background shells, as Hands has them: `bash run_in_background` answers a
+ * shell id, `wait` answers "still running" until the command is done. The
+ * command still really runs; the first wait on each shell says it is not done,
+ * so the loop is exercised rather than satisfied on its first answer.
+ */
+function backgroundSandbox(label: string): Sandbox & { tools: string[] } {
+  const s = sandbox(label);
+  const tools: string[] = [];
+  const shells = new Map<string, { command: string; waits: number }>();
+  const foreground = s.hands;
+  return {
+    ...s,
+    tools,
+    hands: {
+      async callToolFull(name: string, args: Record<string, unknown>) {
+        tools.push(name === "bash" && args.run_in_background ? "bash&" : name);
+        if (name === "bash" && args.run_in_background === true) {
+          const id = `sh-${shells.size + 1}`;
+          shells.set(id, { command: String(args.command), waits: 0 });
+          return { text: `Started background shell ${id}.`, isError: false, structured: { shell_id: id } };
+        }
+        if (name === "wait") {
+          const shell = shells.get(String(args.shell_id))!;
+          if (shell.waits++ === 0) {
+            return { text: "still running", isError: false, structured: { finished: false, status: "running", exit_code: null } };
+          }
+          const r = await foreground.callToolFull("bash", { command: shell.command });
+          return {
+            text: `Shell finished\n\n${r.text}`, isError: false,
+            structured: { finished: true, status: r.isError ? "failed" : "completed", exit_code: r.isError ? 128 : 0 },
+          };
+        }
+        return foreground.callToolFull(name, args);
+      },
+    } as Sandbox["hands"],
+  };
+}
+
+test("GB1 with background shells the clone runs in the background and is waited for, whatever its length", async () => {
+  const s = backgroundSandbox("gb1");
+  const b = await bindRepo(s.hands, { url: REPO_URL }, { root: s.root, stateDir: s.state, background: true });
+  assert.equal(b.state, "cloned", JSON.stringify(b));
+  assert.equal(b.failure, null);
+  assert.equal(fs.readFileSync(path.join(b.path, "README.md"), "utf8"), "# example\n");
+  assert.deepEqual(s.tools.slice(0, 4), ["bash", "bash&", "wait", "wait"], "the clone was not started in the background and waited for");
+  assert.equal(s.calls.filter((c) => /git clone --quiet --/.test(c)).length, 1, "the clone ran once");
+});
+
+test("GB2 a background clone that fails: a reason in the block, and nothing left behind", async () => {
+  const s = backgroundSandbox("gb2");
+  const b = await bindRepo(s.hands, { url: `${URL_BASE}/missing.git` }, { root: s.root, stateDir: s.state, background: true });
+  assert.equal(b.state, "failed");
+  assert.match(b.failure ?? "", /git clone of .* failed: .+/);
+  assert.deepEqual(fs.readdirSync(s.root), []);
+});
+
+test("GB3 without background shells the clone is one foreground call, as before", async () => {
+  const s = backgroundSandbox("gb3");
+  const b = await bindRepo(s.hands, { url: REPO_URL }, { root: s.root, stateDir: s.state });
+  assert.equal(b.state, "cloned");
+  assert.ok(!s.tools.includes("bash&") && !s.tools.includes("wait"), s.tools.join());
+});
+
+for (const [label, wait] of [
+  ["the turn is aborted during the wait", "abort"],
+  ["the wait answers an error", "error"],
+] as const) {
+  test(`GB4 a background clone that is not waited to its end is stopped: ${label}`, async () => {
+    const s = sandbox(`gb4-${wait}`);
+    const ac = new AbortController();
+    const kills: Array<{ shell_id: unknown; aborted: boolean | undefined }> = [];
+    const hands = {
+      async callToolFull(name: string, args: Record<string, unknown>, signal?: AbortSignal) {
+        if (name === "bash" && args.run_in_background === true) {
+          return { text: "Started background shell sh-1.", isError: false, structured: { shell_id: "sh-1" } };
+        }
+        if (name === "wait") {
+          if (wait === "error") return { text: "Error: the sandbox went away", isError: true };
+          ac.abort();
+          throw Object.assign(new Error("This operation was aborted"), { name: "AbortError" });
+        }
+        if (name === "kill_shell") {
+          kills.push({ shell_id: args.shell_id, aborted: signal?.aborted });
+          return { text: "killed", isError: false };
+        }
+        if (signal?.aborted) throw new Error("aborted");
+        return s.hands.callToolFull(name, args);
+      },
+    };
+    const b = await bindRepo(hands, { url: REPO_URL }, { root: s.root, stateDir: s.state, background: true, signal: ac.signal });
+    assert.equal(b.state, "failed", JSON.stringify(b));
+    assert.deepEqual(kills, [{ shell_id: "sh-1", aborted: false }], "the background clone was left running, or stopped under the aborted signal");
+  });
+}
+
+test("GB5 a background clone that finishes is not stopped", async () => {
+  const s = backgroundSandbox("gb5");
+  const b = await bindRepo(s.hands, { url: REPO_URL }, { root: s.root, stateDir: s.state, background: true });
+  assert.equal(b.state, "cloned");
+  assert.ok(!s.tools.includes("kill_shell"), s.tools.join());
+});
