@@ -63,6 +63,7 @@ import {
   hasHolderEvidence, noDeliveryInFlightSql,
   parseDispatchCompensationRecord, SWEEPABLE_RUN_STATUSES, UNSUPPORTED_RECEIPT_SQL,
 } from "./chat-run.js";
+import { sweepAssistant } from "../assistant/sweep.js";
 
 const logger = pino({ name: "task-sweeper" });
 
@@ -2922,6 +2923,8 @@ export async function sweeperTick(): Promise<void> {
   // that does not know what it was.
   await runContained("sweeper.dispatch_reconcile_failed", reconcileAmbiguousDispatches);
   await runContained("sweeper.orphaned_pending_drain_failed", drainOrphanedPendingMessages);
+  // After the orphan drain, so a queued report is already on its way; before the session reapers, which close runs this reads.
+  await runContained("sweeper.assistant_failed", sweepAssistant);
   await runContained("sweeper.orphaned_fat_runs_failed", reapOrphanedFatRuns);
   await runContained("sweeper.finalize_compensations_failed", finalizeDispatchCompensations);
   await runContained("sweeper.audit_compensations_failed", auditRefusedCompensations);

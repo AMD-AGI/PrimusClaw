@@ -16,7 +16,7 @@
  * report is the caller's job, in the same transaction, from `wake`.
  */
 import { CLAW_ASSISTANT_MAX_ACTIVE_ITEMS } from "../config.js";
-import { db, inTransaction, type StatementRunner } from "../infra/db.js";
+import { db, inTransaction, type Querier, type StatementRunner } from "../infra/db.js";
 import { stopSessionRuns } from "../tasks/chat-run.js";
 import { newWorkItemId } from "../tasks/ids.js";
 
@@ -35,12 +35,12 @@ export interface WorkReport {
   result?: unknown;
 }
 
-const TITLE_MAX = 40;
+export const TITLE_MAX = 40;
 const SUMMARY_MAX = 80;
 export const DONE_WINDOW_DAYS = 7;
 
 /** One line, at most `max` characters (not UTF-16 units: titles are mostly Chinese). */
-function clipOneLine(text: string, max: number): string {
+export function clipOneLine(text: string, max: number): string {
   return Array.from(text.replace(/\s+/g, " ").trim()).slice(0, max).join("");
 }
 
@@ -318,8 +318,11 @@ export async function stopWorkItem(input: {
   itemId: string;
   source: "user" | "router";
   reason?: string;
+  /** Runs first inside the transaction; throwing stops nothing. The router's tool asks whether its turn is still live. */
+  guard?: (query: Querier) => Promise<void>;
 }): Promise<DecisionResult> {
   const stopped = await inTransaction(async (query) => {
+    await input.guard?.(query);
     const rows = (await query(
       `WITH upd AS (
          UPDATE claw_work_items
@@ -352,6 +355,11 @@ export async function stopWorkItem(input: {
 /**
  * The user asked for more on an item: back to in progress, with the old result no
  * longer the one to accept (the accept's WHERE clause needs `ready`).
+ *
+ * The generation goes up with it. A run that is still executing never saw this
+ * instruction, so whatever it reports next, `ready` above all, describes work the
+ * user has already asked to change: it is fenced out, and the run that carries the
+ * instruction is the next one to be heard.
  */
 export async function reopenWorkItem(
   q: StatementRunner,
@@ -361,7 +369,7 @@ export async function reopenWorkItem(
     `WITH upd AS (
        UPDATE claw_work_items
           SET board_state = 'in_progress', last_report_kind = 'progress', pending_question = NULL,
-              updated_at = NOW()
+              generation = generation + 1, updated_at = NOW()
         WHERE item_id = $1 AND user_id = $2 AND board_state <> 'done'
     RETURNING ${ITEM_COLUMNS}, generation
      ), ev AS (
