@@ -877,13 +877,13 @@ render_chart() {
   # on an empty here-string still yields a single empty element, which reaches
   # helm as an empty positional argument and fails the render.
   [ -n "$preserved_out" ] && mapfile -t preserved <<<"$preserved_out"
-  # EXTRA_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* / EXTRA_SECRET_MOUNTS_* from the values file, as a Helm values
-  # file: arbitrary values survive --set quoting only through a file.
+  # EXTRA_ENV_* / EXTRA_SECRET_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* / EXTRA_SECRET_MOUNTS_* from the values file,
+  # as a Helm values file: arbitrary values survive --set quoting only through a file.
   local extra_values
   extra_values="$(mktemp)"
   if ! python3 "$(dirname "${BASH_SOURCE[0]}")/extra-values.py" > "$extra_values"; then
     rm -f "$extra_values"
-    fail "EXTRA_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* / EXTRA_SECRET_MOUNTS_* in $_VALUES_FILE are malformed or collide (see above)."
+    fail "EXTRA_ENV_* / EXTRA_SECRET_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* / EXTRA_SECRET_MOUNTS_* in $_VALUES_FILE are malformed or collide (see above)."
   fi
   helm template primus-claw "$CLAW_CHART_DIR" \
     -n "$NAMESPACE" \
@@ -922,6 +922,18 @@ render_chart() {
     "$@" \
     --show-only "templates/$template" > "$dst" || { rm -f "$extra_values"; return 1; }
   rm -f "$extra_values"
+  # An EXTRA_SECRET_ENV_* name the chart renders into this container as well is
+  # only visible in what helm just rendered: the chart's own env depends on this
+  # render (NATS credentials read back from the cluster, a CA ConfigMap).
+  local extra_target=""
+  case "$template" in
+    api-deployment.yaml)   extra_target=API ;;
+    brain-deployment.yaml) extra_target=BRAIN ;;
+  esac
+  if [ -n "$extra_target" ] \
+     && ! python3 "$(dirname "${BASH_SOURCE[0]}")/extra-values.py" --check-rendered "$extra_target" "$dst"; then
+    fail "EXTRA_SECRET_ENV_${extra_target}_* in $_VALUES_FILE names an env var the chart already renders in $template (see above)."
+  fi
 }
 
 # ── kubectl apply wrapper ────────────────────────────────────────────────
