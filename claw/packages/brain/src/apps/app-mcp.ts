@@ -107,7 +107,8 @@ export async function probeAppMcp(i: McpProbeInput): Promise<McpProbeVerdict> {
 }
 
 export interface AppMcpSeamDeps {
-  routerBase?: () => string | null;
+  /** The Router base for a sandbox in the given namespace. */
+  routerBase?: (namespace: string) => string | null;
   namespace?: string;
   routerAuth?: () => boolean;
   fetch?: typeof globalThis.fetch;
@@ -133,12 +134,13 @@ export function appMcpSeams(deps: AppMcpSeamDeps = {}): Pick<AppRunnerSeams, "re
       if (!mcp || !ctx.instance || !workloadId) return;
       const runId = ctx.record.run_id;
       if (registered.get(runId) === workloadId) return;
-      const base = routerBase();
+      const namespace = ctx.instance.namespace?.trim() || deps.namespace || SANDBOX_NAMESPACE;
+      const base = routerBase(namespace);
       if (!base) {
         logger.warn({ runId }, "app_mcp.no_router_base");
         return;
       }
-      const url = appMcpUrl(base, ctx.instance.namespace?.trim() || deps.namespace || SANDBOX_NAMESPACE, workloadId, mcp);
+      const url = appMcpUrl(base, namespace, workloadId, mcp);
       const { mcp_token: token } = await ctx.store.secrets(runId);
       const verdict = await probeAppMcp({
         url, token, tokenHeader: mcp.token_header, sandboxSessionId: workloadId,

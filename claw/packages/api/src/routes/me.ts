@@ -29,8 +29,9 @@
  *   - `sandbox.available` -- at least one cluster is Ready AND at least one
  *     workspace carries the `Sandbox` scope.
  *   - `sandbox.defaultWorkspaceId` -- the workspace sandboxes start in. That is the
- *     deployment's own default (SANDBOX_NAMESPACE, the workspace Brain uses when a
- *     request names none) when the caller has it among their Sandbox-scoped
+ *     deployment's own default (SANDBOX_CPU_NAMESPACE when the deployment keeps CPU
+ *     sandboxes apart from GPU ones, else SANDBOX_NAMESPACE: the workspace Brain uses
+ *     when a request names none) when the caller has it among their Sandbox-scoped
  *     workspaces, else the first Sandbox-scoped workspace in the order SaFE lists
  *     them (by name). The console sends this id with every turn, which makes it win
  *     over Brain's default: a default that disagreed with Brain's would send every
@@ -67,7 +68,7 @@ import pino from "pino";
 import { callerAuthOf } from "../auth/caller-auth.js";
 import { devAuthBypassEnabled, getUser } from "../auth/middleware.js";
 import type { UserInfo } from "../auth/models.js";
-import { SAFE_API_URL, SANDBOX_NAMESPACE, isKubernetesMode } from "../config.js";
+import { SAFE_API_URL, SANDBOX_CPU_NAMESPACE, SANDBOX_NAMESPACE, isKubernetesMode } from "../config.js";
 import { UpstreamError, getUpstreamJson } from "../shared/upstream.js";
 
 const logger = pino({ name: "me-route" });
@@ -133,7 +134,7 @@ export function buildMe(
   clustersBody: unknown,
   userBody: unknown,
   /** The deployment's default sandbox workspace; a parameter so the rule is testable without the environment. */
-  deploymentDefaultWorkspaceId: string = SANDBOX_NAMESPACE,
+  deploymentDefaultWorkspaceId: string = SANDBOX_CPU_NAMESPACE || SANDBOX_NAMESPACE,
 ): Me | null {
   const workspaceItems = itemsOf(workspacesBody);
   const clusterItems = itemsOf(clustersBody);

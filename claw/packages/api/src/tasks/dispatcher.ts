@@ -23,6 +23,7 @@ import {
   readTrustedSessionCredentials,
 } from "../auth/session-credentials.js";
 import { CLAW_DEPLOY_MODE } from "../config.js";
+import { defaultTaskWorkspaceId } from "./default-workspace.js";
 import { isMemoryActive } from "../memory/service.js";
 import { resolveTaskPlugin } from "../marketplace/plugins.js";
 import { db } from "../infra/db.js";
@@ -181,7 +182,7 @@ async function loadSessionCredentials(sessionId: string): Promise<{
     platform_key: credentials.platformKey,
     // The namespace is not a credential: it names where the work runs, not who
     // it runs as, and a deployment-wide default for it grants nothing.
-    workspace_id: sessionWorkspaceId || process.env.SANDBOX_NAMESPACE || "",
+    workspace_id: sessionWorkspaceId || defaultTaskWorkspaceId(),
     llm_api_key: credentials.llmApiKey,
   };
 }
