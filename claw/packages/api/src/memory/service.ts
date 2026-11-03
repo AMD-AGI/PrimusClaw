@@ -22,6 +22,7 @@ import {
 } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { publishEvent } from "../events/store.js";
+import { sessionWithholdsMemory } from "../github-review/session-tools.js";
 import { estimateTokens } from "../shared/tokens.js";
 import {
   BODY_MAX, NOTE_MAX, SIMILARITY_THRESHOLD, TITLE_MAX, isMemoryType, legacyType, normalizeText, quoteAsksToForget,
@@ -118,6 +119,8 @@ export async function memoryAccess(sessionId: string, userId: string): Promise<M
     if (!session || session.user_id !== userId) return { optedIn, serves: false };
     if (session.parent_session_id) return { optedIn, serves: false };
     if (session.memory === "off" || session.memory === false) return { optedIn, serves: false };
+    // A session that acts as a user reads what strangers wrote (github-review/session-tools.ts).
+    if (await sessionWithholdsMemory(sessionId)) return { optedIn, serves: false };
     if (await existsOrNoTable("SELECT 1 FROM claw_tasks WHERE session_id = $1 AND origin <> 'chat' LIMIT 1", [sessionId])) {
       return { optedIn, serves: false };
     }

@@ -148,7 +148,17 @@ export class AgentEngine {
     // Platform defaults sit under everything else: a request, tool or plugin
     // server of the same name wins. Unset file -> `defaults` is null and none
     // of this runs.
-    const defaults = PLATFORM_DEFAULTS_FILE ? loadPlatformDefaults() : null;
+    //
+    // A session that acts as a user (`withhold_sandbox_keys`) is given none, MCP servers and
+    // skills alike. Its model reads what strangers wrote; the default servers are authenticated
+    // with the requester's own platform key (`<SAFE_API_KEY>`), so one of their read tools is the
+    // requester's read access to the platform, put in the hands of that text, and a default skill
+    // steers the model towards it. Such a session has what its own request carries (the API puts
+    // the review tools there) and nothing that is the deployment's. This is the one place defaults
+    // enter a run, and every run of Brain comes through it, a turn, a queued turn, a task of a DAG;
+    // a sub-agent starts from the schemas of the run that made it, so it has none either. Read as
+    // truthy, not `=== true`: a mark that is not a boolean is still a mark.
+    const defaults = PLATFORM_DEFAULTS_FILE && !request.withhold_sandbox_keys ? loadPlatformDefaults() : null;
     const mergedMcp = normalizeMcpConfigs({
       ...(defaults?.mcpServers || {}),
       ...(request.mcp_servers || {}),
@@ -353,8 +363,10 @@ export class AgentEngine {
       router.lazySkillWriter = lazySkills;
       // The listed skills are Brain's to hand over: `load_skill` serves them without a sandbox.
       if (progressiveSkills.length) router.skillStore = new SkillStore([...defaultProgressive, ...pluginProgressive], `${sessionDir}/.skills`);
-      // Offered only when the API said so: a request without the field is not the user's conversation.
-      router.memoryEnabled = request.memory_enabled === true;
+      // Offered only when the API said so: a request without the field is not the user's conversation. A session that acts as a
+      // user (`withhold_sandbox_keys`) never has them: what its model writes into the requester's long-term memory is what a
+      // stranger's text made it write, and every later session of the requester would read it.
+      router.memoryEnabled = request.memory_enabled === true && !request.withhold_sandbox_keys;
       router.memoryTurn = { sessionId: request.session_id, messageId: request.message_id };
       // Whom an identity-authenticated a2a_call peer is called as, and when the run's budget ends.
       const deadlineMs = request.deadline_at ? Date.parse(request.deadline_at) : NaN;

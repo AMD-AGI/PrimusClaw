@@ -6,6 +6,7 @@ import type { Message } from "@claw/protocol";
 import { coerceToolInput } from "@claw/utils";
 
 import { buildMemoryCatalogue, memoryAccess, memoryAvailable } from "../memory/service.js";
+import { sessionWithholdsMemory } from "../github-review/session-tools.js";
 import pino from "pino";
 import { estimateTokens } from "../shared/tokens.js";
 
@@ -166,9 +167,10 @@ export async function buildSystemContextParts(
   let rulesTokens = 0;
 
   // Long-term memory: the catalogue of the user's entries, one line each, for a session memory serves (the
-  // user's own chat; see memoryAccess). A user who has not opted in is told it is off. The profile earlier
-  // versions generated is no longer injected: the user and feedback entries say the same, visibly.
-  if (memoryAvailable()) {
+  // user's own chat; see memoryAccess). A user who has not opted in is told it is off, except in a session that
+  // acts as a user, which hears nothing about the requester's memory. The profile earlier versions generated is
+  // no longer injected: the user and feedback entries say the same, visibly.
+  if (memoryAvailable() && !(await sessionWithholdsMemory(sessionId))) {
     const access = await memoryAccess(sessionId, userId);
     if (!access.optedIn) {
       parts.push(MEMORY_OFF_NOTICE);

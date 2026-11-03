@@ -38,6 +38,9 @@ func LogEvent(event *AuditEvent) {
 	if event.Reason != "" {
 		args = append(args, "reason", event.Reason)
 	}
+	if detail := event.Metadata["detail"]; detail != "" {
+		args = append(args, "detail", detail)
+	}
 	if event.DeleteReason != "" {
 		args = append(args, "delete_reason", event.DeleteReason)
 	}

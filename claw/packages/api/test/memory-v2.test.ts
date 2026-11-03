@@ -15,8 +15,9 @@
  *   W5  a duplicate answers with the existing entry, a near-duplicate is refused with it, force_new needs another quote
  *   W6  a full store refuses the write and drops nothing
  *   W7  memory serves only the user's own chat: not an assistant's router or worker, an application's run, a
- *       session that carried an A2A run, a session marked memory "off", a child session, another user's session,
- *       or a turn that is no longer live; and not a user who has not opted in
+ *       session that carried an A2A run, a session marked memory "off", a session that acts as a user (GitHub
+ *       review), a child session, another user's session, or a turn that is no longer live; and not a user who has
+ *       not opted in
  *   W8  REST writes pass the same checks; one made with a key (not a sign-in) waits for confirmation
  *   W9  an entry waiting for confirmation is not the model's to read, change or delete
  * Deletes
@@ -28,7 +29,8 @@
  *   R1  the catalogue is one line per entry, bounded by lines and by tokens, user and feedback first, pinned on top
  *   R2  a project entry past its review date leaves the catalogue (counted) until it is confirmed again
  *   R3  the profile earlier versions generated is not injected; pre-typed entries are, under their category's type
- *   R4  no catalogue where memory does not serve, and the off notice for a user who has not opted in
+ *   R4  no catalogue where memory does not serve, and the off notice for a user who has not opted in (but not in a
+ *       session that acts as a user, which hears nothing of the requester's memory)
  *   R5  the token estimate counts a CJK character as about one token
  *   R6  a dispatched turn is offered the memory tools only where memory serves
  */
@@ -56,6 +58,7 @@ describe("memory v2", { skip }, () => {
     w = await startWorld({
       CLAW_MEMORY_ENABLED: "true", AUTH_INTERNAL_TOKEN: INTERNAL, CLAW_MEMORY_MAX_ENTRIES: String(MAX),
       CLAW_MEMORY_CATALOGUE_MAX_LINES: "40", CLAW_MEMORY_CATALOGUE_MAX_TOKENS: "1500", APP_RUNS_ENABLED: "true",
+      CLAW_GITHUB_REVIEW_ENABLED: "true",
     });
     svc = await import("../src/memory/service.js");
     ctx = await import("../src/sessions/context-builder.js");
@@ -275,6 +278,11 @@ describe("memory v2", { skip }, () => {
       }],
       ["a session marked memory off (a group chat)", async () => {
         const sid = await chat("alice", { config: { memory: "off" } });
+        const t = await turn(sid, quote);
+        return { sid, mid: t.messageId };
+      }],
+      ["a session that acts as a user", async () => {
+        const sid = await chat("alice", { config: { acting_as: "u-bob" } });
         const t = await turn(sid, quote);
         return { sid, mid: t.messageId };
       }],
@@ -536,8 +544,9 @@ describe("memory v2", { skip }, () => {
     await insert("alice", 1, () => ({ type: "user", title: "speaks Chinese" }));
     const group = await chat("alice", { config: { memory: "off" } });
     const router = (await w.user("alice")).routerSid;
+    const acting = await chat("alice", { config: { acting_as: "u-bob" } });
     const own = await chat("alice");
-    for (const sid of [group, router]) {
+    for (const sid of [group, router, acting]) {
       const text = await catalogueOf(sid);
       assert.ok(!text.includes("speaks Chinese"), sid);
       assert.ok(!text.includes("Long-term Memory"), sid);
@@ -547,6 +556,7 @@ describe("memory v2", { skip }, () => {
     const off = await catalogueOf(own);
     assert.ok(off.includes(ctx.MEMORY_OFF_NOTICE));
     assert.ok(!off.includes("speaks Chinese"));
+    assert.ok(!(await catalogueOf(acting)).includes("Long-term"), "a session that acts as a user hears nothing of it, not even that it is off");
   });
 
   test("R5 the token estimate counts a CJK character as about one token", () => {
