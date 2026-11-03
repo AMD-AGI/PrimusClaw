@@ -140,6 +140,8 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
       // Absent, the insert that carries a dedupe key fails outright, so every
       // submit that names one is refused -- the retry-safe path, not the plain one.
       "dedupe_key",
+      // Named by every queue insert and read back by the drain, like `topology`.
+      "tools_allowlist",
     ],
   },
   {

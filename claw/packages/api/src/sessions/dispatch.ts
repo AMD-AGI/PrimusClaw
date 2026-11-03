@@ -18,6 +18,7 @@ import { isAdmin, type UserInfo } from "../auth/models.js";
 import { stampSessionCredentials } from "../auth/session-credentials.js";
 import { buildMessages } from "./context-builder.js";
 import { isMemoryActive } from "../memory/service.js";
+import { CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
 import { selectSkillsForTask } from "../marketplace/skill-service.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { eventSubject, taskSubject, type EnvironmentTopology } from "@claw/protocol";
@@ -96,6 +97,8 @@ export interface DispatchInput {
    * either absent or well-formed.
    */
   topology?: EnvironmentTopology;
+  /** The tools the turn may use (`tools_allowlist`, enforced by Brain); absent or empty is no restriction. */
+  toolsAllowlist?: string[];
   /**
    * Run the dispatch as a sandbox-only run: bring up (or reuse) the session's
    * sandbox exactly as a turn would, then finish, with no model call and no
@@ -156,7 +159,7 @@ export async function dispatchTaskToBrain(
   const {
     sessionId, userId, user, content, toolIds, pluginId,
     requestImage, requestResource, requestTimeout, workspaceId,
-    mcpServers, capturedUserEnvSnapshot, capturedSessionEnv, topology,
+    mcpServers, capturedUserEnvSnapshot, capturedSessionEnv, topology, toolsAllowlist,
   } = input;
   const sandboxOnly = input.sandboxOnly === true;
 
@@ -304,6 +307,7 @@ export async function dispatchTaskToBrain(
       prompt: content,
       history,
       memory_enabled: await isMemoryActive(userId),
+      skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED,
       user_id: userId,
       llm_api_key: resolveUserLlmKey(user),
       platform_key: user?.platformKey || "",
@@ -325,6 +329,7 @@ export async function dispatchTaskToBrain(
     if (pluginTools !== undefined) {
       task.plugin_tools = pluginTools;
     }
+    if (toolsAllowlist?.length) task.tools_allowlist = toolsAllowlist;
     if (sandboxOnly) {
       // Brain opens the sandbox up front for script mode and the empty script
       // then has nothing to run: the run ends with the sandbox up and parked.
