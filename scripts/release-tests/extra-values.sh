@@ -135,8 +135,8 @@ refuses "two Secrets at one path" EXTRA_SECRET_MOUNTS_API \
   "EXTRA_SECRET_MOUNTS_API=sec-one:/etc/x sec-two:/etc/x"
 refuses "two ConfigMaps at one path" EXTRA_CONFIGMAP_MOUNTS_BRAIN \
   "EXTRA_CONFIGMAP_MOUNTS_BRAIN=cm-one:/etc/x cm-two:/etc/x"
-# The API server compares what the container sees, so the same directory written
-# another way is the same path.
+# The API server compares the strings it is given, but the runtime mounts the
+# directory, so the same directory written another way is refused too.
 for spelling in /etc/x/ /etc//x //etc/x /etc/./x /etc/y/../x; do
   refuses "/etc/x written as $spelling" EXTRA_SECRET_MOUNTS_BRAIN \
     EXTRA_CONFIGMAP_MOUNTS_BRAIN=cm-one:/etc/x "EXTRA_SECRET_MOUNTS_BRAIN=sec-one:$spelling"
