@@ -360,8 +360,14 @@ describe("assistant role profile", { skip }, () => {
     await completeAsBrain(await claim(), "好的");
     assert.deepEqual(await stored(), [["user", chinese], ["assistant", "好的"]], "doorbell claim");
 
-    // The queue's replay, with its run row opened as it is in production.
+    // The queue's replay, with its run row opened as it is in production, and the row of an earlier turn beside it:
+    // the words are those of the turn that completed.
     await reset();
+    await w.q(
+      `INSERT INTO claw_tasks (task_id, session_id, name, status, origin, prompt, metadata)
+       VALUES ('ktsk_earlier', $1, 'earlier', 'succeeded', 'chat', 'an earlier question', '{"message_id": "claw-earlier-1"}'::jsonb)`,
+      [alice.routerSid],
+    );
     const { dispatchPendingMessage, pendingDispatchPorts } = await import("../src/tasks/pending-dispatch.js");
     const { openChatRun } = await import("../src/tasks/chat-run.js");
     const stub = await stubPending();

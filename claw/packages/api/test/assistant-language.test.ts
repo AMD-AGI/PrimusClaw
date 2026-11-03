@@ -63,6 +63,12 @@ test("L1c a quotation is not the user's sentence, and a message that opens in Ch
     ["帮我翻译一下：Please fix the build and then deploy it. The nightly job has been red since yesterday and nobody has looked at it.", "Chinese"],
     ["ビルドを check the build and then fix it please", "Japanese"],
     ["빌드가 왜 깨졌는지 check the build and then fix it please", "Korean"],
+    // Whatever the quotation marks, when the Chinese around them has no grammar word of its own to open the message with.
+    ["翻译成中文：\"Please fix the build and then deploy it\"", "Chinese"],
+    ["翻译成中文：“Please fix the build and then deploy it”", "Chinese"],
+    ["翻译成中文：'Please fix the build and then deploy it'", "Chinese"],
+    ["翻译成中文：‘Please fix the build and then deploy it’", "Chinese"],
+    ["翻译成中文：「Please fix the build and then deploy it」", "Chinese"],
     // An English user asking about a Chinese, Japanese or Korean one.
     ["What does \"你好\" mean?", "English"],
     ["Translate “这个构建为什么一直是红的” into English, please", "English"],
@@ -74,6 +80,7 @@ test("L1c a quotation is not the user's sentence, and a message that opens in Ch
     // An apostrophe inside a word is not a quote.
     ["I don't know what the 帮助 doc says, it isn't clear", "English"],
     ["The users' list isn't what I'd expect, and 我的 items are missing", "English"],
+    ["Sadly 构建 builds don't work for the users and that isn't fine", "English"],
     // Nothing but a quotation: the quotation is all there is to go on.
     ["\"Please fix the build\"", "English"],
     ["\"这个构建为什么是红的\"", "Chinese"],
