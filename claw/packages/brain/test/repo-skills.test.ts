@@ -12,6 +12,8 @@
  *   K3 the engine: listed as [repository] after the others, a name in use is not taken,
  *      load_skill serves it from the staged copy with the repository's path, the
  *      sandbox's .skills/ is never written for it, and the staged copy goes with the run
+ *   K4 a file of it that is not text is pointed to at its path in the repository
+ *   K5 a session that acts as a user is listed none of them and cannot load one
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -130,7 +132,8 @@ function boundHands() {
       if (/CLAW-REPO-SKILL-FILE/.test(c)) {
         assert.ok(c.includes(`${REPO}/.claude/skills/deploy-check`), c);
         return { isError: false, text: `@@CLAW-REPO-SKILL-FILE ${hex("SKILL.md")}@@${Buffer.from(md("deploy-check", "d", "REPO-SKILL-BODY")).toString("base64")}\n`
-          + `@@CLAW-REPO-SKILL-FILE ${hex("scripts/check.sh")}@@${Buffer.from("echo ok").toString("base64")}\n` };
+          + `@@CLAW-REPO-SKILL-FILE ${hex("scripts/check.sh")}@@${Buffer.from("echo ok").toString("base64")}\n`
+          + `@@CLAW-REPO-SKILL-FILE ${hex("template.png")}@@${Buffer.from([0x89, 0x50, 0x4e, 0x47, 0xff, 0xfe, 0x00]).toString("base64")}\n` };
       }
       return { isError: false, text: "" };
     },
@@ -168,4 +171,34 @@ test("K3 the engine lists them as [repository] after the others, keeps a name in
   assert.equal(hands.commands.some((c) => c.startsWith("write:") && c.includes(".skills/deploy-check")), false, "never written to .skills/");
   assert.equal(stagedDuringRun.length, 1, "staged under the run's work root");
   assert.equal(fs.existsSync(stagedUnder), false, "and gone with the run");
+});
+
+test("K4 a file of a repository skill that is not text is pointed to where it is in the repository", async () => {
+  const hands = boundHands();
+  world.llmBodies.length = 0;
+  world.script([{ tool: "load_skill", input: { name: "deploy-check", file: "template.png" } }, { text: "done" }]);
+  await new AgentEngine().execute(
+    baseRequest({ session_id: "s-k4", repo: { url: URL } }), (async () => {}) as never, undefined, null as never,
+    { attachHands: async () => hands as never } as never,
+  );
+  const second = world.llmBodies[1];
+  assert.ok(second.includes(`'template.png' of skill 'deploy-check' is not text; use it from the sandbox at ${REPO}/.claude/skills/deploy-check/template.png.`), second);
+  assert.equal(second.includes(".skills/deploy-check"), false, "not the platform skills' directory, where it never is");
+});
+
+test("K5 a session that acts as a user is listed none of the repository's skills and cannot load one", async () => {
+  const hands = boundHands();
+  world.llmBodies.length = 0;
+  world.script([{ tool: "load_skill", input: { name: "deploy-check" } }, { text: "done" }]);
+  await new AgentEngine().execute(
+    baseRequest({ session_id: "s-k5", repo: { url: URL }, withhold_sandbox_keys: true }), (async () => {}) as never, undefined, null as never,
+    { attachHands: async () => hands as never } as never,
+  );
+  const [first, second] = world.llmBodies;
+  assert.ok(first.includes(REPO), "the repository is still bound");
+  assert.equal(first.includes("deploy-check"), false, "the skill is not listed");
+  assert.equal(first.includes("[repository]"), false, "nor announced");
+  assert.match(second, /Unknown tool: load_skill/, "with no skill listed there is no load_skill to call");
+  assert.equal(second.includes("REPO-SKILL-BODY"), false);
+  assert.equal(hands.commands.some((c) => /CLAW-REPO-SKILL-FILE/.test(c)), false, "nothing staged");
 });

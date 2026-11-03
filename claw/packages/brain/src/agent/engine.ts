@@ -243,8 +243,10 @@ export class AgentEngine {
     // The repository's own skills, listed after everything else (the list's cap
     // drops them first) and served by load_skill like the others; a name already
     // in use belongs to whoever has it. Their staged copies live under the run's
-    // work root, which the run removes when it ends.
-    const repoProgressive = binding && PROGRESSIVE_SKILLS_ENABLED && loadSkillAllowed && binding.skills.length
+    // work root, which the run removes when it ends. A session that acts as a user
+    // gets none, like the platform defaults: its working tree can be a stranger's
+    // checkout, and a listed skill is one the model is told to use.
+    const repoProgressive = binding && !request.withhold_sandbox_keys && PROGRESSIVE_SKILLS_ENABLED && loadSkillAllowed && binding.skills.length
       ? (() => {
           const taken = new Set([...Object.keys(allSkills), ...defaultProgressive.map((s) => s.name), ...pluginSkills.map((s) => s.name)]);
           const candidates = repoSkillsToList(binding.skills, binding.path, taken, sandbox, path.join(pluginWorkRoot, "repo-skills"), signal);

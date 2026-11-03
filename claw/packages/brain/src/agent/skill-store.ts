@@ -111,7 +111,7 @@ export class SkillStore {
     }
     const encoded = encodeFileForSandbox(real);
     if (encoded.encoding !== "utf8") {
-      return { ok: false, error: `Error: '${rel}' of skill '${name}' is not text; use it from the sandbox at ${this.skillBase}/${name}/${rel}.` };
+      return { ok: false, error: `Error: '${rel}' of skill '${name}' is not text; use it from the sandbox at ${this.sandboxDir(skill)}/${rel}.` };
     }
     const body = encoded.contents;
     const start = offset === undefined || offset === null || offset === "" ? 0
@@ -141,13 +141,18 @@ export class SkillStore {
     return { ok: true, text };
   }
 
+  /** Where the skill's files are in the sandbox: a repository skill in the repository, any other under `skillBase`. */
+  private sandboxDir(skill: DefaultSkill): string {
+    return skill.sandboxDir ?? `${this.skillBase}/${skill.name}`;
+  }
+
   private footer(skill: DefaultSkill, base: string): string {
     const { name } = skill;
     const files = listRegularFiles(base)
       .map((f) => path.relative(base, f).split(path.sep).join("/"))
       .filter((f) => f !== "SKILL.md")
       .sort();
-    const dir = skill.sandboxDir ?? `${this.skillBase}/${name}`;
+    const dir = this.sandboxDir(skill);
     const shown = files.filter((f) => f.length <= FOOTER_PATH_MAX_CHARS).slice(0, FOOTER_MAX_FILES).map((f) => `- ${f}`);
     if (files.length > shown.length) shown.push(`- (${files.length - shown.length} more)`);
     const head = skill.sandboxDir
