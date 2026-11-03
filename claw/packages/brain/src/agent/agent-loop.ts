@@ -392,6 +392,19 @@ export function subAgentTurnCap(requested: number | undefined, parentMaxTurns: n
   return requested !== undefined && requested > 0 && (deployment <= 0 || requested < deployment) ? requested : deployment;
 }
 
+/**
+ * `gh_pr_get` of the API's reserved `github_review` server pages a pull request itself, every page under the API's own bound
+ * (`PAGE_MAX_CHARS`, pages.ts), so it gets a bound of its own just above that one. Under the generic cap a review read its diff and its
+ * instructions in 5500-character pages, 42 calls over five reviews; this bound carries four times as much per call.
+ */
+export const GITHUB_REVIEW_READ_TOOL = "mcp__github_review__gh_pr_get";
+export const GITHUB_REVIEW_READ_MAX_CHARS = 24_000;
+
+/** The generic cap, or a tool's own when it pages its answers itself. */
+function resultCapFor(toolName: string | undefined): number {
+  return toolName === GITHUB_REVIEW_READ_TOOL ? GITHUB_REVIEW_READ_MAX_CHARS : TOOL_RESULT_MAX_CHARS;
+}
+
 export function truncateToolResult(text: string, toolName?: string, savedAt?: string): string {
   if (toolName === LOAD_SKILL_TOOL) {
     if (typeof text !== "string" || text.length <= LOAD_SKILL_RESULT_MAX_CHARS) return text;
@@ -400,7 +413,7 @@ export function truncateToolResult(text: string, toolName?: string, savedAt?: st
     const dropped = text.length - head.length - tail.length;
     return `${head}\n\n[... ${dropped} chars cut from this ${LOAD_SKILL_TOOL} result; get what is missing by calling ${LOAD_SKILL_TOOL} again with name, file and the offset to continue from ...]\n\n${tail}`;
   }
-  if (typeof text !== "string" || text.length <= TOOL_RESULT_MAX_CHARS) return text;
+  if (typeof text !== "string" || text.length <= resultCapFor(toolName)) return text;
   if (toolName === "read") return truncateReadResult(text);
   const head = text.slice(0, TOOL_RESULT_HEAD_CHARS);
   const tail = text.slice(-TOOL_RESULT_TAIL_CHARS);
@@ -436,7 +449,7 @@ function truncateReadResult(text: string): string {
 
 /** Whether a result is kept whole in the sandbox before it is cut: not for tools whose source can simply be read again. */
 function spillsWhenCut(text: string, toolName: string): boolean {
-  return typeof text === "string" && text.length > TOOL_RESULT_MAX_CHARS
+  return typeof text === "string" && text.length > resultCapFor(toolName)
     && toolName !== "read" && toolName !== LOAD_SKILL_TOOL;
 }
 

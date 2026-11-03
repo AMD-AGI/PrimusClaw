@@ -170,6 +170,8 @@ interface ReviewRead {
   riskReasons: string[];
   reviewPath: string;
   reviewPathReason: string;
+  /** `how_to_read` of the overview: the deep review's sandbox path reads the diff from its checkout instead of in pages. */
+  howToRead: string;
 }
 
 /** A merge queue entry as GitHub reports it (`MergeQueueEntry`): the id, the place in the queue and its state (QUEUED, AWAITING_CHECKS, MERGEABLE, UNMERGEABLE, LOCKED). */
@@ -193,6 +195,10 @@ const HOW_TO_READ = "Each answer fits what you can read at once. Read every sect
   + "with this pr, `section`, this `head_sha` and `read_id`, and `offset` (0, then each page's `next_offset` until it is null). Read `instructions` first. In `files`, each file "
   + "gives its offset and length in `diff`, to read one file's part: pass `file` with that offset (or 0) to stay inside it. Offsets are always "
   + "the whole diff's. An offset past the end is refused, never an empty page. A page costs one GitHub request.";
+const HOW_TO_READ_FROM_CHECKOUT = "Each answer fits what you can read at once. Read every section in `sections` that is not inline, whole, before you judge, "
+  + "except `diff`: this review checks the pull request out, and its diff is read there once, as the review instructions say; page it only if the checkout "
+  + "fails. To read a section, call gh_pr_get with this pr, `section`, this `head_sha` and `read_id`, and `offset` (0, then each page's `next_offset` until it "
+  + "is null). Read `instructions` first. An offset past the end is refused, never an empty page. A page costs one GitHub request.";
 const HOUR_MS = 3_600_000;
 /** Refusals that say nothing about the merge itself and will pass: the acting user's "allow" is kept for another try. */
 const TRANSIENT_REFUSALS = new Set(["too_many_concurrent", "rate_limited", "github_rate_limited", "identity_unavailable", "audit_unavailable"]);
@@ -383,6 +389,7 @@ export class GithubReview {
     return {
       readId, pr, files: change.files, overview: { ...overview, read_id: readId }, instructions: instructions.text, conversation,
       riskReasons: risk.evidence.map((e) => `evidence: ${e}`), reviewPath: choice.path, reviewPathReason: choice.reason,
+      howToRead: ctx.settings.deepReview && choice.path === "sandbox" && recipe ? HOW_TO_READ_FROM_CHECKOUT : HOW_TO_READ,
     };
   }
 
@@ -392,7 +399,7 @@ export class GithubReview {
     const untrusted = { title: clip(read.pr.title, 300), ...(inline.files !== undefined ? { files: inline.files } : {}),
       ...(inline.conversation !== undefined ? { conversation: inline.conversation } : {}), ...(inline.diff !== undefined ? { diff: inline.diff } : {}) };
     return {
-      ...read.overview, how_to_read: HOW_TO_READ, sections,
+      ...read.overview, how_to_read: read.howToRead, sections,
       ...(inline.instructions !== undefined ? { review_instructions: inline.instructions } : {}),
       untrusted,
     };

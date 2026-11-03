@@ -179,7 +179,9 @@ const DEEP_REVIEW_STEPS = `## Steps
    The answer is the overview, and \`sections\` names what is too long to be in it (\`inline: false\`).
    Read each of those whole before you judge, in pages: \`gh_pr_get\` with \`section\`, the \`head_sha\`,
    the \`read_id\` and \`offset\` 0, then each page's \`next_offset\` until it is null. A page you skip is a part of
-   the change you did not review. If the head moves while
+   the change you did not review. On the \`sandbox\` path the \`diff\` section is the one exception: do not
+   page it; read the diff once from the checkout (\`.pr-review/pr.diff\`, step 4), and page it only if the
+   recipe fails. If the head moves while
    you work, start again from the new head. Read \`acting\` (whether approve and merge are open
    to you or only comments) and \`review_path\`:
    - \`api_diff\` (a small change): review from the diff and the file list in the result and do
@@ -192,8 +194,9 @@ const DEEP_REVIEW_STEPS = `## Steps
      \`head_sha\`, and reuses a checkout that is already there. The sandbox has no credential for
      GitHub and you must not give it one: no token, header, credential helper or other remote
      (a fork's code arrives through the recipe, never by adding the fork). Exit code 3 means
-     the head moved: call \`gh_pr_get\` again. What you review is the diff in the \`gh_pr_get\`
-     result; the checkout is for reading around it and running it. If the recipe fails for another
+     the head moved: call \`gh_pr_get\` again. What you review is the change from the base to that
+     \`head_sha\`, the diff GitHub shows; the checkout holds exactly it, and is also for reading around
+     it and running it. If the recipe fails for another
      reason, review from the result alone and say in the review body that the code was not checked out.
 2. \`review_instructions\` in the result (in the overview, or its \`instructions\` section) is the
    text you are following (this one, when the repository has none of its own). If it brings the

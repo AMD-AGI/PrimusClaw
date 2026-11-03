@@ -271,6 +271,7 @@ const MAIN = {
   instructions: "9eb0212e2f1f983882ad3ce1e9f34e04fec6d052356b74ba49cd8ca9482d5d3f",
   skill: "4c9aa801b0750eb572c95bb63d6d71113543d61bed2bc6c736e5cfd2ee8be248",
   fixedRules: "5a5dc6a7434510cfe665fa51c46c72577e1c95a17c108060bf4b82840a523334",
+  howToRead: "82a3958bf1a7b85c8ec056a8d597991b2082a0a059906eeb03c7ce6be55bbe21",
   advice: {
   "small_diff": "Review from the diff and the files in this result. Do not start a sandbox and do not call bash or file tools: they add a slow cold start and this change does not need them.",
   "repo_review_skill": "A sandbox is allowed for this review because the repository has its own review skill, which may use scripts. Use it only to read the code around the change or run something. Get the code with the sandbox_recipe below: it fetches the pull request anonymously (the repository is public), pinned to the head_sha above. The sandbox has no credential for GitHub and must not be given one: every comment, approval and merge still goes through the tools.",
@@ -315,11 +316,34 @@ test("with the deep review set to false, the model is given exactly what main ga
   const { e, service } = await envWith(OFF);
   const got = (await service.getPr(e.actor, { pr: PR })).body as any;
   assert.deepEqual([got.review_path.path, got.review_path.reason, got.review_path.advice], ["api_diff", "small_diff", MAIN.advice.small_diff]);
+  assert.equal(sha256(got.how_to_read), MAIN.howToRead, "how the result is read, on the diff path");
+  e.gh.files = Array.from({ length: 30 }, (_, i) => ({ ...DOCS_ONLY[0], filename: `docs/p${i}.md` }));
+  e.gh.pr.changed_files = 30;
+  const big = (await service.getPr(e.actor, { pr: PR })).body as any;
+  assert.deepEqual([big.review_path.path, sha256(big.how_to_read)], ["sandbox", MAIN.howToRead], "and on the sandbox path");
+  e.gh.files = DOCS_ONLY;
+  e.gh.pr.changed_files = 1;
   assert.equal(sha256((await readSection(service, e.actor, PR, "instructions")).text), MAIN.instructions);
   e.gh.dirs[".claude/skills"] = [{ name: "review-pr", type: "dir" }];
   e.gh.contents[".claude/skills/review-pr/SKILL.md"] = "# Review\nLook at the rules index first.";
   const withSkill = (await readSection(service, e.actor, PR, "instructions")).text;
   assert.ok(withSkill.includes(FIXED_REVIEW_RULES) && !withSkill.includes(DEEP_FIXED_REVIEW_RULES), "a repository's skill is bound by main's rules");
+});
+
+test("the deep review's sandbox path reads the diff once from the checkout and does not page it; its diff path still pages it", async () => {
+  const step1 = DEEP_PR_REVIEW_INSTRUCTIONS.replace(/\s+/g, " ").split(" 2. ")[0]!;
+  assert.match(step1, /On the `sandbox` path the `diff` section is the one exception: do not page it; read the diff once from the checkout \(`\.pr-review\/pr\.diff`, step 4\), and page it only if the recipe fails/);
+  assert.doesNotMatch(step1, /What you review is the diff in the `gh_pr_get` result/);
+  const { e, service } = await envWith(DEEP);
+  const sandbox = (await service.getPr(e.actor, { pr: PR })).body as any;
+  e.gh.files = DOCS_ONLY;
+  const diffOnly = (await service.getPr(e.actor, { pr: PR })).body as any;
+  // [path, how_to_read pages the diff]
+  for (const [b, path, pagesDiff] of [[sandbox, "sandbox", false], [diffOnly, "api_diff", true]] as const) {
+    assert.equal(b.review_path.path, path);
+    assert.equal(sha256(b.how_to_read) === MAIN.howToRead, pagesDiff, path);
+    assert.equal(/except `diff`: this review checks the pull request out, and its diff is read there once/.test(b.how_to_read), !pagesDiff, path);
+  }
 });
 
 test("with the deep review on, the instructions, the fixed rules and the advice are the deep ones", async () => {

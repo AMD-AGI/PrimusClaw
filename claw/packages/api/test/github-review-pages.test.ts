@@ -31,7 +31,7 @@ import { BASE_TIP, HEAD, type FakeFile } from "./support/fake-github.js";
 import { PR, TOKEN, closeShared, readSection, reviewEnv, type ReviewEnv } from "./support/review-env.js";
 
 /** Brain's cut (brain/src/agent/agent-loop.ts): a longer result reaches the model with its middle missing. */
-const BRAIN_CUT = 6000;
+const BRAIN_CUT = 24_000;
 
 let e: ReviewEnv;
 /** The read_id of the last overview: a page continues it, as the model is told to pass it. */
@@ -271,7 +271,7 @@ test("G7 a page fits whatever the text costs to escape, ends at a line end when 
 
 test("G9 the acting user's token in the change is masked before the section is cut into pages: no page boundary splits it out of reach", async () => {
   // One line far longer than a page, the token every 97 characters: page boundaries fall inside some of them.
-  const line = Array.from({ length: 400 }, (_, i) => `${"x".repeat(i % 50)}${TOKEN}`.padEnd(97, "y")).join("");
+  const line = Array.from({ length: Math.ceil(PAGE_MAX_CHARS * 8 / 97) }, (_, i) => `${"x".repeat(i % 50)}${TOKEN}`.padEnd(97, "y")).join("");
   useChange([{ filename: "leak.ts", status: "added", additions: 1, deletions: 0, patch: `@@ -0,0 +1 @@\n+${line}` }]);
   for (const section of ["diff", "files"]) {
     const { text, pages } = await readSection(e.service, e.actor, PR, section);
