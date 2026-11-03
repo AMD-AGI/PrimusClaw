@@ -78,6 +78,10 @@ rules:
     resources: ["pods/log"]
     verbs: ["get", "list"]
   - apiGroups: [""]
+    resources: ["configmaps"]
+    # The Router public key ConfigMap in sandbox pod namespaces.
+    verbs: ["create", "get", "update"]
+  - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
   - apiGroups: ["agents.x-k8s.io"]

@@ -339,6 +339,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := (&workloadmanager.RouterPublicKeyReconciler{
+		Clientset: clientset,
+	}).SetupWithManager(mgr); err != nil {
+		log.Error("unable to setup router public key controller", "error", err)
+		os.Exit(1)
+	}
+
 	// Session routing reads Sandbox CRs (namespace/name). MemoryStore is only
 	// for the rare path where the K8s client cannot be constructed.
 	var (

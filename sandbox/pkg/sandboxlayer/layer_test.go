@@ -4,7 +4,6 @@
 package sandboxlayer
 
 import (
-	"strings"
 	"testing"
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
@@ -27,13 +26,6 @@ func TestResolveDefaultsReadOnly(t *testing.T) {
 	}
 	if !got[0].ReadOnly || got[1].ReadOnly {
 		t.Fatalf("readOnly = %v, %v", got[0].ReadOnly, got[1].ReadOnly)
-	}
-	enc, err := Encode(got)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(enc, `"readOnly":true`) || !strings.Contains(enc, `"mount":"/opt/data"`) {
-		t.Fatalf("encode = %s", enc)
 	}
 }
 

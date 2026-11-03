@@ -47,8 +47,8 @@ func TestWorkloadObjectUsesTemplateResources(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, found, _ := unstructured.NestedFieldNoCopy(obj.Object, "spec", "entryPoints"); found {
-		t.Fatal("entryPoints must stay unset")
+	if entry, _, _ := unstructured.NestedStringSlice(obj.Object, "spec", "entryPoints"); len(entry) != 1 || entry[0] != safeStartupScript() {
+		t.Fatalf("entryPoints = %v", entry)
 	}
 	if obj.GetLabels()[safeDisplayNameLabel] != "dev" || obj.GetLabels()[ownerSessionIDLabel] != "s-8f2a" || obj.GetLabels()["primus-claw/session-id"] != "" || obj.GetLabels()[safeUserIDLabel] != "u-123" || obj.GetLabels()[grantIDLabel] != "gr-01jb7m9k2x" || obj.GetLabels()[sandboxIDLabel] != sandboxID {
 		t.Fatalf("labels=%v", obj.GetLabels())
@@ -620,23 +620,60 @@ func testCodeInterpreter() *runtimev1alpha1.CodeInterpreter {
 	}
 }
 
-func TestWorkloadObjectCarriesLayersAnnotation(t *testing.T) {
+func TestWorkloadObjectRendersEnvdPodParts(t *testing.T) {
 	const image = "registry.example/layer@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	ci := testCodeInterpreter()
 	ci.Spec.Template.Layers = []runtimev1alpha1.SandboxLayer{{Image: image, From: "/layer", Mount: "/opt/host"}}
 	const sandboxID = "sbx-7a9b9b693452f613877992145c818d29"
-	req := e2b.CreateRequest{SandboxID: sandboxID, TemplateID: "ar-run-dev-g2", Role: "dev", SessionID: "s-8f2a", Workspace: "top-models", GrantID: "gr-1", Attestation: "eyJ.test"}
+	req := e2b.CreateRequest{SandboxID: sandboxID, TemplateID: "ar-run-dev-g2", Role: "dev", SessionID: "s-8f2a", Workspace: "top-models",
+		GrantID: "gr-1", Attestation: "eyJ.test", SigningKeyPEM: "test-private-key"}
 	obj, err := workloadObject(sandboxID, req, ci)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `[{"image":"` + image + `","from":"/layer","mount":"/opt/host","readOnly":true}]`
-	if got := obj.GetAnnotations()["agent-sandbox.io/layers"]; got != want {
-		t.Fatalf("layers annotation = %s", got)
+	if _, ok := obj.GetAnnotations()["agent-sandbox.io/layers"]; ok {
+		t.Fatal("layers must be rendered, not annotated")
 	}
-	images, _, _ := unstructured.NestedSlice(obj.Object, "spec", "images")
-	if len(images) != 1 {
-		t.Fatalf("images = %v", images)
+	inits, _, _ := unstructured.NestedSlice(obj.Object, "spec", "initContainers")
+	if len(inits) != 2 || inits[0].(map[string]any)["name"] != "envd-injector" || inits[1].(map[string]any)["image"] != image {
+		t.Fatalf("initContainers = %v", inits)
+	}
+	injector := inits[0].(map[string]any)
+	if injector["env"] == nil || !strings.Contains(injector["command"].([]any)[2].(string), "chmod 0400 /run/signing-key/signing-key.pem") {
+		t.Fatalf("injector = %v", injector)
+	}
+	volumes, _, _ := unstructured.NestedSlice(obj.Object, "spec", "volumes")
+	names := map[string]map[string]any{}
+	for _, v := range volumes {
+		names[v.(map[string]any)["name"].(string)] = v.(map[string]any)
+	}
+	if names["signing-secret"]["secret"] != sandboxID || names["as-layer-0"] == nil || names["envd-session-identity"] == nil {
+		t.Fatalf("volumes = %v", volumes)
+	}
+	mounts, _, _ := unstructured.NestedSlice(obj.Object, "spec", "volumeMounts")
+	paths := map[string]bool{}
+	for _, m := range mounts {
+		paths[m.(map[string]any)["mountPath"].(string)] = true
+	}
+	if !paths["/shared/bin"] || !paths["/run/signing-key"] || !paths["/opt/host"] || paths[signingSecretMountRoot+"/"+sandboxID] {
+		t.Fatalf("volumeMounts = %v", mounts)
+	}
+	refs, _, _ := unstructured.NestedSlice(obj.Object, "spec", "envRefs")
+	if len(refs) != 2 || refs[1].(map[string]any)["configMapKeyRef"].(map[string]any)["name"] != RouterPublicKeyConfigMap {
+		t.Fatalf("envRefs = %v", refs)
+	}
+	if port, _, _ := unstructured.NestedInt64(obj.Object, "spec", "readiness", "port"); port != envdPort {
+		t.Fatalf("readiness port = %d", port)
+	}
+
+	req.SigningKeyPEM = ""
+	obj, err = workloadObject(sandboxID, req, ci)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inits, _, _ = unstructured.NestedSlice(obj.Object, "spec", "initContainers")
+	if inits[0].(map[string]any)["env"] != nil {
+		t.Fatal("a sandbox without a signing key must not require one")
 	}
 
 	ci.Spec.Template.Layers[0].Mount = "/run/signing-key"

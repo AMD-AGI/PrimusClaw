@@ -7,7 +7,6 @@
 package sandboxlayer
 
 import (
-	"encoding/json"
 	"fmt"
 	"path"
 	"regexp"
@@ -17,9 +16,6 @@ import (
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 )
-
-// Annotation carries the resolved layers on a SaFE Workload.
-const Annotation = "agent-sandbox.io/layers"
 
 // MaxLayers is the most layers one template may declare.
 const MaxLayers = 4
@@ -129,18 +125,6 @@ func TemplateMounts(tmpl *runtimev1alpha1.CodeInterpreterSandboxTemplate) []stri
 		out = append(out, vm.MountPath)
 	}
 	return out
-}
-
-// Encode returns the annotation value for resolved layers.
-func Encode(layers []Layer) (string, error) {
-	if len(layers) == 0 {
-		return "", nil
-	}
-	raw, err := json.Marshal(layers)
-	if err != nil {
-		return "", err
-	}
-	return string(raw), nil
 }
 
 // CopyCommand is the init container command that copies a layer into CopyTarget.
