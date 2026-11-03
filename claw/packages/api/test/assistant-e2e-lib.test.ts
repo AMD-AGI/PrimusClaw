@@ -10,19 +10,21 @@
  *   B3  while rejecting it answers 500 and records nothing as received, and takes deliveries again afterwards
  *   B4  an event accepted twice is reported as a duplicate, one accepted once is not
  *   B5  the percentile is nearest-rank; the table says which interjection was too slow and which got no answer
- *   B6  `until` returns what the probe found, null at the deadline, and never answers "found" for a probe that never did
+ *   B6  `until` returns what the probe found, null at the deadline, and never answers "found" for a probe that never did;
+ *       the deadline is strict: an answer that came after it, or a deadline already past, is null
  *   B7  a run tag is the one given, or a fresh one per run: two runs never share task names
  *   B8  a soak round counts as its own only items numbered after the round began that no earlier round took
  *   B9  the sandbox count is of this run's sessions only, and only of sandboxes not yet stopped; an unreadable list throws
  *   B10 cleanup runs after an early return, an exception and success alike, latest first, each despite another failing;
  *       the exit code is 0 only when the scenario finished with nothing failed
+ *   B11 a round's item is the one whose title names its task, not a task whose name merely contains it
  */
 import assert from "node:assert/strict";
 import test from "node:test";
 
 import { EVENT_ID_HEADER, SIGNATURE_HEADER, TIMESTAMP_HEADER, signPayload } from "../src/notifications/signing.js";
 import {
-  aliveSandboxes, duplicateEventIds, latencyMs, newItemsSince, percentile, renderTimings, runTag, settle, startReceiver, until,
+  aliveSandboxes, duplicateEventIds, itemNamed, latencyMs, newItemsSince, percentile, renderTimings, runTag, settle, startReceiver, until,
 } from "./e2e/assistant-p1-lib.js";
 
 const SECRET = "s".repeat(64);
@@ -119,6 +121,12 @@ test("B6 until returns what was found, and null at the deadline", async () => {
   assert.equal(await until(() => undefined, started + 60, 5), null);
   assert.ok(Date.now() - started >= 60, "it waited for the deadline");
   assert.equal(await until(() => false, Date.now() + 10, 1), false, "false is an answer: only undefined means not yet");
+  let probed = 0;
+  assert.equal(await until(() => { probed++; return "late"; }, Date.now() - 1, 1), null, "a deadline already past is null");
+  assert.equal(probed, 0, "and nothing is probed after it");
+  const slow = () => new Promise<string>((r) => setTimeout(() => r("ready"), 40));
+  assert.equal(await until(slow, Date.now() + 10, 1), null, "an answer that arrives after the deadline is not on time");
+  assert.equal(await until(slow, Date.now() + 500, 1), "ready", "one that arrives before it is");
 });
 
 test("B7 a run tag is the one given, or fresh per run", () => {
@@ -184,4 +192,15 @@ test("B10 cleanup runs whatever happened, and the exit code says whether it all 
   const failures = ["the board shows A as in progress"];
   assert.equal(await settle(async () => undefined, [], failures), 1);
   assert.deepEqual(failures, ["the board shows A as in progress"], "a recorded failure is not doubled by the early-return note");
+});
+
+test("B11 a round's item is the one its title names", () => {
+  const items = [{ title: "Task soak3-S13a: write s13a.txt" }, { title: "Task soak3-S1ab: write" }, { title: "Task soak3-S1b: write s1b.txt" }];
+  assert.equal(itemNamed(items, "S1a"), undefined, "S13a and S1ab are other tasks");
+  assert.equal(itemNamed(items, "S1b")?.title, "Task soak3-S1b: write s1b.txt");
+  assert.equal(itemNamed(items, "s13A")?.title, "Task soak3-S13a: write s13a.txt", "case does not matter");
+  assert.equal(itemNamed([{ title: "S2a" }], "S2a")?.title, "S2a", "at the start and end of the title");
+  assert.equal(itemNamed([{ title: "Task S2a.txt" }], "S2a")?.title, "Task S2a.txt");
+  assert.equal(itemNamed([{ title: "anything" }], "a.*"), undefined, "the name is literal");
+  assert.equal(itemNamed([{ title: "Task soak3-XS1a: write" }], "S1a"), undefined, "XS1a is another task");
 });

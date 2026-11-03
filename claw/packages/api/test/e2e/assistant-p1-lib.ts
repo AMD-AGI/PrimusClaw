@@ -123,11 +123,15 @@ export function apiClient(base: string, defaultKey: string) {
   };
 }
 
-/** Poll until `probe` returns something other than undefined, or the deadline passes (then null: never "assumed fine"). */
+/**
+ * Poll until `probe` returns something other than undefined, or the deadline passes (then null: never "assumed fine").
+ * The deadline is strict: an answer that arrives after it, or a deadline already past, is null.
+ */
 export async function until<T>(probe: () => Promise<T | undefined> | T | undefined, deadlineAt: number, everyMs = 250): Promise<T | null> {
   for (;;) {
+    if (Date.now() > deadlineAt) return null;
     const value = await probe();
-    if (value !== undefined) return value;
+    if (value !== undefined) return Date.now() <= deadlineAt ? value : null;
     if (Date.now() >= deadlineAt) return null;
     await new Promise((r) => setTimeout(r, everyMs));
   }
@@ -145,6 +149,13 @@ export function runTag(given: string | undefined, now = Date.now()): string {
 /** Items created after the board's highest number was `floorSeq`, that the run has not already counted as its own. */
 export function newItemsSince<T extends { item_id: string; seq: number }>(board: readonly T[], floorSeq: number, taken: ReadonlySet<string>): T[] {
   return board.filter((i) => Number(i.seq) > floorSeq && !taken.has(i.item_id)).sort((a, b) => a.seq - b.seq);
+}
+
+/** The item whose title names this task (`S3a` names neither `S13a` nor `S3ab`), if any. */
+export function itemNamed<T extends { title: string }>(items: Iterable<T>, name: string): T | undefined {
+  const re = new RegExp(`(^|[^A-Za-z0-9])${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}($|[^A-Za-z0-9])`, "i");
+  for (const i of items) if (re.test(i.title)) return i;
+  return undefined;
 }
 
 export const SESSION_ID_LABEL = "primus-claw/session-id";

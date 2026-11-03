@@ -31,6 +31,9 @@
  *                        (default 4); counted with kubectl (SaFE workloads labelled with the run's session ids)
  *   KUBECTL_ARGS         extra kubectl arguments for that count, e.g. "--context global"
  *
+ * One run at a time per user: everything numbered after the run began is taken as the run's own and is stopped and
+ * its worker deleted at the end, whatever ends the run.
+ *
  * Exit 0 only if every check passed. The last line is a JSON summary.
  */
 import { execFile } from "node:child_process";
@@ -38,8 +41,8 @@ import { promisify } from "node:util";
 
 import { mintAssistantToken } from "../../src/assistant/token.js";
 import {
-  SESSION_ID_LABEL, aliveSandboxes, apiClient, duplicateEventIds, latencyMs, newItemsSince, percentile, renderTimings,
-  runTag, settle, startReceiver, until, type Received, type Timing,
+  SESSION_ID_LABEL, aliveSandboxes, apiClient, duplicateEventIds, itemNamed, latencyMs, newItemsSince, percentile,
+  renderTimings, runTag, settle, startReceiver, until, type Received, type Timing,
 } from "./assistant-p1-lib.js";
 
 const run = promisify(execFile);
@@ -105,24 +108,25 @@ const runItems = new Map<string, { workerSessionId: string | null; retired: bool
 /** The sessions whose sandboxes count against SANDBOX_MAX: the assistant's and every worker of this run. */
 const runSessions = new Set<string>();
 
-/** Counts an item as this run's: it is stopped and its worker deleted at the latest when the run ends. */
+/** Counts an item as this run's (before anything can fail): it is stopped and its worker deleted when the run ends. */
 async function track(id: string): Promise<ItemView | null> {
+  if (!runItems.has(id)) runItems.set(id, { workerSessionId: null, retired: false });
   const it = await itemOf(id);
-  if (!runItems.has(id)) runItems.set(id, { workerSessionId: it?.worker_session_id ?? null, retired: false });
   if (it?.worker_session_id) { runItems.get(id)!.workerSessionId = it.worker_session_id; runSessions.add(it.worker_session_id); }
   return it;
 }
 
-/** Stops an item that is not done and deletes its worker session (and with it the sandbox). */
+/** Stops an item that is not done and deletes its worker session (and with it the sandbox). Unread is not retired. */
 async function retire(id: string): Promise<boolean> {
   const t = runItems.get(id);
   if (!t || t.retired) return true;
-  const it = await itemOf(id);
-  const stop = it && it.board_state !== "done" ? (await api("POST", `/v1/work-items/${id}/stop`)).status : 200;
+  const got = await api("GET", `/v1/work-items/${id}`);
+  const it = got.status === 200 ? (got.json.data as ItemView) : null;
+  const stop = !it ? got.status : it.board_state !== "done" ? (await api("POST", `/v1/work-items/${id}/stop`)).status : 200;
   const wid = it?.worker_session_id ?? t.workerSessionId;
-  const del = wid ? (await api("DELETE", `/v1/sessions/${wid}`)).status : 404;
+  const del = !it ? 0 : wid ? (await api("DELETE", `/v1/sessions/${wid}`)).status : 200;
   t.retired = stop === 200 && (del === 200 || del === 204 || del === 404);
-  if (!t.retired) log("could not retire", id, `stop ${stop}, delete worker ${del}`);
+  if (!t.retired) log("could not retire", id, `read ${got.status}, stop ${stop}, delete worker ${del}`);
   return t.retired;
 }
 const retireAll = async (ids: Iterable<string>) => (await Promise.all([...ids].map(retire))).every(Boolean);
@@ -140,7 +144,10 @@ let summaryPrinted = false;
 async function scenario(): Promise<"finished" | void> {
   const receiver = await startReceiver(Number(process.env.RECEIVER_PORT ?? 0));
   cleanups.push({ what: "close the receiver", run: () => receiver.close() });
+  const runFloor = Math.max(0, ...(await board()).map((i) => Number(i.seq)));
   cleanups.push({ what: "stop this run's items and delete their workers", run: async () => {
+    // Also what the run never saw: an item the Router created after the run last looked.
+    for (const i of newItemsSince(await board(), runFloor, new Set())) await track(i.item_id);
     if (!await retireAll(runItems.keys())) throw new Error("some items or workers could not be retired (see the log)");
   } });
   const hookUrl = `${RECEIVER_URL.replace(/:\d+$/, "")}:${RECEIVER_URL.match(/:(\d+)$/) ? RECEIVER_URL.match(/:(\d+)$/)![1] : receiver.port}/hook`;
@@ -265,7 +272,7 @@ async function scenario(): Promise<"finished" | void> {
   let roundsRun = 0;
   for (let round = 1; round <= SOAK_ROUNDS; round++) {
     if (!await sandboxGuard(round)) { log("FAIL", `soak round ${round}: stopping the run, too many of its sandboxes are alive`); break; }
-    soak.push(...await soakRound(round, send, receiver));
+    soak.push(...await soakRound(round, send, receiver, sid));
     roundsRun = round;
   }
   if (SOAK_ROUNDS) check(roundsRun === SOAK_ROUNDS, `all ${SOAK_ROUNDS} soak rounds ran (${roundsRun})`);
@@ -377,38 +384,49 @@ async function refusedReceiver(send: Send, receiver: Rec, newItem: NewItem, know
 
 /**
  * One short A/B round with two interjections, for the latency distribution. Everything the round creates is closed
- * in the round: both items accepted (or stopped when not ready in time) and their workers deleted. Returns the
- * interjection latencies.
+ * in the round: its two items accepted (or stopped when not ready in time), anything else new stopped, and every
+ * worker deleted. Returns the interjection latencies.
  */
-async function soakRound(round: number, send: Send, receiver: Rec): Promise<number[]> {
+async function soakRound(round: number, send: Send, receiver: Rec, assistantSid: string): Promise<number[]> {
   const floor = Math.max(0, ...(await board()).map((i) => Number(i.seq)));
-  const startedAt = Date.now();
-  const name = (x: string) => `${RUN_TAG}-S${round}${x}`;
-  const t = await send(`Task ${name("a")}: write "${name("a")}" into /workspace/s${round}a.txt. Task ${name("b")}: write "${name("b")}" into /workspace/s${round}b.txt. Start both now.`);
-  const mine = new Map<string, number>();
+  const deadline = Date.now() + SOAK_DONE_WAIT_MS;
+  const names = [`S${round}a`, `S${round}b`];
+  const full = (n: string) => `${RUN_TAG}-${n}`;
+  const seen = new Map<string, ItemView>();
   const collect = async () => {
-    for (const i of newItemsSince(await board(), floor, new Set(runItems.keys()))) { mine.set(i.item_id, i.seq); await track(i.item_id); }
+    for (const i of newItemsSince(await board(), floor, new Set(runItems.keys()))) { seen.set(i.item_id, i); await track(i.item_id); }
   };
-  await until(async () => { await collect(); return mine.size >= 2 ? true : undefined; }, t + SAY_BUDGET_MS * 3, 1000);
-  check(mine.size === 2, `soak round ${round}: both tasks are on the board (${mine.size})`);
-  const out: number[] = [];
-  for (const q of ["How are the two tasks going?", "Which of them is done?"]) {
-    const sent = await send(q);
-    // A "ready, accept it" message is the system reporting a task, not the answer to this question.
-    const said = await until(() => receiver.received.find((r) => r.type === "assistant.say" && r.at >= sent && !r.item?.can_accept), sent + SAY_BUDGET_MS * 3, 100);
-    out.push(said ? said.at - sent : Number.POSITIVE_INFINITY);
-  }
-  const deadline = startedAt + SOAK_DONE_WAIT_MS;
-  for (const [id, seq] of mine) {
-    const it = await ready(id, deadline);
-    if (check(it !== null, `soak round ${round}: #${seq} is ready in time`)) {
-      check((await api("POST", `/v1/work-items/${id}/accept`, { version: it!.result_version })).status === 200, `soak round ${round}: #${seq} is accepted`);
+  try {
+    const t = await send(`Task ${full(names[0])}: write "${full(names[0])}" into /workspace/s${round}a.txt. Task ${full(names[1])}: write "${full(names[1])}" into /workspace/s${round}b.txt. Start both now.`);
+    const mine = await until(async () => {
+      await collect();
+      const found = names.map((n) => itemNamed(seen.values(), n));
+      return found.every(Boolean) ? (found as ItemView[]) : undefined;
+    }, t + SAY_BUDGET_MS * 3, 1000);
+    check(mine !== null, `soak round ${round}: both tasks are on the board (${names.map((n) => `${n} ${itemNamed(seen.values(), n) ? `#${itemNamed(seen.values(), n)!.seq}` : "missing"}`).join(", ")})`);
+    const out: number[] = [];
+    for (const q of ["How are the two tasks going?", "Which of them is done?"]) {
+      // Only once the assistant is between turns is the next thing it says the answer to this question.
+      const idle = await until(async () => ((await api("GET", `/v1/sessions/${assistantSid}`)).json?.data?.agent_status === "running" ? undefined : true), Date.now() + 60_000, 500);
+      check(idle === true, `soak round ${round}: the assistant is between turns before "${q}"`);
+      const sent = await send(q);
+      // A "ready, accept it" message is the system reporting a task, not the answer to this question.
+      const said = await until(() => receiver.received.find((r) => r.type === "assistant.say" && r.at >= sent && !r.item?.can_accept), sent + SAY_BUDGET_MS * 3, 100);
+      out.push(said ? said.at - sent : Number.POSITIVE_INFINITY);
     }
+    const readied = await Promise.all((mine ?? []).map((i) => ready(i.item_id, deadline)));
+    for (const [k, it] of readied.entries()) {
+      const seq = mine![k].seq;
+      if (check(it !== null, `soak round ${round}: #${seq} is ready in time`)) {
+        check((await api("POST", `/v1/work-items/${it!.item_id}/accept`, { version: it!.result_version })).status === 200, `soak round ${round}: #${seq} is accepted`);
+      }
+    }
+    log(`soak round ${round}:`, out.map((n) => (Number.isFinite(n) ? `${n}ms` : "no answer")).join(", "));
+    return out;
+  } finally {
+    await collect();
+    check(await retireAll(seen.keys()), `soak round ${round}: its ${seen.size} items are closed and their workers deleted`);
   }
-  await collect();
-  check(await retireAll(mine.keys()), `soak round ${round}: its ${mine.size} items are closed and their workers deleted`);
-  log(`soak round ${round}:`, out.map((n) => (Number.isFinite(n) ? `${n}ms` : "no answer")).join(", "));
-  return out;
 }
 
 main().catch((err) => {
