@@ -445,7 +445,7 @@ record it.
   as soon as the platform reports it, instead of one "Waiting in queue (position 0)" and then ten minutes of nothing
   (`log`, plus additive `waiting` = `queued` | `unscheduled` and `waitReason`: one line in our words, such as how many
   nodes cannot take the sandbox and why, never the platform's pool ids, namespaces, pod names or taint keys, which stay
-  in the Brain log). A sandbox the platform admitted whose pod no node has taken and for which no node is being added,
+  in the Brain log; the queue's own short phrases are repeated as written). A sandbox the platform admitted whose pod no node has taken and for which no node is being added,
   for `SANDBOX_UNSCHEDULABLE_TIMEOUT_SECONDS` (default 300, chart `secret.sandboxUnschedulableTimeoutSeconds`, `0` turns
   it off), now ends with the new reason `sandbox_unschedulable` saying what was observed, and its workload is stopped;
   before, it was waited on for the whole of `SANDBOX_START_TIMEOUT_SECONDS` (15 minutes) once the platform called it

@@ -107,6 +107,18 @@ const count = (text: string, re: RegExp): number => Number(re.exec(text)?.[1] ??
 /** Said when the platform's text is not one we can summarise, and the workload is admitted. */
 const UNPLACED = "the platform has not been able to place the sandbox on a node yet";
 
+/** Said when the platform's queue text is not a phrase of its own that we can repeat. */
+const NOT_ADMITTED = "the platform has not admitted the sandbox yet";
+
+/**
+ * The platform's own queue wording: a short phrase of words and separators, the way
+ * its scheduler writes it ("In queue - insufficient resources, no cpu available").
+ * Anything with more in it -- digits, paths, braces, a colon and a message after it,
+ * which is where an id or a name from the platform would be -- is not this, and is
+ * not repeated to the user.
+ */
+const QUEUE_PHRASE = /^In queue - [A-Za-z][A-Za-z ,'-]{0,150}$/;
+
 /**
  * A line for the user out of the scheduler's and the autoscaler's text, or null
  * when the text is neither. Only what the user can use survives: how many nodes
@@ -157,11 +169,12 @@ export function readWaitingState(detail: Record<string, unknown>): WaitingState 
   const summary = text ? summarizeScheduling(text) : null;
 
   // The platform's own queue: the reason is its own wording, which for this
-  // state is a sentence about capacity, not a scheduler dump.
+  // state is a short phrase about capacity, repeated as written when it is one
+  // and summarised or replaced when it is not.
   if (phase === "pending" && position > 0) {
     return {
       kind: "queued",
-      reason: summary ?? (cleanPlatformText(text) || "the platform has not admitted the sandbox yet"),
+      reason: summary ?? (QUEUE_PHRASE.test(text) ? text : NOT_ADMITTED),
       detail: text,
     };
   }

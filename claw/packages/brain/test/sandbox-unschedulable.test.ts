@@ -272,13 +272,34 @@ test("platform text reaches the user as one bounded line", () => {
   const long = cleanPlatformText("x".repeat(1000));
   assert.equal(long.length, 300);
   assert.ok(long.endsWith("…"));
-  // The queue's own words are shown as written, so they get the bound.
-  const w = readWaitingState(queued(2, `bad\nreason ${"y".repeat(500)}`));
-  assert.ok(!w!.reason.includes("\n") && w!.reason.length <= 300);
   // And the pod and node names in the log's sentence get the same treatment.
   const named = readWaitingState({ phase: "Pending", pods: [{ podId: `p\n${"z".repeat(500)}`, phase: "Pending" }] });
   assert.ok(!named!.detail.includes("\n") && named!.detail.length < 200, named!.detail);
   assert.doesNotMatch(named!.reason, /z/);
+});
+
+test("the queue's own phrases are repeated as written, and anything else it says is not", () => {
+  for (const message of [
+    "In queue - insufficient resources, no cpu available",
+    "In queue - waiting for earlier or higher priority workloads",
+    "In queue - waiting for scheduled start time",
+  ]) {
+    assert.deepEqual(readWaitingState(queued(2, message)), { kind: "queued", reason: message, detail: message });
+  }
+  const generic = "the platform has not admitted the sandbox yet";
+  for (const message of [
+    "",
+    `In queue - capacity reservation ${POOL} was rejected`,
+    "In queue - waiting for capacity service: claw-sandboxes/claw-1785291793209-sandbox-x7k2p not found",
+    `In queue - ${"y".repeat(500)}`,
+    "In queue - waiting\nfor {example.amd.com/node-profile}",
+    "queued behind everything else",
+  ]) {
+    const w = readWaitingState(queued(2, message))!;
+    assert.equal(w.kind, "queued", message);
+    assert.equal(w.reason, generic, message);
+    assert.equal(w.detail, cleanPlatformText(message, Infinity), "the log keeps what the platform said");
+  }
 });
 
 test("the progress sentence names the reason for each kind", () => {
@@ -584,6 +605,15 @@ test("a queued sandbox's progress event says the position and the platform's rea
   assert.equal(progress.log, "Waiting in queue (position 3): In queue - insufficient resources, no cpu available");
   assert.equal(progress.waiting, "queued");
   assert.equal(progress.waitReason, "In queue - insufficient resources, no cpu available");
+});
+
+test("a queued sandbox's event carries none of the platform's identifiers either", { timeout: 5000 }, async () => {
+  const { events } = await poll([queued(2, `In queue - capacity reservation ${POOL} rejected by claw-sandboxes/x7k2p`), running]);
+  const progress = events.find((e) => e.status === "pending");
+  assert.ok(progress, JSON.stringify(events));
+  assert.equal(progress.log, "Waiting in queue (position 2): the platform has not admitted the sandbox yet");
+  assert.equal(progress.waitReason, "the platform has not admitted the sandbox yet");
+  assert.doesNotMatch(JSON.stringify(events), IDENTIFIERS);
 });
 
 test("an unschedulable sandbox says so when it starts waiting, then ends with the reason as an event", { timeout: 5000 }, async () => {

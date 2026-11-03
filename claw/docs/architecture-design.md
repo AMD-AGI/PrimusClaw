@@ -598,7 +598,9 @@ queue time and never a sandbox that is pulling an image, and only the sandbox a 
 applications wait as before). While a sandbox waits in either way the loop reports it as soon as the
 platform says so, not on the ten-minute tick, and the user is shown one line in our words (how many
 nodes cannot take it and why, whether a node is being added) rather than the platform's text, which
-carries its pool ids, namespaces, pod names and taint keys and stays in the logs. When a run's open
+carries its pool ids, namespaces, pod names and taint keys and stays in the logs. The platform's own
+short queue phrases ("In queue - insufficient resources, no cpu available") are repeated as written;
+a queue text with anything else in it is replaced by a generic line. When a run's open
 ends on this, the start ceiling or the queue ceiling, the run refuses to open another sandbox for the
 rest of that turn, the model is told so in the tool error and told to report the reason to the user, and
 the workload is stopped and its pending binding reaped.
