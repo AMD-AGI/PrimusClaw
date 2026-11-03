@@ -40,6 +40,12 @@ record it.
   export, build and run the closest tests under a time bound, then a second adversarial pass by a read-only
   sub-agent; the review body lists what was read and run and carries non-blocking suggestions and open questions,
   while inline comments stay for verified blocking findings. The gates are unchanged.
+- An on-behalf review costs less: every turn of a session that acts as a user writes its rolling prompt-cache markers
+  for 5 minutes and keeps the anchor at `LLM_CACHE_TTL` (new `ExecuteRequest.rolling_cache_ttl`; other sessions are
+  unchanged), bounds its second pass to 20 turns (new `ExecuteRequest.sub_agent_max_turns`, never above
+  `SUB_AGENT_MAX_TURNS`), and hands that pass the diff file, what was read and the callers seen but not opened.
+  `gh_pr_get` answers in pages of up to 23000 characters (Brain cuts that tool at 24000, other tools still at 6000), and
+  the deep review's sandbox path reads the diff once from its checkout instead of in pages. Deploy Brain before the API.
 - The model can schedule work itself: with `CLAW_TRIGGER_TOOLS_ENABLED` (needs `CLAW_TRIGGERS_ENABLED` and a
   `CLAW_TRIGGER_TOOLS_TOKEN_KEY` of 32+ characters; off by default) every turn but a trigger's own run is offered
   `trigger_create`, `trigger_list` and `trigger_cancel`, served by the API at `/v1/internal/trigger-mcp`. The user is

@@ -82,7 +82,7 @@ review and the merge and who is the reviewer of record, and whose own standing a
 
 | Tool | What it does |
 |---|---|
-| `gh_pr_get` | The pull request, its files and diff, CI, review threads, existing comments, the risk evidence and hard holds for the model's `risk_judgement`, what the acting user may do, the review path (below) and the review instructions. Text that came from the pull request is under `untrusted`. Call it first. Every answer fits under Brain's 6000-character tool-result cut: the first is the overview, and what does not fit in it (`instructions`, `files`, `diff`, `conversation`) is read whole in pages, with `section`, `head_sha`, `read_id` and `offset` from each page's `next_offset`. Offsets are the whole diff's, with or without `file`; an offset past the end, or a `file` that is not in the change, is refused (`offset_out_of_range`, `unknown_file`), never answered with an empty page. A page is served from what the session read of that head and costs one GitHub request, which re-checks the repository gates, the head and the base branch; when the base branch has moved, the pull request is read again and the page is served only if it still reads the same (`read_id`), else refused with `read_changed`. |
+| `gh_pr_get` | The pull request, its files and diff, CI, review threads, existing comments, the risk evidence and hard holds for the model's `risk_judgement`, what the acting user may do, the review path (below) and the review instructions. Text that came from the pull request is under `untrusted`. Call it first. Every answer fits under Brain's cut of this tool's results (24000 characters; 6000 for other tools), at most 23000 characters: the first is the overview, and what does not fit in it (`instructions`, `files`, `diff`, `conversation`) is read whole in pages, with `section`, `head_sha`, `read_id` and `offset` from each page's `next_offset` (on the deep review's sandbox path, `how_to_read` says the diff is read once from the checkout instead, and paged only if the checkout fails). Brain must be deployed before the API: an older Brain cuts a page at 6000 characters. Offsets are the whole diff's, with or without `file`; an offset past the end, or a `file` that is not in the change, is refused (`offset_out_of_range`, `unknown_file`), never answered with an empty page. A page is served from what the session read of that head and costs one GitHub request, which re-checks the repository gates, the head and the base branch; when the base branch has moved, the pull request is read again and the page is served only if it still reads the same (`read_id`), else refused with `read_changed`. |
 | `gh_pr_risk` | Whether an approval or a merge would be held, and why, for the `risk_judgement` and `risk_flags` (`security_finding`, `review_skipped`) the model passes (see High risk): the judgement decides, except for the hard holds, and none holds. |
 | `gh_review_submit` | One review on the pinned head commit (the model may pass the same `risk_flags` as to `gh_pr_risk`, and they count for an `APPROVE`), with inline comments that must sit on lines the diff shows. `COMMENT`, `REQUEST_CHANGES` or `APPROVE`. A body footer says `Reviewed by <agent name> on behalf of <login> (requested by <name>), run <id>` (the agent name is `CLAW_GITHUB_REVIEW_AGENT_NAME`, default `Claw`) and a hidden marker (the run, the event and a digest of the text and inline comments) keeps a retry of the same review from posting twice, while a different review of the same kind on the same commit is posted. An `APPROVE` the model judges high, without a judgement, or with a hard hold is held until the acting user confirms (below). |
 | `gh_pr_merge` | Approves when needed and merges, if every gate is open. On a base branch that is merged through a merge queue it puts the pull request in the queue instead of merging it (`queued`, below). A merge the model judges high, without a judgement, or with a hard hold is held until the acting user confirms. |
@@ -459,8 +459,24 @@ packages from their built output, which a fresh checkout lacks; dependencies and
 in the reused checkout are kept and reused, never reinstalled from clean), then has a
 second, adversarial pass look for what the first missed (a `task` sub-agent with read and bash
 tools only), and the review body lists what was read and run. A diff alone shows what changed, not
-who depends on it. It is off by default: on a benchmark of injected bugs it caught no more than the
-review without it, at about 3.6 times the cost per review.
+who depends on it.
+
+It is on by default, and an operator upgrading gets it with its cost: every change of a source file
+now takes the sandbox path, with the sandbox the instructions require, and a review costs more.
+Measured on claude-opus-5.5 over five real pull requests, it cost about $1.86 per review (against about
+$0.62 for the review without it on the same model, and $0.29 for that review on claude-sonnet-5.5), and found 17 real
+problems where the review without it found 4. Three things below keep the cost down, and re-measured
+on two of those pull requests they took a review from $1.14 to $0.80 and from $1.17 to $0.96, with the same
+verdicts. Every turn of an on-behalf review writes its rolling prompt-cache markers for 5 minutes,
+since nobody waits between its turns, and keeps the anchor at `LLM_CACHE_TTL` (1h by default) so the
+next review still reads the shared prefix; the second pass is bounded to 20 turns and is handed the
+diff (written once to `.pr-review/pr.diff` in the checkout, excluded from git), what the first pass
+read, and the callers a search showed but it did not open, which it opens first; and the diff is
+read once from the checkout rather than in `gh_pr_get` pages.
+
+`CLAW_GITHUB_REVIEW_DEEP_ENABLED=false` turns the deep review off. The review model stays
+`CLAW_GITHUB_REVIEW_MODEL` (default `claude-opus-5.5`); to have the deployment's own model back as
+well, set `CLAW_GITHUB_REVIEW_MODEL=default` too.
 
 Either way, Brain opens a sandbox only when a turn uses a sandbox tool, so the decision is
 advice plus a record: a structured log line (`github_review.path_chosen` with `review_path`,
