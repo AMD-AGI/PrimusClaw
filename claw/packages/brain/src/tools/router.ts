@@ -52,7 +52,7 @@ function validateSubFilePath(filePath: string): string | null {
 const SKILLS_PATH_RE = /\.skills\b/;
 
 /** Most of a result kept on disk; past this a command's output is better re-run into a file of its own. */
-const SPILL_MAX_CHARS = 4 * 1024 * 1024;
+export const SPILL_MAX_CHARS = 4 * 1024 * 1024;
 
 /** The tools that write skills, which the API keeps only when skill self-evolution is on. */
 export const SKILL_WRITE_TOOLS = new Set(["save_skill", "add_skill_file", "update_skill_file", "remove_skill_file"]);

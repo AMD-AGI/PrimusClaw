@@ -16,7 +16,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { Message, ToolSchema } from "@claw/protocol";
 import type { LlmSession, LlmTurnResult, LlmContentBlock } from "../src/llm/provider.js";
-import { ToolRouter, SKILL_WRITE_TOOLS } from "../src/tools/router.js";
+import { ToolRouter, SKILL_WRITE_TOOLS, SPILL_MAX_CHARS } from "../src/tools/router.js";
 import { TOOL_RESULTS_DIR } from "../src/workspace/excludes.js";
 import { agentLoop, truncateToolResult, type LoopOptions } from "../src/agent/agent-loop.js";
 import { connectPlatformMcp, mcpContentText, mcpUnavailableNote } from "../src/clients/mcp.js";
@@ -186,6 +186,19 @@ test("H5 a long read page is not kept again: it is cut at a line with the offset
   const lastKept = Number(/(\d+)\|z+\n\n\[\.\.\. read result cut/.exec(seen)?.[1]);
   assert.ok(lastKept > 0 && lastKept < 400, seen.slice(-300));
   assert.match(seen, new RegExp(`continue with read offset=${lastKept + 1}\\b`));
+});
+
+test("H5 a result over the spill cap is said to be kept only in part", () => {
+  const huge = "q".repeat(SPILL_MAX_CHARS + 10);
+  const seen = truncateToolResult(huge, "bash", "/workspace/.tool-results/t.txt");
+  assert.match(seen, new RegExp(`only the first ${SPILL_MAX_CHARS} of its ${huge.length} chars are saved`));
+  assert.doesNotMatch(seen, /the whole result/);
+});
+
+test("H5 a read page whose first line alone is over the budget does not point past the cut", () => {
+  const seen = truncateToolResult(`1|${"w".repeat(9000)}\n2|next`, "read");
+  assert.match(seen, /line 1 alone is longer than this and was cut; see the rest of it with bash/);
+  assert.doesNotMatch(seen, /\[\.\.\. [^\]]*; continue with read offset=2, and a smaller limit/);
 });
 
 test("H5 a short result is passed through untouched and nothing is written", () => {

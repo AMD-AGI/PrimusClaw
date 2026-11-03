@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { ToolRouter } from "../tools/router.js";
+import { ToolRouter, SPILL_MAX_CHARS } from "../tools/router.js";
 import { isRetryable } from "../infra/retry.js";
 import { runSubagent, SUBAGENT_TYPES, type SubagentType } from "./sub-agent.js";
 import {
@@ -393,9 +393,11 @@ export function truncateToolResult(text: string, toolName?: string, savedAt?: st
   const head = text.slice(0, TOOL_RESULT_HEAD_CHARS);
   const tail = text.slice(-TOOL_RESULT_TAIL_CHARS);
   const dropped = text.length - TOOL_RESULT_HEAD_CHARS - TOOL_RESULT_TAIL_CHARS;
-  const how = savedAt
-    ? `the whole result (${text.length} chars) is saved at ${savedAt}: read it with offset/limit or grep it instead of re-running`
-    : "if you need the elided portion, re-run the command with narrower scope (head/tail/grep/sed range)";
+  const how = !savedAt
+    ? "if you need the elided portion, re-run the command with narrower scope (head/tail/grep/sed range)"
+    : text.length <= SPILL_MAX_CHARS
+      ? `the whole result (${text.length} chars) is saved at ${savedAt}: read it with offset/limit or grep it instead of re-running`
+      : `only the first ${SPILL_MAX_CHARS} of its ${text.length} chars are saved at ${savedAt}; for the rest, re-run the command with its output narrowed or written to a file of its own`;
   return `${head}\n\n[... ${dropped} chars truncated for context efficiency; ${how} ...]\n\n${tail}`;
 }
 
@@ -411,9 +413,12 @@ function truncateReadResult(text: string): string {
   const cut = budget.lastIndexOf("\n");
   const kept = cut > 0 ? budget.slice(0, cut) : budget;
   const last = /(?:^|\n)(\d+)\|[^\n]*$/.exec(kept);
-  const how = last
-    ? `continue with read offset=${Number(last[1]) + 1}, and a smaller limit if lines are long`
-    : "page through the file with read offset and limit";
+  // No whole line fits: the one shown is cut, and read cannot page inside a line.
+  const how = cut <= 0 && last
+    ? `line ${last[1]} alone is longer than this and was cut; see the rest of it with bash (e.g. sed -n '${last[1]}p' <file> | cut -c 1-) or grep, then continue with read offset=${Number(last[1]) + 1}`
+    : last
+      ? `continue with read offset=${Number(last[1]) + 1}, and a smaller limit if lines are long`
+      : "page through the file with read offset and limit";
   return `${kept}\n\n[... read result cut at ${kept.length} of ${text.length} chars for context efficiency; ${how} ...]`;
 }
 
