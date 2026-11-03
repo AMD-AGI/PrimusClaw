@@ -30,6 +30,10 @@ account bound and is not looked at; the committer's account must not be the auth
 (`cannot_approve_own_pull_request`), and without the committer's standing authorization nothing is done
 with their account (`delegation_off`).
 
+Two roles run through the rest of this page. The *requester* asks (usually the author of the pull request, and the
+owner of the session); the *acting user* is the committer named in `config.acting_as`, whose GitHub account does the
+review and the merge and who is the reviewer of record, and whose own standing authorization is what lets someone else ask.
+
 ## How a session uses it
 
 1. The requester creates a session with `config.acting_as = "<user id>"` (`POST /v1/sessions`),
