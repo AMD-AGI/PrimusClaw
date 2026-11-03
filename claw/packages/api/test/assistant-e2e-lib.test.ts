@@ -11,12 +11,19 @@
  *   B4  an event accepted twice is reported as a duplicate, one accepted once is not
  *   B5  the percentile is nearest-rank; the table says which interjection was too slow and which got no answer
  *   B6  `until` returns what the probe found, null at the deadline, and never answers "found" for a probe that never did
+ *   B7  a run tag is the one given, or a fresh one per run: two runs never share task names
+ *   B8  a soak round counts as its own only items numbered after the round began that no earlier round took
+ *   B9  the sandbox count is of this run's sessions only, and only of sandboxes not yet stopped; an unreadable list throws
+ *   B10 cleanup runs after an early return, an exception and success alike, latest first, each despite another failing;
+ *       the exit code is 0 only when the scenario finished with nothing failed
  */
 import assert from "node:assert/strict";
 import test from "node:test";
 
 import { EVENT_ID_HEADER, SIGNATURE_HEADER, TIMESTAMP_HEADER, signPayload } from "../src/notifications/signing.js";
-import { duplicateEventIds, latencyMs, percentile, renderTimings, startReceiver, until } from "./e2e/assistant-p1-lib.js";
+import {
+  aliveSandboxes, duplicateEventIds, latencyMs, newItemsSince, percentile, renderTimings, runTag, settle, startReceiver, until,
+} from "./e2e/assistant-p1-lib.js";
 
 const SECRET = "s".repeat(64);
 const payload = (id: string, extra: Record<string, unknown> = {}) => JSON.stringify({
@@ -112,4 +119,69 @@ test("B6 until returns what was found, and null at the deadline", async () => {
   assert.equal(await until(() => undefined, started + 60, 5), null);
   assert.ok(Date.now() - started >= 60, "it waited for the deadline");
   assert.equal(await until(() => false, Date.now() + 10, 1), false, "false is an answer: only undefined means not yet");
+});
+
+test("B7 a run tag is the one given, or fresh per run", () => {
+  assert.equal(runTag("soak3"), "soak3");
+  assert.equal(runTag("  soak3 \n"), "soak3");
+  assert.equal(runTag(undefined, 1_000_000), "r" + (1_000_000).toString(36));
+  assert.equal(runTag("", 1_000_000), runTag(undefined, 1_000_000));
+  assert.notEqual(runTag(undefined, 1_000_000), runTag(undefined, 1_000_001), "two runs started apart do not share names");
+});
+
+test("B8 a round takes only items numbered after it began, and none an earlier round took", () => {
+  const board = [{ item_id: "k5", seq: 5 }, { item_id: "k7", seq: 7 }, { item_id: "k6", seq: 6 }, { item_id: "k8", seq: 8 }];
+  assert.deepEqual(newItemsSince(board, 5, new Set()).map((i) => i.item_id), ["k6", "k7", "k8"], "in number order");
+  assert.deepEqual(newItemsSince(board, 5, new Set(["k7"])).map((i) => i.item_id), ["k6", "k8"], "an earlier round's item is not taken");
+  assert.deepEqual(newItemsSince(board, 8, new Set()), [], "nothing after the floor");
+  assert.deepEqual(newItemsSince([{ item_id: "k9", seq: "9" as unknown as number }], 8, new Set()).map((i) => i.item_id), ["k9"], "a number sent as a string still counts");
+});
+
+test("B9 the sandbox count is of this run's live sandboxes only", () => {
+  const w = (name: string, sid: string | null, phase?: string) => ({
+    metadata: { name, labels: (sid ? { "primus-claw/session-id": sid } : {}) as Record<string, string> }, ...(phase ? { status: { phase } } : {}),
+  });
+  const list = { items: [
+    w("mine-running", "s1", "Running"), w("mine-pending", "s2", "Pending"), w("mine-new", "s2"),
+    w("mine-stopped", "s1", "Stopped"), w("mine-failed", "s1", "Failed"), w("mine-done", "s2", "Succeeded"),
+    w("other-running", "s9", "Running"), w("unlabelled", null, "Running"),
+  ] };
+  assert.deepEqual(aliveSandboxes(list, new Set(["s1", "s2"])), ["mine-running", "mine-pending", "mine-new"]);
+  assert.deepEqual(aliveSandboxes(list, new Set()), [], "an empty run owns nothing, not the unlabelled one");
+  assert.throws(() => aliveSandboxes({} as never, new Set(["s1"])), /no items/, "an unreadable list is not zero sandboxes");
+});
+
+test("B10 cleanup runs whatever happened, and the exit code says whether it all passed", async () => {
+  const runWith = async (scenario: () => Promise<"finished" | void>, failingCleanup = false) => {
+    const order: string[] = [];
+    const failures: string[] = [];
+    const cleanups = [
+      { what: "first", run: async () => { order.push("first"); } },
+      { what: "second", run: async () => { order.push("second"); if (failingCleanup) throw new Error("boom"); } },
+      { what: "third", run: async () => { order.push("third"); } },
+    ];
+    const code = await settle(() => scenario.call(null), cleanups, failures);
+    return { code, order, failures };
+  };
+  const ok = await runWith(async () => "finished");
+  assert.deepEqual(ok, { code: 0, order: ["third", "second", "first"], failures: [] });
+
+  const early = await runWith(async () => { /* a check failed and the scenario returned */ });
+  assert.equal(early.code, 1, "an early return never exits 0");
+  assert.deepEqual(early.order, ["third", "second", "first"]);
+  assert.match(early.failures[0], /ended before it finished/);
+
+  const thrown = await runWith(async () => { throw new Error("network down"); });
+  assert.equal(thrown.code, 1);
+  assert.deepEqual(thrown.order, ["third", "second", "first"]);
+  assert.match(thrown.failures[0], /network down/);
+
+  const badCleanup = await runWith(async () => "finished", true);
+  assert.equal(badCleanup.code, 1, "a cleanup that failed fails the run");
+  assert.deepEqual(badCleanup.order, ["third", "second", "first"], "the cleanups after it still run");
+  assert.match(badCleanup.failures[0], /cleanup: second: boom/);
+
+  const failures = ["the board shows A as in progress"];
+  assert.equal(await settle(async () => undefined, [], failures), 1);
+  assert.deepEqual(failures, ["the board shows A as in progress"], "a recorded failure is not doubled by the early-return note");
 });

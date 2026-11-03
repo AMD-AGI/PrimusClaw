@@ -132,3 +132,51 @@ export async function until<T>(probe: () => Promise<T | undefined> | T | undefin
     await new Promise((r) => setTimeout(r, everyMs));
   }
 }
+
+/**
+ * The tag every task name of one run carries. The Router answers a task it closed in the last day from that item
+ * ("already done"), so a rerun whose task names repeat an earlier run's gets no new item; a tag per run prevents it.
+ */
+export function runTag(given: string | undefined, now = Date.now()): string {
+  const tag = (given ?? "").trim();
+  return tag || `r${now.toString(36)}`;
+}
+
+/** Items created after the board's highest number was `floorSeq`, that the run has not already counted as its own. */
+export function newItemsSince<T extends { item_id: string; seq: number }>(board: readonly T[], floorSeq: number, taken: ReadonlySet<string>): T[] {
+  return board.filter((i) => Number(i.seq) > floorSeq && !taken.has(i.item_id)).sort((a, b) => a.seq - b.seq);
+}
+
+export const SESSION_ID_LABEL = "primus-claw/session-id";
+const TERMINAL_PHASES = new Set(["Stopped", "Succeeded", "Failed"]);
+
+export interface WorkloadList {
+  items?: Array<{ metadata?: { name?: string; labels?: Record<string, string> }; status?: { phase?: string } }>;
+}
+
+/** Names of the sandboxes (SaFE workloads) of these sessions that are not yet in a terminal phase. */
+export function aliveSandboxes(list: WorkloadList, sessions: ReadonlySet<string>): string[] {
+  if (!Array.isArray(list?.items)) throw new Error("the workload list has no items array");
+  return list.items
+    .filter((w) => sessions.has(w.metadata?.labels?.[SESSION_ID_LABEL] ?? "") && !TERMINAL_PHASES.has(w.status?.phase ?? ""))
+    .map((w) => w.metadata?.name ?? "?");
+}
+
+/**
+ * Runs the scenario, then every registered cleanup whatever happened (latest first, each one even if another failed),
+ * and answers the exit code: 0 only if nothing failed. A scenario that throws, or ends without a recorded failure
+ * but without finishing, is a failure too.
+ */
+export async function settle(
+  scenario: () => Promise<"finished" | void>, cleanups: Array<{ what: string; run: () => Promise<void> }>, failures: string[],
+): Promise<number> {
+  try {
+    if ((await scenario()) !== "finished" && failures.length === 0) failures.push("the scenario ended before it finished");
+  } catch (err) {
+    failures.push(`the scenario could not be carried out: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  for (const c of [...cleanups].reverse()) {
+    try { await c.run(); } catch (err) { failures.push(`cleanup: ${c.what}: ${err instanceof Error ? err.message : String(err)}`); }
+  }
+  return failures.length === 0 ? 0 : 1;
+}

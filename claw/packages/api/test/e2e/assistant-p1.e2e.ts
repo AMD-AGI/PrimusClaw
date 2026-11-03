@@ -24,6 +24,12 @@
  *   RECEIVER_HOLD_SEC    how long the receiver refuses in the "receiver" chaos step (default SILENT_SWEEP_SEC + 60;
  *                        must be longer than SILENT_SWEEP_SEC, or the system's own message is not yet due)
  *   DONE_WAIT_SEC        how long to wait for a task to finish (default 1200)
+ *   RUN_TAG              prefix of every task name (default: one per run); the Router answers a task it closed in
+ *                        the last day from that item, so a rerun must not repeat an earlier run's names
+ *   SOAK_DONE_WAIT_SEC   how long a soak round waits for its two tasks to be ready (default 600)
+ *   SANDBOX_MAX          the soak stops with a failure when more of this run's sandboxes are alive before a round
+ *                        (default 4); counted with kubectl (SaFE workloads labelled with the run's session ids)
+ *   KUBECTL_ARGS         extra kubectl arguments for that count, e.g. "--context global"
  *
  * Exit 0 only if every check passed. The last line is a JSON summary.
  */
@@ -32,8 +38,8 @@ import { promisify } from "node:util";
 
 import { mintAssistantToken } from "../../src/assistant/token.js";
 import {
-  apiClient, duplicateEventIds, latencyMs, percentile, renderTimings, startReceiver, until,
-  type Received, type Timing,
+  SESSION_ID_LABEL, aliveSandboxes, apiClient, duplicateEventIds, latencyMs, newItemsSince, percentile, renderTimings,
+  runTag, settle, startReceiver, until, type Received, type Timing,
 } from "./assistant-p1-lib.js";
 
 const run = promisify(execFile);
@@ -52,6 +58,10 @@ const CHAOS = new Set((process.env.CHAOS ?? "").split(",").map((s) => s.trim()).
 const SILENT_SWEEP_SEC = Number(process.env.SILENT_SWEEP_SEC ?? 300);
 const RECEIVER_HOLD_SEC = Number(process.env.RECEIVER_HOLD_SEC ?? SILENT_SWEEP_SEC + 60);
 const DONE_WAIT_MS = Number(process.env.DONE_WAIT_SEC ?? 1200) * 1000;
+const SOAK_DONE_WAIT_MS = Number(process.env.SOAK_DONE_WAIT_SEC ?? 600) * 1000;
+const SANDBOX_MAX = Number(process.env.SANDBOX_MAX ?? 4);
+const KUBECTL_ARGS = (process.env.KUBECTL_ARGS ?? "").split(/\s+/).filter(Boolean);
+const RUN_TAG = runTag(process.env.RUN_TAG);
 if (CHAOS.has("receiver") && RECEIVER_HOLD_SEC <= SILENT_SWEEP_SEC) {
   console.error(`RECEIVER_HOLD_SEC (${RECEIVER_HOLD_SEC}) must be longer than SILENT_SWEEP_SEC (${SILENT_SWEEP_SEC})`);
   process.exit(2);
@@ -77,7 +87,7 @@ interface ItemView {
 }
 
 const taskText = (name: string, file: string, sleepSec: number) =>
-  `Task ${name}: run two steps, each one \`sleep ${sleepSec}\` as its own command, then write "${name}-done" into /workspace/${file}, and report when it is written.`;
+  `Task ${RUN_TAG}-${name}: run two steps, each one \`sleep ${sleepSec}\` as its own command, then write "${name}-done" into /workspace/${file}, and report when it is written.`;
 
 async function board(state?: string): Promise<ItemView[]> {
   const r = await api("GET", `/v1/work-items${state ? `?state=${state}` : ""}`);
@@ -89,8 +99,50 @@ async function itemOf(id: string, key = KEY): Promise<ItemView | null> {
   return r.status === 200 ? (r.json.data as ItemView) : null;
 }
 
+/** What this run created, so that it is stopped and deleted whatever happens: items, their workers, the subscription. */
+const cleanups: Array<{ what: string; run: () => Promise<void> }> = [];
+const runItems = new Map<string, { workerSessionId: string | null; retired: boolean }>();
+/** The sessions whose sandboxes count against SANDBOX_MAX: the assistant's and every worker of this run. */
+const runSessions = new Set<string>();
+
+/** Counts an item as this run's: it is stopped and its worker deleted at the latest when the run ends. */
+async function track(id: string): Promise<ItemView | null> {
+  const it = await itemOf(id);
+  if (!runItems.has(id)) runItems.set(id, { workerSessionId: it?.worker_session_id ?? null, retired: false });
+  if (it?.worker_session_id) { runItems.get(id)!.workerSessionId = it.worker_session_id; runSessions.add(it.worker_session_id); }
+  return it;
+}
+
+/** Stops an item that is not done and deletes its worker session (and with it the sandbox). */
+async function retire(id: string): Promise<boolean> {
+  const t = runItems.get(id);
+  if (!t || t.retired) return true;
+  const it = await itemOf(id);
+  const stop = it && it.board_state !== "done" ? (await api("POST", `/v1/work-items/${id}/stop`)).status : 200;
+  const wid = it?.worker_session_id ?? t.workerSessionId;
+  const del = wid ? (await api("DELETE", `/v1/sessions/${wid}`)).status : 404;
+  t.retired = stop === 200 && (del === 200 || del === 204 || del === 404);
+  if (!t.retired) log("could not retire", id, `stop ${stop}, delete worker ${del}`);
+  return t.retired;
+}
+const retireAll = async (ids: Iterable<string>) => (await Promise.all([...ids].map(retire))).every(Boolean);
+
 async function main(): Promise<void> {
+  log("run tag", RUN_TAG);
+  const code = await settle(scenario, cleanups, failures);
+  for (const f of failures.filter((f) => f.startsWith("cleanup:") || f.startsWith("the scenario"))) log("FAIL", f);
+  if (!summaryPrinted) console.log(JSON.stringify({ ok: false, failures }));
+  process.exit(code);
+}
+
+let summaryPrinted = false;
+
+async function scenario(): Promise<"finished" | void> {
   const receiver = await startReceiver(Number(process.env.RECEIVER_PORT ?? 0));
+  cleanups.push({ what: "close the receiver", run: () => receiver.close() });
+  cleanups.push({ what: "stop this run's items and delete their workers", run: async () => {
+    if (!await retireAll(runItems.keys())) throw new Error("some items or workers could not be retired (see the log)");
+  } });
   const hookUrl = `${RECEIVER_URL.replace(/:\d+$/, "")}:${RECEIVER_URL.match(/:(\d+)$/) ? RECEIVER_URL.match(/:(\d+)$/)![1] : receiver.port}/hook`;
   log("receiver listening on", receiver.port, "and registered as", hookUrl);
 
@@ -99,9 +151,14 @@ async function main(): Promise<void> {
   if (!check(sub.status === 201, `a subscription for assistant.say and work_item.needs_you is accepted (${sub.status}${sub.status === 201 ? "" : ` ${JSON.stringify(sub.json?.error ?? sub.json).slice(0, 120)}`})`)) return;
   receiver.setSecret(sub.json.data.secret);
   const subscriptionId = sub.json.data.subscription_id ?? sub.json.data.id;
+  cleanups.push({ what: "delete the subscription", run: async () => {
+    const r = await api("DELETE", `/v1/notification-subscriptions/${subscriptionId}`);
+    if (r.status !== 200 && r.status !== 204) throw new Error(`DELETE answered ${r.status}`);
+  } });
   const assistant = await api("POST", "/v1/assistant");
   if (!check(assistant.status === 200 && Boolean(assistant.json.data.session_id), "the assistant session exists")) return;
   const sid: string = assistant.json.data.session_id;
+  runSessions.add(sid);
   const again = await api("POST", "/v1/assistant");
   check(again.json?.data?.session_id === sid && again.json?.data?.created === false, "asking again returns the same session");
 
@@ -116,8 +173,11 @@ async function main(): Promise<void> {
   const waitSay = (since: number, budgetMs: number, match?: (r: Received) => boolean) =>
     until(() => sayAfter(since, match), since + budgetMs, 100);
   const known = new Set((await board()).map((i) => i.item_id));
-  const newItem = async (since: number): Promise<ItemView | null> =>
-    until(async () => (await board("in_progress")).find((i) => !known.has(i.item_id)), since + SAY_BUDGET_MS);
+  const newItem = async (since: number): Promise<ItemView | null> => {
+    const found = await until(async () => (await board("in_progress")).find((i) => !known.has(i.item_id) && !runItems.has(i.item_id)), since + SAY_BUDGET_MS);
+    if (found) await track(found.item_id);
+    return found;
+  };
 
   // 1. Task A: taken on within the budget.
   const tA = await send(taskText("A", "a.txt", 45));
@@ -165,11 +225,7 @@ async function main(): Promise<void> {
 
   // 4. Both finish, each is told with its own result.
   const doneAt = Date.now() + DONE_WAIT_MS;
-  const ready = async (id: string) => until(async () => {
-    const it = await itemOf(id);
-    return it && it.board_state === "needs_you" && it.last_report_kind === "ready" ? it : undefined;
-  }, doneAt, 2000);
-  const [readyA, readyB] = await Promise.all([ready(itemA!.item_id), ready(itemB!.item_id)]);
+  const [readyA, readyB] = await Promise.all([ready(itemA!.item_id, doneAt), ready(itemB!.item_id, doneAt)]);
   check(readyA !== null && readyA.can_accept && readyA.result_version === 1, "A is ready at version 1");
   check(readyB !== null && readyB.can_accept && readyB.result_version === 1, "B is ready at version 1");
   const toldAbout = (id: string) => receiver.received.some((r) => r.type === "assistant.say" && r.item?.item_id === id && r.item.can_accept);
@@ -200,12 +256,19 @@ async function main(): Promise<void> {
   } else log("skip", "cross-user check (KEY_B not given)");
 
   if (CHAOS.has("stale")) await staleReport(itemA!);
-  if (CHAOS.has("restart")) await restartDuringWork(send, receiver, newItem, known, ready);
+  if (CHAOS.has("restart")) await restartDuringWork(send, receiver, newItem, known);
   if (CHAOS.has("receiver")) await refusedReceiver(send, receiver, newItem, known, subscriptionId);
 
-  // 7. The soak, and the totals that must be zero.
+  // 7. The soak, and the totals that must be zero. The workers so far are done with: their sandboxes go first.
+  check(await retireAll(runItems.keys()), "the items so far are closed and their workers deleted");
   const soak: number[] = [];
-  for (let round = 1; round <= SOAK_ROUNDS; round++) soak.push(...await soakRound(round, send, receiver, newItem, known, ready));
+  let roundsRun = 0;
+  for (let round = 1; round <= SOAK_ROUNDS; round++) {
+    if (!await sandboxGuard(round)) { log("FAIL", `soak round ${round}: stopping the run, too many of its sandboxes are alive`); break; }
+    soak.push(...await soakRound(round, send, receiver));
+    roundsRun = round;
+  }
+  if (SOAK_ROUNDS) check(roundsRun === SOAK_ROUNDS, `all ${SOAK_ROUNDS} soak rounds ran (${roundsRun})`);
 
   const dups = duplicateEventIds(receiver.received);
   check(dups.length === 0, `no event was accepted twice (${dups.length})`);
@@ -217,7 +280,8 @@ async function main(): Promise<void> {
   const summary = {
     ok: failures.length === 0, failures,
     interjections: timings.map((t) => ({ label: t.label, ms: latencyMs(t) })),
-    soak: SOAK_ROUNDS ? { rounds: SOAK_ROUNDS, samples: soak.length, p95_ms: percentile(soak, 95), max_ms: soak.length ? Math.max(...soak) : null } : null,
+    run_tag: RUN_TAG,
+    soak: SOAK_ROUNDS ? { rounds: roundsRun, samples: soak.length, p95_ms: percentile(soak, 95), max_ms: soak.length ? Math.max(...soak) : null } : null,
     p95_ms: percentile(all.filter((n) => n !== null), 95),
     says: receiver.received.filter((r) => r.type === "assistant.say").length,
     needs_you_fallbacks: receiver.received.filter((r) => r.type === "work_item.needs_you").length,
@@ -225,15 +289,31 @@ async function main(): Promise<void> {
   };
   if (SOAK_ROUNDS) check((summary.soak!.p95_ms ?? Infinity) < SAY_BUDGET_MS, `the soak's P95 is under ${SAY_BUDGET_MS}ms (${summary.soak!.p95_ms}ms, max ${summary.soak!.max_ms}ms)`);
   summary.ok = failures.length === 0;
-  await api("DELETE", `/v1/notification-subscriptions/${subscriptionId}`);
-  await receiver.close();
   console.log(JSON.stringify(summary));
-  process.exit(failures.length === 0 ? 0 : 1);
+  summaryPrinted = true;
+  return "finished";
+}
+
+/** Waits until the item is ready to accept, or the deadline passes (null). */
+const ready = async (id: string, deadlineAt: number) => until(async () => {
+  const it = await itemOf(id);
+  return it && it.board_state === "needs_you" && it.last_report_kind === "ready" ? it : undefined;
+}, deadlineAt, 2000);
+
+/** Before a soak round: no more than SANDBOX_MAX of this run's sandboxes may still be alive. Unreadable is a failure. */
+async function sandboxGuard(round: number): Promise<boolean> {
+  let alive: string[];
+  try {
+    const out = await run("kubectl", [...KUBECTL_ARGS, "get", "workloads.amd.com", "-l", SESSION_ID_LABEL, "-o", "json"], { maxBuffer: 256 << 20 });
+    alive = aliveSandboxes(JSON.parse(out.stdout), runSessions);
+  } catch (err) {
+    return check(false, `soak round ${round}: this run's sandboxes could be counted (${err instanceof Error ? err.message.split("\n")[0] : err})`);
+  }
+  return check(alive.length <= SANDBOX_MAX, `soak round ${round}: at most ${SANDBOX_MAX} of this run's sandboxes are alive (${alive.length}${alive.length ? `: ${alive.join(" ")}` : ""})`);
 }
 
 type Send = (content: string) => Promise<number>;
 type NewItem = (since: number) => Promise<ItemView | null>;
-type Ready = (id: string) => Promise<ItemView | null>;
 type Rec = Awaited<ReturnType<typeof startReceiver>>;
 
 /** A worker's token for a run that is over, used to report: refused, and the item does not move. */
@@ -257,7 +337,7 @@ async function staleReport(item: ItemView): Promise<void> {
 }
 
 /** The API is restarted while work runs: the items are still there, finish, and nothing is said twice. */
-async function restartDuringWork(send: Send, receiver: Rec, newItem: NewItem, known: Set<string>, ready: Ready): Promise<void> {
+async function restartDuringWork(send: Send, receiver: Rec, newItem: NewItem, known: Set<string>): Promise<void> {
   const rollout = need("KUBECTL_ROLLOUT").split(/\s+/);
   const t = await send(taskText("R", "r.txt", 30));
   const item = await newItem(t);
@@ -269,7 +349,7 @@ async function restartDuringWork(send: Send, receiver: Rec, newItem: NewItem, kn
   check(status, "chaos restart: the rollout completed");
   const again = await itemOf(item!.item_id);
   check(again !== null, "chaos restart: the item is still on the board");
-  const done = await ready(item!.item_id);
+  const done = await ready(item!.item_id, Date.now() + DONE_WAIT_MS);
   check(done !== null, "chaos restart: it still finished");
   check(duplicateEventIds(receiver.received).length === 0, "chaos restart: and nothing was delivered twice");
 }
@@ -295,19 +375,38 @@ async function refusedReceiver(send: Send, receiver: Rec, newItem: NewItem, know
   check(fallbacks().length === 1, `chaos receiver: and there is exactly one (${fallbacks().length})`);
 }
 
-/** One short A/B round with two interjections, for the latency distribution. Returns the interjection latencies. */
-async function soakRound(round: number, send: Send, receiver: Rec, newItem: NewItem, known: Set<string>, ready: Ready): Promise<number[]> {
-  const t = await send(`Task S${round}a: write "S${round}a" into /workspace/s${round}a.txt. Task S${round}b: write "S${round}b" into /workspace/s${round}b.txt. Start both now.`);
-  const a = await newItem(t);
-  if (a) known.add(a.item_id);
+/**
+ * One short A/B round with two interjections, for the latency distribution. Everything the round creates is closed
+ * in the round: both items accepted (or stopped when not ready in time) and their workers deleted. Returns the
+ * interjection latencies.
+ */
+async function soakRound(round: number, send: Send, receiver: Rec): Promise<number[]> {
+  const floor = Math.max(0, ...(await board()).map((i) => Number(i.seq)));
+  const startedAt = Date.now();
+  const name = (x: string) => `${RUN_TAG}-S${round}${x}`;
+  const t = await send(`Task ${name("a")}: write "${name("a")}" into /workspace/s${round}a.txt. Task ${name("b")}: write "${name("b")}" into /workspace/s${round}b.txt. Start both now.`);
+  const mine = new Map<string, number>();
+  const collect = async () => {
+    for (const i of newItemsSince(await board(), floor, new Set(runItems.keys()))) { mine.set(i.item_id, i.seq); await track(i.item_id); }
+  };
+  await until(async () => { await collect(); return mine.size >= 2 ? true : undefined; }, t + SAY_BUDGET_MS * 3, 1000);
+  check(mine.size === 2, `soak round ${round}: both tasks are on the board (${mine.size})`);
   const out: number[] = [];
   for (const q of ["How are the two tasks going?", "Which of them is done?"]) {
     const sent = await send(q);
-    const said = await until(() => receiver.received.find((r) => r.type === "assistant.say" && r.at >= sent), sent + SAY_BUDGET_MS * 3, 100);
+    // A "ready, accept it" message is the system reporting a task, not the answer to this question.
+    const said = await until(() => receiver.received.find((r) => r.type === "assistant.say" && r.at >= sent && !r.item?.can_accept), sent + SAY_BUDGET_MS * 3, 100);
     out.push(said ? said.at - sent : Number.POSITIVE_INFINITY);
   }
-  const items = (await Promise.all([a].filter(Boolean).map((i) => ready(i!.item_id)))).filter(Boolean) as ItemView[];
-  for (const i of items) await api("POST", `/v1/work-items/${i.item_id}/accept`, { version: i.result_version });
+  const deadline = startedAt + SOAK_DONE_WAIT_MS;
+  for (const [id, seq] of mine) {
+    const it = await ready(id, deadline);
+    if (check(it !== null, `soak round ${round}: #${seq} is ready in time`)) {
+      check((await api("POST", `/v1/work-items/${id}/accept`, { version: it!.result_version })).status === 200, `soak round ${round}: #${seq} is accepted`);
+    }
+  }
+  await collect();
+  check(await retireAll(mine.keys()), `soak round ${round}: its ${mine.size} items are closed and their workers deleted`);
   log(`soak round ${round}:`, out.map((n) => (Number.isFinite(n) ? `${n}ms` : "no answer")).join(", "));
   return out;
 }
