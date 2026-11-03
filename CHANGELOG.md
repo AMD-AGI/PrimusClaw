@@ -440,6 +440,19 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- The assistant's Router (behind `CLAW_ASSISTANT_ENABLED`) could not act on the items it was shown. Its list and a
+  worker's report named an item only as `#3` while the tools took only the item's id, so in an evaluation against a
+  real model a follow-up or a stop was refused as `item_not_found` three times in four. `say`, `work_send`,
+  `work_stop` and `work_recall` now take the item's `item_id` or its number (`#3`, `3`) among the caller's own items
+  (a number is per user, and another user's item is still not found), both are shown in the list and in a report's
+  header, and a reference that names nothing is refused as `item_not_found`, `invalid_item_ref` or
+  `ambiguous_item_ref`. The Router is told to call `work_create`, `work_send` and `work_stop` without a `say` in the
+  same step and to speak after their results, so it no longer announces what a refused call did not do. The message
+  it is answering is followed by a `[Reply language: X]` line (Chinese, Japanese, Korean or English, read from the
+  user's own words, or from their last ones when a worker's report woke it), so item titles in another language no
+  longer decide the language of a reply. A turn that ends with plain text and no `say`, which reached nobody, has its
+  text delivered as a `say`. The evaluation in `claw/packages/api/test/e2e/assistant-router-eval.ts` measures
+  all of this against a real model.
 - A caller authenticated by an identity provider's access token (`CLAW_IDENTITY_TOKEN_AUTH_ENABLED`) now has
   the platform key and the virtual key SaFE holds for the token's subject, in the SaFE deployment mode. SaFE is never
   shown the person's token: the API exchanges it at the provider (RFC 8693 service delegation, subject token type

@@ -76,7 +76,7 @@ describe("assistant outbound", { skip }, () => {
   async function seedItem(o: Record<string, unknown> = {}): Promise<string> {
     itemNo += 1;
     const row = {
-      item_id: `item-${itemNo}`, user_id: "u1", seq: itemNo, title: "Fix the build", board_state: "needs_you",
+      item_id: `kwi_item${itemNo}`, user_id: "u1", seq: itemNo, title: "Fix the build", board_state: "needs_you",
       last_report_kind: "ready", pending_question: null, result_version: 1, attention_seq: 1, ...o,
     };
     await q(
@@ -176,11 +176,40 @@ describe("assistant outbound", { skip }, () => {
     test("about another user's item, or one that does not exist, is refused with nothing written", async () => {
       await subscribe();
       const theirs = await seedItem({ user_id: "u2" });
-      for (const itemId of [theirs, "no-such-item"]) {
+      for (const itemId of [theirs, "kwi_nosuchitem"]) {
         await assert.rejects(say("hello", { itemId }), (e: any) => e.name === "SayRefused" && e.code === "item_not_found");
       }
       assert.equal((await saysRows()).length, 0);
       assert.equal((await outboxRows()).length, 0);
+    });
+
+    test("about an item named by its number is about the caller's own item with that number", async () => {
+      await subscribe();
+      const mine = await seedItem({ seq: 40, title: "Mine" });
+      const theirs = await seedItem({ user_id: "u2", seq: 40, title: "Theirs" });
+      const other = await seedItem({ user_id: "u2", seq: 41, title: "Theirs only" });
+      for (const ref of ["#40", "40", "item 40", mine]) {
+        await say("about it", { itemId: ref });
+        const stored = (await saysRows()).at(-1)!;
+        assert.equal(stored.item_id, mine, ref);
+        assert.equal((await outboxRows()).at(-1)!.payload.item.title, "Mine", ref);
+      }
+      // The other user's #41 is not this user's, and neither is the id of their #40.
+      for (const ref of ["#41", other, theirs]) {
+        await assert.rejects(say("hello", { itemId: ref }), (e: any) => e.name === "SayRefused" && e.code === "item_not_found", ref);
+      }
+      assert.equal((await saysRows()).length, 4, "only the four that named the caller's own item");
+    });
+
+    test("an item that is not named as an item is refused for what it is", async () => {
+      await subscribe();
+      await seedItem({ seq: 50 });
+      const code = async (itemId: string) => { try { await say("hello", { itemId }); } catch (e: any) { return e.code; } return "accepted"; };
+      assert.equal(await code("#99"), "item_not_found");
+      assert.equal(await code("the build one"), "invalid_item_ref");
+      assert.equal(await code("#50, #51"), "ambiguous_item_ref");
+      assert.equal(await code("  "), "accepted", "a blank item is no item, as before");
+      assert.equal((await saysRows()).length, 1, "and only that one was stored");
     });
 
     test("is refused, with nothing written, when the caller's guard throws", async () => {
@@ -199,7 +228,7 @@ describe("assistant outbound", { skip }, () => {
       assert.equal((await saysRows()).length, 1);
       // A failure after the guard rolls the whole say back, which it could not if the guard committed on its own.
       await assert.rejects(
-        say("two", { itemId: "no-such-item", guard: async (query) => { await query("UPDATE claw_assistant_says SET text = 'tampered'"); } }),
+        say("two", { itemId: "kwi_nosuchitem", guard: async (query) => { await query("UPDATE claw_assistant_says SET text = 'tampered'"); } }),
         (e: any) => e.code === "item_not_found",
       );
       assert.deepEqual((await saysRows()).map((s) => s.text), ["one"]);

@@ -21,10 +21,10 @@
  *   EVAL_CASES         comma list of case ids or kinds to run (default all)
  *   EVAL_OUT           a directory for the full traces, one JSON file per run (default: none)
  *   EVAL_GATE          the accuracy to reach, 0..1 (default 0.95)
- *   EVAL_STRICT_IDS    default 1: an item reference that is not the item's real id is refused, as the real tools
- *                      refuse it, so the score is what the system as built would do. 0: "#3" and "3" are read as item 3,
- *                      which scores the Router's decisions apart from how it names an item (the count of references that
- *                      are not a real id is printed either way).
+ *   EVAL_STRICT_IDS    default 1: an item is named as the real tools read it (its item_id, or its number as "#3" or "3")
+ *                      and anything else is refused as they refuse it, so the score is what the system as built would do.
+ *                      0: a few more spellings of a number are read as well (the count of references by number rather than
+ *                      by id is printed either way).
  *
  * The last line is a JSON summary.
  */
@@ -91,7 +91,7 @@ async function main(): Promise<void> {
     console.log("  by kind: " + Object.entries(sum.byKind).map(([k, v]) => `${k} ${v.dispatchOk}/${v.total}`).join(", "));
     const inexact = scores.reduce((n, s) => n + s.inexactRefs, 0);
     const refused = scores.reduce((n, s) => n + s.refusals.length, 0);
-    console.log(`  item references that are not the item's real id: ${inexact}; calls the tools refused: ${refused}`);
+    console.log(`  item references by number rather than by id: ${inexact}; calls the tools refused: ${refused}`);
     console.log(`  replies written in the same step as a work call, before its result: ${scores.reduce((n, s) => n + s.saidBeforeResult, 0)}; of those beside a call that was refused: ${scores.reduce((n, s) => n + s.saidBesideRefusal, 0)}`);
     for (const { c, trace, score } of done) {
       if (score.turnOk) continue;

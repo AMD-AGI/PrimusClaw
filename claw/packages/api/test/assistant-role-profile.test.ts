@@ -14,6 +14,9 @@
  *   A6  a server named assistant in a request cannot stand in for ours, and a router drops every other server
  *   A7  a router turn does not select skills; a worker's and an ordinary session's do
  *   A8  a turn whose profile cannot be applied does not run
+ *   A9  a router turn's message carries the reply-language line on every route, and what is stored is the user's words
+ *   A10 a worker's report that wakes the router carries the language the user last wrote in, and nothing when none is known
+ *   A11 the router's item list names each item by its id and its number, and a report's header does as well
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -57,7 +60,7 @@ describe("assistant role profile", { skip }, () => {
   };
 
   const pristineDispatch = (() => { let p: any = null; return () => (p ??= { ...dispatch.sessionDispatchPorts }); })();
-  async function send(sessionId: string, userId: string, opts: { doorbell: boolean; mcpServers?: Record<string, Record<string, unknown>>; toolIds?: number[] }) {
+  async function send(sessionId: string, userId: string, opts: { doorbell: boolean; mcpServers?: Record<string, Record<string, unknown>>; toolIds?: number[]; content?: string }) {
     const p = dispatch.sessionDispatchPorts as any;
     Object.assign(p, pristineDispatch());
     p.doorbellDispatch = opts.doorbell ? () => ({ release() {} }) : () => null;
@@ -67,7 +70,7 @@ describe("assistant role profile", { skip }, () => {
     p.publishTask = async (_s: string, payload: string) => { published.push(payload); return published.length; };
     await w.q("DELETE FROM claw_tasks WHERE session_id = $1", [sessionId]);
     const result = await dispatch.dispatchTaskToBrain({
-      sessionId, userId, user: user(userId), content: "hello", messageType: "text", toolIds: opts.toolIds ?? [], pluginId: undefined,
+      sessionId, userId, user: user(userId), content: opts.content ?? "hello", messageType: "text", toolIds: opts.toolIds ?? [], pluginId: undefined,
       requestImage: undefined, requestResource: undefined, requestTimeout: undefined, workspaceId: undefined,
       mcpServers: opts.mcpServers, capturedUserEnvSnapshot: {}, capturedSessionEnv: {},
     } as never, async () => {});
@@ -136,7 +139,7 @@ describe("assistant role profile", { skip }, () => {
     assert.equal(task.task_id, result.runId);
     assert.ok(claims.exp > Math.floor(Date.now() / 1000) + 3600, "outlives the longest turn the row allows");
     assert.ok(task.system_append.startsWith("You are the user's personal assistant."));
-    assert.match(task.system_append, /Work items \(open ones[^)]*\):\n#1 \[in_progress\] Fix the build/);
+    assert.match(task.system_append, new RegExp(`Work items \\(open ones[^)]*\\):\\n#1 \\(item_id: ${item.itemId}\\) \\[in_progress\\] Fix the build`));
     assert.equal(task.skills, undefined);
   });
 
@@ -169,7 +172,7 @@ describe("assistant role profile", { skip }, () => {
     const claims = verify(request);
     assert.equal(claims.task_id, result.runId, "the bearer names the claimed run");
     assert.equal(claims.task_id, request.task_id);
-    assert.match(request.system_append, /#2 \[in_progress\] Added while it waited/);
+    assert.match(request.system_append, /#2 \(item_id: kwi_\w+\) \[in_progress\] Added while it waited/);
   });
 
   test("A3 a queued router message replayed on the wire is profiled after its run is opened", async () => {
@@ -282,6 +285,81 @@ describe("assistant role profile", { skip }, () => {
     assert.equal(router.published.length, 1);
     assert.deepEqual(router.published[0].tools_allowlist, ["mcp__assistant__*"]);
     assert.equal((await drained("plain")).askedForSkills, true);
+  });
+
+  test("A9 the router's message carries the reply-language line on every route, and what is stored is the user's words", async () => {
+    const english = "Can you check why the nightly build is red?";
+    const chinese = "帮我看一下 staging 为什么一直重启";
+    const line = (language: string) => `\n\n[Reply language: ${language}]`;
+
+    // The fat dispatch: the line is on the request, and the run row and the history keep the words as they were sent.
+    for (const [content, language] of [[english, "English"], [chinese, "Chinese"]] as const) {
+      const { result, published } = await send(alice.routerSid, "alice", { doorbell: false, content });
+      const task = JSON.parse(published[0]);
+      assert.equal(task.prompt, `${content}${line(language)}`);
+      const [row] = await w.q("SELECT prompt, input FROM claw_tasks WHERE task_id = $1", [result.runId]);
+      assert.equal(row.prompt, content, "the run row holds the user's words");
+      assert.ok(!JSON.stringify(row.input).includes("Reply language"));
+      assert.equal(task.history.at(-1).content, content, "and so does the history Brain is given");
+    }
+
+    // The doorbell claim.
+    const { result } = await send(alice.routerSid, "alice", { doorbell: true, content: chinese });
+    const [stored] = await w.q("SELECT prompt, input FROM claw_tasks WHERE task_id = $1", [result.runId]);
+    assert.ok(!JSON.stringify(stored).includes("Reply language"), "the row holds none of it");
+    assert.equal((await claim()).prompt, `${chinese}${line("Chinese")}`);
+    await w.q("DELETE FROM claw_tasks");
+
+    // The queue's replay.
+    const { dispatchPendingMessage } = await import("../src/tasks/pending-dispatch.js");
+    const stub = await stubPending();
+    try {
+      await dispatchPendingMessage({
+        sessionId: alice.routerSid, pendingId: 1, userId: "alice", messageId: "claw-pending-1", prompt: english,
+        task: { session_id: alice.routerSid, message_id: "claw-pending-1", prompt: english },
+      });
+    } finally { stub.restore(); }
+    assert.equal(JSON.parse(stub.published[0]!).prompt, `${english}${line("English")}`);
+  });
+
+  test("A9b a message that shows no language gets no line of its own; a worker's and a plain session's get none", async () => {
+    const task = JSON.parse((await send(alice.routerSid, "alice", { doorbell: false, content: "#1" })).published[0]);
+    assert.equal(task.prompt, "#1", "nothing to go on, and nobody wrote before");
+    for (const sessionId of [item.workerSid, "plain"]) {
+      const sent = JSON.parse((await send(sessionId, "alice", { doorbell: false, content: "Can you check why the nightly build is red?" })).published[0]);
+      assert.equal(sent.prompt, "Can you check why the nightly build is red?", sessionId);
+    }
+  });
+
+  test("A10 a report that wakes the router carries the language the user last wrote in", async () => {
+    const turn = async (content: string, prompt: string) => {
+      await w.q("INSERT INTO claw_conversation_turns (session_id, turn_index, role, content, message_id) VALUES ($1, (SELECT COALESCE(MAX(turn_index), 0) + 1 FROM claw_conversation_turns WHERE session_id = $1), $2, $3, $4)", [alice.routerSid, prompt, content, `m-${Math.random()}`]);
+    };
+    const report = `[work_event] #1 (item_id: ${item.itemId}) ready v1: Opened PR 12 for the build, and it is ready to review`;
+    const prompt = async () => JSON.parse((await send(alice.routerSid, "alice", { doorbell: false, content: report })).published[0]).prompt;
+
+    assert.equal(await prompt(), report, "a user who has written nothing has no language to name");
+
+    await turn("帮我把 CI 修好", "user");
+    await turn("[work_event] #1 (item_id: x) blocked: which org should the runners be in?", "user");
+    await turn("Sure, thanks!", "assistant");
+    assert.equal(await prompt(), `${report}\n\n[Reply language: Chinese]`, "the report is English, the user's words are not");
+
+    await turn("ok", "user");
+    assert.equal(await prompt(), `${report}\n\n[Reply language: Chinese]`, "a message that shows nothing is passed over");
+
+    await turn("Please keep going", "user");
+    assert.equal(await prompt(), `${report}\n\n[Reply language: English]`, "the newest of the user's words that has one");
+  });
+
+  test("A11 the item list names each item by its id and its number", async () => {
+    const second = await w.createItem(alice, "Second item");
+    const task = JSON.parse((await send(alice.routerSid, "alice", { doorbell: false })).published[0]);
+    for (const i of [item, second]) {
+      assert.ok(task.system_append.includes(`#${i.seq} (item_id: ${i.itemId}) [in_progress]`), `#${i.seq} with its id`);
+    }
+    assert.match(task.system_append, /Wherever a tool takes item_id, pass the item_id shown beside the item/);
+    assert.match(task.system_append, /without a say in the same step, wait for their results, and only then call say/);
   });
 
   test("A8 a turn whose profile cannot be applied does not run", async () => {
