@@ -64,7 +64,8 @@ const CJK_RUN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=
  * How much of a message is read: this many characters from its start and from its end. A message is a sentence or a
  * paragraph; what is longer is a paste, and the user's own words are in front of it or after it. This runs on every
  * turn, on the thread that serves every other request, and a message may be megabytes (so may the earlier ones that are
- * read when it shows nothing), so the cost is fixed here instead of left to the length of whatever was sent.
+ * read when it shows nothing), so the cost is fixed here instead of left to the length of whatever was sent. What lies
+ * between the two parts is not read: the user's words in the middle of a message, between two long pastes, say nothing.
  */
 export const READ_CHARS = 2000;
 
@@ -145,11 +146,12 @@ function withoutQuotations(text: string, opening: RegExp, closing: RegExp): stri
  * are what it asks about ("What does 我爱你 mean?").
  */
 function opensInCjk(text: string): boolean {
+  // Where the first letter or digit is, found once: looking in the text before each run would read a long start of punctuation again for every run.
+  const firstLetter = text.search(/[\p{L}\p{N}]/u);
   for (const run of text.matchAll(CJK_RUN)) {
-    const before = text.slice(0, run.index);
-    if (!/[\p{L}\p{N}]/u.test(before)) return true;
+    if (firstLetter >= run.index) return true;
     const hasGrammar = /[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(run[0]) || [...run[0]].some((c) => HAN_FRAME.has(c));
-    if (hasGrammar) return englishWords(before) === 0;
+    if (hasGrammar) return englishWords(text.slice(0, run.index)) === 0;
   }
   return false;
 }

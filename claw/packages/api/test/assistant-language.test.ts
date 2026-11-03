@@ -233,6 +233,7 @@ const AWKWARD: Array<[string, (size: number) => string]> = [
   ["unclosed single quotation marks", (n) => "x 'y ".repeat(n / 5)],
   ["unclosed code marks", (n) => `\`\`\`${"a ".repeat(n / 2)}`],
   ["single Chinese characters", (n) => "构 ".repeat(n / 2)],
+  ["punctuation, then a Chinese character after each English word", (n) => `${"!".repeat(n / 2)}${"to 构 ".repeat(n / 12)}`],
 ];
 
 const PROSE = "Please check the build on main and tell me why it has been red since yesterday. ";
