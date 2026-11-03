@@ -4,7 +4,7 @@
 /**
  * A service answering a held merge for the user it acts for, through the real authentication hook over real HTTP.
  *
- * A chat integration (Clawy's worker) is a service client of the identity provider. When a person presses Merge on their card it exchanges its
+ * A chat integration (its worker) is a service client of the identity provider. When a person presses Merge on their card it exchanges its
  * own client credentials for an access token that acts as that person (RFC 8693: `sub` is the user, `act.sub` and `client_id` the
  * service) and calls Claw with it. Claw takes that only from a client an operator has named
  * (`CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS`), only for the user the token names, and records who stood behind the answer.
@@ -29,7 +29,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { FakeIdentity, signJwt, testKey } from "../../utils/test/identity-fake.js";
 
 const PR = "AMD-AGI/demo#7";
-const CLAWY = "clawy-worker";
+const CHAT = "chat-worker";
 const nowSec = () => Math.floor(Date.now() / 1000);
 const es = testKey("ES256", "k-es");
 const log = { info() {}, warn() {}, error() {} };
@@ -90,7 +90,7 @@ describe("a service an operator allowed answers a held merge for the user its to
   });
 
   /** An access token as the identity provider issues it. An exchanged one (a service acting for a user) carries `bid` and `act`; a person's own grant carries `gid`. */
-  const exchanged = (sub: string, client: string | undefined = CLAWY, over: Record<string, unknown> = {}): string => mint({ sub, client_id: client, act: { sub: client ?? CLAWY }, bid: 7, ...over });
+  const exchanged = (sub: string, client: string | undefined = CHAT, over: Record<string, unknown> = {}): string => mint({ sub, client_id: client, act: { sub: client ?? CHAT }, bid: 7, ...over });
   const personal = (sub: string): string => mint({ sub, client_id: "claw-web", gid: "g-1" });
   function mint(over: Record<string, unknown>): string {
     const claims: Record<string, unknown> = {
@@ -101,7 +101,7 @@ describe("a service an operator allowed answers a held merge for the user its to
   }
 
   /** The routes behind the real authentication hook, on a service and a fake GitHub of their own. */
-  async function boot(settings: Record<string, string> = { CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS: CLAWY }): Promise<void> {
+  async function boot(settings: Record<string, string> = { CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS: CHAT }): Promise<void> {
     await app?.close();
     const { authMiddleware } = await import("../src/auth/middleware.js");
     const { registerGithubReviewRoutes } = await import("../src/github-review/mcp.js");
@@ -144,16 +144,16 @@ describe("a service an operator allowed answers a held merge for the user its to
     const c = await row(id);
     assert.equal(c.status, "merged");
     assert.equal(c.decided_by, "u-bob", "the subject is the acting user, the person the service acted for");
-    assert.deepEqual(c.decided_via, { kind: "service", client_id: CLAWY, act_sub: CLAWY });
+    assert.deepEqual(c.decided_via, { kind: "service", client_id: CHAT, act_sub: CHAT });
     assert.equal(c.result.by, "service");
-    assert.equal(c.result.client_id, CLAWY);
+    assert.equal(c.result.client_id, CHAT);
     const audit = await env.sql("SELECT arguments FROM claw_github_audit WHERE tool = 'gh_pr_merge' AND arguments ? 'confirmation_id'");
     assert.equal(audit.length, 1);
-    assert.equal(audit[0]?.arguments.decided_by_service, CLAWY, "the audit row of the merge says who answered");
+    assert.equal(audit[0]?.arguments.decided_by_service, CHAT, "the audit row of the merge says who answered");
     // Who answered is on the listing too, for the person's own view.
     const listed = await fetch(`${base}/v1/github-review/confirmations?session_id=s-1&status=merged`, { headers: bearer(personal("u-bob")) });
     const items = ((await listed.json()) as any).items as any[];
-    assert.deepEqual(items.map((i) => [i.decided_by, i.decided_via?.client_id]), [["u-bob", CLAWY]]);
+    assert.deepEqual(items.map((i) => [i.decided_by, i.decided_via?.client_id]), [["u-bob", CHAT]]);
     // Used once: the same answer again does not merge again.
     const again = await decide(id, bearer(exchanged("u-bob")));
     assert.notEqual(again.body.status, "merged");
@@ -167,15 +167,15 @@ describe("a service an operator allowed answers a held merge for the user its to
     assert.equal(r.body.status, "denied");
     const c = await row(id);
     assert.equal(c.status, "denied");
-    assert.deepEqual(c.decided_via, { kind: "service", client_id: CLAWY, act_sub: CLAWY });
-    assert.deepEqual(c.result, { by: "service", client_id: CLAWY, act_sub: CLAWY });
+    assert.deepEqual(c.decided_via, { kind: "service", client_id: CHAT, act_sub: CHAT });
+    assert.deepEqual(c.result, { by: "service", client_id: CHAT, act_sub: CHAT });
     assert.equal(puts(), 0);
     assert.notEqual((await decide(id, bearer(exchanged("u-bob")))).body.status, "merged", "a denied merge cannot be allowed afterwards");
   });
 
   test("S3 a client that is not named is refused, every client is while the list is empty, and ids are compared exactly", async () => {
     const id = await hold();
-    for (const client of ["some-other-service", `${CLAWY}-2`, `${CLAWY}x`, "clawy", CLAWY.toUpperCase(), ` ${CLAWY}`, `${CLAWY} `]) {
+    for (const client of ["some-other-service", `${CHAT}-2`, `${CHAT}x`, "chat", CHAT.toUpperCase(), ` ${CHAT}`, `${CHAT} `]) {
       for (const decision of ["allow", "deny"]) {
         const r = await decide(id, bearer(exchanged("u-bob", client)), decision);
         assert.equal(r.status, 403, `${JSON.stringify(client)} ${decision}`);
@@ -227,16 +227,16 @@ describe("a service an operator allowed answers a held merge for the user its to
     assert.deepEqual(c.result, { by: "actor" });
     // Naming a service's client id on a token with no actor does not make it a service's: it is a person's, as before, and decides alike.
     const second = await hold();
-    assert.equal((await decide(second, bearer(mint({ sub: "u-bob", client_id: CLAWY, gid: "g-1" })), "deny")).status, 200);
+    assert.equal((await decide(second, bearer(mint({ sub: "u-bob", client_id: CHAT, gid: "g-1" })), "deny")).status, 200);
     assert.equal((await row(second)).decided_via, null);
   });
 
   test("S7 a token that names an actor and no client is refused, and the service's own token, whose subject is the service, cannot answer", async () => {
     const id = await hold();
-    const noClient = await decide(id, bearer(mint({ sub: "u-bob", act: { sub: CLAWY }, bid: 7 })));
+    const noClient = await decide(id, bearer(mint({ sub: "u-bob", act: { sub: CHAT }, bid: 7 })));
     assert.equal(noClient.status, 403);
     assert.equal(noClient.body.error, "service_client_not_allowed");
-    const own = await decide(id, bearer(mint({ sub: CLAWY, client_id: CLAWY, act: { sub: CLAWY }, bid: 7 })));
+    const own = await decide(id, bearer(mint({ sub: CHAT, client_id: CHAT, act: { sub: CHAT }, bid: 7 })));
     assert.equal(own.status, 403);
     assert.equal(own.body.error, "only_the_acting_user_can_decide");
     assert.equal((await row(id)).status, "pending");
@@ -245,22 +245,22 @@ describe("a service an operator allowed answers a held merge for the user its to
 
   test("S8 the classifier: who is a person, who is a service, who is neither", async () => {
     const { classifyAttendedCaller: classifyDecisionCaller } = await import("../src/github-review/attended.js");
-    const service = { delegation: { actorSub: CLAWY, clientId: CLAWY } };
+    const service = { delegation: { actorSub: CHAT, clientId: CHAT } };
     const rows: Array<[string, string | null, Parameters<typeof classifyDecisionCaller>[1], readonly string[], unknown]> = [
       // A session cookie is what SaFE's own sign-in hands out, and a key can complete that sign-in (see test/github-review-decision-credential.test.ts).
       ["a browser session", "cookie", {}, [], { ok: false, error: "interactive_sign_in_required" }],
-      ["a browser session, whatever its user object carries and whatever the list says", "cookie", service, [CLAWY], { ok: false, error: "interactive_sign_in_required" }],
+      ["a browser session, whatever its user object carries and whatever the list says", "cookie", service, [CHAT], { ok: false, error: "interactive_sign_in_required" }],
       ["a person's token", "identity_token", { delegation: { clientId: "claw-web" } }, [], { ok: true, via: null }],
       ["a token with no delegation at all", "identity_token", {}, [], { ok: true, via: null }],
-      ["an allowed service", "identity_token", service, [CLAWY], { ok: true, via: { clientId: CLAWY, actorSub: CLAWY } }],
-      ["a service among several", "identity_token", service, ["a", CLAWY, "b"], { ok: true, via: { clientId: CLAWY, actorSub: CLAWY } }],
+      ["an allowed service", "identity_token", service, [CHAT], { ok: true, via: { clientId: CHAT, actorSub: CHAT } }],
+      ["a service among several", "identity_token", service, ["a", CHAT, "b"], { ok: true, via: { clientId: CHAT, actorSub: CHAT } }],
       ["a service not on the list", "identity_token", service, ["a"], { ok: false, error: "service_client_not_allowed" }],
       ["a service with the list empty", "identity_token", service, [], { ok: false, error: "service_client_not_allowed" }],
-      ["an actor and no client", "identity_token", { delegation: { actorSub: CLAWY } }, [CLAWY], { ok: false, error: "service_client_not_allowed" }],
-      ["an api key", "api_key", service, [CLAWY], { ok: false, error: "interactive_sign_in_required" }],
-      ["an x-api-key", "x_api_key", service, [CLAWY], { ok: false, error: "interactive_sign_in_required" }],
-      ["a connector token", "connector_token", service, [CLAWY], { ok: false, error: "interactive_sign_in_required" }],
-      ["no recorded method", null, service, [CLAWY], { ok: false, error: "interactive_sign_in_required" }],
+      ["an actor and no client", "identity_token", { delegation: { actorSub: CHAT } }, [CHAT], { ok: false, error: "service_client_not_allowed" }],
+      ["an api key", "api_key", service, [CHAT], { ok: false, error: "interactive_sign_in_required" }],
+      ["an x-api-key", "x_api_key", service, [CHAT], { ok: false, error: "interactive_sign_in_required" }],
+      ["a connector token", "connector_token", service, [CHAT], { ok: false, error: "interactive_sign_in_required" }],
+      ["no recorded method", null, service, [CHAT], { ok: false, error: "interactive_sign_in_required" }],
     ];
     for (const [name, method, user, allowed, want] of rows) assert.deepEqual(classifyDecisionCaller(method, user, allowed), want, name);
   });

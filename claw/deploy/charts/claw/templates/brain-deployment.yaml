@@ -246,11 +246,11 @@ spec:
         {{- end }}
         {{- if .Values.tls.extraCACertsConfigMap }}
         - name: NODE_EXTRA_CA_CERTS
-          value: /etc/claw-ca/ca.crt
+          value: {{ include "primus-claw.mountPath" (list . "brain" "extra-ca") }}/ca.crt
         {{- end }}
         {{- if and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
         - name: AGENT_SANDBOX_TEMPLATE_FILE
-          value: /etc/claw/codeinterpreter-base.yaml
+          value: {{ include "primus-claw.mountPath" (list . "brain" "sandbox-template") }}/codeinterpreter-base.yaml
         {{- end }}
         - name: AGENT_SANDBOX_WARM_POOL_SIZE
           value: {{ .Values.sandboxTemplate.warmPoolSize | default 0 | quote }}
@@ -341,12 +341,12 @@ spec:
         volumeMounts:
         {{- if and .Values.sandboxTemplate.enabled .Values.sandboxTemplate.codeInterpreterYaml }}
         - name: sandbox-template
-          mountPath: /etc/claw
+          mountPath: {{ include "primus-claw.mountPath" (list . "brain" "sandbox-template") }}
           readOnly: true
         {{- end }}
         {{- if .Values.tls.extraCACertsConfigMap }}
         - name: extra-ca
-          mountPath: /etc/claw-ca
+          mountPath: {{ include "primus-claw.mountPath" (list . "brain" "extra-ca") }}
           readOnly: true
         {{- end }}
         {{- with .Values.brain.extraVolumeMounts }}

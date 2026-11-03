@@ -28,10 +28,14 @@
  * route changes nothing a user sees:
  *   - `sandbox.available` -- at least one cluster is Ready AND at least one
  *     workspace carries the `Sandbox` scope.
- *   - `sandbox.defaultWorkspaceId` -- the first Sandbox-scoped workspace in the
- *     order SaFE lists them (by name). The client's "current workspace" is only
- *     ever the first workspace it was given, so this is that rule without a
- *     client-side memory. `gpuProduct` is that workspace's.
+ *   - `sandbox.defaultWorkspaceId` -- the workspace sandboxes start in. That is the
+ *     deployment's own default (SANDBOX_NAMESPACE, the workspace Brain uses when a
+ *     request names none) when the caller has it among their Sandbox-scoped
+ *     workspaces, else the first Sandbox-scoped workspace in the order SaFE lists
+ *     them (by name). The console sends this id with every turn, which makes it win
+ *     over Brain's default: a default that disagreed with Brain's would send every
+ *     console sandbox to the workspace the deployment moved away from.
+ *     `gpuProduct` is that workspace's.
  *   - `workspaces[].admin` -- the caller manages that workspace. System-wide admin
  *     roles are reported in `roles`; they do not turn every `admin` on.
  *
@@ -63,7 +67,7 @@ import pino from "pino";
 import { callerAuthOf } from "../auth/caller-auth.js";
 import { devAuthBypassEnabled, getUser } from "../auth/middleware.js";
 import type { UserInfo } from "../auth/models.js";
-import { SAFE_API_URL, isKubernetesMode } from "../config.js";
+import { SAFE_API_URL, SANDBOX_NAMESPACE, isKubernetesMode } from "../config.js";
 import { UpstreamError, getUpstreamJson } from "../shared/upstream.js";
 
 const logger = pino({ name: "me-route" });
@@ -128,6 +132,8 @@ export function buildMe(
   workspacesBody: unknown,
   clustersBody: unknown,
   userBody: unknown,
+  /** The deployment's default sandbox workspace; a parameter so the rule is testable without the environment. */
+  deploymentDefaultWorkspaceId: string = SANDBOX_NAMESPACE,
 ): Me | null {
   const workspaceItems = itemsOf(workspacesBody);
   const clusterItems = itemsOf(clustersBody);
@@ -155,7 +161,10 @@ export function buildMe(
   }
 
   const anyReadyCluster = clusterItems.some((c) => c.phase === READY_PHASE);
-  const defaultSandbox = workspaces.find((w) => w.scopes.includes(SANDBOX_SCOPE));
+  const sandboxWorkspaces = workspaces.filter((w) => w.scopes.includes(SANDBOX_SCOPE));
+  const preferred = deploymentDefaultWorkspaceId.trim();
+  const defaultSandbox = (preferred ? sandboxWorkspaces.find((w) => w.id === preferred) : undefined)
+    ?? sandboxWorkspaces[0];
   const sandbox: Me["sandbox"] = { available: anyReadyCluster && defaultSandbox !== undefined };
   if (defaultSandbox) {
     sandbox.defaultWorkspaceId = defaultSandbox.id;
