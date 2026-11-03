@@ -349,8 +349,8 @@ export class GithubReview {
   }
 
   /** The overview, with the index of the sections and the ones in `inline` whole in it. */
-  private overviewBody(read: ReviewRead, file: string | null, inline: Inline): Record<string, unknown> {
-    const sections = Object.fromEntries(PAGED_SECTIONS.map((s) => [s, { chars: this.sectionText(read, s, file).length, inline: s in inline }]));
+  private overviewBody(read: ReviewRead, file: string | null, inline: Inline, redact: (t: string) => string): Record<string, unknown> {
+    const sections = Object.fromEntries(PAGED_SECTIONS.map((s) => [s, { chars: this.sectionText(read, s, file, redact).length, inline: s in inline }]));
     const untrusted = { title: clip(read.pr.title, 300), ...(inline.files !== undefined ? { files: inline.files } : {}),
       ...(inline.conversation !== undefined ? { conversation: inline.conversation } : {}), ...(inline.diff !== undefined ? { diff: inline.diff } : {}) };
     return {
@@ -360,15 +360,18 @@ export class GithubReview {
     };
   }
 
-  /** A section's whole text: `file` narrows the diff to one file's part. */
-  private sectionText(read: ReviewRead, section: Section, file: string | null): string {
+  /**
+   * A section's whole text, redacted whole before it is cut into pages (a secret cut in two is matched by neither half): `file` narrows
+   * the diff to one file's part.
+   */
+  private sectionText(read: ReviewRead, section: Section, file: string | null, redact: (t: string) => string): string {
     switch (section) {
       // Read in pages only when it does not fit in one answer, and then with the index of what else to read, none of it inline.
-      case "overview": return JSON.stringify(this.overviewBody(read, file, {}));
-      case "instructions": return read.instructions;
-      case "files": return filesText(read.files);
-      case "diff": return diffText(read.files, file);
-      case "conversation": return read.conversation;
+      case "overview": return redact(JSON.stringify(this.overviewBody(read, file, {}, redact)));
+      case "instructions": return redact(read.instructions);
+      case "files": return filesText(read.files, redact);
+      case "diff": return diffText(read.files, file, redact);
+      case "conversation": return redact(read.conversation);
     }
   }
 
@@ -378,11 +381,11 @@ export class GithubReview {
    */
   private overviewAnswer(read: ReviewRead, file: string | null, redact: (t: string) => string): ToolOutcome | null {
     const inline: Inline = {};
-    const render = (): Record<string, unknown> => this.overviewBody(read, file, inline);
+    const render = (): Record<string, unknown> => this.overviewBody(read, file, inline, redact);
     const fits = (): boolean => redact(JSON.stringify(render())).length <= PAGE_MAX_CHARS;
     if (!fits()) return null;
     for (const s of PAGED_SECTIONS) {
-      inline[s] = this.sectionText(read, s, file);
+      inline[s] = this.sectionText(read, s, file, redact);
       if (!fits()) delete inline[s];
     }
     return ok(render(), redact);
@@ -394,7 +397,7 @@ export class GithubReview {
    */
   private pageAnswer(read: ReviewRead, section: Section, offset: number, args: Record<string, unknown>, redact: (t: string) => string): ToolOutcome {
     const file = typeof args.file === "string" && args.file ? args.file : null;
-    const full = this.sectionText(read, section, file);
+    const full = this.sectionText(read, section, file, redact);
     const want = section === "diff" && Number.isSafeInteger(args.max_diff_chars) && Number(args.max_diff_chars) > 0 ? Number(args.max_diff_chars) : PAGE_MAX_CHARS;
     const untrusted = section === "files" || section === "diff" || section === "conversation";
     let body: Record<string, unknown> = {};

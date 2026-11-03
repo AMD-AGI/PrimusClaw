@@ -14,6 +14,7 @@
  *   G6  an overview too long for one answer is itself read in pages, and still names the sections to read
  *   G7  a page fits whatever the text costs to escape, and a line longer than a page is still read whole
  *   G8  a page from the session's read is still held to the repository gates as they are now
+ *   G9  the acting user's token is masked in a section before it is cut into pages, so no two pages put it back together
  */
 import assert from "node:assert/strict";
 import test, { after, afterEach, beforeEach } from "node:test";
@@ -21,7 +22,7 @@ import { PR_REVIEW_SKILL } from "../src/github-review/default-skill.js";
 import { PAGE_MAX_CHARS, diffText, fitPage } from "../src/github-review/pages.js";
 import type { RiskFile } from "../src/github-review/risk.js";
 import { HEAD, type FakeFile } from "./support/fake-github.js";
-import { PR, closeShared, readSection, reviewEnv, type ReviewEnv } from "./support/review-env.js";
+import { PR, TOKEN, closeShared, readSection, reviewEnv, type ReviewEnv } from "./support/review-env.js";
 
 /** Brain's cut (brain/src/agent/agent-loop.ts): a longer result reaches the model with its middle missing. */
 const BRAIN_CUT = 6000;
@@ -239,5 +240,17 @@ test("G7 a page fits whatever the text costs to escape, ends at a line end when 
       offset = page.next;
     }
     assert.equal(got, full);
+  }
+});
+
+test("G9 the acting user's token in the change is masked before the section is cut into pages: no page boundary splits it out of reach", async () => {
+  // One line far longer than a page, the token every 97 characters: page boundaries fall inside some of them.
+  const line = Array.from({ length: 400 }, (_, i) => `${"x".repeat(i % 50)}${TOKEN}`.padEnd(97, "y")).join("");
+  useChange([{ filename: "leak.ts", status: "added", additions: 1, deletions: 0, patch: `@@ -0,0 +1 @@\n+${line}` }]);
+  for (const section of ["diff", "files"]) {
+    const { text, pages } = await readSection(e.service, e.actor, PR, section);
+    if (section === "diff") assert.ok(pages > 5, `pages ${pages}`);
+    assert.ok(!text.includes(TOKEN), `${section}: the pages put together carry the token`);
+    for (let n = 12; n < TOKEN.length; n += 6) assert.ok(!text.includes(TOKEN.slice(0, n)), `${section}: a prefix of ${n}`);
   }
 });

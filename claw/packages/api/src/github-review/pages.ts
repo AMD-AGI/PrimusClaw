@@ -39,20 +39,26 @@ function filePart(f: RiskFile): string {
   return `${fileHeader(f)}\n${shown}\n`;
 }
 
-/** The diff of every file (or of `only`), one after the other, each under a `### path` header. */
-export function diffText(files: RiskFile[], only: string | null = null): string {
-  return files.filter((f) => !only || f.path === only).map(filePart).join("");
+type Redact = (t: string) => string;
+const asIs: Redact = (t) => t;
+
+/**
+ * The diff of every file (or of `only`), one after the other, each under a `### path` header, each passed through `redact` whole: a
+ * secret is masked before the text is cut into pages, where a secret cut in two would be matched by neither half.
+ */
+export function diffText(files: RiskFile[], only: string | null = null, redact: Redact = asIs): string {
+  return files.filter((f) => !only || f.path === only).map((f) => redact(filePart(f))).join("");
 }
 
 /** One line per changed file: what it is, and where its part of the `diff` section starts and how long it is, so a page can be aimed at it. */
-export function filesText(files: RiskFile[]): string {
+export function filesText(files: RiskFile[], redact: Redact = asIs): string {
   let offset = 0;
-  return files.map((f) => {
-    const part = filePart(f).length;
+  return redact(files.map((f) => {
+    const part = redact(filePart(f)).length;
     const line = `${f.path} (${f.status}, +${f.additions} -${f.deletions}) diff offset ${offset}, ${part} chars${diffNotSent(f) ? ", no diff" : ""}\n`;
     offset += part;
     return line;
-  }).join("");
+  }).join(""));
 }
 
 export function conversationText(title: string, description: string, comments: Comment[]): string {
