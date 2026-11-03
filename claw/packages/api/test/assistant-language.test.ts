@@ -5,6 +5,7 @@
  * The language the assistant is told to answer in (`src/assistant/language.ts`).
  *
  *   L1  Chinese, Japanese, Korean and English are told apart, with the other things a message contains left out
+ *   L1c a quotation is not the user's sentence, and a message that opens in Chinese, Japanese or Korean is theirs whatever English follows
  *   L2  a message that cannot be told, or is in another language, has no verdict rather than a wrong one
  *   L3  the verdict agrees with the language every evaluation message is labelled with
  *   L4  the language is the message's own, else the one the user wrote in before; a report is not the user's message
@@ -47,6 +48,39 @@ test("L1b code, links, paths and addresses do not decide the language", () => {
   assert.equal(detectLanguage("```\nthe and that this with you\n```"), null, "nothing outside the code is language");
   assert.equal(detectLanguage("send it to someone@example.com please"), "English");
   assert.equal(detectLanguage("see docs/the-and-that/with-you.md"), null);
+});
+
+test("L1c a quotation is not the user's sentence, and a message that opens in Chinese, Japanese or Korean is theirs whatever English follows", () => {
+  const table: Array<[string, string | null]> = [
+    // A Chinese user asking about an English sentence: the English is quoted, or what the Chinese sentence is about.
+    ["把 'Please fix the build and then deploy it' 翻译成中文", "Chinese"],
+    ["这个 PR 的 title 是 \"Fix the build and add the tests for it\"，帮我改成中文", "Chinese"],
+    ["帮我 check the build and then fix it please", "Chinese"],
+    ["OK 帮我 check the build and then fix it please", "Chinese"],
+    ["把‘Please fix the build and then deploy it’翻译成中文", "Chinese"],
+    ["把「Please fix the build and then deploy it」翻译成中文", "Chinese"],
+    ["请把 “Fix the build and add the tests for it” 改成中文", "Chinese"],
+    ["帮我翻译一下：Please fix the build and then deploy it. The nightly job has been red since yesterday and nobody has looked at it.", "Chinese"],
+    ["ビルドを check the build and then fix it please", "Japanese"],
+    ["빌드가 왜 깨졌는지 check the build and then fix it please", "Korean"],
+    // An English user asking about a Chinese, Japanese or Korean one.
+    ["What does \"你好\" mean?", "English"],
+    ["Translate “这个构建为什么一直是红的” into English, please", "English"],
+    ["Please translate '日本語のビルドエラー' into English for me", "English"],
+    ["Please translate 「ビルドが赤い理由を調べてください」 into English", "English"],
+    ["Can you check why the nightly build is red? The error says \"找不到模块\"", "English"],
+    ["What does 我爱你 mean?", "English"],
+    ["Please translate 帮我看一下这个 into English", "English"],
+    // An apostrophe inside a word is not a quote.
+    ["I don't know what the 帮助 doc says, it isn't clear", "English"],
+    ["The users' list isn't what I'd expect, and 我的 items are missing", "English"],
+    // Nothing but a quotation: the quotation is all there is to go on.
+    ["\"Please fix the build\"", "English"],
+    ["\"这个构建为什么是红的\"", "Chinese"],
+    ["「ビルドが赤い」", "Japanese"],
+    ["''", null],
+  ];
+  for (const [text, want] of table) assert.equal(detectLanguage(text), want, text);
 });
 
 test("L2 what cannot be told has no verdict", () => {

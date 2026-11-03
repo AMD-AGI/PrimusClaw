@@ -45,6 +45,21 @@ const ENGLISH_SENTENCE_SHARE = 0.2;
 
 const count = (text: string, re: RegExp): number => text.match(re)?.length ?? 0;
 
+/** The words of a text in lower case, apostrophes inside a word kept. */
+const wordsOf = (text: string): string[] => text.toLowerCase().split(/[^\p{L}']+/u).map((w) => w.replace(/^'+|'+$/g, ""));
+
+const englishWords = (text: string): number => wordsOf(text).filter((w) => ENGLISH.has(w)).length;
+
+/**
+ * Chinese characters that carry a sentence rather than name a thing: pronouns, particles, auxiliaries, question and
+ * request words ("帮我", "请", "把", "这个", "吗"). A Chinese word quoted in an English sentence is a noun or a phrase;
+ * one of these in a run of characters says the run is the user's own grammar. Japanese and Korean say it with any kana
+ * or Hangul, which occur in their grammar and hardly anywhere else.
+ */
+const HAN_FRAME = new Set([..."我你您他她它们咱的了吗呢吧把被让给对在要能想会可请帮替为是这那哪什么怎还就也都又不没别有"]);
+
+const CJK_RUN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}ー]+/gu;
+
 /**
  * What the user said, without what only looks like language: code, links, paths and addresses are not in any language,
  * and a pasted log must not decide how the answer is written.
@@ -60,23 +75,60 @@ function wording(text: string): string {
     .replace(/’/g, "'");
 }
 
+/**
+ * The message without what it quotes. A quotation is somebody else's sentence: "translate 'Please fix the build' into
+ * Chinese" is a Chinese user's request about an English sentence, and `What does "你好" mean?` an English user's about a
+ * Chinese one. So the words around the quotes decide, and the quotes only when there is nothing else. An apostrophe
+ * inside a word (`don't`, `users'`) opens nothing.
+ */
+function unquoted(text: string): string {
+  const inWord = "\\p{Script=Latin}\\p{N}";
+  return text
+    .replace(/"[^"\n]*"/g, " ")
+    .replace(/“[^”\n]*”/g, " ")
+    .replace(/[「『][^」』\n]*[」』]/g, " ")
+    // wording() has already turned a curly apostrophe into a straight one, so ‘…’ arrives as ‘…'.
+    .replace(new RegExp(`(?<![${inWord}])['‘][^'‘\\n]*'(?![${inWord}])`, "gu"), " ");
+}
+
+/**
+ * Whether the message opens with a sentence of the user's in Chinese, Japanese or Korean: a run of those characters
+ * that has grammar of its own, with no English function word before it. English that follows it is then what the
+ * sentence is about ("帮我 check the build and then fix it please"), however much of it there is. When English comes
+ * first, the English is the frame and the characters are what it asks about ("What does 我爱你 mean?").
+ */
+function opensInCjk(text: string): boolean {
+  for (const run of text.matchAll(CJK_RUN)) {
+    const hasGrammar = /[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(run[0]) || [...run[0]].some((c) => HAN_FRAME.has(c));
+    if (hasGrammar) return englishWords(text.slice(0, run.index)) === 0;
+  }
+  return false;
+}
+
 /** The language of one message, or null when it cannot be told. */
 export function detectLanguage(message: string): string | null {
   const text = wording(message);
+  const outside = unquoted(text);
+  // The user's own words first; what they quoted only when they said nothing besides it.
+  return judge(outside) ?? (outside === text ? null : judge(text));
+}
+
+function judge(text: string): string | null {
   const kana = count(text, /[\p{Script=Hiragana}\p{Script=Katakana}]/gu);
   const hangul = count(text, /\p{Script=Hangul}/gu);
   const han = count(text, /\p{Script=Han}/gu);
   const cjk = kana + hangul + han;
-  const words = text.toLowerCase().split(/[^\p{L}']+/u).map((w) => w.replace(/^'+|'+$/g, ""));
+  const words = wordsOf(text);
   // English needs a function word to say so: a Chinese sentence full of English terms has none, and must not be called English.
   const english = words.filter((w) => ENGLISH.has(w)).length;
   if (english > 0 && cjk === 0) return "English";
   // Both in one message: the one that is the user's own sentence wins, and a quoted word is not a sentence. English counts
   // only when it is more words than the other script (a word of those is about two characters) and is made like a sentence:
   // a pasted log or a list of terms in a Chinese message has far fewer function words than an English sentence that
-  // asks about a Chinese, Japanese or Korean word.
+  // asks about a Chinese, Japanese or Korean word. A message that opens in the other script is that script's, whatever
+  // English follows.
   const latinWords = words.filter((w) => /^[\p{Script=Latin}']{2,}$/u.test(w)).length;
-  if (english > 0 && latinWords > cjk / 2 && english / latinWords >= ENGLISH_SENTENCE_SHARE) return "English";
+  if (english > 0 && latinWords > cjk / 2 && english / latinWords >= ENGLISH_SENTENCE_SHARE && !opensInCjk(text)) return "English";
   // Kana only occur in Japanese and Hangul only in Korean, so a couple of them settle it between the three.
   if (kana >= 2) return "Japanese";
   if (hangul >= 2) return "Korean";

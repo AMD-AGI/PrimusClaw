@@ -15,6 +15,7 @@
  *   A7  a router turn does not select skills; a worker's and an ordinary session's do
  *   A8  a turn whose profile cannot be applied does not run
  *   A9  a router turn's message carries the reply-language line on every route, and what is stored is the user's words
+ *   A9c the same turn once it has completed: the conversation holds the user's words, not the request Brain ran
  *   A10 a worker's report that wakes the router carries the language the user last wrote in, and nothing when none is known
  *   A11 the router's item list names each item by its id and its number, and a report's header does as well
  */
@@ -320,6 +321,70 @@ describe("assistant role profile", { skip }, () => {
       });
     } finally { stub.restore(); }
     assert.equal(JSON.parse(stub.published[0]!).prompt, `${english}${line("English")}`);
+  });
+
+  test("A9c when the turn completes, the conversation holds the user's words and none of the reply-language line, on every route", async () => {
+    const english = "Can you check why the nightly build is red?";
+    const chinese = "帮我看一下 staging 为什么一直重启";
+    const line = /\[Reply language/;
+    // What Brain does with the request it was given: runs it, and echoes its prompt in the completion event.
+    const completeAsBrain = async (request: { prompt: string; message_id: string }, answer: string) => {
+      assert.match(request.prompt, line, "the request Brain ran does carry the line");
+      await w.mod.consumer.recordCompletionTurns(
+        alice.routerSid,
+        { type: "exec_complete", session_id: alice.routerSid, message_id: request.message_id, prompt: request.prompt, final_text: answer, failed: false },
+        request.message_id,
+      );
+    };
+    const stored = async () => (await w.q(
+      "SELECT role, content FROM claw_conversation_turns WHERE session_id = $1 AND deleted_at IS NULL ORDER BY turn_index", [alice.routerSid],
+    )).map((r) => [r.role, r.content]);
+    const reset = async () => { await w.q("DELETE FROM claw_conversation_turns"); await w.q("DELETE FROM claw_tasks"); };
+
+    // The fat dispatch, then the next message: the history Brain is given for it is the user's words as sent.
+    for (const [content, language] of [[english, "English"], [chinese, "Chinese"]] as const) {
+      await reset();
+      const { published } = await send(alice.routerSid, "alice", { doorbell: false, content });
+      const request = JSON.parse(published[0]);
+      assert.ok(request.prompt.endsWith(`[Reply language: ${language}]`));
+      await completeAsBrain(request, "On it.");
+      assert.deepEqual(await stored(), [["user", content], ["assistant", "On it."]], `fat dispatch, ${language}`);
+      const next = JSON.parse((await send(alice.routerSid, "alice", { doorbell: false, content: "ok" })).published[0]);
+      assert.deepEqual(next.history.map((m: any) => [m.role, m.content]), [["user", content], ["assistant", "On it."], ["user", "ok"]], "what Brain is given as history");
+      assert.ok(!JSON.stringify(next.history).match(line));
+    }
+
+    // The doorbell claim.
+    await reset();
+    await send(alice.routerSid, "alice", { doorbell: true, content: chinese });
+    await completeAsBrain(await claim(), "好的");
+    assert.deepEqual(await stored(), [["user", chinese], ["assistant", "好的"]], "doorbell claim");
+
+    // The queue's replay, with its run row opened as it is in production.
+    await reset();
+    const { dispatchPendingMessage, pendingDispatchPorts } = await import("../src/tasks/pending-dispatch.js");
+    const { openChatRun } = await import("../src/tasks/chat-run.js");
+    const stub = await stubPending();
+    let request: any;
+    try {
+      pendingDispatchPorts.openChatRun = ((input: Parameters<typeof openChatRun>[0]) => openChatRun({ ...input, recordWorkspaceUse: false })) as never;
+      await dispatchPendingMessage({
+        sessionId: alice.routerSid, pendingId: 1, userId: "alice", messageId: "claw-pending-2", prompt: english,
+        task: { session_id: alice.routerSid, message_id: "claw-pending-2", prompt: english },
+      });
+      request = JSON.parse(stub.published[0]!);
+    } finally { stub.restore(); }
+    const [row] = await w.q("SELECT prompt FROM claw_tasks WHERE session_id = $1 AND metadata->>'message_id' = 'claw-pending-2'", [alice.routerSid]);
+    assert.equal(row?.prompt, english, "the replayed turn has its run row, holding the user's words");
+    await completeAsBrain(request, "On it.");
+    assert.deepEqual(await stored(), [["user", english], ["assistant", "On it."]], "queue replay");
+
+    // A run with no row has only the event's copy of the prompt, which is then what is stored.
+    await reset();
+    await w.mod.consumer.recordCompletionTurns(
+      alice.routerSid, { type: "exec_complete", message_id: "no-row", prompt: "no row for this one", final_text: "fine", failed: false }, "no-row",
+    );
+    assert.deepEqual(await stored(), [["user", "no row for this one"], ["assistant", "fine"]]);
   });
 
   test("A9b a message that shows no language gets no line of its own; a worker's and a plain session's get none", async () => {
