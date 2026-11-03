@@ -6,17 +6,25 @@
  * (`BASH_APPROVAL_DEFAULTS_ENABLED=false`): the writes to GitHub that a model can
  * make from the sandbox with the user's own token. The GitHub MCP tools hold the
  * same writes for a person; without these, the shell would be the way around that.
- * A plain `git push` of a branch is not here: publishing a branch changes nothing
- * that is not the user's, and opening the pull request from it is held.
+ * A plain `git push` of a feature branch is not here: publishing it changes nothing
+ * that is not the user's, and opening the pull request from it is held. A push
+ * named for main / master is, since it lands without a review where the branch is
+ * unprotected (a bare `git push` while on main is not seen). A GraphQL call is
+ * held only when it is a mutation, or its query is read from somewhere unseen.
  *
  * Copied verbatim from the outbound-actions pack (examples/bash-approval), which
  * is where they are tested command by command; a test keeps the two the same.
  */
-export const DEFAULT_BASH_APPROVAL_RULES: ReadonlyArray<Record<string, string>> = [
+export const DEFAULT_BASH_APPROVAL_RULES: ReadonlyArray<Record<string, unknown>> = [
   {
     "label": "git push --force / --delete (rewrites or deletes remote history)",
     "program": "git",
     "args_regex": "^(?:(?:-[cC]|--(?:git-dir|work-tree|namespace|super-prefix|config-env|attr-source))\\s+\\S+\\s+|(?!(?:-[cC]|--(?:git-dir|work-tree|namespace|super-prefix|config-env|attr-source))\\s)-\\S*\\s+)*push\\s(?:.*\\s)?(?:--force(?:-with-lease|-if-includes)?(?:=\\S*)?|--delete|--mirror|--prune|-[A-Za-z]*[fd][A-Za-z]*|\\+\\S*|:\\S+)(?:\\s|$)"
+  },
+  {
+    "label": "git push to the default branch (main / master)",
+    "program": "git",
+    "args_regex": "^(?:(?:-[cC]|--(?:git-dir|work-tree|namespace|super-prefix|config-env|attr-source))\\s+\\S+\\s+|(?!(?:-[cC]|--(?:git-dir|work-tree|namespace|super-prefix|config-env|attr-source))\\s)-\\S*\\s+)*push\\s(?:.*\\s)?(?:\\S*:)?(?:refs/heads/)?(?:main|master)(?:\\s|$)"
   },
   {
     "label": "gh pr write (creates, changes or merges a pull request)",
@@ -40,10 +48,16 @@ export const DEFAULT_BASH_APPROVAL_RULES: ReadonlyArray<Record<string, string>> 
     "args_regex": "^(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*api\\s(?:.*\\s)?(?:-X\\s*|--method(?:\\s+|=))(?:POST|PUT|PATCH|DELETE)(?:\\s|$)"
   },
   {
+    "label": "gh api graphql mutation (or a query read from a file or stdin)",
+    "program": "gh",
+    "flags": "i",
+    "args_regex": "^(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*api\\s+/?graphql(?:\\s|$)(?=[\\s\\S]*\\bmutation\\b|[\\s\\S]*=@|(?:[\\s\\S]*\\s)?--input(?:\\s|=|$))"
+  },
+  {
     "label": "gh api with fields or a body (an implied POST)",
     "program": "gh",
     "flags": "i",
-    "args_regex": "^(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*api(?!(?:.*\\s)?(?:-X\\s*|--method(?:\\s+|=))GET(?:\\s|$)).*\\s(?:-[fF]|--field|--raw-field|--input)"
+    "args_regex": "^(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*api(?!\\s+/?graphql(?:\\s|$))(?!(?:.*\\s)?(?:-X\\s*|--method(?:\\s+|=))GET(?:\\s|$)).*\\s(?:-[fF]|--field|--raw-field|--input)"
   },
   {
     "label": "gh repo write (creates, changes or deletes a repository)",
@@ -54,5 +68,29 @@ export const DEFAULT_BASH_APPROVAL_RULES: ReadonlyArray<Record<string, string>> 
     "label": "gh workflow write (runs, enables or disables a workflow)",
     "program": "gh",
     "args_regex": "^(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*workflow\\s+(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*(?:run|enable|disable)(?:\\s|$)"
+  },
+  {
+    "label": "gh secret / variable / label / run / gist / key write",
+    "program": "gh",
+    "args_regex": "^(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*(?:(?:secret|variable)\\s+(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*(?:set|delete|remove)|label\\s+(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*(?:create|edit|delete|clone)|run\\s+(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*(?:rerun|cancel|delete)|gist\\s+(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*(?:create|new|edit|delete|rename)|(?:ssh|gpg)-key\\s+(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*(?:add|delete)|cache\\s+(?:(?:-R|--repo)\\s+\\S+\\s+|(?!(?:-R|--repo)\\s)-\\S*\\s+)*delete)(?:\\s|$)"
+  },
+  {
+    "label": "curl / wget write to the GitHub API (POST / PUT / PATCH / DELETE)",
+    "program": [
+      "curl",
+      "wget"
+    ],
+    "http": {
+      "methods": [
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE"
+      ],
+      "url_prefix": [
+        "api.github.com",
+        "uploads.github.com"
+      ]
+    }
   }
 ];
