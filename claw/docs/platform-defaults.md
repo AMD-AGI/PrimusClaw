@@ -50,6 +50,18 @@ Mount order, lowest priority first: platform defaults, request `mcp_servers`,
 listed like any other plugin skill (see below), a local or `tool_ids` skill stays
 fully inlined.
 
+**A session that acts as a user is given none of the defaults.** A run whose request
+carries `withhold_sandbox_keys` (a session with `config.acting_as`, see
+`github-review.md`) reads text that strangers wrote, and a default MCP server whose token
+is `<SAFE_API_KEY>` is called with the requester's own key, so one of its tools is the
+requester's access in the hands of that text; a default skill steers the model towards
+it. Such a run has no default MCP server and no default skill (none is listed in the
+prompt or fetched from the marketplace), and what it is offered is what its own request
+carries: the review tools the API adds for such a session, and a `mcp_servers`,
+`tool_ids` or plugin that the request itself names. This holds for every run Brain makes
+for the session (a message, a turn claimed from the queue, a task of a DAG, a sub-agent,
+which starts from its parent's tools). Every other session is given the defaults as before.
+
 ## How skills load (progressive disclosure)
 
 The prompt carries one line per default skill: name and a one-line description

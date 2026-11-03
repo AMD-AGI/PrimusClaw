@@ -12,6 +12,7 @@ import (
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
+	"sigs.k8s.io/agent-sandbox/pkg/sandboxlayer"
 )
 
 // TemplateListResult is the response payload for listing CodeInterpreter templates.
@@ -44,6 +45,14 @@ type UpdateTemplateRequest struct {
 	// Public optionally changes the template's public visibility.
 	// Only system-admin can change this. nil means no change.
 	Public *bool `json:"public,omitempty"`
+}
+
+// validateTemplateLayers checks the layers of a template spec.
+func validateTemplateLayers(spec runtimev1alpha1.CodeInterpreterSpec) error {
+	if spec.Template == nil {
+		return nil
+	}
+	return sandboxlayer.Validate(spec.Template.Layers, sandboxlayer.TemplateMounts(spec.Template))
 }
 
 // CreateTemplate creates a new CodeInterpreter CRD object in Kubernetes.

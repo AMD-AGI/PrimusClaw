@@ -150,7 +150,17 @@ export class AgentEngine {
     // of this runs. Only the defaults file is the operator's, so only its
     // servers may read the environment (the names it lists); the rest are
     // written by requesters and tool authors.
-    const defaults = PLATFORM_DEFAULTS_FILE ? loadPlatformDefaults() : null;
+    //
+    // A session that acts as a user (`withhold_sandbox_keys`) is given none, MCP servers and
+    // skills alike. Its model reads what strangers wrote; the default servers are authenticated
+    // with the requester's own platform key (`<SAFE_API_KEY>`), so one of their read tools is the
+    // requester's read access to the platform, put in the hands of that text, and a default skill
+    // steers the model towards it. Such a session has what its own request carries (the API puts
+    // the review tools there) and nothing that is the deployment's. This is the one place defaults
+    // enter a run, and every run of Brain comes through it, a turn, a queued turn, a task of a DAG;
+    // a sub-agent starts from the schemas of the run that made it, so it has none either. Read as
+    // truthy, not `=== true`: a mark that is not a boolean is still a mark.
+    const defaults = PLATFORM_DEFAULTS_FILE && !request.withhold_sandbox_keys ? loadPlatformDefaults() : null;
     const authoredMcp = {
       ...(request.mcp_servers || {}),
       ...resolved.mcpServers,
@@ -361,7 +371,9 @@ export class AgentEngine {
       router.lazySkillWriter = lazySkills;
       // The listed skills are Brain's to hand over: `load_skill` serves them without a sandbox.
       if (progressiveSkills.length) router.skillStore = new SkillStore([...defaultProgressive, ...pluginProgressive], `${sessionDir}/.skills`);
-      router.memoryEnabled = request.memory_enabled !== false;
+      // A session that acts as a user (`withhold_sandbox_keys`) has no `save_memory`: what its model writes into the requester's long-term
+      // memory is what a stranger's text made it write, and every later session of the requester would read it.
+      router.memoryEnabled = request.memory_enabled !== false && !request.withhold_sandbox_keys;
       // Whom an identity-authenticated a2a_call peer is called as, and when the run's budget ends.
       const deadlineMs = request.deadline_at ? Date.parse(request.deadline_at) : NaN;
       router.a2aContext = {
