@@ -77,7 +77,6 @@ export function reviewPathAdvice(choice: ReviewPathChoice): string {
     source_change: "the change touches source code",
   };
   return `This review must use a sandbox because ${why[choice.reason] ?? choice.reason}. `
-    + "Get the code with the sandbox_recipe below: it fetches the pull request anonymously (the repository is public), pinned to the head_sha above. "
-    + "Then read the callers and the code around every changed function and export, and run the tests closest to the change, as the review instructions say. "
-    + "The sandbox has no credential for GitHub and must not be given one: every comment, approval and merge still goes through the tools.";
+    + "Run the sandbox_recipe below (anonymous, pinned to the head_sha), then read the callers of what changed and run the tests closest to the change. "
+    + "Never give the sandbox a GitHub credential: comments, approvals and merges go through the tools.";
 }

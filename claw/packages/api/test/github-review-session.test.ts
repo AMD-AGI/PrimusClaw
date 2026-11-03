@@ -304,11 +304,11 @@ test("T8 the mark does not depend on the tools being offered: a session that act
   }
 });
 
-test("M1 a session that acts as a user and names no model runs on the review model at the review effort; one that names a model keeps it; an ordinary one has neither", async () => {
+test("M1 a session that acts as a user and names no model runs on the review model, with no effort unless one is set; one that names a model keeps it; an ordinary chat session has neither", async () => {
   const cases: Array<[string, Record<string, unknown>, Record<string, unknown>, string | null, string | undefined]> = [
-    ["acting, no model", { acting_as: "u-bob" }, {}, "claude-opus-5.5", "high"],
-    ["acting, model null", { acting_as: "u-bob" }, { model: null }, "claude-opus-5.5", "high"],
-    ["acting, own model", { acting_as: "u-bob" }, { model: "claude-sonnet-5.5" }, "claude-sonnet-5.5", "high"],
+    ["acting, no model", { acting_as: "u-bob" }, {}, "claude-sonnet-5.5", undefined],
+    ["acting, model null", { acting_as: "u-bob" }, { model: null }, "claude-sonnet-5.5", undefined],
+    ["acting, own model", { acting_as: "u-bob" }, { model: "claude-opus-5.5" }, "claude-opus-5.5", undefined],
     ["ordinary", { notify_on_finish: true }, {}, null, undefined],
   ];
   for (const [what, config, extra, model, effort] of cases) {
@@ -322,7 +322,7 @@ test("M1 a session that acts as a user and names no model runs on the review mod
   }
 });
 
-test("M2 the operator chooses both: another model and effort, or the deployment's defaults with `default`", async () => {
+test("M2 the operator chooses both: another model and an effort for every turn of a review (an ordinary session gets neither), or the deployment's model with `default` and no effort", async () => {
   const saved = { m: process.env.CLAW_GITHUB_REVIEW_MODEL, e: process.env.CLAW_GITHUB_REVIEW_EFFORT };
   const restore = () => {
     for (const [k, v] of [["CLAW_GITHUB_REVIEW_MODEL", saved.m], ["CLAW_GITHUB_REVIEW_EFFORT", saved.e]] as const) {
@@ -330,7 +330,7 @@ test("M2 the operator chooses both: another model and effort, or the deployment'
     }
   };
   try {
-    for (const [m, e, model, effort] of [["glm-5-3", "medium", "glm-5-3", "medium"], ["default", "default", null, undefined]] as const) {
+    for (const [m, e, model, effort] of [["glm-5-3", "high", "glm-5-3", "high"], ["default", "", null, undefined]] as const) {
       process.env.CLAW_GITHUB_REVIEW_MODEL = m;
       process.env.CLAW_GITHUB_REVIEW_EFFORT = e;
       published = [];
@@ -339,7 +339,11 @@ test("M2 the operator chooses both: another model and effort, or the deployment'
       const [row] = await h.sql("SELECT model FROM claw_sessions WHERE session_id = $1", [r.body.data.session_id]);
       assert.equal(row?.model ?? null, model, m);
       assert.equal(published[0]?.effort, effort, e);
-      assert.equal("effort" in (published[0] ?? {}), effort !== undefined, `${e}: no field at all for the gateway's default`);
+      assert.equal("effort" in (published[0] ?? {}), effort !== undefined, `${e}: no field at all for the model's default`);
+      published = [];
+      const plain = await create(ALICE, { notify_on_finish: true }, { message: { content: "hello" } });
+      assert.equal(plain.status, 200);
+      assert.deepEqual([published[0]?.model, "effort" in (published[0] ?? {})], [undefined, false], `${m}/${e}: an ordinary chat session is untouched`);
     }
   } finally {
     restore();

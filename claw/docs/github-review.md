@@ -517,8 +517,8 @@ logs and the audit rows.
 | `CLAW_GITHUB_REQUESTS_PER_SESSION` | 60 | GitHub requests one session may make |
 | `CLAW_GITHUB_REVIEW_FAST_MAX_FILES` | 15 | At most this many changed files for the diff-only path |
 | `CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES` | 200 | At most this many added plus deleted lines for the diff-only path; a change of a non-test source file takes the sandbox path whatever its size |
-| `CLAW_GITHUB_REVIEW_MODEL` | `claude-opus-5.5` | The model of a session created with `config.acting_as` when the request names none (`model` absent or null); a request's own `model` wins. `default` leaves Brain's `DEFAULT_MODEL`. The requester's key pays for it |
-| `CLAW_GITHUB_REVIEW_EFFORT` | `high` | The reasoning effort of every turn of such a session, its sub-agents included (`low`, `medium`, `high`; Anthropic adaptive thinking at `output_config.effort`, OpenAI `reasoning_effort`). `default` leaves the gateway's |
+| `CLAW_GITHUB_REVIEW_MODEL` | `claude-sonnet-5.5` | The model of a session created with `config.acting_as` when the request names none (`model` absent or null); a request's own `model` wins. `default` leaves Brain's `DEFAULT_MODEL`. The requester's key pays for it |
+| `CLAW_GITHUB_REVIEW_EFFORT` | unset | The reasoning effort of every turn of such a session, its sub-agents included (`low`, `medium`, `high`; Anthropic `output_config.effort`, OpenAI `reasoning_effort`). Unset sends neither field, so the model's own default applies, as before; another value is reported and sends none |
 
 The identity provider must give the API's own client the `identity.credential.resolve` scope
 (see [identity-client.md](identity-client.md), external credentials). Without a bound credential

@@ -199,15 +199,15 @@ test("the secret in the settings is not part of the path decision", () => {
   assert.equal(SECRET.length >= 32, true);
 });
 
-test("the review model and effort are read from the environment: opus at high by default, `default` for the deployment's, a bad value falls back and is reported", () => {
+test("the review model and effort are read from the environment: sonnet and no effort by default, `default` for the deployment's model, a bad value is reported", () => {
   const d = readGithubReviewSettings({}, true);
-  assert.deepEqual([d.reviewModel, d.reviewEffort], ["claude-opus-5.5", "high"]);
-  const s = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_MODEL: "claude-sonnet-5.5", CLAW_GITHUB_REVIEW_EFFORT: "Medium" }, true);
-  assert.deepEqual([s.reviewModel, s.reviewEffort], ["claude-sonnet-5.5", "medium"]);
-  const off = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_MODEL: "default", CLAW_GITHUB_REVIEW_EFFORT: "default" }, true);
+  assert.deepEqual([d.reviewModel, d.reviewEffort], ["claude-sonnet-5.5", null]);
+  const s = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_MODEL: "claude-opus-5.5", CLAW_GITHUB_REVIEW_EFFORT: "Medium" }, true);
+  assert.deepEqual([s.reviewModel, s.reviewEffort], ["claude-opus-5.5", "medium"]);
+  const off = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_MODEL: "default", CLAW_GITHUB_REVIEW_EFFORT: "" }, true);
   assert.deepEqual([off.reviewModel, off.reviewEffort, off.problems], [null, null, []]);
   const bad = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_MODEL: "has space", CLAW_GITHUB_REVIEW_EFFORT: "max" }, true);
-  assert.deepEqual([bad.reviewModel, bad.reviewEffort], ["claude-opus-5.5", "high"]);
+  assert.deepEqual([bad.reviewModel, bad.reviewEffort], ["claude-sonnet-5.5", null]);
   assert.match(bad.problems.join(), /CLAW_GITHUB_REVIEW_MODEL/);
   assert.match(bad.problems.join(), /CLAW_GITHUB_REVIEW_EFFORT=max/);
 });

@@ -61,15 +61,15 @@ function openAiStub() {
 
 const EFFORT_KEYS = ["thinking", "output_config", "reasoning_effort"];
 
-test("Anthropic: every streamed turn asks for adaptive thinking at the run's effort; a run without one sends neither field", async () => {
+test("Anthropic: every streamed turn asks for the run's effort; a run without one does not", async () => {
   for (const effort of ["low", "medium", "high"] as const) {
     const { client, bodies } = anthropicStub();
     const session = buildAnthropicSession(client, "claude-opus-5.5", {}, effort);
     await session.streamTurn(MSGS, NO_TOOLS);
     await session.streamTurn(MSGS, NO_TOOLS);
     for (const b of bodies) {
-      assert.deepEqual(b.thinking, { type: "adaptive" }, effort);
       assert.deepEqual(b.output_config, { effort }, effort);
+      assert.equal("thinking" in b, false, `${effort}: the model's own thinking default is left alone`);
     }
     // A compaction or summary call keeps its own knobs: the run's effort is not spent on it.
     await session.complete("sys", "text", 100);

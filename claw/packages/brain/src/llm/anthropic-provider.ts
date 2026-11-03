@@ -120,8 +120,8 @@ async function streamingTurn(
           messages: body.messages as unknown as MessageParam[],
           tools,
           max_tokens: 16384,
-          // Adaptive thinking is what the effort is spent on; without it a model only answers more or less at length.
-          ...(effort ? { thinking: { type: "adaptive" as const }, output_config: { effort } } : {}),
+          // Only the effort: the models think adaptively by default, and a run without one sends exactly what it always did.
+          ...(effort ? { output_config: { effort } } : {}),
           stream: true,
         },
         { signal: ctrl.signal },

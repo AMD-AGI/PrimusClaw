@@ -413,9 +413,9 @@ export interface ExecuteRequest {
   rules_text?: string;
   model?: string;
   /**
-   * How hard the model is asked to think on every LLM turn of this run, its sub-agents included (Anthropic: adaptive thinking at
-   * `output_config.effort`; OpenAI: `reasoning_effort`). Absent means the gateway's own defaults, which is what every run had before the
-   * field. The API sets it for a session that reviews a pull request on someone's behalf (`CLAW_GITHUB_REVIEW_EFFORT`).
+   * How hard the model is asked to think on every LLM turn of this run, its sub-agents included (Anthropic: `output_config.effort`;
+   * OpenAI: `reasoning_effort`). Absent means the model's own default, which is what every run had before the field. The API sets it
+   * for a session that reviews a pull request on someone's behalf, when an operator set `CLAW_GITHUB_REVIEW_EFFORT`.
    */
   effort?: ReasoningEffort;
   max_turns?: number;

@@ -25,6 +25,7 @@ process.env.CLAW_GITHUB_REVIEW_ENABLED = "true";
 process.env.CLAW_GITHUB_REVIEW_MCP_SECRET = "t".repeat(40);
 process.env.TASK_DISPATCH_STAGE_TIMEOUT_MS = "200";
 process.env.CLAW_DEPLOY_MODE = "safe";
+process.env.CLAW_GITHUB_REVIEW_EFFORT = "high"; // an operator who set one: every turn of a review carries it
 
 const { db } = await import("../src/infra/db.js");
 const { initUserEnvCrypto } = await import("../src/crypto/user-env.js");

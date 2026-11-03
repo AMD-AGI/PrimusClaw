@@ -21,9 +21,9 @@
  *   CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES  ... and at most this many added plus deleted lines, default 200; a change of
  *                                           a non-test source file takes the sandbox path whatever its size (review-path.ts)
  *   CLAW_GITHUB_REVIEW_MODEL                the model of a session that acts as a user when its creator named none, default
- *                                           claude-opus-5.5; `default` leaves the deployment's DEFAULT_MODEL
- *   CLAW_GITHUB_REVIEW_EFFORT               the reasoning effort of every turn of such a session (low, medium, high), default high;
- *                                           `default` leaves the gateway's
+ *                                           claude-sonnet-5.5; `default` leaves the deployment's DEFAULT_MODEL
+ *   CLAW_GITHUB_REVIEW_EFFORT               the reasoning effort of every turn of such a session (low, medium, high); unset (default)
+ *                                           sends none, as every turn did before
  *   CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS  identity-provider client ids of the services that may answer a held write for the user a
  *                                           token names (RFC 8693 exchange: `sub` the user, `act` the service); default none
  *   CLAW_GITHUB_REVIEW_AGENT_NAME           how the footer of a review names its author ("Reviewed by <name> on behalf of ..."), default Claw
@@ -37,10 +37,9 @@ import { parseSessionModel } from "../sessions/session-model.js";
 export const GITHUB_PROVIDER = "github";
 export const MIN_MCP_SECRET_LENGTH = 32;
 export const DEFAULT_AGENT_NAME = "Claw";
-/** The strongest model the gateway serves: a review is read by people who act on it, so it is worth the requester's spend. */
-export const DEFAULT_REVIEW_MODEL = "claude-opus-5.5";
-export const DEFAULT_REVIEW_EFFORT: ReasoningEffort = "high";
-/** The value of either review setting that leaves the deployment's own default in place. */
+/** The review's own model, apart from the deployment's DEFAULT_MODEL; the depth comes from the sandbox and the second pass, not a costlier model. */
+export const DEFAULT_REVIEW_MODEL = "claude-sonnet-5.5";
+/** The value of the review model setting that leaves the deployment's own default in place. */
 const DEPLOYMENT_DEFAULT = "default";
 const MAX_AGENT_NAME_CHARS = 40;
 
@@ -61,7 +60,7 @@ export interface GithubReviewSettings {
   fastMaxChangedLines: number;
   /** The model of a session that acts as a user, when whoever created it named none; null leaves Brain's DEFAULT_MODEL. */
   reviewModel: string | null;
-  /** The reasoning effort of every turn of such a session; null leaves the gateway's. */
+  /** The reasoning effort of every turn of such a session; null (the default) sends none, so the model's own default applies. */
   reviewEffort: ReasoningEffort | null;
   /** The services (identity client ids, compared exactly as signed) that may decide a held write for the user their token names. */
   decisionClientIds: string[];
@@ -98,9 +97,10 @@ export function readGithubReviewSettings(env: Env = process.env, enabled: boolea
   const reviewModelRaw = (env.CLAW_GITHUB_REVIEW_MODEL ?? "").trim() || DEFAULT_REVIEW_MODEL;
   const parsedModel = reviewModelRaw === DEPLOYMENT_DEFAULT ? { ok: true as const, model: null } : parseSessionModel(reviewModelRaw);
   if (!parsedModel.ok) problems.push(`CLAW_GITHUB_REVIEW_MODEL ${parsedModel.error}; using ${DEFAULT_REVIEW_MODEL}`);
-  const reviewEffortRaw = (env.CLAW_GITHUB_REVIEW_EFFORT ?? "").trim().toLowerCase() || DEFAULT_REVIEW_EFFORT;
-  const reviewEffortKnown = reviewEffortRaw === DEPLOYMENT_DEFAULT || isReasoningEffort(reviewEffortRaw);
-  if (!reviewEffortKnown) problems.push(`CLAW_GITHUB_REVIEW_EFFORT=${reviewEffortRaw} is not low, medium, high or default; using ${DEFAULT_REVIEW_EFFORT}`);
+  const reviewEffortRaw = (env.CLAW_GITHUB_REVIEW_EFFORT ?? "").trim().toLowerCase();
+  if (reviewEffortRaw && !isReasoningEffort(reviewEffortRaw)) {
+    problems.push(`CLAW_GITHUB_REVIEW_EFFORT=${reviewEffortRaw} is not low, medium or high; sending none`);
+  }
   const apiUrl = ((env.CLAW_GITHUB_API_URL ?? "").trim() || "https://api.github.com").replace(/(?<!\/)\/+$/, "");
   return {
     enabled,
@@ -118,7 +118,7 @@ export function readGithubReviewSettings(env: Env = process.env, enabled: boolea
     fastMaxFiles: num("CLAW_GITHUB_REVIEW_FAST_MAX_FILES", 15, { min: 0, max: 500 }),
     fastMaxChangedLines: num("CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES", 200, { min: 0, max: 100_000 }),
     reviewModel: parsedModel.ok ? parsedModel.model : DEFAULT_REVIEW_MODEL,
-    reviewEffort: !reviewEffortKnown ? DEFAULT_REVIEW_EFFORT : isReasoningEffort(reviewEffortRaw) ? reviewEffortRaw : null,
+    reviewEffort: isReasoningEffort(reviewEffortRaw) ? reviewEffortRaw : null,
     decisionClientIds: parseClientIds(env.CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS),
     agentName: agentName || DEFAULT_AGENT_NAME,
     problems,
