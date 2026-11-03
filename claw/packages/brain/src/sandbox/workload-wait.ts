@@ -186,9 +186,11 @@ export interface WorkloadWaitOptions {
    * GPU cluster is another matter, and a hosted application has its own owner.
    * Counted from the first read that shows the pod untaken and cleared the
    * moment anything takes it, so it measures an absence of progress and never
-   * the time a healthy start takes. A queued workload is not covered: a queue
-   * moves, and its own ceiling (the Pending one) is what bounds it. 0 or absent
-   * disables.
+   * the time a healthy start takes. Not covered: a queued workload (a queue
+   * moves, and its own ceiling, the Pending one, bounds it) and an admitted one
+   * the platform has put a reason on (for example waiting for a node to scale
+   * up, which it manages and which can outlast any limit of ours). Only an
+   * admitted workload with nothing explaining its wait is. 0 or absent disables.
    */
   unschedulableTimeoutMs?: number;
   deps?: WorkloadWaitDeps;

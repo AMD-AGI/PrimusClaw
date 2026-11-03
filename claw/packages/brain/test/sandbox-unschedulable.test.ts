@@ -34,9 +34,12 @@ type Body = Record<string, unknown>;
 /** In SaFE's own queue: not admitted, the scheduler says why. */
 const queued = (position: number, message = "In queue - insufficient resources, no cpu available"): Body =>
   ({ phase: "Pending", queuePosition: position, message });
-/** Admitted (position 0, message cleared) with a pod that nothing has taken. */
+/** Admitted (position 0, message cleared) with a pod that nothing has taken, and nothing said about why. */
 const untaken = (message = ""): Body =>
   ({ phase: "Pending", queuePosition: 0, message, pods: [{ podId: "sb-1-abc", phase: "Pending" }] });
+/** Admitted, the pod untaken, and the platform saying it is waiting on capacity: a node scaling up. */
+const scalingUp = (detail = "TriggeredScaleUp: pod triggered scale-up: [{pool-a 1->2 (max: 5)}]"): Body =>
+  untaken(`In queue - waiting for scale-up - ${detail}`);
 /** The same pod once a node's kubelet has acknowledged it: pulling its image. */
 const taken: Body = {
   phase: "Pending", queuePosition: 0,
@@ -114,25 +117,29 @@ test("queued: the scheduler's own reason is the reason", () => {
   });
 });
 
-test("admitted with the pod untaken is unscheduled, whichever phase the platform gives it", () => {
+test("admitted with the pod untaken and nothing said about why is unscheduled, whichever phase", () => {
   for (const phase of ["Pending", "NotReady"]) {
     const w = readWaitingState({ phase, queuePosition: 0, pods: [{ podId: "p1", phase: "Pending" }] });
     assert.equal(w?.kind, "unscheduled", phase);
-    assert.match(w!.reason, /pod p1 has not been started on any node/);
+    assert.equal(w!.reason, "the pod p1 is Pending and has not been placed on any node");
   }
   // No pod yet at all reads the same, in different words.
   assert.match(readWaitingState({ phase: "Pending" })!.reason, /no node has taken its pod/);
 });
 
-test("a message the platform gave wins over our wording", () => {
-  const w = readWaitingState(untaken("waiting for scale-up - 0/3 nodes are available: 3 node(s) were unschedulable"));
-  assert.equal(w?.reason, "waiting for scale-up - 0/3 nodes are available: 3 node(s) were unschedulable");
+test("a reason the platform put on an admitted workload makes it a platform wait, not an unscheduled one", () => {
+  // SaFE clears its message when it admits a workload; one that is there was
+  // written after, for a pod it is waiting on capacity for -- a node scaling up.
+  const why = "In queue - waiting for scale-up - TriggeredScaleUp: pod triggered scale-up";
+  const w = readWaitingState(untaken(why));
+  assert.deepEqual(w, { kind: "queued", reason: why });
 });
 
-test("a pod that has only been bound to a node is still untaken", () => {
+test("a pod that has only been bound to a node is still untaken, and the reason says which node", () => {
   // The pod that will not start: the scheduler named a node and the node never answered.
   const w = readWaitingState({ phase: "Pending", pods: [{ podId: "p", phase: "Pending", adminNodeName: "node-9" }] });
   assert.equal(w?.kind, "unscheduled");
+  assert.equal(w!.reason, "the pod p was assigned to node node-9, which has not started it");
 });
 
 test("any sign a node took the pod means it is starting, not waiting", () => {
@@ -160,12 +167,20 @@ test("platform text reaches the user as one bounded line", () => {
   assert.ok(long.endsWith("…"));
   const w = readWaitingState(untaken(`bad\nreason ${"y".repeat(500)}`));
   assert.ok(!w!.reason.includes("\n") && w!.reason.length <= 300);
+  // And the pod and node names in our own wording get the same treatment.
+  const named = readWaitingState({ phase: "Pending", pods: [{ podId: `p\n${"z".repeat(500)}`, phase: "Pending" }] });
+  assert.ok(!named!.reason.includes("\n") && named!.reason.length < 200, named!.reason);
 });
 
-test("the progress sentence names the platform's reason for either kind", () => {
+test("the progress sentence names the reason for each kind", () => {
   assert.equal(
     describeWaiting({ kind: "queued", reason: "In queue - insufficient resources" }, 4),
     "Waiting in queue (position 4): In queue - insufficient resources",
+  );
+  // Admitted, so no position to give: said as what it is.
+  assert.equal(
+    describeWaiting({ kind: "queued", reason: "In queue - waiting for scale-up" }, 0),
+    "Sandbox is waiting on the platform: In queue - waiting for scale-up",
   );
   assert.equal(
     describeWaiting({ kind: "unscheduled", reason: "0/3 nodes are available" }, 0),
@@ -184,22 +199,43 @@ test("an admitted workload no node takes ends as sandbox_unschedulable at the li
   assert.equal(r.terminal.length, 1);
   assert.equal(r.terminal[0]!.reason, "sandbox_unschedulable");
   assert.equal(r.terminal[0]!.status, "failed");
-  assert.match(r.terminal[0]!.message!, /could not be scheduled: the pod sb-1-abc has not been started on any node/);
+  assert.match(r.terminal[0]!.message!, /could not be scheduled: the pod sb-1-abc is Pending and has not been placed on any node/);
 });
 
-test("the error carries the platform's reason", { timeout: 5000 }, async () => {
-  const why = "0/3 nodes are available: 3 node(s) were unschedulable";
-  const r = await run([untaken(why)], { unschedulableTimeoutMs: 60_000 });
+test("the error says what was observed, and for how long", { timeout: 5000 }, async () => {
+  const r = await run([untaken()], { unschedulableTimeoutMs: 60_000 });
   assert.equal(r.ended, "sandbox_unschedulable");
-  assert.ok(r.terminal[0]!.message!.includes(why), r.terminal[0]!.message);
+  const message = r.terminal[0]!.message!;
+  assert.match(message, /could not be scheduled: the pod sb-1-abc is Pending and has not been placed on any node/);
+  assert.match(message, /admitted by the platform, but no node took its pod for 6\ds; phase=pending/);
 });
 
 test("the user is told when the wait begins, once, and with the reason", { timeout: 5000 }, async () => {
-  const why = "0/3 nodes are available: 3 node(s) were unschedulable";
-  const r = await run([untaken(why)], { unschedulableTimeoutMs: 180_000 });
+  const r = await run([untaken()], { unschedulableTimeoutMs: 180_000 });
   // Dozens of reads happen before it gives up; the same reason is not repeated.
   assert.equal(r.progress.length, 1);
-  assert.deepEqual(r.progress[0]!.waiting, { kind: "unscheduled", reason: why });
+  assert.deepEqual(r.progress[0]!.waiting, {
+    kind: "unscheduled", reason: "the pod sb-1-abc is Pending and has not been placed on any node",
+  });
+});
+
+test("a node scale-up the platform reports is never cut short, however long it takes", { timeout: 5000 }, async () => {
+  // Admitted, the pod unschedulable until a node arrives, the platform saying so
+  // the whole time: two hours here, against a limit of three minutes.
+  const r = await run([...repeat(1440, scalingUp()), running], { unschedulableTimeoutMs: 180_000 });
+  assert.equal(r.ended, null);
+  assert.ok(r.clock.value > 7_000_000);
+  assert.deepEqual(r.progress[0]!.waiting, {
+    kind: "queued", reason: "In queue - waiting for scale-up - TriggeredScaleUp: pod triggered scale-up: [{pool-a 1->2 (max: 5)}]",
+  });
+});
+
+test("once the platform withdraws its reason, the wait is unscheduled and the clock starts then", { timeout: 5000 }, async () => {
+  // 300s of scale-up, then nothing said and the pod still untaken: the limit
+  // counts from the first read with no reason (305s), not from admission.
+  const r = await run([...repeat(60, scalingUp()), untaken()], { unschedulableTimeoutMs: 180_000 });
+  assert.equal(r.ended, "sandbox_unschedulable");
+  assert.equal(r.clock.value, 490_000);
 });
 
 test("a queued workload is told its reason at once, and a move up the queue is announced", { timeout: 5000 }, async () => {
@@ -312,15 +348,25 @@ test("a queued sandbox's progress event says the position and the platform's rea
 });
 
 test("an unschedulable sandbox says so when it starts waiting, then ends with the reason as an event", { timeout: 5000 }, async () => {
-  const why = "0/3 nodes are available: 3 node(s) were unschedulable";
-  const { events, ended } = await poll([untaken(why)], 60_000);
+  const why = "the pod sb-1-abc is Pending and has not been placed on any node";
+  const { events, ended } = await poll([untaken()], 60_000);
   assert.equal(ended, "sandbox_unschedulable");
   const progress = events.find((e) => e.status === "pending");
   assert.equal(progress?.log, `Sandbox is waiting for the platform to schedule it: ${why}`);
   assert.equal(progress?.waiting, "unscheduled");
+  assert.equal(progress?.waitReason, why);
   const failed = events.find((e) => e.status === "failed");
   assert.equal(failed?.reason, "sandbox_unschedulable");
   assert.ok(String(failed?.message).includes(why), JSON.stringify(failed));
+});
+
+test("a scale-up the platform reports is announced with its own reason", { timeout: 5000 }, async () => {
+  const { events, ended } = await poll([scalingUp("TriggeredScaleUp: pod triggered scale-up"), running], 60_000);
+  assert.equal(ended, null);
+  const progress = events.find((e) => e.status === "pending");
+  assert.equal(progress?.log, "Sandbox is waiting on the platform: In queue - waiting for scale-up - TriggeredScaleUp: pod triggered scale-up");
+  assert.equal(progress?.waiting, "queued");
+  assert.equal(progress?.queuePosition, 0);
 });
 
 test("a sandbox that is simply starting is announced exactly as before", { timeout: 5000 }, async () => {
@@ -342,7 +388,7 @@ test("create ends an unschedulable sandbox with the reason and stops the workloa
     if (String(url).endsWith("/api/v1/workloads")) {
       return { ok: true, status: 200, json: async () => ({ workloadId: "wl-created" }) };
     }
-    return { ok: true, status: 200, json: async () => untaken("0/3 nodes are available"), text: async () => "" };
+    return { ok: true, status: 200, json: async () => untaken(), text: async () => "" };
   }) as unknown as typeof fetch;
 
   // SANDBOX_UNSCHEDULABLE_TIMEOUT_SECONDS=1 (above) and the real 5s poll: the
@@ -357,7 +403,7 @@ test("create ends an unschedulable sandbox with the reason and stops the workloa
 
   assert.ok(err instanceof SandboxProvisionTerminalError, String(err));
   assert.equal(err.reason, "sandbox_unschedulable");
-  assert.ok(err.message.includes("0/3 nodes are available"), err.message);
+  assert.ok(err.message.includes("the pod sb-1-abc is Pending and has not been placed on any node"), err.message);
   assert.ok(calls.includes("POST /api/v1/workloads/wl-created/stop"), `the workload is stopped: ${calls.join(", ")}`);
   assert.ok(events.some((e) => e.waiting === "unscheduled"), "the user was told it was waiting");
   assert.ok(events.some((e) => e.status === "failed" && e.reason === "sandbox_unschedulable"));

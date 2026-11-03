@@ -582,8 +582,10 @@ fail the message with reason `sandbox_gone`.
 A fifth is a shorter limit for a sandbox that cannot start at all, and it is the one place a
 single-node sandbox is treated differently from a cluster: `SANDBOX_UNSCHEDULABLE_TIMEOUT_SECONDS`
 (default 5 minutes) ends the wait with reason `sandbox_unschedulable` when the platform has admitted
-the workload (queue position 0) and nothing has taken its pod -- no address, start time or container,
-the shape of a pod every node refuses or ignores. Waiting longer does not change that, and the long
+the workload (queue position 0), nothing has taken its pod -- no address, start time or container,
+the shape of a pod every node refuses or ignores -- and the platform has put no reason on it. A reason the
+platform does give (queued behind others, or waiting for a node to scale up) is a wait it manages, announced
+with that reason and left to the queue ceiling. Waiting longer does not change that, and the long
 start ceiling would otherwise leave the user on a progress bar for 15 minutes, twice when the model
 retries. It counts only an unbroken absence of progress, never queue time and never a sandbox that
 is pulling an image, and only the sandbox a run opens asks for it (`unschedulableTimeoutMs` on the

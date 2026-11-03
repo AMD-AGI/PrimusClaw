@@ -19,15 +19,19 @@
 /**
  * The two ways a sandbox that is not ready can be waiting for the platform:
  *
- *  - `queued`: the platform's own scheduler has not admitted the workload yet
- *    (queue position above zero), usually because capacity is taken. A queue is
- *    a deliberate wait that moves, and for a GPU sandbox it can be hours; the
- *    user is told, and the queue ceiling is the only limit.
- *  - `unscheduled`: the workload was admitted (queue position zero) and its pod
- *    exists, but nothing has taken it -- no node has acknowledged it. That is
- *    what a pod that no node will accept (every node cordoned, or down) looks
- *    like, and no amount of waiting changes it. It is the state the early limit
- *    applies to.
+ *  - `queued`: the platform is holding the workload and says why. Either its own
+ *    scheduler has not admitted it yet (queue position above zero, usually
+ *    because capacity is taken), or it was admitted and the platform has put a
+ *    reason on it anyway -- waiting for a node to scale up, say. Both are waits
+ *    the platform manages and can be hours long (a GPU queue, a node that takes
+ *    minutes to arrive); the user is told the reason, and the queue ceiling is
+ *    the only limit.
+ *  - `unscheduled`: the workload was admitted (queue position zero), its pod
+ *    exists, nothing has taken it -- no node has acknowledged it -- and the
+ *    platform has said nothing about why. That is what a pod that no node will
+ *    accept (every node cordoned, or down) looks like, and no amount of waiting
+ *    changes it. It is the state the early limit applies to: only a wait nothing
+ *    is explaining is a wait nothing is working on.
  */
 export type WaitingKind = "queued" | "unscheduled";
 
@@ -93,16 +97,29 @@ export function readWaitingState(detail: Record<string, unknown>): WaitingState 
     return { kind: "queued", reason: message || "the platform has not admitted the sandbox yet" };
   }
 
-  const podId = cleanPlatformText(pods.find((p) => p?.podId)?.podId, 80);
-  const fallback = pods.length > 0
-    ? `the pod${podId ? ` ${podId}` : ""} has not been started on any node`
-    : "the platform has accepted the sandbox, but no node has taken its pod yet";
-  return { kind: "unscheduled", reason: message || fallback };
+  // Admitted. The platform clears its reason when it admits a workload, so a
+  // reason that is there is one it wrote afterwards -- for a pod it is waiting
+  // on capacity for (a node scaling up reports itself this way). That wait is
+  // the platform's to bound, and a scale-up can take longer than any limit of
+  // ours; it is announced with its reason and left to the queue ceiling.
+  if (message) return { kind: "queued", reason: message };
+
+  const pod = pods.find((p) => p?.podId) ?? pods[0];
+  const podId = cleanPlatformText(pod?.podId, 80);
+  const node = cleanPlatformText(pod?.adminNodeName, 80);
+  const name = `the pod${podId ? ` ${podId}` : ""}`;
+  const reason = pods.length === 0
+    ? "the platform has accepted the sandbox, but no node has taken its pod yet"
+    : node
+      ? `${name} was assigned to node ${node}, which has not started it`
+      : `${name} is Pending and has not been placed on any node`;
+  return { kind: "unscheduled", reason };
 }
 
 /** The one line of progress text for a waiting state. */
 export function describeWaiting(w: WaitingState, queuePosition: number): string {
+  if (w.kind === "queued" && queuePosition > 0) return `Waiting in queue (position ${queuePosition}): ${w.reason}`;
   return w.kind === "queued"
-    ? `Waiting in queue (position ${queuePosition}): ${w.reason}`
+    ? `Sandbox is waiting on the platform: ${w.reason}`
     : `Sandbox is waiting for the platform to schedule it: ${w.reason}`;
 }
