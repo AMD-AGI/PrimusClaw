@@ -22,6 +22,8 @@ import { applyTaskStatusTransition } from "../tasks/db.js";
 import { gpuNodesFromSpec, topologyErrors } from "../tasks/run-spec.js";
 import type { EnvironmentTopology } from "@claw/protocol";
 import { isMemoryActive } from "../memory/service.js";
+import { CLAW_AGENT_GUIDELINE_ENABLED } from "../config.js";
+import { withAgentGuideline } from "../sessions/agent-guideline.js";
 import type { PoolClient } from "pg";
 import { ErrorCode, NatsError } from "nats";
 import pino from "pino";
@@ -940,6 +942,7 @@ async function publishA2AExecuteTask(
     payload.sandbox_image = spec.sandboxImage;
     if (spec.resources) payload.resources = spec.resources;
   }
+  if (CLAW_AGENT_GUIDELINE_ENABLED) withAgentGuideline(payload);
   await js.publish("tasks.execute", sc.encode(JSON.stringify(payload)));
 }
 
@@ -2025,7 +2028,10 @@ async function handleLegacyInvoke(
   // caller-supplied task or message id it is the difference between a skipped
   // compensation and a `taskId` that does not exist.
   try {
-    const payload = { session_id: target.taskId, prompt: text, history: [], memory_enabled: await isMemoryActive("a2a"), user_id: "a2a" };
+    const payload: Record<string, unknown> = {
+      session_id: target.taskId, prompt: text, history: [], memory_enabled: await isMemoryActive("a2a"), user_id: "a2a",
+    };
+    if (CLAW_AGENT_GUIDELINE_ENABLED) withAgentGuideline(payload);
     await js.publish("tasks.execute", sc.encode(JSON.stringify(payload)));
   } catch (err: unknown) {
     if (entry.kind === "opened") await rollbackA2AAdmission(target, entry.taskId, err);
