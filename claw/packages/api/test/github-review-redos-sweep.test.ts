@@ -16,7 +16,9 @@
  *       lines that were slow, and read what they read before
  *   S5  one `assessRisk` call on the most a pull request can make it read (500 lines at the cap) costs a bounded amount, whatever the lines
  *       repeat: the bound is on the call, which is what the shared API pays, and not on one `exec`; it is a multiple of what a call on lines
- *       nothing reads costs, timed in the same run, so that how fast or how busy the machine is cancels out
+ *       nothing reads costs, timed in the same run, so that how fast or how busy the machine is cancels out; and that call on lines
+ *       nothing reads is itself bounded, by the same text in lines a tenth as long and by a plain pass of linear patterns over it, since a
+ *       slowdown that reaches every line moves the call and what it is compared with alike
  *   S6  the three patterns that were rewritten after S5 was written read what they read before
  */
 import assert from "node:assert/strict";
@@ -41,6 +43,29 @@ const EXEC_BOUND_MS = CALL_BUDGET_MS / LINES_AT_CAP;
 /** The length and the bound the first sweep used, which the patterns it was written for are timed at (see S2). */
 const FORMER_LENGTH = 8000;
 const FORMER_BOUND_MS = 10;
+/**
+ * What the call on lines that nothing reads is held to, since the ratio above takes it as its unit and a slowdown that reaches every line
+ * moves it as much as it moves what it is compared with. Both are timed in the same run, and neither goes through the rule pack's work on a line.
+ * The call on the lines at the cap may cost this many times the call on the same characters in ten times as many lines of a tenth of the
+ * length: a call that is linear in what it reads costs about the same (a little less, as a line has a cost of its own), and a pattern that
+ * costs the square of its line makes the long lines cost up to ten times the short ones.
+ */
+const SHORT_LINES_RATIO = 2;
+/**
+ * ... and this many times a plain pass over the same characters: every line split into words and read by a few ordinary patterns that are
+ * linear in the line, none of them the rule pack's. The call costs about five times it, so a call that does the same work several times
+ * over, or a pattern that costs more than its line is long, is over it, and the rule pack has room to cost a little over three times what it does.
+ */
+const REFERENCE_PASS_RATIO = 20;
+const REFERENCE_PATTERNS = [/foo/, /\bbar\b/i, /baz\s*=/, /(?:a|b)c+d/, /x\d{2,3}y/, /^\s*#/, /@\w+/, /todo|fixme/i, /\.get\(/, /import\s+\w+/];
+const referencePass = (lines: string[]): number => {
+  let n = 0;
+  for (const line of lines) {
+    for (const re of REFERENCE_PATTERNS) if (re.test(line)) n += 1;
+    n += line.split(/\s+/).length;
+  }
+  return n;
+};
 
 test("S1 the reader finds regular expression literals and not the divisions, strings, templates and comments around them", () => {
   const src = [
@@ -165,7 +190,7 @@ const addedLines = (lines: string[], path = "src/line.xyz"): RiskFile[] => [
 ];
 const assessLines = (lines: string[], path?: string): { ms: number; reasons: string[] } => assess(addedLines(lines, path));
 
-test("S5 one assessRisk call on the most a pull request can make it read costs a bounded amount, whatever the lines repeat", () => {
+test("S5 one assessRisk call on the most a pull request can make it read costs a bounded amount, whatever the lines repeat", (t) => {
   // Every line is MAX_LINE_CHARS long and there are as many of them as the budget allows: the call reads all of them and a single
   // synchronous pattern that scans on to the end of the line from every copy of its opening makes the call take seconds. One line of
   // each opening that a pattern of the rule pack starts with and cannot finish; the sweep (S3) finds a pattern by what it costs, this finds
@@ -176,13 +201,49 @@ test("S5 one assessRisk call on the most a pull request can make it read costs a
   // that a slow machine slows both and the ratio stays what it is. Each is timed ROUNDS times, round after round, and the least of the
   // rounds is the one compared: a pause only ever makes a call slower, so the least is the one it touched least, on either side of the
   // ratio, and one pause cannot decide the result. A pattern that has gone super-linear is over the bound in every round.
+  //
+  // That ratio cannot see a slowdown that reaches every line, which slows the call on lines nothing reads as much as the call it is compared
+  // with. So the call on lines nothing reads is bounded first, and by two things that do not go through the same work on a line, timed in
+  // the same rounds: the same characters in ten times as many shorter lines (what the cost does as a line grows) and a plain pass of ordinary
+  // patterns over the same lines (what the call does besides reading them). Neither is a number of milliseconds either.
   const ROUNDS = 3;
+  const BASE_ROUNDS = 7; // the two bounds on the call that reads nothing are cheap to time, so the least of more rounds
   const openings = ["#[arg(", "#[clap(", "r.get<", "app.PUT<", "r.get<x>(", "nolint:", "eslint-disable", "/*", "function ", "export ", "import("];
+  const fill = (unit: string, length = MAX_LINE_CHARS): string => unit.repeat(Math.ceil(length / unit.length)).slice(0, length);
   const callMs = (line: string): number => assessLines(Array.from({ length: LINES_AT_CAP }, () => line)).ms;
-  const fill = (unit: string): string => unit.repeat(Math.ceil(MAX_LINE_CHARS / unit.length)).slice(0, MAX_LINE_CHARS);
-  const quiet = fill("lorem ipsum dolor sit amet "); // words, as a line of prose is, and none of the openings above
-  const lines = openings.map(fill);
+  const words = "lorem ipsum dolor sit amet "; // words, as a line of prose is, and none of the openings above
+  const quiet = fill(words);
+  const quietLines = Array.from({ length: LINES_AT_CAP }, () => quiet);
+  const shortLines = Array.from({ length: 10 * LINES_AT_CAP }, () => fill(words, MAX_LINE_CHARS / 10)); // the same characters
+  const timed = (f: () => unknown): number => { const t0 = performance.now(); f(); return performance.now() - t0; };
+
   let base = Infinity;
+  let shortBase = Infinity;
+  let reference = Infinity;
+  let reasons: string[] = [];
+  let shortReasons: string[] = [];
+  for (let round = 0; round < BASE_ROUNDS; round++) {
+    reference = Math.min(reference, timed(() => referencePass(quietLines)));
+    const call = assessLines(quietLines);
+    base = Math.min(base, call.ms);
+    reasons = call.reasons;
+    const shortCall = assessLines(shortLines);
+    shortBase = Math.min(shortBase, shortCall.ms);
+    shortReasons = shortCall.reasons;
+  }
+  t.diagnostic(`${LINES_AT_CAP} lines of ${MAX_LINE_CHARS}: ${base.toFixed(1)} ms; the same characters in ${shortLines.length} lines of ${MAX_LINE_CHARS / 10}: ${shortBase.toFixed(1)} ms (${(base / shortBase).toFixed(2)} times, bound ${SHORT_LINES_RATIO}); a plain pass: ${reference.toFixed(1)} ms (${(base / reference).toFixed(1)} times, bound ${REFERENCE_PASS_RATIO})`);
+  // Both calls read all of what they were given (neither was cut at the budget) and say the same, or they are not the same text.
+  assert.deepEqual(shortReasons, reasons, "the calls on the long and on the short lines read the same text");
+  const unbounded: string[] = [];
+  if (base > SHORT_LINES_RATIO * shortBase) {
+    unbounded.push(`${LINES_AT_CAP} lines of ${MAX_LINE_CHARS}: ${Math.round(base)} ms against ${Math.round(shortBase)} ms for the same characters in ${shortLines.length} lines of ${MAX_LINE_CHARS / 10} (${(base / shortBase).toFixed(1)} times, over ${SHORT_LINES_RATIO}): the cost grows faster than the line`);
+  }
+  if (base > REFERENCE_PASS_RATIO * reference) {
+    unbounded.push(`${LINES_AT_CAP} lines of ${MAX_LINE_CHARS}: ${Math.round(base)} ms against ${reference.toFixed(1)} ms for a plain pass over the same text (${(base / reference).toFixed(1)} times, over ${REFERENCE_PASS_RATIO}): the call does more work than reading it needs`);
+  }
+  assert.deepEqual(unbounded, [], `the call on lines that nothing reads is bounded by the same text in shorter lines and by a plain pass, least of ${BASE_ROUNDS} rounds each`);
+
+  const lines = openings.map((o) => fill(o));
   const least = openings.map(() => Infinity);
   for (let round = 0; round < ROUNDS; round++) {
     base = Math.min(base, callMs(quiet));
