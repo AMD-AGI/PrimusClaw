@@ -61,6 +61,9 @@ describe("R reading", () => {
     assert.match(b.risk.guidance, /risk_judgement decides/);
     assert.match(b.notice, /untrusted/);
     assert.match(b.review_instructions, /Pull request review/);
+    assert.doesNotMatch(b.review_instructions, /^---$/m, "no skill frontmatter");
+    assert.doesNotMatch(b.review_instructions, /^name: pr-review$/m);
+    assert.match(b.review_instructions, /You only read and comment/);
     assert.equal(b.review_instructions_source.source, "default");
     // The model-facing text outside `untrusted` never carries the injected sentence.
     const { untrusted: _u, ...rest } = b;
