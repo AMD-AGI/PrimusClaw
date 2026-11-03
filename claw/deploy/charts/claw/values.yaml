@@ -42,7 +42,7 @@ api:
   # entry is a Kubernetes EnvVar ({name, value} or {name, valueFrom}).
   # extraVolumes / extraVolumeMounts are Kubernetes Volume / VolumeMount lists
   # appended to the pod and the api container. upgrade.sh builds these from
-  # EXTRA_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* / EXTRA_SECRET_MOUNTS_* in values.<ns>.env (see
+  # EXTRA_ENV_* / EXTRA_SECRET_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* / EXTRA_SECRET_MOUNTS_* in values.<ns>.env (see
   # values.example.env); a bare `helm upgrade --set` is dropped by the next
   # upgrade.sh. Empty by default, which changes nothing.
   extraEnv: []
@@ -142,7 +142,7 @@ brain:
   # entry is a Kubernetes EnvVar ({name, value} or {name, valueFrom}).
   # extraVolumes / extraVolumeMounts are Kubernetes Volume / VolumeMount lists
   # appended to the pod and the brain container. upgrade.sh builds these from
-  # EXTRA_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* / EXTRA_SECRET_MOUNTS_* in values.<ns>.env (see
+  # EXTRA_ENV_* / EXTRA_SECRET_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* / EXTRA_SECRET_MOUNTS_* in values.<ns>.env (see
   # values.example.env); a bare `helm upgrade --set` is dropped by the next
   # upgrade.sh. Empty by default, which changes nothing.
   #
