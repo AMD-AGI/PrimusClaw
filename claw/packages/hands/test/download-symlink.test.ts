@@ -59,3 +59,26 @@ test("an ordinary path is written", async () => {
   assert.deepEqual(out.ok, [target]);
   assert.equal(fs.readFileSync(target, "utf-8"), "uploaded bytes");
 });
+
+test("a directory swapped for a link after the check is still not written through", async () => {
+  const fsMod = await import("node:fs");
+  const target = path.join(WORK, "race", "e.txt");
+  const real = fsMod.default.mkdirSync;
+  // The swap lands between the link check and the open: the moment the directories are made.
+  fsMod.default.mkdirSync = ((dir: string, opts: unknown) => {
+    const made = real(dir, opts as never);
+    if (String(dir) === path.join(WORK, "race")) {
+      fsMod.default.rmSync(dir, { recursive: true, force: true });
+      fsMod.default.symlinkSync(OUTSIDE, dir);
+    }
+    return made;
+  }) as typeof real;
+  try {
+    const out = result(await downloadS3.execute({ files: [{ local_path: target, presigned_url: url }] }));
+    assert.deepEqual(out.ok, []);
+    assert.match(out.failed[0].error, /outside the workspace/);
+    assert.deepEqual(fsMod.default.readdirSync(OUTSIDE).filter((n) => n === "e.txt"), [], "nothing was left outside");
+  } finally {
+    fsMod.default.mkdirSync = real;
+  }
+});

@@ -55,6 +55,45 @@ function linkOnTheWay(p: string): string | null {
 }
 
 /**
+ * Write `body` to `p` only if the file opened is the one `p` names inside the
+ * workspace; returns why not, or null when written.
+ *
+ * The check above can be raced: a directory on the way can be swapped for a
+ * link between it and the open. So the file is opened first (not truncated, not
+ * through a final link), the path the kernel actually opened is read back from
+ * /proc, and only a file inside the workspace is truncated and written. A file
+ * this call created elsewhere is removed again; one that was there is untouched.
+ */
+function writeWhereNamed(p: string, body: Buffer): string | null {
+  const named = path.relative(path.resolve(WORKSPACE), p);
+  if (!named || named.startsWith("..") || path.isAbsolute(named)) {
+    fs.writeFileSync(p, body);   // a path the caller named outside the workspace is written as it always was
+    return null;
+  }
+  const root = fs.realpathSync(path.resolve(WORKSPACE));
+  const existed = fs.existsSync(p);
+  const fd = fs.openSync(p, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW);
+  try {
+    let opened: string;
+    try {
+      opened = fs.readlinkSync(`/proc/self/fd/${fd}`);
+    } catch {
+      return "not written: cannot tell which file was opened";
+    }
+    const rel = path.relative(root, opened);
+    if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
+      if (!existed) fs.rmSync(opened, { force: true });
+      return `not written: ${p} resolved to ${opened}, outside the workspace`;
+    }
+    fs.ftruncateSync(fd, 0);
+    fs.writeFileSync(fd, body);
+    return null;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
  * Counterpart to upload_to_s3 — pulls files from S3 into the sandbox using
  * pre-signed GET URLs. Same zero-credential model: Brain signs, Hands fetches.
  * Returns a structured JSON envelope so Brain can retry failures.
@@ -85,9 +124,11 @@ export const downloadS3 = {
           continue;
         }
         fs.mkdirSync(path.dirname(safePath), { recursive: true });
-        // O_NOFOLLOW: a link put in the file's place after the check is not followed either.
-        const fd = fs.openSync(safePath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW);
-        try { fs.writeFileSync(fd, body); } finally { fs.closeSync(fd); }
+        const written = writeWhereNamed(safePath, body);
+        if (written) {
+          failed.push({ path: file.local_path, status: 0, error: written });
+          continue;
+        }
         ok.push(file.local_path);
       } catch (e: any) {
         failed.push({ path: file.local_path, status: 0, error: e?.message || String(e) });
