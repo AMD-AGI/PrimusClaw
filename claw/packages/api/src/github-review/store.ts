@@ -5,7 +5,7 @@
  * The two tables behind GitHub pull request review, created only while
  * `CLAW_GITHUB_REVIEW_ENABLED` is on:
  *
- *  - `claw_github_confirmations`: a write held for the acting user, a merge or a review (with its
+ *  - `claw_github_confirmations`: a high-risk write held for the acting user, a merge or an approving review (with its
  *    event, text and inline comments, so that what is posted is what they were shown). One row per
  *    (session, repository, pull request, head commit, write) while pending, single use,
  *    bound to the head commit it was asked about.

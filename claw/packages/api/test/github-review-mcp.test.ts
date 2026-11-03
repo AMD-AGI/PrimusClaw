@@ -136,10 +136,6 @@ describe("B a tool call", () => {
     const c = await connect(token());
     const r = await call(c, "gh_review_submit", { pr: PR, head_sha: HEAD, event: "COMMENT", body: "Fine." });
     assert.equal(r.isError, false, r.text);
-    // Alice asked for Bob's account, so the review waits for Bob; it is posted when he allows it.
-    assert.equal(r.body.status, "confirmation_required");
-    assert.equal(e.gh.writes.length, 0);
-    assert.equal((await e.service.decide("u-bob", String(r.body.confirmation_id), "allow")).body.status, "submitted");
     assert.match(String(e.gh.writes[0]?.body.body), /Reviewed by Claw on behalf of bob \(requested by Alice A\)/);
     await c.close();
   });
@@ -152,14 +148,15 @@ describe("B a tool call", () => {
     await c.close();
   });
 
-  test("B6 gh_review_submit takes the same risk_flags as gh_pr_merge, and a flagged APPROVE is refused through MCP too", async () => {
+  test("B6 gh_review_submit takes the same risk_flags as gh_pr_merge, and a flagged APPROVE is held for the acting user through MCP too", async () => {
     e.identity.answer = async () => credential({ delegation: true });
     const c = await connect(token());
     const tool = (await c.listTools()).tools.find((t) => t.name === "gh_review_submit");
     assert.ok(tool && "risk_flags" in ((tool.inputSchema as { properties?: Record<string, unknown> }).properties ?? {}));
     const flagged = await call(c, "gh_review_submit", { pr: PR, head_sha: HEAD, event: "APPROVE", body: "Fine.", risk_flags: ["security_finding"] });
-    assert.equal(flagged.isError, true);
-    assert.equal(flagged.body.reason, "high_risk_approval");
+    assert.equal(flagged.isError, false, flagged.text);
+    assert.deepEqual([flagged.body.status, flagged.body.kind], ["confirmation_required", "review"]);
+    assert.match(String((flagged.body.reasons as string[]).join()), /security issue/);
     const unknown = await c.callTool({ name: "gh_review_submit", arguments: { pr: PR, head_sha: HEAD, event: "APPROVE", body: "Fine.", risk_flags: ["whatever"] } }) as { isError?: boolean };
     assert.equal(unknown.isError, true);
     assert.equal(e.gh.writes.length, 0);
@@ -243,13 +240,13 @@ describe("E a session bound to one pull request, over the wire", () => {
   test("E4 a held review is listed with its kind and what it would post, so a card can show it", async () => {
     e.identity.answer = async () => credential({ delegation: true });
     const c = await connect(token());
-    const held = await call(c, "gh_review_submit", { pr: PR, head_sha: HEAD, event: "REQUEST_CHANGES", body: "Please fix.", comments: [{ path: "src/app.ts", line: 3, body: "here" }] });
+    const held = await call(c, "gh_review_submit", { pr: PR, head_sha: HEAD, event: "APPROVE", body: "Please fix.", risk_flags: ["security_finding"], comments: [{ path: "src/app.ts", line: 3, body: "here" }] });
     assert.equal(held.body.status, "confirmation_required");
     await c.close();
     const r = await fetch(`${base}/v1/github-review/confirmations?session_id=s-1&status=pending`, { headers: { "x-test-user": "u-bob" } });
     const item = ((await r.json()) as any).items[0];
     assert.equal(item.kind, "review");
-    assert.deepEqual(item.review, { event: "REQUEST_CHANGES", body: "Please fix.", comments: [{ path: "src/app.ts", line: 3, side: "RIGHT", body: "here" }] });
+    assert.deepEqual(item.review, { event: "APPROVE", body: "Please fix.", comments: [{ path: "src/app.ts", line: 3, side: "RIGHT", body: "here" }] });
     assert.equal(item.id, held.body.confirmation_id);
   });
 });

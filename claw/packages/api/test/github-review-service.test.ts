@@ -22,11 +22,7 @@ import assert from "node:assert/strict";
 import test, { after, afterEach, beforeEach, describe } from "node:test";
 import { IdentityCredentialRefusedError } from "@claw/utils";
 import { HEAD } from "./support/fake-github.js";
-import { PR, REQUESTER_TOKEN, TOKEN, closeShared, credential, directory, down, expired, reviewEnv as makeEnv, unbound, type ReviewEnv } from "./support/review-env.js";
-
-/** An environment where the requester is the acting user, so a write goes straight to GitHub: what these tests are about unless they say `delegated()`. */
-const reviewEnv = (env: Record<string, string> = {}, over: Parameters<typeof makeEnv>[1] = {}): Promise<ReviewEnv> =>
-  makeEnv(env, { ...over, actor: { requesterUserId: "u-bob", ...over.actor } });
+import { PR, REQUESTER_TOKEN, TOKEN, closeShared, credential, directory, down, expired, reviewEnv, unbound, type ReviewEnv } from "./support/review-env.js";
 
 let e: ReviewEnv;
 beforeEach(async () => { e = await reviewEnv(); });
@@ -36,8 +32,6 @@ after(closeShared);
 const get = () => e.service.getPr(e.actor, { pr: PR });
 const submit = (over: Record<string, unknown> = {}) => e.service.submitReview(e.actor, { pr: PR, head_sha: HEAD, event: "COMMENT", body: "Looks fine.", ...over });
 const merge = (over: Record<string, unknown> = {}) => e.service.mergePr(e.actor, { pr: PR, head_sha: HEAD, ...over });
-/** The requester is someone else (`u-alice`) asking for the acting user's account: nothing is written until the acting user confirms it. */
-const delegated = () => { e.actor = { ...e.actor, requesterUserId: "u-alice" }; };
 /** The acting user lets others act for them. */
 const allowed = () => { e.identity.answer = directory({ delegation: true }); };
 /** The acting user has not. */
@@ -144,7 +138,6 @@ describe("P which pull requests", () => {
 });
 
 describe("D delegation and permissions", () => {
-  beforeEach(delegated);
   test("D1 when the acting user has not allowed others, every tool is refused, a comment and a read included, and nothing is sent to GitHub with their account", async () => {
     denied();
     for (const event of ["COMMENT", "APPROVE", "REQUEST_CHANGES"]) {
@@ -183,56 +176,70 @@ describe("D delegation and permissions", () => {
     assert.equal(e.gh.writes.length, 0);
   });
 
-  test("D5 the requester cannot get their own pull request approved or merged through someone else's account, however the login is cased", async () => {
-    for (const [requesterLogin, author] of [["alice", "alice"], ["Alice", "alice"], ["alice", "ALICE"]] as const) {
-      e.identity.answer = directory({ delegation: true }, { providerLogin: requesterLogin });
-      e.gh.pr.user = { login: author };
-      assert.equal(reason(await submit({ event: "APPROVE" })), "cannot_act_for_own_pull_request", `${requesterLogin} / ${author}`);
-      assert.equal(reason(await merge()), "cannot_act_for_own_pull_request", `${requesterLogin} / ${author}`);
-    }
-    assert.equal(e.gh.writes.length, 0);
-    assert.equal(puts().length, 0);
-    // The lookup was the requester's own, and it was the only thing their credential was used for.
-    assert.deepEqual(e.resolved.filter((r) => r.userId === "u-alice").slice(0, 2).map((r) => [r.requesterUserId, r.purpose]), [["u-alice", "gh_review_submit:requester_login"], ["u-alice", "gh_pr_merge:requester_login"]]);
-    assert.equal(e.gh.calls.every((c) => !c.authorization.includes(REQUESTER_TOKEN)), true);
-    // A comment on it is not an approval.
-    assert.equal((await submit({ event: "COMMENT" })).isError, false);
-  });
-
-  test("D6 a requester with no GitHub account bound cannot be shown not to be the author, so approve and merge are refused; the identity service failing refuses too", async () => {
+  test("D5 the pull request's author asking for it is the ordinary case: whatever their own GitHub state, an approval and a merge go through the acting user's account, and the author is never looked up", async () => {
     const acting = directory({ delegation: true });
-    for (const [fail, code] of [[unbound, "requester_not_bound"], [expired, "requester_credential_expired"], [down, "identity_unavailable"]] as const) {
-      e.identity.answer = (req) => (req.userId === "u-alice" ? fail() : acting(req));
-      assert.equal(reason(await submit({ event: "APPROVE" })), code, code);
-      assert.equal(reason(await merge()), code, code);
+    const asking: Array<[string, (req: Parameters<typeof acting>[0]) => ReturnType<typeof acting>]> = [
+      ["the author has bound GitHub", (req) => (req.userId === "u-alice" ? Promise.resolve(credential({ token: REQUESTER_TOKEN, providerLogin: "alice", delegation: false })) : acting(req))],
+      ["the author has no GitHub account bound", (req) => (req.userId === "u-alice" ? unbound() : acting(req))],
+      ["the author's authorization has expired", (req) => (req.userId === "u-alice" ? expired() : acting(req))],
+      ["the identity service has nothing for the author", (req) => (req.userId === "u-alice" ? down() : acting(req))],
+    ];
+    for (const [name, answer] of asking) {
+      e = await reviewEnv();
+      e.identity.answer = answer;
+      e.gh.reviews = [];
+      e.gh.pr.user = { login: "alice" };
+      const approved = await submit({ event: "APPROVE" });
+      assert.equal(approved.body.status, "submitted", `${name}: ${approved.text}`);
+      e.gh.graphql.mergeStateStatus = "CLEAN";
+      const merged = await merge();
+      assert.equal(merged.body.status, "merged", `${name}: ${merged.text}`);
+      assert.deepEqual(e.resolved.filter((r) => r.userId === "u-alice"), [], `${name}: the requester's credential was asked for`);
+      assert.equal(e.gh.calls.every((c) => c.authorization === `Bearer ${TOKEN}`), true, name);
+      assert.deepEqual(await e.sql("SELECT * FROM claw_github_confirmations"), [], `${name}: nobody was asked`);
     }
-    e.identity.answer = directory({ delegation: true }, { providerLogin: "" });
-    assert.equal(reason(await submit({ event: "APPROVE" })), "requester_not_bound");
-    assert.equal(reason(await merge()), "requester_not_bound");
-    assert.equal(e.gh.writes.length, 0);
-    assert.equal(puts().length, 0);
   });
 
-  test("D7 a requester who is not the author can have it approved and merged through the acting user's account once the acting user confirms it, and only the acting user's token reaches GitHub", async () => {
+  test("D6 the acting user cannot approve or merge a pull request they wrote, however the login is cased: refused up front, before CI, the diff or anything else is read and before anyone is asked", async () => {
+    for (const [login, author] of [["bob", "bob"], ["Bob", "bob"], ["bob", "BOB"]] as const) {
+      e = await reviewEnv();
+      e.identity.answer = directory({ delegation: true, providerLogin: login });
+      e.gh.pr.user = { login: author };
+      const calls = ["/repos/AMD-AGI/demo", "/repos/AMD-AGI/demo/pulls/7"];
+      for (const [name, call] of [["an APPROVE review", () => submit({ event: "APPROVE", comments: [{ path: "src/app.ts", line: 3, body: "x" }] })], ["a merge", () => merge()]] as const) {
+        const before = e.gh.calls.length;
+        const o = await call();
+        assert.equal(reason(o), "cannot_approve_own_pull_request", `${name} ${login}/${author}: ${o.text}`);
+        assert.deepEqual(e.gh.calls.slice(before).map((c) => c.path), calls, `${name} ${login}/${author}: only the two reads that tell who wrote it`);
+      }
+      assert.equal(e.gh.writes.length, 0);
+      assert.deepEqual(await e.sql("SELECT * FROM claw_github_confirmations"), []);
+      // A comment and a request for changes approve nothing.
+      e.gh.reviews = [];
+      assert.equal((await submit({ event: "COMMENT" })).isError, false);
+    }
+  });
+
+  test("D7 a requester who is not the author can have it approved and merged through the acting user's account, and only the acting user's token reaches GitHub", async () => {
     e.gh.onReview = (r) => { if (r.event === "APPROVE") e.gh.graphql.mergeStateStatus = "CLEAN"; };
     e.gh.graphql.mergeStateStatus = "BLOCKED";
-    const asked = await merge();
-    assert.equal(asked.body.status, "confirmation_required", asked.text);
-    assert.equal(e.gh.writes.length, 0, "nothing is approved or merged before the acting user says so");
-    const o = await e.service.decide("u-bob", String(asked.body.confirmation_id), "allow");
-    assert.equal(o.body.status, "merged", JSON.stringify(o.body));
+    const o = await merge();
+    assert.equal(o.body.status, "merged", o.text);
     assert.equal(e.gh.writes[0]?.body.event, "APPROVE");
     assert.equal(e.gh.calls.every((c) => c.authorization.includes(TOKEN)), true);
     assert.equal(e.gh.calls.some((c) => c.authorization.includes(REQUESTER_TOKEN)), false);
-    assert.equal(asked.text.includes(REQUESTER_TOKEN) || JSON.stringify(o.body).includes(REQUESTER_TOKEN), false);
+    assert.equal(o.text.includes(REQUESTER_TOKEN), false);
   });
 
-  test("D8 a high-risk merge for the requester's own pull request is refused before anyone is asked to confirm it", async () => {
-    e.identity.answer = directory({ delegation: true }, { providerLogin: "alice" });
+  test("D8 a high-risk merge the pull request's author asked for is held for the acting user like any other, for the reasons the rules gave", async () => {
+    e.gh.pr.user = { login: "alice" };
     e.gh.files = [{ filename: ".github/workflows/ci.yml", status: "modified", additions: 2, deletions: 0, patch: "@@ -1,2 +1,4 @@\n a\n+b\n+c\n d" }];
     e.gh.pr.changed_files = 1;
-    assert.equal(reason(await merge()), "cannot_act_for_own_pull_request");
-    assert.deepEqual(await e.sql("SELECT * FROM claw_github_confirmations"), []);
+    const o = await merge();
+    assert.equal(o.body.status, "confirmation_required");
+    assert.match((o.body.reasons as string[]).join(), /workflow/);
+    assert.equal(e.gh.writes.length, 0);
+    assert.equal((await e.sql("SELECT * FROM claw_github_confirmations")).length, 1);
   });
 });
 
@@ -473,13 +480,14 @@ describe("M the merge gates", () => {
     assert.equal(posts().length, 0);
   });
 
-  test("M7 the author cannot approve: it merges only if GitHub already counts it approved, else another approver is needed", async () => {
+  test("M7 the author cannot merge their own pull request through this tool even when GitHub already counts it approved: it is refused before the merge state is read", async () => {
     e.gh.pr.user = { login: "bob" };
-    assert.equal(reason(await merge()), "needs_other_approver");
-    assert.equal(e.gh.writes.length, 0);
     e.gh.graphql.mergeStateStatus = "CLEAN";
-    assert.equal((await merge()).body.status, "merged");
-    assert.equal(posts().length, 0);
+    e.gh.reviews = [{ id: 1, state: "APPROVED", user: { login: "carol" }, commit_id: HEAD, body: "" }];
+    const o = await merge();
+    assert.equal(reason(o), "cannot_approve_own_pull_request", o.text);
+    assert.equal(e.gh.writes.length, 0);
+    assert.equal(e.gh.calls.some((c) => c.path === "/graphql"), false);
   });
 
   test("M8 a refusal from GitHub at the last step is reported as one, not as a merge", async () => {
@@ -565,11 +573,11 @@ describe("M the merge gates", () => {
     e.gh.graphql.mergeStateStatus = "BLOCKED";
     assert.equal(reason(await merge()), "merge_state_not_clean");
     assert.deepEqual(e.sleeps, []);
-    // The author's own pull request: nothing was approved by this call, so BLOCKED is final at once.
+    // An approval this call found already given: nothing of this call's could unblock BLOCKED, so it is final at once.
     e = await reviewEnv(); allowed();
-    e.gh.pr.user = { login: "bob" };
+    e.gh.reviews = [{ id: 1, state: "APPROVED", user: { login: "bob" }, commit_id: HEAD, body: "" }];
     e.gh.graphql.mergeStateStatus = "BLOCKED";
-    assert.equal(reason(await merge()), "needs_other_approver");
+    assert.equal(reason(await merge()), "merge_state_not_clean");
     assert.deepEqual(e.sleeps, []);
   });
 });
@@ -586,7 +594,7 @@ describe("M2 what the change was, and what an approval may do", () => {
     assert.equal(e.gh.writes.length, 0);
   });
 
-  test("M10 an APPROVE is posted only where gh_pr_merge would not stop (CI green, no open thread, not high risk); comments are not held to that", async () => {
+  test("M10 an APPROVE is posted only where gh_pr_merge would not stop (CI green, no open thread), and a high-risk one is held for the acting user; comments are not held to that", async () => {
     e.gh.checkRuns = [{ name: "test", status: "completed", conclusion: "failure" }];
     assert.equal(reason(await submit({ event: "APPROVE" })), "ci_not_green");
     e.gh.checkRuns = [{ name: "test", status: "completed", conclusion: "success" }];
@@ -596,7 +604,7 @@ describe("M2 what the change was, and what an approval may do", () => {
     e.gh.files = [{ filename: ".github/workflows/ci.yml", status: "modified", additions: 2, deletions: 0, patch: "@@ -1,2 +1,4 @@\n a\n+b\n+c\n d" }];
     e.gh.pr.changed_files = 1;
     const high = await submit({ event: "APPROVE" });
-    assert.equal(reason(high), "high_risk_approval");
+    assert.deepEqual([high.body.status, high.body.kind], ["confirmation_required", "review"]);
     assert.match(String((high.body.reasons as string[]).join()), /workflow/);
     assert.equal(e.gh.writes.length, 0);
     // None of that holds back a comment or a request for changes, and a clean pull request is approved.
@@ -648,7 +656,7 @@ describe("M4 what the change does, and the reviewer's judgement of it", () => {
     assert.equal((c?.reasons as string[])[0], `the reviewer's judgement: ${judgement.reason}`);
     assert.equal(e.gh.calls.filter((c) => c.method === "PUT").length, 0, "nothing was merged");
     // An APPROVE is held the same way: auto-merge must not get past what the reviewer saw.
-    assert.equal(reason(await submit({ event: "APPROVE", risk_judgement: judgement })), "high_risk_approval");
+    assert.equal((await submit({ event: "APPROVE", risk_judgement: judgement })).body.status, "confirmation_required");
     assert.equal(e.gh.writes.length, 0);
   });
 
@@ -681,7 +689,7 @@ describe("M3 the model's flags", () => {
   test("M11 the reviewer's risk flags hold an APPROVE as they hold a merge, so auto-merge cannot get past the confirmation", async () => {
     for (const risk_flags of [["security_finding"], ["review_skipped"], ["security_finding", "review_skipped"]]) {
       const o = await submit({ event: "APPROVE", risk_flags });
-      assert.equal(reason(o), "high_risk_approval", risk_flags.join());
+      assert.deepEqual([o.body.status, o.body.kind], ["confirmation_required", "review"], risk_flags.join());
       assert.match(String((o.body.reasons as string[]).join()), /security issue|skipped a step/);
     }
     assert.equal(e.gh.writes.length, 0);
@@ -713,7 +721,7 @@ describe("M4 a change the diff does not show, and a lock file", () => {
       assert.equal(b.review_path.path, "sandbox", what);
       assert.equal(b.review_path.reason, "diff_not_available", what);
       assert.equal(b.files[0].has_diff, false, what);
-      assert.equal(reason(await submit({ event: "APPROVE" })), "high_risk_approval", what);
+      assert.equal((await submit({ event: "APPROVE" })).body.status, "confirmation_required", what);
       const m = await merge();
       assert.equal(m.body.status, "confirmation_required", what);
       assert.match(String((m.body.reasons as string[]).join()), /diff not readable/, what);
@@ -747,7 +755,7 @@ describe("M4 a change the diff does not show, and a lock file", () => {
       assert.equal(b.review_path.reason, "diff_not_available", what);
       assert.equal(b.files[0].has_diff, false, what);
       assert.match(b.untrusted.diff, /Git LFS pointer: the file it stands for is not shown/, what);
-      assert.equal(reason(await submit({ event: "APPROVE" })), "high_risk_approval", what);
+      assert.equal((await submit({ event: "APPROVE" })).body.status, "confirmation_required", what);
       const m = await merge();
       assert.equal(m.body.status, "confirmation_required", what);
       assert.match(String((m.body.reasons as string[]).join()), /Git LFS file changed/, what);
@@ -766,14 +774,13 @@ describe("M4 a change the diff does not show, and a lock file", () => {
     assert.equal(risk.level, "high");
     assert.match(risk.reasons.join(), /lock file changed/);
     assert.equal((await merge()).body.status, "confirmation_required");
-    assert.equal(reason(await submit({ event: "APPROVE" })), "high_risk_approval");
+    assert.equal((await submit({ event: "APPROVE" })).body.status, "confirmation_required");
     assert.equal(e.gh.writes.length, 0);
   });
 });
 
 describe("C high risk waits for the acting user", () => {
   beforeEach(() => {
-    delegated();
     allowed();
     e.gh.files = [{ filename: ".github/workflows/ci.yml", status: "modified", additions: 2, deletions: 0, patch: "@@ -1,2 +1,4 @@\n a\n+b\n+c\n d" }];
     e.gh.pr.changed_files = 1;
@@ -953,16 +960,16 @@ describe("C high risk waits for the acting user", () => {
     assert.deepEqual(rows.at(-1), { requester_user_id: "u-alice", actor_user_id: "u-bob", tool: "gh_pr_merge" });
     assert.equal(rows.some((r) => r.requester_user_id === "u-bob"), false);
     assert.match(String(e.gh.writes[0]?.body.body), /requested by Alice A\)/);
-    // The requester's lookup for the rule on their own pull request was theirs, not the acting user's.
-    assert.equal(e.resolved.some((r) => r.userId === "u-alice" && r.purpose === "gh_pr_merge:requester_login"), true);
+    // The requester's own credential is not asked for anything: it is the acting user's account that is used.
+    assert.equal(e.resolved.some((r) => r.userId === "u-alice"), false);
   });
 
-  test("C14 at the moment of the merge the rule on the requester's own pull request still applies to the requester, not to the acting user", async () => {
+  test("C14 the rule on the acting user's own pull request is applied again at their allow: a login that has become the author's is refused, with nothing written", async () => {
     const id = String((await merge()).body.confirmation_id);
-    e.identity.answer = directory({ delegation: true }, { providerLogin: "alice" });
+    e.identity.answer = directory({ delegation: true, providerLogin: "alice" });
     const r = await e.service.decide("u-bob", id, "allow");
     assert.equal(r.body.status, "refused");
-    assert.equal(r.body.reason, "cannot_act_for_own_pull_request");
+    assert.equal(r.body.reason, "cannot_approve_own_pull_request");
     assert.equal(e.gh.writes.length, 0);
   });
 
@@ -1014,7 +1021,7 @@ describe("W dry run, limits and the budget", () => {
     e.gh.pr.head = { ...e.gh.pr.head, sha: headFor(2) };
     assert.equal((await submit({ head_sha: headFor(2), event: "REQUEST_CHANGES", body: "second half" })).body.status, "submitted");
     // Another account, but the deployment's own ceiling.
-    e.actor = { ...e.actor, sessionId: "s-2", requesterUserId: "u-carol", actorUserId: "u-carol" };
+    e.actor = { ...e.actor, sessionId: "s-2", actorUserId: "u-carol" };
     e.gh.pr.head = { ...e.gh.pr.head, sha: headFor(4) };
     assert.equal((await submit({ head_sha: headFor(4) })).body.status, "submitted");
     e.actor = { ...e.actor, sessionId: "s-3" };
@@ -1091,7 +1098,6 @@ describe("W dry run, limits and the budget", () => {
 });
 
 describe("I the identity provider and the audit trail", () => {
-  beforeEach(delegated);
   test("I1 a user who has not bound GitHub, an expired authorization and an identity outage each stop the call before GitHub is asked, with different words", async () => {
     const seen = new Set<string>();
     for (const [answer, code] of [[unbound, "actor_not_bound"], [expired, "credential_expired"], [down, "identity_unavailable"]] as const) {
@@ -1106,13 +1112,11 @@ describe("I the identity provider and the audit trail", () => {
     assert.equal(e.gh.calls.length, 0);
   });
 
-  test("I6 only the provider's own not_bound is 'not bound': any other refusal is an outage, and says so, for the acting user and for the requester", async () => {
-    const acting = directory({ delegation: true });
+  test("I6 only the provider's own not_bound is 'not bound': any other refusal is an outage, and says so", async () => {
     for (const [code, status] of [["not_found", 404], ["invalid_request", 400], ["unauthorized_client", 401]] as const) {
       const fail = (): Promise<never> => Promise.reject(new IdentityCredentialRefusedError(code, status));
       e.identity.answer = fail;
       assert.equal(reason(await get()), "identity_unavailable", code);
-      e.identity.answer = (req) => (req.userId === "u-alice" ? fail() : acting(req));
       assert.equal(reason(await submit({ event: "APPROVE" })), "identity_unavailable", code);
     }
     e.identity.answer = unbound;
@@ -1129,20 +1133,11 @@ describe("I the identity provider and the audit trail", () => {
 
   test("I3 every call leaves an audit row: who, for whom, what, which commit, how many GitHub requests and their ids, the risk, the result", async () => {
     allowed();
-    const held = await submit({ comments: [{ path: "src/app.ts", line: 3, body: "x" }] });
-    const id = String(held.body.confirmation_id);
-    assert.equal((await e.service.decide("u-bob", id, "allow")).body.status, "submitted");
+    await submit({ comments: [{ path: "src/app.ts", line: 3, body: "x" }] });
     await merge().catch(() => undefined);
     const rows = await e.sql("SELECT * FROM claw_github_audit ORDER BY id");
-    assert.deepEqual(rows.map((r) => r.tool), ["gh_review_submit", "gh_review_submit", "gh_pr_merge"]);
-    const [asked, posted, merging] = rows as Array<Record<string, any>>;
-    // The call that held the review wrote nothing and says which confirmation it opened.
-    assert.equal(asked?.write, false);
-    assert.equal(asked?.confirmation_id, id);
-    assert.equal(asked?.detail, "confirmation_required");
-    assert.equal(merging?.write, false);
-    // The one the acting user allowed is the write.
-    const r = posted as Record<string, any>;
+    assert.deepEqual(rows.map((r) => r.tool), ["gh_review_submit", "gh_pr_merge"]);
+    const r = rows[0] as Record<string, any>;
     assert.equal(r.requester_user_id, "u-alice");
     assert.equal(r.actor_user_id, "u-bob");
     assert.equal(r.session_id, "s-1");
@@ -1151,11 +1146,10 @@ describe("I the identity provider and the audit trail", () => {
     assert.equal(r.head_sha, HEAD);
     assert.equal(r.write, true);
     assert.equal(r.result, "ok");
-    assert.equal(r.confirmation_id, id);
     assert.equal(r.github_requests >= 3, true);
     assert.equal(Array.isArray(r.github_request_ids) && r.github_request_ids.length > 0, true);
-    assert.deepEqual(asked?.arguments.comments, "[1 items]");
-    assert.equal(asked?.arguments.body, "[11 characters]");
+    assert.deepEqual(r.arguments.comments, "[1 items]");
+    assert.equal(r.arguments.body, "[11 characters]");
   });
 
   test("I4 refusals are audited with their reason", async () => {

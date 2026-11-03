@@ -154,8 +154,6 @@ const HOUR_MS = 3_600_000;
 const TRANSIENT_REFUSALS = new Set(["too_many_concurrent", "rate_limited", "github_rate_limited", "identity_unavailable", "audit_unavailable"]);
 /** Writes (a merge, a review) waiting for one acting user's decision; past it nothing new is asked of them. */
 const MAX_PENDING_CONFIRMATIONS = 10;
-/** What the acting user is told when nothing about the change holds a write and the only reason is that someone else asked for it. */
-const onBehalfReason = (what: string): string => `another user asked for ${what}; nothing is written with your GitHub account until you confirm it`;
 /** The hidden line in a review's footer that names the run; a retry looks for it. The prefix an earlier release wrote is still looked for (legacy-names.ts). */
 const RUN_MARKER_PREFIX = "claw-review:run";
 const REVIEW_EVENTS: readonly ReviewEvent[] = ["COMMENT", "REQUEST_CHANGES", "APPROVE"];
@@ -307,9 +305,10 @@ export class GithubReview {
   }
 
   /**
-   * One review, from the gates to the write. For someone else's account (the requester is not the acting user) it stops short of the write
-   * and holds the review for the acting user, whatever its event: they read exactly what would be posted, and the gates are read again when
-   * they allow it, so `confirmation` is set on that second pass and the review is written.
+   * One review, from the gates to the write. An `APPROVE` of a high-risk change stops short of the write and is held for the acting user,
+   * whoever asked: they read exactly what would be posted, and the gates are read again when they allow it, so `confirmation` is set on that
+   * second pass and the review is written. Any other review, and an approval of a change that is not high risk, is posted at once: the
+   * acting user's standing permission to act for them (their delegation setting) is the say, and a comment approves nothing.
    */
   private async submit(
     ctx: Ctx, ref: PrRef, headSha: string,
@@ -319,18 +318,21 @@ export class GithubReview {
     this.requireOpen(pr);
     this.requireHead(pr, headSha);
     ctx.acc.confirmationId = o.confirmation?.id;
-    if (o.event === "APPROVE") await this.requireNotRequestersOwn(ctx, pr);
+    // Before the diff, CI or the threads are read and before anyone is asked: an approval by the person who wrote the change is no review.
+    if (o.event === "APPROVE") this.requireNotAuthor(ctx, pr, "an approval");
     const needsChange = Array.isArray(o.rawComments) && o.rawComments.length > 0;
     const change = needsChange ? await this.collectChange(ctx, ref, pr) : null;
     const comments = this.checkComments(o.rawComments, change);
-    await this.requireEvent(ctx, repo, pr, o.event);
-    if (o.event === "APPROVE") await this.requireApprovable(ctx, ref, repo, pr, change, o.flags, o.judgement);
-    if (!o.confirmation && this.onSomeoneElsesRequest(ctx)) {
-      const review: HeldReview = { event: o.event, body: o.text, comments };
-      return this.hold(ctx, ref, pr, headSha, {
-        kind: "review", review, reasons: [onBehalfReason("this review")], checks: {},
-        message: `A ${o.event} review would be posted with ${ctx.cred.login}'s account on another user's request, so ${ctx.cred.login} is asked to confirm it first. Nothing was posted. Say that the review waits for their decision.`,
-      });
+    await this.requireEvent(ctx, repo, o.event);
+    if (o.event === "APPROVE") {
+      const risk = await this.requireApprovable(ctx, ref, repo, pr, change, o.flags, o.judgement);
+      if (!o.confirmation && risk.level === "high") {
+        const review: HeldReview = { event: o.event, body: o.text, comments };
+        return this.hold(ctx, ref, pr, headSha, {
+          kind: "review", review, reasons: risk.reasons, checks: {},
+          message: `This change is high risk, so ${ctx.cred.login} is asked to confirm the approval. Nothing was posted. Say that the approval waits for their decision and give the reasons.`,
+        });
+      }
     }
     const result = await this.writeReview(ctx, ref, pr, o.event, o.text, comments);
     return { status: result.status, head_sha: headSha, ...result.detail };
@@ -382,7 +384,7 @@ export class GithubReview {
       return { http: 200, body: { ok: true, status: claimed.reason === "expired" ? "expired" : "refused", reason: claimed.reason } };
     }
     const confirmation = claimed.confirmation;
-    // Who asked stays who asked: the audit row and the approval's footer name them, and the rule on a requester's own pull request is applied to them.
+    // Who asked stays who asked: the audit row and the review's footer name them.
     const actor: ReviewActor = {
       sessionId: confirmation.sessionId, requesterUserId: confirmation.requesterUserId, actorUserId: deciderUserId,
       requesterLabel: await this.requesterLabel(confirmation.sessionId),
@@ -494,11 +496,11 @@ export class GithubReview {
         throw new Refusal("too_many_concurrent", "too many reviews of this repository are running; try again in a minute");
       }
       this.inflight.set(held, (this.inflight.get(held) ?? 0) + 1);
-      const cred = await this.credential(actor.actorUserId, actor, tool, "acting");
+      const cred = await this.credential(actor.actorUserId, actor, tool);
       // Every tool acts with the acting user's account, reads included, so every tool needs their say: the
-      // person who asked for their own account needs no one's permission, anyone else needs the owner's switch.
-      // The owner's own "allow" to one held merge is that say for that merge. Nothing is sent to GitHub for a
-      // refusal here, and the token is dropped unused.
+      // person who asked for their own account needs no one's permission, anyone else needs the owner's switch
+      // (their standing authorization). The owner's own "allow" to one held write is that say for that write.
+      // Nothing is sent to GitHub for a refusal here, and the token is dropped unused.
       if (!opts.consented && actor.requesterUserId !== actor.actorUserId && !cred.delegation) {
         throw new Refusal("delegation_off", "the acting user has not allowed others to act for them, so nothing is done with their GitHub account");
       }
@@ -542,11 +544,9 @@ export class GithubReview {
     return failure("internal_error", "the tool failed; nothing further was done", {}, redact);
   }
 
-  /** One lookup at the identity provider: the acting user's credential for the call, or the requester's own when only their login is wanted. */
-  private async credential(userId: string, actor: ReviewActor, purpose: string, whose: "acting" | "requesting"): Promise<ResolvedCredential> {
-    const who = whose === "acting" ? "the acting user" : "the user who asked";
-    const prefix = whose === "acting" ? "" : "requester_";
-    const expiredRefusal = (): Refusal => new Refusal(`${prefix}credential_expired`, `${who}'s GitHub authorization has expired; they have to bind GitHub again`);
+  /** One lookup at the identity provider: the acting user's credential for the call. */
+  private async credential(userId: string, actor: ReviewActor, purpose: string): Promise<ResolvedCredential> {
+    const expiredRefusal = (): Refusal => new Refusal("credential_expired", "the acting user's GitHub authorization has expired; they have to bind GitHub again");
     try {
       const cred = await this.deps.resolveCredential({ userId, provider: GITHUB_PROVIDER, requesterUserId: actor.requesterUserId, purpose });
       if (cred.expiresAt !== null && cred.expiresAt <= this.now()) throw expiredRefusal();
@@ -555,34 +555,26 @@ export class GithubReview {
       if (err instanceof Refusal) throw err;
       if (err instanceof IdentityCredentialRefusedError) {
         if (err.code === "expired") throw expiredRefusal();
-        if (err.code === "not_bound") throw new Refusal(whose === "acting" ? "actor_not_bound" : "requester_not_bound", `${who} has not bound a GitHub account`);
+        if (err.code === "not_bound") throw new Refusal("actor_not_bound", "the acting user has not bound a GitHub account");
         // Any other answer is not about this user (a resolve URL that is wrong, a request the provider did not understand): it is an outage, and says so.
         logger.error({ code: err.code, status: err.status, purpose }, "github_review.identity_refused_unexpected");
         throw new Refusal("identity_unavailable", "the identity service could not be asked; nothing was done");
       }
       if (err instanceof IdentityUnavailableError) throw new Refusal("identity_unavailable", "the identity service could not be asked; nothing was done");
-      throw new Refusal("identity_unavailable", `${who}'s credential could not be fetched; nothing was done`);
+      throw new Refusal("identity_unavailable", "the acting user's credential could not be fetched; nothing was done");
     }
   }
 
   /**
-   * An approval, and a merge, made with someone else's account are not made for the person who wrote the pull request: that would get their
-   * own change through with no second person's review. Asked first by every approving write (an `APPROVE` review, a merge), before any other
-   * gate is read and before anyone is asked to confirm, so that a requester who cannot pass is refused before a turn's work is spent on it. The
-   * requester's GitHub login is looked up (only the login is kept; their token is dropped unused) and compared with the author's. A requester
-   * who has no usable GitHub account bound cannot be shown not to be the author, so that refuses too. The person who is the acting user is
-   * covered by the rule on their own login. One person with two GitHub accounts passes it with the one that is not the author's: the acting
-   * user's confirmation, which shows the author, is what stands there (docs/github-review.md). A comment and a request for changes approve
-   * nothing and are not held to this.
+   * The acting user cannot approve a pull request they wrote: GitHub does not count it, and a second person's review is what an approval is
+   * for. Asked first by every approving write (an `APPROVE` review, a merge, which approves where it must), right after the pull request is
+   * read and before anything else is, so that it is refused before a turn's work is spent on it and before anyone is asked to confirm.
+   * The person who asked, who is very often the author, is not looked at: asking a committer to review one's own pull request is the
+   * ordinary case, and it is the committer's account, not the requester's, that must not have written it.
    */
-  private async requireNotRequestersOwn(ctx: Ctx, pr: PrInfo): Promise<void> {
-    if (ctx.actor.requesterUserId === ctx.actor.actorUserId) return;
-    const cred = await this.credential(ctx.actor.requesterUserId, ctx.actor, `${ctx.tool}:requester_login`, "requesting");
-    const login = cred.providerLogin.trim().toLowerCase();
-    if (!login) throw new Refusal("requester_not_bound", "the user who asked has no GitHub login on record, so it cannot be checked that they did not write this pull request");
-    if (login === pr.authorLogin.toLowerCase()) {
-      throw new Refusal("cannot_act_for_own_pull_request", "the user who asked wrote this pull request; an approval or a merge made with another person's account would get it through without a second reviewer");
-    }
+  private requireNotAuthor(ctx: Ctx, pr: PrInfo, what: "an approval" | "a merge"): void {
+    if (pr.authorLogin.toLowerCase() !== ctx.cred.login.toLowerCase()) return;
+    throw new Refusal("cannot_approve_own_pull_request", `the acting user wrote this pull request, so ${what} with their account is refused: it would be no second person's review; another approver is needed`);
   }
 
   private pinned(raw: unknown): string {
@@ -742,19 +734,15 @@ export class GithubReview {
   // ------------------------------------------------------------ blocks
 
   private actingBlock(ctx: Ctx, repo: RepoInfo): Record<string, unknown> {
-    const own = ctx.actor.requesterUserId === ctx.actor.actorUserId;
     return {
       github_login: ctx.cred.login,
-      requested_by_acting_user: own,
+      requested_by_acting_user: ctx.actor.requesterUserId === ctx.actor.actorUserId,
       acting_user_allows_others: ctx.cred.delegation,
       may_approve_and_merge: repo.push,
       has_write_permission: repo.push,
-      // Someone else's request: nothing is posted or merged until the acting user confirms it, which the model is told before it tries.
-      writes_need_acting_user_confirmation: !own,
-      note: (repo.push
-        ? "approve and merge are open, subject to the gates"
-        : "the acting user has no write permission here: comment only, and say that nothing was merged for that reason")
-        + (own ? "" : "; every review and merge is held for the acting user to confirm, so none is posted or merged until they do"),
+      note: repo.push
+        ? "approve and merge are open, subject to the gates; a high-risk approval or merge waits for the acting user's confirmation"
+        : "the acting user has no write permission here: comment only, and say that nothing was merged for that reason",
     };
   }
 
@@ -768,29 +756,24 @@ export class GithubReview {
 
   // ----------------------------------------------------------- reviews
 
-  private async requireEvent(ctx: Ctx, repo: RepoInfo, pr: PrInfo, event: ReviewEvent): Promise<void> {
+  private async requireEvent(ctx: Ctx, repo: RepoInfo, event: ReviewEvent): Promise<void> {
     if (event !== "APPROVE") return;
     if (!repo.push) throw new Refusal("no_write_permission", `${ctx.cred.login} has no write permission on ${repo.fullName}, and an approval without it does not count; post a comment instead`);
-    if (pr.authorLogin.toLowerCase() === ctx.cred.login.toLowerCase()) {
-      throw new Refusal("cannot_approve_own_pull_request", "the acting user wrote this pull request and cannot approve it; another approver is needed");
-    }
   }
 
   /**
    * An approval can merge a pull request by itself (GitHub's auto-merge), so it is
-   * posted only where `gh_pr_merge` would not stop: CI green on the head commit, no
-   * open thread, and a change that does not need the acting user's confirmation.
-   * A high-risk approval goes through `gh_pr_merge`, which asks them first.
+   * posted only where `gh_pr_merge` would not stop: CI green on the head commit and no
+   * open thread. The change's risk comes back, because a high-risk approval is not
+   * posted before the acting user confirms it (the caller holds it).
    */
-  private async requireApprovable(ctx: Ctx, ref: PrRef, repo: RepoInfo, pr: PrInfo, change: Change | null, flags: string[], judgement: ReviewerJudgement | null): Promise<void> {
+  private async requireApprovable(ctx: Ctx, ref: PrRef, repo: RepoInfo, pr: PrInfo, change: Change | null, flags: string[], judgement: ReviewerJudgement | null): Promise<RiskResult> {
     const read = change ?? await this.collectChange(ctx, ref, pr);
     // The reviewer's own flags and judgement count here as they do at the merge: they can only raise the verdict.
     const risk = assessRisk(this.riskInput(pr, repo, read, flags, judgement));
     ctx.acc.riskReasons = risk.reasons;
     this.requireGreen(await this.readState(ctx, ref, pr, repo), pr.headSha);
-    if (risk.level === "high") {
-      throw new Refusal("high_risk_approval", "this change is high risk, so an approval waits for the acting user's confirmation: post a comment-only review and call gh_pr_merge, which asks them", { reasons: risk.reasons });
-    }
+    return risk;
   }
 
   private checkComments(raw: unknown, change: Change | null): ReviewComment[] {
@@ -911,7 +894,7 @@ export class GithubReview {
     }
     ctx.acc.confirmationId = opts.confirmation?.id;
     // Before anything else is read or asked, and so before any approval is written or anyone is asked to confirm.
-    await this.requireNotRequestersOwn(ctx, pr);
+    this.requireNotAuthor(ctx, pr, "a merge");
     if (!repo.push) {
       throw new Refusal("no_merge_permission", `${ctx.cred.login} has no write permission on ${repo.fullName}: the review stands as comments and nothing was merged`);
     }
@@ -925,42 +908,33 @@ export class GithubReview {
     let state = await this.readState(ctx, ref, pr, repo);
     // Before anyone is asked: a person is not woken to confirm a merge that CI or an open thread would refuse anyway.
     this.requireGreen(state, headSha);
-    if (!opts.confirmation && (risk.level === "high" || this.onSomeoneElsesRequest(ctx))) {
-      const high = risk.level === "high";
+    if (risk.level === "high" && !opts.confirmation) {
       return this.hold(ctx, ref, pr, headSha, {
-        kind: "merge", review: null, reasons: high ? risk.reasons : [onBehalfReason("this merge, with an approval first where one is needed")], checks: { ...state.checks.summary, green: state.checks.green },
-        message: high
-          ? `This change is high risk, so ${ctx.cred.login} is asked to confirm the merge. Nothing was merged. Say that the merge waits for their decision and give the reasons.`
-          : `This merge would be made with ${ctx.cred.login}'s account on another user's request, so ${ctx.cred.login} is asked to confirm it first. Nothing was merged. Say that the merge waits for their decision.`,
+        kind: "merge", review: null, reasons: risk.reasons, checks: { ...state.checks.summary, green: state.checks.green },
+        message: `This change is high risk, so ${ctx.cred.login} is asked to confirm the merge. Nothing was merged. Say that the merge waits for their decision and give the reasons.`,
       });
     }
 
-    const ownPr = pr.authorLogin.toLowerCase() === ctx.cred.login.toLowerCase();
     let approved = false;
-    if (!ownPr) {
-      const reviews = await this.listReviews<{ user?: { login?: string }; state?: string; commit_id?: string }>(ctx, ref);
-      const already = reviews.some((r) => r.user?.login?.toLowerCase() === ctx.cred.login.toLowerCase() && r.state === "APPROVED" && String(r.commit_id ?? "").toLowerCase() === headSha);
-      if (!already) {
-        if (!ctx.settings.writesEnabled) {
-          ctx.acc.dryRun = true;
-          return {
-            status: "dry_run", message: "writes are switched off in this deployment: every gate except the approval and the merge was checked, and nothing was written",
-            would: { approve: true, merge_method: method, risk: risk.level, confirmed: opts.confirmation !== null },
-            gates: { checks_green: state.checks.green, unresolved_threads: state.unresolvedThreads, merge_state: state.mergeStateStatus },
-          };
-        }
-        const result = await this.writeReview(ctx, ref, pr, "APPROVE", "No blocking issues found; approving so the merge can go ahead.", []);
-        approved = result.status === "submitted" || result.status === "already_submitted";
-        state = await this.readState(ctx, ref, pr, repo);
-        this.requireGreen(state, headSha);
+    const reviews = await this.listReviews<{ user?: { login?: string }; state?: string; commit_id?: string }>(ctx, ref);
+    const already = reviews.some((r) => r.user?.login?.toLowerCase() === ctx.cred.login.toLowerCase() && r.state === "APPROVED" && String(r.commit_id ?? "").toLowerCase() === headSha);
+    if (!already) {
+      if (!ctx.settings.writesEnabled) {
+        ctx.acc.dryRun = true;
+        return {
+          status: "dry_run", message: "writes are switched off in this deployment: every gate except the approval and the merge was checked, and nothing was written",
+          would: { approve: true, merge_method: method, risk: risk.level, confirmed: opts.confirmation !== null },
+          gates: { checks_green: state.checks.green, unresolved_threads: state.unresolvedThreads, merge_state: state.mergeStateStatus },
+        };
       }
+      const result = await this.writeReview(ctx, ref, pr, "APPROVE", "No blocking issues found; approving so the merge can go ahead.", []);
+      approved = result.status === "submitted" || result.status === "already_submitted";
+      state = await this.readState(ctx, ref, pr, repo);
+      this.requireGreen(state, headSha);
     }
     state = await this.settleMergeState(ctx, ref, pr, state, approved);
     if (state.mergeStateStatus !== "CLEAN") {
-      const why = ownPr && state.reviewDecision !== "APPROVED"
-        ? "the acting user wrote this pull request and cannot approve it, and GitHub does not yet count it as approved: another approver is needed"
-        : `GitHub's merge state is ${state.mergeStateStatus} (review decision ${state.reviewDecision ?? "none"}), not CLEAN`;
-      throw new Refusal(ownPr ? "needs_other_approver" : "merge_state_not_clean", why, { merge_state: state.mergeStateStatus, review_decision: state.reviewDecision, approved_by_this_call: approved });
+      throw new Refusal("merge_state_not_clean", `GitHub's merge state is ${state.mergeStateStatus} (review decision ${state.reviewDecision ?? "none"}), not CLEAN`, { merge_state: state.mergeStateStatus, review_decision: state.reviewDecision, approved_by_this_call: approved });
     }
     if (!ctx.settings.writesEnabled) {
       ctx.acc.dryRun = true;
@@ -980,14 +954,10 @@ export class GithubReview {
     }
   }
 
-  /** The write is made with the acting user's account for another user: the requester is not them. */
-  private onSomeoneElsesRequest(ctx: Ctx): boolean {
-    return ctx.actor.requesterUserId !== ctx.actor.actorUserId;
-  }
-
   /**
    * Holds a write for the acting user instead of making it: one pending confirmation for this head commit and this exact write, and nothing
-   * sent to GitHub. They answer it signed in, in their own session (see `decide`), so no tool or key of the model's can.
+   * sent to GitHub. Only a high-risk approval or merge is held. They answer it signed in, in their own session (see `decide`), so no tool or
+   * key of the model's can.
    */
   private async hold(
     ctx: Ctx, ref: PrRef, pr: PrInfo, headSha: string,

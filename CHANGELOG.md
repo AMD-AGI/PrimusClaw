@@ -116,19 +116,22 @@ record it.
   server spec, so the entry that released the call is in the `hitl.policy_allow` log line instead). See
   `claw/docs/mcp-approval.md`.
 - GitHub pull request review, guards around the account of someone who is asked for (all inside the feature, which is
-  still off by default). When the requester is not the acting user, every write made with the acting user's account
-  (a merge, and a `COMMENT`, `REQUEST_CHANGES` or `APPROVE` review) now stops at `confirmation_required` until the
-  acting user confirms that very write; a held review keeps its event, text and inline comments, and the confirmation
-  route lists them (`kind`, `review`) and answers `submitted` once it is posted. A session may be bound to one pull
-  request with `config.review_target = {owner, repo, number}`, set only at creation: every tool call that names
-  another is refused as `review_target_mismatch` before the acting user's credential is looked up. A merge into a
-  branch whose rules include a merge queue is refused as `merge_queue_required` before any approval is written. An
-  `APPROVE` review and a merge check the requester (a usable GitHub account, not the author) before anything else
-  is read. The review footer, the hidden run marker and the repository configuration file no longer carry the name
-  of the chat integration: the footer name is `CLAW_GITHUB_REVIEW_AGENT_NAME` (default `Claw`), the marker is
-  `claw-review:run` and the file is `.github/claw-review.yml`; the old marker and file are still read and never
-  written. The confirmations table gains `kind`, `review` and `action_key` and a new status (upgraded in place at
-  start-up). See `claw/docs/github-review.md`.
+  still off by default). The ordinary request is the author of a pull request asking for a committer's review and
+  merge: with the committer's standing authorization (the identity provider's `delegation` flag) it is made with the
+  committer's account and no confirmation, and the author's own GitHub is not looked at; an `APPROVE` review or a
+  merge of a high-risk change is held (`confirmation_required`, `kind` `merge` or `review`) until the committer
+  confirms that very write, and the held review keeps its event, text and inline comments, which the confirmation
+  route lists and answers `submitted` once posted. A `COMMENT` or `REQUEST_CHANGES` is never held. The acting user
+  may not approve or merge a pull request they wrote (`cannot_approve_own_pull_request`), refused before CI, the
+  diff or any confirmation. A session may be bound to one pull request with
+  `config.review_target = {owner, repo, number}`, set only at creation: every tool call that names another is
+  refused as `review_target_mismatch` before the acting user's credential is looked up. A merge into a branch whose
+  rules include a merge queue is refused as `merge_queue_required` before any approval is written. The review
+  footer, the hidden run marker and the repository configuration file no longer carry the name of the chat
+  integration: the footer name is `CLAW_GITHUB_REVIEW_AGENT_NAME` (default `Claw`), the marker is `claw-review:run`
+  and the file is `.github/claw-review.yml`; the old marker and file are still read and never written. The
+  confirmations table gains `kind`, `review` and `action_key` and a new status (upgraded in place at start-up).
+  See `claw/docs/github-review.md`.
 - GitHub pull request review, off by default (`CLAW_GITHUB_REVIEW_ENABLED=true`). A session created with
   `config.acting_as = <user id>` is offered four tools (`gh_pr_get`, `gh_pr_risk`, `gh_review_submit`,
   `gh_pr_merge`) that review, and when everything is green merge, a public pull request with that user's GitHub

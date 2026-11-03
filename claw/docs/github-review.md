@@ -15,6 +15,20 @@ sandbox have no token to leak.
 Off by default. With `CLAW_GITHUB_REVIEW_ENABLED` unset there are no tables, no routes, no
 tool offered to a session, and `config.acting_as` is refused.
 
+## The ordinary request
+
+The author of a pull request asks a chat integration to have a committer review and merge it. The
+committer has allowed that once, beforehand: they bound their GitHub account at the identity
+provider and switched on its `delegation` flag, which is their standing authorization. The
+integration then starts a session that acts as the committer (`config.acting_as`) and reviews and
+merges the author's pull request with the committer's own account, with no confirmation and no question
+asked, as long as CI is green and the change is not high risk (architecture, interfaces, security, CI
+or release, dependencies, size: see "High risk"). An approval or a merge of a high-risk change is held
+until the committer confirms that very write, signed in as themselves. The author needs no GitHub
+account bound and is not looked at; the committer's account must not be the author of the pull request
+(`cannot_approve_own_pull_request`), and without the committer's standing authorization nothing is done
+with their account (`delegation_off`).
+
 ## How a session uses it
 
 1. The requester creates a session with `config.acting_as = "<user id>"` (`POST /v1/sessions`),
@@ -59,8 +73,8 @@ tool offered to a session, and `config.acting_as` is refused.
 |---|---|
 | `gh_pr_get` | The pull request, its files and diff, CI, review threads, existing comments, the risk verdict, what the acting user may do, the review path (below) and the review instructions. Text that came from the pull request is under `untrusted`. Call it first. |
 | `gh_pr_risk` | The risk verdict alone, with its categories. The model may pass `risk_flags` (`security_finding`, `review_skipped`) and a `risk_judgement` (see High risk); both can only raise the verdict. |
-| `gh_review_submit` | One review on the pinned head commit (the model may pass the same `risk_flags` as to `gh_pr_risk`, and they count for an `APPROVE`), with inline comments that must sit on lines the diff shows. `COMMENT`, `REQUEST_CHANGES` or `APPROVE`. A body footer says `Reviewed by <agent name> on behalf of <login> (requested by <name>), run <id>` (the agent name is `CLAW_GITHUB_REVIEW_AGENT_NAME`, default `Claw`) and a hidden marker (the run, the event and a digest of the text and inline comments) keeps a retry of the same review from posting twice, while a different review of the same kind on the same commit is posted. When someone else asked, nothing is posted until the acting user confirms (below). |
-| `gh_pr_merge` | Approves when needed and merges, if every gate is open. A base branch that is merged through a merge queue is refused (below). When someone else asked, nothing is approved or merged until the acting user confirms. |
+| `gh_review_submit` | One review on the pinned head commit (the model may pass the same `risk_flags` as to `gh_pr_risk`, and they count for an `APPROVE`), with inline comments that must sit on lines the diff shows. `COMMENT`, `REQUEST_CHANGES` or `APPROVE`. A body footer says `Reviewed by <agent name> on behalf of <login> (requested by <name>), run <id>` (the agent name is `CLAW_GITHUB_REVIEW_AGENT_NAME`, default `Claw`) and a hidden marker (the run, the event and a digest of the text and inline comments) keeps a retry of the same review from posting twice, while a different review of the same kind on the same commit is posted. An `APPROVE` of a high-risk change is held until the acting user confirms (below). |
+| `gh_pr_merge` | Approves when needed and merges, if every gate is open. A base branch that is merged through a merge queue is refused (below). A high-risk change is held until the acting user confirms. |
 
 ## Gates (all enforced inside the tools)
 
@@ -73,28 +87,28 @@ tool offered to a session, and `config.acting_as` is refused.
   `sha=<head>`, so GitHub refuses it too if the head moves in between.
 - **The acting user's say.** The credential is the acting user's own (`requester_user_id ==
   user_id`) or the user has allowed others to act for them (the identity provider's
-  `delegation` flag). Without that every tool is refused (`delegation_off`), reads and
-  comments included: the account is not used, and nothing is sent to GitHub with it. An
-  approval also needs the user to have write permission on the repository, and they cannot
-  approve their own pull request. Without write permission the review stands as comments and
-  nothing is merged (`no_merge_permission`). When the requester is someone else, an approval
-  or a merge is also refused if the requester wrote the pull request
-  (`cannot_act_for_own_pull_request`), judged by their own GitHub login (read from the
-  identity provider; their token is not used), or has no usable GitHub account bound
-  (`requester_not_bound`, `requester_credential_expired`). That is the first thing an `APPROVE` review and a
-  merge ask, after the pull request itself has been read and before CI, threads, the diff or the merge
-  rules are read and before anyone is asked to confirm, so a requester who cannot pass is refused before
-  a turn's work is spent on it. A comment and a request for changes approve nothing and are not held
-  to it. The identity provider's answer is read strictly: only its
-  `not_bound` is "not bound"; any other refusal is reported as `identity_unavailable` and logged.
-- **Someone else's request.** When the requester is not the acting user, no write is made with the
-  acting user's account until the acting user has confirmed that very write, whatever its risk: a merge
-  (which approves first when it has to) and a review of any event (`COMMENT`, `REQUEST_CHANGES`,
-  `APPROVE`) each stop at `confirmation_required` and write nothing. The confirmation holds the review as
-  it will be posted (event, text, inline comments), so what the acting user reads is what goes out; the
-  gates of the write are read again when they allow it. It cannot be switched off by a setting or by a
-  repository's configuration. A requester who is the acting user needs none of this: the person who asked
-  for their own account is the one who decides.
+  `delegation` flag, their standing authorization). Without that every tool is refused
+  (`delegation_off`), reads and comments included: the account is not used, and nothing is sent to
+  GitHub with it. An approval also needs the user to have write permission on the repository. Without
+  write permission the review stands as comments and nothing is merged (`no_merge_permission`).
+- **The acting user did not write it.** An approval and a merge (which approves where it must) made
+  with the account of the pull request's author are refused (`cannot_approve_own_pull_request`): GitHub
+  does not count it, and it would be no second person's review. It is the first thing an `APPROVE`
+  review and a merge ask, after the pull request itself has been read and before CI, threads, the diff
+  or the merge rules are read and before anyone is asked to confirm, and again when the acting user
+  allows a held write. The person who asked is not looked at: they are very often the author, which is
+  the ordinary case, and their own GitHub account need not be bound. A comment and a request for changes
+  approve nothing and are not held to it.
+- **Standing authorization and high risk.** With the acting user's `delegation` flag on, a `COMMENT`, a
+  `REQUEST_CHANGES`, an `APPROVE` and a merge are made at once, whoever asked, when the change is not
+  high risk. An `APPROVE` review and a merge of a high-risk change (the rules and the reviewer's own flags
+  and judgement count, see "High risk") stop at `confirmation_required` and write nothing, for the
+  reasons the rules gave, until the acting user has confirmed that very write; a comment or a request for
+  changes on the same change is posted as ever. The confirmation holds the review as it will be posted
+  (event, text, inline comments), so what the acting user reads is what goes out; the gates of the write
+  are read again when they allow it. It cannot be switched off by a setting or by a repository's
+  configuration. A held approval is posted alone: to approve and merge in one confirmation, a model calls
+  `gh_pr_merge`.
 - **Merge queue.** A merge is refused (`merge_queue_required`) before anything is written, and before
   anyone is asked to confirm, when the rules of the base branch (`GET /repos/{owner}/{repo}/rules/branches/{branch}`,
   the same read that finds the required checks) include a `merge_queue` rule: this tool approves and
@@ -104,10 +118,9 @@ tool offered to a session, and `config.acting_as` is refused.
   not a queue; they fail the CI gate (`ci_not_green`) before any write.
 - **An approval.** An approval can merge a pull request by itself (GitHub's auto-merge), so
   `gh_review_submit` with `APPROVE` is posted only where `gh_pr_merge` would not stop: CI is
-  green on the head commit (`ci_not_green`), no review thread is open (`threads_unresolved`)
-  and the change is not high risk, the model's `risk_flags` included (`high_risk_approval`: post
-  a comment and call `gh_pr_merge`, which asks the acting user). `COMMENT` and `REQUEST_CHANGES`
-  are not held to that.
+  green on the head commit (`ci_not_green`) and no review thread is open (`threads_unresolved`);
+  an approval of a high-risk change, the model's `risk_flags` included, is then held for the acting
+  user (`confirmation_required`, `kind: "review"`). `COMMENT` and `REQUEST_CHANGES` are not held to that.
 - **The merge.** Everything is read again at merge time: CI is green on the **head commit**
   (every check completed and passing; a required check that never reported is missing; a pull
   request with no check at all is not green however clean GitHub calls it; an infrastructure
@@ -119,7 +132,7 @@ tool offered to a session, and `config.acting_as` is refused.
   The method is the repository's first allowed one, squash first.
 - **High risk.** A versioned rule pack (`packages/api/src/github-review/risk.ts` and
   `risk-signals.ts`, version `2026-11-02.1`) decides from what the change **does**, read from
-  its diff, not from which kind of file it touches. A merge is held for the acting user's own
+  its diff, not from which kind of file it touches. An approval or a merge is held for the acting user's own
   confirmation when the change is
   - an **architecture** change: a package or module added or removed (a manifest, a `go.mod`, a
     `__init__.py`), a deployable unit added or removed (a Dockerfile, a compose file, a
@@ -190,9 +203,8 @@ tool offered to a session, and `config.acting_as` is refused.
   (`risk.rule_level`, `risk.raised_by_reviewer`, `risk.categories`: `architecture`, `interface`,
   `security`, `ci_release`, `dependency`, `size_breadth`, `integrity`, `provenance`, `reviewer`).
 
-  A merge that needs confirmation creates one pending row for the head commit and merges
-  nothing. When the requester is not the acting user it needs confirmation whatever the rules said:
-  the card then says that another user asked for it.
+  A merge or an approval that needs confirmation creates one pending row for the head commit and
+  writes nothing.
 
 ## Confirmations
 
@@ -328,8 +340,15 @@ answer `reviews_unreadable`).
 
 ## Risks accepted in this phase
 
-- **One person, two GitHub accounts.** The rule that the requester did not write the pull request compares the GitHub login the requester has bound with the author's. A requester who has another account, the one the pull request was written under, passes it, and so does one who writes from an account nobody knows is theirs. Nothing in this code can tell. What stands is the acting user's confirmation of every merge and approval, which shows the author and the requester; it is not a control that is independent of the people involved. Which people may ask for someone else's account is for the deployment to decide; it should be people whose GitHub accounts are known.
-- **The acting user is asked more.** Every write on someone else's request is a card. A person who is asked by many can have ten waiting at once and then every further request is refused until they answer or the cards expire; there is no per-requester limit yet.
+- **The standing authorization is wide.** With the `delegation` flag on, whoever can start a session that
+  acts as the committer can have a pull request approved and merged with the committer's account, their
+  own included, whenever CI is green and the change is not high risk; the committer is asked only about
+  high-risk changes. Which people may ask for someone else's account is for the deployment to decide
+  (`CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS` names the services that may), and the committer's own
+  switch is what limits it. The rules that call a change high risk are a hold for a human, not a security scan.
+- **A held write waits for a person.** A person who is asked by many can have ten high-risk writes
+  waiting at once and then every further one is refused until they answer or the cards expire; there is no
+  per-requester limit yet.
 - **A merge queue set up through classic branch protection** is not seen (see "Gates"), so a merge there can fail after the approval is posted.
 
 ## What it does not do

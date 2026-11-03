@@ -9,8 +9,8 @@
  *    session row again (still there, same owner, same `acting_as`), and the tools
  *    themselves enforce every gate (see service.ts). The path is under
  *    `/v1/internal/`, which the global authentication hook leaves to the route.
- *  - `GET /v1/github-review/confirmations` and `POST .../:id/decision`: a write (a merge or a
- *    review) held for the acting user, and their answer. Ordinary authenticated routes; only the
+ *  - `GET /v1/github-review/confirmations` and `POST .../:id/decision`: a high-risk write (a merge or
+ *    an approving review) held for the acting user, and their answer. Ordinary authenticated routes; only the
  *    acting user can decide, and only with a credential a sandbox cannot obtain (see
  *    attended.ts): neither the key a session's sandbox holds nor a browser session that
  *    key can sign in to. A service an operator has allowed
@@ -80,16 +80,16 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor)
   mcp.tool(
     "gh_pr_risk",
     "The risk verdict for a pull request, from rules that read what the change does (architecture, interfaces, security-sensitive code, CI and release, "
-    + "dependencies, size) with the floor under them (high means a merge needs the acting user's own confirmation). Pass your own `risk_judgement` to add to it.",
+    + "dependencies, size) with the floor under them (high means an approval or a merge needs the acting user's own confirmation). Pass your own `risk_judgement` to add to it.",
     { pr: z.string().describe(PR_HELP), risk_flags: FLAGS, risk_judgement: JUDGEMENT },
     async (a) => toResult(await service.assessPr(actor, a)),
   );
   mcp.tool(
     "gh_review_submit",
-    "Post one review on the pinned head commit, with inline comments. APPROVE is refused when the user who asked wrote the pull request, "
-    + "and unless CI is green, no thread is open and the change is not high risk (then use gh_pr_merge, which asks the acting user). "
-    + "The review is signed with the acting user's account and a footer that names who asked. When someone other than the acting user asked, no review is "
-    + "posted until the acting user confirms it: the answer is confirmation_required, and you say that it waits for them.",
+    "Post one review on the pinned head commit, with inline comments. APPROVE is refused when the acting user wrote the pull request, "
+    + "and unless CI is green and no thread is open. A COMMENT or REQUEST_CHANGES review, and an APPROVE of a change that is not high risk, are posted at once. "
+    + "An APPROVE of a high-risk change is not: the answer is confirmation_required, and you say that it waits for the acting user. "
+    + "The review is signed with the acting user's account and a footer that names who asked.",
     {
       pr: z.string().describe(PR_HELP),
       head_sha: z.string().describe("The head_sha from gh_pr_get; a pull request that has moved is refused"),
@@ -106,7 +106,7 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor)
   mcp.tool(
     "gh_pr_merge",
     "Approve (when needed) and merge the pull request if every gate is open: CI green on the head commit, no unresolved thread, merge state CLEAN, "
-    + "the acting user allowing it, and no high-risk change without their confirmation; when someone other than the acting user asked, every merge waits for it. "
+    + "the acting user allowing it (refused when they wrote the pull request), and no high-risk change without their confirmation: a high-risk merge answers confirmation_required and waits for them. "
     + "A branch that is merged through a merge queue is refused (merge_queue_required). It never bypasses a protection.",
     {
       pr: z.string().describe(PR_HELP),
