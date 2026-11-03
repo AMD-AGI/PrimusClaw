@@ -34,8 +34,9 @@ function fakeHands(files: Record<string, FakeFile>, upload: "ok" | "fail" = "ok"
         const p = unquote(/^stat -L -c '[^']*' -- '((?:[^']|'\\'')*)' 2>&1 && /.exec(command)![1]);
         const f = files[p];
         if (!f) return `stat: cannot statx '${p}': No such file or directory\n\nExit code: 1`;
+        const resolved = Buffer.from(`${root}\0${f.real ?? p.replace(/^\/workspace/, root)}\0`, "utf8").toString("base64");
         return `__claw_deliver_stat__${f.type ?? (f.size ? "regular file" : "regular empty file")}|${f.size}\n`
-          + `__claw_deliver_real__${root}\n__claw_deliver_real__${f.real ?? p.replace(/^\/workspace/, root)}\n`;
+          + `__claw_deliver_real__${resolved}\n`;
       }
       if (name === "bash" && command.includes("base64 -w0")) {
         const p = unquote(/base64 -w0 -- '((?:[^']|'\\'')*)'/.exec(command)![1]);
@@ -96,6 +97,10 @@ test("refusals: outside /workspace, missing, a directory, too large, an upload t
     "/workspace/dir": { type: "directory", size: 4096 }, "/workspace/big.bin": { size: 1001 }, "/workspace/a.txt": { size: 3 },
     "/workspace/link.txt": { size: 9, real: "/etc/passwd" }, "/workspace/dirlink/x.txt": { size: 9, real: "/root/x.txt" },
     "/workspace/lookalike.txt": { size: 9, real: "/workspace2/x.txt" },
+    // A link target may hold a newline: the name is read whole, never cut at the line.
+    "/workspace/nl.txt": { size: 9, real: "/workspace/report\n__claw_deliver_real__/workspace/notes.csv" },
+    // An answer that is not exactly two names is no answer.
+    "/workspace/three.txt": { size: 9, real: "/workspace/a\0/workspace/b" },
   };
   const rows: Array<[Record<string, unknown>, RegExp, "ok" | "fail"]> = [
     [{ path: "/etc/passwd" }, /under \/workspace/, "ok"],
@@ -107,7 +112,14 @@ test("refusals: outside /workspace, missing, a directory, too large, an upload t
     [{ path: "dirlink/x.txt" }, /resolves to a file outside \/workspace/, "ok"],
     [{ path: "lookalike.txt" }, /resolves to a file outside \/workspace/, "ok"],
     [{ path: "a\nb.txt" }, /under \/workspace/, "ok"],
+    [{ path: "three.txt" }, /resolves to a file outside \/workspace/, "ok"],
   ];
+  // The newline target is a real file inside the workspace: it is delivered as itself, whole.
+  const { hands: nlHands, calls: nlCalls } = fakeHands(files);
+  const nl = await deliverFile(nlHands, CTX, { path: "nl.txt" });
+  assert.ok(nl.ok, JSON.stringify(nl));
+  assert.equal(nlCalls.find((c) => c.name === "upload_to_s3")!.args.files[0].local_path,
+    "/workspace/report\n__claw_deliver_real__/workspace/notes.csv");
   for (const [input, want, upload] of rows) {
     const { hands, calls } = fakeHands(files, upload);
     const r = await deliverFile(hands, CTX, input);
@@ -124,7 +136,7 @@ test("an empty file is a file; the path reaches the shell as one quoted word", a
   assert.ok(r.ok, JSON.stringify(r));
   const quoted = `'/workspace/it'\\''s $(rm -rf x) \`y\`.txt'`;
   assert.equal(calls[0].args.command, `stat -L -c '__claw_deliver_stat__%F|%s' -- ${quoted} 2>&1`
-    + ` && printf '__claw_deliver_real__%s\\n' "$(realpath -e -- /workspace)" "$(realpath -e -- ${quoted})"`);
+    + ` && printf '__claw_deliver_real__%s\\n' "$(realpath -ez -- /workspace ${quoted} | base64 -w0)"`);
   assert.equal(r.delivery.content_type, "text/plain");
 });
 

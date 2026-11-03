@@ -87,6 +87,21 @@ export const deliverPorts = {
   newId: () => crypto.randomUUID(),
 };
 
+/**
+ * The two paths `realpath -ez` printed (the workspace, then the file), or none:
+ * exactly two NUL-terminated names, each valid UTF-8 as it is, since the path
+ * Hands is handed must be byte for byte the one that was checked.
+ */
+function resolvedPaths(probe: string): string[] {
+  const line = new RegExp(`^${REAL_MARK}([A-Za-z0-9+/=]+)$`, "m").exec(probe)?.[1];
+  if (!line) return [];
+  const raw = Buffer.from(line, "base64");
+  if (raw.length === 0 || raw[raw.length - 1] !== 0) return [];
+  const names = raw.subarray(0, raw.length - 1).toString("utf8").split("\0");
+  if (names.length !== 2 || names.some((n) => !n)) return [];
+  return Buffer.from(names.join("\0") + "\0", "utf8").equals(raw) ? names : [];
+}
+
 /** A small image's bytes, base64, read from the path that was copied; null when they cannot be read as that size. */
 async function inlineData(hands: HandsClient, real: string, size: number, signal?: AbortSignal): Promise<string | null> {
   const out = await hands.callTool("bash", {
@@ -112,14 +127,14 @@ export async function deliverFile(
   // reads whatever the path it is given resolves to, so the resolved path is checked and is what gets copied.
   const probe = await hands.callTool("bash", {
     command: `stat -L -c '${STAT_MARK}%F|%s' -- ${shellWord(file)} 2>&1`
-      + ` && printf '${REAL_MARK}%s\\n' "$(realpath -e -- ${WORKSPACE})" "$(realpath -e -- ${shellWord(file)})"`,
+      // NUL-separated and base64-wrapped: a link target may hold any byte but NUL, a newline included.
+      + ` && printf '${REAL_MARK}%s\\n' "$(realpath -ez -- ${WORKSPACE} ${shellWord(file)} | base64 -w0)"`,
     timeout: STAT_TIMEOUT_SEC,
   }, signal);
   const stat = STAT_LINE.exec(probe);
   if (!stat) return { ok: false, error: `Error: ${file} does not exist or cannot be read.` };
-  const resolved = probe.split("\n").filter((l) => l.startsWith(REAL_MARK)).map((l) => l.slice(REAL_MARK.length));
-  const [root, real] = resolved;
-  if (resolved.length !== 2 || !root || !real || !real.startsWith(`${root}/`)) {
+  const [root, real] = resolvedPaths(probe);
+  if (!root || !real || !real.startsWith(`${root}/`)) {
     return { ok: false, error: `Error: ${file} resolves to a file outside /workspace; deliver a file in the workspace.` };
   }
   if (!stat[1].startsWith("regular")) return { ok: false, error: `Error: ${file} is a ${stat[1]}, not a file. Deliver one file (zip a directory first).` };
