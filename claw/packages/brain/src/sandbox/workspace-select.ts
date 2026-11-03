@@ -18,7 +18,10 @@
  * the server's default workspace on every turn, so without the exception a deployment
  * could not make its default a CPU workspace and still run a GPU sandbox from it.
  *
- * A multi-node cluster is always the "GPU requested" case (`gpuWorkspaceFor`).
+ * A multi-node cluster is always the "GPU requested" case (`gpuWorkspaceFor`), and the Hands
+ * sandbox of a multi-node run is not placed by these rules at all: it goes to its cluster's
+ * namespace (see `sandboxNamespaceFor` in ensure-hands.ts), because the cluster's service and pod
+ * addresses resolve only on the cluster's own cluster.
  *
  * With SANDBOX_CPU_NAMESPACE unset nothing changes: the function returns exactly what
  * `request.workspace_id?.trim() || SANDBOX_NAMESPACE` did.
