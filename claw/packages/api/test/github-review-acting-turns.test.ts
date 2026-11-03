@@ -14,7 +14,7 @@
  *       are 403, and leave nothing behind (no row, no queued message, no turn)
  *   A2  the person's own identity-provider token, and an allowed service's, still send one; a service that is not allowed is refused
  *   A3  a session that does not act as a user is exactly what it was: any credential sends to it
- *   A4  an approval or an answer to a question of the model (three routes), and Stop, which is not asked for
+ *   A4  an approval or an answer to a question of the model (four routes), and Stop, which is not asked for
  *   A5  the Anthropic-compatible events route
  *   A6  a task, a batch and a retry (and a hosted application run, which is a task with a mode)
  *   A7  a session whose `acting_as` is not a well-formed id is not offered the tools, is not gated and keeps its sandbox's keys: one reading decides all three
@@ -204,11 +204,12 @@ test("A3 a session that does not act as a user takes any credential, as it alway
   assert.equal(bob.body.error, "only the session creator can send messages");
 });
 
-test("A4 an approval, and the answer to a question of the model, in a session that acts as a user: refused to a key on all three routes; Stop is still open to it", async () => {
+test("A4 an approval, and the answer to a question of the model, in a session that acts as a user: refused to a key on all four routes; Stop is still open to it", async () => {
   const id = await session();
   const decision = { actionId: "a-1", decision: "allow" };
   const requests: Array<[string, { method: "POST"; url: string; payload: unknown }]> = [
     ["messages route, type decision", { method: "POST", url: `/v1/sessions/${id}/messages`, payload: { messageType: "decision", action_id: "a-1", decision: "allow" } }],
+    ["messages route, type answer", { method: "POST", url: `/v1/sessions/${id}/messages`, payload: { messageType: "answer", action_id: "a-1", answers: { q: "yes" } } }],
     ["decisions route", { method: "POST", url: `/v1/chat/sessions/${id}/decisions`, payload: decision }],
     ["answers route", { method: "POST", url: `/v1/chat/sessions/${id}/answers`, payload: { actionId: "a-1", answers: { q: "yes" } } }],
   ];

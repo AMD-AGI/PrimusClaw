@@ -19,7 +19,7 @@ import {
   forceIdleAfterInterrupt, releaseSessionGateForTurn, stopSessionRuns, takeSessionGate,
 } from "../tasks/chat-run.js";
 import { kv, nc, sc } from "../infra/nats.js";
-import { buildDecisionMessage } from "../sessions/decision-message.js";
+import { buildAnswerMessage, buildDecisionMessage } from "../sessions/decision-message.js";
 import { getUser } from "../auth/middleware.js";
 import { getAuthMethod } from "../auth/request-credential.js";
 import {
@@ -1838,9 +1838,10 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       return { ok: true, session_id: sessionId, accepted: true, interrupted: true };
     }
 
-    if (messageType === "decision") {
+    if (messageType === "decision" || messageType === "answer") {
       // The answer to a pending tool-approval request (Brain's approval gate,
-      // agent/hitl.ts). Only a person who may write to the session can give it.
+      // agent/hitl.ts) or to a question the model asked (ask_user_question).
+      // Only a person who may write to the session can give it.
       const row = (await db.query(
         "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
         [sessionId],
@@ -1852,6 +1853,12 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       // In a session that acts as a user an approval is the person's say, not something the key a sandbox holds may give itself.
       const unattended = await actingTurnRefusalFor(req, sessionId);
       if (unattended) return reply.status(403).send({ ok: false, error: unattended });
+      if (messageType === "answer") {
+        const built = buildAnswerMessage(sessionId, userId, body);
+        if (!built.ok) return reply.status(400).send({ ok: false, error: built.error });
+        nc.publish(`decision.${sessionId}`, sc.encode(JSON.stringify(built.message)));
+        return { ok: true, session_id: sessionId, action_id: built.message.action_id };
+      }
       const built = buildDecisionMessage(sessionId, userId, body);
       if (!built.ok) return reply.status(400).send({ ok: false, error: built.error });
       nc.publish(`decision.${sessionId}`, sc.encode(JSON.stringify(built.message)));

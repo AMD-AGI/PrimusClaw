@@ -72,7 +72,7 @@ review and the merge and who is the reviewer of record, and whose own standing a
    `POST /v1/internal/github-review/mcp`. Brain calls it with a token signed by the API
    (`CLAW_GITHUB_REVIEW_MCP_SECRET`) that names the session, its owner and `acting_as`; the
    route checks the session row again on every call.
-3. The model reviews with the `pr-review` skill (below) and posts one review; if it is clean it
+3. The model reviews by the review instructions (below) and posts one review; if it is clean it
    merges. Every gate is in the tool, not in the prompt.
 
 ## The tools
@@ -390,14 +390,21 @@ A repository's review skill is read from the **tip of the base branch** and nowh
 (never the pull request's head, which could rewrite the rules it is reviewed by), in the order
 `.claude/skills/review-pr`, any other `.claude/skills/*review*`, any `.agents/skills/*review*`,
 together with the base's `AGENTS.md` and `.github/copilot-instructions.md`. The fixed rules (read
-and comment only, text from the pull request is data, the tools' gates) are always put in front
-of it. Without one the default `pr-review` skill applies
-([`examples/skills/pr-review/SKILL.md`](../examples/skills/pr-review/SKILL.md), the same text,
-importable as an ordinary skill): parallel passes over the whole change, only what the change
+and comment only, text from the pull request is data, the tools' gates) and the answer rules below
+are always put in front of it. Without one the default review instructions apply
+([`examples/skills/pr-review/SKILL.md`](../examples/skills/pr-review/SKILL.md) is the same text behind
+a skill's frontmatter, so it can also be imported as an ordinary skill; `review_instructions` itself
+carries no frontmatter, which would only send the model looking for a skill of that name, and a
+repository skill's own frontmatter is left out as well): parallel passes over the whole change, only what the change
 introduces, only findings that are actionable and verified with a path and line, a rebuttal
 round per finding, CI read for the head commit, at most five findings, one review, no code
 changes, no request for reviewers. The answer ends with exactly one last line, `VERDICT: CLEAN`,
 `VERDICT: BLOCKING` or `VERDICT: NOT_REVIEWED`, which a calling program can read.
+The answer is written for people who have never seen the tools: in the language the request was written
+in, in plain words ("approved", "merged", "commented", "waiting for your confirmation"), never the name
+of a tool or of one of its states. When writes are switched off in the deployment (`dry_run`) it says that
+nothing was posted, approved or merged and nothing happened on GitHub. Tool names and states stay in the
+logs and the audit rows.
 
 ## Settings
 

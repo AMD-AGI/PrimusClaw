@@ -2085,6 +2085,8 @@ class AgentLoopRunner {
           type: "userQuestion",
           actionId: toolId,
           questions: finalInput.questions,
+          // How long the answer is waited for, as a permissionRequest says it: a client stops offering the question then.
+          timeout_ms: ASK_USER_QUESTION_TIMEOUT_MS,
           ts: Date.now(),
         });
       } catch (err) {
