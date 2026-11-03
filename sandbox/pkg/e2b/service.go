@@ -320,7 +320,7 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		}
 		failed := grant.Op(http.StatusInternalServerError, "sandbox_create_failed", runErr.Error())
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			failed = grant.Op(http.StatusInternalServerError, "pending_timeout", "not running after "+tpl.Pending.String()+": "+runErr.Error())
+			failed = grant.Op(http.StatusServiceUnavailable, "pending_timeout", "not running after "+tpl.Pending.String()+": "+runErr.Error())
 		}
 		_ = s.grants.FailSandbox(context.WithoutCancel(ctx), grantID, sandboxID, failed.Error())
 		return SandboxResponse{}, 0, failed
@@ -364,11 +364,7 @@ func (s *Service) replay(ctx context.Context, grantID string, ref runtimev1alpha
 		return SandboxResponse{}, 0, err
 	}
 	if ref.State == runtimev1alpha1.SandboxEnded {
-		detail := ref.ID
-		if strings.Contains(ref.EndReason, ": ") {
-			detail += "; " + ref.EndReason
-		}
-		return SandboxResponse{}, 0, grant.Op(http.StatusGone, "idempotency_key_spent", detail)
+		return SandboxResponse{}, 0, grant.Op(http.StatusGone, "idempotency_key_spent", ref.ID)
 	}
 	token, err := s.addAccessToken(ctx, grantID, ref.ID)
 	if err != nil {

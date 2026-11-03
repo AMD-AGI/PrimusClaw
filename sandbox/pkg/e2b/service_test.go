@@ -215,11 +215,12 @@ func TestOriginalCreateReportsFailureBeforeReplay(t *testing.T) {
 		name   string
 		fail   error
 		hold   bool
+		status int
 		reason string
 		want   string
 	}{
-		{name: "workload failed", fail: errors.New("workload sbx-1 phase Failed: CapacityGone: allocation generation is Lost"), reason: "sandbox_create_failed", want: "CapacityGone"},
-		{name: "pending timeout", hold: true, reason: "pending_timeout", want: "not running after 1s"},
+		{name: "workload failed", fail: errors.New("workload sbx-1 phase Failed: CapacityGone: allocation generation is Lost"), status: http.StatusInternalServerError, reason: "sandbox_create_failed", want: "CapacityGone"},
+		{name: "pending timeout", hold: true, status: http.StatusServiceUnavailable, reason: "pending_timeout", want: "not running after 1s"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -231,12 +232,11 @@ func TestOriginalCreateReportsFailureBeforeReplay(t *testing.T) {
 			body := CreateBody{TemplateID: "runner", Timeout: 60, Metadata: map[string]string{idempotencyMetadataKey: "once"}}
 			_, _, err := svc.Create(context.Background(), keys["measurement"], body)
 			var oe *grant.OpError
-			if !errors.As(err, &oe) || oe.Status != http.StatusInternalServerError || oe.Reason != tc.reason || !strings.Contains(oe.Detail, tc.want) {
+			if !errors.As(err, &oe) || oe.Status != tc.status || oe.Reason != tc.reason || !strings.Contains(oe.Detail, tc.want) {
 				t.Fatalf("create=%v", err)
 			}
 			_, _, err = svc.Create(context.Background(), keys["measurement"], body)
-			if !errors.As(err, &oe) || oe.Status != http.StatusGone || oe.Reason != "idempotency_key_spent" ||
-				!strings.HasPrefix(oe.Detail, "sbx-") || !strings.Contains(oe.Detail, tc.reason) || !strings.Contains(oe.Detail, tc.want) {
+			if !errors.As(err, &oe) || oe.Status != http.StatusGone || oe.Reason != "idempotency_key_spent" || !strings.HasPrefix(oe.Detail, "sbx-") || strings.Contains(oe.Detail, " ") {
 				t.Fatalf("replay=%v", err)
 			}
 		})
@@ -260,16 +260,16 @@ func TestReplayThatEndsTheRefKeepsTheReason(t *testing.T) {
 	awaitStarted(t, runner.started, done)
 	_, _, err := svc.Create(context.Background(), keys["measurement"], body)
 	var oe *grant.OpError
-	if !errors.As(err, &oe) || oe.Status != http.StatusGone || !strings.Contains(oe.Detail, "CapacityGone") {
-		t.Fatalf("first replay=%v", err)
+	if !errors.As(err, &oe) || oe.Status != http.StatusGone || oe.Reason != "idempotency_key_spent" {
+		t.Fatalf("replay=%v", err)
+	}
+	refs, err := svc.grants.ListRoleSandboxes(context.Background(), "gr-01jb7m9k2x", "measurement")
+	if err != nil || len(refs) != 1 || !strings.Contains(refs[0].EndReason, "CapacityGone") {
+		t.Fatalf("refs=%+v err=%v", refs, err)
 	}
 	close(runner.hold)
 	if err := <-done; !errors.As(err, &oe) || oe.Status != http.StatusInternalServerError || !strings.Contains(oe.Detail, "CapacityGone") {
 		t.Fatalf("create=%v", err)
-	}
-	_, _, err = svc.Create(context.Background(), keys["measurement"], body)
-	if !errors.As(err, &oe) || oe.Status != http.StatusGone || !strings.Contains(oe.Detail, "CapacityGone") {
-		t.Fatalf("second replay=%v", err)
 	}
 }
 
