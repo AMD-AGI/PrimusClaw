@@ -44,6 +44,7 @@ import { loadUserEnvForSession } from "../github-review/session-tools.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
 import { releaseSessionGateForTurn, takeSessionGate } from "../tasks/chat-run.js";
 import { drainOldestPendingMessage } from "../events/consumer.js";
+import { holdPendingDrainClaim } from "./drain-claim.js";
 import { dispatchTaskToBrain, newChatMessageId } from "./dispatch.js";
 
 // The name the route logged these records under before they moved, so a filter an
@@ -277,6 +278,9 @@ export async function submitSessionMessage(
   const client = await db.pool.connect();
   try {
     await client.query("BEGIN");
+    // A drain under way has dispatched a turn that has not taken the gate yet: this message waits for it and then
+    // finds the session running, rather than taking the gate the drain is about to take over it.
+    await holdPendingDrainClaim(client, sessionId);
     const lockResult = await client.query(
       "SELECT agent_status, user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL FOR UPDATE",
       [sessionId],
@@ -364,9 +368,8 @@ export async function submitSessionMessage(
     if (wasRunning) return { kind: "queued", pendingId, deduplicated, drain: "awaiting_turn" };
     // `enqueue` on a session nobody holds: nothing will complete to drain this,
     // so it is drained here, after the transaction and on its own connection.
-    // This is the drain the completion handler runs, with the caveat it has: a
-    // send that takes the gate between the commit above and this call puts a
-    // second turn on a live session, which Brain serialises per session.
+    // This is the drain the completion handler runs: a send that takes the gate
+    // between the commit above and this call leaves the row to that turn.
     //
     // A drain that throws is not a drain that left the message queued: it
     // publishes, deletes the queue row and only then takes the gate, so it can

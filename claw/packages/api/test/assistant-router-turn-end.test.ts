@@ -5,7 +5,7 @@
  * A router turn that ends with words and no message (`src/assistant/router-turn-end.ts`), against a real Postgres
  * with the production schema. Skipped without DATABASE_URL, and a skip is not a pass.
  *
- *   T1  a turn that answers the user in plain text and says nothing: the text is delivered through say, once
+ *   T1  a turn that answers the user in plain text and says nothing: the text is delivered through say, once, naming the turn
  *   T2  a turn that said something is left alone, whatever else it wrote; a message of the system's own does not count as having spoken
  *   T3  a turn that a worker's report started may end silent on purpose: what it wrote is not delivered
  *   T4  a turn that failed, was interrupted, was written by the sweeper, or wrote nothing delivers nothing
@@ -57,10 +57,15 @@ describe("assistant router turn end", { skip }, () => {
     assert.equal(w.events.length, 1, "the web client sees it in the assistant's session");
     assert.equal(w.events[0].type, "AssistantSay");
     assert.equal(w.events[0].session_id, alice.routerSid);
+    assert.equal(w.events[0].turn_message_id, undefined, "a completion that names no turn names none");
     assert.equal((await w.q("SELECT 1 FROM claw_notification_outbox")).length, 1, "and a subscriber is told");
     // A completion delivered again finds the message and adds nothing.
     assert.equal(await end(turn, { finalText: "The build is still running; no failures so far." }), "skipped");
     assert.equal((await says()).length, 1);
+    // The ended turn's message id goes on the session's event: it is what says which message this answers.
+    const next = await endedTurn("And the tests?");
+    assert.equal(await end(next, { finalText: "All green.", messageId: next.mid }), "said");
+    assert.equal(w.events.at(-1)?.turn_message_id, next.mid);
   });
 
   test("T2 a turn that said something is left alone, and a message of the system's own is not the turn's", async () => {
@@ -134,7 +139,13 @@ describe("assistant router turn end", { skip }, () => {
   test("T7 the completion handler asks for it when a router turn ends", async () => {
     const turn = await w.routerTurn(alice);
     await w.q("UPDATE claw_tasks SET prompt = 'What is the weather like on the build farm?' WHERE task_id = $1", [turn.task_id]);
-    const { consumeEventDelivery, tombstoneReader } = w.mod.consumer;
+    const { completionPorts, consumeEventDelivery, tombstoneReader } = w.mod.consumer;
+    const realDeliver = completionPorts.deliverUnsaidAnswer;
+    const ended: Array<{ messageId?: string }> = [];
+    completionPorts.deliverUnsaidAnswer = (async (end: { messageId?: string }, deps?: unknown) => {
+      ended.push(end);
+      return realDeliver(end as never, deps as never);
+    }) as typeof completionPorts.deliverUnsaidAnswer;
     const { sc } = await import("../src/infra/nats.js");
     const { resetDeletedSessionCache } = await import("../src/sessions/deleted-cache.js");
     const originalTombstone = { ...tombstoneReader };
@@ -153,8 +164,10 @@ describe("assistant router turn end", { skip }, () => {
       });
     } finally {
       Object.assign(tombstoneReader, originalTombstone);
+      completionPorts.deliverUnsaidAnswer = realDeliver;
       resetDeletedSessionCache();
     }
     assert.deepEqual((await says()).map((s) => s.text), ["Sunny, and the build is green."], `delivered by the handler (${acked.join(", ")})`);
+    assert.deepEqual(ended.map((e) => e.messageId), [turn.mid], "the say is the ended turn's: its message id goes with it");
   });
 });

@@ -56,6 +56,8 @@ export interface SayInput {
    * aborts the say. The place for the check that the caller still holds the turn.
    */
   guard?: (q: Querier) => Promise<void>;
+  /** The message id of the turn that says it: on the session's event, it is what tells a reader which message this answers. */
+  turnMessageId?: string;
 }
 
 export interface SayDeps {
@@ -144,7 +146,7 @@ async function store(q: Querier, m: ToStore): Promise<Stored | null> {
 }
 
 /** After the commit: the web client's copy of the message, and the delivery that cannot wait for the poll. */
-async function announce(stored: Stored, deps: SayDeps): Promise<void> {
+async function announce(stored: Stored, deps: SayDeps, turnMessageId?: string): Promise<void> {
   if (stored.sessionId) {
     const { payload } = stored;
     try {
@@ -152,6 +154,7 @@ async function announce(stored: Stored, deps: SayDeps): Promise<void> {
         type: "AssistantSay",
         session_id: stored.sessionId,
         say_id: stored.sayId,
+        ...(turnMessageId ? { turn_message_id: turnMessageId } : {}),
         text: payload.text,
         ...(payload.item ? { item: payload.item } : {}),
         fallback: payload.type === "work_item.needs_you",
@@ -208,7 +211,7 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
     return store(q, { type: "assistant.say", sayId: randomUUID(), userId: input.userId, sessionId: input.sessionId, text, item });
   });
   if (!stored) throw new Error("a fresh say id was already stored");
-  await announce(stored, deps);
+  await announce(stored, deps, input.turnMessageId);
   return { say_id: stored.sayId, subscribers: stored.subscribers };
 }
 

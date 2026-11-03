@@ -16,7 +16,7 @@ import { classifyAttendedCaller } from "../github-review/attended.js";
 import { loadUserEnvForSession, withholdsSandboxKeys } from "../github-review/session-tools.js";
 import { readGithubReviewSettings } from "../github-review/settings.js";
 import {
-  forceIdleAfterInterrupt, releaseSessionGateForTurn, stopSessionRuns, takeSessionGate,
+  forceIdleAfterInterrupt, queuedMessageId, releaseSessionGateForTurn, stopSessionRuns, takeSessionGate,
 } from "../tasks/chat-run.js";
 import { kv, nc, sc } from "../infra/nats.js";
 import { buildAnswerMessage, buildDecisionMessage } from "../sessions/decision-message.js";
@@ -1891,8 +1891,12 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         return reply.status(403).send({ ok: false, error: submitted.reason });
       case "queued":
         // No `run_id`: what this call accepted is a queued message, and the run
-        // row is opened later by the drain -- see docs/run-api.md.
-        return { ok: true, session_id: sessionId, queued: true };
+        // row is opened later by the drain -- see docs/run-api.md. The message id
+        // is already decided: it is the one the turn that runs it will carry.
+        return {
+          ok: true, session_id: sessionId, queued: true,
+          ...(submitted.pendingId !== null ? { message_id: queuedMessageId(submitted.pendingId) } : {}),
+        };
       case "client_gone":
         return reply.status(499).send({ ok: false, error: "client_closed_request" });
       case "dispatch_failed":
