@@ -57,10 +57,15 @@ controlplane:
     # entry comes from the default or admin quota of that user.
     identity:
       introspectUrl: ""
-      # attestUrl is the identity provider sandbox attestation endpoint. It is
-      # used only with identity keys: an identity-key create forwards the
-      # caller's key there and copies the returned token onto the Workload.
-      attestUrl: ""
+      # tokenUrl is the identity provider token endpoint. It is used only with
+      # identity keys: an identity-key create exchanges the caller's key there
+      # for an assertion bound to the Workload (RFC 8693, requested_token_type
+      # jwt) and copies it onto the Workload. assertionAudience and
+      # assertionDetailType are its aud and authorization_details type; they
+      # match the admission constraint.
+      tokenUrl: ""
+      assertionAudience: "agent-sandbox-admission"
+      assertionDetailType: "agent-sandbox-workload"
       clientSecret: "agent-sandbox-identity-client"
       ownerPolicyConfigMap: ""
   # Graceful drain on rollout or eviction, in Kubernetes order:

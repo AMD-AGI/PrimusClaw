@@ -316,9 +316,13 @@ spec:
                 configMapKeyRef:
                   name: {{ .ownerPolicyConfigMap | quote }}
                   key: policy.json
-            {{- if .attestUrl }}
-            - name: IDENTITY_ATTEST_URL
-              value: {{ .attestUrl | quote }}
+            {{- if .tokenUrl }}
+            - name: IDENTITY_TOKEN_URL
+              value: {{ .tokenUrl | quote }}
+            - name: IDENTITY_ASSERTION_AUDIENCE
+              value: {{ .assertionAudience | quote }}
+            - name: IDENTITY_ASSERTION_DETAIL_TYPE
+              value: {{ .assertionDetailType | quote }}
             {{- end }}
             {{- end }}
             {{- end }}

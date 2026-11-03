@@ -98,11 +98,11 @@ type SafeWorkloadCreator struct {
 	identity       IdentityAttester
 }
 
-// IdentityAttester asks the identity provider for a short sandbox attestation.
-// subjectKey is the caller's identity key; the attestation names its owner,
-// workspace, the Workload name sandbox, and the GPU ceiling maxGPUs.
+// IdentityAttester asks the identity provider for a short assertion.
+// subjectKey is the caller's identity key; the assertion names its owner and
+// binds workspace, the Workload name sandbox, and the Workload GPU total gpus.
 type IdentityAttester interface {
-	Attest(ctx context.Context, subjectKey, workspace, sandbox string, maxGPUs int) (string, error)
+	Attest(ctx context.Context, subjectKey, workspace, sandbox string, gpus int) (string, error)
 }
 
 // SetIdentityAttester records the client that signs sandbox attestations.

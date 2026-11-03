@@ -38,7 +38,7 @@ type CreateRequest struct {
 	OwnerKey bool
 	// SubjectKey is the identity key the caller presented. The identity provider attests for its owner.
 	SubjectKey string
-	Env      map[string]string
+	Env        map[string]string
 	// SigningKeyPEM is the PKCS#8 Ed25519 private key written into a sealed sandbox.
 	SigningKeyPEM string
 	// AvoidNodes are node names the Workload prefers not to run on, space-separated.

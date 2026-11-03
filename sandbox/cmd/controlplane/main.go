@@ -448,7 +448,7 @@ func main() {
 		if idClient != nil {
 			opts.Identity = idClient
 			if attester == nil {
-				log.Warn("identity-key sandbox creates are refused: IDENTITY_ATTEST_URL is not set")
+				log.Warn("identity-key sandbox creates are refused: IDENTITY_TOKEN_URL is not set")
 			}
 		}
 		plane := e2b.New(opts)
