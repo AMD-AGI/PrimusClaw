@@ -306,9 +306,9 @@ test("T8 the mark does not depend on the tools being offered: a session that act
 
 test("M1 a session that acts as a user and names no model runs on the review model, with no effort unless one is set; one that names a model keeps it; an ordinary chat session has neither", async () => {
   const cases: Array<[string, Record<string, unknown>, Record<string, unknown>, string | null, string | undefined]> = [
-    ["acting, no model", { acting_as: "u-bob" }, {}, "claude-sonnet-5.5", undefined],
-    ["acting, model null", { acting_as: "u-bob" }, { model: null }, "claude-sonnet-5.5", undefined],
-    ["acting, own model", { acting_as: "u-bob" }, { model: "claude-opus-5.5" }, "claude-opus-5.5", undefined],
+    ["acting, no model", { acting_as: "u-bob" }, {}, "claude-opus-5.5", undefined],
+    ["acting, model null", { acting_as: "u-bob" }, { model: null }, "claude-opus-5.5", undefined],
+    ["acting, own model", { acting_as: "u-bob" }, { model: "claude-sonnet-5.5" }, "claude-sonnet-5.5", undefined],
     ["ordinary", { notify_on_finish: true }, {}, null, undefined],
   ];
   for (const [what, config, extra, model, effort] of cases) {

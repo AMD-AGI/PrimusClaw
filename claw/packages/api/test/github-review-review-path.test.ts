@@ -3,8 +3,8 @@
 
 /**
  * How a pull request is reviewed: from the diff alone (`api_diff`, no sandbox, no
- * 16 s cold start) or with a sandbox. A change of a non-test source file always takes
- * the sandbox; otherwise the decision is by thresholds an operator can change, a
+ * 16 s cold start) or with a sandbox. With the deep review on, a change of a non-test source
+ * file always takes the sandbox; otherwise the decision is by thresholds an operator can change, a
  * repository's own review skill forces the sandbox path, and which way it went is
  * logged and kept in the audit row.
  */
@@ -12,13 +12,17 @@ import assert from "node:assert/strict";
 import test, { after } from "node:test";
 import { GithubReview } from "../src/github-review/service.js";
 import { chooseReviewPath, isNonTestSource, reviewPathAdvice } from "../src/github-review/review-path.js";
-import { PR_REVIEW_INSTRUCTIONS } from "../src/github-review/default-skill.js";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { DEEP_FIXED_REVIEW_RULES, DEEP_PR_REVIEW_INSTRUCTIONS, FIXED_REVIEW_RULES, PR_REVIEW_INSTRUCTIONS, PR_REVIEW_SKILL } from "../src/github-review/default-skill.js";
 import { readGithubReviewSettings } from "../src/github-review/settings.js";
 import { PR, SECRET, closeShared, credential, readSection, reviewEnv } from "./support/review-env.js";
 
 after(closeShared);
 
-const LIMITS = { fastMaxFiles: 15, fastMaxChangedLines: 600 };
+/** The deep review on: what most tests here are about. */
+const LIMITS = { fastMaxFiles: 15, fastMaxChangedLines: 600, deepReview: true };
+const DEEP = { CLAW_GITHUB_REVIEW_DEEP_ENABLED: "true" };
 const SMALL = { changedFiles: 3, changedLines: 80, filesComplete: true, diffMissing: false, repoSkill: false, paths: ["docs/guide.md", "README.md", "test/app.test.ts"] };
 /** The change most fixtures here are: documentation only, so it may be reviewed from the diff. */
 const DOCS_ONLY = [{ filename: "docs/app.md", status: "modified", additions: 3, deletions: 1, patch: "@@ -1,4 +1,6 @@\n a\n-b\n+b2\n+c\n+d\n e\n f" }];
@@ -86,18 +90,19 @@ test("a repository's own review skill, an incomplete file list and a diff GitHub
 });
 
 test("the advice tells the model not to use a sandbox on the fast path, and that the other one requires it and why", () => {
-  assert.match(reviewPathAdvice({ path: "api_diff", reason: "small_diff" }), /Do not start a sandbox/);
-  const slow = reviewPathAdvice({ path: "sandbox", reason: "too_many_files" });
+  assert.match(reviewPathAdvice({ path: "api_diff", reason: "small_diff" }, true), /Do not start a sandbox/);
+  const slow = reviewPathAdvice({ path: "sandbox", reason: "too_many_files" }, true);
   assert.match(slow, /must use a sandbox because the change touches many files/);
   assert.match(slow, /callers/);
   assert.match(slow, /build what the tests closest to the change need \(the documented way, only what is missing\) and run them/);
-  assert.match(reviewPathAdvice({ path: "sandbox", reason: "source_change" }), /because the change touches source code/);
+  assert.match(reviewPathAdvice({ path: "sandbox", reason: "source_change" }, true), /because the change touches source code/);
 });
 
 test("the thresholds are read from the environment with documented defaults, and a bad value falls back and is reported", () => {
   const d = readGithubReviewSettings({}, true);
   assert.equal(d.fastMaxFiles, 15);
-  assert.equal(d.fastMaxChangedLines, 200);
+  assert.equal(d.fastMaxChangedLines, 600);
+  assert.equal(readGithubReviewSettings(DEEP, true).fastMaxChangedLines, 200);
   const s = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_FAST_MAX_FILES: "40", CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES: "2500" }, true);
   assert.equal(s.fastMaxFiles, 40);
   assert.equal(s.fastMaxChangedLines, 2500);
@@ -157,8 +162,8 @@ test("past the file threshold the path is the sandbox, in the result, the log li
   assert.deepEqual(await auditPath(e), { review_path: "sandbox", review_path_reason: "too_many_files" });
 });
 
-test("a four-line change of a source file is reviewed with a sandbox, with the recipe, in the result and the audit row", async () => {
-  const { e, rec, service } = await envWith();
+test("with the deep review on, a four-line change of a source file is reviewed with a sandbox, with the recipe, in the result and the audit row", async () => {
+  const { e, rec, service } = await envWith(DEEP);
   const b = (await service.getPr(e.actor, { pr: PR })).body as any;
   assert.deepEqual([b.review_path.path, b.review_path.reason], ["sandbox", "source_change"]);
   assert.match(b.review_path.sandbox_recipe, /pull\/7\/head/);
@@ -205,21 +210,21 @@ test("the secret in the settings is not part of the path decision", () => {
   assert.equal(SECRET.length >= 32, true);
 });
 
-test("the review model and effort are read from the environment: sonnet and no effort by default, `default` for the deployment's model, a bad value is reported", () => {
+test("the review model and effort are read from the environment: opus and no effort by default, `default` for the deployment's model, a bad value is reported", () => {
   const d = readGithubReviewSettings({}, true);
-  assert.deepEqual([d.reviewModel, d.reviewEffort], ["claude-sonnet-5.5", null]);
-  const s = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_MODEL: "claude-opus-5.5", CLAW_GITHUB_REVIEW_EFFORT: "Medium" }, true);
-  assert.deepEqual([s.reviewModel, s.reviewEffort], ["claude-opus-5.5", "medium"]);
+  assert.deepEqual([d.reviewModel, d.reviewEffort], ["claude-opus-5.5", null]);
+  const s = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_MODEL: "claude-sonnet-5.5", CLAW_GITHUB_REVIEW_EFFORT: "Medium" }, true);
+  assert.deepEqual([s.reviewModel, s.reviewEffort], ["claude-sonnet-5.5", "medium"]);
   const off = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_MODEL: "default", CLAW_GITHUB_REVIEW_EFFORT: "" }, true);
   assert.deepEqual([off.reviewModel, off.reviewEffort, off.problems], [null, null, []]);
   const bad = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_MODEL: "has space", CLAW_GITHUB_REVIEW_EFFORT: "max" }, true);
-  assert.deepEqual([bad.reviewModel, bad.reviewEffort], ["claude-sonnet-5.5", null]);
+  assert.deepEqual([bad.reviewModel, bad.reviewEffort], ["claude-opus-5.5", null]);
   assert.match(bad.problems.join(), /CLAW_GITHUB_REVIEW_MODEL/);
   assert.match(bad.problems.join(), /CLAW_GITHUB_REVIEW_EFFORT=max/);
 });
 
 test("the instructions build what the closest tests import before running them, reuse what an earlier run left, and fall back to tests that need no build", () => {
-  const text = PR_REVIEW_INSTRUCTIONS.replace(/\s+/g, " ");
+  const text = DEEP_PR_REVIEW_INSTRUCTIONS.replace(/\s+/g, " ");
   // Order: find the tests, build what they need, then judge what ran.
   const find = text.indexOf("run the tests closest to the change");
   const build = text.indexOf("build what those tests need first, the documented way");
@@ -237,4 +242,73 @@ test("the instructions build what the closest tests import before running them, 
   assert.match(text, /a failed build, time\) is not a pass/);
   // Bounded like every other command.
   assert.match(text, /Bound every command with `timeout 600`/);
+});
+
+/**
+ * What main gave the model before the deep review existed (8f0bf87, src/github-review unchanged since 92ed1dd), computed by running
+ * that tree's own code: the sha256 of each instruction text, and every advice string word for word.
+ */
+const MAIN = {
+  instructions: "9eb0212e2f1f983882ad3ce1e9f34e04fec6d052356b74ba49cd8ca9482d5d3f",
+  skill: "4c9aa801b0750eb572c95bb63d6d71113543d61bed2bc6c736e5cfd2ee8be248",
+  fixedRules: "5a5dc6a7434510cfe665fa51c46c72577e1c95a17c108060bf4b82840a523334",
+  advice: {
+  "small_diff": "Review from the diff and the files in this result. Do not start a sandbox and do not call bash or file tools: they add a slow cold start and this change does not need them.",
+  "repo_review_skill": "A sandbox is allowed for this review because the repository has its own review skill, which may use scripts. Use it only to read the code around the change or run something. Get the code with the sandbox_recipe below: it fetches the pull request anonymously (the repository is public), pinned to the head_sha above. The sandbox has no credential for GitHub and must not be given one: every comment, approval and merge still goes through the tools.",
+  "incomplete_change_list": "A sandbox is allowed for this review because the list of changed files is incomplete. Use it only to read the code around the change or run something. Get the code with the sandbox_recipe below: it fetches the pull request anonymously (the repository is public), pinned to the head_sha above. The sandbox has no credential for GitHub and must not be given one: every comment, approval and merge still goes through the tools.",
+  "diff_not_available": "A sandbox is allowed for this review because GitHub did not send the diff of some files. Use it only to read the code around the change or run something. Get the code with the sandbox_recipe below: it fetches the pull request anonymously (the repository is public), pinned to the head_sha above. The sandbox has no credential for GitHub and must not be given one: every comment, approval and merge still goes through the tools.",
+  "too_many_files": "A sandbox is allowed for this review because the change touches many files. Use it only to read the code around the change or run something. Get the code with the sandbox_recipe below: it fetches the pull request anonymously (the repository is public), pinned to the head_sha above. The sandbox has no credential for GitHub and must not be given one: every comment, approval and merge still goes through the tools.",
+  "too_many_changed_lines": "A sandbox is allowed for this review because the change is large. Use it only to read the code around the change or run something. Get the code with the sandbox_recipe below: it fetches the pull request anonymously (the repository is public), pinned to the head_sha above. The sandbox has no credential for GitHub and must not be given one: every comment, approval and merge still goes through the tools."
+} as Record<string, string>,
+};
+const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+
+test("the deep review is off by default, read like the other switches, and a bad value is reported and leaves it off", () => {
+  assert.equal(readGithubReviewSettings({}, true).deepReview, false);
+  for (const v of ["true", "1", "yes", " TRUE "]) assert.equal(readGithubReviewSettings({ CLAW_GITHUB_REVIEW_DEEP_ENABLED: v }, true).deepReview, true, v);
+  for (const v of ["false", "0", "no", ""]) {
+    const s = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_DEEP_ENABLED: v }, true);
+    assert.deepEqual([s.deepReview, s.problems], [false, []], v);
+  }
+  const bad = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_DEEP_ENABLED: "on" }, true);
+  assert.equal(bad.deepReview, false);
+  assert.match(bad.problems.join(), /CLAW_GITHUB_REVIEW_DEEP_ENABLED=on is not true or false; using false/);
+});
+
+test("with the deep review off, the model is given exactly what main gave it: instructions, skill, fixed rules, path and advice", async () => {
+  const off = readGithubReviewSettings({}, true);
+  assert.equal(sha256(PR_REVIEW_INSTRUCTIONS), MAIN.instructions);
+  assert.equal(sha256(PR_REVIEW_SKILL), MAIN.skill);
+  assert.equal(sha256(readFileSync(new URL("../../../examples/skills/pr-review/SKILL.md", import.meta.url), "utf8")), MAIN.skill);
+  assert.equal(sha256(FIXED_REVIEW_RULES), MAIN.fixedRules);
+  for (const [reason, text] of Object.entries(MAIN.advice)) {
+    assert.equal(reviewPathAdvice({ path: reason === "small_diff" ? "api_diff" : "sandbox", reason }, off.deepReview), text, reason);
+  }
+  // A small change of a source file is reviewed from the diff, as on main; 601 lines is past main's threshold.
+  assert.deepEqual(chooseReviewPath({ ...SMALL, changedLines: 10, paths: ["src/auth.ts"] }, off), { path: "api_diff", reason: "small_diff" });
+  assert.deepEqual(chooseReviewPath({ ...SMALL, changedLines: 600, paths: ["src/auth.ts"] }, off).path, "api_diff");
+  assert.deepEqual(chooseReviewPath({ ...SMALL, changedLines: 601 }, off), { path: "sandbox", reason: "too_many_changed_lines" });
+  // What gh_pr_get hands the model as `review_instructions`, with no repository instructions and with a repository skill.
+  const { e, service } = await envWith();
+  const got = (await service.getPr(e.actor, { pr: PR })).body as any;
+  assert.deepEqual([got.review_path.path, got.review_path.reason, got.review_path.advice], ["api_diff", "small_diff", MAIN.advice.small_diff]);
+  assert.equal(sha256((await readSection(service, e.actor, PR, "instructions")).text), MAIN.instructions);
+  e.gh.dirs[".claude/skills"] = [{ name: "review-pr", type: "dir" }];
+  e.gh.contents[".claude/skills/review-pr/SKILL.md"] = "# Review\nLook at the rules index first.";
+  const withSkill = (await readSection(service, e.actor, PR, "instructions")).text;
+  assert.ok(withSkill.includes(FIXED_REVIEW_RULES) && !withSkill.includes(DEEP_FIXED_REVIEW_RULES), "a repository's skill is bound by main's rules");
+});
+
+test("with the deep review on, the instructions, the fixed rules and the advice are the deep ones", async () => {
+  assert.notEqual(sha256(DEEP_PR_REVIEW_INSTRUCTIONS), MAIN.instructions);
+  assert.notEqual(DEEP_FIXED_REVIEW_RULES, FIXED_REVIEW_RULES);
+  assert.match(DEEP_PR_REVIEW_INSTRUCTIONS, /Second pass, always/);
+  assert.doesNotMatch(PR_REVIEW_INSTRUCTIONS, /Second pass|adversarial/);
+  assert.match(reviewPathAdvice({ path: "sandbox", reason: "too_many_files" }, true), /must use a sandbox/);
+  const { e, service } = await envWith(DEEP);
+  assert.equal((await readSection(service, e.actor, PR, "instructions")).text, DEEP_PR_REVIEW_INSTRUCTIONS);
+  e.gh.dirs[".claude/skills"] = [{ name: "review-pr", type: "dir" }];
+  e.gh.contents[".claude/skills/review-pr/SKILL.md"] = "# Review\nLook at the rules index first.";
+  const withSkill = (await readSection(service, e.actor, PR, "instructions")).text;
+  assert.ok(withSkill.includes(DEEP_FIXED_REVIEW_RULES), "a repository's skill is bound by the deep rules");
 });

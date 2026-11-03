@@ -69,7 +69,7 @@ const ACTING: Array<[string, unknown, boolean]> = [
   ["no acting_as", undefined, false],
 ];
 
-async function claim(actingAs: unknown, model = "claude-sonnet-5.5"): Promise<{ request: Record<string, unknown>; asked: string[] }> {
+async function claim(actingAs: unknown, model = "claude-opus-5.5"): Promise<{ request: Record<string, unknown>; asked: string[] }> {
   const asked: string[] = [];
   db.query = (async (text: string) => {
     const sql = text.replace(/\s+/g, " ").trim();
@@ -99,7 +99,7 @@ test("D1 a turn claimed from the queue is marked for a session that acts as a us
 const NOW = new Date().toISOString();
 const taskRow = () => ({
   task_id: "t-1", session_id: "s-1", status: "preparing", mode: "script", prompt: "", input: {}, plugin_id: null, sandbox_spec: "none",
-  dag_root_task_id: null, started_at: NOW, created_at: NOW, model: "claude-sonnet-5.5",
+  dag_root_task_id: null, started_at: NOW, created_at: NOW, model: "claude-opus-5.5",
 });
 
 async function dispatchDag(config: Record<string, unknown>): Promise<Record<string, unknown>> {

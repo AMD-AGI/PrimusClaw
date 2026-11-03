@@ -332,7 +332,7 @@ export class GithubReview {
     const risk = assessRisk(this.riskInput(pr, repo, change));
     const state = await this.readState(ctx, ref, pr, repo);
     // At the base commit the head was compared with (instructionChanges), not wherever the branch is by now.
-    const instructions = await selectReviewInstructions(ctx.client, ref, pr.baseRef, pr.baseSha);
+    const instructions = await selectReviewInstructions(ctx.client, ref, pr.baseRef, pr.baseSha, ctx.settings.deepReview);
     const choice = chooseReviewPath({
       changedFiles: pr.changedFiles, changedLines: pr.additions + pr.deletions, filesComplete: change.complete,
       diffMissing: change.files.some(diffNotSent),
@@ -370,7 +370,7 @@ export class GithubReview {
       },
       files_complete: change.complete,
       review_path: {
-        path: choice.path, reason: choice.reason, advice: reviewPathAdvice(choice),
+        path: choice.path, reason: choice.reason, advice: reviewPathAdvice(choice, ctx.settings.deepReview),
         max_files_for_diff_only: ctx.settings.fastMaxFiles, max_changed_lines_for_diff_only: ctx.settings.fastMaxChangedLines,
         // The code reaches the sandbox anonymously and pinned to this head; the token is never part of it.
         sandbox_recipe: recipe, sandbox_recipe_usage: recipe ? SANDBOX_RECIPE_USAGE : null,

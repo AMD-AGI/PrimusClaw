@@ -28,16 +28,18 @@ record it.
 ## [Unreleased]
 
 ### Added
-- A pull request reviewed on someone's behalf is reviewed in depth. A session created with `config.acting_as` and no
-  `model` runs on `CLAW_GITHUB_REVIEW_MODEL` (default `claude-sonnet-5.5`, apart from the deployment's `DEFAULT_MODEL`); a
-  request's own `model` wins. `CLAW_GITHUB_REVIEW_EFFORT` (unset by default: nothing is sent, as before) runs every turn of
-  it at that effort while it runs on that model (new `ExecuteRequest.effort`, which Brain sends as `output_config.effort`, or `reasoning_effort`, on every
-  turn and sub-agent of the run). The requester's key pays.
-  Any change of a non-test source file, or of more than 200 lines (`CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES`, was
-  600), takes the sandbox path (`source_change`), and the default instructions require it: check the pull request
-  out, read the callers of every changed function and export, run the closest tests under a time bound, then a second
-  adversarial pass by a read-only sub-agent; the review body lists what was read and run and carries non-blocking
-  suggestions and open questions, while inline comments stay for verified blocking findings. The gates are unchanged.
+- A session created with `config.acting_as` and no `model` (a pull request reviewed on someone's behalf) runs on
+  `CLAW_GITHUB_REVIEW_MODEL` (default `claude-opus-5.5`, apart from the deployment's `DEFAULT_MODEL`; `default` keeps
+  that); a request's own `model` wins. `CLAW_GITHUB_REVIEW_EFFORT` (unset by default: nothing is sent, as before) runs
+  every turn of it at that effort while it runs on that model (new `ExecuteRequest.effort`, which Brain sends as
+  `output_config.effort`, or `reasoning_effort`, on every turn and sub-agent of the run). The requester's key pays.
+- A deep review behind `CLAW_GITHUB_REVIEW_DEEP_ENABLED` (off by default; off, the review instructions, path advice and
+  thresholds are exactly the previous ones). On, any change of a non-test source file, or of more than 200 lines
+  (`CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES`, 600 with it off), takes the sandbox path (`source_change`), and the
+  default instructions require it: check the pull request out, read the callers of every changed function and
+  export, build and run the closest tests under a time bound, then a second adversarial pass by a read-only
+  sub-agent; the review body lists what was read and run and carries non-blocking suggestions and open questions,
+  while inline comments stay for verified blocking findings. The gates are unchanged.
 - The model can schedule work itself: with `CLAW_TRIGGER_TOOLS_ENABLED` (needs `CLAW_TRIGGERS_ENABLED` and a
   `CLAW_TRIGGER_TOOLS_TOKEN_KEY` of 32+ characters; off by default) every turn but a trigger's own run is offered
   `trigger_create`, `trigger_list` and `trigger_cancel`, served by the API at `/v1/internal/trigger-mcp`. The user is
