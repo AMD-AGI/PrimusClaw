@@ -471,9 +471,10 @@ record it.
   `ambiguous_item_ref`. The Router is told to call `work_create`, `work_send` and `work_stop` without a `say` in the
   same step and to speak after their results, so it no longer announces what a refused call did not do. The message
   it is answering is followed by a `[Reply language: X]` line (Chinese, Japanese, Korean or English, read from the
-  user's own words with what they quote left out, or from their last ones when a worker's report woke it; only the
-  first and last 2000 characters of a long message are read, so a message of megabytes costs what a short one does),
-  so item titles in another language no longer decide the language of a reply. The line is on the request only: the
+  user's own words with what they quote left out, or from their last ones when a worker's report woke it; a message
+  in another language gets no line, and only one with too few letters to be in any language, such as `ok`, looks back;
+  only the first and last 2000 characters of a long message are read, so a message of megabytes costs what a short
+  one does), so item titles in another language no longer decide the language of a reply. The line is on the request only: the
   conversation turn written when the run completes holds the user's words from the run row, as they were sent. A
   turn that ends with plain text and no `say`, which reached nobody, has its text delivered as a `say`. The
   evaluation in `claw/packages/api/test/e2e/assistant-router-eval.ts` measures all of this against a real model.

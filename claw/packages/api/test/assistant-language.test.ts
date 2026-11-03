@@ -10,6 +10,7 @@
  *   L2  a message that cannot be told, or is in another language, has no verdict rather than a wrong one
  *   L3  the verdict agrees with the language every evaluation message is labelled with
  *   L4  the language is the message's own, else the one the user wrote in before; a report is not the user's message
+ *   L4b a message with words in a language that cannot be named gets no line, and is not answered in the language of older ones; one with too few letters to be in any language still looks back
  *   L5  the line is the same every time and is added once
  *   L6  only the start and the end of a long message are read, and a paste between them does not decide
  *   L7  what it costs does not grow with what was sent: not by the length of the message, nor by how its characters are arranged
@@ -19,7 +20,7 @@ import { performance } from "node:perf_hooks";
 import test from "node:test";
 
 import {
-  detectLanguage, detectLanguageOfAll, languageToAnswerIn, replyLanguageLine, withReplyLanguage, READ_CHARS, REPLY_LANGUAGE_LABEL,
+  detectLanguage, detectLanguageOfAll, languageToAnswerIn, readLanguage, replyLanguageLine, withReplyLanguage, READ_CHARS, REPLY_LANGUAGE_LABEL,
 } from "../src/assistant/language.js";
 import { WORK_EVENT_PREFIX } from "../src/assistant/prompts.js";
 import { CASES } from "./e2e/assistant-router-eval-cases.js";
@@ -146,6 +147,57 @@ test("L4 the message's own language, else the user's earlier words, and a report
   assert.equal(await languageToAnswerIn(null, earlier()), null);
   assert.equal(await languageToAnswerIn("ok", earlier("ok", "#2")), null, "nothing says, so no verdict");
   assert.equal(await languageToAnswerIn("ok", async () => ["Please look"]), "English", "earlier may be asked asynchronously");
+});
+
+test("L4b a message with words in a language that cannot be named gets no line; one with too few letters to be in any language looks back", async () => {
+  const french = "Bonjour, peux-tu corriger le build s'il te plaît ?";
+  const german = "Hallo, kannst du bitte den Build reparieren? Er ist seit gestern rot.";
+  const spanish = "Hola, ¿puedes arreglar la compilación? Lleva en rojo desde ayer.";
+  const italian = "Ciao, puoi sistemare la build? È rossa da ieri.";
+  const russian = "Привет, можешь починить сборку? Она красная со вчера.";
+  const english = "Please fix the CI";
+  const chinese = "请看一下";
+  // [the message, what the user wrote before it (newest first), the language to answer in, whether the earlier messages are read]
+  const table: Array<[string | null, string[], string | null, boolean]> = [
+    // Words in a language this cannot name: no line, whatever was written before.
+    ...[french, german, spanish, italian, russian].flatMap((message): Array<[string, string[], null, false]> => [
+      [message, [english], null, false],
+      [message, [english, chinese], null, false],
+      [message, [chinese], null, false],
+    ]),
+    // Three letters are words, two are not.
+    ["oui", [english], null, false],
+    ["Hola", [english], null, false],
+    // Too few letters to be in any language: the older messages are read, newest first.
+    ["ok", [english], "English", true],
+    ["#3", [chinese, english], "Chinese", true],
+    ["👍", [english], "English", true],
+    ["3", ["#2", english], "English", true],
+    ["ok", ["", "#2", chinese], "Chinese", true],
+    ["```\nERROR build failed\n```", [chinese], "Chinese", true],
+    ["https://example.com/a/b?c=d", [english], "English", true],
+    // Among the older messages the newest that has words decides, named or not.
+    ["ok", [french, english], null, true],
+    ["#3", ["ok", german, chinese], null, true],
+    ["ok", ["#2", spanish, english], null, true],
+    ["ok", ["#2", english, spanish], "English", true],
+    // A report is not the user's message: their words decide in the same way.
+    [null, [french, english], null, true],
+    [null, ["ok", english, french], "English", true],
+    [null, ["ok", "#2"], null, true],
+  ];
+  for (const [message, before, language, readEarlier] of table) {
+    let asked = false;
+    const answer = await languageToAnswerIn(message, () => { asked = true; return before; });
+    assert.equal(answer, language, `${JSON.stringify(message)} after ${JSON.stringify(before)}`);
+    assert.equal(asked, readEarlier, `${JSON.stringify(message)}: whether the earlier messages are read`);
+  }
+  // The reading says which of the two a message is.
+  assert.deepEqual(readLanguage(french), { language: null, hasWords: true });
+  assert.deepEqual(readLanguage("ok"), { language: null, hasWords: false });
+  assert.deepEqual(readLanguage("Please stop"), { language: "English", hasWords: true });
+  assert.deepEqual(readLanguage("好"), { language: "Chinese", hasWords: true });
+  assert.deepEqual(readLanguage(""), { language: null, hasWords: false });
 });
 
 test("L5 the line is the same every time and is added once", () => {

@@ -421,6 +421,12 @@ describe("assistant role profile", { skip }, () => {
 
     await turn("Please keep going", "user");
     assert.equal(await prompt(), `${report}\n\n[Reply language: English]`, "the newest of the user's words that has one");
+
+    await turn("Bonjour, peux-tu corriger le build s'il te plaît ?", "user");
+    assert.equal(await prompt(), report, "words in a language that cannot be named are the newest words: no line, not the English before them");
+
+    await turn("ok", "user");
+    assert.equal(await prompt(), report, "and a message that shows nothing does not look past them");
   });
 
   test("A11 the item list names each item by its id and its number", async () => {

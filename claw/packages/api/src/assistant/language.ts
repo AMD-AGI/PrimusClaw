@@ -10,10 +10,12 @@
  * the model cannot mistake for anything else.
  *
  * Deliberately small: Chinese, Japanese, Korean and English, which a script count and a short list of English function
- * words tell apart without a model or a dependency. For any other text, and for a message too short to tell (`ok`,
- * `#3`), there is no verdict and no line is added; the caller then looks at the user's earlier messages, and if they
- * say nothing either the model reads the language from the message as it always did. A wrong line would be worse than
- * none, so every rule below prefers "no verdict".
+ * words tell apart without a model or a dependency. For any other text there is no verdict and no line is added, and
+ * the model reads the language from the message as it always did. A message with too few letters to be in any language
+ * (`ok`, `#3`, an emoji) says nothing either, but it says nothing about the user's language rather than something
+ * unknown: the caller then looks at the user's earlier messages, newest first, and the first of them that has words
+ * decides, named or not (a French message after English ones is not answered in English). A wrong line would be worse
+ * than none, so every rule below prefers "no verdict".
  */
 
 export const REPLY_LANGUAGE_LABEL = "Reply language";
@@ -156,17 +158,44 @@ function opensInCjk(text: string): boolean {
   return false;
 }
 
-/** The language of one message, or null when it cannot be told. Of a long message only the start and the end are read (READ_CHARS). */
+/** Fewer letters than this are not a sentence of any language: `ok`, `#3`, `👍`. */
+const MIN_LETTERS = 3;
+
+/** Whether there are enough letters in the text to be wording in some language. */
+function hasLetters(text: string): boolean {
+  let letters = 0;
+  for (const _ of text.matchAll(/\p{L}/gu)) if (++letters >= MIN_LETTERS) return true;
+  return false;
+}
+
+export interface LanguageReading {
+  /** The language of the message, or null when it cannot be told. */
+  language: string | null;
+  /** Whether the message has wording of its own, whatever language it is in: false for `ok`, `#3` or an emoji. */
+  hasWords: boolean;
+}
+
+/** What one message says about the language: which, and whether it says anything. Of a long message only the start and the end are read (READ_CHARS). */
+export function readLanguage(message: string): LanguageReading {
+  return readLanguageOfAll(readable(message));
+}
+
+/** The language of one message, or null when it cannot be told. */
 export function detectLanguage(message: string): string | null {
-  return detectLanguageOfAll(readable(message));
+  return readLanguage(message).language;
 }
 
 /** The language of the whole of `text`, however long it is: `detectLanguage` without the limit on how much is read. Here so that a test can time what the limit would hide. */
 export function detectLanguageOfAll(whole: string): string | null {
+  return readLanguageOfAll(whole).language;
+}
+
+function readLanguageOfAll(whole: string): LanguageReading {
   const text = wording(whole);
   const outside = unquoted(text);
   // The user's own words first; what they quoted only when they said nothing besides it.
-  return judge(outside) ?? (outside === text ? null : judge(text));
+  const language = judge(outside) ?? (outside === text ? null : judge(text));
+  return { language, hasWords: language !== null || hasLetters(text) };
 }
 
 function judge(text: string): string | null {
@@ -194,16 +223,20 @@ function judge(text: string): string | null {
 /**
  * The language to answer in: the one the user's message is in, and failing that the one of what they wrote before,
  * newest first. `message` is null when the turn did not start with the user's words (a worker's report woke the
- * assistant): a report says nothing about the user's language. `earlier` is asked only when the message did not show one.
+ * assistant): a report says nothing about the user's language. `earlier` is asked only when the message has no words
+ * (`ok`, `#3`): a message with words in a language that cannot be named gets no line, not the language of older ones,
+ * and among the earlier messages the newest that has words decides in the same way.
  */
 export async function languageToAnswerIn(
   message: string | null, earlier: () => Promise<readonly string[]> | readonly string[],
 ): Promise<string | null> {
-  const own = message === null ? null : detectLanguage(message);
-  if (own) return own;
+  if (message !== null) {
+    const own = readLanguage(message);
+    if (own.hasWords) return own.language;
+  }
   for (const text of await earlier()) {
-    const language = detectLanguage(text);
-    if (language) return language;
+    const reading = readLanguage(text);
+    if (reading.hasWords) return reading.language;
   }
   return null;
 }
