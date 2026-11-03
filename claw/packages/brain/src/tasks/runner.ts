@@ -64,7 +64,7 @@ import type { ContainerProbeVerdict, HandsProbeEntry } from "../sandbox/containe
 import { checkHandsHealth } from "../sandbox/hands-health.js";
 import { restartHandsInSandbox } from "../sandbox/hands-restart.js";
 import { resolveSandboxAction } from "../sandbox/params.js";
-import { provisionTerminalOf } from "../sandbox/errors.js";
+import { provisionTerminalOf, sandboxUnavailableOf } from "../sandbox/errors.js";
 import { runScript, type ScriptProgress } from "./script-runner.js";
 import { createAppRunner } from "../apps/app-runner-wiring.js";
 import { AppRunFailedError, type AppRunOutcome } from "../apps/app-runner.js";
@@ -1254,6 +1254,15 @@ class TaskRunner {
   // which may happen much later than the read on a deferred run.
   private pendingResumeCkpt: TaskCheckpoint | null = null;
   private handsAttach: Promise<HandsClient> | null = null;
+  /**
+   * Why this run cannot have a sandbox, once opening one has ended on one of
+   * SANDBOX_UNAVAILABLE_REASONS. Every later attempt to open it is refused with
+   * this same error instead of provisioning again: the platform had no sandbox
+   * for this run after as long a wait as the deployment allows, and a second
+   * wait inside the same run is the same wait again. Per run, not per session --
+   * the next message of the session tries afresh.
+   */
+  private sandboxUnavailable: unknown = null;
   private resumeMetricsRecorded = false;
   // Set by the first successful reap, which a terminal path may do early to
   // keep a still-writing process out of its snapshot; the release on the way
@@ -2499,9 +2508,12 @@ class TaskRunner {
    * that need one from the start, and from inside the agent loop for the rest,
    * where several tool calls can race for it — hence the shared promise rather
    * than a plain `if (!this.hands)`. A failure is not cached: the tool that
-   * triggered it reports the error, and a later tool gets a fresh attempt.
+   * triggered it reports the error, and a later tool gets a fresh attempt --
+   * except a failure that says the platform has no sandbox for this run
+   * (SANDBOX_UNAVAILABLE_REASONS), which is: see `sandboxUnavailable`.
    */
   private readonly attachHands = (): Promise<HandsClient> => {
+    if (this.sandboxUnavailable) return Promise.reject(this.sandboxUnavailable);
     // The in-flight attach is consulted before the assigned client, because
     // openSandbox assigns `this.hands` and only then restores /workspace from
     // S3. A caller that read the field would be handed a sandbox whose files
@@ -2512,11 +2524,52 @@ class TaskRunner {
     // cached and how a rebuild is not undone: `recreateHands` replaces
     // `this.hands` without coming through here, so a retained promise would keep
     // handing out the sandbox the rebuild has already destroyed.
-    this.handsAttach = this.openSandbox().finally(() => {
+    this.handsAttach = this.openSandbox().catch(async (err: unknown) => {
+      await this.settleUnavailableOpen(err);
+      throw err;
+    }).finally(() => {
       this.handsAttach = null;
     });
     return this.handsAttach;
   };
+
+  /**
+   * An open that ended because the platform cannot give this run a sandbox: stop
+   * offering it another, and clean up the one it left behind.
+   *
+   * The latch is set before anything awaited, so a tool call racing this one
+   * cannot slip in a second provision while the clean-up runs.
+   *
+   * The clean-up is the failure path's own, in its own order -- the platform's
+   * account, the handle onto the row, then the reap -- run here because a failed
+   * open is not always the end of the run. Opened lazily, which is the default
+   * for a chat turn, the failure is a tool error the model reads and the run
+   * carries on, so the failure path never comes and nothing would reap the
+   * workload (the next open's stale-entry check used to, which the latch now
+   * stops from happening). Run on the eager path as well it does what that path
+   * would have done a moment later, and the failure path finds nothing left to
+   * redo.
+   *
+   * The platform is not asked about an unschedulable workload: it never ran,
+   * the provider has already stopped it, and what the platform would then say of
+   * it is our own stop.
+   */
+  private async settleUnavailableOpen(err: unknown): Promise<void> {
+    const unavailable = sandboxUnavailableOf(err);
+    if (!unavailable) return;
+    this.sandboxUnavailable = err;
+    logger.warn(
+      { sessionId: this.sessionId, messageId: this.messageId, reason: unavailable.reason },
+      "task.sandbox_unavailable_latched",
+    );
+    try {
+      if (unavailable.reason !== "sandbox_unschedulable") await this.capturePlatformFacts();
+      await this.recordSandboxBeforeReap();
+      await this.reapOwnPendingHands();
+    } catch (e) {
+      logger.warn({ err: e, sessionId: this.sessionId }, "task.sandbox_unavailable_cleanup_failed");
+    }
+  }
 
   private async openSandbox(): Promise<HandsClient> {
     // Multi-node: provision the GPU cluster before the Hands sandbox, via

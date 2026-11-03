@@ -19,6 +19,7 @@ import {
   AGENT_SANDBOX_MAX_SESSION_SECONDS,
   SANDBOX_NAMESPACE,
   SANDBOX_WORKLOAD_PRIORITY,
+  SANDBOX_UNSCHEDULABLE_TIMEOUT_MS,
   AUTH_INTERNAL_TOKEN,
 } from "../config.js";
 import {
@@ -33,6 +34,7 @@ import { EXEC_TRANSPORT_SLACK_MS, parseExecTimeoutMs } from "./provider.js";
 import { sandboxWorkloadName } from "./workload-naming.js";
 import { fetchThroughRouters, safeHandsBaseUrl, sandboxRouterBasesFor } from "./sandbox-router.js";
 import { waitForWorkloadReady, type WorkloadWaitDeps, type WorkloadWaitOptions } from "./workload-wait.js";
+import { describeWaiting } from "./workload-stall.js";
 import type {
   SandboxProvider,
   SandboxCreateParams,
@@ -144,12 +146,19 @@ export class SafeWorkloadProvider implements SandboxProvider {
     await pollWorkloadUntilRunning(workloadId, apiKey, params.onEvent, undefined, "hands", {
       signal: params.signal,
       reclaimOnAbort: params.reclaimOnAbort,
-      // Only for a cancelled run, which the failure path does not reap. Every
+      // The sandbox a run opens gives up early on an admitted workload that no
+      // node will run; see SANDBOX_UNSCHEDULABLE_TIMEOUT_MS.
+      unschedulableTimeoutMs: SANDBOX_UNSCHEDULABLE_TIMEOUT_MS,
+      // For a cancelled run, which the failure path does not reap, and for an
+      // unschedulable one, which has nothing to wait for or learn from: no pod
+      // ever ran, so the platform has no account of it that the failure path
+      // would be reading, and a lazily opened sandbox (the default for a chat
+      // turn) never reaches a failure path that would reap it at all. Every
       // other ending keeps its existing handling: the failure path reaps the
       // PENDING workload after it has read the platform's account of it
       // (sandbox_start_timeout included), and the reaper covers the rest.
       onGiveUp: async ({ reason }) => {
-        if (reason !== "sandbox_wait_interrupted") return;
+        if (reason !== "sandbox_wait_interrupted" && reason !== "sandbox_unschedulable") return;
         await this.stop({
           provider: "safe-workload", id: workloadId, sandboxName: workloadId,
           namespace: ns, handsBaseUrl: "", platformKey: apiKey,
@@ -324,7 +333,7 @@ export async function pollWorkloadUntilRunning(
   /** Event-name prefix of the wait's logs (`<prefix>.poll_error`); `hands` unless another owner says so. */
   logPrefix = "hands",
   /** The run's cancel signal, and what to do with the workload when the wait is given up. */
-  wait?: Pick<WorkloadWaitOptions, "signal" | "onGiveUp" | "reclaimOnAbort">,
+  wait?: Pick<WorkloadWaitOptions, "signal" | "onGiveUp" | "reclaimOnAbort" | "unschedulableTimeoutMs">,
 ): Promise<void> {
   await onEvent?.({ type: "sandboxStatus", event: "phase", phase: "Creating", status: "creating", log: "" });
 
@@ -336,22 +345,31 @@ export async function pollWorkloadUntilRunning(
     onReady: async ({ queuePosition }) => {
       await onEvent?.({ type: "sandboxStatus", event: "phase", phase: "Running", status: "running", queuePosition });
     },
-    onTerminal: async ({ phase, status, reason }) => {
-      await onEvent?.({ type: "sandboxStatus", event: "phase", phase, status, reason });
+    onTerminal: async ({ phase, status, reason, message }) => {
+      await onEvent?.({
+        type: "sandboxStatus", event: "phase", phase, status, reason,
+        ...(message ? { message } : {}),
+      });
     },
-    onProgress: async ({ phase, queuePosition }) => {
+    onProgress: async ({ phase, queuePosition, waiting }) => {
       await onEvent?.({
         type: "sandboxStatus",
         event: "phase",
         phase: phase || "Pending",
         status: "pending",
         queuePosition,
-        log: `Waiting in queue (position ${queuePosition})`,
+        // The platform's own account of why, when it gave one, so what the user
+        // reads says what the sandbox is waiting for and not only that it waits.
+        // `waiting` and `waitReason` are additive: a consumer that reads only
+        // `log` gets the sentence, one that reads fields gets the parts.
+        log: waiting ? describeWaiting(waiting, queuePosition) : `Waiting in queue (position ${queuePosition})`,
+        ...(waiting ? { waiting: waiting.kind, waitReason: waiting.reason } : {}),
       });
     },
     signal: wait?.signal,
     reclaimOnAbort: wait?.reclaimOnAbort,
     onGiveUp: wait?.onGiveUp,
+    unschedulableTimeoutMs: wait?.unschedulableTimeoutMs,
     deps,
   });
 }
