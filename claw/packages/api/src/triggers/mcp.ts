@@ -116,7 +116,9 @@ export const triggerToolSettings = { enabled: CLAW_TRIGGER_TOOLS_ENABLED, key: C
  * a trigger's run is an ordinary session with the owner's keys in its sandbox. A turn does not depend on them: on any failure the tools are simply not offered.
  */
 export async function applyTriggerToolsToTask(task: Record<string, unknown>, sessionId: string): Promise<void> {
-  if (!triggerToolSettings.enabled) return;
+  // A turn already marked keyless keeps the mark even when the session reads as ordinary now (the review feature
+  // turned off after it was queued); its model is still one that reads what strangers wrote.
+  if (!triggerToolSettings.enabled || task.withhold_sandbox_keys === true) return;
   const taskId = typeof task.task_id === "string" ? task.task_id : "";
   const messageId = typeof task.message_id === "string" ? task.message_id : "";
   if (!taskId || !messageId) return;

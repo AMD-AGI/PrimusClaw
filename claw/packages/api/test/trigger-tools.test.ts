@@ -263,6 +263,10 @@ describe("trigger tools", { skip }, () => {
 
     const actingSid = await chatSession("alice", { acting_as: "bob" });
     assert.equal(await offered(actingSid, await turn(actingSid)), undefined, "a session acting as a user is not offered them");
+    assert.equal(
+      await offered(sid, await turn(sid), { withhold_sandbox_keys: true }), undefined,
+      "a turn already marked keyless is not offered them, whatever its session reads as now",
+    );
 
     const alice = await w.user("alice");
     assert.equal(await offered(alice.routerSid, await w.routerTurn(alice)), undefined, "a router keeps to its own tools");
