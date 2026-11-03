@@ -20,6 +20,7 @@ import { bashApprovalFromEnvValue, bashApprovalPolicyFrom } from "./bash-approva
 import { DecisionDispatcher } from "../delivery/decision-dispatcher.js";
 import { connectPlatformMcp } from "../clients/mcp.js";
 import { buildPrompt, buildProgressiveSkillHint, listProgressiveSkills } from "./prompt.js";
+import { SkillStore } from "./skill-store.js";
 import { loadPlatformDefaults, resolveDefaultSkills, skillDescription, LazyDefaultSkills, type DefaultSkill } from "./platform-defaults.js";
 import { metrics } from "../infra/metrics.js";
 import { createAnthropicClient } from "../llm/anthropic-provider.js";
@@ -206,7 +207,7 @@ export class AgentEngine {
     // contains is one the agent cannot know to use.
     const pluginProgressive = PROGRESSIVE_SKILLS_ENABLED
       ? (() => {
-          const fits = new Set(listProgressiveSkills([...defaultProgressive, ...pluginSkills], sessionDir).listed.map((s) => s.name));
+          const fits = new Set(listProgressiveSkills([...defaultProgressive, ...pluginSkills]).listed.map((s) => s.name));
           return pluginSkills.filter((s) => fits.has(s.name));
         })()
       : [];
@@ -340,6 +341,8 @@ export class AgentEngine {
           ? new WebFetchService(webToolCtx) : undefined,
       }, sandbox);
       router.lazySkillWriter = lazySkills;
+      // The listed skills are Brain's to hand over: `load_skill` serves them without a sandbox.
+      if (progressiveSkills.length) router.skillStore = new SkillStore([...defaultProgressive, ...pluginProgressive], `${sessionDir}/.skills`);
       router.memoryEnabled = request.memory_enabled !== false;
       // Whom an identity-authenticated a2a_call peer is called as, and when the run's budget ends.
       const deadlineMs = request.deadline_at ? Date.parse(request.deadline_at) : NaN;

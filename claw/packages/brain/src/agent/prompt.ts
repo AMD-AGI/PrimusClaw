@@ -4,6 +4,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { A2A_CLIENT_ENABLED, RULES_DIR, SAFETY_PREAMBLE_ENABLED } from "../config.js";
+import { LOAD_SKILL_TOOL } from "./skill-store.js";
 
 const SAFETY_PREAMBLE_FILE = path.join(RULES_DIR, "safety-preamble.txt");
 const EXECUTION_POLICY_FILE = path.join(RULES_DIR, "execution-policy.txt");
@@ -57,13 +58,11 @@ const PROGRESSIVE_MAX_CHARS = 8000;
  */
 export function listProgressiveSkills(
   skills: ProgressiveSkill[],
-  sessionDir = "",
 ): { listed: ProgressiveSkill[]; omitted: number; lines: string } {
-  const skillBase = sessionDir ? `${sessionDir}/.skills` : ".skills";
   let lines = "";
   const listed: ProgressiveSkill[] = [];
   for (const s of skills) {
-    const line = `\n  - ${s.name}: ${s.description}   [read ${skillBase}/${s.name}/SKILL.md]`;
+    const line = `\n  - ${s.name}: ${s.description}`;
     if (listed.length >= PROGRESSIVE_MAX_ENTRIES || lines.length + line.length > PROGRESSIVE_MAX_CHARS) break;
     lines += line;
     listed.push(s);
@@ -72,18 +71,23 @@ export function listProgressiveSkills(
 }
 
 /**
- * The on-demand skill list: one line per skill, no body. The agent reads
- * SKILL.md itself when a description matches; the file is written into the
- * sandbox on that first read. Descriptions are untrusted marketplace text and
- * are only concatenated here.
+ * The on-demand skill list: one line per skill, no body. The agent loads a
+ * skill with the `load_skill` tool when a description matches; Brain serves it
+ * from its own copy, so no sandbox is involved. The skill's files reach the
+ * sandbox only when a command there first names `.skills`, which is where its
+ * scripts run from. Descriptions are untrusted marketplace text and are only
+ * concatenated here.
  */
 export function buildProgressiveSkillHint(skills: ProgressiveSkill[], sessionDir = ""): string {
   if (!skills.length) return "";
-  const { omitted, lines } = listProgressiveSkills(skills, sessionDir);
+  const { omitted, lines } = listProgressiveSkills(skills);
+  const skillBase = sessionDir ? `${sessionDir}/.skills` : ".skills";
   let hint = `\n- Platform Skills (load on demand):${lines}`;
   if (omitted > 0) hint += `\n  - (${omitted} more skills not listed)`;
-  hint += `\nBefore starting a task, if a skill's description matches, read its SKILL.md with the read tool and follow it. `;
-  hint += `Supporting files live next to SKILL.md in the same directory; read them only when SKILL.md points to them.`;
+  hint += `\nBefore starting a task, if a skill's description matches, load it with the ${LOAD_SKILL_TOOL} tool (name = the skill's name) and follow it. `;
+  hint += `Loading a skill needs no sandbox: do not read or cat its files for that. Other files of a skill are listed at the end of its SKILL.md; `;
+  hint += `load one with ${LOAD_SKILL_TOOL} (name and file) only when SKILL.md points to it. `;
+  hint += `A skill's scripts run in the sandbox with bash, from ${skillBase}/<name>/.`;
   return hint;
 }
 

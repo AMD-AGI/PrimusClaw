@@ -440,6 +440,18 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- Reading a skill no longer starts a sandbox. With `PROGRESSIVE_SKILLS_ENABLED`, the prompt told the model to open
+  `/workspace/.skills/<name>/SKILL.md` with the `read` tool, which made Brain provision a sandbox for a file read:
+  a turn that called an MCP tool and then needed the skill waited for a pod, and on a cluster that could not
+  schedule one (all sandbox nodes unschedulable) the user watched a progress bar for minutes before Brain gave up
+  after ~15 minutes. A skill is instructions for the model, so Brain now serves it: the listed skills are loaded
+  with a new `load_skill` tool (`name`, optional `file`) from Brain's own staged copy, with no sandbox, and the
+  prompt says so instead of giving a path to read. SKILL.md comes back with the skill's other files and the sandbox
+  path its scripts run from. The sandbox is for running things: a skill's files, scripts included, are still
+  written into it the first time a sandbox tool names `.skills`, so running a script starts a sandbox as before, and
+  a model that reads a `.skills` path with `read` or `bash` still gets the file. `load_skill` is offered only when
+  the prompt lists skills, is allowed in plan mode and for the `readonly` and `explore` sub-agents, and is subject
+  to `tools_allowlist`.
 - A caller authenticated by an identity provider's access token (`CLAW_IDENTITY_TOKEN_AUTH_ENABLED`) now has
   the platform key and the virtual key SaFE holds for the token's subject, in the SaFE deployment mode. SaFE is never
   shown the person's token: the API exchanges it at the provider (RFC 8693 service delegation, subject token type

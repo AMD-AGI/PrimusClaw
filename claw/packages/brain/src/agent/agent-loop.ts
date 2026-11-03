@@ -620,7 +620,7 @@ const SETUP_CMD_RE =
 
 /** Plan mode read-only allowlist (§5.7) */
 const PLAN_MODE_ALLOWLIST = new Set([
-  "read", "glob", "grep", "ls", "web_search", "web_fetch",
+  "read", "glob", "grep", "ls", "web_search", "web_fetch", "load_skill",
   "bash_output", "todo_write", "exit_plan_mode", "ask_user_question",
 ]);
 

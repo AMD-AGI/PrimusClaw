@@ -16,6 +16,7 @@ import {
 } from "../config.js";
 import type { WebSearchService } from "./web/search.js";
 import type { WebFetchService } from "./web/fetch.js";
+import { LOAD_SKILL_TOOL, type SkillStore } from "../agent/skill-store.js";
 
 /**
  * The bash timeout ceiling the schema states.
@@ -100,6 +101,20 @@ const LOOP_INTERCEPTED_TOOLS = new Set([
   "exit_plan_mode",
   "ask_user_question",
 ]);
+
+/** The tool that hands the model a skill the prompt listed; offered only when one is listed. */
+function loadSkillSchema(): ToolSchema {
+  return {
+    name: LOAD_SKILL_TOOL,
+    description: "Load a skill listed under 'Platform Skills' in the prompt: with only `name` you get its SKILL.md (instructions, plus the list of its other files); with `file` you get one of those files. Served without a sandbox, so use it, not read or bash, to read a skill. Run a skill's scripts with bash.",
+    input_schema: {
+      type: "object", properties: {
+        name: { type: "string", description: "The skill's name, as listed in the prompt" },
+        file: { type: "string", description: "Path of a text file inside the skill's directory, e.g. references/api.md; omit for SKILL.md" },
+      }, required: ["name"],
+    },
+  };
+}
 
 export interface WebToolServices {
   webSearch?: WebSearchService;
@@ -199,6 +214,15 @@ export class ToolRouter {
    */
   lazySkillWriter?: { ensure(hands: HandsClient, text: string, coldSandbox: boolean): Promise<void> };
 
+  /**
+   * The skills the prompt lists, served to the model by `load_skill` from Brain's
+   * own copy. Set by the engine only when the prompt lists skills; absent, the
+   * tool is not offered and not routed. It never reaches a sandbox, so a turn
+   * that only loads a skill and calls MCP tools starts none. Inherited by
+   * children, like the writer.
+   */
+  skillStore?: SkillStore;
+
   constructor(
     private hands: HandsClient | null,
     private platformMcp: Map<string, { callTool: (name: string, args: Record<string, unknown>) => Promise<string> }> = new Map(),
@@ -278,6 +302,7 @@ export class ToolRouter {
   /** Register a child router so subsequent setHands() cascades to it. */
   registerChild(child: ToolRouter): void {
     child.lazySkillWriter = this.lazySkillWriter;
+    child.skillStore = this.skillStore;
     child.a2aContext = this.a2aContext;
     this.children.add(child);
   }
@@ -431,6 +456,18 @@ export class ToolRouter {
       return `File '${filePath}' queued to remove from skill '${skillName}'.`;
     }
 
+    // Before any sandbox branch: the skill is Brain's to give, and this call must
+    // never be the reason a sandbox is opened.
+    if (name === LOAD_SKILL_TOOL && this.skillStore) {
+      const skillName = typeof input.name === "string" ? input.name : "";
+      const file = typeof input.file === "string" ? input.file : undefined;
+      const loaded = await this.skillStore.load(skillName, file);
+      if (!loaded.ok) return refuse(outcome, loaded.error);
+      // Same rule as a read of `.skills/<name>/SKILL.md`: the skill counts as used when its SKILL.md was.
+      if (file === undefined || file === "" || file === "SKILL.md") this.skillsRead.add(skillName);
+      return loaded.text;
+    }
+
     if (!BG_SHELL_ENABLED && isBackgroundShellCall(name, input)) {
       return refuse(outcome, BG_SHELL_DISABLED_MESSAGE);
     }
@@ -495,7 +532,8 @@ export class ToolRouter {
    */
   getToolSchemas(): ToolSchema[] {
     const all = this.allToolSchemas();
-    return this.memoryEnabled ? all : all.filter((t) => t.name !== "save_memory");
+    const out = this.memoryEnabled ? all : all.filter((t) => t.name !== "save_memory");
+    return this.skillStore ? [...out, loadSkillSchema()] : out;
   }
 
   private allToolSchemas(): ToolSchema[] {

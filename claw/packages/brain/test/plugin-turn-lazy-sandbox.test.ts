@@ -182,6 +182,7 @@ test("progressive OFF: every plugin skill body is still inlined and no on-demand
   assert.ok(r.prompt.includes("BOARD-BODY-MARKER") && r.prompt.includes("FLEET-BODY-MARKER"));
   assert.match(r.prompt, /=== SKILL: board-ops \(SKILL\.md\) ===/);
   assert.ok(!r.prompt.includes("load on demand"));
+  assert.ok(!r.prompt.includes("load_skill"), "nothing is listed, so the tool that serves a listed skill is not offered");
   assert.equal(r.attached, 0);
 });
 
