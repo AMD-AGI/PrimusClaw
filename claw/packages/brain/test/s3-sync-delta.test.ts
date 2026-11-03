@@ -16,9 +16,9 @@
  * paths are redirected from /workspace and /tmp/.claw-s3-sync into a temp dir.
  * What is asserted is the thing that matters: which files were sent to S3.
  *
- * The prune afterwards talks to an object store that is not there (connection
- * refused) and is caught, which is what a prune failure does in production; its
- * own behaviour is pinned in s3-prune.test.ts.
+ * The prune afterwards talks to `store`, an in-memory object store holding what
+ * the stand-in's `upload_to_s3` was sent, so what it lists and deletes can be
+ * counted; which objects it may delete is pinned in s3-prune.test.ts.
  */
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
@@ -28,15 +28,57 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { fileURLToPath } from "node:url";
 
-process.env.S3_API_ENDPOINT = "http://127.0.0.1:1";
-process.env.S3_SANDBOX_ENDPOINT = "http://127.0.0.1:1";
+/**
+ * The bucket: keys only, which is all a prune reads. Lists and deletes are
+ * counted, and `failDeletes` makes it refuse every delete the way a store
+ * under trouble does.
+ */
+const store = { objects: new Set<string>(), lists: 0, deletes: [] as string[], failDeletes: false };
+const s3 = createServer((req, res) => {
+  const url = new URL(req.url ?? "/", "http://s3.test");
+  const key = decodeURIComponent(url.pathname.replace(/^\/claw\//, ""));
+  if (req.method === "GET" && url.searchParams.get("list-type") === "2") {
+    store.lists++;
+    const prefix = url.searchParams.get("prefix") ?? "";
+    const keys = [...store.objects].filter((k) => k.startsWith(prefix)).sort();
+    res.setHeader("Content-Type", "application/xml");
+    res.end(`<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>claw</Name><Prefix>${prefix}</Prefix>`
+      + `<KeyCount>${keys.length}</KeyCount><IsTruncated>false</IsTruncated>`
+      + keys.map((k) => `<Contents><Key>${k}</Key><Size>1</Size></Contents>`).join("")
+      + "</ListBucketResult>");
+    return;
+  }
+  if (req.method === "DELETE") {
+    store.deletes.push(key);
+    if (store.failDeletes) {
+      res.statusCode = 403;
+      res.setHeader("Content-Type", "application/xml");
+      res.end("<Error><Code>AccessDenied</Code><Message>refused</Message></Error>");
+      return;
+    }
+    store.objects.delete(key);
+    res.statusCode = 204;
+    res.end();
+    return;
+  }
+  res.statusCode = 400;
+  res.end();
+});
+await new Promise<void>((r) => s3.listen(0, "127.0.0.1", r));
+s3.unref();
+const s3Url = `http://127.0.0.1:${(s3.address() as AddressInfo).port}`;
+
+process.env.S3_API_ENDPOINT = s3Url;
+process.env.S3_SANDBOX_ENDPOINT = s3Url;
 process.env.S3_ACCESS_KEY = "AK";
 process.env.S3_SECRET_KEY = "SK";
 process.env.S3_BUCKET = "claw";
 
-const { syncWorkspaceToS3, syncLeftSnapshot } = await import("../src/workspace/s3-uploader.js");
+const { syncWorkspaceToS3, syncWorkspaceFromS3, syncLeftSnapshot } = await import("../src/workspace/s3-uploader.js");
 const {
   finishedOutput, invalidateSyncManifest, parseDigestListing, parseStatListing, planUploadDelta, SYNC_STATE_DIR,
 } = await import("../src/workspace/sync-delta.js");
@@ -66,6 +108,8 @@ class Sandbox {
   /** When set, `write` refuses, the way Hands' does: as text, not by throwing. */
   writeRefused = false;
   uploadDelayMs = 0;
+  /** When set, `download_from_s3` fails every file. */
+  failDownloads = false;
   inFlight = 0;
   maxInFlight = 0;
   private clock = 1_700_000_000;
@@ -135,6 +179,16 @@ class Sandbox {
         return `Written to ${args.path}`;
       }
       if (tool === "log_s3_upload_manifest") return JSON.stringify({ ok: true });
+      if (tool === "download_from_s3") {
+        // Every file comes down with the same bytes; what is under test is what the
+        // restore leaves behind for the next sync, not the copy.
+        const files = (args.files as Array<{ local_path: string }>).map((f) => f.local_path);
+        if (this.failDownloads) {
+          return JSON.stringify({ ok: [], failed: files.map((path) => ({ path, status: 500, error: "injected" })), total: files.length });
+        }
+        for (const f of files) this.put(f.replace("/workspace/", ""), "restored");
+        return JSON.stringify({ ok: files, failed: [], total: files.length });
+      }
       if (tool === "upload_to_s3") {
         const files = args.files as Array<{ local_path: string }>;
         this.batches.push(files.map((f) => f.local_path));
@@ -143,6 +197,11 @@ class Sandbox {
         if (this.uploadDelayMs) await new Promise((r) => setTimeout(r, this.uploadDelayMs));
         this.inFlight--;
         const ok = files.map((f) => f.local_path).filter((p) => !this.failPaths.has(p));
+        for (const f of files) {
+          if (!this.failPaths.has(f.local_path)) {
+            store.objects.add(decodeURIComponent(new URL((f as { presigned_url: string }).presigned_url).pathname.replace(/^\/claw\//, "")));
+          }
+        }
         const failed = files.map((f) => f.local_path).filter((p) => this.failPaths.has(p))
           .map((path) => ({ path, status: 500, error: "injected" }));
         return JSON.stringify({ ok, failed, total: files.length });
@@ -951,4 +1010,165 @@ test("W1 the checkpoint recovery forgets the record after it copies a snapshot o
   const call = body.search(/await invalidateSyncManifest\(this\.hands, sessionPrefix(, \d+)?\)/);
   assert.ok(copy > 0);
   assert.ok(call > copy, "the record for the session prefix is invalidated, after the copy");
+});
+
+// ===== the prune names what the record says is gone, instead of listing the prefix =====
+
+/** What the sandbox's record says about the prune, per shard. */
+function recordPruned(sb: Sandbox): boolean[] {
+  return sb.manifestFiles().map((f) => JSON.parse(readFileSync(join(sb.state, f), "utf-8")).pruned);
+}
+
+test("L1 after one listing, a sync deletes a removed file by name and lists nothing", async () => {
+  // Measured on the live fleet: listing a 1,500-object prefix on its MinIO takes
+  // about 45 s, and every sync did it, so a turn that changed one file -- or
+  // none -- still held its session busy for most of a minute after the answer.
+  const sb = threeFiles();
+  store.lists = 0;
+  await sb.sync();
+  assert.equal(store.lists, 1, "a first sync has no record to go by, so it lists");
+  assert.ok(store.objects.has("users/user-1/sessions/sess-1/dir/c.txt"));
+  assert.deepEqual(recordPruned(sb), [true]);
+
+  store.lists = 0;
+  store.deletes = [];
+  sb.remove("dir/c.txt");
+  await sb.sync();
+  assert.equal(store.lists, 0, "the record named everything the prefix held");
+  assert.deepEqual(store.deletes, ["users/user-1/sessions/sess-1/dir/c.txt"]);
+  assert.equal(store.objects.has("users/user-1/sessions/sess-1/dir/c.txt"), false);
+  assert.ok(store.objects.has("users/user-1/sessions/sess-1/a.txt"), "and only what is gone");
+
+  store.deletes = [];
+  await sb.sync();
+  assert.equal(store.lists, 0, "nor does a sync with nothing changed");
+  assert.deepEqual(store.deletes, []);
+});
+
+test("L2 a prune that could not delete everything leaves a record the next sync does not prune by", async () => {
+  // Whatever it failed to delete is in S3 and no longer in the record, so only a
+  // listing can find it again.
+  const sb = threeFiles();
+  await sb.sync();
+  sb.remove("dir/b.txt");
+  store.failDeletes = true;
+  try {
+    await sb.sync();
+  } finally {
+    store.failDeletes = false;
+  }
+  assert.ok(store.objects.has("users/user-1/sessions/sess-1/dir/b.txt"), "the delete was refused");
+  assert.deepEqual(recordPruned(sb), [false]);
+
+  store.lists = 0;
+  await sb.sync();
+  assert.equal(store.lists, 1, "the record cannot account for the prefix, so the prefix is listed");
+  assert.equal(store.objects.has("users/user-1/sessions/sess-1/dir/b.txt"), false, "and the leftover goes");
+  assert.deepEqual(recordPruned(sb), [true], "after which the record can be pruned by again");
+});
+
+test("L3 a record written before the prune said anything is not pruned by", async () => {
+  // What a sandbox holds from a Brain that did not write the flag.
+  const sb = threeFiles();
+  await sb.sync();
+  for (const f of sb.manifestFiles()) {
+    const p = join(sb.state, f);
+    const shard = JSON.parse(readFileSync(p, "utf-8"));
+    delete shard.pruned;
+    writeFileSync(p, `${JSON.stringify(shard)}\n`);
+  }
+
+  store.lists = 0;
+  sb.remove("a.txt");
+  await sb.sync();
+  assert.equal(store.lists, 1);
+  assert.equal(store.objects.has("users/user-1/sessions/sess-1/a.txt"), false);
+});
+
+/**
+ * A workspace with a file and a four-file repository, whose measurement reports
+ * `measured` files for it. Answered here because the stand-in's paths are not
+ * /workspace, and the measurement prints its paths hex-encoded where the
+ * stand-in cannot map them back.
+ */
+function withRepo(measured = 4): Sandbox {
+  const sb = new Sandbox();
+  sb.put("a.txt", "alpha");
+  for (const f of ["HEAD", "config", "objects/1", "objects/2"]) sb.put(`repo/.git/${f}`, f);
+  sb.reply = (command) => command.includes("__CLAW_GIT_PROBE_EOF__")
+    ? `__claw_git_begin__\n40 ${measured} ${Buffer.from("/workspace/repo/.git").toString("hex")}\n__claw_git_end__:0\n`
+    : undefined;
+  return sb;
+}
+const ROOMY = { maxBytes: 1 << 30, maxFiles: 1000, totalBytes: 1 << 30, totalFiles: 1000 };
+const TIGHT = { ...ROOMY, maxFiles: 2 };
+
+test("L4 a repository over the bound keeps objects the record stops naming, so that record is not pruned by", async () => {
+  const sb = withRepo();
+  await syncWorkspaceToS3(sb.client, "sess-1", "user-1", { gitLimits: ROOMY });
+  assert.deepEqual(recordPruned(sb), [true]);
+  assert.ok(store.objects.has("users/user-1/sessions/sess-1/repo/.git/HEAD"));
+
+  // Over the bound now: left out of the listing, its objects spared by the prune.
+  await syncWorkspaceToS3(sb.client, "sess-1", "user-1", { gitLimits: TIGHT });
+  assert.ok(store.objects.has("users/user-1/sessions/sess-1/repo/.git/HEAD"), "spared, not pruned");
+  assert.deepEqual(recordPruned(sb), [false], "and the next record no longer names them");
+});
+
+test("L5 a repository the listing held back from the upload keeps objects the record does not name either", async () => {
+  // The measurement says one file, the listing finds four: `enforceListedGit`
+  // holds the repository back from the upload, but it is still listed, so the
+  // prune keeps its objects -- which the record then does not name.
+  const sb = withRepo(1);
+  await syncWorkspaceToS3(sb.client, "sess-1", "user-1", { gitLimits: ROOMY });
+  assert.deepEqual(recordPruned(sb), [true]);
+  sb.put("a.txt", "ALPHA");
+  await syncWorkspaceToS3(sb.client, "sess-1", "user-1", { gitLimits: TIGHT });
+  assert.ok(store.objects.has("users/user-1/sessions/sess-1/repo/.git/HEAD"));
+  assert.deepEqual(recordPruned(sb), [false]);
+});
+
+/** A session prefix as a sandbox that went away left it: two workspace files, a transcript, a stale bootstrap artifact. */
+function leftBehind(): void {
+  for (const k of [...store.objects]) if (k.startsWith("users/user-1/sessions/sess-1/")) store.objects.delete(k);
+  for (const rel of ["kept.txt", "gone.txt", ".transcripts/claw-1.jsonl", ".hands-binary"]) {
+    store.objects.add(`users/user-1/sessions/sess-1/${rel}`);
+  }
+}
+
+test("L6 a sandbox restored from S3 syncs without listing again what its restore just listed", async () => {
+  // The first sync of a recreated sandbox (after an idle reclaim, say) used to
+  // list the prefix the restore had listed moments before.
+  leftBehind();
+  const sb = new Sandbox();
+  store.lists = 0;
+  await syncWorkspaceFromS3(sb.client, "sess-1", "user-1");
+  assert.equal(store.lists, 1, "the restore's own listing");
+  assert.ok(existsSync(join(sb.root, "gone.txt")));
+
+  sb.remove("gone.txt");
+  store.deletes = [];
+  await sb.sync();
+  assert.equal(store.lists, 1, "the sync went by what the restore found");
+  assert.deepEqual(store.deletes.sort(), [
+    "users/user-1/sessions/sess-1/.hands-binary",
+    "users/user-1/sessions/sess-1/gone.txt",
+  ], "what was not restored is still what a listing prune would have deleted");
+  assert.ok(store.objects.has("users/user-1/sessions/sess-1/.transcripts/claw-1.jsonl"), "a transcript is not the workspace's");
+  assert.ok(sb.uploaded.includes("/workspace/kept.txt"),
+    "a restored file is uploaded again: the record knows it is in S3, not that it is unchanged");
+});
+
+test("L7 a restore that did not bring everything back leaves the next sync to list the prefix", async () => {
+  leftBehind();
+  const sb = new Sandbox();
+  sb.failDownloads = true;
+  await syncWorkspaceFromS3(sb.client, "sess-1", "user-1");
+  sb.failDownloads = false;
+  assert.deepEqual(sb.manifestFiles(), [], "no record");
+
+  sb.put("new.txt", "new");
+  store.lists = 0;
+  await sb.sync();
+  assert.equal(store.lists, 1);
 });
