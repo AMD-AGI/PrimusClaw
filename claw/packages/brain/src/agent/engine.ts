@@ -147,14 +147,22 @@ export class AgentEngine {
     if (platformKey) envOverrides.SAFE_API_KEY = platformKey;
     // Platform defaults sit under everything else: a request, tool or plugin
     // server of the same name wins. Unset file -> `defaults` is null and none
-    // of this runs.
+    // of this runs. Only the defaults file is the operator's, so only its
+    // servers may read the environment (the names it lists); the rest are
+    // written by requesters and tool authors.
     const defaults = PLATFORM_DEFAULTS_FILE ? loadPlatformDefaults() : null;
-    const mergedMcp = normalizeMcpConfigs({
-      ...(defaults?.mcpServers || {}),
+    const authoredMcp = {
       ...(request.mcp_servers || {}),
       ...resolved.mcpServers,
       ...pluginLayer.mcpServers,
-    }, envOverrides);
+    };
+    const defaultMcp = Object.fromEntries(
+      Object.entries(defaults?.mcpServers || {}).filter(([name]) => !(name in authoredMcp)),
+    );
+    const mergedMcp = {
+      ...normalizeMcpConfigs(defaultMcp, envOverrides, defaults?.mcpEnvAllow),
+      ...normalizeMcpConfigs(authoredMcp, envOverrides),
+    };
 
     const allSkills: Record<string, string> = {};
     const skillSources: Record<string, "plugin" | "local" | "marketplace"> = {};

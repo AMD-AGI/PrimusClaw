@@ -34,6 +34,7 @@ import { publicSessionRow } from "../events/redaction.js";
 import { archiveSession, unarchiveSession } from "../sessions/archive.js";
 import { getChangesPatch, getChangesSummary, type ChangesFailure } from "../sessions/changes-service.js";
 import { parseSessionModel } from "../sessions/session-model.js";
+import { refuseRequestMcpServers } from "../sessions/request-mcp-servers.js";
 import {
   isUserEnvKeyAllowed,
   validateTopology, type EnvironmentTopology,
@@ -1238,6 +1239,8 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         workspaceId: fmWorkspaceId,
         mcpServers: (fm.mcp_servers as Record<string, Record<string, unknown>>) || undefined,
       };
+      const mcpRefused = await refuseRequestMcpServers(fm.mcp_servers);
+      if (mcpRefused) return reply.status(400).send({ ok: false, error: `message.${mcpRefused}` });
     }
 
     const sessionEnvResult = parseSessionEnv(body.env);
@@ -1765,6 +1768,8 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         ? workspaceIdRaw.trim()
         : undefined;
     const mcpServers = (body.mcp_servers as Record<string, Record<string, unknown>>) || undefined;
+    const mcpRefused = await refuseRequestMcpServers(body.mcp_servers);
+    if (mcpRefused) return reply.status(400).send({ ok: false, error: mcpRefused });
 
     // What the run needs beyond a sandbox, declared rather than written into
     // the prompt as Hyperloom flags. Refused here rather than downgraded:

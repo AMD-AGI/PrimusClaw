@@ -103,6 +103,25 @@ test("loader: valid file loads and a changed mtime reloads it", () => {
   assert.deepEqual(loadPlatformDefaults(f)?.skills, [{ toolId: 6, name: undefined }]);
 });
 
+test("loader: mcp_env_allow is a list of placeholder names, and anything else rejects the file", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pd-load-"));
+  const f = path.join(dir, "d.json");
+  const rows: Array<{ allow: unknown; want: string[] | null }> = [
+    { allow: undefined, want: [] },
+    { allow: ["TAVILY_API_KEY", "MY_HOST"], want: ["TAVILY_API_KEY", "MY_HOST"] },
+    { allow: "TAVILY_API_KEY", want: null },
+    { allow: ["tavily"], want: null },
+    { allow: [5], want: null },
+  ];
+  for (const [i, row] of rows.entries()) {
+    resetPlatformDefaultsCacheForTest();
+    fs.writeFileSync(f, JSON.stringify({ mcp_servers: { safe: { url: "u" } }, ...(row.allow === undefined ? {} : { mcp_env_allow: row.allow }) }));
+    fs.utimesSync(f, new Date(), new Date(Date.now() + 5000 * (i + 1)));
+    const got = loadPlatformDefaults(f);
+    assert.deepEqual(got ? [...got.mcpEnvAllow] : null, row.want, JSON.stringify(row.allow));
+  }
+});
+
 function routerWith(writes: string[]) {
   let attached = 0;
   const order: string[] = [];
