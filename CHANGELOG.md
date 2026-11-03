@@ -495,6 +495,25 @@ record it.
   have sent the model back to `read` or `bash` for the rest: `load_skill` returns a file in parts of up to 16000
   characters, each saying the `offset` of the next, and has a bound of its own that leaves a part and the skill's
   file list whole.
+- A sandbox that cannot start is now told to the user early and ended early. While a sandbox is held up, either
+  queued in the platform or admitted with nothing yet willing to run its pod, the turn's progress event says so
+  as soon as the platform reports it, instead of one "Waiting in queue (position 0)" and then ten minutes of nothing
+  (`log`, plus additive `waiting` = `queued` | `unscheduled` and `waitReason`: one line in our words, such as how many
+  nodes cannot take the sandbox and why, never the platform's pool ids, namespaces, pod names or taint keys, which stay
+  in the Brain log; the queue's own short phrases are repeated as written). A sandbox the platform admitted whose pod no node has taken and for which no node is being added,
+  for `SANDBOX_UNSCHEDULABLE_TIMEOUT_SECONDS` (default 300, chart `secret.sandboxUnschedulableTimeoutSeconds`, `0` turns
+  it off), now ends with the new reason `sandbox_unschedulable` saying what was observed, and its workload is stopped;
+  before, it was waited on for the whole of `SANDBOX_START_TIMEOUT_SECONDS` (15 minutes) once the platform called it
+  NotReady, and for `SANDBOX_PENDING_TIMEOUT_SECONDS` (3 hours) while it called it Pending. The platform's own message
+  on such a pod ("0/7 nodes are available ...", "pod didn't trigger scale-up ...") says why it is stuck and does not
+  exempt it; a scale-up the platform reports as triggered, or a message it has not said before, restarts the clock.
+  A sandbox still in the platform's queue, one with a scale-up under way and one that is pulling an image keep their
+  existing, longer limits, and multi-node clusters and hosted applications are unchanged. When opening a
+  run's sandbox ends on `sandbox_unschedulable`, `sandbox_start_timeout` or `sandbox_pending_timeout`, the run no longer
+  provisions another for the rest of that turn (the model used to read a bare "did not become ready", call the tool
+  again, and make the user wait the whole time twice): the tool error tells the model the sandbox is unavailable and to
+  report the reason to the user, a further attempt is refused with the same error, and the workload the failed open left
+  is stopped and its binding reaped even though the run goes on.
 - The assistant's Router (behind `CLAW_ASSISTANT_ENABLED`) could not act on the items it was shown. Its list and a
   worker's report named an item only as `#3` while the tools took only the item's id, so in an evaluation against a
   real model a follow-up or a stop was refused as `item_not_found` three times in four. `say`, `work_send`,
