@@ -38,6 +38,11 @@ default; with `PLATFORM_DEFAULTS_FILE` unset, chats are built exactly as before.
   extra `headers` are merged on top. `<SAFE_API_KEY>` is replaced inside Brain
   with the calling user's own key, so `"token": "<SAFE_API_KEY>"` authenticates
   as the caller. A server without a token is rejected at connect time.
+- `mcp_env_allow` (optional) lists the Brain environment names this file's
+  `mcp_servers` may use as `<NAME>` placeholders, e.g. `["TAVILY_API_KEY"]`.
+  Only this file can read the Brain's environment: a server from a request, a
+  `tool_ids` tool or a plugin gets `<SAFE_API_KEY>` and an empty string for any
+  other name. An unlisted name expands to an empty string here too.
 
 Mount order, lowest priority first: platform defaults, request `mcp_servers`,
 `tool_ids`, plugin. A skill the request already supplies (plugin, local, or
