@@ -63,6 +63,14 @@ type SandboxGrantSpec struct {
 	// allow-list and concurrency caps. Template names here are the expanded
 	// names, after per-GPU variants are applied.
 	Roles map[string]GrantRole `json:"roles"`
+	// MaxSandboxes caps the in-flight sandboxes summed over every role. Nil
+	// means only the role caps apply.
+	// +optional
+	MaxSandboxes *int32 `json:"maxSandboxes,omitempty"`
+	// MaxGPUs caps the in-flight GPUs summed over every role. Nil means only
+	// the role caps apply.
+	// +optional
+	MaxGPUs *int32 `json:"maxGpus,omitempty"`
 	// Templates is the run-level template set Claw submitted. Kept on the
 	// grant until CodeInterpreter grows the safe-workload fields.
 	// +optional

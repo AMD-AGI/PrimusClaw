@@ -193,16 +193,16 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		return SandboxResponse{}, 0, err
 	}
 	if err := checkMetadata(body.Metadata); err != nil {
-		s.grants.AuditDenied(ctx, grantID, "")
+		s.grants.AuditDenied(ctx, grantID, "", err)
 		return SandboxResponse{}, 0, err
 	}
 	tpl, err := resolveTemplate(snap, role, body.TemplateID)
 	if err != nil {
-		s.grants.AuditDenied(ctx, grantID, "")
+		s.grants.AuditDenied(ctx, grantID, "", err)
 		return SandboxResponse{}, 0, err
 	}
 	if err := checkEnv(tpl.AcceptedEnvs, body.EnvVars); err != nil {
-		s.grants.AuditDenied(ctx, grantID, "")
+		s.grants.AuditDenied(ctx, grantID, "", err)
 		return SandboxResponse{}, 0, err
 	}
 	var workspace string
@@ -212,12 +212,13 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		workspace, err = firstWorkspace(snap.Workspaces)
 	}
 	if err != nil {
-		s.grants.AuditDenied(ctx, grantID, "")
+		s.grants.AuditDenied(ctx, grantID, "", err)
 		return SandboxResponse{}, 0, err
 	}
 	if snap.SessionID == "" {
-		s.grants.AuditDenied(ctx, grantID, "")
-		return SandboxResponse{}, 0, grant.Op(http.StatusBadRequest, "invalid_grant", "session is required")
+		err := grant.Op(http.StatusBadRequest, "invalid_grant", "session is required")
+		s.grants.AuditDenied(ctx, grantID, "", err)
+		return SandboxResponse{}, 0, err
 	}
 	timeoutSec := body.Timeout
 	if timeoutSec == 0 {
@@ -230,8 +231,10 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		return SandboxResponse{}, 0, grant.Op(http.StatusBadRequest, "invalid_sandbox", "timeout must be >= 0")
 	}
 	if snap.MaxSandboxSeconds > 0 && timeoutSec > snap.MaxSandboxSeconds {
-		s.grants.AuditDenied(ctx, grantID, "")
-		return SandboxResponse{}, 0, grant.Op(http.StatusForbidden, "timeout_not_allowed", "timeout exceeds the grant cap")
+		err := grant.Op(http.StatusForbidden, "timeout_not_allowed",
+			"timeout "+strconv.FormatInt(timeoutSec, 10)+" exceeds the grant cap "+strconv.FormatInt(snap.MaxSandboxSeconds, 10))
+		s.grants.AuditDenied(ctx, grantID, "", err)
+		return SandboxResponse{}, 0, err
 	}
 	sandboxID, err := newSandboxID()
 	if err != nil {
@@ -280,7 +283,7 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 	}
 	if err != nil {
 		if denied(err) {
-			s.grants.AuditDenied(ctx, grantID, sandboxID)
+			s.grants.AuditDenied(ctx, grantID, sandboxID, err)
 		}
 		return SandboxResponse{}, 0, err
 	}

@@ -58,11 +58,13 @@ func (m staticMembership) Check(_ context.Context, _ string, workspaces []string
 type memRecord struct {
 	mu     sync.Mutex
 	events []string
+	full   []*audit.AuditEvent
 }
 
 func (m *memRecord) Record(_ context.Context, event *audit.AuditEvent) {
 	m.mu.Lock()
 	m.events = append(m.events, event.EventType)
+	m.full = append(m.full, event)
 	m.mu.Unlock()
 }
 
@@ -429,7 +431,7 @@ func TestBudgetExhausted(t *testing.T) {
 	}
 	err := svc.Reserve(context.Background(), req.GrantID, "measurement", "sbx-2", "sess-2", 1)
 	oe, ok := err.(*OpError)
-	if !ok || oe.Status != http.StatusTooManyRequests || oe.Reason != "grant_quota_exceeded" || !strings.Contains(oe.Error(), "grant_quota_exceeded") {
+	if !ok || oe.Status != http.StatusForbidden || oe.Reason != "grant_budget_exhausted" || !strings.Contains(oe.Error(), "grant_budget_exhausted") {
 		t.Fatalf("err=%v", err)
 	}
 }
