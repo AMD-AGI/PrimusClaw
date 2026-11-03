@@ -167,6 +167,10 @@ test("E8 graders pass on what a correct session leaves", () => {
   });
   assert.equal(d3.grade({ ...nothing, files: { "d3/sales.xlsx": xlsx } }, CTX).pass, true);
 
+  const d4 = task("d4");
+  const memo = zip({ "word/document.xml": `<w:body><w:p><w:r><w:t>Quarterly Memo</w:t></w:r></w:p><w:p><w:r><w:t xml:space="preserve">Revenue grew 12% </w:t></w:r><w:r><w:t>this quarter.</w:t></w:r></w:p></w:body>` });
+  assert.equal(d4.grade({ ...nothing, files: { "d4/memo.docx": memo } }, CTX).pass, true, "a paragraph split across runs");
+
   const d6 = task("d6");
   const deck = zip({ "ppt/slides/slide1.xml": "<a:t>Plan</a:t>", "ppt/slides/slide2.xml": "<a:t>Risks</a:t>" });
   assert.equal(d6.grade({ ...nothing, files: { "d6/deck.pptx": deck } }, CTX).pass, true);

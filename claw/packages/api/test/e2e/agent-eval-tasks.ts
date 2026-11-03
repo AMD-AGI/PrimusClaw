@@ -60,6 +60,10 @@ const code = (id: string, dir: string, task: string, given: Record<string, strin
   }),
 });
 
+/** The text runs of an Office XML part (`w:t` in a document, `a:t` in a slide), in order. */
+const runsOf = (xml: string, tag: string): string[] =>
+  [...xml.matchAll(new RegExp(`<${tag}(?:\\s[^>]*)?>([^<]*)</${tag}>`, "g"))].map((m) => m[1]!);
+
 const unittestMain = `\nif __name__ == "__main__":\n    unittest.main()\n`;
 
 const mcp = (id: string, prompt: string, answered: (t: Trace, ctx: EvalContext) => boolean): EvalTask => ({
@@ -149,7 +153,7 @@ export const TASKS: readonly EvalTask[] = [
     prompt: "Create the Word document /workspace/d4/memo.docx with the title \"Quarterly Memo\" and one paragraph: \"Revenue grew 12% this quarter.\"",
     grade: (t) => {
       const doc = zipEntry(t.files["d4/memo.docx"], "word/document.xml") ?? "";
-      const plain = doc.replace(/<[^>]+>/g, "");
+      const plain = runsOf(doc, "w:t").join("");
       return all({ docx: !!doc, title: plain.includes("Quarterly Memo"), paragraph: plain.includes("Revenue grew 12% this quarter.") });
     },
   },
@@ -167,7 +171,7 @@ export const TASKS: readonly EvalTask[] = [
     grade: (t) => {
       const buf = t.files["d6/deck.pptx"];
       const slides = zipNames(buf).filter((n) => /^ppt\/slides\/slide\d+\.xml$/.test(n));
-      const words = slides.map((n) => (zipEntry(buf, n) ?? "").replace(/<[^>]+>/g, " ")).join(" ");
+      const words = slides.flatMap((n) => runsOf(zipEntry(buf, n) ?? "", "a:t")).join(" ");
       return all({ pptx: slides.length === 2, titles: /\bPlan\b/.test(words) && /\bRisks\b/.test(words) });
     },
   },
