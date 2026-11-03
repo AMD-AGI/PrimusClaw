@@ -7,6 +7,7 @@ import { coerceToolInput } from "@claw/utils";
 
 import { getMemoryEntries, getProfileEntry, getMemoryPreference } from "../memory/service.js";
 import { CLAW_MEMORY_ENABLED } from "../config.js";
+import { sessionWithholdsMemory } from "../github-review/session-tools.js";
 import pino from "pino";
 import { estimateTokens } from "../shared/tokens.js";
 
@@ -176,8 +177,10 @@ export async function buildSystemContextParts(
   // A second gate, per user: memory is opt-in, so a user who has not turned it on
   // gets neither injection nor a way to write (see insertMemoryEntry). If the
   // preference cannot be read, treat it as off.
+  // A session that acts as a user gets none of its requester's memory, and not the notice about it either.
+  const memoryOn = CLAW_MEMORY_ENABLED && !(await sessionWithholdsMemory(sessionId));
   let memoryOptIn = false;
-  if (CLAW_MEMORY_ENABLED) {
+  if (memoryOn) {
     try {
       memoryOptIn = await getMemoryPreference(userId);
     } catch (err: any) {
@@ -187,7 +190,7 @@ export async function buildSystemContextParts(
       parts.push(MEMORY_OFF_NOTICE);
     }
   }
-  if (CLAW_MEMORY_ENABLED && memoryOptIn) {
+  if (memoryOn && memoryOptIn) {
     // 1. User profile
     try {
       const profileContent = await getProfileEntry(userId);
