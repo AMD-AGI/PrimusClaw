@@ -193,7 +193,10 @@ test("H5 a short result is passed through untouched and nothing is written", () 
 });
 
 test("H5 spillToolResult writes only into a sandbox the run already has", async () => {
-  assert.equal(await new ToolRouter(null).spillToolResult("t1", LONG), null, "a run with no sandbox wrote one");
+  let opened = 0;
+  const lazy = new ToolRouter(null, new Map(), {}, async () => { opened++; throw new Error("opened a sandbox"); });
+  assert.equal(await lazy.spillToolResult("t1", LONG), null, "a run with no sandbox wrote one");
+  assert.equal(opened, 0, "keeping a result opened a sandbox");
 
   const writes: Array<Record<string, unknown>> = [];
   const hands = {
