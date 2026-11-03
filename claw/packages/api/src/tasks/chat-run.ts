@@ -2053,7 +2053,7 @@ export async function applySessionGateTransition(input: {
           AND ($4::boolean
                OR agent_gate_message_id IS NULL
                OR agent_gate_message_id = $2
-               OR ${gateIsStaleSql("$1", "agent_gate_message_id", "$2")})`,
+               ${input.force === true ? "" : `OR ${gateIsStaleSql("$1", "agent_gate_message_id", "$2")}`})`,
       [input.sessionId, input.actor, input.status, input.force === true, ...alsoVals],
     );
     return (r.rowCount ?? 0) > 0;
