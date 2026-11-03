@@ -82,3 +82,11 @@ test("a directory swapped for a link after the check is still not written throug
     fsMod.default.mkdirSync = real;
   }
 });
+
+test("a file already in the workspace is replaced by the download", async () => {
+  const target = path.join(WORK, ".uploads", "c", "d.txt");
+  fs.writeFileSync(target, "an older and longer body that must not survive");
+  const out = result(await downloadS3.execute({ files: [{ local_path: target, presigned_url: url }] }));
+  assert.deepEqual(out.ok, [target]);
+  assert.equal(fs.readFileSync(target, "utf-8"), "uploaded bytes");
+});

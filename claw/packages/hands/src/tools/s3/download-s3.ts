@@ -71,8 +71,16 @@ function writeWhereNamed(p: string, body: Buffer): string | null {
     return null;
   }
   const root = fs.realpathSync(path.resolve(WORKSPACE));
-  const existed = fs.existsSync(p);
-  const fd = fs.openSync(p, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW);
+  // Whether this call made the file is learnt from the open itself (O_EXCL), never from an earlier look at the path.
+  let existed = false;
+  let fd: number;
+  try {
+    fd = fs.openSync(p, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW);
+  } catch (e: any) {
+    if (e?.code !== "EEXIST") throw e;
+    existed = true;
+    fd = fs.openSync(p, fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW);
+  }
   try {
     let opened: string;
     try {
