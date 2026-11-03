@@ -55,7 +55,10 @@ checked, and an approval tells people the change was read. Take the time the cha
 3. Understand the intent from the description and the changed files. A description that does
    not match the diff is itself a finding, and so is a change of behaviour the description does
    not mention.
-4. On the sandbox path, read around the change before you judge it:
+4. On the sandbox path, read around the change before you judge it. This and the second pass
+   (step 8) are done whatever you have already found: a blocking finding is not a reason to stop
+   reading, a change rarely has only one problem, and a review that stops at the first one misses
+   the others.
    - for every changed or added function, method, type, exported name, route, configuration key,
      database column and command-line flag, find its callers and users in the checkout
      (`rg -n '<name>'`, `git grep`) and read them, and read the code around the change, not only the hunk;
@@ -84,8 +87,9 @@ checked, and an approval tells people the change was read. Take the time the cha
    Drop style preferences, naming, formatting and anything a linter owns.
 7. Try to prove each remaining finding wrong, twice: once by reading the code around it, once
    by looking for the guard you think is missing. Drop the ones that survive neither.
-8. Second pass: before you write the review, have the change looked at again by a reviewer
-   whose only job is to find what the first pass missed in logic, security and compatibility.
+8. Second pass, always, also when the first pass found blocking problems: before you write the
+   review, have the change looked at again by a reviewer whose only job is to find what the first
+   pass missed in logic, security and compatibility.
    - On the sandbox path, start it with the `task` tool: `subagent_type` `explore` and
      `tools` `["bash", "read", "grep", "glob", "ls"]` (it must not have the review tools). Its prompt
      names the checkout directory, the base (`origin/<base>`), the head commit, the intent of the
