@@ -55,6 +55,8 @@ const CLONE_TIMEOUT_SEC = 100;
  * large repository is bounded by this instead.
  */
 const CLONE_BACKGROUND_MAX_SEC = 900;
+/** How long stopping a background clone may take; its own budget, since the turn's signal may be the reason it is stopped. */
+const KILL_SHELL_TIMEOUT_MS = 10_000;
 const GIT_TIMEOUT_SEC = 60;
 const REASON_MAX_CHARS = 300;
 
@@ -153,12 +155,15 @@ async function shLong(
 ): Promise<{ ok: boolean; out: string }> {
   const { signal } = options;
   if (!options.background) return sh(hands, command, CLONE_TIMEOUT_SEC, signal);
+  let shellId: string | undefined;
+  let finished = false;
   try {
     const start = await hands.callToolFull("bash", { command, run_in_background: true }, signal);
-    const shellId = (start.structured as { shell_id?: unknown } | undefined)?.shell_id;
-    if (start.isError || typeof shellId !== "string" || !shellId) {
+    const id = (start.structured as { shell_id?: unknown } | undefined)?.shell_id;
+    if (start.isError || typeof id !== "string" || !id) {
       return { ok: false, out: `stderr: could not start the command in the background: ${start.text}` };
     }
+    shellId = id;
     const deadline = Date.now() + CLONE_BACKGROUND_MAX_SEC * 1000;
     let out = "";
     for (;;) {
@@ -166,14 +171,19 @@ async function shLong(
       out += `${w.text}\n`;
       if (w.isError) return { ok: false, out };
       const s = w.structured as { finished?: unknown; exit_code?: unknown } | undefined;
-      if (s?.finished === true) return { ok: s.exit_code === 0, out };
+      if (s?.finished === true) { finished = true; return { ok: s.exit_code === 0, out }; }
       if (Date.now() >= deadline) {
-        await hands.callToolFull("kill_shell", { shell_id: shellId }, signal).catch(() => undefined);
         return { ok: false, out: `stderr: did not finish within ${CLONE_BACKGROUND_MAX_SEC}s and was stopped` };
       }
     }
   } catch (err) {
     return { ok: false, out: `stderr: could not run the command in the sandbox: ${(err as Error)?.message ?? err}` };
+  } finally {
+    // A clone left running would race the next turn's bind: its staging dir removed
+    // under it, or its move landing inside the checkout that turn put in place.
+    if (shellId && !finished) {
+      await hands.callToolFull("kill_shell", { shell_id: shellId }, AbortSignal.timeout(KILL_SHELL_TIMEOUT_MS)).catch(() => undefined);
+    }
   }
 }
 

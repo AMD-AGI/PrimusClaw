@@ -683,3 +683,42 @@ test("GB3 without background shells the clone is one foreground call, as before"
   assert.equal(b.state, "cloned");
   assert.ok(!s.tools.includes("bash&") && !s.tools.includes("wait"), s.tools.join());
 });
+
+for (const [label, wait] of [
+  ["the turn is aborted during the wait", "abort"],
+  ["the wait answers an error", "error"],
+] as const) {
+  test(`GB4 a background clone that is not waited to its end is stopped: ${label}`, async () => {
+    const s = sandbox(`gb4-${wait}`);
+    const ac = new AbortController();
+    const kills: Array<{ shell_id: unknown; aborted: boolean | undefined }> = [];
+    const hands = {
+      async callToolFull(name: string, args: Record<string, unknown>, signal?: AbortSignal) {
+        if (name === "bash" && args.run_in_background === true) {
+          return { text: "Started background shell sh-1.", isError: false, structured: { shell_id: "sh-1" } };
+        }
+        if (name === "wait") {
+          if (wait === "error") return { text: "Error: the sandbox went away", isError: true };
+          ac.abort();
+          throw Object.assign(new Error("This operation was aborted"), { name: "AbortError" });
+        }
+        if (name === "kill_shell") {
+          kills.push({ shell_id: args.shell_id, aborted: signal?.aborted });
+          return { text: "killed", isError: false };
+        }
+        if (signal?.aborted) throw new Error("aborted");
+        return s.hands.callToolFull(name, args);
+      },
+    };
+    const b = await bindRepo(hands, { url: REPO_URL }, { root: s.root, stateDir: s.state, background: true, signal: ac.signal });
+    assert.equal(b.state, "failed", JSON.stringify(b));
+    assert.deepEqual(kills, [{ shell_id: "sh-1", aborted: false }], "the background clone was left running, or stopped under the aborted signal");
+  });
+}
+
+test("GB5 a background clone that finishes is not stopped", async () => {
+  const s = backgroundSandbox("gb5");
+  const b = await bindRepo(s.hands, { url: REPO_URL }, { root: s.root, stateDir: s.state, background: true });
+  assert.equal(b.state, "cloned");
+  assert.ok(!s.tools.includes("kill_shell"), s.tools.join());
+});
