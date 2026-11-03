@@ -200,6 +200,18 @@ PY
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 0. Render what this run will apply, before applying any of it
+# ═══════════════════════════════════════════════════════════════════════════
+# render_chart refuses a Deployment whose rendered env sets one name twice because
+# of EXTRA_SECRET_ENV_*. Brain is rendered only after API has been applied and
+# has rolled, so without this a doubled name in Brain's env would be found with
+# API already changed.
+if ! $ROLLBACK; then
+  if $UPGRADE_API;   then render_chart api-deployment.yaml   "$WORK_DIR/preflight-api-deployment.yaml"; fi
+  if $UPGRADE_BRAIN; then render_chart brain-deployment.yaml "$WORK_DIR/preflight-brain-deployment.yaml"; fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 1. Upgrade API (Deployment — standard rolling update)
 # ═══════════════════════════════════════════════════════════════════════════
 if $UPGRADE_API; then

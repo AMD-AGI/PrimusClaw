@@ -722,11 +722,26 @@ with open(sys.argv[1], "w", encoding="utf-8") as f:
     json.dump(values, f, indent=2)
 PY
 
-# EXTRA_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* / EXTRA_SECRET_MOUNTS_* (see values.example.env), as a second
-# values file so a fresh deploy carries what upgrade.sh's render carries.
+# EXTRA_ENV_* / EXTRA_SECRET_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* / EXTRA_SECRET_MOUNTS_* (see values.example.env),
+# as a second values file so a fresh deploy carries what upgrade.sh's render carries.
 CLAW_EXTRA_VALUES_FILE="$WORK_DIR/claw-extra-values.json"
 python3 "$SCRIPT_DIR/extra-values.py" > "$CLAW_EXTRA_VALUES_FILE" \
-  || fail "EXTRA_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* / EXTRA_SECRET_MOUNTS_* in $_VALUES_FILE are malformed or collide (see above)."
+  || fail "EXTRA_ENV_* / EXTRA_SECRET_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* / EXTRA_SECRET_MOUNTS_* in $_VALUES_FILE are malformed or collide (see above)."
+
+# A Secret env name the chart renders into the container as well is only visible
+# in the render, so render both Deployments the way the install below will and
+# stop before it installs anything. Skipped when no Secret env var is set.
+if grep -q '"secretKeyRef"' "$CLAW_EXTRA_VALUES_FILE"; then
+  for _deployment in api brain; do
+    helm template primus-claw "$CLAW_CHART_DIR" -n "$NAMESPACE" \
+      -f "$CLAW_VALUES_FILE" -f "$CLAW_EXTRA_VALUES_FILE" \
+      --show-only "templates/${_deployment}-deployment.yaml" > "$WORK_DIR/check-${_deployment}-deployment.yaml" \
+      || fail "the claw chart did not render the ${_deployment} Deployment from these values (see above)."
+    python3 "$SCRIPT_DIR/extra-values.py" --check-rendered "$(echo "$_deployment" | tr '[:lower:]' '[:upper:]')" \
+      "$WORK_DIR/check-${_deployment}-deployment.yaml" \
+      || fail "EXTRA_SECRET_ENV_* in $_VALUES_FILE names an env var the chart already renders in the ${_deployment} Deployment (see above)."
+  done
+fi
 
 if $DRY_RUN; then
   helm upgrade --install primus-claw "$CLAW_CHART_DIR" \
