@@ -96,3 +96,27 @@ export async function reviewEnv(env: Record<string, string> = {}, over: { actor?
 export const unbound = (): Promise<never> => Promise.reject(new IdentityCredentialRefusedError("not_bound", 404));
 export const expired = (): Promise<never> => Promise.reject(new IdentityCredentialRefusedError("expired", 410));
 export const down = (): Promise<never> => Promise.reject(new IdentityUnavailableError("credential", "http_5xx", 503));
+
+/** The text of one `gh_pr_get` answer's section: the review instructions, or the pull request's own text under `untrusted`. */
+function sectionOf(body: Record<string, any>, section: string): string | undefined {
+  if (section === "instructions") return body.review_instructions;
+  return body.untrusted?.[section] ?? body.untrusted?.text;
+}
+
+/**
+ * A `gh_pr_get` section whole, as the model is told to read it: from the overview when it is inline there, else page after page from
+ * offset 0 along `next_offset`. `pages` counts the paged calls.
+ */
+export async function readSection(service: GithubReview, actor: ReviewActor, pr: string, section: string, extra: Record<string, unknown> = {}): Promise<{ text: string; pages: number }> {
+  const first = (await service.getPr(actor, { pr, ...extra })).body as Record<string, any>;
+  if (first.sections?.[section]?.inline) return { text: sectionOf(first, section) as string, pages: 0 };
+  let text = "";
+  let pages = 0;
+  for (let offset: number | null = 0; offset !== null; pages++) {
+    const o = await service.getPr(actor, { pr, section, head_sha: first.pull_request.head_sha, offset, ...extra });
+    if (o.isError) throw new Error(`page refused: ${o.text}`);
+    text += sectionOf(o.body as Record<string, any>, section) ?? "";
+    offset = (o.body as Record<string, any>).next_offset;
+  }
+  return { text, pages };
+}
