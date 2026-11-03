@@ -28,6 +28,7 @@ import (
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
+	"sigs.k8s.io/agent-sandbox/pkg/sandboxlayer"
 )
 
 // CodeInterpreterReconciler reconciles CodeInterpreter objects.
@@ -117,6 +118,9 @@ func computeSpecHash(pt sandboxv1alpha1.PodTemplate) string {
 // reflect.DeepEqual always return false), we compute a SHA-256 hash of our desired spec
 // and store it as an annotation. The template is only updated when the hash changes.
 func (r *CodeInterpreterReconciler) ensureSandboxTemplate(ctx context.Context, ci *runtimev1alpha1.CodeInterpreter) error {
+	if err := validateTemplateLayers(ci.Spec); err != nil {
+		return err
+	}
 	desired := r.buildPodTemplate(ci)
 	desiredHash := computeSpecHash(desired)
 
@@ -625,6 +629,11 @@ func (r *CodeInterpreterReconciler) buildPodTemplate(ci *runtimev1alpha1.CodeInt
 		mainVolumeMounts = append(mainVolumeMounts, codeInterpreterVolumeMountToCore(vm, isMemoryEmptyDir))
 	}
 
+	layers, _ := sandboxlayer.Resolve(tmpl.Layers, sandboxlayer.TemplateMounts(tmpl))
+	layerInits, layerVolumes, layerMounts := sandboxlayer.PodParts(layers, tmpl.ImagePullPolicy)
+	volumes = append(volumes, layerVolumes...)
+	mainVolumeMounts = append(mainVolumeMounts, layerMounts...)
+
 	injectorCmd := "cp /envd /shared/bin/envd && (cp /tmux /shared/bin/tmux 2>/dev/null || true) && (cp /iptables /shared/bin/iptables && cp /iptables /shared/bin/ip6tables && ln -sf iptables /shared/bin/iptables-legacy && ln -sf ip6tables /shared/bin/ip6tables-legacy && cp /musl-ld.so /shared/bin/ld-musl-x86_64.so.1 && ln -sf ld-musl-x86_64.so.1 /shared/bin/libc.musl-x86_64.so.1 2>/dev/null || true)"
 	if extraCAEnabled() {
 		// No `|| true`: an injector image without the script fails the
@@ -710,7 +719,7 @@ func (r *CodeInterpreterReconciler) buildPodTemplate(ci *runtimev1alpha1.CodeInt
 	containers = append(containers, tmpl.Sidecars...)
 
 	podSpec := corev1.PodSpec{
-		InitContainers:   []corev1.Container{envdInjectorContainer},
+		InitContainers:   append([]corev1.Container{envdInjectorContainer}, layerInits...),
 		Containers:       containers,
 		ImagePullSecrets: tmpl.ImagePullSecrets,
 		RuntimeClassName: runtimeClass,
