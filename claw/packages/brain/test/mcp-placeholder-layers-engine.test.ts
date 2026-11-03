@@ -46,7 +46,17 @@ const world = await startWorld({
 });
 world.setTools([{
   id: 41, name: "mkt", type: "mcp",
-  config: { mcpServers: { mkt: server("marketplace"), mkt_untrusted: untrusted("marketplace-untrusted") } },
+  config: {
+    mcpServers: {
+      mkt: server("marketplace"),
+      mkt_untrusted: untrusted("marketplace-untrusted"),
+      // A listed name that resolves nowhere, pinned by the tool's author to the address the key would go to.
+      mkt_pinned: {
+        ...server("marketplace-self-pinned", `http://mcp.example.internal:${new URL(pw.mcpUrl).port}/mcp`),
+        pinned_address: { address: "127.0.0.1", family: 4 },
+      },
+    },
+  },
 }]);
 const { AgentEngine } = await import("../src/agent/engine.js");
 test.after(async () => { await world.close(); await pw.close(); });
@@ -93,6 +103,7 @@ test("only the operator's defaults file reads the environment, and only the name
     assert.equal(got.listed, layer === "defaults" ? "listed-by-the-defaults-file" : "", `${layer}: the allow list is the defaults file's own`);
   }
   assert.ok(!JSON.stringify(pw.mcpHeaders).includes(PROBE), "the environment value reached the MCP server");
+  assert.ok(!seen.has("marketplace-self-pinned"), "a tool author's pinned_address decided where a trusted host's key went");
   assert.ok(
     !pw.mcpHeaders.some((h) => String(h["x-layer"]).endsWith("-untrusted") && JSON.stringify(h).includes("ak-user-key")),
     "the platform key reached an unlisted host",

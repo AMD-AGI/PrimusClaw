@@ -164,8 +164,16 @@ export class AgentEngine {
     // Marketplace and plugin servers are third parties' at URLs nobody vetted, so the requester's
     // platform key fills their `<SAFE_API_KEY>` only on a host the operator trusts
     // (MCP_PLATFORM_KEY_ALLOWED_HOSTS). A request's own servers are the requester's choice of where
-    // their own key goes.
-    const toolMcp = { ...resolved.mcpServers, ...pluginLayer.mcpServers };
+    // their own key goes. A `pinned_address` is the API's record of where it vetted a request's
+    // server; one in a tool or plugin config is the author's, and would connect a trusted host name
+    // to an address of their choosing, so it is dropped.
+    const toolMcp = Object.fromEntries(
+      Object.entries({ ...resolved.mcpServers, ...pluginLayer.mcpServers }).map(([name, spec]) => {
+        if (!spec || typeof spec !== "object") return [name, spec];
+        const { pinned_address: _authorsPin, ...rest } = spec;
+        return [name, rest];
+      }),
+    );
     const requestMcp = Object.fromEntries(
       Object.entries(request.mcp_servers || {}).filter(([name]) => !Object.hasOwn(toolMcp, name)),
     );
