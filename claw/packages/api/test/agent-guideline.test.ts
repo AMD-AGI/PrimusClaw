@@ -30,3 +30,19 @@ test("a turn gets the working guideline ahead of the system text it carries, and
     (db as any).query = real;
   }
 });
+
+test("only the working-style sections give way to the user and supplied rules; Safety always applies", async () => {
+  const { AGENT_GUIDELINE } = await import("../src/sessions/agent-guideline.js");
+  const sections = AGENT_GUIDELINE.split(/^## /m);
+  const opening = sections[0]!;
+  assert.match(
+    opening,
+    /The sections on doing the task, checking your work and talking to the user are defaults that the user's instructions, and any rules or skills supplied with the request, may override\. The Safety section always applies\./,
+  );
+  // A plugin rule or skill claiming precedence must not reach "never print secrets" or a denied approval.
+  assert.doesNotMatch(opening, /take precedence/);
+  assert.deepEqual(
+    sections.slice(1).map((s) => s.split("\n", 1)[0]),
+    ["Doing the task", "Checking your work", "Talking to the user", "Safety"],
+  );
+});
