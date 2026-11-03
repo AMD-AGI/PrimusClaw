@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -663,5 +664,53 @@ func TestWorkloadObjectMarksOwnerKeyWorkload(t *testing.T) {
 	}
 	if _, ok := obj.GetLabels()["agent-sandbox.io/owner-key"]; ok {
 		t.Fatal("grant workload must not carry the owner-key label")
+	}
+}
+
+func TestWaitRunningNamesTheLastWorkloadStatus(t *testing.T) {
+	prev := workloadPollInterval
+	workloadPollInterval = time.Millisecond
+	t.Cleanup(func() { workloadPollInterval = prev })
+	const name = "sbx-7a9b9b693452f613877992145c818d29"
+	queued := "In queue - insufficient resources, no cpu available"
+	cases := []struct {
+		name   string
+		remove bool
+		want   []string
+	}{
+		{name: "still pending", want: []string{"phase Pending", queued}},
+		{name: "removed", remove: true, want: []string{"removed while pending", queued}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dc := dynfake.NewSimpleDynamicClientWithCustomListKinds(k8sruntime.NewScheme(), map[schema.GroupVersionResource]string{
+				workloadGVR: "WorkloadList",
+			})
+			calls := 0
+			dc.PrependReactor("get", "workloads", func(k8stesting.Action) (bool, k8sruntime.Object, error) {
+				calls++
+				if tc.remove && calls > 2 {
+					return true, nil, apierrors.NewNotFound(workloadGVR.GroupResource(), name)
+				}
+				obj := &unstructured.Unstructured{Object: map[string]any{
+					"apiVersion": "amd.com/v1", "kind": "Workload",
+					"metadata": map[string]any{"name": name},
+					"status":   map[string]any{"phase": "Pending", "message": queued},
+				}}
+				return true, obj, nil
+			})
+			creator := NewSafeWorkloadCreator(dc, fake.NewClientBuilder().Build())
+			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer cancel()
+			_, _, _, err := creator.waitRunning(ctx, name, "global-cpu")
+			if err == nil {
+				t.Fatal("waitRunning returned no error")
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("err=%q missing %q", err, want)
+				}
+			}
+		})
 	}
 }
