@@ -84,13 +84,15 @@ approval request.
 
 | Rule | Held | Runs without asking |
 |---|---|---|
-| `git push` | `git push` in any form, `git -C dir push`, `git --git-dir=... push`; the **force / delete** forms (`--force`, `-f`, `--force-with-lease`, `--delete`, `-d`, `--mirror`, `--prune`, `+ref`, `:ref`) are labelled separately | `status`, `log`, `diff`, `fetch`, `pull`, `clone`, `checkout`, `branch`, `commit`, `stash` (also `stash push`), `remote`, `config` |
+| `git push` | `git push` in any form, `git -C dir push`, `git --git-dir=... push`; the **force / delete** forms (`--force`, `-f`, `--force-with-lease`, `--delete`, `-d`, `--mirror`, `--prune`, `+ref`, `:ref`) and a push whose destination is **`main` / `master`** (`origin main`, `HEAD:main`, `HEAD:refs/heads/master`) are labelled separately | `status`, `log`, `diff`, `fetch`, `pull`, `clone`, `checkout`, `branch`, `commit`, `stash` (also `stash push`), `remote`, `config` |
 | `gh pr` | `create`, `merge`, `close`, `review`, `ready`, `edit`, `reopen`, `comment`, `update-branch` | `view`, `list`, `checks`, `diff`, `status`, `checkout` |
 | `gh issue` | `create`, `close`, `comment`, `edit`, `delete`, `reopen`, `transfer`, `lock`, `unlock`, `pin`, `unpin`, `develop` | `view`, `list`, `status` |
 | `gh release` | `create`, `edit`, `delete`, `upload`, `delete-asset` | `list`, `view`, `download` |
-| `gh api` | `-X` / `--method` `POST`, `PUT`, `PATCH`, `DELETE`; and any call with `-f`, `-F`, `--field`, `--raw-field` or `--input` and no explicit `GET` (`gh` sends those as a POST) | `GET` calls, including `-X GET ... -f q=...` |
+| `gh api` | `-X` / `--method` `POST`, `PUT`, `PATCH`, `DELETE`; any call with `-f`, `-F`, `--field`, `--raw-field` or `--input` and no explicit `GET` (`gh` sends those as a POST); and `gh api graphql` when the query is a `mutation` or is read from a file or stdin (`-F query=@file`, `--input`) | `GET` calls, including `-X GET ... -f q=...`; `gh api graphql -f query='{ ... }'` reads |
 | `gh repo` | `create`, `delete`, `edit`, `rename`, `archive`, `unarchive`, `fork`, `sync` | `view`, `clone`, `list` |
 | `gh workflow` | `run`, `enable`, `disable` | `list`, `view` |
+| `gh secret` / `variable` / `label` / `run` / `gist` / `ssh-key` / `gpg-key` / `cache` | `secret` and `variable` `set` / `delete`; `label` `create` / `edit` / `delete` / `clone`; `run` `rerun` / `cancel` / `delete`; `gist` `create` / `edit` / `delete` / `rename`; key `add` / `delete`; `cache delete` | `list`, `view`, `get`, `watch`, `download` (and every `gh ruleset` command, which only reads) |
+| `curl` / `wget` to GitHub's API | `POST`, `PUT`, `PATCH`, `DELETE` (stated, or implied by a body or an upload) to `api.github.com` or `uploads.github.com` | `GET` / `HEAD`, and every other host |
 | `kubectl` | `apply`, `delete`, `patch`, `scale`, `exec`, `create`, `replace`, `edit`, `label`, `annotate`, `cordon`, `uncordon`, `drain`, `taint`, `set`, `run`, `cp`, `debug`, `expose`, `autoscale`, `rollout restart/undo/pause/resume` | `get`, `describe`, `logs`, `top`, `config`, `rollout status`, `rollout history` |
 | `helm` | `install`, `upgrade`, `uninstall`, `delete`, `rollback`, `push` | `list`, `template`, `status`, `get`, `lint`, `show`, `repo` |
 | `rm` | a recursive `rm` (`-r`, `-R`, `-rf`, `-fr`, `--recursive`, in any spelling) unless **every** target is spelled out as `/workspace/<something>`: an absolute path elsewhere, `~`, `$HOME`, `/workspace` itself, `/workspace/*`, any path with a `..` segment, and any **relative** path (`rm -rf node_modules`, `cd / && rm -rf usr`) are held | `rm file`, `rm -f /tmp/x.log` (not recursive), `rm -rf /workspace/app/build`, `rm -r /workspace/a /workspace/b` |
@@ -109,9 +111,13 @@ Things this pack does not do, beyond the limits above:
   words are matched after the shell's quotes are removed.
 - A recursive delete of a `/tmp` path is held, because it is outside `/workspace`. Delete the `rm` rule, or
   narrow it, if scratch cleanup should not ask.
-- A GraphQL read through `gh api graphql -f query=...` is a POST to GitHub and is held.
-- It does not cover `gh gist`, `gh secret`, `gh run`, `git` aliases, other HTTP clients (add an
-  `http` rule), `docker push`, or a script that does any of this.
+- A GraphQL mutation is recognised by the word `mutation` in the command; a query held in a shell variable
+  (`-f query="$Q"`) is not seen. A `gh api graphql` call with options before the word `graphql` is judged as
+  an ordinary `gh api` call (held when it has fields).
+- A push to `main` is recognised by its destination; a bare `git push` while `main` is checked out is held as
+  a plain push only where the pack's `git push` rule is in force (the built-in rules do not have it).
+- It does not cover `git` aliases, other HTTP clients (add an `http` rule), a GitHub Enterprise API host
+  (add it to the `curl` / `wget` rule's `url_prefix`), `docker push`, or a script that does any of this.
 
 The held call's request goes to whoever can answer it. With `CLAW_NOTIFICATIONS_ENABLED`, a subscription that
 lists `approval.requested` in its `event_types` is also sent a signed `approval.requested` webhook for each

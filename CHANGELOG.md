@@ -34,10 +34,12 @@ record it.
   change a pull request, reply to or resolve a review thread) that each wait for the user's decision. The
   owner's token is read by the API per call, from the session the signed token names; it never travels in
   the server entry. See `claw/docs/github-mcp.md`.
-- Built-in bash approval rules for GitHub writes from the shell (`git push` force / delete forms, writing
-  `gh pr` / `gh issue` / `gh release` / `gh api` / `gh repo` / `gh workflow` commands), on unless
-  `BASH_APPROVAL_DEFAULTS_ENABLED=false`. A run with no approval channel now has these commands denied
-  instead of run. The outbound-actions pack gains the `gh issue` rule. See `claw/docs/bash-approval.md`.
+- Built-in bash approval rules for GitHub writes from the shell (`git push` force / delete forms and pushes
+  to `main` / `master`, writing `gh pr` / `gh issue` / `gh release` / `gh api` / `gh repo` / `gh workflow` /
+  `gh secret` / `gh variable` / `gh label` / `gh run` / `gh gist` / key / cache commands, a GraphQL mutation,
+  and `curl` / `wget` writes to `api.github.com`), on unless `BASH_APPROVAL_DEFAULTS_ENABLED=false`. A run with
+  no approval channel now has these commands denied instead of run. The outbound-actions pack gains the same
+  rules, and no longer holds a GraphQL read. See `claw/docs/bash-approval.md`.
 - Brain's MCP client passes on every content block of a tool result: an image, an embedded resource or a
   resource link becomes a line that says what it was (an embedded text resource is passed in full) instead
   of the result reading as empty, and a result with only `structuredContent` is passed as JSON. A server that
