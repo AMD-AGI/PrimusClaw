@@ -61,6 +61,27 @@ export interface AppContainer {
    * an OOM kill). A key the manifest leaves out has no manifest maximum.
    */
   resources?: Record<string, string>;
+  /**
+   * Image directories Agent Sandbox copies into the app container before it starts,
+   * at most {@link APP_MAX_LAYERS}. Claw checks their shape and passes them through;
+   * Agent Sandbox owns the path rules.
+   */
+  layers?: AppLayer[];
+}
+
+/** The most layers `container.layers` may list. */
+export const APP_MAX_LAYERS = 4;
+
+/** One image directory copied into the app container. */
+export interface AppLayer {
+  /** Pinned by digest: `name@sha256:<64 hex>`. */
+  image: string;
+  /** Absolute directory in the image to copy. */
+  from: string;
+  /** Absolute path of the copy in the app container. */
+  mount: string;
+  /** Defaults to true. */
+  readOnly?: boolean;
 }
 
 export interface AppBootstrap {
@@ -196,6 +217,8 @@ const B64_PATTERN = "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3
 
 const ref = (name: string) => ({ $ref: `#/$defs/${name}` });
 const posInt = { type: "integer", minimum: 1 } as const;
+const LAYER_IMAGE_PATTERN = "^[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}$";
+const LAYER_PATH_PATTERN = "^/[A-Za-z0-9._/-]*$";
 const nonNegInt = { type: "integer", minimum: 0 } as const;
 const nonEmptyStr = { type: "string", minLength: 1 } as const;
 
@@ -238,6 +261,21 @@ export const APP_MANIFEST_JSON_SCHEMA = {
       properties: {
         image: nonEmptyStr,
         resources: ref("stringMap"),
+        layers: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["image", "from", "mount"],
+            properties: {
+              image: { type: "string", pattern: LAYER_IMAGE_PATTERN },
+              from: { type: "string", pattern: LAYER_PATH_PATTERN },
+              mount: { type: "string", pattern: LAYER_PATH_PATTERN },
+              readOnly: { type: "boolean" },
+            },
+          },
+        },
       },
     },
     state_dir: nonEmptyStr,
@@ -429,6 +467,11 @@ export function validateAppManifest(value: unknown): AppManifestIssue[] {
     if (!hasRole(role)) bad(`${section}.${key}`, `role ${JSON.stringify(role)} is not declared in sandbox_roles`);
   };
   for (const role of Object.keys(obj(obj(value.env_map).sandbox_keys))) needRole("env_map.sandbox_keys", role, role);
+
+  const layers = obj(value.container).layers;
+  if (Array.isArray(layers) && layers.length > APP_MAX_LAYERS) {
+    bad("container.layers", `at most ${APP_MAX_LAYERS} layers, got ${layers.length}`);
+  }
 
   // container.resources: no GPU key (the count is the request's alone), a Kubernetes
   // resource name for every key, and a readable quantity for every value, so a
