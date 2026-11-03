@@ -257,7 +257,8 @@ review and the merge and who is the reviewer of record, and whose own standing a
   `gh_pr_get`, before any judgement, gives the evidence, the hard holds and the guidance. The audit row
   keeps the reasons and the evidence (marked `evidence:`). A `low` without a reason is no judgement.
   An approval or a merge of a head commit for which an earlier approval or merge already waits for the
-  acting user, or was refused by them, is held too, whatever the later call says: a lower judgement on a
+  acting user, is being decided by them, or was refused by them (the repository name compared without
+  case), is held too, and `gh_pr_risk` says so, whatever the later call says: a lower judgement on a
   second call, or the other of the two tools, does not get past their decision.
 
   A merge or an approval that needs confirmation creates one pending row for the head commit and

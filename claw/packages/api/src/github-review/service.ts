@@ -306,7 +306,8 @@ export class GithubReview {
     return this.run(actor, "gh_pr_risk", args, async (ctx, ref) => {
       const { repo, pr } = await this.load(ctx, ref);
       const change = await this.collectChange(ctx, ref, pr);
-      const risk = assessRisk(this.riskInput(pr, repo, change, this.flags(args), this.judgement(ctx, args)));
+      // The same answer an approval or a merge would get now, an earlier write of this commit that waits for the acting user included.
+      const risk = await this.heldBefore(ctx, ref, pr, assessRisk(this.riskInput(pr, repo, change, this.flags(args), this.judgement(ctx, args))));
       ctx.acc.riskReasons = this.auditedReasons(risk);
       ctx.acc.headSha = pr.headSha;
       return ok({ status: "ok", head_sha: pr.headSha, risk: this.riskBlock(risk) }, (t) => ctx.client.redact(t));

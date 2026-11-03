@@ -691,6 +691,12 @@ describe("M4 what the change does, and the reviewer's judgement of it", () => {
     assert.equal(spelled.body.status, "confirmation_required", "nor does the same pull request spelled in another case");
     assert.equal(e.gh.writes.length, 0);
     assert.equal(puts().length, 0);
+    const asked = (await e.service.assessPr(e.actor, { pr: PR, risk_judgement: LOW })).body.risk as any;
+    assert.equal(asked.level, "high", "gh_pr_risk gives the answer the write would get");
+    // A decision being carried out (claimConfirmation's `merging`, a deny as much as an allow) is still the person's.
+    await e.sql("UPDATE claw_github_confirmations SET status = 'merging'");
+    assert.equal((await merge()).body.status, "confirmation_required", "a deny in flight is not lost to a write");
+    await e.sql("DELETE FROM claw_github_confirmations WHERE kind = 'merge'");
     await e.sql("UPDATE claw_github_confirmations SET status = 'denied'");
     const after = await merge();
     assert.equal(after.body.status, "confirmation_required", "a refusal stands for the commit it was about");
