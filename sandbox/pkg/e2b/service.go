@@ -322,7 +322,7 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 			failed = grant.Op(http.StatusInternalServerError, "pending_timeout", "not running after "+tpl.Pending.String()+": "+runErr.Error())
 		}
-		_ = s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, sandboxID, failed.Error())
+		_ = s.grants.FailSandbox(context.WithoutCancel(ctx), grantID, sandboxID, failed.Error())
 		return SandboxResponse{}, 0, failed
 	}
 	running := grant.RunningUpdate{
@@ -395,11 +395,18 @@ func (s *Service) adoptPending(ctx context.Context, grantID string, ref runtimev
 		return ref, false, err
 	}
 	if phase == WorkloadFinished {
-		if err := s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, ref.ID, "create_failed"); err != nil {
+		reason := "create_failed"
+		if result.Failure != "" {
+			reason = grant.Op(http.StatusInternalServerError, "sandbox_create_failed", result.Failure).Error()
+		}
+		if err := s.grants.FailSandbox(context.WithoutCancel(ctx), grantID, ref.ID, reason); err != nil {
 			return ref, false, err
 		}
-		ref.State = runtimev1alpha1.SandboxEnded
-		return ref, true, nil
+		ended, err := s.grants.Sandbox(ctx, grantID, ref.Role, ref.ID)
+		if err != nil {
+			return ref, false, err
+		}
+		return ended, true, nil
 	}
 	if phase != WorkloadRunning {
 		return ref, false, nil

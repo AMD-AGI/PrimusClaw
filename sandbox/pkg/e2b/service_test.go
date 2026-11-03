@@ -42,6 +42,7 @@ type fakeRunner struct {
 	startOnce sync.Once
 	hold      chan struct{}
 	observed  string
+	failure   string
 	node      string
 	adopted   []time.Duration
 }
@@ -77,7 +78,7 @@ func (f *fakeRunner) Observe(_ context.Context, sandboxID string) (CreateResult,
 	if node == "" {
 		node = "node-a"
 	}
-	return CreateResult{SandboxName: "pod-" + sandboxID, Namespace: "ns", PodIP: "10.0.0.8", PodPort: 8080, NodeName: node}, f.observed, nil
+	return CreateResult{SandboxName: "pod-" + sandboxID, Namespace: "ns", PodIP: "10.0.0.8", PodPort: 8080, NodeName: node, Failure: f.failure}, f.observed, nil
 }
 
 func (f *fakeRunner) Delete(_ context.Context, sandboxID string) error {
@@ -239,6 +240,36 @@ func TestOriginalCreateReportsFailureBeforeReplay(t *testing.T) {
 				t.Fatalf("replay=%v", err)
 			}
 		})
+	}
+}
+
+func TestReplayThatEndsTheRefKeepsTheReason(t *testing.T) {
+	svc, runner, keys := testPlane(t, 600, []int32{1}, 1)
+	failure := "workload sbx-1 phase Failed: CapacityGone: allocation generation is Lost"
+	runner.started = make(chan struct{})
+	runner.hold = make(chan struct{})
+	runner.observed = WorkloadFinished
+	runner.failure = failure
+	runner.fail = errors.New(failure)
+	body := CreateBody{TemplateID: "runner", Timeout: 60, Metadata: map[string]string{idempotencyMetadataKey: "once"}}
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := svc.Create(context.Background(), keys["measurement"], body)
+		done <- err
+	}()
+	awaitStarted(t, runner.started, done)
+	_, _, err := svc.Create(context.Background(), keys["measurement"], body)
+	var oe *grant.OpError
+	if !errors.As(err, &oe) || oe.Status != http.StatusGone || !strings.Contains(oe.Detail, "CapacityGone") {
+		t.Fatalf("first replay=%v", err)
+	}
+	close(runner.hold)
+	if err := <-done; !errors.As(err, &oe) || oe.Status != http.StatusInternalServerError || !strings.Contains(oe.Detail, "CapacityGone") {
+		t.Fatalf("create=%v", err)
+	}
+	_, _, err = svc.Create(context.Background(), keys["measurement"], body)
+	if !errors.As(err, &oe) || oe.Status != http.StatusGone || !strings.Contains(oe.Detail, "CapacityGone") {
+		t.Fatalf("second replay=%v", err)
 	}
 }
 

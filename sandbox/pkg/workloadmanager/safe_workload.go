@@ -322,13 +322,14 @@ func (c *SafeWorkloadCreator) Observe(ctx context.Context, sandboxID string) (e2
 	if err != nil {
 		return e2b.CreateResult{}, "", err
 	}
-	if obj.GetDeletionTimestamp() != nil {
-		return e2b.CreateResult{}, e2b.WorkloadFinished, nil
-	}
 	phase, _, _ := unstructured.NestedString(obj.Object, "status", "phase")
+	if obj.GetDeletionTimestamp() != nil {
+		failure := pendingWorkloadError(fmt.Sprintf("workload %s is being deleted", sandboxID), phase, workloadFailureText(obj))
+		return e2b.CreateResult{Failure: failure.Error()}, e2b.WorkloadFinished, nil
+	}
 	switch phase {
 	case "Failed", "Succeeded", "Stopped":
-		return e2b.CreateResult{}, e2b.WorkloadFinished, nil
+		return e2b.CreateResult{Failure: terminalWorkloadError(sandboxID, phase, obj).Error()}, e2b.WorkloadFinished, nil
 	case "Running":
 		workspace, _, _ := unstructured.NestedString(obj.Object, "spec", "workspace")
 		cluster := obj.GetLabels()[safeClusterIDLabel]

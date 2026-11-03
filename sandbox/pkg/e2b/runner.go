@@ -54,6 +54,8 @@ type CreateResult struct {
 	NodeName    string
 	// Cluster is the SaFE cluster id copied from the Workload, when known.
 	Cluster string
+	// Failure is the failure text of a finished Workload, when known.
+	Failure string
 }
 
 // Runner creates and deletes sandboxes. It must not inject a platform inference key.
