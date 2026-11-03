@@ -12,6 +12,7 @@
  */
 import pino from "pino";
 import { CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
+import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { db } from "../infra/db.js";
 import { actingUserOf } from "./acting-as.js";
 import { storedActingAs } from "./acting-turns.js";
@@ -37,16 +38,41 @@ export function withholdsSandboxKeys(config: unknown): boolean {
 
 /**
  * `withholdsSandboxKeys` for a session that is read from its row now, as the tools are. Not caught: a session that cannot be read is not
- * one whose work is started with its keys in the sandbox. Asks the database nothing while the feature is off.
+ * one whose work is started with its keys in the sandbox. Asks the database nothing while the feature is off. `q` is the connection the
+ * caller is on, for one that holds the session's row lock in a transaction and must not borrow a second connection.
  */
-export async function sessionWithholdsSandboxKeys(sessionId: string): Promise<boolean> {
+export async function sessionWithholdsSandboxKeys(sessionId: string, q: Parameters<typeof storedActingAs>[1] = db): Promise<boolean> {
   if (!CLAW_GITHUB_REVIEW_ENABLED) return false;
-  return withholdsSandboxKeys({ acting_as: await storedActingAs(sessionId) });
+  return withholdsSandboxKeys({ acting_as: await storedActingAs(sessionId, q) });
 }
 
-/** Marks a turn that is built here for a session that acts as a user (`withhold_sandbox_keys`, protocol). */
+/**
+ * The owner's stored variables (the env vault: personal tokens for GitHub, Hugging Face, W&B and the like) for a turn in this session, or
+ * none for a session that withholds its sandbox's keys. The vault is the other half of what a sandbox's environment holds of its owner:
+ * the model of such a session reads what strangers wrote and can print whatever the environment holds, so these are not sent either. Not
+ * read here, so not frozen on a queued message and not put on a request. What the callers that read it before the session exists, or
+ * carry what was read earlier, do about it is listed in `test/github-review-acting-user-env.test.ts` (E9); Brain ignores `user_env`
+ * under the mark as well.
+ */
+export async function loadUserEnvForSession(
+  q: Parameters<typeof loadUserEnvSnapshot>[0] & Parameters<typeof storedActingAs>[1],
+  userId: string,
+  sessionId: string,
+  log?: Parameters<typeof loadUserEnvSnapshot>[2],
+): Promise<Record<string, string>> {
+  if (await sessionWithholdsSandboxKeys(sessionId, q)) return {};
+  return await loadUserEnvSnapshot(q, userId, log);
+}
+
+/**
+ * Marks a turn that is built here for a session that acts as a user (`withhold_sandbox_keys`, protocol), and takes the owner's stored
+ * variables off it: whichever way they reached the task (a queued message that was frozen with them before the mark applied), a session
+ * that withholds its sandbox's keys is sent none.
+ */
 export async function applySandboxKeyPolicyToTask(task: Record<string, unknown>, sessionId: string): Promise<void> {
-  if (await sessionWithholdsSandboxKeys(sessionId)) task.withhold_sandbox_keys = true;
+  if (!(await sessionWithholdsSandboxKeys(sessionId))) return;
+  task.withhold_sandbox_keys = true;
+  delete task.user_env;
 }
 
 export async function githubReviewMcpServers(sessionId: string): Promise<McpServers> {

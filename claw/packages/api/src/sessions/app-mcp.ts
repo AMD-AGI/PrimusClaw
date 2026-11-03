@@ -107,6 +107,7 @@ export async function sessionAppMcpServers(
  * path for the same reason, a session that has `config.acting_as` only, under a
  * reserved server name that a request cannot replace. So does what such a session
  * is not given: its sandbox holds none of its owner's keys (`withhold_sandbox_keys`),
+ * and none of its owner's stored variables (any `user_env` is taken off the task),
  * decided from the live row at the claim like the tools are.
  */
 export async function applyAppMcpToTask(task: Record<string, unknown>, sessionId: string): Promise<void> {

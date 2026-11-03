@@ -412,9 +412,11 @@ function buildExecuteRequest(opts: {
   // Lift per-user env snapshot from task.input back to the top-level
   // ExecuteRequest field Brain expects. expandDag embedded it under
   // input.user_env at workbench POST /runs time (workbenches/routes.ts).
+  // None for a session that acts as a user, whatever the task's input holds (a run created before the session was marked, or by a
+  // creator that does not know): its sandbox is given none of its owner's stored variables (github-review/session-tools.ts).
   const rawUserEnv = ((updated.input ?? {}) as Record<string, unknown>).user_env;
   const userEnvForReq =
-    rawUserEnv && typeof rawUserEnv === "object" && !Array.isArray(rawUserEnv)
+    !session.withhold_sandbox_keys && rawUserEnv && typeof rawUserEnv === "object" && !Array.isArray(rawUserEnv)
       ? (rawUserEnv as Record<string, string>)
       : undefined;
   return {

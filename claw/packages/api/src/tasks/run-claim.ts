@@ -10,6 +10,7 @@
  * CAS on an expired-or-absent lease.
  */
 
+import { sessionWithholdsSandboxKeys } from "../github-review/session-tools.js";
 import { applyAppMcpToTask } from "../sessions/app-mcp.js";
 import { createHash, randomBytes } from "node:crypto";
 import type { ExecuteRequest, RunFailClaimReason, RunLease } from "@claw/protocol";
@@ -902,6 +903,12 @@ async function hydrateExecuteRequest(row: ClawTaskRow, leaseToken: string): Prom
 export async function injectLiveUserEnv(request: ExecuteRequest): Promise<void> {
   const userId = request.user_id;
   if (!userId) return;
+  // A session that acts as a user is sent none of its owner's stored variables, whether the request came with some or not, and decided
+  // here from the live row rather than from the mark that `applyAppMcpToTask` may or may not have put on it yet.
+  if (request.session_id && await sessionWithholdsSandboxKeys(request.session_id)) {
+    delete request.user_env;
+    return;
+  }
   const snapshot = await loadUserEnvSnapshot(db, userId, logger);
   if (Object.keys(snapshot).length) request.user_env = snapshot;
 }

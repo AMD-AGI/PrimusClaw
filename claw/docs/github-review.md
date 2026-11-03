@@ -10,8 +10,8 @@ A session can review a public GitHub pull request, and merge it when everything 
 reviewer of record. Four tools do the work. The GitHub token is fetched from the identity
 provider for one tool call, used on the API's side and dropped; it never enters a sandbox, a
 tool result, a log line or an event. Claude, Codex and the other agents that review in a
-sandbox have no token to leak. Nor does the requester's own key: the sandbox of such a session
-holds none (see "The sandbox holds no key").
+sandbox have no token to leak. Nor does the requester's own key or their stored variables: the
+sandbox of such a session holds none of them (see "The sandbox holds no key").
 
 Off by default. With `CLAW_GITHUB_REVIEW_ENABLED` unset there are no tables, no routes, no
 tool offered to a session, and `config.acting_as` is refused.
@@ -233,7 +233,7 @@ turn claimed from the queue, a task of a DAG), and Brain creates its sandbox wit
 the key for what it does itself, the model calls and the workload it creates and owns in SaFE. What a process in
 the sandbox cannot do is call the model or SaFE as the requester: a review reads and runs code, it does not need
 to. The three variables are taken out of the environment once it is composed, whichever layer set them (the
-sandbox spec's, the requester's own stored variables, the request's); every other variable is applied as before.
+sandbox spec's, the request's); every other variable of those layers is applied as before.
 The session's own sandbox, if it holds the keys (one made before the mark existed), is not reused for a marked turn:
 the mark is part of what a sandbox is reused by, so the turn gets a new one, and the fingerprint of a sandbox made
 without the mark is unchanged. A sandbox that a DAG handle names is looked up before that comparison, so a session that
@@ -245,6 +245,28 @@ with the key, and an application is code the session's model can hand text to.
 The key stays where the session already keeps it (the session's stored configuration, server-managed), and is not
 shown to the model or the sandbox. Nothing changes while `CLAW_GITHUB_REVIEW_ENABLED` is off: such a session is
 an ordinary one.
+
+**The requester's stored variables are not sent either.** The requester's env vault (`/v1/env/user`) is where
+personal tokens are kept (GitHub, Hugging Face, W&B and the like), under names no key filter would know, and an ordinary
+session's sandbox is composed with all of it. The model of a session with `config.acting_as` can print those as it can
+print the keys, so such a session is sent none of them, on every path that carries the vault: the API does not read it
+for a message, for a message queued behind a running turn, for the first message of a new session, for the start of the
+session's sandbox, for an event of the Anthropic-compatible route, or for a workbench run into the session; it reads none
+when Brain claims a queued turn, and takes whatever a queued message was frozen with before the mark applied off the turn
+it sends on; and the scheduler's dispatch of a task of a DAG leaves out what the task's input holds. Brain composes none
+of `request.user_env` into the sandbox of a request marked `withhold_sandbox_keys` (and so a change in the vault is not a
+change of such a sandbox), whatever the request carries, as a backstop for one that is sent some anyway. A new place that
+reads the vault or puts it on a request fails `test/github-review-acting-user-env.test.ts` (E9) until it says how it
+decides.
+
+Two other layers of a sandbox's environment are applied as before, and this is why. The request's own `env` (the
+per-message `session_env`) is written by the person, or the allowed service, that sends the message, for that sandbox:
+nothing is read from a store on their behalf, so it carries no secret that the sender did not hand over for the purpose,
+and only the person's own sign-in or an allowed service can send into such a session at all; the three key variables are
+still taken out of it. The system environment (`/v1/env/system`, written by a system administrator) is composed
+into the sandbox of every session of every user as a fallback: it is nobody's personal secret, a model in any other
+session can print the same, and it cannot name the model keys. A personal credential does not belong in it, and a review
+sandbox is not given a smaller one.
 
 ## Review path: the diff or a sandbox
 

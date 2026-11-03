@@ -355,6 +355,17 @@ export function withholdKeyEnv(env: Record<string, string>): void {
 }
 
 /**
+ * The caller's stored variables (its env vault: personal tokens for GitHub, Hugging Face, W&B and the like) that a sandbox for this request
+ * is composed with. None for a request marked `withhold_sandbox_keys`, whatever the request carries: the model of such a session reads what
+ * strangers wrote and can print whatever its sandbox's environment holds, and these are the owner's as the keys are. The API sends none for
+ * such a session; this is for a request that has some anyway (an older API, a queued message frozen before the mark applied). The request's
+ * own `session_env` is the caller's, written on that request, and is not this.
+ */
+export function sandboxUserEnv(request: Pick<ExecuteRequest, "user_env" | "withhold_sandbox_keys">): Record<string, string> {
+  return request.withhold_sandbox_keys ? {} : request.user_env ?? {};
+}
+
+/**
  * Only the two model variables, under the conventional Anthropic / OpenAI
  * names, without `SAFE_API_KEY`. In safe mode the value is still the caller's
  * platform key (see applyPlatformKeyEnv).

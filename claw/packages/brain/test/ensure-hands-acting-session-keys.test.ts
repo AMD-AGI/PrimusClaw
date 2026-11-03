@@ -10,11 +10,16 @@
  * kubernetes half is ensure-hands-acting-session-keys-k8s.test.ts. Both drive the real `ensureHands` and read what the
  * provider was handed, which is what a sandbox is built from: an ordinary request is run beside each, so that a test
  * that cannot see a key at all (a renamed variable) fails here instead of passing for want of one.
+ *
+ * The keys are not the only thing of its owner's that a sandbox's environment holds: the owner's stored variables (the env vault, where
+ * personal tokens are kept: GitHub, Hugging Face, W&B) arrive on the request as `user_env`, and the same model can print those. A marked
+ * request is composed without them whatever it carries (the API sends none for such a session, and Brain does not rely on that).
  */
 import test, { afterEach, before } from "node:test";
 import assert from "node:assert/strict";
 import type { KV } from "nats";
-import { ensureHands, bindSandboxReuseEffects } from "../src/sandbox/ensure-hands.js";
+import { ensureHands, bindSandboxReuseEffects, requestSpecFingerprint } from "../src/sandbox/ensure-hands.js";
+import { resolveSandboxAction } from "../src/sandbox/params.js";
 import { bindHandsKv } from "../src/sandbox/registry.js";
 import { bindSandboxProviders } from "../src/sandbox/factory.js";
 import { HANDS_ENV_PAYLOAD_ENV } from "../src/sandbox/bootstrap.js";
@@ -115,7 +120,7 @@ test("the marker is a switch for a true value only: false and absent are an ordi
   }
 });
 
-test("no layer can put a key back: the spec's env, the user's own variables and the request's env are all taken out of a marked sandbox, and reach an ordinary one", async () => {
+test("no layer can put a key back: the spec's env and the request's env have theirs taken out of a marked sandbox, the user's own variables are not applied at all, and all reach an ordinary one", async () => {
   const layers = {
     sandbox_spec: {
       handle: "main", image: "registry.test/img:1", resources: { cpu: "1", memory: "1Gi" },
@@ -132,7 +137,8 @@ test("no layer can put a key back: the spec's env, the user's own variables and 
   const marked = await sandboxEnvOf({ ...layers, withhold_sandbox_keys: true });
   for (const env of everyEnv(marked)) {
     for (const name of KEY_NAMES) assert.equal(name in env, false, `${name} is not in the sandbox's environment`);
-    assert.deepEqual([env.SPEC_KEPT, env.USER_KEPT, env.SESSION_KEPT], ["1", "1", "1"], "and nothing else is taken out");
+    assert.deepEqual([env.SPEC_KEPT, env.SESSION_KEPT], ["1", "1"], "and nothing else is taken out of the layers that are applied");
+    assert.equal("USER_KEPT" in env, false, "the user's own variables are not one of them: none is composed in (see the test of the stored variables)");
   }
 });
 
@@ -172,4 +178,57 @@ test("a sandbox that was made with the keys is not reused for a turn that is not
   assert.equal("SAFE_API_KEY" in created[1]!.env, false);
   await turn({ withhold_sandbox_keys: true });
   assert.equal(created.length, 2, "and the sandbox it was given is reused for the next one");
+});
+
+/** What an owner keeps in the env vault that is not one of the three key variables: personal tokens, under names a key filter would not know. */
+const VAULT = {
+  GITHUB_TOKEN: "ghp_vault_planted_0001",
+  HF_TOKEN: "hf_vault_planted_0002",
+  WANDB_API_KEY: "wandb_vault_planted_0003",
+  MY_PRIVATE_SETTING: "vault-planted-0004",
+};
+
+test("the owner's stored variables are in an ordinary sandbox and in none of a marked one, in either place its environment travels, and what is not theirs is kept", async () => {
+  const layers = {
+    sandbox_spec: {
+      handle: "main", image: "registry.test/img:1", resources: { cpu: "1", memory: "1Gi" },
+      env: { SPEC_KEPT: "1" },
+    },
+    user_env: { ...VAULT },
+    session_env: { SESSION_KEPT: "1" },
+  } as Partial<ExecuteRequest>;
+  // Control: without the mark the vault reaches both places, so that the absence below is the mark's and not a renamed variable's.
+  for (const env of everyEnv(await sandboxEnvOf(layers))) {
+    for (const [name, value] of Object.entries(VAULT)) assert.equal(env[name], value, `control: ${name} reaches an ordinary sandbox`);
+  }
+  for (const env of everyEnv(await sandboxEnvOf({ ...layers, withhold_sandbox_keys: true }))) {
+    for (const name of Object.keys(VAULT)) assert.equal(name in env, false, `${name} is not in the sandbox's environment`);
+    for (const [name, value] of Object.entries(env)) {
+      for (const secret of Object.values(VAULT)) assert.ok(!value.includes(secret), `${name} carries a stored variable`);
+    }
+    assert.deepEqual([env.SPEC_KEPT, env.SESSION_KEPT], ["1", "1"], "the spec's env and the request's own env are not the vault, and are applied as before");
+    assert.equal(env.CLAW_SESSION_ID, "sess-acting", "and the rest of the environment is built as it always was");
+  }
+});
+
+test("a change in the owner's stored variables is a change in an ordinary sandbox and not in a marked one: nothing was built from it", () => {
+  const request = (over: Partial<ExecuteRequest>): ExecuteRequest => ({
+    session_id: "s-fp", prompt: "carry on", sandbox_image: "example.io/torch:2.4", ...over,
+  } as ExecuteRequest);
+  const fingerprint = (r: ExecuteRequest): string => {
+    const action = resolveSandboxAction(r);
+    assert.equal(action.kind, "create");
+    return requestSpecFingerprint(r, action as never);
+  };
+  assert.notEqual(fingerprint(request({ user_env: { GITHUB_TOKEN: "a" } })), fingerprint(request({ user_env: { GITHUB_TOKEN: "b" } })), "control: an ordinary sandbox is rebuilt over it");
+  assert.equal(
+    fingerprint(request({ user_env: { GITHUB_TOKEN: "a" }, withhold_sandbox_keys: true })),
+    fingerprint(request({ user_env: { GITHUB_TOKEN: "b" }, withhold_sandbox_keys: true })),
+    "a marked one is not",
+  );
+  assert.equal(
+    fingerprint(request({ user_env: { GITHUB_TOKEN: "a" }, withhold_sandbox_keys: true })),
+    fingerprint(request({ withhold_sandbox_keys: true })),
+    "and a marked request that carries some is the one that carries none",
+  );
 });

@@ -98,7 +98,7 @@ test("a session that acts as a user gets a sandbox without the key, wherever its
   }
 });
 
-test("no layer can put the key back: the spec's env, the user's own variables and the request's env are all taken out", async () => {
+test("no layer can put the key back: the spec's env and the request's env have it taken out, and the user's own variables are not applied at all", async () => {
   const layers = {
     sandbox_spec: {
       handle: "main", image: "registry.test/img:1", resources: { cpu: "1", memory: "1Gi" },
@@ -111,6 +111,21 @@ test("no layer can put the key back: the spec's env, the user's own variables an
   assert.deepEqual([ordinary!.ANTHROPIC_API_KEY, ordinary!.OPENAI_API_KEY], ["planted-in-session", "the-users-own"], "control: without the mark they reach the sandbox");
   for (const env of await sandboxEnvOf({ ...layers, withhold_sandbox_keys: true })) {
     for (const name of KEY_NAMES) assert.equal(name in env, false, `${name} is not in the sandbox's environment`);
-    assert.deepEqual([env.SPEC_KEPT, env.USER_KEPT, env.SESSION_KEPT], ["1", "1", "1"], "and nothing else is taken out");
+    assert.deepEqual([env.SPEC_KEPT, env.SESSION_KEPT], ["1", "1"], "and nothing else is taken out of the layers that are applied");
+    assert.equal("USER_KEPT" in env, false, "the user's own variables are not one of them: none is composed in (see the test of the stored variables)");
+  }
+});
+
+test("the owner's stored variables are not in a marked sandbox either, and are in an ordinary one", async () => {
+  const vault = { GITHUB_TOKEN: "ghp_vault_planted_0001", HF_TOKEN: "hf_vault_planted_0002", MY_PRIVATE_SETTING: "vault-planted-0003" };
+  const layers = { user_env: { ...vault }, session_env: { SESSION_KEPT: "1" } } as Partial<ExecuteRequest>;
+  const [ordinary] = await sandboxEnvOf(layers);
+  for (const [name, value] of Object.entries(vault)) assert.equal(ordinary![name], value, `control: ${name} reaches an ordinary sandbox`);
+  for (const env of await sandboxEnvOf({ ...layers, withhold_sandbox_keys: true })) {
+    for (const name of Object.keys(vault)) assert.equal(name in env, false, `${name} is not in the sandbox's environment`);
+    for (const [name, value] of Object.entries(env)) {
+      for (const secret of Object.values(vault)) assert.ok(!value.includes(secret), `${name} carries a stored variable`);
+    }
+    assert.equal(env.SESSION_KEPT, "1", "the request's own env is not the vault");
   }
 });
