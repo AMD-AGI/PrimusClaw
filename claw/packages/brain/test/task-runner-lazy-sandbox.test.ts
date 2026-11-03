@@ -345,8 +345,11 @@ test("a run that declares a cluster is never deferred, valid declaration or not"
   // Neither case can reach a real cluster here, so what is pinned is the
   // branch: no `deferred`, no turn run without the sandbox, and the reason the
   // provisioning stopped is one the caller can act on.
+  // The first stops at the next thing this test environment lacks. It used to stop at the
+  // workspace, until a cluster was placed in the deployment's GPU workspace rather than
+  // refused for want of one on the request (multi-node-gpu-workspace.test.ts).
   const cases: Array<[unknown, RegExp]> = [
-    [{ nodes: 2, backend: "rayjob" }, /requires workspace_id/],
+    [{ nodes: 2, backend: "rayjob" }, /SAFE_API_URL is not configured/],
     [{ node: 64, backend: "rayjob" }, /did you mean nodes/],
   ];
 

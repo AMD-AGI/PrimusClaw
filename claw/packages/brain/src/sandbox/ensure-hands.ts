@@ -44,6 +44,7 @@ import {
 } from "./params.js";
 import type { SandboxAction } from "./params.js";
 import { resourcesJsonToWorkloadArray } from "./workload-resources.js";
+import { sandboxNamespaceForResources } from "./workspace-select.js";
 import type { MultiNodeContext } from "./multi-node/types.js";
 import { writeSandboxSshKey } from "./multi-node/sandbox-key.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
@@ -164,6 +165,7 @@ function effectiveWorkloadResources(
 export function requestSpecFingerprint(
   request: ExecuteRequest,
   action: Extract<SandboxAction, { kind: "create" }>,
+  multiNodeContext?: MultiNodeContext,
 ): string {
   const kubernetes = isKubernetesMode();
   // The same composition the sandbox is actually built from, minus the layers
@@ -182,7 +184,10 @@ export function requestSpecFingerprint(
   const withholdKeys = request.withhold_sandbox_keys === true;
   if (withholdKeys) withholdKeyEnv(env);
   const labels = action.params.labels ?? {};
-  const namespace = sandboxNamespaceFor(request);
+  // The resources the SaFE create will use; the namespace depends on whether they ask
+  // for a GPU, so it is read once and reused for the fingerprint below.
+  const effective = kubernetes ? null : effectiveWorkloadResources(request, action.params);
+  const namespace = sandboxNamespaceFor(request, effective, multiNodeContext);
   if (kubernetes) {
     return sandboxSpecFingerprint({
       image: action.params.image,
@@ -204,7 +209,7 @@ export function requestSpecFingerprint(
     });
   }
   const resources: Record<string, string> = {};
-  for (const entry of effectiveWorkloadResources(request, action.params) ?? []) {
+  for (const entry of effective ?? []) {
     for (const [k, v] of Object.entries(entry)) resources[k] = String(v);
   }
   return sandboxSpecFingerprint({
@@ -228,9 +233,22 @@ export function requestSpecFingerprint(
  * name, the SaFE exec URL and the KV entry keepalive reads back -- and with the
  * fingerprint, since a pod cannot move namespace after it is scheduled.
  */
-function sandboxNamespaceFor(request: ExecuteRequest): string {
-  const fallback = isKubernetesMode() ? AGENT_SANDBOX_NAMESPACE : SANDBOX_NAMESPACE;
-  return request.workspace_id?.trim() || fallback;
+function sandboxNamespaceFor(
+  request: ExecuteRequest,
+  resources?: unknown,
+  multiNodeContext?: MultiNodeContext,
+): string {
+  if (isKubernetesMode()) return request.workspace_id?.trim() || AGENT_SANDBOX_NAMESPACE;
+  // A multi-node run's sandbox goes where its cluster is, whatever the sandbox asks for.
+  // The optimizer in it drives the cluster through the Ray head's service and the Infera
+  // pods' IPs, which resolve only on the cluster's own cluster; a CPU-only sandbox placed
+  // by its resources would land in the CPU workspace, which may be on another one. The
+  // Router follows the namespace (`sandboxRouterBasesFor`), so it is the cluster's.
+  const clusterNamespace = multiNodeContext?.namespace?.trim();
+  if (clusterNamespace) return clusterNamespace;
+  // SaFE mode: a deployment with a CPU workspace chooses by what the sandbox asks for
+  // (see workspace-select.ts); without one this is `workspace_id || SANDBOX_NAMESPACE`.
+  return sandboxNamespaceForResources(request.workspace_id, resources);
 }
 
 /**
@@ -2574,7 +2592,7 @@ async function provisionHands(
 
   // What the caller is asking for, condensed so it can be compared against what
   // the session's existing sandbox was actually built with.
-  const requestedSpec = requestSpecFingerprint(request, action);
+  const requestedSpec = requestSpecFingerprint(request, action, multiNodeContext);
 
   if (!options.skipSessionReuse) {
     const reused = await tryReuseSessionSandbox({
@@ -2703,7 +2721,7 @@ async function provisionHands(
     );
   }
 
-  const nsForSandbox = sandboxNamespaceFor(request);
+  const nsForSandbox = sandboxNamespaceFor(request, workloadResourcesArr, multiNodeContext);
   // Sweeper relies on `dag-root` + `sandbox-handle` to reconcile orphan
   // workloads against the DagHandleMap KV (see task-design.md §9.4 sweeper).
   const labels = composeSandboxLabels({

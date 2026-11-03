@@ -180,7 +180,7 @@ export interface AppRunnerSeams {
 export interface AppSandboxOps {
   /** An existing live sandbox of the run, or a new one, Running; records its id. */
   ensure(run: AppSandboxRun): Promise<AppSandbox>;
-  instance(run: Pick<AppSandboxRun, "workspaceId" | "platformKey">, workloadId: string): SandboxInstance;
+  instance(run: Pick<AppSandboxRun, "workspaceId" | "platformKey" | "sandboxSpec">, workloadId: string): SandboxInstance;
   status(inst: SandboxInstance): Promise<SandboxStatus>;
   exec(inst: SandboxInstance, command: string, timeout: string, opts?: SandboxExecOptions): Promise<SandboxExecResult>;
   stop(inst: SandboxInstance): Promise<void>;
