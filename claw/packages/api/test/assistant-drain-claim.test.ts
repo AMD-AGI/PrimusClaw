@@ -7,7 +7,7 @@
  *
  *   Q1  soak 6, round 16: a worker's report is being dispatched into the idle assistant when a second report finds
  *       the assistant idle too, and the user asks a question. The second report does not start a turn over the first,
- *       the question waits for the first turn instead of taking the gate it is about to take, the first turn can still
+ *       the question is queued at once behind the first turn instead of taking the gate it is about to take, the first turn can still
  *       speak (its say names it), and when it ends the user's question goes before the second report.
  *   Q2  the sweeper and the completion's drain take the same queued message at once: one turn, one run row, and no
  *       duplicate key on `claw_tasks`.
@@ -155,6 +155,11 @@ describe("pending drain claim", { skip }, () => {
     // The user asks while the first turn is still being dispatched.
     const asked = tracked(ask("Which of them is done?"));
     await settledOrWaiting(() => asked.done);
+    // Queued at once, not held in a transaction (and a pooled connection) until the dispatch is over.
+    assert.deepEqual(
+      (await w.pending(alice.routerSid)).map((p) => p.content).filter((c) => c.startsWith("Which")), ["Which of them is done?"],
+      "the question is queued while the first turn is still being dispatched",
+    );
     first.release();
     await one.promise;
     firstDone.release();
@@ -165,10 +170,7 @@ describe("pending drain claim", { skip }, () => {
     assert.equal(published[0].prompt.startsWith(report(1)), true, "the first report's");
     const turn = published[0].messageId;
     assert.deepEqual(await session(), { agent_status: "running", agent_gate_message_id: turn }, "and it holds the session");
-    assert.equal(question.kind, "queued", "the question waited for it");
-    assert.equal(
-      (question as { drain?: string }).drain, "awaiting_turn", "behind the running turn, which drains it",
-    );
+    assert.equal(question.kind, "queued", "the question is behind it, for its completion to drain");
 
     // The turn in front can still speak, and what it says names it.
     const taskId = await runOf(turn);

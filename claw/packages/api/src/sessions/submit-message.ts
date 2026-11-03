@@ -44,7 +44,7 @@ import { loadUserEnvForSession } from "../github-review/session-tools.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
 import { releaseSessionGateForTurn, takeSessionGate } from "../tasks/chat-run.js";
 import { drainOldestPendingMessage } from "../events/consumer.js";
-import { holdPendingDrainClaim } from "./drain-claim.js";
+import { tryPendingDrainClaim } from "./drain-claim.js";
 import { dispatchTaskToBrain, newChatMessageId } from "./dispatch.js";
 
 // The name the route logged these records under before they moved, so a filter an
@@ -115,7 +115,7 @@ export type SubmitSessionMessageInput = SubmitSessionMessageBase & (
 export type QueuedDrain =
   /** The session was running: the turn in front drains the queue when it ends. */
   | "awaiting_turn"
-  /** `enqueue` on an idle session, and the drain returned. */
+  /** `enqueue` on an idle session, or a message queued behind a drain under way, and the drain returned. */
   | "drained"
   /**
    * `enqueue` on an idle session, the drain threw, and the row is still queued:
@@ -278,9 +278,9 @@ export async function submitSessionMessage(
   const client = await db.pool.connect();
   try {
     await client.query("BEGIN");
-    // A drain under way has dispatched a turn that has not taken the gate yet: this message waits for it and then
-    // finds the session running, rather than taking the gate the drain is about to take over it.
-    await holdPendingDrainClaim(client, sessionId);
+    // A drain under way is dispatching a turn that has not taken the gate yet: this message is queued behind it
+    // rather than taking the gate the drain is about to take over it.
+    const drainUnderWay = !await tryPendingDrainClaim(client, sessionId);
     const lockResult = await client.query(
       "SELECT agent_status, user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL FOR UPDATE",
       [sessionId],
@@ -316,7 +316,7 @@ export async function submitSessionMessage(
     // and blocking ALTER TABLE / reads cluster-wide.
     // None for a session that acts as a user: its sandbox is given none of its owner's stored variables (see `loadUserEnvForSession`).
     const userEnvSnapshot = await loadUserEnvForSession(client, userId, sessionId, logger);
-    if (status === "running" || mode === "enqueue") {
+    if (status === "running" || mode === "enqueue" || drainUnderWay) {
       const secrets = pendingSecretColumns({
         llmKey: resolveUserLlmKey(user) || "",
         platformKey: user?.platformKey || "",
@@ -366,8 +366,10 @@ export async function submitSessionMessage(
     const { pendingId, deduplicated, wasRunning } = queued;
     if (deduplicated) return { kind: "queued", pendingId, deduplicated, drain: "duplicate" };
     if (wasRunning) return { kind: "queued", pendingId, deduplicated, drain: "awaiting_turn" };
-    // `enqueue` on a session nobody holds: nothing will complete to drain this,
-    // so it is drained here, after the transaction and on its own connection.
+    // `enqueue` on a session nobody holds, or a message queued behind a drain
+    // that held the session's claim: nothing may complete to drain this, so it
+    // is drained here, after the transaction and on its own connection. Behind
+    // a drain, this one waits for it and does nothing when it started a turn.
     // This is the drain the completion handler runs: a send that takes the gate
     // between the commit above and this call leaves the row to that turn.
     //
