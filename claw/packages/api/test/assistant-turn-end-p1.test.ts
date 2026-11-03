@@ -67,7 +67,7 @@ describe("assistant turn ends and sweeps", { skip }, () => {
     assert.equal(record.run_id, turn.task_id);
     assert.equal(record.generation, turn.gen);
     assert.equal(await routerWakes(), 1);
-    assert.match((await w.pending(alice.routerSid))[0].content, /^\[work_event\] #1 ready v1: Opened PR 12/);
+    assert.match((await w.pending(alice.routerSid))[0].content, /^\[work_event\] #1 \(item_id: kwi_\w+\) ready v1: Opened PR 12/);
   });
 
   test("E1b with nothing to say the record says so, and points at the worker's session", async () => {

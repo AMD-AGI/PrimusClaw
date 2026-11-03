@@ -14,15 +14,23 @@
  *   R2  every decision the Router can make is labelled somewhere: create, send, stop, nothing, and a mix
  *   R3  every item a label names exists, and is open where the label sends to it or stops it
  *   R4  the Router is offered exactly the assistant's five tools, and sees the fixture's items in its prompt
- *   R5  the stand-in refuses what the real tools refuse: a long say, a send to a closed item, an unknown item
+ *   R5  the stand-in refuses what the real tools refuse: a long say, a send to a closed item, an unknown item, a name that is not one
+ *   R5b the stand-in names an item as the real tools do: by id or by number, in every tool and in say
  *   R6  the loop follows the model's calls to the end, and a refused call changes nothing
  *   R7  scoring accepts the listed alternatives, forgives silence only where allowed, and checks item and language
- *   R8  with `strict` an item reference that is not the real id is refused; without it, "#3" means item 3 and is counted
+ *   R8  an item is named by its id or its number as the real tools read it; "#3" is item 3 and is counted as a number
+ *   R8f a turn that ends in plain text and no say is delivered as a say, as the completion handler does, for a turn that answers the user
+ *   R8e the model is sent the user's words with the reply-language line the API adds, and for a report, the language of the user's earlier words
+ *   R8h the verdict is "passed" only for the whole set: a subset that scores well shows its score and does not pass
  *   R9  against a real model the Router's dispatch decisions are at least 95% right, with items named as the real tools
  *       name them (EVAL_STRICT_IDS=0 scores the decisions apart from that); skips without a model
  */
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { createAssistantMcpServer } from "../src/assistant/mcp.js";
@@ -33,7 +41,7 @@ import {
 } from "./e2e/assistant-router-eval-cases.js";
 import {
   effectsOf, fixtureFor, gateReached, manifestOf, messagesLlm, numberFromEnv, pool, resolveItemRef, routerTools, runCase, sameEffects, scoreCase,
-  summarize, userTurn, type Block, type Llm, type ModelResponse,
+  summarize, userTurn, verdictOf, type Block, type Llm, type ModelResponse,
 } from "./e2e/assistant-router-eval-lib.js";
 
 const P = "mcp__assistant__";
@@ -109,7 +117,7 @@ test("R4 the Router is offered exactly the assistant's five tools, and sees the 
   const worker = createAssistantMcpServer({ sid: "s", mid: "m", task_id: "t", exp: 4102444800, role: "worker", item_id: "i", gen: 1 });
   assert.ok(worker);
   const system = renderRouterSystem(manifestOf(FIXTURE));
-  for (const i of FIXTURE) assert.ok(system.includes(`#${i.seq} [${i.boardState}]`), `#${i.seq} is in the prompt`);
+  for (const i of FIXTURE) assert.ok(system.includes(`#${i.seq} (item_id: ${itemIdOf(i.seq)}) [${i.boardState}]`), `#${i.seq} is in the prompt with its id`);
   assert.ok(system.includes("work_create") && system.includes("[work_event]"));
   assert.ok(userTurn("hi").startsWith("hi\n\n"), "the user's words come first");
   assert.ok(userTurn("hi").includes("[Session Context]"));
@@ -122,6 +130,8 @@ test("R5 the stand-in refuses what the real tools refuse", async () => {
       use("work_send", { item_id: itemIdOf(5), text: "more" }),
       use("work_stop", { item_id: itemIdOf(9) }),
       use("work_send", { item_id: "kwi_nope", text: "more" }),
+      use("work_send", { item_id: "the CI one", text: "more" }),
+      use("work_stop", { item_id: "#1, #2", reason: "no" }),
       use("work_recall", { item_id: itemIdOf(2), detail: "worker_tail" }),
       use("nonsense", {}),
     ),
@@ -130,7 +140,8 @@ test("R5 the stand-in refuses what the real tools refuse", async () => {
   const trace = await runCase(byId("chat-01"), { llm: script.llm, tools: await routerTools() });
   const got = trace.calls.map((c) => `${c.tool}:${c.refused ? (c.result as { error: string }).error : "ok"}`);
   assert.deepEqual(got, [
-    "say:text_too_long", "work_send:item_closed", "work_stop:item_closed", "work_send:item_not_found", "work_recall:ok", "nonsense:unknown_tool",
+    "say:text_too_long", "work_send:item_closed", "work_stop:item_closed", "work_send:item_not_found",
+    "work_send:invalid_item_ref", "work_stop:ambiguous_item_ref", "work_recall:ok", "nonsense:unknown_tool",
   ]);
   assert.deepEqual(effectsOf(trace), NOTHING, "refused calls change nothing");
   assert.deepEqual(effectsOf(trace, { attempted: true }).sends, [5], "but are visible as what was attempted");
@@ -224,35 +235,130 @@ test("R7 scoring accepts the listed alternatives, forgives silence only where al
   assert.deepEqual(sum.byKind.duplicate, { total: 1, dispatchOk: 1 });
 });
 
-test("R8 with strict an item reference that is not the real id is refused; without it, \"#3\" means item 3 and is counted", async () => {
+test("R5b the stand-in names an item as the real tools do: by id or by number, in every tool and in say", async () => {
+  const tools = await routerTools();
+  const one = async (name: string, input: Record<string, unknown>) => {
+    const trace = await runCase(byId("chat-01"), { llm: scripted([reply(use(name, input)), reply()]).llm, tools, strictIds: true });
+    return trace.calls[0]!;
+  };
+  for (const ref of [itemIdOf(3), "#3", "3"]) {
+    assert.equal((await one("work_send", { item_id: ref, text: "x" })).refused, false, `work_send ${ref}`);
+    assert.equal((await one("work_recall", { item_id: ref, detail: "summary" })).refused, false, `work_recall ${ref}`);
+    assert.equal((await one("say", { text: "x", item_id: ref })).refused, false, `say ${ref}`);
+    assert.equal((await one("work_stop", { item_id: ref, reason: "x" })).refused, false, `work_stop ${ref}`);
+  }
+  // What the real tool answers with is the item's id and number, whichever way it was named.
+  assert.deepEqual((await one("work_send", { item_id: "#3", text: "x" })).result, { ok: true, item_id: itemIdOf(3), seq: 3, status: "in_progress" });
+  assert.deepEqual((await one("work_stop", { item_id: "3", reason: "x" })).result, { ok: true, item_id: itemIdOf(3), seq: 3, outcome: "stopped" });
+  // A blank item names no item, as in the real say.
+  assert.equal((await one("say", { text: "x", item_id: "  " })).refused, false);
+  for (const tool of ["say", "work_send", "work_stop", "work_recall"]) {
+    const input = { text: "x", reason: "x", detail: "summary" };
+    const refused = async (ref: unknown) => (await one(tool, { ...input, item_id: ref })).result as { error: string };
+    assert.equal((await refused("#99")).error, "item_not_found", `${tool}: a number that is no item`);
+    assert.equal((await refused("the CI one")).error, "invalid_item_ref", `${tool}: not a reference`);
+    assert.equal((await refused("#1 #2")).error, "ambiguous_item_ref", `${tool}: two items`);
+    assert.equal((await refused(3)).error, "invalid_arguments", `${tool}: not a string`);
+  }
+});
+
+test("R8 an item is named by its id or its number as the real tools read it; a number is counted as one", async () => {
   const items = FIXTURE.map((i) => ({ ...i }));
   assert.deepEqual(resolveItemRef(itemIdOf(3), items), { seq: 3, exact: true });
   for (const ref of ["3", "#3", " #3 ", "item 3", "Item #3"]) assert.deepEqual(resolveItemRef(ref, items), { seq: 3, exact: false }, ref);
   for (const ref of ["#99", "kwi_other", "three", "", undefined, 3]) assert.equal(resolveItemRef(ref, items).seq, null, String(ref));
-  assert.equal(resolveItemRef("#3", items, true).seq, null);
-  assert.equal(resolveItemRef(itemIdOf(3), items, true).seq, 3);
+  assert.equal(resolveItemRef("#99", items).refusal?.error, "item_not_found");
+  assert.equal(resolveItemRef("three", items).refusal?.error, "invalid_item_ref");
+  assert.equal(resolveItemRef("seq 3", items).seq, null, "not a form the real tools read");
+  assert.equal(resolveItemRef("seq 3", items, true).seq, 3, "but read when asked to be lenient");
 
   const tools = await routerTools();
   const call = () => scripted([reply(use("work_send", { item_id: "#3", text: "weekly" }), use("say", { text: "Sent to #3.", item_id: "#3" })), reply()]).llm;
-  const lenient = await runCase(byId("fol-04"), { llm: call(), tools });
-  assert.deepEqual(effectsOf(lenient).sends, [3]);
-  const s = scoreCase(byId("fol-04"), lenient);
-  assert.ok(s.dispatchOk);
-  assert.equal(s.inexactRefs, 2);
   const strict = await runCase(byId("fol-04"), { llm: call(), tools, strictIds: true });
-  assert.deepEqual(effectsOf(strict).sends, [], "refused, so nothing was sent");
-  assert.deepEqual(scoreCase(byId("fol-04"), strict).refusals, ["work_send:item_not_found", "say:item_not_found"]);
-  assert.equal(scoreCase(byId("fol-04"), strict).inexactRefs, 2, "counted whether or not the call was refused");
-  // With the real id from the conversation, strict passes.
+  assert.deepEqual(effectsOf(strict).sends, [3], "the real tools take a number");
+  const s = scoreCase(byId("fol-04"), strict);
+  assert.ok(s.dispatchOk);
+  assert.deepEqual(s.refusals, []);
+  assert.equal(s.inexactRefs, 2, "and the numbers are counted");
+  // A reference that names nothing is refused with the reason, and changes nothing.
+  const lost = await runCase(byId("fol-04"), {
+    llm: scripted([reply(use("work_send", { item_id: "the weekly one", text: "weekly" }), use("say", { text: "Sent.", item_id: "#3" })), reply()]).llm, tools, strictIds: true,
+  });
+  assert.deepEqual(effectsOf(lost).sends, [], "refused, so nothing was sent");
+  assert.deepEqual(scoreCase(byId("fol-04"), lost).refusals, ["work_send:invalid_item_ref"]);
+  // With the real id from the conversation it is the item's own id, and not a number.
   const exact = await runCase(byId("fol-16"), {
     llm: scripted([reply(use("work_send", { item_id: itemIdOf(8), text: "also hands" }), use("say", { text: "Added." })), reply()]).llm, tools, strictIds: true,
   });
   assert.deepEqual(effectsOf(exact).sends, [8]);
+  assert.equal(scoreCase(byId("fol-16"), exact).inexactRefs, 0);
   // The earlier turns are in what the model is sent, with the id the earlier work_create returned.
   const sent = scripted([reply()]);
   await runCase(byId("fol-16"), { llm: sent.llm, tools });
   assert.ok(JSON.stringify(sent.sent[0]?.messages).includes(itemIdOf(8)));
   assert.equal(sent.sent[0]?.messages.at(-1)?.role, "user");
+});
+
+test("R8e the model is sent the user's words with the reply-language line the API adds, and for a report the language of their earlier words", async () => {
+  const tools = await routerTools();
+  const lastUser = async (c: EvalCase): Promise<string> => {
+    const sent = scripted([reply()]);
+    await runCase(c, { llm: sent.llm, tools });
+    return String(sent.sent[0]?.messages.at(-1)?.content);
+  };
+  // The line follows the user's words and comes before what Brain adds after them.
+  const en = await lastUser(byId("new-02"));
+  assert.ok(en.startsWith(`${byId("new-02").text}\n\n[Reply language: English]\n\n`), en);
+  assert.ok(en.indexOf("[Reply language: English]") < en.indexOf("Available MCP servers"), "before what Brain adds after the user's words");
+  assert.ok((await lastUser(byId("new-01"))).includes("\n\n[Reply language: Chinese]\n\n"));
+  // A worker's report says nothing of the user's language: the case's earlier user turn is Chinese, so the line is Chinese.
+  const withHistory = CASES.find((c) => c.text.startsWith("[work_event]") && c.history?.length);
+  if (withHistory) {
+    const earlierZh = /\p{Script=Han}/u.test(withHistory.history![withHistory.history!.length - 1]!.user);
+    assert.ok((await lastUser(withHistory)).includes(`[Reply language: ${earlierZh ? "Chinese" : "English"}]`), withHistory.id);
+  }
+  // With no earlier words to learn it from, a report is sent as it is.
+  const report = CASES.find((c) => c.text.startsWith("[work_event]") && !c.history?.length) as EvalCase;
+  assert.ok(!(await lastUser(report)).includes("[Reply language"), report.id);
+  // The history the model is sent holds the user's words as they were stored, without the line.
+  const sent = scripted([reply()]);
+  const hist = CASES.find((c) => c.history?.length && !c.text.startsWith("[work_event]")) as EvalCase;
+  await runCase(hist, { llm: sent.llm, tools });
+  assert.ok(!JSON.stringify(sent.sent[0]?.messages.slice(0, -1)).includes("Reply language"));
+});
+
+test("R8f a turn that ends in plain text and no say is delivered as a say, for a turn that answers the user", async () => {
+  const tools = await routerTools();
+  const run = (c: EvalCase, ...replies: ModelResponse[]) => runCase(c, { llm: scripted(replies).llm, tools });
+  const hi = byId("chat-01");
+  const answer = "Hello! Nothing needs you right now.";
+
+  const plain = await run(hi, reply(text(answer)));
+  assert.equal(plain.delivered, answer);
+  const score = scoreCase(hi, plain);
+  assert.ok(score.rescued && score.spokeOk && score.turnOk, "the user heard it");
+  assert.equal(score.spoke, 1);
+  // What is delivered is checked for language like a say is.
+  const wrong = scoreCase(hi, await run(hi, reply(text("你好，目前没有需要你处理的事。"))));
+  assert.ok(wrong.rescued && !wrong.langOk && !wrong.turnOk);
+
+  // A turn that said something is not given a second message, whatever else it wrote.
+  const said = await run(hi, reply(use("say", { text: "Hi!" }), text("Done.")), reply());
+  assert.equal(said.delivered, undefined);
+  assert.equal(scoreCase(hi, said).rescued, false);
+  // A say the tools refused told the user nothing.
+  const refused = await run(hi, reply(use("say", { text: "x".repeat(SAY_MAX_CHARS + 1) }), text("It was too long.")), reply());
+  assert.equal(refused.delivered, "It was too long.");
+  // No text, no message: silence stays silence (the case that needs a reply is then a miss).
+  const silent = await run(hi, reply());
+  assert.equal(silent.delivered, undefined);
+  assert.ok(!scoreCase(hi, silent).spokeOk);
+  // A turn that a worker's report started may end silent on purpose, and what it wrote then is not for the user.
+  const report = CASES.find((c) => c.text.startsWith("[work_event]")) as EvalCase;
+  assert.equal((await run(report, reply(text("Nothing to tell the user.")))).delivered, undefined);
+  // A model that could not be reached delivers nothing.
+  const dead = await runCase(hi, { llm: async () => { throw new Error("HTTP 503"); }, tools });
+  assert.equal(dead.delivered, undefined);
 });
 
 test("R8b the model call is the Messages request, retries only what may pass, and never puts the key anywhere else", async () => {
@@ -326,6 +432,53 @@ test("R8d a setting that is not a number in range is refused rather than read as
   assert.equal(gateReached([], 0, 0.95), false, "no runs");
   assert.equal(gateReached([], Number.NaN, 0.95), false, "a count that is not a number");
   assert.equal(gateReached([1], 3, 0.95), false, "fewer runs than were asked for");
+});
+
+test("R8h the verdict is passed only for the whole set, and the summary line says how it was run", async () => {
+  assert.deepEqual(verdictOf([1], 1, 0.95, CASES.length, CASES.length), { full_set: true, passed: true });
+  assert.deepEqual(verdictOf([0.9], 1, 0.95, CASES.length, CASES.length), { full_set: true, passed: false }, "the whole set under the gate");
+  assert.deepEqual(verdictOf([1], 1, 0.95, 3, CASES.length), { full_set: false, passed: false }, "a subset that scores 100% does not pass");
+  assert.deepEqual(verdictOf([1, 1], 3, 0.95, CASES.length, CASES.length), { full_set: true, passed: false }, "fewer runs than asked for");
+
+  // The script itself, against a gateway that answers every call with a plain "hello": right for a case that expects no
+  // dispatch, so a subset made of such a case scores 100%.
+  const gateway = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ content: [{ type: "text", text: "Hello! How can I help?" }], stop_reason: "end_turn" }));
+    });
+  });
+  await new Promise<void>((resolve) => gateway.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${(gateway.address() as AddressInfo).port}`;
+  const script = fileURLToPath(new URL("./e2e/assistant-router-eval.ts", import.meta.url));
+  const run = (env: Record<string, string>) => new Promise<{ code: number | null; last: Record<string, unknown>; out: string }>((resolve, reject) => {
+    const child = spawn(process.execPath, ["--import", "tsx", script], {
+      env: { PATH: process.env.PATH ?? "", EVAL_BASE_URL: base, EVAL_MODEL: "stub", EVAL_KEY: "stub-key", EVAL_RUNS: "1", ...env },
+    });
+    let out = "";
+    child.stdout.on("data", (d) => { out += d; });
+    child.stderr.on("data", (d) => { out += d; });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      const line = out.trim().split("\n").filter((l) => l.startsWith("{")).at(-1);
+      resolve({ code, last: line ? JSON.parse(line) : {}, out });
+    });
+  });
+  try {
+    const subset = await run({ EVAL_CASES: "chat-01" });
+    assert.deepEqual(subset.last.accuracy, [1], subset.out);
+    assert.equal(subset.last.cases, 1);
+    assert.equal(subset.last.full_set, false);
+    assert.equal(subset.last.passed, false, "a subset does not pass");
+    assert.notEqual(subset.code, 0);
+    assert.match(subset.out, /a subset of the set \(1 of \d+ cases\)/);
+    assert.equal(subset.last.strict_ids, true, "the summary says how item references were read");
+    const lenient = await run({ EVAL_CASES: "chat-01", EVAL_STRICT_IDS: "0" });
+    assert.equal(lenient.last.strict_ids, false);
+  } finally {
+    gateway.close();
+  }
 });
 
 test("R8c the pool keeps the order of the results and the bound on what is in flight", async () => {

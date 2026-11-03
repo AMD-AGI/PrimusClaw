@@ -17,6 +17,7 @@
  */
 import { CLAW_ASSISTANT_MAX_ACTIVE_ITEMS } from "../config.js";
 import { db, inTransaction, type Querier, type StatementRunner } from "../infra/db.js";
+import { ITEM_REF_HINT, parseItemRef, type ItemRefError } from "./item-ref.js";
 import { stopSessionRuns } from "../tasks/chat-run.js";
 import { newWorkItemId } from "../tasks/ids.js";
 
@@ -208,6 +209,44 @@ export async function getWorkItem(userId: string, itemId: string): Promise<Recor
   )).rows as Array<Record<string, unknown>>;
   return rows[0] ?? null;
 }
+
+/** What a reference named: enough to act on the item, whichever way it was named. */
+export interface ResolvedItem {
+  item_id: string;
+  seq: number;
+  worker_session_id: string;
+}
+
+export type ItemLookup =
+  | { ok: true; item: ResolvedItem }
+  | { ok: false; error: ItemRefError | "item_not_found"; message: string };
+
+/**
+ * The item a reference names among this user's own, by its id or by its number (`item-ref.ts`).
+ *
+ * The user is part of the lookup, never a check after it: a number is only unique per user, and another user's
+ * item, named by its id or by a number, is indistinguishable from one that does not exist. `forUpdate` locks the
+ * row for the caller's transaction.
+ */
+export async function resolveWorkItem(
+  run: (text: string, params?: unknown[]) => Promise<{ rows: unknown[] }>,
+  userId: string, raw: unknown, opts: { forUpdate?: boolean } = {},
+): Promise<ItemLookup> {
+  const parsed = parseItemRef(raw);
+  if (!parsed.ok) return parsed;
+  const byId = parsed.ref.by === "id";
+  const row = (await run(
+    `SELECT item_id, seq, worker_session_id FROM claw_work_items
+      WHERE user_id = $1 AND ${byId ? "item_id" : "seq"} = $2${opts.forUpdate ? " FOR UPDATE" : ""}`,
+    [userId, parsed.ref.by === "id" ? parsed.ref.itemId : parsed.ref.seq],
+  )).rows[0] as ResolvedItem | undefined;
+  if (!row) return { ok: false, error: "item_not_found", message: `no such item: ${ITEM_REF_HINT}` };
+  return { ok: true, item: { item_id: row.item_id, seq: Number(row.seq), worker_session_id: row.worker_session_id } };
+}
+
+/** `resolveWorkItem` outside a transaction. */
+export const resolveWorkItemNow = (userId: string, raw: unknown): Promise<ItemLookup> =>
+  resolveWorkItem((text, params) => db.query(text, params), userId, raw);
 
 export async function listWorkItems(userId: string, state: BoardState | null): Promise<WorkItemView[]> {
   const rows = (await db.query(

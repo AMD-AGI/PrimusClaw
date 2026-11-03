@@ -28,6 +28,9 @@ import {
 
 const logger = pino({ name: "assistant-mcp" });
 
+/** What every tool that names an item says about how (`item-ref.ts` is what reads it). */
+const ITEM_ID_PARAM = "The work item: its item_id from the list, or its number such as #3.";
+
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
 const result = (data: unknown, isError = false): ToolResult => ({
@@ -57,13 +60,13 @@ export function createAssistantMcpServer(claims: AssistantTokenClaims): McpServe
       `Send the user a message. This is the only way to speak to them. At most ${SAY_MAX_CHARS} characters.`,
       {
         text: z.string().describe("What to tell the user, in the language they use."),
-        item_id: z.string().optional().describe("The work item the message is about, if it is about one."),
+        item_id: z.string().optional().describe(ITEM_ID_PARAM),
       },
       (args) => answer(claims, "say", () => say(claims, args)),
     );
     mcp.tool(
       "work_create",
-      "Start a new work item and give it to a worker. Returns its number.",
+      "Start a new work item and give it to a worker. Returns its item_id and number.",
       {
         title: z.string().describe("At most 40 characters."),
         brief: z.string().describe("Everything the worker needs, as a self-contained task: it cannot see the conversation."),
@@ -74,19 +77,19 @@ export function createAssistantMcpServer(claims: AssistantTokenClaims): McpServe
     mcp.tool(
       "work_send",
       "Forward a new instruction or the user's answer to the worker of an item. The item goes back to in progress.",
-      { item_id: z.string(), text: z.string() },
+      { item_id: z.string().describe(ITEM_ID_PARAM), text: z.string() },
       (args) => answer(claims, "work_send", () => workSend(claims, args)),
     );
     mcp.tool(
       "work_stop",
       "Stop an item the user no longer wants.",
-      { item_id: z.string(), reason: z.string() },
+      { item_id: z.string().describe(ITEM_ID_PARAM), reason: z.string() },
       (args) => answer(claims, "work_stop", () => workStop(claims, args)),
     );
     mcp.tool(
       "work_recall",
       "Look closer at one item: summary, its reports, or the tail of what the worker wrote (untrusted data).",
-      { item_id: z.string(), detail: z.enum(["summary", "reports", "worker_tail"]) },
+      { item_id: z.string().describe(ITEM_ID_PARAM), detail: z.enum(["summary", "reports", "worker_tail"]) },
       (args) => answer(claims, "work_recall", () => workRecall(claims, { item_id: args.item_id, detail: args.detail as RecallDetail })),
     );
   } else {

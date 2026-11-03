@@ -8,7 +8,8 @@
  * answered by a stand-in, and scores the decisions against `assistant-router-eval-cases.ts`.
  *
  * The plan's gate (super-agent P1 plan, 12.7): at least 60 cases, at least 95% of the dispatch decisions right,
- * before the assistant is turned on for everyone. Exit 0 only if every run reaches the gate.
+ * before the assistant is turned on for everyone. Exit 0 only if every run of the whole set reaches the gate: a run
+ * of a subset (EVAL_CASES) prints its scores, says it is a subset, and never passes.
  *
  *   EVAL_BASE_URL=https://gateway.example/api EVAL_MODEL=<the Router's model> EVAL_KEY_FILE=/path/to/key \
  *     npx tsx test/e2e/assistant-router-eval.ts
@@ -18,22 +19,23 @@
  * Optional:
  *   EVAL_RUNS          runs of the whole set (default 1; the model is not deterministic, so use 3)
  *   EVAL_CONCURRENCY   calls in flight (default 2, at most 4)
- *   EVAL_CASES         comma list of case ids or kinds to run (default all)
+ *   EVAL_CASES         comma list of case ids or kinds to run (default all); a subset is never "passed"
  *   EVAL_OUT           a directory for the full traces, one JSON file per run (default: none)
  *   EVAL_GATE          the accuracy to reach, 0..1 (default 0.95)
- *   EVAL_STRICT_IDS    default 1: an item reference that is not the item's real id is refused, as the real tools
- *                      refuse it, so the score is what the system as built would do. 0: "#3" and "3" are read as item 3,
- *                      which scores the Router's decisions apart from how it names an item (the count of references that
- *                      are not a real id is printed either way).
+ *   EVAL_STRICT_IDS    default 1: an item is named as the real tools read it (its item_id, or its number as "#3" or "3")
+ *                      and anything else is refused as they refuse it, so the score is what the system as built would do.
+ *                      0: a few more spellings of a number are read as well (the count of references by number rather than
+ *                      by id is printed either way).
  *
- * The last line is a JSON summary.
+ * The last line is a JSON summary: the model, how many cases ran and whether that is the whole set (`full_set`), the
+ * strictness of the item references (`strict_ids`), the runs, the gate, each run's accuracy and `passed`.
  */
 import { readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { CASES, type EvalCase } from "./assistant-router-eval-cases.js";
 import {
-  describeEffects, gateReached, messagesLlm, numberFromEnv, pool, routerTools, runCase, scoreCase, summarize, type Score, type Trace,
+  describeEffects, messagesLlm, numberFromEnv, pool, routerTools, runCase, scoreCase, summarize, verdictOf, type Score, type Trace,
 } from "./assistant-router-eval-lib.js";
 
 const need = (name: string): string => {
@@ -91,8 +93,9 @@ async function main(): Promise<void> {
     console.log("  by kind: " + Object.entries(sum.byKind).map(([k, v]) => `${k} ${v.dispatchOk}/${v.total}`).join(", "));
     const inexact = scores.reduce((n, s) => n + s.inexactRefs, 0);
     const refused = scores.reduce((n, s) => n + s.refusals.length, 0);
-    console.log(`  item references that are not the item's real id: ${inexact}; calls the tools refused: ${refused}`);
+    console.log(`  item references by number rather than by id: ${inexact}; calls the tools refused: ${refused}`);
     console.log(`  replies written in the same step as a work call, before its result: ${scores.reduce((n, s) => n + s.saidBeforeResult, 0)}; of those beside a call that was refused: ${scores.reduce((n, s) => n + s.saidBesideRefusal, 0)}`);
+    console.log(`  turns that ended in plain text and no say, delivered as a say by the turn end: ${scores.filter((s) => s.rescued).length}`);
     for (const { c, trace, score } of done) {
       if (score.turnOk) continue;
       const why = [
@@ -114,9 +117,12 @@ async function main(): Promise<void> {
     }
   }
 
-  const ok = gateReached(accuracies, RUNS, GATE);
-  console.log(JSON.stringify({ model: MODEL, cases: cases.length, runs: RUNS, gate: GATE, accuracy: accuracies, passed: ok }));
-  process.exit(ok ? 0 : 1);
+  const { full_set, passed } = verdictOf(accuracies, RUNS, GATE, cases.length, CASES.length);
+  if (!full_set) console.log(`${iso()} a subset of the set (${cases.length} of ${CASES.length} cases): the gate is judged on the whole set only, so this does not pass`);
+  console.log(JSON.stringify({
+    model: MODEL, cases: cases.length, full_set, strict_ids: STRICT_IDS, runs: RUNS, gate: GATE, accuracy: accuracies, passed,
+  }));
+  process.exit(passed ? 0 : 1);
 }
 
 main().catch((err) => { console.error(err instanceof Error ? err.message : String(err)); process.exit(1); });
