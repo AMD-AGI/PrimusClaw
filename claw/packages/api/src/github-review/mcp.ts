@@ -9,8 +9,8 @@
  *    session row again (still there, same owner, same `acting_as`), and the tools
  *    themselves enforce every gate (see service.ts). The path is under
  *    `/v1/internal/`, which the global authentication hook leaves to the route.
- *  - `GET /v1/github-review/confirmations` and `POST .../:id/decision`: a merge held
- *    for the acting user, and their answer. Ordinary authenticated routes; only the
+ *  - `GET /v1/github-review/confirmations` and `POST .../:id/decision`: a high-risk write (a merge or
+ *    an approving review) held for the acting user, and their answer. Ordinary authenticated routes; only the
  *    acting user can decide, and only with a credential a sandbox cannot obtain (see
  *    attended.ts): neither the key a session's sandbox holds nor a browser session that
  *    key can sign in to. A service an operator has allowed
@@ -32,6 +32,7 @@ import { CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
 import { db } from "../infra/db.js";
 import { parseActingAs } from "./acting-as.js";
 import { classifyAttendedCaller } from "./attended.js";
+import { reviewTargetOf } from "./review-target.js";
 import { GithubReview, type ReviewActor, type ToolOutcome } from "./service.js";
 import { readGithubReviewSettings, type GithubReviewSettings } from "./settings.js";
 import { listConfirmations, type ConfirmationStatus, type Queryable } from "./store.js";
@@ -79,14 +80,15 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor)
   mcp.tool(
     "gh_pr_risk",
     "The risk verdict for a pull request, from rules that read what the change does (architecture, interfaces, security-sensitive code, CI and release, "
-    + "dependencies, size) with the floor under them (high means a merge needs the acting user's own confirmation). Pass your own `risk_judgement` to add to it.",
+    + "dependencies, size) with the floor under them (high means an approval or a merge needs the acting user's own confirmation). Pass your own `risk_judgement` to add to it.",
     { pr: z.string().describe(PR_HELP), risk_flags: FLAGS, risk_judgement: JUDGEMENT },
     async (a) => toResult(await service.assessPr(actor, a)),
   );
   mcp.tool(
     "gh_review_submit",
-    "Post one review on the pinned head commit, with inline comments. APPROVE is refused when the user who asked wrote the pull request, "
-    + "and unless CI is green, no thread is open and the change is not high risk (then use gh_pr_merge, which asks the acting user). "
+    "Post one review on the pinned head commit, with inline comments. APPROVE is refused when the acting user wrote the pull request, "
+    + "and unless CI is green and no thread is open. A COMMENT or REQUEST_CHANGES review, and an APPROVE of a change that is not high risk, are posted at once. "
+    + "An APPROVE of a high-risk change is not: the answer is confirmation_required, and you say that it waits for the acting user. "
     + "The review is signed with the acting user's account and a footer that names who asked.",
     {
       pr: z.string().describe(PR_HELP),
@@ -104,7 +106,9 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor)
   mcp.tool(
     "gh_pr_merge",
     "Approve (when needed) and merge the pull request if every gate is open: CI green on the head commit, no unresolved thread, merge state CLEAN, "
-    + "the acting user allowing it, and no high-risk change without their confirmation. It never bypasses a protection.",
+    + "the acting user allowing it (refused when they wrote the pull request), and no high-risk change without their confirmation: a high-risk merge answers confirmation_required and waits for them. "
+    + "A branch that is merged through a merge queue gets the pull request put in the queue instead (status queued, never merged): the queue runs its own checks and merges it, and this tool does not follow it. "
+    + "It never bypasses a protection.",
     {
       pr: z.string().describe(PR_HELP),
       head_sha: z.string().describe("The head_sha from gh_pr_get"),
@@ -121,7 +125,7 @@ function refuse(reply: FastifyReply, status: number, error: string): FastifyRepl
   return reply.status(status).send({ ok: false, error });
 }
 
-const CONFIRMATION_STATUSES = new Set<string>(["pending", "merging", "merged", "denied", "stale", "expired", "refused"]);
+const CONFIRMATION_STATUSES = new Set<string>(["pending", "merging", "merged", "queued", "submitted", "denied", "stale", "expired", "refused"]);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export async function registerGithubReviewRoutes(app: FastifyInstance, opts: GithubReviewRouteOptions = {}): Promise<void> {
@@ -160,9 +164,15 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
     if (!row || row.user_id !== claims.requesterUserId || !acting.ok || acting.actingAs !== claims.actorUserId) {
       return refuse(reply, 403, "session_mismatch");
     }
+    // A target that is there and cannot be read is not "no target": the session does not get the tools.
+    const target = reviewTargetOf(row.config);
+    if (!target.ok) {
+      logger.warn({ sessionId: claims.sessionId }, "github_review.review_target_unreadable");
+      return refuse(reply, 403, "review_target_invalid");
+    }
     const label = typeof row.config?.acting_as_requester === "string" ? row.config.acting_as_requester : undefined;
     const mcp = buildReviewToolServer(service, {
-      sessionId: claims.sessionId, requesterUserId: claims.requesterUserId, actorUserId: claims.actorUserId, requesterLabel: label,
+      sessionId: claims.sessionId, requesterUserId: claims.requesterUserId, actorUserId: claims.actorUserId, requesterLabel: label, reviewTarget: target.target,
     });
     // Stateless, like the platform's own MCP endpoint: one server and transport per request.
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined as unknown as () => string });
@@ -184,7 +194,7 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
     const items = (await listConfirmations(database, user.userId, {
       sessionId: typeof q.session_id === "string" && q.session_id ? q.session_id : undefined, status: status as ConfirmationStatus,
     })).map((c) => ({
-      id: c.id, repo: c.repo, pr: c.pr, title: c.title, author: c.author, head_sha: c.headSha, reasons: c.reasons, checks: c.checks,
+      id: c.id, kind: c.kind, review: c.review, repo: c.repo, pr: c.pr, title: c.title, author: c.author, head_sha: c.headSha, reasons: c.reasons, checks: c.checks,
       actor_user_id: c.actorUserId, requester_user_id: c.requesterUserId, session_id: c.sessionId, expires_at: c.expiresAt, status: c.status,
       decided_by: c.decidedBy, decided_via: c.decidedVia,
     }));

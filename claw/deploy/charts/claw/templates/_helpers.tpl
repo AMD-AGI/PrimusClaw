@@ -21,6 +21,23 @@
 {{- default (printf "%s-pguser-%s" .Values.postgres.clusterName .Values.postgres.appUser) .Values.postgres.userSecretName -}}
 {{- end -}}
 
+{{- /*
+The directory the chart itself mounts a volume at in a container, read from
+mount-paths.json ({container: {volume name: directory}}). That file is the only
+place these paths are written: the Deployments take them from here, and
+claw/deploy/extra-values.py refuses an EXTRA_*_MOUNTS_* entry at any of them
+(a container cannot have two mounts at one path), so the two cannot drift.
+
+Call as: include "primus-claw.mountPath" (list . "api" "extra-ca")
+*/ -}}
+{{- define "primus-claw.mountPath" -}}
+{{- $root := index . 0 -}}
+{{- $container := index . 1 -}}
+{{- $volume := index . 2 -}}
+{{- $all := $root.Files.Get "mount-paths.json" | fromJson -}}
+{{- required (printf "mount-paths.json has no %s.%s" $container $volume) (index (index $all $container | default dict) $volume) -}}
+{{- end -}}
+
 {{- define "primus-claw.labels" -}}
 app: primus-claw
 app.kubernetes.io/name: {{ include "primus-claw.name" . }}
