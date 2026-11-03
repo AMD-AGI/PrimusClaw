@@ -18,7 +18,7 @@ import { WebFetchService, fetchWithRedirects, guardedLookup, isBlockedAddress } 
 test("address ranges: inward addresses are blocked, public ones are not", () => {
   const cases: Array<[string, boolean]> = [
     ["10.96.0.1", true],            // a typical ClusterIP
-    ["192.168.170.254", true],      // ClusterIP shape on the cluster this ships to
+    ["192.168.170.254", true],      // a ClusterIP drawn from 192.168/16
     ["172.16.1.239", true],         // pod IP shape
     ["169.254.169.254", true],      // cloud metadata
     ["127.0.0.1", true],
@@ -97,7 +97,7 @@ test("web_fetch refuses inward targets with an SSRF error and without connecting
     "https://192.168.170.254/v1/health",
     "https://10.96.0.1/",
     "https://kubernetes.default.svc.cluster.local/",
-    "https://primus-claw-api.primus-claw.svc/",
+    "https://api.some-namespace.svc/",
     "https://metadata.google.internal/computeMetadata/v1/",
     "https://anything.localhost/",
   ];
