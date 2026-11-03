@@ -159,7 +159,8 @@ unattended while Cursor keeps asking. For that agent the connector then:
 
 **Before the first phone session, check which way your Claude settings go.** When `permissions.defaultMode` is
 `bypassPermissions` in your user `settings.json` (`$CLAUDE_CONFIG_DIR`, else `~/.claude`) or in Claude's managed settings,
-every session of a `claude` or `claude-attach` agent without `approval = "never"` is closed with `mode_not_enforced`.
+every session of a `claude` agent without `approval = "never"` is closed with `mode_not_enforced` (a `claude-attach`
+agent accepts the warning while it takes a conversation over, so it is not affected).
 `claw-connector status` and the start-up line of `run` say so for each such agent:
 
 ```

@@ -26,8 +26,12 @@ import path from "node:path";
 import type { AgentConfig } from "./config.js";
 import { isObject } from "./util.js";
 
-/** The agent kinds that run the Claude adapter (the `claude` and `claude-attach` presets). */
-const CLAUDE_KINDS = new Set(["claude", "attach"]);
+/**
+ * The agents this applies to: those made from the `claude` preset. A `claude-attach` agent takes over a conversation
+ * whose mode was chosen in a terminal, and accepts the adapter's warning while it starts (session.ts,
+ * `inheritedWarningOk`), so its sessions are not closed for it.
+ */
+const isClaude = (a: AgentConfig): boolean => a.kind === "claude" && !a.attach;
 
 type Source = "user" | "project" | "local" | "managed";
 
@@ -104,7 +108,7 @@ export function claudeStartMode(o: StartModeInput): StartMode {
 export function noAskWarnings(agents: AgentConfig[], env: NodeJS.ProcessEnv, opts: { managedFile?: string; euid?: number | null } = {}): string[] {
   const out: string[] = [];
   for (const a of agents) {
-    if (!CLAUDE_KINDS.has(a.kind) || a.allowUnsafeModes) continue;
+    if (!isClaude(a) || a.allowUnsafeModes) continue;
     const agentEnv = { ...env, ...a.env };
     const files = new Set<string>();
     const unreadable = new Set<string>();
