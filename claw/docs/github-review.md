@@ -335,6 +335,12 @@ into the sandbox of every session of every user as a fallback: it is nobody's pe
 session can print the same, and it cannot name the model keys. A personal credential does not belong in it, and a review
 sandbox is not given a smaller one.
 
+**The deployment's platform defaults are not given either.** The default MCP servers
+(`PLATFORM_DEFAULTS_FILE`) are called with the requester's own key, and the model of such a session can be
+steered by what a pull request says, so a default server's read tools would answer it as the requester. A turn marked
+`withhold_sandbox_keys` is given no default MCP server and no default skill, on every path above; it has the review
+tools and whatever its own request names. See `platform-defaults.md`.
+
 ## Review path: the diff or a sandbox
 
 A sandbox costs a cold start of about 16 seconds. A small change needs none: `gh_pr_get`

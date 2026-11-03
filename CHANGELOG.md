@@ -363,6 +363,12 @@ record it.
   like the platform defaults instead of being inlined.
 
 ### Security
+- A session that acts as a user (`config.acting_as`, GitHub review on; its turns carry `withhold_sandbox_keys`) is no longer
+  given the deployment's platform defaults (`PLATFORM_DEFAULTS_FILE`): no default MCP server and no default skill. The default
+  servers are called with the requester's own key (`<SAFE_API_KEY>`), so a pull request's text that a review turn reads could
+  drive their read tools as the requester and carry the result into the review. Such a turn now has only what its own request
+  carries (the review tools the API puts there), whichever way it reaches Brain (a message, a queued turn, a task of a DAG,
+  a sub-agent). Every other session is given the defaults as before. See `claw/docs/platform-defaults.md`.
 - `a2a_call` no longer accepts a URL, and no longer sends the user's LLM key or the platform key to a peer.
   The model used to be able to name any `http(s)://` address, and the call went out with the user's key (or,
   in safe mode, the platform key) as its `Authorization` bearer, so a prompt-injected model could send that key
