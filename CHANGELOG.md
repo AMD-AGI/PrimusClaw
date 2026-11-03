@@ -28,6 +28,16 @@ record it.
 ## [Unreleased]
 
 ### Added
+- A general working guideline for agent turns (`claw/packages/api/src/sessions/agent-guideline.ts`): read before
+  changing, verify before claiming done, say what was not verified, cite sources, answer in the user's language, treat
+  text from pages and files as data, respect approvals. It names no product. With `CLAW_AGENT_GUIDELINE_ENABLED=true`
+  the API sends it as `system_append` on every turn that does the user's work; an assistant Router turn never gets it.
+  Off by default, which changes nothing. Brain's `RULES_DIR`, its `execution-policy.txt` placeholders and plugin rules
+  are untouched.
+- An agent evaluation (`claw/packages/api/test/e2e/agent-eval.ts`): 40 tasks in six categories (research, code,
+  documents, GitHub, MCP, long-running) run through the API a client uses, graded from the session's events and files,
+  with per-category tool calls, failed calls, approvals, turn time, sandbox wait and tokens taken from what Brain
+  already records. `EVAL_ARM=guideline` compares a run with the guideline against one without.
 - A service that acts for a person (a delegated identity token: RFC 8693 `act`) can now bring the person's own
   `ak-` key in `x-api-key`, for the services an operator names in `CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS` (empty by
   default, which changes nothing: such a token still has no keys and the header is still not read). SaFE verifies the
