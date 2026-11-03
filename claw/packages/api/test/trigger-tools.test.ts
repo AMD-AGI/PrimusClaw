@@ -130,9 +130,14 @@ describe("trigger tools", { skip }, () => {
       const smuggled = await call(bob, "trigger_create", { ...DAILY, name: "mine", user_id: "alice", owner_user_id: "alice" });
       assert.equal(smuggled.isError, false, smuggled.text);
       assert.equal((await trig(smuggled.body.trigger.trigger_id)).owner_user_id, "bob");
+      // Nor behind the wire's schema, which drops unknown arguments before the tool sees them.
+      const tools = await import("../src/triggers/tools.js");
+      const bobTurn = await turn(await chatSession("bob"));
+      const direct = (await tools.triggerCreate(bobTurn, { ...DAILY, name: "direct", user_id: "alice" })).trigger as any;
+      assert.equal((await trig(direct.trigger_id)).owner_user_id, "bob");
 
       const bobList = await call(bob, "trigger_list", {});
-      assert.deepEqual(bobList.body.triggers.map((x: any) => x.name), ["mine"]);
+      assert.deepEqual(bobList.body.triggers.map((x: any) => x.name), ["mine", "direct"]);
       const cancel = await call(bob, "trigger_cancel", { trigger_id: id });
       assert.equal(cancel.isError, true);
       assert.equal(cancel.body.error, "not_found");
