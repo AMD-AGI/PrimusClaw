@@ -8,8 +8,6 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
-
-	"sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
 // TestLogEventWritesDetail checks that the detail carried in metadata reaches the process log.
@@ -17,7 +15,7 @@ func TestLogEventWritesDetail(t *testing.T) {
 	prev := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(prev) })
 	var buf bytes.Buffer
-	logx.InstallHandler(slog.NewTextHandler(&buf, nil))
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
 
 	LogEvent(&AuditEvent{
 		EventType: EventSandboxDenied,
