@@ -70,6 +70,17 @@ describe("R reading", () => {
     assert.doesNotMatch(JSON.stringify(rest), /Ignore your rules/);
   });
 
+  test("R1b the review instructions are read at the base commit the head was compared with, not wherever the branch has moved since", async () => {
+    const compared = "c".repeat(40);
+    e.gh.pr.base.sha = compared;
+    e.gh.dirs[".claude/skills"] = [{ name: "review-pr", type: "dir" }];
+    e.gh.contents[".claude/skills/review-pr/SKILL.md"] = "# Repo review";
+    const b = (await get()).body as any;
+    assert.equal(b.review_instructions_source.base_sha, compared);
+    assert.ok(e.gh.contentRefs.length > 0 && e.gh.contentRefs.filter((r) => r !== "main").every((r) => r === compared), e.gh.contentRefs.join());
+    assert.ok(e.gh.treeReads.some((t) => t.sha === compared), "the same commit the trees were compared at");
+  });
+
   test("R2 gh_pr_get says what the acting user may do, so the model does not try what is refused", async () => {
     let b = (await get()).body as any;
     assert.equal(b.acting.github_login, "bob");

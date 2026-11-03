@@ -239,7 +239,8 @@ export class GithubReview {
       const risk = assessRisk(this.riskInput(pr, repo, change));
       ctx.acc.riskReasons = risk.evidence.map((e) => `evidence: ${e}`);
       const state = await this.readState(ctx, ref, pr, repo);
-      const instructions = await selectReviewInstructions(ctx.client, ref, pr.baseRef);
+      // At the base commit the head was compared with (instructionChanges), not wherever the branch is by now.
+      const instructions = await selectReviewInstructions(ctx.client, ref, pr.baseRef, pr.baseSha);
       const choice = chooseReviewPath({
         changedFiles: pr.changedFiles, changedLines: pr.additions + pr.deletions, filesComplete: change.complete,
         diffMissing: change.files.some(diffNotSent),

@@ -95,9 +95,14 @@ export function reviewSkillCandidates(entries: Array<{ name: string; type: strin
   return [...first, ...rest];
 }
 
-export async function selectReviewInstructions(client: GithubClient, ref: PrRef, baseRef: string): Promise<ReviewInstructions> {
+/**
+ * `pinnedSha`, when given, is the base commit to read at instead of the branch's tip: the one the caller compared the head with
+ * (service.ts instructionChanges), so that the instructions the model is given are the ones that were checked, however the branch moves.
+ */
+export async function selectReviewInstructions(client: GithubClient, ref: PrRef, baseRef: string, pinnedSha?: string): Promise<ReviewInstructions> {
   let baseSha: string;
-  try {
+  if (pinnedSha !== undefined && /^[0-9a-f]{40}$/.test(pinnedSha)) baseSha = pinnedSha;
+  else try {
     const a = await client.get<{ object?: { sha?: string } }>(repoPath(ref, `/git/ref/heads/${encodePath(baseRef)}`));
     const sha = a.json?.object?.sha;
     if (typeof sha !== "string" || !/^[0-9a-f]{40}$/.test(sha)) throw new Error("no sha");
