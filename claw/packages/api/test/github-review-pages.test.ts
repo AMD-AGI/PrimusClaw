@@ -18,7 +18,7 @@
  */
 import assert from "node:assert/strict";
 import test, { after, afterEach, beforeEach } from "node:test";
-import { PR_REVIEW_SKILL } from "../src/github-review/default-skill.js";
+import { PR_REVIEW_INSTRUCTIONS } from "../src/github-review/default-skill.js";
 import { PAGE_MAX_CHARS, diffText, fitPage } from "../src/github-review/pages.js";
 import type { RiskFile } from "../src/github-review/risk.js";
 import { HEAD, type FakeFile } from "./support/fake-github.js";
@@ -105,7 +105,7 @@ test("G1 a pull request of about 1800 changed lines is read whole within the req
   for (const f of files) {
     for (const line of (f.patch as string).split("\n")) assert.ok(read.texts.diff.includes(`${line}\n`), line);
   }
-  assert.equal(read.texts.instructions, PR_REVIEW_SKILL);
+  assert.equal(read.texts.instructions, PR_REVIEW_INSTRUCTIONS);
   assert.equal(read.texts.files.trim().split("\n").length, 24);
   const requests = e.gh.calls.length;
   const audited = (await e.sql("SELECT sum(github_requests)::int AS n FROM claw_github_audit WHERE session_id = 's-1'"))[0]?.n;
@@ -119,13 +119,13 @@ test("G1 a pull request of about 1800 changed lines is read whole within the req
 });
 
 test("G2 the review instructions reach the model whole: the default skill, and a repository's skill far longer than one answer", async () => {
-  assert.equal((await readSection(e.service, e.actor, PR, "instructions")).text, PR_REVIEW_SKILL);
+  assert.equal((await readSection(e.service, e.actor, PR, "instructions")).text, PR_REVIEW_INSTRUCTIONS);
   const skill = Array.from({ length: 700 }, (_, i) => `- rule ${i}: check "the ${i}th thing" before you approve.`).join("\n");
   e.gh.dirs[".claude/skills"] = [{ name: "review-pr", type: "dir" }];
   e.gh.contents[".claude/skills/review-pr/SKILL.md"] = skill;
   const { text, pages } = await readSection(e.service, e.actor, PR, "instructions");
   assert.ok(text.endsWith(skill), "the last rule of the skill is read");
-  assert.match(text, /^The repository's own review skill/);
+  assert.match(text, /^The repository's own review instructions/);
   assert.ok(pages >= Math.ceil(text.length / PAGE_MAX_CHARS), `pages ${pages}`);
 });
 
@@ -193,7 +193,7 @@ test("G6 an overview longer than one answer is itself read in pages, and nothing
   assert.equal(overview.how_to_read.length > 0, true);
   assert.deepEqual(Object.keys(overview.sections).sort(), ["conversation", "diff", "files", "instructions"]);
   assert.ok(Object.values(overview.sections).every((s: any) => s.inline === false));
-  assert.equal((await readSection(e.service, e.actor, PR, "instructions")).text, PR_REVIEW_SKILL);
+  assert.equal((await readSection(e.service, e.actor, PR, "instructions")).text, PR_REVIEW_INSTRUCTIONS);
 });
 
 test("G8 a page from the session's read is still held to the repository as it is now: owner, public, not archived", async () => {

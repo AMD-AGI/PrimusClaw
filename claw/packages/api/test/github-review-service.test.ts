@@ -56,7 +56,11 @@ describe("R reading", () => {
     assert.equal(b.merge_state.unresolved_threads, 0);
     assert.equal(b.risk.level, "low");
     assert.match(b.notice, /untrusted/);
-    assert.match((await readSection(e.service, e.actor, PR, "instructions")).text, /Pull request review/);
+    const instructions = (await readSection(e.service, e.actor, PR, "instructions")).text;
+    assert.match(instructions, /Pull request review/);
+    assert.doesNotMatch(instructions, /^---$/m, "no skill frontmatter");
+    assert.doesNotMatch(instructions, /^name: pr-review$/m);
+    assert.match(instructions, /You only read and comment/);
     assert.equal(b.review_instructions_source.source, "default");
     // The model-facing text outside `untrusted` never carries the injected sentence.
     const { untrusted: _u, ...rest } = b;
