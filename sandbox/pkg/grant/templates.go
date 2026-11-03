@@ -17,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
+	"sigs.k8s.io/agent-sandbox/pkg/sandboxlayer"
 )
 
 // grantIDKey labels and annotates a CodeInterpreter created for one grant.
@@ -67,6 +68,23 @@ func (s *Service) registerTemplates(ctx context.Context, grantID, appRunID strin
 				return opWrap(http.StatusInternalServerError, "template_register_failed", name, err)
 			}
 			created = append(created, name)
+		}
+	}
+	return nil
+}
+
+// validateTemplateLayers rejects a grant whose template spec declares invalid layers.
+func validateTemplateLayers(templates []runtimev1alpha1.GrantTemplate) error {
+	for _, tpl := range templates {
+		base, ok, err := templateFromSpec(tpl.Spec)
+		if err != nil {
+			return opWrap(http.StatusBadRequest, "invalid_grant", "template spec is not JSON", err)
+		}
+		if !ok {
+			continue
+		}
+		if err := sandboxlayer.Validate(base.Layers, sandboxlayer.TemplateMounts(base)); err != nil {
+			return opWrap(http.StatusBadRequest, "invalid_grant", "template "+tpl.Name+" layers are invalid", err)
 		}
 	}
 	return nil
