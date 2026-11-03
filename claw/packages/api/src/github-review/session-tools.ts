@@ -93,13 +93,17 @@ export function actingSessionEffort(model: unknown): { effort?: ReasoningEffort 
   return settings.reviewEffort && onReviewModel ? { effort: settings.reviewEffort } : {};
 }
 
+/** The most turns the review's second pass (a sub-agent) takes; over five measured reviews it took 11 to 33, 20 on average. */
+export const REVIEW_SUB_AGENT_MAX_TURNS = 20;
+
 /**
- * What a turn of a session that acts as a user carries beyond the mark: the review's effort, and rolling cache markers written for five
- * minutes. Nobody waits between a review's turns (the longest gap measured over five reviews was 102 s), so a 1h write of the tail is
- * paid at 8/5 of the 5m price and read only seconds later; the anchor stays at Brain's TTL and still carries the prefix to the next review.
+ * What a turn of a session that acts as a user carries beyond the mark: the review's effort, rolling cache markers written for five
+ * minutes, and a bounded second pass. Nobody waits between a review's turns (the longest gap measured over five reviews was 102 s), so a
+ * 1h write of the tail is paid at 8/5 of the 5m price and read only seconds later; the anchor stays at Brain's TTL and still carries the
+ * prefix to the next review.
  */
-export function actingSessionTurnFields(model: unknown): { effort?: ReasoningEffort; rolling_cache_ttl: "5m" } {
-  return { ...actingSessionEffort(model), rolling_cache_ttl: "5m" };
+export function actingSessionTurnFields(model: unknown): { effort?: ReasoningEffort; rolling_cache_ttl: "5m"; sub_agent_max_turns: number } {
+  return { ...actingSessionEffort(model), rolling_cache_ttl: "5m", sub_agent_max_turns: REVIEW_SUB_AGENT_MAX_TURNS };
 }
 
 /**

@@ -320,6 +320,7 @@ test("M1 a session that acts as a user and names no model runs on the review mod
     assert.equal(published[0]?.model, model ?? undefined, `${what}: the turn's model`);
     assert.equal(published[0]?.effort, effort, `${what}: the turn's effort`);
     assert.equal(published[0]?.rolling_cache_ttl, config.acting_as ? "5m" : undefined, `${what}: rolling cache markers live 5 minutes only on a review`);
+    assert.equal(published[0]?.sub_agent_max_turns, config.acting_as ? 20 : undefined, `${what}: only a review's second pass is bounded`);
   }
 });
 

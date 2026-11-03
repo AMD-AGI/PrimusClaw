@@ -524,6 +524,7 @@ export class AgentEngine {
           // A value Brain does not know is no effort at all: the gateway's defaults, never a refused turn.
           ...(isReasoningEffort(request.effort) ? { effort: request.effort } : {}),
           ...(request.rolling_cache_ttl === "5m" ? { rollingCacheTtl: "5m" as const } : {}),
+          ...(Number.isSafeInteger(request.sub_agent_max_turns) && request.sub_agent_max_turns! > 0 ? { subAgentMaxTurns: request.sub_agent_max_turns } : {}),
           apiUrl,
           apiKey,
           maxTurns,

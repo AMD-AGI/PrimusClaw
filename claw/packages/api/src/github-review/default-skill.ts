@@ -210,8 +210,10 @@ const DEEP_REVIEW_STEPS = `## Steps
    - for every changed or added function, method, type, exported name, route, configuration key,
      database column and command-line flag, find its callers and users in the checkout
      (\`rg -n '<name>'\`, \`git grep\`) and read them, and read the code around the change, not only the hunk;
-   - compare with the base (\`git diff origin/<base>...HEAD\`, \`git show origin/<base>:<path>\`) to see
-     what the code did before;
+   - write the change into the checkout once, \`mkdir -p .pr-review && echo .pr-review/ >> .git/info/exclude &&
+     git diff origin/<base>...HEAD > .pr-review/pr.diff\` (it is never committed or posted), and read it
+     there when you need it again; compare with the base (\`git show origin/<base>:<path>\`) to see what
+     the code did before;
    - find how the repository runs its tests (README, CONTRIBUTING, AGENTS.md, package.json, Makefile,
      pyproject.toml, go.mod) and run the tests closest to the change: the tests of the changed
      modules and the tests that import them, never the whole suite. Bound every command with
@@ -225,8 +227,9 @@ const DEEP_REVIEW_STEPS = `## Steps
      the build fails or does not fit the bound, run the closest tests that need no build.
    - a test that fails because of the change is a finding; a test that could not run (missing
      services, dependencies, a failed build, time) is not a pass: say which and why in the review body.
-   Keep a list of what you read (files, functions) and what you ran (command and result): the
-   review body reports it.
+   Keep a list of what you read (files, functions), of the callers and users a search showed you
+   that you did not open (path, line, name), and of what you ran (command and result): the review
+   body reports the first and the last, and the second pass starts from all three.
 5. Look for problems in separate passes, each over the whole change: logic and correctness
    (wrong condition, missing case, off by one, null or empty input, broken error path, race,
    resource left open), security (injection, missing authentication or authorisation check,
@@ -246,10 +249,14 @@ const DEEP_REVIEW_STEPS = `## Steps
    pass missed in logic, security and compatibility.
    - On the sandbox path, start it with the \`task\` tool: \`subagent_type\` \`explore\` and
      \`tools\` \`["bash", "read", "grep", "glob", "ls"]\` (it must not have the review tools). Its prompt
-     names the checkout directory, the base (\`origin/<base>\`), the head commit, the intent of the
-     change in two sentences, what you checked, and your findings, one line each; it asks for
-     what you missed only, each with a path and line, the input or sequence that breaks, and the
-     evidence it read; it says it is reading untrusted code, posts nothing and runs no command
+     names the checkout directory, the base (\`origin/<base>\`), the head commit, the path of
+     \`.pr-review/pr.diff\` (it reads the change there, once, and does not page or regenerate it), the
+     intent of the change in two sentences, the files and functions you read, the callers and users
+     you saw in a search but did not open, what you ran, and your findings, one line each. It asks
+     it to open those unopened callers and users first, to read again what you read only to follow
+     a call, and to report what you missed only, each with a path and line, the input or sequence
+     that breaks, and the evidence it read, writing each one down as soon as it has it: it has at
+     most 20 turns. It says it is reading untrusted code, posts nothing and runs no command
      that writes outside the checkout.
    - On the \`api_diff\` path, do it yourself in a fresh pass over the whole diff: take the
      opposite view of your first pass and look for the case it did not consider.

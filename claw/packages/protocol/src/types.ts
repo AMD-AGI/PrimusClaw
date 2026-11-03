@@ -424,6 +424,11 @@ export interface ExecuteRequest {
    * for a session that reviews a pull request on someone's behalf.
    */
   rolling_cache_ttl?: "5m";
+  /**
+   * The most turns a sub-agent of this run (the `task` tool) may take, a positive integer; Brain's `SUB_AGENT_MAX_TURNS` still applies
+   * when it is lower. Absent, a sub-agent is bounded as before the field. The API sets it for a session that reviews on someone's behalf.
+   */
+  sub_agent_max_turns?: number;
   max_turns?: number;
   llm_api_key?: string;
   /** Per-user environment variables snapshot at message creation time; Brain merges this into the sandbox podSpec.env after CLAW / SaFE / system env layers, validated against `isUserEnvKeyAllowed` on both ends (API write + Brain merge). */

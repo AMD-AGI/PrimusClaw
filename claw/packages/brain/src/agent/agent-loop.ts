@@ -266,6 +266,8 @@ export interface LoopOptions {
   effort?: ReasoningEffort;
   /** `ExecuteRequest.rolling_cache_ttl`, for this loop and its sub-agents. */
   rollingCacheTtl?: "5m";
+  /** `ExecuteRequest.sub_agent_max_turns`: the most turns a sub-agent of this loop may take. */
+  subAgentMaxTurns?: number;
   router: ToolRouter;
   onEvent: EventCallback;
   signal?: AbortSignal;
@@ -384,6 +386,12 @@ const TOOL_RESULT_TAIL_CHARS = 1500;
  * which the store never exceeds, and its own notice, which names the paging and
  * never a sandbox tool.
  */
+/** A sub-agent's turn cap: the run's own when it set one, never above a deployment's `SUB_AGENT_MAX_TURNS`, else the parent's. */
+export function subAgentTurnCap(requested: number | undefined, parentMaxTurns: number): number {
+  const deployment = SUB_AGENT_MAX_TURNS > 0 ? SUB_AGENT_MAX_TURNS : parentMaxTurns;
+  return requested !== undefined && requested > 0 && (deployment <= 0 || requested < deployment) ? requested : deployment;
+}
+
 export function truncateToolResult(text: string, toolName?: string, savedAt?: string): string {
   if (toolName === LOAD_SKILL_TOOL) {
     if (typeof text !== "string" || text.length <= LOAD_SKILL_RESULT_MAX_CHARS) return text;
@@ -2401,7 +2409,7 @@ class AgentLoopRunner {
         signal: this.signal,
         model: this.model, apiUrl: this.apiUrl, apiKey: this.apiKey, effort: this.opts.effort,
         rollingCacheTtl: this.opts.rollingCacheTtl,
-        maxTurns: SUB_AGENT_MAX_TURNS > 0 ? SUB_AGENT_MAX_TURNS : this.maxTurns,
+        maxTurns: subAgentTurnCap(this.opts.subAgentMaxTurns, this.maxTurns),
         userId: this.userId, sessionId: this.sessionId,
         depth: this.depth + 1,
         hooks: this.opts.hooks,

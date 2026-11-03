@@ -60,3 +60,35 @@ test("rolling markers at 5m on every request of the run and of its sub-agent; th
     assert.ok(requests[2]!.length > 1 && requests[3]!.length > 1, `${what}: ${JSON.stringify(requests)}`);
   }
 });
+
+test("a run's sub_agent_max_turns bounds its sub-agent; a deployment's lower SUB_AGENT_MAX_TURNS and the parent's cap still apply", async () => {
+  const { subAgentTurnCap } = await import("../src/agent/agent-loop.js");
+  // [requested by the run, the parent's max turns, expected] with SUB_AGENT_MAX_TURNS unset (0) in this process
+  const cases: Array<[number | undefined, number, number]> = [
+    [20, 120, 20], [undefined, 120, 120], [0, 120, 120], [-3, 120, 120], [200, 120, 120], [20, 0, 20], [undefined, 0, 0],
+  ];
+  for (const [requested, parent, expected] of cases) assert.equal(subAgentTurnCap(requested, parent), expected, `${requested}/${parent}`);
+});
+
+test("through the engine: a sub-agent of a run with sub_agent_max_turns 2 stops after two turns; without it, it runs on", async () => {
+  // The sub-agent calls bash on every turn it is given; the parent's next request is the first after the sub-agent ended.
+  for (const [over, subTurns] of [[{ sub_agent_max_turns: 2 }, 2], [{}, 4], [{ sub_agent_max_turns: "2" }, 4]] as const) {
+    world.script([
+      { tool: "task", input: { description: "d", prompt: "p" } },
+      { tool: "bash", input: { command: "true" } },
+      { tool: "bash", input: { command: "true" } },
+      { tool: "bash", input: { command: "true" } },
+      { text: "sub done" },
+      { text: "parent done" },
+    ]);
+    world.llmBodies.length = 0;
+    await new AgentEngine().execute(
+      baseRequest({ session_id: uniqueSession(), ...over }),
+      (async () => {}) as never, undefined, null as never,
+      { attachHands: async () => fakeHands() as never } as never,
+    );
+    const firstUser = (raw: string) => JSON.stringify((JSON.parse(raw) as { messages: Array<{ content: unknown }> }).messages[0]?.content);
+    const sub = world.llmBodies.filter((b) => firstUser(b) === JSON.stringify("p") || firstUser(b).includes('"p"'));
+    assert.equal(sub.length, subTurns, `${JSON.stringify(over)}: ${world.llmBodies.length} requests`);
+  }
+});

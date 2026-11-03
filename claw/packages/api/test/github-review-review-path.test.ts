@@ -245,6 +245,24 @@ test("the instructions build what the closest tests import before running them, 
   assert.match(text, /Bound every command with `timeout 600`/);
 });
 
+test("the second pass is handed the diff file, what was read and the callers seen but not opened, and is told its turn bound", () => {
+  const text = DEEP_PR_REVIEW_INSTRUCTIONS.replace(/\s+/g, " ");
+  // The main loop writes the change into the checkout once, out of anything committed, before the second pass starts.
+  const write = text.indexOf("git diff origin/<base>...HEAD > .pr-review/pr.diff");
+  assert.ok(write > 0 && write < text.indexOf("Second pass, always"), `${write}`);
+  assert.match(text, /echo \.pr-review\/ >> \.git\/info\/exclude/);
+  // It keeps the list the second pass starts from: read, seen in a search but not opened, ran.
+  assert.match(text, /of the callers and users a search showed you that you did not open \(path, line, name\)/);
+  const second = text.slice(text.indexOf("Second pass, always"));
+  for (const handed of [
+    /the path of `\.pr-review\/pr\.diff` \(it reads the change there, once, and does not page or regenerate it\)/,
+    /the files and functions you read, the callers and users you saw in a search but did not open, what you ran/,
+    /to open those unopened callers and users first/,
+    /writing each one down as soon as it has it: it has at most 20 turns/,
+  ]) assert.match(second, handed);
+  assert.doesNotMatch(PR_REVIEW_INSTRUCTIONS, /pr\.diff|did not open/);
+});
+
 /**
  * What main gave the model before the deep review existed (8f0bf87, src/github-review unchanged since 92ed1dd), computed by running
  * that tree's own code: the sha256 of each instruction text, and every advice string word for word.
