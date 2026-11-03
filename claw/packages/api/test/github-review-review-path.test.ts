@@ -222,20 +222,19 @@ test("the instructions build what the closest tests import before running them, 
   const text = PR_REVIEW_INSTRUCTIONS.replace(/\s+/g, " ");
   // Order: find the tests, build what they need, then judge what ran.
   const find = text.indexOf("run the tests closest to the change");
-  const build = text.indexOf("build what those tests need before you run them, the way the repository documents it");
+  const build = text.indexOf("build what those tests need first, the documented way");
   const judge = text.indexOf("a test that could not run");
   assert.ok(find > 0 && build > find && judge > build, `${find} ${build} ${judge}`);
   // A workspace's sibling packages load from their built output, which a fresh checkout lacks.
-  assert.match(text, /sibling packages from theirs \(`dist\/`, a compiled module\)/);
-  assert.match(text, /`npm run build -w <package>` for each, in dependency order/);
+  assert.match(text, /a test loads sibling packages from theirs \(`dist\/`\)/);
+  assert.match(text, /`npm run build -w <package>`, in dependency order/);
   // Cached: what an earlier run left is reused, never wiped by a clean install.
-  assert.match(text, /only when they are missing/);
-  assert.match(text, /do not run a clean install \(`npm ci`\) over installed ones/);
-  assert.match(text, /Build again after each recipe run/);
+  assert.match(text, /Install dependencies only when missing; keep what an earlier run left in the checkout \(no `npm ci` over installed ones\)/);
+  assert.match(text, /build again after each recipe run/);
   // A missing module is a build not done, not a result; a build that does not fit is not a pass.
-  assert.match(text, /stops on a missing module or a missing built file did not run: build what it names and run it again/);
+  assert.match(text, /stops on a missing module or built file did not run: build it and run it again/);
   assert.match(text, /If the build fails or does not fit the bound, run the closest tests that need no build/);
-  assert.match(text, /a build that failed or did not fit, time\) is not a pass/);
+  assert.match(text, /a failed build, time\) is not a pass/);
   // Bounded like every other command.
   assert.match(text, /Bound every command with `timeout 600`/);
 });
