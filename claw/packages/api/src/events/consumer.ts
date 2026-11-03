@@ -12,7 +12,8 @@ import { resolveTaskPlugin } from "../marketplace/plugins.js";
 import { buildMessages } from "../sessions/context-builder.js";
 import { sessionModelFromRow } from "../sessions/session-model.js";
 import { sessionRepoFromRow } from "../sessions/session-repo.js";
-import { maybeExtractMemory, insertMemoryEntry, isMemoryActive, scanMemoryContent, maybeUpdateUserProfile } from "../memory/service.js";
+import { memoryAccess } from "../memory/service.js";
+import { scanMemoryContent } from "../memory/gates.js";
 import {
   saveSkill, recordSkillFeedback,
   selectSkillsForTask,
@@ -23,7 +24,7 @@ import {
 import { appEventIdentity } from "./app-events.js";
 import { enqueueEvolutionJob } from "../marketplace/evolve-worker.js";
 import { callMemoryLLM } from "../llm/client.js";
-import { CLAW_ASSISTANT_ENABLED, CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
+import { CLAW_ASSISTANT_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
 import { skipsSkillSelection } from "../assistant/role-profile.js";
 import { deliverUnsaidAnswer } from "../assistant/router-turn-end.js";
 import { recordWorkerTurnEnd } from "../assistant/turn-end.js";
@@ -809,12 +810,10 @@ export const eventNotificationPorts = {
  * substituted). Production reads every one from here.
  */
 export const completionPorts = {
-  insertMemoryEntry,
   saveSkill,
   recordSkillFeedback,
   checkProbationGraduation,
   maybeSummarize: (sessionId: string, userId: string) => maybeSummarize(sessionId, userId),
-  maybeExtractMemory,
   maybeRecordTaskPattern,
   enqueueEvolutionJob,
   recordRunFinished,
@@ -946,34 +945,11 @@ async function handleComplete(
   // 3. Save conversation turns.
   await recordCompletionTurns(sessionId, event, messageId, stillHeld);
 
-  // 4. Process explicit save_memory events (from Brain's save_memory tool).
-  // Gated by CLAW_MEMORY_ENABLED. When OFF: drop the payload, warn for audit.
-  // Brain's save_memory tool stays in the schema, so the LLM may still call it;
-  // this is the silent-discard contract documented in the feature flag.
-  let explicitMemorySaved = false;
-  const memoriesToSave = sandboxOnly ? [] : (event as any).memories_to_save || [];
-  if (!CLAW_MEMORY_ENABLED) {
-    if (memoriesToSave.length) {
-      logger.warn({ sessionId, count: memoriesToSave.length }, "memory.write_skipped_flag_off");
-    }
-  } else {
-    for (const mem of memoriesToSave) {
-      const blocked = scanMemoryContent(mem.content);
-      if (blocked) { logger.warn({ reason: blocked }, "memory.blocked"); continue; }
-      try {
-        if (await completionPorts.insertMemoryEntry(userId, { ...mem, sourceSession: sessionId, sourceType: "explicit" })) {
-          explicitMemorySaved = true;
-        } else {
-          logger.warn({ sessionId }, "memory.write_skipped_user_opted_out");
-        }
-      } catch (err) {
-        logger.error({ err, sessionId }, "memory.save_failed");
-      }
-    }
-    if (explicitMemorySaved) {
-      maybeUpdateUserProfile(userId).catch(err =>
-        logger.error({ err, userId }, "memory.profile_update_failed"));
-    }
+  // 4. Memory is written during the turn, through the API's checks (routes/internal-memory.ts). A Brain from
+  // before that still sends what its save_memory buffered; it bypassed every check, so it is dropped.
+  const legacyMemories = (event as any).memories_to_save;
+  if (Array.isArray(legacyMemories) && legacyMemories.length) {
+    logger.warn({ sessionId, count: legacyMemories.length }, "memory.legacy_save_dropped");
   }
 
   // 4 + 4.5. Skill writes (save_skill tool, skill_file mutations).
@@ -1158,17 +1134,13 @@ async function handleComplete(
 
   // 7a. Best-effort background tasks (setImmediate fire-and-forget).
   //     These produce signal but losing one occurrence is acceptable —
-  //     summary/memory will be regenerated on the next exec_complete, and
+  //     a summary will be regenerated on the next exec_complete, and
   //     pattern occurrences accumulate over many sessions.
-  //     Memory extraction gated by CLAW_MEMORY_ENABLED; pattern recording
-  //     gated by CLAW_SKILL_EVOLUTION_ENABLED. Summary stays unconditional.
+  //     Pattern recording gated by CLAW_SKILL_EVOLUTION_ENABLED. Summary
+  //     stays unconditional. Memory is never extracted in the background.
   setImmediate(() => {
     completionPorts.maybeSummarize(sessionId, userId).catch(err =>
       logger.error({ err, sessionId }, "summarize_failed"));
-    if (CLAW_MEMORY_ENABLED && !explicitMemorySaved) {
-      completionPorts.maybeExtractMemory(sessionId, userId).catch(err =>
-        logger.error({ err, sessionId }, "memory.extraction_failed"));
-    }
     if (CLAW_SKILL_EVOLUTION_ENABLED) {
       completionPorts.maybeRecordTaskPattern(sessionId, userId, event).catch(err =>
         logger.error({ err, sessionId }, "skill.pattern_record_failed"));
@@ -1400,7 +1372,7 @@ if (pending) {
     message_id: pendingMessageId,
     prompt: pending.content,
     history,
-    memory_enabled: await isMemoryActive(pendingUserId),
+    memory_enabled: (await memoryAccess(sessionId, pendingUserId)).serves,
     user_id: pendingUserId,
     llm_api_key: typeof pending.llm_api_key === "string" ? pending.llm_api_key : "",
     platform_key: typeof pending.platform_key === "string" ? pending.platform_key : "",

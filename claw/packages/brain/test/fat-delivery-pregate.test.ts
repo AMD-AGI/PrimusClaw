@@ -772,7 +772,6 @@ function runnerFixture(opts: { failEngine?: boolean } = {}) {
     finalText: "done",
     tokenUsage: { input_tokens: 1, output_tokens: 1, cache_read: 0, cache_create: 0 },
     turns: 1,
-    pendingMemories: [],
     pendingSkills: [],
     skillsUsed: {},
     errorCount: 0,

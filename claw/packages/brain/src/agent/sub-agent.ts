@@ -8,6 +8,7 @@ import type { HookRunner } from "./hooks.js";
 import type { Message, ToolSchema, EventCallback } from "@claw/protocol";
 import type { RunIdentity } from "../tasks/run-identity.js";
 import { filterToolSchemas, type ToolAllowlist } from "../tools/allowlist.js";
+import { MEMORY_TOOLS } from "../tools/memory-tools.js";
 import pino from "pino";
 import { randomUUID } from "node:crypto";
 
@@ -34,12 +35,12 @@ const PROFILE_ALLOW: Record<SubagentType, string[] | "all"> = {
 
 /**
  * Tools sub-agents never get, regardless of profile. They are either
- * Brain↔Hands plumbing (upload/download) or break isolation (save_memory /
- * save_skill write to global knowledge; task would allow uncontrolled
+ * Brain↔Hands plumbing (upload/download) or break isolation (the memory tools
+ * and save_skill write to global knowledge; task would allow uncontrolled
  * recursion beyond SUB_AGENT_MAX_DEPTH).
  */
 const DENY_LIST = new Set([
-  "save_memory",
+  ...MEMORY_TOOLS,
   "save_skill",
   "task",
   "upload_to_s3",

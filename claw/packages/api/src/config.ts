@@ -443,8 +443,16 @@ export const ANTHROPIC_BASE_URL = env("ANTHROPIC_BASE_URL");
 export const MAX_SELECTED_SKILLS = envInt("MAX_SELECTED_SKILLS", 3);
 
 // --- Phase-2 feature flags (default OFF; opt-in per deployment) ---
-// When false: long-term memory read+write+decay paths are short-circuited.
+// When false: long-term memory read and write paths are short-circuited.
 export const CLAW_MEMORY_ENABLED = envBool("CLAW_MEMORY_ENABLED", false);
+// Long-term memory limits. The catalogue is what every turn of an opted-in user carries (one line per entry);
+// a write past the entry limit is refused, never made room for by dropping another entry.
+export const CLAW_MEMORY_MAX_ENTRIES = envInt("CLAW_MEMORY_MAX_ENTRIES", 100, { min: 1 });
+export const CLAW_MEMORY_CATALOGUE_MAX_LINES = envInt("CLAW_MEMORY_CATALOGUE_MAX_LINES", 40, { min: 1 });
+export const CLAW_MEMORY_CATALOGUE_MAX_TOKENS = envInt("CLAW_MEMORY_CATALOGUE_MAX_TOKENS", 1500, { min: 100 });
+// Days after which a project / reference entry leaves the catalogue until the user confirms it again.
+export const CLAW_MEMORY_PROJECT_REVIEW_DAYS = envInt("CLAW_MEMORY_PROJECT_REVIEW_DAYS", 30, { min: 1 });
+export const CLAW_MEMORY_REFERENCE_REVIEW_DAYS = envInt("CLAW_MEMORY_REFERENCE_REVIEW_DAYS", 90, { min: 1 });
 // When false: skill selection, save, mutation, feedback, evolution, pattern
 // recording, evolve worker, and skill-files cleanup are all short-circuited.
 export const CLAW_SKILL_EVOLUTION_ENABLED = envBool("CLAW_SKILL_EVOLUTION_ENABLED", false);

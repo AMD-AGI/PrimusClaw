@@ -198,8 +198,8 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
   {
     table: "claw_memory_entries",
     // The reason this guard exists, found the long way round. `kind` separates
-    // the rows decay is allowed to forget from the KB rows it must not touch,
-    // and the ALTER that adds it discards its error like every other. When the
+    // the user's rows from the KB rows memory must not touch, and the ALTER
+    // that adds it discards its error like every other. When the
     // column was absent the daily decay threw `column "kind" does not exist`
     // into a cron log nobody reads, and the only visible symptom was that
     // memory never faded -- a job silently not running, for months, with no
@@ -207,7 +207,14 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     columns: [
       "id", "user_id", "category", "content", "importance",
       "access_count", "created_at", "last_accessed", "deleted_at", "kind",
+      "mtype", "title", "why", "how_to_apply", "status", "pinned", "token_count", "evidence_quote", "source_kind",
+      "recorded_at", "last_confirmed_at", "expires_at", "prev_title", "prev_body",
     ],
+  },
+  {
+    table: "claw_memory_events",
+    // Every memory write and delete records here in the same transaction: absent, each one fails.
+    columns: ["id", "user_id", "entry_id", "op", "actor", "session_id", "reason", "title", "evidence_quote", "created_at"],
   },
   {
     table: "claw_assistants",

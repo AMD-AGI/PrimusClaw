@@ -7,7 +7,7 @@
  *
  * Shared by the two switch-state test files because the surface differs between
  * them only in `bash`'s property set and the three background names; writing the
- * other seventeen rows twice is how the two copies come to disagree.
+ * other sixteen rows twice is how the two copies come to disagree.
  *
  * Description prose is deliberately absent: a whole-description assertion turns
  * every wording improvement into a failure and pins nothing the field sets do
@@ -31,17 +31,18 @@ interface Expected {
 }
 
 /**
- * The seventeen names published in both switch states, in publication order.
+ * The sixteen names published in both switch states, in publication order.
  * `a2a_call` is not among them: it is published only while A2A_CLIENT_ENABLED is on,
- * and its own surface is pinned in a2a-client-tool.test.ts.
+ * and its own surface is pinned in a2a-client-tool.test.ts. Nor are the memory tools:
+ * they are published only for a conversation the API gave memory (memory-tools.test.ts).
  */
 export const CLOSED_STATE_NAMES = [
-  "save_memory", "save_skill", "add_skill_file", "update_skill_file", "remove_skill_file",
+  "save_skill", "add_skill_file", "update_skill_file", "remove_skill_file",
   "bash", "read", "write", "edit", "glob", "grep", "ls", "notebook_edit", "multi_edit",
   "todo_write", "exit_plan_mode", "task",
 ];
 
-/** The same seventeen, with the background trio spliced in after `bash`. */
+/** The same sixteen, with the background trio spliced in after `bash`. */
 export const OPEN_STATE_NAMES = CLOSED_STATE_NAMES.flatMap((name) =>
   name === "bash" ? [name, "bash_output", "kill_shell", "wait"] : [name],
 );
@@ -50,11 +51,6 @@ export const OPEN_STATE_NAMES = CLOSED_STATE_NAMES.flatMap((name) =>
 export const BACKGROUND_TOOL_NAMES = ["bash", "bash_output", "kill_shell", "wait"];
 
 const SHARED: Record<string, Expected> = {
-  save_memory: {
-    properties: ["category", "content", "importance"],
-    required: ["category", "content"],
-    enums: { category: ["preference", "correction", "env_fact", "tool_quirk", "pattern"] },
-  },
   save_skill: {
     properties: ["skill_name", "description", "content"],
     required: ["skill_name", "content", "description"],

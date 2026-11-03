@@ -353,7 +353,9 @@ export class AgentEngine {
       router.lazySkillWriter = lazySkills;
       // The listed skills are Brain's to hand over: `load_skill` serves them without a sandbox.
       if (progressiveSkills.length) router.skillStore = new SkillStore([...defaultProgressive, ...pluginProgressive], `${sessionDir}/.skills`);
-      router.memoryEnabled = request.memory_enabled !== false;
+      // Offered only when the API said so: a request without the field is not the user's conversation.
+      router.memoryEnabled = request.memory_enabled === true;
+      router.memoryTurn = { sessionId: request.session_id, messageId: request.message_id };
       // Whom an identity-authenticated a2a_call peer is called as, and when the run's budget ends.
       const deadlineMs = request.deadline_at ? Date.parse(request.deadline_at) : NaN;
       router.a2aContext = {
@@ -477,7 +479,6 @@ export class AgentEngine {
             errorCount: 0,
             toolStats: { total_calls: 0, error_calls: 0, by_tool: {} },
             elapsedMs: 0,
-            pendingMemories: [],
             pendingSkills: [],
             skillsUsed: {},
           };
@@ -572,7 +573,6 @@ export class AgentEngine {
         errorCount: loopResult.errorCount,
         toolStats: loopResult.toolStats,
         elapsedMs: loopResult.elapsedMs,
-        pendingMemories: router.pendingMemories,
         pendingSkills: router.pendingSkills,
         pendingSkillFileMutations: router.pendingSkillFileMutations,
         skillsUsed,

@@ -217,21 +217,20 @@ for (const row of routeRows) {
   });
 }
 
-test("route: save_memory and save_skill outside the list buffer nothing", async () => {
+test("route: save_memory and save_skill outside the list do nothing", async () => {
   const { router } = makeRouter(["mcp__board__*"]);
-  const memory = await router.route("save_memory", { category: "preference", content: "tabs" });
+  router.memoryEnabled = true;
+  const memory = await router.route("save_memory", { type: "user", title: "tabs", body: "tabs", evidence_quote: "I like tabs" });
   const skill = await router.route("save_skill", { skill_name: "x", content: "c", description: "d" });
   assert.equal(memory, toolNotAllowedMessage("save_memory"));
   assert.equal(skill, toolNotAllowedMessage("save_skill"));
-  assert.equal(router.pendingMemories.length, 0);
   assert.equal(router.pendingSkills.length, 0);
 });
 
-test("route: a listed save_memory still saves", async () => {
+test("route: a listed save_memory gets past the list to the memory check", async () => {
   const { router } = makeRouter(["save_memory"]);
-  const out = await router.route("save_memory", { category: "preference", content: "tabs" });
-  assert.match(out, /Memory saved/);
-  assert.equal(router.pendingMemories.length, 1);
+  const out = await router.route("save_memory", { type: "user", title: "tabs", body: "tabs", evidence_quote: "I like tabs" });
+  assert.match(out, /long-term memory is not available in this conversation/);
 });
 
 test("route: a loop-handled tool outside the list gets the refusal; inside it, the old error", async () => {

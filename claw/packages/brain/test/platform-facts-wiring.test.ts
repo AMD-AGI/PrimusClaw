@@ -152,7 +152,7 @@ test("R2 the wire body carries the platform fields", async () => {
     await postAgentDone(
       { task_id: "ktsk_1", callback_url: "http://api.test/t" } as ExecuteRequest,
       {
-        finalText: "", turns: 0, pendingMemories: [], pendingSkills: [],
+        finalText: "", turns: 0, pendingSkills: [],
         skillsUsed: {}, errorCount: 1, platformFacts: EVICTED,
       } as ExecuteResult,
     );
@@ -179,7 +179,7 @@ test("R3 a run the platform said nothing about sends no platform fields", async 
     await postAgentDone(
       { task_id: "ktsk_2", callback_url: "http://api.test/t" } as ExecuteRequest,
       {
-        finalText: "ok", turns: 1, pendingMemories: [], pendingSkills: [],
+        finalText: "ok", turns: 1, pendingSkills: [],
         skillsUsed: {}, errorCount: 0,
       } as ExecuteResult,
     );
@@ -276,7 +276,7 @@ async function runRecovering(after: "succeeds" | "fails" | "rebuild_fails"): Pro
       if (after === "fails") throw new Error("the rebuilt sandbox did not save it");
       return {
         finalText: "done on the new sandbox", turns: 4, elapsedMs: 10,
-        pendingMemories: [], pendingSkills: [], skillsUsed: {}, errorCount: 0,
+        pendingSkills: [], skillsUsed: {}, errorCount: 0,
         tokenUsage: { input_tokens: 1, output_tokens: 1 },
       };
     },

@@ -487,13 +487,6 @@ export interface TokenUsage {
   turns: number;
 }
 
-/** Pending memory entry from save_memory tool (Brain → API via exec_complete). */
-export interface PendingMemory {
-  category: string;
-  content: string;
-  importance: number;
-}
-
 /** Pending skill entry from save_skill tool (Brain → API via exec_complete). */
 export interface PendingSkill {
   skill_name: string;
@@ -592,7 +585,6 @@ export interface ExecuteResult {
    * that an earlier attempt filled alone.
    */
   platformFacts?: ExecutePlatformFacts;
-  pendingMemories: PendingMemory[];
   pendingSkills: PendingSkill[];
   /** Sub-file mutations queued by add/update/remove_skill_file tool calls. */
   pendingSkillFileMutations?: PendingSkillFileMutation[];
