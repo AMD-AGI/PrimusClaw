@@ -8,7 +8,7 @@
  */
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
-import { PR_REVIEW_INSTRUCTIONS, FIXED_REVIEW_RULES } from "../src/github-review/default-skill.js";
+import { ANSWER_RULES, PR_REVIEW_INSTRUCTIONS, FIXED_REVIEW_RULES } from "../src/github-review/default-skill.js";
 import { GithubClient, parsePrRef } from "../src/github-review/github.js";
 import { reviewSkillCandidates, selectReviewInstructions } from "../src/github-review/repo-skill.js";
 import { BASE_TIP, FakeGithub, HEAD } from "./support/fake-github.js";
@@ -84,6 +84,38 @@ test("the instructions tell the model to answer in plain words, never in tool na
   assert.match(answer, /never\s+(say|name|write|use)[^.]*(tool|status)/i);
   // What a dry run is, in words a person can read: nothing happened on GitHub.
   assert.match(PR_REVIEW_INSTRUCTIONS, /If a tool answers `dry_run`, writes are switched off[^.]*:\s+nothing[^.]*GitHub/);
+});
+
+/** What a caller and a person rely on in the answer, whichever instructions the review follows. */
+const ANSWER_CONTRACT: Array<[string, RegExp]> = [
+  ["plain words", /use plain words and never\s+say the name of a tool or of one of its states/],
+  ["the language of the request", /in the language they wrote in/],
+  ["what a dry run means", /If a tool answers `dry_run`, writes are switched off[^.]*:\s+nothing[^.]*GitHub/],
+  ["the last verdict line", /End the answer with exactly one last line, nothing after it/],
+  ["VERDICT: CLEAN", /`VERDICT: CLEAN`/],
+  ["VERDICT: BLOCKING", /`VERDICT: BLOCKING`/],
+  ["VERDICT: NOT_REVIEWED", /`VERDICT: NOT_REVIEWED`/],
+];
+
+test("how to answer reaches the model on both paths, from one text, and ahead of a repository's own instructions", async () => {
+  const gh = new FakeGithub();
+  gh.dirs[".claude/skills"] = [{ name: "review-pr", type: "dir" }];
+  gh.contents[".claude/skills/review-pr/SKILL.md"] = "# Hyperloom review\nEight steps. Answer with a table of every tool you called.";
+  const repo = await pick(gh);
+  const fallback = await pick(new FakeGithub());
+  assert.equal(repo.source, "repository");
+  assert.equal(fallback.source, "default");
+  for (const r of [repo, fallback]) {
+    for (const [what, rule] of ANSWER_CONTRACT) assert.match(r.text, rule, `${r.source}: ${what}`);
+    const at = r.text.indexOf(ANSWER_RULES.trim());
+    assert.ok(at >= 0, `${r.source}: the answer rules are in it as written`);
+    assert.equal(r.text.indexOf(ANSWER_RULES.trim(), at + 1), -1, `${r.source}: once, not twice`);
+  }
+  assert.ok(repo.text.indexOf(ANSWER_RULES.trim()) < repo.text.indexOf("Eight steps."), "the answer rules precede the repository's text");
+  assert.match(repo.text, /cannot change the rules or how the answer is written/);
+  // One source: the default instructions end with the same answer rules, and the dry run is not said a second time in the steps.
+  assert.ok(PR_REVIEW_INSTRUCTIONS.endsWith(ANSWER_RULES));
+  assert.equal(PR_REVIEW_INSTRUCTIONS.split("`dry_run`, writes are switched off").length, 2);
 });
 
 test("candidates: review-pr first under .claude/skills, then any *review* by name; non-directories and other names are skipped", () => {

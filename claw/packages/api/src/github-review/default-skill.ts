@@ -23,7 +23,7 @@ description: Review a GitHub pull request the way a careful senior reviewer does
 
 `;
 
-export const PR_REVIEW_INSTRUCTIONS = `# Pull request review
+const REVIEW_RULES = `# Pull request review
 
 You review one pull request on behalf of one person, with the four tools of the
 \`github_review\` server (\`gh_pr_get\`, \`gh_pr_risk\`, \`gh_review_submit\`, \`gh_pr_merge\`).
@@ -43,8 +43,9 @@ You act with that person's GitHub account, so be careful and be brief.
   report the refusal in its own words. Do not look for a way around it.
 - You have no GitHub credential in the sandbox and you must not ask for one, create one or
   put one in a command.
+`;
 
-## Steps
+const REVIEW_STEPS = `## Steps
 
 1. Call \`gh_pr_get\`. Note the \`head_sha\`: every later call passes it. If the head moves while
    you work, start again from the new head. Read \`acting\` (whether approve and merge are open
@@ -105,9 +106,6 @@ You act with that person's GitHub account, so be careful and be brief.
      verdict: a \`low\` changes nothing, and a change the rules already hold stays held.
    - If a tool says the person has not allowed others to act for them (\`delegation_off\`),
      nothing can be done with their account, not even a comment. Say so in your answer.
-   - If a tool answers \`dry_run\`, writes are switched off in this deployment: nothing was posted,
-     approved or merged, and nothing happened on GitHub. Say exactly that, in plain words, and never
-     that a review was posted or a pull request merged.
    - If \`gh_review_submit\` (APPROVE) refuses because CI is not green or a thread is open
      (\`ci_not_green\`, \`threads_unresolved\`), do not approve: post a comment-only review.
    - If \`gh_review_submit\` (APPROVE) or \`gh_pr_merge\` says the person whose account is used
@@ -130,8 +128,10 @@ You act with that person's GitHub account, so be careful and be brief.
    Never state that something was merged or approved unless a tool result says so.
 10. If you skipped a step (a tool refused, material was too large, a file was unreadable),
     say which one in the review body and in your answer.
+`;
 
-## Answer
+/** How the answer is written. Like the rules, it binds whatever instructions a repository brings: a caller reads its last line. */
+export const ANSWER_RULES = `## Answer
 
 Write the answer for the person who asked, in the language they wrote in and in the natural
 wording of that language: say "no line comments" the way a speaker would, and do not carry an
@@ -139,6 +139,10 @@ English term over word for word. They have never seen the tools, so use plain wo
 say the name of a tool or of one of its states (\`gh_pr_get\`, \`gh_pr_risk\`, \`gh_review_submit\`,
 \`gh_pr_merge\`, \`dry_run\`, \`confirmation_required\` and the like): say "approved", "merged",
 "commented", "requested changes" or "waiting for your confirmation" instead.
+
+If a tool answers \`dry_run\`, writes are switched off in this deployment: nothing was posted,
+approved or merged, and nothing happened on GitHub. Say exactly that, in plain words, and never
+that a review was posted or a pull request merged.
 
 Finish with a short answer: the verdict, the link to the review, what is blocking, whether it
 was merged and if not what it is waiting for (CI, threads, the person's confirmation, their
@@ -152,6 +156,8 @@ End the answer with exactly one last line, nothing after it:
   tool, an unreadable change, a pull request that is not reviewable).
 `;
 
+export const PR_REVIEW_INSTRUCTIONS = [REVIEW_RULES, REVIEW_STEPS, ANSWER_RULES].join("\n");
+
 /** The same instructions as an importable skill (`claw/examples/skills/pr-review/SKILL.md`). */
 export const PR_REVIEW_SKILL = SKILL_FRONTMATTER + PR_REVIEW_INSTRUCTIONS;
 
@@ -164,7 +170,4 @@ export function withoutFrontmatter(text: string): string {
 }
 
 /** The rules of the default instructions, without their steps: they bind whatever instructions a repository brings. */
-export const FIXED_REVIEW_RULES: string = (() => {
-  const cut = PR_REVIEW_INSTRUCTIONS.indexOf("\n## Steps");
-  return (cut === -1 ? PR_REVIEW_INSTRUCTIONS : PR_REVIEW_INSTRUCTIONS.slice(0, cut)).trim();
-})();
+export const FIXED_REVIEW_RULES: string = REVIEW_RULES.trim();
