@@ -8,7 +8,7 @@ import multipart from "@fastify/multipart";
 import {
   API_PORT, APP_ENV, SAFE_API_URL, DATABASE_URL, resolveCorsOrigin,
   AUTH_INTERNAL_TOKEN, NATS_URL,
-  CLAW_ASSISTANT_ENABLED, CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
+  CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
   runLeaseTiming, envSettingProblems, assertAdmissionSettings,
 } from "./config.js";
 import { runLeaseTimingProblems } from "@claw/protocol";
@@ -30,6 +30,8 @@ import { registerA2ARoutes } from "./routes/a2a.js";
 import { registerPluginRoutes } from "./routes/plugins.js";
 import { registerUserEnvVarRoutes } from "./routes/user-env-vars.js";
 import { registerAssistantRoutes } from "./routes/assistant.js";
+import { registerAssistantMcpRoutes } from "./assistant/mcp.js";
+import { assertAssistantTokenKey } from "./assistant/token.js";
 import { registerNotificationSubscriptionRoutes } from "./routes/notification-subscriptions.js";
 import { registerRemoteAgentRoutes } from "./routes/remote-agents.js";
 import { startNotificationWorker } from "./notifications/outbox.js";
@@ -174,6 +176,7 @@ async function main() {
   validateStartupConfig();
   assertNoSharedIdentityBypass();
   assertRunLeaseTiming();
+  assertAssistantTokenKey(CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY);
   // Before the admission assertion, not after: the rollout gauges are applied
   // on the way through, and a pod that dies on the second assertion would
   // otherwise start exporting neither.
@@ -307,6 +310,8 @@ async function main() {
   await registerRemoteAgentRoutes(app);
   // Off unless CLAW_ASSISTANT_ENABLED: the module registers nothing otherwise.
   await registerAssistantRoutes(app);
+  // The assistant's own MCP service, under /v1/internal/; registers nothing unless CLAW_ASSISTANT_ENABLED.
+  await registerAssistantMcpRoutes(app);
   // Off unless CLAW_GITHUB_REVIEW_ENABLED: nothing is registered otherwise.
   await registerGithubReviewRoutes(app);
   await registerSystemEnvVarRoutes(app);

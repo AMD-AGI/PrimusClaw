@@ -11,6 +11,7 @@
  */
 
 import { applyAppMcpToTask } from "../sessions/app-mcp.js";
+import { applySessionRoleToTask } from "../assistant/role-profile.js";
 import { createHash, randomBytes } from "node:crypto";
 import type { ExecuteRequest, RunFailClaimReason, RunLease } from "@claw/protocol";
 import pino from "pino";
@@ -866,6 +867,8 @@ async function hydrateExecuteRequest(row: ClawTaskRow, leaseToken: string): Prom
   // that waited must not carry a token stored with it, a run that ended meanwhile
   // must not be offered, and a replaced sandbox must be addressed by its new id.
   await applyAppMcpToTask(request as unknown as Record<string, unknown>, row.session_id);
+  // An assistant session's role, at the claim for the same reason: its token expires and its item list moves.
+  await applySessionRoleToTask(request as unknown as Record<string, unknown>, row.session_id);
   // The column and the spec are written from the same string, but the spec is
   // kept as a fallback: an empty prompt here would not fail, it would quietly
   // send the model a turn with nothing in it.
