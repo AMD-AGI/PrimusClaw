@@ -222,7 +222,7 @@ next sandbox and will not be there when the session is rehydrated:
 
 | Path | Owner |
 |------|-------|
-| `.uploads/` | Files uploaded through the API; expired on their own schedule |
+| `.uploads/` | Files uploaded through the API (`POST /v1/sessions/:id/upload`), put into the sandbox when a run attaches to it, including one already running; expired on their own schedule |
 | `.transcripts/` | Per-run transcripts Brain writes straight to object storage |
 | `.hands-binary` | Bootstrap artefact from older releases |
 | `hands.log` | The agent runtime's own log, truncated at every launch |

@@ -4,6 +4,7 @@
 import fs from "node:fs";
 import { z } from "zod";
 import { guardPath } from "../../runtime/path-guard.js";
+import { readImage } from "./read-image.js";
 
 const schema = {
   path: z.string().describe("File path (relative to workspace)"),
@@ -76,7 +77,7 @@ function formatCell(cell: Record<string, unknown>, index: number): string {
 
 export const read = {
   name: "read",
-  description: "Read a file from the workspace. Supports line offset and limit. Automatically detects .ipynb and formats notebook cells.",
+  description: "Read a file from the workspace. Supports line offset and limit. Automatically detects .ipynb and formats notebook cells. A PNG, JPEG, GIF or WebP image is returned as the image itself, so you can look at it.",
   zodSchema: schema,
   execute: async (args: { path: string; offset?: number; limit?: number; notebook_cell_index?: number }) => {
     let safePath: string;
@@ -95,6 +96,9 @@ export const read = {
         return { content: [{ type: "text" as const, text: `Error reading notebook ${args.path}: ${e.message}` }] };
       }
     }
+
+    const image = readImage(safePath, args.path);
+    if (image) return image;
 
     let content: string;
     try { content = fs.readFileSync(safePath, "utf-8"); } catch (e: any) {
