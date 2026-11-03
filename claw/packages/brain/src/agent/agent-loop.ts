@@ -732,6 +732,14 @@ class AgentLoopRunner {
    * every task in the batch is already counted.
    */
   private toolsStarted = 0;
+  /**
+   * The PARALLEL_READ_TOOLS among `toolsStarted` and, in this process, among
+   * `totalToolCalls`. A read changes nothing a redelivery could repeat, so
+   * `mayRethrowOpenFailure` leaves them out: a first turn of several reads is
+   * the commonest cold-start shape, and they now start together.
+   */
+  private readsStarted = 0;
+  private readsCounted = 0;
   private setupCommands: Array<{ cmd: string; turn: number }>;
   private readonly startTime: number;
   private readonly initialTurn: number;
@@ -1911,12 +1919,15 @@ class AgentLoopRunner {
       // had no matching entry to update). Total bytes still drop ~60% vs
       // the pre-optimisation baseline because the terminal event no longer
       // re-sends argumentsDetail (only `description` carrying the result).
+    const isRead = PARALLEL_READ_TOOLS.has(toolName);
     this.toolsStarted++;
+    if (isRead) this.readsStarted++;
     await this.onEvent({
         type: "toolUsed", tool: toolName, actionId: toolId, status: "start",
         argumentsDetail: { [toolName]: toolInput },
       });
     this.totalToolCalls++;
+    if (isRead) this.readsCounted++;
     this.toolCallsByName[toolName] = (this.toolCallsByName[toolName] || 0) + 1;
 
       // PreToolUse: plugin hooks may block the call, edit input, or no-op.
@@ -2150,7 +2161,7 @@ class AgentLoopRunner {
         // and the delivery is acked, which is how a classified-retryable race
         // became a permanent task failure on the default path while the eager
         // path naked correctly. See brain/src/agent/attach-error.ts.
-        if (this.mayRethrowOpenFailure(err)) throw err.cause;
+        if (this.mayRethrowOpenFailure(err, isRead)) throw err.cause;
         // A call that threw is a call that did not happen. Left at its
         // optimistic default the outcome would fall through to the success
         // count below, which is the one place a transport failure could be
@@ -2226,10 +2237,14 @@ class AgentLoopRunner {
    * it opens the sandbox before any tool has run, so there is nothing to
    * repeat.
    *
-   * `totalToolCalls` is incremented before the call it counts, so 1 is "this
-   * one, and nothing before it". It also carries across a redelivery from the
-   * checkpoint, which keeps a resumed run on the conservative side: the work
-   * behind that count is in the recovered history and must not be re-run.
+   * Reads (PARALLEL_READ_TOOLS) are not counted: re-running one repeats
+   * nothing, and a batch of them starts together, so counting them would cost
+   * an all-read first turn its redelivery. Every other call is, the failing
+   * one excepted (`isRead` says which it is): both counters are incremented
+   * before the call they count. `totalToolCalls` also carries across a
+   * redelivery from the checkpoint, reads and all, which keeps a resumed run on
+   * the conservative side: the work behind that count is in the recovered
+   * history and must not be re-run.
    *
    * The cost of being wrong either way decides where the line sits. Refusing a
    * rethrow loses a redelivery, and the model is told the sandbox could not be
@@ -2237,7 +2252,7 @@ class AgentLoopRunner {
    * wrongly repeats a side effect that has already left the process, which
    * nothing downstream can undo.
    */
-  private mayRethrowOpenFailure(err: unknown): boolean {
+  private mayRethrowOpenFailure(err: unknown, isRead: boolean): boolean {
     const e = err as { name?: string; cause?: unknown } | null;
     if (e?.name !== "SandboxAttachError") return false;
     if (!isRetryable(e.cause)) return false;
@@ -2246,12 +2261,15 @@ class AgentLoopRunner {
     // begun, including a sibling that has not reached its own increment;
     // `totalToolCalls` arrives from the checkpoint and covers work done under
     // an earlier delivery, which `toolsStarted` has no memory of.
-    if (this.toolsStarted > 1 || this.totalToolCalls > 1) {
+    const self = isRead ? 0 : 1;
+    if (this.toolsStarted - this.readsStarted > self || this.totalToolCalls - this.readsCounted > self) {
       logger.warn(
         {
           sessionId: this.sessionId,
           toolsStarted: this.toolsStarted,
+          readsStarted: this.readsStarted,
           totalToolCalls: this.totalToolCalls,
+          readsCounted: this.readsCounted,
         },
         "sandbox.open_retryable_but_turn_has_run_tools",
       );
@@ -2391,7 +2409,7 @@ class AgentLoopRunner {
         // `task` whose sandbox never opened did not run a sub-agent, and the
         // open is reached from here too (`attachHands` above) for a turn whose
         // first tool is a `task`.
-        if (this.mayRethrowOpenFailure(err)) throw err.cause;
+        if (this.mayRethrowOpenFailure(err, false)) throw err.cause;
         resultText = `Error: ${err?.message || String(err)}`;
       this.errorCount++;
       logger.warn({ err, subagentId, depth: this.depth, sessionId: this.sessionId }, "sub-agent.failed");
