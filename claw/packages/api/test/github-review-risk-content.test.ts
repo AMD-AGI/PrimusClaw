@@ -697,8 +697,9 @@ const HOLD_INPUTS: Array<[string, RiskInput, "repo" | "hard" | "judged"]> = [
   ["a repository that asks on every merge", input([mod("src/a.ts", "@@ -1 +1 @@\n-a\n+b")], { repoConfig: { confirmMerge: "always", highRiskPaths: [] } }), "repo"],
   ["a path the repository marks", input([mod("docs/legal/terms.md", "@@ -1 +1 @@\n-a\n+b")], { repoConfig: { confirmMerge: "risk", highRiskPaths: ["docs/legal/**"] } }), "repo"],
   ["a repository configuration that does not parse", input([mod("src/a.ts", "@@ -1 +1 @@\n-a\n+b")], { repoConfig: "invalid" }), "repo"],
-  ["a file list that was cut", input([mod("src/a.ts", "@@ -1 +1 @@\n-a\n+b")], { changedFiles: 600, filesComplete: false }), "hard"],
-  ["a file list that was cut where the repository marks paths", input([mod("src/a.ts", "@@ -1 +1 @@\n-a\n+b")], { changedFiles: 600, filesComplete: false, repoConfig: { confirmMerge: "risk", highRiskPaths: ["docs/legal/**"] } }), "repo"],
+  // The part that was not read may hold a change to the review instructions, which holds under every mode: so the cut does too.
+  ["a file list that was cut", input([mod("src/a.ts", "@@ -1 +1 @@\n-a\n+b")], { changedFiles: 600, filesComplete: false }), "repo"],
+  ["a file list GitHub says is complete but is shorter than the change", input([mod("src/a.ts", "@@ -1 +1 @@\n-a\n+b")], { changedFiles: 600 }), "repo"],
 ];
 const JUDGEMENTS: Array<[string, unknown, boolean]> = [
   ["low", { level: "low", reason: "an ordinary change the description explains" }, false],

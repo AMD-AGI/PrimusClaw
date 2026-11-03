@@ -351,10 +351,10 @@ function assess(input: RiskInput): { findings: Finding[]; hard: Set<string>; rep
   };
 
   // ---- the floor: nothing here reads what the change says, and all of it stays as a backstop.
-  // Size and completeness first: nothing below can be trusted if the list is cut, and a cut list cannot show that no file that controls the
-  // repository changed, so it holds.
+  // Size and completeness first: nothing below can be trusted if the list is cut. A cut list cannot show that no file that controls the
+  // repository changed, nor that the review instructions did not (which holds under every review mode, as below), so it holds under every mode.
   if (!input.filesComplete || input.changedFiles > input.files.length) {
-    add("integrity", `the change list is incomplete (${input.files.length} of ${input.changedFiles} files read)`, "hard");
+    add("integrity", `too many files changed to see them all (${input.files.length} of ${input.changedFiles} read): the change may include the review instructions`, "repo");
   }
   if (input.changedFiles > 3000) add("integrity", "more than 3000 files changed: GitHub's file list limit");
   if (input.changedFiles > 40) add("size_breadth", `large change: ${input.changedFiles} files`);
@@ -373,10 +373,6 @@ function assess(input: RiskInput): { findings: Finding[]; hard: Set<string>; rep
   const extra = input.repoConfig && input.repoConfig !== "invalid" ? input.repoConfig : null;
   if (extra?.confirmMerge === "always") add("provenance", "the repository asks for confirmation on every merge", "repo");
   const extraGlobs = (extra?.highRiskPaths ?? []).map(globToRegExp);
-  // A path the repository marks may be among the files that were not read.
-  if (extraGlobs.length > 0 && (!input.filesComplete || input.changedFiles > input.files.length)) {
-    add("provenance", "the repository marks paths high risk and not every changed file was read", "repo");
-  }
 
   // ---- what the change does: architecture, interfaces, security-sensitive code (risk-signals.ts).
   const read = readChange(input.files);

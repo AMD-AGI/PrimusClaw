@@ -93,7 +93,7 @@ const HIGH: Array<[string, RiskInput, RegExp]> = [
   ["a fork", input([file("src/a.ts")], { fork: true }), /fork/],
   ["an author outside the organisation", input([file("src/a.ts")], { authorAssociation: "FIRST_TIME_CONTRIBUTOR" }), /not a member/],
   ["a base that is not the default branch", input([file("src/a.ts")], { baseRef: "releases" }), /base branch is releases/],
-  ["a file list that was cut", input([file("src/a.ts")], { filesComplete: false, changedFiles: 600 }), /incomplete/],
+  ["a file list that was cut", input([file("src/a.ts")], { filesComplete: false, changedFiles: 600 }), /too many files changed to see them all/],
   ["more files than GitHub lists", input([file("src/a.ts")], { changedFiles: 3500, filesComplete: false }), /3000/],
   ["a repository config that does not parse", input([file("src/a.ts")], { repoConfig: "invalid" }), /claw-review\.yml could not be read/],
   ["a repository that asks for confirmation every time", input([file("src/a.ts")], { repoConfig: { confirmMerge: "always", highRiskPaths: [] } }), /every merge/],
