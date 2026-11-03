@@ -587,7 +587,11 @@ the shape of a pod every node refuses or ignores -- and no node is being added f
 writes a message on every pod it could not place ("0/7 nodes are available ...", and the autoscaler's
 "pod didn't trigger scale-up ..."); that message says why the pod is stuck and is not progress, so it
 does not exempt the wait. Progress is a scale-up the platform reports as triggered (`TriggeredScaleUp`)
-or a message it has not said before during the stall, and either restarts the clock. A workload still in
+or a message it has not said before during the stall, and either restarts the clock. The platform
+writes only its newest scheduling event on the workload, and the scheduler goes on repeating its own
+after the autoscaler's single `TriggeredScaleUp`, so a scale-up that has been seen stays in force
+through the scheduler's account that follows it; it ends when the autoscaler says
+`NotTriggerScaleUp`, when the platform withdraws its message, or when a pod is taken. A workload still in
 the platform's queue, or admitted with a scale-up under way, is a wait the platform manages: it is
 announced with its reason and keeps the ceilings of its phase -- the start ceiling (15 minutes) once the
 platform reports it NotReady, the Pending ceiling (3 hours) while it reports it Pending. Waiting longer
@@ -596,7 +600,9 @@ minutes, or hours, twice when the model retries. It counts only an unbroken abse
 queue time and never a sandbox that is pulling an image, and only the sandbox a run opens asks for it
 (`unschedulableTimeoutMs` on the shared loop, off by default, so multi-node clusters and hosted
 applications wait as before). While a sandbox waits in either way the loop reports it as soon as the
-platform says so, not on the ten-minute tick, and the user is shown one line in our words (how many
+platform says so, not on the ten-minute tick (a wait the platform has said nothing about, which
+is also what a workload looks like before it has been synced, is reported once it has lasted 30
+seconds, so a sandbox that starts a moment after it is created is never announced as stuck), and the user is shown one line in our words (how many
 nodes cannot take it and why, whether a node is being added) rather than the platform's text, which
 carries its pool ids, namespaces, pod names and taint keys and stays in the logs. The platform's own
 short queue phrases ("In queue - insufficient resources, no cpu available") are repeated as written;

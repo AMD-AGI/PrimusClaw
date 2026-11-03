@@ -1098,7 +1098,12 @@ export const SANDBOX_START_TIMEOUT_MS = envInt("SANDBOX_START_TIMEOUT_SECONDS", 
 // available ...", "pod didn't trigger scale-up ..."). That message says why the
 // pod is stuck; it is not progress, so it does not exempt the wait. Progress is a
 // scale-up the platform reports as triggered (`TriggeredScaleUp`), or a message
-// that changes: either restarts the clock.
+// that changes: either restarts the clock. The platform keeps only its newest
+// scheduling event on the workload and the scheduler repeats its own after the
+// autoscaler's one, so a scale-up that was reported stays in force through the
+// scheduler's account that follows it, and ends only when the autoscaler says it
+// will not add a node (`NotTriggerScaleUp`), the platform withdraws its message
+// or a pod is taken.
 //
 // Counted from the first read that shows the pod untaken and cleared the moment
 // anything takes it, so it measures an absence of progress and never the time a

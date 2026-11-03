@@ -461,7 +461,8 @@ secret:
   # no node being added for it (every node cordoned, down or tainted) before the message fails
   # with reason sandbox_unschedulable, the workload is stopped, and the model is told to report it
   # rather than open another. The platform's "0/N nodes are available" or "didn't trigger
-  # scale-up" text is why it is stuck, not progress; a scale-up it reports as triggered, or a
+  # scale-up" text is why it is stuck, not progress; a scale-up it reports as triggered (and
+  # stays in force until the autoscaler says it will not add a node), or a
   # message that keeps changing, restarts the clock. Not applied to a sandbox still in the
   # platform's queue or one with a scale-up under way (the Pending ceiling above, or the start
   # ceiling once NotReady), or to one that is starting (the start ceiling). Raise it, or 0 = off,

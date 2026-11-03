@@ -119,7 +119,11 @@ export interface WorkloadWaitDeps {
   notifyIntervalMs?: number;
   /**
    * Minimum gap between two progress events that announce a change in what the
-   * workload is waiting for. The first announcement is never held back.
+   * workload is waiting for. The first announcement is not held back, except for
+   * a wait the platform has said nothing about (no message): that is announced
+   * only once it has lasted this long, because it is also what a workload looks
+   * like in the seconds before the platform has synced it, and a sandbox that is
+   * simply starting must not be announced as stuck.
    */
   waitNoticeGapMs?: number;
 }
@@ -206,7 +210,12 @@ export interface WorkloadWaitOptions {
    * available", the autoscaler's "pod didn't trigger scale-up" -- says why the pod
    * is stuck, and is not progress by being there: a message is on every unplaced
    * pod, including one that no node will ever take. Progress is a scale-up the
-   * platform reports as triggered, or a message that changes. Not covered: a
+   * platform reports as triggered, or a message that changes. The platform
+   * writes only the newest of its scheduling events on the workload, and the
+   * scheduler keeps repeating its own after the autoscaler's one, so a scale-up
+   * that was reported stays in force through the scheduler's account that follows
+   * it, and ends only when the autoscaler says it will not add a node, when the
+   * platform withdraws its message, or when a pod is taken. Not covered: a
    * queued workload (a queue moves, and the Pending ceiling bounds it) and an
    * admitted one with a scale-up under way (a node can take minutes to arrive);
    * those keep the ceilings of their phase, the Pending one while Pending and the
@@ -257,8 +266,10 @@ async function sleepUnlessAborted(
  *   - admitted, no node has taken the pod and none is being added, past
  *     `unschedulableTimeoutMs` -> sandbox_unschedulable, counted from the first
  *     such read, restarted by a message the stall has not had before, and
- *     cleared the moment a pod is taken, a scale-up is triggered or the workload
- *     goes back to the queue;
+ *     cleared the moment a pod is taken, a scale-up is triggered (and it stays
+ *     cleared while the scheduler's account follows the scale-up, until the
+ *     autoscaler says it will not add a node) or the workload goes back to the
+ *     queue;
  *   - dispatched but not ready past its own ceiling -> sandbox_start_timeout,
  *     counted from the first read that is not Pending and reset if the workload
  *     falls back to Pending. SaFE reports a container's waiting state nowhere
@@ -307,6 +318,14 @@ export async function waitForWorkloadReady(
   // has already said, again, is not. Bounded, so a message that changes on every
   // read (a counter, a timestamp) cannot hold the stall open for ever.
   const unscheduledDetails = new Set<string>();
+  // Whether the last read was a node being added. A scale-up is visible on the
+  // workload only while it is the newest scheduling event, so the next read is
+  // asked to keep it in force (see readWaitingState).
+  let scaleUpSeen = false;
+  // When the workload was first seen waiting with nothing said about why, in an
+  // unbroken run of such reads. Such a wait is announced only once it has lasted
+  // WAIT_NOTICE_GAP_MS: a workload the platform has not synced yet looks the same.
+  let silentSince: number | null = null;
   // The last waiting state the user was told about, and when. Compared on
   // (kind, queue position, reason) so a change is announced and a repeat is not.
   let lastWaitingSig = "";
@@ -462,7 +481,8 @@ export async function waitForWorkloadReady(
     // before the ceilings below so that an admitted workload nothing will run is
     // ended on its own, shorter limit rather than on the long one meant for a
     // sandbox that is genuinely starting.
-    const waiting = readWaitingState(detail);
+    const waiting = readWaitingState(detail, scaleUpSeen);
+    scaleUpSeen = waiting?.scalingUp === true;
     if (waiting?.kind === "unscheduled") {
       const t = now();
       if (unscheduledSince === null) {
@@ -527,23 +547,33 @@ export async function waitForWorkloadReady(
     // the sandbox is held up, and why, the moment the platform says so instead
     // of ten minutes into a progress bar that does not move; it is paced so a
     // reason that flaps cannot flood the stream.
+    //
+    // A wait the platform has said nothing about is not announced until it has
+    // lasted a while: the first read after a create usually finds a workload the
+    // platform has not synced yet (Pending, no pods, no message), which is the
+    // same state, and a sandbox that starts a few seconds later was never waiting
+    // for anything. Until then the caller is told what it was told before there
+    // was a reason to say more. The stall clock above is not affected.
     const nowMs = now();
-    const waitingSig = waiting ? `${waiting.kind}|${queuePosition}|${waiting.reason}` : "";
-    if (!waiting) lastWaitingSig = "";
-    const waitingChanged = waiting !== null && waitingSig !== lastWaitingSig
+    if (waiting?.silent) silentSince ??= nowMs;
+    else silentSince = null;
+    const told = waiting && !(waiting.silent && nowMs - silentSince! < WAIT_NOTICE_GAP_MS) ? waiting : null;
+    const waitingSig = told ? `${told.kind}|${queuePosition}|${told.reason}` : "";
+    if (!told) lastWaitingSig = "";
+    const waitingChanged = told !== null && waitingSig !== lastWaitingSig
       && (lastWaitingNoticeMs === 0 || nowMs - lastWaitingNoticeMs >= WAIT_NOTICE_GAP_MS);
     if (waitingChanged || lastNotifyMs === 0 || nowMs - lastNotifyMs >= NOTIFY_INTERVAL_MS) {
       lastNotifyMs = nowMs;
-      if (waiting && waitingChanged) {
+      if (told && waitingChanged) {
         lastWaitingSig = waitingSig;
         lastWaitingNoticeMs = nowMs;
         logger.info(
-          { workloadId, phase, queuePosition, waiting: waiting.kind, reason: waiting.reason, platformMessage: cleanPlatformText(waiting.detail, LOGGED_TEXT_LIMIT) },
+          { workloadId, phase, queuePosition, waiting: told.kind, reason: told.reason, platformMessage: cleanPlatformText(told.detail, LOGGED_TEXT_LIMIT) },
           `${logPrefix}.waiting`,
         );
       }
       await opts.onProgress?.({
-        phase, queuePosition, ...(waiting ? { waiting: { kind: waiting.kind, reason: waiting.reason } } : {}),
+        phase, queuePosition, ...(told ? { waiting: { kind: told.kind, reason: told.reason } } : {}),
       }).catch(() => {});
     }
   }

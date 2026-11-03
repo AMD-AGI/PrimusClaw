@@ -24,7 +24,8 @@
  *  - `queued`: the platform is holding the workload and something is moving.
  *    Either its own scheduler has not admitted it yet (queue position above
  *    zero, usually because capacity is taken), or it was admitted and a node is
- *    actually being added for it (the autoscaler reports `TriggeredScaleUp`).
+ *    actually being added for it (the autoscaler reports `TriggeredScaleUp`,
+ *    and the scale-up stays in force until the platform says otherwise).
  *    Both are waits the platform manages and can be long (a GPU queue, a node
  *    that takes minutes to arrive); the user is told the reason, and the ceilings
  *    for the phase are the only limit.
@@ -53,6 +54,20 @@ export interface WaitingState {
    * changed from one that repeats. Never shown to the user.
    */
   detail: string;
+  /**
+   * Set when a node is being added for the sandbox: the autoscaler's
+   * `TriggeredScaleUp` is on the message, or was seen earlier in this stall and
+   * nothing since has said it was withdrawn (see `readWaitingState`).
+   */
+  scalingUp?: true;
+  /**
+   * Set when the platform has said nothing about why the sandbox waits (no
+   * message), so the state is one of our own sentences about the pod. It is also
+   * what a workload looks like in the seconds before the platform has synced it,
+   * which a sandbox that is simply starting passes through; the wait loop does not
+   * announce it until it has lasted a while.
+   */
+  silent?: true;
 }
 
 /** Long enough for any real reason, short enough to be one line of progress text. */
@@ -102,7 +117,19 @@ function scaleUpTriggered(text: string): boolean {
   return /\bTriggeredScaleUp\b/.test(text);
 }
 
+/**
+ * Whether the platform has since said that it will not add a node. The newest of
+ * the autoscaler's events is what the platform writes on the workload, so this
+ * is the autoscaler withdrawing an earlier scale-up, and the only thing that is.
+ */
+function scaleUpWithdrawn(text: string): boolean {
+  return /\bNotTriggerScaleUp\b/.test(text);
+}
+
 const count = (text: string, re: RegExp): number => Number(re.exec(text)?.[1] ?? 0);
+
+/** Said while a node is being added for the sandbox. */
+const ADDING_NODE = "the platform is adding a node for the sandbox";
 
 /** Said when the platform's text is not one we can summarise, and the workload is admitted. */
 const UNPLACED = "the platform has not been able to place the sandbox on a node yet";
@@ -127,7 +154,7 @@ const QUEUE_PHRASE = /^In queue - [A-Za-z][A-Za-z ,'-]{0,150}$/;
  * reason this is a summary and not the text cut short.
  */
 export function summarizeScheduling(text: string): string | null {
-  if (scaleUpTriggered(text)) return "the platform is adding a node for the sandbox";
+  if (scaleUpTriggered(text)) return ADDING_NODE;
   const total = /\b\d+\/(\d+) nodes are available\b/.exec(text)?.[1];
   const notAdded = /\bNotTriggerScaleUp\b/.test(text);
   if (!total && !notAdded) return null;
@@ -155,8 +182,19 @@ export function summarizeScheduling(text: string): string | null {
  * already ruled those out. A phase other than Pending or NotReady is not read as
  * waiting at all, so a state this does not know about keeps whatever handling it
  * had.
+ *
+ * `scaleUpSeen` is whether the read before this one was a node being added. The
+ * platform writes only the newest of the autoscaler's and the scheduler's events
+ * on the workload, and the autoscaler says `TriggeredScaleUp` once while the
+ * scheduler goes on repeating `FailedScheduling`, so a scale-up is visible for
+ * only as long as it is the newest event; seconds later the message reads as the
+ * scheduler's account of a pod it cannot place, which is also exactly what a pod
+ * no node will take looks like. A scale-up that has been seen therefore stays in
+ * force through every message that does not take it back: until the autoscaler
+ * says `NotTriggerScaleUp`, the platform withdraws its message, a pod is taken or
+ * the workload goes back to the queue.
  */
-export function readWaitingState(detail: Record<string, unknown>): WaitingState | null {
+export function readWaitingState(detail: Record<string, unknown>, scaleUpSeen = false): WaitingState | null {
   const phase = String(detail.phase ?? "").toLowerCase();
   if (phase !== "pending" && phase !== "notready") return null;
 
@@ -182,29 +220,36 @@ export function readWaitingState(detail: Record<string, unknown>): WaitingState 
   // Admitted. The platform writes its message here for a pod it could not place,
   // and says in it whether a node is being added. A node being added is a wait
   // the platform manages, can take longer than any limit of ours, and is left to
-  // the ceilings of the phase. Everything else is a pod stuck for a reason, and
-  // the reason does not change by being repeated.
-  if (text && scaleUpTriggered(text)) return { kind: "queued", reason: summary!, detail: text };
+  // the ceilings of the phase; so is one that was being added and whose event has
+  // since been followed by the scheduler's own account (see above). Everything
+  // else is a pod stuck for a reason, and the reason does not change by being
+  // repeated.
+  if (text && (scaleUpTriggered(text) || (scaleUpSeen && !scaleUpWithdrawn(text)))) {
+    return { kind: "queued", reason: ADDING_NODE, detail: text, scalingUp: true };
+  }
   if (text) return { kind: "unscheduled", reason: summary ?? UNPLACED, detail: text };
 
   const pod = pods.find((p) => p?.podId) ?? pods[0];
   const podId = cleanPlatformText(pod?.podId, 80);
   const node = cleanPlatformText(pod?.adminNodeName, 80);
   const name = `the pod${podId ? ` ${podId}` : ""}`;
+  // The platform has said nothing: what follows is our own account of the pod.
   if (pods.length === 0) {
     const none = "the platform has accepted the sandbox, but no node has taken its pod yet";
-    return { kind: "unscheduled", reason: none, detail: none };
+    return { kind: "unscheduled", reason: none, detail: none, silent: true };
   }
   return node
     ? {
       kind: "unscheduled",
       reason: "the sandbox's pod was assigned to a node that has not started it",
       detail: `${name} was assigned to node ${node}, which has not started it`,
+      silent: true,
     }
     : {
       kind: "unscheduled",
       reason: "the sandbox's pod has not been placed on any node",
       detail: `${name} is Pending and has not been placed on any node`,
+      silent: true,
     };
 }
 
