@@ -124,11 +124,25 @@ async function retire(id: string): Promise<boolean> {
   const it = got.status === 200 ? (got.json.data as ItemView) : null;
   const stop = !it ? got.status : it.board_state !== "done" ? (await api("POST", `/v1/work-items/${id}/stop`)).status : 200;
   const wid = it?.worker_session_id ?? t.workerSessionId;
-  const del = !it ? 0 : wid ? (await api("DELETE", `/v1/sessions/${wid}`)).status : 200;
+  // An item that could not be read is not retired, but a worker already known is still deleted.
+  const del = wid ? (await api("DELETE", `/v1/sessions/${wid}`)).status : it ? 200 : 0;
   t.retired = stop === 200 && (del === 200 || del === 204 || del === 404);
   if (!t.retired) log("could not retire", id, `read ${got.status}, stop ${stop}, delete worker ${del}`);
   return t.retired;
 }
+/**
+ * Waits until the assistant is between turns (read, and not running) and nothing has been delivered for `quietMs`,
+ * so the next thing it says belongs to what is sent next. Null when that does not happen before the deadline.
+ */
+async function settled(sid: string, receiver: Rec, quietMs: number, deadlineAt: number): Promise<true | null> {
+  return until(async () => {
+    const s = await api("GET", `/v1/sessions/${sid}`);
+    if (s.status !== 200 || typeof s.json?.data?.agent_status !== "string" || s.json.data.agent_status === "running") return undefined;
+    const last = receiver.received.at(-1)?.at ?? 0;
+    return Date.now() - last >= quietMs ? true : undefined;
+  }, deadlineAt, 500);
+}
+
 const retireAll = async (ids: Iterable<string>) => (await Promise.all([...ids].map(retire))).every(Boolean);
 
 async function main(): Promise<void> {
@@ -145,8 +159,10 @@ async function scenario(): Promise<"finished" | void> {
   const receiver = await startReceiver(Number(process.env.RECEIVER_PORT ?? 0));
   cleanups.push({ what: "close the receiver", run: () => receiver.close() });
   const runFloor = Math.max(0, ...(await board()).map((i) => Number(i.seq)));
+  let assistantSid: string | null = null;
   cleanups.push({ what: "stop this run's items and delete their workers", run: async () => {
-    // Also what the run never saw: an item the Router created after the run last looked.
+    // Also what the run never saw: an item the Router created after the run last looked, once its turn is over.
+    if (assistantSid && !await settled(assistantSid, receiver, 0, Date.now() + 120_000)) log("the assistant was still in a turn after 120s; sweeping anyway");
     for (const i of newItemsSince(await board(), runFloor, new Set())) await track(i.item_id);
     if (!await retireAll(runItems.keys())) throw new Error("some items or workers could not be retired (see the log)");
   } });
@@ -166,6 +182,7 @@ async function scenario(): Promise<"finished" | void> {
   if (!check(assistant.status === 200 && Boolean(assistant.json.data.session_id), "the assistant session exists")) return;
   const sid: string = assistant.json.data.session_id;
   runSessions.add(sid);
+  assistantSid = sid;
   const again = await api("POST", "/v1/assistant");
   check(again.json?.data?.session_id === sid && again.json?.data?.created === false, "asking again returns the same session");
 
@@ -181,7 +198,8 @@ async function scenario(): Promise<"finished" | void> {
     until(() => sayAfter(since, match), since + budgetMs, 100);
   const known = new Set((await board()).map((i) => i.item_id));
   const newItem = async (since: number): Promise<ItemView | null> => {
-    const found = await until(async () => (await board("in_progress")).find((i) => !known.has(i.item_id) && !runItems.has(i.item_id)), since + SAY_BUDGET_MS);
+    // At least a few seconds of looking, even when the acknowledgement it follows came late in its budget.
+    const found = await until(async () => (await board("in_progress")).find((i) => !known.has(i.item_id) && !runItems.has(i.item_id)), Math.max(since + SAY_BUDGET_MS, Date.now() + 5_000));
     if (found) await track(found.item_id);
     return found;
   };
@@ -406,9 +424,9 @@ async function soakRound(round: number, send: Send, receiver: Rec, assistantSid:
     check(mine !== null, `soak round ${round}: both tasks are on the board (${names.map((n) => `${n} ${itemNamed(seen.values(), n) ? `#${itemNamed(seen.values(), n)!.seq}` : "missing"}`).join(", ")})`);
     const out: number[] = [];
     for (const q of ["How are the two tasks going?", "Which of them is done?"]) {
-      // Only once the assistant is between turns is the next thing it says the answer to this question.
-      const idle = await until(async () => ((await api("GET", `/v1/sessions/${assistantSid}`)).json?.data?.agent_status === "running" ? undefined : true), Date.now() + 60_000, 500);
-      check(idle === true, `soak round ${round}: the assistant is between turns before "${q}"`);
+      // Only once the assistant is between turns, and its last message has landed, is the next thing it says the answer.
+      const idle = await settled(assistantSid, receiver, 3_000, Date.now() + 60_000);
+      check(idle === true, `soak round ${round}: the assistant is between turns and quiet before "${q}"`);
       const sent = await send(q);
       // A "ready, accept it" message is the system reporting a task, not the answer to this question.
       const said = await until(() => receiver.received.find((r) => r.type === "assistant.say" && r.at >= sent && !r.item?.can_accept), sent + SAY_BUDGET_MS * 3, 100);
