@@ -24,7 +24,7 @@ import {
   type HandsRecoveryAllowance,
   type RecreateHandsResult,
 } from "./index.js";
-import type { Message, ToolSchema, TokenUsage, EventCallback } from "@claw/protocol";
+import type { Message, ReasoningEffort, ToolSchema, TokenUsage, EventCallback } from "@claw/protocol";
 import type { RunIdentity } from "../tasks/run-identity.js";
 import { safePreview } from "@claw/utils";
 import { HandsClient, isHandsNetworkError, isHandsToolTimeout, explainHandsError, handsNetworkErrorReason } from "../clients/hands.js";
@@ -262,6 +262,8 @@ export interface LoopOptions {
   apiUrl: string;
   apiKey: string;
   maxTurns: number;
+  /** The run's reasoning effort (`ExecuteRequest.effort`), asked on every turn of this loop and of its sub-agents. */
+  effort?: ReasoningEffort;
   router: ToolRouter;
   onEvent: EventCallback;
   signal?: AbortSignal;
@@ -926,7 +928,7 @@ class AgentLoopRunner {
     // through LoopOptions, so this one call to a module-level singleton was the
     // only thing standing between this file and being testable at all.
     this.session = opts.llmSession
-      ?? getProvider().createSession({ model, apiUrl, apiKey, userId, sessionId });
+      ?? getProvider().createSession({ model, apiUrl, apiKey, userId, sessionId, effort: opts.effort });
     // Captured alongside the session because the cache metrics have to say
     // which wire produced each number: the two protocols differ in what they
     // report at all -- cache writes, and the TTL split -- so the same counter
@@ -2395,7 +2397,7 @@ class AgentLoopRunner {
         parentRouter: this.router,
         onEvent: this.onEvent,
         signal: this.signal,
-        model: this.model, apiUrl: this.apiUrl, apiKey: this.apiKey,
+        model: this.model, apiUrl: this.apiUrl, apiKey: this.apiKey, effort: this.opts.effort,
         maxTurns: SUB_AGENT_MAX_TURNS > 0 ? SUB_AGENT_MAX_TURNS : this.maxTurns,
         userId: this.userId, sessionId: this.sessionId,
         depth: this.depth + 1,

@@ -8,7 +8,7 @@ import type {
   ChatCompletionMessageParam,
   ChatCompletionTool,
 } from "openai/resources/chat/completions";
-import type { Message, ToolSchema } from "@claw/protocol";
+import type { Message, ReasoningEffort, ToolSchema } from "@claw/protocol";
 import { coerceToolInput } from "@claw/utils";
 import { LLM_CACHE_STYLE, LLM_CACHE_TTL, OPENAI_CACHE_MARKERS, STREAM_FIRST_BYTE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS } from "../config.js";
 
@@ -147,6 +147,7 @@ async function streamingTurn(
   signal: AbortSignal | undefined,
   capture: RoutedModelSink,
   cacheState: OpenAiCacheState,
+  effort?: ReasoningEffort,
 ): Promise<LlmTurnResult> {
   const ctrl = new AbortController();
   const onParentAbort = () => ctrl.abort(signal?.reason);
@@ -190,6 +191,7 @@ async function streamingTurn(
         stream: true,
         stream_options: { include_usage: true },
         max_tokens: 16384,
+        ...(effort ? { reasoning_effort: effort } : {}),
         // The native dialect needs this or the breakpoints are accepted and
         // ignored -- caching that looks configured and bills as if it is not.
         // Sent only when markers in that dialect actually went out, so an
@@ -232,6 +234,7 @@ async function streamingTurn(
           stream: true,
           stream_options: { include_usage: true },
           max_tokens: 16384,
+          ...(effort ? { reasoning_effort: effort } : {}),
         },
         { signal: ctrl.signal },
       );
@@ -471,7 +474,7 @@ export class OpenAiProvider implements LlmProvider {
   readonly name = "openai" as const;
 
   createSession(opts: LlmSessionOptions): LlmSession {
-    const { model, apiUrl, apiKey, userId, sessionId } = opts;
+    const { model, apiUrl, apiKey, userId, sessionId, effort } = opts;
 
     const litellmTags = ["product:primus-claw", "executor:brain", `engine:${model.split("-")[0]}`].join(",");
     const litellmMeta = JSON.stringify({ session_id: sessionId || "", user_id: userId || "" });
@@ -496,7 +499,7 @@ export class OpenAiProvider implements LlmProvider {
       },
     });
 
-    return buildOpenAiSession(client, model, capture);
+    return buildOpenAiSession(client, model, capture, effort);
   }
 }
 
@@ -512,11 +515,12 @@ export function buildOpenAiSession(
   client: OpenAI,
   model: string,
   capture: RoutedModelSink = {},
+  effort?: ReasoningEffort,
 ): LlmSession {
   const cacheState: OpenAiCacheState = { markersDisabled: false, decoratedFailures: 0, probedWithoutRelief: false };
   return {
     streamTurn: (messages, tools, signal) =>
-      streamingTurn(client, model, messages, tools, signal, capture, cacheState),
+      streamingTurn(client, model, messages, tools, signal, capture, cacheState, effort),
       async complete(systemPrompt, userText, maxTokens, signal, options) {
         const resp = await client.chat.completions.create({
           model,

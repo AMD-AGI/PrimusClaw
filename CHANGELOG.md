@@ -28,6 +28,15 @@ record it.
 ## [Unreleased]
 
 ### Added
+- A pull request reviewed on someone's behalf is reviewed in depth. A session created with `config.acting_as` and no
+  `model` runs on `CLAW_GITHUB_REVIEW_MODEL` (default `claude-opus-5.5`), and every turn of it at
+  `CLAW_GITHUB_REVIEW_EFFORT` (default `high`; new `ExecuteRequest.effort`, which Brain sends as adaptive thinking at
+  `output_config.effort`, or `reasoning_effort`, on every turn and sub-agent of the run). The requester's key pays.
+  Any change of a non-test source file, or of more than 200 lines (`CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES`, was
+  600), takes the sandbox path (`source_change`), and the default instructions require it: check the pull request
+  out, read the callers of every changed function and export, run the closest tests under a time bound, then a second
+  adversarial pass by a read-only sub-agent; the review body lists what was read and run and carries non-blocking
+  suggestions and open questions, while inline comments stay for verified blocking findings. The gates are unchanged.
 - The model can schedule work itself: with `CLAW_TRIGGER_TOOLS_ENABLED` (needs `CLAW_TRIGGERS_ENABLED` and a
   `CLAW_TRIGGER_TOOLS_TOKEN_KEY` of 32+ characters; off by default) every turn but a trigger's own run is offered
   `trigger_create`, `trigger_list` and `trigger_cancel`, served by the API at `/v1/internal/trigger-mcp`. The user is

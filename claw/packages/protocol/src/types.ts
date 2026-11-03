@@ -6,6 +6,14 @@ import type { RunTimeReport } from "./run-time.js";
 import type { EnvironmentTopology } from "./topology.js";
 import type { SessionRepo } from "./session-repo.js";
 
+/** The reasoning efforts every provider Brain speaks to accepts under the same name. */
+export const REASONING_EFFORTS = ["low", "medium", "high"] as const;
+export type ReasoningEffort = typeof REASONING_EFFORTS[number];
+
+export function isReasoningEffort(v: unknown): v is ReasoningEffort {
+  return typeof v === "string" && (REASONING_EFFORTS as readonly string[]).includes(v);
+}
+
 /** Conversation message for LLM API. */
 export interface Message {
   role: "user" | "assistant" | "system";
@@ -404,6 +412,12 @@ export interface ExecuteRequest {
   system_append?: string;
   rules_text?: string;
   model?: string;
+  /**
+   * How hard the model is asked to think on every LLM turn of this run, its sub-agents included (Anthropic: adaptive thinking at
+   * `output_config.effort`; OpenAI: `reasoning_effort`). Absent means the gateway's own defaults, which is what every run had before the
+   * field. The API sets it for a session that reviews a pull request on someone's behalf (`CLAW_GITHUB_REVIEW_EFFORT`).
+   */
+  effort?: ReasoningEffort;
   max_turns?: number;
   llm_api_key?: string;
   /** Per-user environment variables snapshot at message creation time; Brain merges this into the sandbox podSpec.env after CLAW / SaFE / system env layers, validated against `isUserEnvKeyAllowed` on both ends (API write + Brain merge). */

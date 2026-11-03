@@ -13,7 +13,7 @@ import { looksLikeCacheRejection } from "./cache-rejection.js";
 import { requiredArgToolNames } from "./tool-schema.js";
 import { parseToolArguments, sanitizeToolUseInputs } from "./tool-input.js";
 import { prepareAnthropicRequest, stripCacheControl, type PreparedAnthropicRequest } from "./anthropic-cache.js";
-import type { Message } from "@claw/protocol";
+import type { Message, ReasoningEffort } from "@claw/protocol";
 import type { LlmCacheReport, LlmContentBlock, LlmProvider, LlmSession, LlmSessionOptions, LlmTurnResult } from "./provider.js";
 import {
   headerModelFromStream,
@@ -66,6 +66,7 @@ async function streamingTurn(
   signal: AbortSignal | undefined,
   capture: RoutedModelSink,
   cacheState: SessionCacheState,
+  effort?: ReasoningEffort,
 ): Promise<LlmTurnResult> {
   // One abort controller PER ATTEMPT, not per turn.
   //
@@ -119,6 +120,8 @@ async function streamingTurn(
           messages: body.messages as unknown as MessageParam[],
           tools,
           max_tokens: 16384,
+          // Adaptive thinking is what the effort is spent on; without it a model only answers more or less at length.
+          ...(effort ? { thinking: { type: "adaptive" as const }, output_config: { effort } } : {}),
           stream: true,
         },
         { signal: ctrl.signal },
@@ -451,7 +454,7 @@ export class AnthropicProvider implements LlmProvider {
   readonly name = "anthropic" as const;
 
   createSession(opts: LlmSessionOptions): LlmSession {
-    const { model, apiUrl, apiKey, userId, sessionId } = opts;
+    const { model, apiUrl, apiKey, userId, sessionId, effort } = opts;
 
     // Observability: LiteLLM headers — every messages.create call carries
     // the same tags for spend/log attribution.
@@ -471,7 +474,7 @@ export class AnthropicProvider implements LlmProvider {
       defaultHeaders: anthropicDefaultHeaders({ litellmTags, litellmMeta, userId, sessionId }),
     });
 
-    return buildAnthropicSession(client, model, capture);
+    return buildAnthropicSession(client, model, capture, effort);
   }
 }
 
@@ -489,6 +492,7 @@ export function buildAnthropicSession(
   client: Anthropic,
   model: string,
   capture: RoutedModelSink = {},
+  effort?: ReasoningEffort,
 ): LlmSession {
   const cacheState: SessionCacheState = { disabled: false, decoratedFailures: 0 };
   return {
@@ -501,6 +505,7 @@ export function buildAnthropicSession(
         signal,
         capture,
         cacheState,
+        effort,
       ),
       async complete(systemPrompt, userText, maxTokens, signal, options) {
         const resp = await client.messages.create({

@@ -433,12 +433,22 @@ be read is treated as one that withholds, so memory is not used and the turn is 
 
 ## Review path: the diff or a sandbox
 
-A sandbox costs a cold start of about 16 seconds. A small change needs none: `gh_pr_get`
+A sandbox costs a cold start of about 16 seconds. A small change that touches no source code
+(documentation, configuration, tests; at most `CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES` lines,
+default 200, in at most `CLAW_GITHUB_REVIEW_FAST_MAX_FILES` files) needs none: `gh_pr_get`
 returns the diff, the file list and the metadata, and says `review_path.path = "api_diff"`.
-A sandbox is allowed (`"sandbox"`) when the change is large, GitHub did not send the diff of
+Every other change is reviewed with a sandbox (`"sandbox"`), and the instructions require it: a
+non-test source file changed (`source_change`: a code, shell or SQL file by extension, outside
+`test/`, `tests/`, `__tests__/`, `spec/`, `fixtures/`, `testdata/`, `e2e/` and not named like a test,
+`*.test.*`, `*.spec.*`, `*_test.go`, `test_*.py`), the change is large, GitHub did not send the diff of
 some file (a binary, a rename or a diff too large, whatever the line counts say), the file list is incomplete, or the repository has a review skill of its own, which
-may use scripts. Brain opens a sandbox only when a turn uses a sandbox tool, so the decision is
-advice plus a record: a structured log line (`github_review.path_chosen` with `review_path`,
+may use scripts. On that path the model checks the pull request out, reads the callers of every
+changed function and export and the code around them, and runs the tests closest to the change
+(the repository's documented test command, scoped, each command under `timeout 600`), then has a
+second, adversarial pass look for what the first missed (a `task` sub-agent with read and bash
+tools only), and the review body lists what was read and run. A diff alone shows what changed, not
+who depends on it. Brain opens a sandbox only when a turn uses a sandbox tool, so the decision is
+an instruction plus a record: a structured log line (`github_review.path_chosen` with `review_path`,
 `review_path_reason`, `session_id`, `repo`, `pr`, `changed_files`, `changed_lines`) and the
 `review_path` and `review_path_reason` columns of the audit row.
 
@@ -506,7 +516,9 @@ logs and the audit rows.
 | `CLAW_GITHUB_CONCURRENT_PER_REPO` | 3 | Tool calls on one repository at once, per API replica |
 | `CLAW_GITHUB_REQUESTS_PER_SESSION` | 60 | GitHub requests one session may make |
 | `CLAW_GITHUB_REVIEW_FAST_MAX_FILES` | 15 | At most this many changed files for the diff-only path |
-| `CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES` | 600 | At most this many added plus deleted lines for the diff-only path |
+| `CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES` | 200 | At most this many added plus deleted lines for the diff-only path; a change of a non-test source file takes the sandbox path whatever its size |
+| `CLAW_GITHUB_REVIEW_MODEL` | `claude-opus-5.5` | The model of a session created with `config.acting_as` when the request names none (`model` absent or null); a request's own `model` wins. `default` leaves Brain's `DEFAULT_MODEL`. The requester's key pays for it |
+| `CLAW_GITHUB_REVIEW_EFFORT` | `high` | The reasoning effort of every turn of such a session, its sub-agents included (`low`, `medium`, `high`; Anthropic adaptive thinking at `output_config.effort`, OpenAI `reasoning_effort`). `default` leaves the gateway's |
 
 The identity provider must give the API's own client the `identity.credential.resolve` scope
 (see [identity-client.md](identity-client.md), external credentials). Without a bound credential

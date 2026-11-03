@@ -5,7 +5,7 @@ import { agentLoop } from "./agent-loop.js";
 import { ToolRouter, type WebToolServices } from "../tools/router.js";
 import type { HandsClient } from "../clients/hands.js";
 import type { HookRunner } from "./hooks.js";
-import type { Message, ToolSchema, EventCallback } from "@claw/protocol";
+import type { Message, ReasoningEffort, ToolSchema, EventCallback } from "@claw/protocol";
 import type { RunIdentity } from "../tasks/run-identity.js";
 import { filterToolSchemas, type ToolAllowlist } from "../tools/allowlist.js";
 import pino from "pino";
@@ -72,6 +72,7 @@ export interface RunSubagentOptions {
 
   // LLM config (inherited from parent engine).
   model: string;
+  effort?: ReasoningEffort;
   apiUrl: string;
   apiKey: string;
   maxTurns: number;
@@ -208,6 +209,7 @@ export async function runSubagent(opts: RunSubagentOptions): Promise<SubagentRes
   try {
     result = await agentLoop(messages, schemas, {
       model: opts.model,
+      effort: opts.effort,
       apiUrl: opts.apiUrl,
       apiKey: opts.apiKey,
       maxTurns: opts.maxTurns,

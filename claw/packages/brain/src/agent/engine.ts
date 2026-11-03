@@ -40,7 +40,7 @@ import {
 } from "../config.js";
 import { a2aApprovalHold } from "../clients/a2a.js";
 import { WebSearchService, WebFetchService, SimpleSessionCostTracker } from "../tools/web/index.js";
-import type { ExecuteRequest, ExecuteResult, EventCallback } from "@claw/protocol";
+import { isReasoningEffort, type ExecuteRequest, type ExecuteResult, type EventCallback } from "@claw/protocol";
 import type { ExecuteExtras } from "./index.js";
 import { untheadedRunIdentity, type RunIdentity } from "../tasks/run-identity.js";
 import { HookRunner, registryHasAny } from "./hooks.js";
@@ -521,6 +521,8 @@ export class AgentEngine {
       try {
         loopResult = await agentLoop(messages, allToolSchemas, {
           model,
+          // A value Brain does not know is no effort at all: the gateway's defaults, never a refused turn.
+          ...(isReasoningEffort(request.effort) ? { effort: request.effort } : {}),
           apiUrl,
           apiKey,
           maxTurns,

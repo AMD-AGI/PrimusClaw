@@ -336,7 +336,7 @@ export class GithubReview {
     const choice = chooseReviewPath({
       changedFiles: pr.changedFiles, changedLines: pr.additions + pr.deletions, filesComplete: change.complete,
       diffMissing: change.files.some(diffNotSent),
-      repoSkill: instructions.source === "repository",
+      repoSkill: instructions.source === "repository", paths: change.files.map((f) => f.path),
     }, ctx.settings);
     const recipe = choice.path === "sandbox" ? buildSandboxRecipe({ ref, baseRef: pr.baseRef, headSha: pr.headSha }) : null;
     (this.deps.logger ?? logger).info({

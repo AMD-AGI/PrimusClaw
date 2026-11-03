@@ -10,6 +10,7 @@
  * credential, which is fetched by the tools themselves, per call. The server name
  * is reserved: whatever a request names `github_review` is replaced.
  */
+import type { ReasoningEffort } from "@claw/protocol";
 import pino from "pino";
 import { CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
@@ -82,15 +83,22 @@ export async function loadUserEnvForSession(
   return await loadUserEnvSnapshot(q, userId, log);
 }
 
+/** The reasoning effort a turn of a session that acts as a user runs at (`CLAW_GITHUB_REVIEW_EFFORT`), as fields of its request. */
+export function actingSessionEffort(): { effort?: ReasoningEffort } {
+  const effort = readGithubReviewSettings().reviewEffort;
+  return effort ? { effort } : {};
+}
+
 /**
  * Marks a turn that is built here for a session that acts as a user (`withhold_sandbox_keys`, protocol), and takes the owner's stored
  * variables off it: whichever way they reached the task (a queued message that was frozen with them before the mark applied), a session
- * that withholds its sandbox's keys is sent none.
+ * that withholds its sandbox's keys is sent none. The same turn is run at the review's reasoning effort: it is a review.
  */
 export async function applySandboxKeyPolicyToTask(task: Record<string, unknown>, sessionId: string): Promise<void> {
   if (!(await sessionWithholdsSandboxKeys(sessionId))) return;
   task.withhold_sandbox_keys = true;
   delete task.user_env;
+  Object.assign(task, actingSessionEffort());
 }
 
 export async function githubReviewMcpServers(sessionId: string): Promise<McpServers> {

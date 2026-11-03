@@ -10,6 +10,7 @@
  *      the person's say, so the key a sandbox holds (or the cookie that key signs in to) cannot start one
  *   T  the `mcp_servers` entry a turn carries: only for such a session, signed, reserved; and the `withhold_sandbox_keys` mark that keeps
  *      its owner's keys out of the sandbox (T6-T8; the other ways a turn reaches Brain are github-review-acting-dispatch-keys.test.ts)
+ *   M  the model and the reasoning effort such a session reviews with: the review's, unless its creator named a model (M1-M2)
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach } from "node:test";
@@ -300,5 +301,47 @@ test("T8 the mark does not depend on the tools being offered: a session that act
     assert.equal("mcp_servers" in task, false);
   } finally {
     process.env.CLAW_GITHUB_REVIEW_MCP_SECRET = saved;
+  }
+});
+
+test("M1 a session that acts as a user and names no model runs on the review model at the review effort; one that names a model keeps it; an ordinary one has neither", async () => {
+  const cases: Array<[string, Record<string, unknown>, Record<string, unknown>, string | null, string | undefined]> = [
+    ["acting, no model", { acting_as: "u-bob" }, {}, "claude-opus-5.5", "high"],
+    ["acting, model null", { acting_as: "u-bob" }, { model: null }, "claude-opus-5.5", "high"],
+    ["acting, own model", { acting_as: "u-bob" }, { model: "claude-sonnet-5.5" }, "claude-sonnet-5.5", "high"],
+    ["ordinary", { notify_on_finish: true }, {}, null, undefined],
+  ];
+  for (const [what, config, extra, model, effort] of cases) {
+    published = [];
+    const r = await create(ALICE, config, { ...extra, message: { content: "review it" } });
+    assert.equal(r.status, 200, `${what}: ${JSON.stringify(r.body)}`);
+    const [row] = await h.sql("SELECT model FROM claw_sessions WHERE session_id = $1", [r.body.data.session_id]);
+    assert.equal(row?.model ?? null, model, `${what}: the stored model`);
+    assert.equal(published[0]?.model, model ?? undefined, `${what}: the turn's model`);
+    assert.equal(published[0]?.effort, effort, `${what}: the turn's effort`);
+  }
+});
+
+test("M2 the operator chooses both: another model and effort, or the deployment's defaults with `default`", async () => {
+  const saved = { m: process.env.CLAW_GITHUB_REVIEW_MODEL, e: process.env.CLAW_GITHUB_REVIEW_EFFORT };
+  const restore = () => {
+    for (const [k, v] of [["CLAW_GITHUB_REVIEW_MODEL", saved.m], ["CLAW_GITHUB_REVIEW_EFFORT", saved.e]] as const) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  };
+  try {
+    for (const [m, e, model, effort] of [["glm-5-3", "medium", "glm-5-3", "medium"], ["default", "default", null, undefined]] as const) {
+      process.env.CLAW_GITHUB_REVIEW_MODEL = m;
+      process.env.CLAW_GITHUB_REVIEW_EFFORT = e;
+      published = [];
+      const r = await create(ALICE, { acting_as: "u-bob" }, { message: { content: "review it" } });
+      assert.equal(r.status, 200);
+      const [row] = await h.sql("SELECT model FROM claw_sessions WHERE session_id = $1", [r.body.data.session_id]);
+      assert.equal(row?.model ?? null, model, m);
+      assert.equal(published[0]?.effort, effort, e);
+      assert.equal("effort" in (published[0] ?? {}), effort !== undefined, `${e}: no field at all for the gateway's default`);
+    }
+  } finally {
+    restore();
   }
 });

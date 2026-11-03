@@ -3,21 +3,24 @@
 
 /**
  * How a pull request is reviewed: from the diff alone (`api_diff`, no sandbox, no
- * 16 s cold start) or with a sandbox. The decision is by thresholds an operator can
- * change, a repository's own review skill forces the sandbox path, and which way it
- * went is logged and kept in the audit row.
+ * 16 s cold start) or with a sandbox. A change of a non-test source file always takes
+ * the sandbox; otherwise the decision is by thresholds an operator can change, a
+ * repository's own review skill forces the sandbox path, and which way it went is
+ * logged and kept in the audit row.
  */
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
 import { GithubReview } from "../src/github-review/service.js";
-import { chooseReviewPath, reviewPathAdvice } from "../src/github-review/review-path.js";
+import { chooseReviewPath, isNonTestSource, reviewPathAdvice } from "../src/github-review/review-path.js";
 import { readGithubReviewSettings } from "../src/github-review/settings.js";
 import { PR, SECRET, closeShared, credential, readSection, reviewEnv } from "./support/review-env.js";
 
 after(closeShared);
 
 const LIMITS = { fastMaxFiles: 15, fastMaxChangedLines: 600 };
-const SMALL = { changedFiles: 3, changedLines: 80, filesComplete: true, diffMissing: false, repoSkill: false };
+const SMALL = { changedFiles: 3, changedLines: 80, filesComplete: true, diffMissing: false, repoSkill: false, paths: ["docs/guide.md", "README.md", "test/app.test.ts"] };
+/** The change most fixtures here are: documentation only, so it may be reviewed from the diff. */
+const DOCS_ONLY = [{ filename: "docs/app.md", status: "modified", additions: 3, deletions: 1, patch: "@@ -1,4 +1,6 @@\n a\n-b\n+b2\n+c\n+d\n e\n f" }];
 
 test("a small change is reviewed from the diff", () => {
   assert.deepEqual(chooseReviewPath(SMALL, LIMITS), { path: "api_diff", reason: "small_diff" });
@@ -36,23 +39,59 @@ test("the limits are the operator's: the same change takes the other path under 
   assert.equal(chooseReviewPath(SMALL, { ...LIMITS, fastMaxChangedLines: 10 }).path, "sandbox");
 });
 
+test("a change of a non-test source file takes the sandbox whatever its size; one of tests, docs and configuration does not", () => {
+  assert.deepEqual(chooseReviewPath({ ...SMALL, changedLines: 1, paths: ["docs/a.md", "src/auth.ts"] }, LIMITS), { path: "sandbox", reason: "source_change" });
+  assert.deepEqual(chooseReviewPath({ ...SMALL, paths: ["test/auth.test.ts", "docs/a.md", "values.yaml"] }, LIMITS), { path: "api_diff", reason: "small_diff" });
+  // A large change says it is large first: the size is the stronger reason.
+  assert.equal(chooseReviewPath({ ...SMALL, changedLines: 601, paths: ["src/auth.ts"] }, LIMITS).reason, "too_many_changed_lines");
+});
+
+const SOURCE_TABLE: Array<[string, boolean]> = [
+  ["claw/packages/api/src/github-review/service.ts", true],
+  ["src/App.tsx", true],
+  ["scripts/deploy.sh", true],
+  ["migrations/0007_add_column.sql", true],
+  ["pkg/server/handler.go", true],
+  ["app/models.py", true],
+  ["lib/latest.ts", true],
+  ["src/main/java/Latest.java", true],
+  ["claw/packages/api/test/github-review-service.test.ts", false],
+  ["src/__tests__/app.ts", false],
+  ["web/app.spec.tsx", false],
+  ["pkg/server/handler_test.go", false],
+  ["tests/test_models.py", false],
+  ["app/test_models.py", false],
+  ["src/test/java/FooTest.java", false],
+  ["e2e/login.ts", false],
+  ["README.md", false],
+  ["claw/charts/claw/values.yaml", false],
+  ["package.json", false],
+  ["Dockerfile", false],
+];
+
+test("what counts as non-test source, path by path", () => {
+  for (const [path, source] of SOURCE_TABLE) assert.equal(isNonTestSource(path), source, path);
+});
+
 test("a repository's own review skill, an incomplete file list and a diff GitHub did not send each force the sandbox, whatever the size", () => {
   assert.deepEqual(chooseReviewPath({ ...SMALL, repoSkill: true }, LIMITS), { path: "sandbox", reason: "repo_review_skill" });
   assert.deepEqual(chooseReviewPath({ ...SMALL, filesComplete: false }, LIMITS), { path: "sandbox", reason: "incomplete_change_list" });
   assert.deepEqual(chooseReviewPath({ ...SMALL, diffMissing: true }, LIMITS), { path: "sandbox", reason: "diff_not_available" });
 });
 
-test("the advice tells the model not to use a sandbox on the fast path, and why one is allowed on the other", () => {
+test("the advice tells the model not to use a sandbox on the fast path, and that the other one requires it and why", () => {
   assert.match(reviewPathAdvice({ path: "api_diff", reason: "small_diff" }), /Do not start a sandbox/);
   const slow = reviewPathAdvice({ path: "sandbox", reason: "too_many_files" });
-  assert.match(slow, /sandbox is allowed/);
-  assert.match(slow, /many files/);
+  assert.match(slow, /must use a sandbox because the change touches many files/);
+  assert.match(slow, /callers/);
+  assert.match(slow, /run the tests closest to the change/);
+  assert.match(reviewPathAdvice({ path: "sandbox", reason: "source_change" }), /because the change touches source code/);
 });
 
 test("the thresholds are read from the environment with documented defaults, and a bad value falls back and is reported", () => {
   const d = readGithubReviewSettings({}, true);
   assert.equal(d.fastMaxFiles, 15);
-  assert.equal(d.fastMaxChangedLines, 600);
+  assert.equal(d.fastMaxChangedLines, 200);
   const s = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_FAST_MAX_FILES: "40", CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES: "2500" }, true);
   assert.equal(s.fastMaxFiles, 40);
   assert.equal(s.fastMaxChangedLines, 2500);
@@ -81,6 +120,7 @@ const auditPath = async (e: Awaited<ReturnType<typeof reviewEnv>>) =>
 
 test("gh_pr_get on a small change chooses the diff, says so to the model, logs it and records it in the audit row", async () => {
   const { e, rec, service } = await envWith();
+  e.gh.files = DOCS_ONLY;
   const o = await service.getPr(e.actor, { pr: PR });
   const b = o.body as any;
   assert.equal(b.review_path.path, "api_diff");
@@ -88,7 +128,7 @@ test("gh_pr_get on a small change chooses the diff, says so to the model, logs i
   assert.match(b.review_path.advice, /Do not start a sandbox/);
   assert.equal(b.review_path.max_files_for_diff_only, 15);
   // The diff, the files and the metadata are all in the result: that is what makes the fast path possible.
-  assert.match(b.untrusted.diff, /src\/app\.ts/);
+  assert.match(b.untrusted.diff, /docs\/app\.md/);
   assert.equal(b.untrusted.files.trim().split("\n").length, 1);
   assert.equal(b.pull_request.head_sha.length, 40);
   const line = rec.lines.find((l) => l.message === "github_review.path_chosen");
@@ -111,8 +151,18 @@ test("past the file threshold the path is the sandbox, in the result, the log li
   assert.deepEqual(await auditPath(e), { review_path: "sandbox", review_path_reason: "too_many_files" });
 });
 
+test("a four-line change of a source file is reviewed with a sandbox, with the recipe, in the result and the audit row", async () => {
+  const { e, rec, service } = await envWith();
+  const b = (await service.getPr(e.actor, { pr: PR })).body as any;
+  assert.deepEqual([b.review_path.path, b.review_path.reason], ["sandbox", "source_change"]);
+  assert.match(b.review_path.sandbox_recipe, /pull\/7\/head/);
+  assert.equal(rec.lines.find((l) => l.message === "github_review.path_chosen")?.fields.review_path_reason, "source_change");
+  assert.deepEqual(await auditPath(e), { review_path: "sandbox", review_path_reason: "source_change" });
+});
+
 test("past the changed-lines threshold the path is the sandbox", async () => {
   const { e, service } = await envWith({ CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES: "3" });
+  e.gh.files = DOCS_ONLY;
   const b = (await service.getPr(e.actor, { pr: PR })).body as any;
   assert.deepEqual([b.review_path.path, b.review_path.reason], ["sandbox", "too_many_changed_lines"]);
 });
@@ -132,6 +182,7 @@ test("a repository with its own review skill takes the sandbox path even for a o
 test("only the AGENTS.md of a repository is context, not a review skill: it does not force a sandbox", async () => {
   const { e, service } = await envWith();
   e.gh.contents["AGENTS.md"] = "Build with make.";
+  e.gh.files = DOCS_ONLY;
   const b = (await service.getPr(e.actor, { pr: PR })).body as any;
   assert.equal(b.review_path.path, "api_diff");
   assert.match((await readSection(service, e.actor, PR, "instructions")).text, /Build with make\./);
@@ -146,4 +197,17 @@ test("a tool that does not choose a path leaves the audit columns empty", async 
 
 test("the secret in the settings is not part of the path decision", () => {
   assert.equal(SECRET.length >= 32, true);
+});
+
+test("the review model and effort are read from the environment: opus at high by default, `default` for the deployment's, a bad value falls back and is reported", () => {
+  const d = readGithubReviewSettings({}, true);
+  assert.deepEqual([d.reviewModel, d.reviewEffort], ["claude-opus-5.5", "high"]);
+  const s = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_MODEL: "claude-sonnet-5.5", CLAW_GITHUB_REVIEW_EFFORT: "Medium" }, true);
+  assert.deepEqual([s.reviewModel, s.reviewEffort], ["claude-sonnet-5.5", "medium"]);
+  const off = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_MODEL: "default", CLAW_GITHUB_REVIEW_EFFORT: "default" }, true);
+  assert.deepEqual([off.reviewModel, off.reviewEffort, off.problems], [null, null, []]);
+  const bad = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_MODEL: "has space", CLAW_GITHUB_REVIEW_EFFORT: "max" }, true);
+  assert.deepEqual([bad.reviewModel, bad.reviewEffort], ["claude-opus-5.5", "high"]);
+  assert.match(bad.problems.join(), /CLAW_GITHUB_REVIEW_MODEL/);
+  assert.match(bad.problems.join(), /CLAW_GITHUB_REVIEW_EFFORT=max/);
 });
