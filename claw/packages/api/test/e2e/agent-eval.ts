@@ -87,6 +87,21 @@ async function replay(sessionId: string): Promise<EventRow[]> {
   return r.json.data as EventRow[];
 }
 
+/**
+ * The session's events once they stop arriving. The turn's end can be stored before the last results of its tool
+ * calls, so the trace is read from a replay that came back the same twice, five seconds apart (at most 30 seconds).
+ */
+async function settledReplay(sessionId: string): Promise<EventRow[]> {
+  let rows = await replay(sessionId);
+  for (let i = 0; i < 6; i++) {
+    await new Promise((r) => setTimeout(r, 5_000));
+    const again = await replay(sessionId);
+    if (again.length === rows.length) return again;
+    rows = again;
+  }
+  return rows;
+}
+
 /** A file the turn wrote, once the workspace has been saved; null when it never appears. */
 async function fetchFile(sessionId: string, path: string, deadline: number): Promise<Buffer | null> {
   const encoded = path.split("/").map(encodeURIComponent).join("/");
@@ -123,7 +138,7 @@ async function runTask(task: EvalTask, ctx: EvalContext): Promise<Outcome> {
       return rows.some((r) => r.data?.type === "exec_complete") ? rows : undefined;
     }, deadline, 5_000);
     if (!ended) await api("POST", `/v1/sessions/${sessionId}/messages`, { messageType: "interrupt" });
-    const rows = ended ?? await replay(sessionId);
+    const rows = await settledReplay(sessionId);
     const files: Record<string, Buffer | null> = {};
     // The workspace is saved when the turn ends; a file may take a moment to be readable.
     for (const path of task.files ?? []) files[path] = await fetchFile(sessionId, path, Date.now() + 60_000);
