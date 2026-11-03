@@ -65,11 +65,13 @@ test("the attestation is ES256 and matches the issue body", () => {
   assert.equal(verify.verify({ key: publicKey, dsaEncoding: "ieee-p1363" }, Buffer.from(s!, "base64url")), true);
   assert.equal((built.body.expiresAt as string), new Date(NOW.getTime() + 3600 * 1000).toISOString());
   const roles = built.body.roles as Record<string, { maxSandboxes: number; maxGpus: number }>;
-  assert.equal(roles.measurement.maxSandboxes, 3);
+  assert.equal(roles.measurement.maxSandboxes, 4);
   assert.equal(roles.measurement.maxGpus, 8);
-  assert.equal(roles.subrun.maxSandboxes, 1);
-  assert.equal(roles.subrun.maxGpus, 0);
+  assert.equal(roles.subrun.maxSandboxes, 4);
+  assert.equal(roles.subrun.maxGpus, 8);
   assert.equal(roles.dev, undefined);
+  assert.equal(built.body.maxSandboxes, 4);
+  assert.equal(built.body.maxGpus, 8);
   const tpl = (built.body.templates as Array<{ spec: { data_plane: { mode: string } } }>)[0]!;
   assert.equal(tpl.spec.data_plane.mode, "sealed");
 });
@@ -155,18 +157,22 @@ test("a single declared role keeps the whole budget", () => {
   assert.equal(roles.measurement.maxSandboxes, 4);
   assert.equal(roles.measurement.maxGpus, 8);
   assert.equal(roles.subrun, undefined);
+  assert.equal(built.body.maxSandboxes, 4);
+  assert.equal(built.body.maxGpus, 8);
 });
 
-test("dev does not receive the measurement GPU cap", () => {
+test("every declared role shares the grant caps", () => {
   const built = buildSandboxGrant({
     ...material(),
     roles: { measurement: ["runner"], subrun: ["runner"], dev: ["runner"] },
   }, NOW);
   const roles = built.body.roles as Record<string, { maxSandboxes: number; maxGpus: number }>;
-  assert.equal(roles.measurement.maxGpus, 8);
-  assert.equal(roles.subrun.maxGpus, 0);
-  assert.equal(roles.dev.maxGpus, 0);
-  assert.equal(roles.measurement.maxSandboxes + roles.subrun.maxSandboxes + roles.dev.maxSandboxes, 4);
+  for (const role of ["measurement", "subrun", "dev"]) {
+    assert.equal(roles[role]!.maxSandboxes, 4, role);
+    assert.equal(roles[role]!.maxGpus, 8, role);
+  }
+  assert.equal(built.body.maxSandboxes, 4);
+  assert.equal(built.body.maxGpus, 8);
 });
 
 test("reissue of a 200 without keys revokes and posts once more", async () => {

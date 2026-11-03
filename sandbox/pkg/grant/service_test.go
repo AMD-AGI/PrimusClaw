@@ -58,11 +58,13 @@ func (m staticMembership) Check(_ context.Context, _ string, workspaces []string
 type memRecord struct {
 	mu     sync.Mutex
 	events []string
+	full   []*audit.AuditEvent
 }
 
 func (m *memRecord) Record(_ context.Context, event *audit.AuditEvent) {
 	m.mu.Lock()
 	m.events = append(m.events, event.EventType)
+	m.full = append(m.full, event)
 	m.mu.Unlock()
 }
 

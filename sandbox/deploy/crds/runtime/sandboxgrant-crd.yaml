@@ -100,6 +100,12 @@ spec:
                           type: integer
                       spec:
                         type: string
+                maxSandboxes:
+                  type: integer
+                  minimum: 0
+                maxGpus:
+                  type: integer
+                  minimum: 0
                 gpuHoursBudget:
                   type: number
                 maxSandboxSeconds:

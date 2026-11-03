@@ -318,6 +318,8 @@ export function buildSandboxGrant(material: SandboxGrantMaterial, now: Date): Bu
       platformKey: material.platformKey,
       issuer: { sessionId: material.sessionId, appRunId: material.appRunId },
       roles,
+      maxSandboxes,
+      maxGpus,
       templates: wired.templates,
       gpuHoursBudget: gpuHours,
       maxSandboxSeconds: runtime,
@@ -362,24 +364,9 @@ function wireTemplates(templates: Array<Record<string, unknown>>): { templates: 
 }
 
 /**
- * The sandbox adds each role's cap, so the grant's one budget is not copied onto every role.
- * GPUs stay on measurement when that role is declared, otherwise on the first declared role.
- * Each other role gets one sandbox slot while the primary keeps at least one.
+ * Each declared role with its templates. Every role carries the grant caps; the
+ * sandbox also holds the grant caps summed over every role.
  */
-function roleBudget(declared: AppSandboxRole[], maxSandboxes: number, maxGpus: number): Map<AppSandboxRole, { maxSandboxes: number; maxGpus: number }> {
-  const primary = declared.includes("measurement") ? "measurement" : declared[0]!;
-  const out = new Map<AppSandboxRole, { maxSandboxes: number; maxGpus: number }>();
-  let left = maxSandboxes;
-  for (const role of declared) {
-    if (role === primary) continue;
-    const share = left > 1 ? 1 : 0;
-    out.set(role, { maxSandboxes: share, maxGpus: 0 });
-    left -= share;
-  }
-  out.set(primary, { maxSandboxes: left, maxGpus });
-  return out;
-}
-
 function wireRoles(roles: AppSandboxRoles | undefined, names: Set<string>, maxSandboxes: number, maxGpus: number): Record<string, { templates: string[]; maxSandboxes: number; maxGpus: number }> {
   const declared: AppSandboxRole[] = [];
   const listedByRole = new Map<AppSandboxRole, string[]>();
@@ -393,11 +380,9 @@ function wireRoles(roles: AppSandboxRoles | undefined, names: Set<string>, maxSa
     listedByRole.set(role, [...listed]);
   }
   if (declared.length === 0) throw new Error("no sandbox role to issue");
-  const budget = roleBudget(declared, maxSandboxes, maxGpus);
   const out: Record<string, { templates: string[]; maxSandboxes: number; maxGpus: number }> = {};
   for (const role of declared) {
-    const cap = budget.get(role)!;
-    out[role] = { templates: listedByRole.get(role)!, maxSandboxes: cap.maxSandboxes, maxGpus: cap.maxGpus };
+    out[role] = { templates: listedByRole.get(role)!, maxSandboxes, maxGpus };
   }
   return out;
 }

@@ -204,6 +204,8 @@ func (s *Service) Issue(ctx context.Context, req IssueRequest) (IssueResponse, i
 				AppRunID:  req.Issuer.AppRunID,
 			},
 			Roles:                 roles,
+			MaxSandboxes:          copyCap(req.MaxSandboxes),
+			MaxGPUs:               copyCap(req.MaxGPUs),
 			Templates:             stored,
 			GPUHoursBudget:        req.GPUHoursBudget,
 			MaxSandboxSeconds:     req.MaxSandboxSeconds,
@@ -605,23 +607,42 @@ func (s *Service) setStatus(ctx context.Context, name string, mutate func(*runti
 }
 
 func (s *Service) audit(ctx context.Context, eventType, grantID, sessionID, appRunID, userID, userName, sandboxID string) {
+	s.auditReason(ctx, eventType, grantID, sessionID, appRunID, userID, userName, sandboxID, "", "")
+}
+
+// auditReason records a grant event. A non-empty reason and detail say why the grant refused a request.
+func (s *Service) auditReason(ctx context.Context, eventType, grantID, sessionID, appRunID, userID, userName, sandboxID, reason, detail string) {
 	if s.record == nil {
 		return
+	}
+	metadata := map[string]string{
+		"grantId":  grantID,
+		"appRunId": appRunID,
+	}
+	if detail != "" {
+		metadata["detail"] = detail
 	}
 	s.record.Record(ctx, &audit.AuditEvent{
 		ID:          audit.NewEventID(),
 		EventType:   eventType,
 		Source:      audit.SourceGrant,
+		Reason:      reason,
 		SessionID:   sessionID,
 		SandboxName: sandboxID,
 		UserID:      userID,
 		UserName:    userName,
 		Timestamp:   s.now(),
-		Metadata: map[string]string{
-			"grantId":  grantID,
-			"appRunId": appRunID,
-		},
+		Metadata:    metadata,
 	})
+}
+
+// copyCap returns a copy of an optional cap.
+func copyCap(v *int32) *int32 {
+	if v == nil {
+		return nil
+	}
+	c := *v
+	return &c
 }
 
 func issueFrom(g *runtimev1alpha1.SandboxGrant, expires time.Time, attestation string) IssueRequest {
