@@ -66,7 +66,7 @@ const FORGET_REQUEST = /(?<!\b(?:don't|dont|do not|never|not)\s+)\b(forget|delet
  */
 export function quoteAsksToForget(quote: string, id: number, entry: string): boolean {
   if (!FORGET_REQUEST.test(quote.normalize("NFKC").replace(/[’‘]/g, "'"))) return false;
-  return new RegExp(`(^|\\D)${id}(\\D|$)`).test(quote.normalize("NFKC")) || quoteSupports(quote, entry);
+  return (quote.normalize("NFKC").match(/\d+/g) ?? []).includes(String(id)) || quoteSupports(quote, entry);
 }
 
 function bigrams(text: string): Set<string> {
