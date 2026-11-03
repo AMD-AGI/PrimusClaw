@@ -241,6 +241,41 @@ describe("trigger tools", { skip }, () => {
     assert.equal((await trig(id)).paused_reason, "item_closed");
   });
 
+  test("T5b resuming an item's trigger renews the worker session's credentials it fires on", async () => {
+    const alice = await w.user("alice");
+    const item = await w.createItem(alice, "Watch PR 13");
+    const wt = await w.workerTurn(item.itemId);
+    const client = await connect(bearer({ sid: wt.sid, mid: wt.mid, task_id: wt.task_id, exp: wt.exp }));
+    let id = "";
+    try {
+      id = (await call(client, "trigger_create", { ...DAILY, name: "watch", prompt: "check PR 13" })).body.trigger.trigger_id;
+    } finally { await client.close(); }
+    await w.closeRun(wt.task_id);
+    await w.q("DELETE FROM claw_pending_messages");
+
+    // The worker session's key is gone (revoked, or never stamped), so the firing fails and pauses.
+    await w.q("UPDATE claw_sessions SET config = config || '{\"platform_key\": null}'::jsonb WHERE session_id = $1", [item.workerSid]);
+    await makeDue(id, "2026-10-27T00:00:00Z");
+    await sched.tickTriggers(new Date("2026-10-27T00:00:30Z"));
+    assert.equal((await trig(id)).paused_reason, "credential_invalid");
+
+    const routes = await import("../src/routes/triggers.js");
+    const api = Fastify();
+    api.addHook("preHandler", async (req) => {
+      (req as any).user = { userId: alice.userId, userName: alice.userId, roles: ["default"], platformKey: "pk-renewed", virtualKey: "vk-renewed" };
+    });
+    await routes.registerTriggerRoutes(api);
+    try {
+      const resumed = await api.inject({ method: "POST", url: `/v1/triggers/${id}/resume` });
+      assert.equal(resumed.statusCode, 200, resumed.body);
+    } finally { await api.close(); }
+
+    await makeDue(id, "2026-10-28T00:00:00Z");
+    await sched.tickTriggers(new Date("2026-10-28T00:00:30Z"));
+    assert.equal((await trig(id)).paused_reason, null);
+    assert.equal((await w.pending(item.workerSid)).length, 1, "the resumed trigger wakes the worker again");
+  });
+
   test("T6 which turns are offered the tools, and creating and cancelling are held for approval", async () => {
     const offered = async (sid: string, t: { task_id: string; mid: string }, extra: Record<string, unknown> = {}) => {
       const task: Record<string, unknown> = { task_id: t.task_id, message_id: t.mid, ...extra };
