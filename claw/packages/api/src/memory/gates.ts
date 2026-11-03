@@ -56,14 +56,16 @@ export function quoteSupports(quote: string, text: string): boolean {
   return false;
 }
 
-const FORGET_WORDS = /(forget|delete|remove|undo|revert|drop|忘|删|撤销|撤回|去掉|不要记|别记|不用记)/i;
+// A request, not a mention: "forget" but not "forgetting" or "don't forget", "忘掉" but not "总忘记".
+const FORGET_REQUEST = /(?<!\b(?:don't|dont|do not|never|not)\s+)\b(forget|delete|remove|undo|revert)\b|忘掉|忘了(它|这|那|吧)|忘记(它|这|那|关于)|删掉|删除|删了|撤销|撤回|去掉|别记|不要记|不用记/i;
 
 /**
- * Whether a quote asks to forget or undo this entry: it says so, and it names the entry by its number or by
- * what it says. Any earlier sentence of the user's ("review this repository") is not such a request.
+ * Whether a quote asks to forget or undo this entry: it is a request to forget, and it names the entry by its
+ * number or by what it says. Any other sentence of the user's ("review this repository", "I keep forgetting
+ * my vim shortcuts") is not such a request.
  */
 export function quoteAsksToForget(quote: string, id: number, entry: string): boolean {
-  if (!FORGET_WORDS.test(quote.normalize("NFKC"))) return false;
+  if (!FORGET_REQUEST.test(quote.normalize("NFKC").replace(/[’‘]/g, "'"))) return false;
   return new RegExp(`(^|\\D)${id}(\\D|$)`).test(quote.normalize("NFKC")) || quoteSupports(quote, entry);
 }
 

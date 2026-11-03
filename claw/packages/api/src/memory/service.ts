@@ -393,8 +393,9 @@ export async function updateMemory(userId: string, id: number, draft: MemoryDraf
   const status = actor.kind === "api" && !actor.attended ? "pending" : "active";
   const days = reviewDays(type, draft.expires_in_days);
   const quote = actor.kind === "model" ? actor.quote : null;
-  await inTransaction(async (q) => {
-    await q(
+  const done = await inTransaction(async (q) => {
+    // The model's edit holds only while the entry is still active (a REST edit may have made it pending since).
+    const updated = await q(
       `UPDATE claw_memory_entries SET
          prev_title = COALESCE(title, ''), prev_body = content,
          mtype = $3, category = CASE WHEN mtype IS NULL THEN category ELSE $3 END, title = $4, content = $5,
@@ -402,12 +403,15 @@ export async function updateMemory(userId: string, id: number, draft: MemoryDraf
          pinned = COALESCE($9, pinned), token_count = $10, evidence_quote = COALESCE($11, evidence_quote),
          last_confirmed_at = NOW(),
          expires_at = CASE WHEN $12::int IS NULL THEN NULL ELSE NOW() + make_interval(days => $12::int) END
-       WHERE user_id = $1 AND id = $2`,
+       WHERE user_id = $1 AND id = $2 AND ${USER_ROWS}${actor.kind === "model" ? " AND status = 'active'" : ""}`,
       [userId, id, type, title, body, why, how, status, typeof draft.pinned === "boolean" ? draft.pinned : null,
         estimateTokens(`${title}\n${body}`), quote, days],
     );
+    if (!updated.rowCount) return false;
     await recordEvent(q, { userId, entryId: id, op: "update", actor: actor.kind, sessionId: actor.kind === "model" ? actor.sessionId : null, title, quote });
+    return true;
   });
+  if (!done) return refuse("not_found", `no memory #${id}`);
   const live = Number((await db.query(`SELECT COUNT(*)::int AS n FROM claw_memory_entries WHERE user_id = $1 AND ${LIVE_ROWS}`, [userId])).rows[0].n);
   return { ok: true, id, op: "update", status, title, live };
 }
@@ -429,10 +433,18 @@ async function eraseEntries(q: Querier, userId: string, ids: number[], actor: st
   for (const id of ids) await recordEvent(q, { userId, entryId: id, op, actor });
 }
 
+/** The model acts on active entries only, checked on the row it changes, under its lock. */
+function modelSees(actorKind: "model" | "api"): string {
+  return actorKind === "model" ? " AND status = 'active'" : "";
+}
+
 /** Delete one entry for good. */
 export async function forgetMemory(userId: string, id: number, actorKind: "model" | "api"): Promise<boolean> {
   return inTransaction(async (q) => {
-    const found = (await q(`SELECT id FROM claw_memory_entries WHERE user_id = $1 AND id = $2 AND kind IS NULL AND deleted_at IS NULL`, [userId, id])).rows.length > 0;
+    const found = (await q(
+      `SELECT id FROM claw_memory_entries WHERE user_id = $1 AND id = $2 AND kind IS NULL AND deleted_at IS NULL${modelSees(actorKind)} FOR UPDATE`,
+      [userId, id],
+    )).rows.length > 0;
     if (found) await eraseEntries(q, userId, [id], actorKind, "delete");
     return found;
   });
@@ -445,7 +457,7 @@ export async function forgetMemory(userId: string, id: number, actorKind: "model
 export async function undoMemory(userId: string, id: number, actorKind: "model" | "api"): Promise<"restored" | "deleted" | "not_found"> {
   return inTransaction(async (q) => {
     const row = (await q(
-      `SELECT prev_title, prev_body FROM claw_memory_entries WHERE user_id = $1 AND id = $2 AND kind IS NULL AND deleted_at IS NULL FOR UPDATE`,
+      `SELECT prev_title, prev_body FROM claw_memory_entries WHERE user_id = $1 AND id = $2 AND kind IS NULL AND deleted_at IS NULL${modelSees(actorKind)} FOR UPDATE`,
       [userId, id],
     )).rows[0];
     if (!row) return "not_found";

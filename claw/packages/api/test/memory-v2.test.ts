@@ -363,6 +363,9 @@ describe("memory v2", { skip }, () => {
     assert.match(updated.text, /not_found/);
     const forgot = await tool("forget_memory", sid, t.messageId, { id, evidence_quote: `forget memory #${id}` });
     assert.equal(forgot.ok, false);
+    // Checked on the row itself, under its lock: an entry that became pending after the model looked it up.
+    assert.equal(await svc.forgetMemory("alice", id, "model"), false);
+    assert.equal(await svc.undoMemory("alice", id, "model"), "not_found");
     const [row] = await entries();
     assert.deepEqual([row.status, row.content], ["pending", "a pending fact about tabs"], "untouched, still waiting");
   });
@@ -439,6 +442,12 @@ describe("memory v2", { skip }, () => {
     const anySentence = await tool("forget_memory", sid, t.messageId, { id, evidence_quote: "remember I use vim" });
     assert.equal(anySentence.ok, false, "a sentence of the user's that does not ask to forget is not a request");
     await w.closeRun(t.taskId);
+    for (const said of ["I keep forgetting my vim shortcuts", "don't forget I use vim", "我总忘记 vim 的快捷键"]) {
+      const m = await turn(sid, said);
+      const r = await tool("forget_memory", sid, m.messageId, { id, evidence_quote: said });
+      assert.equal(r.ok, false, `${said}: mentions forgetting, asks nothing`);
+      await w.closeRun(m.taskId);
+    }
     const t1 = await turn(sid, "please delete the note about the weather");
     const other = await tool("forget_memory", sid, t1.messageId, { id, evidence_quote: "please delete the note about the weather" });
     assert.equal(other.ok, false, "a request to forget something else is not a request to forget this");
