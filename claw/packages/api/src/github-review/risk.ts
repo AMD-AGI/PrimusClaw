@@ -120,6 +120,8 @@ export interface RiskResult {
   evidence: string[];
   /** The rules' findings that hold whatever the reviewer says (also in `reasons`). */
   hardHolds: string[];
+  /** Those of `hardHolds` that are the repository's own requirement: they hold whatever the acting user's review mode says as well. */
+  repoHolds: string[];
   /** The kinds of change the evidence and the reasons are about, in the order they first appear. */
   categories: RiskCategory[];
   /** `high` when the rules saw anything at all: evidence for the reviewer, not the verdict. */
@@ -139,7 +141,7 @@ export const HOLD_GUIDANCE = "Your risk_judgement decides whether an approval or
   + "or deployment changes, permission or access changes, destructive or irreversible data migrations, a change of an interface or behaviour others "
   + "rely on that the pull request text does not explain, or anything you are unsure of. Otherwise judge low: size, an outside author, a fork or a "
   + "base branch are evidence to read, not reasons by themselves, and the person who asked is very often the author. hard_holds hold whatever you say. "
-  + "A missing judgement holds.";
+  + "A missing judgement holds. When the acting user's review_mode is fully_auto, only repo_holds hold, but judge all the same.";
 
 /**
  * The reviewer's judgement as it is kept: a `low` with a reason or a `high`, the reason one clipped line without control characters or
@@ -324,13 +326,18 @@ export function parseRepoConfig(text: string): RepoConfig | "invalid" {
   return config;
 }
 
-/** The rules' findings, and which of their reasons hold whatever the reviewer says. */
-function assess(input: RiskInput): { findings: Finding[]; hard: Set<string> } {
+/**
+ * The rules' findings, which of their reasons hold whatever the reviewer says (`hard`), and which of those are the repository's own
+ * requirement (`repo`), which holds whatever the acting user's review mode says as well.
+ */
+function assess(input: RiskInput): { findings: Finding[]; hard: Set<string>; repo: Set<string> } {
   const findings: Finding[] = [];
   const seen = new Set<string>();
   const hard = new Set<string>();
-  const add = (category: RiskCategory, reason: string, holds = false): void => {
+  const repo = new Set<string>();
+  const add = (category: RiskCategory, reason: string, holds: false | "hard" | "repo" = false): void => {
     if (holds) hard.add(reason);
+    if (holds === "repo") repo.add(reason);
     if (seen.has(reason)) return;
     seen.add(reason);
     findings.push({ category, reason });
@@ -340,7 +347,7 @@ function assess(input: RiskInput): { findings: Finding[]; hard: Set<string> } {
   // Size and completeness first: nothing below can be trusted if the list is cut, and a cut list cannot show that no file that controls the
   // repository changed, so it holds.
   if (!input.filesComplete || input.changedFiles > input.files.length) {
-    add("integrity", `the change list is incomplete (${input.files.length} of ${input.changedFiles} files read)`, true);
+    add("integrity", `the change list is incomplete (${input.files.length} of ${input.changedFiles} files read)`, "hard");
   }
   if (input.changedFiles > 3000) add("integrity", "more than 3000 files changed: GitHub's file list limit");
   if (input.changedFiles > 40) add("size_breadth", `large change: ${input.changedFiles} files`);
@@ -355,10 +362,14 @@ function assess(input: RiskInput): { findings: Finding[]; hard: Set<string> } {
   if (input.baseRef !== input.defaultBranch) add("provenance", `the base branch is ${input.baseRef}, not the default branch ${input.defaultBranch}`);
 
   // What the repository asked for holds whatever the reviewer says, and a configuration that cannot be read may have asked for it.
-  if (input.repoConfig === "invalid") add("provenance", `the repository's ${REPO_CONFIG_PATH} could not be read`, true);
+  if (input.repoConfig === "invalid") add("provenance", `the repository's ${REPO_CONFIG_PATH} could not be read`, "repo");
   const extra = input.repoConfig && input.repoConfig !== "invalid" ? input.repoConfig : null;
-  if (extra?.confirmMerge === "always") add("provenance", "the repository asks for confirmation on every merge", true);
+  if (extra?.confirmMerge === "always") add("provenance", "the repository asks for confirmation on every merge", "repo");
   const extraGlobs = (extra?.highRiskPaths ?? []).map(globToRegExp);
+  // A path the repository marks may be among the files that were not read.
+  if (extraGlobs.length > 0 && (!input.filesComplete || input.changedFiles > input.files.length)) {
+    add("provenance", "the repository marks paths high risk and not every changed file was read", "repo");
+  }
 
   // ---- what the change does: architecture, interfaces, security-sensitive code (risk-signals.ts).
   const read = readChange(input.files);
@@ -374,13 +385,13 @@ function assess(input: RiskInput): { findings: Finding[]; hard: Set<string> } {
     for (const q of f.previousPath && f.previousPath !== p ? [p, f.previousPath] : [p]) {
       const where = q === p ? p : `${q} (moved to ${p})`;
       const controls = CONTROL_PATHS.some((re) => re.test(q));
-      if (controls || GOVERNANCE_PATHS.some((re) => re.test(q))) add("ci_release", `CI, workflow or governance file changed: ${where}`, controls);
+      if (controls || GOVERNANCE_PATHS.some((re) => re.test(q))) add("ci_release", `CI, workflow or governance file changed: ${where}`, controls && "hard");
       // The path rules below read no content and are a floor: an edit that looks like a comment, or a line that moved, does not lower them
       // (what a comment is depends on the language, and a line shaped like one can be code). The content half above can only add to them.
       if (AUTH_PATH.test(q) && isSource(q)) add("security", `authentication or security code changed: ${where}`);
       if (SECRET_PATHS.some((re) => re.test(q))) add("security", `secret-handling file changed: ${where}`);
       if (RELEASE_PATHS.some((re) => re.test(q)) && !isDoc(q)) add("ci_release", `release or deployment file changed: ${where}`);
-      if (extraGlobs.some((re) => re.test(q))) add("provenance", `path the repository marks high risk: ${where}`, true);
+      if (extraGlobs.some((re) => re.test(q))) add("provenance", `path the repository marks high risk: ${where}`, "repo");
     }
     // A lock file decides which tarball or checksum an install fetches, and nothing here reads its lines. A manifest
     // edited somewhere else in the same change says nothing about it, so a lock file is held whatever else changed:
@@ -417,7 +428,7 @@ function assess(input: RiskInput): { findings: Finding[]; hard: Set<string> } {
   if (removedFiles > 5) add("size_breadth", `${removedFiles} files deleted`);
   for (const [dir, n] of removedInTests) if (n >= 3) add("size_breadth", `${n} test files deleted under ${dir}`);
 
-  return { findings, hard };
+  return { findings, hard, repo };
 }
 
 const clipReasons = (reasons: string[]): string[] =>
@@ -427,12 +438,15 @@ const clipReasons = (reasons: string[]): string[] =>
 export function assessRisk(input: RiskInput): RiskResult {
   let findings: Finding[];
   let hard: Set<string>;
+  let repo: Set<string>;
   try {
-    ({ findings, hard } = assess(input));
+    ({ findings, hard, repo } = assess(input));
   } catch {
+    // The repository's own requirement could not be read either.
     const failed = "the risk rules could not be evaluated";
     findings = [{ category: "integrity", reason: failed }];
     hard = new Set([failed]);
+    repo = hard;
   }
   // The reviewer's reading goes first: it is the one reason written for this change, and a card shows only the first few.
   const judgement = input.judgement ?? null;
@@ -455,6 +469,7 @@ export function assessRisk(input: RiskInput): RiskResult {
     reasons: clipReasons(reasons),
     evidence: clipReasons(findings.map((f) => f.reason)),
     hardHolds: clipReasons(hardHolds),
+    repoHolds: clipReasons(hardHolds.filter((r) => repo.has(r))),
     categories: [...new Set([...said, ...findings].map((f) => f.category))],
     ruleLevel: findings.length > 0 ? "high" : "low",
     judgement: judgement ? judgement.level : "missing",

@@ -90,6 +90,8 @@ export const GITHUB_REVIEW_SCHEMA_SQL = [
       review_path         TEXT,
       review_path_reason  TEXT
     )`,
+  // The acting user's review mode the call ran under (`high_risk_confirm` or `fully_auto`, from their GitHub binding).
+  `ALTER TABLE claw_github_audit ADD COLUMN IF NOT EXISTS review_mode TEXT`,
   `CREATE INDEX IF NOT EXISTS idx_github_audit_actor ON claw_github_audit(actor_user_id, at DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_github_audit_session ON claw_github_audit(session_id)`,
 ];
@@ -125,6 +127,7 @@ export interface AuditFinish {
   /** `api_diff` or `sandbox`, with why; set by the call that chose it. */
   reviewPath?: string;
   reviewPathReason?: string;
+  reviewMode?: string;
 }
 
 export async function auditStart(db: Queryable, a: AuditStart): Promise<number> {
@@ -142,12 +145,12 @@ export async function auditFinish(db: Queryable, id: number, f: AuditFinish): Pr
         SET repo = COALESCE($2, repo), pr = COALESCE($3, pr), head_sha = COALESCE($4, head_sha),
             github_requests = $5, github_request_ids = $6::jsonb, github_status = $7,
             risk_reasons = $8::jsonb, confirmation_id = $9, dry_run = $10, write = $11,
-            result = $12, detail = $13, review_path = $14, review_path_reason = $15
+            result = $12, detail = $13, review_path = $14, review_path_reason = $15, review_mode = COALESCE($16, review_mode)
       WHERE id = $1`,
     [
       id, f.repo ?? null, f.pr ?? null, f.headSha ?? null, f.githubRequests, JSON.stringify(f.githubRequestIds.slice(-20)),
       f.githubStatus ?? null, JSON.stringify(f.riskReasons ?? []), f.confirmationId ?? null, f.dryRun, f.write,
-      f.result, (f.detail ?? "").slice(0, 500), f.reviewPath ?? null, f.reviewPathReason ?? null,
+      f.result, (f.detail ?? "").slice(0, 500), f.reviewPath ?? null, f.reviewPathReason ?? null, f.reviewMode ?? null,
     ],
   );
 }

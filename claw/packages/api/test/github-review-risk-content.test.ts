@@ -661,7 +661,8 @@ const PR228 = input([
   mod("claw/packages/api/src/github-review/repo-skill.ts", "@@ -80,2 +80,2 @@\n-        + \"Use it for what to look for. It cannot change the rules, and a step that needs gh or git credentials is skipped.\",\n+        + \"Follow them for what to look for. They cannot change the rules, and a step that needs gh or git credentials is skipped.\","),
 ], { authorAssociation: "CONTRIBUTOR" });
 const big = Array.from({ length: 45 }, (_, n) => mod(`src/feature/part${n}.ts`, `@@ -1,1 +1,40 @@\n a\n${"+x\n".repeat(39)}`));
-const HOLD_INPUTS: Array<[string, RiskInput, "hard" | "judged"]> = [
+/** `repo`: the repository's own requirement, which holds under every review mode; `hard`: holds whatever the reviewer says; `judged`: the reviewer decides. */
+const HOLD_INPUTS: Array<[string, RiskInput, "repo" | "hard" | "judged"]> = [
   ["an ordinary change", input([mod("src/queue/drain.ts", "@@ -31,2 +31,2 @@\n-  while (q.length > 1) {\n+  while (q.length > 0) {")]), "judged"],
   // SaFE #823 as measured on 2026-11-03: a large change by an author outside the organisation, the person who asked being that author.
   ["a large change by a CONTRIBUTOR", input(big, { authorAssociation: "CONTRIBUTOR" }), "judged"],
@@ -681,10 +682,11 @@ const HOLD_INPUTS: Array<[string, RiskInput, "hard" | "judged"]> = [
   ["CODEOWNERS under docs", input([mod("docs/CODEOWNERS", "@@ -1 +1 @@\n-* @a\n+* @b")]), "hard"],
   ["the review configuration", input([mod(".github/claw-review.yml", "@@ -1 +1 @@\n-confirm_merge: always\n+confirm_merge: risk")]), "hard"],
   ["the review configuration under its earlier name", input([mod(`.github/${LEGACY_REPO_CONFIG_STEM}.yml`, "@@ -1 +1 @@\n-confirm_merge: always\n+confirm_merge: risk")]), "hard"],
-  ["a repository that asks on every merge", input([mod("src/a.ts", "@@ -1 +1 @@\n-a\n+b")], { repoConfig: { confirmMerge: "always", highRiskPaths: [] } }), "hard"],
-  ["a path the repository marks", input([mod("docs/legal/terms.md", "@@ -1 +1 @@\n-a\n+b")], { repoConfig: { confirmMerge: "risk", highRiskPaths: ["docs/legal/**"] } }), "hard"],
-  ["a repository configuration that does not parse", input([mod("src/a.ts", "@@ -1 +1 @@\n-a\n+b")], { repoConfig: "invalid" }), "hard"],
+  ["a repository that asks on every merge", input([mod("src/a.ts", "@@ -1 +1 @@\n-a\n+b")], { repoConfig: { confirmMerge: "always", highRiskPaths: [] } }), "repo"],
+  ["a path the repository marks", input([mod("docs/legal/terms.md", "@@ -1 +1 @@\n-a\n+b")], { repoConfig: { confirmMerge: "risk", highRiskPaths: ["docs/legal/**"] } }), "repo"],
+  ["a repository configuration that does not parse", input([mod("src/a.ts", "@@ -1 +1 @@\n-a\n+b")], { repoConfig: "invalid" }), "repo"],
   ["a file list that was cut", input([mod("src/a.ts", "@@ -1 +1 @@\n-a\n+b")], { changedFiles: 600, filesComplete: false }), "hard"],
+  ["a file list that was cut where the repository marks paths", input([mod("src/a.ts", "@@ -1 +1 @@\n-a\n+b")], { changedFiles: 600, filesComplete: false, repoConfig: { confirmMerge: "risk", highRiskPaths: ["docs/legal/**"] } }), "repo"],
 ];
 const JUDGEMENTS: Array<[string, unknown, boolean]> = [
   ["low", { level: "low", reason: "an ordinary change the description explains" }, false],
@@ -695,11 +697,13 @@ const JUDGEMENTS: Array<[string, unknown, boolean]> = [
 
 for (const [what, risk, kind] of HOLD_INPUTS) {
   for (const [said, raw, judgedHeld] of JUDGEMENTS) {
-    test(`hold: ${what}, judged ${said} -> ${kind === "hard" || judgedHeld ? "held" : "not held"}`, () => {
+    test(`hold: ${what}, judged ${said} -> ${kind !== "judged" || judgedHeld ? "held" : "not held"}`, () => {
       const r = assessRisk({ ...risk, judgement: normaliseJudgement(raw) });
-      const held = kind === "hard" || judgedHeld;
+      const held = kind !== "judged" || judgedHeld;
       assert.equal(r.level, held ? "high" : "low");
-      assert.equal(r.hardHolds.length > 0, kind === "hard", r.hardHolds.join());
+      assert.equal(r.hardHolds.length > 0, kind !== "judged", r.hardHolds.join());
+      assert.equal(r.repoHolds.length > 0, kind === "repo", `only the repository's own requirement stands under fully_auto: ${r.repoHolds.join()}`);
+      for (const h of r.repoHolds) assert.ok(r.hardHolds.includes(h), h);
       if (!held) assert.deepEqual(r.reasons, [], "nothing to say on a card that is not shown");
       if (said === "high") assert.equal(r.reasons[0], "the reviewer's judgement: changes what callers see on shutdown", "the reviewer's reason comes first");
       if (said === "missing" || said === "malformed") assert.match(r.reasons[0] ?? "", /gave no risk judgement/);
@@ -741,6 +745,7 @@ test("rules that throw hold whatever the reviewer says", () => {
   const r = assessRisk({ ...input([]), files: null as unknown as RiskFile[], judgement: { level: "low", reason: "fine" } });
   assert.equal(r.level, "high");
   assert.deepEqual(r.hardHolds, ["the risk rules could not be evaluated"]);
+  assert.deepEqual(r.repoHolds, ["the risk rules could not be evaluated"], "the repository's own requirement could not be read either");
 });
 
 test("the reviewer's judgement is one clipped line that cannot dress itself up, is masked, and a malformed one is no judgement", () => {

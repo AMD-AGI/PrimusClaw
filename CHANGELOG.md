@@ -354,7 +354,17 @@ record it.
   before. The held confirmation and the tool answer give the reasons in plain words, the model's own first.
   Delegation, author != acting user, CI, merge state, branch protection, the writes switch, the head-SHA binding
   and the audit are unchanged; the audit row keeps the evidence (`evidence: ...`). `gh_pr_risk` no longer
-  answers `raised_by_reviewer`. See `claw/docs/github-review.md` ("High risk").
+  answers `raised_by_reviewer`. An approval or a merge of a head commit whose earlier approval or merge still
+  waits for the acting user, is being decided, or was refused is held too. See `claw/docs/github-review.md` ("High risk").
+- GitHub review: the acting user's own review mode, read from their GitHub binding (`review_mode` in the identity
+  provider's credential answer; `@claw/utils` `ResolvedCredential.reviewMode`), decides what holds for every review and
+  merge made with their account, whoever asked: `high_risk_confirm` (the default, also for a binding without it)
+  holds as above, `fully_auto` holds only what the repository itself requires (`confirm_merge: always`, a
+  `high_risk_paths` match, a configuration that does not parse) and an earlier held or refused write of the commit.
+  `delegation` still decides alone whether others may ask. The mode is in `gh_pr_get` and `gh_pr_risk`, in a new
+  `claw_github_audit.review_mode` column (added on start), and a write made under `fully_auto` answers
+  `review_mode_note`. The identity provider must store and return `review_mode` for `fully_auto` to take effect;
+  until then every binding is `high_risk_confirm`.
 - `claw-connector`: two changes for an existing `agents.toml` that need no setting to take effect. A file with
   `allow_unsafe_modes = true` now also accepts an adapter's "will not ask for permission" warning for every agent without
   its own `approval`, so a session that used to be closed with `mode_not_enforced` now opens and is reported

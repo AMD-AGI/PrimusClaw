@@ -32,8 +32,21 @@ export interface ResolvedCredential {
    * to honour it: `requesterUserId === userId || delegation`.
    */
   delegation: boolean;
+  /**
+   * How the owner wants a held write made with this credential confirmed, whoever asked for it: `high_risk_confirm` (the default, and what
+   * a binding without the setting means) asks them when the change needs a person, `fully_auto` asks only what the repository itself
+   * requires. Independent of `delegation`, which says only whether others may ask.
+   */
+  reviewMode: CredentialReviewMode;
   /** Epoch milliseconds, or null when the provider did not say. */
   expiresAt: number | null;
+}
+
+export type CredentialReviewMode = "high_risk_confirm" | "fully_auto";
+
+/** A value that is not one of the modes is the default, the one that asks more. */
+export function parseReviewMode(raw: unknown): CredentialReviewMode {
+  return raw === "fully_auto" ? "fully_auto" : "high_risk_confirm";
 }
 
 export interface CredentialSettings {
@@ -95,6 +108,7 @@ export class CredentialClient {
           kind: typeof raw.kind === "string" ? raw.kind : "",
           scopes,
           delegation: raw.delegation === true,
+          reviewMode: parseReviewMode(raw.review_mode),
           expiresAt: Number.isFinite(expires) ? expires : null,
         };
         return { value: value as ResolvedCredential | IdentityCredentialRefusedError, outcome: "ok" as const };

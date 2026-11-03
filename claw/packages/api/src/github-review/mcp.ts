@@ -56,7 +56,8 @@ const JUDGEMENT = z.object({
 }).optional().describe(
   "Your own reading of what the change DOES, which decides whether an APPROVE or a merge waits for the acting user: `high` holds it for their "
   + "confirmation (they read your reason first), `low` lets it through the other gates, and leaving it out holds it. Judge from the diff and from "
-  + "the evidence in gh_pr_get's `risk` (its `guidance` says what to hold for); `hard_holds` there hold whatever you say");
+  + "the evidence in gh_pr_get's `risk` (its `guidance` says what to hold for); `hard_holds` there hold whatever you say. When the acting user's "
+  + "`review_mode` is `fully_auto` (their own setting), only `repo_holds`, what the repository itself requires, hold");
 
 function toResult(outcome: ToolOutcome): { content: Array<{ type: "text"; text: string }>; isError?: boolean } {
   return { content: [{ type: "text" as const, text: outcome.text }], ...(outcome.isError ? { isError: true } : {}) };

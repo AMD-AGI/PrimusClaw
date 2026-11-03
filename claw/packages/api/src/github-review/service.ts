@@ -22,7 +22,7 @@
  */
 import { createHash } from "node:crypto";
 import pino from "pino";
-import { IdentityCredentialRefusedError, IdentityUnavailableError, type ResolveCredentialRequest, type ResolvedCredential } from "@claw/utils";
+import { IdentityCredentialRefusedError, IdentityUnavailableError, parseReviewMode, type CredentialReviewMode, type ResolveCredentialRequest, type ResolvedCredential } from "@claw/utils";
 import { evaluateChecks, hasMergeQueueRule, requiredContextsFromRules, type ChecksVerdict } from "./checks.js";
 import { commentableLines } from "./diff.js";
 import { GithubClient, GithubError, GithubGraphqlError, parsePrRef, repoPath, type PrRef } from "./github.js";
@@ -85,7 +85,8 @@ export interface ReviewDeps {
 interface Ctx {
   actor: ReviewActor;
   settings: GithubReviewSettings;
-  cred: { login: string; scopes: string[]; delegation: boolean };
+  /** `mode` is the acting user's own review mode, from their GitHub binding: it decides their holds whoever asked (see `holdFor`). */
+  cred: { login: string; scopes: string[]; delegation: boolean; mode: CredentialReviewMode };
   client: GithubClient;
   /** The tool being run, as the identity provider's audit trail names the purpose of a lookup. */
   tool: string;
@@ -93,7 +94,7 @@ interface Ctx {
   auditId: number;
   acc: {
     repo?: string; pr?: number; headSha?: string; riskReasons?: string[]; confirmationId?: string;
-    write: boolean; dryRun: boolean; reviewPath?: string; reviewPathReason?: string;
+    write: boolean; dryRun: boolean; reviewPath?: string; reviewPathReason?: string; reviewMode?: CredentialReviewMode;
     /** The audit row has been marked as a write, so it already counts against the limits. */
     reserved?: boolean;
   };
@@ -273,7 +274,10 @@ export class GithubReview {
           merge_queue: this.viaQueue(ctx, state), in_merge_queue: state.queueEntry !== null,
         },
         // No judgement yet: the model's own, on gh_review_submit and gh_pr_merge, decides the hold. This is what it judges from.
-        risk: { hard_holds: risk.hardHolds, evidence: risk.evidence, rule_level: risk.ruleLevel, categories: risk.categories, rule_pack: risk.rulePack, guidance: HOLD_GUIDANCE },
+        risk: {
+          review_mode: ctx.cred.mode, hard_holds: risk.hardHolds, repo_holds: risk.repoHolds, evidence: risk.evidence, rule_level: risk.ruleLevel,
+          categories: risk.categories, rule_pack: risk.rulePack, guidance: HOLD_GUIDANCE,
+        },
         files: change.files.map((f) => ({ path: f.path, status: f.status, additions: f.additions, deletions: f.deletions, has_diff: !diffNotSent(f) })),
         files_complete: change.complete,
         diff_cut: diffCut,
@@ -307,10 +311,10 @@ export class GithubReview {
       const { repo, pr } = await this.load(ctx, ref);
       const change = await this.collectChange(ctx, ref, pr);
       // The same answer an approval or a merge would get now, an earlier write of this commit that waits for the acting user included.
-      const risk = await this.heldBefore(ctx, ref, pr, assessRisk(this.riskInput(pr, repo, change, this.flags(args), this.judgement(ctx, args))));
+      const risk = await this.holdFor(ctx, ref, pr, assessRisk(this.riskInput(pr, repo, change, this.flags(args), this.judgement(ctx, args))));
       ctx.acc.riskReasons = this.auditedReasons(risk);
       ctx.acc.headSha = pr.headSha;
-      return ok({ status: "ok", head_sha: pr.headSha, risk: this.riskBlock(risk) }, (t) => ctx.client.redact(t));
+      return ok({ status: "ok", head_sha: pr.headSha, risk: this.riskBlock(ctx, risk) }, (t) => ctx.client.redact(t));
     });
   }
 
@@ -325,9 +329,9 @@ export class GithubReview {
       const text = typeof args.body === "string" ? args.body.trim() : "";
       if (!text) throw new Refusal("empty_review", "a review needs a body");
       if (text.length > MAX_BODY_CHARS) throw new Refusal("body_too_long", `the body is longer than ${MAX_BODY_CHARS} characters`);
-      return ok(await this.submit(ctx, ref, headSha, {
+      return ok(this.withMode(ctx, await this.submit(ctx, ref, headSha, {
         event: event as ReviewEvent, text, rawComments: args.comments, flags: this.flags(args), judgement: this.judgement(ctx, args), confirmation: null,
-      }), (t) => ctx.client.redact(t));
+      })), (t) => ctx.client.redact(t));
     });
   }
 
@@ -374,8 +378,20 @@ export class GithubReview {
       if (method !== undefined && !["squash", "merge", "rebase"].includes(method)) {
         throw new Refusal("invalid_method", "method must be squash, merge or rebase");
       }
-      return ok(await this.merge(ctx, ref, headSha, { method: method as "squash" | "merge" | "rebase" | undefined, flags: this.flags(args), judgement: this.judgement(ctx, args), confirmation: null }), (t) => ctx.client.redact(t));
+      return ok(this.withMode(ctx, await this.merge(ctx, ref, headSha, { method: method as "squash" | "merge" | "rebase" | undefined, flags: this.flags(args), judgement: this.judgement(ctx, args), confirmation: null })), (t) => ctx.client.redact(t));
     });
+  }
+
+  /**
+   * A write made unasked says under which of the acting user's review modes it was made, so that what the person reads afterwards can say
+   * so ("merged under bob's fully automatic setting").
+   */
+  private withMode(ctx: Ctx, body: Record<string, unknown>): Record<string, unknown> {
+    if (!["submitted", "merged", "queued"].includes(String(body.status))) return body;
+    return {
+      ...body, review_mode: ctx.cred.mode,
+      ...(ctx.cred.mode === "fully_auto" ? { review_mode_note: `made under ${ctx.cred.login}'s fully automatic setting: nobody was asked to confirm it` } : {}),
+    };
   }
 
   // -------------------------------------------------- confirmations
@@ -540,8 +556,9 @@ export class GithubReview {
       client = new GithubClient({ token: cred.token, apiUrl: settings.apiUrl, fetchImpl: this.deps.fetchImpl });
       const ctx: Ctx = {
         actor, settings, client, tool, auditId, acc,
-        cred: { login: cred.providerLogin, scopes: cred.scopes, delegation: cred.delegation },
+        cred: { login: cred.providerLogin, scopes: cred.scopes, delegation: cred.delegation, mode: parseReviewMode(cred.reviewMode) },
       };
+      acc.reviewMode = ctx.cred.mode;
       outcome = await body(ctx, ref);
     } catch (err) {
       outcome = this.errorOutcome(err, client);
@@ -558,7 +575,7 @@ export class GithubReview {
         githubRequests: client?.requests ?? 0, githubRequestIds: client?.requestIds ?? [], githubStatus: client?.lastStatus || undefined,
         riskReasons: acc.riskReasons, confirmationId: acc.confirmationId, dryRun: acc.dryRun, write: acc.write,
         result: outcome.isError ? "refused" : "ok", detail: String(outcome.body.reason ?? outcome.body.status ?? ""),
-        reviewPath: acc.reviewPath, reviewPathReason: acc.reviewPathReason,
+        reviewPath: acc.reviewPath, reviewPathReason: acc.reviewPathReason, reviewMode: acc.reviewMode,
       });
     } catch {
       // The row was written before the work; a failure to finish it leaves it 'started', which counts against limits and reads as unfinished.
@@ -724,29 +741,33 @@ export class GithubReview {
     return normaliseJudgement(args.risk_judgement, (t) => ctx.client.redact(t));
   }
 
-  private riskBlock(risk: RiskResult): Record<string, unknown> {
+  private riskBlock(ctx: Ctx, risk: RiskResult): Record<string, unknown> {
     return {
-      level: risk.level, reasons: risk.reasons, judgement: risk.judgement, hard_holds: risk.hardHolds, evidence: risk.evidence,
-      rule_level: risk.ruleLevel, categories: risk.categories, rule_pack: risk.rulePack, guidance: HOLD_GUIDANCE,
+      level: risk.level, reasons: risk.reasons, review_mode: ctx.cred.mode, judgement: risk.judgement, hard_holds: risk.hardHolds,
+      repo_holds: risk.repoHolds, evidence: risk.evidence, rule_level: risk.ruleLevel, categories: risk.categories, rule_pack: risk.rulePack,
+      guidance: HOLD_GUIDANCE,
     };
   }
 
   /**
-   * A write this call would make unasked is held after all when an approval or a merge of the same commit already waits for the acting
-   * user, or was refused by them: a later call with a lower judgement, or the other of the two tools, must not get past their decision.
+   * Whether this write waits for the acting user, under their own review mode (from their GitHub binding, whoever asked, the acting user
+   * themselves included): `high_risk_confirm` holds what assessRisk holds, `fully_auto` only the repository's own requirement. Under
+   * either, an approval or a merge of a head commit for which an earlier one already waits for the acting user, is being decided by them,
+   * or was refused by them is held as well: a later call with a lower judgement, or the other of the two tools, must not get past their
+   * decision. The answer's `level` and `reasons` are this decision; the rest is what assessRisk said.
    */
-  private async heldBefore(ctx: Ctx, ref: PrRef, pr: PrInfo, risk: RiskResult): Promise<RiskResult> {
+  private async holdFor(ctx: Ctx, ref: PrRef, pr: PrInfo, risk: RiskResult): Promise<RiskResult> {
     const earlier = await heldOrDeniedOn(this.deps.db, ctx.actor.actorUserId, `${ref.owner}/${ref.repo}`, ref.number, pr.headSha);
-    if (!earlier) return risk;
-    const reason = earlier === "denied"
-      ? `${ctx.cred.login} refused an approval or a merge of this commit before, so this one is theirs to decide as well`
-      : `an approval or a merge of this commit already waits for ${ctx.cred.login}'s decision, so this one waits as well`;
-    return { ...risk, level: "high", reasons: [reason, ...risk.reasons.filter((r) => r !== reason)] };
+    const theirs = earlier === "denied"
+      ? [`${ctx.cred.login} refused an approval or a merge of this commit before, so this one is theirs to decide as well`]
+      : earlier === "pending" ? [`an approval or a merge of this commit already waits for ${ctx.cred.login}'s decision, so this one waits as well`] : [];
+    const reasons = [...theirs, ...(ctx.cred.mode === "fully_auto" ? risk.repoHolds : risk.reasons)];
+    return { ...risk, level: reasons.length > 0 ? "high" : "low", reasons };
   }
 
   /** The audit row keeps why a write was held and what the rules saw, the evidence marked as such. */
   private auditedReasons(risk: RiskResult): string[] {
-    return [...risk.reasons, ...risk.evidence.filter((e) => !risk.hardHolds.includes(e)).map((e) => `evidence: ${e}`)];
+    return [...risk.reasons, ...risk.evidence.filter((e) => !risk.reasons.includes(e)).map((e) => `evidence: ${e}`)];
   }
 
   private async readState(ctx: Ctx, ref: PrRef, pr: PrInfo, _repo: RepoInfo): Promise<PullState> {
@@ -807,12 +828,15 @@ export class GithubReview {
       requested_by_acting_user: ctx.actor.requesterUserId === ctx.actor.actorUserId,
       acting_user_is_author: author,
       acting_user_allows_others: ctx.cred.delegation,
+      review_mode: ctx.cred.mode,
       may_approve_and_merge: repo.push && !author,
       has_write_permission: repo.push,
       note: author
         ? "the acting user wrote this pull request: an approval or a merge with their account is refused (cannot_approve_own_pull_request), so comment only, and say that nothing was approved or merged for that reason"
         : repo.push
-          ? "approve and merge are open, subject to the gates; an approval or merge you judge high risk (or one a hard hold catches) waits for the acting user's confirmation"
+          ? ctx.cred.mode === "fully_auto"
+            ? "approve and merge are open, subject to the gates; the acting user chose fully_auto, so only what the repository itself requires (risk.repo_holds) waits for their confirmation"
+            : "approve and merge are open, subject to the gates; an approval or merge you judge high risk (or one a hard hold catches) waits for the acting user's confirmation"
           : "the acting user has no write permission here: comment only, and say that nothing was merged for that reason",
     };
   }
@@ -841,7 +865,7 @@ export class GithubReview {
   private async requireApprovable(ctx: Ctx, ref: PrRef, repo: RepoInfo, pr: PrInfo, change: Change | null, flags: string[], judgement: ReviewerJudgement | null): Promise<RiskResult> {
     const read = change ?? await this.collectChange(ctx, ref, pr);
     // The reviewer's own flags and judgement count here as they do at the merge.
-    const risk = await this.heldBefore(ctx, ref, pr, assessRisk(this.riskInput(pr, repo, read, flags, judgement)));
+    const risk = await this.holdFor(ctx, ref, pr, assessRisk(this.riskInput(pr, repo, read, flags, judgement)));
     ctx.acc.riskReasons = this.auditedReasons(risk);
     this.requireGreen(await this.readState(ctx, ref, pr, repo), pr.headSha);
     return risk;
@@ -972,7 +996,7 @@ export class GithubReview {
 
     const change = await this.collectChange(ctx, ref, pr);
     const risk = opts.confirmation ? assessRisk(this.riskInput(pr, repo, change, opts.flags, opts.judgement))
-      : await this.heldBefore(ctx, ref, pr, assessRisk(this.riskInput(pr, repo, change, opts.flags, opts.judgement)));
+      : await this.holdFor(ctx, ref, pr, assessRisk(this.riskInput(pr, repo, change, opts.flags, opts.judgement)));
     ctx.acc.riskReasons = this.auditedReasons(risk);
     let state = await this.readState(ctx, ref, pr, repo);
     // A branch with a merge queue takes the pull request through it (see `viaQueue`); the queue, not this call, chooses the merge method.

@@ -42,7 +42,7 @@ export interface ReviewEnv {
 
 /** The acting user (`bob`) has bound GitHub and lets others act for them, which most tests need; a test for the switch being off says `delegation: false`. */
 export function credential(over: Partial<ResolvedCredential> = {}): ResolvedCredential {
-  return { token: TOKEN, providerLogin: "bob", kind: "oauth", scopes: ["public_repo"], delegation: true, expiresAt: null, ...over };
+  return { token: TOKEN, providerLogin: "bob", kind: "oauth", scopes: ["public_repo"], delegation: true, reviewMode: "high_risk_confirm", expiresAt: null, ...over };
 }
 
 /**

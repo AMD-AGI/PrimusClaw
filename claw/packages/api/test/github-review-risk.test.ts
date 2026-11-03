@@ -22,7 +22,7 @@ const patchWith = (...added: string[]): string => `@@ -1,1 +1,${added.length + 1
 test("an ordinary change is low risk, and the verdict names the rule pack", () => {
   const r = assessRisk(input([file("src/render.ts"), file("test/render.test.ts")]));
   assert.deepEqual(assessRisk({ ...input([file("src/render.ts"), file("test/render.test.ts")]), judgement: { level: "low", reason: "a render fix" } }), {
-    level: "low", reasons: [], evidence: [], hardHolds: [], categories: [], ruleLevel: "low", judgement: "low", rulePack: RISK_RULE_PACK_VERSION,
+    level: "low", reasons: [], evidence: [], hardHolds: [], repoHolds: [], categories: [], ruleLevel: "low", judgement: "low", rulePack: RISK_RULE_PACK_VERSION,
   });
   assert.equal(r.level, "high", "no judgement holds");
 });

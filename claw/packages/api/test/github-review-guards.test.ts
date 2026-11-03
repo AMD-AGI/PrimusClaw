@@ -41,6 +41,7 @@ const get = () => e.service.getPr(e.actor, { pr: PR });
 const LOW = { level: "low", reason: "an ordinary change, nothing for a person to look at" };
 const submit = (over: Record<string, unknown> = {}) => e.service.submitReview(e.actor, { pr: PR, head_sha: HEAD, event: "COMMENT", body: "Looks fine.", risk_judgement: LOW, ...over });
 const merge = (over: Record<string, unknown> = {}) => e.service.mergePr(e.actor, { pr: PR, head_sha: HEAD, risk_judgement: LOW, ...over });
+const puts = () => e.gh.calls.filter((c) => c.method === "PUT");
 const reason = (o: ToolOutcome) => String(o.body.reason ?? o.body.status);
 const rows = () => e.sql("SELECT * FROM claw_github_confirmations ORDER BY created_at, confirmation_id");
 /** A change the rules call high risk: a workflow file is edited. */
@@ -51,6 +52,50 @@ const highRisk = () => {
 const inline = { path: ".github/workflows/ci.yml", line: 2, body: "This runs untrusted input." };
 const EVENTS = ["COMMENT", "REQUEST_CHANGES", "APPROVE"] as const;
 const stages = (o: { gh: ReviewEnv["gh"] }): string[] => o.gh.writes.map((w) => `${w.method} ${w.path.split("/").slice(-1)[0]}`);
+
+describe("K the acting user's review mode, from their GitHub binding, whoever asked", () => {
+  const MODES = ["high_risk_confirm", "fully_auto", undefined] as const;
+  const WHO = [["someone else asks", {}], ["the acting user asks for their own account", { requesterUserId: "u-bob" }]] as const;
+  const JUDGED = [["low", { level: "low", reason: "an ordinary change" }], ["high", { level: "high", reason: "changes what callers see on shutdown" }]] as const;
+  for (const mode of MODES) for (const [who, actor] of WHO) for (const [said, judgement] of JUDGED) for (const workflow of [false, true]) for (const always of [false, true]) {
+    // A binding without the setting is high_risk_confirm. fully_auto holds only what the repository itself requires.
+    const held = always || ((mode ?? "high_risk_confirm") === "high_risk_confirm" && (said === "high" || workflow));
+    test(`K ${mode ?? "no mode on the binding"}, ${who}, judged ${said}${workflow ? ", a workflow change" : ""}${always ? `, the repository's ${LEGACY_REPO_CONFIG_STEM}.yml says confirm_merge: always` : ""} -> ${held ? "held" : "merged"}`, async () => {
+      e = await env({}, { actor, cred: mode ? { reviewMode: mode } : { reviewMode: undefined as never } });
+      if (workflow) highRisk();
+      if (always) e.gh.contents[`.github/${LEGACY_REPO_CONFIG_STEM}.yml`] = "confirm_merge: always\n";
+      const o = await merge({ risk_judgement: judgement });
+      assert.equal(o.body.status, held ? "confirmation_required" : "merged", o.text);
+      const [audit] = await e.sql("SELECT review_mode FROM claw_github_audit WHERE tool = 'gh_pr_merge'");
+      assert.equal(audit?.review_mode, mode ?? "high_risk_confirm", "the audit row says which mode the call ran under");
+      if (held) {
+        const reasons = (o.body.reasons as string[]).join("\n");
+        if (always) assert.match(reasons, /asks for confirmation on every merge/);
+        if (mode === "fully_auto") assert.doesNotMatch(reasons, /workflow|reviewer's judgement/, "fully_auto holds for the repository alone");
+        assert.equal(puts().length, 0);
+      } else {
+        assert.equal(o.body.review_mode, mode ?? "high_risk_confirm");
+        if (mode === "fully_auto") assert.equal(o.body.review_mode_note, "made under bob's fully automatic setting: nobody was asked to confirm it");
+        else assert.equal(o.body.review_mode_note, undefined);
+      }
+    });
+  }
+
+  test("K gh_pr_get and gh_pr_risk say which mode applies and what it holds; delegation is a separate question", async () => {
+    e = await env({}, { cred: { reviewMode: "fully_auto" } });
+    highRisk();
+    const got = (await get()).body as any;
+    assert.equal(got.acting.review_mode, "fully_auto");
+    assert.match(got.acting.note, /fully_auto, so only what the repository itself requires/);
+    assert.equal(got.risk.review_mode, "fully_auto");
+    assert.deepEqual(got.risk.repo_holds, []);
+    assert.match(got.risk.hard_holds.join(), /workflow/);
+    const risk = (await e.service.assessPr(e.actor, { pr: PR, risk_judgement: { level: "high", reason: "x" } })).body.risk as any;
+    assert.deepEqual([risk.level, risk.reasons, risk.review_mode], ["low", [], "fully_auto"]);
+    e = await env({}, { cred: { reviewMode: "fully_auto", delegation: false } });
+    assert.equal(reason(await merge()), "delegation_off", "fully_auto does not let others ask: that is delegation's");
+  });
+});
 
 describe("H what is held for the acting user", () => {
   test("H1 with the acting user's standing permission a COMMENT, a REQUEST_CHANGES, an APPROVE and a merge of a change the rules call low go straight to GitHub as the acting user, whoever asked: nobody is asked", async () => {

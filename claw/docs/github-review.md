@@ -119,9 +119,29 @@ review and the merge and who is the reviewer of record, and whose own standing a
   reviewer's own first), until the acting user has confirmed that very write; a comment or a request for
   changes on the same change is posted as ever. The confirmation holds the review as it will be posted
   (event, text, inline comments), so what the acting user reads is what goes out; the gates of the write
-  are read again when they allow it. It cannot be switched off by a setting or by a repository's
-  configuration. A held approval is posted alone: to approve and merge in one confirmation, a model calls
-  `gh_pr_merge`.
+  are read again when they allow it. A repository's configuration cannot switch it off; the acting user's
+  own review mode (next item) decides what holds. A held approval is posted alone: to approve and merge in
+  one confirmation, a model calls `gh_pr_merge`.
+- **The acting user's review mode.** How a held write is confirmed is the acting user's own setting, kept
+  on their GitHub binding at the identity provider and returned with the credential (`review_mode` in the
+  `/oauth/external-credentials/resolve` answer). It applies to every review and merge made with their
+  account, whoever asked, the acting user themselves included:
+  - `high_risk_confirm` (the default, and what a binding without the setting means): an `APPROVE` or a
+    merge is held as "High risk" says, for the reviewer's judgement, its flags or a hard hold;
+  - `fully_auto`: nothing is held except what the repository itself requires (`risk.repo_holds`: its
+    configuration's `confirm_merge: always` or a `high_risk_paths` match, a configuration that does not
+    parse, rules that failed, a cut file list where it marks paths), and an earlier write of the same
+    commit that still waits for the person, is being decided by them, or was refused by them. The other
+    gates (CI green, no open thread, merge state `CLEAN`, not the author, delegation, the head commit)
+    stand as ever.
+
+  It says nothing about who may ask: that stays the `delegation` flag (others may ask only when it is on).
+  A value that is not one of the two is `high_risk_confirm`. `gh_pr_get` (`acting.review_mode`,
+  `risk.review_mode`, `risk.repo_holds`) and `gh_pr_risk` show the mode in force, the audit row records it
+  (`review_mode`), and an approval or a merge made under `fully_auto` answers `review_mode_note` ("made
+  under <login>'s fully automatic setting: nobody was asked to confirm it") for the report to repeat. The
+  setting is written where the binding is, at the identity provider, at bind time or later by its owner,
+  as `delegation` is; this API only reads it.
 - **Merge queue.** A base branch that is merged through a merge queue refuses a direct merge, so there
   `gh_pr_merge` does not merge: after every gate of a merge has passed and the approval is on the pull
   request (or the acting user has allowed a held merge), it puts the pull request in the queue with the
@@ -463,7 +483,7 @@ Every tool call writes a row to `claw_github_audit` **before** it does anything 
 it afterwards: requester, acting user, session, repository, pull request, head commit, tool,
 a summary of the arguments (names and sizes, not the text of a review), the number of GitHub
 requests and their request ids, the risk reasons, the confirmation, whether it was a dry run or
-a write, the result and the review path. A call that cannot be written down is not made. No
+a write, the result, the review path and the acting user's review mode. A call that cannot be written down is not made. No
 table holds a credential. A tool answer is masked with the token and anything shaped like a
 secret before the model reads it. Rate limits answer `rate_limited`; GitHub's own limits
 answer `github_rate_limited` with `retry_after_seconds`, and a write is never retried blindly:

@@ -7,7 +7,7 @@ export {
   buildIdentityClient, startIdentityClient,
   type IdentityProcessMetrics, type IdentityStartupLog,
 } from "./startup.js";
-export { type ResolveCredentialRequest, type ResolvedCredential } from "./credentials.js";
+export { parseReviewMode, type CredentialReviewMode, type ResolveCredentialRequest, type ResolvedCredential } from "./credentials.js";
 export {
   IdentityCredentialRefusedError, IdentityExchangeRefusedError, IdentityUnavailableError, JwtVerificationError,
   type JwtFailure, type UnavailableReason,
