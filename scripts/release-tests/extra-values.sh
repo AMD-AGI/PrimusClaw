@@ -10,7 +10,12 @@
 # reverts, so what it does express has to be exact: nothing set renders nothing,
 # each setting lands on the one container it names, a ConfigMap mount and a
 # Secret mount sit side by side without sharing a volume name, and a malformed
-# entry stops the render instead of being dropped.
+# entry stops the render instead of being dropped. So does a mount path that is
+# used twice in one container, or that the chart itself mounts there: the API
+# server rejects that Deployment only at kubectl apply, after api has rolled, so
+# the render has to be where it stops. What the chart mounts is read from the
+# chart (charts/claw/mount-paths.json, which the Deployments render from too), and
+# this test checks that file against the rendered Deployments.
 
 set -euo pipefail
 
@@ -116,6 +121,35 @@ refuses "a Secret name with capitals"                EXTRA_SECRET_MOUNTS_API    
 refuses "a ConfigMap entry with no mount path"       EXTRA_CONFIGMAP_MOUNTS_API EXTRA_CONFIGMAP_MOUNTS_API=cm-one
 refuses "an env name that is not a variable name"    EXTRA_ENV_API_1BAD         EXTRA_ENV_API_1BAD=x
 
+echo "==> a mount path used twice in one container stops the render"
+# Naming the variable is not enough when two of them are involved: the reader has
+# to be told which entry the refused one collides with.
+also_names() { grep -qF -- "$1" "$err" || bad "the refusal must also name $1, got: $(cat "$err")"; }
+refuses "a ConfigMap and a Secret at one path (brain)" EXTRA_SECRET_MOUNTS_BRAIN \
+  EXTRA_CONFIGMAP_MOUNTS_BRAIN=cm-one:/etc/x EXTRA_SECRET_MOUNTS_BRAIN=sec-one:/etc/x
+also_names EXTRA_CONFIGMAP_MOUNTS_BRAIN
+refuses "a Secret and a ConfigMap at one path (api)" EXTRA_SECRET_MOUNTS_API \
+  EXTRA_CONFIGMAP_MOUNTS_API=cm-one:/etc/x EXTRA_SECRET_MOUNTS_API=sec-one:/etc/x
+also_names EXTRA_CONFIGMAP_MOUNTS_API
+refuses "two Secrets at one path" EXTRA_SECRET_MOUNTS_API \
+  "EXTRA_SECRET_MOUNTS_API=sec-one:/etc/x sec-two:/etc/x"
+refuses "two ConfigMaps at one path" EXTRA_CONFIGMAP_MOUNTS_BRAIN \
+  "EXTRA_CONFIGMAP_MOUNTS_BRAIN=cm-one:/etc/x cm-two:/etc/x"
+# The API server compares what the container sees, so the same directory written
+# another way is the same path.
+for spelling in /etc/x/ /etc//x //etc/x /etc/./x /etc/y/../x; do
+  refuses "/etc/x written as $spelling" EXTRA_SECRET_MOUNTS_BRAIN \
+    EXTRA_CONFIGMAP_MOUNTS_BRAIN=cm-one:/etc/x "EXTRA_SECRET_MOUNTS_BRAIN=sec-one:$spelling"
+done
+refuses "a Secret at the root written as /." EXTRA_SECRET_MOUNTS_BRAIN EXTRA_SECRET_MOUNTS_BRAIN=sec-one:/.
+
+# Different containers have different mount tables, and so do different paths.
+extra \
+  EXTRA_CONFIGMAP_MOUNTS_API=cm-one:/etc/x EXTRA_SECRET_MOUNTS_BRAIN=sec-one:/etc/x \
+  EXTRA_SECRET_MOUNTS_API=sec-two:/etc/y EXTRA_CONFIGMAP_MOUNTS_BRAIN=cm-two:/etc/y/z \
+  >/dev/null 2>"$err" || bad "refused paths that are free in their own container: $(cat "$err")"
+ok "the same path in api and brain, and a path under another, are accepted"
+
 echo "==> the chart renders the mounts into the right Deployment"
 extra \
   EXTRA_CONFIGMAP_MOUNTS_BRAIN=cm-one:/etc/one \
@@ -150,5 +184,53 @@ has "$tmp/brain.yaml" '- mountPath: /var/run/two\n\s+name: extra-secret-0\n\s+re
 if has "$tmp/api.yaml" 'sec-two|cm-one'; then bad "api carries a mount that was set for brain"; fi
 if has "$tmp/brain.yaml" 'sec-one'; then bad "brain carries a mount that was set for api"; fi
 ok "each Deployment carries its own mounts, read-only, and none of the other's"
+
+echo "==> every directory the chart mounts is refused, in the container it mounts it into"
+# Render with every switch that adds a mount turned on, so the Deployments show
+# every directory the chart can mount (the release values leave the optional ones off).
+helm template extra-test "$chart_dir" -f "$release_values" \
+  --set-string tls.extraCACertsConfigMap=ca-cm --set-string tls.extraCACertsKey=ca.crt \
+  --set grantSigningKey.enabled=true --set-string sandboxTemplate.codeInterpreterYaml=x \
+  >"$tmp/render-all.yaml" 2>"$err" || bad "the chart did not render with every mount switch on: $(cat "$err")"
+document_of "$tmp/render-all.yaml" primus-claw/templates/api-deployment.yaml   >"$tmp/api-all.yaml"
+document_of "$tmp/render-all.yaml" primus-claw/templates/brain-deployment.yaml >"$tmp/brain-all.yaml"
+mount_paths_of() { sed -n 's/^[[:space:]]*\(-[[:space:]]*\)\{0,1\}mountPath:[[:space:]]*//p' "$1" | sort -u; }
+mount_paths_of "$tmp/api-all.yaml"   >"$tmp/api.paths"
+mount_paths_of "$tmp/brain-all.yaml" >"$tmp/brain.paths"
+[ -s "$tmp/api.paths" ] && [ -s "$tmp/brain.paths" ] || bad "found no mountPath in a rendered Deployment, so there is nothing to compare"
+
+# Every mountPath of a Deployment comes from mount-paths.json. A path typed into
+# a template again would be one extra-values.py never hears about.
+if grep -n 'mountPath:' "$chart_dir/templates/api-deployment.yaml" "$chart_dir/templates/brain-deployment.yaml" \
+    | grep -vF 'include "primus-claw.mountPath"'; then
+  bad "a Deployment template writes a mountPath instead of taking it from mount-paths.json"
+fi
+python3 - "$chart_dir/mount-paths.json" "$tmp/api.paths" "$tmp/brain.paths" <<'PY' || bad "mount-paths.json is not what the chart renders"
+import json, sys
+want = json.load(open(sys.argv[1]))
+if sorted(want) != ["api", "brain"]:
+    sys.exit("mount-paths.json must describe exactly api and brain, got %s" % sorted(want))
+for key, listing in (("api", sys.argv[2]), ("brain", sys.argv[3])):
+    got = sorted(l.strip() for l in open(listing) if l.strip())
+    exp = sorted(want[key].values())
+    if got != exp:
+        sys.exit("%s: the chart renders %s, mount-paths.json says %s" % (key, got, exp))
+PY
+ok "the Deployments mount exactly what mount-paths.json lists, and take it from there"
+
+for tag in API BRAIN; do
+  lower="$(echo "$tag" | tr '[:upper:]' '[:lower:]')"
+  while read -r path; do
+    refuses "the chart's own $path in $lower, as a Secret"    "EXTRA_SECRET_MOUNTS_$tag"    "EXTRA_SECRET_MOUNTS_$tag=sec-one:$path"
+    refuses "the chart's own $path in $lower, as a ConfigMap" "EXTRA_CONFIGMAP_MOUNTS_$tag" "EXTRA_CONFIGMAP_MOUNTS_$tag=cm-one:$path"
+    refuses "the chart's own $path/ in $lower, with a trailing slash" "EXTRA_SECRET_MOUNTS_$tag" "EXTRA_SECRET_MOUNTS_$tag=sec-one:$path/"
+  done <"$tmp/$lower.paths"
+done
+
+# The other container's table is not this one's: the chart mounts /var/run/claw/grant
+# into api only and /etc/claw into brain only.
+extra EXTRA_SECRET_MOUNTS_BRAIN=sec-one:/var/run/claw/grant EXTRA_SECRET_MOUNTS_API=sec-two:/etc/claw \
+  >/dev/null 2>"$err" || bad "refused a path the chart mounts into the other container only: $(cat "$err")"
+ok "a path the chart mounts into one container stays free in the other"
 
 echo "extra-values: all checks passed"
