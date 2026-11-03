@@ -19,7 +19,7 @@
  *   T  the token: nowhere it should not be
  */
 import assert from "node:assert/strict";
-import test, { after, afterEach, beforeEach, describe } from "node:test";
+import test, { after, afterEach, beforeEach, describe, mock } from "node:test";
 import { IdentityCredentialRefusedError } from "@claw/utils";
 import { HEAD } from "./support/fake-github.js";
 import { PR, REQUESTER_TOKEN, TOKEN, closeShared, credential, directory, down, expired, reviewEnv, unbound, type ReviewEnv } from "./support/review-env.js";
@@ -734,6 +734,23 @@ describe("M4 what the change does, and the reviewer's judgement of it", () => {
     await e.sql("UPDATE claw_github_write_locks SET expires_at = NOW() - INTERVAL '1 second'");
     assert.equal((await merge()).body.status, "merged");
     assert.deepEqual(await e.sql("SELECT * FROM claw_github_write_locks"), [], "a call gives the lock back");
+  });
+
+  test("M14e the lock is renewed while its call still works, however long GitHub takes, so it cannot lapse under a live decision", async () => {
+    e.gh.files = drain;
+    const seen: string[] = [];
+    const query = e.db.query.bind(e.db);
+    e.db.query = (text, params) => { seen.push(text); return query(text, params); };
+    mock.timers.enable({ apis: ["setInterval"] });
+    try {
+      // GitHub still computing the merge state keeps the call at work; meanwhile two renewal periods pass.
+      e.gh.graphql.mergeStateStatus = "UNKNOWN";
+      e.onSleep = () => { mock.timers.tick(31_000); e.gh.graphql.mergeStateStatus = "CLEAN"; };
+      assert.equal((await merge()).body.status, "merged");
+    } finally {
+      mock.timers.reset();
+    }
+    assert.ok(seen.some((t) => /UPDATE claw_github_write_locks SET expires_at/.test(t)), "the lock was renewed during the call");
   });
 
   test("M14d a high approval and a low merge made at the same time never merge past the hold", async () => {

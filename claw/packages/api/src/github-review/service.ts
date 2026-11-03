@@ -35,7 +35,7 @@ import { SANDBOX_RECIPE_USAGE, buildSandboxRecipe } from "./sandbox-recipe.js";
 import { GITHUB_PROVIDER, type GithubReviewSettings } from "./settings.js";
 import {
   auditFinish, auditStart, claimConfirmation, finishConfirmation, getConfirmation, openConfirmation,
-  acquireWriteLock, countPendingConfirmations, getReviewMode, heldOrDeniedOn, recentWrites, releaseWriteLock, reopenConfirmation, reserveWrite, reviewDigest, sessionRequestCount,
+  acquireWriteLock, countPendingConfirmations, getReviewMode, heldOrDeniedOn, recentWrites, releaseWriteLock, renewWriteLock, reopenConfirmation, reserveWrite, reviewDigest, sessionRequestCount,
   type Confirmation, type DecidedVia, type HeldReview, type Queryable, type ReviewComment, type ReviewEvent, type ReviewMode,
 } from "./store.js";
 
@@ -162,7 +162,7 @@ const FILE_PAGE = 100;
 const MAX_REVIEW_COMMENTS = 30;
 const MAX_COMMENT_CHARS = 4000;
 const MAX_BODY_CHARS = 20_000;
-/** Longest an approval or a merge decision holds the lock (`oneAtATime`); a merge waits for GitHub's merge state a few seconds at most. */
+/** How long the lock of an approval or a merge decision lasts without renewal (`oneAtATime` renews it every quarter of this). */
 const WRITE_LOCK_SECONDS = 120;
 const DEFAULT_DIFF_CHARS = 80_000;
 const MAX_DIFF_CHARS = 200_000;
@@ -397,9 +397,13 @@ export class GithubReview {
     const key = `${ctx.actor.actorUserId}|${`${ref.owner}/${ref.repo}`.toLowerCase()}#${ref.number}`;
     const holder = await acquireWriteLock(this.deps.db, key, WRITE_LOCK_SECONDS);
     if (!holder) throw new Refusal("write_in_progress", "another approval or merge of this pull request with this account is being decided; nothing was written, try again in a moment");
+    // Renewed while the call works, however long GitHub takes; only a call that died lets it lapse.
+    const renew = setInterval(() => { void renewWriteLock(this.deps.db, key, holder, WRITE_LOCK_SECONDS).catch(() => undefined); }, (WRITE_LOCK_SECONDS * 1000) / 4);
+    renew.unref?.();
     try {
       return await body();
     } finally {
+      clearInterval(renew);
       await releaseWriteLock(this.deps.db, key, holder).catch(() => undefined);
     }
   }
@@ -545,6 +549,9 @@ export class GithubReview {
     let outcome: ToolOutcome;
     let held: string | null = null;
     try {
+      // The acting user's own setting, read for every call and recorded on its audit row, a refused one included.
+      const { mode } = await getReviewMode(this.deps.db, actor.actorUserId);
+      acc.reviewMode = mode;
       if (!ref) throw new Refusal("invalid_pull_request", "name the pull request as a github.com URL or owner/repo#number");
       // Before the owner list, the budget and the credential: a session bound to one pull request has no business with another, and the
       // account it acts as is not even looked up for it. Reads are held to it as well as writes.
@@ -568,9 +575,6 @@ export class GithubReview {
       }
       this.inflight.set(held, (this.inflight.get(held) ?? 0) + 1);
       const cred = await this.credential(actor.actorUserId, actor, tool);
-      // The acting user's own setting, read for every call and recorded on its audit row, a refused one included.
-      const { mode } = await getReviewMode(this.deps.db, actor.actorUserId);
-      acc.reviewMode = mode;
       // Every tool acts with the acting user's account, reads included, so every tool needs their say: the
       // person who asked for their own account needs no one's permission, anyone else needs the owner's switch
       // (their standing authorization). The owner's own "allow" to one held write is that say for that write.

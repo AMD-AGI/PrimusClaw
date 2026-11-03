@@ -117,8 +117,8 @@ export async function ensureGithubReviewSchema(client: pg.PoolClient): Promise<v
 /**
  * Takes the lock on one acting user's approvals and merges of one pull request, or answers null when another call holds it. Between
  * deciding that an approval or a merge is not held and making it, another call of the same acting user on the same pull request could
- * open the hold that should have stopped it; the lock makes the two take turns. It lapses after `ttlSeconds`, so a call that died does
- * not hold it for ever.
+ * open the hold that should have stopped it; the lock makes the two take turns. Its holder renews it while it works
+ * ({@link renewWriteLock}); it lapses `ttlSeconds` after the last renewal, so a call that died does not hold it for ever.
  */
 export async function acquireWriteLock(db: Queryable, key: string, ttlSeconds: number): Promise<string | null> {
   const holder = randomUUID();
@@ -130,6 +130,15 @@ export async function acquireWriteLock(db: Queryable, key: string, ttlSeconds: n
     [key, holder, ttlSeconds],
   );
   return (r.rows[0] as { holder?: string } | undefined)?.holder === holder ? holder : null;
+}
+
+/** Keeps a held lock from lapsing while its call is still at work; false when it is no longer this holder's. */
+export async function renewWriteLock(db: Queryable, key: string, holder: string, ttlSeconds: number): Promise<boolean> {
+  const r = await db.query(
+    "UPDATE claw_github_write_locks SET expires_at = NOW() + ($3::bigint * INTERVAL '1 second') WHERE lock_key = $1 AND holder = $2",
+    [key, holder, ttlSeconds],
+  );
+  return (r.rowCount ?? 0) > 0;
 }
 
 export async function releaseWriteLock(db: Queryable, key: string, holder: string): Promise<void> {

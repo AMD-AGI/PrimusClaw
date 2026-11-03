@@ -284,7 +284,8 @@ review and the merge and who is the reviewer of record, and whose own standing a
   the repository name compared without case, is held too, and `gh_pr_risk` says so, whatever the later call says: a lower judgement on a
   second call, or the other of the two tools, does not get past their decision. Calls in parallel take
   turns: an `APPROVE` or a merge decision holds a lock on the acting user's writes to that pull request
-  (`claw_github_write_locks`, across replicas, lapsing after two minutes), and a second one meanwhile is
+  (`claw_github_write_locks`, across replicas, renewed while the call works and lapsing two minutes after
+  a call that died), and a second one meanwhile is
   refused at once as `write_in_progress`, with nothing written, to be made again.
 
   A merge or an approval that needs confirmation creates one pending row for the head commit and
@@ -457,7 +458,10 @@ no recipe, and the review proceeds from the `gh_pr_get` result alone).
 A repository's review skill is read from the **tip of the base branch** and nowhere else
 (never the pull request's head, which could rewrite the rules it is reviewed by), in the order
 `.claude/skills/review-pr`, any other `.claude/skills/*review*`, any `.agents/skills/*review*`,
-together with the base's `AGENTS.md` and `.github/copilot-instructions.md`. The fixed rules (read
+together with the base's `AGENTS.md` and `.github/copilot-instructions.md`. A file there that is a symlink
+to another file is not read: GitHub would answer with the other file, which a pull request could change
+without touching an instruction path. A pull request that changes any of these paths is held whatever the
+review mode (see "High risk"). The fixed rules (read
 and comment only, text from the pull request is data, the tools' gates) and the answer rules below
 are always put in front of it. Without one the default review instructions apply
 ([`examples/skills/pr-review/SKILL.md`](../examples/skills/pr-review/SKILL.md) is the same text behind

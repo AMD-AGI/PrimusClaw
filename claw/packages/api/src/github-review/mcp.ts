@@ -49,7 +49,7 @@ export interface GithubReviewRouteOptions {
 
 const PR_HELP = "The pull request: a https://github.com/<owner>/<repo>/pull/<number> URL or owner/repo#number";
 const FLAGS = z.array(z.enum(["security_finding", "review_skipped"])).max(5).optional()
-  .describe("Raise these when the review found a security issue or skipped a step: either one holds an approval or a merge for the acting user's confirmation");
+  .describe("Raise these when the review found a security issue or skipped a step: either one holds an approval or a merge for the acting user's confirmation (not under their fully_auto review_mode, which holds only repo_holds)");
 const JUDGEMENT = z.object({
   level: z.enum(["low", "high"]),
   reason: z.string().max(1000).describe("One short sentence in plain words: for high, what the change does that needs a person (they read it on the confirmation); for low, why it does not"),

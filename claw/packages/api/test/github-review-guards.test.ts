@@ -108,6 +108,9 @@ describe("K the acting user's review mode, their own setting in Claw, whoever as
     assert.equal(reason(await merge()), "delegation_off", "fully_auto does not let others ask: that is delegation's");
     const [audit] = await e.sql("SELECT review_mode FROM claw_github_audit");
     assert.equal(audit?.review_mode, "fully_auto", "a refused call records the mode too");
+    await e.sql("DELETE FROM claw_github_audit");
+    assert.equal(reason(await e.service.mergePr(e.actor, { pr: "not a pull request", head_sha: HEAD })), "invalid_pull_request");
+    assert.equal((await e.sql("SELECT review_mode FROM claw_github_audit"))[0]?.review_mode, "fully_auto", "so does one refused before anything is read");
   });
 });
 

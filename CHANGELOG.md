@@ -352,11 +352,13 @@ record it.
   match) or not parsing; a change to `.github/workflows/`, `.github/actions/`, `.github/scripts/`, another CI
   definition, `CODEOWNERS` or that configuration file; a change to the instructions the reviewing model reads (a
   review skill, the root `AGENTS.md`, `.github/copilot-instructions.md`); a cut file list; rules that fail; and a missing or malformed judgement. The model's `risk_flags` hold as
-  before. The held confirmation and the tool answer give the reasons in plain words, the model's own first.
+  before (all of this under the default review mode; see the next entry for `fully_auto`). The held confirmation and the tool answer give the reasons in plain words, the model's own first.
   Delegation, author != acting user, CI, merge state, branch protection, the writes switch, the head-SHA binding
   and the audit are unchanged; the audit row keeps the evidence (`evidence: ...`). `gh_pr_risk` no longer
   answers `raised_by_reviewer`. An approval or a merge of a head commit whose earlier approval or merge still
-  waits for the acting user, is being decided, was refused, or expired unanswered is held too. See `claw/docs/github-review.md` ("High risk").
+  waits for the acting user, is being decided, was refused, or expired unanswered is held too, and approval and
+  merge decisions of one acting user on one pull request take turns (`write_in_progress`). Review instructions
+  that are a symlink to another file are no longer read. See `claw/docs/github-review.md` ("High risk").
 - GitHub review: the acting user's own review mode decides what holds for every review and merge made with their
   account, whoever asked: `high_risk_confirm` (the default, also for a person who never set one) holds as above,
   `fully_auto` holds only what the repository itself requires (`confirm_merge: always`, a `high_risk_paths` match, a

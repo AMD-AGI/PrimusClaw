@@ -58,11 +58,14 @@ function encodePath(p: string): string {
 
 async function readFileAt(client: GithubClient, ref: PrRef, path: string, sha: string, maxBytes: number): Promise<string | null> {
   try {
-    const a = await client.get<{ type?: string; content?: string; encoding?: string; size?: number }>(
+    const a = await client.get<{ type?: string; path?: string; content?: string; encoding?: string; size?: number }>(
       repoPath(ref, `/contents/${encodePath(path)}`), { ref: sha },
     );
     const j = a.json;
     if (!j || Array.isArray(j) || j.type !== "file" || j.encoding !== "base64" || typeof j.content !== "string") return null;
+    // GitHub answers a symlink to a file with that file, under its own path. Instructions read from somewhere else would change with a pull
+    // request that touches only that other file, which isReviewInstructionPath cannot see: they are not read.
+    if (j.path !== path) return null;
     const text = Buffer.from(j.content, "base64").toString("utf8");
     return text.length > maxBytes ? `${text.slice(0, maxBytes)}\n[cut: the file is longer than ${maxBytes} bytes]` : text;
   } catch (err) {
