@@ -232,11 +232,12 @@ export class AgentEngine {
     const binding = request.repo ? await bindRepo(await sandbox(), request.repo, { signal }) : null;
     // The repository's own skills, listed after everything else (the list's cap
     // drops them first) and served by load_skill like the others; a name already
-    // in use belongs to whoever has it.
+    // in use belongs to whoever has it. Their staged copies live under the run's
+    // work root, which the run removes when it ends.
     const repoProgressive = binding && PROGRESSIVE_SKILLS_ENABLED && loadSkillAllowed && binding.skills.length
       ? (() => {
           const taken = new Set([...Object.keys(allSkills), ...defaultProgressive.map((s) => s.name), ...pluginSkills.map((s) => s.name)]);
-          const candidates = repoSkillsToList(binding.skills, binding.path, taken, sandbox, signal);
+          const candidates = repoSkillsToList(binding.skills, binding.path, taken, sandbox, path.join(pluginWorkRoot, "repo-skills"), signal);
           const fits = new Set(listProgressiveSkills([...defaultProgressive, ...pluginProgressive, ...candidates], sessionDir, loadSkillAllowed).listed.map((s) => s.name));
           return candidates.filter((s) => fits.has(s.name));
         })()

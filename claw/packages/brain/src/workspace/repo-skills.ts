@@ -13,7 +13,6 @@
  * the prompt says so.
  */
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { createPrivateStagingRoot } from "../tasks/plugin-from-message.js";
 import { SKILL_NAME_RE, skillDescription, type DefaultSkill } from "../agent/platform-defaults.js";
@@ -79,11 +78,14 @@ export function parseRepoSkills(out: string, repoDir: string): RepoSkill[] {
 
 /**
  * Copies a repository skill's regular files out of the sandbox into a fresh private
- * directory on Brain and returns it, for `load_skill` to serve. Links are neither
+ * directory under `stagingRoot` on Brain and returns it, for `load_skill` to serve. The
+ * caller owns `stagingRoot` and removes it when the run ends. Links are neither
  * followed nor copied; the copy is bounded in files and bytes, and a skill whose
  * directory has left the repository since it was listed is refused.
  */
-export async function stageRepoSkill(hands: RepoHands, repoDir: string, skill: RepoSkill, signal?: AbortSignal): Promise<string> {
+export async function stageRepoSkill(
+  hands: RepoHands, repoDir: string, skill: RepoSkill, stagingRoot: string, signal?: AbortSignal,
+): Promise<string> {
   const command = [
     `RD=$(realpath -e -- ${shq(repoDir)} 2>/dev/null) || exit 3; S=${shq(skill.dir)};`,
     `[ -L "$S" ] && exit 3; rs=$(realpath -e -- "$S" 2>/dev/null); case "$rs" in "$RD"/*) ;; *) exit 3;; esac;`,
@@ -103,7 +105,7 @@ export async function stageRepoSkill(hands: RepoHands, repoDir: string, skill: R
     files.push({ rel, data: Buffer.from(m[2], "base64") });
   }
   if (!files.some((f) => f.rel === "SKILL.md")) throw new Error(`${skill.dir}/SKILL.md could not be read`);
-  const root = createPrivateStagingRoot(path.join(os.tmpdir(), "claw-repo-skills"));
+  const root = createPrivateStagingRoot(stagingRoot);
   const dir = fs.mkdtempSync(path.join(root, `${skill.name}-`));
   for (const f of files) {
     const dest = path.join(dir, ...f.rel.split("/"));
@@ -121,7 +123,7 @@ export async function stageRepoSkill(hands: RepoHands, repoDir: string, skill: R
  */
 export function repoSkillsToList(
   skills: RepoSkill[], repoDir: string, taken: Set<string>,
-  sandbox: () => Promise<RepoHands>, signal?: AbortSignal,
+  sandbox: () => Promise<RepoHands>, stagingRoot: string, signal?: AbortSignal,
 ): DefaultSkill[] {
   return skills.filter((s) => !taken.has(s.name)).map((s) => ({
     name: s.name,
@@ -129,7 +131,7 @@ export function repoSkillsToList(
     toolId: 0,
     // Nothing is staged until the skill is loaded: SkillStore stages a skill whose directory does not exist.
     localDir: "",
-    restage: async () => stageRepoSkill(await sandbox(), repoDir, s, signal),
+    restage: async () => stageRepoSkill(await sandbox(), repoDir, s, stagingRoot, signal),
     source: "repo" as const,
     sandboxDir: s.dir,
   }));

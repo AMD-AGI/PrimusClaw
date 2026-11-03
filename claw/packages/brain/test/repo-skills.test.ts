@@ -11,7 +11,7 @@
  *   K2 staging: regular files only, bounded, nothing from outside the repository
  *   K3 the engine: listed as [repository] after the others, a name in use is not taken,
  *      load_skill serves it from the staged copy with the repository's path, the
- *      sandbox's .skills/ is never written for it
+ *      sandbox's .skills/ is never written for it, and the staged copy goes with the run
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -88,7 +88,9 @@ test("K2 staging: regular files of the skill only, bounded, and nothing from out
   write(world, { "secret.txt": "SANDBOX-SECRET", "evil/SKILL.md": "EVIL" });
   fs.symlinkSync(path.join(world, "secret.txt"), path.join(repo, ".claude/skills/fmt/leak.txt"));
   const skill = { name: "fmt", description: "d", dir: path.join(repo, ".claude/skills/fmt") };
-  const dir = await stageRepoSkill(realHands, repo, skill);
+  const staging = path.join(world, "staging");
+  const dir = await stageRepoSkill(realHands, repo, skill, staging);
+  assert.ok(dir.startsWith(`${staging}${path.sep}`), "under the root the caller gave");
   const files = (d: string): string[] => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? files(path.join(d, e.name)).map((f) => `${e.name}/${f}`) : [e.name]).sort();
   assert.deepEqual(files(dir), ["SKILL.md", "scripts/run.sh"]);
   assert.ok(fs.readFileSync(path.join(dir, "SKILL.md"), "utf8").includes("FMT-BODY"));
@@ -97,8 +99,8 @@ test("K2 staging: regular files of the skill only, bounded, and nothing from out
   // Listed, then replaced by a link out of the repository: refused, nothing read.
   fs.rmSync(skill.dir, { recursive: true });
   fs.symlinkSync(path.join(world, "evil"), skill.dir);
-  await assert.rejects(() => stageRepoSkill(realHands, repo, skill), /could not be read/);
-  await assert.rejects(() => stageRepoSkill(realHands, repo, { ...skill, dir: path.join(world, "evil") }), /could not be read/);
+  await assert.rejects(() => stageRepoSkill(realHands, repo, skill, staging), /could not be read/);
+  await assert.rejects(() => stageRepoSkill(realHands, repo, { ...skill, dir: path.join(world, "evil") }, staging), /could not be read/);
 });
 
 // --- K3: the engine ---------------------------------------------------------------------
@@ -138,7 +140,12 @@ function boundHands() {
 test("K3 the engine lists them as [repository] after the others, keeps a name in use, and load_skill serves them", async () => {
   const hands = boundHands();
   world.llmBodies.length = 0;
-  world.script([{ tool: "load_skill", input: { name: "deploy-check" } }, { text: "done" }]);
+  const stagedUnder = path.join(os.tmpdir(), "claw-plugin-work", "s-k3", "repo-skills");
+  let stagedDuringRun: string[] = [];
+  world.script([
+    { tool: "load_skill", input: { name: "deploy-check" } },
+    () => { stagedDuringRun = fs.existsSync(stagedUnder) ? fs.readdirSync(stagedUnder) : []; return { text: "done" }; },
+  ]);
   const result = await new AgentEngine().execute(
     baseRequest({ session_id: "s-k3", repo: { url: URL } }), (async () => {}) as never, undefined, null as never,
     { attachHands: async () => hands as never } as never,
@@ -159,4 +166,6 @@ test("K3 the engine lists them as [repository] after the others, keeps a name in
   assert.ok(second.includes(`use bash on its path under ${REPO}/.claude/skills/deploy-check/ (it is part of the repository)`));
   assert.equal(hands.commands.filter((c) => /CLAW-REPO-SKILL-FILE/.test(c)).length, 1, "staged once, when loaded");
   assert.equal(hands.commands.some((c) => c.startsWith("write:") && c.includes(".skills/deploy-check")), false, "never written to .skills/");
+  assert.equal(stagedDuringRun.length, 1, "staged under the run's work root");
+  assert.equal(fs.existsSync(stagedUnder), false, "and gone with the run");
 });
