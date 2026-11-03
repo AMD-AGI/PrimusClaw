@@ -156,6 +156,15 @@ jobs:
 
       - run: bash scripts/release-tests/sandbox-router-ingress.sh
 
+  claw-extra-values:
+    name: Claw deploy extra values (env, ConfigMap and Secret mounts)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - run: bash scripts/release-tests/extra-values.sh
+
   litellm-existing-secret:
     name: LiteLLM existingSecret handling
     runs-on: ubuntu-latest

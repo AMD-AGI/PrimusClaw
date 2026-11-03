@@ -11,6 +11,7 @@ import { submitSessionMessage } from "../sessions/submit-message.js";
 import { CLAW_GITHUB_REVIEW_ENABLED, SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
 import { actingTurnRefusalFor } from "../github-review/acting-turns.js";
 import { parseActingAs } from "../github-review/acting-as.js";
+import { parseReviewTarget } from "../github-review/review-target.js";
 import { classifyAttendedCaller } from "../github-review/attended.js";
 import { readGithubReviewSettings } from "../github-review/settings.js";
 import {
@@ -1143,6 +1144,15 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       }
       // The requester's name for the review footer, from the verified caller.
       sessionConfig.acting_as_requester = (user.userName || user.userId).slice(0, 100);
+    }
+    // The one pull request the session's review tools may touch. It is only ever set here, and it binds nothing without `acting_as`, which
+    // is why asking for it without one is refused rather than silently ignored.
+    const parsedTarget = parseReviewTarget(sessionConfig.review_target);
+    if (!parsedTarget.ok) {
+      return reply.status(400).send({ ok: false, error: parsedTarget.error });
+    }
+    if (parsedTarget.target !== null && parsedActingAs.actingAs === null) {
+      return reply.status(400).send({ ok: false, error: "config.review_target needs config.acting_as" });
     }
 
     // The model this session's turns ask for. Checked here, before any row or

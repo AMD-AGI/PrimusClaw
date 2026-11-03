@@ -136,7 +136,7 @@ describe("B a tool call", () => {
     const c = await connect(token());
     const r = await call(c, "gh_review_submit", { pr: PR, head_sha: HEAD, event: "COMMENT", body: "Fine." });
     assert.equal(r.isError, false, r.text);
-    assert.match(String(e.gh.writes[0]?.body.body), /Reviewed by Clawy on behalf of bob \(requested by Alice A\)/);
+    assert.match(String(e.gh.writes[0]?.body.body), /Reviewed by Claw on behalf of bob \(requested by Alice A\)/);
     await c.close();
   });
 
@@ -148,14 +148,15 @@ describe("B a tool call", () => {
     await c.close();
   });
 
-  test("B6 gh_review_submit takes the same risk_flags as gh_pr_merge, and a flagged APPROVE is refused through MCP too", async () => {
+  test("B6 gh_review_submit takes the same risk_flags as gh_pr_merge, and a flagged APPROVE is held for the acting user through MCP too", async () => {
     e.identity.answer = async () => credential({ delegation: true });
     const c = await connect(token());
     const tool = (await c.listTools()).tools.find((t) => t.name === "gh_review_submit");
     assert.ok(tool && "risk_flags" in ((tool.inputSchema as { properties?: Record<string, unknown> }).properties ?? {}));
     const flagged = await call(c, "gh_review_submit", { pr: PR, head_sha: HEAD, event: "APPROVE", body: "Fine.", risk_flags: ["security_finding"] });
-    assert.equal(flagged.isError, true);
-    assert.equal(flagged.body.reason, "high_risk_approval");
+    assert.equal(flagged.isError, false, flagged.text);
+    assert.deepEqual([flagged.body.status, flagged.body.kind], ["confirmation_required", "review"]);
+    assert.match(String((flagged.body.reasons as string[]).join()), /security issue/);
     const unknown = await c.callTool({ name: "gh_review_submit", arguments: { pr: PR, head_sha: HEAD, event: "APPROVE", body: "Fine.", risk_flags: ["whatever"] } }) as { isError?: boolean };
     assert.equal(unknown.isError, true);
     assert.equal(e.gh.writes.length, 0);
@@ -193,6 +194,63 @@ describe("B a tool call", () => {
   });
 });
 
+describe("E a session bound to one pull request, over the wire", () => {
+  const target = { owner: "AMD-AGI", repo: "demo", number: 7 };
+  const bind = (review_target: unknown) =>
+    e.sql("UPDATE claw_sessions SET config = config || $1::jsonb WHERE session_id = 's-1'", [JSON.stringify({ review_target })]);
+  beforeEach(async () => { await boot(); });
+
+  test("E1 the tool route takes the binding from the session row: another pull request is refused as review_target_mismatch, the bound one is read", async () => {
+    await bind(target);
+    const c = await connect(token());
+    for (const pr of ["AMD-AGI/demo#8", "AMD-AGI/other#7", "https://github.com/AMD-AGI/demo/pull/9"]) {
+      for (const [name, args] of [["gh_pr_get", { pr }], ["gh_review_submit", { pr, head_sha: HEAD, event: "COMMENT", body: "x" }], ["gh_pr_merge", { pr, head_sha: HEAD }]] as const) {
+        const r = await call(c, name, args);
+        assert.equal(r.isError, true, `${name} ${pr}`);
+        assert.equal(r.body.reason, "review_target_mismatch", `${name} ${pr}`);
+        assert.equal(r.body.review_target, "AMD-AGI/demo#7");
+      }
+    }
+    assert.equal(e.gh.calls.length, 0);
+    assert.equal(e.resolved.length, 0);
+    const ok = await call(c, "gh_pr_get", { pr: PR });
+    assert.equal(ok.isError, false, ok.text);
+    await c.close();
+  });
+
+  test("E2 a target that is there and cannot be read is not 'no target': the route answers 403 review_target_invalid and nothing is reached", async () => {
+    for (const unreadable of [{ owner: "AMD-AGI" }, "AMD-AGI/demo#7", { ...target, number: 0 }, { ...target, extra: 1 }]) {
+      await bind(unreadable);
+      const r = await fetch(`${base}/v1/internal/github-review/mcp`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${token()}` }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) });
+      assert.equal(r.status, 403, JSON.stringify(unreadable));
+      assert.deepEqual(await r.json(), { ok: false, error: "review_target_invalid" }, JSON.stringify(unreadable));
+    }
+    assert.equal(e.gh.calls.length, 0);
+    assert.equal(e.resolved.length, 0);
+  });
+
+  test("E3 a session with no target is as it was: any pull request of an allowed owner", async () => {
+    const c = await connect(token());
+    assert.equal((await call(c, "gh_pr_get", { pr: "AMD-AGI/demo#8" })).isError, false);
+    await bind(null);
+    assert.equal((await call(c, "gh_pr_get", { pr: "AMD-AGI/other#9" })).isError, false);
+    await c.close();
+  });
+
+  test("E4 a held review is listed with its kind and what it would post, so a card can show it", async () => {
+    e.identity.answer = async () => credential({ delegation: true });
+    const c = await connect(token());
+    const held = await call(c, "gh_review_submit", { pr: PR, head_sha: HEAD, event: "APPROVE", body: "Please fix.", risk_flags: ["security_finding"], comments: [{ path: "src/app.ts", line: 3, body: "here" }] });
+    assert.equal(held.body.status, "confirmation_required");
+    await c.close();
+    const r = await fetch(`${base}/v1/github-review/confirmations?session_id=s-1&status=pending`, { headers: { "x-test-user": "u-bob" } });
+    const item = ((await r.json()) as any).items[0];
+    assert.equal(item.kind, "review");
+    assert.deepEqual(item.review, { event: "APPROVE", body: "Please fix.", comments: [{ path: "src/app.ts", line: 3, side: "RIGHT", body: "here" }] });
+    assert.equal(item.id, held.body.confirmation_id);
+  });
+});
+
 describe("C confirmations over HTTP", () => {
   beforeEach(async () => {
     await boot();
@@ -215,7 +273,9 @@ describe("C confirmations over HTTP", () => {
       assert.equal(r.status, 200, who);
       assert.equal(r.body.items.length, 1, who);
       const item = r.body.items[0];
-      assert.deepEqual(Object.keys(item).sort(), ["actor_user_id", "author", "checks", "decided_by", "decided_via", "expires_at", "head_sha", "id", "pr", "reasons", "repo", "requester_user_id", "session_id", "status", "title"]);
+      assert.deepEqual(Object.keys(item).sort(), ["actor_user_id", "author", "checks", "decided_by", "decided_via", "expires_at", "head_sha", "id", "kind", "pr", "reasons", "repo", "requester_user_id", "review", "session_id", "status", "title"]);
+      assert.equal(item.kind, "merge");
+      assert.equal(item.review, null, "a merge holds no review");
       assert.equal(item.decided_by, null, "nobody has answered it yet");
       assert.equal(item.decided_via, null);
       assert.equal(item.repo, "AMD-AGI/demo");
@@ -246,6 +306,38 @@ describe("C confirmations over HTTP", () => {
     const again = await http("u-bob", "POST", path, { decision: "allow" });
     assert.equal(again.body.status, "refused");
     assert.equal(e.gh.calls.filter((x) => x.method === "PUT").length, 1);
+  });
+});
+
+describe("C4 a merge into a branch with a merge queue, over HTTP", () => {
+  beforeEach(async () => {
+    await boot();
+    e.identity.answer = async () => credential({ delegation: true });
+    e.gh.files = [{ filename: ".github/workflows/ci.yml", status: "modified", additions: 1, deletions: 0, patch: "@@ -1 +1,2 @@\n a\n+b" }];
+    e.gh.rules = [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "test" }] } }, { type: "merge_queue", parameters: {} }];
+  });
+  const http = async (user: string, method: string, path: string, body?: unknown) => {
+    const r = await fetch(base + path, { method, headers: { "x-test-user": user, ...(body === undefined ? {} : { "content-type": "application/json" }) }, body: body === undefined ? undefined : JSON.stringify(body) });
+    return { status: r.status, body: (await r.json().catch(() => null)) as any };
+  };
+
+  test("C4 the acting user's allow answers queued with the queue entry, the card is listed under status=queued, and nothing was merged", async () => {
+    const c = await connect(token());
+    const held = await call(c, "gh_pr_merge", { pr: PR, head_sha: HEAD });
+    assert.equal(held.body.status, "confirmation_required");
+    await c.close();
+    const id = held.body.confirmation_id as string;
+    const ok = await http("u-bob", "POST", `/v1/github-review/confirmations/${id}/decision`, { decision: "allow" });
+    assert.equal(ok.status, 200);
+    assert.deepEqual(ok.body, { ok: true, status: "queued", queue_entry_id: "MQE_kwDOdemo1", queue_position: 3, queue_state: "QUEUED", url: "https://github.com/AMD-AGI/demo/pull/7" });
+    assert.equal(e.gh.calls.filter((x) => x.method === "PUT").length, 0, "no direct merge");
+    assert.equal(e.gh.enqueues.length, 1);
+    const listed = await http("u-bob", "GET", "/v1/github-review/confirmations?session_id=s-1&status=queued");
+    assert.equal(listed.status, 200);
+    assert.deepEqual(listed.body.items.map((i: any) => [i.id, i.status]), [[id, "queued"]]);
+    assert.equal((await http("u-bob", "GET", "/v1/github-review/confirmations?session_id=s-1&status=pending")).body.items.length, 0);
+    assert.equal((await http("u-bob", "POST", `/v1/github-review/confirmations/${id}/decision`, { decision: "allow" })).body.status, "refused");
+    assert.equal(e.gh.enqueues.length, 1);
   });
 });
 

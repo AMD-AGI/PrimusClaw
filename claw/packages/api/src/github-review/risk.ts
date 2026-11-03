@@ -28,13 +28,17 @@
  * hold for a human, not a security scan.
  *
  * What the repository itself says comes from the BASE branch only (see
- * {@link parseClawyConfig}); a pull request that edits that file is high risk.
+ * {@link parseRepoConfig}); a pull request that edits that file is high risk.
  */
+import { LEGACY_REPO_CONFIG_STEM } from "./legacy-names.js";
 import { MAX_READ_CHARS, MAX_READ_LINES, contentFindings, isDoc, isSource, isTest, rawHead, readChange, type Finding, type RiskCategory } from "./risk-signals.js";
 
 export type { Finding, RiskCategory } from "./risk-signals.js";
 
-export const RISK_RULE_PACK_VERSION = "2026-10-31.1";
+export const RISK_RULE_PACK_VERSION = "2026-11-02.1";
+
+/** The repository's own configuration file, read from the base branch ({@link parseRepoConfig}). */
+export const REPO_CONFIG_PATH = ".github/claw-review.yml";
 
 /** What the reviewing model says about the change after reading it. It can only raise the verdict. */
 export interface ReviewerJudgement {
@@ -138,7 +142,7 @@ const MAX_REASONS = 20;
 
 const GOVERNANCE_PATHS: RegExp[] = [
   /^\.github\/(workflows|actions|scripts|codeql)\//i,
-  /^\.github\/(CODEOWNERS|dependabot\.ya?ml|copilot-instructions\.md|clawy\.ya?ml)$/i,
+  new RegExp(`^\\.github\\/(CODEOWNERS|dependabot\\.ya?ml|copilot-instructions\\.md|claw-review\\.ya?ml|${LEGACY_REPO_CONFIG_STEM}\\.ya?ml)$`, "i"),
   /^(CODEOWNERS|SECURITY\.md|REUSE\.toml|LICENSE[^/]*|COPYING[^/]*)$/i,
   /(^|\/)(AGENTS|CLAUDE)\.md$/i,
   /^\.(claude|agents|codex|cursor)\//i,
@@ -245,8 +249,8 @@ function listItemValue(line: string): string | null {
 }
 
 /**
- * The optional `.github/clawy.yml` of the base branch. Only two keys exist, and
- * only the plain shape is read:
+ * The optional {@link REPO_CONFIG_PATH} of the base branch (an earlier release read another name, see legacy-names.ts, which
+ * is still read when this one is absent). Only two keys exist, and only the plain shape is read:
  *
  *     confirm_merge: always        # or: risk
  *     high_risk_paths:
@@ -256,7 +260,7 @@ function listItemValue(line: string): string | null {
  * high risk: a repository that wrote something this does not understand has not
  * been read.
  */
-export function parseClawyConfig(text: string): RepoConfig | "invalid" {
+export function parseRepoConfig(text: string): RepoConfig | "invalid" {
   const config: RepoConfig = { confirmMerge: "risk", highRiskPaths: [] };
   let inPaths = false;
   for (const raw of text.split(/\r?\n/)) {
@@ -313,7 +317,7 @@ function assess(input: RiskInput): Finding[] {
   }
   if (input.baseRef !== input.defaultBranch) add("provenance", `the base branch is ${input.baseRef}, not the default branch ${input.defaultBranch}`);
 
-  if (input.repoConfig === "invalid") add("provenance", "the repository's .github/clawy.yml could not be read");
+  if (input.repoConfig === "invalid") add("provenance", `the repository's ${REPO_CONFIG_PATH} could not be read`);
   const extra = input.repoConfig && input.repoConfig !== "invalid" ? input.repoConfig : null;
   if (extra?.confirmMerge === "always") add("provenance", "the repository asks for confirmation on every merge");
   const extraGlobs = (extra?.highRiskPaths ?? []).map(globToRegExp);
