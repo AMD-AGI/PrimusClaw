@@ -27,6 +27,7 @@ import { CLAW_ASSISTANT_ENABLED, CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED
 import { skipsSkillSelection } from "../assistant/role-profile.js";
 import { deliverUnsaidAnswer } from "../assistant/router-turn-end.js";
 import { recordWorkerTurnEnd } from "../assistant/turn-end.js";
+import { sessionWithholdsMemory } from "../github-review/session-tools.js";
 import { a2aPushEnabled } from "../routes/a2a-flags.js";
 import { recordSessionEvent as recordA2aPushEvent } from "../routes/a2a-push.js";
 import { recordApprovalRequested, recordRunFinished } from "../notifications/outbox.js";
@@ -938,6 +939,9 @@ async function handleComplete(
   // run.completed / run.failed notification. Everything below that is such a
   // side effect is gated on this one answer, or follows the early return.
   const sandboxOnly = messageId !== null && await isSandboxOnlyRun(sessionId, messageId);
+  // A session that acts as a user saves nothing to its requester's memory, from the model's `save_memory` or from what is extracted
+  // from its conversation, which is what strangers wrote (`sessionWithholdsMemory`).
+  const memoryWithheld = await sessionWithholdsMemory(sessionId);
   const gateOpened = await releaseSessionGateIfLastRun(
     sessionId, gateTurn, Boolean(failed),
     provenance !== "foreign" ? provenance : null,
@@ -951,7 +955,7 @@ async function handleComplete(
   // Brain's save_memory tool stays in the schema, so the LLM may still call it;
   // this is the silent-discard contract documented in the feature flag.
   let explicitMemorySaved = false;
-  const memoriesToSave = sandboxOnly ? [] : (event as any).memories_to_save || [];
+  const memoriesToSave = sandboxOnly || memoryWithheld ? [] : (event as any).memories_to_save || [];
   if (!CLAW_MEMORY_ENABLED) {
     if (memoriesToSave.length) {
       logger.warn({ sessionId, count: memoriesToSave.length }, "memory.write_skipped_flag_off");
@@ -1165,7 +1169,7 @@ async function handleComplete(
   setImmediate(() => {
     completionPorts.maybeSummarize(sessionId, userId).catch(err =>
       logger.error({ err, sessionId }, "summarize_failed"));
-    if (CLAW_MEMORY_ENABLED && !explicitMemorySaved) {
+    if (CLAW_MEMORY_ENABLED && !explicitMemorySaved && !memoryWithheld) {
       completionPorts.maybeExtractMemory(sessionId, userId).catch(err =>
         logger.error({ err, sessionId }, "memory.extraction_failed"));
     }
