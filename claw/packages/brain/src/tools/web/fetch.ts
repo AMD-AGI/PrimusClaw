@@ -41,8 +41,8 @@ const MAX_REDIRECTS = 10;
 /**
  * Addresses web_fetch never connects to: loopback, private, link-local (cloud
  * metadata), CGNAT -- the blocks cluster Service and Pod ranges are drawn from --
- * documentation and reserved ranges, and the IPv6 forms that embed or route to them.
- * BlockList also matches IPv4-mapped IPv6 (::ffff:a.b.c.d) against the IPv4 rules.
+ * documentation and reserved ranges, and the IPv6 forms that route to them.
+ * IPv6 forms that carry an IPv4 address are judged by that address: see embeddedIPv4.
  */
 const BLOCKED_ADDRESSES = (() => {
   const list = new net.BlockList();
@@ -53,17 +53,59 @@ const BLOCKED_ADDRESSES = (() => {
     ["224.0.0.0", 3],
   ] as const) list.addSubnet(prefix, bits, "ipv4");
   for (const [prefix, bits] of [
-    ["::", 128], ["::1", 128], ["64:ff9b::", 96], ["64:ff9b:1::", 48], ["100::", 64],
+    ["64:ff9b:1::", 48], ["100::", 64],
     ["2001::", 32], ["2001:db8::", 32], ["2002::", 16], ["fc00::", 7], ["fe80::", 10],
     ["fec0::", 10], ["ff00::", 8],
   ] as const) list.addSubnet(prefix, bits, "ipv6");
   return list;
 })();
 
+/** The 16 bytes of an IPv6 address, including a dotted IPv4 tail. */
+function ipv6Bytes(ip: string): number[] {
+  let text = ip;
+  const tail: number[] = [];
+  const dotted = text.match(/^(.*:)(\d+\.\d+\.\d+\.\d+)$/);
+  if (dotted) {
+    text = dotted[1].endsWith("::") ? dotted[1] : dotted[1].slice(0, -1);
+    const v4 = dotted[2].split(".").map(Number);
+    tail.push(v4[0], v4[1], v4[2], v4[3]);
+  }
+  const [head, rest] = text.split("::");
+  const groups = (part?: string) => (part ? part.split(":").filter(Boolean).map((g) => parseInt(g, 16)) : []);
+  const left = groups(head);
+  const right = rest === undefined ? [] : groups(rest);
+  const missing = 8 - tail.length / 2 - left.length - right.length;
+  const words = [...left, ...Array(rest === undefined ? 0 : missing).fill(0), ...right];
+  return [...words.flatMap((w) => [w >> 8, w & 0xff]), ...tail];
+}
+
+/**
+ * The IPv4 address an IPv6 address carries in its last 32 bits, for the forms
+ * that do: IPv4-compatible (::/96, deprecated, so `[::169.254.169.254]` is
+ * the metadata address), IPv4-mapped (::ffff:0:0/96), IPv4-translated
+ * (::ffff:0:0:0/96) and NAT64 (64:ff9b::/96).
+ */
+function embeddedIPv4(ip: string): string | null {
+  const b = ipv6Bytes(ip);
+  const prefix = b.slice(0, 12);
+  const zero = (xs: number[]) => xs.every((x) => x === 0);
+  const carries =
+    zero(prefix)
+    || (zero(prefix.slice(0, 10)) && prefix[10] === 0xff && prefix[11] === 0xff)
+    || (zero(prefix.slice(0, 8)) && prefix[8] === 0xff && prefix[9] === 0xff && zero(prefix.slice(10)))
+    || (b[0] === 0x00 && b[1] === 0x64 && b[2] === 0xff && b[3] === 0x9b && zero(prefix.slice(4)));
+  return carries ? b.slice(12).join(".") : null;
+}
+
 export function isBlockedAddress(ip: string): boolean {
   const family = net.isIP(ip);
   if (family === 0) return true;
-  return BLOCKED_ADDRESSES.check(ip, family === 6 ? "ipv6" : "ipv4");
+  if (family === 6) {
+    const v4 = embeddedIPv4(ip);
+    if (v4 !== null) return BLOCKED_ADDRESSES.check(v4, "ipv4");
+    return BLOCKED_ADDRESSES.check(ip, "ipv6");
+  }
+  return BLOCKED_ADDRESSES.check(ip, "ipv4");
 }
 
 /** Names that only mean something inside a cluster or a host, refused before any lookup. */

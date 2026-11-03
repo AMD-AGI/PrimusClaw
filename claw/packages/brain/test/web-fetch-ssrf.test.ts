@@ -29,6 +29,14 @@ test("address ranges: inward addresses are blocked, public ones are not", () => 
     ["::ffff:169.254.169.254", true],
     ["::ffff:a9fe:a9fe", true],      // the same, hex-mapped
     ["64:ff9b::a9fe:a9fe", true],    // NAT64 of the metadata address
+    ["::169.254.169.254", true],     // IPv4-compatible (::/96) form of the metadata address
+    ["::a9fe:a9fe", true],           // the same, as the URL parser normalises it
+    ["::a00:1", true],               // IPv4-compatible 10.0.0.1
+    ["::ffff:10.96.0.1", true],
+    ["::ffff:0:a9fe:a9fe", true],    // IPv4-translated (::ffff:0:0:0/96)
+    ["64:ff9b::7f00:1", true],       // NAT64 of loopback
+    ["::ffff:808:808", false],       // mapped public 8.8.8.8 is judged as 8.8.8.8
+    ["64:ff9b::808:808", false],     // NAT64 of public 8.8.8.8
     ["fe80::1", true],
     ["fd00::1", true],
     ["not-an-ip", true],
@@ -67,6 +75,13 @@ test("the connect-time lookup refuses a name that resolves inward, and resolves 
   const ok = await lookupOnce(guardedLookup(outward.resolve), "example.com");
   assert.equal(ok.err, null);
   assert.equal(ok.address, "93.184.215.14");
+});
+
+test("a name whose AAAA answer carries an inward IPv4 address is refused", async () => {
+  for (const address of ["::a9fe:a9fe", "::ffff:a9fe:a9fe", "64:ff9b::a9fe:a9fe", "::a00:1"]) {
+    const r = await lookupOnce(guardedLookup(stubResolver([{ address, family: 6 }]).resolve), "v6.example.com");
+    assert.match(String(r.err?.message), /^SSRF: /, `${address} -> ${r.err?.message} / ${String(r.address)}`);
+  }
 });
 
 // A plain TCP listener on loopback: whatever the guard lets through shows up as a connection.
