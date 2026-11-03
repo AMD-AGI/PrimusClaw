@@ -2392,7 +2392,7 @@ class AgentLoopRunner {
         parentRouter: this.router,
         onEvent: this.onEvent,
         signal: this.signal,
-        model: picked.model, apiUrl: this.apiUrl, apiKey: this.apiKey,
+        model: picked.model, fallbackModel: picked.fallback, apiUrl: this.apiUrl, apiKey: this.apiKey,
         maxTurns: SUB_AGENT_MAX_TURNS > 0 ? SUB_AGENT_MAX_TURNS : this.maxTurns,
         userId: this.userId, sessionId: this.sessionId,
         depth: this.depth + 1,

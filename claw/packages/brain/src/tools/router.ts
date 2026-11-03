@@ -102,6 +102,9 @@ const LOOP_INTERCEPTED_TOOLS = new Set([
   "ask_user_question",
 ]);
 
+/** The `task` tool's `model` value that keeps a sub-agent on the run's own model. */
+export const INHERIT_MODEL = "inherit";
+
 /** The tool that hands the model a skill the prompt listed; offered only when one is listed. */
 function loadSkillSchema(): ToolSchema {
   return {
@@ -777,8 +780,8 @@ export class ToolRouter {
           // enum of nothing would be a field the model can only get wrong.
           ...(SUB_AGENT_MODELS.length ? { model: {
             type: "string",
-            enum: [...SUB_AGENT_MODELS],
-            description: "Optional: the model this sub-agent runs on. Omit to use the default (a lighter model for explore/readonly where one is configured, otherwise your own). Pick a lighter one for broad reading and searching, your own for work that needs judgement.",
+            enum: [...SUB_AGENT_MODELS, INHERIT_MODEL],
+            description: `Optional: the model this sub-agent runs on; "${INHERIT_MODEL}" runs it on your own. Omit to use the default (a lighter model for explore/readonly where one is configured, otherwise your own). Pick a lighter one for broad reading and searching, "${INHERIT_MODEL}" for work that needs judgement.`,
           } } : {}),
         },
         required: ["description", "prompt"],

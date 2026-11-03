@@ -49,10 +49,20 @@ function scripted(turns: Turn[]): LlmSession & { sent: Message[][] } {
 
 /** Sub-agents open their session through the provider: record the model each was opened with. */
 const opened: string[] = [];
+/** Models the gateway refuses for this key, with the status it answers. */
+const refused = new Map<string, number>();
 const originalAnthropic = AnthropicProvider.prototype.createSession;
 const originalOpenAi = OpenAiProvider.prototype.createSession;
 before(() => {
-  const create = (opts: LlmSessionOptions) => { opened.push(opts.model); return scripted([say("sub done")]); };
+  const create = (opts: LlmSessionOptions) => {
+    opened.push(opts.model);
+    const status = refused.get(opts.model);
+    if (status === undefined) return scripted([say("sub done")]);
+    return {
+      async streamTurn() { throw Object.assign(new Error(`${status} key may not call ${opts.model}`), { status }); },
+      async complete() { return "summary"; },
+    };
+  };
   AnthropicProvider.prototype.createSession = create as never;
   OpenAiProvider.prototype.createSession = create as never;
 });
@@ -68,29 +78,30 @@ function resultOf(session: { sent: Message[][] }, id: string): string {
   return String(block?.content);
 }
 
-const PICK_ROWS: Array<{ name: string; requested: unknown; type: SubagentType; want: string | RegExp }> = [
-  { name: "nothing named, a reading profile: the reading default", requested: undefined, type: "explore", want: "light-model" },
-  { name: "nothing named, readonly: the reading default", requested: "", type: "readonly", want: "light-model" },
-  { name: "nothing named, a working profile: the run's own", requested: undefined, type: "generalPurpose", want: "run-model" },
-  { name: "nothing named, shell: the run's own", requested: undefined, type: "shell", want: "run-model" },
-  { name: "an offered model", requested: "other-model", type: "generalPurpose", want: "other-model" },
-  { name: "the run's own model, named", requested: "run-model", type: "explore", want: "run-model" },
-  { name: "a model not offered is refused", requested: "costly-model", type: "explore", want: /not offered.*run-model, light-model, other-model/ },
+const PICK_ROWS: Array<{ name: string; requested: unknown; type: SubagentType; want: { model: string; fallback?: string } | RegExp }> = [
+  { name: "nothing named, a reading profile: the reading default, the run's own behind it", requested: undefined, type: "explore", want: { model: "light-model", fallback: "run-model" } },
+  { name: "nothing named, readonly: the reading default", requested: "", type: "readonly", want: { model: "light-model", fallback: "run-model" } },
+  { name: "nothing named, a working profile: the run's own", requested: undefined, type: "generalPurpose", want: { model: "run-model" } },
+  { name: "nothing named, shell: the run's own", requested: undefined, type: "shell", want: { model: "run-model" } },
+  { name: "an offered model, which has no fallback", requested: "other-model", type: "generalPurpose", want: { model: "other-model" } },
+  { name: "the run's own model, named", requested: "run-model", type: "explore", want: { model: "run-model" } },
+  { name: "inherit keeps a reading profile on the run's own", requested: "inherit", type: "explore", want: { model: "run-model" } },
+  { name: "a model not offered is refused", requested: "costly-model", type: "explore", want: /not offered.*run-model, light-model, other-model, inherit/ },
   { name: "a non-string is refused", requested: 7, type: "explore", want: /not offered/ },
 ];
 
 for (const row of PICK_ROWS) {
   test(`pickSubagentModel: ${row.name}`, () => {
     const got = pickSubagentModel(row.requested, row.type, "run-model");
-    if (typeof row.want === "string") assert.deepEqual(got, { model: row.want });
-    else assert.match((got as { error: string }).error, row.want);
+    if (row.want instanceof RegExp) assert.match((got as { error: string }).error, row.want);
+    else assert.deepEqual(got, row.want);
   });
 }
 
 test("the task schema offers exactly the configured models", () => {
   const task = new ToolRouter(null, new Map()).allToolSchemas().find((t) => t.name === "task")!;
   const model = (task.input_schema as { properties: Record<string, { enum?: string[] }> }).properties.model;
-  assert.deepEqual(model?.enum, ["light-model", "other-model"]);
+  assert.deepEqual(model?.enum, ["light-model", "other-model", "inherit"]);
 });
 
 function parentOptions(session: LlmSession, router: unknown): LoopOptions {
@@ -159,3 +170,32 @@ test("reads emitted together run together; a write waits for them and runs alone
   assert.equal(resultOf(parent, "r1"), "read ok");
   assert.equal(resultOf(parent, "w1"), "write ok");
 });
+
+const FALLBACK_ROWS: Array<{ name: string; input: Record<string, unknown>; status: number; refuse: string; opened: string[]; result: RegExp }> = [
+  { name: "a default the key cannot reach falls back to the run's model", input: { subagent_type: "explore" }, status: 403, refuse: "light-model", opened: ["light-model", "run-model"], result: /^sub done$/ },
+  { name: "so does a default the gateway does not know", input: { subagent_type: "readonly" }, status: 404, refuse: "light-model", opened: ["light-model", "run-model"], result: /^sub done$/ },
+  // The call chose this model: falling back would hide that its choice did not happen.
+  { name: "a model the call named does not", input: { subagent_type: "explore", model: "other-model" }, status: 403, refuse: "other-model", opened: ["other-model"], result: /Sub-agent failed: 403/ },
+  // Not a refusal of the model: running again elsewhere would hide a real failure.
+  { name: "a failure that is not a refusal does not", input: { subagent_type: "explore" }, status: 500, refuse: "light-model", opened: ["light-model"], result: /Sub-agent failed: 500/ },
+];
+
+for (const row of FALLBACK_ROWS) {
+  test(`sub-agent default model: ${row.name}`, async () => {
+    opened.length = 0;
+    refused.clear();
+    refused.set(row.refuse, row.status);
+    try {
+      const parent = scripted([
+        { content: [toolUse("t1", "task", { description: "a", prompt: "p", ...row.input })], stopReason: "tool_use" },
+        say("all done"),
+      ]);
+      const router = new ToolRouter({} as HandsClient, new Map());
+      await agentLoop([{ role: "user", content: "go" } as Message], [taskSchema, readSchema("read")], parentOptions(parent, router));
+      assert.deepEqual(opened, row.opened);
+      assert.match(resultOf(parent, "t1"), row.result);
+    } finally {
+      refused.clear();
+    }
+  });
+}
