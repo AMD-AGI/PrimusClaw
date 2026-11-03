@@ -102,6 +102,8 @@ function scriptedFetch(bodies: Body[]) {
   return (async () => {
     const body = bodies[Math.min(i, bodies.length - 1)]!;
     i++;
+    // A read the platform answers with an error, not a workload.
+    if ("__http" in body) return { ok: false, status: body.__http as number, json: async () => ({}) };
     return { ok: true, status: 200, json: async () => body };
   }) as unknown as typeof fetch;
 }
@@ -545,6 +547,23 @@ test("a scale-up followed by the scheduler's account is still a node being added
       assert.deepEqual(p.waiting, { kind: "queued", reason: "the platform is adding a node for the sandbox" }, phase);
     }
   }
+});
+
+test("a read that says nothing about the workload leaves a scale-up in force", { timeout: 5000 }, async () => {
+  // An error from the platform, and a 2xx with no phase, between the scale-up and the scheduler's account
+  // that follows it: neither is the platform withdrawing the scale-up, so the node is still being waited for.
+  for (const blank of [{ __http: 503 }, {}, { phase: "" }]) {
+    const r = await run([scaleUpEvent(), blank, ...repeat(100, failedScheduling()), running], {
+      unschedulableTimeoutMs: 300_000, startTimeoutMs: 3_600_000,
+    });
+    assert.equal(r.ended, null, JSON.stringify(blank));
+    assert.ok(r.progress.every((p) => p.waiting?.kind !== "unscheduled"), JSON.stringify(blank));
+  }
+  // A readable status that is not a node being added does clear it: this is the contrast.
+  const cleared = await run([scaleUpEvent(), takenNotReady, ...repeat(100, failedScheduling())], {
+    unschedulableTimeoutMs: 300_000, startTimeoutMs: 3_600_000,
+  });
+  assert.equal(cleared.ended, "sandbox_unschedulable");
 });
 
 test("a scale-up that was seen is out of the short limit's clock, and the ceilings of the phase still apply", { timeout: 5000 }, async () => {

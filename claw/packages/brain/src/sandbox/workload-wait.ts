@@ -482,7 +482,9 @@ export async function waitForWorkloadReady(
     // ended on its own, shorter limit rather than on the long one meant for a
     // sandbox that is genuinely starting.
     const waiting = readWaitingState(detail, scaleUpSeen);
-    scaleUpSeen = waiting?.scalingUp === true;
+    // A body with no phase says nothing about the workload, so what was seen
+    // before it stands; any other read decides it.
+    if (phase) scaleUpSeen = waiting?.scalingUp === true;
     if (waiting?.kind === "unscheduled") {
       const t = now();
       if (unscheduledSince === null) {
