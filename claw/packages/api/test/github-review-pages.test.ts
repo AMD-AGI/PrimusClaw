@@ -18,6 +18,8 @@
  *   G10 an offset past the end of a section, or outside the named file, is refused: never an empty page that reads as the end
  *   G11 a file that is not in the change is refused, not answered with an empty diff
  *   G13 a pull request retargeted to another base branch, same head, refuses the page: the diff read is no longer the change
+ *   G14 a page is served only from a read that says what the overview's read said (read_id): a base branch that moved, or a read lost
+ *       from memory, is read again and refused when the change no longer reads the same
  *   G12 `file` with the offset the files index gives reads that file's part whole, in the whole diff's offsets
  */
 import assert from "node:assert/strict";
@@ -25,13 +27,21 @@ import test, { after, afterEach, beforeEach } from "node:test";
 import { PR_REVIEW_INSTRUCTIONS } from "../src/github-review/default-skill.js";
 import { PAGE_MAX_CHARS, diffText, fitPage } from "../src/github-review/pages.js";
 import type { RiskFile } from "../src/github-review/risk.js";
-import { HEAD, type FakeFile } from "./support/fake-github.js";
+import { BASE_TIP, HEAD, type FakeFile } from "./support/fake-github.js";
 import { PR, TOKEN, closeShared, readSection, reviewEnv, type ReviewEnv } from "./support/review-env.js";
 
 /** Brain's cut (brain/src/agent/agent-loop.ts): a longer result reaches the model with its middle missing. */
 const BRAIN_CUT = 6000;
 
 let e: ReviewEnv;
+/** The read_id of the last overview: a page continues it, as the model is told to pass it. */
+let lastReadId = "";
+/** `gh_pr_get` as the model calls it: a page carries the read_id of the last overview unless the test names one. */
+async function gp(actor: ReviewEnv["actor"], args: Record<string, unknown>) {
+  const o = await e.service.getPr(actor, args.head_sha !== undefined && args.read_id === undefined ? { ...args, read_id: lastReadId } : args);
+  if (args.head_sha === undefined && typeof o.body.read_id === "string") lastReadId = o.body.read_id;
+  return o;
+}
 beforeEach(async () => { e = await reviewEnv(); });
 afterEach(async () => { await e.close(); });
 after(closeShared);
@@ -74,7 +84,7 @@ function useChange(files: FakeFile[]): void {
 async function readLikeTheModel(): Promise<{ calls: number; texts: Record<string, string>; longest: number }> {
   const answers: string[] = [];
   const call = async (args: Record<string, unknown>): Promise<string> => {
-    const o = await e.service.getPr(e.actor, { pr: PR, ...args });
+    const o = await gp(e.actor, { pr: PR, ...args });
     answers.push(o.text);
     assert.equal(o.isError, false, o.text.slice(0, 300));
     return o.text;
@@ -86,7 +96,7 @@ async function readLikeTheModel(): Promise<{ calls: number; texts: Record<string
     if (info.inline) { texts[section] = section === "instructions" ? overview.review_instructions : overview.untrusted[section]; continue; }
     texts[section] = "";
     for (let offset: number | null = 0; offset !== null;) {
-      const text = await call({ section, head_sha: overview.pull_request.head_sha, offset });
+      const text = await call({ section, head_sha: overview.pull_request.head_sha, read_id: overview.read_id, offset });
       const nl = text.indexOf("\n");
       const head = JSON.parse(text.slice(0, nl));
       assert.equal(head.offset, offset);
@@ -135,31 +145,31 @@ test("G2 the review instructions reach the model whole: the default skill, and a
 
 test("G3 a page costs one GitHub request (the repository gates and the head, as they are now), from this session's read; another session reads for itself", async () => {
   useChange(bigChange(6, 25));
-  const first = (await e.service.getPr(e.actor, { pr: PR })).body as any;
+  const first = (await gp(e.actor, { pr: PR })).body as any;
   assert.equal(first.sections.diff.inline, false);
   const before = e.gh.calls.length;
   assert.ok(before >= 10, `the overview reads everything: ${before}`);
-  const page = await e.service.getPr(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0 });
+  const page = await gp(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0 });
   assert.equal(page.isError, false);
   assert.deepEqual(e.gh.calls.slice(before).map((c) => c.path), ["/graphql"]);
   const other = { ...e.actor, sessionId: "s-2" };
   const mark = e.gh.calls.length;
-  assert.equal((await e.service.getPr(other, { pr: PR, section: "diff", head_sha: HEAD, offset: 0 })).isError, false);
+  assert.equal((await gp(other, { pr: PR, section: "diff", head_sha: HEAD, offset: 0 })).isError, false);
   assert.ok(e.gh.calls.length - mark >= 10, "another session's page is not served from this session's read");
 });
 
 test("G4 a head that moved refuses the page with the new head, and the next overview reads the new head", async () => {
   useChange(bigChange(6, 25));
-  await e.service.getPr(e.actor, { pr: PR });
+  await gp(e.actor, { pr: PR });
   const moved = "2".repeat(40);
   e.gh.pr.head.sha = moved;
-  const page = await e.service.getPr(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0 });
+  const page = await gp(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0 });
   assert.equal(page.isError, true);
   assert.equal(page.body.reason, "head_moved");
   assert.equal(page.body.current_head_sha, moved);
   e.gh.files = bigChange(1, 3);
   e.gh.pr.changed_files = 1;
-  const again = (await e.service.getPr(e.actor, { pr: PR })).body as any;
+  const again = (await gp(e.actor, { pr: PR })).body as any;
   assert.equal(again.pull_request.head_sha, moved);
   const diff = (await readSection(e.service, e.actor, PR, "diff")).text;
   assert.equal(diff, diffText(asRead(e.gh.files)), "the new head's diff, not the one read before");
@@ -172,7 +182,8 @@ test("G5 `file` narrows the diff to one file and `max_diff_chars` makes its page
   const { text, pages } = await readSection(e.service, e.actor, PR, "diff", { file: target.filename, max_diff_chars: 1500 });
   assert.equal(text, diffText(asRead([target])));
   assert.ok(pages >= Math.ceil(text.length / 1500), `pages ${pages}`);
-  const page = (await e.service.getPr(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0, file: target.filename, max_diff_chars: 1500 })).body as any;
+  await gp(e.actor, { pr: PR });
+  const page = (await gp(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0, file: target.filename, max_diff_chars: 1500 })).body as any;
   assert.ok(page.untrusted.text.length <= 1500);
   assert.equal(page.file, target.filename);
 });
@@ -181,14 +192,14 @@ test("G6 an overview longer than one answer is itself read in pages, and nothing
   // A base branch that requires 150 checks none of which ran: the overview names each one missing.
   e.gh.rules = [{ type: "required_status_checks", parameters: { required_status_checks: Array.from({ length: 150 }, (_, i) => ({ context: `required-check-with-a-long-name-number-${i}` })) } }];
   e.gh.checkRuns = [];
-  const first = await e.service.getPr(e.actor, { pr: PR });
+  const first = await gp(e.actor, { pr: PR });
   assert.ok(first.text.length <= PAGE_MAX_CHARS);
   assert.equal(first.body.section, "overview");
   let json = "";
   for (let o: any = first.body; ; ) {
     json += o.text;
     if (o.next_offset === null) break;
-    o = (await e.service.getPr(e.actor, { pr: PR, section: "overview", head_sha: HEAD, offset: o.next_offset })).body;
+    o = (await gp(e.actor, { pr: PR, section: "overview", head_sha: HEAD, offset: o.next_offset })).body;
   }
   const overview = JSON.parse(json);
   assert.equal(overview.checks.requiredMissing.length, 150);
@@ -212,9 +223,9 @@ test("G8 a page from the session's read is still held to the repository as it is
     e = await reviewEnv(); // a request budget of its own for each case
     useChange(bigChange(6, 25));
     const original = { ...e.gh.repo };
-    assert.equal((await e.service.getPr(e.actor, { pr: PR })).isError, false);
+    assert.equal((await gp(e.actor, { pr: PR })).isError, false);
     e.gh.repo = { ...original, ...patch };
-    const page = await e.service.getPr(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0 });
+    const page = await gp(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0 });
     assert.equal(page.isError, true, JSON.stringify(patch));
     assert.equal(page.body.reason, code, JSON.stringify(patch));
     assert.equal(page.body.untrusted, undefined);
@@ -245,6 +256,17 @@ test("G7 a page fits whatever the text costs to escape, ends at a line end when 
     }
     assert.equal(got, full);
   }
+  // A page of one character asked for, starting at a character outside the basic plane: both halves come together.
+  const astral = "x😀y😀😀z";
+  let got = "";
+  for (let offset: number | null = 0; offset !== null;) {
+    const page = fitPage(astral, offset, 1, render);
+    const slice = JSON.parse(page.text).untrusted.text as string;
+    assert.ok(slice.isWellFormed(), `at ${offset}`);
+    got += slice;
+    offset = page.next;
+  }
+  assert.equal(got, astral);
 });
 
 test("G9 the acting user's token in the change is masked before the section is cut into pages: no page boundary splits it out of reach", async () => {
@@ -265,15 +287,15 @@ test("G10 an offset past the end of a section, or outside the named file, is ref
   e = await reviewEnv({ CLAW_GITHUB_REQUESTS_PER_SESSION: "1000" }); // many whole reads; the budget is G1's subject
   const files = bigChange(6, 25);
   useChange(files);
-  await e.service.getPr(e.actor, { pr: PR });
+  await gp(e.actor, { pr: PR });
   for (const section of ["diff", "files", "instructions", "conversation"]) {
     const { text } = await readSection(e.service, e.actor, PR, section);
     for (const offset of [text.length, text.length + 1, text.length + 50_000]) {
-      const o = await e.service.getPr(e.actor, { pr: PR, section, head_sha: HEAD, offset });
+      const o = await gp(e.actor, { pr: PR, section, head_sha: HEAD, offset });
       assert.equal(refusal(o), "offset_out_of_range", `${section} at ${offset}`);
       assert.equal(o.body.section_chars, text.length, section);
     }
-    const last = await e.service.getPr(e.actor, { pr: PR, section, head_sha: HEAD, offset: text.length - 1 });
+    const last = await gp(e.actor, { pr: PR, section, head_sha: HEAD, offset: text.length - 1 });
     assert.equal(refusal(last), "answered", `${section}: the last character is still a page`);
   }
   // Inside the diff but outside the named file: before it and at its end.
@@ -281,24 +303,24 @@ test("G10 an offset past the end of a section, or outside the named file, is ref
   const ranges = (await readSection(e.service, e.actor, PR, "files")).text.trim().split("\n").map((l) => /diff offset (\d+), (\d+) chars/.exec(l) as RegExpExecArray);
   const r4 = { start: Number(ranges[3]?.[1]), end: Number(ranges[3]?.[1]) + Number(ranges[3]?.[2]) };
   for (const offset of [r4.start - 1, r4.end, r4.end + 10]) {
-    const o = await e.service.getPr(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset, file: fourth.filename });
+    const o = await gp(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset, file: fourth.filename });
     assert.equal(refusal(o), "offset_out_of_range", `${offset}`);
     assert.deepEqual([o.body.file_start, o.body.file_end], [r4.start, r4.end]);
   }
-  assert.equal(refusal(await e.service.getPr(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0, file: first.filename })), "answered");
+  assert.equal(refusal(await gp(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0, file: first.filename })), "answered");
 });
 
 test("G11 a file that is not in the change is refused, in the overview and in a page, not answered with an empty diff", async () => {
   useChange(bigChange(6, 25));
-  assert.equal(refusal(await e.service.getPr(e.actor, { pr: PR, file: "src/nope.ts" })), "unknown_file");
-  assert.equal(refusal(await e.service.getPr(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0, file: "src/nope.ts" })), "unknown_file");
+  assert.equal(refusal(await gp(e.actor, { pr: PR, file: "src/nope.ts" })), "unknown_file");
+  assert.equal(refusal(await gp(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0, file: "src/nope.ts" })), "unknown_file");
 });
 
 test("G12 `file` with the offset the files index gives reads that file's part whole, and its pages go on in the whole diff's offsets", async () => {
   e = await reviewEnv({ CLAW_GITHUB_REQUESTS_PER_SESSION: "1000" }); // many whole reads; the budget is G1's subject
   const files = bigChange(6, 25);
   useChange(files);
-  await e.service.getPr(e.actor, { pr: PR });
+  await gp(e.actor, { pr: PR });
   const index = (await readSection(e.service, e.actor, PR, "files")).text.trim().split("\n");
   const whole = diffText(asRead(files));
   for (const [i, f] of files.entries()) {
@@ -307,7 +329,7 @@ test("G12 `file` with the offset the files index gives reads that file's part wh
     let text = "";
     let pages = 0;
     for (let offset: number | null = start; offset !== null; pages++) {
-      const o = await e.service.getPr(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset, file: f.filename, max_diff_chars: 2000 });
+      const o = await gp(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset, file: f.filename, max_diff_chars: 2000 });
       assert.equal(o.isError, false, o.text.slice(0, 200));
       const b = o.body as any;
       assert.equal(b.offset, offset);
@@ -323,17 +345,47 @@ test("G12 `file` with the offset the files index gives reads that file's part wh
 
 test("G13 a pull request retargeted to another base branch with the same head refuses the page, and the next overview reads the new diff", async () => {
   useChange(bigChange(6, 25));
-  await e.service.getPr(e.actor, { pr: PR });
+  await gp(e.actor, { pr: PR });
   e.gh.pr.base = { ...e.gh.pr.base, ref: "release-1" };
   e.gh.files = bigChange(2, 3);
   e.gh.pr.changed_files = 2;
-  const page = await e.service.getPr(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0 });
+  const page = await gp(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0 });
   assert.equal(page.isError, true);
   assert.equal(page.body.reason, "base_changed");
   assert.equal(page.body.current_base, "release-1");
   assert.equal(page.body.untrusted, undefined);
-  const again = (await e.service.getPr(e.actor, { pr: PR })).body as any;
+  const again = (await gp(e.actor, { pr: PR })).body as any;
   assert.equal(again.pull_request.base, "release-1");
-  const fresh = await e.service.getPr(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0 });
+  const fresh = await gp(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0 });
   assert.equal((fresh.body as any).untrusted.text, diffText(asRead(e.gh.files)));
+});
+
+test("G14 a page is served only from a read that says what the overview's read said: a moved base or a forgotten read is read again, and refused when the change differs", async () => {
+  e = await reviewEnv({ CLAW_GITHUB_REQUESTS_PER_SESSION: "1000" });
+  const files = bigChange(6, 25);
+  useChange(files);
+  const first = (await gp(e.actor, { pr: PR })).body as any;
+  assert.match(first.read_id, /^[0-9a-f]{16}$/);
+  assert.equal(refusal(await e.service.getPr(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0 })), "read_id_required");
+  // The base branch moves on, and the diff stays the same: the page is served, from a new read.
+  e.gh.pr.base = { ...e.gh.pr.base, sha: "c".repeat(40) };
+  const same = await gp(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0 });
+  assert.equal(refusal(same), "answered");
+  assert.equal(same.body.read_id, first.read_id);
+  // It moves again, and the merge base with it: the diff is another one, and the page is refused.
+  e.gh.pr.base = { ...e.gh.pr.base, sha: "d".repeat(40) };
+  e.gh.files = [...files.slice(0, 5), { ...(files[5] as FakeFile), patch: `${(files[5] as FakeFile).patch}\n+  one more line` }];
+  const moved = await gp(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 5000 });
+  assert.equal(refusal(moved), "read_changed");
+  assert.notEqual(moved.body.current_read_id, first.read_id);
+  assert.equal(moved.body.untrusted, undefined);
+  // A read forgotten (more sessions than are kept), then the change differs with the same head and base: refused, not paged on.
+  e.gh.files = files;
+  e.gh.pr.base = { ...e.gh.pr.base, sha: BASE_TIP };
+  const again = (await gp(e.actor, { pr: PR })).body as any;
+  assert.equal(again.read_id, first.read_id);
+  for (let i = 0; i < 70; i++) await e.service.getPr({ ...e.actor, sessionId: `s-other-${i}` }, { pr: PR });
+  e.gh.files = bigChange(5, 25);
+  const forgotten = await gp(e.actor, { pr: PR, section: "diff", head_sha: HEAD, read_id: again.read_id, offset: 5000 });
+  assert.equal(refusal(forgotten), "read_changed");
 });

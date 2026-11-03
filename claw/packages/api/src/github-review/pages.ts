@@ -100,7 +100,7 @@ export function fitPage(full: string, offset: number, want: number, render: (sli
       if (nl + 1 > start + (cut - start) / 2) cut = nl + 1;
       // Never between the two halves of a surrogate pair.
       const code = full.charCodeAt(cut - 1);
-      if (cut - 1 > start && code >= 0xd800 && code <= 0xdbff) cut -= 1;
+      if (code >= 0xd800 && code <= 0xdbff) cut += cut - 1 > start ? -1 : 1;
     }
     const next = cut < full.length ? cut : null;
     const text = render(full.slice(start, cut), next);

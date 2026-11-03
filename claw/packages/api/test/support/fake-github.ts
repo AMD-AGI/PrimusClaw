@@ -40,7 +40,7 @@ export class FakeGithub {
   pr: Record<string, any> = {
     number: 7, title: "Fix the thing", body: "Fixes the thing.", state: "open", draft: false, merged: false,
     head: { sha: HEAD, ref: "fix", repo: { full_name: "AMD-AGI/demo" } },
-    base: { ref: "main", repo: { full_name: "AMD-AGI/demo" } },
+    base: { ref: "main", sha: BASE_TIP, repo: { full_name: "AMD-AGI/demo" } },
     user: { login: "alice" }, author_association: "MEMBER", additions: 3, deletions: 1, changed_files: 1,
     html_url: "https://github.com/AMD-AGI/demo/pull/7",
   };
@@ -118,7 +118,7 @@ export class FakeGithub {
         owner: r.owner, isPrivate: r.private, visibility: typeof r.visibility === "string" ? r.visibility.toUpperCase() : undefined,
         isArchived: r.archived, isDisabled: r.disabled,
       };
-      const pull = /isArchived/.test(String(call.body?.query ?? "")) ? { headRefOid: this.pr.head?.sha, baseRefName: this.pr.base?.ref } : { ...this.graphql, ...(this.graphqlQueue.shift() ?? {}) };
+      const pull = /isArchived/.test(String(call.body?.query ?? "")) ? { headRefOid: this.pr.head?.sha, baseRefName: this.pr.base?.ref, baseRefOid: this.pr.base?.sha } : { ...this.graphql, ...(this.graphqlQueue.shift() ?? {}) };
       return json(200, { data: { repository: { ...repository, pullRequest: pull } } });
     }
     if (/^\/repos\/[^/]+\/[^/]+$/.test(p)) return json(200, this.repo);

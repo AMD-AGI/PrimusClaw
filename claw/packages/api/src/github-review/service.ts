@@ -118,6 +118,8 @@ interface PrInfo {
   headSha: string;
   headRef: string;
   baseRef: string;
+  /** The base branch's tip when the pull request was read. */
+  baseSha: string;
   authorLogin: string;
   authorAssociation: string;
   fork: boolean;
@@ -153,6 +155,8 @@ interface PullState {
 type Inline = Partial<Record<Exclude<Section, "overview">, string>>;
 
 interface ReviewRead {
+  /** What the sections say, as a digest: a page is only served from a read that says the same as the one the model began on. */
+  readId: string;
   pr: PrInfo;
   files: RiskFile[];
   overview: Record<string, unknown>;
@@ -179,7 +183,7 @@ const MAX_BODY_CHARS = 20_000;
 const MAX_KEPT_READS = 64;
 const PAGED_SECTIONS = SECTIONS.filter((s): s is Exclude<Section, "overview"> => s !== "overview");
 const HOW_TO_READ = "Each answer fits what you can read at once. Read every section in `sections` that is not inline, whole, before you judge: call gh_pr_get "
-  + "with this pr, `section`, this `head_sha` and `offset` (0, then each page's `next_offset` until it is null). Read `instructions` first. In `files`, each file "
+  + "with this pr, `section`, this `head_sha` and `read_id`, and `offset` (0, then each page's `next_offset` until it is null). Read `instructions` first. In `files`, each file "
   + "gives its offset and length in `diff`, to read one file's part: pass `file` with that offset (or 0) to stay inside it. Offsets are always "
   + "the whole diff's. An offset past the end is refused, never an empty page. A page costs one GitHub request.";
 const HOUR_MS = 3_600_000;
@@ -206,7 +210,7 @@ const THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!){reposito
 
 /** What a page served from a session's read asks of GitHub: the repository as it is now (the gates of `readRepo`) and the head. */
 const PAGE_GATE_QUERY = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){
-  owner{login} isPrivate visibility isArchived isDisabled pullRequest(number:$number){headRefOid baseRefName}}}`;
+  owner{login} isPrivate visibility isArchived isDisabled pullRequest(number:$number){headRefOid baseRefName baseRefOid}}}`;
 
 /**
  * Puts the pull request in the base branch's merge queue as the acting user. expectedHeadOid is the head commit the review read: GitHub refuses
@@ -259,7 +263,11 @@ export class GithubReview {
     return this.run(actor, "gh_pr_get", args, async (ctx, ref) => {
       const section = args.section ?? "overview";
       if (!isSection(section)) throw new Refusal("invalid_section", `section is one of ${SECTIONS.join(", ")}`);
-      const read = await this.reviewRead(ctx, ref, args.head_sha === undefined ? null : this.pinned(args.head_sha));
+      const pinned = args.head_sha === undefined ? null : this.pinned(args.head_sha);
+      if (pinned && (typeof args.read_id !== "string" || !args.read_id)) {
+        throw new Refusal("read_id_required", "a page needs the read_id of the overview it continues");
+      }
+      const read = await this.reviewRead(ctx, ref, pinned ? { headSha: pinned, readId: String(args.read_id) } : null);
       ctx.acc.headSha = read.pr.headSha;
       ctx.acc.riskReasons = read.riskReasons;
       ctx.acc.reviewPath = read.reviewPath;
@@ -278,25 +286,37 @@ export class GithubReview {
   }
 
   /** What this session read of the pull request: from memory when `pinned` is the head it read and still the head, else from GitHub. */
-  private async reviewRead(ctx: Ctx, ref: PrRef, pinned: string | null): Promise<ReviewRead> {
+  private async reviewRead(ctx: Ctx, ref: PrRef, pin: { headSha: string; readId: string } | null): Promise<ReviewRead> {
     const key = [ctx.actor.sessionId, ctx.actor.actorUserId, ref.owner.toLowerCase(), ref.repo.toLowerCase(), ref.number].join("\n");
-    const known = pinned ? this.reads.get(key) : undefined;
-    if (known && known.pr.headSha === pinned) {
-      await this.requirePageStillValid(ctx, ref, known.pr);
-      this.reads.delete(key);
-      this.reads.set(key, known);
-      return known;
+    const known = pin ? this.reads.get(key) : undefined;
+    if (pin && known && known.readId === pin.readId && known.pr.headSha === pin.headSha) {
+      // A base branch that moved can move the merge base, and with it the diff: then the pages are served only if a new read says the same.
+      if (!(await this.requirePageStillValid(ctx, ref, known.pr)).baseMoved) {
+        this.remember(key, known);
+        return known;
+      }
     }
     const read = await this.readForReview(ctx, ref);
-    if (pinned) this.requireHead(read.pr, pinned);
+    this.remember(key, read);
+    if (pin) {
+      this.requireHead(read.pr, pin.headSha);
+      if (read.readId !== pin.readId) {
+        throw new Refusal("read_changed", "the pull request no longer reads as it did when you began (its diff, instructions or conversation changed); "
+          + "the pages so far are of another change: start again with gh_pr_get without head_sha", { current_read_id: read.readId });
+      }
+    }
+    return read;
+  }
+
+  private remember(key: string, read: ReviewRead): void {
     this.reads.delete(key);
     this.reads.set(key, read);
     for (const old of this.reads.keys()) {
       if (this.reads.size <= MAX_KEPT_READS) break;
       this.reads.delete(old);
     }
-    return read;
   }
+
 
   /** Everything `gh_pr_get` says, read from GitHub. */
   private async readForReview(ctx: Ctx, ref: PrRef): Promise<ReviewRead> {
@@ -346,8 +366,10 @@ export class GithubReview {
       },
       review_instructions_source: { source: instructions.source, path: instructions.skillPath ?? null, base_sha: instructions.baseSha ?? null, note: instructions.note ?? null },
     };
+    const conversation = conversationText(clip(pr.title, 300), clip(pr.body, 8000), comments);
+    const readId = createHash("sha256").update(JSON.stringify([pr.headSha, pr.baseRef, instructions.text, conversation, diffText(change.files)])).digest("hex").slice(0, 16);
     return {
-      pr, files: change.files, overview, instructions: instructions.text, conversation: conversationText(clip(pr.title, 300), clip(pr.body, 8000), comments),
+      readId, pr, files: change.files, overview: { ...overview, read_id: readId }, instructions: instructions.text, conversation,
       riskReasons: risk.reasons, reviewPath: choice.path, reviewPathReason: choice.reason,
     };
   }
@@ -417,9 +439,9 @@ export class GithubReview {
     let body: Record<string, unknown> = {};
     const page = fitPage(full.slice(0, range.end), from, want, (slice, next) => {
       const head = {
-        status: "ok", head_sha: read.pr.headSha, section, ...(file ? { file, file_start: range.start, file_end: range.end } : {}), offset: from,
+        status: "ok", head_sha: read.pr.headSha, read_id: read.readId, section, ...(file ? { file, file_start: range.start, file_end: range.end } : {}), offset: from,
         section_chars: full.length, next_offset: next,
-        ...(next === null ? {} : { next: `call gh_pr_get with section "${section}"${file ? ", the same file" : ""}, this head_sha and offset ${next}` }),
+        ...(next === null ? {} : { next: `call gh_pr_get with section "${section}"${file ? ", the same file" : ""}, this head_sha and read_id, and offset ${next}` }),
         ...(untrusted ? { notice: UNTRUSTED_PAGE_NOTICE } : {}),
         text: "the lines after this one",
       };
@@ -782,9 +804,9 @@ export class GithubReview {
   }
 
   /** For a page served from this session's read: the repository gates, the head and the base branch, as they are now, in one request. */
-  private async requirePageStillValid(ctx: Ctx, ref: PrRef, known: PrInfo): Promise<void> {
+  private async requirePageStillValid(ctx: Ctx, ref: PrRef, known: PrInfo): Promise<{ baseMoved: boolean }> {
     const g = await ctx.client.graphql<{ repository?: {
-      owner?: { login?: string }; isPrivate?: boolean; visibility?: string; isArchived?: boolean; isDisabled?: boolean; pullRequest?: { headRefOid?: string; baseRefName?: string } | null;
+      owner?: { login?: string }; isPrivate?: boolean; visibility?: string; isArchived?: boolean; isDisabled?: boolean; pullRequest?: { headRefOid?: string; baseRefName?: string; baseRefOid?: string } | null;
     } | null }>(PAGE_GATE_QUERY, { owner: ref.owner, name: ref.repo, number: ref.number });
     const r = g.repository;
     if (!r?.pullRequest) throw new Refusal("unreadable_pull_request", "GitHub did not return the pull request");
@@ -799,6 +821,7 @@ export class GithubReview {
     if (base !== known.baseRef) {
       throw new Refusal("base_changed", "the pull request now targets another base branch, so its diff is another one; read it again with gh_pr_get without head_sha", { current_base: base });
     }
+    return { baseMoved: String(r.pullRequest.baseRefOid ?? "").toLowerCase() !== known.baseSha };
   }
 
   private async readRepo(ctx: Ctx, ref: PrRef): Promise<RepoInfo> {
@@ -827,7 +850,7 @@ export class GithubReview {
     const pr: PrInfo = {
       number: ref.number, title: String(p.title ?? ""), body: String(p.body ?? ""), state: String(p.state ?? ""),
       draft: p.draft === true, merged: p.merged === true, headSha: String(head.sha ?? "").toLowerCase(), headRef: String(head.ref ?? ""),
-      baseRef: String(base.ref ?? ""), authorLogin: String((p.user as { login?: string } | undefined)?.login ?? ""),
+      baseRef: String(base.ref ?? ""), baseSha: String((base as { sha?: string }).sha ?? "").toLowerCase(), authorLogin: String((p.user as { login?: string } | undefined)?.login ?? ""),
       authorAssociation: String(p.author_association ?? ""),
       fork: !head.repo || !base.repo || String(head.repo.full_name).toLowerCase() !== String(base.repo.full_name).toLowerCase(),
       additions: Number(p.additions ?? 0), deletions: Number(p.deletions ?? 0), changedFiles: Number(p.changed_files ?? 0),
