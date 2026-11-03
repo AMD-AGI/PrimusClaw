@@ -27,6 +27,10 @@ const MaxLayers = 4
 // volumePrefix names the emptyDir of each layer.
 const volumePrefix = "as-layer-"
 
+// CopyTarget is where the copy init container mounts the layer emptyDir.
+// It is outside the layer image paths, so From is never hidden by the mount.
+const CopyTarget = "/as-layer-out"
+
 // reservedPaths are owned by the sandbox runtime. A layer mount may not be
 // one of them, sit under one, or contain one.
 var reservedPaths = []string{
@@ -84,6 +88,9 @@ func Resolve(layers []runtimev1alpha1.SandboxLayer, taken []string) ([]Layer, er
 		if err := checkPath(l.From); err != nil {
 			return nil, fmt.Errorf("layers[%d].from: %w", i, err)
 		}
+		if overlaps(l.From, CopyTarget) {
+			return nil, fmt.Errorf("layers[%d].from %s overlaps %s", i, l.From, CopyTarget)
+		}
 		if err := checkPath(l.Mount); err != nil {
 			return nil, fmt.Errorf("layers[%d].mount: %w", i, err)
 		}
@@ -136,9 +143,9 @@ func Encode(layers []Layer) (string, error) {
 	return string(raw), nil
 }
 
-// CopyCommand is the init container command that copies a layer into its mount.
+// CopyCommand is the init container command that copies a layer into CopyTarget.
 func CopyCommand(l Layer) []string {
-	return []string{"sh", "-c", "set -e; cp -a " + quote(l.From+"/.") + " " + quote(l.Mount+"/")}
+	return []string{"sh", "-c", "set -e; cp -a " + quote(l.From+"/.") + " " + quote(CopyTarget+"/")}
 }
 
 // VolumeName is the emptyDir name of the layer at index i.
@@ -162,7 +169,7 @@ func PodParts(layers []Layer, pullPolicy corev1.PullPolicy) ([]corev1.Container,
 			Image:           l.Image,
 			ImagePullPolicy: pullPolicy,
 			Command:         CopyCommand(l),
-			VolumeMounts:    []corev1.VolumeMount{{Name: name, MountPath: l.Mount}},
+			VolumeMounts:    []corev1.VolumeMount{{Name: name, MountPath: CopyTarget}},
 		})
 		mounts = append(mounts, corev1.VolumeMount{Name: name, MountPath: l.Mount, ReadOnly: l.ReadOnly})
 	}

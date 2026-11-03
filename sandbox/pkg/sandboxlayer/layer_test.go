@@ -53,6 +53,7 @@ func TestResolveRejects(t *testing.T) {
 		"signing key":    {layers: []runtimev1alpha1.SandboxLayer{layer("/a", "/run/signing-key")}},
 		"taken":          {layers: []runtimev1alpha1.SandboxLayer{layer("/a", "/data/x")}, taken: []string{"/data"}},
 		"nested layers":  {layers: []runtimev1alpha1.SandboxLayer{layer("/a", "/opt/a"), layer("/b", "/opt/a/b")}},
+		"copy target":    {layers: []runtimev1alpha1.SandboxLayer{layer("/as-layer-out/x", "/opt/a")}},
 		"too many": {layers: []runtimev1alpha1.SandboxLayer{
 			layer("/a", "/opt/a"), layer("/a", "/opt/b"), layer("/a", "/opt/c"), layer("/a", "/opt/d"), layer("/a", "/opt/e"),
 		}},
@@ -78,7 +79,24 @@ func TestPodParts(t *testing.T) {
 	if inits[0].Name != "as-layer-0" || vols[0].EmptyDir == nil || !mounts[0].ReadOnly || mounts[0].MountPath != "/opt/host" {
 		t.Fatalf("unexpected parts %+v %+v %+v", inits[0], vols[0], mounts[0])
 	}
-	if cmd := inits[0].Command[2]; cmd != "set -e; cp -a '/layer/.' '/opt/host/'" {
+	if cmd := inits[0].Command[2]; cmd != "set -e; cp -a '/layer/.' '/as-layer-out/'" {
 		t.Fatalf("command = %s", cmd)
+	}
+}
+
+func TestPodPartsCopiesSamePath(t *testing.T) {
+	got, err := Resolve([]runtimev1alpha1.SandboxLayer{layer("/opt/tools", "/opt/tools")}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inits, _, mounts := PodParts(got, "")
+	if m := inits[0].VolumeMounts; len(m) != 1 || m[0].MountPath != "/as-layer-out" {
+		t.Fatalf("copy mount = %+v", m)
+	}
+	if cmd := inits[0].Command[2]; cmd != "set -e; cp -a '/opt/tools/.' '/as-layer-out/'" {
+		t.Fatalf("command = %s", cmd)
+	}
+	if mounts[0].MountPath != "/opt/tools" {
+		t.Fatalf("main mount = %+v", mounts[0])
 	}
 }
