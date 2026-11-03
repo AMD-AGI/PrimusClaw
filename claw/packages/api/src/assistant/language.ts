@@ -61,17 +61,33 @@ const HAN_FRAME = new Set([..."我你您他她它们咱的了吗呢吧把被让�
 const CJK_RUN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}ー]+/gu;
 
 /**
+ * How much of a message is read: this many characters from its start and from its end. A message is a sentence or a
+ * paragraph; what is longer is a paste, and the user's own words are in front of it or after it. This runs on every
+ * turn, on the thread that serves every other request, and a message may be megabytes (so may the earlier ones that are
+ * read when it shows nothing), so the cost is fixed here instead of left to the length of whatever was sent.
+ */
+export const READ_CHARS = 2000;
+
+/** The text itself when it is short, else its start and its end, joined by a line break so no token or quotation runs across the cut. */
+function readable(text: string): string {
+  return text.length <= 2 * READ_CHARS ? text : `${text.slice(0, READ_CHARS)}\n${text.slice(-READ_CHARS)}`;
+}
+
+/**
  * What the user said, without what only looks like language: code, links, paths and addresses are not in any language,
  * and a pasted log must not decide how the answer is written.
+ *
+ * Each pattern below that matches a run of characters starts only at the start of its run (the lookbehind), so a run
+ * that does not end the way the pattern needs is read once and not again from every character in it.
  */
 function wording(text: string): string {
   return text
     .replace(/```[\s\S]*?```/g, " ")
     .replace(/`[^`\n]*`/g, " ")
     // ASCII only below: Chinese is written without spaces, so a path or a link is followed directly by the sentence.
-    .replace(/\b[a-z][a-z0-9+.-]*:\/\/[\x21-\x7e]+/gi, " ")
-    .replace(/[\w.~@:+-]*[\\/][\w.~@:+/\\-]*/g, " ")
-    .replace(/[\w.+-]+@[\w.-]+/g, " ")
+    .replace(/(?<![a-z0-9+.-])[0-9+.-]*[a-z][a-z0-9+.-]*:\/\/[\x21-\x7e]+/gi, " ")
+    .replace(/(?<![\w.~@:+/\\-])[\w.~@:+-]*[\\/][\w.~@:+/\\-]*/g, " ")
+    .replace(/(?<![\w.+-])[\w.+-]+@[\w.-]+/g, " ")
     .replace(/’/g, "'");
 }
 
@@ -83,13 +99,42 @@ function wording(text: string): string {
  */
 function unquoted(text: string): string {
   const inWord = "\\p{Script=Latin}\\p{N}";
-  return text
-    .replace(/"[^"\n]*"/g, " ")
-    .replace(/“[^”\n]*”/g, " ")
-    .replace(/[「『][^」』\n]*[」』]/g, " ")
+  return withoutQuotations(withoutQuotations(text.replace(/"[^"\n]*"/g, " "), /“/g, /”/g), /[「『]/g, /[」』]/g)
     // wording() has already turned a curly apostrophe into a straight one, so ‘…’ arrives as ‘…'. An apostrophe between
     // two letters belongs to its word, also inside the quotation ('I don't know').
     .replace(new RegExp(`(?<![${inWord}])['‘](?:[^'‘\\n]|(?<=[${inWord}])'(?=[${inWord}]))*'(?![${inWord}])`, "gu"), " ");
+}
+
+/**
+ * The text without each stretch that opens with a mark matching `opening` and ends with the first mark matching
+ * `closing` after it, on one line: what `/“[^”\n]*”/g` would remove. Written as a scan because that expression, with
+ * an opening mark that has no closing mark on its line, reads to the end of the line again from every opening mark
+ * after it, a time that grows with the square of the line. Here each mark is looked for once, going forward.
+ */
+function withoutQuotations(text: string, opening: RegExp, closing: RegExp): string {
+  const next = (re: RegExp, from: number): number => { re.lastIndex = from; return re.exec(text)?.index ?? Infinity; };
+  let out = "";
+  let kept = 0; // the text before this is in `out`
+  let from = 0; // where an opening mark is looked for
+  let close = -1; // the first closing mark after the opening mark being looked at, found once for all that come before it
+  let lineEnd = -1; // and the end of the line it is on
+  for (;;) {
+    const open = next(opening, from);
+    if (open === Infinity) break;
+    if (close <= open) close = next(closing, open + 1);
+    if (close === Infinity) break; // nothing is closed from here on
+    if (lineEnd <= open) {
+      const newline = text.indexOf("\n", open);
+      lineEnd = newline < 0 ? Infinity : newline;
+    }
+    if (lineEnd < close) {
+      from = lineEnd + 1; // closed on a later line: none of the opening marks on this line is
+      continue;
+    }
+    out += `${text.slice(kept, open)} `;
+    kept = from = close + 1;
+  }
+  return out + text.slice(kept);
 }
 
 /**
@@ -109,9 +154,14 @@ function opensInCjk(text: string): boolean {
   return false;
 }
 
-/** The language of one message, or null when it cannot be told. */
+/** The language of one message, or null when it cannot be told. Of a long message only the start and the end are read (READ_CHARS). */
 export function detectLanguage(message: string): string | null {
-  const text = wording(message);
+  return detectLanguageOfAll(readable(message));
+}
+
+/** The language of the whole of `text`, however long it is: `detectLanguage` without the limit on how much is read. Here so that a test can time what the limit would hide. */
+export function detectLanguageOfAll(whole: string): string | null {
+  const text = wording(whole);
   const outside = unquoted(text);
   // The user's own words first; what they quoted only when they said nothing besides it.
   return judge(outside) ?? (outside === text ? null : judge(text));

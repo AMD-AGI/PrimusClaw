@@ -6,15 +6,21 @@
  *
  *   L1  Chinese, Japanese, Korean and English are told apart, with the other things a message contains left out
  *   L1c a quotation is not the user's sentence, and a message that opens in Chinese, Japanese or Korean is theirs whatever English follows
+ *   L1d a quotation ends at the first closing mark on its line, whatever opens inside it or never closes
  *   L2  a message that cannot be told, or is in another language, has no verdict rather than a wrong one
  *   L3  the verdict agrees with the language every evaluation message is labelled with
  *   L4  the language is the message's own, else the one the user wrote in before; a report is not the user's message
  *   L5  the line is the same every time and is added once
+ *   L6  only the start and the end of a long message are read, and a paste between them does not decide
+ *   L7  what it costs does not grow with what was sent: not by the length of the message, nor by how its characters are arranged
  */
 import assert from "node:assert/strict";
+import { performance } from "node:perf_hooks";
 import test from "node:test";
 
-import { detectLanguage, languageToAnswerIn, replyLanguageLine, withReplyLanguage, REPLY_LANGUAGE_LABEL } from "../src/assistant/language.js";
+import {
+  detectLanguage, detectLanguageOfAll, languageToAnswerIn, replyLanguageLine, withReplyLanguage, READ_CHARS, REPLY_LANGUAGE_LABEL,
+} from "../src/assistant/language.js";
 import { WORK_EVENT_PREFIX } from "../src/assistant/prompts.js";
 import { CASES } from "./e2e/assistant-router-eval-cases.js";
 
@@ -151,4 +157,119 @@ test("L5 the line is the same every time and is added once", () => {
   assert.equal(withReplyLanguage("hello there  \n", "Chinese"), "hello there  \n\n\n[Reply language: Chinese]");
   // Neutral: the line names a language and nothing else.
   assert.doesNotMatch(replyLanguageLine("English"), /claw|assistant|router/i);
+});
+
+test("L1d a quotation ends at the first closing mark on its line, whatever opens inside it or never closes", () => {
+  const table: Array<[string, string]> = [
+    // Nested: what is inside is quoted too, and what the user says around it is theirs.
+    ["Translate 「他说『你好』」 into English please", "English"],
+    ["Translate “他说 “你好” 谢谢” and summarize it", "English"],
+    // An opening mark with no closing mark does not quote what comes after it...
+    ["Please look at “ and tell me why 你好 你好 你好", "English"],
+    ["What does 「你好 mean? Please tell me, thanks and 「再见」", "English"],
+    ["“你好 “你好 “你好 please tell me why the build is red and what to do about it", "Chinese"],
+    // ... and a quotation does not run onto the next line.
+    ["Is “你好\n谢谢” a greeting? Please tell me", "Chinese"],
+    ["What does 你好 mean?\n“\n“\n”", "English"],
+  ];
+  for (const [message, language] of table) assert.equal(detectLanguage(message), language, message);
+});
+
+// A paste of this many lines is far longer than what is read of a message.
+const LOG_LINES = 5000;
+
+test("L6 only the start and the end of a long message are read, and a paste between them does not decide", () => {
+  const english = "ERROR the build failed because of the missing file in this run\n".repeat(LOG_LINES);
+  const chinese = "错误：构建失败，请检查这个文件是否存在\n".repeat(LOG_LINES);
+  assert.ok(english.length > 10 * READ_CHARS && chinese.length > 10 * READ_CHARS);
+  // The user's words in front of a paste, and after it; and a paste in a code block is left out although the cut falls
+  // inside it: the block opens in what is read of the start and closes in what is read of the end.
+  const fence = "```";
+  const table: Array<[string, string]> = [
+    [`帮我看看这个日志\n${english}`, "Chinese"],
+    [`Please summarise the log below\n${fence}\n${chinese}${fence}\n`, "English"],
+    [`${fence}\n${chinese}${fence}\nWhy is the build red? Please tell me`, "English"],
+    [`${fence}\n${english}${fence}\n请帮我看看`, "Chinese"],
+  ];
+  for (const [message, language] of table) {
+    assert.equal(detectLanguage(message), language, message.slice(0, 40));
+    assert.equal(detectLanguage(message), detectLanguageOfAll(message), "what is read gives the verdict that reading all of it would");
+  }
+  // A message no longer than what is read is read whole, with a word in the middle of it; one character more and the middle is not.
+  const whole = `${"a".repeat(READ_CHARS)}请${"a".repeat(READ_CHARS - 1)}`;
+  assert.equal(whole.length, 2 * READ_CHARS);
+  assert.equal(detectLanguage(whole), "Chinese");
+  assert.equal(detectLanguage(`${whole}a`), null);
+});
+
+/** The fastest of `times` runs, in milliseconds: the least that noise on a busy machine can add to is the run it left alone. */
+function fastest(times: number, run: () => unknown): number {
+  let least = Infinity;
+  for (let i = 0; i < times; i++) {
+    const start = performance.now();
+    run();
+    least = Math.min(least, performance.now() - start);
+  }
+  return least;
+}
+
+/**
+ * Text that costs a time that grows with the square of its length to a regular expression that backtracks: a long run of
+ * the characters a pattern accepts that does not end the way the pattern needs, and an opening mark that nothing closes,
+ * many times over. Each is made of `size` characters or a few more.
+ */
+const AWKWARD: Array<[string, (size: number) => string]> = [
+  ["one long token", (n) => "a".repeat(n)],
+  ["one long token after a Chinese word", (n) => `帮我看 ${"a".repeat(n)}`],
+  ["a long dotted token", (n) => "a.".repeat(n / 2)],
+  ["a long token with an at sign at its end", (n) => `${"a.".repeat(n / 2)}@`],
+  ["a long token with a colon at its end", (n) => `${"a.".repeat(n / 2)}:`],
+  ["unclosed curly quotation marks", (n) => "“a ".repeat(n / 3)],
+  ["unclosed corner brackets", (n) => "「a ".repeat(n / 3)],
+  ["unclosed corner brackets of both kinds", (n) => "『「".repeat(n / 2)],
+  ["curly quotation marks closed on the next line", (n) => `${"“a ".repeat(n / 3)}\n”`],
+  ["corner brackets closed on the next line", (n) => `${"「a ".repeat(n / 3)}\n』`],
+  ["curly quotation marks on many lines, closed on the last", (n) => `${"“a\n".repeat(n / 3)}”`],
+  ["unclosed single quotation marks", (n) => "x 'y ".repeat(n / 5)],
+  ["unclosed code marks", (n) => `\`\`\`${"a ".repeat(n / 2)}`],
+  ["single Chinese characters", (n) => "构 ".repeat(n / 2)],
+];
+
+const PROSE = "Please check the build on main and tell me why it has been red since yesterday. ";
+const proseOf = (n: number): string => PROSE.repeat(Math.ceil(n / PROSE.length)).slice(0, n);
+
+// The bounds compare one run of the code with another in the same process, so how fast the machine is does not enter.
+// What is measured is about 1 to 3 times its reference; text that costs the square of its length is a thousand times.
+const BOUND = 20;
+
+test("L7 the cost of reading a message does not grow with the arrangement of its characters", () => {
+  // The whole text, with no limit on how much is read: the reference is a text of the same length that is plain prose.
+  for (const size of [80_000, 200_000]) {
+    const plain = fastest(3, () => detectLanguageOfAll(proseOf(size)));
+    for (const [name, make] of AWKWARD) {
+      const text = make(size);
+      const took = fastest(3, () => detectLanguageOfAll(text));
+      assert.ok(took <= BOUND * plain, `${name}, ${text.length} characters: ${took.toFixed(1)} ms, plain prose of the same length ${plain.toFixed(1)} ms`);
+    }
+  }
+});
+
+test("L7 the cost of reading a message does not grow with its length", () => {
+  const bodyLimit = 4 * 1024 * 1024;
+  // What is read of a message is the same however long it is: the reference is the same text at the length that is read.
+  for (const [name, make] of [...AWKWARD, ["plain prose", proseOf] as [string, (size: number) => string]]) {
+    const read = fastest(15, () => detectLanguage(make(2 * READ_CHARS)));
+    for (const size of [80_000, 200_000, bodyLimit]) {
+      const text = make(size);
+      const took = fastest(15, () => detectLanguage(text));
+      assert.ok(took <= BOUND * read, `${name}, ${text.length} characters: ${took.toFixed(3)} ms, the same text cut to what is read ${read.toFixed(3)} ms`);
+    }
+  }
+  // One long message among the earlier ones does not slow every later turn: each of them is read the same way.
+  const poisoned = Array.from({ length: 5 }, () => "“a ".repeat(bodyLimit / 3));
+  const cut = Array.from({ length: 5 }, () => "“a ".repeat(2 * READ_CHARS / 3));
+  const again = (earlier: readonly string[]) => () => languageToAnswerIn("ok", () => earlier);
+  const read = fastest(15, again(cut));
+  const took = fastest(15, again(poisoned));
+  assert.ok(took <= BOUND * read, `five messages of ${bodyLimit} characters: ${took.toFixed(3)} ms, cut to what is read ${read.toFixed(3)} ms`);
 });
