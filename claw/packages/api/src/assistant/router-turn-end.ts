@@ -49,12 +49,23 @@ function asMessage(text: string): string {
 }
 
 /**
+ * What a turn that ended in plain text is to say, if anything: the text, as a message, for a turn that answers the user.
+ * A turn that only a worker's report started may end silent on purpose, and the text it wrote then is not for the user.
+ * Pure, so the evaluation asks the same question the completion handler does.
+ */
+export function answerToDeliver(finalText: string | undefined, prompts: readonly string[]): string | null {
+  const text = asMessage(finalText ?? "");
+  // Every run started by a report, or no run at all, is nothing to answer.
+  if (!text || prompts.every((p) => p.startsWith(WORK_EVENT_PREFIX))) return null;
+  return text;
+}
+
+/**
  * Deliver what the Router wrote when it ended a turn that answers the user without saying anything. Returns
  * `said` when it did. A redelivered completion finds the message it stored and does nothing.
  */
 export async function deliverUnsaidAnswer(end: RouterTurnEnd, deps: SayDeps = {}): Promise<"said" | "skipped"> {
-  const text = asMessage(end.finalText ?? "");
-  if (end.failed || end.interrupted || end.fromSweeper || !text) return "skipped";
+  if (end.failed || end.interrupted || end.fromSweeper) return "skipped";
   const router = (await db.query("SELECT user_id FROM claw_assistants WHERE session_id = $1", [end.sessionId])).rows[0] as
     { user_id: string } | undefined;
   if (!router) return "skipped";
@@ -63,7 +74,8 @@ export async function deliverUnsaidAnswer(end: RouterTurnEnd, deps: SayDeps = {}
        FROM claw_tasks WHERE session_id = $1 AND task_id = ANY($2::text[]) AND origin = 'chat'`,
     [end.sessionId, end.runIds],
   )).rows as Array<{ began: Date; prompt: string }>;
-  if (!runs.length || runs.every((r) => r.prompt.startsWith(WORK_EVENT_PREFIX))) return "skipped";
+  const text = answerToDeliver(end.finalText, runs.map((r) => r.prompt));
+  if (!text) return "skipped";
   const began = new Date(Math.min(...runs.map((r) => new Date(r.began).getTime())));
   // The system's own messages are not the model's, so they do not count as the turn having spoken.
   const spoke = await db.query(

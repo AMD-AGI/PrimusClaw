@@ -93,6 +93,7 @@ async function main(): Promise<void> {
     const refused = scores.reduce((n, s) => n + s.refusals.length, 0);
     console.log(`  item references by number rather than by id: ${inexact}; calls the tools refused: ${refused}`);
     console.log(`  replies written in the same step as a work call, before its result: ${scores.reduce((n, s) => n + s.saidBeforeResult, 0)}; of those beside a call that was refused: ${scores.reduce((n, s) => n + s.saidBesideRefusal, 0)}`);
+    console.log(`  turns that ended in plain text and no say, delivered as a say by the turn end: ${scores.filter((s) => s.rescued).length}`);
     for (const { c, trace, score } of done) {
       if (score.turnOk) continue;
       const why = [

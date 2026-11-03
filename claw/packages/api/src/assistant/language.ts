@@ -40,7 +40,7 @@ const ENGLISH = new Set((
   + "hi hey lgtm anything everything nothing something waiting looks good great accepted"
 ).split(/\s+/));
 
-/** The share of function words below which English in a message that also has Chinese is not a sentence of the user's. */
+/** The share of function words below which English in a message that also has Chinese, Japanese or Korean is not a sentence of the user's. */
 const ENGLISH_SENTENCE_SHARE = 0.2;
 
 const count = (text: string, re: RegExp): number => text.match(re)?.length ?? 0;
@@ -63,19 +63,23 @@ function wording(text: string): string {
 /** The language of one message, or null when it cannot be told. */
 export function detectLanguage(message: string): string | null {
   const text = wording(message);
-  // Kana only occur in Japanese and Hangul only in Korean, so a couple of them settle it, whatever else is in the text.
-  if (count(text, /[\p{Script=Hiragana}\p{Script=Katakana}]/gu) >= 2) return "Japanese";
-  if (count(text, /\p{Script=Hangul}/gu) >= 2) return "Korean";
+  const kana = count(text, /[\p{Script=Hiragana}\p{Script=Katakana}]/gu);
+  const hangul = count(text, /\p{Script=Hangul}/gu);
+  const han = count(text, /\p{Script=Han}/gu);
+  const cjk = kana + hangul + han;
   const words = text.toLowerCase().split(/[^\p{L}']+/u).map((w) => w.replace(/^'+|'+$/g, ""));
   // English needs a function word to say so: a Chinese sentence full of English terms has none, and must not be called English.
   const english = words.filter((w) => ENGLISH.has(w)).length;
-  const han = count(text, /\p{Script=Han}/gu);
-  if (english > 0 && han === 0) return "English";
-  // Both scripts in one message: the one that is the user's own sentence wins. English counts only when it is more words
-  // than the Chinese (a Chinese word is about two characters) and is made like a sentence: a pasted log or a list of
-  // terms in a Chinese message has far fewer function words than an English sentence that quotes a Chinese title.
+  if (english > 0 && cjk === 0) return "English";
+  // Both in one message: the one that is the user's own sentence wins, and a quoted word is not a sentence. English counts
+  // only when it is more words than the other script (a word of those is about two characters) and is made like a sentence:
+  // a pasted log or a list of terms in a Chinese message has far fewer function words than an English sentence that
+  // asks about a Chinese, Japanese or Korean word.
   const latinWords = words.filter((w) => /^[\p{Script=Latin}']{2,}$/u.test(w)).length;
-  if (english > 0 && latinWords > han / 2 && english / latinWords >= ENGLISH_SENTENCE_SHARE) return "English";
+  if (english > 0 && latinWords > cjk / 2 && english / latinWords >= ENGLISH_SENTENCE_SHARE) return "English";
+  // Kana only occur in Japanese and Hangul only in Korean, so a couple of them settle it between the three.
+  if (kana >= 2) return "Japanese";
+  if (hangul >= 2) return "Korean";
   return han > 0 ? "Chinese" : null;
 }
 

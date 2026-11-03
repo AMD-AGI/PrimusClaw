@@ -19,6 +19,7 @@
  *   R6  the loop follows the model's calls to the end, and a refused call changes nothing
  *   R7  scoring accepts the listed alternatives, forgives silence only where allowed, and checks item and language
  *   R8  an item is named by its id or its number as the real tools read it; "#3" is item 3 and is counted as a number
+ *   R8f a turn that ends in plain text and no say is delivered as a say, as the completion handler does, for a turn that answers the user
  *   R8e the model is sent the user's words with the reply-language line the API adds, and for a report, the language of the user's earlier words
  *   R9  against a real model the Router's dispatch decisions are at least 95% right, with items named as the real tools
  *       name them (EVAL_STRICT_IDS=0 scores the decisions apart from that); skips without a model
@@ -319,6 +320,40 @@ test("R8e the model is sent the user's words with the reply-language line the AP
   const hist = CASES.find((c) => c.history?.length && !c.text.startsWith("[work_event]")) as EvalCase;
   await runCase(hist, { llm: sent.llm, tools });
   assert.ok(!JSON.stringify(sent.sent[0]?.messages.slice(0, -1)).includes("Reply language"));
+});
+
+test("R8f a turn that ends in plain text and no say is delivered as a say, for a turn that answers the user", async () => {
+  const tools = await routerTools();
+  const run = (c: EvalCase, ...replies: ModelResponse[]) => runCase(c, { llm: scripted(replies).llm, tools });
+  const hi = byId("chat-01");
+  const answer = "Hello! Nothing needs you right now.";
+
+  const plain = await run(hi, reply(text(answer)));
+  assert.equal(plain.delivered, answer);
+  const score = scoreCase(hi, plain);
+  assert.ok(score.rescued && score.spokeOk && score.turnOk, "the user heard it");
+  assert.equal(score.spoke, 1);
+  // What is delivered is checked for language like a say is.
+  const wrong = scoreCase(hi, await run(hi, reply(text("你好，目前没有需要你处理的事。"))));
+  assert.ok(wrong.rescued && !wrong.langOk && !wrong.turnOk);
+
+  // A turn that said something is not given a second message, whatever else it wrote.
+  const said = await run(hi, reply(use("say", { text: "Hi!" }), text("Done.")), reply());
+  assert.equal(said.delivered, undefined);
+  assert.equal(scoreCase(hi, said).rescued, false);
+  // A say the tools refused told the user nothing.
+  const refused = await run(hi, reply(use("say", { text: "x".repeat(SAY_MAX_CHARS + 1) }), text("It was too long.")), reply());
+  assert.equal(refused.delivered, "It was too long.");
+  // No text, no message: silence stays silence (the case that needs a reply is then a miss).
+  const silent = await run(hi, reply());
+  assert.equal(silent.delivered, undefined);
+  assert.ok(!scoreCase(hi, silent).spokeOk);
+  // A turn that a worker's report started may end silent on purpose, and what it wrote then is not for the user.
+  const report = CASES.find((c) => c.text.startsWith("[work_event]")) as EvalCase;
+  assert.equal((await run(report, reply(text("Nothing to tell the user.")))).delivered, undefined);
+  // A model that could not be reached delivers nothing.
+  const dead = await runCase(hi, { llm: async () => { throw new Error("HTTP 503"); }, tools });
+  assert.equal(dead.delivered, undefined);
 });
 
 test("R8b the model call is the Messages request, retries only what may pass, and never puts the key anywhere else", async () => {

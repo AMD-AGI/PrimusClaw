@@ -31,6 +31,11 @@ test("L1 the four languages are told apart", () => {
     ["What happened to Q3 MI300 利用率汇总 and why is it taking so long?", "English"],
     ["ビルドが赤い理由を調べてください", "Japanese"],
     ["이번 주 빌드가 왜 깨졌는지 알아봐 줘", "Korean"],
+    ["この error の理由を調べてください", "Japanese"],
+    ["What does こんにちは mean?", "English"],
+    ["What does 안녕하세요 mean?", "English"],
+    ["Please translate 日本語のビルドエラー into English for me", "English"],
+    ["ビルドが赤い理由を調べてください please", "Japanese"],
   ];
   for (const [text, want] of table) assert.equal(detectLanguage(text), want, text);
 });

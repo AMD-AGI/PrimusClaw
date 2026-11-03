@@ -8,7 +8,8 @@
  *
  * Nothing about the Router is restated here. The prompt is `renderRouterSystem`, the tool definitions are what
  * the assistant's MCP server lists for a router token, the reply limit is `SAY_MAX_CHARS`, the way an item is named
- * is `parseItemRef`, the reply-language line is `languageToAnswerIn` and `withReplyLanguage`, and the turn budget is
+ * is `parseItemRef`, the reply-language line is `languageToAnswerIn` and `withReplyLanguage`, what is delivered when a turn
+ * ends in plain text is `answerToDeliver`, and the turn budget is
  * `CLAW_ASSISTANT_ROUTER_MAX_TURNS`: when one of them changes, the evaluation measures the new one. The one
  * piece that is reproduced rather than imported is the wrapper Brain puts around the user's words
  * (`brain/src/agent/prompt.ts: buildPrompt`), because the api package does not depend on Brain.
@@ -21,6 +22,7 @@ import { createAssistantMcpServer } from "../../src/assistant/mcp.js";
 import { parseItemRef } from "../../src/assistant/item-ref.js";
 import { languageToAnswerIn, withReplyLanguage } from "../../src/assistant/language.js";
 import { renderRouterSystem, SAY_MAX_CHARS, WORK_EVENT_PREFIX, type ManifestItem } from "../../src/assistant/prompts.js";
+import { answerToDeliver } from "../../src/assistant/router-turn-end.js";
 import { ASSISTANT_MCP_SERVER } from "../../src/assistant/role-profile.js";
 import {
   FIXTURE, itemIdOf, NOTHING, type EvalCase, type Effects, type FixtureItem, type HistoryTurn,
@@ -320,8 +322,10 @@ export interface Trace {
   turns: number;
   /** The turn budget ran out with the model still calling tools. */
   exhausted: boolean;
-  /** The text the model wrote outside any tool; it reaches nobody. */
+  /** The text the model wrote outside any tool; it reaches nobody unless the turn ended without a say (`delivered`). */
   stray: string;
+  /** What the completion handler delivers when the turn ends in plain text and no say (`answerToDeliver`). */
+  delivered?: string;
   inputTokens: number;
   outputTokens: number;
   /** The model could not be reached: the case has no answer, which is not a pass. */
@@ -339,8 +343,19 @@ export interface RunOptions {
   strictIds?: boolean;
 }
 
-/** Runs the Router on one case: the model calls tools, the stand-in answers, until the model stops or the budget is spent. */
+/**
+ * Runs the Router on one case: the model calls tools, the stand-in answers, until the model stops or the budget is spent,
+ * and then the turn ends as the system ends it: plain text and no say is delivered as a say.
+ */
 export async function runCase(c: EvalCase, opts: RunOptions): Promise<Trace> {
+  const trace = await runLoop(c, opts);
+  const spoke = trace.calls.some((x) => x.tool === "say" && !x.refused);
+  const text = trace.error || spoke ? null : answerToDeliver(trace.stray, [c.text]);
+  if (text) trace.delivered = text;
+  return trace;
+}
+
+async function runLoop(c: EvalCase, opts: RunOptions): Promise<Trace> {
   const maxTurns = opts.maxTurns ?? CLAW_ASSISTANT_ROUTER_MAX_TURNS;
   const items = fixtureFor(c);
   const system = renderRouterSystem(manifestOf(items));
@@ -447,6 +462,8 @@ export interface Score {
   sayItemOk: boolean;
   /** The reply is in the user's language. */
   langOk: boolean;
+  /** The user was told by the turn's end (plain text, no say) and not by a say. */
+  rescued: boolean;
   /** dispatch, speech, item and language all right. */
   turnOk: boolean;
   actual: Effects;
@@ -475,14 +492,15 @@ export function scoreCase(c: EvalCase, t: Trace): Score {
   const accepted = [c.expect, ...(c.also ?? [])];
   const says = t.calls.filter((x) => x.tool === "say" && !x.refused);
   const dispatchOk = !t.error && accepted.some((e) => sameEffects(e, actual));
-  const spokeOk = !t.error && (c.says === "optional" || says.length > 0);
+  const delivered = t.delivered ? [t.delivered] : [];
+  const spokeOk = !t.error && (c.says === "optional" || says.length + delivered.length > 0);
   const sayItemOk = c.sayItem == null || says.some((x) => x.ref?.seq === c.sayItem);
-  const texts = says.map((x) => String(x.input.text ?? ""));
+  const texts = [...says.map((x) => String(x.input.text ?? "")), ...delivered];
   const langOk = !c.lang || texts.every((s) => (c.lang === "zh" ? CJK.test(s) : !CJK.test(s)));
   return {
-    id: c.id, kind: c.kind, dispatchOk, spokeOk, sayItemOk, langOk,
+    id: c.id, kind: c.kind, dispatchOk, spokeOk, sayItemOk, langOk, rescued: delivered.length > 0,
     turnOk: dispatchOk && spokeOk && sayItemOk && langOk,
-    actual, attempted, spoke: says.length,
+    actual, attempted, spoke: says.length + delivered.length,
     inexactRefs: t.calls.filter((x) => x.ref && !x.ref.exact).length,
     refusals: t.calls.filter((x) => x.refused).map((x) => `${x.tool}:${(x.result as { error?: string }).error}`),
     saidBeforeResult: says.filter((x) => beside(t, x).length > 0).length,

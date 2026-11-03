@@ -68,6 +68,16 @@ test("P2 the router is told plain output reaches nobody, with the limit the serv
   assert.equal(SAY_MAX_CHARS, SAY_TEXT_MAX);
 });
 
+test("P1b the router and the worker are told the full name a tool is called by, which is the one Brain gives it", async () => {
+  const { TOOL_NAME_PREFIX } = await import("../src/assistant/prompts.js");
+  const { ASSISTANT_TOOLS_PATTERN, ASSISTANT_MCP_SERVER } = await import("../src/assistant/role-profile.js");
+  assert.equal(TOOL_NAME_PREFIX, "mcp__assistant__");
+  assert.equal(ASSISTANT_TOOLS_PATTERN, `${TOOL_NAME_PREFIX}*`, "the allowlist and the prompt name the same prefix");
+  assert.equal(ASSISTANT_MCP_SERVER, "assistant");
+  assert.match(ROUTER_PROMPT, /Tools \(call each by its full name: mcp__assistant__ followed by the name below, for example mcp__assistant__say\)/);
+  assert.match(WORKER_PROMPT, /mcp__assistant__report/);
+});
+
 test("P3 the worker is told how to report, to end with a report, and to check before it repeats", () => {
   assert.match(WORKER_PROMPT, /mcp__assistant__report/);
   assert.match(WORKER_PROMPT, new RegExp(`at most ${REPORT_SUMMARY_MAX} characters`));

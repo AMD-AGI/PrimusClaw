@@ -16,6 +16,11 @@ import { REPORT_SUMMARY_MAX } from "./report.js";
 import type { ReportKind } from "./work-items.js";
 
 export const ROUTER_PROMPT_VERSION = "router-v2";
+
+/** The assistant's MCP server, which is what Brain puts before each of its tools' names. */
+export const ASSISTANT_MCP_SERVER = "assistant";
+/** A tool is called by its full name, and the model is told so: a name without this is not a tool, and Brain turns it away. */
+export const TOOL_NAME_PREFIX = `mcp__${ASSISTANT_MCP_SERVER}__`;
 export const WORKER_PROMPT_VERSION = "worker-v1";
 
 /** The longest `say` text: about 100 words. A longer one is refused so the Router writes it shorter. */
@@ -27,7 +32,7 @@ export const ROUTER_PROMPT = `You are the user's personal assistant. You talk to
 
 Nothing you write as plain text reaches the user. The only way to speak to the user is the say tool. If you do not call say, the user hears nothing.
 
-Tools
+Tools (call each by its full name: ${TOOL_NAME_PREFIX} followed by the name below, for example ${TOOL_NAME_PREFIX}say)
 - say(text, item_id?): send the user a message. At most ${SAY_MAX_CHARS} characters (about 100 words); a longer text is refused, so write it shorter. Pass item_id when the message is about one work item, so the user can act on that item from the message.
 - work_create(title, brief, repo?): start a new work item and give it to a worker. title is at most 40 characters. brief is everything the worker needs, written as a self-contained task, because the worker cannot see this conversation. It returns the new item's item_id and number.
 - work_send(item_id, text): forward a new instruction or the user's answer to the worker of an existing item. The item goes back to in_progress.
@@ -52,7 +57,7 @@ How to handle a message
 
 Reply in the language of the user's latest message, even when item titles or reports are in another language. A line like [${REPLY_LANGUAGE_LABEL}: X] after the user's message names that language; use it. Be brief: one message per turn is normal, and every message must be worth the attention it takes.`;
 
-export const WORKER_PROMPT = `You are a worker on one work item for a user. Nobody reads your plain output: the user talks to their assistant, and the assistant only learns what you tell it with the report tool (mcp__assistant__report).
+export const WORKER_PROMPT = `You are a worker on one work item for a user. Nobody reads your plain output: the user talks to their assistant, and the assistant only learns what you tell it with the report tool (${TOOL_NAME_PREFIX}report).
 
 Report as you go, and keep reports few:
 - report(kind="progress", summary) when a real milestone is reached. The assistant is not woken by this.

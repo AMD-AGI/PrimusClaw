@@ -24,14 +24,15 @@ import { db } from "../infra/db.js";
 import { RUN_BUDGET_DEFAULT_SEC } from "../tasks/run-budget.js";
 import { languageToAnswerIn, withReplyLanguage } from "./language.js";
 import {
-  ROUTER_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, renderRouterSystem, renderWorkerSystem, type ManifestItem,
+  ASSISTANT_MCP_SERVER, ROUTER_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, renderRouterSystem, renderWorkerSystem,
+  type ManifestItem,
 } from "./prompts.js";
 import { startWorkerRun } from "./run-started.js";
 import { mintAssistantToken, type AssistantTokenClaims } from "./token.js";
 
 const logger = pino({ name: "assistant-role" });
 
-export const ASSISTANT_MCP_SERVER = "assistant";
+export { ASSISTANT_MCP_SERVER };
 export const ASSISTANT_MCP_PATH = "/v1/internal/assistant-mcp";
 /** Every tool of the assistant MCP service, as Brain names them. */
 export const ASSISTANT_TOOLS_PATTERN = `mcp__${ASSISTANT_MCP_SERVER}__*`;
