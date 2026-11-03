@@ -64,7 +64,7 @@ export async function closeShared(): Promise<void> {
 
 export async function reviewEnv(env: Record<string, string> = {}, over: { actor?: Partial<ReviewActor>; cred?: Partial<ResolvedCredential> } = {}): Promise<ReviewEnv> {
   const pg = (shared ??= new PGlite());
-  await pg.exec("DROP TABLE IF EXISTS claw_github_audit, claw_github_confirmations, claw_sessions");
+  await pg.exec("DROP TABLE IF EXISTS claw_github_audit, claw_github_confirmations, claw_github_review_settings, claw_github_write_locks, claw_sessions");
   await pg.exec("CREATE TABLE claw_sessions (session_id TEXT PRIMARY KEY, user_id TEXT, config JSONB DEFAULT '{}'::jsonb, deleted_at TIMESTAMPTZ)");
   for (const sql of GITHUB_REVIEW_SCHEMA_SQL) await pg.exec(sql);
   const db: Queryable = {

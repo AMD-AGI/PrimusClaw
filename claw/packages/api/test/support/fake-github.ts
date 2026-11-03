@@ -149,15 +149,22 @@ export class FakeGithub {
       return json(200, { sha: "m".repeat(40), merged: true, message: "Pull Request successfully merged" });
     }
     if (/\/git\/ref\/heads\/(.+)$/.test(p)) return json(200, { object: { sha: BASE_TIP } });
+    const tree = /\/git\/trees\/([0-9a-f]{40})$/.exec(p);
+    if (tree) {
+      this.treeReads.push({ sha: tree[1] as string, recursive: call.query.recursive ?? "" });
+      return json(200, { sha: tree[1], truncated: false, tree: [], ...this.trees[tree[1] as string] });
+    }
     const contents = /\/contents\/(.+)$/.exec(p);
     if (contents) {
       const path = decodeURIComponent(contents[1] as string);
       // Contents are read at the base tip or the base branch, never at the head.
       this.contentRefs.push(call.query.ref ?? "");
       if (this.dirs[path]) return json(200, this.dirs[path]);
-      if (path in this.contents) {
-        const text = this.contents[path] as string;
-        return json(200, { type: "file", encoding: "base64", content: Buffer.from(text).toString("base64"), size: text.length });
+      // A symlink to a file answers with the file it points at, under that file's own path, as GitHub does.
+      const target = this.symlinks[path] ?? path;
+      if (target in this.contents) {
+        const text = this.contents[target] as string;
+        return json(200, { type: "file", path: target, encoding: "base64", content: Buffer.from(text).toString("base64"), size: text.length });
       }
       return json(404, { message: "Not Found" });
     }
@@ -165,4 +172,9 @@ export class FakeGithub {
   };
 
   contentRefs: string[] = [];
+  /** commit sha -> its recursive tree, as `GET /git/trees/{sha}?recursive=1` answers it; a commit not named here has an empty tree. */
+  trees: Record<string, { truncated?: boolean; tree?: Array<{ path: string; type: string; mode?: string; sha: string }> }> = {};
+  treeReads: Array<{ sha: string; recursive: string }> = [];
+  /** path -> the path a symlink there points at. */
+  symlinks: Record<string, string> = {};
 }
