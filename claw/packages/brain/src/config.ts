@@ -1863,6 +1863,12 @@ export const RULES_DIR = env("RULES_DIR", "/app/rules");
 // JSON ({"skills":[{"tool_id":N,"name"?:"x"}],"mcp_servers":{...}}); unset or
 // unreadable means the feature is off and chats are built exactly as before.
 export const PLATFORM_DEFAULTS_FILE = env("PLATFORM_DEFAULTS_FILE");
+// Comma-separated hosts a marketplace tool's or a plugin's MCP server must name
+// for its `<SAFE_API_KEY>` to expand to the caller's platform key. Those servers
+// are written by third parties at any URL; anywhere else the key expands to "".
+export const MCP_PLATFORM_KEY_ALLOWED_HOSTS: ReadonlySet<string> = new Set(
+  env("MCP_PLATFORM_KEY_ALLOWED_HOSTS").split(",").map((h) => h.trim().toLowerCase()).filter(Boolean),
+);
 // Whether the file's `skills` apply. Off: only its MCP servers are mounted.
 export const PROGRESSIVE_SKILLS_ENABLED = envBool("PROGRESSIVE_SKILLS_ENABLED", false);
 // Budget for the downloaded skill files (plugin skills and marketplace tool_ids

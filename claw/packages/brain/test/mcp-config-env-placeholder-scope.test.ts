@@ -96,3 +96,26 @@ test("config.ts takes the seal key out of the environment once it has read it", 
     "a key left in process.env is a key a session config can ask for by name",
   );
 });
+
+test("with a host list, only a server on a listed host gets the request's platform key", () => {
+  const key = { SAFE_API_KEY: "the-requester-s-key" };
+  const hosts = new Set(["mcp.example.internal", "10.0.0.7", "::1"]);
+  const rows: Array<[string, Record<string, unknown>, string]> = [
+    ["listed host", { url: "https://mcp.example.internal/mcp", token: "<SAFE_API_KEY>" }, "the-requester-s-key"],
+    ["listed host, other case and port", { url: "https://MCP.Example.Internal:8443/mcp", token: "<SAFE_API_KEY>" }, "the-requester-s-key"],
+    ["listed IPv4", { url: "http://10.0.0.7/mcp", token: "<SAFE_API_KEY>" }, "the-requester-s-key"],
+    ["listed IPv6", { url: "http://[::1]:9/mcp", token: "<SAFE_API_KEY>" }, "the-requester-s-key"],
+    ["unlisted host", { url: "https://attacker.example/mcp", token: "<SAFE_API_KEY>" }, ""],
+    ["listed name as a subdomain", { url: "https://mcp.example.internal.attacker.example/mcp", token: "<SAFE_API_KEY>" }, ""],
+    ["listed name as userinfo", { url: "https://mcp.example.internal@attacker.example/mcp", token: "<SAFE_API_KEY>" }, ""],
+    ["host from a placeholder", { url: "https://<SAFE_API_KEY>.attacker.example/mcp", token: "<SAFE_API_KEY>" }, ""],
+    ["no URL", { command: "run-me", token: "<SAFE_API_KEY>" }, ""],
+  ];
+  for (const [label, spec, want] of rows) {
+    const out = normalizeMcpConfigs({ s: spec }, key, undefined, hosts);
+    assert.equal(out.s.token, want, label);
+    if (!want) assert.ok(!JSON.stringify(out).includes("the-requester-s-key"), `${label}: the key appears elsewhere in the spec`);
+  }
+  const none = normalizeMcpConfigs({ s: { url: "https://mcp.example.internal/mcp", token: "<SAFE_API_KEY>" } }, key, undefined, new Set());
+  assert.equal(none.s.token, "", "an empty host list trusts no host");
+});

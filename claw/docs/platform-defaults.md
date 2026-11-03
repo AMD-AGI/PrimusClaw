@@ -42,7 +42,10 @@ default; with `PLATFORM_DEFAULTS_FILE` unset, chats are built exactly as before.
   `mcp_servers` may use as `<NAME>` placeholders, e.g. `["EXAMPLE_MCP_TOKEN"]`.
   Only this file can read the Brain's environment: a server from a request, a
   `tool_ids` tool or a plugin gets `<SAFE_API_KEY>` and an empty string for any
-  other name. An unlisted name expands to an empty string here too.
+  other name. An unlisted name expands to an empty string here too. A `tool_ids`
+  or plugin server gets `<SAFE_API_KEY>` only when its URL's host is listed in
+  the Brain's `MCP_PLATFORM_KEY_ALLOWED_HOSTS` (comma separated); elsewhere the
+  placeholder expands to an empty string.
 
 Mount order, lowest priority first: platform defaults, request `mcp_servers`,
 `tool_ids`, plugin. A skill the request already supplies (plugin, local, or

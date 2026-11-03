@@ -12,8 +12,11 @@
  * Only the defaults file is written by the operator; the other three are
  * written by whoever sends the message or publishes the tool. So only the
  * defaults file gets environment values, and only the names it lists in
- * `mcp_env_allow`. Every layer still gets the values the request itself carries
- * (`<SAFE_API_KEY>`, the requester's own platform key).
+ * `mcp_env_allow`. The defaults file and the request's own servers get the
+ * values the request itself carries (`<SAFE_API_KEY>`, the requester's own
+ * platform key); a marketplace or plugin server gets it only on a host listed in
+ * MCP_PLATFORM_KEY_ALLOWED_HOSTS. The same server is reached as `127.0.0.1`
+ * (listed) and as `localhost` (not), so only the host name differs.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -25,19 +28,26 @@ const pw = await startPluginWorld();
 const PROBE = "probe-value-from-brain-env";
 process.env.CLAW261_PROBE = PROBE;
 process.env.CLAW261_LISTED = "listed-by-the-defaults-file";
+process.env.MCP_PLATFORM_KEY_ALLOWED_HOSTS = " 127.0.0.1 ,mcp.example.internal";
+const untrustedUrl = pw.mcpUrl.replace("127.0.0.1", "localhost");
 
-const server = (layer: string) => ({
+const server = (layer: string, url = pw.mcpUrl) => ({
   type: "http",
-  url: pw.mcpUrl,
+  url,
   token: "<SAFE_API_KEY>",
-  headers: { "x-layer": layer, "x-probe": "<CLAW261_PROBE>", "x-listed": "<CLAW261_LISTED>" },
+  headers: { "x-layer": layer, "x-probe": "<CLAW261_PROBE>", "x-listed": "<CLAW261_LISTED>", "x-key": "<SAFE_API_KEY>" },
 });
+/** An empty token is refused before connecting, so the unlisted-host servers carry one of their own to be seen arriving. */
+const untrusted = (layer: string) => ({ ...server(layer, untrustedUrl), token: "the-tool-s-own-token" });
 
 const world = await startWorld({
   mcp_servers: { pd: server("defaults") },
   mcp_env_allow: ["CLAW261_LISTED"],
 });
-world.setTools([{ id: 41, name: "mkt", type: "mcp", config: { mcpServers: { mkt: server("marketplace") } } }]);
+world.setTools([{
+  id: 41, name: "mkt", type: "mcp",
+  config: { mcpServers: { mkt: server("marketplace"), mkt_untrusted: untrusted("marketplace-untrusted") } },
+}]);
 const { AgentEngine } = await import("../src/agent/engine.js");
 test.after(async () => { await world.close(); await pw.close(); });
 
@@ -55,20 +65,36 @@ test("only the operator's defaults file reads the environment, and only the name
   await run({ mcp_servers: { req: server("request") }, tool_ids: [41] });
   await run({
     plugin_id: 5,
-    plugin_tools: [{ id: 17, type: "mcp", name: "plg", config: { mcpServers: { plg: server("plugin") } } }],
+    plugin_tools: [{
+      id: 17, type: "mcp", name: "plg",
+      config: { mcpServers: { plg: server("plugin"), plg_untrusted: untrusted("plugin-untrusted") } },
+    }],
   });
 
-  const seen = new Map<string, { probe: unknown; listed: unknown; auth: unknown }>();
+  const seen = new Map<string, { probe: unknown; listed: unknown; auth: unknown; key: unknown }>();
   for (const h of pw.mcpHeaders) {
     if (typeof h["x-layer"] === "string" && !seen.has(h["x-layer"])) {
-      seen.set(h["x-layer"], { probe: h["x-probe"], listed: h["x-listed"], auth: h.authorization });
+      seen.set(h["x-layer"], { probe: h["x-probe"], listed: h["x-listed"], auth: h.authorization, key: h["x-key"] });
     }
   }
-  assert.deepEqual([...seen.keys()].sort(), ["defaults", "marketplace", "plugin", "request"], "every layer's server was contacted");
+  assert.deepEqual(
+    [...seen.keys()].sort(),
+    ["defaults", "marketplace", "marketplace-untrusted", "plugin", "plugin-untrusted", "request"],
+    "every layer's server was contacted",
+  );
   for (const [layer, got] of seen) {
-    assert.equal(got.auth, "Bearer ak-user-key", `${layer}: the request's own platform key still fills <SAFE_API_KEY>`);
+    if (layer.endsWith("-untrusted")) {
+      assert.equal(got.key, "", `${layer}: a third party's server on an unlisted host gets no platform key`);
+    } else {
+      assert.equal(got.auth, "Bearer ak-user-key", `${layer}: the request's own platform key fills <SAFE_API_KEY>`);
+      assert.equal(got.key, "ak-user-key", `${layer}: in a header as well`);
+    }
     assert.equal(got.probe, "", `${layer}: a name nobody listed expands to nothing`);
     assert.equal(got.listed, layer === "defaults" ? "listed-by-the-defaults-file" : "", `${layer}: the allow list is the defaults file's own`);
   }
   assert.ok(!JSON.stringify(pw.mcpHeaders).includes(PROBE), "the environment value reached the MCP server");
+  assert.ok(
+    !pw.mcpHeaders.some((h) => String(h["x-layer"]).endsWith("-untrusted") && JSON.stringify(h).includes("ak-user-key")),
+    "the platform key reached an unlisted host",
+  );
 });

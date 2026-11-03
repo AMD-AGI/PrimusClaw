@@ -36,7 +36,7 @@ import {
   DEFAULT_MODEL, MAX_TURNS,
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED,
   BASH_APPROVAL_RULES, ASK_USER_QUESTION_ENABLED, A2A_CLIENT_ENABLED,
-  PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED,
+  MCP_PLATFORM_KEY_ALLOWED_HOSTS, PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED,
 } from "../config.js";
 import { a2aApprovalHold } from "../clients/a2a.js";
 import { WebSearchService, WebFetchService, SimpleSessionCostTracker } from "../tools/web/index.js";
@@ -161,17 +161,21 @@ export class AgentEngine {
     // a sub-agent starts from the schemas of the run that made it, so it has none either. Read as
     // truthy, not `=== true`: a mark that is not a boolean is still a mark.
     const defaults = PLATFORM_DEFAULTS_FILE && !request.withhold_sandbox_keys ? loadPlatformDefaults() : null;
-    const authoredMcp = {
-      ...(request.mcp_servers || {}),
-      ...resolved.mcpServers,
-      ...pluginLayer.mcpServers,
-    };
+    // Marketplace and plugin servers are third parties' at URLs nobody vetted, so the requester's
+    // platform key fills their `<SAFE_API_KEY>` only on a host the operator trusts
+    // (MCP_PLATFORM_KEY_ALLOWED_HOSTS). A request's own servers are the requester's choice of where
+    // their own key goes.
+    const toolMcp = { ...resolved.mcpServers, ...pluginLayer.mcpServers };
+    const requestMcp = Object.fromEntries(
+      Object.entries(request.mcp_servers || {}).filter(([name]) => !Object.hasOwn(toolMcp, name)),
+    );
     const defaultMcp = Object.fromEntries(
-      Object.entries(defaults?.mcpServers || {}).filter(([name]) => !(name in authoredMcp)),
+      Object.entries(defaults?.mcpServers || {}).filter(([name]) => !Object.hasOwn(toolMcp, name) && !Object.hasOwn(requestMcp, name)),
     );
     const mergedMcp = {
       ...normalizeMcpConfigs(defaultMcp, envOverrides, defaults?.mcpEnvAllow),
-      ...normalizeMcpConfigs(authoredMcp, envOverrides),
+      ...normalizeMcpConfigs(requestMcp, envOverrides),
+      ...normalizeMcpConfigs(toolMcp, envOverrides, undefined, MCP_PLATFORM_KEY_ALLOWED_HOSTS),
     };
 
     const allSkills: Record<string, string> = {};

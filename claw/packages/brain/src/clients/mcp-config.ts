@@ -44,16 +44,29 @@ function replaceEnvPlaceholders(
   return obj;
 }
 
+/** The literal host a spec's URL names, or null when it names none (no URL, or a placeholder in the host). */
+function literalUrlHost(url: unknown): string | null {
+  if (typeof url !== "string") return null;
+  try {
+    return new URL(url).hostname.replace(/^\[|\]$/g, "").toLowerCase() || null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Normalize and validate MCP server configs.
  * @param servers - raw MCP server configs from tool_ids / request
  * @param overrides - values the request carries, for `<VAR>` placeholders in spec
  * @param envAllow - names that may be read from process.env; only the operator's defaults file has any
+ * @param overrideHosts - when given, only a server whose URL names one of these hosts gets `overrides`
+ *   (the requester's platform key); any other server gets the empty string for them, as for an unlisted name
  */
 export function normalizeMcpConfigs(
   servers: Record<string, Record<string, unknown>>,
   overrides: Record<string, string> = {},
   envAllow: ReadonlySet<string> = new Set(),
+  overrideHosts?: ReadonlySet<string>,
 ): Record<string, Record<string, unknown>> {
   const out: Record<string, Record<string, unknown>> = {};
 
@@ -61,7 +74,9 @@ export function normalizeMcpConfigs(
     if (!rawSpec || typeof rawSpec !== "object") continue;
     if (!rawSpec.url && !rawSpec.command) continue;
 
-    const spec = replaceEnvPlaceholders({ ...rawSpec }, overrides, envAllow) as Record<string, unknown>;
+    const host = overrideHosts ? literalUrlHost(rawSpec.url) : null;
+    const trusted = !overrideHosts || (host !== null && overrideHosts.has(host));
+    const spec = replaceEnvPlaceholders({ ...rawSpec }, trusted ? overrides : {}, envAllow) as Record<string, unknown>;
 
     if (!spec.type) {
       if (spec.url) {
