@@ -367,7 +367,10 @@ export interface ExecuteRequest {
    * This session acts as another user's GitHub account (`config.acting_as`), so its model reads text that strangers wrote. Brain keeps
    * using the keys of this request for its own calls (the LLM gateway, SaFE) and puts none of them in the environment of the sandbox it
    * creates: no `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or `SAFE_API_KEY`. Whatever the model runs in the sandbox, it has no key to read
-   * out. Absent means a session like any other, as before the field existed.
+   * out. Nor is such a run given the deployment's platform defaults (`PLATFORM_DEFAULTS_FILE`: default MCP servers, which are called with
+   * the requester's key, and default skills): it has the tools its own request names, and nothing that every session of the deployment
+   * is given. It is not offered `save_memory` either (whatever `memory_enabled` says), and the API puts none of the requester's memory in
+   * its prompt and saves none from it. Absent means a session like any other, as before the field existed.
    */
   withhold_sandbox_keys?: boolean;
 
