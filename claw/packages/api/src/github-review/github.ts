@@ -33,6 +33,20 @@ export class GithubError extends Error {
   }
 }
 
+/**
+ * GitHub answered a GraphQL request with 200 and an `errors` list: the request was understood and refused. `detail` is the first error's
+ * message (redacted, cut), which is what a caller tells the person; the message of the error itself carries the same text.
+ */
+export class GithubGraphqlError extends GithubError {
+  readonly detail: string;
+
+  constructor(detail: string, requestId: string) {
+    super(502, `GraphQL: ${detail}`, requestId);
+    this.name = "GithubGraphqlError";
+    this.detail = detail;
+  }
+}
+
 export interface GithubClientOptions {
   token: string;
   apiUrl: string;
@@ -203,7 +217,7 @@ export class GithubClient {
     const body = answer.json;
     if (!body || body.errors?.length || body.data === undefined) {
       const msg = this.redact(body?.errors?.[0]?.message ?? "no data").slice(0, 200);
-      throw new GithubError(502, `GraphQL: ${msg}`, answer.requestId);
+      throw new GithubGraphqlError(msg, answer.requestId);
     }
     return body.data;
   }

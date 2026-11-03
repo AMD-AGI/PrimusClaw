@@ -74,7 +74,7 @@ with their account (`delegation_off`).
 | `gh_pr_get` | The pull request, its files and diff, CI, review threads, existing comments, the risk verdict, what the acting user may do, the review path (below) and the review instructions. Text that came from the pull request is under `untrusted`. Call it first. |
 | `gh_pr_risk` | The risk verdict alone, with its categories. The model may pass `risk_flags` (`security_finding`, `review_skipped`) and a `risk_judgement` (see High risk); both can only raise the verdict. |
 | `gh_review_submit` | One review on the pinned head commit (the model may pass the same `risk_flags` as to `gh_pr_risk`, and they count for an `APPROVE`), with inline comments that must sit on lines the diff shows. `COMMENT`, `REQUEST_CHANGES` or `APPROVE`. A body footer says `Reviewed by <agent name> on behalf of <login> (requested by <name>), run <id>` (the agent name is `CLAW_GITHUB_REVIEW_AGENT_NAME`, default `Claw`) and a hidden marker (the run, the event and a digest of the text and inline comments) keeps a retry of the same review from posting twice, while a different review of the same kind on the same commit is posted. An `APPROVE` of a high-risk change is held until the acting user confirms (below). |
-| `gh_pr_merge` | Approves when needed and merges, if every gate is open. A base branch that is merged through a merge queue is refused (below). A high-risk change is held until the acting user confirms. |
+| `gh_pr_merge` | Approves when needed and merges, if every gate is open. On a base branch that is merged through a merge queue it puts the pull request in the queue instead of merging it (`queued`, below). A high-risk change is held until the acting user confirms. |
 
 ## Gates (all enforced inside the tools)
 
@@ -84,7 +84,7 @@ with their account (`delegation_off`).
   is judged by its owner now. Nothing is asked of GitHub for an owner that is not allowed.
 - **Which commit.** `gh_review_submit` and `gh_pr_merge` take the `head_sha` that `gh_pr_get`
   returned. A head that moved is refused (`head_moved`); the merge itself is made with
-  `sha=<head>`, so GitHub refuses it too if the head moves in between.
+  `sha=<head>` (and a request to the merge queue names it as `expectedHeadOid`), so GitHub refuses it too if the head moves in between.
 - **The acting user's say.** The credential is the acting user's own (`requester_user_id ==
   user_id`) or the user has allowed others to act for them (the identity provider's
   `delegation` flag, their standing authorization). Without that every tool is refused
@@ -97,8 +97,10 @@ with their account (`delegation_off`).
   review and a merge ask, after the pull request itself has been read and before CI, threads, the diff
   or the merge rules are read and before anyone is asked to confirm, and again when the acting user
   allows a held write. The person who asked is not looked at: they are very often the author, which is
-  the ordinary case, and their own GitHub account need not be bound. A comment and a request for changes
-  approve nothing and are not held to it.
+  the ordinary case, and their own GitHub account need not be bound. An account whose login the identity
+  provider does not know (an empty one) cannot be compared with the author, so an approval or a merge with it is
+  refused too (`acting_login_unknown`), at the same place. A comment and a request for changes approve nothing
+  and are not held to either. `gh_pr_get` tells the model before it tries: `acting.acting_user_is_author`.
 - **Standing authorization and high risk.** With the acting user's `delegation` flag on, a `COMMENT`, a
   `REQUEST_CHANGES`, an `APPROVE` and a merge are made at once, whoever asked, when the change is not
   high risk. An `APPROVE` review and a merge of a high-risk change (the rules and the reviewer's own flags
@@ -109,16 +111,30 @@ with their account (`delegation_off`).
   are read again when they allow it. It cannot be switched off by a setting or by a repository's
   configuration. A held approval is posted alone: to approve and merge in one confirmation, a model calls
   `gh_pr_merge`.
-- **Merge queue.** A merge is refused (`merge_queue_required`) before anything is written, and before
-  anyone is asked to confirm, when the base branch is merged through a merge queue: this tool approves and
-  then merges directly, which such a branch refuses after the approval is already on the pull request.
-  Two reads say it. The rules of the base branch (`GET /repos/{owner}/{repo}/rules/branches/{branch}`, the
-  same read that finds the required checks) include a `merge_queue` rule; that sees rulesets only. And
-  the pull request's `isMergeQueueEnabled` (the GraphQL read of its merge state, so no further request)
-  is true, which also covers a queue set up through classic branch protection. Either one refuses, a
-  `false`, a `null` and a missing field are not a queue, and a queue that appears after the acting user was
-  asked refuses at their allow. Rules that cannot be read are not a queue; they fail the CI gate
-  (`ci_not_green`) before any write.
+- **Merge queue.** A base branch that is merged through a merge queue refuses a direct merge, so there
+  `gh_pr_merge` does not merge: after every gate of a merge has passed and the approval is on the pull
+  request (or the acting user has allowed a high-risk merge), it puts the pull request in the queue with the
+  GraphQL mutation `enqueuePullRequest`, as the acting user, pinned to the head commit the review read
+  (`expectedHeadOid`), so a push after the last read is not queued. It never jumps the queue. The answer is
+  `status: "queued"`, never `merged`, with the queue entry GitHub returned (`queue_entry_id`,
+  `queue_position`, `queue_state`) and `approved_by_this_call`. Claw does not track the queue: the queue runs
+  its own checks and merges the pull request, or takes it out, later, and nothing here looks again. A second
+  `gh_pr_merge` finds the pull request in the queue (`isInMergeQueue`, `mergeQueueEntry` in the same GraphQL
+  read) and answers `queued` with `already_queued: true` and writes nothing, so a retry after a lost answer
+  does not queue twice. Two reads say a queue is there, and either one is enough: the rules of the base branch
+  (`GET /repos/{owner}/{repo}/rules/branches/{branch}`, the same read that finds the required checks) include
+  a `merge_queue` rule, which sees rulesets only; and the pull request's `isMergeQueueEnabled` (the GraphQL
+  read of its merge state) is true, which also covers a queue set up through classic branch protection. A
+  `false`, a `null` and a missing field are not a queue; rules that cannot be read are not a queue either and
+  fail the CI gate (`ci_not_green`) before any write. The queue, not this call, chooses the merge method, so
+  `method` and the repository's allowed methods do not matter there. Failures are told as they are:
+  a head that moved (checked before the approval is written, and again when GitHub refuses the pinned head,
+  which is read again to say why) is `head_moved`; a queue GitHub refuses (repository settings, permissions) is
+  `enqueue_refused` with GitHub's own message and `approved_by_this_call`; an answer without a queue entry is
+  `enqueue_unconfirmed`; a pull request GitHub gave no id for is `unreadable_pull_request`. Nothing is ever
+  reported as queued or merged unless GitHub said so. The acting user's allow of a held merge queues it and
+  closes the confirmation as `queued` (below). A merge queue has not been exercised against a real
+  repository.
 - **An approval.** An approval can merge a pull request by itself (GitHub's auto-merge), so
   `gh_review_submit` with `APPROVE` is posted only where `gh_pr_merge` would not stop: CI is
   green on the head commit (`ci_not_green`) and no review thread is open (`threads_unresolved`);
@@ -213,8 +229,8 @@ with their account (`delegation_off`).
 
 | Route | Purpose |
 |---|---|
-| `GET /v1/github-review/confirmations?session_id=<id>&status=pending` | The confirmations of the caller's own sessions and those that ask the caller. `{items:[{id, kind, review, repo, pr, title, author, head_sha, reasons, checks, actor_user_id, requester_user_id, session_id, expires_at, status}]}`. `kind` is `merge` or `review`; for a `review`, `review` is `{event, body, comments: [{path, line, side, body}]}` as it will be posted (without its footer), and `null` for a merge. `status` is `pending`, `merging`, `merged`, `submitted`, `denied`, `stale`, `expired` or `refused` |
-| `POST /v1/github-review/confirmations/:id/decision` `{decision: "allow" \| "deny"}` | The acting user's answer, given with an identity provider's access token: their own sign-in at the provider, or an allowed service's (next section). Anyone else gets `403`, and so does the acting user with an `ak-` key (`Authorization: Bearer` or `x-api-key`), a BYOK key, a connector token or a browser session cookie, whatever the id (`403 interactive_sign_in_required`; the check is on how the request was authenticated, before the confirmation is looked up). The sandbox of a session holds its owner's key, and with SaFE's built-in sign-in that key sets the owner's password and logs in, which returns a session cookie the API verifies as the person's own: so neither a key nor a cookie is proof of a person, and a model in any session of that user could otherwise answer a confirmation itself. On `allow` every gate is read again and the held write is made with the acting user's account; the answer is `{status: "merged" \| "submitted" \| "denied" \| "stale" \| "expired" \| "refused" \| "retry", reason, merge_sha, review_id, url}` (`merged` for a merge, `submitted` for a review). `retry` means the write could not be tried just now (the identity service or GitHub failed, a limit was hit) before anything was sent to GitHub, and the confirmation is still open: allow it again. Once a review, an approval or a merge has been sent the try is not given back: the confirmation is closed as `refused` with `wrote: true`. The write is recorded as asked for by the requester, not by the acting user. A service an operator named may answer for the acting user too (next section) |
+| `GET /v1/github-review/confirmations?session_id=<id>&status=pending` | The confirmations of the caller's own sessions and those that ask the caller. `{items:[{id, kind, review, repo, pr, title, author, head_sha, reasons, checks, actor_user_id, requester_user_id, session_id, expires_at, status}]}`. `kind` is `merge` or `review`; for a `review`, `review` is `{event, body, comments: [{path, line, side, body}]}` as it will be posted (without its footer), and `null` for a merge. `status` is `pending`, `merging`, `merged`, `queued`, `submitted`, `denied`, `stale`, `expired` or `refused` |
+| `POST /v1/github-review/confirmations/:id/decision` `{decision: "allow" \| "deny"}` | The acting user's answer, given with an identity provider's access token: their own sign-in at the provider, or an allowed service's (next section). Anyone else gets `403`, and so does the acting user with an `ak-` key (`Authorization: Bearer` or `x-api-key`), a BYOK key, a connector token or a browser session cookie, whatever the id (`403 interactive_sign_in_required`; the check is on how the request was authenticated, before the confirmation is looked up). The sandbox of a session holds its owner's key, and with SaFE's built-in sign-in that key sets the owner's password and logs in, which returns a session cookie the API verifies as the person's own: so neither a key nor a cookie is proof of a person, and a model in any session of that user could otherwise answer a confirmation itself. On `allow` every gate is read again and the held write is made with the acting user's account; the answer is `{status: "merged" \| "queued" \| "submitted" \| "denied" \| "stale" \| "expired" \| "refused" \| "retry", reason, merge_sha, queue_entry_id, queue_position, queue_state, review_id, url}` (`merged` for a merge, `queued` for a merge that put the pull request in the base branch's merge queue, which is not yet merged, `submitted` for a review). `retry` means the write could not be tried just now (the identity service or GitHub failed, a limit was hit) before anything was sent to GitHub, and the confirmation is still open: allow it again. Once a review, an approval or a merge has been sent the try is not given back: the confirmation is closed as `refused` with `wrote: true`. The write is recorded as asked for by the requester, not by the acting user. A service an operator named may answer for the acting user too (next section) |
 
 A browser session cookie would be taken again only where the platform that issues it refuses to set a
 password with an API key; that is a change to Primus-SaFE, not something this code can check, so until

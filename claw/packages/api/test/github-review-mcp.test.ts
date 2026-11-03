@@ -309,6 +309,38 @@ describe("C confirmations over HTTP", () => {
   });
 });
 
+describe("C4 a merge into a branch with a merge queue, over HTTP", () => {
+  beforeEach(async () => {
+    await boot();
+    e.identity.answer = async () => credential({ delegation: true });
+    e.gh.files = [{ filename: ".github/workflows/ci.yml", status: "modified", additions: 1, deletions: 0, patch: "@@ -1 +1,2 @@\n a\n+b" }];
+    e.gh.rules = [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "test" }] } }, { type: "merge_queue", parameters: {} }];
+  });
+  const http = async (user: string, method: string, path: string, body?: unknown) => {
+    const r = await fetch(base + path, { method, headers: { "x-test-user": user, ...(body === undefined ? {} : { "content-type": "application/json" }) }, body: body === undefined ? undefined : JSON.stringify(body) });
+    return { status: r.status, body: (await r.json().catch(() => null)) as any };
+  };
+
+  test("C4 the acting user's allow answers queued with the queue entry, the card is listed under status=queued, and nothing was merged", async () => {
+    const c = await connect(token());
+    const held = await call(c, "gh_pr_merge", { pr: PR, head_sha: HEAD });
+    assert.equal(held.body.status, "confirmation_required");
+    await c.close();
+    const id = held.body.confirmation_id as string;
+    const ok = await http("u-bob", "POST", `/v1/github-review/confirmations/${id}/decision`, { decision: "allow" });
+    assert.equal(ok.status, 200);
+    assert.deepEqual(ok.body, { ok: true, status: "queued", queue_entry_id: "MQE_kwDOdemo1", queue_position: 3, queue_state: "QUEUED", url: "https://github.com/AMD-AGI/demo/pull/7" });
+    assert.equal(e.gh.calls.filter((x) => x.method === "PUT").length, 0, "no direct merge");
+    assert.equal(e.gh.enqueues.length, 1);
+    const listed = await http("u-bob", "GET", "/v1/github-review/confirmations?session_id=s-1&status=queued");
+    assert.equal(listed.status, 200);
+    assert.deepEqual(listed.body.items.map((i: any) => [i.id, i.status]), [[id, "queued"]]);
+    assert.equal((await http("u-bob", "GET", "/v1/github-review/confirmations?session_id=s-1&status=pending")).body.items.length, 0);
+    assert.equal((await http("u-bob", "POST", `/v1/github-review/confirmations/${id}/decision`, { decision: "allow" })).body.status, "refused");
+    assert.equal(e.gh.enqueues.length, 1);
+  });
+});
+
 describe("C3 who may answer for the acting user", () => {
   beforeEach(async () => {
     await boot();

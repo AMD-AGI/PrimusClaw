@@ -107,7 +107,8 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor)
     "gh_pr_merge",
     "Approve (when needed) and merge the pull request if every gate is open: CI green on the head commit, no unresolved thread, merge state CLEAN, "
     + "the acting user allowing it (refused when they wrote the pull request), and no high-risk change without their confirmation: a high-risk merge answers confirmation_required and waits for them. "
-    + "A branch that is merged through a merge queue is refused (merge_queue_required). It never bypasses a protection.",
+    + "A branch that is merged through a merge queue gets the pull request put in the queue instead (status queued, never merged): the queue runs its own checks and merges it, and this tool does not follow it. "
+    + "It never bypasses a protection.",
     {
       pr: z.string().describe(PR_HELP),
       head_sha: z.string().describe("The head_sha from gh_pr_get"),
@@ -124,7 +125,7 @@ function refuse(reply: FastifyReply, status: number, error: string): FastifyRepl
   return reply.status(status).send({ ok: false, error });
 }
 
-const CONFIRMATION_STATUSES = new Set<string>(["pending", "merging", "merged", "submitted", "denied", "stale", "expired", "refused"]);
+const CONFIRMATION_STATUSES = new Set<string>(["pending", "merging", "merged", "queued", "submitted", "denied", "stale", "expired", "refused"]);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export async function registerGithubReviewRoutes(app: FastifyInstance, opts: GithubReviewRouteOptions = {}): Promise<void> {

@@ -52,7 +52,8 @@ export class FakeGithub {
   rules: unknown = [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "test" }] } }];
   rulesStatus = 200;
   graphql: Record<string, any> = {
-    mergeStateStatus: "CLEAN", mergeable: "MERGEABLE", reviewDecision: "APPROVED", headRefOid: HEAD, isMergeQueueEnabled: false,
+    id: "PR_kwDOdemo7", mergeStateStatus: "CLEAN", mergeable: "MERGEABLE", reviewDecision: "APPROVED", headRefOid: HEAD, isMergeQueueEnabled: false,
+    isInMergeQueue: false, mergeQueueEntry: null,
     reviewThreads: { totalCount: 0, nodes: [] },
   };
   /** What the next GraphQL calls answer, one entry each and in order, each laid over `graphql`; once used up, `graphql` itself. */
@@ -65,6 +66,12 @@ export class FakeGithub {
   /** directory path -> entries. */
   dirs: Record<string, Array<{ name: string; type: string }>> = {};
   mergeStatus = 200;
+  /** What the `enqueuePullRequest` mutation answers with when it goes through: the entry GitHub returns, or null for an answer without one. */
+  enqueueEntry: Record<string, any> | null = { id: "MQE_kwDOdemo1", position: 3, state: "QUEUED" };
+  /** A GraphQL error message for the mutation (the answer is 200 with `errors`), as GitHub gives when it refuses to queue; null to let it through. */
+  enqueueRefusal: string | null = null;
+  /** Runs when the mutation arrives, before GitHub looks at the head it names: a test moves the pull request's head here. */
+  onEnqueue: () => void = () => {};
   /** Runs after a review is posted, so a test can make an approval turn the merge state CLEAN. */
   onReview: (review: Record<string, any>) => void = () => {};
   /** Errors by path prefix, for a test of how failures read. */
@@ -72,7 +79,10 @@ export class FakeGithub {
   /** Hold every request until released, for a test of concurrency. */
   gate: Promise<void> | null = null;
 
-  get writes(): Call[] { return this.calls.filter((c) => c.method !== "GET" && c.path !== "/graphql"); }
+  /** The mutations that put a pull request in the merge queue, among the GraphQL calls. */
+  get enqueues(): Call[] { return this.calls.filter((c) => c.path === "/graphql" && /enqueuePullRequest/.test(String(c.body?.query ?? ""))); }
+  /** Every request that changes something: a review, a merge, or a pull request put in the merge queue (the other GraphQL calls only read). */
+  get writes(): Call[] { return this.calls.filter((c) => (c.method !== "GET" && c.path !== "/graphql") || this.enqueues.includes(c)); }
   count(pattern: RegExp, method?: string): number {
     return this.calls.filter((c) => pattern.test(c.path) && (!method || c.method === method)).length;
   }
@@ -93,6 +103,14 @@ export class FakeGithub {
       if (call.path.startsWith(prefix) && (!f.method || f.method === method)) return json(f.status, { message: f.message });
     }
     const p = call.path;
+    if (p === "/graphql" && this.enqueues.includes(call)) {
+      this.onEnqueue();
+      const refusal = this.enqueueRefusal
+        ?? (call.body.variables?.head !== this.graphql.headRefOid ? "Head branch was modified. Review the latest changes and try again." : null);
+      if (refusal) return json(200, { data: { enqueuePullRequest: null }, errors: [{ type: "UNPROCESSABLE", path: ["enqueuePullRequest"], message: refusal }] });
+      if (this.enqueueEntry) Object.assign(this.graphql, { isInMergeQueue: true, mergeQueueEntry: this.enqueueEntry });
+      return json(200, { data: { enqueuePullRequest: { mergeQueueEntry: this.enqueueEntry } } });
+    }
     if (p === "/graphql") return json(200, { data: { repository: { pullRequest: { ...this.graphql, ...(this.graphqlQueue.shift() ?? {}) } } } });
     if (/^\/repos\/[^/]+\/[^/]+$/.test(p)) return json(200, this.repo);
     if (/^\/repos\/[^/]+\/[^/]+\/pulls\/\d+$/.test(p)) return json(200, this.pr);

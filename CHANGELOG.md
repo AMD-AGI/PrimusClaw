@@ -127,11 +127,15 @@ record it.
   `config.review_target = {owner, repo, number}`, set only at creation: every tool call that names another is
   refused as `review_target_mismatch` before the acting user's credential is looked up. A merge into a branch with a merge
   queue (a `merge_queue` rule, or the pull request's own `isMergeQueueEnabled`, which also covers classic branch
-  protection) is refused as `merge_queue_required` before any approval is written. The review
+  protection) puts the pull request in the queue instead of merging it: after the approval (or the committer's allow
+  of a high-risk merge) the committer's account calls GraphQL `enqueuePullRequest` pinned to the head the review read,
+  and the answer is `queued` with the queue entry, never `merged`; Claw does not follow the queue (a moved head is
+  `head_moved`, a refusal by GitHub `enqueue_refused`). An account whose GitHub login is empty is refused for an
+  approval or a merge (`acting_login_unknown`), and `gh_pr_get` says `acting.acting_user_is_author`. The review
   footer, the hidden run marker and the repository configuration file no longer carry the name of the chat
   integration: the footer name is `CLAW_GITHUB_REVIEW_AGENT_NAME` (default `Claw`), the marker is `claw-review:run`
   and the file is `.github/claw-review.yml`; the old marker and file are still read and never written. The
-  confirmations table gains `kind`, `review` and `action_key` and a new status (upgraded in place at start-up).
+  confirmations table gains `kind`, `review` and `action_key` and the statuses `submitted` and `queued` (upgraded in place at start-up).
   See `claw/docs/github-review.md`.
 - GitHub pull request review, off by default (`CLAW_GITHUB_REVIEW_ENABLED=true`). A session created with
   `config.acting_as = <user id>` is offered four tools (`gh_pr_get`, `gh_pr_risk`, `gh_review_submit`,

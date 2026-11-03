@@ -11,8 +11,9 @@
  *
  *   H  what is held for the acting user: a high-risk merge and a high-risk approval, each posted exactly as held, once, when they allow it
  *   A  the author of the pull request asks: no look at the requester's own GitHub, and the committer's account does the work
- *   Q  a base branch with a merge queue, shown by its rules or only by GitHub's own answer: refused before anything is written, before anyone is asked
- *   O  the acting user wrote the pull request: refused up front
+ *   Q  a base branch with a merge queue, shown by its rules or only by GitHub's own answer: the pull request is put in the queue as the acting
+ *      user, pinned to the head the review read, and the answer is queued, never merged
+ *   O  the acting user wrote the pull request, or their login is not known: refused up front
  *   B  a session bound to one pull request: no tool call names another
  *   N  names: the footer, the marker and the repository's configuration file, and what an earlier release left behind
  */
@@ -311,45 +312,307 @@ describe("A the author of the pull request asks", () => {
 });
 
 describe("Q a base branch with a merge queue", () => {
-  const queue = [
-    { type: "required_status_checks", parameters: { required_status_checks: [{ context: "test" }] } },
-    { type: "merge_queue", parameters: { merge_method: "SQUASH", grouping_strategy: "ALLGREEN" } },
-  ];
+  // A queue is shown by the base branch's rules (a ruleset) or, for classic branch protection, only by GitHub's own isMergeQueueEnabled.
+  const needsTest = [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "test" }] } }];
+  const queue = [...needsTest, { type: "merge_queue", parameters: { merge_method: "SQUASH", grouping_strategy: "ALLGREEN" } }];
+  const byRule = (): void => { e.gh.rules = queue; };
+  const byClassic = (): void => { e.gh.rules = needsTest; e.gh.graphql.isMergeQueueEnabled = true; };
+  const ways: Array<[string, () => void]> = [["a merge_queue ruleset rule", byRule], ["classic branch protection (isMergeQueueEnabled)", byClassic]];
+  const enqueueStage = ["POST reviews", "POST graphql"];
 
-  test("Q1 a merge is refused as merge_queue_required, for the requester's own account and for someone else's, high risk or not, with nothing written and no one asked", async () => {
-    const cases: Array<[string, Parameters<typeof makeEnv>[1], () => void]> = [
-      ["the requester's own account", own, () => {}],
-      ["someone else's account", {}, () => {}],
-      ["someone else's account, high risk", {}, highRisk],
+  test("Q1 a merge into a branch with a queue approves and then puts the pull request in the queue, pinned to the head the review read, as the acting user: the answer is queued, never merged, whoever asked and however the queue shows", async () => {
+    for (const [way, setup] of ways) {
+      for (const [who, over] of [["someone else's account", {}], ["the requester's own account", own]] as const) {
+        const name = `${way}, ${who}`;
+        e = await env({}, over);
+        setup();
+        const o = await merge();
+        assert.equal(o.isError, false, `${name}: ${o.text}`);
+        assert.equal(o.body.status, "queued", name);
+        assert.deepEqual([o.body.queue_entry_id, o.body.queue_position, o.body.queue_state, o.body.approved_by_this_call, o.body.url], ["MQE_kwDOdemo1", 3, "QUEUED", true, "https://github.com/AMD-AGI/demo/pull/7"], name);
+        assert.equal(o.body.merge_sha, undefined, name);
+        assert.match(String(o.body.note), /not merged/, name);
+        assert.deepEqual(stages(e), enqueueStage, `${name}: an approval, then the queue, and no PUT merge`);
+        assert.equal(e.gh.count(/\/merge$/), 0, name);
+        const [call] = e.gh.enqueues;
+        assert.equal(call?.body.variables.id, "PR_kwDOdemo7", name);
+        assert.equal(call?.body.variables.head, HEAD, `${name}: pinned to the head the review read`);
+        assert.match(String(call?.body.query), /expectedHeadOid:\$head/, name);
+        assert.doesNotMatch(String(call?.body.query), /jump/, `${name}: never jumps the queue`);
+        assert.equal(e.gh.calls.every((c) => c.authorization === `Bearer ${TOKEN}`), true, `${name}: only the acting user's token reaches GitHub`);
+        assert.deepEqual(await rows(), [], `${name} asked someone`);
+      }
+    }
+  });
+
+  test("Q2 the queue merges after its own checks and this tool does not follow it: a second call finds the pull request in the queue and writes nothing, whatever the risk", async () => {
+    for (const [way, setup] of ways) {
+      e = await env();
+      setup();
+      assert.equal((await merge()).body.status, "queued", way);
+      highRisk();
+      const again = await merge();
+      assert.equal(again.isError, false, way);
+      assert.deepEqual([again.body.status, again.body.already_queued, again.body.queue_entry_id, again.body.queue_position], ["queued", true, "MQE_kwDOdemo1", 3], way);
+      assert.deepEqual(stages(e), enqueueStage, `${way}: the second call wrote`);
+      assert.deepEqual(await rows(), [], `${way}: the second call asked someone`);
+    }
+  });
+
+  test("Q3 a pull request that is in the queue already (put there by a person) is reported as it is, with nothing written; one that GitHub says is in the queue without an entry is too", async () => {
+    for (const entry of [{ id: "MQE_person", position: 1, state: "AWAITING_CHECKS" }, null]) {
+      e = await env();
+      byRule();
+      e.gh.graphql.isInMergeQueue = true;
+      e.gh.graphql.mergeQueueEntry = entry;
+      const o = await merge();
+      assert.deepEqual([o.body.status, o.body.already_queued, o.body.queue_entry_id ?? null, o.body.queue_state ?? null], ["queued", true, entry?.id ?? null, entry?.state ?? null], JSON.stringify(entry));
+      assert.equal(e.gh.writes.length, 0);
+    }
+  });
+
+  test("Q4 a high-risk merge into a branch with a queue is held as ever, and the acting user's allow approves and queues it: the card closes as queued and the answer carries the entry", async () => {
+    for (const [way, setup] of ways) {
+      e = await env();
+      setup();
+      highRisk();
+      const held = await merge();
+      assert.equal(held.body.status, "confirmation_required", way);
+      assert.equal(e.gh.writes.length, 0, `${way}: wrote before the allow`);
+      const id = String(held.body.confirmation_id);
+      const r = await e.service.decide("u-bob", id, "allow");
+      assert.deepEqual(r.body, { ok: true, status: "queued", queue_entry_id: "MQE_kwDOdemo1", queue_position: 3, queue_state: "QUEUED", url: "https://github.com/AMD-AGI/demo/pull/7" }, way);
+      assert.deepEqual(stages(e), enqueueStage, way);
+      const [row, ...more] = await rows();
+      assert.equal(more.length, 0, way);
+      assert.deepEqual([row?.status, row?.result?.queue_entry_id, row?.result?.queue_position, row?.decided_by], ["queued", "MQE_kwDOdemo1", 3, "u-bob"], way);
+      // The card is spent: a second click gets nothing and writes nothing.
+      assert.equal((await e.service.decide("u-bob", id, "allow")).body.status, "refused", way);
+      assert.equal(e.gh.enqueues.length, 1, way);
+    }
+  });
+
+  test("Q5 a head that moved is never queued: before the approval it is refused with nothing written, and after it (a push between the last read and the queue) GitHub's refusal of the pinned head is told as head_moved", async () => {
+    for (const [way, setup] of ways) {
+      // Seen before the approval is written: no review, no queue.
+      e = await env();
+      setup();
+      e.gh.graphql.headRefOid = "2".repeat(40);
+      let o = await merge();
+      assert.equal(reason(o), "head_moved", `${way}: ${o.text}`);
+      assert.equal(e.gh.writes.length, 0, `${way} wrote for a head that had already moved`);
+      // A push after the last read: the mutation names the head the review read, GitHub refuses it, and the head is read again to say why.
+      e = await env();
+      setup();
+      e.gh.onEnqueue = () => { e.gh.graphql.headRefOid = "3".repeat(40); };
+      o = await merge();
+      assert.equal(o.isError, true, way);
+      assert.equal(reason(o), "head_moved", `${way}: ${o.text}`);
+      assert.equal(o.body.current_head_sha, "3".repeat(40), way);
+      assert.deepEqual(stages(e), enqueueStage, `${way}: the approval was written, the queue refused`);
+      assert.equal(e.gh.enqueues[0]?.body.variables.head, HEAD, way);
+      assert.equal(o.body.status, "refused", way);
+    }
+  });
+
+  test("Q6 the acting user's allow of a held merge whose head moved meanwhile closes the card as stale and queues nothing", async () => {
+    byRule();
+    highRisk();
+    const id = String((await merge()).body.confirmation_id);
+    e.gh.graphql.headRefOid = "2".repeat(40);
+    const r = await e.service.decide("u-bob", id, "allow");
+    assert.deepEqual([r.body.status, r.body.reason], ["stale", "head_moved"]);
+    assert.equal(e.gh.writes.length, 0);
+    assert.equal((await rows())[0]?.status, "stale");
+  });
+
+  test("Q7 a queue GitHub refuses (repository settings, permissions) is refused as enqueue_refused with GitHub's own message: never queued, never merged, the approval said to be on the pull request", async () => {
+    for (const [way, setup] of ways) {
+      e = await env();
+      setup();
+      e.gh.enqueueRefusal = "Pull request is not in a mergeable state to be added to the merge queue";
+      const o = await merge();
+      assert.equal(o.isError, true, way);
+      assert.equal(reason(o), "enqueue_refused", `${way}: ${o.text}`);
+      assert.match(String(o.body.message), /Pull request is not in a mergeable state to be added to the merge queue/, way);
+      assert.equal(o.body.approved_by_this_call, true, way);
+      assert.notEqual(o.body.status, "queued", way);
+      assert.deepEqual(stages(e), enqueueStage, way);
+      assert.equal(e.gh.count(/\/merge$/), 0, way);
+      assert.equal(o.wrote, true, way);
+    }
+  });
+
+  test("Q7b a queue request that goes out counts as a write even when no approval was needed: the approval is on the pull request already, the queue refuses, and the call says it wrote", async () => {
+    byRule();
+    e.gh.reviews = [{ id: 1, state: "APPROVED", user: { login: "bob" }, commit_id: HEAD, body: "earlier" }];
+    e.gh.enqueueRefusal = "Merge queue is not enabled for this branch";
+    const o = await merge();
+    assert.equal(reason(o), "enqueue_refused", o.text);
+    assert.equal(o.body.approved_by_this_call, false);
+    assert.deepEqual(stages(e), ["POST graphql"], "only the queue request was sent");
+    assert.equal(o.wrote, true, "a request was sent to GitHub, so the try is not given back");
+  });
+
+  test("Q8 a refused queue at the acting user's allow closes the card as refused, with the reason and the fact that an approval went out", async () => {
+    byClassic();
+    highRisk();
+    const id = String((await merge()).body.confirmation_id);
+    e.gh.enqueueRefusal = "Merge queue is not enabled for this branch";
+    const r = await e.service.decide("u-bob", id, "allow");
+    assert.deepEqual([r.body.status, r.body.reason, r.body.wrote], ["refused", "enqueue_refused", true]);
+    assert.match(String(r.body.message), /Merge queue is not enabled for this branch/);
+    assert.equal((await rows())[0]?.status, "refused");
+  });
+
+  test("Q9 an answer that carries no queue entry is not queued: enqueue_unconfirmed, with the pull request left for a person to look at", async () => {
+    byRule();
+    e.gh.enqueueEntry = null;
+    const o = await merge();
+    assert.equal(o.isError, true);
+    assert.equal(reason(o), "enqueue_unconfirmed", o.text);
+    assert.notEqual(o.body.status, "queued");
+  });
+
+  test("Q10 an HTTP failure of the queue request is no queued and no merged either: the call fails with the status and nothing is claimed", async () => {
+    byRule();
+    const real = e.gh.fetch;
+    const flaky = async (input: URL | string | Request, init: RequestInit = {}): Promise<Response> => {
+      if (String(init.body ?? "").includes("enqueuePullRequest")) { await real(input, init); return new Response(JSON.stringify({ message: "Bad Gateway" }), { status: 502, headers: { "content-type": "application/json" } }); }
+      return real(input, init);
+    };
+    const failing = e.service as any;
+    const original = failing.deps.fetchImpl;
+    failing.deps.fetchImpl = flaky;
+    try {
+      const o = await merge();
+      assert.equal(o.isError, true, o.text);
+      assert.equal(reason(o), "github_error");
+      assert.equal(o.body.github_status, 502);
+      assert.notEqual(o.body.status, "queued");
+      assert.equal(o.wrote, true, "a request that may have landed counts as a write");
+    } finally {
+      failing.deps.fetchImpl = original;
+    }
+    // The request did land: the retry finds the pull request in the queue and says so, and writes nothing more.
+    const again = await merge();
+    assert.deepEqual([again.body.status, again.body.already_queued], ["queued", true]);
+    assert.equal(e.gh.enqueues.length, 1);
+  });
+
+  test("Q10b an HTTP refusal of the queue request (a missing permission, a request GitHub will not process) is enqueue_refused with GitHub's message; a rate limit is not, and a 5xx is not", async () => {
+    const answering = (status: number, message: string, headers: Record<string, string> = {}) => async (input: URL | string | Request, init: RequestInit = {}): Promise<Response> => {
+      const real = e.gh.fetch;
+      if (String(init.body ?? "").includes("enqueuePullRequest")) { await real(input, init); return new Response(JSON.stringify({ message }), { status, headers: { "content-type": "application/json", ...headers } }); }
+      return real(input, init);
+    };
+    const cases: Array<[number, string, Record<string, string>, string]> = [
+      [403, "Resource not accessible by personal access token", {}, "enqueue_refused"],
+      [422, "Validation Failed", {}, "enqueue_refused"],
+      [403, "You have exceeded a secondary rate limit", { "retry-after": "30" }, "github_rate_limited"],
+      [503, "Service Unavailable", {}, "github_error"],
     ];
-    for (const [name, over, setup] of cases) {
-      e = await env({}, over);
-      e.gh.rules = queue;
+    for (const [status, message, headers, code] of cases) {
+      e = await env();
+      byClassic();
+      const svc = e.service as any;
+      const original = svc.deps.fetchImpl;
+      svc.deps.fetchImpl = answering(status, message, headers);
+      try {
+        const o = await merge();
+        assert.equal(o.isError, true, `${status}: ${o.text}`);
+        assert.equal(reason(o), code, `${status} ${message}: ${o.text}`);
+        if (code === "enqueue_refused") assert.match(String(o.body.message), new RegExp(message), `${status}`);
+        assert.notEqual(o.body.status, "queued", String(status));
+        assert.equal(e.gh.count(/\/merge$/), 0, String(status));
+      } finally {
+        svc.deps.fetchImpl = original;
+      }
+    }
+  });
+
+  test("Q11 the queue chooses the merge method: a method the repository does not allow, or none allowed at all, does not stop a queued merge, and a branch without a queue still refuses it", async () => {
+    for (const [way, setup] of ways) {
+      e = await env();
+      setup();
+      e.gh.repo.allow_squash_merge = false;
+      e.gh.repo.allow_merge_commit = false;
+      e.gh.repo.allow_rebase_merge = false;
+      assert.equal((await merge({ method: "squash" })).body.status, "queued", way);
+    }
+    e = await env();
+    e.gh.repo.allow_squash_merge = false;
+    assert.equal(reason(await merge({ method: "squash" })), "merge_method_not_allowed");
+    assert.equal(e.gh.writes.length, 0);
+  });
+
+  test("Q12 a pull request GitHub gave no id for cannot be put in the queue: refused before anything is written", async () => {
+    for (const [way, setup] of ways) {
+      e = await env();
+      setup();
+      delete e.gh.graphql.id;
+      const o = await merge();
+      assert.equal(reason(o), "unreadable_pull_request", `${way}: ${o.text}`);
+      assert.equal(e.gh.writes.length, 0, way);
+    }
+  });
+
+  test("Q13 the same gates as any merge come first: CI red, an open thread and a merge state that is not CLEAN refuse a queued merge too, before anyone is asked and before the queue is asked", async () => {
+    for (const [way, setup] of ways) {
+      e = await env();
+      setup();
+      e.gh.checkRuns = [{ name: "test", status: "completed", conclusion: "failure" }];
+      assert.equal(reason(await merge()), "ci_not_green", way);
+      assert.equal(e.gh.writes.length, 0, way);
+      e = await env();
+      setup();
+      e.gh.graphql.reviewThreads = { totalCount: 1, nodes: [{ isResolved: false }] };
+      assert.equal(reason(await merge()), "threads_unresolved", way);
+      assert.equal(e.gh.writes.length, 0, way);
+      e = await env();
+      setup();
+      e.gh.graphql.mergeStateStatus = "BLOCKED";
+      assert.equal(reason(await merge()), "merge_state_not_clean", way);
+      assert.equal(e.gh.enqueues.length, 0, way);
+    }
+  });
+
+  test("Q14 with writes switched off every gate is checked and nothing is written: the dry run says it would queue", async () => {
+    for (const [way, setup] of ways) {
+      e = await env({ CLAW_GITHUB_WRITES_ENABLED: "false" });
       setup();
       const o = await merge();
-      assert.equal(o.isError, true, name);
-      assert.equal(reason(o), "merge_queue_required", `${name}: ${o.text}`);
-      assert.equal(e.gh.writes.length, 0, `${name} wrote`);
-      assert.equal(e.gh.calls.filter((c) => /\/reviews$/.test(c.path)).length, 0, `${name} even looked at the reviews`);
-      assert.deepEqual(await rows(), [], `${name} asked someone`);
+      assert.equal(o.body.status, "dry_run", way);
+      assert.deepEqual(o.body.would, { approve: true, enqueue: true, risk: "low", confirmed: false }, way);
+      assert.equal(e.gh.writes.length, 0, way);
     }
   });
 
-  test("Q2 only a merge_queue rule is a queue: other rules, an empty list and the same rule on another branch's answer are not", async () => {
-    for (const rules of [[], [{ type: "pull_request", parameters: {} }], [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "test" }] } }]]) {
+  test("Q15 a branch without a queue merges directly as ever: an approval and a PUT merge pinned to the head, no queue request, merged; only a queue that is on is a queue", async () => {
+    const cases: Array<[string, () => void]> = [
+      ["no queue anywhere", () => {}],
+      ["other rules only", () => { e.gh.rules = [{ type: "pull_request", parameters: {} }, ...needsTest]; }],
+      ["isMergeQueueEnabled false", () => { e.gh.graphql.isMergeQueueEnabled = false; }],
+      ["isMergeQueueEnabled null", () => { e.gh.graphql.isMergeQueueEnabled = null; }],
+      ["isMergeQueueEnabled missing", () => { delete e.gh.graphql.isMergeQueueEnabled; }],
+      ["no id in the answer (only a queue needs it)", () => { delete e.gh.graphql.id; }],
+    ];
+    for (const [name, setup] of cases) {
       e = await env();
-      e.gh.rules = rules;
-      e.gh.checkRuns = [{ name: "test", status: "completed", conclusion: "success" }];
-      assert.notEqual(reason(await merge()), "merge_queue_required", JSON.stringify(rules));
+      setup();
+      const o = await merge();
+      assert.equal(o.body.status, "merged", `${name}: ${o.text}`);
+      assert.deepEqual(stages(e), ["POST reviews", "PUT merge"], name);
+      assert.equal(e.gh.enqueues.length, 0, name);
+      assert.deepEqual(e.gh.writes[1]?.body, { sha: HEAD, merge_method: "squash" }, name);
     }
   });
 
-  test("Q3 the rules are read once for a merge, by the queue guard and the CI gate together", async () => {
-    assert.equal((await merge()).body.status, "merged");
+  test("Q16 the rules are read once for a merge, by the queue and the CI gate together; rules GitHub would not give are not read as 'no queue' (the CI gate refuses them before anything is written) and a classic queue still shows", async () => {
+    byRule();
+    assert.equal((await merge()).body.status, "queued");
     assert.equal(e.gh.count(/\/rules\/branches\//), 1);
-  });
-
-  test("Q4 rules GitHub would not give are not read as 'no queue': the CI gate refuses them before anything is written", async () => {
+    e = await env();
     e.gh.rulesStatus = 404;
     const o = await merge();
     assert.equal(reason(o), "ci_not_green");
@@ -358,72 +621,39 @@ describe("Q a base branch with a merge queue", () => {
     assert.deepEqual(await rows(), []);
   });
 
-  test("Q5 a queue that appears after the acting user was asked refuses at their allow, with nothing written and the confirmation closed", async () => {
-    highRisk();
-    const id = String((await merge()).body.confirmation_id);
-    e.gh.rules = queue;
-    const r = await e.service.decide("u-bob", id, "allow");
-    assert.deepEqual([r.body.status, r.body.reason], ["refused", "merge_queue_required"]);
-    assert.equal(e.gh.writes.length, 0);
-    assert.equal((await rows())[0]?.status, "refused");
-  });
-
-  test("Q6 a review is not a merge: with a queue on the branch a comment, a request for changes and an approval are posted as ever", async () => {
-    e.gh.rules = queue;
-    e.gh.checkRuns = [{ name: "test", status: "completed", conclusion: "success" }];
-    e.gh.reviews = [];
-    for (const event of EVENTS) assert.equal((await submit({ event })).body.status, "submitted", event);
-    assert.equal((await get()).isError, false);
-  });
-});
-
-describe("Q (continued) a merge queue the rules do not show", () => {
-  // Classic branch protection ("require merge queue") is not a ruleset rule: only the pull request's own isMergeQueueEnabled says it.
-  test("Q7 a queue only GitHub's isMergeQueueEnabled shows is refused as merge_queue_required, for the requester's own account and someone else's, high risk or not, with nothing written and no one asked", async () => {
-    const cases: Array<[string, Parameters<typeof makeEnv>[1], () => void]> = [
-      ["the requester's own account", own, () => {}],
-      ["someone else's account", {}, () => {}],
-      ["someone else's account, high risk", {}, highRisk],
-      ["someone else's account, CI red: the queue is what is said, not CI", {}, () => { e.gh.checkRuns = [{ name: "test", status: "completed", conclusion: "failure" }]; }],
-    ];
-    for (const [name, over, setup] of cases) {
-      e = await env({}, over);
-      e.gh.rules = [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "test" }] } }];
-      e.gh.graphql.isMergeQueueEnabled = true;
-      setup();
-      const o = await merge();
-      assert.equal(o.isError, true, name);
-      assert.equal(reason(o), "merge_queue_required", `${name}: ${o.text}`);
-      assert.equal(e.gh.writes.length, 0, `${name} wrote`);
-      assert.equal(e.gh.calls.filter((c) => /\/reviews$/.test(c.path)).length, 0, `${name} even looked at the reviews`);
-      assert.deepEqual(await rows(), [], `${name} asked someone`);
-      assert.equal(e.gh.calls.some((c) => c.path === "/graphql" && JSON.stringify(c.body).includes("isMergeQueueEnabled")), true, `${name}: the field was never asked for`);
-    }
-  });
-
-  test("Q8 only a true isMergeQueueEnabled is a queue: false, null and an answer without the field are not", async () => {
-    for (const value of [false, null, undefined]) {
+  test("Q17 a review is not a merge: with a queue on the branch a comment, a request for changes and an approval are posted as ever, and the queue is not asked", async () => {
+    for (const [way, setup] of ways) {
       e = await env();
-      if (value === undefined) delete e.gh.graphql.isMergeQueueEnabled; else e.gh.graphql.isMergeQueueEnabled = value;
-      const o = await merge();
-      assert.equal(o.body.status, "merged", `${String(value)}: ${o.text}`);
+      setup();
+      e.gh.reviews = [];
+      for (const event of EVENTS) assert.equal((await submit({ event })).body.status, "submitted", `${way}: ${event}`);
+      assert.equal(e.gh.enqueues.length, 0, way);
+      assert.equal((await get()).isError, false, way);
     }
   });
 
-  test("Q9 a queue that GitHub reports after the acting user was asked refuses at their allow, with nothing written and the confirmation closed", async () => {
-    highRisk();
-    const id = String((await merge()).body.confirmation_id);
-    e.gh.graphql.isMergeQueueEnabled = true;
-    const r = await e.service.decide("u-bob", id, "allow");
-    assert.deepEqual([r.body.status, r.body.reason], ["refused", "merge_queue_required"]);
-    assert.equal(e.gh.writes.length, 0);
-    assert.equal((await rows())[0]?.status, "refused");
+  test("Q19 the merge state read asks GitHub for what queuing needs: the pull request's id, whether a queue is on, whether it is in one, and its entry", async () => {
+    byClassic();
+    assert.equal((await merge()).body.status, "queued");
+    const reads = e.gh.calls.filter((c) => c.path === "/graphql" && !e.gh.enqueues.includes(c)).map((c) => String(c.body.query));
+    assert.equal(reads.length > 0, true);
+    for (const field of [/pullRequest\(number:\$number\)\{\s*id\s/, /isMergeQueueEnabled/, /isInMergeQueue/, /mergeQueueEntry\{id position state\}/, /headRefOid/]) {
+      assert.equal(reads.every((q) => field.test(q)), true, String(field));
+    }
+    // And what the mutation asks back: the entry, nothing that would move the pull request ahead of others.
+    assert.match(String(e.gh.enqueues[0]?.body.query), /mergeQueueEntry\{id position state\}/);
   });
 
-  test("Q10 a review is not a merge: the same queue does not stop a comment, a request for changes or an approval", async () => {
-    e.gh.graphql.isMergeQueueEnabled = true;
-    e.gh.reviews = [];
-    for (const event of EVENTS) assert.equal((await submit({ event })).body.status, "submitted", event);
+  test("Q18 gh_pr_get tells the model that a merge here is a place in the queue, and whether the pull request is in it already", async () => {
+    const mergeState = async (): Promise<any> => ((await get()).body.merge_state as any);
+    assert.deepEqual([(await mergeState()).merge_queue, (await mergeState()).in_merge_queue], [false, false]);
+    for (const [way, setup] of ways) {
+      e = await env();
+      setup();
+      assert.deepEqual([(await mergeState()).merge_queue, (await mergeState()).in_merge_queue], [true, false], way);
+      e.gh.graphql.isInMergeQueue = true;
+      assert.equal((await mergeState()).in_merge_queue, true, way);
+    }
   });
 });
 
@@ -463,6 +693,71 @@ describe("O the acting user wrote the pull request", () => {
       e.gh.reviews = [];
       assert.equal((await submit({ event: "APPROVE" })).body.status, "submitted", author);
     }
+  });
+});
+
+describe("O (continued) the acting user's login is not known", () => {
+  const LOADS = ["/repos/AMD-AGI/demo", "/repos/AMD-AGI/demo/pulls/7"];
+  // The identity provider gives "" when it holds no login for the account; "" is equal to no author's name, so a comparison alone would pass.
+  const unknown: Array<[string, Parameters<typeof makeEnv>[1]]> = [
+    ["an empty login", { cred: { providerLogin: "" } }],
+    ["a blank login", { cred: { providerLogin: "  " } }],
+    ["an empty login on the requester's own request", { cred: { providerLogin: "" }, actor: { requesterUserId: "u-bob" } }],
+  ];
+
+  test("O4 an approval or a merge with an account whose login is not known is refused as acting_login_unknown before CI, threads, the diff or the rules are read, with nothing written and no one asked", async () => {
+    for (const [name, over] of unknown) {
+      for (const [what, call] of [
+        ["an APPROVE review", () => submit({ event: "APPROVE", comments: [{ path: "src/app.ts", line: 3, body: "x" }] })],
+        ["a merge", () => merge()],
+      ] as const) {
+        for (const author of ["alice", ""]) {
+          e = await env({}, over);
+          e.gh.pr.user = { login: author };
+          highRisk();
+          const o = await call();
+          assert.equal(reason(o), "acting_login_unknown", `${name}, ${what}, author ${JSON.stringify(author)}: ${o.text}`);
+          assert.deepEqual(e.gh.calls.map((c) => c.path), LOADS, `${name}, ${what}`);
+          assert.equal(e.gh.writes.length, 0, `${name}, ${what}`);
+          assert.deepEqual(await rows(), [], `${name}, ${what}`);
+        }
+      }
+    }
+  });
+
+  test("O5 the acting user's allow of a held write is refused the same way when the login has gone unknown meanwhile", async () => {
+    highRisk();
+    const id = String((await merge()).body.confirmation_id);
+    e.identity.answer = directory({ providerLogin: "" });
+    const r = await e.service.decide("u-bob", id, "allow");
+    assert.deepEqual([r.body.status, r.body.reason], ["refused", "acting_login_unknown"]);
+    assert.equal(e.gh.writes.length, 0);
+  });
+
+  test("O6 a comment and a request for changes approve nothing and are not refused for it; a known login that is not the author's still passes", async () => {
+    e = await env({}, { cred: { providerLogin: "" } });
+    e.gh.reviews = [];
+    for (const event of ["COMMENT", "REQUEST_CHANGES"]) assert.equal((await submit({ event })).body.status, "submitted", event);
+    e = await env();
+    e.gh.reviews = [];
+    assert.equal((await submit({ event: "APPROVE" })).body.status, "submitted");
+  });
+
+  test("O7 gh_pr_get says whether the acting user wrote the pull request, so the model does not try: the same comparison as the refusal, and an unknown login is not 'the author'", async () => {
+    const acting = async (user: string, cred: Record<string, unknown> = {}): Promise<any> => {
+      e = await env({}, { cred });
+      e.gh.pr.user = { login: user };
+      return (await get()).body.acting;
+    };
+    let a = await acting("bob");
+    assert.deepEqual([a.acting_user_is_author, a.may_approve_and_merge, a.has_write_permission], [true, false, true]);
+    assert.match(String(a.note), /cannot_approve_own_pull_request/);
+    a = await acting("BOB");
+    assert.equal(a.acting_user_is_author, true);
+    a = await acting("alice");
+    assert.deepEqual([a.acting_user_is_author, a.may_approve_and_merge], [false, true]);
+    a = await acting("", { providerLogin: "" });
+    assert.equal(a.acting_user_is_author, false);
   });
 });
 

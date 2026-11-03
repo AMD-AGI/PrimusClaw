@@ -36,7 +36,7 @@ export const GITHUB_REVIEW_SCHEMA_SQL = [
       reasons           JSONB NOT NULL DEFAULT '[]'::jsonb,
       checks            JSONB NOT NULL DEFAULT '{}'::jsonb,
       status            TEXT NOT NULL DEFAULT 'pending'
-                        CHECK (status IN ('pending', 'merging', 'merged', 'submitted', 'denied', 'stale', 'expired', 'refused')),
+                        CHECK (status IN ('pending', 'merging', 'merged', 'queued', 'submitted', 'denied', 'stale', 'expired', 'refused')),
       created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       expires_at        TIMESTAMPTZ NOT NULL,
       decided_at        TIMESTAMPTZ,
@@ -51,12 +51,13 @@ export const GITHUB_REVIEW_SCHEMA_SQL = [
   `ALTER TABLE claw_github_confirmations ADD COLUMN IF NOT EXISTS review JSONB`,
   // Tells one held review from another on the same head commit; empty for a merge.
   `ALTER TABLE claw_github_confirmations ADD COLUMN IF NOT EXISTS action_key TEXT NOT NULL DEFAULT ''`,
-  // 'submitted' is the end of a held review that was posted. A table made by an earlier release has a check without it, which is replaced.
+  // 'submitted' is the end of a held review that was posted, 'queued' the end of a merge that put the pull request in the base branch's merge queue.
+  // A table made by an earlier release has a check without them (or without 'queued'), which is replaced.
   `DO $$ BEGIN
-     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'claw_github_confirmations_status_check' AND pg_get_constraintdef(oid) LIKE '%submitted%') THEN
+     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'claw_github_confirmations_status_check' AND pg_get_constraintdef(oid) LIKE '%queued%') THEN
        ALTER TABLE claw_github_confirmations DROP CONSTRAINT IF EXISTS claw_github_confirmations_status_check;
        ALTER TABLE claw_github_confirmations ADD CONSTRAINT claw_github_confirmations_status_check
-         CHECK (status IN ('pending', 'merging', 'merged', 'submitted', 'denied', 'stale', 'expired', 'refused'));
+         CHECK (status IN ('pending', 'merging', 'merged', 'queued', 'submitted', 'denied', 'stale', 'expired', 'refused'));
      END IF;
    END $$`,
   // One pending row per head commit and write, so asking twice shows the person one card. The index an earlier release made, on the commit alone,
@@ -196,7 +197,7 @@ export async function recentWrites(
 
 // ---------------------------------------------------------- confirmations
 
-export type ConfirmationStatus = "pending" | "merging" | "merged" | "submitted" | "denied" | "stale" | "expired" | "refused";
+export type ConfirmationStatus = "pending" | "merging" | "merged" | "queued" | "submitted" | "denied" | "stale" | "expired" | "refused";
 
 export type ReviewEvent = "COMMENT" | "REQUEST_CHANGES" | "APPROVE";
 export interface ReviewComment { path: string; line: number; side: "RIGHT" | "LEFT"; body: string }

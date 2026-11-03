@@ -63,6 +63,30 @@ test("a table an earlier release made is upgraded in place, and upgrading twice 
     // The new end of a held review is a status the table takes; one it does not know still is refused.
     await pg.exec(insert(7, "review", "COMMENT:cccccccccccc", "submitted"));
     await assert.rejects(pg.exec(insert(8, "review", "COMMENT:dddddddddddd", "posted")), /status_check/);
+    // And so is the end of a merge that put the pull request in the base branch's merge queue.
+    await pg.exec(insert(9, "merge", "", "queued"));
+  } finally {
+    await pg.close();
+  }
+});
+
+test("a table that already takes 'submitted' but not 'queued' (an earlier head of this release) learns 'queued' too, and a table that has it is left alone", async () => {
+  const pg = new PGlite();
+  try {
+    for (const sql of EARLIER_RELEASE) await pg.exec(sql);
+    for (const sql of GITHUB_REVIEW_SCHEMA_SQL) await pg.exec(sql);
+    // The constraint as that head wrote it: 'submitted' in, 'queued' not.
+    await pg.exec(`ALTER TABLE claw_github_confirmations DROP CONSTRAINT claw_github_confirmations_status_check`);
+    await pg.exec(`ALTER TABLE claw_github_confirmations ADD CONSTRAINT claw_github_confirmations_status_check
+                   CHECK (status IN ('pending', 'merging', 'merged', 'submitted', 'denied', 'stale', 'expired', 'refused'))`);
+    await assert.rejects(pg.exec(insert(1, "merge", "", "queued")), /status_check/);
+    for (let round = 1; round <= 2; round++) {
+      for (const sql of GITHUB_REVIEW_SCHEMA_SQL) await pg.exec(sql);
+      await pg.exec(`DELETE FROM claw_github_confirmations`);
+      await pg.exec(insert(2, "merge", "", "queued"));
+      await pg.exec(insert(3, "review", "COMMENT:cccccccccccc", "submitted"));
+      await assert.rejects(pg.exec(insert(4, "merge", "", "posted")), /status_check/, `round ${round}`);
+    }
   } finally {
     await pg.close();
   }
