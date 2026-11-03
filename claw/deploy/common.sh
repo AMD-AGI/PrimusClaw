@@ -883,7 +883,7 @@ render_chart() {
   extra_values="$(mktemp)"
   if ! python3 "$(dirname "${BASH_SOURCE[0]}")/extra-values.py" > "$extra_values"; then
     rm -f "$extra_values"
-    fail "EXTRA_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* / EXTRA_SECRET_MOUNTS_* in $_VALUES_FILE are malformed (see above)."
+    fail "EXTRA_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* / EXTRA_SECRET_MOUNTS_* in $_VALUES_FILE are malformed or collide (see above)."
   fi
   helm template primus-claw "$CLAW_CHART_DIR" \
     -n "$NAMESPACE" \

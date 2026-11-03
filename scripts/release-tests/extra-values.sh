@@ -233,4 +233,47 @@ extra EXTRA_SECRET_MOUNTS_BRAIN=sec-one:/var/run/claw/grant EXTRA_SECRET_MOUNTS_
   >/dev/null 2>"$err" || bad "refused a path the chart mounts into the other container only: $(cat "$err")"
 ok "a path the chart mounts into one container stays free in the other"
 
+echo "==> upgrade.sh refuses a colliding mount before it applies anything"
+# The reason the script has to be the one to stop: the API server's own refusal
+# comes at kubectl apply, and upgrade.sh applies api before it renders brain. The
+# collision here is in brain, and the first render is api's, so the run has to end
+# there with no cluster call that changes anything.
+mkdir -p "$tmp/bin" "$tmp/home"
+cat >"$tmp/bin/kubectl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$KUBECTL_LOG"
+case " $* " in *" --ignore-not-found "*) exit 0 ;; esac
+case "$*" in
+  *"config current-context"*) echo release-test ;;
+  *"get sc"*) printf 'fast (default)\n' ;;
+  *"get pods"*) printf '%s true\n' "${MOCK_TAG:-none}" ;;
+  *"get secret"*|*"get deploy"*|*"get statefulset"*|*"get pod"*) exit 1 ;;
+esac
+exit 0
+EOF
+chmod +x "$tmp/bin/kubectl"
+namespace="claw-extra-values-$$"
+values_file="$repo_root/claw/deploy/values.${namespace}.env"
+trap 'rm -rf "$tmp"; rm -f "$values_file"' EXIT
+upgrade() { # exit status of an upgrade.sh run against the values file written for it
+  : >"$tmp/kubectl.log"
+  env -i HOME="$tmp/home" PATH="$tmp/bin:$PATH" KUBECTL_LOG="$tmp/kubectl.log" MOCK_TAG=release-test TAG=release-test \
+    bash "$repo_root/claw/deploy/upgrade.sh" -n "$namespace" --skip-health --skip-shared-assets >"$tmp/upgrade.log" 2>&1
+}
+mutations='(^| )(apply|patch|rollout|delete|create|scale|replace|annotate|label)( |$)'
+
+printf 'REGISTRY="docker.io/primussafe"\nEXTRA_CONFIGMAP_MOUNTS_BRAIN="cm-one:/etc/x"\nEXTRA_SECRET_MOUNTS_BRAIN="sec-one:/var/run/y"\n' >"$values_file"
+upgrade || bad "upgrade.sh did not complete with valid mounts: $(tail -5 "$tmp/upgrade.log")"
+grep -q 'apply .*brain-deployment.yaml' "$tmp/kubectl.log" || bad "the stub cluster saw no apply for brain on a valid file, so it cannot show one is absent"
+ok "a valid file runs through to the brain apply"
+
+for collision in "EXTRA_SECRET_MOUNTS_BRAIN=sec-one:/etc/x" "EXTRA_SECRET_MOUNTS_BRAIN=sec-one:/etc/claw"; do
+  printf 'REGISTRY="docker.io/primussafe"\nEXTRA_CONFIGMAP_MOUNTS_BRAIN="cm-one:/etc/x"\n%s\n' "$(echo "$collision" | sed 's/=\(.*\)/="\1"/')" >"$values_file"
+  if upgrade; then bad "upgrade.sh went ahead with $collision"; fi
+  grep -qF EXTRA_SECRET_MOUNTS_BRAIN "$tmp/upgrade.log" || bad "upgrade.sh did not name EXTRA_SECRET_MOUNTS_BRAIN for $collision: $(tail -5 "$tmp/upgrade.log")"
+  if grep -Eq "$mutations" "$tmp/kubectl.log"; then bad "upgrade.sh changed the cluster before refusing $collision: $(grep -E "$mutations" "$tmp/kubectl.log")"; fi
+  ok "refused before any change to the cluster: $collision"
+done
+rm -f "$values_file"
+
 echo "extra-values: all checks passed"
