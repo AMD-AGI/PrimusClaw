@@ -137,6 +137,24 @@ spec:
                           readOnly:
                             type: boolean
                         required: ["name", "mountPath"]
+                    layers:
+                      description: >-
+                        Images whose directory is copied into an emptyDir before the sandbox
+                        starts and mounted on the main container. readOnly defaults to true.
+                      type: array
+                      maxItems: 4
+                      items:
+                        type: object
+                        properties:
+                          image:
+                            type: string
+                          from:
+                            type: string
+                          mount:
+                            type: string
+                          readOnly:
+                            type: boolean
+                        required: ["image", "from", "mount"]
                 gpu:
                   type: object
                   properties:
