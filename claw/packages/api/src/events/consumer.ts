@@ -32,7 +32,7 @@ import { a2aPushEnabled } from "../routes/a2a-flags.js";
 import { recordSessionEvent as recordA2aPushEvent } from "../routes/a2a-push.js";
 import { recordApprovalRequested, recordRunFinished } from "../notifications/outbox.js";
 import {
-  markChatRunRunning, closeChatRun, gateOwnershipEnforced, queuedMessageId,
+  markChatRunRunning, closeChatRun, gateNamesEndedTurnSql, gateOwnershipEnforced, queuedMessageId,
   retireDispatchReconcileForReport,
 } from "../tasks/chat-run.js";
 import { dispatchPendingMessage, publishRefusedTurn } from "../tasks/pending-dispatch.js";
@@ -644,7 +644,8 @@ export async function releaseSessionGateIfLastRun(
         SET agent_status = $1, agent_gate_message_id = NULL, updated_at = NOW()
       WHERE session_id = $2
         AND deleted_at IS NULL
-        AND (NOT $4::boolean OR agent_gate_message_id IS NOT DISTINCT FROM $3)
+        AND (NOT $4::boolean OR agent_gate_message_id IS NOT DISTINCT FROM $3
+             OR ${gateNamesEndedTurnSql("$2", "agent_gate_message_id")})
         AND NOT EXISTS (
           SELECT 1 FROM claw_tasks t
            WHERE t.session_id = $2
