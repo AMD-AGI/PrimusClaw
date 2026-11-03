@@ -12,6 +12,7 @@
 import { assertLiveRun, ToolRefused } from "../assistant/tools.js";
 import { sessionRole } from "../assistant/role-profile.js";
 import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
+import { sessionWithholdsSandboxKeys } from "../github-review/session-tools.js";
 import { CLAW_ASSISTANT_ENABLED, CLAW_DEPLOY_MODE, TRIGGER_MIN_INTERVAL_MINUTES } from "../config.js";
 import { db } from "../infra/db.js";
 import { deleteTrigger, insertTrigger, listTriggers, parseTriggerInput, sealTriggerCredentials } from "./store.js";
@@ -21,8 +22,13 @@ export { ToolRefused };
 
 const query = (text: string, params?: unknown[]) => db.query(text, params);
 
+/** A bearer minted before the session was set to act as a user is still valid, so that is asked per call. */
 async function turnOwner(claims: TriggerTokenClaims): Promise<string> {
-  return (await assertLiveRun(query, claims)).userId;
+  const { userId } = await assertLiveRun(query, claims);
+  if (await sessionWithholdsSandboxKeys(claims.sid)) {
+    throw new ToolRefused("not_allowed", "a conversation that acts as a user has no scheduled tasks");
+  }
+  return userId;
 }
 
 /** What the model is told about a trigger: never its sealed credential. */

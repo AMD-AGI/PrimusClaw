@@ -8,7 +8,8 @@
  * authentication leaves to the route, and authenticated by a bearer minted for one turn (`token.ts`). What the
  * bearer proves is which turn is calling; whose triggers those are is read from that turn's session. Creating a
  * trigger is held for the user's decision (`requires_approval`), which shows them the whole prompt and schedule:
- * a scheduled run acts on their behalf later with nobody watching.
+ * a scheduled run acts on their behalf later with nobody watching. Cancelling is held too: it deletes for good any
+ * of the user's triggers, also ones they set up themselves, so a fetched page must not be able to do it unseen.
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -19,6 +20,7 @@ import { tokenTtlSeconds } from "../assistant/role-profile.js";
 import {
   CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGER_TOOLS_TOKEN_KEY, INTERNAL_BACKEND_URL, TRIGGER_MIN_INTERVAL_MINUTES,
 } from "../config.js";
+import { withholdsSandboxKeys } from "../github-review/session-tools.js";
 import { db } from "../infra/db.js";
 import { mintTriggerToken, verifyTriggerToken, type TriggerTokenClaims } from "./token.js";
 import { ToolRefused, triggerCancel, triggerCreate, triggerList } from "./tools.js";
@@ -73,7 +75,7 @@ export function createTriggerMcpServer(claims: TriggerTokenClaims): McpServer {
   );
   mcp.tool(
     "trigger_cancel",
-    "Cancel one of the user's scheduled tasks for good.",
+    "Cancel one of the user's scheduled tasks for good. The user is asked to approve it first.",
     { trigger_id: z.string().describe("The trigger_id from trigger_list or trigger_create.") },
     (args) => answer(claims, "trigger_cancel", () => triggerCancel(claims, args)),
   );
@@ -110,7 +112,8 @@ export const triggerToolSettings = { enabled: CLAW_TRIGGER_TOOLS_ENABLED, key: C
  * the assistant's role is (`applySessionRoleToTask`), which keeps a router turn to its own tools.
  *
  * Not offered to a run a trigger started, so a scheduled run cannot schedule more of itself, nor to a session
- * without an owner. A turn does not depend on them: on any failure the tools are simply not offered.
+ * without an owner, nor to one that acts as a user (`withholdsSandboxKeys`): its model reads what strangers wrote, and
+ * a trigger's run is an ordinary session with the owner's keys in its sandbox. A turn does not depend on them: on any failure the tools are simply not offered.
  */
 export async function applyTriggerToolsToTask(task: Record<string, unknown>, sessionId: string): Promise<void> {
   if (!triggerToolSettings.enabled) return;
@@ -121,7 +124,7 @@ export async function applyTriggerToolsToTask(task: Record<string, unknown>, ses
     const row = (await db.query(
       "SELECT user_id, config FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL", [sessionId],
     )).rows[0] as { user_id: string | null; config: Record<string, unknown> | null } | undefined;
-    if (!row?.user_id || row.user_id === "default" || row.config?.trigger_id) return;
+    if (!row?.user_id || row.user_id === "default" || row.config?.trigger_id || withholdsSandboxKeys(row.config)) return;
     const token = mintTriggerToken(
       { sid: sessionId, mid: messageId, task_id: taskId, exp: Math.floor(Date.now() / 1000) + tokenTtlSeconds() },
       triggerToolSettings.key,
@@ -130,7 +133,7 @@ export async function applyTriggerToolsToTask(task: Record<string, unknown>, ses
     task.mcp_servers = {
       ...(task.mcp_servers as Record<string, Record<string, unknown>> | undefined),
       [TRIGGER_MCP_SERVER]: {
-        type: "http", url: `${INTERNAL_BACKEND_URL}${TRIGGER_MCP_PATH}`, token, requires_approval: ["trigger_create"],
+        type: "http", url: `${INTERNAL_BACKEND_URL}${TRIGGER_MCP_PATH}`, token, requires_approval: ["trigger_create", "trigger_cancel"],
       },
     };
   } catch (err) {

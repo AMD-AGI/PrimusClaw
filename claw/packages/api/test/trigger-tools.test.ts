@@ -10,7 +10,9 @@
  *   T3  a turn that has ended can no longer act
  *   T4  max_runs and until end a trigger by themselves
  *   T5  a trigger made from a work item's worker wakes that worker, and ends with the item
- *   T6  which turns are offered the tools: every owned turn but a trigger's own run and a router; creation held for approval
+ *   T6  which turns are offered the tools: every owned turn but a trigger's own run, a router and an acting session;
+ *       creation and cancelling held for approval
+ *   T7  a session that acts as a user can do nothing with them, even on a bearer minted before it did
  */
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
@@ -39,6 +41,7 @@ describe("trigger tools", { skip }, () => {
   before(async () => {
     w = await startWorld({
       CLAW_TRIGGERS_ENABLED: "true", CLAW_TRIGGER_TOOLS_ENABLED: "true", CLAW_TRIGGER_TOOLS_TOKEN_KEY: KEY,
+      CLAW_GITHUB_REVIEW_ENABLED: "true",
     });
     mcpMod = await import("../src/triggers/mcp.js");
     tokenMod = await import("../src/triggers/token.js");
@@ -238,7 +241,7 @@ describe("trigger tools", { skip }, () => {
     assert.equal((await trig(id)).paused_reason, "item_closed");
   });
 
-  test("T6 which turns are offered the tools, and creation is held for approval", async () => {
+  test("T6 which turns are offered the tools, and creating and cancelling are held for approval", async () => {
     const offered = async (sid: string, t: { task_id: string; mid: string }, extra: Record<string, unknown> = {}) => {
       const task: Record<string, unknown> = { task_id: t.task_id, message_id: t.mid, ...extra };
       await mcpMod.applyTriggerToolsToTask(task, sid);
@@ -250,13 +253,16 @@ describe("trigger tools", { skip }, () => {
     const server = await offered(sid, t, { mcp_servers: { schedules: { type: "http", url: "https://evil.example.com/mcp", token: "x" } } });
     assert.ok(server, "an ordinary turn is offered the tools");
     assert.match(server.url, /\/v1\/internal\/trigger-mcp$/, "a request's own server of that name is replaced");
-    assert.deepEqual(server.requires_approval, ["trigger_create"]);
+    assert.deepEqual([...server.requires_approval].sort(), ["trigger_cancel", "trigger_create"]);
     const verdict = tokenMod.verifyTriggerToken(server.token, KEY);
     assert.ok(verdict.ok);
     assert.deepEqual(verdict.ok && [verdict.claims.sid, verdict.claims.mid, verdict.claims.task_id], [sid, t.mid, t.task_id]);
 
     const runSid = await chatSession("alice", { trigger_id: "trg-1" });
     assert.equal(await offered(runSid, await turn(runSid)), undefined, "a trigger's own run cannot schedule more");
+
+    const actingSid = await chatSession("alice", { acting_as: "bob" });
+    assert.equal(await offered(actingSid, await turn(actingSid)), undefined, "a session acting as a user is not offered them");
 
     const alice = await w.user("alice");
     assert.equal(await offered(alice.routerSid, await w.routerTurn(alice)), undefined, "a router keeps to its own tools");
@@ -266,5 +272,23 @@ describe("trigger tools", { skip }, () => {
 
     mcpMod.triggerToolSettings.enabled = false;
     assert.equal(await offered(sid, await turn(sid)), undefined, "off means not offered");
+  });
+
+  test("T7 a session that acts as a user can do nothing with them, even on a bearer minted before it did", async () => {
+    const sid = await chatSession("alice");
+    const client = await connect(bearer(await turn(sid)));
+    try {
+      const made = await call(client, "trigger_create", DAILY);
+      assert.equal(made.isError, false, made.text);
+      const id = made.body.trigger.trigger_id;
+      await w.q("UPDATE claw_sessions SET config = config || '{\"acting_as\": \"bob\"}'::jsonb WHERE session_id = $1", [sid]);
+      for (const [name, args] of [["trigger_list", {}], ["trigger_cancel", { trigger_id: id }], ["trigger_create", DAILY]] as const) {
+        const res = await call(client, name, args);
+        assert.equal(res.isError, true, name);
+        assert.equal(res.body.error, "not_allowed", name);
+      }
+      assert.ok(await trig(id), "nothing was cancelled");
+      assert.equal((await w.q("SELECT count(*)::int AS n FROM claw_triggers"))[0].n, 1, "nothing was created");
+    } finally { await client.close(); }
   });
 });
