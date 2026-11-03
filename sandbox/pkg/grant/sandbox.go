@@ -397,14 +397,19 @@ func tokenHashMatches(ref runtimev1alpha1.GrantSandboxRef, want string) bool {
 	return matched == 1
 }
 
-// AuditDenied records a create that the grant refused.
-func (s *Service) AuditDenied(ctx context.Context, grantID, sandboxID string) {
+// AuditDenied records a create that the grant refused, with the reason and detail of cause.
+func (s *Service) AuditDenied(ctx context.Context, grantID, sandboxID string, cause error) {
 	userID, userName, sessionID, appRunID := "", "", "", ""
 	if g, err := s.get(ctx, grantID); err == nil {
 		userID, userName = g.Spec.Owner.UserID, g.Spec.Owner.UserName
 		sessionID, appRunID = g.Spec.Issuer.SessionID, g.Spec.Issuer.AppRunID
 	}
-	s.audit(ctx, audit.EventSandboxDenied, grantID, sessionID, appRunID, userID, userName, sandboxID)
+	reason, detail := "", ""
+	var oe *OpError
+	if errors.As(cause, &oe) {
+		reason, detail = oe.Reason, oe.Detail
+	}
+	s.auditReason(ctx, audit.EventSandboxDenied, grantID, sessionID, appRunID, userID, userName, sandboxID, reason, detail)
 }
 
 func beginOne(g *runtimev1alpha1.SandboxGrant, req BeginRequest, now time.Time) error {
@@ -439,19 +444,10 @@ func beginOne(g *runtimev1alpha1.SandboxGrant, req BeginRequest, now time.Time) 
 		return opErr(http.StatusForbidden, "timeout_not_allowed",
 			fmtDetail("%d > %d", req.TimeoutSec, g.Spec.MaxSandboxSeconds))
 	}
+	if err := checkQuota(g, req.Role, limit, req.GPUs); err != nil {
+		return err
+	}
 	usage := g.Status.Usage[req.Role]
-	if limit.MaxSandboxes >= 0 && usage.Sandboxes+1 > limit.MaxSandboxes {
-		return opErr(http.StatusTooManyRequests, "grant_quota_exceeded",
-			fmtDetail("%s %d/%d sandboxes", req.Role, usage.Sandboxes, limit.MaxSandboxes))
-	}
-	if limit.MaxGPUs >= 0 && usage.GPUs+req.GPUs > limit.MaxGPUs {
-		return opErr(http.StatusTooManyRequests, "grant_quota_exceeded",
-			fmtDetail("%s %d/%d gpus", req.Role, usage.GPUs, limit.MaxGPUs))
-	}
-	if overBudget(g) {
-		return opErr(http.StatusTooManyRequests, "grant_quota_exceeded",
-			fmtDetail("%s gpu hours", g.Name))
-	}
 	if g.Status.Usage == nil {
 		g.Status.Usage = map[string]runtimev1alpha1.GrantRoleUsage{}
 	}

@@ -27,6 +27,8 @@ type IssueRequest struct {
 	PlatformKey       string                 `json:"platformKey"`
 	Issuer            IssuerRequest          `json:"issuer"`
 	Roles             map[string]RoleRequest `json:"roles"`
+	MaxSandboxes      *int32                 `json:"maxSandboxes,omitempty"`
+	MaxGPUs           *int32                 `json:"maxGpus,omitempty"`
 	Templates         []TemplateRequest      `json:"templates"`
 	GPUHoursBudget    float64                `json:"gpuHoursBudget"`
 	MaxSandboxSeconds int64                  `json:"maxSandboxSeconds"`
@@ -69,10 +71,13 @@ type ExtendRequest struct {
 
 // IssueResponse is the body of a successful issue call.
 // Keys is omitted when the grant already existed.
+// MaxSandboxes and MaxGPUs are the grant caps as stored.
 type IssueResponse struct {
-	GrantID   string              `json:"grantId"`
-	Keys      map[string]string   `json:"keys,omitempty"`
-	Templates map[string][]string `json:"templates,omitempty"`
+	GrantID      string              `json:"grantId"`
+	Keys         map[string]string   `json:"keys,omitempty"`
+	Templates    map[string][]string `json:"templates,omitempty"`
+	MaxSandboxes *int32              `json:"maxSandboxes,omitempty"`
+	MaxGPUs      *int32              `json:"maxGpus,omitempty"`
 }
 
 // GrantView is GET /internal/v1/grants/{id}. It has no keys and no platform key.
@@ -82,6 +87,8 @@ type GrantView struct {
 	Owner             runtimev1alpha1.GrantOwner                `json:"owner"`
 	Issuer            runtimev1alpha1.GrantIssuer               `json:"issuer"`
 	Roles             map[string]runtimev1alpha1.GrantRole      `json:"roles"`
+	MaxSandboxes      *int32                                    `json:"maxSandboxes,omitempty"`
+	MaxGPUs           *int32                                    `json:"maxGpus,omitempty"`
 	GPUHoursBudget    float64                                   `json:"gpuHoursBudget"`
 	MaxSandboxSeconds int64                                     `json:"maxSandboxSeconds"`
 	ExpiresAt         time.Time                                 `json:"expiresAt"`
@@ -123,6 +130,9 @@ func validateIssue(req IssueRequest, now time.Time) error {
 	}
 	if req.GPUHoursBudget < 0 || req.MaxSandboxSeconds < 0 {
 		return opErr(http.StatusBadRequest, "invalid_grant", "budgets must be >= 0")
+	}
+	if (req.MaxSandboxes != nil && *req.MaxSandboxes < 0) || (req.MaxGPUs != nil && *req.MaxGPUs < 0) {
+		return opErr(http.StatusBadRequest, "invalid_grant", "grant caps must be >= 0")
 	}
 	for role, cap := range req.Roles {
 		if !roleLabel(role) {
@@ -277,6 +287,8 @@ func viewOf(g *runtimev1alpha1.SandboxGrant) GrantView {
 		Owner:             g.Spec.Owner,
 		Issuer:            g.Spec.Issuer,
 		Roles:             g.Spec.Roles,
+		MaxSandboxes:      g.Spec.MaxSandboxes,
+		MaxGPUs:           g.Spec.MaxGPUs,
 		GPUHoursBudget:    g.Spec.GPUHoursBudget,
 		MaxSandboxSeconds: g.Spec.MaxSandboxSeconds,
 		ExpiresAt:         g.Spec.ExpiresAt.Time,
@@ -316,7 +328,18 @@ func specMatches(got *runtimev1alpha1.SandboxGrant, want runtimev1alpha1.Sandbox
 	if got.Spec.GPUHoursBudget != want.GPUHoursBudget || got.Spec.MaxSandboxSeconds != want.MaxSandboxSeconds {
 		return false
 	}
+	if !sameCap(got.Spec.MaxSandboxes, want.MaxSandboxes) || !sameCap(got.Spec.MaxGPUs, want.MaxGPUs) {
+		return false
+	}
 	return sameRoles(got.Spec.Roles, want.Roles) && sameTemplates(got.Spec.Templates, want.Templates)
+}
+
+// sameCap reports whether two optional caps are both unset or equal.
+func sameCap(got, want *int32) bool {
+	if got == nil || want == nil {
+		return got == want
+	}
+	return *got == *want
 }
 
 func sameRoles(got, want map[string]runtimev1alpha1.GrantRole) bool {
