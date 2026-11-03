@@ -195,7 +195,7 @@ export const SANDBOX_CPU_ROUTER_URL = env("SANDBOX_CPU_ROUTER_URL");
  * Off by default because the DNS name is the shorter path wherever it resolves, which is
  * every deployment whose sandboxes run in its own cluster. Turn it on when they run in
  * another cluster, where that name does not resolve and the Router is the only way in.
- * Has no effect without SANDBOX_ROUTER_URL.
+ * Has no effect without SANDBOX_ROUTER_URL (or, for the CPU workspace, SANDBOX_CPU_ROUTER_URL).
  *
  * Requires a Router running without `--enable-auth`. Routed Hands requests carry the
  * per-sandbox Hands token (in Authorization and X-Hands-Token), not a SaFE API key, so a
