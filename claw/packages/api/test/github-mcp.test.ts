@@ -87,13 +87,15 @@ async function connect(bearer: string): Promise<Client> {
   await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/v1/internal/github/mcp`), { requestInit: { headers: { Authorization: `Bearer ${bearer}` } } }));
   return client;
 }
-async function status(bearer: string): Promise<number> {
+/** The answer's status, and for a refusal its `error`: which check refused, not only that one did. */
+async function status(bearer: string): Promise<number | string> {
   const r = await fetch(`${base}/v1/internal/github/mcp`, {
     method: "POST", headers: { Authorization: `Bearer ${bearer}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
   });
-  await r.text();
-  return r.status;
+  const text = await r.text();
+  if (r.status < 400) return r.status;
+  return `${r.status} ${(JSON.parse(text) as { error?: string }).error}`;
 }
 const call = async (client: Client, name: string, args: Record<string, unknown>) => {
   const r = await client.callTool({ name, arguments: args }) as { content: Array<{ type: string; text: string }>; isError?: boolean };
@@ -110,23 +112,26 @@ describe("A who may call", () => {
   });
 
   test("A2 a token minted for the review tools, under the same secret, is not accepted", async () => {
-    assert.equal(await status(token({}, { purpose: "claw-github-review" })), 401);
-    assert.equal(await status(token({}, { ttl: -5 })), 401, "expired");
-    assert.equal(await status(`${token()}x`), 401, "bad signature");
+    assert.equal(await status(token({}, { purpose: "claw-github-review" })), "401 invalid_token");
+    assert.equal(await status(token({}, { ttl: -5 })), "401 invalid_token", "expired");
+    assert.equal(await status(`${token()}x`), "401 invalid_token", "bad signature");
   });
 
   test("A3 the session row decides: gone, another owner, or acting as someone else is refused", async () => {
-    assert.equal(await status(token({ requesterUserId: "u-mallory", actorUserId: "u-mallory" })), 403, "not the owner");
-    assert.equal(await status(token({ actorUserId: "u-bob" })), 403, "a token naming another actor");
+    // Mallory keeps a token of her own, so only the owner check can refuse her.
+    await sql("INSERT INTO claw_user_env_vars VALUES ('u-mallory', 'GH_TOKEN', $1)", [encryptUserEnvValue("ghp_mallory")]);
+    assert.equal(await status(token()), 200, "the owner");
+    assert.equal(await status(token({ requesterUserId: "u-mallory", actorUserId: "u-mallory" })), "403 session_mismatch", "not the owner");
+    assert.equal(await status(token({ actorUserId: "u-bob" })), "403 session_mismatch", "a token naming another actor");
     await sql("UPDATE claw_sessions SET config = $1::jsonb WHERE session_id = 's-1'", [JSON.stringify({ acting_as: "u-bob" })]);
-    assert.equal(await status(token()), 403, "acting as another user");
+    assert.equal(await status(token()), "403 session_mismatch", "acting as another user");
     await sql("UPDATE claw_sessions SET config = '{}'::jsonb, deleted_at = now() WHERE session_id = 's-1'");
-    assert.equal(await status(token()), 403, "deleted");
+    assert.equal(await status(token()), "403 session_mismatch", "deleted");
   });
 
   test("A4 an owner who keeps no GitHub token is refused", async () => {
     await pg.exec("DELETE FROM claw_user_env_vars");
-    assert.equal(await status(token()), 403);
+    assert.equal(await status(token()), "403 no_github_token");
   });
 });
 
