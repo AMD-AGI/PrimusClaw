@@ -23,6 +23,11 @@ test("nothing configured: nothing is stamped", () => {
   assert.equal(defaultTaskWorkspaceId({ SANDBOX_NAMESPACE: "" }), "");
 });
 
+test("kubernetes mode has no CPU workspace: the task is stamped with SANDBOX_NAMESPACE whatever else is set", () => {
+  assert.equal(defaultTaskWorkspaceId({ SANDBOX_NAMESPACE: "ns", SANDBOX_CPU_NAMESPACE: "cpu-ws" }, true), "ns");
+  assert.equal(defaultTaskWorkspaceId({ SANDBOX_NAMESPACE: "ns" }, true), "ns");
+});
+
 test("a CPU workspace: nothing is stamped, so Brain picks per sandbox", () => {
   assert.equal(defaultTaskWorkspaceId({ SANDBOX_NAMESPACE: "gpu-ws", SANDBOX_CPU_NAMESPACE: "cpu-ws" }), "");
   assert.equal(defaultTaskWorkspaceId({ SANDBOX_CPU_NAMESPACE: "cpu-ws" }), "");
@@ -30,6 +35,6 @@ test("a CPU workspace: nothing is stamped, so Brain picks per sandbox", () => {
 
 test("the dispatcher stamps its tasks through it, not from the environment directly", () => {
   const src = readFileSync(new URL("../src/tasks/dispatcher.ts", import.meta.url), "utf8");
-  assert.match(src, /workspace_id: sessionWorkspaceId \|\| defaultTaskWorkspaceId\(\)/);
+  assert.match(src, /workspace_id: sessionWorkspaceId \|\| defaultTaskWorkspaceId\(process\.env, CLAW_DEPLOY_MODE === "kubernetes"\)/);
   assert.doesNotMatch(src, /process\.env\.SANDBOX_NAMESPACE/);
 });

@@ -32,6 +32,7 @@ const {
 } = await import("../src/sandbox/sandbox-router.js");
 const { SafeWorkloadProvider } = await import("../src/sandbox/safe-workload-provider.js");
 const { handsBehindRouterProxy } = await import("../src/config.js");
+const { probeAppMcp } = await import("../src/apps/app-mcp.js");
 
 const originalFetch = globalThis.fetch;
 afterEach(() => {
@@ -199,5 +200,25 @@ test("a stored Hands URL fails over inside its own Router's list, whichever Rout
     "http://gpu-r1.test/v1/namespaces/gpu-ws/code-interpreters/w/invocations/proxy/9100/health",
     "http://gpu-r2.test/v1/namespaces/gpu-ws/code-interpreters/w/invocations/proxy/9100/health",
     "http://w.cpu-ws.svc.cluster.local:9100/health",
+  ]);
+});
+
+test("the app MCP probe fails over inside the list of the Router its URL is on, never to the other cluster's", async () => {
+  const seen: string[] = [];
+  globalThis.fetch = (async (input: unknown) => {
+    seen.push(String(input));
+    if (new URL(String(input)).host === "cpu-r1.test") {
+      throw Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error("refused"), { code: "ECONNREFUSED" }) });
+    }
+    return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+  const verdict = await probeAppMcp({
+    url: "http://cpu-r1.test/v1/namespaces/cpu-ws/code-interpreters/wl-1/invocations/proxy/9000/mcp",
+    tokenHeader: "x-mcp-token", token: "t", sandboxSessionId: "wl-1", bearer: "b",
+  });
+  assert.deepEqual(verdict, { kind: "ok" });
+  assert.deepEqual(seen, [
+    "http://cpu-r1.test/v1/namespaces/cpu-ws/code-interpreters/wl-1/invocations/proxy/9000/mcp",
+    "http://cpu-r2.test/v1/namespaces/cpu-ws/code-interpreters/wl-1/invocations/proxy/9000/mcp",
   ]);
 });

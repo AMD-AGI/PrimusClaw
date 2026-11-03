@@ -182,7 +182,7 @@ async function loadSessionCredentials(sessionId: string): Promise<{
     platform_key: credentials.platformKey,
     // The namespace is not a credential: it names where the work runs, not who
     // it runs as, and a deployment-wide default for it grants nothing.
-    workspace_id: sessionWorkspaceId || defaultTaskWorkspaceId(),
+    workspace_id: sessionWorkspaceId || defaultTaskWorkspaceId(process.env, CLAW_DEPLOY_MODE === "kubernetes"),
     llm_api_key: credentials.llmApiKey,
   };
 }
