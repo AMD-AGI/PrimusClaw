@@ -86,7 +86,10 @@ export const grep = {
         break;
       }
       try {
-        if (fs.statSync(file).size > GREP_MAX_FILE_BYTES) { tooLarge++; continue; }
+        // Followed through a link: a device or FIFO has no size to cap and a read of it never ends.
+        const st = fs.statSync(file);
+        if (!st.isFile()) continue;
+        if (st.size > GREP_MAX_FILE_BYTES) { tooLarge++; continue; }
         const lines = fs.readFileSync(file, "utf-8").split("\n");
         const rel = path.relative(WORKSPACE, file);
         const fileDeadline = Date.now() + PER_FILE_TIMEOUT_MS;
