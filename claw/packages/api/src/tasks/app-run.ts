@@ -49,6 +49,7 @@ import { devAuthBypassEnabled } from "../auth/middleware.js";
 import { isAdmin, type UserInfo } from "../auth/models.js";
 import { assertSessionCredentialsForDispatch, MissingPlatformKeyError, stampSessionCredentials } from "../auth/session-credentials.js";
 import { newMcpToken, sealAppRunSecret } from "../crypto/app-run-secrets.js";
+import { sessionWithholdsSandboxKeys } from "../github-review/session-tools.js";
 import { db } from "../infra/db.js";
 import { canViewPlugin } from "../marketplace/plugins.js";
 import pino from "pino";
@@ -355,6 +356,10 @@ export async function checkAppRunRequest(
   resolved: ResolvedAppResources; plan: AppRunPlan;
 }> {
   if (!ports.enabled()) return refuse(501, "app_runs_disabled");
+  // A session that acts as a user keeps its owner's keys out of every sandbox it is given, and an application's sandbox is made with
+  // them: none is made for such a session. (An application is code that the session's model, which reads what strangers wrote, can hand
+  // text to.)
+  if (await sessionWithholdsSandboxKeys(req.sessionId)) return refuse(409, "app_run_not_allowed_for_acting_session");
 
   const pluginId = req.body.plugin_id;
   if (typeof pluginId !== "number" || !Number.isSafeInteger(pluginId) || pluginId <= 0) {

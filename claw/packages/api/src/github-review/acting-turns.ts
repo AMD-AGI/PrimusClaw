@@ -33,7 +33,7 @@ const logger = pino({ name: "github-review-acting-turns" });
 export type ActingTurnRefusal = Extract<AttendedCaller, { ok: false }>["error"];
 
 /** Anything that can run one SQL statement: the pool, or a client that is inside a transaction. */
-interface Statements { query(text: string, params?: unknown[]): Promise<{ rows: Array<Record<string, unknown>> }> }
+interface Statements { query(text: string, params?: unknown[]): Promise<{ rows: unknown[] }> }
 
 /**
  * Why this request may not start a turn in a session whose stored `config.acting_as` is `actingAs`, or null when it may.
@@ -51,7 +51,7 @@ export function actingTurnRefusal(req: FastifyRequest, actingAs: unknown): Actin
 
 /** The session's stored `config.acting_as` (undefined when it has none or is gone): for a route that has the session id and nothing else of the row. */
 export async function storedActingAs(sessionId: string, q: Statements = db): Promise<unknown> {
-  const rows = (await q.query("SELECT config->'acting_as' AS acting_as FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL", [sessionId])).rows;
+  const rows = (await q.query("SELECT config->'acting_as' AS acting_as FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL", [sessionId])).rows as Array<{ acting_as?: unknown } | undefined>;
   return rows[0]?.acting_as;
 }
 

@@ -39,6 +39,8 @@ import {
   writeTopologyHandoff,
   hasSshKeyFile,
   applyPlatformKeyEnv,
+  withholdKeyEnv,
+  sandboxUserEnv,
 } from "./params.js";
 import type { SandboxAction } from "./params.js";
 import { resourcesJsonToWorkloadArray } from "./workload-resources.js";
@@ -173,9 +175,13 @@ export function requestSpecFingerprint(
   // request's fingerprint depend on a value no request can change.
   const env = composeSandboxEnv({
     base: action.params.env ?? {},
-    userEnv: request.user_env,
+    userEnv: sandboxUserEnv(request),
     sessionEnv: request.session_env,
   });
+  // As the sandbox is built (provisionHands): a session that acts as a user has none of the key variables, so a change in one of
+  // them is not a change in the sandbox, and its key is not one that was injected.
+  const withholdKeys = request.withhold_sandbox_keys === true;
+  if (withholdKeys) withholdKeyEnv(env);
   const labels = action.params.labels ?? {};
   // The resources the SaFE create will use; the namespace depends on whether they ask
   // for a GPU, so it is read once and reused for the fingerprint below.
@@ -197,7 +203,8 @@ export function requestSpecFingerprint(
       // rotation only reaches the sandbox by rebuilding it. safe mode
       // authenticates with the deployment's platform key instead, which is
       // not per-request and so is not folded in there.
-      llmKey: resolveRequestLlmKey(request),
+      llmKey: withholdKeys ? undefined : resolveRequestLlmKey(request),
+      withholdKeys,
     });
   }
   const resources: Record<string, string> = {};
@@ -212,6 +219,7 @@ export function requestSpecFingerprint(
     ttlSec: action.params.ttl_sec ?? DEFAULT_SANDBOX_TTL_SEC,
     labels,
     namespace,
+    withholdKeys,
   });
 }
 
@@ -2677,9 +2685,17 @@ async function provisionHands(
   env = composeSandboxEnv({
     base: env,
     systemEnv: getSystemEnv(),
-    userEnv: request.user_env ?? {},
+    userEnv: sandboxUserEnv(request),
     sessionEnv: request.session_env ?? {},
   });
+  // A session that acts as a user's GitHub account: its model reads text strangers
+  // wrote, and whatever the sandbox's environment holds the model can print. Its
+  // owner's stored variables are not composed in at all (`sandboxUserEnv`), and the
+  // key variables are taken out of the composed result, so that no layer can have
+  // put one there (the spec's env, the user's own variables, the request's).
+  // `apiKey` is still what the workload is created and owned with (below); only a
+  // copy a process in the sandbox could read is withheld.
+  if (request.withhold_sandbox_keys) withholdKeyEnv(env);
 
   // ── kubernetes/BYOK mode: agent-sandbox provider path (design §16.5). ──
   // safe mode falls through to the SaFE Workload path below (unchanged).

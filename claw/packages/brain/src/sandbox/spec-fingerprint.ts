@@ -30,6 +30,12 @@ export interface SandboxSpecFacts {
   namespace?: string;
   /** The caller's LLM key. Hashed here and never stored or logged in full. */
   llmKey?: string;
+  /**
+   * The sandbox was built without the caller's keys (`withhold_sandbox_keys`). Part of the fingerprint only when true, so that
+   * every fingerprint already stored (none of them withheld) still compares as it did, and a sandbox that holds the keys is not reused
+   * for a request that is not to have them.
+   */
+  withholdKeys?: boolean;
 }
 
 /**
@@ -71,6 +77,7 @@ export function sandboxSpecFingerprint(facts: SandboxSpecFacts): string {
     // MAC'd before it joins the rest so the key never appears in a string
     // this process holds, even transiently.
     llmKey: fingerprintLlmKey(facts.llmKey),
+    ...(facts.withholdKeys ? { withholdKeys: true } : {}),
   });
   // A format prefix, not part of the hash, so a comparison change can be told
   // apart from a spec change. evaluateReuse treats a different format as a

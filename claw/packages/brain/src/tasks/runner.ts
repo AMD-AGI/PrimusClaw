@@ -4469,6 +4469,13 @@ class TaskRunner {
       }
       throw new AppRunFailedError("an app run needs the session owner's platform key");
     }
+    // A session that acts as a user is not given a hosted application's sandbox, which is made with the owner's model key (the API refuses
+    // to admit one). A run admitted before it did is wound up here instead of started: whatever sandbox an earlier worker made is stopped and
+    // the grant revoked, as for a cancel, and the row is ended. Not a finish-only dispatch: that is this already.
+    if (this.request.withhold_sandbox_keys === true && !finishOnly) {
+      await fx().createAppRunner(runId, this.platformKey, epoch).finishNow("cancelled");
+      throw new AppRunFailedError("a hosted application is not run for a session that acts as a user");
+    }
     const runner = fx().createAppRunner(runId, this.platformKey, epoch);
     // A finish-only dispatch is not a run starting: the task is already over as far as the
     // user is concerned, so nothing says "running" and nothing reports a terminal state.
