@@ -21,18 +21,26 @@ import { WORKSPACE_EXCLUDES } from "../src/workspace/excludes.js";
 
 const ID = "0f8fad5b-d9cb-469f-a165-70867728950e";
 
-interface FakeFile { type?: string; size: number }
-function fakeHands(files: Record<string, FakeFile>, upload: "ok" | "fail" = "ok") {
+/** `real`: where the path resolves (a link); `content`: the bytes, for an inline read; `root`: what /workspace resolves to. */
+interface FakeFile { type?: string; size: number; real?: string; content?: Buffer }
+const unquote = (w: string) => w.replace(/'\\''/g, "'");
+function fakeHands(files: Record<string, FakeFile>, upload: "ok" | "fail" = "ok", root = "/workspace") {
   const calls: Array<{ name: string; args: Record<string, any> }> = [];
   const hands = {
     async callTool(name: string, args: Record<string, any>): Promise<string> {
       calls.push({ name, args });
-      if (name === "bash") {
-        const m = /-- '(.*)' 2>&1$/.exec(args.command as string);
-        const p = m ? m[1].replace(/'\\''/g, "'") : "";
+      const command = args.command as string;
+      if (name === "bash" && command.startsWith("stat ")) {
+        const p = unquote(/^stat -L -c '[^']*' -- '((?:[^']|'\\'')*)' 2>&1 && /.exec(command)![1]);
         const f = files[p];
         if (!f) return `stat: cannot statx '${p}': No such file or directory\n\nExit code: 1`;
-        return `__claw_deliver_stat__${f.type ?? (f.size ? "regular file" : "regular empty file")}|${f.size}\n`;
+        return `__claw_deliver_stat__${f.type ?? (f.size ? "regular file" : "regular empty file")}|${f.size}\n`
+          + `__claw_deliver_real__${root}\n__claw_deliver_real__${f.real ?? p.replace(/^\/workspace/, root)}\n`;
+      }
+      if (name === "bash" && command.includes("base64 -w0")) {
+        const p = unquote(/base64 -w0 -- '((?:[^']|'\\'')*)'/.exec(command)![1]);
+        const f = Object.entries(files).find(([k, v]) => (v.real ?? k.replace(/^\/workspace/, root)) === p)?.[1];
+        return `__claw_deliver_data__${f?.content?.toString("base64") ?? ""}\n`;
       }
       if (name === "upload_to_s3") {
         const local = args.files[0].local_path as string;
@@ -74,22 +82,31 @@ test("a path is a file under /workspace, absolute or relative, and nothing else"
 
 test("a file is copied to <session prefix>.deliveries/<id>/<name> and described", async () => {
   const { hands, calls } = fakeHands({ "/workspace/out/chart.png": { size: 640 } });
-  const r = await deliverFile(hands, CTX, { path: "out/chart.png", caption: "  CPU vs GPU\n  per node " });
+  const r = await deliverFile(hands, { ...CTX, maxBytes: 100_000 }, { path: "out/chart.png", caption: "  CPU vs GPU\n  per node " });
   assert.ok(r.ok, JSON.stringify(r));
-  assert.deepEqual(r.delivery, { id: ID, name: "chart.png", size: 640, content_type: "image/png", caption: "CPU vs GPU per node" });
+  assert.deepEqual(r.delivery, { id: ID, name: "chart.png", size: 640, content_type: "image/png", caption: "CPU vs GPU per node" },
+    "an image whose bytes could not be read as its size carries none");
   assert.deepEqual(presigned, [`users/u-1/sessions/s-1/${DELIVERY_DIR}/${ID}/chart.png`]);
   const upload = calls.find((c) => c.name === "upload_to_s3")!;
   assert.deepEqual(upload.args.files, [{ local_path: "/workspace/out/chart.png", presigned_url: `https://store.invalid/${presigned[0]}?sig` }]);
 });
 
 test("refusals: outside /workspace, missing, a directory, too large, an upload that failed", async () => {
-  const files = { "/workspace/dir": { type: "directory", size: 4096 }, "/workspace/big.bin": { size: 1001 }, "/workspace/a.txt": { size: 3 } };
+  const files = {
+    "/workspace/dir": { type: "directory", size: 4096 }, "/workspace/big.bin": { size: 1001 }, "/workspace/a.txt": { size: 3 },
+    "/workspace/link.txt": { size: 9, real: "/etc/passwd" }, "/workspace/dirlink/x.txt": { size: 9, real: "/root/x.txt" },
+    "/workspace/lookalike.txt": { size: 9, real: "/workspace2/x.txt" },
+  };
   const rows: Array<[Record<string, unknown>, RegExp, "ok" | "fail"]> = [
     [{ path: "/etc/passwd" }, /under \/workspace/, "ok"],
     [{ path: "nope.txt" }, /does not exist/, "ok"],
     [{ path: "dir" }, /is a directory, not a file/, "ok"],
     [{ path: "big.bin" }, /1001 bytes; at most 1000/, "ok"],
     [{ path: "a.txt" }, /could not be copied for delivery: AccessDenied/, "fail"],
+    [{ path: "link.txt" }, /resolves to a file outside \/workspace/, "ok"],
+    [{ path: "dirlink/x.txt" }, /resolves to a file outside \/workspace/, "ok"],
+    [{ path: "lookalike.txt" }, /resolves to a file outside \/workspace/, "ok"],
+    [{ path: "a\nb.txt" }, /under \/workspace/, "ok"],
   ];
   for (const [input, want, upload] of rows) {
     const { hands, calls } = fakeHands(files, upload);
@@ -105,8 +122,38 @@ test("an empty file is a file; the path reaches the shell as one quoted word", a
   const { hands, calls } = fakeHands({ [odd]: { size: 0 } });
   const r = await deliverFile(hands, CTX, { path: odd });
   assert.ok(r.ok, JSON.stringify(r));
-  assert.equal(calls[0].args.command, `stat -L -c '__claw_deliver_stat__%F|%s' -- '/workspace/it'\\''s $(rm -rf x) \`y\`.txt' 2>&1`);
+  const quoted = `'/workspace/it'\\''s $(rm -rf x) \`y\`.txt'`;
+  assert.equal(calls[0].args.command, `stat -L -c '__claw_deliver_stat__%F|%s' -- ${quoted} 2>&1`
+    + ` && printf '__claw_deliver_real__%s\\n' "$(realpath -e -- /workspace)" "$(realpath -e -- ${quoted})"`);
   assert.equal(r.delivery.content_type, "text/plain");
+});
+
+test("a link inside the workspace is delivered as the file it resolves to, also when /workspace itself is a link", async () => {
+  const { hands, calls } = fakeHands({ "/workspace/latest.csv": { size: 5, real: "/data/ws/runs/7/out.csv" } }, "ok", "/data/ws");
+  const r = await deliverFile(hands, CTX, { path: "latest.csv" });
+  assert.ok(r.ok, JSON.stringify(r));
+  assert.equal(r.delivery.name, "latest.csv", "offered under the name the agent gave");
+  assert.equal(calls.find((c) => c.name === "upload_to_s3")!.args.files[0].local_path, "/data/ws/runs/7/out.csv", "the resolved file is what is copied");
+});
+
+test("a small image carries its bytes for a client to show; a large one, or another type, does not", async () => {
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 1, 2, 3, 4]);
+  const big = Buffer.alloc(15_001, 1);
+  const { hands } = fakeHands({
+    "/workspace/c.png": { size: png.length, content: png },
+    "/workspace/big.png": { size: big.length, content: big },
+    "/workspace/c.csv": { size: png.length, content: png },
+    "/workspace/lies.png": { size: png.length + 1, content: png },
+  });
+  const ctx = { ...CTX, maxBytes: 100_000 };
+  const small = await deliverFile(hands, ctx, { path: "c.png" });
+  assert.ok(small.ok);
+  assert.equal(small.delivery.data_base64, png.toString("base64"));
+  for (const path of ["big.png", "c.csv", "lies.png"]) {
+    const r = await deliverFile(hands, ctx, { path });
+    assert.ok(r.ok, path);
+    assert.ok(!("data_base64" in r.delivery), path);
+  }
 });
 
 test("the delivered copies belong to Brain: never pruned, never restored into the sandbox, never uploaded from it", () => {

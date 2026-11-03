@@ -16,7 +16,9 @@
  */
 import crypto from "node:crypto";
 import path from "node:path";
-import { deliveryContentType, deliveryKeyPrefix, type Delivery, type ToolSchema } from "@claw/protocol";
+import {
+  DELIVERY_INLINE_MAX_BYTES, DELIVERY_INLINE_TYPES, deliveryContentType, deliveryKeyPrefix, type Delivery, type ToolSchema,
+} from "@claw/protocol";
 import type { HandsClient } from "../clients/hands.js";
 import { presignPut } from "../workspace/s3-uploader.js";
 
@@ -25,8 +27,10 @@ export const DELIVER_FILE_TOOL = "deliver_file";
 const WORKSPACE = "/workspace";
 const CAPTION_MAX = 300;
 const STAT_TIMEOUT_SEC = 15;
-/** Printed in front of `stat`'s answer so it is told from anything else the shell says. */
+/** Printed in front of each answer of the probe so it is told from anything else the shell says. */
 const STAT_MARK = "__claw_deliver_stat__";
+const REAL_MARK = "__claw_deliver_real__";
+const DATA_MARK = "__claw_deliver_data__";
 const STAT_LINE = new RegExp(`^${STAT_MARK}(regular (?:empty )?file|[a-z ]+)\\|(\\d+)$`, "m");
 
 export function deliverFileSchema(): ToolSchema {
@@ -49,7 +53,8 @@ export function deliverFileSchema(): ToolSchema {
 
 /** The absolute sandbox path for `input`, or null when it is not a file path under /workspace. */
 export function workspaceFilePath(input: unknown): string | null {
-  if (typeof input !== "string" || !input.trim() || input.includes("\0")) return null;
+  // No control characters: the probe's answer is read line by line.
+  if (typeof input !== "string" || !input.trim() || /[\x00-\x1f\x7f]/.test(input)) return null;
   const resolved = path.posix.resolve(WORKSPACE, input.trim());
   return resolved.startsWith(`${WORKSPACE}/`) ? resolved : null;
 }
@@ -82,6 +87,16 @@ export const deliverPorts = {
   newId: () => crypto.randomUUID(),
 };
 
+/** A small image's bytes, base64, read from the path that was copied; null when they cannot be read as that size. */
+async function inlineData(hands: HandsClient, real: string, size: number, signal?: AbortSignal): Promise<string | null> {
+  const out = await hands.callTool("bash", {
+    command: `printf '${DATA_MARK}%s\\n' "$(base64 -w0 -- ${shellWord(real)})"`,
+    timeout: STAT_TIMEOUT_SEC,
+  }, signal);
+  const data = new RegExp(`^${DATA_MARK}([A-Za-z0-9+/=]*)$`, "m").exec(out)?.[1] ?? "";
+  return data && Buffer.from(data, "base64").length === size ? data : null;
+}
+
 export async function deliverFile(
   hands: HandsClient,
   ctx: DeliverContext,
@@ -93,12 +108,20 @@ export async function deliverFile(
   const captionIn = typeof input.caption === "string" ? input.caption.replace(/\s+/g, " ").trim() : "";
   const caption = captionIn.slice(0, CAPTION_MAX);
 
-  const statOut = await hands.callTool("bash", {
-    command: `stat -L -c '${STAT_MARK}%F|%s' -- ${shellWord(file)} 2>&1`,
+  // What the file is, and where it really is: a link under /workspace may point anywhere in the sandbox, and Hands
+  // reads whatever the path it is given resolves to, so the resolved path is checked and is what gets copied.
+  const probe = await hands.callTool("bash", {
+    command: `stat -L -c '${STAT_MARK}%F|%s' -- ${shellWord(file)} 2>&1`
+      + ` && printf '${REAL_MARK}%s\\n' "$(realpath -e -- ${WORKSPACE})" "$(realpath -e -- ${shellWord(file)})"`,
     timeout: STAT_TIMEOUT_SEC,
   }, signal);
-  const stat = STAT_LINE.exec(statOut);
+  const stat = STAT_LINE.exec(probe);
   if (!stat) return { ok: false, error: `Error: ${file} does not exist or cannot be read.` };
+  const resolved = probe.split("\n").filter((l) => l.startsWith(REAL_MARK)).map((l) => l.slice(REAL_MARK.length));
+  const [root, real] = resolved;
+  if (resolved.length !== 2 || !root || !real || !real.startsWith(`${root}/`)) {
+    return { ok: false, error: `Error: ${file} resolves to a file outside /workspace; deliver a file in the workspace.` };
+  }
   if (!stat[1].startsWith("regular")) return { ok: false, error: `Error: ${file} is a ${stat[1]}, not a file. Deliver one file (zip a directory first).` };
   const size = Number(stat[2]);
   if (size > ctx.maxBytes) {
@@ -109,21 +132,24 @@ export async function deliverFile(
   const name = deliveryName(file);
   const key = `${deliveryKeyPrefix(`users/${ctx.userId}/sessions/${ctx.sessionId}/`, id)}${name}`;
   const raw = await hands.callTool("upload_to_s3", {
-    files: [{ local_path: file, presigned_url: await deliverPorts.presignPut(key) }],
+    files: [{ local_path: real, presigned_url: await deliverPorts.presignPut(key) }],
   }, signal);
   let uploaded = false;
   let reason = "";
   try {
     const parsed = JSON.parse(raw) as { ok?: unknown; failed?: Array<{ error?: string }> };
-    uploaded = Array.isArray(parsed.ok) && parsed.ok.includes(file);
+    uploaded = Array.isArray(parsed.ok) && parsed.ok.includes(real);
     reason = parsed.failed?.[0]?.error ?? "";
   } catch {
     reason = raw.slice(0, 200);
   }
   if (!uploaded) return { ok: false, error: `Error: ${file} could not be copied for delivery${reason ? `: ${reason}` : ""}.` };
 
+  const contentType = deliveryContentType(name);
+  const inline = DELIVERY_INLINE_TYPES.includes(contentType) && size <= DELIVERY_INLINE_MAX_BYTES
+    ? await inlineData(hands, real, size, signal) : null;
   const delivery: Delivery = {
-    id, name, size, content_type: deliveryContentType(name), ...(caption ? { caption } : {}),
+    id, name, size, content_type: contentType, ...(caption ? { caption } : {}), ...(inline ? { data_base64: inline } : {}),
   };
   return { ok: true, delivery, text: `Delivered ${name} (${size} bytes) to the user as a download.` };
 }

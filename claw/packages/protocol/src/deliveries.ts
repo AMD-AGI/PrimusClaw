@@ -29,7 +29,18 @@ export interface Delivery {
   content_type: string;
   /** One line the agent wrote to go with the file; absent when it wrote none. */
   caption?: string;
+  /**
+   * The file itself, base64, for a small image (DELIVERY_INLINE_TYPES, at most
+   * DELIVERY_INLINE_MAX_BYTES): what a client shows inline without fetching it,
+   * since the download answers a signed-in person and not a client's key.
+   */
+  data_base64?: string;
 }
+
+/** The images a delivery carries inline when they are small enough. */
+export const DELIVERY_INLINE_TYPES: readonly string[] = ["image/png", "image/jpeg", "image/gif"];
+/** Bytes, before base64: small enough for a chat message that holds a card around it. */
+export const DELIVERY_INLINE_MAX_BYTES = 15_000;
 
 /** A delivery id is a v4-shaped UUID and nothing else: it becomes part of an object key. */
 export const DELIVERY_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;

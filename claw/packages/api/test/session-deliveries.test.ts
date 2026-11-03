@@ -12,6 +12,7 @@
  *   D2 only a sign-in: every key method (the sandbox holds the owner's key) is 403, before anything is looked up
  *   D3 another user's session, an administrator, a missing session, a malformed id, a missing object: the same 404
  *   D4 past DELIVERY_TTL_DAYS the link is gone (410), the object is not read
+ *   D5 no file route serves a delivered copy to a key: not by its path, not inside a folder download
  */
 import test, { after, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -22,6 +23,7 @@ import { GetObjectCommand, ListObjectsV2Command, S3Client } from "@aws-sdk/clien
 process.env.CLAW_DEPLOY_MODE = "kubernetes";
 
 const { registerSessionDeliveryRoutes, SIGNED_IN_METHODS } = await import("../src/routes/session-deliveries.js");
+const { registerSessionRoutes } = await import("../src/routes/sessions.js");
 const { recordRequestCredential } = await import("../src/auth/request-credential.js");
 const { DELIVERY_TTL_DAYS } = await import("../src/config.js");
 const { startHarness, seedSession } = await import("./scenario-harness.js");
@@ -46,13 +48,16 @@ before(async () => {
     if (command instanceof ListObjectsV2Command) {
       const prefix = command.input.Prefix ?? "";
       asked.push(`list ${prefix}`);
-      return { Contents: [...objects].filter(([k]) => k.startsWith(prefix)).map(([Key, LastModified]) => ({ Key, LastModified })) };
+      return {
+        Contents: [...objects].filter(([k]) => k.startsWith(prefix)).map(([Key, LastModified]) => ({ Key, LastModified, Size: BODY.length })),
+      };
     }
     if (command instanceof GetObjectCommand) {
       asked.push(`get ${command.input.Key}`);
       return { Body: Readable.from([BODY]), ContentLength: BODY.length, ContentType: "application/octet-stream" };
     }
-    throw new Error("unexpected S3 command");
+    asked.push(`other ${(command as object).constructor.name}`);   // the zip task's marker and upload
+    return {};
   }) as typeof S3Client.prototype.send;
 });
 beforeEach(async () => {
@@ -66,16 +71,17 @@ after(async () => {
   await h.close();
 });
 
-async function get(url: string, user: typeof OWNER = OWNER, method: string | null = "cookie") {
+async function get(url: string, user: typeof OWNER = OWNER, method: string | null = "cookie", post?: Record<string, unknown>) {
   const app: FastifyInstance = Fastify();
   app.addHook("preHandler", async (req) => {
     (req as unknown as { user: typeof OWNER }).user = user;
     if (method !== null) recordRequestCredential(req, method);
   });
   await registerSessionDeliveryRoutes(app);
+  await registerSessionRoutes(app);
   await app.ready();
   try {
-    const res = await app.inject({ method: "GET", url });
+    const res = await app.inject(post ? { method: "POST", url, payload: post } : { method: "GET", url });
     return { status: res.statusCode, headers: res.headers, raw: res.rawPayload, json: () => res.json() as any };
   } finally {
     await app.close();
@@ -130,4 +136,27 @@ test("D4 past the TTL the link is gone and the object is not read", async () => 
   assert.equal(res.status, 410);
   assert.equal(res.json().error, "delivery_expired");
   assert.ok(!asked.some((a) => a.startsWith("get ")));
+});
+
+test("D5 no file route serves a delivered copy to a key: not by its path, not inside a folder download", async () => {
+  const name = encodeURIComponent("CPU vs GPU.png");
+  for (const url of [
+    `/v1/sessions/${SID}/files/.deliveries/${ID}/${name}`,
+    `/v1/sessions/${SID}/files/.deliveries/${ID}/${name}/stream`,
+    `/v1/sessions/${SID}/files/.deliveries/${ID}`,
+    `/v1/sessions/${SID}/files/.deliveries`,
+  ]) {
+    const res = await get(url, OWNER, "api_key");
+    assert.equal(res.status, 404, url);
+  }
+  assert.ok(!asked.some((a) => a.startsWith("get ") || a.startsWith("list ")), asked.join("; "));
+
+  objects.set(`users/u-1/sessions/${SID}/report.csv`, new Date());
+  const zipped = await get(`/v1/sessions/${SID}/zip-tasks`, OWNER, "api_key", { path: "" });
+  assert.equal(zipped.status, 200);
+  assert.equal(zipped.json().data.total_files, 1, "the whole session's archive leaves the delivered copy out");
+  for (const path of [".deliveries", `.deliveries/${ID}`]) {
+    const res = await get(`/v1/sessions/${SID}/zip-tasks`, OWNER, "api_key", { path });
+    assert.equal(res.status, 404, `an archive of ${path} has nothing in it`);
+  }
 });
