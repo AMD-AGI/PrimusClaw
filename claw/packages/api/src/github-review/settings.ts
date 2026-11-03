@@ -18,8 +18,8 @@
  *   CLAW_GITHUB_CONCURRENT_PER_REPO         default 3 (per API replica)
  *   CLAW_GITHUB_REQUESTS_PER_SESSION        GitHub requests one session may make, default 60
  *   CLAW_GITHUB_REVIEW_FAST_MAX_FILES       a change with at most this many files is reviewed from the diff, no sandbox, default 15
- *   CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES  ... and at most this many added plus deleted lines, default 600 (200 with the deep
- *                                           review on, where a change of a non-test source file takes the sandbox path whatever its size)
+ *   CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES  ... and at most this many added plus deleted lines, default 200 with the deep review
+ *                                           on, where a change of a non-test source file takes the sandbox path whatever its size; 600 off
  *   CLAW_GITHUB_REVIEW_DEEP_ENABLED         the deep review (default-skill.ts, review-path.ts), on by default: a source change is checked
  *                                           out, its callers read, its closest tests run, then a second adversarial pass; `false`
  *                                           gives the review it was before the switch

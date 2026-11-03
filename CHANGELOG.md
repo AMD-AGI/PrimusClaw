@@ -33,9 +33,9 @@ record it.
   that); a request's own `model` wins. `CLAW_GITHUB_REVIEW_EFFORT` (unset by default: nothing is sent, as before) runs
   every turn of it at that effort while it runs on that model (new `ExecuteRequest.effort`, which Brain sends as
   `output_config.effort`, or `reasoning_effort`, on every turn and sub-agent of the run). The requester's key pays.
-- A deep review behind `CLAW_GITHUB_REVIEW_DEEP_ENABLED` (off by default; off, the review instructions, path advice and
-  thresholds are exactly the previous ones). On, any change of a non-test source file, or of more than 200 lines
-  (`CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES`, 600 with it off), takes the sandbox path (`source_change`), and the
+- A deep review behind `CLAW_GITHUB_REVIEW_DEEP_ENABLED`, on by default (`false` turns it off, and then the review
+  instructions, path advice and thresholds are exactly the previous ones). On, any change of a non-test source file,
+  or of more than 200 lines (`CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES`, 600 with it off), takes the sandbox path (`source_change`), and the
   default instructions require it: check the pull request out, read the callers of every changed function and
   export, build and run the closest tests under a time bound, then a second adversarial pass by a read-only
   sub-agent; the review body lists what was read and run and carries non-blocking suggestions and open questions,

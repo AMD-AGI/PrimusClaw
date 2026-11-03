@@ -434,7 +434,7 @@ be read is treated as one that withholds, so memory is not used and the turn is 
 ## Review path: the diff or a sandbox
 
 A sandbox costs a cold start of about 16 seconds. A small change (at most
-`CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES` lines, default 600, in at most
+`CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES` lines, default 600 with the deep review off, in at most
 `CLAW_GITHUB_REVIEW_FAST_MAX_FILES` files) needs none: `gh_pr_get` returns the diff, the file list
 and the metadata, and says `review_path.path = "api_diff"`. A sandbox is allowed (`"sandbox"`) when
 the change is large, GitHub did not send the diff of some file (a binary, a rename or a diff too
@@ -443,9 +443,9 @@ skill of its own, which may use scripts.
 
 ### The deep review
 
-`CLAW_GITHUB_REVIEW_DEEP_ENABLED` (off by default) reviews in depth. Off, the model is given the
-instructions, the advice and the thresholds above, word for word what it was given before the
-switch existed. On, the diff-only path is kept for a small change that touches no source code
+`CLAW_GITHUB_REVIEW_DEEP_ENABLED` (on by default) reviews in depth. Set to `false`, the model is
+given the instructions, the advice and the thresholds above, word for word what it was given before
+the switch existed. On, the diff-only path is kept for a small change that touches no source code
 (documentation, configuration, tests; the line threshold defaults to 200), and every other change
 is reviewed with a sandbox that the instructions require: a non-test source file changed
 (`source_change`: a code, shell, SQL or interface-schema (`.proto`, `.thrift`, `.graphql`) file by extension, outside
@@ -531,8 +531,8 @@ logs and the audit rows.
 | `CLAW_GITHUB_CONCURRENT_PER_REPO` | 3 | Tool calls on one repository at once, per API replica |
 | `CLAW_GITHUB_REQUESTS_PER_SESSION` | 60 | GitHub requests one session may make |
 | `CLAW_GITHUB_REVIEW_FAST_MAX_FILES` | 15 | At most this many changed files for the diff-only path |
-| `CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES` | 600 (200 with the deep review on) | At most this many added plus deleted lines for the diff-only path; with the deep review on, a change of a non-test source file takes the sandbox path whatever its size |
-| `CLAW_GITHUB_REVIEW_DEEP_ENABLED` | off | The deep review ("The deep review" above): a required sandbox for source changes, the callers read, the closest tests run, and a second adversarial pass. Off gives the review as it was before the switch. Another value than `true`/`1`/`yes`/`false`/`0`/`no` is reported and leaves it off |
+| `CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES` | 200 (600 with the deep review off) | At most this many added plus deleted lines for the diff-only path; with the deep review on, a change of a non-test source file takes the sandbox path whatever its size |
+| `CLAW_GITHUB_REVIEW_DEEP_ENABLED` | on | The deep review ("The deep review" above): a required sandbox for source changes, the callers read, the closest tests run, and a second adversarial pass. `false` (or `0`, `no`) gives the review as it was before the switch. Another value than `true`/`1`/`yes`/`false`/`0`/`no` is reported and leaves it on |
 | `CLAW_GITHUB_REVIEW_MODEL` | `claude-opus-5.5` | The model of a session created with `config.acting_as` when the request names none (`model` absent or null); a request's own `model` wins. `default` leaves Brain's `DEFAULT_MODEL`. The requester's key pays for it |
 | `CLAW_GITHUB_REVIEW_EFFORT` | unset | The reasoning effort of every turn of such a session, its sub-agents included (`low`, `medium`, `high`; Anthropic `output_config.effort`, OpenAI `reasoning_effort`). Sent only while the session runs on `CLAW_GITHUB_REVIEW_MODEL` (a model its creator named instead may refuse the field). Unset sends neither field, so the model's own default applies, as before; another value is reported and sends none |
 
