@@ -1273,6 +1273,11 @@ export async function initDb(): Promise<void> {
     await client.query(
       `ALTER TABLE claw_pending_messages ADD COLUMN IF NOT EXISTS topology JSONB`,
     ).catch(() => {});
+    // The request's `tools_allowlist`, for the same reason as `topology`: a
+    // queued message is sent on from this row alone.
+    await client.query(
+      `ALTER TABLE claw_pending_messages ADD COLUMN IF NOT EXISTS tools_allowlist JSONB`,
+    ).catch(() => {});
     // How many times replaying this message has been refused a workspace.
     //
     // The replay is driven by a redelivered completion event, which the consumer

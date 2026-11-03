@@ -97,7 +97,7 @@ before(async () => {
   for (const column of [
     "plugin_id INTEGER", "tool_ids JSONB DEFAULT '[]'::jsonb", "workspace_id TEXT",
     "platform_key TEXT", "llm_api_key TEXT", "credentials_blob TEXT", "image TEXT",
-    "resources JSONB", "timeout INTEGER", "topology JSONB",
+    "resources JSONB", "timeout INTEGER", "topology JSONB", "tools_allowlist JSONB",
     "bind_attempts INTEGER NOT NULL DEFAULT 0",
     "user_env JSONB DEFAULT '{}'::jsonb", "session_env JSONB DEFAULT '{}'::jsonb",
   ]) {
