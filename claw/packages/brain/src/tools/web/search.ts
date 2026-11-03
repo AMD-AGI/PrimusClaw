@@ -382,13 +382,16 @@ export class WebSearchService {
       return "Error: web search rate limit exceeded (30 req/min). Please wait before searching again.";
     }
 
+    // The last backend's failure, so a search that fails everywhere says why.
+    let lastError = "";
+
     // Anthropic native path (Claude engine only)
     if (WEB_SEARCH_PROVIDER === "anthropic") {
       try {
         return await executeAnthropicSearch(searchInput, this.ctx);
       } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.warn({ err: msg }, "anthropic_search_failed, trying fallbacks");
+        lastError = `anthropic: ${err instanceof Error ? err.message : String(err)}`;
+        logger.warn({ err: lastError }, "anthropic_search_failed, trying fallbacks");
       }
     }
 
@@ -415,8 +418,8 @@ export class WebSearchService {
 
         return formatThirdPartyResults(searchInput.query, hits);
       } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.info({ provider: provider.name, err: msg }, "search_provider_failed");
+        lastError = `${provider.name}: ${err instanceof Error ? err.message : String(err)}`;
+        logger.info({ provider: provider.name, err: lastError }, "search_provider_failed");
       }
     }
 
@@ -424,6 +427,7 @@ export class WebSearchService {
       return "Error: web search disabled";
     }
 
+    if (lastError) return `Error: web search failed (${lastError.slice(0, 500)})`;
     return "Error: no web search provider available";
   }
 }
