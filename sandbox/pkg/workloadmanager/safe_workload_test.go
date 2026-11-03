@@ -145,6 +145,8 @@ func TestCreateWorkloadWaitsForPod(t *testing.T) {
 		return true, obj, nil
 	})
 	creator := NewSafeWorkloadCreator(dc, cl)
+	var call attestCall
+	creator.SetIdentityAttester(staticAttester{token: "eyJ.identity", call: &call})
 	result, err := creator.Create(context.Background(), e2b.CreateRequest{
 		SandboxID:   sandboxID,
 		TemplateID:  ci.Name,
@@ -169,9 +171,16 @@ func TestCreateWorkloadWaitsForPod(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	timeout, _, _ := unstructured.NestedInt64(stored.(*unstructured.Unstructured).Object, "spec", "timeout")
+	obj := stored.(*unstructured.Unstructured)
+	timeout, _, _ := unstructured.NestedInt64(obj.Object, "spec", "timeout")
 	if timeout != 60 {
 		t.Fatalf("timeout=%d", timeout)
+	}
+	if _, ok := obj.GetAnnotations()[identityAttestationAnnotation]; ok || obj.GetAnnotations()[grantAttestationAnnotation] != "eyJ.test" {
+		t.Fatalf("annotations=%v", obj.GetAnnotations())
+	}
+	if call.called {
+		t.Fatal("a grant-key create asked the identity provider for an attestation")
 	}
 	if err := creator.Delete(context.Background(), result.SandboxName); err != nil {
 		t.Fatal(err)
@@ -206,7 +215,9 @@ func TestCreateDeletesFailedWorkload(t *testing.T) {
 		_ = unstructured.SetNestedField(obj.Object, "Container codeinterpreter terminated: reason=Error exitCode=1, details: [{\"pod\":\"sbx-1\",\"node\":\"node-a\",\"message\":\"task ended Failed\",\"container\":{\"name\":\"codeinterpreter\",\"reason\":\"Error\",\"exitCode\":1}}]", "status", "message")
 		return true, obj, nil
 	})
-	_, err := NewSafeWorkloadCreator(dc, cl).Create(context.Background(), e2b.CreateRequest{
+	creator := NewSafeWorkloadCreator(dc, cl)
+	creator.SetIdentityAttester(staticAttester{token: "eyJ.identity"})
+	_, err := creator.Create(context.Background(), e2b.CreateRequest{
 		SandboxID:   sandboxID,
 		TemplateID:  "ar-run-dev-g2",
 		Namespace:   "agent-sandbox-system",
@@ -375,7 +386,86 @@ func signingWorkloadCreator(t *testing.T, sandboxID, phase string) (*SafeWorkloa
 		_ = unstructured.SetNestedField(obj.Object, phase, "status", "phase")
 		return true, obj, nil
 	})
-	return NewSafeWorkloadCreator(dc, cl), dc
+	creator := NewSafeWorkloadCreator(dc, cl)
+	creator.SetIdentityAttester(staticAttester{token: "eyJ.identity"})
+	return creator, dc
+}
+
+type staticAttester struct {
+	token string
+	err   error
+	call  *attestCall
+}
+
+// attestCall records the arguments of the last Attest call.
+type attestCall struct {
+	called           bool
+	key, ws, sandbox string
+	gpus             int
+}
+
+func (a staticAttester) Attest(_ context.Context, subjectKey, workspace, sandbox string, maxGPUs int) (string, error) {
+	if a.call != nil {
+		*a.call = attestCall{called: true, key: subjectKey, ws: workspace, sandbox: sandbox, gpus: maxGPUs}
+	}
+	if a.err != nil {
+		return "", a.err
+	}
+	return a.token, nil
+}
+
+// ownerCreateRequest is an identity-key create: no Claw attestation, and the caller's key.
+func ownerCreateRequest(sandboxID string) e2b.CreateRequest {
+	req := signingCreateRequest(sandboxID)
+	req.Attestation, req.OwnerKey = "", true
+	req.GrantID = "owner-c6c289e49e9c05b214586038"
+	req.SubjectKey = "ak-caller-key"
+	return req
+}
+
+func TestCreateRefusesWithoutIdentityAttester(t *testing.T) {
+	const sandboxID = "sbx-7a9b9b693452f613877992145c818d29"
+	creator, dc := signingWorkloadCreator(t, sandboxID, "Running")
+	creator.SetIdentityAttester(nil)
+	if _, err := creator.Create(context.Background(), ownerCreateRequest(sandboxID)); err == nil || !strings.Contains(err.Error(), "not configured") {
+		t.Fatalf("err=%v", err)
+	}
+	if _, err := dc.Tracker().Get(workloadGVR, "", sandboxID); err == nil {
+		t.Fatal("workload was created without an attestation")
+	}
+}
+
+func TestOwnerKeyCreateForwardsTheCallerKey(t *testing.T) {
+	const sandboxID = "sbx-7a9b9b693452f613877992145c818d29"
+	creator, dc := signingWorkloadCreator(t, sandboxID, "Running")
+	var call attestCall
+	creator.SetIdentityAttester(staticAttester{token: "eyJ.identity", call: &call})
+	if _, err := creator.Create(context.Background(), ownerCreateRequest(sandboxID)); err != nil {
+		t.Fatal(err)
+	}
+	if call.key != "ak-caller-key" || call.ws != "top-models" || call.sandbox != sandboxID || call.gpus != 2 {
+		t.Fatalf("attest call=%+v", call)
+	}
+	stored, err := dc.Tracker().Get(workloadGVR, "", sandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stored.(*unstructured.Unstructured).GetAnnotations()[identityAttestationAnnotation]; got != "eyJ.identity" {
+		t.Fatalf("identity annotation=%q", got)
+	}
+}
+
+func TestOwnerKeyCreateNeedsTheCallerKey(t *testing.T) {
+	const sandboxID = "sbx-7a9b9b693452f613877992145c818d29"
+	creator, dc := signingWorkloadCreator(t, sandboxID, "Running")
+	req := ownerCreateRequest(sandboxID)
+	req.SubjectKey = ""
+	if _, err := creator.Create(context.Background(), req); err == nil {
+		t.Fatal("an identity-key create without the caller's key was accepted")
+	}
+	if _, err := dc.Tracker().Get(workloadGVR, "", sandboxID); err == nil {
+		t.Fatal("workload was created without an attestation")
+	}
 }
 
 func TestWorkloadNameMatchesSandboxID(t *testing.T) {
@@ -400,6 +490,21 @@ func TestWorkloadNameMatchesSandboxID(t *testing.T) {
 		if err := validateWorkloadRequest(req); err == nil {
 			t.Fatalf("accepted %q", id)
 		}
+	}
+}
+
+func TestWorkloadAttestationRequiredUnlessOwnerKey(t *testing.T) {
+	req := e2b.CreateRequest{
+		SandboxID: "sbx-7a9b9b693452f613877992145c818d29", TemplateID: "tpl", Namespace: "ns",
+		Role: "e2b", SessionID: "owner-0123456789abcdef01234567", Workspace: "lab",
+		GrantID: "owner-0123456789abcdef01234567",
+	}
+	if err := validateWorkloadRequest(req); err == nil {
+		t.Fatal("accepted a grant sandbox without attestation")
+	}
+	req.OwnerKey = true
+	if err := validateWorkloadRequest(req); err != nil {
+		t.Fatalf("owner-key sandbox rejected: %v", err)
 	}
 }
 
@@ -511,5 +616,27 @@ func testCodeInterpreter() *runtimev1alpha1.CodeInterpreter {
 			},
 			GPU: &runtimev1alpha1.GPUConfig{Count: 2, SharedMemory: "250Gi", ResourceName: "amd.com/gpu"},
 		},
+	}
+}
+
+func TestWorkloadObjectMarksOwnerKeyWorkload(t *testing.T) {
+	ci := testCodeInterpreter()
+	const sandboxID = "sbx-7a9b9b693452f613877992145c818d29"
+	req := e2b.CreateRequest{SandboxID: sandboxID, TemplateID: "e2b-runner-g1", Role: "e2b", SessionID: "owner-c6c289e49e9c05b214586038",
+		Workspace: "lab", UserID: "user-1", GrantID: "owner-c6c289e49e9c05b214586038", OwnerKey: true}
+	obj, err := workloadObject(sandboxID, req, ci)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obj.GetLabels()["agent-sandbox.io/owner-key"] != "true" || obj.GetLabels()[grantIDLabel] != req.GrantID {
+		t.Fatalf("labels = %v", obj.GetLabels())
+	}
+	req.OwnerKey, req.Attestation = false, "eyJ.test"
+	obj, err = workloadObject(sandboxID, req, ci)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := obj.GetLabels()["agent-sandbox.io/owner-key"]; ok {
+		t.Fatal("grant workload must not carry the owner-key label")
 	}
 }

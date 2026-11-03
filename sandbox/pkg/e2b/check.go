@@ -38,11 +38,24 @@ const sameNodeMetadata = metadataPrefix + "same-node"
 // avoidNodesMetadata lists nodes the workload prefers not to run on.
 const avoidNodesMetadata = metadataPrefix + "avoid-nodes"
 
+// workspaceMetadata selects the SaFE workspace of an identity-key sandbox.
+const workspaceMetadata = metadataPrefix + "workspace"
+
+// ownerUserMetadata is the owner user id shown to a system-admin listing.
+const ownerUserMetadata = metadataPrefix + "owner-user-id"
+
+// scopeMetadata is the list filter that selects every sandbox for a system-admin.
+const scopeMetadata = metadataPrefix + "scope"
+
+// scopeAll is the scopeMetadata value that lists every sandbox.
+const scopeAll = "all"
+
 // callerMetadataKeys may be set by the SDK under agent-sandbox.io/.
 var callerMetadataKeys = map[string]struct{}{
 	"idempotency-key": {},
 	"avoid-nodes":     {},
 	"priority":        {},
+	"workspace":       {},
 }
 
 // reservedMetadataKeys are assigned by the platform and rejected from callers.
@@ -51,6 +64,7 @@ var reservedMetadataKeys = map[string]struct{}{
 	"signing-public-key": {},
 	"same-node":          {},
 	"nodes":              {},
+	"owner-user-id":      {},
 }
 
 // checkMetadata accepts agent-sandbox.io/ keys, including the caller keys above.

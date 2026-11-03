@@ -7,6 +7,7 @@ import (
 	"context"
 	"net/http"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -53,6 +54,18 @@ type MembershipChecker interface {
 	Check(ctx context.Context, userID string, workspaces []string) error
 }
 
+// OwnerUser is the SaFE User data an identity-key request uses.
+type OwnerUser struct {
+	Found      bool
+	Admin      bool
+	Workspaces []string
+}
+
+// UserReader reads a SaFE User once. A missing User is Found=false with no error.
+type UserReader interface {
+	ReadUser(ctx context.Context, userID string) (OwnerUser, error)
+}
+
 // UserCRMembership reads users.amd.com and compares the workspace list.
 type UserCRMembership struct {
 	client dynamic.Interface
@@ -78,8 +91,8 @@ func listedWorkspaces(obj *unstructured.Unstructured) ([]string, error) {
 	return nil, nil
 }
 
-// systemAdminRole matches SaFE's system-admin role. That role is not limited to listed workspaces.
-const systemAdminRole = "system-admin"
+// SystemAdminRole matches SaFE's system-admin role. That role is not limited to listed workspaces.
+const SystemAdminRole = "system-admin"
 
 // isSystemAdmin reports whether spec.roles contains the system-admin role.
 func isSystemAdmin(obj *unstructured.Unstructured) bool {
@@ -87,28 +100,51 @@ func isSystemAdmin(obj *unstructured.Unstructured) bool {
 	if err != nil {
 		return false
 	}
-	return contains(roles, systemAdminRole)
+	return contains(roles, SystemAdminRole)
+}
+
+// ReadUser reads the User once. A read error other than not-found is returned unchanged.
+func (m *UserCRMembership) ReadUser(ctx context.Context, userID string) (OwnerUser, error) {
+	if m == nil || m.client == nil {
+		return OwnerUser{}, opErr(http.StatusServiceUnavailable, "membership_unavailable", "User client is not configured")
+	}
+	obj, err := m.client.Resource(userGVR).Get(ctx, userID, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return OwnerUser{}, nil
+	}
+	if err != nil {
+		return OwnerUser{}, err
+	}
+	u := OwnerUser{Found: true, Admin: isSystemAdmin(obj)}
+	if u.Workspaces, err = listedWorkspaces(obj); err != nil {
+		return OwnerUser{}, opWrap(http.StatusForbidden, "user_not_in_workspace", "workspace list is unreadable", err)
+	}
+	return u, nil
 }
 
 // Check rejects a missing user and any workspace not listed on the User.
 // A system admin is accepted for every workspace.
 func (m *UserCRMembership) Check(ctx context.Context, userID string, workspaces []string) error {
-	if m == nil || m.client == nil {
-		return opErr(http.StatusServiceUnavailable, "membership_unavailable", "User client is not configured")
+	u, err := m.ReadUser(ctx, userID)
+	if _, ok := err.(*OpError); ok {
+		return err
 	}
-	obj, err := m.client.Resource(userGVR).Get(ctx, userID, metav1.GetOptions{})
-	if err != nil {
+	if err != nil || !u.Found {
 		return opErr(http.StatusForbidden, "user_not_in_workspace", "user was not found")
 	}
-	if isSystemAdmin(obj) {
+	return u.allows(workspaces)
+}
+
+// allows rejects any workspace not listed on the User unless the User is a system admin.
+func (u OwnerUser) allows(workspaces []string) error {
+	if !u.Found {
+		return opErr(http.StatusForbidden, "user_not_in_workspace", "user was not found")
+	}
+	if u.Admin {
 		return nil
 	}
-	got, err := listedWorkspaces(obj)
-	if err != nil {
-		return opWrap(http.StatusForbidden, "user_not_in_workspace", "workspace list is unreadable", err)
-	}
 	for _, ws := range workspaces {
-		if !contains(got, ws) {
+		if !contains(u.Workspaces, ws) {
 			return opErr(http.StatusForbidden, "user_not_in_workspace", ws)
 		}
 	}

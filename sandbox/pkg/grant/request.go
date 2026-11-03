@@ -106,6 +106,9 @@ func validateIssue(req IssueRequest, now time.Time) error {
 	if req.Issuer.AppRunID == "" {
 		return opErr(http.StatusBadRequest, "invalid_grant", "issuer.appRunId is required")
 	}
+	if reservedAppRunID(req.Issuer.AppRunID) {
+		return opErr(http.StatusBadRequest, "invalid_grant", "issuer.appRunId maps to template names reserved for identity keys")
+	}
 	if len(req.Roles) == 0 {
 		return opErr(http.StatusBadRequest, "invalid_grant", "at least one role is required")
 	}
@@ -209,6 +212,13 @@ func TemplateNames(appRunID, templateName string, perGPU []int32) []string {
 
 func expandOne(appRunID string, tpl TemplateRequest) []string {
 	return TemplateNames(appRunID, tpl.Name, tpl.PerGPUCount)
+}
+
+// reservedAppRunID reports whether template names built from appRunID can equal
+// the owner template names, which all start with the owner app run id.
+func reservedAppRunID(appRunID string) bool {
+	name := dnsName(appRunID)
+	return name == ownerAppRunID || strings.HasPrefix(name, ownerAppRunID+"-")
 }
 
 // templateObjectName builds a DNS-1123 name. Run ids may contain underscores.

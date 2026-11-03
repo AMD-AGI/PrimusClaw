@@ -46,6 +46,28 @@ controlplane:
     # image (built with EXTRA_CA_CERT_URLS) and fails the same way if it is empty.
     sandboxExtraCAConfigMap: ""
     sandboxExtraCARequired: false
+    # Identity provider keys on the E2B API. They are enabled when
+    # introspectUrl and ownerPolicyConfigMap are both set. The client Secret
+    # holds client_id and client_secret; the identity provider creates that
+    # Secret once in this namespace and does not rotate it. The ConfigMap key
+    # policy.json holds the owner quota policy.
+    # The policy is read at startup: a ConfigMap change needs a rollout restart.
+    # The policy role must match the role of existing owner records.
+    # A quota field left out keeps the built-in value; one left out of an owners
+    # entry comes from the default or admin quota of that user.
+    identity:
+      introspectUrl: ""
+      # tokenUrl is the identity provider token endpoint. It is used only with
+      # identity keys: an identity-key create exchanges the caller's key there
+      # for an assertion bound to the Workload (RFC 8693, requested_token_type
+      # jwt) and copies it onto the Workload. assertionAudience and
+      # assertionDetailType are its aud and authorization_details type; they
+      # match the admission constraint.
+      tokenUrl: ""
+      assertionAudience: "agent-sandbox-admission"
+      assertionDetailType: "agent-sandbox-workload"
+      clientSecret: "agent-sandbox-identity-client"
+      ownerPolicyConfigMap: ""
   # Graceful drain on rollout or eviction, in Kubernetes order:
   #  1. preStop sleeps preStopSleepSeconds while the Pod, already terminating,
   #     is removed from the Service endpoints and the gateway stops routing to

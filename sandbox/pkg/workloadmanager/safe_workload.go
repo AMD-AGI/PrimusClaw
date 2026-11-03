@@ -41,10 +41,13 @@ const (
 	// ownerSessionIDLabel records the issuing Claw session. Pulse reads
 	// primus-claw/session-id as the session's own sandbox, so a grant workload
 	// must not use that key.
-	ownerSessionIDLabel        = "primus-claw/owner-session-id"
-	grantIDLabel               = "agent-sandbox.io/grant-id"
-	sandboxIDLabel             = "agent-sandbox.io/sandbox-id"
-	grantAttestationAnnotation = "agent-sandbox.io/grant-attestation"
+	ownerSessionIDLabel = "primus-claw/owner-session-id"
+	grantIDLabel        = "agent-sandbox.io/grant-id"
+	// ownerKeyLabel marks a Workload charged to an identity-key owner record.
+	ownerKeyLabel                 = "agent-sandbox.io/owner-key"
+	sandboxIDLabel                = "agent-sandbox.io/sandbox-id"
+	grantAttestationAnnotation    = "agent-sandbox.io/grant-attestation"
+	identityAttestationAnnotation = "agent-sandbox.io/identity-attestation"
 	// nodesAffinityAnnotation asks SaFE to treat excluded-nodes as a preference.
 	nodesAffinityAnnotation  = "primus-safe.nodes.affinity"
 	nodesAffinityPreferred   = "preferred"
@@ -92,6 +95,22 @@ type SafeWorkloadCreator struct {
 	// remoteClusters are SaFE cluster ids whose pods this control plane cannot address.
 	// A Running Workload in one of them is ready without a pod IP.
 	remoteClusters map[string]struct{}
+	identity       IdentityAttester
+}
+
+// IdentityAttester asks the identity provider for a short assertion.
+// subjectKey is the caller's identity key; the assertion names its owner and
+// binds workspace, the Workload name sandbox, and the Workload GPU total gpus.
+type IdentityAttester interface {
+	Attest(ctx context.Context, subjectKey, workspace, sandbox string, gpus int) (string, error)
+}
+
+// SetIdentityAttester records the client that signs sandbox attestations.
+func (c *SafeWorkloadCreator) SetIdentityAttester(attester IdentityAttester) {
+	if c == nil {
+		return
+	}
+	c.identity = attester
 }
 
 // SetRemoteClusters records SaFE cluster ids that are reached through another Router.
@@ -134,6 +153,13 @@ func (c *SafeWorkloadCreator) Create(ctx context.Context, req e2b.CreateRequest)
 	// SaFE copies the Workload name into the session-id annotation. EnvD accepts
 	// a token only when that annotation equals the E2B sandbox id.
 	name := req.SandboxID
+	if req.OwnerKey {
+		token, err := c.identityAttestation(ctx, req, name, gpuCount(ci))
+		if err != nil {
+			return nil, err
+		}
+		req.IdentityAttestation = token
+	}
 	obj, err := workloadObject(name, req, ci)
 	if err != nil {
 		return nil, err
@@ -723,6 +749,25 @@ func addressFromStatus(obj *unstructured.Unstructured) (string, string, bool) {
 	return "", "", false
 }
 
+// identityAttestation asks the identity provider for the token copied onto an identity-key Workload.
+// name is the Workload name and gpus the template GPU count the Workload requests.
+func (c *SafeWorkloadCreator) identityAttestation(ctx context.Context, req e2b.CreateRequest, name string, gpus int) (string, error) {
+	if c == nil || c.identity == nil {
+		return "", fmt.Errorf("identity attester is not configured")
+	}
+	if req.SubjectKey == "" {
+		return "", fmt.Errorf("identity attestation needs the caller's identity key")
+	}
+	token, err := c.identity.Attest(ctx, req.SubjectKey, req.Workspace, name, gpus)
+	if err != nil {
+		return "", fmt.Errorf("identity attestation: %w", err)
+	}
+	if token == "" {
+		return "", fmt.Errorf("identity attestation is empty")
+	}
+	return token, nil
+}
+
 func validateWorkloadRequest(req e2b.CreateRequest) error {
 	if req.TemplateID == "" || req.Namespace == "" {
 		return fmt.Errorf("template and namespace are required")
@@ -745,7 +790,7 @@ func validateWorkloadRequest(req e2b.CreateRequest) error {
 	if !labelValue(req.GrantID) {
 		return fmt.Errorf("grant id %q is not a label value", req.GrantID)
 	}
-	if req.Attestation == "" {
+	if req.Attestation == "" && !req.OwnerKey {
 		return fmt.Errorf("grant attestation is required")
 	}
 	return nil
@@ -811,12 +856,18 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 	if req.GrantID != "" {
 		labels[grantIDLabel] = req.GrantID
 	}
+	if req.OwnerKey {
+		labels[ownerKeyLabel] = "true"
+	}
 	annotations := map[string]any{}
 	if req.UserName != "" {
 		annotations[safeUserNameAnnotation] = req.UserName
 	}
 	if req.Attestation != "" {
 		annotations[grantAttestationAnnotation] = req.Attestation
+	}
+	if req.IdentityAttestation != "" {
+		annotations[identityAttestationAnnotation] = req.IdentityAttestation
 	}
 	if strings.TrimSpace(req.AvoidNodes) != "" {
 		annotations[nodesAffinityAnnotation] = nodesAffinityPreferred
