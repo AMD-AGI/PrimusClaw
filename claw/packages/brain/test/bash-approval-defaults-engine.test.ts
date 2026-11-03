@@ -64,8 +64,8 @@ test("the built-in rules are the outbound-actions pack's GitHub rules, verbatim"
   const pack = JSON.parse(readFileSync(new URL("../../../examples/bash-approval/outbound-actions.json", import.meta.url), "utf8")) as Array<Record<string, any>>;
   const byLabel = new Map(pack.map((r) => [r.label, r]));
   for (const rule of DEFAULT_BASH_APPROVAL_RULES) assert.deepEqual(rule, byLabel.get(rule.label as string), rule.label as string);
-  // Every gh write, every git push except the plain branch push, and the HTTP writes aimed at GitHub's API.
+  // Every gh write, every git push except the plain branch push, and the pack's one http rule (GitHub's API).
   const github = pack.filter((r) => r.program === "gh" || (r.program === "git" && !r.label.startsWith("git push (publishes"))
-    || JSON.stringify(r.http?.url_prefix ?? "").includes("api.github.com")).map((r) => r.label);
+    || r.http !== undefined).map((r) => r.label);
   assert.deepEqual(DEFAULT_BASH_APPROVAL_RULES.map((r) => r.label), github, "every GitHub write rule of the pack, and nothing else");
 });
