@@ -17,7 +17,7 @@ import {
 import { HandsClient } from "../clients/hands.js";
 import { isSessionDeletedLocally } from "../infra/deleted-sessions.js";
 import { s3Excludes, findExcludeArgs } from "./excludes.js";
-import { TRUNCATED_FOOTER, planUploadDelta, seedSyncManifest } from "./sync-delta.js";
+import { TRUNCATED_FOOTER, invalidateSyncManifest, planUploadDelta, seedSyncManifest } from "./sync-delta.js";
 import {
   configuredGitLimits,
   enforceListedGit,
@@ -783,6 +783,11 @@ export async function syncWorkspaceToS3(
   // prune below is exactly what it was. Only for a listing that proved itself: a
   // doubtful one is uploaded whole, as before, and decides nothing about what is
   // already in S3.
+  //
+  // A doubtful listing also takes the record away before anything is uploaded:
+  // the upload puts objects under the prefix the record does not name, and a
+  // later prune by that record would never delete them.
+  if (!listing.trusted) await invalidateSyncManifest(hands, s3Prefix);
   const delta = listing.trusted
     ? await planUploadDelta(hands, s3Prefix, files, excludeArgs)
     : null;
@@ -988,10 +993,11 @@ export async function syncWorkspaceFromS3(
 ): Promise<number> {
   const s3Prefix = options?.s3PrefixOverride
     ?? `users/${userId}/sessions/${sessionId}/`;
+  const listedAt = Date.now();
   const { keys, prunable } = await listCurrentWorkspaceKeys(s3Prefix);
   // Only once the workspace holds everything the listing found: then the
   // listing is also what the next sync's prune would have to list again.
-  const seed = (): Promise<void> => seedSyncManifest(hands, s3Prefix, prunable);
+  const seed = (): Promise<void> => seedSyncManifest(hands, s3Prefix, prunable, listedAt);
   if (!keys.length) {
     logger.info({ sessionId, s3Prefix }, "s3.restore.empty");
     await seed();

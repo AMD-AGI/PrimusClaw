@@ -1186,3 +1186,88 @@ test("L8 a file called __proto__ is in the record like any other, so its removal
   assert.equal(store.lists, 0);
   assert.equal(store.objects.has("users/user-1/sessions/sess-1/__proto__"), false);
 });
+
+/** Run every listing the sandbox is asked for, but report it as a `find` that exited 1: untrusted, with every file in it. */
+function untrustedListing(sb: Sandbox): void {
+  sb.reply = (command) => command.includes("__claw_ls_begin__")
+    ? sb.run(command).stdout.replace(/__claw_ls_end__:0/, "__claw_ls_end__:1")
+    : undefined;
+}
+
+for (const [name, degrade, restore] of [
+  ["a sandbox that cannot stat", (sb: Sandbox) => { sb.noStat = true; }, (sb: Sandbox) => { sb.noStat = false; }],
+  ["an untrusted listing", untrustedListing, (sb: Sandbox) => { sb.reply = undefined; }],
+] as const) {
+  test(`L9 a sync that uploads without a plan (${name}) leaves no record a later prune could go by`, async () => {
+    // It uploads files the record does not name; a later prune by name from that
+    // record would never delete them, and they would come back on every restore.
+    const sb = threeFiles();
+    await sb.sync();
+    assert.deepEqual(recordPruned(sb), [true]);
+
+    degrade(sb);
+    sb.put("new.txt", "new");
+    await sb.sync();
+    restore(sb);
+    assert.ok(store.objects.has("users/user-1/sessions/sess-1/new.txt"));
+    assert.deepEqual(sb.manifestFiles(), [], "the record no longer vouches for the prefix");
+
+    sb.remove("new.txt");
+    store.lists = 0;
+    await sb.sync();
+    assert.equal(store.lists, 1, "so the next prune lists");
+    assert.equal(store.objects.has("users/user-1/sessions/sess-1/new.txt"), false, "and finds what was uploaded without it");
+  });
+}
+
+/** Move the record's last listing `ms` into the past, as if that much time had gone by since. */
+function ageRecord(sb: Sandbox, ms: number): void {
+  for (const f of sb.manifestFiles()) {
+    const p = join(sb.state, f);
+    const shard = JSON.parse(readFileSync(p, "utf-8"));
+    shard.listed -= ms;
+    writeFileSync(p, `${JSON.stringify(shard)}\n`);
+  }
+}
+
+test("L10 a record that has gone long enough without a listing is not pruned by, so what it does not name is found", async () => {
+  // An object the record does not name: a write that raced the restore's listing,
+  // a checkpoint copy whose invalidation was not confirmed.
+  const sb = threeFiles();
+  await sb.sync();
+  const stray = "users/user-1/sessions/sess-1/stray.txt";
+  store.objects.add(stray);
+
+  store.lists = 0;
+  await sb.sync();
+  assert.equal(store.lists, 0, "a fresh record is pruned by");
+  assert.ok(store.objects.has(stray));
+
+  ageRecord(sb, 31 * 60 * 1000);
+  await sb.sync();
+  assert.equal(store.lists, 1, "an old one is not");
+  assert.equal(store.objects.has(stray), false);
+
+  await sb.sync();
+  assert.equal(store.lists, 1, "and the listing makes the record fresh again");
+});
+
+test("L11 a record whose last listing is in the future, or missing, is not pruned by", async () => {
+  for (const shift of [-60 * 60 * 1000, Number.NaN]) {
+    const sb = threeFiles();
+    await sb.sync();
+    if (Number.isNaN(shift)) {
+      for (const f of sb.manifestFiles()) {
+        const p = join(sb.state, f);
+        const shard = JSON.parse(readFileSync(p, "utf-8"));
+        delete shard.listed;
+        writeFileSync(p, `${JSON.stringify(shard)}\n`);
+      }
+    } else {
+      ageRecord(sb, shift);
+    }
+    store.lists = 0;
+    await sb.sync();
+    assert.equal(store.lists, 1, `shift ${shift}`);
+  }
+});
