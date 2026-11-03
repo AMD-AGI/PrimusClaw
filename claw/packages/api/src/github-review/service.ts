@@ -9,7 +9,8 @@
  * its SHA; a head that moved refuses), what the acting user may do (their own
  * permission on the repository and their delegation setting), when a merge is
  * allowed (CI green on the head commit, no unresolved thread, GitHub's own merge
- * state CLEAN, not high risk or confirmed by the acting user) and how much may be
+ * state CLEAN, not held by the reviewing model's risk judgement or a hard hold, or
+ * confirmed by the acting user) and how much may be
  * done (rate limits, a request budget per session). The GitHub token is fetched
  * for one tool call, held in a {@link GithubClient} and dropped; it is not in any
  * result, log line, audit row or event. Text that came from the pull request is
@@ -26,7 +27,7 @@ import { evaluateChecks, hasMergeQueueRule, requiredContextsFromRules, type Chec
 import { commentableLines } from "./diff.js";
 import { GithubClient, GithubError, GithubGraphqlError, parsePrRef, repoPath, type PrRef } from "./github.js";
 import { LEGACY_REPO_CONFIG_STEM, LEGACY_RUN_MARKER_PREFIX } from "./legacy-names.js";
-import { MAX_FILES_READ, REPO_CONFIG_PATH, assessRisk, diffNotSent, normaliseJudgement, parseRepoConfig, type RepoConfig, type ReviewerJudgement, type RiskFile, type RiskResult } from "./risk.js";
+import { HOLD_GUIDANCE, MAX_FILES_READ, REPO_CONFIG_PATH, assessRisk, diffNotSent, normaliseJudgement, parseRepoConfig, type RepoConfig, type ReviewerJudgement, type RiskFile, type RiskResult } from "./risk.js";
 import { selectReviewInstructions } from "./repo-skill.js";
 import { chooseReviewPath, reviewPathAdvice } from "./review-path.js";
 import { isReviewTarget } from "./review-target.js";
@@ -228,7 +229,7 @@ export class GithubReview {
       const { repo, pr } = await this.load(ctx, ref);
       const change = await this.collectChange(ctx, ref, pr);
       const risk = assessRisk(this.riskInput(pr, repo, change));
-      ctx.acc.riskReasons = risk.reasons;
+      ctx.acc.riskReasons = risk.evidence;
       const state = await this.readState(ctx, ref, pr, repo);
       const instructions = await selectReviewInstructions(ctx.client, ref, pr.baseRef);
       const choice = chooseReviewPath({
@@ -271,7 +272,8 @@ export class GithubReview {
           // A merge here is not a merge but a place in the base branch's merge queue (gh_pr_merge answers queued).
           merge_queue: this.viaQueue(ctx, state), in_merge_queue: state.queueEntry !== null,
         },
-        risk: this.riskBlock(risk),
+        // No judgement yet: the model's own, on gh_review_submit and gh_pr_merge, decides the hold. This is what it judges from.
+        risk: { hard_holds: risk.hardHolds, evidence: risk.evidence, rule_level: risk.ruleLevel, categories: risk.categories, rule_pack: risk.rulePack, guidance: HOLD_GUIDANCE },
         files: change.files.map((f) => ({ path: f.path, status: f.status, additions: f.additions, deletions: f.deletions, has_diff: !diffNotSent(f) })),
         files_complete: change.complete,
         diff_cut: diffCut,
@@ -299,13 +301,13 @@ export class GithubReview {
     });
   }
 
-  /** `gh_pr_risk`: the rule pack's verdict alone. */
+  /** `gh_pr_risk`: whether an approval or a merge would be held, with the judgement given (none holds). */
   assessPr(actor: ReviewActor, args: Record<string, unknown>): Promise<ToolOutcome> {
     return this.run(actor, "gh_pr_risk", args, async (ctx, ref) => {
       const { repo, pr } = await this.load(ctx, ref);
       const change = await this.collectChange(ctx, ref, pr);
       const risk = assessRisk(this.riskInput(pr, repo, change, this.flags(args), this.judgement(ctx, args)));
-      ctx.acc.riskReasons = risk.reasons;
+      ctx.acc.riskReasons = this.auditedReasons(risk);
       ctx.acc.headSha = pr.headSha;
       return ok({ status: "ok", head_sha: pr.headSha, risk: this.riskBlock(risk) }, (t) => ctx.client.redact(t));
     });
@@ -329,9 +331,10 @@ export class GithubReview {
   }
 
   /**
-   * One review, from the gates to the write. An `APPROVE` of a high-risk change stops short of the write and is held for the acting user,
+   * One review, from the gates to the write. An `APPROVE` that is held (see risk.ts: the reviewer's judgement, or a hard hold) stops short of
+   * the write and is held for the acting user,
    * whoever asked: they read exactly what would be posted, and the gates are read again when they allow it, so `confirmation` is set on that
-   * second pass and the review is written. Any other review, and an approval of a change that is not high risk, is posted at once: the
+   * second pass and the review is written. Any other review, and an approval that is not held, is posted at once: the
    * acting user's standing permission to act for them (their delegation setting) is the say, and a comment approves nothing.
    */
   private async submit(
@@ -354,7 +357,7 @@ export class GithubReview {
         const review: HeldReview = { event: o.event, body: o.text, comments };
         return this.hold(ctx, ref, pr, headSha, {
           kind: "review", review, reasons: risk.reasons, checks: {},
-          message: `This change is high risk, so ${ctx.cred.login} is asked to confirm the approval. Nothing was posted. Say that the approval waits for their decision and give the reasons.`,
+          message: `The approval is held for ${ctx.cred.login} to confirm. Nothing was posted. Say that the approval waits for their decision and why, in the words of the reasons.`,
         });
       }
     }
@@ -715,13 +718,21 @@ export class GithubReview {
     };
   }
 
-  /** The reviewing model's content judgement of the change, as it is kept: it can only raise the verdict (see normaliseJudgement). */
+  /** The reviewing model's content judgement of the change, which decides the hold; none or a malformed one is null, which holds (see normaliseJudgement). */
   private judgement(ctx: Ctx, args: Record<string, unknown>): ReviewerJudgement | null {
     return normaliseJudgement(args.risk_judgement, (t) => ctx.client.redact(t));
   }
 
   private riskBlock(risk: RiskResult): Record<string, unknown> {
-    return { level: risk.level, rule_level: risk.ruleLevel, raised_by_reviewer: risk.raisedByReviewer, reasons: risk.reasons, categories: risk.categories, rule_pack: risk.rulePack };
+    return {
+      level: risk.level, reasons: risk.reasons, judgement: risk.judgement, hard_holds: risk.hardHolds, evidence: risk.evidence,
+      rule_level: risk.ruleLevel, categories: risk.categories, rule_pack: risk.rulePack, guidance: HOLD_GUIDANCE,
+    };
+  }
+
+  /** The audit row keeps why a write was held and what the rules saw, the evidence marked as such. */
+  private auditedReasons(risk: RiskResult): string[] {
+    return [...risk.reasons, ...risk.evidence.filter((e) => !risk.hardHolds.includes(e)).map((e) => `evidence: ${e}`)];
   }
 
   private async readState(ctx: Ctx, ref: PrRef, pr: PrInfo, _repo: RepoInfo): Promise<PullState> {
@@ -787,7 +798,7 @@ export class GithubReview {
       note: author
         ? "the acting user wrote this pull request: an approval or a merge with their account is refused (cannot_approve_own_pull_request), so comment only, and say that nothing was approved or merged for that reason"
         : repo.push
-          ? "approve and merge are open, subject to the gates; a high-risk approval or merge waits for the acting user's confirmation"
+          ? "approve and merge are open, subject to the gates; an approval or merge you judge high risk (or one a hard hold catches) waits for the acting user's confirmation"
           : "the acting user has no write permission here: comment only, and say that nothing was merged for that reason",
     };
   }
@@ -810,14 +821,14 @@ export class GithubReview {
   /**
    * An approval can merge a pull request by itself (GitHub's auto-merge), so it is
    * posted only where `gh_pr_merge` would not stop: CI green on the head commit and no
-   * open thread. The change's risk comes back, because a high-risk approval is not
+   * open thread. The change's risk comes back, because a held approval is not
    * posted before the acting user confirms it (the caller holds it).
    */
   private async requireApprovable(ctx: Ctx, ref: PrRef, repo: RepoInfo, pr: PrInfo, change: Change | null, flags: string[], judgement: ReviewerJudgement | null): Promise<RiskResult> {
     const read = change ?? await this.collectChange(ctx, ref, pr);
-    // The reviewer's own flags and judgement count here as they do at the merge: they can only raise the verdict.
+    // The reviewer's own flags and judgement count here as they do at the merge.
     const risk = assessRisk(this.riskInput(pr, repo, read, flags, judgement));
-    ctx.acc.riskReasons = risk.reasons;
+    ctx.acc.riskReasons = this.auditedReasons(risk);
     this.requireGreen(await this.readState(ctx, ref, pr, repo), pr.headSha);
     return risk;
   }
@@ -947,7 +958,7 @@ export class GithubReview {
 
     const change = await this.collectChange(ctx, ref, pr);
     const risk: RiskResult = assessRisk(this.riskInput(pr, repo, change, opts.flags, opts.judgement));
-    ctx.acc.riskReasons = risk.reasons;
+    ctx.acc.riskReasons = this.auditedReasons(risk);
     let state = await this.readState(ctx, ref, pr, repo);
     // A branch with a merge queue takes the pull request through it (see `viaQueue`); the queue, not this call, chooses the merge method.
     // Before anyone is asked: a person is not woken to confirm a merge that the method, CI or an open thread would refuse anyway.
@@ -962,7 +973,7 @@ export class GithubReview {
     if (risk.level === "high" && !opts.confirmation) {
       return this.hold(ctx, ref, pr, headSha, {
         kind: "merge", review: null, reasons: risk.reasons, checks: { ...state.checks.summary, green: state.checks.green },
-        message: `This change is high risk, so ${ctx.cred.login} is asked to confirm the merge. Nothing was merged. Say that the merge waits for their decision and give the reasons.`,
+        message: `The merge is held for ${ctx.cred.login} to confirm. Nothing was merged. Say that the merge waits for their decision and why, in the words of the reasons.`,
       });
     }
 
@@ -1011,7 +1022,7 @@ export class GithubReview {
 
   /**
    * Holds a write for the acting user instead of making it: one pending confirmation for this head commit and this exact write, and nothing
-   * sent to GitHub. Only a high-risk approval or merge is held. They answer it signed in, in their own session (see `decide`), so no tool or
+   * sent to GitHub. Only an approval or a merge is held. They answer it signed in, in their own session (see `decide`), so no tool or
    * key of the model's can.
    */
   private async hold(

@@ -49,15 +49,14 @@ export interface GithubReviewRouteOptions {
 
 const PR_HELP = "The pull request: a https://github.com/<owner>/<repo>/pull/<number> URL or owner/repo#number";
 const FLAGS = z.array(z.enum(["security_finding", "review_skipped"])).max(5).optional()
-  .describe("Raise these when the review found a security issue or skipped a step: they can only make a merge need confirmation");
+  .describe("Raise these when the review found a security issue or skipped a step: either one holds an approval or a merge for the acting user's confirmation");
 const JUDGEMENT = z.object({
   level: z.enum(["low", "high"]),
-  reason: z.string().max(1000).describe("One short sentence the acting user reads on the confirmation: what the change does that needs a person, in plain words"),
+  reason: z.string().max(1000).describe("One short sentence in plain words: for high, what the change does that needs a person (they read it on the confirmation); for low, why it does not"),
 }).optional().describe(
-  "Your own reading of what the change DOES, beyond the rules: high when it changes the architecture (a package, a service, the layering, "
-  + "who depends on whom), an interface others rely on (a public signature, an HTTP route, a schema, a CLI flag, a configuration or environment "
-  + "setting, a database schema, a wire or event format), or code that decides who may do what. A `high` makes the merge wait for the acting user "
-  + "and its reason is shown to them; a `low` changes nothing: you can raise the verdict, never lower it");
+  "Your own reading of what the change DOES, which decides whether an APPROVE or a merge waits for the acting user: `high` holds it for their "
+  + "confirmation (they read your reason first), `low` lets it through the other gates, and leaving it out holds it. Judge from the diff and from "
+  + "the evidence in gh_pr_get's `risk` (its `guidance` says what to hold for); `hard_holds` there hold whatever you say");
 
 function toResult(outcome: ToolOutcome): { content: Array<{ type: "text"; text: string }>; isError?: boolean } {
   return { content: [{ type: "text" as const, text: outcome.text }], ...(outcome.isError ? { isError: true } : {}) };
@@ -79,16 +78,17 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor)
   );
   mcp.tool(
     "gh_pr_risk",
-    "The risk verdict for a pull request, from rules that read what the change does (architecture, interfaces, security-sensitive code, CI and release, "
-    + "dependencies, size) with the floor under them (high means an approval or a merge needs the acting user's own confirmation). Pass your own `risk_judgement` to add to it.",
+    "Whether an approval or a merge of a pull request would be held for the acting user's own confirmation (level high), given your `risk_judgement` "
+    + "and `risk_flags`: the judgement decides, except for the hard holds (the repository's own configuration, a change to its workflows, actions, "
+    + "CODEOWNERS or review configuration, a file list that was cut), and a missing judgement holds. The rules' evidence comes with it.",
     { pr: z.string().describe(PR_HELP), risk_flags: FLAGS, risk_judgement: JUDGEMENT },
     async (a) => toResult(await service.assessPr(actor, a)),
   );
   mcp.tool(
     "gh_review_submit",
     "Post one review on the pinned head commit, with inline comments. APPROVE is refused when the acting user wrote the pull request, "
-    + "and unless CI is green and no thread is open. A COMMENT or REQUEST_CHANGES review, and an APPROVE of a change that is not high risk, are posted at once. "
-    + "An APPROVE of a high-risk change is not: the answer is confirmation_required, and you say that it waits for the acting user. "
+    + "and unless CI is green and no thread is open. A COMMENT or REQUEST_CHANGES review, and an APPROVE you judge low risk (`risk_judgement`) with no hard hold, are posted at once. "
+    + "An APPROVE you judge high, with no judgement, or with a hard hold is not: the answer is confirmation_required, and you say that it waits for the acting user and why. "
     + "The review is signed with the acting user's account and a footer that names who asked.",
     {
       pr: z.string().describe(PR_HELP),
@@ -106,7 +106,8 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor)
   mcp.tool(
     "gh_pr_merge",
     "Approve (when needed) and merge the pull request if every gate is open: CI green on the head commit, no unresolved thread, merge state CLEAN, "
-    + "the acting user allowing it (refused when they wrote the pull request), and no high-risk change without their confirmation: a high-risk merge answers confirmation_required and waits for them. "
+    + "the acting user allowing it (refused when they wrote the pull request), and not held: a merge you judge high (`risk_judgement`), one with no judgement, "
+    + "and one with a hard hold answer confirmation_required and wait for them. "
     + "A branch that is merged through a merge queue gets the pull request put in the queue instead (status queued, never merged): the queue runs its own checks and merges it, and this tool does not follow it. "
     + "It never bypasses a protection.",
     {

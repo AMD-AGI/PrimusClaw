@@ -37,8 +37,10 @@ afterEach(async () => { await e.close(); });
 after(closeShared);
 
 const get = () => e.service.getPr(e.actor, { pr: PR });
-const submit = (over: Record<string, unknown> = {}) => e.service.submitReview(e.actor, { pr: PR, head_sha: HEAD, event: "COMMENT", body: "Looks fine.", ...over });
-const merge = (over: Record<string, unknown> = {}) => e.service.mergePr(e.actor, { pr: PR, head_sha: HEAD, ...over });
+/** What a reviewer that found nothing to hold for says; a test of the hold passes its own, or `risk_judgement: undefined` for none. */
+const LOW = { level: "low", reason: "an ordinary change, nothing for a person to look at" };
+const submit = (over: Record<string, unknown> = {}) => e.service.submitReview(e.actor, { pr: PR, head_sha: HEAD, event: "COMMENT", body: "Looks fine.", risk_judgement: LOW, ...over });
+const merge = (over: Record<string, unknown> = {}) => e.service.mergePr(e.actor, { pr: PR, head_sha: HEAD, risk_judgement: LOW, ...over });
 const reason = (o: ToolOutcome) => String(o.body.reason ?? o.body.status);
 const rows = () => e.sql("SELECT * FROM claw_github_confirmations ORDER BY created_at, confirmation_id");
 /** A change the rules call high risk: a workflow file is edited. */
@@ -261,12 +263,12 @@ describe("H what is held for the acting user", () => {
     assert.deepEqual(await rows(), []);
   });
 
-  test("H14 gh_pr_get tells the model, before it tries, that a high-risk approval or merge waits for the acting user, and says nothing of a hold on every write", async () => {
+  test("H14 gh_pr_get tells the model, before it tries, that an approval or merge it judges high risk waits for the acting user, and says nothing of a hold on every write", async () => {
     const acting = (await get()).body.acting as any;
     assert.equal(acting.writes_need_acting_user_confirmation, undefined);
     assert.equal(acting.requested_by_acting_user, false);
     assert.equal(acting.acting_user_allows_others, true);
-    assert.match(String(acting.note), /a high-risk approval or merge waits for the acting user's confirmation/);
+    assert.match(String(acting.note), /an approval or merge you judge high risk \(or one a hard hold catches\) waits for the acting user's confirmation/);
     assert.doesNotMatch(String(acting.note), /every review and merge is held/);
     e = await env({}, own);
     assert.equal(((await get()).body.acting as any).requested_by_acting_user, true);

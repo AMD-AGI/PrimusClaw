@@ -137,7 +137,7 @@ const assess = (files: RiskFile[]): { ms: number; reasons: string[] } => {
     files, changedFiles: files.length, filesComplete: true, additions: files.length, deletions: 0,
     fork: false, authorAssociation: "MEMBER", baseRef: "main", defaultBranch: "main", repoConfig: null,
   });
-  return { ms: performance.now() - started, reasons: r.reasons };
+  return { ms: performance.now() - started, reasons: r.evidence };
 };
 
 test("S4 a package.json that adds string entries of whitespace, with and without the workspaces key in the diff, costs a bounded amount and still reads as before", () => {

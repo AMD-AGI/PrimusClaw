@@ -21,7 +21,10 @@ const patchWith = (...added: string[]): string => `@@ -1,1 +1,${added.length + 1
 
 test("an ordinary change is low risk, and the verdict names the rule pack", () => {
   const r = assessRisk(input([file("src/render.ts"), file("test/render.test.ts")]));
-  assert.deepEqual(r, { level: "low", reasons: [], categories: [], ruleLevel: "low", raisedByReviewer: false, rulePack: RISK_RULE_PACK_VERSION });
+  assert.deepEqual(assessRisk({ ...input([file("src/render.ts"), file("test/render.test.ts")]), judgement: { level: "low", reason: "a render fix" } }), {
+    level: "low", reasons: [], evidence: [], hardHolds: [], categories: [], ruleLevel: "low", judgement: "low", rulePack: RISK_RULE_PACK_VERSION,
+  });
+  assert.equal(r.level, "high", "no judgement holds");
 });
 
 const HIGH: Array<[string, RiskInput, RegExp]> = [
@@ -95,15 +98,13 @@ const HIGH: Array<[string, RiskInput, RegExp]> = [
   ["a repository config that does not parse", input([file("src/a.ts")], { repoConfig: "invalid" }), /claw-review\.yml could not be read/],
   ["a repository that asks for confirmation every time", input([file("src/a.ts")], { repoConfig: { confirmMerge: "always", highRiskPaths: [] } }), /every merge/],
   ["a path the repository marks", input([file("docs/legal/terms.md")], { repoConfig: { confirmMerge: "risk", highRiskPaths: ["docs/legal/**"] } }), /marks high risk/],
-  ["a security finding the reviewer reports", input([file("src/a.ts")], { flags: ["security_finding"] }), /security issue/],
-  ["a skipped review step the reviewer reports", input([file("src/a.ts")], { flags: ["review_skipped"] }), /skipped a step/],
 ];
 
 for (const [name, i, why] of HIGH) {
   test(`high: ${name}`, () => {
     const r = assessRisk(i);
-    assert.equal(r.level, "high");
-    assert.match(r.reasons.join("\n"), why);
+    assert.equal(r.ruleLevel, "high");
+    assert.match(r.evidence.join("\n"), why);
   });
 }
 
@@ -124,22 +125,22 @@ const LOW: Array<[string, RiskInput]> = [
 ];
 for (const [name, i] of LOW) {
   test(`low: ${name}`, () => {
-    assert.deepEqual(assessRisk(i).reasons, []);
+    assert.deepEqual(assessRisk(i).evidence, []);
   });
 }
 
 test("a rule that throws makes the verdict high, never low", () => {
   const hostile = { ...input([file("src/a.ts")]), files: null } as unknown as RiskInput;
   const r = assessRisk(hostile);
-  assert.equal(r.level, "high");
-  assert.match(r.reasons.join(), /could not be evaluated/);
+  assert.equal(r.ruleLevel, "high");
+  assert.match(r.evidence.join(), /could not be evaluated/);
 });
 
 test("the list of reasons is bounded and says how many more there were", () => {
   const files = Array.from({ length: 30 }, (_, i) => file(`.github/workflows/w${i}.yml`));
   const r = assessRisk(input(files));
-  assert.equal(r.reasons.length, 21);
-  assert.match(r.reasons.at(-1) ?? "", /and \d+ more/);
+  assert.equal(r.evidence.length, 21);
+  assert.match(r.evidence.at(-1) ?? "", /and \d+ more/);
 });
 
 test("the stem of the config file an earlier release read is plain letters, because it is put into a pattern", () => {
@@ -174,21 +175,21 @@ test("a file moved out of a protected path is judged by where it was, not only w
     ["docs/legal/terms.md", "docs/terms.md", /marks high risk/],
   ] as const) {
     const r = assessRisk(input([moved(from, to)], { repoConfig: { confirmMerge: "risk", highRiskPaths: ["docs/legal/**"] } }));
-    assert.equal(r.level, "high", `${from} -> ${to}`);
-    assert.match(r.reasons.join("\n"), why, `${from} -> ${to}`);
-    assert.equal(r.reasons.some((x) => x.includes(`${from} (moved to ${to})`)), true, `${from} -> ${to}`);
+    assert.equal(r.ruleLevel, "high", `${from} -> ${to}`);
+    assert.match(r.evidence.join("\n"), why, `${from} -> ${to}`);
+    assert.equal(r.evidence.some((x) => x.includes(`${from} (moved to ${to})`)), true, `${from} -> ${to}`);
   }
   // A removed governance file is held too, and a rename that comes with its diff is not.
-  assert.equal(assessRisk(input([file(".github/workflows/ci.yml", undefined, { status: "removed", additions: 0, deletions: 4 })])).level, "high");
-  assert.deepEqual(assessRisk(input([file("src/b.ts", undefined, { status: "renamed", previousPath: "src/a.ts" })])).reasons, []);
+  assert.equal(assessRisk(input([file(".github/workflows/ci.yml", undefined, { status: "removed", additions: 0, deletions: 4 })])).ruleLevel, "high");
+  assert.deepEqual(assessRisk(input([file("src/b.ts", undefined, { status: "renamed", previousPath: "src/a.ts" })])).evidence, []);
 });
 
 test("a file that came without its diff is held whatever its status and counts say, and the rule that holds it is the one the review path reads", () => {
   for (const status of ["modified", "renamed", "copied", "removed", "added", "changed"]) {
     for (const [additions, deletions] of [[0, 0], [0, 7], [7, 0], [7, 7]]) {
       const r = assessRisk(input([file("vendor/lib/libfoo.so", undefined, { status, patch: undefined, additions, deletions })]));
-      assert.equal(r.level, "high", `${status} +${additions} -${deletions}`);
-      assert.match(r.reasons.join("\n"), /diff not readable/, `${status} +${additions} -${deletions}`);
+      assert.equal(r.ruleLevel, "high", `${status} +${additions} -${deletions}`);
+      assert.match(r.evidence.join("\n"), /diff not readable/, `${status} +${additions} -${deletions}`);
     }
   }
   assert.equal(diffNotSent({ patch: undefined }), true);
@@ -203,12 +204,12 @@ test("a lock file is held, in every ecosystem's spelling, whatever else the chan
     "mix.lock", "pubspec.lock", "flake.lock", "tools/cli/package-lock.json", "app/composer.lock",
   ]) {
     const alone = assessRisk(input([file(name)]));
-    assert.equal(alone.level, "high", name);
-    assert.match(alone.reasons.join("\n"), /lock file changed/, name);
+    assert.equal(alone.ruleLevel, "high", name);
+    assert.match(alone.evidence.join("\n"), /lock file changed/, name);
     // The manifest beside it changes metadata only, which is what an attacker's change would look like.
     const beside = assessRisk(input([file("package.json", patchWith('"description": "x"')), file("go.mod", patchWith("// x")), file(name)]));
-    assert.equal(beside.level, "high", `${name} beside manifests`);
-    assert.match(beside.reasons.join("\n"), /lock file changed/, `${name} beside manifests`);
+    assert.equal(beside.ruleLevel, "high", `${name} beside manifests`);
+    assert.match(beside.evidence.join("\n"), /lock file changed/, `${name} beside manifests`);
   }
 });
 
@@ -218,8 +219,8 @@ test("a manifest line that is very long costs a bounded amount to read, and is h
   const started = Date.now();
   const r = assessRisk(input([file("go.mod", `@@ -1,1 +1,2 @@\n a\n+\t${long}`)]));
   assert.ok(Date.now() - started < 1000, `took ${Date.now() - started} ms`);
-  assert.equal(r.level, "high");
-  assert.match(r.reasons.join("\n"), /too long to read/);
+  assert.equal(r.ruleLevel, "high");
+  assert.match(r.evidence.join("\n"), /too long to read/);
 });
 
 test("a go.mod full of adversarial lines is read in a bounded time: the module-path pattern cannot overlap itself", () => {
@@ -227,14 +228,14 @@ test("a go.mod full of adversarial lines is read in a bounded time: the module-p
   const started = Date.now();
   const r = assessRisk(input([file("go.mod", `@@ -1,1 +1,301 @@\n a\n${Array.from({ length: 300 }, () => line).join("\n")}`)]));
   assert.ok(Date.now() - started < 700, `took ${Date.now() - started} ms`);
-  assert.equal(r.level, "high");
+  assert.equal(r.ruleLevel, "high");
   // A real module line is still a dependency.
-  assert.match(assessRisk(input([file("go.mod", patchWith("\tgithub.com/foo/bar v1.2.3"))])).reasons.join(), /dependency added or changed/);
-  assert.match(assessRisk(input([file("go.mod", patchWith("\texample.org/a-b.c/d/e v0.1.0"))])).reasons.join(), /dependency added or changed/);
+  assert.match(assessRisk(input([file("go.mod", patchWith("\tgithub.com/foo/bar v1.2.3"))])).evidence.join(), /dependency added or changed/);
+  assert.match(assessRisk(input([file("go.mod", patchWith("\texample.org/a-b.c/d/e v0.1.0"))])).evidence.join(), /dependency added or changed/);
 });
 
 test("a changed line that begins with ++ is read by the line rules like any other", () => {
   for (const line of ["+  chmod 777 /data", "+x; rejectUnauthorized: false", "+-----BEGIN RSA PRIVATE KEY-----"]) {
-    assert.equal(assessRisk(input([file("src/x.sh", patchWith(line))])).level, "high", line);
+    assert.equal(assessRisk(input([file("src/x.sh", patchWith(line))])).ruleLevel, "high", line);
   }
 });

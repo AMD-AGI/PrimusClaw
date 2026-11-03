@@ -340,6 +340,21 @@ record it.
   `--`, with literal pathspecs and without its optional index lock. See `claw/docs/sandbox-session-lifecycle.md`.
 
 ### Changed
+- GitHub review: whether an `APPROVE` or a merge made with someone else's account waits for that person's
+  confirmation is now decided by the reviewing model's `risk_judgement` (`high` holds, `low` lets it through the
+  other gates), not by the rule pack (`claw/packages/api/src/github-review/risk.ts`, `assessRisk`; rule pack
+  `2026-11-03.1`). The rules are given to the model as evidence (`risk.evidence`, `risk.hard_holds` and
+  `risk.guidance` in `gh_pr_get` and `gh_pr_risk`) and no longer hold on their own: a large change, an author
+  outside the organisation (the person who asked is very often the author), a fork, another base branch, an
+  interface or dependency change are for the model to weigh. Before, nearly every approval of an ordinary large
+  pull request by a contributor was held. What still holds whatever the model says: the repository's own
+  `.github/claw-review.yml` (or `.github/clawy.yml`) asking for it (`confirm_merge: always`, a `high_risk_paths`
+  match) or not parsing; a change to `.github/workflows/`, `.github/actions/`, `CODEOWNERS` or that configuration
+  file; a cut file list; rules that fail; and a missing or malformed judgement. The model's `risk_flags` hold as
+  before. The held confirmation and the tool answer give the reasons in plain words, the model's own first.
+  Delegation, author != acting user, CI, merge state, branch protection, the writes switch, the head-SHA binding
+  and the audit are unchanged; the audit row keeps the evidence (`evidence: ...`). `gh_pr_risk` no longer
+  answers `raised_by_reviewer`. See `claw/docs/github-review.md` ("High risk").
 - `claw-connector`: two changes for an existing `agents.toml` that need no setting to take effect. A file with
   `allow_unsafe_modes = true` now also accepts an adapter's "will not ask for permission" warning for every agent without
   its own `approval`, so a session that used to be closed with `mode_not_enforced` now opens and is reported

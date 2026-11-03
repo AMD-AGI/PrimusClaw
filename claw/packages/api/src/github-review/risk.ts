@@ -2,10 +2,19 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * The high-risk rule pack: a deterministic, versioned decision that a pull request
- * must not be merged without its acting user's own confirmation.
+ * Whether an approval or a merge made with someone else's account is held for that person's own confirmation.
  *
- * What makes a change high risk is what it DOES, not which kind of file it touches
+ * The reviewing model decides it: its `risk_judgement` on `gh_review_submit` and `gh_pr_merge` (`high` holds, `low`
+ * does not). The rules below do not decide it; they are EVIDENCE the model is shown with the pull request (and
+ * {@link HOLD_GUIDANCE} says what to hold), because a rule that holds every large change or every outside author holds
+ * nearly every approval, and a person asked about everything reads none of it. Only a few things hold whatever the
+ * model says ({@link RiskResult.hardHolds}): what the repository itself asked for in its configuration (or a
+ * configuration that cannot be read), a change to the files that decide who controls the repository (its workflows
+ * and local actions, its CODEOWNERS, its review configuration), a file list that was cut or rules that failed (so
+ * that change cannot be ruled out), and a judgement that is missing or malformed (fail closed). The model's flags
+ * (`security_finding`, `review_skipped`) hold as well: they are its own judgement.
+ *
+ * What the rules flag is what a change DOES, not which kind of file it touches
  * (see risk-signals.ts): an architecture change (a package or deployable unit added or
  * removed, a directory moved, the layering or the dependency graph changed), an interface
  * change (an exported signature, an HTTP route, a schema, a command-line flag, a
@@ -19,31 +28,26 @@
  * file, a submodule pointer, a file mode change, a file list that was cut, a fork, a
  * non-member, a base branch that is not the default.
  *
- * It runs in the API, on GitHub's own description of the change, and nothing the model
- * says can lower its answer. The reviewing model may only RAISE it: with `flags`
- * (`security_finding`, `review_skipped`) and with a content judgement, a short reason
- * that is shown to the acting user on the confirmation. It fails closed: a file list that
- * cannot be read in full, a patch GitHub did not send, a repository configuration that
- * does not parse and a rule that throws are all `high`. The rules are examples of what to
- * hold for a human, not a security scan.
+ * The rules run in the API, on GitHub's own description of the change, and the hard holds among them cannot be lowered
+ * by anything the model says. They are examples of what a person may want to look at, not a security scan.
  *
  * What the repository itself says comes from the BASE branch only (see
- * {@link parseRepoConfig}); a pull request that edits that file is high risk.
+ * {@link parseRepoConfig}); a pull request that edits that file is held.
  */
 import { LEGACY_REPO_CONFIG_STEM } from "./legacy-names.js";
 import { MAX_READ_CHARS, MAX_READ_LINES, contentFindings, isDoc, isSource, isTest, rawHead, readChange, type Finding, type RiskCategory } from "./risk-signals.js";
 
 export type { Finding, RiskCategory } from "./risk-signals.js";
 
-export const RISK_RULE_PACK_VERSION = "2026-11-02.1";
+export const RISK_RULE_PACK_VERSION = "2026-11-03.1";
 
 /** The repository's own configuration file, read from the base branch ({@link parseRepoConfig}). */
 export const REPO_CONFIG_PATH = ".github/claw-review.yml";
 
-/** What the reviewing model says about the change after reading it. It can only raise the verdict. */
+/** What the reviewing model says about the change after reading it: `high` holds an approval or a merge for the acting user, `low` lets it go. */
 export interface ReviewerJudgement {
   level: "low" | "high";
-  /** One short sentence, shown to the acting user on the confirmation. */
+  /** One short sentence; a `high` one is what the acting user reads first on the confirmation. */
   reason: string;
 }
 
@@ -64,7 +68,7 @@ export interface RiskFile {
 export interface RepoConfig {
   /** `always` holds every merge for the acting user, whatever the rules say. */
   confirmMerge: "always" | "risk";
-  /** Extra globs (`*` within a segment, `**` across segments) that make a change high risk. */
+  /** Extra globs (`*` within a segment, `**` across segments) that hold a change whatever the reviewer says. */
   highRiskPaths: string[];
 }
 
@@ -103,40 +107,58 @@ export interface RiskInput {
   repoConfig: RepoConfig | null | "invalid";
   /** Escalations only: `security_finding`, `review_skipped`. */
   flags?: string[];
-  /** The reviewing model's own reading of the change; a `high` adds a reason, a `low` changes nothing. */
+  /** The reviewing model's own reading of the change, which decides the hold; none or a malformed one holds. */
   judgement?: ReviewerJudgement | null;
 }
 
 export interface RiskResult {
-  /** The verdict: `high` when there is any reason, from the rules or from the reviewer. */
+  /** `high`: an approval or a merge is held for the acting user. */
   level: "low" | "high";
+  /** Why it is held, in plain words, the reviewer's own reason first; empty when it is not. This is what the confirmation shows. */
   reasons: string[];
-  /** The kinds of change the reasons are about, in the order they first appear. */
+  /** What the rules saw in the change. Shown to the reviewer as evidence; none of it holds by itself. */
+  evidence: string[];
+  /** The rules' findings that hold whatever the reviewer says (also in `reasons`). */
+  hardHolds: string[];
+  /** The kinds of change the evidence and the reasons are about, in the order they first appear. */
   categories: RiskCategory[];
-  /** What the rules alone say. The reviewer's judgement is never in it, and it never goes down because of it. */
+  /** `high` when the rules saw anything at all: evidence for the reviewer, not the verdict. */
   ruleLevel: "low" | "high";
-  /** The reviewer's judgement is what made a change the rules call low into a high one. */
-  raisedByReviewer: boolean;
+  /** The reviewer's judgement as it counted: `missing` when there was none or it did not parse, which holds. */
+  judgement: "low" | "high" | "missing";
   rulePack: string;
 }
 
 /**
- * The reviewer's judgement as it is kept: only a `high` with a reason counts, the reason is one clipped line without
- * control characters or markup that could dress it up on a card, and `mask` (the token and secret masking of the tool
- * answers) is applied to it. Anything else, a `low` included, is nothing: the model cannot lower a verdict.
+ * What the reviewing model is told about the hold, with the evidence: the model decides, and these are the cases to hold for. Kept here so the
+ * tool answer, the tool descriptions and the review skill say the same thing.
+ */
+export const HOLD_GUIDANCE = "Your risk_judgement decides whether an approval or a merge waits for the person whose account is used: "
+  + "high holds it for their confirmation, low lets it go through the other gates. Hold (high) only for what a person should look at: "
+  + "security-sensitive code (authentication, authorization, permissions, cryptography, sandboxing), credentials or secrets, CI, workflow, release "
+  + "or deployment changes, permission or access changes, destructive or irreversible data migrations, a change of an interface or behaviour others "
+  + "rely on that the pull request text does not explain, or anything you are unsure of. Otherwise judge low: size, an outside author, a fork or a "
+  + "base branch are evidence to read, not reasons by themselves, and the person who asked is very often the author. hard_holds hold whatever you say. "
+  + "A missing judgement holds.";
+
+/**
+ * The reviewer's judgement as it is kept: a `low` or a `high`, its reason one clipped line without control characters or markup that
+ * could dress it up on a card, with `mask` (the token and secret masking of the tool answers) applied to it. Anything else is no
+ * judgement, which holds.
  */
 export function normaliseJudgement(raw: unknown, mask: (text: string) => string = (t) => t): ReviewerJudgement | null {
   if (typeof raw !== "object" || raw === null) return null;
   const { level, reason } = raw as { level?: unknown; reason?: unknown };
-  if (level !== "high") return null;
+  if (level !== "high" && level !== "low") return null;
   const text = mask(typeof reason === "string" ? reason : "")
     // eslint-disable-next-line no-control-regex
     .replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, " ").replace(/[`<>]/g, "'").replace(/\s+/g, " ").trim();
   const clipped = text.length > MAX_JUDGEMENT_REASON_CHARS ? `${text.slice(0, MAX_JUDGEMENT_REASON_CHARS - 1)}…` : text;
-  return { level: "high", reason: clipped || "the reviewer judged this change high risk and gave no reason" };
+  if (level === "low") return { level, reason: clipped };
+  return { level, reason: clipped || "the reviewer judged this change high risk and gave no reason" };
 }
 
-/** Most files the reader fetches; a pull request with more is high risk by size alone. */
+/** Most files the reader fetches; a pull request with more has a cut file list, which holds. */
 export const MAX_FILES_READ = 500;
 const MAX_REASONS = 20;
 
@@ -148,6 +170,16 @@ const GOVERNANCE_PATHS: RegExp[] = [
   /^\.(claude|agents|codex|cursor)\//i,
   /(^|\/)\.gitlab-ci\.ya?ml$/i,
   /(^|\/)(azure-pipelines|Jenkinsfile|\.circleci\/config)/i,
+];
+/**
+ * The files that decide who controls the repository: its workflows and the local actions they run (which act with the workflow's token),
+ * who must review what (CODEOWNERS, in each place GitHub reads it), and this feature's own configuration (which can switch the hold off).
+ * A change to one holds whatever the reviewer says.
+ */
+const CONTROL_PATHS: RegExp[] = [
+  /^\.github\/(workflows|actions)\//i,
+  /^(\.github\/|docs\/)?CODEOWNERS$/i,
+  new RegExp(`^\\.github\\/(claw-review|${LEGACY_REPO_CONFIG_STEM})\\.ya?ml$`, "i"),
 ];
 const AUTH_PATH = /(^|[/._-])(auth|authn|authz|rbac|iam|oauth|oidc|jwt|session|sessions|crypto|tls|sandbox|permission|permissions)([/._-]|$)/i;
 const SECRET_PATHS: RegExp[] = [
@@ -257,7 +289,7 @@ function listItemValue(line: string): string | null {
  *       - "docs/legal/**"
  *
  * Anything else that is not blank or a comment makes the file `invalid`, which is
- * high risk: a repository that wrote something this does not understand has not
+ * held: a repository that wrote something this does not understand has not
  * been read.
  */
 export function parseRepoConfig(text: string): RepoConfig | "invalid" {
@@ -291,21 +323,25 @@ export function parseRepoConfig(text: string): RepoConfig | "invalid" {
   return config;
 }
 
-function assess(input: RiskInput): Finding[] {
+/** The rules' findings, and which of their reasons hold whatever the reviewer says. */
+function assess(input: RiskInput): { findings: Finding[]; hard: Set<string> } {
   const findings: Finding[] = [];
   const seen = new Set<string>();
-  const add = (category: RiskCategory, reason: string): void => {
+  const hard = new Set<string>();
+  const add = (category: RiskCategory, reason: string, holds = false): void => {
+    if (holds) hard.add(reason);
     if (seen.has(reason)) return;
     seen.add(reason);
     findings.push({ category, reason });
   };
 
   // ---- the floor: nothing here reads what the change says, and all of it stays as a backstop.
-  // Size and completeness first: nothing below can be trusted if the list is cut.
+  // Size and completeness first: nothing below can be trusted if the list is cut, and a cut list cannot show that no file that controls the
+  // repository changed, so it holds.
   if (!input.filesComplete || input.changedFiles > input.files.length) {
-    add("integrity", `the change list is incomplete (${input.files.length} of ${input.changedFiles} files read)`);
+    add("integrity", `the change list is incomplete (${input.files.length} of ${input.changedFiles} files read)`, true);
   }
-  if (input.changedFiles > 3000) add("integrity", "more than 3000 files changed: GitHub's file list limit");
+  if (input.changedFiles > 3000) add("integrity", "more than 3000 files changed: GitHub's file list limit", true);
   if (input.changedFiles > 40) add("size_breadth", `large change: ${input.changedFiles} files`);
   if (input.additions + input.deletions > 1000) add("size_breadth", `large change: ${input.additions + input.deletions} lines`);
   if (input.deletions > 300) add("size_breadth", `${input.deletions} lines deleted`);
@@ -317,9 +353,10 @@ function assess(input: RiskInput): Finding[] {
   }
   if (input.baseRef !== input.defaultBranch) add("provenance", `the base branch is ${input.baseRef}, not the default branch ${input.defaultBranch}`);
 
-  if (input.repoConfig === "invalid") add("provenance", `the repository's ${REPO_CONFIG_PATH} could not be read`);
+  // What the repository asked for holds whatever the reviewer says, and a configuration that cannot be read may have asked for it.
+  if (input.repoConfig === "invalid") add("provenance", `the repository's ${REPO_CONFIG_PATH} could not be read`, true);
   const extra = input.repoConfig && input.repoConfig !== "invalid" ? input.repoConfig : null;
-  if (extra?.confirmMerge === "always") add("provenance", "the repository asks for confirmation on every merge");
+  if (extra?.confirmMerge === "always") add("provenance", "the repository asks for confirmation on every merge", true);
   const extraGlobs = (extra?.highRiskPaths ?? []).map(globToRegExp);
 
   // ---- what the change does: architecture, interfaces, security-sensitive code (risk-signals.ts).
@@ -335,13 +372,14 @@ function assess(input: RiskInput): Finding[] {
     // A file moved out of a protected path is a change to that path, as much as one moved in or edited in place.
     for (const q of f.previousPath && f.previousPath !== p ? [p, f.previousPath] : [p]) {
       const where = q === p ? p : `${q} (moved to ${p})`;
-      if (GOVERNANCE_PATHS.some((re) => re.test(q))) add("ci_release", `CI, workflow or governance file changed: ${where}`);
+      const controls = CONTROL_PATHS.some((re) => re.test(q));
+      if (controls || GOVERNANCE_PATHS.some((re) => re.test(q))) add("ci_release", `CI, workflow or governance file changed: ${where}`, controls);
       // The path rules below read no content and are a floor: an edit that looks like a comment, or a line that moved, does not lower them
       // (what a comment is depends on the language, and a line shaped like one can be code). The content half above can only add to them.
       if (AUTH_PATH.test(q) && isSource(q)) add("security", `authentication or security code changed: ${where}`);
       if (SECRET_PATHS.some((re) => re.test(q))) add("security", `secret-handling file changed: ${where}`);
       if (RELEASE_PATHS.some((re) => re.test(q)) && !isDoc(q)) add("ci_release", `release or deployment file changed: ${where}`);
-      if (extraGlobs.some((re) => re.test(q))) add("provenance", `path the repository marks high risk: ${where}`);
+      if (extraGlobs.some((re) => re.test(q))) add("provenance", `path the repository marks high risk: ${where}`, true);
     }
     // A lock file decides which tarball or checksum an install fetches, and nothing here reads its lines. A manifest
     // edited somewhere else in the same change says nothing about it, so a lock file is held whatever else changed:
@@ -378,32 +416,47 @@ function assess(input: RiskInput): Finding[] {
   if (removedFiles > 5) add("size_breadth", `${removedFiles} files deleted`);
   for (const [dir, n] of removedInTests) if (n >= 3) add("size_breadth", `${n} test files deleted under ${dir}`);
 
-  for (const flag of input.flags ?? []) {
-    if (flag === "security_finding") add("reviewer", "the review found a security issue (even if it was fixed)");
-    else if (flag === "review_skipped") add("reviewer", "the review skipped a step");
-    else add("reviewer", `the reviewer raised the flag ${flag.slice(0, 40)}`);
-  }
-  return findings;
+  return { findings, hard };
 }
 
-/** Never throws: a rule that fails makes the answer `high`. */
+const clipReasons = (reasons: string[]): string[] =>
+  reasons.length > MAX_REASONS ? [...reasons.slice(0, MAX_REASONS), `and ${reasons.length - MAX_REASONS} more`] : reasons;
+
+/** Never throws: a rule that fails holds. */
 export function assessRisk(input: RiskInput): RiskResult {
   let findings: Finding[];
+  let hard: Set<string>;
   try {
-    findings = assess(input);
+    ({ findings, hard } = assess(input));
   } catch {
-    findings = [{ category: "integrity", reason: "the risk rules could not be evaluated" }];
+    const failed = "the risk rules could not be evaluated";
+    findings = [{ category: "integrity", reason: failed }];
+    hard = new Set([failed]);
   }
-  const ruleLevel: "low" | "high" = findings.length > 0 ? "high" : "low";
-  // The reviewer's reading can add to the verdict and never take from it. It goes first: it is the one reason written for
-  // this change, and a card shows only the first few.
-  const judged = input.judgement?.level === "high" ? input.judgement : null;
-  if (judged) findings.unshift({ category: "reviewer", reason: `the reviewer's judgement: ${judged.reason}` });
-  const shown = findings.slice(0, MAX_REASONS).map((f) => f.reason);
-  if (findings.length > MAX_REASONS) shown.push(`and ${findings.length - MAX_REASONS} more`);
-  const categories = [...new Set(findings.map((f) => f.category))];
+  // The reviewer's reading goes first: it is the one reason written for this change, and a card shows only the first few.
+  const judgement = input.judgement ?? null;
+  const said: Finding[] = [];
+  if (judgement?.level === "high") said.push({ category: "reviewer", reason: `the reviewer's judgement: ${judgement.reason}` });
+  for (const flag of new Set(input.flags ?? [])) {
+    if (flag === "security_finding") said.push({ category: "reviewer", reason: "the review found a security issue (even if it was fixed)" });
+    else if (flag === "review_skipped") said.push({ category: "reviewer", reason: "the review skipped a step" });
+    else said.push({ category: "reviewer", reason: `the reviewer raised the flag ${flag.slice(0, 40)}` });
+  }
+  const hardHolds = findings.filter((f) => hard.has(f.reason)).map((f) => f.reason);
+  const reasons = [
+    ...said.map((f) => f.reason),
+    // Not a kind of change, so it has no category.
+    ...(judgement ? [] : ["the reviewer gave no risk judgement, so it is held for the person"]),
+    ...hardHolds,
+  ];
   return {
-    level: findings.length > 0 ? "high" : "low", reasons: shown, categories, ruleLevel,
-    raisedByReviewer: judged !== null && ruleLevel === "low", rulePack: RISK_RULE_PACK_VERSION,
+    level: reasons.length > 0 ? "high" : "low",
+    reasons: clipReasons(reasons),
+    evidence: clipReasons(findings.map((f) => f.reason)),
+    hardHolds: clipReasons(hardHolds),
+    categories: [...new Set([...said, ...findings].map((f) => f.category))],
+    ruleLevel: findings.length > 0 ? "high" : "low",
+    judgement: judgement ? judgement.level : "missing",
+    rulePack: RISK_RULE_PACK_VERSION,
   };
 }
