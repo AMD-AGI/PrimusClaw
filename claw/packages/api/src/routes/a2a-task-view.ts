@@ -60,6 +60,7 @@ export type PendingInput =
     kind: "question";
     actionId: string;
     questions: unknown[];
+    timeoutMs: number | null;
   };
 
 /** Chunks of assistant text join the way Brain joins them into `final_text`. */
@@ -156,6 +157,7 @@ export function pendingInputOf(events: RunEvent[]): PendingInput | null {
         kind: "question",
         actionId,
         questions: Array.isArray(d.questions) ? d.questions : [],
+        timeoutMs: typeof d.timeout_ms === "number" ? d.timeout_ms : null,
       });
     } else if (e.event === "decisionResult") {
       open.delete(actionId);
@@ -235,7 +237,12 @@ export function inputRequiredMessage(
     parts.push({ text: questionsAsText(pending.questions) });
     parts.push({
       mediaType: "application/json",
-      data: { kind: "question", actionId: pending.actionId, questions: pending.questions },
+      data: {
+        kind: "question",
+        actionId: pending.actionId,
+        questions: pending.questions,
+        ...(pending.timeoutMs !== null ? { timeoutMs: pending.timeoutMs } : {}),
+      },
     });
   }
   return {
