@@ -24,8 +24,8 @@ import { db, inTransaction, type Querier } from "../infra/db.js";
 import { publishEvent } from "../events/store.js";
 import { estimateTokens } from "../shared/tokens.js";
 import {
-  BODY_MAX, NOTE_MAX, SIMILARITY_THRESHOLD, TITLE_MAX, isMemoryType, legacyType, normalizeText, quoteIsFrom,
-  quoteSupports, scanInjection, scanSecrets, similarity, type MemoryType,
+  BODY_MAX, NOTE_MAX, SIMILARITY_THRESHOLD, TITLE_MAX, isMemoryType, legacyType, normalizeText, quoteAsksToForget,
+  quoteIsFrom, quoteSupports, scanInjection, scanSecrets, similarity, type MemoryType,
 } from "./gates.js";
 
 const logger = pino({ name: "memory-service" });
@@ -207,10 +207,14 @@ export async function listMemories(userId: string): Promise<MemoryRow[]> {
   return rows.map(toRow);
 }
 
-async function readEntry(userId: string, id: number, q: Querier = db.query): Promise<Record<string, any> | null> {
-  return (await q(
+/**
+ * One entry of the user's. The model sees only active entries: one waiting for the user's confirmation is
+ * not its to read, change or delete (`activeOnly`).
+ */
+async function readEntry(userId: string, id: number, activeOnly: boolean): Promise<Record<string, any> | null> {
+  return (await db.query(
     `SELECT ${ROW_COLUMNS}, evidence_quote, prev_title, prev_body FROM claw_memory_entries
-      WHERE user_id = $1 AND id = $2 AND ${USER_ROWS}`,
+      WHERE user_id = $1 AND id = $2 AND ${USER_ROWS}${activeOnly ? " AND status = 'active'" : ""}`,
     [userId, id],
   )).rows[0] ?? null;
 }
@@ -373,7 +377,7 @@ export async function writeMemory(userId: string, draft: MemoryDraft, actor: Mem
  * entry counts as confirmed again: a project or reference entry gets a fresh review date.
  */
 export async function updateMemory(userId: string, id: number, draft: MemoryDraft & { pinned?: unknown }, actor: MemoryActor): Promise<WriteResult> {
-  const current = await readEntry(userId, id);
+  const current = await readEntry(userId, id, actor.kind === "model");
   if (!current) {
     await recordRefusal(userId, actor, "not_found", id);
     return refuse("not_found", `no memory #${id}`);
@@ -388,21 +392,19 @@ export async function updateMemory(userId: string, id: number, draft: MemoryDraf
   // An unattended API edit (a key a sandbox also holds) leaves the entry waiting for its owner, out of the catalogue.
   const status = actor.kind === "api" && !actor.attended ? "pending" : "active";
   const days = reviewDays(type, draft.expires_in_days);
-  const changed = title !== (current.title ?? "") || body !== current.content;
   const quote = actor.kind === "model" ? actor.quote : null;
   await inTransaction(async (q) => {
     await q(
       `UPDATE claw_memory_entries SET
-         prev_title = CASE WHEN $11 THEN COALESCE(title, '') ELSE prev_title END,
-         prev_body = CASE WHEN $11 THEN content ELSE prev_body END,
+         prev_title = COALESCE(title, ''), prev_body = content,
          mtype = $3, category = CASE WHEN mtype IS NULL THEN category ELSE $3 END, title = $4, content = $5,
          why = COALESCE($6, why), how_to_apply = COALESCE($7, how_to_apply), status = $8,
-         pinned = COALESCE($9, pinned), token_count = $10, evidence_quote = COALESCE($12, evidence_quote),
+         pinned = COALESCE($9, pinned), token_count = $10, evidence_quote = COALESCE($11, evidence_quote),
          last_confirmed_at = NOW(),
-         expires_at = CASE WHEN $13::int IS NULL THEN NULL ELSE NOW() + make_interval(days => $13::int) END
+         expires_at = CASE WHEN $12::int IS NULL THEN NULL ELSE NOW() + make_interval(days => $12::int) END
        WHERE user_id = $1 AND id = $2`,
       [userId, id, type, title, body, why, how, status, typeof draft.pinned === "boolean" ? draft.pinned : null,
-        estimateTokens(`${title}\n${body}`), changed, quote, days],
+        estimateTokens(`${title}\n${body}`), quote, days],
     );
     await recordEvent(q, { userId, entryId: id, op: "update", actor: actor.kind, sessionId: actor.kind === "model" ? actor.sessionId : null, title, quote });
   });
@@ -475,7 +477,7 @@ export async function forgetAllMemories(userId: string): Promise<number> {
 export async function recallMemory(userId: string, by: { id?: number; query?: string }): Promise<MemoryRow[]> {
   let rows: MemoryRow[];
   if (by.id !== undefined) {
-    const row = await readEntry(userId, by.id);
+    const row = await readEntry(userId, by.id, true);
     rows = row ? [toRow(row)] : [];
   } else {
     const query = by.query ?? "";
@@ -652,13 +654,16 @@ export async function runMemoryTool(
     if (!rows.length) return { ok: true, text: id !== null ? `No memory #${id}.` : "No memory matches." };
     return { ok: true, text: rows.map(describe).join("\n\n") };
   }
-  // forget_memory: only on the user's own request in this conversation, quoted.
+  // forget_memory: only on the user's own request in this conversation to forget or undo this entry, quoted.
   const id = entryId(input.id);
   if (id === null) return { ok: false, text: "Error: id (the entry's number) is required" };
   const quote = text(input.evidence_quote) ?? "";
-  if (!quoteIsFrom(quote, ctx.humanMessages)) {
+  const target = await readEntry(ctx.userId, id, true);
+  if (!target) return { ok: false, text: `Error: no memory #${id}` };
+  const named = `${target.title ?? ""}\n${target.content}`;
+  if (!quoteIsFrom(quote, ctx.humanMessages) || !quoteAsksToForget(quote, id, named)) {
     await recordRefusal(ctx.userId, actor(), "quote_not_from_user", id);
-    return { ok: false, text: "Error: nothing deleted: evidence_quote must be the user's own request to forget or undo, copied exactly from their message" };
+    return { ok: false, text: "Error: nothing deleted: evidence_quote must be the user's own request to forget or undo this entry (naming it or its number), copied exactly from their message" };
   }
   if (input.undo === true) {
     const done = await undoMemory(ctx.userId, id, "model");

@@ -18,11 +18,12 @@
  *       session that carried an A2A run, a session marked memory "off", a child session, another user's session,
  *       or a turn that is no longer live; and not a user who has not opted in
  *   W8  REST writes pass the same checks; one made with a key (not a sign-in) waits for confirmation
+ *   W9  an entry waiting for confirmation is not the model's to read, change or delete
  * Deletes
  *   D1  deleting is for good: no text of the entry is left anywhere in the database
  *   D2  a deleted entry is gone from the next turn's catalogue
- *   D3  undo restores the previous version of an edit and deletes a new entry
- *   D4  forgetting needs the user's own request, quoted
+ *   D3  undo restores the previous version of an edit (a confirmation included) and deletes a new entry
+ *   D4  forgetting needs the user's own request to forget that entry, quoted; any other sentence of theirs is not one
  * Reads
  *   R1  the catalogue is one line per entry, bounded by lines and by tokens, user and feedback first, pinned on top
  *   R2  a project entry past its review date leaves the catalogue (counted) until it is confirmed again
@@ -349,6 +350,23 @@ describe("memory v2", { skip }, () => {
     assert.equal(other.status, 403);
   });
 
+  test("W9 an entry waiting for confirmation is not the model's to read, change or delete", async () => {
+    const byKey = await rest("POST", "/v1/users/me/memories", "alice", { type: "user", title: "pending fact", body: "a pending fact about tabs" });
+    const id = byKey.body.data.id;
+    assert.equal(byKey.body.data.status, "pending");
+    const sid = await chat("alice");
+    const t = await turn(sid, `I prefer a pending fact about tabs; forget memory #${id}`);
+    const recalled = await tool("recall_memory", sid, t.messageId, { id });
+    assert.equal(recalled.text, `No memory #${id}.`);
+    assert.ok(!(await tool("recall_memory", sid, t.messageId, { query: "pending fact" })).text.includes("pending fact"));
+    const updated = await tool("update_memory", sid, t.messageId, { id, body: "a pending fact about tabs", evidence_quote: "I prefer a pending fact about tabs" });
+    assert.match(updated.text, /not_found/);
+    const forgot = await tool("forget_memory", sid, t.messageId, { id, evidence_quote: `forget memory #${id}` });
+    assert.equal(forgot.ok, false);
+    const [row] = await entries();
+    assert.deepEqual([row.status, row.content], ["pending", "a pending fact about tabs"], "untouched, still waiting");
+  });
+
   // ── deletes ───────────────────────────────────────────────────────────────
 
   test("D1 deleting is for good: no text of the entry is left anywhere", async () => {
@@ -402,6 +420,13 @@ describe("memory v2", { skip }, () => {
     const again = await rest("POST", `/v1/users/me/memories/${id}/undo`, "alice");
     assert.equal(again.body.data.result, "deleted", "nothing to go back to: the new entry goes");
     assert.deepEqual(await entries(), []);
+
+    // A confirmation is a change like any other: undoing it keeps the entry.
+    await tool("save_memory", sid, t.messageId, save("weekly sync on Tuesday", "weekly sync moved to Tuesday", "the weekly sync moved to Tuesday", "project"));
+    const kept = Number((await entries())[0].id);
+    await rest("PUT", `/v1/users/me/memories/${kept}`, "alice", {}, true);
+    assert.equal((await rest("POST", `/v1/users/me/memories/${kept}/undo`, "alice")).body.data.result, "restored");
+    assert.equal((await entries()).length, 1);
   });
 
   test("D4 forgetting needs the user's own request, quoted", async () => {
@@ -411,10 +436,23 @@ describe("memory v2", { skip }, () => {
     const id = Number((await entries())[0].id);
     const unasked = await tool("forget_memory", sid, t.messageId, { id, evidence_quote: "the user no longer uses vim" });
     assert.equal(unasked.ok, false);
-    assert.equal((await entries()).length, 1);
+    const anySentence = await tool("forget_memory", sid, t.messageId, { id, evidence_quote: "remember I use vim" });
+    assert.equal(anySentence.ok, false, "a sentence of the user's that does not ask to forget is not a request");
     await w.closeRun(t.taskId);
-    const t2 = await turn(sid, `撤销记忆 #${id}`);
-    const asked = await tool("forget_memory", sid, t2.messageId, { id, evidence_quote: `撤销记忆 #${id}`, undo: true });
+    const t1 = await turn(sid, "please delete the note about the weather");
+    const other = await tool("forget_memory", sid, t1.messageId, { id, evidence_quote: "please delete the note about the weather" });
+    assert.equal(other.ok, false, "a request to forget something else is not a request to forget this");
+    assert.equal((await entries()).length, 1);
+    await w.closeRun(t1.taskId);
+    const byName = await turn(sid, "forget that I use vim");
+    assert.equal((await tool("forget_memory", sid, byName.messageId, { id, evidence_quote: "forget that I use vim" })).ok, true);
+    assert.deepEqual(await entries(), []);
+    await w.closeRun(byName.taskId);
+    await tool("save_memory", sid, (await turn(sid, "remember I use vim")).messageId, save("uses vim", "uses vim", "I use vim"));
+    await w.q("UPDATE claw_tasks SET status = 'completed'");
+    const id2 = Number((await entries())[0].id);
+    const t2 = await turn(sid, `撤销记忆 #${id2}`);
+    const asked = await tool("forget_memory", sid, t2.messageId, { id: id2, evidence_quote: `撤销记忆 #${id2}`, undo: true });
     assert.equal(asked.ok, true, asked.text);
     assert.deepEqual(await entries(), []);
   });
