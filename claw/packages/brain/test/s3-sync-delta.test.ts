@@ -1271,3 +1271,19 @@ test("L11 a record whose last listing is in the future, or missing, is not prune
     assert.equal(store.lists, 1, `shift ${shift}`);
   }
 });
+
+test("L12 a sync whose every listed file is held back leaves no record behind the prune it still runs", async () => {
+  // The prune deletes a recorded file; were the record kept, the same bytes
+  // written again would match it and never be uploaded, and S3 would lose them.
+  const sb = withRepo(1);
+  await syncWorkspaceToS3(sb.client, "sess-1", "user-1", { gitLimits: ROOMY });
+  assert.ok(store.objects.has("users/user-1/sessions/sess-1/a.txt"));
+
+  sb.remove("a.txt");
+  await syncWorkspaceToS3(sb.client, "sess-1", "user-1", { gitLimits: TIGHT });
+  assert.equal(store.objects.has("users/user-1/sessions/sess-1/a.txt"), false, "pruned");
+
+  sb.put("a.txt", "alpha");
+  await syncWorkspaceToS3(sb.client, "sess-1", "user-1", { gitLimits: TIGHT });
+  assert.ok(store.objects.has("users/user-1/sessions/sess-1/a.txt"), "the file is back in S3");
+});

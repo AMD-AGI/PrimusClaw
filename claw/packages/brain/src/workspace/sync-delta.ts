@@ -515,7 +515,12 @@ export async function planUploadDelta(
   excludeArgs: string,
   opts: { shardFiles?: number } = {},
 ): Promise<UploadDelta | null> {
-  if (files.length === 0) return null;
+  // Nothing to plan is still a sync whose prune may delete what the record vouches
+  // for (every listed file held back with its repository), so the record goes.
+  if (files.length === 0) {
+    await invalidateSyncManifest(hands, s3Prefix);
+    return null;
+  }
   const shardFiles = opts.shardFiles ?? SHARD_FILES;
   // A record this process could not take away is not planned from, and is taken
   // away again first: the sandbox may have been fixed since.
