@@ -1727,6 +1727,13 @@ export const A2A_STREAM_MAX_MS = envInt("A2A_STREAM_MAX_MS", 600_000, { min: 1_0
 
 // --- Background Shell ---
 export const BG_SHELL_ENABLED = envBool("BG_SHELL_ENABLED", false);
+/**
+ * Background work that finishes in an idle sandbox (no turn running) wakes the
+ * session: the keepalive sweep, which already watches that sandbox's jobs, asks
+ * the API for a turn that reports the result (api sessions/wake.ts). Off by
+ * default: each wake is a model turn the user did not send.
+ */
+export const BACKGROUND_WORK_WAKE_ENABLED = envBool("BACKGROUND_WORK_WAKE_ENABLED", false);
 
 /**
  * The foreground command ceiling, for describing the bash tool to the model.
