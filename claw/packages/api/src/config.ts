@@ -485,6 +485,10 @@ export const CLAW_REMOTE_AGENTS_RETENTION_DAYS = envInt("CLAW_REMOTE_AGENTS_RETE
 // that asks for `config.acting_as` is refused. See docs/github-review.md.
 export const CLAW_GITHUB_REVIEW_ENABLED = envBool("CLAW_GITHUB_REVIEW_ENABLED", false);
 
+// --- GitHub tools for every session whose owner stored a GH_TOKEN (default OFF) ---
+// When false: no route, and no `github` MCP server is offered to a session. See claw/docs/github-mcp.md.
+export const CLAW_GITHUB_MCP_ENABLED = envBool("CLAW_GITHUB_MCP_ENABLED", false);
+
 /**
  * How a connector's access token is checked (see auth/connector-token.ts). Read
  * on each use rather than once, so what a request is judged by is what the

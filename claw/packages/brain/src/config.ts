@@ -1856,6 +1856,11 @@ export const HITL_SUMMARY_MODEL = env("HITL_SUMMARY_MODEL", "").trim();
  * Unset means none; set but unparsable holds every bash command.
  */
 export const BASH_APPROVAL_RULES = process.env.BASH_APPROVAL_RULES;
+/**
+ * The built-in rules that hold GitHub writes made from the shell (agent/bash-approval-defaults.ts),
+ * on unless set to false. They add to BASH_APPROVAL_RULES and to a plugin's rules, never replace them.
+ */
+export const BASH_APPROVAL_DEFAULTS_ENABLED = envBool("BASH_APPROVAL_DEFAULTS_ENABLED", true);
 
 // --- Rules ---
 export const RULES_ENABLED = envBool("RULES_ENABLED", false);

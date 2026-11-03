@@ -1,0 +1,52 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+/**
+ * The settings of the GitHub tools, read from the environment each time they are needed. They only
+ * matter while `CLAW_GITHUB_MCP_ENABLED` is on.
+ *
+ *   CLAW_GITHUB_MCP_SECRET   HMAC key of the session token the tools are called with (32+ characters)
+ *   CLAW_GITHUB_MCP_URL      where Brain reaches the tools, default <INTERNAL_BACKEND_URL>/v1/internal/github/mcp
+ *   CLAW_GITHUB_API_URL      shared with GitHub review, default https://api.github.com
+ */
+import { CLAW_GITHUB_MCP_ENABLED } from "../config.js";
+import { MIN_MCP_SECRET_LENGTH } from "../github-review/settings.js";
+
+export const GITHUB_MCP_PATH = "/v1/internal/github/mcp";
+/** The variable of the owner's env vault that holds their GitHub token: the one the sandbox's `gh` and `git` use. */
+export const GITHUB_TOKEN_ENV_NAME = "GH_TOKEN";
+/** A turn's token outlives any turn; the session row is checked again on every call. */
+export const GITHUB_MCP_TOKEN_TTL_SECONDS = 12 * 3600;
+
+export interface GithubMcpSettings {
+  enabled: boolean;
+  secret: string;
+  mcpUrl: string;
+  apiUrl: string;
+}
+
+type Env = Readonly<Record<string, string | undefined>>;
+
+export function readGithubMcpSettings(env: Env = process.env, enabled: boolean = CLAW_GITHUB_MCP_ENABLED): GithubMcpSettings {
+  const backend = ((env.INTERNAL_BACKEND_URL ?? "").trim() || `http://127.0.0.1:${(env.API_PORT ?? "").trim() || "8200"}`).replace(/(?<!\/)\/+$/, "");
+  return {
+    enabled,
+    secret: (env.CLAW_GITHUB_MCP_SECRET ?? "").trim(),
+    mcpUrl: (env.CLAW_GITHUB_MCP_URL ?? "").trim() || `${backend}${GITHUB_MCP_PATH}`,
+    apiUrl: ((env.CLAW_GITHUB_API_URL ?? "").trim() || "https://api.github.com").replace(/(?<!\/)\/+$/, ""),
+  };
+}
+
+/** What is wrong with an enabled configuration, as sentences: a process asked for the tools that cannot authenticate them must not start. */
+export function githubMcpConfigErrors(s: GithubMcpSettings): string[] {
+  if (!s.enabled) return [];
+  const errors: string[] = [];
+  if (s.secret.length < MIN_MCP_SECRET_LENGTH) errors.push(`CLAW_GITHUB_MCP_SECRET must be at least ${MIN_MCP_SECRET_LENGTH} characters`);
+  try {
+    const u = new URL(s.apiUrl);
+    if (u.username || u.password || (u.protocol !== "https:" && u.protocol !== "http:")) throw new Error("bad");
+  } catch {
+    errors.push("CLAW_GITHUB_API_URL must be an http(s) URL without credentials");
+  }
+  return errors;
+}

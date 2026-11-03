@@ -28,6 +28,20 @@ record it.
 ## [Unreleased]
 
 ### Added
+- GitHub tools as an MCP server hosted by the API, off by default (`CLAW_GITHUB_MCP_ENABLED`, with
+  `CLAW_GITHUB_MCP_SECRET`). A session whose owner keeps `GH_TOKEN` in their env vault is offered `github`:
+  eleven read tools that run without asking and six write tools (comment, open an issue or a pull request,
+  change a pull request, reply to or resolve a review thread) that each wait for the user's decision. The
+  owner's token is read by the API per call, from the session the signed token names; it never travels in
+  the server entry. See `claw/docs/github-mcp.md`.
+- Built-in bash approval rules for GitHub writes from the shell (`git push` force / delete forms, writing
+  `gh pr` / `gh issue` / `gh release` / `gh api` / `gh repo` / `gh workflow` commands), on unless
+  `BASH_APPROVAL_DEFAULTS_ENABLED=false`. A run with no approval channel now has these commands denied
+  instead of run. The outbound-actions pack gains the `gh issue` rule. See `claw/docs/bash-approval.md`.
+- Brain's MCP client passes on every content block of a tool result: an image, an embedded resource or a
+  resource link becomes a line that says what it was (an embedded text resource is passed in full) instead
+  of the result reading as empty, and a result with only `structuredContent` is passed as JSON. A server that
+  declares resources is also offered `list_resources` and `read_resource` under its own prefix.
 - A service that acts for a person (a delegated identity token: RFC 8693 `act`) can now bring the person's own
   `ak-` key in `x-api-key`, for the services an operator names in `CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS` (empty by
   default, which changes nothing: such a token still has no keys and the header is still not read). SaFE verifies the

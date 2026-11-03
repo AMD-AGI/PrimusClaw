@@ -19,6 +19,11 @@ only makes the honest, common case ask first.
 - A plugin tool's `config.bash_approval` (or `bashApproval`), on any tool
   type. Rules apply to the sessions that mount that tool.
 - The deployment's `BASH_APPROVAL_RULES` environment variable (a JSON list).
+- Built in: the GitHub write rules of the pack below (`git push` in its force / delete forms, and the
+  writing `gh pr`, `gh issue`, `gh release`, `gh api`, `gh repo` and `gh workflow` commands), on unless
+  `BASH_APPROVAL_DEFAULTS_ENABLED=false`. A model can reach GitHub from the sandbox with the user's own
+  token, and the GitHub MCP tools hold the same writes for a person (see `github-mcp.md`); without these
+  the shell would be the way around that. A plain `git push` of a branch is not held.
 
 All sources are combined. Absent, `null` or `false` means no rule.
 
@@ -81,6 +86,7 @@ approval request.
 |---|---|---|
 | `git push` | `git push` in any form, `git -C dir push`, `git --git-dir=... push`; the **force / delete** forms (`--force`, `-f`, `--force-with-lease`, `--delete`, `-d`, `--mirror`, `--prune`, `+ref`, `:ref`) are labelled separately | `status`, `log`, `diff`, `fetch`, `pull`, `clone`, `checkout`, `branch`, `commit`, `stash` (also `stash push`), `remote`, `config` |
 | `gh pr` | `create`, `merge`, `close`, `review`, `ready`, `edit`, `reopen`, `comment`, `update-branch` | `view`, `list`, `checks`, `diff`, `status`, `checkout` |
+| `gh issue` | `create`, `close`, `comment`, `edit`, `delete`, `reopen`, `transfer`, `lock`, `unlock`, `pin`, `unpin`, `develop` | `view`, `list`, `status` |
 | `gh release` | `create`, `edit`, `delete`, `upload`, `delete-asset` | `list`, `view`, `download` |
 | `gh api` | `-X` / `--method` `POST`, `PUT`, `PATCH`, `DELETE`; and any call with `-f`, `-F`, `--field`, `--raw-field` or `--input` and no explicit `GET` (`gh` sends those as a POST) | `GET` calls, including `-X GET ... -f q=...` |
 | `gh repo` | `create`, `delete`, `edit`, `rename`, `archive`, `unarchive`, `fork`, `sync` | `view`, `clone`, `list` |
@@ -104,7 +110,7 @@ Things this pack does not do, beyond the limits above:
 - A recursive delete of a `/tmp` path is held, because it is outside `/workspace`. Delete the `rm` rule, or
   narrow it, if scratch cleanup should not ask.
 - A GraphQL read through `gh api graphql -f query=...` is a POST to GitHub and is held.
-- It does not cover `gh issue`, `gh gist`, `gh secret`, `gh run`, `git` aliases, other HTTP clients (add an
+- It does not cover `gh gist`, `gh secret`, `gh run`, `git` aliases, other HTTP clients (add an
   `http` rule), `docker push`, or a script that does any of this.
 
 The held call's request goes to whoever can answer it. With `CLAW_NOTIFICATIONS_ENABLED`, a subscription that
