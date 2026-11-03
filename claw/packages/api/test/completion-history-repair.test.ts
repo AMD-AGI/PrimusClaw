@@ -74,7 +74,8 @@ before(async () => {
     ADD COLUMN timeout INTEGER,
     ADD COLUMN user_env JSONB,
     ADD COLUMN session_env JSONB,
-    ADD COLUMN topology JSONB`);
+    ADD COLUMN topology JSONB,
+    ADD COLUMN tools_allowlist JSONB`);
 });
 
 beforeEach(async () => {

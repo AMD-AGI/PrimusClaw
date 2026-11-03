@@ -18,6 +18,7 @@ import { isAdmin, type UserInfo } from "../auth/models.js";
 import { stampSessionCredentials } from "../auth/session-credentials.js";
 import { buildMessages } from "./context-builder.js";
 import { memoryAccess } from "../memory/service.js";
+import { CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
 import { selectSkillsForTask } from "../marketplace/skill-service.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { eventSubject, taskSubject, type EnvironmentTopology } from "@claw/protocol";
@@ -35,6 +36,7 @@ import { sessionModelFromRow } from "./session-model.js";
 import { sessionRepoFromRow } from "./session-repo.js";
 import { applyAppMcpToTask } from "./app-mcp.js";
 import { applySessionRoleToTask, skipsSkillSelection } from "../assistant/role-profile.js";
+import { applyTriggerToolsToTask } from "../triggers/mcp.js";
 import { ensureSessionWorkspace, requireWorkspaceBinding } from "../workspace/store.js";
 import pino from "pino";
 
@@ -96,6 +98,8 @@ export interface DispatchInput {
    * either absent or well-formed.
    */
   topology?: EnvironmentTopology;
+  /** The tools the turn may use (`tools_allowlist`, enforced by Brain); absent or empty is no restriction. */
+  toolsAllowlist?: string[];
   /**
    * Run the dispatch as a sandbox-only run: bring up (or reuse) the session's
    * sandbox exactly as a turn would, then finish, with no model call and no
@@ -156,7 +160,7 @@ export async function dispatchTaskToBrain(
   const {
     sessionId, userId, user, content, toolIds, pluginId,
     requestImage, requestResource, requestTimeout, workspaceId,
-    mcpServers, capturedUserEnvSnapshot, capturedSessionEnv, topology,
+    mcpServers, capturedUserEnvSnapshot, capturedSessionEnv, topology, toolsAllowlist,
   } = input;
   const sandboxOnly = input.sandboxOnly === true;
 
@@ -304,6 +308,7 @@ export async function dispatchTaskToBrain(
       prompt: content,
       history,
       memory_enabled: (await memoryAccess(sessionId, userId)).serves,
+      skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED,
       user_id: userId,
       llm_api_key: resolveUserLlmKey(user),
       platform_key: user?.platformKey || "",
@@ -325,6 +330,7 @@ export async function dispatchTaskToBrain(
     if (pluginTools !== undefined) {
       task.plugin_tools = pluginTools;
     }
+    if (toolsAllowlist?.length) task.tools_allowlist = toolsAllowlist;
     if (sandboxOnly) {
       // Brain opens the sandbox up front for script mode and the empty script
       // then has nothing to run: the run ends with the sandbox up and parked.
@@ -510,6 +516,7 @@ export async function dispatchTaskToBrain(
     // (tasks/run-claim.ts), so no token is stored and a replaced sandbox is not offered.
     await applyAppMcpToTask(task, sessionId);
     // After the run row exists: the turn's token names the run. A doorbell turn gets this at claim instead.
+    await applyTriggerToolsToTask(task, sessionId);
     await applySessionRoleToTask(task, sessionId);
     const payload = JSON.stringify(task);
     const seq = await publishRunMessage(

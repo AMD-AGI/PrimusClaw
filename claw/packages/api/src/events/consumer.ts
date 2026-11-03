@@ -32,7 +32,7 @@ import { a2aPushEnabled } from "../routes/a2a-flags.js";
 import { recordSessionEvent as recordA2aPushEvent } from "../routes/a2a-push.js";
 import { recordApprovalRequested, recordRunFinished } from "../notifications/outbox.js";
 import {
-  markChatRunRunning, closeChatRun, gateOwnershipEnforced, queuedMessageId,
+  markChatRunRunning, closeChatRun, gateNamesEndedTurnSql, gateOwnershipEnforced, queuedMessageId,
   retireDispatchReconcileForReport,
 } from "../tasks/chat-run.js";
 import { dispatchPendingMessage, publishRefusedTurn } from "../tasks/pending-dispatch.js";
@@ -644,7 +644,8 @@ export async function releaseSessionGateIfLastRun(
         SET agent_status = $1, agent_gate_message_id = NULL, updated_at = NOW()
       WHERE session_id = $2
         AND deleted_at IS NULL
-        AND (NOT $4::boolean OR agent_gate_message_id IS NOT DISTINCT FROM $3)
+        AND (NOT $4::boolean OR agent_gate_message_id IS NOT DISTINCT FROM $3
+             OR ${gateNamesEndedTurnSql("$2", "agent_gate_message_id")})
         AND NOT EXISTS (
           SELECT 1 FROM claw_tasks t
            WHERE t.session_id = $2
@@ -1303,7 +1304,7 @@ export async function drainOldestPendingMessage(
   // session has when the message is sent on, which is what a change "from the next
   // turn" means for a turn that was already parked.
   const pending = (await db.query(
-  "SELECT id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology, (SELECT model FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_model, (SELECT config->'repo' FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_repo FROM claw_pending_messages WHERE session_id = $1 ORDER BY created_at LIMIT 1",
+  "SELECT id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology, tools_allowlist, (SELECT model FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_model, (SELECT config->'repo' FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_repo FROM claw_pending_messages WHERE session_id = $1 ORDER BY created_at LIMIT 1",
   [sessionId],
 )).rows[0];
 
@@ -1373,6 +1374,7 @@ if (pending) {
     prompt: pending.content,
     history,
     memory_enabled: (await memoryAccess(sessionId, pendingUserId)).serves,
+    skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED,
     user_id: pendingUserId,
     llm_api_key: typeof pending.llm_api_key === "string" ? pending.llm_api_key : "",
     platform_key: typeof pending.platform_key === "string" ? pending.platform_key : "",
@@ -1387,6 +1389,7 @@ if (pending) {
     user_env: pendingUserEnv && Object.keys(pendingUserEnv).length ? pendingUserEnv : undefined,
     session_env: pendingSessionEnv && Object.keys(pendingSessionEnv).length ? pendingSessionEnv : undefined,
     topology: asJsonObject(pending.topology),
+    ...(Array.isArray(pending.tools_allowlist) && pending.tools_allowlist.length ? { tools_allowlist: pending.tools_allowlist } : {}),
   };
   // Same rule as the immediate path in sessions/dispatch.ts: no field at all for
   // a session with no choice, so Brain falls back on its own default.

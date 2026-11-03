@@ -43,6 +43,7 @@ const REGISTRARS: Record<string, string> = {
   registerRemoteAgentRoutes: "routes/remote-agents.js",
   registerAssistantRoutes: "routes/assistant.js",
   registerAssistantMcpRoutes: "assistant/mcp.js",
+  registerTriggerMcpRoutes: "triggers/mcp.js",
   registerGithubReviewRoutes: "github-review/mcp.js",
   registerAnswerFeedbackRoutes: "routes/answer-feedback.js",
   registerImageRoutes: "routes/images.js",
@@ -90,7 +91,7 @@ describe("a connector access token over the whole router", { skip }, () => {
     h = await startAdmissionCluster({
       // Never called: no route is sent a credential SaFE could judge.
       SAFE_API_URL: "http://127.0.0.1:9", AUTH_INTERNAL_TOKEN: "t", CLAW_REMOTE_AGENTS_ENABLED: "true",
-      CLAW_ASSISTANT_ENABLED: "true",
+      CLAW_ASSISTANT_ENABLED: "true", CLAW_TRIGGER_TOOLS_ENABLED: "true",
     });
     Object.assign(process.env, {
       IDENTITY_CLIENT_ENABLED: "true", IDENTITY_ISSUER_URL: fake.issuer, IDENTITY_CLIENT_ID: "svc-claw", IDENTITY_CLIENT_SECRET: "s3cret",

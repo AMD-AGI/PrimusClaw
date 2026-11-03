@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { ToolRouter } from "../tools/router.js";
+import { ToolRouter, SPILL_MAX_CHARS } from "../tools/router.js";
 import { isRetryable } from "../infra/retry.js";
 import { runSubagent, SUBAGENT_TYPES, type SubagentType } from "./sub-agent.js";
 import {
@@ -380,7 +380,7 @@ const TOOL_RESULT_TAIL_CHARS = 1500;
  * which the store never exceeds, and its own notice, which names the paging and
  * never a sandbox tool.
  */
-export function truncateToolResult(text: string, toolName?: string): string {
+export function truncateToolResult(text: string, toolName?: string, savedAt?: string): string {
   if (toolName === LOAD_SKILL_TOOL) {
     if (typeof text !== "string" || text.length <= LOAD_SKILL_RESULT_MAX_CHARS) return text;
     const head = text.slice(0, Math.floor(LOAD_SKILL_RESULT_MAX_CHARS * 0.65));
@@ -389,10 +389,43 @@ export function truncateToolResult(text: string, toolName?: string): string {
     return `${head}\n\n[... ${dropped} chars cut from this ${LOAD_SKILL_TOOL} result; get what is missing by calling ${LOAD_SKILL_TOOL} again with name, file and the offset to continue from ...]\n\n${tail}`;
   }
   if (typeof text !== "string" || text.length <= TOOL_RESULT_MAX_CHARS) return text;
+  if (toolName === "read") return truncateReadResult(text);
   const head = text.slice(0, TOOL_RESULT_HEAD_CHARS);
   const tail = text.slice(-TOOL_RESULT_TAIL_CHARS);
   const dropped = text.length - TOOL_RESULT_HEAD_CHARS - TOOL_RESULT_TAIL_CHARS;
-  return `${head}\n\n[... ${dropped} chars truncated for context efficiency; if you need the elided portion, re-run the command with narrower scope (head/tail/grep/sed range) ...]\n\n${tail}`;
+  const how = !savedAt
+    ? "if you need the elided portion, re-run the command with narrower scope (head/tail/grep/sed range)"
+    : text.length <= SPILL_MAX_CHARS
+      ? `the whole result (${text.length} chars) is saved at ${savedAt}: read it with offset/limit or grep it instead of re-running`
+      : `only the first ${SPILL_MAX_CHARS} of its ${text.length} chars are saved at ${savedAt}; for the rest, re-run the command with its output narrowed or written to a file of its own`;
+  return `${head}\n\n[... ${dropped} chars truncated for context efficiency; ${how} ...]\n\n${tail}`;
+}
+
+/**
+ * A `read` page over the cap, cut at a line and told where to continue.
+ *
+ * Head and tail would leave a hole in the middle of a file with no way to name
+ * it; the file is already on disk, so the answer is the next offset, read from
+ * the `N|` prefix of the last line kept.
+ */
+function truncateReadResult(text: string): string {
+  const budget = text.slice(0, TOOL_RESULT_HEAD_CHARS + TOOL_RESULT_TAIL_CHARS);
+  const cut = budget.lastIndexOf("\n");
+  const kept = cut > 0 ? budget.slice(0, cut) : budget;
+  const last = /(?:^|\n)(\d+)\|[^\n]*$/.exec(kept);
+  // No whole line fits: the one shown is cut, and read cannot page inside a line.
+  const how = cut <= 0 && last
+    ? `line ${last[1]} alone is longer than this and was cut; see the rest of it with bash (e.g. sed -n '${last[1]}p' <file> | cut -c 1-) or grep, then continue with read offset=${Number(last[1]) + 1}`
+    : last
+      ? `continue with read offset=${Number(last[1]) + 1}, and a smaller limit if lines are long`
+      : "page through the file with read offset and limit";
+  return `${kept}\n\n[... read result cut at ${kept.length} of ${text.length} chars for context efficiency; ${how} ...]`;
+}
+
+/** Whether a result is kept whole in the sandbox before it is cut: not for tools whose source can simply be read again. */
+function spillsWhenCut(text: string, toolName: string): boolean {
+  return typeof text === "string" && text.length > TOOL_RESULT_MAX_CHARS
+    && toolName !== "read" && toolName !== LOAD_SKILL_TOOL;
 }
 
 /** Cap on any single string inside a persisted `tool_use.input`.
@@ -974,6 +1007,10 @@ class AgentLoopRunner {
     }
     if (this.planMode) {
       filtered = filtered.filter((t) => PLAN_MODE_ALLOWLIST.has(t.name));
+    } else {
+      // Only a run in plan mode can leave it. Offered to every other run it was
+      // a tool whose one effect was an automatic "Plan accepted".
+      filtered = filtered.filter((t) => t.name !== "exit_plan_mode");
     }
     return filtered;
   }
@@ -1627,10 +1664,15 @@ class AgentLoopRunner {
     // Apply per-result truncation here (single chokepoint) so every tool's
     // contribution to the conversation history is bounded — see
     // truncateToolResult() docstring for rationale.
-    const results: Array<Record<string, unknown>> = toolUses.map((tc: any) => ({
-      type: "tool_result",
-      tool_use_id: tc.id as string,
-      content: truncateToolResult(resultByToolId.get(tc.id as string) ?? "(no result)", tc.name as string),
+    // A result that is cut is first kept whole in the sandbox, so the cut is a
+    // pointer the model can follow rather than output it can only get by
+    // running the command again.
+    const results: Array<Record<string, unknown>> = await Promise.all(toolUses.map(async (tc: any) => {
+      const raw = resultByToolId.get(tc.id as string) ?? "(no result)";
+      const savedAt = spillsWhenCut(raw, tc.name as string)
+        ? await this.router.spillToolResult(tc.id as string, raw) ?? undefined
+        : undefined;
+      return { type: "tool_result", tool_use_id: tc.id as string, content: truncateToolResult(raw, tc.name as string, savedAt) };
     }));
 
     await this.maybeRecoverSandbox(results);
@@ -2043,6 +2085,8 @@ class AgentLoopRunner {
           type: "userQuestion",
           actionId: toolId,
           questions: finalInput.questions,
+          // How long the answer is waited for, as a permissionRequest says it: a client stops offering the question then.
+          timeout_ms: ASK_USER_QUESTION_TIMEOUT_MS,
           ts: Date.now(),
         });
       } catch (err) {

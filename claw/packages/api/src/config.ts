@@ -529,6 +529,13 @@ export const TRIGGER_RUN_TIME_LIMIT_SECONDS = envInt("TRIGGER_RUN_TIME_LIMIT_SEC
 export const TRIGGER_STALE_AFTER_SECONDS = envInt("TRIGGER_STALE_AFTER_SECONDS", 900, { min: 1 });
 /** Consecutive failed starts before a trigger pauses itself. */
 export const TRIGGER_MAX_CONSECUTIVE_FAILURES = envInt("TRIGGER_MAX_CONSECUTIVE_FAILURES", 3, { min: 1 });
+/**
+ * The model's own trigger tools (`trigger_create`, `trigger_list`, `trigger_cancel`), served by this API as an
+ * MCP service and offered to every turn but a trigger's own runs. Needs CLAW_TRIGGERS_ENABLED. Off by default.
+ */
+export const CLAW_TRIGGER_TOOLS_ENABLED = envBool("CLAW_TRIGGER_TOOLS_ENABLED", false);
+/** HMAC key of the bearer a turn presents to the trigger tools; at least 32 characters when they are on. */
+export const CLAW_TRIGGER_TOOLS_TOKEN_KEY = env("CLAW_TRIGGER_TOOLS_TOKEN_KEY");
 
 /**
  * Accept `mode: "app"` on `POST /v1/sessions/:sessionId/tasks`. Off by default:

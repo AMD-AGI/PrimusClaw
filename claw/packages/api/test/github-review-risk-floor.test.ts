@@ -44,16 +44,16 @@ test("F1 an authentication module or a release file edited with lines that look 
   ];
   for (const [what, before, after] of lines) {
     const r = assess([edit("src/auth/session.ts", before, after)]);
-    assert.equal(r.level, "high", what);
     assert.equal(r.ruleLevel, "high", what);
-    assert.match(r.reasons.join("\n"), /authentication or security code changed: src\/auth\/session\.ts/, what);
+    assert.equal(r.ruleLevel, "high", what);
+    assert.match(r.evidence.join("\n"), /authentication or security code changed: src\/auth\/session\.ts/, what);
     const d = assess([edit("Dockerfile", `# ${before}`, `# ${after}`)]);
-    assert.match(d.reasons.join("\n"), /release or deployment file changed: Dockerfile/, `${what} (a Dockerfile)`);
+    assert.match(d.evidence.join("\n"), /release or deployment file changed: Dockerfile/, `${what} (a Dockerfile)`);
   }
   // The same files with a change that has no line at all in common with a comment are held, as they always were.
-  assert.equal(assess([edit("src/auth/session.ts", "const TTL = 86400;", "const TTL = 864000;")]).level, "high");
+  assert.equal(assess([edit("src/auth/session.ts", "const TTL = 86400;", "const TTL = 864000;")]).ruleLevel, "high");
   // A module that is not on the floor and has only comments edited is not held: the floor is a floor, not a tripwire on every source file.
-  assert.equal(assess([edit("src/queue/ttl.ts", "// Entries last a day.", "// Entries last one day.")]).level, "low");
+  assert.equal(assess([edit("src/queue/ttl.ts", "// Entries last a day.", "// Entries last one day.")]).ruleLevel, "low");
 });
 
 test("F2 a line that only starts like a comment is code, and the content rules read it; a real comment of the file's language is still not", () => {
@@ -71,8 +71,8 @@ test("F2 a line that only starts like a comment is code, and the content rules r
   ];
   for (const [what, path, line] of code) {
     const r = assess([{ path, status: "modified", additions: 1, deletions: 0, patch: `@@ -1,1 +1,2 @@\n ctx\n+${line}` }]);
-    assert.equal(r.level, "high", what);
-    assert.match(r.reasons.join("\n"), /security-sensitive code/, what);
+    assert.equal(r.ruleLevel, "high", what);
+    assert.match(r.evidence.join("\n"), /security-sensitive code/, what);
   }
   const comments: Array<[string, string, string]> = [
     ["a line comment in TypeScript", "src/server.ts", "// execSync(command) would be the wrong fix: eval(input);"],
@@ -88,8 +88,8 @@ test("F2 a line that only starts like a comment is code, and the content rules r
   ];
   for (const [what, path, line] of comments) {
     const r = assess([{ path, status: "modified", additions: 1, deletions: 0, patch: `@@ -1,1 +1,2 @@\n ctx\n+${line}` }]);
-    assert.deepEqual(r.reasons, [], what);
-    assert.equal(r.level, "low", what);
+    assert.deepEqual(r.evidence, [], what);
+    assert.equal(r.ruleLevel, "low", what);
   }
 });
 
@@ -111,16 +111,16 @@ test("F3 a binary tracked by Git LFS is its pointer, a text patch with real line
     assert.equal(isLfsPointerPatch(f.patch as string), true, what);
     assert.equal(diffNotSent(f), true, what);
     const r = assess([f]);
-    assert.equal(r.level, "high", what);
+    assert.equal(r.ruleLevel, "high", what);
     assert.ok(r.categories.includes("integrity"), what);
-    assert.match(r.reasons.join("\n"), /Git LFS file changed .*: /, what);
+    assert.match(r.evidence.join("\n"), /Git LFS file changed .*: /, what);
   }
   // A file whose diff GitHub did not send is still the other reason, and a text file that is not a pointer is not either.
-  assert.match(assess([{ path: "a.bin", status: "modified", additions: 0, deletions: 0 }]).reasons.join(), /diff not readable/);
+  assert.match(assess([{ path: "a.bin", status: "modified", additions: 0, deletions: 0 }]).evidence.join(), /diff not readable/);
   for (const text of ["const note = 'oid sha256:" + OLD + "';", "version https://git-lfs.github.com/spec/v1 is the first line of a pointer", "oid sha256:abc", "size 12"]) {
     const f = file("src/notes.ts", `@@ -1,1 +1,2 @@\n ctx\n+${text}`);
     assert.equal(isLfsPointerPatch(f.patch as string), false, text);
     assert.equal(diffNotSent(f), false, text);
-    assert.equal(assess([f]).level, "low", text);
+    assert.equal(assess([f]).ruleLevel, "low", text);
   }
 });

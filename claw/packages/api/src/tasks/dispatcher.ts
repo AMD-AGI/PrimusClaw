@@ -22,7 +22,7 @@ import {
   MissingPlatformKeyError,
   readTrustedSessionCredentials,
 } from "../auth/session-credentials.js";
-import { CLAW_DEPLOY_MODE } from "../config.js";
+import { CLAW_DEPLOY_MODE, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
 import { withholdsSandboxKeys } from "../github-review/session-tools.js";
 import { defaultTaskWorkspaceId } from "./default-workspace.js";
 import { resolveTaskPlugin } from "../marketplace/plugins.js";
@@ -456,6 +456,7 @@ function buildExecuteRequest(opts: {
     history: [],
     // A task, DAG node or application run is not the user's conversation: no memory tools.
     memory_enabled: false,
+    skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED,
     script: rendered.script as ExecuteRequest["script"] | undefined,
     tools_allowlist: (updated.tools_allowlist as string[]) ?? undefined,
     model: updated.model ?? undefined,

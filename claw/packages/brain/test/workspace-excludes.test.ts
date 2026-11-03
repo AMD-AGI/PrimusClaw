@@ -23,6 +23,7 @@ import {
   rsyncExcludeArgs,
   tarExcludeArgs,
   findExcludeArgs,
+  TOOL_RESULTS_DIR,
 } from "../src/workspace/excludes.js";
 
 test("the destinations differ over .skills and nothing else", () => {
@@ -60,6 +61,10 @@ test("what another lifecycle owns is left alone by both", () => {
   for (const pat of [".hands-binary", "hands.log"]) {
     assert.ok(WORKSPACE_EXCLUDES.includes(pat as never), `common list missing ${pat}`);
   }
+  // Whole tool results kept for the sandbox that produced them: not the user's
+  // content, potentially large, and re-creatable by running the command again.
+  assert.ok(WORKSPACE_EXCLUDES.includes(TOOL_RESULTS_DIR as never));
+  assert.ok(findExcludeArgs(s3Excludes()).includes(`-not -path '*/${TOOL_RESULTS_DIR}/*'`));
 });
 
 test("rsync patterns are quoted and unanchored", () => {
