@@ -18,6 +18,7 @@ import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
 import { CLAW_ASSISTANT_WORKER_MODEL, CLAW_DEPLOY_MODE } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { insertSessionRow } from "../routes/sessions.js";
+import { gateNamesEndedTurnSql } from "../tasks/chat-run.js";
 import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
 import { recordAssistantSay, SayRefused, type SayDeps } from "./outbound.js";
 import { parseReport } from "./report.js";
@@ -45,22 +46,26 @@ const RECALL_EVENTS = 20;
  * The current user of a live turn, or a refusal. `FOR SHARE` holds the session row for the rest of the
  * caller's transaction: the gate cannot change hands between this check and the write it protects.
  *
- * A turn is live while its run row is open and the session's gate does not name another turn. An unnamed
- * gate is a session from before gates carried an owner, and is not a reason to refuse.
+ * A turn is live while its run row is open and the session's gate does not name another live turn. An unnamed
+ * gate is a session from before gates carried an owner, and a gate naming a turn that has ended is one this
+ * run outlived (`gateNamesEndedTurnSql`); neither is a reason to refuse.
  */
 export async function assertLiveRun(q: Querier, claims: AssistantTokenClaims): Promise<{ userId: string }> {
   const row = (await q(
-    `SELECT s.user_id, s.agent_gate_message_id, t.status
+    `SELECT s.user_id, s.agent_gate_message_id, t.status,
+            ${gateNamesEndedTurnSql("s.session_id", "s.agent_gate_message_id")} AS gate_turn_ended
        FROM claw_tasks t JOIN claw_sessions s ON s.session_id = t.session_id
       WHERE t.task_id = $1 AND t.session_id = $2 AND t.origin = 'chat'
         AND t.metadata->>'message_id' = $3 AND s.deleted_at IS NULL
         FOR SHARE OF s`,
     [claims.task_id, claims.sid, claims.mid],
-  )).rows[0] as { user_id: string | null; agent_gate_message_id: string | null; status: string } | undefined;
+  )).rows[0] as {
+    user_id: string | null; agent_gate_message_id: string | null; status: string; gate_turn_ended: boolean;
+  } | undefined;
   if (!row || (row.status !== "preparing" && row.status !== "running")) {
     throw new ToolRefused("turn_not_live", "this turn has ended or been interrupted, so it can no longer act");
   }
-  if (row.agent_gate_message_id && row.agent_gate_message_id !== claims.mid) {
+  if (row.agent_gate_message_id && row.agent_gate_message_id !== claims.mid && !row.gate_turn_ended) {
     throw new ToolRefused("turn_superseded", "a newer turn has taken over this session, so this one can no longer act");
   }
   if (!row.user_id) throw new ToolRefused("turn_not_live", "the session has no owner");
