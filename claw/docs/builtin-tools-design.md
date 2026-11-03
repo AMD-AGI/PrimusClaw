@@ -1178,7 +1178,7 @@ The controller is **disabled by default**. It only emits permission requests whe
 The controller:
 
 1. Subscribes to `decision.<sessionId>` NATS subject when the engine starts.
-2. Checks `tool` against `HITL_AUTO_ALLOW` (env-configurable; safe default: `read`, `glob`, `grep`, `ls`, `todo_write`, `web_search`, `save_memory`). This is intentionally stricter than V1 for `web_fetch`, because URL fetching can touch untrusted hosts.
+2. Checks `tool` against `HITL_AUTO_ALLOW` (env-configurable; safe default: `read`, `glob`, `grep`, `ls`, `load_skill`, `todo_write`, `web_search`, `save_memory`). This is intentionally stricter than V1 for `web_fetch`, because URL fetching can touch untrusted hosts.
 3. For non-allowlisted tools, when `HITL_ENABLED=true`:
    - Emits `permissionRequest` event with `actionId` (= LLM tool_use_id), `tool`, `input`, `description`, `timeout_ms`.
    - Awaits one of: matching NATS `decision` message, timeout (default 300 s), or `signal.aborted`.
@@ -1736,7 +1736,7 @@ All new behavior is gated by env vars so deployments can opt in:
 | `BG_SHELL_STALL_CHECK_INTERVAL_MS` | `5000` | Watchdog tick interval |
 | `EXIT_PLAN_MODE_ENABLED` | `true` | When false, plan mode never engages |
 | `HITL_ENABLED` | `false` | Master switch for permissionRequest emission |
-| `HITL_AUTO_ALLOW` | `"read,glob,grep,ls,todo_write,web_search,save_memory"` | CSV (note: `notebook_read` removed since merged into `read`) |
+| `HITL_AUTO_ALLOW` | `"read,glob,grep,ls,load_skill,todo_write,web_search,save_memory"` | CSV (note: `notebook_read` removed since merged into `read`) |
 | `HITL_DECISION_TIMEOUT_MS` | `300000` | |
 | `HITL_DECISION_DEFAULT` | `"allow"` | `"allow"` or `"deny"` on timeout |
 | `HITL_SUMMARY_ENABLED` | `true` | Adds a one-sentence, model-written plain-language summary to each `permissionRequest` (with `tool_description` and `intent`); set `false` to send none |

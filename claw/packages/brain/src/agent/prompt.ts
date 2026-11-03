@@ -55,14 +55,24 @@ const PROGRESSIVE_MAX_CHARS = 8000;
  * always a prefix of `skills`. Exported so a caller that must not lose a skill
  * to the cap (the engine, for plugin skills) can ask which ones fit before it
  * decides what to inline instead.
+ *
+ * `loadSkill` is whether the run has the `load_skill` tool. Without it a skill
+ * can only be opened by path, so each line carries the path to read and counts
+ * against the cap; the engine asks with the same flag the prompt is built with,
+ * so what it decides fits is what the prompt lists.
  */
 export function listProgressiveSkills(
   skills: ProgressiveSkill[],
+  sessionDir = "",
+  loadSkill = true,
 ): { listed: ProgressiveSkill[]; omitted: number; lines: string } {
+  const skillBase = sessionDir ? `${sessionDir}/.skills` : ".skills";
   let lines = "";
   const listed: ProgressiveSkill[] = [];
   for (const s of skills) {
-    const line = `\n  - ${s.name}: ${s.description}`;
+    const line = loadSkill
+      ? `\n  - ${s.name}: ${s.description}`
+      : `\n  - ${s.name}: ${s.description}   [read ${skillBase}/${s.name}/SKILL.md]`;
     if (listed.length >= PROGRESSIVE_MAX_ENTRIES || lines.length + line.length > PROGRESSIVE_MAX_CHARS) break;
     lines += line;
     listed.push(s);
@@ -77,13 +87,24 @@ export function listProgressiveSkills(
  * sandbox only when a command there first names `.skills`, which is where its
  * scripts run from. Descriptions are untrusted marketplace text and are only
  * concatenated here.
+ *
+ * A run whose `tools_allowlist` leaves `load_skill` out (every list written
+ * before the tool existed) is not offered it, and a hint that sends the model
+ * to it, and forbids the `read` it does have, leaves its skills unusable. For
+ * such a run (`loadSkill` false) the hint is the one from before the tool: read
+ * SKILL.md with `read`, from the path on each line.
  */
-export function buildProgressiveSkillHint(skills: ProgressiveSkill[], sessionDir = ""): string {
+export function buildProgressiveSkillHint(skills: ProgressiveSkill[], sessionDir = "", loadSkill = true): string {
   if (!skills.length) return "";
-  const { omitted, lines } = listProgressiveSkills(skills);
+  const { omitted, lines } = listProgressiveSkills(skills, sessionDir, loadSkill);
   const skillBase = sessionDir ? `${sessionDir}/.skills` : ".skills";
   let hint = `\n- Platform Skills (load on demand):${lines}`;
   if (omitted > 0) hint += `\n  - (${omitted} more skills not listed)`;
+  if (!loadSkill) {
+    hint += `\nBefore starting a task, if a skill's description matches, read its SKILL.md with the read tool and follow it. `;
+    hint += `Supporting files live next to SKILL.md in the same directory; read them only when SKILL.md points to them.`;
+    return hint;
+  }
   hint += `\nBefore starting a task, if a skill's description matches, load it with the ${LOAD_SKILL_TOOL} tool (name = the skill's name) and follow it. `;
   hint += `Loading a skill needs no sandbox: do not read or cat its files for that. Other files of a skill are listed at the end of its SKILL.md; `;
   hint += `load one with ${LOAD_SKILL_TOOL} (name and file) only when SKILL.md points to it. `;
@@ -103,6 +124,8 @@ export function buildPrompt(
   progressiveSkills: ProgressiveSkill[] = [],
   /** The bound repository's block (see workspace/repo-binding.ts); "" for a session with none. */
   repoBlock = "",
+  /** Whether the run has the `load_skill` tool (see buildProgressiveSkillHint); false when its `tools_allowlist` leaves it out. */
+  loadSkill = true,
 ): string {
   let skillHint = "";
   const skillNames = Object.keys(skillContents);
@@ -125,7 +148,7 @@ export function buildPrompt(
     skillHint += `Follow the SKILL.md orchestrator above precisely.`;
   }
 
-  if (progressiveSkills.length) skillHint += (skillHint ? "\n\n" : "") + buildProgressiveSkillHint(progressiveSkills, sessionDir).replace(/^\n/, "");
+  if (progressiveSkills.length) skillHint += (skillHint ? "\n\n" : "") + buildProgressiveSkillHint(progressiveSkills, sessionDir, loadSkill).replace(/^\n/, "");
 
   let mcpHint = "";
   if (mcpServerNames.length) {

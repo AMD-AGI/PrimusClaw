@@ -473,7 +473,10 @@ record it.
   written into it the first time a sandbox tool names `.skills`, so running a script starts a sandbox as before, and
   a model that reads a `.skills` path with `read` or `bash` still gets the file. `load_skill` is offered only when
   the prompt lists skills, is allowed in plan mode and for the `readonly` and `explore` sub-agents, and is subject
-  to `tools_allowlist`. A skill longer than the loop's 6000-character tool-result cap is not cut by it, which would
+  to `tools_allowlist`: a run whose list does not name it (every list written before the tool existed) is not
+  offered it, and gets the skill hint from before, which reads SKILL.md with `read` from the path on each line, as
+  its skills were read until now; a list that names `load_skill` gets the sandbox-free load. It is in the default
+  `HITL_AUTO_ALLOW`, so turning approval on does not start asking about every skill the model loads. A skill longer than the loop's 6000-character tool-result cap is not cut by it, which would
   have sent the model back to `read` or `bash` for the rest: `load_skill` returns a file in parts of up to 16000
   characters, each saying the `offset` of the next, and has a bound of its own that leaves a part and the skill's
   file list whole.

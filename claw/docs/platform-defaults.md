@@ -78,6 +78,17 @@ read-only set (plan mode, the `readonly` and `explore` sub-agents) and is subjec
 to `tools_allowlist` like any other tool. A model that reads `.skills/...` with
 `read` or `bash` anyway still gets the file, from the sandbox, written first.
 
+A run whose `tools_allowlist` does not name `load_skill` (any list written before
+the tool existed, for example `["read", "bash", "mcp__x__*"]`) is not offered it,
+and the router refuses it. Such a run gets the skill hint from before the tool
+instead: each list line ends with `[read <skills dir>/<name>/SKILL.md]`, and the
+model is told to read SKILL.md with the `read` tool. So are the sub-agent
+skill-read refusal's advice (it names `read`, not `load_skill`) and the size the
+list may take (the path is part of each line). Its skills stay readable, at the
+cost they had before: the read starts a sandbox. Add `load_skill` to the list to
+get the sandbox-free load. `load_skill` is in the default `HITL_AUTO_ALLOW`, next
+to `read`, so enabling HITL does not ask for approval to load a skill.
+
 Limits: 50 entries and 8000 characters of list; further default skills are
 summarized as "N more skills not listed". Keep SKILL.md short (about 300 lines)
 and move detail into files next to it, which the agent reads only when SKILL.md

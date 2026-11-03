@@ -20,7 +20,7 @@ import { bashApprovalFromEnvValue, bashApprovalPolicyFrom } from "./bash-approva
 import { DecisionDispatcher } from "../delivery/decision-dispatcher.js";
 import { connectPlatformMcp } from "../clients/mcp.js";
 import { buildPrompt, buildProgressiveSkillHint, listProgressiveSkills } from "./prompt.js";
-import { SkillStore } from "./skill-store.js";
+import { SkillStore, LOAD_SKILL_TOOL } from "./skill-store.js";
 import { loadPlatformDefaults, resolveDefaultSkills, skillDescription, LazyDefaultSkills, type DefaultSkill } from "./platform-defaults.js";
 import { metrics } from "../infra/metrics.js";
 import { createAnthropicClient } from "../llm/anthropic-provider.js";
@@ -187,6 +187,15 @@ export class AgentEngine {
         })
       : [];
 
+    // The tools the run may use at all (`tools_allowlist`), read once for everything below that asks:
+    // the prompt (is `load_skill` among them?), the router and the schemas the model is offered.
+    // No field, or an empty one, is no restriction.
+    const toolAllowlist = parseToolAllowlist(request.tools_allowlist);
+    // A run whose list leaves `load_skill` out (any list written before the tool existed) is not offered
+    // it, and the router refuses it. Its prompt must not send the model there: it gets the skill hint
+    // from before the tool, which reads SKILL.md with `read`.
+    const loadSkillAllowed = !toolAllowlist || toolAllowlist.allows(LOAD_SKILL_TOOL);
+
     // Plugin skills, staged on Brain by resolvePluginToolsFromMessage. A skill
     // the request overrode under the same name (local / marketplace) is not the
     // plugin's any more and is left to the paths that own it.
@@ -207,7 +216,7 @@ export class AgentEngine {
     // contains is one the agent cannot know to use.
     const pluginProgressive = PROGRESSIVE_SKILLS_ENABLED
       ? (() => {
-          const fits = new Set(listProgressiveSkills([...defaultProgressive, ...pluginSkills]).listed.map((s) => s.name));
+          const fits = new Set(listProgressiveSkills([...defaultProgressive, ...pluginSkills], sessionDir, loadSkillAllowed).listed.map((s) => s.name));
           return pluginSkills.filter((s) => fits.has(s.name));
         })()
       : [];
@@ -223,7 +232,7 @@ export class AgentEngine {
     const lazySkillList = [...defaultProgressive, ...(pluginNeedsSandbox ? [] : pluginSkills)];
     const lazySkills = lazySkillList.length ? new LazyDefaultSkills(lazySkillList, onEvent, sessionDir) : undefined;
     if (defaultProgressive.length) {
-      metrics.onPlatformDefaultChat(buildProgressiveSkillHint(defaultProgressive, sessionDir).length);
+      metrics.onPlatformDefaultChat(buildProgressiveSkillHint(defaultProgressive, sessionDir, loadSkillAllowed).length);
     }
 
     // A session bound to a repository has it set up now: the sandbox is opened
@@ -253,6 +262,7 @@ export class AgentEngine {
       },
       progressiveSkills,
       repoBlock,
+      loadSkillAllowed,
     );
 
     logger.info({
@@ -354,7 +364,6 @@ export class AgentEngine {
       // `tools_allowlist`: what the model is offered, and what the router will
       // run, both read from the one parsed list. No field, or an empty one, is
       // no restriction and leaves both exactly as they were.
-      const toolAllowlist = parseToolAllowlist(request.tools_allowlist);
       router.setToolAllowlist(toolAllowlist);
       const allToolSchemas = filterToolSchemas([...router.getToolSchemas(), ...mcpResult.schemas], toolAllowlist);
 
