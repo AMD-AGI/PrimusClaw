@@ -87,20 +87,24 @@ function unquoted(text: string): string {
     .replace(/"[^"\n]*"/g, " ")
     .replace(/“[^”\n]*”/g, " ")
     .replace(/[「『][^」』\n]*[」』]/g, " ")
-    // wording() has already turned a curly apostrophe into a straight one, so ‘…’ arrives as ‘…'.
-    .replace(new RegExp(`(?<![${inWord}])['‘][^'‘\\n]*'(?![${inWord}])`, "gu"), " ");
+    // wording() has already turned a curly apostrophe into a straight one, so ‘…’ arrives as ‘…'. An apostrophe between
+    // two letters belongs to its word, also inside the quotation ('I don't know').
+    .replace(new RegExp(`(?<![${inWord}])['‘](?:[^'‘\\n]|(?<=[${inWord}])'(?=[${inWord}]))*'(?![${inWord}])`, "gu"), " ");
 }
 
 /**
- * Whether the message opens with a sentence of the user's in Chinese, Japanese or Korean: a run of those characters
- * that has grammar of its own, with no English function word before it. English that follows it is then what the
- * sentence is about ("帮我 check the build and then fix it please"), however much of it there is. When English comes
- * first, the English is the frame and the characters are what it asks about ("What does 我爱你 mean?").
+ * Whether the message opens in Chinese, Japanese or Korean: it begins with a run of those characters, or its first run
+ * with grammar of its own (see HAN_FRAME; any kana or Hangul) has no English function word before it. English that
+ * follows is then what the user's sentence is about ("翻译 this paragraph into English", "帮我 check the build and then
+ * fix it please"), however much of it there is. When English comes first, the English is the frame and the characters
+ * are what it asks about ("What does 我爱你 mean?").
  */
 function opensInCjk(text: string): boolean {
   for (const run of text.matchAll(CJK_RUN)) {
+    const before = text.slice(0, run.index);
+    if (!/[\p{L}\p{N}]/u.test(before)) return true;
     const hasGrammar = /[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(run[0]) || [...run[0]].some((c) => HAN_FRAME.has(c));
-    if (hasGrammar) return englishWords(text.slice(0, run.index)) === 0;
+    if (hasGrammar) return englishWords(before) === 0;
   }
   return false;
 }

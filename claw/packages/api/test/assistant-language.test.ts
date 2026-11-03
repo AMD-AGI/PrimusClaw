@@ -63,6 +63,12 @@ test("L1c a quotation is not the user's sentence, and a message that opens in Ch
     ["帮我翻译一下：Please fix the build and then deploy it. The nightly job has been red since yesterday and nobody has looked at it.", "Chinese"],
     ["ビルドを check the build and then fix it please", "Japanese"],
     ["빌드가 왜 깨졌는지 check the build and then fix it please", "Korean"],
+    // The message opens with Chinese, whatever it is made of; and an apostrophe inside a quoted English sentence belongs to its word.
+    ["翻译 'I don't know' into Chinese", "Chinese"],
+    ["翻译 this paragraph into English", "Chinese"],
+    ["翻译成中文：'I don't think the build is fixed, and it isn't what we want'", "Chinese"],
+    ["翻译成中文：“I don’t think the build is fixed, and it isn’t what we want”", "Chinese"],
+    ["翻译成中文：‘I don’t think the build is fixed, and it isn’t what we want’", "Chinese"],
     // Whatever the quotation marks, when the Chinese around them has no grammar word of its own to open the message with.
     ["翻译成中文：\"Please fix the build and then deploy it\"", "Chinese"],
     ["翻译成中文：“Please fix the build and then deploy it”", "Chinese"],
@@ -70,6 +76,8 @@ test("L1c a quotation is not the user's sentence, and a message that opens in Ch
     ["翻译成中文：‘Please fix the build and then deploy it’", "Chinese"],
     ["翻译成中文：「Please fix the build and then deploy it」", "Chinese"],
     // An English user asking about a Chinese, Japanese or Korean one.
+    ["Please translate 'I don't know' into Chinese", "English"],
+    ["What does '你好' mean? I don't get it", "English"],
     ["What does \"你好\" mean?", "English"],
     ["Translate “这个构建为什么一直是红的” into English, please", "English"],
     ["Please translate '日本語のビルドエラー' into English for me", "English"],
@@ -77,6 +85,8 @@ test("L1c a quotation is not the user's sentence, and a message that opens in Ch
     ["Can you check why the nightly build is red? The error says \"找不到模块\"", "English"],
     ["What does 我爱你 mean?", "English"],
     ["Please translate 帮我看一下这个 into English", "English"],
+    // A pasted line with one function word among many is not an English sentence, however much of it there is.
+    ["npm ERR missing script build for the package json 报错信息 scripts section", "Chinese"],
     // An apostrophe inside a word is not a quote.
     ["I don't know what the 帮助 doc says, it isn't clear", "English"],
     ["The users' list isn't what I'd expect, and 我的 items are missing", "English"],
