@@ -34,8 +34,8 @@ record it.
   change a pull request, reply to or resolve a review thread) that each wait for the user's decision. The
   owner's token is read by the API per call, from the session the signed token names; it never travels in
   the server entry. See `claw/docs/github-mcp.md`.
-- Built-in bash approval rules for GitHub writes from the shell (`git push` force / delete forms and pushes
-  to `main` / `master`, writing `gh pr` / `gh issue` / `gh release` / `gh api` / `gh repo` / `gh workflow` /
+- Built-in bash approval rules for GitHub writes from the shell (`git push` force / delete forms, pushes
+  to `main` / `master` and pushes that do not name their destination, writing `gh pr` / `gh issue` / `gh release` / `gh api` / `gh repo` / `gh workflow` /
   `gh secret` / `gh variable` / `gh label` / `gh run` / `gh gist` / key / cache commands, a GraphQL mutation,
   and `curl` / `wget` writes to `api.github.com`), on unless `BASH_APPROVAL_DEFAULTS_ENABLED=false`. A run with
   no approval channel now has these commands denied instead of run. The outbound-actions pack gains the same

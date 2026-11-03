@@ -340,7 +340,8 @@ function httpInfo(seg: Segment): Http | null {
   return null;
 }
 
-const bare = (u: string) => u.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "").toLowerCase();
+/** The URL without its scheme and without credentials before the host (`user:token@`), so a prefix sees the host. */
+const bare = (u: string) => u.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "").replace(/^[^/?#@\s]*@/, "").toLowerCase();
 
 function fail(msg: string): never { throw new Error(msg); }
 

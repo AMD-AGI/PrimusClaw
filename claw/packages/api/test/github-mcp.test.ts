@@ -213,6 +213,19 @@ describe("B what a call does", () => {
     assert.equal(r.text, `[${keptLines - 2} earlier lines not shown]\n${line(last - 1)}${line(last)}`);
   });
 
+  test("B4c one chunk larger than the kept tail is cut to its end", async () => {
+    const line = (i: number) => `line ${String(i).padStart(9, "0")} ${"y".repeat(48)}\n`;
+    const n = (2 * MAX_LOG_BYTES) / line(0).length + 5;
+    const big = Buffer.from(Array.from({ length: n }, (_, i) => line(i)).join(""));
+    respond = (url) => url.hostname === "github.api.test"
+      ? new Response(null, { status: 302, headers: { location: "https://logs.blob.test/job/9?sig=x" } })
+      : new Response(new ReadableStream<Uint8Array>({ start(c) { c.enqueue(big); c.enqueue(Buffer.from("tail\n")); c.close(); } }), { status: 200 });
+    const r = await call(await connect(token()), "job_logs", { repo: "o/r", job_id: 9, tail_lines: 3 });
+    assert.equal(r.isError, false, r.text);
+    // 5 bytes of "tail\n" push the cut 5 bytes into a line, which comes back as a partial first line.
+    assert.equal(r.text, `[${MAX_LOG_BYTES / line(0).length - 1} earlier lines not shown]\n${line(n - 1)}tail\n`);
+  });
+
   test("B5 a write sends exactly what was asked", async () => {
     respond = () => json({ number: 7, title: "new", state: "closed", head: { sha: "abc" }, base: { ref: "main" } });
     const r = await call(await connect(token()), "pr_update", { repo: "o/r", number: 7, title: "new", state: "closed" });

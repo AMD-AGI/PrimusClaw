@@ -120,11 +120,14 @@ async function tailBytes(body: ReadableStream<Uint8Array> | null, max: number): 
     for (let r = await reader.read(); !r.done; r = await reader.read()) {
       kept.push(r.value);
       size += r.value.length;
-      while (size - kept[0].length >= max) size -= kept.shift()!.length;
+      while (size > max) {
+        const over = size - max;
+        if (kept[0].length <= over) size -= kept.shift()!.length;
+        else { kept[0] = kept[0].slice(over); size = max; }
+      }
     }
   }
-  const all = Buffer.concat(kept, size);
-  return all.subarray(Math.max(0, all.length - max));
+  return Buffer.concat(kept, size);
 }
 
 export function buildGithubToolServer({ gh, fetchImpl = fetch }: GithubToolDeps): McpServer {

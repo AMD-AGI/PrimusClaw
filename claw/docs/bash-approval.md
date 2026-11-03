@@ -84,7 +84,7 @@ approval request.
 
 | Rule | Held | Runs without asking |
 |---|---|---|
-| `git push` | `git push` in any form, `git -C dir push`, `git --git-dir=... push`; the **force / delete** forms (`--force`, `-f`, `--force-with-lease`, `--delete`, `-d`, `--mirror`, `--prune`, `+ref`, `:ref`) and a push whose destination is **`main` / `master`** (`origin main`, `HEAD:main`, `HEAD:refs/heads/master`) are labelled separately | `status`, `log`, `diff`, `fetch`, `pull`, `clone`, `checkout`, `branch`, `commit`, `stash` (also `stash push`), `remote`, `config` |
+| `git push` | `git push` in any form, `git -C dir push`, `git --git-dir=... push`; the **force / delete** forms (`--force`, `-f`, `--force-with-lease`, `--delete`, `-d`, `--mirror`, `--prune`, `+ref`, `:ref`) and a push to **`main` / `master`** (`origin main`, `HEAD:main`, `HEAD:refs/heads/master`) or to a branch the command does not name (no refspec, `HEAD`, `--all`: whatever is checked out, which may be `main`) are labelled separately | `status`, `log`, `diff`, `fetch`, `pull`, `clone`, `checkout`, `branch`, `commit`, `stash` (also `stash push`), `remote`, `config` |
 | `gh pr` | `create`, `merge`, `close`, `review`, `ready`, `edit`, `reopen`, `comment`, `update-branch` | `view`, `list`, `checks`, `diff`, `status`, `checkout` |
 | `gh issue` | `create`, `close`, `comment`, `edit`, `delete`, `reopen`, `transfer`, `lock`, `unlock`, `pin`, `unpin`, `develop` | `view`, `list`, `status` |
 | `gh release` | `create`, `edit`, `delete`, `upload`, `delete-asset` | `list`, `view`, `download` |
@@ -114,8 +114,11 @@ Things this pack does not do, beyond the limits above:
 - A GraphQL mutation is recognised by the word `mutation` in the command; a query held in a shell variable
   (`-f query="$Q"`) is not seen. A `gh api graphql` call with options before the word `graphql` is judged as
   an ordinary `gh api` call (held when it has fields).
-- A push to `main` is recognised by its destination; a bare `git push` while `main` is checked out is held as
-  a plain push only where the pack's `git push` rule is in force (the built-in rules do not have it).
+- A push to `main` is recognised by its destination as written. The built-in rules let a push that names a
+  feature branch run (`git push origin feat/x`, `git push -u origin HEAD:feat/x`) and hold one that does not
+  name its destination (`git push`, `git push -u origin HEAD`).
+- An `http` rule's `url_prefix` is compared after the scheme and any `user:token@` before the host are
+  dropped, so `https://x-access-token:...@api.github.com/...` is a call to `api.github.com`.
 - It does not cover `git` aliases, other HTTP clients (add an `http` rule), a GitHub Enterprise API host
   (add it to the `curl` / `wget` rule's `url_prefix`), `docker push`, or a script that does any of this.
 
