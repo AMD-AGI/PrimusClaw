@@ -440,6 +440,20 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- A sandbox that cannot start is now told to the user early and ended early. While a sandbox is held up, either
+  queued in the platform or admitted with nothing yet willing to run its pod, the turn's progress event says so with
+  the platform's own reason (`log`, plus additive `waiting` = `queued` | `unscheduled` and `waitReason`) as soon as the
+  platform reports it, instead of one "Waiting in queue (position 0)" and then ten minutes of nothing. A sandbox the
+  platform admitted whose pod no node has taken for `SANDBOX_UNSCHEDULABLE_TIMEOUT_SECONDS` (default 300, chart
+  `secret.sandboxUnschedulableTimeoutSeconds`, `0` turns it off) now ends with the new reason `sandbox_unschedulable`
+  naming the platform's reason, and its workload is stopped; before, it was waited on for the whole of
+  `SANDBOX_START_TIMEOUT_SECONDS` (15 minutes). A sandbox still in the platform's queue and one that is pulling an image
+  keep their existing, longer limits, and multi-node clusters and hosted applications are unchanged. When opening a
+  run's sandbox ends on `sandbox_unschedulable`, `sandbox_start_timeout` or `sandbox_pending_timeout`, the run no longer
+  provisions another for the rest of that turn (the model used to read a bare "did not become ready", call the tool
+  again, and make the user wait the whole time twice): the tool error tells the model the sandbox is unavailable and to
+  report the reason to the user, a further attempt is refused with the same error, and the workload the failed open left
+  is stopped and its binding reaped even though the run goes on.
 - A caller authenticated by an identity provider's access token (`CLAW_IDENTITY_TOKEN_AUTH_ENABLED`) now has
   the platform key and the virtual key SaFE holds for the token's subject, in the SaFE deployment mode. SaFE is never
   shown the person's token: the API exchanges it at the provider (RFC 8693 service delegation, subject token type

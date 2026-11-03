@@ -1084,6 +1084,26 @@ export const SANDBOX_PENDING_TIMEOUT_MS = envInt("SANDBOX_PENDING_TIMEOUT_SECOND
 // 0 waits indefinitely. Stored in ms; configured in seconds like the siblings.
 export const SANDBOX_START_TIMEOUT_MS = envInt("SANDBOX_START_TIMEOUT_SECONDS", 15 * 60) * 1000;
 
+// Maximum duration a sandbox the platform has ADMITTED may sit with nothing having
+// taken its pod -- no node has acknowledged it -- before the message fails
+// terminally with reason `sandbox_unschedulable`, the workload is stopped, and
+// the model is told to report it rather than open another. That is what a sandbox
+// that no node will run looks like (every node cordoned or down): waiting longer
+// does not change it, and the user is otherwise left on a progress bar for the
+// whole of the start ceiling above (15 minutes by default), twice over if the
+// model retries.
+//
+// Counted from the first read that shows the pod untaken and cleared the moment
+// anything takes it, so it measures an absence of progress and never the time a
+// healthy start (image pull, container boot) takes; that keeps its own, longer
+// ceiling above. It does NOT cover a workload still in the platform's queue (a
+// queue moves, and for a GPU sandbox can be hours): that is bounded by
+// SANDBOX_PENDING_TIMEOUT_SECONDS, and the user is told why it is waiting. Applies
+// to the sandbox a run opens, not to hosted applications or multi-node clusters.
+// Stored in ms; configured in seconds like the siblings. Default 5 minutes. 0
+// disables it (the previous behaviour: only the ceilings above end the wait).
+export const SANDBOX_UNSCHEDULABLE_TIMEOUT_MS = envInt("SANDBOX_UNSCHEDULABLE_TIMEOUT_SECONDS", 5 * 60) * 1000;
+
 // The same ceiling for a multi-node GPU cluster, off by default. A cluster's
 // start is routinely longer than a single sandbox's -- large GPU images, and an
 // Infera cluster is not ready until every role pod is up while the workload

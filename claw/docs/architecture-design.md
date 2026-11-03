@@ -579,6 +579,21 @@ never trips it.
 A fourth ends a wait for a workload that no longer exists: consecutive 404s past a limit
 fail the message with reason `sandbox_gone`.
 
+A fifth is a shorter limit for a sandbox that cannot start at all, and it is the one place a
+single-node sandbox is treated differently from a cluster: `SANDBOX_UNSCHEDULABLE_TIMEOUT_SECONDS`
+(default 5 minutes) ends the wait with reason `sandbox_unschedulable` when the platform has admitted
+the workload (queue position 0) and nothing has taken its pod -- no address, start time or container,
+the shape of a pod every node refuses or ignores. Waiting longer does not change that, and the long
+start ceiling would otherwise leave the user on a progress bar for 15 minutes, twice when the model
+retries. It counts only an unbroken absence of progress, never queue time and never a sandbox that
+is pulling an image, and only the sandbox a run opens asks for it (`unschedulableTimeoutMs` on the
+shared loop, off by default, so multi-node clusters and hosted applications wait as before). While a
+sandbox waits in either way the loop reports it -- the platform's own reason in the progress event --
+as soon as the platform says so, not on the ten-minute tick. When a run's open ends on this, the start
+ceiling or the queue ceiling, the run refuses to open another sandbox for the rest of that turn, the
+model is told so in the tool error and told to report the reason to the user, and the workload is
+stopped and its pending binding reaped.
+
 **These bound multi-node GPU clusters on the same terms.** Single-node sandboxes and
 multi-node clusters are created with different bodies but waited on by one loop
 (`sandbox/workload-wait.ts`), so the poll rhythm, the reading of a status, and all four ways

@@ -10,6 +10,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import pino from "pino";
 import { Agent, fetch as undiciFetch } from "undici";
 import { withRouterFailover } from "../sandbox/sandbox-router.js";
+import { sandboxUnavailableOf } from "../sandbox/errors.js";
 import { metrics } from "../infra/metrics.js";
 import {
   isShellAddressingCall, resolveStart, restorePublicShellId, restoreStructuredShellId,
@@ -163,6 +164,20 @@ function errorText(err: unknown): string {
 }
 
 /**
+ * What the model reads when the sandbox could not be opened and will not be
+ * opened again this turn. The platform's reason is in `detail`; the rest is the
+ * instruction the run itself enforces (see the open latch in tasks/runner.ts),
+ * so the model is told what will happen rather than asked to behave.
+ */
+export function sandboxUnavailableText(detail: string): string {
+  return `Error: the sandbox could not be started: ${detail}\n`
+    + "It will not be started again during this turn, so every tool that runs in the sandbox "
+    + "will fail the same way. Tell the user plainly that the sandbox is unavailable and why "
+    + "(the reason above), and what you could not do because of it. Do not retry the call "
+    + "and do not call another tool that needs the sandbox; carry on only with what needs no sandbox.";
+}
+
+/**
  * What a sandbox tool's own deadline passing means, and what to do about it.
  *
  * What arrived before was `Error: MCP error -32001: Request timed out`, which
@@ -241,6 +256,12 @@ export function explainHandsError(
   toolName: string,
   args: Record<string, unknown> = {},
 ): string {
+  // The sandbox could not be opened and will not be this turn. Said before
+  // anything about the tool, because nothing about the tool is the matter: it
+  // never ran. The model is told to report it, since a model left to read a bare
+  // "did not become ready" calls the tool again, which is a second full wait.
+  const unavailable = sandboxUnavailableOf(err);
+  if (unavailable) return sandboxUnavailableText(errorText(err));
   const sandboxTool = isSandboxTool(toolName);
   if (isHandsToolTimeout(err)) {
     if (sandboxTool) return explainSandboxTimeout(toolName, args);
