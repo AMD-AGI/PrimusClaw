@@ -11,7 +11,7 @@
  *
  *   H  what is held for the acting user: a high-risk merge and a high-risk approval, each posted exactly as held, once, when they allow it
  *   A  the author of the pull request asks: no look at the requester's own GitHub, and the committer's account does the work
- *   Q  a base branch with a merge queue: refused before anything is written, before anyone is asked
+ *   Q  a base branch with a merge queue, shown by its rules or only by GitHub's own answer: refused before anything is written, before anyone is asked
  *   O  the acting user wrote the pull request: refused up front
  *   B  a session bound to one pull request: no tool call names another
  *   N  names: the footer, the marker and the repository's configuration file, and what an earlier release left behind
@@ -374,6 +374,56 @@ describe("Q a base branch with a merge queue", () => {
     e.gh.reviews = [];
     for (const event of EVENTS) assert.equal((await submit({ event })).body.status, "submitted", event);
     assert.equal((await get()).isError, false);
+  });
+});
+
+describe("Q (continued) a merge queue the rules do not show", () => {
+  // Classic branch protection ("require merge queue") is not a ruleset rule: only the pull request's own isMergeQueueEnabled says it.
+  test("Q7 a queue only GitHub's isMergeQueueEnabled shows is refused as merge_queue_required, for the requester's own account and someone else's, high risk or not, with nothing written and no one asked", async () => {
+    const cases: Array<[string, Parameters<typeof makeEnv>[1], () => void]> = [
+      ["the requester's own account", own, () => {}],
+      ["someone else's account", {}, () => {}],
+      ["someone else's account, high risk", {}, highRisk],
+      ["someone else's account, CI red: the queue is what is said, not CI", {}, () => { e.gh.checkRuns = [{ name: "test", status: "completed", conclusion: "failure" }]; }],
+    ];
+    for (const [name, over, setup] of cases) {
+      e = await env({}, over);
+      e.gh.rules = [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "test" }] } }];
+      e.gh.graphql.isMergeQueueEnabled = true;
+      setup();
+      const o = await merge();
+      assert.equal(o.isError, true, name);
+      assert.equal(reason(o), "merge_queue_required", `${name}: ${o.text}`);
+      assert.equal(e.gh.writes.length, 0, `${name} wrote`);
+      assert.equal(e.gh.calls.filter((c) => /\/reviews$/.test(c.path)).length, 0, `${name} even looked at the reviews`);
+      assert.deepEqual(await rows(), [], `${name} asked someone`);
+      assert.equal(e.gh.calls.some((c) => c.path === "/graphql" && JSON.stringify(c.body).includes("isMergeQueueEnabled")), true, `${name}: the field was never asked for`);
+    }
+  });
+
+  test("Q8 only a true isMergeQueueEnabled is a queue: false, null and an answer without the field are not", async () => {
+    for (const value of [false, null, undefined]) {
+      e = await env();
+      if (value === undefined) delete e.gh.graphql.isMergeQueueEnabled; else e.gh.graphql.isMergeQueueEnabled = value;
+      const o = await merge();
+      assert.equal(o.body.status, "merged", `${String(value)}: ${o.text}`);
+    }
+  });
+
+  test("Q9 a queue that GitHub reports after the acting user was asked refuses at their allow, with nothing written and the confirmation closed", async () => {
+    highRisk();
+    const id = String((await merge()).body.confirmation_id);
+    e.gh.graphql.isMergeQueueEnabled = true;
+    const r = await e.service.decide("u-bob", id, "allow");
+    assert.deepEqual([r.body.status, r.body.reason], ["refused", "merge_queue_required"]);
+    assert.equal(e.gh.writes.length, 0);
+    assert.equal((await rows())[0]?.status, "refused");
+  });
+
+  test("Q10 a review is not a merge: the same queue does not stop a comment, a request for changes or an approval", async () => {
+    e.gh.graphql.isMergeQueueEnabled = true;
+    e.gh.reviews = [];
+    for (const event of EVENTS) assert.equal((await submit({ event })).body.status, "submitted", event);
   });
 });
 

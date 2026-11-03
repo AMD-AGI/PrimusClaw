@@ -52,7 +52,7 @@ export class FakeGithub {
   rules: unknown = [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "test" }] } }];
   rulesStatus = 200;
   graphql: Record<string, any> = {
-    mergeStateStatus: "CLEAN", mergeable: "MERGEABLE", reviewDecision: "APPROVED", headRefOid: HEAD,
+    mergeStateStatus: "CLEAN", mergeable: "MERGEABLE", reviewDecision: "APPROVED", headRefOid: HEAD, isMergeQueueEnabled: false,
     reviewThreads: { totalCount: 0, nodes: [] },
   };
   /** What the next GraphQL calls answer, one entry each and in order, each laid over `graphql`; once used up, `graphql` itself. */

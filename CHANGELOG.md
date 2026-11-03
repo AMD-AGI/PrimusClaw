@@ -125,8 +125,9 @@ record it.
   may not approve or merge a pull request they wrote (`cannot_approve_own_pull_request`), refused before CI, the
   diff or any confirmation. A session may be bound to one pull request with
   `config.review_target = {owner, repo, number}`, set only at creation: every tool call that names another is
-  refused as `review_target_mismatch` before the acting user's credential is looked up. A merge into a branch whose
-  rules include a merge queue is refused as `merge_queue_required` before any approval is written. The review
+  refused as `review_target_mismatch` before the acting user's credential is looked up. A merge into a branch with a merge
+  queue (a `merge_queue` rule, or the pull request's own `isMergeQueueEnabled`, which also covers classic branch
+  protection) is refused as `merge_queue_required` before any approval is written. The review
   footer, the hidden run marker and the repository configuration file no longer carry the name of the chat
   integration: the footer name is `CLAW_GITHUB_REVIEW_AGENT_NAME` (default `Claw`), the marker is `claw-review:run`
   and the file is `.github/claw-review.yml`; the old marker and file are still read and never written. The

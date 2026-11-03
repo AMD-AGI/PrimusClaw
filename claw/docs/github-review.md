@@ -110,12 +110,15 @@ with their account (`delegation_off`).
   configuration. A held approval is posted alone: to approve and merge in one confirmation, a model calls
   `gh_pr_merge`.
 - **Merge queue.** A merge is refused (`merge_queue_required`) before anything is written, and before
-  anyone is asked to confirm, when the rules of the base branch (`GET /repos/{owner}/{repo}/rules/branches/{branch}`,
-  the same read that finds the required checks) include a `merge_queue` rule: this tool approves and
+  anyone is asked to confirm, when the base branch is merged through a merge queue: this tool approves and
   then merges directly, which such a branch refuses after the approval is already on the pull request.
-  Only rulesets are visible to that read; a merge queue set up through classic branch protection is not,
-  and GitHub's refusal there arrives after the approval (`not_mergeable`). Rules that cannot be read are
-  not a queue; they fail the CI gate (`ci_not_green`) before any write.
+  Two reads say it. The rules of the base branch (`GET /repos/{owner}/{repo}/rules/branches/{branch}`, the
+  same read that finds the required checks) include a `merge_queue` rule; that sees rulesets only. And
+  the pull request's `isMergeQueueEnabled` (the GraphQL read of its merge state, so no further request)
+  is true, which also covers a queue set up through classic branch protection. Either one refuses, a
+  `false`, a `null` and a missing field are not a queue, and a queue that appears after the acting user was
+  asked refuses at their allow. Rules that cannot be read are not a queue; they fail the CI gate
+  (`ci_not_green`) before any write.
 - **An approval.** An approval can merge a pull request by itself (GitHub's auto-merge), so
   `gh_review_submit` with `APPROVE` is posted only where `gh_pr_merge` would not stop: CI is
   green on the head commit (`ci_not_green`) and no review thread is open (`threads_unresolved`);
@@ -349,7 +352,6 @@ answer `reviews_unreadable`).
 - **A held write waits for a person.** A person who is asked by many can have ten high-risk writes
   waiting at once and then every further one is refused until they answer or the cards expire; there is no
   per-requester limit yet.
-- **A merge queue set up through classic branch protection** is not seen (see "Gates"), so a merge there can fail after the approval is posted.
 
 ## What it does not do
 
