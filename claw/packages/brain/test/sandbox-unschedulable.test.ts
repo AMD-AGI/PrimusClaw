@@ -58,7 +58,7 @@ const SCHEDULER_ACCOUNT =
 const INCIDENT_MESSAGE = `In queue - waiting for scale-up - ${SCHEDULER_ACCOUNT} - `
   + `NotTriggerScaleUp: pod didn't trigger scale-up: pool ${POOL}: NotTriggerScaleUp: `
   + "pod claw-sandboxes/claw-1785291793209-sandbox-x7k2p does not fit a new node of this pool: "
-  + "TaintToleration: node(s) had untolerated taint {example.amd.com/node-profile: user}";
+  + "TaintToleration: node(s) had untolerated taint {sandbox-nodes/profile: user}";
 /** The scheduler's account when the pod is one of a group, as it is on the live cluster for multi-node workloads: longer. */
 const POD_GROUP = ", PodGroup claw-sandboxes/claw-1785291793209-sandbox gets rejected due to "
   + "Pod claw-1785291793209-sandbox-x7k2p is unschedulable even after PostFilter";
@@ -70,7 +70,7 @@ const NOT_SCALING_MESSAGE = `In queue - waiting for scale-up - ${SCHEDULER_ACCOU
 const INCIDENT_SUMMARY =
   "no node can take the sandbox right now (7 nodes: 4 unschedulable, 3 restricted to other workloads), and no new node is being added";
 /** Everything the platform's text carries that the user is not shown. */
-const IDENTIFIERS = new RegExp([POOL, "claw-sandboxes", "claw-1785291793209", "x7k2p", "example\\.amd\\.com"].join("|"));
+const IDENTIFIERS = new RegExp([POOL, "claw-sandboxes", "claw-1785291793209", "x7k2p", "sandbox-nodes/profile"].join("|"));
 const incident = (phase = "NotReady", message = INCIDENT_MESSAGE): Body =>
   ({ phase, queuePosition: null, pods: null, message });
 /** The same pod once a node's kubelet has acknowledged it: pulling its image. */
@@ -222,7 +222,7 @@ test("the user is told in our words what the platform's text says, without its i
   // Whatever a message carries, none of it is repeated to the user.
   const messages = [
     INCIDENT_MESSAGE, SCALING_UP_MESSAGE, NOT_SCALING_MESSAGE,
-    `0/7 nodes are available: 7 node(s) had untolerated taint {example.amd.com/node-profile: ${POOL}}.`,
+    `0/7 nodes are available: 7 node(s) had untolerated taint {sandbox-nodes/profile: ${POOL}}.`,
   ];
   for (const message of messages) {
     for (const phase of ["NotReady", "Pending"]) {
@@ -292,7 +292,7 @@ test("the queue's own phrases are repeated as written, and anything else it says
     `In queue - capacity reservation ${POOL} was rejected`,
     "In queue - waiting for capacity service: claw-sandboxes/claw-1785291793209-sandbox-x7k2p not found",
     `In queue - ${"y".repeat(500)}`,
-    "In queue - waiting\nfor {example.amd.com/node-profile}",
+    "In queue - waiting\nfor {sandbox-nodes/profile}",
     "queued behind everything else",
   ]) {
     const w = readWaitingState(queued(2, message))!;
@@ -382,7 +382,7 @@ test("the incident: admitted, no pods, the platform saying why and that it will 
     assert.equal(r.clock.value, 310_000, phase);
     assert.deepEqual(r.gaveUp, [{ reason: "sandbox_unschedulable", phase: phase.toLowerCase() }]);
     const message = r.terminal[0]!.message!;
-    assert.match(message, new RegExp(`could not be scheduled: ${INCIDENT_SUMMARY.replace(/[()]/g, "\\$&")}`));
+    assert.ok(message.includes(`could not be scheduled: ${INCIDENT_SUMMARY}`), message);
     assert.doesNotMatch(message, IDENTIFIERS);
     // The user was told at the start, once, in our words.
     assert.equal(r.progress.length, 1);
