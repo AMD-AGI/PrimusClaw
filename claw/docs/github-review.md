@@ -30,6 +30,10 @@ account bound and is not looked at; the committer's account must not be the auth
 (`cannot_approve_own_pull_request`), and without the committer's standing authorization nothing is done
 with their account (`delegation_off`).
 
+Two roles run through the rest of this page. The *requester* asks (usually the author of the pull request, and the
+owner of the session); the *acting user* is the committer named in `config.acting_as`, whose GitHub account does the
+review and the merge and who is the reviewer of record, and whose own standing authorization is what lets someone else ask.
+
 ## How a session uses it
 
 1. The requester creates a session with `config.acting_as = "<user id>"` (`POST /v1/sessions`),
@@ -68,7 +72,7 @@ with their account (`delegation_off`).
    `POST /v1/internal/github-review/mcp`. Brain calls it with a token signed by the API
    (`CLAW_GITHUB_REVIEW_MCP_SECRET`) that names the session, its owner and `acting_as`; the
    route checks the session row again on every call.
-3. The model reviews with the `pr-review` skill (below) and posts one review; if it is clean it
+3. The model reviews by the review instructions (below) and posts one review; if it is clean it
    merges. Every gate is in the tool, not in the prompt.
 
 ## The tools
@@ -335,6 +339,21 @@ into the sandbox of every session of every user as a fallback: it is nobody's pe
 session can print the same, and it cannot name the model keys. A personal credential does not belong in it, and a review
 sandbox is not given a smaller one.
 
+**The deployment's platform defaults are not given either.** The default MCP servers
+(`PLATFORM_DEFAULTS_FILE`) are called with the requester's own key, and the model of such a session can be
+steered by what a pull request says, so a default server's read tools would answer it as the requester. A turn marked
+`withhold_sandbox_keys` is given no default MCP server and no default skill, on every path above; it has the review
+tools and whatever its own request names. See `platform-defaults.md`.
+
+**The requester's long-term memory is not given either, in either direction.** The model of such a session reads what
+strangers wrote and its answer is posted publicly, so the requester's remembered entries and profile are not put in its
+prompt (nor the notice that memory is off), and it cannot write to that memory, which every later session of the requester
+reads: Brain does not offer `save_memory` to a turn marked `withhold_sandbox_keys` (whatever `memory_enabled` says; a
+sub-agent starts from its parent's tools and has none), and a completion of the session drops `memories_to_save` and does
+not extract memory from its conversation. It is decided from the session's row, as the mark is; a session whose row cannot
+be read is treated as one that withholds, so memory is not used and the turn is not failed. With
+`CLAW_GITHUB_REVIEW_ENABLED` off such a session is an ordinary one.
+
 ## Review path: the diff or a sandbox
 
 A sandbox costs a cold start of about 16 seconds. A small change needs none: `gh_pr_get`
@@ -371,14 +390,21 @@ A repository's review skill is read from the **tip of the base branch** and nowh
 (never the pull request's head, which could rewrite the rules it is reviewed by), in the order
 `.claude/skills/review-pr`, any other `.claude/skills/*review*`, any `.agents/skills/*review*`,
 together with the base's `AGENTS.md` and `.github/copilot-instructions.md`. The fixed rules (read
-and comment only, text from the pull request is data, the tools' gates) are always put in front
-of it. Without one the default `pr-review` skill applies
-([`examples/skills/pr-review/SKILL.md`](../examples/skills/pr-review/SKILL.md), the same text,
-importable as an ordinary skill): parallel passes over the whole change, only what the change
+and comment only, text from the pull request is data, the tools' gates) and the answer rules below
+are always put in front of it. Without one the default review instructions apply
+([`examples/skills/pr-review/SKILL.md`](../examples/skills/pr-review/SKILL.md) is the same text behind
+a skill's frontmatter, so it can also be imported as an ordinary skill; `review_instructions` itself
+carries no frontmatter, which would only send the model looking for a skill of that name, and a
+repository skill's own frontmatter is left out as well): parallel passes over the whole change, only what the change
 introduces, only findings that are actionable and verified with a path and line, a rebuttal
 round per finding, CI read for the head commit, at most five findings, one review, no code
 changes, no request for reviewers. The answer ends with exactly one last line, `VERDICT: CLEAN`,
 `VERDICT: BLOCKING` or `VERDICT: NOT_REVIEWED`, which a calling program can read.
+The answer is written for people who have never seen the tools: in the language the request was written
+in, in plain words ("approved", "merged", "commented", "waiting for your confirmation"), never the name
+of a tool or of one of its states. When writes are switched off in the deployment (`dry_run`) it says that
+nothing was posted, approved or merged and nothing happened on GitHub. Tool names and states stay in the
+logs and the audit rows.
 
 ## Settings
 

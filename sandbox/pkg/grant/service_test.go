@@ -15,6 +15,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"errors"
 
@@ -957,6 +958,19 @@ func TestMeasurementTemplateDeniesEgress(t *testing.T) {
 	}
 }
 
+func TestIssueRejectsInvalidTemplateLayers(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	svc, priv, _, _ := testService(t, now)
+	req := sampleRequest(now.Add(time.Minute))
+	req.Templates[0].Spec = json.RawMessage(`{"fromImage":"example:latest","layers":[{"image":"layer:latest","from":"/layer","mount":"/opt/host"}]}`)
+	req.Attestation = signGrant(t, priv, req)
+	_, _, err := svc.Issue(context.Background(), req)
+	var op *OpError
+	if !errors.As(err, &op) || op.Status != http.StatusBadRequest {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestIssueRejectsReservedAppRunID(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	svc, priv, _, _ := testService(t, now)
@@ -976,5 +990,50 @@ func TestIssueRejectsReservedAppRunID(t *testing.T) {
 		if err := validateIssue(req, now); err != nil {
 			t.Fatalf("%s: err = %v", appRunID, err)
 		}
+	}
+}
+
+func TestFailSandboxKeepsTheCreateReason(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	svc, priv, _, _ := testService(t, now)
+	req := sampleRequest(now.Add(time.Hour))
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"sbx-1", "sbx-2"} {
+		if _, err := svc.BeginSandbox(context.Background(), BeginRequest{
+			GrantID: req.GrantID, Role: "measurement", SandboxID: id,
+			TemplateID: "ar-01ja-runner-g1", GPUs: 1, TimeoutSec: 60,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := svc.EndSandbox(context.Background(), req.GrantID, "sbx-1", "create_failed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.EndSandbox(context.Background(), req.GrantID, "sbx-2", "killed"); err != nil {
+		t.Fatal(err)
+	}
+	long := "pending_timeout: not running after 1m0s: " + strings.Repeat("\u00e9", 300)
+	for _, id := range []string{"sbx-1", "sbx-2"} {
+		if err := svc.FailSandbox(context.Background(), req.GrantID, id, long); err != nil {
+			t.Fatal(err)
+		}
+	}
+	view, err := svc.Get(context.Background(), req.GrantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reasons := map[string]string{}
+	for _, ref := range view.Sandboxes {
+		reasons[ref.ID] = ref.EndReason
+	}
+	got := reasons["sbx-1"]
+	if !strings.HasPrefix(got, "pending_timeout: ") || len(got) > endReasonLimit || !utf8.ValidString(got) {
+		t.Fatalf("sbx-1 reason=%q len=%d", got, len(got))
+	}
+	if reasons["sbx-2"] != "killed" {
+		t.Fatalf("sbx-2 reason=%q", reasons["sbx-2"])
 	}
 }
