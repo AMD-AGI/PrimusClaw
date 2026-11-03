@@ -449,10 +449,11 @@ record it.
   `ambiguous_item_ref`. The Router is told to call `work_create`, `work_send` and `work_stop` without a `say` in the
   same step and to speak after their results, so it no longer announces what a refused call did not do. The message
   it is answering is followed by a `[Reply language: X]` line (Chinese, Japanese, Korean or English, read from the
-  user's own words, or from their last ones when a worker's report woke it), so item titles in another language no
-  longer decide the language of a reply. A turn that ends with plain text and no `say`, which reached nobody, has its
-  text delivered as a `say`. The evaluation in `claw/packages/api/test/e2e/assistant-router-eval.ts` measures
-  all of this against a real model.
+  user's own words with what they quote left out, or from their last ones when a worker's report woke it), so item
+  titles in another language no longer decide the language of a reply. The line is on the request only: the
+  conversation turn written when the run completes holds the user's words from the run row, as they were sent. A
+  turn that ends with plain text and no `say`, which reached nobody, has its text delivered as a `say`. The
+  evaluation in `claw/packages/api/test/e2e/assistant-router-eval.ts` measures all of this against a real model.
 - A caller authenticated by an identity provider's access token (`CLAW_IDENTITY_TOKEN_AUTH_ENABLED`) now has
   the platform key and the virtual key SaFE holds for the token's subject, in the SaFE deployment mode. SaFE is never
   shown the person's token: the API exchanges it at the provider (RFC 8693 service delegation, subject token type
