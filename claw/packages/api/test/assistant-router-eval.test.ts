@@ -21,11 +21,16 @@
  *   R8  an item is named by its id or its number as the real tools read it; "#3" is item 3 and is counted as a number
  *   R8f a turn that ends in plain text and no say is delivered as a say, as the completion handler does, for a turn that answers the user
  *   R8e the model is sent the user's words with the reply-language line the API adds, and for a report, the language of the user's earlier words
+ *   R8h the verdict is "passed" only for the whole set: a subset that scores well shows its score and does not pass
  *   R9  against a real model the Router's dispatch decisions are at least 95% right, with items named as the real tools
  *       name them (EVAL_STRICT_IDS=0 scores the decisions apart from that); skips without a model
  */
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { createAssistantMcpServer } from "../src/assistant/mcp.js";
@@ -36,7 +41,7 @@ import {
 } from "./e2e/assistant-router-eval-cases.js";
 import {
   effectsOf, fixtureFor, gateReached, manifestOf, messagesLlm, numberFromEnv, pool, resolveItemRef, routerTools, runCase, sameEffects, scoreCase,
-  summarize, userTurn, type Block, type Llm, type ModelResponse,
+  summarize, userTurn, verdictOf, type Block, type Llm, type ModelResponse,
 } from "./e2e/assistant-router-eval-lib.js";
 
 const P = "mcp__assistant__";
@@ -427,6 +432,53 @@ test("R8d a setting that is not a number in range is refused rather than read as
   assert.equal(gateReached([], 0, 0.95), false, "no runs");
   assert.equal(gateReached([], Number.NaN, 0.95), false, "a count that is not a number");
   assert.equal(gateReached([1], 3, 0.95), false, "fewer runs than were asked for");
+});
+
+test("R8h the verdict is passed only for the whole set, and the summary line says how it was run", async () => {
+  assert.deepEqual(verdictOf([1], 1, 0.95, CASES.length, CASES.length), { full_set: true, passed: true });
+  assert.deepEqual(verdictOf([0.9], 1, 0.95, CASES.length, CASES.length), { full_set: true, passed: false }, "the whole set under the gate");
+  assert.deepEqual(verdictOf([1], 1, 0.95, 3, CASES.length), { full_set: false, passed: false }, "a subset that scores 100% does not pass");
+  assert.deepEqual(verdictOf([1, 1], 3, 0.95, CASES.length, CASES.length), { full_set: true, passed: false }, "fewer runs than asked for");
+
+  // The script itself, against a gateway that answers every call with a plain "hello": right for a case that expects no
+  // dispatch, so a subset made of such a case scores 100%.
+  const gateway = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ content: [{ type: "text", text: "Hello! How can I help?" }], stop_reason: "end_turn" }));
+    });
+  });
+  await new Promise<void>((resolve) => gateway.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${(gateway.address() as AddressInfo).port}`;
+  const script = fileURLToPath(new URL("./e2e/assistant-router-eval.ts", import.meta.url));
+  const run = (env: Record<string, string>) => new Promise<{ code: number | null; last: Record<string, unknown>; out: string }>((resolve, reject) => {
+    const child = spawn(process.execPath, ["--import", "tsx", script], {
+      env: { PATH: process.env.PATH ?? "", EVAL_BASE_URL: base, EVAL_MODEL: "stub", EVAL_KEY: "stub-key", EVAL_RUNS: "1", ...env },
+    });
+    let out = "";
+    child.stdout.on("data", (d) => { out += d; });
+    child.stderr.on("data", (d) => { out += d; });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      const line = out.trim().split("\n").filter((l) => l.startsWith("{")).at(-1);
+      resolve({ code, last: line ? JSON.parse(line) : {}, out });
+    });
+  });
+  try {
+    const subset = await run({ EVAL_CASES: "chat-01" });
+    assert.deepEqual(subset.last.accuracy, [1], subset.out);
+    assert.equal(subset.last.cases, 1);
+    assert.equal(subset.last.full_set, false);
+    assert.equal(subset.last.passed, false, "a subset does not pass");
+    assert.notEqual(subset.code, 0);
+    assert.match(subset.out, /a subset of the set \(1 of \d+ cases\)/);
+    assert.equal(subset.last.strict_ids, true, "the summary says how item references were read");
+    const lenient = await run({ EVAL_CASES: "chat-01", EVAL_STRICT_IDS: "0" });
+    assert.equal(lenient.last.strict_ids, false);
+  } finally {
+    gateway.close();
+  }
 });
 
 test("R8c the pool keeps the order of the results and the bound on what is in flight", async () => {

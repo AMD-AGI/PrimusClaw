@@ -407,6 +407,17 @@ export function gateReached(accuracies: readonly number[], runs: number, gate: n
   return runs > 0 && accuracies.length === runs && accuracies.every((a) => a >= gate);
 }
 
+/**
+ * What the summary line says. The gate is a statement about the whole set, so a run of a subset (`EVAL_CASES`) shows its
+ * scores and never passes: `passed` is true only when every case of the set was run and every run reached the gate.
+ */
+export function verdictOf(
+  accuracies: readonly number[], runs: number, gate: number, selected: number, total: number,
+): { full_set: boolean; passed: boolean } {
+  const full = selected === total;
+  return { full_set: full, passed: full && gateReached(accuracies, runs, gate) };
+}
+
 /** `work` over `items` with at most `n` in flight; results in the order of `items`. */
 export async function pool<T, R>(items: readonly T[], n: number, work: (item: T, i: number) => Promise<R>): Promise<R[]> {
   const out: R[] = new Array(items.length);
