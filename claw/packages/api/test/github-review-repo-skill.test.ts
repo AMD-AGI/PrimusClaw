@@ -8,7 +8,7 @@
  */
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
-import { PR_REVIEW_SKILL, FIXED_REVIEW_RULES } from "../src/github-review/default-skill.js";
+import { PR_REVIEW_INSTRUCTIONS, FIXED_REVIEW_RULES } from "../src/github-review/default-skill.js";
 import { GithubClient, parsePrRef } from "../src/github-review/github.js";
 import { reviewSkillCandidates, selectReviewInstructions } from "../src/github-review/repo-skill.js";
 import { BASE_TIP, FakeGithub, HEAD } from "./support/fake-github.js";
@@ -24,8 +24,66 @@ test("with nothing in the repository the default skill is used, read at the base
   const gh = new FakeGithub();
   const r = await pick(gh);
   assert.equal(r.source, "default");
-  assert.equal(r.text, PR_REVIEW_SKILL);
+  assert.equal(r.text, PR_REVIEW_INSTRUCTIONS);
   assert.equal(r.baseSha, BASE_TIP);
+});
+
+/** What the model must not be handed as "instructions": the frontmatter of a skill, which sends it looking for a skill of that name. */
+const FRONTMATTER = /^---\n[\s\S]*?\n---(\n|$)/;
+
+test("the default review instructions carry the rules and no skill frontmatter, with or without AGENTS.md", async () => {
+  for (const withAgents of [false, true]) {
+    const gh = new FakeGithub();
+    if (withAgents) gh.contents["AGENTS.md"] = "Use make test.";
+    const r = await pick(gh);
+    assert.equal(r.source, "default");
+    assert.doesNotMatch(r.text, FRONTMATTER, "no skill frontmatter");
+    assert.doesNotMatch(r.text, /^name: pr-review$/m);
+    assert.doesNotMatch(r.text, /\bpr-review skill\b/i);
+    assert.ok(r.text.includes(FIXED_REVIEW_RULES), "the fixed rules are in it");
+    assert.match(r.text, /You only read and comment/);
+    assert.match(r.text, /^# Pull request review/m);
+    assert.doesNotMatch(r.text, /default one applies|default skill/);
+  }
+});
+
+test("the fallbacks (base branch or repository unreadable) also hand over the instructions, not the skill file", async () => {
+  const gh = new FakeGithub();
+  gh.fail["/repos/AMD-AGI/demo/git/ref"] = { status: 500, message: "boom" };
+  const a = await pick(gh);
+  const gh2 = new FakeGithub();
+  gh2.fail["/repos/AMD-AGI/demo/contents"] = { status: 500, message: "boom" };
+  const b = await pick(gh2);
+  for (const r of [a, b]) {
+    assert.equal(r.text, PR_REVIEW_INSTRUCTIONS);
+    assert.doesNotMatch(r.text, FRONTMATTER);
+    assert.doesNotMatch(r.note ?? "", /skill/i);
+  }
+});
+
+test("a repository skill's own frontmatter is not handed over either; its body is", async () => {
+  const gh = new FakeGithub();
+  gh.dirs[".claude/skills"] = [{ name: "review-pr", type: "dir" }];
+  gh.contents[".claude/skills/review-pr/SKILL.md"] = "---\nname: review-pr\ndescription: Hyperloom review\n---\n# Hyperloom review\nEight steps.";
+  const r = await pick(gh);
+  assert.equal(r.source, "repository");
+  assert.doesNotMatch(r.text, /^name: review-pr$/m);
+  assert.doesNotMatch(r.text, /^description: Hyperloom review$/m);
+  assert.match(r.text, /# Hyperloom review\nEight steps\./);
+  assert.ok(r.text.includes(FIXED_REVIEW_RULES));
+  assert.doesNotMatch(r.text, /review skill/i, "it is said to be review instructions, not a skill to look up");
+});
+
+test("the instructions tell the model to answer in plain words, never in tool names or states, and what writes-off means", () => {
+  const answer = PR_REVIEW_INSTRUCTIONS.slice(PR_REVIEW_INSTRUCTIONS.indexOf("## Answer"));
+  assert.match(answer, /plain words/);
+  assert.match(answer, /language\s+(they|the person)\s+(wrote|asked)/i);
+  for (const raw of ["gh_pr_get", "gh_review_submit", "gh_pr_merge", "dry_run", "confirmation_required"]) {
+    assert.ok(answer.includes(`\`${raw}\``), `the answer section names ${raw} as something not to say`);
+  }
+  assert.match(answer, /never\s+(say|name|write|use)[^.]*(tool|status)/i);
+  // What a dry run is, in words a person can read: nothing happened on GitHub.
+  assert.match(PR_REVIEW_INSTRUCTIONS, /If a tool answers `dry_run`, writes are switched off[^.]*:\s+nothing[^.]*GitHub/);
 });
 
 test("candidates: review-pr first under .claude/skills, then any *review* by name; non-directories and other names are skipped", () => {
