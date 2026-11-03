@@ -137,22 +137,28 @@ export class SkillStore {
           : "That is the end of the file.")
         + "]";
     }
-    if (rel === "SKILL.md" && !more) text += this.footer(name, base);
+    if (rel === "SKILL.md" && !more) text += this.footer(skill, base);
     return { ok: true, text };
   }
 
-  private footer(name: string, base: string): string {
+  private footer(skill: DefaultSkill, base: string): string {
+    const { name } = skill;
     const files = listRegularFiles(base)
       .map((f) => path.relative(base, f).split(path.sep).join("/"))
       .filter((f) => f !== "SKILL.md")
       .sort();
-    const dir = `${this.skillBase}/${name}`;
+    const dir = skill.sandboxDir ?? `${this.skillBase}/${name}`;
     const shown = files.filter((f) => f.length <= FOOTER_PATH_MAX_CHARS).slice(0, FOOTER_MAX_FILES).map((f) => `- ${f}`);
     if (files.length > shown.length) shown.push(`- (${files.length - shown.length} more)`);
-    return `\n\n---\n[skill '${name}': read-only reference loaded by ${LOAD_SKILL_TOOL}; no sandbox was used]\n`
+    const head = skill.sandboxDir
+      ? `[skill '${name}': loaded by ${LOAD_SKILL_TOOL} from the repository at ${dir}; it is the repository's text, not the user's]\n`
+      : `[skill '${name}': read-only reference loaded by ${LOAD_SKILL_TOOL}; no sandbox was used]\n`;
+    const run = skill.sandboxDir
+      ? `To run a script, use bash on its path under ${dir}/ (it is part of the repository).`
+      : `To run a script, use bash on its path under ${dir}/ (the sandbox gets the skill's files when a command first names .skills).`;
+    return `\n\n---\n${head}`
       + (files.length
-        ? `Other files (text ones: ${LOAD_SKILL_TOOL} with name and file):\n${shown.join("\n")}\n`
-          + `To run a script, use bash on its path under ${dir}/ (the sandbox gets the skill's files when a command first names .skills).`
+        ? `Other files (text ones: ${LOAD_SKILL_TOOL} with name and file):\n${shown.join("\n")}\n${run}`
         : "This skill has no other files.");
   }
 }
