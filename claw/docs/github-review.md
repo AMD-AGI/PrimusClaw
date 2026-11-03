@@ -223,7 +223,7 @@ review and the merge and who is the reviewer of record, and whose own standing a
   `-- +goose` and `-- migrate:` lines, `//go:generate`, `//go:build`, a `+kubebuilder` marker, the
   C preprocessor, and a marker that switches a security scanner off for a line (`#nosec`,
   `checkov:skip`, `nolint:gosec` and the like) all count as changed content. A changed line longer
-  than 4000 characters (minified or generated code) is held rather than scanned, and so is a change
+  than 4000 characters (minified or generated code) is reported as evidence rather than scanned, and so is a change
   with more than 20 000 changed lines or two million characters, which is not read past that point.
   Every pattern that reads a line runs in time linear in its length (the author of a pull request
   may be outside the organisation, and the rules run in the API's own process:
@@ -255,7 +255,10 @@ review and the merge and who is the reviewer of record, and whose own standing a
   `risk.rule_level` (whether the rules saw anything) and `risk.categories` (`architecture`, `interface`,
   `security`, `ci_release`, `dependency`, `size_breadth`, `integrity`, `provenance`, `reviewer`);
   `gh_pr_get`, before any judgement, gives the evidence, the hard holds and the guidance. The audit row
-  keeps the reasons and the evidence (marked `evidence:`).
+  keeps the reasons and the evidence (marked `evidence:`). A `low` without a reason is no judgement.
+  An approval or a merge of a head commit for which an earlier approval or merge already waits for the
+  acting user, or was refused by them, is held too, whatever the later call says: a lower judgement on a
+  second call, or the other of the two tools, does not get past their decision.
 
   A merge or an approval that needs confirmation creates one pending row for the head commit and
   writes nothing.

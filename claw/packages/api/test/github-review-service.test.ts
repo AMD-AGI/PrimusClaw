@@ -617,6 +617,8 @@ describe("M2 what the change was, and what an approval may do", () => {
     assert.equal((await submit({ event: "REQUEST_CHANGES", body: "Please fix." })).isError, false);
     e.gh.checkRuns = [{ name: "test", status: "completed", conclusion: "success" }];
     e.gh.files = [{ filename: "src/app.ts", status: "modified", additions: 3, deletions: 1, patch: "@@ -1,4 +1,6 @@\n a\n-b\n+b2\n+c\n+d\n e\n f" }];
+    // The held approval above was of the workflow change; with it still waiting, this one would wait too (M14b).
+    await e.sql("DELETE FROM claw_github_confirmations");
     const ok = await submit({ event: "APPROVE" });
     assert.equal(ok.body.status, "submitted", ok.text);
     assert.deepEqual(e.gh.writes.map((w) => w.body.event), ["COMMENT", "REQUEST_CHANGES", "APPROVE"]);
@@ -677,6 +679,25 @@ describe("M4 what the change does, and the reviewer's judgement of it", () => {
     assert.equal(e.gh.calls.filter((c) => c.method === "PUT").length, 1, "only the first merge was made");
   });
 
+  test("M14b a write already held for this commit, or refused by the acting user, holds every later approval or merge of it, whatever the later call judges", async () => {
+    e.gh.files = drain;
+    const high = { level: "high", reason: "changes what callers see on shutdown" };
+    assert.equal((await submit({ event: "APPROVE", risk_judgement: high })).body.status, "confirmation_required");
+    const merged = await merge();
+    assert.equal(merged.body.status, "confirmation_required", "a low judgement on the merge does not get past the held approval");
+    assert.match((merged.body.reasons as string[])[0] ?? "", /already waits for bob's decision/);
+    assert.equal((await submit({ event: "APPROVE" })).body.status, "confirmation_required", "nor does a second approval");
+    assert.equal(e.gh.writes.length, 0);
+    assert.equal(puts().length, 0);
+    await e.sql("UPDATE claw_github_confirmations SET status = 'denied'");
+    const after = await merge();
+    assert.equal(after.body.status, "confirmation_required", "a refusal stands for the commit it was about");
+    assert.match((after.body.reasons as string[])[0] ?? "", /bob refused an approval or a merge of this commit/);
+    // Another commit is another question.
+    await e.sql("UPDATE claw_github_confirmations SET head_sha = $1", ["f".repeat(40)]);
+    assert.equal((await merge()).body.status, "merged");
+  });
+
   test("M15 the reviewer's reason is a clipped line with the token masked: it is written for a card and cannot carry a credential or markup", async () => {
     e.gh.files = drain;
     const o = await merge({ risk_judgement: { level: "high", reason: `see ${TOKEN}\nand <b>this</b> ${"x".repeat(900)}` } });
@@ -698,7 +719,8 @@ describe("M3 the model's flags", () => {
       assert.match(String((o.body.reasons as string[]).join()), /security issue|skipped a step/);
     }
     assert.equal(e.gh.writes.length, 0);
-    // The same call without flags is a clean approval; a flag does not hold a comment.
+    // The same call without flags is a clean approval once the held ones are gone (while they wait, it waits too: M14b); a flag does not hold a comment.
+    await e.sql("DELETE FROM claw_github_confirmations");
     assert.equal((await submit({ event: "COMMENT", risk_flags: ["security_finding"] })).isError, false);
     assert.equal((await submit({ event: "APPROVE" })).body.status, "submitted");
     assert.equal((await merge({ risk_flags: ["security_finding"] })).body.status, "confirmation_required");
@@ -729,7 +751,7 @@ describe("M4 a change the diff does not show, and a lock file", () => {
       assert.equal((await submit({ event: "APPROVE", risk_judgement: undefined })).body.status, "confirmation_required", what);
       const m = await merge({ risk_judgement: { level: "high", reason: "a binary nobody can read in the diff" } });
       assert.equal(m.body.status, "confirmation_required", what);
-      assert.equal((m.body.reasons as string[])[0], "the reviewer's judgement: a binary nobody can read in the diff", what);
+      assert.ok((m.body.reasons as string[]).includes("the reviewer's judgement: a binary nobody can read in the diff"), what);
       assert.equal(e.gh.writes.length, 0, what);
       assert.equal(puts().length, 0, what);
     }
@@ -763,7 +785,7 @@ describe("M4 a change the diff does not show, and a lock file", () => {
       assert.equal((await submit({ event: "APPROVE", risk_judgement: undefined })).body.status, "confirmation_required", what);
       const m = await merge({ risk_judgement: { level: "high", reason: "swaps a file the diff cannot show" } });
       assert.equal(m.body.status, "confirmation_required", what);
-      assert.equal((m.body.reasons as string[])[0], "the reviewer's judgement: swaps a file the diff cannot show", what);
+      assert.ok((m.body.reasons as string[]).includes("the reviewer's judgement: swaps a file the diff cannot show"), what);
       assert.equal(e.gh.writes.length, 0, what);
       assert.equal(puts().length, 0, what);
     }

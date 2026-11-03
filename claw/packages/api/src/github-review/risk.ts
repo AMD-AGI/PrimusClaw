@@ -142,9 +142,9 @@ export const HOLD_GUIDANCE = "Your risk_judgement decides whether an approval or
   + "A missing judgement holds.";
 
 /**
- * The reviewer's judgement as it is kept: a `low` or a `high`, its reason one clipped line without control characters or markup that
- * could dress it up on a card, with `mask` (the token and secret masking of the tool answers) applied to it. Anything else is no
- * judgement, which holds.
+ * The reviewer's judgement as it is kept: a `low` with a reason or a `high`, the reason one clipped line without control characters or
+ * markup that could dress it up on a card, with `mask` (the token and secret masking of the tool answers) applied to it. Anything else
+ * is no judgement, which holds.
  */
 export function normaliseJudgement(raw: unknown, mask: (text: string) => string = (t) => t): ReviewerJudgement | null {
   if (typeof raw !== "object" || raw === null) return null;
@@ -154,7 +154,8 @@ export function normaliseJudgement(raw: unknown, mask: (text: string) => string 
     // eslint-disable-next-line no-control-regex
     .replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, " ").replace(/[`<>]/g, "'").replace(/\s+/g, " ").trim();
   const clipped = text.length > MAX_JUDGEMENT_REASON_CHARS ? `${text.slice(0, MAX_JUDGEMENT_REASON_CHARS - 1)}…` : text;
-  if (level === "low") return { level, reason: clipped };
+  // A low with nothing said for it is no judgement: the hold is lifted only by a reviewer who says why.
+  if (level === "low") return clipped ? { level, reason: clipped } : null;
   return { level, reason: clipped || "the reviewer judged this change high risk and gave no reason" };
 }
 

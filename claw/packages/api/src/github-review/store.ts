@@ -316,6 +316,22 @@ export async function countPendingConfirmations(db: Queryable, actorUserId: stri
   return Number((r.rows[0] as { n: number }).n);
 }
 
+/**
+ * Whether an approval or a merge of this head commit, with this acting user's account, is already waiting for them or was refused by
+ * them: a later call for the same commit must not make that write without them, whatever it says of the change.
+ */
+export async function heldOrDeniedOn(db: Queryable, actorUserId: string, repo: string, pr: number, headSha: string): Promise<"pending" | "denied" | null> {
+  const r = await db.query(
+    `SELECT status FROM claw_github_confirmations
+      WHERE actor_user_id = $1 AND repo = $2 AND pr = $3 AND head_sha = $4
+        AND ((status = 'pending' AND expires_at > NOW()) OR status = 'denied')
+      ORDER BY status = 'denied' DESC LIMIT 1`,
+    [actorUserId, repo, pr, headSha],
+  );
+  const status = (r.rows[0] as { status?: string } | undefined)?.status;
+  return status === "pending" || status === "denied" ? status : null;
+}
+
 export async function getConfirmation(db: Queryable, id: string): Promise<Confirmation | null> {
   const r = await db.query("SELECT * FROM claw_github_confirmations WHERE confirmation_id = $1", [id]);
   return r.rows[0] ? toConfirmation(r.rows[0] as Record<string, unknown>) : null;

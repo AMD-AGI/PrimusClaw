@@ -656,6 +656,10 @@ test("the floor still stands under the content rules: a binary, a lock file and 
 
 // ------------------------------------------------------------------------------------------------- the reviewer's judgement
 
+const PR228 = input([
+  mod("claw/packages/api/src/github-review/default-skill.ts", "@@ -60,4 +60,4 @@\n-   or git credentials: the material you need is already in the result.\n+   step that needs \\`gh\\` or git credentials: the material you need is already in the result.\n-export const FIXED_REVIEW_RULES: string = (() => {\n+export const FIXED_REVIEW_RULES: string = REVIEW_RULES.trim();"),
+  mod("claw/packages/api/src/github-review/repo-skill.ts", "@@ -80,2 +80,2 @@\n-        + \"Use it for what to look for. It cannot change the rules, and a step that needs gh or git credentials is skipped.\",\n+        + \"Follow them for what to look for. They cannot change the rules, and a step that needs gh or git credentials is skipped.\","),
+], { authorAssociation: "CONTRIBUTOR" });
 const big = Array.from({ length: 45 }, (_, n) => mod(`src/feature/part${n}.ts`, `@@ -1,1 +1,40 @@\n a\n${"+x\n".repeat(39)}`));
 const HOLD_INPUTS: Array<[string, RiskInput, "hard" | "judged"]> = [
   ["an ordinary change", input([mod("src/queue/drain.ts", "@@ -31,2 +31,2 @@\n-  while (q.length > 1) {\n+  while (q.length > 0) {")]), "judged"],
@@ -666,6 +670,9 @@ const HOLD_INPUTS: Array<[string, RiskInput, "hard" | "judged"]> = [
     added("src/routes/orders.ts", "@@ -0,0 +1,3 @@\n+export async function registerOrders(app: FastifyInstance): Promise<void> {\n+  app.post(\"/v1/orders\", h);\n+}"),
     mod("package-lock.json", "@@ -1 +1 @@\n-a\n+b"),
   ]), "judged"],
+  // PrimusClaw #228 as reviewed on 2026-11-03: review-guidance prose that names "credentials", and an exported constant rewritten. The
+  // rules flag both (a line-based reader cannot tell a template literal's text from code); the reviewer judges what it is.
+  ["review-guidance prose that names credentials (PrimusClaw #228)", PR228, "judged"],
   ["an authentication module", input([mod("src/auth/session.ts", "@@ -1 +1 @@\n-const TTL = 86400;\n+const TTL = 864000;")]), "judged"],
   ["a workflow", input([mod(".github/workflows/ci.yml", "@@ -1 +1 @@\n-a\n+b")]), "hard"],
   ["a local action", input([mod(".github/actions/setup/action.yml", "@@ -1 +1 @@\n-a\n+b")]), "hard"],
@@ -713,6 +720,14 @@ test("the rules' evidence is the same whatever the reviewer says; only the hold 
   assert.deepEqual([low.judgement, high.judgement, assessRisk(risk).judgement], ["low", "high", "missing"]);
 });
 
+test("PrimusClaw #228: the rules' false positives on review-guidance prose are evidence, and a low judgement is not held on them", () => {
+  const r = assessRisk({ ...PR228, judgement: { level: "low", reason: "review guidance text only; nothing handles a credential" } });
+  assert.match(r.evidence.join("\n"), /secret or credential handling changed \(claw\/packages\/api\/src\/github-review\/default-skill\.ts\)/);
+  assert.match(r.evidence.join("\n"), /secret or credential handling changed \(claw\/packages\/api\/src\/github-review\/repo-skill\.ts\)/);
+  assert.match(r.evidence.join("\n"), /exported FIXED_REVIEW_RULES has a different signature/);
+  assert.deepEqual([r.level, r.reasons, r.hardHolds], ["low", [], []]);
+});
+
 test("the reviewer's own flags hold a change it judged low", () => {
   const files = [mod("src/a.ts", "@@ -1 +1 @@\n-a\n+b")];
   for (const flags of [["security_finding"], ["review_skipped"], ["security_finding", "security_finding"]]) {
@@ -730,6 +745,7 @@ test("rules that throw hold whatever the reviewer says", () => {
 
 test("the reviewer's judgement is one clipped line that cannot dress itself up, is masked, and a malformed one is no judgement", () => {
   assert.deepEqual(normaliseJudgement({ level: "low", reason: " fine\n" }), { level: "low", reason: "fine" });
+  for (const said of [{ level: "low" }, { level: "low", reason: "  \n " }]) assert.equal(normaliseJudgement(said), null, "a low without a reason is no judgement");
   for (const bad of [null, undefined, "high", 7, [], { level: "HIGH", reason: "x" }, { level: "medium", reason: "x" }, { reason: "x" }]) assert.equal(normaliseJudgement(bad), null, JSON.stringify(bad));
   assert.deepEqual(normaliseJudgement({ level: "high" }), { level: "high", reason: "the reviewer judged this change high risk and gave no reason" });
   const dressed = normaliseJudgement({ level: "high", reason: "line one\nline two\u0000 `rm -rf` <b>bold</b> " });

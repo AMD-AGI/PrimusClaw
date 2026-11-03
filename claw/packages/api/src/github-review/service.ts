@@ -35,7 +35,7 @@ import { SANDBOX_RECIPE_USAGE, buildSandboxRecipe } from "./sandbox-recipe.js";
 import { GITHUB_PROVIDER, type GithubReviewSettings } from "./settings.js";
 import {
   auditFinish, auditStart, claimConfirmation, finishConfirmation, getConfirmation, openConfirmation,
-  countPendingConfirmations, recentWrites, reopenConfirmation, reserveWrite, reviewDigest, sessionRequestCount,
+  countPendingConfirmations, heldOrDeniedOn, recentWrites, reopenConfirmation, reserveWrite, reviewDigest, sessionRequestCount,
   type Confirmation, type DecidedVia, type HeldReview, type Queryable, type ReviewComment, type ReviewEvent,
 } from "./store.js";
 
@@ -229,7 +229,7 @@ export class GithubReview {
       const { repo, pr } = await this.load(ctx, ref);
       const change = await this.collectChange(ctx, ref, pr);
       const risk = assessRisk(this.riskInput(pr, repo, change));
-      ctx.acc.riskReasons = risk.evidence;
+      ctx.acc.riskReasons = risk.evidence.map((e) => `evidence: ${e}`);
       const state = await this.readState(ctx, ref, pr, repo);
       const instructions = await selectReviewInstructions(ctx.client, ref, pr.baseRef);
       const choice = chooseReviewPath({
@@ -730,6 +730,19 @@ export class GithubReview {
     };
   }
 
+  /**
+   * A write this call would make unasked is held after all when an approval or a merge of the same commit already waits for the acting
+   * user, or was refused by them: a later call with a lower judgement, or the other of the two tools, must not get past their decision.
+   */
+  private async heldBefore(ctx: Ctx, ref: PrRef, pr: PrInfo, risk: RiskResult): Promise<RiskResult> {
+    const earlier = await heldOrDeniedOn(this.deps.db, ctx.actor.actorUserId, `${ref.owner}/${ref.repo}`, ref.number, pr.headSha);
+    if (!earlier) return risk;
+    const reason = earlier === "denied"
+      ? `${ctx.cred.login} refused an approval or a merge of this commit before, so this one is theirs to decide as well`
+      : `an approval or a merge of this commit already waits for ${ctx.cred.login}'s decision, so this one waits as well`;
+    return { ...risk, level: "high", reasons: [reason, ...risk.reasons.filter((r) => r !== reason)] };
+  }
+
   /** The audit row keeps why a write was held and what the rules saw, the evidence marked as such. */
   private auditedReasons(risk: RiskResult): string[] {
     return [...risk.reasons, ...risk.evidence.filter((e) => !risk.hardHolds.includes(e)).map((e) => `evidence: ${e}`)];
@@ -827,7 +840,7 @@ export class GithubReview {
   private async requireApprovable(ctx: Ctx, ref: PrRef, repo: RepoInfo, pr: PrInfo, change: Change | null, flags: string[], judgement: ReviewerJudgement | null): Promise<RiskResult> {
     const read = change ?? await this.collectChange(ctx, ref, pr);
     // The reviewer's own flags and judgement count here as they do at the merge.
-    const risk = assessRisk(this.riskInput(pr, repo, read, flags, judgement));
+    const risk = await this.heldBefore(ctx, ref, pr, assessRisk(this.riskInput(pr, repo, read, flags, judgement)));
     ctx.acc.riskReasons = this.auditedReasons(risk);
     this.requireGreen(await this.readState(ctx, ref, pr, repo), pr.headSha);
     return risk;
@@ -957,7 +970,8 @@ export class GithubReview {
     }
 
     const change = await this.collectChange(ctx, ref, pr);
-    const risk: RiskResult = assessRisk(this.riskInput(pr, repo, change, opts.flags, opts.judgement));
+    const risk = opts.confirmation ? assessRisk(this.riskInput(pr, repo, change, opts.flags, opts.judgement))
+      : await this.heldBefore(ctx, ref, pr, assessRisk(this.riskInput(pr, repo, change, opts.flags, opts.judgement)));
     ctx.acc.riskReasons = this.auditedReasons(risk);
     let state = await this.readState(ctx, ref, pr, repo);
     // A branch with a merge queue takes the pull request through it (see `viaQueue`); the queue, not this call, chooses the merge method.
