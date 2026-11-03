@@ -5,7 +5,9 @@
  * A request's own MCP server reaches Brain with the address the API vetted it at (`pinned_address`), and Brain
  * connects only there, against a real MCP server: the host name is not looked up again (a `.invalid` name that
  * resolves nowhere still connects), it still goes out as the Host header, and a redirect to another origin is not
- * followed. A spec without the field connects as before.
+ * followed. A spec without the field connects as before, and its redirects to another origin are not followed
+ * either: a marketplace or plugin server on a host trusted with `<SAFE_API_KEY>` cannot bounce a header carrying the
+ * key to a host that is not.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -28,14 +30,16 @@ const rows: Array<{ name: string; spec: Record<string, unknown>; tools: string[]
   { name: "a pinned server's redirect to another origin is not followed", spec: { url: `http://vetted-host.invalid:${redirectPort}/mcp`, pinned_address: PIN }, tools: [] },
   { name: "a malformed pin does not connect", spec: { url: `http://vetted-host.invalid:${port}/mcp`, pinned_address: { address: "vetted-host.invalid", family: 4 } }, tools: [] },
   { name: "an unpinned spec connects as before", spec: { url: pw.mcpUrl }, tools: ["ping"] },
+  { name: "an unpinned server's redirect to another origin is not followed", spec: { url: `http://127.0.0.1:${redirectPort}/mcp` }, tools: [] },
 ];
 
 for (const row of rows) {
   test(row.name, async () => {
     pw.mcpHeaders.length = 0;
-    const r = await connectPlatformMcp({ s: { type: "http", token: "t", ...row.spec } });
+    const r = await connectPlatformMcp({ s: { type: "http", token: "t", headers: { "x-key": "key-for-this-host" }, ...row.spec } });
     try {
       assert.deepEqual(r.schemas.map((t) => t.name.replace(/^mcp__s__/, "")), row.tools);
+      if (!row.tools.length) assert.deepEqual(pw.mcpHeaders, [], "nothing reached the server behind the redirect");
       if (row.host) assert.equal(pw.mcpHeaders[0]?.host, row.host, "the vetted name is still the Host");
     } finally {
       await r.closeAll();
