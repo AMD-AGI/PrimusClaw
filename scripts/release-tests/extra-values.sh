@@ -564,6 +564,22 @@ if grep -Eq "$mutations" "$tmp/kubectl.log"; then bad "upgrade.sh changed the cl
 ok "refused before any change to the cluster: EXTRA_ENV_BRAIN_TOKEN and EXTRA_SECRET_ENV_BRAIN_TOKEN"
 rm -f "$values_file"
 
+echo "==> upgrade.sh renders the grant signing key from GRANT_SIGNING_KEY_ENABLED"
+# The chart reserves /var/run/claw/grant in api for this volume, so EXTRA_SECRET_MOUNTS_API cannot
+# carry it: without the forwarded switch an upgrade drops the mount and both env vars from api.
+printf 'REGISTRY="docker.io/primussafe"\nGRANT_SIGNING_KEY_ENABLED="true"\n' >"$values_file"
+upgrade || bad "upgrade.sh did not complete with GRANT_SIGNING_KEY_ENABLED: $(tail -5 "$tmp/upgrade.log")"
+has "$tmp/applied/api-deployment.yaml" '- name: grant-signing-key\n\s+secret:\n\s+secretName: primus-claw-grant-signing-key\n' || bad "the applied api manifest has no grant-signing-key Secret volume"
+has "$tmp/applied/api-deployment.yaml" '- name: grant-signing-key\n\s+mountPath: /var/run/claw/grant\n' || bad "the applied api manifest does not mount the grant signing key"
+has "$tmp/applied/api-deployment.yaml" '- name: GRANT_SIGNING_KEY_FILE\n\s+value: /var/run/claw/grant/signing-key.pem\n' || bad "the applied api manifest has no GRANT_SIGNING_KEY_FILE"
+has "$tmp/applied/brain-deployment.yaml" '- name: AGENT_SANDBOX_GRANT_URL\n' || bad "the applied brain manifest has no AGENT_SANDBOX_GRANT_URL"
+ok "GRANT_SIGNING_KEY_ENABLED=true mounts the key into api and sets the grant URL in api and brain"
+printf 'REGISTRY="docker.io/primussafe"\n' >"$values_file"
+upgrade || bad "upgrade.sh did not complete without GRANT_SIGNING_KEY_ENABLED: $(tail -5 "$tmp/upgrade.log")"
+if has "$tmp/applied/api-deployment.yaml" 'grant-signing-key|GRANT_SIGNING_KEY_FILE'; then bad "the api manifest carries the grant signing key while it is off"; fi
+ok "a file that does not set it renders no grant signing key"
+rm -f "$values_file"
+
 echo "==> deploy.sh refuses a doubled env var before it installs the chart"
 # deploy.sh installs the whole chart with `helm upgrade --install`, not through
 # render_chart, so it needs the same check on its own path.
@@ -613,6 +629,9 @@ for collision in "EXTRA_SECRET_ENV_BRAIN_POSTGRES_HOST=sec-one:host" "EXTRA_SECR
   if grep -q '^upgrade ' "$tmp/helm.args"; then bad "deploy.sh installed the chart despite $collision"; fi
   ok "refused before the chart is installed: ${collision%%=*}"
 done
+deploy GRANT_SIGNING_KEY_ENABLED=true || bad "deploy.sh did not complete with GRANT_SIGNING_KEY_ENABLED: $(tail -5 "$tmp/deploy.log")"
+has "$tmp/dvalues/claw-values.json" '"grantSigningKey": \{\s+"enabled": true' || bad "the install did not turn grantSigningKey on"
+ok "a fresh deploy forwards GRANT_SIGNING_KEY_ENABLED"
 rm -f "$deploy_values_file"
 
 echo "extra-values: all checks passed"

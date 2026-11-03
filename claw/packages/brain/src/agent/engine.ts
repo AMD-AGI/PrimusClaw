@@ -18,7 +18,7 @@ import { approvalPolicyFromMcp } from "./approval-policy.js";
 import { HitlController } from "./hitl.js";
 import { bashApprovalFromEnvValue, bashApprovalPolicyFrom } from "./bash-approval.js";
 import { DecisionDispatcher } from "../delivery/decision-dispatcher.js";
-import { connectPlatformMcp } from "../clients/mcp.js";
+import { connectPlatformMcp, mcpUnavailableNote } from "../clients/mcp.js";
 import { buildPrompt, buildProgressiveSkillHint, listProgressiveSkills } from "./prompt.js";
 import { SkillStore, LOAD_SKILL_TOOL } from "./skill-store.js";
 import { loadPlatformDefaults, resolveDefaultSkills, skillDescription, LazyDefaultSkills, type DefaultSkill } from "./platform-defaults.js";
@@ -36,7 +36,7 @@ import {
   DEFAULT_MODEL, MAX_TURNS,
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED,
   BASH_APPROVAL_RULES, ASK_USER_QUESTION_ENABLED, A2A_CLIENT_ENABLED,
-  MCP_PLATFORM_KEY_ALLOWED_HOSTS, PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED,
+  MCP_PLATFORM_KEY_ALLOWED_HOSTS, PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED, BG_SHELL_ENABLED,
 } from "../config.js";
 import { a2aApprovalHold } from "../clients/a2a.js";
 import { WebSearchService, WebFetchService, SimpleSessionCostTracker } from "../tools/web/index.js";
@@ -273,7 +273,7 @@ export class AgentEngine {
     // opened at all fails the run, as it does for any other turn that needs one.
     // No `repo` on the request, no sandbox here and no block: the turn is what it was.
     const repoBlock = request.repo
-      ? renderRepoBlock(await bindRepo(await sandbox(), request.repo, { signal }))
+      ? renderRepoBlock(await bindRepo(await sandbox(), request.repo, { signal, background: BG_SHELL_ENABLED }))
       : "";
 
     const rules = loadRules();
@@ -306,7 +306,12 @@ export class AgentEngine {
 
     const mcpResult = Object.keys(mergedMcp).length > 0
       ? await connectPlatformMcp(mergedMcp)
-      : { clients: new Map(), schemas: [], closeAll: async () => {} };
+      : { clients: new Map(), schemas: [], failed: [], closeAll: async () => {} };
+    // A server that is down is said, to the user as a progress line and to the
+    // model in the prompt, instead of its tools quietly not being there.
+    if (mcpResult.failed.length) {
+      await onEvent({ type: "statusUpdate", agentStatus: "running", event: "mcp_unavailable", servers: mcpResult.failed });
+    }
 
     // Tools a server's `requires_approval` policy holds for a person. Built
     // only when some server declares one: without a rule the loop gets no
@@ -386,6 +391,7 @@ export class AgentEngine {
       // A session that acts as a user (`withhold_sandbox_keys`) has no `save_memory`: what its model writes into the requester's long-term
       // memory is what a stranger's text made it write, and every later session of the requester would read it.
       router.memoryEnabled = request.memory_enabled !== false && !request.withhold_sandbox_keys;
+      router.skillEvolutionEnabled = request.skill_evolution_enabled === true;
       // Whom an identity-authenticated a2a_call peer is called as, and when the run's budget ends.
       const deadlineMs = request.deadline_at ? Date.parse(request.deadline_at) : NaN;
       router.a2aContext = {
@@ -414,7 +420,8 @@ export class AgentEngine {
           messages.unshift({ role: "system" as const, content: brainSystem });
         }
       }
-      messages.push({ role: "user" as const, content: fullPrompt });
+      const unavailable = mcpUnavailableNote(mcpResult.failed);
+      messages.push({ role: "user" as const, content: unavailable ? `${fullPrompt}\n\n${unavailable}` : fullPrompt });
 
       {
         // Plugin skills of a hooks plugin — write each file from Brain local dir

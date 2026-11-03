@@ -22,6 +22,7 @@ import { applyTaskStatusTransition } from "../tasks/db.js";
 import { gpuNodesFromSpec, topologyErrors } from "../tasks/run-spec.js";
 import type { EnvironmentTopology } from "@claw/protocol";
 import { isMemoryActive } from "../memory/service.js";
+import { CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
 import type { PoolClient } from "pg";
 import { ErrorCode, NatsError } from "nats";
 import pino from "pino";
@@ -920,6 +921,7 @@ async function publishA2AExecuteTask(
     prompt: text,
     history,
     memory_enabled: await isMemoryActive(auth.userId || "a2a"),
+    skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED,
     user_id: auth.userId || "a2a",
     platform_key: auth.platformKey,
     llm_api_key: auth.virtualKey,
@@ -2025,7 +2027,7 @@ async function handleLegacyInvoke(
   // caller-supplied task or message id it is the difference between a skipped
   // compensation and a `taskId` that does not exist.
   try {
-    const payload = { session_id: target.taskId, prompt: text, history: [], memory_enabled: await isMemoryActive("a2a"), user_id: "a2a" };
+    const payload = { session_id: target.taskId, prompt: text, history: [], memory_enabled: await isMemoryActive("a2a"), skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED, user_id: "a2a" };
     await js.publish("tasks.execute", sc.encode(JSON.stringify(payload)));
   } catch (err: unknown) {
     if (entry.kind === "opened") await rollbackA2AAdmission(target, entry.taskId, err);

@@ -17,7 +17,8 @@ import {
 } from "../auth/session-credentials.js";
 import { TRIGGER_RUN_TIME_LIMIT_SECONDS } from "../config.js";
 import { decryptUserEnvValue, loadUserEnvSnapshot } from "../crypto/user-env.js";
-import { db } from "../infra/db.js";
+import { db, inTransaction } from "../infra/db.js";
+import { drainSessionIfIdle, queueServerMessage } from "../assistant/messages.js";
 import { insertSessionRow } from "../routes/sessions.js";
 import { dispatchTaskToBrain, newChatMessageId } from "../sessions/dispatch.js";
 import { releaseSessionRefs } from "../workspace/store.js";
@@ -32,6 +33,8 @@ export interface TriggerRow {
   schedule: string;
   timezone: string;
   credential_enc: string;
+  /** Set for a trigger made from a work item's turn: its firings wake that item's worker. */
+  item_id: string | null;
 }
 
 /**
@@ -59,8 +62,12 @@ export const triggerPorts = {
 };
 
 export type FireOutcome =
-  | { status: "started"; sessionId: string; messageId: string }
-  | { status: "failed_start"; detail: string; credentialInvalid: boolean };
+  /** `messageId` is null for a firing queued to an item's worker: the turn it starts is named when it is drained. */
+  | { status: "started"; sessionId: string; messageId: string | null }
+  | { status: "failed_start"; detail: string; credentialInvalid: boolean }
+  /** The item is finished or stopped, so its watch is over; or it is waiting for its user, so this firing is not run. */
+  | { status: "item_closed" }
+  | { status: "item_waiting" };
 
 export async function fireTrigger(trigger: TriggerRow, plannedAt: Date): Promise<FireOutcome> {
   const user = triggerPorts.getCredentialsFor(trigger);
@@ -134,6 +141,37 @@ export async function fireTrigger(trigger: TriggerRow, plannedAt: Date): Promise
   } catch (err) {
     logger.error({ err, triggerId: trigger.trigger_id }, "trigger.fire_failed");
     if (inserted) await rollback().catch((e) => logger.error({ err: e, sessionId }, "trigger.rollback_failed"));
+    return { status: "failed_start", detail: "internal_error", credentialInvalid: false };
+  }
+}
+
+/**
+ * A firing of a trigger made from a work item's turn: the prompt goes to the item's own worker, the way an
+ * instruction the user sends it does, so its result comes back as that item's report and not as a conversation
+ * nobody opened. The worker's session holds its owner's credentials already; the trigger's own are not used.
+ */
+export async function fireIntoItem(trigger: TriggerRow, plannedAt: Date): Promise<FireOutcome> {
+  try {
+    const queued = await inTransaction(async (query) => {
+      const item = (await query(
+        `SELECT worker_session_id, board_state FROM claw_work_items
+          WHERE item_id = $1 AND user_id = $2 FOR SHARE`,
+        [trigger.item_id, trigger.owner_user_id],
+      )).rows[0] as { worker_session_id: string; board_state: string } | undefined;
+      if (!item || item.board_state === "done") return { status: "item_closed" as const };
+      if (item.board_state !== "in_progress") return { status: "item_waiting" as const };
+      const r = await queueServerMessage({ query }, {
+        sessionId: item.worker_session_id, userId: trigger.owner_user_id,
+        content: `Scheduled run of "${trigger.name}" (${plannedAt.toISOString()}):\n\n${trigger.prompt}`,
+        dedupeKey: `trigger:${trigger.trigger_id}:${plannedAt.toISOString()}`,
+      });
+      if (!r.ok) return { status: "failed_start" as const, detail: r.error, credentialInvalid: r.error === "no_credentials" };
+      return { status: "started" as const, sessionId: item.worker_session_id, messageId: null };
+    });
+    if (queued.status === "started") await drainSessionIfIdle(queued.sessionId, trigger.owner_user_id);
+    return queued;
+  } catch (err) {
+    logger.error({ err, triggerId: trigger.trigger_id }, "trigger.fire_into_item_failed");
     return { status: "failed_start", detail: "internal_error", credentialInvalid: false };
   }
 }

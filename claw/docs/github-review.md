@@ -23,9 +23,12 @@ committer has allowed that once, beforehand: they bound their GitHub account at 
 provider and switched on its `delegation` flag, which is their standing authorization. The
 integration then starts a session that acts as the committer (`config.acting_as`) and reviews and
 merges the author's pull request with the committer's own account, with no confirmation and no question
-asked, as long as CI is green and the change is not high risk (architecture, interfaces, security, CI
-or release, dependencies, size: see "High risk"). An approval or a merge of a high-risk change is held
-until the committer confirms that very write, signed in as themselves. The author needs no GitHub
+asked, as long as CI is green and nothing holds it. What holds it is the reviewing model's own judgement
+that a person should look (security-sensitive code, credentials, CI or workflow changes, destructive
+migrations, behaviour the pull request does not explain, anything it is unsure of), and a short list of
+hard holds the model cannot lower (see "High risk"); size, an outside author or a fork are evidence for
+the model, not holds. A held approval or merge waits until the committer confirms that very write, signed
+in as themselves. The author needs no GitHub
 account bound and is not looked at; the committer's account must not be the author of the pull request
 (`cannot_approve_own_pull_request`), and without the committer's standing authorization nothing is done
 with their account (`delegation_off`).
@@ -79,10 +82,10 @@ review and the merge and who is the reviewer of record, and whose own standing a
 
 | Tool | What it does |
 |---|---|
-| `gh_pr_get` | The pull request, its files and diff, CI, review threads, existing comments, the risk verdict, what the acting user may do, the review path (below) and the review instructions. Text that came from the pull request is under `untrusted`. Call it first. |
-| `gh_pr_risk` | The risk verdict alone, with its categories. The model may pass `risk_flags` (`security_finding`, `review_skipped`) and a `risk_judgement` (see High risk); both can only raise the verdict. |
-| `gh_review_submit` | One review on the pinned head commit (the model may pass the same `risk_flags` as to `gh_pr_risk`, and they count for an `APPROVE`), with inline comments that must sit on lines the diff shows. `COMMENT`, `REQUEST_CHANGES` or `APPROVE`. A body footer says `Reviewed by <agent name> on behalf of <login> (requested by <name>), run <id>` (the agent name is `CLAW_GITHUB_REVIEW_AGENT_NAME`, default `Claw`) and a hidden marker (the run, the event and a digest of the text and inline comments) keeps a retry of the same review from posting twice, while a different review of the same kind on the same commit is posted. An `APPROVE` of a high-risk change is held until the acting user confirms (below). |
-| `gh_pr_merge` | Approves when needed and merges, if every gate is open. On a base branch that is merged through a merge queue it puts the pull request in the queue instead of merging it (`queued`, below). A high-risk change is held until the acting user confirms. |
+| `gh_pr_get` | The pull request, its files and diff, CI, review threads, existing comments, the risk evidence and hard holds for the model's `risk_judgement`, what the acting user may do, the review path (below) and the review instructions. Text that came from the pull request is under `untrusted`. Call it first. Every answer fits under Brain's 6000-character tool-result cut: the first is the overview, and what does not fit in it (`instructions`, `files`, `diff`, `conversation`) is read whole in pages, with `section`, `head_sha`, `read_id` and `offset` from each page's `next_offset`. Offsets are the whole diff's, with or without `file`; an offset past the end, or a `file` that is not in the change, is refused (`offset_out_of_range`, `unknown_file`), never answered with an empty page. A page is served from what the session read of that head and costs one GitHub request, which re-checks the repository gates, the head and the base branch; when the base branch has moved, the pull request is read again and the page is served only if it still reads the same (`read_id`), else refused with `read_changed`. |
+| `gh_pr_risk` | Whether an approval or a merge would be held, and why, for the `risk_judgement` and `risk_flags` (`security_finding`, `review_skipped`) the model passes (see High risk): the judgement decides, except for the hard holds, and none holds. |
+| `gh_review_submit` | One review on the pinned head commit (the model may pass the same `risk_flags` as to `gh_pr_risk`, and they count for an `APPROVE`), with inline comments that must sit on lines the diff shows. `COMMENT`, `REQUEST_CHANGES` or `APPROVE`. A body footer says `Reviewed by <agent name> on behalf of <login> (requested by <name>), run <id>` (the agent name is `CLAW_GITHUB_REVIEW_AGENT_NAME`, default `Claw`) and a hidden marker (the run, the event and a digest of the text and inline comments) keeps a retry of the same review from posting twice, while a different review of the same kind on the same commit is posted. An `APPROVE` the model judges high, without a judgement, or with a hard hold is held until the acting user confirms (below). |
+| `gh_pr_merge` | Approves when needed and merges, if every gate is open. On a base branch that is merged through a merge queue it puts the pull request in the queue instead of merging it (`queued`, below). A merge the model judges high, without a judgement, or with a hard hold is held until the acting user confirms. |
 
 ## Gates (all enforced inside the tools)
 
@@ -109,19 +112,37 @@ review and the merge and who is the reviewer of record, and whose own standing a
   provider does not know (an empty one) cannot be compared with the author, so an approval or a merge with it is
   refused too (`acting_login_unknown`), at the same place. A comment and a request for changes approve nothing
   and are not held to either. `gh_pr_get` tells the model before it tries: `acting.acting_user_is_author`.
-- **Standing authorization and high risk.** With the acting user's `delegation` flag on, a `COMMENT`, a
-  `REQUEST_CHANGES`, an `APPROVE` and a merge are made at once, whoever asked, when the change is not
-  high risk. An `APPROVE` review and a merge of a high-risk change (the rules and the reviewer's own flags
-  and judgement count, see "High risk") stop at `confirmation_required` and write nothing, for the
-  reasons the rules gave, until the acting user has confirmed that very write; a comment or a request for
+- **Standing authorization and the hold.** With the acting user's `delegation` flag on, a `COMMENT`, a
+  `REQUEST_CHANGES`, an `APPROVE` and a merge are made at once, whoever asked, when nothing holds them. An
+  `APPROVE` review and a merge that are held (the reviewer's judgement, its flags and the hard holds, see
+  "High risk") stop at `confirmation_required` and write nothing, with the reasons in plain words (the
+  reviewer's own first), until the acting user has confirmed that very write; a comment or a request for
   changes on the same change is posted as ever. The confirmation holds the review as it will be posted
   (event, text, inline comments), so what the acting user reads is what goes out; the gates of the write
-  are read again when they allow it. It cannot be switched off by a setting or by a repository's
-  configuration. A held approval is posted alone: to approve and merge in one confirmation, a model calls
-  `gh_pr_merge`.
+  are read again when they allow it. A repository's configuration cannot switch it off; the acting user's
+  own review mode (next item) decides what holds. A held approval is posted alone: to approve and merge in
+  one confirmation, a model calls `gh_pr_merge`.
+- **The acting user's review mode.** How a held write is confirmed is the acting user's own setting, kept
+  in Claw by their user id (`claw_github_review_settings`, see "Review mode" below). It applies to every
+  review and merge made with their account, whoever asked, the acting user themselves included:
+  - `high_risk_confirm` (the default, and what a person who never set one has): an `APPROVE` or a
+    merge is held as "High risk" says, for the reviewer's judgement, its flags or a hard hold;
+  - `fully_auto`: nothing is held except what the repository itself requires (`risk.repo_holds`: its
+    configuration's `confirm_merge: always` or a `high_risk_paths` match, a configuration that does not
+    parse, rules that failed), a change to the instructions the reviewing model reads (or not being able
+    to tell), a file list cut at GitHub's 3000 files, and an earlier write of the same commit that still waits for the person, is
+    being decided by them, was refused by them, or was held and never answered. The other
+    gates (CI green, no open thread, merge state `CLEAN`, not the author, delegation, the head commit)
+    stand as ever.
+
+  It says nothing about who may ask: that stays the `delegation` flag (others may ask only when it is on).
+  `gh_pr_get` (`acting.review_mode`,
+  `risk.review_mode`, `risk.repo_holds`) and `gh_pr_risk` show the mode in force, the audit row records it
+  (`review_mode`), and an approval or a merge made under `fully_auto` answers `review_mode_note` ("made
+  under <login>'s fully automatic setting: nobody was asked to confirm it") for the report to repeat.
 - **Merge queue.** A base branch that is merged through a merge queue refuses a direct merge, so there
   `gh_pr_merge` does not merge: after every gate of a merge has passed and the approval is on the pull
-  request (or the acting user has allowed a high-risk merge), it puts the pull request in the queue with the
+  request (or the acting user has allowed a held merge), it puts the pull request in the queue with the
   GraphQL mutation `enqueuePullRequest`, as the acting user, pinned to the head commit the review read
   (`expectedHeadOid`), so a push after the last read is not queued. It never jumps the queue. The answer is
   `status: "queued"`, never `merged`, with the queue entry GitHub returned (`queue_entry_id`,
@@ -146,8 +167,8 @@ review and the merge and who is the reviewer of record, and whose own standing a
 - **An approval.** An approval can merge a pull request by itself (GitHub's auto-merge), so
   `gh_review_submit` with `APPROVE` is posted only where `gh_pr_merge` would not stop: CI is
   green on the head commit (`ci_not_green`) and no review thread is open (`threads_unresolved`);
-  an approval of a high-risk change, the model's `risk_flags` included, is then held for the acting
-  user (`confirmation_required`, `kind: "review"`). `COMMENT` and `REQUEST_CHANGES` are not held to that.
+  an approval that is held (see "High risk": the model's `risk_judgement` and `risk_flags`, or a hard
+  hold) is then held for the acting user (`confirmation_required`, `kind: "review"`). `COMMENT` and `REQUEST_CHANGES` are not held to that.
 - **The merge.** Everything is read again at merge time: CI is green on the **head commit**
   (every check completed and passing; a required check that never reported is missing; a pull
   request with no check at all is not green however clean GitHub calls it; an infrastructure
@@ -157,10 +178,42 @@ review and the merge and who is the reviewer of record, and whose own standing a
   request a look, with CI read once more before a merge that had to wait, before the merge is refused as `merge_state_not_clean`), and the repository's own
   protections are met because they are GitHub's. No admin merge, no auto-merge, no branch update, no change to a rule.
   The method is the repository's first allowed one, squash first.
-- **High risk.** A versioned rule pack (`packages/api/src/github-review/risk.ts` and
-  `risk-signals.ts`, version `2026-11-02.1`) decides from what the change **does**, read from
-  its diff, not from which kind of file it touches. An approval or a merge is held for the acting user's own
-  confirmation when the change is
+- **High risk.** Whether an `APPROVE` or a merge is held for the acting user's own confirmation is
+  decided in `packages/api/src/github-review/risk.ts` (`assessRisk`). Under the acting user's default review
+  mode, `high_risk_confirm` (under `fully_auto` see the item above), it is held when
+  1. the reviewing model's `risk_judgement` on `gh_review_submit` / `gh_pr_merge` is `high`; or it is
+     missing or malformed (fail closed); or the model passed a `risk_flags` (`security_finding`,
+     `review_skipped`); or
+  2. a **hard hold** applies, which no judgement lowers: the repository's own configuration on the base
+     branch asks for it (`confirm_merge: always`, or a changed path matches its `high_risk_paths`), or
+     that configuration does not parse; the change touches a file that controls the repository
+     (`.github/workflows/`, `.github/actions/`, `.github/scripts/`, `.gitlab-ci.yml`, a `Jenkinsfile`,
+     `azure-pipelines`, `.circleci/config`, `CODEOWNERS` at the root, under `.github/` or `docs/`,
+     `.github/claw-review.yml` or the same file under its earlier name), including a file moved out of
+     one; the change touches the instructions the reviewing model reads (`repo-skill.ts`
+     `isReviewInstructionPath`: a review skill directory under `.claude/skills/` or `.agents/skills/`,
+     the root `AGENTS.md`, `.github/copilot-instructions.md`), which holds under `fully_auto` too. That
+     check does not rely on the file list: the base and head commits' whole trees are read (two requests,
+     `GET /git/trees/{sha}?recursive=1`) and every such path that was added, removed, edited, moved or
+     given another mode counts, however many files the pull request changes. A tree GitHub cut (a very
+     large repository) or could not give holds as well, with that reason. The file list itself is read up
+     to GitHub's limit of 3000 files, 100 a page, each page counted against the session's request budget
+     (`CLAW_GITHUB_REQUESTS_PER_SESSION`; a read that would pass it stops as `request_budget_exhausted`);
+     a pull request with more files is cut, "too many files changed to see them all", which holds under
+     `fully_auto` too; or the rules themselves fail.
+
+  Nothing else holds. The rule pack below (version `2026-11-03.1`) is **evidence**: `gh_pr_get` and
+  `gh_pr_risk` give it to the model as `risk.evidence`, with `risk.hard_holds`; the `risk_judgement`
+  field's description (on every tool that takes it) and the review instructions carry the guidance, the
+  instruction to hold for security-sensitive code (authentication, authorization, permissions,
+  cryptography, sandboxing), credentials or secrets, CI, workflow, release or deployment changes,
+  permission or access changes, destructive or irreversible data migrations, a change of an interface or
+  behaviour others rely on that the pull request text does not explain, and anything it is unsure of,
+  and to judge low otherwise. Size, an author outside the organisation (`CONTRIBUTOR`, `NONE`), a fork
+  and a base branch other than the default are evidence, not reasons by themselves: the person who asked
+  is very often the author, and a rule that held every large change by a contributor held nearly every
+  approval. The rule pack reads what the change **does**, from its diff, not which kind of file it
+  touches. It flags a change that is
   - an **architecture** change: a package or module added or removed (a manifest, a `go.mod`, a
     `__init__.py`), a deployable unit added or removed (a Dockerfile, a compose file, a
     Kubernetes Deployment, Service, Ingress or role, a Terraform resource), a directory moved
@@ -200,7 +253,7 @@ review and the merge and who is the reviewer of record, and whose own standing a
   `-- +goose` and `-- migrate:` lines, `//go:generate`, `//go:build`, a `+kubebuilder` marker, the
   C preprocessor, and a marker that switches a security scanner off for a line (`#nosec`,
   `checkov:skip`, `nolint:gosec` and the like) all count as changed content. A changed line longer
-  than 4000 characters (minified or generated code) is held rather than scanned, and so is a change
+  than 4000 characters (minified or generated code) is reported as evidence rather than scanned, and so is a change
   with more than 20 000 changed lines or two million characters, which is not read past that point.
   Every pattern that reads a line runs in time linear in its length (the author of a pull request
   may be outside the organisation, and the rules run in the API's own process:
@@ -208,30 +261,54 @@ review and the merge and who is the reviewer of record, and whose own standing a
   field added to an exported type, a parameter on a wrapped signature line, a behaviour that changed
   under an unchanged name) is for the reviewer's own judgement (below).
 
-  Under the content rules sits a **floor** that reads no content and stays as a backstop: a file
+  Under the content rules sits a **floor** of evidence that reads no content: a file
   that came without its diff (GitHub sends none for a binary, a rename or a diff it finds too large,
   and counts a modified or renamed binary as 0 lines, so the missing patch is the signal), a lock
   file (it decides what an install downloads), a submodule pointer, a file mode change, a file list
   that was cut, a fork, a non-member author, a base branch other than the default, an
   authentication module, a workflow, a Dockerfile, a chart or a release script that is edited at
   all (a line shaped like a comment does not take it below the floor: the content rules can only
-  add), a file tracked by Git LFS (GitHub sends its pointer, `version`, `oid sha256:` and `size`,
+  add), and a file tracked by Git LFS (GitHub sends its pointer, `version`, `oid sha256:` and `size`,
   as an ordinary text patch with real line counts; that is a diff that did not show the file, and
-  is treated like a binary's), and any rule that throws: the rules fail closed. A file that was moved is judged by the path it left as well
+  is treated like a binary's). A file that was moved is judged by the path it left as well
   as the one it went to, and a line that starts with `++` or `--` is read like any other. A
   repository's `.github/claw-review.yml` on the base branch can add paths (`high_risk_paths`) or ask for
-  confirmation on every merge (`confirm_merge: always`).
+  confirmation on every merge (`confirm_merge: always`); both are hard holds.
 
   **The reviewer's judgement.** `gh_pr_risk`, `gh_review_submit` and `gh_pr_merge` take
-  `risk_judgement: {level: "low" | "high", reason}`. A `high` with its reason adds a reason that
-  comes first on the confirmation the acting user is shown (one clipped line, markup stripped, the
-  token masked) and holds the merge, and an APPROVE with it. A `low` changes nothing: the
-  reviewer can raise the verdict, never lower it, and what the rules said alone is reported apart
-  (`risk.rule_level`, `risk.raised_by_reviewer`, `risk.categories`: `architecture`, `interface`,
-  `security`, `ci_release`, `dependency`, `size_breadth`, `integrity`, `provenance`, `reviewer`).
+  `risk_judgement: {level: "low" | "high", reason}`. A `high` holds the APPROVE and the merge, and its
+  reason comes first on the confirmation the acting user is shown and in what the model reports (one
+  clipped line, markup stripped, the token masked). A `low` lets them through the other gates unless a
+  hard hold applies; its reason is not shown as a reason to hold. No judgement, or one that is not
+  `low` or `high`, holds. `gh_pr_risk` answers `risk.level` (held or not), `risk.reasons` (why, in plain
+  words), `risk.judgement` (`low`, `high` or `missing`), `risk.hard_holds`, `risk.evidence`,
+  `risk.rule_level` (whether the rules saw anything) and `risk.categories` (`architecture`, `interface`,
+  `security`, `ci_release`, `dependency`, `size_breadth`, `integrity`, `provenance`, `reviewer`);
+  `gh_pr_get`, before any judgement, gives the evidence and the hard holds. The audit row
+  keeps the reasons and the evidence (marked `evidence:`). A `low` without a reason is no judgement.
+  An approval or a merge of a head commit for which an earlier approval or merge already waits for the
+  acting user, is being decided by them, was refused by them, or was held and never answered (an expired
+  confirmation: asking again until a judgement says low does not get past it; a new head commit does), with
+  the repository name compared without case, is held too, and `gh_pr_risk` says so, whatever the later call says: a lower judgement on a
+  second call, or the other of the two tools, does not get past their decision. Calls in parallel take
+  turns: an `APPROVE` or a merge decision holds a lock on the acting user's writes to that pull request
+  (`claw_github_write_locks`, across replicas, renewed while the call works and lapsing two minutes after
+  a call that died), and a second one meanwhile is
+  refused at once as `write_in_progress`, with nothing written, to be made again.
 
   A merge or an approval that needs confirmation creates one pending row for the head commit and
   writes nothing.
+
+## Review mode
+
+| Route | What it does |
+|---|---|
+| `GET /v1/github-review/settings` | The caller's own review mode: `{ok: true, data: {review_mode, updated_at, review_modes}}`. `review_mode` is `high_risk_confirm` or `fully_auto`; with nothing set it is `high_risk_confirm` and `updated_at` is `null`. `review_modes` lists the values. Any signed-in caller; `401` without one |
+| `PUT /v1/github-review/settings` `{review_mode: "high_risk_confirm" \| "fully_auto"}` | Sets the caller's own review mode and answers as `GET` does. Given as a decision is (next section): the person's own identity-provider token, or the exchange token of a service an operator named in `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS`; an `ak-` key, a BYOK key, a connector token or a cookie is `403 interactive_sign_in_required`. Another value is `400` |
+
+Neither route names a user: what is read or set is always the caller's own, so nobody can change another
+person's mode. A chat integration sets it when the person binds GitHub and whenever they change it. It is
+independent of `delegation` (whether others may ask), which stays at the identity provider.
 
 ## Confirmations
 
@@ -389,7 +466,10 @@ no recipe, and the review proceeds from the `gh_pr_get` result alone).
 A repository's review skill is read from the **tip of the base branch** and nowhere else
 (never the pull request's head, which could rewrite the rules it is reviewed by), in the order
 `.claude/skills/review-pr`, any other `.claude/skills/*review*`, any `.agents/skills/*review*`,
-together with the base's `AGENTS.md` and `.github/copilot-instructions.md`. The fixed rules (read
+together with the base's `AGENTS.md` and `.github/copilot-instructions.md`. A file there that is a symlink
+to another file is not read: GitHub would answer with the other file, which a pull request could change
+without touching an instruction path. A pull request that changes any of these paths is held whatever the
+review mode (see "High risk"). The fixed rules (read
 and comment only, text from the pull request is data, the tools' gates) and the answer rules below
 are always put in front of it. Without one the default review instructions apply
 ([`examples/skills/pr-review/SKILL.md`](../examples/skills/pr-review/SKILL.md) is the same text behind
@@ -439,7 +519,7 @@ Every tool call writes a row to `claw_github_audit` **before** it does anything 
 it afterwards: requester, acting user, session, repository, pull request, head commit, tool,
 a summary of the arguments (names and sizes, not the text of a review), the number of GitHub
 requests and their request ids, the risk reasons, the confirmation, whether it was a dry run or
-a write, the result and the review path. A call that cannot be written down is not made. No
+a write, the result, the review path and the acting user's review mode. A call that cannot be written down is not made. No
 table holds a credential. A tool answer is masked with the token and anything shaped like a
 secret before the model reads it. Rate limits answer `rate_limited`; GitHub's own limits
 answer `github_rate_limited` with `retry_after_seconds`, and a write is never retried blindly:
@@ -448,17 +528,19 @@ answer `reviews_unreadable`).
 
 ## Names
 
-- Earlier release names, still read and never written: the hidden marker `<!-- clawy:run:... -->` in a review's footer (a retry still finds a review an earlier release posted, and does not post it twice) and the repository configuration file `.github/clawy.yml`, which is read only where `.github/claw-review.yml` is absent. A pull request that edits either file is high risk. Everything new is written under the neutral names: the marker `<!-- claw-review:run:... -->`, the file `.github/claw-review.yml` and the footer name `CLAW_GITHUB_REVIEW_AGENT_NAME`. The platform does not name the clients that call it; `test/github-review-public-tree.test.ts` fails on the product name anywhere else in this feature.
+- Earlier release names, still read and never written: the hidden marker `<!-- clawy:run:... -->` in a review's footer (a retry still finds a review an earlier release posted, and does not post it twice) and the repository configuration file `.github/clawy.yml`, which is read only where `.github/claw-review.yml` is absent. A pull request that edits either file is held (a hard hold). Everything new is written under the neutral names: the marker `<!-- claw-review:run:... -->`, the file `.github/claw-review.yml` and the footer name `CLAW_GITHUB_REVIEW_AGENT_NAME`. The platform does not name the clients that call it; `test/github-review-public-tree.test.ts` fails on the product name anywhere else in this feature.
 
 ## Risks accepted in this phase
 
 - **The standing authorization is wide.** With the `delegation` flag on, whoever can start a session that
   acts as the committer can have a pull request approved and merged with the committer's account, their
-  own included, whenever CI is green and the change is not high risk; the committer is asked only about
-  high-risk changes. Which people may ask for someone else's account is for the deployment to decide
+  own included, whenever CI is green and nothing holds it; the committer is asked only when the reviewing
+  model judges it worth their look or a hard hold applies, which should be the few. The model's judgement
+  is what stands between most pull requests and a merge: a model that judges a risky change low merges it,
+  within the hard holds and the other gates. Which people may ask for someone else's account is for the deployment to decide
   (`CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS` names the services that may), and the committer's own
-  switch is what limits it. The rules that call a change high risk are a hold for a human, not a security scan.
-- **A held write waits for a person.** A person who is asked by many can have ten high-risk writes
+  switch is what limits it. The rules are evidence for the model and a few hard holds, not a security scan.
+- **A held write waits for a person.** A person who is asked by many can have ten held writes
   waiting at once and then every further one is refused until they answer or the cards expire; there is no
   per-requester limit yet.
 
@@ -466,5 +548,5 @@ answer `reviews_unreadable`).
 
 It does not edit or push code, request reviewers, resolve another person's thread, re-run CI,
 update a branch, use auto-merge, merge with admin rights or change a rule. It reviews only
-public repositories of the configured owners. The risk rules are a hold for a human, not a
+public repositories of the configured owners. The risk rules are evidence for the reviewing model and a few hard holds, not a
 security scan.

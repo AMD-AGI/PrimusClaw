@@ -28,6 +28,12 @@ record it.
 ## [Unreleased]
 
 ### Added
+- The model can schedule work itself: with `CLAW_TRIGGER_TOOLS_ENABLED` (needs `CLAW_TRIGGERS_ENABLED` and a
+  `CLAW_TRIGGER_TOOLS_TOKEN_KEY` of 32+ characters; off by default) every turn but a trigger's own run is offered
+  `trigger_create`, `trigger_list` and `trigger_cancel`, served by the API at `/v1/internal/trigger-mcp`. The user is
+  always the owner of the calling turn's session, named by a bearer minted for that turn, never by an argument;
+  `trigger_create` is held for the user's approval. A trigger can end by itself (`until`, `max_runs`, also accepted by
+  `POST /v1/triggers`), and one made from a work item's worker wakes that worker instead of starting a new session.
 - A service that acts for a person (a delegated identity token: RFC 8693 `act`) can now bring the person's own
   `ak-` key in `x-api-key`, for the services an operator names in `CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS` (empty by
   default, which changes nothing: such a token still has no keys and the header is still not read). SaFE verifies the
@@ -340,6 +346,38 @@ record it.
   `--`, with literal pathspecs and without its optional index lock. See `claw/docs/sandbox-session-lifecycle.md`.
 
 ### Changed
+- GitHub review: whether an `APPROVE` or a merge made with someone else's account waits for that person's
+  confirmation is now decided by the reviewing model's `risk_judgement` (`high` holds, `low` lets it through the
+  other gates), not by the rule pack (`claw/packages/api/src/github-review/risk.ts`, `assessRisk`; rule pack
+  `2026-11-03.1`). The rules are given to the model as evidence (`risk.evidence` and `risk.hard_holds` in
+  `gh_pr_get` and `gh_pr_risk`; what to hold for is in the `risk_judgement` description and the review instructions) and no longer hold on their own: a large change, an author
+  outside the organisation (the person who asked is very often the author), a fork, another base branch, an
+  interface or dependency change are for the model to weigh. Before, nearly every approval of an ordinary large
+  pull request by a contributor was held. What still holds whatever the model says: the repository's own
+  `.github/claw-review.yml` (or the same file under its earlier name) asking for it (`confirm_merge: always`, a `high_risk_paths`
+  match) or not parsing; a change to `.github/workflows/`, `.github/actions/`, `.github/scripts/`, another CI
+  definition, `CODEOWNERS` or that configuration file; a change to the instructions the reviewing model reads (a
+  review skill, the root `AGENTS.md`, `.github/copilot-instructions.md`); a cut file list; rules that fail; and a missing or malformed judgement. The model's `risk_flags` hold as
+  before (all of this under the default review mode; see the next entry for `fully_auto`). The held confirmation and the tool answer give the reasons in plain words, the model's own first.
+  Delegation, author != acting user, CI, merge state, branch protection, the writes switch, the head-SHA binding
+  and the audit are unchanged; the audit row keeps the evidence (`evidence: ...`). `gh_pr_risk` no longer
+  answers `raised_by_reviewer`. An approval or a merge of a head commit whose earlier approval or merge still
+  waits for the acting user, is being decided, was refused, or expired unanswered is held too, and approval and
+  merge decisions of one acting user on one pull request take turns (`write_in_progress`). Review instructions
+  that are a symlink to another file are no longer read. See `claw/docs/github-review.md` ("High risk").
+- GitHub review: the acting user's own review mode decides what holds for every review and merge made with their
+  account, whoever asked: `high_risk_confirm` (the default, also for a person who never set one) holds as above,
+  `fully_auto` holds only what the repository itself requires (`confirm_merge: always`, a `high_risk_paths` match, a
+  configuration that does not parse), a change to the instructions the reviewing model reads (compared between the
+  base and head commits' trees, not from the file list, so a change hidden among thousands of files is seen; a tree
+  GitHub cuts holds), a file list past GitHub's 3000 files (now read in full up to there, page by page against the
+  session's request budget, instead of 500), and an earlier held,
+  refused or unanswered write of the commit. It is kept in Claw
+  (`claw_github_review_settings`, by user id, created on start) and read and set by the person themselves with
+  `GET` / `PUT /v1/github-review/settings` (`{review_mode}`; the `PUT` needs the person's sign-in or an allowed
+  service's exchange token). `delegation` still decides alone whether others may ask. The mode is in `gh_pr_get` and
+  `gh_pr_risk`, in a new `claw_github_audit.review_mode` column, and a write made under `fully_auto` answers
+  `review_mode_note`.
 - `claw-connector`: two changes for an existing `agents.toml` that need no setting to take effect. A file with
   `allow_unsafe_modes = true` now also accepts an adapter's "will not ask for permission" warning for every agent without
   its own `approval`, so a session that used to be closed with `mode_not_enforced` now opens and is reported

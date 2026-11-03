@@ -15,3 +15,8 @@
 export function replaceLiteralOnce(haystack: string, needle: string, replacement: string): string {
   return haystack.replace(needle, () => replacement);
 }
+
+/** Every occurrence, with the same literal treatment of `replacement`. */
+export function replaceLiteralAll(haystack: string, needle: string, replacement: string): string {
+  return haystack.split(needle).join(replacement);
+}

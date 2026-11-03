@@ -7,6 +7,7 @@ import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import type { FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { ToolSchema } from "@claw/protocol";
 import { isIP } from "node:net";
+import { redactSecrets } from "@claw/utils";
 import pino from "pino";
 import { Agent, fetch as undiciFetch } from "undici";
 
@@ -115,11 +116,7 @@ async function connectMcpServer(name: string, spec: Record<string, unknown>): Pr
   return {
     async callTool(toolName: string, args: Record<string, unknown>): Promise<string> {
       const result = await client.callTool({ name: toolName, arguments: args });
-      const texts = (result.content as Array<{ type: string; text?: string }>)
-        ?.filter((c) => c.type === "text" && c.text)
-        .map((c) => c.text!)
-        .join("\n");
-      return texts || "";
+      return mcpContentText(result.content);
     },
     async listTools(): Promise<ToolSchema[]> {
       const result = await client.listTools();
@@ -133,6 +130,23 @@ async function connectMcpServer(name: string, spec: Record<string, unknown>): Pr
       try { await client.close(); } catch { /* ignore */ }
     },
   };
+}
+
+/**
+ * The text of an MCP tool result.
+ *
+ * Only text reaches the model. A block of any other kind (an image, audio, a
+ * resource) is named in a line rather than dropped, so a tool that answered
+ * with a screenshot does not read as a tool that answered nothing.
+ */
+export function mcpContentText(content: unknown): string {
+  if (!Array.isArray(content)) return "";
+  return (content as Array<{ type?: string; text?: string; mimeType?: string }>)
+    .map((c) => c?.type === "text"
+      ? (c.text ?? "")
+      : `[${c?.type ?? "unknown"} content omitted${c?.mimeType ? ` (${c.mimeType})` : ""}: this tool result can only be shown as text]`)
+    .filter(Boolean)
+    .join("\n");
 }
 
 /**
@@ -153,6 +167,29 @@ export function sortToolSchemasByName<T extends { name: string }>(tools: readonl
   return [...tools].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }
 
+export interface McpConnectFailure { name: string; reason: string }
+
+const FAILURE_REASON_MAX_CHARS = 200;
+
+/** A failure's message, short and without anything token-shaped, fit to show the model and the user. */
+function connectFailureReason(err: unknown): string {
+  const text = redactSecrets(String((err as Error)?.message ?? err).replace(/\s+/g, " ").trim()).text || "unknown error";
+  return text.length > FAILURE_REASON_MAX_CHARS ? `${text.slice(0, FAILURE_REASON_MAX_CHARS)}...` : text;
+}
+
+/**
+ * The line the model is given about servers that did not connect, or "" when all did.
+ *
+ * Without it a server that is down is indistinguishable from one that was never
+ * configured: the model is simply not offered its tools, and tells the user it
+ * has no way to do what they asked instead of saying the service is unreachable.
+ */
+export function mcpUnavailableNote(failed: readonly McpConnectFailure[]): string {
+  if (!failed.length) return "";
+  const list = failed.map((f) => `${f.name} (${f.reason})`).join("; ");
+  return `[Unavailable this turn: MCP server(s) ${list}. Their tools are not offered. If the request needs one, tell the user that service is unreachable right now rather than that you lack the capability.]`;
+}
+
 /**
  * Connect to all MCP servers from resolved configs.
  * Returns a Map for ToolRouter and combined tool schemas for LLM.
@@ -166,11 +203,14 @@ export async function connectPlatformMcp(
 ): Promise<{
   clients: Map<string, { callTool: (name: string, args: Record<string, unknown>) => Promise<string> }>;
   schemas: ToolSchema[];
+  /** Servers that could not be connected or listed, with why; their tools are not offered. */
+  failed: McpConnectFailure[];
   closeAll: () => Promise<void>;
 }> {
   const clients = new Map<string, { callTool: (name: string, args: Record<string, unknown>) => Promise<string> }>();
   const schemas: ToolSchema[] = [];
   const wrappers: McpClientWrapper[] = [];
+  const failed: McpConnectFailure[] = [];
 
   for (const [name, spec] of Object.entries(servers)) {
     try {
@@ -184,12 +224,15 @@ export async function connectPlatformMcp(
       // Log URL + type so operators can diagnose 4xx / DNS / TLS without
       // cross-referencing SaFE Tools API responses.
       logger.warn({ err, name, url: spec.url, type: spec.type || "http" }, "mcp_client.connect_failed");
+      clients.delete(name);
+      failed.push({ name, reason: connectFailureReason(err) });
     }
   }
 
   return {
     clients,
     schemas: sortToolSchemasByName(schemas),
+    failed,
     async closeAll() {
       for (const w of wrappers) await w.close();
     },
