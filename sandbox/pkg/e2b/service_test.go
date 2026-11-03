@@ -211,25 +211,31 @@ func (allowMember) Check(context.Context, string, []string) error { return nil }
 
 func TestOriginalCreateReportsFailureBeforeReplay(t *testing.T) {
 	cases := []struct {
-		name string
-		fail error
-		want string
+		name   string
+		fail   error
+		hold   bool
+		reason string
+		want   string
 	}{
-		{name: "workload failed", fail: errors.New("workload sbx-1 phase Failed: allocation generation is Lost"), want: "Lost"},
-		{name: "pending timeout", fail: context.DeadlineExceeded, want: "deadline exceeded"},
+		{name: "workload failed", fail: errors.New("workload sbx-1 phase Failed: CapacityGone: allocation generation is Lost"), reason: "sandbox_create_failed", want: "CapacityGone"},
+		{name: "pending timeout", hold: true, reason: "pending_timeout", want: "not running after 1s"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			svc, runner, keys := testPlane(t, 600, []int32{1}, 1)
+			svc, runner, keys := testPlaneWithSpec(t, 600, []int32{1}, 1, `{"pendingTimeoutSec":1}`)
 			runner.fail = tc.fail
+			if tc.hold {
+				runner.hold = make(chan struct{})
+			}
 			body := CreateBody{TemplateID: "runner", Timeout: 60, Metadata: map[string]string{idempotencyMetadataKey: "once"}}
 			_, _, err := svc.Create(context.Background(), keys["measurement"], body)
 			var oe *grant.OpError
-			if !errors.As(err, &oe) || oe.Status != http.StatusInternalServerError || oe.Reason != "sandbox_create_failed" || !strings.Contains(oe.Detail, tc.want) {
+			if !errors.As(err, &oe) || oe.Status != http.StatusInternalServerError || oe.Reason != tc.reason || !strings.Contains(oe.Detail, tc.want) {
 				t.Fatalf("create=%v", err)
 			}
 			_, _, err = svc.Create(context.Background(), keys["measurement"], body)
-			if !errors.As(err, &oe) || oe.Status != http.StatusGone || oe.Reason != "idempotency_key_spent" {
+			if !errors.As(err, &oe) || oe.Status != http.StatusGone || oe.Reason != "idempotency_key_spent" ||
+				!strings.HasPrefix(oe.Detail, "sbx-") || !strings.Contains(oe.Detail, tc.reason) || !strings.Contains(oe.Detail, tc.want) {
 				t.Fatalf("replay=%v", err)
 			}
 		})

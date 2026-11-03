@@ -497,15 +497,20 @@ func (c *SafeWorkloadCreator) Delete(ctx context.Context, name string) error {
 	return err
 }
 
+// A timeout or a Workload removed while pending names the last phase and status SaFE reported.
 func (c *SafeWorkloadCreator) waitRunning(ctx context.Context, name, workspace string) (string, string, string, error) {
-	var podIP, nodeName, cluster string
+	var podIP, nodeName, cluster, lastPhase, lastText string
 	err := wait.PollUntilContextCancel(ctx, workloadPollInterval, true, func(ctx context.Context) (bool, error) {
 		obj, err := c.dynamic.Resource(workloadGVR).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return false, pendingWorkloadError(fmt.Sprintf("workload %s was removed while pending", name), lastPhase, lastText)
+		}
 		if err != nil {
 			return false, err
 		}
 		cluster = obj.GetLabels()[safeClusterIDLabel]
 		phase, _, _ := unstructured.NestedString(obj.Object, "status", "phase")
+		lastPhase, lastText = phase, workloadFailureText(obj)
 		switch phase {
 		case "Failed", "Succeeded", "Stopped":
 			return false, terminalWorkloadError(name, phase, obj)
@@ -525,10 +530,24 @@ func (c *SafeWorkloadCreator) waitRunning(ctx context.Context, name, workspace s
 			return false, nil
 		}
 	})
+	if err != nil && ctx.Err() != nil {
+		return "", "", cluster, pendingWorkloadError(fmt.Sprintf("workload %s is not running", name), lastPhase, lastText)
+	}
 	if err != nil {
 		return "", "", cluster, err
 	}
 	return podIP, nodeName, cluster, nil
+}
+
+// pendingWorkloadError appends the last observed Workload phase and status to head.
+func pendingWorkloadError(head, phase, text string) error {
+	if phase == "" {
+		phase = "Pending"
+	}
+	if text == "" {
+		return fmt.Errorf("%s: phase %s", head, phase)
+	}
+	return fmt.Errorf("%s: phase %s: %s", head, phase, text)
 }
 
 // nodeFromUsage reads the first admin node recorded on an offloaded Workload.

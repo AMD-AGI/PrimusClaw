@@ -314,11 +314,16 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		AvoidNodes:    excludedNodesLabel(metadata[avoidNodesMetadata]),
 	})
 	if runErr != nil {
-		_ = s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, sandboxID, "create_failed")
 		if errors.Is(runErr, ErrTemplateMissing) {
+			_ = s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, sandboxID, "create_failed")
 			return SandboxResponse{}, 0, grant.Op(http.StatusServiceUnavailable, "template_unavailable", tpl.ID)
 		}
-		return SandboxResponse{}, 0, grant.Op(http.StatusInternalServerError, "sandbox_create_failed", runErr.Error())
+		failed := grant.Op(http.StatusInternalServerError, "sandbox_create_failed", runErr.Error())
+		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+			failed = grant.Op(http.StatusInternalServerError, "pending_timeout", "not running after "+tpl.Pending.String()+": "+runErr.Error())
+		}
+		_ = s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, sandboxID, failed.Error())
+		return SandboxResponse{}, 0, failed
 	}
 	running := grant.RunningUpdate{
 		SandboxName: result.SandboxName,
@@ -359,7 +364,11 @@ func (s *Service) replay(ctx context.Context, grantID string, ref runtimev1alpha
 		return SandboxResponse{}, 0, err
 	}
 	if ref.State == runtimev1alpha1.SandboxEnded {
-		return SandboxResponse{}, 0, grant.Op(http.StatusGone, "idempotency_key_spent", ref.ID)
+		detail := ref.ID
+		if strings.Contains(ref.EndReason, ": ") {
+			detail += "; " + ref.EndReason
+		}
+		return SandboxResponse{}, 0, grant.Op(http.StatusGone, "idempotency_key_spent", detail)
 	}
 	token, err := s.addAccessToken(ctx, grantID, ref.ID)
 	if err != nil {
