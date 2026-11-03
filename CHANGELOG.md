@@ -362,8 +362,10 @@ record it.
 - GitHub review: the acting user's own review mode decides what holds for every review and merge made with their
   account, whoever asked: `high_risk_confirm` (the default, also for a person who never set one) holds as above,
   `fully_auto` holds only what the repository itself requires (`confirm_merge: always`, a `high_risk_paths` match, a
-  configuration that does not parse), a change to the instructions the reviewing model reads, a cut file list (it may
-  hide such a change), and an earlier held,
+  configuration that does not parse), a change to the instructions the reviewing model reads (compared between the
+  base and head commits' trees, not from the file list, so a change hidden among thousands of files is seen; a tree
+  GitHub cuts holds), a file list past GitHub's 3000 files (now read in full up to there, page by page against the
+  session's request budget, instead of 500), and an earlier held,
   refused or unanswered write of the commit. It is kept in Claw
   (`claw_github_review_settings`, by user id, created on start) and read and set by the person themselves with
   `GET` / `PUT /v1/github-review/settings` (`{review_mode}`; the `PUT` needs the person's sign-in or an allowed

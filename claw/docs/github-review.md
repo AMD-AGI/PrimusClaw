@@ -129,8 +129,8 @@ review and the merge and who is the reviewer of record, and whose own standing a
     merge is held as "High risk" says, for the reviewer's judgement, its flags or a hard hold;
   - `fully_auto`: nothing is held except what the repository itself requires (`risk.repo_holds`: its
     configuration's `confirm_merge: always` or a `high_risk_paths` match, a configuration that does not
-    parse, rules that failed), a change to the instructions the reviewing model reads, a file list that
-    was cut (too many files to see them all, so such a change cannot be ruled out), and an earlier write of the same commit that still waits for the person, is
+    parse, rules that failed), a change to the instructions the reviewing model reads (or not being able
+    to tell), a file list cut at GitHub's 3000 files, and an earlier write of the same commit that still waits for the person, is
     being decided by them, was refused by them, or was held and never answered. The other
     gates (CI green, no open thread, merge state `CLEAN`, not the author, delegation, the head commit)
     stand as ever.
@@ -192,9 +192,15 @@ review and the merge and who is the reviewer of record, and whose own standing a
      `.github/claw-review.yml` or the same file under its earlier name), including a file moved out of
      one; the change touches the instructions the reviewing model reads (`repo-skill.ts`
      `isReviewInstructionPath`: a review skill directory under `.claude/skills/` or `.agents/skills/`,
-     the root `AGENTS.md`, `.github/copilot-instructions.md`), which holds under `fully_auto` too; the file list is cut (more files than are read), so neither kind of
-     change can be ruled out, which holds under `fully_auto` too; or the
-     rules themselves fail.
+     the root `AGENTS.md`, `.github/copilot-instructions.md`), which holds under `fully_auto` too. That
+     check does not rely on the file list: the base and head commits' whole trees are read (two requests,
+     `GET /git/trees/{sha}?recursive=1`) and every such path that was added, removed, edited, moved or
+     given another mode counts, however many files the pull request changes. A tree GitHub cut (a very
+     large repository) or could not give holds as well, with that reason. The file list itself is read up
+     to GitHub's limit of 3000 files, 100 a page, each page counted against the session's request budget
+     (`CLAW_GITHUB_REQUESTS_PER_SESSION`; a read that would pass it stops as `request_budget_exhausted`);
+     a pull request with more files is cut, "too many files changed to see them all", which holds under
+     `fully_auto` too; or the rules themselves fail.
 
   Nothing else holds. The rule pack below (version `2026-11-03.1`) is **evidence**: `gh_pr_get` and
   `gh_pr_risk` give it to the model as `risk.evidence`, with `risk.hard_holds`; the `risk_judgement`

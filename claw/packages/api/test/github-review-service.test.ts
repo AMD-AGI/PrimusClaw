@@ -701,6 +701,7 @@ describe("M4 what the change does, and the reviewer's judgement of it", () => {
     await e.sql("UPDATE claw_github_confirmations SET status = 'merging'");
     assert.equal((await merge()).body.status, "confirmation_required", "a deny in flight is not lost to a write");
     await e.sql("DELETE FROM claw_github_confirmations WHERE kind = 'merge'");
+    await e.sql("DELETE FROM claw_github_audit"); // the session's request budget, which this many calls spend
     // A hold nobody answered: closed as expired, or still pending past its time. Asking again until the judgement says low does not get past it.
     for (const expire of ["UPDATE claw_github_confirmations SET status = 'expired'", "UPDATE claw_github_confirmations SET status = 'pending', expires_at = NOW() - INTERVAL '1 second'"]) {
       await e.sql(expire);

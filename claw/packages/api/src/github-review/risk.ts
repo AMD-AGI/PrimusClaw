@@ -108,6 +108,8 @@ export interface RiskInput {
   repoConfig: RepoConfig | null | "invalid";
   /** Escalations only: `security_finding`, `review_skipped`. */
   flags?: string[];
+  /** From the base and head trees; absent when not looked at. Any change, or not knowing, holds under every review mode. */
+  instructions?: InstructionChanges;
   /** The reviewing model's own reading of the change, which decides the hold; none or a malformed one holds. */
   judgement?: ReviewerJudgement | null;
 }
@@ -166,8 +168,14 @@ export function normaliseJudgement(raw: unknown, mask: (text: string) => string 
   return { level, reason: clipped || "the reviewer judged this change high risk and gave no reason" };
 }
 
-/** Most files the reader fetches; a pull request with more has a cut file list, which holds. */
-export const MAX_FILES_READ = 500;
+/** Most files the reader fetches, GitHub's own limit for a pull request's file list; a pull request with more has a cut file list, which holds. */
+export const MAX_FILES_READ = 3000;
+
+/**
+ * How the files the reviewing model's instructions come from differ between the base and the head commit, read from the two commits' trees
+ * (service.ts instructionChanges), not from the file list: `changed` paths, or why that could not be told.
+ */
+export type InstructionChanges = { changed: string[] } | { unreadable: string };
 const MAX_REASONS = 20;
 
 const GOVERNANCE_PATHS: RegExp[] = [
@@ -351,10 +359,11 @@ function assess(input: RiskInput): { findings: Finding[]; hard: Set<string>; rep
   };
 
   // ---- the floor: nothing here reads what the change says, and all of it stays as a backstop.
-  // Size and completeness first: nothing below can be trusted if the list is cut. A cut list cannot show that no file that controls the
-  // repository changed, nor that the review instructions did not (which holds under every review mode, as below), so it holds under every mode.
+  // Size and completeness first: nothing below can be trusted if the list is cut (more than GitHub lists, 3000 files). A cut list cannot show
+  // that no file the repository marks or that controls it changed, so it holds, under every review mode. The review instructions are compared
+  // from the commits' trees instead (`instructions`), whatever the list says.
   if (!input.filesComplete || input.changedFiles > input.files.length) {
-    add("integrity", `too many files changed to see them all (${input.files.length} of ${input.changedFiles} read): the change may include the review instructions`, "repo");
+    add("integrity", `too many files changed to see them all (${input.files.length} of ${input.changedFiles} read)`, "repo");
   }
   if (input.changedFiles > 3000) add("integrity", "more than 3000 files changed: GitHub's file list limit");
   if (input.changedFiles > 40) add("size_breadth", `large change: ${input.changedFiles} files`);
@@ -369,6 +378,13 @@ function assess(input: RiskInput): { findings: Finding[]; hard: Set<string>; rep
   if (input.baseRef !== input.defaultBranch) add("provenance", `the base branch is ${input.baseRef}, not the default branch ${input.defaultBranch}`);
 
   // What the repository asked for holds whatever the reviewer says, and a configuration that cannot be read may have asked for it.
+  const ins = input.instructions;
+  if (ins && "unreadable" in ins) {
+    add("ci_release", `the instructions the reviewing model reads could not be compared between the base and the head (${ins.unreadable}), so a change to them cannot be ruled out`, "repo");
+  } else if (ins) {
+    for (const path of ins.changed) add("ci_release", `the instructions the reviewing model reads changed: ${path}`, "repo");
+  }
+
   if (input.repoConfig === "invalid") add("provenance", `the repository's ${REPO_CONFIG_PATH} could not be read`, "repo");
   const extra = input.repoConfig && input.repoConfig !== "invalid" ? input.repoConfig : null;
   if (extra?.confirmMerge === "always") add("provenance", "the repository asks for confirmation on every merge", "repo");

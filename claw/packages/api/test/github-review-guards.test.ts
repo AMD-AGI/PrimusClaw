@@ -22,7 +22,7 @@ import test, { after, afterEach, beforeEach, describe } from "node:test";
 import { LEGACY_REPO_CONFIG_STEM, LEGACY_RUN_MARKER_PREFIX } from "../src/github-review/legacy-names.js";
 import type { ToolOutcome } from "../src/github-review/service.js";
 import { setReviewMode } from "../src/github-review/store.js";
-import { HEAD } from "./support/fake-github.js";
+import { BASE_TIP, HEAD } from "./support/fake-github.js";
 import { PR, REQUESTER_TOKEN, TOKEN, closeShared, credential, directory, down, reviewEnv as makeEnv, unbound, type ReviewEnv } from "./support/review-env.js";
 
 /**
@@ -83,12 +83,49 @@ describe("K the acting user's review mode, their own setting in Claw, whoever as
     });
   }
 
-  test("K fully_auto still holds a change too large to see whole: the files not read may change the review instructions", async () => {
+  test("K a change to the review instructions is seen however many files the pull request changes: 600 files, AGENTS.md the 550th, under fully_auto", async () => {
+    e = await env({ CLAW_GITHUB_REQUESTS_PER_SESSION: "400" });
     await setReviewMode(e.db, "u-bob", "fully_auto");
+    e.gh.files = Array.from({ length: 600 }, (_, i) => ({ filename: i === 549 ? "AGENTS.md" : `src/pad/a${String(i).padStart(4, "0")}.ts`, status: "modified", additions: 1, deletions: 0, patch: "@@ -1 +1 @@\n-a\n+b" }));
     e.gh.pr.changed_files = 600;
+    e.gh.trees[BASE_TIP] = { tree: [{ path: "AGENTS.md", type: "blob", mode: "100644", sha: "1".repeat(40) }] };
+    e.gh.trees[HEAD] = { tree: [{ path: "AGENTS.md", type: "blob", mode: "100644", sha: "2".repeat(40) }] };
     const o = await merge();
     assert.equal(o.body.status, "confirmation_required", o.text);
-    assert.match((o.body.reasons as string[]).join(), /too many files changed to see them all .*: the change may include the review instructions/);
+    assert.match((o.body.reasons as string[]).join(), /the instructions the reviewing model reads changed: AGENTS\.md/);
+    assert.doesNotMatch((o.body.reasons as string[]).join(), /too many files/, "all 600 files were read");
+    // Seen from the trees alone too: the file list may not show it at all.
+    e = await env({ CLAW_GITHUB_REQUESTS_PER_SESSION: "400" });
+    await setReviewMode(e.db, "u-bob", "fully_auto");
+    e.gh.trees[BASE_TIP] = { tree: [{ path: ".claude/skills/review-pr/SKILL.md", type: "blob", mode: "100644", sha: "1".repeat(40) }] };
+    e.gh.trees[HEAD] = { tree: [{ path: "docs/old-review.md", type: "blob", mode: "100644", sha: "1".repeat(40) }] };
+    const moved = await merge();
+    assert.equal(moved.body.status, "confirmation_required", moved.text);
+    assert.match((moved.body.reasons as string[]).join(), /reads changed: \.claude\/skills\/review-pr\/SKILL\.md/);
+    assert.deepEqual(e.gh.treeReads.map((r) => [r.sha, r.recursive]).sort(), [[BASE_TIP, "1"], [HEAD, "1"]].sort(), "two requests, one per commit");
+  });
+
+  test("K reading a long file list spends the session's request budget page by page, and stops at it", async () => {
+    e = await env({ CLAW_GITHUB_REQUESTS_PER_SESSION: "6" });
+    e.gh.files = Array.from({ length: 900 }, (_, i) => ({ filename: `src/pad/a${i}.ts`, status: "modified", additions: 1, deletions: 0, patch: "@@ -1 +1 @@\n-a\n+b" }));
+    e.gh.pr.changed_files = 900;
+    assert.equal(reason(await merge()), "request_budget_exhausted");
+    assert.ok(e.gh.calls.filter((c) => /\/pulls\/7\/files$/.test(c.path)).length < 9, "it stopped before reading every page");
+    assert.equal(puts().length, 0);
+  });
+
+  test("K a tree GitHub cut, or a change past GitHub's file list, cannot be read whole and is held under fully_auto too", async () => {
+    await setReviewMode(e.db, "u-bob", "fully_auto");
+    e.gh.trees[HEAD] = { truncated: true };
+    const cut = await merge();
+    assert.equal(cut.body.status, "confirmation_required", cut.text);
+    assert.match((cut.body.reasons as string[]).join(), /could not be compared between the base and the head \(the repository is too large/);
+    e = await env();
+    await setReviewMode(e.db, "u-bob", "fully_auto");
+    e.gh.pr.changed_files = 3500;
+    const many = await merge();
+    assert.equal(many.body.status, "confirmation_required", many.text);
+    assert.match((many.body.reasons as string[]).join(), /too many files changed to see them all/);
   });
 
   test("K fully_auto still holds a change to the instructions the reviewing model reads", async () => {

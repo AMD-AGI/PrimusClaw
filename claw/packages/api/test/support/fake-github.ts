@@ -40,7 +40,7 @@ export class FakeGithub {
   pr: Record<string, any> = {
     number: 7, title: "Fix the thing", body: "Fixes the thing.", state: "open", draft: false, merged: false,
     head: { sha: HEAD, ref: "fix", repo: { full_name: "AMD-AGI/demo" } },
-    base: { ref: "main", repo: { full_name: "AMD-AGI/demo" } },
+    base: { ref: "main", sha: BASE_TIP, repo: { full_name: "AMD-AGI/demo" } },
     user: { login: "alice" }, author_association: "MEMBER", additions: 3, deletions: 1, changed_files: 1,
     html_url: "https://github.com/AMD-AGI/demo/pull/7",
   };
@@ -140,6 +140,11 @@ export class FakeGithub {
       return json(200, { sha: "m".repeat(40), merged: true, message: "Pull Request successfully merged" });
     }
     if (/\/git\/ref\/heads\/(.+)$/.test(p)) return json(200, { object: { sha: BASE_TIP } });
+    const tree = /\/git\/trees\/([0-9a-f]{40})$/.exec(p);
+    if (tree) {
+      this.treeReads.push({ sha: tree[1] as string, recursive: call.query.recursive ?? "" });
+      return json(200, { sha: tree[1], truncated: false, tree: [], ...this.trees[tree[1] as string] });
+    }
     const contents = /\/contents\/(.+)$/.exec(p);
     if (contents) {
       const path = decodeURIComponent(contents[1] as string);
@@ -158,6 +163,9 @@ export class FakeGithub {
   };
 
   contentRefs: string[] = [];
+  /** commit sha -> its recursive tree, as `GET /git/trees/{sha}?recursive=1` answers it; a commit not named here has an empty tree. */
+  trees: Record<string, { truncated?: boolean; tree?: Array<{ path: string; type: string; mode?: string; sha: string }> }> = {};
+  treeReads: Array<{ sha: string; recursive: string }> = [];
   /** path -> the path a symlink there points at. */
   symlinks: Record<string, string> = {};
 }

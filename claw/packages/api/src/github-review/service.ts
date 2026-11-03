@@ -27,8 +27,8 @@ import { evaluateChecks, hasMergeQueueRule, requiredContextsFromRules, type Chec
 import { commentableLines } from "./diff.js";
 import { GithubClient, GithubError, GithubGraphqlError, parsePrRef, repoPath, type PrRef } from "./github.js";
 import { LEGACY_REPO_CONFIG_STEM, LEGACY_RUN_MARKER_PREFIX } from "./legacy-names.js";
-import { MAX_FILES_READ, REPO_CONFIG_PATH, assessRisk, diffNotSent, normaliseJudgement, parseRepoConfig, type RepoConfig, type ReviewerJudgement, type RiskFile, type RiskResult } from "./risk.js";
-import { selectReviewInstructions } from "./repo-skill.js";
+import { MAX_FILES_READ, REPO_CONFIG_PATH, assessRisk, type InstructionChanges, diffNotSent, normaliseJudgement, parseRepoConfig, type RepoConfig, type ReviewerJudgement, type RiskFile, type RiskResult } from "./risk.js";
+import { isReviewInstructionPath, selectReviewInstructions } from "./repo-skill.js";
 import { chooseReviewPath, reviewPathAdvice } from "./review-path.js";
 import { isReviewTarget } from "./review-target.js";
 import { SANDBOX_RECIPE_USAGE, buildSandboxRecipe } from "./sandbox-recipe.js";
@@ -98,6 +98,8 @@ interface Ctx {
     /** The audit row has been marked as a write, so it already counts against the limits. */
     reserved?: boolean;
   };
+  /** The call is not held to the session's request budget (a person's answer to a held write, see `decide`). */
+  skipBudget?: boolean;
   /** The base branch's rules as GitHub gave them, read once per call (see `baseRules`); null when they could not be read. */
   rules?: unknown;
 }
@@ -119,6 +121,8 @@ interface PrInfo {
   headSha: string;
   headRef: string;
   baseRef: string;
+  /** The base commit GitHub compares the pull request with; empty when it did not say. */
+  baseSha: string;
   authorLogin: string;
   authorAssociation: string;
   fork: boolean;
@@ -132,6 +136,7 @@ interface Change {
   files: RiskFile[];
   complete: boolean;
   repoConfig: RepoConfig | null | "invalid";
+  instructions: InstructionChanges;
 }
 
 interface PullState {
@@ -584,7 +589,7 @@ export class GithubReview {
       }
       client = new GithubClient({ token: cred.token, apiUrl: settings.apiUrl, fetchImpl: this.deps.fetchImpl });
       const ctx: Ctx = {
-        actor, settings, client, tool, auditId, acc,
+        actor, settings, client, tool, auditId, acc, skipBudget: opts.skipBudget,
         cred: { login: cred.providerLogin, scopes: cred.scopes, delegation: cred.delegation, mode },
       };
       outcome = await body(ctx, ref);
@@ -707,11 +712,11 @@ export class GithubReview {
     };
     const p = (await ctx.client.get<Record<string, unknown>>(repoPath(ref, `/pulls/${ref.number}`))).json ?? {};
     const head = (p.head ?? {}) as { sha?: string; ref?: string; repo?: { full_name?: string } | null };
-    const base = (p.base ?? {}) as { ref?: string; repo?: { full_name?: string } | null };
+    const base = (p.base ?? {}) as { ref?: string; sha?: string; repo?: { full_name?: string } | null };
     const pr: PrInfo = {
       number: ref.number, title: String(p.title ?? ""), body: String(p.body ?? ""), state: String(p.state ?? ""),
       draft: p.draft === true, merged: p.merged === true, headSha: String(head.sha ?? "").toLowerCase(), headRef: String(head.ref ?? ""),
-      baseRef: String(base.ref ?? ""), authorLogin: String((p.user as { login?: string } | undefined)?.login ?? ""),
+      baseRef: String(base.ref ?? ""), baseSha: String(base.sha ?? "").toLowerCase(), authorLogin: String((p.user as { login?: string } | undefined)?.login ?? ""),
       authorAssociation: String(p.author_association ?? ""),
       fork: !head.repo || !base.repo || String(head.repo.full_name).toLowerCase() !== String(base.repo.full_name).toLowerCase(),
       additions: Number(p.additions ?? 0), deletions: Number(p.deletions ?? 0), changedFiles: Number(p.changed_files ?? 0),
@@ -725,7 +730,13 @@ export class GithubReview {
   private async collectChange(ctx: Ctx, ref: PrRef, pr: PrInfo): Promise<Change> {
     const files: RiskFile[] = [];
     const limit = Math.min(pr.changedFiles, MAX_FILES_READ);
+    // Every page is a request against the session's budget, which is checked here as well as at the start of the call: a large pull request
+    // must not run a session past it in one read.
+    const spentBefore = ctx.skipBudget ? 0 : await sessionRequestCount(this.deps.db, ctx.actor.sessionId);
     for (let page = 1; files.length < limit && page <= Math.ceil(MAX_FILES_READ / FILE_PAGE); page++) {
+      if (page > 1 && !ctx.skipBudget && spentBefore + ctx.client.requests >= ctx.settings.requestsPerSession) {
+        throw new Refusal("request_budget_exhausted", `this session has used its ${ctx.settings.requestsPerSession} GitHub requests while reading the changed files`);
+      }
       const a = await ctx.client.get<Array<Record<string, unknown>>>(repoPath(ref, `/pulls/${ref.number}/files`), { per_page: FILE_PAGE, page });
       const batch = Array.isArray(a.json) ? a.json : [];
       for (const f of batch) {
@@ -753,14 +764,40 @@ export class GithubReview {
       if (err instanceof GithubError && err.rateLimited) throw err;
       repoConfig = "invalid";
     }
-    return { files, complete: files.length >= pr.changedFiles && pr.changedFiles <= MAX_FILES_READ, repoConfig };
+    const instructions = await this.instructionChanges(ctx, ref, pr);
+    return { files, complete: files.length >= pr.changedFiles && pr.changedFiles <= MAX_FILES_READ, repoConfig, instructions };
+  }
+
+  /**
+   * Which of the files the reviewing model's instructions are read from (repo-skill.ts isReviewInstructionPath) differ between the base
+   * commit and the head, from the two commits' whole trees (two requests, `GET /git/trees/{sha}?recursive=1`) and not from the pull
+   * request's file list, which GitHub cuts at 3000 files: a change to them is seen however many other files the pull request changes. A
+   * path added, removed, edited, moved or given another mode is a change. A tree GitHub cut (a very large repository), or one that could
+   * not be read, says nothing either way, and is answered as such.
+   */
+  private async instructionChanges(ctx: Ctx, ref: PrRef, pr: PrInfo): Promise<InstructionChanges> {
+    if (!SHA_RE.test(pr.baseSha)) return { unreadable: "GitHub did not give the base commit" };
+    type Tree = { truncated?: boolean; tree?: Array<{ path?: string; type?: string; mode?: string; sha?: string }> };
+    let trees: Tree[];
+    try {
+      trees = await Promise.all([pr.baseSha, pr.headSha].map(async (sha) => (await ctx.client.get<Tree>(repoPath(ref, `/git/trees/${sha}`), { recursive: "1" })).json ?? {}));
+    } catch (err) {
+      if (err instanceof GithubError && err.rateLimited) throw err;
+      return { unreadable: "the base or the head commit's file tree could not be read" };
+    }
+    if (trees.some((t) => t.truncated !== false || !Array.isArray(t.tree))) return { unreadable: "the repository is too large for GitHub to list its files whole" };
+    const [base, head] = trees.map((t) => new Map((t.tree ?? [])
+      .filter((e) => e.type !== "tree" && typeof e.path === "string" && isReviewInstructionPath(e.path))
+      .map((e) => [e.path as string, `${e.mode ?? ""}:${e.sha ?? ""}`]))) as [Map<string, string>, Map<string, string>];
+    const changed = [...new Set([...base.keys(), ...head.keys()])].filter((p) => base.get(p) !== head.get(p)).sort();
+    return { changed };
   }
 
   private riskInput(pr: PrInfo, repo: RepoInfo, change: Change, flags: string[] = [], judgement: ReviewerJudgement | null = null): Parameters<typeof assessRisk>[0] {
     return {
       files: change.files, changedFiles: pr.changedFiles, filesComplete: change.complete, additions: pr.additions, deletions: pr.deletions,
       fork: pr.fork, authorAssociation: pr.authorAssociation, baseRef: pr.baseRef, defaultBranch: repo.defaultBranch,
-      repoConfig: change.repoConfig, flags, judgement,
+      repoConfig: change.repoConfig, instructions: change.instructions, flags, judgement,
     };
   }
 
