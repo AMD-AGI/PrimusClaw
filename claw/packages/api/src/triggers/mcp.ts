@@ -16,7 +16,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import pino from "pino";
 import { z } from "zod";
-import { TRIGGER_MCP_SERVER } from "@claw/protocol";
+import { TRIGGER_MCP_PATH, TRIGGER_MCP_SERVER } from "@claw/protocol";
 import { tokenTtlSeconds } from "../assistant/role-profile.js";
 import {
   CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGER_TOOLS_TOKEN_KEY, INTERNAL_BACKEND_URL, TRIGGER_MIN_INTERVAL_MINUTES,
@@ -28,8 +28,7 @@ import { ToolRefused, triggerCancel, triggerCreate, triggerList } from "./tools.
 
 const logger = pino({ name: "trigger-mcp" });
 
-export { TRIGGER_MCP_SERVER };
-export const TRIGGER_MCP_PATH = "/v1/internal/trigger-mcp";
+export { TRIGGER_MCP_PATH, TRIGGER_MCP_SERVER };
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 

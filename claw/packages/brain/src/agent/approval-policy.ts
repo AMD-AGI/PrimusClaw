@@ -42,7 +42,7 @@
  * argument that matters, or leave the tool unlisted.
  */
 import pino from "pino";
-import { TRIGGER_MCP_SERVER } from "@claw/protocol";
+import { isTriggerMcpServer } from "@claw/protocol";
 
 const logger = pino({ name: "approval-policy" });
 
@@ -50,7 +50,7 @@ export interface ApprovalPolicy {
   /** True when at least one server declares a rule. */
   readonly active: boolean;
   /**
-   * True when a server other than the platform's trigger server declares one. Only such a rule makes the
+   * True when a server other than the platform's trigger server (`isTriggerMcpServer`) declares one. Only such a rule makes the
    * turn one whose every tool HITL_ENABLED asks about; the trigger server's rule holds its own tools alone.
    */
   readonly operatorActive: boolean;
@@ -189,7 +189,7 @@ export function approvalPolicyFromMcp(
       autos.push(match);
     }
     if (holds.length === 0) continue;
-    rules.push({ prefix, holds: (bare) => holds.some((h) => h(bare)), autos, operator: name !== TRIGGER_MCP_SERVER });
+    rules.push({ prefix, holds: (bare) => holds.some((h) => h(bare)), autos, operator: !isTriggerMcpServer(name, spec) });
   }
   const held = (r: ServerRule, toolName: string): boolean =>
     toolName.startsWith(r.prefix) && r.holds!(toolName.slice(r.prefix.length));

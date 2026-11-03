@@ -16,7 +16,7 @@ process.env.HITL_ENABLED = "true";
 // Short, so a call that is wrongly held fails this suite in seconds rather than after the default wait.
 process.env.HITL_DECISION_TIMEOUT_MS = "2000";
 
-import { TRIGGER_MCP_SERVER } from "@claw/protocol";
+import { TRIGGER_MCP_PATH, TRIGGER_MCP_SERVER } from "@claw/protocol";
 import { startWorld, fakeHands, baseRequest } from "./support/platform-defaults-world.js";
 import { startPluginWorld, uniqueSession } from "./support/plugin-world.js";
 import { fakeNats } from "./support/fake-nats.js";
@@ -27,14 +27,15 @@ const { AgentEngine } = await import("../src/agent/engine.js");
 const { HITL_ENABLED } = await import("../src/config.js");
 test.after(async () => { await world.close(); await pw.close(); });
 
-/** The server entry `applyTriggerToolsToTask` adds, pointed at the stub MCP server. */
-const triggerServer = { type: "http", url: pw.mcpUrl, token: "t", requires_approval: ["trigger_create", "trigger_cancel"] };
-const operatorPlugin = {
-  id: 17, type: "mcp", name: "board",
-  config: { mcpServers: { board: { type: "http", url: pw.mcpUrl, token: "t", requires_approval: ["stop"] } } },
-};
+/** The server entry `applyTriggerToolsToTask` adds, at the API's path on the stub MCP server (it answers any path). */
+const triggerUrl = `${new URL(pw.mcpUrl).origin}${TRIGGER_MCP_PATH}`;
+const triggerServer = { type: "http", url: triggerUrl, token: "t", requires_approval: ["trigger_create", "trigger_cancel"] };
+const operatorPlugin = (name: string) => ({
+  id: 17, type: "mcp", name,
+  config: { mcpServers: { [name]: { type: "http", url: pw.mcpUrl, token: "t", requires_approval: ["stop"] } } },
+});
 
-async function run(tool: string, opts: { operatorPolicy?: boolean; decision?: string } = {}) {
+async function run(tool: string, opts: { operatorPolicy?: string; trigger?: boolean; decision?: string } = {}) {
   world.script([{ tool, input: {} }, { text: "done" }]);
   world.llmBodies.length = 0;
   const nats = fakeNats();
@@ -50,8 +51,8 @@ async function run(tool: string, opts: { operatorPolicy?: boolean; decision?: st
   await new AgentEngine().execute(
     baseRequest({
       session_id: uniqueSession(),
-      mcp_servers: { [TRIGGER_MCP_SERVER]: triggerServer },
-      ...(opts.operatorPolicy ? { plugin_id: 5, plugin_tools: [operatorPlugin] } : {}),
+      ...(opts.trigger === false ? {} : { mcp_servers: { [TRIGGER_MCP_SERVER]: triggerServer } }),
+      ...(opts.operatorPolicy ? { plugin_id: 5, plugin_tools: [operatorPlugin(opts.operatorPolicy)] } : {}),
     }),
     onEvent as never, undefined, null as never,
     { attachHands: async () => fakeHands() as never, natsConnection: nats } as never,
@@ -83,7 +84,13 @@ test("trigger_create is still held for the user", async () => {
 });
 
 test("an operator's own policy still makes HITL_ENABLED ask about the other tools", async () => {
-  const r = await run(`mcp__${TRIGGER_MCP_SERVER}__ping`, { operatorPolicy: true, decision: "allow" });
+  const r = await run(`mcp__${TRIGGER_MCP_SERVER}__ping`, { operatorPolicy: "board", decision: "allow" });
   assert.deepEqual(r.asked, [`mcp__${TRIGGER_MCP_SERVER}__ping`], "HITL_ENABLED asks once an operator policy is in play");
   assert.equal(r.ran, 1, "and the allowed call runs");
+});
+
+test("an operator's server that only shares the trigger server's name is still a policy", async () => {
+  const r = await run(`mcp__${TRIGGER_MCP_SERVER}__ping`, { operatorPolicy: TRIGGER_MCP_SERVER, trigger: false, decision: "allow" });
+  assert.deepEqual(r.asked, [`mcp__${TRIGGER_MCP_SERVER}__ping`], "known by name and path, not by name alone");
+  assert.equal(r.ran, 1);
 });
