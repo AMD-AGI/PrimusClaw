@@ -21,6 +21,8 @@
  *                        restart (needs KUBECTL_ROLLOUT, e.g. "deployment/claw-api -n claw"),
  *                        receiver (a receiver that refuses, then a fallback; takes SILENT_SWEEP_SEC)
  *   SILENT_SWEEP_SEC     the deployment's CLAW_ASSISTANT_SILENT_SWEEP_SEC (default 300)
+ *   RECEIVER_HOLD_SEC    how long the receiver refuses in the "receiver" chaos step (default SILENT_SWEEP_SEC + 60;
+ *                        must be longer than SILENT_SWEEP_SEC, or the system's own message is not yet due)
  *   DONE_WAIT_SEC        how long to wait for a task to finish (default 1200)
  *
  * Exit 0 only if every check passed. The last line is a JSON summary.
@@ -48,7 +50,12 @@ const KEY_B = process.env.KEY_B;
 const SOAK_ROUNDS = Number(process.env.SOAK_ROUNDS ?? 0);
 const CHAOS = new Set((process.env.CHAOS ?? "").split(",").map((s) => s.trim()).filter(Boolean));
 const SILENT_SWEEP_SEC = Number(process.env.SILENT_SWEEP_SEC ?? 300);
+const RECEIVER_HOLD_SEC = Number(process.env.RECEIVER_HOLD_SEC ?? SILENT_SWEEP_SEC + 60);
 const DONE_WAIT_MS = Number(process.env.DONE_WAIT_SEC ?? 1200) * 1000;
+if (CHAOS.has("receiver") && RECEIVER_HOLD_SEC <= SILENT_SWEEP_SEC) {
+  console.error(`RECEIVER_HOLD_SEC (${RECEIVER_HOLD_SEC}) must be longer than SILENT_SWEEP_SEC (${SILENT_SWEEP_SEC})`);
+  process.exit(2);
+}
 /** The plan's budget for the assistant to answer a message the user sends while work runs. */
 const SAY_BUDGET_MS = 10_000;
 
@@ -89,7 +96,7 @@ async function main(): Promise<void> {
 
   // 0. The user, the subscription, the assistant.
   const sub = await api("POST", "/v1/notification-subscriptions", { url: hookUrl, event_types: ["assistant.say", "work_item.needs_you"] });
-  if (!check(sub.status === 201, `a subscription for assistant.say and work_item.needs_you is accepted (${sub.status} ${JSON.stringify(sub.json).slice(0, 120)})`)) return;
+  if (!check(sub.status === 201, `a subscription for assistant.say and work_item.needs_you is accepted (${sub.status}${sub.status === 201 ? "" : ` ${JSON.stringify(sub.json?.error ?? sub.json).slice(0, 120)}`})`)) return;
   receiver.setSecret(sub.json.data.secret);
   const subscriptionId = sub.json.data.subscription_id ?? sub.json.data.id;
   const assistant = await api("POST", "/v1/assistant");
@@ -276,7 +283,7 @@ async function refusedReceiver(send: Send, receiver: Rec, newItem: NewItem, know
   known.add(item!.item_id);
   const needs = await until(async () => (await itemOf(item!.item_id))?.board_state === "needs_you" ? true : undefined, Date.now() + DONE_WAIT_MS, 2000);
   check(needs === true, "chaos receiver: the board shows it needs the user while no message could be delivered");
-  const waitUntil = Date.now() + (SILENT_SWEEP_SEC + 60) * 1000;
+  const waitUntil = Date.now() + RECEIVER_HOLD_SEC * 1000;
   log(`chaos receiver: holding the receiver closed until ${new Date(waitUntil).toISOString()}`);
   await until(() => (Date.now() >= waitUntil ? true : undefined), waitUntil + 1000, 5000);
   receiver.setRejecting(false);
