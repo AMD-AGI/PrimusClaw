@@ -343,8 +343,8 @@ record it.
 - GitHub review: whether an `APPROVE` or a merge made with someone else's account waits for that person's
   confirmation is now decided by the reviewing model's `risk_judgement` (`high` holds, `low` lets it through the
   other gates), not by the rule pack (`claw/packages/api/src/github-review/risk.ts`, `assessRisk`; rule pack
-  `2026-11-03.1`). The rules are given to the model as evidence (`risk.evidence`, `risk.hard_holds` and
-  `risk.guidance` in `gh_pr_get` and `gh_pr_risk`) and no longer hold on their own: a large change, an author
+  `2026-11-03.1`). The rules are given to the model as evidence (`risk.evidence` and `risk.hard_holds` in
+  `gh_pr_get` and `gh_pr_risk`; what to hold for is in the `risk_judgement` description and the review instructions) and no longer hold on their own: a large change, an author
   outside the organisation (the person who asked is very often the author), a fork, another base branch, an
   interface or dependency change are for the model to weigh. Before, nearly every approval of an ordinary large
   pull request by a contributor was held. What still holds whatever the model says: the repository's own
