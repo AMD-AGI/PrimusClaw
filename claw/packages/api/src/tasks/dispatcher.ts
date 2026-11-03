@@ -449,7 +449,7 @@ function buildExecuteRequest(opts: {
     workspace_id: extractSandboxNamespace(sandboxSpecForBrain) || session.workspace_id || undefined,
     platform_key: session.platform_key || "",
     llm_api_key: session.llm_api_key || undefined,
-    ...(session.withhold_sandbox_keys ? { withhold_sandbox_keys: true, ...actingSessionEffort() } : {}),
+    ...(session.withhold_sandbox_keys ? { withhold_sandbox_keys: true, ...actingSessionEffort(updated.model ?? undefined) } : {}),
     user_id: session.user_id || "",
     user_env: userEnvForReq,
     plugin_id: updated.plugin_id ?? undefined,

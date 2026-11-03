@@ -438,8 +438,8 @@ A sandbox costs a cold start of about 16 seconds. A small change that touches no
 default 200, in at most `CLAW_GITHUB_REVIEW_FAST_MAX_FILES` files) needs none: `gh_pr_get`
 returns the diff, the file list and the metadata, and says `review_path.path = "api_diff"`.
 Every other change is reviewed with a sandbox (`"sandbox"`), and the instructions require it: a
-non-test source file changed (`source_change`: a code, shell or SQL file by extension, outside
-`test/`, `tests/`, `__tests__/`, `spec/`, `fixtures/`, `testdata/`, `e2e/` and not named like a test,
+non-test source file changed (`source_change`: a code, shell, SQL or interface-schema (`.proto`, `.thrift`, `.graphql`) file by extension, outside
+`test/`, `tests/`, `__tests__/`, `spec/`, `fixtures/`, `testdata/`, `e2e/`, `*.Tests/` and not named like a test,
 `*.test.*`, `*.spec.*`, `*_test.go`, `test_*.py`), the change is large, GitHub did not send the diff of
 some file (a binary, a rename or a diff too large, whatever the line counts say), the file list is incomplete, or the repository has a review skill of its own, which
 may use scripts. On that path the model checks the pull request out, reads the callers of every
@@ -518,7 +518,7 @@ logs and the audit rows.
 | `CLAW_GITHUB_REVIEW_FAST_MAX_FILES` | 15 | At most this many changed files for the diff-only path |
 | `CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES` | 200 | At most this many added plus deleted lines for the diff-only path; a change of a non-test source file takes the sandbox path whatever its size |
 | `CLAW_GITHUB_REVIEW_MODEL` | `claude-sonnet-5.5` | The model of a session created with `config.acting_as` when the request names none (`model` absent or null); a request's own `model` wins. `default` leaves Brain's `DEFAULT_MODEL`. The requester's key pays for it |
-| `CLAW_GITHUB_REVIEW_EFFORT` | unset | The reasoning effort of every turn of such a session, its sub-agents included (`low`, `medium`, `high`; Anthropic `output_config.effort`, OpenAI `reasoning_effort`). Unset sends neither field, so the model's own default applies, as before; another value is reported and sends none |
+| `CLAW_GITHUB_REVIEW_EFFORT` | unset | The reasoning effort of every turn of such a session, its sub-agents included (`low`, `medium`, `high`; Anthropic `output_config.effort`, OpenAI `reasoning_effort`). Sent only while the session runs on `CLAW_GITHUB_REVIEW_MODEL` (a model its creator named instead may refuse the field). Unset sends neither field, so the model's own default applies, as before; another value is reported and sends none |
 
 The identity provider must give the API's own client the `identity.credential.resolve` scope
 (see [identity-client.md](identity-client.md), external credentials). Without a bound credential

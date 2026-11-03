@@ -69,13 +69,13 @@ const ACTING: Array<[string, unknown, boolean]> = [
   ["no acting_as", undefined, false],
 ];
 
-async function claim(actingAs: unknown): Promise<{ request: Record<string, unknown>; asked: string[] }> {
+async function claim(actingAs: unknown, model = "claude-sonnet-5.5"): Promise<{ request: Record<string, unknown>; asked: string[] }> {
   const asked: string[] = [];
   db.query = (async (text: string) => {
     const sql = text.replace(/\s+/g, " ").trim();
     asked.push(sql);
     if (/UPDATE claw_tasks/.test(sql)) {
-      return { rows: [{ task_id: "ktsk_1", session_id: "s-1", status: "preparing", deadline_at: null, input: { prompt: "hello", session_id: "s-1", user_id: "u-1", credentials: blob } }], rowCount: 1 };
+      return { rows: [{ task_id: "ktsk_1", session_id: "s-1", status: "preparing", deadline_at: null, input: { prompt: "hello", session_id: "s-1", user_id: "u-1", model, credentials: blob } }], rowCount: 1 };
     }
     if (/SELECT config->'acting_as' AS acting_as FROM claw_sessions/.test(sql)) return { rows: actingAs === undefined ? [{ acting_as: null }] : [{ acting_as: actingAs }], rowCount: 1 };
     return { rows: [], rowCount: 0 };
@@ -90,6 +90,7 @@ test("D1 a turn claimed from the queue is marked for a session that acts as a us
     const { request } = await claim(actingAs);
     assert.equal(request.withhold_sandbox_keys, marked ? true : undefined, what);
     assert.equal(request.effort, marked ? "high" : undefined, `${what}: a review runs at the review's effort`);
+    assert.equal((await claim(actingAs, "gpt-4o")).request.effort, undefined, `${what}: not on a model the effort was not set for`);
     assert.equal(request.platform_key, "pk-live", `${what}: Brain still needs the key for the model and for SaFE`);
     assert.equal(request.llm_api_key, "sk-live", what);
   }
@@ -98,7 +99,7 @@ test("D1 a turn claimed from the queue is marked for a session that acts as a us
 const NOW = new Date().toISOString();
 const taskRow = () => ({
   task_id: "t-1", session_id: "s-1", status: "preparing", mode: "script", prompt: "", input: {}, plugin_id: null, sandbox_spec: "none",
-  dag_root_task_id: null, started_at: NOW, created_at: NOW,
+  dag_root_task_id: null, started_at: NOW, created_at: NOW, model: "claude-sonnet-5.5",
 });
 
 async function dispatchDag(config: Record<string, unknown>): Promise<Record<string, unknown>> {

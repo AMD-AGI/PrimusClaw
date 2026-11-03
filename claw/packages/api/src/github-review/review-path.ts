@@ -52,10 +52,10 @@ export function chooseReviewPath(
   return { path: "api_diff", reason: "small_diff" };
 }
 
-/** Files a program is built from or runs, by extension: code, shell, SQL (a migration is code). */
-const SOURCE_EXT = /\.(?:[cm]?[jt]sx?|py|go|rs|java|kt|kts|scala|c|cc|cpp|cxx|h|hh|hpp|cu|cs|rb|php|swift|m|mm|sh|bash|zsh|ps1|sql|lua|pl|ex|exs|erl|hs|ml|clj|dart|vue|svelte)$/i;
+/** Files a program is built from or runs, by extension: code, shell, SQL (a migration is code), interface schemas. */
+const SOURCE_EXT = /\.(?:[cm]?[jt]sx?|py|go|rs|java|kt|kts|scala|c|cc|cpp|cxx|h|hh|hpp|cu|cs|rb|php|swift|m|mm|sh|bash|zsh|ps1|sql|lua|pl|ex|exs|erl|hs|ml|clj|dart|vue|svelte|proto|thrift|graphql|gql)$/i;
 /** A test by where it lives or how it is named, in the conventions of the languages above. */
-const TEST_DIR = /(?:^|\/)(?:tests?|__tests__|__mocks__|spec|specs|testdata|test-?fixtures|fixtures|e2e)\//i;
+const TEST_DIR = /(?:^|\/)(?:tests?|__tests__|__mocks__|spec|specs|testdata|test-?fixtures|fixtures|e2e|[^/]+\.Tests?)\//i;
 const TEST_NAME = /(?:[._-](?:test|spec)\.[^/]+|_test\.go|(?:^|\/)test_[^/]+\.py|_test\.py|Tests?\.(?:java|kt|cs|swift))$/;
 
 /** A changed file whose change can break what runs: source code that is not a test. */

@@ -31,7 +31,7 @@ record it.
 - A pull request reviewed on someone's behalf is reviewed in depth. A session created with `config.acting_as` and no
   `model` runs on `CLAW_GITHUB_REVIEW_MODEL` (default `claude-sonnet-5.5`, apart from the deployment's `DEFAULT_MODEL`); a
   request's own `model` wins. `CLAW_GITHUB_REVIEW_EFFORT` (unset by default: nothing is sent, as before) runs every turn of
-  it at that effort (new `ExecuteRequest.effort`, which Brain sends as `output_config.effort`, or `reasoning_effort`, on every
+  it at that effort while it runs on that model (new `ExecuteRequest.effort`, which Brain sends as `output_config.effort`, or `reasoning_effort`, on every
   turn and sub-agent of the run). The requester's key pays.
   Any change of a non-test source file, or of more than 200 lines (`CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES`, was
   600), takes the sandbox path (`source_change`), and the default instructions require it: check the pull request

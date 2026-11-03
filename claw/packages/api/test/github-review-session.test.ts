@@ -344,6 +344,10 @@ test("M2 the operator chooses both: another model and an effort for every turn o
       const plain = await create(ALICE, { notify_on_finish: true }, { message: { content: "hello" } });
       assert.equal(plain.status, 200);
       assert.deepEqual([published[0]?.model, "effort" in (published[0] ?? {})], [undefined, false], `${m}/${e}: an ordinary chat session is untouched`);
+      published = [];
+      const own = await create(ALICE, { acting_as: "u-bob" }, { model: "gpt-4o", message: { content: "review it" } });
+      assert.equal(own.status, 200);
+      assert.deepEqual([published[0]?.model, "effort" in (published[0] ?? {})], ["gpt-4o", false], `${m}/${e}: a model the creator named is not sent the review effort, which it may refuse`);
     }
   } finally {
     restore();

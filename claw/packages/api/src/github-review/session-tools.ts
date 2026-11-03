@@ -83,10 +83,14 @@ export async function loadUserEnvForSession(
   return await loadUserEnvSnapshot(q, userId, log);
 }
 
-/** The reasoning effort a turn of a session that acts as a user runs at (`CLAW_GITHUB_REVIEW_EFFORT`), as fields of its request. */
-export function actingSessionEffort(): { effort?: ReasoningEffort } {
-  const effort = readGithubReviewSettings().reviewEffort;
-  return effort ? { effort } : {};
+/**
+ * The reasoning effort a turn of a session that acts as a user runs at (`CLAW_GITHUB_REVIEW_EFFORT`), as fields of its request. Only on
+ * the model the operator set it for: a session whose creator named another model (one that may refuse the field) is sent none.
+ */
+export function actingSessionEffort(model: unknown): { effort?: ReasoningEffort } {
+  const settings = readGithubReviewSettings();
+  const onReviewModel = (model === undefined || model === null || model === "") ? settings.reviewModel === null : model === settings.reviewModel;
+  return settings.reviewEffort && onReviewModel ? { effort: settings.reviewEffort } : {};
 }
 
 /**
@@ -98,7 +102,7 @@ export async function applySandboxKeyPolicyToTask(task: Record<string, unknown>,
   if (!(await sessionWithholdsSandboxKeys(sessionId))) return;
   task.withhold_sandbox_keys = true;
   delete task.user_env;
-  Object.assign(task, actingSessionEffort());
+  Object.assign(task, actingSessionEffort(task.model));
 }
 
 export async function githubReviewMcpServers(sessionId: string): Promise<McpServers> {
