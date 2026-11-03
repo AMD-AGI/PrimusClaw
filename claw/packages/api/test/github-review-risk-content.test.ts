@@ -677,7 +677,7 @@ const HOLD_INPUTS: Array<[string, RiskInput, "hard" | "judged"]> = [
   ["a repository that asks on every merge", input([mod("src/a.ts", "@@ -1 +1 @@\n-a\n+b")], { repoConfig: { confirmMerge: "always", highRiskPaths: [] } }), "hard"],
   ["a path the repository marks", input([mod("docs/legal/terms.md", "@@ -1 +1 @@\n-a\n+b")], { repoConfig: { confirmMerge: "risk", highRiskPaths: ["docs/legal/**"] } }), "hard"],
   ["a repository configuration that does not parse", input([mod("src/a.ts", "@@ -1 +1 @@\n-a\n+b")], { repoConfig: "invalid" }), "hard"],
-  ["a file list that was cut", input([mod("src/a.ts", "@@ -1 +1 @@\n-a\n+b")], { changedFiles: 4000, filesComplete: false }), "hard"],
+  ["a file list that was cut", input([mod("src/a.ts", "@@ -1 +1 @@\n-a\n+b")], { changedFiles: 600, filesComplete: false }), "hard"],
 ];
 const JUDGEMENTS: Array<[string, unknown, boolean]> = [
   ["low", { level: "low", reason: "an ordinary change the description explains" }, false],

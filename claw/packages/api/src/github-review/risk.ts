@@ -341,7 +341,7 @@ function assess(input: RiskInput): { findings: Finding[]; hard: Set<string> } {
   if (!input.filesComplete || input.changedFiles > input.files.length) {
     add("integrity", `the change list is incomplete (${input.files.length} of ${input.changedFiles} files read)`, true);
   }
-  if (input.changedFiles > 3000) add("integrity", "more than 3000 files changed: GitHub's file list limit", true);
+  if (input.changedFiles > 3000) add("integrity", "more than 3000 files changed: GitHub's file list limit");
   if (input.changedFiles > 40) add("size_breadth", `large change: ${input.changedFiles} files`);
   if (input.additions + input.deletions > 1000) add("size_breadth", `large change: ${input.additions + input.deletions} lines`);
   if (input.deletions > 300) add("size_breadth", `${input.deletions} lines deleted`);
