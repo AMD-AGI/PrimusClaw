@@ -50,9 +50,9 @@ import sys
 
 NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 CM_RE = re.compile(r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$")
-# A Secret key is what Kubernetes calls a config-map key: letters, digits, '-', '_'
+# A key of a Secret is what Kubernetes calls a config-map key: letters, digits, '-', '_'
 # and '.', at most 253 characters, not "." and not starting with "..".
-SECRET_KEY_RE = re.compile(r"^[-._a-zA-Z0-9]+$")
+OBJECT_KEY_RE = re.compile(r"^[-._a-zA-Z0-9]+$")
 MAX_NAME = 253
 TARGETS = {"API": "api", "BRAIN": "brain"}
 # Where the chart writes down the directories it mounts into each container; the
@@ -90,7 +90,7 @@ def chart_mounts(key):
         die("cannot read what the chart mounts into %s from %s: %s" % (key, CHART_MOUNT_PATHS, e))
 
 
-def secret_env(tag):
+def referenced_env(tag):
     """[(variable, env name, Secret name, key)] for EXTRA_SECRET_ENV_<tag>_*, in name order.
 
     A malformed entry is a refusal that names the variable and not its value.
@@ -105,7 +105,7 @@ def secret_env(tag):
             die("%s: %r is not a valid environment variable name" % (var, name))
         holder, sep, item = value.partition(":")
         if (not sep or len(holder) > MAX_NAME or not CM_RE.match(holder)
-                or len(item) > MAX_NAME or not SECRET_KEY_RE.match(item) or item == "." or item.startswith("..")):
+                or len(item) > MAX_NAME or not OBJECT_KEY_RE.match(item) or item == "." or item.startswith("..")):
             die("%s must be <secret>:<key>, the name of a Secret (lowercase letters, digits, '-' and '.') "
                 "and one of its keys (letters, digits, '-', '_' and '.'); what it holds is not repeated here" % var)
         refs.append((var, name, holder, item))
@@ -163,16 +163,18 @@ def env_blocks(text):
 
 def read_rendered(tag, path):
     """The text of a rendered Deployment; one that cannot be read is a refusal, not a pass."""
+    text = ""
     try:
         with open(path, encoding="utf-8") as f:
-            return f.read()
+            text = f.read()
     except (OSError, ValueError) as e:
         die("cannot read the rendered %s Deployment to check its env from %s: %s" % (TARGETS[tag], path, e))
+    return text
 
 
 def check_rendered(tag, path):
     """Refuse a Secret env name that the chart renders into the container as well."""
-    refs = secret_env(tag)
+    refs = referenced_env(tag)
     if not refs:
         return
     blocks = env_blocks(read_rendered(tag, path))
@@ -202,7 +204,7 @@ for tag, key in TARGETS.items():
 
     # After the plain entries, so a file with no Secret env renders what it always did.
     plain = {e["name"]: "EXTRA_ENV_%s_%s" % (tag, e["name"]) for e in env}
-    for var, name, holder, item in secret_env(tag):
+    for var, name, holder, item in referenced_env(tag):
         if name in plain:
             die("%s: %s is already set by %s; an env var can be set once per container, so keep one of them"
                 % (var, name, plain[name]))
