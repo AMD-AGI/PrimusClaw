@@ -150,6 +150,8 @@ interface PullState {
 }
 
 /** What one `gh_pr_get` read from GitHub, kept for the pages of the same head (see `reviewRead`). */
+type Inline = Partial<Record<Exclude<Section, "overview">, string>>;
+
 interface ReviewRead {
   pr: PrInfo;
   files: RiskFile[];
@@ -200,6 +202,10 @@ const MAX_REVIEW_PAGES = 10;
 const THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){
   id mergeStateStatus mergeable reviewDecision headRefOid isMergeQueueEnabled isInMergeQueue mergeQueueEntry{id position state}
   reviewThreads(first:100){totalCount nodes{isResolved}}}}}`;
+
+/** What a page served from a session's read asks of GitHub: the repository as it is now (the gates of `readRepo`) and the head. */
+const PAGE_GATE_QUERY = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){
+  owner{login} isPrivate visibility isArchived isDisabled pullRequest(number:$number){headRefOid}}}`;
 
 /**
  * Puts the pull request in the base branch's merge queue as the acting user. expectedHeadOid is the head commit the review read: GitHub refuses
@@ -272,7 +278,7 @@ export class GithubReview {
     const key = [ctx.actor.sessionId, ctx.actor.actorUserId, ref.owner.toLowerCase(), ref.repo.toLowerCase(), ref.number].join("\n");
     const known = pinned ? this.reads.get(key) : undefined;
     if (known && known.pr.headSha === pinned) {
-      this.requireHead(await this.readPull(ctx, ref), known.pr.headSha);
+      await this.requirePageStillValid(ctx, ref, known.pr);
       this.reads.delete(key);
       this.reads.set(key, known);
       return known;
@@ -342,10 +348,23 @@ export class GithubReview {
     };
   }
 
+  /** The overview, with the index of the sections and the ones in `inline` whole in it. */
+  private overviewBody(read: ReviewRead, file: string | null, inline: Inline): Record<string, unknown> {
+    const sections = Object.fromEntries(PAGED_SECTIONS.map((s) => [s, { chars: this.sectionText(read, s, file).length, inline: s in inline }]));
+    const untrusted = { title: clip(read.pr.title, 300), ...(inline.files !== undefined ? { files: inline.files } : {}),
+      ...(inline.conversation !== undefined ? { conversation: inline.conversation } : {}), ...(inline.diff !== undefined ? { diff: inline.diff } : {}) };
+    return {
+      ...read.overview, how_to_read: HOW_TO_READ, sections,
+      ...(inline.instructions !== undefined ? { review_instructions: inline.instructions } : {}),
+      untrusted,
+    };
+  }
+
   /** A section's whole text: `file` narrows the diff to one file's part. */
   private sectionText(read: ReviewRead, section: Section, file: string | null): string {
     switch (section) {
-      case "overview": return JSON.stringify(read.overview);
+      // Read in pages only when it does not fit in one answer, and then with the index of what else to read, none of it inline.
+      case "overview": return JSON.stringify(this.overviewBody(read, file, {}));
       case "instructions": return read.instructions;
       case "files": return filesText(read.files);
       case "diff": return diffText(read.files, file);
@@ -358,17 +377,8 @@ export class GithubReview {
    * their length, to be read in pages. Null when the overview does not fit by itself, and is then read in pages too.
    */
   private overviewAnswer(read: ReviewRead, file: string | null, redact: (t: string) => string): ToolOutcome | null {
-    const inline: Partial<Record<Exclude<Section, "overview">, string>> = {};
-    const render = (): Record<string, unknown> => {
-      const sections = Object.fromEntries(PAGED_SECTIONS.map((s) => [s, { chars: this.sectionText(read, s, file).length, inline: s in inline }]));
-      const untrusted = { title: clip(read.pr.title, 300), ...(inline.files !== undefined ? { files: inline.files } : {}),
-        ...(inline.conversation !== undefined ? { conversation: inline.conversation } : {}), ...(inline.diff !== undefined ? { diff: inline.diff } : {}) };
-      return {
-        ...read.overview, how_to_read: HOW_TO_READ, sections,
-        ...(inline.instructions !== undefined ? { review_instructions: inline.instructions } : {}),
-        untrusted,
-      };
-    };
+    const inline: Inline = {};
+    const render = (): Record<string, unknown> => this.overviewBody(read, file, inline);
     const fits = (): boolean => redact(JSON.stringify(render())).length <= PAGE_MAX_CHARS;
     if (!fits()) return null;
     for (const s of PAGED_SECTIONS) {
@@ -743,18 +753,39 @@ export class GithubReview {
     return { repo, pr: await this.readPull(ctx, ref) };
   }
 
+  /** The repository gates every read is held to, as the repository is now. */
+  private requireReviewableRepo(ctx: Ctx, repo: { ownerLogin: string; isPublic: boolean; closed: boolean }): void {
+    // Whatever the name resolved to must itself be an allowed owner: a renamed or transferred repository is judged by where it is now.
+    if (!ctx.settings.owners.includes(repo.ownerLogin.toLowerCase())) {
+      throw new Refusal("owner_not_allowed", `reviews are limited to repositories owned by ${ctx.settings.owners.join(", ")}`);
+    }
+    if (!repo.isPublic) throw new Refusal("repository_not_public", "only public repositories can be reviewed");
+    if (repo.closed) throw new Refusal("repository_archived", "the repository is archived or disabled");
+  }
+
+  /** For a page served from this session's read: the repository gates and the head, as they are now, in one request. */
+  private async requirePageStillValid(ctx: Ctx, ref: PrRef, known: PrInfo): Promise<void> {
+    const g = await ctx.client.graphql<{ repository?: {
+      owner?: { login?: string }; isPrivate?: boolean; visibility?: string; isArchived?: boolean; isDisabled?: boolean; pullRequest?: { headRefOid?: string } | null;
+    } | null }>(PAGE_GATE_QUERY, { owner: ref.owner, name: ref.repo, number: ref.number });
+    const r = g.repository;
+    if (!r?.pullRequest) throw new Refusal("unreadable_pull_request", "GitHub did not return the pull request");
+    this.requireReviewableRepo(ctx, {
+      ownerLogin: r.owner?.login ?? "",
+      isPublic: r.isPrivate === false && (r.visibility === undefined || r.visibility === "PUBLIC"),
+      closed: r.isArchived === true || r.isDisabled === true,
+    });
+    this.requireHead({ ...known, headSha: String(r.pullRequest.headRefOid ?? "").toLowerCase() }, known.headSha);
+  }
+
   private async readRepo(ctx: Ctx, ref: PrRef): Promise<RepoInfo> {
     const r = (await ctx.client.get<Record<string, unknown>>(repoPath(ref))).json ?? {};
     const fullName = String(r.full_name ?? "");
-    const ownerLogin = (r.owner as { login?: string } | undefined)?.login ?? fullName.split("/")[0] ?? "";
-    // Whatever the name resolved to must itself be an allowed owner: a renamed or transferred repository is judged by where it is now.
-    if (!ctx.settings.owners.includes(ownerLogin.toLowerCase())) {
-      throw new Refusal("owner_not_allowed", `reviews are limited to repositories owned by ${ctx.settings.owners.join(", ")}`);
-    }
-    if (r.private !== false || (typeof r.visibility === "string" && r.visibility !== "public")) {
-      throw new Refusal("repository_not_public", "only public repositories can be reviewed");
-    }
-    if (r.archived === true || r.disabled === true) throw new Refusal("repository_archived", "the repository is archived or disabled");
+    this.requireReviewableRepo(ctx, {
+      ownerLogin: (r.owner as { login?: string } | undefined)?.login ?? fullName.split("/")[0] ?? "",
+      isPublic: r.private === false && (typeof r.visibility !== "string" || r.visibility === "public"),
+      closed: r.archived === true || r.disabled === true,
+    });
     const perms = (r.permissions ?? {}) as Record<string, unknown>;
     const methods: RepoInfo["methods"] = [];
     if (r.allow_squash_merge !== false) methods.push("squash");

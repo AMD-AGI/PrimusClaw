@@ -8,11 +8,12 @@
  *   G1  a pull request of about 1800 changed lines, read the way the tool tells the model to: every answer fits, every hunk is read, and
  *       the calls and the GitHub requests stay within the budget
  *   G2  the review instructions reach the model whole, the default ones and a repository's long skill
- *   G3  a page costs one GitHub request, from what the session read of that head; another session reads for itself
+ *   G3  a page costs one GitHub request (repository gates and head), from what the session read of that head; another session reads for itself
  *   G4  a head that moved refuses the page, and the next overview reads the new head
  *   G5  `file` and `max_diff_chars` narrow a page, which still fits
- *   G6  an overview too long for one answer is itself read in pages
+ *   G6  an overview too long for one answer is itself read in pages, and still names the sections to read
  *   G7  a page fits whatever the text costs to escape, and a line longer than a page is still read whole
+ *   G8  a page from the session's read is still held to the repository gates as they are now
  */
 import assert from "node:assert/strict";
 import test, { after, afterEach, beforeEach } from "node:test";
@@ -127,7 +128,7 @@ test("G2 the review instructions reach the model whole: the default skill, and a
   assert.ok(pages >= Math.ceil(text.length / PAGE_MAX_CHARS), `pages ${pages}`);
 });
 
-test("G3 a page costs one GitHub request (is the head still that one), from this session's read; another session reads for itself", async () => {
+test("G3 a page costs one GitHub request (the repository gates and the head, as they are now), from this session's read; another session reads for itself", async () => {
   useChange(bigChange(6, 25));
   const first = (await e.service.getPr(e.actor, { pr: PR })).body as any;
   assert.equal(first.sections.diff.inline, false);
@@ -135,7 +136,7 @@ test("G3 a page costs one GitHub request (is the head still that one), from this
   assert.ok(before >= 10, `the overview reads everything: ${before}`);
   const page = await e.service.getPr(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0 });
   assert.equal(page.isError, false);
-  assert.deepEqual(e.gh.calls.slice(before).map((c) => c.path), ["/repos/AMD-AGI/demo/pulls/7"]);
+  assert.deepEqual(e.gh.calls.slice(before).map((c) => c.path), ["/graphql"]);
   const other = { ...e.actor, sessionId: "s-2" };
   const mark = e.gh.calls.length;
   assert.equal((await e.service.getPr(other, { pr: PR, section: "diff", head_sha: HEAD, offset: 0 })).isError, false);
@@ -187,6 +188,32 @@ test("G6 an overview longer than one answer is itself read in pages, and nothing
   const overview = JSON.parse(json);
   assert.equal(overview.checks.requiredMissing.length, 150);
   assert.equal(overview.pull_request.head_sha, HEAD);
+  // It still says what else there is to read, and how: none of it is inline, and the instructions are read from it.
+  assert.equal(overview.how_to_read.length > 0, true);
+  assert.deepEqual(Object.keys(overview.sections).sort(), ["conversation", "diff", "files", "instructions"]);
+  assert.ok(Object.values(overview.sections).every((s: any) => s.inline === false));
+  assert.equal((await readSection(e.service, e.actor, PR, "instructions")).text, PR_REVIEW_SKILL);
+});
+
+test("G8 a page from the session's read is still held to the repository as it is now: owner, public, not archived", async () => {
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ["repository_not_public", { private: true, visibility: "private" }],
+    ["repository_not_public", { visibility: "internal" }],
+    ["repository_archived", { archived: true }],
+    ["repository_archived", { disabled: true }],
+    ["owner_not_allowed", { owner: { login: "someone-else" } }],
+  ];
+  for (const [code, patch] of cases) {
+    e = await reviewEnv(); // a request budget of its own for each case
+    useChange(bigChange(6, 25));
+    const original = { ...e.gh.repo };
+    assert.equal((await e.service.getPr(e.actor, { pr: PR })).isError, false);
+    e.gh.repo = { ...original, ...patch };
+    const page = await e.service.getPr(e.actor, { pr: PR, section: "diff", head_sha: HEAD, offset: 0 });
+    assert.equal(page.isError, true, JSON.stringify(patch));
+    assert.equal(page.body.reason, code, JSON.stringify(patch));
+    assert.equal(page.body.untrusted, undefined);
+  }
 });
 
 test("G7 a page fits whatever the text costs to escape, ends at a line end when it can, and a line longer than a page is read whole", () => {

@@ -113,7 +113,7 @@ export async function readSection(service: GithubReview, actor: ReviewActor, pr:
   let text = "";
   let pages = 0;
   for (let offset: number | null = 0; offset !== null; pages++) {
-    const o = await service.getPr(actor, { pr, section, head_sha: first.pull_request.head_sha, offset, ...extra });
+    const o = await service.getPr(actor, { pr, section, head_sha: first.pull_request?.head_sha ?? first.head_sha, offset, ...extra });
     if (o.isError) throw new Error(`page refused: ${o.text}`);
     text += sectionOf(o.body as Record<string, any>, section) ?? "";
     offset = (o.body as Record<string, any>).next_offset;

@@ -111,7 +111,16 @@ export class FakeGithub {
       if (this.enqueueEntry) Object.assign(this.graphql, { isInMergeQueue: true, mergeQueueEntry: this.enqueueEntry });
       return json(200, { data: { enqueuePullRequest: { mergeQueueEntry: this.enqueueEntry } } });
     }
-    if (p === "/graphql") return json(200, { data: { repository: { pullRequest: { ...this.graphql, ...(this.graphqlQueue.shift() ?? {}) } } } });
+    if (p === "/graphql") {
+      // The repository as the REST answer above describes it, in GraphQL's names, and its pull request: the head is the REST one's.
+      const r = this.repo;
+      const repository = {
+        owner: r.owner, isPrivate: r.private, visibility: typeof r.visibility === "string" ? r.visibility.toUpperCase() : undefined,
+        isArchived: r.archived, isDisabled: r.disabled,
+      };
+      const pull = /isArchived/.test(String(call.body?.query ?? "")) ? { headRefOid: this.pr.head?.sha } : { ...this.graphql, ...(this.graphqlQueue.shift() ?? {}) };
+      return json(200, { data: { repository: { ...repository, pullRequest: pull } } });
+    }
     if (/^\/repos\/[^/]+\/[^/]+$/.test(p)) return json(200, this.repo);
     if (/^\/repos\/[^/]+\/[^/]+\/pulls\/\d+$/.test(p)) return json(200, this.pr);
     if (/\/pulls\/\d+\/files$/.test(p)) {
