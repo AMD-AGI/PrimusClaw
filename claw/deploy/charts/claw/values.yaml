@@ -458,12 +458,14 @@ secret:
   # before the message fails with reason sandbox_start_timeout. 0 = wait forever. Default 15m.
   sandboxStartTimeoutSeconds: "900"
   # Max time a sandbox the platform has admitted may sit with no node having taken its pod and
-  # the platform saying nothing about why (every node cordoned or down) before the message fails
+  # no node being added for it (every node cordoned, down or tainted) before the message fails
   # with reason sandbox_unschedulable, the workload is stopped, and the model is told to report it
-  # rather than open another. Not applied to a sandbox still in the platform's queue or one the
-  # platform has put a reason on, e.g. waiting for a node scale-up (the Pending ceiling above), or
-  # to one that is starting (the start ceiling). Raise it, or 0 = off, if nodes scale up silently.
-  # Default 5m.
+  # rather than open another. The platform's "0/N nodes are available" or "didn't trigger
+  # scale-up" text is why it is stuck, not progress; a scale-up it reports as triggered, or a
+  # message that keeps changing, restarts the clock. Not applied to a sandbox still in the
+  # platform's queue or one with a scale-up under way (the Pending ceiling above, or the start
+  # ceiling once NotReady), or to one that is starting (the start ceiling). Raise it, or 0 = off,
+  # if nodes scale up without the platform saying so. Default 5m.
   sandboxUnschedulableTimeoutSeconds: "300"
   # The same ceiling for multi-node GPU clusters (giving up deletes the cluster).
   # 0 = off, the default: large images and Infera role pods routinely take longer.

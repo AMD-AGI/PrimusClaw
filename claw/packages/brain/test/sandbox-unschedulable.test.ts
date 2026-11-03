@@ -16,12 +16,13 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 
 process.env.SAFE_API_URL = "http://safe.test";
 // Read when the config module loads; the create-path test below waits it out in real time.
 process.env.SANDBOX_UNSCHEDULABLE_TIMEOUT_SECONDS = "1";
 const { waitForWorkloadReady } = await import("../src/sandbox/workload-wait.js");
-const { readWaitingState, cleanPlatformText, describeWaiting } = await import("../src/sandbox/workload-stall.js");
+const { readWaitingState, cleanPlatformText, describeWaiting, summarizeScheduling } = await import("../src/sandbox/workload-stall.js");
 const {
   SandboxProvisionTerminalError, SANDBOX_UNAVAILABLE_REASONS, sandboxUnavailableOf,
 } = await import("../src/sandbox/errors.js");
@@ -37,9 +38,41 @@ const queued = (position: number, message = "In queue - insufficient resources, 
 /** Admitted (position 0, message cleared) with a pod that nothing has taken, and nothing said about why. */
 const untaken = (message = ""): Body =>
   ({ phase: "Pending", queuePosition: 0, message, pods: [{ podId: "sb-1-abc", phase: "Pending" }] });
-/** Admitted, the pod untaken, and the platform saying it is waiting on capacity: a node scaling up. */
+/** Admitted, the pod untaken, and the platform saying a node is being added for it. */
 const scalingUp = (detail = "TriggeredScaleUp: pod triggered scale-up: [{pool-a 1->2 (max: 5)}]"): Body =>
   untaken(`In queue - waiting for scale-up - ${detail}`);
+/** The scheduler's account of a pod it cannot place, n nodes and none of them usable. */
+const sched = (n: number) => `0/${n} nodes are available: ${n} node(s) were unschedulable.`;
+
+// The incident of 2026-11-03: sandbox nodes cordoned, the sandbox's pod pending. This is
+// the platform's message on the sandbox workload in the shape it has on the live cluster
+// (the scheduler's account, then the autoscaler's event after it), with the identifiers
+// replaced by placeholders of the same shape. The workload is admitted -- no queue
+// position -- and has no pods listed; the platform reports the phase as NotReady (and as
+// Pending on others), and writes "waiting for scale-up" on it whether or not any scale-up
+// was triggered. None of this is progress: no node took the pod and none was added.
+const POOL = "7f3c9a52-1d4e-4b86-9c0a-5e2d8b1f6a43";
+const SCHEDULER_ACCOUNT =
+  "0/7 nodes are available: 3 node(s) had untolerated taint(s), 4 node(s) were unschedulable. "
+  + "no new claims to deallocate, preemption: not eligible due to preemptionPolicy=Never.";
+const INCIDENT_MESSAGE = `In queue - waiting for scale-up - ${SCHEDULER_ACCOUNT} - `
+  + `NotTriggerScaleUp: pod didn't trigger scale-up: pool ${POOL}: NotTriggerScaleUp: `
+  + "pod claw-sandboxes/claw-1785291793209-sandbox-x7k2p does not fit a new node of this pool: "
+  + "TaintToleration: node(s) had untolerated taint {example.amd.com/node-profile: user}";
+/** The scheduler's account when the pod is one of a group, as it is on the live cluster for multi-node workloads: longer. */
+const POD_GROUP = ", PodGroup claw-sandboxes/claw-1785291793209-sandbox gets rejected due to "
+  + "Pod claw-1785291793209-sandbox-x7k2p is unschedulable even after PostFilter";
+/** A pod the autoscaler does add a node for: the event after the (long) account is the one thing that differs. */
+const SCALING_UP_MESSAGE = `In queue - waiting for scale-up - ${SCHEDULER_ACCOUNT}${POD_GROUP} - `
+  + `TriggeredScaleUp: pod triggered scale-up: [{pool ${POOL} 1->2 (max: 5)}]`;
+const NOT_SCALING_MESSAGE = `In queue - waiting for scale-up - ${SCHEDULER_ACCOUNT}${POD_GROUP} - `
+  + `NotTriggerScaleUp: pod didn't trigger scale-up: pool ${POOL}: NoHeadroom: the pods need 1 new node(s)`;
+const INCIDENT_SUMMARY =
+  "no node can take the sandbox right now (7 nodes: 4 unschedulable, 3 restricted to other workloads), and no new node is being added";
+/** Everything the platform's text carries that the user is not shown. */
+const IDENTIFIERS = new RegExp([POOL, "claw-sandboxes", "claw-1785291793209", "x7k2p", "example\\.amd\\.com"].join("|"));
+const incident = (phase = "NotReady", message = INCIDENT_MESSAGE): Body =>
+  ({ phase, queuePosition: null, pods: null, message });
 /** The same pod once a node's kubelet has acknowledged it: pulling its image. */
 const taken: Body = {
   phase: "Pending", queuePosition: 0,
@@ -81,6 +114,7 @@ type Progress = { phase: string; queuePosition: number; waiting?: { kind: string
 
 /** Runs the shared loop to its end and reports everything it told the caller. */
 async function run(bodies: Body[], o: {
+  workloadId?: string;
   unschedulableTimeoutMs?: number;
   pendingTimeoutMs?: number;
   startTimeoutMs?: number;
@@ -92,7 +126,7 @@ async function run(bodies: Body[], o: {
   let ended: string | null = null;
   try {
     await waitForWorkloadReady({
-      workloadId: "wl-1", apiKey: "key", logPrefix: "test", isReady: isRunning,
+      workloadId: o.workloadId ?? "wl-1", apiKey: "key", logPrefix: "test", isReady: isRunning,
       unschedulableTimeoutMs: o.unschedulableTimeoutMs,
       onProgress: async (p) => { progress.push({ ...p, at: clock.now() } as Progress); },
       onTerminal: async (t) => { terminal.push(t); },
@@ -113,7 +147,9 @@ async function run(bodies: Body[], o: {
 
 test("queued: the scheduler's own reason is the reason", () => {
   assert.deepEqual(readWaitingState(queued(3)), {
-    kind: "queued", reason: "In queue - insufficient resources, no cpu available",
+    kind: "queued",
+    reason: "In queue - insufficient resources, no cpu available",
+    detail: "In queue - insufficient resources, no cpu available",
   });
 });
 
@@ -121,25 +157,93 @@ test("admitted with the pod untaken and nothing said about why is unscheduled, w
   for (const phase of ["Pending", "NotReady"]) {
     const w = readWaitingState({ phase, queuePosition: 0, pods: [{ podId: "p1", phase: "Pending" }] });
     assert.equal(w?.kind, "unscheduled", phase);
-    assert.equal(w!.reason, "the pod p1 is Pending and has not been placed on any node");
+    // What the user reads names no pod; the log's sentence does.
+    assert.equal(w!.reason, "the sandbox's pod has not been placed on any node");
+    assert.equal(w!.detail, "the pod p1 is Pending and has not been placed on any node");
   }
   // No pod yet at all reads the same, in different words.
   assert.match(readWaitingState({ phase: "Pending" })!.reason, /no node has taken its pod/);
 });
 
-test("a reason the platform put on an admitted workload makes it a platform wait, not an unscheduled one", () => {
-  // SaFE clears its message when it admits a workload; one that is there was
-  // written after, for a pod it is waiting on capacity for -- a node scaling up.
-  const why = "In queue - waiting for scale-up - TriggeredScaleUp: pod triggered scale-up";
-  const w = readWaitingState(untaken(why));
-  assert.deepEqual(w, { kind: "queued", reason: why });
+test("an admitted workload with a node being added is a platform wait, not an unscheduled one", () => {
+  // The autoscaler's own event reason, whole, wherever in the message it is.
+  for (const message of [
+    "In queue - waiting for scale-up - TriggeredScaleUp: pod triggered scale-up",
+    SCALING_UP_MESSAGE,
+  ]) {
+    const w = readWaitingState(untaken(message));
+    assert.deepEqual(w, { kind: "queued", reason: "the platform is adding a node for the sandbox", detail: message });
+  }
 });
 
-test("a pod that has only been bound to a node is still untaken, and the reason says which node", () => {
+test("the platform's account of why an admitted pod is stuck is not a node being added", () => {
+  // The incident, in both phases the platform reports it in, with the fields as the platform sends them.
+  for (const phase of ["NotReady", "Pending"]) {
+    const w = readWaitingState(incident(phase));
+    assert.equal(w?.kind, "unscheduled", phase);
+    assert.equal(w!.reason, INCIDENT_SUMMARY);
+    assert.equal(w!.detail, INCIDENT_MESSAGE, "the whole text is kept, for the log");
+  }
+  // The scheduler's account alone, and the scheduler's event: stuck, not scaling.
+  assert.equal(readWaitingState(untaken(`In queue - waiting for scale-up - ${SCHEDULER_ACCOUNT}`))?.kind, "unscheduled");
+  assert.equal(readWaitingState(untaken(`In queue - waiting for scale-up - FailedScheduling: ${sched(7)}`))?.kind, "unscheduled");
+  // "waiting for scale-up" is on every message the platform writes for an unplaced pod;
+  // it is not the autoscaler saying it scaled.
+  assert.equal(readWaitingState(untaken("In queue - waiting for scale-up"))?.kind, "unscheduled");
+  // Neither is the autoscaler saying it did not, however it is worded.
+  assert.equal(readWaitingState(untaken("NotTriggeredScaleUp: pod did not trigger"))?.kind, "unscheduled");
+});
+
+test("what tells a node being added from none is read from the whole message, not its first 300 characters", () => {
+  assert.ok(SCALING_UP_MESSAGE.indexOf("TriggeredScaleUp") > 300, "the event is after the scheduler's account");
+  assert.equal(readWaitingState(incident("NotReady", SCALING_UP_MESSAGE))?.kind, "queued");
+  assert.equal(readWaitingState(incident("NotReady", NOT_SCALING_MESSAGE))?.kind, "unscheduled");
+  // And a message far past any bound still says what its tail says.
+  const long = `In queue - ${"x".repeat(20_000)} - TriggeredScaleUp: pod triggered scale-up`;
+  assert.equal(readWaitingState(untaken(long))?.kind, "queued");
+});
+
+test("the user is told in our words what the platform's text says, without its identifiers", () => {
+  assert.equal(summarizeScheduling(INCIDENT_MESSAGE), INCIDENT_SUMMARY);
+  assert.equal(summarizeScheduling(SCALING_UP_MESSAGE), "the platform is adding a node for the sandbox");
+  assert.equal(
+    summarizeScheduling("0/8 nodes are available: 1 Insufficient ephemeral-storage, 3 node(s) had untolerated taint(s), 4 node(s) were unschedulable. no new claims to deallocate"),
+    "no node can take the sandbox right now (8 nodes: 4 unschedulable, 3 restricted to other workloads, 1 short of ephemeral-storage)",
+  );
+  assert.equal(
+    summarizeScheduling("0/3 nodes are available: 3 Insufficient amd.com/gpu."),
+    "no node can take the sandbox right now (3 nodes: 3 short of amd.com/gpu)",
+  );
+  assert.equal(
+    summarizeScheduling("NotTriggerScaleUp: pod didn't trigger scale-up: pool abc: NoHeadroom: the pods need 1 new node(s)"),
+    "no node can take the sandbox right now, and no new node is being added",
+  );
+  assert.equal(summarizeScheduling("something the platform wrote that we do not know"), null);
+  // Whatever a message carries, none of it is repeated to the user.
+  const messages = [
+    INCIDENT_MESSAGE, SCALING_UP_MESSAGE, NOT_SCALING_MESSAGE,
+    `0/7 nodes are available: 7 node(s) had untolerated taint {example.amd.com/node-profile: ${POOL}}.`,
+  ];
+  for (const message of messages) {
+    for (const phase of ["NotReady", "Pending"]) {
+      const w = readWaitingState(incident(phase, message))!;
+      assert.doesNotMatch(w.reason, IDENTIFIERS, message);
+      assert.ok(!w.reason.includes("\n") && w.reason.length < 200, w.reason);
+    }
+  }
+  // Text it cannot summarise on an admitted workload is not passed through either.
+  const unknown = readWaitingState(untaken(`something new about ${POOL}`))!;
+  assert.equal(unknown.kind, "unscheduled");
+  assert.equal(unknown.reason, "the platform has not been able to place the sandbox on a node yet");
+  assert.ok(unknown.detail.includes(POOL));
+});
+
+test("a pod that has only been bound to a node is still untaken, and the log says which node", () => {
   // The pod that will not start: the scheduler named a node and the node never answered.
   const w = readWaitingState({ phase: "Pending", pods: [{ podId: "p", phase: "Pending", adminNodeName: "node-9" }] });
   assert.equal(w?.kind, "unscheduled");
-  assert.equal(w!.reason, "the pod p was assigned to node node-9, which has not started it");
+  assert.equal(w!.reason, "the sandbox's pod was assigned to a node that has not started it");
+  assert.equal(w!.detail, "the pod p was assigned to node node-9, which has not started it");
 });
 
 test("any sign a node took the pod means it is starting, not waiting", () => {
@@ -150,6 +254,8 @@ test("any sign a node took the pod means it is starting, not waiting", () => {
   for (const sign of signs) {
     const w = readWaitingState({ phase: "Pending", pods: [{ podId: "p", phase: "Pending", ...sign }] });
     assert.equal(w, null, JSON.stringify(sign));
+    // A message on the workload does not make a taken pod a stuck one.
+    assert.equal(readWaitingState({ phase: "NotReady", message: INCIDENT_MESSAGE, pods: [{ podId: "p", phase: "Pending", ...sign }] }), null);
   }
   assert.equal(readWaitingState(taken), null);
 });
@@ -157,6 +263,7 @@ test("any sign a node took the pod means it is starting, not waiting", () => {
 test("phases it does not know to be waiting are not read as waiting", () => {
   for (const phase of ["Running", "Failed", "Stopped", "Updating", ""]) {
     assert.equal(readWaitingState({ phase, queuePosition: 0 }), null, phase);
+    assert.equal(readWaitingState({ phase, queuePosition: 0, message: INCIDENT_MESSAGE }), null, phase);
   }
 });
 
@@ -165,11 +272,13 @@ test("platform text reaches the user as one bounded line", () => {
   const long = cleanPlatformText("x".repeat(1000));
   assert.equal(long.length, 300);
   assert.ok(long.endsWith("…"));
-  const w = readWaitingState(untaken(`bad\nreason ${"y".repeat(500)}`));
+  // The queue's own words are shown as written, so they get the bound.
+  const w = readWaitingState(queued(2, `bad\nreason ${"y".repeat(500)}`));
   assert.ok(!w!.reason.includes("\n") && w!.reason.length <= 300);
-  // And the pod and node names in our own wording get the same treatment.
+  // And the pod and node names in the log's sentence get the same treatment.
   const named = readWaitingState({ phase: "Pending", pods: [{ podId: `p\n${"z".repeat(500)}`, phase: "Pending" }] });
-  assert.ok(!named!.reason.includes("\n") && named!.reason.length < 200, named!.reason);
+  assert.ok(!named!.detail.includes("\n") && named!.detail.length < 200, named!.detail);
+  assert.doesNotMatch(named!.reason, /z/);
 });
 
 test("the progress sentence names the reason for each kind", () => {
@@ -179,12 +288,12 @@ test("the progress sentence names the reason for each kind", () => {
   );
   // Admitted, so no position to give: said as what it is.
   assert.equal(
-    describeWaiting({ kind: "queued", reason: "In queue - waiting for scale-up" }, 0),
-    "Sandbox is waiting on the platform: In queue - waiting for scale-up",
+    describeWaiting({ kind: "queued", reason: "the platform is adding a node for the sandbox" }, 0),
+    "Sandbox is waiting on the platform: the platform is adding a node for the sandbox",
   );
   assert.equal(
-    describeWaiting({ kind: "unscheduled", reason: "0/3 nodes are available" }, 0),
-    "Sandbox is waiting for the platform to schedule it: 0/3 nodes are available",
+    describeWaiting({ kind: "unscheduled", reason: INCIDENT_SUMMARY }, 0),
+    `Sandbox is waiting for the platform to schedule it: ${INCIDENT_SUMMARY}`,
   );
 });
 
@@ -199,14 +308,15 @@ test("an admitted workload no node takes ends as sandbox_unschedulable at the li
   assert.equal(r.terminal.length, 1);
   assert.equal(r.terminal[0]!.reason, "sandbox_unschedulable");
   assert.equal(r.terminal[0]!.status, "failed");
-  assert.match(r.terminal[0]!.message!, /could not be scheduled: the pod sb-1-abc is Pending and has not been placed on any node/);
+  assert.match(r.terminal[0]!.message!, /could not be scheduled: the sandbox's pod has not been placed on any node/);
 });
 
 test("the error says what was observed, and for how long", { timeout: 5000 }, async () => {
   const r = await run([untaken()], { unschedulableTimeoutMs: 60_000 });
   assert.equal(r.ended, "sandbox_unschedulable");
   const message = r.terminal[0]!.message!;
-  assert.match(message, /could not be scheduled: the pod sb-1-abc is Pending and has not been placed on any node/);
+  assert.match(message, /could not be scheduled: the sandbox's pod has not been placed on any node/);
+  assert.doesNotMatch(message, /sb-1-abc/);
   assert.match(message, /admitted by the platform, but no node took its pod for 6\ds; phase=pending/);
 });
 
@@ -215,7 +325,7 @@ test("the user is told when the wait begins, once, and with the reason", { timeo
   // Dozens of reads happen before it gives up; the same reason is not repeated.
   assert.equal(r.progress.length, 1);
   assert.deepEqual(r.progress[0]!.waiting, {
-    kind: "unscheduled", reason: "the pod sb-1-abc is Pending and has not been placed on any node",
+    kind: "unscheduled", reason: "the sandbox's pod has not been placed on any node",
   });
 });
 
@@ -226,8 +336,83 @@ test("a node scale-up the platform reports is never cut short, however long it t
   assert.equal(r.ended, null);
   assert.ok(r.clock.value > 7_000_000);
   assert.deepEqual(r.progress[0]!.waiting, {
-    kind: "queued", reason: "In queue - waiting for scale-up - TriggeredScaleUp: pod triggered scale-up: [{pool-a 1->2 (max: 5)}]",
+    kind: "queued", reason: "the platform is adding a node for the sandbox",
   });
+});
+
+test("a scale-up that is triggered after the scheduler's long account is not cut short either", { timeout: 5000 }, async () => {
+  // The event is past the 300th character of what the platform sent.
+  for (const phase of ["NotReady", "Pending"]) {
+    const r = await run([...repeat(1440, incident(phase, SCALING_UP_MESSAGE)), running], { unschedulableTimeoutMs: 300_000 });
+    assert.equal(r.ended, null, phase);
+    assert.ok(r.clock.value > 7_000_000);
+  }
+});
+
+test("the incident: admitted, no pods, the platform saying why and that it will not scale -- ends at the short limit", { timeout: 5000 }, async () => {
+  // The real ceilings, so that what ends it is the short limit and not one of them:
+  // NotReady would otherwise wait 15 minutes, Pending 3 hours.
+  for (const phase of ["NotReady", "Pending"]) {
+    const r = await run([incident(phase)], {
+      unschedulableTimeoutMs: 300_000, startTimeoutMs: 900_000, pendingTimeoutMs: 10_800_000,
+    });
+    assert.equal(r.ended, "sandbox_unschedulable", phase);
+    // The first read (5s) starts the clock; the first read more than 300s later ends it.
+    assert.equal(r.clock.value, 310_000, phase);
+    assert.deepEqual(r.gaveUp, [{ reason: "sandbox_unschedulable", phase: phase.toLowerCase() }]);
+    const message = r.terminal[0]!.message!;
+    assert.match(message, new RegExp(`could not be scheduled: ${INCIDENT_SUMMARY.replace(/[()]/g, "\\$&")}`));
+    assert.doesNotMatch(message, IDENTIFIERS);
+    // The user was told at the start, once, in our words.
+    assert.equal(r.progress.length, 1);
+    assert.equal(r.progress[0]!.waiting?.kind, "unscheduled");
+    assert.equal(r.progress[0]!.waiting?.reason, INCIDENT_SUMMARY);
+  }
+});
+
+test("without the short limit the incident waits out the ceiling of its phase, which is what the limit is for", { timeout: 5000 }, async () => {
+  const notReady = await run([incident("NotReady")], { startTimeoutMs: 900_000, pendingTimeoutMs: 10_800_000 });
+  assert.equal(notReady.ended, "sandbox_start_timeout");
+  assert.equal(notReady.clock.value, 905_000 + 5_000);
+  const pending = await run([incident("Pending")], { startTimeoutMs: 900_000, pendingTimeoutMs: 10_800_000 });
+  assert.equal(pending.ended, "sandbox_pending_timeout");
+  assert.equal(pending.clock.value, 10_800_000 + 10_000);
+});
+
+test("a message the stall has not had before is the platform doing something: the clock starts over", { timeout: 5000 }, async () => {
+  // 200s on each of three accounts: 600s in all, and never 300s on one.
+  const moving = [...repeat(40, untaken(sched(7))), ...repeat(40, untaken(sched(8))), ...repeat(40, untaken(sched(9))), running];
+  assert.equal((await run(moving, { unschedulableTimeoutMs: 300_000 })).ended, null);
+  // The same 600s on one account is a stall, so the change is what saved it.
+  const still = await run([...repeat(120, untaken(sched(7))), running], { unschedulableTimeoutMs: 300_000 });
+  assert.equal(still.ended, "sandbox_unschedulable");
+  assert.equal(still.clock.value, 310_000);
+});
+
+test("a message that goes back and forth between the same two does not keep a stall alive", { timeout: 5000 }, async () => {
+  const flapping: Body[] = [];
+  for (let k = 0; k < 2000; k++) flapping.push(untaken(sched(k % 2 ? 7 : 8)));
+  const r = await run(flapping, { unschedulableTimeoutMs: 300_000 });
+  // Both accounts are new by the second read (10s); nothing after that restarts the clock.
+  assert.equal(r.ended, "sandbox_unschedulable");
+  assert.equal(r.clock.value, 315_000);
+});
+
+test("a message that is new on every read does not keep a stall alive for ever either", { timeout: 5000 }, async () => {
+  const counting: Body[] = [];
+  for (let k = 1; k <= 2000; k++) counting.push(untaken(sched(k)));
+  const r = await run(counting, { unschedulableTimeoutMs: 300_000 });
+  assert.equal(r.ended, "sandbox_unschedulable");
+  assert.ok(r.clock.value <= 400_000, String(r.clock.value));
+});
+
+test("when the platform stops saying a node is being added, the stall is counted from then", { timeout: 5000 }, async () => {
+  // 600s of a node being added, then the autoscaler gives up: the clock starts at the first read of that.
+  const r = await run([...repeat(120, incident("NotReady", SCALING_UP_MESSAGE)), incident("NotReady")], {
+    unschedulableTimeoutMs: 300_000, startTimeoutMs: 3_600_000,
+  });
+  assert.equal(r.ended, "sandbox_unschedulable");
+  assert.equal(r.clock.value, 605_000 + 305_000);
 });
 
 test("once the platform withdraws its reason, the wait is unscheduled and the clock starts then", { timeout: 5000 }, async () => {
@@ -249,9 +434,12 @@ test("a queued workload is told its reason at once, and a move up the queue is a
 });
 
 test("a reason that changes is announced again, paced rather than on every read", { timeout: 5000 }, async () => {
-  const bodies = [...repeat(3, untaken("reason A")), ...repeat(20, untaken("reason B")), running];
+  const bodies = [...repeat(3, untaken(sched(7))), ...repeat(20, untaken(sched(8))), running];
   const r = await run(bodies, {});
-  assert.deepEqual(r.progress.map((p) => p.waiting?.reason), ["reason A", "reason B"]);
+  assert.deepEqual(r.progress.map((p) => p.waiting?.reason), [
+    "no node can take the sandbox right now (7 nodes: 7 unschedulable)",
+    "no node can take the sandbox right now (8 nodes: 8 unschedulable)",
+  ]);
   // B first appears at 20s but A was announced at 5s: B waits out the 30s pace.
   assert.deepEqual(r.progress.map((p) => p.at), [5_000, 35_000]);
 });
@@ -259,7 +447,7 @@ test("a reason that changes is announced again, paced rather than on every read"
 test("a reason that flaps cannot flood the stream", { timeout: 5000 }, async () => {
   // 500s of the platform alternating between two messages every read.
   const flapping: Body[] = [];
-  for (let k = 0; k < 100; k++) flapping.push(untaken(k % 2 ? "reason B" : "reason A"));
+  for (let k = 0; k < 100; k++) flapping.push(untaken(k % 2 ? sched(7) : sched(8)));
   flapping.push(running);
   const r = await run(flapping, {});
   assert.ok(r.progress.length >= 10, `announced ${r.progress.length} times`);
@@ -318,6 +506,57 @@ test("the long ceilings still apply to what the short limit does not cover", { t
   assert.equal(r.ended, "sandbox_pending_timeout");
 });
 
+// ── what the log keeps ──────────────────────────────────────────────────────
+
+/**
+ * Every line the process logs while `fn` runs, and until `settled` says the ones
+ * wanted have arrived: pino writes to fd 1 with fs.write / fs.writeSync, and
+ * asynchronously, so a test that follows a noisy one waits behind its backlog.
+ */
+async function captureLogs<T>(fn: () => Promise<T>, settled: (logs: string) => boolean): Promise<{ out: T; logs: string }> {
+  const logs: string[] = [];
+  const realWriteSync = fs.writeSync;
+  const realWrite = fs.write;
+  fs.writeSync = ((fd: number, data: unknown, ...rest: unknown[]) => {
+    if (fd === 1 || fd === 2) logs.push(String(data));
+    return (realWriteSync as (...a: unknown[]) => number)(fd, data, ...rest);
+  }) as typeof fs.writeSync;
+  fs.write = ((fd: number, data: unknown, ...rest: unknown[]) => {
+    if (fd === 1 || fd === 2) logs.push(String(data));
+    return (realWrite as (...a: unknown[]) => void)(fd, data, ...rest);
+  }) as typeof fs.write;
+  try {
+    const out = await fn();
+    for (let waited = 0; waited < 20_000 && !settled(logs.join("")); waited += 50) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return { out, logs: logs.join("") };
+  } finally {
+    fs.writeSync = realWriteSync;
+    fs.write = realWrite;
+  }
+}
+
+test("the platform's own text, identifiers and all, is in the log and in nothing the user is sent", { timeout: 5000 }, async () => {
+  const { out, logs } = await captureLogs(
+    () => run([incident()], { workloadId: "wl-incident", unschedulableTimeoutMs: 300_000 }),
+    (all) => all.includes("test.unschedulable") && all.includes('"wl-incident"'),
+  );
+  assert.equal(out.ended, "sandbox_unschedulable");
+  // Lines of earlier tests can still be flushing; this one's are the ones for its own workload.
+  const lines = logs.split("\n").filter((l) => l.includes("workload-wait") && l.includes('"wl-incident"'));
+  assert.ok(lines.length >= 2, logs.slice(-2000));
+  const waiting = lines.find((l) => l.includes("test.waiting"));
+  assert.ok(waiting, `the wait is logged when it starts:\n${logs.slice(-2000)}`);
+  const gaveUp = lines.find((l) => l.includes("test.unschedulable"));
+  assert.ok(gaveUp, `the give-up is logged:\n${logs.slice(-2000)}`);
+  for (const line of [waiting, gaveUp]) {
+    assert.ok(line.includes(POOL) && line.includes("claw-1785291793209-sandbox-x7k2p"), `the platform's text, whole, is logged: ${line}`);
+    assert.ok(line.includes(INCIDENT_SUMMARY), line);
+  }
+  assert.doesNotMatch(JSON.stringify([out.progress, out.terminal, out.gaveUp]), IDENTIFIERS);
+});
+
 // ── what the sandbox's consumers are sent ────────────────────────────────────
 
 async function poll(bodies: Body[], unschedulableTimeoutMs?: number) {
@@ -348,7 +587,7 @@ test("a queued sandbox's progress event says the position and the platform's rea
 });
 
 test("an unschedulable sandbox says so when it starts waiting, then ends with the reason as an event", { timeout: 5000 }, async () => {
-  const why = "the pod sb-1-abc is Pending and has not been placed on any node";
+  const why = "the sandbox's pod has not been placed on any node";
   const { events, ended } = await poll([untaken()], 60_000);
   assert.equal(ended, "sandbox_unschedulable");
   const progress = events.find((e) => e.status === "pending");
@@ -358,13 +597,29 @@ test("an unschedulable sandbox says so when it starts waiting, then ends with th
   const failed = events.find((e) => e.status === "failed");
   assert.equal(failed?.reason, "sandbox_unschedulable");
   assert.ok(String(failed?.message).includes(why), JSON.stringify(failed));
+  assert.doesNotMatch(JSON.stringify(events), /sb-1-abc/, "the pod's name is for the log");
+});
+
+test("the incident's events say it in one line and carry none of the platform's identifiers", { timeout: 5000 }, async () => {
+  for (const phase of ["NotReady", "Pending"]) {
+    const { events, ended } = await poll([incident(phase)], 300_000);
+    assert.equal(ended, "sandbox_unschedulable", phase);
+    const progress = events.find((e) => e.status === "pending");
+    assert.equal(progress?.log, `Sandbox is waiting for the platform to schedule it: ${INCIDENT_SUMMARY}`);
+    assert.equal(progress?.waiting, "unscheduled");
+    assert.equal(progress?.waitReason, INCIDENT_SUMMARY);
+    const failed = events.find((e) => e.status === "failed");
+    assert.equal(failed?.reason, "sandbox_unschedulable");
+    assert.ok(String(failed?.message).includes(INCIDENT_SUMMARY), JSON.stringify(failed));
+    assert.doesNotMatch(JSON.stringify(events), IDENTIFIERS);
+  }
 });
 
 test("a scale-up the platform reports is announced with its own reason", { timeout: 5000 }, async () => {
   const { events, ended } = await poll([scalingUp("TriggeredScaleUp: pod triggered scale-up"), running], 60_000);
   assert.equal(ended, null);
   const progress = events.find((e) => e.status === "pending");
-  assert.equal(progress?.log, "Sandbox is waiting on the platform: In queue - waiting for scale-up - TriggeredScaleUp: pod triggered scale-up");
+  assert.equal(progress?.log, "Sandbox is waiting on the platform: the platform is adding a node for the sandbox");
   assert.equal(progress?.waiting, "queued");
   assert.equal(progress?.queuePosition, 0);
 });
@@ -388,7 +643,7 @@ test("create ends an unschedulable sandbox with the reason and stops the workloa
     if (String(url).endsWith("/api/v1/workloads")) {
       return { ok: true, status: 200, json: async () => ({ workloadId: "wl-created" }) };
     }
-    return { ok: true, status: 200, json: async () => untaken(), text: async () => "" };
+    return { ok: true, status: 200, json: async () => incident(), text: async () => "" };
   }) as unknown as typeof fetch;
 
   // SANDBOX_UNSCHEDULABLE_TIMEOUT_SECONDS=1 (above) and the real 5s poll: the
@@ -403,7 +658,9 @@ test("create ends an unschedulable sandbox with the reason and stops the workloa
 
   assert.ok(err instanceof SandboxProvisionTerminalError, String(err));
   assert.equal(err.reason, "sandbox_unschedulable");
-  assert.ok(err.message.includes("the pod sb-1-abc is Pending and has not been placed on any node"), err.message);
+  assert.ok(err.message.includes(INCIDENT_SUMMARY), err.message);
+  assert.doesNotMatch(err.message, IDENTIFIERS);
+  assert.doesNotMatch(JSON.stringify(events), IDENTIFIERS);
   assert.ok(calls.includes("POST /api/v1/workloads/wl-created/stop"), `the workload is stopped: ${calls.join(", ")}`);
   assert.ok(events.some((e) => e.waiting === "unscheduled"), "the user was told it was waiting");
   assert.ok(events.some((e) => e.status === "failed" && e.reason === "sandbox_unschedulable"));

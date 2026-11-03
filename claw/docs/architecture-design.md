@@ -583,18 +583,25 @@ A fifth is a shorter limit for a sandbox that cannot start at all, and it is the
 single-node sandbox is treated differently from a cluster: `SANDBOX_UNSCHEDULABLE_TIMEOUT_SECONDS`
 (default 5 minutes) ends the wait with reason `sandbox_unschedulable` when the platform has admitted
 the workload (queue position 0), nothing has taken its pod -- no address, start time or container,
-the shape of a pod every node refuses or ignores -- and the platform has put no reason on it. A reason the
-platform does give (queued behind others, or waiting for a node to scale up) is a wait it manages, announced
-with that reason and left to the queue ceiling. Waiting longer does not change that, and the long
-start ceiling would otherwise leave the user on a progress bar for 15 minutes, twice when the model
-retries. It counts only an unbroken absence of progress, never queue time and never a sandbox that
-is pulling an image, and only the sandbox a run opens asks for it (`unschedulableTimeoutMs` on the
-shared loop, off by default, so multi-node clusters and hosted applications wait as before). While a
-sandbox waits in either way the loop reports it -- the platform's own reason in the progress event --
-as soon as the platform says so, not on the ten-minute tick. When a run's open ends on this, the start
-ceiling or the queue ceiling, the run refuses to open another sandbox for the rest of that turn, the
-model is told so in the tool error and told to report the reason to the user, and the workload is
-stopped and its pending binding reaped.
+the shape of a pod every node refuses or ignores -- and no node is being added for it. The platform
+writes a message on every pod it could not place ("0/7 nodes are available ...", and the autoscaler's
+"pod didn't trigger scale-up ..."); that message says why the pod is stuck and is not progress, so it
+does not exempt the wait. Progress is a scale-up the platform reports as triggered (`TriggeredScaleUp`)
+or a message it has not said before during the stall, and either restarts the clock. A workload still in
+the platform's queue, or admitted with a scale-up under way, is a wait the platform manages: it is
+announced with its reason and keeps the ceilings of its phase -- the start ceiling (15 minutes) once the
+platform reports it NotReady, the Pending ceiling (3 hours) while it reports it Pending. Waiting longer
+does not change a stuck pod, and the long ceilings would otherwise leave the user on a progress bar for 15
+minutes, or hours, twice when the model retries. It counts only an unbroken absence of progress, never
+queue time and never a sandbox that is pulling an image, and only the sandbox a run opens asks for it
+(`unschedulableTimeoutMs` on the shared loop, off by default, so multi-node clusters and hosted
+applications wait as before). While a sandbox waits in either way the loop reports it as soon as the
+platform says so, not on the ten-minute tick, and the user is shown one line in our words (how many
+nodes cannot take it and why, whether a node is being added) rather than the platform's text, which
+carries its pool ids, namespaces, pod names and taint keys and stays in the logs. When a run's open
+ends on this, the start ceiling or the queue ceiling, the run refuses to open another sandbox for the
+rest of that turn, the model is told so in the tool error and told to report the reason to the user, and
+the workload is stopped and its pending binding reaped.
 
 **These bound multi-node GPU clusters on the same terms.** Single-node sandboxes and
 multi-node clusters are created with different bodies but waited on by one loop
