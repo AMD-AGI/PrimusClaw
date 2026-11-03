@@ -115,6 +115,13 @@ export function resolveCorsOrigin(raw: string | undefined): string[] | false {
 }
 export const SAFE_API_URL = env("SAFE_API_URL");
 /**
+ * The SaFE workspace a sandbox starts in when a request names none. Brain reads the
+ * same variable for the same purpose; the API reads it to name that workspace in
+ * `GET /v1/me`, because the console sends whatever `sandbox.defaultWorkspaceId` says
+ * with every turn and so overrides Brain's own default. Empty when not configured.
+ */
+export const SANDBOX_NAMESPACE = env("SANDBOX_NAMESPACE");
+/**
  * Management API of the Agent Sandbox control plane that `GET /v1/admin/sandbox/*`
  * lists for the console. Not SANDBOX_ROUTER_URL: that names the Router Brain
  * creates sandboxes through, which may sit in another cluster and expose only the

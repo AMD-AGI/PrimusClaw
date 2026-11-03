@@ -110,7 +110,7 @@ exist before the first session runs, or workspace sync has nowhere to write.
 | `POSTGRES_DB`                  | Target database name                     | `primus-claw`                                        |
 | `POSTGRES_SSLMODE`             | PG SSL mode                              | `require`                                            |
 | `SAFE_API_URL`                 | SaFE platform base URL                   | `https://cluster.example.com`                |
-| `SANDBOX_NAMESPACE`            | SaFE sandbox namespace                   | `example-sandbox`                                     |
+| `SANDBOX_NAMESPACE`            | SaFE sandbox namespace; the default workspace of a sandbox, also the one `GET /v1/me` names as `sandbox.defaultWorkspaceId` when the caller has it | `example-sandbox`                                     |
 | `ANTHROPIC_BASE_URL`           | LLM gateway URL                          | `https://cluster.example.com/llm-gateway`   |
 | `S3_ENDPOINT`                  | MinIO / S3 endpoint                      | `http://minio.minio.svc.cluster.local:9000`          |
 | `S3_SANDBOX_ENDPOINT`          | S3 endpoint as sandboxes reach it, for presigned URLs (default: `S3_API_ENDPOINT`) | `https://cluster.example.com` |
