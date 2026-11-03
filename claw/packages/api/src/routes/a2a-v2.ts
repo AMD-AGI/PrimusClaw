@@ -21,7 +21,7 @@
 import type { FastifyReply } from "fastify";
 import pino from "pino";
 import { applyTaskStatusTransition } from "../tasks/db.js";
-import { buildDecisionMessage } from "../sessions/decision-message.js";
+import { buildAnswerMessage, buildDecisionMessage } from "../sessions/decision-message.js";
 import { interruptSubject } from "@claw/protocol";
 import { sanitizeSessionEvent } from "../events/store.js";
 import { a2aPushEnabled } from "./a2a-flags.js";
@@ -279,14 +279,11 @@ export function createA2aV2<Auth extends { userId: string }>(deps: A2aV2Deps<Aut
       if (!built.ok) return { error: invalid(rpcId, built.error) };
       deps.nats.publish(`decision.${run.sessionId}`, JSON.stringify(built.message));
     } else {
-      deps.nats.publish(`decision.${run.sessionId}`, JSON.stringify({
-        type: "answer",
-        session_id: run.sessionId,
-        user_id: auth.userId,
-        action_id: parsed.actionId,
-        answers: parsed.answers,
-        skipped: [],
-      }));
+      const built = buildAnswerMessage(run.sessionId, auth.userId, {
+        extData: { tool_use_id: parsed.actionId, answers: parsed.answers },
+      });
+      if (!built.ok) return { error: invalid(rpcId, built.error) };
+      deps.nats.publish(`decision.${run.sessionId}`, JSON.stringify(built.message));
     }
     logger.info({ taskId: run.taskId, actionId: parsed.actionId, kind: parsed.kind }, "a2a.AnswerTask");
     return { run, actionId: parsed.actionId };

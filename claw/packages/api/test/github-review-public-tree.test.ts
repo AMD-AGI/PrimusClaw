@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import test from "node:test";
-import { FIXED_REVIEW_RULES, PR_REVIEW_SKILL } from "../src/github-review/default-skill.js";
+import { FIXED_REVIEW_RULES, PR_REVIEW_INSTRUCTIONS, PR_REVIEW_SKILL } from "../src/github-review/default-skill.js";
 
 const root = new URL("../../..", import.meta.url).pathname;
 
@@ -63,6 +63,18 @@ const NEUTRAL_FILES = [
 test("the default skill is the same text as the skill file anyone can import", () => {
   assert.equal(PR_REVIEW_SKILL, readFileSync(join(root, "examples/skills/pr-review/SKILL.md"), "utf8"));
   assert.match(PR_REVIEW_SKILL, /^---\nname: pr-review\n/);
+});
+
+test("the skill file is a valid skill whose body is the instructions the model reads, and the instructions have no frontmatter", () => {
+  const file = readFileSync(join(root, "examples/skills/pr-review/SKILL.md"), "utf8");
+  const head = /^---\nname: pr-review\ndescription: [^\n]+\n---\n\n/.exec(file);
+  assert.ok(head, "SKILL.md opens with a skill frontmatter (name and description)");
+  assert.equal(file.slice(head[0].length), PR_REVIEW_INSTRUCTIONS, "one text, not two");
+  assert.equal(PR_REVIEW_SKILL, head[0] + PR_REVIEW_INSTRUCTIONS);
+  assert.doesNotMatch(PR_REVIEW_INSTRUCTIONS, /^---/);
+  assert.doesNotMatch(PR_REVIEW_INSTRUCTIONS, /^(name|description): /m);
+  assert.match(PR_REVIEW_INSTRUCTIONS, /^# Pull request review/);
+  assert.doesNotMatch(PR_REVIEW_INSTRUCTIONS, /\b(use|using|with) the `?pr-review`? skill\b/i);
 });
 
 test("the skill ends its answer with one verdict line a caller can read, and nothing in a tool contradicts it", () => {
