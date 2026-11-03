@@ -97,3 +97,66 @@ test("settings: defaults, and a refused number falls back and is reported", () =
   assert.equal(t.writesEnabled, true);
   assert.equal(t.mcpUrl, "http://api:9000/v1/internal/github-review/mcp");
 });
+
+test("the sandbox's keys are left alone, and the database is asked nothing, for a row that has acting_as", async () => {
+  // Nothing is offered to such a row, so it is an ordinary session, and an ordinary session's sandbox holds its owner's keys as it always did.
+  const { applySandboxKeyPolicyToTask, sessionWithholdsSandboxKeys, withholdsSandboxKeys } = await import("../src/github-review/session-tools.js");
+  const { applyAppMcpToTask } = await import("../src/sessions/app-mcp.js");
+  assert.equal(withholdsSandboxKeys({ acting_as: "u-2" }), false);
+  const query = db.query;
+  const asked: string[] = [];
+  db.query = (async (text: string) => { asked.push(text); return { rows: [{ acting_as: "u-2", user_id: "u-1", config: { acting_as: "u-2" } }], rowCount: 1 }; }) as unknown as typeof db.query;
+  try {
+    const task: Record<string, unknown> = {};
+    await applySandboxKeyPolicyToTask(task, "s-1");
+    assert.deepEqual(task, {});
+    assert.equal(await sessionWithholdsSandboxKeys("s-1"), false, "and a hosted application run is asked for as it always was");
+    // The whole of what is added to a turn built for a session: the application servers' own statements, and none about acting_as.
+    await applyAppMcpToTask(task, "s-1");
+    assert.equal("withhold_sandbox_keys" in task, false);
+  } finally {
+    db.query = query;
+  }
+  assert.equal(asked.some((sql) => /acting_as/.test(sql)), false);
+});
+
+test("the services that may bring a user's own key must be ones that may speak for the user, or an enabled deployment does not start", () => {
+  const settings = (decision: string, enabled = true) => readGithubReviewSettings({ CLAW_GITHUB_REVIEW_MCP_SECRET: "g".repeat(32), CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS: decision }, enabled);
+  // [decision list, own-key list, what the error names (null: none)]
+  const cases: Array<[string, string[], string[] | null]> = [
+    ["svc-a svc-b", ["svc-a"], null],
+    ["svc-a,svc-b", ["svc-a", "svc-b"], null],
+    ["svc-a", [], null],
+    ["", [], null],
+    ["svc-a svc-answers-only", ["svc-a"], null],
+    ["", ["svc-a"], ["svc-a"]],
+    ["svc-a", ["svc-a", "svc-x"], ["svc-x"]],
+    ["svc-a", ["svc-x", "svc-y"], ["svc-x", "svc-y"]],
+    ["svc-a", ["SVC-A"], ["SVC-A"]],
+    ["svc-a", ["svc-a "], ["svc-a "]],
+  ];
+  for (const [decision, own, named] of cases) {
+    const errors = githubReviewConfigErrors(settings(decision), true, own);
+    if (named === null) {
+      assert.deepEqual(errors, [], `${decision} / ${own.join()}`);
+      continue;
+    }
+    assert.equal(errors.length, 1, `${decision} / ${own.join()}: ${errors.join(" | ")}`);
+    assert.match(errors[0]!, /CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS/);
+    assert.match(errors[0]!, /CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS/);
+    for (const id of named) assert.ok(errors[0]!.includes(JSON.stringify(id)), `${errors[0]} names ${id}`);
+    for (const id of own.filter((o) => !named.includes(o))) assert.ok(!errors[0]!.includes(JSON.stringify(id)), `${errors[0]} does not name ${id}`);
+  }
+  // Without the feature there is no list to check it against and no flow that uses the key.
+  assert.deepEqual(githubReviewConfigErrors(settings("", false), true, ["svc-x"]), []);
+  // It comes with the other reasons not to start, and does not replace them.
+  assert.equal(githubReviewConfigErrors(readGithubReviewSettings({ CLAW_GITHUB_REVIEW_MCP_SECRET: "short" }, true), false, ["svc-x"]).length, 3);
+  // A caller that does not pass the list (every one before this setting) is asked nothing about it.
+  assert.deepEqual(githubReviewConfigErrors(settings("svc-a"), true), []);
+});
+
+test("the lists of client ids are read the same way: commas or white space, each as signed, once", () => {
+  const s = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS: " first ,Second\n first  third\t,", CLAW_GITHUB_REVIEW_MCP_SECRET: "g".repeat(32) }, true);
+  assert.deepEqual(s.decisionClientIds, ["first", "Second", "third"]);
+  assert.deepEqual(readGithubReviewSettings({}, true).decisionClientIds, []);
+});

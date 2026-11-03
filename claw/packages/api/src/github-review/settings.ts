@@ -24,6 +24,7 @@
  *   CLAW_GITHUB_REVIEW_AGENT_NAME           how the footer of a review names its author ("Reviewed by <name> on behalf of ..."), default Claw
  */
 import { readIntSetting, type IntSettingBounds } from "@claw/utils";
+import { parseClientIds } from "../auth/identity-token.js";
 import { CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
 
 export const GITHUB_PROVIDER = "github";
@@ -94,8 +95,7 @@ export function readGithubReviewSettings(env: Env = process.env, enabled: boolea
     requestsPerSession: num("CLAW_GITHUB_REQUESTS_PER_SESSION", 60, { min: 5, max: 1000 }),
     fastMaxFiles: num("CLAW_GITHUB_REVIEW_FAST_MAX_FILES", 15, { min: 0, max: 500 }),
     fastMaxChangedLines: num("CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES", 600, { min: 0, max: 100_000 }),
-    // Not lower-cased and not trimmed past the separators: a client id is compared as the identity provider signed it.
-    decisionClientIds: [...new Set((env.CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS ?? "").split(/[\s,]+/).filter(Boolean))],
+    decisionClientIds: parseClientIds(env.CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS),
     agentName: agentName || DEFAULT_AGENT_NAME,
     problems,
   };
@@ -105,10 +105,20 @@ export function readGithubReviewSettings(env: Env = process.env, enabled: boolea
  * What is wrong with an enabled configuration, as sentences. A process that was
  * asked for the feature and cannot offer it must not start: running on would be
  * running without the gates the feature is made of.
+ *
+ * `ownKeyClientIds` is `CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS`: the services that may bring a user's own key with
+ * a delegated token (auth/identity-token.ts). Each must also be a service that may speak for a user here
+ * (`decisionClientIds`). A name that is in one list and mistyped in the other is otherwise found as a session that
+ * is created and whose first turn cannot run. The other way round is allowed: a service that only answers held
+ * merges needs no key of the user's.
  */
-export function githubReviewConfigErrors(s: GithubReviewSettings, identityClientBuilt: boolean): string[] {
+export function githubReviewConfigErrors(s: GithubReviewSettings, identityClientBuilt: boolean, ownKeyClientIds: readonly string[] = []): string[] {
   if (!s.enabled) return [];
   const errors: string[] = [];
+  const unlisted = ownKeyClientIds.filter((id) => !s.decisionClientIds.includes(id));
+  if (unlisted.length) {
+    errors.push(`CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS names ${unlisted.map((id) => JSON.stringify(id)).join(", ")}, which CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS does not: a service that brings a user's own key must be one that may speak for the user`);
+  }
   if (s.mcpSecret.length < MIN_MCP_SECRET_LENGTH) {
     errors.push(`CLAW_GITHUB_REVIEW_MCP_SECRET must be at least ${MIN_MCP_SECRET_LENGTH} characters`);
   }

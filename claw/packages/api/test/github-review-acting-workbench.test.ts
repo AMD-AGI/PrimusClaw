@@ -88,3 +88,46 @@ test("W2 the same run into a session that does not act as a user is admitted, an
     dbStub!.restore();
   }
 });
+
+/**
+ * The stored variables of the caller (the env vault) are not embedded in the nodes of a run that goes into a session that acts as a user:
+ * its nodes run with the review tools in their hands, and what a sandbox's environment holds of the owner the model can print. The run is
+ * made with the person's own identity-provider token, which is what may send into such a session, and what is written to the nodes is read
+ * back from the statements that wrote them. A session that does not act as a user is run beside it, and must still be given the vault.
+ */
+test("W3 the nodes of a run into a session that acts as a user are written without the caller's stored variables, and with them for any other session", async () => {
+  process.env.USER_ENV_ENCRYPTION_KEY = Buffer.alloc(32, 9).toString("base64");
+  const { initUserEnvCrypto, encryptUserEnvValue } = await import("../src/crypto/user-env.js");
+  initUserEnvCrypto();
+  const Fastify = (await import("fastify")).default;
+  const { registerWorkbenchRunRoutes } = await import("../src/workbenches/routes.js");
+  const personApp = Fastify();
+  // The person's own token: set before the route's own check, which for the development bypass records no method.
+  personApp.addHook("preHandler", async (req) => { (req as unknown as { authMethod: string }).authMethod = "identity_token"; });
+  await registerWorkbenchRunRoutes(personApp);
+  await personApp.ready();
+  const vault: Record<string, string> = { GITHUB_TOKEN: "ghp_vault_planted_0001", HF_TOKEN: "hf_vault_planted_0002", MY_PRIVATE_SETTING: "vault-planted-0003" };
+  const rows = Object.entries(vault).map(([key_name, value]) => ({ key_name, key_value_enc: encryptUserEnvValue(value) }));
+  try {
+    for (const [what, actingAs] of [["a session that acts as a user", "u-bob"], ["an ordinary session", null]] as const) {
+      dbStub = stubDb((sql) => {
+        if (/FROM claw_task_dags/.test(sql)) return [DAG_ROW];
+        if (/FROM plugins/.test(sql)) return [PLUGIN_ROW];
+        if (/FROM claw_user_env_vars/.test(sql)) return rows;
+        if (/FROM claw_sessions WHERE session_id/.test(sql)) return [{ session_id: "sess-named", user_id: DEV_USER, acting_as: actingAs }];
+        return [];
+      });
+      const res = await personApp.inject({ method: "POST", url: `/v1/workbenches/${WORKBENCH_ID}/runs`, payload: { prompt: "go", session_id: "sess-named" } });
+      assert.equal(res.statusCode, 200, `${what}: ${res.body}`);
+      const nodes = dbStub.seen.filter((q) => /^INSERT INTO claw_tasks/.test(q.sql));
+      assert.ok(nodes.length > 0, `${what}: its nodes were written`);
+      const holds = nodes.some((q) => Object.values(vault).some((secret) => JSON.stringify(q.params).includes(secret)));
+      assert.equal(holds, actingAs === null, `${what}: ${actingAs === null ? "control, the vault is embedded in its nodes as it always was" : "none of the vault is in what was written"}`);
+      assert.equal(dbStub.ran(/FROM claw_user_env_vars/), actingAs === null, `${what}: the vault is ${actingAs === null ? "read as it always was" : "not read at all"}`);
+      dbStub.restore();
+      dbStub = null;
+    }
+  } finally {
+    await personApp.close();
+  }
+});

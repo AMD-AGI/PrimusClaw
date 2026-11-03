@@ -175,12 +175,23 @@ describe("a valid token", () => {
     process.env.CLAW_IDENTITY_TOKEN_SCOPE = "other.scope";
     assert.equal(refused(await verify(mint())).status, 401, "the default audience no longer fits");
     verified(await verify(mint({ aud: "other-api", scope: "other.scope" })));
-    assert.deepEqual(identityTokenSettings(), { enabled: true, audience: "other-api", scope: "other.scope", introspect: false, trustedRoles: [], delegationAudience: "primus-safe", delegationScope: "safe.api" });
+    assert.deepEqual(identityTokenSettings(), { enabled: true, audience: "other-api", scope: "other.scope", introspect: false, trustedRoles: [], delegationAudience: "primus-safe", delegationScope: "safe.api", ownKeyClientIds: [] });
   });
 
-  test("the defaults are claw-api and claw.api, with introspection off and no role adopted", () => {
-    for (const k of ["CLAW_IDENTITY_TOKEN_AUTH_ENABLED", "CLAW_IDENTITY_TOKEN_AUDIENCE", "CLAW_IDENTITY_TOKEN_SCOPE", "CLAW_IDENTITY_TOKEN_INTROSPECT", "CLAW_IDENTITY_TOKEN_TRUSTED_ROLES"]) delete process.env[k];
-    assert.deepEqual(identityTokenSettings(), { enabled: false, audience: "claw-api", scope: "claw.api", introspect: false, trustedRoles: [], delegationAudience: "primus-safe", delegationScope: "safe.api" });
+  test("the defaults are claw-api and claw.api, with introspection off, no role adopted and no service that may bring a person's own key", () => {
+    for (const k of ["CLAW_IDENTITY_TOKEN_AUTH_ENABLED", "CLAW_IDENTITY_TOKEN_AUDIENCE", "CLAW_IDENTITY_TOKEN_SCOPE", "CLAW_IDENTITY_TOKEN_INTROSPECT", "CLAW_IDENTITY_TOKEN_TRUSTED_ROLES", "CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS"]) delete process.env[k];
+    assert.deepEqual(identityTokenSettings(), { enabled: false, audience: "claw-api", scope: "claw.api", introspect: false, trustedRoles: [], delegationAudience: "primus-safe", delegationScope: "safe.api", ownKeyClientIds: [] });
+  });
+
+  test("the services that may bring a person's own key are read from the environment each time: commas or white space, as signed, once", () => {
+    try {
+      process.env.CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS = " svc-a ,Svc-B\n svc-a\t";
+      assert.deepEqual(identityTokenSettings().ownKeyClientIds, ["svc-a", "Svc-B"]);
+      process.env.CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS = "  ,, ";
+      assert.deepEqual(identityTokenSettings().ownKeyClientIds, []);
+    } finally {
+      delete process.env.CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS;
+    }
   });
 
   test("the answer carries no part of the token", async () => {

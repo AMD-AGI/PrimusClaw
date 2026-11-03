@@ -127,12 +127,14 @@ accepts. The code is `packages/api/src/auth/identity-token.ts`; it verifies with
 | `CLAW_IDENTITY_TOKEN_DELEGATION_AUDIENCE` | `primus-safe` | SaFE deployment mode: the audience of the token the API asks the provider for, to present to SaFE in the person's name (see "Keys for a token's user") |
 | `CLAW_IDENTITY_TOKEN_DELEGATION_SCOPE` | `safe.api` | The scope of that token |
 | `CLAW_IDENTITY_TOKEN_TRUSTED_ROLES` | none | The platform roles a token the provider confirms may confer: `system-admin` and/or `system-admin-readonly`, separated by commas or spaces. Any other name is ignored. See "Administrators" below |
+| `CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS` | none | SaFE deployment mode: the client ids of the services whose delegated token (RFC 8693 `act`) may bring the person's own `ak-` key in `x-api-key`, separated by commas or spaces and compared exactly as the provider signed the token's `client_id`. Empty: no service may, and a delegated token has no keys, as before. See "A service that brings the person's own key" below |
 
 These are read on each request. In the chart they are `identity.tokenAuth.enabled`,
 `.audience`, `.scope`, `.introspect`, `.delegationAudience`, `.delegationScope` and `.trustedRoles` (a list), rendered into the
 API Deployment only; `identity.tokenAuth.enabled` without `identity.enabled` is
 refused at render time, and so is a `trustedRoles` entry that is not one of the two
-adoptable roles.
+adoptable roles. `CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS` is not in the chart: set it as an environment
+variable of the API, as `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS` is.
 
 **What a token must be.** Typed `at+jwt` in its JOSE header, signed RS256 or ES256
 by a key in the issuer's key set, issued by the configured issuer, naming
@@ -195,6 +197,39 @@ turn has no model key (unless Brain has a deployment-wide one, `ANTHROPIC_AUTH_T
 as it always could), a sandbox has no platform key, and `GET /v1/me` is a 401
 `authentication_required`, because there is nothing to present to SaFE.
 
+**A service that brings the person's own key (SaFE deployment mode).** A token that is itself delegated
+(RFC 8693: `sub` the person, `act` the service, `client_id` the service's client) is not exchanged again, so the
+caller has no keys: the party that holds it is a service, and SaFE would be asked about a token that was not
+sent for the person. A service the operator named in `CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS` may send the
+person's own `ak-` key in `x-api-key` beside the token (the service holds it because the person gave it, for
+example by linking it). SaFE verifies that key as it verifies any `ak-` key (`POST /api/v1/auth/verify`, the answer
+kept five minutes, so a key revoked at SaFE works for up to that long), and the key counts only when SaFE says it is
+the token's own `sub`'s: the same rule as for the keys got by delegation. Then the caller is the token's person, a
+service acting for them (`delegation.actorSub` and `.clientId` are still recorded, and the request is still an
+`identity_token` request: whatever is asked of a service that speaks for the person is asked of it), and the keys it
+carries are the ones SaFE answered for the key. Nothing is exchanged at the provider. Whoever asks for the key and does not get it is refused,
+never served keyless:
+
+| The request | The answer |
+|---|---|
+| the key is the token's user's | authenticated, with that key's platform key and virtual key |
+| the key is another user's | 401 `key_subject_mismatch` |
+| the value is not an `ak-` key (including an empty `x-api-key`), SaFE does not know it or holds no keys for it | 401 `invalid_api_key` |
+| SaFE 5xx or no answer, a 200 that is not an answer | 503 `authentication_service_unavailable`, not remembered |
+| (no `AUTH_INTERNAL_TOKEN` to ask with, or no SaFE at all: the Kubernetes mode) | 500 `authentication_misconfigured` |
+
+Everything else is as it was. The header is not read for a token that is not delegated, for a service that is not
+named (an empty setting names none), for a client id that only looks like a named one (compared exactly as signed,
+with no trimming and no change of case), or when the request has no `x-api-key`: the caller then has no keys, as in
+the table above. A Bearer value shaped like a JWT is still final (see "How it combines"), so the key beside it is
+never judged as a credential of its own: a key alone, in either header, is still only what it was (a key caller:
+`method` is `api_key` or `x_api_key`, never `identity_token`).
+
+The service must also be in `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS` when GitHub review is on: a process whose
+`CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS` names a client that list does not refuses to start (see
+[github-review.md](github-review.md)). The other way round is allowed: a service that only answers held merges needs
+no key.
+
 What has to be set up, and what is not done:
 
 - **The provider** has to know this API's client (`IDENTITY_CLIENT_ID`) as one that may exchange
@@ -210,12 +245,14 @@ What has to be set up, and what is not done:
   token, which leaves every token caller keyless; one that was not told about the actor answers 403, the same.
   SaFE needs no name of this API beyond that client id.
 - A token that is itself delegated (RFC 8693, with an `act` claim: a service acting for the person) is
-  not exchanged again. Such a caller has no keys.
+  not exchanged again. Such a caller has no keys, unless the service is one the operator named in
+  `CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS` and brings the person's own key (above).
 - The person's token is not forwarded to SaFE by any route. The MCP tool that lists models, which sends the
   caller's own `Authorization` header to SaFE, sends such a caller's platform key instead (nothing if they have none).
 - The roles in SaFE's answer are ignored, as the token's are: only
   `CLAW_IDENTITY_TOKEN_TRUSTED_ROLES` makes a token's caller an administrator.
-- The Kubernetes deployment mode has no SaFE to ask; a token's caller has no keys there.
+- The Kubernetes deployment mode has no SaFE to ask; a token's caller has no keys there, and a named service
+  that sends a key is refused (500 `authentication_misconfigured`), not served without one.
 
 **Administrators.** A person who signs in through the provider and is an administrator
 there reaches the admin pages (the sandbox admin page, for one) only if the operator
@@ -260,7 +297,9 @@ names differently, and then the setting should stay empty.
   `ak-` key, the token path's answer is final. A token that does not verify is a
   401 `invalid_token` (a missing scope is a 403 `insufficient_scope`), and no other
   credential on the request is tried instead; a provider that cannot be asked is a
-  503 `authentication_service_unavailable`, never an "invalid token".
+  503 `authentication_service_unavailable`, never an "invalid token". An `x-api-key` beside
+  such a token is not a credential of its own: only the token path reads it, and only for a
+  delegated token of a named service (above).
 - A `Token` cookie is still judged first, and an `ak-` key is still judged by SaFE
   (`ak-` is settled before the token path runs). On the browser-download routes the
   existing `?token=` key path is still tried before any header, so a valid key there

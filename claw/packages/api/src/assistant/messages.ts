@@ -17,7 +17,7 @@
 import pino from "pino";
 import { CLAW_DEPLOY_MODE, RUN_DOORBELL_DISPATCH } from "../config.js";
 import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
-import { loadUserEnvSnapshot } from "../crypto/user-env.js";
+import { loadUserEnvForSession } from "../github-review/session-tools.js";
 import { db, type StatementRunner } from "../infra/db.js";
 import { insertPendingMessage, submitMessagePorts } from "../sessions/submit-message.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
@@ -51,7 +51,8 @@ export async function queueServerMessage(q: StatementRunner, m: ServerMessage): 
   const secrets = pendingSecretColumns({
     llmKey: creds.llmApiKey,
     platformKey: creds.platformKey,
-    userEnv: await loadUserEnvSnapshot(q, m.userId, logger),
+    // None for a session that acts as a user (see `loadUserEnvForSession`).
+    userEnv: await loadUserEnvForSession(q, m.userId, m.sessionId, logger),
     doorbell: RUN_DOORBELL_DISPATCH,
   });
   const inserted = await insertPendingMessage(q, {
