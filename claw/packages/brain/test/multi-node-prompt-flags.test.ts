@@ -4,12 +4,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  assertMultiNodeInferaModel,
+  assertMultiNodeModel,
   isMultiNodeRequest,
   parseMultiNodePromptFlags,
   requestedNodeCount,
+  resolveTopology,
+  specFromTopology,
 } from "../src/sandbox/multi-node/prompt-flags.js";
 import { classifySandboxFailure } from "../src/sandbox/reaper.js";
+import { SandboxFailure, sandboxFailureOf } from "../src/sandbox/errors.js";
 
 /** Synthetic prompt preserving the parser's nested flags and continuations. */
 const REAL_PROMPT = `Use the skill at /shared/skills/inference_optimizer/SKILL.md to optimize inference performance.
@@ -100,6 +103,10 @@ test("parseMultiNodePromptFlags reads the real optimize prompt", () => {
     pdDecodeNodes: 0,
     pdPrefillTp: 0,
     pdDecodeTp: 0,
+    serverArgs: "--attention-backend aiter --mem-fraction-static 0.8 --max-running-requests 1024",
+    pdPrefillExtraArgs: "",
+    pdDecodeExtraArgs: "",
+    pdIbDevice: "",
   });
 });
 
@@ -135,6 +142,10 @@ test("parseMultiNodePromptFlags applies Hyperloom's own defaults for omitted fla
     pdDecodeNodes: 0,
     pdPrefillTp: 0,
     pdDecodeTp: 0,
+    serverArgs: "",
+    pdPrefillExtraArgs: "",
+    pdDecodeExtraArgs: "",
+    pdIbDevice: "",
   });
 });
 
@@ -177,6 +188,9 @@ test("parseMultiNodePromptFlags reads the infera backend and its PD topology", (
     spec.image,
     "registry.example.com/primus-claw/sglang:test",
   );
+  assert.match(spec.pdPrefillExtraArgs, /--mem-fraction-static 0\.78/);
+  assert.match(spec.pdDecodeExtraArgs, /--mem-fraction-static 0\.82/);
+  assert.equal(spec.nodes, 2);
 });
 
 test("parseMultiNodePromptFlags is not confused by --pd-*-nodes when reading --nodes", () => {
@@ -235,6 +249,15 @@ test("parseMultiNodePromptFlags reads flags wrapped in markdown backticks", () =
   assert.equal(isMultiNodeRequest({ prompt: BULLET_PROMPT }), true);
 });
 
+test("parseMultiNodePromptFlags closes an escaped-quote server-args value", () => {
+  const spec = parseMultiNodePromptFlags(
+    '--nodes 2 --mn-backend atom --server-args \\"--mem-fraction-static 0.8\\" --model /models/Qwen3-14B-FP8',
+  );
+  assert.ok(spec);
+  assert.equal(spec.serverArgs, "--mem-fraction-static 0.8");
+  assert.equal(spec.model, "/models/Qwen3-14B-FP8");
+});
+
 test("parseMultiNodePromptFlags keeps separators inside a value", () => {
   // Only the outermost decoration goes, so a comma-separated list survives it.
   const spec = parseMultiNodePromptFlags(
@@ -256,34 +279,117 @@ test("isMultiNodeRequest follows the prompt flags, not the request body", () => 
   assert.equal(isMultiNodeRequest({}), false);
 });
 
-test("assertMultiNodeInferaModel rejects infera without --model", () => {
+test("assertMultiNodeModel rejects infera without --model", () => {
   const spec = parseMultiNodePromptFlags("--nodes 2 --mn-backend infera");
   assert.ok(spec);
   assert.throws(
-    () => assertMultiNodeInferaModel(spec),
-    /multi-node infera request requires --model/,
+    () => assertMultiNodeModel(spec),
+    /model is required/,
   );
 });
 
-test("assertMultiNodeInferaModel allows infera with --model", () => {
+test("parseMultiNodePromptFlags accepts sglangrouter and still requires --model", () => {
+  const spec = parseMultiNodePromptFlags(
+    "--nodes 2 --mn-backend sglangrouter --model /models/Qwen3-14B --pd-transfer-backend mooncake --pd-mode disaggregated",
+  );
+  assert.ok(spec);
+  assert.equal(spec.backend, "sglangrouter");
+  assert.doesNotThrow(() => assertMultiNodeModel(spec));
+  const missing = parseMultiNodePromptFlags(
+    "--nodes 2 --mn-backend sglangrouter --pd-mode disaggregated",
+  );
+  assert.ok(missing);
+  assert.throws(() => assertMultiNodeModel(missing), /model is required/);
+});
+
+test("parseMultiNodePromptFlags accepts atom and still requires --model", () => {
+  const spec = parseMultiNodePromptFlags(
+    "--nodes 2 --mn-backend atom --model /models/Qwen3-14B-FP8 --pd-transfer-backend mooncake --pd-mode disaggregated",
+  );
+  assert.ok(spec);
+  assert.equal(spec.backend, "atom");
+  assert.equal(spec.kvTransferBackend, "mooncake");
+  assert.doesNotThrow(() => assertMultiNodeModel(spec));
+  const missing = parseMultiNodePromptFlags(
+    "--nodes 2 --mn-backend atom --pd-mode disaggregated",
+  );
+  assert.ok(missing);
+  assert.throws(() => assertMultiNodeModel(missing), /model is required/);
+});
+
+test("atom and sglangrouter default to disaggregated mooncake", () => {
+  const spec = parseMultiNodePromptFlags("--nodes 2 --mn-backend atom --model /models/m");
+  assert.ok(spec);
+  assert.equal(spec.pdMode, "disaggregated");
+  assert.equal(spec.kvTransferBackend, "mooncake");
+  assert.doesNotThrow(() => assertMultiNodeModel(spec));
+  const declared = specFromTopology({ nodes: 2, backend: "atom", model: "/m" });
+  assert.equal(declared.pdMode, "disaggregated");
+  assert.equal(declared.kvTransferBackend, "mooncake");
+});
+
+test("assertMultiNodeModel rejects an explicit aggregated pd-mode for atom", () => {
+  const spec = parseMultiNodePromptFlags(
+    "--nodes 2 --mn-backend atom --model /models/m --pd-mode aggregated",
+  );
+  assert.ok(spec);
+  assert.equal(spec.pdMode, "aggregated");
+  assert.throws(() => assertMultiNodeModel(spec), /requires --pd-mode disaggregated/);
+});
+
+test("assertMultiNodeModel allows infera with --model", () => {
   const spec = parseMultiNodePromptFlags(
     "--nodes 2 --mn-backend infera --model /models/Qwen3-30B-A3B",
   );
   assert.ok(spec);
-  assert.doesNotThrow(() => assertMultiNodeInferaModel(spec));
+  assert.doesNotThrow(() => assertMultiNodeModel(spec));
 });
 
-test("classifySandboxFailure maps infera model errors", () => {
+function failureCode(run: () => void): string | undefined {
+  try {
+    run();
+  } catch (err) {
+    return sandboxFailureOf(err)?.code;
+  }
+  return undefined;
+}
+
+test("model and shape refusals carry a code that does not depend on the message", () => {
+  const infera = parseMultiNodePromptFlags("--nodes 2 --mn-backend infera");
+  assert.equal(failureCode(() => assertMultiNodeModel(infera!)), "infera_model_missing");
+  const atom = parseMultiNodePromptFlags("--nodes 2 --mn-backend atom");
+  assert.equal(failureCode(() => assertMultiNodeModel(atom!)), "mn_model_missing");
+  const sglang = parseMultiNodePromptFlags("--nodes 2 --mn-backend sglangrouter");
+  assert.equal(failureCode(() => assertMultiNodeModel(sglang!)), "mn_model_missing");
   assert.equal(
-    classifySandboxFailure(
-      "multi-node infera request requires --model (infera frontend --router-tokenizer-path)",
-    ),
-    "infera_model_missing",
+    failureCode(() => resolveTopology({ topology: { nodes: 2, backend: "atom" } })),
+    "mn_model_missing",
+  );
+  const aggregated = parseMultiNodePromptFlags(
+    "--nodes 2 --mn-backend atom --model /models/m --pd-mode aggregated",
+  );
+  assert.equal(failureCode(() => assertMultiNodeModel(aggregated!)), "mn_config_invalid");
+  assert.equal(
+    failureCode(() => resolveTopology({
+      topology: { nodes: 4, backend: "atom", model: "/m", pd_prefill_nodes: 1, pd_decode_nodes: 1 },
+    })),
+    "mn_config_invalid",
   );
   assert.equal(
-    classifySandboxFailure("model is required (infera frontend --router-tokenizer-path)"),
-    "infera_model_missing",
+    failureCode(() => resolveTopology({
+      topology: { nodes: 2, backend: "atom", model: "/m", pd_prefill_tp: 16 },
+    })),
+    "mn_config_invalid",
   );
+  let caught: unknown;
+  try {
+    assertMultiNodeModel(aggregated!);
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof SandboxFailure);
+  assert.equal(sandboxFailureOf(new Error("wrapped", { cause: caught }))?.code, "mn_config_invalid");
+  assert.equal(classifySandboxFailure((caught as Error).message), null);
 });
 
 test("classifySandboxFailure maps multi-node cluster provisioning errors", () => {

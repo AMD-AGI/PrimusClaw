@@ -5,16 +5,16 @@
  * Deploy-mode-agnostic contract for provisioning the multi-node inference
  * cluster a task runs against.
  *
- * Clusters are created as SaFE workloads (RayJob or Infera); see factory.ts,
+ * Clusters are created as SaFE workloads (RayJob, Infera, Atom, or SGLangRouter); see factory.ts,
  * which rejects a deployment without SaFE. The result is a `MultiNodeContext`,
  * all the sandbox needs to drive the cluster via Hyperloom's "external mode"
  * (see sandbox/params.ts applyMultiNodeExternalEnv).
  */
 
-import type { ExecuteRequest } from "@claw/protocol";
+import type { ExecuteRequest, TopologyBackend } from "@claw/protocol";
 
 /** Engine topology, from the prompt's `--mn-backend`. */
-export type MultiNodeBackend = "rayjob" | "infera";
+export type MultiNodeBackend = TopologyBackend;
 
 /** Which mechanism provisioned the cluster. */
 export type MultiNodeProviderKind = "safe";
@@ -30,7 +30,7 @@ export interface MultiNodeContext {
   nodeCount: number;
   /** GPUs on each node; carried to the sandbox in the topology handoff. */
   gpusPerNode: number;
-  /** Base URL benchmarks target: Ray head :8888, or the Infera frontend on its derived port. */
+  /** Base URL benchmarks target: Ray head :8888, the Infera frontend, or the Atom/SGLangRouter router :8000. */
   serviceUrl: string;
   /** rayjob: host serving Ray Dashboard :8265 and GCS :6379. */
   headHost?: string;

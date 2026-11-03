@@ -16,6 +16,11 @@
  * load deterministic builders without inheriting process environment.
  */
 
+import {
+  assertPdClusterPrompt,
+  resolvePdClusterReplicas,
+} from "./prompt-flags.js";
+import { SandboxFailure } from "../errors.js";
 import type { MultiNodeBackend } from "./types.js";
 
 /** RayJob head serves the inference server here; matches the Claw template. */
@@ -435,7 +440,10 @@ export interface InferaWorkloadParams extends CommonWorkloadParams {
 export function buildInferaWorkloadBody(p: InferaWorkloadParams): Record<string, unknown> {
   assertCommon(p);
   if (!p.model.trim()) {
-    throw new Error("model is required (infera frontend --router-tokenizer-path)");
+    throw new SandboxFailure(
+      "infera_model_missing",
+      "model is required (infera frontend --router-tokenizer-path)",
+    );
   }
   if (!p.sshAuthorizedKey.trim()) {
     throw new Error("sshAuthorizedKey is required for the Infera idle-pod control plane");
@@ -467,7 +475,7 @@ export function buildInferaWorkloadBody(p: InferaWorkloadParams): Record<string,
 
   const frontendEp = b64(
     `python3 -m infera.server --host 0.0.0.0 --port ${frontendPort} ` +
-    `--router-policy round-robin --router-tokenizer-path ${p.model.trim()} --enable-profiling`,
+    `--router-tokenizer-path ${shellSingleQuote(p.model.trim())}`,
   );
 
   let resources: Record<string, unknown>[];
@@ -549,6 +557,259 @@ export function buildInferaWorkloadBody(p: InferaWorkloadParams): Record<string,
   if (p.description) body.description = p.description;
   if (p.ownerId) body.ownerId = p.ownerId;
   return body;
+}
+
+/** Router Service port. SaFE rejects any other Atom targetPort. */
+export const ATOM_ROUTER_PORT = 8000;
+
+/** Mooncake bootstrap ports published on the prefill and decode Services. */
+const ATOM_PREFILL_BOOTSTRAP_PORT = 8998;
+const ATOM_DECODE_BOOTSTRAP_PORT = 9098;
+
+/** Quote a value for a single-quoted shell word. */
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+/**
+ * SGLang model-gateway command.
+ *
+ * SaFE replaces `{prefill}` and `{decode}` with the engine Service URLs. The
+ * bootstrap port stays in the command because it is the Mooncake port, not
+ * part of that URL.
+ */
+function sglangRouterEntrypoint(): string {
+  return [
+    "set -euo pipefail",
+    "exec python3 -m sglang_router.launch_router \\",
+    "  --pd-disaggregation \\",
+    `  --prefill {prefill} ${ATOM_PREFILL_BOOTSTRAP_PORT} \\`,
+    "  --decode {decode} \\",
+    "  --host 0.0.0.0 \\",
+    "  --port \"${ATOM_SERVER_PORT}\"",
+  ].join("\n");
+}
+
+/**
+ * Router command. SaFE injects ATOM_SERVER_PORT and the role endpoints.
+ * `--backend` is the prompt's `--framework`.
+ */
+function atomRouterEntrypoint(framework: string): string {
+  return [
+    "set -euo pipefail",
+    "exec atomesh launch \\",
+    "  --host 0.0.0.0 \\",
+    "  --port \"${ATOM_SERVER_PORT}\" \\",
+    "  --pd-disaggregation \\",
+    `  --prefill "\${ATOM_PREFILL_ENDPOINT}" ${ATOM_PREFILL_BOOTSTRAP_PORT} \\`,
+    "  --decode \"${ATOM_DECODE_ENDPOINT}\" \\",
+    `  --backend ${shellSingleQuote(framework)}`,
+  ].join("\n");
+}
+
+/** Split a prompt arg string into shell words. Quotes are already removed. */
+function shellWords(raw: string): string[] {
+  return raw.trim().split(/\s+/).filter((word) => word.length > 0);
+}
+
+/**
+ * Prefill or decode command. Model, TP, transfer backend, IB device, and the
+ * extra server flags all come from the prompt. The listen port is the one SaFE
+ * injects. Bootstrap ports are the pair this workload's router command uses.
+ */
+function atomEngineEntrypoint(
+  role: "prefill" | "decode",
+  model: string,
+  tp: number,
+  kvTransferBackend: string,
+  ibDevice: string,
+  serverArgs: string,
+  roleArgs: string,
+): string {
+  const bootstrap = role === "prefill" ? ATOM_PREFILL_BOOTSTRAP_PORT : ATOM_DECODE_BOOTSTRAP_PORT;
+  const lines = [
+    "set -euo pipefail",
+    "export SGLANG_HOST_IP=\"${POD_IP:-$(hostname -i | awk '{print $1}')}\"",
+    "args=(",
+    "  python3 -m sglang.launch_server",
+    `  --model-path ${shellSingleQuote(model)}`,
+    "  --host 0.0.0.0",
+    "  --port \"${ATOM_SERVER_PORT}\"",
+    `  --tp-size ${tp}`,
+    `  --disaggregation-mode ${role}`,
+    `  --disaggregation-transfer-backend ${shellSingleQuote(kvTransferBackend)}`,
+    `  --disaggregation-bootstrap-port ${bootstrap}`,
+  ];
+  if (ibDevice.trim()) {
+    lines.push(`  --disaggregation-ib-device ${shellSingleQuote(ibDevice.trim())}`);
+  }
+  for (const word of [...shellWords(serverArgs), ...shellWords(roleArgs)]) {
+    lines.push(`  ${shellSingleQuote(word)}`);
+  }
+  lines.push(")", "exec \"${args[@]}\"");
+  return lines.join("\n");
+}
+
+export interface AtomWorkloadParams extends CommonWorkloadParams {
+  /** Model path for prefill and decode `--model-path`. */
+  model: string;
+  /** Prompt `--framework`, passed to atomesh `--backend`. */
+  framework: string;
+  /** Prompt `--server-args`. */
+  serverArgs?: string;
+  /** Prompt `--pd-prefill-extra-args`. */
+  pdPrefillExtraArgs?: string;
+  /** Prompt `--pd-decode-extra-args`. */
+  pdDecodeExtraArgs?: string;
+  /** Prompt `--pd-ib-device`. */
+  pdIbDevice?: string;
+  /** KV transfer backend for both engine roles. */
+  kvTransferBackend: string;
+  /** Must be disaggregated; Atom/SGLangRouter have no aggregated shape. */
+  pdMode: "aggregated" | "disaggregated";
+  pdPrefillNodes?: number;
+  pdDecodeNodes?: number;
+  pdPrefillTp?: number;
+  pdDecodeTp?: number;
+  rdmaResource?: string;
+}
+
+interface PdClusterBodyOptions {
+  /** SaFE GroupVersionKind.kind. */
+  kind: "Atom" | "SGLangRouter";
+  /** Correlation label and env value. */
+  backend: "atom" | "sglangrouter";
+  /** Router command, base64-encoded by the builder. */
+  routerEntrypoint: string;
+}
+
+/**
+ * SaFE CreateWorkloadRequest for a router, prefill, decode cluster.
+ *
+ * The router is a CPU process. Both engine roles request GPUs and RDMA because
+ * the KV transfer plane needs a device. Entry points start the servers directly.
+ *
+ * @param p Prompt-derived sizes, image, model, and env.
+ * @param opts Kind and router command. Engine commands are shared.
+ */
+function buildPdClusterWorkloadBody(
+  p: AtomWorkloadParams,
+  opts: PdClusterBodyOptions,
+): Record<string, unknown> {
+  assertCommon(p);
+  if (!p.model.trim()) {
+    throw new SandboxFailure(
+      "mn_model_missing",
+      `model is required (${opts.backend} prefill/decode --model-path)`,
+    );
+  }
+  assertPdClusterPrompt({
+    backend: opts.backend,
+    pdMode: p.pdMode,
+    framework: p.framework,
+    nodes: p.nodes,
+    gpusPerNode: p.gpusPerNode,
+    pdPrefillNodes: p.pdPrefillNodes ?? 0,
+    pdDecodeNodes: p.pdDecodeNodes ?? 0,
+    pdPrefillTp: p.pdPrefillTp ?? 0,
+    pdDecodeTp: p.pdDecodeTp ?? 0,
+  });
+
+  const model = p.model.trim();
+  const { prefill: prefillReplica, decode: decodeReplica } = resolvePdClusterReplicas({
+    nodes: p.nodes,
+    pdPrefillNodes: p.pdPrefillNodes ?? 0,
+    pdDecodeNodes: p.pdDecodeNodes ?? 0,
+    backend: opts.backend,
+  });
+
+  // Default TP to every GPU on the pod. An explicit size above that was already rejected.
+  const prefillTp = p.pdPrefillTp && p.pdPrefillTp > 0 ? p.pdPrefillTp : p.gpusPerNode;
+  const decodeTp = p.pdDecodeTp && p.pdDecodeTp > 0 ? p.pdDecodeTp : p.gpusPerNode;
+
+  const sharedMemoryGi = Math.max(1, Math.floor(p.memGiPerNode / 2));
+
+  const routerResource = {
+    replica: 1,
+    cpu: "4",
+    memory: "16Gi",
+    sharedMemory: "4Gi",
+    ephemeralStorage: "20Gi",
+  };
+  const gpuResource = (replica: number): Record<string, unknown> => ({
+    replica,
+    cpu: String(p.cpusPerNode),
+    memory: `${p.memGiPerNode}Gi`,
+    gpu: String(p.gpusPerNode),
+    sharedMemory: `${sharedMemoryGi}Gi`,
+    ephemeralStorage: `${p.ephemeralGiPerNode}Gi`,
+    rdmaResource: p.rdmaResource ?? "1k",
+  });
+
+  const env = sanitizeEnv(p.extraEnv);
+  applyCorrelationEnv(env, opts.backend, p.sessionId, p.messageId);
+
+  // useWorkspaceStorage stays absent: SaFE defaults an absent *bool to true
+  // (see baseBody). Sending it could only ever turn the mount off.
+  const body: Record<string, unknown> = {
+    ...baseBody(opts.kind),
+    groupVersionKind: { group: "amd.com", kind: opts.kind, version: "v1" },
+    timeout: workloadTimeout(p.timeoutSec, p.defaultTimeoutSec),
+    displayName: p.displayName,
+    workspaceId: p.workspace,
+    resources: [routerResource, gpuResource(prefillReplica), gpuResource(decodeReplica)],
+    images: [p.image, p.image, p.image],
+    entryPoints: [
+      b64(opts.routerEntrypoint),
+      b64(atomEngineEntrypoint(
+        "prefill", model, prefillTp, p.kvTransferBackend,
+        p.pdIbDevice ?? "", p.serverArgs ?? "", p.pdPrefillExtraArgs ?? "",
+      )),
+      b64(atomEngineEntrypoint(
+        "decode", model, decodeTp, p.kvTransferBackend,
+        p.pdIbDevice ?? "", p.serverArgs ?? "", p.pdDecodeExtraArgs ?? "",
+      )),
+    ],
+    env,
+    labels: correlationLabels(p.extraLabels, opts.backend, p.sessionId, p.messageId),
+    service: {
+      protocol: "TCP",
+      port: ATOM_ROUTER_PORT,
+      targetPort: ATOM_ROUTER_PORT,
+      serviceType: "ClusterIP",
+    },
+  };
+  applyWorkloadId(body, p.messageId);
+  if (p.description) body.description = p.description;
+  if (p.ownerId) body.ownerId = p.ownerId;
+  return body;
+}
+
+/**
+ * SaFE CreateWorkloadRequest for a multi-node Atom workload.
+ *
+ * Roles are fixed as router, prefill, decode. The router runs atomesh.
+ */
+export function buildAtomWorkloadBody(p: AtomWorkloadParams): Record<string, unknown> {
+  return buildPdClusterWorkloadBody(p, {
+    kind: "Atom",
+    backend: "atom",
+    routerEntrypoint: atomRouterEntrypoint(p.framework),
+  });
+}
+
+/**
+ * SaFE CreateWorkloadRequest for a multi-node SGLangRouter workload.
+ *
+ * Same three roles as Atom. The router runs sglang_router and leaves
+ * `{prefill}` and `{decode}` for SaFE to replace with Service URLs.
+ */
+export function buildSGLangRouterWorkloadBody(p: AtomWorkloadParams): Record<string, unknown> {
+  return buildPdClusterWorkloadBody(p, {
+    kind: "SGLangRouter",
+    backend: "sglangrouter",
+    routerEntrypoint: sglangRouterEntrypoint(),
+  });
 }
 
 /** Positional serviceRoles for a topology; must match the builders above. */
