@@ -47,13 +47,47 @@ fully inlined.
 
 ## How skills load (progressive disclosure)
 
-The prompt carries one line per default skill: name, a one-line description
+The prompt carries one line per default skill: name and a one-line description
 (from the SKILL.md frontmatter `description`, else the first body paragraph,
-capped at 300 characters) and the path to read. The body is **not** in the
-prompt. The skill directory is written into the sandbox the first time a
-sandbox tool call names `.skills`, immediately before that call, and the agent
-reads it with its normal `read` tool. A chat that never reads a default skill
-never writes one and never starts a sandbox on their account.
+capped at 300 characters). The body is **not** in the prompt. The model loads a
+skill with the `load_skill` tool (`name`, and optionally `file` for one of the
+skill's other text files). Brain answers it from its own staged copy: a skill is
+instructions for the model, so reading one never starts a sandbox, and a turn
+that only loads skills and calls MCP tools runs without one. The SKILL.md comes
+back with a footer listing the skill's other files and where its scripts run.
+
+A file longer than 16000 characters comes in parts. Each part ends at a line
+break where it can, and one that is not the last says so and gives the `offset`
+to pass to `load_skill` for the next; the footer comes with the last part of a
+SKILL.md. `load_skill` is exempt from the generic 6000-character tool-result cap
+(head 4000 plus tail 1500, with advice to re-run with `head`/`tail`/`grep`,
+which for a skill means `read` or `bash` and so a sandbox): a part, its footer
+(at most 100 paths of at most 120 characters, the rest counted) and the notices
+fit a bound of its own, and a skill of any length is read through `load_skill`
+alone. A skill name is at most 255 characters (the name repeats in those notices,
+and a longer one could not be a directory in the sandbox); `load_skill` refuses
+a longer one.
+
+The sandbox is for running commands. The skill directory is written into it the
+first time a sandbox tool call names `.skills`, immediately before that call
+(supporting files and scripts included), so `bash python3
+/workspace/.skills/<name>/scripts/x.py` finds the script. A chat that never runs
+a skill's script never writes one and never starts a sandbox on its account.
+`load_skill` is offered only when the prompt lists skills, is part of the
+read-only set (plan mode, the `readonly` and `explore` sub-agents) and is subject
+to `tools_allowlist` like any other tool. A model that reads `.skills/...` with
+`read` or `bash` anyway still gets the file, from the sandbox, written first.
+
+A run whose `tools_allowlist` does not name `load_skill` (any list written before
+the tool existed, for example `["read", "bash", "mcp__x__*"]`) is not offered it,
+and the router refuses it. Such a run gets the skill hint from before the tool
+instead: each list line ends with `[read <skills dir>/<name>/SKILL.md]`, and the
+model is told to read SKILL.md with the `read` tool. So are the sub-agent
+skill-read refusal's advice (it names `read`, not `load_skill`) and the size the
+list may take (the path is part of each line). Its skills stay readable, at the
+cost they had before: the read starts a sandbox. Add `load_skill` to the list to
+get the sandbox-free load. `load_skill` is in the default `HITL_AUTO_ALLOW`, next
+to `read`, so enabling HITL does not ask for approval to load a skill.
 
 Limits: 50 entries and 8000 characters of list; further default skills are
 summarized as "N more skills not listed". Keep SKILL.md short (about 300 lines)
@@ -64,7 +98,8 @@ resolver and base URL and stay inlined.
 ### Plugin skills
 
 With `PROGRESSIVE_SKILLS_ENABLED=true`, a plugin's skills use the same list and
-the same on-demand write instead of inlining every SKILL.md body. A plugin skill
+the same `load_skill` tool and on-demand sandbox write instead of inlining every
+SKILL.md body. A plugin skill
 the capped list has no room for stays inlined, so no skill is ever neither listed
 nor contained in the prompt. With the flag off, plugin skills are inlined as
 before.
