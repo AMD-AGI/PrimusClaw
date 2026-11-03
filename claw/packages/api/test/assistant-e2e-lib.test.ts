@@ -18,13 +18,16 @@
  *   B10 cleanup runs after an early return, an exception and success alike, latest first, each despite another failing;
  *       the exit code is 0 only when the scenario finished with nothing failed
  *   B11 a round's item is the one whose title names its task, not a task whose name merely contains it
+ *   B12 a round waits only as long as it takes for the user's last hour plus the round to fit the message cap
+ *   B13 an idempotent request is repeated on 5xx or a failed send, not on an answer, and gives up after its tries
  */
 import assert from "node:assert/strict";
 import test from "node:test";
 
 import { EVENT_ID_HEADER, SIGNATURE_HEADER, TIMESTAMP_HEADER, signPayload } from "../src/notifications/signing.js";
 import {
-  aliveSandboxes, duplicateEventIds, itemNamed, latencyMs, newItemsSince, percentile, renderTimings, runTag, settle, startReceiver, until,
+  aliveSandboxes, duplicateEventIds, itemNamed, latencyMs, newItemsSince, percentile, renderTimings, retry5xx, runTag, sayPacingWaitMs,
+  settle, startReceiver, until,
 } from "./e2e/assistant-p1-lib.js";
 
 const SECRET = "s".repeat(64);
@@ -203,4 +206,35 @@ test("B11 a round's item is the one its title names", () => {
   assert.equal(itemNamed([{ title: "Task S2a.txt" }], "S2a")?.title, "Task S2a.txt");
   assert.equal(itemNamed([{ title: "anything" }], "a.*"), undefined, "the name is literal");
   assert.equal(itemNamed([{ title: "Task soak3-XS1a: write" }], "S1a"), undefined, "XS1a is another task");
+});
+
+test("B12 a round waits until the last hour plus the round fit the cap", () => {
+  const H = 3_600_000;
+  const now = 10 * H;
+  assert.equal(sayPacingWaitMs([], now, 120, 8), 0);
+  const at = (n: number, from: number, step: number) => Array.from({ length: n }, (_, i) => from + i * step);
+  assert.equal(sayPacingWaitMs(at(112, now - 1000 * 112, 1000), now, 120, 8), 0, "112 + 8 is exactly the cap");
+  const full = at(113, now - 50 * 60_000, 1000);
+  assert.equal(sayPacingWaitMs(full, now, 120, 8), full[0] + H - now + 1000, "one over: wait until the oldest leaves the hour");
+  assert.equal(sayPacingWaitMs([...full, ...full.slice(0, 2)], now, 120, 8), full[1] + H - now + 1000, "three over: until the third oldest leaves");
+  assert.equal(sayPacingWaitMs(at(200, now - 3 * H, 1000), now, 120, 8), 0, "messages older than an hour do not count");
+  assert.equal(sayPacingWaitMs([], now, 5, 8), Number.POSITIVE_INFINITY, "a round that alone exceeds the cap never fits");
+});
+
+test("B13 an idempotent request is repeated on 5xx and on a failed send only", async () => {
+  const seq = (statuses: Array<number | Error>) => {
+    let i = 0;
+    return { calls: () => i, call: async () => { const s = statuses[i++]; if (s instanceof Error) throw s; return s; } };
+  };
+  const a = seq([503, new Error("reset"), 200]);
+  assert.equal(await retry5xx(a.call, 3, 1), 200);
+  assert.equal(a.calls(), 3);
+  const b = seq([404]);
+  assert.equal(await retry5xx(b.call, 3, 1), 404, "an answer is not retried");
+  assert.equal(b.calls(), 1);
+  const c = seq([500, 502, 503, 200]);
+  assert.equal(await retry5xx(c.call, 3, 1), 503, "it gives up after its tries with the last status");
+  assert.equal(c.calls(), 3);
+  const d = seq([new Error("down"), new Error("down")]);
+  assert.equal(await retry5xx(d.call, 2, 1), 599, "a request that could not be sent is a failure");
 });

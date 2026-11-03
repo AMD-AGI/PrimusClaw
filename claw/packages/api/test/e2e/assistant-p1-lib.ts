@@ -191,3 +191,26 @@ export async function settle(
   }
   return failures.length === 0 ? 0 : 1;
 }
+
+/**
+ * How long to wait before a round so that the user's messages in the last hour, plus what the round will say, stay
+ * within the deployment's per-user cap (CLAW_ASSISTANT_SAY_MAX_PER_HOUR). Over the cap the assistant is refused and
+ * says nothing, which would read as no answer. 0 when there is room; Infinity when one round alone would not fit.
+ */
+export function sayPacingWaitMs(sayTimes: readonly number[], now: number, limit: number, reserve: number, windowMs = 3_600_000): number {
+  if (reserve > limit) return Number.POSITIVE_INFINITY;
+  const inWindow = sayTimes.filter((t) => t > now - windowMs).sort((a, b) => a - b);
+  const over = inWindow.length + reserve - limit;
+  return over <= 0 ? 0 : inWindow[over - 1] + windowMs - now + 1_000;
+}
+
+/** Calls an idempotent request again (up to `tries` times, `gapMs` apart) while it answers 5xx or cannot be sent. */
+export async function retry5xx(call: () => Promise<number>, tries = 3, gapMs = 2_000): Promise<number> {
+  let status = 0;
+  for (let i = 0; i < tries; i++) {
+    if (i) await new Promise((r) => setTimeout(r, gapMs));
+    try { status = await call(); } catch { status = 599; }
+    if (status < 500) return status;
+  }
+  return status;
+}

@@ -30,9 +30,12 @@
  *   SANDBOX_MAX          the soak stops with a failure when more of this run's sandboxes are alive before a round
  *                        (default 4); counted with kubectl (SaFE workloads labelled with the run's session ids)
  *   KUBECTL_ARGS         extra kubectl arguments for that count, e.g. "--context global"
+ *   SAY_MAX_PER_HOUR     the deployment's CLAW_ASSISTANT_SAY_MAX_PER_HOUR (default 120): a soak round starts only
+ *                        when the run's messages of the last hour plus SOAK_ROUND_SAYS (default 8) stay within it
  *
  * One run at a time per user: everything numbered after the run began is taken as the run's own and is stopped and
- * its worker deleted at the end, whatever ends the run.
+ * its worker deleted at the end, whatever ends the run. The cap on the assistant's messages counts the user's last
+ * hour, which the run cannot see before it started: start a soak after an hour without assistant messages.
  *
  * Exit 0 only if every check passed. The last line is a JSON summary.
  */
@@ -42,7 +45,7 @@ import { promisify } from "node:util";
 import { mintAssistantToken } from "../../src/assistant/token.js";
 import {
   SESSION_ID_LABEL, aliveSandboxes, apiClient, duplicateEventIds, itemNamed, latencyMs, newItemsSince, percentile,
-  renderTimings, runTag, settle, startReceiver, until, type Received, type Timing,
+  renderTimings, retry5xx, runTag, sayPacingWaitMs, settle, startReceiver, until, type Received, type Timing,
 } from "./assistant-p1-lib.js";
 
 const run = promisify(execFile);
@@ -65,6 +68,8 @@ const SOAK_DONE_WAIT_MS = Number(process.env.SOAK_DONE_WAIT_SEC ?? 600) * 1000;
 const SANDBOX_MAX = Number(process.env.SANDBOX_MAX ?? 4);
 const KUBECTL_ARGS = (process.env.KUBECTL_ARGS ?? "").split(/\s+/).filter(Boolean);
 const RUN_TAG = runTag(process.env.RUN_TAG);
+const SAY_MAX_PER_HOUR = Number(process.env.SAY_MAX_PER_HOUR ?? 120);
+const SOAK_ROUND_SAYS = Number(process.env.SOAK_ROUND_SAYS ?? 8);
 if (CHAOS.has("receiver") && RECEIVER_HOLD_SEC <= SILENT_SWEEP_SEC) {
   console.error(`RECEIVER_HOLD_SEC (${RECEIVER_HOLD_SEC}) must be longer than SILENT_SWEEP_SEC (${SILENT_SWEEP_SEC})`);
   process.exit(2);
@@ -120,14 +125,19 @@ async function track(id: string): Promise<ItemView | null> {
 async function retire(id: string): Promise<boolean> {
   const t = runItems.get(id);
   if (!t || t.retired) return true;
-  const got = await api("GET", `/v1/work-items/${id}`);
-  const it = got.status === 200 ? (got.json.data as ItemView) : null;
-  const stop = !it ? got.status : it.board_state !== "done" ? (await api("POST", `/v1/work-items/${id}/stop`)).status : 200;
-  const wid = it?.worker_session_id ?? t.workerSessionId;
+  let it: ItemView | null = null;
+  const read = await retry5xx(async () => {
+    const got = await api("GET", `/v1/work-items/${id}`);
+    if (got.status === 200) it = got.json.data as ItemView;
+    return got.status;
+  });
+  const item = it as ItemView | null;
+  const stop = !item ? read : item.board_state !== "done" ? await retry5xx(async () => (await api("POST", `/v1/work-items/${id}/stop`)).status) : 200;
+  const wid = item?.worker_session_id ?? t.workerSessionId;
   // An item that could not be read is not retired, but a worker already known is still deleted.
-  const del = wid ? (await api("DELETE", `/v1/sessions/${wid}`)).status : it ? 200 : 0;
+  const del = wid ? await retry5xx(async () => (await api("DELETE", `/v1/sessions/${wid}`)).status) : item ? 200 : 0;
   t.retired = stop === 200 && (del === 200 || del === 204 || del === 404);
-  if (!t.retired) log("could not retire", id, `read ${got.status}, stop ${stop}, delete worker ${del}`);
+  if (!t.retired) log("could not retire", id, `read ${read}, stop ${stop}, delete worker ${del}`);
   return t.retired;
 }
 /**
@@ -290,6 +300,13 @@ async function scenario(): Promise<"finished" | void> {
   let roundsRun = 0;
   for (let round = 1; round <= SOAK_ROUNDS; round++) {
     if (!await sandboxGuard(round)) { log("FAIL", `soak round ${round}: stopping the run, too many of its sandboxes are alive`); break; }
+    const says = () => receiver.received.filter((r) => r.type === "assistant.say").map((r) => r.at);
+    const pause = sayPacingWaitMs(says(), Date.now(), SAY_MAX_PER_HOUR, SOAK_ROUND_SAYS);
+    if (!Number.isFinite(pause)) { check(false, `soak round ${round}: one round (${SOAK_ROUND_SAYS} messages) fits the cap of ${SAY_MAX_PER_HOUR} an hour`); break; }
+    if (pause > 0) {
+      log(`soak round ${round}: waiting ${Math.round(pause / 1000)}s so the user stays within ${SAY_MAX_PER_HOUR} messages an hour (${says().filter((t) => t > Date.now() - 3_600_000).length} in the last hour)`);
+      await new Promise((r) => setTimeout(r, pause));
+    }
     soak.push(...await soakRound(round, send, receiver, sid));
     roundsRun = round;
   }
