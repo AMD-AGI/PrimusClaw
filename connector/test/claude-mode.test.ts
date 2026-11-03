@@ -119,13 +119,27 @@ describe("which agents are warned about", () => {
     assert.equal(warn(l, cfg(l, `[[agents]]\nid = "cc"\npreset = "claude"\nroots = [ROOT]\napproval = "ask"\n`, "allow_unsafe_modes = true")).length, 1);
   });
 
-  test("only the claude preset is checked: not claude-attach (it accepts the warning while it takes over), Codex or a custom agent", () => {
+  test("only agents that run the Claude adapter are checked: not claude-attach (it accepts the warning while it takes over), Codex, or a custom agent labelled claude", () => {
     const l = layout();
     write(l.user, BYPASS);
-    const w = warn(l, cfg(l, `[[agents]]\nid = "att"\npreset = "claude-attach"\nroots = [ROOT]\n[[agents]]\nid = "cx"\npreset = "codex"\nroots = [ROOT]\n[[agents]]\nid = "mine"\ncommand = "x"\nask_mode = "a"\nroots = [ROOT]\n`));
+    const w = warn(l, cfg(l, `[[agents]]\nid = "att"\npreset = "claude-attach"\nroots = [ROOT]\n[[agents]]\nid = "cx"\npreset = "codex"\nroots = [ROOT]\n[[agents]]\nid = "mine"\nkind = "claude"\ncommand = "x"\nask_mode = "a"\nroots = [ROOT]\n`));
     assert.deepEqual(w, []);
     const both = warn(l, cfg(l, `[[agents]]\nid = "att"\npreset = "claude-attach"\nroots = [ROOT]\n[[agents]]\nid = "cc"\npreset = "claude"\nroots = [ROOT]\n`));
     assert.deepEqual(both.map((s) => s.split(":")[0]), ["cc"]);
+  });
+
+  test("a custom agent that runs claude-agent-acp is checked, whatever its kind", () => {
+    const l = layout();
+    write(l.user, BYPASS);
+    const w = warn(l, cfg(l, `[[agents]]\nid = "own"\ncommand = "node"\nargs = ["/opt/claude-agent-acp/dist/index.js"]\nask_mode = "default"\nroots = [ROOT]\n`));
+    assert.deepEqual(w.map((s) => s.split(":")[0]), ["own"]);
+  });
+
+  test("a root's own .claude file that sets another defaultMode does not hide the warning: a session may start below it", () => {
+    const l = layout();
+    write(l.user, BYPASS);
+    write(l.project, { permissions: { defaultMode: "default" } });
+    assert.equal(warn(l, cfg(l, `[[agents]]\nid = "cc"\npreset = "claude"\nroots = [ROOT]\n`)).length, 1);
   });
 
   test("the agent's own [agents.env] CLAUDE_CONFIG_DIR is the one read", () => {

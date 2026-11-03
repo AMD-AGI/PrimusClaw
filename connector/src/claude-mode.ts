@@ -27,11 +27,12 @@ import type { AgentConfig } from "./config.js";
 import { isObject } from "./util.js";
 
 /**
- * The agents this applies to: those made from the `claude` preset. A `claude-attach` agent takes over a conversation
- * whose mode was chosen in a terminal, and accepts the adapter's warning while it starts (session.ts,
+ * The agents this applies to: those that run the Claude adapter (the `claude` preset, or any agent whose command line
+ * names claude-agent-acp), recognised by what they run, since `kind` is only a label. A `claude-attach` agent takes over
+ * a conversation whose mode was chosen in a terminal, and accepts the adapter's warning while it starts (session.ts,
  * `inheritedWarningOk`), so its sessions are not closed for it.
  */
-const isClaude = (a: AgentConfig): boolean => a.kind === "claude" && !a.attach;
+const isClaude = (a: AgentConfig): boolean => !a.attach && [a.command, ...a.args].some((s) => s.includes("claude-agent-acp"));
 
 type Source = "user" | "project" | "local" | "managed";
 
@@ -44,8 +45,8 @@ export function managedSettingsFile(platform: NodeJS.Platform = process.platform
 export interface StartModeInput {
   /** The adapter's environment: the connector's own, with the agent's `[agents.env]` over it. */
   env: NodeJS.ProcessEnv;
-  /** The session's working directory. */
-  cwd: string;
+  /** The session's working directory; null reads only the files that apply in every directory (user, managed). */
+  cwd: string | null;
   managedFile?: string;
   euid?: number | null;
 }
@@ -77,8 +78,10 @@ export function claudeStartMode(o: StartModeInput): StartMode {
   const configDir = o.env.CLAUDE_CONFIG_DIR?.trim() || path.join(home, ".claude");
   const files: [Source, string][] = [
     ["user", path.join(configDir, "settings.json")],
-    ["project", path.join(o.cwd, ".claude", "settings.json")],
-    ["local", path.join(o.cwd, ".claude", "settings.local.json")],
+    ...(o.cwd === null ? [] : [
+      ["project", path.join(o.cwd, ".claude", "settings.json")] as [Source, string],
+      ["local", path.join(o.cwd, ".claude", "settings.local.json")] as [Source, string],
+    ]),
     ["managed", o.managedFile ?? managedSettingsFile()],
   ];
   const unreadable: string[] = [];
@@ -103,24 +106,19 @@ export function claudeStartMode(o: StartModeInput): StartMode {
 
 /**
  * For each Claude agent that has no opt-out of per-step approval, a sentence saying that its sessions will be refused,
- * or that the settings could not be read. Checked with each root as the session's directory.
+ * or that the settings could not be read. Only the files that apply wherever a session starts are read (the user's and
+ * the managed settings): a repository's `.claude` files cannot switch bypass on, and a session may start in any
+ * directory below a root, where a file that switches it off at the root does not apply.
  */
 export function noAskWarnings(agents: AgentConfig[], env: NodeJS.ProcessEnv, opts: { managedFile?: string; euid?: number | null } = {}): string[] {
   const out: string[] = [];
   for (const a of agents) {
     if (!isClaude(a) || a.allowUnsafeModes) continue;
-    const agentEnv = { ...env, ...a.env };
-    const files = new Set<string>();
-    const unreadable = new Set<string>();
-    for (const root of a.roots) {
-      const r = claudeStartMode({ env: agentEnv, cwd: root, ...opts });
-      if (r.bypass && r.file) files.add(r.file);
-      for (const f of r.unreadable) unreadable.add(f);
+    const r = claudeStartMode({ env: { ...env, ...a.env }, cwd: null, ...opts });
+    if (r.bypass) {
+      out.push(`${a.id}: sessions will be refused (mode_not_enforced): Claude defaults to bypassPermissions here (permissions.defaultMode in ${r.file}); set approval = "never" on this agent or change defaultMode`);
     }
-    if (files.size) {
-      out.push(`${a.id}: sessions will be refused (mode_not_enforced): Claude defaults to bypassPermissions here (permissions.defaultMode in ${[...files].join(", ")}); set approval = "never" on this agent or change defaultMode`);
-    }
-    for (const f of unreadable) out.push(`${a.id}: cannot tell whether Claude defaults to bypassPermissions: ${f} is not readable JSON`);
+    for (const f of r.unreadable) out.push(`${a.id}: cannot tell whether Claude defaults to bypassPermissions: ${f} is not readable JSON`);
   }
   return out;
 }

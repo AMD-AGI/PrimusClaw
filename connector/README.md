@@ -168,10 +168,11 @@ warning:    claude: sessions will be refused (mode_not_enforced): Claude default
 ```
 
 Choose one: `approval = "never"` on that agent (knowing the risk below), or another `defaultMode` in that file. The check
-reads the files the Claude adapter reads, the way it reads them: `bypassPermissions` from a repository's
-`.claude/settings.json` or `.claude/settings.local.json` is ignored by the adapter (and so by the check), root without
-`IS_SANDBOX` cannot use it, and `permissions.disableBypassPermissionsMode = "disable"` turns it off. Codex and Cursor have
-no equivalent: their own settings are replaced by the mode the connector sets and reads back.
+reads the two files from which the Claude adapter takes `bypassPermissions` (it ignores that value in a repository's
+`.claude/settings.json` and `.claude/settings.local.json`), and only the exact spelling counts, as for the adapter; root
+without `IS_SANDBOX` cannot use bypass, and `permissions.disableBypassPermissionsMode = "disable"` turns it off. It applies
+to every agent that runs `claude-agent-acp` except `claude-attach`. Codex and Cursor have no equivalent: their own
+settings are replaced by the mode the connector sets and reads back.
 
 **The risk, in one sentence:** an agent without per-step approval acts on whatever it is told, including text it read in
 a file or a web page, with everything your account can do inside its roots (and `--force` or full access reach outside the
