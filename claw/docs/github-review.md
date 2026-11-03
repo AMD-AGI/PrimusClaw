@@ -253,7 +253,9 @@ print the keys, so such a session is sent none of them, on every path that carri
 for a message, for a message queued behind a running turn, for the first message of a new session, for the start of the
 session's sandbox, for an event of the Anthropic-compatible route, or for a workbench run into the session; it reads none
 when Brain claims a queued turn, and takes whatever a queued message was frozen with before the mark applied off the turn
-it sends on; and the scheduler's dispatch of a task of a DAG leaves out what the task's input holds. Brain composes none
+it sends on; and the scheduler's dispatch of a task of a DAG leaves out what the task's input holds, from the request and from the
+context its prompt and script templates are rendered with (a template that names it does not resolve and the task is not
+sent). Brain composes none
 of `request.user_env` into the sandbox of a request marked `withhold_sandbox_keys` (and so a change in the vault is not a
 change of such a sandbox), whatever the request carries, as a backstop for one that is sent some anyway. A new place that
 reads the vault or puts it on a request fails `test/github-review-acting-user-env.test.ts` (E9) until it says how it

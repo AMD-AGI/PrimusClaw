@@ -19,6 +19,7 @@
  *   E6  the start of the session's sandbox
  *   E7  a turn claimed from the queue by Brain (the doorbell path), whose vault is read live at the claim
  *   E8  a task of a DAG, whose vault was embedded in its input when the run was created
+ *   E8b the templates of that task, which can read its input into a prompt
  *   E9  the closed set: every place in the source that reads the vault or puts it on a request is on a list with how it decides
  *
  * A session that does not act as a user is run beside each one, and must still be sent the vault: a test that cannot see the vault at all
@@ -346,6 +347,42 @@ test("E8 a task of a DAG is given no vault for a session that acts as a user, wh
   }
 });
 
+test("E8b a template of a DAG task cannot read the vault out of the task's input for a session that acts as a user: the secret is in no prompt that Brain is sent", async () => {
+  const { dispatchTask, taskPublisher } = await import("../src/tasks/dispatcher.js");
+  const NOW = new Date().toISOString();
+  const originalQuery = db.query;
+  const originalPublish = taskPublisher.publish;
+  try {
+    for (const [what, actingAs, marked] of KINDS) {
+      const config = { platform_key: "pk-user-1", _server_managed_credentials: true, ...(actingAs === null ? {} : { acting_as: actingAs }) };
+      const row = {
+        task_id: "t-1", session_id: "s-1", status: "preparing", mode: "llm", prompt: "use ${task.input.user_env.GITHUB_TOKEN} to clone", input: { user_env: VAULT },
+        metadata: {}, depends_on: [], batch_id: null, user_id: "u-1", session_config: config, plugin_id: null, sandbox_spec: "none", dag_root_task_id: null, started_at: NOW, created_at: NOW,
+      };
+      db.query = (async (text: string) => {
+        const sql = text.replace(/\s+/g, " ").trim();
+        if (/SELECT user_id, config FROM claw_sessions/.test(sql)) return { rows: [{ user_id: "u-1", config }], rowCount: 1 };
+        if (/^UPDATE claw_tasks/.test(sql) || /FROM claw_tasks t LEFT JOIN claw_sessions/.test(sql)) return { rows: [row], rowCount: 1 };
+        if (/claw_workspace/.test(sql)) return { rows: [{ workspace_id: "kws_1", storage_prefix: "users/u-1/sessions/s-1/" }], rowCount: 1 };
+        return { rows: [], rowCount: 0 };
+      }) as typeof db.query;
+      const sent: Array<Record<string, unknown>> = [];
+      taskPublisher.publish = (async (payload: string) => { sent.push(JSON.parse(payload)); }) as typeof taskPublisher.publish;
+      await dispatchTask("t-1");
+      if (marked) {
+        assert.equal(sent.some((request) => holdsVault(request)), false, `${what}: no prompt that Brain is sent carries a secret of the vault`);
+        assert.equal(sent.length, 0, `${what}: a template that names the vault does not resolve, and the task is not sent as if it had`);
+      } else {
+        assert.equal(sent.length, 1, `${what}: dispatched`);
+        assert.equal(sent[0]!.prompt, `use ${VAULT.GITHUB_TOKEN} to clone`, `${what}: control, the template reads the task's input as it always did`);
+      }
+    }
+  } finally {
+    db.query = originalQuery;
+    taskPublisher.publish = originalPublish;
+  }
+});
+
 // ------------------------------------------------------------------------------------------------ the closed set
 
 function walk(dir: string): string[] {
@@ -372,6 +409,7 @@ test("E9 every place in the source that reads the vault or puts it on a request 
     "tasks/pending-dispatch.ts": "the drain's fat branch: applyAppMcpToTask takes it off a marked task, and injectLiveUserEnv reads none for one (E3)",
     "tasks/run-claim.ts": "the claim reads the vault live; injectLiveUserEnv reads none for a session that withholds its keys, and takes any off the request (E7)",
     "tasks/dispatcher.ts": "a task of a DAG lifts it out of its input; none for a session that withholds its keys (E8)",
+    "tasks/template-renderer.ts": "a template reads the task's input, which holds the vault of a run made before the session was marked; the render context leaves it out for a session that withholds its keys (E8b)",
     "tasks/run-spec.ts": "strips it from a run's stored spec, for every session",
     "crypto/user-env.ts": "the vault's own reader and cipher",
     "routes/user-env-vars.ts": "the owner's routes to edit the vault, not a request to Brain",
