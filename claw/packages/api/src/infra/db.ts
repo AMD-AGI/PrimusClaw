@@ -1643,6 +1643,12 @@ export async function initDb(): Promise<void> {
           updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
       `);
+      // When a trigger ends by itself (`until`, `max_runs`), how many runs it has started, and the work item
+      // whose worker a firing wakes instead of starting a new session (a trigger made from an item's turn).
+      await client.query("ALTER TABLE claw_triggers ADD COLUMN IF NOT EXISTS ends_at TIMESTAMPTZ");
+      await client.query("ALTER TABLE claw_triggers ADD COLUMN IF NOT EXISTS max_runs INT");
+      await client.query("ALTER TABLE claw_triggers ADD COLUMN IF NOT EXISTS runs INT NOT NULL DEFAULT 0");
+      await client.query("ALTER TABLE claw_triggers ADD COLUMN IF NOT EXISTS item_id TEXT");
       await client.query("CREATE INDEX IF NOT EXISTS idx_triggers_owner ON claw_triggers(owner_user_id)");
       await client.query("CREATE INDEX IF NOT EXISTS idx_triggers_due ON claw_triggers(next_fire_at) WHERE enabled AND paused_reason IS NULL");
       await client.query(`

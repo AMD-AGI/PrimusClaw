@@ -48,7 +48,9 @@ const RECALL_EVENTS = 20;
  * A turn is live while its run row is open and the session's gate does not name another turn. An unnamed
  * gate is a session from before gates carried an owner, and is not a reason to refuse.
  */
-export async function assertLiveRun(q: Querier, claims: AssistantTokenClaims): Promise<{ userId: string }> {
+export async function assertLiveRun(
+  q: Querier, claims: Pick<AssistantTokenClaims, "sid" | "mid" | "task_id">,
+): Promise<{ userId: string }> {
   const row = (await q(
     `SELECT s.user_id, s.agent_gate_message_id, t.status
        FROM claw_tasks t JOIN claw_sessions s ON s.session_id = t.session_id

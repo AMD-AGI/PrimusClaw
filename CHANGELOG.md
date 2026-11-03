@@ -28,6 +28,12 @@ record it.
 ## [Unreleased]
 
 ### Added
+- The model can schedule work itself: with `CLAW_TRIGGER_TOOLS_ENABLED` (needs `CLAW_TRIGGERS_ENABLED` and a
+  `CLAW_TRIGGER_TOOLS_TOKEN_KEY` of 32+ characters; off by default) every turn but a trigger's own run is offered
+  `trigger_create`, `trigger_list` and `trigger_cancel`, served by the API at `/v1/internal/trigger-mcp`. The user is
+  always the owner of the calling turn's session, named by a bearer minted for that turn, never by an argument;
+  `trigger_create` is held for the user's approval. A trigger can end by itself (`until`, `max_runs`, also accepted by
+  `POST /v1/triggers`), and one made from a work item's worker wakes that worker instead of starting a new session.
 - A service that acts for a person (a delegated identity token: RFC 8693 `act`) can now bring the person's own
   `ak-` key in `x-api-key`, for the services an operator names in `CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS` (empty by
   default, which changes nothing: such a token still has no keys and the header is still not read). SaFE verifies the
