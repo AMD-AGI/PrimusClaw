@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 
 import { read, READ_DEFAULT_LINES } from "../src/tools/fs/read.js";
 import { edit } from "../src/tools/fs/edit.js";
@@ -125,15 +125,24 @@ test("grep does not read a file over the size cap, and says so", async () => {
   assert.match(out, /1 file\(s\) over 8 MB not searched/);
 });
 
-test("grep reads only regular files: a link to a FIFO or a device is passed over, not read forever", async () => {
+test("grep reads only regular files: a link to a FIFO or a device is passed over, not read forever", () => {
   put("a.txt", "needle\n");
   const fifo = path.join(dir, "..", `${path.basename(dir)}.fifo`);
   execFileSync("mkfifo", [fifo]);
   try {
     fs.symlinkSync(fifo, path.join(dir, "pipe"));
     fs.symlinkSync("/dev/zero", path.join(dir, "zero"));
-    const out = textOf(await grep.execute({ pattern: "needle", path: dir }));
-    assert.match(out, /a\.txt/);
+    // In a child, so a read that never ends fails this test instead of hanging the run.
+    const run = spawnSync(process.execPath, [
+      "--import", "tsx", "--input-type=module", "-e",
+      "const { grep } = await import('./src/tools/fs/grep.ts');"
+        + "const r = await grep.execute({ pattern: 'needle', path: process.argv[1] });"
+        + "process.stdout.write(r.content.map((c) => c.text).join('\\n'));",
+      dir,
+    ], { cwd: path.join(import.meta.dirname, ".."), encoding: "utf-8", timeout: 20_000 });
+    assert.equal(run.signal, null, "grep did not finish: it read a FIFO or a device");
+    assert.match(run.stdout, /a\.txt/, run.stderr);
+    assert.doesNotMatch(run.stdout, /not searched/, "a FIFO or a device was read as a file");
   } finally {
     fs.rmSync(fifo, { force: true });
   }

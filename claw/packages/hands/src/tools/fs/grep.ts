@@ -22,6 +22,31 @@ export const GREP_SKIP = [".git", ".venv", ...WORKSPACE_EXCLUDES] as const;
 /** A file bigger than this is not read: a dataset or a binary, and one read would hold Hands past every deadline. */
 export const GREP_MAX_FILE_BYTES = 8 * 1024 * 1024;
 
+/**
+ * A file's text, or why it is not read. The path is opened once and everything is
+ * asked of that descriptor, so a link swapped between a check and the read cannot
+ * hand the read a FIFO or a device; nonblocking, so opening a FIFO does not wait
+ * for a writer. Only a regular file is read, and never past its size when checked.
+ */
+function readCapped(file: string): { text: string } | "not-a-file" | "too-large" {
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) return "not-a-file";
+    if (st.size > GREP_MAX_FILE_BYTES) return "too-large";
+    const buf = Buffer.alloc(st.size);
+    let off = 0;
+    while (off < buf.length) {
+      const n = fs.readSync(fd, buf, off, buf.length - off, off);
+      if (n === 0) break;
+      off += n;
+    }
+    return { text: buf.toString("utf-8", 0, off) };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 const skipped = (name: string) => GREP_SKIP.some((p) => minimatch(name, p, { dot: true }));
 
 function walkFiles(dir: string): string[] {
@@ -86,11 +111,10 @@ export const grep = {
         break;
       }
       try {
-        // Followed through a link: a device or FIFO has no size to cap and a read of it never ends.
-        const st = fs.statSync(file);
-        if (!st.isFile()) continue;
-        if (st.size > GREP_MAX_FILE_BYTES) { tooLarge++; continue; }
-        const lines = fs.readFileSync(file, "utf-8").split("\n");
+        const read = readCapped(file);
+        if (read === "not-a-file") continue;
+        if (read === "too-large") { tooLarge++; continue; }
+        const lines = read.text.split("\n");
         const rel = path.relative(WORKSPACE, file);
         const fileDeadline = Date.now() + PER_FILE_TIMEOUT_MS;
         let aborted = false;
