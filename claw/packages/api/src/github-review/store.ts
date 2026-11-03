@@ -318,12 +318,13 @@ export async function countPendingConfirmations(db: Queryable, actorUserId: stri
 
 /**
  * Whether an approval or a merge of this head commit, with this acting user's account, is already waiting for them or was refused by
- * them: a later call for the same commit must not make that write without them, whatever it says of the change.
+ * them: a later call for the same commit must not make that write without them, whatever it says of the change. GitHub's names are not
+ * case sensitive, and neither is this: `amd-agi/DEMO#7` is the same pull request as `AMD-AGI/demo#7`.
  */
 export async function heldOrDeniedOn(db: Queryable, actorUserId: string, repo: string, pr: number, headSha: string): Promise<"pending" | "denied" | null> {
   const r = await db.query(
     `SELECT status FROM claw_github_confirmations
-      WHERE actor_user_id = $1 AND repo = $2 AND pr = $3 AND head_sha = $4
+      WHERE actor_user_id = $1 AND lower(repo) = lower($2) AND pr = $3 AND head_sha = $4
         AND ((status = 'pending' AND expires_at > NOW()) OR status = 'denied')
       ORDER BY status = 'denied' DESC LIMIT 1`,
     [actorUserId, repo, pr, headSha],

@@ -687,6 +687,8 @@ describe("M4 what the change does, and the reviewer's judgement of it", () => {
     assert.equal(merged.body.status, "confirmation_required", "a low judgement on the merge does not get past the held approval");
     assert.match((merged.body.reasons as string[])[0] ?? "", /already waits for bob's decision/);
     assert.equal((await submit({ event: "APPROVE" })).body.status, "confirmation_required", "nor does a second approval");
+    const spelled = await e.service.mergePr(e.actor, { pr: PR.replace("AMD-AGI/demo", "amd-agi/DEMO"), head_sha: HEAD, risk_judgement: LOW });
+    assert.equal(spelled.body.status, "confirmation_required", "nor does the same pull request spelled in another case");
     assert.equal(e.gh.writes.length, 0);
     assert.equal(puts().length, 0);
     await e.sql("UPDATE claw_github_confirmations SET status = 'denied'");
