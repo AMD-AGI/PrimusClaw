@@ -100,6 +100,7 @@ func releaseOne(g *runtimev1alpha1.SandboxGrant, sandboxID string, gpuSeconds in
 
 // checkQuota refuses one more sandbox with gpus GPUs in role when it passes the role cap, the grant cap summed
 // over every role, or the GPU-hour budget. The detail names the cap, the request, the usage, and the limit.
+// A count cap is 429 grant_quota_exceeded. A spent GPU-hour budget is 403 grant_budget_exhausted.
 func checkQuota(g *runtimev1alpha1.SandboxGrant, role string, limit runtimev1alpha1.GrantRole, gpus int32) error {
 	usage := g.Status.Usage[role]
 	if limit.MaxSandboxes >= 0 && usage.Sandboxes+1 > limit.MaxSandboxes {
@@ -120,7 +121,7 @@ func checkQuota(g *runtimev1alpha1.SandboxGrant, role string, limit runtimev1alp
 		return quotaExceeded("grant gpus", gpus, total.GPUs, *g.Spec.MaxGPUs)
 	}
 	if overBudget(g) {
-		return opErr(http.StatusTooManyRequests, "grant_quota_exceeded",
+		return opErr(http.StatusForbidden, "grant_budget_exhausted",
 			fmtDetail("grant gpu hours: used %.2f, limit %.2f", float64(g.Status.GPUSeconds)/3600, g.Spec.GPUHoursBudget))
 	}
 	return nil

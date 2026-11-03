@@ -431,7 +431,7 @@ func TestBudgetExhausted(t *testing.T) {
 	}
 	err := svc.Reserve(context.Background(), req.GrantID, "measurement", "sbx-2", "sess-2", 1)
 	oe, ok := err.(*OpError)
-	if !ok || oe.Status != http.StatusTooManyRequests || oe.Reason != "grant_quota_exceeded" || !strings.Contains(oe.Error(), "grant_quota_exceeded") {
+	if !ok || oe.Status != http.StatusForbidden || oe.Reason != "grant_budget_exhausted" || !strings.Contains(oe.Error(), "grant_budget_exhausted") {
 		t.Fatalf("err=%v", err)
 	}
 }

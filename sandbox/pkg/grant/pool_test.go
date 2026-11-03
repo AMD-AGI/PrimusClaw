@@ -168,7 +168,8 @@ func TestBudgetDetailNamesUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 	err := svc.Reserve(context.Background(), req.GrantID, "measurement", "sbx-2", "sess-2", 1)
-	if !IsReason(err, "grant_quota_exceeded") || detailOf(err) != "grant gpu hours: used 1.00, limit 1.00" {
+	var oe *OpError
+	if !IsReason(err, "grant_budget_exhausted") || !errors.As(err, &oe) || oe.Status != 403 || detailOf(err) != "grant gpu hours: used 1.00, limit 1.00" {
 		t.Fatalf("err=%v", err)
 	}
 }
