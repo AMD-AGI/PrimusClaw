@@ -27,7 +27,7 @@ import { evaluateChecks, hasMergeQueueRule, requiredContextsFromRules, type Chec
 import { commentableLines } from "./diff.js";
 import { GithubClient, GithubError, GithubGraphqlError, parsePrRef, repoPath, type PrRef } from "./github.js";
 import { LEGACY_REPO_CONFIG_STEM, LEGACY_RUN_MARKER_PREFIX } from "./legacy-names.js";
-import { HOLD_GUIDANCE, MAX_FILES_READ, REPO_CONFIG_PATH, assessRisk, diffNotSent, normaliseJudgement, parseRepoConfig, type RepoConfig, type ReviewerJudgement, type RiskFile, type RiskResult } from "./risk.js";
+import { MAX_FILES_READ, REPO_CONFIG_PATH, assessRisk, diffNotSent, normaliseJudgement, parseRepoConfig, type RepoConfig, type ReviewerJudgement, type RiskFile, type RiskResult } from "./risk.js";
 import { selectReviewInstructions } from "./repo-skill.js";
 import { chooseReviewPath, reviewPathAdvice } from "./review-path.js";
 import { isReviewTarget } from "./review-target.js";
@@ -278,7 +278,7 @@ export class GithubReview {
         // No judgement yet: the model's own, on gh_review_submit and gh_pr_merge, decides the hold. This is what it judges from.
         risk: {
           review_mode: ctx.cred.mode, hard_holds: risk.hardHolds, repo_holds: risk.repoHolds, evidence: risk.evidence, rule_level: risk.ruleLevel,
-          categories: risk.categories, rule_pack: risk.rulePack, guidance: HOLD_GUIDANCE,
+          categories: risk.categories, rule_pack: risk.rulePack,
         },
         files: change.files.map((f) => ({ path: f.path, status: f.status, additions: f.additions, deletions: f.deletions, has_diff: !diffNotSent(f) })),
         files_complete: change.complete,
@@ -773,7 +773,6 @@ export class GithubReview {
     return {
       level: risk.level, reasons: risk.reasons, review_mode: ctx.cred.mode, judgement: risk.judgement, hard_holds: risk.hardHolds,
       repo_holds: risk.repoHolds, evidence: risk.evidence, rule_level: risk.ruleLevel, categories: risk.categories, rule_pack: risk.rulePack,
-      guidance: HOLD_GUIDANCE,
     };
   }
 

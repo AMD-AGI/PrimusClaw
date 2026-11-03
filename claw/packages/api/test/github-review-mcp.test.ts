@@ -16,6 +16,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { registerGithubReviewRoutes } from "../src/github-review/mcp.js";
+import { HOLD_GUIDANCE } from "../src/github-review/risk.js";
 import { mintSessionToolToken } from "../src/github-review/token.js";
 import { HEAD } from "./support/fake-github.js";
 import { PR, SECRET, TOKEN, closeShared, credential, reviewEnv, type ReviewEnv } from "./support/review-env.js";
@@ -172,6 +173,11 @@ describe("B a tool call", () => {
       assert.ok(tool && "risk_judgement" in ((tool.inputSchema as { properties?: Record<string, unknown> }).properties ?? {}), name);
     }
     assert.ok(!("risk_judgement" in ((tools.find((t) => t.name === "gh_pr_get")?.inputSchema as { properties?: Record<string, unknown> }).properties ?? {})), "gh_pr_get has nothing to add to");
+    // The hold guidance reaches the model with the tools themselves, on every turn, wherever it judges.
+    for (const name of ["gh_pr_risk", "gh_review_submit", "gh_pr_merge"]) {
+      const judgement = ((tools.find((t) => t.name === name)?.inputSchema as { properties?: Record<string, { description?: string }> }).properties ?? {}).risk_judgement;
+      assert.ok(judgement?.description?.includes(HOLD_GUIDANCE), name);
+    }
     const bad = await c.callTool({ name: "gh_pr_merge", arguments: { pr: PR, head_sha: HEAD, risk_judgement: { level: "medium", reason: "x" } } }) as { isError?: boolean };
     assert.equal(bad.isError, true);
     assert.equal(e.gh.calls.length, 0, "the schema stopped it before anything was asked of GitHub");

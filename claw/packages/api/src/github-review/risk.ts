@@ -136,8 +136,9 @@ export interface RiskResult {
 }
 
 /**
- * What the reviewing model is told about the hold, with the evidence: the model decides, and these are the cases to hold for. Kept here so the
- * tool answer, the tool descriptions and the review skill say the same thing.
+ * What the reviewing model is told about the hold: the model decides, and these are the cases to hold for. It is in the description of
+ * `risk_judgement` on every tool that takes it (mcp.ts), which the model has on every turn, and not in a tool answer, which would pay for it
+ * on every call.
  */
 export const HOLD_GUIDANCE = "Your risk_judgement decides whether an approval or a merge waits for the person whose account is used: "
   + "high holds it for their confirmation, low lets it go through the other gates. Hold (high) only for what a person should look at: "

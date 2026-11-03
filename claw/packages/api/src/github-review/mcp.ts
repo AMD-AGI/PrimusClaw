@@ -35,6 +35,7 @@ import { classifyAttendedCaller } from "./attended.js";
 import { reviewTargetOf } from "./review-target.js";
 import { GithubReview, type ReviewActor, type ToolOutcome } from "./service.js";
 import { readGithubReviewSettings, type GithubReviewSettings } from "./settings.js";
+import { HOLD_GUIDANCE } from "./risk.js";
 import { REVIEW_MODES, getReviewMode, listConfirmations, setReviewMode, type ConfirmationStatus, type Queryable, type ReviewMode } from "./store.js";
 import { verifySessionToolToken } from "./token.js";
 
@@ -56,8 +57,9 @@ const JUDGEMENT = z.object({
 }).optional().describe(
   "Your own reading of what the change DOES, which decides whether an APPROVE or a merge waits for the acting user: `high` holds it for their "
   + "confirmation (they read your reason first), `low` lets it through the other gates, and leaving it out holds it. Judge from the diff and from "
-  + "the evidence in gh_pr_get's `risk` (its `guidance` says what to hold for); `hard_holds` there hold whatever you say. When the acting user's "
-  + "`review_mode` is `fully_auto` (their own setting), only `repo_holds`, what the repository itself requires, hold");
+  + "the evidence in gh_pr_get's `risk`; `hard_holds` there hold whatever you say. When the acting user's "
+  + "`review_mode` is `fully_auto` (their own setting), only `repo_holds`, what the repository itself requires, hold"
+  + ". " + HOLD_GUIDANCE);
 
 function toResult(outcome: ToolOutcome): { content: Array<{ type: "text"; text: string }>; isError?: boolean } {
   return { content: [{ type: "text" as const, text: outcome.text }], ...(outcome.isError ? { isError: true } : {}) };

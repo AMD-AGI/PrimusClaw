@@ -58,7 +58,7 @@ describe("R reading", () => {
     assert.equal(b.merge_state.unresolved_threads, 0);
     assert.deepEqual([b.risk.hard_holds, b.risk.evidence, b.risk.rule_level], [[], [], "low"]);
     assert.equal(b.risk.level, undefined, "no judgement has been given yet, so there is no verdict to show");
-    assert.match(b.risk.guidance, /risk_judgement decides/);
+    assert.equal(b.risk.guidance, undefined, "the guidance is in the risk_judgement description, not paid for in every answer");
     assert.match(b.notice, /untrusted/);
     assert.match(b.review_instructions, /Pull request review/);
     assert.doesNotMatch(b.review_instructions, /^---$/m, "no skill frontmatter");
@@ -647,7 +647,8 @@ describe("M4 what the change does, and the reviewer's judgement of it", () => {
     assert.equal(get.rule_pack, "2026-11-03.1");
     const risk = (await e.service.assessPr(e.actor, { pr: PR, risk_judgement: LOW })).body.risk as any;
     assert.deepEqual([risk.level, risk.judgement, risk.reasons], ["low", "low", []]);
-    assert.deepEqual([risk.evidence, risk.hard_holds, risk.rule_level, risk.categories, risk.rule_pack, risk.guidance], [get.evidence, get.hard_holds, get.rule_level, get.categories, get.rule_pack, get.guidance]);
+    assert.deepEqual([risk.evidence, risk.hard_holds, risk.rule_level, risk.categories, risk.rule_pack], [get.evidence, get.hard_holds, get.rule_level, get.categories, get.rule_pack]);
+    assert.equal(risk.guidance, undefined);
   });
 
   test("M13 a merge the rules call low is held when the reviewer judges it high, and the reviewer's reason is the first thing the acting user is shown", async () => {

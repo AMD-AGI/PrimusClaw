@@ -82,7 +82,7 @@ review and the merge and who is the reviewer of record, and whose own standing a
 
 | Tool | What it does |
 |---|---|
-| `gh_pr_get` | The pull request, its files and diff, CI, review threads, existing comments, the risk evidence and hard holds with the guidance for the model's `risk_judgement`, what the acting user may do, the review path (below) and the review instructions. Text that came from the pull request is under `untrusted`. Call it first. |
+| `gh_pr_get` | The pull request, its files and diff, CI, review threads, existing comments, the risk evidence and hard holds for the model's `risk_judgement`, what the acting user may do, the review path (below) and the review instructions. Text that came from the pull request is under `untrusted`. Call it first. |
 | `gh_pr_risk` | Whether an approval or a merge would be held, and why, for the `risk_judgement` and `risk_flags` (`security_finding`, `review_skipped`) the model passes (see High risk): the judgement decides, except for the hard holds, and none holds. |
 | `gh_review_submit` | One review on the pinned head commit (the model may pass the same `risk_flags` as to `gh_pr_risk`, and they count for an `APPROVE`), with inline comments that must sit on lines the diff shows. `COMMENT`, `REQUEST_CHANGES` or `APPROVE`. A body footer says `Reviewed by <agent name> on behalf of <login> (requested by <name>), run <id>` (the agent name is `CLAW_GITHUB_REVIEW_AGENT_NAME`, default `Claw`) and a hidden marker (the run, the event and a digest of the text and inline comments) keeps a retry of the same review from posting twice, while a different review of the same kind on the same commit is posted. An `APPROVE` the model judges high, without a judgement, or with a hard hold is held until the acting user confirms (below). |
 | `gh_pr_merge` | Approves when needed and merges, if every gate is open. On a base branch that is merged through a merge queue it puts the pull request in the queue instead of merging it (`queued`, below). A merge the model judges high, without a judgement, or with a hard hold is held until the acting user confirms. |
@@ -196,7 +196,8 @@ review and the merge and who is the reviewer of record, and whose own standing a
      rules themselves fail.
 
   Nothing else holds. The rule pack below (version `2026-11-03.1`) is **evidence**: `gh_pr_get` and
-  `gh_pr_risk` give it to the model as `risk.evidence`, with `risk.hard_holds` and `risk.guidance`, the
+  `gh_pr_risk` give it to the model as `risk.evidence`, with `risk.hard_holds`; the `risk_judgement`
+  field's description (on every tool that takes it) and the review instructions carry the guidance, the
   instruction to hold for security-sensitive code (authentication, authorization, permissions,
   cryptography, sandboxing), credentials or secrets, CI, workflow, release or deployment changes,
   permission or access changes, destructive or irreversible data migrations, a change of an interface or
@@ -276,7 +277,7 @@ review and the merge and who is the reviewer of record, and whose own standing a
   words), `risk.judgement` (`low`, `high` or `missing`), `risk.hard_holds`, `risk.evidence`,
   `risk.rule_level` (whether the rules saw anything) and `risk.categories` (`architecture`, `interface`,
   `security`, `ci_release`, `dependency`, `size_breadth`, `integrity`, `provenance`, `reviewer`);
-  `gh_pr_get`, before any judgement, gives the evidence, the hard holds and the guidance. The audit row
+  `gh_pr_get`, before any judgement, gives the evidence and the hard holds. The audit row
   keeps the reasons and the evidence (marked `evidence:`). A `low` without a reason is no judgement.
   An approval or a merge of a head commit for which an earlier approval or merge already waits for the
   acting user, is being decided by them, was refused by them, or was held and never answered (an expired
