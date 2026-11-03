@@ -108,8 +108,8 @@ test("loader: mcp_env_allow is a list of placeholder names, and anything else re
   const f = path.join(dir, "d.json");
   const rows: Array<{ allow: unknown; want: string[] | null }> = [
     { allow: undefined, want: [] },
-    { allow: ["TAVILY_API_KEY", "MY_HOST"], want: ["TAVILY_API_KEY", "MY_HOST"] },
-    { allow: "TAVILY_API_KEY", want: null },
+    { allow: ["EXAMPLE_MCP_TOKEN", "MY_HOST"], want: ["EXAMPLE_MCP_TOKEN", "MY_HOST"] },
+    { allow: "EXAMPLE_MCP_TOKEN", want: null },
     { allow: ["tavily"], want: null },
     { allow: [5], want: null },
   ];

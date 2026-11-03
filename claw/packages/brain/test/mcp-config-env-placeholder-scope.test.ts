@@ -56,19 +56,19 @@ test("a config with no allow list gets nothing from the environment, however it 
 });
 
 test("an allow list resolves exactly its own names", () => {
-  withEnv({ MY_MCP_HOST: "mcp.example.internal", TAVILY_API_KEY: "tvly-abc123", NATS_PASSWORD }, () => {
+  withEnv({ MY_MCP_HOST: "mcp.example.internal", EXAMPLE_MCP_TOKEN: "example-token-123", NATS_PASSWORD }, () => {
     const out = normalizeMcpConfigs(
       {
-        search: { url: "https://<MY_MCP_HOST>/sse", token: "<TAVILY_API_KEY>", headers: { "x-n": "<NATS_PASSWORD>" } },
+        search: { url: "https://<MY_MCP_HOST>/sse", token: "<EXAMPLE_MCP_TOKEN>", headers: { "x-n": "<NATS_PASSWORD>" } },
         platform: { url: "https://<MY_MCP_HOST>/mcp", token: "<PLATFORM_KEY>" },
       },
       { PLATFORM_KEY: "per-request-platform-key" },
-      new Set(["MY_MCP_HOST", "TAVILY_API_KEY"]),
+      new Set(["MY_MCP_HOST", "EXAMPLE_MCP_TOKEN"]),
     );
 
     assert.equal(out.search.url, "https://mcp.example.internal/sse");
     assert.equal(out.search.type, "sse", "the /sse suffix still decides the type");
-    assert.equal(out.search.token, "tvly-abc123", "a listed per-server credential resolves");
+    assert.equal(out.search.token, "example-token-123", "a listed per-server credential resolves");
     assert.deepEqual(out.search.headers, { "x-n": "" }, "an unlisted name beside it does not");
     assert.equal(out.platform.token, "per-request-platform-key", "an override is not an environment read");
   });
