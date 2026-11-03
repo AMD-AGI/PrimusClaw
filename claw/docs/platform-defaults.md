@@ -56,6 +56,16 @@ instructions for the model, so reading one never starts a sandbox, and a turn
 that only loads skills and calls MCP tools runs without one. The SKILL.md comes
 back with a footer listing the skill's other files and where its scripts run.
 
+A file longer than 16000 characters comes in parts. Each part ends at a line
+break where it can, and one that is not the last says so and gives the `offset`
+to pass to `load_skill` for the next; the footer comes with the last part of a
+SKILL.md. `load_skill` is exempt from the generic 6000-character tool-result cap
+(head 4000 plus tail 1500, with advice to re-run with `head`/`tail`/`grep`,
+which for a skill means `read` or `bash` and so a sandbox): a part, its footer
+(at most 100 paths of at most 120 characters, the rest counted) and the notices
+fit a bound of its own, and a skill of any length is read through `load_skill`
+alone.
+
 The sandbox is for running commands. The skill directory is written into it the
 first time a sandbox tool call names `.skills`, immediately before that call
 (supporting files and scripts included), so `bash python3

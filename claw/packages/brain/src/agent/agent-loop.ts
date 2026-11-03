@@ -29,6 +29,7 @@ import type { RunIdentity } from "../tasks/run-identity.js";
 import { safePreview } from "@claw/utils";
 import { HandsClient, isHandsNetworkError, isHandsToolTimeout, explainHandsError, handsNetworkErrorReason } from "../clients/hands.js";
 import { isSandboxTool } from "../tools/hands.js";
+import { LOAD_SKILL_TOOL, LOAD_SKILL_RESULT_MAX_CHARS } from "./skill-store.js";
 import { toolNotAllowedMessage, type ToolAllowlist } from "../tools/allowlist.js";
 import type { HookRunner } from "./hooks.js";
 import { refusalMessage, type HitlController } from "./hitl.js";
@@ -369,7 +370,24 @@ const TOOL_RESULT_MAX_CHARS = 6000;
 const TOOL_RESULT_HEAD_CHARS = 4000;
 const TOOL_RESULT_TAIL_CHARS = 1500;
 
-function truncateToolResult(text: string): string {
+/**
+ * `load_skill` is the one tool that does not run into the generic cap above.
+ * Its answer is already bounded and paged by the skill store (a part of at
+ * most SKILL_PAGE_CHARS, the file list, and the offset of the next part when
+ * there is one), and the cap's advice, "re-run with head/tail/grep/sed", is
+ * what sends a model to `read` or `bash` on /workspace/.skills, which opens a
+ * sandbox: the failure this tool exists to avoid. So it gets its own bound,
+ * which the store never exceeds, and its own notice, which names the paging and
+ * never a sandbox tool.
+ */
+export function truncateToolResult(text: string, toolName?: string): string {
+  if (toolName === LOAD_SKILL_TOOL) {
+    if (typeof text !== "string" || text.length <= LOAD_SKILL_RESULT_MAX_CHARS) return text;
+    const head = text.slice(0, Math.floor(LOAD_SKILL_RESULT_MAX_CHARS * 0.65));
+    const tail = text.slice(-Math.floor(LOAD_SKILL_RESULT_MAX_CHARS * 0.3));
+    const dropped = text.length - head.length - tail.length;
+    return `${head}\n\n[... ${dropped} chars cut from this ${LOAD_SKILL_TOOL} result; get what is missing by calling ${LOAD_SKILL_TOOL} again with name, file and the offset to continue from ...]\n\n${tail}`;
+  }
   if (typeof text !== "string" || text.length <= TOOL_RESULT_MAX_CHARS) return text;
   const head = text.slice(0, TOOL_RESULT_HEAD_CHARS);
   const tail = text.slice(-TOOL_RESULT_TAIL_CHARS);
@@ -1612,7 +1630,7 @@ class AgentLoopRunner {
     const results: Array<Record<string, unknown>> = toolUses.map((tc: any) => ({
       type: "tool_result",
       tool_use_id: tc.id as string,
-      content: truncateToolResult(resultByToolId.get(tc.id as string) ?? "(no result)"),
+      content: truncateToolResult(resultByToolId.get(tc.id as string) ?? "(no result)", tc.name as string),
     }));
 
     await this.maybeRecoverSandbox(results);
@@ -2279,7 +2297,11 @@ class AgentLoopRunner {
         ) || []).length;
         const readVerb = /\b(read|cat|contents?|full contents?|simultaneously|in parallel)\b/i.test(promptText);
         if (skillPathHits >= 2 && readVerb) {
-          const errMsg = `Error: do not dispatch sub-agents to read skill files (${skillPathHits} skill paths detected in prompt). Use the \`read\` tool directly — one call per file, no truncation, no overhead. See SKILL.md "How to Read This Skill". To override per-deployment set BRAIN_BLOCK_SKILL_SUBAGENTS=false.`;
+          // With `load_skill` on offer, a skill is read with it: `read` of a skill path is a sandbox call.
+          const readWith = this.tools.some((t) => t.name === LOAD_SKILL_TOOL)
+            ? `Use the \`${LOAD_SKILL_TOOL}\` tool directly (name, and file for a reference; it pages a long file with offset) — one call per file, no sandbox, no overhead.`
+            : `Use the \`read\` tool directly — one call per file, no truncation, no overhead. See SKILL.md "How to Read This Skill".`;
+          const errMsg = `Error: do not dispatch sub-agents to read skill files (${skillPathHits} skill paths detected in prompt). ${readWith} To override per-deployment set BRAIN_BLOCK_SKILL_SUBAGENTS=false.`;
         await this.onEvent({
             type: "toolUsed", tool: "task", actionId: toolId, status: "error",
             argumentsDetail: { task: { description: toolInput.description, subagent_type: subagentType, subagent_id: subagentId } },

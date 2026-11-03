@@ -87,6 +87,7 @@ export function buildProgressiveSkillHint(skills: ProgressiveSkill[], sessionDir
   hint += `\nBefore starting a task, if a skill's description matches, load it with the ${LOAD_SKILL_TOOL} tool (name = the skill's name) and follow it. `;
   hint += `Loading a skill needs no sandbox: do not read or cat its files for that. Other files of a skill are listed at the end of its SKILL.md; `;
   hint += `load one with ${LOAD_SKILL_TOOL} (name and file) only when SKILL.md points to it. `;
+  hint += `A long file comes in parts: when a result says it is not the whole file, call ${LOAD_SKILL_TOOL} again with the offset it gives, until the end. `;
   hint += `A skill's scripts run in the sandbox with bash, from ${skillBase}/<name>/.`;
   return hint;
 }

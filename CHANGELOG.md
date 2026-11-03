@@ -451,7 +451,10 @@ record it.
   written into it the first time a sandbox tool names `.skills`, so running a script starts a sandbox as before, and
   a model that reads a `.skills` path with `read` or `bash` still gets the file. `load_skill` is offered only when
   the prompt lists skills, is allowed in plan mode and for the `readonly` and `explore` sub-agents, and is subject
-  to `tools_allowlist`.
+  to `tools_allowlist`. A skill longer than the loop's 6000-character tool-result cap is not cut by it, which would
+  have sent the model back to `read` or `bash` for the rest: `load_skill` returns a file in parts of up to 16000
+  characters, each saying the `offset` of the next, and has a bound of its own that leaves a part and the skill's
+  file list whole.
 - A caller authenticated by an identity provider's access token (`CLAW_IDENTITY_TOKEN_AUTH_ENABLED`) now has
   the platform key and the virtual key SaFE holds for the token's subject, in the SaFE deployment mode. SaFE is never
   shown the person's token: the API exchanges it at the provider (RFC 8693 service delegation, subject token type

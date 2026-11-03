@@ -12,7 +12,8 @@ import os from "node:os";
 import path from "node:path";
 import type { ToolSchema } from "@claw/protocol";
 
-const { SkillStore, LOAD_SKILL_TOOL } = await import("../src/agent/skill-store.js");
+const { SkillStore, LOAD_SKILL_TOOL, SKILL_PAGE_CHARS, LOAD_SKILL_RESULT_MAX_CHARS } = await import("../src/agent/skill-store.js");
+const { truncateToolResult } = await import("../src/agent/agent-loop.js");
 const { ToolRouter } = await import("../src/tools/router.js");
 const { parseToolAllowlist } = await import("../src/tools/allowlist.js");
 import type { DefaultSkill } from "../src/agent/platform-defaults.js";
@@ -125,6 +126,10 @@ test("router: the tool is offered only when a store is set; without one a call i
   const t = router.getToolSchemas().find((x) => x.name === LOAD_SKILL_TOOL);
   assert.ok(t);
   assert.deepEqual((t.input_schema as { required: string[] }).required, ["name"]);
+  const props = (t.input_schema as { properties: Record<string, { type: string }> }).properties;
+  assert.deepEqual(Object.keys(props), ["name", "file", "offset"], "the model is offered the offset it is told to continue with");
+  assert.equal(props.offset.type, "integer");
+  assert.match(t.description, /offset/);
   await assert.rejects(routerWith().router.route("load_skill", { name: "s1" }), /Unknown tool: load_skill/);
 });
 
@@ -193,4 +198,170 @@ test("sub-agents: the read-only and explore profiles are offered load_skill, a s
   }
   assert.deepEqual(offered.map((o) => o.includes("load_skill")), [true, true, false]);
   assert.ok(!offered.flat().includes("write"), "profiles still narrow as they did");
+});
+
+// --- paging: a long file comes in parts, none of them cut ---------------------
+
+const lines = (n: number, width = 99) => Array.from({ length: n }, (_, i) => `${String(i).padStart(4, "0")} ${"x".repeat(width - 5)}\n`).join("");
+/** What a part says about the file: the text before its continuation line or footer. */
+const partText = (t: string) => t.split("\n\n[load_skill: chars ")[0].split("\n\n---\n[skill '")[0];
+const nextOffset = (t: string) => { const m = t.match(/NOT the whole file[^\n]*"offset":(\d+)/); return m ? Number(m[1]) : null; };
+
+/** Follow "offset" the way a model does; returns every result. */
+async function readAll(store: InstanceType<typeof SkillStore>, name: string, file?: string): Promise<string[]> {
+  const out: string[] = [];
+  let offset: number | undefined;
+  for (let i = 0; i < 50; i++) {
+    const r = await store.load(name, file, offset);
+    assert.ok(r.ok, r.ok ? "" : r.error);
+    out.push(r.text);
+    const n = nextOffset(r.text);
+    if (n === null) return out;
+    assert.ok(n > (offset ?? 0), "every part moves forward");
+    offset = n;
+  }
+  throw new Error("did not end");
+}
+
+test("a SKILL.md up to a part long is one result with no continuation line; the footer is the same as before", async () => {
+  const body = lines(Math.floor(SKILL_PAGE_CHARS / 100)); // just under a part
+  const r = await new SkillStore([skill("s1", stage({ "SKILL.md": body, "references/a.md": "A" }))]).load("s1");
+  assert.ok(r.ok);
+  assert.ok(r.text.startsWith(body) && !r.text.includes("[load_skill: chars"));
+  assert.ok(r.text.includes("- references/a.md") && r.text.includes("/workspace/.skills/s1/"));
+});
+
+test("a SKILL.md of 7829, 12399 and 17234 chars is served in whole, in parts that end at line breaks, the file list on the last one", async () => {
+  for (const size of [7829, 12399, 17234, 45000]) {
+    const body = lines(Math.ceil(size / 97), 96).slice(0, size - 1) + "\n"; // 97-char lines: a part's limit falls inside a line
+    const results = await readAll(new SkillStore([skill("s1", stage({ "SKILL.md": body, "scripts/run.py": "x" }))]), "s1");
+    assert.equal(results.map(partText).join(""), body, `${size}: the parts joined are the file`);
+    assert.equal(results.length, Math.ceil(size / SKILL_PAGE_CHARS) , `${size}: ${results.length} parts`);
+    results.forEach((t, i) => {
+      assert.ok(partText(t).length <= SKILL_PAGE_CHARS, `${size}: part ${i} is within a part`);
+      assert.ok(i === results.length - 1 || partText(t).endsWith("\n"), `${size}: part ${i} ends at a line break`);
+      assert.equal(t.includes("- scripts/run.py"), i === results.length - 1, `${size}: only the last part has the file list`);
+      assert.equal(truncateToolResult(t, LOAD_SKILL_TOOL), t, `${size}: part ${i} passes the loop's cap for load_skill unchanged`);
+    });
+  }
+});
+
+test("a part that is not the last names the next offset and the tool to call with it; the last says it is the end", async () => {
+  const body = lines(400); // 40000 chars
+  const results = await readAll(new SkillStore([skill("s1", stage({ "SKILL.md": body, "references/big.md": body }))]), "s1");
+  assert.equal(results.length, 3);
+  const next = results[0].match(/load_skill (\{[^}]*\})\./)![1];
+  assert.deepEqual(JSON.parse(next), { name: "s1", offset: nextOffset(results[0]) });
+  assert.ok(results[0].includes("chars 0-") && results[0].includes("of 40000"));
+  assert.ok(results[2].includes("That is the end of the file."));
+  // A reference file: no footer, and the next call names the file.
+  const ref = await readAll(new SkillStore([skill("s1", stage({ "SKILL.md": "X", "references/big.md": body }))]), "s1", "references/big.md");
+  assert.equal(ref.map(partText).join(""), body);
+  assert.deepEqual(JSON.parse(ref[0].match(/load_skill (\{[^}]*\})\./)![1]), { name: "s1", file: "references/big.md", offset: nextOffset(ref[0]) });
+  assert.ok(!ref.some((t) => t.includes("[skill 's1'")), "a reference file has no footer");
+});
+
+test("a file with no line break is cut at the limit; a cut never splits a surrogate pair", async () => {
+  const flat = "y".repeat(SKILL_PAGE_CHARS * 2 + 5);
+  const a = await readAll(new SkillStore([skill("s1", stage({ "SKILL.md": flat }))]), "s1");
+  assert.deepEqual(a.map((t) => partText(t).length), [SKILL_PAGE_CHARS, SKILL_PAGE_CHARS, 5]);
+  assert.equal(a.map(partText).join(""), flat);
+  // 'a' puts every emoji's high surrogate at an odd index, so the limit falls between the halves.
+  const emoji = "a" + "\u{1F600}".repeat(SKILL_PAGE_CHARS);
+  const b = await readAll(new SkillStore([skill("s2", stage({ "SKILL.md": emoji }))]), "s2");
+  assert.ok(b.length >= 2);
+  for (const t of b) assert.ok(partText(t).isWellFormed(), "no lone surrogate at either end of a part");
+  assert.equal(b.map(partText).join(""), emoji);
+});
+
+test("offset: a number or a digit string is taken; anything else, or one past the end, is refused with the length", async () => {
+  const body = lines(300); // 30000
+  const store = new SkillStore([skill("s1", stage({ "SKILL.md": body }))]);
+  const at = async (o: unknown) => store.load("s1", undefined, o);
+  const mid = await at(20000);
+  assert.ok(mid.ok && mid.text.startsWith(body.slice(20000, 20010)));
+  assert.deepEqual(await at("20000"), mid, "a model may send the number as a string");
+  assert.deepEqual(await at(undefined), await store.load("s1"));
+  const end = await at(30000);
+  assert.ok(end.ok && end.text.includes("That is the end of the file."), "the very end is an empty last part, not an error");
+  for (const bad of [-1, 1.5, 30001, "abc", "-5", "1e3", {}, [], true, NaN]) {
+    const r = await at(bad);
+    assert.ok(!r.ok && r.error.includes("30000"), `${JSON.stringify(bad)} is refused and the file's length is given`);
+  }
+});
+
+test("the file list is bounded: 100 paths of at most 120 chars, longer ones and the rest counted; the whole result stays under the load_skill cap", async () => {
+  const files: Record<string, string> = { "SKILL.md": lines(140).slice(0, SKILL_PAGE_CHARS + 50) }; // two parts, the second short
+  for (let i = 0; i < 100; i++) files[`references/${String(i).padStart(3, "0")}-${"d".repeat(100)}.md`] = "x"; // 120-char paths
+  for (let i = 0; i < 15; i++) files[`references/-${"e".repeat(150)}${i}.md`] = "x"; // too long to list; "-" sorts them first
+  const results = await readAll(new SkillStore([skill("s1", stage(files))]), "s1");
+  const last = results[results.length - 1];
+  assert.equal(last.split("\n- ").length - 1, 101, "100 listed plus the count line");
+  assert.ok(last.includes("- (15 more)"));
+  assert.equal(last.match(/\n- references\/\d{3}-d{100}\.md/g)?.length, 100, "the 100 that fit are the ones listed");
+  assert.ok(!last.includes("eeee"), "a path too long to list is not");
+  assert.ok(last.includes("To run a script, use bash on its path under /workspace/.skills/s1/"), "the footer's last line is there");
+  assert.ok(last.length <= LOAD_SKILL_RESULT_MAX_CHARS, `${last.length} <= ${LOAD_SKILL_RESULT_MAX_CHARS}`);
+  assert.equal(truncateToolResult(last, LOAD_SKILL_TOOL), last, "the loop's cap leaves the whole list");
+  assert.ok(truncateToolResult(last).length < last.length, "where the generic cap would have cut it");
+});
+
+// --- the loop's cap -----------------------------------------------------------
+
+test("tool-result cap: others keep the generic cap and its advice; load_skill has its own bound and a notice that names load_skill, never a sandbox tool", () => {
+  const big = "z".repeat(10000);
+  const generic = truncateToolResult(big, "bash");
+  assert.equal(generic, truncateToolResult(big), "without a name, or with another tool's, it is the generic cap");
+  assert.ok(generic.length < 6200 && /head\/tail\/grep\/sed/.test(generic));
+  assert.equal(truncateToolResult("short", "bash"), "short");
+  assert.equal(truncateToolResult(big, LOAD_SKILL_TOOL), big, "10000 chars is under the load_skill bound");
+  const over = "z".repeat(LOAD_SKILL_RESULT_MAX_CHARS + 5000);
+  const cut = truncateToolResult(over, LOAD_SKILL_TOOL);
+  assert.ok(cut.length < LOAD_SKILL_RESULT_MAX_CHARS, "the result is brought under its bound");
+  assert.match(cut, /\d+ chars cut from this load_skill result/);
+  assert.ok(cut.includes("calling load_skill again with name, file and the offset"), "the notice points at load_skill paging");
+  assert.ok(!/head|tail|grep|sed|\bread\b|bash/.test(cut.replace(/z+/g, "")), "and at no other tool");
+});
+
+// --- sub-agent refusal wording -------------------------------------------------
+
+/** One top-level run whose model dispatches a `task` that reads two skill files, then ends; returns the tool_result text it was given back. */
+async function refusalSeenBy(offered: string[]): Promise<string> {
+  const { agentLoop } = await import("../src/agent/agent-loop.js");
+  const seen: string[] = [];
+  let turn = 0;
+  const session = {
+    async streamTurn(messages: unknown) {
+      seen.push(JSON.stringify(messages));
+      const first = turn++ === 0;
+      return {
+        content: first
+          ? [{ type: "tool_use", id: "t1", name: "task", input: { description: "read the skill", subagent_type: "explore", prompt: "read /workspace/.skills/a/SKILL.md and /workspace/.skills/a/references/b.md in parallel" } }]
+          : [{ type: "text", text: "done" }],
+        stopReason: first ? "tool_use" : "end_turn",
+        usage: { input_tokens: 0, output_tokens: 0, cache_create: 0, cache_read: 0 }, firstByteMs: 1,
+      };
+    },
+    async complete() { return "summary"; },
+  } as unknown as Session;
+  await agentLoop([{ role: "user", content: "go" }], offered.map(tool), {
+    model: "m", apiUrl: "http://localhost:0", apiKey: "k", maxTurns: 3,
+    router: { route: async () => { throw new Error("the refused task reached the router"); }, setHands: () => {} } as never,
+    onEvent: async () => {}, sessionId: "s", userId: "u", llmSession: session,
+  } as never);
+  assert.equal(seen.length, 2);
+  return JSON.parse(seen[1]).at(-1).content[0].content as string;
+}
+
+test("sub-agent skill-read refusal: with load_skill on offer it points at load_skill, not at read", async () => {
+  const msg = await refusalSeenBy(["task", "load_skill", "read"]);
+  assert.match(msg, /do not dispatch sub-agents to read skill files/);
+  assert.match(msg, /Use the `load_skill` tool directly/);
+  assert.ok(!/`read`/.test(msg), "a read of a skill path is a sandbox call: the model is not sent to it");
+});
+
+test("sub-agent skill-read refusal: where load_skill is not offered (skills live in the sandbox) the advice is still read", async () => {
+  const msg = await refusalSeenBy(["task", "read"]);
+  assert.match(msg, /Use the `read` tool directly/);
+  assert.ok(!msg.includes("load_skill"));
 });

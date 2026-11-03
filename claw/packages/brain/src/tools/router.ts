@@ -106,11 +106,12 @@ const LOOP_INTERCEPTED_TOOLS = new Set([
 function loadSkillSchema(): ToolSchema {
   return {
     name: LOAD_SKILL_TOOL,
-    description: "Load a skill listed under 'Platform Skills' in the prompt: with only `name` you get its SKILL.md (instructions, plus the list of its other files); with `file` you get one of those files. Served without a sandbox, so use it, not read or bash, to read a skill. Run a skill's scripts with bash.",
+    description: "Load a skill listed under 'Platform Skills' in the prompt: with only `name` you get its SKILL.md (instructions, plus the list of its other files); with `file` you get one of those files. A long file comes in parts of up to ~16000 characters: the end of each part says the `offset` of the next, so keep calling with that offset until the end. Served without a sandbox, so use it, not read or bash, to read any part of a skill. Run a skill's scripts with bash.",
     input_schema: {
       type: "object", properties: {
         name: { type: "string", description: "The skill's name, as listed in the prompt" },
         file: { type: "string", description: "Path of a text file inside the skill's directory, e.g. references/api.md; omit for SKILL.md" },
+        offset: { type: "integer", minimum: 0, description: "Character to start from, for the next part of a file that did not fit; omit (0) for the beginning" },
       }, required: ["name"],
     },
   };
@@ -461,7 +462,7 @@ export class ToolRouter {
     if (name === LOAD_SKILL_TOOL && this.skillStore) {
       const skillName = typeof input.name === "string" ? input.name : "";
       const file = typeof input.file === "string" ? input.file : undefined;
-      const loaded = await this.skillStore.load(skillName, file);
+      const loaded = await this.skillStore.load(skillName, file, input.offset);
       if (!loaded.ok) return refuse(outcome, loaded.error);
       // Same rule as a read of `.skills/<name>/SKILL.md`: the skill counts as used when its SKILL.md was.
       if (file === undefined || file === "" || file === "SKILL.md") this.skillsRead.add(skillName);
