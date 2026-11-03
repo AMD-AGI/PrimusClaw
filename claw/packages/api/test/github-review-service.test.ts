@@ -718,6 +718,35 @@ describe("M4 what the change does, and the reviewer's judgement of it", () => {
     assert.equal((await merge()).body.status, "merged");
   });
 
+  test("M14c an approval or a merge decision takes turns with a parallel one of the same acting user on the same pull request", async () => {
+    e.gh.files = drain;
+    const key = "u-bob|amd-agi/demo#7";
+    // Another call is between its hold check and its write (or opening its hold): this one is refused, nothing written, and may come again.
+    await e.sql("INSERT INTO claw_github_write_locks (lock_key, holder, expires_at) VALUES ($1, 'other', NOW() + INTERVAL '1 minute')", [key]);
+    for (const call of [() => merge(), () => submit({ event: "APPROVE" })]) {
+      const o = await call();
+      assert.equal(o.body.reason, "write_in_progress", o.text);
+    }
+    assert.equal((await submit({ event: "COMMENT" })).body.status, "submitted", "a comment approves nothing and does not wait");
+    assert.equal(e.gh.writes.filter((w) => w.body.event !== "COMMENT").length, 0);
+    assert.equal(puts().length, 0);
+    // A lock whose call died lapses.
+    await e.sql("UPDATE claw_github_write_locks SET expires_at = NOW() - INTERVAL '1 second'");
+    assert.equal((await merge()).body.status, "merged");
+    assert.deepEqual(await e.sql("SELECT * FROM claw_github_write_locks"), [], "a call gives the lock back");
+  });
+
+  test("M14d a high approval and a low merge made at the same time never merge past the hold", async () => {
+    e.gh.files = drain;
+    const [approve, merged] = await Promise.all([
+      submit({ event: "APPROVE", risk_judgement: { level: "high", reason: "changes what callers see on shutdown" } }),
+      merge(),
+    ]);
+    assert.equal(approve.body.status, "confirmation_required", approve.text);
+    assert.ok(["confirmation_required", "refused"].includes(String(merged.body.status)), merged.text);
+    assert.equal(puts().length, 0, "nothing was merged");
+  });
+
   test("M15 the reviewer's reason is a clipped line with the token masked: it is written for a card and cannot carry a credential or markup", async () => {
     e.gh.files = drain;
     const o = await merge({ risk_judgement: { level: "high", reason: `see ${TOKEN}\nand <b>this</b> ${"x".repeat(900)}` } });

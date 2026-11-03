@@ -93,6 +93,12 @@ export const GITHUB_REVIEW_SCHEMA_SQL = [
   // The acting user's review mode the call ran under (`high_risk_confirm` or `fully_auto`, their own setting in claw_github_review_settings).
   `ALTER TABLE claw_github_audit ADD COLUMN IF NOT EXISTS review_mode TEXT`,
   `CREATE INDEX IF NOT EXISTS idx_github_audit_actor ON claw_github_audit(actor_user_id, at DESC)`,
+  // One approval or merge decision at a time per acting user and pull request, across replicas (see acquireWriteLock).
+  `CREATE TABLE IF NOT EXISTS claw_github_write_locks (
+      lock_key    TEXT PRIMARY KEY,
+      holder      TEXT NOT NULL,
+      expires_at  TIMESTAMPTZ NOT NULL
+    )`,
   // A person's own review mode for writes made with their GitHub account (see {@link getReviewMode}); no row is the default.
   `CREATE TABLE IF NOT EXISTS claw_github_review_settings (
       user_id      TEXT PRIMARY KEY,
@@ -104,6 +110,30 @@ export const GITHUB_REVIEW_SCHEMA_SQL = [
 
 export async function ensureGithubReviewSchema(client: pg.PoolClient): Promise<void> {
   for (const sql of GITHUB_REVIEW_SCHEMA_SQL) await client.query(sql);
+}
+
+// ---------------------------------------------------------------- write lock
+
+/**
+ * Takes the lock on one acting user's approvals and merges of one pull request, or answers null when another call holds it. Between
+ * deciding that an approval or a merge is not held and making it, another call of the same acting user on the same pull request could
+ * open the hold that should have stopped it; the lock makes the two take turns. It lapses after `ttlSeconds`, so a call that died does
+ * not hold it for ever.
+ */
+export async function acquireWriteLock(db: Queryable, key: string, ttlSeconds: number): Promise<string | null> {
+  const holder = randomUUID();
+  const r = await db.query(
+    `INSERT INTO claw_github_write_locks (lock_key, holder, expires_at) VALUES ($1, $2, NOW() + ($3::bigint * INTERVAL '1 second'))
+     ON CONFLICT (lock_key) DO UPDATE SET holder = EXCLUDED.holder, expires_at = EXCLUDED.expires_at
+       WHERE claw_github_write_locks.expires_at <= NOW()
+     RETURNING holder`,
+    [key, holder, ttlSeconds],
+  );
+  return (r.rows[0] as { holder?: string } | undefined)?.holder === holder ? holder : null;
+}
+
+export async function releaseWriteLock(db: Queryable, key: string, holder: string): Promise<void> {
+  await db.query("DELETE FROM claw_github_write_locks WHERE lock_key = $1 AND holder = $2", [key, holder]);
 }
 
 // ---------------------------------------------------------------- review mode

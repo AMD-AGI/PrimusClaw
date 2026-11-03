@@ -90,7 +90,8 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor)
     "gh_review_submit",
     "Post one review on the pinned head commit, with inline comments. APPROVE is refused when the acting user wrote the pull request, "
     + "and unless CI is green and no thread is open. A COMMENT or REQUEST_CHANGES review, and an APPROVE you judge low risk (`risk_judgement`) with no hard hold, are posted at once. "
-    + "An APPROVE you judge high, with no judgement, or with a hard hold is not: the answer is confirmation_required, and you say that it waits for the acting user and why. "
+    + "An APPROVE you judge high, with no judgement, or with a hard hold is not (under the acting user's fully_auto review_mode only repo_holds): the answer is "
+    + "confirmation_required, and you say that it waits for the acting user and why. write_in_progress means another approval or merge of it is being decided: try again. "
     + "The review is signed with the acting user's account and a footer that names who asked.",
     {
       pr: z.string().describe(PR_HELP),
@@ -109,7 +110,7 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor)
     "gh_pr_merge",
     "Approve (when needed) and merge the pull request if every gate is open: CI green on the head commit, no unresolved thread, merge state CLEAN, "
     + "the acting user allowing it (refused when they wrote the pull request), and not held: a merge you judge high (`risk_judgement`), one with no judgement, "
-    + "and one with a hard hold answer confirmation_required and wait for them. "
+    + "and one with a hard hold answer confirmation_required and wait for them (under the acting user's fully_auto review_mode only repo_holds do). "
     + "A branch that is merged through a merge queue gets the pull request put in the queue instead (status queued, never merged): the queue runs its own checks and merges it, and this tool does not follow it. "
     + "It never bypasses a protection.",
     {

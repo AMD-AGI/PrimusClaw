@@ -282,7 +282,10 @@ review and the merge and who is the reviewer of record, and whose own standing a
   acting user, is being decided by them, was refused by them, or was held and never answered (an expired
   confirmation: asking again until a judgement says low does not get past it; a new head commit does), with
   the repository name compared without case, is held too, and `gh_pr_risk` says so, whatever the later call says: a lower judgement on a
-  second call, or the other of the two tools, does not get past their decision.
+  second call, or the other of the two tools, does not get past their decision. Calls in parallel take
+  turns: an `APPROVE` or a merge decision holds a lock on the acting user's writes to that pull request
+  (`claw_github_write_locks`, across replicas, lapsing after two minutes), and a second one meanwhile is
+  refused at once as `write_in_progress`, with nothing written, to be made again.
 
   A merge or an approval that needs confirmation creates one pending row for the head commit and
   writes nothing.

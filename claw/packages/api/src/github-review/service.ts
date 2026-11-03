@@ -35,7 +35,7 @@ import { SANDBOX_RECIPE_USAGE, buildSandboxRecipe } from "./sandbox-recipe.js";
 import { GITHUB_PROVIDER, type GithubReviewSettings } from "./settings.js";
 import {
   auditFinish, auditStart, claimConfirmation, finishConfirmation, getConfirmation, openConfirmation,
-  countPendingConfirmations, getReviewMode, heldOrDeniedOn, recentWrites, reopenConfirmation, reserveWrite, reviewDigest, sessionRequestCount,
+  acquireWriteLock, countPendingConfirmations, getReviewMode, heldOrDeniedOn, recentWrites, releaseWriteLock, reopenConfirmation, reserveWrite, reviewDigest, sessionRequestCount,
   type Confirmation, type DecidedVia, type HeldReview, type Queryable, type ReviewComment, type ReviewEvent, type ReviewMode,
 } from "./store.js";
 
@@ -162,6 +162,8 @@ const FILE_PAGE = 100;
 const MAX_REVIEW_COMMENTS = 30;
 const MAX_COMMENT_CHARS = 4000;
 const MAX_BODY_CHARS = 20_000;
+/** Longest an approval or a merge decision holds the lock (`oneAtATime`); a merge waits for GitHub's merge state a few seconds at most. */
+const WRITE_LOCK_SECONDS = 120;
 const DEFAULT_DIFF_CHARS = 80_000;
 const MAX_DIFF_CHARS = 200_000;
 const HOUR_MS = 3_600_000;
@@ -329,9 +331,11 @@ export class GithubReview {
       const text = typeof args.body === "string" ? args.body.trim() : "";
       if (!text) throw new Refusal("empty_review", "a review needs a body");
       if (text.length > MAX_BODY_CHARS) throw new Refusal("body_too_long", `the body is longer than ${MAX_BODY_CHARS} characters`);
-      return ok(this.withMode(ctx, await this.submit(ctx, ref, headSha, {
+      const review = () => this.submit(ctx, ref, headSha, {
         event: event as ReviewEvent, text, rawComments: args.comments, flags: this.flags(args), judgement: this.judgement(ctx, args), confirmation: null,
-      })), (t) => ctx.client.redact(t));
+      });
+      // A comment approves nothing and is never held, so it does not wait for an approval or a merge being decided.
+      return ok(this.withMode(ctx, event === "APPROVE" ? await this.oneAtATime(ctx, ref, review) : await review()), (t) => ctx.client.redact(t));
     });
   }
 
@@ -378,8 +382,26 @@ export class GithubReview {
       if (method !== undefined && !["squash", "merge", "rebase"].includes(method)) {
         throw new Refusal("invalid_method", "method must be squash, merge or rebase");
       }
-      return ok(this.withMode(ctx, await this.merge(ctx, ref, headSha, { method: method as "squash" | "merge" | "rebase" | undefined, flags: this.flags(args), judgement: this.judgement(ctx, args), confirmation: null })), (t) => ctx.client.redact(t));
+      return ok(this.withMode(ctx, await this.oneAtATime(ctx, ref, () => this.merge(ctx, ref, headSha, {
+        method: method as "squash" | "merge" | "rebase" | undefined, flags: this.flags(args), judgement: this.judgement(ctx, args), confirmation: null,
+      }))), (t) => ctx.client.redact(t));
     });
+  }
+
+  /**
+   * Runs an approval or a merge decision with the lock on this acting user's writes to this pull request (store.ts acquireWriteLock): a call
+   * judged low cannot pass the hold check while a parallel one, judged high, is still opening its hold. A call that finds it taken is
+   * refused at once, nothing written, and may be made again.
+   */
+  private async oneAtATime<T>(ctx: Ctx, ref: PrRef, body: () => Promise<T>): Promise<T> {
+    const key = `${ctx.actor.actorUserId}|${`${ref.owner}/${ref.repo}`.toLowerCase()}#${ref.number}`;
+    const holder = await acquireWriteLock(this.deps.db, key, WRITE_LOCK_SECONDS);
+    if (!holder) throw new Refusal("write_in_progress", "another approval or merge of this pull request with this account is being decided; nothing was written, try again in a moment");
+    try {
+      return await body();
+    } finally {
+      await releaseWriteLock(this.deps.db, key, holder).catch(() => undefined);
+    }
   }
 
   /**
