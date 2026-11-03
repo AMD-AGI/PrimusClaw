@@ -4,7 +4,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  buildAtomWorkloadBody,
   buildInferaWorkloadBody,
+  buildSGLangRouterWorkloadBody,
   buildRayJobWorkloadBody,
   inferaFrontendPort,
   inferaSshPortBase,
@@ -71,6 +73,20 @@ test("neither body claims the workspace-storage field", () => {
   for (const [name, body] of [
     ["rayjob", buildRayJobWorkloadBody(COMMON)],
     ["infera", buildInferaWorkloadBody({ ...INFERA_COMMON, pdMode: "aggregated" })],
+    ["atom", buildAtomWorkloadBody({
+      ...COMMON,
+      model: "/models/m",
+      framework: "sglang",
+      kvTransferBackend: "mooncake",
+      pdMode: "disaggregated",
+    })],
+    ["sglangrouter", buildSGLangRouterWorkloadBody({
+      ...COMMON,
+      model: "/models/m",
+      framework: "sglang",
+      kvTransferBackend: "mooncake",
+      pdMode: "disaggregated",
+    })],
   ] as const) {
     assert.ok(
       !("useWorkspaceStorage" in (body as Record<string, unknown>)),
@@ -233,8 +249,11 @@ test("buildInferaWorkloadBody deploys aggregated workers idle with a role-scoped
 
   assert.match(
     decodeEp(body.entryPoints[0]),
-    new RegExp(`infera\\.server .*--port ${port} .*--router-tokenizer-path /models/Qwen3-30B-A3B`),
+    new RegExp(`infera\\.server .*--port ${port} .*--router-tokenizer-path '/models/Qwen3-30B-A3B'`),
   );
+  const frontend = decodeEp(body.entryPoints[0]);
+  assert.equal(frontend.includes("--router-policy"), false);
+  assert.equal(frontend.includes("--enable-profiling"), false);
   // The worker never starts an engine at deploy time; the optimizer SSHes in.
   assert.equal(
     decodeEp(body.entryPoints[1]),
@@ -278,6 +297,184 @@ test("buildInferaWorkloadBody marks a role multinode when its TP exceeds one pod
     pdDecodeTp: 8,
   }) as Record<string, any>;
   assert.deepStrictEqual(body.inferaOptions.multinodeRoles, ["prefill"]);
+});
+
+test("buildAtomWorkloadBody creates router, prefill and decode from the prompt spec", () => {
+  const body = buildAtomWorkloadBody({
+    ...COMMON,
+    displayName: "msg1-atom",
+    model: "/models/Qwen3-14B-FP8",
+    framework: "sglang",
+    kvTransferBackend: "mooncake",
+    pdMode: "disaggregated",
+    pdPrefillNodes: 1,
+    pdDecodeNodes: 1,
+    pdPrefillTp: 8,
+    pdDecodeTp: 8,
+    memGiPerNode: 128,
+    cpusPerNode: 16,
+    ephemeralGiPerNode: 50,
+    extraEnv: { NCCL_IB_GID_INDEX: "1" },
+  }) as Record<string, any>;
+
+  assert.deepStrictEqual(body.groupVersionKind, { group: "amd.com", kind: "Atom", version: "v1" });
+  assert.equal(body.useWorkspaceStorage, undefined);
+  assert.equal(body.workloadId, "msg1");
+  assert.equal(body.resources.length, 3);
+  assert.equal(body.resources[0].gpu, undefined);
+  assert.equal(body.resources[0].cpu, "4");
+  assert.equal(body.resources[0].sharedMemory, "4Gi");
+  assert.equal(body.resources[1].replica, 1);
+  assert.equal(body.resources[1].gpu, "8");
+  assert.equal(body.resources[1].memory, "128Gi");
+  assert.equal(body.resources[1].sharedMemory, "64Gi");
+  assert.equal(body.resources[1].rdmaResource, "1k");
+  assert.equal(body.resources[2].rdmaResource, "1k");
+  assert.equal(body.images.length, 3);
+  assert.equal(body.service.port, 8000);
+  assert.equal(body.service.targetPort, 8000);
+  assert.equal(body.env.PRIMUS_CLAW_MN_BACKEND, "atom");
+  assert.equal(body.env.NCCL_IB_GID_INDEX, "1");
+  assert.equal(body.env.MN_SSH_AUTHORIZED_KEY, undefined);
+  assert.equal(body.inferaOptions, undefined);
+
+  const router = decodeEp(body.entryPoints[0]);
+  const prefill = decodeEp(body.entryPoints[1]);
+  const decode = decodeEp(body.entryPoints[2]);
+  assert.match(router, /atomesh launch/);
+  assert.match(router, /--backend 'sglang'/);
+  assert.equal(router.includes("--policy"), false);
+  assert.equal(prefill.includes("--mem-fraction-static"), false);
+  assert.match(prefill, /--model-path '\/models\/Qwen3-14B-FP8'/);
+  assert.match(prefill, /--tp-size 8/);
+  assert.match(prefill, /--disaggregation-mode prefill/);
+  assert.match(prefill, /--disaggregation-bootstrap-port 8998/);
+  assert.match(prefill, /--disaggregation-transfer-backend 'mooncake'/);
+  assert.match(decode, /--disaggregation-mode decode/);
+  assert.match(decode, /--disaggregation-bootstrap-port 9098/);
+});
+
+test("buildAtomWorkloadBody splits --nodes across prefill and decode when pd counts are omitted", () => {
+  const body = buildAtomWorkloadBody({
+    ...COMMON,
+    nodes: 4,
+    model: "/models/m",
+    framework: "sglang",
+    kvTransferBackend: "mooncake",
+    pdMode: "disaggregated",
+  }) as Record<string, any>;
+  assert.equal(body.resources[1].replica, 2);
+  assert.equal(body.resources[2].replica, 2);
+  assert.match(decodeEp(body.entryPoints[1]), /--tp-size 8/);
+});
+
+test("buildAtomWorkloadBody uses the prompt framework and engine args", () => {
+  const body = buildAtomWorkloadBody({
+    ...COMMON,
+    model: "/models/m",
+    framework: "vllm",
+    kvTransferBackend: "nixl",
+    pdMode: "disaggregated",
+    serverArgs: "--mem-fraction-static 0.8",
+    pdPrefillExtraArgs: "--watchdog-timeout 3600",
+    pdDecodeExtraArgs: "--max-running-requests 4",
+    pdIbDevice: "mlx5_0",
+  }) as Record<string, any>;
+  const router = decodeEp(body.entryPoints[0]);
+  const prefill = decodeEp(body.entryPoints[1]);
+  const decode = decodeEp(body.entryPoints[2]);
+  assert.match(router, /--backend 'vllm'/);
+  assert.match(prefill, /--disaggregation-transfer-backend 'nixl'/);
+  assert.ok(prefill.includes("'--mem-fraction-static'"));
+  assert.ok(prefill.includes("'0.8'"));
+  assert.ok(prefill.includes("'--watchdog-timeout'"));
+  assert.ok(prefill.includes("'3600'"));
+  assert.match(prefill, /--disaggregation-ib-device 'mlx5_0'/);
+  assert.equal(prefill.includes("max-running-requests"), false);
+  assert.ok(decode.includes("'--max-running-requests'"));
+  assert.ok(decode.includes("'4'"));
+  assert.equal(decode.includes("watchdog-timeout"), false);
+});
+
+test("buildAtomWorkloadBody rejects aggregated pd-mode and cross-pod TP", () => {
+  const base = {
+    ...COMMON,
+    model: "/models/m",
+    framework: "sglang" as const,
+    kvTransferBackend: "mooncake",
+    pdMode: "disaggregated" as const,
+  };
+  assert.throws(
+    () => buildAtomWorkloadBody({ ...base, pdMode: "aggregated" }),
+    /requires --pd-mode disaggregated/,
+  );
+  assert.throws(
+    () => buildAtomWorkloadBody({ ...base, pdPrefillTp: 16 }),
+    /cross-pod TP is not supported/,
+  );
+  assert.throws(
+    () => buildAtomWorkloadBody({
+      ...base,
+      nodes: 4,
+      pdPrefillNodes: 1,
+      pdDecodeNodes: 1,
+    }),
+    /must equal prefill\+decode/,
+  );
+});
+
+test("buildSGLangRouterWorkloadBody uses the model gateway and the same engine roles", () => {
+  const body = buildSGLangRouterWorkloadBody({
+    ...COMMON,
+    displayName: "msg1-sglangrouter",
+    model: "/models/Qwen3-14B",
+    framework: "sglang",
+    kvTransferBackend: "mooncake",
+    pdMode: "disaggregated",
+    pdPrefillNodes: 1,
+    pdDecodeNodes: 1,
+    extraEnv: { MC_GID_INDEX: "1" },
+  }) as Record<string, any>;
+
+  assert.deepStrictEqual(body.groupVersionKind, {
+    group: "amd.com",
+    kind: "SGLangRouter",
+    version: "v1",
+  });
+  assert.equal(body.resources.length, 3);
+  assert.equal(body.resources[1].rdmaResource, "1k");
+  assert.equal(body.resources[2].rdmaResource, "1k");
+  assert.equal(body.service.port, 8000);
+  assert.equal(body.env.PRIMUS_CLAW_MN_BACKEND, "sglangrouter");
+  assert.equal(body.env.MC_GID_INDEX, "1");
+  assert.equal(body.labels["primus-claw/mn-backend"], "sglangrouter");
+
+  const router = decodeEp(body.entryPoints[0]);
+  const prefill = decodeEp(body.entryPoints[1]);
+  const decode = decodeEp(body.entryPoints[2]);
+  assert.match(router, /sglang_router\.launch_router/);
+  assert.match(router, /--prefill \{prefill\} 8998/);
+  assert.match(router, /--decode \{decode\}/);
+  assert.equal(router.includes("atomesh"), false);
+  assert.match(prefill, /--model-path '\/models\/Qwen3-14B'/);
+  assert.match(prefill, /--tp-size 8/);
+  assert.match(prefill, /--disaggregation-mode prefill/);
+  assert.match(decode, /--disaggregation-mode decode/);
+  assert.equal(prefill.includes("atomesh"), false);
+  assert.equal(decode.includes("atomesh"), false);
+});
+
+test("buildAtomWorkloadBody rejects a missing model", () => {
+  assert.throws(
+    () => buildAtomWorkloadBody({
+      ...COMMON,
+      model: "  ",
+      framework: "sglang",
+      kvTransferBackend: "mooncake",
+      pdMode: "disaggregated",
+    }),
+    /model is required/,
+  );
 });
 
 test("buildInferaWorkloadBody rejects a missing model or authorized key", () => {

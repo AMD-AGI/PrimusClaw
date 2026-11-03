@@ -16,13 +16,14 @@
  * never carries them and a restore never overwrites them.
  *
  * Only the block of the active backend is present: `ray` for `rayjob`, `infera`
- * for `infera`. Optional fields are omitted when Claw has no value for them
- * rather than written as empty strings.
+ * for `infera`. `atom` and `sglangrouter` carry the router service and no
+ * control-plane block. Optional fields are omitted when Claw has no value for
+ * them rather than written as empty strings.
  */
 
 export const TOPOLOGY_HANDOFF_SCHEMA = "topology-handoff/v1" as const;
 
-export type TopologyHandoffBackend = "rayjob" | "infera";
+export type TopologyHandoffBackend = "rayjob" | "infera" | "atom" | "sglangrouter";
 
 export interface TopologyHandoffRay {
   head_ip?: string;
@@ -68,10 +69,18 @@ export const TOPOLOGY_HANDOFF_JSON_SCHEMA = {
       if: { properties: { backend: { const: "infera" } } },
       then: { required: ["infera"], not: { required: ["ray"] } },
     },
+    {
+      if: { properties: { backend: { const: "atom" } } },
+      then: { not: { anyOf: [{ required: ["ray"] }, { required: ["infera"] }] } },
+    },
+    {
+      if: { properties: { backend: { const: "sglangrouter" } } },
+      then: { not: { anyOf: [{ required: ["ray"] }, { required: ["infera"] }] } },
+    },
   ],
   properties: {
     schema: { const: TOPOLOGY_HANDOFF_SCHEMA },
-    backend: { enum: ["rayjob", "infera"] },
+    backend: { enum: ["rayjob", "infera", "atom", "sglangrouter"] },
     nodes: { type: "integer", minimum: 1 },
     gpus_per_node: { type: "integer", minimum: 1 },
     service_url: { type: "string", minLength: 1 },
@@ -142,7 +151,9 @@ export function validateTopologyHandoff(value: unknown): string[] {
         if (v !== TOPOLOGY_HANDOFF_SCHEMA) problems.push(`schema: must be ${TOPOLOGY_HANDOFF_SCHEMA}`);
         break;
       case "backend":
-        if (!S.properties.backend.enum.includes(v as never)) problems.push("backend: must be rayjob or infera");
+        if (!S.properties.backend.enum.includes(v as never)) {
+          problems.push("backend: must be rayjob, infera, atom, or sglangrouter");
+        }
         break;
       case "nodes":
         int("nodes", v, 1);
@@ -171,6 +182,11 @@ export function validateTopologyHandoff(value: unknown): string[] {
     const [want, other] = value.backend === "rayjob" ? (["ray", "infera"] as const) : (["infera", "ray"] as const);
     if (!Object.hasOwn(value, want)) problems.push(`${want}: required when backend is ${value.backend}`);
     if (Object.hasOwn(value, other)) problems.push(`${other}: not allowed when backend is ${value.backend}`);
+  }
+  if (isObj(value) && (value.backend === "atom" || value.backend === "sglangrouter")) {
+    for (const block of ["ray", "infera"] as const) {
+      if (Object.hasOwn(value, block)) problems.push(`${block}: not allowed when backend is ${value.backend}`);
+    }
   }
   return problems;
 }
