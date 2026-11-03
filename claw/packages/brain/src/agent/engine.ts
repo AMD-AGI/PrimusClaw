@@ -363,7 +363,9 @@ export class AgentEngine {
       router.lazySkillWriter = lazySkills;
       // The listed skills are Brain's to hand over: `load_skill` serves them without a sandbox.
       if (progressiveSkills.length) router.skillStore = new SkillStore([...defaultProgressive, ...pluginProgressive], `${sessionDir}/.skills`);
-      router.memoryEnabled = request.memory_enabled !== false;
+      // A session that acts as a user (`withhold_sandbox_keys`) has no `save_memory`: what its model writes into the requester's long-term
+      // memory is what a stranger's text made it write, and every later session of the requester would read it.
+      router.memoryEnabled = request.memory_enabled !== false && !request.withhold_sandbox_keys;
       // Whom an identity-authenticated a2a_call peer is called as, and when the run's budget ends.
       const deadlineMs = request.deadline_at ? Date.parse(request.deadline_at) : NaN;
       router.a2aContext = {

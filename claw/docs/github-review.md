@@ -341,6 +341,15 @@ steered by what a pull request says, so a default server's read tools would answ
 `withhold_sandbox_keys` is given no default MCP server and no default skill, on every path above; it has the review
 tools and whatever its own request names. See `platform-defaults.md`.
 
+**The requester's long-term memory is not given either, in either direction.** The model of such a session reads what
+strangers wrote and its answer is posted publicly, so the requester's remembered entries and profile are not put in its
+prompt (nor the notice that memory is off), and it cannot write to that memory, which every later session of the requester
+reads: Brain does not offer `save_memory` to a turn marked `withhold_sandbox_keys` (whatever `memory_enabled` says; a
+sub-agent starts from its parent's tools and has none), and a completion of the session drops `memories_to_save` and does
+not extract memory from its conversation. It is decided from the session's row, as the mark is; a session whose row cannot
+be read is treated as one that withholds, so memory is not used and the turn is not failed. With
+`CLAW_GITHUB_REVIEW_ENABLED` off such a session is an ordinary one.
+
 ## Review path: the diff or a sandbox
 
 A sandbox costs a cold start of about 16 seconds. A small change needs none: `gh_pr_get`
