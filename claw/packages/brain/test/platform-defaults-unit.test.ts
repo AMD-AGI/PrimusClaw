@@ -19,10 +19,16 @@ const { ToolRouter } = await import("../src/tools/router.js");
 
 const ctx = { sessionId: "s", userId: "u" };
 
-test("prompt: progressive entries carry name, description and path, never a body", () => {
+test("prompt: progressive entries carry name and description, never a body; the model is told to load, not read", () => {
   const p = buildPrompt("hi", {}, [], "m", "/workspace", "", ctx, [{ name: "a", description: "does A" }]);
-  assert.match(p, /- a: does A {3}\[read \/workspace\/\.skills\/a\/SKILL\.md\]/);
+  assert.match(p, /- a: does A\n/);
   assert.ok(!p.includes("=== SKILL:"));
+  // A skill is not a file the model opens in a sandbox: no path to read, and the tool is named.
+  assert.ok(!p.includes("[read"), "no read path is advertised");
+  assert.ok(!p.includes("SKILL.md with the read tool"), "the model is no longer told to read SKILL.md");
+  assert.match(p, /load it with the load_skill tool/);
+  assert.match(p, /needs no sandbox/);
+  assert.match(p, /scripts run in the sandbox with bash, from \/workspace\/\.skills\/<name>\//);
 });
 
 test("prompt: inline skills and progressive skills coexist; inline keeps its body", () => {
@@ -103,7 +109,7 @@ function routerWith(writes: string[]) {
   const hands = {
     async callToolFull(name: string, args: Record<string, unknown>) { order.push(`call:${name}`); return { text: "ok", isError: false, args }; },
   };
-  const router = new ToolRouter(null, new Map(), undefined, "", async () => { attached++; return hands as never; });
+  const router = new ToolRouter(null, new Map(), undefined, async () => { attached++; return hands as never; });
   router.lazySkillWriter = {
     async ensure(_h, text) { writes.push(text); order.push("write"); },
   };

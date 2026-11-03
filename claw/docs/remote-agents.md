@@ -43,7 +43,7 @@ session), or an access token from the identity provider (see
 
 Command frames are `event: command` with `data: {v, cmd_id, type, session_id, ...}`.
 Delivery is at least once: a connector deduplicates on `cmd_id` (or skips `cmd_seq` values it has handled). Types: `session.new`
-(`agent_id`, `cwd`, `mode`), `prompt` (`text`), `cancel`, `set_mode` (`mode_id`),
+(`agent_id`, `cwd`, `mode`, and `resume_ref` when the user chose an existing session), `prompt` (`text`), `cancel`, `set_mode` (`mode_id`),
 `resume`, `close`, `decision` (`action_id`, `option_id`, `by`). Nothing else is ever sent.
 
 Events are stored once per `(session_id, seq)`; a repeat is ignored and a gap is
@@ -56,6 +56,38 @@ Special event types: `permissionRequest` (`data.actionId`, `data.options[].optio
 `permission_resolved` (`data.actionId`, `data.optionId`, `data.by`), and
 `session_closed`. They are audited, and `permissionRequest` is what a decision is
 checked against.
+
+### Continuing a session that already exists
+
+A connector may offer sessions that already exist on its machine instead of (or beside) starting new ones. Claw does not
+model that: the agent's `capabilities` (at most 4 KB, replaced by every heartbeat) may carry `resumable`, a list that only the
+connector and the user's client understand, and a client that wants one of them sends `POST /v1/remote-agents/sessions` with
+`resume_ref`, an opaque string of 1 to 128 printable characters that Claw forwards unread in the `session.new` command and
+records in the audit trail. The connector decides what it means and refuses what it cannot honour (the session is then
+closed with a `reason`); an agent that does not offer existing sessions closes the session with `resume_not_supported` rather
+than start a new conversation.
+
+The convention the connector in this repository uses for `resumable`, newest first and at most twelve entries:
+`[{ref, title, cwd, updated_at, state}]` with `ref` the value to send back as `resume_ref`, `updated_at` in seconds since the
+epoch, and `state` one of `idle`, `live` (something else has it open: not offered for takeover), `attached` (this
+connector already holds it) or `unknown`.
+
+## Whether a session asks before it acts
+
+Whether an agent asks the user before it writes a file or runs a command is the machine owner's choice,
+made in the connector's own configuration; nothing Claw sends can change it. Claw does not interpret what the
+connector reports about it, and relays it unchanged (an agent's `capabilities`, and an event's `data`, are opaque to
+the API). The connector in this repository reports these keys, none of which names a product:
+
+| Where | Key | Meaning |
+|---|---|---|
+| an agent's `capabilities` | `unattended` | Its sessions start in a mode that does not ask before a write or a command. |
+| an agent's `capabilities` | `unattended_allowed` | A client may switch this agent to such a mode (`set_mode`). Where it is `false` the connector refuses the switch (`command_rejected`, `mode_not_allowed`). |
+| `session_started`, `session_resumed`, `mode_update` event `data` | `unattended` | This session, as it is now, does not ask. It is also `true` when the agent has said it will not ask, whatever its mode is called. |
+| `data.modes[]` of `session_started` and `session_resumed` | `unattended` | Selecting this mode makes the session unattended. |
+
+A client should show `unattended` wherever it shows a session's mode, so nobody is surprised that nothing asks. The keys are
+absent from a connector that predates them: a client treats absent as unknown, not as "asks".
 
 ## Connector access tokens
 
@@ -148,7 +180,7 @@ connector-side route answers `401 revoked`.
 |---|---|
 | `GET /v1/remote-agents/connectors` | The caller's connectors, with `online` and their agents. |
 | `DELETE .../connectors/:cid` | Revoke: closes its sessions, drops its queued commands. |
-| `POST /v1/remote-agents/sessions` | `{connector_id, agent_id, cwd, mode?}`. `409 connector_offline` unless online. |
+| `POST /v1/remote-agents/sessions` | `{connector_id, agent_id, cwd, mode?, resume_ref?}`. `409 connector_offline` unless online. |
 | `GET .../sessions`, `GET .../sessions/:id` | List, and read one with `connector_online`. |
 | `POST .../sessions/:id/commands` | `{type: prompt\|cancel\|set_mode\|resume\|close, ...}`. `Idempotency-Key` makes a retry queue one command. |
 | `POST .../sessions/:id/decisions` | `{action_id, option_id}`, an option the agent offered. Answered twice, counted once: a different second choice is `409 already_decided`, even after the connector has acknowledged the first, because the audit trail remembers it. |

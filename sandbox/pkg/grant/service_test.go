@@ -58,11 +58,13 @@ func (m staticMembership) Check(_ context.Context, _ string, workspaces []string
 type memRecord struct {
 	mu     sync.Mutex
 	events []string
+	full   []*audit.AuditEvent
 }
 
 func (m *memRecord) Record(_ context.Context, event *audit.AuditEvent) {
 	m.mu.Lock()
 	m.events = append(m.events, event.EventType)
+	m.full = append(m.full, event)
 	m.mu.Unlock()
 }
 
@@ -429,7 +431,7 @@ func TestBudgetExhausted(t *testing.T) {
 	}
 	err := svc.Reserve(context.Background(), req.GrantID, "measurement", "sbx-2", "sess-2", 1)
 	oe, ok := err.(*OpError)
-	if !ok || oe.Status != http.StatusTooManyRequests || oe.Reason != "grant_quota_exceeded" || !strings.Contains(oe.Error(), "grant_quota_exceeded") {
+	if !ok || oe.Status != http.StatusForbidden || oe.Reason != "grant_budget_exhausted" || !strings.Contains(oe.Error(), "grant_budget_exhausted") {
 		t.Fatalf("err=%v", err)
 	}
 }
@@ -965,5 +967,27 @@ func TestIssueRejectsInvalidTemplateLayers(t *testing.T) {
 	var op *OpError
 	if !errors.As(err, &op) || op.Status != http.StatusBadRequest {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestIssueRejectsReservedAppRunID(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	svc, priv, _, _ := testService(t, now)
+	for _, appRunID := range []string{"e2b", "E2B", "e2b_", "e2b-foo", "E2B.run"} {
+		req := sampleRequest(now.Add(time.Minute))
+		req.Issuer.AppRunID = appRunID
+		req.Attestation = signGrant(t, priv, req)
+		_, _, err := svc.Issue(context.Background(), req)
+		var op *OpError
+		if !errors.As(err, &op) || op.Status != http.StatusBadRequest {
+			t.Fatalf("%s: err = %v", appRunID, err)
+		}
+	}
+	for _, appRunID := range []string{"e2bx", "run-e2b"} {
+		req := sampleRequest(now.Add(time.Minute))
+		req.Issuer.AppRunID = appRunID
+		if err := validateIssue(req, now); err != nil {
+			t.Fatalf("%s: err = %v", appRunID, err)
+		}
 	}
 }

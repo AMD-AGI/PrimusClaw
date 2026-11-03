@@ -414,7 +414,7 @@ fi
 # `callbacks` is a list as often as it is a string -- anything that adds
 # `prometheus` alongside the hook makes it one. Reading it as a scalar printed
 # the repr of the list, which still matched `*.*`, so the module name became
-# "['prometheus', 'litellm.proxy.hooks.apim_key_hook" and the import failed:
+# "['prometheus', 'litellm.proxy.hooks.prompt_cache_hook" and the import failed:
 # a hard error on a perfectly healthy deployment. Normalise to one entry per
 # line and check each dotted one on its own; bare names like `prometheus` are
 # built in and have nothing to import.

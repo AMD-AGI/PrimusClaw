@@ -26,7 +26,8 @@
  */
 import pino from "pino";
 import type { SandboxSpecCreate } from "@claw/protocol";
-import { SAFE_API_URL, SANDBOX_DEFAULT_TIMEOUT_SECONDS, SANDBOX_NAMESPACE, isKubernetesMode } from "../config.js";
+import { SAFE_API_URL, SANDBOX_DEFAULT_TIMEOUT_SECONDS, isKubernetesMode } from "../config.js";
+import { sandboxNamespaceForResources } from "../sandbox/workspace-select.js";
 import {
   DEFAULT_SANDBOX_TTL_SEC, composeSandboxLabels, createSafeWorkloadSandbox, SESSION_ID_LABEL, COMPONENT_LABEL,
 } from "../sandbox/create-sandbox.js";
@@ -178,8 +179,8 @@ export function appSandboxEnv(run: Pick<AppSandboxRun, "runId" | "sandboxSpec" |
   return env;
 }
 
-const appSandboxNamespace = (run: Pick<AppSandboxRun, "workspaceId">): string =>
-  run.workspaceId?.trim() || SANDBOX_NAMESPACE;
+const appSandboxNamespace = (run: Pick<AppSandboxRun, "workspaceId" | "sandboxSpec">): string =>
+  sandboxNamespaceForResources(run.workspaceId, run.sandboxSpec?.resources);
 
 /**
  * The handle of an app sandbox whose workload id is already known: a run being
@@ -187,7 +188,7 @@ const appSandboxNamespace = (run: Pick<AppSandboxRun, "workspaceId">): string =>
  * the instance without creating anything.
  */
 export function appSandboxInstance(
-  run: Pick<AppSandboxRun, "workspaceId" | "platformKey">,
+  run: Pick<AppSandboxRun, "workspaceId" | "platformKey" | "sandboxSpec">,
   workloadId: string,
 ): SandboxInstance {
   const ns = appSandboxNamespace(run);

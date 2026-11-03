@@ -39,6 +39,11 @@ export interface SchemaRequirement {
    * at start-up, not a refusal to serve.
    */
   onlyWhenAppRuns?: boolean;
+  /**
+   * Exists only when `CLAW_ASSISTANT_ENABLED` is true. With it off the tables are
+   * never created, so their absence is neither a refusal nor a warning.
+   */
+  onlyWhenAssistant?: boolean;
 }
 
 /** A column somewhere in the database, as `information_schema` reports it. */
@@ -132,6 +137,9 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
       // Absent, a retried drain cannot recognise the run it already opened and
       // executes the queued message a second time.
       "dispatch_task_id",
+      // Absent, the insert that carries a dedupe key fails outright, so every
+      // submit that names one is refused -- the retry-safe path, not the plain one.
+      "dedupe_key",
     ],
   },
   {
@@ -175,6 +183,13 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     columns: ["user_id", "enabled"],
   },
   {
+    table: "claw_terminal_tickets",
+    // Every terminal ticket is minted into it and redeemed out of it. Absent, the
+    // mint fails and no browser terminal can be opened -- while everything else
+    // answers, which is how a missing table goes unnoticed.
+    columns: ["ticket_hash", "user_id", "session_id", "sealed", "expires_at"],
+  },
+  {
     table: "claw_answer_feedback",
     // The vote routes write and delete by this key. Absent, a vote answers 500
     // for every user, on a deployment where nothing else is wrong.
@@ -193,6 +208,33 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
       "id", "user_id", "category", "content", "importance",
       "access_count", "created_at", "last_accessed", "deleted_at", "kind",
     ],
+  },
+  {
+    table: "claw_assistants",
+    // `POST /v1/assistant` and every work-item write start from this row.
+    onlyWhenAssistant: true,
+    columns: ["user_id", "session_id", "router_model", "created_at", "updated_at"],
+  },
+  {
+    table: "claw_work_items",
+    // The columns the state machine's WHERE clauses name: absent, a report, an
+    // acceptance or a stop fails on the statement and the board looks empty.
+    onlyWhenAssistant: true,
+    columns: [
+      "item_id", "user_id", "seq", "title", "summary", "board_state", "last_report_kind",
+      "pending_question", "outcome", "worker_session_id", "generation", "result_version",
+      "accepted_version", "attention_seq", "repo", "created_at", "updated_at", "closed_at",
+    ],
+  },
+  {
+    table: "claw_work_item_events",
+    onlyWhenAssistant: true,
+    columns: ["id", "item_id", "kind", "source", "generation", "run_id", "summary", "question", "result", "created_at"],
+  },
+  {
+    table: "claw_assistant_says",
+    onlyWhenAssistant: true,
+    columns: ["say_id", "user_id", "item_id", "item_attention_seq", "text", "fallback", "created_at", "delivered_at"],
   },
 ];
 
@@ -235,14 +277,18 @@ export function missingSchemaObjects(
 /**
  * The problems that stop start-up and the ones that are only warned about. A
  * table marked `onlyWhenAppRuns` is fatal when app runs are enabled and a
- * warning when they are not; everything else is always fatal.
+ * warning when they are not; one marked `onlyWhenAssistant` is fatal when the
+ * assistant is enabled and not looked at otherwise; everything else is always
+ * fatal.
  */
 export function classifySchemaProblems(
   required: SchemaRequirement[],
   present: PresentColumn[],
   appRunsEnabled: boolean,
+  assistantEnabled = false,
 ): { fatal: string[]; warnings: string[] } {
-  const fatal = missingSchemaObjects(required.filter((r) => !r.onlyWhenAppRuns), present);
+  const always = required.filter((r) => !r.onlyWhenAppRuns && (assistantEnabled || !r.onlyWhenAssistant));
+  const fatal = missingSchemaObjects(always, present);
   const app = missingSchemaObjects(required.filter((r) => r.onlyWhenAppRuns), present);
   return appRunsEnabled ? { fatal: [...fatal, ...app], warnings: [] } : { fatal, warnings: app };
 }

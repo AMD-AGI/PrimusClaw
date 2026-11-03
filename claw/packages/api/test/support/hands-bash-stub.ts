@@ -26,15 +26,31 @@ export interface HandsBashStub {
   refused: number;
   /** While true, a `tools/call` request is answered by dropping the connection (a sandbox that dies mid-command). */
   dropToolCalls: boolean;
+  /** Close every connection the server holds idle, the way its own idle timeout would, and return how many were. */
+  dropIdleConnections(): number;
   close(): Promise<void>;
 }
 
 export async function startHandsBashStub(opts: { token: string; env: Record<string, string>; dropToolCalls?: boolean }): Promise<HandsBashStub> {
-  const stub: HandsBashStub = { url: "", token: opts.token, commands: [], headers: [], refused: 0, dropToolCalls: opts.dropToolCalls === true, close: async () => {} };
+  const stub: HandsBashStub = { url: "", token: opts.token, commands: [], headers: [], refused: 0, dropToolCalls: opts.dropToolCalls === true, dropIdleConnections: () => 0, close: async () => {} };
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", async () => {
+      // One request per connection, because this server and its client share a
+      // process and `bash` below blocks that process's event loop for as long as
+      // the command runs.
+      //
+      // The server closes a connection that has sat idle for six seconds (the
+      // five of `keepAliveTimeout` and a second of buffer), on the real clock.
+      // undici counts a pooled connection's idle time in timer ticks, so a loop
+      // that was blocked for those six seconds has barely aged it, and the next
+      // request is dispatched on a socket the server has already shut: "fetch
+      // failed", which the API turns into "sandbox not running". Hands is a
+      // separate process in production and nothing blocks the client's loop, so
+      // this is a property of the stand-in. Without a connection to reuse there
+      // is nothing to go stale, and a loopback handshake per request is cheap.
+      res.setHeader("connection", "close");
       stub.headers.push({ ...req.headers });
       if ((req.headers.authorization ?? "") !== `Bearer ${opts.token}`) {
         stub.refused++;
@@ -60,6 +76,9 @@ export async function startHandsBashStub(opts: { token: string; env: Record<stri
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   stub.url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/mcp`;
+  const sockets = new Set<import("node:net").Socket>();
+  server.on("connection", (s) => { sockets.add(s); s.on("close", () => sockets.delete(s)); });
+  stub.dropIdleConnections = () => { const n = sockets.size; server.closeIdleConnections(); return n; };
   stub.close = () => new Promise<void>((resolve) => { server.closeAllConnections?.(); server.close(() => resolve()); });
   return stub;
 }

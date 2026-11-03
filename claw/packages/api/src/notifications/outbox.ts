@@ -19,9 +19,10 @@ import { createHash, randomUUID } from "node:crypto";
 import pino from "pino";
 import { NOTIFY_LINK_BASE, NOTIFY_MIN_RUN_SECONDS, NOTIFY_WEBHOOK_ALLOWED_HOSTS } from "../config.js";
 import { decryptUserEnvValue } from "../crypto/user-env.js";
-import { db } from "../infra/db.js";
+import { db, type Querier } from "../infra/db.js";
 import { redactPublicJson } from "../events/redaction.js";
 import { approvalTarget, redactCommandSecrets } from "./approval-target.js";
+import type { AssistantEventPayload } from "./assistant-events.js";
 import { EVENT_ID_HEADER, SIGNATURE_HEADER, TIMESTAMP_HEADER, signPayload } from "./signing.js";
 import { httpTransport, type Transport } from "./transport.js";
 import { guardWebhookUrl, parseAllowedHosts, type Resolver } from "./url-guard.js";
@@ -70,6 +71,9 @@ export interface NotificationPayload {
   /** Present on `approval.requested` only. */
   approval?: ApprovalInfo;
 }
+
+/** Everything an outbox row can carry. Run events keep `NotificationPayload`; an assistant event has its own. */
+export type OutboundPayload = NotificationPayload | AssistantEventPayload;
 
 /** Same inputs, same id: the receiver's dedup key. */
 export function deterministicEventId(type: string, sessionId: string, taskId: string): string {
@@ -145,15 +149,22 @@ export async function recordRunFinished(input: RunFinished): Promise<number> {
   return written;
 }
 
-/** One outbox row per subscription; a row that already exists (same event, same subscription) is left alone. */
-async function enqueue(
+const direct: Querier = (text, params) => db.query(text, params);
+
+/**
+ * One outbox row per subscription; a row that already exists (same event, same
+ * subscription) is left alone. `q` lets a caller write the rows in the transaction
+ * that records what they announce.
+ */
+export async function enqueue(
   eventId: string,
   subs: Array<{ subscription_id: string }>,
-  payload: NotificationPayload,
+  payload: OutboundPayload,
+  q: Querier = direct,
 ): Promise<number> {
   let written = 0;
   for (const sub of subs) {
-    const r = await db.query(
+    const r = await q(
       `INSERT INTO claw_notification_outbox (event_id, subscription_id, payload)
        VALUES ($1, $2, $3::jsonb) ON CONFLICT (event_id, subscription_id) DO NOTHING`,
       [eventId, sub.subscription_id, JSON.stringify(payload)],
@@ -269,6 +280,33 @@ export async function recordApprovalRequested(
   return enqueue(eventId, subs, payload);
 }
 
+export interface DeliveredRow {
+  eventId: string;
+  subscriptionId: string;
+  payload: OutboundPayload;
+}
+
+const deliveredHooks = new Map<string, Array<(row: DeliveredRow) => Promise<void>>>();
+
+/**
+ * Run `hook` after a delivery of one of `types` got a 2xx, before the outbox row is
+ * marked delivered. A hook that throws is logged and does not undo the delivery: the
+ * receiver has the event, and it is the receiver's dedup key that absorbs the send
+ * a later retry would repeat. The hook may run again for the same event (another
+ * subscription, a retry), so it has to be idempotent.
+ */
+export function onDelivered(types: readonly string[], hook: (row: DeliveredRow) => Promise<void>): void {
+  for (const type of types) deliveredHooks.set(type, [...(deliveredHooks.get(type) ?? []), hook]);
+}
+
+async function runDeliveredHooks(row: Claimed): Promise<void> {
+  for (const hook of deliveredHooks.get(row.payload.type) ?? []) {
+    await hook({ eventId: row.event_id, subscriptionId: row.subscription_id, payload: row.payload }).catch((err) => {
+      logger.error({ err, eventId: row.event_id, type: row.payload.type }, "notification.delivered_hook_failed");
+    });
+  }
+}
+
 export interface DeliveryDeps {
   transport?: Transport;
   resolve?: Resolver;
@@ -280,7 +318,7 @@ interface Claimed {
   id: string;
   event_id: string;
   subscription_id: string;
-  payload: NotificationPayload;
+  payload: OutboundPayload;
   attempts: number;
   expired: boolean;
 }
@@ -374,6 +412,9 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
           },
         });
         if (code >= 200 && code < 300) {
+          // Before the row is marked: a crash in between repeats the send, which the
+          // receiver's dedup absorbs, instead of leaving a delivered event unrecorded.
+          await runDeliveredHooks(row);
           await db.query(
             `UPDATE claw_notification_outbox SET delivered_at = NOW(), last_status = $2 WHERE id = $1`,
             [row.id, String(code)],
@@ -420,17 +461,41 @@ export function newSubscriptionId(): string {
 
 const POLL_MS = 5000;
 let timer: NodeJS.Timeout | null = null;
-let inFlight = false;
+let running: Promise<void> | null = null;
+let rerun = false;
+let latestDeps: DeliveryDeps = {};
+
+/**
+ * Deliver what is due now instead of at the next tick. The poll waits up to
+ * `POLL_MS`, which a message a person is waiting for cannot spare.
+ *
+ * One delivery loop runs per process, whoever asks: a request that arrives while it
+ * runs makes it go round once more, so a row written after its claim is not missed
+ * and, within this process, two sends to one receiver do not overtake each other.
+ * Never rejects.
+ */
+export function kickDelivery(deps: DeliveryDeps = {}): Promise<void> {
+  latestDeps = deps;
+  if (running) {
+    rerun = true;
+    return running;
+  }
+  running = (async () => {
+    try {
+      do {
+        rerun = false;
+        await deliverDue(latestDeps).catch((err) => logger.error({ err }, "notification.tick_failed"));
+      } while (rerun);
+    } finally {
+      running = null;
+    }
+  })();
+  return running;
+}
 
 export function startNotificationWorker(): void {
   if (timer) return;
-  timer = setInterval(() => {
-    if (inFlight) return;
-    inFlight = true;
-    deliverDue()
-      .catch((err) => logger.error({ err }, "notification.tick_failed"))
-      .finally(() => { inFlight = false; });
-  }, POLL_MS);
+  timer = setInterval(() => { if (!running) void kickDelivery(); }, POLL_MS);
   timer.unref();
   logger.info({ pollMs: POLL_MS }, "notification-worker.started");
 }

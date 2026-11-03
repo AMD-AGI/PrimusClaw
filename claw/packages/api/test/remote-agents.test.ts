@@ -308,6 +308,29 @@ describe("remote agents", { skip }, () => {
       assert.deepEqual(prompt.json(), { text: "do it", v: 1, cmd_id: sent.body.data.cmd_id, type: "prompt", session_id: sid });
     });
 
+    test("a session that names an existing session passes the reference to the connector as given, and a malformed one is refused", async () => {
+      const { cid, stream } = await online1();
+      const ref = "0f8fad5b-d9cb-469f-a165-70867728950e";
+      const made = await as("u1").post("/v1/remote-agents/sessions", { connector_id: cid, agent_id: "a1", cwd: "/work/repo", resume_ref: ref });
+      assert.equal(made.status, 201, JSON.stringify(made.body));
+      const cmd = (await stream.nextEvent("command")).json();
+      assert.deepEqual(cmd, {
+        agent_id: "a1", cwd: "/work/repo", mode: null, resume_ref: ref,
+        v: 1, cmd_id: cmd.cmd_id, type: "session.new", session_id: made.body.data.session_id,
+      });
+      assert.equal("resume_ref" in made.body.data, false, "the row does not keep it: the connector does");
+      const audited = (await as("u1").get(`/v1/remote-agents/audit?session_id=${made.body.data.session_id}`)).body.data;
+      assert.ok(audited.some((r: any) => r.action === "session.created" && r.detail.resume_ref === ref));
+      for (const bad of ["", "x".repeat(129), "a\nb", 5]) {
+        const r = await as("u1").post("/v1/remote-agents/sessions", { connector_id: cid, agent_id: "a1", cwd: "/work/repo", resume_ref: bad });
+        assert.equal(r.status, 400, JSON.stringify(bad));
+        assert.equal(r.body.error, "invalid_resume_ref");
+      }
+      // Without one, the command is what it always was.
+      const plain = await session("u1", cid);
+      assert.equal("resume_ref" in (await stream.nextEvent("command")).json(), false, plain);
+    });
+
     test("a reconnect is sent every command not yet acknowledged, whatever cursor it presents", async () => {
       const { cid, stream } = await online1();
       const sid = await session("u1", cid);
@@ -583,6 +606,27 @@ describe("remote agents", { skip }, () => {
       const live = await s.next();
       assert.equal(live.event, "turn_end");
       assert.equal((await s.next((f) => !!f.comment, 1500)).comment, true, "a keepalive follows while idle");
+    });
+
+    test("what a connector says about a session running without per-step approval reaches the user's client unchanged", async () => {
+      // `unattended` is not interpreted here: the API relays whatever the connector reports, in the agent's
+      // capabilities and in the session events that name a mode. Nothing in it is a product name.
+      const caps = { ask_mode: "no-approval-mode", modes: ["a", "b"], unattended: true, unattended_allowed: true, protocol: 1 };
+      const asking = { ask_mode: "default", modes: ["a", "b"], unattended: false, unattended_allowed: false, protocol: 1 };
+      const cid = await connector();
+      await heartbeat("u1", cid, {}, [{ ...AGENT, capabilities: caps }, { agent_id: "a2", kind: "other", name: "Two", capabilities: asking }]);
+      const listed = (await as("u1").get("/v1/remote-agents/connectors")).body.data[0].agents;
+      assert.deepEqual(listed.map((a: any) => [a.agent_id, a.capabilities]), [["a1", caps], ["a2", asking]]);
+
+      const { cid: online, stream: _s } = await online1();
+      const sid = await session("u1", online);
+      const started = { acp_session_id: "x", agent_id: "a1", kind: "example-kind", cwd: "/work/repo", currentMode: "no-approval-mode", unattended: true, modes: [{ id: "a", unattended: false }, { id: "no-approval-mode", unattended: true }] };
+      const changed = { currentMode: "a", unattended: false };
+      const posted = await post("u1", online, [ev(sid, "session_started", started), ev(sid, "mode_update", changed), ev(sid, "session_resumed", { ...started })]);
+      assert.deepEqual(posted.body.data.rejected, []);
+      const s = await SseClient.open(`${base}/v1/remote-agents/sessions/${sid}/events`, { "x-test-user": "u1" });
+      streams.push(s);
+      assert.deepEqual([(await s.next()).json().data, (await s.next()).json().data, (await s.next()).json().data], [started, changed, started]);
     });
 
     test("a session with no events still gets its marker", async () => {

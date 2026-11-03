@@ -43,6 +43,14 @@ func (in *SandboxGrantSpec) DeepCopyInto(out *SandboxGrantSpec) {
 			out.Roles[k] = *v.DeepCopy()
 		}
 	}
+	if in.MaxSandboxes != nil {
+		v := *in.MaxSandboxes
+		out.MaxSandboxes = &v
+	}
+	if in.MaxGPUs != nil {
+		v := *in.MaxGPUs
+		out.MaxGPUs = &v
+	}
 	if in.Templates != nil {
 		out.Templates = make([]GrantTemplate, len(in.Templates))
 		for i := range in.Templates {

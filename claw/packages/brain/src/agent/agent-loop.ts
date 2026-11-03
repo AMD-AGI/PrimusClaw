@@ -29,6 +29,8 @@ import type { RunIdentity } from "../tasks/run-identity.js";
 import { safePreview } from "@claw/utils";
 import { HandsClient, isHandsNetworkError, isHandsToolTimeout, explainHandsError, handsNetworkErrorReason } from "../clients/hands.js";
 import { isSandboxTool } from "../tools/hands.js";
+import { LOAD_SKILL_TOOL, LOAD_SKILL_RESULT_MAX_CHARS } from "./skill-store.js";
+import { toolNotAllowedMessage, type ToolAllowlist } from "../tools/allowlist.js";
 import type { HookRunner } from "./hooks.js";
 import { refusalMessage, type HitlController } from "./hitl.js";
 import { latestUserText, type Completer } from "./approval-explain.js";
@@ -329,6 +331,15 @@ export interface LoopOptions {
   llmSession?: LlmSession;
   /** Test seam: HITL_SUMMARY_MODEL for this loop, where the deployment's setting is read at import. */
   hitlSummaryModel?: string;
+  /**
+   * The run's `tools_allowlist`; absent when it has none. The schemas handed to
+   * `agentLoop` are already narrowed by it, and `ToolRouter.route()` refuses what
+   * is outside it. This is for the calls that never reach a router: the ones this
+   * loop handles itself (`task`, `todo_write`, `ask_user_question`,
+   * `exit_plan_mode`), and the wait probe that opens a sandbox before a `wait` is
+   * routed. Forwarded to every sub-agent.
+   */
+  toolAllowlist?: ToolAllowlist | null;
 }
 
 // ── P1: todo_write in-loop state ──
@@ -359,7 +370,24 @@ const TOOL_RESULT_MAX_CHARS = 6000;
 const TOOL_RESULT_HEAD_CHARS = 4000;
 const TOOL_RESULT_TAIL_CHARS = 1500;
 
-function truncateToolResult(text: string): string {
+/**
+ * `load_skill` is the one tool that does not run into the generic cap above.
+ * Its answer is already bounded and paged by the skill store (a part of at
+ * most SKILL_PAGE_CHARS, the file list, and the offset of the next part when
+ * there is one), and the cap's advice, "re-run with head/tail/grep/sed", is
+ * what sends a model to `read` or `bash` on /workspace/.skills, which opens a
+ * sandbox: the failure this tool exists to avoid. So it gets its own bound,
+ * which the store never exceeds, and its own notice, which names the paging and
+ * never a sandbox tool.
+ */
+export function truncateToolResult(text: string, toolName?: string): string {
+  if (toolName === LOAD_SKILL_TOOL) {
+    if (typeof text !== "string" || text.length <= LOAD_SKILL_RESULT_MAX_CHARS) return text;
+    const head = text.slice(0, Math.floor(LOAD_SKILL_RESULT_MAX_CHARS * 0.65));
+    const tail = text.slice(-Math.floor(LOAD_SKILL_RESULT_MAX_CHARS * 0.3));
+    const dropped = text.length - head.length - tail.length;
+    return `${head}\n\n[... ${dropped} chars cut from this ${LOAD_SKILL_TOOL} result; get what is missing by calling ${LOAD_SKILL_TOOL} again with name, file and the offset to continue from ...]\n\n${tail}`;
+  }
   if (typeof text !== "string" || text.length <= TOOL_RESULT_MAX_CHARS) return text;
   const head = text.slice(0, TOOL_RESULT_HEAD_CHARS);
   const tail = text.slice(-TOOL_RESULT_TAIL_CHARS);
@@ -610,7 +638,7 @@ const SETUP_CMD_RE =
 
 /** Plan mode read-only allowlist (§5.7) */
 const PLAN_MODE_ALLOWLIST = new Set([
-  "read", "glob", "grep", "ls", "web_search", "web_fetch",
+  "read", "glob", "grep", "ls", "web_search", "web_fetch", "load_skill",
   "bash_output", "todo_write", "exit_plan_mode", "ask_user_question",
 ]);
 
@@ -1602,7 +1630,7 @@ class AgentLoopRunner {
     const results: Array<Record<string, unknown>> = toolUses.map((tc: any) => ({
       type: "tool_result",
       tool_use_id: tc.id as string,
-      content: truncateToolResult(resultByToolId.get(tc.id as string) ?? "(no result)"),
+      content: truncateToolResult(resultByToolId.get(tc.id as string) ?? "(no result)", tc.name as string),
     }));
 
     await this.maybeRecoverSandbox(results);
@@ -1851,6 +1879,10 @@ class AgentLoopRunner {
       }
     logger.info({ turn, sessionId: this.sessionId, toolName, input: logInput }, "tool.call");
 
+      // Outside the run's tool allowlist: answered here, before a hook, an
+      // approver or a sandbox probe can be reached on its behalf.
+      if (await this.refuseUnlisted(toolName, toolId, resultByToolId)) return;
+
       // Emit `start` synchronously with full argumentsDetail. The web client's
       // event reducer only creates the tool card on
       // status="start" and does NOT read argumentsDetail on the terminal
@@ -1997,18 +2029,28 @@ class AgentLoopRunner {
           resultByToolId.set(toolId, errMsg);
           return;
         }
-      await this.onEvent({
+      // Registered before the question is announced: a caller that answers the
+      // moment it sees the question would otherwise find nothing waiting, and
+      // the answer would be dropped (the approval gate does the same, hitl.ts).
+      const waiting = this.opts.questionDispatcher.register({
+          actionId: toolId, type: "answer",
+          timeoutMs: ASK_USER_QUESTION_TIMEOUT_MS,
+          signal: this.signal,
+        });
+      waiting.catch(() => { /* consumed below; this only keeps an early failure from being unhandled */ });
+      try {
+        await this.onEvent({
           type: "userQuestion",
           actionId: toolId,
           questions: finalInput.questions,
           ts: Date.now(),
         });
+      } catch (err) {
+        this.opts.questionDispatcher.deregister(toolId, "answer");
+        throw err;
+      }
         try {
-        const answer = await this.opts.questionDispatcher.register({
-            actionId: toolId, type: "answer",
-            timeoutMs: ASK_USER_QUESTION_TIMEOUT_MS,
-          signal: this.signal,
-          });
+        const answer = await waiting;
           const resultMsg = answer ? JSON.stringify(answer.answers ?? {}) : "No answer received";
         await this.onEvent({ type: "toolUsed", tool: toolName, actionId: toolId, status: "success", description: resultMsg.slice(0, 200) });
         logger.info({ turn, sessionId: this.sessionId, toolName, resultLen: resultMsg.length, resultPreview: safePreview(resultMsg, 200) }, "tool.result");
@@ -2197,11 +2239,40 @@ class AgentLoopRunner {
     return true;
   }
 
+  /**
+   * Turn away a call to a tool outside the run's `tools_allowlist`.
+   *
+   * Reports to the model as an error result, the way every other refusal does,
+   * and counts as a call that failed. Returns whether it refused; with no
+   * allowlist it never does, and a run without one is exactly what it was.
+   */
+  private async refuseUnlisted(
+    toolName: string,
+    toolId: string,
+    resultByToolId: Map<string, string>,
+  ): Promise<boolean> {
+    const allowlist = this.opts.toolAllowlist;
+    if (!allowlist || allowlist.allows(toolName)) return false;
+    const reason = toolNotAllowedMessage(toolName);
+    this.totalToolCalls++;
+    this.errorCount++;
+    this.toolCallsByName[toolName] = (this.toolCallsByName[toolName] || 0) + 1;
+    logger.warn({ sessionId: this.sessionId, toolName }, "tool.not_in_allowlist");
+    await this.onEvent({ type: "toolUsed", tool: toolName, actionId: toolId, status: "error", description: reason });
+    resultByToolId.set(toolId, reason);
+    return true;
+  }
+
   private async runTaskTool(
     tc: any,
     turn: number,
     resultByToolId: Map<string, string>,
   ): Promise<void> {
+    // A `task` the run's tool allowlist does not name starts nothing: it would
+    // open a sandbox for the sub-agent before anything else could object. It
+    // counts as no started call, so it is turned away ahead of the increment
+    // below, which only a call that really begins may make.
+    if (await this.refuseUnlisted("task", tc.id as string, resultByToolId)) return;
     // FIRST, before any await. A sibling in the same `Promise.all` batch must
     // be visible to a check made while this one is still suspended -- see
     // `toolsStarted`.
@@ -2226,7 +2297,11 @@ class AgentLoopRunner {
         ) || []).length;
         const readVerb = /\b(read|cat|contents?|full contents?|simultaneously|in parallel)\b/i.test(promptText);
         if (skillPathHits >= 2 && readVerb) {
-          const errMsg = `Error: do not dispatch sub-agents to read skill files (${skillPathHits} skill paths detected in prompt). Use the \`read\` tool directly — one call per file, no truncation, no overhead. See SKILL.md "How to Read This Skill". To override per-deployment set BRAIN_BLOCK_SKILL_SUBAGENTS=false.`;
+          // With `load_skill` on offer, a skill is read with it: `read` of a skill path is a sandbox call.
+          const readWith = this.tools.some((t) => t.name === LOAD_SKILL_TOOL)
+            ? `Use the \`${LOAD_SKILL_TOOL}\` tool directly (name, and file for a reference; it pages a long file with offset) — one call per file, no sandbox, no overhead.`
+            : `Use the \`read\` tool directly — one call per file, no truncation, no overhead. See SKILL.md "How to Read This Skill".`;
+          const errMsg = `Error: do not dispatch sub-agents to read skill files (${skillPathHits} skill paths detected in prompt). ${readWith} To override per-deployment set BRAIN_BLOCK_SKILL_SUBAGENTS=false.`;
         await this.onEvent({
             type: "toolUsed", tool: "task", actionId: toolId, status: "error",
             argumentsDetail: { task: { description: toolInput.description, subagent_type: subagentType, subagent_id: subagentId } },
@@ -2284,6 +2359,8 @@ class AgentLoopRunner {
         hitl: this.opts.hitl,
         runIdentity: this.opts.runIdentity,
         webToolServices: this.router.getWebToolServices?.(),
+        // Forwarded, never re-derived: a sub-agent is no way around the list.
+        toolAllowlist: this.opts.toolAllowlist,
         });
         resultText = sub.finalText || "(sub-agent produced no final text)";
       } catch (err: any) {

@@ -102,6 +102,15 @@ const eventPersistedTotal = new Counter({
   registers: [registry],
 });
 
+// A worker's report refused because its run is no longer the item's current one (stopped, replaced or
+// overtaken): the fencing doing its job, and the number to watch if reports seem to go missing.
+const workItemStaleRejectedTotal = new Counter({
+  name: "claw_work_item_stale_rejected_total",
+  help: "Worker reports refused by the work item's generation fence, by source.",
+  labelNames: ["source"] as const,
+  registers: [registry],
+});
+
 // `error` keeps a throw out of loadUsage or queueLength in the denominator;
 // without it a partial outage makes every rollout ratio read healthier.
 const admissionDecisionTotal = new Counter({
@@ -351,5 +360,8 @@ export const metrics = {
   },
   onDoorbellLeaseRequeued(rows: number): void {
     if (rows > 0) doorbellLeaseRequeuedTotal.inc(rows);
+  },
+  onWorkItemStaleRejected(source: "worker" | "turn_end" | "sweep"): void {
+    workItemStaleRejectedTotal.inc({ source });
   },
 };

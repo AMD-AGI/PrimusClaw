@@ -34,6 +34,7 @@ import { stripRunSecrets } from "../tasks/run-spec.js";
 import { sessionModelFromRow } from "./session-model.js";
 import { sessionRepoFromRow } from "./session-repo.js";
 import { applyAppMcpToTask } from "./app-mcp.js";
+import { applySessionRoleToTask, skipsSkillSelection } from "../assistant/role-profile.js";
 import { ensureSessionWorkspace, requireWorkspaceBinding } from "../workspace/store.js";
 import pino from "pino";
 
@@ -252,7 +253,8 @@ export async function dispatchTaskToBrain(
 
     let localSkills: Record<string, { content: string; enabled: boolean; version?: number; description?: string; files?: Array<{ path: string; content: string; is_binary?: boolean }> }> = {};
     try {
-      const activeSkills = sandboxOnly ? {} : await selectSkillsForTask(userId, content);
+      // A router turn only classifies and calls tools; selecting skills costs it an LLM call it has no use for.
+      const activeSkills = sandboxOnly || await skipsSkillSelection(sessionId) ? {} : await selectSkillsForTask(userId, content);
       for (const [name, bundle] of Object.entries(activeSkills)) {
         localSkills[name] = {
           content: bundle.content,
@@ -507,6 +509,8 @@ export async function dispatchTaskToBrain(
     // application's servers are built from the live record when it is claimed
     // (tasks/run-claim.ts), so no token is stored and a replaced sandbox is not offered.
     await applyAppMcpToTask(task, sessionId);
+    // After the run row exists: the turn's token names the run. A doorbell turn gets this at claim instead.
+    await applySessionRoleToTask(task, sessionId);
     const payload = JSON.stringify(task);
     const seq = await publishRunMessage(
       () => sessionDispatchPorts.publishTask(subject, payload),

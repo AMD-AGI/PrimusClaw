@@ -78,7 +78,11 @@ describe("an identity access token in the Kubernetes deployment mode", () => {
   test("a valid token authenticates the request, with no gateway key, and a `system-admin` role in it (mint() carries one) is not copied: this mode has no route to admin", async () => {
     const r = await whoami({ authorization: `Bearer ${mint()}` });
     assert.equal(r.status, 200, JSON.stringify(r.body));
-    assert.deepEqual(r.body.user, { userId: "web-user", userName: "Web User", roles: ["default"], platformKey: "", virtualKey: "" });
+    // The client the token was issued to is recorded beside the user (auth/identity-token.ts); it grants nothing.
+    assert.deepEqual(r.body.user, {
+      userId: "web-user", userName: "Web User", roles: ["default"], platformKey: "", virtualKey: "",
+      delegation: { clientId: "claw-web" },
+    });
     assert.equal(isAdmin(r.body.user), false);
   });
 

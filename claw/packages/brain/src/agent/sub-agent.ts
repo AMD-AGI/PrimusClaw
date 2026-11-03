@@ -7,6 +7,7 @@ import type { HandsClient } from "../clients/hands.js";
 import type { HookRunner } from "./hooks.js";
 import type { Message, ToolSchema, EventCallback } from "@claw/protocol";
 import type { RunIdentity } from "../tasks/run-identity.js";
+import { filterToolSchemas, type ToolAllowlist } from "../tools/allowlist.js";
 import pino from "pino";
 import { randomUUID } from "node:crypto";
 
@@ -25,8 +26,8 @@ export const SUBAGENT_TYPES = ["explore", "readonly", "shell", "generalPurpose"]
 export type SubagentType = typeof SUBAGENT_TYPES[number];
 
 const PROFILE_ALLOW: Record<SubagentType, string[] | "all"> = {
-  explore:         ["read", "grep", "glob", "ls", "bash"],
-  readonly:        ["read", "grep", "glob", "ls"],
+  explore:         ["read", "grep", "glob", "ls", "bash", "load_skill"],
+  readonly:        ["read", "grep", "glob", "ls", "load_skill"],
   shell:           ["bash"],
   generalPurpose:  "all",
 };
@@ -84,6 +85,13 @@ export interface RunSubagentOptions {
   runIdentity?: RunIdentity;
   /** Web tool services from the parent, shared across sub-agents. */
   webToolServices?: WebToolServices;
+  /**
+   * The parent run's `tools_allowlist`. The parent's schemas are normally narrowed
+   * by it already; applying it here as well keeps a sub-agent inside the list for
+   * a caller that hands over schemas which were not, and it is forwarded to the
+   * sub-agent's own loop for the calls that loop handles itself.
+   */
+  toolAllowlist?: ToolAllowlist | null;
 }
 
 export interface SubagentResult {
@@ -100,14 +108,18 @@ export interface SubagentResult {
   elapsed_ms: number;
 }
 
-/** Pick the effective tool schemas for this sub-agent. */
+/**
+ * Pick the effective tool schemas for this sub-agent: the parent's, narrowed by
+ * the run's tools_allowlist first so that nothing below can widen them again.
+ */
 function filterSchemas(
   parentSchemas: ToolSchema[],
   profile: SubagentType,
   explicitAllow?: string[],
+  runAllowlist?: ToolAllowlist | null,
 ): ToolSchema[] {
   const profileAllow = PROFILE_ALLOW[profile];
-  return parentSchemas.filter((s) => {
+  return filterToolSchemas(parentSchemas, runAllowlist).filter((s) => {
     const name = s.name;
     // Universal deny.
     if (DENY_LIST.has(name)) return false;
@@ -139,7 +151,7 @@ export async function runSubagent(opts: RunSubagentOptions): Promise<SubagentRes
     ? opts.subagentType
     : "generalPurpose";
 
-  const schemas = filterSchemas(opts.parentSchemas, type, opts.allowedTools);
+  const schemas = filterSchemas(opts.parentSchemas, type, opts.allowedTools, opts.toolAllowlist);
   // Empty toolset → give the LLM a heads-up; don't hard-fail.
   if (!schemas.length) {
     logger.warn({ subagentId, type }, "sub-agent.no_tools_left");
@@ -210,6 +222,7 @@ export async function runSubagent(opts: RunSubagentOptions): Promise<SubagentRes
       hitl: opts.hitl,
       // Forwarded, never re-derived: these waits belong to the parent's run.
       runIdentity: opts.runIdentity,
+      toolAllowlist: opts.toolAllowlist,
     });
   } catch (err: any) {
     failed = true;

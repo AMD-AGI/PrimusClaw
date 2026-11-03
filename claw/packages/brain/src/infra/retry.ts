@@ -221,6 +221,14 @@ export function isRetryable(err: unknown): boolean {
   // wrapper that made a previously-retryable contention terminal would be a
   // regression introduced by the tagging itself.
   if (e?.name === "SandboxAttachError" && e?.cause) return isRetryable(e.cause);
+  // A provisioning give-up (`SandboxProvisionTerminalError`) is terminal by its
+  // own contract -- re-queuing cannot fix it -- and says so by name, so it is
+  // settled here and not left to the substring matches below. Those read the
+  // message, and the message now carries text the platform wrote (why a pod was
+  // not scheduled: node names, counts, whatever it says), which can contain
+  // "503" or "nats" by chance and would turn a refused sandbox into a
+  // redelivery that provisions, and waits, all over again.
+  if (e?.name === "SandboxProvisionTerminalError") return false;
   if (e?.name === "DagHandleContendedError") return true;
   // The same redelivery for a release that never reached the table:
   // `DagHandleScanTimeoutError` (brain/src/sandbox/errors.ts), the enumeration

@@ -3,17 +3,17 @@
 
 # Use the provided base image (includes pre-built UI)
 # v1.96.2 is the floor for Auto Router v2 + classifier context windows.
-FROM ghcr.io/berriai/litellm:v1.103.2@sha256:f63fb81b831b170ec16851e23c36ac5bf52ef106b271406429524a2ed730bbfd
+FROM ghcr.io/berriai/litellm:v1.106.6@sha256:37e2dafb088a7723beb998590682957386dfc83ffea1848486f8e0e5cfac0b06
 
 WORKDIR /app
  
 # ═══ Inject custom hook files ═══
 # In the base image, litellm is pip-installed, so the import path resolves to
 # site-packages, NOT /app. We dynamically locate the real install path and copy there.
-COPY apim_key_hook.py /tmp/hooks/apim_key_hook.py
+COPY prompt_cache_hook.py /tmp/hooks/prompt_cache_hook.py
 RUN HOOKS_DIR=$(python3 -c "import litellm.proxy.hooks; import os; print(os.path.dirname(litellm.proxy.hooks.__file__))") && \
     echo "Installing hooks to: $HOOKS_DIR" && \
-    cp /tmp/hooks/apim_key_hook.py "$HOOKS_DIR/" && \
+    cp /tmp/hooks/prompt_cache_hook.py "$HOOKS_DIR/" && \
     rm -rf /tmp/hooks && \
     echo "Hook installed successfully"
  

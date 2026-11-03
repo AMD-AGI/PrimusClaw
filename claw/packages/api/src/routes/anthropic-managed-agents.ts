@@ -31,7 +31,8 @@ import { resolveUserLlmKey } from "../llm/key-source.js";
 import { RUN_DOORBELL_DISPATCH } from "../config.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
 import { applySessionGateTransition, stopSessionRuns } from "../tasks/chat-run.js";
-import { loadUserEnvSnapshot } from "../crypto/user-env.js";
+import { actingTurnRefusal } from "../github-review/acting-turns.js";
+import { loadUserEnvForSession } from "../github-review/session-tools.js";
 import {
   createSessionSubscriptionReady, sanitizeSessionEvent, type SessionSubscription,
 } from "../events/store.js";
@@ -1228,7 +1229,8 @@ async function gateUserMessageTurn(
       await client.query("ROLLBACK");
       return { kind: "missing" };
     }
-    const userEnv = await loadUserEnvSnapshot(client, userId, logger);
+    // None for a session that acts as a user (see `loadUserEnvForSession`).
+    const userEnv = await loadUserEnvForSession(client, userId, sessionId, logger);
     if (locked.rows[0].agent_status === "running") {
       const secrets = pendingSecretColumns({
         llmKey: resolveUserLlmKey(user) || "",
@@ -1369,6 +1371,9 @@ function registerAnthropicEventRoutes(app: FastifyInstance): void {
     if (!sessionRow || sessionRow.user_id !== userId) {
       return sendError(reply, 404, "not_found_error", "session not found");
     }
+    // A turn in a session that acts as a user is the person's say (github-review/acting-turns.ts), whichever route it comes in by.
+    const unattended = actingTurnRefusal(req, asJsonObject(sessionRow.config)?.acting_as);
+    if (unattended) return sendError(reply, 403, "permission_error", unattended);
     const { pluginId, workspaceId, mcpServers, resources, sessionEnv, mcpToolPrefixes: existingMcpPrefixes } = readPrimusClawConfig(sessionRow.config);
 
     // Resolve+persist real MCP server name prefixes once per session (design

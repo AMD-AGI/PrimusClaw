@@ -21,6 +21,23 @@
 {{- default (printf "%s-pguser-%s" .Values.postgres.clusterName .Values.postgres.appUser) .Values.postgres.userSecretName -}}
 {{- end -}}
 
+{{- /*
+The directory the chart itself mounts a volume at in a container, read from
+mount-paths.json ({container: {volume name: directory}}). That file is the only
+place these paths are written: the Deployments take them from here, and
+claw/deploy/extra-values.py refuses an EXTRA_*_MOUNTS_* entry at any of them
+(a container cannot have two mounts at one path), so the two cannot drift.
+
+Call as: include "primus-claw.mountPath" (list . "api" "extra-ca")
+*/ -}}
+{{- define "primus-claw.mountPath" -}}
+{{- $root := index . 0 -}}
+{{- $container := index . 1 -}}
+{{- $volume := index . 2 -}}
+{{- $all := $root.Files.Get "mount-paths.json" | fromJson -}}
+{{- required (printf "mount-paths.json has no %s.%s" $container $volume) (index (index $all $container | default dict) $volume) -}}
+{{- end -}}
+
 {{- define "primus-claw.labels" -}}
 app: primus-claw
 app.kubernetes.io/name: {{ include "primus-claw.name" . }}
@@ -112,7 +129,8 @@ Deployment only (Brain authenticates nobody with it). Renders nothing while
 identity.tokenAuth.enabled is false, so the default chart is byte-for-byte what it
 was. The token is verified by the identity client, so it also needs identity.enabled:
 asking for one without the other is refused here rather than rendered as a switch
-that quietly does nothing.
+that quietly does nothing. identity.tokenAuth.trustedRoles (empty by default) names the
+platform roles a token the provider confirms may confer; it renders only when it is not empty.
 */ -}}
 {{- define "primus-claw.identityTokenEnv" -}}
 {{- $i := .Values.identity | default dict -}}
@@ -125,9 +143,15 @@ that quietly does nothing.
   value: "true"
 {{- include "primus-claw.identityOptionalEnv" (dict "name" "CLAW_IDENTITY_TOKEN_AUDIENCE" "value" $t.audience) }}
 {{- include "primus-claw.identityOptionalEnv" (dict "name" "CLAW_IDENTITY_TOKEN_SCOPE" "value" $t.scope) }}
+{{- include "primus-claw.identityOptionalEnv" (dict "name" "CLAW_IDENTITY_TOKEN_DELEGATION_AUDIENCE" "value" $t.delegationAudience) }}
+{{- include "primus-claw.identityOptionalEnv" (dict "name" "CLAW_IDENTITY_TOKEN_DELEGATION_SCOPE" "value" $t.delegationScope) }}
 {{- if $t.introspect }}
 - name: CLAW_IDENTITY_TOKEN_INTROSPECT
   value: "true"
+{{- end }}
+{{- with $t.trustedRoles }}
+- name: CLAW_IDENTITY_TOKEN_TRUSTED_ROLES
+  value: {{ join "," . | quote }}
 {{- end }}
 {{- end }}
 {{- end -}}

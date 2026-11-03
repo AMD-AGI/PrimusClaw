@@ -197,6 +197,22 @@ func (s *Service) EndSandbox(ctx context.Context, grantID, sandboxID, reason str
 // from now, and the sandbox still cannot run longer than MaxSandboxSeconds
 // from the time it started.
 func (s *Service) SetSandboxTimeout(ctx context.Context, grantID, role, sandboxID string, timeoutSec int64) error {
+	return s.setSandboxTimeout(ctx, grantID, sandboxID, timeoutSec, func(ref runtimev1alpha1.GrantSandboxRef) bool {
+		return ref.Role == role
+	}, func(g *runtimev1alpha1.SandboxGrant) int64 { return g.Spec.MaxSandboxSeconds })
+}
+
+// SetSandboxTimeoutAs replaces the lifetime of a sandbox in any role.
+// maxSec bounds the lifetime from the sandbox start instead of the grant cap.
+func (s *Service) SetSandboxTimeoutAs(ctx context.Context, grantID, sandboxID string, timeoutSec, maxSec int64) error {
+	return s.setSandboxTimeout(ctx, grantID, sandboxID, timeoutSec, func(runtimev1alpha1.GrantSandboxRef) bool {
+		return true
+	}, func(*runtimev1alpha1.SandboxGrant) int64 { return maxSec })
+}
+
+// setSandboxTimeout updates the first live sandbox that match accepts.
+func (s *Service) setSandboxTimeout(ctx context.Context, grantID, sandboxID string, timeoutSec int64,
+	match func(runtimev1alpha1.GrantSandboxRef) bool, capOf func(*runtimev1alpha1.SandboxGrant) int64) error {
 	if timeoutSec <= 0 {
 		return opErr(http.StatusBadRequest, "invalid_sandbox", "timeout must be > 0")
 	}
@@ -204,16 +220,17 @@ func (s *Service) SetSandboxTimeout(ctx context.Context, grantID, role, sandboxI
 		if err := usable(g, s.now()); err != nil {
 			return err
 		}
+		maxSec := capOf(g)
 		for i, ref := range g.Status.Sandboxes {
-			if ref.ID != sandboxID || ref.Role != role {
+			if ref.ID != sandboxID || !match(ref) {
 				continue
 			}
 			if ref.State == runtimev1alpha1.SandboxEnded {
 				return opErr(http.StatusNotFound, "sandbox_not_found", sandboxID)
 			}
-			if g.Spec.MaxSandboxSeconds > 0 && !timeoutWithinLifetime(ref.StartedAt.Time, s.now(), timeoutSec, g.Spec.MaxSandboxSeconds) {
+			if maxSec > 0 && !timeoutWithinLifetime(ref.StartedAt.Time, s.now(), timeoutSec, maxSec) {
 				return opErr(http.StatusForbidden, "timeout_not_allowed",
-					fmtDetail("%d > %d", timeoutSec, g.Spec.MaxSandboxSeconds))
+					fmtDetail("%d > %d", timeoutSec, maxSec))
 			}
 			ref.TimeoutSec = timeoutSec
 			g.Status.Sandboxes[i] = ref
@@ -257,6 +274,44 @@ func (s *Service) SandboxByID(ctx context.Context, sandboxID string) (runtimev1a
 		}
 	}
 	return runtimev1alpha1.GrantSandboxRef{}, false, nil
+}
+
+// OwnedSandbox is a sandbox ref with the grant and owner it is charged to.
+// MaxSandboxSeconds is the lifetime cap of that grant; zero is unlimited.
+type OwnedSandbox struct {
+	GrantID           string
+	UserID            string
+	MaxSandboxSeconds int64
+	Ref               runtimev1alpha1.GrantSandboxRef
+}
+
+// FindSandbox returns the sandbox and its grant from any grant.
+func (s *Service) FindSandbox(ctx context.Context, sandboxID string) (OwnedSandbox, error) {
+	all, err := s.ListAllSandboxes(ctx)
+	if err != nil {
+		return OwnedSandbox{}, err
+	}
+	for _, sb := range all {
+		if sb.Ref.ID == sandboxID {
+			return sb, nil
+		}
+	}
+	return OwnedSandbox{}, opErr(http.StatusNotFound, "sandbox_not_found", sandboxID)
+}
+
+// ListAllSandboxes returns the sandboxes recorded on every grant.
+func (s *Service) ListAllSandboxes(ctx context.Context) ([]OwnedSandbox, error) {
+	grants, err := s.list(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []OwnedSandbox
+	for i := range grants {
+		for _, ref := range grants[i].Status.Sandboxes {
+			out = append(out, OwnedSandbox{GrantID: grants[i].Name, UserID: grants[i].Spec.Owner.UserID, MaxSandboxSeconds: grants[i].Spec.MaxSandboxSeconds, Ref: ref})
+		}
+	}
+	return out, nil
 }
 
 // Sandbox returns one sandbox when it belongs to the role. Other roles are not found.
@@ -342,14 +397,19 @@ func tokenHashMatches(ref runtimev1alpha1.GrantSandboxRef, want string) bool {
 	return matched == 1
 }
 
-// AuditDenied records a create that the grant refused.
-func (s *Service) AuditDenied(ctx context.Context, grantID, sandboxID string) {
+// AuditDenied records a create that the grant refused, with the reason and detail of cause.
+func (s *Service) AuditDenied(ctx context.Context, grantID, sandboxID string, cause error) {
 	userID, userName, sessionID, appRunID := "", "", "", ""
 	if g, err := s.get(ctx, grantID); err == nil {
 		userID, userName = g.Spec.Owner.UserID, g.Spec.Owner.UserName
 		sessionID, appRunID = g.Spec.Issuer.SessionID, g.Spec.Issuer.AppRunID
 	}
-	s.audit(ctx, audit.EventSandboxDenied, grantID, sessionID, appRunID, userID, userName, sandboxID)
+	reason, detail := "", ""
+	var oe *OpError
+	if errors.As(cause, &oe) {
+		reason, detail = oe.Reason, oe.Detail
+	}
+	s.auditReason(ctx, audit.EventSandboxDenied, grantID, sessionID, appRunID, userID, userName, sandboxID, reason, detail)
 }
 
 func beginOne(g *runtimev1alpha1.SandboxGrant, req BeginRequest, now time.Time) error {
@@ -384,19 +444,10 @@ func beginOne(g *runtimev1alpha1.SandboxGrant, req BeginRequest, now time.Time) 
 		return opErr(http.StatusForbidden, "timeout_not_allowed",
 			fmtDetail("%d > %d", req.TimeoutSec, g.Spec.MaxSandboxSeconds))
 	}
+	if err := checkQuota(g, req.Role, limit, req.GPUs); err != nil {
+		return err
+	}
 	usage := g.Status.Usage[req.Role]
-	if limit.MaxSandboxes >= 0 && usage.Sandboxes+1 > limit.MaxSandboxes {
-		return opErr(http.StatusTooManyRequests, "grant_quota_exceeded",
-			fmtDetail("%s %d/%d sandboxes", req.Role, usage.Sandboxes, limit.MaxSandboxes))
-	}
-	if limit.MaxGPUs >= 0 && usage.GPUs+req.GPUs > limit.MaxGPUs {
-		return opErr(http.StatusTooManyRequests, "grant_quota_exceeded",
-			fmtDetail("%s %d/%d gpus", req.Role, usage.GPUs, limit.MaxGPUs))
-	}
-	if overBudget(g) {
-		return opErr(http.StatusTooManyRequests, "grant_quota_exceeded",
-			fmtDetail("%s gpu hours", g.Name))
-	}
 	if g.Status.Usage == nil {
 		g.Status.Usage = map[string]runtimev1alpha1.GrantRoleUsage{}
 	}

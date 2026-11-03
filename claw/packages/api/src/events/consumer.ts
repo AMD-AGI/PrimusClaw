@@ -23,7 +23,12 @@ import {
 import { appEventIdentity } from "./app-events.js";
 import { enqueueEvolutionJob } from "../marketplace/evolve-worker.js";
 import { callMemoryLLM } from "../llm/client.js";
-import { CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
+import { CLAW_ASSISTANT_ENABLED, CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
+import { skipsSkillSelection } from "../assistant/role-profile.js";
+import { deliverUnsaidAnswer } from "../assistant/router-turn-end.js";
+import { recordWorkerTurnEnd } from "../assistant/turn-end.js";
+import { a2aPushEnabled } from "../routes/a2a-flags.js";
+import { recordSessionEvent as recordA2aPushEvent } from "../routes/a2a-push.js";
 import { recordApprovalRequested, recordRunFinished } from "../notifications/outbox.js";
 import {
   markChatRunRunning, closeChatRun, gateOwnershipEnforced, queuedMessageId,
@@ -497,6 +502,18 @@ export async function consumeEventDelivery(msg: {
       }
     }
 
+    // After the event is stored and, for a completion, processed: the run row a
+    // finished task's notification reports is closed by now. Best-effort, like
+    // the run notifications: a notification not recorded is not worth failing
+    // an event over, and the event is acked whatever happens here.
+    if (a2aPushEnabled()) {
+      try {
+        await recordA2aPushEvent(sessionId, event, rowId);
+      } catch (err) {
+        logger.error({ err, sessionId, type: event.type }, "a2a_push.record_failed");
+      }
+    }
+
     msg.ack();
 }
 
@@ -801,6 +818,8 @@ export const completionPorts = {
   maybeRecordTaskPattern,
   enqueueEvolutionJob,
   recordRunFinished,
+  recordWorkerTurnEnd,
+  deliverUnsaidAnswer,
 };
 
 async function handleComplete(
@@ -1185,6 +1204,39 @@ async function handleComplete(
     }
   }
 
+  // 9. A worker's turn that ended without telling the assistant anything it must act on becomes a report
+  //    of its own (ready, or failed), so an accepted item is never one that just stopped. Best-effort here
+  //    and not allowed to be the only line: the assistant sweep records a run whose end this lost.
+  if (CLAW_ASSISTANT_ENABLED && !interrupted && endedRunIds.length) {
+    try {
+      await completionPorts.recordWorkerTurnEnd({
+        sessionId,
+        runIds: endedRunIds,
+        failed: Boolean(failed),
+        interrupted: Boolean(interrupted),
+        finalText: typeof (event as any).final_text === "string" ? (event as any).final_text : undefined,
+        failureReason: failed ? String(failure_reason ?? "agent_error") : undefined,
+      });
+    } catch (err) {
+      logger.error({ err, sessionId }, "assistant.turn_end_failed");
+    }
+    // 9b. A router turn that answered the user in plain text and said nothing: the text is what it meant to say.
+    //     Best-effort: a turn whose words were lost here is a user who heard nothing, which the model could have
+    //     caused on its own, so this is a repair and not a promise.
+    try {
+      await completionPorts.deliverUnsaidAnswer({
+        sessionId,
+        runIds: endedRunIds,
+        failed: Boolean(failed),
+        interrupted: Boolean(interrupted),
+        fromSweeper: (event as any).completion_source === "sweeper",
+        finalText: typeof (event as any).final_text === "string" ? (event as any).final_text : undefined,
+      });
+    } catch (err) {
+      logger.error({ err, sessionId }, "assistant.unsaid_answer_failed");
+    }
+  }
+
   logger.info({ sessionId, failed, userId }, "exec_complete.handled");
 }
 
@@ -1232,6 +1284,7 @@ function resolvePendingRequestShape(
  * "no skills were resolved" mean different things downstream.
  */
 async function pendingSkillBundle(
+  sessionId: string,
   userId: string,
   content: string,
 ): Promise<Record<string, {
@@ -1240,7 +1293,8 @@ async function pendingSkillBundle(
 }> | undefined> {
 let pendingSkills: Record<string, { content: string; enabled: boolean; version?: number; description?: string; files?: Array<{ path: string; content: string; is_binary?: boolean }> }> | undefined;
 try {
-  const activeSkills = await selectSkillsForTask(userId, content);
+  // A router turn has no use for skills, and selecting them can cost an LLM call (see sessions/dispatch.ts).
+  const activeSkills = await skipsSkillSelection(sessionId) ? {} : await selectSkillsForTask(userId, content);
   pendingSkills = {};
   for (const [name, bundle] of Object.entries(activeSkills)) {
     pendingSkills[name] = {
@@ -1285,7 +1339,7 @@ if (pending) {
   const pendingUserId = pending.user_id || userId;
   const history = await buildMessages(sessionId, pending.content, pendingUserId);
 
-  const pendingSkills = await pendingSkillBundle(pendingUserId, pending.content || "");
+  const pendingSkills = await pendingSkillBundle(sessionId, pendingUserId, pending.content || "");
   const rawTools = pending.tool_ids;
   const toolIds: number[] = Array.isArray(rawTools)
     ? rawTools.map((x) => Number(x)).filter((n) => Number.isFinite(n))

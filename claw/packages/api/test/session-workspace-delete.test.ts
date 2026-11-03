@@ -325,17 +325,27 @@ test("a walk that runs out of budget says so instead of reporting an empty prefi
   assert.deepEqual(s3.listed, [], "a walk past its deadline does not start one more listing");
 });
 
-test("the budget is honoured inside a page, not only between prefixes", async () => {
+test("the budget is honoured inside a page, not only between prefixes", async (t) => {
   // A thousand-key page deleted unconditionally is how an inline request spends
   // minutes after its budget, overlapping the sweeper that thought it owned the
   // rest. Stopping at a delete-batch boundary is still resumable: the next
   // attempt lists from the start and the keys already gone are not returned.
+  //
+  // The deadline is an epoch time, so the clock here is the test's own. A real
+  // few-millisecond budget is spent by a runner that deschedules this process
+  // between computing the deadline and starting the first batch, and the walk
+  // then stops at its first check having deleted nothing: the property pinned
+  // is "a batch that started finishes, the next one does not", which no amount
+  // of waiting can establish and no amount of starvation can break.
+  let now = 1_700_000_000_000;
+  t.mock.method(Date, "now", () => now);
   const keys = Array.from({ length: 40 }, (_, i) => `users/u-1/sessions/sess-abc/f${i}`);
-  const s3 = stubS3(keys, undefined, async () => {
-    await new Promise((r) => setTimeout(r, 50));
-  });
+  // Deleting is what spends the budget: the first delete of the first batch
+  // moves the clock past the deadline, and every other delete of that batch is
+  // already in flight.
+  const s3 = stubS3(keys, undefined, async () => { now += 10; });
 
-  const outcome = await deleteSessionWorkspaceObjects("u-1", "sess-abc", Date.now() + 5);
+  const outcome = await deleteSessionWorkspaceObjects("u-1", "sess-abc", now + 5);
 
   assert.equal(outcome.deleted, 16, "one batch starts before the clock is checked again");
   assert.equal(outcome.complete, false);

@@ -76,7 +76,7 @@ import {
   bindTaskLockKv, lockContentionNakMs, lockExpiresBetweenRenewals,
 } from "./tasks/lock.js";
 import { bindTaskRunnerDeps } from "./tasks/runner.js";
-import { handleTask, bindTaskDispatchKv, inflightTasks, handleClaimedRequest } from "./tasks/dispatch.js";
+import { handleTask, bindTaskDispatchKv, inflightTasks, handleClaimedRequest, isFinishOnlyDelivery } from "./tasks/dispatch.js";
 import { claimNextRun } from "./clients/run-claim.js";
 import { flushPendingRetries } from "./delivery/doorbell-delivery.js";
 import { claimNextEnabled, startClaimNextLoop } from "./delivery/claim-next-loop.js";
@@ -598,6 +598,7 @@ async function startTaskDelivery(jsm: JetStreamManager): Promise<DeliveryResiden
         return false;
       }
     },
+    isFinishOnly: isFinishOnlyDelivery,
     // A fat chat delivery holds a durable SQL lease before it queues for a
     // slot, so a Stop reaches it through the row while nothing else can.
     fatPreGate: createFatPreGate({ emit: (sessionId, evt) => emitter.emit(sessionId, evt) }),

@@ -175,19 +175,23 @@ spec:
         {{- end }}
         {{- if .Values.grantSigningKey.enabled }}
         - name: GRANT_SIGNING_KEY_FILE
-          value: /var/run/claw/grant/signing-key.pem
+          value: {{ include "primus-claw.mountPath" (list . "api" "grant-signing-key") }}/signing-key.pem
         - name: AGENT_SANDBOX_GRANT_URL
           value: {{ .Values.grantSigningKey.url | quote }}
         {{- end }}
         {{- if .Values.tls.extraCACertsConfigMap }}
         - name: NODE_EXTRA_CA_CERTS
-          value: /etc/claw-ca/ca.crt
+          value: {{ include "primus-claw.mountPath" (list . "api" "extra-ca") }}/ca.crt
         {{- end }}
         {{- with (include "primus-claw.identityEnv" .) }}
         {{- . | nindent 8 }}
         {{- end }}
         {{- with (include "primus-claw.identityTokenEnv" .) }}
         {{- . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.api.requiredPlatformRoles }}
+        - name: CLAW_REQUIRED_PLATFORM_ROLES
+          value: {{ join "," . | quote }}
         {{- end }}
         {{- with .Values.api.extraEnv }}
         {{- toYaml . | nindent 8 }}
@@ -204,12 +208,12 @@ spec:
         volumeMounts:
         {{- if .Values.tls.extraCACertsConfigMap }}
         - name: extra-ca
-          mountPath: /etc/claw-ca
+          mountPath: {{ include "primus-claw.mountPath" (list . "api" "extra-ca") }}
           readOnly: true
         {{- end }}
         {{- if .Values.grantSigningKey.enabled }}
         - name: grant-signing-key
-          mountPath: /var/run/claw/grant
+          mountPath: {{ include "primus-claw.mountPath" (list . "api" "grant-signing-key") }}
           readOnly: true
         {{- end }}
         {{- with .Values.api.extraVolumeMounts }}
