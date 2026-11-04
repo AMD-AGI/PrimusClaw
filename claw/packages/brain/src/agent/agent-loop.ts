@@ -1052,7 +1052,7 @@ class AgentLoopRunner {
     };
   }
 
-  /** A sub-agent's one text-only reply after its last allowed turn ended in tool calls (see TURN_CAP_NOTICE). */
+  /** A sub-agent's one text-only reply after its last allowed turn ended without an answer (see TURN_CAP_NOTICE). */
   private async reportAtTurnCap(turn: number): Promise<void> {
     this.workingMessages.push({ role: "user", content: TURN_CAP_NOTICE });
     const { content, usage } = await this.streamTurnWithRetry(turn, Date.now());
