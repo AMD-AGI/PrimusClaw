@@ -151,7 +151,7 @@ test("S3 every regular expression literal in the module costs under the bound on
         if (isSlow(grew[0]!)) grew.push(growth(r.source, r.flags, line, MAX_LINE_CHARS));
         if (grew.every(isSlow)) {
           const g = grew[grew.length - 1]!;
-          slow.push(`${f}:${r.line} /${r.source}/ ${g.ms.toFixed(2)} ms on ${line.what}, ${g.ratio.toFixed(1)} times as long as at a quarter of the length (${g.excessMs.toFixed(2)} ms more than four times)`);
+          slow.push(`${f}:${r.line} /${r.source}/ ${g.ms.toFixed(2)} ms on ${line.what}, ${g.ratio.toFixed(1)} times as long as at a quarter of the length (${g.excessMs.toFixed(2)} ms of it super-linear)`);
           break;
         }
       }
