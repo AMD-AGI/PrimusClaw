@@ -16,7 +16,7 @@ process.env.HITL_ENABLED = "true";
 // Short, so a call that is wrongly held fails this suite in seconds rather than after the default wait.
 process.env.HITL_DECISION_TIMEOUT_MS = "2000";
 
-import { TRIGGER_MCP_PATH, TRIGGER_MCP_SERVER } from "@claw/protocol";
+import { GITHUB_MCP_PATH, GITHUB_MCP_SERVER, TRIGGER_MCP_PATH, TRIGGER_MCP_SERVER } from "@claw/protocol";
 import { startWorld, fakeHands, baseRequest } from "./support/platform-defaults-world.js";
 import { startPluginWorld, uniqueSession } from "./support/plugin-world.js";
 import { fakeNats } from "./support/fake-nats.js";
@@ -30,12 +30,16 @@ test.after(async () => { await world.close(); await pw.close(); });
 /** The server entry `applyTriggerToolsToTask` adds, at the API's path on the stub MCP server (it answers any path). */
 const triggerUrl = `${new URL(pw.mcpUrl).origin}${TRIGGER_MCP_PATH}`;
 const triggerServer = { type: "http", url: triggerUrl, token: "t", requires_approval: ["trigger_create", "trigger_cancel"] };
+/** The server entry `githubMcpServers` adds: every tool held, its reads released (the stub's `ping` stands in for one). */
+const githubServer = {
+  type: "http", url: `${new URL(pw.mcpUrl).origin}${GITHUB_MCP_PATH}`, token: "t", requires_approval: true, auto_approve: ["ping"],
+};
 const operatorPlugin = (name: string) => ({
   id: 17, type: "mcp", name,
   config: { mcpServers: { [name]: { type: "http", url: pw.mcpUrl, token: "t", requires_approval: ["stop"] } } },
 });
 
-async function run(tool: string, opts: { operatorPolicy?: string; trigger?: boolean; decision?: string } = {}) {
+async function run(tool: string, opts: { operatorPolicy?: string; trigger?: boolean; github?: boolean; decision?: string } = {}) {
   world.script([{ tool, input: {} }, { text: "done" }]);
   world.llmBodies.length = 0;
   const nats = fakeNats();
@@ -51,7 +55,10 @@ async function run(tool: string, opts: { operatorPolicy?: string; trigger?: bool
   await new AgentEngine().execute(
     baseRequest({
       session_id: uniqueSession(),
-      ...(opts.trigger === false ? {} : { mcp_servers: { [TRIGGER_MCP_SERVER]: triggerServer } }),
+      mcp_servers: {
+        ...(opts.trigger === false ? {} : { [TRIGGER_MCP_SERVER]: triggerServer }),
+        ...(opts.github ? { [GITHUB_MCP_SERVER]: githubServer } : {}),
+      },
       ...(opts.operatorPolicy ? { plugin_id: 5, plugin_tools: [operatorPlugin(opts.operatorPolicy)] } : {}),
     }),
     onEvent as never, undefined, null as never,
@@ -95,5 +102,26 @@ test("an operator's own policy still makes HITL_ENABLED ask about the other tool
 test("an operator's server that only shares the trigger server's name is still a policy", async () => {
   const r = await run(`mcp__${TRIGGER_MCP_SERVER}__ping`, { operatorPolicy: TRIGGER_MCP_SERVER, trigger: false, decision: "allow" });
   assert.deepEqual(r.asked, [`mcp__${TRIGGER_MCP_SERVER}__ping`], "known by name and path, not by name alone");
+  assert.equal(r.ran, 1);
+});
+
+test("with the GitHub tools on, a tool they do not hold runs without asking anyone", async () => {
+  const r = await run(`mcp__${TRIGGER_MCP_SERVER}__ping`, { github: true });
+  assert.deepEqual(r.asked, [], "the GitHub server's hold is the platform's: it holds its own tools only");
+  assert.equal(r.ran, 1);
+});
+
+test("a GitHub write is still held for the user, and a released read runs", async () => {
+  const w = await run(`mcp__${GITHUB_MCP_SERVER}__issue_comment`, { github: true, decision: "deny" });
+  assert.deepEqual(w.asked, [`mcp__${GITHUB_MCP_SERVER}__issue_comment`]);
+  assert.equal(w.ran, 0);
+  const r = await run(`mcp__${GITHUB_MCP_SERVER}__ping`, { github: true });
+  assert.deepEqual(r.asked, []);
+  assert.equal(r.ran, 1);
+});
+
+test("an operator's server named github at another path is still a policy", async () => {
+  const r = await run(`mcp__${TRIGGER_MCP_SERVER}__ping`, { operatorPolicy: GITHUB_MCP_SERVER, decision: "allow" });
+  assert.deepEqual(r.asked, [`mcp__${TRIGGER_MCP_SERVER}__ping`]);
   assert.equal(r.ran, 1);
 });

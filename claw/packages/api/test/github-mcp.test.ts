@@ -26,6 +26,8 @@ const { githubMcpServers, registerGithubMcpRoutes } = await import("../src/githu
 const { READ_TOOLS, MAX_LOG_BYTES } = await import("../src/github-mcp/tools.js");
 const { mintSessionToolToken, verifySessionToolToken } = await import("../src/github-review/token.js");
 const { approvalPolicyFromMcp } = await import("../../brain/src/agent/approval-policy.js");
+const { readGithubMcpSettings } = await import("../src/github-mcp/settings.js");
+const { isPlatformMcpServer } = await import("@claw/protocol");
 initUserEnvCrypto();
 
 const SECRET = "g".repeat(40);
@@ -247,6 +249,13 @@ describe("C the entry a turn is given", () => {
     for (const t of [...READ_TOOLS, ...WRITE_TOOLS]) assert.equal(policy.requiresApproval(`mcp__github__${t}`), true, t);
     for (const t of READ_TOOLS) assert.notEqual(policy.autoApprovalRule(`mcp__github__${t}`, {}), null, t);
     for (const t of [...WRITE_TOOLS, "a_tool_added_later"]) assert.equal(policy.autoApprovalRule(`mcp__github__${t}`, {}), null, t);
+    // The platform's hold, like the trigger tools': it does not make HITL_ENABLED ask about every other call of the turn.
+    assert.equal(policy.operatorActive, false);
+  });
+
+  test("C1b the default address is one Brain knows as the platform's GitHub server", () => {
+    const { mcpUrl } = readGithubMcpSettings({ CLAW_GITHUB_MCP_ENABLED: "true", INTERNAL_BACKEND_URL: "http://claw-api:3000" });
+    assert.equal(isPlatformMcpServer("github", { url: mcpUrl }), true, mcpUrl);
   });
 
   test("C2 nothing for an owner without a token, a session acting as someone else, or the feature off", async () => {

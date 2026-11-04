@@ -10,9 +10,10 @@
  *   CLAW_GITHUB_API_URL      shared with GitHub review, default https://api.github.com
  */
 import { CLAW_GITHUB_MCP_ENABLED } from "../config.js";
+import { GITHUB_MCP_PATH } from "@claw/protocol";
 import { MIN_MCP_SECRET_LENGTH } from "../github-review/settings.js";
 
-export const GITHUB_MCP_PATH = "/v1/internal/github/mcp";
+export { GITHUB_MCP_PATH };
 /** The variable of the owner's env vault that holds their GitHub token: the one the sandbox's `gh` and `git` use. */
 export const GITHUB_TOKEN_ENV_NAME = "GH_TOKEN";
 /** A turn's token outlives any turn; the session row is checked again on every call. */

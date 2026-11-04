@@ -22,6 +22,7 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import pino from "pino";
+import { GITHUB_MCP_SERVER } from "@claw/protocol";
 import { decryptUserEnvValue } from "../crypto/user-env.js";
 import { db as defaultDb } from "../infra/db.js";
 import { actingUserOf } from "../github-review/acting-as.js";
@@ -36,7 +37,7 @@ import { buildGithubToolServer, READ_TOOLS } from "./tools.js";
 
 const logger = pino({ name: "github-mcp" });
 
-export const GITHUB_MCP_SERVER_NAME = "github";
+export const GITHUB_MCP_SERVER_NAME = GITHUB_MCP_SERVER;
 const PURPOSE = "claw-github-mcp" as const;
 
 type McpServers = Record<string, Record<string, unknown>>;
