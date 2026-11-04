@@ -130,9 +130,15 @@ export function repoGrounded(text: string, pr: Pick<PrRef, "owner" | "repo">, ch
   return whole(full, "a-z0-9_.-") || whole(lower(pr.repo), "a-z0-9_./-");
 }
 
-/** Whether the text points at a work item by its number: `#12`, not `#123`, and not `repo#12` (a pull request). */
+/**
+ * Whether the text points at a work item by its number: `#12`, not `#123`, not `repo#12`, and not `PR #12` or
+ * `pull request #12` (a pull request, whatever item has that number).
+ */
 export function mentionsItem(text: string, seq: number): boolean {
-  return new RegExp(`(?<![A-Za-z0-9_.-])#${seq}(?![0-9])`).test(text);
+  for (const m of text.matchAll(new RegExp(`(?<![A-Za-z0-9_.-])#${seq}(?![0-9])`, "g"))) {
+    if (!/(?:\bprs?|\bpull(?:\s+request)?|拉取请求|合并请求)[\s:：]*$/i.test(text.slice(0, m.index))) return true;
+  }
+  return false;
 }
 
 /**
@@ -262,7 +268,9 @@ function pointsAtReview(message: TurnMessage, reviews: ReviewRow[], item: Review
   const sharing = reviews.filter((r) => Number(r.params?.pr?.number) === number).length;
   const byNumber = !!pr && prGrounded(message.content, pr)
     && (sharing === 1 || repoGrounded(message.content, pr, message.context.repos, []));
-  return byNumber || mentionsItem(message.content, item.seq) || reviews.length === 1;
+  // `#N` where N is also the number of a pull request under review is that pull request, not item #N.
+  const bySeq = mentionsItem(message.content, item.seq) && !reviews.some((r) => Number(r.params?.pr?.number) === item.seq);
+  return byNumber || bySeq || reviews.length === 1;
 }
 
 /**

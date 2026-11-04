@@ -32,6 +32,7 @@
  *   X1  channel_action emits the listed action once, to the channel that carried the message
  *   W1  work_send refuses a review item; work_stop stops one only in a turn that answers the person
  *   W2  work_stop stops only the review the person's message points at
+ *   W3  a pull request written with # is that pull request, never the item that happens to have its number
  *   P1  a user's message stops the router turn that is reading a report, and never one that answers them
  *   F1  a turn that answered the user and failed says so once, in their language; a report's turn does not
  *   T1  the tools exist only with CLAW_ASSISTANT_TOOLS on
@@ -558,6 +559,26 @@ describe("assistant review tools", { skip }, () => {
     await w.closeRun(byNumber.task_id);
     const bySeq = await userTurn(alice, "#1 停掉");
     assert.equal((await w.mod.tools.workStop(bySeq, { item_id: r254, reason: "user said stop" })).outcome, "stopped");
+  });
+
+  test("W3 a pull request written with # is that pull request, never the item that happens to have its number", async () => {
+    const item12 = await reviewItem(alice, 12, { owner: "AMD-AGI", repo: "PrimusClaw", number: 500 });
+    await reviewItem(alice, 13, { owner: "AMD-AGI", repo: "PrimusClaw", number: 501 });
+    for (const text of ["stop PR #12", "停 PR #12", "pull request #12 停掉", "stop pull #12"]) {
+      const turn = await userTurn(alice, text);
+      assert.equal(await code(w.mod.tools.workStop(turn, { item_id: item12, reason: "user said stop" })), "item_not_in_message", text);
+      assert.equal(await code(rt.reviewRestart(turn, { item_id: item12, model: "claude-opus-4-8" })), "item_not_in_message", text);
+      await w.closeRun(turn.task_id);
+    }
+    // With a review of pull request 12 too, a bare #12 is that pull request.
+    const pr12 = await reviewItem(alice, 14, { owner: "AMD-AGI", repo: "PrimusClaw", number: 12 });
+    const bare = await userTurn(alice, "#12 停掉");
+    assert.equal(await code(w.mod.tools.workStop(bare, { item_id: item12, reason: "user said stop" })), "item_not_in_message");
+    assert.equal((await w.item(item12)).board_state, "in_progress");
+    assert.equal((await w.mod.tools.workStop(bare, { item_id: pr12, reason: "user said stop" })).outcome, "stopped");
+    await w.closeRun(bare.task_id);
+    assert.equal(calls.restart.length, 0);
+    assert.equal(rt.mentionsItem("PR #5 and #12", 12), true, "an item number beside a pull request is still the item");
   });
 
   test("P1 a user's message stops the router turn reading a report, and never one that answers them", async () => {
