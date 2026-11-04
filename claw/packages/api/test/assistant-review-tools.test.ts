@@ -15,7 +15,6 @@
  *   I2  the message route takes who stands behind a message from how it was authenticated, never from the body
  *   A1  a turn that answers no signed-in message cannot act: a report's turn, a key's message, an injected report
  *   A2  the person's say goes stale after CLAW_ASSISTANT_ATTENDED_TTL_SEC
- *   A3  a turn that has ended cannot act through a stand-in's guard either
  *   S1  review_start hands across exactly what the user asked: prs, review only or merge, reviewer, model, who and which message
  *   S2  a pull request must be in the user's message, as a number of its own
  *   S3  a repository must be named, the channel's own, or one of the user's recent reviews
@@ -49,24 +48,22 @@ describe("assistant review tools", { skip }, () => {
   let inbound: typeof import("../src/assistant/inbound.js");
   let saved: Record<string, unknown>;
   const calls: { start: Recorded[]; restart: Recorded[]; decide: Recorded[] } = { start: [], restart: [], decide: [] };
-  let startAnswer: (input: Recorded) => Promise<unknown>;
+  let startAnswer: (request: Recorded) => Promise<unknown>;
 
   before(async () => {
     w = await startWorld({
-      CLAW_ASSISTANT_TOOLS: "on", CLAW_GITHUB_REVIEW_ENABLED: "true", CLAW_ASSISTANT_ATTENDED_TTL_SEC: "600",
+      CLAW_ASSISTANT_TOOLS: "on", CLAW_GITHUB_REVIEW_ENABLED: "true", CLAW_ASSISTANT_REVIEW_ITEMS: "true", CLAW_ASSISTANT_ATTENDED_TTL_SEC: "600",
     });
     rt = await import("../src/assistant/review-tools.js");
     inbound = await import("../src/assistant/inbound.js");
     saved = { ...rt.reviewToolPorts };
-    rt.reviewToolPorts.startReviewItems = (async (input: Recorded) => {
-      calls.start.push(input);
-      if (input.guard) await w.h.app.db.inTransaction(async (q) => input.guard(q));
-      return startAnswer(input);
+    rt.reviewToolPorts.startReviews = (async (user: Recorded, method: string, request: Recorded) => {
+      calls.start.push({ user, method, request });
+      return startAnswer(request);
     }) as never;
-    rt.reviewToolPorts.restartReviewItem = (async (input: Recorded) => {
-      calls.restart.push(input);
-      if (input.guard) await w.h.app.db.inTransaction(async (q) => input.guard(q));
-      return { ok: true, data: { stopped: { item_id: input.itemId }, item: { item_id: "item_new", seq: 9 } } };
+    rt.reviewToolPorts.restartReview = (async (user: Recorded, method: string, itemId: string, change: Recorded) => {
+      calls.restart.push({ user, method, itemId, change });
+      return { stopped: { item_id: itemId, seq: 1 }, item: { item_id: "kwi_new", seq: 9 } };
     }) as never;
     rt.reviewToolPorts.decide = (async (userId: string, id: string, decision: string, via: unknown) => {
       calls.decide.push({ userId, id, decision, via });
@@ -81,9 +78,7 @@ describe("assistant review tools", { skip }, () => {
       claw_github_review_settings CASCADE`);
     w.drains.length = 0;
     calls.start.length = 0; calls.restart.length = 0; calls.decide.length = 0;
-    startAnswer = async (input) => ({
-      ok: true, data: { items: input.prs.map((p: Recorded, i: number) => ({ item_id: `item_${i}`, seq: i + 1, pr: p })) },
-    });
+    startAnswer = async (request) => request.prs.map((p: Recorded, i: number) => ({ item_id: `kwi_s${i}`, seq: i + 1, pr: p.pr }));
     alice = await w.user("alice");
     bob = await w.user("bob");
   });
@@ -98,8 +93,8 @@ describe("assistant review tools", { skip }, () => {
   ): Promise<Claims> {
     const turn = await w.routerTurn(u);
     await w.q(
-      `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content, attended_via, channel_context, received_at)
-       VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, NOW() - make_interval(secs => $7::int))`,
+      `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, user_name, content, attended_via, channel_context, received_at)
+       VALUES ($1, $2, $3, 'Alice A', $4, $5::jsonb, $6::jsonb, NOW() - make_interval(secs => $7::int))`,
       [u.routerSid, turn.mid, u.userId, content, o.via === null ? null : JSON.stringify(o.via ?? PERSON),
         JSON.stringify(inbound.parseChannelContext(o.context ?? DEFAULT_CTX)), o.agoSec ?? 0],
     );
@@ -244,26 +239,6 @@ describe("assistant review tools", { skip }, () => {
     assert.equal(calls.start.length, 1);
   });
 
-  test("A3 a turn that ended between the check and the write is refused inside the write", async () => {
-    const turn = await userTurn(alice, "审一下 254");
-    startAnswer = async () => ({ ok: true, data: { items: [] } });
-    rt.reviewToolPorts.startReviewItems = (async (input: Recorded) => {
-      calls.start.push(input);
-      await w.closeRun(turn.task_id);
-      await w.h.app.db.inTransaction(async (q) => input.guard(q));
-      return { ok: true, data: {} };
-    }) as never;
-    try {
-      assert.equal(await code(rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#254"], merge: false })), "turn_not_live");
-    } finally {
-      rt.reviewToolPorts.startReviewItems = (async (input: Recorded) => {
-        calls.start.push(input);
-        if (input.guard) await w.h.app.db.inTransaction(async (q) => input.guard(q));
-        return startAnswer(input);
-      }) as never;
-    }
-  });
-
   test("S1 review_start hands across exactly what the user asked", async () => {
     const ctx = { ...DEFAULT_CTX, people: [{ name: "Wei Lei", user_id: "u-weilei", email: "weilei@amd.com" }] };
     const turn = await userTurn(alice, "请 Wei Lei 用 opus 审 254 和 257，审完合入", { context: ctx });
@@ -272,25 +247,25 @@ describe("assistant review tools", { skip }, () => {
       reviewer: "u-weilei", model: "claude-opus-4-8",
     });
     assert.equal(calls.start.length, 1);
-    const got = calls.start[0];
-    assert.deepEqual(
-      { ...got, guard: typeof got.guard },
-      {
-        userId: alice.userId, attended: { via: null, messageId: turn.mid },
-        prs: [{ owner: "AMD-AGI", repo: "PrimusClaw", number: 254 }, { owner: "AMD-AGI", repo: "PrimusClaw", number: 257 }],
-        actingAs: "u-weilei", actingAsName: "Wei Lei", model: "claude-opus-4-8", reviewOnly: false, guard: "function",
+    assert.deepEqual(calls.start[0], {
+      // Asked as the person: their sign-in, and the credentials their own messages gave the assistant.
+      user: { userId: alice.userId, userName: "Alice A", roles: [], platformKey: `pk-${alice.userId}`, virtualKey: `vk-${alice.userId}` },
+      method: "identity_token",
+      request: {
+        prs: [{ pr: { owner: "AMD-AGI", repo: "PrimusClaw", number: 254 }, message: null }, { pr: { owner: "AMD-AGI", repo: "PrimusClaw", number: 257 }, message: null }],
+        actingAs: "u-weilei", actingAsName: "Wei Lei", model: "claude-opus-4-8", effort: undefined, reviewOnly: false,
       },
-    );
+    });
     assert.equal((out as Recorded).items.length, 2);
 
     // Review only, as the user, with a service's say recorded as the service.
     const svc = { kind: "service", client_id: "clawy", act_sub: "sub-1" };
     const turn2 = await userTurn(alice, "只审 260", { via: svc });
     await rt.reviewStart(turn2, { prs: ["AMD-AGI/PrimusClaw#260"], merge: false });
-    assert.deepEqual(calls.start[1].attended, { via: { clientId: "clawy", actorSub: "sub-1" }, messageId: turn2.mid });
-    assert.equal(calls.start[1].actingAs, alice.userId);
-    assert.equal(calls.start[1].reviewOnly, true);
-    assert.equal("model" in calls.start[1], false);
+    assert.deepEqual(calls.start[1].user.delegation, { clientId: "clawy", actorSub: "sub-1" }, "a service's say is the service's, and is checked again");
+    assert.equal(calls.start[1].request.actingAs, null, "the user themself");
+    assert.equal(calls.start[1].request.reviewOnly, true);
+    assert.equal(calls.start[1].request.model, undefined);
   });
 
   test("S2 a pull request must be in the user's message, as a number of its own", async () => {
@@ -329,7 +304,7 @@ describe("assistant review tools", { skip }, () => {
     assert.equal(await code(rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#254"], merge: false, reviewer: "u-yihan" })), "reviewer_not_in_message");
     assert.equal(calls.start.length, 0);
     await rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#254"], merge: false, reviewer: alice.userId });
-    assert.equal(calls.start[0].actingAs, alice.userId);
+    assert.equal(calls.start[0].request.actingAs, null);
   });
 
   test("S5 a model must be named by the user", async () => {
@@ -337,12 +312,13 @@ describe("assistant review tools", { skip }, () => {
     assert.equal(await code(rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#254"], merge: false, model: "claude-opus-4-8" })), "model_not_in_message");
     const asked = await userTurn(alice, "用 Opus 审 254");
     await rt.reviewStart(asked, { prs: ["AMD-AGI/PrimusClaw#254"], merge: false, model: "claude-opus-4-8" });
-    assert.equal(calls.start[0].model, "claude-opus-4-8");
+    assert.equal(calls.start[0].request.model, "claude-opus-4-8");
     assert.ok(!rt.modelGrounded("审 254 v4", "claude-opus-4-8"), "a version number is not a model's name");
   });
 
   test("S6 what the review service refuses reaches the model as it said it, with its data", async () => {
-    startAnswer = async () => ({ ok: false, status: 409, error: "review_in_progress", message: "254 is being reviewed", data: { pr: 254, item_id: "item_x", seq: 3 } });
+    const { ReviewItemRefused } = await import("../src/assistant/review-items.js");
+    startAnswer = async () => { throw new ReviewItemRefused(409, "review_in_progress", "254 is being reviewed", { pr: 254, item_id: "item_x", seq: 3 }); };
     const turn = await userTurn(alice, "审 254");
     try {
       await rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#254"], merge: false });
@@ -358,13 +334,13 @@ describe("assistant review tools", { skip }, () => {
     const task = await w.createItem(alice, "Fix the build");
     const byNumber = await userTurn(alice, "换 opus 重审 254");
     await rt.reviewRestart(byNumber, { item_id: first, model: "claude-opus-4-8" });
-    assert.deepEqual({ ...calls.restart[0], guard: typeof calls.restart[0].guard }, {
-      userId: alice.userId, attended: { via: null, messageId: byNumber.mid }, itemId: first, model: "claude-opus-4-8", guard: "function",
+    assert.deepEqual({ ...calls.restart[0], user: calls.restart[0].user.userId }, {
+      user: alice.userId, method: "identity_token", itemId: first, change: { model: "claude-opus-4-8" },
     });
     // The only review the user has: "重审一下" names it.
     const only = await userTurn(alice, "重审一下，审完合入");
     await rt.reviewRestart(only, { item_id: "#1", merge: true });
-    assert.equal(calls.restart[1].reviewOnly, false);
+    assert.deepEqual(calls.restart[1].change, { reviewOnly: false });
     await reviewItem(alice, 3, { owner: "AMD-AGI", repo: "PrimusClaw", number: 257 });
     const vague = await userTurn(alice, "重审一下");
     assert.equal(await code(rt.reviewRestart(vague, { item_id: first })), "item_not_in_message");

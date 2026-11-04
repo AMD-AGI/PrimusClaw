@@ -8,14 +8,11 @@ import { singleflightCreate, type FlightResult } from "../shared/singleflight.js
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions/dispatch.js";
 import { submitSessionMessage } from "../sessions/submit-message.js";
-import { CLAW_ASSISTANT_ENABLED, CLAW_GITHUB_REVIEW_ENABLED, SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
+import { CLAW_ASSISTANT_ENABLED, SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
 import { attendedViaOfRequest, parseChannelContext, preemptReportTurn, recordAssistantMessage } from "../assistant/inbound.js";
 import { actingTurnRefusalFor } from "../github-review/acting-turns.js";
-import { parseActingAs } from "../github-review/acting-as.js";
-import { parseReviewTarget } from "../github-review/review-target.js";
-import { classifyAttendedCaller } from "../github-review/attended.js";
+import { checkSessionCreate } from "../github-review/acting-session.js";
 import { loadUserEnvForSession, withholdsSandboxKeys } from "../github-review/session-tools.js";
-import { readGithubReviewSettings } from "../github-review/settings.js";
 import {
   forceIdleAfterInterrupt, queuedMessageId, releaseSessionGateForTurn, stopSessionRuns, takeSessionGate,
 } from "../tasks/chat-run.js";
@@ -34,7 +31,7 @@ import { getContextUsageSnapshot } from "../sessions/context-builder.js";
 import { publicSessionRow } from "../events/redaction.js";
 import { archiveSession, unarchiveSession } from "../sessions/archive.js";
 import { getChangesPatch, getChangesSummary, type ChangesFailure } from "../sessions/changes-service.js";
-import { parseSessionModel } from "../sessions/session-model.js";
+import { parseSessionEffort, parseSessionModel } from "../sessions/session-model.js";
 import { vetRequestMcpServers } from "../sessions/request-mcp-servers.js";
 import {
   isUserEnvKeyAllowed,
@@ -90,6 +87,8 @@ export interface NewSessionRow {
    * the check.
    */
   model?: string | null;
+  /** The reasoning effort this session's turns ask for, or null/absent for none. Already validated by `parseSessionEffort`. */
+  effort?: string | null;
 }
 
 // A value rather than a boolean, carrying the parent it was issued for, so a
@@ -116,12 +115,12 @@ export async function insertSessionRow(
   }
   await q.query(
     `INSERT INTO claw_sessions
-     (session_id, name, user_id, mode, agent_status, agent_gate_message_id, agent_id, system_prompt, status, config, parent_session_id, team_role, model, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $10, 'agent_default', $6, 'active', $7::jsonb, $8, $9, $11, NOW(), NOW())`,
+     (session_id, name, user_id, mode, agent_status, agent_gate_message_id, agent_id, system_prompt, status, config, parent_session_id, team_role, model, effort, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $10, 'agent_default', $6, 'active', $7::jsonb, $8, $9, $11, $12, NOW(), NOW())`,
     [
       row.sessionId, row.name, row.userId, row.mode, row.agentStatus,
       row.systemPrompt, JSON.stringify(row.config), row.parentSid, row.role,
-      row.gateMessageId ?? null, row.model ?? null,
+      row.gateMessageId ?? null, row.model ?? null, row.effort ?? null,
     ],
   );
 }
@@ -1124,57 +1123,15 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       return reply.status(400).send({ ok: false, error: parsedRepo.error });
     }
 
-    // The user whose GitHub account this session's review tools act as. A reference
-    // only; checked here, before any row exists, and refused while the feature is
-    // off so that a session never silently goes without the tools it asked for.
-    const parsedActingAs = parseActingAs(sessionConfig.acting_as);
-    if (!parsedActingAs.ok) {
-      return reply.status(400).send({ ok: false, error: parsedActingAs.error });
+    // `acting_as`, `review_target`, `review_only`, the model and the effort, and for a session that acts as a user the person's own
+    // credential: checked here, before any row or run exists, by the one function every create of such a session goes through.
+    const checked = checkSessionCreate({ config: sessionConfig, model: body.model, effort: body.effort, user: user ?? null, method: getAuthMethod(req) });
+    if (!checked.ok) {
+      if (checked.log) logger.warn({ userId: user?.userId, method: getAuthMethod(req) ?? "none", clientId: user?.delegation?.clientId?.slice(0, 128) }, checked.log);
+      return reply.status(checked.status).send({ ok: false, error: checked.error });
     }
-    if (parsedActingAs.actingAs !== null) {
-      if (!CLAW_GITHUB_REVIEW_ENABLED) {
-        return reply.status(400).send({ ok: false, error: "config.acting_as is not enabled on this deployment" });
-      }
-      if (!user) {
-        return reply.status(401).send({ ok: false, error: "authentication required" });
-      }
-      // A session that acts as a user is the person's say, and the key a sandbox holds (or a sign-in that key can complete) must not be
-      // able to start one: a model injected in any ordinary session of the user would otherwise review and merge with their account
-      // on its own. The same credentials as answering a held merge (github-review/attended.ts).
-      const caller = classifyAttendedCaller(getAuthMethod(req), user, readGithubReviewSettings().decisionClientIds);
-      if (!caller.ok) {
-        logger.warn({ userId: user.userId, method: getAuthMethod(req) ?? "none", clientId: user.delegation?.clientId?.slice(0, 128) }, `github_review.acting_as_refused_${caller.error}`);
-        return reply.status(403).send({ ok: false, error: caller.error });
-      }
-      // The requester's name for the review footer, from the verified caller.
-      sessionConfig.acting_as_requester = (user.userName || user.userId).slice(0, 100);
-    }
-    // The one pull request the session's review tools may touch. It is only ever set here, and it binds nothing without `acting_as`, which
-    // is why asking for it without one is refused rather than silently ignored.
-    const parsedTarget = parseReviewTarget(sessionConfig.review_target);
-    if (!parsedTarget.ok) {
-      return reply.status(400).send({ ok: false, error: parsedTarget.error });
-    }
-    if (parsedTarget.target !== null && parsedActingAs.actingAs === null) {
-      return reply.status(400).send({ ok: false, error: "config.review_target needs config.acting_as" });
-    }
-
-    // The model this session's turns ask for. Checked here, before any row or
-    // run exists, so a malformed name leaves nothing behind. Absent and null both
-    // mean no choice; whether the gateway serves the name is its answer to give,
-    // on the first turn that uses it.
-    let sessionModel: string | null = null;
-    if (body.model !== undefined) {
-      const parsedModel = parseSessionModel(body.model);
-      if (!parsedModel.ok) {
-        return reply.status(400).send({ ok: false, error: parsedModel.error });
-      }
-      sessionModel = parsedModel.model;
-    }
-    // A session that reviews on someone's behalf runs on the review model unless its creator named one: the requester's key pays.
-    if (sessionModel === null && parsedActingAs.actingAs !== null) {
-      sessionModel = readGithubReviewSettings().reviewModel;
-    }
+    const sessionModel = checked.model;
+    const sessionEffort = checked.effort;
 
     if (parentSid && !user) {
       return reply.status(401).send({ ok: false, error: "authentication required" });
@@ -1378,6 +1335,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
           parentSid, role,
           gateMessageId: firstMessageId,
           model: sessionModel,
+          effort: sessionEffort,
         };
         // A create with no parent grows no existing tree; every create that
         // names one adds a node to it, so it is decided against the ceiling
@@ -1399,7 +1357,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
             data: {
               session_id: sessionId, name, user_id: userId, mode: dispMode,
               agent_status: "idle", parent_session_id: parentSid, team_role: role,
-              model: sessionModel,
+              model: sessionModel, effort: sessionEffort,
             },
           };
           if (idemKey && idemLock) await saveIdempotencyBestEffort(idemLock, userId, route, idemKey, 200, response);
@@ -1490,7 +1448,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
           data: {
             session_id: sessionId, name, user_id: userId, mode: dispMode,
             agent_status: "running", parent_session_id: parentSid, team_role: role,
-            model: sessionModel,
+            model: sessionModel, effort: sessionEffort,
             message: {
               message_id: dispatch.messageId,
               dispatched: true,
@@ -1636,7 +1594,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     return { ok: true, data: rows.map(mapSessionForDisplay) };
   });
 
-  // --- Update Session (rename, choose the model) ---
+  // --- Update Session (rename, choose the model or the effort) ---
   //
   // Either field alone, or both. `name` is the old contract unchanged. `model`
   // is the model this session's turns ask the gateway for: a string sets it, null
@@ -1649,10 +1607,11 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     const body = (req.body ?? {}) as Record<string, unknown>;
     const wantsName = body.name !== undefined;
     const wantsModel = body.model !== undefined;
+    const wantsEffort = body.effort !== undefined;
     const newName = ((body.name as string) || "").trim();
-    // With no `model` in the body this is exactly the rename it always was,
+    // With no `model` or `effort` in the body this is exactly the rename it always was,
     // including its refusal of a blank name.
-    if ((wantsName || !wantsModel) && !newName) {
+    if ((wantsName || (!wantsModel && !wantsEffort)) && !newName) {
       return reply.status(400).send({ ok: false, error: "name is required" });
     }
     let newModel: string | null = null;
@@ -1662,6 +1621,14 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         return reply.status(400).send({ ok: false, error: parsedModel.error });
       }
       newModel = parsedModel.model;
+    }
+    let newEffort: string | null = null;
+    if (wantsEffort) {
+      const parsedEffort = parseSessionEffort(body.effort);
+      if (!parsedEffort.ok) {
+        return reply.status(400).send({ ok: false, error: parsedEffort.error });
+      }
+      newEffort = parsedEffort.effort;
     }
 
     const row = (await db.query(
@@ -1676,7 +1643,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     if (!canAccessSession(row.user_id, userId) && !(!row.user_id && user && isSystemAdmin(user))) {
       return reply.status(403).send({
         ok: false,
-        error: wantsModel ? "only the session owner can update it" : "only the session owner can rename",
+        error: wantsModel || wantsEffort ? "only the session owner can update it" : "only the session owner can rename",
       });
     }
 
@@ -1690,17 +1657,21 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       params.push(newModel);
       sets.push(`model = $${params.length}`);
     }
+    if (wantsEffort) {
+      params.push(newEffort);
+      sets.push(`effort = $${params.length}`);
+    }
     params.push(sessionId);
     const updated = (await db.query(
       `UPDATE claw_sessions SET ${sets.join(", ")}, updated_at = NOW() `
-        + `WHERE session_id = $${params.length} AND deleted_at IS NULL RETURNING name, model`,
+        + `WHERE session_id = $${params.length} AND deleted_at IS NULL RETURNING name, model, effort`,
       params,
     )).rows[0];
     // Deleted between the read above and the write: there is nothing to report.
     if (!updated) return reply.status(404).send({ ok: false, error: "session not found" });
     return {
       ok: true,
-      data: { session_id: sessionId, name: updated.name, model: updated.model ?? null },
+      data: { session_id: sessionId, name: updated.name, model: updated.model ?? null, effort: updated.effort ?? null },
     };
   });
 

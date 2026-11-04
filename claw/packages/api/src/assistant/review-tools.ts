@@ -27,19 +27,40 @@ import { db, inTransaction, type Querier } from "../infra/db.js";
 import { deterministicEventId, enqueue, kickDelivery } from "../notifications/outbox.js";
 import type { AssistantActionPayload } from "../notifications/assistant-events.js";
 import { decidedViaOf, turnMessage, type AttendedVia, type TurnMessage } from "./inbound.js";
-import { restartReviewItem, startReviewItems, type ReviewItemsResult } from "./review-items.js";
+import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
+import { IDENTITY_TOKEN_METHOD } from "../auth/identity-token.js";
+import type { UserInfo } from "../auth/models.js";
+import {
+  confirmationOfStoppedReview, denyForStoppedReview, parseRestartRequest, parseReviewRequest, restartReview, ReviewItemRefused,
+  reviewItemsEnabled, startReviews, syncReviewItemOfSession,
+} from "./review-items.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, ToolRefused } from "./tools.js";
 import { resolveWorkItemNow } from "./work-items.js";
 
 const logger = pino({ name: "assistant-review-tools" });
 
+/**
+ * Answer a held write as the decision route does: a write held by a review its requester stopped is denied whatever the
+ * answer, and the review item of the session closes with the answer (`review-items.ts`).
+ */
+async function decideAsTheRoute(userId: string, id: string, decision: "allow" | "deny", via: ReturnType<typeof decidedViaOf>) {
+  if (await confirmationOfStoppedReview(id)) {
+    await denyForStoppedReview(id);
+    return { http: 200, body: { ok: true, status: "denied", reason: "review_stopped" } as Record<string, unknown> };
+  }
+  const answer = await githubReviewService().decide(userId, id, decision, via);
+  const row = (await db.query("SELECT session_id FROM claw_github_confirmations WHERE confirmation_id = $1", [id])).rows[0] as
+    { session_id: string } | undefined;
+  if (row) await syncReviewItemOfSession(row.session_id).catch((err) => logger.warn({ err }, "assistant.review_item_sync_failed"));
+  return answer;
+}
+
 /** The ways out of this module, so a test can stand in for what lies beyond the HTTP boundary of each. */
 export const reviewToolPorts = {
-  startReviewItems,
-  restartReviewItem,
-  decide: (userId: string, id: string, decision: "allow" | "deny", via: ReturnType<typeof decidedViaOf>) =>
-    githubReviewService().decide(userId, id, decision, via),
+  startReviews,
+  restartReview,
+  decide: decideAsTheRoute,
   kick: (): Promise<void> => kickDelivery(),
 };
 
@@ -55,8 +76,39 @@ function requireRouter(claims: AssistantTokenClaims): void {
 }
 
 /** The review tools need the reviews: a deployment without them has no confirmations, modes or review items to act on. */
-function requireReviews(): void {
-  if (!CLAW_GITHUB_REVIEW_ENABLED) throw new ToolRefused("reviews_off", "GitHub reviews are not available on this deployment: tell the user");
+function requireReviews(items = false): void {
+  if (!CLAW_GITHUB_REVIEW_ENABLED || (items && !reviewItemsEnabled())) {
+    throw new ToolRefused("reviews_off", "reviews cannot be started from the assistant on this deployment: tell the user");
+  }
+}
+
+/**
+ * The requester as the review service asks of a signed-in caller (`startReviews`): the person's message stands for the sign-in,
+ * so the service classifies it exactly as it would the request (an identity-provider token; a service's only if it is still
+ * an allowed one), and the review session gets the credentials the requester's own messages gave their assistant.
+ */
+async function requesterSignedIn(q: Querier, routerSid: string, userId: string, message: TurnMessage, via: AttendedVia): Promise<{
+  user: UserInfo; method: string;
+}> {
+  const router = (await q("SELECT config FROM claw_sessions WHERE session_id = $1", [routerSid])).rows[0] as { config: unknown } | undefined;
+  const creds = readTrustedSessionCredentials(router?.config);
+  return {
+    user: {
+      userId, userName: message.userName ?? userId, roles: [], platformKey: creds.platformKey, virtualKey: creds.llmApiKey,
+      ...(via.kind === "service" ? { delegation: { clientId: via.client_id, actorSub: via.act_sub } } : {}),
+    },
+    method: IDENTITY_TOKEN_METHOD,
+  };
+}
+
+/** The review service's answer, as the tool's: its code, words and data, so the router reads what the interface said. */
+async function asTool<T>(run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (err) {
+    if (err instanceof ReviewItemRefused) throw new ToolRefused(err.code, err.message, err.data);
+    throw err;
+  }
 }
 
 /**
@@ -134,12 +186,6 @@ function refuseUngrounded(code: string, message: string): never {
   throw new ToolRefused(code, message);
 }
 
-/** C1's answer, as the tool's: the same code, words and data, so the router reads what the interface said. */
-function unwrap(result: ReviewItemsResult): Record<string, unknown> {
-  if (!result.ok) throw new ToolRefused(result.error, result.message, result.data);
-  return result.data;
-}
-
 // --- Tools ------------------------------------------------------------------------------------------------------
 
 export async function reviewStart(
@@ -147,10 +193,10 @@ export async function reviewStart(
   args: { prs: unknown; reviewer?: string; merge: boolean; model?: string; effort?: string },
 ): Promise<Record<string, unknown>> {
   requireRouter(claims);
-  requireReviews();
+  requireReviews(true);
   const prs = parsePrs(args.prs);
   if (typeof args.merge !== "boolean") throw new ToolRefused("invalid_arguments", "merge must be true or false: true only when the user clearly asked to merge");
-  // Asked here, so a refusal costs the review service nothing; the turn is asked again inside its write (`guard`).
+  // Asked here, so a refusal costs the review service nothing.
   const ready = await inTransaction(async (q) => {
     const { userId, message, via } = await attendedTurn(q, claims);
     const recent = await recentReviewRepos(q, userId);
@@ -165,10 +211,11 @@ export async function reviewStart(
     if (args.model && !modelGrounded(message.content, args.model)) {
       refuseUngrounded("model_not_in_message", "the user did not ask for that model: leave model out unless they named one");
     }
-    if (!args.reviewer || args.reviewer === userId) return { userId, via, actingAs: userId, actingAsName: undefined };
+    const signedIn = await requesterSignedIn(q, claims.sid, userId, message, via);
+    if (!args.reviewer || args.reviewer === userId) return { userId, signedIn, actingAs: userId, actingAsName: undefined };
     const reviewer = lower(args.reviewer);
     const person = message.context.people.find((p) => p.user_id === args.reviewer);
-    if (person) return { userId, via, actingAs: args.reviewer, actingAsName: person.name };
+    if (person) return { userId, signedIn, actingAs: args.reviewer, actingAsName: person.name };
     const named = message.context.people.some((p) => lower(p.name) === reviewer || (p.email !== undefined && lower(p.email) === reviewer));
     return refuseUngrounded(
       named ? "reviewer_not_linked" : "reviewer_not_in_message",
@@ -177,16 +224,15 @@ export async function reviewStart(
         : "reviewer must be left out (the user), or be the user_id of someone in this message's people list",
     );
   });
-  const result = await reviewToolPorts.startReviewItems({
-    userId: ready.userId,
-    attended: { via: decidedViaOf(ready.via), messageId: claims.mid },
+  // The body `POST /v1/assistant/reviews` would have been sent, read by the same parser: the same checks either way.
+  const items = await asTool(async () => reviewToolPorts.startReviews(ready.signedIn.user, ready.signedIn.method, parseReviewRequest({
     prs: prs.map((p) => ({ owner: p.owner, repo: p.repo, number: p.number })),
-    actingAs: ready.actingAs, ...(ready.actingAsName ? { actingAsName: ready.actingAsName } : {}),
+    ...(ready.actingAs !== ready.userId ? { acting_as: ready.actingAs } : {}),
+    ...(ready.actingAsName ? { acting_as_name: ready.actingAsName } : {}),
     ...(args.model ? { model: args.model } : {}), ...(args.effort ? { effort: args.effort } : {}),
-    reviewOnly: !args.merge,
-    guard: async (q) => { await attendedTurn(q, claims); },
-  });
-  return { ok: true, ...unwrap(result) };
+    review_only: !args.merge,
+  })));
+  return { ok: true, items };
 }
 
 /** The user's review items the router could mean, newest first: the open ones and those closed in the last day. */
@@ -203,7 +249,7 @@ export async function reviewRestart(
   claims: AssistantTokenClaims, args: { item_id: string; model?: string; merge?: boolean; effort?: string },
 ): Promise<Record<string, unknown>> {
   requireRouter(claims);
-  requireReviews();
+  requireReviews(true);
   const chosen = await inTransaction(async (q) => {
     const { userId, message, via } = await attendedTurn(q, claims);
     const named = await resolveWorkItemNow(userId, args.item_id);
@@ -217,15 +263,13 @@ export async function reviewRestart(
     if (args.model && !modelGrounded(message.content, args.model)) {
       refuseUngrounded("model_not_in_message", "the user did not ask for that model: leave model out to keep the one it had");
     }
-    return { userId, via, itemId: item.item_id };
+    return { itemId: item.item_id, signedIn: await requesterSignedIn(q, claims.sid, userId, message, via) };
   });
-  const result = await reviewToolPorts.restartReviewItem({
-    userId: chosen.userId, attended: { via: decidedViaOf(chosen.via), messageId: claims.mid }, itemId: chosen.itemId,
+  const restarted = await asTool(async () => reviewToolPorts.restartReview(chosen.signedIn.user, chosen.signedIn.method, chosen.itemId, parseRestartRequest({
     ...(args.model ? { model: args.model } : {}), ...(args.effort ? { effort: args.effort } : {}),
-    ...(typeof args.merge === "boolean" ? { reviewOnly: !args.merge } : {}),
-    guard: async (q) => { await attendedTurn(q, claims); },
-  });
-  return { ok: true, ...unwrap(result) };
+    ...(typeof args.merge === "boolean" ? { review_only: !args.merge } : {}),
+  })));
+  return { ok: true, ...restarted };
 }
 
 interface PendingConfirmation { id: string; repo: string; pr: number; kind: string; created_at: Date; expires_at: Date }

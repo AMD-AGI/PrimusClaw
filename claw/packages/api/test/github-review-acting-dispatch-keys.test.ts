@@ -25,7 +25,7 @@ process.env.CLAW_GITHUB_REVIEW_ENABLED = "true";
 process.env.CLAW_GITHUB_REVIEW_MCP_SECRET = "t".repeat(40);
 process.env.TASK_DISPATCH_STAGE_TIMEOUT_MS = "200";
 process.env.CLAW_DEPLOY_MODE = "safe";
-process.env.CLAW_GITHUB_REVIEW_EFFORT = "high"; // an operator who set one: every turn of a review carries it
+process.env.CLAW_GITHUB_REVIEW_EFFORT = "high"; // left over from a deployment that set it: no longer read, a turn carries only its session's own effort
 
 const { db } = await import("../src/infra/db.js");
 const { initUserEnvCrypto } = await import("../src/crypto/user-env.js");
@@ -69,13 +69,13 @@ const ACTING: Array<[string, unknown, boolean]> = [
   ["no acting_as", undefined, false],
 ];
 
-async function claim(actingAs: unknown, model = "claude-opus-5.5"): Promise<{ request: Record<string, unknown>; asked: string[] }> {
+async function claim(actingAs: unknown, model = "claude-opus-5.5", effort?: string): Promise<{ request: Record<string, unknown>; asked: string[] }> {
   const asked: string[] = [];
   db.query = (async (text: string) => {
     const sql = text.replace(/\s+/g, " ").trim();
     asked.push(sql);
     if (/UPDATE claw_tasks/.test(sql)) {
-      return { rows: [{ task_id: "ktsk_1", session_id: "s-1", status: "preparing", deadline_at: null, input: { prompt: "hello", session_id: "s-1", user_id: "u-1", model, credentials: blob } }], rowCount: 1 };
+      return { rows: [{ task_id: "ktsk_1", session_id: "s-1", status: "preparing", deadline_at: null, input: { prompt: "hello", session_id: "s-1", user_id: "u-1", model, ...(effort ? { effort } : {}), credentials: blob } }], rowCount: 1 };
     }
     if (/SELECT config->'acting_as' AS acting_as FROM claw_sessions/.test(sql)) return { rows: actingAs === undefined ? [{ acting_as: null }] : [{ acting_as: actingAs }], rowCount: 1 };
     return { rows: [], rowCount: 0 };
@@ -89,8 +89,8 @@ test("D1 a turn claimed from the queue is marked for a session that acts as a us
   for (const [what, actingAs, marked] of ACTING) {
     const { request } = await claim(actingAs);
     assert.equal(request.withhold_sandbox_keys, marked ? true : undefined, what);
-    assert.equal(request.effort, marked ? "high" : undefined, `${what}: a review runs at the review's effort`);
-    assert.equal((await claim(actingAs, "gpt-4o")).request.effort, undefined, `${what}: not on a model the effort was not set for`);
+    assert.equal(request.effort, undefined, `${what}: no effort the session did not choose, whatever the environment says`);
+    assert.equal((await claim(actingAs, "gpt-4o", "medium")).request.effort, "medium", `${what}: the effort the session chose, as sent`);
     assert.equal(request.rolling_cache_ttl, marked ? "5m" : undefined, `${what}: nobody waits between a review's turns`);
     assert.equal((await claim(actingAs, "gpt-4o")).request.rolling_cache_ttl, marked ? "5m" : undefined, `${what}: on any model`);
     assert.equal(request.sub_agent_max_turns, marked ? 20 : undefined, `${what}: a review's second pass is bounded`);
@@ -105,10 +105,11 @@ const taskRow = () => ({
   dag_root_task_id: null, started_at: NOW, created_at: NOW, model: "claude-opus-5.5",
 });
 
-async function dispatchDag(config: Record<string, unknown>): Promise<Record<string, unknown>> {
+async function dispatchDag(config: Record<string, unknown>, effort: string | null = null): Promise<Record<string, unknown>> {
   db.query = (async (text: string) => {
     const sql = text.replace(/\s+/g, " ").trim();
     if (/SELECT user_id, config FROM claw_sessions/.test(sql)) return { rows: [{ user_id: "u-1", config }], rowCount: 1 };
+    if (/^SELECT effort FROM claw_sessions WHERE session_id = \$1$/.test(sql)) return { rows: [{ effort }], rowCount: 1 };
     if (/^UPDATE claw_tasks/.test(sql) || /FROM claw_tasks t LEFT JOIN claw_sessions/.test(sql)) return { rows: [taskRow()], rowCount: 1 };
     if (/claw_workspace/.test(sql)) return { rows: [{ workspace_id: "kws_1", storage_prefix: "users/u-1/sessions/s-1/" }], rowCount: 1 };
     return { rows: [], rowCount: 0 };
@@ -129,7 +130,9 @@ test("D2 a task of a DAG is marked for a session that acts as a user, and its ke
   for (const [what, actingAs, marked] of ACTING) {
     const request = await dispatchDag({ platform_key: "pk-user-1", _server_managed_credentials: true, ...(actingAs === undefined ? {} : { acting_as: actingAs }) });
     assert.equal(request.withhold_sandbox_keys, marked ? true : undefined, what);
-    assert.equal(request.effort, marked ? "high" : undefined, `${what}: a review runs at the review's effort`);
+    assert.equal(request.effort, undefined, `${what}: the environment's old review effort is not read`);
+    const chosen = await dispatchDag({ platform_key: "pk-user-1", _server_managed_credentials: true, ...(actingAs === undefined ? {} : { acting_as: actingAs }) }, "medium");
+    assert.equal(chosen.effort, "medium", `${what}: a run of the session asks for the effort the session chose`);
     assert.equal(request.rolling_cache_ttl, marked ? "5m" : undefined, `${what}: nobody waits between a review's turns; any other DAG keeps Brain's TTL`);
     assert.equal(request.sub_agent_max_turns, marked ? 20 : undefined, `${what}: a review's second pass is bounded; any other DAG's is not`);
     assert.equal(request.platform_key, "pk-user-1", `${what}: Brain still needs the key to own the workload`);

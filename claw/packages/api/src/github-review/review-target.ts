@@ -33,3 +33,20 @@ export function reviewTargetOf(config: unknown): ReviewTargetParse {
 export function isReviewTarget(ref: PrRef, target: PrRef): boolean {
   return ref.owner.toLowerCase() === target.owner.toLowerCase() && ref.repo.toLowerCase() === target.repo.toLowerCase() && ref.number === target.number;
 }
+
+/**
+ * `config.review_only` of a session: true when whoever created it asked for a review and nothing more. Like the target, written only at
+ * creation and enforced by the tools: such a session's `gh_pr_merge` is refused (`review_only`), whatever its model was told, so it can
+ * review and approve but never merge, nor approve on the way to a merge. Absent is false; anything but a boolean is refused at creation.
+ */
+export function parseReviewOnly(value: unknown): { ok: true; reviewOnly: boolean } | { ok: false; error: string } {
+  if (value === undefined || value === null) return { ok: true, reviewOnly: false };
+  return typeof value === "boolean" ? { ok: true, reviewOnly: value } : { ok: false, error: "config.review_only must be true or false" };
+}
+
+/** Whether a session's stored config asks for a review only. A stored value that is not a boolean reads as review only: the caller refuses less, never more. */
+export function reviewOnlyOf(config: unknown): boolean {
+  const value = config !== null && typeof config === "object" ? (config as Record<string, unknown>).review_only : undefined;
+  const parsed = parseReviewOnly(value);
+  return parsed.ok ? parsed.reviewOnly : true;
+}

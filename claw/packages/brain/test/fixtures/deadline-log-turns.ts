@@ -111,7 +111,7 @@ const engine: Engine = {
       signal?.addEventListener("abort", () => done());
     });
     return {
-      finalText: "", turns: 0, pendingMemories: [], pendingSkills: [],
+      finalText: "", turns: 0, pendingSkills: [],
       skillsUsed: {}, errorCount: 0, elapsedMs: 1,
     } as ExecuteResult;
   },

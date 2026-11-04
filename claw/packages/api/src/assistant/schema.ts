@@ -61,6 +61,17 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
   await client.query(
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_worker_session ON claw_work_items(worker_session_id)",
   );
+  // What the item is: `task`, done by a worker that reports, or `review`, a GitHub review on someone's behalf whose
+  // state is read off what it did (`review-items.ts`). `params` is what a review was asked with.
+  await client.query("ALTER TABLE claw_work_items ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'task'");
+  await client.query("ALTER TABLE claw_work_items ADD COLUMN IF NOT EXISTS params JSONB NOT NULL DEFAULT '{}'::jsonb");
+  // One open review of a pull request at a time, whoever asked: two sessions reviewing it could both write to it.
+  // GitHub's names are not case sensitive, and neither is this.
+  await client.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_open_review_pr ON claw_work_items(
+       lower(params->'pr'->>'owner'), lower(params->'pr'->>'repo'), (params->'pr'->>'number'))
+     WHERE kind = 'review' AND board_state <> 'done'`,
+  );
 
   await client.query(`
     CREATE TABLE IF NOT EXISTS claw_work_item_events (
@@ -68,7 +79,7 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
       item_id     TEXT NOT NULL,
       -- created | run_started | progress | waiting | ready | blocked | failed | dropped | accepted | stopped
       kind        TEXT NOT NULL,
-      -- worker | turn_end | sweep | user | router
+      -- worker | turn_end | sweep | user | router | policy (a review's state, read off what it did)
       source      TEXT NOT NULL,
       generation  INT NOT NULL,
       run_id      TEXT,

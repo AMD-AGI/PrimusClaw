@@ -14,7 +14,7 @@ import { marketplaceToolIds, pluginToolsHaveHooks, resolvePluginToolsFromMessage
 import { loadRules } from "./rules.js";
 import { bindRepo, renderRepoBlock } from "../workspace/repo-binding.js";
 import { repoSkillsToList } from "../workspace/repo-skills.js";
-import { normalizeMcpConfigs } from "../clients/mcp-config.js";
+import { normalizeMcpConfigs, originsSendingPlaceholder } from "../clients/mcp-config.js";
 import { approvalPolicyFromMcp } from "./approval-policy.js";
 import { HitlController } from "./hitl.js";
 import { bashApprovalFromEnvValue, bashApprovalPolicyFrom } from "./bash-approval.js";
@@ -163,8 +163,10 @@ export class AgentEngine {
     // truthy, not `=== true`: a mark that is not a boolean is still a mark.
     const defaults = PLATFORM_DEFAULTS_FILE && !request.withhold_sandbox_keys ? loadPlatformDefaults() : null;
     // Marketplace and plugin servers are third parties' at URLs nobody vetted, so the requester's
-    // platform key fills their `<SAFE_API_KEY>` only on a host the operator trusts
-    // (MCP_PLATFORM_KEY_ALLOWED_HOSTS). A request's own servers are the requester's choice of where
+    // platform key fills their `<SAFE_API_KEY>` only where the operator trusts it: a host listed in
+    // MCP_PLATFORM_KEY_ALLOWED_HOSTS, or, in a run given the defaults, an origin the defaults file
+    // itself sends the key to (a plugin commonly ships the platform servers the defaults file mounts,
+    // under the same names, and replaces them). A request's own servers are the requester's choice of where
     // their own key goes. A `pinned_address` is the API's record of where it vetted a request's
     // server; one in a tool or plugin config is the author's, and would connect a trusted host name
     // to an address of their choosing, so it is dropped.
@@ -181,10 +183,14 @@ export class AgentEngine {
     const defaultMcp = Object.fromEntries(
       Object.entries(defaults?.mcpServers || {}).filter(([name]) => !Object.hasOwn(toolMcp, name) && !Object.hasOwn(requestMcp, name)),
     );
+    const platformKeyHosts = new Set([
+      ...MCP_PLATFORM_KEY_ALLOWED_HOSTS,
+      ...originsSendingPlaceholder(defaults?.mcpServers ?? {}, "SAFE_API_KEY"),
+    ]);
     const mergedMcp = {
       ...normalizeMcpConfigs(defaultMcp, envOverrides, defaults?.mcpEnvAllow),
       ...normalizeMcpConfigs(requestMcp, envOverrides),
-      ...normalizeMcpConfigs(toolMcp, envOverrides, undefined, MCP_PLATFORM_KEY_ALLOWED_HOSTS),
+      ...normalizeMcpConfigs(toolMcp, envOverrides, undefined, platformKeyHosts),
     };
 
     const allSkills: Record<string, string> = {};
@@ -406,9 +412,11 @@ export class AgentEngine {
       router.lazySkillWriter = lazySkills;
       // The listed skills are Brain's to hand over: `load_skill` serves them without a sandbox.
       if (progressiveSkills.length) router.skillStore = new SkillStore(progressiveSkills, `${sessionDir}/.skills`);
-      // A session that acts as a user (`withhold_sandbox_keys`) has no `save_memory`: what its model writes into the requester's long-term
-      // memory is what a stranger's text made it write, and every later session of the requester would read it.
-      router.memoryEnabled = request.memory_enabled !== false && !request.withhold_sandbox_keys;
+      // Offered only when the API said so: a request without the field is not the user's conversation. A session that acts as a
+      // user (`withhold_sandbox_keys`) never has them: what its model writes into the requester's long-term memory is what a
+      // stranger's text made it write, and every later session of the requester would read it.
+      router.memoryEnabled = request.memory_enabled === true && !request.withhold_sandbox_keys;
+      router.memoryTurn = { sessionId: request.session_id, messageId: request.message_id };
       router.skillEvolutionEnabled = request.skill_evolution_enabled === true;
       // Whom an identity-authenticated a2a_call peer is called as, and when the run's budget ends.
       const deadlineMs = request.deadline_at ? Date.parse(request.deadline_at) : NaN;
@@ -534,7 +542,6 @@ export class AgentEngine {
             errorCount: 0,
             toolStats: { total_calls: 0, error_calls: 0, by_tool: {} },
             elapsedMs: 0,
-            pendingMemories: [],
             pendingSkills: [],
             skillsUsed: {},
           };
@@ -563,6 +570,7 @@ export class AgentEngine {
           ...(isReasoningEffort(request.effort) ? { effort: request.effort } : {}),
           ...(request.rolling_cache_ttl === "5m" ? { rollingCacheTtl: "5m" as const } : {}),
           ...(Number.isSafeInteger(request.sub_agent_max_turns) && request.sub_agent_max_turns! > 0 ? { subAgentMaxTurns: request.sub_agent_max_turns } : {}),
+          ...(request.withhold_sandbox_keys ? { actingReview: true } : {}),
           apiUrl,
           apiKey,
           maxTurns,
@@ -633,7 +641,6 @@ export class AgentEngine {
         errorCount: loopResult.errorCount,
         toolStats: loopResult.toolStats,
         elapsedMs: loopResult.elapsedMs,
-        pendingMemories: router.pendingMemories,
         pendingSkills: router.pendingSkills,
         pendingSkillFileMutations: router.pendingSkillFileMutations,
         skillsUsed,

@@ -70,6 +70,13 @@ review and the merge and who is the reviewer of record, and whose own standing a
    the session may act on any pull request of an allowed owner. The binding is what stops a model that
    was talked into naming another pull request from reading it, or writing under the acting user's name
    on it.
+   The creator may also ask for a review only with `config.review_only = true`: `gh_pr_merge` is then
+   refused (`review_only`) before anything is read or written, so the session reviews, and may approve,
+   but never merges and never approves on the way to a merge; an approval is refused (`review_only`) as well
+   while GitHub's auto-merge is on for the pull request, since it could merge it; a merge held for such a session is refused
+   at the acting user's allow as well. Like the target it is written only at creation, is `400` without
+   `config.acting_as` or when it is neither a boolean nor null (null and absent are false), and a stored value that is
+   not a boolean reads as true.
 2. From then on every turn of that session is offered an MCP server named `github_review`
    (reserved: a request cannot replace it) with four tools, hosted by the API at
    `POST /v1/internal/github-review/mcp`. Brain calls it with a token signed by the API
@@ -77,6 +84,30 @@ review and the merge and who is the reviewer of record, and whose own standing a
    route checks the session row again on every call.
 3. The model reviews by the review instructions (below) and posts one review; if it is clean it
    merges. Every gate is in the tool, not in the prompt.
+
+## As an item of the assistant
+
+With `CLAW_ASSISTANT_REVIEW_ITEMS` on (and `CLAW_ASSISTANT_ENABLED`), a review can also be started as a work item of the
+requester's assistant, so it is on their board and can be stopped there. The session is the same: it is made by the same
+check as `POST /v1/sessions` makes of a session with `config.acting_as` (`github-review/acting-session.ts`), with the same
+credentials asked of the caller, and holds the same tools and gates.
+
+| Route | |
+|---|---|
+| `POST /v1/assistant/reviews` | `{prs: [{owner, repo, number, message?}], acting_as?, acting_as_name?, model?, effort?, review_only?}`: one item per pull request (1 to 10), all of them or none. `review_only` defaults to `true`; `message` is the session's first message, written by Claw when absent |
+| `POST /v1/assistant/reviews/:id/restart` | The same pull request again with what the body changes (`model`, `effort`, `review_only`, `message`); the old item is stopped as a stop would stop it |
+| `POST /v1/work-items/:id/stop` | Also denies every write the session holds for an answer, in the same transaction; `409 merge_in_progress` while one is being made, `409 already_merged` after a merge |
+
+Before anything is made: only an identity-provider token (`403 interactive_sign_in_required` / `service_client_not_allowed`);
+one open review per pull request whoever asked (`409 review_in_progress`, or `review_in_progress_by_other` without the other
+person's item); the hourly limits below, counting the open reviews that have not written yet (`429 rate_limited` with how many
+more fit); the requester's limit of unfinished items (`409 too_many_active_items`); and the pull request read with the acting
+user's account (`422 pr_check_failed` with the tool's refusal code, `503 pr_check_unavailable` for an outage).
+
+The item's state is read off the audit and confirmation tables, never from the model: a merge, a queued merge or a posted
+review is done (accepted by policy); a write held for the requester themselves, or a closed one that did not write (`stale`,
+`expired`, `refused`), a merge refused by a gate, a failed turn or a turn that posted nothing needs them; a write held for
+someone else, or being made, is in progress; a denied one is done (stopped). A review session gets no worker report tool.
 
 ## The tools
 
@@ -474,9 +505,10 @@ diff (written once to `.pr-review/pr.diff` in the checkout, excluded from git), 
 read, and the callers a search showed but it did not open, which it opens first; and the diff is
 read once from the checkout rather than in `gh_pr_get` pages.
 
-`CLAW_GITHUB_REVIEW_DEEP_ENABLED=false` turns the deep review off. The review model stays
-`CLAW_GITHUB_REVIEW_MODEL` (default `claude-opus-5.5`); to have the deployment's own model back as
-well, set `CLAW_GITHUB_REVIEW_MODEL=default` too.
+`CLAW_GITHUB_REVIEW_DEEP_ENABLED=false` turns the deep review off. The review has no model or
+reasoning effort of its own: the session runs on the `model` and `effort` its creator sent with
+`POST /v1/sessions` (or set later with `PATCH /v1/sessions/:id`), or on the deployment's defaults, as any
+other session does.
 
 Either way, Brain opens a sandbox only when a turn uses a sandbox tool, so the decision is
 advice plus a record: a structured log line (`github_review.path_chosen` with `review_path`,
@@ -549,8 +581,6 @@ logs and the audit rows.
 | `CLAW_GITHUB_REVIEW_FAST_MAX_FILES` | 15 | At most this many changed files for the diff-only path |
 | `CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES` | 200 (600 with the deep review off) | At most this many added plus deleted lines for the diff-only path; with the deep review on, a change of a non-test source file takes the sandbox path whatever its size |
 | `CLAW_GITHUB_REVIEW_DEEP_ENABLED` | on | The deep review ("The deep review" above): a required sandbox for source changes, the callers read, the closest tests run, and a second adversarial pass. `false` (or `0`, `no`) gives the review as it was before the switch. Another value than `true`/`1`/`yes`/`false`/`0`/`no` is reported and leaves it on |
-| `CLAW_GITHUB_REVIEW_MODEL` | `claude-opus-5.5` | The model of a session created with `config.acting_as` when the request names none (`model` absent or null); a request's own `model` wins. `default` leaves Brain's `DEFAULT_MODEL`. The requester's key pays for it |
-| `CLAW_GITHUB_REVIEW_EFFORT` | unset | The reasoning effort of every turn of such a session, its sub-agents included (`low`, `medium`, `high`; Anthropic `output_config.effort`, OpenAI `reasoning_effort`). Sent only while the session runs on `CLAW_GITHUB_REVIEW_MODEL` (a model its creator named instead may refuse the field). Unset sends neither field, so the model's own default applies, as before; another value is reported and sends none |
 
 The identity provider must give the API's own client the `identity.credential.resolve` scope
 (see [identity-client.md](identity-client.md), external credentials). Without a bound credential
