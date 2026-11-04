@@ -11,6 +11,10 @@
  *       speak (its say names it), and when it ends the user's question goes before the second report.
  *   Q2  the sweeper and the completion's drain take the same queued message at once: one turn, one run row, and no
  *       duplicate key on `claw_tasks`.
+ *   Q3  the user asks while a drain is under way, so the question is queued behind it and its own drain finds the claim
+ *       taken. The drain starts no turn: its message is refused admission, and the refusal's completion is handled
+ *       while the drain still holds the claim, so that completion's drain is turned away too. The question is not left
+ *       for the sweeper: the drain looks at the queue again once it lets the claim go, and dispatches it.
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -27,6 +31,8 @@ describe("pending drain claim", { skip }, () => {
   let pendingDispatch: typeof import("../src/tasks/pending-dispatch.js");
   let dispatch: typeof import("../src/sessions/dispatch.js");
   let prompts: typeof import("../src/assistant/prompts.js");
+  let chatRun: typeof import("../src/tasks/chat-run.js");
+  let drainClaim: typeof import("../src/sessions/drain-claim.js");
   let pendingPorts: Record<string, unknown>;
   let sessionPorts: Record<string, unknown>;
   const user = (id: string) => ({ userId: id, userName: id, roles: ["default"], platformKey: `pk-${id}`, virtualKey: `vk-${id}` });
@@ -67,6 +73,8 @@ describe("pending drain claim", { skip }, () => {
     pendingDispatch = await import("../src/tasks/pending-dispatch.js");
     dispatch = await import("../src/sessions/dispatch.js");
     prompts = await import("../src/assistant/prompts.js");
+    chatRun = await import("../src/tasks/chat-run.js");
+    drainClaim = await import("../src/sessions/drain-claim.js");
     pendingPorts = { ...pendingDispatch.pendingDispatchPorts };
     sessionPorts = { ...dispatch.sessionDispatchPorts };
   });
@@ -181,6 +189,42 @@ describe("pending drain claim", { skip }, () => {
     assert.equal(published.length, 2);
     assert.equal(published[1].prompt.startsWith("Which of them is done?"), true, `the question goes first, not ${published[1].prompt}`);
     assert.deepEqual((await w.pending(alice.routerSid)).map((p) => p.content), [report(2)], "the report waits its turn");
+  });
+
+  test("Q3 a question queued behind a drain that starts no turn is dispatched when that drain ends", { timeout: 30_000 }, async () => {
+    const binding = gate();
+    let binds = 0;
+    let admissions = 0;
+    Object.assign(pendingDispatch.pendingDispatchPorts, {
+      bindWorkspace: async () => {
+        if (binds++ === 0) { binding.reached(); await binding.released; }
+        return "kws_1";
+      },
+      admit: async () => (admissions++ === 0 ? { kind: "reject", reason: "runs_hard_limit" } : { kind: "admit" }),
+      // The consumer handling the refusal's completion: it hands the gate back and drains, under the drain's claim.
+      publishSessionEvent: async (sid: string, event: Record<string, unknown>) => {
+        if (event.type !== "exec_complete") return;
+        await chatRun.releaseSessionGateForTurn(sid, event.message_id as string);
+        completionDrained = await drainClaim.withPendingDrainClaim(sid, async () => {});
+      },
+    });
+    let completionDrained: boolean | undefined;
+    await queueReport(1);
+    const drain = tracked(consumer.drainOldestPendingMessage(alice.routerSid, "alice"));
+    await binding.reachedP;
+    assert.equal((await session()).agent_status, "idle", "the drain has not taken the gate");
+
+    const asked = tracked(ask("Is S16a done?"));
+    await settledSoon(asked, "the question");
+    assert.equal((await asked.promise).kind, "queued", "queued behind the drain under way");
+    binding.release();
+    await drain.promise;
+
+    assert.equal(completionDrained, false, "the refusal's completion was turned away by the drain's claim");
+    assert.equal(admissions, 2, "the report was refused, and the question was then admitted");
+    assert.deepEqual(published.map((p) => p.prompt.startsWith("Is S16a done?")), [true], "the question's turn started, and only it");
+    assert.deepEqual(await w.pending(alice.routerSid), [], "nothing is left for the sweeper");
+    assert.equal((await session()).agent_status, "running");
   });
 
   test("Q2 the sweeper and the completion's drain of one message start one turn", { timeout: 30_000 }, async () => {
