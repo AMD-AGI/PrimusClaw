@@ -46,10 +46,15 @@ export interface DefaultSkill {
    * A skill that came with the request's plugin rather than from the platform
    * defaults. Its write must not fail quietly: see `LazyDefaultSkills.ensure`.
    */
-  source?: "plugin";
+  source?: "plugin" | "repo";
+  /**
+   * Where the skill's files already are in the sandbox, for a skill that came with the bound
+   * repository: its scripts run from there, and it is never written to `.skills/`.
+   */
+  sandboxDir?: string;
 }
 
-const SKILL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+export const SKILL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 export const DESCRIPTION_MAX = 300;
 export const MAX_DEFAULT_SKILLS = 50;
 
