@@ -7,12 +7,13 @@
  * and the service wired to all three. The acting user is `u-bob` (GitHub login
  * `bob`); the requester is `u-alice`.
  */
+import { createHash, randomUUID } from "node:crypto";
 import { PGlite } from "@electric-sql/pglite";
 import { IdentityCredentialRefusedError, IdentityUnavailableError, type ResolveCredentialRequest, type ResolvedCredential } from "@claw/utils";
 import { GithubReview, type ReviewActor } from "../../src/github-review/service.js";
 import { readGithubReviewSettings, type GithubReviewSettings } from "../../src/github-review/settings.js";
 import { GITHUB_REVIEW_SCHEMA_SQL, type Queryable } from "../../src/github-review/store.js";
-import { FakeGithub } from "./fake-github.js";
+import { FakeGithub, HEAD } from "./fake-github.js";
 
 export const TOKEN = "gho_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
 export const REQUESTER_TOKEN = "gho_Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i2";
@@ -62,10 +63,44 @@ export async function closeShared(): Promise<void> {
   await pg?.close();
 }
 
-export async function reviewEnv(env: Record<string, string> = {}, over: { actor?: Partial<ReviewActor>; cred?: Partial<ResolvedCredential> } = {}): Promise<ReviewEnv> {
+/**
+ * What the review instructions ask of the session before an approval or a merge of `head`, seeded as the service reads it back
+ * (store.ts `headReviewFacts`): it read that head with `gh_pr_get` on `path`, and, unless `secondPass` is false, a sub-agent of it that used
+ * a tool finished after that read.
+ */
+export async function reviewedHead(
+  e: Pick<ReviewEnv, "sql" | "actor">, o: { head?: string; path?: "sandbox" | "api_diff"; secondPass?: boolean; pr?: string } = {},
+): Promise<void> {
+  const [repo, pr] = (o.pr ?? PR).split("#");
+  await e.sql(
+    `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, tool, repo, pr, head_sha, result, detail, review_path, at)
+     VALUES ($1, $2, $3, 'gh_pr_get', $4, $5, $6, 'ok', 'ok', $7, NOW() - INTERVAL '1 minute')`,
+    [e.actor.requesterUserId, e.actor.actorUserId, e.actor.sessionId, repo, Number(pr), o.head ?? HEAD, o.path ?? "sandbox"],
+  );
+  if (o.secondPass !== false) await subAgentEnded(e);
+}
+
+/** Brain's `subagentEnd` of one sub-agent of the session, stored as the event consumer stores it. */
+export async function subAgentEnded(e: Pick<ReviewEnv, "sql" | "actor">, data: Record<string, unknown> = { failed: false, turns: 12, tool_stats: { total_calls: 9, error_calls: 0, by_tool: {} } }): Promise<void> {
+  await e.sql("INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, 'subagentEnd', $3::jsonb)", [randomUUID(), e.actor.sessionId, JSON.stringify(data)]);
+}
+
+/** An approval this session posted on `head` (default HEAD), as GitHub lists it: the acting user's, with the session's run marker. */
+export function ownApproval(sessionId: string, head: string = HEAD, prefix = "claw-review:run"): Record<string, any> {
+  const runId = createHash("sha256").update(`${sessionId}:${head}`).digest("hex").slice(0, 12);
+  return { id: 880, state: "APPROVED", user: { login: "bob" }, commit_id: head, body: `No blocking findings.\n\n<!-- ${prefix}:${runId}:APPROVE:0123456789ab -->` };
+}
+
+export async function reviewEnv(
+  env: Record<string, string> = {},
+  over: { actor?: Partial<ReviewActor>; cred?: Partial<ResolvedCredential>; reviewed?: boolean; approved?: boolean } = {},
+): Promise<ReviewEnv> {
   const pg = (shared ??= new PGlite());
-  await pg.exec("DROP TABLE IF EXISTS claw_github_audit, claw_github_confirmations, claw_github_review_settings, claw_github_write_locks, claw_sessions");
+  await pg.exec("DROP TABLE IF EXISTS claw_github_audit, claw_github_confirmations, claw_github_review_settings, claw_github_write_locks, claw_sessions, claw_session_events");
   await pg.exec("CREATE TABLE claw_sessions (session_id TEXT PRIMARY KEY, user_id TEXT, config JSONB DEFAULT '{}'::jsonb, deleted_at TIMESTAMPTZ)");
+  // The columns of infra/db.ts that the review reads: a session's sub-agent runs (`subagentEnd`), as the event consumer stores them.
+  await pg.exec(`CREATE TABLE claw_session_events (id SERIAL PRIMARY KEY, event_id TEXT NOT NULL, session_id TEXT NOT NULL, UNIQUE (event_id, session_id),
+    event TEXT NOT NULL, data JSONB DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ DEFAULT NOW(), deleted_at TIMESTAMPTZ)`);
   for (const sql of GITHUB_REVIEW_SCHEMA_SQL) await pg.exec(sql);
   const db: Queryable = {
     query: async (text, params) => {
@@ -85,12 +120,16 @@ export async function reviewEnv(env: Record<string, string> = {}, over: { actor?
     resolveCredential: async (req) => { resolved.push(req); return identity.answer(req); },
   });
   const actor: ReviewActor = { sessionId: "s-1", requesterUserId: "u-alice", actorUserId: "u-bob", requesterLabel: "Alice A", ...over.actor };
-  return {
+  const made = {
     pg, db, gh, service, get settings() { return current; }, resolved, sleeps, get onSleep() { return hooks.onSleep; }, set onSleep(f: (ms: number) => void) { hooks.onSleep = f; }, identity, actor,
     sql: async (text, params) => (await pg.query(text, params as unknown[] | undefined)).rows as Record<string, any>[],
     configure(extra) { current = readGithubReviewSettings({ CLAW_GITHUB_REVIEW_MCP_SECRET: SECRET, CLAW_GITHUB_WRITES_ENABLED: "true", ...env, ...extra }, true); },
     close: async () => {},
   } as ReviewEnv;
+  // Most tests are about a later gate, so their session has done what the review asks first; a test of these gates says otherwise.
+  if (over.reviewed !== false) await reviewedHead(made);
+  if (over.approved) gh.reviews.push(ownApproval(actor.sessionId));
+  return made;
 }
 
 export const unbound = (): Promise<never> => Promise.reject(new IdentityCredentialRefusedError("not_bound", 404));

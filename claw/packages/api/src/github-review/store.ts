@@ -273,6 +273,36 @@ export async function recentWrites(
   return { count: Number(row.n), pairPresent: row.present === true };
 }
 
+/**
+ * What this session did with one head commit of a pull request before an approval or a merge of it: whether it read it with `gh_pr_get`
+ * (`read`), whether any of those reads chose the sandbox path, and whether a sub-agent of the session finished, used a tool and did not fail
+ * after the first of them (`secondPass`). The sub-agent's end is Brain's `subagentEnd` event as the event consumer stored it; Brain publishes
+ * it, so neither the model nor the pull request's text can write it.
+ */
+export async function headReviewFacts(
+  db: Queryable, sessionId: string, repo: string, pr: number, headSha: string,
+): Promise<{ read: boolean; sandbox: boolean; secondPass: boolean }> {
+  const r = await db.query(
+    `WITH reads AS (
+       SELECT MIN(at) AS first_at, COALESCE(BOOL_OR(review_path = 'sandbox'), FALSE) AS sandbox
+         FROM claw_github_audit
+        WHERE session_id = $1 AND tool = 'gh_pr_get' AND result = 'ok' AND lower(repo) = lower($2) AND pr = $3 AND head_sha = $4
+     )
+     SELECT first_at IS NOT NULL AS read, sandbox,
+            EXISTS (
+              SELECT 1 FROM claw_session_events ev
+               WHERE ev.session_id = $1 AND ev.event = 'subagentEnd' AND ev.deleted_at IS NULL AND ev.created_at >= reads.first_at
+                 AND COALESCE(ev.data->>'failed', 'false') <> 'true'
+                 AND CASE WHEN jsonb_typeof(ev.data->'tool_stats'->'total_calls') = 'number'
+                          THEN (ev.data->'tool_stats'->>'total_calls')::numeric > 0 ELSE FALSE END
+            ) AS second_pass
+       FROM reads`,
+    [sessionId, repo, pr, headSha],
+  );
+  const row = r.rows[0] as { read: boolean; sandbox: boolean; second_pass: boolean };
+  return { read: row.read === true, sandbox: row.sandbox === true, secondPass: row.second_pass === true };
+}
+
 // ---------------------------------------------------------- confirmations
 
 export type ConfirmationStatus = "pending" | "merging" | "merged" | "queued" | "submitted" | "denied" | "stale" | "expired" | "refused";

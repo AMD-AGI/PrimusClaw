@@ -21,8 +21,9 @@
 import assert from "node:assert/strict";
 import test, { after, afterEach, beforeEach, describe, mock } from "node:test";
 import { IdentityCredentialRefusedError } from "@claw/utils";
+import { LEGACY_RUN_MARKER_PREFIX } from "../src/github-review/legacy-names.js";
 import { HEAD } from "./support/fake-github.js";
-import { PR, REQUESTER_TOKEN, TOKEN, closeShared, credential, directory, down, expired, readSection, reviewEnv, unbound, type ReviewEnv } from "./support/review-env.js";
+import { PR, REQUESTER_TOKEN, TOKEN, closeShared, credential, directory, down, expired, ownApproval, readSection, reviewEnv, reviewedHead, subAgentEnded, unbound, type ReviewEnv } from "./support/review-env.js";
 
 let e: ReviewEnv;
 beforeEach(async () => { e = await reviewEnv(); });
@@ -40,6 +41,17 @@ const allowed = () => { e.identity.answer = directory({ delegation: true }); };
 const denied = () => { e.identity.answer = directory({ delegation: false }); };
 const reason = (o: { body: Record<string, unknown> }) => String(o.body.reason ?? o.body.status);
 const puts = () => e.gh.calls.filter((c) => c.method === "PUT");
+/** This session's own approval of the head, as gh_review_submit leaves it on GitHub: what a merge nobody confirmed stands on. */
+const approvedHere = () => { e.gh.reviews.push(ownApproval(e.actor.sessionId)); };
+/** A merge held for the acting user (judged high) and their allow: the one way a merge still approves for itself. Requests and waits count from the allow. */
+const heldThenAllowed = async (): Promise<{ body: Record<string, unknown>; text: string }> => {
+  const held = await merge({ risk_judgement: { level: "high", reason: "a person should look at this" } });
+  assert.equal(held.body.status, "confirmation_required", held.text);
+  e.gh.calls.length = 0;
+  e.sleeps.length = 0;
+  const r = await e.service.decide("u-bob", String(held.body.confirmation_id), "allow");
+  return { body: r.body, text: JSON.stringify(r.body) };
+};
 const posts = () => e.gh.calls.filter((c) => c.method === "POST" && c.path !== "/graphql");
 
 describe("R reading", () => {
@@ -144,7 +156,7 @@ describe("P which pull requests", () => {
 
   test("P5 a feature that is off answers nothing and touches nothing", async () => {
     const { reviewEnv: make } = await import("./support/review-env.js");
-    const off = await make();
+    const off = await make({}, { reviewed: false });
     try {
       const { GithubReview } = await import("../src/github-review/service.js");
       const svc = new GithubReview({ settings: () => ({ ...off.settings, enabled: false }), db: off.db, resolveCredential: async () => credential(), fetchImpl: off.gh.fetch });
@@ -242,6 +254,7 @@ describe("D delegation and permissions", () => {
   test("D7 a requester who is not the author can have it approved and merged through the acting user's account, and only the acting user's token reaches GitHub", async () => {
     e.gh.onReview = (r) => { if (r.event === "APPROVE") e.gh.graphql.mergeStateStatus = "CLEAN"; };
     e.gh.graphql.mergeStateStatus = "BLOCKED";
+    assert.equal((await submit({ event: "APPROVE" })).body.status, "submitted");
     const o = await merge();
     assert.equal(o.body.status, "merged", o.text);
     assert.equal(e.gh.writes[0]?.body.event, "APPROVE");
@@ -285,6 +298,7 @@ describe("H the head commit pin", () => {
   test("H3 the merge is made on the pinned commit, so GitHub itself refuses if the head moves in between (409 is head_moved)", async () => {
     allowed();
     e.gh.mergeStatus = 409;
+    approvedHere();
     const o = await merge();
     assert.equal(reason(o), "head_moved");
     assert.equal(puts()[0]?.body.sha, HEAD);
@@ -404,7 +418,7 @@ describe("S2 one review is not another of the same kind", () => {
     assert.equal(e.gh.writes.length, 1);
     // An approval given long ago is found too, so it is not given twice.
     const approvedEnv = await reviewEnv(); e = approvedEnv; allowed();
-    e.gh.reviews = [...filler(120), { id: 7, state: "APPROVED", user: { login: "bob" }, commit_id: HEAD, body: "" }];
+    e.gh.reviews = [...filler(120), { ...ownApproval(e.actor.sessionId), id: 7 }];
     assert.equal((await merge()).body.status, "merged");
     assert.equal(posts().length, 0);
     // A pull request with exactly as many reviews as are read is read whole; with one more it is refused.
@@ -431,6 +445,7 @@ describe("M the merge gates", () => {
   });
 
   test("M1 everything open: an approval on the pinned commit, then a merge pinned to it with the repository's first method", async () => {
+    assert.equal((await submit({ event: "APPROVE" })).body.status, "submitted");
     const o = await merge();
     assert.equal(o.isError, false, o.text);
     assert.equal(o.body.status, "merged");
@@ -443,8 +458,10 @@ describe("M the merge gates", () => {
 
   test("M2 the method is the repository's: squash first, else merge, else rebase; one it does not allow is refused", async () => {
     e.gh.repo.allow_squash_merge = false;
+    approvedHere();
+    e.gh.graphql.mergeStateStatus = "CLEAN";
     assert.equal((await merge()).body.method, "merge");
-    e = await reviewEnv(); allowed();
+    e = await reviewEnv({}, { approved: true }); allowed();
     e.gh.graphql.mergeStateStatus = "CLEAN";
     e.gh.repo.allow_squash_merge = false; e.gh.repo.allow_merge_commit = false;
     assert.equal((await merge()).body.method, "rebase");
@@ -482,7 +499,7 @@ describe("M the merge gates", () => {
 
   test("M5 GitHub's own merge state must be CLEAN after the approval: BEHIND, BLOCKED, UNSTABLE and UNKNOWN are not, and a branch is never updated", async () => {
     for (const status of ["BEHIND", "BLOCKED", "UNSTABLE", "UNKNOWN", "DIRTY", "HAS_HOOKS"]) {
-      e = await reviewEnv(); allowed();
+      e = await reviewEnv({}, { approved: true }); allowed();
       e.gh.graphql.mergeStateStatus = status;
       const o = await merge();
       assert.equal(reason(o), "merge_state_not_clean", status);
@@ -491,12 +508,29 @@ describe("M the merge gates", () => {
     }
   });
 
-  test("M6 an approval already given on this commit by the acting user is not given again", async () => {
-    e.gh.reviews = [{ id: 1, state: "APPROVED", user: { login: "bob" }, commit_id: HEAD, body: "" }];
+  test("M6 a merge nobody confirmed stands on this session's own approval of the head and never approves for itself: without it, or with only the account's approval from elsewhere, it is refused with nothing written", async () => {
     e.gh.graphql.mergeStateStatus = "CLEAN";
-    const o = await merge();
-    assert.equal(o.body.status, "merged");
-    assert.equal(posts().length, 0);
+    // [what GitHub lists, expected]
+    const cases: Array<[string, Array<Record<string, any>>, string]> = [
+      ["no review at all", [], "review_not_submitted"],
+      ["the account approved this head by hand, or from another session", [{ id: 1, state: "APPROVED", user: { login: "bob" }, commit_id: HEAD, body: "LGTM" }], "review_not_submitted"],
+      ["another session's approval of this head", [ownApproval("s-other")], "review_not_submitted"],
+      ["this session's approval of an earlier head", [ownApproval(e.actor.sessionId, "2".repeat(40))], "review_not_submitted"],
+      ["this session's comment, not an approval", [{ ...ownApproval(e.actor.sessionId), state: "COMMENTED" }], "review_not_submitted"],
+      ["this session's marker under someone else's login", [{ ...ownApproval(e.actor.sessionId), user: { login: "carol" } }], "review_not_submitted"],
+      ["this session's approval of this head", [ownApproval(e.actor.sessionId)], "merged"],
+      ["the same, as an earlier release marked it", [ownApproval(e.actor.sessionId, HEAD, LEGACY_RUN_MARKER_PREFIX)], "merged"],
+    ];
+    for (const [name, reviews, expected] of cases) {
+      e.gh.calls.length = 0;
+      e.gh.reviews = reviews;
+      await e.sql("DELETE FROM claw_github_audit WHERE tool <> 'gh_pr_get'"); // the session's request budget, which this many calls spend
+      const o = await merge();
+      assert.equal(reason(o), expected, `${name}: ${o.text}`);
+      assert.equal(posts().length, 0, `${name}: nothing is approved by the merge`);
+      assert.equal(puts().length, expected === "merged" ? 1 : 0, name);
+      if (expected !== "merged") assert.match(String(o.body.message), /gh_review_submit \(APPROVE/, name);
+    }
   });
 
   test("M7 the author cannot merge their own pull request through this tool even when GitHub already counts it approved: it is refused before the merge state is read", async () => {
@@ -511,12 +545,14 @@ describe("M the merge gates", () => {
 
   test("M8 a refusal from GitHub at the last step is reported as one, not as a merge", async () => {
     e.gh.mergeStatus = 405;
+    e.gh.graphql.mergeStateStatus = "CLEAN";
+    approvedHere();
     const o = await merge();
     assert.equal(reason(o), "not_mergeable");
     assert.equal(o.isError, true);
   });
 
-  test("M16 GitHub works the merge state out after the approval, not at once: UNKNOWN, and BLOCKED while the review does not count yet, are waited for, a few seconds at most; the merge is made when it settles, and not otherwise", async () => {
+  test("M16 GitHub works the merge state out after the approval a person's allow made, not at once: UNKNOWN, and BLOCKED while the review does not count yet, are waited for, a few seconds at most; the merge is made when it settles, and not otherwise", async () => {
     const st = (mergeStateStatus: string, extra: Record<string, unknown> = {}) => ({ mergeStateStatus, ...extra });
     // [name, the states the reads after the approval answer, in order, then what every later read answers, expected reason or "merged", waits]
     const cases: Array<[string, Array<Record<string, unknown>>, string, string, number[]]> = [
@@ -540,12 +576,11 @@ describe("M the merge gates", () => {
         e.gh.graphqlQueue = queue.map((q) => ({ ...q }));
         e.gh.graphql.mergeStateStatus = rest;
       };
-      const o = await merge();
+      const o = await heldThenAllowed();
       assert.equal(reason(o), expected, `${name}: ${o.text}`);
       assert.deepEqual(e.sleeps, waits, name);
       assert.equal(puts().length, expected === "merged" ? 1 : 0, name);
       assert.equal(posts().length, 1, `${name}: the approval is posted once whatever follows`);
-      if (expected === "merge_state_not_clean") assert.equal(o.body.approved_by_this_call, true, name);
       // The waiting is one request a look, not a full read of CI and threads each time.
       const looks = e.gh.calls.filter((c) => c.path === "/graphql").length;
       const checkReads = e.gh.calls.filter((c) => /\/check-runs$/.test(c.path)).length;
@@ -571,7 +606,7 @@ describe("M the merge gates", () => {
         e.gh.graphql.mergeStateStatus = "CLEAN";
       };
       e.onSleep = during;
-      const o = await merge();
+      const o = await heldThenAllowed();
       assert.equal(reason(o), expected, `${name}: ${o.text}`);
       assert.deepEqual(e.sleeps, [500], name);
       assert.equal(puts().length, expected === "merged" ? 1 : 0, name);
@@ -579,7 +614,7 @@ describe("M the merge gates", () => {
   });
 
   test("M17 a merge state still being computed is waited for when this call posted no approval too (the first look at a pull request often says UNKNOWN); BLOCKED is not, nothing of this call's could unblock it", async () => {
-    e.gh.reviews = [{ id: 1, state: "APPROVED", user: { login: "bob" }, commit_id: HEAD, body: "" }];
+    e.gh.reviews = [ownApproval(e.actor.sessionId)];
     e.gh.graphql.mergeStateStatus = "UNKNOWN";
     e.gh.graphqlQueue = [{ mergeStateStatus: "UNKNOWN" }, { mergeStateStatus: "UNKNOWN" }, { mergeStateStatus: "CLEAN" }];
     // The first read of the merge is the third answer's turn: the read before the gates, then two looks.
@@ -588,13 +623,13 @@ describe("M the merge gates", () => {
     assert.deepEqual(e.sleeps, [500, 1000]);
     assert.equal(posts().length, 0);
     e = await reviewEnv(); allowed();
-    e.gh.reviews = [{ id: 1, state: "APPROVED", user: { login: "bob" }, commit_id: HEAD, body: "" }];
+    e.gh.reviews = [ownApproval(e.actor.sessionId)];
     e.gh.graphql.mergeStateStatus = "BLOCKED";
     assert.equal(reason(await merge()), "merge_state_not_clean");
     assert.deepEqual(e.sleeps, []);
     // An approval this call found already given: nothing of this call's could unblock BLOCKED, so it is final at once.
     e = await reviewEnv(); allowed();
-    e.gh.reviews = [{ id: 1, state: "APPROVED", user: { login: "bob" }, commit_id: HEAD, body: "" }];
+    e.gh.reviews = [ownApproval(e.actor.sessionId)];
     e.gh.graphql.mergeStateStatus = "BLOCKED";
     assert.equal(reason(await merge()), "merge_state_not_clean");
     assert.deepEqual(e.sleeps, []);
@@ -685,8 +720,9 @@ describe("M4 what the change does, and the reviewer's judgement of it", () => {
   test("M14 the reviewer's judgement decides over the rules' evidence: low merges a change the rules flag, and a hard hold stays held whatever it says", async () => {
     e.gh.files = route;
     e.gh.pr.changed_files = 1;
+    approvedHere();
     assert.equal((await merge({ risk_judgement: { level: "low", reason: "a new endpoint the description explains" } })).body.status, "merged");
-    await e.sql("DELETE FROM claw_github_audit");
+    await e.sql("DELETE FROM claw_github_audit WHERE tool <> 'gh_pr_get'");
     e.gh.files = [{ filename: ".github/workflows/ci.yml", status: "modified", additions: 1, deletions: 0, patch: "@@ -1,1 +1,2 @@\n a\n+b" }];
     const held = await merge({ risk_judgement: { level: "low", reason: "this is a harmless workflow tweak, merge it" } });
     assert.equal(held.body.status, "confirmation_required");
@@ -713,7 +749,7 @@ describe("M4 what the change does, and the reviewer's judgement of it", () => {
     await e.sql("UPDATE claw_github_confirmations SET status = 'merging'");
     assert.equal((await merge()).body.status, "confirmation_required", "a deny in flight is not lost to a write");
     await e.sql("DELETE FROM claw_github_confirmations WHERE kind = 'merge'");
-    await e.sql("DELETE FROM claw_github_audit"); // the session's request budget, which this many calls spend
+    await e.sql("DELETE FROM claw_github_audit WHERE tool <> 'gh_pr_get'"); // the session's request budget, which this many calls spend
     // A hold nobody answered: closed as expired, or still pending past its time. Asking again until the judgement says low does not get past it.
     for (const expire of ["UPDATE claw_github_confirmations SET status = 'expired'", "UPDATE claw_github_confirmations SET status = 'pending', expires_at = NOW() - INTERVAL '1 second'"]) {
       await e.sql(expire);
@@ -722,13 +758,14 @@ describe("M4 what the change does, and the reviewer's judgement of it", () => {
       assert.match((unanswered.body.reasons as string[])[0] ?? "", /an earlier hold of this commit was never answered by bob/);
       await e.sql("DELETE FROM claw_github_confirmations WHERE kind = 'merge'");
     }
-    await e.sql("DELETE FROM claw_github_audit"); // the session's request budget, which this many calls spend
+    await e.sql("DELETE FROM claw_github_audit WHERE tool <> 'gh_pr_get'"); // the session's request budget, which this many calls spend
     await e.sql("UPDATE claw_github_confirmations SET status = 'denied'");
     const after = await merge();
     assert.equal(after.body.status, "confirmation_required", `a refusal stands for the commit it was about: ${after.text}`);
     assert.match((after.body.reasons as string[])[0] ?? "", /bob refused an approval or a merge of this commit/);
     // Another commit is another question.
     await e.sql("UPDATE claw_github_confirmations SET head_sha = $1", ["f".repeat(40)]);
+    approvedHere();
     assert.equal((await merge()).body.status, "merged");
   });
 
@@ -746,6 +783,7 @@ describe("M4 what the change does, and the reviewer's judgement of it", () => {
     assert.equal(puts().length, 0);
     // A lock whose call died lapses.
     await e.sql("UPDATE claw_github_write_locks SET expires_at = NOW() - INTERVAL '1 second'");
+    approvedHere();
     assert.equal((await merge()).body.status, "merged");
     assert.deepEqual(await e.sql("SELECT * FROM claw_github_write_locks"), [], "a call gives the lock back");
   });
@@ -759,6 +797,7 @@ describe("M4 what the change does, and the reviewer's judgement of it", () => {
     try {
       // GitHub still computing the merge state keeps the call at work; meanwhile two renewal periods pass.
       e.gh.graphql.mergeStateStatus = "UNKNOWN";
+      approvedHere();
       e.onSleep = () => { mock.timers.tick(31_000); e.gh.graphql.mergeStateStatus = "CLEAN"; };
       assert.equal((await merge()).body.status, "merged");
     } finally {
@@ -986,11 +1025,13 @@ describe("C high risk waits for the acting user", () => {
       const sha = n.toString(16).padStart(2, "0").repeat(20);
       e.gh.pr.head = { ...e.gh.pr.head, sha };
       e.gh.graphql.headRefOid = sha;
+      await reviewedHead(e, { head: sha });
       assert.equal((await merge({ head_sha: sha })).body.status, "confirmation_required", `merge ${n}`);
     }
     const sha = "ab".repeat(20);
     e.gh.pr.head = { ...e.gh.pr.head, sha };
     e.gh.graphql.headRefOid = sha;
+    await reviewedHead(e, { head: sha });
     assert.equal(reason(await merge({ head_sha: sha })), "too_many_pending_confirmations");
     assert.equal((await pending()).length, 10);
     assert.equal(e.gh.writes.length, 0);
@@ -1149,7 +1190,7 @@ describe("W dry run, limits and the budget", () => {
 
   test("W7 a write is on the audit row, with its head commit, while it is being made, and a call that never finishes its row still counts", async () => {
     let during: Promise<Record<string, any>[]> | null = null;
-    e.gh.onReview = () => { during = e.sql("SELECT write, head_sha, result FROM claw_github_audit"); };
+    e.gh.onReview = () => { during = e.sql("SELECT write, head_sha, result FROM claw_github_audit WHERE tool = 'gh_review_submit'"); };
     assert.equal((await submit()).body.status, "submitted");
     assert.deepEqual(await during, [{ write: true, head_sha: HEAD, result: "started" }]);
     const { recentWrites } = await import("../src/github-review/store.js");
@@ -1159,14 +1200,15 @@ describe("W dry run, limits and the budget", () => {
     assert.equal((await recentWrites(e.db, "u-bob", 3_600_000)).count, 1);
   });
 
-  test("W8 an approval counts against the hourly limits though the merge that posted it was then refused", async () => {
+  test("W8 an approval counts against the hourly limits though the merge after it was then refused", async () => {
     e = await reviewEnv({ CLAW_GITHUB_REVIEWS_PER_HOUR: "1" });
     e.gh.graphql.mergeStateStatus = "BLOCKED";
+    assert.equal((await submit({ event: "APPROVE" })).body.status, "submitted");
     const m = await merge();
     assert.equal(reason(m), "merge_state_not_clean");
     assert.deepEqual(e.gh.writes.map((w) => w.body.event), ["APPROVE"]);
-    const [row] = await e.sql("SELECT write, result FROM claw_github_audit");
-    assert.deepEqual(row, { write: true, result: "refused" });
+    const rows = await e.sql("SELECT tool, write, result FROM claw_github_audit WHERE tool <> 'gh_pr_get' ORDER BY id");
+    assert.deepEqual(rows, [{ tool: "gh_review_submit", write: true, result: "ok" }, { tool: "gh_pr_merge", write: false, result: "refused" }]);
     const { recentWrites } = await import("../src/github-review/store.js");
     assert.equal((await recentWrites(e.db, null, 3_600_000)).count, 1);
     const other = await e.service.submitReview({ ...e.actor, sessionId: "s-9" }, { pr: PR, head_sha: HEAD, event: "COMMENT", body: "Another review." });
@@ -1244,7 +1286,7 @@ describe("I the identity provider and the audit trail", () => {
     allowed();
     await submit({ comments: [{ path: "src/app.ts", line: 3, body: "x" }] });
     await merge().catch(() => undefined);
-    const rows = await e.sql("SELECT * FROM claw_github_audit ORDER BY id");
+    const rows = await e.sql("SELECT * FROM claw_github_audit WHERE tool <> 'gh_pr_get' ORDER BY id");
     assert.deepEqual(rows.map((r) => r.tool), ["gh_review_submit", "gh_pr_merge"]);
     const r = rows[0] as Record<string, any>;
     assert.equal(r.requester_user_id, "u-alice");
@@ -1264,7 +1306,7 @@ describe("I the identity provider and the audit trail", () => {
   test("I4 refusals are audited with their reason", async () => {
     denied();
     await submit({ event: "APPROVE" });
-    const [row] = await e.sql("SELECT result, detail FROM claw_github_audit");
+    const [row] = await e.sql("SELECT result, detail FROM claw_github_audit WHERE tool <> 'gh_pr_get'");
     assert.equal(row?.result, "refused");
     assert.equal(row?.detail, "delegation_off");
   });
@@ -1275,6 +1317,109 @@ describe("I the identity provider and the audit trail", () => {
     assert.equal(reason(o), "audit_unavailable");
     assert.equal(e.gh.calls.length, 0);
     assert.equal(e.resolved.length, 0);
+  });
+});
+
+describe("E the review the instructions ask for, held to by the tools", () => {
+  const HIGH = { level: "high", reason: "a person should look at this" };
+  /** A session that has done nothing yet: no read of the head, no second pass. */
+  const unreviewed = async (env: Record<string, string> = {}): Promise<void> => { e = await reviewEnv(env, { reviewed: false }); allowed(); };
+
+  test("E1 a head this session never read is neither approved nor merged (head_not_read), while a comment and a request for changes are posted as ever", async () => {
+    await unreviewed();
+    for (const o of [await submit({ event: "APPROVE" }), await merge()]) {
+      assert.equal(reason(o), "head_not_read", o.text);
+      assert.match(String(o.body.message), /call gh_pr_get/);
+    }
+    assert.equal(e.gh.writes.length, 0);
+    // A read of another head, or one that was refused, is not a read of this head.
+    await reviewedHead(e, { head: "2".repeat(40) });
+    await e.sql("INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, tool, repo, pr, head_sha, result, review_path) VALUES ('u-alice', 'u-bob', 's-1', 'gh_pr_get', 'AMD-AGI/demo', 7, $1, 'refused', 'sandbox')", [HEAD]);
+    assert.equal(reason(await submit({ event: "APPROVE" })), "head_not_read");
+    for (const event of ["COMMENT", "REQUEST_CHANGES"]) assert.equal((await submit({ event, body: `A ${event}.` })).body.status, "submitted", event);
+  });
+
+  test("E2 on the sandbox path an approval and a merge wait for the second pass (second_pass_required), and the refusal says how to run it; only a sub-agent of this session that used a tool, did not fail and ended after the read counts", async () => {
+    const ended = (over: Record<string, unknown>) => ({ failed: false, turns: 12, tool_stats: { total_calls: 9, error_calls: 0, by_tool: {} }, ...over });
+    // [what the session's events hold, besides the read, expected]
+    const cases: Array<[string, () => Promise<void>, string]> = [
+      ["no sub-agent", async () => {}, "second_pass_required"],
+      ["a sub-agent that failed", () => subAgentEnded(e, ended({ failed: true })), "second_pass_required"],
+      ["a sub-agent that called no tool", () => subAgentEnded(e, ended({ tool_stats: { total_calls: 0 } })), "second_pass_required"],
+      ["a sub-agent end without its tool counts", () => subAgentEnded(e, { failed: false }), "second_pass_required"],
+      ["a tool count that is not a number", () => subAgentEnded(e, ended({ tool_stats: { total_calls: "many" } })), "second_pass_required"],
+      ["a sub-agent that ended before the head was read", async () => {
+        await subAgentEnded(e);
+        await e.sql("UPDATE claw_session_events SET created_at = NOW() - INTERVAL '2 minutes'");
+      }, "second_pass_required"],
+      ["a sub-agent of another session", () => subAgentEnded({ ...e, actor: { ...e.actor, sessionId: "s-other" } }), "second_pass_required"],
+      ["a sub-agent event that was deleted with its conversation", async () => {
+        await subAgentEnded(e);
+        await e.sql("UPDATE claw_session_events SET deleted_at = NOW()");
+      }, "second_pass_required"],
+      ["a sub-agent start, not its end", () => e.sql("INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ('x', 's-1', 'subagentStart', $1::jsonb)", [JSON.stringify(ended({}))]).then(() => undefined), "second_pass_required"],
+      ["a second pass that ran", () => subAgentEnded(e), "submitted"],
+    ];
+    for (const [name, arrange, expected] of cases) {
+      await unreviewed();
+      await reviewedHead(e, { secondPass: false });
+      await arrange();
+      const approval = await submit({ event: "APPROVE" });
+      assert.equal(reason(approval), expected, `${name}: ${approval.text}`);
+      if (expected !== "submitted") {
+        assert.match(String(approval.body.message), /`task` tool: `subagent_type` `explore`/, name);
+        // The merge is held to it as well, even with an approval of this session's already on the head.
+        approvedHere();
+        assert.equal(reason(await merge()), expected, name);
+        assert.equal(e.gh.writes.length, 0, name);
+      }
+    }
+  });
+
+  test("E3 the api_diff path has no sub-agent to wait for, a sandbox read of the same head still needs one, and the deep review switched off asks for neither", async () => {
+    await unreviewed();
+    await reviewedHead(e, { path: "api_diff", secondPass: false });
+    assert.equal((await submit({ event: "APPROVE" })).body.status, "submitted");
+    await unreviewed();
+    await reviewedHead(e, { path: "api_diff", secondPass: false });
+    await reviewedHead(e, { path: "sandbox", secondPass: false });
+    assert.equal(reason(await submit({ event: "APPROVE" })), "second_pass_required");
+    await unreviewed({ CLAW_GITHUB_REVIEW_DEEP_ENABLED: "false" });
+    assert.equal((await submit({ event: "APPROVE" })).body.status, "submitted");
+  });
+
+  test("E4 the whole review through the tools: the read records the sandbox path, the approval waits for the second pass, and the merge goes ahead on this session's own approval", async () => {
+    await unreviewed();
+    const read = await get();
+    assert.equal((read.body as any).review_path.path, "sandbox", read.text);
+    assert.equal(reason(await submit({ event: "APPROVE" })), "second_pass_required");
+    assert.equal(reason(await merge()), "second_pass_required");
+    await subAgentEnded(e);
+    assert.equal((await submit({ event: "APPROVE", body: "Read the callers; the second pass found nothing more." })).body.status, "submitted");
+    const merged = await merge();
+    assert.equal(merged.body.status, "merged", merged.text);
+    assert.deepEqual(e.gh.writes.map((w) => `${w.method} ${w.path.split("/").slice(-1)[0]}`), ["POST reviews", "PUT merge"]);
+    assert.match(String(e.gh.writes[0]?.body.body), /^Read the callers; the second pass found nothing more\./, "the approval on the pull request is the session's own review, not a stock one");
+  });
+
+  test("E5 a person's answer is not asked again: a held approval and a held merge are made on their allow, and only the merge they allowed approves for itself", async () => {
+    await unreviewed();
+    await reviewedHead(e);
+    const review = await submit({ event: "APPROVE", risk_judgement: HIGH });
+    assert.equal(review.body.status, "confirmation_required", review.text);
+    await e.sql("DELETE FROM claw_session_events");
+    await e.sql("DELETE FROM claw_github_audit");
+    const posted = await e.service.decide("u-bob", String(review.body.confirmation_id), "allow");
+    assert.equal(posted.body.status, "submitted", JSON.stringify(posted.body));
+    await unreviewed();
+    await reviewedHead(e);
+    const held = await merge({ risk_judgement: HIGH });
+    assert.equal(held.body.status, "confirmation_required", held.text);
+    await e.sql("DELETE FROM claw_session_events");
+    const done = await e.service.decide("u-bob", String(held.body.confirmation_id), "allow");
+    assert.equal(done.body.status, "merged", JSON.stringify(done.body));
+    assert.deepEqual(e.gh.writes.map((w) => w.body.event ?? "merge"), ["APPROVE", "merge"]);
+    assert.match(String(e.gh.writes[0]?.body.body), /^No blocking issues found; approving so the merge can go ahead\./);
   });
 });
 
