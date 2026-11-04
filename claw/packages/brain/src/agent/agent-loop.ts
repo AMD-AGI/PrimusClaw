@@ -155,6 +155,17 @@ const EMPTY_TURN_NUDGE = `${RESUME_NOTICE_PREFIX} Your last reply was empty: no 
   + "report of what you did and the result.";
 
 /**
+ * What a sub-agent is told when it has used every turn it was given.
+ *
+ * Its caller reads only its final text, and a sub-agent cut off mid-investigation
+ * has none: it returned nothing for all the work it did. One more reply is asked
+ * for, with nothing run from it but its text.
+ */
+const TURN_CAP_NOTICE = `${RESUME_NOTICE_PREFIX} You have used every turn you were given, and no further tool call `
+  + "will be run. Reply now, in text only, with your findings so far: what you checked, what you found, "
+  + "and what you could not get to.";
+
+/**
  * A top-level run whose model went silent twice running and never said anything.
  *
  * Not retryable on purpose: the message avoids every phrase isRetryable reads,
@@ -1009,16 +1020,15 @@ class AgentLoopRunner {
       toolCount: this.effectiveTools.length,
     }, "agent-loop.start");
 
-    for (
-      let turn = this.initialTurn;
-      this.maxTurns <= 0 || turn < this.maxTurns + this.initialTurn;
-      turn++
-    ) {
+    let ended = false;
+    let turn = this.initialTurn;
+    for (; this.maxTurns <= 0 || turn < this.maxTurns + this.initialTurn; turn++) {
       this.turnsExecuted = turn + 1 - this.initialTurn;
       if (this.signal?.aborted) break;
-      const shouldBreak = await this.runTurn(turn);
-      if (shouldBreak) break;
+      ended = await this.runTurn(turn);
+      if (ended) break;
     }
+    if (!ended && this.depth > 0 && !this.signal?.aborted) await this.reportAtTurnCap(turn);
 
     logger.info({
       sessionId: this.sessionId,
@@ -1040,6 +1050,28 @@ class AgentLoopRunner {
       },
       elapsedMs: Date.now() - this.startTime,
     };
+  }
+
+  /** A sub-agent's one text-only reply after its last allowed turn ended in tool calls (see TURN_CAP_NOTICE). */
+  private async reportAtTurnCap(turn: number): Promise<void> {
+    this.workingMessages.push({ role: "user", content: TURN_CAP_NOTICE });
+    const { content, usage } = await this.streamTurnWithRetry(turn, Date.now());
+    this.usage.input_tokens += usage.input_tokens;
+    this.usage.output_tokens += usage.output_tokens;
+    this.usage.cache_read += usage.cache_read;
+    this.usage.cache_create += usage.cache_create;
+    this.usage.turns++;
+    const text = content
+      .filter((b: any) => b.type === "text" && typeof b.text === "string")
+      .map((b: any) => b.text as string)
+      .join("\n")
+      .trim();
+    const ignoredToolCalls = content.filter((b: any) => b.type === "tool_use").length;
+    logger.info({ turn, sessionId: this.sessionId, depth: this.depth, textLen: text.length, ignoredToolCalls }, "agent-loop.turn_cap_report");
+    if (!text) return;
+    this.textParts.push(text);
+    this.workingMessages.push({ role: "assistant", content: [{ type: "text", text }] });
+    await this.onEvent({ type: "AssistantMessage", data: { content: [{ type: "text", text }] } });
   }
 
   private buildEffectiveTools(): ToolSchema[] {
