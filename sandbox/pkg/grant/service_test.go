@@ -402,8 +402,9 @@ func TestReserveStopsAtCap(t *testing.T) {
 		defer inFlight.Add(-1)
 		for m := maxInFlight.Load(); n > m && !maxInFlight.CompareAndSwap(m, n); m = maxInFlight.Load() {
 		}
+		err := c.Get(ctx, key, obj, opts...)
 		time.Sleep(time.Millisecond)
-		return c.Get(ctx, key, obj, opts...)
+		return err
 	}}
 	svc, priv, _, _ := testService(t, now, slowRead)
 	req := sampleRequest(now.Add(time.Hour))
