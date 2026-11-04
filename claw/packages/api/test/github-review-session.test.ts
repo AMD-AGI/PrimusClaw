@@ -96,11 +96,14 @@ const create = async (user: Caller, config: Record<string, unknown>, extra: Reco
 const stored = async (id: string) => (await h.sql("SELECT user_id, config FROM claw_sessions WHERE session_id = $1", [id]))[0] as { user_id: string; config: Record<string, unknown> };
 
 test("V1 a session created with acting_as records the reference and the verified caller's name, and the requester is the owner", async () => {
-  const r = await create(ALICE, { acting_as: "u-bob", notify_on_finish: true });
+  // Only as its creator, with the review items off as here: a review of someone else is theirs, asked through POST /v1/assistant/reviews.
+  const other = await create(ALICE, { acting_as: "u-bob", notify_on_finish: true });
+  assert.deepEqual([other.status, other.body.error], [403, "acting_as_must_be_self"]);
+  const r = await create(ALICE, { acting_as: "u-alice", notify_on_finish: true });
   assert.equal(r.status, 200, JSON.stringify(r.body));
   const row = await stored(r.body.data.session_id);
   assert.equal(row.user_id, "u-alice");
-  assert.deepEqual(row.config, { acting_as: "u-bob", acting_as_requester: "Alice A", notify_on_finish: true });
+  assert.deepEqual(row.config, { acting_as: "u-alice", acting_as_requester: "Alice A", notify_on_finish: true });
 });
 
 test("V2 acting_as must be a plain user id; each malformed one is a 400 that leaves no session and no turn", async () => {
@@ -114,7 +117,7 @@ test("V2 acting_as must be a plain user id; each malformed one is a 400 that lea
 });
 
 test("V3 a client cannot set the requester's name: it is server-managed, with or without acting_as", async () => {
-  for (const config of [{ acting_as: "u-bob", acting_as_requester: "Someone Else" }, { acting_as_requester: "Someone Else" }]) {
+  for (const config of [{ acting_as: "u-alice", acting_as_requester: "Someone Else" }, { acting_as_requester: "Someone Else" }]) {
     const r = await create(ALICE, config);
     assert.equal(r.status, 400);
     assert.equal(r.body.error, "config.acting_as_requester is server-managed");
@@ -131,40 +134,40 @@ test("V4 a session without acting_as is exactly what it was: no extra key is sto
 
 test("V8 config.review_target binds the session to one pull request: it is recorded as sent, and only a well-formed reference with acting_as is accepted", async () => {
   const target = { owner: "AMD-AGI", repo: "demo", number: 7 };
-  const r = await create(ALICE, { acting_as: "u-bob", review_target: target });
+  const r = await create(ALICE, { acting_as: "u-alice", review_target: target });
   assert.equal(r.status, 200, JSON.stringify(r.body));
-  assert.deepEqual((await stored(r.body.data.session_id)).config, { acting_as: "u-bob", acting_as_requester: "Alice A", review_target: target });
+  assert.deepEqual((await stored(r.body.data.session_id)).config, { acting_as: "u-alice", acting_as_requester: "Alice A", review_target: target });
   const bad: unknown[] = [
     "AMD-AGI/demo#7", 7, [], [target], { owner: "AMD-AGI", repo: "demo" }, { ...target, number: "7" }, { ...target, number: 0 }, { ...target, number: -1 }, { ...target, number: 1.5 },
     { ...target, number: 1e10 }, { ...target, owner: "a b" }, { ...target, owner: "../x" }, { ...target, owner: "" }, { ...target, repo: ".." }, { ...target, repo: "a/b" },
     { ...target, repo: "demo#8" }, { ...target, extra: "x" }, { ...target, pr: "AMD-AGI/other#1" },
   ];
   for (const review_target of bad) {
-    const refused = await create(ALICE, { acting_as: "u-bob", review_target }, { message: { content: "review it" } });
+    const refused = await create(ALICE, { acting_as: "u-alice", review_target }, { message: { content: "review it" } });
     assert.equal(refused.status, 400, JSON.stringify(review_target));
     assert.match(refused.body.error, /^config\.review_target must be \{owner, repo, number\}/, JSON.stringify(review_target));
   }
   const alone = await create(ALICE, { review_target: target }, { message: { content: "review it" } });
   assert.equal(alone.status, 400);
   assert.equal(alone.body.error, "config.review_target needs config.acting_as");
-  const nulled = await create(ALICE, { acting_as: "u-bob", review_target: null });
+  const nulled = await create(ALICE, { acting_as: "u-alice", review_target: null });
   assert.equal(nulled.status, 200, "null is no target, as it is for acting_as");
   assert.equal(await count(), 2, "only the two that were accepted left a session");
   assert.equal(published.length, 0);
 });
 
 test("V8b config.review_only is recorded as sent; only a boolean is accepted, and true needs acting_as", async () => {
-  const r = await create(ALICE, { acting_as: "u-bob", review_only: true });
+  const r = await create(ALICE, { acting_as: "u-alice", review_only: true });
   assert.equal(r.status, 200, JSON.stringify(r.body));
-  assert.deepEqual((await stored(r.body.data.session_id)).config, { acting_as: "u-bob", acting_as_requester: "Alice A", review_only: true });
+  assert.deepEqual((await stored(r.body.data.session_id)).config, { acting_as: "u-alice", acting_as_requester: "Alice A", review_only: true });
   for (const review_only of ["true", 1, 0, {}, []]) {
-    const refused = await create(ALICE, { acting_as: "u-bob", review_only }, { message: { content: "review it" } });
+    const refused = await create(ALICE, { acting_as: "u-alice", review_only }, { message: { content: "review it" } });
     assert.equal(refused.status, 400, JSON.stringify(review_only));
     assert.equal(refused.body.error, "config.review_only must be true or false");
   }
   const alone = await create(ALICE, { review_only: true }, { message: { content: "review it" } });
   assert.deepEqual([alone.status, alone.body.error], [400, "config.review_only needs config.acting_as"]);
-  for (const config of [{ review_only: false }, { acting_as: "u-bob", review_only: null }]) {
+  for (const config of [{ review_only: false }, { acting_as: "u-alice", review_only: null }]) {
     assert.equal((await create(ALICE, config)).status, 200, `${JSON.stringify(config)}: false and null ask for nothing`);
   }
   assert.equal(await count(), 3, "only the three that were accepted left a session");
@@ -173,7 +176,7 @@ test("V8b config.review_only is recorded as sent; only a boolean is accepted, an
 
 test("V9 asking for a bound session needs the same credentials as any session that acts as a user", async () => {
   for (const method of ["api_key", "x_api_key", "cookie", null]) {
-    const r = await create(ALICE, { acting_as: "u-bob", review_target: { owner: "AMD-AGI", repo: "demo", number: 7 } }, {}, method);
+    const r = await create(ALICE, { acting_as: "u-alice", review_target: { owner: "AMD-AGI", repo: "demo", number: 7 } }, {}, method);
     assert.equal(r.status, 403, String(method));
     assert.equal(r.body.error, "interactive_sign_in_required", String(method));
   }
@@ -186,7 +189,7 @@ test("V5 the key a sandbox holds, the cookie that key signs in to and every othe
   // A model injected in any ordinary session of Alice holds her key and could otherwise start a session that acts as her (or as a colleague who
   // allowed her) and review and merge with the account on its own.
   for (const method of ["api_key", "x_api_key", "query_token", "connector_token", "cookie", "something_new", null]) {
-    for (const actingAs of ["u-alice", "u-bob"]) {
+    for (const actingAs of ["u-alice"]) {
       const r = await create(ALICE, { acting_as: actingAs }, { message: { content: "review it" } }, method);
       assert.equal(r.status, 403, `${method} acting as ${actingAs}`);
       assert.equal(r.body.error, "interactive_sign_in_required", `${method} acting as ${actingAs}`);
@@ -201,14 +204,14 @@ test("V6 an identity-provider token creates one: a person's own, and a service's
   try {
     process.env.CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS = "chat-worker";
     assert.equal((await create(ALICE, { acting_as: "u-alice" })).status, 200, "a person's own token, acting as themselves");
-    assert.equal((await create({ ...ALICE, delegation: { clientId: "claw-web" } }, { acting_as: "u-bob" })).status, 200, "a token that names a client and no actor is the person's");
+    assert.equal((await create({ ...ALICE, delegation: { clientId: "claw-web" } }, { acting_as: "u-alice" })).status, 200, "a token that names a client and no actor is the person's");
     const service = { ...ALICE, delegation: { actorSub: "chat-worker", clientId: "chat-worker" } };
-    assert.equal((await create(service, { acting_as: "u-bob" })).status, 200, "an allowed service acting for Alice");
-    const other = await create({ ...ALICE, delegation: { actorSub: "other-service", clientId: "other-service" } }, { acting_as: "u-bob" });
+    assert.equal((await create(service, { acting_as: "u-alice" })).status, 200, "an allowed service acting for Alice");
+    const other = await create({ ...ALICE, delegation: { actorSub: "other-service", clientId: "other-service" } }, { acting_as: "u-alice" });
     assert.equal(other.status, 403);
     assert.equal(other.body.error, "service_client_not_allowed");
     process.env.CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS = "";
-    assert.equal((await create(service, { acting_as: "u-bob" })).body.error, "service_client_not_allowed", "every service is refused while the list is empty");
+    assert.equal((await create(service, { acting_as: "u-alice" })).body.error, "service_client_not_allowed", "every service is refused while the list is empty");
     assert.equal(await count(), 3);
   } finally {
     if (saved === undefined) delete process.env.CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS; else process.env.CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS = saved;
@@ -221,14 +224,14 @@ test("V7 a key is still the ordinary way to use the API: a session without actin
 });
 
 test("T1 the first turn of such a session carries the review tools: a signed token for this session, its owner and the acting user, and no GitHub credential", async () => {
-  const r = await create(ALICE, { acting_as: "u-bob" }, { message: { content: "review it" } });
+  const r = await create(ALICE, { acting_as: "u-alice" }, { message: { content: "review it" } });
   assert.equal(r.status, 200, JSON.stringify(r.body));
   assert.equal(published.length, 1);
   const server = (published[0]?.mcp_servers as Record<string, Record<string, unknown>>).github_review as Record<string, unknown>;
   assert.equal(server.type, "http");
   assert.equal(server.url, "http://api.internal.example:8200/v1/internal/github-review/mcp");
   const v = verify(String(server.token), "t".repeat(40));
-  assert.deepEqual(v, { ok: true, claims: { sessionId: r.body.data.session_id, requesterUserId: "u-alice", actorUserId: "u-bob" } });
+  assert.deepEqual(v, { ok: true, claims: { sessionId: r.body.data.session_id, requesterUserId: "u-alice", actorUserId: "u-alice" } });
   assert.doesNotMatch(JSON.stringify(published[0]), /gh[pousr]_[A-Za-z0-9]{20}/);
 });
 
@@ -239,7 +242,7 @@ test("T2 a session without acting_as is offered no review tools, and a request's
 });
 
 test("T3 the server name is reserved: what a task already names github_review is replaced, and others are kept", async () => {
-  const r = await create(ALICE, { acting_as: "u-bob" });
+  const r = await create(ALICE, { acting_as: "u-alice" });
   const task: Record<string, unknown> = { mcp_servers: { github_review: { type: "http", url: "http://evil.example/mcp", token: "x" }, other: { type: "http", url: "http://o.example/mcp", token: "y" } } };
   await applyAppMcpToTask(task, r.body.data.session_id);
   const servers = task.mcp_servers as Record<string, Record<string, unknown>>;
@@ -248,7 +251,7 @@ test("T3 the server name is reserved: what a task already names github_review is
 });
 
 test("T4 no tools for a deleted session, a missing one, or when the secret is missing; a database failure is not a failed turn", async () => {
-  const r = await create(ALICE, { acting_as: "u-bob" });
+  const r = await create(ALICE, { acting_as: "u-alice" });
   const id = r.body.data.session_id as string;
   assert.deepEqual(Object.keys(await tools.githubReviewMcpServers(id)), ["github_review"]);
   assert.deepEqual(await tools.githubReviewMcpServers("no-such-session"), {});
@@ -264,7 +267,7 @@ test("T4 no tools for a deleted session, a missing one, or when the secret is mi
 });
 
 test("T5 a bound session is offered the tools, and one whose stored target cannot be read is offered none rather than the tools without the binding", async () => {
-  const r = await create(ALICE, { acting_as: "u-bob", review_target: { owner: "AMD-AGI", repo: "demo", number: 7 } });
+  const r = await create(ALICE, { acting_as: "u-alice", review_target: { owner: "AMD-AGI", repo: "demo", number: 7 } });
   const id = r.body.data.session_id as string;
   assert.deepEqual(Object.keys(await tools.githubReviewMcpServers(id)), ["github_review"]);
   for (const unreadable of [{ owner: "AMD-AGI" }, "AMD-AGI/demo#7", { owner: "AMD-AGI", repo: "demo", number: 0 }, []]) {
@@ -274,7 +277,7 @@ test("T5 a bound session is offered the tools, and one whose stored target canno
 });
 
 test("T6 the first turn of a session that acts as a user is marked so that its sandbox holds none of its owner's keys, and any other turn is not", async () => {
-  const acting = await create(ALICE, { acting_as: "u-bob" }, { message: { content: "review it" } });
+  const acting = await create(ALICE, { acting_as: "u-alice" }, { message: { content: "review it" } });
   assert.equal(acting.status, 200, JSON.stringify(acting.body));
   assert.equal(published[0]?.withhold_sandbox_keys, true);
   assert.equal(published[0]?.platform_key, "pk", "Brain is still given the keys: it asks the model and SaFE with them");
@@ -285,7 +288,7 @@ test("T6 the first turn of a session that acts as a user is marked so that its s
 });
 
 test("T7 the mark is read from the live row at the time the turn is built, as the tools are, and a row that cannot be read is not a turn with keys", async () => {
-  const id = (await create(ALICE, { acting_as: "u-bob" })).body.data.session_id as string;
+  const id = (await create(ALICE, { acting_as: "u-alice" })).body.data.session_id as string;
   const marked = async (sessionId: string): Promise<unknown> => {
     const task: Record<string, unknown> = {};
     await tools.applySandboxKeyPolicyToTask(task, sessionId);
@@ -294,7 +297,7 @@ test("T7 the mark is read from the live row at the time the turn is built, as th
   assert.equal(await marked(id), true);
   // The same reading of `acting_as` as the tools and the turn gate: only a well-formed id counts.
   for (const [config, expected] of [
-    [{ acting_as: "u-bob" }, true], [{ acting_as: "has space" }, undefined], [{ acting_as: 7 }, undefined], [{ acting_as: null }, undefined], [{}, undefined],
+    [{ acting_as: "u-alice" }, true], [{ acting_as: "has space" }, undefined], [{ acting_as: 7 }, undefined], [{ acting_as: null }, undefined], [{}, undefined],
   ] as const) {
     await h.sql("UPDATE claw_sessions SET config = $2::jsonb WHERE session_id = $1", [id, JSON.stringify(config)]);
     assert.equal(await marked(id), expected, JSON.stringify(config));
@@ -308,7 +311,7 @@ test("T7 the mark is read from the live row at the time the turn is built, as th
 });
 
 test("T8 the mark does not depend on the tools being offered: a session that acts as a user is marked without a secret to sign the tools with", async () => {
-  const id = (await create(ALICE, { acting_as: "u-bob" })).body.data.session_id as string;
+  const id = (await create(ALICE, { acting_as: "u-alice" })).body.data.session_id as string;
   const saved = process.env.CLAW_GITHUB_REVIEW_MCP_SECRET;
   process.env.CLAW_GITHUB_REVIEW_MCP_SECRET = "";
   try {
@@ -330,11 +333,11 @@ test("M1 a session that acts as a user runs on the model and effort its creator 
   try {
     // [what, config, other create fields, the stored and sent model, the stored and sent effort]
     const cases: Array<[string, Record<string, unknown>, Record<string, unknown>, string | null, string | null]> = [
-      ["acting, no model", { acting_as: "u-bob" }, {}, null, null],
-      ["acting, model and effort null", { acting_as: "u-bob" }, { model: null, effort: null }, null, null],
-      ["acting, own model", { acting_as: "u-bob" }, { model: "claude-sonnet-5.5" }, "claude-sonnet-5.5", null],
-      ["acting, own model and effort", { acting_as: "u-bob" }, { model: "claude-opus-5.5", effort: "high" }, "claude-opus-5.5", "high"],
-      ["acting, effort only", { acting_as: "u-bob" }, { effort: "low" }, null, "low"],
+      ["acting, no model", { acting_as: "u-alice" }, {}, null, null],
+      ["acting, model and effort null", { acting_as: "u-alice" }, { model: null, effort: null }, null, null],
+      ["acting, own model", { acting_as: "u-alice" }, { model: "claude-sonnet-5.5" }, "claude-sonnet-5.5", null],
+      ["acting, own model and effort", { acting_as: "u-alice" }, { model: "claude-opus-5.5", effort: "high" }, "claude-opus-5.5", "high"],
+      ["acting, effort only", { acting_as: "u-alice" }, { effort: "low" }, null, "low"],
       ["ordinary", { notify_on_finish: true }, {}, null, null],
       ["ordinary, own effort", { notify_on_finish: true }, { effort: "medium" }, null, "medium"],
     ];
@@ -361,7 +364,7 @@ test("M1 a session that acts as a user runs on the model and effort its creator 
 test("M2 effort is checked like model: a value outside low, medium and high is refused before any row exists", async () => {
   for (const effort of ["max", "High", "", 3, true, {}]) {
     const before = await h.sql("SELECT count(*)::int AS n FROM claw_sessions");
-    const r = await create(ALICE, { acting_as: "u-bob" }, { effort, message: { content: "review it" } });
+    const r = await create(ALICE, { acting_as: "u-alice" }, { effort, message: { content: "review it" } });
     assert.equal(r.status, 400, JSON.stringify(effort));
     assert.match(String(r.body.error), /^effort must be one of low, medium, high or null$/);
     assert.deepEqual(await h.sql("SELECT count(*)::int AS n FROM claw_sessions"), before, `${JSON.stringify(effort)}: nothing left behind`);

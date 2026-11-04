@@ -117,7 +117,7 @@ const send = async (user: Caller, method: string | null, req: { method: "POST" |
 };
 
 /** A session as the create route makes it, so that the row is what the create route writes: acting as `actingAs` when one is given. */
-const session = async (actingAs: string | null = "u-bob"): Promise<string> => {
+const session = async (actingAs: string | null = "u-alice"): Promise<string> => {
   const r = await send(ALICE, "identity_token", { method: "POST", url: "/v1/sessions", payload: { name: "review", config: actingAs === null ? { notify_on_finish: true } : { acting_as: actingAs } } });
   assert.equal(r.status, 200, JSON.stringify(r.body));
   return r.body.data.session_id as string;

@@ -164,7 +164,7 @@ const session = async (actingAs: string | null): Promise<string> => {
 };
 
 /** Both kinds, so that every path is shown to be the mark's doing and not an empty vault's. */
-const KINDS: Array<[string, string | null, boolean]> = [["a session that acts as a user", "u-bob", true], ["an ordinary session", null, false]];
+const KINDS: Array<[string, string | null, boolean]> = [["a session that acts as a user", "u-alice", true], ["an ordinary session", null, false]];
 
 /** Whether any secret of the vault is anywhere in this: a wire message, a row, a request. Field names do not matter, values do. */
 const holdsVault = (thing: unknown): boolean => SECRETS.some((secret) => JSON.stringify(thing).includes(secret));

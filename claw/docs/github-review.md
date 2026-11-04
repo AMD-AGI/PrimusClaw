@@ -39,7 +39,8 @@ review and the merge and who is the reviewer of record, and whose own standing a
 
 ## How a session uses it
 
-1. The requester creates a session with `config.acting_as = "<user id>"` (`POST /v1/sessions`),
+1. The requester creates a session with `config.acting_as = "<user id>"` (`POST /v1/sessions`; there only their own id,
+   `403 acting_as_must_be_self` otherwise: a review of someone else is asked as below, "A review asked of someone else"),
    signed in with an identity provider's access token: a person's own, or a service's that an
    operator named (see "Who may speak for the person"). An `ak-` key, a BYOK key, a connector token
    and a browser session cookie are refused (`403 interactive_sign_in_required`): the key a sandbox
@@ -124,7 +125,7 @@ credentials with the request: `x-acting-as-token` (X's delegated identity-provid
   review is not run, it goes to X as failed with the reason, and X's keys are removed from every open review others asked of X.
 - The session config carries `requested_by: {user_id, label}` and `sandbox_profile: "review"`, written only by the server;
   `POST /v1/sessions` refuses both (and `requester_note`) as server-managed, and refuses `acting_as` naming anyone but the caller
-  (`403 acting_as_must_be_self`) while these routes exist. The review tools take `requested_by` as the requester only when the
+  (`403 acting_as_must_be_self`), whether or not these routes are on. The review tools take `requested_by` as the requester only when the
   session's owner is the acting user; for every other session the requester is the owner.
 - The session runs with a fixed profile: the review tools and the sandbox's file and shell tools, nothing else (no skills,
   memory, triggers, stored variables, default or application MCP servers, `a2a_call`, `deliver_file`; no pattern or skill

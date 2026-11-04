@@ -12,7 +12,7 @@
  *
  * Neither can be set by a caller: `POST /v1/sessions` refuses both as server-managed, and nothing else writes a session's config.
  */
-import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_REVIEW_ITEMS, CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
+import { CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
 import { actingUserOf, parseActingAs } from "./acting-as.js";
 
 export const REVIEW_SANDBOX_PROFILE = "review";
@@ -71,7 +71,3 @@ export function usesReviewProfile(config: unknown): boolean {
   return c.sandbox_profile === REVIEW_SANDBOX_PROFILE || c.requested_by !== undefined;
 }
 
-/** Whether `POST /v1/assistant/reviews` exists on this deployment: the one way to ask a review of someone else when it does. */
-export function reviewItemsAvailable(): boolean {
-  return CLAW_ASSISTANT_ENABLED && CLAW_ASSISTANT_REVIEW_ITEMS && CLAW_GITHUB_REVIEW_ENABLED;
-}

@@ -8,6 +8,7 @@
  *   G1  a session made by `POST /v1/sessions` cannot carry what the server writes for such a review: `requested_by`, `sandbox_profile`,
  *       `requester_note` are each a 400 that leaves nothing
  *   G2  nor act as anyone but its creator: `acting_as` naming someone else is a 403 that leaves nothing; naming oneself is as it was
+ *       (with the review items off too: github-review-session.test.ts V1)
  *   G3  the person who asked cannot send a turn into the reviewer's session
  *   P1  the review profile on a turn: the fixed list, only the review tools' server, none of the owner's belongings, the turn budget;
  *       the owner's own review of their account keeps what it had
@@ -97,7 +98,7 @@ test("G1 a session made by POST /v1/sessions cannot carry what the server writes
   assert.equal(await sessions(), 0);
 });
 
-test("G2 a session made by POST /v1/sessions acts only as its creator while the review items are on", async () => {
+test("G2 a session made by POST /v1/sessions acts only as its creator", async () => {
   const other = await post(ALICE, "/v1/sessions", { name: "x", config: { acting_as: "u-bob" } });
   assert.deepEqual([other.status, other.body.error], [403, "acting_as_must_be_self"]);
   assert.match(other.body.message, /POST \/v1\/assistant\/reviews/);

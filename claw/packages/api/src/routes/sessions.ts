@@ -11,7 +11,7 @@ import { submitSessionMessage } from "../sessions/submit-message.js";
 import { SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
 import { actingTurnRefusalFor } from "../github-review/acting-turns.js";
 import { checkSessionCreate } from "../github-review/acting-session.js";
-import { REQUESTED_REVIEW_CONFIG_KEYS, reviewItemsAvailable } from "../github-review/requested-by.js";
+import { REQUESTED_REVIEW_CONFIG_KEYS } from "../github-review/requested-by.js";
 import { loadUserEnvForSession, withholdsSandboxKeys } from "../github-review/session-tools.js";
 import {
   forceIdleAfterInterrupt, queuedMessageId, releaseSessionGateForTurn, stopSessionRuns, takeSessionGate,
@@ -1150,9 +1150,9 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       return reply.status(checked.status).send({ ok: false, error: checked.error });
     }
     // A review of someone else's account is that person's work, made only by `POST /v1/assistant/reviews`, which checks their say and
-    // their credentials and puts it on their board. Here a session may act only as its own creator; while the review items are not
-    // available on this deployment there is no other way, and the older path stays as it was.
-    if (checked.actingAs !== null && user && checked.actingAs !== user.userId && reviewItemsAvailable()) {
+    // their credentials and puts it on their board. Here a session may act only as its own creator, whatever else is switched on: a
+    // session the requester owns would hold the other person's review tools outside every one of those checks.
+    if (checked.actingAs !== null && user && checked.actingAs !== user.userId) {
       logger.warn({ userId: user.userId }, "github_review.acting_as_other_refused");
       return reply.status(403).send({
         ok: false, error: "acting_as_must_be_self",
