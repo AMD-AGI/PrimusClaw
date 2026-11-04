@@ -10,8 +10,6 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import http from "node:http";
-import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 
@@ -20,11 +18,12 @@ const OUTSIDE = fs.mkdtempSync(path.join(os.tmpdir(), "claw-dl-outside-"));
 process.env.WORKSPACE_PATH = WORK;
 const { downloadS3 } = await import("../src/tools/s3/download-s3.js");
 
-const server = http.createServer((_req, res) => res.end("uploaded bytes"));
-await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/obj`;
+// The presigned GET is answered in-process: these tests are about where the bytes land, not about fetching them.
+const realFetch = globalThis.fetch;
+globalThis.fetch = (async () => new Response("uploaded bytes")) as typeof fetch;
+const url = "http://s3.invalid/obj";
 after(() => {
-  server.close();
+  globalThis.fetch = realFetch;
   fs.rmSync(WORK, { recursive: true, force: true });
   fs.rmSync(OUTSIDE, { recursive: true, force: true });
 });
@@ -89,4 +88,35 @@ test("a file already in the workspace is replaced by the download", async () => 
   const out = result(await downloadS3.execute({ files: [{ local_path: target, presigned_url: url }] }));
   assert.deepEqual(out.ok, [target]);
   assert.equal(fs.readFileSync(target, "utf-8"), "uploaded bytes");
+});
+
+test("a directory renamed out of the workspace after the check is not left holding the bytes", async () => {
+  const fsMod = (await import("node:fs")).default;
+  const dir = path.join(WORK, "moving");
+  const target = path.join(dir, "f.txt");
+  const real = fsMod.ftruncateSync;
+  // The rename lands after the opened file was found inside the workspace, just before it is written.
+  fsMod.ftruncateSync = ((fd: number, len?: number) => {
+    fsMod.ftruncateSync = real;
+    fsMod.renameSync(dir, path.join(OUTSIDE, "moving"));
+    return real(fd, len);
+  }) as typeof real;
+  try {
+    const out = result(await downloadS3.execute({ files: [{ local_path: target, presigned_url: url }] }));
+    assert.deepEqual(out.ok, []);
+    assert.match(out.failed[0].error, /moved while being written/);
+    assert.deepEqual(fsMod.readdirSync(path.join(OUTSIDE, "moving")), [], "nothing was left outside");
+  } finally {
+    fsMod.ftruncateSync = real;
+  }
+});
+
+test("a file inside that is also a name for a file outside is not written", async () => {
+  const victim = path.join(OUTSIDE, "linked-victim");
+  fs.writeFileSync(victim, "keep");
+  fs.linkSync(victim, path.join(WORK, "g.txt"));
+  const out = result(await downloadS3.execute({ files: [{ local_path: path.join(WORK, "g.txt"), presigned_url: url }] }));
+  assert.deepEqual(out.ok, []);
+  assert.match(out.failed[0].error, /one name/);
+  assert.equal(fs.readFileSync(victim, "utf-8"), "keep");
 });

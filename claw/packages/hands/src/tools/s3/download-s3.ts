@@ -55,14 +55,49 @@ function linkOnTheWay(p: string): string | null {
 }
 
 /**
+ * Where the file open on `fd` is now, or why it does not count as inside `root`.
+ *
+ * The path is the kernel's, read back from /proc, so it follows renames. A file
+ * with a second name could be one outside the workspace under a name inside it.
+ */
+function placeOf(fd: number, root: string): { at: string } | { not: string } {
+  let at: string;
+  try {
+    at = fs.readlinkSync(`/proc/self/fd/${fd}`);
+  } catch {
+    return { not: "cannot tell which file was opened" };
+  }
+  const st = fs.fstatSync(fd);
+  if (!st.isFile() || st.nlink !== 1) return { not: `${at} is not a file with one name` };
+  const rel = path.relative(root, at);
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return { not: `resolved to ${at}, outside the workspace` };
+  return { at };
+}
+
+/** Remove the file this call created on `fd`, under whatever name it has now, if that name is still it. */
+function removeCreated(fd: number): void {
+  try {
+    const at = fs.readlinkSync(`/proc/self/fd/${fd}`);
+    const mine = fs.fstatSync(fd);
+    const there = fs.lstatSync(at);
+    if (there.ino === mine.ino && there.dev === mine.dev) fs.unlinkSync(at);
+  } catch {
+    // already gone, or no longer reachable by that name
+  }
+}
+
+/**
  * Write `body` to `p` only if the file opened is the one `p` names inside the
  * workspace; returns why not, or null when written.
  *
- * The check above can be raced: a directory on the way can be swapped for a
- * link between it and the open. So the file is opened first (not truncated, not
- * through a final link), the path the kernel actually opened is read back from
- * /proc, and only a file inside the workspace is truncated and written. A file
- * this call created elsewhere is removed again; one that was there is untouched.
+ * Any path check can be raced: a directory on the way can be swapped for a link
+ * before the open, or renamed out of the workspace after it. So the file is
+ * opened first (not truncated, not through a final link), and only a file the
+ * kernel says is inside the workspace is written, through that descriptor; the
+ * bytes then can only reach that one file. Where it is is asked again after the
+ * write: a file moved out meanwhile is emptied again (and removed, if this call
+ * created it). A move after that is a move of a finished file, which no write
+ * can prevent.
  */
 function writeWhereNamed(p: string, body: Buffer): string | null {
   const named = path.relative(path.resolve(WORKSPACE), p);
@@ -71,30 +106,30 @@ function writeWhereNamed(p: string, body: Buffer): string | null {
     return null;
   }
   const root = fs.realpathSync(path.resolve(WORKSPACE));
-  // Whether this call made the file is learnt from the open itself (O_EXCL), never from an earlier look at the path.
-  let existed = false;
+  const { O_WRONLY, O_CREAT, O_EXCL, O_NOFOLLOW } = fs.constants;
+  let created = true;
   let fd: number;
   try {
-    fd = fs.openSync(p, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW);
+    fd = fs.openSync(p, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW);
   } catch (e: any) {
     if (e?.code !== "EEXIST") throw e;
-    existed = true;
-    fd = fs.openSync(p, fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW);
+    created = false;
+    fd = fs.openSync(p, O_WRONLY | O_NOFOLLOW);
   }
   try {
-    let opened: string;
-    try {
-      opened = fs.readlinkSync(`/proc/self/fd/${fd}`);
-    } catch {
-      return "not written: cannot tell which file was opened";
-    }
-    const rel = path.relative(root, opened);
-    if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
-      if (!existed) fs.rmSync(opened, { force: true });
-      return `not written: ${p} resolved to ${opened}, outside the workspace`;
+    const before = placeOf(fd, root);
+    if ("not" in before) {
+      if (created) removeCreated(fd);
+      return `not written: ${p} ${before.not}`;
     }
     fs.ftruncateSync(fd, 0);
     fs.writeFileSync(fd, body);
+    const after = placeOf(fd, root);
+    if ("not" in after) {
+      fs.ftruncateSync(fd, 0);
+      if (created) removeCreated(fd);
+      return `not written: ${p} was moved while being written and ${after.not}`;
+    }
     return null;
   } finally {
     fs.closeSync(fd);
