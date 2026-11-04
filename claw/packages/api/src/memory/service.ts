@@ -98,7 +98,8 @@ async function existsOrNoTable(sql: string, params: unknown[]): Promise<boolean>
  * Whether a session's turns are the user's own conversation, which is the only kind memory serves.
  *
  * Not served, by server-side facts a caller cannot write: a session owned by someone else, an assistant's
- * router or a work item's worker (their user turns are written by the router, not the person), an
+ * router or a work item's worker (their user turns are written by the router, not the person), an assistant's
+ * watcher of a group or a repository (its turns are other people's messages), an
  * application's run, and any session that has carried a non-chat run (an A2A peer's, a task's, a DAG node's).
  * Not served on the caller's word either: `config.memory: "off"`, which is how a client marks a session other
  * people read, a group chat, and a child session (`parent_session_id`), whose turns its parent writes.
@@ -126,6 +127,8 @@ export async function memoryAccess(sessionId: string, userId: string): Promise<M
     }
     for (const sql of [
       "SELECT 1 FROM claw_assistants WHERE session_id = $1",
+      // An assistant's watcher of a group or a repository (`assistant/observe.ts`): what it reads is other people's.
+      "SELECT 1 FROM claw_assistant_scopes WHERE session_id = $1",
       "SELECT 1 FROM claw_work_items WHERE worker_session_id = $1",
       "SELECT 1 FROM claw_app_runs WHERE session_id = $1 LIMIT 1",
     ]) {

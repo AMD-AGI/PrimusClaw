@@ -34,6 +34,7 @@
  *   I4  a worker's search is chosen from what it may read before the top ten are taken and before anything counts as read
  *   I5  an entry bound to an item whose row is gone stays in the router's index, so it can be seen and forgotten
  *   W1  a router session marked `memory: "off"` starts workers that are marked so too: no index, no recall
+ *   O1  an assistant's watcher of a group or a repository (observe) is not a session the chat's memory serves
  *   P1  a router turn carries the memory section and index (or the off note); a worker turn a read-only index
  *   T1  over the wire: a router is offered the memory tools, a worker only memory_recall
  */
@@ -75,7 +76,7 @@ describe("assistant memory tools", { skip }, () => {
   });
   after(async () => { await app?.close(); await w?.stop(); });
   beforeEach(async () => {
-    await w.q("TRUNCATE claw_work_item_events, claw_work_items, claw_assistant_says, claw_pending_messages, claw_tasks, claw_assistants, claw_sessions, claw_notification_outbox, claw_memory_entries, claw_memory_events, claw_user_memory_prefs CASCADE");
+    await w.q("TRUNCATE claw_work_item_events, claw_work_items, claw_assistant_says, claw_pending_messages, claw_tasks, claw_assistants, claw_sessions, claw_notification_outbox, claw_memory_entries, claw_memory_events, claw_user_memory_prefs, claw_assistant_scopes CASCADE");
     signedIn.clear();
     // C2's question, answered for this file's own signed-in messages only; a report's turn has none.
     mt.memoryToolPorts.attended = async (_q, claims) => {
@@ -436,6 +437,18 @@ describe("assistant memory tools", { skip }, () => {
     await w.q(`UPDATE claw_sessions SET config = config - 'memory' WHERE session_id = $1`, [alice.routerSid]);
     const own = await w.createItem(alice, "Another");
     assert.ok((await mt.workerMemoryBlock("alice", own.itemId, own.workerSid))?.includes("回复用中文"));
+  });
+
+  test("O1 an assistant's watcher of a group or a repository is not a session the chat's memory serves", async () => {
+    await stored("alice", "回复用中文");
+    const own = randomUUID();
+    const watcher = randomUUID();
+    for (const sid of [own, watcher]) {
+      await w.q(`INSERT INTO claw_sessions (session_id, user_id, name, mode, agent_status, config) VALUES ($1, 'alice', 'x', 'claw', 'idle', '{}'::jsonb)`, [sid]);
+    }
+    await w.q("INSERT INTO claw_assistant_scopes (user_id, scope, session_id) VALUES ('alice', 'group:feishu:oc_1', $1)", [watcher]);
+    assert.deepEqual(await svc.memoryAccess(own, "alice"), { optedIn: true, serves: true }, "the user's own chat is served");
+    assert.deepEqual(await svc.memoryAccess(watcher, "alice"), { optedIn: true, serves: false });
   });
 
   test("P1 a router turn carries the memory section and index, a worker turn a read-only index", async () => {
