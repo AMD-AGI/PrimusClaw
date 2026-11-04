@@ -74,17 +74,43 @@ const FORGET_REQUEST = [
 // The entry by its number: "#3", "memory 3", "记忆 #3", "第3条"; a bare number ("delete 3 files") is not a reference.
 const ENTRY_NUMBER = /#\s*(\d+)|(?:memory|note|entry|记忆|条目)[\s#]*(\d+)|第\s*(\d+)\s*条/gi;
 
+/** The clauses of a user's message: an instruction to forget names its entry within its own clause. */
+function clauses(text: string): string[] {
+  return text.normalize("NFKC").replace(/[’‘]/g, "'").split(/[.!?;:,\n。！？；：，、]+/).map((c) => c.trim());
+}
+
+/** Whether a clause is an instruction to forget (see FORGET_REQUEST) that names this entry by its number or by what it says. */
+function clauseAsksToForget(clause: string, id: number, entry: string): boolean {
+  if (!FORGET_REQUEST.some((r) => r.test(clause))) return false;
+  const numbers = [...clause.matchAll(ENTRY_NUMBER)].map((m) => m[1] ?? m[2] ?? m[3]);
+  return numbers.includes(String(id)) || quoteSupports(clause, entry);
+}
+
 /**
- * Whether a quote asks to forget or undo this entry: one of its clauses is an instruction to forget (see
- * FORGET_REQUEST) that names the entry by its number or by what it says. Any other sentence of the user's
- * ("review this repository", "I keep forgetting my vim shortcuts", "remove vim from my laptop") is not one.
+ * Whether the user asked to forget or undo this entry, where the model quotes them: the quote is part of one of
+ * their `messages` and overlaps a clause of that message that is an instruction to forget naming the entry. The
+ * clause is read from the user's message, not from the quote: quoting "delete this memory about vim" out of "please
+ * do not delete this memory about vim", or "Forget my password I use vim" out of "Forget my password. I use vim.",
+ * finds no such clause. Any other sentence of the user's ("review this repository", "I keep forgetting my vim
+ * shortcuts", "remove vim from my laptop") is not one.
  */
-export function quoteAsksToForget(quote: string, id: number, entry: string): boolean {
-  // The entry must be named in the instruction itself: "Forget my password: I use vim." asks nothing about vim.
-  return quote.normalize("NFKC").replace(/[’‘]/g, "'").split(/[.!?;:,\n。！？；：，、]+/).map((c) => c.trim()).some((clause) => {
-    if (!FORGET_REQUEST.some((r) => r.test(clause))) return false;
-    const numbers = [...clause.matchAll(ENTRY_NUMBER)].map((m) => m[1] ?? m[2] ?? m[3]);
-    return numbers.includes(String(id)) || quoteSupports(clause, entry);
+export function quoteAsksToForget(quote: string, messages: readonly string[], id: number, entry: string): boolean {
+  const q = normalizeText(quote);
+  if ([...q].length < QUOTE_MIN) return false;
+  return messages.some((message) => {
+    const whole = normalizeText(message);
+    const spans: Array<{ clause: string; start: number; end: number }> = [];
+    for (const clause of clauses(message)) {
+      const start = spans.at(-1)?.end ?? 0;
+      spans.push({ clause, start, end: start + normalizeText(clause).length });
+    }
+    // The delimiters are punctuation and whitespace, which normalisation drops, so the clauses tile the message.
+    if ((spans.at(-1)?.end ?? 0) !== whole.length) return false;
+    return spans.some(({ clause, start, end }) => {
+      if (!clauseAsksToForget(clause, id, entry)) return false;
+      const at = whole.indexOf(q, Math.max(0, start - q.length + 1));
+      return at !== -1 && at < end;
+    });
   });
 }
 

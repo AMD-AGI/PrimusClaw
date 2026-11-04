@@ -508,6 +508,21 @@ describe("memory v2", { skip }, () => {
       }
       await w.closeRun(m.taskId);
     }
+    // The model picks the quote: an excerpt that drops the user's negation or the stop between two clauses is still
+    // read in the user's own clause.
+    const excerpts = [
+      ["Please do not delete this memory about vim", "delete this memory about vim"],
+      ["我不想删除这条关于 vim 的记忆", "删除这条关于 vim 的记忆"],
+      ["Forget my password. I use vim.", "Forget my password I use vim"],
+      // The quote is the request itself, not another sentence of a message that has one.
+      [`Forget memory #${id}. I use vim.`, "I use vim"],
+    ];
+    for (const [said, quote] of excerpts) {
+      const m = await turn(sid, said);
+      const r = await tool("forget_memory", sid, m.messageId, { id, evidence_quote: quote });
+      assert.equal(r.ok, false, `${quote} out of ${said}: the user asked nothing`);
+      await w.closeRun(m.taskId);
+    }
     assert.equal((await entries()).length, 1);
     const t1 = await turn(sid, "please delete the note about the weather");
     const other = await tool("forget_memory", sid, t1.messageId, { id, evidence_quote: "please delete the note about the weather" });
@@ -526,12 +541,15 @@ describe("memory v2", { skip }, () => {
     assert.equal(asked.ok, true, asked.text);
     assert.deepEqual(await entries(), []);
     await w.closeRun(t2.taskId);
-    for (const said of ["delete the vim memory", "把关于 vim 的那条记忆删掉", "忘掉我用 vim 这件事", "Please forget I use vim."]) {
+    for (const [said, quote] of [
+      ["delete the vim memory"], ["把关于 vim 的那条记忆删掉"], ["忘掉我用 vim 这件事"], ["Please forget I use vim."],
+      ["ok, please forget that I use vim, thanks", "forget that I use vim"],
+    ]) {
       await tool("save_memory", sid, (await turn(sid, "remember I use vim")).messageId, save("uses vim", "uses vim", "I use vim"));
       await w.q("UPDATE claw_tasks SET status = 'completed'");
       const n = Number((await entries())[0].id);
       const m = await turn(sid, said);
-      const r = await tool("forget_memory", sid, m.messageId, { id: n, evidence_quote: said });
+      const r = await tool("forget_memory", sid, m.messageId, { id: n, evidence_quote: quote ?? said });
       assert.equal(r.ok, true, `${said}: ${r.text}`);
       assert.deepEqual(await entries(), []);
       await w.closeRun(m.taskId);

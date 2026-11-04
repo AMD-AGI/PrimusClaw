@@ -676,7 +676,7 @@ export async function runMemoryTool(
   const target = await readEntry(ctx.userId, id, true);
   if (!target) return { ok: false, text: `Error: no memory #${id}` };
   const named = `${target.title ?? ""}\n${target.content}`;
-  if (!quoteIsFrom(quote, ctx.humanMessages) || !quoteAsksToForget(quote, id, named)) {
+  if (!quoteAsksToForget(quote, ctx.humanMessages, id, named)) {
     await recordRefusal(ctx.userId, actor(), "quote_not_from_user", id);
     return { ok: false, text: "Error: nothing deleted: evidence_quote must be the user's own request to forget or undo this entry (naming it or its number), copied exactly from their message" };
   }
