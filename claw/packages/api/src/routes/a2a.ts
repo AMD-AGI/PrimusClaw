@@ -821,10 +821,10 @@ async function publishContextRun(
     if (beforePublish) await beforePublish();
     // The turns the context already has, so a follow-up in it is a conversation
     // and not a fresh start. Memory and the user's profile come with it, as for
-    // a turn sent from the web client. The last message is this prompt, which
-    // Brain adds itself.
+    // a turn sent from the web client. This prompt is not part of it: Brain
+    // adds it itself.
     const { buildMessages } = await import("../sessions/context-builder.js");
-    const history = (await buildMessages(target.taskId, text, auth.userId)).slice(0, -1);
+    const history = await buildMessages(target.taskId, text, auth.userId);
     await publishA2AExecuteTask(target.taskId, text, auth, spec, history);
   } catch (err) {
     await rollbackA2AAdmission(target, entry.taskId, err);
