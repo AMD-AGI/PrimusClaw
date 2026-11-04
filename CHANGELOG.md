@@ -311,6 +311,10 @@ record it.
 - `@primusclaw/connector` 0.1.1 is the first version published by the release workflow, with a build-provenance
   attestation (`gh attestation verify` on the tarball attached to the release, and the provenance shown on npmjs.com). It has
   the same code as 0.1.0, which was published by hand: no behaviour change.
+- `@primusclaw/connector` 0.1.2: `claw-connector status` (text, and a `warnings` field in `--json`) and the start-up line of
+  `run` warn per agent when the machine's Claude Code settings default to `bypassPermissions` (user `settings.json` or the
+  managed settings file) and the agent has no `approval = "never"`, so every session of that agent would be closed with
+  `mode_not_enforced`. Before, such a machine showed online and nothing said so before the first session (#247).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
