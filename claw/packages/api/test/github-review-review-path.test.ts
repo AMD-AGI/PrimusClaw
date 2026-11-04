@@ -118,7 +118,7 @@ function recorder() {
 }
 
 async function envWith(env: Record<string, string> = {}) {
-  const e = await reviewEnv(env);
+  const e = await reviewEnv(env, { reviewed: false });
   const rec = recorder();
   const service = new GithubReview({
     settings: () => e.settings, db: e.db, fetchImpl: e.gh.fetch, logger: rec.logger,
@@ -261,6 +261,12 @@ test("the second pass is handed the diff file, what was read and the callers see
     /writing each one down as soon as it has it: it has at most 20 turns/,
   ]) assert.match(second, handed);
   assert.doesNotMatch(PR_REVIEW_INSTRUCTIONS, /pr\.diff|did not open/);
+});
+
+test("the deep review grades a defect that breaks the main path once a flag is on as blocking, even when the flag is off by default", () => {
+  const text = DEEP_PR_REVIEW_INSTRUCTIONS.replace(/\s+/g, " ");
+  assert.match(text, /A problem that breaks the main path \(every turn, every request, every user, or an unattended run\) as soon as a shipped flag or documented setting is turned on is blocking, even when that flag is off by default: off by default lowers the urgency, not the severity\./);
+  assert.doesNotMatch(PR_REVIEW_INSTRUCTIONS, /off by default/);
 });
 
 /**

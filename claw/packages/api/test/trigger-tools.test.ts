@@ -9,7 +9,8 @@
  *   T2  a turn's user is its session's owner: another user's triggers cannot be listed, cancelled or created for them
  *   T3  a turn that has ended can no longer act
  *   T4  max_runs and until end a trigger by themselves
- *   T5  a trigger made from a work item's worker wakes that worker, and ends with the item
+ *   T5  a trigger made from a work item's worker wakes that worker, and ends with the item; it fires after the worker's
+ *       turn ends the way every turn ends (ready), and waits while the item asks its user something
  *   T6  which turns are offered the tools: every owned turn but a trigger's own run, a router and an acting session;
  *       creation and cancelling held for approval
  *   T7  a session that acts as a user can do nothing with them, even on a bearer minted before it did
@@ -228,17 +229,81 @@ describe("trigger tools", { skip }, () => {
     assert.equal(fired.session_id, item.workerSid);
 
     await w.q("DELETE FROM claw_pending_messages");
-    await w.q("UPDATE claw_work_items SET board_state = 'needs_you' WHERE item_id = $1", [item.itemId]);
-    await makeDue(id, "2026-10-28T00:00:00Z");
-    await sched.tickTriggers(new Date("2026-10-28T00:00:30Z"));
-    assert.equal((await w.pending(item.workerSid)).length, 0, "an item waiting for its user is not woken");
-    assert.equal((await trig(id)).paused_reason, null);
-
     await w.q("UPDATE claw_work_items SET board_state = 'done' WHERE item_id = $1", [item.itemId]);
     await makeDue(id, "2026-10-29T00:00:00Z");
     await sched.tickTriggers(new Date("2026-10-29T00:00:30Z"));
     assert.equal((await w.pending(item.workerSid)).length, 0);
     assert.equal((await trig(id)).paused_reason, "item_closed");
+  });
+
+  test("T5c an item trigger fires after its worker's turn ends the way every turn ends, and not while the item asks its user", async () => {
+    const alice = await w.user("alice");
+    const item = await w.createItem(alice, "Watch PR 14");
+    const wt = await w.workerTurn(item.itemId);
+    const client = await connect(bearer({ sid: wt.sid, mid: wt.mid, task_id: wt.task_id, exp: wt.exp }));
+    let id = "";
+    try {
+      id = (await call(client, "trigger_create", { ...DAILY, name: "watch", prompt: "check PR 14" })).body.trigger.trigger_id;
+    } finally { await client.close(); }
+    // The completion handler's own record of the end: a turn that said nothing becomes a ready report.
+    await w.closeRun(wt.task_id);
+    await w.mod.turnEnd.recordWorkerTurnEnd({ sessionId: item.workerSid, runIds: [wt.task_id], failed: false, interrupted: false, finalText: "watching PR 14" });
+    assert.equal((await w.item(item.itemId)).board_state, "needs_you", "every finished turn leaves the item needing its user");
+
+    await makeDue(id, "2026-10-27T00:00:00Z");
+    await sched.tickTriggers(new Date("2026-10-27T00:00:30Z"));
+    const fired = (await w.q("SELECT status FROM claw_trigger_fires WHERE trigger_id = $1", [id]))[0];
+    assert.equal(fired.status, "started", "a ready item's watch still runs");
+    assert.match((await w.pending(item.workerSid))[0]?.content ?? "", /check PR 14/);
+
+    // The next turn asks the user something: the watch waits for the answer.
+    await w.q("DELETE FROM claw_pending_messages");
+    for (const asked of [{ kind: "blocked", summary: "no access" }, { kind: "waiting", summary: "which branch?", question: "main or dev?" }] as const) {
+      const next = await w.workerTurn(item.itemId);
+      await w.mod.tools.report(next, asked);
+      await w.closeRun(next.task_id);
+      await w.mod.turnEnd.recordWorkerTurnEnd({ sessionId: item.workerSid, runIds: [next.task_id], failed: false, interrupted: false });
+      const at = asked.kind === "blocked" ? "2026-10-28T00:00:00Z" : "2026-10-29T00:00:00Z";
+      await makeDue(id, at);
+      await sched.tickTriggers(new Date(new Date(at).getTime() + 30_000));
+      assert.equal((await w.pending(item.workerSid)).length, 0, `an item that is ${asked.kind} on its user is not woken`);
+      assert.equal((await w.q("SELECT status FROM claw_trigger_fires WHERE trigger_id = $1 AND fire_key = $2", [id, new Date(at).toISOString()]))[0].status, "skipped_item_waiting");
+    }
+  });
+
+  test("T5b resuming an item's trigger renews the worker session's credentials it fires on", async () => {
+    const alice = await w.user("alice");
+    const item = await w.createItem(alice, "Watch PR 13");
+    const wt = await w.workerTurn(item.itemId);
+    const client = await connect(bearer({ sid: wt.sid, mid: wt.mid, task_id: wt.task_id, exp: wt.exp }));
+    let id = "";
+    try {
+      id = (await call(client, "trigger_create", { ...DAILY, name: "watch", prompt: "check PR 13" })).body.trigger.trigger_id;
+    } finally { await client.close(); }
+    await w.closeRun(wt.task_id);
+    await w.q("DELETE FROM claw_pending_messages");
+
+    // The worker session's key is gone (revoked, or never stamped), so the firing fails and pauses.
+    await w.q("UPDATE claw_sessions SET config = config || '{\"platform_key\": null}'::jsonb WHERE session_id = $1", [item.workerSid]);
+    await makeDue(id, "2026-10-27T00:00:00Z");
+    await sched.tickTriggers(new Date("2026-10-27T00:00:30Z"));
+    assert.equal((await trig(id)).paused_reason, "credential_invalid");
+
+    const routes = await import("../src/routes/triggers.js");
+    const api = Fastify();
+    api.addHook("preHandler", async (req) => {
+      (req as any).user = { userId: alice.userId, userName: alice.userId, roles: ["default"], platformKey: "pk-renewed", virtualKey: "vk-renewed" };
+    });
+    await routes.registerTriggerRoutes(api);
+    try {
+      const resumed = await api.inject({ method: "POST", url: `/v1/triggers/${id}/resume` });
+      assert.equal(resumed.statusCode, 200, resumed.body);
+    } finally { await api.close(); }
+
+    await makeDue(id, "2026-10-28T00:00:00Z");
+    await sched.tickTriggers(new Date("2026-10-28T00:00:30Z"));
+    assert.equal((await trig(id)).paused_reason, null);
+    assert.equal((await w.pending(item.workerSid)).length, 1, "the resumed trigger wakes the worker again");
   });
 
   test("T6 which turns are offered the tools, and creating and cancelling are held for approval", async () => {

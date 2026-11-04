@@ -16,7 +16,7 @@ import { classifyAttendedCaller } from "../github-review/attended.js";
 import { loadUserEnvForSession, withholdsSandboxKeys } from "../github-review/session-tools.js";
 import { readGithubReviewSettings } from "../github-review/settings.js";
 import {
-  forceIdleAfterInterrupt, releaseSessionGateForTurn, stopSessionRuns, takeSessionGate,
+  forceIdleAfterInterrupt, queuedMessageId, releaseSessionGateForTurn, stopSessionRuns, takeSessionGate,
 } from "../tasks/chat-run.js";
 import { kv, nc, sc } from "../infra/nats.js";
 import { buildAnswerMessage, buildDecisionMessage } from "../sessions/decision-message.js";
@@ -34,6 +34,7 @@ import { publicSessionRow } from "../events/redaction.js";
 import { archiveSession, unarchiveSession } from "../sessions/archive.js";
 import { getChangesPatch, getChangesSummary, type ChangesFailure } from "../sessions/changes-service.js";
 import { parseSessionModel } from "../sessions/session-model.js";
+import { vetRequestMcpServers } from "../sessions/request-mcp-servers.js";
 import {
   isUserEnvKeyAllowed,
   validateTopology, type EnvironmentTopology,
@@ -1241,8 +1242,11 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         requestResource: asJsonObject(fmResourceRaw),
         requestTimeout: Number.isFinite(fmTimeoutNum) ? Math.trunc(fmTimeoutNum) : undefined,
         workspaceId: fmWorkspaceId,
-        mcpServers: (fm.mcp_servers as Record<string, Record<string, unknown>>) || undefined,
+        mcpServers: undefined,
       };
+      const vetted = await vetRequestMcpServers(fm.mcp_servers);
+      if (!vetted.ok) return reply.status(400).send({ ok: false, error: `message.${vetted.error}` });
+      firstMessage.mcpServers = vetted.servers;
     }
 
     const sessionEnvResult = parseSessionEnv(body.env);
@@ -1769,7 +1773,9 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       typeof workspaceIdRaw === "string" && workspaceIdRaw.trim() !== ""
         ? workspaceIdRaw.trim()
         : undefined;
-    const mcpServers = (body.mcp_servers as Record<string, Record<string, unknown>>) || undefined;
+    const vettedMcp = await vetRequestMcpServers(body.mcp_servers);
+    if (!vettedMcp.ok) return reply.status(400).send({ ok: false, error: vettedMcp.error });
+    const mcpServers = vettedMcp.servers;
 
     // What the run needs beyond a sandbox, declared rather than written into
     // the prompt as Hyperloom flags. Refused here rather than downgraded:
@@ -1895,8 +1901,12 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         return reply.status(403).send({ ok: false, error: submitted.reason });
       case "queued":
         // No `run_id`: what this call accepted is a queued message, and the run
-        // row is opened later by the drain -- see docs/run-api.md.
-        return { ok: true, session_id: sessionId, queued: true };
+        // row is opened later by the drain -- see docs/run-api.md. The message id
+        // is already decided: it is the one the turn that runs it will carry.
+        return {
+          ok: true, session_id: sessionId, queued: true,
+          ...(submitted.pendingId !== null ? { message_id: queuedMessageId(submitted.pendingId) } : {}),
+        };
       case "client_gone":
         return reply.status(499).send({ ok: false, error: "client_closed_request" });
       case "dispatch_failed":

@@ -19,7 +19,7 @@ import {
   TRIGGER_RUN_TIME_LIMIT_SECONDS, TRIGGER_STALE_AFTER_SECONDS,
 } from "../config.js";
 import { db } from "../infra/db.js";
-import { stopTurnRuns } from "../tasks/chat-run.js";
+import { gateNamesEndedTurnSql, stopTurnRuns } from "../tasks/chat-run.js";
 import { fireIntoItem, fireTrigger, type TriggerRow } from "./fire.js";
 import { nextFireAfter } from "./schedule.js";
 
@@ -193,9 +193,15 @@ export async function enforceRunTimeLimit(now: Date = new Date()): Promise<numbe
         -- The turn this trigger started, not whichever turn the session is running
         -- now: a user who continues the conversation later holds the gate under a
         -- different message id, and that turn is theirs to run for as long as they like.
+        -- A gate naming a turn that ended while this one ran on is this turn's.
         AND EXISTS (SELECT 1 FROM claw_sessions s
                      WHERE s.session_id = f.session_id AND s.agent_status = 'running'
-                       AND s.agent_gate_message_id = f.message_id)
+                       AND (s.agent_gate_message_id = f.message_id
+                            OR (${gateNamesEndedTurnSql("s.session_id", "s.agent_gate_message_id")}
+                                AND EXISTS (SELECT 1 FROM claw_tasks t
+                                             WHERE t.session_id = f.session_id
+                                               AND t.metadata->>'message_id' = f.message_id
+                                               AND t.status IN ('queued','preparing','running','cancelling')))))
       RETURNING f.session_id, f.message_id`,
     [new Date(now.getTime() - TRIGGER_RUN_TIME_LIMIT_SECONDS * 1000)],
   )).rows as Array<{ session_id: string; message_id: string }>;

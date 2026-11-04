@@ -19,7 +19,7 @@ import { registerGithubReviewRoutes } from "../src/github-review/mcp.js";
 import { HOLD_GUIDANCE } from "../src/github-review/risk.js";
 import { mintSessionToolToken } from "../src/github-review/token.js";
 import { HEAD } from "./support/fake-github.js";
-import { PR, SECRET, TOKEN, closeShared, credential, reviewEnv, type ReviewEnv } from "./support/review-env.js";
+import { PR, SECRET, TOKEN, closeShared, credential, ownApproval, reviewEnv, type ReviewEnv } from "./support/review-env.js";
 
 after(closeShared);
 
@@ -467,6 +467,7 @@ describe("S the caller's own review mode", () => {
     await c.close();
     await e.sql("DELETE FROM claw_github_confirmations");
     assert.equal((await http("u-bob", "PUT", { review_mode: "fully_auto" })).status, 200);
+    e.gh.reviews.push(ownApproval("s-1"));
     c = await connect(token());
     const merged = await call(c, "gh_pr_merge", { pr: PR, head_sha: HEAD, risk_judgement: judged });
     await c.close();

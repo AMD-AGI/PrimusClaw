@@ -507,10 +507,12 @@ values_file="$repo_root/claw/deploy/values.${namespace}.env"
 deploy_namespace="claw-extra-deploy-$$"
 deploy_values_file="$repo_root/claw/deploy/values.${deploy_namespace}.env"
 trap 'rm -rf "$tmp"; rm -f "$values_file" "$deploy_values_file"' EXIT
+upgrade_env=() # VAR=value settings the next upgrade() has in its shell, as an operator's command line would
 upgrade() { # exit status of an upgrade.sh run (extra flags as arguments) against the values file written for it
   : >"$tmp/kubectl.log"
   rm -rf "$tmp/applied"; mkdir -p "$tmp/applied"
   env -i HOME="$tmp/home" PATH="$tmp/bin:$PATH" KUBECTL_LOG="$tmp/kubectl.log" KUBECTL_APPLIED="$tmp/applied" MOCK_TAG=release-test TAG=release-test \
+    ${upgrade_env[@]+"${upgrade_env[@]}"} \
     bash "$repo_root/claw/deploy/upgrade.sh" -n "$namespace" --skip-health --skip-shared-assets "$@" >"$tmp/upgrade.log" 2>&1
 }
 mutations='(^| )(apply|patch|rollout|delete|create|scale|replace|annotate|label)( |$)'
@@ -578,6 +580,24 @@ printf 'REGISTRY="docker.io/primussafe"\n' >"$values_file"
 upgrade || bad "upgrade.sh did not complete without GRANT_SIGNING_KEY_ENABLED: $(tail -5 "$tmp/upgrade.log")"
 if has "$tmp/applied/api-deployment.yaml" 'grant-signing-key|GRANT_SIGNING_KEY_FILE'; then bad "the api manifest carries the grant signing key while it is off"; fi
 ok "a file that does not set it renders no grant signing key"
+# The run that turns the key on from the shell is the only one that names it; the values file has no line for it,
+# as one written before the key existed. The upgrade after it, run with nothing in the shell, keeps it mounted.
+upgrade_env=(GRANT_SIGNING_KEY_ENABLED=true)
+upgrade || bad "upgrade.sh did not complete with GRANT_SIGNING_KEY_ENABLED from the shell: $(tail -5 "$tmp/upgrade.log")"
+upgrade_env=()
+has "$tmp/applied/api-deployment.yaml" '- name: grant-signing-key\n\s+mountPath: /var/run/claw/grant\n' || bad "GRANT_SIGNING_KEY_ENABLED=true from the shell did not mount the key"
+grep -q '^GRANT_SIGNING_KEY_ENABLED="true"$' "$values_file" || bad "the values file does not record GRANT_SIGNING_KEY_ENABLED: $(cat "$values_file")"
+upgrade || bad "the upgrade after it did not complete: $(tail -5 "$tmp/upgrade.log")"
+has "$tmp/applied/api-deployment.yaml" '- name: grant-signing-key\n\s+mountPath: /var/run/claw/grant\n' || bad "the next upgrade, with nothing in the shell, dropped the grant signing key mount"
+ok "a key turned on from the shell is recorded and still mounted by the next upgrade"
+# deploy.sh turns it on for "true" alone; an upgrade of the same file must not read anything else as on.
+printf 'REGISTRY="docker.io/primussafe"\nGRANT_SIGNING_KEY_ENABLED="yes"\n' >"$values_file"
+upgrade || bad "upgrade.sh did not complete with GRANT_SIGNING_KEY_ENABLED=yes: $(tail -5 "$tmp/upgrade.log")"
+if has "$tmp/applied/api-deployment.yaml" 'grant-signing-key|GRANT_SIGNING_KEY_FILE'; then bad "upgrade.sh mounted the grant signing key for \"yes\", which deploy.sh reads as off"; fi
+printf 'REGISTRY="docker.io/primussafe"\nGRANT_SIGNING_KEY_ENABLED="TRUE"\n' >"$values_file"
+upgrade || bad "upgrade.sh did not complete with GRANT_SIGNING_KEY_ENABLED=TRUE: $(tail -5 "$tmp/upgrade.log")"
+has "$tmp/applied/api-deployment.yaml" '- name: grant-signing-key\n\s+mountPath: /var/run/claw/grant\n' || bad "upgrade.sh did not mount the grant signing key for \"TRUE\", which deploy.sh reads as on"
+ok "upgrade.sh reads the value as deploy.sh does: \"true\" in any case is on, anything else is off"
 rm -f "$values_file"
 
 echo "==> deploy.sh refuses a doubled env var before it installs the chart"

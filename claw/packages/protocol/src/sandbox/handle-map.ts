@@ -55,6 +55,12 @@ export interface HandleInfo {
   namespace?: string;
   user_id?: string;
   session_id?: string;
+  /**
+   * Built for a session that acts as a user (`withhold_sandbox_keys`): its environment holds only what Brain sets for Hands to run.
+   * Such a session is served by no handle without it -- one built for an ordinary turn, or before this was recorded, can hold
+   * credentials that code run in it can read.
+   */
+  withheld_env?: boolean;
 }
 
 function keyOf(dagRootTaskId: string): string {

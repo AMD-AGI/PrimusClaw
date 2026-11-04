@@ -314,3 +314,27 @@ test("a sibling task still in flight blocks the rethrow", async () => {
     "a nak here would abandon a sibling that Promise.all does not cancel, and the redelivery would run it twice",
   );
 });
+
+const contended = () => new SandboxAttachError(new DagHandleContendedError("5 attempts exhausted"));
+
+const READ_BATCH_ROWS: Array<{ name: string; names: string[]; failAt: number; resume?: number; rethrows: boolean }> = [
+  // The commonest cold-start shape: the first turn reads several files, and
+  // reads emitted together now start together. None of them changes anything,
+  // so re-running the turn repeats nothing and the redelivery must survive.
+  { name: "a first turn of reads keeps its redelivery", names: ["read", "grep", "ls"], failAt: 0, rethrows: true },
+  { name: "whichever read's open fails", names: ["read", "glob", "read"], failAt: 2, rethrows: true },
+  // A read that ran before a write is no reason to give up the write's retry.
+  { name: "a write after a read keeps it", names: ["read", "bash"], failAt: 1, rethrows: true },
+  // Reads do not excuse what ran beside them.
+  { name: "a read after a write that ran does not rethrow", names: ["bash", "read"], failAt: 1, rethrows: false },
+  { name: "a resumed run of reads stays conservative", names: ["read", "grep"], failAt: 0, resume: 7, rethrows: false },
+];
+
+for (const row of READ_BATCH_ROWS) {
+  test(`reads and the open-failure redelivery: ${row.name}`, async () => {
+    const { threw, routed } = await runTools({ names: row.names, failAt: row.failAt, resumeToolCalls: row.resume, fail: contended });
+    assert.ok(routed.length > row.failAt, `the failing call was reached (routed: ${routed.join(",")})`);
+    if (row.rethrows) assert.equal((threw as Error | null)?.name, "DagHandleContendedError");
+    else assert.equal(threw, null);
+  });
+}

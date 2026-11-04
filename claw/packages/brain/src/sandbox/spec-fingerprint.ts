@@ -33,7 +33,8 @@ export interface SandboxSpecFacts {
   /**
    * The sandbox was built without the caller's keys (`withhold_sandbox_keys`). Part of the fingerprint only when true, so that
    * every fingerprint already stored (none of them withheld) still compares as it did, and a sandbox that holds the keys is not reused
-   * for a request that is not to have them.
+   * for a request that is not to have them. Recorded as `withheldEnv`, not the `withholdKeys` an earlier Brain recorded: a sandbox it
+   * built withheld only the key variables and still holds the deployment's system env, so it is not reused either.
    */
   withholdKeys?: boolean;
 }
@@ -77,7 +78,7 @@ export function sandboxSpecFingerprint(facts: SandboxSpecFacts): string {
     // MAC'd before it joins the rest so the key never appears in a string
     // this process holds, even transiently.
     llmKey: fingerprintLlmKey(facts.llmKey),
-    ...(facts.withholdKeys ? { withholdKeys: true } : {}),
+    ...(facts.withholdKeys ? { withheldEnv: "brain-only" } : {}),
   });
   // A format prefix, not part of the hash, so a comparison change can be told
   // apart from a spec change. evaluateReuse treats a different format as a

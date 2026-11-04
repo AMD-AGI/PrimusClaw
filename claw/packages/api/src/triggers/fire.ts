@@ -154,12 +154,16 @@ export async function fireIntoItem(trigger: TriggerRow, plannedAt: Date): Promis
   try {
     const queued = await inTransaction(async (query) => {
       const item = (await query(
-        `SELECT worker_session_id, board_state FROM claw_work_items
+        `SELECT worker_session_id, board_state, last_report_kind, pending_question FROM claw_work_items
           WHERE item_id = $1 AND user_id = $2 FOR SHARE`,
         [trigger.item_id, trigger.owner_user_id],
-      )).rows[0] as { worker_session_id: string; board_state: string } | undefined;
+      )).rows[0] as {
+        worker_session_id: string; board_state: string; last_report_kind: string | null; pending_question: string | null;
+      } | undefined;
       if (!item || item.board_state === "done") return { status: "item_closed" as const };
-      if (item.board_state !== "in_progress") return { status: "item_waiting" as const };
+      // Every finished turn leaves its item needing the user (a ready or failed end), so needing them is not
+      // waiting on them: only an item whose worker asked the user something, a question or a block, is.
+      if (item.pending_question !== null || item.last_report_kind === "blocked") return { status: "item_waiting" as const };
       const r = await queueServerMessage({ query }, {
         sessionId: item.worker_session_id, userId: trigger.owner_user_id,
         content: `Scheduled run of "${trigger.name}" (${plannedAt.toISOString()}):\n\n${trigger.prompt}`,
