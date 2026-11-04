@@ -11,6 +11,9 @@ import { resolveTaskPlugin } from "../marketplace/plugins.js";
 
 import { buildMessages } from "../sessions/context-builder.js";
 import { sessionModelFromRow } from "../sessions/session-model.js";
+import { sessionRepoFromRow } from "../sessions/session-repo.js";
+import { withPendingDrainClaim } from "../sessions/drain-claim.js";
+import { WORK_EVENT_PREFIX } from "../assistant/prompts.js";
 import { maybeExtractMemory, insertMemoryEntry, isMemoryActive, scanMemoryContent, maybeUpdateUserProfile } from "../memory/service.js";
 import {
   saveSkill, recordSkillFeedback,
@@ -22,10 +25,16 @@ import {
 import { appEventIdentity } from "./app-events.js";
 import { enqueueEvolutionJob } from "../marketplace/evolve-worker.js";
 import { callMemoryLLM } from "../llm/client.js";
-import { CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
-import { recordRunFinished } from "../notifications/outbox.js";
+import { CLAW_ASSISTANT_ENABLED, CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
+import { skipsSkillSelection } from "../assistant/role-profile.js";
+import { deliverUnsaidAnswer } from "../assistant/router-turn-end.js";
+import { recordWorkerTurnEnd } from "../assistant/turn-end.js";
+import { sessionWithholdsMemory } from "../github-review/session-tools.js";
+import { a2aPushEnabled } from "../routes/a2a-flags.js";
+import { recordSessionEvent as recordA2aPushEvent } from "../routes/a2a-push.js";
+import { recordApprovalRequested, recordRunFinished } from "../notifications/outbox.js";
 import {
-  markChatRunRunning, closeChatRun, gateOwnershipEnforced, queuedMessageId,
+  markChatRunRunning, closeChatRun, gateNamesEndedTurnSql, gateOwnershipEnforced, queuedMessageId,
   retireDispatchReconcileForReport,
 } from "../tasks/chat-run.js";
 import { dispatchPendingMessage, publishRefusedTurn } from "../tasks/pending-dispatch.js";
@@ -484,6 +493,28 @@ export async function consumeEventDelivery(msg: {
       // up. Best-effort: a row left describing itself as preparing is a
       // reporting inaccuracy, and this event is not worth redelivering over.
       await markChatRunRunning(sessionId);
+    } else if (event.type === "permissionRequest" && CLAW_NOTIFICATIONS_ENABLED) {
+      // Brain is now waiting for a person to decide on a held tool call. Tell the
+      // owner's subscriptions, so the wait does not depend on someone watching the
+      // run. Best-effort like the run notifications, and idempotent: the row's
+      // key is derived from the request, so a redelivered event records nothing new.
+      try {
+        await eventNotificationPorts.recordApprovalRequested({ sessionId, event });
+      } catch (err) {
+        logger.error({ err, sessionId }, "notification.approval_record_failed");
+      }
+    }
+
+    // After the event is stored and, for a completion, processed: the run row a
+    // finished task's notification reports is closed by now. Best-effort, like
+    // the run notifications: a notification not recorded is not worth failing
+    // an event over, and the event is acked whatever happens here.
+    if (a2aPushEnabled()) {
+      try {
+        await recordA2aPushEvent(sessionId, event, rowId);
+      } catch (err) {
+        logger.error({ err, sessionId, type: event.type }, "a2a_push.record_failed");
+      }
     }
 
     msg.ack();
@@ -615,7 +646,8 @@ export async function releaseSessionGateIfLastRun(
         SET agent_status = $1, agent_gate_message_id = NULL, updated_at = NOW()
       WHERE session_id = $2
         AND deleted_at IS NULL
-        AND (NOT $4::boolean OR agent_gate_message_id IS NOT DISTINCT FROM $3)
+        AND (NOT $4::boolean OR agent_gate_message_id IS NOT DISTINCT FROM $3
+             OR ${gateNamesEndedTurnSql("$2", "agent_gate_message_id")})
         AND NOT EXISTS (
           SELECT 1 FROM claw_tasks t
            WHERE t.session_id = $2
@@ -768,6 +800,14 @@ function runClaimOf(event: Record<string, unknown>): number | undefined {
 }
 
 /**
+ * What the event consumer does besides storing an event, behind a seam for the
+ * same reason as `completionPorts`: an imported binding cannot be substituted.
+ */
+export const eventNotificationPorts = {
+  recordApprovalRequested,
+};
+
+/**
  * The completion's side effects, behind a seam so a test can see which of them
  * a given run triggers (the functions are imported bindings, which cannot be
  * substituted). Production reads every one from here.
@@ -782,6 +822,8 @@ export const completionPorts = {
   maybeRecordTaskPattern,
   enqueueEvolutionJob,
   recordRunFinished,
+  recordWorkerTurnEnd,
+  deliverUnsaidAnswer,
 };
 
 async function handleComplete(
@@ -900,6 +942,9 @@ async function handleComplete(
   // run.completed / run.failed notification. Everything below that is such a
   // side effect is gated on this one answer, or follows the early return.
   const sandboxOnly = messageId !== null && await isSandboxOnlyRun(sessionId, messageId);
+  // A session that acts as a user saves nothing to its requester's memory, from the model's `save_memory` or from what is extracted
+  // from its conversation, which is what strangers wrote (`sessionWithholdsMemory`).
+  const memoryWithheld = await sessionWithholdsMemory(sessionId);
   const gateOpened = await releaseSessionGateIfLastRun(
     sessionId, gateTurn, Boolean(failed),
     provenance !== "foreign" ? provenance : null,
@@ -913,7 +958,7 @@ async function handleComplete(
   // Brain's save_memory tool stays in the schema, so the LLM may still call it;
   // this is the silent-discard contract documented in the feature flag.
   let explicitMemorySaved = false;
-  const memoriesToSave = sandboxOnly ? [] : (event as any).memories_to_save || [];
+  const memoriesToSave = sandboxOnly || memoryWithheld ? [] : (event as any).memories_to_save || [];
   if (!CLAW_MEMORY_ENABLED) {
     if (memoriesToSave.length) {
       logger.warn({ sessionId, count: memoriesToSave.length }, "memory.write_skipped_flag_off");
@@ -1127,7 +1172,7 @@ async function handleComplete(
   setImmediate(() => {
     completionPorts.maybeSummarize(sessionId, userId).catch(err =>
       logger.error({ err, sessionId }, "summarize_failed"));
-    if (CLAW_MEMORY_ENABLED && !explicitMemorySaved) {
+    if (CLAW_MEMORY_ENABLED && !explicitMemorySaved && !memoryWithheld) {
       completionPorts.maybeExtractMemory(sessionId, userId).catch(err =>
         logger.error({ err, sessionId }, "memory.extraction_failed"));
     }
@@ -1163,6 +1208,40 @@ async function handleComplete(
       });
     } catch (err) {
       logger.error({ err, sessionId }, "notification.record_failed");
+    }
+  }
+
+  // 9. A worker's turn that ended without telling the assistant anything it must act on becomes a report
+  //    of its own (ready, or failed), so an accepted item is never one that just stopped. Best-effort here
+  //    and not allowed to be the only line: the assistant sweep records a run whose end this lost.
+  if (CLAW_ASSISTANT_ENABLED && !interrupted && endedRunIds.length) {
+    try {
+      await completionPorts.recordWorkerTurnEnd({
+        sessionId,
+        runIds: endedRunIds,
+        failed: Boolean(failed),
+        interrupted: Boolean(interrupted),
+        finalText: typeof (event as any).final_text === "string" ? (event as any).final_text : undefined,
+        failureReason: failed ? String(failure_reason ?? "agent_error") : undefined,
+      });
+    } catch (err) {
+      logger.error({ err, sessionId }, "assistant.turn_end_failed");
+    }
+    // 9b. A router turn that answered the user in plain text and said nothing: the text is what it meant to say.
+    //     Best-effort: a turn whose words were lost here is a user who heard nothing, which the model could have
+    //     caused on its own, so this is a repair and not a promise.
+    try {
+      await completionPorts.deliverUnsaidAnswer({
+        sessionId,
+        runIds: endedRunIds,
+        messageId: messageId ?? undefined,
+        failed: Boolean(failed),
+        interrupted: Boolean(interrupted),
+        fromSweeper: (event as any).completion_source === "sweeper",
+        finalText: typeof (event as any).final_text === "string" ? (event as any).final_text : undefined,
+      });
+    } catch (err) {
+      logger.error({ err, sessionId }, "assistant.unsaid_answer_failed");
     }
   }
 
@@ -1213,6 +1292,7 @@ function resolvePendingRequestShape(
  * "no skills were resolved" mean different things downstream.
  */
 async function pendingSkillBundle(
+  sessionId: string,
   userId: string,
   content: string,
 ): Promise<Record<string, {
@@ -1221,7 +1301,8 @@ async function pendingSkillBundle(
 }> | undefined> {
 let pendingSkills: Record<string, { content: string; enabled: boolean; version?: number; description?: string; files?: Array<{ path: string; content: string; is_binary?: boolean }> }> | undefined;
 try {
-  const activeSkills = await selectSkillsForTask(userId, content);
+  // A router turn has no use for skills, and selecting them can cost an LLM call (see sessions/dispatch.ts).
+  const activeSkills = await skipsSkillSelection(sessionId) ? {} : await selectSkillsForTask(userId, content);
   pendingSkills = {};
   for (const [name, bundle] of Object.entries(activeSkills)) {
     pendingSkills[name] = {
@@ -1241,32 +1322,40 @@ try {
 }
 
 /**
- * Dispatch the oldest message parked behind this session, if there is one.
+ * Dispatch the next message parked behind this session, if there is one and the session is free.
  *
  * Extracted from the completion handler rather than duplicated, because the
  * sweeper has to be able to run exactly this path: a dispatch that fails
  * before execution emits no completion, so a session idled by publish-failure
  * cleanup with a row still in the queue has no trigger left and that turn is
- * parked for ever. Callers are responsible for proving the session is free.
+ * parked for ever. Every caller drains through the session's claim
+ * (`withPendingDrainClaim`), which is what keeps two of them from starting two turns.
  */
 export async function drainOldestPendingMessage(
   sessionId: string,
   userId: string,
 ): Promise<void> {
+  await withPendingDrainClaim(sessionId, () => drainNextPendingMessage(sessionId, userId));
+}
+
+async function drainNextPendingMessage(sessionId: string, userId: string): Promise<void> {
   // `session_model` is read with the row rather than stored on it: the message
   // may have waited behind a long turn, and the model that applies is the one the
   // session has when the message is sent on, which is what a change "from the next
   // turn" means for a turn that was already parked.
+  //
+  // A worker's report queued for the assistant waits behind what its user sent: the user is waiting for an answer,
+  // and the report is on the board already, where the turn answering the user reads it.
   const pending = (await db.query(
-  "SELECT id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology, (SELECT model FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_model FROM claw_pending_messages WHERE session_id = $1 ORDER BY created_at LIMIT 1",
-  [sessionId],
+  "SELECT id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology, tools_allowlist, (SELECT model FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_model, (SELECT config->'repo' FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_repo FROM claw_pending_messages WHERE session_id = $1 ORDER BY starts_with(content, $2), created_at LIMIT 1",
+  [sessionId, WORK_EVENT_PREFIX],
 )).rows[0];
 
 if (pending) {
   const pendingUserId = pending.user_id || userId;
   const history = await buildMessages(sessionId, pending.content, pendingUserId);
 
-  const pendingSkills = await pendingSkillBundle(pendingUserId, pending.content || "");
+  const pendingSkills = await pendingSkillBundle(sessionId, pendingUserId, pending.content || "");
   const rawTools = pending.tool_ids;
   const toolIds: number[] = Array.isArray(rawTools)
     ? rawTools.map((x) => Number(x)).filter((n) => Number.isFinite(n))
@@ -1328,6 +1417,7 @@ if (pending) {
     prompt: pending.content,
     history,
     memory_enabled: await isMemoryActive(pendingUserId),
+    skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED,
     user_id: pendingUserId,
     llm_api_key: typeof pending.llm_api_key === "string" ? pending.llm_api_key : "",
     platform_key: typeof pending.platform_key === "string" ? pending.platform_key : "",
@@ -1342,11 +1432,15 @@ if (pending) {
     user_env: pendingUserEnv && Object.keys(pendingUserEnv).length ? pendingUserEnv : undefined,
     session_env: pendingSessionEnv && Object.keys(pendingSessionEnv).length ? pendingSessionEnv : undefined,
     topology: asJsonObject(pending.topology),
+    ...(Array.isArray(pending.tools_allowlist) && pending.tools_allowlist.length ? { tools_allowlist: pending.tools_allowlist } : {}),
   };
   // Same rule as the immediate path in sessions/dispatch.ts: no field at all for
   // a session with no choice, so Brain falls back on its own default.
   const pendingModel = sessionModelFromRow({ model: pending.session_model });
   if (pendingModel) task.model = pendingModel;
+  // The session's bound repository, as the immediate path attaches it.
+  const pendingRepo = sessionRepoFromRow({ repo: pending.session_repo }, sessionId);
+  if (pendingRepo) task.repo = pendingRepo;
   const credentialsReadable = await applyPendingCredentials(task, pending, {
     sessionId, userId: pendingUserId, messageId: pendingMessageId,
   });

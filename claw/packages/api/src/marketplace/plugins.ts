@@ -332,6 +332,22 @@ export async function formatPluginRow(r: JsonObject, enrichRefs = false): Promis
 }
 
 /**
+ * The plugin as `GET /v1/plugins/:id` shows it to this user, or null when it is
+ * missing or the user may not see it. The two are not told apart on purpose:
+ * callers that expose the answer (an A2A agent card or endpoint) must not
+ * become an existence oracle for private plugins.
+ */
+export async function getViewablePlugin(
+  pluginId: number,
+  userId: string | undefined,
+  admin: boolean,
+): Promise<JsonObject | null> {
+  const row = await MarketplaceDb.pluginGetById(pluginId, false);
+  if (!row || !canViewPlugin(row, userId, admin)) return null;
+  return formatPluginRow(row, true);
+}
+
+/**
  * What a dispatch takes from the plugin it was asked to run under.
  *
  * `tools` is the list Brain expands into MCP servers, skills, rules and bash
@@ -366,11 +382,8 @@ export async function resolveTaskPlugin(
   userId: string | undefined,
   admin: boolean,
 ): Promise<TaskPlugin> {
-  const row = await MarketplaceDb.pluginGetById(pluginId, false);
-  if (!row || !canViewPlugin(row, userId, admin)) {
-    return { tools: null, image: undefined, resource: undefined };
-  }
-  const formatted = await formatPluginRow(row, true);
+  const formatted = await getViewablePlugin(pluginId, userId, admin);
+  if (!formatted) return { tools: null, image: undefined, resource: undefined };
   const resource = formatted.resource;
   return {
     tools: (formatted.tools as unknown[]) ?? [],

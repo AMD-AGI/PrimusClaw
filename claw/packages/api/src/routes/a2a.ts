@@ -6,28 +6,33 @@ import { db, MarketplaceDb, type Querier, type StatementRunner } from "../infra/
 import { metrics } from "../infra/metrics.js";
 import { js, sc, nc } from "../infra/nats.js";
 import { sanitizeSessionEvent } from "../events/store.js";
-import { getUser } from "../auth/middleware.js";
+import { authErrorPayload, getUser } from "../auth/middleware.js";
+import { getAuthMethod } from "../auth/request-credential.js";
 import { canWriteSessionAsOperator, isAdmin, type UserInfo } from "../auth/models.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
-import { resolveTaskPlugin } from "../marketplace/plugins.js";
+import { getViewablePlugin, resolveTaskPlugin } from "../marketplace/plugins.js";
 import {
   decideAdmission, envAdmitLimits, sessionTreeShape, withOwnedAdmissionLock,
   type AdmissionAsk,
 } from "../tasks/admission.js";
 import { applySessionGateTransition, openChatRun } from "../tasks/chat-run.js";
+import { createA2aV2, type A2aV2, type ContextEntry, type OpenRunInput } from "./a2a-v2.js";
+import { a2aContextTasksEnabled, identityCallerMayUseA2a } from "./a2a-flags.js";
 import { applyTaskStatusTransition } from "../tasks/db.js";
 import { gpuNodesFromSpec, topologyErrors } from "../tasks/run-spec.js";
 import type { EnvironmentTopology } from "@claw/protocol";
 import { isMemoryActive } from "../memory/service.js";
+import { CLAW_AGENT_GUIDELINE_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
+import { withAgentGuideline } from "../sessions/agent-guideline.js";
 import type { PoolClient } from "pg";
 import { ErrorCode, NatsError } from "nats";
 import pino from "pino";
 import { randomUUID } from "node:crypto";
 import {
-  type AgentCard, type AgentSkill, type Task, type Message,
+  type Task, type Message,
   type Part, type StreamResponse,
   type TaskStatusUpdateEvent, type TaskArtifactUpdateEvent,
-  type SendMessageRequest, type GetTaskRequest, type ListTasksRequest,
+  type SendMessageRequest, type GetTaskRequest, type ListTasksRequest, type TaskPushNotificationConfig,
   type ListTasksResponse, type CancelTaskRequest, type SubscribeToTaskRequest,
   type JsonRpcRequest, type JsonRpcResponse,
   TaskState, Role, TERMINAL_STATES,
@@ -39,6 +44,10 @@ import {
   makeUnsupportedOperationError, makePushNotificationNotSupportedError,
   makeTaskNotCancelableError, makeVersionNotSupportedError,
 } from "./a2a-types.js";
+import {
+  bindPluginToSend, cardEtag, cardOptionsFromEnv, etagMatches, genericAgentCard, pluginAgentCard,
+  publicBaseUrl,
+} from "./a2a-agents.js";
 
 const logger = pino({ name: "a2a-server" });
 const SUPPORTED_A2A_VERSION = "1.0";
@@ -84,46 +93,6 @@ function validateA2AVersion(req: FastifyRequest, rpcId: string | number | null):
   }
   return null;
 }
-
-// ---------------------------------------------------------------------------
-// Agent Card — full Google A2A v1.0 spec
-// ---------------------------------------------------------------------------
-function buildAgentCard(): AgentCard {
-  const baseUrl = process.env.CLAW_PUBLIC_URL || "";
-  return {
-    name: "PrimusClaw",
-    description: "AI Agent operating system for code generation, debugging, and deployment on AMD infrastructure",
-    version: "2.0.0",
-    provider: { url: "https://www.amd.com", organization: "AMD" },
-    supportedInterfaces: [
-      {
-        url: `${baseUrl}/a2a`,
-        protocolBinding: "JSONRPC",
-        protocolVersion: "1.0",
-      },
-    ],
-    capabilities: {
-      streaming: true,
-      pushNotifications: false,
-      extendedAgentCard: false,
-    },
-    securitySchemes: {
-      bearer: { httpAuthSecurityScheme: { scheme: "bearer", description: "Bearer token authentication" } },
-    },
-    securityRequirements: [{ bearer: [] }],
-    defaultInputModes: ["text/plain", "application/json"],
-    defaultOutputModes: ["text/plain", "application/json"],
-    skills: [
-      { id: "code-generation", name: "Code Generation", description: "Generate, edit, and refactor code in any language", tags: ["code", "generation", "refactor"] },
-      { id: "debugging", name: "Debugging", description: "Debug code issues with automated root cause analysis", tags: ["debug", "error", "fix"] },
-      { id: "code-review", name: "Code Review", description: "Review code for quality, security, and best practices", tags: ["review", "security", "quality"] },
-      { id: "optimization", name: "Performance Optimization", description: "Optimize code and model inference performance on AMD GPUs", tags: ["performance", "gpu", "amd"] },
-    ] satisfies AgentSkill[],
-    iconUrl: undefined,
-  };
-}
-
-const AGENT_CARD = buildAgentCard();
 
 // ---------------------------------------------------------------------------
 // DB ↔ A2A mapping helpers
@@ -382,6 +351,10 @@ interface A2AAuthContext {
   roles: string[];
   platformKey: string;
   virtualKey: string;
+  /** How the caller authenticated (`api_key`, `identity_token`, ...). */
+  authMethod?: string | null;
+  /** Who acted for the user, when an upstream service presented the token. */
+  delegation?: { actorSub?: string; clientId?: string };
 }
 
 
@@ -629,6 +602,262 @@ async function admitAndOpenA2ASend(
   }));
 }
 
+// ---------------------------------------------------------------------------
+// Context/task model (CLAW_A2A_CONTEXT_TASKS): the admission half.
+//
+// A context is a session; a send finds it by caller and context id (or creates
+// it), takes its gate, and opens one run, which is the task. The handlers that
+// answer the caller live in a2a-v2.ts and are handed these functions.
+// ---------------------------------------------------------------------------
+
+interface ContextOpened {
+  target: SendTarget;
+  spec: A2ARunSpec;
+  auth: A2AAuthContext;
+  messageId: string;
+}
+
+type ContextAdmission =
+  | { kind: "opened"; target: SendTarget; taskId: string }
+  | { kind: "duplicate"; target: SendTarget; taskId: string }
+  | { kind: "busy"; taskId: string }
+  | { kind: "rejected"; reason: string }
+  | { kind: "deferred" }
+  | { kind: "error"; error: JsonRpcResponse };
+
+/**
+ * The session a context names for this caller, taken for a new run.
+ *
+ * One transaction-scoped advisory lock per (caller, context) serialises two
+ * sends to the same context, so the second reads the first's run row and is
+ * told the context is busy instead of both starting.
+ */
+async function resolveContextTarget(
+  message: Message,
+  contextId: string,
+  callerId: string,
+  auth: A2AAuthContext,
+  text: string,
+  q: StatementRunner,
+): Promise<{ target: SendTarget } | { dupe: string } | { busy: string }> {
+  await q.query(
+    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+    [JSON.stringify(["a2a-context", callerId, contextId])],
+  );
+  const found = await q.query(
+    `SELECT session_id, user_id, ${TOUCHED_TARGET_COLUMNS.join(", ")}
+       FROM claw_sessions
+      WHERE a2a_caller_id = $1 AND context_id = $2 AND deleted_at IS NULL
+      ORDER BY created_at DESC LIMIT 1
+      FOR UPDATE`,
+    [callerId, contextId],
+  );
+  const row = found.rows?.[0] as Record<string, unknown> | undefined;
+  if (!row) {
+    const sessionId = `a2a-${randomUUID()}`;
+    await q.query(
+      `INSERT INTO claw_sessions
+         (session_id, name, user_id, mode, agent_status, context_id, a2a_caller_id, agent_gate_message_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [sessionId, text.slice(0, 80), auth.userId, "claw", "pending", contextId, callerId, message.messageId],
+    );
+    return { target: { taskId: sessionId, contextId, created: true } };
+  }
+  const sessionId = String(row.session_id);
+  // A resend of a message this context already ran is that run, whether or not
+  // it is still going.
+  const same = await q.query(
+    `SELECT task_id FROM claw_tasks
+      WHERE session_id = $1 AND origin = 'a2a' AND metadata->>'message_id' = $2 LIMIT 1`,
+    [sessionId, message.messageId],
+  );
+  if (same.rows?.[0]) return { dupe: String((same.rows[0] as { task_id: string }).task_id) };
+  const live = await q.query(
+    `SELECT task_id FROM claw_tasks
+      WHERE session_id = $1 AND origin IN ('a2a','chat')
+        AND status IN ('queued','preparing','running','cancelling')
+      ORDER BY created_at DESC LIMIT 1`,
+    [sessionId],
+  );
+  if (live.rows?.[0]) return { busy: String((live.rows[0] as { task_id: string }).task_id) };
+  const preImage = Object.fromEntries(TOUCHED_TARGET_COLUMNS.map((c) => [c, row[c]]));
+  // A session an earlier version minted under the shared owner becomes the caller's.
+  if (!row.user_id || row.user_id === "a2a") {
+    await q.query("UPDATE claw_sessions SET user_id = $2 WHERE session_id = $1", [sessionId, auth.userId]);
+  }
+  await applySessionGateTransition({
+    sessionId,
+    actor: message.messageId,
+    intent: "take",
+    status: "pending",
+    force: true,
+    expectReleaser: true,
+    also: { context_id: contextId },
+    q: { query: (t: string, p?: unknown[]) => q.query(t, p) },
+  });
+  return { target: { taskId: sessionId, contextId, created: false, preImage, markerWritten: message.messageId } };
+}
+
+async function admitAndOpenA2AContextSend(
+  message: Message,
+  text: string,
+  contextId: string,
+  callerId: string,
+  auth: A2AAuthContext,
+  spec: A2ARunSpec,
+): Promise<ContextAdmission> {
+  const settled = await withOwnedAdmissionLock(async (client): Promise<ContextAdmission> => {
+    if (spec.parentSessionId) await assertParentWritable(spec.parentSessionId, auth, client);
+    // A message that names no context mints one, so the pair check inside the
+    // context cannot see a retry of it. The retry of a send whose answer was lost
+    // is the same message: it is that run, wherever it ran. Serialised on the
+    // message, so two copies sent at once start one run.
+    if (!message.contextId) {
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        [JSON.stringify(["a2a-message", callerId, message.messageId])],
+      );
+      const sent = (await client.query(
+        `SELECT t.task_id, t.session_id, s.context_id
+           FROM claw_tasks t JOIN claw_sessions s ON s.session_id = t.session_id
+          WHERE t.origin = 'a2a' AND s.a2a_caller_id = $1 AND s.deleted_at IS NULL
+            AND t.metadata->>'message_id' = $2
+          ORDER BY t.created_at DESC LIMIT 1`,
+        [callerId, message.messageId],
+      )).rows?.[0] as { task_id: string; session_id: string; context_id: string } | undefined;
+      if (sent) {
+        return {
+          kind: "duplicate", taskId: sent.task_id,
+          target: { taskId: sent.session_id, contextId: sent.context_id, created: false },
+        };
+      }
+    }
+    const existing = (await client.query(
+      "SELECT session_id FROM claw_sessions WHERE a2a_caller_id = $1 AND context_id = $2 AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1",
+      [callerId, contextId],
+    )).rows?.[0] as { session_id?: string } | undefined;
+    const decision = await decideAdmission(await a2aAdmissionAsk(existing?.session_id ?? null, spec, client), client);
+    if (decision.kind === "reject") return { kind: "rejected", reason: decision.reason };
+    if (decision.kind === "queue") return { kind: "deferred" };
+
+    const resolved = await resolveContextTarget(message, contextId, callerId, auth, text, client);
+    if ("busy" in resolved) return { kind: "busy", taskId: resolved.busy };
+    if ("dupe" in resolved) {
+      return {
+        kind: "duplicate", taskId: resolved.dupe,
+        target: { taskId: existing?.session_id ?? "", contextId, created: false },
+      };
+    }
+    const { target } = resolved;
+    await attachA2AParent(target, auth, spec, client);
+    const taskId = await openA2ARun(target, text, auth, spec, client);
+    // A repeated pair was answered above, so the open cannot find one. Thrown
+    // rather than returned: the lock rolls the session and its gate back.
+    if (!taskId) throw new Error("a2a.context_run_not_opened");
+    // Who asked, for the audit trail: the run belongs to the caller, and an
+    // upstream service may have asked on their behalf.
+    await client.query(
+      "UPDATE claw_tasks SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb WHERE task_id = $1",
+      [taskId, JSON.stringify({
+        a2a: {
+          caller_id: callerId,
+          context_id: contextId,
+          auth_method: auth.authMethod ?? null,
+          ...(auth.delegation?.actorSub ? { act_sub: auth.delegation.actorSub } : {}),
+          ...(auth.delegation?.clientId ? { client_id: auth.delegation.clientId.slice(0, 128) } : {}),
+        },
+      })],
+    );
+    // The turn in the transcript, and the point in the event log this task's
+    // events are counted from (routes/a2a-store.ts).
+    await client.query(
+      `INSERT INTO claw_session_events (event_id, session_id, event, data)
+       VALUES ($1, $2, 'UserMessage', $3::jsonb)
+       ON CONFLICT (event_id, session_id) DO NOTHING`,
+      [spec.messageId, target.taskId, JSON.stringify({
+        type: "UserMessage", message_id: spec.messageId, role: "user",
+        data: { content: [{ type: "text", text }] },
+      })],
+    );
+    return { kind: "opened", target, taskId };
+  });
+  if (settled.kind === "opened" && settled.target.created) metrics.onSessionCreated("ok");
+  return settled;
+}
+
+async function openContextRun(input: OpenRunInput<A2AAuthContext>): Promise<ContextEntry> {
+  const { text, callerId, rpcId, auth, metadata } = input;
+  const message: Message = { ...input.message, messageId: input.message.messageId || randomUUID() };
+  const resolved = await resolveA2ARunSpec(message.messageId, metadata, auth);
+  if ("invalidTopology" in resolved) {
+    return { kind: "error", error: makeInvalidParams(rpcId, resolved.invalidTopology.join("; ")).error };
+  }
+  const contextId = message.contextId || `ctx-${randomUUID()}`;
+  const admitted = await admitAndOpenA2AContextSend(message, text, contextId, callerId, auth, resolved.spec);
+  switch (admitted.kind) {
+    case "opened": {
+      const internal: ContextOpened = { target: admitted.target, spec: resolved.spec, auth, messageId: message.messageId };
+      return {
+        kind: "opened", sessionId: admitted.target.taskId, contextId, taskId: admitted.taskId,
+        messageId: message.messageId, internal,
+      };
+    }
+    case "duplicate":
+      return {
+        kind: "duplicate", sessionId: admitted.target.taskId, contextId: admitted.target.contextId, taskId: admitted.taskId,
+      };
+    default:
+      return admitted;
+  }
+}
+
+async function publishContextRun(
+  entry: Extract<ContextEntry, { kind: "opened" }>,
+  text: string,
+  auth: A2AAuthContext,
+  beforePublish?: () => Promise<void>,
+): Promise<void> {
+  const { target, spec } = entry.internal as ContextOpened;
+  try {
+    if (beforePublish) await beforePublish();
+    // The turns the context already has, so a follow-up in it is a conversation
+    // and not a fresh start. Memory and the user's profile come with it, as for
+    // a turn sent from the web client. The last message is this prompt, which
+    // Brain adds itself.
+    const { buildMessages } = await import("../sessions/context-builder.js");
+    const history = (await buildMessages(target.taskId, text, auth.userId)).slice(0, -1);
+    await publishA2AExecuteTask(target.taskId, text, auth, spec, history);
+  } catch (err) {
+    await rollbackA2AAdmission(target, entry.taskId, err);
+    await db.query(
+      "DELETE FROM claw_session_events WHERE event_id = $1 AND session_id = $2 AND event = 'UserMessage'",
+      [spec.messageId, target.taskId],
+    ).catch(() => { /* the session row is the one that matters */ });
+    // Push configurations written for the task that never ran (the table exists only with push on).
+    await db.query("DELETE FROM claw_a2a_push_configs WHERE task_id = $1", [entry.taskId])
+      .catch(() => { /* no table, nothing to remove */ });
+    throw err;
+  }
+}
+
+let contextV2: A2aV2<A2AAuthContext> | null = null;
+
+/** Built on first use, from this module's own NATS binding (which a suite points elsewhere). */
+function a2aV2(): A2aV2<A2AAuthContext> {
+  contextV2 ??= createA2aV2<A2AAuthContext>({
+    nats: {
+      subscribe: (subject) => nc.subscribe(subject) as never,
+      publish: (subject, payload) => { nc.publish(subject, payload === undefined ? undefined : sc.encode(payload)); },
+      decode: (data) => sc.decode(data),
+    },
+    openRun: openContextRun,
+    publishRun: publishContextRun,
+    admissionRejected: makeAdmissionRejectedError,
+    admissionDeferred: makeAdmissionDeferredError,
+  });
+  return contextV2;
+}
+
 // Counted after the commit: inside the lock the insert is still provisional.
 async function countingCreatedSession(entry: Promise<A2AEntry>): Promise<A2AEntry> {
   const settled = await entry;
@@ -685,13 +914,15 @@ async function publishA2AExecuteTask(
   text: string,
   auth: A2AAuthContext,
   spec: A2ARunSpec,
+  history: unknown[] = [],
 ): Promise<void> {
   const payload: Record<string, unknown> = {
     session_id: taskId,
     message_id: spec.messageId,
     prompt: text,
-    history: [],
+    history,
     memory_enabled: await isMemoryActive(auth.userId || "a2a"),
+    skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED,
     user_id: auth.userId || "a2a",
     platform_key: auth.platformKey,
     llm_api_key: auth.virtualKey,
@@ -712,6 +943,7 @@ async function publishA2AExecuteTask(
     payload.sandbox_image = spec.sandboxImage;
     if (spec.resources) payload.resources = spec.resources;
   }
+  if (CLAW_AGENT_GUIDELINE_ENABLED) withAgentGuideline(payload);
   await js.publish("tasks.execute", sc.encode(JSON.stringify(payload)));
 }
 
@@ -1427,19 +1659,76 @@ const PUSH_NOTIFICATION_METHODS: Set<string> = new Set([
   A2A_METHODS.DeleteTaskPushNotificationConfig,
 ]);
 
+/**
+ * Whether an identity-provider token's caller is refused A2A under the
+ * context/task model (see identityCallerMayUseA2a). Asked on every path that
+ * runs something, the JSON-RPC endpoint and the gateway's `/invoke` alike.
+ */
+function identityCallerRefused(req: FastifyRequest): boolean {
+  if (!a2aContextTasksEnabled()) return false;
+  return !identityCallerMayUseA2a(getAuthMethod(req), getUser(req)?.delegation?.clientId);
+}
+
+/** The methods of the context/task model; what it does not change is answered as before. */
+async function dispatchContextTasks(
+  method: string,
+  p: Record<string, unknown>,
+  id: string | number,
+  reply: FastifyReply,
+  callerId: string,
+  auth: A2AAuthContext,
+): Promise<JsonRpcResponse | null> {
+  const v2 = a2aV2();
+  switch (method) {
+    case A2A_METHODS.SendMessage:
+      return v2.sendMessage(p as unknown as SendMessageRequest, id, callerId, auth);
+    case A2A_METHODS.SendStreamingMessage:
+      await v2.sendStreamingMessage(p as unknown as SendMessageRequest, id, reply, callerId, auth);
+      return null;
+    case A2A_METHODS.GetTask:
+      return v2.getTask(p as unknown as GetTaskRequest, id, callerId);
+    case A2A_METHODS.ListTasks:
+      return v2.listTasks(p as unknown as ListTasksRequest, id, callerId);
+    case A2A_METHODS.CancelTask:
+      return v2.cancelTask(p as unknown as CancelTaskRequest, id, callerId);
+    case A2A_METHODS.SubscribeToTask:
+      await v2.subscribeToTask(p as unknown as SubscribeToTaskRequest, id, reply, callerId);
+      return null;
+    case A2A_METHODS.CreateTaskPushNotificationConfig:
+      return v2.createPushConfig(p as unknown as TaskPushNotificationConfig, id, callerId);
+    case A2A_METHODS.GetTaskPushNotificationConfig:
+      return v2.getPushConfig(p, id, callerId);
+    case A2A_METHODS.ListTaskPushNotificationConfigs:
+      return v2.listPushConfigs(p, id, callerId);
+    case A2A_METHODS.DeleteTaskPushNotificationConfig:
+      return v2.deletePushConfig(p, id, callerId);
+    case A2A_METHODS.GetExtendedAgentCard:
+      return makeUnsupportedOperationError(id, "Extended agent card is not supported");
+    default:
+      return makeJsonRpcError(id, JSON_RPC_METHOD_NOT_FOUND, `Method not found: ${method}`);
+  }
+}
+
+/**
+ * @param pluginId set when the request came in on a per-plugin agent endpoint,
+ *   whose sends run with that plugin. Everything else (tasks, ownership, auth)
+ *   is exactly what the generic endpoint does.
+ */
 async function dispatch(
   rpc: JsonRpcRequest,
   req: FastifyRequest,
   reply: FastifyReply,
+  pluginId?: number,
 ): Promise<JsonRpcResponse | null> {
-  const { method, params, id } = rpc;
-  const p = (params ?? {}) as Record<string, unknown>;
+  const { method, id } = rpc;
+  let p = (rpc.params ?? {}) as Record<string, unknown>;
   const callerId = extractCallerId(req);
   if (!callerId) {
     return makeJsonRpcError(id, JSON_RPC_INVALID_REQUEST, "authentication required");
   }
 
-  if (PUSH_NOTIFICATION_METHODS.has(method)) {
+  const contextTasks = a2aContextTasksEnabled();
+  if (!contextTasks && PUSH_NOTIFICATION_METHODS.has(method)) {
     return makePushNotificationNotSupportedError(id);
   }
 
@@ -1449,7 +1738,23 @@ async function dispatch(
     roles: user?.roles ?? [],
     platformKey: user?.platformKey || "",
     virtualKey: resolveUserLlmKey(user),
+    authMethod: getAuthMethod(req),
+    delegation: user?.delegation,
   };
+
+  if (contextTasks && identityCallerRefused(req)) {
+    reply.status(403);
+    return makeJsonRpcError(id, JSON_RPC_INVALID_REQUEST, "this credential may not use the A2A interface");
+  }
+
+  if (pluginId !== undefined
+    && (method === A2A_METHODS.SendMessage || method === A2A_METHODS.SendStreamingMessage)) {
+    const bound = bindPluginToSend(p, pluginId);
+    if ("error" in bound) return makeJsonRpcError(id, JSON_RPC_INVALID_PARAMS, bound.error);
+    p = bound.params;
+  }
+
+  if (contextTasks) return dispatchContextTasks(method, p, id, reply, callerId, auth);
 
   switch (method) {
     case A2A_METHODS.SendMessage:
@@ -1481,6 +1786,85 @@ async function dispatch(
 }
 
 // ---------------------------------------------------------------------------
+// Per-plugin agents
+// ---------------------------------------------------------------------------
+
+// What a card's URL is derived from. A shared cache has to key on all of it.
+const CARD_VARY = "Host, X-Forwarded-Host, X-Forwarded-Proto, X-Forwarded-Prefix";
+
+type PluginGate =
+  | { ok: true; pluginId: number; plugin: Record<string, unknown> & { id: number } }
+  | { ok: false; status: 401 | 404; message: string };
+
+/**
+ * Whether the caller may reach the agent for the plugin `:pluginId` names.
+ *
+ * The one place the rule lives, run by every request to a per-plugin path --
+ * the card and every JSON-RPC method alike -- so no method is reachable that
+ * the card is not. Visibility is the plugin REST API's own: the owner, any
+ * caller for a public plugin, an admin for all. A malformed id, a missing
+ * plugin and a plugin the caller cannot view are one answer, because a
+ * different one for the last would tell any caller which ids are private
+ * plugins.
+ */
+async function gatePluginAgent(req: FastifyRequest, rawPluginId: string): Promise<PluginGate> {
+  const user = getUser(req);
+  if (!user?.userId) return { ok: false, status: 401, message: "authentication required" };
+  const notFound: PluginGate = { ok: false, status: 404, message: "plugin agent not found" };
+  if (!/^[1-9][0-9]{0,14}$/.test(rawPluginId)) return notFound;
+  const pluginId = Number(rawPluginId);
+  if (!Number.isSafeInteger(pluginId)) return notFound;
+  const plugin = await getViewablePlugin(pluginId, user.userId, isAdmin(user));
+  if (!plugin) return notFound;
+  return { ok: true, pluginId, plugin: { ...plugin, id: pluginId } };
+}
+
+// The JSON-RPC entry both `POST /a2a` and `POST /a2a/plugins/:pluginId` serve.
+// Registered inside the scope whose error handler maps a body parse failure to
+// -32700.
+async function serveRpc(
+  req: FastifyRequest,
+  reply: FastifyReply,
+  rawPluginId?: string,
+): Promise<JsonRpcResponse | undefined> {
+  const rpc = req.body as JsonRpcRequest | undefined;
+  if (
+    !rpc
+    || rpc.jsonrpc !== "2.0"
+    || !rpc.method
+    || rpc.id === undefined
+    || (typeof rpc.id !== "string" && typeof rpc.id !== "number" && rpc.id !== null)
+  ) {
+    return makeJsonRpcError(
+      (rpc?.id ?? null) as string | number | null,
+      JSON_RPC_INVALID_REQUEST,
+      "Request payload validation error: must include jsonrpc='2.0', method, and id",
+    );
+  }
+
+  const versionError = validateA2AVersion(req, rpc.id);
+  if (versionError) return versionError;
+
+  try {
+    let pluginId: number | undefined;
+    if (rawPluginId !== undefined) {
+      const gate = await gatePluginAgent(req, rawPluginId);
+      if (!gate.ok) {
+        reply.status(gate.status);
+        return makeJsonRpcError(rpc.id, JSON_RPC_INVALID_REQUEST, gate.message);
+      }
+      pluginId = gate.pluginId;
+    }
+    const result = await dispatch(rpc, req, reply, pluginId);
+    if (result === null) return; // SSE streaming handled inline
+    return result;
+  } catch (err: unknown) {
+    logger.error({ err, method: rpc.method }, "a2a.dispatch.unhandled");
+    return makeJsonRpcError(rpc.id, JSON_RPC_INTERNAL_ERROR, "Internal error");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Route registration
 // ---------------------------------------------------------------------------
 
@@ -1490,14 +1874,50 @@ export async function registerA2ARoutes(app: FastifyInstance): Promise<void> {
   // Spec §8.2: the canonical well-known URI in v1.0 is
   // `/.well-known/agent-card.json`. The plain `agent.json` paths are kept
   // for v0.x clients (e.g. older SaFE Gateway scanners) during transition.
-  const serveAgentCard = async (_req: FastifyRequest, reply: FastifyReply) => {
+  const serveAgentCard = async (req: FastifyRequest, reply: FastifyReply) => {
     reply.header("Access-Control-Allow-Origin", "*");
-    return AGENT_CARD;
+    reply.header("Vary", CARD_VARY);
+    const opts = cardOptionsFromEnv();
+    const card = genericAgentCard(publicBaseUrl(req.headers), opts);
+    if (!opts.contextTasks) return card;
+    // Spec 8.6: a validator and a lifetime, so a client revalidates cheaply.
+    const etag = cardEtag(card);
+    reply.header("ETag", etag);
+    reply.header("Cache-Control", "public, max-age=300");
+    if (etagMatches(req.headers["if-none-match"], etag)) return reply.status(304).send();
+    return card;
   };
   app.get("/.well-known/agent-card.json", serveAgentCard);
   app.get("/a2a/.well-known/agent-card.json", serveAgentCard);
   app.get("/.well-known/agent.json", serveAgentCard); // legacy v0.x
   app.get("/a2a/.well-known/agent.json", serveAgentCard); // legacy v0.x
+
+  // === Per-plugin Agent Card (authenticated) ===
+  // Not anonymous, unlike the generic card: whether a plugin may be described
+  // at all depends on who is asking, and a private plugin's name, description
+  // and tools are its owner's. A plugin the caller cannot view answers exactly
+  // as one that does not exist.
+  app.get<{ Params: { pluginId: string } }>(
+    "/a2a/plugins/:pluginId/.well-known/agent-card.json",
+    async (req, reply) => {
+      const opts = cardOptionsFromEnv();
+      // The card depends on who asks (a private plugin answers its owner only).
+      reply.header("Vary", opts.contextTasks ? `${CARD_VARY}, Authorization` : CARD_VARY);
+      reply.header("Cache-Control", opts.contextTasks ? "private, max-age=0, must-revalidate" : "private, no-store");
+      const gate = await gatePluginAgent(req, req.params.pluginId);
+      if (!gate.ok) {
+        reply.header("Cache-Control", "private, no-store");
+        reply.status(gate.status);
+        return authErrorPayload(gate.status === 401 ? "unauthorized" : "not_found", gate.message);
+      }
+      const card = pluginAgentCard(publicBaseUrl(req.headers), gate.plugin, opts);
+      if (!opts.contextTasks) return card;
+      const etag = cardEtag(card);
+      reply.header("ETag", etag);
+      if (etagMatches(req.headers["if-none-match"], etag)) return reply.status(304).send();
+      return card;
+    },
+  );
 
   // === Health (for SaFE K8s scanner) ===
   app.get("/a2a/health", async () => ({ status: "ok", service: "claw-a2a" }));
@@ -1522,43 +1942,30 @@ export async function registerA2ARoutes(app: FastifyInstance): Promise<void> {
       reply.send(err);
     });
 
-    rpcScope.post("/a2a", async (req: FastifyRequest, reply: FastifyReply) => {
-      const rpc = req.body as JsonRpcRequest | undefined;
-      if (
-        !rpc
-        || rpc.jsonrpc !== "2.0"
-        || !rpc.method
-        || rpc.id === undefined
-        || (typeof rpc.id !== "string" && typeof rpc.id !== "number" && rpc.id !== null)
-      ) {
-        return makeJsonRpcError(
-          (rpc?.id ?? null) as string | number | null,
-          JSON_RPC_INVALID_REQUEST,
-          "Request payload validation error: must include jsonrpc='2.0', method, and id",
-        );
-      }
+    rpcScope.post("/a2a", (req: FastifyRequest, reply: FastifyReply) => serveRpc(req, reply));
 
-      const versionError = validateA2AVersion(req, rpc.id);
-      if (versionError) return versionError;
-
-      try {
-        const result = await dispatch(rpc, req, reply);
-        if (result === null) return; // SSE streaming handled inline
-        return result;
-      } catch (err: unknown) {
-        logger.error({ err, method: rpc.method }, "a2a.dispatch.unhandled");
-        return makeJsonRpcError(rpc.id, JSON_RPC_INTERNAL_ERROR, "Internal error");
-      }
-    });
+    // One agent per plugin: the same JSON-RPC surface and the same caller-scoped
+    // tasks, with every send running under the plugin named in the path.
+    rpcScope.post<{ Params: { pluginId: string } }>(
+      "/a2a/plugins/:pluginId",
+      (req, reply) => serveRpc(req, reply, req.params.pluginId),
+    );
   });
 
   // === SaFE Gateway backward-compatible endpoints ===
   app.post<{ Params: { skill?: string } }>("/invoke/:skill", async (req, reply) => {
+    if (identityCallerRefused(req)) return refuseLegacyInvoke(reply);
     return handleLegacyInvoke(req.body as Record<string, unknown>, req.params.skill, reply);
   });
   app.post("/invoke", async (req, reply) => {
+    if (identityCallerRefused(req)) return refuseLegacyInvoke(reply);
     return handleLegacyInvoke(req.body as Record<string, unknown>, undefined, reply);
   });
+}
+
+function refuseLegacyInvoke(reply: FastifyReply): { success: false; error: string } {
+  reply.status(403);
+  return { success: false, error: "this credential may not use the A2A interface" };
 }
 
 const LEGACY_INVOKE_AUTH: A2AAuthContext = {
@@ -1622,7 +2029,11 @@ async function handleLegacyInvoke(
   // caller-supplied task or message id it is the difference between a skipped
   // compensation and a `taskId` that does not exist.
   try {
-    const payload = { session_id: target.taskId, prompt: text, history: [], memory_enabled: await isMemoryActive("a2a"), user_id: "a2a" };
+    const payload: Record<string, unknown> = {
+      session_id: target.taskId, prompt: text, history: [], memory_enabled: await isMemoryActive("a2a"),
+      skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED, user_id: "a2a",
+    };
+    if (CLAW_AGENT_GUIDELINE_ENABLED) withAgentGuideline(payload);
     await js.publish("tasks.execute", sc.encode(JSON.stringify(payload)));
   } catch (err: unknown) {
     if (entry.kind === "opened") await rollbackA2AAdmission(target, entry.taskId, err);

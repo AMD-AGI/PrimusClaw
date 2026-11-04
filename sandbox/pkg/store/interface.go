@@ -14,11 +14,13 @@ const (
 	SandboxKind         = "Sandbox"
 	SandboxClaimKind    = "SandboxClaim"
 	CodeInterpreterKind = "CodeInterpreter"
+	// WorkloadKind is a cluster-scoped SaFE Workload created for an E2B sandbox.
+	WorkloadKind = "Workload"
 )
 
 // SandboxInfo holds all metadata for a session↔sandbox mapping.
 type SandboxInfo struct {
-	// Kind indicates the K8s resource kind: "Sandbox" or "SandboxClaim"
+	// Kind indicates the K8s resource kind: "Sandbox", "SandboxClaim", or "Workload".
 	// Used by GC to choose the correct deletion method.
 	Kind        string `json:"kind"`
 	SessionID   string `json:"session_id"`

@@ -366,7 +366,8 @@ test("cancelling mid-batch stops dispatch but every tool_use still gets a result
       } as unknown as ToolRouter,
       onCheckpoint: async (s: CheckpointState) => { seen.push(s); },
       llmSession: scriptedSession([
-        { content: [toolUse("t1", "read"), toolUse("t2", "read"), toolUse("t3", "read")],
+        // Writes, which run one at a time: reads emitted together go to the sandbox together.
+        { content: [toolUse("t1", "write"), toolUse("t2", "write"), toolUse("t3", "write")],
           stopReason: "tool_use" },
         { content: [text("done")], stopReason: "end_turn" },
       ]),

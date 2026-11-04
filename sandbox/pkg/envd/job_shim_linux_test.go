@@ -51,7 +51,7 @@ func requireJobShim(t *testing.T) {
 		var out synchronizedBuffer
 		s := newTestServer()
 		_, exitCh, _, _, err := s.startTrackedCommand(
-			[]string{"true"}, "", os.Environ(), &out, &out, jobTracking{},
+			[]string{"true"}, "", os.Environ(), &out, &out, nil, jobTracking{},
 		)
 		if err != nil {
 			shimProbe.err = err
@@ -75,7 +75,7 @@ func run(t *testing.T, s *Server, track bool, args ...string) (int, *synchronize
 	t.Helper()
 	var out synchronizedBuffer
 	_, exitCh, drained, _, err := s.startTrackedCommand(
-		args, "", os.Environ(), &out, &out, jobTracking{track: track},
+		args, "", os.Environ(), &out, &out, nil, jobTracking{track: track},
 	)
 	if err != nil {
 		t.Fatalf("startTrackedCommand: %v", err)
@@ -193,7 +193,7 @@ func TestSetsidDescendantIsAdoptedByItsSupervisor(t *testing.T) {
 		[]string{"sh", "-c", fmt.Sprintf(
 			"setsid sh -c 'echo $$ > %s; sleep 30' >/dev/null 2>&1 & exit 0", pidFile,
 		)},
-		"", os.Environ(), &out, &out, jobTracking{track: true},
+		"", os.Environ(), &out, &out, nil, jobTracking{track: true},
 	)
 	if err != nil {
 		t.Fatalf("startTrackedCommand: %v", err)
@@ -275,7 +275,7 @@ func TestPurgeFreesShimStuckReapingOrphans(t *testing.T) {
 		[]string{"sh", "-c", fmt.Sprintf(
 			"setsid sh -c 'echo $$ > %s; sleep 100000' >/dev/null 2>&1 & exit 0", pidFile,
 		)},
-		"", os.Environ(), &out, &out, jobTracking{track: true},
+		"", os.Environ(), &out, &out, nil, jobTracking{track: true},
 	)
 	if err != nil {
 		t.Fatalf("startTrackedCommand: %v", err)
@@ -360,7 +360,7 @@ func TestPurgeFreesShimWhileTheTreeKeepsForking(t *testing.T) {
 		[]string{"sh", "-c",
 			"setsid sh -c 'i=0; while [ $i -lt 3000 ]; do sleep 100000 & i=$((i+1)); done; wait'" +
 				" >/dev/null 2>&1 & exit 0"},
-		"", os.Environ(), &out, &out, jobTracking{track: true},
+		"", os.Environ(), &out, &out, nil, jobTracking{track: true},
 	)
 	if err != nil {
 		t.Fatalf("startTrackedCommand: %v", err)
@@ -396,7 +396,7 @@ func TestCancelWhilePrimaryRunsSparesSetsidWork(t *testing.T) {
 		[]string{"sh", "-c", fmt.Sprintf(
 			"setsid sh -c 'echo $$ > %s; sleep 100000' >/dev/null 2>&1 & sleep 100000", pidFile,
 		)},
-		"", os.Environ(), &out, &out, jobTracking{track: true},
+		"", os.Environ(), &out, &out, nil, jobTracking{track: true},
 	)
 	if err != nil {
 		t.Fatalf("startTrackedCommand: %v", err)
@@ -510,7 +510,7 @@ func TestSignalledUntrackedShimDoesNotLoseTracking(t *testing.T) {
 	s := newTestServer()
 	var out synchronizedBuffer
 	_, exitCh, _, stop, err := s.startTrackedCommand(
-		[]string{"sh", "-c", "sleep 30"}, "", os.Environ(), &out, &out, jobTracking{},
+		[]string{"sh", "-c", "sleep 30"}, "", os.Environ(), &out, &out, nil, jobTracking{},
 	)
 	if err != nil {
 		t.Fatalf("startTrackedCommand: %v", err)
@@ -661,7 +661,7 @@ func TestKilledTrackedShimLatchesTrackingLoss(t *testing.T) {
 		[]string{"sh", "-c", fmt.Sprintf(
 			"setsid sh -c 'echo $$ > %s; sleep 60' >/dev/null 2>&1 & exit 0", pidFile,
 		)},
-		"", os.Environ(), &out, &out, jobTracking{track: true, hands: true},
+		"", os.Environ(), &out, &out, nil, jobTracking{track: true, hands: true},
 	)
 	if err != nil {
 		t.Fatalf("startTrackedCommand: %v", err)

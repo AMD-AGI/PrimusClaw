@@ -131,6 +131,14 @@
       "type": "object",
       "additionalProperties": true,
       "properties": {
+        "requiredPlatformRoles": {
+          "description": "Platform roles, as SaFE reports them, of which a caller must hold at least one to use Claw (CLAW_REQUIRED_PLATFORM_ROLES). Empty, the default, checks nothing.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[^\\s,]+$"
+          }
+        },
         "admitSoftRuns": {
           "$ref": "#/definitions/admitCeiling"
         },
@@ -162,7 +170,7 @@
       "additionalProperties": true,
       "properties": {
         "enabled": {
-          "description": "Build the shared identity client in API and Brain. Off by default; nothing authenticates through it yet.",
+          "description": "Build the shared identity client in API and Brain. Off by default; it authenticates a connector access token on the remote-agents connector routes, and an identity provider's access token on the rest of the API only when identity.tokenAuth is on.",
           "default": false,
           "type": "boolean"
         },
@@ -189,6 +197,43 @@
         },
         "exchangeRefreshSkewSeconds": {
           "$ref": "#/definitions/optionalWholeNumber"
+        },
+        "tokenAuth": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "enabled": {
+              "description": "Accept an access token the identity provider issued as an API credential. Off by default; needs identity.enabled.",
+              "default": false,
+              "type": "boolean"
+            },
+            "audience": {
+              "type": "string"
+            },
+            "scope": {
+              "type": "string"
+            },
+            "delegationAudience": {
+              "description": "The audience of the token the API asks the identity provider for (RFC 8693) to present to SaFE in a signed-in person's name. Blank: primus-safe.",
+              "type": "string"
+            },
+            "delegationScope": {
+              "description": "The scope of that token. Blank: safe.api.",
+              "type": "string"
+            },
+            "introspect": {
+              "type": "boolean"
+            },
+            "trustedRoles": {
+              "description": "Platform roles a token the identity provider confirms (RFC 7662) may confer on its caller. Empty by default: every token's caller is a plain user.",
+              "default": [],
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "enum": ["system-admin", "system-admin-readonly"]
+              }
+            }
+          }
         }
       }
     }

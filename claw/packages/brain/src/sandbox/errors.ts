@@ -97,6 +97,34 @@ export function provisionTerminalOf(err: unknown): SandboxProvisionTerminalError
 }
 
 /**
+ * The provisioning endings that mean the platform cannot give this run a sandbox
+ * right now, after the run has already waited as long as the deployment allows
+ * for one: the early limit on a workload no node will run, the ceiling on one
+ * that was admitted and never became ready, and the queue ceiling.
+ *
+ * What they share is what a second try inside the same run buys: the same wait
+ * again, for the same cause, ending the same way. It used to be bought anyway --
+ * the open failed as a tool error, the model read it and called the tool again,
+ * and the user sat through the whole wait a second time. These are the endings
+ * the rest of the run is told about instead of offered another go at.
+ *
+ * Not the other provisioning endings (a pod that exited, a workload that
+ * vanished, a status that could not be read): those do not say that waiting is
+ * what failed.
+ */
+export const SANDBOX_UNAVAILABLE_REASONS: ReadonlySet<string> = new Set([
+  "sandbox_unschedulable",
+  "sandbox_start_timeout",
+  "sandbox_pending_timeout",
+]);
+
+/** The give-up behind `err` when it is one of SANDBOX_UNAVAILABLE_REASONS, else null. */
+export function sandboxUnavailableOf(err: unknown): SandboxProvisionTerminalError | null {
+  const terminal = provisionTerminalOf(err);
+  return terminal && SANDBOX_UNAVAILABLE_REASONS.has(terminal.reason) ? terminal : null;
+}
+
+/**
  * classifyWorkloadTerminalReason maps a SaFE workload detail payload (already
  * observed in a terminal phase) to a stable reason.
  *

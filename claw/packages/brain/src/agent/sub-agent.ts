@@ -2,11 +2,15 @@
 // SPDX-License-Identifier: MIT
 
 import { agentLoop } from "./agent-loop.js";
-import { ToolRouter, type WebToolServices } from "../tools/router.js";
+import { ToolRouter, INHERIT_MODEL, type WebToolServices } from "../tools/router.js";
 import type { HandsClient } from "../clients/hands.js";
 import type { HookRunner } from "./hooks.js";
-import type { Message, ToolSchema, EventCallback } from "@claw/protocol";
+import type { Message, ReasoningEffort, ToolSchema, EventCallback } from "@claw/protocol";
 import type { RunIdentity } from "../tasks/run-identity.js";
+import { filterToolSchemas, type ToolAllowlist } from "../tools/allowlist.js";
+import { SUB_AGENT_EXPLORE_MODEL, SUB_AGENT_MODELS } from "../config.js";
+import { modelRefusalStatus } from "./summary-completer.js";
+import { metrics } from "../infra/metrics.js";
 import pino from "pino";
 import { randomUUID } from "node:crypto";
 
@@ -25,8 +29,8 @@ export const SUBAGENT_TYPES = ["explore", "readonly", "shell", "generalPurpose"]
 export type SubagentType = typeof SUBAGENT_TYPES[number];
 
 const PROFILE_ALLOW: Record<SubagentType, string[] | "all"> = {
-  explore:         ["read", "grep", "glob", "ls", "bash"],
-  readonly:        ["read", "grep", "glob", "ls"],
+  explore:         ["read", "grep", "glob", "ls", "bash", "load_skill"],
+  readonly:        ["read", "grep", "glob", "ls", "load_skill"],
   shell:           ["bash"],
   generalPurpose:  "all",
 };
@@ -44,6 +48,42 @@ const DENY_LIST = new Set([
   "upload_to_s3",
   "download_from_s3",
 ]);
+
+/** The profiles that only read and search: the ones a lighter default model is for. */
+const READING_PROFILES = new Set<SubagentType>(["explore", "readonly"]);
+
+/**
+ * The model a `task` call's sub-agent runs on: the one the call names when the
+ * deployment offers it (SUB_AGENT_MODELS), the run's own for INHERIT_MODEL,
+ * else the reading default for a reading profile, else the run's own. A name
+ * the deployment does not offer is refused rather than replaced, so the model
+ * learns its choice did not happen.
+ *
+ * `fallback` is set only when the model is the reading default the call never
+ * asked for: the gateway checks model access per key, so a key that cannot
+ * reach the default must still get the sub-agent it got before, on the run's
+ * own model.
+ */
+export function pickSubagentModel(
+  requested: unknown,
+  type: SubagentType,
+  runModel: string,
+  offered: ReadonlyArray<string> = SUB_AGENT_MODELS,
+  readingDefault: string = SUB_AGENT_EXPLORE_MODEL,
+): { model: string; fallback?: string } | { error: string } {
+  if (requested === undefined || requested === null || requested === "") {
+    if (READING_PROFILES.has(type) && readingDefault && readingDefault !== runModel) {
+      return { model: readingDefault, fallback: runModel };
+    }
+    return { model: runModel };
+  }
+  if (requested === INHERIT_MODEL) return { model: runModel };
+  if (typeof requested === "string" && (requested === runModel || offered.includes(requested))) {
+    return { model: requested };
+  }
+  const choices = [...new Set([runModel, ...offered, INHERIT_MODEL])].join(", ");
+  return { error: `Error: model ${JSON.stringify(String(requested)).slice(0, 80)} is not offered for sub-agents; choose one of: ${choices}, or omit it.` };
+}
 
 export interface RunSubagentOptions {
   /** Sub-agent identity, used for event tagging and log correlation. */
@@ -71,6 +111,13 @@ export interface RunSubagentOptions {
 
   // LLM config (inherited from parent engine).
   model: string;
+  /**
+   * The model to run on instead when the gateway refuses `model` for this key
+   * before the sub-agent has run a tool (pickSubagentModel's `fallback`).
+   */
+  fallbackModel?: string;
+  effort?: ReasoningEffort;
+  rollingCacheTtl?: "5m";
   apiUrl: string;
   apiKey: string;
   maxTurns: number;
@@ -84,6 +131,13 @@ export interface RunSubagentOptions {
   runIdentity?: RunIdentity;
   /** Web tool services from the parent, shared across sub-agents. */
   webToolServices?: WebToolServices;
+  /**
+   * The parent run's `tools_allowlist`. The parent's schemas are normally narrowed
+   * by it already; applying it here as well keeps a sub-agent inside the list for
+   * a caller that hands over schemas which were not, and it is forwarded to the
+   * sub-agent's own loop for the calls that loop handles itself.
+   */
+  toolAllowlist?: ToolAllowlist | null;
 }
 
 export interface SubagentResult {
@@ -100,14 +154,18 @@ export interface SubagentResult {
   elapsed_ms: number;
 }
 
-/** Pick the effective tool schemas for this sub-agent. */
+/**
+ * Pick the effective tool schemas for this sub-agent: the parent's, narrowed by
+ * the run's tools_allowlist first so that nothing below can widen them again.
+ */
 function filterSchemas(
   parentSchemas: ToolSchema[],
   profile: SubagentType,
   explicitAllow?: string[],
+  runAllowlist?: ToolAllowlist | null,
 ): ToolSchema[] {
   const profileAllow = PROFILE_ALLOW[profile];
-  return parentSchemas.filter((s) => {
+  return filterToolSchemas(parentSchemas, runAllowlist).filter((s) => {
     const name = s.name;
     // Universal deny.
     if (DENY_LIST.has(name)) return false;
@@ -139,7 +197,7 @@ export async function runSubagent(opts: RunSubagentOptions): Promise<SubagentRes
     ? opts.subagentType
     : "generalPurpose";
 
-  const schemas = filterSchemas(opts.parentSchemas, type, opts.allowedTools);
+  const schemas = filterSchemas(opts.parentSchemas, type, opts.allowedTools, opts.toolAllowlist);
   // Empty toolset → give the LLM a heads-up; don't hard-fail.
   if (!schemas.length) {
     logger.warn({ subagentId, type }, "sub-agent.no_tools_left");
@@ -148,7 +206,9 @@ export async function runSubagent(opts: RunSubagentOptions): Promise<SubagentRes
   const startedAt = Date.now();
 
   // Event bubbling: tag every event with subagent metadata before forwarding.
+  let toolsRan = false;
   const bubble: EventCallback = async (evt) => {
+    if (evt.type === "toolUsed") toolsRan = true;
     await opts.onEvent({
       ...evt,
       subagent_id: subagentId,
@@ -187,30 +247,41 @@ export async function runSubagent(opts: RunSubagentOptions): Promise<SubagentRes
   // new sandbox. Cleanup on completion to avoid keeping references alive.
   opts.parentRouter?.registerChild(router);
 
-  const messages: Message[] = [
-    { role: "user", content: opts.prompt },
-  ];
+  const runOn = (model: string) => agentLoop([{ role: "user", content: opts.prompt } as Message], schemas, {
+    model,
+    effort: opts.effort,
+    rollingCacheTtl: opts.rollingCacheTtl,
+    apiUrl: opts.apiUrl,
+    apiKey: opts.apiKey,
+    maxTurns: opts.maxTurns,
+    router,
+    onEvent: bubble,
+    signal: opts.signal,
+    userId: opts.userId,
+    sessionId: opts.sessionId,
+    // Sub-agents forbid further nesting (enforced by agent-loop via depth).
+    depth: opts.depth,
+    hooks: opts.hooks,
+    hitl: opts.hitl,
+    // Forwarded, never re-derived: these waits belong to the parent's run.
+    runIdentity: opts.runIdentity,
+    toolAllowlist: opts.toolAllowlist,
+  });
 
   let result;
   let failed = false;
   try {
-    result = await agentLoop(messages, schemas, {
-      model: opts.model,
-      apiUrl: opts.apiUrl,
-      apiKey: opts.apiKey,
-      maxTurns: opts.maxTurns,
-      router,
-      onEvent: bubble,
-      signal: opts.signal,
-      userId: opts.userId,
-      sessionId: opts.sessionId,
-      // Sub-agents forbid further nesting (enforced by agent-loop via depth).
-      depth: opts.depth,
-      hooks: opts.hooks,
-      hitl: opts.hitl,
-      // Forwarded, never re-derived: these waits belong to the parent's run.
-      runIdentity: opts.runIdentity,
-    });
+    try {
+      result = await runOn(opts.model);
+    } catch (err) {
+      const status = modelRefusalStatus(err);
+      const fallback = opts.fallbackModel;
+      // Only before any tool ran: past that point a second run would repeat work.
+      if (!fallback || fallback === opts.model || status === undefined || toolsRan || opts.signal?.aborted) throw err;
+      logger.warn({ subagentId, type, model: opts.model, fallback, status }, "sub-agent.default_model_refused");
+      metrics.onSubagentDefaultModelRefused(status);
+      result = await runOn(fallback);
+    }
   } catch (err: any) {
     failed = true;
     result = {

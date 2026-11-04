@@ -45,21 +45,28 @@ nodeSelector: {}
 tolerations: []
 
 # Extra environment for the proxy container, appended verbatim -- raw env
-# entries, so `valueFrom` works. The APIM hook this chart bakes into the image
-# reads its credentials from the environment (AMD_HYPERLOOM_APIM_KEY and
-# AMD_HYPERLOOM_APIM_USER), and without a way to pass them the chart ships a
-# hook it cannot feed: every upstream call goes out with an empty subscription
-# header and is refused.
+# entries, so `valueFrom` works. Use it to hand the proxy the provider
+# credentials a modelList entry refers to as `os.environ/<NAME>`, or the
+# environment of any additional callback you load.
 #
 #   extraEnv:
-#     - name: AMD_HYPERLOOM_APIM_KEY
+#     - name: ANTHROPIC_API_KEY
 #       valueFrom:
-#         secretKeyRef: {name: my-litellm-secret, key: hyperloom_apim_key}
+#         secretKeyRef: {name: my-provider-secret, key: anthropic_api_key}
 extraEnv: []
 
 # Merged over the chart's litellm_settings defaults (drop_params, set_verbose,
-# and the apim_key_hook callback). Set `callbacks` here to replace that list --
-# include the hook entry if you still want it. This is also where
+# and an empty `callbacks` list). The default list is empty on purpose: the
+# image pinned above predates deploy/litellm/prompt_cache_hook.py, so naming
+# that hook here would start a proxy that cannot import it. Opt in with
+#
+#   litellmSettings:
+#     callbacks:
+#       - litellm.proxy.hooks.prompt_cache_hook.proxy_handler_instance
+#
+# once the image is one built from this directory (build.sh); the example
+# values.autorouting.example.yaml does exactly that. `callbacks` here replaces
+# the list, so repeat every entry you want. This is also where
 # prometheus_metrics_config goes when `prometheus` is one of the callbacks.
 litellmSettings: {}
 
@@ -73,7 +80,8 @@ generalSettings: {}
 # Auto Routing (LiteLLM v1.96+ complexity_router) is also a modelList entry,
 # not a separate Helm key. ConfigMap templates toYaml the whole list. See
 # litellm/values.autorouting.example.yaml. Alias names must contain "claude"
-# so apim_key_hook.py still injects Anthropic prompt-cache breakpoints.
+# so prompt_cache_hook.py injects Anthropic prompt-cache breakpoints (once it is
+# listed in litellmSettings.callbacks).
 # Do not put API keys in this public chart. Opt in at runtime with
 # DEFAULT_MODEL=claude-auto; leave this list empty in public defaults.
 # Skip deploy.sh interactive /models discovery when using a router entry —
@@ -83,7 +91,7 @@ modelList: []
 # Prometheus Operator ServiceMonitor for LiteLLM /metrics. Off by default
 # because the monitoring.coreos.com CRDs may not be installed, and because
 # scrape is useless until litellmSettings.callbacks includes prometheus.
-# See deploy/litellm/README.md for a values snippet that keeps the APIM hook.
+# See deploy/litellm/README.md for a values snippet that adds prometheus.
 #
 # bearerTokenSecret is resolved in the ServiceMonitor namespace. Leave
 # namespace empty (the release namespace) to reuse secrets.existingSecret.

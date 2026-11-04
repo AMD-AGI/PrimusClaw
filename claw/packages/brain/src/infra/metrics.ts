@@ -673,6 +673,26 @@ const approvalSummaryModelRefusedTotal = new Counter({
   registers: [registry],
 });
 
+// An explore/readonly sub-agent's default model (SUB_AGENT_EXPLORE_MODEL), which the call did not ask
+// for, was refused by the gateway for the run's key; the sub-agent ran on the run's own model instead.
+// Steady state is 0: anything else means some keys cannot reach the configured default.
+const subagentDefaultModelRefusedTotal = new Counter({
+  name: "claw_brain_subagent_default_model_refused_total",
+  help: "Sub-agents whose default model the gateway refused for the run's key, rerun on the run's model, by HTTP status.",
+  labelNames: ["status"] as const,
+  registers: [registry],
+});
+
+// A call that `requires_approval` held and the same server's `auto_approve` released, so it ran
+// without a decision. No labels, on purpose: neither the tool name (a model can invent any) nor the
+// allowlist entry or server name (a request can carry its own spec) is bounded, and either would
+// mint a series per turn. The entry that released the call is in the `hitl.policy_allow` log line.
+const hitlPolicyAllowTotal = new Counter({
+  name: "claw_hitl_policy_allow_total",
+  help: "Held tool calls released by an auto_approve allowlist.",
+  registers: [registry],
+});
+
 // ─── Keepalive idle reclaim: destroys and the holds that refused them ─
 // A destroy from the jobs probe used to need one reading; now it needs several
 // agreeing ones and a quiet window after any failure. The pair says how often
@@ -942,6 +962,15 @@ export const metrics = {
 
   onApprovalSummaryModelRefused(status: number): void {
     approvalSummaryModelRefusedTotal.inc({ status: String(status) });
+  },
+
+  onSubagentDefaultModelRefused(status: number): void {
+    subagentDefaultModelRefusedTotal.inc({ status: String(status) });
+  },
+
+  /** A held call released by `auto_approve`. Unlabelled: see the counter. */
+  onHitlPolicyAllow(): void {
+    hitlPolicyAllowTotal.inc();
   },
 
   // ─── Plan Y v2 checkpoint helpers ────────────────────────────────

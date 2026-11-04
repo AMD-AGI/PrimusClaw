@@ -1,0 +1,487 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+/**
+ * The review tools over the wire, the way Brain uses them: an MCP client with the
+ * signed session token against the API's own route, plus the confirmation routes.
+ *
+ *   A  who may call: the token, the session row and its owner
+ *   B  what a tool call is: four tools, errors as errors, nothing secret in an answer
+ *   C  the confirmation routes: only the acting user decides, and only by signing in (C3: not with the key a sandbox holds)
+ *   D  with the feature off, nothing exists
+ */
+import assert from "node:assert/strict";
+import test, { after, afterEach, beforeEach, describe } from "node:test";
+import Fastify, { type FastifyInstance } from "fastify";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { registerGithubReviewRoutes } from "../src/github-review/mcp.js";
+import { HOLD_GUIDANCE } from "../src/github-review/risk.js";
+import { mintSessionToolToken } from "../src/github-review/token.js";
+import { HEAD } from "./support/fake-github.js";
+import { PR, SECRET, TOKEN, closeShared, credential, reviewEnv, type ReviewEnv } from "./support/review-env.js";
+
+after(closeShared);
+
+let e: ReviewEnv;
+let app: FastifyInstance;
+let base = "";
+const clients: Client[] = [];
+
+async function boot(opts: { enabled?: boolean } = {}): Promise<void> {
+  app = Fastify();
+  app.addHook("preHandler", async (req) => {
+    // Stands in for the global authentication hook, as the other route tests do.
+    const who = req.headers["x-test-user"];
+    if (typeof who === "string") {
+      (req as unknown as { user: unknown }).user = { userId: who, userName: who, roles: ["default"], platformKey: "", virtualKey: "" };
+      // How the caller signed in is what the hook records beside the user (auth/request-credential.ts): a person's identity-provider token unless a test
+      // says otherwise, and `none` for a credential the hook records no method for (a BYOK key, the development bypass).
+      const method = req.headers["x-test-method"];
+      if (method !== "none") (req as unknown as { authMethod: string }).authMethod = typeof method === "string" ? method : "identity_token";
+    }
+  });
+  await registerGithubReviewRoutes(app, { enabled: opts.enabled ?? true, settings: () => e.settings, db: e.db, service: e.service });
+  await app.listen({ port: 0, host: "127.0.0.1" });
+  base = `http://127.0.0.1:${(app.server.address() as { port: number }).port}`;
+}
+
+beforeEach(async () => {
+  e = await reviewEnv();
+  await e.sql("INSERT INTO claw_sessions (session_id, user_id, config) VALUES ('s-1', 'u-alice', $1::jsonb)", [JSON.stringify({ acting_as: "u-bob", acting_as_requester: "Alice A" })]);
+});
+afterEach(async () => {
+  // A test that failed before it closed its client must not leave the server waiting for it for ever.
+  for (const c of clients.splice(0)) await c.close().catch(() => undefined);
+  app?.server.closeAllConnections();
+  await app?.close();
+});
+
+const token = (over: Partial<{ sessionId: string; requesterUserId: string; actorUserId: string }> = {}, ttl = 600, secret = SECRET) =>
+  mintSessionToolToken({ sessionId: "s-1", requesterUserId: "u-alice", actorUserId: "u-bob", ...over }, secret, ttl);
+
+async function connect(bearer: string): Promise<Client> {
+  const client = new Client({ name: "test", version: "1" });
+  clients.push(client);
+  await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/v1/internal/github-review/mcp`), { requestInit: { headers: { Authorization: `Bearer ${bearer}` } } }));
+  return client;
+}
+
+const call = async (client: Client, name: string, args: Record<string, unknown>) => {
+  const r = await client.callTool({ name, arguments: args }) as { content: Array<{ type: string; text: string }>; isError?: boolean };
+  return { isError: r.isError === true, text: r.content[0]?.text ?? "", body: JSON.parse(r.content[0]?.text ?? "null") as any };
+};
+
+describe("A who may call", () => {
+  beforeEach(async () => { await boot(); });
+
+  test("A1 a valid token lists exactly the four tools", async () => {
+    const c = await connect(token());
+    const tools = (await c.listTools()).tools;
+    assert.deepEqual(tools.map((t) => t.name).sort(), ["gh_pr_get", "gh_pr_merge", "gh_pr_risk", "gh_review_submit"]);
+    for (const t of tools) assert.ok(t.description && t.description.length > 20, t.name);
+    await c.close();
+  });
+
+  test("A2 no token, another secret, an expired token and junk are all 401 and reach nothing", async () => {
+    for (const bearer of ["", "junk", token({}, 600, "x".repeat(40)), token({}, -5)]) {
+      const r = await fetch(`${base}/v1/internal/github-review/mcp`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: bearer ? `Bearer ${bearer}` : "" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) });
+      assert.equal(r.status, 401, bearer.slice(0, 12));
+    }
+    assert.equal(e.gh.calls.length, 0);
+    assert.equal(e.resolved.length, 0);
+  });
+
+  test("A3 a token is only as good as the session row: another owner, another acting user, a deleted or missing session are 403", async () => {
+    const post = (bearer: string) => fetch(`${base}/v1/internal/github-review/mcp`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${bearer}` }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) });
+    assert.equal((await post(token({ requesterUserId: "u-mallory" }))).status, 403);
+    assert.equal((await post(token({ actorUserId: "u-carol" }))).status, 403);
+    assert.equal((await post(token({ sessionId: "s-missing" }))).status, 403);
+    await e.sql("UPDATE claw_sessions SET deleted_at = NOW()");
+    assert.equal((await post(token())).status, 403);
+    await e.sql("UPDATE claw_sessions SET deleted_at = NULL, config = '{}'::jsonb");
+    assert.equal((await post(token())).status, 403, "a session without acting_as has no tools");
+    assert.equal(e.gh.calls.length, 0);
+  });
+});
+
+describe("B a tool call", () => {
+  beforeEach(async () => { await boot(); });
+
+  test("B1 gh_pr_get through MCP answers, GitHub saw the acting user's token and the model did not", async () => {
+    const c = await connect(token());
+    const r = await call(c, "gh_pr_get", { pr: PR });
+    assert.equal(r.isError, false);
+    assert.equal(r.body.pull_request.head_sha, HEAD);
+    assert.equal(r.text.includes(TOKEN), false);
+    assert.equal(e.gh.calls.every((x) => x.authorization === `Bearer ${TOKEN}`), true);
+    assert.deepEqual(e.resolved[0], { userId: "u-bob", provider: "github", requesterUserId: "u-alice", purpose: "gh_pr_get" });
+    await c.close();
+  });
+
+  test("B2 a refusal arrives as an error the model can read, and the token never appears even when GitHub echoes it", async () => {
+    e.gh.fail["/repos/AMD-AGI/demo/pulls/7"] = { status: 500, message: `echo ${TOKEN}` };
+    const c = await connect(token());
+    const r = await call(c, "gh_pr_get", { pr: PR });
+    assert.equal(r.isError, true);
+    assert.equal(r.body.reason, "github_error");
+    assert.equal(r.text.includes(TOKEN), false);
+    const owner = await call(c, "gh_pr_get", { pr: "evil/x#1" });
+    assert.equal(owner.isError, true);
+    assert.equal(owner.body.reason, "owner_not_allowed");
+    await c.close();
+  });
+
+  test("B3 the footer names the requester the session recorded, and the acting user's login", async () => {
+    e.identity.answer = async () => credential({ delegation: true });
+    const c = await connect(token());
+    const r = await call(c, "gh_review_submit", { pr: PR, head_sha: HEAD, event: "COMMENT", body: "Fine." });
+    assert.equal(r.isError, false, r.text);
+    assert.match(String(e.gh.writes[0]?.body.body), /Reviewed by Claw on behalf of bob \(requested by Alice A\)/);
+    await c.close();
+  });
+
+  test("B4 the schema stops what the tool would refuse anyway: a bad event or a missing head_sha never reaches the service", async () => {
+    const c = await connect(token());
+    const bad = await c.callTool({ name: "gh_review_submit", arguments: { pr: PR, head_sha: HEAD, event: "DISMISS", body: "x" } }) as { isError?: boolean };
+    assert.equal(bad.isError, true);
+    assert.equal(e.gh.calls.length, 0);
+    await c.close();
+  });
+
+  test("B6 gh_review_submit takes the same risk_flags as gh_pr_merge, and a flagged APPROVE is held for the acting user through MCP too", async () => {
+    e.identity.answer = async () => credential({ delegation: true });
+    const c = await connect(token());
+    const tool = (await c.listTools()).tools.find((t) => t.name === "gh_review_submit");
+    assert.ok(tool && "risk_flags" in ((tool.inputSchema as { properties?: Record<string, unknown> }).properties ?? {}));
+    const flagged = await call(c, "gh_review_submit", { pr: PR, head_sha: HEAD, event: "APPROVE", body: "Fine.", risk_flags: ["security_finding"] });
+    assert.equal(flagged.isError, false, flagged.text);
+    assert.deepEqual([flagged.body.status, flagged.body.kind], ["confirmation_required", "review"]);
+    assert.match(String((flagged.body.reasons as string[]).join()), /security issue/);
+    const unknown = await c.callTool({ name: "gh_review_submit", arguments: { pr: PR, head_sha: HEAD, event: "APPROVE", body: "Fine.", risk_flags: ["whatever"] } }) as { isError?: boolean };
+    assert.equal(unknown.isError, true);
+    assert.equal(e.gh.writes.length, 0);
+    await c.close();
+  });
+
+  test("B7 the three tools that judge risk take the reviewer's judgement, only low and high are words it knows, and a high through MCP holds a merge the rules would let through", async () => {
+    e.identity.answer = async () => credential({ delegation: true });
+    const c = await connect(token());
+    const tools = (await c.listTools()).tools;
+    for (const name of ["gh_pr_risk", "gh_review_submit", "gh_pr_merge"]) {
+      const tool = tools.find((t) => t.name === name);
+      assert.ok(tool && "risk_judgement" in ((tool.inputSchema as { properties?: Record<string, unknown> }).properties ?? {}), name);
+    }
+    assert.ok(!("risk_judgement" in ((tools.find((t) => t.name === "gh_pr_get")?.inputSchema as { properties?: Record<string, unknown> }).properties ?? {})), "gh_pr_get has nothing to add to");
+    // The hold guidance reaches the model with the tools themselves, on every turn, wherever it judges.
+    for (const name of ["gh_pr_risk", "gh_review_submit", "gh_pr_merge"]) {
+      const judgement = ((tools.find((t) => t.name === name)?.inputSchema as { properties?: Record<string, { description?: string }> }).properties ?? {}).risk_judgement;
+      assert.ok(judgement?.description?.includes(HOLD_GUIDANCE), name);
+    }
+    const bad = await c.callTool({ name: "gh_pr_merge", arguments: { pr: PR, head_sha: HEAD, risk_judgement: { level: "medium", reason: "x" } } }) as { isError?: boolean };
+    assert.equal(bad.isError, true);
+    assert.equal(e.gh.calls.length, 0, "the schema stopped it before anything was asked of GitHub");
+    const held = await call(c, "gh_pr_merge", { pr: PR, head_sha: HEAD, risk_judgement: { level: "high", reason: "changes the shape of every run's result" } });
+    assert.equal(held.isError, false, held.text);
+    assert.equal(held.body.status, "confirmation_required");
+    assert.equal(held.body.reasons[0], "the reviewer's judgement: changes the shape of every run's result");
+    assert.equal(e.gh.calls.filter((x) => x.method === "PUT").length, 0);
+    await c.close();
+  });
+
+  test("B5 gh_pr_merge through MCP holds a high-risk change for the acting user", async () => {
+    e.identity.answer = async () => credential({ delegation: true });
+    e.gh.files = [{ filename: ".github/workflows/ci.yml", status: "modified", additions: 1, deletions: 0, patch: "@@ -1 +1,2 @@\n a\n+b" }];
+    const c = await connect(token());
+    const r = await call(c, "gh_pr_merge", { pr: PR, head_sha: HEAD });
+    assert.equal(r.body.status, "confirmation_required");
+    assert.equal(e.gh.writes.length, 0);
+    await c.close();
+  });
+});
+
+describe("E a session bound to one pull request, over the wire", () => {
+  const target = { owner: "AMD-AGI", repo: "demo", number: 7 };
+  const bind = (review_target: unknown) =>
+    e.sql("UPDATE claw_sessions SET config = config || $1::jsonb WHERE session_id = 's-1'", [JSON.stringify({ review_target })]);
+  beforeEach(async () => { await boot(); });
+
+  test("E1 the tool route takes the binding from the session row: another pull request is refused as review_target_mismatch, the bound one is read", async () => {
+    await bind(target);
+    const c = await connect(token());
+    for (const pr of ["AMD-AGI/demo#8", "AMD-AGI/other#7", "https://github.com/AMD-AGI/demo/pull/9"]) {
+      for (const [name, args] of [["gh_pr_get", { pr }], ["gh_review_submit", { pr, head_sha: HEAD, event: "COMMENT", body: "x" }], ["gh_pr_merge", { pr, head_sha: HEAD }]] as const) {
+        const r = await call(c, name, args);
+        assert.equal(r.isError, true, `${name} ${pr}`);
+        assert.equal(r.body.reason, "review_target_mismatch", `${name} ${pr}`);
+        assert.equal(r.body.review_target, "AMD-AGI/demo#7");
+      }
+    }
+    assert.equal(e.gh.calls.length, 0);
+    assert.equal(e.resolved.length, 0);
+    const ok = await call(c, "gh_pr_get", { pr: PR });
+    assert.equal(ok.isError, false, ok.text);
+    await c.close();
+  });
+
+  test("E2 a target that is there and cannot be read is not 'no target': the route answers 403 review_target_invalid and nothing is reached", async () => {
+    for (const unreadable of [{ owner: "AMD-AGI" }, "AMD-AGI/demo#7", { ...target, number: 0 }, { ...target, extra: 1 }]) {
+      await bind(unreadable);
+      const r = await fetch(`${base}/v1/internal/github-review/mcp`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${token()}` }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) });
+      assert.equal(r.status, 403, JSON.stringify(unreadable));
+      assert.deepEqual(await r.json(), { ok: false, error: "review_target_invalid" }, JSON.stringify(unreadable));
+    }
+    assert.equal(e.gh.calls.length, 0);
+    assert.equal(e.resolved.length, 0);
+  });
+
+  test("E3 a session with no target is as it was: any pull request of an allowed owner", async () => {
+    const c = await connect(token());
+    assert.equal((await call(c, "gh_pr_get", { pr: "AMD-AGI/demo#8" })).isError, false);
+    await bind(null);
+    assert.equal((await call(c, "gh_pr_get", { pr: "AMD-AGI/other#9" })).isError, false);
+    await c.close();
+  });
+
+  test("E4 a held review is listed with its kind and what it would post, so a card can show it", async () => {
+    e.identity.answer = async () => credential({ delegation: true });
+    const c = await connect(token());
+    const held = await call(c, "gh_review_submit", { pr: PR, head_sha: HEAD, event: "APPROVE", body: "Please fix.", risk_flags: ["security_finding"], comments: [{ path: "src/app.ts", line: 3, body: "here" }] });
+    assert.equal(held.body.status, "confirmation_required");
+    await c.close();
+    const r = await fetch(`${base}/v1/github-review/confirmations?session_id=s-1&status=pending`, { headers: { "x-test-user": "u-bob" } });
+    const item = ((await r.json()) as any).items[0];
+    assert.equal(item.kind, "review");
+    assert.deepEqual(item.review, { event: "APPROVE", body: "Please fix.", comments: [{ path: "src/app.ts", line: 3, side: "RIGHT", body: "here" }] });
+    assert.equal(item.id, held.body.confirmation_id);
+  });
+});
+
+describe("C confirmations over HTTP", () => {
+  beforeEach(async () => {
+    await boot();
+    e.identity.answer = async () => credential({ delegation: true });
+    e.gh.files = [{ filename: ".github/workflows/ci.yml", status: "modified", additions: 1, deletions: 0, patch: "@@ -1 +1,2 @@\n a\n+b" }];
+    e.gh.graphql.mergeStateStatus = "BLOCKED";
+    e.gh.onReview = (r) => { if (r.event === "APPROVE") e.gh.graphql.mergeStateStatus = "CLEAN"; };
+    const c = await connect(token());
+    await call(c, "gh_pr_merge", { pr: PR, head_sha: HEAD });
+    await c.close();
+  });
+  const http = async (user: string | null, method: string, path: string, body?: unknown, signedInWith?: string) => {
+    const r = await fetch(base + path, { method, headers: { ...(user ? { "x-test-user": user } : {}), ...(signedInWith ? { "x-test-method": signedInWith } : {}), ...(body === undefined ? {} : { "content-type": "application/json" }) }, body: body === undefined ? undefined : JSON.stringify(body) });
+    return { status: r.status, body: (await r.json().catch(() => null)) as any };
+  };
+
+  test("C1 the acting user and the requester see the pending confirmation, with what a card needs; anyone else sees none; no credential is 401", async () => {
+    for (const who of ["u-bob", "u-alice"]) {
+      const r = await http(who, "GET", "/v1/github-review/confirmations?session_id=s-1&status=pending");
+      assert.equal(r.status, 200, who);
+      assert.equal(r.body.items.length, 1, who);
+      const item = r.body.items[0];
+      assert.deepEqual(Object.keys(item).sort(), ["actor_user_id", "author", "checks", "decided_by", "decided_via", "expires_at", "head_sha", "id", "kind", "pr", "reasons", "repo", "requester_user_id", "review", "session_id", "status", "title"]);
+      assert.equal(item.kind, "merge");
+      assert.equal(item.review, null, "a merge holds no review");
+      assert.equal(item.decided_by, null, "nobody has answered it yet");
+      assert.equal(item.decided_via, null);
+      assert.equal(item.repo, "AMD-AGI/demo");
+      assert.equal(item.pr, 7);
+      assert.equal(item.head_sha, HEAD);
+      assert.equal(item.status, "pending");
+      assert.deepEqual(r.body.data.items, r.body.items);
+    }
+    assert.equal((await http("u-mallory", "GET", "/v1/github-review/confirmations?session_id=s-1")).body.items.length, 0);
+    assert.equal((await http(null, "GET", "/v1/github-review/confirmations")).status, 401);
+    assert.equal((await http("u-bob", "GET", "/v1/github-review/confirmations?status=bogus")).status, 400);
+  });
+
+  test("C2 only the acting user decides: the requester gets 403 and nothing is merged; the acting user's allow merges once", async () => {
+    const id = (await http("u-bob", "GET", "/v1/github-review/confirmations")).body.items[0].id as string;
+    const path = `/v1/github-review/confirmations/${id}/decision`;
+    assert.equal((await http("u-alice", "POST", path, { decision: "allow" })).status, 403);
+    assert.equal((await http(null, "POST", path, { decision: "allow" })).status, 401);
+    assert.equal((await http("u-bob", "POST", path, { decision: "maybe" })).status, 400);
+    assert.equal((await http("u-bob", "POST", "/v1/github-review/confirmations/not-a-uuid/decision", { decision: "allow" })).status, 404);
+    assert.equal((await http("u-bob", "POST", "/v1/github-review/confirmations/00000000-0000-4000-8000-000000000000/decision", { decision: "allow" })).status, 404);
+    assert.equal(e.gh.writes.length, 0);
+    const ok = await http("u-bob", "POST", path, { decision: "allow" });
+    assert.equal(ok.status, 200);
+    assert.equal(ok.body.status, "merged");
+    assert.equal(ok.body.merge_sha, "m".repeat(40));
+    assert.equal(e.gh.calls.filter((x) => x.method === "PUT").length, 1);
+    const again = await http("u-bob", "POST", path, { decision: "allow" });
+    assert.equal(again.body.status, "refused");
+    assert.equal(e.gh.calls.filter((x) => x.method === "PUT").length, 1);
+  });
+});
+
+describe("C4 a merge into a branch with a merge queue, over HTTP", () => {
+  beforeEach(async () => {
+    await boot();
+    e.identity.answer = async () => credential({ delegation: true });
+    e.gh.files = [{ filename: ".github/workflows/ci.yml", status: "modified", additions: 1, deletions: 0, patch: "@@ -1 +1,2 @@\n a\n+b" }];
+    e.gh.rules = [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "test" }] } }, { type: "merge_queue", parameters: {} }];
+  });
+  const http = async (user: string, method: string, path: string, body?: unknown) => {
+    const r = await fetch(base + path, { method, headers: { "x-test-user": user, ...(body === undefined ? {} : { "content-type": "application/json" }) }, body: body === undefined ? undefined : JSON.stringify(body) });
+    return { status: r.status, body: (await r.json().catch(() => null)) as any };
+  };
+
+  test("C4 the acting user's allow answers queued with the queue entry, the card is listed under status=queued, and nothing was merged", async () => {
+    const c = await connect(token());
+    const held = await call(c, "gh_pr_merge", { pr: PR, head_sha: HEAD });
+    assert.equal(held.body.status, "confirmation_required");
+    await c.close();
+    const id = held.body.confirmation_id as string;
+    const ok = await http("u-bob", "POST", `/v1/github-review/confirmations/${id}/decision`, { decision: "allow" });
+    assert.equal(ok.status, 200);
+    assert.deepEqual(ok.body, { ok: true, status: "queued", queue_entry_id: "MQE_kwDOdemo1", queue_position: 3, queue_state: "QUEUED", url: "https://github.com/AMD-AGI/demo/pull/7" });
+    assert.equal(e.gh.calls.filter((x) => x.method === "PUT").length, 0, "no direct merge");
+    assert.equal(e.gh.enqueues.length, 1);
+    const listed = await http("u-bob", "GET", "/v1/github-review/confirmations?session_id=s-1&status=queued");
+    assert.equal(listed.status, 200);
+    assert.deepEqual(listed.body.items.map((i: any) => [i.id, i.status]), [[id, "queued"]]);
+    assert.equal((await http("u-bob", "GET", "/v1/github-review/confirmations?session_id=s-1&status=pending")).body.items.length, 0);
+    assert.equal((await http("u-bob", "POST", `/v1/github-review/confirmations/${id}/decision`, { decision: "allow" })).body.status, "refused");
+    assert.equal(e.gh.enqueues.length, 1);
+  });
+});
+
+describe("C3 who may answer for the acting user", () => {
+  beforeEach(async () => {
+    await boot();
+    e.identity.answer = async () => credential({ delegation: true });
+    e.gh.files = [{ filename: ".github/workflows/ci.yml", status: "modified", additions: 1, deletions: 0, patch: "@@ -1 +1,2 @@\n a\n+b" }];
+    e.gh.graphql.mergeStateStatus = "BLOCKED";
+    e.gh.onReview = (r) => { if (r.event === "APPROVE") e.gh.graphql.mergeStateStatus = "CLEAN"; };
+  });
+  const decide = async (id: string, decision: unknown, signedInWith?: string, user = "u-bob") => {
+    const r = await fetch(`${base}/v1/github-review/confirmations/${id}/decision`, {
+      method: "POST",
+      headers: { "x-test-user": user, "content-type": "application/json", ...(signedInWith ? { "x-test-method": signedInWith } : {}) },
+      body: JSON.stringify({ decision }),
+    });
+    return { status: r.status, body: (await r.json().catch(() => null)) as any };
+  };
+  const hold = async (): Promise<string> => {
+    const c = await connect(token());
+    const held = await call(c, "gh_pr_merge", { pr: PR, head_sha: HEAD });
+    await c.close();
+    assert.equal(held.body.status, "confirmation_required");
+    return held.body.confirmation_id as string;
+  };
+  const status = async (id: string) => (await e.sql("SELECT status FROM claw_github_confirmations WHERE confirmation_id = $1", [id]))[0]?.status;
+
+  test("C3 the model cannot answer its own confirmation with the key its sandbox holds, or with the session cookie that key can sign in to: an ak- key, an x-api-key, a query token, a BYOK key (no method), a connector token and a cookie are all 403", async () => {
+    // The session's owner is also the acting user (the self case): the key in the sandbox is that user's own.
+    await e.sql("UPDATE claw_sessions SET user_id = 'u-bob', config = $1::jsonb WHERE session_id = 's-1'", [JSON.stringify({ acting_as: "u-bob", acting_as_requester: "Bob B" })]);
+    const c = await connect(token({ requesterUserId: "u-bob" }));
+    const held = await call(c, "gh_pr_merge", { pr: PR, head_sha: HEAD });
+    await c.close();
+    assert.equal(held.body.status, "confirmation_required");
+    const id = held.body.confirmation_id as string;
+    for (const how of ["api_key", "x_api_key", "query_token", "connector_token", "cookie", "none", "something_new"]) {
+      for (const decision of ["allow", "deny", "nonsense"]) {
+        const r = await decide(id, decision, how);
+        assert.equal(r.status, 403, `${how} ${decision}`);
+        assert.equal(r.body.error, "interactive_sign_in_required", `${how} ${decision}`);
+      }
+    }
+    assert.equal(await status(id), "pending", "the confirmation is untouched");
+    assert.equal(e.gh.writes.length, 0, "nothing was approved");
+    assert.equal(e.gh.calls.filter((x) => x.method === "PUT").length, 0, "nothing was merged");
+    // The same person, signed in at the identity provider, can.
+    const ok = await decide(id, "allow", "identity_token");
+    assert.equal(ok.status, 200);
+    assert.equal(ok.body.status, "merged");
+    assert.equal(e.gh.calls.filter((x) => x.method === "PUT").length, 1);
+  });
+
+  test("C4 an identity provider's access token decides, and a deny made with it is final", async () => {
+    for (const how of ["identity_token"]) {
+      await e.sql("DELETE FROM claw_github_confirmations");
+      const id = await hold();
+      const r = await decide(id, "deny", how);
+      assert.equal(r.status, 200, how);
+      assert.equal(r.body.status, "denied", how);
+      assert.equal(await status(id), "denied", how);
+    }
+  });
+
+  test("C5 the credential is judged before the confirmation is looked up, so a refused caller learns nothing about which ids exist", async () => {
+    const missing = "00000000-0000-4000-8000-000000000000";
+    assert.deepEqual((await decide(missing, "allow", "api_key")).body, { ok: false, error: "interactive_sign_in_required" });
+    const id = await hold();
+    assert.deepEqual((await decide(id, "allow", "api_key")).body, { ok: false, error: "interactive_sign_in_required" });
+    assert.equal((await decide(missing, "allow", "identity_token")).status, 404);
+  });
+});
+
+describe("S the caller's own review mode", () => {
+  const http = async (user: string | null, method: string, body?: unknown, signedInWith?: string) => {
+    const r = await fetch(`${base}/v1/github-review/settings`, { method, headers: { ...(user ? { "x-test-user": user } : {}), ...(signedInWith ? { "x-test-method": signedInWith } : {}), ...(body === undefined ? {} : { "content-type": "application/json" }) }, body: body === undefined ? undefined : JSON.stringify(body) });
+    return { status: r.status, body: (await r.json().catch(() => null)) as any };
+  };
+  beforeEach(async () => { await boot(); });
+
+  test("S1 with no row it is high_risk_confirm; the person sets their own, signed in, and reads it back; nobody else's changes", async () => {
+    const first = await http("u-bob", "GET");
+    assert.equal(first.status, 200);
+    assert.deepEqual(first.body.data, { review_mode: "high_risk_confirm", updated_at: null, review_modes: ["high_risk_confirm", "fully_auto"] });
+    const set = await http("u-bob", "PUT", { review_mode: "fully_auto" });
+    assert.equal(set.status, 200, JSON.stringify(set.body));
+    assert.equal(set.body.data.review_mode, "fully_auto");
+    assert.equal((await http("u-bob", "GET")).body.data.review_mode, "fully_auto");
+    assert.equal((await http("u-alice", "GET")).body.data.review_mode, "high_risk_confirm", "a setting is the person's own");
+    // There is no user in the request: what alice sets is alice's, and bob's stays.
+    assert.equal((await http("u-alice", "PUT", { review_mode: "high_risk_confirm", user_id: "u-bob" })).status, 200);
+    assert.equal((await http("u-bob", "GET")).body.data.review_mode, "fully_auto");
+    assert.equal((await http("u-bob", "PUT", { review_mode: "high_risk_confirm" })).body.data.review_mode, "high_risk_confirm");
+    assert.deepEqual((await e.sql("SELECT user_id, review_mode FROM claw_github_review_settings ORDER BY user_id")).map((r) => [r.user_id, r.review_mode]),
+      [["u-alice", "high_risk_confirm"], ["u-bob", "high_risk_confirm"]]);
+  });
+
+  test("S2 a key a sandbox holds, a cookie and the like cannot set it, nor can no one; a value that is not a mode is 400", async () => {
+    for (const how of ["api_key", "x_api_key", "query_token", "connector_token", "cookie", "none"]) {
+      const r = await http("u-bob", "PUT", { review_mode: "fully_auto" }, how);
+      assert.deepEqual([r.status, r.body.error], [403, "interactive_sign_in_required"], how);
+    }
+    assert.equal((await http(null, "PUT", { review_mode: "fully_auto" })).status, 401);
+    assert.equal((await http(null, "GET")).status, 401);
+    for (const bad of ["FULLY_AUTO", "off", true, null]) assert.equal((await http("u-bob", "PUT", { review_mode: bad })).status, 400, String(bad));
+    assert.deepEqual(await e.sql("SELECT * FROM claw_github_review_settings"), []);
+  });
+
+  test("S3 what the person set is what their account's writes run under, whoever asked: fully_auto merges a workflow change the default holds", async () => {
+    e.identity.answer = async () => credential({ delegation: true });
+    e.gh.files = [{ filename: ".github/workflows/ci.yml", status: "modified", additions: 1, deletions: 0, patch: "@@ -1 +1,2 @@\n a\n+b" }];
+    e.gh.onReview = (r) => { if (r.event === "APPROVE") e.gh.graphql.mergeStateStatus = "CLEAN"; };
+    const judged = { level: "low", reason: "a test step renamed" };
+    let c = await connect(token());
+    assert.equal((await call(c, "gh_pr_merge", { pr: PR, head_sha: HEAD, risk_judgement: judged })).body.status, "confirmation_required");
+    await c.close();
+    await e.sql("DELETE FROM claw_github_confirmations");
+    assert.equal((await http("u-alice", "PUT", { review_mode: "fully_auto" })).status, 200);
+    c = await connect(token());
+    assert.equal((await call(c, "gh_pr_merge", { pr: PR, head_sha: HEAD, risk_judgement: judged })).body.status, "confirmation_required", "the requester's own setting is not the acting user's");
+    await c.close();
+    await e.sql("DELETE FROM claw_github_confirmations");
+    assert.equal((await http("u-bob", "PUT", { review_mode: "fully_auto" })).status, 200);
+    c = await connect(token());
+    const merged = await call(c, "gh_pr_merge", { pr: PR, head_sha: HEAD, risk_judgement: judged });
+    await c.close();
+    assert.equal(merged.body.status, "merged", merged.text);
+    assert.equal(merged.body.review_mode_note, "made under bob's fully automatic setting: nobody was asked to confirm it");
+  });
+});
+
+describe("D with the feature off nothing exists", () => {
+  test("D1 no route is registered, whatever the caller", async () => {
+    e = await reviewEnv();
+    await boot({ enabled: false });
+    for (const [method, path] of [["POST", "/v1/internal/github-review/mcp"], ["GET", "/v1/github-review/confirmations"], ["GET", "/v1/github-review/settings"], ["POST", "/v1/github-review/confirmations/00000000-0000-4000-8000-000000000000/decision"]] as const) {
+      const r = await fetch(base + path, { method, headers: { "x-test-user": "u-bob", "content-type": "application/json" }, body: method === "POST" ? "{}" : undefined });
+      assert.equal(r.status, 404, `${method} ${path}`);
+    }
+  });
+});

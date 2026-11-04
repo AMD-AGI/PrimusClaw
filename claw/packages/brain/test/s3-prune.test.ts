@@ -296,11 +296,20 @@ test("a file whose name contains a newline is not silently split into two", () =
   assert.equal(listing.reason, "listing_unexpected_lines");
 });
 
-/** A sandbox whose `find` returns exactly `output`, and `ok` to the probe. */
+/**
+ * A sandbox whose `find` returns exactly `output`, and `ok` to the probe.
+ *
+ * It answers the git measurement too, with a workspace that has no repositories:
+ * the measurement is a `find` as well, and handing it the listing would read as a
+ * sandbox that could not say how big its repositories are.
+ */
 function handsListing(output: string): HandsClient {
   return {
-    callTool: async (_tool: string, args: { command?: string }) =>
-      (args.command?.includes("find") ? output : "ok"),
+    callTool: async (_tool: string, args: { command?: string }) => {
+      const command = args.command ?? "";
+      if (command.includes("__claw_git_begin__")) return "__claw_git_begin__\n__claw_git_end__:0";
+      return command.includes("find") ? output : "ok";
+    },
   } as unknown as HandsClient;
 }
 

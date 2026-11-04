@@ -13,6 +13,7 @@ import {
   workspaceSigtermSyncSemaphore,
 } from "./workspace/sync-semaphore.js";
 import { startSandboxKeepalive } from "./sandbox/keepalive.js";
+import { wakeSession } from "./clients/session-wake.js";
 import {
   validateKeepaliveCapacity, type CapacitySettings,
 } from "./sandbox/keepalive-capacity.js";
@@ -53,7 +54,7 @@ import {
   openAiBaseUrlFellBack,
   INTERNAL_BACKEND_URL, CLAIM_NEXT_IDLE_MS,
   RUN_DOORBELL_DISPATCH,
-  BG_SHELL_ENABLED, SANDBOX_KEEPALIVE_INTERVAL_SEC,
+  BG_SHELL_ENABLED, SANDBOX_KEEPALIVE_INTERVAL_SEC, BACKGROUND_WORK_WAKE_ENABLED,
   SANDBOX_KEEPALIVE_TARGET_CEILING, SANDBOX_KEEPALIVE_RECONCILE_RESERVE,
   SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC, SANDBOX_KEEPALIVE_SWEEP_SPAN_SEC,
 } from "./config.js";
@@ -76,7 +77,7 @@ import {
   bindTaskLockKv, lockContentionNakMs, lockExpiresBetweenRenewals,
 } from "./tasks/lock.js";
 import { bindTaskRunnerDeps } from "./tasks/runner.js";
-import { handleTask, bindTaskDispatchKv, inflightTasks, handleClaimedRequest } from "./tasks/dispatch.js";
+import { handleTask, bindTaskDispatchKv, inflightTasks, handleClaimedRequest, isFinishOnlyDelivery } from "./tasks/dispatch.js";
 import { claimNextRun } from "./clients/run-claim.js";
 import { flushPendingRetries } from "./delivery/doorbell-delivery.js";
 import { claimNextEnabled, startClaimNextLoop } from "./delivery/claim-next-loop.js";
@@ -598,6 +599,7 @@ async function startTaskDelivery(jsm: JetStreamManager): Promise<DeliveryResiden
         return false;
       }
     },
+    isFinishOnly: isFinishOnlyDelivery,
     // A fat chat delivery holds a durable SQL lease before it queues for a
     // slot, so a Stop reaches it through the row while nothing else can.
     fatPreGate: createFatPreGate({ emit: (sessionId, evt) => emitter.emit(sessionId, evt) }),
@@ -745,6 +747,9 @@ async function startBackgroundRuntime(capacity: CapacitySettings): Promise<void>
     kv,
     ...rosterDeps(kv, capacity),
     emitSandboxFailure: (sessionId, event) => emitter.emit(sessionId, event),
+    ...(BACKGROUND_WORK_WAKE_ENABLED
+      ? { onBackgroundWorkFinished: (sessionId: string, key: string) => { void wakeSession(sessionId, key); } }
+      : {}),
   });
   startSandboxSweeper();
   startMultiNodeSweeper();

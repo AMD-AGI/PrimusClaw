@@ -8,7 +8,7 @@ import multipart from "@fastify/multipart";
 import {
   API_PORT, APP_ENV, SAFE_API_URL, DATABASE_URL, resolveCorsOrigin,
   AUTH_INTERNAL_TOKEN, NATS_URL,
-  CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
+  CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGER_TOOLS_TOKEN_KEY, CLAW_SKILL_EVOLUTION_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
   runLeaseTiming, envSettingProblems, assertAdmissionSettings,
 } from "./config.js";
 import { runLeaseTimingProblems } from "@claw/protocol";
@@ -19,6 +19,8 @@ import { initUserEnvCrypto } from "./crypto/user-env.js";
 import { authLogPath, authMiddleware } from "./auth/middleware.js";
 import { startIdentityClient } from "./auth/identity.js";
 import { registerSessionRoutes } from "./routes/sessions.js";
+import { registerAnswerFeedbackRoutes } from "./routes/answer-feedback.js";
+import { registerImageRoutes } from "./routes/images.js";
 import { registerEventRoutes } from "./routes/events.js";
 import { registerAnthropicManagedAgentsRoutes } from "./routes/anthropic-managed-agents.js";
 import { registerAdminRoutes } from "./routes/admin.js";
@@ -27,10 +29,27 @@ import { registerSkillRoutes } from "./routes/skills.js";
 import { registerA2ARoutes } from "./routes/a2a.js";
 import { registerPluginRoutes } from "./routes/plugins.js";
 import { registerUserEnvVarRoutes } from "./routes/user-env-vars.js";
+import { registerAssistantRoutes } from "./routes/assistant.js";
+import { registerAssistantMcpRoutes } from "./assistant/mcp.js";
+import { assertAssistantTokenKey } from "./assistant/token.js";
+import { registerTriggerMcpRoutes } from "./triggers/mcp.js";
+import { assertTriggerToolsConfig } from "./triggers/token.js";
 import { registerNotificationSubscriptionRoutes } from "./routes/notification-subscriptions.js";
+import { registerRemoteAgentRoutes } from "./routes/remote-agents.js";
 import { startNotificationWorker } from "./notifications/outbox.js";
+import { registerAssistantDeliveryHook } from "./assistant/outbound.js";
+import { a2aPushEnabled } from "./routes/a2a-flags.js";
+import { startA2aPushWorker } from "./routes/a2a-push.js";
 import { registerSystemEnvVarRoutes, publishSystemEnvToKv } from "./routes/system-env-vars.js";
+import { registerSandboxAdminRoutes } from "./routes/sandbox-admin.js";
+import { registerTerminalRoutes } from "./routes/terminal.js";
 import { registerMcpRoutes } from "./routes/mcp.js";
+import { registerGithubReviewRoutes } from "./github-review/mcp.js";
+import { githubReviewConfigErrors, readGithubReviewSettings } from "./github-review/settings.js";
+import { identityClient } from "./auth/identity.js";
+import { identityTokenSettings } from "./auth/identity-token.js";
+import { registerMeRoutes } from "./routes/me.js";
+import { registerModelsRoutes } from "./routes/models.js";
 import { registerInternalTaskRoutes } from "./routes/internal-tasks.js";
 import { registerInternalRunRoutes } from "./routes/internal-runs.js";
 import { registerInternalAppRoutes } from "./routes/internal-apps.js";
@@ -142,17 +161,35 @@ function assertRunLeaseTiming(): void {
   );
 }
 
+/**
+ * Refuse to serve GitHub review without what its gates are made of: the secret that
+ * signs the tool token and the identity client that fetches the acting user's credential.
+ */
+function assertGithubReviewConfig(): void {
+  const settings = readGithubReviewSettings();
+  if (!settings.enabled) return;
+  if (settings.problems.length) logger.error({ refused: settings.problems }, "startup.config_refused");
+  const errors = githubReviewConfigErrors(settings, identityClient() !== null, identityTokenSettings().ownKeyClientIds);
+  if (errors.length === 0) return;
+  logger.error({ errors }, "startup.github_review_refused");
+  throw new Error(`CLAW_GITHUB_REVIEW_ENABLED is true but GitHub review cannot be offered: ${errors.join("; ")}`);
+}
+
 async function main() {
   validateStartupConfig();
   assertNoSharedIdentityBypass();
   assertRunLeaseTiming();
+  assertAssistantTokenKey(CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY);
+  assertTriggerToolsConfig(CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_TRIGGER_TOOLS_TOKEN_KEY);
   // Before the admission assertion, not after: the rollout gauges are applied
   // on the way through, and a pod that dies on the second assertion would
   // otherwise start exporting neither.
   assertRolloutConfigAtStartup();
   assertAdmissionSettings(logger);
-  // Off unless IDENTITY_CLIENT_ENABLED is set; nothing authenticates through it yet.
+  // Off unless IDENTITY_CLIENT_ENABLED is set; it authenticates a connector's access token, and an identity provider's access token only with CLAW_IDENTITY_TOKEN_AUTH_ENABLED.
   startIdentityClient(logger);
+  // Off unless CLAW_GITHUB_REVIEW_ENABLED. A deployment that asked for it and cannot offer its gates does not start.
+  assertGithubReviewConfig();
   // Validate USER_ENV_ENCRYPTION_KEY before doing anything else; we want a
   // fast-fail if the K8s Secret is misconfigured (missing or wrong length),
   // not a runtime surprise on the first PUT /v1/users/me/env-vars/* call.
@@ -262,6 +299,8 @@ async function main() {
   app.addHook("preHandler", authMiddleware);
 
   await registerSessionRoutes(app);
+  await registerAnswerFeedbackRoutes(app);
+  await registerImageRoutes(app);
   await registerEventRoutes(app);
   await registerAnthropicManagedAgentsRoutes(app);
   await registerAdminRoutes(app);
@@ -271,7 +310,18 @@ async function main() {
   await registerPluginRoutes(app);
   await registerUserEnvVarRoutes(app);
   await registerNotificationSubscriptionRoutes(app);
+  // Off unless CLAW_REMOTE_AGENTS_ENABLED: the module registers nothing otherwise.
+  await registerRemoteAgentRoutes(app);
+  // Off unless CLAW_ASSISTANT_ENABLED: the module registers nothing otherwise.
+  await registerAssistantRoutes(app);
+  // The assistant's own MCP service, under /v1/internal/; registers nothing unless CLAW_ASSISTANT_ENABLED.
+  await registerAssistantMcpRoutes(app);
+  await registerTriggerMcpRoutes(app);
+  // Off unless CLAW_GITHUB_REVIEW_ENABLED: nothing is registered otherwise.
+  await registerGithubReviewRoutes(app);
   await registerSystemEnvVarRoutes(app);
+  await registerSandboxAdminRoutes(app);
+  await registerTerminalRoutes(app);
   await registerMcpRoutes(app);
   await registerInternalTaskRoutes(app);
   await registerInternalRunRoutes(app);
@@ -281,6 +331,8 @@ async function main() {
   await registerTaskRoutes(app);
   await registerRunRoutes(app);
   await registerWorkbenchRoutes(app);
+  await registerModelsRoutes(app);
+  await registerMeRoutes(app);
   // Scheduled triggers: nothing is registered unless the deployment turns them on.
   if (CLAW_TRIGGERS_ENABLED) await registerTriggerRoutes(app);
 
@@ -314,6 +366,9 @@ async function main() {
   // Outbound notification delivery (HMAC-signed webhooks from the outbox).
   // Gated: with the flag off no table exists and nothing polls.
   if (CLAW_NOTIFICATIONS_ENABLED) startNotificationWorker();
+  // The assistant's messages go out through the same outbox, so both switches have to be on.
+  if (CLAW_NOTIFICATIONS_ENABLED && CLAW_ASSISTANT_ENABLED) registerAssistantDeliveryHook();
+  if (a2aPushEnabled()) startA2aPushWorker();
 
   // Daily maintenance crons (every 24h, first run 1 min after startup).
   // Memory decay gated by CLAW_MEMORY_ENABLED, skill cleanups gated by

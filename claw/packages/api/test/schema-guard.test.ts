@@ -141,6 +141,22 @@ for (const column of [
   });
 }
 
+test("names the answer-feedback table before a vote tries to write it", () => {
+  // The vote routes insert and delete on it for every user, so a database that
+  // lost it must stop the start-up rather than answer 500 to each vote.
+  const present = fullSchema().filter((c) => c.table_name !== "claw_answer_feedback");
+  assert.deepEqual(missingSchemaObjects(REQUIRED_SCHEMA, present), ["table claw_answer_feedback is missing"]);
+});
+
+for (const column of ["session_id", "message_id", "user_id", "vote", "reason", "updated_at"]) {
+  test(`keeps ${column} required on the answer-feedback table`, () => {
+    assert.deepEqual(
+      missingSchemaObjects(REQUIRED_SCHEMA, without([["claw_answer_feedback", column]])),
+      [`claw_answer_feedback is missing column(s): ${column}`],
+    );
+  });
+}
+
 test("keeps the run-time epoch required, since requeues overwrite queued_at", () => {
   const tasks = REQUIRED_SCHEMA.find((r) => r.table === "claw_tasks");
   assert.ok(tasks?.columns.includes("run_time_epoch_at"));
@@ -219,4 +235,34 @@ test("a missing app-run table stops start-up only when app runs are enabled", ()
   assert.deepEqual(classifySchemaProblems(REQUIRED_SCHEMA, noTable, true).fatal, ["table claw_app_runs is missing"]);
   const other = without([["claw_tasks", "queued_at"]]);
   assert.deepEqual(classifySchemaProblems(REQUIRED_SCHEMA, other, false).fatal, ["claw_tasks is missing column(s): queued_at"]);
+});
+
+const ASSISTANT_TABLES = ["claw_assistants", "claw_work_items", "claw_work_item_events", "claw_assistant_says"];
+
+test("the assistant tables are required only when the assistant is enabled", () => {
+  const noTables = fullSchema().filter((c) => !ASSISTANT_TABLES.includes(c.table_name));
+  // Off: the tables were never created, so their absence is not even a warning.
+  assert.deepEqual(classifySchemaProblems(REQUIRED_SCHEMA, noTables, false), { fatal: [], warnings: [] });
+  assert.deepEqual(classifySchemaProblems(REQUIRED_SCHEMA, noTables, true), { fatal: [], warnings: [] });
+  assert.deepEqual(
+    classifySchemaProblems(REQUIRED_SCHEMA, noTables, false, true).fatal,
+    ASSISTANT_TABLES.map((t) => `table ${t} is missing`),
+  );
+  assert.deepEqual(classifySchemaProblems(REQUIRED_SCHEMA, fullSchema(), false, true), { fatal: [], warnings: [] });
+});
+
+test("a missing assistant column stops start-up when enabled, and names what the state machine reads", () => {
+  const present = without([["claw_work_items", "generation"], ["claw_work_items", "result_version"]]);
+  assert.deepEqual(classifySchemaProblems(REQUIRED_SCHEMA, present, false, false).fatal, []);
+  assert.deepEqual(
+    classifySchemaProblems(REQUIRED_SCHEMA, present, false, true).fatal,
+    ["claw_work_items is missing column(s): generation, result_version"],
+  );
+});
+
+test("the other tables stay fatal whether or not the assistant is enabled", () => {
+  const present = without([["claw_tasks", "queued_at"]]);
+  for (const assistant of [false, true]) {
+    assert.deepEqual(classifySchemaProblems(REQUIRED_SCHEMA, present, false, assistant).fatal, ["claw_tasks is missing column(s): queued_at"]);
+  }
 });

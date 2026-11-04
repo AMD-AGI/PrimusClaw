@@ -253,16 +253,11 @@ test("a session acquired between the sweep's read and its dispatch is skipped", 
     recheck.indexOf("stillFree") < recheck.indexOf("drainPendingMessage"),
     "the question comes before the dispatch it gates",
   );
-  // And the comment states the limit rather than a bound that is not there. An
-  // earlier version cited the admission lock as serialising creation; that lock
-  // is skipped when every ceiling is zero, which is the default, so it
-  // serialises nothing on a default deployment.
-  //
-  // Asserted as what the comment now says, not as what it must not say: the
-  // correction quotes the claim it is correcting, and a pattern looking for the
-  // claim cannot tell the two apart.
+  // And the comment names what closes the rest of the window: the drain's own
+  // claim on the session, which a concurrent drain waits for (exercised in
+  // assistant-drain-claim.test.ts, against a real Postgres).
   assert.match(
-    recheck, /skipped when every ceiling is zero/,
-    "the residual window is described as open, with the reason the old bound did not hold",
+    recheck, /withPendingDrainClaim/,
+    "the residual window is closed by the drain's claim, and the comment says so",
   );
 });

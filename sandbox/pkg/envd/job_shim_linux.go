@@ -252,11 +252,13 @@ func killAdoptedDescendants() {
 }
 
 // startTrackedCommand starts a shim independent of the HTTP request lifetime.
+// stdin may be nil, which leaves the command with no standard input.
 func (s *Server) startTrackedCommand(
 	command []string,
 	workDir string,
 	env []string,
 	stdout, stderr io.Writer,
+	stdin io.Reader,
 	tracking jobTracking,
 ) (primaryPID int, exitCh <-chan int, drained <-chan struct{}, cancel func(), err error) {
 	self, err := os.Executable()
@@ -271,6 +273,7 @@ func (s *Server) startTrackedCommand(
 	shim := exec.Command(self, append([]string{jobShimArg}, command...)...)
 	shim.Dir = workDir
 	shim.Env = env
+	shim.Stdin = stdin
 	shim.Stdout = stdout
 	shim.Stderr = stderr
 	shim.ExtraFiles = []*os.File{exitW}

@@ -5,8 +5,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -23,6 +25,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
@@ -34,9 +37,13 @@ import (
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
 	"sigs.k8s.io/agent-sandbox/pkg/builder"
+	"sigs.k8s.io/agent-sandbox/pkg/e2b"
+	"sigs.k8s.io/agent-sandbox/pkg/grant"
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/nsadmission"
 	"sigs.k8s.io/agent-sandbox/pkg/router"
+	"sigs.k8s.io/agent-sandbox/pkg/safe"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 	"sigs.k8s.io/agent-sandbox/pkg/workloadmanager"
 )
@@ -354,6 +361,16 @@ func main() {
 		}
 		st = crStore
 	}
+	workloads := workloadmanager.NewSafeWorkloadCreator(dynamicClient, mgr.GetClient())
+	attester, err := identity.AttesterFromEnv()
+	if err != nil {
+		log.Error("identity attestation config is invalid", "error", err)
+		os.Exit(1)
+	}
+	if attester != nil {
+		workloads.SetIdentityAttester(attester)
+	}
+	st = workloadmanager.NewWorkloadSessionStore(st, workloads)
 	defer st.Close()
 
 	wmSandboxReconciler := &workloadmanager.SandboxReconciler{
@@ -396,11 +413,47 @@ func main() {
 	if k8s != nil {
 		apiServer.WithK8s(k8s)
 	}
+	apiServer.WithSafeWorkloads(workloads)
 
 	routerServer, err := router.New(ctx, routerCfg, st, clientset)
 	if err != nil {
 		log.Error("router init failed", "error", err)
 		os.Exit(1)
+	}
+	if err := routerServer.ConfigureDataPlane(
+		os.Getenv(router.EnvClusterID),
+		os.Getenv(router.EnvClusterRoutes),
+		os.Getenv(router.EnvUpstreamPublicKey),
+		workloadmanager.NewPodAddressFinder(mgr.GetClient()).PodAddress,
+	); err != nil {
+		log.Error("dataplane route config failed", "error", err)
+		os.Exit(1)
+	}
+	workloads.SetRemoteClusters(routerServer.RemoteClusterIDs())
+
+	grants, err := startGrants(ctx, mgr.GetClient(), mgr.GetAPIReader(), clientset, dynamicClient, apiServer, st, workloads, wmCfg.Namespace)
+	if err != nil {
+		log.Error("grant service init failed", "error", err)
+		os.Exit(1)
+	}
+
+	if grants != nil {
+		routerServer.WithGrants(grants)
+		idClient := ownerKeys(ctx, grants)
+		opts := e2b.Options{
+			Grants:    grants,
+			Runner:    apiServer,
+			Namespace: grant.Namespace(wmCfg.Namespace),
+		}
+		if idClient != nil {
+			opts.Identity = idClient
+			if attester == nil {
+				log.Warn("identity-key sandbox creates are refused: IDENTITY_TOKEN_URL is not set")
+			}
+		}
+		plane := e2b.New(opts)
+		grants.SetPromoter(plane)
+		apiServer.WithE2B(plane)
 	}
 
 	// Sandbox health watcher — exposes pod health as Prometheus metrics
@@ -431,4 +484,122 @@ func main() {
 		os.Exit(1)
 	}
 	log.Info("controlplane shutdown complete")
+}
+
+// ownerPolicyRetry is the first delay between owner policy attempts. It doubles up to a minute.
+var ownerPolicyRetry = time.Second
+
+// ownerKeys enables identity provider keys when both the introspection client and
+// the owner policy are configured. It returns nil when either is absent or
+// invalid, so grant keys keep working. A policy that fails for a transient
+// reason is retried in the background; identity keys get 503 until it applies.
+func ownerKeys(ctx context.Context, grants *grant.Service) *identity.Client {
+	client, err := identity.FromEnv()
+	if err != nil {
+		log.Error("identity keys disabled: identity client config is invalid", "error", err)
+		return nil
+	}
+	if client == nil {
+		return nil
+	}
+	policy, err := grant.OwnerPolicyFromEnv()
+	if err != nil {
+		log.Error("identity keys disabled: owner policy is invalid", "error", err)
+		return nil
+	}
+	if policy == nil {
+		log.Warn("identity keys disabled: owner policy is not configured")
+		return nil
+	}
+	err = grants.SetOwnerPolicy(ctx, *policy)
+	if err == nil {
+		log.Info("identity keys enabled", "role", grants.OwnerRole())
+		return client
+	}
+	if !transientPolicyError(err) {
+		log.Error("identity keys disabled: owner policy was not applied", "error", err)
+		return nil
+	}
+	log.Warn("owner policy was not applied, retrying", "error", err)
+	go retryOwnerPolicy(ctx, grants, *policy)
+	return client
+}
+
+// transientPolicyError reports whether an owner policy error may clear on retry.
+// A rejected policy, such as an invalid quota or a name conflict, is not retried.
+func transientPolicyError(err error) bool {
+	var op *grant.OpError
+	return !errors.As(err, &op) || op.Status >= http.StatusInternalServerError
+}
+
+// retryOwnerPolicy applies the owner policy until it succeeds, fails permanently, or ctx ends.
+func retryOwnerPolicy(ctx context.Context, grants *grant.Service, policy grant.OwnerPolicy) {
+	delay := ownerPolicyRetry
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		err := grants.SetOwnerPolicy(ctx, policy)
+		if err == nil {
+			log.Info("identity keys enabled", "role", grants.OwnerRole())
+			return
+		}
+		if !transientPolicyError(err) {
+			log.Error("identity keys disabled: owner policy was not applied", "error", err)
+			return
+		}
+		log.Warn("owner policy was not applied, retrying", "error", err, "delay", delay)
+		if delay *= 2; delay > time.Minute {
+			delay = time.Minute
+		}
+	}
+}
+
+// startGrants serves the grant admin API from SandboxGrant CRs and reaps
+// expired grants. Claw remains the authority; this process keeps the
+// execution copy.
+func startGrants(ctx context.Context, cl ctrlclient.Client, reader ctrlclient.Reader, clientset kubernetes.Interface, dyn dynamic.Interface, api *workloadmanager.Server, st store.Store, workloads *workloadmanager.SafeWorkloadCreator, namespace string) (*grant.Service, error) {
+	dataKey, err := grant.DataKeyFromEnv()
+	if err != nil {
+		return nil, fmt.Errorf("GRANT_DATA_KEY: %w", err)
+	}
+	jwks, err := grant.JWKSFromEnv()
+	if err != nil {
+		return nil, fmt.Errorf("grant JWKS: %w", err)
+	}
+	var attest grant.AttestationChecker
+	if len(jwks) > 0 {
+		attest, err = grant.NewJWKSChecker(jwks)
+		if err != nil {
+			return nil, fmt.Errorf("grant JWKS: %w", err)
+		}
+	}
+	var identity grant.IdentityChecker
+	if url := os.Getenv("SAFE_API_URL"); url != "" {
+		identity = grant.NewSafeIdentityChecker(safe.NewClient(url))
+	}
+	var membership grant.MembershipChecker
+	if dyn != nil {
+		membership = grant.NewUserCRMembership(dyn)
+	}
+	ns := grant.Namespace(namespace)
+	svc := grant.New(grant.Options{
+		Client:     cl,
+		Reader:     reader,
+		Namespace:  ns,
+		DataKey:    dataKey,
+		Authn:      grant.NewTokenReviewAuthenticator(clientset, grant.AllowedCallersFromEnv()),
+		Attest:     attest,
+		Identity:   identity,
+		Membership: membership,
+		Reclaimer:  workloadmanager.NewGrantReclaimer(api),
+		Exists:     workloadmanager.NewGrantExists(st, workloads),
+		Record:     api,
+	})
+	api.WithGrants(svc)
+	go svc.Run(ctx, 30*time.Second)
+	log.Info("grant service started", "namespace", ns)
+	return svc, nil
 }

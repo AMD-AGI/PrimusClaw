@@ -23,6 +23,7 @@ import {
 } from "../workspace/s3-uploader.js";
 import { invalidateSyncManifest } from "../workspace/sync-delta.js";
 import { syncWorkspace, restoreWorkspace } from "../workspace/sync.js";
+import { SIGTERM_PROBE_TIMEOUT_SEC, gitReportKey, type GitReport } from "../workspace/git-dirs.js";
 import {
   workspaceSyncSemaphore,
   workspaceSigtermSyncSemaphore,
@@ -52,6 +53,7 @@ import {
 } from "../config.js";
 import { ensureHands } from "../sandbox/ensure-hands.js";
 import { isMultiNodeRequest } from "../sandbox/multi-node/prompt-flags.js";
+import { gpuWorkspaceFor } from "../sandbox/workspace-select.js";
 import { getMultiNodeProvider, multiNodeAvailable } from "../sandbox/multi-node/factory.js";
 import type { MultiNodeContext } from "../sandbox/multi-node/types.js";
 import { destroyHands, reapPendingHands, classifySandboxFailure } from "../sandbox/reaper.js";
@@ -62,12 +64,17 @@ import type { ContainerProbeVerdict, HandsProbeEntry } from "../sandbox/containe
 import { checkHandsHealth } from "../sandbox/hands-health.js";
 import { restartHandsInSandbox } from "../sandbox/hands-restart.js";
 import { resolveSandboxAction } from "../sandbox/params.js";
-import { provisionTerminalOf, sandboxFailureOf } from "../sandbox/errors.js";
+import { provisionTerminalOf, sandboxFailureOf, sandboxUnavailableOf } from "../sandbox/errors.js";
 import { runScript, type ScriptProgress } from "./script-runner.js";
 import { createAppRunner } from "../apps/app-runner-wiring.js";
 import { AppRunFailedError, type AppRunOutcome } from "../apps/app-runner.js";
+
+/** A finish-only run that could not finish: nothing is reported, the sweeper hands it over again. */
+class FinishOnlyHandOver extends Error {
+  constructor(why: string) { super(why); this.name = "FinishOnlyHandOver"; }
+}
 import {
-  AgentDoneDeliveryError, postAgentDone, postRunLease, postTaskRunning, sandboxForLease,
+  AgentDoneDeliveryError, postAgentDone, postAppFinishDone, postAppFinishHandOver, postRunLease, postTaskRunning, sandboxForLease,
   type LeaseRenewal, type RunAttemptToken,
 } from "./callback.js";
 import { taskSubject, type RunTimeReport } from "@claw/protocol";
@@ -463,6 +470,8 @@ export interface TaskRunnerSideEffects {
   restoreWorkspace: typeof restoreWorkspace;
   postAgentDone: typeof postAgentDone;
   postTaskRunning: typeof postTaskRunning;
+  postAppFinishDone: typeof postAppFinishDone;
+  postAppFinishHandOver: typeof postAppFinishHandOver;
   postRunLease: typeof postRunLease;
   settleRunAttempt: typeof settleClaimedRun;
   runScript: typeof runScript;
@@ -497,6 +506,8 @@ const REAL_SIDE_EFFECTS: TaskRunnerSideEffects = {
   restoreWorkspace,
   postAgentDone,
   postTaskRunning,
+  postAppFinishDone,
+  postAppFinishHandOver,
   postRunLease,
   settleRunAttempt: settleClaimedRun,
   runScript,
@@ -1166,6 +1177,8 @@ class TaskRunner {
   private lastSyncAt = 0;
   private pendingSync: Promise<unknown> | null = null;
   private lastSyncedTurn = 0; // updated post-sync; gates has_workspace_sync KV bit
+  /** What the user was last told about repositories in this run (gitReportKey); see announceGitSkipped. */
+  private lastGitKey: string | undefined;
   /** Monotonic write counter; see CheckpointEnvelope.seq. */
   private checkpointSeq = 0;
   private lastWrittenSeq = 0;
@@ -1241,6 +1254,15 @@ class TaskRunner {
   // which may happen much later than the read on a deferred run.
   private pendingResumeCkpt: TaskCheckpoint | null = null;
   private handsAttach: Promise<HandsClient> | null = null;
+  /**
+   * Why this run cannot have a sandbox, once opening one has ended on one of
+   * SANDBOX_UNAVAILABLE_REASONS. Every later attempt to open it is refused with
+   * this same error instead of provisioning again: the platform had no sandbox
+   * for this run after as long a wait as the deployment allows, and a second
+   * wait inside the same run is the same wait again. Per run, not per session --
+   * the next message of the session tries afresh.
+   */
+  private sandboxUnavailable: unknown = null;
   private resumeMetricsRecorded = false;
   // Set by the first successful reap, which a terminal path may do early to
   // keep a still-writing process out of its snapshot; the release on the way
@@ -1324,6 +1346,32 @@ class TaskRunner {
     this.transcriptLog.push({ ts: Date.now(), ...safeEvent });
     await this.emitter.emit(this.sessionId, safeEvent);
   };
+
+  /**
+   * Tell the user a snapshot left a repository out, or could not measure one.
+   *
+   * The event is the only place they can learn that commits in it will not survive
+   * the sandbox. Both ways the workspace is saved report it -- the S3 sync that ends
+   * a run, and the shared-disk sync after a checkpoint -- and the second runs every
+   * turn, so what is said is which repositories were left out and why, once: not
+   * again while that stays the same, though the sizes in the sentence move with
+   * every turn. Once a sync leaves nothing out the next one that does is news again.
+   * A sync that left nothing out says nothing.
+   */
+  private async announceGitSkipped(git: GitReport | undefined): Promise<void> {
+    if (!git) { this.lastGitKey = undefined; return; }
+    const key = gitReportKey(git);
+    if (key === this.lastGitKey) return;
+    await this.onEvent({
+      type: "sandboxStatus",
+      status: "workspace_git_skipped",
+      reason: git.unmeasured ? "git_unmeasured" : "git_over_limit",
+      message: git.note,
+      message_id: this.messageId,
+    });
+    // Only once it went out: an event the stream refused is tried again next turn.
+    this.lastGitKey = key;
+  }
 
   /**
    * Freshest proof the run's prefix cache entry existed, ahead of the
@@ -1504,6 +1552,11 @@ class TaskRunner {
             { sessionId: this.sessionId, turn: turnSnapshot, sizeBytes: info.size, durationMs: info.durationMs },
             "checkpoint.workspace_sync_done",
           );
+          // Last, and on its own: the snapshot is saved and the flag is set whether
+          // or not the user can be told what it left out.
+          await this.announceGitSkipped(info.git).catch((e: unknown) => {
+            logger.warn({ err: e, sessionId: this.sessionId }, "checkpoint.git_skipped_event_failed");
+          });
           return info;
         })
         .catch((e: unknown) => {
@@ -2455,9 +2508,12 @@ class TaskRunner {
    * that need one from the start, and from inside the agent loop for the rest,
    * where several tool calls can race for it — hence the shared promise rather
    * than a plain `if (!this.hands)`. A failure is not cached: the tool that
-   * triggered it reports the error, and a later tool gets a fresh attempt.
+   * triggered it reports the error, and a later tool gets a fresh attempt --
+   * except a failure that says the platform has no sandbox for this run
+   * (SANDBOX_UNAVAILABLE_REASONS), which is: see `sandboxUnavailable`.
    */
   private readonly attachHands = (): Promise<HandsClient> => {
+    if (this.sandboxUnavailable) return Promise.reject(this.sandboxUnavailable);
     // The in-flight attach is consulted before the assigned client, because
     // openSandbox assigns `this.hands` and only then restores /workspace from
     // S3. A caller that read the field would be handed a sandbox whose files
@@ -2468,11 +2524,52 @@ class TaskRunner {
     // cached and how a rebuild is not undone: `recreateHands` replaces
     // `this.hands` without coming through here, so a retained promise would keep
     // handing out the sandbox the rebuild has already destroyed.
-    this.handsAttach = this.openSandbox().finally(() => {
+    this.handsAttach = this.openSandbox().catch(async (err: unknown) => {
+      await this.settleUnavailableOpen(err);
+      throw err;
+    }).finally(() => {
       this.handsAttach = null;
     });
     return this.handsAttach;
   };
+
+  /**
+   * An open that ended because the platform cannot give this run a sandbox: stop
+   * offering it another, and clean up the one it left behind.
+   *
+   * The latch is set before anything awaited, so a tool call racing this one
+   * cannot slip in a second provision while the clean-up runs.
+   *
+   * The clean-up is the failure path's own, in its own order -- the platform's
+   * account, the handle onto the row, then the reap -- run here because a failed
+   * open is not always the end of the run. Opened lazily, which is the default
+   * for a chat turn, the failure is a tool error the model reads and the run
+   * carries on, so the failure path never comes and nothing would reap the
+   * workload (the next open's stale-entry check used to, which the latch now
+   * stops from happening). Run on the eager path as well it does what that path
+   * would have done a moment later, and the failure path finds nothing left to
+   * redo.
+   *
+   * The platform is not asked about an unschedulable workload: it never ran,
+   * the provider has already stopped it, and what the platform would then say of
+   * it is our own stop.
+   */
+  private async settleUnavailableOpen(err: unknown): Promise<void> {
+    const unavailable = sandboxUnavailableOf(err);
+    if (!unavailable) return;
+    this.sandboxUnavailable = err;
+    logger.warn(
+      { sessionId: this.sessionId, messageId: this.messageId, reason: unavailable.reason },
+      "task.sandbox_unavailable_latched",
+    );
+    try {
+      if (unavailable.reason !== "sandbox_unschedulable") await this.capturePlatformFacts();
+      await this.recordSandboxBeforeReap();
+      await this.reapOwnPendingHands();
+    } catch (e) {
+      logger.warn({ err: e, sessionId: this.sessionId }, "task.sandbox_unavailable_cleanup_failed");
+    }
+  }
 
   private async openSandbox(): Promise<HandsClient> {
     // Multi-node: provision the GPU cluster before the Hands sandbox, via
@@ -2915,7 +3012,9 @@ class TaskRunner {
       );
       return;
     }
-    const namespace = this.multiNodeContext?.namespace ?? this.request.workspace_id?.trim();
+    // Where ensure created the cluster; failing that, where it would have (a run that
+    // failed before the context existed still owes the release), by the same rule.
+    const namespace = this.multiNodeContext?.namespace ?? gpuWorkspaceFor(this.request.workspace_id);
     if (!namespace || !this.messageId) return;
     // A deployment without SaFE has no cluster to release. Reachable: a prompt
     // carrying multi-node flags is not rejected before it gets here, it just
@@ -3075,9 +3174,11 @@ class TaskRunner {
       );
     } else {
       logger.info({ sessionId: this.sessionId, messageId: this.messageId }, "s3.sync_start");
+      let syncedGit: GitReport | undefined;
       try {
         const r = await fx().syncWorkspaceToS3(hands, this.sessionId, this.request.user_id || "default");
         syncOk = !r.exhausted && !r.empty;
+        syncedGit = r.git;
         if (r.empty) {
           await this.onEvent({
             type: "sandboxStatus",
@@ -3121,6 +3222,13 @@ class TaskRunner {
         // surface the artifacts captured at the last checkpoint window.
         await this.recoverInflightCheckpoint("from_inflight_checkpoint");
       }
+      // Independent of the above: a sync can land and still have left a repository
+      // behind. Outside the try on purpose: the upload succeeded, and an event the
+      // stream refused must not turn it into the failure above, whose recovery
+      // copies an older in-flight checkpoint over the files just uploaded.
+      await this.announceGitSkipped(syncedGit).catch((e: unknown) => {
+        logger.warn({ err: e, sessionId: this.sessionId }, "s3.git_skipped_event_failed");
+      });
       if (BRAIN_WORKSPACE_SNAPSHOT_ENABLED && this.messageId && syncOk) {
         try { await fx().archiveRunToS3(this.sessionId, this.request.user_id || "default", this.messageId); } catch (e) {
           logger.warn({ err: e, sessionId: this.sessionId, messageId: this.messageId }, "s3.archive_failed");
@@ -3387,8 +3495,12 @@ class TaskRunner {
       if (!syncedFlag && this.hands) {
         const hands = this.hands;
         try {
+          // The measurement of the repositories is capped like the shared-disk SIGTERM
+          // sync's: with the shared disk unset, which is the default, this is the
+          // only sync a SIGTERM runs, and its budget cannot hold a long one.
           const r = await fx().syncWorkspaceToS3(
             hands, this.sessionId, this.userIdForSync,
+            { gitProbeTimeoutSec: SIGTERM_PROBE_TIMEOUT_SEC },
           );
           if (!r.empty) {
             sigtermSyncResult = r.exhausted ? "timeout" : "success";
@@ -4387,11 +4499,17 @@ class TaskRunner {
    */
   private async executeAppRun(): Promise<void> {
     const runId = this.request.task_id;
+    const finishOnly = this.request.app_finish_only === true;
     // Not an AppRunFailedError: that means the app run is already `ended` on its row
     // (see handleRunFailure), and these two are refusals made before anything ran.
     if (!runId) throw new Error("an app run needs a task id");
     const epoch = this.heldGeneration();
     // Without it SaFE cannot be asked for anything, and every tick would fail the same way.
+    if (!this.platformKey && finishOnly) {
+      // The task is already over for the user: no terminal report. The sweeper hands the finish over again.
+      logger.error({ taskId: runId }, "task.app_finish_only_without_platform_key");
+      throw new FinishOnlyHandOver("no platform key");
+    }
     if (!this.platformKey) {
       const closed = await fx().createAppRunner(runId, "", epoch)
         .markEnded("the session owner's platform key is not available to this worker")
@@ -4406,11 +4524,26 @@ class TaskRunner {
       }
       throw new AppRunFailedError("an app run needs the session owner's platform key");
     }
+    // A session that acts as a user is not given a hosted application's sandbox, which is made with the owner's model key (the API refuses
+    // to admit one). A run admitted before it did is wound up here instead of started: whatever sandbox an earlier worker made is stopped and
+    // the grant revoked, as for a cancel, and the row is ended. Not a finish-only dispatch: that is this already.
+    if (this.request.withhold_sandbox_keys === true && !finishOnly) {
+      await fx().createAppRunner(runId, this.platformKey, epoch).finishNow("cancelled");
+      throw new AppRunFailedError("a hosted application is not run for a session that acts as a user");
+    }
     const runner = fx().createAppRunner(runId, this.platformKey, epoch);
-    await this.onEvent({ type: "statusUpdate", agentStatus: "running" });
-    await fx().postTaskRunning(this.request, { brainId: BRAIN_ID, attempt: this.attempt });
+    // A finish-only dispatch is not a run starting: the task is already over as far as the
+    // user is concerned, so nothing says "running" and nothing reports a terminal state.
+    if (!finishOnly) {
+      await this.onEvent({ type: "statusUpdate", agentStatus: "running" });
+      await fx().postTaskRunning(this.request, { brainId: BRAIN_ID, attempt: this.attempt });
+    }
 
     const result = await runner.run(this.abortCtrl.signal);
+    if (result.kind === "ended" && finishOnly) {
+      await this.settleFinishOnly();
+      return;
+    }
     if (result.kind === "ended") {
       if (!result.outcome.success) throw new AppRunFailedError(result.outcome.reason, result.outcome.captures);
       await this.finalizeAppSuccess(result.outcome);
@@ -4436,12 +4569,30 @@ class TaskRunner {
       // An application that wrote a successful `final` within its grace keeps its
       // own result: reported as the success it is, with its captures, not as the
       // cancel that asked it to stop.
+      if (outcome && finishOnly) {
+        await this.settleFinishOnly();
+        return;
+      }
       if (outcome?.success) {
         await this.finalizeAppSuccess(outcome);
         return;
       }
     }
+    // Finish-only never reports a terminal state, whatever stopped it (a finish that kept failing,
+    // the deadline): the lease lapses and the sweeper hands the finish over again.
+    if (finishOnly && !handedOver) throw new FinishOnlyHandOver(String(reason ?? "finish not completed"));
     throw reason ?? new Error("cancelled by user");
+  }
+
+  /**
+   * A finish-only dispatch is over: the run row is `ended`. The task goes back to the
+   * terminal state it had, with no event, and the delivery is settled. If Backend would not
+   * settle it (the lease went) the delivery is given back instead of dropped.
+   */
+  private async settleFinishOnly(): Promise<void> {
+    const settled = await fx().postAppFinishDone(this.request, BRAIN_ID);
+    await this.releaseAfterTerminal();
+    if (settled) this.msg.ack(); else this.msg.nak(5_000);
   }
 
   /** Report an app run that ended as a success. */
@@ -4461,6 +4612,7 @@ class TaskRunner {
   }
 
   private failureOutcome(err: unknown): TaskOutcome {
+    if (err instanceof FinishOnlyHandOver) return "retryable";
     if (err instanceof AppRunFailedError && this.stillOwnsLock()) return "failed";
     if (this.abortCtrl.signal.reason === SIGTERM_ABORT_REASON) return "retryable";
     // `stillOwnsLock()` rather than the abort reason alone: the reason belongs
@@ -4479,6 +4631,17 @@ class TaskRunner {
   }
 
   private async handleRunFailure(err: any): Promise<void> {
+    if (err instanceof FinishOnlyHandOver) {
+      // No agent_done and no status update: the task keeps the terminal state it had.
+      logger.warn({ taskId: this.request.task_id, why: err.message }, "task.app_finish_only_handed_over");
+      await this.releaseAfterTerminal();
+      // Give the lease on the task row back, as every other ending does, so the sweeper hands
+      // the finish over at once rather than after the lost-lease grace as a lost worker.
+      await fx().postAppFinishHandOver(this.request, BRAIN_ID);
+      await this.releaseAttempt().catch((e) => logger.warn({ err: String(e?.message ?? e) }, "task.app_finish_only_release_failed"));
+      this.msg.ack();
+      return;
+    }
     if (this.abortCtrl.signal.reason === SIGTERM_ABORT_REASON) {
       await this.handleSigtermAbort();
       return;

@@ -1,6 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import { createHash } from "node:crypto";
 import type { UserInfo } from "./models.js";
 import { safePreview } from "@claw/utils";
 import pino from "pino";
@@ -84,6 +85,20 @@ export class SafeUpstreamHttpError extends Error {
   }
 }
 
+/**
+ * SaFE answered 2xx with something that is not an answer: a body that is not JSON (a proxy's page, a truncated
+ * response) or an answer with no user id. It is not a decision about the credential. A caller that keeps what SaFE
+ * said must not keep this, and one that tells a person "no keys" must tell them SaFE did not answer instead.
+ */
+export class SafeUpstreamProtocolError extends Error {
+  constructor(message: string, cause?: unknown) {
+    super(message);
+    this.name = "SafeUpstreamProtocolError";
+    Object.setPrototypeOf(this, new.target.prototype);
+    if (cause !== undefined) (this as Error & { cause?: unknown }).cause = cause;
+  }
+}
+
 function isUpstreamNetworkError(err: Error): boolean {
   const msg = (err.message || "").toLowerCase();
   const cause = (err as Error & { cause?: { code?: string; message?: string } }).cause;
@@ -102,6 +117,15 @@ const CACHE_TTL = 300_000;
 const NEGATIVE_TTL = 30_000;
 const MAX_CACHE = 1000;
 const VERIFY_PATH = "/api/v1/auth/verify";
+
+/**
+ * The roles SaFE reported. Only an array of strings counts: the field is SaFE's
+ * to add or drop, and anything else (absent, null, a bare string) is no roles
+ * rather than something a role check would take apart character by character.
+ */
+function rolesOf(raw: unknown): string[] {
+  return Array.isArray(raw) ? raw.filter((r): r is string => typeof r === "string") : [];
+}
 
 export function isApiKey(token: string): boolean {
   return token.startsWith(API_KEY_PREFIX);
@@ -135,12 +159,18 @@ export class SafeClient {
 
   private parseResponse(data: Record<string, unknown>): UserInfo {
     const d = (data.data ?? data) as Record<string, unknown>;
-    const userId = (d.id as string) || "";
-    if (!userId) throw new Error("SaFE returned empty user ID");
+    // A string and not empty: an id of any other kind is not an answer, and must not become somebody's subject.
+    if (d.id !== undefined && d.id !== null && typeof d.id !== "string") throw new SafeUpstreamProtocolError("SaFE returned a user ID that is not a string");
+    const userId = (d.id as string | undefined) || "";
+    if (!userId) throw new SafeUpstreamProtocolError("SaFE returned empty user ID");
+    // Only a present, non-empty string: the field is optional on SaFE's side and
+    // an `email: undefined` key would change what a UserInfo compares equal to.
+    const email = typeof d.email === "string" && d.email !== "" ? d.email : undefined;
     return {
       userId,
       userName: (d.name as string) || "",
-      roles: (d.roles as string[]) || [],
+      ...(email !== undefined ? { email } : {}),
+      roles: rolesOf(d.roles),
       platformKey: (d.platformKey as string) || (d.platform_key as string) || "",
       virtualKey: (d.virtualKey as string) || (d.virtual_key as string) || "",
     };
@@ -165,7 +195,7 @@ export class SafeClient {
     return { includePlatformKey: true, includeVirtualKey: true };
   }
 
-  // Cache-lookup + singleflight wrapper shared by the API-key and cookie paths.
+  // Cache-lookup + singleflight wrapper shared by the API-key, cookie and access-token paths.
   // Warm cache hits (positive or negative) return before touching the in-flight
   // map; concurrent misses for the same credential await one shared upstream call.
   private async verify(
@@ -189,11 +219,12 @@ export class SafeClient {
 
   // Single upstream verify call. Timeouts / network faults surface as
   // AuthUpstreamUnreachableError (mapped to 503, NOT negatively cached) so a slow
-  // SaFE never blacklists a valid credential for NEGATIVE_TTL.
+  // SaFE never blacklists a valid credential for NEGATIVE_TTL; a 5xx is not cached either.
   private async doVerify(
     cacheKey: string,
     payload: Record<string, unknown>,
     invalidMsg: string,
+    cacheable = true,
   ): Promise<UserInfo> {
     try {
       const resp = await fetch(`${this.baseUrl}${VERIFY_PATH}`, {
@@ -207,7 +238,7 @@ export class SafeClient {
         const bodySnippet = await readBodySnippet(resp);
         const requestId = pickRequestId(resp);
         log.warn({
-          method: cacheKey.startsWith("cookie:") ? "cookie" : "apiKey",
+          method: cacheKey.startsWith("cookie:") ? "cookie" : cacheKey.startsWith("token:") ? "accessToken" : "apiKey",
           url: `${this.baseUrl}${VERIFY_PATH}`,
           status: resp.status,
           upstreamRequestId: requestId ?? null,
@@ -216,8 +247,15 @@ export class SafeClient {
         }, "auth.safe.upstream_error");
         throw new SafeUpstreamHttpError({ status: resp.status, bodySnippet, requestId });
       }
-      const user = this.parseResponse(await resp.json() as Record<string, unknown>);
-      this.setCache(cacheKey, user, null, CACHE_TTL);
+      let answer: unknown;
+      try {
+        answer = await resp.json();
+      } catch (parseErr) {
+        throw new SafeUpstreamProtocolError("SaFE answered 200 with a body that is not JSON", parseErr);
+      }
+      if (answer === null || typeof answer !== "object") throw new SafeUpstreamProtocolError("SaFE answered 200 with a body that is not an object");
+      const user = this.parseResponse(answer as Record<string, unknown>);
+      if (cacheable) this.setCache(cacheKey, user, null, CACHE_TTL);
       return user;
     } catch (e: unknown) {
       if (e instanceof AuthServiceMisconfiguredError) throw e;
@@ -228,7 +266,12 @@ export class SafeClient {
           err,
         );
       }
-      this.setCache(cacheKey, null, err.message, NEGATIVE_TTL);
+      // A SaFE that answers 5xx has not judged the credential, any more than one that does not
+      // answer: remembering it as a failed verification would turn one error response into half
+      // a minute of "invalid" for a credential that is fine.
+      if (cacheable && !(err instanceof SafeUpstreamHttpError && err.status >= 500)) {
+        this.setCache(cacheKey, null, err.message, NEGATIVE_TTL);
+      }
       throw err;
     }
   }
@@ -236,6 +279,30 @@ export class SafeClient {
   async verifyApiKey(apiKey: string): Promise<UserInfo> {
     if (!isApiKey(apiKey)) throw new Error("invalid API key format");
     return this.verify(apiKey, { ...this.body(), apiKey }, "invalid or expired API key");
+  }
+
+  /**
+   * An access token SaFE's own authentication accepts, presented to SaFE the way a cookie or an `ak-` key is: as
+   * the credential of the person it names. SaFE answers with that person's id and, because both are asked for,
+   * their platform key and their LiteLLM virtual key, which is what every per-user call this API makes for them
+   * is built on.
+   *
+   * What this API presents is a delegated token (RFC 8693) that the identity provider issued to this API's own
+   * service client for SaFE's audience, with the API as its actor (`act`); see `delegated-keys.ts`. SaFE gives a
+   * key only to a token whose actor it has been told to accept, and only the keys of the token's subject. A SaFE
+   * that does not know the issuer or the audience, or an actor it was not told about, is a 401 or 403 here.
+   *
+   * The cache key is a digest, so the map never holds a token. `cache: false` neither reads nor writes it, for a
+   * caller that keeps the answer itself (a delegated token is minted per person, and its caller bounds the answer
+   * by the token's own remaining life).
+   */
+  async verifyAccessToken(token: string, opts: { cache?: boolean } = {}): Promise<UserInfo> {
+    if (!token) throw new Error("empty access token");
+    const payload = { ...this.body(), authorization: `Bearer ${token}` };
+    const invalidMsg = "SaFE does not accept this access token";
+    if (opts.cache === false) return this.doVerify("token:uncached", payload, invalidMsg, false);
+    const digest = createHash("sha256").update(token).digest("hex");
+    return this.verify(`token:${digest}`, payload, invalidMsg);
   }
 
   async verifyCookie(token: string, userType = ""): Promise<UserInfo> {

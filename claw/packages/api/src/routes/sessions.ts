@@ -7,15 +7,21 @@ import { connectionLost, db, type StatementRunner } from "../infra/db.js";
 import { singleflightCreate, type FlightResult } from "../shared/singleflight.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions/dispatch.js";
-import { resolveUserLlmKey } from "../llm/key-source.js";
-import { RUN_DOORBELL_DISPATCH, SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
-import { pendingSecretColumns } from "../tasks/run-secrets.js";
+import { submitSessionMessage } from "../sessions/submit-message.js";
+import { CLAW_GITHUB_REVIEW_ENABLED, SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
+import { actingTurnRefusalFor } from "../github-review/acting-turns.js";
+import { parseActingAs } from "../github-review/acting-as.js";
+import { parseReviewTarget } from "../github-review/review-target.js";
+import { classifyAttendedCaller } from "../github-review/attended.js";
+import { loadUserEnvForSession, withholdsSandboxKeys } from "../github-review/session-tools.js";
+import { readGithubReviewSettings } from "../github-review/settings.js";
 import {
-  forceIdleAfterInterrupt, releaseSessionGateForTurn, stopSessionRuns, takeSessionGate,
+  forceIdleAfterInterrupt, queuedMessageId, releaseSessionGateForTurn, stopSessionRuns, takeSessionGate,
 } from "../tasks/chat-run.js";
 import { kv, nc, sc } from "../infra/nats.js";
-import { buildDecisionMessage } from "../sessions/decision-message.js";
+import { buildAnswerMessage, buildDecisionMessage } from "../sessions/decision-message.js";
 import { getUser } from "../auth/middleware.js";
+import { getAuthMethod } from "../auth/request-credential.js";
 import {
   canAccessSession,
   canAccessSessionAsOperator,
@@ -26,7 +32,9 @@ import {
 import { getContextUsageSnapshot } from "../sessions/context-builder.js";
 import { publicSessionRow } from "../events/redaction.js";
 import { archiveSession, unarchiveSession } from "../sessions/archive.js";
+import { getChangesPatch, getChangesSummary, type ChangesFailure } from "../sessions/changes-service.js";
 import { parseSessionModel } from "../sessions/session-model.js";
+import { vetRequestMcpServers } from "../sessions/request-mcp-servers.js";
 import {
   isUserEnvKeyAllowed,
   validateTopology, type EnvironmentTopology,
@@ -48,7 +56,8 @@ import { Upload } from "@aws-sdk/lib-storage";
 import { ZipArchive } from "archiver";
 import { Readable, PassThrough } from "node:stream";
 import pino from "pino"
-import { handsSessionKey, putTerminalHold } from "@claw/protocol";
+import { handsSessionKey, parseSessionRepo, putTerminalHold } from "@claw/protocol";
+import { toolsAllowlistProblem } from "../tasks/dags/admission.js";
 
 const logger = pino({ name: "sessions" });
 
@@ -277,13 +286,16 @@ const ZIP_PRESIGN_EXPIRES_SEC = 3600;
 //   .uploads    - user-uploaded inputs with their own TTL (upload-sweeper)
 //   .skills     - runtime-resolved skill assets mirrored from marketplace /
 //                 plugins; not user artifacts and would clutter the file list
+//   .git        - a repository's object store, which the snapshot carries so
+//                 unpushed commits survive a sandbox restart: thousands of
+//                 files, none of them the user's artifacts
 //
 // `.transcripts/` is deliberately absent. It is written by Brain rather than by
 // the sandbox, so the sync treats it as internal -- but it is the user's record
 // of what their run did, and it was downloadable from this listing for every
 // release before it moved into a directory. Hiding it here would take a feature
 // away as a side effect of a storage-layout change.
-const INTERNAL_PREFIXES_RE = /(?:^|\/)(\.zip-cache|\.uploads|\.skills)\//;
+const INTERNAL_PREFIXES_RE = /(?:^|\/)(\.zip-cache|\.uploads|\.skills|\.git)\//;
 
 /**
  * Whether an object under the session prefix is hidden from the user's files.
@@ -1089,6 +1101,8 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       "llm_api_key",
       "virtual_key",
       "_server_managed_credentials",
+      // Set below from the verified caller, never taken from the request.
+      "acting_as_requester",
     ];
     const suppliedReservedKey = reservedConfigKeys.find((key) =>
       Object.prototype.hasOwnProperty.call(sessionConfig, key)
@@ -1098,6 +1112,50 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         ok: false,
         error: `config.${suppliedReservedKey} is server-managed`,
       });
+    }
+
+    // The repository this session is bound to. Checked here, before any row or
+    // run exists, so a malformed url or branch leaves nothing behind. The value
+    // stays in `config` as the client sent it; every turn reads it from there and
+    // Brain checks it once more before it builds a command out of it.
+    const parsedRepo = parseSessionRepo(sessionConfig.repo);
+    if (!parsedRepo.ok) {
+      return reply.status(400).send({ ok: false, error: parsedRepo.error });
+    }
+
+    // The user whose GitHub account this session's review tools act as. A reference
+    // only; checked here, before any row exists, and refused while the feature is
+    // off so that a session never silently goes without the tools it asked for.
+    const parsedActingAs = parseActingAs(sessionConfig.acting_as);
+    if (!parsedActingAs.ok) {
+      return reply.status(400).send({ ok: false, error: parsedActingAs.error });
+    }
+    if (parsedActingAs.actingAs !== null) {
+      if (!CLAW_GITHUB_REVIEW_ENABLED) {
+        return reply.status(400).send({ ok: false, error: "config.acting_as is not enabled on this deployment" });
+      }
+      if (!user) {
+        return reply.status(401).send({ ok: false, error: "authentication required" });
+      }
+      // A session that acts as a user is the person's say, and the key a sandbox holds (or a sign-in that key can complete) must not be
+      // able to start one: a model injected in any ordinary session of the user would otherwise review and merge with their account
+      // on its own. The same credentials as answering a held merge (github-review/attended.ts).
+      const caller = classifyAttendedCaller(getAuthMethod(req), user, readGithubReviewSettings().decisionClientIds);
+      if (!caller.ok) {
+        logger.warn({ userId: user.userId, method: getAuthMethod(req) ?? "none", clientId: user.delegation?.clientId?.slice(0, 128) }, `github_review.acting_as_refused_${caller.error}`);
+        return reply.status(403).send({ ok: false, error: caller.error });
+      }
+      // The requester's name for the review footer, from the verified caller.
+      sessionConfig.acting_as_requester = (user.userName || user.userId).slice(0, 100);
+    }
+    // The one pull request the session's review tools may touch. It is only ever set here, and it binds nothing without `acting_as`, which
+    // is why asking for it without one is refused rather than silently ignored.
+    const parsedTarget = parseReviewTarget(sessionConfig.review_target);
+    if (!parsedTarget.ok) {
+      return reply.status(400).send({ ok: false, error: parsedTarget.error });
+    }
+    if (parsedTarget.target !== null && parsedActingAs.actingAs === null) {
+      return reply.status(400).send({ ok: false, error: "config.review_target needs config.acting_as" });
     }
 
     // The model this session's turns ask for. Checked here, before any row or
@@ -1111,6 +1169,10 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         return reply.status(400).send({ ok: false, error: parsedModel.error });
       }
       sessionModel = parsedModel.model;
+    }
+    // A session that reviews on someone's behalf runs on the review model unless its creator named one: the requester's key pays.
+    if (sessionModel === null && parsedActingAs.actingAs !== null) {
+      sessionModel = readGithubReviewSettings().reviewModel;
     }
 
     if (parentSid && !user) {
@@ -1180,8 +1242,11 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         requestResource: asJsonObject(fmResourceRaw),
         requestTimeout: Number.isFinite(fmTimeoutNum) ? Math.trunc(fmTimeoutNum) : undefined,
         workspaceId: fmWorkspaceId,
-        mcpServers: (fm.mcp_servers as Record<string, Record<string, unknown>>) || undefined,
+        mcpServers: undefined,
       };
+      const vetted = await vetRequestMcpServers(fm.mcp_servers);
+      if (!vetted.ok) return reply.status(400).send({ ok: false, error: `message.${vetted.error}` });
+      firstMessage.mcpServers = vetted.servers;
     }
 
     const sessionEnvResult = parseSessionEnv(body.env);
@@ -1283,8 +1348,10 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
 
         // Snapshot user env BEFORE inserting the session so a snapshot failure
         // can short-circuit without leaving a row behind.
+        // A session that acts as a user is sent none of its owner's stored variables (see `loadUserEnvForSession`); this one has no row to
+        // be read from yet, and the config it is about to be written with is what decides.
         let userEnvSnapshot: Record<string, string> = {};
-        if (firstMessage) {
+        if (firstMessage && !withholdsSandboxKeys(sessionConfig)) {
           userEnvSnapshot = await loadUserEnvSnapshot(db, userId, logger);
         }
 
@@ -1706,7 +1773,9 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       typeof workspaceIdRaw === "string" && workspaceIdRaw.trim() !== ""
         ? workspaceIdRaw.trim()
         : undefined;
-    const mcpServers = (body.mcp_servers as Record<string, Record<string, unknown>>) || undefined;
+    const vettedMcp = await vetRequestMcpServers(body.mcp_servers);
+    if (!vettedMcp.ok) return reply.status(400).send({ ok: false, error: vettedMcp.error });
+    const mcpServers = vettedMcp.servers;
 
     // What the run needs beyond a sandbox, declared rather than written into
     // the prompt as Hyperloom flags. Refused here rather than downgraded:
@@ -1727,6 +1796,12 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       return reply.status(400).send({ ok: false, error: sessionEnvResult.error });
     }
     const sessionEnv = sessionEnvResult.env;
+
+    // The tools this turn may use, enforced by Brain: exact names, or a prefix
+    // ending in `*` such as `mcp__<server>__*`. Absent or empty is no restriction.
+    const allowlistProblem = toolsAllowlistProblem(body.tools_allowlist);
+    if (allowlistProblem) return reply.status(400).send({ ok: false, error: allowlistProblem });
+    const toolsAllowlist = body.tools_allowlist as string[] | undefined;
 
     // V1-compatible control-channel messages share the /messages endpoint.
     // Handle them before the "content required" check that only applies to text.
@@ -1773,9 +1848,10 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       return { ok: true, session_id: sessionId, accepted: true, interrupted: true };
     }
 
-    if (messageType === "decision") {
+    if (messageType === "decision" || messageType === "answer") {
       // The answer to a pending tool-approval request (Brain's approval gate,
-      // agent/hitl.ts). Only a person who may write to the session can give it.
+      // agent/hitl.ts) or to a question the model asked (ask_user_question).
+      // Only a person who may write to the session can give it.
       const row = (await db.query(
         "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
         [sessionId],
@@ -1783,6 +1859,15 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       if (!row) return reply.status(404).send({ ok: false, error: "session not found" });
       if (!canWriteSessionAsOperator(row.user_id, user)) {
         return reply.status(403).send({ ok: false, error: "access denied" });
+      }
+      // In a session that acts as a user an approval is the person's say, not something the key a sandbox holds may give itself.
+      const unattended = await actingTurnRefusalFor(req, sessionId);
+      if (unattended) return reply.status(403).send({ ok: false, error: unattended });
+      if (messageType === "answer") {
+        const built = buildAnswerMessage(sessionId, userId, body);
+        if (!built.ok) return reply.status(400).send({ ok: false, error: built.error });
+        nc.publish(`decision.${sessionId}`, sc.encode(JSON.stringify(built.message)));
+        return { ok: true, session_id: sessionId, action_id: built.message.action_id };
       }
       const built = buildDecisionMessage(sessionId, userId, body);
       if (!built.ok) return reply.status(400).send({ ok: false, error: built.error });
@@ -1795,141 +1880,51 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     // queues into claw_pending_messages (next-turn semantics); if idle it dispatches immediately.
     if (!content) return reply.status(400).send({ ok: false, error: "content required" });
 
-    // Captured inside the transaction (idle path) so the task publish below
-    // can inject user_env without re-reading the DB. Queue path freezes it
-    // onto claw_pending_messages directly and leaves this map empty.
-    let capturedUserEnvSnapshot: Record<string, string> = {};
-
-    // Minted before the gate is taken, so marker and turn are one string.
-    const turnMessageId = newChatMessageId();
-
-    // Transaction: lock row → check status → queue or dispatch
-    const client = await db.pool.connect();
-    try {
-      await client.query("BEGIN");
-      const lockResult = await client.query(
-        "SELECT agent_status, user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL FOR UPDATE",
-        [sessionId],
-      );
-      if (!lockResult.rows.length) {
-        await client.query("ROLLBACK");
+    // Lock, gate, queue or dispatch: all of it is `submitSessionMessage`, which is
+    // also what a caller that is not an HTTP request goes through.
+    const submitted = await submitSessionMessage({
+      sessionId, userId, user,
+      content, messageType, toolIds, pluginId,
+      requestImage, requestResource, requestTimeout, topology, toolsAllowlist,
+      workspaceId, mcpServers, sessionEnv,
+      isCancelled: () => isClientGone(req),
+      // A turn in a session that acts as a user is the person's say, like creating it: the key a sandbox holds is the owner's own and
+      // reaches this route, so it must not be able to put work in front of a model that holds the person's GitHub account.
+      refuse: (tx) => actingTurnRefusalFor(req, sessionId, tx),
+    });
+    switch (submitted.kind) {
+      case "session_not_found":
         return reply.status(404).send({ ok: false, error: "session not found" });
-      }
-      const row = lockResult.rows[0];
-      // Owner-only: text/inject messages are conversation writes; only the
-      // session creator may extend the conversation. Other ops on this session
-      // (read, interrupt, delete-of-own-session) are governed by their own
-      // rules above / below.
-      if (!canAccessSession(row.user_id, userId) && !(!row.user_id && user && isSystemAdmin(user))) {
-        await client.query("ROLLBACK");
+      case "not_owner":
         return reply.status(403).send({ ok: false, error: "only the session creator can send messages" });
-      }
-
-      const status = lockResult.rows[0].agent_status;
-      // Snapshot per-user env at message creation time. Decrypted once here,
-      // frozen on the pending_messages row (queue path) or NATS task body
-      // (immediate path) so Brain reads plaintext without touching the
-      // master key. Same userId source as the SELECT above (req.user).
-      // IMPORTANT: reuse the transaction connection `client` here. Using the
-      // pool (`db`) would borrow a second connection while this tx still holds
-      // the FOR UPDATE row lock; under load that exhausts the pool, leaving
-      // connections stuck "idle in transaction" holding claw_sessions locks
-      // and blocking ALTER TABLE / reads cluster-wide.
-      const userEnvSnapshot = await loadUserEnvSnapshot(client, userId, logger);
-      if (status === "running") {
-        const secrets = pendingSecretColumns({
-          llmKey: resolveUserLlmKey(user) || "",
-          platformKey: user?.platformKey || "",
-          userEnv: userEnvSnapshot,
-          doorbell: RUN_DOORBELL_DISPATCH,
-        });
-        await client.query(
-          "INSERT INTO claw_pending_messages (session_id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11::jsonb, $12, $13::jsonb, $14::jsonb, $15::jsonb)",
-          [
-            sessionId,
-            content,
-            userId,
-            pluginId ?? null,
-            JSON.stringify(toolIds.length ? toolIds : []),
-            workspaceId ?? null,
-            secrets.platform,
-            secrets.llm,
-            secrets.blob,
-            requestImage ?? null,
-            requestResource ? JSON.stringify(requestResource) : null,
-            requestTimeout ?? null,
-            JSON.stringify(secrets.userEnv),
-            JSON.stringify(sessionEnv),
-            topology ? JSON.stringify(topology) : null,
-          ],
-        );
-        await client.query("COMMIT");
-        // No `run_id` here, and none invented. What this call accepted is a
-        // queued message; the run row is opened later by the drain, once the
-        // turn in front of it finishes. An id minted now would answer 404 on
-        // `/v1/runs` until then, and would name nothing at all if the replay is
-        // later refused a workspace or its admission. The caller polls the
-        // session until a run appears -- see docs/run-api.md.
-        return { ok: true, session_id: sessionId, queued: true };
-      }
-      // Stash the snapshot for the immediate-dispatch path below — building
-      // `task` happens outside the transaction so we need it accessible.
-      // Hoisted via outer-scope variable defined after the try/finally block.
-      capturedUserEnvSnapshot = userEnvSnapshot;
-
-      await takeSessionGate(sessionId, turnMessageId, client);
-      await client.query("COMMIT");
-    } catch (e) {
-      await client.query("ROLLBACK");
-      throw e;
-    } finally {
-      client.release();
+      case "refused":
+        return reply.status(403).send({ ok: false, error: submitted.reason });
+      case "queued":
+        // No `run_id`: what this call accepted is a queued message, and the run
+        // row is opened later by the drain -- see docs/run-api.md. The message id
+        // is already decided: it is the one the turn that runs it will carry.
+        return {
+          ok: true, session_id: sessionId, queued: true,
+          ...(submitted.pendingId !== null ? { message_id: queuedMessageId(submitted.pendingId) } : {}),
+        };
+      case "client_gone":
+        return reply.status(499).send({ ok: false, error: "client_closed_request" });
+      case "dispatch_failed":
+        return reply.status(503).send({ ok: false, error: "task dispatch failed", detail: submitted.error?.message });
+      case "admission_rejected":
+        return reply.status(429).send({ ok: false, error: "admission_rejected", reason: submitted.reason });
+      case "dispatched":
+        return {
+          ok: true,
+          session_id: sessionId,
+          message_id: submitted.messageId,
+          accepted: true,
+          // Present exactly when this call opened a run row. The queued branch
+          // above returns before this and carries no id on purpose: that message
+          // is in `claw_pending_messages` and no run exists to name yet.
+          run_id: submitted.runId,
+        };
     }
-
-    // A3: client already disconnected — don't dispatch; revert to idle so no
-    // phantom 'running' spinner is left behind (mirrors the publish-failure
-    // rollback below). The transaction above already committed 'running'.
-    if (isClientGone(req)) {
-      await releaseSessionGateForTurn(sessionId, turnMessageId);
-      logger.warn({ sessionId, userId }, "message.client_gone_pre_dispatch");
-      return reply.status(499).send({ ok: false, error: "client_closed_request" });
-    }
-
-    // Outside transaction: hand off to the shared brain-dispatch helper.
-    // On JetStream publish failure we MUST flip agent_status back to 'idle'
-    // here (the transaction above committed 'running'); otherwise the
-    // frontend spinner never stops and the next /messages POST queues into
-    // claw_pending_messages waiting for an exec_complete that never arrives.
-    const dispatch = await dispatchTaskToBrain(
-      {
-        sessionId, userId, user,
-        content, messageType, toolIds, pluginId,
-        requestImage, requestResource, requestTimeout, topology,
-        workspaceId, mcpServers,
-        capturedUserEnvSnapshot,
-        capturedSessionEnv: sessionEnv,
-        messageId: turnMessageId,
-      },
-      async () => {
-        await releaseSessionGateForTurn(sessionId, turnMessageId);
-      },
-    );
-    if (dispatch.kind === "publish_failed" || dispatch.kind === "publish_unknown") {
-      return reply.status(503).send({ ok: false, error: "task dispatch failed", detail: dispatch.error?.message });
-    }
-    if (dispatch.kind === "rejected") {
-      return reply.status(429).send({ ok: false, error: "admission_rejected", reason: dispatch.reason });
-    }
-    return {
-      ok: true,
-      session_id: sessionId,
-      message_id: dispatch.messageId,
-      accepted: true,
-      // Present exactly when this call opened a run row. The queued branch
-      // above returns before this and carries no id on purpose: that message is
-      // in `claw_pending_messages` and no run exists to name yet.
-      run_id: dispatch.runId,
-    };
   });
 
   // --- Start the session's sandbox without a turn (creator-only) ---
@@ -1998,7 +1993,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         await client.query("ROLLBACK");
         return { ok: true, session_id: sessionId, state: "running", workload_id: binding.workloadId };
       }
-      dispatchUserEnv = await loadUserEnvSnapshot(client, userId, logger);
+      dispatchUserEnv = await loadUserEnvForSession(client, userId, sessionId, logger);
       turnMessageId = newChatMessageId();
       await takeSessionGate(sessionId, turnMessageId, client);
       await client.query("COMMIT");
@@ -2076,6 +2071,48 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       ok: true, session_id: sessionId, throttled: false, workload_id: binding.workloadId,
       hold_ms: SESSION_SANDBOX_HOLD_MS,
     };
+  });
+
+  // --- What the session's sandbox has changed (creator-only, live) ---
+  //
+  // Asked of the sandbox that is running, through Hands, and of no other: a session
+  // whose sandbox was reclaimed is a 409, never a reason to start one. Another user's
+  // session and a missing one are the same 404, and an administrator is not the
+  // creator: this runs commands in the creator's sandbox.
+  //
+  //   GET /v1/sessions/:id/changes                      the work trees under /workspace, files and +/-
+  //   GET /v1/sessions/:id/changes?repo=<path>&file=<path>   one file's unified diff
+  app.get<{ Params: { id: string } }>("/v1/sessions/:id/changes", async (req, reply) => {
+    const sessionId = req.params.id;
+    const userId = getUser(req)?.userId ?? "default";
+    const row = (await db.query(
+      "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
+      [sessionId],
+    )).rows[0];
+    if (!row || !canAccessSession(row.user_id, userId)) {
+      return reply.status(404).send({ ok: false, error: "session not found" });
+    }
+    const failure = (f: ChangesFailure) => {
+      switch (f.kind) {
+        case "not_running": return reply.status(409).send({ ok: false, error: "sandbox_not_running" });
+        case "unavailable": return reply.status(502).send({ ok: false, error: "changes_unavailable" });
+        case "bad_request": return reply.status(400).send({ ok: false, error: f.error });
+        case "not_found": return reply.status(404).send({ ok: false, error: f.error });
+        case "busy": return reply.status(429).send({ ok: false, error: "too_many_requests" });
+      }
+    };
+    const q = (req.query ?? {}) as Record<string, unknown>;
+    if (q.repo === undefined && q.file === undefined) {
+      const summary = await getChangesSummary(sessionId);
+      if (summary.kind !== "ok") return failure(summary);
+      return { ok: true, ...summary.value };
+    }
+    if (q.repo === undefined || q.file === undefined) {
+      return reply.status(400).send({ ok: false, error: "repo and file must be given together" });
+    }
+    const patch = await getChangesPatch(sessionId, q.repo, q.file);
+    if (patch.kind !== "ok") return failure(patch);
+    return { ok: true, ...patch.value };
   });
 
   // --- List Files (V1/V2 split) ---

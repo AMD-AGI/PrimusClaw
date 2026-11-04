@@ -21,6 +21,23 @@
 {{- default (printf "%s-pguser-%s" .Values.postgres.clusterName .Values.postgres.appUser) .Values.postgres.userSecretName -}}
 {{- end -}}
 
+{{- /*
+The directory the chart itself mounts a volume at in a container, read from
+mount-paths.json ({container: {volume name: directory}}). That file is the only
+place these paths are written: the Deployments take them from here, and
+claw/deploy/extra-values.py refuses an EXTRA_*_MOUNTS_* entry at any of them
+(a container cannot have two mounts at one path), so the two cannot drift.
+
+Call as: include "primus-claw.mountPath" (list . "api" "extra-ca")
+*/ -}}
+{{- define "primus-claw.mountPath" -}}
+{{- $root := index . 0 -}}
+{{- $container := index . 1 -}}
+{{- $volume := index . 2 -}}
+{{- $all := $root.Files.Get "mount-paths.json" | fromJson -}}
+{{- required (printf "mount-paths.json has no %s.%s" $container $volume) (index (index $all $container | default dict) $volume) -}}
+{{- end -}}
+
 {{- define "primus-claw.labels" -}}
 app: primus-claw
 app.kubernetes.io/name: {{ include "primus-claw.name" . }}
@@ -104,4 +121,56 @@ same client, so they cannot be configured to disagree.
 {{- include "primus-claw.identityOptionalEnv" (dict "name" "IDENTITY_KEYS_REFRESH_SECONDS" "value" $i.keysRefreshSeconds) }}
 {{- include "primus-claw.identityOptionalEnv" (dict "name" "IDENTITY_EXCHANGE_REFRESH_SKEW_SECONDS" "value" $i.exchangeRefreshSkewSeconds) }}
 {{- end }}
+{{- end -}}
+
+{{- /*
+Accepting an identity provider's access token as an API credential, for the API
+Deployment only (Brain authenticates nobody with it). Renders nothing while
+identity.tokenAuth.enabled is false, so the default chart is byte-for-byte what it
+was. The token is verified by the identity client, so it also needs identity.enabled:
+asking for one without the other is refused here rather than rendered as a switch
+that quietly does nothing. identity.tokenAuth.trustedRoles (empty by default) names the
+platform roles a token the provider confirms may confer; it renders only when it is not empty.
+*/ -}}
+{{- define "primus-claw.identityTokenEnv" -}}
+{{- $i := .Values.identity | default dict -}}
+{{- $t := $i.tokenAuth | default dict -}}
+{{- if $t.enabled -}}
+{{- if not $i.enabled -}}
+{{- fail "identity.tokenAuth.enabled requires identity.enabled: the access token is verified by the identity client" -}}
+{{- end -}}
+- name: CLAW_IDENTITY_TOKEN_AUTH_ENABLED
+  value: "true"
+{{- include "primus-claw.identityOptionalEnv" (dict "name" "CLAW_IDENTITY_TOKEN_AUDIENCE" "value" $t.audience) }}
+{{- include "primus-claw.identityOptionalEnv" (dict "name" "CLAW_IDENTITY_TOKEN_SCOPE" "value" $t.scope) }}
+{{- include "primus-claw.identityOptionalEnv" (dict "name" "CLAW_IDENTITY_TOKEN_DELEGATION_AUDIENCE" "value" $t.delegationAudience) }}
+{{- include "primus-claw.identityOptionalEnv" (dict "name" "CLAW_IDENTITY_TOKEN_DELEGATION_SCOPE" "value" $t.delegationScope) }}
+{{- if $t.introspect }}
+- name: CLAW_IDENTITY_TOKEN_INTROSPECT
+  value: "true"
+{{- end }}
+{{- with $t.trustedRoles }}
+- name: CLAW_IDENTITY_TOKEN_TRUSTED_ROLES
+  value: {{ join "," . | quote }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{- /*
+The externally reachable base URL of the API (CLAW_PUBLIC_URL), or the empty
+string when nothing says what it is.
+
+api.publicUrl wins when set. Otherwise, with the ingress enabled, it is
+https://<ingress.host><ingress.path>: the ingress serves the API under that
+path and rewrites it away, so the API cannot see the prefix a client has to use
+and A2A agent cards would advertise <host>/a2a instead of <host><path>/a2a.
+Without an ingress host there is nothing to derive from, and the API falls back
+to the proxy's forwarded headers, then to a relative URL.
+*/ -}}
+{{- define "primus-claw.publicUrl" -}}
+{{- if .Values.api.publicUrl -}}
+{{- .Values.api.publicUrl | trimSuffix "/" -}}
+{{- else if and .Values.ingress.enabled .Values.ingress.host -}}
+{{- printf "https://%s%s" .Values.ingress.host (.Values.ingress.path | default "" | trimSuffix "/") -}}
+{{- end -}}
 {{- end -}}

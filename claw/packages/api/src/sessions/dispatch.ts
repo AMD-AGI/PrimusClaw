@@ -18,6 +18,7 @@ import { isAdmin, type UserInfo } from "../auth/models.js";
 import { stampSessionCredentials } from "../auth/session-credentials.js";
 import { buildMessages } from "./context-builder.js";
 import { isMemoryActive } from "../memory/service.js";
+import { CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
 import { selectSkillsForTask } from "../marketplace/skill-service.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { eventSubject, taskSubject, type EnvironmentTopology } from "@claw/protocol";
@@ -32,7 +33,10 @@ import { decideAdmission, withOwnedAdmissionLock } from "../tasks/admission.js";
 import { admissionAskFor } from "../tasks/run-dispatch.js";
 import { stripRunSecrets } from "../tasks/run-spec.js";
 import { sessionModelFromRow } from "./session-model.js";
+import { sessionRepoFromRow } from "./session-repo.js";
 import { applyAppMcpToTask } from "./app-mcp.js";
+import { applySessionRoleToTask, skipsSkillSelection } from "../assistant/role-profile.js";
+import { applyTriggerToolsToTask } from "../triggers/mcp.js";
 import { ensureSessionWorkspace, requireWorkspaceBinding } from "../workspace/store.js";
 import pino from "pino";
 
@@ -94,6 +98,8 @@ export interface DispatchInput {
    * either absent or well-formed.
    */
   topology?: EnvironmentTopology;
+  /** The tools the turn may use (`tools_allowlist`, enforced by Brain); absent or empty is no restriction. */
+  toolsAllowlist?: string[];
   /**
    * Run the dispatch as a sandbox-only run: bring up (or reuse) the session's
    * sandbox exactly as a turn would, then finish, with no model call and no
@@ -154,7 +160,7 @@ export async function dispatchTaskToBrain(
   const {
     sessionId, userId, user, content, toolIds, pluginId,
     requestImage, requestResource, requestTimeout, workspaceId,
-    mcpServers, capturedUserEnvSnapshot, capturedSessionEnv, topology,
+    mcpServers, capturedUserEnvSnapshot, capturedSessionEnv, topology, toolsAllowlist,
   } = input;
   const sandboxOnly = input.sandboxOnly === true;
 
@@ -251,7 +257,8 @@ export async function dispatchTaskToBrain(
 
     let localSkills: Record<string, { content: string; enabled: boolean; version?: number; description?: string; files?: Array<{ path: string; content: string; is_binary?: boolean }> }> = {};
     try {
-      const activeSkills = sandboxOnly ? {} : await selectSkillsForTask(userId, content);
+      // A router turn only classifies and calls tools; selecting skills costs it an LLM call it has no use for.
+      const activeSkills = sandboxOnly || await skipsSkillSelection(sessionId) ? {} : await selectSkillsForTask(userId, content);
       for (const [name, bundle] of Object.entries(activeSkills)) {
         localSkills[name] = {
           content: bundle.content,
@@ -301,6 +308,7 @@ export async function dispatchTaskToBrain(
       prompt: content,
       history,
       memory_enabled: await isMemoryActive(userId),
+      skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED,
       user_id: userId,
       llm_api_key: resolveUserLlmKey(user),
       platform_key: user?.platformKey || "",
@@ -322,6 +330,7 @@ export async function dispatchTaskToBrain(
     if (pluginTools !== undefined) {
       task.plugin_tools = pluginTools;
     }
+    if (toolsAllowlist?.length) task.tools_allowlist = toolsAllowlist;
     if (sandboxOnly) {
       // Brain opens the sandbox up front for script mode and the empty script
       // then has nothing to run: the run ends with the sandbox up and parked.
@@ -332,7 +341,7 @@ export async function dispatchTaskToBrain(
       task.sandbox_only = true;
     }
     const sessionMeta = (await db.query(
-      "SELECT parent_session_id, team_role, model FROM claw_sessions WHERE session_id = $1",
+      "SELECT parent_session_id, team_role, model, config->'repo' AS repo FROM claw_sessions WHERE session_id = $1",
       [sessionId],
     )).rows[0];
     if (sessionMeta?.parent_session_id) {
@@ -347,6 +356,11 @@ export async function dispatchTaskToBrain(
     // Brain's `request.model`, so this one field is the whole of the selection.
     const sessionModel = sessionModelFromRow(sessionMeta);
     if (sessionModel) task.model = sessionModel;
+    // The repository the session is bound to, read now for the same reason: Brain
+    // sets the working tree up in whatever sandbox this turn opens, which after an
+    // idle reclaim is a new one. No field at all for a session with no binding.
+    const sessionRepo = sessionRepoFromRow(sessionMeta, sessionId);
+    if (sessionRepo) task.repo = sessionRepo;
     // Names collide unhelpfully here: `workspace_id` above is the sandbox
     // namespace, this is the files. Brain gates concurrency on it, which is
     // what makes two runs over one directory queue instead of overwriting
@@ -501,6 +515,9 @@ export async function dispatchTaskToBrain(
     // application's servers are built from the live record when it is claimed
     // (tasks/run-claim.ts), so no token is stored and a replaced sandbox is not offered.
     await applyAppMcpToTask(task, sessionId);
+    // After the run row exists: the turn's token names the run. A doorbell turn gets this at claim instead.
+    await applyTriggerToolsToTask(task, sessionId);
+    await applySessionRoleToTask(task, sessionId);
     const payload = JSON.stringify(task);
     const seq = await publishRunMessage(
       () => sessionDispatchPorts.publishTask(subject, payload),

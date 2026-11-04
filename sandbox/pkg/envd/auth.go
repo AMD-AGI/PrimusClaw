@@ -20,6 +20,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
+	"sigs.k8s.io/agent-sandbox/pkg/e2b"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
@@ -146,6 +147,37 @@ func (s *Server) jwtMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), verifiedSessionIDKey{}, tokenSessionID)))
+		ctx := context.WithValue(r.Context(), verifiedSessionIDKey{}, tokenSessionID)
+		ctx = e2b.WithRequestPolicy(ctx, policyFromClaims(claims))
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// policyFromClaims reads the sealed allow-list from a verified Router token.
+// Request headers are not a source for this policy.
+func policyFromClaims(claims jwt.MapClaims) e2b.RequestPolicy {
+	sealed, _ := claims["sealed"].(bool)
+	if !sealed {
+		return e2b.RequestPolicy{}
+	}
+	return e2b.RequestPolicy{
+		Sealed:  true,
+		Inputs:  claimStrings(claims["inputs"]),
+		Outputs: claimStrings(claims["outputs"]),
+	}
+}
+
+func claimStrings(value any) []string {
+	items, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		text, ok := item.(string)
+		if ok && text != "" {
+			out = append(out, text)
+		}
+	}
+	return out
 }

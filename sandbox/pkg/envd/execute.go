@@ -81,7 +81,7 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 
 	startTime := time.Now()
 	_, exitCh, drained, stop, err := s.startTrackedCommand(
-		req.Command, workDir, s.buildChildEnv(req.Env), &stdout, &stderr,
+		req.Command, workDir, s.buildChildEnv(req.Env), &stdout, &stderr, nil,
 		jobTracking{track: !req.Untracked, hands: handsExecute(&req)},
 	)
 	exitCode := 0
@@ -203,6 +203,7 @@ func (s *Server) handleExecuteStream(w http.ResponseWriter, r *http.Request) {
 		s.buildChildEnv(req.Env),
 		stream.writer("stdout"),
 		stream.writer("stderr"),
+		nil,
 		jobTracking{track: !req.Untracked, hands: handsExecute(&req)},
 	)
 	if err != nil {

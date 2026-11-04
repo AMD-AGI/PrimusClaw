@@ -17,6 +17,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/require"
+	e2bapi "sigs.k8s.io/agent-sandbox/pkg/e2b"
 )
 
 func TestJWTMiddlewareBindsTokenToPodSession(t *testing.T) {
@@ -62,6 +63,29 @@ func TestJWTMiddlewareBindsTokenToPodSession(t *testing.T) {
 			handler.ServeHTTP(rec, req)
 			require.Equal(t, tc.wantStatus, rec.Code)
 		})
+	}
+}
+
+func TestSealedLegacyMiddlewareRejectsAPIRoutes(t *testing.T) {
+	handler := (&Server{}).sealedLegacyMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	legacy := httptest.NewRequest(http.MethodPost, "/api/files?path=/out/result.json", nil)
+	legacy = legacy.WithContext(e2bapi.WithRequestPolicy(legacy.Context(), e2bapi.RequestPolicy{
+		Sealed: true, Inputs: []string{"/in"}, Outputs: []string{"/out"},
+	}))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, legacy)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("legacy status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	e2bRequest := httptest.NewRequest(http.MethodGet, "/files?path=/out/result.json", nil)
+	e2bRequest = e2bRequest.WithContext(e2bapi.WithRequestPolicy(e2bRequest.Context(), e2bapi.RequestPolicy{Sealed: true}))
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, e2bRequest)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("e2b status=%d", rec.Code)
 	}
 }
 

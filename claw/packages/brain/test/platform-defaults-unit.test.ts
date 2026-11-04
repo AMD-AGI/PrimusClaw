@@ -19,10 +19,16 @@ const { ToolRouter } = await import("../src/tools/router.js");
 
 const ctx = { sessionId: "s", userId: "u" };
 
-test("prompt: progressive entries carry name, description and path, never a body", () => {
+test("prompt: progressive entries carry name and description, never a body; the model is told to load, not read", () => {
   const p = buildPrompt("hi", {}, [], "m", "/workspace", "", ctx, [{ name: "a", description: "does A" }]);
-  assert.match(p, /- a: does A {3}\[read \/workspace\/\.skills\/a\/SKILL\.md\]/);
+  assert.match(p, /- a: does A\n/);
   assert.ok(!p.includes("=== SKILL:"));
+  // A skill is not a file the model opens in a sandbox: no path to read, and the tool is named.
+  assert.ok(!p.includes("[read"), "no read path is advertised");
+  assert.ok(!p.includes("SKILL.md with the read tool"), "the model is no longer told to read SKILL.md");
+  assert.match(p, /load it with the load_skill tool/);
+  assert.match(p, /needs no sandbox/);
+  assert.match(p, /scripts run in the sandbox with bash, from \/workspace\/\.skills\/<name>\//);
 });
 
 test("prompt: inline skills and progressive skills coexist; inline keeps its body", () => {
@@ -97,13 +103,32 @@ test("loader: valid file loads and a changed mtime reloads it", () => {
   assert.deepEqual(loadPlatformDefaults(f)?.skills, [{ toolId: 6, name: undefined }]);
 });
 
+test("loader: mcp_env_allow is a list of placeholder names, and anything else rejects the file", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pd-load-"));
+  const f = path.join(dir, "d.json");
+  const rows: Array<{ allow: unknown; want: string[] | null }> = [
+    { allow: undefined, want: [] },
+    { allow: ["EXAMPLE_MCP_TOKEN", "MY_HOST"], want: ["EXAMPLE_MCP_TOKEN", "MY_HOST"] },
+    { allow: "EXAMPLE_MCP_TOKEN", want: null },
+    { allow: ["tavily"], want: null },
+    { allow: [5], want: null },
+  ];
+  for (const [i, row] of rows.entries()) {
+    resetPlatformDefaultsCacheForTest();
+    fs.writeFileSync(f, JSON.stringify({ mcp_servers: { safe: { url: "u" } }, ...(row.allow === undefined ? {} : { mcp_env_allow: row.allow }) }));
+    fs.utimesSync(f, new Date(), new Date(Date.now() + 5000 * (i + 1)));
+    const got = loadPlatformDefaults(f);
+    assert.deepEqual(got ? [...got.mcpEnvAllow] : null, row.want, JSON.stringify(row.allow));
+  }
+});
+
 function routerWith(writes: string[]) {
   let attached = 0;
   const order: string[] = [];
   const hands = {
     async callToolFull(name: string, args: Record<string, unknown>) { order.push(`call:${name}`); return { text: "ok", isError: false, args }; },
   };
-  const router = new ToolRouter(null, new Map(), undefined, "", async () => { attached++; return hands as never; });
+  const router = new ToolRouter(null, new Map(), undefined, async () => { attached++; return hands as never; });
   router.lazySkillWriter = {
     async ensure(_h, text) { writes.push(text); order.push("write"); },
   };

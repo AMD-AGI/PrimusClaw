@@ -1,19 +1,24 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { HandsClient, type ShellClassProbe } from "../clients/hands.js";
+import { HandsClient, withHandsTimeout, type ShellClassProbe } from "../clients/hands.js";
 import { isSandboxTool, toolTimeoutCeilingSec } from "./hands.js";
 import { handleA2ACall } from "../clients/a2a.js";
+import { LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON } from "../tasks/abort-registry.js";
 import { callBackendMcpTool } from "../clients/backend-mcp.js";
 import { getPluginToolScope } from "./scope.js";
+import { toolNotAllowedMessage, type ToolAllowlist } from "./allowlist.js";
 import type { ToolSchema, PendingMemory, PendingSkill, PendingSkillFileMutation } from "@claw/protocol";
 import {
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED, TODO_WRITE_ENABLED, BG_SHELL_ENABLED,
-  EXIT_PLAN_MODE_ENABLED, ASK_USER_QUESTION_ENABLED,
-  BASH_FOREGROUND_DEFAULT_SEC, WAIT_DEFAULT_SEC,
+  EXIT_PLAN_MODE_ENABLED, ASK_USER_QUESTION_ENABLED, A2A_CLIENT_ENABLED,
+  BASH_FOREGROUND_DEFAULT_SEC, WAIT_DEFAULT_SEC, SUB_AGENT_MODELS,
+  HANDS_CALL_DEFAULT_TIMEOUT_MS,
 } from "../config.js";
 import type { WebSearchService } from "./web/search.js";
 import type { WebFetchService } from "./web/fetch.js";
+import { LOAD_SKILL_TOOL, type SkillStore } from "../agent/skill-store.js";
+import { TOOL_RESULTS_DIR } from "../workspace/excludes.js";
 
 /**
  * The bash timeout ceiling the schema states.
@@ -46,6 +51,12 @@ function validateSubFilePath(filePath: string): string | null {
 
 /** A sandbox tool input that touches the skills directory. */
 const SKILLS_PATH_RE = /\.skills\b/;
+
+/** Most of a result kept on disk; past this a command's output is better re-run into a file of its own. */
+export const SPILL_MAX_CHARS = 4 * 1024 * 1024;
+
+/** The tools that write skills, which the API keeps only when skill self-evolution is on. */
+export const SKILL_WRITE_TOOLS = new Set(["save_skill", "add_skill_file", "update_skill_file", "remove_skill_file"]);
 
 const BRAIN_NETWORK_TOOLS = new Set(["web_search", "web_fetch"]);
 
@@ -99,6 +110,24 @@ const LOOP_INTERCEPTED_TOOLS = new Set([
   "ask_user_question",
 ]);
 
+/** The `task` tool's `model` value that keeps a sub-agent on the run's own model. */
+export const INHERIT_MODEL = "inherit";
+
+/** The tool that hands the model a skill the prompt listed; offered only when one is listed. */
+function loadSkillSchema(): ToolSchema {
+  return {
+    name: LOAD_SKILL_TOOL,
+    description: "Load a skill listed under 'Platform Skills' in the prompt: with only `name` you get its SKILL.md (instructions, plus the list of its other files); with `file` you get one of those files. A long file comes in parts of up to ~16000 characters: the end of each part says the `offset` of the next, so keep calling with that offset until the end. Served without a sandbox, so use it, not read or bash, to read any part of a skill. Run a skill's scripts with bash.",
+    input_schema: {
+      type: "object", properties: {
+        name: { type: "string", description: "The skill's name, as listed in the prompt" },
+        file: { type: "string", description: "Path of a text file inside the skill's directory, e.g. references/api.md; omit for SKILL.md" },
+        offset: { type: "integer", minimum: 0, description: "Character to start from, for the next part of a file that did not fit; omit (0) for the beginning" },
+      }, required: ["name"],
+    },
+  };
+}
+
 export interface WebToolServices {
   webSearch?: WebSearchService;
   webFetch?: WebFetchService;
@@ -131,12 +160,11 @@ function scanContent(content: string, maxLength: number): string | null {
  * - Platform MCP tools (mcp__server__tool) → remote MCP servers (Brain-side)
  * - save_memory / save_skill → local pending buffers (flushed via exec_complete)
  *
- * Feature-flag contract: save_skill / *_skill_file schemas stay exposed
- * regardless of CLAW_SKILL_EVOLUTION_ENABLED (the API discards the payload
- * when it is off). save_memory is different: the API tells Brain per request
- * whether memory is active (`memory_enabled`), and when it is not the tool is
- * not offered and a call is refused, so the agent is never told "saved" for a
- * write the API will drop.
+ * Feature-flag contract: the API tells Brain per request whether memory is
+ * active (`memory_enabled`) and whether skill self-evolution is
+ * (`skill_evolution_enabled`). When one is not, its tools are not offered and a
+ * call is refused, so the agent is never told "saved" for a write the API will
+ * drop.
  */
 export class ToolRouter {
   readonly pendingMemories: PendingMemory[] = [];
@@ -156,9 +184,28 @@ export class ToolRouter {
   /** False when the API said memory is off for this user; save_memory is then withheld. */
   memoryEnabled = true;
 
-  private webServices: WebToolServices;
+  /**
+   * True only when the API said skill self-evolution is on. Off, the API drops
+   * every saved skill, so the skill-writing tools are withheld and refused.
+   */
+  skillEvolutionEnabled = false;
 
-  private bearerToken: string;
+  /**
+   * The run's `tools_allowlist`, null when it has none. Set by the engine from
+   * the request; `route()` refuses any call outside it. A sub-agent's router is
+   * not given it: that router's own guard is built from the schemas the
+   * sub-agent was handed, which the same list has already narrowed.
+   */
+  private toolAllowlist: ToolAllowlist | null = null;
+
+  /**
+   * Whom `a2a_call` acts for and how long the run has: the session's owner (an identity
+   * peer is called as them), its id for logs, and the epoch ms its budget ends. Set by the
+   * engine; sub-agent routers inherit it, so a sub-agent's call is the same user's.
+   */
+  a2aContext: { userId?: string; sessionId?: string; deadlineAtMs?: number } = {};
+
+  private webServices: WebToolServices;
 
   /**
    * Backend-side MCP connection (task-design.md §7.5). When provided, tool
@@ -184,15 +231,22 @@ export class ToolRouter {
    */
   lazySkillWriter?: { ensure(hands: HandsClient, text: string, coldSandbox: boolean): Promise<void> };
 
+  /**
+   * The skills the prompt lists, served to the model by `load_skill` from Brain's
+   * own copy. Set by the engine only when the prompt lists skills; absent, the
+   * tool is not offered and not routed. It never reaches a sandbox, so a turn
+   * that only loads a skill and calls MCP tools starts none. Inherited by
+   * children, like the writer.
+   */
+  skillStore?: SkillStore;
+
   constructor(
     private hands: HandsClient | null,
     private platformMcp: Map<string, { callTool: (name: string, args: Record<string, unknown>) => Promise<string> }> = new Map(),
     webServices?: WebToolServices,
-    bearerToken?: string,
     attachHands?: () => Promise<HandsClient>,
   ) {
     this.webServices = webServices ?? {};
-    this.bearerToken = bearerToken || "";
     this.attachHands = attachHands;
   }
 
@@ -239,6 +293,11 @@ export class ToolRouter {
     this.pluginTools = opts.pluginTools ?? undefined;
   }
 
+  /** Restrict this router to a run's `tools_allowlist`; null lifts the restriction. */
+  setToolAllowlist(allowlist: ToolAllowlist | null): void {
+    this.toolAllowlist = allowlist;
+  }
+
   /** Parse a file path for `.skills/{name}/SKILL.md` and record the skill name. */
   private trackSkillRead(path: string): void {
     const m = path.match(/\.skills\/([a-z0-9][a-z0-9-]*)\/SKILL\.md/i);
@@ -252,6 +311,24 @@ export class ToolRouter {
     for (const child of this.children) child.setHands(newHands);
   }
 
+  /**
+   * Keep a tool result whole in the sandbox and say where, or null when it was
+   * not kept. Only into a sandbox the run already has: a turn that has not
+   * needed one (MCP and skills only) must not start one to store an answer.
+   */
+  async spillToolResult(toolUseId: string, text: string): Promise<string | null> {
+    if (!this.hands) return null;
+    const path = `/workspace/${TOOL_RESULTS_DIR}/${toolUseId.replace(/[^A-Za-z0-9_-]/g, "_")}.txt`;
+    try {
+      const out = String(await withHandsTimeout(
+        this.hands, "write", { path, contents: text.slice(0, SPILL_MAX_CHARS) }, HANDS_CALL_DEFAULT_TIMEOUT_MS,
+      ));
+      return out.startsWith("Error") ? null : path;
+    } catch {
+      return null;
+    }
+  }
+
   /** Return the web tool services for sub-agent propagation. */
   getWebToolServices(): WebToolServices {
     return this.webServices;
@@ -260,6 +337,9 @@ export class ToolRouter {
   /** Register a child router so subsequent setHands() cascades to it. */
   registerChild(child: ToolRouter): void {
     child.lazySkillWriter = this.lazySkillWriter;
+    child.skillStore = this.skillStore;
+    child.a2aContext = this.a2aContext;
+    child.skillEvolutionEnabled = this.skillEvolutionEnabled;
     this.children.add(child);
   }
 
@@ -312,6 +392,12 @@ export class ToolRouter {
     /** Replay-stable identity of this call site; sealed on the reference row. */
     ctx?: { stepIdentity?: string },
   ): Promise<string> {
+    // First, before any branch below can reach a sandbox, a server or a peer:
+    // the schemas the model was given are advice, and this is the enforcement.
+    if (this.toolAllowlist && !this.toolAllowlist.allows(name)) {
+      return refuse(outcome, toolNotAllowedMessage(name));
+    }
+
     if (LOOP_INTERCEPTED_TOOLS.has(name)) {
       throw new Error(`${name} must be handled by engine loop, not router`);
     }
@@ -354,6 +440,9 @@ export class ToolRouter {
         importance: (input.importance as number) ?? 0.7,
       });
       return "Memory saved. It will be available in future sessions.";
+    }
+    if (SKILL_WRITE_TOOLS.has(name) && !this.skillEvolutionEnabled) {
+      return refuse(outcome, "Error: saving skills is turned off in this deployment; nothing was saved.");
     }
     if (name === "save_skill") {
       const content = input.content as string || "";
@@ -406,6 +495,18 @@ export class ToolRouter {
       return `File '${filePath}' queued to remove from skill '${skillName}'.`;
     }
 
+    // Before any sandbox branch: the skill is Brain's to give, and this call must
+    // never be the reason a sandbox is opened.
+    if (name === LOAD_SKILL_TOOL && this.skillStore) {
+      const skillName = typeof input.name === "string" ? input.name : "";
+      const file = typeof input.file === "string" ? input.file : undefined;
+      const loaded = await this.skillStore.load(skillName, file, input.offset);
+      if (!loaded.ok) return refuse(outcome, loaded.error);
+      // Same rule as a read of `.skills/<name>/SKILL.md`: the skill counts as used when its SKILL.md was.
+      if (file === undefined || file === "" || file === "SKILL.md") this.skillsRead.add(skillName);
+      return loaded.text;
+    }
+
     if (!BG_SHELL_ENABLED && isBackgroundShellCall(name, input)) {
       return refuse(outcome, BG_SHELL_DISABLED_MESSAGE);
     }
@@ -443,7 +544,15 @@ export class ToolRouter {
     }
 
     if (name === "a2a_call") {
-      return handleA2ACall(input, this.bearerToken);
+      // The schema is withheld while the switch is off, but a resumed transcript can still hold a call.
+      if (!A2A_CLIENT_ENABLED) return refuse(outcome, "Error: a2a_call is disabled in this deployment");
+      return handleA2ACall(input, {
+        ...this.a2aContext,
+        signal,
+        outcome,
+        // A Stop ends the peer's task too. A restart does not: the run resumes and may still want it.
+        cancelOnAbort: (reason) => reason !== SIGTERM_ABORT_REASON && reason !== LEASE_LOST_ABORT_REASON,
+      });
     }
 
     if (name.startsWith("mcp__")) {
@@ -461,8 +570,10 @@ export class ToolRouter {
    * Field names MUST match what Hands tools expect.
    */
   getToolSchemas(): ToolSchema[] {
-    const all = this.allToolSchemas();
-    return this.memoryEnabled ? all : all.filter((t) => t.name !== "save_memory");
+    const out = this.allToolSchemas().filter((t) =>
+      (this.memoryEnabled || t.name !== "save_memory")
+      && (this.skillEvolutionEnabled || !SKILL_WRITE_TOOLS.has(t.name)));
+    return this.skillStore ? [...out, loadSkillSchema()] : out;
   }
 
   private allToolSchemas(): ToolSchema[] {
@@ -539,11 +650,11 @@ export class ToolRouter {
           }, required: ["shell_id"],
         }} as ToolSchema,
       ] : []),
-      { name: "read", description: "Read file contents with optional line range. Automatically detects .ipynb and formats notebook cells.", input_schema: {
+      { name: "read", description: "Read a file. Lines come numbered as N|text (the number is not part of the file); at most 2000 lines per call, and the end says the offset to continue from. Automatically detects .ipynb and formats notebook cells.", input_schema: {
         type: "object", properties: {
           path: { type: "string", description: "File path relative to /workspace" },
           offset: { type: "number", description: "Start line (1-based)" },
-          limit: { type: "number", description: "Number of lines to read" },
+          limit: { type: "number", description: "Number of lines to read (default 2000)" },
           notebook_cell_index: { type: "number", description: "For .ipynb files: return only this cell (0-based)" },
         }, required: ["path"],
       }},
@@ -553,11 +664,12 @@ export class ToolRouter {
           contents: { type: "string", description: "Full file content" },
         }, required: ["path", "contents"],
       }},
-      { name: "edit", description: "Replace a unique string in a file (old_string must match exactly once)", input_schema: {
+      { name: "edit", description: "Replace exact text in a file. old_string must match exactly once, unless replace_all is set (e.g. to rename a variable everywhere in the file).", input_schema: {
         type: "object", properties: {
           path: { type: "string", description: "File path relative to /workspace" },
-          old_string: { type: "string", description: "Exact text to find (must be unique)" },
+          old_string: { type: "string", description: "Exact text to find (must be unique unless replace_all); copy it without the N| prefix read adds" },
           new_string: { type: "string", description: "Replacement text" },
+          replace_all: { type: "boolean", description: "Replace every occurrence (default false)" },
         }, required: ["path", "old_string", "new_string"],
       }},
       { name: "glob", description: "Find files matching a glob pattern", input_schema: {
@@ -566,11 +678,13 @@ export class ToolRouter {
           directory: { type: "string", description: "Subdirectory to search in" },
         }, required: ["pattern"],
       }},
-      { name: "grep", description: "Search file contents with a regex pattern", input_schema: {
+      { name: "grep", description: "Search file contents with a regex pattern. Case-insensitive unless case_sensitive is set. Searches dot-directories such as .github; skips .git, node_modules and caches.", input_schema: {
         type: "object", properties: {
           pattern: { type: "string", description: "Regular expression pattern" },
           path: { type: "string", description: "File or directory to search" },
           context: { type: "number", description: "Lines of context around matches (default 2)" },
+          case_sensitive: { type: "boolean", description: "Match case exactly (default false)" },
+          glob: { type: "string", description: "Only search files matching this glob, e.g. *.ts or src/**/*.py" },
         }, required: ["pattern"],
       }},
       { name: "ls", description: "List directory contents with file types and sizes", input_schema: {
@@ -657,21 +771,25 @@ export class ToolRouter {
         },
       } as ToolSchema] : []),
 
-      { name: "a2a_call", description: "Call an external AI agent using the A2A protocol. Authentication is handled automatically — do NOT use bash/curl for A2A calls. Use when: (1) the task requires expertise from another agent, (2) user explicitly asks to involve another agent, (3) creating worker agents in an agent team. Use mode='discover' first to check capabilities. Pass metadata.plugin_id to load a specific plugin/skill on the remote agent.", input_schema: {
+      ...(A2A_CLIENT_ENABLED ? [{ name: "a2a_call", description: "Call a peer AI agent that the operator has configured, using the A2A protocol. Only configured peers can be called (never a URL), and authentication is handled for you — do NOT use bash/curl for A2A calls. Use when: (1) the task requires expertise from another agent, (2) user explicitly asks to involve another agent, (3) creating worker agents in an agent team. Use mode='discover' first to check capabilities. Pass metadata.plugin_id to load a specific plugin/skill on the remote agent. The result is JSON: {state, task_id, context_id, text, artifacts, input_required?}. state is submitted, working, input_required, auth_required, completed, failed, canceled or rejected. A call that outlasts its wait returns state=working with a task_id: read it later with mode='get'. state=input_required means the peer is asking something: input_required.text is the question; answer by calling again with the same task_id and context_id and your answer in message (or approval for an approval request). Pass context_id alone to continue the same conversation in a new task.", input_schema: {
         type: "object", properties: {
-          agent: { type: "string", description: "Agent name (from registry) or full URL" },
-          message: { type: "string", description: "The task/question to send to the remote agent" },
-          skill: { type: "string", description: "Optional: target a specific skill on the remote agent" },
-          mode: { type: "string", enum: ["stream", "fire_and_forget", "discover"], description: "stream (default): wait for full response. fire_and_forget: submit and return immediately. discover: fetch agent card only." },
-          task_id: { type: "string", description: "Optional: existing task ID for multi-turn follow-up on the same remote session" },
+          agent: { type: "string", description: "Name of a configured peer agent (not a URL); an unknown name is refused with the list of configured peers" },
+          message: { type: "string", description: "The task/question to send to the remote agent, or your answer when task_id is set. Not needed for discover, get or cancel." },
+          mode: { type: "string", enum: ["stream", "fire_and_forget", "discover", "get", "cancel"], description: "stream (default): wait for the response, up to an idle and a total limit. fire_and_forget: submit and return immediately. discover: fetch agent card only. get: read the task task_id (state and result). cancel: ask the peer to cancel task task_id." },
+          task_id: { type: "string", description: "The peer's task: required for get and cancel; with stream or fire_and_forget it answers that task when it is input_required." },
+          context_id: { type: "string", description: "Optional: the peer's conversation (from an earlier result) to continue in a new task." },
+          approval: { type: "object", description: "Answer a peer's approval request (input_required.approval). allow is held for the user's own approval before it is sent.", properties: {
+            action_id: { type: "string", description: "input_required.approval.action_id" },
+            decision: { type: "string", enum: ["allow", "deny"] },
+          }, required: ["action_id", "decision"] },
           metadata: { type: "object", description: "Optional: A2A metadata passed to the remote agent. Key fields: plugin_id (number) to load a plugin/skill, workspace_id (string) for sandbox namespace, parent_session_id (string) for agent team, team_role (string) for team role name.", properties: {
             plugin_id: { type: "number", description: "Marketplace plugin ID — the remote Brain will download and load this plugin's skill/rules/tools" },
             workspace_id: { type: "string", description: "Target K8s namespace for the remote sandbox" },
             parent_session_id: { type: "string", description: "Parent session ID to form an agent team" },
             team_role: { type: "string", description: "Role name within the agent team" },
           }},
-        }, required: ["agent", "message"],
-      }},
+        }, required: ["agent"],
+      }} as ToolSchema] : []),
       // NOTE: `upload_to_s3` is intentionally NOT exposed to the LLM. It is an
       // internal Brain↔Hands plumbing tool (used by syncWorkspaceToS3), and
       // the LLM has no S3 credentials to produce valid presigned URLs — any
@@ -697,6 +815,13 @@ export class ToolRouter {
             items: { type: "string" },
             description: "Optional: exact tool base names allowed for this sub-agent (further narrows subagent_type). Omit to use the profile defaults.",
           },
+          // Offered only where the deployment names models to choose from: an
+          // enum of nothing would be a field the model can only get wrong.
+          ...(SUB_AGENT_MODELS.length ? { model: {
+            type: "string",
+            enum: [...SUB_AGENT_MODELS, INHERIT_MODEL],
+            description: `Optional: the model this sub-agent runs on; "${INHERIT_MODEL}" runs it on your own. Omit to use the default (a lighter model for explore/readonly where one is configured, otherwise your own). Pick a lighter one for broad reading and searching, "${INHERIT_MODEL}" for work that needs judgement.`,
+          } } : {}),
         },
         required: ["description", "prompt"],
       }},

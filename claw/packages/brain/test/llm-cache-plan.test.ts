@@ -239,9 +239,21 @@ test("degenerate inputs do not throw and produce no bogus markers", () => {
   assert.equal(one.breakpoints.length, 1);
 });
 
-test("ttl is carried through to the plan", () => {
-  assert.equal(planCacheBreakpoints(conversation(2), { ttl: "5m" }).ttl, "5m");
-  assert.equal(planCacheBreakpoints(conversation(2), { ttl: "1h" }).ttl, "1h");
+test("every marker carries the run's ttl unless rolling markers are asked for 5m, and then only the anchor keeps it", () => {
+  const ttls = (opts: Parameters<typeof planCacheBreakpoints>[1]) =>
+    planCacheBreakpoints(conversation(40), opts).breakpoints.map((b) => b.ttl);
+  // [options, expected ttl per marker, front to back: the anchor first]
+  const cases: Array<[Parameters<typeof planCacheBreakpoints>[1], string[]]> = [
+    [{ ttl: "1h" }, ["1h", "1h", "1h", "1h"]],
+    [{ ttl: "5m" }, ["5m", "5m", "5m", "5m"]],
+    [{ ttl: "1h", rollingTtl: "5m" }, ["1h", "5m", "5m", "5m"]],
+    [{ ttl: "5m", rollingTtl: "5m" }, ["5m", "5m", "5m", "5m"]],
+  ];
+  for (const [opts, expected] of cases) assert.deepEqual(ttls(opts), expected, JSON.stringify(opts));
+  // The positions do not depend on the lifetimes: only the ttl of each marker changes.
+  const at = (opts: Parameters<typeof planCacheBreakpoints>[1]) =>
+    planCacheBreakpoints(conversation(40), opts).breakpoints.map(({ messageIndex, blockIndex }) => [messageIndex, blockIndex]);
+  assert.deepEqual(at({ ttl: "1h", rollingTtl: "5m" }), at({ ttl: "1h" }));
 });
 
 /** Flatten the same way the planner does, so distances are comparable. */

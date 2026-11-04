@@ -13,13 +13,13 @@
   "dependencies": {
     "@claw/protocol": "*",
     "@claw/utils": "*",
-    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "fastify": "^5.12.5",
-    "minimatch": "^10.2.6",
+    "minimatch": "^11.0.3",
     "zod": "^4.6.5"
   },
   "devDependencies": {
-    "@types/node": "^26.6.3",
+    "@types/node": "^26.6.6",
     "typescript": "^7.0.2",
     "tsx": "^4.23.15"
   }

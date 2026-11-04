@@ -803,8 +803,8 @@ test("H22 the reaper's identity check is wired through every call site", async (
   const runnerSrc = readFileSync(
     fileURLToPath(new URL("../src/tasks/runner.ts", import.meta.url)), "utf-8");
   assert.equal(
-    (runnerSrc.match(/await this\.reapOwnPendingHands\(\)/g) || []).length, 2,
-    "both failure paths go through the wrapper");
+    (runnerSrc.match(/await this\.reapOwnPendingHands\(\)/g) || []).length, 3,
+    "both failure paths, and the clean-up of a sandbox open the platform refused, go through the wrapper");
   assert.equal(
     (runnerSrc.match(/fx\(\)\.reapPendingHands\(/g) || []).length, 1,
     "and only the wrapper calls the reaper itself");

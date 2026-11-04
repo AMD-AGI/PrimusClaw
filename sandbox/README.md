@@ -95,15 +95,16 @@ kubectl -n <sandbox-namespace> create configmap <your-ca-configmap> \
 | `EXTRA_CA_REQUIRED` | main-container env, read by the script | `true`: fail when no extra anchor is found (the controller sets it). |
 | `EXTRA_CA_IMAGE_BUNDLE` | main-container env, read by the script | Path of the image-baked bundle; default `/shared/bin/extra-ca-bundle.pem`. |
 | `/etc/claw/extra-ca` | mount path | Where the ConfigMap is mounted; the script reads every file in it. |
-| `EXTRA_CA_CERT_URLS` | `docker build --build-arg` of the envd-injector image | Space-separated URLs of PEM certificates baked into `/extra-ca-bundle.pem`. Empty by default. |
+| `EXTRA_CA_CERT_URLS` | `docker build --build-arg` of the envd-injector image | Space-separated URLs of extra PEM certificates appended to `/extra-ca-bundle.pem`. The AMD root and issuing CAs in `docker/certs` are always included. |
 
 ##### How it works
 
 Both ways of starting a sandbox below use the same script from the
 envd-injector image, `/setup-extra-ca.sh`. It merges
 
-- `/shared/bin/extra-ca-bundle.pem`, the bundle baked into the injector image at
-  build time with `--build-arg EXTRA_CA_CERT_URLS=...` (empty by default), and
+- `/shared/bin/extra-ca-bundle.pem`, the bundle baked into the injector image.
+  It always contains the AMD CAs from `docker/certs`. `--build-arg EXTRA_CA_CERT_URLS=...`
+  appends more certificates, and
 - every file in `/etc/claw/extra-ca`, where you mount the ConfigMap,
 
 with the user image's system bundle into `/shared/bin/ca-bundle.pem`.

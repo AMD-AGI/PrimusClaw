@@ -17,7 +17,19 @@ import {
 import { HandsClient } from "../clients/hands.js";
 import { isSessionDeletedLocally } from "../infra/deleted-sessions.js";
 import { s3Excludes, findExcludeArgs } from "./excludes.js";
-import { planUploadDelta } from "./sync-delta.js";
+import { TRUNCATED_FOOTER, invalidateSyncManifest, planUploadDelta, seedSyncManifest } from "./sync-delta.js";
+import {
+  configuredGitLimits,
+  enforceListedGit,
+  ensureGitSkeleton,
+  gitFindArgs,
+  gitPruneExempt,
+  gitReport,
+  hasGitComponent,
+  planGit,
+  type GitLimits,
+  type GitReport,
+} from "./git-dirs.js";
 import pino from "pino";
 
 const logger = pino({ name: "s3-uploader" });
@@ -90,20 +102,6 @@ const LS_END = "__claw_ls_end__";
 const LS_END_LINE = new RegExp(`^${LS_END}:(\\d+)$`);
 
 /**
- * Hands' footer for output its ring buffer dropped, matched as a whole line.
- *
- * Written by `collectOutput` in hands/src/tools/shell/process-runner.ts on exactly
- * the condition that bytes were dropped, which makes it the one thing in this
- * output that reports truncation rather than being evidence of it.
- *
- * Matched as a whole line for the reason the trailing fence is: a filename can
- * contain anything, so a listing could print this text itself. That direction
- * is harmless -- it refuses a prune that would have been allowed, and a prune
- * refused deletes nothing.
- */
-const TRUNCATED_FOOTER = /^\[stdout truncated; \d+ bytes dropped\]$/;
-
-/**
  * The tag that lets a lifecycle rule address workspace objects at all.
  *
  * The existing rules match `imports/staging/` by prefix and two tags set by
@@ -160,6 +158,12 @@ export interface SyncWorkspaceResult {
    *  them in S3 as they are now. `uploaded + unchanged + failedCount` is
    *  `totalFiles`; absent when every file was a candidate. */
   unchanged?: number;
+  /**
+   * What the sync did about the workspace's git repositories, when it left any out
+   * or could not measure them; absent when every `.git` went up. `note` is the
+   * sentence the user is shown.
+   */
+  git?: GitReport;
 }
 
 /**
@@ -352,43 +356,67 @@ const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, m
  * that the listing is complete cannot be left behind at a call site: an
  * unfenced listing reaches here and stops here.
  *
- * @returns how many objects were removed.
+ * `exempt` is for a part of the workspace this sync did not look at, as opposed
+ * to one it looked at and found empty: the objects of a repository whose size
+ * could not be measured are not listed, and that is not the user deleting them.
+ * It spares those objects and nothing else, so one repository nobody can measure
+ * does not freeze the prune of every other file.
+ *
+ * `recorded` is the sync manifest's account of what the prefix holds, when it
+ * has one it can stand behind (`UploadDelta.recorded`). Given it, the objects to
+ * delete are named from it and the prefix is not listed: a listing costs a round
+ * trip per thousand objects and, on the MinIO this runs against, about 30 ms an
+ * object, so it was most of the time a finished turn kept its session busy.
+ *
+ * `complete` is whether the prefix is left holding nothing a later prune would
+ * have to find by listing: nothing stale deferred or failed, nothing spared for a
+ * repository that could not be measured. Only then may the next sync name its
+ * deletions from the record instead.
  */
 async function pruneRemovedObjects(
   sessionId: string,
   s3Prefix: string,
   listing: WorkspaceListing,
-): Promise<number> {
+  exempt: (rel: string) => boolean = () => false,
+  recorded: ReadonlySet<string> | null = null,
+): Promise<{ deleted: number; complete: boolean }> {
   if (!listing.trusted) {
     logger.warn(
       { sessionId, s3Prefix, reason: listing.reason, listed: listing.files.length },
       "s3.prune.skipped_untrusted_listing",
     );
-    return 0;
+    return { deleted: 0, complete: false };
   }
   const expectedKeys = new Set(listing.files.map((f) => localPathToS3Key(f, s3Prefix)));
   const client = getS3Client();
   const stale: string[] = [];
+  let spared = 0;
   let total = 0;
-  let token: string | undefined;
-  do {
-    const page = await client.send(new ListObjectsV2Command({
-      Bucket: S3_BUCKET,
-      Prefix: s3Prefix,
-      ContinuationToken: token,
-    }));
-    for (const obj of page.Contents ?? []) {
-      const key = obj.Key;
-      if (!key) continue;
-      total++;
-      if (expectedKeys.has(key)) continue;
-      if (isPruneExempt(key.slice(s3Prefix.length))) continue;
-      stale.push(key);
-    }
-    token = page.IsTruncated ? page.NextContinuationToken : undefined;
-  } while (token);
+  const consider = (key: string): void => {
+    total++;
+    if (expectedKeys.has(key)) return;
+    if (isPruneExempt(key.slice(s3Prefix.length))) return;
+    if (exempt(key.slice(s3Prefix.length))) { spared++; return; }
+    stale.push(key);
+  };
+  if (recorded) {
+    for (const rel of recorded) consider(`${s3Prefix}${rel}`);
+  } else {
+    let token: string | undefined;
+    do {
+      const page = await client.send(new ListObjectsV2Command({
+        Bucket: S3_BUCKET,
+        Prefix: s3Prefix,
+        ContinuationToken: token,
+      }));
+      for (const obj of page.Contents ?? []) {
+        if (obj.Key) consider(obj.Key);
+      }
+      token = page.IsTruncated ? page.NextContinuationToken : undefined;
+    } while (token);
+  }
 
-  if (stale.length === 0) return 0;
+  if (stale.length === 0) return { deleted: 0, complete: spared === 0 };
 
   const { doomed, deferred } = prunePlan(stale);
   if (deferred > 0) {
@@ -430,8 +458,8 @@ async function pruneRemovedObjects(
       }
     }
   }
-  logger.info({ sessionId, s3Prefix, deleted, total }, "s3.pruned");
-  return deleted;
+  logger.info({ sessionId, s3Prefix, deleted, total, listed: !recorded }, "s3.pruned");
+  return { deleted, complete: spared === 0 && deferred === 0 && deleted === stale.length };
 }
 
 /**
@@ -646,7 +674,7 @@ export async function syncWorkspaceToS3(
   hands: HandsClient,
   sessionId: string,
   userId: string,
-  options?: { s3PrefixOverride?: string },
+  options?: { s3PrefixOverride?: string; gitLimits?: GitLimits; gitProbeTimeoutSec?: number },
 ): Promise<SyncWorkspaceResult> {
   // A run being torn down still has a final flush on its way, and the delete
   // that stopped it has already listed the prefix. Landing now would re-create
@@ -672,6 +700,18 @@ export async function syncWorkspaceToS3(
     timeout: SANDBOX_PROBE_TIMEOUT_SEC,
   });
 
+  // Which git repositories are carried (workspace/git-dirs.ts). Decided before the
+  // listing because the listing is what the upload, the delta's `stat` and the
+  // prune are all derived from, so all of them have to see the same files.
+  //
+  // `gitProbeTimeoutSec` is for a caller with less time than the default allows: the
+  // SIGTERM sync, whose whole budget is smaller than one default measurement.
+  const gitLimits = options?.gitLimits ?? configuredGitLimits();
+  const measured = await planGit(
+    hands, "/workspace", s3Excludes(), gitLimits, undefined, options?.gitProbeTimeoutSec,
+  );
+  let excludeArgs = `${findExcludeArgs(s3Excludes())} ${gitFindArgs(measured)}`;
+
   // List files in workspace via Hands. The skips come from the one list in
   // workspace/excludes.ts, shared with the shared-filesystem sync -- the two
   // used to disagree about most of their contents, so restoring from S3 and
@@ -687,25 +727,44 @@ export async function syncWorkspaceToS3(
   // list of paths.
   const fileList = await hands.callTool("bash", {
     command:
-      `echo ${LS_BEGIN}; find /workspace -type f ${findExcludeArgs(s3Excludes())}`
+      `echo ${LS_BEGIN}; find /workspace -type f ${excludeArgs}`
       + ` 2>/dev/null; echo "${LS_END}:$?"`,
     timeout: FIND_TIMEOUT_SEC,
   });
   const listing = parseWorkspaceListing(fileList);
-  const files = listing.files;
+  // A listing that left a repository out because it could not measure it is still
+  // a complete listing of everything else: the `find` ran to its fence. So the
+  // delta below is as good as ever (the upload is not a full re-upload of the
+  // workspace on every turn for as long as `du` is slow), and the prune is as good
+  // as ever for everything but that repository's objects, which it must not take
+  // as deleted -- it would remove a repository's saved history for a failed `du`.
+  //
+  // The listing is also what says how many files each repository really has, which
+  // is what an upload pays for, and the agent was working between the measurement
+  // and it: see `enforceListedGit`. What that leaves out is left out of everything
+  // below, and joins the repositories the saved copy of which is kept.
+  const held = enforceListedGit(listing.files, measured, gitLimits);
+  const git = held.decision;
+  const files = held.files;
+  const report = gitReport(git, gitLimits, "/workspace");
+  const gitResult: Pick<SyncWorkspaceResult, "git"> = report ? { git: report } : {};
+  const pruneExempt = gitPruneExempt(git, "/workspace");
+  if (git !== measured) excludeArgs = `${findExcludeArgs(s3Excludes())} ${gitFindArgs(git)}`;
   if (!listing.trusted) {
     logger.warn(
-      { sessionId, s3Prefix, reason: listing.reason, listed: files.length },
+      { sessionId, s3Prefix, reason: listing.reason, listed: listing.files.length },
       "s3.sync.listing_untrusted",
     );
     // A listing that did not parse and yielded nothing is not an empty
     // workspace; see WorkspaceListingUntrusted for what reporting it as one
     // costs, and for what the failure path then does.
-    if (!files.length) {
+    if (!listing.files.length) {
       throw new WorkspaceListingUntrusted(listing.reason);
     }
   }
-  if (!files.length) {
+  // The listing's, not the upload's: a workspace whose only files are in
+  // repositories left out has nothing to upload, and is not an empty one.
+  if (!listing.files.length) {
     // A fenced, zero-exit listing with nothing in it: `find` walked /workspace
     // and there was nothing to find. The sandbox tearing down with /workspace
     // unmounted no longer reaches here -- `find` exits non-zero on a missing
@@ -713,17 +772,24 @@ export async function syncWorkspaceToS3(
     // that genuinely produced no files. Still logged, because the user will read
     // it as artifacts that went missing and the correlation is worth having.
     logger.warn({ sessionId, s3Prefix }, "s3.sync.empty_workspace");
-    return { uploaded: 0, totalFiles: 0, failedCount: 0, exhausted: false, empty: true };
+    // With what was left out, which is the reason when the only thing the workspace
+    // holds is a repository over a bound: the listing never saw it.
+    return { uploaded: 0, totalFiles: 0, failedCount: 0, exhausted: false, empty: true, ...gitResult };
   }
-  await logUploadManifestToHandsLog(hands, sessionId, s3Prefix, files);
+  if (files.length) await logUploadManifestToHandsLog(hands, sessionId, s3Prefix, files);
 
   // Only what changed since the last sync that landed, when the sandbox can say;
   // everything otherwise. `files` stays the authority for what exists, so the
   // prune below is exactly what it was. Only for a listing that proved itself: a
   // doubtful one is uploaded whole, as before, and decides nothing about what is
   // already in S3.
+  //
+  // A doubtful listing also takes the record away before anything is uploaded:
+  // the upload puts objects under the prefix the record does not name, and a
+  // later prune by that record would never delete them.
+  if (!listing.trusted) await invalidateSyncManifest(hands, s3Prefix);
   const delta = listing.trusted
-    ? await planUploadDelta(hands, s3Prefix, files, findExcludeArgs(s3Excludes()))
+    ? await planUploadDelta(hands, s3Prefix, files, excludeArgs)
     : null;
   let pending = delta ? delta.pending : files;
   const unchanged = delta?.unchanged ?? 0;
@@ -735,17 +801,20 @@ export async function syncWorkspaceToS3(
   const finishSynced = async (round: number): Promise<SyncWorkspaceResult> => {
     // Only once every file is up. A prune after a partial upload would be
     // deleting the old copy of something whose new copy did not arrive.
-    const pruned = await pruneRemovedObjects(sessionId, s3Prefix, listing)
+    const prune = await pruneRemovedObjects(sessionId, s3Prefix, listing, pruneExempt, delta?.recorded ?? null)
       .catch((e: unknown) => {
       logger.warn(
         { sessionId, err: (e as { message?: string })?.message ?? String(e) },
         "s3.prune.failed",
       );
-      return 0;
+      return { deleted: 0, complete: false };
     });
+    const pruned = prune.deleted;
     // After the prune, so a sync that dies in it leaves no manifest rather than
-    // one claiming a state S3 was not left in.
-    await delta?.commit();
+    // one claiming a state S3 was not left in. A repository left out of the
+    // upload keeps objects the record does not name, so its sync cannot vouch for
+    // the prefix either.
+    await delta?.commit(prune.complete && files.length === listing.files.length);
     logger.info(
       { sessionId, round, totalUploaded: uploaded, unchanged, total: files.length, pruned, s3Prefix },
       "s3.synced",
@@ -753,6 +822,7 @@ export async function syncWorkspaceToS3(
     return {
       uploaded, totalFiles: files.length, failedCount: 0, exhausted: false, empty: false,
       ...(delta ? { unchanged } : {}),
+      ...gitResult,
     };
   };
 
@@ -800,6 +870,7 @@ export async function syncWorkspaceToS3(
     exhausted: true,
     empty: false,
     ...(delta ? { unchanged } : {}),
+    ...gitResult,
   };
 }
 
@@ -858,9 +929,11 @@ export function isRestoreSkipped(rel: string): boolean {
 
 /** List all object keys under prefix, paginated, minus everything that belongs
  *  to another lifecycle. */
-async function listCurrentWorkspaceKeys(s3Prefix: string): Promise<string[]> {
+/** The keys to restore, and every path under the prefix a prune could delete. */
+async function listCurrentWorkspaceKeys(s3Prefix: string): Promise<{ keys: string[]; prunable: string[] }> {
   const s3 = getS3Client();
   const keys: string[] = [];
+  const prunable: string[] = [];
   let continuationToken: string | undefined;
   do {
     const resp = await s3.send(new ListObjectsV2Command({
@@ -870,12 +943,13 @@ async function listCurrentWorkspaceKeys(s3Prefix: string): Promise<string[]> {
       const k = obj.Key;
       if (!k) continue;
       const rel = k.slice(s3Prefix.length);
+      if (!isPruneExempt(rel)) prunable.push(rel);
       if (isRestoreSkipped(rel)) continue;
       keys.push(k);
     }
     continuationToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
   } while (continuationToken);
-  return keys;
+  return { keys, prunable };
 }
 
 async function buildDownloadList(keys: string[], s3Prefix: string) {
@@ -919,21 +993,33 @@ export async function syncWorkspaceFromS3(
 ): Promise<number> {
   const s3Prefix = options?.s3PrefixOverride
     ?? `users/${userId}/sessions/${sessionId}/`;
-  const keys = await listCurrentWorkspaceKeys(s3Prefix);
+  const listedAt = Date.now();
+  const { keys, prunable } = await listCurrentWorkspaceKeys(s3Prefix);
+  // Only once the workspace holds everything the listing found: then the
+  // listing is also what the next sync's prune would have to list again.
+  const seed = (): Promise<void> => seedSyncManifest(hands, s3Prefix, prunable, listedAt);
   if (!keys.length) {
     logger.info({ sessionId, s3Prefix }, "s3.restore.empty");
+    await seed();
     return 0;
   }
 
   let pending = keys;
   let downloaded = 0;
   let lastFailures: DownloadBatchResult["failed"] = [];
+  // Objects are files, so the directories a repository keeps empty did not come
+  // back; see ensureGitSkeleton. Whatever was restored is a repository the user
+  // expects to work, so this runs whether or not every file made it.
+  const putBackGitDirs = (): Promise<void> =>
+    ensureGitSkeleton(hands, "/workspace", keys.map((k) => k.slice(s3Prefix.length)));
 
   for (let round = 1; round <= MAX_UPLOAD_ROUNDS && pending.length > 0; round++) {
     const result = await downloadRound(hands, pending, s3Prefix);
     downloaded += result.ok.length;
     lastFailures = result.failed;
     if (result.failed.length === 0) {
+      await putBackGitDirs();
+      await seed();
       logger.info({ sessionId, round, totalDownloaded: downloaded, total: keys.length, s3Prefix }, "s3.restored");
       return downloaded;
     }
@@ -949,6 +1035,7 @@ export async function syncWorkspaceFromS3(
     { sessionId, downloaded, totalFailed: lastFailures.length, sample: lastFailures.slice(0, 5), s3Prefix },
     "s3.restore.exhausted",
   );
+  await putBackGitDirs();
   return downloaded;
 }
 
@@ -972,7 +1059,7 @@ export async function copyS3Prefix(
   dstPrefix: string,
 ): Promise<{ copied: number; failed: number }> {
   const s3 = getS3Client();
-  const keys = await listCurrentWorkspaceKeys(srcPrefix).catch((e: unknown) => {
+  const keys = await listCurrentWorkspaceKeys(srcPrefix).then((l) => l.keys).catch((e: unknown) => {
     logger.warn({ err: e, sessionId, srcPrefix }, "s3.recover.list_failed");
     return [] as string[];
   });
@@ -1031,7 +1118,7 @@ export async function archiveRunToS3(
   const s3Prefix = `users/${userId}/sessions/${sessionId}/`;
   const archivePrefix = `${s3Prefix}${messageId}/`;
   const s3 = getS3Client();
-  const keys = await listCurrentWorkspaceKeys(s3Prefix).catch((e) => {
+  const keys = await listCurrentWorkspaceKeys(s3Prefix).then((l) => l.keys).catch((e) => {
     logger.warn({ err: e, sessionId }, "s3.archive.list_failed");
     return [] as string[];
   });
@@ -1054,6 +1141,10 @@ export async function archiveRunToS3(
       // the upload-sweeper; duplicating them into per-message archives would
       // leave copies that outlive the user's expiration intent.
       if (rel.startsWith(".uploads/")) continue;
+      // Nor a repository's object store, which would be copied whole for every
+      // message. The live prefix is what a restore reads, and the archive is a
+      // record of what the run produced.
+      if (hasGitComponent(rel)) continue;
       const dstKey = `${archivePrefix}${rel}`;
       try {
         // CopySource encoding: AWS expects each path segment percent-encoded,

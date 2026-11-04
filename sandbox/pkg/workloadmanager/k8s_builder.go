@@ -53,8 +53,12 @@ type SandboxResult struct {
 	Namespace   string
 	PodIP       string
 	PodPort     int
-	// Kind is "Sandbox" or "SandboxClaim" — used by GC to choose deletion method.
+	// Kind is "Sandbox", "SandboxClaim", or "Workload". GC uses it to choose deletion.
 	Kind string
+	// NodeName is the node the sandbox pod landed on, when known.
+	NodeName string
+	// Cluster is the SaFE cluster id from the Workload label, when known.
+	Cluster string
 	// MaxSessionDuration is read from CodeInterpreter.spec.maxSessionDuration.
 	// WM uses this to set SandboxInfo.ExpiresAt (hard upper bound on session lifetime).
 	MaxSessionDuration time.Duration
@@ -313,6 +317,9 @@ func (c *K8sSandboxCreator) CreateSandbox(
 
 // createDirect creates a Sandbox directly from the CodeInterpreter template.
 func (c *K8sSandboxCreator) createDirect(ctx context.Context, ci *runtimev1alpha1.CodeInterpreter, sandboxName, namespace, sessionID string, user *UserIdentity, overrides *SandboxOverrides) (*SandboxResult, error) {
+	if err := validateTemplateLayers(ci.Spec); err != nil {
+		return nil, err
+	}
 	r := &CodeInterpreterReconciler{Client: c.client}
 	podTemplate := r.buildPodTemplate(ci)
 

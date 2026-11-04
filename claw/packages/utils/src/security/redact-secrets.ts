@@ -96,7 +96,18 @@ const VENDOR_TOKEN_RE = new RegExp([
 // a username meant that one was not redacted at all. The username is `*` now
 // rather than `+`; the colon and the password still have to be there, so a
 // bare `scheme://host` is untouched.
-const URL_CREDENTIALS_RE = /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/:@]*:[^\s/@]+@/g;
+//
+// The scheme begins where a run of scheme characters begins (the lookbehind), not at
+// every letter inside it. Without that, a long run of letters with no `://` after it
+// is rescanned from each of its starting positions, which is quadratic: a single line
+// of 64 KB of letters took 16 seconds and blocked the event loop for all of them.
+//
+// The one other place a scheme may begin is straight after a line's own `+` or `-`. Those are
+// scheme characters, and a patch marks every added and removed line with one, so a line that BEGINS
+// with a URL (`+postgres://app:pw@db/x`, `-git+https://u:pw@host/r.git`) would otherwise read its
+// marker as the front of the scheme and go unmasked. The allowance is one position per line (the
+// `m` flag makes `^` a line start), so it adds at most one more start per line and stays linear.
+const URL_CREDENTIALS_RE = /(?:(?<![a-zA-Z0-9+.-])|(?<=^[+-]))([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/:@]*:[^\s/@]+@/gm;
 
 /**
  * Whether a discrete configuration VALUE looks like a credential on its own.

@@ -194,6 +194,21 @@ function verifyHeaders(apiKey: string, apiStyle: LlmApiStyle): Record<string, st
   return { Authorization: `Bearer ${apiKey}` };
 }
 
+/**
+ * Where the gateway lists its models, and the headers that present `apiKey` to
+ * it. Two callers want exactly this request: BYOK verification asks whether the
+ * key is accepted, `GET /v1/models` asks what it can reach. Sharing the
+ * resolution means the second cannot drift onto a different gateway, protocol or
+ * auth header than the first, and a deployment that configured verification has
+ * already configured this.
+ *
+ * Throws AuthServiceMisconfiguredError when no gateway is configured.
+ */
+export function gatewayModelsRequest(apiKey: string): { url: string; headers: Record<string, string> } {
+  const target = resolveByokVerifyTarget();
+  return { url: target.url, headers: verifyHeaders(apiKey, target.apiStyle) };
+}
+
 async function verifyByokKeyFresh(apiKey: string, keyFingerprint: string): Promise<string> {
   const target = resolveByokVerifyTarget();
   let resp: Response;

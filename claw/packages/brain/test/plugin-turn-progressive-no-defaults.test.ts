@@ -39,7 +39,8 @@ test("flag on, no defaults file: plugin skill listed not inlined; an MCP-only tu
   const before = pw.mcpCalls.length;
   const r = await run([{ tool: "mcp__board__ping", input: {} }, { text: "done" }]);
   assert.ok(!r.prompt.includes("BOARD-BODY-MARKER"));
-  assert.match(r.prompt, /board-ops: Read the agent board +\[read \/workspace\/\.skills\/board-ops\/SKILL\.md\]/);
+  assert.match(r.prompt, /board-ops: Read the agent board\\n/);
+  assert.ok(r.prompt.includes("load_skill"), "the tool that serves the listed skill is offered");
   assert.equal(r.attached, 0);
   assert.equal(pw.mcpCalls.length, before + 1);
 });

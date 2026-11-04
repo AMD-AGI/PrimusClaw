@@ -4,6 +4,15 @@
 import type { RunTimeReport } from "./run-time.js";
 
 import type { EnvironmentTopology } from "./topology.js";
+import type { SessionRepo } from "./session-repo.js";
+
+/** The reasoning efforts every provider Brain speaks to accepts under the same name. */
+export const REASONING_EFFORTS = ["low", "medium", "high"] as const;
+export type ReasoningEffort = typeof REASONING_EFFORTS[number];
+
+export function isReasoningEffort(v: unknown): v is ReasoningEffort {
+  return typeof v === "string" && (REASONING_EFFORTS as readonly string[]).includes(v);
+}
 
 /** Conversation message for LLM API. */
 export interface Message {
@@ -334,6 +343,12 @@ export interface ExecuteRequest {
   // ── Execution mode ────────────────────────────────────────────────────
   /** Defaults to "llm" when omitted (legacy chat path). */
   mode?: TaskMode;
+  /**
+   * An app run whose task was already closed (cancelled / failed) while its run row
+   * was left in `finishing`: this dispatch only completes the finishing steps and
+   * reports with `app_finish_done`. It never reports a terminal state of its own.
+   */
+  app_finish_only?: boolean;
 
   // ── Run budget ────────────────────────────────────────────────────────
   /**
@@ -356,6 +371,16 @@ export interface ExecuteRequest {
   workspace_id?: string;
   /** SaFE platform API key for this user; Brain calls SaFE on behalf of user. */
   platform_key?: string;
+  /**
+   * This session acts as another user's GitHub account (`config.acting_as`), so its model reads text that strangers wrote. Brain keeps
+   * using the keys of this request for its own calls (the LLM gateway, SaFE) and puts none of them in the environment of the sandbox it
+   * creates: no `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or `SAFE_API_KEY`. Whatever the model runs in the sandbox, it has no key to read
+   * out. Nor is such a run given the deployment's platform defaults (`PLATFORM_DEFAULTS_FILE`: default MCP servers, which are called with
+   * the requester's key, and default skills): it has the tools its own request names, and nothing that every session of the deployment
+   * is given. It is not offered `save_memory` either (whatever `memory_enabled` says), and the API puts none of the requester's memory in
+   * its prompt and saves none from it. Absent means a session like any other, as before the field existed.
+   */
+  withhold_sandbox_keys?: boolean;
 
   // ── Legacy chat fields (Phase 4 removes; do not use in new task code) ─
   /** @deprecated Use `sandbox_spec.image`. Kept for legacy chat NATS path. */
@@ -378,13 +403,43 @@ export interface ExecuteRequest {
    * Absent means an API that predates the field: the tool stays offered.
    */
   memory_enabled?: boolean;
+  /**
+   * Whether the API keeps skills the agent saves (CLAW_SKILL_EVOLUTION_ENABLED).
+   * Anything but `true` means Brain neither offers nor runs save_skill and the
+   * *_skill_file tools: the API would drop what they write.
+   */
+  skill_evolution_enabled?: boolean;
   system_append?: string;
   rules_text?: string;
   model?: string;
+  /**
+   * How hard the model is asked to think on every LLM turn of this run, its sub-agents included (Anthropic: `output_config.effort`;
+   * OpenAI: `reasoning_effort`). Absent means the model's own default, which is what every run had before the field. The API sets it
+   * for a session that reviews a pull request on someone's behalf, when an operator set `CLAW_GITHUB_REVIEW_EFFORT`.
+   */
+  effort?: ReasoningEffort;
+  /**
+   * "5m": the rolling prompt-cache markers of this run's turns (sub-agents included) are written for five minutes, the anchor keeps
+   * Brain's `LLM_CACHE_TTL`. For a run nobody waits on between turns; absent, every marker is written at `LLM_CACHE_TTL`. The API sets it
+   * for a session that reviews a pull request on someone's behalf.
+   */
+  rolling_cache_ttl?: "5m";
+  /**
+   * The most turns a sub-agent of this run (the `task` tool) may take, a positive integer; Brain's `SUB_AGENT_MAX_TURNS` still applies
+   * when it is lower. Absent, a sub-agent is bounded as before the field. The API sets it for a session that reviews on someone's behalf.
+   */
+  sub_agent_max_turns?: number;
   max_turns?: number;
   llm_api_key?: string;
   /** Per-user environment variables snapshot at message creation time; Brain merges this into the sandbox podSpec.env after CLAW / SaFE / system env layers, validated against `isUserEnvKeyAllowed` on both ends (API write + Brain merge). */
   user_env?: Record<string, string>;
+  /**
+   * The repository this session is bound to (`config.repo` at create time).
+   * Brain makes `/workspace/<name>` a working tree of it when it opens the
+   * sandbox, before the conversation starts. Absent means no binding, and the run
+   * is exactly what it was before the field existed.
+   */
+  repo?: SessionRepo;
   /** Per-session (request-level) environment variables from the POST body; highest precedence in the sandbox env merge chain, validated against `isUserEnvKeyAllowed`. */
   session_env?: Record<string, string>;
   /** Local + marketplace skills available to this task; `files` holds optional sub-files (relative path -> content) under references/, templates/, scripts/, assets/, materialized onto the sandbox fs alongside SKILL.md. */
@@ -609,3 +664,23 @@ export interface UserInfo {
 }
 
 export type EventCallback = (payload: Record<string, unknown>) => void | Promise<void>;
+
+/**
+ * The MCP server the API adds to a turn for the model's trigger tools, and the API path it is served on. Its
+ * `requires_approval` holds those tools for the user and nothing else: Brain does not count it as an operator's
+ * approval policy, which would let HITL_ENABLED ask about every other call of the turn, turns nobody is watching
+ * included. Brain knows it by both name and path, so an operator's own server that happens to share the name
+ * still counts as a policy.
+ */
+export const TRIGGER_MCP_SERVER = "schedules";
+export const TRIGGER_MCP_PATH = "/v1/internal/trigger-mcp";
+
+/** Whether an MCP server entry is the one the API adds for the trigger tools. */
+export function isTriggerMcpServer(name: string, spec: Record<string, unknown> | undefined): boolean {
+  if (name !== TRIGGER_MCP_SERVER || typeof spec?.url !== "string") return false;
+  try {
+    return new URL(spec.url).pathname === TRIGGER_MCP_PATH;
+  } catch {
+    return false;
+  }
+}

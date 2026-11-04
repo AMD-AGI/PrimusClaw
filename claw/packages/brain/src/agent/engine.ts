@@ -5,22 +5,26 @@ import fs from "node:fs";
 import { attachOrWrap } from "./attach-error.js";
 import os from "node:os";
 import path from "node:path";
-import Anthropic from "@anthropic-ai/sdk";
 import { HandsClient } from "../clients/hands.js";
 import { ToolRouter } from "../tools/router.js";
+import { filterToolSchemas, parseToolAllowlist } from "../tools/allowlist.js";
 import { agentLoop } from "./agent-loop.js";
 import { resolveToolIds } from "../tools/resolve.js";
 import { marketplaceToolIds, pluginToolsHaveHooks, resolvePluginToolsFromMessage } from "../tasks/plugin-from-message.js";
 import { loadRules } from "./rules.js";
+import { bindRepo, renderRepoBlock } from "../workspace/repo-binding.js";
+import { repoSkillsToList } from "../workspace/repo-skills.js";
 import { normalizeMcpConfigs } from "../clients/mcp-config.js";
 import { approvalPolicyFromMcp } from "./approval-policy.js";
 import { HitlController } from "./hitl.js";
 import { bashApprovalFromEnvValue, bashApprovalPolicyFrom } from "./bash-approval.js";
 import { DecisionDispatcher } from "../delivery/decision-dispatcher.js";
-import { connectPlatformMcp } from "../clients/mcp.js";
+import { connectPlatformMcp, mcpUnavailableNote } from "../clients/mcp.js";
 import { buildPrompt, buildProgressiveSkillHint, listProgressiveSkills } from "./prompt.js";
+import { SkillStore, LOAD_SKILL_TOOL } from "./skill-store.js";
 import { loadPlatformDefaults, resolveDefaultSkills, skillDescription, LazyDefaultSkills, type DefaultSkill } from "./platform-defaults.js";
 import { metrics } from "../infra/metrics.js";
+import { createAnthropicClient } from "../llm/anthropic-provider.js";
 import { resolveRequestLlmKey } from "../llm/key-source.js";
 import {
   isSafeRelativePath,
@@ -32,11 +36,12 @@ import {
   ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY, OPENAI_BASE_URL, OPENAI_API_KEY, LLM_API_STYLE,
   DEFAULT_MODEL, MAX_TURNS,
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED,
-  BASH_APPROVAL_RULES,
-  PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED,
+  BASH_APPROVAL_RULES, ASK_USER_QUESTION_ENABLED, A2A_CLIENT_ENABLED,
+  MCP_PLATFORM_KEY_ALLOWED_HOSTS, PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED, BG_SHELL_ENABLED,
 } from "../config.js";
+import { a2aApprovalHold } from "../clients/a2a.js";
 import { WebSearchService, WebFetchService, SimpleSessionCostTracker } from "../tools/web/index.js";
-import type { ExecuteRequest, ExecuteResult, EventCallback } from "@claw/protocol";
+import { isReasoningEffort, type ExecuteRequest, type ExecuteResult, type EventCallback } from "@claw/protocol";
 import type { ExecuteExtras } from "./index.js";
 import { untheadedRunIdentity, type RunIdentity } from "../tasks/run-identity.js";
 import { HookRunner, registryHasAny } from "./hooks.js";
@@ -143,14 +148,44 @@ export class AgentEngine {
     if (platformKey) envOverrides.SAFE_API_KEY = platformKey;
     // Platform defaults sit under everything else: a request, tool or plugin
     // server of the same name wins. Unset file -> `defaults` is null and none
-    // of this runs.
-    const defaults = PLATFORM_DEFAULTS_FILE ? loadPlatformDefaults() : null;
-    const mergedMcp = normalizeMcpConfigs({
-      ...(defaults?.mcpServers || {}),
-      ...(request.mcp_servers || {}),
-      ...resolved.mcpServers,
-      ...pluginLayer.mcpServers,
-    }, envOverrides);
+    // of this runs. Only the defaults file is the operator's, so only its
+    // servers may read the environment (the names it lists); the rest are
+    // written by requesters and tool authors.
+    //
+    // A session that acts as a user (`withhold_sandbox_keys`) is given none, MCP servers and
+    // skills alike. Its model reads what strangers wrote; the default servers are authenticated
+    // with the requester's own platform key (`<SAFE_API_KEY>`), so one of their read tools is the
+    // requester's read access to the platform, put in the hands of that text, and a default skill
+    // steers the model towards it. Such a session has what its own request carries (the API puts
+    // the review tools there) and nothing that is the deployment's. This is the one place defaults
+    // enter a run, and every run of Brain comes through it, a turn, a queued turn, a task of a DAG;
+    // a sub-agent starts from the schemas of the run that made it, so it has none either. Read as
+    // truthy, not `=== true`: a mark that is not a boolean is still a mark.
+    const defaults = PLATFORM_DEFAULTS_FILE && !request.withhold_sandbox_keys ? loadPlatformDefaults() : null;
+    // Marketplace and plugin servers are third parties' at URLs nobody vetted, so the requester's
+    // platform key fills their `<SAFE_API_KEY>` only on a host the operator trusts
+    // (MCP_PLATFORM_KEY_ALLOWED_HOSTS). A request's own servers are the requester's choice of where
+    // their own key goes. A `pinned_address` is the API's record of where it vetted a request's
+    // server; one in a tool or plugin config is the author's, and would connect a trusted host name
+    // to an address of their choosing, so it is dropped.
+    const toolMcp = Object.fromEntries(
+      Object.entries({ ...resolved.mcpServers, ...pluginLayer.mcpServers }).map(([name, spec]) => {
+        if (!spec || typeof spec !== "object") return [name, spec];
+        const { pinned_address: _authorsPin, ...rest } = spec;
+        return [name, rest];
+      }),
+    );
+    const requestMcp = Object.fromEntries(
+      Object.entries(request.mcp_servers || {}).filter(([name]) => !Object.hasOwn(toolMcp, name)),
+    );
+    const defaultMcp = Object.fromEntries(
+      Object.entries(defaults?.mcpServers || {}).filter(([name]) => !Object.hasOwn(toolMcp, name) && !Object.hasOwn(requestMcp, name)),
+    );
+    const mergedMcp = {
+      ...normalizeMcpConfigs(defaultMcp, envOverrides, defaults?.mcpEnvAllow),
+      ...normalizeMcpConfigs(requestMcp, envOverrides),
+      ...normalizeMcpConfigs(toolMcp, envOverrides, undefined, MCP_PLATFORM_KEY_ALLOWED_HOSTS),
+    };
 
     const allSkills: Record<string, string> = {};
     const skillSources: Record<string, "plugin" | "local" | "marketplace"> = {};
@@ -183,6 +218,15 @@ export class AgentEngine {
         })
       : [];
 
+    // The tools the run may use at all (`tools_allowlist`), read once for everything below that asks:
+    // the prompt (is `load_skill` among them?), the router and the schemas the model is offered.
+    // No field, or an empty one, is no restriction.
+    const toolAllowlist = parseToolAllowlist(request.tools_allowlist);
+    // A run whose list leaves `load_skill` out (any list written before the tool existed) is not offered
+    // it, and the router refuses it. Its prompt must not send the model there: it gets the skill hint
+    // from before the tool, which reads SKILL.md with `read`.
+    const loadSkillAllowed = !toolAllowlist || toolAllowlist.allows(LOAD_SKILL_TOOL);
+
     // Plugin skills, staged on Brain by resolvePluginToolsFromMessage. A skill
     // the request overrode under the same name (local / marketplace) is not the
     // plugin's any more and is left to the paths that own it.
@@ -203,11 +247,34 @@ export class AgentEngine {
     // contains is one the agent cannot know to use.
     const pluginProgressive = PROGRESSIVE_SKILLS_ENABLED
       ? (() => {
-          const fits = new Set(listProgressiveSkills([...defaultProgressive, ...pluginSkills], sessionDir).listed.map((s) => s.name));
+          const fits = new Set(listProgressiveSkills([...defaultProgressive, ...pluginSkills], sessionDir, loadSkillAllowed).listed.map((s) => s.name));
           return pluginSkills.filter((s) => fits.has(s.name));
         })()
       : [];
-    const progressiveSkills = [...defaultProgressive, ...pluginProgressive];
+
+    // A session bound to a repository has it set up now: the sandbox is opened
+    // here, not left to the first tool call, because the working tree has to be
+    // there before the conversation starts and the model has to be told what it
+    // is standing in. A failure of the setup itself is not this run's failure; it
+    // comes back as a reason and goes into the prompt. A sandbox that cannot be
+    // opened at all fails the run, as it does for any other turn that needs one.
+    // No `repo` on the request, no sandbox here and no block: the turn is what it was.
+    const binding = request.repo ? await bindRepo(await sandbox(), request.repo, { signal, background: BG_SHELL_ENABLED }) : null;
+    // The repository's own skills, listed after everything else (the list's cap
+    // drops them first) and served by load_skill like the others; a name already
+    // in use belongs to whoever has it. Their staged copies live under the run's
+    // work root, which the run removes when it ends. A session that acts as a user
+    // gets none, like the platform defaults: its working tree can be a stranger's
+    // checkout, and a listed skill is one the model is told to use.
+    const repoProgressive = binding && !request.withhold_sandbox_keys && PROGRESSIVE_SKILLS_ENABLED && loadSkillAllowed && binding.skills.length
+      ? (() => {
+          const taken = new Set([...Object.keys(allSkills), ...defaultProgressive.map((s) => s.name), ...pluginSkills.map((s) => s.name)]);
+          const candidates = repoSkillsToList(binding.skills, binding.path, taken, sandbox, path.join(pluginWorkRoot, "repo-skills"), signal);
+          const fits = new Set(listProgressiveSkills([...defaultProgressive, ...pluginProgressive, ...candidates], sessionDir, loadSkillAllowed).listed.map((s) => s.name));
+          return candidates.filter((s) => fits.has(s.name));
+        })()
+      : [];
+    const progressiveSkills = [...defaultProgressive, ...pluginProgressive, ...repoProgressive];
     const listedPlugin = new Set(pluginProgressive.map((s) => s.name));
     const inlineSkills = listedPlugin.size
       ? Object.fromEntries(Object.entries(allSkills).filter(([name]) => !listedPlugin.has(name)))
@@ -219,8 +286,10 @@ export class AgentEngine {
     const lazySkillList = [...defaultProgressive, ...(pluginNeedsSandbox ? [] : pluginSkills)];
     const lazySkills = lazySkillList.length ? new LazyDefaultSkills(lazySkillList, onEvent, sessionDir) : undefined;
     if (defaultProgressive.length) {
-      metrics.onPlatformDefaultChat(buildProgressiveSkillHint(defaultProgressive, sessionDir).length);
+      metrics.onPlatformDefaultChat(buildProgressiveSkillHint(defaultProgressive, sessionDir, loadSkillAllowed).length);
     }
+
+    const repoBlock = binding ? renderRepoBlock(binding, repoProgressive.length) : "";
 
     const rules = loadRules();
     const fullPrompt = buildPrompt(
@@ -237,6 +306,8 @@ export class AgentEngine {
         teamRole: request.team_role,
       },
       progressiveSkills,
+      repoBlock,
+      loadSkillAllowed,
     );
 
     logger.info({
@@ -250,7 +321,12 @@ export class AgentEngine {
 
     const mcpResult = Object.keys(mergedMcp).length > 0
       ? await connectPlatformMcp(mergedMcp)
-      : { clients: new Map(), schemas: [], closeAll: async () => {} };
+      : { clients: new Map(), schemas: [], failed: [], closeAll: async () => {} };
+    // A server that is down is said, to the user as a progress line and to the
+    // model in the prompt, instead of its tools quietly not being there.
+    if (mcpResult.failed.length) {
+      await onEvent({ type: "statusUpdate", agentStatus: "running", event: "mcp_unavailable", servers: mcpResult.failed });
+    }
 
     // Tools a server's `requires_approval` policy holds for a person. Built
     // only when some server declares one: without a rule the loop gets no
@@ -262,14 +338,29 @@ export class AgentEngine {
       ...[...pluginLayer.bashApproval, ...resolved.bashApproval].map((value) => ({ source: "tool_config", value })),
       { source: "BASH_APPROVAL_RULES", value: bashApprovalFromEnvValue(BASH_APPROVAL_RULES) },
     ]);
-    const anyApproval = approval.active || bashPolicy.active;
-    const decisions = anyApproval && extras?.natsConnection
+    // With a2a_call on, an allow that answers a peer's approval request is held for the user
+    // (a2aApprovalHold). Nothing else changes: calls the policies do not name stay as they were.
+    // The trigger tools' hold is the platform's in the same way: it holds trigger_create and
+    // trigger_cancel, and must not make HITL_ENABLED ask about every call of a worker or doorbell
+    // turn that nobody is watching.
+    const policyActive = approval.operatorActive || bashPolicy.active;
+    const anyApproval = approval.active || policyActive || A2A_CLIENT_ENABLED;
+    // The channel decisions arrive on. Approvals need it, and so does the
+    // question tool, which waits for its answer on the same subject: a
+    // deployment that turns questions on without any approval policy gets the
+    // channel for the question alone (`hitl` below is still built only for an
+    // approval policy).
+    const decisions = (anyApproval || ASK_USER_QUESTION_ENABLED) && extras?.natsConnection
       ? new DecisionDispatcher(extras.natsConnection, sessionId)
       : null;
     const hitl = anyApproval
       ? new HitlController(decisions, onEvent, {
           requireApproval: (t) => approval.requiresApproval(t),
-          requireApprovalFor: (t, input) => (t.toLowerCase() === "bash" ? bashPolicy.check(input.command) : null),
+          autoApprovalRule: (t, input) => approval.autoApprovalRule(t, input),
+          requireApprovalFor: (t, input) =>
+            t.toLowerCase() === "bash" ? bashPolicy.check(input.command) : a2aApprovalHold(t, input),
+          // Without a policy of the operator's the controller exists only for that hold.
+          onlyHeld: !policyActive,
         })
       : undefined;
 
@@ -288,8 +379,9 @@ export class AgentEngine {
       const webApiKey = LLM_API_STYLE === "anthropic" ? apiKey : ANTHROPIC_API_KEY;
       const webToolCtx = (WEB_SEARCH_PROVIDER !== "disabled" || WEB_FETCH_ENABLED)
         ? (() => {
-            const anthropicClient = new Anthropic({
-              apiKey: webApiKey, baseURL: ANTHROPIC_BASE_URL, maxRetries: 2,
+            const anthropicClient = createAnthropicClient({
+              apiKey: webApiKey,
+              baseURL: ANTHROPIC_BASE_URL,
               defaultHeaders: webToolClientHeaders(),
             });
             const costTracker = new SimpleSessionCostTracker();
@@ -310,12 +402,26 @@ export class AgentEngine {
           ? new WebSearchService(webToolCtx) : undefined,
         webFetch: webToolCtx && WEB_FETCH_ENABLED
           ? new WebFetchService(webToolCtx) : undefined,
-        // a2a bearer: keep the platform_key fallback so safe-mode dispatch
-        // (empty llm_api_key) still authenticates sub-agent calls.
-      }, resolveRequestLlmKey(request) || request.platform_key || "", sandbox);
+      }, sandbox);
       router.lazySkillWriter = lazySkills;
-      router.memoryEnabled = request.memory_enabled !== false;
-      const allToolSchemas = [...router.getToolSchemas(), ...mcpResult.schemas];
+      // The listed skills are Brain's to hand over: `load_skill` serves them without a sandbox.
+      if (progressiveSkills.length) router.skillStore = new SkillStore(progressiveSkills, `${sessionDir}/.skills`);
+      // A session that acts as a user (`withhold_sandbox_keys`) has no `save_memory`: what its model writes into the requester's long-term
+      // memory is what a stranger's text made it write, and every later session of the requester would read it.
+      router.memoryEnabled = request.memory_enabled !== false && !request.withhold_sandbox_keys;
+      router.skillEvolutionEnabled = request.skill_evolution_enabled === true;
+      // Whom an identity-authenticated a2a_call peer is called as, and when the run's budget ends.
+      const deadlineMs = request.deadline_at ? Date.parse(request.deadline_at) : NaN;
+      router.a2aContext = {
+        userId: request.user_id || undefined,
+        sessionId: request.session_id,
+        ...(Number.isFinite(deadlineMs) ? { deadlineAtMs: deadlineMs } : {}),
+      };
+      // `tools_allowlist`: what the model is offered, and what the router will
+      // run, both read from the one parsed list. No field, or an empty one, is
+      // no restriction and leaves both exactly as they were.
+      router.setToolAllowlist(toolAllowlist);
+      const allToolSchemas = filterToolSchemas([...router.getToolSchemas(), ...mcpResult.schemas], toolAllowlist);
 
       const messages = [...(request.history || [])];
       const brainSystemParts = [rules, request.rules_text, request.system_append].filter(Boolean);
@@ -332,7 +438,8 @@ export class AgentEngine {
           messages.unshift({ role: "system" as const, content: brainSystem });
         }
       }
-      messages.push({ role: "user" as const, content: fullPrompt });
+      const unavailable = mcpUnavailableNote(mcpResult.failed);
+      messages.push({ role: "user" as const, content: unavailable ? `${fullPrompt}\n\n${unavailable}` : fullPrompt });
 
       {
         // Plugin skills of a hooks plugin — write each file from Brain local dir
@@ -442,6 +549,7 @@ export class AgentEngine {
         sessionId,
         maxTurns,
         toolSchemaCount: allToolSchemas.length,
+        toolAllowlist: toolAllowlist?.patterns,
         messageCount: messages.length,
         mcpClients: mcpResult.clients.size,
         hasHooks: !!hookRunner,
@@ -451,6 +559,10 @@ export class AgentEngine {
       try {
         loopResult = await agentLoop(messages, allToolSchemas, {
           model,
+          // A value Brain does not know is no effort at all: the gateway's defaults, never a refused turn.
+          ...(isReasoningEffort(request.effort) ? { effort: request.effort } : {}),
+          ...(request.rolling_cache_ttl === "5m" ? { rollingCacheTtl: "5m" as const } : {}),
+          ...(Number.isSafeInteger(request.sub_agent_max_turns) && request.sub_agent_max_turns! > 0 ? { subAgentMaxTurns: request.sub_agent_max_turns } : {}),
           apiUrl,
           apiKey,
           maxTurns,
@@ -463,10 +575,16 @@ export class AgentEngine {
           hands: attached,
           attachHands: sandbox,
           runIdentity,
+          toolAllowlist,
           platformMcpClients: mcpResult.clients,
           recreateHands: extras?.recreateHands,
           hooks: hookRunner,
           hitl,
+          // The question tool waits for its answer on the same channel as an
+          // approval. It was never handed over, so the tool answered "not
+          // available" whenever it was called and a question could not be asked
+          // of anyone, a web client or an A2A caller.
+          questionDispatcher: decisions ?? undefined,
           onCheckpoint: extras?.onCheckpoint,
           onCacheUse: extras?.onCacheUse,
           resumeFrom: extras?.resumeCheckpoint,

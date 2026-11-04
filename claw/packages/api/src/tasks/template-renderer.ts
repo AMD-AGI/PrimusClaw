@@ -18,6 +18,7 @@
  * verbatim. Brain MUST NOT touch ours either (they are already resolved
  * when the ExecuteRequest arrives).
  */
+import { withholdsSandboxKeys } from "../github-review/session-tools.js";
 import { db } from "../infra/db.js";
 
 const NON_NODE_ROOTS = new Set(["task", "session", "batch", "captures", "prev", "input", "user"]);
@@ -179,6 +180,12 @@ export async function buildRenderContext(taskId: string): Promise<RenderContext>
   };
   const sessionCfg = (row.session_config ?? {}) as Record<string, unknown>;
   const workspaceId = typeof sessionCfg.workspace_id === "string" ? sessionCfg.workspace_id : null;
+  // What a template can read of the task's input. Not the owner's stored variables (`user_env`, embedded by a workbench run) for a session
+  // that acts as a user, whatever the row holds (a run made before the session was marked, or by a creator that does not know): they are
+  // not sent to its sandbox, and a prompt or a script step is read by a model that reads what strangers wrote. A template that names one then
+  // fails to resolve, as for any path that is not there.
+  const input: Record<string, unknown> = { ...(row.input ?? {}) };
+  if (withholdsSandboxKeys(sessionCfg)) delete input.user_env;
 
   // Pull *every* task in the same DAG instance keyed by dag_node_id. The
   // direct-deps query previously here missed ancestors (e.g. authoring -> 
@@ -209,7 +216,7 @@ export async function buildRenderContext(taskId: string): Promise<RenderContext>
       session_id: row.session_id,
       dag_root_task_id: row.dag_root_task_id,
       dag_node_id: row.dag_node_id,
-      input: row.input ?? {},
+      input,
       metadata: row.metadata ?? {},
     },
     session: {

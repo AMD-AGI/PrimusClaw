@@ -173,12 +173,29 @@ export const TOOLS_API_URL = `${SAFE_API_URL}/claw-api/v1/tools`;
  */
 export const SANDBOX_ROUTER_URL = env("SANDBOX_ROUTER_URL", "");
 /**
+ * The workspace for a sandbox that asks for no GPU (`gpu` absent or 0), when a
+ * deployment keeps CPU-only sandboxes apart from GPU ones. Empty by default: every
+ * sandbox then goes where it always did (the request's `workspace_id`, else
+ * SANDBOX_NAMESPACE). A sandbox that asks for a GPU never goes here: it goes to
+ * SANDBOX_NAMESPACE, which is then the GPU workspace. A request that names a
+ * workspace of its own is still honoured, except that it cannot send a GPU request
+ * to this workspace. See sandbox/workspace-select.ts.
+ */
+export const SANDBOX_CPU_NAMESPACE = env("SANDBOX_CPU_NAMESPACE");
+/**
+ * The Router base(s) of the sandboxes in SANDBOX_CPU_NAMESPACE, same format as
+ * SANDBOX_ROUTER_URL. A Router answers only for the sandboxes of its own cluster, so
+ * a CPU workspace on another cluster than SANDBOX_NAMESPACE needs its own. Empty
+ * means SANDBOX_ROUTER_URL serves it too (and the CPU workspace is on the same cluster).
+ */
+export const SANDBOX_CPU_ROUTER_URL = env("SANDBOX_CPU_ROUTER_URL");
+/**
  * Reach Hands through the Router's port proxy instead of the sandbox's cluster DNS name.
  *
  * Off by default because the DNS name is the shorter path wherever it resolves, which is
  * every deployment whose sandboxes run in its own cluster. Turn it on when they run in
  * another cluster, where that name does not resolve and the Router is the only way in.
- * Has no effect without SANDBOX_ROUTER_URL.
+ * Has no effect without SANDBOX_ROUTER_URL (or, for the CPU workspace, SANDBOX_CPU_ROUTER_URL).
  *
  * Requires a Router running without `--enable-auth`. Routed Hands requests carry the
  * per-sandbox Hands token (in Authorization and X-Hands-Token), not a SaFE API key, so a
@@ -192,7 +209,8 @@ export const SANDBOX_HANDS_VIA_ROUTER = envBool("SANDBOX_HANDS_VIA_ROUTER", fals
  * defined in this file depend on it and that module imports this one.
  */
 export function handsBehindRouterProxy(): boolean {
-  return SANDBOX_HANDS_VIA_ROUTER && /[^\s,]/.test(SANDBOX_ROUTER_URL);
+  return SANDBOX_HANDS_VIA_ROUTER
+    && (/[^\s,]/.test(SANDBOX_ROUTER_URL) || /[^\s,]/.test(SANDBOX_CPU_ROUTER_URL));
 }
 /**
  * Whether the sandbox Router runs with `--enable-auth`. It decides what an
@@ -746,12 +764,9 @@ export const CHECKPOINT_WRITE_VERSION = envInt("CHECKPOINT_WRITE_VERSION", 3, {
  * has no business being able to decrypt a conversation.
  */
 export const BRAIN_CHECKPOINT_KEY = env("BRAIN_CHECKPOINT_KEY");
-// Read once, then taken out of the environment. A session owner supplies its
-// own mcp_servers config, and the MCP client expands <ENV_VAR> placeholders out
-// of process.env (clients/mcp-config.ts) -- so a key left sitting in the
-// environment is a key that can be asked for by name and shipped out as an
-// Authorization header. Nothing else reads it from process.env, and dropping it
-// here also keeps it out of every stdio MCP child process we spawn.
+// Read once, then taken out of the environment: nothing else reads it from
+// process.env, and a key that is not there cannot be named by an MCP
+// placeholder (clients/mcp-config.ts) even in a defaults file that lists it.
 delete process.env.BRAIN_CHECKPOINT_KEY;
 export const SESSION_ID = env("SESSION_ID");
 export const USER_ID = env("USER_ID", "default");
@@ -977,10 +992,33 @@ export const WORKSPACE_SYNC_NORMAL_SLOTS = envInt("WORKSPACE_SYNC_NORMAL_SLOTS",
 export const WORKSPACE_SIGTERM_PRIORITY_SLOTS = envInt("WORKSPACE_SIGTERM_PRIORITY_SLOTS", 4);
 export const WORKSPACE_RESTORE_TIMEOUT_MS = envInt("WORKSPACE_RESTORE_TIMEOUT_MS", 120_000);
 
+// A workspace snapshot carries each repository's `.git` (so unpushed commits
+// survive a sandbox that is reclaimed and rebuilt from it), unless that one
+// directory is over either bound: then it is left out whole, the user is told, and
+// the copy saved of it before is kept (workspace/git-dirs.ts). Bytes bound what Hands has to hold in memory to upload
+// a pack; files bound what each sync pays, since the upload is one PUT per file.
+// WORKSPACE_GIT_MAX_BYTES=0 stops carrying `.git` at all, the old behaviour.
+//
+// The same two bounds again across all of a workspace's repositories together
+// (WORKSPACE_GIT_TOTAL_MAX_*): a tree of dozens of small clones is within the
+// per-repository bounds one by one and still adds tens of thousands of PUTs. When
+// the sum is over, whole repositories are dropped, largest first.
+export const WORKSPACE_GIT_MAX_BYTES = envInt("WORKSPACE_GIT_MAX_BYTES", 300 * 1024 * 1024, { min: 0 });
+export const WORKSPACE_GIT_MAX_FILES = envInt("WORKSPACE_GIT_MAX_FILES", 2000, { min: 1 });
+export const WORKSPACE_GIT_TOTAL_MAX_BYTES = envInt("WORKSPACE_GIT_TOTAL_MAX_BYTES", 1024 * 1024 * 1024, { min: 1 });
+export const WORKSPACE_GIT_TOTAL_MAX_FILES = envInt("WORKSPACE_GIT_TOTAL_MAX_FILES", 10_000, { min: 1 });
+// How long the sandbox gets to measure those repositories before the sync goes on
+// without a measurement (the previous copy of each repository is then kept, not
+// dropped). Sized like the listing it sits beside, not like a liveness probe: the
+// walk is over the whole workspace. A SIGTERM sync is capped lower in git-dirs.ts,
+// because its budget (below) has no room for it.
+export const WORKSPACE_GIT_PROBE_TIMEOUT_SEC = envInt("WORKSPACE_GIT_PROBE_TIMEOUT_SEC", 60, { min: 1 });
+
 // SIGTERM-time wait budget for an in-flight workspace_sync to drain
 // before the SIGTERM catch block issues its own final writeKvCheckpoint.
 // Sized so the full SIGTERM budget breakdown (15s pending-sync drain +
-// 60s priority workspace sync + 3s event + 15s transcript ≈ 93s) fits
+// 60s priority workspace sync (its git measurement is capped at 10s of that) +
+// 3s event + 15s transcript ≈ 93s) fits
 // inside the brain-deployment.yaml terminationGracePeriodSeconds (300s).
 // See checkpoint-architecture-redesign.md §5.3.
 export const SIGTERM_PENDING_SYNC_WAIT_MS = envInt(
@@ -1060,6 +1098,42 @@ export const SANDBOX_PENDING_TIMEOUT_MS = envInt("SANDBOX_PENDING_TIMEOUT_SECOND
 // Pending. Set it above the slowest legitimate image pull for the deployment.
 // 0 waits indefinitely. Stored in ms; configured in seconds like the siblings.
 export const SANDBOX_START_TIMEOUT_MS = envInt("SANDBOX_START_TIMEOUT_SECONDS", 15 * 60) * 1000;
+
+// Maximum duration a sandbox the platform has ADMITTED may sit with nothing having
+// taken its pod -- no node has acknowledged it -- and no node being added for it,
+// before the message fails terminally with reason `sandbox_unschedulable`, the
+// workload is stopped, and the model is told to report it rather than open
+// another. That is what a sandbox that no node will run looks like (every node
+// cordoned, down or tainted for other workloads): waiting longer does not change
+// it, and the user is otherwise left on a progress bar for the whole of the start
+// ceiling above (15 minutes by default, 3 hours if the platform still reports it
+// Pending), twice over if the model retries.
+//
+// The platform writes a message on every pod it could not place ("0/7 nodes are
+// available ...", "pod didn't trigger scale-up ..."). That message says why the
+// pod is stuck; it is not progress, so it does not exempt the wait. Progress is a
+// scale-up the platform reports as triggered (`TriggeredScaleUp`), or a message
+// that changes: either restarts the clock. The platform keeps only its newest
+// scheduling event on the workload and the scheduler repeats its own after the
+// autoscaler's one, so a scale-up that was reported stays in force through the
+// scheduler's account that follows it, and ends only when the autoscaler says it
+// will not add a node (`NotTriggerScaleUp`), the platform withdraws its message
+// or a pod is taken.
+//
+// Counted from the first read that shows the pod untaken and cleared the moment
+// anything takes it, so it measures an absence of progress and never the time a
+// healthy start (image pull, container boot) takes; that keeps its own, longer
+// ceiling above. It does NOT cover a workload still in the platform's queue (a
+// queue moves, and for a GPU sandbox can be hours), nor an admitted one with a
+// node being added (which can take longer than this): those keep the ceilings of
+// their phase, SANDBOX_PENDING_TIMEOUT_SECONDS while Pending and
+// SANDBOX_START_TIMEOUT_SECONDS once the platform reports it NotReady, and the
+// user is told why they are waiting. A cluster whose nodes scale up without the
+// platform saying so should raise this or set 0. Applies to the sandbox a run
+// opens, not to hosted applications or multi-node clusters.
+// Stored in ms; configured in seconds like the siblings. Default 5 minutes. 0
+// disables it (the previous behaviour: only the ceilings above end the wait).
+export const SANDBOX_UNSCHEDULABLE_TIMEOUT_MS = envInt("SANDBOX_UNSCHEDULABLE_TIMEOUT_SECONDS", 5 * 60) * 1000;
 
 // The same ceiling for a multi-node GPU cluster, off by default. A cluster's
 // start is routinely longer than a single sandbox's -- large GPU images, and an
@@ -1265,8 +1339,20 @@ export const MULTI_NODE_SWEEPER_INTERVAL_MS = envInt(
 // SUB_AGENT_MAX_TURNS: upper bound on turns inside a sub-agent. 0 disables
 // the `task` tool entirely (sub-agents unavailable).
 export const SUB_AGENT_MAX_TURNS = envInt("SUB_AGENT_MAX_TURNS", 0);
-export const SUB_AGENT_MAX_CONCURRENT = envInt("SUB_AGENT_MAX_CONCURRENT", 2);
+export const SUB_AGENT_MAX_CONCURRENT = envInt("SUB_AGENT_MAX_CONCURRENT", 4, { min: 1, max: 16 });
 export const SUB_AGENT_MAX_DEPTH = envInt("SUB_AGENT_MAX_DEPTH", 1);
+// SUB_AGENT_MODELS: the models a `task` call may name for its sub-agent, besides
+// the run's own (comma-separated; empty: a sub-agent always runs on the run's
+// model, and `task` offers no choice). SUB_AGENT_EXPLORE_MODEL: what an
+// `explore` or `readonly` sub-agent runs on when the call names none -- a
+// cheaper model for reading and searching; empty: the run's model. It is one of
+// SUB_AGENT_MODELS by construction (added to the list when absent), so the
+// default is never a model the call itself could not have named.
+export const SUB_AGENT_EXPLORE_MODEL = env("SUB_AGENT_EXPLORE_MODEL").trim();
+export const SUB_AGENT_MODELS: ReadonlyArray<string> = [...new Set([
+  ...env("SUB_AGENT_MODELS").split(",").map((m) => m.trim()).filter(Boolean),
+  ...(SUB_AGENT_EXPLORE_MODEL ? [SUB_AGENT_EXPLORE_MODEL] : []),
+])];
 // Block sub-agent dispatches whose prompt is dominated by skill-file reads.
 // The dispatch is rejected with an error message instructing the agent to
 // use the direct `read` tool. Mitigates a recurring pattern where Opus
@@ -1405,7 +1491,7 @@ export const LLM_CACHE_TTL: PromptCacheTtl = resolvePromptCacheTtl();
  *
  * An allowlist rather than a header name baked in, because the header that
  * identifies a backend is a property of the deployment, not of Claw: it is
- * `x-litellm-model-id` behind one proxy, an Azure APIM request id behind
+ * `x-litellm-model-id` behind one proxy, a gateway request id behind
  * another, a plain `request-id` when talking to the provider directly.
  *
  * An allowlist rather than capturing everything, because response headers carry
@@ -1587,6 +1673,12 @@ export const WEB_SEARCH_MAX_USES = envInt("WEB_SEARCH_MAX_USES", 8);
 export const TAVILY_API_KEY = env("TAVILY_API_KEY");
 export const BRAVE_API_KEY = env("BRAVE_API_KEY");
 export const SERPER_API_KEY = env("SERPER_API_KEY");
+// The search key is the Brain's alone: read once and taken out of the
+// environment for the reason BRAIN_CHECKPOINT_KEY is, so no `<NAME>`
+// placeholder in an MCP config can expand it and no child process inherits it.
+delete process.env.TAVILY_API_KEY;
+delete process.env.BRAVE_API_KEY;
+delete process.env.SERPER_API_KEY;
 export const WEB_SEARCH_MODEL = env("WEB_SEARCH_MODEL", "");
 export const WEB_SEARCH_FORCE_TOOL = envBool("WEB_SEARCH_FORCE_TOOL", true);
 export const WEB_SEARCH_DOMAIN_DENYLIST = env("WEB_SEARCH_DOMAIN_DENYLIST", "");
@@ -1626,8 +1718,25 @@ export const EXIT_PLAN_MODE_ENABLED = envBool("EXIT_PLAN_MODE_ENABLED", true);
 export const ASK_USER_QUESTION_ENABLED = envBool("ASK_USER_QUESTION_ENABLED", false);
 export const ASK_USER_QUESTION_TIMEOUT_MS = envInt("ASK_USER_QUESTION_TIMEOUT_MS", 600_000);
 
+// --- A2A client (the a2a_call tool) ---
+// Off by default: the tool is not offered to the model and a call is refused. The peers it may
+// reach are the operator's A2A_AGENTS (clients/a2a.ts); this switch is the operator's decision that
+// this deployment calls other agents at all.
+export const A2A_CLIENT_ENABLED = envBool("A2A_CLIENT_ENABLED", false);
+// A streamed call gives up waiting (without failing the peer's task) after this long with no event,
+// and after A2A_STREAM_MAX_MS in all, or when the run's own budget is nearly spent, whichever is first.
+export const A2A_STREAM_IDLE_TIMEOUT_MS = envInt("A2A_STREAM_IDLE_TIMEOUT_MS", 120_000, { min: 1_000, max: 3_600_000 });
+export const A2A_STREAM_MAX_MS = envInt("A2A_STREAM_MAX_MS", 600_000, { min: 1_000, max: 7_200_000 });
+
 // --- Background Shell ---
 export const BG_SHELL_ENABLED = envBool("BG_SHELL_ENABLED", false);
+/**
+ * Background work that finishes in an idle sandbox (no turn running) wakes the
+ * session: the keepalive sweep, which already watches that sandbox's jobs, asks
+ * the API for a turn that reports the result (api sessions/wake.ts). Off by
+ * default: each wake is a model turn the user did not send.
+ */
+export const BACKGROUND_WORK_WAKE_ENABLED = envBool("BACKGROUND_WORK_WAKE_ENABLED", false);
 
 /**
  * The foreground command ceiling, for describing the bash tool to the model.
@@ -1744,7 +1853,7 @@ export const WAIT_DEFAULT_SEC = envInt("WAIT_DEFAULT_SEC", 100, { min: 1 });
 
 // --- HITL ---
 export const HITL_ENABLED = envBool("HITL_ENABLED", false);
-export const HITL_AUTO_ALLOW = env("HITL_AUTO_ALLOW", "read,glob,grep,ls,todo_write,web_search,save_memory");
+export const HITL_AUTO_ALLOW = env("HITL_AUTO_ALLOW", "read,glob,grep,ls,load_skill,todo_write,web_search,save_memory");
 export const HITL_DECISION_TIMEOUT_MS = envInt("HITL_DECISION_TIMEOUT_MS", 300_000);
 export const HITL_DECISION_DEFAULT = env("HITL_DECISION_DEFAULT", "allow");
 /**
@@ -1779,6 +1888,12 @@ export const RULES_DIR = env("RULES_DIR", "/app/rules");
 // JSON ({"skills":[{"tool_id":N,"name"?:"x"}],"mcp_servers":{...}}); unset or
 // unreadable means the feature is off and chats are built exactly as before.
 export const PLATFORM_DEFAULTS_FILE = env("PLATFORM_DEFAULTS_FILE");
+// Comma-separated hosts a marketplace tool's or a plugin's MCP server must name
+// for its `<SAFE_API_KEY>` to expand to the caller's platform key. Those servers
+// are written by third parties at any URL; anywhere else the key expands to "".
+export const MCP_PLATFORM_KEY_ALLOWED_HOSTS: ReadonlySet<string> = new Set(
+  env("MCP_PLATFORM_KEY_ALLOWED_HOSTS").split(",").map((h) => h.trim().toLowerCase()).filter(Boolean),
+);
 // Whether the file's `skills` apply. Off: only its MCP servers are mounted.
 export const PROGRESSIVE_SKILLS_ENABLED = envBool("PROGRESSIVE_SKILLS_ENABLED", false);
 // Budget for the downloaded skill files (plugin skills and marketplace tool_ids

@@ -81,7 +81,7 @@ function rejection(outcome: CredentialOutcome): { status: number; legacyError: s
   return { status, legacyError };
 }
 
-test("path order is cookie, query token, bearer, x-api-key", () => {
+test("path order is cookie, query token, bearer, identity token, x-api-key", () => {
   // Cookie must stay first: if a header path ran first, a request carrying a
   // stale cookie *and* a valid key would authenticate instead of being
   // rejected on the cookie.
@@ -89,6 +89,7 @@ test("path order is cookie, query token, bearer, x-api-key", () => {
     "verifySessionCookie",
     "verifyDownloadQueryToken",
     "verifyBearerApiKey",
+    "verifyIdentityAccessToken",
     "verifyXApiKeyHeader",
   ]);
 });

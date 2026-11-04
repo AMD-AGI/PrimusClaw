@@ -26,6 +26,7 @@ test("memory on (default): save_memory is offered and reports success", async ()
 test("memory off: save_memory is not offered", () => {
   const router = new ToolRouter(null);
   router.memoryEnabled = false;
+  router.skillEvolutionEnabled = true;
   assert.ok(!router.getToolSchemas().some((t) => t.name === "save_memory"));
   // the other tools are untouched
   assert.ok(router.getToolSchemas().some((t) => t.name === "save_skill"));

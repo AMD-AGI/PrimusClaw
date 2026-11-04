@@ -83,7 +83,7 @@ func TestExtraCAUndeclaredLeavesPodUnchanged(t *testing.T) {
 		t.Fatalf("injector command changed with no extra CA declared:\n%s", got)
 	}
 	main := pt.Spec.Containers[0]
-	if want := pathSetupScript() + buildStartupScript(ci.Spec.Template.Steps, "/home/sandbox"); main.Args[0] != want {
+	if want := pathSetupScript() + buildStartupScript(ci.Spec.Template.Steps, "/app/work"); main.Args[0] != want {
 		t.Fatalf("startup script changed with no extra CA declared:\n got %q\nwant %q", main.Args[0], want)
 	}
 	for _, v := range pt.Spec.Volumes {

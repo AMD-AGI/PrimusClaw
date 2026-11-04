@@ -114,6 +114,31 @@ export function resolveCorsOrigin(raw: string | undefined): string[] | false {
   return origins.length > 0 ? origins : false;
 }
 export const SAFE_API_URL = env("SAFE_API_URL");
+/**
+ * The SaFE workspace a sandbox starts in when a request names none. Brain reads the
+ * same variable for the same purpose; the API reads it to name that workspace in
+ * `GET /v1/me`, because the console sends whatever `sandbox.defaultWorkspaceId` says
+ * with every turn and so overrides Brain's own default. Empty when not configured.
+ */
+export const SANDBOX_NAMESPACE = env("SANDBOX_NAMESPACE");
+/**
+ * The workspace for sandboxes that ask for no GPU, when a deployment has a separate one
+ * (Brain's SANDBOX_CPU_NAMESPACE; see the Brain config for the rule). Then the workspace
+ * sandboxes start in is this one, not SANDBOX_NAMESPACE, which becomes the GPU workspace:
+ * `GET /v1/me` names this as the default, and Brain's own default is chosen per sandbox.
+ * Empty when not configured.
+ */
+export const SANDBOX_CPU_NAMESPACE = env("SANDBOX_CPU_NAMESPACE");
+/**
+ * Management API of the Agent Sandbox control plane that `GET /v1/admin/sandbox/*`
+ * lists for the console. Not SANDBOX_ROUTER_URL: that names the Router Brain
+ * creates sandboxes through, which may sit in another cluster and expose only the
+ * data plane. The default is the in-cluster Service the sandbox chart creates.
+ */
+export const SANDBOX_ADMIN_URL = env(
+  "SANDBOX_ADMIN_URL",
+  "http://agent-sandbox-router.agent-sandbox-system.svc.cluster.local:8080",
+);
 
 // --- Deploy mode ---
 // "safe": existing SaFE deployment (SaFE auth). "kubernetes": standalone BYOK (no SaFE auth).
@@ -217,6 +242,32 @@ export const SESSION_SANDBOX_HOLD_MS = Math.min(
   envInt("SESSION_SANDBOX_HOLD_SECONDS", 300, { min: 30 }) * 1000,
   BRAIN_REGISTRY_TTL_MS,
 );
+
+// --- The browser terminal ---
+// `GET /v1/sessions/:id/terminal/ws` is a WebSocket proxy to the sandbox's shell,
+// so every open terminal holds two sockets and a pod's pty for as long as it
+// lives. These bound that per replica. A limit that is slightly loose across
+// replicas still bounds the cost, which is all they are for.
+//
+// Connections: at most this many terminals open on one replica, in total and
+// for one user. Past either, the upgrade is refused with 429.
+export const TERMINAL_MAX_CONNECTIONS = envInt("TERMINAL_MAX_CONNECTIONS", 200, { min: 1, max: 100_000 });
+export const TERMINAL_MAX_CONNECTIONS_PER_USER = envInt("TERMINAL_MAX_CONNECTIONS_PER_USER", 5, { min: 1, max: 1000 });
+// A terminal with no input and no output in either direction for this long is
+// closed. Pings do not count: they only prove the sockets are alive. Output does,
+// so someone watching `top` is not cut off; a forgotten tab on `tail -f` is the
+// lifetime's to end, below.
+export const TERMINAL_IDLE_TIMEOUT_SECONDS = envInt("TERMINAL_IDLE_TIMEOUT_SECONDS", 900, { min: 10, max: 86_400 });
+// No terminal stays open longer than this, whatever is going on in it: traffic
+// does not extend it, which is what makes it a bound where the idle timeout
+// above is not (output that never stops keeps a terminal from ever being idle).
+// The shell holds the user's SaFE key, and nothing tells it that the key was
+// revoked or the session deleted; the browser reconnects with a new ticket.
+// There is no way to turn this off: 0, or anything outside 60 seconds to 7 days
+// (604800), is refused -- the default applies, and start-up reports the setting
+// as refused like any other -- because a switch that makes the shell open for as
+// long as the browser likes is the thing this exists to prevent.
+export const TERMINAL_MAX_LIFETIME_SECONDS = envInt("TERMINAL_MAX_LIFETIME_SECONDS", 28_800, { min: 60, max: 604_800 });
 
 // --- How long an idle sandbox stays reusable ---
 // Brain's setting, read here under the same name and default because the orphan
@@ -398,16 +449,67 @@ export const CLAW_MEMORY_ENABLED = envBool("CLAW_MEMORY_ENABLED", false);
 // recording, evolve worker, and skill-files cleanup are all short-circuited.
 export const CLAW_SKILL_EVOLUTION_ENABLED = envBool("CLAW_SKILL_EVOLUTION_ENABLED", false);
 
+// When true: every turn that does the user's work (not an assistant Router turn) carries the
+// general working guideline (sessions/agent-guideline.ts) in its system message.
+export const CLAW_AGENT_GUIDELINE_ENABLED = envBool("CLAW_AGENT_GUIDELINE_ENABLED", false);
+
 // --- Outbound notifications (default OFF) ---
 // When false: no notification tables, routes, outbox writes or delivery loop.
 export const CLAW_NOTIFICATIONS_ENABLED = envBool("CLAW_NOTIFICATIONS_ENABLED", false);
 // Comma-separated hosts a subscription may name even though they resolve to a
 // private address (an in-cluster receiver). The only hosts where http is accepted.
 export const NOTIFY_WEBHOOK_ALLOWED_HOSTS = env("NOTIFY_WEBHOOK_ALLOWED_HOSTS");
+// Comma-separated hosts an MCP server in a request's `mcp_servers` may name
+// even though they resolve to a private address. The only hosts where http is
+// accepted.
+export const MCP_SERVER_ALLOWED_HOSTS = env("MCP_SERVER_ALLOWED_HOSTS");
 // A run that is not trigger-started is announced only once it ran this long.
 export const NOTIFY_MIN_RUN_SECONDS = envInt("NOTIFY_MIN_RUN_SECONDS", 60);
 // Prefix of the `link` field in a notification, relative to the web UI origin.
 export const NOTIFY_LINK_BASE = env("NOTIFY_LINK_BASE", "/primus-claw");
+// The most `say` messages one user's assistant may send in an hour. A guard against a
+// looping assistant, not a quota: a person is not meant to meet it.
+export const CLAW_ASSISTANT_SAY_MAX_PER_HOUR = envInt("CLAW_ASSISTANT_SAY_MAX_PER_HOUR", 120, { min: 1 });
+
+// --- Assistant (default OFF) ---
+// When false: no assistant tables and no routes, as if the feature did not exist.
+// One switch for every user: Claw has no per-user allow-list for it.
+export const CLAW_ASSISTANT_ENABLED = envBool("CLAW_ASSISTANT_ENABLED", false);
+// The model a user's router session asks for. Blank is the deployment default.
+export const CLAW_ASSISTANT_ROUTER_MODEL = env("CLAW_ASSISTANT_ROUTER_MODEL");
+// Work items one user may have unfinished (not on the done board) at once.
+export const CLAW_ASSISTANT_MAX_ACTIVE_ITEMS = envInt("CLAW_ASSISTANT_MAX_ACTIVE_ITEMS", 20, { min: 1 });
+
+// --- Remote agents (default OFF) ---
+// When false: no remote-agent tables, no routes, and nothing polls. A connector
+// on a user's machine dials out to these routes; see docs/remote-agents.md.
+export const CLAW_REMOTE_AGENTS_ENABLED = envBool("CLAW_REMOTE_AGENTS_ENABLED", false);
+// Days a closed remote-agent session, with its stored events, is kept. Zero or
+// less keeps them for ever. The audit trail is not touched by this.
+export const CLAW_REMOTE_AGENTS_RETENTION_DAYS = envInt("CLAW_REMOTE_AGENTS_RETENTION_DAYS", 30);
+
+// --- GitHub pull request review (default OFF) ---
+// When false: no tables, no routes, no MCP server offered to a session, and a session
+// that asks for `config.acting_as` is refused. See docs/github-review.md.
+export const CLAW_GITHUB_REVIEW_ENABLED = envBool("CLAW_GITHUB_REVIEW_ENABLED", false);
+
+/**
+ * How a connector's access token is checked (see auth/connector-token.ts). Read
+ * on each use rather than once, so what a request is judged by is what the
+ * environment says now; both only matter while remote agents and the identity
+ * client are on.
+ *
+ *   CLAW_CONNECTOR_TOKEN_AUDIENCE    the `aud` the token must name, default claw-api
+ *   CLAW_CONNECTOR_TOKEN_INTROSPECT  also ask the identity provider whether the
+ *                                    token is still active, so a revoked grant
+ *                                    stops at once instead of when the token expires
+ */
+export function connectorTokenSettings(): { audience: string; introspect: boolean } {
+  return {
+    audience: env("CLAW_CONNECTOR_TOKEN_AUDIENCE", "claw-api"),
+    introspect: envBool("CLAW_CONNECTOR_TOKEN_INTROSPECT", false),
+  };
+}
 
 /**
  * Scheduled triggers: a cron schedule that starts a run as the user who created
@@ -427,6 +529,13 @@ export const TRIGGER_RUN_TIME_LIMIT_SECONDS = envInt("TRIGGER_RUN_TIME_LIMIT_SEC
 export const TRIGGER_STALE_AFTER_SECONDS = envInt("TRIGGER_STALE_AFTER_SECONDS", 900, { min: 1 });
 /** Consecutive failed starts before a trigger pauses itself. */
 export const TRIGGER_MAX_CONSECUTIVE_FAILURES = envInt("TRIGGER_MAX_CONSECUTIVE_FAILURES", 3, { min: 1 });
+/**
+ * The model's own trigger tools (`trigger_create`, `trigger_list`, `trigger_cancel`), served by this API as an
+ * MCP service and offered to every turn but a trigger's own runs. Needs CLAW_TRIGGERS_ENABLED. Off by default.
+ */
+export const CLAW_TRIGGER_TOOLS_ENABLED = envBool("CLAW_TRIGGER_TOOLS_ENABLED", false);
+/** HMAC key of the bearer a turn presents to the trigger tools; at least 32 characters when they are on. */
+export const CLAW_TRIGGER_TOOLS_TOKEN_KEY = env("CLAW_TRIGGER_TOOLS_TOKEN_KEY");
 
 /**
  * Accept `mode: "app"` on `POST /v1/sessions/:sessionId/tasks`. Off by default:
@@ -612,3 +721,18 @@ export function assertAdmissionSettings(
 // Bad cases get more attention since they drive the change; good cases serve as a baseline.
 export const EVOLVE_EVIDENCE_GOOD_COUNT = Number(env("EVOLVE_EVIDENCE_GOOD_COUNT", "3"));
 export const EVOLVE_EVIDENCE_BAD_COUNT = Number(env("EVOLVE_EVIDENCE_BAD_COUNT", "4"));
+
+// --- Assistant: router and worker turns (the switch itself is CLAW_ASSISTANT_ENABLED) ---
+// HMAC key of the bearer a router or worker turn presents to the assistant MCP service.
+// Required, 32 characters at least, whenever the assistant is on: a deployment without
+// it refuses to start rather than mint turns nobody can authenticate.
+export const CLAW_ASSISTANT_TOKEN_KEY = env("CLAW_ASSISTANT_TOKEN_KEY");
+// The model a work item's worker turns ask for. Blank is the worker session's own choice.
+export const CLAW_ASSISTANT_WORKER_MODEL = env("CLAW_ASSISTANT_WORKER_MODEL");
+// LLM calls a router turn may make. A router only classifies, calls a tool and says one line.
+export const CLAW_ASSISTANT_ROUTER_MAX_TURNS = envInt("CLAW_ASSISTANT_ROUTER_MAX_TURNS", 8, { min: 1 });
+// How long an item may need the user with nobody having told them before the system tells them.
+export const CLAW_ASSISTANT_SILENT_SWEEP_SEC = envInt("CLAW_ASSISTANT_SILENT_SWEEP_SEC", 300, { min: 1 });
+// The address Brain reaches this API at; the assistant MCP service is served under it.
+export const INTERNAL_BACKEND_URL =
+  process.env.INTERNAL_BACKEND_URL || `http://127.0.0.1:${process.env.API_PORT || "8200"}`;

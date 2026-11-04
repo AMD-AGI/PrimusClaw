@@ -144,3 +144,18 @@ test("a fingerprint from an earlier format is reused, not torn down", () => {
   assert.equal(verdict.reuse, true);
   assert.equal(verdict.reason, "spec_format_changed");
 });
+
+test("a sandbox built without the caller's keys is not the one built with them, and no fingerprint stored before the field is disturbed", () => {
+  // The values are what this function answered before `withholdKeys` existed: every live sandbox has one of them recorded, and the first
+  // Brain that carries this code must read them as the same request, not tear the fleet down over a field none of them has.
+  assert.equal(sandboxSpecFingerprint(base), "3:2f1d65b2e54b7cac");
+  assert.equal(
+    sandboxSpecFingerprint({ ...base, timeout: 28_800, ttlSec: 600, labels: { a: "b" }, namespace: "ns", llmKey: "sk-test" }),
+    "3:306b3a28af40d2ad",
+  );
+  assert.equal(sandboxSpecFingerprint({ ...base, withholdKeys: false }), sandboxSpecFingerprint(base), "false is the field being absent");
+  const withheld = sandboxSpecFingerprint({ ...base, withholdKeys: true });
+  assert.notEqual(withheld, sandboxSpecFingerprint(base), "a sandbox that holds the keys is not reused for a request that is not to have them");
+  assert.equal(evaluateReuse(sandboxSpecFingerprint(base), withheld).reuse, false);
+  assert.equal(evaluateReuse(withheld, withheld).reuse, true);
+});

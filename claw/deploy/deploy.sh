@@ -59,6 +59,9 @@ PG_SSL_NO_VERIFY="${PG_SSL_NO_VERIFY:-false}"
 # Private-CA trust for api and brain: see tls.extraCACertsConfigMap in the chart.
 EXTRA_CA_CERTS_CONFIGMAP="${EXTRA_CA_CERTS_CONFIGMAP:-}"
 EXTRA_CA_CERTS_KEY="${EXTRA_CA_CERTS_KEY:-ca.crt}"
+# Mount Secret primus-claw-grant-signing-key into api and send grants to the sandbox Router:
+# see grantSigningKey in the chart.
+GRANT_SIGNING_KEY_ENABLED="${GRANT_SIGNING_KEY_ENABLED:-false}"
 PG_WAIT_TIMEOUT="${PG_WAIT_TIMEOUT:-600}"
 PGO_RELEASE="${PGO_RELEASE:-primus-pgo}"
 NATS_RELEASE="${NATS_RELEASE:-primus-claw-nats}"
@@ -474,7 +477,7 @@ export NATS_PASSWORD_API NATS_PASSWORD_BRAIN NATS_PASSWORD_REAPER NATS_PASSWORD_
 export CHECKPOINT_WRITE_VERSION
 export S3_ENDPOINT S3_API_ENDPOINT S3_ACCESS_KEY S3_SECRET_KEY
 export CLAW_DEPLOY_MODE PG_CLUSTER PG_APP_USER PG_APP_DB PG_USER_SECRET PG_SSL_NO_VERIFY
-export EXTRA_CA_CERTS_CONFIGMAP EXTRA_CA_CERTS_KEY
+export EXTRA_CA_CERTS_CONFIGMAP EXTRA_CA_CERTS_KEY GRANT_SIGNING_KEY_ENABLED
 export SANDBOX_NAMESPACE SANDBOX_WORKLOAD_NAMESPACE SANDBOX_ROUTER_URL SANDBOX_HANDS_VIA_ROUTER SANDBOX_ROUTER_AUTH_ENABLED
 export WORKSPACE_PERSIST_BASE LITELLM_API_BASE
 export SAFE_DEFAULT_WORKSPACE
@@ -565,6 +568,9 @@ values = {
         "extraCACertsConfigMap": env("EXTRA_CA_CERTS_CONFIGMAP", ""),
         "extraCACertsKey": env("EXTRA_CA_CERTS_KEY", "") or "ca.crt",
     },
+    "grantSigningKey": {
+        "enabled": env("GRANT_SIGNING_KEY_ENABLED", "false").lower() == "true",
+    },
     "ingress": {
         "enabled": True,
         # Higress is what this repo's reference cluster runs, not a
@@ -617,6 +623,7 @@ values = {
         "sandboxDefaultTimeoutSeconds": env("SANDBOX_DEFAULT_TIMEOUT_SECONDS", "86400"),
         "sandboxPendingTimeoutSeconds": env("SANDBOX_PENDING_TIMEOUT_SECONDS", "10800"),
         "sandboxStartTimeoutSeconds": env("SANDBOX_START_TIMEOUT_SECONDS", "900"),
+        "sandboxUnschedulableTimeoutSeconds": env("SANDBOX_UNSCHEDULABLE_TIMEOUT_SECONDS", "300"),
         "multiNodeStartTimeoutSeconds": env("MULTI_NODE_START_TIMEOUT_SECONDS", "0"),
         "sandboxIdleReuseSeconds": env("SANDBOX_IDLE_REUSE_SECONDS", "900"),
         "multiNodeDefaultTimeoutSeconds": env(
@@ -721,11 +728,26 @@ with open(sys.argv[1], "w", encoding="utf-8") as f:
     json.dump(values, f, indent=2)
 PY
 
-# EXTRA_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* (see values.example.env), as a second
-# values file so a fresh deploy carries what upgrade.sh's render carries.
+# EXTRA_ENV_* / EXTRA_SECRET_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* / EXTRA_SECRET_MOUNTS_* (see values.example.env),
+# as a second values file so a fresh deploy carries what upgrade.sh's render carries.
 CLAW_EXTRA_VALUES_FILE="$WORK_DIR/claw-extra-values.json"
 python3 "$SCRIPT_DIR/extra-values.py" > "$CLAW_EXTRA_VALUES_FILE" \
-  || fail "EXTRA_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* in $_VALUES_FILE are malformed (see above)."
+  || fail "EXTRA_ENV_* / EXTRA_SECRET_ENV_* / EXTRA_CONFIGMAP_MOUNTS_* / EXTRA_SECRET_MOUNTS_* in $_VALUES_FILE are malformed or collide (see above)."
+
+# A Secret env name the chart renders into the container as well is only visible
+# in the render, so render both Deployments the way the install below will and
+# stop before it installs anything. Skipped when no Secret env var is set.
+if grep -q '"secretKeyRef"' "$CLAW_EXTRA_VALUES_FILE"; then
+  for _deployment in api brain; do
+    helm template primus-claw "$CLAW_CHART_DIR" -n "$NAMESPACE" \
+      -f "$CLAW_VALUES_FILE" -f "$CLAW_EXTRA_VALUES_FILE" \
+      --show-only "templates/${_deployment}-deployment.yaml" > "$WORK_DIR/check-${_deployment}-deployment.yaml" \
+      || fail "the claw chart did not render the ${_deployment} Deployment from these values (see above)."
+    python3 "$SCRIPT_DIR/extra-values.py" --check-rendered "$(echo "$_deployment" | tr '[:lower:]' '[:upper:]')" \
+      "$WORK_DIR/check-${_deployment}-deployment.yaml" \
+      || fail "EXTRA_SECRET_ENV_* in $_VALUES_FILE names an env var the chart already renders in the ${_deployment} Deployment (see above)."
+  done
+fi
 
 if $DRY_RUN; then
   helm upgrade --install primus-claw "$CLAW_CHART_DIR" \

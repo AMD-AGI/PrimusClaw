@@ -629,7 +629,7 @@ Please call web_fetch again with the redirected URL and the same prompt if you s
 - **Auto-upgrade** `http://` → `https://` before request.
 - **URL validation**: reject username/password embedded in URL, hostname must have ≥ 1 dot.
 - 60-second per-hop timeout (matches reference's `FETCH_TIMEOUT_MS`).
-- **SSRF guard**: resolve hostname via `dns.lookup` before request and after every redirect. Refuse `localhost`, IPv4 loopback/private/link-local/reserved ranges (`0.0.0.0/8`, `10.0.0.0/8`, `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.168.0.0/16`, multicast/reserved), IPv6 loopback/link-local/private ranges (`::1`, `fc00::/7`, `fe80::/10`), and IPv4-mapped IPv6 addresses that resolve into blocked IPv4 ranges. Re-resolve and re-check the hostname for every redirect to reduce DNS rebinding risk. Also apply configurable `WEB_FETCH_DOMAIN_DENYLIST`.
+- **SSRF guard**: the check runs in the HTTP agents' `lookup`, on the addresses the socket is about to dial (no separate pre-lookup a short-TTL name could answer differently), with the name resolved as absolute so resolver search domains do not apply; IP-literal hosts, which skip `lookup`, are checked directly. Refuse IPv4 loopback/private/link-local/CGNAT/reserved ranges (`0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.168.0.0/16`, documentation, multicast/reserved), IPv6 unspecified/loopback/link-local/private ranges and the forms that embed IPv4 (IPv4-mapped, NAT64, 6to4, Teredo), and names under `localhost`, `local`, `internal`, `svc`, `home.arpa` before any lookup. web_fetch connects directly (`proxy: false`): a proxy would resolve the name itself. Also apply configurable `WEB_FETCH_DOMAIN_DENYLIST`.
 
   > **Why local DNS checks**: V2 Brain runs in a controlled cluster and cannot assume an external domain-reputation preflight service is reachable, so SSRF protection is enforced locally via DNS resolution plus IP-range checks. If operators later deploy an egress proxy with allowlisting, these DNS checks become defense-in-depth.
 - **Egress proxy guard**: if axios returns `403` with header `X-Proxy-Error: blocked-by-allowlist`, surface a structured `EGRESS_BLOCKED` error.
@@ -1178,7 +1178,7 @@ The controller is **disabled by default**. It only emits permission requests whe
 The controller:
 
 1. Subscribes to `decision.<sessionId>` NATS subject when the engine starts.
-2. Checks `tool` against `HITL_AUTO_ALLOW` (env-configurable; safe default: `read`, `glob`, `grep`, `ls`, `todo_write`, `web_search`, `save_memory`). This is intentionally stricter than V1 for `web_fetch`, because URL fetching can touch untrusted hosts.
+2. Checks `tool` against `HITL_AUTO_ALLOW` (env-configurable; safe default: `read`, `glob`, `grep`, `ls`, `load_skill`, `todo_write`, `web_search`, `save_memory`). This is intentionally stricter than V1 for `web_fetch`, because URL fetching can touch untrusted hosts.
 3. For non-allowlisted tools, when `HITL_ENABLED=true`:
    - Emits `permissionRequest` event with `actionId` (= LLM tool_use_id), `tool`, `input`, `description`, `timeout_ms`.
    - Awaits one of: matching NATS `decision` message, timeout (default 300 s), or `signal.aborted`.
@@ -1736,7 +1736,7 @@ All new behavior is gated by env vars so deployments can opt in:
 | `BG_SHELL_STALL_CHECK_INTERVAL_MS` | `5000` | Watchdog tick interval |
 | `EXIT_PLAN_MODE_ENABLED` | `true` | When false, plan mode never engages |
 | `HITL_ENABLED` | `false` | Master switch for permissionRequest emission |
-| `HITL_AUTO_ALLOW` | `"read,glob,grep,ls,todo_write,web_search,save_memory"` | CSV (note: `notebook_read` removed since merged into `read`) |
+| `HITL_AUTO_ALLOW` | `"read,glob,grep,ls,load_skill,todo_write,web_search,save_memory"` | CSV (note: `notebook_read` removed since merged into `read`) |
 | `HITL_DECISION_TIMEOUT_MS` | `300000` | |
 | `HITL_DECISION_DEFAULT` | `"allow"` | `"allow"` or `"deny"` on timeout |
 | `HITL_SUMMARY_ENABLED` | `true` | Adds a one-sentence, model-written plain-language summary to each `permissionRequest` (with `tool_description` and `intent`); set `false` to send none |

@@ -15,7 +15,9 @@ import path from "node:path";
 import type { AddressInfo } from "node:net";
 import AdmZip from "adm-zip";
 
-export type Turn = { text: string } | { tool: string; input: Record<string, unknown> };
+export type FixedTurn = { text: string } | { tool: string; input: Record<string, unknown> };
+/** A turn is fixed, or decided from the request the model is answering (its history, tool results included), as a model's is. */
+export type Turn = FixedTurn | ((requestBody: string) => FixedTurn);
 
 export function skillZip(name: string, body: string, description: string, wrap = ""): Buffer {
   const zip = new AdmZip();
@@ -29,7 +31,7 @@ export interface World {
   llmBodies: string[];
   downloads: number[];
   listCalls: number;
-  setTools(t: Array<{ id: number; name: string; zip?: Buffer; fail?: boolean; type?: string; version?: string | null; hang?: boolean; delayMs?: number }>): void;
+  setTools(t: Array<{ id: number; name: string; zip?: Buffer; fail?: boolean; type?: string; version?: string | null; hang?: boolean; delayMs?: number; config?: Record<string, unknown> }>): void;
   byIdCalls: number[];
   /** Every request path the marketplace saw, in order. */
   paths: string[];
@@ -37,7 +39,7 @@ export interface World {
   close(): Promise<void>;
 }
 
-function sse(res: http.ServerResponse, turn: Turn, n: number): void {
+function sse(res: http.ServerResponse, turn: FixedTurn, n: number): void {
   const ev = (e: string, d: unknown) => res.write(`event: ${e}\ndata: ${JSON.stringify(d)}\n\n`);
   res.writeHead(200, { "content-type": "text/event-stream" });
   ev("message_start", { type: "message_start", message: { id: `m${n}`, type: "message", role: "assistant", model: "m", content: [], stop_reason: null, usage: { input_tokens: 1, output_tokens: 0 } } });
@@ -77,7 +79,7 @@ export async function startWorld(defaultsFile?: object): Promise<World> {
       if (t?.hang) return;
       res.setHeader("content-type", "application/json");
       if (!t) { res.statusCode = 404; res.end(JSON.stringify({ ok: false, error: "not_found", message: "tool not found" })); return; }
-      res.end(JSON.stringify({ ok: true, data: { id: t.id, name: t.name, type: t.type ?? "skill", ...(t.version === null ? {} : { updated_at: t.version ?? "v1" }) } }));
+      res.end(JSON.stringify({ ok: true, data: { id: t.id, name: t.name, type: t.type ?? "skill", ...(t.config ? { config: t.config } : {}), ...(t.version === null ? {} : { updated_at: t.version ?? "v1" }) } }));
       return;
     }
     if (/^(\/claw-api)?\/v1\/tools\?/.test(url)) {
@@ -101,7 +103,8 @@ export async function startWorld(defaultsFile?: object): Promise<World> {
       req.on("data", (c) => (body += c));
       req.on("end", () => {
         world.llmBodies.push(body);
-        sse(res, turns[turnN] ?? { text: "done" }, turnN);
+        const next = turns[turnN] ?? { text: "done" };
+        sse(res, typeof next === "function" ? next(body) : next, turnN);
         turnN++;
       });
       return;

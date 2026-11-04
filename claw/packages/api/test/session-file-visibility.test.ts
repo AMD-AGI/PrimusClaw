@@ -35,6 +35,17 @@ test("the directories that belong to another lifecycle stay hidden", () => {
   assert.equal(isHiddenSessionFile("claw-1786000000000/.uploads/input.csv"), true);
 });
 
+test("a repository's object store is hidden, wherever the repository is", () => {
+  // The snapshot carries .git so a restored sandbox is still a repository; that
+  // puts thousands of objects under the session prefix, none of them artifacts.
+  assert.equal(isHiddenSessionFile(".git/HEAD"), true);
+  assert.equal(isHiddenSessionFile("repo/.git/objects/pack/pack-1.pack"), true);
+  // The project's own git-adjacent files are the user's.
+  assert.equal(isHiddenSessionFile("repo/.gitignore"), false);
+  assert.equal(isHiddenSessionFile("repo/.github/workflows/ci.yml"), false);
+  assert.equal(isHiddenSessionFile(".git-notes.md"), false);
+});
+
 test("the user's own files are shown", () => {
   assert.equal(isHiddenSessionFile("src/main.py"), false);
   assert.equal(isHiddenSessionFile("results.jsonl"), false);

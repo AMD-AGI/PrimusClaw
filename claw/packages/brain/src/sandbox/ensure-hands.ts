@@ -39,9 +39,12 @@ import {
   writeTopologyHandoff,
   hasSshKeyFile,
   applyPlatformKeyEnv,
+  withholdKeyEnv,
+  sandboxUserEnv,
 } from "./params.js";
 import type { SandboxAction } from "./params.js";
 import { resourcesJsonToWorkloadArray } from "./workload-resources.js";
+import { sandboxNamespaceForResources } from "./workspace-select.js";
 import type { MultiNodeContext } from "./multi-node/types.js";
 import { writeSandboxSshKey } from "./multi-node/sandbox-key.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
@@ -162,6 +165,7 @@ function effectiveWorkloadResources(
 export function requestSpecFingerprint(
   request: ExecuteRequest,
   action: Extract<SandboxAction, { kind: "create" }>,
+  multiNodeContext?: MultiNodeContext,
 ): string {
   const kubernetes = isKubernetesMode();
   // The same composition the sandbox is actually built from, minus the layers
@@ -172,11 +176,18 @@ export function requestSpecFingerprint(
   // request's fingerprint depend on a value no request can change.
   const env = composeSandboxEnv({
     base: action.params.env ?? {},
-    userEnv: request.user_env,
+    userEnv: sandboxUserEnv(request),
     sessionEnv: request.session_env,
   });
+  // As the sandbox is built (provisionHands): a session that acts as a user has none of the key variables, so a change in one of
+  // them is not a change in the sandbox, and its key is not one that was injected.
+  const withholdKeys = request.withhold_sandbox_keys === true;
+  if (withholdKeys) withholdKeyEnv(env);
   const labels = action.params.labels ?? {};
-  const namespace = sandboxNamespaceFor(request);
+  // The resources the SaFE create will use; the namespace depends on whether they ask
+  // for a GPU, so it is read once and reused for the fingerprint below.
+  const effective = kubernetes ? null : effectiveWorkloadResources(request, action.params);
+  const namespace = sandboxNamespaceFor(request, effective, multiNodeContext);
   if (kubernetes) {
     return sandboxSpecFingerprint({
       image: action.params.image,
@@ -193,11 +204,12 @@ export function requestSpecFingerprint(
       // rotation only reaches the sandbox by rebuilding it. safe mode
       // authenticates with the deployment's platform key instead, which is
       // not per-request and so is not folded in there.
-      llmKey: resolveRequestLlmKey(request),
+      llmKey: withholdKeys ? undefined : resolveRequestLlmKey(request),
+      withholdKeys,
     });
   }
   const resources: Record<string, string> = {};
-  for (const entry of effectiveWorkloadResources(request, action.params) ?? []) {
+  for (const entry of effective ?? []) {
     for (const [k, v] of Object.entries(entry)) resources[k] = String(v);
   }
   return sandboxSpecFingerprint({
@@ -208,6 +220,7 @@ export function requestSpecFingerprint(
     ttlSec: action.params.ttl_sec ?? DEFAULT_SANDBOX_TTL_SEC,
     labels,
     namespace,
+    withholdKeys,
   });
 }
 
@@ -220,9 +233,22 @@ export function requestSpecFingerprint(
  * name, the SaFE exec URL and the KV entry keepalive reads back -- and with the
  * fingerprint, since a pod cannot move namespace after it is scheduled.
  */
-function sandboxNamespaceFor(request: ExecuteRequest): string {
-  const fallback = isKubernetesMode() ? AGENT_SANDBOX_NAMESPACE : SANDBOX_NAMESPACE;
-  return request.workspace_id?.trim() || fallback;
+function sandboxNamespaceFor(
+  request: ExecuteRequest,
+  resources?: unknown,
+  multiNodeContext?: MultiNodeContext,
+): string {
+  if (isKubernetesMode()) return request.workspace_id?.trim() || AGENT_SANDBOX_NAMESPACE;
+  // A multi-node run's sandbox goes where its cluster is, whatever the sandbox asks for.
+  // The optimizer in it drives the cluster through the Ray head's service and the Infera
+  // pods' IPs, which resolve only on the cluster's own cluster; a CPU-only sandbox placed
+  // by its resources would land in the CPU workspace, which may be on another one. The
+  // Router follows the namespace (`sandboxRouterBasesFor`), so it is the cluster's.
+  const clusterNamespace = multiNodeContext?.namespace?.trim();
+  if (clusterNamespace) return clusterNamespace;
+  // SaFE mode: a deployment with a CPU workspace chooses by what the sandbox asks for
+  // (see workspace-select.ts); without one this is `workspace_id || SANDBOX_NAMESPACE`.
+  return sandboxNamespaceForResources(request.workspace_id, resources);
 }
 
 /**
@@ -2566,7 +2592,7 @@ async function provisionHands(
 
   // What the caller is asking for, condensed so it can be compared against what
   // the session's existing sandbox was actually built with.
-  const requestedSpec = requestSpecFingerprint(request, action);
+  const requestedSpec = requestSpecFingerprint(request, action, multiNodeContext);
 
   if (!options.skipSessionReuse) {
     const reused = await tryReuseSessionSandbox({
@@ -2671,9 +2697,17 @@ async function provisionHands(
   env = composeSandboxEnv({
     base: env,
     systemEnv: getSystemEnv(),
-    userEnv: request.user_env ?? {},
+    userEnv: sandboxUserEnv(request),
     sessionEnv: request.session_env ?? {},
   });
+  // A session that acts as a user's GitHub account: its model reads text strangers
+  // wrote, and whatever the sandbox's environment holds the model can print. Its
+  // owner's stored variables are not composed in at all (`sandboxUserEnv`), and the
+  // key variables are taken out of the composed result, so that no layer can have
+  // put one there (the spec's env, the user's own variables, the request's).
+  // `apiKey` is still what the workload is created and owned with (below); only a
+  // copy a process in the sandbox could read is withheld.
+  if (request.withhold_sandbox_keys) withholdKeyEnv(env);
 
   // ── kubernetes/BYOK mode: agent-sandbox provider path (design §16.5). ──
   // safe mode falls through to the SaFE Workload path below (unchanged).
@@ -2687,7 +2721,7 @@ async function provisionHands(
     );
   }
 
-  const nsForSandbox = sandboxNamespaceFor(request);
+  const nsForSandbox = sandboxNamespaceFor(request, workloadResourcesArr, multiNodeContext);
   // Sweeper relies on `dag-root` + `sandbox-handle` to reconcile orphan
   // workloads against the DagHandleMap KV (see task-design.md §9.4 sweeper).
   const labels = composeSandboxLabels({

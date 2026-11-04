@@ -57,7 +57,7 @@ before(async () => {
   for (const column of [
     "plugin_id INTEGER", "tool_ids JSONB DEFAULT '[]'::jsonb", "workspace_id TEXT",
     "platform_key TEXT", "llm_api_key TEXT", "credentials_blob TEXT", "image TEXT",
-    "resources JSONB", "timeout INTEGER", "topology JSONB",
+    "resources JSONB", "timeout INTEGER", "topology JSONB", "tools_allowlist JSONB",
     "bind_attempts INTEGER NOT NULL DEFAULT 0",
     "user_env JSONB DEFAULT '{}'::jsonb", "session_env JSONB DEFAULT '{}'::jsonb",
   ]) {
@@ -197,6 +197,8 @@ async function queued(doorbell: boolean, s: Scenario): Promise<Request> {
     return published.length;
   }) as typeof pendingDispatchPorts.publish;
 
+  // The turn in front has ended and handed the session back: a drain only runs on a free session.
+  await h.sql("UPDATE claw_sessions SET agent_status = 'idle', agent_gate_message_id = NULL WHERE session_id = $1", [SESSION]);
   await drainOldestPendingMessage(SESSION, OWNER);
 
   if (doorbell) {

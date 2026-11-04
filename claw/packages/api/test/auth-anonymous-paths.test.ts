@@ -53,6 +53,16 @@ test("isAnonymousPath: no unlisted route under /a2a/ is anonymous", () => {
   assert.equal(isAnonymousPath("/a2a/.well-known/openid-configuration"), false);
 });
 
+test("isAnonymousPath: a per-plugin A2A agent and its card require authentication", () => {
+  // Whether a plugin may be reached, or even described, depends on who asks: a
+  // private plugin's name, description and tools are its owner's. The generic
+  // card is public discovery; a plugin's card is not.
+  assert.equal(isAnonymousPath("/a2a/plugins/7"), false);
+  assert.equal(isAnonymousPath("/a2a/plugins/7/.well-known/agent-card.json"), false);
+  assert.equal(isAnonymousPath("/a2a/plugins/7/.well-known/agent.json"), false);
+  assert.equal(isAnonymousPath("/a2a/plugins/7/health"), false);
+});
+
 test("isAnonymousPath: the legacy SaFE Gateway invoke routes require authentication", () => {
   assert.equal(isAnonymousPath("/invoke"), false);
   assert.equal(isAnonymousPath("/invoke/code-generation"), false);

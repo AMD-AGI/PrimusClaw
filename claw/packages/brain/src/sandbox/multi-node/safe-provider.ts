@@ -30,6 +30,7 @@ import {
   type MultiNodePromptSpec,
 } from "./prompt-flags.js";
 import { multiNodeWorkloadName } from "../workload-naming.js";
+import { gpuWorkspaceFor } from "../workspace-select.js";
 import { SandboxProvisionTerminalError } from "../errors.js";
 import { ACTIVE_PHASES, TERMINAL_PHASES, waitForWorkloadReady, type WorkloadWaitDeps } from "../workload-wait.js";
 import { parseWorkloadListPage, type WorkloadRef } from "./workload-parse.js";
@@ -319,7 +320,10 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
 
     const messageId = request.message_id?.trim();
     if (!messageId) throw new Error("multi-node request requires message_id");
-    const namespace = request.workspace_id?.trim();
+    // A cluster is GPU nodes, so it never goes to the CPU workspace: a request that names
+    // none (the API stamps none once SANDBOX_CPU_NAMESPACE is set) or names the CPU one is
+    // placed in the GPU workspace, the same rule a single-node GPU sandbox follows.
+    const namespace = gpuWorkspaceFor(request.workspace_id);
     if (!namespace) throw new Error("multi-node request requires workspace_id");
     const apiKey = (opts?.platformKey ?? request.platform_key ?? "").trim();
     if (!apiKey) throw new Error("multi-node request requires a SaFE platform key in safe mode");
