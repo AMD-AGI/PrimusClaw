@@ -36,6 +36,7 @@
 import { parseSessionRepo, sessionRepoDirName, type SessionRepo } from "@claw/protocol";
 import { redactSecrets } from "@claw/utils";
 import pino from "pino";
+import { randomBytes } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 import { parseRepoSkills, repoSkillsCommand, type RepoSkill } from "./repo-skills.js";
 
@@ -155,19 +156,50 @@ async function sh(
 }
 
 /**
+ * The command, and after it a record of how it ended, written where the probe and
+ * the next turn never look. Hands keeps a shell's exit status in its own memory, so
+ * a Hands that restarts while the command runs loses it: from then on every wait
+ * answers `lost` or `ended_unreaped` and never `finished`. This record is what still
+ * says whether the command succeeded.
+ */
+function recordExitCommand(command: string, exitFile: string): string {
+  const tmp = shq(`${exitFile}.tmp`);
+  return `( ${command} ); rc=$?; printf '%s\\n' "$rc" > ${tmp} && mv -f ${tmp} ${shq(exitFile)}; exit $rc`;
+}
+
+function readExitCommand(exitFile: string): string {
+  return `f=${shq(exitFile)}; if [ -f "$f" ]; then echo "CLAW_REPO_EXIT=$(head -c 16 "$f")"; rm -f "$f"; else echo CLAW_REPO_EXIT=none; fi`;
+}
+
+/** The exit status the command recorded, or null when it has recorded none (or the record cannot be read). */
+async function recordedExit(hands: RepoHands, exitFile: string, signal?: AbortSignal): Promise<number | null> {
+  const r = await sh(hands, readExitCommand(exitFile), GIT_TIMEOUT_SEC, signal);
+  const code = r.ok ? marker(r.out, "EXIT") : null;
+  return code && /^\d+$/.test(code) ? Number(code) : null;
+}
+
+/**
  * A command that may outlast the foreground ceiling: started in the background
  * and waited on, one wait at a time, until it ends or CLONE_BACKGROUND_MAX_SEC
  * passes. Foreground, as before, when background shells are off.
+ *
+ * When Hands answers without waiting (it lost the shell on a restart), the
+ * command's own exit record decides: present, the command is over and that is
+ * its outcome; absent while the shell's process group is gone (`ended_unreaped`),
+ * it was stopped before it could say, which is a failure. Absent while the group
+ * may still be running (`lost`), it is waited for as before: failing then would let
+ * the next turn's bind remove the staging directory the clone is still writing.
  */
 async function shLong(
-  hands: RepoHands, command: string, options: BindOptions,
+  hands: RepoHands, command: string, options: BindOptions, exitPrefix: string,
 ): Promise<{ ok: boolean; out: string }> {
   const { signal } = options;
   if (!options.background) return sh(hands, command, CLONE_TIMEOUT_SEC, signal);
+  const exitFile = `${exitPrefix}-${randomBytes(6).toString("hex")}`;
   let shellId: string | undefined;
   let finished = false;
   try {
-    const start = await hands.callToolFull("bash", { command, run_in_background: true }, signal);
+    const start = await hands.callToolFull("bash", { command: recordExitCommand(command, exitFile), run_in_background: true }, signal);
     const id = (start.structured as { shell_id?: unknown } | undefined)?.shell_id;
     if (start.isError || typeof id !== "string" || !id) {
       return { ok: false, out: `stderr: could not start the command in the background: ${start.text}` };
@@ -179,8 +211,19 @@ async function shLong(
       const w = await hands.callToolFull("wait", { shell_id: shellId, timeout_sec: CLONE_TIMEOUT_SEC }, signal);
       out += `${w.text}\n`;
       if (w.isError) return { ok: false, out };
-      const s = w.structured as { finished?: unknown; exit_code?: unknown; blocking?: unknown } | undefined;
+      const s = w.structured as { finished?: unknown; exit_code?: unknown; blocking?: unknown; shell_class?: unknown } | undefined;
       if (s?.finished === true) { finished = true; return { ok: s.exit_code === 0, out }; }
+      if (s?.blocking === false) {
+        const code = await recordedExit(hands, exitFile, signal);
+        if (code !== null) {
+          finished = true;
+          return { ok: code === 0, out: code === 0 ? out : `${out}stderr: exited with status ${code} while Hands had lost track of it; its output was not kept` };
+        }
+        if (s.shell_class === "ended_unreaped") {
+          finished = true;
+          return { ok: false, out: `${out}stderr: ended without recording an exit status (it was stopped while Hands restarted)` };
+        }
+      }
       if (Date.now() >= deadline) {
         return { ok: false, out: `stderr: did not finish within ${CLONE_BACKGROUND_MAX_SEC}s and was stopped` };
       }
@@ -409,6 +452,7 @@ export async function bindRepo(hands: RepoHands, raw: unknown, options: BindOpti
   const stateDir = (options.stateDir ?? "/tmp").replace(/\/+$/, "");
   const boundMarker = `${stateDir}/.claw-repo-bound-${name}`;
   const stagingRecord = `${stateDir}/.claw-repo-staging-${name}`;
+  const exitPrefix = `${stateDir}/.claw-repo-exit-${name}`;
   const b = emptyBinding(repo.url, repo.branch ?? null, dir);
   const started = Date.now();
   const { signal } = options;
@@ -446,11 +490,11 @@ export async function bindRepo(hands: RepoHands, raw: unknown, options: BindOpti
       // instruction files back with it, so this turn made one call.
       inline = probe.out;
     } else {
-      const f = await shLong(hands, fetchCommand(dir, boundMarker), options);
+      const f = await shLong(hands, fetchCommand(dir, boundMarker), options, exitPrefix);
       if (!f.ok) b.notes.push(`git fetch failed (${reasonOf(f.out)}); the checkout is as it was left`);
     }
   } else if (state === "occupied") {
-    const a = await shLong(hands, adoptCommand(dir, root, stagingRecord, repo.url, boundMarker), options);
+    const a = await shLong(hands, adoptCommand(dir, root, stagingRecord, repo.url, boundMarker), options, exitPrefix);
     if (!a.ok) {
       b.failure = `${dir} already has files and is not a git repository, and attaching the repository to them failed: ${reasonOf(a.out)}`;
       return finish(b, started);
@@ -459,7 +503,7 @@ export async function bindRepo(hands: RepoHands, raw: unknown, options: BindOpti
     b.notes.push(`${dir} already had files and no .git (a snapshot from before .git was kept): the repository's .git was attached on its default branch and those files show as local changes`);
     if (b.requestedBranch) b.notes.push(`branch ${b.requestedBranch} was not checked out because the files are in the way; the checkout is on the remote's default branch`);
   } else {
-    const c = await shLong(hands, cloneCommand(dir, root, stagingRecord, repo.url, boundMarker), options);
+    const c = await shLong(hands, cloneCommand(dir, root, stagingRecord, repo.url, boundMarker), options, exitPrefix);
     if (!c.ok) {
       b.failure = `git clone of ${repo.url} failed: ${reasonOf(c.out)}`;
       return finish(b, started);
