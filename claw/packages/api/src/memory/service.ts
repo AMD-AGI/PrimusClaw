@@ -25,7 +25,7 @@ import { publishEvent } from "../events/store.js";
 import { sessionWithholdsMemory } from "../github-review/session-tools.js";
 import { estimateTokens } from "../shared/tokens.js";
 import {
-  BODY_MAX, NOTE_MAX, SIMILARITY_THRESHOLD, TITLE_MAX, isMemoryType, legacyType, normalizeText, quoteAsksToForget,
+  BODY_MAX, NOTE_MAX, SIMILARITY_THRESHOLD, TITLE_MAX, isMemoryType, legacyType, memoryCommand, normalizeText,
   quoteIsFrom, quoteSupports, scanInjection, scanSecrets, similarity, type MemoryType,
 } from "./gates.js";
 
@@ -231,7 +231,7 @@ export type MemoryActor =
 
 export type WriteRefusal =
   | "memory_off" | "invalid" | "quote_not_from_user" | "quote_unrelated" | "secret" | "injection"
-  | "similar_exists" | "memory_full" | "not_found";
+  | "similar_exists" | "memory_full" | "not_found" | "not_the_users_command";
 
 export type WriteResult =
   | { ok: true; id: number; op: "add" | "existing" | "update"; status: string; title: string; live: number }
@@ -628,16 +628,17 @@ function savedText(r: Extract<WriteResult, { ok: true }>): string {
     : "";
   if (r.op === "existing") return `Already remembered as #${r.id} "${r.title}"; nothing new was stored.${room}`;
   return `${verb} memory #${r.id} "${r.title}". End your reply with one line telling the user, in their language, ` +
-    `that it was ${r.op === "update" ? "updated" : "remembered"} and that they can undo it by saying "undo memory #${r.id}".${room}`;
+    `that it was ${r.op === "update" ? "updated" : "remembered"} and that they can undo it by sending exactly "undo memory #${r.id}" (or "撤销记忆 #${r.id}").${room}`;
 }
 
 /**
  * One call of the model's memory tools, for a live chat turn of `sessionId`. `humanMessages` are the user's
- * own messages in the session, which every write must quote. Answers with the text the model is shown.
+ * own messages in the session, which every write must quote; `turnMessage` is the user's message of this turn,
+ * the only one that can command forgetting or undoing (`memoryCommand`). Answers with the text the model is shown.
  */
 export async function runMemoryTool(
   name: MemoryToolName, input: Record<string, unknown>,
-  ctx: { userId: string; sessionId: string; humanMessages: readonly string[] },
+  ctx: { userId: string; sessionId: string; humanMessages: readonly string[]; turnMessage: string },
 ): Promise<{ ok: boolean; text: string }> {
   const actor = (): MemoryActor => ({ kind: "model", sessionId: ctx.sessionId, quote: text(input.evidence_quote) ?? "", humanMessages: ctx.humanMessages });
   const announce = async (r: Extract<WriteResult, { ok: true }>) => {
@@ -669,18 +670,20 @@ export async function runMemoryTool(
     if (!rows.length) return { ok: true, text: id !== null ? `No memory #${id}.` : "No memory matches." };
     return { ok: true, text: rows.map(describe).join("\n\n") };
   }
-  // forget_memory: only on the user's own request in this conversation to forget or undo this entry, quoted.
+  // forget_memory: only when the user's message of this very turn is the command for this entry and this op.
   const id = entryId(input.id);
   if (id === null) return { ok: false, text: "Error: id (the entry's number) is required" };
-  const quote = text(input.evidence_quote) ?? "";
-  const target = await readEntry(ctx.userId, id, true);
-  if (!target) return { ok: false, text: `Error: no memory #${id}` };
-  const named = `${target.title ?? ""}\n${target.content}`;
-  if (!quoteAsksToForget(quote, ctx.humanMessages, id, named)) {
-    await recordRefusal(ctx.userId, actor(), "quote_not_from_user", id);
-    return { ok: false, text: "Error: nothing deleted: evidence_quote must be the user's own request to forget or undo this entry (naming it or its number), copied exactly from their message" };
+  const op = input.undo === true ? "undo" : "forget";
+  const said = memoryCommand(ctx.turnMessage);
+  if (!said || said.op !== op || said.id !== id) {
+    await recordRefusal(ctx.userId, actor(), "not_the_users_command", id);
+    return {
+      ok: false,
+      text: `Error: nothing ${op === "undo" ? "undone" : "deleted"}: the model may ${op} memory #${id} only when the user's message in this turn is exactly ` +
+        `"${op} memory #${id}" (or "${op === "undo" ? "撤销" : "忘掉"}记忆 #${id}"). Tell the user to send exactly that, or to use their memory settings.`,
+    };
   }
-  if (input.undo === true) {
+  if (op === "undo") {
     const done = await undoMemory(ctx.userId, id, "model");
     if (done === "not_found") return { ok: false, text: `Error: no memory #${id}` };
     return { ok: true, text: done === "restored" ? `Memory #${id} is back to its previous version.` : `Memory #${id} was deleted.` };

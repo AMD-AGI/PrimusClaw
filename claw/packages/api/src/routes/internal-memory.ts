@@ -32,12 +32,12 @@ export async function registerInternalMemoryRoutes(app: FastifyInstance): Promis
       if (!sessionId || !messageId) return reply.status(400).send({ ok: false, text: "Error: session_id and message_id are required" });
 
       const run = (await db.query(
-        `SELECT s.user_id FROM claw_tasks t JOIN claw_sessions s ON s.session_id = t.session_id AND s.deleted_at IS NULL
+        `SELECT s.user_id, t.prompt FROM claw_tasks t JOIN claw_sessions s ON s.session_id = t.session_id AND s.deleted_at IS NULL
           WHERE t.session_id = $1 AND t.origin = 'chat' AND t.metadata->>'message_id' = $2
             AND t.status IN ('preparing', 'running', 'cancelling')
           LIMIT 1`,
         [sessionId, messageId],
-      )).rows[0] as { user_id: string } | undefined;
+      )).rows[0] as { user_id: string; prompt: string | null } | undefined;
       if (!run) {
         logger.warn({ sessionId, messageId, tool }, "memory.tool_outside_live_chat_turn");
         return reply.status(409).send({ ok: false, text: "Error: memory is only available in a live turn of the user's own chat; nothing was done." });
@@ -48,7 +48,9 @@ export async function registerInternalMemoryRoutes(app: FastifyInstance): Promis
         return reply.status(409).send({ ok: false, text: "Error: memory is not available in this conversation; nothing was done." });
       }
       try {
-        const out = await runMemoryTool(tool, input, { userId: run.user_id, sessionId, humanMessages: await humanMessages(sessionId) });
+        const out = await runMemoryTool(tool, input, {
+          userId: run.user_id, sessionId, humanMessages: await humanMessages(sessionId), turnMessage: run.prompt ?? "",
+        });
         logger.info({ sessionId, tool, ok: out.ok }, "memory.tool");
         return out;
       } catch (err) {

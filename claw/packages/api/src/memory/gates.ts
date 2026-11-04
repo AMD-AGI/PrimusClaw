@@ -56,80 +56,28 @@ export function quoteSupports(quote: string, text: string): boolean {
   return false;
 }
 
-// An instruction to forget, not a mention of forgetting or deleting something. Each form is an imperative at the
-// start of a clause: "forget ..." (not "I keep forgetting my vim shortcuts", "don't forget", "forget it" = never
-// mind), or "delete"/"remove"/"undo" aimed at a memory ("delete the vim memory", "undo memory #3"; not "remove vim
-// from my laptop"); in Chinese "忘掉 ..."/"别记 ...", or erasing aimed at an entry ("把这条记忆删掉", "撤销记忆 #3";
-// not "我总是忘记 vim 快捷键", "忘了说，我用 vim", "我不想删除这条记忆").
-const POLITE = String.raw`(?:(?:please|pls|can you|could you|would you|you can|you should|i want you to|i'd like you to|i would like you to|go ahead and|let's|just|now|ok|okay)\s+)*`;
-const MEMORY_ZH = "(?:记忆|这条|那条|这一条|那一条|条目)";
-const ERASE_ZH = "(?<!不要|别|不用|不|勿|没|没有|不能|不许|不想|不希望|不必|不该|被)(?:忘掉|忘记|删掉|删除|删了|撤销|撤回|去掉)";
-const ZH_PLEASE = "^(?:请|麻烦)?你?(?:帮我|给我)?";
-const FORGET_REQUEST = [
-  new RegExp(`^${POLITE}(?:forget|stop remembering|unlearn)\\b(?!\\s+(?:it|about it)\\b)`, "i"),
-  new RegExp(`^${POLITE}(?:delete|remove|erase|drop|clear|undo|revert)\\b(?:\\s+[\\w'#-]+){0,4}?\\s+(?:memory|memories)\\b`, "i"),
-  new RegExp(`${ZH_PLEASE}(?:忘掉|忘记(?:它|这|那|关于|掉)|忘了(?:它|这|那|吧)|别记|不要记|不用记|别再记)`),
-  new RegExp(`${ZH_PLEASE}(?:(?:(?:把|将).{0,20}?)?${MEMORY_ZH}.{0,10}?${ERASE_ZH}|${ERASE_ZH}.{0,20}${MEMORY_ZH})`),
+export type MemoryCommandOp = "forget" | "undo";
+
+// The whole message, and nothing else: an optional "please"/"请", the command, an optional full stop or "!".
+const MEMORY_COMMANDS: ReadonlyArray<{ pattern: RegExp; op: Record<string, MemoryCommandOp> }> = [
+  { pattern: /^(?:please )?(forget|undo) memory ?# ?([1-9]\d*)[.!]?$/, op: { forget: "forget", undo: "undo" } },
+  { pattern: /^请?(忘掉|撤销) ?记忆 ?# ?([1-9]\d*)[.!。]?$/, op: { 忘掉: "forget", 撤销: "undo" } },
 ];
-// The entry by its number: "#3", "memory 3", "记忆 #3", "第3条"; a bare number ("delete 3 files") is not a reference.
-const ENTRY_NUMBER = /#\s*(\d+)|(?:memory|note|entry|记忆|条目)[\s#]*(\d+)|第\s*(\d+)\s*条/gi;
 
 /**
- * The clauses of a user's message: an instruction to forget names its entry within its own clause. Every mark
- * `normalizeText` drops ends one (stops, commas, colons, dashes, brackets, quotation marks), except those inside a
- * reference or a word: an apostrophe, "#", "_", and a hyphen between two letters or digits. Only the start of the
- * message and a stop, comma or colon begin an instruction (`opens`): what follows a bracket, quotation mark or dash
- * is an aside or a quotation of the sentence before it ("Please don't (forget I use vim)", "I never said 'forget
- * memory #3'").
+ * The commands that let the model forget or undo an entry: the user's message is exactly "forget memory #N" or
+ * "undo memory #N" ("忘掉记忆 #N", "撤销记忆 #N"), in any letter case and full- or half-width forms. Any other
+ * message, however it mentions forgetting, commands nothing: a fixed phrase has no clause, aside or negation for
+ * a quote to cut out.
  */
-function clauses(text: string): Array<{ clause: string; opens: boolean }> {
-  const parts = text.normalize("NFKC").replace(/[’‘]/g, "'")
-    .split(/((?:(?!['#_-])[\p{P}\p{S}]|-(?!(?<=[\p{L}\p{N}]-)[\p{L}\p{N}])|\n)+)/u);
-  const out: Array<{ clause: string; opens: boolean }> = [];
-  let marks = "";
-  parts.forEach((part, i) => {
-    if (i % 2) { marks += part; return; }
-    const clause = part.trim();
-    if (!clause) return;
-    out.push({ clause, opens: /^[.!?;:,\n。！？；：，、]*$/u.test(marks) });
-    marks = "";
-  });
-  return out;
-}
-
-/** Whether a clause is an instruction to forget (see FORGET_REQUEST) that names this entry by its number or by what it says. */
-function clauseAsksToForget(clause: string, id: number, entry: string): boolean {
-  if (!FORGET_REQUEST.some((r) => r.test(clause))) return false;
-  const numbers = [...clause.matchAll(ENTRY_NUMBER)].map((m) => m[1] ?? m[2] ?? m[3]);
-  return numbers.includes(String(id)) || quoteSupports(clause, entry);
-}
-
-/**
- * Whether the user asked to forget or undo this entry, where the model quotes them: the quote is part of one of
- * their `messages` and overlaps a clause of that message that is an instruction to forget naming the entry. The
- * clause is read from the user's message, not from the quote: quoting "delete this memory about vim" out of "please
- * do not delete this memory about vim", or "Forget my password I use vim" out of "Forget my password. I use vim.",
- * finds no such clause. Any other sentence of the user's ("review this repository", "I keep forgetting my vim
- * shortcuts", "remove vim from my laptop") is not one.
- */
-export function quoteAsksToForget(quote: string, messages: readonly string[], id: number, entry: string): boolean {
-  const q = normalizeText(quote);
-  if ([...q].length < QUOTE_MIN) return false;
-  return messages.some((message) => {
-    const whole = normalizeText(message);
-    const spans: Array<{ clause: string; opens: boolean; start: number; end: number }> = [];
-    for (const { clause, opens } of clauses(message)) {
-      const start = spans.at(-1)?.end ?? 0;
-      spans.push({ clause, opens, start, end: start + normalizeText(clause).length });
-    }
-    // The delimiters are punctuation and whitespace, which normalisation drops, so the clauses tile the message.
-    if ((spans.at(-1)?.end ?? 0) !== whole.length) return false;
-    return spans.some(({ clause, opens, start, end }) => {
-      if (!opens || !clauseAsksToForget(clause, id, entry)) return false;
-      const at = whole.indexOf(q, Math.max(0, start - q.length + 1));
-      return at !== -1 && at < end;
-    });
-  });
+export function memoryCommand(message: string): { op: MemoryCommandOp; id: number } | null {
+  const said = (message || "").normalize("NFKC").trim().toLowerCase().replace(/\s+/g, " ");
+  for (const { pattern, op } of MEMORY_COMMANDS) {
+    const m = pattern.exec(said);
+    const id = m ? Number(m[2]) : NaN;
+    if (m && Number.isSafeInteger(id)) return { op: op[m[1]], id };
+  }
+  return null;
 }
 
 function bigrams(text: string): Set<string> {

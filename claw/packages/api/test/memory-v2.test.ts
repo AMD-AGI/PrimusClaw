@@ -25,8 +25,9 @@
  *   D1  deleting is for good: no text of the entry is left anywhere in the database
  *   D2  a deleted entry is gone from the next turn's catalogue
  *   D3  undo restores the previous version of an edit (a confirmation included) and deletes a new entry
- *   D4  forgetting needs the user's own instruction to forget that entry, quoted; a sentence that only mentions
- *       forgetting or deleting, or deletes something else, is not one
+ *   D4  the model forgets or undoes an entry only when the user's whole message of this turn is the fixed command
+ *       for that entry and that op ("forget memory #N", "undo memory #N", "忘掉记忆 #N", "撤销记忆 #N"); any other
+ *       message, the command inside a longer one, a negated one and an earlier turn's are refused with the phrase
  * Reads
  *   R1  the catalogue is one line per entry, bounded by lines and by tokens, user and feedback first, pinned on top
  *   R2  a project entry past its review date leaves the catalogue (counted) until it is confirmed again
@@ -365,14 +366,16 @@ describe("memory v2", { skip }, () => {
     const id = byKey.body.data.id;
     assert.equal(byKey.body.data.status, "pending");
     const sid = await chat("alice");
-    const t = await turn(sid, `I prefer a pending fact about tabs; forget memory #${id}`);
+    const t = await turn(sid, "I prefer a pending fact about tabs");
     const recalled = await tool("recall_memory", sid, t.messageId, { id });
     assert.equal(recalled.text, `No memory #${id}.`);
     assert.ok(!(await tool("recall_memory", sid, t.messageId, { query: "pending fact" })).text.includes("pending fact"));
     const updated = await tool("update_memory", sid, t.messageId, { id, body: "a pending fact about tabs", evidence_quote: "I prefer a pending fact about tabs" });
     assert.match(updated.text, /not_found/);
-    const forgot = await tool("forget_memory", sid, t.messageId, { id, evidence_quote: `forget memory #${id}` });
-    assert.equal(forgot.ok, false);
+    await w.closeRun(t.taskId);
+    const asked = await turn(sid, `forget memory #${id}`);
+    const forgot = await tool("forget_memory", sid, asked.messageId, { id });
+    assert.equal(forgot.text, `Error: no memory #${id}`);
     // Checked on the row itself, under its lock: an entry that became pending after the model looked it up.
     assert.equal(await svc.forgetMemory("alice", id, "model"), false);
     assert.equal(await svc.undoMemory("alice", id, "model"), "not_found");
@@ -479,83 +482,87 @@ describe("memory v2", { skip }, () => {
     assert.equal((await entries()).length, 1);
   });
 
-  test("D4 forgetting needs the user's own request, quoted", async () => {
+  test("D4 the model forgets or undoes an entry only on the user's fixed command, the whole message of this turn", async () => {
     const sid = await chat("alice");
     const t = await turn(sid, "remember I use vim");
     await tool("save_memory", sid, t.messageId, save("uses vim", "uses vim", "I use vim"));
-    const id = Number((await entries())[0].id);
-    const unasked = await tool("forget_memory", sid, t.messageId, { id, evidence_quote: "the user no longer uses vim" });
-    assert.equal(unasked.ok, false);
-    const anySentence = await tool("forget_memory", sid, t.messageId, { id, evidence_quote: "remember I use vim" });
-    assert.equal(anySentence.ok, false, "a sentence of the user's that does not ask to forget is not a request");
     await w.closeRun(t.taskId);
-    // Each mentions forgetting or deleting, shares "vim" with the entry, and is no instruction to forget it.
-    const incidental = [
+    const id = Number((await entries())[0].id);
+    // Every sentence the heuristic this replaced was shown to misread (review rounds 1-7), the ones it read right,
+    // and the command itself inside a longer message: none is the command, whatever the model quotes or asks.
+    const refused = [
+      "the user no longer uses vim", "remember I use vim",
       "I keep forgetting my vim shortcuts", "don't forget I use vim", "我总忘记 vim 的快捷键", "I forget my vim notes all the time",
       "remove vim from my laptop", "can you delete the vim swap files", "forget it, I use vim anyway", "I can't delete the vim memory",
       "忘了说，我用 vim", "不要删除这条记忆，我用 vim", `delete ${id} files in vim`,
-      // An instruction to forget something else, with the entry's words in another clause.
-      "Forget my password. I use vim.", "forget my password, I use vim", "Forget my password: I use vim", "忘掉我的密码。我用 vim",
-      "忘掉密码：我用 vim", "Forget my password — I use vim.", "Forget my password - I use vim", "Forget my password (I use vim)",
-      "Forget my password \"I use vim\"",
-      // An instruction inside an aside or a quotation belongs to the sentence around it.
+      "Forget my password. I use vim.", "Forget my password I use vim", "forget my password, I use vim", "Forget my password: I use vim",
+      "忘掉我的密码。我用 vim", "忘掉密码：我用 vim", "Forget my password — I use vim.", "Forget my password - I use vim",
+      "Forget my password (I use vim)", "Forget my password \"I use vim\"",
       "Please don’t (forget I use vim)", "I never said \"forget I use vim\"", "Please don't — forget I use vim",
-      // Not wanting it deleted is no request to delete it.
       "我不想删除这条关于 vim 的记忆", "我不希望删除这条关于 vim 的记忆", "这条 vim 记忆为什么被删除了",
+      "Please do not delete this memory about vim", "please delete the note about the weather",
+      "forget that I use vim", "delete the vim memory", "把关于 vim 的那条记忆删掉", "忘掉我用 vim 这件事", "Please forget I use vim.",
+      `Do not do this: forget memory #${id}`, `Do not do this, forget memory #${id}`, `Do not do this. forget memory #${id}`,
+      `I never said "forget memory #${id}"`, `don't forget memory #${id}`, `do not undo memory #${id}`, `不要忘掉记忆 #${id}`,
+      `别撤销记忆 #${id}`, `forget memory #${id}?`, `forget memory #${id} and #${id + 1}`, `forget memory #${id}\nno wait, keep it`,
+      `Forget memory #${id}. I use vim.`, `what happens if I say forget memory #${id}`, `forget memory #${id + 1}`,
+      `forget memory ${id}`, `forget memory #0${id}`, `forget memories #${id}`,
     ];
-    for (const said of incidental) {
+    for (const said of refused) {
       const m = await turn(sid, said);
       for (const undo of [false, true]) {
         const r = await tool("forget_memory", sid, m.messageId, { id, evidence_quote: said, undo });
-        assert.equal(r.ok, false, `${said} (undo ${undo}): mentions forgetting, asks nothing`);
+        assert.equal(r.ok, false, `${JSON.stringify(said)} (undo ${undo}) is not the command`);
+        assert.ok(r.text.includes(`"${undo ? "undo" : "forget"} memory #${id}"`), `the refusal names the exact phrase: ${r.text}`);
       }
       await w.closeRun(m.taskId);
     }
-    // The model picks the quote: an excerpt that drops the user's negation or the stop between two clauses is still
-    // read in the user's own clause.
-    const excerpts = [
-      ["Please do not delete this memory about vim", "delete this memory about vim"],
-      ["我不想删除这条关于 vim 的记忆", "删除这条关于 vim 的记忆"],
-      ["Forget my password. I use vim.", "Forget my password I use vim"],
-      // The quote is the request itself, not another sentence of a message that has one.
-      [`Forget memory #${id}. I use vim.`, "I use vim"],
-    ];
-    for (const [said, quote] of excerpts) {
-      const m = await turn(sid, said);
-      const r = await tool("forget_memory", sid, m.messageId, { id, evidence_quote: quote });
-      assert.equal(r.ok, false, `${quote} out of ${said}: the user asked nothing`);
+    assert.equal((await entries()).length, 1);
+    const refusals = await w.q("SELECT reason FROM claw_memory_events WHERE op = 'refused' AND entry_id = $1", [id]);
+    assert.deepEqual([...new Set(refusals.map((e) => e.reason))], ["not_the_users_command"]);
+    assert.equal(refusals.length, refused.length * 2);
+
+    // The command commands its own op only, in its own turn only.
+    const forgetSaid = await turn(sid, `forget memory #${id}`);
+    assert.equal((await tool("forget_memory", sid, forgetSaid.messageId, { id, undo: true })).ok, false, "forget is not undo");
+    await w.closeRun(forgetSaid.taskId);
+    const later = await turn(sid, "thanks");
+    assert.equal((await tool("forget_memory", sid, later.messageId, { id })).ok, false, "an earlier turn's command is spent");
+    await w.closeRun(later.taskId);
+    const undoSaid = await turn(sid, `undo memory #${id}`);
+    assert.equal((await tool("forget_memory", sid, undoSaid.messageId, { id })).ok, false, "undo is not forget");
+    await w.closeRun(undoSaid.taskId);
+    assert.equal((await entries()).length, 1);
+
+    for (const command of [
+      `forget memory #${id}`, `Forget Memory #${id}.`, `please forget memory # ${id}!`, `  FORGET   memory   #${id}  `,
+      `ｆｏｒｇｅｔ ｍｅｍｏｒｙ ＃${id}`, `忘掉记忆 #${id}`, `请忘掉记忆#${id}。`,
+    ]) {
+      await w.q("TRUNCATE claw_memory_entries, claw_memory_events");
+      await w.q("SELECT setval(pg_get_serial_sequence('claw_memory_entries', 'id'), $1, false)", [id]);
+      const s = await turn(sid, "remember I use vim");
+      await tool("save_memory", sid, s.messageId, save("uses vim", "uses vim", "I use vim"));
+      await w.closeRun(s.taskId);
+      assert.equal(Number((await entries())[0].id), id);
+      const m = await turn(sid, command);
+      const r = await tool("forget_memory", sid, m.messageId, { id });
+      assert.equal(r.ok, true, `${JSON.stringify(command)}: ${r.text}`);
+      assert.deepEqual(await entries(), []);
       await w.closeRun(m.taskId);
     }
-    assert.equal((await entries()).length, 1);
-    const t1 = await turn(sid, "please delete the note about the weather");
-    const other = await tool("forget_memory", sid, t1.messageId, { id, evidence_quote: "please delete the note about the weather" });
-    assert.equal(other.ok, false, "a request to forget something else is not a request to forget this");
-    assert.equal((await entries()).length, 1);
-    await w.closeRun(t1.taskId);
-    const byName = await turn(sid, "forget that I use vim");
-    assert.equal((await tool("forget_memory", sid, byName.messageId, { id, evidence_quote: "forget that I use vim" })).ok, true);
-    assert.deepEqual(await entries(), []);
-    await w.closeRun(byName.taskId);
-    await tool("save_memory", sid, (await turn(sid, "remember I use vim")).messageId, save("uses vim", "uses vim", "I use vim"));
-    await w.q("UPDATE claw_tasks SET status = 'completed'");
-    const id2 = Number((await entries())[0].id);
-    const t2 = await turn(sid, `撤销记忆 #${id2}`);
-    const asked = await tool("forget_memory", sid, t2.messageId, { id: id2, evidence_quote: `撤销记忆 #${id2}`, undo: true });
-    assert.equal(asked.ok, true, asked.text);
-    assert.deepEqual(await entries(), []);
-    await w.closeRun(t2.taskId);
-    for (const [said, quote] of [
-      ["delete the vim memory"], ["把关于 vim 的那条记忆删掉"], ["忘掉我用 vim 这件事"], ["Please forget I use vim."],
-      ["ok, please forget that I use vim, thanks", "forget that I use vim"],
-      ["Please forget that I use vim (I switched to emacs)", "forget that I use vim"],
-    ]) {
-      await tool("save_memory", sid, (await turn(sid, "remember I use vim")).messageId, save("uses vim", "uses vim", "I use vim"));
-      await w.q("UPDATE claw_tasks SET status = 'completed'");
+
+    // Undo: an edited entry goes back, a new one goes.
+    for (const command of ["undo memory #", "撤销记忆 #"]) {
+      await w.q("TRUNCATE claw_memory_entries, claw_memory_events");
+      const s = await turn(sid, "remember I use vim. no, I use neovim now");
+      await tool("save_memory", sid, s.messageId, save("uses vim", "uses vim", "I use vim"));
       const n = Number((await entries())[0].id);
-      const m = await turn(sid, said);
-      const r = await tool("forget_memory", sid, m.messageId, { id: n, evidence_quote: quote ?? said });
-      assert.equal(r.ok, true, `${said}: ${r.text}`);
-      assert.deepEqual(await entries(), []);
+      assert.equal((await tool("update_memory", sid, s.messageId, { id: n, title: "uses neovim", body: "uses neovim", evidence_quote: "I use neovim now" })).ok, true);
+      await w.closeRun(s.taskId);
+      const m = await turn(sid, `${command}${n}`);
+      const r = await tool("forget_memory", sid, m.messageId, { id: n, undo: true });
+      assert.equal(r.ok, true, r.text);
+      assert.deepEqual((await entries()).map((e) => e.title), ["uses vim"]);
       await w.closeRun(m.taskId);
     }
   });
@@ -677,4 +684,31 @@ describe("memory v2", { skip }, () => {
       Object.assign(p, pristine);
     }
   });
+});
+
+test("G1 memoryCommand reads only the whole fixed command", async () => {
+  const { memoryCommand } = await import("../src/memory/gates.js");
+  const table: Array<[string, { op: string; id: number } | null]> = [
+    ["forget memory #3", { op: "forget", id: 3 }],
+    ["Please forget memory #3.", { op: "forget", id: 3 }],
+    ["undo memory # 12!", { op: "undo", id: 12 }],
+    ["ＵＮＤＯ ＭＥＭＯＲＹ ＃１２", { op: "undo", id: 12 }],
+    ["忘掉记忆 #3", { op: "forget", id: 3 }],
+    ["请撤销记忆#3。", { op: "undo", id: 3 }],
+    ["Do not do this: forget memory #3", null],
+    ["Do not do this, forget memory #3", null],
+    ["don't forget memory #3", null],
+    ["不要忘掉记忆 #3", null],
+    ["forget memory #3?", null],
+    ["forget memory #3 please", null],
+    ["forget memory 3", null],
+    ["forget memory #03", null],
+    ["forget memory #0", null],
+    ["forget memory #99999999999999999999", null],
+    ["forget memory #3\nkeep it", null],
+    ["\"forget memory #3\"", null],
+    ["forget that I use vim", null],
+    ["", null],
+  ];
+  for (const [said, want] of table) assert.deepEqual(memoryCommand(said), want, JSON.stringify(said));
 });
