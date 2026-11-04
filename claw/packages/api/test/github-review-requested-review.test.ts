@@ -147,6 +147,7 @@ test("P2 skill selection is skipped for a requested review, and not for the owne
   // The assistant's tables, which this harness does not make: the owner's own review is asked whether it is a router's turn.
   await h.sql("CREATE TABLE IF NOT EXISTS claw_assistants (user_id TEXT PRIMARY KEY, session_id TEXT)");
   await h.sql("CREATE TABLE IF NOT EXISTS claw_work_items (item_id TEXT, user_id TEXT, seq INT, title TEXT, worker_session_id TEXT, kind TEXT)");
+  await h.sql("CREATE TABLE IF NOT EXISTS claw_assistant_scopes (user_id TEXT, scope TEXT, session_id TEXT)");
   assert.equal(await role.skipsSkillSelection("s-req"), true);
   assert.equal(await role.skipsSkillSelection("s-own"), false);
 });
