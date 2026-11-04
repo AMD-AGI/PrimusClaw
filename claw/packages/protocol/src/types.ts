@@ -656,3 +656,23 @@ export interface UserInfo {
 }
 
 export type EventCallback = (payload: Record<string, unknown>) => void | Promise<void>;
+
+/**
+ * The MCP server the API adds to a turn for the model's trigger tools, and the API path it is served on. Its
+ * `requires_approval` holds those tools for the user and nothing else: Brain does not count it as an operator's
+ * approval policy, which would let HITL_ENABLED ask about every other call of the turn, turns nobody is watching
+ * included. Brain knows it by both name and path, so an operator's own server that happens to share the name
+ * still counts as a policy.
+ */
+export const TRIGGER_MCP_SERVER = "schedules";
+export const TRIGGER_MCP_PATH = "/v1/internal/trigger-mcp";
+
+/** Whether an MCP server entry is the one the API adds for the trigger tools. */
+export function isTriggerMcpServer(name: string, spec: Record<string, unknown> | undefined): boolean {
+  if (name !== TRIGGER_MCP_SERVER || typeof spec?.url !== "string") return false;
+  try {
+    return new URL(spec.url).pathname === TRIGGER_MCP_PATH;
+  } catch {
+    return false;
+  }
+}

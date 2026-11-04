@@ -2150,9 +2150,9 @@ export async function takeSessionGate(
     status: "running",
     // Unconditional, as it has always been: this runs after the turn is
     // published, so the run it names exists and its completion is the releaser.
-    // (That it can still write over an owner installed in between is recorded
-    // as a separate pre-existing issue; the chokepoint is what makes it one
-    // line to change when that is addressed.)
+    // A drain takes it holding the session's drain claim, which a message sent
+    // through `submitSessionMessage` waits for (`drain-claim.ts`); the sandbox
+    // start and A2A sends do not wait, so they can still be written over.
     force: true,
     expectReleaser: true,
     ...(client ? { q: client as { query: (t: string, p?: unknown[]) => Promise<{ rowCount: number | null }> } } : {}),

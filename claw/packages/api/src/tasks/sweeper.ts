@@ -2315,21 +2315,10 @@ export async function drainOrphanedPendingMessages(limit = 20): Promise<number> 
     try {
       // Re-asked immediately before dispatching, because the SELECT above is a
       // snapshot of the whole batch: a send can acquire any of these sessions
-      // between that read and this call, and dispatching then puts a second
-      // turn onto a live one.
-      //
-      // This narrows the window to a single statement; it does not close it.
-      // Closing it needs an atomic claim on the session, which this path has no
-      // field for -- the gate marker names a turn, and the drain has no turn to
-      // name until `drainOldestPendingMessage` has read one. Recorded as a
-      // follow-up rather than invented here.
-      //
-      // There is no standing bound to lean on in the meantime, and an earlier
-      // version of this comment claimed one: it said the dispatch below decides
-      // admission under `withOwnedAdmissionLock`, which serialises creation.
-      // That lock is skipped when every ceiling is zero, which is the default,
-      // so on a default deployment it serialises nothing. Saying so mattered --
-      // a reader who believed it would treat the window as covered.
+      // between that read and this call. What closes the rest of the window is
+      // the drain's own claim on the session (`withPendingDrainClaim`): a drain
+      // the completion handler is running at the same moment is waited for, and
+      // the session it leaves running is not drained again.
       const stillFree = await db.query(
         `SELECT 1 FROM claw_sessions s
           WHERE s.session_id = $1

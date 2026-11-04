@@ -66,6 +66,8 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
       "agent_gate_message_id",
       // Absent, the read that gives a turn its model fails, and so does every turn.
       "model",
+      // Absent, every message to a session and every drain of its queue fails.
+      "pending_drain_until",
     ],
   },
   {

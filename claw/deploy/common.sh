@@ -230,6 +230,11 @@ PG_SSL_NO_VERIFY="${PG_SSL_NO_VERIFY:-}"
 # re-renders api and brain from this file alone.
 EXTRA_CA_CERTS_CONFIGMAP="${EXTRA_CA_CERTS_CONFIGMAP:-}"
 EXTRA_CA_CERTS_KEY="${EXTRA_CA_CERTS_KEY:-}"
+
+# "true" mounts Secret primus-claw-grant-signing-key into api and sends grants
+# to the sandbox Router (grantSigningKey.* in the chart). Empty means off.
+# Recorded here because upgrade.sh re-renders api and brain from this file alone.
+GRANT_SIGNING_KEY_ENABLED="${GRANT_SIGNING_KEY_ENABLED:-}"
 EOF
   chmod 600 "$_VALUES_FILE"
   unset _BOOT_USER_ENV_KEY _BOOT_AUTH_TOKEN
@@ -249,7 +254,8 @@ _SHELL_S3_SECRET_KEY="${S3_SECRET_KEY:-}"
 # Fields the file may leave blank for the shell to answer, and which the run
 # that answers one records for every run after it: the Doorbell switches and
 # admission ceilings, the background-shell runtime's enablement, bash ceiling,
-# keepalive bounds and child-UID range, and the API's PG certificate policy.
+# keepalive bounds and child-UID range, the API's PG certificate policy, and
+# the grant signing key.
 # Adding a key here is all it takes to give it the whole
 # capture -> file-wins -> write-back cycle below.
 CLAW_RECORDED_KEYS="AGENT_SANDBOX_SESSION_TIMEOUT AGENT_SANDBOX_MAX_SESSION_DURATION
@@ -261,7 +267,8 @@ SANDBOX_KEEPALIVE_TARGET_CEILING SANDBOX_KEEPALIVE_RECONCILE_RESERVE
 SANDBOX_KEEPALIVE_IDLE_DEADLINE_SEC
 HANDS_CHILD_UID_MIN HANDS_CHILD_UID_MAX HANDS_CHILD_ISOLATION
 PG_SSL_NO_VERIFY
-EXTRA_CA_CERTS_CONFIGMAP EXTRA_CA_CERTS_KEY"
+EXTRA_CA_CERTS_CONFIGMAP EXTRA_CA_CERTS_KEY
+GRANT_SIGNING_KEY_ENABLED"
 for _recorded_key in $CLAW_RECORDED_KEYS; do
   eval "_SHELL_${_recorded_key}=\${${_recorded_key}:-}"
 done
@@ -918,7 +925,7 @@ render_chart() {
     ${PG_SSL_NO_VERIFY:+--set postgres.sslNoVerify="$PG_SSL_NO_VERIFY"} \
     ${EXTRA_CA_CERTS_CONFIGMAP:+--set-string tls.extraCACertsConfigMap="$EXTRA_CA_CERTS_CONFIGMAP"} \
     ${EXTRA_CA_CERTS_KEY:+--set-string tls.extraCACertsKey="$EXTRA_CA_CERTS_KEY"} \
-    ${GRANT_SIGNING_KEY_ENABLED:+--set grantSigningKey.enabled="$GRANT_SIGNING_KEY_ENABLED"} \
+    ${GRANT_SIGNING_KEY_ENABLED:+--set grantSigningKey.enabled="$([ "${GRANT_SIGNING_KEY_ENABLED,,}" = true ] && echo true || echo false)"} \
     ${preserved[@]+"${preserved[@]}"} \
     "$@" \
     --show-only "templates/$template" > "$dst" || { rm -f "$extra_values"; return 1; }

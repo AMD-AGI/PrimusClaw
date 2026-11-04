@@ -12,6 +12,8 @@ import { resolveTaskPlugin } from "../marketplace/plugins.js";
 import { buildMessages } from "../sessions/context-builder.js";
 import { sessionModelFromRow } from "../sessions/session-model.js";
 import { sessionRepoFromRow } from "../sessions/session-repo.js";
+import { withPendingDrainClaim } from "../sessions/drain-claim.js";
+import { WORK_EVENT_PREFIX } from "../assistant/prompts.js";
 import { memoryAccess } from "../memory/service.js";
 import { scanMemoryContent } from "../memory/gates.js";
 import {
@@ -1200,6 +1202,7 @@ async function handleComplete(
       await completionPorts.deliverUnsaidAnswer({
         sessionId,
         runIds: endedRunIds,
+        messageId: messageId ?? undefined,
         failed: Boolean(failed),
         interrupted: Boolean(interrupted),
         fromSweeper: (event as any).completion_source === "sweeper",
@@ -1287,25 +1290,33 @@ try {
 }
 
 /**
- * Dispatch the oldest message parked behind this session, if there is one.
+ * Dispatch the next message parked behind this session, if there is one and the session is free.
  *
  * Extracted from the completion handler rather than duplicated, because the
  * sweeper has to be able to run exactly this path: a dispatch that fails
  * before execution emits no completion, so a session idled by publish-failure
  * cleanup with a row still in the queue has no trigger left and that turn is
- * parked for ever. Callers are responsible for proving the session is free.
+ * parked for ever. Every caller drains through the session's claim
+ * (`withPendingDrainClaim`), which is what keeps two of them from starting two turns.
  */
 export async function drainOldestPendingMessage(
   sessionId: string,
   userId: string,
 ): Promise<void> {
+  await withPendingDrainClaim(sessionId, () => drainNextPendingMessage(sessionId, userId));
+}
+
+async function drainNextPendingMessage(sessionId: string, userId: string): Promise<void> {
   // `session_model` is read with the row rather than stored on it: the message
   // may have waited behind a long turn, and the model that applies is the one the
   // session has when the message is sent on, which is what a change "from the next
   // turn" means for a turn that was already parked.
+  //
+  // A worker's report queued for the assistant waits behind what its user sent: the user is waiting for an answer,
+  // and the report is on the board already, where the turn answering the user reads it.
   const pending = (await db.query(
-  "SELECT id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology, tools_allowlist, (SELECT model FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_model, (SELECT config->'repo' FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_repo FROM claw_pending_messages WHERE session_id = $1 ORDER BY created_at LIMIT 1",
-  [sessionId],
+  "SELECT id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology, tools_allowlist, (SELECT model FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_model, (SELECT config->'repo' FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_repo FROM claw_pending_messages WHERE session_id = $1 ORDER BY starts_with(content, $2), created_at LIMIT 1",
+  [sessionId, WORK_EVENT_PREFIX],
 )).rows[0];
 
 if (pending) {

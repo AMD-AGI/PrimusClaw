@@ -1194,6 +1194,8 @@ export async function initDb(): Promise<void> {
     // value for every session created before the column existed and for one that
     // never chose: such a turn carries no model and Brain uses its DEFAULT_MODEL.
     await addCol("model", "TEXT");
+    // Until when a drain of the session's queue is under way (`sessions/drain-claim.ts`). NULL: none is.
+    await addCol("pending_drain_until", "TIMESTAMPTZ");
     await client.query("CREATE INDEX IF NOT EXISTS idx_sessions_user ON claw_sessions(user_id, created_at DESC)").catch(() => {});
     await client.query("CREATE INDEX IF NOT EXISTS idx_sessions_context ON claw_sessions(context_id) WHERE context_id != ''").catch(() => {});
     await client.query("CREATE INDEX IF NOT EXISTS idx_sessions_a2a_caller ON claw_sessions(a2a_caller_id) WHERE a2a_caller_id != ''").catch(() => {});
