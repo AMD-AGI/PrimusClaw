@@ -25,7 +25,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { bindRepo, renderRepoBlock, REPO_INSTRUCTIONS_MAX_BYTES, REPO_TRUNCATION_MARKER, GIT_CREDENTIAL_HELPER } from "../src/workspace/repo-binding.js";
+import { bindRepo, renderRepoBlock, REPO_INSTRUCTIONS_MAX_BYTES, REPO_TRUNCATION_MARKER, GIT_CREDENTIAL_HELPER, BACKGROUND_REPOLL_MS } from "../src/workspace/repo-binding.js";
 
 const FAKE_TOKEN = "ghp_0123456789abcdefghijklmnopqrstuvwxyzAB";
 const URL_BASE = "https://git.example.invalid/example-org";
@@ -724,9 +724,9 @@ test("GB5 a background clone that finishes is not stopped", async () => {
 });
 
 for (const shellClass of ["lost", "ended_unreaped"] as const) {
-  test(`GB6 a background clone whose shell is ${shellClass} fails at once instead of waiting on it again`, async () => {
+  test(`GB6 a background clone whose wait does not block (${shellClass}) is asked again only after a pause`, async () => {
     const s = sandbox(`gb6-${shellClass}`);
-    let waits = 0;
+    const asked: number[] = [];
     const kills: unknown[] = [];
     const hands = {
       async callToolFull(name: string, args: Record<string, unknown>) {
@@ -734,8 +734,9 @@ for (const shellClass of ["lost", "ended_unreaped"] as const) {
           return { text: "Started background shell sh-1.", isError: false, structured: { shell_id: "sh-1" } };
         }
         if (name === "wait") {
-          // Bounded so that a loop that keeps asking ends the test red rather than hanging it.
-          if (++waits > 3) return { text: "Error: asked again", isError: true };
+          asked.push(performance.now());
+          // Ends the clone after three answers, so a loop that never pauses ends red rather than spinning to the deadline.
+          if (asked.length >= 3) return { text: "Error: the sandbox went away", isError: true };
           return {
             text: `Shell sh-1 is ${shellClass}; nothing was waited for`, isError: false,
             structured: { shell_id: "sh-1", shell_class: shellClass, blocking: false, finished: false, status: null, exit_code: null, waited_sec: 0 },
@@ -747,8 +748,11 @@ for (const shellClass of ["lost", "ended_unreaped"] as const) {
     };
     const b = await bindRepo(hands, { url: REPO_URL }, { root: s.root, stateDir: s.state, background: true });
     assert.equal(b.state, "failed", JSON.stringify(b));
-    assert.equal(waits, 1, "the clone was waited on again after the wait said there was nothing to wait for");
-    assert.match(b.failure ?? "", new RegExp(shellClass));
+    assert.equal(asked.length, 3);
+    for (let i = 1; i < asked.length; i++) {
+      assert.ok(asked[i] - asked[i - 1] >= BACKGROUND_REPOLL_MS - 50,
+        `wait was asked again ${Math.round(asked[i] - asked[i - 1])}ms after an answer that did not wait`);
+    }
     assert.deepEqual(kills, ["sh-1"]);
   });
 }
