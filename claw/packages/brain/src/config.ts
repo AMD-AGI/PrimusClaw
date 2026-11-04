@@ -1714,7 +1714,10 @@ export const TODO_WRITE_ENABLED = envBool("TODO_WRITE_ENABLED", true);
 // --- Deliver File ---
 // `deliver_file`: the agent hands a workspace file to the user as a download
 // (tools/deliver-file.ts). The cap is what Hands reads into memory to upload it.
-export const DELIVER_FILE_ENABLED = envBool("DELIVER_FILE_ENABLED", true);
+// Off by default in kubernetes mode: the download answers only an interactive sign-in
+// (a SaFE cookie or an identity-provider token), and a BYOK key is not one because the
+// sandbox holds the same key. Turn it on there when users sign in with identity tokens.
+export const DELIVER_FILE_ENABLED = envBool("DELIVER_FILE_ENABLED", !isKubernetesMode());
 export const DELIVER_FILE_MAX_BYTES = envInt("DELIVER_FILE_MAX_BYTES", 100 * 1024 * 1024, { min: 1 });
 
 // --- Plan Mode ---
