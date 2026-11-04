@@ -422,7 +422,10 @@ export function counted(source: string, flags: string): CountedPattern {
       }
       if (end >= 0 && global) {
         // Every match in turn, each compared with V8's next one; the next search starts where this match ended (one on, if it was empty).
-        same(text, Array.from(caps), nativeGlobal.exec(text), start);
+        const next = nativeGlobal.exec(text);
+        // As `matchAll` and `replace` do: an empty match moves the next search on by one.
+        if (next !== null && next[0] === "") nativeGlobal.lastIndex += 1;
+        same(text, Array.from(caps), next, start);
         caps.fill(-1);
         reg.fill(-1);
         start = end > start ? end - 1 : start;
