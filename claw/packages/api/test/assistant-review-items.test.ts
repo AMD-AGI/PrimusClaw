@@ -349,12 +349,12 @@ describe("assistant review items", { skip }, () => {
     await confirmation(merging.session_id, "merging");
     const merged = await one("alice", { prs: [PR(400)] });
     await audit(merged.session_id, "gh_pr_merge", "ok", "merged");
-    for (const [it, code] of [[merging, "merge_in_progress"], [merged, "already_merged"]] as const) {
+    for (const [it, code, pr] of [[merging, "merge_in_progress", 300], [merged, "already_merged", 400]] as const) {
       const turn = await w.routerTurn(alice);
-      // Stopping a review is the person's say (`attendedTurn`): the turn answers their signed-in message.
+      // Stopping a review is the person's say (`attendedTurn`): the turn answers their signed-in message, which names it.
       await w.q(
-        `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content, attended_via) VALUES ($1, $2, 'alice', 'stop it', '{"kind":"person"}'::jsonb)`,
-        [alice.routerSid, turn.mid],
+        `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content, attended_via) VALUES ($1, $2, 'alice', $3, '{"kind":"person"}'::jsonb)`,
+        [alice.routerSid, turn.mid, `stop ${pr}`],
       );
       await assert.rejects(w.mod.tools.workStop(turn, { item_id: it.item_id, reason: "stop it" }), (err: any) => err.code === code, code);
       await w.closeRun(turn.task_id);

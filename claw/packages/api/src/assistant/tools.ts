@@ -256,7 +256,12 @@ export async function workStop(
       // Stopping a review also denies what waits for the person's answer in it: that is their say, so a report's turn,
       // or one that read a worker's words, cannot. The stop button on the item needs nothing (the person pressed it).
       const kind = (await query("SELECT kind FROM claw_work_items WHERE item_id = $1", [item.item_id])).rows[0]?.kind;
-      if (kind === "review") await attendedTurn(query, claims);
+      if (kind === "review") {
+        const { message } = await attendedTurn(query, claims);
+        // Which review is the person's say too, as it is for a restart (`review-tools.ts`, loaded here to keep the two modules acyclic).
+        const { requireReviewNamed } = await import("./review-tools.js");
+        await requireReviewNamed(query, userId, message, item.item_id);
+      }
     },
   });
   if (stopped.status === "not_found") throw new ToolRefused("item_not_found", "no such item");

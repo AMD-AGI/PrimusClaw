@@ -20,14 +20,17 @@
  *   S2  a pull request must be in the user's message, as a number of its own
  *   S2b a number written in full with its repository binds the two
  *   S3  a repository must be named, the channel's own, or one of the user's recent reviews
+ *   S3b a repository is named whole: not by a longer name that starts with it, nor under another owner
  *   S4  a reviewer is the user, or someone the channel listed with a Claw user id
  *   S5  a model must be named by the user
  *   S6  what the review service refuses reaches the model as it said it, with its data
  *   R1  review_restart takes a review the user pointed at, and only a review
+ *   R1b an item number is read whole: #11 does not point at #1, nor repo#1 at item #1
  *   C1  confirmation_answer allows only a write the user named (or the only one, asked before they wrote); deny needs no name
  *   M1  review_mode_set can only make reviews ask more
  *   X1  channel_action emits the listed action once, to the channel that carried the message
  *   W1  work_send refuses a review item; work_stop stops one only in a turn that answers the person
+ *   W2  work_stop stops only the review the person's message points at
  *   P1  a user's message stops the router turn that is reading a report, and never one that answers them
  *   F1  a turn that answered the user and failed says so once, in their language; a report's turn does not
  *   T1  the tools exist only with CLAW_ASSISTANT_TOOLS on
@@ -322,6 +325,18 @@ describe("assistant review tools", { skip }, () => {
     assert.equal(calls.start.length, 2);
   });
 
+  test("S3b a repository is named whole: not by a longer name that starts with it, nor under another owner", async () => {
+    const bare = { channel: "teams", channel_message_id: "a" };
+    for (const text of ["审 AMD-AGI/PrimusClaw-fork 254", "审 AMD-AGI/PrimusClaw.old 254", "审 someone/PrimusClaw 254", "审 PrimusClaw-fork 254"]) {
+      const turn = await userTurn(alice, text, { context: bare });
+      assert.equal(await code(rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#254"], merge: false })), "repo_not_grounded", text);
+    }
+    assert.equal(calls.start.length, 0);
+    for (const text of ["审 AMD-AGI/PrimusClaw 254", "审 AMD-AGI/PrimusClaw.", "https://github.com/AMD-AGI/PrimusClaw/pull/254 审一下", "审 primusclaw的254"]) {
+      assert.equal(rt.repoGrounded(text, { owner: "AMD-AGI", repo: "PrimusClaw" }, [], []), true, text);
+    }
+  });
+
   test("S4 a reviewer is the user, or someone the channel listed with a Claw user id", async () => {
     const ctx = { ...DEFAULT_CTX, people: [{ name: "Wei Lei", user_id: "u-weilei" }, { name: "Chao", email: "chao@amd.com" }] };
     const turn = await userTurn(alice, "请 Chao 审 254", { context: ctx });
@@ -386,6 +401,19 @@ describe("assistant review tools", { skip }, () => {
     const bobs = await userTurn(alice, "重审 300");
     assert.equal(await code(rt.reviewRestart(bobs, { item_id: bobItem })), "item_not_found");
     assert.equal(calls.restart.length, 4);
+  });
+
+  test("R1b an item number is read whole: #11 does not point at #1, and repo#1 is a pull request, not item #1", async () => {
+    const one = await reviewItem(alice, 1, { owner: "AMD-AGI", repo: "PrimusClaw", number: 254 });
+    await reviewItem(alice, 11, { owner: "AMD-AGI", repo: "PrimusClaw", number: 257 });
+    for (const text of ["#11 换 opus 重审", "AMD-AGI/Primus-Turbo#1 换 opus 重审"]) {
+      const turn = await userTurn(alice, text);
+      assert.equal(await code(rt.reviewRestart(turn, { item_id: one, model: "claude-opus-4-8" })), "item_not_in_message", text);
+    }
+    assert.equal(calls.restart.length, 0);
+    const right = await userTurn(alice, "#1 换 opus 重审");
+    await rt.reviewRestart(right, { item_id: one, model: "claude-opus-4-8" });
+    assert.equal(calls.restart.length, 1);
   });
 
   test("C1 confirmation_answer allows only a write the user named; deny needs no name", async () => {
@@ -480,6 +508,26 @@ describe("assistant review tools", { skip }, () => {
     const task = await w.createItem(alice, "Fix the build");
     const another = await w.routerTurn(alice);
     assert.equal((await w.mod.tools.workStop(another, { item_id: task.itemId, reason: "done" })).outcome, "stopped");
+  });
+
+  test("W2 work_stop stops only the review the person's message points at", async () => {
+    const r254 = await reviewItem(alice, 1, { owner: "AMD-AGI", repo: "PrimusClaw", number: 254 });
+    const r257 = await reviewItem(alice, 2, { owner: "AMD-AGI", repo: "PrimusClaw", number: 257 });
+    const held = await confirmation(alice.userId, 257);
+    await w.q("UPDATE claw_github_confirmations SET session_id = $1 WHERE confirmation_id = $2", [`ws_${r257}`, held]);
+    for (const text of ["把 254 的 review 停一下", "停一下", "#22 停掉"]) {
+      const turn = await userTurn(alice, text);
+      assert.equal(await code(w.mod.tools.workStop(turn, { item_id: r257, reason: "user said stop" })), "item_not_in_message", text);
+      await w.closeRun(turn.task_id);
+    }
+    assert.equal((await w.item(r257)).board_state, "in_progress", "a review the person did not name is not stopped");
+    assert.equal((await w.q("SELECT status FROM claw_github_confirmations WHERE confirmation_id = $1", [held]))[0].status, "pending",
+      "and what waits in it for their answer is not denied");
+    const byNumber = await userTurn(alice, "把 257 停掉");
+    assert.equal((await w.mod.tools.workStop(byNumber, { item_id: r257, reason: "user said stop" })).outcome, "stopped");
+    await w.closeRun(byNumber.task_id);
+    const bySeq = await userTurn(alice, "#1 停掉");
+    assert.equal((await w.mod.tools.workStop(bySeq, { item_id: r254, reason: "user said stop" })).outcome, "stopped");
   });
 
   test("P1 a user's message stops the router turn reading a report, and never one that answers them", async () => {

@@ -106,14 +106,23 @@ export function mentionsNumber(text: string, n: number): boolean {
   return new RegExp(`(?<![0-9])${n}(?![0-9])`).test(text);
 }
 
+const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 /** Whether the repository is one the person meant: named in the message, the channel's own, or one they reviewed in lately. */
 export function repoGrounded(text: string, pr: Pick<PrRef, "owner" | "repo">, channelRepos: readonly string[], recentRepos: readonly string[]): boolean {
   const full = lower(`${pr.owner}/${pr.repo}`);
   if ([...channelRepos, ...recentRepos].some((r) => lower(r) === full)) return true;
   const t = lower(text);
-  if (t.includes(full)) return true;
-  const name = lower(pr.repo).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(?<![a-z0-9_.-])${name}(?![a-z0-9_-])`).test(t);
+  // The whole name, not the start of a longer one: `PrimusClaw` is not named by `PrimusClaw-fork` or `PrimusClaw.old`.
+  // A bare name counts unless it is written under an owner (`other/PrimusClaw` names another owner's repository).
+  const whole = (name: string, before: string) =>
+    new RegExp(`(?<![${before}])${escapeRe(name)}(?![a-z0-9_-]|\\.[a-z0-9_-])`).test(t);
+  return whole(full, "a-z0-9_.-") || whole(lower(pr.repo), "a-z0-9_./-");
+}
+
+/** Whether the text points at a work item by its number: `#12`, not `#123`, and not `repo#12` (a pull request). */
+export function mentionsItem(text: string, seq: number): boolean {
+  return new RegExp(`(?<![A-Za-z0-9_.-])#${seq}(?![0-9])`).test(text);
 }
 
 /**
@@ -221,13 +230,41 @@ export async function reviewStart(
 }
 
 /** The user's review items the router could mean, newest first: the open ones and those closed in the last day. */
-async function reviewItemsOf(q: Querier, userId: string): Promise<Array<{ item_id: string; seq: number; params: Record<string, any> }>> {
+type ReviewRow = { item_id: string; seq: number; params: Record<string, any> };
+
+async function reviewItemsOf(q: Querier, userId: string): Promise<ReviewRow[]> {
   return (await q(
     `SELECT item_id, seq, params FROM claw_work_items
       WHERE user_id = $1 AND kind = 'review' AND (board_state <> 'done' OR closed_at > NOW() - INTERVAL '1 day')
       ORDER BY seq DESC`,
     [userId],
-  )).rows as Array<{ item_id: string; seq: number; params: Record<string, any> }>;
+  )).rows as ReviewRow[];
+}
+
+/**
+ * Whether the person's message points at this review: its pull request (with the repository when another of their reviews
+ * shares the number), its item number, or it is the only review they have.
+ */
+function pointsAtReview(message: TurnMessage, reviews: ReviewRow[], item: ReviewRow): boolean {
+  const pr = item.params?.pr as PrRef | undefined;
+  const number = Number(pr?.number);
+  // A number shared by reviews in two repositories names neither, unless the repository is named too.
+  const sharing = reviews.filter((r) => Number(r.params?.pr?.number) === number).length;
+  const byNumber = !!pr && prGrounded(message.content, pr)
+    && (sharing === 1 || repoGrounded(message.content, pr, message.context.repos, []));
+  return byNumber || mentionsItem(message.content, item.seq) || reviews.length === 1;
+}
+
+/**
+ * The refusal `work_stop` gives a review the person's message does not point at. Stopping a review denies what waits in it
+ * for their answer, so which one is their say, as it is for a restart.
+ */
+export async function requireReviewNamed(q: Querier, userId: string, message: TurnMessage, itemId: string): Promise<void> {
+  const reviews = await reviewItemsOf(q, userId);
+  const item = reviews.find((r) => r.item_id === itemId);
+  if (!item || !pointsAtReview(message, reviews, item)) {
+    refuseUngrounded("item_not_in_message", "the user did not say which review to stop: ask them (the pull request number is enough)");
+  }
 }
 
 export async function reviewRestart(
@@ -242,14 +279,7 @@ export async function reviewRestart(
     const reviews = await reviewItemsOf(q, userId);
     const item = reviews.find((r) => r.item_id === named.item.item_id);
     if (!item) throw new ToolRefused("not_a_review_item", "that item is not a review: only a review can be restarted");
-    const pr = item.params?.pr as PrRef | undefined;
-    const number = Number(pr?.number);
-    // A number shared by reviews in two repositories names neither, unless the repository is named too.
-    const sharing = reviews.filter((r) => Number(r.params?.pr?.number) === number).length;
-    const byNumber = !!pr && prGrounded(message.content, pr)
-      && (sharing === 1 || repoGrounded(message.content, pr, message.context.repos, []));
-    const pointed = byNumber || message.content.includes(`#${item.seq}`) || reviews.length === 1;
-    if (!pointed) refuseUngrounded("item_not_in_message", "the user did not say which review: ask them (the pull request number is enough)");
+    if (!pointsAtReview(message, reviews, item)) refuseUngrounded("item_not_in_message", "the user did not say which review: ask them (the pull request number is enough)");
     if (args.model && !modelGrounded(message.content, args.model)) {
       refuseUngrounded("model_not_in_message", "the user did not ask for that model: leave model out to keep the one it had");
     }
