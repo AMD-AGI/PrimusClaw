@@ -479,6 +479,9 @@ export const CLAW_ASSISTANT_ENABLED = envBool("CLAW_ASSISTANT_ENABLED", false);
 export const CLAW_ASSISTANT_ROUTER_MODEL = env("CLAW_ASSISTANT_ROUTER_MODEL");
 // Work items one user may have unfinished (not on the done board) at once.
 export const CLAW_ASSISTANT_MAX_ACTIVE_ITEMS = envInt("CLAW_ASSISTANT_MAX_ACTIVE_ITEMS", 20, { min: 1 });
+// On-behalf GitHub reviews as work items of the assistant (`POST /v1/assistant/reviews`). Needs
+// CLAW_ASSISTANT_ENABLED and CLAW_GITHUB_REVIEW_ENABLED as well; off, the routes do not exist.
+export const CLAW_ASSISTANT_REVIEW_ITEMS = envBool("CLAW_ASSISTANT_REVIEW_ITEMS", false);
 
 // --- Remote agents (default OFF) ---
 // When false: no remote-agent tables, no routes, and nothing polls. A connector

@@ -8,13 +8,10 @@ import { singleflightCreate, type FlightResult } from "../shared/singleflight.js
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions/dispatch.js";
 import { submitSessionMessage } from "../sessions/submit-message.js";
-import { CLAW_GITHUB_REVIEW_ENABLED, SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
+import { SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
 import { actingTurnRefusalFor } from "../github-review/acting-turns.js";
-import { parseActingAs } from "../github-review/acting-as.js";
-import { parseReviewOnly, parseReviewTarget } from "../github-review/review-target.js";
-import { classifyAttendedCaller } from "../github-review/attended.js";
+import { checkSessionCreate } from "../github-review/acting-session.js";
 import { loadUserEnvForSession, withholdsSandboxKeys } from "../github-review/session-tools.js";
-import { readGithubReviewSettings } from "../github-review/settings.js";
 import {
   forceIdleAfterInterrupt, queuedMessageId, releaseSessionGateForTurn, stopSessionRuns, takeSessionGate,
 } from "../tasks/chat-run.js";
@@ -1125,69 +1122,15 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       return reply.status(400).send({ ok: false, error: parsedRepo.error });
     }
 
-    // The user whose GitHub account this session's review tools act as. A reference
-    // only; checked here, before any row exists, and refused while the feature is
-    // off so that a session never silently goes without the tools it asked for.
-    const parsedActingAs = parseActingAs(sessionConfig.acting_as);
-    if (!parsedActingAs.ok) {
-      return reply.status(400).send({ ok: false, error: parsedActingAs.error });
+    // `acting_as`, `review_target`, `review_only`, the model and the effort, and for a session that acts as a user the person's own
+    // credential: checked here, before any row or run exists, by the one function every create of such a session goes through.
+    const checked = checkSessionCreate({ config: sessionConfig, model: body.model, effort: body.effort, user: user ?? null, method: getAuthMethod(req) });
+    if (!checked.ok) {
+      if (checked.log) logger.warn({ userId: user?.userId, method: getAuthMethod(req) ?? "none", clientId: user?.delegation?.clientId?.slice(0, 128) }, checked.log);
+      return reply.status(checked.status).send({ ok: false, error: checked.error });
     }
-    if (parsedActingAs.actingAs !== null) {
-      if (!CLAW_GITHUB_REVIEW_ENABLED) {
-        return reply.status(400).send({ ok: false, error: "config.acting_as is not enabled on this deployment" });
-      }
-      if (!user) {
-        return reply.status(401).send({ ok: false, error: "authentication required" });
-      }
-      // A session that acts as a user is the person's say, and the key a sandbox holds (or a sign-in that key can complete) must not be
-      // able to start one: a model injected in any ordinary session of the user would otherwise review and merge with their account
-      // on its own. The same credentials as answering a held merge (github-review/attended.ts).
-      const caller = classifyAttendedCaller(getAuthMethod(req), user, readGithubReviewSettings().decisionClientIds);
-      if (!caller.ok) {
-        logger.warn({ userId: user.userId, method: getAuthMethod(req) ?? "none", clientId: user.delegation?.clientId?.slice(0, 128) }, `github_review.acting_as_refused_${caller.error}`);
-        return reply.status(403).send({ ok: false, error: caller.error });
-      }
-      // The requester's name for the review footer, from the verified caller.
-      sessionConfig.acting_as_requester = (user.userName || user.userId).slice(0, 100);
-    }
-    // The one pull request the session's review tools may touch. It is only ever set here, and it binds nothing without `acting_as`, which
-    // is why asking for it without one is refused rather than silently ignored.
-    const parsedTarget = parseReviewTarget(sessionConfig.review_target);
-    if (!parsedTarget.ok) {
-      return reply.status(400).send({ ok: false, error: parsedTarget.error });
-    }
-    if (parsedTarget.target !== null && parsedActingAs.actingAs === null) {
-      return reply.status(400).send({ ok: false, error: "config.review_target needs config.acting_as" });
-    }
-    const parsedReviewOnly = parseReviewOnly(sessionConfig.review_only);
-    if (!parsedReviewOnly.ok) {
-      return reply.status(400).send({ ok: false, error: parsedReviewOnly.error });
-    }
-    if (parsedReviewOnly.reviewOnly && parsedActingAs.actingAs === null) {
-      return reply.status(400).send({ ok: false, error: "config.review_only needs config.acting_as" });
-    }
-
-    // The model this session's turns ask for. Checked here, before any row or
-    // run exists, so a malformed name leaves nothing behind. Absent and null both
-    // mean no choice; whether the gateway serves the name is its answer to give,
-    // on the first turn that uses it.
-    let sessionModel: string | null = null;
-    if (body.model !== undefined) {
-      const parsedModel = parseSessionModel(body.model);
-      if (!parsedModel.ok) {
-        return reply.status(400).send({ ok: false, error: parsedModel.error });
-      }
-      sessionModel = parsedModel.model;
-    }
-    // The reasoning effort, checked the same way and stored the same way: what the session's creator asked for, nothing the deployment adds.
-    let sessionEffort: string | null = null;
-    if (body.effort !== undefined) {
-      const parsedEffort = parseSessionEffort(body.effort);
-      if (!parsedEffort.ok) {
-        return reply.status(400).send({ ok: false, error: parsedEffort.error });
-      }
-      sessionEffort = parsedEffort.effort;
-    }
+    const sessionModel = checked.model;
+    const sessionEffort = checked.effort;
 
     if (parentSid && !user) {
       return reply.status(401).send({ ok: false, error: "authentication required" });

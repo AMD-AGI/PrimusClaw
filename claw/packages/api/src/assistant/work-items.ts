@@ -16,6 +16,7 @@
  * report is the caller's job, in the same transaction, from `wake`.
  */
 import { CLAW_ASSISTANT_MAX_ACTIVE_ITEMS } from "../config.js";
+import { closeConfirmationsForStop } from "../github-review/store.js";
 import { db, inTransaction, type Querier, type StatementRunner } from "../infra/db.js";
 import { ITEM_REF_HINT, parseItemRef, type ItemRefError } from "./item-ref.js";
 import { stopSessionRuns } from "../tasks/chat-run.js";
@@ -28,6 +29,10 @@ export const REPORT_KINDS = ["progress", "waiting", "ready", "blocked", "failed"
 export type ReportKind = (typeof REPORT_KINDS)[number];
 
 export type Outcome = "accepted" | "dropped" | "stopped";
+
+/** `task`: a worker that reports does it. `review`: a GitHub review on someone's behalf, whose state is read off what it did (`review-items.ts`). */
+export const ITEM_KINDS = ["task", "review"] as const;
+export type ItemKind = (typeof ITEM_KINDS)[number];
 
 export interface WorkReport {
   kind: ReportKind;
@@ -162,7 +167,7 @@ export async function applyWorkerReport(q: StatementRunner, input: ApplyReport):
 // --- What the user sees ---------------------------------------------------------------
 
 const ITEM_COLUMNS = `item_id, seq, title, summary, board_state, last_report_kind, pending_question,
-  outcome, result_version, accepted_version, worker_session_id, created_at, updated_at, closed_at`;
+  outcome, result_version, accepted_version, worker_session_id, created_at, updated_at, closed_at, kind, params`;
 
 export interface WorkItemView {
   item_id: string;
@@ -176,6 +181,9 @@ export interface WorkItemView {
   result_version: number;
   accepted_version: number | null;
   can_accept: boolean;
+  kind: ItemKind;
+  /** What a review was asked with (`review-items.ts`); `{}` for a task. */
+  params: Record<string, unknown>;
   updated_at: Date;
 }
 
@@ -197,6 +205,8 @@ export function itemView(row: Record<string, unknown>): WorkItemView {
     result_version: Number(row.result_version),
     accepted_version: row.accepted_version == null ? null : Number(row.accepted_version),
     can_accept: canAccept(row as { board_state: string; last_report_kind: string | null }),
+    kind: row.kind === "review" ? "review" : "task",
+    params: row.params !== null && typeof row.params === "object" ? row.params as Record<string, unknown> : {},
     updated_at: row.updated_at as Date,
   };
 }
@@ -282,7 +292,7 @@ export type InsertWorkItemResult =
  */
 export async function insertWorkItem(
   q: StatementRunner,
-  input: { userId: string; title: string; workerSessionId: string; repo?: unknown },
+  input: { userId: string; title: string; workerSessionId: string; repo?: unknown; kind?: ItemKind; params?: Record<string, unknown> },
 ): Promise<InsertWorkItemResult> {
   const locked = await q.query("SELECT 1 FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [input.userId]);
   if (!locked.rowCount) return { ok: false, error: "no_assistant" };
@@ -294,11 +304,11 @@ export async function insertWorkItem(
   if (counts.active >= CLAW_ASSISTANT_MAX_ACTIVE_ITEMS) return { ok: false, error: "too_many_active_items" };
   const itemId = newWorkItemId();
   await q.query(
-    `INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, worker_session_id, repo)
-     VALUES ($1, $2, $3, $4, 'in_progress', $5, $6::jsonb)`,
+    `INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, worker_session_id, repo, kind, params)
+     VALUES ($1, $2, $3, $4, 'in_progress', $5, $6::jsonb, $7, $8::jsonb)`,
     [
       itemId, input.userId, counts.next, clipOneLine(input.title, TITLE_MAX), input.workerSessionId,
-      input.repo === undefined ? null : JSON.stringify(input.repo),
+      input.repo === undefined ? null : JSON.stringify(input.repo), input.kind ?? "task", JSON.stringify(input.params ?? {}),
     ],
   );
   await q.query(
@@ -313,7 +323,15 @@ export async function insertWorkItem(
 export type DecisionResult =
   | { status: "ok"; item: WorkItemView }
   | { status: "not_found" }
-  | { status: "conflict"; error: "version_mismatch" | "not_acceptable" | "item_closed"; item: WorkItemView };
+  | { status: "conflict"; error: "version_mismatch" | "not_acceptable" | "item_closed" | StopRefusal; item: WorkItemView };
+
+/** Why a review item cannot be stopped: its merge is being made, or was made. Saying so is the truth; nothing is undone. */
+export type StopRefusal = "merge_in_progress" | "already_merged";
+
+/** Thrown inside the stop's transaction, which it rolls back: nothing was stopped and no confirmation was denied. */
+class StopRefused extends Error {
+  constructor(readonly reason: StopRefusal) { super(reason); }
+}
 
 /**
  * Accept the result the user was shown. It succeeds only if that result is still
@@ -351,6 +369,11 @@ export async function acceptWorkItem(userId: string, itemId: string, version: nu
  * a crash between the two leaves an item that says stopped, never a worker that
  * was stopped for an item still on the board. Stopping an item that is already
  * stopped sends the interrupt again, which is how a stop that failed is retried.
+ *
+ * A review item's session may have a merge or an approval held for someone's
+ * answer. Interrupting the session leaves that card answerable for a day, so the
+ * held writes are denied in the same transaction (`closeConfirmationsForStop`);
+ * one that is already being made, or a merge that was made, refuses the stop.
  */
 export async function stopWorkItem(input: {
   userId: string;
@@ -360,8 +383,17 @@ export async function stopWorkItem(input: {
   /** Runs first inside the transaction; throwing stops nothing. The router's tool asks whether its turn is still live. */
   guard?: (query: Querier) => Promise<void>;
 }): Promise<DecisionResult> {
+  let refused: StopRefusal | null = null;
   const stopped = await inTransaction(async (query) => {
     await input.guard?.(query);
+    const open = (await query(
+      "SELECT kind, worker_session_id FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND board_state <> 'done' FOR UPDATE",
+      [input.itemId, input.userId],
+    )).rows[0] as { kind: string; worker_session_id: string } | undefined;
+    if (open?.kind === "review") {
+      const refusal = await closeConfirmationsForStop({ query }, open.worker_session_id, input.userId);
+      if (refusal) throw new StopRefused(refusal);
+    }
     const rows = (await query(
       `WITH upd AS (
          UPDATE claw_work_items
@@ -382,10 +414,15 @@ export async function stopWorkItem(input: {
     // turn on an item the user has already stopped.
     if (row) await query("DELETE FROM claw_pending_messages WHERE session_id = $1", [row.worker_session_id]);
     return row;
+  }).catch((err: unknown) => {
+    if (!(err instanceof StopRefused)) throw err;
+    refused = err.reason;
+    return undefined;
   });
   const current = stopped ?? await getWorkItem(input.userId, input.itemId);
   if (!current) return { status: "not_found" };
   const item = itemView(current);
+  if (refused) return { status: "conflict", error: refused, item };
   if (!stopped && current.outcome !== "stopped") return { status: "conflict", error: "item_closed", item };
   await stopSessionRuns(current.worker_session_id as string);
   return { status: "ok", item };

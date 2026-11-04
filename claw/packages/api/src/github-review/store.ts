@@ -542,3 +542,35 @@ export async function finishConfirmation(
     [id, status, deciderUserId, JSON.stringify(result)],
   );
 }
+
+/** Whether this session merged its pull request, or put it in the merge queue: by a confirmation a person allowed, or by a merge made at once. */
+export async function sessionMerged(db: Queryable, sessionId: string): Promise<boolean> {
+  const r = await db.query(
+    `SELECT EXISTS (SELECT 1 FROM claw_github_confirmations WHERE session_id = $1 AND status IN ('merged', 'queued'))
+         OR EXISTS (SELECT 1 FROM claw_github_audit WHERE session_id = $1 AND tool = 'gh_pr_merge' AND result = 'ok' AND detail IN ('merged', 'queued'))
+         AS merged`,
+    [sessionId],
+  );
+  return (r.rows[0] as { merged?: boolean } | undefined)?.merged === true;
+}
+
+/**
+ * The requester stopped this session's work: every write it holds for someone's answer is denied, so that a card left in a chat cannot
+ * still make it. Run in the stop's own transaction. Answers why the stop must not go ahead instead, having denied nothing the caller
+ * keeps (it rolls back): the pull request was merged (`already_merged`), or a person's allow is being carried out right now
+ * (`merge_in_progress`), which the session's interrupt would not stop.
+ *
+ * The deny comes before the look for one being carried out: a decision that claims a row after this statement finds it denied, and one
+ * that claimed it before is seen as `merging`.
+ */
+export async function closeConfirmationsForStop(db: Queryable, sessionId: string, stoppedBy: string): Promise<"already_merged" | "merge_in_progress" | null> {
+  if (await sessionMerged(db, sessionId)) return "already_merged";
+  await db.query(
+    `UPDATE claw_github_confirmations
+        SET status = 'denied', decided_at = NOW(), decided_by = $2, result = '{"by":"requester","reason":"stopped"}'::jsonb
+      WHERE session_id = $1 AND status = 'pending'`,
+    [sessionId, stoppedBy],
+  );
+  const merging = await db.query("SELECT 1 FROM claw_github_confirmations WHERE session_id = $1 AND status = 'merging' LIMIT 1", [sessionId]);
+  return merging.rows.length > 0 ? "merge_in_progress" : null;
+}

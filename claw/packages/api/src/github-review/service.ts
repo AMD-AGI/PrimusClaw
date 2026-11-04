@@ -592,6 +592,20 @@ export class GithubReview {
   // -------------------------------------------------- confirmations
 
   /**
+   * Before a review is started for someone: that the pull request is one the review tools would take, read with the acting user's
+   * account as every tool reads it (the owner list, the acting user's say, a public repository that is not archived, an open pull request
+   * that is not a draft). A refusal here costs no session and no turn, where the same refusal from the session's first tool call costs both.
+   * Not held to any session's request budget: there is no session yet, and it writes nothing.
+   */
+  checkPullRequest(actor: ReviewActor, ref: PrRef): Promise<ToolOutcome> {
+    return this.run(actor, "gh_pr_check", { pr: `${ref.owner}/${ref.repo}#${ref.number}` }, async (ctx) => {
+      const { pr } = await this.load(ctx, ref);
+      this.requireOpen(pr);
+      return ok({ status: "ok", title: pr.title, head_sha: pr.headSha, url: pr.url }, (t) => ctx.client.redact(t));
+    }, { skipBudget: true, ref });
+  }
+
+  /**
    * The acting user's answer to a held write, a merge or a review. Only the actor can give it (the
    * caller checks that and passes `deciderUserId`); on allow, every gate of that write is
    * read again and it is made with the actor's own account.
