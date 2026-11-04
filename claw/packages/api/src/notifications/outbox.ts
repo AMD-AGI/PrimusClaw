@@ -65,7 +65,8 @@ export interface NotificationPayload {
   session_id: string;
   task_id: string;
   /**
-   * Run events only: the chat message whose turn this run was (`null` for a run no chat message started).
+   * Run events only: the message whose turn this run was (`metadata.message_id` of its task: a chat message, or the one a
+   * trigger or an A2A call sent; `null` for a task that has none).
    * A client that sent the message and already showed the turn's answer can tell this run's end is that turn's
    * by the id, not by when it ended: a run ends after its last answer, sometimes minutes after.
    */

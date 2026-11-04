@@ -28,10 +28,11 @@ record it.
 ## [Unreleased]
 
 ### Added
-- `run.completed` and `run.failed` notifications carry `message_id`, the chat message whose turn the run was (`null`
-  for a run no chat message started, such as a trigger's). A client that sent that message and already showed its
-  answer can now tell the run's end is that turn's by the id: a run is closed after its last answer, often more than
-  a minute after, so matching by time sent a second "Run completed" card to the chat that had just shown the answer.
+- `run.completed` and `run.failed` notifications carry `message_id`, the message whose turn the run was (a trigger's
+  run names the message the trigger sent; `null` for a task that has none). A client that sent that message and
+  already showed its answer can now tell the run's end is that turn's by the id: a run is closed after its last
+  answer, often more than a minute after, so matching by time sent a second "Run completed" card to the chat that had
+  just shown the answer.
 - The assistant can watch a group chat or a repository and record what it would do there without doing it, behind
   `CLAW_ASSISTANT_OBSERVE` (default off; needs `CLAW_ASSISTANT_ENABLED`): `POST /v1/assistant/observations` hands one
   message of a place (`group:<channel>:<id>` or `repo:<owner>/<repo>`) to a watcher session of the caller's own, whose

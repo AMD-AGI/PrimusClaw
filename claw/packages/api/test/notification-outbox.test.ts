@@ -106,7 +106,7 @@ describe("notification outbox", { skip }, () => {
       await outbox.recordRunFinished({ sessionId: "s-trig", taskIds: ["t-trig"], outcome: "failed", failureReason: "boom" });
       const byTask = new Map((await rows()).map((r) => [r.payload.task_id, r.payload]));
       assert.equal(byTask.get("t-turn").message_id, "claw-1793790955023");
-      assert.equal(byTask.get("t-trig").message_id, null, "a run no chat message started names none");
+      assert.equal(byTask.get("t-trig").message_id, null, "a task with no message id names none");
       await deliver();
       const delivered = sent.map((r) => JSON.parse(String(r.body))).find((b) => b.task_id === "t-turn");
       assert.equal(delivered?.message_id, "claw-1793790955023", "the receiver is sent the id, not only the outbox row");
