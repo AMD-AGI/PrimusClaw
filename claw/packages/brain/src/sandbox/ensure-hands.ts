@@ -40,6 +40,8 @@ import {
   hasSshKeyFile,
   applyPlatformKeyEnv,
   withholdSandboxEnv,
+  handleEnvRecord,
+  handleServesEnvOf,
   sandboxUserEnv,
 } from "./params.js";
 import type { SandboxAction } from "./params.js";
@@ -67,7 +69,7 @@ import {
   type ContainerProbeOutcome,
   type HandsProbeEntry,
 } from "./container-probe.js";
-import { sandboxSpecFingerprint, evaluateReuse } from "./spec-fingerprint.js";
+import { sandboxSpecFingerprint, evaluateReuse, type ReuseVerdict } from "./spec-fingerprint.js";
 import { metrics } from "../infra/metrics.js";
 import { handsSessionKey } from "./hands-key.js";
 import { readHandsEntry, retentionStore, type HandsBinding } from "./registry.js";
@@ -1796,12 +1798,14 @@ async function reuseOwnDagHandle(
         ? "no_token_recorded"
         : !handleImageMatches(own, action)
           ? "image_changed"
-          : null;
+          : !handleServesEnvOf(own, request)
+            ? "env_not_withheld"
+            : null;
   if (unusable) {
     const refused = await releaseOwnHandleSandbox(
       a, dagRoot, action.handle, own, identity, ownKey, unusable,
-      // Only a spec change reaches here over a sandbox that is alive.
-      unusable === "image_changed",
+      // Only a spec change (its image, or an environment this request must not have) reaches here over a sandbox that is alive.
+      unusable === "image_changed" || unusable === "env_not_withheld",
     );
     if (!refused) return null;
     throw new Error(
@@ -2019,7 +2023,12 @@ export async function tryReuseSessionSandbox(a: ReuseAttempt): Promise<EnsureHan
     return null;
   }
 
-  const verdict = evaluateReuse(info.specFingerprint, requestedSpec);
+  // A session that acts as a user is served only by a sandbox recorded as built for one: the leniency for a sandbox with no or an older
+  // fingerprint is for what the session already had, and such a sandbox can hold the environment this one must not.
+  const evaluated = evaluateReuse(info.specFingerprint, requestedSpec);
+  const verdict: ReuseVerdict = request.withhold_sandbox_keys === true && evaluated.reason !== "spec_match"
+    ? { reuse: false, reason: "spec_changed", recorded: String(info.specFingerprint ?? ""), requested: requestedSpec }
+    : evaluated;
   if (!verdict.reuse) {
     logger.info(
       { sessionId, recorded: verdict.recorded, requested: verdict.requested },
@@ -2312,6 +2321,7 @@ export async function registerReusedDagHandle(
       namespace: identity.namespace,
       session_id: identity.sessionId,
       user_id: identity.userId,
+      ...handleEnvRecord(request),
     }, { mayTakeFrom: retainedTaker(kv) });
   } catch (e) {
     // Not swallowed. Adopting a sandbox whose ownership could not be recorded
@@ -2494,6 +2504,12 @@ async function provisionHands(
 ): Promise<EnsureHandsResult> {
   const kv = getHandsKv();
 
+  // Multi-node writes a credential into the sandbox (infera's SSH key for its GPU pods) that no environment rule can take back out, and
+  // a session that acts as a user runs code strangers wrote.
+  if (multiNodeContext && request.withhold_sandbox_keys === true) {
+    throw new Error("a session that acts as a user cannot be given a multi-node sandbox");
+  }
+
   // Local dev mode: Hands is running locally — treat as "not created" (no
   // lifecycle, no need to restore workspace from S3).
   //
@@ -2564,6 +2580,11 @@ async function provisionHands(
     if (!info || !info.hands_url || !info.token) {
       throw new Error(
         `sandbox_spec.use='${action.handle}' has no registered handle for dag ${dagRoot}`,
+      );
+    }
+    if (!handleServesEnvOf(info, request)) {
+      throw new Error(
+        `sandbox_spec.use='${action.handle}' names a sandbox that was not built for a session that acts as a user`,
       );
     }
     const identity = identityFromHandleInfo(info);
@@ -2978,6 +2999,7 @@ async function provisionHands(
         // deployment default when the field is missing, so a workspace-scoped
         // sandbox would be polled where it is not and expire while still live.
         namespace: nsForSandbox,
+        ...handleEnvRecord(request),
       }, { mayTakeFrom: retainedTaker(kv) });
     } catch (e) {
       // Was non-fatal, on the reasoning that a DAG can still complete without
@@ -3725,6 +3747,7 @@ async function ensureHandsAgentSandbox(
           hands_url: handsUrl,
           token: handsToken,
           image: workloadImage,
+          ...handleEnvRecord(request),
         }, { mayTakeFrom: retainedTaker(kv) });
       } catch (e) {
         // Same reasoning as the SaFE path, rollback included: the sandbox is

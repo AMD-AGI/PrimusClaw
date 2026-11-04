@@ -30,7 +30,7 @@ import { HANDS_ENV_PAYLOAD_ENV } from "../src/sandbox/bootstrap.js";
 import { seedSystemEnv } from "./support/system-env.js";
 import type { SandboxCreateParams, SandboxProvider } from "../src/sandbox/provider.js";
 import type { ExecuteRequest } from "@claw/protocol";
-import { bindDagHandles } from "./support/dag-handle-kv.js";
+import { bindDagHandleModule, bindDagHandles } from "./support/dag-handle-kv.js";
 
 before(bindDagHandles);
 
@@ -277,4 +277,92 @@ test("a marked sandbox holds what Brain sets for Hands to run and nothing else, 
     assert.deepEqual(Object.keys(env).sort(), BRAIN_ONLY);
     for (const [name, value] of Object.entries(env)) assert.ok(!value.startsWith("planted-") && !value.startsWith("system-planted-"), `${name} carries a layer's value`);
   }
+});
+
+/**
+ * A sandbox reached by any route other than a fresh create: a DAG's `use` of a handle, a retried turn's own handle, the session's record.
+ * Each of them can name a sandbox built for an ordinary turn, or by a Brain that withheld only the key variables, and so one that holds
+ * the environment a marked turn must not have.
+ */
+async function reuseWorld(effects: Record<string, unknown> = {}) {
+  restores.push(await bindDagHandleModule());
+  const kv = echoKv();
+  bindHandsKv(kv);
+  const created: SandboxCreateParams[] = [];
+  const provider = {
+    kind: "safe-workload",
+    async create(params: SandboxCreateParams) {
+      created.push(params);
+      return { provider: "safe-workload", id: `wl-${created.length}`, sandboxName: `wl-${created.length}`, namespace: "ns-test", handsBaseUrl: "", platformKey: PLATFORM_KEY };
+    },
+    async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
+    async stop() {},
+  } as unknown as SandboxProvider;
+  restores.push(bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider }));
+  restores.push(bindSandboxReuseEffects({
+    registerSandbox: () => {},
+    probeSandboxContainer: async () => ({ verdict: "gone", reason: "test" }),
+    workloadHeldByOtherDag: async () => false,
+    countLiveWork: async () => ({ verdict: "clear", classes: {} }),
+    ...effects,
+  } as never));
+  realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response("ok", { status: 200 })) as unknown as typeof fetch;
+  const run = (sessionId: string, over: Partial<ExecuteRequest>, multiNode?: unknown) => ensureHands(sessionId, {
+    session_id: sessionId, llm_api_key: "sk-owner-virtual-key-0001",
+    sandbox_spec: { handle: "main", image: "registry.test/img:1", resources: { cpu: "1", memory: "1Gi" } }, ...over,
+  } as unknown as ExecuteRequest, PLATFORM_KEY, async () => {}, multiNode as never);
+  return { kv, created, run };
+}
+
+test("a DAG's use of a handle serves a marked turn only when that handle was built for one", async () => {
+  const { created, run } = await reuseWorld();
+  await run("sess-use-ord", { task_id: "dag-use-ord" });
+  await run("sess-use-act", { task_id: "dag-use-act", withhold_sandbox_keys: true });
+  assert.equal(created.length, 2);
+  const use = (dag: string, mark: boolean) => run(`sess-${dag}-use`, {
+    task_id: `${dag}-next`, dag_root_task_id: dag, sandbox_spec: { use: "main" } as never, ...(mark ? { withhold_sandbox_keys: true } : {}),
+  });
+  assert.equal((await use("dag-use-ord", false)).created, false, "control: an ordinary turn uses an ordinary handle");
+  await assert.rejects(use("dag-use-ord", true), /not built for a session that acts as a user/);
+  assert.equal((await use("dag-use-act", true)).created, false, "a marked turn uses a handle built for one");
+});
+
+test("a retried turn's own handle serves a marked turn only when it was built for one: otherwise it is let go and a sandbox is built", async () => {
+  const ordinary = await reuseWorld();
+  await ordinary.run("sess-own-1", { task_id: "dag-own-ord" });
+  bindHandsKv(echoKv()); // the session slot is empty: the DAG's own handle is what is left
+  await ordinary.run("sess-own-2", { task_id: "dag-own-ord", withhold_sandbox_keys: true });
+  assert.equal(ordinary.created.length, 2, "the ordinary sandbox the handle names is not given to the marked turn");
+  assert.equal("SAFE_API_KEY" in ordinary.created[1]!.env, false);
+
+  const marked = await reuseWorld();
+  await marked.run("sess-own-3", { task_id: "dag-own-act", withhold_sandbox_keys: true });
+  bindHandsKv(echoKv());
+  await marked.run("sess-own-4", { task_id: "dag-own-act", withhold_sandbox_keys: true });
+  assert.equal(marked.created.length, 1, "control: one built for a marked turn is reused");
+});
+
+test("the session's record serves a marked turn only on a fingerprint that matches: one recorded without a fingerprint is rebuilt", async () => {
+  const stripFingerprint = async (kv: KV) => {
+    const entry = await kv.get("hands.any");
+    const info = JSON.parse(new TextDecoder().decode(entry!.value)) as Record<string, unknown>;
+    assert.ok("specFingerprint" in info, "the record carries a fingerprint to take away");
+    delete info.specFingerprint;
+    await kv.put("hands.any", new TextEncoder().encode(JSON.stringify(info)));
+  };
+  for (const mark of [false, true]) {
+    const { kv, created, run } = await reuseWorld();
+    await run("sess-nofp", { task_id: "task-nofp-1", ...(mark ? { withhold_sandbox_keys: true } : {}) });
+    await stripFingerprint(kv);
+    await run("sess-nofp", { task_id: "task-nofp-2", ...(mark ? { withhold_sandbox_keys: true } : {}) });
+    assert.equal(created.length, mark ? 2 : 1, mark ? "a marked turn is given a new sandbox" : "control: an ordinary turn reuses it, as before");
+  }
+});
+
+test("a marked turn is not given a multi-node sandbox: it writes a credential no environment rule takes back", async () => {
+  const { created, run } = await reuseWorld();
+  const cluster = { backend: "rayjob", nodeCount: 2, serviceUrl: "http://cluster.test" };
+  await assert.rejects(run("sess-mn", { task_id: "task-mn", withhold_sandbox_keys: true }, cluster), /cannot be given a multi-node sandbox/);
+  assert.equal(created.length, 0);
 });

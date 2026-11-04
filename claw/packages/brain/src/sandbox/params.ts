@@ -366,6 +366,19 @@ export function withholdSandboxEnv(env: Record<string, string>): void {
   }
 }
 
+/** What a handle registered for this request records of its environment (`HandleInfo.withheld_env`). */
+export function handleEnvRecord(request: Pick<ExecuteRequest, "withhold_sandbox_keys">): { withheld_env?: true } {
+  return request.withhold_sandbox_keys === true ? { withheld_env: true } : {};
+}
+
+/**
+ * Whether a registered handle may serve this request: one that withholds its sandbox's environment is served only by a sandbox built to
+ * withhold it.
+ */
+export function handleServesEnvOf(info: { withheld_env?: boolean }, request: Pick<ExecuteRequest, "withhold_sandbox_keys">): boolean {
+  return request.withhold_sandbox_keys !== true || info.withheld_env === true;
+}
+
 /**
  * The caller's stored variables (its env vault: personal tokens for GitHub, Hugging Face, W&B and the like) that a sandbox for this request
  * is composed with. None for a request marked `withhold_sandbox_keys`, whatever the request carries: the model of such a session reads what
