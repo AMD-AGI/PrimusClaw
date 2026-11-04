@@ -11,8 +11,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -389,14 +391,19 @@ func TestIssueRejectsBadWorkspace(t *testing.T) {
 
 func TestReserveStopsAtCap(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	// A grant read slower than the conflict retry interval lets every
-	// concurrent caller read the same resourceVersion, as a busy API server does.
+	// A grant read slower than the conflict retry interval lets concurrent
+	// callers read the same resourceVersion, as a busy API server does.
+	var inFlight, maxInFlight atomic.Int32
 	slowRead := interceptor.Funcs{Get: func(ctx context.Context, c ctrlclient.WithWatch, key ctrlclient.ObjectKey, obj ctrlclient.Object, opts ...ctrlclient.GetOption) error {
-		err := c.Get(ctx, key, obj, opts...)
-		if _, ok := obj.(*runtimev1alpha1.SandboxGrant); ok {
-			time.Sleep(time.Millisecond)
+		if _, ok := obj.(*runtimev1alpha1.SandboxGrant); !ok {
+			return c.Get(ctx, key, obj, opts...)
 		}
-		return err
+		n := inFlight.Add(1)
+		defer inFlight.Add(-1)
+		for m := maxInFlight.Load(); n > m && !maxInFlight.CompareAndSwap(m, n); m = maxInFlight.Load() {
+		}
+		time.Sleep(time.Millisecond)
+		return c.Get(ctx, key, obj, opts...)
 	}}
 	svc, priv, _, _ := testService(t, now, slowRead)
 	req := sampleRequest(now.Add(time.Hour))
@@ -428,6 +435,43 @@ func TestReserveStopsAtCap(t *testing.T) {
 	wg.Wait()
 	if okN != 16 || denyN != 16 {
 		t.Fatalf("ok=%d deny=%d", okN, denyN)
+	}
+	if got := maxInFlight.Load(); got != 1 {
+		t.Fatalf("%d grant reads overlapped; writes of one grant must queue", got)
+	}
+}
+
+func TestReserveOutlastsAnotherReplica(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	// Another replica writes the grant between each of our first five reads
+	// and our update, which is more conflicts than retry.DefaultRetry absorbs.
+	var interfere atomic.Int32
+	otherReplica := interceptor.Funcs{Get: func(ctx context.Context, c ctrlclient.WithWatch, key ctrlclient.ObjectKey, obj ctrlclient.Object, opts ...ctrlclient.GetOption) error {
+		if err := c.Get(ctx, key, obj, opts...); err != nil {
+			return err
+		}
+		if _, ok := obj.(*runtimev1alpha1.SandboxGrant); !ok || interfere.Add(-1) < 0 {
+			return nil
+		}
+		other := &runtimev1alpha1.SandboxGrant{}
+		if err := c.Get(ctx, key, other); err != nil {
+			return err
+		}
+		other.Labels = map[string]string{"other-replica-write": strconv.Itoa(int(interfere.Load()))}
+		return c.Update(ctx, other)
+	}}
+	svc, priv, _, _ := testService(t, now, otherReplica)
+	req := sampleRequest(now.Add(time.Hour))
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	interfere.Store(5)
+	if err := svc.Reserve(context.Background(), req.GrantID, "measurement", "sbx-1", "sess-1", 1); err != nil {
+		t.Fatal(err)
+	}
+	if left := interfere.Load(); left >= 0 {
+		t.Fatalf("other replica wrote only %d of 5 times", 5-left)
 	}
 }
 

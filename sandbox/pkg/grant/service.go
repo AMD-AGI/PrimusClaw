@@ -16,6 +16,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -71,15 +72,22 @@ type Service struct {
 
 // grantLocks serialises the read-modify-write of one grant inside this process,
 // as a workqueue never hands one key to two workers: concurrent callers queue
-// instead of spending each other's conflict retries and failing with a 409.
+// instead of spending each other's conflict retries.
 type grantLocks [64]sync.Mutex
 
-func (l *grantLocks) lock(name string) (unlock func()) {
+// conflictBackoff retries a grant write that lost to another control-plane
+// replica. retry.DefaultRetry gives up after five 10ms rounds, which a busy
+// replica writing the same grant can win every time.
+var conflictBackoff = wait.Backoff{Steps: 8, Duration: 10 * time.Millisecond, Factor: 2, Jitter: 1, Cap: time.Second}
+
+// rewrite runs one read-modify-write of grant name until it does not conflict.
+func (s *Service) rewrite(name string, fn func() error) error {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(name))
-	m := &l[h.Sum32()%uint32(len(l))]
+	m := &s.writes[h.Sum32()%uint32(len(s.writes))]
 	m.Lock()
-	return m.Unlock
+	defer m.Unlock()
+	return retry.RetryOnConflict(conflictBackoff, fn)
 }
 
 // PendingPromoter finishes a pending sandbox whose Workload the create goroutine no longer owns.
@@ -297,8 +305,7 @@ func (s *Service) Extend(ctx context.Context, grantID string, req ExtendRequest)
 	if err := s.attest.Check(req.Attestation, issue); err != nil {
 		return GrantView{}, err
 	}
-	unlock := s.writes.lock(grantID)
-	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err = s.rewrite(grantID, func() error {
 		current, err := s.get(ctx, grantID)
 		if err != nil {
 			return err
@@ -313,7 +320,6 @@ func (s *Service) Extend(ctx context.Context, grantID string, req ExtendRequest)
 		current.Spec.Attestation = req.Attestation
 		return s.client.Update(ctx, current)
 	})
-	unlock()
 	if err != nil {
 		if _, ok := err.(*OpError); ok {
 			return GrantView{}, err
@@ -576,8 +582,7 @@ func (s *Service) reclaimAll(ctx context.Context, grantID string) (int, error) {
 }
 
 func (s *Service) clearPlatformKey(ctx context.Context, grantID string) error {
-	defer s.writes.lock(grantID)()
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	return s.rewrite(grantID, func() error {
 		current, err := s.get(ctx, grantID)
 		if err != nil {
 			return err
@@ -611,8 +616,7 @@ func (s *Service) list(ctx context.Context) ([]runtimev1alpha1.SandboxGrant, err
 }
 
 func (s *Service) setStatus(ctx context.Context, name string, mutate func(*runtimev1alpha1.SandboxGrant) error) error {
-	defer s.writes.lock(name)()
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err := s.rewrite(name, func() error {
 		current, err := s.get(ctx, name)
 		if err != nil {
 			return err
