@@ -28,33 +28,6 @@ function sizeOf(p: string): number | null {
 }
 
 /**
- * The first symbolic link on the way from the workspace root to `p`, if any.
- *
- * Hands writes as its own identity, which can differ from the one the model's
- * commands run as, and a download into a sandbox that is already running (the
- * uploads a reused sandbox is given) lands where links made there point. Only
- * the part below the workspace root is checked: the root itself is the
- * deployment's to place.
- */
-function linkOnTheWay(p: string): string | null {
-  const root = path.resolve(WORKSPACE);
-  const rel = path.relative(root, p);
-  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return null;
-  let at = root;
-  for (const part of rel.split(path.sep)) {
-    at = path.join(at, part);
-    let st: fs.Stats;
-    try {
-      st = fs.lstatSync(at);
-    } catch {
-      return null;   // nothing there yet: the rest is created below, as directories
-    }
-    if (st.isSymbolicLink()) return at;
-  }
-  return null;
-}
-
-/**
  * Where the file open on `fd` is now, or why it does not count as inside `root`.
  *
  * The path is the kernel's, read back from /proc, so it follows renames. A file
@@ -87,47 +60,114 @@ function removeCreated(fd: number): void {
 }
 
 /**
+ * Open `rel` below the workspace root for writing, one name at a time from a
+ * descriptor of the directory above it, never through a symbolic link, making
+ * the directories on the way. Each name is looked up through
+ * /proc/self/fd/<dir>/<name>, i.e. relative to that open directory, so swapping
+ * a directory for a link at any moment cannot redirect the open.
+ *
+ * Hands writes as its own identity, which can differ from the one the model's
+ * commands run as, and a download into a sandbox that is already running (the
+ * uploads a reused sandbox is given) lands where links made there point. Only
+ * the part below the workspace root is checked: the root itself is the
+ * deployment's to place.
+ */
+function openBelow(root: string, rel: string): { fd: number; created: boolean } | { not: string } {
+  const { O_RDONLY, O_WRONLY, O_CREAT, O_EXCL, O_NOFOLLOW, O_DIRECTORY, O_NONBLOCK } = fs.constants;
+  const WRITE = O_WRONLY | O_NOFOLLOW | O_NONBLOCK;   // a FIFO planted there fails instead of hanging the call
+  const parts = rel.split(path.sep);
+  const name = parts.pop()!;
+  let dir = fs.openSync(root, O_RDONLY | O_DIRECTORY);
+  let shown = root;
+  const notThrough = (e: any, at: string): { not: string } => {
+    if (e?.code !== "ELOOP" && e?.code !== "ENOTDIR") throw e;
+    let link = false;
+    try {
+      link = fs.lstatSync(at).isSymbolicLink();
+    } catch {
+      // gone again: report it as what the open saw
+    }
+    return { not: `${shown} is ${link || e.code === "ELOOP" ? "a symbolic link" : "not a directory"}` };
+  };
+  try {
+    for (const part of parts) {
+      const at = `/proc/self/fd/${dir}/${part}`;
+      shown = path.join(shown, part);
+      try {
+        fs.mkdirSync(at);
+      } catch (e: any) {
+        if (e?.code !== "EEXIST") throw e;
+      }
+      let next: number;
+      try {
+        next = fs.openSync(at, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+      } catch (e: any) {
+        return notThrough(e, at);
+      }
+      fs.closeSync(dir);
+      dir = next;
+    }
+    const at = `/proc/self/fd/${dir}/${name}`;
+    shown = path.join(shown, name);
+    try {
+      return { fd: fs.openSync(at, WRITE | O_CREAT | O_EXCL), created: true };
+    } catch (e: any) {
+      if (e?.code !== "EEXIST") return notThrough(e, at);
+    }
+    try {
+      return { fd: fs.openSync(at, WRITE), created: false };
+    } catch (e: any) {
+      return notThrough(e, at);
+    }
+  } finally {
+    fs.closeSync(dir);
+  }
+}
+
+/**
  * Write `body` to `p` only if the file opened is the one `p` names inside the
  * workspace; returns why not, or null when written.
  *
- * Any path check can be raced: a directory on the way can be swapped for a link
- * before the open, or renamed out of the workspace after it. So the file is
- * opened first (not truncated, not through a final link), and only a file the
- * kernel says is inside the workspace is written, through that descriptor; the
- * bytes then can only reach that one file. Where it is is asked again after the
- * write: a file moved out meanwhile is emptied again (and removed, if this call
+ * The file is opened by openBelow and written only through that descriptor, so
+ * the bytes can reach no file but the one opened inside the workspace. Nothing
+ * stops another process renaming a directory holding it while it is written, so
+ * where it is is asked again after the write: a file moved out meanwhile, or a
+ * write that failed part way, is emptied again (and removed, if this call
  * created it). A move after that is a move of a finished file, which no write
  * can prevent.
  */
 function writeWhereNamed(p: string, body: Buffer): string | null {
   const named = path.relative(path.resolve(WORKSPACE), p);
   if (!named || named.startsWith("..") || path.isAbsolute(named)) {
-    fs.writeFileSync(p, body);   // a path the caller named outside the workspace is written as it always was
+    // a path the caller named outside the workspace is written as it always was
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, body);
     return null;
   }
   const root = fs.realpathSync(path.resolve(WORKSPACE));
-  const { O_WRONLY, O_CREAT, O_EXCL, O_NOFOLLOW } = fs.constants;
-  let created = true;
-  let fd: number;
-  try {
-    fd = fs.openSync(p, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW);
-  } catch (e: any) {
-    if (e?.code !== "EEXIST") throw e;
-    created = false;
-    fd = fs.openSync(p, O_WRONLY | O_NOFOLLOW);
-  }
+  const opened = openBelow(root, named);
+  if ("not" in opened) return `not written: ${opened.not}`;
+  const { fd, created } = opened;
+  const undo = () => {
+    fs.ftruncateSync(fd, 0);
+    if (created) removeCreated(fd);
+  };
   try {
     const before = placeOf(fd, root);
     if ("not" in before) {
       if (created) removeCreated(fd);
       return `not written: ${p} ${before.not}`;
     }
-    fs.ftruncateSync(fd, 0);
-    fs.writeFileSync(fd, body);
+    try {
+      fs.ftruncateSync(fd, 0);
+      fs.writeFileSync(fd, body);
+    } catch (e) {
+      undo();
+      throw e;
+    }
     const after = placeOf(fd, root);
     if ("not" in after) {
-      fs.ftruncateSync(fd, 0);
-      if (created) removeCreated(fd);
+      undo();
       return `not written: ${p} was moved while being written and ${after.not}`;
     }
     return null;
@@ -161,12 +201,6 @@ export const downloadS3 = {
           continue;
         }
         const body = Buffer.from(await resp.arrayBuffer());
-        const link = linkOnTheWay(safePath);
-        if (link) {
-          failed.push({ path: file.local_path, status: 0, error: `not written: ${link} is a symbolic link` });
-          continue;
-        }
-        fs.mkdirSync(path.dirname(safePath), { recursive: true });
         const written = writeWhereNamed(safePath, body);
         if (written) {
           failed.push({ path: file.local_path, status: 0, error: written });

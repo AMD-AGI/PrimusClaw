@@ -59,26 +59,46 @@ test("an ordinary path is written", async () => {
   assert.equal(fs.readFileSync(target, "utf-8"), "uploaded bytes");
 });
 
-test("a directory swapped for a link after the check is still not written through", async () => {
-  const fsMod = await import("node:fs");
+test("a directory swapped for a link right after it is made is not written through", async () => {
+  const fsMod = (await import("node:fs")).default;
   const target = path.join(WORK, "race", "e.txt");
-  const real = fsMod.default.mkdirSync;
-  // The swap lands between the link check and the open: the moment the directories are made.
-  fsMod.default.mkdirSync = ((dir: string, opts: unknown) => {
+  const real = fsMod.mkdirSync;
+  // The swap lands between making the directory and opening it.
+  fsMod.mkdirSync = ((dir: string, opts: unknown) => {
     const made = real(dir, opts as never);
-    if (String(dir) === path.join(WORK, "race")) {
-      fsMod.default.rmSync(dir, { recursive: true, force: true });
-      fsMod.default.symlinkSync(OUTSIDE, dir);
+    if (String(dir).endsWith("/race")) {
+      fsMod.rmSync(path.join(WORK, "race"), { recursive: true, force: true });
+      fsMod.symlinkSync(OUTSIDE, path.join(WORK, "race"));
     }
     return made;
   }) as typeof real;
   try {
     const out = result(await downloadS3.execute({ files: [{ local_path: target, presigned_url: url }] }));
     assert.deepEqual(out.ok, []);
-    assert.match(out.failed[0].error, /outside the workspace/);
-    assert.deepEqual(fsMod.default.readdirSync(OUTSIDE).filter((n) => n === "e.txt"), [], "nothing was left outside");
+    assert.match(out.failed[0].error, /race is a symbolic link/);
+    assert.deepEqual(fsMod.readdirSync(OUTSIDE).filter((n) => n === "e.txt"), [], "nothing was left outside");
   } finally {
-    fsMod.default.mkdirSync = real;
+    fsMod.mkdirSync = real;
+  }
+});
+
+test("a write that fails part way leaves no part of the download", async () => {
+  const fsMod = (await import("node:fs")).default;
+  const target = path.join(WORK, "partial", "p.txt");
+  const real = fsMod.writeFileSync;
+  fsMod.writeFileSync = ((file: unknown, data: unknown, opts?: unknown) => {
+    if (typeof file !== "number") return real(file as never, data as never, opts as never);
+    fsMod.writeFileSync = real;
+    fsMod.writeSync(file, "uploaded");
+    throw Object.assign(new Error("no space left on device"), { code: "ENOSPC" });
+  }) as typeof real;
+  try {
+    const out = result(await downloadS3.execute({ files: [{ local_path: target, presigned_url: url }] }));
+    assert.deepEqual(out.ok, []);
+    assert.match(out.failed[0].error, /no space left/);
+    assert.equal(fsMod.existsSync(target), false, "the part written was removed");
+  } finally {
+    fsMod.writeFileSync = real;
   }
 });
 
