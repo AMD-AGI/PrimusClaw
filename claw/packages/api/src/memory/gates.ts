@@ -58,10 +58,11 @@ export function quoteSupports(quote: string, text: string): boolean {
 
 export type MemoryCommandOp = "forget" | "undo";
 
-// The whole message, and nothing else: an optional "please"/"请", the command, an optional full stop or "!".
+// The whole message, and nothing else: an optional "please"/"请", the command spelt as shown (the space before "#"
+// optional in Chinese only), an optional full stop or "!".
 const MEMORY_COMMANDS: ReadonlyArray<{ pattern: RegExp; op: Record<string, MemoryCommandOp> }> = [
-  { pattern: /^(?:please )?(forget|undo) memory ?# ?([1-9]\d*)[.!]?$/, op: { forget: "forget", undo: "undo" } },
-  { pattern: /^请?(忘掉|撤销) ?记忆 ?# ?([1-9]\d*)[.!。]?$/, op: { 忘掉: "forget", 撤销: "undo" } },
+  { pattern: /^(?:please )?(forget|undo) memory #([1-9]\d*)[.!。]?$/, op: { forget: "forget", undo: "undo" } },
+  { pattern: /^请?(忘掉|撤销)记忆 ?#([1-9]\d*)[.!。]?$/, op: { 忘掉: "forget", 撤销: "undo" } },
 ];
 
 /**
