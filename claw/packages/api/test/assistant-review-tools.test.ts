@@ -522,6 +522,9 @@ describe("assistant review tools", { skip }, () => {
     await confirmation(alice.userId, 301, 60, "AMD-AGI/PrimusClaw", "abcdef02-0000-4000-8000-000000000002");
     const twins = await userTurn(alice, "批准 #abcdef");
     assert.equal(await code(rt.confirmationAnswer(twins, { decision: "allow" })), "which_confirmation");
+    // Shared when the user wrote, and one of them answered since: the ref still named neither.
+    await w.q("UPDATE claw_github_confirmations SET status = 'denied', decided_at = NOW() + INTERVAL '1 second' WHERE confirmation_id <> $1", [twinA]);
+    assert.equal(await code(rt.confirmationAnswer(twins, { decision: "allow" })), "which_confirmation");
     const whole = await userTurn(alice, `approve #${twinA}`);
     await rt.confirmationAnswer(whole, { decision: "allow" });
     assert.equal(calls.decide.at(-1)?.id, twinA);

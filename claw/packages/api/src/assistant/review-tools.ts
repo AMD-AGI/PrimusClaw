@@ -395,14 +395,18 @@ export async function confirmationAnswer(
       if (!ref) {
         refuseUngrounded("not_an_approval_command", `the user's message is not an approval command, so nothing is let through: tell them to reply exactly that (${replies}) or press the button on its card`);
       }
-      const named = pending.filter((c) => refersTo(ref, c.id));
-      if (named.length > 1) refuseUngrounded("which_confirmation", "that short id fits more than one waiting write: ask the user to press the button on its card");
-      pick = named[0];
-      if (!pick) refuseUngrounded("confirmation_not_found", `no write waiting for the user has the id #${ref}: what waits is ${replies}`);
-      // A write held after they wrote is one they have not seen (a new head, a new hold): their command was not about it.
-      if (!(await waitingWhenWritten(q, userId, message.receivedAt)).includes(pick.id)) {
-        refuseUngrounded("confirmation_after_message", `the write waiting on ${pick.repo}#${pick.pr} was held after the user's message: tell them, and let them answer it`);
+      // What the command names is read against what waited when the user wrote: a write held since is one they have not seen
+      // (a new head, a new hold), and a short ref two writes shared then named neither, whatever has become of one of them.
+      const namedThen = (await waitingWhenWritten(q, userId, message.receivedAt)).filter((id) => refersTo(ref, id));
+      if (namedThen.length > 1) refuseUngrounded("which_confirmation", "that short id fitted more than one waiting write: ask the user to press the button on its card");
+      if (!namedThen.length) {
+        if (pending.some((c) => refersTo(ref, c.id))) {
+          refuseUngrounded("confirmation_after_message", `the write with the id #${ref} was held after the user's message: tell them, and let them answer it`);
+        }
+        refuseUngrounded("confirmation_not_found", `no write waiting for the user has the id #${ref}: what waits is ${replies}`);
       }
+      pick = pending.find((c) => c.id === namedThen[0]);
+      if (!pick) refuseUngrounded("confirmation_not_found", `the write with the id #${ref} no longer waits (answered or expired): what waits is ${replies}`);
       // The router's arguments may only agree with the command: they never choose another write.
       const ref2 = args.pr ? parsePrRef(args.pr) : null;
       const prNumber = ref2?.number ?? (args.pr ? Number(String(args.pr).replace(/^#/, "")) : pick.pr);
