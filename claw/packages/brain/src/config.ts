@@ -764,12 +764,9 @@ export const CHECKPOINT_WRITE_VERSION = envInt("CHECKPOINT_WRITE_VERSION", 3, {
  * has no business being able to decrypt a conversation.
  */
 export const BRAIN_CHECKPOINT_KEY = env("BRAIN_CHECKPOINT_KEY");
-// Read once, then taken out of the environment. A session owner supplies its
-// own mcp_servers config, and the MCP client expands <ENV_VAR> placeholders out
-// of process.env (clients/mcp-config.ts) -- so a key left sitting in the
-// environment is a key that can be asked for by name and shipped out as an
-// Authorization header. Nothing else reads it from process.env, and dropping it
-// here also keeps it out of every stdio MCP child process we spawn.
+// Read once, then taken out of the environment: nothing else reads it from
+// process.env, and a key that is not there cannot be named by an MCP
+// placeholder (clients/mcp-config.ts) even in a defaults file that lists it.
 delete process.env.BRAIN_CHECKPOINT_KEY;
 export const SESSION_ID = env("SESSION_ID");
 export const USER_ID = env("USER_ID", "default");
@@ -1891,6 +1888,12 @@ export const RULES_DIR = env("RULES_DIR", "/app/rules");
 // JSON ({"skills":[{"tool_id":N,"name"?:"x"}],"mcp_servers":{...}}); unset or
 // unreadable means the feature is off and chats are built exactly as before.
 export const PLATFORM_DEFAULTS_FILE = env("PLATFORM_DEFAULTS_FILE");
+// Comma-separated hosts a marketplace tool's or a plugin's MCP server must name
+// for its `<SAFE_API_KEY>` to expand to the caller's platform key. Those servers
+// are written by third parties at any URL; anywhere else the key expands to "".
+export const MCP_PLATFORM_KEY_ALLOWED_HOSTS: ReadonlySet<string> = new Set(
+  env("MCP_PLATFORM_KEY_ALLOWED_HOSTS").split(",").map((h) => h.trim().toLowerCase()).filter(Boolean),
+);
 // Whether the file's `skills` apply. Off: only its MCP servers are mounted.
 export const PROGRESSIVE_SKILLS_ENABLED = envBool("PROGRESSIVE_SKILLS_ENABLED", false);
 // Budget for the downloaded skill files (plugin skills and marketplace tool_ids

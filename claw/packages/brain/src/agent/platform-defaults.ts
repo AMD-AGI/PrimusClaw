@@ -13,6 +13,7 @@ import { lookupTool, type LookupFailure } from "../tools/lookup.js";
 export { platformToolsBase } from "../tools/lookup.js";
 import { uploadDirToSandbox } from "../sandbox/write.js";
 import { createPrivateStagingRoot } from "../tasks/plugin-from-message.js";
+import { ENV_PLACEHOLDER_NAME_RE } from "../clients/mcp-config.js";
 import type { HandsClient } from "../clients/hands.js";
 import type { EventCallback } from "@claw/protocol";
 
@@ -27,6 +28,8 @@ const logger = pino({ name: "platform-defaults" });
 export interface PlatformDefaults {
   skills: Array<{ toolId: number; name?: string }>;
   mcpServers: Record<string, Record<string, unknown>>;
+  /** The environment names `mcpServers` may name as `<NAME>` placeholders (`mcp_env_allow`). */
+  mcpEnvAllow: ReadonlySet<string>;
 }
 
 /** A default skill ready to be listed in the prompt; its body is not loaded. */
@@ -134,7 +137,17 @@ function parseDefaults(raw: unknown): PlatformDefaults {
       mcpServers[k] = v;
     }
   }
-  return { skills, mcpServers };
+  const mcpEnvAllow = new Set<string>();
+  if (raw.mcp_env_allow !== undefined) {
+    if (!Array.isArray(raw.mcp_env_allow)) throw new Error("mcp_env_allow must be an array");
+    for (const name of raw.mcp_env_allow) {
+      if (typeof name !== "string" || !ENV_PLACEHOLDER_NAME_RE.test(name)) {
+        throw new Error(`invalid mcp_env_allow name '${String(name)}'`);
+      }
+      mcpEnvAllow.add(name);
+    }
+  }
+  return { skills, mcpServers, mcpEnvAllow };
 }
 
 /**

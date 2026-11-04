@@ -37,7 +37,7 @@ import {
   DEFAULT_MODEL, MAX_TURNS,
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED,
   BASH_APPROVAL_RULES, ASK_USER_QUESTION_ENABLED, A2A_CLIENT_ENABLED,
-  PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED, BG_SHELL_ENABLED,
+  MCP_PLATFORM_KEY_ALLOWED_HOSTS, PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED, BG_SHELL_ENABLED,
 } from "../config.js";
 import { a2aApprovalHold } from "../clients/a2a.js";
 import { WebSearchService, WebFetchService, SimpleSessionCostTracker } from "../tools/web/index.js";
@@ -148,7 +148,9 @@ export class AgentEngine {
     if (platformKey) envOverrides.SAFE_API_KEY = platformKey;
     // Platform defaults sit under everything else: a request, tool or plugin
     // server of the same name wins. Unset file -> `defaults` is null and none
-    // of this runs.
+    // of this runs. Only the defaults file is the operator's, so only its
+    // servers may read the environment (the names it lists); the rest are
+    // written by requesters and tool authors.
     //
     // A session that acts as a user (`withhold_sandbox_keys`) is given none, MCP servers and
     // skills alike. Its model reads what strangers wrote; the default servers are authenticated
@@ -160,12 +162,30 @@ export class AgentEngine {
     // a sub-agent starts from the schemas of the run that made it, so it has none either. Read as
     // truthy, not `=== true`: a mark that is not a boolean is still a mark.
     const defaults = PLATFORM_DEFAULTS_FILE && !request.withhold_sandbox_keys ? loadPlatformDefaults() : null;
-    const mergedMcp = normalizeMcpConfigs({
-      ...(defaults?.mcpServers || {}),
-      ...(request.mcp_servers || {}),
-      ...resolved.mcpServers,
-      ...pluginLayer.mcpServers,
-    }, envOverrides);
+    // Marketplace and plugin servers are third parties' at URLs nobody vetted, so the requester's
+    // platform key fills their `<SAFE_API_KEY>` only on a host the operator trusts
+    // (MCP_PLATFORM_KEY_ALLOWED_HOSTS). A request's own servers are the requester's choice of where
+    // their own key goes. A `pinned_address` is the API's record of where it vetted a request's
+    // server; one in a tool or plugin config is the author's, and would connect a trusted host name
+    // to an address of their choosing, so it is dropped.
+    const toolMcp = Object.fromEntries(
+      Object.entries({ ...resolved.mcpServers, ...pluginLayer.mcpServers }).map(([name, spec]) => {
+        if (!spec || typeof spec !== "object") return [name, spec];
+        const { pinned_address: _authorsPin, ...rest } = spec;
+        return [name, rest];
+      }),
+    );
+    const requestMcp = Object.fromEntries(
+      Object.entries(request.mcp_servers || {}).filter(([name]) => !Object.hasOwn(toolMcp, name)),
+    );
+    const defaultMcp = Object.fromEntries(
+      Object.entries(defaults?.mcpServers || {}).filter(([name]) => !Object.hasOwn(toolMcp, name) && !Object.hasOwn(requestMcp, name)),
+    );
+    const mergedMcp = {
+      ...normalizeMcpConfigs(defaultMcp, envOverrides, defaults?.mcpEnvAllow),
+      ...normalizeMcpConfigs(requestMcp, envOverrides),
+      ...normalizeMcpConfigs(toolMcp, envOverrides, undefined, MCP_PLATFORM_KEY_ALLOWED_HOSTS),
+    };
 
     const allSkills: Record<string, string> = {};
     const skillSources: Record<string, "plugin" | "local" | "marketplace"> = {};
