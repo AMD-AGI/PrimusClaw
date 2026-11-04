@@ -299,8 +299,9 @@ export function worstCost(
 
 /**
  * How many times as long an `exec` of the pattern takes on the line at `length` as on the same line at a quarter of it (`ratio`): about 4 for a
- * pattern whose cost is linear in its line, about 16 for one that costs the square of it, and more for worse; and what one `exec` on the line
- * at `length` cost (`ms`). The ratio is only telling where that is well over the resolution of the clock: a pattern that costs a microsecond
+ * pattern whose cost is linear in its line, about 16 for one that costs the square of it, and more for worse; what one `exec` on the line
+ * at `length` cost (`ms`); and how much of that is more than four times the cost at a quarter of the length (`excessMs`), which is the part
+ * of the cost that grows faster than the line, whatever the rest of it is and however fast the machine is. The ratio is only telling where that is well over the resolution of the clock: a pattern that costs a microsecond
  * or two can take eight times as long on four times the line for reasons that have nothing to do with backtracking. A ratio of two times taken on the same
  * machine in the same moments, not a number of milliseconds: a busy or slow machine slows both alike. The two are timed in turn, `rounds`
  * times, and the least of each is the one compared, since a pause only ever makes a run slower. Each time is of as many `exec`s as make the
@@ -308,7 +309,7 @@ export function worstCost(
  * clock, and short enough that most runs fit between two of the pauses of a machine whose CPU is shared (a time of a millisecond is cut by
  * one in almost every round on a CPU quota of a quarter, and the least of them is no longer a time nothing touched).
  */
-export function growth(source: string, flags: string, line: Line, length: number, rounds = 15): { ratio: number; ms: number } {
+export function growth(source: string, flags: string, line: Line, length: number, rounds = 15): { ratio: number; ms: number; excessMs: number } {
   const re = new RegExp(source, flags.replace(/[gy]/g, ""));
   const short = line.at(Math.floor(length / 4));
   const long = line.at(length);
@@ -326,6 +327,6 @@ export function growth(source: string, flags: string, line: Line, length: number
     leastShort = Math.min(leastShort, time(short, runs));
     leastLong = Math.min(leastLong, time(long, runs));
   }
-  return { ratio: leastLong / leastShort, ms: leastLong / runs };
+  return { ratio: leastLong / leastShort, ms: leastLong / runs, excessMs: (leastLong - 4 * leastShort) / runs };
 }
 

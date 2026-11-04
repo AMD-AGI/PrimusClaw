@@ -134,21 +134,24 @@ test("S3 every regular expression literal in the module costs under the bound on
   // of two times that the same pauses touch alike, and is slow only if it grows faster than the line: the defect the bound is there for is
   // a pattern whose cost grows with the square of its line (S2), and such a pattern is over the bound in the first place and over
   // GROWTH_BOUND as well, on the line that showed it, whichever line cost the most. It is still over the bound in the least of the rounds
-  // that measured its growth, which a pattern that only looked slow in one moment is not.
+  // that measured its growth, which a pattern that only looked slow in one moment is not. A pattern whose cost is partly linear and partly
+  // super-linear can grow less than GROWTH_BOUND and still cost over the bound; it is slow when the part of its cost that grows faster
+  // than the line is over the bound by itself, a part that is nothing for a linear pattern however slow the machine is.
   const slow: string[] = [];
   let timed = 0;
   for (const f of readdirSync(SOURCES).filter((n) => n.endsWith(".ts"))) {
     for (const r of regexLiterals(readFileSync(new URL(f, SOURCES), "utf8"))) {
       const { over } = worstCost(r.source, r.flags, MAX_LINE_CHARS, Infinity, EXEC_BOUND_MS);
       timed += 1;
-      const isSlow = (g: { ratio: number; ms: number }): boolean => g.ratio > GROWTH_BOUND && g.ms > EXEC_BOUND_MS;
+      const isSlow = (g: { ratio: number; ms: number; excessMs: number }): boolean =>
+        (g.ratio > GROWTH_BOUND && g.ms > EXEC_BOUND_MS) || g.excessMs > EXEC_BOUND_MS;
       for (const line of over) {
         // Asked twice before it is called slow: a super-linear pattern is over both every time.
         const grew = [growth(r.source, r.flags, line, MAX_LINE_CHARS)];
         if (isSlow(grew[0]!)) grew.push(growth(r.source, r.flags, line, MAX_LINE_CHARS));
         if (grew.every(isSlow)) {
           const g = grew[grew.length - 1]!;
-          slow.push(`${f}:${r.line} /${r.source}/ ${g.ms.toFixed(2)} ms on ${line.what}, ${g.ratio.toFixed(1)} times as long as at a quarter of the length`);
+          slow.push(`${f}:${r.line} /${r.source}/ ${g.ms.toFixed(2)} ms on ${line.what}, ${g.ratio.toFixed(1)} times as long as at a quarter of the length (${g.excessMs.toFixed(2)} ms more than four times)`);
           break;
         }
       }
