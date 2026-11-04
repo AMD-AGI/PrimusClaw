@@ -6,14 +6,15 @@
  *
  * A list that someone keeps by hand is the hole the last fix fell through: it named three patterns and a fourth stood next to them. So the
  * sweep starts from the source files: it reads every regular expression literal in them (`regexLiterals`), makes strings that each one
- * matches (`sampleStrings`), and times it on those strings with one run of repeated characters pushed in at every place where the kind of
- * character changes (`worstCost`). A pattern that backtracks super-linearly is slow on such a line however it is written, because what makes it
- * slow is two parts that can both match the same run, and a run of the right character in the right place divides between them in as many
- * ways as it is long.
+ * matches (`sampleStrings`), makes lines of them that a pattern which backtracks super-linearly is slow on (`sweepLines`), and counts the
+ * work one `exec` does on each line at three lengths (`workOf`), in steps of a matcher that counts them (`./regex-work.ts`), not in
+ * milliseconds: a count is the same on every machine, so how fast the work grows with the line is a number with no noise in it.
  *
  * Not a parser of JavaScript: a regular expression literal is told from a division by what stands before it, which is enough for source that
  * is written the way this repository's is, and `regexLiterals` is itself tested on that (see the sweep test).
  */
+
+import { counted } from "./regex-work.js";
 
 export interface RegexLiteral { source: string; flags: string; line: number }
 
@@ -165,7 +166,7 @@ function classHas(c: string, cls: Extract<Atom, { t: "class" }>): boolean {
   return cls.neg ? !hit : hit;
 }
 
-/** A small deterministic generator, so that the same pattern is always timed on the same strings. */
+/** A small deterministic generator, so that the same pattern is always read on the same strings. */
 function generator(seed: number): () => number {
   let s = seed >>> 0;
   return () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s / 2 ** 32; };
@@ -222,7 +223,7 @@ export function sampleStrings(source: string, count = 12): string[] {
   return [...out];
 }
 
-// ---------------------------------------------------------------------------------------------------------------- timing
+// ---------------------------------------------------------------------------------------------------------------- lines
 
 const kindOf = (c: string): string => (/\w/.test(c) ? "w" : /\s/.test(c) ? "s" : c);
 
@@ -231,7 +232,7 @@ const kindOf = (c: string): string => (/\w/.test(c) ? "w" : /\s/.test(c) ? "s" :
  * alone and with a space after, with and without a character that fails the match at the end, each as a recipe for a line of any length.
  * A pattern that scans on from its opening to the end of the line (`#\[arg\([^\]]*long`) starts again at every copy of the opening and reads
  * the rest of the line each time, so it costs the square of the line however short the run of one character it can divide is; a run of
- * one character pushed in (`worstCost` below) never says its opening twice and does not find that.
+ * one character pushed in (`sweepLines` below) never says its opening twice and does not find that.
  */
 function repeatedOpenings(samples: string[]): Line[] {
   const units = new Set<string>();
@@ -242,43 +243,31 @@ function repeatedOpenings(samples: string[]): Line[] {
   for (const unit of units) {
     const at = (length: number): string => unit.repeat(Math.ceil(length / unit.length)).slice(0, length);
     const what = `${JSON.stringify(unit.repeat(Math.ceil(24 / unit.length)).slice(0, 24))}... (an opening said over and over)`;
-    lines.push({ what, at }, { what: `${what}, then "!"`, at: (length) => `${at(length).slice(0, length - 1)}!` });
+    const period = unit.length;
+    lines.push({ what, at, period }, { what: `${what}, then "!"`, at: (length) => `${at(length).slice(0, length - 1)}!`, period });
   }
   return lines;
 }
 
-/** A line the sweep times a pattern on, as a recipe: the same line at any length, so that how its cost grows with the length can be asked. */
-export interface Line { what: string; at: (length: number) => string }
+/** A line the sweep reads a pattern on, as a recipe: the same line at any length, so that how its work grows with the length can be asked. */
+export interface Line {
+  what: string;
+  at: (length: number) => string;
+  /** How many characters the line repeats: two lengths that differ by a multiple of it end alike, so they are the same line, longer or shorter. */
+  period: number;
+}
 
 /**
- * The most one `exec` of the pattern cost, in milliseconds, over the sample strings each with a run of characters pushed in where the kind of
- * character changes, and with a character that fails the match after the run, and over lines that say one opening of a sample over and over
- * (`repeatedOpenings`), every line `length` characters long. Each slow line is timed again and the fastest of the runs counts, so one pause of
- * the process is not a slow pattern. With `stopAboveMs` it stops at the first line over that, which is how a pattern that is known to be slow
- * is shown to be without waiting for it on every line. `line` is the line that cost the most, and `over` every line that cost more than
- * `overMs`, which `growth` times again at other lengths: the line that cost the most can be one the pattern reads in linear time while
- * another, that cost less, is read in the square of its length.
+ * Every line the sweep reads a pattern on, as recipes: the lines that say one opening of a sample over and over (`repeatedOpenings`), and
+ * each sample string with a run of characters pushed in where the kind of character changes (both ends, and wherever a word character meets
+ * a space or a punctuation mark), with and without a character that fails the match after the run. A pattern that backtracks super-linearly
+ * is slow on one of them however it is written, because what makes it slow is two parts that can both match the same run, and a run of the
+ * right character in the right place divides between them in as many ways as it is long.
  */
-export function worstCost(
-  source: string, flags: string, length: number, stopAboveMs = Infinity, overMs = Infinity,
-): { ms: number; line: Line; over: Line[] } {
-  const re = new RegExp(source, flags.replace(/[gy]/g, ""));
-  let worst: { ms: number; line: Line; over: Line[] } = { ms: 0, line: { what: "", at: () => "" }, over: [] };
-  const time = (line: string): number => { const t0 = performance.now(); re.exec(line); return performance.now() - t0; };
+export function sweepLines(source: string): Line[] {
   const samples = sampleStrings(source);
-  const slowest = (line: Line): boolean => {
-    const text = line.at(length);
-    let ms = time(text);
-    if (ms > worst.ms || ms > overMs) {
-      ms = Math.min(ms, time(text), time(text));
-      if (ms > overMs) worst.over.push(line);
-      if (ms > worst.ms) worst = { ms, line, over: worst.over };
-    }
-    return worst.ms > stopAboveMs;
-  };
-  for (const line of repeatedOpenings(samples)) if (slowest(line)) return worst;
+  const lines = repeatedOpenings(samples);
   for (const s of samples) {
-    // The places to push a run in: both ends, and wherever the kind of character changes.
     const cuts = Array.from({ length: s.length + 1 }, (_, k) => k).filter((k) => k === 0 || k === s.length || kindOf(s[k - 1] as string) !== kindOf(s[k] as string));
     for (const k of cuts) {
       for (const filler of new Set([" ", "a", "\t", s[k - 1] ?? "", s[k] ?? "", s.slice(Math.max(0, k - 2), k), s.slice(k, k + 2)])) {
@@ -288,49 +277,71 @@ export function worstCost(
           return s.slice(0, k) + filler.repeat(Math.ceil(room / filler.length)).slice(0, room) + s.slice(k);
         };
         const what = `${JSON.stringify(s)} with ${JSON.stringify(filler)} repeated at ${k}`;
-        for (const line of [{ what, at: pushed }, { what: `${what}, then "!"`, at: (length: number) => `${pushed(length).slice(0, length - 1)}!` }]) {
-          if (slowest(line)) return worst;
-        }
+        const period = filler.length;
+        lines.push({ what, at: pushed, period }, { what: `${what}, then "!"`, at: (length: number) => `${pushed(length).slice(0, length - 1)}!`, period });
       }
     }
   }
-  return worst;
+  return lines;
+}
+
+// ---------------------------------------------------------------------------------------------------------------- work
+
+/** What a pattern does on one line of the sweep, in steps of the counting matcher (`./regex-work.ts`), not in milliseconds. */
+export interface Work {
+  line: Line;
+  /** Steps of one `exec` on the line at the length asked, or `Infinity` when that was over the budget (`perChar` times the length). */
+  steps: number;
+  /**
+   * The coefficient of the square of the line in the steps (`q` of `a + b·n + q·n²`), from the steps on the same line at three lengths
+   * equally far apart (`n`, `n - d`, `n - 2d`, with `d` about a quarter of `n` and a whole number of the line's periods, so that the three
+   * end alike): their second difference over `2d²`. Exactly zero for a pattern whose work on the line is linear in it, however much work
+   * that is per character, since a count has no noise; the coefficient itself for one whose work is the square of the line; and more than
+   * it for one whose work grows faster still. `0` when it was not measured: on a line where all of the steps are too few for a part
+   * that grows with the square of the line to be over the bound (see `workOf`), and on one that was over the budget.
+   */
+  quadratic: number;
 }
 
 /**
- * How many times as long an `exec` of the pattern takes on the line at `length` as on the same line at a quarter of it (`ratio`): about 4 for a
- * pattern whose cost is linear in its line, about 16 for one that costs the square of it, and more for worse; what one `exec` on the line
- * at `length` cost (`ms`); and the part of that cost that grows faster than the line (`excessMs`), whatever the rest of it is and however
- * fast the machine is: what it costs over four times the cost at a quarter of the length is three quarters of a part that grows with the
- * square of the line (`bn²` less `4b(n/4)²`), so that is taken as four thirds of it, which is more than the part when it grows faster still
- * (five quarters of a cubic part, and four thirds of an exponential one). It is less than the part for one that grows as a power of the line
- * between one and two (a third of the cost for `n^1.2`), and a part that grows only a little faster than the line cannot be told from a linear
- * one on a busy machine at all; a backtracking pattern does not cost such a power, its cost grows with a whole power of the line or faster. The ratio is only telling where that is well over the resolution of the clock: a pattern that costs a microsecond
- * or two can take eight times as long on four times the line for reasons that have nothing to do with backtracking. A ratio of two times taken on the same
- * machine in the same moments, not a number of milliseconds: a busy or slow machine slows both alike. The two are timed in turn, `rounds`
- * times, and the least of each is the one compared, since a pause only ever makes a run slower. Each time is of as many `exec`s as make the
- * one on the long line last some tens of microseconds: enough that a pattern that costs a microsecond is not timed at the resolution of the
- * clock, and short enough that most runs fit between two of the pauses of a machine whose CPU is shared (a time of a millisecond is cut by
- * one in almost every round on a CPU quota of a quarter, and the least of them is no longer a time nothing touched).
+ * The lines of the sweep (`sweepLines`) that the pattern is slow on at `length`: where one `exec` takes more than `perChar` steps per
+ * character of the line, or where the part of its steps that grows with the square of the line has a coefficient over `quadratic`. A line
+ * on which one `exec` takes no more than `quadratic` times the square of half the line is not measured at the two shorter lengths: the steps
+ * at a length include that part, which is at least the coefficient times the square of the part of the line that repeats, and no line of
+ * the sweep has less than half of itself repeating once it is longer than twice a sample (a sample is at most 60 characters). With
+ * `stopAtFirst` it returns at the first slow line. Also the line the pattern did the most work on, and the one whose work grew fastest.
  */
-export function growth(source: string, flags: string, line: Line, length: number, rounds = 15): { ratio: number; ms: number; excessMs: number } {
-  const re = new RegExp(source, flags.replace(/[gy]/g, ""));
-  const short = line.at(Math.floor(length / 4));
-  const long = line.at(length);
-  const time = (text: string, runs: number): number => {
-    const t0 = performance.now();
-    for (let k = 0; k < runs; k++) re.exec(text);
-    return performance.now() - t0;
-  };
-  time(short, 1);
-  const once = Math.min(time(long, 1), time(long, 1));
-  const runs = Math.min(100, Math.max(1, Math.ceil(0.05 / Math.max(once, 0.0005))));
-  let leastShort = Infinity;
-  let leastLong = Infinity;
-  for (let round = 0; round < rounds; round++) {
-    leastShort = Math.min(leastShort, time(short, runs));
-    leastLong = Math.min(leastLong, time(long, runs));
+export function workOf(
+  source: string, flags: string, length: number, bounds: { perChar: number; quadratic: number; stopAtFirst?: boolean },
+): { slow: Work[]; most: Work; fastest: Work; lines: number } {
+  if (length < 240) throw new Error(`a length of ${length} is too short for the lines of the sweep to repeat over half of it`);
+  const pattern = counted(source, flags);
+  const none: Work = { line: { what: "", at: () => "", period: 1 }, steps: 0, quadratic: 0 };
+  const out = { slow: [] as Work[], most: none, fastest: none, lines: 0 };
+  const seen = new Set<string>();
+  for (const line of sweepLines(source)) {
+    const text = line.at(length);
+    if (seen.has(text)) continue;
+    seen.add(text);
+    out.lines += 1;
+    const steps = pattern.steps(text, bounds.perChar * length);
+    let quadratic = 0;
+    if (steps !== Infinity && steps > bounds.quadratic * (length / 2) ** 2) {
+      const d = line.period * Math.max(1, Math.round(length / 4 / line.period));
+      quadratic = (steps - 2 * pattern.steps(line.at(length - d)) + pattern.steps(line.at(length - 2 * d))) / (2 * d * d);
+    }
+    const work: Work = { line, steps, quadratic };
+    if (steps > out.most.steps) out.most = work;
+    if (quadratic > out.fastest.quadratic) out.fastest = work;
+    if (steps === Infinity || quadratic > bounds.quadratic) {
+      out.slow.push(work);
+      if (bounds.stopAtFirst) return out;
+    }
   }
-  return { ratio: leastLong / leastShort, ms: leastLong / runs, excessMs: ((leastLong - 4 * leastShort) * 4) / 3 / runs };
+  return out;
 }
 
+/** A slow line, said: what the line was and what the pattern did on it. */
+export const describeWork = (w: Work, length: number, perChar: number): string => (w.steps === Infinity
+  ? `over ${perChar * length} steps (${perChar} a character) on ${w.line.what} at ${length} characters`
+  : `${w.steps} steps on ${w.line.what} at ${length} characters, ${w.quadratic.toFixed(3)} of them per square of a character`);
