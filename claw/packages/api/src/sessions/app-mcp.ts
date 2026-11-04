@@ -22,6 +22,7 @@ import { APP_RUNS_ENABLED, SANDBOX_ROUTER_AUTH_ENABLED } from "../config.js";
 import { db } from "../infra/db.js";
 import { openAppRunSecret } from "../crypto/app-run-secrets.js";
 import { applySandboxKeyPolicyToTask, githubReviewMcpServers } from "../github-review/session-tools.js";
+import { githubMcpServers } from "../github-mcp/mcp.js";
 
 const logger = pino({ name: "session-app-mcp" });
 
@@ -103,7 +104,8 @@ export async function sessionAppMcpServers(
  * when it is claimed instead (`tasks/run-claim.ts`), so that nothing sealed on the
  * row holds the MCP token and a stale record is never offered.
  *
- * The GitHub review tools (see `github-review/session-tools.ts`) ride the same
+ * The GitHub tools of a session whose owner keeps a GitHub token (`github-mcp/mcp.ts`) and
+ * the GitHub review tools (see `github-review/session-tools.ts`) ride the same
  * path for the same reason, a session that has `config.acting_as` only, under a
  * reserved server name that a request cannot replace. So does what such a session
  * is not given: its sandbox holds none of its owner's keys (`withhold_sandbox_keys`),
@@ -116,9 +118,9 @@ export async function applyAppMcpToTask(task: Record<string, unknown>, sessionId
     task.mcp_servers as McpServers | undefined,
   );
   if (merged !== undefined) task.mcp_servers = merged;
-  const review = await githubReviewMcpServers(sessionId);
-  if (Object.keys(review).length > 0) {
-    task.mcp_servers = { ...((task.mcp_servers as McpServers | undefined) ?? {}), ...review };
+  const reserved = { ...(await githubMcpServers(sessionId)), ...(await githubReviewMcpServers(sessionId)) };
+  if (Object.keys(reserved).length > 0) {
+    task.mcp_servers = { ...((task.mcp_servers as McpServers | undefined) ?? {}), ...reserved };
   }
   await applySandboxKeyPolicyToTask(task, sessionId);
 }

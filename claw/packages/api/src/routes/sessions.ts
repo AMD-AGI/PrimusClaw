@@ -1100,6 +1100,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       "platform_key",
       "llm_api_key",
       "virtual_key",
+      "sealed_credentials",
       "_server_managed_credentials",
       // Set below from the verified caller, never taken from the request.
       "acting_as_requester",

@@ -14,7 +14,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { parseSessionRepo } from "@claw/protocol";
-import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
+import { readTrustedSessionCredentials, sealedCredentialFields } from "../auth/sealed-session-credentials.js";
 import { CLAW_ASSISTANT_WORKER_MODEL, CLAW_DEPLOY_MODE } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { insertSessionRow } from "../routes/sessions.js";
@@ -184,10 +184,7 @@ export async function workCreate(
       systemPrompt: "",
       // The credentials the owner's own messages stamp (`sessionCredentialPatch`), taken from the assistant's
       // session: this session never receives a message from the user directly.
-      config: {
-        platform_key: creds.platformKey || null, llm_api_key: creds.llmApiKey || null,
-        _server_managed_credentials: true, ...(repo !== undefined ? { repo } : {}),
-      },
+      config: { ...sealedCredentialFields(creds), ...(repo !== undefined ? { repo } : {}) },
       parentSid: null,
       role: "",
       model: CLAW_ASSISTANT_WORKER_MODEL || null,

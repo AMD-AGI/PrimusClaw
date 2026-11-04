@@ -507,7 +507,11 @@ changed function and export and the code around them, and runs the tests closest
 (the repository's documented test command, scoped, each command under `timeout 600`, after
 building what those tests import the documented way: in a workspace a test loads its sibling
 packages from their built output, which a fresh checkout lacks; dependencies and build output left
-in the reused checkout are kept and reused, never reinstalled from clean), then has a
+in the reused checkout are kept and reused, never reinstalled from clean; and under the runtime
+version the repository declares in `.nvmrc`, `.node-version`, `engines`, `.python-version` or `go.mod`:
+when the sandbox image's is older, the model downloads that version into the checkout, Node from
+`nodejs.org` checked against its `SHASUMS256.txt`, so a repository that needs a newer Node than the
+image has does not end with its tests failing to load), then has a
 second, adversarial pass look for what the first missed (a `task` sub-agent with read and bash
 tools only), and the review body lists what was read and run. A diff alone shows what changed, not
 who depends on it.
