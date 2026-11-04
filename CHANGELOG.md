@@ -28,6 +28,19 @@ record it.
 ## [Unreleased]
 
 ### Added
+- A work item can watch a GitHub pull request, behind `CLAW_ASSISTANT_GITHUB_EVENTS` (default off; needs
+  `CLAW_ASSISTANT_ENABLED`). New comments, reviews, review comments, a failed CI on the head commit and the pull request
+  closing reach the item's worker as one queued message, without anybody mentioning it and without going through the
+  router. A small loop reads each watched pull request every `CLAW_ASSISTANT_GITHUB_POLL_SEC` (default 30, at least 10)
+  with the owner's own `GH_TOKEN`; each event is stored once under GitHub's id and delivered in the transaction that
+  queues the message, at most 6 deliveries per item in 10 minutes (the rest wait, they are not dropped). A pull request
+  that cannot be read for 10 minutes puts the item in front of the user. New routes `POST/GET
+  /v1/work-items/:id/subscriptions` and `DELETE /v1/work-items/:id/subscriptions/:sub_id`; the router gets
+  `work_subscribe`, the worker `pr_reply`, which answers one event on the pull request as the owner, once per event,
+  and only where the owner allowed it themselves (`reply: true`, which needs an identity-provider sign-in; a key can
+  only take it away). Reviews on someone's behalf are never subscribed. New tables `claw_work_item_subscriptions`,
+  `claw_work_item_github_events` and `claw_work_item_pr_replies` (required at start-up when the assistant is on);
+  `CLAW_ASSISTANT_GITHUB_MAX_SUBSCRIPTIONS` (default 20) caps what one user watches.
 - On-behalf GitHub reviews as work items of the assistant, behind `CLAW_ASSISTANT_REVIEW_ITEMS` (default off; needs
   `CLAW_ASSISTANT_ENABLED` and `CLAW_GITHUB_REVIEW_ENABLED`): `POST /v1/assistant/reviews` and `POST
   /v1/assistant/reviews/:id/restart`; `claw_work_items.kind` (`task` | `review`) and `params` (new columns, required at
