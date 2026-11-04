@@ -1344,10 +1344,14 @@ describe("E the review the instructions ask for, held to by the tools", () => {
     // [what the session's events hold, besides the read, expected]
     const cases: Array<[string, () => Promise<void>, string]> = [
       ["no sub-agent", async () => {}, "second_pass_required"],
-      ["a sub-agent that failed", () => subAgentEnded(e, ended({ failed: true })), "second_pass_required"],
-      ["a sub-agent that called no tool", () => subAgentEnded(e, ended({ tool_stats: { total_calls: 0 } })), "second_pass_required"],
-      ["a sub-agent end without its tool counts", () => subAgentEnded(e, { failed: false }), "second_pass_required"],
-      ["a tool count that is not a number", () => subAgentEnded(e, ended({ tool_stats: { total_calls: "many" } })), "second_pass_required"],
+      ["a sub-agent that failed", () => subAgentEnded(e, { end: ended({ failed: true }) }), "second_pass_required"],
+      ["a sub-agent that called no tool", () => subAgentEnded(e, { end: ended({ tool_stats: { total_calls: 0 } }) }), "second_pass_required"],
+      ["a sub-agent end without its tool counts", () => subAgentEnded(e, { end: { failed: false } }), "second_pass_required"],
+      ["a tool count that is not a number", () => subAgentEnded(e, { end: ended({ tool_stats: { total_calls: "many" } }) }), "second_pass_required"],
+      ["a sub-agent not given this head (run pwd)", () => subAgentEnded(e, { prompt: "Run pwd and report the directory." }), "second_pass_required"],
+      ["a sub-agent given another head", () => subAgentEnded(e, { prompt: `Head commit ${"2".repeat(40)}. Review .pr-review/pr.diff.` }), "second_pass_required"],
+      ["the head named by another sub-agent's start", () => subAgentEnded(e, { startId: "sub-someone-else" }), "second_pass_required"],
+      ["a second pass given the short head commit", () => subAgentEnded(e, { prompt: `Second pass of ${HEAD.slice(0, 7).toUpperCase()} in /workspace/demo.` }), "submitted"],
       ["a sub-agent that ended before the head was read", async () => {
         await subAgentEnded(e);
         await e.sql("UPDATE claw_session_events SET created_at = NOW() - INTERVAL '2 minutes'");
@@ -1368,6 +1372,7 @@ describe("E the review the instructions ask for, held to by the tools", () => {
       assert.equal(reason(approval), expected, `${name}: ${approval.text}`);
       if (expected !== "submitted") {
         assert.match(String(approval.body.message), /`task` tool: `subagent_type` `explore`/, name);
+        assert.match(String(approval.body.message), new RegExp(`starting with the head commit ${HEAD}`), name);
         // The merge is held to it as well, even with an approval of this session's already on the head.
         approvedHere();
         assert.equal(reason(await merge()), expected, name);

@@ -275,9 +275,10 @@ export async function recentWrites(
 
 /**
  * What this session did with one head commit of a pull request before an approval or a merge of it: whether it read it with `gh_pr_get`
- * (`read`), whether any of those reads chose the sandbox path, and whether a sub-agent of the session finished, used a tool and did not fail
- * after the first of them (`secondPass`). The sub-agent's end is Brain's `subagentEnd` event as the event consumer stored it; Brain publishes
- * it, so neither the model nor the pull request's text can write it.
+ * (`read`), whether any of those reads chose the sandbox path, and whether a sub-agent of the session that was given this head commit (its
+ * short form, in the first 2000 characters of its prompt that Brain's `subagentStart` keeps) used a tool, did not fail and ended after the
+ * first of those reads (`secondPass`). Both events are Brain's, as the event consumer stored them; neither the model nor the pull request's
+ * text can write one.
  */
 export async function headReviewFacts(
   db: Queryable, sessionId: string, repo: string, pr: number, headSha: string,
@@ -291,10 +292,14 @@ export async function headReviewFacts(
      SELECT first_at IS NOT NULL AS read, sandbox,
             EXISTS (
               SELECT 1 FROM claw_session_events ev
+                JOIN claw_session_events st
+                  ON st.session_id = ev.session_id AND st.event = 'subagentStart' AND st.deleted_at IS NULL
+                 AND st.data->>'subagent_id' = ev.data->>'subagent_id'
                WHERE ev.session_id = $1 AND ev.event = 'subagentEnd' AND ev.deleted_at IS NULL AND ev.created_at >= reads.first_at
                  AND COALESCE(ev.data->>'failed', 'false') <> 'true'
                  AND CASE WHEN jsonb_typeof(ev.data->'tool_stats'->'total_calls') = 'number'
                           THEN (ev.data->'tool_stats'->>'total_calls')::numeric > 0 ELSE FALSE END
+                 AND position(left($4, 7) IN lower(COALESCE(st.data->>'prompt', ''))) > 0
             ) AS second_pass
        FROM reads`,
     [sessionId, repo, pr, headSha],

@@ -1175,8 +1175,8 @@ export class GithubReview {
     }
     if (facts.sandbox && !facts.secondPass) {
       throw new Refusal("second_pass_required", "this review is on the sandbox path, so an approval or a merge needs the second pass first, and this session has not run it on this head. "
-        + "Start it now with the `task` tool: `subagent_type` `explore`, `tools` [\"bash\", \"read\", \"grep\", \"glob\", \"ls\"], and the prompt step 8 of the review instructions describes "
-        + "(the checkout, origin/<base>, the head commit, .pr-review/pr.diff, what you read, the callers you did not open, what you ran, your findings). "
+        + "Start it now with the `task` tool: `subagent_type` `explore`, `tools` [\"bash\", \"read\", \"grep\", \"glob\", \"ls\"], and the prompt step 8 of the review instructions describes, "
+        + `starting with the head commit ${headSha} (a second pass whose prompt does not name it is not counted), then the checkout, origin/<base>, .pr-review/pr.diff, what you read, the callers you did not open, what you ran and your findings. `
         + "Verify what it returns, say in the review body what it added, then call this tool again. Nothing was approved or merged. "
         + "A second pass that ended in the last few seconds may not be recorded yet: then call again in a moment.");
     }

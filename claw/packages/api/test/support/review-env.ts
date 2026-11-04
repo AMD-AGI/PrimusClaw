@@ -77,12 +77,23 @@ export async function reviewedHead(
      VALUES ($1, $2, $3, 'gh_pr_get', $4, $5, $6, 'ok', 'ok', $7, NOW() - INTERVAL '1 minute')`,
     [e.actor.requesterUserId, e.actor.actorUserId, e.actor.sessionId, repo, Number(pr), o.head ?? HEAD, o.path ?? "sandbox"],
   );
-  if (o.secondPass !== false) await subAgentEnded(e);
+  if (o.secondPass !== false) await subAgentEnded(e, { head: o.head });
 }
 
-/** Brain's `subagentEnd` of one sub-agent of the session, stored as the event consumer stores it. */
-export async function subAgentEnded(e: Pick<ReviewEnv, "sql" | "actor">, data: Record<string, unknown> = { failed: false, turns: 12, tool_stats: { total_calls: 9, error_calls: 0, by_tool: {} } }): Promise<void> {
-  await e.sql("INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, 'subagentEnd', $3::jsonb)", [randomUUID(), e.actor.sessionId, JSON.stringify(data)]);
+/**
+ * One sub-agent of the session as the event consumer stores Brain's events of it: its `subagentStart` with the prompt it was given (the
+ * second pass of the review instructions by default, which names the head commit), then its `subagentEnd`.
+ */
+export async function subAgentEnded(
+  e: Pick<ReviewEnv, "sql" | "actor">,
+  o: { end?: Record<string, unknown>; prompt?: string; startId?: string; head?: string } = {},
+): Promise<void> {
+  const id = `sub-${randomUUID().slice(0, 8)}`;
+  const prompt = o.prompt ?? `Head commit ${o.head ?? HEAD}. Checkout /workspace/demo, base origin/main, the change in .pr-review/pr.diff. Report only what the first pass missed.`;
+  const insert = "INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, $3, $4::jsonb)";
+  await e.sql(insert, [randomUUID(), e.actor.sessionId, "subagentStart", JSON.stringify({ subagent_id: o.startId ?? id, subagent_type: "explore", prompt })]);
+  const end = o.end ?? { failed: false, turns: 12, tool_stats: { total_calls: 9, error_calls: 0, by_tool: {} } };
+  await e.sql(insert, [randomUUID(), e.actor.sessionId, "subagentEnd", JSON.stringify({ subagent_id: id, subagent_type: "explore", ...end })]);
 }
 
 /** An approval this session posted on `head` (default HEAD), as GitHub lists it: the acting user's, with the session's run marker. */

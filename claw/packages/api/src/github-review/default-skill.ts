@@ -255,7 +255,7 @@ const DEEP_REVIEW_STEPS = `## Steps
    pass missed in logic, security and compatibility.
    - On the sandbox path, start it with the \`task\` tool: \`subagent_type\` \`explore\` and
      \`tools\` \`["bash", "read", "grep", "glob", "ls"]\` (it must not have the review tools). Its prompt
-     names the checkout directory, the base (\`origin/<base>\`), the head commit, the path of
+     starts with the head commit (only such a pass counts), then names the checkout directory, the base (\`origin/<base>\`), the path of
      \`.pr-review/pr.diff\` (it reads the change there once, all of it, with as many \`read\` offsets as it
      takes, and does not regenerate it), the
      intent of the change in two sentences, the files and functions you read, the callers and users
@@ -328,10 +328,7 @@ const DEEP_REVIEW_STEPS = `## Steps
      already be on the pull request, \`approved_by_this_call\` says so): nothing is queued or merged, so say so and leave it to a person.
    - If \`gh_pr_merge\` answers \`acting_login_unknown\`, the account's GitHub login is not known, so it cannot be told whether the person wrote the pull request:
      nothing was approved or merged. Say so; a comment-only review is still open.
-   - The tools hold you to steps 1, 8 and 11: \`head_not_read\` means this session has not read that head with
-     \`gh_pr_get\`, \`second_pass_required\` that the second pass (step 8) has not run on it, and
-     \`review_not_submitted\` from \`gh_pr_merge\` that you have not posted your own \`APPROVE\` of it. Do
-     what the message says and call again; nothing was approved or merged.
+   - \`head_not_read\`, \`second_pass_required\` or \`review_not_submitted\`: a step was skipped; do what it says.
    - If a tool answers \`review_target_mismatch\`, this session is bound to one pull request: do not try
      another one.
    Never state that something was merged or approved unless a tool result says so.
