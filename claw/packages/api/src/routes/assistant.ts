@@ -11,6 +11,10 @@
  *   POST /v1/work-items/:id/stop
  *   POST /v1/assistant/reviews            reviews on someone's behalf, as items (`review-items.ts`)
  *   POST /v1/assistant/reviews/:id/restart the same pull request again, with what the body changes
+ *   GET  /v1/assistant/scopes             the group chats and repositories the caller's assistant watches
+ *   PUT  /v1/assistant/scopes             {scope, mode}: observe, or auto (only from a person; see `observe.ts`)
+ *   POST /v1/assistant/observations       {scope, content, message_id?}: one message of a watched place, to its watcher
+ *   GET  /v1/assistant/observations?scope= what the assistant would have done there, message by message
  *
  * Talking to the assistant is the existing `POST /v1/sessions/:id/messages`.
  *
@@ -31,7 +35,16 @@ import {
 import {
   parseRestartRequest, parseReviewRequest, restartReview, ReviewItemRefused, startReviews, syncReviewItem,
 } from "../assistant/review-items.js";
-import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_REVIEW_ITEMS, CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
+import {
+  getOrCreateScope, listObservations, listScopes, OBSERVATIONS_LIST_MAX, OBSERVED_CONTENT_MAX_CHARS, parseScope,
+  queueObservation, SCOPE_MODES, setScopeMode, type ScopeMode,
+} from "../assistant/observe.js";
+import { MissingPlatformKeyError, stampSessionCredentials } from "../auth/session-credentials.js";
+import { classifyAttendedCaller } from "../github-review/attended.js";
+import { readGithubReviewSettings } from "../github-review/settings.js";
+import {
+  CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_OBSERVE, CLAW_ASSISTANT_REVIEW_ITEMS, CLAW_GITHUB_REVIEW_ENABLED,
+} from "../config.js";
 
 const logger = pino({ name: "assistant" });
 
@@ -118,6 +131,8 @@ export async function registerAssistantRoutes(app: FastifyInstance): Promise<voi
     }
   });
 
+  if (CLAW_ASSISTANT_OBSERVE) registerObserveRoutes(app);
+
   if (!CLAW_ASSISTANT_REVIEW_ITEMS || !CLAW_GITHUB_REVIEW_ENABLED) return;
 
   const refused = (reply: FastifyReply, err: unknown) => {
@@ -145,5 +160,97 @@ export async function registerAssistantRoutes(app: FastifyInstance): Promise<voi
     } catch (err) {
       return refused(reply, err);
     }
+  });
+}
+
+/** The scope a request names, or a 400 that says what one looks like. */
+function requestScope(reply: FastifyReply, raw: unknown): string | null {
+  const scope = parseScope(raw);
+  if (!scope) {
+    reply.status(400).send({ ok: false, error: "invalid_scope", message: "scope is group:<channel>:<id> or repo:<owner>/<repo>" });
+  }
+  return scope;
+}
+
+function scopeView(row: { scope: string; mode: ScopeMode; session_id: string; mode_set_at: Date | null; created_at: Date }) {
+  // Acting in `auto` is not built yet: the record is kept in both modes, and nothing is done in either.
+  return { scope: row.scope, mode: row.mode, session_id: row.session_id, acting: false, mode_set_at: row.mode_set_at, created_at: row.created_at };
+}
+
+function registerObserveRoutes(app: FastifyInstance): void {
+  app.get("/v1/assistant/scopes", async (req, reply) => {
+    const userId = requireRealUser(req, reply);
+    if (!userId) return;
+    return reply.send({ ok: true, data: (await listScopes(userId)).map(scopeView) });
+  });
+
+  app.put("/v1/assistant/scopes", async (req, reply) => {
+    const userId = requireRealUser(req, reply);
+    if (!userId) return;
+    const body = (req.body ?? {}) as { scope?: unknown; mode?: unknown };
+    const scope = requestScope(reply, body.scope);
+    if (!scope) return;
+    const mode = body.mode ?? "observe";
+    if (typeof mode !== "string" || !(SCOPE_MODES as readonly string[]).includes(mode)) {
+      return reply.status(400).send({ ok: false, error: "invalid_mode", message: `mode is one of ${SCOPE_MODES.join(", ")}` });
+    }
+    const method = getAuthMethod(req);
+    let via: Record<string, unknown> = { method };
+    if (mode === "auto") {
+      // Letting the assistant act in a place is the person's say, and a key a sandbox holds is not a person.
+      const caller = classifyAttendedCaller(method, getUser(req)!, readGithubReviewSettings().decisionClientIds);
+      if (!caller.ok) {
+        return reply.status(403).send({ ok: false, error: caller.error, message: "only you, signed in, can let the assistant act there" });
+      }
+      via = { method, service: caller.via };
+    }
+    return reply.send({ ok: true, data: scopeView(await setScopeMode(userId, scope, mode as ScopeMode, via)) });
+  });
+
+  app.post("/v1/assistant/observations", async (req, reply) => {
+    const userId = requireRealUser(req, reply);
+    if (!userId) return;
+    const body = (req.body ?? {}) as { scope?: unknown; content?: unknown; message_id?: unknown };
+    const scope = requestScope(reply, body.scope);
+    if (!scope) return;
+    const content = typeof body.content === "string" ? body.content.trim() : "";
+    if (!content || content.length > OBSERVED_CONTENT_MAX_CHARS) {
+      return reply.status(400).send({ ok: false, error: "invalid_content", message: `content is 1 to ${OBSERVED_CONTENT_MAX_CHARS} characters` });
+    }
+    const messageId = body.message_id;
+    if (messageId !== undefined && (typeof messageId !== "string" || !messageId || messageId.length > 200)) {
+      return reply.status(400).send({ ok: false, error: "invalid_message_id" });
+    }
+    const { row } = await getOrCreateScope(userId, scope);
+    try {
+      // The watcher's turns run as the person who handed it the message, as their own messages run.
+      await stampSessionCredentials(row.session_id, getUser(req)!);
+    } catch (err) {
+      if (err instanceof MissingPlatformKeyError) return reply.status(403).send({ ok: false, error: "platform_key_required" });
+      throw err;
+    }
+    const queued = await queueObservation({
+      userId, sessionId: row.session_id, scope, mode: row.mode, content, messageId: (messageId as string | undefined) ?? null,
+    });
+    if (!queued.ok) {
+      const status = queued.error === "observe_backlog" ? 429 : 409;
+      return reply.status(status).send({ ok: false, error: queued.error });
+    }
+    return reply.send({ ok: true, data: { ...queued, acting: false } });
+  });
+
+  app.get("/v1/assistant/observations", async (req, reply) => {
+    const userId = requireRealUser(req, reply);
+    if (!userId) return;
+    const query = req.query as { scope?: string; limit?: string };
+    const scope = requestScope(reply, query.scope);
+    if (!scope) return;
+    const limit = query.limit === undefined ? 50 : Number(query.limit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > OBSERVATIONS_LIST_MAX) {
+      return reply.status(400).send({ ok: false, error: `limit is 1 to ${OBSERVATIONS_LIST_MAX}` });
+    }
+    const record = await listObservations(userId, scope, limit);
+    if (!record) return reply.status(404).send({ ok: false, error: "not_found" });
+    return reply.send({ ok: true, data: record });
   });
 }

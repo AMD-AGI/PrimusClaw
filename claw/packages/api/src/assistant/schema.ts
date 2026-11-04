@@ -12,6 +12,7 @@
  * says all outlive it.
  */
 import type pg from "pg";
+import { ensureObserveSchema } from "./observe.js";
 
 export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void> {
   await client.query(`
@@ -79,7 +80,7 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
       item_id     TEXT NOT NULL,
       -- created | run_started | progress | waiting | ready | blocked | failed | dropped | accepted | stopped
       kind        TEXT NOT NULL,
-      -- worker | turn_end | sweep | user | router | policy (a review's state, read off what it did)
+      -- worker | turn_end | sweep | watchdog | user | router | policy (a review's state, read off what it did)
       source      TEXT NOT NULL,
       generation  INT NOT NULL,
       run_id      TEXT,
@@ -124,4 +125,7 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_says_fallback
        ON claw_assistant_says(item_id, item_attention_seq) WHERE fallback`,
   );
+
+  // The places the assistant watches, and what it would have done there.
+  await ensureObserveSchema(client);
 }

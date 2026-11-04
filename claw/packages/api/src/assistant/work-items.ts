@@ -86,7 +86,7 @@ export function reportTransition(report: Pick<WorkReport, "kind" | "question">):
   }
 }
 
-export type ReportSource = "worker" | "turn_end" | "sweep";
+export type ReportSource = "worker" | "turn_end" | "sweep" | "watchdog";
 
 export interface ApplyReport {
   itemId: string;
