@@ -46,8 +46,8 @@ default; with `PLATFORM_DEFAULTS_FILE` unset, chats are built exactly as before.
   or plugin server gets `<SAFE_API_KEY>` only when its URL's host is listed in
   the Brain's `MCP_PLATFORM_KEY_ALLOWED_HOSTS` (comma separated), or, in a run
   given these defaults, when its URL has the origin (scheme, host and port) of
-  one of this file's servers that sends `<SAFE_API_KEY>` in its URL, token or
-  headers. Elsewhere the placeholder expands to an empty string, the server then
+  one of this file's servers that sends `<SAFE_API_KEY>` in its URL, its token
+  (unless its own `Authorization` header replaces it) or a header value. Elsewhere the placeholder expands to an empty string, the server then
   fails to authenticate, and Brain logs `mcp.placeholder_withheld_untrusted_host`
   with the host to list.
 

@@ -66,8 +66,19 @@ function literalUrlOrigin(url: unknown): string | null {
 }
 
 /**
- * The origins of the servers that send `<name>`: those naming it in a field that goes out with every
- * request (the URL, the token, a header), at a URL with a literal host.
+ * The values a server sends with every request, as `connectMcpServer` builds them: its URL, its
+ * headers' values, and its token as the bearer unless a header of its own replaces Authorization.
+ */
+function sentValues(spec: Record<string, unknown>): unknown[] {
+  const headers = spec.headers && typeof spec.headers === "object" && !Array.isArray(spec.headers)
+    ? spec.headers as Record<string, unknown>
+    : {};
+  const ownAuthorization = Object.keys(headers).some((k) => k.toLowerCase() === "authorization");
+  return [spec.url, ...(ownAuthorization ? [] : [spec.token || spec.api_key]), ...Object.values(headers)];
+}
+
+/**
+ * The origins of the servers that send `<name>` (see `sentValues`), at a URL with a literal host.
  */
 export function originsSendingPlaceholder(
   servers: Record<string, Record<string, unknown>>,
@@ -76,8 +87,8 @@ export function originsSendingPlaceholder(
   const origins = new Set<string>();
   for (const spec of Object.values(servers)) {
     if (!spec || typeof spec !== "object") continue;
-    const sent = JSON.stringify([spec.url, spec.token, spec.api_key, spec.headers]);
-    const origin = sent.includes(`<${name}>`) ? literalUrlOrigin(spec.url) : null;
+    const sends = sentValues(spec).some((v) => typeof v === "string" && v.includes(`<${name}>`));
+    const origin = sends ? literalUrlOrigin(spec.url) : null;
     if (origin) origins.add(origin);
   }
   return origins;

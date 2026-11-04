@@ -87,7 +87,7 @@ test("a run not given the defaults is not given their trust either", async () =>
   assert.notEqual(seen.get("plugin")?.key, "ak-user-key", "the plugin's server got the platform key on the defaults' word");
 });
 
-test("only a server sending the placeholder, at a literal http(s) origin, vouches for that origin", () => {
+test("only a server sending the placeholder (URL, bearer, header value), at a literal http(s) origin, vouches for it", () => {
   assert.deepEqual(
     [...originsSendingPlaceholder({
       a: { url: "https://Platform.Example.com:443/mcp", token: "<SAFE_API_KEY>" },
@@ -96,6 +96,8 @@ test("only a server sending the placeholder, at a literal http(s) origin, vouche
       d: { url: "https://<HOST>/mcp", token: "<SAFE_API_KEY>" },
       e: { command: "run-it", token: "<SAFE_API_KEY>" },
       f: { url: "https://described.example.com/mcp", token: "fixed", description: "takes <SAFE_API_KEY>" },
+      g: { url: "https://named.example.com/mcp", token: "fixed", headers: { "x-<SAFE_API_KEY>": "fixed" } },
+      h: { url: "https://replaced.example.com/mcp", token: "<SAFE_API_KEY>", headers: { authorization: "Bearer fixed" } },
     }, "SAFE_API_KEY")].sort(),
     ["http://third.example.com:8080", "https://platform.example.com"],
   );
