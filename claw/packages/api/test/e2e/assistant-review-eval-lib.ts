@@ -18,7 +18,7 @@ import { CLAW_ASSISTANT_ROUTER_MAX_TURNS } from "../../src/config.js";
 import { parseItemRef } from "../../src/assistant/item-ref.js";
 import { createAssistantMcpServer } from "../../src/assistant/mcp.js";
 import { renderReviewContext, renderRouterSystem, WORK_EVENT_PREFIX } from "../../src/assistant/prompts.js";
-import { mentionsNumber, modelGrounded, parsePrs, repoGrounded } from "../../src/assistant/review-tools.js";
+import { mentionsNumber, modelGrounded, parsePrs, prGrounded, repoGrounded } from "../../src/assistant/review-tools.js";
 import { ASSISTANT_MCP_SERVER } from "../../src/assistant/role-profile.js";
 import type { Block, Llm, Message, ModelResponse, ToolSchema } from "./assistant-router-eval-lib.js";
 import { promptFor, userTurn } from "./assistant-router-eval-lib.js";
@@ -96,7 +96,7 @@ export function standIn(c: ReviewEvalCase) {
         try { prs = parsePrs(input.prs); } catch (err) { return refuse((err as { code: string }).code); }
         if (typeof input.merge !== "boolean") return refuse("invalid_arguments");
         for (const pr of prs) {
-          if (!mentionsNumber(text, pr.number)) return refuse("pr_not_in_message");
+          if (!prGrounded(text, pr)) return refuse("pr_not_in_message");
           if (!repoGrounded(text, pr, c.repos ?? [], [])) return refuse("repo_not_grounded");
           if (!KNOWN_REPOS.has(`${pr.owner}/${pr.repo}`.toLowerCase())) return refuse("pr_check_failed", "github_not_found: no such repository");
         }

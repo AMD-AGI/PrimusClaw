@@ -18,6 +18,7 @@
  *   A3  a turn that read what a worker wrote (work_recall) no longer acts for the person
  *   S1  review_start hands across exactly what the user asked: prs, review only or merge, reviewer, model, who and which message
  *   S2  a pull request must be in the user's message, as a number of its own
+ *   S2b a number written in full with its repository binds the two
  *   S3  a repository must be named, the channel's own, or one of the user's recent reviews
  *   S4  a reviewer is the user, or someone the channel listed with a Claw user id
  *   S5  a model must be named by the user
@@ -297,6 +298,15 @@ describe("assistant review tools", { skip }, () => {
     assert.ok(!rt.mentionsNumber("1224", 224));
   });
 
+  test("S2b a number written in full with its repository binds the two: they cannot be paired the other way round", async () => {
+    const turn = await userTurn(alice, "审 AMD-AGI/PrimusClaw#224 和 https://github.com/AMD-AGI/Primus-Turbo/pull/225");
+    assert.equal(await code(rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#225", "AMD-AGI/Primus-Turbo#224"], merge: false })), "pr_not_in_message");
+    assert.equal(calls.start.length, 0);
+    await rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#224", "AMD-AGI/Primus-Turbo#225"], merge: false });
+    assert.equal(calls.start.length, 1);
+    assert.deepEqual(rt.fullRefsIn("see a/b#1, https://github.com/C/D/pull/22 and e/f#333x"), ["a/b#1", "c/d#22", "e/f#333"]);
+  });
+
   test("S3 a repository must be named, the channel's own, or one of the user's recent reviews", async () => {
     const bare = { channel: "teams", channel_message_id: "a" };
     const none = await userTurn(alice, "审 254", { context: bare });
@@ -364,11 +374,18 @@ describe("assistant review tools", { skip }, () => {
     assert.equal(await code(rt.reviewRestart(bySeq, { item_id: task.itemId })), "not_a_review_item");
     const noModel = await userTurn(alice, "重审 254");
     assert.equal(await code(rt.reviewRestart(noModel, { item_id: first, model: "claude-opus-4-8" })), "model_not_in_message");
+    // The same number in two repositories names neither, until the repository is said too.
+    const turbo = await reviewItem(alice, 5, { owner: "AMD-AGI", repo: "Primus-Turbo", number: 254 });
+    const twoRepos = await userTurn(alice, "换 opus 重审 254");
+    assert.equal(await code(rt.reviewRestart(twoRepos, { item_id: turbo, model: "claude-opus-4-8" })), "item_not_in_message");
+    const named = await userTurn(alice, "换 opus 重审 Primus-Turbo 254");
+    await rt.reviewRestart(named, { item_id: turbo, model: "claude-opus-4-8" });
+    assert.equal(calls.restart.at(-1)?.itemId, turbo);
     // Another user's review is not found as theirs.
     const bobItem = await reviewItem(bob, 1, { owner: "AMD-AGI", repo: "PrimusClaw", number: 300 });
     const bobs = await userTurn(alice, "重审 300");
     assert.equal(await code(rt.reviewRestart(bobs, { item_id: bobItem })), "item_not_found");
-    assert.equal(calls.restart.length, 3);
+    assert.equal(calls.restart.length, 4);
   });
 
   test("C1 confirmation_answer allows only a write the user named; deny needs no name", async () => {
@@ -401,9 +418,20 @@ describe("assistant review tools", { skip }, () => {
     assert.equal(await code(rt.confirmationAnswer(vague, { decision: "allow", pr: "999" })), "confirmation_not_found");
     await rt.confirmationAnswer(vague, { decision: "deny", pr: "257" });
     assert.deepEqual(calls.decide.at(-1), { userId: alice.userId, id: c257, decision: "deny", via: null });
+    // The same number waiting in two repositories: the number alone names neither.
+    await w.q("DELETE FROM claw_github_confirmations");
+    const claw224 = await confirmation(alice.userId, 224);
+    const turbo224 = await confirmation(alice.userId, 224, 60, "AMD-AGI/Primus-Turbo");
+    const bare = await userTurn(alice, "224 可以合入");
+    assert.equal(await code(rt.confirmationAnswer(bare, { decision: "allow", confirmation_id: turbo224 })), "pr_not_in_message");
+    assert.equal(await code(rt.confirmationAnswer(bare, { decision: "allow", pr: "224" })), "which_confirmation");
+    const withRepo = await userTurn(alice, "Primus-Turbo 224 可以合入");
+    await rt.confirmationAnswer(withRepo, { decision: "allow", confirmation_id: turbo224 });
+    assert.equal(calls.decide.at(-1)?.id, turbo224);
+    assert.notEqual(claw224, turbo224);
     const injected = await userTurn(alice, "看看 999 怎么样");
     assert.equal(await code(rt.confirmationAnswer(injected, { decision: "allow", pr: "999" })), "confirmation_not_found");
-    assert.equal(calls.decide.length, 3);
+    assert.equal(calls.decide.length, 4);
   });
 
   test("M1 review_mode_set can only make reviews ask more", async () => {

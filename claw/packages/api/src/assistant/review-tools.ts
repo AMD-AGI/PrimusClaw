@@ -142,6 +142,26 @@ export function modelGrounded(text: string, model: string): boolean {
   return lower(model).split(/[^a-z0-9]+/).some((part) => /^[a-z][a-z0-9]{2,}$/.test(part) && t.includes(part));
 }
 
+/** The pull requests the text names in full (`owner/repo#N`, or a pull request URL), lower-cased. */
+export function fullRefsIn(text: string): string[] {
+  const out: string[] = [];
+  for (const m of text.matchAll(/([A-Za-z0-9][A-Za-z0-9-]*)\/([A-Za-z0-9_.-]+)(?:#|\/pull\/)(\d{1,9})(?![0-9])/g)) {
+    out.push(`${m[1]}/${m[2]}#${m[3]}`.toLowerCase());
+  }
+  return out;
+}
+
+/**
+ * Whether the message names this pull request: its number stands on its own there, and when the message writes that number
+ * in full with a repository (`a/b#224`, a URL), it is this repository's. Two repositories and two numbers cannot be paired
+ * the other way round.
+ */
+export function prGrounded(text: string, pr: PrRef): boolean {
+  if (!mentionsNumber(text, pr.number)) return false;
+  const full = fullRefsIn(text).filter((r) => r.endsWith(`#${pr.number}`));
+  return full.length === 0 || full.includes(`${pr.owner}/${pr.repo}#${pr.number}`.toLowerCase());
+}
+
 /** The pull requests a call names, parsed, or the refusal for the first that is not one. */
 export function parsePrs(prs: unknown): PrRef[] {
   if (!Array.isArray(prs) || prs.length === 0) throw new ToolRefused("invalid_arguments", "prs needs at least one pull request, as owner/repo#number or its URL");
@@ -183,8 +203,8 @@ export async function reviewStart(
     const { userId, message, via } = await attendedTurn(q, claims);
     const recent = await recentReviewRepos(q, userId);
     for (const pr of prs) {
-      if (!mentionsNumber(message.content, pr.number)) {
-        refuseUngrounded("pr_not_in_message", `${pr.number} is not in the user's message: start only the pull requests they named`);
+      if (!prGrounded(message.content, pr)) {
+        refuseUngrounded("pr_not_in_message", `${pr.owner}/${pr.repo}#${pr.number} is not what the user's message names: start only the pull requests they named`);
       }
       if (!repoGrounded(message.content, pr, message.context.repos, recent)) {
         refuseUngrounded("repo_not_grounded", `the user did not name ${pr.owner}/${pr.repo}: ask them which repository`);
@@ -239,8 +259,13 @@ export async function reviewRestart(
     const reviews = await reviewItemsOf(q, userId);
     const item = reviews.find((r) => r.item_id === named.item.item_id);
     if (!item) throw new ToolRefused("not_a_review_item", "that item is not a review: only a review can be restarted");
-    const number = Number(item.params?.pr?.number);
-    const pointed = mentionsNumber(message.content, number) || message.content.includes(`#${item.seq}`) || reviews.length === 1;
+    const pr = item.params?.pr as PrRef | undefined;
+    const number = Number(pr?.number);
+    // A number shared by reviews in two repositories names neither, unless the repository is named too.
+    const sharing = reviews.filter((r) => Number(r.params?.pr?.number) === number).length;
+    const byNumber = !!pr && prGrounded(message.content, pr)
+      && (sharing === 1 || repoGrounded(message.content, pr, message.context.repos, []));
+    const pointed = byNumber || message.content.includes(`#${item.seq}`) || reviews.length === 1;
     if (!pointed) refuseUngrounded("item_not_in_message", "the user did not say which review: ask them (the pull request number is enough)");
     if (args.model && !modelGrounded(message.content, args.model)) {
       refuseUngrounded("model_not_in_message", "the user did not ask for that model: leave model out to keep the one it had");
@@ -304,7 +329,12 @@ export async function confirmationAnswer(
     if (args.decision === "allow") {
       const waiting = await waitingWhenWritten(q, userId, message.receivedAt);
       const only = waiting.length === 1 && waiting[0] === pick.id;
-      if (!mentionsNumber(message.content, pick.pr) && !only) {
+      const [owner = "", repo = ""] = pick.repo.split("/");
+      const ref = { owner, repo, number: pick.pr };
+      // The number of another waiting write in another repository is not this one's name.
+      const sharing = pending.filter((c) => c.pr === pick.pr).length;
+      const named = prGrounded(message.content, ref) && (sharing === 1 || repoGrounded(message.content, ref, [], []));
+      if (!named && !only) {
         refuseUngrounded("pr_not_in_message", `the user's message does not name ${pick.repo}#${pick.pr}: ask them to say which pull request to let through`);
       }
     }
