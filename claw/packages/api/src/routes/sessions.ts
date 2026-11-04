@@ -1895,7 +1895,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       // A message to the user's own assistant is written down with how it was authenticated, for the turn that answers it.
       ...(CLAW_ASSISTANT_ENABLED ? {
         accepted: (tx: PoolClient, messageId: string) => recordAssistantMessage(tx, {
-          sessionId, messageId, userId, content,
+          sessionId, messageId, userId, userName: user?.userName, content,
           attendedVia: attendedViaOfRequest(req),
           context: parseChannelContext(body.channel_context),
         }),

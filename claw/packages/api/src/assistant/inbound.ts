@@ -107,14 +107,15 @@ export function decidedViaOf(via: AttendedVia): DecidedVia | null {
  * other session: the row is what makes a router turn able to act, and only a router turn reads it.
  */
 export async function recordAssistantMessage(tx: PoolClient, m: {
-  sessionId: string; messageId: string; userId: string; content: string; attendedVia: AttendedVia | null; context: ChannelContext;
+  sessionId: string; messageId: string; userId: string; userName?: string; content: string; attendedVia: AttendedVia | null; context: ChannelContext;
 }): Promise<void> {
   const inserted = await tx.query(
-    `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content, attended_via, channel_context)
-     SELECT $1, $2, $3, $4, $5::jsonb, $6::jsonb
+    `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, user_name, content, attended_via, channel_context)
+     SELECT $1, $2, $3, $7, $4, $5::jsonb, $6::jsonb
       WHERE EXISTS (SELECT 1 FROM claw_assistants WHERE session_id = $1 AND user_id = $3)
      ON CONFLICT (session_id, message_id) DO NOTHING`,
-    [m.sessionId, m.messageId, m.userId, m.content, m.attendedVia ? JSON.stringify(m.attendedVia) : null, JSON.stringify(m.context)],
+    [m.sessionId, m.messageId, m.userId, m.content, m.attendedVia ? JSON.stringify(m.attendedVia) : null, JSON.stringify(m.context),
+      m.userName?.slice(0, CONTEXT_STRING_MAX) || null],
   );
   if (inserted.rowCount) {
     await tx.query(
@@ -126,6 +127,8 @@ export async function recordAssistantMessage(tx: PoolClient, m: {
 
 export interface TurnMessage {
   messageId: string;
+  /** The sender's name as their sign-in gave it, when it did. */
+  userName: string | null;
   content: string;
   context: ChannelContext;
   attendedVia: AttendedVia | null;
@@ -137,16 +140,17 @@ export interface TurnMessage {
 /** The user's message a router turn answers, or null for a turn that answers none (a worker's report). */
 export async function turnMessage(q: Querier, sessionId: string, messageId: string): Promise<TurnMessage | null> {
   const row = (await q(
-    `SELECT message_id, content, attended_via, channel_context, received_at,
+    `SELECT message_id, user_name, content, attended_via, channel_context, received_at,
             received_at > NOW() - make_interval(secs => $3::int) AS fresh
        FROM claw_assistant_messages WHERE session_id = $1 AND message_id = $2`,
     [sessionId, messageId, CLAW_ASSISTANT_ATTENDED_TTL_SEC],
   )).rows[0] as {
-    message_id: string; content: string; attended_via: AttendedVia | null; channel_context: unknown; received_at: Date; fresh: boolean;
+    message_id: string; user_name: string | null; content: string; attended_via: AttendedVia | null; channel_context: unknown; received_at: Date; fresh: boolean;
   } | undefined;
   if (!row) return null;
   return {
     messageId: row.message_id,
+    userName: row.user_name,
     content: row.content,
     context: parseChannelContext(row.channel_context),
     attendedVia: row.attended_via && (row.attended_via.kind === "person" || row.attended_via.kind === "service") ? row.attended_via : null,

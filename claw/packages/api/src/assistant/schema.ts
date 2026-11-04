@@ -122,6 +122,8 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
       session_id       TEXT NOT NULL,
       message_id       TEXT NOT NULL,
       user_id          TEXT NOT NULL,
+      -- The name the sign-in gave, for what a review signs with ("asked by ...").
+      user_name        TEXT,
       content          TEXT NOT NULL,
       -- {kind: "person"} or {kind: "service", client_id, act_sub} when an identity-provider token carried it; NULL otherwise.
       attended_via     JSONB,

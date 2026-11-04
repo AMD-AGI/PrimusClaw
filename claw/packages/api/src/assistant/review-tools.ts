@@ -19,9 +19,10 @@
  * commit and every gate again.
  */
 import pino from "pino";
+import { CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
 import { parsePrRef, type PrRef } from "../github-review/github.js";
 import { githubReviewService } from "../github-review/mcp.js";
-import { getReviewMode, setReviewMode } from "../github-review/store.js";
+import { DEFAULT_REVIEW_MODE, getReviewMode, setReviewMode } from "../github-review/store.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { deterministicEventId, enqueue, kickDelivery } from "../notifications/outbox.js";
 import type { AssistantActionPayload } from "../notifications/assistant-events.js";
@@ -51,6 +52,11 @@ export const REVIEW_MODES_SETTABLE = ["high_risk_confirm"] as const;
 
 function requireRouter(claims: AssistantTokenClaims): void {
   if (claims.role !== "router") throw new ToolRefused("not_allowed", `this tool is for the router, not the ${claims.role}`);
+}
+
+/** The review tools need the reviews: a deployment without them has no confirmations, modes or review items to act on. */
+function requireReviews(): void {
+  if (!CLAW_GITHUB_REVIEW_ENABLED) throw new ToolRefused("reviews_off", "GitHub reviews are not available on this deployment: tell the user");
 }
 
 /**
@@ -141,6 +147,7 @@ export async function reviewStart(
   args: { prs: unknown; reviewer?: string; merge: boolean; model?: string; effort?: string },
 ): Promise<Record<string, unknown>> {
   requireRouter(claims);
+  requireReviews();
   const prs = parsePrs(args.prs);
   if (typeof args.merge !== "boolean") throw new ToolRefused("invalid_arguments", "merge must be true or false: true only when the user clearly asked to merge");
   // Asked here, so a refusal costs the review service nothing; the turn is asked again inside its write (`guard`).
@@ -196,29 +203,24 @@ export async function reviewRestart(
   claims: AssistantTokenClaims, args: { item_id: string; model?: string; merge?: boolean; effort?: string },
 ): Promise<Record<string, unknown>> {
   requireRouter(claims);
-  let itemId = "";
-  let via: AttendedVia | null = null;
-  let userId = "";
-  await inTransaction(async (q) => {
-    const turn = await attendedTurn(q, claims);
-    userId = turn.userId;
-    via = turn.via;
+  requireReviews();
+  const chosen = await inTransaction(async (q) => {
+    const { userId, message, via } = await attendedTurn(q, claims);
     const named = await resolveWorkItemNow(userId, args.item_id);
     if (!named.ok) throw new ToolRefused(named.error, named.message);
     const reviews = await reviewItemsOf(q, userId);
     const item = reviews.find((r) => r.item_id === named.item.item_id);
     if (!item) throw new ToolRefused("not_a_review_item", "that item is not a review: only a review can be restarted");
     const number = Number(item.params?.pr?.number);
-    const pointed = mentionsNumber(turn.message.content, number) || turn.message.content.includes(`#${item.seq}`)
-      || reviews.length === 1;
+    const pointed = mentionsNumber(message.content, number) || message.content.includes(`#${item.seq}`) || reviews.length === 1;
     if (!pointed) refuseUngrounded("item_not_in_message", "the user did not say which review: ask them (the pull request number is enough)");
-    if (args.model && !modelGrounded(turn.message.content, args.model)) {
+    if (args.model && !modelGrounded(message.content, args.model)) {
       refuseUngrounded("model_not_in_message", "the user did not ask for that model: leave model out to keep the one it had");
     }
-    itemId = item.item_id;
+    return { userId, via, itemId: item.item_id };
   });
   const result = await reviewToolPorts.restartReviewItem({
-    userId, attended: { via: decidedViaOf(via as unknown as AttendedVia), messageId: claims.mid }, itemId,
+    userId: chosen.userId, attended: { via: decidedViaOf(chosen.via), messageId: claims.mid }, itemId: chosen.itemId,
     ...(args.model ? { model: args.model } : {}), ...(args.effort ? { effort: args.effort } : {}),
     ...(typeof args.merge === "boolean" ? { reviewOnly: !args.merge } : {}),
     guard: async (q) => { await attendedTurn(q, claims); },
@@ -241,6 +243,7 @@ export async function confirmationAnswer(
   claims: AssistantTokenClaims, args: { decision: "allow" | "deny"; confirmation_id?: string; pr?: string },
 ): Promise<Record<string, unknown>> {
   requireRouter(claims);
+  requireReviews();
   if (args.decision !== "allow" && args.decision !== "deny") throw new ToolRefused("invalid_arguments", "decision must be allow or deny");
   const chosen = await inTransaction(async (q) => {
     const { userId, message, via } = await attendedTurn(q, claims);
@@ -281,6 +284,7 @@ export async function confirmationAnswer(
 
 export async function reviewModeSet(claims: AssistantTokenClaims, args: { mode: string }): Promise<Record<string, unknown>> {
   requireRouter(claims);
+  requireReviews();
   // Turning confirmations off is never the assistant's to do: one misreading would let every later merge through
   // unasked. It is a setting the person changes themselves.
   if (args.mode === LOOSER_MODE) {
@@ -337,10 +341,8 @@ export async function reviewContextFor(userId: string, sessionId: string, messag
   confirmations: PendingConfirmation[]; reviewMode: string; message: TurnMessage | null;
 }> {
   const q: Querier = (text, params) => db.query(text, params);
-  const [confirmations, mode, message] = await Promise.all([
-    pendingConfirmationsFor(q, userId),
-    getReviewMode(db, userId),
-    turnMessage(q, sessionId, messageId),
-  ]);
+  const message = await turnMessage(q, sessionId, messageId);
+  if (!CLAW_GITHUB_REVIEW_ENABLED) return { confirmations: [], reviewMode: DEFAULT_REVIEW_MODE, message };
+  const [confirmations, mode] = await Promise.all([pendingConfirmationsFor(q, userId), getReviewMode(db, userId)]);
   return { confirmations, reviewMode: mode.mode, message };
 }
