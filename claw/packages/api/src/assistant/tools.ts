@@ -101,7 +101,7 @@ export async function say(
   const userId = await assistantUser(claims.sid);
   try {
     const out = await recordAssistantSay({
-      userId, sessionId: claims.sid, text: args.text, itemId: args.item_id,
+      userId, sessionId: claims.sid, text: args.text, itemId: args.item_id, turnMessageId: claims.mid,
       guard: async (q) => {
         if ((await assertLiveRun(q, claims)).userId !== userId) throw new ToolRefused("turn_not_live", "the session changed hands");
       },

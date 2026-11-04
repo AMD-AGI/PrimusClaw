@@ -557,6 +557,16 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- A session's queue is drained by one drain at a time (a lease on the session row, the new column
+  `claw_sessions.pending_drain_until`, added on start). Two drains running together -- a turn's completion and the
+  sweeper's, or two workers' reports waking an idle assistant a moment apart -- each started a turn: the second
+  started the next queued message on top of the first, whose `say` was then refused as `turn_superseded`, or the same
+  message again, which failed on a duplicate run id (`sweeper.orphaned_pending_drain_failed`). A message the owner
+  sends while a queued one is being dispatched now waits for that dispatch and is queued behind it, instead of
+  starting a turn the dispatch then took the session from. In the assistant's session the user's queued messages go
+  before queued worker reports. `POST /v1/sessions/{id}/messages` on a busy session now also answers the `message_id`
+  the queued message's turn will carry, and the assistant's `AssistantSay` session event names the turn that said it
+  (`turn_message_id`).
 - The review instructions that `gh_pr_get` returns (`review_instructions`) no longer open with a skill's frontmatter
   (`name: pr-review ...`), which sent the model looking for a skill that is not in its session and made it say so. The
   default instructions are the rules and steps alone, a repository skill's own frontmatter is left out too, and

@@ -57,6 +57,7 @@ CREATE TABLE claw_sessions (
   user_id        TEXT DEFAULT 'default',
   agent_status   TEXT DEFAULT 'idle',
   agent_gate_message_id TEXT,
+  pending_drain_until TIMESTAMPTZ,
   status         TEXT DEFAULT 'active',
   -- The create route's INSERT names every one of these, so a scenario that
   -- drives it against a narrower table fails on the column rather than on the
