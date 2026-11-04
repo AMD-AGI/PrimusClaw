@@ -27,6 +27,8 @@ export interface PluginWorld {
   omitEtags: boolean;
   /** Every MCP tool call the server answered, by tool name. */
   mcpCalls: string[];
+  /** The headers of every request the MCP server received, in order. */
+  mcpHeaders: http.IncomingHttpHeaders[];
   mcpUrl: string;
   close(): Promise<void>;
 }
@@ -65,7 +67,9 @@ export async function startPluginWorld(): Promise<PluginWorld> {
   });
 
   const mcpCalls: string[] = [];
+  const mcpHeaders: http.IncomingHttpHeaders[] = [];
   const mcp = http.createServer((req, res) => {
+    mcpHeaders.push(req.headers);
     let raw = "";
     req.on("data", (c) => (raw += c));
     req.on("end", async () => {
@@ -101,6 +105,7 @@ export async function startPluginWorld(): Promise<PluginWorld> {
     get omitEtags() { return state.omitEtags; },
     set omitEtags(v: boolean) { state.omitEtags = v; },
     mcpCalls,
+    mcpHeaders,
     mcpUrl: `http://127.0.0.1:${(mcp.address() as AddressInfo).port}/mcp`,
     close: async () => {
       await Promise.all([

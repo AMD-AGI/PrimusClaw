@@ -106,6 +106,21 @@ export function renderTimings(timings: readonly Timing[], budgetMs: number): str
   return ["interjection                       sent (UTC)                   latency  verdict", ...rows].join("\n");
 }
 
+/** One event of the assistant's session (`GET /v1/chat/sessions/:id/messages?mode=replay`), as far as the answer needs it. */
+export interface SessionEvent { data?: { type?: unknown; say_id?: unknown; turn_message_id?: unknown } }
+
+/**
+ * The answer to a message: the first say received that the message's own turn made, read from the session, where
+ * each say names its turn. Whether a say offers an item to accept says nothing about which message it answers:
+ * a turn answering the question may offer one, and a turn a worker's report started says something unasked.
+ */
+export function answerTo(messageId: string, session: readonly SessionEvent[], received: readonly Received[]): Received | undefined {
+  const own = new Set(session
+    .filter((e) => e.data?.type === "AssistantSay" && e.data.turn_message_id === messageId)
+    .map((e) => String(e.data!.say_id)));
+  return received.find((r) => r.type === "assistant.say" && own.has(r.eventId));
+}
+
 export interface ApiResult { status: number; json: any }
 
 export function apiClient(base: string, defaultKey: string) {

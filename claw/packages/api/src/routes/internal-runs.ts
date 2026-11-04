@@ -25,6 +25,7 @@ import {
   type ClaimedRun, type ClaimNextDiagnostics,
 } from "../tasks/run-claim.js";
 import type { RunSettlement } from "../tasks/run-time-ledger.js";
+import { wakeSession } from "../sessions/wake.js";
 
 const logger = pino({ name: "internal-runs" });
 
@@ -293,9 +294,35 @@ function registerClaimNextRoute(app: FastifyInstance): void {
   );
 }
 
+/** The only reason Brain wakes a session today; anything else is refused rather than guessed at. */
+const WAKE_REASONS = new Set(["background_work_finished"]);
+const WAKE_KEY_MAX = 200;
+
+/** Brain asks for a turn on a session whose sandbox finished background work while no turn ran (sessions/wake.ts). */
+function registerSessionWakeRoute(app: FastifyInstance): void {
+  app.post<{ Params: { sessionId: string } }>(
+    "/v1/internal/sessions/:sessionId/wake",
+    { preHandler: clusterInternalAuth },
+    async (req, reply) => {
+      const reason = fieldOf(req.body, "reason");
+      const key = fieldOf(req.body, "key");
+      if (typeof reason !== "string" || !WAKE_REASONS.has(reason)) {
+        return reply.status(400).send({ ok: false, error: "reason_invalid" });
+      }
+      if (typeof key !== "string" || !key || key.length > WAKE_KEY_MAX) {
+        return reply.status(400).send({ ok: false, error: "key_invalid" });
+      }
+      const outcome = await wakeSession(req.params.sessionId, key);
+      if (outcome === "not_found") return reply.status(404).send({ ok: false, error: "session_not_found" });
+      return { ok: true, outcome };
+    },
+  );
+}
+
 export async function registerInternalRunRoutes(app: FastifyInstance): Promise<void> {
   registerClaimByIdRoute(app);
   registerUnclaimRoute(app);
   registerFailClaimRoute(app);
   registerClaimNextRoute(app);
+  registerSessionWakeRoute(app);
 }

@@ -25,6 +25,8 @@ export interface RouterTurnEnd {
   sessionId: string;
   /** The runs the completion closed. */
   runIds: string[];
+  /** The message id of the turn that ended. */
+  messageId?: string;
   failed: boolean;
   interrupted: boolean;
   /** The completion was written by the sweeper for a run that never reported, so its text is a placeholder and not the model's. */
@@ -84,7 +86,7 @@ export async function deliverUnsaidAnswer(end: RouterTurnEnd, deps: SayDeps = {}
   );
   if (spoke.rowCount) return "skipped";
   try {
-    await recordAssistantSay({ userId: router.user_id, sessionId: end.sessionId, text }, deps);
+    await recordAssistantSay({ userId: router.user_id, sessionId: end.sessionId, text, turnMessageId: end.messageId }, deps);
   } catch (err) {
     // A refusal (the hourly cap) is the same answer the model's own say would have had; only a fault is worth a retry.
     if (err instanceof SayRefused) {

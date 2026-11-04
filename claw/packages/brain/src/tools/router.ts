@@ -12,7 +12,8 @@ import type { ToolSchema, PendingMemory, PendingSkill, PendingSkillFileMutation 
 import {
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED, TODO_WRITE_ENABLED, BG_SHELL_ENABLED,
   EXIT_PLAN_MODE_ENABLED, ASK_USER_QUESTION_ENABLED, A2A_CLIENT_ENABLED,
-  BASH_FOREGROUND_DEFAULT_SEC, WAIT_DEFAULT_SEC, HANDS_CALL_DEFAULT_TIMEOUT_MS,
+  BASH_FOREGROUND_DEFAULT_SEC, WAIT_DEFAULT_SEC, SUB_AGENT_MODELS,
+  HANDS_CALL_DEFAULT_TIMEOUT_MS,
 } from "../config.js";
 import type { WebSearchService } from "./web/search.js";
 import type { WebFetchService } from "./web/fetch.js";
@@ -108,6 +109,9 @@ const LOOP_INTERCEPTED_TOOLS = new Set([
   "exit_plan_mode",
   "ask_user_question",
 ]);
+
+/** The `task` tool's `model` value that keeps a sub-agent on the run's own model. */
+export const INHERIT_MODEL = "inherit";
 
 /** The tool that hands the model a skill the prompt listed; offered only when one is listed. */
 function loadSkillSchema(): ToolSchema {
@@ -812,6 +816,13 @@ export class ToolRouter {
             items: { type: "string" },
             description: "Optional: exact tool base names allowed for this sub-agent (further narrows subagent_type). Omit to use the profile defaults.",
           },
+          // Offered only where the deployment names models to choose from: an
+          // enum of nothing would be a field the model can only get wrong.
+          ...(SUB_AGENT_MODELS.length ? { model: {
+            type: "string",
+            enum: [...SUB_AGENT_MODELS, INHERIT_MODEL],
+            description: `Optional: the model this sub-agent runs on; "${INHERIT_MODEL}" runs it on your own. Omit to use the default (a lighter model for explore/readonly where one is configured, otherwise your own). Pick a lighter one for broad reading and searching, "${INHERIT_MODEL}" for work that needs judgement.`,
+          } } : {}),
         },
         required: ["description", "prompt"],
       }},

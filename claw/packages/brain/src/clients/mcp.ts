@@ -4,9 +4,12 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
+import type { FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { ToolSchema } from "@claw/protocol";
+import { isIP } from "node:net";
 import { redactSecrets } from "@claw/utils";
 import pino from "pino";
+import { Agent, fetch as undiciFetch } from "undici";
 
 const logger = pino({ name: "mcp-clients" });
 
@@ -14,6 +17,34 @@ interface McpClientWrapper {
   callTool: (name: string, args: Record<string, unknown>) => Promise<string>;
   listTools: () => Promise<ToolSchema[]>;
   close: () => Promise<void>;
+}
+
+/**
+ * A fetch that connects only to the address the API vetted for this server.
+ *
+ * The API checks where a requester's own MCP server resolves and records the
+ * answer on the spec as `pinned_address`; a name that resolved somewhere public
+ * then, and somewhere inside the cluster now, would otherwise pass. The host
+ * name still goes out as SNI and Host, so TLS is checked against it. (The
+ * SDK follows a redirect only within the same origin, which this pins too.) Specs
+ * without the field (the operator's, and those the API adds itself) connect
+ * normally.
+ */
+export function pinnedFetch(pin: unknown): FetchLike | undefined {
+  if (!pin || typeof pin !== "object") return undefined;
+  const { address, family } = pin as { address?: unknown; family?: unknown };
+  if (typeof address !== "string" || !isIP(address) || (family !== 4 && family !== 6)) {
+    throw new Error("mcp_pinned_address_invalid");
+  }
+  const dispatcher = new Agent({
+    connect: {
+      lookup: (_host, opts, cb) => {
+        if ((opts as { all?: boolean }).all) (cb as (e: null, a: Array<{ address: string; family: number }>) => void)(null, [{ address, family }]);
+        else cb(null, address, family);
+      },
+    },
+  });
+  return (url, init) => undiciFetch(url, { ...(init as object), dispatcher }) as unknown as Promise<Response>;
 }
 
 /**
@@ -46,11 +77,13 @@ async function connectMcpServer(name: string, spec: Record<string, unknown>): Pr
     { capabilities: {}, requestTimeoutMs } as any,
   );
 
+  const fetch = pinnedFetch(spec.pinned_address);
   const tryConnect = async (kind: "sse" | "streamable-http") => {
     const c = makeClient();
+    const opts = { requestInit: { headers }, ...(fetch ? { fetch } : {}) };
     const transport = kind === "sse"
-      ? new SSEClientTransport(new URL(url), { requestInit: { headers } })
-      : new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers } });
+      ? new SSEClientTransport(new URL(url), opts)
+      : new StreamableHTTPClientTransport(new URL(url), opts);
     await c.connect(transport);
     return c;
   };

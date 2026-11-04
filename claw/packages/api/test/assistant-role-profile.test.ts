@@ -10,7 +10,7 @@
  *   A2  a doorbell router turn is given all of that at the claim, and the row holds none of it
  *   A3  a queued router message replayed on the wire is given it after its run exists, so the bearer names that run
  *   A4  a worker turn gets its prompt, its item and the generation it started under, and keeps what the request brought
- *   A5  a session that is not an assistant's is left exactly as it was, whatever route its turn takes
+ *   A5  a session that is not an assistant's gets the working guideline and nothing else, whatever route its turn takes
  *   A6  a server named assistant in a request cannot stand in for ours, and a router drops every other server
  *   A7  a router turn does not select skills; a worker's and an ordinary session's do
  *   A8  a turn whose profile cannot be applied does not run
@@ -18,12 +18,16 @@
  *   A9c the same turn once it has completed: the conversation holds the user's words, not the request Brain ran
  *   A10 a worker's report that wakes the router carries the language the user last wrote in, and nothing when none is known
  *   A11 the router's item list names each item by its id and its number, and a report's header does as well
+ *
+ * With the working guideline on (`CLAW_AGENT_GUIDELINE_ENABLED`): a worker's system text starts with it and a
+ * router's never holds it (A1, A4).
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
 
 import { postgresSkipReason } from "./support/pg-cluster.js";
 import { startWorld, TOKEN_KEY, type World } from "./support/assistant-world.js";
+import { AGENT_GUIDELINE } from "../src/sessions/agent-guideline.js";
 
 const skip = postgresSkipReason();
 
@@ -36,7 +40,7 @@ describe("assistant role profile", { skip }, () => {
   const user = (id: string) => ({ userId: id, userName: id, roles: ["default"], platformKey: `pk-${id}`, virtualKey: `vk-${id}` });
 
   before(async () => {
-    w = await startWorld({ CLAW_SKILL_EVOLUTION_ENABLED: "true", MAX_SELECTED_SKILLS: "1" });
+    w = await startWorld({ CLAW_SKILL_EVOLUTION_ENABLED: "true", MAX_SELECTED_SKILLS: "1", CLAW_AGENT_GUIDELINE_ENABLED: "true" });
     dispatch = await import("../src/sessions/dispatch.js");
   });
   after(async () => { await w?.stop(); });
@@ -140,6 +144,7 @@ describe("assistant role profile", { skip }, () => {
     assert.equal(task.task_id, result.runId);
     assert.ok(claims.exp > Math.floor(Date.now() / 1000) + 3600, "outlives the longest turn the row allows");
     assert.ok(task.system_append.startsWith("You are the user's personal assistant."));
+    assert.ok(!task.system_append.includes(AGENT_GUIDELINE), "a router only dispatches: the working guideline is not its");
     assert.match(task.system_append, new RegExp(`Work items \\(open ones[^)]*\\):\\n#1 \\(item_id: ${item.itemId}\\) \\[in_progress\\] Fix the build`));
     assert.equal(task.skills, undefined);
   });
@@ -190,6 +195,7 @@ describe("assistant role profile", { skip }, () => {
     assert.equal(first.tools_allowlist, undefined, "a worker keeps every tool");
     assert.equal(first.max_turns, undefined);
     assert.deepEqual(Object.keys(first.mcp_servers).sort(), ["assistant", "mine"]);
+    assert.ok(first.system_append.startsWith(`${AGENT_GUIDELINE}\n\n`), "a worker does the user's work, under the working guideline");
     assert.match(first.system_append, /You are a worker on one work item/);
     assert.match(first.system_append, /item #1: Fix the build$/);
     assert.equal((await w.item(item.itemId)).generation, 1);
@@ -214,21 +220,23 @@ describe("assistant role profile", { skip }, () => {
     assert.equal((await w.item(item.itemId)).generation, 1, "the same run again is the same generation");
   });
 
-  test("A5 a session that is not an assistant's is left as it was", async () => {
+  test("A5 a session that is not an assistant's gets the working guideline and nothing else", async () => {
     const mine = { mine: { type: "http", url: "http://m/mcp", token: "t" } };
     for (const doorbell of [false, true]) {
       const { published } = await send("plain", "alice", { doorbell, mcpServers: mine });
       const task = doorbell ? await claim() : JSON.parse(published[0]);
-      for (const key of ["tools_allowlist", "max_turns", "system_append"]) assert.equal(task[key], undefined, `${key} (doorbell=${doorbell})`);
+      for (const key of ["tools_allowlist", "max_turns"]) assert.equal(task[key], undefined, `${key} (doorbell=${doorbell})`);
+      assert.equal(task.system_append, AGENT_GUIDELINE, `doorbell=${doorbell}`);
       assert.deepEqual(Object.keys(task.mcp_servers ?? {}), ["mine"]);
       await w.q("DELETE FROM claw_tasks");
     }
     const { task } = await replayed("plain", "alice", mine);
     assert.equal(task.tools_allowlist, undefined);
+    assert.equal(task.system_append, AGENT_GUIDELINE);
     assert.deepEqual(Object.keys(task.mcp_servers), ["mine"]);
     const bare: Record<string, unknown> = { task_id: "ktsk_1", message_id: "m" };
     await w.mod.role.applySessionRoleToTask(bare, "plain");
-    assert.deepEqual(bare, { task_id: "ktsk_1", message_id: "m" });
+    assert.deepEqual(bare, { task_id: "ktsk_1", message_id: "m", system_append: AGENT_GUIDELINE });
   });
 
   test("A6 a server named assistant in the request cannot stand in for ours, and a router drops the rest", async () => {

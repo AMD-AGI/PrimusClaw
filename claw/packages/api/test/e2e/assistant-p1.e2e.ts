@@ -44,8 +44,8 @@ import { promisify } from "node:util";
 
 import { mintAssistantToken } from "../../src/assistant/token.js";
 import {
-  SESSION_ID_LABEL, aliveSandboxes, apiClient, duplicateEventIds, itemNamed, latencyMs, newItemsSince, percentile,
-  renderTimings, retry5xx, runTag, sayPacingWaitMs, settle, startReceiver, until, type Received, type Timing,
+  SESSION_ID_LABEL, aliveSandboxes, answerTo, apiClient, duplicateEventIds, itemNamed, latencyMs, newItemsSince, percentile,
+  renderTimings, retry5xx, runTag, sayPacingWaitMs, settle, startReceiver, until, type Received, type SessionEvent, type Timing,
 } from "./assistant-p1-lib.js";
 
 const run = promisify(execFile);
@@ -196,11 +196,12 @@ async function scenario(): Promise<"finished" | void> {
   const again = await api("POST", "/v1/assistant");
   check(again.json?.data?.session_id === sid && again.json?.data?.created === false, "asking again returns the same session");
 
-  const send = async (content: string): Promise<number> => {
+  const send = async (content: string): Promise<number> => (await sendMessage(content)).at;
+  const sendMessage = async (content: string): Promise<Sent> => {
     const at = Date.now();
     const r = await api("POST", `/v1/sessions/${sid}/messages`, { content, messageType: "text" });
     if (r.status !== 200) throw new Error(`sending a message answered ${r.status}: ${JSON.stringify(r.json).slice(0, 200)}`);
-    return at;
+    return { at, messageId: typeof r.json?.message_id === "string" ? r.json.message_id : null };
   };
   const sayAfter = (since: number, match: (r: Received) => boolean = () => true) =>
     receiver.received.find((r) => r.type === "assistant.say" && r.at >= since && match(r));
@@ -307,7 +308,7 @@ async function scenario(): Promise<"finished" | void> {
       log(`soak round ${round}: waiting ${Math.round(pause / 1000)}s so the user stays within ${SAY_MAX_PER_HOUR} messages an hour (${says().filter((t) => t > Date.now() - 3_600_000).length} in the last hour)`);
       await new Promise((r) => setTimeout(r, pause));
     }
-    soak.push(...await soakRound(round, send, receiver, sid));
+    soak.push(...await soakRound(round, sendMessage, receiver, sid));
     roundsRun = round;
   }
   if (SOAK_ROUNDS) check(roundsRun === SOAK_ROUNDS, `all ${SOAK_ROUNDS} soak rounds ran (${roundsRun})`);
@@ -355,6 +356,14 @@ async function sandboxGuard(round: number): Promise<boolean> {
 }
 
 type Send = (content: string) => Promise<number>;
+interface Sent { at: number; messageId: string | null }
+type SendMessage = (content: string) => Promise<Sent>;
+
+/** The assistant session's recorded events; an unreadable read is none, which the deadline then reports as no answer. */
+async function sessionEvents(sid: string): Promise<SessionEvent[]> {
+  const r = await api("GET", `/v1/chat/sessions/${sid}/messages?mode=replay`);
+  return r.status === 200 && Array.isArray(r.json?.data) ? (r.json.data as SessionEvent[]) : [];
+}
 type NewItem = (since: number) => Promise<ItemView | null>;
 type Rec = Awaited<ReturnType<typeof startReceiver>>;
 
@@ -422,7 +431,7 @@ async function refusedReceiver(send: Send, receiver: Rec, newItem: NewItem, know
  * in the round: its two items accepted (or stopped when not ready in time), anything else new stopped, and every
  * worker deleted. Returns the interjection latencies.
  */
-async function soakRound(round: number, send: Send, receiver: Rec, assistantSid: string): Promise<number[]> {
+async function soakRound(round: number, sendMessage: SendMessage, receiver: Rec, assistantSid: string): Promise<number[]> {
   const floor = Math.max(0, ...(await board()).map((i) => Number(i.seq)));
   const deadline = Date.now() + SOAK_DONE_WAIT_MS;
   const names = [`S${round}a`, `S${round}b`];
@@ -432,7 +441,7 @@ async function soakRound(round: number, send: Send, receiver: Rec, assistantSid:
     for (const i of newItemsSince(await board(), floor, new Set(runItems.keys()))) { seen.set(i.item_id, i); await track(i.item_id); }
   };
   try {
-    const t = await send(`Task ${full(names[0])}: write "${full(names[0])}" into /workspace/s${round}a.txt. Task ${full(names[1])}: write "${full(names[1])}" into /workspace/s${round}b.txt. Start both now.`);
+    const t = (await sendMessage(`Task ${full(names[0])}: write "${full(names[0])}" into /workspace/s${round}a.txt. Task ${full(names[1])}: write "${full(names[1])}" into /workspace/s${round}b.txt. Start both now.`)).at;
     const mine = await until(async () => {
       await collect();
       const found = names.map((n) => itemNamed(seen.values(), n));
@@ -444,10 +453,10 @@ async function soakRound(round: number, send: Send, receiver: Rec, assistantSid:
       // Only once the assistant is between turns, and its last message has landed, is the next thing it says the answer.
       const idle = await settled(assistantSid, receiver, 3_000, Date.now() + 60_000);
       check(idle === true, `soak round ${round}: the assistant is between turns and quiet before "${q}"`);
-      const sent = await send(q);
-      // A "ready, accept it" message is the system reporting a task, not the answer to this question.
-      const said = await until(() => receiver.received.find((r) => r.type === "assistant.say" && r.at >= sent && !r.item?.can_accept), sent + SAY_BUDGET_MS * 3, 100);
-      out.push(said ? said.at - sent : Number.POSITIVE_INFINITY);
+      const sent = await sendMessage(q);
+      if (!check(sent.messageId !== null, `soak round ${round}: "${q}" was given a message id`)) { out.push(Number.POSITIVE_INFINITY); continue; }
+      const said = await until(async () => answerTo(sent.messageId!, await sessionEvents(assistantSid), receiver.received), sent.at + SAY_BUDGET_MS * 3, 1000);
+      out.push(said ? said.at - sent.at : Number.POSITIVE_INFINITY);
     }
     const readied = await Promise.all((mine ?? []).map((i) => ready(i.item_id, deadline)));
     for (const [k, it] of readied.entries()) {

@@ -263,6 +263,12 @@ test("the second pass is handed the diff file, what was read and the callers see
   assert.doesNotMatch(PR_REVIEW_INSTRUCTIONS, /pr\.diff|did not open/);
 });
 
+test("the deep review grades a defect that breaks the main path once a flag is on as blocking, even when the flag is off by default", () => {
+  const text = DEEP_PR_REVIEW_INSTRUCTIONS.replace(/\s+/g, " ");
+  assert.match(text, /A problem that breaks the main path \(every turn, every request, every user, or an unattended run\) as soon as a shipped flag or documented setting is turned on is blocking, even when that flag is off by default: off by default lowers the urgency, not the severity\./);
+  assert.doesNotMatch(PR_REVIEW_INSTRUCTIONS, /off by default/);
+});
+
 /**
  * What main gave the model before the deep review existed (8f0bf87, src/github-review unchanged since 92ed1dd), computed by running
  * that tree's own code: the sha256 of each instruction text, and every advice string word for word.

@@ -197,6 +197,8 @@ async function queued(doorbell: boolean, s: Scenario): Promise<Request> {
     return published.length;
   }) as typeof pendingDispatchPorts.publish;
 
+  // The turn in front has ended and handed the session back: a drain only runs on a free session.
+  await h.sql("UPDATE claw_sessions SET agent_status = 'idle', agent_gate_message_id = NULL WHERE session_id = $1", [SESSION]);
   await drainOldestPendingMessage(SESSION, OWNER);
 
   if (doorbell) {
