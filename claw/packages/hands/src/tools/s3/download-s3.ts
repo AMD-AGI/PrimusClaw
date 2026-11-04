@@ -40,8 +40,13 @@ function placeOf(fd: number, root: string): string | null {
   } catch {
     return "cannot tell which file was opened";
   }
-  const rel = path.relative(root, at);
-  return rel.startsWith("..") || path.isAbsolute(rel) ? `resolved to ${at}, outside the workspace` : null;
+  return below(root, at) === null ? `resolved to ${at}, outside the workspace` : null;
+}
+
+/** `p` relative to `root`, or null when it is not `root` or below it. A name like `..x` is below. */
+function below(root: string, p: string): string | null {
+  const rel = path.relative(root, p);
+  return rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel) ? null : rel;
 }
 
 /**
@@ -95,7 +100,8 @@ function openDirBelow(root: string, parts: string[]): number | string {
  *
  * The bytes go into a new file only Hands can open (made next to the target
  * through the directory's descriptor), which then takes the target's name in
- * that same directory: no other name, link or file can receive them, and a
+ * that same directory and is opened to others only once it is known to be in
+ * place: no other name, link or file can receive them, and a
  * file already at `p` is replaced rather than written into. Nothing stops
  * another process renaming a directory while this runs, so where the file is
  * is asked once more after the rename: one moved out meanwhile is emptied and
@@ -103,8 +109,8 @@ function openDirBelow(root: string, parts: string[]): number | string {
  * prevent.
  */
 function writeWhereNamed(p: string, body: Buffer): string | null {
-  const named = path.relative(path.resolve(WORKSPACE), p);
-  if (!named || named.startsWith("..") || path.isAbsolute(named)) {
+  const named = below(path.resolve(WORKSPACE), p);
+  if (!named) {
     // a path the caller named outside the workspace is written as it always was
     fs.mkdirSync(path.dirname(p), { recursive: true });
     fs.writeFileSync(p, body);
@@ -125,7 +131,6 @@ function writeWhereNamed(p: string, body: Buffer): string | null {
     fd = fs.openSync(part, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
     try {
       fs.writeFileSync(fd, body);
-      fs.fchmodSync(fd, 0o666 & ~process.umask());
       fs.renameSync(part, target);
     } catch (e) {
       fs.rmSync(part, { force: true });
@@ -139,6 +144,7 @@ function writeWhereNamed(p: string, body: Buffer): string | null {
       if (there && there.ino === mine.ino && there.dev === mine.dev) fs.unlinkSync(target);
       return `not written: ${p} was moved while being written and ${moved}`;
     }
+    fs.fchmodSync(fd, 0o666 & ~process.umask());   // readable by others only once it is known to be in place
     return null;
   } finally {
     if (fd !== undefined) fs.closeSync(fd);

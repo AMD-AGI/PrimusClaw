@@ -30,7 +30,7 @@ after(() => {
 });
 
 /** Replace `fs.<name>` until its first call, running `meanwhile` just before that call goes through. */
-function onFirstCall(name: "renameSync" | "writeFileSync", meanwhile: (...args: any[]) => void): () => void {
+function onFirstCall(name: "renameSync" | "writeFileSync" | "ftruncateSync", meanwhile: (...args: any[]) => void): () => void {
   const real = fs[name] as (...args: any[]) => any;
   (fs as any)[name] = (...args: any[]) => {
     (fs as any)[name] = real;
@@ -141,14 +141,18 @@ for (const existing of [false, true]) {
     const dir = path.join(WORK, name);
     fs.mkdirSync(dir);
     if (existing) fs.writeFileSync(path.join(dir, "f.txt"), "old");
-    const restore = onFirstCall("renameSync", () => fs.renameSync(dir, path.join(OUTSIDE, name)));
+    let modeWhileOutside = -1;
+    const restoreRename = onFirstCall("renameSync", () => fs.renameSync(dir, path.join(OUTSIDE, name)));
+    const restoreTruncate = onFirstCall("ftruncateSync", (fd: number) => { modeWhileOutside = fs.fstatSync(fd).mode & 0o777; });
     try {
       const out = result(await downloadS3.execute({ files: [{ local_path: path.join(dir, "f.txt"), presigned_url: url }] }));
       assert.deepEqual(out.ok, []);
       assert.match(out.failed[0].error, /moved while being written/);
+      assert.equal(modeWhileOutside, 0o600, "no other identity could open it while it was outside");
       assert.deepEqual(outsideHolds("uploaded bytes"), [], "the bytes did not stay outside");
     } finally {
-      restore();
+      restoreTruncate();
+      restoreRename();
     }
   });
 }
@@ -167,4 +171,14 @@ test("a write that fails part way leaves no part of the download", async () => {
   } finally {
     restore();
   }
+});
+
+test("a directory whose name merely starts with two dots is inside the workspace and not written through", async () => {
+  const victim = path.join(OUTSIDE, "dotted-victim");
+  fs.writeFileSync(victim, "keep");
+  fs.symlinkSync(OUTSIDE, path.join(WORK, "..escape"));
+  const out = result(await downloadS3.execute({ files: [{ local_path: path.join(WORK, "..escape", "dotted-victim"), presigned_url: url }] }));
+  assert.deepEqual(out.ok, []);
+  assert.match(out.failed[0].error, /\.\.escape is a symbolic link/);
+  assert.equal(fs.readFileSync(victim, "utf-8"), "keep");
 });
