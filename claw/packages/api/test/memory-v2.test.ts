@@ -20,6 +20,7 @@
  *       not opted in
  *   W8  REST writes pass the same checks; one made with a key (not a sign-in) waits for confirmation
  *   W9  an entry waiting for confirmation is not the model's to read, change or delete
+ *   W10 nor is one that becomes pending while the model is changing, deleting or undoing it
  * Deletes
  *   D1  deleting is for good: no text of the entry is left anywhere in the database
  *   D2  a deleted entry is gone from the next turn's catalogue
@@ -379,6 +380,42 @@ describe("memory v2", { skip }, () => {
     assert.deepEqual([row.status, row.content], ["pending", "a pending fact about tabs"], "untouched, still waiting");
   });
 
+  test("W10 an entry a key's edit makes pending while the model is acting on it is left alone", async () => {
+    const said = "remember I use neovim";
+    const model = { kind: "model" as const, sessionId: "s-race", quote: "I use neovim", humanMessages: [said] };
+    const acts: Array<[string, (id: number) => Promise<unknown>, unknown]> = [
+      ["update", (id) => svc.updateMemory("alice", id, { title: "uses neovim daily", body: "I use neovim daily" }, model), "not_found"],
+      ["forget", (id) => svc.forgetMemory("alice", id, "model"), false],
+      ["undo", (id) => svc.undoMemory("alice", id, "model"), "not_found"],
+    ];
+    for (const [name, act, refused] of acts) {
+      await w.q("TRUNCATE claw_memory_entries, claw_memory_events");
+      const saved = await svc.writeMemory("alice", { type: "user", title: "uses neovim", body: "I use neovim" }, model);
+      assert.equal(saved.ok, true);
+      const id = (saved as { id: number }).id;
+      // The key's edit holds the row, uncommitted, while the model's statement starts: the model has read the
+      // entry as active (the committed version) and must still not act once the edit commits it as pending.
+      const key = await w.h.app.db.db.pool.connect();
+      try {
+        await key.query("BEGIN");
+        await key.query("UPDATE claw_memory_entries SET status = 'pending', content = 'edited by a key' WHERE id = $1", [id]);
+        const acting = act(id);
+        for (let i = 0; ; i++) {
+          const waiting = await w.q("SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'");
+          if (waiting.length) break;
+          assert.ok(i < 200, `${name}: the model's statement never waited on the key's edit`);
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        await key.query("COMMIT");
+        const result = await acting;
+        assert.equal(typeof result === "object" ? (result as { error?: string }).error : result, refused, name);
+      } finally {
+        key.release();
+      }
+      const [row] = await entries();
+      assert.deepEqual([row?.status, row?.content], ["pending", "edited by a key"], `${name}: the pending edit stands`);
+    }
+  });
 
   // ── deletes ───────────────────────────────────────────────────────────────
 
