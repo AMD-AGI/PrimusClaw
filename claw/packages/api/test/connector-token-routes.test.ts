@@ -56,6 +56,7 @@ const REGISTRARS: Record<string, string> = {
   registerInternalRunRoutes: "routes/internal-runs.js",
   registerInternalAppRoutes: "routes/internal-apps.js",
   registerInternalWorkspaceRoutes: "routes/internal-workspaces.js",
+  registerInternalMemoryRoutes: "routes/internal-memory.js",
   registerTaskDagRoutes: "routes/task-dags.js",
   registerTaskRoutes: "routes/tasks.js",
   registerRunRoutes: "runs/routes.js",

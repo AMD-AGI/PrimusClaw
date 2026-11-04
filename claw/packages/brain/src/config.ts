@@ -1862,7 +1862,7 @@ export const WAIT_DEFAULT_SEC = envInt("WAIT_DEFAULT_SEC", 100, { min: 1 });
 
 // --- HITL ---
 export const HITL_ENABLED = envBool("HITL_ENABLED", false);
-export const HITL_AUTO_ALLOW = env("HITL_AUTO_ALLOW", "read,glob,grep,ls,load_skill,todo_write,web_search,save_memory");
+export const HITL_AUTO_ALLOW = env("HITL_AUTO_ALLOW", "read,glob,grep,ls,load_skill,todo_write,web_search,save_memory,update_memory,recall_memory,forget_memory");
 export const HITL_DECISION_TIMEOUT_MS = envInt("HITL_DECISION_TIMEOUT_MS", 300_000);
 export const HITL_DECISION_DEFAULT = env("HITL_DECISION_DEFAULT", "allow");
 /**

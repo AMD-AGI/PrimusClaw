@@ -412,9 +412,11 @@ export class AgentEngine {
       router.lazySkillWriter = lazySkills;
       // The listed skills are Brain's to hand over: `load_skill` serves them without a sandbox.
       if (progressiveSkills.length) router.skillStore = new SkillStore(progressiveSkills, `${sessionDir}/.skills`);
-      // A session that acts as a user (`withhold_sandbox_keys`) has no `save_memory`: what its model writes into the requester's long-term
-      // memory is what a stranger's text made it write, and every later session of the requester would read it.
-      router.memoryEnabled = request.memory_enabled !== false && !request.withhold_sandbox_keys;
+      // Offered only when the API said so: a request without the field is not the user's conversation. A session that acts as a
+      // user (`withhold_sandbox_keys`) never has them: what its model writes into the requester's long-term memory is what a
+      // stranger's text made it write, and every later session of the requester would read it.
+      router.memoryEnabled = request.memory_enabled === true && !request.withhold_sandbox_keys;
+      router.memoryTurn = { sessionId: request.session_id, messageId: request.message_id };
       router.skillEvolutionEnabled = request.skill_evolution_enabled === true;
       // Whom an identity-authenticated a2a_call peer is called as, and when the run's budget ends.
       const deadlineMs = request.deadline_at ? Date.parse(request.deadline_at) : NaN;
@@ -540,7 +542,6 @@ export class AgentEngine {
             errorCount: 0,
             toolStats: { total_calls: 0, error_calls: 0, by_tool: {} },
             elapsedMs: 0,
-            pendingMemories: [],
             pendingSkills: [],
             skillsUsed: {},
           };
@@ -569,6 +570,7 @@ export class AgentEngine {
           ...(isReasoningEffort(request.effort) ? { effort: request.effort } : {}),
           ...(request.rolling_cache_ttl === "5m" ? { rollingCacheTtl: "5m" as const } : {}),
           ...(Number.isSafeInteger(request.sub_agent_max_turns) && request.sub_agent_max_turns! > 0 ? { subAgentMaxTurns: request.sub_agent_max_turns } : {}),
+          ...(request.withhold_sandbox_keys ? { actingReview: true } : {}),
           apiUrl,
           apiKey,
           maxTurns,
@@ -639,7 +641,6 @@ export class AgentEngine {
         errorCount: loopResult.errorCount,
         toolStats: loopResult.toolStats,
         elapsedMs: loopResult.elapsedMs,
-        pendingMemories: router.pendingMemories,
         pendingSkills: router.pendingSkills,
         pendingSkillFileMutations: router.pendingSkillFileMutations,
         skillsUsed,

@@ -293,6 +293,12 @@ export interface LoopOptions {
   rollingCacheTtl?: "5m";
   /** `ExecuteRequest.sub_agent_max_turns`: the most turns a sub-agent of this loop may take. */
   subAgentMaxTurns?: number;
+  /**
+   * `ExecuteRequest.withhold_sandbox_keys`: a session that acts as a user, which is a pull request review. Its second pass is a `task`
+   * whose prompt names the files the review read, so a change to two skill files would trip the skill-read guard
+   * (`BRAIN_BLOCK_SKILL_SUBAGENTS`) and the review could never approve: the guard does not apply to such a loop.
+   */
+  actingReview?: boolean;
   router: ToolRouter;
   onEvent: EventCallback;
   signal?: AbortSignal;
@@ -2457,7 +2463,7 @@ class AgentLoopRunner {
       // wasted LLM turns each, (b) truncates the merged final_text forcing
       // re-dispatches. Validated regression: session 37dbaecd took 14 min
       // reading skill via 11 explore sub-agents vs ~2 min direct.
-      if (BRAIN_BLOCK_SKILL_SUBAGENTS) {
+      if (BRAIN_BLOCK_SKILL_SUBAGENTS && !this.opts.actingReview) {
         const promptText = String((toolInput.prompt as string) || "")
           + " " + String((toolInput.description as string) || "");
         const skillPathHits = (promptText.match(

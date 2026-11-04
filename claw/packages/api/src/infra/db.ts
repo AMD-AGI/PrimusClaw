@@ -4,6 +4,7 @@
 import pg from "pg";
 import { APP_RUNS_ENABLED, CLAW_ASSISTANT_ENABLED, CLAW_GITHUB_REVIEW_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_REMOTE_AGENTS_ENABLED, CLAW_TRIGGERS_ENABLED, DATABASE_URL, envBool, envInt } from "../config.js";
 import { ensureAssistantSchema } from "../assistant/schema.js";
+import { sealPlaintextSessionCredentials } from "../auth/sealed-session-credentials.js";
 import { ensureA2aPushSchema } from "../notifications/a2a-push-schema.js";
 import { ensureNotificationSchema } from "../notifications/schema.js";
 import { ensureRemoteAgentSchema } from "../remote-agents/schema.js";
@@ -1194,6 +1195,8 @@ export async function initDb(): Promise<void> {
     // value for every session created before the column existed and for one that
     // never chose: such a turn carries no model and Brain uses its DEFAULT_MODEL.
     await addCol("model", "TEXT");
+    // The reasoning effort this session's turns ask for (low, medium, high). NULL: none is sent and the model's own default applies.
+    await addCol("effort", "TEXT");
     // Until when a drain of the session's queue is under way (`sessions/drain-claim.ts`). NULL: none is.
     await addCol("pending_drain_until", "TIMESTAMPTZ");
     await client.query("CREATE INDEX IF NOT EXISTS idx_sessions_user ON claw_sessions(user_id, created_at DESC)").catch(() => {});
@@ -1326,6 +1329,32 @@ export async function initDb(): Promise<void> {
       CREATE UNIQUE INDEX IF NOT EXISTS unique_user_profile
       ON claw_memory_entries(user_id) WHERE category = 'user_profile'
     `).catch(() => {});
+    // Memory v2 (memory/service.ts). A row without `mtype` predates it and is shown under its category's type.
+    for (const [col, type] of [
+      ["mtype", "TEXT"], ["title", "TEXT"], ["why", "TEXT"], ["how_to_apply", "TEXT"],
+      ["status", "TEXT NOT NULL DEFAULT 'active'"], ["pinned", "BOOLEAN NOT NULL DEFAULT FALSE"], ["token_count", "INT"],
+      ["evidence_quote", "TEXT"], ["source_kind", "TEXT"], ["recorded_at", "TIMESTAMPTZ"], ["last_confirmed_at", "TIMESTAMPTZ"],
+      ["expires_at", "TIMESTAMPTZ"], ["prev_title", "TEXT"], ["prev_body", "TEXT"],
+    ] as const) {
+      await client.query(`ALTER TABLE claw_memory_entries ADD COLUMN IF NOT EXISTS ${col} ${type}`).catch(() => {});
+    }
+    // What happened to each entry, for audit and undo. A deleted entry's events keep that it existed and lose
+    // what it said (title and quote are cleared), and a refused write never records what it carried.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS claw_memory_events (
+        id              BIGSERIAL PRIMARY KEY,
+        user_id         TEXT NOT NULL,
+        entry_id        INT,
+        op              TEXT NOT NULL,
+        actor           TEXT NOT NULL,
+        session_id      TEXT,
+        reason          TEXT,
+        title           TEXT,
+        evidence_quote  TEXT,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query("CREATE INDEX IF NOT EXISTS idx_memory_events_entry ON claw_memory_events(user_id, entry_id)");
 
     // Per-user opt-in for long-term memory. No row means off.
     await client.query(`
@@ -1540,6 +1569,14 @@ export async function initDb(): Promise<void> {
           SET cleanup_state = 'pending', cleanup_next_at = NOW()
         WHERE deleted_at IS NOT NULL AND cleanup_state IS NULL`,
     ).catch(() => {});
+
+    // Keys that sessions stamped by earlier builds hold in plain config fields
+    // are sealed here; matches nothing once done (sealed-session-credentials.ts).
+    // Not fatal: the reader still accepts the plain fields, and the next start retries.
+    await sealPlaintextSessionCredentials(client).then(
+      (n) => { if (n > 0) logger.info({ sessions: n }, "db.session_credentials_sealed"); },
+      (err) => logger.warn({ err: (err as Error)?.message }, "db.session_credentials_seal_failed"),
+    );
 
     // Per-session recency lookup. The sweeper's stuck-session reaper asks
     // "has this session emitted an event lately", which without this index is a

@@ -107,8 +107,9 @@ describe("scheduled triggers", { skip }, () => {
     assert.equal(input.requestTimeout, 60, "the per-run limit travels with the dispatch");
     const s = (await q("SELECT user_id, config FROM claw_sessions")).rows[0] as any;
     assert.equal(s.user_id, "u1");
-    assert.equal(s.config.platform_key, "pk-creator");
-    assert.equal(s.config._server_managed_credentials, true);
+    const { readTrustedSessionCredentials } = await import("../src/auth/session-credentials.js");
+    assert.equal(readTrustedSessionCredentials(s.config).platformKey, "pk-creator");
+    assert.equal(JSON.stringify(s.config).includes("pk-creator"), false, "sealed, never in the clear");
     assert.equal(s.config.trigger_id, id);
     const f = (await q("SELECT status, session_id FROM claw_trigger_fires")).rows[0] as any;
     assert.equal(f.status, "started");

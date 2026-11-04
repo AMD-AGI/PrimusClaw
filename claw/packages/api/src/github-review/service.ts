@@ -31,7 +31,7 @@ import { MAX_FILES_READ, REPO_CONFIG_PATH, assessRisk, type InstructionChanges, 
 import { PAGE_MAX_CHARS, SECTIONS, conversationText, diffRanges, diffText, filesText, fitPage, isSection, type Comment, type Section } from "./pages.js";
 import { isReviewInstructionPath, selectReviewInstructions } from "./repo-skill.js";
 import { chooseReviewPath, reviewPathAdvice } from "./review-path.js";
-import { isReviewTarget } from "./review-target.js";
+import { isReviewTarget, reviewOnlyOf } from "./review-target.js";
 import { SANDBOX_RECIPE_USAGE, buildSandboxRecipe } from "./sandbox-recipe.js";
 import { GITHUB_PROVIDER, type GithubReviewSettings } from "./settings.js";
 import {
@@ -52,6 +52,8 @@ export interface ReviewActor {
   requesterLabel?: string;
   /** The one pull request the session may touch (`config.review_target`, see review-target.ts); none means any pull request of an allowed owner. */
   reviewTarget?: PrRef | null;
+  /** `config.review_only` (review-target.ts): the session reviews and never merges, so `gh_pr_merge` is refused (`review_only`). */
+  reviewOnly?: boolean;
 }
 
 export interface ToolOutcome {
@@ -154,6 +156,8 @@ interface PullState {
   nodeId: string;
   /** The pull request's entry in the merge queue when it is already in one, as GitHub reports it; null when it is not. */
   queueEntry: QueueEntry | null;
+  /** Someone turned GitHub's auto-merge on for the pull request, so an approval that completes its requirements merges it. */
+  autoMerge: boolean;
 }
 
 /** What one `gh_pr_get` read from GitHub, kept for the pages of the same head (see `reviewRead`). */
@@ -218,7 +222,7 @@ const REVIEW_PAGE = 100;
 const MAX_REVIEW_PAGES = 10;
 
 const THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){
-  id mergeStateStatus mergeable reviewDecision headRefOid isMergeQueueEnabled isInMergeQueue mergeQueueEntry{id position state}
+  id mergeStateStatus mergeable reviewDecision headRefOid isMergeQueueEnabled isInMergeQueue mergeQueueEntry{id position state} autoMergeRequest{enabledAt}
   reviewThreads(first:100){totalCount nodes{isResolved}}}}}`;
 
 /** What a page served from a session's read asks of GitHub: the repository as it is now (the gates of `readRepo`) and the head. */
@@ -622,7 +626,7 @@ export class GithubReview {
     // Who asked stays who asked: the audit row and the review's footer name them.
     const actor: ReviewActor = {
       sessionId: confirmation.sessionId, requesterUserId: confirmation.requesterUserId, actorUserId: deciderUserId,
-      requesterLabel: await this.requesterLabel(confirmation.sessionId),
+      ...await this.sessionFacts(confirmation.sessionId),
     };
     const ref = parsePrRef(`${confirmation.repo}#${confirmation.pr}`);
     if (!ref) {
@@ -677,14 +681,19 @@ export class GithubReview {
     return { http: 200, body: { ok: true, status: final, reason, message: message || null, ...(wrote ? { wrote: true } : {}) } };
   }
 
-  /** How the session names its owner in a review's footer; none when the session cannot be read. */
-  private async requesterLabel(sessionId: string): Promise<string | undefined> {
+  /**
+   * How the session names its owner in a review's footer (none when the session cannot be read), and whether it asked for a review only
+   * (yes when the read fails: a held write is decided for a session whose say on merging is unknown as one that may not merge). A held merge
+   * of a session that asked for a review only cannot exist, since its `gh_pr_merge` is refused before anything is held; this is the second lock.
+   */
+  private async sessionFacts(sessionId: string): Promise<{ requesterLabel?: string; reviewOnly: boolean }> {
     try {
-      const r = await this.deps.db.query("SELECT config->>'acting_as_requester' AS label FROM claw_sessions WHERE session_id = $1", [sessionId]);
-      const label = (r.rows[0] as { label?: unknown } | undefined)?.label;
-      return typeof label === "string" && label ? label : undefined;
+      const r = await this.deps.db.query("SELECT config->>'acting_as_requester' AS label, config->'review_only' AS review_only FROM claw_sessions WHERE session_id = $1", [sessionId]);
+      const row = r.rows[0] as { label?: unknown; review_only?: unknown } | undefined;
+      const label = row?.label;
+      return { requesterLabel: typeof label === "string" && label ? label : undefined, reviewOnly: reviewOnlyOf({ review_only: row?.review_only }) };
     } catch {
-      return undefined;
+      return { reviewOnly: true };
     }
   }
 
@@ -1057,6 +1066,7 @@ export class GithubReview {
     const g = await ctx.client.graphql<{ repository?: { pullRequest?: {
       id?: string; mergeStateStatus?: string; mergeable?: string; reviewDecision?: string | null; headRefOid?: string; isMergeQueueEnabled?: boolean | null;
       isInMergeQueue?: boolean | null; mergeQueueEntry?: { id?: string | null; position?: number | null; state?: string | null } | null;
+      autoMergeRequest?: { enabledAt?: string | null } | null;
       reviewThreads?: { totalCount?: number; nodes?: Array<{ isResolved?: boolean }> };
     } | null } | null }>(THREADS_QUERY, { owner: ref.owner, name: ref.repo, number: ref.number });
     const p = g.repository?.pullRequest;
@@ -1075,6 +1085,7 @@ export class GithubReview {
       queueEntry: p.isInMergeQueue === true || p.mergeQueueEntry
         ? { id: p.mergeQueueEntry?.id ?? null, position: p.mergeQueueEntry?.position ?? null, state: p.mergeQueueEntry?.state ?? null }
         : null,
+      autoMerge: p.autoMergeRequest != null,
     };
   }
 
@@ -1127,7 +1138,12 @@ export class GithubReview {
     // The reviewer's own flags and judgement count here as they do at the merge.
     const risk = await this.holdFor(ctx, ref, pr, assessRisk(this.riskInput(pr, repo, read, flags, judgement)));
     ctx.acc.riskReasons = this.auditedReasons(risk);
-    this.requireGreen(await this.readState(ctx, ref, pr, repo), pr.headSha);
+    const state = await this.readState(ctx, ref, pr, repo);
+    // A session asked for a review only may approve, but not an approval that would merge: with auto-merge on, it can.
+    if (ctx.actor.reviewOnly && state.autoMerge) {
+      throw new Refusal("review_only", "this session was asked for a review only, and auto-merge is on for this pull request, so an approval could merge it: nothing was posted. Post the review as COMMENT or REQUEST_CHANGES instead.");
+    }
+    this.requireGreen(state, pr.headSha);
     return risk;
   }
 
@@ -1267,6 +1283,10 @@ export class GithubReview {
     ctx: Ctx, ref: PrRef, headSha: string,
     opts: { method?: "squash" | "merge" | "rebase"; flags: string[]; judgement: ReviewerJudgement | null; confirmation: Confirmation | null },
   ): Promise<Record<string, unknown>> {
+    // Before anything is read: a session that was asked for a review only has nothing to merge, and no approval is written on the way.
+    if (ctx.actor.reviewOnly) {
+      throw new Refusal("review_only", "this session was asked for a review only: it never merges, and nothing was approved or merged. Post the review with gh_review_submit and stop.");
+    }
     const { repo, pr } = await this.load(ctx, ref);
     this.requireOpen(pr);
     this.requireHead(pr, headSha);

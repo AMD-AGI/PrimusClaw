@@ -456,6 +456,37 @@ describe("M the merge gates", () => {
     assert.deepEqual(e.gh.writes[1]?.body, { sha: HEAD, merge_method: "squash" });
   });
 
+  test("M1b a session asked for a review only (config.review_only) is refused gh_pr_merge before anything is read: no approval, no merge, and its review still posts", async () => {
+    e = await reviewEnv({}, { actor: { reviewOnly: true } }); allowed();
+    e.gh.graphql.mergeStateStatus = "BLOCKED";
+    e.gh.onReview = (r) => { if (r.event === "APPROVE") e.gh.graphql.mergeStateStatus = "CLEAN"; };
+    assert.equal((await submit({ event: "APPROVE" })).body.status, "submitted", "it reviews, approval included");
+    const writes = e.gh.writes.length;
+    const calls = e.gh.calls.length;
+    const o = await merge();
+    assert.equal(o.isError, true, o.text);
+    assert.equal(reason(o), "review_only");
+    assert.equal(e.gh.writes.length, writes, "nothing written");
+    assert.equal(e.gh.calls.length, calls, "nothing even read");
+    const [row] = await e.sql("SELECT result, detail FROM claw_github_audit WHERE tool = 'gh_pr_merge'");
+    assert.deepEqual(row, { result: "refused", detail: "review_only" });
+  });
+
+  test("M1c a review-only session's approval is refused (review_only) while auto-merge is on, since it could merge the pull request; a comment still posts, and without auto-merge the approval does", async () => {
+    e = await reviewEnv({}, { actor: { reviewOnly: true } }); allowed();
+    e.gh.graphql.autoMergeRequest = { enabledAt: "2026-11-04T00:00:00Z" };
+    const refused = await submit({ event: "APPROVE" });
+    assert.equal(reason(refused), "review_only", refused.text);
+    assert.equal(posts().length, 0, "nothing posted");
+    assert.equal((await submit({ event: "COMMENT" })).body.status, "submitted");
+    e.gh.graphql.autoMergeRequest = null;
+    assert.equal((await submit({ event: "APPROVE", body: "Approved." })).body.status, "submitted");
+    // An ordinary session approves with auto-merge on, as before.
+    e = await reviewEnv(); allowed();
+    e.gh.graphql.autoMergeRequest = { enabledAt: "2026-11-04T00:00:00Z" };
+    assert.equal((await submit({ event: "APPROVE" })).body.status, "submitted");
+  });
+
   test("M2 the method is the repository's: squash first, else merge, else rebase; one it does not allow is refused", async () => {
     e.gh.repo.allow_squash_merge = false;
     approvedHere();
@@ -1112,6 +1143,24 @@ describe("C high risk waits for the acting user", () => {
     assert.match(String(e.gh.writes[0]?.body.body), /requested by Alice A\)/);
     // The requester's own credential is not asked for anything: it is the acting user's account that is used.
     assert.equal(e.resolved.some((r) => r.userId === "u-alice"), false);
+  });
+
+  test("C13b a held merge is not made for a session that asked for a review only: the allow is refused (review_only) and nothing is written", async () => {
+    const id = String((await merge()).body.confirmation_id);
+    await e.sql("INSERT INTO claw_sessions (session_id, user_id, config) VALUES ('s-1', 'u-alice', $1::jsonb)", [JSON.stringify({ acting_as: "u-bob", acting_as_requester: "Alice A", review_only: true })]);
+    const r = await e.service.decide("u-bob", id, "allow");
+    assert.deepEqual([r.body.status, r.body.reason], ["refused", "review_only"]);
+    assert.equal(e.gh.writes.length, 0);
+  });
+
+  test("C13c a held approval of a review-only session is not posted at the allow while auto-merge is on", async () => {
+    const held = await submit({ event: "APPROVE", risk_judgement: { level: "high", reason: "a person should look at this" } });
+    assert.equal(held.body.status, "confirmation_required", held.text);
+    await e.sql("INSERT INTO claw_sessions (session_id, user_id, config) VALUES ('s-1', 'u-alice', $1::jsonb)", [JSON.stringify({ acting_as: "u-bob", acting_as_requester: "Alice A", review_only: true })]);
+    e.gh.graphql.autoMergeRequest = { enabledAt: "2026-11-04T00:00:00Z" };
+    const r = await e.service.decide("u-bob", String(held.body.confirmation_id), "allow");
+    assert.deepEqual([r.body.status, r.body.reason], ["refused", "review_only"]);
+    assert.equal(e.gh.writes.length, 0);
   });
 
   test("C14 the rule on the acting user's own pull request is applied again at their allow: a login that has become the author's is refused, with nothing written", async () => {

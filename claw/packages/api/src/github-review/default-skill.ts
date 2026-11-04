@@ -221,6 +221,9 @@ const DEEP_REVIEW_STEPS = `## Steps
      pyproject.toml, go.mod) and run the tests closest to the change: the tests of the changed
      modules and the tests that import them, never the whole suite. Bound every command with
      \`timeout 600\` and the whole of it to about fifteen minutes.
+   - use the runtime version the repository declares (\`.nvmrc\`, \`engines\`, \`go.mod\`): if the sandbox's
+     is older, put that one in \`.pr-review/\` first (Node: \`nodejs.org/dist/latest-v<major>.x/\`, checked
+     against its \`SHASUMS256.txt\`) and first on \`PATH\`.
    - build what those tests need first, the documented way. A fresh checkout has no built output,
      and in a workspace a test loads sibling packages from theirs (\`dist/\`): build only the packages
      the tests import when the tool allows it (\`npm run build -w <package>\`, in dependency order),

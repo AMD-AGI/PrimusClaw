@@ -17,7 +17,7 @@ import { js, sc, nc, publishCertainlyFailed } from "../infra/nats.js";
 import { isAdmin, type UserInfo } from "../auth/models.js";
 import { stampSessionCredentials } from "../auth/session-credentials.js";
 import { buildMessages } from "./context-builder.js";
-import { isMemoryActive } from "../memory/service.js";
+import { memoryAccess } from "../memory/service.js";
 import { CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
 import { selectSkillsForTask } from "../marketplace/skill-service.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
@@ -32,7 +32,7 @@ import type { PoolClient } from "pg";
 import { decideAdmission, withOwnedAdmissionLock } from "../tasks/admission.js";
 import { admissionAskFor } from "../tasks/run-dispatch.js";
 import { stripRunSecrets } from "../tasks/run-spec.js";
-import { sessionModelFromRow } from "./session-model.js";
+import { sessionEffortFromRow, sessionModelFromRow } from "./session-model.js";
 import { sessionRepoFromRow } from "./session-repo.js";
 import { applyAppMcpToTask } from "./app-mcp.js";
 import { applySessionRoleToTask, skipsSkillSelection } from "../assistant/role-profile.js";
@@ -307,7 +307,7 @@ export async function dispatchTaskToBrain(
       message_id: messageId,
       prompt: content,
       history,
-      memory_enabled: await isMemoryActive(userId),
+      memory_enabled: (await memoryAccess(sessionId, userId)).serves,
       skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED,
       user_id: userId,
       llm_api_key: resolveUserLlmKey(user),
@@ -341,7 +341,7 @@ export async function dispatchTaskToBrain(
       task.sandbox_only = true;
     }
     const sessionMeta = (await db.query(
-      "SELECT parent_session_id, team_role, model, config->'repo' AS repo FROM claw_sessions WHERE session_id = $1",
+      "SELECT parent_session_id, team_role, model, effort, config->'repo' AS repo FROM claw_sessions WHERE session_id = $1",
       [sessionId],
     )).rows[0];
     if (sessionMeta?.parent_session_id) {
@@ -356,6 +356,9 @@ export async function dispatchTaskToBrain(
     // Brain's `request.model`, so this one field is the whole of the selection.
     const sessionModel = sessionModelFromRow(sessionMeta);
     if (sessionModel) task.model = sessionModel;
+    // The effort the owner chose, the same way: read now, and no field for a session with none.
+    const sessionEffort = sessionEffortFromRow(sessionMeta);
+    if (sessionEffort) task.effort = sessionEffort;
     // The repository the session is bound to, read now for the same reason: Brain
     // sets the working tree up in whatever sandbox this turn opens, which after an
     // idle reclaim is a new one. No field at all for a session with no binding.

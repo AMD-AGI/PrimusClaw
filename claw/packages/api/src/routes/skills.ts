@@ -8,7 +8,7 @@ import {
   manualRollback, getSkillStats,
   addSkillFile, updateSkillFile, removeSkillFile, getSkillFiles, getSkillFile,
 } from "../marketplace/skill-service.js";
-import { scanMemoryContent } from "../memory/service.js";
+import { scanMemoryContent } from "../memory/gates.js";
 import { db } from "../infra/db.js";
 
 export async function registerSkillRoutes(app: FastifyInstance): Promise<void> {

@@ -5,8 +5,7 @@ import { db } from "../infra/db.js";
 import type { Message } from "@claw/protocol";
 import { coerceToolInput } from "@claw/utils";
 
-import { getMemoryEntries, getProfileEntry, getMemoryPreference } from "../memory/service.js";
-import { CLAW_MEMORY_ENABLED } from "../config.js";
+import { buildMemoryCatalogue, memoryAccess, memoryAvailable } from "../memory/service.js";
 import { sessionWithholdsMemory } from "../github-review/session-tools.js";
 import pino from "pino";
 import { estimateTokens } from "../shared/tokens.js";
@@ -146,11 +145,9 @@ function parseJsonbArray(v: unknown): any[] {
   return [];
 }
 
-const MEMORY_BUDGET = 3_000;
-
-/** Tells the agent that save_memory will not persist, so it does not claim otherwise. */
+/** Tells the agent that the memory tools are not there, so it does not claim to remember. */
 export const MEMORY_OFF_NOTICE =
-  "## Long-term Memory\nLong-term memory is turned off for this user, so save_memory does not store anything. " +
+  "## Long-term Memory\nLong-term memory is turned off for this user, so nothing is remembered between conversations. " +
   "If the user asks you to remember something, say that memory is off and that they can turn it on in the chat settings.";
 
 export async function buildSystemContextParts(
@@ -158,92 +155,39 @@ export async function buildSystemContextParts(
   userId: string,
   rulesText = "",
   systemAppend = "",
-  recordMemoryAccess = true,
 ): Promise<{
   parts: string[];
-  profileTokens: number;
   memoryTokens: number;
   summaryTokens: number;
   rulesTokens: number;
 }> {
   const parts: string[] = [];
-  let profileTokens = 0;
   let memoryTokens = 0;
   let summaryTokens = 0;
   let rulesTokens = 0;
 
-  // Long-term memory injection (profile + entries) is gated by CLAW_MEMORY_ENABLED.
-  // When OFF: skip both DB queries and emit nothing — system prompt drops these sections.
-  // A second gate, per user: memory is opt-in, so a user who has not turned it on
-  // gets neither injection nor a way to write (see insertMemoryEntry). If the
-  // preference cannot be read, treat it as off.
-  // A session that acts as a user gets none of its requester's memory, and not the notice about it either.
-  const memoryOn = CLAW_MEMORY_ENABLED && !(await sessionWithholdsMemory(sessionId));
-  let memoryOptIn = false;
-  if (memoryOn) {
-    try {
-      memoryOptIn = await getMemoryPreference(userId);
-    } catch (err: any) {
-      logger.error({ err, userId }, "memory.preference_read_failed");
-    }
-    if (!memoryOptIn) {
+  // Long-term memory: the catalogue of the user's entries, one line each, for a session memory serves (the
+  // user's own chat; see memoryAccess). A user who has not opted in is told it is off, except in a session that
+  // acts as a user, which hears nothing about the requester's memory. The profile earlier versions generated is
+  // no longer injected: the user and feedback entries say the same, visibly.
+  if (memoryAvailable() && !(await sessionWithholdsMemory(sessionId))) {
+    const access = await memoryAccess(sessionId, userId);
+    if (!access.optedIn) {
       parts.push(MEMORY_OFF_NOTICE);
-    }
-  }
-  if (memoryOn && memoryOptIn) {
-    // 1. User profile
-    try {
-      const profileContent = await getProfileEntry(userId);
-      if (profileContent) {
-        const block = `## User Profile\n${profileContent}`;
-        parts.push(block);
-        profileTokens = estimateTokens(block);
-      }
-    } catch (err: any) {
-      if (!isMissingRelationError(err)) {
-        logger.error({ err, userId }, "memory.profile_query_failed");
-      }
-    }
-
-    // 2. Long-term memory (top-K by importance, excluding user_profile)
-    try {
-      const memories = (await getMemoryEntries(userId, 30))
-        .filter((m: any) => m.category !== "user_profile");
-
-      if (memories.length) {
-        const selected: any[] = [];
-        let accumulated = 0;
-        for (const m of memories) {
-          const line = `- [${m.category}] ${m.content}`;
-          const lineTokens = estimateTokens(line);
-          if (accumulated + lineTokens > MEMORY_BUDGET) break;
-          selected.push(m);
-          accumulated += lineTokens;
-        }
-
-        if (selected.length) {
-          const memoryBlock = selected.map((m: any) => `- [${m.category}] ${m.content}`).join("\n");
-          const block = `## Long-term Memory\n${memoryBlock}`;
-          parts.push(block);
-          memoryTokens = estimateTokens(block);
+    } else if (access.serves) {
+      try {
+        const catalogue = await buildMemoryCatalogue(userId);
+        if (catalogue) {
+          parts.push(catalogue.text);
+          memoryTokens = catalogue.tokens;
           logger.info({
-            userId, injected: selected.length, total: memories.length,
-            categories: selected.map((m: any) => m.category),
-            truncated: selected.length < memories.length,
+            userId, listed: catalogue.listed, total: catalogue.total, dueForReview: catalogue.dueForReview, tokens: catalogue.tokens,
           }, "memory.injected");
-          // access_count update: best-effort on local PG, skipped for remote
-          const ids = selected.map((m: any) => m.id).filter((id: any) => typeof id === "number");
-          if (recordMemoryAccess && ids.length) {
-            db.query(
-              "UPDATE claw_memory_entries SET access_count = access_count + 1, last_accessed = NOW() WHERE id = ANY($1)",
-              [ids]
-            ).catch((err) => logger.warn({ err, userId }, "memory.access_update_failed"));
-          }
         }
-      }
-    } catch (err: any) {
-      if (!isMissingRelationError(err)) {
-        logger.error({ err, userId }, "memory.query_failed");
+      } catch (err: any) {
+        if (!isMissingRelationError(err)) {
+          logger.error({ err, userId }, "memory.query_failed");
+        }
       }
     }
   }
@@ -266,7 +210,7 @@ export async function buildSystemContextParts(
     rulesTokens = estimateTokens(block);
   }
 
-  return { parts, profileTokens, memoryTokens, summaryTokens, rulesTokens };
+  return { parts, memoryTokens, summaryTokens, rulesTokens };
 }
 
 function extractUserMessageText(event: any): string {
@@ -319,7 +263,7 @@ export async function getContextUsageSnapshot(
   rulesText = "",
   systemAppend = "",
 ): Promise<ContextUsageSnapshot> {
-  const system = await buildSystemContextParts(sessionId, userId, rulesText, systemAppend, false);
+  const system = await buildSystemContextParts(sessionId, userId, rulesText, systemAppend);
 
   const lastCompleteRow = (await db.query(
     "SELECT COALESCE(MAX(id), 0) AS id FROM claw_session_events WHERE session_id = $1 AND deleted_at IS NULL AND event = 'exec_complete'",
@@ -347,7 +291,7 @@ export async function getContextUsageSnapshot(
   const history = selectHistoryTokens(turns, historyBudget);
 
   const breakdown: ContextUsageBreakdown = {
-    system_prompt: system.profileTokens + system.memoryTokens,
+    system_prompt: system.memoryTokens,
     tools: CONTEXT_TOOL_SCHEMA_TOKENS,
     rules: system.rulesTokens,
     skills: 0,
@@ -377,7 +321,7 @@ export async function getContextUsageSnapshot(
   };
 }
 
-/** Build full messages array: system(profile+memory+summary+rules) + history + user(prompt). */
+/** Build full messages array: system(memory+summary+rules) + history + user(prompt). */
 export async function buildMessages(
   sessionId: string,
   prompt: string,

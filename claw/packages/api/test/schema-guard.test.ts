@@ -123,6 +123,11 @@ test("names the session model column before a turn tries to read it", () => {
   assert.deepEqual(problems, ["claw_sessions is missing column(s): model"]);
 });
 
+test("names the session effort column, read with the model by every dispatch", () => {
+  const problems = missingSchemaObjects(REQUIRED_SCHEMA, without([["claw_sessions", "effort"]]));
+  assert.deepEqual(problems, ["claw_sessions is missing column(s): effort"]);
+});
+
 for (const column of [
   "attempt_id",
   "attempt_generation",
