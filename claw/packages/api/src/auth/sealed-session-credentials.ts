@@ -38,7 +38,8 @@ export function sealedCredentialFields(creds: TrustedSessionCredentials): Record
 }
 
 function plaintextCredentials(cfg: Record<string, unknown>): TrustedSessionCredentials | null {
-  if (!PLAINTEXT_CREDENTIAL_FIELDS.some((f) => typeof cfg[f] === "string")) return null;
+  // Present, not merely a string: an earlier build clears a revoked key by writing null.
+  if (!PLAINTEXT_CREDENTIAL_FIELDS.some((f) => Object.prototype.hasOwnProperty.call(cfg, f))) return null;
   return {
     platformKey: typeof cfg.platform_key === "string" ? cfg.platform_key : "",
     llmApiKey: typeof cfg.llm_api_key === "string"
@@ -54,9 +55,9 @@ function plaintextCredentials(cfg: Record<string, unknown>): TrustedSessionCrede
  * alone turns arbitrary JSON into a bearer token. Keep the trust decision in one
  * helper so dispatch, platform backfill, and teardown cannot drift.
  *
- * Plain fields win over the blob: a stamp from this build removes them, so when
- * both are present the plain ones were written later, by a replica of the
- * previous build during a rollout. A blob that will not open reads as no keys,
+ * Plain fields win over the blob, nulls included: a stamp from this build
+ * removes them, so when both are present the plain ones were written later, by a
+ * replica of the previous build during a rollout. A blob that will not open reads as no keys,
  * which every caller already refuses on, as it does for a session never stamped.
  */
 export function readTrustedSessionCredentials(config: unknown): TrustedSessionCredentials {

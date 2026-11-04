@@ -52,6 +52,9 @@ describe("sealed session credentials", { skip }, () => {
     // A replica of the previous build stamped after this one: its plain fields are the newer keys.
     assert.deepEqual(read({ ...sealed("pk-old", "vk-old"), platform_key: "pk-new", llm_api_key: "vk-new" }),
       { platformKey: "pk-new", llmApiKey: "vk-new" });
+    // ...and one that cleared a revoked key wrote nulls, which the older blob must not outlive.
+    assert.deepEqual(read({ ...sealed("pk-old", "vk-old"), platform_key: null, llm_api_key: null }),
+      { platformKey: "", llmApiKey: "" });
   });
 
   test("R2 nothing is trusted without the marker, and a blob that will not open reads as no keys", () => {
