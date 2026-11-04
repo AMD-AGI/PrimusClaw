@@ -74,9 +74,14 @@ const FORGET_REQUEST = [
 // The entry by its number: "#3", "memory 3", "记忆 #3", "第3条"; a bare number ("delete 3 files") is not a reference.
 const ENTRY_NUMBER = /#\s*(\d+)|(?:memory|note|entry|记忆|条目)[\s#]*(\d+)|第\s*(\d+)\s*条/gi;
 
-/** The clauses of a user's message: an instruction to forget names its entry within its own clause. */
+/**
+ * The clauses of a user's message: an instruction to forget names its entry within its own clause. Every mark
+ * `normalizeText` drops ends one (stops, commas, colons, dashes, brackets, quotation marks), except those inside a
+ * reference or a word: an apostrophe, "#", "_", and a hyphen between two letters or digits.
+ */
 function clauses(text: string): string[] {
-  return text.normalize("NFKC").replace(/[’‘]/g, "'").split(/[.!?;:,\n。！？；：，、]+/).map((c) => c.trim());
+  return text.normalize("NFKC").replace(/[’‘]/g, "'")
+    .split(/(?:(?!['#_-])[\p{P}\p{S}]|-(?!(?<=[\p{L}\p{N}]-)[\p{L}\p{N}])|\n)+/u).map((c) => c.trim());
 }
 
 /** Whether a clause is an instruction to forget (see FORGET_REQUEST) that names this entry by its number or by what it says. */

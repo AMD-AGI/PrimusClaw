@@ -496,7 +496,8 @@ describe("memory v2", { skip }, () => {
       "忘了说，我用 vim", "不要删除这条记忆，我用 vim", `delete ${id} files in vim`,
       // An instruction to forget something else, with the entry's words in another clause.
       "Forget my password. I use vim.", "forget my password, I use vim", "Forget my password: I use vim", "忘掉我的密码。我用 vim",
-      "忘掉密码：我用 vim",
+      "忘掉密码：我用 vim", "Forget my password — I use vim.", "Forget my password - I use vim", "Forget my password (I use vim)",
+      "Forget my password \"I use vim\"",
       // Not wanting it deleted is no request to delete it.
       "我不想删除这条关于 vim 的记忆", "我不希望删除这条关于 vim 的记忆", "这条 vim 记忆为什么被删除了",
     ];
