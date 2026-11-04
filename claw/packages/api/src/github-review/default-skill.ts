@@ -244,7 +244,10 @@ const DEEP_REVIEW_STEPS = `## Steps
    - actionable: the author knows what to change;
    - verified: you can point to a path and line in the diff and say what goes wrong and when.
      Mark each one \`[verified]\` or \`[inferred]\`; post only \`[verified]\` ones.
-   Drop style preferences, naming, formatting and anything a linter owns.
+   Drop style preferences, naming, formatting and anything a linter owns. A problem that breaks
+   the main path (every turn, every request, every user, or an unattended run) as soon as a shipped
+   flag or documented setting is turned on is blocking, even when that flag is off by default:
+   off by default lowers the urgency, not the severity.
 7. Try to prove each remaining finding wrong, twice: once by reading the code around it, once
    by looking for the guard you think is missing. Drop the ones that survive neither.
 8. Second pass, always, also when the first pass found blocking problems: before you write the
