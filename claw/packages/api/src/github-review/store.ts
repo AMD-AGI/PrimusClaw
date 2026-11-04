@@ -273,6 +273,41 @@ export async function recentWrites(
   return { count: Number(row.n), pairPresent: row.present === true };
 }
 
+/**
+ * What this session did with one head commit of a pull request before an approval or a merge of it: whether it read it with `gh_pr_get`
+ * (`read`), whether any of those reads chose the sandbox path, and whether a sub-agent of the session that was given this head commit (its
+ * short form, in the first 2000 characters of its prompt that Brain's `subagentStart` keeps) used a tool, did not fail and ended after the
+ * first of those reads (`secondPass`). Both events are Brain's, as the event consumer stored them; neither the model nor the pull request's
+ * text can write one.
+ */
+export async function headReviewFacts(
+  db: Queryable, sessionId: string, repo: string, pr: number, headSha: string,
+): Promise<{ read: boolean; sandbox: boolean; secondPass: boolean }> {
+  const r = await db.query(
+    `WITH reads AS (
+       SELECT MIN(at) AS first_at, COALESCE(BOOL_OR(review_path = 'sandbox'), FALSE) AS sandbox
+         FROM claw_github_audit
+        WHERE session_id = $1 AND tool = 'gh_pr_get' AND result = 'ok' AND lower(repo) = lower($2) AND pr = $3 AND head_sha = $4
+     )
+     SELECT first_at IS NOT NULL AS read, sandbox,
+            EXISTS (
+              SELECT 1 FROM claw_session_events ev
+                JOIN claw_session_events st
+                  ON st.session_id = ev.session_id AND st.event = 'subagentStart' AND st.deleted_at IS NULL
+                 AND st.data->>'subagent_id' = ev.data->>'subagent_id'
+               WHERE ev.session_id = $1 AND ev.event = 'subagentEnd' AND ev.deleted_at IS NULL AND ev.created_at >= reads.first_at
+                 AND COALESCE(ev.data->>'failed', 'false') <> 'true'
+                 AND CASE WHEN jsonb_typeof(ev.data->'tool_stats'->'total_calls') = 'number'
+                          THEN (ev.data->'tool_stats'->>'total_calls')::numeric > 0 ELSE FALSE END
+                 AND position(left($4, 7) IN lower(COALESCE(st.data->>'prompt', ''))) > 0
+            ) AS second_pass
+       FROM reads`,
+    [sessionId, repo, pr, headSha],
+  );
+  const row = r.rows[0] as { read: boolean; sandbox: boolean; second_pass: boolean };
+  return { read: row.read === true, sandbox: row.sandbox === true, secondPass: row.second_pass === true };
+}
+
 // ---------------------------------------------------------- confirmations
 
 export type ConfirmationStatus = "pending" | "merging" | "merged" | "queued" | "submitted" | "denied" | "stale" | "expired" | "refused";

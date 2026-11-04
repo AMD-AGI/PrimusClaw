@@ -15,6 +15,7 @@ import {
   CredentialsError, DEFAULT_CLIENT_ID, GrantRevokedError, loadCredentials, providerFor, saveCredentials, type Credentials,
 } from "./credentials.js";
 import { DeviceFlowError, deviceLogin } from "./deviceflow.js";
+import { noAskWarnings } from "./claude-mode.js";
 import { HooksError, hooksStatus, installHooks, settingsFile, uninstallHooks } from "./hooks.js";
 import { Connector, type ConnectorTiming } from "./connector.js";
 import {
@@ -36,6 +37,9 @@ export interface Ctx {
   /** The file the terminal hooks run (default: `terminal-hook.js` next to this program) and the node that runs it. */
   hookScript?: string;
   node?: string;
+  /** Claude Code's managed settings file and the effective uid, as the Claude adapter sees them (tests set them). */
+  claudeManagedSettings?: string;
+  euid?: number | null;
 }
 
 export const EXIT = { ok: 0, failure: 1, usage: 2, revoked: 3 } as const;
@@ -70,6 +74,10 @@ Files: ${"$"}XDG_CONFIG_HOME/claw-connector (agents.toml, credentials.json) and 
 function loadCfg(ctx: Ctx): ConnectorConfig {
   return loadConfig(configFile(ctx.dirs), { hostname: ctx.hostname ?? os.hostname() });
 }
+
+/** Agents whose sessions the connector will close because Claude's own settings start them in a mode that never asks. */
+const noAsk = (ctx: Ctx, cfg: ConnectorConfig): string[] =>
+  noAskWarnings(cfg.agents, ctx.env, { managedFile: ctx.claudeManagedSettings, euid: ctx.euid });
 
 function serverUrl(ctx: Ctx, flag: string | undefined, cfg: ConnectorConfig | null, creds: Credentials | null): string | null {
   const v = flag ?? ctx.env.CLAW_URL ?? cfg?.server ?? creds?.server ?? null;
@@ -282,6 +290,7 @@ async function cmdRun(_args: string[], ctx: Ctx): Promise<number> {
   const connector = new Connector({ config: cfg, dirs: ctx.dirs, client, server, audit, log, version: VERSION, timing: ctx.timing });
   ctx.onConnector?.(connector);
   ctx.out(`connecting ${cfg.agents.map((a) => (a.unattended ? `${a.id} (no per-step approval)` : a.id)).join(", ")} to ${server} as "${cfg.name}"`);
+  for (const w of noAsk(ctx, cfg)) ctx.out(`warning: ${w}`);
   try {
     const result = await connector.run();
     if (result === "revoked") { ctx.err("this connector was revoked: every agent was stopped. Run login again to connect it anew."); return EXIT.revoked; }
@@ -302,7 +311,13 @@ function cmdStatus(args: string[], ctx: Ctx): number {
   let agents: string[] = [];
   let unattended: string[] = [];
   let configProblem: string | null = null;
-  try { const cfg = loadCfg(ctx); agents = cfg.agents.map((a) => a.id); unattended = cfg.agents.filter((a) => a.unattended).map((a) => a.id); } catch (e) { configProblem = errMessage(e); }
+  let warnings: string[] = [];
+  try {
+    const cfg = loadCfg(ctx);
+    agents = cfg.agents.map((a) => a.id);
+    unattended = cfg.agents.filter((a) => a.unattended).map((a) => a.id);
+    warnings = noAsk(ctx, cfg);
+  } catch (e) { configProblem = errMessage(e); }
   let connectorId: string | null = null;
   try { const raw: unknown = JSON.parse(fs.readFileSync(identityFile(ctx.dirs), "utf8")); if (isObject(raw) && typeof raw.connector_id === "string") connectorId = raw.connector_id; } catch { /* not registered yet */ }
   const reg = new ChildRegistry(childrenFile(ctx.dirs));
@@ -317,6 +332,8 @@ function cmdStatus(args: string[], ctx: Ctx): number {
     unattended,
     adapters: reg.list().filter((r) => reg.isOurs(r)).map((r) => ({ pid: r.pid, agent: r.agent_id, session: r.session_id })),
     problems: [credsProblem, configProblem].filter((x): x is string => !!x),
+    /** Agents whose sessions will be refused as things stand (Claude's own settings start them in a mode that never asks). */
+    warnings,
   };
   if (values.json) { ctx.out(JSON.stringify(status, null, 2)); return EXIT.ok; }
   ctx.out(`connector:  ${status.running ? `running (pid ${status.running})` : "not running"}${status.paused ? ", PAUSED" : ""}`);
@@ -324,6 +341,7 @@ function cmdStatus(args: string[], ctx: Ctx): number {
   ctx.out(`agents:     ${agents.map((a) => (unattended.includes(a) ? `${a} (no per-step approval)` : a)).join(", ") || "none configured"}`);
   ctx.out(`adapters:   ${status.adapters.length ? status.adapters.map((a) => `${a.agent} pid ${a.pid}`).join(", ") : "none running"}`);
   for (const p of status.problems) ctx.out(`problem:    ${p}`);
+  for (const w of status.warnings) ctx.out(`warning:    ${w}`);
   return EXIT.ok;
 }
 

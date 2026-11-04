@@ -139,6 +139,7 @@ test("A4 a message queued behind a running turn keeps its list", async () => {
     assert.deepEqual(rows[0].tools_allowlist, ["grep"]);
 
     // The running turn ends and the queued message is sent on from its row.
+    await h.sql("UPDATE claw_sessions SET agent_status = 'idle', agent_gate_message_id = NULL WHERE session_id = $1", [sid]);
     const { pendingDispatchPorts } = await import("../src/tasks/pending-dispatch.js");
     const { drainOldestPendingMessage } = await import("../src/events/consumer.js");
     const pristine = { ...pendingDispatchPorts };

@@ -30,7 +30,8 @@ Keep the `run_id` from the response that started the run:
 `POST /v1/sessions` without a `message` starts no run and returns no run ID.
 
 A message sent while the session is still running a turn is accepted onto a queue and
-answers `{"queued": true}` with **no** `run_id`: the run row is opened later, when the
+answers `{"queued": true, "message_id": ...}` with **no** `run_id` (`message_id` is the one
+the turn that runs it will carry, as its events do): the run row is opened later, when the
 turn in front of it finishes. There is no ID to report yet, and one minted at accept
 time would answer 404 here until the queue drains -- and would name nothing at all if
 the queued message is later refused a workspace or its admission. Poll the session, or

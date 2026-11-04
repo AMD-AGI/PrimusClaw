@@ -13,6 +13,7 @@ import { resolveToolIds } from "../tools/resolve.js";
 import { marketplaceToolIds, pluginToolsHaveHooks, resolvePluginToolsFromMessage } from "../tasks/plugin-from-message.js";
 import { loadRules } from "./rules.js";
 import { bindRepo, renderRepoBlock } from "../workspace/repo-binding.js";
+import { repoSkillsToList } from "../workspace/repo-skills.js";
 import { normalizeMcpConfigs } from "../clients/mcp-config.js";
 import { DEFAULT_BASH_APPROVAL_RULES } from "./bash-approval-defaults.js";
 import { approvalPolicyFromMcp } from "./approval-policy.js";
@@ -37,7 +38,7 @@ import {
   DEFAULT_MODEL, MAX_TURNS,
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED,
   BASH_APPROVAL_RULES, BASH_APPROVAL_DEFAULTS_ENABLED, ASK_USER_QUESTION_ENABLED, A2A_CLIENT_ENABLED,
-  PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED, BG_SHELL_ENABLED,
+  MCP_PLATFORM_KEY_ALLOWED_HOSTS, PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED, BG_SHELL_ENABLED,
 } from "../config.js";
 import { a2aApprovalHold } from "../clients/a2a.js";
 import { WebSearchService, WebFetchService, SimpleSessionCostTracker } from "../tools/web/index.js";
@@ -148,7 +149,9 @@ export class AgentEngine {
     if (platformKey) envOverrides.SAFE_API_KEY = platformKey;
     // Platform defaults sit under everything else: a request, tool or plugin
     // server of the same name wins. Unset file -> `defaults` is null and none
-    // of this runs.
+    // of this runs. Only the defaults file is the operator's, so only its
+    // servers may read the environment (the names it lists); the rest are
+    // written by requesters and tool authors.
     //
     // A session that acts as a user (`withhold_sandbox_keys`) is given none, MCP servers and
     // skills alike. Its model reads what strangers wrote; the default servers are authenticated
@@ -160,12 +163,30 @@ export class AgentEngine {
     // a sub-agent starts from the schemas of the run that made it, so it has none either. Read as
     // truthy, not `=== true`: a mark that is not a boolean is still a mark.
     const defaults = PLATFORM_DEFAULTS_FILE && !request.withhold_sandbox_keys ? loadPlatformDefaults() : null;
-    const mergedMcp = normalizeMcpConfigs({
-      ...(defaults?.mcpServers || {}),
-      ...(request.mcp_servers || {}),
-      ...resolved.mcpServers,
-      ...pluginLayer.mcpServers,
-    }, envOverrides);
+    // Marketplace and plugin servers are third parties' at URLs nobody vetted, so the requester's
+    // platform key fills their `<SAFE_API_KEY>` only on a host the operator trusts
+    // (MCP_PLATFORM_KEY_ALLOWED_HOSTS). A request's own servers are the requester's choice of where
+    // their own key goes. A `pinned_address` is the API's record of where it vetted a request's
+    // server; one in a tool or plugin config is the author's, and would connect a trusted host name
+    // to an address of their choosing, so it is dropped.
+    const toolMcp = Object.fromEntries(
+      Object.entries({ ...resolved.mcpServers, ...pluginLayer.mcpServers }).map(([name, spec]) => {
+        if (!spec || typeof spec !== "object") return [name, spec];
+        const { pinned_address: _authorsPin, ...rest } = spec;
+        return [name, rest];
+      }),
+    );
+    const requestMcp = Object.fromEntries(
+      Object.entries(request.mcp_servers || {}).filter(([name]) => !Object.hasOwn(toolMcp, name)),
+    );
+    const defaultMcp = Object.fromEntries(
+      Object.entries(defaults?.mcpServers || {}).filter(([name]) => !Object.hasOwn(toolMcp, name) && !Object.hasOwn(requestMcp, name)),
+    );
+    const mergedMcp = {
+      ...normalizeMcpConfigs(defaultMcp, envOverrides, defaults?.mcpEnvAllow),
+      ...normalizeMcpConfigs(requestMcp, envOverrides),
+      ...normalizeMcpConfigs(toolMcp, envOverrides, undefined, MCP_PLATFORM_KEY_ALLOWED_HOSTS),
+    };
 
     const allSkills: Record<string, string> = {};
     const skillSources: Record<string, "plugin" | "local" | "marketplace"> = {};
@@ -231,7 +252,30 @@ export class AgentEngine {
           return pluginSkills.filter((s) => fits.has(s.name));
         })()
       : [];
-    const progressiveSkills = [...defaultProgressive, ...pluginProgressive];
+
+    // A session bound to a repository has it set up now: the sandbox is opened
+    // here, not left to the first tool call, because the working tree has to be
+    // there before the conversation starts and the model has to be told what it
+    // is standing in. A failure of the setup itself is not this run's failure; it
+    // comes back as a reason and goes into the prompt. A sandbox that cannot be
+    // opened at all fails the run, as it does for any other turn that needs one.
+    // No `repo` on the request, no sandbox here and no block: the turn is what it was.
+    const binding = request.repo ? await bindRepo(await sandbox(), request.repo, { signal, background: BG_SHELL_ENABLED }) : null;
+    // The repository's own skills, listed after everything else (the list's cap
+    // drops them first) and served by load_skill like the others; a name already
+    // in use belongs to whoever has it. Their staged copies live under the run's
+    // work root, which the run removes when it ends. A session that acts as a user
+    // gets none, like the platform defaults: its working tree can be a stranger's
+    // checkout, and a listed skill is one the model is told to use.
+    const repoProgressive = binding && !request.withhold_sandbox_keys && PROGRESSIVE_SKILLS_ENABLED && loadSkillAllowed && binding.skills.length
+      ? (() => {
+          const taken = new Set([...Object.keys(allSkills), ...defaultProgressive.map((s) => s.name), ...pluginSkills.map((s) => s.name)]);
+          const candidates = repoSkillsToList(binding.skills, binding.path, taken, sandbox, path.join(pluginWorkRoot, "repo-skills"), signal);
+          const fits = new Set(listProgressiveSkills([...defaultProgressive, ...pluginProgressive, ...candidates], sessionDir, loadSkillAllowed).listed.map((s) => s.name));
+          return candidates.filter((s) => fits.has(s.name));
+        })()
+      : [];
+    const progressiveSkills = [...defaultProgressive, ...pluginProgressive, ...repoProgressive];
     const listedPlugin = new Set(pluginProgressive.map((s) => s.name));
     const inlineSkills = listedPlugin.size
       ? Object.fromEntries(Object.entries(allSkills).filter(([name]) => !listedPlugin.has(name)))
@@ -246,16 +290,7 @@ export class AgentEngine {
       metrics.onPlatformDefaultChat(buildProgressiveSkillHint(defaultProgressive, sessionDir, loadSkillAllowed).length);
     }
 
-    // A session bound to a repository has it set up now: the sandbox is opened
-    // here, not left to the first tool call, because the working tree has to be
-    // there before the conversation starts and the model has to be told what it
-    // is standing in. A failure of the setup itself is not this run's failure; it
-    // comes back as a reason and goes into the prompt. A sandbox that cannot be
-    // opened at all fails the run, as it does for any other turn that needs one.
-    // No `repo` on the request, no sandbox here and no block: the turn is what it was.
-    const repoBlock = request.repo
-      ? renderRepoBlock(await bindRepo(await sandbox(), request.repo, { signal, background: BG_SHELL_ENABLED }))
-      : "";
+    const repoBlock = binding ? renderRepoBlock(binding, repoProgressive.length) : "";
 
     const rules = loadRules();
     const fullPrompt = buildPrompt(
@@ -308,8 +343,11 @@ export class AgentEngine {
     ]);
     // With a2a_call on, an allow that answers a peer's approval request is held for the user
     // (a2aApprovalHold). Nothing else changes: calls the policies do not name stay as they were.
-    const policyActive = approval.active || bashPolicy.active;
-    const anyApproval = policyActive || A2A_CLIENT_ENABLED;
+    // The trigger tools' hold is the platform's in the same way: it holds trigger_create and
+    // trigger_cancel, and must not make HITL_ENABLED ask about every call of a worker or doorbell
+    // turn that nobody is watching.
+    const policyActive = approval.operatorActive || bashPolicy.active;
+    const anyApproval = approval.active || policyActive || A2A_CLIENT_ENABLED;
     // The channel decisions arrive on. Approvals need it, and so does the
     // question tool, which waits for its answer on the same subject: a
     // deployment that turns questions on without any approval policy gets the
@@ -370,7 +408,7 @@ export class AgentEngine {
       }, sandbox);
       router.lazySkillWriter = lazySkills;
       // The listed skills are Brain's to hand over: `load_skill` serves them without a sandbox.
-      if (progressiveSkills.length) router.skillStore = new SkillStore([...defaultProgressive, ...pluginProgressive], `${sessionDir}/.skills`);
+      if (progressiveSkills.length) router.skillStore = new SkillStore(progressiveSkills, `${sessionDir}/.skills`);
       // A session that acts as a user (`withhold_sandbox_keys`) has no `save_memory`: what its model writes into the requester's long-term
       // memory is what a stranger's text made it write, and every later session of the requester would read it.
       router.memoryEnabled = request.memory_enabled !== false && !request.withhold_sandbox_keys;

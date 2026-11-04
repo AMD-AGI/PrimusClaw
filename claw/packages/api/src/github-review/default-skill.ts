@@ -244,7 +244,10 @@ const DEEP_REVIEW_STEPS = `## Steps
    - actionable: the author knows what to change;
    - verified: you can point to a path and line in the diff and say what goes wrong and when.
      Mark each one \`[verified]\` or \`[inferred]\`; post only \`[verified]\` ones.
-   Drop style preferences, naming, formatting and anything a linter owns.
+   Drop style preferences, naming, formatting and anything a linter owns. A problem that breaks
+   the main path (every turn, every request, every user, or an unattended run) as soon as a shipped
+   flag or documented setting is turned on is blocking, even when that flag is off by default:
+   off by default lowers the urgency, not the severity.
 7. Try to prove each remaining finding wrong, twice: once by reading the code around it, once
    by looking for the guard you think is missing. Drop the ones that survive neither.
 8. Second pass, always, also when the first pass found blocking problems: before you write the
@@ -252,7 +255,7 @@ const DEEP_REVIEW_STEPS = `## Steps
    pass missed in logic, security and compatibility.
    - On the sandbox path, start it with the \`task\` tool: \`subagent_type\` \`explore\` and
      \`tools\` \`["bash", "read", "grep", "glob", "ls"]\` (it must not have the review tools). Its prompt
-     names the checkout directory, the base (\`origin/<base>\`), the head commit, the path of
+     starts with the head commit (only such a pass counts), then names the checkout directory, the base (\`origin/<base>\`), the path of
      \`.pr-review/pr.diff\` (it reads the change there once, all of it, with as many \`read\` offsets as it
      takes, and does not regenerate it), the
      intent of the change in two sentences, the files and functions you read, the callers and users
@@ -325,6 +328,7 @@ const DEEP_REVIEW_STEPS = `## Steps
      already be on the pull request, \`approved_by_this_call\` says so): nothing is queued or merged, so say so and leave it to a person.
    - If \`gh_pr_merge\` answers \`acting_login_unknown\`, the account's GitHub login is not known, so it cannot be told whether the person wrote the pull request:
      nothing was approved or merged. Say so; a comment-only review is still open.
+   - \`head_not_read\`, \`second_pass_required\` or \`review_not_submitted\`: a step was skipped; do what it says.
    - If a tool answers \`review_target_mismatch\`, this session is bound to one pull request: do not try
      another one.
    Never state that something was merged or approved unless a tool result says so.

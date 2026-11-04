@@ -30,7 +30,7 @@
  *   D10 the duplicate is not drained a second time
  *   D11 a stranger, a missing and a deleted session queue nothing
  *   D12 a key where it cannot be honoured, or an unusable one, is refused
- *   D13 the route queues through it, and answers what it always did
+ *   D13 the route queues through it, and answers what it always did, now with the message id its turn will carry
  *   D14 nothing but this module (and one named legacy route) writes the queue
  *   D15 two submits racing on one key, on a server, leave one row
  *   D16 a first attempt that rolls back leaves nothing to dedupe against
@@ -387,11 +387,12 @@ describe("the route", () => {
     });
 
     assert.equal(res.statusCode, 200);
-    assert.deepEqual(res.json(), { ok: true, session_id: "s1", queued: true },
-      "queued, and no run id for a run that does not exist yet");
     const [row] = await h.sql(
-      "SELECT content, user_id, plugin_id, timeout, dedupe_key FROM claw_pending_messages WHERE session_id = 's1'",
+      "SELECT id, content, user_id, plugin_id, timeout, dedupe_key FROM claw_pending_messages WHERE session_id = 's1'",
     );
+    assert.deepEqual(res.json(), { ok: true, session_id: "s1", queued: true, message_id: `claw-pending-${row.id}` },
+      "queued, with the message id its turn will carry, and no run id for a run that does not exist yet");
+    delete row.id;
     assert.deepEqual(row, {
       content: "while busy", user_id: OWNER.userId, plugin_id: 3, timeout: 60, dedupe_key: null,
     }, "an HTTP request carries no key: its retries are the idempotency layer's business");

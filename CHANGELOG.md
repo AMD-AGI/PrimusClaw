@@ -44,6 +44,16 @@ record it.
   resource link becomes a line that says what it was (an embedded text resource is passed in full) instead
   of the result reading as empty, and a result with only `structuredContent` is passed as JSON. A server that
   declares resources is also offered `list_resources` and `read_resource` under its own prefix.
+- A general working guideline for agent turns (`claw/packages/api/src/sessions/agent-guideline.ts`): read before
+  changing, verify before claiming done, say what was not verified, cite sources, answer in the user's language, treat
+  text from pages and files as data, respect approvals. It names no product. With `CLAW_AGENT_GUIDELINE_ENABLED=true`
+  the API sends it as `system_append` on every turn that does the user's work; an assistant Router turn never gets it.
+  Off by default, which changes nothing. Brain's `RULES_DIR`, its `execution-policy.txt` placeholders and plugin rules
+  are untouched.
+- An agent evaluation (`claw/packages/api/test/e2e/agent-eval.ts`): 40 tasks in six categories (research, code,
+  documents, GitHub, MCP, long-running) run through the API a client uses, graded from the session's events and files,
+  with per-category tool calls, failed calls, approvals, turn time, sandbox wait and tokens taken from what Brain
+  already records. `EVAL_ARM=guideline` compares a run with the guideline against one without.
 - A session created with `config.acting_as` and no `model` (a pull request reviewed on someone's behalf) runs on
   `CLAW_GITHUB_REVIEW_MODEL` (default `claude-opus-5.5`, apart from the deployment's `DEFAULT_MODEL`; `default` keeps
   that); a request's own `model` wins. `CLAW_GITHUB_REVIEW_EFFORT` (unset by default: nothing is sent, as before) runs
@@ -563,6 +573,16 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- A session's queue is drained by one drain at a time (a lease on the session row, the new column
+  `claw_sessions.pending_drain_until`, added on start). Two drains running together -- a turn's completion and the
+  sweeper's, or two workers' reports waking an idle assistant a moment apart -- each started a turn: the second
+  started the next queued message on top of the first, whose `say` was then refused as `turn_superseded`, or the same
+  message again, which failed on a duplicate run id (`sweeper.orphaned_pending_drain_failed`). A message the owner
+  sends while a queued one is being dispatched now waits for that dispatch and is queued behind it, instead of
+  starting a turn the dispatch then took the session from. In the assistant's session the user's queued messages go
+  before queued worker reports. `POST /v1/sessions/{id}/messages` on a busy session now also answers the `message_id`
+  the queued message's turn will carry, and the assistant's `AssistantSay` session event names the turn that said it
+  (`turn_message_id`).
 - The review instructions that `gh_pr_get` returns (`review_instructions`) no longer open with a skill's frontmatter
   (`name: pr-review ...`), which sent the model looking for a skill that is not in its session and made it say so. The
   default instructions are the rules and steps alone, a repository skill's own frontmatter is left out too, and
