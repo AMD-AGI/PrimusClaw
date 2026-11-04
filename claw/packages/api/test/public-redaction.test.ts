@@ -105,3 +105,17 @@ test("publicTaskRow masks the sealed credentials blob on a doorbell spec", () =>
   assert.equal(encoded.includes("hello"), true);
   assert.equal((safe.input as { credentials: string }).credentials, "[REDACTED]");
 });
+
+test("redactPublicJson shows which API key a held call names, and hides the key itself", () => {
+  // The permissionRequest for apikey_delete carried input {"apikey_id": 192};
+  // the approval card showed it as "[REDACTED]".
+  const safe = redactPublicJson({
+    type: "permissionRequest",
+    tool: "mcp__safe__apikey_delete",
+    input: { apikey_id: 192, apikey_name: "claw5-gate-allow", key_prefix: "ak-1a2b" },
+    result: { apikey: "plain-key-value-no-shape", api_key: "another-plain-value" },
+  }) as { input: Record<string, unknown>; result: Record<string, unknown> };
+  assert.deepEqual(safe.input, { apikey_id: 192, apikey_name: "claw5-gate-allow", key_prefix: "ak-1a2b" });
+  assert.equal(safe.result.apikey, "[REDACTED]");
+  assert.equal(safe.result.api_key, "[REDACTED]");
+});

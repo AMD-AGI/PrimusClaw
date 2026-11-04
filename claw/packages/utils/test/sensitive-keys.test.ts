@@ -65,11 +65,32 @@ test("camelCase credential names are sensitive", () => {
 test("a credential word is sensitive as a prefix as well as a suffix", () => {
   // Widening only the leading boundary would still have missed these: the word
   // is qualified on the right rather than the left.
-  assertSensitive(["apiKeyId", "secretName", "passwordHint", "tokenValue", "credentialsPath"], true);
+  assertSensitive(["passwordHint", "tokenValue", "credentialsPath", "apiKeySecret"], true);
 });
 
 test("acronym runs split into words", () => {
-  assertSensitive(["APIKey", "apikey", "APIKeyId"], true);
+  assertSensitive(["APIKey", "apikey", "APIKeyValue"], true);
+});
+
+test("a key that names a credential by id, name or prefix is not itself a credential", () => {
+  // An approval card for apikey_delete {"apikey_id": 192} showed the id as
+  // [REDACTED], so the approver could not see which key was being deleted.
+  assertSensitive([
+    "apikey_id", "apiKeyId", "APIKeyId", "api_key_ids", "apikey_name", "apiKeyName",
+    "secretName", "secret_name", "token_id", "tokenPrefix", "api_key_prefix",
+    "credential_uuid", "access_key_id",
+  ], false);
+});
+
+test("an identifier word decides only at the end, and never alone", () => {
+  // The credential word still wins in every other position: id_token is an
+  // OIDC token, and a trailing secret word is what the value is.
+  assertSensitive([
+    "id_token", "idToken", "api_key_id_secret", "name_password", "prefix_token",
+    "apikey", "api_key", "apiKey", "client_secret", "access_token", "password",
+  ], true);
+  // A bare identifier word was never a credential and still is not.
+  assertSensitive(["id", "name", "prefix", "uuid"], false);
 });
 
 test("token counters are not credentials", () => {

@@ -480,3 +480,18 @@ test("a credential value repeated in ANOTHER argument is hidden there too, in th
   assert.match(prompt, /"reason":"rotate \[hidden\] now"/);
   assert.deepEqual(maskArguments({ a: "keep hunter2" }, ["hunter2"]), { a: "keep [hidden]" });
 });
+
+test("maskArguments and summaryPrompt keep a credential's id and name, and hide its value", () => {
+  // K1b: the summary model was handed apikey_id as [hidden] and wrote
+  // "Soft-delete the API key whose id is [hidden]".
+  const input = { apikey_id: 192, apikey_name: "claw5-gate-allow", api_key: "plainvalue-without-shape" };
+  const out = maskArguments(input, credentialValues(input)) as Record<string, unknown>;
+  assert.equal(out.apikey_id, 192);
+  assert.equal(out.apikey_name, "claw5-gate-allow");
+  assert.equal(out.api_key, "[hidden]");
+  assert.deepEqual(credentialValues(input), ["plainvalue-without-shape"]);
+  const prompt = summaryPrompt("mcp__safe__apikey_delete", input, {});
+  assert.ok(prompt.includes('"apikey_id":192'), prompt);
+  assert.ok(prompt.includes("claw5-gate-allow"), prompt);
+  assert.ok(!prompt.includes("plainvalue-without-shape"), prompt);
+});

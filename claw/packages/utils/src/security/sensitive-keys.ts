@@ -197,6 +197,26 @@ const ENV_KEYS = new Set(["env", "user env", "session env", "runtime env"]);
 const COUNTER_KEYS = new Set(["token usage", "token count", "token limit", "token len"]);
 
 /**
+ * Last words that make a credential-named key name the credential rather than
+ * hold it: `apikey_id`, `secretName`, `token_prefix`.
+ *
+ * The value under such a key is how a person tells one credential from
+ * another, and masking it is not cosmetic. An approval card for
+ * `apikey_delete {"apikey_id": 192}` came out as `"apikey_id": "[REDACTED]"`,
+ * the summary model was handed `[hidden]` and wrote "the API key whose id is
+ * [hidden]", and the approver was asked to allow a delete without being shown
+ * which key it deletes.
+ *
+ * Only the LAST word counts, and only when something precedes it, so the
+ * credential word still decides every other position: `id_token` ends in
+ * `token` and stays masked, and `api_key_id_secret` ends in `secret`. A value
+ * under an identifier key is not trusted either; it still goes through the
+ * shape scan, so a real key pasted into a `key_name` field is caught by what
+ * it looks like.
+ */
+const IDENTIFIER_TAILS = new Set(["id", "ids", "uuid", "name", "names", "prefix", "prefixes"]);
+
+/**
  * Split a key into lowercase words across camelCase, snake_case, kebab-case and
  * dotted paths, so that one word list covers every spelling a JSON payload
  * might use. `OPENAI_API_KEY`, `openaiApiKey` and `x-api-key` all become
@@ -219,8 +239,11 @@ function splitWords(key: string): string[] {
  * Whether a value stored under `key` must be masked before it leaves the
  * process.
  *
- * Matching is by word, not substring: `accessToken` and `apiKeyId` are
+ * Matching is by word, not substring: `accessToken` and `apiKeySecret` are
  * credentials, while `tokenizer` and `brokenLink` merely contain the letters.
+ * A key that ends in an identifier word (`apiKeyId`, `secretName`) names a
+ * credential instead of holding one and is not masked; see
+ * {@link IDENTIFIER_TAILS}.
  * The predicate errs towards redacting -- a masked field that turned out to be
  * harmless is a cosmetic bug, a leaked one is not -- so anything genuinely safe
  * that trips it belongs in {@link COUNTER_KEYS} with a note on why.
@@ -231,6 +254,7 @@ export function isSensitiveKey(key: string): boolean {
   const normalized = words.join(" ");
   if (COUNTER_KEYS.has(normalized)) return false;
   if (ENV_KEYS.has(normalized)) return true;
+  if (words.length > 1 && IDENTIFIER_TAILS.has(words[words.length - 1]!)) return false;
   for (let i = 0; i < words.length; i += 1) {
     if (SENSITIVE_WORDS.has(words[i]!)) return true;
     // Qualified only: sensitive as part of a name, never as the whole of one.

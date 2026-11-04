@@ -238,3 +238,17 @@ for (const c of hostileKeys) {
     });
   });
 }
+
+test("a permissionRequest keeps the id and name of the key it targets, and masks a key value", () => {
+  // The approval card for apikey_delete showed input.apikey_id as redacted, so
+  // the approver could not tell which key would be deleted.
+  const event = redactPersistedEvent({
+    type: "permissionRequest",
+    tool: "mcp__safe__apikey_delete",
+    input: { apikey_id: 192, apikey_name: "claw5-gate-allow", api_key: "plainvalue-without-shape" },
+  });
+  const input = event.input as Record<string, unknown>;
+  assert.equal(input.apikey_id, 192);
+  assert.equal(input.apikey_name, "claw5-gate-allow");
+  assert.equal(input.api_key, "<redacted>");
+});
