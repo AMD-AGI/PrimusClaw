@@ -5,7 +5,7 @@ import { agentLoop } from "./agent-loop.js";
 import { ToolRouter, INHERIT_MODEL, type WebToolServices } from "../tools/router.js";
 import type { HandsClient } from "../clients/hands.js";
 import type { HookRunner } from "./hooks.js";
-import type { Message, ToolSchema, EventCallback } from "@claw/protocol";
+import type { Message, ReasoningEffort, ToolSchema, EventCallback } from "@claw/protocol";
 import type { RunIdentity } from "../tasks/run-identity.js";
 import { filterToolSchemas, type ToolAllowlist } from "../tools/allowlist.js";
 import { SUB_AGENT_EXPLORE_MODEL, SUB_AGENT_MODELS } from "../config.js";
@@ -116,6 +116,8 @@ export interface RunSubagentOptions {
    * before the sub-agent has run a tool (pickSubagentModel's `fallback`).
    */
   fallbackModel?: string;
+  effort?: ReasoningEffort;
+  rollingCacheTtl?: "5m";
   apiUrl: string;
   apiKey: string;
   maxTurns: number;
@@ -247,6 +249,8 @@ export async function runSubagent(opts: RunSubagentOptions): Promise<SubagentRes
 
   const runOn = (model: string) => agentLoop([{ role: "user", content: opts.prompt } as Message], schemas, {
     model,
+    effort: opts.effort,
+    rollingCacheTtl: opts.rollingCacheTtl,
     apiUrl: opts.apiUrl,
     apiKey: opts.apiKey,
     maxTurns: opts.maxTurns,

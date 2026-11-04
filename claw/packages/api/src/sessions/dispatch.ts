@@ -36,6 +36,7 @@ import { sessionModelFromRow } from "./session-model.js";
 import { sessionRepoFromRow } from "./session-repo.js";
 import { applyAppMcpToTask } from "./app-mcp.js";
 import { applySessionRoleToTask, skipsSkillSelection } from "../assistant/role-profile.js";
+import { applyTriggerToolsToTask } from "../triggers/mcp.js";
 import { ensureSessionWorkspace, requireWorkspaceBinding } from "../workspace/store.js";
 import pino from "pino";
 
@@ -515,6 +516,7 @@ export async function dispatchTaskToBrain(
     // (tasks/run-claim.ts), so no token is stored and a replaced sandbox is not offered.
     await applyAppMcpToTask(task, sessionId);
     // After the run row exists: the turn's token names the run. A doorbell turn gets this at claim instead.
+    await applyTriggerToolsToTask(task, sessionId);
     await applySessionRoleToTask(task, sessionId);
     const payload = JSON.stringify(task);
     const seq = await publishRunMessage(

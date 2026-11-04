@@ -59,6 +59,9 @@ PG_SSL_NO_VERIFY="${PG_SSL_NO_VERIFY:-false}"
 # Private-CA trust for api and brain: see tls.extraCACertsConfigMap in the chart.
 EXTRA_CA_CERTS_CONFIGMAP="${EXTRA_CA_CERTS_CONFIGMAP:-}"
 EXTRA_CA_CERTS_KEY="${EXTRA_CA_CERTS_KEY:-ca.crt}"
+# Mount Secret primus-claw-grant-signing-key into api and send grants to the sandbox Router:
+# see grantSigningKey in the chart.
+GRANT_SIGNING_KEY_ENABLED="${GRANT_SIGNING_KEY_ENABLED:-false}"
 PG_WAIT_TIMEOUT="${PG_WAIT_TIMEOUT:-600}"
 PGO_RELEASE="${PGO_RELEASE:-primus-pgo}"
 NATS_RELEASE="${NATS_RELEASE:-primus-claw-nats}"
@@ -474,7 +477,7 @@ export NATS_PASSWORD_API NATS_PASSWORD_BRAIN NATS_PASSWORD_REAPER NATS_PASSWORD_
 export CHECKPOINT_WRITE_VERSION
 export S3_ENDPOINT S3_API_ENDPOINT S3_ACCESS_KEY S3_SECRET_KEY
 export CLAW_DEPLOY_MODE PG_CLUSTER PG_APP_USER PG_APP_DB PG_USER_SECRET PG_SSL_NO_VERIFY
-export EXTRA_CA_CERTS_CONFIGMAP EXTRA_CA_CERTS_KEY
+export EXTRA_CA_CERTS_CONFIGMAP EXTRA_CA_CERTS_KEY GRANT_SIGNING_KEY_ENABLED
 export SANDBOX_NAMESPACE SANDBOX_WORKLOAD_NAMESPACE SANDBOX_ROUTER_URL SANDBOX_HANDS_VIA_ROUTER SANDBOX_ROUTER_AUTH_ENABLED
 export WORKSPACE_PERSIST_BASE LITELLM_API_BASE
 export SAFE_DEFAULT_WORKSPACE
@@ -564,6 +567,9 @@ values = {
     "tls": {
         "extraCACertsConfigMap": env("EXTRA_CA_CERTS_CONFIGMAP", ""),
         "extraCACertsKey": env("EXTRA_CA_CERTS_KEY", "") or "ca.crt",
+    },
+    "grantSigningKey": {
+        "enabled": env("GRANT_SIGNING_KEY_ENABLED", "false").lower() == "true",
     },
     "ingress": {
         "enabled": True,

@@ -13,7 +13,7 @@ import { looksLikeCacheRejection } from "./cache-rejection.js";
 import { requiredArgToolNames } from "./tool-schema.js";
 import { parseToolArguments, sanitizeToolUseInputs } from "./tool-input.js";
 import { prepareAnthropicRequest, stripCacheControl, type PreparedAnthropicRequest } from "./anthropic-cache.js";
-import type { Message } from "@claw/protocol";
+import type { Message, ReasoningEffort } from "@claw/protocol";
 import type { LlmCacheReport, LlmContentBlock, LlmProvider, LlmSession, LlmSessionOptions, LlmTurnResult } from "./provider.js";
 import {
   headerModelFromStream,
@@ -66,6 +66,8 @@ async function streamingTurn(
   signal: AbortSignal | undefined,
   capture: RoutedModelSink,
   cacheState: SessionCacheState,
+  effort?: ReasoningEffort,
+  rollingCacheTtl?: "5m",
 ): Promise<LlmTurnResult> {
   // One abort controller PER ATTEMPT, not per turn.
   //
@@ -96,7 +98,7 @@ async function streamingTurn(
     metrics.onToolInputRepaired("wire", sanitized.repaired);
     logger.warn({ repaired: sanitized.repaired }, "llm.tool_input.repaired_on_wire");
   }
-  const prepared = prepareAnthropicRequest(sanitized.messages, { ttl: LLM_CACHE_TTL });
+  const prepared = prepareAnthropicRequest(sanitized.messages, { ttl: LLM_CACHE_TTL, rollingTtl: rollingCacheTtl });
   const useMarkers = PROMPT_CACHE_ENABLED && !cacheState.disabled;
   const decorated = useMarkers ? prepared : stripCacheControl(prepared);
 
@@ -119,6 +121,8 @@ async function streamingTurn(
           messages: body.messages as unknown as MessageParam[],
           tools,
           max_tokens: 16384,
+          // Only the effort: the models think adaptively by default, and a run without one sends exactly what it always did.
+          ...(effort ? { output_config: { effort } } : {}),
           stream: true,
         },
         { signal: ctrl.signal },
@@ -451,7 +455,7 @@ export class AnthropicProvider implements LlmProvider {
   readonly name = "anthropic" as const;
 
   createSession(opts: LlmSessionOptions): LlmSession {
-    const { model, apiUrl, apiKey, userId, sessionId } = opts;
+    const { model, apiUrl, apiKey, userId, sessionId, effort, rollingCacheTtl } = opts;
 
     // Observability: LiteLLM headers — every messages.create call carries
     // the same tags for spend/log attribution.
@@ -471,7 +475,7 @@ export class AnthropicProvider implements LlmProvider {
       defaultHeaders: anthropicDefaultHeaders({ litellmTags, litellmMeta, userId, sessionId }),
     });
 
-    return buildAnthropicSession(client, model, capture);
+    return buildAnthropicSession(client, model, capture, effort, rollingCacheTtl);
   }
 }
 
@@ -489,6 +493,8 @@ export function buildAnthropicSession(
   client: Anthropic,
   model: string,
   capture: RoutedModelSink = {},
+  effort?: ReasoningEffort,
+  rollingCacheTtl?: "5m",
 ): LlmSession {
   const cacheState: SessionCacheState = { disabled: false, decoratedFailures: 0 };
   return {
@@ -501,6 +507,8 @@ export function buildAnthropicSession(
         signal,
         capture,
         cacheState,
+        effort,
+        rollingCacheTtl,
       ),
       async complete(systemPrompt, userText, maxTokens, signal, options) {
         const resp = await client.messages.create({

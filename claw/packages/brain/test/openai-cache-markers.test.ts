@@ -127,6 +127,15 @@ test("rendering does not mutate the wire messages handed in", () => {
   assert.equal(JSON.stringify(wire), before);
 });
 
+test("on the anthropic dialect, rolling markers at 5m leave only the first marker at 1h", () => {
+  const wire = toOpenAiMessages(Array.from({ length: 30 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: `m${i} `.repeat(20) })) as Message[]);
+  const out = renderOpenAiCacheMarkers(wire as any, { style: "anthropic", ttl: "1h", rollingTtl: "5m" });
+  const markers = out.messages.flatMap((m: any) => Array.isArray(m.content) ? m.content.filter((p: any) => p.cache_control).map((p: any) => p.cache_control) : []);
+  assert.equal(markers.length, out.breakpointsApplied);
+  assert.ok(markers.length > 1);
+  assert.deepEqual(markers, [{ type: "ephemeral", ttl: "1h" }, ...Array(markers.length - 1).fill({ type: "ephemeral" })]);
+});
+
 test("5m renders the bare marker, 1h carries the ttl", () => {
   const wire = toOpenAiMessages([{ role: "user", content: "hello ".repeat(30) }]);
   const five = renderOpenAiCacheMarkers(wire as any, { style: "anthropic", ttl: "5m" });
@@ -204,13 +213,13 @@ test("a marker the plan asks for but the renderer refuses is not counted", () =>
   // An assistant that only calls tools: content null, nothing to widen.
   const toolIdx = wire.findIndex((m: any) => m.role === "assistant" && m.content == null);
   const bogus = {
-    ttl: "1h" as const, systemRunLength: 0,
+    systemRunLength: 0,
     breakpoints: [
-      { kind: "message" as const, messageIndex: 0, blockIndex: 0, wrapStringContent: true },
-      { kind: "message" as const, messageIndex: toolIdx, blockIndex: 0, wrapStringContent: true },
+      { kind: "message" as const, messageIndex: 0, blockIndex: 0, wrapStringContent: true, ttl: "1h" as const },
+      { kind: "message" as const, messageIndex: toolIdx, blockIndex: 0, wrapStringContent: true, ttl: "1h" as const },
     ],
   };
-  const out = renderPlannedOpenAiMarkers(wire as any, bogus, { style: "anthropic", ttl: "1h" });
+  const out = renderPlannedOpenAiMarkers(wire as any, bogus, { style: "anthropic" });
   assert.equal(out.breakpointsApplied, 1, "the refused marker must not be counted");
   assert.equal(JSON.stringify(out.messages[toolIdx]).includes("cache_control"), false);
 });

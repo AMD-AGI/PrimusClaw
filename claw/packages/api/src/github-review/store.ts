@@ -90,12 +90,89 @@ export const GITHUB_REVIEW_SCHEMA_SQL = [
       review_path         TEXT,
       review_path_reason  TEXT
     )`,
+  // The acting user's review mode the call ran under (`high_risk_confirm` or `fully_auto`, their own setting in claw_github_review_settings).
+  `ALTER TABLE claw_github_audit ADD COLUMN IF NOT EXISTS review_mode TEXT`,
   `CREATE INDEX IF NOT EXISTS idx_github_audit_actor ON claw_github_audit(actor_user_id, at DESC)`,
+  // One approval or merge decision at a time per acting user and pull request, across replicas (see acquireWriteLock).
+  `CREATE TABLE IF NOT EXISTS claw_github_write_locks (
+      lock_key    TEXT PRIMARY KEY,
+      holder      TEXT NOT NULL,
+      expires_at  TIMESTAMPTZ NOT NULL
+    )`,
+  // A person's own review mode for writes made with their GitHub account (see {@link getReviewMode}); no row is the default.
+  `CREATE TABLE IF NOT EXISTS claw_github_review_settings (
+      user_id      TEXT PRIMARY KEY,
+      review_mode  TEXT NOT NULL CHECK (review_mode IN ('high_risk_confirm', 'fully_auto')),
+      updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`,
   `CREATE INDEX IF NOT EXISTS idx_github_audit_session ON claw_github_audit(session_id)`,
 ];
 
 export async function ensureGithubReviewSchema(client: pg.PoolClient): Promise<void> {
   for (const sql of GITHUB_REVIEW_SCHEMA_SQL) await client.query(sql);
+}
+
+// ---------------------------------------------------------------- write lock
+
+/**
+ * Takes the lock on one acting user's approvals and merges of one pull request, or answers null when another call holds it. Between
+ * deciding that an approval or a merge is not held and making it, another call of the same acting user on the same pull request could
+ * open the hold that should have stopped it; the lock makes the two take turns. Its holder renews it while it works
+ * ({@link renewWriteLock}); it lapses `ttlSeconds` after the last renewal, so a call that died does not hold it for ever.
+ */
+export async function acquireWriteLock(db: Queryable, key: string, ttlSeconds: number): Promise<string | null> {
+  const holder = randomUUID();
+  const r = await db.query(
+    `INSERT INTO claw_github_write_locks (lock_key, holder, expires_at) VALUES ($1, $2, NOW() + ($3::bigint * INTERVAL '1 second'))
+     ON CONFLICT (lock_key) DO UPDATE SET holder = EXCLUDED.holder, expires_at = EXCLUDED.expires_at
+       WHERE claw_github_write_locks.expires_at <= NOW()
+     RETURNING holder`,
+    [key, holder, ttlSeconds],
+  );
+  return (r.rows[0] as { holder?: string } | undefined)?.holder === holder ? holder : null;
+}
+
+/** Keeps a held lock from lapsing while its call is still at work; false when it is no longer this holder's. */
+export async function renewWriteLock(db: Queryable, key: string, holder: string, ttlSeconds: number): Promise<boolean> {
+  const r = await db.query(
+    "UPDATE claw_github_write_locks SET expires_at = NOW() + ($3::bigint * INTERVAL '1 second') WHERE lock_key = $1 AND holder = $2",
+    [key, holder, ttlSeconds],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
+export async function releaseWriteLock(db: Queryable, key: string, holder: string): Promise<void> {
+  await db.query("DELETE FROM claw_github_write_locks WHERE lock_key = $1 AND holder = $2", [key, holder]);
+}
+
+// ---------------------------------------------------------------- review mode
+
+/**
+ * How a person wants a held approval or merge made with their GitHub account confirmed, whoever asked: `high_risk_confirm` asks them
+ * when the change needs a person, `fully_auto` only for what the repository itself requires. Their own setting, kept here by their
+ * Claw user id; whether others may ask at all is the identity provider's `delegation`, not this.
+ */
+export type ReviewMode = "high_risk_confirm" | "fully_auto";
+export const REVIEW_MODES: readonly ReviewMode[] = ["high_risk_confirm", "fully_auto"];
+export const DEFAULT_REVIEW_MODE: ReviewMode = "high_risk_confirm";
+
+/** The person's review mode; the default when they never set one. */
+export async function getReviewMode(db: Queryable, userId: string): Promise<{ mode: ReviewMode; updatedAt: string | null }> {
+  const r = await db.query("SELECT review_mode, updated_at FROM claw_github_review_settings WHERE user_id = $1", [userId]);
+  const row = r.rows[0] as { review_mode?: string; updated_at?: Date | string } | undefined;
+  if (!row || row.review_mode !== "fully_auto") return { mode: DEFAULT_REVIEW_MODE, updatedAt: row?.updated_at ? new Date(row.updated_at).toISOString() : null };
+  return { mode: "fully_auto", updatedAt: new Date(row.updated_at as Date | string).toISOString() };
+}
+
+export async function setReviewMode(db: Queryable, userId: string, mode: ReviewMode): Promise<{ mode: ReviewMode; updatedAt: string }> {
+  const r = await db.query(
+    `INSERT INTO claw_github_review_settings (user_id, review_mode) VALUES ($1, $2)
+     ON CONFLICT (user_id) DO UPDATE SET review_mode = EXCLUDED.review_mode, updated_at = NOW()
+     RETURNING review_mode, updated_at`,
+    [userId, mode],
+  );
+  const row = r.rows[0] as { review_mode: ReviewMode; updated_at: Date | string };
+  return { mode: row.review_mode, updatedAt: new Date(row.updated_at).toISOString() };
 }
 
 // ---------------------------------------------------------------- audit
@@ -125,6 +202,7 @@ export interface AuditFinish {
   /** `api_diff` or `sandbox`, with why; set by the call that chose it. */
   reviewPath?: string;
   reviewPathReason?: string;
+  reviewMode?: string;
 }
 
 export async function auditStart(db: Queryable, a: AuditStart): Promise<number> {
@@ -142,12 +220,12 @@ export async function auditFinish(db: Queryable, id: number, f: AuditFinish): Pr
         SET repo = COALESCE($2, repo), pr = COALESCE($3, pr), head_sha = COALESCE($4, head_sha),
             github_requests = $5, github_request_ids = $6::jsonb, github_status = $7,
             risk_reasons = $8::jsonb, confirmation_id = $9, dry_run = $10, write = $11,
-            result = $12, detail = $13, review_path = $14, review_path_reason = $15
+            result = $12, detail = $13, review_path = $14, review_path_reason = $15, review_mode = COALESCE($16, review_mode)
       WHERE id = $1`,
     [
       id, f.repo ?? null, f.pr ?? null, f.headSha ?? null, f.githubRequests, JSON.stringify(f.githubRequestIds.slice(-20)),
       f.githubStatus ?? null, JSON.stringify(f.riskReasons ?? []), f.confirmationId ?? null, f.dryRun, f.write,
-      f.result, (f.detail ?? "").slice(0, 500), f.reviewPath ?? null, f.reviewPathReason ?? null,
+      f.result, (f.detail ?? "").slice(0, 500), f.reviewPath ?? null, f.reviewPathReason ?? null, f.reviewMode ?? null,
     ],
   );
 }
@@ -314,6 +392,27 @@ export async function countPendingConfirmations(db: Queryable, actorUserId: stri
     [actorUserId],
   );
   return Number((r.rows[0] as { n: number }).n);
+}
+
+/**
+ * Whether an approval or a merge of this head commit, with this acting user's account, is already waiting for them, is being decided, was
+ * refused by them, or was held and never answered: a later call for the same commit must not make that write without them, whatever it says of the change. GitHub's names are not
+ * case sensitive, and neither is this: `amd-agi/DEMO#7` is the same pull request as `AMD-AGI/demo#7`.
+ */
+export async function heldOrDeniedOn(db: Queryable, actorUserId: string, repo: string, pr: number, headSha: string): Promise<"pending" | "denied" | "expired" | null> {
+  const r = await db.query(
+    `SELECT CASE WHEN status = 'pending' AND expires_at <= NOW() THEN 'expired' ELSE status END AS state
+       FROM claw_github_confirmations
+      WHERE actor_user_id = $1 AND lower(repo) = lower($2) AND pr = $3 AND head_sha = $4
+        AND status IN ('pending', 'merging', 'denied', 'expired')`,
+    [actorUserId, repo, pr, headSha],
+  );
+  const states = new Set((r.rows as Array<{ state?: string }>).map((row) => row.state));
+  if (states.has("denied")) return "denied";
+  // `merging` is a decision being carried out, a deny as much as an allow (claimConfirmation): until it is recorded it is still theirs.
+  if (states.has("pending") || states.has("merging")) return "pending";
+  // Nobody answered: the judgement that held it may be asked again until it says low, so the commit stays theirs to decide.
+  return states.has("expired") ? "expired" : null;
 }
 
 export async function getConfirmation(db: Queryable, id: string): Promise<Confirmation | null> {

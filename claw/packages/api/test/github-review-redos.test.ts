@@ -36,7 +36,7 @@ const run = (files: RiskFile[]): { ms: number; reasons: string[]; level: string 
     additions: files.reduce((n, f) => n + f.additions, 0), deletions: files.reduce((n, f) => n + f.deletions, 0),
     fork: false, authorAssociation: "MEMBER", baseRef: "main", defaultBranch: "main", repoConfig: null,
   });
-  return { ms: performance.now() - started, reasons: r.reasons, level: r.level };
+  return { ms: performance.now() - started, reasons: r.evidence, level: r.ruleLevel };
 };
 
 /**
