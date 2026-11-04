@@ -149,6 +149,8 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
       last_error       TEXT,
       failing_since    TIMESTAMPTZ,
       failure_reported BOOLEAN NOT NULL DEFAULT FALSE,
+      -- The owner was told that comments by others are held back because their token cannot see who may write to the repository.
+      trust_reported   BOOLEAN NOT NULL DEFAULT FALSE,
       created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       ended_at         TIMESTAMPTZ
     )

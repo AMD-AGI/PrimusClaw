@@ -13,7 +13,8 @@
  * the worker is started. The model only judges what to do about them.
  *
  * Whose words reach the worker is decided in code before any model reads them: people who can write to the repository and the
- * owner's own account (`TRUSTED_PERMISSIONS`, asked of GitHub per author); anyone else's comment is recorded and dropped, and a check run's
+ * owner's own account (`TRUSTED_PERMISSIONS`, asked of GitHub per author; bots only when the operator lists them); anyone else's comment is
+ * recorded and dropped (and when the owner's token may not ask, held back and the owner told), and a check run's
  * name, which a pull request from a fork can set, is never passed on. What an event can do is what the item
  * could already do. The poll only reads. The worker answers on the pull
  * request through `pr_reply`, which posts as the owner only when the owner, signed in themselves, allowed it for
@@ -27,14 +28,17 @@
  * stored and is tried again, one that is dropped says why, and a pull request that cannot be read for ten
  * minutes puts the item in front of the user rather than looking like a quiet one.
  */
+import { createHash } from "node:crypto";
 import pino from "pino";
 import {
   CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_GITHUB_EVENTS, CLAW_ASSISTANT_GITHUB_MAX_SUBSCRIPTIONS, CLAW_ASSISTANT_GITHUB_POLL_SEC,
+  CLAW_ASSISTANT_GITHUB_TRUSTED_BOTS,
 } from "../config.js";
 import { redactSecrets } from "@claw/utils";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { readGithubMcpSettings } from "../github-mcp/settings.js";
 import { loadGithubToken } from "../github-mcp/mcp.js";
+import { CLAW_WRITE_MARK } from "../github-mcp/tools.js";
 import { GithubClient, GithubError, parsePrRef, repoPath, type PrRef } from "../github-review/github.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
@@ -89,8 +93,24 @@ const AUTHORED_KINDS: ReadonlySet<string> = new Set(["issue_comment", "review_co
  * owner's credentials. `author_association` is not enough: a member of the organisation may only read the repository.
  */
 export const TRUSTED_PERMISSIONS: ReadonlySet<string> = new Set(["admin", "maintain", "write"]);
-/** Stored values shorter than this are not looked for in an answer: they are not credentials, and would refuse ordinary words. */
-export const SECRET_MIN_LENGTH = 8;
+/**
+ * Stored values at least this long are refused anywhere in an answer. Every shorter one is refused too, but only as a whole word (not
+ * next to a letter or digit), so a 3-character value is not found inside an ordinary longer word; the refusal names the variable, never
+ * its value, so the worker can write around a value that is also an ordinary word.
+ */
+export const SECRET_SUBSTRING_LENGTH = 8;
+
+/**
+ * What one poll of a pull request asks GitHub: the pull request, its two comment lists, its reviews and its head's check runs (the
+ * account is remembered, authors are asked once per new event). The owner's token serves their own `github` tools and `gh` as well, so
+ * the loop keeps to `GITHUB_HOURLY_BUDGET` of its 5000 requests an hour: the more pull requests one person watches, the less often each
+ * is read. And whenever GitHub says the token has less than `RATE_FLOOR_SHARE` of its hour left, nothing of theirs is read until it resets.
+ */
+export const REQUESTS_PER_POLL = 5;
+export const GITHUB_HOURLY_BUDGET = 1200;
+export const RATE_FLOOR_SHARE = 0.2;
+/** The account a token belongs to is asked once an hour, not at every poll. */
+const ACCOUNT_TTL_MS = 3600_000;
 
 export function githubEventsEnabled(): boolean {
   return CLAW_ASSISTANT_ENABLED && CLAW_ASSISTANT_GITHUB_EVENTS;
@@ -109,6 +129,39 @@ export const githubEventPorts: {
 
 const github = (token: string): GithubClient =>
   new GithubClient({ token, apiUrl: githubEventPorts.apiUrl(), fetchImpl: githubEventPorts.fetchImpl });
+
+/** What GitHub said of a token's hour while it was used: the lowest remaining seen. */
+interface RateSeen { remaining: number; limit: number; resetAt: number }
+
+/** A client that also notes the rate limit GitHub reports on each answer. */
+function watchedGithub(token: string): { gh: GithubClient; rate: () => RateSeen | null } {
+  let seen: RateSeen | null = null;
+  const base = githubEventPorts.fetchImpl ?? fetch;
+  const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    const resp = await base(input, init);
+    const remaining = Number(resp.headers.get("x-ratelimit-remaining") ?? NaN);
+    const limit = Number(resp.headers.get("x-ratelimit-limit") ?? NaN);
+    const resetAt = Number(resp.headers.get("x-ratelimit-reset") ?? NaN) * 1000;
+    if (Number.isFinite(remaining) && Number.isFinite(limit) && limit > 0 && (seen === null || remaining < seen.remaining)) {
+      seen = { remaining, limit, resetAt: Number.isFinite(resetAt) ? resetAt : Date.now() + 3600_000 };
+    }
+    return resp;
+  }) as typeof fetch;
+  return { gh: new GithubClient({ token, apiUrl: githubEventPorts.apiUrl(), fetchImpl }), rate: () => seen };
+}
+
+const accounts = new Map<string, { login: string; at: number }>();
+
+/** The account answers are posted with (the token's own), remembered by the token's hash for an hour. */
+async function accountOf(gh: GithubClient, token: string): Promise<string | null> {
+  const key = createHash("sha256").update(token).digest("hex");
+  const hit = accounts.get(key);
+  if (hit && Date.now() - hit.at < ACCOUNT_TTL_MS) return hit.login;
+  const me = login((await gh.get<any>("/user")).json);
+  if (accounts.size > 10_000) accounts.clear();
+  if (me) accounts.set(key, { login: me, at: Date.now() });
+  return me;
+}
 
 /** A refusal for the caller to show: HTTP status, a code a client or a model acts on, and a sentence. */
 export class SubscriptionRefused extends Error {
@@ -216,14 +269,23 @@ export async function listSubscriptions(userId: string, itemId: string): Promise
  * when the subscription is not the caller's (or not there).
  */
 export async function endSubscription(userId: string, itemId: string, subId: number): Promise<SubscriptionView | null> {
-  const row = (await db.query(
-    `UPDATE claw_work_item_subscriptions
-        SET state = 'ended', end_reason = COALESCE(end_reason, 'user'), ended_at = COALESCE(ended_at, NOW()), reply_allowed = FALSE
-      WHERE id = $1 AND item_id = $2 AND user_id = $3
-      RETURNING *`,
-    [subId, itemId, userId],
-  )).rows[0] as Record<string, any> | undefined;
-  return row ? subscriptionView(row) : null;
+  return inTransaction(async (query) => {
+    const row = (await query(
+      `UPDATE claw_work_item_subscriptions
+          SET state = 'ended', end_reason = COALESCE(end_reason, 'user'), ended_at = COALESCE(ended_at, NOW()), reply_allowed = FALSE
+        WHERE id = $1 AND item_id = $2 AND user_id = $3
+        RETURNING *`,
+      [subId, itemId, userId],
+    )).rows[0] as Record<string, any> | undefined;
+    if (!row) return null;
+    // What was read and not yet delivered (held by the wake limit, say) is not delivered after the user stopped watching.
+    await query(
+      `UPDATE claw_work_item_github_events SET dropped_at = NOW(), drop_reason = 'subscription_ended'
+        WHERE sub_id = $1 AND delivered_at IS NULL AND dropped_at IS NULL`,
+      [subId],
+    );
+    return subscriptionView(row);
+  });
 }
 
 /**
@@ -334,12 +396,28 @@ async function checkRunsOf(gh: GithubClient, path: string): Promise<{ runs: any[
   return { runs, complete: runs.length >= total };
 }
 
-/** What is new on the pull request, and whether it is closed. Throws what GitHub threw: an unread pull request is not a quiet one. */
-export async function readPullRequestEvents(gh: GithubClient, sub: Pick<Subscription, "owner" | "repo" | "number" | "since" | "cursor_at">):
-  Promise<{ events: GithubEvent[]; closed: "pr_merged" | "pr_closed" | null; readUpTo: Date | null; login: string | null; writers: Set<string> }> {
+export interface PullRequestRead {
+  events: GithubEvent[];
+  closed: "pr_merged" | "pr_closed" | null;
+  readUpTo: Date | null;
+  /** The account answers are posted with: what our own answers are written by. */
+  login: string | null;
+  /** Authors GitHub says can write to the repository (or trusted bots). */
+  writers: ReadonlySet<string>;
+  /** Authors whose permission the owner's token may not see (GitHub wants push access to tell): held back, and the owner told. */
+  unverifiable: ReadonlySet<string>;
+}
+
+/**
+ * What is new on the pull request, and whether it is closed. Throws what GitHub threw: an unread pull request is not a quiet one.
+ * `known` names the events already stored, whose authors are not asked about again.
+ */
+export async function readPullRequestEvents(
+  gh: GithubClient, sub: Pick<Subscription, "id" | "owner" | "repo" | "number" | "since" | "cursor_at">,
+  opts: { me: string | null; known?: (eventIds: string[]) => Promise<ReadonlySet<string>> },
+): Promise<PullRequestRead> {
   const r: PrRef = { owner: sub.owner, repo: sub.repo, number: sub.number };
-  // The account answers are posted with: what our own answers are written by.
-  const me = login((await gh.get<any>("/user")).json);
+  const me = opts.me;
   const pr = (await gh.get<any>(repoPath(r, `/pulls/${r.number}`))).json ?? {};
   const since = { since: sub.cursor_at.toISOString() };
   const events: GithubEvent[] = [];
@@ -399,16 +477,36 @@ export async function readPullRequestEvents(gh: GithubClient, sub: Pick<Subscrip
       body: pr.merged ? "the pull request was merged" : "the pull request was closed without merging", occurredAt: pr.closed_at ?? null,
     });
   }
-  // Who among the authors can write to the repository, asked once per author per read. Not answered is not a writer.
+  // Who among the authors of new events can write to the repository, asked once per author per read. A 404 is GitHub saying they are
+  // not a collaborator. A 403 that is not a rate limit says the owner's token may not ask (no push access): that is not knowing, kept
+  // apart so the owner is told. A rate limit or an outage throws: the read is tried again whole, and nobody is judged on no answer.
   const writers = new Set<string>();
-  const authors = [...new Set(events.filter((e) => AUTHORED_KINDS.has(e.kind) && e.author && e.author !== me).map((e) => e.author as string))];
+  const unverifiable = new Set<string>();
+  const known = opts.known ? await opts.known(events.map((e) => eventIdOf(sub.id, e))) : new Set<string>();
+  const authors = [...new Set(events
+    .filter((e) => AUTHORED_KINDS.has(e.kind) && e.author && e.author !== me && !known.has(eventIdOf(sub.id, e)))
+    .map((e) => e.author as string))];
   for (const author of authors) {
-    const got = await gh.get<any>(repoPath(r, `/collaborators/${encodeURIComponent(author)}/permission`), undefined, [403, 404]);
-    const role = String(got.json?.role_name ?? "");
-    const permission = String(got.json?.permission ?? "");
-    if (got.status === 200 && (TRUSTED_PERMISSIONS.has(role) || TRUSTED_PERMISSIONS.has(permission))) writers.add(author);
+    if (CLAW_ASSISTANT_GITHUB_TRUSTED_BOTS.has(author.toLowerCase())) {
+      writers.add(author);
+      continue;
+    }
+    if (author.endsWith("[bot]")) continue;
+    let got: Awaited<ReturnType<GithubClient["get"]>>;
+    try {
+      got = await gh.get<any>(repoPath(r, `/collaborators/${encodeURIComponent(author)}/permission`), undefined, [404]);
+    } catch (err) {
+      if (err instanceof GithubError && err.status === 403 && !err.rateLimited) {
+        unverifiable.add(author);
+        continue;
+      }
+      throw err;
+    }
+    if (got.status !== 200) continue;
+    const json = got.json as { role_name?: unknown; permission?: unknown } | null;
+    if (TRUSTED_PERMISSIONS.has(String(json?.role_name ?? "")) || TRUSTED_PERMISSIONS.has(String(json?.permission ?? ""))) writers.add(author);
   }
-  return { events, closed, readUpTo, login: me, writers };
+  return { events, closed, readUpTo, login: me, writers, unverifiable };
 }
 
 export const eventIdOf = (subId: number, e: Pick<GithubEvent, "kind" | "githubId">): string => `gh:${subId}:${e.kind}:${e.githubId}`;
@@ -425,28 +523,27 @@ function readError(err: unknown): string {
 }
 
 /** Stored, deduplicated by id, and the subscription moved on, in one transaction: a read that is not stored is read again. */
-export async function storeEvents(
-  sub: Subscription,
-  read: { events: GithubEvent[]; closed: "pr_merged" | "pr_closed" | null; readUpTo: Date | null; login: string | null; writers: ReadonlySet<string> },
-): Promise<number> {
+export async function storeEvents(sub: Subscription, read: PullRequestRead): Promise<{ stored: number; unverifiable: number }> {
   return inTransaction(async (query) => {
     const live = (await query("SELECT state FROM claw_work_item_subscriptions WHERE id = $1 FOR UPDATE", [sub.id])).rows[0] as
       { state: string } | undefined;
-    if (live?.state !== "active") return 0;
+    if (live?.state !== "active") return { stored: 0, unverifiable: 0 };
     // Our own answers: written by the account answers are posted with, carrying the marker of an answer we are posting or posted
-    // (`claw_work_item_pr_replies`). Never the marker alone: anyone can copy text, nobody can write as that account but its owner.
+    // (`claw_work_item_pr_replies`), or the mark the `github` tools put on every comment they write (an answer made with the owner's
+    // approval when automatic answers are off). Never a mark alone: anyone can copy text, nobody can write as that account but its owner.
     const byUs = (e: GithubEvent): boolean => COMMENT_KINDS.has(e.kind) && read.login !== null && e.author === read.login;
     const markers = read.events.filter(byUs).flatMap((e) => markersIn(e.body));
     const answered = new Set(markers.length ? ((await query(
       "SELECT event_id FROM claw_work_item_pr_replies WHERE event_id = ANY($1::text[])", [markers],
     )).rows as Array<{ event_id: string }>).map((r) => r.event_id) : []);
-    const isOurs = (e: GithubEvent): boolean => byUs(e) && markersIn(e.body).some((m) => answered.has(m));
+    const isOurs = (e: GithubEvent): boolean => byUs(e) && (e.body.includes(CLAW_WRITE_MARK) || markersIn(e.body).some((m) => answered.has(m)));
     const untrusted = (e: GithubEvent): boolean => AUTHORED_KINDS.has(e.kind)
       && !(read.login !== null && e.author === read.login) && !(e.author !== null && read.writers.has(e.author));
     let stored = 0;
+    let unverifiable = 0;
     for (const e of read.events) {
       if (isOurs(e)) continue;
-      const dropped = untrusted(e) ? "author_not_trusted" : null;
+      const dropped = !untrusted(e) ? null : (e.author !== null && read.unverifiable.has(e.author) ? "author_unverifiable" : "author_not_trusted");
       const inserted = await query(
         `INSERT INTO claw_work_item_github_events
            (event_id, sub_id, item_id, kind, github_id, author, url, body, path, line, reply_to, head_sha, occurred_at, dropped_at, drop_reason)
@@ -456,6 +553,7 @@ export async function storeEvents(
           e.path ?? null, e.line ?? null, e.replyTo ?? null, e.headSha ?? null, e.occurredAt, dropped],
       );
       stored += inserted.rowCount ?? 0;
+      if (dropped === "author_unverifiable") unverifiable += inserted.rowCount ?? 0;
     }
     await query(
       `UPDATE claw_work_item_subscriptions
@@ -467,8 +565,41 @@ export async function storeEvents(
         WHERE id = $1`,
       [sub.id, sub.read_at, SINCE_MARGIN_SEC, read.closed, read.readUpTo],
     );
-    return stored;
+    return { stored, unverifiable };
   });
+}
+
+/**
+ * Comments by others were held back because the owner's token cannot see who may write to the repository (it has no push access there,
+ * as on an upstream a fork's pull request goes to). The owner is told once per subscription, through the report path, and decides.
+ */
+async function reportUnverifiable(sub: Subscription): Promise<void> {
+  const claimed = await db.query(
+    "UPDATE claw_work_item_subscriptions SET trust_reported = TRUE WHERE id = $1 AND NOT trust_reported RETURNING id", [sub.id],
+  );
+  if (!claimed.rowCount) return;
+  const item = (await db.query(
+    "SELECT worker_session_id, generation, board_state FROM claw_work_items WHERE item_id = $1", [sub.item_id],
+  )).rows[0] as { worker_session_id: string; generation: number; board_state: string } | undefined;
+  if (!item || item.board_state === "done") return;
+  const out = await ingestReport({
+    itemId: sub.item_id, workerSessionId: item.worker_session_id, generation: Number(item.generation), runId: null,
+  }, {
+    kind: "waiting",
+    summary: `Comments by others on ${prName(sub)} are not passed to this item: the GitHub token GH_TOKEN cannot see who may write to ${sub.owner}/${sub.repo} (GitHub tells that only to accounts with push access), and words from someone who may not write never reach the worker. Your own comments and failed CI still do.`,
+    question: "Keep watching for your own comments and CI only, or stop watching this pull request?",
+  }, "sweep");
+  if (out.status !== "applied") await db.query("UPDATE claw_work_item_subscriptions SET trust_reported = FALSE WHERE id = $1", [sub.id]);
+}
+
+/** Nothing more of this user's is read before `until`: their token's hour is nearly spent, and it serves more than this loop. */
+async function deferUser(userId: string, until: number): Promise<void> {
+  await db.query(
+    `UPDATE claw_work_item_subscriptions SET polled_at = GREATEST(COALESCE(polled_at, to_timestamp(0)), to_timestamp($2::double precision / 1000))
+      WHERE user_id = $1 AND state = 'active'`,
+    [userId, until],
+  );
+  logger.warn({ userId, until: new Date(until).toISOString() }, "assistant.github_rate_floor_deferred");
 }
 
 /**
@@ -503,7 +634,8 @@ async function recordReadFailure(sub: Subscription, code: string): Promise<void>
   }
 }
 
-export async function pollSubscription(sub: Subscription): Promise<number> {
+/** What one poll of a subscription stored, and whether comments were held back for a permission the owner's token may not see. */
+export async function pollSubscription(sub: Subscription): Promise<{ stored: number; unverifiable: number }> {
   const item = (await db.query("SELECT board_state FROM claw_work_items WHERE item_id = $1", [sub.item_id])).rows[0] as
     { board_state: string } | undefined;
   if (!item || item.board_state === "done") {
@@ -511,19 +643,31 @@ export async function pollSubscription(sub: Subscription): Promise<number> {
       "UPDATE claw_work_item_subscriptions SET state = 'ended', end_reason = 'item_closed', ended_at = NOW() WHERE id = $1 AND state = 'active'",
       [sub.id],
     );
-    return 0;
+    return { stored: 0, unverifiable: 0 };
   }
   const token = await githubEventPorts.loadToken(sub.user_id);
   if (!token) {
     await recordReadFailure(sub, "no_github_token");
-    return 0;
+    return { stored: 0, unverifiable: 0 };
   }
-  let read: Awaited<ReturnType<typeof readPullRequestEvents>>;
+  const { gh, rate } = watchedGithub(token);
+  let read: PullRequestRead;
   try {
-    read = await readPullRequestEvents(github(token), sub);
+    read = await readPullRequestEvents(gh, sub, {
+      me: await accountOf(gh, token),
+      known: async (ids) => new Set(((await db.query(
+        "SELECT event_id FROM claw_work_item_github_events WHERE event_id = ANY($1::text[])", [ids],
+      )).rows as Array<{ event_id: string }>).map((r) => r.event_id)),
+    });
   } catch (err) {
     await recordReadFailure(sub, readError(err));
-    return 0;
+    if (err instanceof GithubError && err.rateLimited) {
+      await deferUser(sub.user_id, Math.max(Date.now() + (err.retryAfterSeconds ?? 60) * 1000, rate()?.resetAt ?? 0));
+    }
+    return { stored: 0, unverifiable: 0 };
+  } finally {
+    const seen = rate();
+    if (seen && seen.remaining < seen.limit * RATE_FLOOR_SHARE) await deferUser(sub.user_id, seen.resetAt);
   }
   return storeEvents(sub, read);
 }
@@ -549,7 +693,8 @@ function describe(e: PendingEvent): string {
   switch (e.kind) {
     case "issue_comment": return `comment${who}`;
     case "review": return `review${who}`;
-    case "review_comment": return `review comment${who}${e.path ? ` on ${e.path}${e.line ? `:${e.line}` : ""}` : ""}`;
+    // The file it is on goes with the quoted text: a pull request's author names its files.
+    case "review_comment": return `review comment${who}`;
     case "check_failed": return "CI finished with failures on the head commit";
     case "pr_closed": return `pull request closed${who}`;
   }
@@ -564,7 +709,8 @@ export function formatGithubEvents(events: readonly PendingEvent[]): string {
   ];
   events.forEach((e, i) => {
     lines.push(`${i + 1}. event_id: ${e.event_id} | ${prName(e)} | ${describe(e)}${e.url ? ` | ${e.url}` : ""}`);
-    for (const l of (e.body ?? "").split("\n")) lines.push(`   > ${l}`);
+    const where = e.kind === "review_comment" && e.path ? `[on ${e.path}${e.line ? `:${e.line}` : ""}]\n` : "";
+    for (const l of `${where}${e.body ?? ""}`.split(/\r\n|\r|\n/)) lines.push(`   > ${l}`);
   });
   lines.push("");
   const replyable = events.some((e) => e.reply_allowed);
@@ -674,22 +820,37 @@ export async function pollDueSubscriptions(intervalSec: number = CLAW_ASSISTANT_
     `UPDATE claw_work_item_subscriptions s SET polled_at = NOW()
       WHERE s.id IN (
         SELECT id FROM claw_work_item_subscriptions
-         WHERE state = 'active' AND (polled_at IS NULL OR polled_at <= NOW() - make_interval(secs => $1::int))
+         WHERE state = 'active' AND (polled_at IS NULL OR polled_at <= NOW() - make_interval(secs => GREATEST($1::int, (
+                 -- One person's pull requests share their hourly budget: each is read less often the more there are.
+                 SELECT COUNT(*) FROM claw_work_item_subscriptions o WHERE o.user_id = claw_work_item_subscriptions.user_id AND o.state = 'active'
+               )::int * $3::int)))
          ORDER BY polled_at NULLS FIRST, id
          LIMIT $2
          FOR UPDATE SKIP LOCKED)
       RETURNING s.id, s.item_id, s.user_id, s.owner, s.repo, s.number, s.since, s.cursor_at, NOW() AS read_at`,
-    [intervalSec, POLL_BATCH],
+    [intervalSec, POLL_BATCH, Math.ceil((REQUESTS_PER_POLL * 3600) / GITHUB_HOURLY_BUDGET)],
   )).rows as Array<Subscription>;
   let stored = 0;
+  const heldBack: Subscription[] = [];
   for (const sub of due) {
+    const s = { ...sub, id: Number(sub.id), number: Number(sub.number) };
     try {
-      stored += await pollSubscription({ ...sub, id: Number(sub.id), number: Number(sub.number) });
+      const out = await pollSubscription(s);
+      stored += out.stored;
+      if (out.unverifiable > 0) heldBack.push(s);
     } catch (err) {
       logger.warn({ err, subId: sub.id }, "assistant.github_poll_failed");
     }
   }
   const delivered = await deliverPendingEvents();
+  // After delivering: news delivered with it would otherwise send the item straight back to work, and the question with it.
+  for (const sub of heldBack) {
+    try {
+      await reportUnverifiable(sub);
+    } catch (err) {
+      logger.warn({ err, subId: sub.id }, "assistant.github_trust_report_failed");
+    }
+  }
   return { polled: due.length, stored, delivered };
 }
 
@@ -752,13 +913,28 @@ function replyPath(t: ReplyTarget): { post: string; list: string } {
  * An answer to this event that is already on the pull request: a post whose result was lost. It carries the event's marker and was
  * written by the account the answer is posted with; a stranger who copied the marker has not answered for us.
  */
-async function findPosted(gh: GithubClient, t: ReplyTarget, since: Date): Promise<{ url: string | null; id: string } | null> {
+async function findPosted(gh: GithubClient, token: string, t: ReplyTarget, since: Date): Promise<{ url: string | null; id: string } | null> {
   const marker = replyMarker(t.event_id);
-  const me = login((await gh.get<any>("/user")).json);
+  const me = await accountOf(gh, token);
   if (!me) return null;
   const listed = await pages(gh, replyPath(t).list, { since: new Date(since.getTime() - SINCE_MARGIN_SEC * 1000).toISOString() });
   const hit = listed.find((c) => typeof c?.body === "string" && c.body.includes(marker) && login(c.user) === me);
   return hit ? { url: typeof hit.html_url === "string" ? hit.html_url : null, id: String(hit.id) } : null;
+}
+
+const escapeRe = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * The name of a stored variable whose value the text holds, or null. Every value counts, whatever its length: one of
+ * `SECRET_SUBSTRING_LENGTH` or more anywhere, a shorter one as a whole word (no letter or digit right before or after it).
+ */
+export function storedValueIn(text: string, vault: Record<string, string>): string | null {
+  for (const [name, raw] of Object.entries(vault)) {
+    const v = raw.trim();
+    if (!v) continue;
+    if (v.length >= SECRET_SUBSTRING_LENGTH ? text.includes(v) : new RegExp(`(?<![\\p{L}\\p{N}])${escapeRe(v)}(?![\\p{L}\\p{N}])`, "u").test(text)) return name;
+  }
+  return null;
 }
 
 /** Statuses after which GitHub certainly did not write the comment. */
@@ -833,15 +1009,17 @@ export async function prReply(
   }
   // What the owner keeps (the env vault the worker's sandbox is given, and the token answers are posted with) never leaves in an answer,
   // whatever a comment talked the worker into writing; nor does anything shaped like a credential.
-  const stored = Object.values(await loadUserEnvSnapshot(db, target.user_id, logger)).map((v) => v.trim()).filter((v) => v.length >= SECRET_MIN_LENGTH);
-  if (redactSecrets(body, [token]).hits > 0 || body.includes(token) || stored.some((v) => body.includes(v))) {
+  const leaked = storedValueIn(body, await loadUserEnvSnapshot(db, target.user_id, logger));
+  if (redactSecrets(body, [token]).hits > 0 || body.includes(token) || leaked !== null) {
     if (!retry) await release();
-    throw new ToolRefused("body_contains_secret", "the answer contains a credential or one of the user's stored values; it was not posted");
+    throw new ToolRefused("body_contains_secret", leaked !== null
+      ? `the answer contains the value of the user's stored variable ${leaked}; it was not posted. Write it without that value`
+      : "the answer contains a credential; it was not posted");
   }
   const gh = github(token);
   try {
     if (retry) {
-      const found = await findPosted(gh, target, createdAt);
+      const found = await findPosted(gh, token, target, createdAt);
       if (found !== null) {
         await posted(found.url, found.id);
         return { ok: true, status: "already_posted", url: found.url };

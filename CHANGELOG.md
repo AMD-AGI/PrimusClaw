@@ -41,7 +41,15 @@ record it.
   ending the subscription takes it away); an answer carrying the owner's token, one of their stored values or
   anything shaped like a credential is refused. Only comments and reviews by people who can write to the repository
   (their permission on it, asked of GitHub: admin, maintain or write) or by the owner's own account reach the worker;
-  others are recorded and dropped. A failed CI is passed on as counts, run ids and conclusions, never the runs' names. Reviews on someone's behalf are never subscribed. New tables `claw_work_item_subscriptions`,
+  others are recorded and dropped. When the owner's token cannot see who may write (no push access, as on an upstream a
+  fork's pull request goes to), others' comments are held back as `author_unverifiable` and the owner is asked once
+  whether to keep watching; a permission GitHub would not give (a rate limit) is asked again, never judged. Bots reach
+  the worker only when listed in `CLAW_ASSISTANT_GITHUB_TRUSTED_BOTS` (default empty). Comments the `github` tools write
+  end with an invisible `<!-- claw:github-tool -->` mark, so an answer the owner approved there does not come back to the
+  worker as news. One poll asks GitHub five things; one user's watched pull requests share 1200 requests an hour (each is
+  read less often the more there are), and nothing of theirs is read while GitHub reports less than a fifth of their
+  token's hour left. Every stored value is looked for in an answer, a value shorter than 8 characters as a whole word,
+  and the refusal names the variable. Events still waiting when the user stops watching are dropped. A failed CI is passed on as counts, run ids and conclusions, never the runs' names. Reviews on someone's behalf are never subscribed. New tables `claw_work_item_subscriptions`,
   `claw_work_item_github_events` and `claw_work_item_pr_replies` (required at start-up when the assistant is on);
   `CLAW_ASSISTANT_GITHUB_MAX_SUBSCRIPTIONS` (default 20) caps what one user watches.
 - On-behalf GitHub reviews as work items of the assistant, behind `CLAW_ASSISTANT_REVIEW_ITEMS` (default off; needs
