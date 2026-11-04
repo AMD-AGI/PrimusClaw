@@ -21,6 +21,13 @@
  *   F3  an item that waits for the user goes back to in progress; one in progress keeps its running turn's generation
  *   F4  past the wake limit events wait in the table and are delivered later, not lost
  *   F5  a pull request that cannot be read for ten minutes puts the item in front of the user, once
+ *   K1  a result waiting for the user stays acceptable whatever the watch reports: an unreadable pull request, and comments held back
+ *       for authors the token may not check, are told once the result is no longer waiting (sent back), never over it
+ *   K2  a pull request merged while its result waits for the user does not take the result back; accepted, the merge is dropped
+ *   F8  a closed pull request whose comments were cut at the page limit is read to the end before the watch ends
+ *   F9  a list cut short is read on from where GitHub's own order stopped: an issue's comments by creation, review comments by update
+ *   F10 items that cannot take their events now (wake limit) do not keep others from being delivered
+ *   R5  answers taken back while an answer is being prepared: nothing is posted
  *   H1  the routes: owner only, reply needs the person, a key can only take it away, a limit on subscriptions
  *   W1  an answer the owner approved through the github tools is Claw's own: read back, it wakes nobody; the owner's own words still do
  *   W2  a steady poll asks GitHub five things; one person's pull requests share an hourly budget; a nearly spent token is left alone
@@ -86,11 +93,16 @@ function fakeGithub() {
     const per = Number(u.searchParams.get("per_page") ?? "30");
     return { items: list.slice((page - 1) * per, page * per), last: Math.max(1, Math.ceil(list.length / per)), per };
   };
-  /** GitHub's list: by update time from `since`, oldest first, one page of `per_page`. */
-  const since = (list: Array<Record<string, any>>, u: URL) => {
+  /**
+   * GitHub's list: what was updated at or after `since`, one page of `per_page`, in GitHub's order. An issue's comments come by
+   * creation (ascending id) whatever is asked; a pull request's review comments by what `sort` asks (creation when absent).
+   */
+  const since = (list: Array<Record<string, any>>, u: URL, sortable = false) => {
     const from = u.searchParams.get("since");
+    const byUpdate = sortable && u.searchParams.get("sort") === "updated";
+    const key = (c: Record<string, any>) => (byUpdate ? Date.parse(c.updated_at ?? c.created_at) : Date.parse(c.created_at));
     const all = (from ? list.filter((c) => Date.parse(c.updated_at ?? c.created_at) >= Date.parse(from)) : list)
-      .slice().sort((a, b) => Date.parse(a.updated_at ?? a.created_at) - Date.parse(b.updated_at ?? b.created_at));
+      .slice().sort((a, b) => key(a) - key(b) || Number(a.id) - Number(b.id));
     const page = Number(u.searchParams.get("page") ?? "1");
     const per = Number(u.searchParams.get("per_page") ?? "30");
     return all.slice((page - 1) * per, page * per);
@@ -107,7 +119,7 @@ function fakeGithub() {
       if (s.failReads > 0) { s.failReads -= 1; return json({ message: "Bad credentials" }, 401); }
       if (path === `${base}/pulls/${PR}`) return json(s.pr);
       if (path === `${base}/issues/${PR}/comments`) return json(since(s.issueComments, u));
-      if (path === `${base}/pulls/${PR}/comments`) return json(since(s.reviewComments, u));
+      if (path === `${base}/pulls/${PR}/comments`) return json(since(s.reviewComments, u, true));
       if (path === "/user") return json({ login: "alice" });
       const perm = /^\/repos\/acme\/app\/collaborators\/([^/]+)\/permission$/.exec(path);
       if (perm) {
@@ -527,6 +539,167 @@ describe("assistant GitHub events", { skip }, () => {
     await poll();
     assert.equal(await count("claw_work_item_github_events"), 550, "the next one reads on, and nothing is skipped");
     assert.equal(await count("claw_work_item_github_events", "item_id = $1", [it.itemId]), 550);
+  });
+
+  test("K1 a ready result stays acceptable when the watch cannot read GitHub, and the user is told once it is sent back", async () => {
+    const wi = w.mod.workItems;
+    const { db } = await import("../src/infra/db.js");
+    const it = await watched();
+    await w.q("UPDATE claw_work_items SET board_state = 'needs_you', last_report_kind = 'ready', result_version = 1 WHERE item_id = $1", [it.itemId]);
+    // The worker opened the pull request and reported ready; then the owner's token lapses for longer than the window.
+    tokens.alice = null;
+    await poll();
+    await w.q("UPDATE claw_work_item_subscriptions SET failing_since = NOW() - INTERVAL '11 minutes'");
+    await poll();
+    await poll();
+    let item = await w.item(it.itemId);
+    assert.deepEqual([item.board_state, item.last_report_kind, Number(item.result_version)], ["needs_you", "ready", 1], "the result is not replaced");
+    assert.equal(wi.itemView(item).can_accept, true);
+    assert.equal((await w.itemEvents(it.itemId)).filter((e) => e.kind === "blocked").length, 0);
+    assert.equal((await w.q("SELECT failure_reported FROM claw_work_item_subscriptions"))[0].failure_reported, false, "still to be told");
+
+    // The user sends it back for more: now the watch's problem is theirs to hear, once.
+    await wi.reopenWorkItem(db, { userId: "alice", itemId: it.itemId, text: "one more change" });
+    await poll();
+    await poll();
+    item = await w.item(it.itemId);
+    assert.deepEqual([item.board_state, item.last_report_kind], ["needs_you", "blocked"]);
+    assert.match(item.pending_question, /GH_TOKEN/);
+    assert.equal((await w.itemEvents(it.itemId)).filter((e) => e.kind === "blocked").length, 1);
+
+    // And a result waiting for the user is accepted as shown, whatever the watch hit meanwhile.
+    const two = await watched({ title: "second" });
+    await w.q("UPDATE claw_work_items SET board_state = 'needs_you', last_report_kind = 'ready', result_version = 2 WHERE item_id = $1", [two.itemId]);
+    await w.q("UPDATE claw_work_item_subscriptions SET failing_since = NOW() - INTERVAL '11 minutes' WHERE id = $1", [two.subId]);
+    await poll();
+    const accepted = await wi.acceptWorkItem("alice", two.itemId, 2);
+    assert.equal(accepted.status, "ok");
+    await poll();
+    assert.equal((await w.q("SELECT end_reason FROM claw_work_item_subscriptions WHERE id = $1", [two.subId]))[0].end_reason, "item_closed");
+  });
+
+  test("K1b comments held back on a ready item do not replace the result; the owner is asked once it is sent back", async () => {
+    const wi = w.mod.workItems;
+    const { db } = await import("../src/infra/db.js");
+    const it = await watched();
+    await w.q("UPDATE claw_work_items SET board_state = 'needs_you', last_report_kind = 'ready', result_version = 1 WHERE item_id = $1", [it.itemId]);
+    gh.s.permissionMode = "no_push";
+    gh.comment("a maintainer's note", { by: "dan" });
+    await poll();
+    let item = await w.item(it.itemId);
+    assert.deepEqual([item.board_state, item.last_report_kind, Number(item.result_version)], ["needs_you", "ready", 1]);
+    assert.equal(wi.itemView(item).can_accept, true);
+    assert.equal((await events(it.itemId))[0].drop_reason, "author_unverifiable", "still held back");
+    assert.equal((await w.q("SELECT trust_reported FROM claw_work_item_subscriptions"))[0].trust_reported, false);
+
+    // Sent back: the next poll asks, though no new comment came.
+    await wi.reopenWorkItem(db, { userId: "alice", itemId: it.itemId, text: "more" });
+    await poll();
+    item = await w.item(it.itemId);
+    assert.deepEqual([item.board_state, item.last_report_kind], ["needs_you", "waiting"]);
+    assert.match(item.pending_question, /stop watching/);
+    await poll();
+    assert.equal((await w.itemEvents(it.itemId)).filter((e) => e.kind === "waiting").length, 1, "asked once");
+  });
+
+  test("K2 a pull request merged while its result waits does not take the result back", async () => {
+    const wi = w.mod.workItems;
+    const it = await watched();
+    await w.q("UPDATE claw_work_items SET board_state = 'needs_you', last_report_kind = 'ready', result_version = 1 WHERE item_id = $1", [it.itemId]);
+    Object.assign(gh.s.pr, { state: "closed", merged: true, merged_by: { login: "alice" }, closed_at: gh.ago(0) });
+    const out = await poll();
+    assert.equal(out.delivered, 0);
+    const item = await w.item(it.itemId);
+    assert.deepEqual([item.board_state, item.last_report_kind, Number(item.result_version)], ["needs_you", "ready", 1]);
+    assert.equal((await w.q("SELECT end_reason FROM claw_work_item_subscriptions"))[0].end_reason, "pr_merged");
+    assert.equal(await ev.deliverItemEvents(it.itemId), "held");
+    assert.equal((await w.pending(it.workerSid)).length, 0);
+    assert.equal((await wi.acceptWorkItem("alice", it.itemId, 1)).status, "ok");
+    await ev.deliverPendingEvents();
+    const [e] = await events(it.itemId);
+    assert.deepEqual([e.kind, e.drop_reason], ["pr_closed", "item_closed"]);
+
+    // Merged with news beside it: the news sends the item back as before, and the merge goes with it.
+    const two = await watched({ title: "second" });
+    await w.q("UPDATE claw_work_items SET board_state = 'needs_you', last_report_kind = 'ready', result_version = 1 WHERE item_id = $1", [two.itemId]);
+    await w.q(
+      `INSERT INTO claw_work_item_github_events (event_id, sub_id, item_id, kind, github_id, body) VALUES
+        ('gh:k2a', $1, $2, 'pr_closed', 'merged', 'merged'), ('gh:k2b', $1, $2, 'issue_comment', '9', 'one more thing')`,
+      [two.subId, two.itemId],
+    );
+    assert.equal(await ev.deliverItemEvents(two.itemId), "delivered");
+    assert.equal((await w.item(two.itemId)).board_state, "in_progress");
+  });
+
+  test("F8 a closed pull request whose comments were cut at the page limit is read to the end first", async () => {
+    const it = await watched();
+    await w.q("UPDATE claw_work_item_subscriptions SET since = NOW() - INTERVAL '1 hour', cursor_at = NOW() - INTERVAL '1 hour'");
+    for (let i = 0; i < 550; i += 1) gh.comment(`c${i}`, { ageSec: 3000 - i });
+    Object.assign(gh.s.pr, { state: "closed", merged: false, closed_at: gh.ago(0) });
+    await poll();
+    assert.equal((await w.q("SELECT state FROM claw_work_item_subscriptions"))[0].state, "active", "not ended with a tail unread");
+    await poll();
+    assert.equal(await count("claw_work_item_github_events", "kind = 'issue_comment' AND item_id = $1", [it.itemId]), 550);
+    const sub = (await w.q("SELECT state, end_reason FROM claw_work_item_subscriptions"))[0];
+    assert.deepEqual([sub.state, sub.end_reason], ["ended", "pr_closed"]);
+  });
+
+  test("F9 a list cut short is read on in GitHub's order: an issue's comments by creation, review comments by update", async () => {
+    const it = await watched();
+    await w.q("UPDATE claw_work_item_subscriptions SET since = NOW() - INTERVAL '1 hour', cursor_at = NOW() - INTERVAL '1 hour'");
+    for (let i = 0; i < 550; i += 1) gh.comment(`c${i}`, { ageSec: 3000 - i });
+    for (let i = 0; i < 550; i += 1) {
+      const at = gh.ago(3000 - i);
+      gh.s.reviewComments.push({ id: 5000 + i, body: `r${i}`, path: "a.ts", line: 1, user: { login: "carol" }, created_at: at, updated_at: at, html_url: "https://github.com/x#r" });
+    }
+    // The last of each first five pages was edited just now: its update time is later than the unread tail's.
+    gh.s.issueComments[499]!.updated_at = gh.ago(0);
+    gh.s.reviewComments[499]!.updated_at = gh.ago(0);
+    await poll();
+    await poll();
+    assert.equal(await count("claw_work_item_github_events", "kind = 'issue_comment' AND item_id = $1", [it.itemId]), 550, "no issue comment skipped");
+    assert.equal(await count("claw_work_item_github_events", "kind = 'review_comment' AND item_id = $1", [it.itemId]), 550, "no review comment skipped");
+  });
+
+  test("F10 items held at their wake limit do not keep another item's events from being delivered", async () => {
+    const it = await watched();
+    // A hundred items of bob's at their wake limit, each with an event waiting, all older than alice's comment and named before hers.
+    await w.q(
+      `INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, worker_session_id)
+       SELECT 'a-held-' || lpad(n::text, 3, '0'), 'bob', 100 + n, 'held', 'in_progress', 'sess-held-' || n FROM generate_series(1, 100) n`,
+    );
+    await w.q(
+      `INSERT INTO claw_work_item_github_events (event_id, sub_id, item_id, kind, github_id, body, created_at, delivered_at, delivery_key)
+       SELECT 'gh:held:' || n || ':' || k, 0, 'a-held-' || lpad(n::text, 3, '0'), 'issue_comment', n || ':' || k, 'x',
+              NOW() - INTERVAL '1 hour', CASE WHEN k <= $1 THEN NOW() END, CASE WHEN k <= $1 THEN 'key' || k END
+         FROM generate_series(1, 100) n, generate_series(1, $1 + 1) k`,
+      [ev.WAKES_PER_WINDOW],
+    );
+    gh.comment("behind a hundred held items");
+    await poll();
+    const [msg] = await w.pending(it.workerSid);
+    assert.ok(msg?.content.includes("behind a hundred held items"), "delivered in the same poll");
+  });
+
+  test("R5 answers taken back while an answer is being prepared: nothing is posted", async () => {
+    const it = await watched();
+    gh.comment("question");
+    await poll();
+    await handedToRun(it.workerSid);
+    const [e] = await events(it.itemId);
+    const turn = await w.workerTurn(it.itemId);
+    const load = ev.githubEventPorts.loadToken;
+    ev.githubEventPorts.loadToken = async (userId) => {
+      await ev.subscribeItem({ userId: "alice", item: it.itemId, pr: prRef, reply: false });
+      return load(userId);
+    };
+    try {
+      assert.equal(await code(ev.prReply(turn, { event_id: e.event_id, body: "late" })), "reply_not_allowed");
+    } finally {
+      ev.githubEventPorts.loadToken = load;
+    }
+    assert.equal(gh.s.posts.length, 0);
+    assert.equal(await count("claw_work_item_pr_replies"), 0, "the event is free again");
   });
 
   test("S1 an answer carries its own event's marker and no other", async () => {

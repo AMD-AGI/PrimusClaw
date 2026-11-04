@@ -46,7 +46,7 @@ import { TOOL_NAME_PREFIX } from "./prompts.js";
 import { ingestReport } from "./reports.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, ToolRefused } from "./tools.js";
-import { reopenWorkItem, resolveWorkItem } from "./work-items.js";
+import { canAccept, reopenWorkItem, resolveWorkItem, type WorkReport } from "./work-items.js";
 
 const logger = pino({ name: "assistant-github-events" });
 
@@ -422,22 +422,26 @@ export async function readPullRequestEvents(
   const since = { since: sub.cursor_at.toISOString() };
   const events: GithubEvent[] = [];
 
-  // Lists read by update time, oldest first. One that was cut short was read up to its last item, and the next read starts
-  // there: moving on to now would skip what was not read.
+  // Lists filtered by update time (GitHub's 'since'). One that was cut short was read up to its last item, and the next read starts
+  // there: moving on to now would skip what was not read. Where that is depends on the list's order. A pull request's review comments
+  // are asked for by update time, so the tail is what was updated after the last one read. An issue's comments come by creation time
+  // whatever is asked (ascending id), so the tail is what was created after the last one read, and was updated no earlier than that:
+  // its creation time is where the next read starts, never its update time, which can be later than an unread comment's.
   let readUpTo: Date | null = null;
-  const sinceList = async (path: string): Promise<any[]> => {
-    const got = await pagesOf(gh, path, since);
+  const sinceList = async (path: string, order: "created" | "updated"): Promise<any[]> => {
+    const got = await pagesOf(gh, path, order === "updated" ? { ...since, sort: "updated", direction: "asc" } : since);
     if (got.capped) {
-      const last = new Date(Date.parse(got.items.at(-1)?.updated_at ?? got.items.at(-1)?.created_at ?? ""));
+      const tail = got.items.at(-1);
+      const last = new Date(Date.parse((order === "updated" ? tail?.updated_at : undefined) ?? tail?.created_at ?? ""));
       if (!Number.isNaN(last.getTime()) && (readUpTo === null || last < readUpTo)) readUpTo = last;
     }
     return got.items;
   };
-  for (const c of await sinceList(repoPath(r, `/issues/${r.number}/comments`))) {
+  for (const c of await sinceList(repoPath(r, `/issues/${r.number}/comments`), "created")) {
     if (!after(c?.created_at, sub.since)) continue;
     events.push({ kind: "issue_comment", githubId: String(c.id), author: login(c.user), url: c.html_url ?? null, body: String(c.body ?? ""), occurredAt: c.created_at });
   }
-  for (const c of await sinceList(repoPath(r, `/pulls/${r.number}/comments`))) {
+  for (const c of await sinceList(repoPath(r, `/pulls/${r.number}/comments`), "updated")) {
     if (!after(c?.created_at, sub.since)) continue;
     events.push({
       kind: "review_comment", githubId: String(c.id), author: login(c.user), url: c.html_url ?? null, body: String(c.body ?? ""),
@@ -555,6 +559,9 @@ export async function storeEvents(sub: Subscription, read: PullRequestRead): Pro
       stored += inserted.rowCount ?? 0;
       if (dropped === "author_unverifiable") unverifiable += inserted.rowCount ?? 0;
     }
+    // A closed pull request ends the watch only once its lists were read to the end: one cut at the page limit still has an unread
+    // tail, which the next poll reads from `readUpTo`.
+    const ending = read.readUpTo === null ? read.closed : null;
     await query(
       `UPDATE claw_work_item_subscriptions
           SET cursor_at = GREATEST(since, LEAST($2::timestamptz - make_interval(secs => $3::int), COALESCE($5::timestamptz, 'infinity'))),
@@ -563,10 +570,42 @@ export async function storeEvents(sub: Subscription, read: PullRequestRead): Pro
               end_reason = COALESCE($4::text, end_reason),
               ended_at = CASE WHEN $4::text IS NULL THEN ended_at ELSE NOW() END
         WHERE id = $1`,
-      [sub.id, sub.read_at, SINCE_MARGIN_SEC, read.closed, read.readUpTo],
+      [sub.id, sub.read_at, SINCE_MARGIN_SEC, ending, read.readUpTo],
     );
     return { stored, unverifiable };
   });
+}
+
+/** Thrown inside a watch report's transaction: the item holds a result waiting for the user, which the report would replace. */
+class HoldsReadyResult extends Error {}
+
+/**
+ * A problem with the watch itself (GitHub unreadable, comments held back), told to the user through the report path every other need
+ * goes through. Never over a result waiting for the user: a report would replace `ready` and the user could no longer accept what they
+ * were shown, for a reason that is the watch's, not the work's. Checked under the item's lock, in the transaction that writes the
+ * report, so a `ready` that lands first is seen. `deferred` writes nothing; the caller asks again at a later poll, and once the result
+ * is accepted the item is closed and its watch ends with it.
+ */
+async function fileWatchReport(sub: Subscription, report: WorkReport): Promise<"applied" | "deferred" | "stale"> {
+  const item = (await db.query(
+    "SELECT worker_session_id, generation, board_state FROM claw_work_items WHERE item_id = $1", [sub.item_id],
+  )).rows[0] as { worker_session_id: string; generation: number; board_state: string } | undefined;
+  if (!item || item.board_state === "done") return "stale";
+  try {
+    const out = await ingestReport({
+      itemId: sub.item_id, workerSessionId: item.worker_session_id, generation: Number(item.generation), runId: null,
+    }, report, "sweep", async (query) => {
+      const now = (await query(
+        "SELECT board_state, last_report_kind FROM claw_work_items WHERE item_id = $1 FOR UPDATE", [sub.item_id],
+      )).rows[0] as { board_state: string; last_report_kind: string | null } | undefined;
+      if (now && canAccept(now)) throw new HoldsReadyResult();
+    });
+    return out.status === "applied" ? "applied" : "stale";
+  } catch (err) {
+    if (!(err instanceof HoldsReadyResult)) throw err;
+    logger.info({ subId: sub.id, itemId: sub.item_id, kind: report.kind }, "assistant.github_watch_report_deferred");
+    return "deferred";
+  }
 }
 
 /**
@@ -578,18 +617,13 @@ async function reportUnverifiable(sub: Subscription): Promise<void> {
     "UPDATE claw_work_item_subscriptions SET trust_reported = TRUE WHERE id = $1 AND NOT trust_reported RETURNING id", [sub.id],
   );
   if (!claimed.rowCount) return;
-  const item = (await db.query(
-    "SELECT worker_session_id, generation, board_state FROM claw_work_items WHERE item_id = $1", [sub.item_id],
-  )).rows[0] as { worker_session_id: string; generation: number; board_state: string } | undefined;
-  if (!item || item.board_state === "done") return;
-  const out = await ingestReport({
-    itemId: sub.item_id, workerSessionId: item.worker_session_id, generation: Number(item.generation), runId: null,
-  }, {
+  const out = await fileWatchReport(sub, {
     kind: "waiting",
     summary: `Comments by others on ${prName(sub)} are not passed to this item: the GitHub token GH_TOKEN cannot see who may write to ${sub.owner}/${sub.repo} (GitHub tells that only to accounts with push access), and words from someone who may not write never reach the worker. Your own comments and failed CI still do.`,
     question: "Keep watching for your own comments and CI only, or stop watching this pull request?",
-  }, "sweep");
-  if (out.status !== "applied") await db.query("UPDATE claw_work_item_subscriptions SET trust_reported = FALSE WHERE id = $1", [sub.id]);
+  });
+  // Not filed (a result waits for the user, or a newer run moved the item on): asked again at a later poll, while comments are held back.
+  if (out !== "applied") await db.query("UPDATE claw_work_item_subscriptions SET trust_reported = FALSE WHERE id = $1", [sub.id]);
 }
 
 /** Nothing more of this user's is read before `until`: their token's hour is nearly spent, and it serves more than this loop. */
@@ -617,19 +651,13 @@ async function recordReadFailure(sub: Subscription, code: string): Promise<void>
   )).rows[0] as { failure_reported: boolean; overdue: boolean } | undefined;
   logger.warn({ subId: sub.id, itemId: sub.item_id, code }, "assistant.github_read_failed");
   if (!row?.overdue || row.failure_reported) return;
-  const item = (await db.query(
-    "SELECT worker_session_id, generation, board_state FROM claw_work_items WHERE item_id = $1", [sub.item_id],
-  )).rows[0] as { worker_session_id: string; generation: number; board_state: string } | undefined;
-  if (!item || item.board_state === "done") return;
-  const out = await ingestReport({
-    itemId: sub.item_id, workerSessionId: item.worker_session_id, generation: Number(item.generation), runId: null,
-  }, {
+  const out = await fileWatchReport(sub, {
     kind: "blocked",
     summary: `GitHub has not been readable for ${prName(sub)} for over ${Math.round(READ_FAILURE_REPORT_SEC / 60)} minutes (${code}), so new comments and CI results on it are not reaching this item.`,
     question: "Should I keep watching (after the GitHub token GH_TOKEN is fixed), or stop watching this pull request?",
-  }, "sweep");
-  // A newer run moved the item on: tried again at the next poll, against the generation it has then.
-  if (out.status === "applied") {
+  });
+  // A newer run moved the item on, or a result waits for the user: tried again at the next poll, against the item as it is then.
+  if (out === "applied") {
     await db.query("UPDATE claw_work_item_subscriptions SET failure_reported = TRUE WHERE id = $1", [sub.id]);
   }
 }
@@ -729,12 +757,12 @@ export function formatGithubEvents(events: readonly PendingEvent[]): string {
  * item's events are dropped with the reason and its subscriptions end; an item past its wake limit keeps them for later. Returns the
  * session to start, if any.
  */
-export async function deliverItemEvents(itemId: string): Promise<"delivered" | "dropped" | "limited" | "nothing" | "not_queued"> {
+export async function deliverItemEvents(itemId: string): Promise<"delivered" | "dropped" | "limited" | "held" | "nothing" | "not_queued"> {
   const out = await inTransaction(async (query) => {
     const q = { query };
     const item = (await query(
-      "SELECT item_id, user_id, kind, board_state, worker_session_id FROM claw_work_items WHERE item_id = $1 FOR UPDATE", [itemId],
-    )).rows[0] as { item_id: string; user_id: string; kind: string; board_state: string; worker_session_id: string } | undefined;
+      "SELECT item_id, user_id, kind, board_state, last_report_kind, worker_session_id FROM claw_work_items WHERE item_id = $1 FOR UPDATE", [itemId],
+    )).rows[0] as { item_id: string; user_id: string; kind: string; board_state: string; last_report_kind: string | null; worker_session_id: string } | undefined;
     const pending = (await query(
       `SELECT e.event_id, e.kind, e.author, e.url, e.body, e.path, e.line, s.owner, s.repo, s.number, s.reply_allowed
          FROM claw_work_item_github_events e JOIN claw_work_item_subscriptions s ON s.id = e.sub_id
@@ -763,6 +791,9 @@ export async function deliverItemEvents(itemId: string): Promise<"delivered" | "
       [itemId, WAKE_WINDOW],
     )).rows[0].n);
     if (wakes >= WAKES_PER_WINDOW) return { status: "limited" as const };
+    // The pull request closing (merged, most often by the user) is no reason to take back a result the user has not judged yet: it is
+    // kept, and reaches the worker with the next news or once the user sends the item back. Accepted, the item ends and it is dropped.
+    if (canAccept(item) && pending.every((e) => e.kind === "pr_closed")) return { status: "held" as const };
     // A result waiting for the user is no longer the one to accept once there is news on the pull request. An item in progress is left
     // alone: its running turn keeps its generation, and the next turn reads these.
     if (item.board_state === "needs_you") {
@@ -795,9 +826,21 @@ export async function deliverItemEvents(itemId: string): Promise<"delivered" | "
 }
 
 export async function deliverPendingEvents(): Promise<number> {
+  // Oldest waiting first, and never an item that could not take them now: one at its wake limit, or one holding a result for the user
+  // with nothing pending but the pull request closing (`deliverItemEvents` keeps those). Otherwise items that keep waiting would fill
+  // every batch and others behind them would wait for good.
   const items = (await db.query(
-    `SELECT DISTINCT item_id FROM claw_work_item_github_events
-      WHERE delivered_at IS NULL AND dropped_at IS NULL LIMIT 100`,
+    `SELECT e.item_id FROM claw_work_item_github_events e
+       LEFT JOIN claw_work_items w ON w.item_id = e.item_id
+      WHERE e.delivered_at IS NULL AND e.dropped_at IS NULL
+        AND (w.item_id IS NULL OR w.board_state = 'done' OR (SELECT COUNT(DISTINCT d.delivery_key) FROM claw_work_item_github_events d
+              WHERE d.item_id = e.item_id AND d.delivered_at > NOW() - $1::interval) < $2)
+      GROUP BY e.item_id, w.board_state, w.last_report_kind
+     HAVING NOT (w.board_state IS NOT DISTINCT FROM 'needs_you' AND w.last_report_kind IS NOT DISTINCT FROM 'ready'
+                 AND bool_and(e.kind = 'pr_closed'))
+      ORDER BY MIN(e.created_at)
+      LIMIT 100`,
+    [WAKE_WINDOW, WAKES_PER_WINDOW],
   )).rows as Array<{ item_id: string }>;
   let delivered = 0;
   for (const { item_id } of items) {
@@ -831,20 +874,27 @@ export async function pollDueSubscriptions(intervalSec: number = CLAW_ASSISTANT_
     [intervalSec, POLL_BATCH, Math.ceil((REQUESTS_PER_POLL * 3600) / GITHUB_HOURLY_BUDGET)],
   )).rows as Array<Subscription>;
   let stored = 0;
-  const heldBack: Subscription[] = [];
+  const polled: Subscription[] = [];
   for (const sub of due) {
     const s = { ...sub, id: Number(sub.id), number: Number(sub.number) };
+    polled.push(s);
     try {
-      const out = await pollSubscription(s);
-      stored += out.stored;
-      if (out.unverifiable > 0) heldBack.push(s);
+      stored += (await pollSubscription(s)).stored;
     } catch (err) {
       logger.warn({ err, subId: sub.id }, "assistant.github_poll_failed");
     }
   }
   const delivered = await deliverPendingEvents();
-  // After delivering: news delivered with it would otherwise send the item straight back to work, and the question with it.
-  for (const sub of heldBack) {
+  // Comments held back that the owner has not been told about: this poll's, and those of a poll whose question could not be asked
+  // then (a result was waiting for the user). After delivering: news delivered with it would otherwise send the item straight back to
+  // work, and the question with it.
+  const heldIds = polled.length ? new Set(((await db.query(
+    `SELECT s.id FROM claw_work_item_subscriptions s
+      WHERE s.id = ANY($1::bigint[]) AND s.state = 'active' AND NOT s.trust_reported
+        AND EXISTS (SELECT 1 FROM claw_work_item_github_events e WHERE e.sub_id = s.id AND e.drop_reason = 'author_unverifiable')`,
+    [polled.map((s) => s.id)],
+  )).rows as Array<{ id: string | number }>).map((r) => Number(r.id))) : new Set<number>();
+  for (const sub of polled.filter((s) => heldIds.has(s.id))) {
     try {
       await reportUnverifiable(sub);
     } catch (err) {
@@ -964,7 +1014,7 @@ export async function prReply(
          JOIN claw_work_item_subscriptions s ON s.id = e.sub_id
          JOIN claw_work_items w ON w.item_id = e.item_id
         WHERE e.event_id = $1 AND e.item_id = $2
-        FOR UPDATE OF w`,
+        FOR UPDATE OF w FOR SHARE OF s`,
       [eventId, claims.item_id],
     )).rows[0] as (ReplyTarget & { delivered_at: Date | null; reply_allowed: boolean; generation: number; board_state: string }) | undefined;
     if (!t || !t.delivered_at) throw new ToolRefused("event_not_found", "no such event on this item: use an event_id from a [github_event] message");
@@ -972,6 +1022,7 @@ export async function prReply(
     if (Number(t.generation) !== claims.gen) {
       throw new ToolRefused("stale_run", "this run is no longer the one working on the item, so it cannot answer for it");
     }
+    // The subscription is locked with the item: ending it (or taking back answers) waits for this check or is seen by it.
     if (!t.reply_allowed) {
       throw new ToolRefused("reply_not_allowed", "the user has not allowed answers on this pull request without asking; use the github tools, which ask them");
     }
@@ -1015,6 +1066,15 @@ export async function prReply(
     throw new ToolRefused("body_contains_secret", leaked !== null
       ? `the answer contains the value of the user's stored variable ${leaked}; it was not posted. Write it without that value`
       : "the answer contains a credential; it was not posted");
+  }
+  // Asked again right before GitHub is: the permission may have been taken back while the token and the vault were read. What is left
+  // is the post itself, which nothing can call back once it is sent.
+  const still = (await db.query(
+    "SELECT reply_allowed AS ok FROM claw_work_item_subscriptions WHERE id = $1", [target.sub_id],
+  )).rows[0] as { ok: boolean } | undefined;
+  if (!still?.ok) {
+    if (!retry) await release();
+    throw new ToolRefused("reply_not_allowed", "the user has taken back answers on this pull request without asking; use the github tools, which ask them");
   }
   const gh = github(token);
   try {

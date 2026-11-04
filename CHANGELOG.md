@@ -34,7 +34,9 @@ record it.
   router. A small loop reads each watched pull request every `CLAW_ASSISTANT_GITHUB_POLL_SEC` (default 30, at least 10)
   with the owner's own `GH_TOKEN`; each event is stored once under GitHub's id and delivered in the transaction that
   queues the message, at most 6 deliveries per item in 10 minutes (the rest wait, they are not dropped). A pull request
-  that cannot be read for 10 minutes puts the item in front of the user. New routes `POST/GET
+  that cannot be read for 10 minutes puts the item in front of the user; neither that nor any other report of the watch's own
+  replaces a result waiting for the user (it is told once the result is sent back), and the pull request closing does not take
+  such a result back. New routes `POST/GET
   /v1/work-items/:id/subscriptions` and `DELETE /v1/work-items/:id/subscriptions/:sub_id`; the router gets
   `work_subscribe`, the worker `pr_reply`, which answers one event on the pull request as the owner, once per event,
   and only where the owner allowed it themselves (`reply: true`, which needs an identity-provider sign-in; a key or

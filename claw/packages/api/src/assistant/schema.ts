@@ -192,6 +192,11 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
     `CREATE INDEX IF NOT EXISTS idx_work_item_github_events_undelivered
        ON claw_work_item_github_events(item_id, created_at) WHERE delivered_at IS NULL AND dropped_at IS NULL`,
   );
+  // Comments held back for an author the owner's token may not check: the poll asks whether the owner was told about them.
+  await client.query(
+    `CREATE INDEX IF NOT EXISTS idx_work_item_github_events_unverifiable
+       ON claw_work_item_github_events(sub_id) WHERE drop_reason = 'author_unverifiable'`,
+  );
   await client.query(`
     CREATE TABLE IF NOT EXISTS claw_work_item_pr_replies (
       -- One answer per event, whatever replays it.
