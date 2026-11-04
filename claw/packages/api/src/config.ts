@@ -416,6 +416,8 @@ export const S3_API_ENDPOINT = env("S3_API_ENDPOINT") || S3_ENDPOINT;
 // --- Upload TTL sweeper (S3 `.uploads/` per-session cleanup) ---
 // TTL for per-session upload artifacts in days. 0 disables the sweeper.
 export const UPLOAD_TTL_DAYS = envInt("UPLOAD_TTL_DAYS", 7);
+/** How long the download of a file the agent delivered (`deliver_file`) keeps working, counted from the delivery. */
+export const DELIVERY_TTL_DAYS = envInt("DELIVERY_TTL_DAYS", 7, { min: 1 });
 // Sweep cadence in minutes.
 export const UPLOAD_SWEEP_INTERVAL_MIN = envInt("UPLOAD_SWEEP_INTERVAL_MIN", 60);
 

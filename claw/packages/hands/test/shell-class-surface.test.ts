@@ -65,8 +65,11 @@ test("a running shell reads `running` on all three verbs", async () => {
 
 test("a shell that exited and was reaped reads `finished`, never the possibly-lost wording", async () => {
   bg.spawnBackground(OWNER, RUN, "echo out; exit 3", "gone");
-  // Past the reap delay, so the registry entry is dropped and only the record
-  // is left -- which is exactly when this used to answer "possibly lost".
+  // Read once, then past the reap delay, so the registry entry is dropped and
+  // only the record is left -- which is exactly when this used to answer
+  // "possibly lost". Output nobody has read keeps the entry, so it is read here.
+  await settle(150);
+  assert.match(bg.pollOutput(OWNER, RUN, "gone").text, /out/);
   await settle(250);
 
   const polled = bg.pollOutput(OWNER, RUN, "gone");

@@ -48,6 +48,8 @@ const DENY_LIST = new Set([
   "task",
   "upload_to_s3",
   "download_from_s3",
+  // Handing a file to the user is the main agent's to do: a sub-agent's events are folded away from the chat.
+  "deliver_file",
 ]);
 
 /** The profiles that only read and search: the ones a lighter default model is for. */

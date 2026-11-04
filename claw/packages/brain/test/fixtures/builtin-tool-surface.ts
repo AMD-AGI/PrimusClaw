@@ -31,7 +31,7 @@ interface Expected {
 }
 
 /**
- * The twelve names published in both switch states, in publication order.
+ * The thirteen names published in both switch states, in publication order.
  * `a2a_call` is not among them: it is published only while A2A_CLIENT_ENABLED is on,
  * and its own surface is pinned in a2a-client-tool.test.ts. Nor are the memory tools:
  * they are published only for a conversation the API gave memory (memory-tools.test.ts).
@@ -40,10 +40,10 @@ interface Expected {
  */
 export const CLOSED_STATE_NAMES = [
   "bash", "read", "write", "edit", "glob", "grep", "ls", "notebook_edit", "multi_edit",
-  "todo_write", "exit_plan_mode", "task",
+  "todo_write", "deliver_file", "exit_plan_mode", "task",
 ];
 
-/** The same twelve, with the background trio spliced in after `bash`. */
+/** The same thirteen, with the background trio spliced in after `bash`. */
 export const OPEN_STATE_NAMES = CLOSED_STATE_NAMES.flatMap((name) =>
   name === "bash" ? [name, "bash_output", "kill_shell", "wait"] : [name],
 );
@@ -89,6 +89,7 @@ const SHARED: Record<string, Expected> = {
     properties: ["todos", "merge"],
     required: ["todos"],
   },
+  deliver_file: { properties: ["path", "caption"], required: ["path"] },
   exit_plan_mode: { properties: ["plan"], required: ["plan"] },
   task: {
     properties: ["description", "prompt", "subagent_type", "tools"],
