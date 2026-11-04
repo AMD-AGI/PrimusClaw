@@ -206,7 +206,7 @@ interface ReviewRead {
   /** `how_to_read` of the overview: the deep review's sandbox path reads the diff from its checkout instead of in pages. */
   howToRead: string;
   /** A re-review's findings of the last review with their notes: words a model wrote after reading the pull request, so under `untrusted`. */
-  previousNotes?: Array<{ thread_id: string | null; path: string; line: number; note: string }>;
+  previousNotes?: Array<{ n: number; thread_id: string | null; path: string; line: number; note: string }>;
 }
 
 /** Most files GitHub lists in one compare; a compare with this many may have been cut, so it is read as a large change. */
@@ -437,15 +437,20 @@ export class GithubReview {
       review_instructions_source: { source: instructions.source, path: instructions.skillPath ?? null, base_sha: instructions.baseSha ?? null, note: instructions.note ?? null },
       ...(continuation && scope ? { continuation: this.continuationBlock(continuation, scope) } : {}),
     };
+    const previousNotes = continuation
+      ? continuation.findings.map((f, i) => ({ n: i + 1, thread_id: f.thread_id, path: f.path, line: f.line, note: ctx.client.redact(f.note) }))
+      : undefined;
     const conversation = conversationText(clip(pr.title, 300), clip(pr.body, 8000), comments);
-    const readId = createHash("sha256").update(JSON.stringify([pr.headSha, pr.baseRef, instructions.text, conversation, diffText(shown), scope?.scope ?? null])).digest("hex").slice(0, 16);
+    // A re-review's read also says what it continues; a first review's is digested exactly as before.
+    const digested = [pr.headSha, pr.baseRef, instructions.text, conversation, diffText(shown), ...(continuation && scope ? [overview.continuation, previousNotes] : [])];
+    const readId = createHash("sha256").update(JSON.stringify(digested)).digest("hex").slice(0, 16);
     // A delta is read in pages here: the checkout holds the whole pull request, which this review does not read again.
     const howToRead = ctx.settings.deepReview && choice.path === "sandbox" && recipe && (!scope || scope.scope === "full") ? HOW_TO_READ_FROM_CHECKOUT : HOW_TO_READ;
     return {
       readId, pr, files: shown, overview: { ...overview, read_id: readId }, instructions: instructions.text, conversation,
       riskReasons: risk.evidence.map((e) => `evidence: ${e}`), reviewPath: choice.path, reviewPathReason: choice.reason,
       howToRead: continuation && scope ? `${this.continuationHowTo(continuation, scope)} ${howToRead}` : howToRead,
-      ...(continuation ? { previousNotes: continuation.findings.map((f) => ({ thread_id: f.thread_id, path: f.path, line: f.line, note: ctx.client.redact(f.note) })) } : {}),
+      ...(previousNotes ? { previousNotes } : {}),
     };
   }
 
@@ -482,15 +487,16 @@ export class GithubReview {
     return {
       since_head_sha: c.sinceHeadSha, scope: scope.scope, reason: scope.reason, evidence: scope.evidence,
       delta_files: scope.scope === "full" ? [] : scope.files.map((f) => f.path),
-      // The last review's findings as this deployment recorded them; what each said is under `untrusted.previous_findings`.
-      findings: c.findings.map((f) => ({ path: f.path, line: f.line, thread_id: f.thread_id, resolved: f.resolved })),
+      // The last review's findings by number and thread; where each is (a path the pull request named) and what it said are under
+      // `untrusted.previous_findings`, by the same number.
+      findings: c.findings.map((f, i) => ({ n: i + 1, thread_id: f.thread_id, resolved: f.resolved })),
     };
   }
 
   private continuationHowTo(c: ReviewContinuation, scope: ContinuationScope): string {
     const since = c.sinceHeadSha.slice(0, 12);
-    const check = "First check each finding in `continuation.findings` at this head: one that is fixed has its thread resolved with gh_thread_resolve "
-      + "(only these threads can be); one that is not is said again in your review.";
+    const check = "First check each finding in `continuation.findings` (where it is and what it said: `untrusted.previous_findings`, same `n`) at this head: "
+      + "one that is fixed has its thread resolved with gh_thread_resolve (only these threads can be); one that is not is said again in your review.";
     switch (scope.scope) {
       case "unchanged": return `This is a re-review and the head is still ${since}, the one reviewed last time. ${check} There is no new change to review.`;
       case "delta": return `This is a re-review of only what changed since ${since}: \`files\` and \`diff\` hold that change, not the whole pull request. ${check} `
@@ -605,8 +611,11 @@ export class GithubReview {
       const review = () => this.submit(ctx, ref, headSha, {
         event: event as ReviewEvent, text, rawComments: args.comments, flags: this.flags(args), judgement: this.judgement(ctx, args), confirmation: null,
       });
-      // A comment approves nothing and is never held, so it does not wait for an approval or a merge being decided.
-      return ok(this.withMode(ctx, event === "APPROVE" ? await this.oneAtATime(ctx, ref, review) : await review()), (t) => ctx.client.redact(t));
+      // A comment approves nothing and is never held, so it does not wait for an approval or a merge being decided. Except where reviews
+      // are items (`recordPosted`): a restart reads what the old session posted and stops it under this lock, so a review still being
+      // posted is either in what the next one continues or refused as stopped, never posted after it was read.
+      const locked = event === "APPROVE" || this.deps.recordPosted === true;
+      return ok(this.withMode(ctx, locked ? await this.oneAtATime(ctx, ref, review) : await review()), (t) => ctx.client.redact(t));
     });
   }
 

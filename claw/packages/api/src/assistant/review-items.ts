@@ -70,6 +70,9 @@ export interface ReviewRecord { head_sha: string; verdict: string; model: string
 /** The record a re-review starts from, and which item it was. */
 export interface ReviewContinues extends ReviewRecord { from_item: string; from_seq: number }
 
+/** A GitHub thread id as the review tools accept one; anything else is not put in a message. */
+const THREAD_ID_SHAPE = /^[A-Za-z0-9_=-]{1,100}$/;
+
 /** Findings a record keeps: two full reviews' worth. */
 const MAX_FINDINGS = 60;
 
@@ -102,19 +105,19 @@ export function defaultBrief(pr: PrRef, reviewOnly: boolean): string {
 
 /**
  * What a re-review is told after its first message: check the last review's findings first (resolve what is fixed), then review as much as
- * `gh_pr_get` says (`continuation.scope`). Only where each finding is and its thread: never what it said (see below).
+ * `gh_pr_get` says (`continuation.scope`). Only each finding's number and thread: never its path or what it said (see below).
  */
 export function continuationBrief(pr: PrRef, c: ReviewContinues): string {
   const since = c.head_sha.slice(0, 12);
   const open = c.findings.filter((f) => !f.resolved);
   const lines = [
     `This is a re-review of ${prName(pr)}. The last review (item #${c.from_seq}) was of head ${since}, verdict ${c.verdict}, model ${c.model ?? "the deployment default"}.`,
-    "First check each finding below at the current head (what each said is in gh_pr_get's `untrusted.previous_findings`): resolve the thread of each one that is fixed with gh_thread_resolve, and say each one that is not again in your review.",
+    "First check each finding below at the current head (where each is and what it said: gh_pr_get's `untrusted.previous_findings`, by number): resolve the thread of each one that is fixed with gh_thread_resolve, and say each one that is not again in your review.",
     `Then review as much as gh_pr_get says in \`continuation.scope\`: only the change since ${since} (\`delta\`), nothing new (\`unchanged\`), or the whole pull request again (\`full\`, with its reason).`,
     open.length ? "Open findings of the last review:" : "The last review left no open inline findings.",
-    // Where and which thread only: what a finding said is text a model wrote after reading the pull request, and this message is the
-    // person's say (it is queued with their proof), so the words stay with the tool's untrusted data.
-    ...open.map((f) => `- ${f.path}:${f.line}${f.thread_id ? ` (thread ${f.thread_id})` : " (thread unknown: check it, but it cannot be resolved here)"}`),
+    // By number and thread only. This message is the person's say (it is queued with their proof): a finding's path is a file name the
+    // pull request chose and its note is what a model wrote after reading it, so both stay with the tool's untrusted data.
+    ...open.map((f, i) => `- finding ${i + 1}: ${f.thread_id && THREAD_ID_SHAPE.test(f.thread_id) ? `thread ${f.thread_id}` : "thread unknown (check it; it cannot be resolved here)"}`),
   ];
   return lines.join("\n");
 }

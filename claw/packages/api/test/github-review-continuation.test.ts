@@ -18,6 +18,7 @@
  *   T3  a thread already resolved is not resolved again; with writes off nothing is; none of it counts against the hourly review limits
  */
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { after, afterEach, describe, test } from "node:test";
 import type { ReviewContinuation } from "../src/github-review/service.js";
 import { HEAD } from "./support/fake-github.js";
@@ -105,10 +106,10 @@ describe("N recording and scope", () => {
     const o = await overview();
     assert.deepEqual(o.continuation, {
       since_head_sha: OLD, scope: "delta", reason: "small_delta", evidence: [], delta_files: ["src/app.ts"],
-      findings: [{ path: "src/app.ts", line: 3, thread_id: "PRRT_1", resolved: false }],
+      findings: [{ n: 1, thread_id: "PRRT_1", resolved: false }],
     });
-    // What a finding said was written by a model that read the pull request: it is data, under `untrusted`, never beside the instructions.
-    assert.deepEqual(o.untrusted.previous_findings, [{ thread_id: "PRRT_1", path: "src/app.ts", line: 3, note: "c is wrong" }]);
+    // Where a finding is (a file name the pull request chose) and what it said (a model's words after reading it) are data, under `untrusted`.
+    assert.deepEqual(o.untrusted.previous_findings, [{ n: 1, thread_id: "PRRT_1", path: "src/app.ts", line: 3, note: "c is wrong" }]);
     assert.match(o.how_to_read, /^This is a re-review of only what changed since 222222222222: `files` and `diff` hold that change/);
     assert.match(o.how_to_read, /gh_thread_resolve/);
     assert.equal(e.gh.count(/\/compare\//, "GET"), 1, "one compare of the two heads");
@@ -170,6 +171,10 @@ describe("N recording and scope", () => {
     assert.equal(o.untrusted.previous_findings, undefined);
     assert.doesNotMatch(o.how_to_read, /re-review/);
     assert.equal(e.gh.count(/\/compare\//), 0);
+    // The read is digested exactly as before this change: a first review's read_id is the same value.
+    const section = async (name: string) => (await readSection(e.service, e.actor, PR, name)).text;
+    const expected = createHash("sha256").update(JSON.stringify([HEAD, "main", await section("instructions"), await section("conversation"), await section("diff")])).digest("hex").slice(0, 16);
+    assert.equal(o.read_id, expected);
   });
 });
 
