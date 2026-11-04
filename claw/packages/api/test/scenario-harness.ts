@@ -72,6 +72,8 @@ CREATE TABLE claw_sessions (
   -- Which model the session's turns ask for; NULL is the deployment default.
   -- Read by every dispatch and written by the create route's INSERT.
   model          TEXT,
+  -- The reasoning effort the session's turns ask for (low, medium, high); NULL sends none.
+  effort         TEXT,
   created_at     TIMESTAMPTZ DEFAULT NOW(),
   updated_at     TIMESTAMPTZ DEFAULT NOW(),
   deleted_at     TIMESTAMPTZ,

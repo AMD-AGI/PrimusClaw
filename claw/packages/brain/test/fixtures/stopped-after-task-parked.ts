@@ -37,7 +37,7 @@ const stub = <T>(value: T) => (() => Promise.resolve(value)) as never;
 const engine: Engine = {
   async execute() {
     return {
-      finalText: "done", turns: 1, pendingMemories: [], pendingSkills: [],
+      finalText: "done", turns: 1, pendingSkills: [],
       skillsUsed: {}, errorCount: 0, elapsedMs: 1,
     } as ExecuteResult;
   },

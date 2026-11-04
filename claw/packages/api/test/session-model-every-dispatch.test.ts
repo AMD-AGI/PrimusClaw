@@ -16,6 +16,7 @@
  *   M3 the model is the one the session has when the turn is sent on, not when the
  *      message was accepted: a message parked behind a running turn picks up a
  *      change made while it waited, and a cleared choice leaves it with none
+ *   E1 the session's reasoning effort the same way: the one it has when the turn is sent on, and no field for none
  *
  * The doorbell variants are read back through the real claim, because what a
  * resumed or late-claimed run is given is what its row holds.
@@ -87,11 +88,14 @@ interface Scenario {
   /** The session's model when the turn is accepted; null is no choice. */
   model: string | null;
   /** Written to the session after the turn was accepted and before it is sent on. */
-  changeTo?: { model: string | null };
+  changeTo?: { model: string | null; effort?: string | null };
+  /** The session's effort when the turn is accepted; absent is none. */
+  effort?: string | null;
 }
 
-async function setModel(model: string | null): Promise<void> {
+async function setModel(model: string | null, effort?: string | null): Promise<void> {
   await h.sql("UPDATE claw_sessions SET model = $1 WHERE session_id = $2", [model, SESSION]);
+  if (effort !== undefined) await h.sql("UPDATE claw_sessions SET effort = $1 WHERE session_id = $2", [effort, SESSION]);
 }
 
 /** A run reclaimed from the spec its row holds: what a late-claimed doorbell run is given. */
@@ -111,8 +115,8 @@ async function reclaimed(spec: Record<string, unknown>): Promise<Request> {
 
 async function immediate(doorbell: boolean, s: Scenario): Promise<Request> {
   await seedSession(h, SESSION, { userId: OWNER });
-  await setModel(s.model);
-  if (s.changeTo) await setModel(s.changeTo.model);
+  await setModel(s.model, s.effort);
+  if (s.changeTo) await setModel(s.changeTo.model, s.changeTo.effort);
   const published: string[] = [];
   const opened: Array<Record<string, unknown>> = [];
   db.query = (async (text: string, params: unknown[] = []) => {
@@ -166,14 +170,14 @@ async function immediate(doorbell: boolean, s: Scenario): Promise<Request> {
 
 async function queued(doorbell: boolean, s: Scenario): Promise<Request> {
   await seedSession(h, SESSION, { userId: OWNER });
-  await setModel(s.model);
+  await setModel(s.model, s.effort);
   await h.sql(
     "INSERT INTO claw_pending_messages (session_id, user_id, content) VALUES ($1, $2, 'ls /tmp')",
     [SESSION, OWNER],
   );
   // The turn that was running ends, and the message is sent on. Whatever the
   // owner changed in between is what it should be sent on.
-  if (s.changeTo) await setModel(s.changeTo.model);
+  if (s.changeTo) await setModel(s.changeTo.model, s.changeTo.effort);
   const published: string[] = [];
   const opened: Array<Record<string, unknown>> = [];
   // The direct publish records its receipt on the run row, and the row here is
@@ -225,6 +229,21 @@ for (const path of PATHS) {
   test(`M2 ${path.name}: a session that chose none sends no model field`, async () => {
     const request = await path.run({ model: null });
     assert.equal("model" in request, false, `model leaked as ${JSON.stringify(request.model)}`);
+  });
+}
+
+for (const path of PATHS) {
+  test(`E1 ${path.name}: the session's effort is sent as it is when the turn goes, and no field for none`, async () => {
+    // [effort when accepted, effort written before it is sent on, expected]
+    const cases: Array<[string | null, string | null | undefined, string | undefined]> = [
+      ["high", undefined, "high"], [null, undefined, undefined], ["high", "low", "low"], ["high", null, undefined],
+    ];
+    for (const [effort, later, expected] of cases) {
+      await h.reset();
+      const request = await path.run({ model: null, effort, ...(later !== undefined ? { changeTo: { model: null, effort: later } } : {}) });
+      assert.equal(request.effort, expected, `${effort} -> ${later}`);
+      assert.equal("effort" in request, expected !== undefined, `${effort} -> ${later}: no field for none`);
+    }
   });
 }
 

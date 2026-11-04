@@ -54,13 +54,54 @@ function literalUrlHost(url: unknown): string | null {
   }
 }
 
+/** The origin (scheme://host[:port]) a spec's http(s) URL names, or null when it names none. */
+function literalUrlOrigin(url: unknown): string | null {
+  if (typeof url !== "string") return null;
+  try {
+    const u = new URL(url);
+    return u.protocol === "https:" || u.protocol === "http:" ? u.origin : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The values a server sends with every request, as `connectMcpServer` builds them: its URL, its
+ * headers' values, and its token as the bearer unless a header of its own replaces Authorization.
+ */
+function sentValues(spec: Record<string, unknown>): unknown[] {
+  const headers = spec.headers && typeof spec.headers === "object" && !Array.isArray(spec.headers)
+    ? spec.headers as Record<string, unknown>
+    : {};
+  const ownAuthorization = Object.keys(headers).some((k) => k.toLowerCase() === "authorization");
+  return [spec.url, ...(ownAuthorization ? [] : [spec.token || spec.api_key]), ...Object.values(headers)];
+}
+
+/**
+ * The origins of the servers that send `<name>` (see `sentValues`), at a URL with a literal host.
+ */
+export function originsSendingPlaceholder(
+  servers: Record<string, Record<string, unknown>>,
+  name: string,
+): Set<string> {
+  const origins = new Set<string>();
+  for (const spec of Object.values(servers)) {
+    if (!spec || typeof spec !== "object") continue;
+    const sends = sentValues(spec).some((v) => typeof v === "string" && v.includes(`<${name}>`));
+    const origin = sends ? literalUrlOrigin(spec.url) : null;
+    if (origin) origins.add(origin);
+  }
+  return origins;
+}
+
 /**
  * Normalize and validate MCP server configs.
  * @param servers - raw MCP server configs from tool_ids / request
  * @param overrides - values the request carries, for `<VAR>` placeholders in spec
  * @param envAllow - names that may be read from process.env; only the operator's defaults file has any
- * @param overrideHosts - when given, only a server whose URL names one of these hosts gets `overrides`
- *   (the requester's platform key); any other server gets the empty string for them, as for an unlisted name
+ * @param overrideHosts - when given, only a server whose URL names one of these host names, or one of
+ *   these origins (`scheme://host[:port]`), gets `overrides` (the requester's platform key); any other
+ *   server gets the empty string for them, as for an unlisted name
  */
 export function normalizeMcpConfigs(
   servers: Record<string, Record<string, unknown>>,
@@ -75,7 +116,15 @@ export function normalizeMcpConfigs(
     if (!rawSpec.url && !rawSpec.command) continue;
 
     const host = overrideHosts ? literalUrlHost(rawSpec.url) : null;
-    const trusted = !overrideHosts || (host !== null && overrideHosts.has(host));
+    const origin = overrideHosts ? literalUrlOrigin(rawSpec.url) : null;
+    const trusted = !overrideHosts
+      || (host !== null && overrideHosts.has(host))
+      || (origin !== null && overrideHosts.has(origin));
+    if (!trusted) {
+      const withheld = Object.keys(overrides).filter((k) => JSON.stringify(rawSpec).includes(`<${k}>`));
+      // Visible here, not only as the server's later auth failure, so an operator can tell a host to list.
+      if (withheld.length) logger.warn({ server: name, host, withheld }, "mcp.placeholder_withheld_untrusted_host");
+    }
     const spec = replaceEnvPlaceholders({ ...rawSpec }, trusted ? overrides : {}, envAllow) as Record<string, unknown>;
 
     if (!spec.type) {

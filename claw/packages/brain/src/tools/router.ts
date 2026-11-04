@@ -1,14 +1,15 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { HandsClient, withHandsTimeout, type ShellClassProbe } from "../clients/hands.js";
+import { HandsClient, withHandsTimeout, type ShellClassProbe, type ToolImage } from "../clients/hands.js";
 import { isSandboxTool, toolTimeoutCeilingSec } from "./hands.js";
 import { handleA2ACall } from "../clients/a2a.js";
 import { LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON } from "../tasks/abort-registry.js";
 import { callBackendMcpTool } from "../clients/backend-mcp.js";
 import { getPluginToolScope } from "./scope.js";
 import { toolNotAllowedMessage, type ToolAllowlist } from "./allowlist.js";
-import type { ToolSchema, PendingMemory, PendingSkill, PendingSkillFileMutation } from "@claw/protocol";
+import type { ToolSchema, PendingSkill, PendingSkillFileMutation } from "@claw/protocol";
+import { MEMORY_TOOLS, MEMORY_TOOL_SCHEMAS, callMemoryTool } from "./memory-tools.js";
 import {
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED, TODO_WRITE_ENABLED, BG_SHELL_ENABLED,
   EXIT_PLAN_MODE_ENABLED, ASK_USER_QUESTION_ENABLED, A2A_CLIENT_ENABLED,
@@ -81,7 +82,7 @@ const BG_SHELL_DISABLED_MESSAGE =
   + "Run the command in the foreground with an appropriate bash timeout instead.";
 
 /** What `route()` fills in for its caller; see its `outcome` parameter. */
-type RouteOutcome = { isError: boolean; structured?: Record<string, unknown> };
+type RouteOutcome = { isError: boolean; structured?: Record<string, unknown>; images?: ToolImage[] };
 
 /**
  * Answer with a refusal, recorded as one.
@@ -135,7 +136,7 @@ export interface WebToolServices {
 
 /**
  * Same threat patterns as API's scanMemoryContent — duplicated here so the
- * save_memory / save_skill tools can give Agent immediate accurate feedback
+ * save_skill tool can give Agent immediate accurate feedback
  * (instead of "saved" optimistically followed by silent server-side rejection).
  */
 const THREAT_PATTERNS: Array<{ pattern: RegExp; id: string }> = [
@@ -158,16 +159,16 @@ function scanContent(content: string, maxLength: number): string | null {
  * Routes tool calls to the correct backend:
  * - Hands tools → Hands MCP Server (sandbox)
  * - Platform MCP tools (mcp__server__tool) → remote MCP servers (Brain-side)
- * - save_memory / save_skill → local pending buffers (flushed via exec_complete)
+ * - save_skill → local pending buffers (flushed via exec_complete)
+ * - the memory tools → the API, during the turn (clients/memory.ts)
  *
- * Feature-flag contract: the API tells Brain per request whether memory is
- * active (`memory_enabled`) and whether skill self-evolution is
- * (`skill_evolution_enabled`). When one is not, its tools are not offered and a
- * call is refused, so the agent is never told "saved" for a write the API will
- * drop.
+ * Feature-flag contract: the API tells Brain per request whether this
+ * conversation has memory (`memory_enabled`) and whether skill self-evolution
+ * is on (`skill_evolution_enabled`). When one is not, its tools are not offered
+ * and a call is refused, so the agent is never told "saved" for a write the API
+ * will drop.
  */
 export class ToolRouter {
-  readonly pendingMemories: PendingMemory[] = [];
   readonly pendingSkills: PendingSkill[] = [];
   readonly pendingSkillFileMutations: PendingSkillFileMutation[] = [];
   /**
@@ -181,8 +182,10 @@ export class ToolRouter {
    *  in-flight sub-agents transparently switch over to the new sandbox. */
   private readonly children: Set<ToolRouter> = new Set();
 
-  /** False when the API said memory is off for this user; save_memory is then withheld. */
-  memoryEnabled = true;
+  /** True only when the API said this conversation has memory; the memory tools are withheld otherwise. */
+  memoryEnabled = false;
+  /** The turn the memory tools act in, which the API checks is a live chat turn. Set by the engine. */
+  memoryTurn: { sessionId?: string; messageId?: string } = {};
 
   /**
    * True only when the API said skill self-evolution is on. Off, the API drops
@@ -423,27 +426,18 @@ export class ToolRouter {
       return out.text;
     }
 
-    // save_memory / save_skill → validate immediately, buffer, flush via exec_complete.
-    // Synchronous scan ensures Agent gets accurate feedback (not optimistic "saved").
-    if (name === "save_memory") {
+    if (MEMORY_TOOLS.has(name)) {
       if (!this.memoryEnabled) {
-        return refuse(outcome, "Error: memory is turned off for this user; nothing was saved.");
+        return refuse(outcome, "Error: long-term memory is not available in this conversation; nothing was done.");
       }
-      const content = input.content as string || "";
-      const blocked = scanContent(content, 2000);
-      if (blocked) {
-        return refuse(outcome, `Error: memory not saved — blocked by safety check (${blocked}).`);
-      }
-      this.pendingMemories.push({
-        category: input.category as string,
-        content,
-        importance: (input.importance as number) ?? 0.7,
-      });
-      return "Memory saved. It will be available in future sessions.";
+      const out = await callMemoryTool(name, this.memoryTurn, input, signal);
+      return out.ok ? out.text : refuse(outcome, out.text);
     }
     if (SKILL_WRITE_TOOLS.has(name) && !this.skillEvolutionEnabled) {
       return refuse(outcome, "Error: saving skills is turned off in this deployment; nothing was saved.");
     }
+    // save_skill → validate immediately, buffer, flush via exec_complete.
+    // Synchronous scan ensures Agent gets accurate feedback (not optimistic "saved").
     if (name === "save_skill") {
       const content = input.content as string || "";
       const skillName = input.skill_name as string || "";
@@ -533,6 +527,7 @@ export class ToolRouter {
         // here left every read, wait and kill answerable only by matching the
         // prose a later reword would change.
         outcome.structured = answered.structured as Record<string, unknown> | undefined;
+        outcome.images = answered.images;
       }
       const result = answered.text;
       if (name === "bash" && typeof input.command === "string") {
@@ -571,20 +566,14 @@ export class ToolRouter {
    */
   getToolSchemas(): ToolSchema[] {
     const out = this.allToolSchemas().filter((t) =>
-      (this.memoryEnabled || t.name !== "save_memory")
+      (this.memoryEnabled || !MEMORY_TOOLS.has(t.name))
       && (this.skillEvolutionEnabled || !SKILL_WRITE_TOOLS.has(t.name)));
     return this.skillStore ? [...out, loadSkillSchema()] : out;
   }
 
   private allToolSchemas(): ToolSchema[] {
     return [
-      { name: "save_memory", description: "Save a durable fact to long-term memory for future sessions. Use when: (1) user explicitly asks to remember something, (2) you discover an important environment/project fact, (3) user corrects you and the correction is generally applicable. Do NOT save task progress or session-specific details. Write content in the same language the user uses.", input_schema: {
-        type: "object", properties: {
-          category: { type: "string", enum: ["preference", "correction", "env_fact", "tool_quirk", "pattern"], description: "Memory category" },
-          content: { type: "string", description: "One concise sentence describing the fact, in the user's language" },
-          importance: { type: "number", minimum: 0, maximum: 1, description: "Importance score 0-1 (default 0.7)" },
-        }, required: ["category", "content"],
-      }},
+      ...MEMORY_TOOL_SCHEMAS,
       { name: "save_skill", description: "Save the current approach as a reusable skill (the main SKILL.md). Use when: (1) user explicitly asks to save a workflow, (2) you completed a complex multi-step task with reusable value. To attach supporting scripts/templates/docs to this skill, follow up with add_skill_file. Write content and description in the user's language.", input_schema: {
         type: "object", properties: {
           skill_name: { type: "string", description: "Short kebab-case English slug, e.g. 'react-scaffold' (name is always English for consistency, content/description follow user language)" },

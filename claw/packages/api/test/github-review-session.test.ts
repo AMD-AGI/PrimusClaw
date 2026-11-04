@@ -153,6 +153,24 @@ test("V8 config.review_target binds the session to one pull request: it is recor
   assert.equal(published.length, 0);
 });
 
+test("V8b config.review_only is recorded as sent; only a boolean is accepted, and true needs acting_as", async () => {
+  const r = await create(ALICE, { acting_as: "u-bob", review_only: true });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.deepEqual((await stored(r.body.data.session_id)).config, { acting_as: "u-bob", acting_as_requester: "Alice A", review_only: true });
+  for (const review_only of ["true", 1, 0, {}, []]) {
+    const refused = await create(ALICE, { acting_as: "u-bob", review_only }, { message: { content: "review it" } });
+    assert.equal(refused.status, 400, JSON.stringify(review_only));
+    assert.equal(refused.body.error, "config.review_only must be true or false");
+  }
+  const alone = await create(ALICE, { review_only: true }, { message: { content: "review it" } });
+  assert.deepEqual([alone.status, alone.body.error], [400, "config.review_only needs config.acting_as"]);
+  for (const config of [{ review_only: false }, { acting_as: "u-bob", review_only: null }]) {
+    assert.equal((await create(ALICE, config)).status, 200, `${JSON.stringify(config)}: false and null ask for nothing`);
+  }
+  assert.equal(await count(), 3, "only the three that were accepted left a session");
+  assert.equal(published.length, 0);
+});
+
 test("V9 asking for a bound session needs the same credentials as any session that acts as a user", async () => {
   for (const method of ["api_key", "x_api_key", "cookie", null]) {
     const r = await create(ALICE, { acting_as: "u-bob", review_target: { owner: "AMD-AGI", repo: "demo", number: 7 } }, {}, method);
@@ -304,54 +322,48 @@ test("T8 the mark does not depend on the tools being offered: a session that act
   }
 });
 
-test("M1 a session that acts as a user and names no model runs on the review model, with no effort unless one is set; one that names a model keeps it; an ordinary chat session has neither", async () => {
-  const cases: Array<[string, Record<string, unknown>, Record<string, unknown>, string | null, string | undefined]> = [
-    ["acting, no model", { acting_as: "u-bob" }, {}, "claude-opus-5.5", undefined],
-    ["acting, model null", { acting_as: "u-bob" }, { model: null }, "claude-opus-5.5", undefined],
-    ["acting, own model", { acting_as: "u-bob" }, { model: "claude-sonnet-5.5" }, "claude-sonnet-5.5", undefined],
-    ["ordinary", { notify_on_finish: true }, {}, null, undefined],
-  ];
-  for (const [what, config, extra, model, effort] of cases) {
-    published = [];
-    const r = await create(ALICE, config, { ...extra, message: { content: "review it" } });
-    assert.equal(r.status, 200, `${what}: ${JSON.stringify(r.body)}`);
-    const [row] = await h.sql("SELECT model FROM claw_sessions WHERE session_id = $1", [r.body.data.session_id]);
-    assert.equal(row?.model ?? null, model, `${what}: the stored model`);
-    assert.equal(published[0]?.model, model ?? undefined, `${what}: the turn's model`);
-    assert.equal(published[0]?.effort, effort, `${what}: the turn's effort`);
-    assert.equal(published[0]?.rolling_cache_ttl, config.acting_as ? "5m" : undefined, `${what}: rolling cache markers live 5 minutes only on a review`);
-    assert.equal(published[0]?.sub_agent_max_turns, config.acting_as ? 20 : undefined, `${what}: only a review's second pass is bounded`);
-  }
-});
-
-test("M2 the operator chooses both: another model and an effort for every turn of a review (an ordinary session gets neither), or the deployment's model with `default` and no effort", async () => {
+test("M1 a session that acts as a user runs on the model and effort its creator chose, or on the deployment's default with no effort, like any other session; an operator's old review settings are ignored", async () => {
   const saved = { m: process.env.CLAW_GITHUB_REVIEW_MODEL, e: process.env.CLAW_GITHUB_REVIEW_EFFORT };
-  const restore = () => {
+  // Left over from a deployment that still sets them: they are not read any more.
+  process.env.CLAW_GITHUB_REVIEW_MODEL = "glm-5-3";
+  process.env.CLAW_GITHUB_REVIEW_EFFORT = "high";
+  try {
+    // [what, config, other create fields, the stored and sent model, the stored and sent effort]
+    const cases: Array<[string, Record<string, unknown>, Record<string, unknown>, string | null, string | null]> = [
+      ["acting, no model", { acting_as: "u-bob" }, {}, null, null],
+      ["acting, model and effort null", { acting_as: "u-bob" }, { model: null, effort: null }, null, null],
+      ["acting, own model", { acting_as: "u-bob" }, { model: "claude-sonnet-5.5" }, "claude-sonnet-5.5", null],
+      ["acting, own model and effort", { acting_as: "u-bob" }, { model: "claude-opus-5.5", effort: "high" }, "claude-opus-5.5", "high"],
+      ["acting, effort only", { acting_as: "u-bob" }, { effort: "low" }, null, "low"],
+      ["ordinary", { notify_on_finish: true }, {}, null, null],
+      ["ordinary, own effort", { notify_on_finish: true }, { effort: "medium" }, null, "medium"],
+    ];
+    for (const [what, config, extra, model, effort] of cases) {
+      published = [];
+      const r = await create(ALICE, config, { ...extra, message: { content: "review it" } });
+      assert.equal(r.status, 200, `${what}: ${JSON.stringify(r.body)}`);
+      assert.deepEqual([r.body.data.model ?? null, r.body.data.effort ?? null], [model, effort], `${what}: the answer`);
+      const [row] = await h.sql("SELECT model, effort FROM claw_sessions WHERE session_id = $1", [r.body.data.session_id]);
+      assert.deepEqual([row?.model ?? null, row?.effort ?? null], [model, effort], `${what}: the stored model and effort`);
+      assert.equal(published[0]?.model, model ?? undefined, `${what}: the turn's model`);
+      assert.equal(published[0]?.effort, effort ?? undefined, `${what}: the turn's effort`);
+      assert.equal("effort" in (published[0] ?? {}), effort !== null, `${what}: no field at all for the model's default`);
+      assert.equal(published[0]?.rolling_cache_ttl, config.acting_as ? "5m" : undefined, `${what}: rolling cache markers live 5 minutes only on a review`);
+      assert.equal(published[0]?.sub_agent_max_turns, config.acting_as ? 20 : undefined, `${what}: only a review's second pass is bounded`);
+    }
+  } finally {
     for (const [k, v] of [["CLAW_GITHUB_REVIEW_MODEL", saved.m], ["CLAW_GITHUB_REVIEW_EFFORT", saved.e]] as const) {
       if (v === undefined) delete process.env[k]; else process.env[k] = v;
     }
-  };
-  try {
-    for (const [m, e, model, effort] of [["glm-5-3", "high", "glm-5-3", "high"], ["default", "", null, undefined]] as const) {
-      process.env.CLAW_GITHUB_REVIEW_MODEL = m;
-      process.env.CLAW_GITHUB_REVIEW_EFFORT = e;
-      published = [];
-      const r = await create(ALICE, { acting_as: "u-bob" }, { message: { content: "review it" } });
-      assert.equal(r.status, 200);
-      const [row] = await h.sql("SELECT model FROM claw_sessions WHERE session_id = $1", [r.body.data.session_id]);
-      assert.equal(row?.model ?? null, model, m);
-      assert.equal(published[0]?.effort, effort, e);
-      assert.equal("effort" in (published[0] ?? {}), effort !== undefined, `${e}: no field at all for the model's default`);
-      published = [];
-      const plain = await create(ALICE, { notify_on_finish: true }, { message: { content: "hello" } });
-      assert.equal(plain.status, 200);
-      assert.deepEqual([published[0]?.model, "effort" in (published[0] ?? {})], [undefined, false], `${m}/${e}: an ordinary chat session is untouched`);
-      published = [];
-      const own = await create(ALICE, { acting_as: "u-bob" }, { model: "gpt-4o", message: { content: "review it" } });
-      assert.equal(own.status, 200);
-      assert.deepEqual([published[0]?.model, "effort" in (published[0] ?? {})], ["gpt-4o", false], `${m}/${e}: a model the creator named is not sent the review effort, which it may refuse`);
-    }
-  } finally {
-    restore();
+  }
+});
+
+test("M2 effort is checked like model: a value outside low, medium and high is refused before any row exists", async () => {
+  for (const effort of ["max", "High", "", 3, true, {}]) {
+    const before = await h.sql("SELECT count(*)::int AS n FROM claw_sessions");
+    const r = await create(ALICE, { acting_as: "u-bob" }, { effort, message: { content: "review it" } });
+    assert.equal(r.status, 400, JSON.stringify(effort));
+    assert.match(String(r.body.error), /^effort must be one of low, medium, high or null$/);
+    assert.deepEqual(await h.sql("SELECT count(*)::int AS n FROM claw_sessions"), before, `${JSON.stringify(effort)}: nothing left behind`);
   }
 });

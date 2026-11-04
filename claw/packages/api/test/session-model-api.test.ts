@@ -17,6 +17,7 @@
  *   P2 PATCH keeps its old contract: a rename alone, and a blank name still refused
  *   P3 only the owner may change it, and a missing session is a 404
  *   P4 a change is the next turn's model, not the running one's
+ *   E1 `effort` the same way: create and PATCH accept low, medium, high and null, refuse anything else, and a turn carries it
  */
 import test, { after, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -255,7 +256,7 @@ test("P1 PATCH sets, replaces and clears the model, with or without a rename", a
     const nameNow = async () => (await h.sql("SELECT name FROM claw_sessions WHERE session_id = 's1'"))[0].name;
 
     assert.deepEqual(await patch({ model: "claude-sonnet-5.5" }), {
-      session_id: "s1", name: "keep", model: "claude-sonnet-5.5",
+      session_id: "s1", name: "keep", model: "claude-sonnet-5.5", effort: null,
     });
     assert.equal(await nameNow(), "keep", "a model alone does not touch the name");
 
@@ -263,7 +264,7 @@ test("P1 PATCH sets, replaces and clears the model, with or without a rename", a
     assert.equal(await storedModel("s1"), "glm-5-3-with-fallback");
 
     const both = await patch({ name: "renamed", model: "claude-haiku-5.5" });
-    assert.deepEqual(both, { session_id: "s1", name: "renamed", model: "claude-haiku-5.5" });
+    assert.deepEqual(both, { session_id: "s1", name: "renamed", model: "claude-haiku-5.5", effort: null });
 
     assert.equal((await patch({ model: null })).model, null, "null clears it back to the default");
     assert.equal(await storedModel("s1"), null);
@@ -351,6 +352,60 @@ test("P4 a change takes effect from the next turn: the one running keeps what it
     const third = await app.inject({ method: "POST", url: `/v1/sessions/${sid}/messages`, payload: { content: "three" } });
     assert.equal(third.statusCode, 200, third.body);
     assert.equal("model" in published[2], false, "cleared: the next turn carries none and Brain uses its default");
+  } finally {
+    await app.close();
+  }
+});
+
+test("E1 effort is the session's own like the model: create and PATCH store it, a turn carries it, null clears it, and anything else is refused", async () => {
+  const app = await appAs(OWNER);
+  const storedEffort = async (sid: string) => (await h.sql("SELECT effort FROM claw_sessions WHERE session_id = $1", [sid]))[0].effort;
+  try {
+    for (const bad of ["max", "HIGH", " low", "", 1, true, ["low"], { effort: "low" }]) {
+      const res = await app.inject({ method: "POST", url: "/v1/sessions", payload: { name: "s", effort: bad, message: { content: "hello" } } });
+      assert.equal(res.statusCode, 400, `${JSON.stringify(bad)}: ${res.body}`);
+      assert.equal((res.json() as { error: string }).error, "effort must be one of low, medium, high or null");
+    }
+    assert.equal(await sessionCount(), 0, "no refusal left a session");
+    assert.equal(published.length, 0);
+
+    const created = (await app.inject({
+      method: "POST", url: "/v1/sessions", payload: { name: "s", effort: "high", message: { content: "one" } },
+    })).json() as { data: { session_id: string; effort: unknown } };
+    const sid = created.data.session_id;
+    assert.equal(created.data.effort, "high");
+    assert.equal(await storedEffort(sid), "high");
+    assert.equal(published[0].effort, "high", "the first turn asks for it");
+    assert.equal("model" in published[0], false, "an effort alone chooses no model");
+
+    for (const bad of ["max", 2]) {
+      const res = await app.inject({ method: "PATCH", url: `/v1/sessions/${sid}`, payload: { name: "renamed", effort: bad } });
+      assert.equal(res.statusCode, 400, res.body);
+    }
+    assert.equal(await storedEffort(sid), "high", "a refused effort changes nothing");
+
+    const lowered = await app.inject({ method: "PATCH", url: `/v1/sessions/${sid}`, payload: { effort: "low" } });
+    assert.equal(lowered.statusCode, 200, lowered.body);
+    assert.deepEqual((lowered.json() as { data: unknown }).data, { session_id: sid, name: "s", model: null, effort: "low" });
+    await h.sql("UPDATE claw_sessions SET agent_status = 'idle', agent_gate_message_id = NULL WHERE session_id = $1", [sid]);
+    assert.equal((await app.inject({ method: "POST", url: `/v1/sessions/${sid}/messages`, payload: { content: "two" } })).statusCode, 200);
+    assert.equal(published[1].effort, "low", "the next turn runs at the new effort");
+
+    const cleared = await app.inject({ method: "PATCH", url: `/v1/sessions/${sid}`, payload: { effort: null } });
+    assert.equal(cleared.statusCode, 200, cleared.body);
+    assert.equal(await storedEffort(sid), null);
+    await h.sql("UPDATE claw_sessions SET agent_status = 'idle', agent_gate_message_id = NULL WHERE session_id = $1", [sid]);
+    assert.equal((await app.inject({ method: "POST", url: `/v1/sessions/${sid}/messages`, payload: { content: "three" } })).statusCode, 200);
+    assert.equal("effort" in published[2], false, "cleared: no field, the model's own default");
+
+    const stranger = await appAs(OTHER);
+    try {
+      const denied = await stranger.inject({ method: "PATCH", url: `/v1/sessions/${sid}`, payload: { effort: "high" } });
+      assert.equal(denied.statusCode, 403, denied.body);
+      assert.equal(await storedEffort(sid), null, "another user's choice did not land");
+    } finally {
+      await stranger.close();
+    }
   } finally {
     await app.close();
   }

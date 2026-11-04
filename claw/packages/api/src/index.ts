@@ -8,7 +8,7 @@ import multipart from "@fastify/multipart";
 import {
   API_PORT, APP_ENV, SAFE_API_URL, DATABASE_URL, resolveCorsOrigin,
   AUTH_INTERNAL_TOKEN, NATS_URL,
-  CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_MEMORY_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGER_TOOLS_TOKEN_KEY, CLAW_SKILL_EVOLUTION_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
+  CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGER_TOOLS_TOKEN_KEY, CLAW_SKILL_EVOLUTION_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
   runLeaseTiming, envSettingProblems, assertAdmissionSettings,
 } from "./config.js";
 import { runLeaseTimingProblems } from "@claw/protocol";
@@ -56,6 +56,7 @@ import { registerInternalTaskRoutes } from "./routes/internal-tasks.js";
 import { registerInternalRunRoutes } from "./routes/internal-runs.js";
 import { registerInternalAppRoutes } from "./routes/internal-apps.js";
 import { registerInternalWorkspaceRoutes } from "./routes/internal-workspaces.js";
+import { registerInternalMemoryRoutes } from "./routes/internal-memory.js";
 import { registerTaskDagRoutes } from "./routes/task-dags.js";
 import { registerTaskRoutes } from "./routes/tasks.js";
 import { registerRunRoutes } from "./runs/routes.js";
@@ -69,7 +70,6 @@ import { startEventConsumer } from "./events/consumer.js";
 import { startEvolveWorker } from "./marketplace/evolve-worker.js";
 import { startUploadSweeper } from "./sessions/upload-sweeper.js";
 import { archiveIdleSessions } from "./sessions/archive.js";
-import { decayMemory } from "./memory/service.js";
 import { cleanupOrphanSkillFiles, cleanupOldPatterns } from "./marketplace/skill-service.js";
 import { registry as metricsRegistry } from "./infra/metrics.js";
 import { assertRolloutConfigAtStartup } from "./startup/rollout-config.js";
@@ -340,6 +340,7 @@ async function main() {
   await registerInternalRunRoutes(app);
   await registerInternalAppRoutes(app);
   await registerInternalWorkspaceRoutes(app);
+  await registerInternalMemoryRoutes(app);
   await registerTaskDagRoutes(app);
   await registerTaskRoutes(app);
   await registerRunRoutes(app);
@@ -384,20 +385,17 @@ async function main() {
   if (a2aPushEnabled()) startA2aPushWorker();
 
   // Daily maintenance crons (every 24h, first run 1 min after startup).
-  // Memory decay gated by CLAW_MEMORY_ENABLED, skill cleanups gated by
-  // CLAW_SKILL_EVOLUTION_ENABLED — when OFF, old data is fully frozen so
-  // toggling the flag back ON restores prior state without value loss.
+  // Skill cleanups gated by CLAW_SKILL_EVOLUTION_ENABLED — when OFF, old data
+  // is fully frozen so toggling the flag back ON restores prior state without
+  // value loss. Memory has none: nothing about it changes on a timer.
   const runMaintenance = () => {
-    if (CLAW_MEMORY_ENABLED) {
-      decayMemory().catch(err => logger.error({ err }, "memory.decay_failed"));
-    }
     archiveIdleSessions(SESSION_AUTO_ARCHIVE_DAYS).catch(err => logger.error({ err }, "session_archive.failed"));
     if (CLAW_SKILL_EVOLUTION_ENABLED) {
       cleanupOrphanSkillFiles().catch(err => logger.error({ err }, "skill_files.cleanup_failed"));
       cleanupOldPatterns().catch(err => logger.error({ err }, "skill_patterns.cleanup_failed"));
     }
   };
-  if (CLAW_MEMORY_ENABLED || CLAW_SKILL_EVOLUTION_ENABLED || SESSION_AUTO_ARCHIVE_DAYS > 0) {
+  if (CLAW_SKILL_EVOLUTION_ENABLED || SESSION_AUTO_ARCHIVE_DAYS > 0) {
     setTimeout(() => {
       runMaintenance();
       setInterval(runMaintenance, 24 * 60 * 60 * 1000);

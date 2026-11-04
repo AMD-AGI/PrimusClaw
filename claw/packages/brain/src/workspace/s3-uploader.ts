@@ -1039,6 +1039,58 @@ export async function syncWorkspaceFromS3(
   return downloaded;
 }
 
+/**
+ * Put the user's uploads into a sandbox that was not restored from S3.
+ *
+ * A file uploaded while the session's sandbox is up reaches S3 only, and the
+ * restore above runs only into a new sandbox, so a turn that reuses the sandbox
+ * would be told about a file /workspace/.uploads/ does not have. Every object
+ * under `.uploads/` is offered with its size, and Hands fetches only the ones it
+ * does not already hold at that size, so a sandbox that has them all costs one
+ * listing. Returns how many objects were offered; failures are logged, not
+ * thrown: a missing upload is the agent's to report, not a reason to fail a turn.
+ */
+export async function syncUploadsFromS3(
+  hands: HandsClient,
+  sessionId: string,
+  userId: string,
+): Promise<number> {
+  const s3Prefix = `users/${userId}/sessions/${sessionId}/`;
+  const s3 = getS3Client();
+  const files: Array<{ local_path: string; presigned_url: string; size: number }> = [];
+  let continuationToken: string | undefined;
+  do {
+    const resp = await s3.send(new ListObjectsV2Command({
+      Bucket: S3_BUCKET, Prefix: `${s3Prefix}.uploads/`, ContinuationToken: continuationToken,
+    }));
+    for (const obj of resp.Contents || []) {
+      if (!obj.Key) continue;
+      files.push({
+        local_path: `/workspace/${obj.Key.slice(s3Prefix.length)}`,
+        presigned_url: await presignGet(obj.Key),
+        size: obj.Size ?? 0,
+      });
+    }
+    continuationToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
+  } while (continuationToken);
+  if (!files.length) return 0;
+  const raw = await hands.callTool("download_from_s3", { files });
+  let failed: DownloadBatchResult["failed"] | null = null;
+  try {
+    const parsed = JSON.parse(raw) as DownloadBatchResult;
+    if (Array.isArray(parsed.failed)) failed = parsed.failed;
+  } catch { /* reported below */ }
+  if (failed === null) {
+    logger.warn({ sessionId, offered: files.length }, "s3.uploads_sync.unparseable");
+  } else if (failed.length) {
+    logger.warn({ sessionId, offered: files.length, failed: failed.length, sample: failed.slice(0, 3) },
+      "s3.uploads_sync.failed");
+  } else {
+    logger.info({ sessionId, offered: files.length }, "s3.uploads_synced");
+  }
+  return files.length;
+}
+
 // ===== Recovery: copy a checkpoint prefix back to the session prefix =====
 
 /**

@@ -36,6 +36,7 @@
 import { parseSessionRepo, sessionRepoDirName, type SessionRepo } from "@claw/protocol";
 import { redactSecrets } from "@claw/utils";
 import pino from "pino";
+import { setTimeout as sleep } from "node:timers/promises";
 import { parseRepoSkills, repoSkillsCommand, type RepoSkill } from "./repo-skills.js";
 
 const logger = pino({ name: "repo-binding" });
@@ -58,6 +59,11 @@ const CLONE_TIMEOUT_SEC = 100;
 const CLONE_BACKGROUND_MAX_SEC = 900;
 /** How long stopping a background clone may take; its own budget, since the turn's signal may be the reason it is stopped. */
 const KILL_SHELL_TIMEOUT_MS = 10_000;
+/**
+ * The pause before asking again when Hands answered a wait without waiting: a shell
+ * it lost on a restart may still be running, but no wait on it blocks.
+ */
+export const BACKGROUND_REPOLL_MS = 2_000;
 const GIT_TIMEOUT_SEC = 60;
 const REASON_MAX_CHARS = 300;
 
@@ -173,11 +179,12 @@ async function shLong(
       const w = await hands.callToolFull("wait", { shell_id: shellId, timeout_sec: CLONE_TIMEOUT_SEC }, signal);
       out += `${w.text}\n`;
       if (w.isError) return { ok: false, out };
-      const s = w.structured as { finished?: unknown; exit_code?: unknown } | undefined;
+      const s = w.structured as { finished?: unknown; exit_code?: unknown; blocking?: unknown } | undefined;
       if (s?.finished === true) { finished = true; return { ok: s.exit_code === 0, out }; }
       if (Date.now() >= deadline) {
         return { ok: false, out: `stderr: did not finish within ${CLONE_BACKGROUND_MAX_SEC}s and was stopped` };
       }
+      if (s?.blocking === false) await sleep(Math.min(BACKGROUND_REPOLL_MS, Math.max(0, deadline - Date.now())), undefined, { signal });
     }
   } catch (err) {
     return { ok: false, out: `stderr: could not run the command in the sandbox: ${(err as Error)?.message ?? err}` };

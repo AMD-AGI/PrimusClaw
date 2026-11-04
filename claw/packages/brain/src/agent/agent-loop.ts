@@ -27,7 +27,12 @@ import {
 import type { Message, ReasoningEffort, ToolSchema, TokenUsage, EventCallback } from "@claw/protocol";
 import type { RunIdentity } from "../tasks/run-identity.js";
 import { safePreview } from "@claw/utils";
-import { HandsClient, isHandsNetworkError, isHandsToolTimeout, explainHandsError, handsNetworkErrorReason } from "../clients/hands.js";
+import {
+  HandsClient, isHandsNetworkError, isHandsToolTimeout, explainHandsError, handsNetworkErrorReason, type ToolImage,
+} from "../clients/hands.js";
+import {
+  boundHistoryImages, IMAGE_REFUSED_TEXT, looksLikeImageRejection, toolResultContent, toolResultText,
+} from "../llm/tool-images.js";
 import { isSandboxTool } from "../tools/hands.js";
 import { LOAD_SKILL_TOOL, LOAD_SKILL_RESULT_MAX_CHARS } from "./skill-store.js";
 import { toolNotAllowedMessage, type ToolAllowlist } from "../tools/allowlist.js";
@@ -155,6 +160,17 @@ const EMPTY_TURN_NUDGE = `${RESUME_NOTICE_PREFIX} Your last reply was empty: no 
   + "report of what you did and the result.";
 
 /**
+ * What a sub-agent is told when it has used every turn it was given.
+ *
+ * Its caller reads only its final text, and a sub-agent cut off mid-investigation
+ * has none: it returned nothing for all the work it did. One more reply is asked
+ * for, with nothing run from it but its text.
+ */
+const TURN_CAP_NOTICE = `${RESUME_NOTICE_PREFIX} You have used every turn you were given, and no further tool call `
+  + "will be run. Reply now, in text only, with your findings so far: what you checked, what you found, "
+  + "and what you could not get to.";
+
+/**
  * A top-level run whose model went silent twice running and never said anything.
  *
  * Not retryable on purpose: the message avoids every phrase isRetryable reads,
@@ -277,6 +293,12 @@ export interface LoopOptions {
   rollingCacheTtl?: "5m";
   /** `ExecuteRequest.sub_agent_max_turns`: the most turns a sub-agent of this loop may take. */
   subAgentMaxTurns?: number;
+  /**
+   * `ExecuteRequest.withhold_sandbox_keys`: a session that acts as a user, which is a pull request review. Its second pass is a `task`
+   * whose prompt names the files the review read, so a change to two skill files would trip the skill-read guard
+   * (`BRAIN_BLOCK_SKILL_SUBAGENTS`) and the review could never approve: the guard does not apply to such a loop.
+   */
+  actingReview?: boolean;
   router: ToolRouter;
   onEvent: EventCallback;
   signal?: AbortSignal;
@@ -662,7 +684,7 @@ async function compactConversation(
         if (bb.type === "text") return String(bb.text ?? "");
         if (bb.type === "thinking") return `[thinking: ${String(bb.thinking ?? "").slice(0, 500)}]`;
         if (bb.type === "tool_use") return `[tool_use ${bb.name}(${JSON.stringify(bb.input).slice(0, 800)})]`;
-        if (bb.type === "tool_result") return `[tool_result ${String(bb.content ?? "").slice(0, 1500)}]`;
+        if (bb.type === "tool_result") return `[tool_result ${toolResultText(bb.content).slice(0, 1500)}]`;
         return `[${bb.type}]`;
       }).join("\n");
     }
@@ -755,6 +777,8 @@ class AgentLoopRunner {
   private usage: TokenUsage;
   private errorCount: number;
   private toolCallsByName: Record<string, number>;
+  /** Images this turn's tools answered with, by tool_use id, until the results are assembled. */
+  private readonly imagesByToolId = new Map<string, ToolImage[]>();
   /**
    * Calls of each tool that reached the sandbox and came back without an error.
    *
@@ -1009,16 +1033,15 @@ class AgentLoopRunner {
       toolCount: this.effectiveTools.length,
     }, "agent-loop.start");
 
-    for (
-      let turn = this.initialTurn;
-      this.maxTurns <= 0 || turn < this.maxTurns + this.initialTurn;
-      turn++
-    ) {
+    let ended = false;
+    let turn = this.initialTurn;
+    for (; this.maxTurns <= 0 || turn < this.maxTurns + this.initialTurn; turn++) {
       this.turnsExecuted = turn + 1 - this.initialTurn;
       if (this.signal?.aborted) break;
-      const shouldBreak = await this.runTurn(turn);
-      if (shouldBreak) break;
+      ended = await this.runTurn(turn);
+      if (ended) break;
     }
+    if (!ended && this.depth > 0 && !this.signal?.aborted) await this.reportAtTurnCap(turn);
 
     logger.info({
       sessionId: this.sessionId,
@@ -1040,6 +1063,28 @@ class AgentLoopRunner {
       },
       elapsedMs: Date.now() - this.startTime,
     };
+  }
+
+  /** A sub-agent's one text-only reply after its last allowed turn ended without an answer (see TURN_CAP_NOTICE). */
+  private async reportAtTurnCap(turn: number): Promise<void> {
+    this.workingMessages.push({ role: "user", content: TURN_CAP_NOTICE });
+    const { content, usage } = await this.streamTurnWithRetry(turn, Date.now());
+    this.usage.input_tokens += usage.input_tokens;
+    this.usage.output_tokens += usage.output_tokens;
+    this.usage.cache_read += usage.cache_read;
+    this.usage.cache_create += usage.cache_create;
+    this.usage.turns++;
+    const text = content
+      .filter((b: any) => b.type === "text" && typeof b.text === "string")
+      .map((b: any) => b.text as string)
+      .join("\n")
+      .trim();
+    const ignoredToolCalls = content.filter((b: any) => b.type === "tool_use").length;
+    logger.info({ turn, sessionId: this.sessionId, depth: this.depth, textLen: text.length, ignoredToolCalls }, "agent-loop.turn_cap_report");
+    if (!text) return;
+    this.textParts.push(text);
+    this.workingMessages.push({ role: "assistant", content: [{ type: "text", text }] });
+    await this.onEvent({ type: "AssistantMessage", data: { content: [{ type: "text", text }] } });
   }
 
   private buildEffectiveTools(): ToolSchema[] {
@@ -1724,8 +1769,16 @@ class AgentLoopRunner {
       const savedAt = spillsWhenCut(raw, tc.name as string)
         ? await this.router.spillToolResult(tc.id as string, raw) ?? undefined
         : undefined;
-      return { type: "tool_result", tool_use_id: tc.id as string, content: truncateToolResult(raw, tc.name as string, savedAt) };
+      return {
+        type: "tool_result",
+        tool_use_id: tc.id as string,
+        content: toolResultContent(
+          truncateToolResult(raw, tc.name as string, savedAt),
+          this.imagesByToolId.get(tc.id as string),
+        ),
+      };
     }));
+    this.imagesByToolId.clear();
 
     await this.maybeRecoverSandbox(results);
 
@@ -1734,6 +1787,7 @@ class AgentLoopRunner {
       content: truncateToolUseInputs(content) as any,
     });
     this.workingMessages.push({ role: "user", content: results as any });
+    boundHistoryImages(this.workingMessages);
 
     // Auto-compaction: when this turn's prompt crossed the trigger, compress
     // older messages to a summary so the next turn fits in the model context
@@ -1889,6 +1943,7 @@ class AgentLoopRunner {
     // call: a second refusal after repairing is not something more repairing
     // can fix.
     let sanitizedRetryUsed = false;
+    let imagesDropped = false;
     for (let attempt = 0; ; attempt++) {
       try {
         // Filter accumulated [system-notice]: messages before each
@@ -1917,6 +1972,16 @@ class AgentLoopRunner {
             this.workingMessages.length = 0;
             this.workingMessages.push(...repaired.messages);
             // The refusal was ours to fix, not a transient: it spends no retry.
+            attempt--;
+            continue;
+          }
+        }
+        if (!imagesDropped && !this.signal?.aborted && looksLikeImageRejection(err)) {
+          imagesDropped = true;
+          // In place, like the repair above, so the checkpoint does not carry the image on.
+          const dropped = boundHistoryImages(this.workingMessages, 0, IMAGE_REFUSED_TEXT);
+          logger.warn({ err: errMsg.slice(0, 300), turn, sessionId: this.sessionId, dropped }, "agent-loop.image_rejected");
+          if (dropped > 0) {
             attempt--;
             continue;
           }
@@ -2173,7 +2238,7 @@ class AgentLoopRunner {
       // executing split exists to measure.
       // Filled by the router from the tool's own result, so what counts as
       // success is the tool's answer rather than the shape of its wording.
-      const outcome = { isError: false };
+      const outcome: { isError: boolean; images?: ToolImage[] } = { isError: false };
       // The model-issued tool-use identifier. Sealed onto the reference row
       // before the dispatch, so a resumed run recognises its own retry of this
       // exact call rather than one that merely produced the same command.
@@ -2189,6 +2254,7 @@ class AgentLoopRunner {
             this.router.route(toolName, finalInput, this.signal, outcome, stepCtx))
         : await this.router.route(toolName, finalInput, this.signal, outcome, stepCtx);
       toolOutcome = outcome;
+      if (outcome.images?.length) this.imagesByToolId.set(toolId, outcome.images);
         // A sandbox tool that answered is the only evidence the sandbox is up,
         // so it is the only thing that clears the count -- even if the result
         // text describes a business-level failure (exit != 0), which still came
@@ -2395,7 +2461,7 @@ class AgentLoopRunner {
       // wasted LLM turns each, (b) truncates the merged final_text forcing
       // re-dispatches. Validated regression: session 37dbaecd took 14 min
       // reading skill via 11 explore sub-agents vs ~2 min direct.
-      if (BRAIN_BLOCK_SKILL_SUBAGENTS) {
+      if (BRAIN_BLOCK_SKILL_SUBAGENTS && !this.opts.actingReview) {
         const promptText = String((toolInput.prompt as string) || "")
           + " " + String((toolInput.description as string) || "");
         const skillPathHits = (promptText.match(

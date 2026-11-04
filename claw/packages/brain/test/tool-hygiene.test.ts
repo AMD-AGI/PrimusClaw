@@ -34,7 +34,7 @@ const SKILL_CALLS: Array<[string, Record<string, unknown>]> = [
 test("H1 skill self-evolution off (the default): the skill tools are not offered", () => {
   const names = new ToolRouter(null).getToolSchemas().map((t) => t.name);
   for (const tool of SKILL_WRITE_TOOLS) assert.ok(!names.includes(tool), `${tool} is offered`);
-  assert.ok(names.includes("save_memory"), "the other tools are untouched");
+  assert.ok(names.includes("bash"), "the other tools are untouched");
 });
 
 test("H1 skill self-evolution off: a call that arrives anyway is refused and buffers nothing", async () => {
