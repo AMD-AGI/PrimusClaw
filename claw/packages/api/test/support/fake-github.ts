@@ -79,10 +79,24 @@ export class FakeGithub {
   /** Hold every request until released, for a test of concurrency. */
   gate: Promise<void> | null = null;
 
+  /**
+   * The review threads as GitHub keeps them, which a posted review with inline comments adds to (one per comment, begun in that review): what
+   * a review item reads back to record its findings (`reviewThreads ... pullRequestReview`), a thread looked up by id (`node(id:`), and one
+   * resolved (`resolveReviewThread`). Apart from `graphql.reviewThreads`, which is what the merge gates read.
+   */
+  threads: Array<{ id: string; isResolved: boolean; path: string; line: number; reviewId: number; author: string; pr: number; repo: string }> = [];
+  /** `old...new` -> what `GET /compare/old...new` answers; a pair not named here is 404 (the old head is gone, as after a force push). */
+  compares: Record<string, { status: string; files: FakeFile[] }> = {};
+  /** Make the read of a posted review's threads fail, for a test that the review is posted all the same. */
+  threadsReadFails = false;
+
+  /** The mutations that resolve a review thread, among the GraphQL calls. */
+  get resolves(): Call[] { return this.calls.filter((c) => c.path === "/graphql" && /resolveReviewThread/.test(String(c.body?.query ?? ""))); }
+
   /** The mutations that put a pull request in the merge queue, among the GraphQL calls. */
   get enqueues(): Call[] { return this.calls.filter((c) => c.path === "/graphql" && /enqueuePullRequest/.test(String(c.body?.query ?? ""))); }
   /** Every request that changes something: a review, a merge, or a pull request put in the merge queue (the other GraphQL calls only read). */
-  get writes(): Call[] { return this.calls.filter((c) => (c.method !== "GET" && c.path !== "/graphql") || this.enqueues.includes(c)); }
+  get writes(): Call[] { return this.calls.filter((c) => (c.method !== "GET" && c.path !== "/graphql") || this.enqueues.includes(c) || this.resolves.includes(c)); }
   count(pattern: RegExp, method?: string): number {
     return this.calls.filter((c) => pattern.test(c.path) && (!method || c.method === method)).length;
   }
@@ -110,6 +124,24 @@ export class FakeGithub {
       if (refusal) return json(200, { data: { enqueuePullRequest: null }, errors: [{ type: "UNPROCESSABLE", path: ["enqueuePullRequest"], message: refusal }] });
       if (this.enqueueEntry) Object.assign(this.graphql, { isInMergeQueue: true, mergeQueueEntry: this.enqueueEntry });
       return json(200, { data: { enqueuePullRequest: { mergeQueueEntry: this.enqueueEntry } } });
+    }
+    const query = String(call.body?.query ?? "");
+    if (p === "/graphql" && /resolveReviewThread/.test(query)) {
+      const t = this.threads.find((x) => x.id === call.body.variables?.id);
+      if (!t) return json(200, { data: { resolveReviewThread: null }, errors: [{ type: "NOT_FOUND", message: "Could not resolve to a node" }] });
+      t.isResolved = true;
+      return json(200, { data: { resolveReviewThread: { thread: { id: t.id, isResolved: true } } } });
+    }
+    if (p === "/graphql" && /node\(id:/.test(query)) {
+      const t = this.threads.find((x) => x.id === call.body.variables?.id);
+      return json(200, { data: { node: t ? {
+        id: t.id, isResolved: t.isResolved, pullRequest: { number: t.pr, repository: { nameWithOwner: t.repo } }, comments: { nodes: [{ author: { login: t.author } }] },
+      } : null } });
+    }
+    if (p === "/graphql" && /pullRequestReview\{databaseId\}/.test(query)) {
+      if (this.threadsReadFails) return json(502, { message: "Bad Gateway" });
+      const nodes = this.threads.map((t) => ({ id: t.id, isResolved: t.isResolved, path: t.path, line: t.line, comments: { nodes: [{ pullRequestReview: { databaseId: t.reviewId } }] } }));
+      return json(200, { data: { repository: { pullRequest: { reviewThreads: { nodes } } } } });
     }
     if (p === "/graphql") {
       // The repository as the REST answer above describes it, in GraphQL's names, and its pull request: the head is the REST one's.
@@ -141,12 +173,20 @@ export class FakeGithub {
       }
       const review = { id: 900 + this.reviews.length, state: call.body.event === "APPROVE" ? "APPROVED" : "COMMENTED", user: { login: "bob" }, commit_id: call.body.commit_id, body: call.body.body, html_url: "https://github.com/AMD-AGI/demo/pull/7#pullrequestreview-1", event: call.body.event };
       this.reviews.push(review);
+      for (const c of (call.body.comments ?? []) as Array<{ path: string; line: number }>) {
+        this.threads.push({ id: `PRRT_${this.threads.length + 1}`, isResolved: false, path: c.path, line: c.line, reviewId: review.id, author: "bob", pr: Number(this.pr.number), repo: String(this.repo.full_name) });
+      }
       this.onReview(review);
       return json(200, review);
     }
     if (/\/pulls\/\d+\/merge$/.test(p) && method === "PUT") {
       if (this.mergeStatus !== 200) return json(this.mergeStatus, { message: this.mergeStatus === 409 ? "Head branch was modified" : "Not mergeable" });
       return json(200, { sha: "m".repeat(40), merged: true, message: "Pull Request successfully merged" });
+    }
+    const compare = /\/compare\/([0-9a-f]{40}\.\.\.[0-9a-f]{40})$/.exec(p);
+    if (compare) {
+      const answer = this.compares[compare[1] as string];
+      return answer ? json(200, { status: answer.status, files: answer.files }) : json(404, { message: "Not Found" });
     }
     if (/\/git\/ref\/heads\/(.+)$/.test(p)) return json(200, { object: { sha: BASE_TIP } });
     const tree = /\/git\/trees\/([0-9a-f]{40})$/.exec(p);

@@ -21,9 +21,9 @@ import type { UserInfo } from "../auth/models.js";
 import { CLAW_ASSISTANT_MAX_ACTIVE_ITEMS, CLAW_ASSISTANT_REVIEW_ITEMS } from "../config.js";
 import { checkSessionCreate, type AttendedProof } from "../github-review/acting-session.js";
 import { isValidPrRef, type PrRef } from "../github-review/github.js";
-import type { ReviewActor, ToolOutcome } from "../github-review/service.js";
+import type { ReviewActor, ReviewContinuation, ToolOutcome } from "../github-review/service.js";
 import { readGithubReviewSettings } from "../github-review/settings.js";
-import { closeConfirmationsForStop, finishConfirmation } from "../github-review/store.js";
+import { closeConfirmationsForStop, finishConfirmation, type PostedReview } from "../github-review/store.js";
 import { db, inTransaction, type Querier, type StatementRunner } from "../infra/db.js";
 import { insertSessionRow } from "../routes/sessions.js";
 import { queuedMessageId, SWEEPABLE_RUN_STATUSES, stopSessionRuns } from "../tasks/chat-run.js";
@@ -52,7 +52,26 @@ export interface ReviewParams {
   review_only: boolean;
   /** The first message of the review's session, as it was sent; a restart that changes nothing about it sends it again. */
   brief: string;
+  /** The last review of the same pull request this one continues (a restart, or a new request after a closed item), as the facts recorded it. */
+  continues?: ReviewContinues | null;
+  /** What this review has posted so far, from the same facts (`reviewRecord`); written when the item's state is brought up to date. */
+  record?: ReviewRecord | null;
 }
+
+/** One finding of a review: where, the thread GitHub opened for it (null when unknown), its first words, and whether its thread is resolved. */
+export interface RecordedFinding { path: string; line: number; thread_id: string | null; note: string; resolved: boolean }
+
+/**
+ * What a review item's reviews have said, read off `claw_github_audit` and never from a model: the head of the last review posted, its event
+ * (the verdict), the model the item asked for, and every finding still open from earlier rounds with this one's.
+ */
+export interface ReviewRecord { head_sha: string; verdict: string; model: string | null; findings: RecordedFinding[] }
+
+/** The record a re-review starts from, and which item it was. */
+export interface ReviewContinues extends ReviewRecord { from_item: string; from_seq: number }
+
+/** Findings a record keeps: two full reviews' worth. */
+const MAX_FINDINGS = 60;
 
 /** A refusal with the HTTP status and the code the API answers with (the C1 contract). */
 export class ReviewItemRefused extends Error {
@@ -79,6 +98,23 @@ export function defaultBrief(pr: PrRef, reviewOnly: boolean): string {
   return reviewOnly
     ? `Review ${prUrl(pr)}. Review only: post your review and do not merge it.`
     : `Review ${prUrl(pr)}. If the review finds nothing that blocks it, approve and merge it; the tools decide whether the merge waits for a person's confirmation first.`;
+}
+
+/**
+ * What a re-review is told after its first message: check the last review's findings first (resolve what is fixed), then review as much as
+ * `gh_pr_get` says (`continuation.scope`). The findings' notes are the last review's own words, posted with the acting user's account.
+ */
+export function continuationBrief(pr: PrRef, c: ReviewContinues): string {
+  const since = c.head_sha.slice(0, 12);
+  const open = c.findings.filter((f) => !f.resolved);
+  const lines = [
+    `This is a re-review of ${prName(pr)}. The last review (item #${c.from_seq}) was of head ${since}, verdict ${c.verdict}, model ${c.model ?? "the deployment default"}.`,
+    "First check each finding below at the current head: resolve the thread of each one that is fixed with gh_thread_resolve, and say each one that is not again in your review.",
+    `Then review as much as gh_pr_get says in \`continuation.scope\`: only the change since ${since} (\`delta\`), nothing new (\`unchanged\`), or the whole pull request again (\`full\`, with its reason).`,
+    open.length ? "Findings of the last review (the notes are that review's own words):" : "The last review left no open inline findings.",
+    ...open.map((f) => `- ${f.path}:${f.line}${f.thread_id ? ` (thread ${f.thread_id})` : " (thread unknown: check it, but it cannot be resolved here)"}: ${f.note}`),
+  ];
+  return lines.join("\n");
 }
 
 function title(pr: PrRef, reviewOnly: boolean): string {
@@ -260,6 +296,12 @@ interface Planned {
   params: ReviewParams;
 }
 
+/** The first message: the brief, and for a re-review what it continues (`params.brief` stays the brief alone, so a later restart does not nest it). */
+function firstMessage(plan: Planned): string {
+  const c = plan.params.continues;
+  return c ? `${plan.params.brief}\n\n${continuationBrief(plan.pr, c)}` : plan.params.brief;
+}
+
 /** The session, the item and the session's first message, in the caller's transaction. */
 async function insertReview(q: StatementRunner, user: UserInfo, plan: Planned): Promise<CreatedReview> {
   const name = title(plan.pr, plan.params.review_only);
@@ -288,7 +330,7 @@ async function insertReview(q: StatementRunner, user: UserInfo, plan: Planned): 
       : new ReviewItemRefused(503, "no_assistant", "the requester has no assistant", {});
   }
   const queued = await queueServerMessage(q, {
-    sessionId: plan.sessionId, userId: user.userId, content: plan.params.brief, dedupeKey: `start:${item.itemId}`, attended: plan.attended,
+    sessionId: plan.sessionId, userId: user.userId, content: firstMessage(plan), dedupeKey: `start:${item.itemId}`, attended: plan.attended,
   });
   if (!queued.ok) throw new ReviewItemRefused(503, queued.error, "the review could not be started", {});
   return {
@@ -344,7 +386,12 @@ export async function startReviews(user: UserInfo, method: string | null, reques
     for (const plan of plans) await refuseIfReviewed(q, user.userId, plan.pr);
     await refuseOverLimit(q, actingAs, plans.length);
     const out: CreatedReview[] = [];
-    for (const plan of plans) out.push(await insertReview(q, user, plan));
+    for (const plan of plans) {
+      // Asking again for a pull request the requester's own closed item reviewed continues that review, as a restart of it would.
+      const continues = await continuationOfLastItem(q, user.userId, plan.pr);
+      if (continues) plan.params.continues = continues;
+      out.push(await insertReview(q, user, plan));
+    }
     return out;
   });
   for (const c of created) await drainSessionIfIdle(c.session_id, user.userId);
@@ -358,6 +405,112 @@ function readParams(row: Record<string, unknown>): ReviewParams | null {
   return {
     pr: p.pr, acting_as: p.acting_as, acting_as_name: p.acting_as_name ?? null, model: p.model ?? null, effort: p.effort ?? null,
     review_only: p.review_only !== false, brief: typeof p.brief === "string" ? p.brief : defaultBrief(p.pr, p.review_only !== false),
+    continues: readContinues(p.continues),
+  };
+}
+
+function readFindings(raw: unknown): RecordedFinding[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.flatMap((f) => {
+    const x = f !== null && typeof f === "object" ? f as Record<string, unknown> : null;
+    if (!x || typeof x.path !== "string" || typeof x.line !== "number") return [];
+    return [{
+      path: x.path, line: x.line, thread_id: typeof x.thread_id === "string" ? x.thread_id : null,
+      note: typeof x.note === "string" ? x.note : "", resolved: x.resolved === true,
+    }];
+  });
+}
+
+function readContinues(raw: unknown): ReviewContinues | null {
+  const c = raw !== null && typeof raw === "object" ? raw as Record<string, unknown> : null;
+  if (!c || typeof c.head_sha !== "string" || typeof c.from_item !== "string") return null;
+  return {
+    from_item: c.from_item, from_seq: Number(c.from_seq), head_sha: c.head_sha, verdict: typeof c.verdict === "string" ? c.verdict : "",
+    model: typeof c.model === "string" ? c.model : null, findings: readFindings(c.findings),
+  };
+}
+
+/** The threads this session resolved (`gh_thread_resolve`), or found resolved, as its audit rows say. */
+async function resolvedThreads(q: StatementRunner, sessionId: string): Promise<Set<string>> {
+  const rows = (await q.query(
+    `SELECT arguments->>'thread_id' AS thread_id FROM claw_github_audit
+      WHERE session_id = $1 AND tool = 'gh_thread_resolve' AND result = 'ok' AND detail IN ('resolved', 'already_resolved')`,
+    [sessionId],
+  )).rows as Array<{ thread_id: string | null }>;
+  return new Set(rows.map((r) => r.thread_id).filter((t): t is string => typeof t === "string"));
+}
+
+/**
+ * The record of a review item's session (see {@link ReviewRecord}), from its audit rows alone: the last review it posted (`posted`, which only
+ * a review that reached GitHub has: not a dry run, a refusal or a retry that found it already there), the threads it resolved, and the open
+ * findings of the review it continued. Null when it posted nothing and continued nothing.
+ */
+export async function reviewRecord(q: StatementRunner, sessionId: string, params: ReviewParams): Promise<ReviewRecord | null> {
+  const last = (await q.query(
+    `SELECT head_sha, posted FROM claw_github_audit
+      WHERE session_id = $1 AND tool = 'gh_review_submit' AND result = 'ok' AND posted IS NOT NULL ORDER BY at DESC, id DESC LIMIT 1`,
+    [sessionId],
+  )).rows[0] as { head_sha: string; posted: PostedReview } | undefined;
+  const before = params.continues ?? null;
+  if (!last && !before) return null;
+  const resolved = await resolvedThreads(q, sessionId);
+  const isResolved = (f: { thread_id: string | null }): boolean => f.thread_id !== null && resolved.has(f.thread_id);
+  const carried = (before?.findings ?? []).filter((f) => !f.resolved).map((f) => ({ ...f, resolved: isResolved(f) }));
+  const fresh = (last ? readFindings(last.posted?.findings) : []).map((f) => ({ ...f, resolved: isResolved(f) }));
+  return {
+    head_sha: last ? last.head_sha : (before as ReviewContinues).head_sha,
+    verdict: last ? String(last.posted?.event ?? "") : (before as ReviewContinues).verdict,
+    model: last ? params.model : (before as ReviewContinues).model,
+    findings: [...carried, ...fresh].slice(-MAX_FINDINGS),
+  };
+}
+
+/** What a re-review of `row`'s pull request continues: its record, named by the item; null when it posted nothing to continue. */
+async function continuationOf(
+  q: StatementRunner, row: { item_id: string; seq: number; worker_session_id: string; kind: string; params: unknown },
+): Promise<ReviewContinues | null> {
+  const params = readParams(row as unknown as Record<string, unknown>);
+  if (!params) return null;
+  const record = await reviewRecord(q, row.worker_session_id, params);
+  // What is resolved is done with; what is open is what the next review checks.
+  return record ? { ...record, findings: record.findings.filter((f) => !f.resolved), from_item: row.item_id, from_seq: Number(row.seq) } : null;
+}
+
+/** The requester's own last closed review of this pull request, continued; another person's review is not theirs to build on. */
+async function continuationOfLastItem(q: StatementRunner, userId: string, pr: PrRef): Promise<ReviewContinues | null> {
+  const row = (await q.query(
+    `SELECT item_id, seq, kind, worker_session_id, params FROM claw_work_items
+      WHERE user_id = $1 AND kind = 'review' AND board_state = 'done'
+        AND lower(params->'pr'->>'owner') = lower($2) AND lower(params->'pr'->>'repo') = lower($3) AND params->'pr'->>'number' = $4
+      ORDER BY created_at DESC, seq DESC LIMIT 1`,
+    [userId, pr.owner, pr.repo, String(pr.number)],
+  )).rows[0] as { item_id: string; seq: number; kind: string; worker_session_id: string; params: unknown } | undefined;
+  return row ? continuationOf(q, row) : null;
+}
+
+/**
+ * What the review tools' service needs of review items: a re-review continues the last review of its item, which needs what that review
+ * posted. Nothing while review items are off, so every other review is posted, read and recorded as before.
+ */
+export function reviewItemServiceDeps(): { continuationOf?: (sessionId: string) => Promise<ReviewContinuation | null>; recordPosted?: boolean } {
+  return CLAW_ASSISTANT_REVIEW_ITEMS ? { continuationOf: reviewContinuationOf, recordPosted: true } : {};
+}
+
+/**
+ * For the review tools (`ReviewDeps.continuationOf`): what this session's item continues, with the threads this session has resolved since
+ * marked so. Null for a session that is no review item, or a first review.
+ */
+export async function reviewContinuationOf(sessionId: string): Promise<ReviewContinuation | null> {
+  if (!CLAW_ASSISTANT_REVIEW_ITEMS) return null;
+  const row = (await db.query(
+    "SELECT params FROM claw_work_items WHERE worker_session_id = $1 AND kind = 'review'", [sessionId],
+  )).rows[0] as { params: Record<string, unknown> | null } | undefined;
+  const c = readContinues(row?.params?.continues);
+  if (!c) return null;
+  const resolved = await resolvedThreads(db, sessionId);
+  return {
+    sinceHeadSha: c.head_sha,
+    findings: c.findings.filter((f) => !f.resolved).map((f) => ({ ...f, resolved: f.thread_id !== null && resolved.has(f.thread_id) })),
   };
 }
 
@@ -391,8 +544,8 @@ export async function restartReview(
     await takeCreateTurn(query);
     await query("SELECT 1 FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [user.userId]);
     const row = (await query(
-      "SELECT board_state, worker_session_id, seq FROM claw_work_items WHERE item_id = $1 AND user_id = $2 FOR UPDATE", [itemId, user.userId],
-    )).rows[0] as { board_state: string; worker_session_id: string; seq: number } | undefined;
+      "SELECT item_id, seq, kind, board_state, worker_session_id, params FROM claw_work_items WHERE item_id = $1 AND user_id = $2 FOR UPDATE", [itemId, user.userId],
+    )).rows[0] as { item_id: string; board_state: string; worker_session_id: string; seq: number; kind: string; params: unknown } | undefined;
     if (!row) throw new ReviewItemRefused(404, "not_found", "no such item");
     const refusal = await closeConfirmationsForStop(q, row.worker_session_id, user.userId, { actorUserId: was.acting_as, pr: was.pr });
     if (refusal) {
@@ -413,6 +566,9 @@ export async function restartReview(
     }
     await refuseIfReviewed(q, user.userId, was.pr, itemId);
     await refuseOverLimit(q, was.acting_as, 1, itemId);
+    // The new session is a fresh one; what it is given of the old one is the record of what that review posted, not its conversation.
+    const continues = await continuationOf(q, row);
+    if (continues) plan.params.continues = continues; else delete plan.params.continues;
     return { oldSession: row.worker_session_id, seq: Number(row.seq), item: await insertReview(q, user, plan) };
   });
   await stopSessionRuns(result.oldSession);
@@ -541,6 +697,10 @@ export async function syncReviewItem(itemId: string): Promise<WorkItemView | nul
     const reportKind = state.boardState === "needs_you" ? state.reportKind : state.boardState === "done" ? null : "progress";
     const question = state.boardState === "done" ? null : state.question;
     const summary = clipOneLine(state.summary, 80);
+    // What the review has posted so far, kept on the item for whoever reads the board; a re-review reads it again from the facts.
+    const record = await reviewRecord(q, row.worker_session_id as string, params);
+    const recordChanged = JSON.stringify(record) !== JSON.stringify((row.params as Record<string, unknown> | null)?.record ?? null);
+    if (recordChanged) await query("UPDATE claw_work_items SET params = params || jsonb_build_object('record', $2::jsonb) WHERE item_id = $1", [itemId, JSON.stringify(record)]);
     if (row.board_state === state.boardState && (row.last_report_kind ?? null) === reportKind
       && (row.pending_question ?? null) === question && row.summary === summary) return null;
     const attention = state.boardState === "needs_you" ? 1 : 0;

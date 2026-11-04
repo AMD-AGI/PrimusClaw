@@ -26,7 +26,7 @@ import { IdentityUnavailableError } from "@claw/utils";
 import pino from "pino";
 import { z } from "zod";
 import {
-  confirmationOfStoppedReview, denyForStoppedReview, reviewItemPorts, reviewSessionStopped, syncReviewItemOfSession,
+  confirmationOfStoppedReview, denyForStoppedReview, reviewContinuationOf, reviewItemPorts, reviewItemServiceDeps, reviewItemsEnabled, reviewSessionStopped, syncReviewItemOfSession,
 } from "../assistant/review-items.js";
 import { identityClient } from "../auth/identity.js";
 import { getUser } from "../auth/middleware.js";
@@ -69,8 +69,11 @@ function toResult(outcome: ToolOutcome): { content: Array<{ type: "text"; text: 
   return { content: [{ type: "text" as const, text: outcome.text }], ...(outcome.isError ? { isError: true } : {}) };
 }
 
-/** The four tools, bound to one session's actor. */
-export function buildReviewToolServer(service: GithubReview, actor: ReviewActor): McpServer {
+/**
+ * The four tools, bound to one session's actor; and a fifth, `gh_thread_resolve`, for a re-review that has the last review's threads to
+ * resolve (`resolvable`): no other session is offered it.
+ */
+export function buildReviewToolServer(service: GithubReview, actor: ReviewActor, opts: { resolvable?: boolean } = {}): McpServer {
   const mcp = new McpServer({ name: "github-review", version: "1.0.0" });
   mcp.tool(
     "gh_pr_get",
@@ -135,6 +138,19 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor)
     },
     async (a) => toResult(await service.mergePr(actor, a)),
   );
+  if (opts.resolvable) {
+    mcp.tool(
+      "gh_thread_resolve",
+      "Resolve the thread of one finding of the last review of this pull request that is fixed at this head: only the threads in gh_pr_get's "
+      + "`continuation.findings` can be, and only after you checked the fix. A finding that is not fixed keeps its thread open and is said again in your review.",
+      {
+        pr: z.string().describe(PR_HELP),
+        thread_id: z.string().describe("The thread_id of the finding, from continuation.findings"),
+        head_sha: z.string().describe("The head_sha from gh_pr_get, the head you checked the fix at"),
+      },
+      async (a) => toResult(await service.resolveThread(actor, a)),
+    );
+  }
   return mcp;
 }
 
@@ -151,6 +167,7 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
   const database: Queryable = opts.db ?? db;
   const service = opts.service ?? new GithubReview({
     settings, db: database, sessionStopped: reviewSessionStopped,
+    ...reviewItemServiceDeps(),
     resolveCredential: async (req) => {
       const client = identityClient();
       if (!client) throw new IdentityUnavailableError("credential", "not_configured");
@@ -191,10 +208,11 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
       return refuse(reply, 403, "review_target_invalid");
     }
     const label = typeof row.config?.acting_as_requester === "string" ? row.config.acting_as_requester : undefined;
+    const continuation = reviewItemsEnabled() ? await reviewContinuationOf(claims.sessionId).catch(() => null) : null;
     const mcp = buildReviewToolServer(service, {
       sessionId: claims.sessionId, requesterUserId: claims.requesterUserId, actorUserId: claims.actorUserId, requesterLabel: label, reviewTarget: target.target,
       reviewOnly: reviewOnlyOf(row.config),
-    });
+    }, { resolvable: continuation?.findings.some((f) => f.thread_id !== null && !f.resolved) === true });
     // Stateless, like the platform's own MCP endpoint: one server and transport per request.
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined as unknown as () => string });
     reply.hijack();

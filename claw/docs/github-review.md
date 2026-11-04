@@ -109,6 +109,27 @@ review is done (accepted by policy); a write held for the requester themselves, 
 `expired`, `refused`), a merge refused by a gate, a failed turn or a turn that posted nothing needs them; a write held for
 someone else, or being made, is in progress; a denied one is done (stopped). A review session gets no worker report tool.
 
+### A review again: it continues the last one
+
+A posted review of an item's session is recorded on its audit row (`claw_github_audit.posted`: the event and each inline finding
+with the thread GitHub opened for it), and the item keeps the result in `params.record`: the head reviewed, the verdict, the
+model and each finding with its thread and whether it is resolved. Nothing of it comes from the model. A restart, or a new
+request for a pull request whose last item of the same requester is closed, makes a fresh session that continues that record
+(`params.continues`): its first message lists the open findings, to check first, and `gh_pr_get` answers with a `continuation`
+block whose `scope` the code decides:
+
+| `scope` | When | What `files` and `diff` hold |
+|---|---|---|
+| `unchanged` | The head is the one reviewed last time | Nothing: only the findings are checked |
+| `delta` | GitHub's compare of the two heads says `ahead`, within the review path's size limits, and touching no security or CI path | The change since the last head |
+| `full` | `history_rewritten` (force push or rebase), `large_delta`, or `security_path` | The whole pull request, as a first review reads it |
+
+The risk, the holds and every gate of a write stay those of the whole pull request. Such a session is also offered
+`gh_thread_resolve(pr, thread_id, head_sha)`, which resolves the thread of a fixed finding: only a thread the last review
+recorded (`thread_not_recorded`), opened by the acting user's own account (`not_own_thread`), on this pull request
+(`thread_not_on_pull_request`), at the head the session read (`head_moved`), and not after the requester stopped the review
+(`review_stopped`). It is not counted in the hourly review limits.
+
 ## The tools
 
 | Tool | What it does |
