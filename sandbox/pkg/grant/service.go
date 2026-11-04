@@ -6,8 +6,10 @@ package grant
 import (
 	"context"
 	"errors"
+	"hash/fnv"
 	"net/http"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -64,6 +66,20 @@ type Service struct {
 	record     Recorder
 	now        func() time.Time
 	owner      atomic.Pointer[ownerConfig]
+	writes     grantLocks
+}
+
+// grantLocks serialises the read-modify-write of one grant inside this process,
+// as a workqueue never hands one key to two workers: concurrent callers queue
+// instead of spending each other's conflict retries and failing with a 409.
+type grantLocks [64]sync.Mutex
+
+func (l *grantLocks) lock(name string) (unlock func()) {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(name))
+	m := &l[h.Sum32()%uint32(len(l))]
+	m.Lock()
+	return m.Unlock
 }
 
 // PendingPromoter finishes a pending sandbox whose Workload the create goroutine no longer owns.
@@ -281,6 +297,7 @@ func (s *Service) Extend(ctx context.Context, grantID string, req ExtendRequest)
 	if err := s.attest.Check(req.Attestation, issue); err != nil {
 		return GrantView{}, err
 	}
+	unlock := s.writes.lock(grantID)
 	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		current, err := s.get(ctx, grantID)
 		if err != nil {
@@ -296,6 +313,7 @@ func (s *Service) Extend(ctx context.Context, grantID string, req ExtendRequest)
 		current.Spec.Attestation = req.Attestation
 		return s.client.Update(ctx, current)
 	})
+	unlock()
 	if err != nil {
 		if _, ok := err.(*OpError); ok {
 			return GrantView{}, err
@@ -558,6 +576,7 @@ func (s *Service) reclaimAll(ctx context.Context, grantID string) (int, error) {
 }
 
 func (s *Service) clearPlatformKey(ctx context.Context, grantID string) error {
+	defer s.writes.lock(grantID)()
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		current, err := s.get(ctx, grantID)
 		if err != nil {
@@ -592,6 +611,7 @@ func (s *Service) list(ctx context.Context) ([]runtimev1alpha1.SandboxGrant, err
 }
 
 func (s *Service) setStatus(ctx context.Context, name string, mutate func(*runtimev1alpha1.SandboxGrant) error) error {
+	defer s.writes.lock(name)()
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		current, err := s.get(ctx, name)
 		if err != nil {

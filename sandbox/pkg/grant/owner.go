@@ -355,6 +355,7 @@ func (s *Service) createOwner(ctx context.Context, name string, spec runtimev1al
 
 // updateOwner replaces the caps, templates, and user name of an owner record.
 func (s *Service) updateOwner(ctx context.Context, name string, want runtimev1alpha1.SandboxGrantSpec) error {
+	defer s.writes.lock(name)()
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		current, err := s.get(ctx, name)
 		if err != nil {

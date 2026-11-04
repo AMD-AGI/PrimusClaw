@@ -27,7 +27,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
@@ -101,13 +103,17 @@ func (r *failOnceReclaimer) Reclaim(_ context.Context, _ SandboxRef) error {
 	return nil
 }
 
-func testService(t *testing.T, now time.Time) (*Service, *ecdsa.PrivateKey, *memRecord, *memReclaimer) {
+func testService(t *testing.T, now time.Time, intercept ...interceptor.Funcs) (*Service, *ecdsa.PrivateKey, *memRecord, *memReclaimer) {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&runtimev1alpha1.SandboxGrant{}).Build()
+	builder := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&runtimev1alpha1.SandboxGrant{})
+	if len(intercept) == 1 {
+		builder = builder.WithInterceptorFuncs(intercept[0])
+	}
+	cl := builder.Build()
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -383,7 +389,16 @@ func TestIssueRejectsBadWorkspace(t *testing.T) {
 
 func TestReserveStopsAtCap(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	svc, priv, _, _ := testService(t, now)
+	// A grant read slower than the conflict retry interval lets every
+	// concurrent caller read the same resourceVersion, as a busy API server does.
+	slowRead := interceptor.Funcs{Get: func(ctx context.Context, c ctrlclient.WithWatch, key ctrlclient.ObjectKey, obj ctrlclient.Object, opts ...ctrlclient.GetOption) error {
+		err := c.Get(ctx, key, obj, opts...)
+		if _, ok := obj.(*runtimev1alpha1.SandboxGrant); ok {
+			time.Sleep(time.Millisecond)
+		}
+		return err
+	}}
+	svc, priv, _, _ := testService(t, now, slowRead)
 	req := sampleRequest(now.Add(time.Hour))
 	req.Roles["measurement"] = RoleRequest{Templates: []string{"runner"}, MaxSandboxes: 16, MaxGPUs: 128}
 	req.Attestation = signGrant(t, priv, req)
