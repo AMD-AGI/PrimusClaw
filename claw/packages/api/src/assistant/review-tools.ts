@@ -14,6 +14,11 @@
  *    the channel listed beside the message with a Claw user id, a repository or a model is in the message (or, for a
  *    repository, one the channel or their recent reviews use). Text from reports or recalled items is not their message.
  *
+ * Two acts are never read from a sentence at all, since a misreading there merges a pull request or changes a setting: letting a
+ * held write through needs the person's message to be the exact command `批准 #<ref>` / `approve #<ref>` naming it (or the card's
+ * button), and a channel action runs at once only when the message is its command typed whole; otherwise it is put to the person
+ * as that command with a button, and runs only when they press it.
+ *
  * Everything past that is the review's own gates, which these call rather than repeat: creating, stopping and restarting
  * a review item is `review-items.ts`; answering a held write is the decision route's own `decideConfirmation`
  * (`github-review/mcp.ts`), whose `decide` checks the head commit and every gate again.
@@ -28,6 +33,8 @@ import { decideConfirmation, githubReviewService } from "../github-review/mcp.js
 import { DEFAULT_REVIEW_MODE, getReviewMode, setReviewMode, type DecidedVia } from "../github-review/store.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { deterministicEventId, enqueue, kickDelivery } from "../notifications/outbox.js";
+import { recordActionConfirm } from "./outbound.js";
+import { confirmationRef } from "./prompts.js";
 import type { AssistantActionPayload } from "../notifications/assistant-events.js";
 import { decidedViaOf, turnMessage, type AttendedVia, type TurnMessage } from "./inbound.js";
 import {
@@ -36,6 +43,8 @@ import {
 import type { AssistantTokenClaims } from "./token.js";
 import { attendedTurn, ToolRefused } from "./tools.js";
 import { resolveWorkItemNow } from "./work-items.js";
+
+export { confirmationRef };
 
 const logger = pino({ name: "assistant-review-tools" });
 
@@ -353,38 +362,18 @@ async function waitingWhenWritten(q: Querier, userId: string, at: Date): Promise
 }
 
 /**
- * Whether the person's message names this held write: its confirmation id, or its pull request's number (with the
- * repository when another waiting write shares the number). Being the only one waiting does not name it.
+ * The confirmation a message lets through, when the message is nothing but an approval command: `批准 #a3f9c2` or
+ * `approve #a3f9c2` (the short id the user was shown, or the whole id), in any case, with any spacing, a full-width `＃`,
+ * and at most some closing punctuation. `null` for every other message: a yes in the person's own words lets nothing
+ * through (it can be misread, and the router reads what workers wrote beside it); the card's button still does.
  */
-export function confirmationNamed(
-  text: string, pick: { id: string; repo: string; pr: number }, pending: ReadonlyArray<{ pr: number }>,
-): boolean {
-  if (pick.id && text.toLowerCase().includes(pick.id.toLowerCase())) return true;
-  const [owner = "", repo = ""] = pick.repo.split("/");
-  const ref = { owner, repo, number: pick.pr };
-  // The number of another waiting write in another repository is not this one's name.
-  const sharing = pending.filter((c) => c.pr === pick.pr).length;
-  return prGrounded(text, ref) && (sharing === 1 || repoGrounded(text, ref, [], []));
+export function approvalCommand(text: string): string | null {
+  const m = /^\s*(?:批准|approve)\s*[#＃]\s*([0-9a-f]{6}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s*[.。!！]*\s*$/i.exec(text);
+  return m ? m[1].toLowerCase() : null;
 }
 
-/**
- * Phrases that say yes to a held write, and nothing else: not a bare 好 or 行 (这行代码, 好像), not a bare merge (maybe merge).
- */
-const APPROVAL = /可以合|合吧|合入吧|合并吧|同意|批准|放行|没问题|好的|行吧|(?<![a-z])(?:yes|ok|okay|sure|approve[sd]?|allow|go ahead|lgtm|ship it|merge it|proceed|confirm(?:ed)?)(?![a-z])/i;
-/**
- * Words that say no, not yet, maybe, or ask, or raise a concern: a message with any of them is not a yes, whatever else it
- * says. Any 不 or 没 counts (不可以, 不应该, 没同意), except in 不错 and 没问题; any English n't counts (shouldn't, won't).
- */
-const NOT_APPROVAL = /不(?!错)|没(?!问题)|(?<!没)问题|别|勿|莫|甭|否|未|拒|取消|停|撤|等|再看|慢着|也许|可能|或许|大概|好像|要不要|考虑|吗|么|呢|怎|进度|情况|状态|[?？]|n['’]t\b|(?<![a-z])(?:no|nope|not|never|neither|nor|cannot|deny|reject|refuse|cancel|abort|revert|undo|block|hold|wait|pause|stop|status|why|how|what|when|whether|later|if|could|would|should|might|maybe|perhaps|probably|can|think|consider|issue|problem|concern)(?![a-z])/i;
-
-/**
- * Whether the person's message says yes, and only yes: an approval word, and no word of refusal, delay or question. Naming
- * the pull request is not saying yes to it ("224 别合", "status of 224?"). Read in code, as the name is: the router reads what
- * workers wrote beside the message, and only the person's words let a write through.
- */
-export function approvalInMessage(text: string): boolean {
-  return APPROVAL.test(text) && !NOT_APPROVAL.test(text);
-}
+/** Whether `ref` (from {@link approvalCommand}) is this confirmation's short id or its whole id. */
+const refersTo = (ref: string, id: string): boolean => ref === id.toLowerCase() || ref === confirmationRef(id);
 
 export async function confirmationAnswer(
   claims: AssistantTokenClaims, args: { decision: "allow" | "deny"; confirmation_id?: string; pr?: string },
@@ -396,36 +385,46 @@ export async function confirmationAnswer(
     const { userId, message, via } = await attendedTurn(q, claims);
     const pending = await pendingConfirmationsFor(q, userId);
     if (!pending.length) throw new ToolRefused("no_pending_confirmation", "nothing waits for the user's answer");
+    const replies = pending.map((c) => `批准 #${confirmationRef(c.id)} for ${c.repo}#${c.pr}`).join("; ");
     let pick: PendingConfirmation | undefined;
-    if (args.confirmation_id) {
-      pick = pending.find((c) => c.id === args.confirmation_id);
-    } else if (args.pr) {
-      const ref = parsePrRef(args.pr);
-      const n = ref?.number ?? Number(String(args.pr).replace(/^#/, ""));
-      const matches = pending.filter((c) => c.pr === n && (!ref || lower(c.repo) === lower(`${ref.owner}/${ref.repo}`)));
-      pick = matches.length === 1 ? matches[0] : undefined;
-      if (matches.length > 1) throw new ToolRefused("which_confirmation", "more than one write waits on that pull request: pass confirmation_id");
-    } else if (pending.length === 1) {
-      pick = pending[0];
-    } else {
-      throw new ToolRefused("which_confirmation", "more than one write waits for the user: ask which pull request");
-    }
-    if (!pick) throw new ToolRefused("confirmation_not_found", "no write of that pull request waits for the user");
-    // Saying yes is the person's say about one change: its pull request or its confirmation id is in their words. Being the
-    // only one waiting is not enough: the router reads what workers wrote beside the message, and a "yes" about something
-    // else must not let a write through. Saying no only makes less happen, so it needs neither.
     if (args.decision === "allow") {
-      const waiting = await waitingWhenWritten(q, userId, message.receivedAt);
-      // A write held after they wrote is one they have not seen (a new head, a new hold): their yes was not about it.
-      if (!waiting.includes(pick.id)) {
+      // Saying yes is one exact command carrying the id of the write the person was shown (`approvalCommand`), or the card's
+      // button (the decision route). Never how a model, or a word list, reads a sentence: the router reads what workers wrote
+      // beside the message, and a misread yes merges.
+      const ref = approvalCommand(message.content);
+      if (!ref) {
+        refuseUngrounded("not_an_approval_command", `the user's message is not an approval command, so nothing is let through: tell them to reply exactly that (${replies}) or press the button on its card`);
+      }
+      const named = pending.filter((c) => refersTo(ref, c.id));
+      if (named.length > 1) refuseUngrounded("which_confirmation", "that short id fits more than one waiting write: ask the user to press the button on its card");
+      pick = named[0];
+      if (!pick) refuseUngrounded("confirmation_not_found", `no write waiting for the user has the id #${ref}: what waits is ${replies}`);
+      // A write held after they wrote is one they have not seen (a new head, a new hold): their command was not about it.
+      if (!(await waitingWhenWritten(q, userId, message.receivedAt)).includes(pick.id)) {
         refuseUngrounded("confirmation_after_message", `the write waiting on ${pick.repo}#${pick.pr} was held after the user's message: tell them, and let them answer it`);
       }
-      if (!confirmationNamed(message.content, pick, pending)) {
-        refuseUngrounded("pr_not_in_message", `the user's message does not name ${pick.repo}#${pick.pr}: ask them to say which pull request to let through`);
+      // The router's arguments may only agree with the command: they never choose another write.
+      const ref2 = args.pr ? parsePrRef(args.pr) : null;
+      const prNumber = ref2?.number ?? (args.pr ? Number(String(args.pr).replace(/^#/, "")) : pick.pr);
+      if ((args.confirmation_id && args.confirmation_id !== pick.id) || prNumber !== pick.pr
+          || (ref2 && lower(`${ref2.owner}/${ref2.repo}`) !== lower(pick.repo))) {
+        refuseUngrounded("confirmation_not_in_message", `the user's command names the write on ${pick.repo}#${pick.pr}, not the one asked for`);
       }
-      if (!approvalInMessage(message.content)) {
-        refuseUngrounded("allow_not_in_message", `the user's message does not say yes to ${pick.repo}#${pick.pr}: do not let it through; ask them, or let them press the button`);
+    } else {
+      if (args.confirmation_id) {
+        pick = pending.find((c) => c.id === args.confirmation_id);
+      } else if (args.pr) {
+        const ref = parsePrRef(args.pr);
+        const n = ref?.number ?? Number(String(args.pr).replace(/^#/, ""));
+        const matches = pending.filter((c) => c.pr === n && (!ref || lower(c.repo) === lower(`${ref.owner}/${ref.repo}`)));
+        pick = matches.length === 1 ? matches[0] : undefined;
+        if (matches.length > 1) throw new ToolRefused("which_confirmation", "more than one write waits on that pull request: pass confirmation_id");
+      } else if (pending.length === 1) {
+        pick = pending[0];
+      } else {
+        throw new ToolRefused("which_confirmation", "more than one write waits for the user: ask which pull request");
       }
+      if (!pick) throw new ToolRefused("confirmation_not_found", "no write of that pull request waits for the user");
     }
     return { userId, via, id: pick.id, repo: pick.repo, pr: pick.pr };
   });
@@ -458,52 +457,52 @@ export async function reviewModeSet(claims: AssistantTokenClaims, args: { mode: 
   });
 }
 
-/** Words of a summary that say nothing about which action it is. */
-const ACTION_STOPWORDS = new Set([
-  "about", "also", "been", "each", "every", "from", "have", "into", "more", "only", "some", "than", "that", "them", "then",
-  "they", "this", "what", "when", "will", "with", "your", "turn", "send", "show", "sets", "set",
-]);
-/** What separates the parts of a Chinese label: punctuation, spaces, and the particles that join a modifier to its noun. */
-const CJK_SPLIT = /[^\p{Script=Han}]+|[的和与及或给]/u;
+/** What the user is shown and may type to run an action: `/name args`. */
+export const actionCommand = (name: string, args: string): string => `/${name}${args ? ` ${args}` : ""}`;
+
+const squash = (s: string): string => s.replace(/\s+/g, "").toLowerCase();
 
 /**
- * Whether the person's message asks for this channel action: it types the command (`/brief`, `/brief10:0`), names it
- * (`brief`), or says what it is about, a word of its label (`morning` of "morning brief", `晨报` of "每个工作日的晨报").
+ * Whether the person's message is this action's command, typed whole: the message is `/name` and what follows it (`/brief off`,
+ * `/brief10:0`), nothing else, and what follows is the arguments the call carries, spacing and case aside. Only then does the
+ * action run at once; anything else, however plainly it seems to ask, is shown to the person as the command, to run with a press.
  */
-export function actionRequested(text: string, action: { name: string; summary?: string }): boolean {
-  const t = lower(text);
-  const name = lower(action.name);
-  if (name && new RegExp(`(?<![a-z0-9_])/?${escapeRe(name)}(?![a-z_])`).test(t)) return true;
-  const label = action.summary ?? "";
-  for (const word of lower(label).match(/[a-z][a-z0-9-]{3,}/g) ?? []) {
-    if (!ACTION_STOPWORDS.has(word) && new RegExp(`(?<![a-z0-9_])${escapeRe(word)}(?![a-z0-9_])`).test(t)) return true;
-  }
-  for (const part of label.split(CJK_SPLIT)) {
-    if (part.length >= 2 && text.includes(part)) return true;
-  }
-  return false;
+export function typedActionCommand(text: string, name: string, args: string): boolean {
+  const m = new RegExp(`^\\s*/${escapeRe(name)}(?![a-z_-])([^\\n]*)$`, "i").exec(text.trim());
+  return !!m && squash(m[1]) === squash(args);
 }
 
 export async function channelAction(claims: AssistantTokenClaims, args: { name: string; args?: string }): Promise<Record<string, unknown>> {
   requireRouter(claims);
   const name = String(args.name ?? "").trim().replace(/^\/+/, "");
-  const actionArgs = String(args.args ?? "").replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+  const actionArgs = String(args.args ?? "").replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
   if (!name) throw new ToolRefused("invalid_arguments", "name the action, as the channel listed it");
   if (actionArgs.length > ACTION_ARGS_MAX) throw new ToolRefused("invalid_arguments", `args is at most ${ACTION_ARGS_MAX} characters`);
+  const command = actionCommand(name, actionArgs);
   const sent = await inTransaction(async (q) => {
     const { userId, message } = await attendedTurn(q, claims);
     // Only what the channel that carried this message said it can do: Claw knows no channel's commands.
-    const offered = message.context.actions.find((a) => a.name === name);
+    const offered = message.context.actions.find((a) => a.name.replace(/^\/+/, "") === name);
     if (!offered) {
       throw new ToolRefused("action_not_offered", "the channel did not list that action with this message: tell the user what to type instead");
     }
-    // Listed is what the channel can do; asked is what the person wants. The router reads what workers wrote beside the
-    // message, so the person's own words must ask for this action.
-    if (!actionRequested(message.content, offered)) {
-      refuseUngrounded("action_not_in_message", "the user's message does not ask for that action: do not change their settings unasked; tell them the command if they want it");
-    }
     if (!message.context.channel_message_id) {
       throw new ToolRefused("no_channel", "this message did not come through a channel that runs actions");
+    }
+    // Listed is what the channel can do; asked is what the person wants. Only the command typed whole runs at once: the router
+    // reads what workers wrote beside the message, so how it read a sentence never changes a setting. Anything else is put to
+    // the person as the exact command, with a button, and runs only when they press it (or type it).
+    if (!typedActionCommand(message.content, name, actionArgs)) {
+      const zh = /\p{Script=Han}/u.test(message.content);
+      const confirm = await recordActionConfirm(q, {
+        userId, sessionId: claims.sid, key: `${claims.mid}\u0000${name}\u0000${actionArgs}`,
+        text: zh ? `要执行 ${command} 吗？点下面的按钮执行，或直接回复 ${command}。` : `Run ${command}? Press the button below to run it, or reply ${command}.`,
+        action: { name, args: actionArgs, message_id: claims.mid, channel_message_id: message.context.channel_message_id },
+      });
+      if (confirm && confirm.subscribers === 0) {
+        throw new ToolRefused("no_channel", `no channel of the user can show a button now: tell them to type ${command} themselves`);
+      }
+      return { confirm };
     }
     const eventId = deterministicEventId("assistant.action", claims.mid, `${name}\u0000${actionArgs}`);
     const payload: AssistantActionPayload = {
@@ -519,8 +518,16 @@ export async function channelAction(claims: AssistantTokenClaims, args: { name: 
     await enqueue(eventId, subs, payload, q);
     return { eventId };
   });
+  if ("confirm" in sent) {
+    // `null`: the same call was made before in this turn, and its button is already in front of the user.
+    if (sent.confirm) await sent.confirm.announce();
+    return {
+      ok: true, ran: false, command, ...(sent.confirm ? { say_id: sent.confirm.sayId } : {}),
+      note: `nothing has run: the user was shown ${command} with a button, and it runs only when they press it (or type it). Do not say it is done.`,
+    };
+  }
   void reviewToolPorts.kick().catch((err) => logger.error({ err }, "assistant.action_kick_failed"));
-  return { ok: true, event_id: sent.eventId, action: name, args: actionArgs, note: "the channel runs it as if the user typed it; it reports the result itself" };
+  return { ok: true, ran: true, event_id: sent.eventId, action: name, args: actionArgs, note: "the channel runs it as if the user typed it; it reports the result itself" };
 }
 
 /** What the router is shown about reviews beside the item list, for one turn. Nothing when the turn answers no message. */

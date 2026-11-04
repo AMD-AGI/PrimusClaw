@@ -32,9 +32,25 @@ interface AssistantEventBase {
   item?: AssistantItemSnapshot;
 }
 
+/**
+ * A channel action put to the person rather than run (`channel_action` when their message was not its command typed whole).
+ * A channel that can draw a button shows one for `/{name} {args}` and runs it, as if the person typed it, only when that person
+ * presses it, under the same checks as an `assistant.action` (a message it sent for them, an action that message declared).
+ * A channel that cannot shows the text, which tells the person the command to type.
+ */
+export interface AssistantConfirmAction {
+  name: string;
+  args: string;
+  /** The id of the turn's message in Claw. */
+  message_id: string;
+  /** What the channel called that message when it sent it. */
+  channel_message_id: string;
+}
+
 /** Something the assistant chose to say to the user. */
 export interface AssistantSayPayload extends AssistantEventBase {
   type: "assistant.say";
+  confirm_action?: AssistantConfirmAction;
 }
 
 /** The system's own message, sent when an item has needed the user for a while and nobody has said so. */

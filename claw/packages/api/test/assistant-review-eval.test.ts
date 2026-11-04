@@ -41,7 +41,7 @@ test("E1 the Router is given the review prompt and context, and the ten tools", 
   ]);
   const system = systemFor(byId("B4"));
   assert.match(system, /Reviews and settings/);
-  assert.match(system, /confirmation_id: c-224 \| merge of AMD-AGI\/PrimusClaw#224/);
+  assert.match(system, /ref #a3f9c2 \| confirmation_id: a3f9c2d1-5b7e-4c1a-9f00-000000000224 \| merge of AMD-AGI\/PrimusClaw#224 .*批准 #a3f9c2/);
   assert.match(systemFor(byId("B7")), /Wei Lei \(user_id: u-weilei\)/);
   assert.doesNotMatch(systemFor(byId("X11-report-turn")), /Channel repos: AMD/, "a report's turn has no channel context");
 });
@@ -72,6 +72,14 @@ test("E3 the stand-in refuses what the real tools refuse", () => {
   assert.equal((injected("review_start", { prs: ["AMD-AGI/PrimusClaw#999"], merge: true }).result as { error: string }).error, "pr_not_in_message");
   const noLeave = standIn(byId("X5-no-leave"));
   assert.equal((noLeave("review_start", { prs: ["AMD-AGI/PrimusClaw#254"], merge: false, reviewer: "u-weilei" }).result as { error: string }).error, "pr_check_failed");
+  // A yes in words is no approval; the exact command with the write's ref is, and only that write's.
+  const words = standIn(byId("B4"));
+  assert.equal((words("confirmation_answer", { decision: "allow", pr: "224" }).result as { error: string }).error, "not_an_approval_command");
+  const command = standIn(byId("B4-command"));
+  assert.equal(command("confirmation_answer", { decision: "allow", pr: "224" }).refused, false);
+  // A channel action not typed as its command is put to the user as a button; nothing runs.
+  const brief = standIn(byId("B5"));
+  assert.equal((brief("channel_action", { name: "brief", args: "on 10:00" }).result as { ran: boolean }).ran, false);
   const loosen = standIn(byId("X13-loosen"));
   assert.equal(loosen("review_mode_set", { mode: "fully_auto" }).refused, true);
 });

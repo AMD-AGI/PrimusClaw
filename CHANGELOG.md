@@ -37,7 +37,10 @@ record it.
   function (`github-review/acting-session.ts`); its answers are unchanged.
 - The assistant's review and settings tools, behind `CLAW_ASSISTANT_TOOLS=on` (default off): `review_start`,
   `review_restart`, `confirmation_answer`, `review_mode_set` (towards `high_risk_confirm` only) and `channel_action`
-  (an `assistant.action` outbox event). They act only in a router turn that answers the user's own signed-in message
+  (an `assistant.action` outbox event when the user typed the command whole; otherwise an `assistant.say` carrying the
+  command as `confirm_action`, for the channel to run only when the user presses its button). A held write is let through
+  only by the exact command `批准 #<ref>` / `approve #<ref>` naming it, or the card's button. They act only in a router turn
+  that answers the user's own signed-in message
   (recorded in the new `claw_assistant_messages` when the message is accepted, with how it was authenticated), received
   at most `CLAW_ASSISTANT_ATTENDED_TTL_SEC` (600) seconds before, that has not read a worker's words; and only on what
   that message names. A user's message now stops a router turn that is reading a worker's report, and a router turn

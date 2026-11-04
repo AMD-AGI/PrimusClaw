@@ -27,12 +27,13 @@
  *   S6  what the review service refuses reaches the model as it said it, with its data
  *   R1  review_restart takes a review the user pointed at, and only a review
  *   R1b an item number is read whole: #11 does not point at #1, nor repo#1 at item #1
- *   C1  confirmation_answer allows only a write the user named, by its pull request or its confirmation id, asked before they
- *       wrote, in a message that says yes; being the only one waiting names nothing; deny needs no name
+ *   C1  confirmation_answer allows only when the message is the exact approval command (批准 #<ref> / approve #<ref>) naming a
+ *       write that waited when they wrote; the router's arguments cannot pick another; deny is read from words
  *   M1  review_mode_set can only make reviews ask more
- *   X1  channel_action emits the listed action once, to the channel that carried the message, when the message asks for it
- *   U1  what a worker wrote in the item list (summary, question) never makes an unrelated signed-in message allow a write or run
- *       a channel action: the list renders it as untrusted data, and the tools refuse on the message's own words
+ *   X1  channel_action runs a listed action at once only when the message is its command typed whole; anything else is put to
+ *       the user as that command with a button (an `assistant.say` carrying it), and runs nothing
+ *   U1  what a worker wrote in the item list (summary, question) never makes a signed-in message allow a write or run a channel
+ *       action: the list renders it as untrusted data, and no phrase but the exact command does either
  *   W1  work_send refuses a review item; work_stop stops one only in a turn that answers the person
  *   W2  work_stop stops only the review the person's message points at
  *   W3  a pull request written with # is that pull request, never the item that happens to have its number
@@ -133,17 +134,23 @@ describe("assistant review tools", { skip }, () => {
     return itemId;
   }
 
-  async function confirmation(actor: string, pr: number, createdAgoSec = 60, repo = "AMD-AGI/PrimusClaw") {
-    const id = (await w.q(
+  async function confirmation(actor: string, pr: number, createdAgoSec = 60, repo = "AMD-AGI/PrimusClaw", id: string | null = null) {
+    return (await w.q(
       `INSERT INTO claw_github_confirmations (confirmation_id, session_id, requester_user_id, actor_user_id, repo, pr, head_sha,
          title, author, reasons, checks, kind, action_key, expires_at, created_at)
-       VALUES (gen_random_uuid(), 'sess-x', $1, $1, $2, $3, 'abc123', 't', 'a', '[]'::jsonb, '{}'::jsonb, 'merge', '',
+       VALUES (COALESCE($5::uuid, gen_random_uuid()), 'sess-x', $1, $1, $2, $3, 'abc123', 't', 'a', '[]'::jsonb, '{}'::jsonb, 'merge', '',
                NOW() + INTERVAL '1 day', NOW() - make_interval(secs => $4::int))
        RETURNING confirmation_id`,
-      [actor, repo, pr, createdAgoSec],
+      [actor, repo, pr, createdAgoSec, id],
     ))[0].confirmation_id as string;
-    return id;
   }
+
+  /** The `assistant.action` events queued: what a channel would run. */
+  const actionsRun = () => count("claw_notification_outbox", "payload->>'type' = 'assistant.action'");
+  /** The buttons put to the user: `assistant.say` events carrying the action they would run. */
+  const buttons = async () => (await w.q(
+    "SELECT payload FROM claw_notification_outbox WHERE payload->>'type' = 'assistant.say' AND payload ? 'confirm_action' ORDER BY id",
+  )).map((r: Recorded) => r.payload);
 
   test("I1 a message to the user's own assistant is written down with the turn's id, how it was authenticated and its context", async () => {
     const big = { people: Array.from({ length: 60 }, (_, i) => ({ name: `P${i}`, user_id: `u${i}`, email: "x".repeat(300) })), channel_message_id: "m-1" };
@@ -284,7 +291,7 @@ describe("assistant review tools", { skip }, () => {
       const restart = await userTurn(alice, "换 opus 重审 254");
       rt.reviewToolPorts.restartReview = (async (_u: unknown, _m: unknown, _i: unknown, _c: unknown, guard: unknown) => late(restart)(guard)) as never;
       assert.equal(await code(rt.reviewRestart(restart, { item_id: "#1", model: "claude-opus-4-8" })), "turn_not_live");
-      const allow = await userTurn(alice, "254 可以合入");
+      const allow = await userTurn(alice, `批准 #${rt.confirmationRef(c)}`);
       rt.reviewToolPorts.decide = (async (_u: unknown, _i: unknown, _d: unknown, _v: unknown, guard: unknown) => late(allow)(guard)) as never;
       assert.equal(await code(rt.confirmationAnswer(allow, { decision: "allow", confirmation_id: c })), "turn_not_live");
       assert.deepEqual(guards, ["asked", "asked", "asked"]);
@@ -462,67 +469,76 @@ describe("assistant review tools", { skip }, () => {
     assert.equal(calls.restart.length, 1);
   });
 
-  test("C1 confirmation_answer allows only a write the user named; deny needs no name", async () => {
+  test("C1 confirmation_answer allows only on the exact approval command naming the write; deny is read from words", async () => {
     const c224 = await confirmation(alice.userId, 224);
-    await confirmation(bob.userId, 999); // bob's: never alice's to answer
-    const named = await userTurn(alice, "224 可以合入");
-    const out = await rt.confirmationAnswer(named, { decision: "allow" });
-    assert.deepEqual(calls.decide[0], { userId: alice.userId, id: c224, decision: "allow", via: null });
-    assert.equal((out as Recorded).pr, "AMD-AGI/PrimusClaw#224");
+    const bob999 = await confirmation(bob.userId, 999); // bob's: never alice's to answer
+    const ref = rt.confirmationRef(c224);
+    assert.match(ref, /^[0-9a-f]{6}$/);
+    const allowed = (text: string) => assert.deepEqual(calls.decide.at(-1), { userId: alice.userId, id: c224, decision: "allow", via: null }, text);
 
-    // The only one waiting, asked before the user wrote: "可以合" still names nothing, so it lets nothing through.
-    const onlyOne = await userTurn(alice, "可以合");
-    assert.equal(await code(rt.confirmationAnswer(onlyOne, { decision: "allow" })), "pr_not_in_message");
-    assert.equal(await code(rt.confirmationAnswer(onlyOne, { decision: "allow", confirmation_id: c224 })), "pr_not_in_message");
-    assert.equal(calls.decide.length, 1);
-    // Its confirmation id, as the card showed it, names it.
-    const byId = await userTurn(alice, `allow ${c224}`);
-    await rt.confirmationAnswer(byId, { decision: "allow", confirmation_id: c224 });
-    assert.deepEqual(calls.decide.at(-1), { userId: alice.userId, id: c224, decision: "allow", via: null });
-    assert.equal(calls.decide.length, 2);
-    // One asked after the user wrote is not what they answered, even when it is of the pull request they named.
+    // The command, with the ref the user was shown or the whole id: case, spacing, a full-width ＃ and closing punctuation aside.
+    const commands = [`批准 #${ref}`, `approve #${ref}`, `  APPROVE＃${ref.toUpperCase()} `, `批准＃ ${ref}。`, `批准#${ref}`, `approve #${c224}!`];
+    for (const text of commands) {
+      const turn = await userTurn(alice, text);
+      const out = await rt.confirmationAnswer(turn, { decision: "allow" });
+      allowed(text);
+      assert.equal((out as Recorded).pr, "AMD-AGI/PrimusClaw#224");
+    }
+    // The router's arguments may agree with the command, never choose: the command names the write.
+    const cmd = await userTurn(alice, `批准 #${ref}`);
+    await rt.confirmationAnswer(cmd, { decision: "allow", confirmation_id: c224, pr: "AMD-AGI/PrimusClaw#224" });
+    assert.equal(calls.decide.length, commands.length + 1);
+
+    // Anything but the command, alone, lets nothing through, the only write waiting or not.
+    for (const text of [`批准 ${ref}`, `请批准 #${ref}`, `批准 #${ref} 吧`, `批准 #${ref.slice(0, 5)}`, `批准 #${ref}0`, `批准 #${ref}，224 可以合入`,
+      `approve #${ref} after CI`, `don't approve #${ref}`, `批准 #${ref}\n批准 #${ref}`, `> 批准 #${ref}\n好`, `allow ${c224}`, "批准", "approve"]) {
+      const turn = await userTurn(alice, text);
+      assert.equal(await code(rt.confirmationAnswer(turn, { decision: "allow", confirmation_id: c224 })), "not_an_approval_command", text);
+    }
+    // Another person's write, or one that is not waiting: nothing.
+    const bobs = await userTurn(alice, `批准 #${rt.confirmationRef(bob999)}`);
+    assert.equal(await code(rt.confirmationAnswer(bobs, { decision: "allow" })), "confirmation_not_found");
+    assert.equal(await code(rt.confirmationAnswer(bobs, { decision: "allow", confirmation_id: bob999 })), "confirmation_not_found");
+    assert.equal(calls.decide.length, commands.length + 1);
+
+    // Two waiting: the command names one, and the router cannot swap in the other.
+    const c257 = await confirmation(alice.userId, 257);
+    const for224 = await userTurn(alice, `批准 #${ref}`);
+    assert.equal(await code(rt.confirmationAnswer(for224, { decision: "allow", confirmation_id: c257 })), "confirmation_not_in_message");
+    assert.equal(await code(rt.confirmationAnswer(for224, { decision: "allow", pr: "257" })), "confirmation_not_in_message");
+    assert.equal(await code(rt.confirmationAnswer(for224, { decision: "allow", pr: "AMD-AGI/Primus-Turbo#224" })), "confirmation_not_in_message");
+    await rt.confirmationAnswer(for224, { decision: "allow", pr: "224" });
+    allowed("224 of two");
+
+    // One held after the user wrote is not what they answered, even with its ref.
     await w.q("UPDATE claw_github_confirmations SET created_at = NOW() + INTERVAL '1 minute' WHERE confirmation_id = $1", [c224]);
-    const later = await userTurn(alice, "可以合");
-    assert.equal(await code(rt.confirmationAnswer(later, { decision: "allow" })), "confirmation_after_message");
-    const namedBefore = await userTurn(alice, "224 可以合入");
-    assert.equal(await code(rt.confirmationAnswer(namedBefore, { decision: "allow" })), "confirmation_after_message");
-    assert.equal(await code(rt.confirmationAnswer(namedBefore, { decision: "allow", pr: "224" })), "confirmation_after_message");
-    assert.equal(calls.decide.length, 2);
+    const before = await userTurn(alice, `批准 #${ref}`);
+    assert.equal(await code(rt.confirmationAnswer(before, { decision: "allow" })), "confirmation_after_message");
     await w.q("UPDATE claw_github_confirmations SET created_at = NOW() - INTERVAL '1 minute' WHERE confirmation_id = $1", [c224]);
 
-    // Two waited when the user wrote; one has gone since. "可以合" was not about the one left.
-    const gone = await confirmation(alice.userId, 300);
-    const twoThen = await userTurn(alice, "可以合");
-    await w.q("UPDATE claw_github_confirmations SET status = 'denied', decided_at = NOW() + INTERVAL '1 second' WHERE confirmation_id = $1", [gone]);
-    assert.equal(await code(rt.confirmationAnswer(twoThen, { decision: "allow" })), "pr_not_in_message");
-
-    const c257 = await confirmation(alice.userId, 257);
-    const vague = await userTurn(alice, "可以合");
-    assert.equal(await code(rt.confirmationAnswer(vague, { decision: "allow" })), "which_confirmation");
-    assert.equal(await code(rt.confirmationAnswer(vague, { decision: "allow", pr: "257" })), "pr_not_in_message");
-    assert.equal(await code(rt.confirmationAnswer(vague, { decision: "allow", pr: "999" })), "confirmation_not_found");
-    await rt.confirmationAnswer(vague, { decision: "deny", pr: "257" });
-    assert.deepEqual(calls.decide.at(-1), { userId: alice.userId, id: c257, decision: "deny", via: null });
-    // The same number waiting in two repositories: the number alone names neither.
+    // Two waiting writes that share the short ref: the ref names neither; the whole id names one.
     await w.q("DELETE FROM claw_github_confirmations");
-    const claw224 = await confirmation(alice.userId, 224);
-    const turbo224 = await confirmation(alice.userId, 224, 60, "AMD-AGI/Primus-Turbo");
-    const bare = await userTurn(alice, "224 可以合入");
-    assert.equal(await code(rt.confirmationAnswer(bare, { decision: "allow", confirmation_id: turbo224 })), "pr_not_in_message");
-    assert.equal(await code(rt.confirmationAnswer(bare, { decision: "allow", pr: "224" })), "which_confirmation");
-    const withRepo = await userTurn(alice, "Primus-Turbo 224 可以合入");
-    await rt.confirmationAnswer(withRepo, { decision: "allow", confirmation_id: turbo224 });
-    assert.equal(calls.decide.at(-1)?.id, turbo224);
-    assert.notEqual(claw224, turbo224);
-    const injected = await userTurn(alice, "看看 999 怎么样");
-    assert.equal(await code(rt.confirmationAnswer(injected, { decision: "allow", pr: "999" })), "confirmation_not_found");
-    assert.equal(calls.decide.length, 4);
-    // Deny still needs no name: saying no only makes less happen.
+    const twinA = await confirmation(alice.userId, 300, 60, "AMD-AGI/PrimusClaw", "abcdef01-0000-4000-8000-000000000001");
+    await confirmation(alice.userId, 301, 60, "AMD-AGI/PrimusClaw", "abcdef02-0000-4000-8000-000000000002");
+    const twins = await userTurn(alice, "批准 #abcdef");
+    assert.equal(await code(rt.confirmationAnswer(twins, { decision: "allow" })), "which_confirmation");
+    const whole = await userTurn(alice, `approve #${twinA}`);
+    await rt.confirmationAnswer(whole, { decision: "allow" });
+    assert.equal(calls.decide.at(-1)?.id, twinA);
+    const decided = calls.decide.length;
+
+    // Deny is still read from the person's words: saying no only makes less happen.
     await w.q("DELETE FROM claw_github_confirmations");
     const only = await confirmation(alice.userId, 224);
     const no = await userTurn(alice, "别合了");
     await rt.confirmationAnswer(no, { decision: "deny" });
     assert.deepEqual(calls.decide.at(-1), { userId: alice.userId, id: only, decision: "deny", via: null });
+    const c400 = await confirmation(alice.userId, 400);
+    const vague = await userTurn(alice, "不要合 400");
+    assert.equal(await code(rt.confirmationAnswer(vague, { decision: "deny" })), "which_confirmation");
+    await rt.confirmationAnswer(vague, { decision: "deny", pr: "400" });
+    assert.deepEqual(calls.decide.at(-1), { userId: alice.userId, id: c400, decision: "deny", via: null });
+    assert.equal(calls.decide.length, decided + 2);
   });
 
   test("M1 review_mode_set can only make reviews ask more", async () => {
@@ -536,37 +552,55 @@ describe("assistant review tools", { skip }, () => {
     assert.equal((await w.q("SELECT review_mode FROM claw_github_review_settings WHERE user_id = $1", [alice.userId]))[0].review_mode, "high_risk_confirm");
   });
 
-  test("X1 channel_action emits the listed action once, to the channel that carried the message", async () => {
+  test("X1 channel_action runs at once only its command typed whole; anything else is put to the user as a button", async () => {
     const ctx = { ...DEFAULT_CTX, actions: [{ name: "/brief", usage: "/brief on HH:MM", summary: "每个工作日的晨报" }] };
-    const none = await userTurn(alice, "每天十点给我晨报", { context: ctx });
+    const none = await userTurn(alice, "/brief on 10:00", { context: ctx });
     assert.equal(await code(rt.channelAction(none, { name: "brief", args: "on 10:00" })), "no_channel", "nobody subscribed to actions");
+    const noButtons = await userTurn(alice, "每天十点给我晨报", { context: ctx });
+    assert.equal(await code(rt.channelAction(noButtons, { name: "brief", args: "on 10:00" })), "no_channel", "nobody to show a button");
+    assert.equal(await count("claw_assistant_says"), 0, "the refused button was not kept either");
     await w.subscribe(alice.userId, ["assistant.say", "assistant.action"]);
-    await w.subscribe(bob.userId, ["assistant.action"]);
-    const turn = await userTurn(alice, "每天十点给我晨报", { context: ctx });
+    await w.subscribe(bob.userId, ["assistant.say", "assistant.action"]);
+
+    // The command, typed whole: it runs, once, on the channel that carried the message.
+    const turn = await userTurn(alice, "/brief on 10:00", { context: ctx });
     assert.equal(await code(rt.channelAction(turn, { name: "unlink" })), "action_not_offered");
     const out = await rt.channelAction(turn, { name: "/brief", args: "on 10:00" });
-    await rt.channelAction(turn, { name: "brief", args: "on 10:00" }); // a replayed call
+    assert.equal((out as Recorded).ran, true);
+    await rt.channelAction(turn, { name: "brief", args: "on  10:00" }); // a replayed call
     const rows = await w.q("SELECT event_id, payload FROM claw_notification_outbox");
     assert.equal(rows.length, 1, "one event, to alice's channel only");
     assert.deepEqual({ ...rows[0].payload, occurred_at: "x" }, {
       type: "assistant.action", event_id: (out as Recorded).event_id, occurred_at: "x", user_id: alice.userId,
       message_id: turn.mid, channel_message_id: "act-1", action: { name: "brief", args: "on 10:00" },
     });
-    const noId = await userTurn(alice, "每天十点给我晨报", { context: { actions: ctx.actions } });
+    const noId = await userTurn(alice, "/brief on 10:00", { context: { actions: ctx.actions } });
     assert.equal(await code(rt.channelAction(noId, { name: "brief", args: "on 10:00" })), "no_channel");
-    // Asked by its command, its name or a word of its label; not by a message about something else.
-    for (const text of ["/brief10:0", "/brief off", "brief me at 9", "晨报关掉"]) {
-      const asked = await userTurn(alice, text, { context: ctx });
-      await rt.channelAction(asked, { name: "brief", args: "off" });
+    for (const [text, args] of [["/brief off", "off"], ["  /BRIEF   Off ", "off"], ["/brief10:0", "10:0"], ["/brief", ""]]) {
+      const typed = await userTurn(alice, text, { context: ctx });
+      assert.equal((await rt.channelAction(typed, { name: "brief", args }) as Recorded).ran, true, text);
     }
-    const english = await userTurn(alice, "send me the morning summary at 9", { context: { ...DEFAULT_CTX, actions: [{ name: "brief", summary: "morning brief" }] } });
-    await rt.channelAction(english, { name: "brief", args: "on 09:00" });
-    assert.equal(await count("claw_notification_outbox"), 6);
-    for (const text of ["254 怎么样了", "briefing notes for 254?", "每个人都在吗"]) {
-      const unrelated = await userTurn(alice, text, { context: ctx });
-      assert.equal(await code(rt.channelAction(unrelated, { name: "brief", args: "off" })), "action_not_in_message", text);
+    assert.equal(await actionsRun(), 5);
+    assert.equal((await buttons()).length, 0);
+
+    // Anything else runs nothing: the user is shown the exact command with a button, once per call.
+    const asks: Array<[string, string]> = [["/brief10:0", "on 10:00"], ["每天十点给我晨报", "on 10:00"], ["/brief off please", "off"],
+      ["/briefing off", "off"], ["晨报关掉 /brief off", "off"], ["/brief off\n/brief on 9:00", "off"], ["/brief on 10:00", "off"]];
+    for (const [text, args] of asks) {
+      const said = await userTurn(alice, text, { context: ctx });
+      const shown = await rt.channelAction(said, { name: "brief", args }) as Recorded;
+      assert.equal(shown.ran, false, text);
+      assert.equal(shown.command, `/brief ${args}`);
+      await rt.channelAction(said, { name: "brief", args }); // a replayed call shows no second button
+      const card = (await buttons()).at(-1);
+      assert.deepEqual(card.confirm_action, { name: "brief", args, message_id: said.mid, channel_message_id: "act-1" }, text);
+      assert.ok(String(card.text).includes(`/brief ${args}`), card.text);
+      assert.equal(card.user_id, alice.userId);
     }
-    assert.equal(await count("claw_notification_outbox"), 6);
+    assert.equal(await actionsRun(), 5, "none of them ran");
+    assert.equal((await buttons()).length, asks.length);
+    assert.match(String((await buttons())[1].text), /^要执行 \/brief on 10:00 吗？/);
+    assert.match(String((await buttons())[2].text), /^Run \/brief off\?/);
   });
 
   test("U1 a worker's words in the item list never let an unrelated message allow a write or run a channel action", async () => {
@@ -588,38 +622,60 @@ describe("assistant review tools", { skip }, () => {
     assert.ok(system.endsWith(UNTRUSTED_CLOSE));
 
     // A signed-in message about something else, with the only write waiting and the action listed: the tools refuse,
-    // whatever the router was steered to call.
+    // whatever the router was steered to call, and the action only becomes a button the user did not press.
+    await w.subscribe(alice.userId, ["assistant.say"]);
+    const ref = rt.confirmationRef(c224);
     const ctx = { ...DEFAULT_CTX, actions: [{ name: "brief", usage: "/brief on HH:MM · /brief off", summary: "每个工作日的晨报" }] };
     const turn = await userTurn(alice, "254 怎么样了", { context: ctx });
-    assert.equal(await code(rt.confirmationAnswer(turn, { decision: "allow" })), "pr_not_in_message");
-    assert.equal(await code(rt.confirmationAnswer(turn, { decision: "allow", confirmation_id: c224 })), "pr_not_in_message");
-    assert.equal(await code(rt.confirmationAnswer(turn, { decision: "allow", pr: "AMD-AGI/PrimusClaw#224" })), "pr_not_in_message");
-    assert.equal(await code(rt.channelAction(turn, { name: "brief", args: "off" })), "action_not_in_message");
+    assert.equal(await code(rt.confirmationAnswer(turn, { decision: "allow" })), "not_an_approval_command");
+    assert.equal(await code(rt.confirmationAnswer(turn, { decision: "allow", confirmation_id: c224 })), "not_an_approval_command");
+    assert.equal(await code(rt.confirmationAnswer(turn, { decision: "allow", pr: "AMD-AGI/PrimusClaw#224" })), "not_an_approval_command");
+    assert.equal((await rt.channelAction(turn, { name: "brief", args: "off" }) as Recorded).ran, false);
     assert.equal(calls.decide.length, 0);
-    assert.equal(await count("claw_notification_outbox"), 0);
+    assert.equal(await actionsRun(), 0);
 
-    // A message that names the pull request without saying yes to it is no allow either.
-    for (const text of ["224 别合", "224 先别合，我再看看", "what's the status of PR 224?", "224 怎么样了", "don't merge 224", "224 merge status",
+    // Every phrase that got through an earlier guard (and every other yes in words) lets nothing through now.
+    const notCommands = [
+      // named, without a yes
+      "224 别合", "224 先别合，我再看看", "what's the status of PR 224?", "224 怎么样了", "don't merge 224", "224 merge status",
       "224 可以合入吗", "wait on 224", "no, not 224", "224 不可以合入", "224 不应该合", "224 还没同意", "224 先等等再合", "224 你可以合入了？",
       "you shouldn't merge 224", "224 can't be merged yet", "ok, but hold 224", "merge 224 only if CI passes", "224 暂缓，未确认",
       "224 这行代码有问题", "224 好像有问题", "Could we merge 224", "maybe merge 224", "should we merge 224", "224 也许可以合",
-      "merge 224", "224 好", "224 行"]) {
+      "merge 224", "224 好", "224 行",
+      // deferred, reported or conditional (the last verification's bypasses)
+      "好的，224 我晚点看一下", "224 ok, I'll look at it tomorrow", "收到 224 好的 稍后再审", "approve 224 after CI", "224 approved by Bob, I'm reviewing",
+      // a plain yes in words: no longer an allow either
+      "224 可以合入", "go ahead with 224", "224 lgtm, merge it", "ok 224", "AMD-AGI/PrimusClaw#224 同意", "224 没问题，合吧", "224 不错，可以合",
+      "可以合", "ok", "批准", `allow ${c224}`, `批准 ${ref}`, `批准 #${ref} 吧`, `approve #${ref} after CI`,
+    ];
+    for (const text of notCommands) {
       const named = await userTurn(alice, text, { context: ctx });
-      assert.equal(await code(rt.confirmationAnswer(named, { decision: "allow", confirmation_id: c224 })), "allow_not_in_message", text);
+      assert.equal(await code(rt.confirmationAnswer(named, { decision: "allow", confirmation_id: c224 })), "not_an_approval_command", text);
+      assert.equal(await code(rt.confirmationAnswer(named, { decision: "allow", pr: "224" })), "not_an_approval_command", text);
     }
     assert.equal(calls.decide.length, 0);
 
-    // The person's own words still work, beside the same list.
-    for (const text of ["224 可以合入", "go ahead with 224", "224 lgtm, merge it", "ok 224", "AMD-AGI/PrimusClaw#224 同意", "224 没问题，合吧", "224 不错，可以合"]) {
-      await w.q("UPDATE claw_github_confirmations SET status = 'pending', decided_at = NULL WHERE confirmation_id = $1", [c224]);
-      const yes = await userTurn(alice, text, { context: ctx });
-      await rt.confirmationAnswer(yes, { decision: "allow" });
-      assert.deepEqual(calls.decide.at(-1), { userId: alice.userId, id: c224, decision: "allow", via: null }, text);
+    // A channel action from words, however close to the setting, only ever shows a button.
+    const digest = [{ name: "digest", usage: "/digest on|off", summary: "Turn the weekly digest email on or off" }];
+    const notTyped: Array<[string, Recorded[], string, string]> = [
+      ["今天晨报内容不错", ctx.actions, "brief", "off"], ["晨报几点发", ctx.actions, "brief", "off"], ["晨报关掉", ctx.actions, "brief", "off"],
+      ["每天十点给我晨报", ctx.actions, "brief", "on 10:00"], ["brief me at 9", ctx.actions, "brief", "on 09:00"],
+      ["email me the file", digest, "digest", "off"], ["I read the digest", digest, "digest", "off"], ["what's in the weekly report", digest, "digest", "on"],
+      ["254 怎么样了", ctx.actions, "brief", "off"],
+    ];
+    for (const [text, actions, name, args] of notTyped) {
+      const said = await userTurn(alice, text, { context: { ...DEFAULT_CTX, actions } });
+      assert.equal((await rt.channelAction(said, { name, args }) as Recorded).ran, false, text);
     }
-    assert.equal(calls.decide.length, 7);
-    const brief = await userTurn(alice, "晨报关掉", { context: ctx });
-    await rt.channelAction(brief, { name: "brief", args: "off" });
-    assert.equal(await count("claw_notification_outbox"), 1);
+    assert.equal(await actionsRun(), 0, "no action ran");
+
+    // The person's own command still works, beside the same list: the approval command, and the action typed whole.
+    const yes = await userTurn(alice, `批准 #${ref}`, { context: ctx });
+    await rt.confirmationAnswer(yes, { decision: "allow" });
+    assert.deepEqual(calls.decide, [{ userId: alice.userId, id: c224, decision: "allow", via: null }]);
+    const brief = await userTurn(alice, "/brief off", { context: ctx });
+    assert.equal((await rt.channelAction(brief, { name: "brief", args: "off" }) as Recorded).ran, true);
+    assert.equal(await actionsRun(), 1);
   });
 
   test("W1 work_send refuses a review item; work_stop stops it only for the person", async () => {

@@ -114,7 +114,7 @@ someone else, or being made, is in progress; a denied one is done (stopped). A r
 With `CLAW_ASSISTANT_TOOLS=on` as well, the assistant's router can start, restart and answer reviews from what the user says
 (`assistant/review-tools.ts`): `review_start`, `review_restart`, `confirmation_answer`, `review_mode_set` (only towards
 `high_risk_confirm`; turning confirmations off stays the user's own setting) and `channel_action` (a setting the user's channel
-listed with the message, sent to it as an `assistant.action` event). `work_stop` stops a review item; `work_send` refuses one.
+listed with the message). `work_stop` stops a review item; `work_send` refuses one.
 
 They act only for the person, never for a key or a report:
 
@@ -124,8 +124,16 @@ They act only for the person, never for a key or a report:
 - **Grounded.** A pull request's number must be in that message; its repository named there, or, when the message names none,
   the only repository it can be: the channel's own (`channel_context.repos`), else the one the user's recent reviews used (two
   candidates and a bare number are refused, so the assistant asks); a model named there; a reviewer the user themself or someone
-  the channel listed with a Claw `user_id` (`channel_context.people`); and a held write the user allows already waiting when they
-  wrote, and named by its number unless it was the only one waiting.
+  the channel listed with a Claw `user_id` (`channel_context.people`).
+- **Two acts are never read from a sentence.** A held write is let through only when the user's whole message is the approval
+  command `批准 #<ref>` or `approve #<ref>` (case, spacing, a full-width `＃` and closing punctuation aside), where `<ref>` is the
+  first six hex digits of its confirmation id (the assistant shows it; the whole id also works), and only for a write that was
+  waiting when they wrote; any other yes is refused (`not_an_approval_command`), and the card's button works as before. Saying
+  no (deny) is still read from the user's words. A channel action runs at once (an `assistant.action` event) only when the
+  user's message is its command typed whole (`/brief off`, with the arguments the call carries); anything else is put to the
+  user as an `assistant.say` that names the exact command and carries it as `confirm_action` (`{name, args, message_id,
+  channel_message_id}`), for the channel to draw as a button that runs it only when the user presses it. A channel that
+  draws no button shows the text, which tells the user to type the command.
 
 The review is then made by the same `startReviews` / `restartReview` as the routes above, with the person's message standing
 for their sign-in, so every check above applies unchanged.

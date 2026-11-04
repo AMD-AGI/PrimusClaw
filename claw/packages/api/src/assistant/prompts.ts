@@ -17,8 +17,12 @@ import type { ReportKind } from "./work-items.js";
 
 /** router-v4: router-v2 with the item list inside an untrusted-data block (what workers and models wrote is quoted data). */
 export const ROUTER_PROMPT_VERSION = "router-v4";
-/** The router's prompt with the review and settings tools (`CLAW_ASSISTANT_TOOLS=on`): router-v4 and `ROUTER_REVIEW_PROMPT` (v5: router-v3 plus that block, and allow and channel actions grounded in the user's words). */
-export const ROUTER_REVIEW_PROMPT_VERSION = "router-v5";
+/**
+ * The router's prompt with the review and settings tools (`CLAW_ASSISTANT_TOOLS=on`): router-v4 and `ROUTER_REVIEW_PROMPT`
+ * (v6: v5 with an allow only on the user's exact approval command, and a channel action not typed as its command put to the user
+ * as a button).
+ */
+export const ROUTER_REVIEW_PROMPT_VERSION = "router-v6";
 
 /** The assistant's MCP server, which is what Brain puts before each of its tools' names. */
 export const ASSISTANT_MCP_SERVER = "assistant";
@@ -66,9 +70,9 @@ These tools act for the user, with their GitHub account or their settings. They 
 - review_restart(item_id, model?, merge?, effort?): the user wants a review changed (another model, merge after all, review only) or run again. It stops the old item and starts a new one with the rest unchanged. It is refused once merged.
 - work_stop(item_id, reason) stops a review as well (like the tools above, only in a turn that answers the user), and cancels what waits for confirmation in it. If it answers merge_in_progress or already_merged, tell the user exactly that.
 - work_send does not reach a review: use review_restart.
-- confirmation_answer(decision, confirmation_id?, pr?): the user answers a write listed under Waiting for you (224 可以合入, go ahead with 224 → allow; 别合, no → deny). Name it by confirmation_id or pr. allow only when the user's own message says yes and names that pull request (its number) or its confirmation_id; a yes that names neither ("可以合", "ok") is refused even when only one write waits, so ask which pull request, and a message that names it without a plain yes (a question, 别合, wait) is never an allow.
+- confirmation_answer(decision, confirmation_id?, pr?): the user answers a write listed under Waiting for you. deny when they say no to it (别合, don't merge 224, stop): name it by confirmation_id or pr. allow only when the user's whole message is the approval command with that write's ref, 批准 #<ref> or approve #<ref> (批准 #a3f9c2); pass its confirmation_id. Any other yes (224 可以合入, ok, go ahead, lgtm) lets nothing through: tell the user to reply exactly 批准 #<ref> for the write they mean, or press the button on its card. When you tell the user about a waiting write, give its ref.
 - review_mode_set(mode): high_risk_confirm when the user wants to be asked before every high-risk approval or merge. Turning confirmations off is a setting only the user changes, in their settings: tell them so.
-- channel_action(name, args): the user asks in words for a setting their channel lists under Channel actions (每天十点给我晨报 → brief, "on 10:00"). Only actions listed with this message, and only when the user's message itself asks for that action: it types the command, or names the action or what it is about. It is refused otherwise; if none fits, tell them the command to type.
+- channel_action(name, args): the user wants a setting their channel lists under Channel actions (每天十点给我晨报 → brief, "on 10:00"). Only actions listed with this message, and only when the user's message is about that setting; when it is not, do not call it. When their message is the command itself (/brief off), it runs at once. Otherwise nothing runs: the user is shown the exact command with a button and it runs only if they press it, so tell them to check it and press the button; never say it is done.
 Every one of these may be refused, and a refusal is the answer: tell the user what it says and what they can do; never report work as started or done that was refused.`;
 
 export const WORKER_PROMPT = `You are a worker on one work item for a user. Nobody reads your plain output: the user talks to their assistant, and the assistant only learns what you tell it with the report tool (${TOOL_NAME_PREFIX}report).
@@ -148,6 +152,12 @@ export function renderRouterSystem(items: readonly ManifestItem[]): string {
   return `${ROUTER_PROMPT}\n\nWork items (open ones, and ones closed in the last day):\n${UNTRUSTED_PREAMBLE}\n${UNTRUSTED_OPEN}\n${list}\n${UNTRUSTED_CLOSE}`;
 }
 
+/** The short form of a confirmation id the user is shown and types back (`批准 #a3f9c2`): its first six hex digits, lower-cased. */
+export const CONFIRMATION_REF_LEN = 6;
+export function confirmationRef(id: string): string {
+  return id.replace(/-/g, "").slice(0, CONFIRMATION_REF_LEN).toLowerCase();
+}
+
 /** What the router is shown beside the item list when it has the review and settings tools, for one turn. */
 export interface ReviewContext {
   confirmations: Array<{ id: string; repo: string; pr: number; kind: string; expires_at: Date | string }>;
@@ -161,7 +171,7 @@ export interface ReviewContext {
 export function renderReviewContext(c: ReviewContext): string {
   const iso = (d: Date | string) => (d instanceof Date ? d.toISOString() : String(d));
   const waiting = c.confirmations.length
-    ? c.confirmations.map((x) => `- confirmation_id: ${x.id} | ${x.kind === "review" ? "approval" : "merge"} of ${oneLine(x.repo)}#${x.pr} | expires ${iso(x.expires_at)}`).join("\n")
+    ? c.confirmations.map((x) => `- ref #${confirmationRef(x.id)} | confirmation_id: ${x.id} | ${x.kind === "review" ? "approval" : "merge"} of ${oneLine(x.repo)}#${x.pr} | expires ${iso(x.expires_at)} | the user lets it through with: 批准 #${confirmationRef(x.id)}`).join("\n")
     : "(nothing)";
   const people = c.people.length
     ? c.people.map((p) => `- ${oneLine(p.name)}${p.user_id ? ` (user_id: ${oneLine(p.user_id)})` : " (not linked: cannot review as them)"}`).join("\n")
