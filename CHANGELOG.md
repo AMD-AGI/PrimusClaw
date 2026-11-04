@@ -52,6 +52,18 @@ record it.
   and the refusal names the variable. Events still waiting when the user stops watching are dropped. A failed CI is passed on as counts, run ids and conclusions, never the runs' names. Reviews on someone's behalf are never subscribed. New tables `claw_work_item_subscriptions`,
   `claw_work_item_github_events` and `claw_work_item_pr_replies` (required at start-up when the assistant is on);
   `CLAW_ASSISTANT_GITHUB_MAX_SUBSCRIPTIONS` (default 20) caps what one user watches.
+- The assistant can watch a group chat or a repository and record what it would do there without doing it, behind
+  `CLAW_ASSISTANT_OBSERVE` (default off; needs `CLAW_ASSISTANT_ENABLED`): `POST /v1/assistant/observations` hands one
+  message of a place (`group:<channel>:<id>` or `repo:<owner>/<repo>`) to a watcher session of the caller's own, whose
+  every assistant tool only writes a record (`claw_assistant_observations`); `GET /v1/assistant/observations?scope=`
+  reads it back message by message; `GET`/`PUT /v1/assistant/scopes` list and switch a place between `observe` (the
+  default) and `auto`, which only a person's sign-in (or a service in `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS`) can
+  set. Acting in `auto` is not built yet: a place in `auto` is still only recorded. New tables `claw_assistant_scopes`
+  and `claw_assistant_observations`, required at start-up when the assistant is on.
+- A watchdog for work items, behind `CLAW_ASSISTANT_WATCHDOG_SEC` (default 0, off): an item in progress with a run or a
+  queued instruction behind it and no sign of life for longer than the threshold is moved to "needs you" with the
+  reason (no progress, a worker with no heartbeat, an instruction no run took up), which wakes the assistant; it runs
+  in the assistant's existing sweep and stops nothing.
 - On-behalf GitHub reviews as work items of the assistant, behind `CLAW_ASSISTANT_REVIEW_ITEMS` (default off; needs
   `CLAW_ASSISTANT_ENABLED` and `CLAW_GITHUB_REVIEW_ENABLED`): `POST /v1/assistant/reviews` and `POST
   /v1/assistant/reviews/:id/restart`; `claw_work_items.kind` (`task` | `review`) and `params` (new columns, required at
