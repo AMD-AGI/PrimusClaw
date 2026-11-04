@@ -255,19 +255,24 @@ export interface Line { what: string; at: (length: number) => string }
  * character changes, and with a character that fails the match after the run, and over lines that say one opening of a sample over and over
  * (`repeatedOpenings`), every line `length` characters long. Each slow line is timed again and the fastest of the runs counts, so one pause of
  * the process is not a slow pattern. With `stopAboveMs` it stops at the first line over that, which is how a pattern that is known to be slow
- * is shown to be without waiting for it on every line. `line` is the line that cost the most, which `growth` times again at other lengths.
+ * is shown to be without waiting for it on every line. `line` is the line that cost the most, and `over` every line that cost more than
+ * `overMs`, which `growth` times again at other lengths: the line that cost the most can be one the pattern reads in linear time while
+ * another, that cost less, is read in the square of its length.
  */
-export function worstCost(source: string, flags: string, length: number, stopAboveMs = Infinity): { ms: number; line: Line } {
+export function worstCost(
+  source: string, flags: string, length: number, stopAboveMs = Infinity, overMs = Infinity,
+): { ms: number; line: Line; over: Line[] } {
   const re = new RegExp(source, flags.replace(/[gy]/g, ""));
-  let worst: { ms: number; line: Line } = { ms: 0, line: { what: "", at: () => "" } };
+  let worst: { ms: number; line: Line; over: Line[] } = { ms: 0, line: { what: "", at: () => "" }, over: [] };
   const time = (line: string): number => { const t0 = performance.now(); re.exec(line); return performance.now() - t0; };
   const samples = sampleStrings(source);
   const slowest = (line: Line): boolean => {
     const text = line.at(length);
     let ms = time(text);
-    if (ms > worst.ms) {
+    if (ms > worst.ms || ms > overMs) {
       ms = Math.min(ms, time(text), time(text));
-      if (ms > worst.ms) worst = { ms, line };
+      if (ms > overMs) worst.over.push(line);
+      if (ms > worst.ms) worst = { ms, line, over: worst.over };
     }
     return worst.ms > stopAboveMs;
   };
@@ -293,15 +298,17 @@ export function worstCost(source: string, flags: string, length: number, stopAbo
 }
 
 /**
- * How many times as long an `exec` of the pattern takes on the line at `length` as on the same line at a quarter of it: about 4 for a pattern
- * whose cost is linear in its line, about 16 for one that costs the square of it, and more for worse. A ratio of two times taken on the same
+ * How many times as long an `exec` of the pattern takes on the line at `length` as on the same line at a quarter of it (`ratio`): about 4 for a
+ * pattern whose cost is linear in its line, about 16 for one that costs the square of it, and more for worse; and what one `exec` on the line
+ * at `length` cost (`ms`). The ratio is only telling where that is well over the resolution of the clock: a pattern that costs a microsecond
+ * or two can take eight times as long on four times the line for reasons that have nothing to do with backtracking. A ratio of two times taken on the same
  * machine in the same moments, not a number of milliseconds: a busy or slow machine slows both alike. The two are timed in turn, `rounds`
  * times, and the least of each is the one compared, since a pause only ever makes a run slower. Each time is of as many `exec`s as make the
  * one on the long line last some tens of microseconds: enough that a pattern that costs a microsecond is not timed at the resolution of the
  * clock, and short enough that most runs fit between two of the pauses of a machine whose CPU is shared (a time of a millisecond is cut by
  * one in almost every round on a CPU quota of a quarter, and the least of them is no longer a time nothing touched).
  */
-export function growth(source: string, flags: string, line: Line, length: number, rounds = 15): number {
+export function growth(source: string, flags: string, line: Line, length: number, rounds = 15): { ratio: number; ms: number } {
   const re = new RegExp(source, flags.replace(/[gy]/g, ""));
   const short = line.at(Math.floor(length / 4));
   const long = line.at(length);
@@ -319,6 +326,6 @@ export function growth(source: string, flags: string, line: Line, length: number
     leastShort = Math.min(leastShort, time(short, runs));
     leastLong = Math.min(leastLong, time(long, runs));
   }
-  return leastLong / leastShort;
+  return { ratio: leastLong / leastShort, ms: leastLong / runs };
 }
 

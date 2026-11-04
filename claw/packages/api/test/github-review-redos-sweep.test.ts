@@ -12,8 +12,8 @@
  *   S2  the timing sees what it is for: the patterns that were super-linear (copied as they were) are over the bound, and their cost grows
  *       faster than their line
  *   S3  every regular expression literal in `src/github-review` is under it, on lines at the longest a changed line is read, including lines
- *       that say the opening of the pattern over and over; or, where one `exec` was timed over it, its cost on its slowest line grows no
- *       faster than the line does, since a pause of a busy runner makes a pattern of a few microseconds look slow and never makes it grow
+ *       that say the opening of the pattern over and over; or, where one `exec` was timed over it, its cost on every line timed over it grows
+ *       no faster than the line does, since a pause of a busy runner makes a pattern of a few microseconds look slow and never makes it grow
  *   S4  the entry points that read a repository's own text (`.github/claw-review.yml`, a `package.json` change) cost a bounded amount on the
  *       lines that were slow, and read what they read before
  *   S5  one `assessRisk` call on the most a pull request can make it read (500 lines at the cap) costs a bounded amount, whatever the lines
@@ -121,7 +121,7 @@ test("S2 the timing flags the patterns that were super-linear, written as they w
     // a line the pattern reads in linear time. Three rounds: they are far over it.
     const slowest = worstCost(source, flags, length / 4).line;
     const grew = growth(source, flags, slowest, length, 3);
-    assert.ok(grew > GROWTH_BOUND, `${what}: ${grew.toFixed(1)} times as long at four times the length (${slowest.what})`);
+    assert.ok(grew.ratio > GROWTH_BOUND && grew.ms > bound, `${what}: ${grew.ratio.toFixed(1)} times as long at four times the length, ${grew.ms.toFixed(1)} ms (${slowest.what})`);
     const re = new RegExp(source, flags);
     const samples = sampleStrings(source);
     assert.ok(samples.some((x) => re.test(x)), `none of ${JSON.stringify(samples.slice(0, 3))} matches /${source}/`);
@@ -130,19 +130,28 @@ test("S2 the timing flags the patterns that were super-linear, written as they w
 
 test("S3 every regular expression literal in the module costs under the bound on a line at the longest a changed line is read, or grows no faster than the line, whatever the line repeats", () => {
   // The bound is a fraction of a millisecond, and a CI runner whose CPU is shared has once timed a pattern that costs 0.06 ms at 1.45 ms
-  // (in each of the three timings of its line). So a pattern over it is asked how its cost grows on that line, a ratio of two times that
-  // the same pauses touch alike, and is slow only if it grows faster than the line: the defect the bound is there for is a pattern whose
-  // cost grows with the square of its line (S2), and such a pattern is over the bound in the first place and over GROWTH_BOUND as well.
+  // (in each of the three timings of its line). So a pattern over it is asked how its cost grows on each line it was over it on, a ratio
+  // of two times that the same pauses touch alike, and is slow only if it grows faster than the line: the defect the bound is there for is
+  // a pattern whose cost grows with the square of its line (S2), and such a pattern is over the bound in the first place and over
+  // GROWTH_BOUND as well, on the line that showed it, whichever line cost the most. It is still over the bound in the least of the rounds
+  // that measured its growth, which a pattern that only looked slow in one moment is not.
   const slow: string[] = [];
   let timed = 0;
   for (const f of readdirSync(SOURCES).filter((n) => n.endsWith(".ts"))) {
     for (const r of regexLiterals(readFileSync(new URL(f, SOURCES), "utf8"))) {
-      const { ms, line } = worstCost(r.source, r.flags, MAX_LINE_CHARS);
+      const { over } = worstCost(r.source, r.flags, MAX_LINE_CHARS, Infinity, EXEC_BOUND_MS);
       timed += 1;
-      if (ms <= EXEC_BOUND_MS) continue;
-      let grew = growth(r.source, r.flags, line, MAX_LINE_CHARS);
-      if (grew > GROWTH_BOUND) grew = Math.min(grew, growth(r.source, r.flags, line, MAX_LINE_CHARS)); // a super-linear pattern is over it every time
-      if (grew > GROWTH_BOUND) slow.push(`${f}:${r.line} /${r.source}/ ${ms.toFixed(2)} ms on ${line.what}, ${grew.toFixed(1)} times as long as at a quarter of the length`);
+      const isSlow = (g: { ratio: number; ms: number }): boolean => g.ratio > GROWTH_BOUND && g.ms > EXEC_BOUND_MS;
+      for (const line of over) {
+        // Asked twice before it is called slow: a super-linear pattern is over both every time.
+        const grew = [growth(r.source, r.flags, line, MAX_LINE_CHARS)];
+        if (isSlow(grew[0]!)) grew.push(growth(r.source, r.flags, line, MAX_LINE_CHARS));
+        if (grew.every(isSlow)) {
+          const g = grew[grew.length - 1]!;
+          slow.push(`${f}:${r.line} /${r.source}/ ${g.ms.toFixed(2)} ms on ${line.what}, ${g.ratio.toFixed(1)} times as long as at a quarter of the length`);
+          break;
+        }
+      }
     }
   }
   assert.ok(timed > 120, `${timed} patterns timed`);
