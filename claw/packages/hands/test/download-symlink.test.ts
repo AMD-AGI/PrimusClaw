@@ -120,3 +120,24 @@ test("a file inside that is also a name for a file outside is not written", asyn
   assert.match(out.failed[0].error, /one name/);
   assert.equal(fs.readFileSync(victim, "utf-8"), "keep");
 });
+
+test("a file already there and renamed out of the workspace mid-write keeps none of the bytes", async () => {
+  const fsMod = (await import("node:fs")).default;
+  const dir = path.join(WORK, "moving-existing");
+  fsMod.mkdirSync(dir);
+  fsMod.writeFileSync(path.join(dir, "h.txt"), "old");
+  const real = fsMod.ftruncateSync;
+  fsMod.ftruncateSync = ((fd: number, len?: number) => {
+    fsMod.ftruncateSync = real;
+    fsMod.renameSync(dir, path.join(OUTSIDE, "moving-existing"));
+    return real(fd, len);
+  }) as typeof real;
+  try {
+    const out = result(await downloadS3.execute({ files: [{ local_path: path.join(dir, "h.txt"), presigned_url: url }] }));
+    assert.deepEqual(out.ok, []);
+    assert.match(out.failed[0].error, /moved while being written/);
+    assert.equal(fsMod.readFileSync(path.join(OUTSIDE, "moving-existing", "h.txt"), "utf-8"), "", "the bytes did not stay outside");
+  } finally {
+    fsMod.ftruncateSync = real;
+  }
+});
