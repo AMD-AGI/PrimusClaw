@@ -248,6 +248,25 @@ describe("assistant review continuation", { skip }, () => {
     assert.equal(await ri.syncReviewItemOfSession(second.session_id), true);
   });
 
+  test("A7 resolving a thread takes the same lock: a restart waits for it, and a stopped review's session resolves nothing", async () => {
+    const { acquireWriteLock, releaseWriteLock, writeLockKey } = await import("../src/github-review/store.js");
+    const first = await start();
+    await post(first.session_id, HEAD, [{ path: "src/app.ts", line: 3, body: "c_bad" }]);
+    await turnEnds(first.session_id);
+    const second = await restart(first.item_id);
+    const key = writeLockKey("alice", PR);
+    const holder = await acquireWriteLock(w.h.app.db.db as never, key, 120);
+    const waiting = await service.resolveThread(actor(second.session_id), { pr: PR_REF, thread_id: "PRRT_1", head_sha: HEAD });
+    assert.equal(waiting.body.reason, "write_in_progress", waiting.text);
+    await releaseWriteLock(w.h.app.db.db as never, key, holder!);
+    // Restarted again: the second session's item is stopped, and its late resolve is refused under the lock.
+    await restart(second.item_id);
+    const late = await service.resolveThread(actor(second.session_id), { pr: PR_REF, thread_id: "PRRT_1", head_sha: HEAD });
+    assert.equal(late.body.reason, "review_stopped", late.text);
+    assert.equal(gh.resolves.length, 0, "nothing was resolved");
+    assert.equal(gh.threads[0]?.isResolved, false);
+  });
+
   test("A6 the continuation note carries no text a pull request or a model chose", () => {
     const text = ri.continuationBrief(PR, {
       from_item: "kwi_1", from_seq: 1, head_sha: HEAD, verdict: "COMMENT", model: null,

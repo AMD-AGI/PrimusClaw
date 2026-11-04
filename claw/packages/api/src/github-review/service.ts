@@ -1449,32 +1449,33 @@ export class GithubReview {
       if (!continuation?.findings.some((f) => f.thread_id === threadId)) {
         throw new Refusal("thread_not_recorded", "only the thread of a finding the last review recorded (continuation.findings) can be resolved");
       }
-      if (this.deps.sessionStopped && await this.deps.sessionStopped(ctx.actor.sessionId)) {
-        throw new Refusal("review_stopped", "the person who asked for this review stopped it; nothing was written");
-      }
-      const { pr } = await this.load(ctx, ref);
-      this.requireOpen(pr);
-      this.requireHead(pr, headSha);
-      const g = await ctx.client.graphql<{ node?: {
-        id?: string; isResolved?: boolean; pullRequest?: { number?: number; repository?: { nameWithOwner?: string } } | null;
-        comments?: { nodes?: Array<{ author?: { login?: string } | null }> };
-      } | null }>(THREAD_QUERY, { id: threadId });
-      const t = g.node;
-      if (!t || t.pullRequest?.number !== ref.number || String(t.pullRequest?.repository?.nameWithOwner ?? "").toLowerCase() !== `${ref.owner}/${ref.repo}`.toLowerCase()) {
-        throw new Refusal("thread_not_on_pull_request", "that thread is not one of this pull request's");
-      }
-      const author = String(t.comments?.nodes?.[0]?.author?.login ?? "");
-      if (!ctx.cred.login.trim() || author.toLowerCase() !== ctx.cred.login.toLowerCase()) {
-        throw new Refusal("not_own_thread", "that thread was not opened by the acting user's account, and another person's thread is theirs to resolve");
-      }
-      const redact = (x: string): string => ctx.client.redact(x);
-      if (t.isResolved === true) return ok({ status: "already_resolved", thread_id: threadId, head_sha: headSha }, redact);
-      if (!ctx.settings.writesEnabled) {
-        ctx.acc.dryRun = true;
-        return ok({ status: "dry_run", thread_id: threadId, note: "writes are switched off in this deployment; nothing was resolved" }, redact);
-      }
-      await ctx.client.graphql(RESOLVE_THREAD_MUTATION, { id: threadId });
-      return ok({ status: "resolved", thread_id: threadId, head_sha: headSha }, redact);
+      // Under the lock a restart and a stop take (and asking there whether the review was stopped): a restart either waits for this
+      // resolve or this resolve sees that the review it belongs to was stopped, and never lands after the next review was told what is open.
+      return this.oneAtATime(ctx, ref, async () => {
+        const { pr } = await this.load(ctx, ref);
+        this.requireOpen(pr);
+        this.requireHead(pr, headSha);
+        const g = await ctx.client.graphql<{ node?: {
+          id?: string; isResolved?: boolean; pullRequest?: { number?: number; repository?: { nameWithOwner?: string } } | null;
+          comments?: { nodes?: Array<{ author?: { login?: string } | null }> };
+        } | null }>(THREAD_QUERY, { id: threadId });
+        const t = g.node;
+        if (!t || t.pullRequest?.number !== ref.number || String(t.pullRequest?.repository?.nameWithOwner ?? "").toLowerCase() !== `${ref.owner}/${ref.repo}`.toLowerCase()) {
+          throw new Refusal("thread_not_on_pull_request", "that thread is not one of this pull request's");
+        }
+        const author = String(t.comments?.nodes?.[0]?.author?.login ?? "");
+        if (!ctx.cred.login.trim() || author.toLowerCase() !== ctx.cred.login.toLowerCase()) {
+          throw new Refusal("not_own_thread", "that thread was not opened by the acting user's account, and another person's thread is theirs to resolve");
+        }
+        const redact = (x: string): string => ctx.client.redact(x);
+        if (t.isResolved === true) return ok({ status: "already_resolved", thread_id: threadId, head_sha: headSha }, redact);
+        if (!ctx.settings.writesEnabled) {
+          ctx.acc.dryRun = true;
+          return ok({ status: "dry_run", thread_id: threadId, note: "writes are switched off in this deployment; nothing was resolved" }, redact);
+        }
+        await ctx.client.graphql(RESOLVE_THREAD_MUTATION, { id: threadId });
+        return ok({ status: "resolved", thread_id: threadId, head_sha: headSha }, redact);
+      });
     });
   }
 
