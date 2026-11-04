@@ -100,13 +100,14 @@ function openDirBelow(root: string, parts: string[]): number | string {
  *
  * The bytes go into a new file only Hands can open (made next to the target
  * through the directory's descriptor), which then takes the target's name in
- * that same directory and is opened to others only once it is known to be in
- * place: no other name, link or file can receive them, and a
+ * that same directory: no other name, link or file can receive them, and a
  * file already at `p` is replaced rather than written into. Nothing stops
  * another process renaming a directory while this runs, so where the file is
- * is asked once more after the rename: one moved out meanwhile is emptied and
- * removed. A move after that is a move of a finished file, which no write can
- * prevent.
+ * is asked after the rename and again after it is opened to others: one moved
+ * out before either answer is closed again, emptied and removed. Only a process
+ * that can rename a directory in the workspace can move it, and it can read the
+ * finished download anyway; a move after the last answer is a move of a
+ * finished file, which no write can prevent.
  */
 function writeWhereNamed(p: string, body: Buffer): string | null {
   const named = below(path.resolve(WORKSPACE), p);
@@ -136,15 +137,19 @@ function writeWhereNamed(p: string, body: Buffer): string | null {
       fs.rmSync(part, { force: true });
       throw e;
     }
-    const moved = placeOf(fd, root);
+    let moved = placeOf(fd, root);
+    if (!moved) {
+      fs.fchmodSync(fd, 0o666 & ~process.umask());
+      moved = placeOf(fd, root);
+    }
     if (moved) {
+      fs.fchmodSync(fd, 0o600);
       fs.ftruncateSync(fd, 0);
       const mine = fs.fstatSync(fd);
       const there = fs.lstatSync(target, { throwIfNoEntry: false });
       if (there && there.ino === mine.ino && there.dev === mine.dev) fs.unlinkSync(target);
       return `not written: ${p} was moved while being written and ${moved}`;
     }
-    fs.fchmodSync(fd, 0o666 & ~process.umask());   // readable by others only once it is known to be in place
     return null;
   } finally {
     if (fd !== undefined) fs.closeSync(fd);

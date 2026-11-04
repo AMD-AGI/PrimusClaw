@@ -30,7 +30,7 @@ after(() => {
 });
 
 /** Replace `fs.<name>` until its first call, running `meanwhile` just before that call goes through. */
-function onFirstCall(name: "renameSync" | "writeFileSync" | "ftruncateSync", meanwhile: (...args: any[]) => void): () => void {
+function onFirstCall(name: "renameSync" | "writeFileSync" | "ftruncateSync" | "fchmodSync", meanwhile: (...args: any[]) => void): () => void {
   const real = fs[name] as (...args: any[]) => any;
   (fs as any)[name] = (...args: any[]) => {
     (fs as any)[name] = real;
@@ -170,6 +170,24 @@ for (const existing of [false, true]) {
     }
   });
 }
+
+test("a directory renamed out of the workspace just before the file is opened to others keeps none of the bytes", async () => {
+  const dir = path.join(WORK, "moving-late");
+  fs.mkdirSync(dir);
+  let modeWhileOutside = -1;
+  const restoreChmod = onFirstCall("fchmodSync", () => fs.renameSync(dir, path.join(OUTSIDE, "moving-late")));
+  const restoreTruncate = onFirstCall("ftruncateSync", (fd: number) => { modeWhileOutside = fs.fstatSync(fd).mode & 0o777; });
+  try {
+    const out = result(await downloadS3.execute({ files: [{ local_path: path.join(dir, "f.txt"), presigned_url: url }] }));
+    assert.deepEqual(out.ok, []);
+    assert.match(out.failed[0].error, /moved while being written/);
+    assert.equal(modeWhileOutside, 0o600, "closed to other identities again before it is emptied");
+    assert.deepEqual(outsideHolds("uploaded bytes"), [], "the bytes did not stay outside");
+  } finally {
+    restoreTruncate();
+    restoreChmod();
+  }
+});
 
 test("a write that fails part way leaves no part of the download", async () => {
   const target = path.join(WORK, "partial", "p.txt");
