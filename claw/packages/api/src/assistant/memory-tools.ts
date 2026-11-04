@@ -200,14 +200,15 @@ export async function memoryRecall(
     await requireMemoryHere(q, claims.sid, turn.userId);
     return turn;
   });
-  const visible = (r: MemoryRow): boolean =>
-    claims.role === "router" || r.work_item_id === null || r.work_item_id === claims.item_id;
+  // A worker's reach is asked of the store itself, so another item's entries are neither among its results nor counted as read.
+  const item = claims.role === "router" ? undefined : (claims.item_id ?? "");
+  const visible = (r: MemoryRow): boolean => item === undefined || r.work_item_id === null || r.work_item_id === item;
   if (args.id !== undefined && args.id !== null && args.id !== "") {
-    const rows = (await recallMemory(userId, { id: entryId(args.id) })).filter(visible);
+    const rows = await recallMemory(userId, { id: entryId(args.id), item });
     return rows.length ? { ok: true, entry: full(rows[0]) } : { ok: false, error: "not_found", message: "no such entry" };
   }
   const query = typeof args.query === "string" ? args.query.trim() : "";
-  if (query) return { ok: true, entries: (await recallMemory(userId, { query })).filter(visible).map(full) };
+  if (query) return { ok: true, entries: (await recallMemory(userId, { query, item })).map(full) };
   // Waiting for the user's confirmation, or the profile earlier versions generated: not the model's to read (`readEntry`).
   const rows = (await listMemories(userId)).filter((r) => r.status === "active" && r.category !== "user_profile" && visible(r));
   return { ok: true, count: rows.length, entries: rows.map(line) };
@@ -256,15 +257,18 @@ export async function memoryUndo(claims: AssistantTokenClaims, args: { id?: unkn
 
 // --- What a turn is shown -------------------------------------------------------------------------------------------
 
-/** Each of the user's work items that an entry is bound to, labelled as the router names items (`item #3`). */
+/**
+ * Each work item that an entry is bound to, labelled as the router names items (`item #3`). One whose row is gone (or is
+ * not the user's) is still listed, as such, so the entry stays in the router's index where the person can see and forget it.
+ */
 async function boundItemLabels(userId: string): Promise<Map<string, string>> {
   const rows = (await db.query(
-    `SELECT DISTINCT w.item_id, w.seq FROM claw_memory_entries e
-       JOIN claw_work_items w ON w.item_id = e.work_item_id AND w.user_id = e.user_id
+    `SELECT DISTINCT e.work_item_id AS item_id, w.seq FROM claw_memory_entries e
+       LEFT JOIN claw_work_items w ON w.item_id = e.work_item_id AND w.user_id = e.user_id
       WHERE e.user_id = $1 AND e.work_item_id IS NOT NULL AND e.deleted_at IS NULL`,
     [userId],
-  )).rows as Array<{ item_id: string; seq: number }>;
-  return new Map(rows.map((r) => [r.item_id, `item #${Number(r.seq)}`]));
+  )).rows as Array<{ item_id: string; seq: number | null }>;
+  return new Map(rows.map((r) => [r.item_id, r.seq === null || r.seq === undefined ? "an item no longer on the board" : `item #${Number(r.seq)}`]));
 }
 
 /** A memory read that fails costs the turn its memory, never the turn: it is background. Said in the log, not hidden. */
@@ -317,7 +321,8 @@ export async function reviewMemoryBlock(sessionId: string): Promise<string | nul
     const item = (await db.query(
       "SELECT item_id, user_id FROM claw_work_items WHERE worker_session_id = $1 AND kind = 'review'", [sessionId],
     )).rows[0] as { item_id: string; user_id: string } | undefined;
-    if (!item || !(await getMemoryPreference(item.user_id))) return null;
+    // The same marker every other turn of the assistant's honours: a session marked as one no personal memory is shown in.
+    if (!item || await sessionWithoutMemory(sessionId) || !(await getMemoryPreference(item.user_id))) return null;
     const bound = await memoriesOfItem(item.user_id, item.item_id);
     return bound.length ? renderItemMemories(bound, ITEM_MEMORY_INTRO) : null;
   });

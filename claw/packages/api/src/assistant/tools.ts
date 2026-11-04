@@ -113,6 +113,12 @@ export async function say(
   }
 }
 
+/** A session config marked as one where no one's personal memory is kept or shown. */
+function memoryOffIn(config: unknown): boolean {
+  const memory = config && typeof config === "object" ? (config as Record<string, unknown>).memory : undefined;
+  return memory === "off" || memory === false;
+}
+
 export async function workCreate(
   claims: AssistantTokenClaims, args: { title: string; brief: string; repo?: unknown },
 ): Promise<{ ok: true; item_id: string; seq: number; deduplicated: boolean }> {
@@ -155,7 +161,8 @@ export async function workCreate(
       systemPrompt: "",
       // The credentials the owner's own messages stamp (`sessionCredentialPatch`), taken from the assistant's
       // session: this session never receives a message from the user directly.
-      config: { ...sealedCredentialFields(creds), ...(repo !== undefined ? { repo } : {}) },
+      // A router session no one's personal memory is kept in (`memory: "off"`, a group's) starts workers that are not either.
+      config: { ...sealedCredentialFields(creds), ...(repo !== undefined ? { repo } : {}), ...(memoryOffIn(router?.config) ? { memory: "off" } : {}) },
       parentSid: null,
       role: "",
       model: CLAW_ASSISTANT_WORKER_MODEL || null,

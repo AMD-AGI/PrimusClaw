@@ -24,7 +24,14 @@
  *   G6  a turn that has ended cannot act; a worker cannot write; another user's entry is not reachable
  *   I1  an entry about one item is bound to it: listed to the router with the item's number, shown in full to that item's
  *       worker only, kept out of the chat's catalogue; another user's item cannot be named
- *   I2  a review item's session is shown what was bound to its item and nothing else of the user's memory
+ *   I2  a review item's session is shown what was bound to its item and nothing else of the user's memory, and nothing in
+ *       a session marked `memory: "off"`
+ *   I3  a duplicate or a near one is an entry of the same binding: an item-bound save next to a matching global entry, or
+ *       one bound to another item, is stored bound to its item (not `existing`, not `similar_exists`); a chat save matching
+ *       an item's entry is stored for the chat's catalogue; within one binding a duplicate is still `existing`
+ *   I4  a worker's search is chosen from what it may read before the top ten are taken and before anything counts as read
+ *   I5  an entry bound to an item whose row is gone stays in the router's index, so it can be seen and forgotten
+ *   W1  a router session marked `memory: "off"` starts workers that are marked so too: no index, no recall
  *   P1  a router turn carries the memory section and index (or the off note); a worker turn a read-only index
  *   T1  over the wire: a router is offered the memory tools, a worker only memory_recall
  */
@@ -322,8 +329,97 @@ describe("assistant memory tools", { skip }, () => {
     const block = await mt.reviewMemoryBlock(reviewSid);
     assert.ok(block?.includes(`#${saved.id} 这次重点看安全: 重点看安全`), block ?? "");
     assert.ok(!block?.includes("回复用中文"), "no index");
+    await w.q(`UPDATE claw_sessions SET config = config || '{"memory":"off"}'::jsonb WHERE session_id = $1`, [reviewSid]);
+    assert.equal(await mt.reviewMemoryBlock(reviewSid), null, "a session marked memory off: nothing");
+    await w.q(`UPDATE claw_sessions SET config = config - 'memory' WHERE session_id = $1`, [reviewSid]);
+    assert.ok(await mt.reviewMemoryBlock(reviewSid), "unmarked again: shown again");
     await svc.setMemoryPreference("alice", false);
     assert.equal(await mt.reviewMemoryBlock(reviewSid), null, "memory off: nothing");
+  });
+
+  test("I3 an item-bound save is not answered by a global or another item's entry, nor a chat save by an item's", async () => {
+    const general = await stored("alice", "PR 用 opus 审");
+    const item = await w.createItem(alice, "Review 254");
+    const other = await w.createItem(alice, "Review 255");
+    const save = async (seq: number, title: string, body: string) => {
+      const turn = await message(alice, `#${seq} ${body}，记住`);
+      const r = await mt.memorySave(turn, { type: "feedback", title, body, evidence_quote: body, item_id: `#${seq}` });
+      await w.closeRun(turn.task_id);
+      return r;
+    };
+    // The same words as the global entry, bound to an item: stored, bound to it, and shown to that item's worker.
+    const same = await save(item.seq, "PR 用 opus 审", "PR 用 opus 审");
+    assert.equal(same.op, "add", JSON.stringify(same));
+    assert.notEqual(same.id, general);
+    const worker = await mt.workerMemoryBlock("alice", item.itemId, item.workerSid);
+    assert.ok(worker?.includes(`#${same.id} PR 用 opus 审: PR 用 opus 审`), worker ?? "");
+    // The same words bound to another item: stored for that one, not answered by the first item's entry.
+    const otherSame = await save(other.seq, "PR 用 opus 审", "PR 用 opus 审");
+    assert.equal(otherSame.op, "add", JSON.stringify(otherSame));
+    // An item-level override of the general preference, close to it in words: stored, not `similar_exists` on the global one.
+    const near = await w.createItem(alice, "Review 256");
+    const override = await save(near.seq, "PR 用 opus 审，重点看安全", "PR 用 opus 审，重点看安全");
+    assert.equal(override.op, "add", JSON.stringify(override));
+    assert.deepEqual((await entries()).map((e) => [e.id, e.work_item_id]),
+      [[general, null], [same.id, item.itemId], [otherSame.id, other.itemId], [override.id, near.itemId]]);
+    // Within one binding a duplicate is still a duplicate, and a near one still refused.
+    assert.equal((await save(item.seq, "PR 用 opus 审", "PR 用 opus 审")).op, "existing");
+    assert.equal(await code(save(near.seq, "PR 用 opus 审，重点看安全性", "PR 用 opus 审，重点看安全性")), "similar_exists");
+
+    // The chat's own save, matching only an item's entry: stored, and in the chat's catalogue.
+    const onlyBound = await save(item.seq, "晨报十点发", "晨报十点发");
+    assert.equal(onlyBound.op, "add");
+    const chat = await svc.writeMemory("alice", { type: "user", title: "晨报十点发", body: "晨报十点发" }, { kind: "model", sessionId: "chat", quote: "晨报十点发", humanMessages: ["晨报十点发"] });
+    assert.ok(chat.ok && chat.op === "add" && chat.id !== onlyBound.id, JSON.stringify(chat));
+    const catalogue = await svc.buildMemoryCatalogue("alice");
+    assert.ok(catalogue?.text.includes(`#${chat.id} 晨报十点发`), catalogue?.text);
+  });
+
+  test("I4 a worker's search is chosen from what it may read, before the top ten and before anything counts as read", async () => {
+    const item = await w.createItem(alice, "Fix the build");
+    const other = await w.createItem(alice, "Other");
+    // Twelve entries of another item that match the search as well as the general one does, stored first so they lead.
+    for (const word of ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet", "kilo", "lima"]) {
+      const body = `构建用 ${word}`;
+      const r = await svc.writeMemory("alice", { type: "project", title: `构建 ${word}`, body },
+        { kind: "model", sessionId: "chat", quote: body, humanMessages: [body] }, { workItemId: other.itemId });
+      assert.ok(r.ok, JSON.stringify(r));
+    }
+    const general = await stored("alice", "构建失败先看日志");
+    const turn = await w.workerTurn(item.itemId);
+    const found = (await mt.memoryRecall(turn, { query: "构建" })).entries as Array<{ id: number }>;
+    assert.deepEqual(found.map((e) => e.id), [general]);
+    assert.equal((await mt.memoryRecall(turn, { id: String((await entries())[0].id) })).ok, false);
+    const counted = await w.q("SELECT id FROM claw_memory_entries WHERE user_id = 'alice' AND access_count > 0 ORDER BY id");
+    assert.deepEqual(counted.map((r: { id: number }) => Number(r.id)), [general], "another item's entries are not counted as read");
+  });
+
+  test("I5 an entry bound to an item whose row is gone stays in the router's index", async () => {
+    const item = await w.createItem(alice, "Gone soon");
+    const turn = await message(alice, `#${item.seq} 用 opus 审，记住`);
+    const saved = await mt.memorySave(turn, { type: "feedback", title: "用 opus 审", body: "用 opus 审", evidence_quote: "用 opus 审", item_id: `#${item.seq}` });
+    await w.q("DELETE FROM claw_work_item_events WHERE item_id = $1", [item.itemId]);
+    await w.q("DELETE FROM claw_work_items WHERE item_id = $1", [item.itemId]);
+    const router = await mt.routerMemoryBlock("alice", alice.routerSid);
+    assert.ok(router?.includes(`#${saved.id} 用 opus 审 (an item no longer on the board)`), router ?? "");
+    const forget = await message(alice, `忘掉 #${saved.id}`);
+    assert.deepEqual(await mt.memoryForget(forget, { id: String(saved.id) }), { ok: true, id: saved.id, op: "deleted" });
+  });
+
+  test("W1 a router session marked memory off starts workers marked so too: no index, no recall", async () => {
+    await stored("alice", "回复用中文");
+    await w.q(`UPDATE claw_sessions SET config = config || '{"memory":"off"}'::jsonb WHERE session_id = $1`, [alice.routerSid]);
+    const item = await w.createItem(alice, "Fix the build");
+    const marked = (await w.q("SELECT config->'memory' AS memory FROM claw_sessions WHERE session_id = $1", [item.workerSid]))[0];
+    assert.equal(marked.memory, "off");
+    assert.equal(await mt.workerMemoryBlock("alice", item.itemId, item.workerSid), null);
+    const turn = await w.workerTurn(item.itemId);
+    assert.equal(await code(mt.memoryRecall(turn, {})), "memory_not_here");
+    await w.closeRun(turn.task_id);
+    // A router session that is the user's own starts workers that are shown the index.
+    await w.q(`UPDATE claw_sessions SET config = config - 'memory' WHERE session_id = $1`, [alice.routerSid]);
+    const own = await w.createItem(alice, "Another");
+    assert.ok((await mt.workerMemoryBlock("alice", own.itemId, own.workerSid))?.includes("回复用中文"));
   });
 
   test("P1 a router turn carries the memory section and index, a worker turn a read-only index", async () => {

@@ -350,14 +350,18 @@ export async function writeMemory(userId: string, draft: MemoryDraft, actor: Mem
     await q("SELECT pg_advisory_xact_lock(hashtext('claw_memory:' || $1))", [userId]);
     await opts.guard?.(q);
     const live = (await q(
-      `SELECT id, category, content, mtype, title, evidence_quote FROM claw_memory_entries WHERE user_id = $1 AND ${LIVE_ROWS}`,
+      `SELECT id, category, content, mtype, title, evidence_quote, work_item_id FROM claw_memory_entries WHERE user_id = $1 AND ${LIVE_ROWS}`,
       [userId],
     )).rows as Array<Record<string, any>>;
+    // A duplicate or a near one is an entry of the same binding: one bound to another item, or to none, is shown elsewhere, and
+    // answering with it would leave nothing bound here (or, for a chat save, nothing in the chat's catalogue).
+    const workItemId = opts.workItemId ?? null;
+    const peers = live.filter((r) => (r.work_item_id ?? null) === workItemId);
     const key = normalizeText(`${title}\n${body}`);
-    const same = live.find((r) => normalizeText(`${r.title || ""}\n${r.content}`) === key || normalizeText(r.content) === normalizeText(body));
+    const same = peers.find((r) => normalizeText(`${r.title || ""}\n${r.content}`) === key || normalizeText(r.content) === normalizeText(body));
     if (same) return { ok: true as const, id: Number(same.id), op: "existing" as const, status, title: same.title || legacyTitle(same.content), live: live.length };
     let closest: { row: Record<string, any>; score: number } | null = null;
-    for (const r of live) {
+    for (const r of peers) {
       const score = Math.max(similarity(body, r.content), r.title ? similarity(title, r.title) : 0);
       if (score >= SIMILARITY_THRESHOLD && (!closest || score > closest.score)) closest = { row: r, score };
     }
@@ -380,7 +384,7 @@ export async function writeMemory(userId: string, draft: MemoryDraft, actor: Mem
                CASE WHEN $13::int IS NULL THEN NULL ELSE NOW() + make_interval(days => $13::int) END, $14)
        RETURNING id`,
       [userId, type, body, actor.kind === "model" ? actor.sessionId : null, actor.kind === "model" ? "explicit" : "manual",
-        title, why, how, status, estimateTokens(`${title}\n${body}`), quote, sourceKind, days, opts.workItemId ?? null],
+        title, why, how, status, estimateTokens(`${title}\n${body}`), quote, sourceKind, days, workItemId],
     )).rows[0];
     const id = Number(row.id);
     await recordEvent(q, { userId, entryId: id, op: "add", actor: actor.kind, sessionId: actor.kind === "model" ? actor.sessionId : null, title, quote });
@@ -513,14 +517,18 @@ export async function forgetAllMemories(userId: string): Promise<number> {
 }
 
 /** Read entries back: one by id, or the closest matches to a query. Counts as a use of each. */
-export async function recallMemory(userId: string, by: { id?: number; query?: string }): Promise<MemoryRow[]> {
+export async function recallMemory(userId: string, by: { id?: number; query?: string; item?: string }): Promise<MemoryRow[]> {
+  // `item`: only what holds everywhere and what is bound to that item (an assistant's worker), chosen before the top ten are
+  // taken and before anything counts as read, so another item's entries neither crowd the answer out nor are counted.
+  const reaches = (r: MemoryRow): boolean => by.item === undefined || r.work_item_id === null || r.work_item_id === by.item;
   let rows: MemoryRow[];
   if (by.id !== undefined) {
     const row = await readEntry(userId, by.id, true);
-    rows = row ? [toRow(row)] : [];
+    rows = row ? [toRow(row)].filter(reaches) : [];
   } else {
     const query = by.query ?? "";
-    const all = (await db.query(`SELECT ${ROW_COLUMNS} FROM claw_memory_entries WHERE user_id = $1 AND ${USER_ROWS} AND status = 'active'`, [userId])).rows.map(toRow);
+    const all = (await db.query(`SELECT ${ROW_COLUMNS} FROM claw_memory_entries WHERE user_id = $1 AND ${USER_ROWS} AND status = 'active'`, [userId]))
+      .rows.map(toRow).filter(reaches);
     const needle = normalizeText(query);
     rows = all
       .map((r) => ({ r, score: normalizeText(`${r.title}\n${r.body}`).includes(needle) ? 1 : similarity(query, `${r.title} ${r.body}`) }))
