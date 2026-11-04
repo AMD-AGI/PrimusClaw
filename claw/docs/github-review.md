@@ -82,7 +82,7 @@ review and the merge and who is the reviewer of record, and whose own standing a
 
 | Tool | What it does |
 |---|---|
-| `gh_pr_get` | The pull request, its files and diff, CI, review threads, existing comments, the risk evidence and hard holds for the model's `risk_judgement`, what the acting user may do, the review path (below) and the review instructions. Text that came from the pull request is under `untrusted`. Call it first. Every answer fits under Brain's 6000-character tool-result cut: the first is the overview, and what does not fit in it (`instructions`, `files`, `diff`, `conversation`) is read whole in pages, with `section`, `head_sha`, `read_id` and `offset` from each page's `next_offset`. Offsets are the whole diff's, with or without `file`; an offset past the end, or a `file` that is not in the change, is refused (`offset_out_of_range`, `unknown_file`), never answered with an empty page. A page is served from what the session read of that head and costs one GitHub request, which re-checks the repository gates, the head and the base branch; when the base branch has moved, the pull request is read again and the page is served only if it still reads the same (`read_id`), else refused with `read_changed`. |
+| `gh_pr_get` | The pull request, its files and diff, CI, review threads, existing comments, the risk evidence and hard holds for the model's `risk_judgement`, what the acting user may do, the review path (below) and the review instructions. Text that came from the pull request is under `untrusted`. Call it first. Every answer fits under Brain's cut of this tool's results (24000 characters; 6000 for other tools), at most 23000 characters: the first is the overview, and what does not fit in it (`instructions`, `files`, `diff`, `conversation`) is read whole in pages, with `section`, `head_sha`, `read_id` and `offset` from each page's `next_offset` (on the deep review's sandbox path, `how_to_read` says the diff is read once from the checkout instead, and paged only if the checkout fails). Brain must be deployed before the API: an older Brain cuts a page at 6000 characters. Offsets are the whole diff's, with or without `file`; an offset past the end, or a `file` that is not in the change, is refused (`offset_out_of_range`, `unknown_file`), never answered with an empty page. A page is served from what the session read of that head and costs one GitHub request, which re-checks the repository gates, the head and the base branch; when the base branch has moved, the pull request is read again and the page is served only if it still reads the same (`read_id`), else refused with `read_changed`. |
 | `gh_pr_risk` | Whether an approval or a merge would be held, and why, for the `risk_judgement` and `risk_flags` (`security_finding`, `review_skipped`) the model passes (see High risk): the judgement decides, except for the hard holds, and none holds. |
 | `gh_review_submit` | One review on the pinned head commit (the model may pass the same `risk_flags` as to `gh_pr_risk`, and they count for an `APPROVE`), with inline comments that must sit on lines the diff shows. `COMMENT`, `REQUEST_CHANGES` or `APPROVE`. A body footer says `Reviewed by <agent name> on behalf of <login> (requested by <name>), run <id>` (the agent name is `CLAW_GITHUB_REVIEW_AGENT_NAME`, default `Claw`) and a hidden marker (the run, the event and a digest of the text and inline comments) keeps a retry of the same review from posting twice, while a different review of the same kind on the same commit is posted. An `APPROVE` the model judges high, without a judgement, or with a hard hold is held until the acting user confirms (below). |
 | `gh_pr_merge` | Approves when needed and merges, if every gate is open. On a base branch that is merged through a merge queue it puts the pull request in the queue instead of merging it (`queued`, below). A merge the model judges high, without a judgement, or with a hard hold is held until the acting user confirms. |
@@ -433,11 +433,52 @@ be read is treated as one that withholds, so memory is not used and the turn is 
 
 ## Review path: the diff or a sandbox
 
-A sandbox costs a cold start of about 16 seconds. A small change needs none: `gh_pr_get`
-returns the diff, the file list and the metadata, and says `review_path.path = "api_diff"`.
-A sandbox is allowed (`"sandbox"`) when the change is large, GitHub did not send the diff of
-some file (a binary, a rename or a diff too large, whatever the line counts say), the file list is incomplete, or the repository has a review skill of its own, which
-may use scripts. Brain opens a sandbox only when a turn uses a sandbox tool, so the decision is
+A sandbox costs a cold start of about 16 seconds. A small change (at most
+`CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES` lines, default 600 with the deep review off, in at most
+`CLAW_GITHUB_REVIEW_FAST_MAX_FILES` files) needs none: `gh_pr_get` returns the diff, the file list
+and the metadata, and says `review_path.path = "api_diff"`. A sandbox is allowed (`"sandbox"`) when
+the change is large, GitHub did not send the diff of some file (a binary, a rename or a diff too
+large, whatever the line counts say), the file list is incomplete, or the repository has a review
+skill of its own, which may use scripts.
+
+### The deep review
+
+`CLAW_GITHUB_REVIEW_DEEP_ENABLED` (on by default) reviews in depth. Set to `false`, the model is
+given the instructions, the advice and the thresholds above, word for word what it was given before
+the switch existed. On, the diff-only path is kept for a small change that touches no source code
+(documentation, configuration, tests; the line threshold defaults to 200), and every other change
+is reviewed with a sandbox that the instructions require: a non-test source file changed
+(`source_change`: a code, shell, SQL or interface-schema (`.proto`, `.thrift`, `.graphql`) file by extension, outside
+`test/`, `tests/`, `__tests__/`, `spec/`, `fixtures/`, `testdata/`, `e2e/`, `*.Tests/` and not named like a test,
+`*.test.*`, `*.spec.*`, `*_test.go`, `test_*.py`), or one of the reasons above. On that path the
+model checks the pull request out, reads the callers of every
+changed function and export and the code around them, and runs the tests closest to the change
+(the repository's documented test command, scoped, each command under `timeout 600`, after
+building what those tests import the documented way: in a workspace a test loads its sibling
+packages from their built output, which a fresh checkout lacks; dependencies and build output left
+in the reused checkout are kept and reused, never reinstalled from clean), then has a
+second, adversarial pass look for what the first missed (a `task` sub-agent with read and bash
+tools only), and the review body lists what was read and run. A diff alone shows what changed, not
+who depends on it.
+
+It is on by default, and an operator upgrading gets it with its cost: every change of a source file
+now takes the sandbox path, with the sandbox the instructions require, and a review costs more.
+Measured on claude-opus-5.5 over five real pull requests, it cost about $1.86 per review (against about
+$0.62 for the review without it on the same model, and $0.29 for that review on claude-sonnet-5.5), and found 17 real
+problems where the review without it found 4. Three things below keep the cost down, and re-measured
+on two of those pull requests they took a review from $1.14 to $0.80 and from $1.17 to $0.96, with the same
+verdicts. Every turn of an on-behalf review writes its rolling prompt-cache markers for 5 minutes,
+since nobody waits between its turns, and keeps the anchor at `LLM_CACHE_TTL` (1h by default) so the
+next review still reads the shared prefix; the second pass is bounded to 20 turns and is handed the
+diff (written once to `.pr-review/pr.diff` in the checkout, excluded from git), what the first pass
+read, and the callers a search showed but it did not open, which it opens first; and the diff is
+read once from the checkout rather than in `gh_pr_get` pages.
+
+`CLAW_GITHUB_REVIEW_DEEP_ENABLED=false` turns the deep review off. The review model stays
+`CLAW_GITHUB_REVIEW_MODEL` (default `claude-opus-5.5`); to have the deployment's own model back as
+well, set `CLAW_GITHUB_REVIEW_MODEL=default` too.
+
+Either way, Brain opens a sandbox only when a turn uses a sandbox tool, so the decision is
 advice plus a record: a structured log line (`github_review.path_chosen` with `review_path`,
 `review_path_reason`, `session_id`, `repo`, `pr`, `changed_files`, `changed_lines`) and the
 `review_path` and `review_path_reason` columns of the audit row.
@@ -506,7 +547,10 @@ logs and the audit rows.
 | `CLAW_GITHUB_CONCURRENT_PER_REPO` | 3 | Tool calls on one repository at once, per API replica |
 | `CLAW_GITHUB_REQUESTS_PER_SESSION` | 60 | GitHub requests one session may make |
 | `CLAW_GITHUB_REVIEW_FAST_MAX_FILES` | 15 | At most this many changed files for the diff-only path |
-| `CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES` | 600 | At most this many added plus deleted lines for the diff-only path |
+| `CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES` | 200 (600 with the deep review off) | At most this many added plus deleted lines for the diff-only path; with the deep review on, a change of a non-test source file takes the sandbox path whatever its size |
+| `CLAW_GITHUB_REVIEW_DEEP_ENABLED` | on | The deep review ("The deep review" above): a required sandbox for source changes, the callers read, the closest tests run, and a second adversarial pass. `false` (or `0`, `no`) gives the review as it was before the switch. Another value than `true`/`1`/`yes`/`false`/`0`/`no` is reported and leaves it on |
+| `CLAW_GITHUB_REVIEW_MODEL` | `claude-opus-5.5` | The model of a session created with `config.acting_as` when the request names none (`model` absent or null); a request's own `model` wins. `default` leaves Brain's `DEFAULT_MODEL`. The requester's key pays for it |
+| `CLAW_GITHUB_REVIEW_EFFORT` | unset | The reasoning effort of every turn of such a session, its sub-agents included (`low`, `medium`, `high`; Anthropic `output_config.effort`, OpenAI `reasoning_effort`). Sent only while the session runs on `CLAW_GITHUB_REVIEW_MODEL` (a model its creator named instead may refuse the field). Unset sends neither field, so the model's own default applies, as before; another value is reported and sends none |
 
 The identity provider must give the API's own client the `identity.credential.resolve` scope
 (see [identity-client.md](identity-client.md), external credentials). Without a bound credential

@@ -24,7 +24,7 @@ import {
 } from "../auth/session-credentials.js";
 import { CLAW_AGENT_GUIDELINE_ENABLED, CLAW_DEPLOY_MODE, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
 import { withAgentGuideline } from "../sessions/agent-guideline.js";
-import { withholdsSandboxKeys } from "../github-review/session-tools.js";
+import { actingSessionTurnFields, withholdsSandboxKeys } from "../github-review/session-tools.js";
 import { defaultTaskWorkspaceId } from "./default-workspace.js";
 import { isMemoryActive } from "../memory/service.js";
 import { resolveTaskPlugin } from "../marketplace/plugins.js";
@@ -450,7 +450,7 @@ function buildExecuteRequest(opts: {
     workspace_id: extractSandboxNamespace(sandboxSpecForBrain) || session.workspace_id || undefined,
     platform_key: session.platform_key || "",
     llm_api_key: session.llm_api_key || undefined,
-    ...(session.withhold_sandbox_keys ? { withhold_sandbox_keys: true } : {}),
+    ...(session.withhold_sandbox_keys ? { withhold_sandbox_keys: true, ...actingSessionTurnFields(updated.model ?? undefined) } : {}),
     user_id: session.user_id || "",
     user_env: userEnvForReq,
     plugin_id: updated.plugin_id ?? undefined,

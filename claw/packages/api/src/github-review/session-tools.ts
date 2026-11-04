@@ -10,6 +10,7 @@
  * credential, which is fetched by the tools themselves, per call. The server name
  * is reserved: whatever a request names `github_review` is replaced.
  */
+import type { ReasoningEffort } from "@claw/protocol";
 import pino from "pino";
 import { CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
@@ -83,14 +84,38 @@ export async function loadUserEnvForSession(
 }
 
 /**
+ * The reasoning effort a turn of a session that acts as a user runs at (`CLAW_GITHUB_REVIEW_EFFORT`), as fields of its request. Only on
+ * the model the operator set it for: a session whose creator named another model (one that may refuse the field) is sent none.
+ */
+export function actingSessionEffort(model: unknown): { effort?: ReasoningEffort } {
+  const settings = readGithubReviewSettings();
+  const onReviewModel = (model === undefined || model === null || model === "") ? settings.reviewModel === null : model === settings.reviewModel;
+  return settings.reviewEffort && onReviewModel ? { effort: settings.reviewEffort } : {};
+}
+
+/** The most turns the review's second pass (a sub-agent) takes; over five measured reviews it took 11 to 33, 20 on average. */
+export const REVIEW_SUB_AGENT_MAX_TURNS = 20;
+
+/**
+ * What a turn of a session that acts as a user carries beyond the mark: the review's effort, rolling cache markers written for five
+ * minutes, and a bounded second pass. Nobody waits between a review's turns (the longest gap measured over five reviews was 102 s), so a
+ * 1h write of the tail is paid at 8/5 of the 5m price and read only seconds later; the anchor stays at Brain's TTL and still carries the
+ * prefix to the next review.
+ */
+export function actingSessionTurnFields(model: unknown): { effort?: ReasoningEffort; rolling_cache_ttl: "5m"; sub_agent_max_turns: number } {
+  return { ...actingSessionEffort(model), rolling_cache_ttl: "5m", sub_agent_max_turns: REVIEW_SUB_AGENT_MAX_TURNS };
+}
+
+/**
  * Marks a turn that is built here for a session that acts as a user (`withhold_sandbox_keys`, protocol), and takes the owner's stored
  * variables off it: whichever way they reached the task (a queued message that was frozen with them before the mark applied), a session
- * that withholds its sandbox's keys is sent none.
+ * that withholds its sandbox's keys is sent none. The same turn is run as a review: `actingSessionTurnFields`.
  */
 export async function applySandboxKeyPolicyToTask(task: Record<string, unknown>, sessionId: string): Promise<void> {
   if (!(await sessionWithholdsSandboxKeys(sessionId))) return;
   task.withhold_sandbox_keys = true;
   delete task.user_env;
+  Object.assign(task, actingSessionTurnFields(task.model));
 }
 
 export async function githubReviewMcpServers(sessionId: string): Promise<McpServers> {
